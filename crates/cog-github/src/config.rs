@@ -965,7 +965,10 @@ mod tests {
     fn the_landing_and_conversation_defaults_read_their_names() {
         let policy = LandingPolicy::default();
         assert_eq!(policy.max_land_attempts, LANDING_MAX_ATTEMPTS);
-        assert_eq!(policy.redrive_max_rounds_per_cause, REDRIVE_ROUNDS_PER_CAUSE);
+        assert_eq!(
+            policy.redrive_max_rounds_per_cause,
+            REDRIVE_ROUNDS_PER_CAUSE
+        );
         assert_eq!(
             ConversationConfig::default().max_clarification_rounds,
             CLARIFICATION_ROUNDS
@@ -990,9 +993,7 @@ mod tests {
                     return false;
                 };
                 let named_field = !field.is_empty()
-                    && field
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_');
+                    && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
                 named_field && value.trim().starts_with(|c: char| c.is_ascii_digit())
             }));
         }

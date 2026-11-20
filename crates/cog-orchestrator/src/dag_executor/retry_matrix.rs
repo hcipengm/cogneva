@@ -416,10 +416,7 @@ mod tests {
     fn the_unclassified_defaults_read_their_names() {
         let breaker = CircuitBreakerConfig::default();
         assert_eq!(breaker.failure_threshold, UNCLASSIFIED_FAILURE_THRESHOLD);
-        assert_eq!(
-            breaker.half_open_max_calls,
-            UNCLASSIFIED_HALF_OPEN_CALLS
-        );
+        assert_eq!(breaker.half_open_max_calls, UNCLASSIFIED_HALF_OPEN_CALLS);
         assert_eq!(RetryConfig::default().max_retries, UNCLASSIFIED_RETRIES);
 
         let source = include_str!("retry_matrix.rs");

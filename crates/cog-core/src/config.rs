@@ -3037,10 +3037,7 @@ mod system_config_reads_its_names {
         assert_eq!(cfg.pattern_db_max_size, DEFAULT_PATTERN_DB_MAX_SIZE);
         assert_eq!(cfg.pg_max_connections, DEFAULT_PG_MAX_CONNECTIONS);
         assert_eq!(cfg.pg_min_connections, DEFAULT_PG_MIN_CONNECTIONS);
-        assert_eq!(
-            cfg.pg_acquire_timeout_secs,
-            DEFAULT_PG_ACQUIRE_TIMEOUT_SECS
-        );
+        assert_eq!(cfg.pg_acquire_timeout_secs, DEFAULT_PG_ACQUIRE_TIMEOUT_SECS);
         assert_eq!(
             cfg.memory_message_broadcast_capacity,
             DEFAULT_MEMORY_MESSAGE_BROADCAST_CAPACITY

@@ -262,7 +262,10 @@ mod tests {
     /// `impl Default` 的字段里不再有数字（下一笔写回裸字面量就红）。
     #[test]
     fn the_long_run_default_reads_its_injection_rate() {
-        assert_eq!(LongRunConfig::default().task_injection_rate, DEFAULT_TASK_INJECTION_RATE);
+        assert_eq!(
+            LongRunConfig::default().task_injection_rate,
+            DEFAULT_TASK_INJECTION_RATE
+        );
         let body = include_str!("long_run.rs")
             .split("impl Default for LongRunConfig")
             .nth(1)

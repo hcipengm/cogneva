@@ -3172,7 +3172,7 @@ mod claim_concurrency_tests {
         assert_eq!(next_claim_bound(0, 2, true), 1);
     }
 
-// proves: taskRouter.claimConcurrency
+    // proves: taskRouter.claimConcurrency
     /// 同一个信号量、同一份读数面：窗口从 12 改到 3，下一拍报出去的界就跟着改，
     /// 不重启；窗口没变的那一拍，求值计数仍然往上走。
     ///

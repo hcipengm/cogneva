@@ -12645,7 +12645,7 @@ mod tests {
         assert!(parse_rows_per_handover("five").is_err());
     }
 
-// proves: changeLedger.rowsPerHandover
+    // proves: changeLedger.rowsPerHandover
     /// The bound follows the graph's own batches: one above the largest that
     /// landed whole, and never a size a generation refused.
     ///

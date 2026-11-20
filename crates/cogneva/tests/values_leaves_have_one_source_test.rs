@@ -791,12 +791,15 @@ fn bare_refs(body: &str) -> Vec<String> {
             continue;
         }
         let previous = if i == 0 { ' ' } else { chars[i - 1] };
-        if previous.is_ascii_alphanumeric() || previous == '_' || previous == '.' || previous == '$' {
+        if previous.is_ascii_alphanumeric() || previous == '_' || previous == '.' || previous == '$'
+        {
             i += 1;
             continue;
         }
         let mut j = i + 1;
-        while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_' || chars[j] == '.') {
+        while j < chars.len()
+            && (chars[j].is_ascii_alphanumeric() || chars[j] == '_' || chars[j] == '.')
+        {
             j += 1;
         }
         let ident: String = chars[i + 1..j].iter().collect();
@@ -811,13 +814,18 @@ fn bare_refs(body: &str) -> Vec<String> {
 
 /// 被整棵交出去的形态：`toYaml`／`join`／`include`／`range` 的实参。
 fn materializes(body: &str) -> bool {
-    ["toYaml", "join", "include", "range"].iter().any(|word| body.contains(word))
+    ["toYaml", "join", "include", "range"]
+        .iter()
+        .any(|word| body.contains(word))
 }
 
 /// 一个 `with`/`range` 的实参解析成 values 路径：绝对路径、某个变量别名，
 /// 或者是别的什么（`.`、函数调用），后两种什么都解析不出来。
 fn operand_path(operand: &str, aliases: &BTreeMap<String, String>) -> Option<String> {
-    let operand = operand.trim().trim_start_matches(|c| c == '(' || c == '-').trim();
+    let operand = operand
+        .trim()
+        .trim_start_matches(|c| c == '(' || c == '-')
+        .trim();
     if operand.starts_with(".Values.") {
         return absolute_refs(operand).into_iter().next();
     }
@@ -871,7 +879,10 @@ fn reads_of(text: &str) -> Reads {
                 operand_path(operand, &aliases)
             };
             blocks.push(Some(scope));
-        } else if head.starts_with("if ") || head.starts_with("define ") || head.starts_with("block ") {
+        } else if head.starts_with("if ")
+            || head.starts_with("define ")
+            || head.starts_with("block ")
+        {
             blocks.push(None);
         } else if head == "else" || head.starts_with("else ") {
             // 同一个块的另一支，不压栈。
@@ -1284,11 +1295,7 @@ fn the_env_layer_does_not_restate_the_handover_document() {
     let mut found = Vec::new();
     for file in &files {
         let text = blank_comments(&read(file));
-        found.extend(restatements(
-            &text,
-            &declared,
-            &file.display().to_string(),
-        ));
+        found.extend(restatements(&text, &declared, &file.display().to_string()));
     }
     assert!(
         found.is_empty(),

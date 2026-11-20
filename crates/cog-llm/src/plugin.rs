@@ -103,7 +103,10 @@ impl ModelCard {
     /// 两张表分开是因为它们的类型不同（条数 vs 每百万 token 价），而登记面
     /// 读的是表本身——写成一个结构体字面量，登记面按类型一眼认不出来，这些
     /// 数就借「类型不是标量也不是数组」从登记表里溜走了。
-    fn from_parts([context_window, max_tokens]: [u32; 2], [input, output, cache_read, cache_write]: [f64; 4]) -> Self {
+    fn from_parts(
+        [context_window, max_tokens]: [u32; 2],
+        [input, output, cache_read, cache_write]: [f64; 4],
+    ) -> Self {
         Self {
             context_window,
             max_tokens,
@@ -138,10 +141,7 @@ const OPENAI_LIMITS: [u32; 2] = [128_000, 4096];
 const OPENAI_PRICE: [f64; 4] = [2.5, 10.0, 1.25, 0.0];
 
 // cap: fixed — 提供方公布的模型卡（窗口、输出上限），随公布值更新
-const ANTHROPIC_LIMITS: [u32; 2] = [
-    200_000,
-    cog_core::config::ANTHROPIC_OUTPUT_TOKEN_DEFAULT,
-];
+const ANTHROPIC_LIMITS: [u32; 2] = [200_000, cog_core::config::ANTHROPIC_OUTPUT_TOKEN_DEFAULT];
 
 // cap: fixed — 提供方公布的每百万 token 价（输入/输出/缓存读/缓存写）
 const ANTHROPIC_PRICE: [f64; 4] = [3.0, 15.0, 0.0, 0.0];
@@ -164,9 +164,7 @@ const OLLAMA_PRICE: [f64; 4] = [0.0, 0.0, 0.0, 0.0];
 fn built_in_card(provider: crate::Provider) -> ModelCard {
     match provider {
         crate::Provider::OpenAI => ModelCard::from_parts(OPENAI_LIMITS, OPENAI_PRICE),
-        crate::Provider::Anthropic => {
-            ModelCard::from_parts(ANTHROPIC_LIMITS, ANTHROPIC_PRICE)
-        }
+        crate::Provider::Anthropic => ModelCard::from_parts(ANTHROPIC_LIMITS, ANTHROPIC_PRICE),
         crate::Provider::Google => ModelCard::from_parts(GOOGLE_LIMITS, GOOGLE_PRICE),
         crate::Provider::Ollama => ModelCard::from_parts(OLLAMA_LIMITS, OLLAMA_PRICE),
     }

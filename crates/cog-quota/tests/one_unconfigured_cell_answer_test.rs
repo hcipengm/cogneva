@@ -59,11 +59,7 @@ impl HierarchyManager for NoReading {
         unimplemented!("这一读不问历史")
     }
 
-    async fn limits(
-        &self,
-        _scope: QuotaScope,
-        _target_id: &str,
-    ) -> SFResult<Option<QuotaLimits>> {
+    async fn limits(&self, _scope: QuotaScope, _target_id: &str) -> SFResult<Option<QuotaLimits>> {
         // 没人配过。
         Ok(None)
     }
@@ -104,10 +100,7 @@ async fn a_cell_with_no_reading_is_raised_from_the_hierarchy_default() {
         .expect("充值要把抬过的上限写下去");
     assert_eq!(
         written,
-        QuotaLimits::new(
-            DECLARED.soft_limit + 10,
-            DECLARED.hard_limit + 10
-        ),
+        QuotaLimits::new(DECLARED.soft_limit + 10, DECLARED.hard_limit + 10),
         "没有读数的格子从层级库声明的那一对起步，不是从合同里另写的一对"
     );
 }

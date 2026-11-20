@@ -159,7 +159,9 @@ mod tests {
             assert_eq!(rule.priority, (count - position) as i32, "{}", rule.id);
         }
         assert!(
-            rules.windows(2).all(|pair| pair[0].priority > pair[1].priority),
+            rules
+                .windows(2)
+                .all(|pair| pair[0].priority > pair[1].priority),
             "相邻两条的先后必须严格分开"
         );
     }

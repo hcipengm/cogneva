@@ -102,10 +102,7 @@ mod tests {
     /// 数字。`confidence_threshold` 已删除——`pick_winner` 从来没有算过它。
     #[test]
     fn the_ab_winner_threshold_reads_its_name() {
-        assert_eq!(
-            AbTestConfig::default().min_samples,
-            AB_WINNER_MIN_SAMPLES
-        );
+        assert_eq!(AbTestConfig::default().min_samples, AB_WINNER_MIN_SAMPLES);
         // 针不在这一行里原样出现：否则这条判据读到的就是它自己。
         let needle = concat!("confidence_", "threshold: f64");
         assert!(

@@ -775,7 +775,10 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
         "crates/cog-orchestrator/src/action_planner/action_plan_orchestrator.rs",
         3,
     ),
-    ("crates/cog-orchestrator/src/action_planner/roundtable.rs", 2),
+    (
+        "crates/cog-orchestrator/src/action_planner/roundtable.rs",
+        2,
+    ),
     ("crates/cog-orchestrator/src/backup_runs.rs", 1),
     ("crates/cog-orchestrator/src/change_ledger.rs", 25),
     ("crates/cog-orchestrator/src/dag_executor/mod.rs", 5),

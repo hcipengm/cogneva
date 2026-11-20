@@ -303,12 +303,10 @@ mod tests {
     /// 一行 `字段: <数字>` 就是一处裸默认。
     fn bare_field_value(line: &str) -> Option<&str> {
         let (field, value) = line.trim().split_once(':')?;
-        let named_field = !field.is_empty()
-            && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        let named_field =
+            !field.is_empty() && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
         let value = value.trim().trim_end_matches(',');
-        (named_field
-            && value.starts_with(|c: char| c.is_ascii_digit())
-            && value != "0")
+        (named_field && value.starts_with(|c: char| c.is_ascii_digit()) && value != "0")
             .then_some(line.trim())
     }
 }

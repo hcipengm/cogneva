@@ -1795,15 +1795,12 @@ mod tests {
     fn the_promotion_and_deployer_defaults_read_their_names() {
         let gate = PromotionGateConfig::default();
         assert_eq!(gate.quota_per_day, PROMOTION_QUOTA_PER_DAY);
+        assert_eq!(gate.rollback_breaker_threshold, ROLLBACK_BREAKER_THRESHOLD);
+        assert_eq!(gate.failure_breaker_threshold, FAILURE_BREAKER_THRESHOLD);
         assert_eq!(
-            gate.rollback_breaker_threshold,
-            ROLLBACK_BREAKER_THRESHOLD
+            gate.gitops.canary_error_rate_multiplier,
+            CANARY_ERROR_RATE_MULTIPLIER
         );
-        assert_eq!(
-            gate.failure_breaker_threshold,
-            FAILURE_BREAKER_THRESHOLD
-        );
-        assert_eq!(gate.gitops.canary_error_rate_multiplier, CANARY_ERROR_RATE_MULTIPLIER);
         assert_eq!(gate.gitops.canary_p99_multiplier, CANARY_P99_MULTIPLIER);
         assert_eq!(
             gate.gitops.canary_min_requests_for_rate,

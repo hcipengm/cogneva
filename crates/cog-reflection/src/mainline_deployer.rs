@@ -24271,7 +24271,7 @@ exit 0
         assert_eq!(prunable_tags(&tags, 0, &HashSet::new()).len(), 3);
     }
 
-// proves: mainlineDeployer.registryMaintenance.retention
+    // proves: mainlineDeployer.registryMaintenance.retention
     /// registry 保留窗口是这一拍实测的函数：声明的卷 ÷ 每个 rev 的边际字节。
     /// 边际字节只算这一个 rev 独有的层与它自己的元数据——共用的基底删掉一个 rev
     /// 也释放不了，摊进来会让容量随基底一起缩水。每算一拍求值计数都往上走，目标
@@ -24364,7 +24364,7 @@ exit 0
         assert_eq!(off.effective_registry_retention(&tags(), Some(1000)), 0);
     }
 
-// proves: mainlineDeployer.registryMaintenance.threshold
+    // proves: mainlineDeployer.registryMaintenance.threshold
     /// 回收阈值是这一拍实测的函数：窗里的增长越大、卷越小，阈值越低（回收来得越早），
     /// 且至少留出一个实测 rev 的空间。相邻两拍读数一变，下一拍的读数面就跟着变，
     /// 不需要重启；量不到时如实落回 seed。
@@ -33454,7 +33454,7 @@ exit 0
         }
     }
 
-// proves: mainlineDeployer.pollIntervalSecs
+    // proves: mainlineDeployer.pollIntervalSecs
     /// 主线轮询的下一拍跟着这一轮真正占用的时间走：跑得比种子久时等待为零（那一段
     /// 已经被这一轮用掉了），目标周期与求值计数一起说明回路在跑、而且跟着输入变。
     #[test]
@@ -33490,7 +33490,7 @@ exit 0
         assert_eq!(pacing.target(POLL_PACING).unwrap().1, 3);
     }
 
-// proves: mainlineDeployer.failureCooldownSecs
+    // proves: mainlineDeployer.failureCooldownSecs
     /// 环境类失败的冷却由「连着坏了几次」定：第一次是种子，之后每多一次拉开一档，
     /// 恢复后回到种子。次数是运行时量出来的，不是人钉的。
     #[test]
@@ -33518,7 +33518,7 @@ exit 0
         assert_eq!(pacing.target(FAILURE_COOLDOWN_PACING).unwrap().1, 4);
     }
 
-// proves: mainlineDeployer.registryMaintenance.cooldownSecs
+    // proves: mainlineDeployer.registryMaintenance.cooldownSecs
     /// 两轮回收之间的冷却由「一次回收重启真实让 tag 服务缺席了多久」定：下次不花得
     /// 比这次重启更频繁。换一次更长的重建，冷却跟着变。
     #[test]
@@ -33553,9 +33553,9 @@ exit 0
         assert_eq!(deployer.effective_registry_cooldown_secs(), before);
     }
 
-// proves: mainlineDeployer.soakSecs
-// proves: mainlineDeployer.startupTimeoutSecs
-// proves: mainlineDeployer.rolloutTimeoutSecs
+    // proves: mainlineDeployer.soakSecs
+    // proves: mainlineDeployer.startupTimeoutSecs
+    // proves: mainlineDeployer.rolloutTimeoutSecs
     /// 三段等待各自量到的时长跨过短命判定 Job 的边界回到部署器：下一轮派发按新的
     /// 尾部申报，三段各由自己那一段决定，互不牵连；并且读数面能看出这件事**又被**
     /// 算过一次——目标跟着输入走、求值次数只增，两半一起才说明回路在跑，而不是一次
@@ -33757,10 +33757,10 @@ exit 0
         }
     }
 
-// proves: mainlineDeployer.rolloutJob.cpuRequest
-// proves: mainlineDeployer.rolloutJob.memoryRequest
-// proves: mainlineDeployer.rolloutJob.cpuLimit
-// proves: mainlineDeployer.rolloutJob.memoryLimit
+    // proves: mainlineDeployer.rolloutJob.cpuRequest
+    // proves: mainlineDeployer.rolloutJob.memoryRequest
+    // proves: mainlineDeployer.rolloutJob.cpuLimit
+    // proves: mainlineDeployer.rolloutJob.memoryLimit
     /// 判定 Job 的尺寸与容器资源回路共用同一个读数面：运行史还不够一趟时是 chart 的
     /// 种子（`source=seed`），够一趟之后同一个量换成实测（`source=derived`）。求值计数
     /// 每一拍都走——目标不动时，这个计数是回路还在跑的唯一证据。

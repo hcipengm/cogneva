@@ -1296,7 +1296,10 @@ mod tests {
     #[test]
     fn both_outlets_read_one_timeout() {
         assert_eq!(LokiConfig::default().timeout_secs, EXPORTER_TIMEOUT_SECS);
-        assert_eq!(AlertmanagerConfig::default().timeout_secs, EXPORTER_TIMEOUT_SECS);
+        assert_eq!(
+            AlertmanagerConfig::default().timeout_secs,
+            EXPORTER_TIMEOUT_SECS
+        );
 
         let source = include_str!("config.rs");
         let bare: Vec<&str> = source

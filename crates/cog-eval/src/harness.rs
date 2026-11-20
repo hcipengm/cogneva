@@ -212,7 +212,10 @@ mod tests {
     /// `impl Default` 的字段里不再有数字（下一笔写回裸字面量就红）。
     #[test]
     fn the_harness_default_reads_its_pass_rate() {
-        assert_eq!(HarnessConfig::default().min_pass_rate, HARNESS_MIN_PASS_RATE);
+        assert_eq!(
+            HarnessConfig::default().min_pass_rate,
+            HARNESS_MIN_PASS_RATE
+        );
         let body = include_str!("harness.rs")
             .split("impl Default for HarnessConfig")
             .nth(1)

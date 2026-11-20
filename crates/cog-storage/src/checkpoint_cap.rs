@@ -684,7 +684,7 @@ mod tests {
         );
     }
 
-// proves: checkpointStore.maxRows
+    // proves: checkpointStore.maxRows
     /// 目标不变的一拍仍然是一拍：读数上的求值计数必须往上走，来源标签必须
     /// 从 seed 变成 derived。没有这一条，「回路在算」就只剩启动时那一次。
     #[tokio::test]

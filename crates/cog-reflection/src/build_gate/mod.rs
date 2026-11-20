@@ -5272,8 +5272,8 @@ mod tests {
         }))
     }
 
-// proves: changeVerification.cargoBuildJobs
-// proves: mainlineDeployer.cargoBuildJobs
+    // proves: changeVerification.cargoBuildJobs
+    // proves: mainlineDeployer.cargoBuildJobs
     /// 编译宽度是宿主核数与单构建需求的函数：同样的机器上需求变大，宽度变小；
     /// 机器变小，宽度也变小；宽度不会超过核数，也不会小于一；量不到时不出数，
     /// 由调用方落回声明——不猜一个宽度。
@@ -6180,7 +6180,7 @@ mod tests {
         assert!(excluding.held());
     }
 
-// proves: evolution.buildGate.maxConcurrent
+    // proves: evolution.buildGate.maxConcurrent
     /// Every dimension is a count of builds: what is left of it, divided by what
     /// one build demands. The tightest is the answer, and which one it was is
     /// part of the reading — a bound of one on a saturated disk is a different
@@ -8075,7 +8075,7 @@ unevictable 28532736
         drop(slot_copy);
     }
 
-// proves: evolution.buildGate.waitSecs
+    // proves: evolution.buildGate.waitSecs
     /// The wait budget is the tail of the waits that actually happened.
     ///
     /// The declared budget is 2s. A wait of 1.5s is recorded the way `acquire`

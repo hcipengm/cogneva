@@ -1485,10 +1485,7 @@ mod tests {
     /// `impl Default` 的字段里不再有数字（下一笔写回裸字面量就红）。
     #[test]
     fn the_squad_default_reads_its_policy_upgrade_count() {
-        assert_eq!(
-            SquadConfig::default().max_retries,
-            SQUAD_POLICY_UPGRADES
-        );
+        assert_eq!(SquadConfig::default().max_retries, SQUAD_POLICY_UPGRADES);
 
         let source = include_str!("executor.rs");
         let body = source

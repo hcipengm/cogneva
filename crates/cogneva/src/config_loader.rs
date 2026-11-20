@@ -920,11 +920,7 @@ mod tests {
                 Some("info".to_string()),
                 "info".to_string(),
             ),
-            (
-                "gateway.only_env".to_string(),
-                None,
-                "x".to_string(),
-            ),
+            ("gateway.only_env".to_string(), None, "x".to_string()),
         ];
         assert_eq!(
             replaced_documented_paths(&applied),
@@ -2092,8 +2088,10 @@ mod tests {
             control_plane_interval_secs: 30,
             control_plane_url: None,
         };
-        let business =
-            cog_supervisor::SupervisorConfig::from_core(cfg, cog_core::config::AGENT_HEARTBEAT_INTERVAL_SECS);
+        let business = cog_supervisor::SupervisorConfig::from_core(
+            cfg,
+            cog_core::config::AGENT_HEARTBEAT_INTERVAL_SECS,
+        );
         assert_eq!(business.health_interval, std::time::Duration::from_secs(7));
         assert_eq!(business.broadcast_capacity, 512);
         assert_eq!(business.quota_threshold, 2000);

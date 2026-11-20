@@ -1026,7 +1026,7 @@ pub fn spawn_build_cache_watch(
 mod tests {
     use super::*;
 
-// proves: evolution.workspaces.cacheScanIntervalSecs
+    // proves: evolution.workspaces.cacheScanIntervalSecs
     /// The wait between passes follows what the last pass cost, and the
     /// evaluation count says the loop has computed it. This is the decision the
     /// watcher makes after every pass; the test feeds it the two passes a real
@@ -1082,7 +1082,7 @@ mod tests {
         assert_eq!(readings.scan_interval_secs(), MIN_SCAN_INTERVAL_SECS);
     }
 
-// proves: evolution.workspaces.targetMaxBytes
+    // proves: evolution.workspaces.targetMaxBytes
     /// The derived cap is a function of two inputs and of nothing else: what the
     /// walk saw the cache hold at its busiest, and what the volume has free.
     /// Moving either one has to move the number, or the reading is a comment.

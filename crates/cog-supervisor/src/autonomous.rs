@@ -464,7 +464,10 @@ mod tests {
     fn the_autonomous_default_reads_its_names() {
         let cfg = AutonomousConfig::default();
         assert_eq!(cfg.max_task_retries, AUTONOMOUS_MAX_TASK_RETRIES);
-        assert_eq!(cfg.decision_interval_secs, AUTONOMOUS_DECISION_INTERVAL_SECS);
+        assert_eq!(
+            cfg.decision_interval_secs,
+            AUTONOMOUS_DECISION_INTERVAL_SECS
+        );
 
         let body = include_str!("autonomous.rs")
             .split("impl Default for AutonomousConfig")
