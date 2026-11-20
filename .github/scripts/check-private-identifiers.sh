@@ -75,7 +75,10 @@ scan_bare_identifiers() {
       return 1
     fi
     log "私有标识门（裸标识）：PRIVATE_IDENTIFIERS 没有注入 ⇒ 这一遍没跑（补漏网层，不是完整证明）。"
-    return 0
+    # 3 而不是 0：这一层没跑成，与「跑了且干净」在退出码上不能同形——同形的话，
+    # 这一个作业在 CI 上永远是绿的，而它有一整层从没执行过。3 是「没验」，由调用方
+    # 决定它算不算失败（今天不算：名单是属主手上的那一格，见 ci.yml 的注释）。
+    return 3
   fi
   while IFS= read -r ident; do
     ident="$(trim "${ident}")"
@@ -117,7 +120,16 @@ main() {
   else
     log "私有标识门（所有者/仓）：${OWNER} 下的引用只有 ${OWNER}/${ALLOWED_REPO}，通过。"
   fi
-  scan_bare_identifiers || rc=1
+  # `|| bare=$?` 而不是分两句：这一份脚本跑在 `set -e` 下，裸调用一个会返回非零的函数
+  # 会让整份脚本当场以那个码退出——第二层还没轮到判词，3 就先出去了。
+  local bare=0
+  scan_bare_identifiers || bare=$?
+  case "${bare}" in
+    0) : ;;
+    # 3 只在还没有红的时候往外传：已经红了的一推，红比「有一层没验」更要紧。
+    3) if [ "${rc}" -eq 0 ]; then rc=3; fi ;;
+    *) rc=1 ;;
+  esac
   return "${rc}"
 }
 

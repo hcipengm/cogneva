@@ -311,7 +311,19 @@ jobs:
         env:
           PRIVATE_IDENTIFIERS: ${{ secrets.PRIVATE_IDENTIFIERS }}
           # REQUIRE_PRIVATE_IDENTIFIERS: "true"   # 属主配好 secret 后打开
-        run: bash .github/scripts/check-private-identifiers.sh
+        # 退出码 3 是「有一层没验」：它不再与「跑了且干净」同形，所以这里必须自己
+        # 处理它——记一条 annotation，让这一层从没执行过这件事在 job 的清单上读得到，
+        # 而不是靠谁去翻日志里的那行「这一遍没跑」。1 照旧是红。
+        run: |
+          set +e
+          bash .github/scripts/check-private-identifiers.sh
+          code=$?
+          set -e
+          if [ "${code}" -eq 3 ]; then
+            echo "::warning title=私有标识门::裸标识那一层没跑（PRIVATE_IDENTIFIERS 未注入）；这一层今天没有在守东西"
+            exit 0
+          fi
+          exit "${code}"
       # LLM 平等：业务侧的清单与配置零厂商名、零厂商 env，真上游只住在网关的上游池。
       # 方言词（openai/anthropic）是协议名，不是厂商身份——判据锚在凭证 env、端点、
       # 域名、模型品牌这些**带身份的形状**上，所以那两个词不会被误伤。
