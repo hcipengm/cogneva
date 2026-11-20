@@ -638,9 +638,24 @@ async fn build_pool_observability(
         analytics.map(|sink| sink as Arc<dyn cog_core::AnalyticsSink>);
     let metrics: Arc<dyn cog_core::ScrapableMetrics> = metrics;
 
-    Arc::new(PoolObservability::new(
-        metrics, analytics, alerts, usage, durable,
-    ))
+    // 调用事实的写入口：与用量账本同一条 URL、同一个进程。接不上时留空——
+    // 读切换之前它只决定「正本多不多一行」，不决定任何读数的对错。
+    let mut pool_obs = PoolObservability::new(metrics, analytics, alerts, usage, durable);
+    if let Some(url) = config.database_url.as_deref() {
+        match sqlx::PgPool::connect(url).await {
+            Ok(pool) => {
+                let deployment = std::env::var(cog_core::env::DEPLOYMENT_NAME_ENV)
+                    .unwrap_or_else(|_| "cogneva".to_string());
+                pool_obs = pool_obs.with_call_events(Arc::new(
+                    cog_storage::LlmCallEventStore::new(pool, deployment),
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "调用事实的写入口接不上；读切换之前不影响读数");
+            }
+        }
+    }
+    Arc::new(pool_obs)
 }
 
 #[cfg(test)]

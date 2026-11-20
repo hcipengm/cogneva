@@ -1735,6 +1735,9 @@ pub struct PoolObservability {
     pub alerts: Option<Arc<dyn PersistentAlertSink>>,
     /// 逐调用 token 计量明细（PG）。未配置数据库时 None，计量退化为指标+时序。
     pub usage: Option<Arc<dyn LlmUsageLedger>>,
+    /// 调用事实的写入口（`cogneva_event` 的 `llm_call`）。与 `usage` 并存到读切换
+    /// 为止：行是投影，事件是正本。
+    pub llm_call_events: Option<Arc<dyn cog_core::LlmCallEvents>>,
     /// 这本账最近是不是写不进去。落账在请求路径上写完才返回，失败在返回值里
     /// 也看得见；但连续失败与恢复对读者是一件事（不是每一次），所以这一格记着
     /// 「连续失败到第几笔」，让告警只在进入/离开故障的那一刻各动一次。
@@ -1769,9 +1772,17 @@ impl PoolObservability {
             analytics,
             alerts,
             usage,
+            llm_call_events: None,
             usage_write_health: Arc::new(crate::usage_landing::WriteHealth::default()),
             durable: durable.map(|backend| Arc::new(DurableGauges::new(backend))),
         }
+    }
+
+    /// 接上调用事实的写入口。装配层有池时用它；没有就保持 `None`，
+    /// 读切换之前这不会让任何读数变错——它只是让正本多一行。
+    pub fn with_call_events(mut self, sink: Arc<dyn cog_core::LlmCallEvents>) -> Self {
+        self.llm_call_events = Some(sink);
+        self
     }
 }
 
@@ -3531,6 +3542,34 @@ async fn land_usage_record(state: &AppState, record: LlmUsageRecord) {
         Ok(_) => {
             if health.note_landed() {
                 resolve_ledger_write_alert(alerts).await;
+            }
+            // 同一笔调用的事实也落进事件流：行是投影，事件是正本。写在行之后、
+            // 在答复离开之前——两处的顺序与 S38 的理由一样：宁可多一次同步写，
+            // 也不要「答复发了、事实还在队列里」。
+            if let Some(sink) = state.pool_obs.llm_call_events.clone() {
+                let call = cog_core::LlmCall {
+                    call_id: format!(
+                        "{}:{}",
+                        record.actor,
+                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                    ),
+                    upstream: record.upstream.clone(),
+                    api_style: record.api_style.clone(),
+                    model: record.model.clone(),
+                    result: record.result.clone(),
+                    input_tokens: record.tokens_input,
+                    output_tokens: record.tokens_output,
+                    latency_ms: None,
+                    task_id: record.task.clone(),
+                    actor: record.actor.clone(),
+                    at: chrono::Utc::now(),
+                };
+                if let Err(e) = sink.append(&call).await {
+                    tracing::warn!(
+                        error = %e,
+                        "这条调用的事实没写进事件流；用量行仍在，读切换之前两者并存"
+                    );
+                }
             }
         }
         Err((error, attempts)) => {
@@ -14764,6 +14803,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         alerts: Arc<dyn cog_core::PersistentAlertSink>,
     ) -> AppState {
         state.pool_obs = Arc::new(PoolObservability {
+            llm_call_events: None,
             metrics: state.pool_obs.metrics.clone(),
             analytics: None,
             alerts: Some(alerts),
@@ -14780,6 +14820,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         ledger: Arc<dyn cog_core::LlmUsageLedger>,
     ) -> AppState {
         state.pool_obs = Arc::new(PoolObservability {
+            llm_call_events: None,
             metrics: state.pool_obs.metrics.clone(),
             analytics: None,
             alerts: None,
@@ -18051,6 +18092,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 ),
             )),
             pool_obs: std::sync::Arc::new(PoolObservability {
+                llm_call_events: None,
                 metrics: test_metrics(),
                 analytics: None,
                 alerts: None,
@@ -20159,6 +20201,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
         let write_health = state.pool_obs.usage_write_health.clone();
         state.pool_obs = Arc::new(PoolObservability {
+            llm_call_events: None,
             metrics: metrics.clone(),
             analytics: None,
             alerts: None,
@@ -20289,6 +20332,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         );
         let write_health = state.pool_obs.usage_write_health.clone();
         state.pool_obs = Arc::new(PoolObservability {
+            llm_call_events: None,
             metrics: metrics.clone(),
             analytics: None,
             alerts: None,
@@ -20336,6 +20380,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             analytics: None,
             alerts: None,
             usage: Some(ledger.clone() as Arc<dyn cog_core::LlmUsageLedger>),
+            llm_call_events: None,
             usage_write_health: write_health,
             durable: None,
         });
@@ -20670,6 +20715,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         ));
         let write_health = state.pool_obs.usage_write_health.clone();
         state.pool_obs = Arc::new(PoolObservability {
+            llm_call_events: None,
             metrics: state.pool_obs.metrics.clone(),
             analytics: None,
             alerts: None,
@@ -20729,6 +20775,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         ));
         let write_health = state.pool_obs.usage_write_health.clone();
         state.pool_obs = Arc::new(PoolObservability {
+            llm_call_events: None,
             metrics: state.pool_obs.metrics.clone(),
             analytics: None,
             alerts: None,
@@ -20758,6 +20805,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         state.owner_budget = Some(Arc::new(StubHierarchy::new(&[])));
         let write_health = state.pool_obs.usage_write_health.clone();
         state.pool_obs = Arc::new(PoolObservability {
+            llm_call_events: None,
             metrics: state.pool_obs.metrics.clone(),
             analytics: None,
             alerts: None,
