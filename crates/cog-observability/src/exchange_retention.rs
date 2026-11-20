@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::{PgPool, Row};
-use tracing::{info, warn};
+use tracing::warn;
 
 use cog_core::metric_names;
 use cog_core::retention::{keep_days_against_volume, RetentionReadings, UNIT_DAYS};
@@ -84,22 +84,11 @@ pub const KEEP_DAYS_ENV: &str = "COGNEVA_LLM_EXCHANGE_KEEP_DAYS";
 // cap: bound — 更短就为一门年龄以天变的表反复重述花掉持久行，更长就让发布出去的大小在两次抓取之间过期
 pub const PERIOD: Duration = Duration::from_secs(300);
 
-/// How many rows one statement may delete.
-///
-/// Two thousand rows of bodies is tens of megabytes, which bounds both the
-/// statement's work and the locks it holds. The pas repeats until it finds
-/// nothing past the cutoff, so the count of batches follows the backlog rather
-/// than the batch size.
-// cap: bound — 循环重复到切点之外没有行为止，所以批数跟的是积压而不是批量
-const BATCH_ROWS: i64 = 2_000;
-
 /// What one pass did, so a caller can assert on it rather than infer it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetentionOutcome {
     /// Rows the archive held after the pass.
     pub held: i64,
-    /// Rows this pass retired.
-    pub removed: u64,
     /// The age of the oldest surviving row, in seconds; zero for an empty
     /// archive.
     pub oldest_age_secs: i64,
@@ -108,9 +97,6 @@ pub struct RetentionOutcome {
     /// Whether `keep_secs` came from this beat's measurements rather than from
     /// the deployment's seed.
     pub keep_derived: bool,
-    /// Rows the pass did **not** retire because no copy of their body was
-    /// verified in the archive. Each one is the only copy of what it holds.
-    pub kept_unarchived: u64,
 }
 
 /// The retention sweep: the archive's table, the pool it lives on, and the age
@@ -211,17 +197,9 @@ impl ExchangeRetention {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             beat.beat();
-            let pass = self.retire_once(|| beat.beat()).await;
+            let pass = self.measure_once().await;
             match pass {
                 Ok(outcome) => {
-                    if outcome.removed > 0 {
-                        info!(
-                            table = self.table,
-                            rows = outcome.removed,
-                            held = outcome.held,
-                            "Retired LLM exchanges past the retention"
-                        );
-                    }
                     self.report(&outcome).await;
                     self.report_pass_failed(false).await;
                 }
@@ -242,18 +220,13 @@ impl ExchangeRetention {
         }
     }
 
-    /// Retire every row older than the retention, calling `progress` before
-    /// each batch.
+    /// 读一次留底表：多少行、最老一行多老、占多少字节、这一拍声明的查询窗口。
     ///
-    /// The loop hands `beat.beat` in here: the work between two beats would
-    /// otherwise be the whole pass, and a first run against an archive that
-    /// grew while nothing retired it deletes for as long as the backlog lasts.
-    /// That is exactly the shape that made a working sweep read as a stopped
-    /// loop on the event log, so the bound published here is one batch.
-    pub async fn retire_once(&self, progress: impl Fn()) -> SFResult<RetentionOutcome> {
-        // The retention is recomputed before the cutoff is chosen: the pass
-        // retires against this beat's measured cost of a day's writes, not
-        // against the number the deployment wrote down at install time.
+    /// 一行都不删。从前这一遍要做的事情是「删掉过了保留期、而且正文在归档里读得回来
+    /// 的那些行」——那条两段条件回答的是「删掉会不会丢掉唯一一份正文」。删界之后这个
+    /// 问题不存在了：没有任何东西会删，于是「哪些行的正文没有可读副本」也不再是这个
+    /// 循环要回答的问题（它是审计与备份演练的事，那边本来就逐表走一遍）。
+    pub async fn measure_once(&self) -> SFResult<RetentionOutcome> {
         let oldest_before = self.oldest_age_secs().await?;
         let bytes = self
             .table_bytes()
@@ -261,115 +234,16 @@ impl ExchangeRetention {
             .ok()
             .map(|bytes| bytes.max(0) as u64);
         let (keep, keep_derived) = self.keep_for(oldest_before, bytes);
-        let cutoff = chrono::Utc::now()
-            - chrono::Duration::from_std(keep).unwrap_or_else(|_| chrono::Duration::days(30));
-        // 这一遍的删除有条件：那一行的正文必须已经在归档里、而且读得到。
-        //
-        // 没有归档层就没有「已归档」这回事——那时一行也不删，并把它们计进
-        // `kept_unarchived`：本表是那几次调用正文的唯一一份，删掉就是抹掉。
-        //
-        // 读的行按 `(ts, id)` 游标一页页翻：删除是有条件的，所以不能靠「删掉就前移」
-        // 来换页；翻到底的那些既没被删、也没被漏数。
-        let mut removed = 0u64;
-        let mut kept_unarchived = 0u64;
-        let mut cursor: Option<(chrono::DateTime<chrono::Utc>, uuid::Uuid)> = None;
-        loop {
-            progress();
-            // 一行：id、时刻、两份正文的归档键。宽是这一行的形状，不是这里的毛病。
-            #[allow(clippy::type_complexity)]
-            type PagedRow = (
-                uuid::Uuid,
-                chrono::DateTime<chrono::Utc>,
-                Option<String>,
-                Option<String>,
-            );
-            let rows: Vec<PagedRow> = sqlx::query_as(&format!(
-                "SELECT id, ts, request_raw, response_raw FROM {table} \
-                     WHERE ts < $1 AND ($2::timestamptz IS NULL OR (ts, id) > ($2, $3)) \
-                     ORDER BY ts, id LIMIT $4",
-                table = cog_core::sql::quote_relation(&self.table),
-            ))
-            .bind(cutoff)
-            .bind(cursor.map(|(ts, _)| ts))
-            .bind(cursor.map(|(_, id)| id))
-            .bind(BATCH_ROWS)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| SFError::Database(e.to_string()))?;
-            let Some(last) = rows.last() else { break };
-            cursor = Some((last.1, last.0));
-            let mut deletable: Vec<uuid::Uuid> = Vec::new();
-            for (id, _ts, request_raw, response_raw) in &rows {
-                // `None`（读不到）与 `Some(false)`（没有副本）都不删。
-                if self
-                    .copies_are_archived(request_raw.as_deref(), response_raw.as_deref())
-                    .await
-                    == Some(true)
-                {
-                    deletable.push(*id);
-                } else {
-                    kept_unarchived += 1;
-                }
-            }
-            if !deletable.is_empty() {
-                removed += sqlx::query(&format!(
-                    "DELETE FROM {table} WHERE id = ANY($1)",
-                    table = cog_core::sql::quote_relation(&self.table),
-                ))
-                .bind(&deletable)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| SFError::Database(e.to_string()))?
-                .rows_affected();
-            }
-            if rows.len() < BATCH_ROWS as usize {
-                break;
-            }
-        }
         let held = self.row_count().await?;
         let oldest_age_secs = self.oldest_age_secs().await?;
         Ok(RetentionOutcome {
             held,
-            removed,
             oldest_age_secs,
             keep_secs: keep.as_secs() as i64,
             keep_derived,
-            kept_unarchived,
         })
     }
 
-    /// 这一行的副本是不是都在归档里、而且读得到。
-    ///
-    /// `None` 表示**不知道该不该删**：没有归档层、或者某一处读失败。两种都不删，
-    /// 因为删掉之后本表就是那几次调用正文的唯一一份，而「读不到」正是那种时刻。
-    async fn copies_are_archived(
-        &self,
-        request_raw: Option<&str>,
-        response_raw: Option<&str>,
-    ) -> Option<bool> {
-        let archive = self.archive.as_ref()?;
-        // 老行还没有 `*_raw`：它们的正文只在这张表里，别处没有副本，于是不算已归档。
-        if request_raw.is_none() && response_raw.is_none() {
-            return Some(false);
-        }
-        // 副本要**读得回来**才叫搬走了。`exists` 只回答「这个名字在」，而一个截断的
-        // 对象、一个写入只落了头的对象都「在」——把它们当成已归档，删掉的那一行就没有
-        // 第二份了。`get` 一直读到尾，读得回来才算数；空对象也不算：一段非空的正文
-        // 归档成零字节，那份副本说不清任何事。读失败（`Err`）与读不到是两件事，前者是
-        // 不知道，所以返回 `None` 让这一行留着。
-        for key in [request_raw, response_raw].into_iter().flatten() {
-            match archive.get(key).await {
-                Ok(Some(bytes)) if !bytes.is_empty() => {}
-                Ok(_) => return Some(false),
-                Err(_) => return None,
-            }
-        }
-        Some(true)
-    }
-
-    /// The retention this beat enforces, and whether it came from a
-    /// measurement.
-    ///
     /// The archive's own size and the age of its oldest row give the daily
     /// write volume directly: what survived the last pass over the span it
     /// covers is what a day costs. The volume's declared share then buys a
@@ -585,11 +459,9 @@ mod tests {
         .with_readings(Arc::clone(&readings));
         let outcome = RetentionOutcome {
             held: 100,
-            removed: 0,
             oldest_age_secs: 86_400,
             keep_secs: 7 * 86_400,
             keep_derived: true,
-            kept_unarchived: 0,
         };
         for expected in 1..=2 {
             sweep.report(&outcome).await;
