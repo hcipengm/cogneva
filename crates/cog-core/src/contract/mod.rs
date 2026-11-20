@@ -57,6 +57,7 @@ pub mod reflection;
 pub mod reranker;
 pub mod resilience;
 pub mod resource_ledger;
+pub mod resume_point;
 pub mod runtime_principle;
 pub mod sandbox;
 pub mod shutdown;
