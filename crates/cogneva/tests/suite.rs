@@ -101,6 +101,9 @@ mod a_job_inner_wait_budget_widens_the_job_deadline_test;
 #[path = "the_event_stream_has_one_write_path_test.rs"]
 mod the_event_stream_has_one_write_path_test;
 
+#[path = "dynamic_insert_tables_are_declared_test.rs"]
+mod dynamic_insert_tables_are_declared_test;
+
 #[path = "every_envelope_column_has_a_reader_test.rs"]
 mod every_envelope_column_has_a_reader_test;
 
