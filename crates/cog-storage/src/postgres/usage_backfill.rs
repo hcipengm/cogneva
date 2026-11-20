@@ -132,3 +132,21 @@ fn event_id_for(call_id: &str) -> String {
     }
     out
 }
+
+/// 一直翻到没有新行为止。返回一共写了多少条。
+///
+/// 这是回填的入口：它自己记住游标（就是上一页的最后一行），调用方不需要知道页的大小
+/// 与翻页规则。中断时什么都没有丢——下一次从头跑，写过的行按行 id 幂等跳过。
+pub async fn backfill_all(pool: &PgPool, writer: &str) -> SFResult<usize> {
+    let mut cursor = None;
+    let mut total = 0usize;
+    loop {
+        let (written, last) = backfill_page(pool, writer, cursor, BATCH).await?;
+        total += written;
+        match last {
+            Some(position) if written > 0 => cursor = Some(position),
+            _ => break,
+        }
+    }
+    Ok(total)
+}
