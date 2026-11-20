@@ -54,7 +54,7 @@ spec:
         # 一直用旧配置，回滚只改 ConfigMap 时进程仍用新配置。指纹同时覆盖 env 那份
         # cogneva-config（通知/告警出口地址在那里），只哈希卷里那份会让「配好地址但
         # 不重启」永远挂不上出口。
-        checksum/config: e6d0f43aebdca27216dd71925d879d20fe93ae395cb6f1aff340b96eb0c81be1
+        checksum/config: c43f79fc59466b41491980906b13e15fad2ec91a91499f4fc02d1eabf167a5c2
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: gateway
@@ -171,13 +171,6 @@ spec:
             # gateway_llm_exchange_keep_seconds，告警拿它和最老一行的年龄比，所以界跟着
             # 这里走。1 以下退回 30。
             - name: COGNEVA_LLM_EXCHANGE_KEEP_DAYS
-              value: "30"
-            # 任务事件档案（cog_events）的保留天数。退役的单位是整个任务的事件流：两个
-            # 读者都从 offset 0 重放，删前缀会让「从这里开始」和「跑到这里」读成同一件事；
-            # 被 cog_checkpoints 指着的流不删。超过这个天数没追加过的流整条退役。循环把
-            # 这个数发布成 cogneva_task_events_keep_seconds，告警拿它和最老一行比，所以界
-            # 跟着这里走。0 = 本部署只量不删；负数退回 30。
-            - name: COGNEVA_TASK_EVENT_KEEP_DAYS
               value: "30"
             # token 账（gateway_llm_usage）的逐次调用明细保留天数。这张表每次上游调用
             # 一行，每小时的折叠面把窗口汇总一次并长期保留——按时间封顶的是「哪次调用
