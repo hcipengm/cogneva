@@ -1277,6 +1277,18 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_gitee_token_refresh_threshold_seconds",
         "crates/cog-gateway/src/contribution_admin.rs",
     ),
+    // 换对象后端是一次数据搬迁：远端后端看不见旧后端写在盘上的那批对象，
+    // 而这条路上没有报错，只有空库。启动时清点一次，两个答案分两条序列：
+    // 数到多少是一条，读不出来是另一条上的 1——并成一条，卷没挂上就会被
+    // 读成「已经搬完了」。
+    (
+        "cogneva_object_store_legacy_objects",
+        "crates/cog-storage/src/legacy_object_tree.rs",
+    ),
+    (
+        "cogneva_object_store_legacy_scan_unreadable",
+        "crates/cog-storage/src/legacy_object_tree.rs",
+    ),
 ];
 
 /// Series the rules read that this workspace does not publish, with the owner.

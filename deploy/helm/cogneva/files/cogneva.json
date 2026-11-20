@@ -1117,6 +1117,26 @@
           "face": "持久化存储"
         },
         {
+          "name": "object_store_legacy_objects_left_behind",
+          "promql": "max without (pod, container, instance, job) (cogneva_object_store_legacy_objects)",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "对象后端已经不是 local-fs，而 `{path}` 下还留着 {value} 个在 local-fs 时期写下的对象。切换后端是一次数据搬迁，不是一次配置改动：远端后端读的是桶，这批对象在它眼里不存在，读回来就是空库。把它们搬进桶之后这条才会熄灭。这个数在进程启动时清点一次，`provider` 是正在跑的那一个后端。",
+          "face": "持久化存储"
+        },
+        {
+          "name": "object_store_legacy_tree_unreadable",
+          "promql": "max without (pod, container, instance, job) (cogneva_object_store_legacy_scan_unreadable)",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "对象后端已经不是 local-fs，但启动时读不出 `{path}` 下还剩多少对象——这不是「已经搬完」，是「不知道」。读不到的原因（没挂上、权限、路径写错）不修掉，搬没搬完这件事就没有答案；修好之后重启，清点重新数过才作数。",
+          "face": "持久化存储"
+        },
+        {
           "name": "volume_capacity_cannot_measure",
           "promql": "max by (persistentvolumeclaim) (increase(cogneva_volume_capacity_outcome_total{outcome=\"unmeasured\"}[1h]))",
           "condition": {

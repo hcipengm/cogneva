@@ -36,6 +36,7 @@ pub mod etcd;
 pub mod event_filter;
 pub mod inbox_orphan_readings;
 pub mod inbox_retirement;
+pub mod legacy_object_tree;
 pub mod pool_readings;
 pub mod pools;
 pub mod projection_readers;

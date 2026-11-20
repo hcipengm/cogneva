@@ -1291,23 +1291,43 @@ impl cog_core::SystemPlugin for StoragePlugin {
         if let Some(base) =
             crate::backends::object_backends::local_object_base(&storage_provider_config)
         {
-            match crate::backends::object_backends::objects_on_disk(&base).await {
-                Ok(0) => info!(
-                    path = %base.display(),
-                    "object store is not local-fs and the local object tree is empty; nothing was left behind"
-                ),
-                Ok(objects) => warn!(
-                    path = %base.display(),
-                    objects,
-                    "object store is not local-fs but this path still holds objects written while it was; they are not visible through the active backend until they are copied into it"
-                ),
-                Err(e) => warn!(
-                    path = %base.display(),
-                    error = %e,
-                    "object store is not local-fs; the local object tree could not be read, so how many objects it still holds is unknown — not zero"
-                ),
-            }
+            let path = base.display().to_string();
+            let objects = match crate::backends::object_backends::objects_on_disk(&base).await {
+                Ok(0) => {
+                    info!(
+                        path = %path,
+                        "object store is not local-fs and the local object tree is empty; nothing was left behind"
+                    );
+                    Some(0)
+                }
+                Ok(objects) => {
+                    warn!(
+                        path = %path,
+                        objects,
+                        "object store is not local-fs but this path still holds objects written while it was; they are not visible through the active backend until they are copied into it"
+                    );
+                    Some(objects)
+                }
+                Err(e) => {
+                    warn!(
+                        path = %path,
+                        error = %e,
+                        "object store is not local-fs; the local object tree could not be read, so how many objects it still holds is unknown — not zero"
+                    );
+                    None
+                }
+            };
+            // 同一件事也要从抓取面答一次：看着日志的人当场就知道，而看告警的人
+            // 只问得到序列。两者读的是同一次清点，不各数一遍。
+            crate::legacy_object_tree::record_scan(crate::legacy_object_tree::LegacyObjectTree {
+                provider: storage_provider_config.provider.clone(),
+                path,
+                objects,
+            });
         }
+        ctx.publish_observable(std::sync::Arc::new(
+            crate::legacy_object_tree::LegacyObjectTreeObservable,
+        ));
 
         // ── 数据库健康 ──
         // 报健康的进程（网关）不持有连接池：池是这一侧的资产。这里给出一个只回答
