@@ -632,7 +632,7 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-gateway/src/eval_reports.rs", 1),
     ("crates/cog-gateway/src/evolution.rs", 2),
     ("crates/cog-gateway/src/git_identity.rs", 2),
-    ("crates/cog-gateway/src/git_mirror.rs", 14),
+    ("crates/cog-gateway/src/git_mirror.rs", 15),
     ("crates/cog-gateway/src/git_routing.rs", 3),
     ("crates/cog-gateway/src/github_app.rs", 4),
     ("crates/cog-gateway/src/governance.rs", 5),
