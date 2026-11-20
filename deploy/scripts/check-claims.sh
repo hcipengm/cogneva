@@ -29,9 +29,17 @@ git -C "$root" rev-parse --verify "$base" >/dev/null 2>&1 || {
     exit 0
 }
 
+# 判的是**声明**，不是提到。提交信息里写「说修好了要带 Reading:」是在描述规则，
+# 不是在声称一次修复——把引号或反引号里的字先抹掉再判，否则这条门会去咬每一个
+# 解释它自己的人（2026-11-19 实测：机制那一笔的说明里写了那个词，门当场把那一笔拒了）。
+strip_mentions() {
+    sed -E 's/`[^`]*`//g; s/"[^"]*"//g; s/“[^”]*”//g; s/「[^」]*」//g' <<<"$1"
+}
+
 fail=0
 for sha in $(git -C "$root" rev-list "$base"..HEAD); do
-    msg="$(git -C "$root" show -s --format=%B "$sha")"
+    raw="$(git -C "$root" show -s --format=%B "$sha")"
+    msg="$(strip_mentions "$raw")"
 
     if printf '%s' "$msg" | grep -qE '修好|已修复|修掉了|\bfixed\b' &&
         ! printf '%s' "$msg" | grep -qE '^Reading:'; then

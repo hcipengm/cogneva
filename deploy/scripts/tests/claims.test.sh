@@ -56,6 +56,9 @@ check "Census is complete
 普查已经完备
 Census: bounds-census.py 791/592/569/334" 0 "声称完备并给出四面计数：绿"
 check "Add a test" 0 "什么都没说：绿（门只判声明）"
+check "Describe the rule
+
+提交信息用「」引用那个词时不算声明" 0 "引号里的词是提到，不是声明"
 
 printf '\nclaims.test.sh: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

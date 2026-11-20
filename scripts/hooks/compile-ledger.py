@@ -67,7 +67,9 @@ def ledgers(ledger: pathlib.Path, worktree: pathlib.Path) -> list[dt.datetime]:
     return sorted(times)
 
 
-CODE_SUFFIXES = {".rs", ".sh", ".py", ".yaml", ".yml", ".toml", ".ts", ".js", ".json", ".ps1"}
+# 只有 Rust 源需要「改完再编译」。脚本（.sh/.py）与清单由它们自己的门判，拿它们去
+# 要求一次 cargo 编译，等于让改一行注释也付一次编译成本。
+CODE_SUFFIXES = {".rs"}
 
 
 def is_code(path: pathlib.Path) -> bool:
