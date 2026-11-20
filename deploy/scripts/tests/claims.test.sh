@@ -7,6 +7,10 @@
 #   3. 声称「普查完备」没有 `Census:` ⇒ 红；有 ⇒ 绿。
 #   4. 什么都没说 ⇒ 绿（门只判声明，不判沉默）。
 set -uo pipefail
+# 夹具仓通过 `git -C <dir>` 或子 shell 的 `cd` 写，两者都不改调用方的仓：可是外层
+# 带进来的绝对 `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` 会让每一次调用写进**调用方**
+# 的仓。一次清干净，文件作用域，后面的用例都覆盖。
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR COGNEVA_COMMIT_INDEX
 root=$(git rev-parse --show-toplevel)
 gate="$root/deploy/scripts/check-claims.sh"
 [ -f "$gate" ] || { echo "FAIL: 门脚本不在：$gate" >&2; exit 1; }

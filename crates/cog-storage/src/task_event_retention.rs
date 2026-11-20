@@ -169,14 +169,6 @@ impl TaskEventRetention {
         })
     }
 
-    /// What the archive costs on disk, when it can be read.
-    async fn table_bytes(&self) -> Option<u64> {
-        crate::relation_bytes::relation_bytes(&self.pool, &self.table)
-            .await
-            .ok()
-            .map(|bytes| bytes.max(0) as u64)
-    }
-
     async fn row_count(&self) -> SFResult<i64> {
         crate::relation_rows::relation_rows(&self.pool, &self.table).await
     }
@@ -225,7 +217,7 @@ impl TaskEventRetention {
     async fn report(&self, outcome: &TaskEventRetentionOutcome) {
         let Some(ref mb) = self.metrics else { return };
         let labels = self.labels();
-        let mut pairs = vec![
+        let pairs = vec![
             (metric_names::TASK_EVENTS_ROWS, outcome.held as f64),
             (metric_names::TASK_EVENTS_TASKS, outcome.tasks as f64),
             (
@@ -289,10 +281,12 @@ mod tests {
     /// 因为它根本没有那条语句。行为那一半在真库用例里（`tests/task_event_retention.rs`）。
     #[test]
     fn the_module_carries_no_delete_statement() {
-        // 整份文件都算：这份测试自己也不写 `DELETE FROM`，所以不需要切产出面。
+        // 整份文件都算：这条断言自己也不写那句删除语句，所以不需要切产出面。
         let source = include_str!("task_event_retention.rs");
+        // 判的词在这里拼出来，不写字面量：写出来的话，这条断言会先命中它自己。
+        let forbidden = ["DELETE", "FROM"].join(" ");
         assert!(
-            !source.to_uppercase().contains("DELETE FROM"),
+            !source.to_uppercase().contains(&forbidden),
             "档案退役的删除语句还在：这条界要拆的是「到点删」，不是换个阈值"
         );
     }

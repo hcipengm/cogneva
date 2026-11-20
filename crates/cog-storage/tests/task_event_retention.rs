@@ -21,9 +21,6 @@
 //! the sweep is never pointed at a renamed table and the shared database's own
 //! `cog_events` is never in reach.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
-
 use chrono::{Duration as ChronoDuration, Utc};
 use cog_storage::TaskEventRetention;
 use sqlx::{PgPool, Row};

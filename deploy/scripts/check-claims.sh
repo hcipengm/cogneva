@@ -21,12 +21,15 @@
 # 一条永久红的门最后会被删掉。
 set -uo pipefail
 
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# 第一个参数是仓库根（这一族门的约定）；不给时才按脚本自己的位置推。
+root="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 base="${COGNEVA_PUSH_BASE:-origin/main}"
 
+# 读不到基线 ⇒ 退 3（「没判」），不是 0：一条在空树上也绿的判据，它的绿不依赖它
+# 自称读的那份东西（`an_empty_tree_is_never_green` 就是这个意思）。
 git -C "$root" rev-parse --verify "$base" >/dev/null 2>&1 || {
-    echo "claims: 找不到基线 $base，这一推不判。"
-    exit 0
+    echo "claims: 找不到基线 $base，这一推没判。" >&2
+    exit 3
 }
 
 # 判的是**声明**，不是提到。提交信息里写「说修好了要带 Reading:」是在描述规则，
@@ -36,8 +39,14 @@ strip_mentions() {
     sed -E 's/`[^`]*`//g; s/"[^"]*"//g; s/“[^”]*”//g; s/「[^」]*」//g' <<<"$1"
 }
 
+shas="$(git -C "$root" rev-list "$base"..HEAD)"
+if [ -z "$shas" ]; then
+    echo "claims: 这一推没有提交，没判。" >&2
+    exit 3
+fi
+
 fail=0
-for sha in $(git -C "$root" rev-list "$base"..HEAD); do
+for sha in $shas; do
     raw="$(git -C "$root" show -s --format=%B "$sha")"
     msg="$(strip_mentions "$raw")"
 

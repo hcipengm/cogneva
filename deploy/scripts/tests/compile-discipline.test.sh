@@ -7,6 +7,10 @@
 #   3. 编辑在编译之前、一批只编译一次 ⇒ 绿。
 #   4. 账本读不到 ⇒ 不判（量不到不是零次），也不假绿成「通过」的措辞。
 set -uo pipefail
+# 夹具仓通过 `git -C <dir>` 或子 shell 的 `cd` 写，两者都不改调用方的仓：可是外层
+# 带进来的绝对 `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` 会让每一次调用写进**调用方**
+# 的仓。一次清干净，文件作用域，后面的用例都覆盖。
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR COGNEVA_COMMIT_INDEX
 root=$(git rev-parse --show-toplevel)
 gate="$root/deploy/scripts/check-compile-discipline.sh"
 reader="$root/scripts/hooks/compile-ledger.py"
@@ -42,7 +46,7 @@ run() { COGNEVA_COMPILE_LEDGER="$ledger" COGNEVA_PUSH_BASE=main bash "$tree/depl
 
 # 1. 没有账本：不判。
 out="$(COGNEVA_COMPILE_LEDGER="$tmp/missing.tsv" COGNEVA_PUSH_BASE=main bash "$tree/deploy/scripts/check-compile-discipline.sh" 2>&1)"; rc=$?
-{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "不判"; } && ok "账本读不到：不判，也不假绿" || bad "账本读不到时的行为不对（rc=$rc）：$out"
+{ [ "$rc" -eq 3 ] && printf '%s' "$out" | grep -q "没判"; } && ok "账本读不到：退 3（没判），不假绿" || bad "账本读不到时的行为不对（rc=$rc）：$out"
 
 # 2. 编译之后又改了文件 ⇒ 红。
 echo "// edit after compile" >>"$tree/crates/demo/src/lib.rs"

@@ -9,6 +9,10 @@
 #   5. Split: 2 没点名重叠的测试目标 ⇒ 红；点名了 ⇒ 绿。
 #   6. 义务全部有证据 ⇒ 绿，不看 Split。
 set -uo pipefail
+# 夹具仓通过 `git -C <dir>` 或子 shell 的 `cd` 写，两者都不改调用方的仓：可是外层
+# 带进来的绝对 `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` 会让每一次调用写进**调用方**
+# 的仓。一次清干净，文件作用域，后面的用例都覆盖。
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR COGNEVA_COMMIT_INDEX
 root=$(git rev-parse --show-toplevel)
 gate="$root/scripts/hooks/batch-gate.py"
 [ -f "$gate" ] || { echo "FAIL: 门脚本不在：$gate" >&2; exit 1; }

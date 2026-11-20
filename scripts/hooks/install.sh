@@ -14,7 +14,6 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-root="$(cd "$here/../.." && pwd)"
 real_cargo="${REAL_CARGO:-$HOME/.cargo/bin/cargo}"
 
 [ -x "$real_cargo" ] || { echo "install-hooks: 找不到 cargo：$real_cargo（可用 REAL_CARGO= 指定）" >&2; exit 1; }

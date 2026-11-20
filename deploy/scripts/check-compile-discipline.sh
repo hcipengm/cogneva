@@ -14,25 +14,25 @@
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-root="$(cd "$here/../.." && pwd)"
+root="${1:-$(cd "$here/../.." && pwd)}"
 ledger="${COGNEVA_COMPILE_LEDGER:-$HOME/.local/state/cogneva/compile-ledger.tsv}"
 reader="$root/scripts/hooks/compile-ledger.py"
 
 if [ ! -f "$reader" ]; then
-  echo "compile-discipline: 读数脚本不在：$reader" >&2
-  exit 0
+  echo "compile-discipline: 读数脚本不在：$reader —— 没判。" >&2
+  exit 3
 fi
 
 if [ ! -f "$ledger" ]; then
-  echo "compile-discipline: 这台机器没有编译账本（未装垫片），这一推不判。"
-  echo "                  安装：bash scripts/hooks/install.sh"
-  exit 0
+  echo "compile-discipline: 这台机器没有编译账本（未装垫片），这一推没判。" >&2
+  echo "                  安装：bash scripts/hooks/install.sh" >&2
+  exit 3
 fi
 
 base="${COGNEVA_PUSH_BASE:-origin/main}"
 if ! git -C "$root" rev-parse --verify "$base" >/dev/null 2>&1; then
-  echo "compile-discipline: 找不到基线 $base，这一推不判。"
-  exit 0
+  echo "compile-discipline: 找不到基线 $base，这一推没判。" >&2
+  exit 3
 fi
 
 python3 "$reader" check --root "$root" --base "$base" --ledger "$ledger"

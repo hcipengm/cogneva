@@ -27,7 +27,16 @@ pod="${COGNEVA_PG_POD:-postgres-0}"
 pg_user="${COGNEVA_PG_USER:-cog_user}"
 pg_db="${COGNEVA_PG_DB:-cogneva}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-migrations="${here}/../../crates/cog-storage/migrations/postgres"
+# 第一个参数是仓库根（这一族门的约定）；不给时才按脚本自己的位置推。
+root="${1:-$(cd "${here}/../.." && pwd)}"
+migrations="${root}/crates/cog-storage/migrations/postgres"
+
+# 读不到迁移目录 ⇒ 退 3（没判）。这条门是 `carrier: 人`、要集群可达；在一棵没有
+# 迁移的树上它没有可判的东西，退 0 会把「没读到」印成「全部合规」。
+if ! compgen -G "${migrations}/*.up.sql" >/dev/null 2>&1; then
+    echo "migrations-against-live-schema: 迁移目录里没有 *.up.sql（${migrations}），没判。" >&2
+    exit 3
+fi
 
 # `COGNEVA_KUBECTL` 是这棵树里给集群客户端的唯一入口（见 `token-face-ingest.py`）。
 read -r -a kubectl <<<"${COGNEVA_KUBECTL:-sudo -n kubectl}"
