@@ -310,7 +310,8 @@ def main(argv: list[str]) -> int:
             import round as round_mod
             current = round_mod.current_round()
             if current:
-                pinned_rev = current[1]
+                # 台账仓的改动基准是**第一次开工**那个 rev，不是重钉后的那一格。
+                pinned_rev = current[4] if len(current) > 4 else current[1]
                 pinned = round_mod.ledger_at(current[1], args.ledger or todo_source.default_spec())
                 args.ledger = str(pinned)
         except Exception:  # 读不到事件流就退回此刻的台账，并在下面说清楚

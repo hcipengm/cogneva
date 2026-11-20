@@ -75,7 +75,7 @@ def psql(sql: str) -> str:
     return result.stdout
 
 
-def current_round() -> tuple[str, str, str] | None:
+def current_round() -> tuple[str, str, str, list[str], str] | None:
     """(event_id, ledger_rev)；没有开着的一轮返回 None。
 
     「开着」＝流里最后一条 `round_opened` 没有配对的 `round_closed`（按 subject_id 配）。
@@ -84,6 +84,9 @@ def current_round() -> tuple[str, str, str] | None:
         "select o.event_id || E'\\t' || coalesce(o.attributes::jsonb->>'ledger_rev','') "
         "|| E'\\t' || coalesce(o.attributes::jsonb->>'code_rev','') "
         "|| E'\\t' || coalesce(o.attributes::jsonb->>'batch','[]') "
+        # 第五格是**这一轮第一次开工**的那个 rev：重钉不改它。改成「自开工以来改了什么」
+        # 的量程一旦跟着重钉走，之前做过的活就全部读作没做（2026-11-21 实测）。
+        "|| E'\\t' || coalesce(o.attributes::jsonb->>'first_rev', o.attributes::jsonb->>'ledger_rev','') "
         "from cogneva_event o where o.kind='round_opened' and not exists ("
         " select 1 from cogneva_event c where c.kind='round_closed'"
         " and c.subject_id=o.subject_id) order by o.at desc, o.event_id desc limit 1"
@@ -99,7 +102,9 @@ def current_round() -> tuple[str, str, str] | None:
         batch = json.loads(parts[3]) if len(parts) > 3 and parts[3] else []
     except ValueError:
         batch = []
-    return event_id, rev, code_rev, [str(b) for b in batch]
+    # 老事件没有那一格：退回 `rev`，与它写下时的量程一致。
+    first_rev = parts[4] if len(parts) > 4 else rev
+    return event_id, rev, code_rev, [str(b) for b in batch], first_rev
 
 
 def ledger_at(rev: str, spec: str) -> pathlib.Path:
@@ -158,9 +163,13 @@ def open_round(spec: str | None, allow_open: bool = False) -> int:
     # `batch` 把这一批的身份写进事件：后面那道门按**这个**清单判「同批」，
     # 而不是每次自己重算一份——重算出来的东西读起来一样，却不是同一件事。
     ids = json.dumps([i.id for i in batch])
+    # 重钉继承「第一次开工」那一格：重钉要的是按新台账重算批次清单，不是把
+    # 「自开工以来改了什么」这条量程清零。
+    _existing = current_round()
+    first_rev = _existing[4] if _existing else rev
     attrs_sql = (
         f"jsonb_build_object('ledger_rev', '{rev}', 'ledger_path', '{source[3:]}', "
-        f"'code_rev', '{code_rev}', 'batch', '{ids}')::text"
+        f"'code_rev', '{code_rev}', 'batch', '{ids}', 'first_rev', '{first_rev}')::text"
     )
     psql(
         "insert into cogneva_event (event_id, kind, subject_kind, subject_id, unit_of_work, "

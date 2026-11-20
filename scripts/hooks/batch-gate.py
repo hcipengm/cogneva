@@ -237,7 +237,8 @@ def main(argv: list[str]) -> int:
         ledger_repo = None
     if ledger_repo is not None:
         out = subprocess.run(
-            ["git", "-C", str(ledger_repo), "diff", "--name-only", current[1] or "HEAD"],
+            ["git", "-C", str(ledger_repo), "diff", "--name-only",
+             (current[4] if len(current) > 4 else current[1]) or "HEAD"],
             capture_output=True, text=True,
         )
         if out.returncode == 0:
