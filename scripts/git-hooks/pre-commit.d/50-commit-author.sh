@@ -8,10 +8,16 @@
 # 2026-10-27 six commits went out as `t <t@example.com>`, the fixture identity a
 # branch test had written into the shared config, and the real authors were
 # unrecoverable from history. The owner's rule (2026-11-07): a commit is signed
-# by the person who made it. The name is not a table here; it is the session's
-# own record (`~/.claude/sessions/<pid>.json`, pid from `CLAUDE_PID`, cross-
-# checked against `CLAUDE_CODE_SESSION_ID`), the same source used to attribute
-# actions to a session.
+# by the person who made it. The name is not a table here; it comes from whoever
+# is making the commit, in the first form that exists:
+#
+#   * `COGNEVA_AGENT_NAME` -- the platform's own agents do not run inside Claude
+#     Code, so they have neither `CLAUDE_*` variables nor a session record on
+#     disk. The side that starts them knows the name and hands it over, which is
+#     cheaper than this hook guessing it from somewhere else.
+#   * the Claude Code session record -- `~/.claude/sessions/<pid>.json`, pid from
+#     `CLAUDE_PID`, cross-checked against `CLAUDE_CODE_SESSION_ID`, the same
+#     source used to attribute actions to a session.
 #
 # "Cannot judge" does not block, and says so: a commit made by the deployer, a
 # cron script or the platform's own landing has no Claude session id, and the

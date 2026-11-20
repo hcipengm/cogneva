@@ -29,16 +29,28 @@ not_judged() {
     exit 0
 }
 
-sid="${CLAUDE_CODE_SESSION_ID:-}"
-pid="${CLAUDE_PID:-}"
-[ -n "$sid" ] || exit 0
+# 身份的第一来源是**显式交进来的名字**，其次才是 Claude Code 的会话记录。
+#
+# 为什么要有第一来源：平台的智能体不在 Claude Code 里跑，它没有 `CLAUDE_*` 环境变量、
+# 盘上也没有 `<pid>.json`。只认会话记录，这道门对它们永远是「判不了」，等于不存在。
+# 交名字的方式是一个环境变量——调用它的那一侧本来就知道自己是谁（任务、进程、actor），
+# 这比让门去别处猜可靠。
+if [ -n "${COGNEVA_AGENT_NAME:-}" ]; then
+    employee="${COGNEVA_AGENT_NAME}"
+    sid=""
+    pid=""
+else
+    sid="${CLAUDE_CODE_SESSION_ID:-}"
+    pid="${CLAUDE_PID:-}"
+    [ -n "$sid" ] || exit 0
+fi
 
 record=""
-if [ -n "$pid" ] && [ -r "$sessions_dir/$pid.json" ]; then
+if [ -n "${sid:-}" ] && [ -n "${pid:-}" ] && [ -r "$sessions_dir/$pid.json" ]; then
     record="$sessions_dir/$pid.json"
 fi
 
-if [ -z "$record" ]; then
+if [ -z "${employee:-}" ] && [ -z "$record" ]; then
     # 没有 CLAUDE_PID（或文件不在）：退到按 sessionId 反查。只认**还活着**的进程，
     # 因为被 resume 过的会话会在盘上留下多份同 sessionId 的记录，死掉的那几份是旧名字。
     shopt -s nullglob
@@ -61,12 +73,14 @@ fi
 # 冒号后的空格必须可选：宿主写的是紧凑 JSON，而任何一次「顺手格式化」都会让原来那条
 # `"sessionId":"…"` 的 sed 读成空串。读成空之后这道门走的是「判不了 → 放行」，也就是
 # 一个格式化差异就能让它静默失效——2026-11-20 实测发生过一次。
-got_sid="$(sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$record" | head -1)"
-[ "$got_sid" = "$sid" ] ||
-    not_judged "$record 记的是会话 ${got_sid:-（空）}，不是 $sid"
-
-employee="$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$record" | head -1)"
-[ -n "$employee" ] || not_judged "$record 里没有 name 字段"
+if [ -z "${employee:-}" ]; then
+    [ -n "$record" ] || not_judged "会话 $sid 没有对应的盘上记录"
+    got_sid="$(sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$record" | head -1)"
+    [ "$got_sid" = "$sid" ] ||
+        not_judged "$record 记的是会话 ${got_sid:-（空）}，不是 $sid"
+    employee="$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$record" | head -1)"
+    [ -n "$employee" ] || not_judged "$record 里没有 name 字段"
+fi
 
 repo="$(env -u GIT_DIR -u GIT_WORK_TREE git rev-parse --show-toplevel 2>/dev/null)" ||
     not_judged "不在 git 工作树里"
@@ -118,7 +132,9 @@ committer="$(ident_name GIT_COMMITTER_IDENT)"
 #
 # 数字员工的写法里有 `#`（`Luna#1822ab0e`）。名字带 `#` 的一律按员工判，不管记录写着
 # 什么 kind：cogneva 自己发布的提交必须署那个员工名，这是属主同一句话的后半截。
-kind="$(sed -n 's/.*"kind":"\([^"]*\)".*/\1/p' "$record" | head -1)"
+kind=""
+[ -n "$record" ] &&
+    kind="$(sed -n 's/.*"kind":"\([^"]*\)".*/\1/p' "$record" | head -1)"
 if [ "$kind" = interactive ] && [ "${employee#*#}" = "$employee" ]; then
     expected="hcipengm"
     email="hcipengm@users.noreply.github.com"
@@ -139,7 +155,7 @@ cat >&2 <<EOF
 
 属主 2026-11-07：提交署提交者自己的名字，不署共享 config 里那个。
 属主 2026-11-08：Claude Code 署 hcipengm，cogneva 的数字员工署各自的员工名。
-这一笔该署「$expected」，依据是会话记录 $record（pid $pid，sessionId $sid，kind ${kind:-（无）}）。
+这一笔该署「$expected」，依据是：${record:+会话记录 $record（pid $pid，sessionId $sid，kind ${kind:-（无）}）}${record:-显式环境变量 COGNEVA_AGENT_NAME（平台智能体没有会话记录）}
 
 工作树归你一个人用时，一次设好（只改这棵工作树，不动共享 config）：
   git config extensions.worktreeConfig true
