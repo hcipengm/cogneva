@@ -988,6 +988,12 @@ else
     skip_step "提交引用可达性" "本机没有 python3 或没有 origin/main（CI 的 Check 会跑编译）"
 fi
 
+# 提交信息不带 AI 署名（`Check commit messages carry no AI attribution`）：这一步不
+# 在这里另写一份。判的字节在提交信息里，一旦推上去能修的只剩历史，而 CI 那一步以前是
+# 多行块、本机回放不了，于是本机从来没判过它、判词里一直写着「这一面没验」。现在范围
+# 计算收在 `check-commit-attribution-ci.sh` 里，CI 那一步是单行，这里**回放的就是它**，
+# 本机与 CI 判的是同一段范围、同一份判据。
+
 # ShellCheck：清单同样由 git 推出来，与 CI 同一条命令。
 mapfile -t shell_scripts < <(git ls-files '*.sh')
 # 零个脚本时 shellcheck 没有参数，它读 stdin、读到空、退 0——「一个脚本都没读到」

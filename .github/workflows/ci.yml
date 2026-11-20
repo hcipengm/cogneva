@@ -282,18 +282,14 @@ jobs:
       # 整部扫一次等于「第一次失手之后永久红」，而永久红的门最后会被删掉。
       # 范围按事件算：PR 读 base/head，push 读 before/sha；before 全零（新建分支）时
       # 退回「HEAD 可达的全部」。范围算不出来时脚本自己拒绝，不静默放行。
+      #
+      # 范围计算放在脚本里、这里留**单行**：推前门只回放单行的 `run:`，写成多行块它
+      # 跳过，然后在判词里说「这一面本机没验」——而这个判据本机跑得了，判词就自相矛盾。
       - name: Check commit messages carry no AI attribution
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: |
-          base="${BASE_SHA}"
-          case "${base}" in
-            "" | 0000000000000000000000000000000000000000) base="" ;;
-          esac
-          if [ -n "${base}" ]; then range="${base}..${HEAD_SHA}"; else range="${HEAD_SHA}"; fi
-          echo "judging ${range}"
-          bash deploy/scripts/check-commit-attribution.sh "${range}"
+        run: bash deploy/scripts/check-commit-attribution-ci.sh
       # 公开树里不许把私有仓指出来。第一层锚在所有者句柄上（结构判据），第二层要一份
       # 裸标识名单，而名单进公开文件本身就是泄露 —— 它从 secret 注入。
       #
