@@ -80,29 +80,39 @@ pub async fn pass(pool: &PgPool, metrics: &Arc<dyn MetricsBackend>) -> SFResult<
     Ok(cells.len())
 }
 
-/// 起这条 loop。停机信号到了就退出——它不进「一轮」，所以没有续跑点。
+/// 起这条 loop，**走存活上报**：一个没有心跳的循环停掉了，与「它一直没东西可报」在
+/// 读数上同形，而这两件事要做的活相反。名字只写一次——`spawn` 用它登记，读数用它报。
 pub fn spawn(
     pool: PgPool,
     metrics: Arc<dyn MetricsBackend>,
     shutdown: ShutdownSignal,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            match pass(&pool, &metrics).await {
-                Ok(cells) => {
-                    tracing::debug!(cells, "event stream census: this pass published every kind");
+    cog_core::loop_health::spawn(
+        LOOP,
+        cog_core::loop_health::Cadence::Periodic(PASS_INTERVAL),
+        shutdown.clone(),
+        move |beat| {
+            let pool = pool.clone();
+            let metrics = Arc::clone(&metrics);
+            let shutdown = shutdown.clone();
+            async move {
+                match pass(&pool, &metrics).await {
+                    Ok(cells) => {
+                        tracing::debug!(
+                            cells,
+                            "event stream census: this pass published every kind"
+                        )
+                    }
+                    // 读不到就说读不到：印一串 0 会把「库读不出来」读成「这一天什么都没发生」。
+                    Err(e) => {
+                        tracing::warn!(error = %e, "event stream census: the window could not be read")
+                    }
                 }
-                // 读不到就说读不到：印一串 0 会把「库读不出来」读成「这一天什么都没发生」。
-                Err(e) => {
-                    tracing::warn!(error = %e, "event stream census: the window could not be read")
-                }
+                beat.tick();
+                shutdown.wait().await;
             }
-            tokio::select! {
-                _ = tokio::time::sleep(PASS_INTERVAL) => {}
-                _ = shutdown.wait() => break,
-            }
-        }
-    })
+        },
+    )
 }
 
 #[cfg(test)]
