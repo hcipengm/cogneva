@@ -11,15 +11,6 @@ use crate::{
     model::Model, AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions, Usage,
 };
 
-/// The wall on one request to this provider.
-///
-/// 等：上游对这一次请求的答复开始（首字节）。本地推理的排队加首字节；这一格挡的是连不上，不是慢生成。
-/// 等不到：这一次调用以错误结束，**不记账、不留半份正文**——上游没开始回，就没有
-/// 可以丢的已生成内容。
-/// 续跑：能。调用方重发是一次新的调用（账上是第二条）；这一格不假装能从中途接着读。
-// cap: bound — 本地推理的排队加首字节；这一格挡的是连不上，不是慢生成。没有更小的实测值可用，等一条真实的「首字节耗时」读数落地后由它导出
-// wall: wait=the local runtime's first byte; on-timeout=the call fails and nothing is kept; resume=yes, the caller makes a new call
-const OLLAMA_REQUEST_TIMEOUT_SECS: u64 = 120;
 
 /// The wall on the liveness probe.
 ///
@@ -175,7 +166,7 @@ impl LLMProvider for OllamaProvider {
                 .json(&body)
                 .map_err(|e| SFError::Agent(format!("JSON serialization failed: {}", e)))
                 .unwrap()
-                .timeout(OLLAMA_REQUEST_TIMEOUT_SECS);
+                ;
 
             let http_response = match client.execute_stream(req).await {
                 Ok(r) => r,
