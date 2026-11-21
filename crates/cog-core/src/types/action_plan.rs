@@ -456,11 +456,58 @@ impl Plan {
         }
         Ok(())
     }
+
+    /// 这份计划点到了每一个给定的身份吗。
+    ///
+    /// 一条**批次**计划与一条单点计划的区别就在这里：批次的意义是「它们一起成立」，
+    /// 所以漏掉一条就不是「计划写得粗」，而是**这一批少了那一件**——而少了的那件
+    /// 在读数上与「做完了」同形。判据因此是逐条的，不是「点到了几条就算过」。
+    ///
+    /// 空清单返回真：没有要覆盖的活时，「每一条都点到了」是真的。
+    pub fn names_every(&self, ids: &[String]) -> bool {
+        ids.iter().all(|id| {
+            self.invariants
+                .iter()
+                .any(|line| line.contains(id.as_str()))
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 批次计划漏一条就答否：漏掉的那件在读数上与「做完了」同形。
+    #[test]
+    fn a_batch_plan_that_misses_an_item_does_not_cover_it() {
+        let plan = Plan {
+            input_type: "ledger-batch".into(),
+            invariants: vec!["S50：流式写入口".into(), "S67：批量入口".into()],
+            acceptance: vec![
+                PlanAcceptance {
+                    shape: "a".into(),
+                    statement: "x".into(),
+                    check: "cmd".into(),
+                },
+                PlanAcceptance {
+                    shape: "b".into(),
+                    statement: "y".into(),
+                    check: "cmd".into(),
+                },
+            ],
+            counterexamples: vec![],
+            one_shape_because: None,
+        };
+        assert!(plan.names_every(&["S50".to_string(), "S67".to_string()]));
+        assert!(
+            !plan.names_every(&["S50".to_string(), "S67".to_string(), "S65".to_string()]),
+            "漏掉 S65 却答「覆盖了」——那一条会读作做完了"
+        );
+        assert!(
+            plan.names_every(&[]),
+            "没有要覆盖的活时，每一条都点到了是真的"
+        );
+    }
 
     fn make_task(id: &str, blocked_by: Vec<&str>, blocks: Vec<&str>) -> AtomicTask {
         AtomicTask {
