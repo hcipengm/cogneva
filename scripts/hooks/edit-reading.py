@@ -129,7 +129,12 @@ def main(argv: list[str]) -> int:
         names = pathlib.Path(args.passed).read_text(errors="ignore").splitlines()
         passed = {name.strip() for name in names if name.strip()}
 
+    # 普查器跟着树走：判的是这棵树的面，工具就该在这棵树里（带外那本 brain 仓里的
+    # 是同一个脚本，但一道门依赖仓外的东西时，它随时会因为「那边没同步」而判不了）。
     census: pathlib.Path | None = None
+    default_census = root / "scripts/bounds-census.py"
+    if not args.census and default_census.is_file():
+        census = default_census
     if args.census:
         candidate = pathlib.Path(args.census)
         census = candidate if candidate.is_file() else None
