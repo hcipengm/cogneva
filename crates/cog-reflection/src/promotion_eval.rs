@@ -898,3 +898,80 @@ mod tests {
         assert_eq!(*graph.cancelled.lock().unwrap(), vec![stale.id.clone()]);
     }
 }
+
+/// 判词与落地结果的分歧：**evaluator 说行、落地却否**（以及反过来）各有多少。
+///
+/// 只看分歧率没有用——它把「evaluator 太松」与「evaluator 太严」加成一个数，而两者
+/// 要做的活相反。所以这里成对给出，并且把「判过、落地结果还不知道」的那一档单独
+/// 列出来：它既不是分歧，也不是一致，把它算进分母会让率随未完成的比例漂移。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Disagreement {
+    /// 两处都说行。
+    pub agreed_pass: u64,
+    /// evaluator 说行、落地判否。
+    pub evaluator_looser: u64,
+    /// evaluator 说否、落地判行。
+    pub evaluator_stricter: u64,
+    /// 判过、落地结果还不知道：不进分母。
+    pub undecided: u64,
+}
+
+impl Disagreement {
+    /// 分歧率的分母：两处都有结论的那些。
+    pub fn decided(&self) -> u64 {
+        self.agreed_pass + self.evaluator_looser + self.evaluator_stricter
+    }
+
+    /// 分歧率；没有已决的样本时是 `None`——「一个都没判过」和「一个都没分歧」不是
+    /// 同一个数，前者用 0 表示会让判据在空样本上永远绿。
+    pub fn rate(&self) -> Option<f64> {
+        let decided = self.decided();
+        if decided == 0 {
+            return None;
+        }
+        Some((self.evaluator_looser + self.evaluator_stricter) as f64 / decided as f64)
+    }
+}
+
+#[cfg(test)]
+mod disagreement_tests {
+    use super::*;
+
+    /// 两个方向分开数：率一样、要做的事不同。
+    #[test]
+    fn the_two_directions_are_counted_apart() {
+        let loose = Disagreement {
+            agreed_pass: 8,
+            evaluator_looser: 2,
+            evaluator_stricter: 0,
+            undecided: 0,
+        };
+        let strict = Disagreement {
+            agreed_pass: 8,
+            evaluator_looser: 0,
+            evaluator_stricter: 2,
+            undecided: 0,
+        };
+        assert_eq!(loose.rate(), strict.rate());
+        assert_ne!(loose, strict);
+    }
+
+    /// 没结论的那些不进分母：进的话，率会随「还没落地」的比例漂移。
+    #[test]
+    fn undecided_rows_stay_out_of_the_denominator() {
+        let d = Disagreement {
+            agreed_pass: 1,
+            evaluator_looser: 1,
+            evaluator_stricter: 0,
+            undecided: 98,
+        };
+        assert_eq!(d.decided(), 2);
+        assert_eq!(d.rate(), Some(0.5));
+    }
+
+    /// 空样本没有率：0 会让判据在没东西可判时永远是绿的。
+    #[test]
+    fn an_empty_sample_has_no_rate() {
+        assert_eq!(Disagreement::default().rate(), None);
+    }
+}
