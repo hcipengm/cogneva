@@ -103,6 +103,16 @@ async fn the_three_metric_projections_rebuild_from_the_source() {
         .await
         .expect("the metric tables exist");
 
+    // 真源里有的那一个名字要在表里，重建才会去问它（名字从表里读，不从注册表猜）。
+    sqlx::query(
+        "INSERT INTO cog_metric_counter_totals (name, labels, upstream, as_of, value) \
+         VALUES ($1, '{}', NULL, NOW(), 0)",
+    )
+    .bind(COUNTER)
+    .execute(&pool)
+    .await
+    .expect("the counter name is present");
+
     // 一个**过时**的行：它不在真源里，重建之后必须消失。整表重写与「合并写」在这
     // 一格上分得开——后者会把它留着，而读数从此多出一行没人能解释的序列。
     sqlx::query(
