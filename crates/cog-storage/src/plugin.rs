@@ -1650,6 +1650,28 @@ impl cog_core::SystemPlugin for StoragePlugin {
             info!("Observability event capacity disabled (no PostgreSQL pool)");
         }
 
+        // ── Event stream census ──
+        // 事件流是账的正本，而「今天一条都没进」与「写入口坏了」在别的读数上同形。
+        // 这一格按 kind 数最近一天进了多少行；闭集里的每一条都印，没有行印 0。
+        if let Some(pool) = self.pg_pool.clone() {
+            let shutdown = ctx
+                .consume::<cog_core::ShutdownSignal>()
+                .map(|s| (*s).clone())
+                .unwrap_or_default();
+            match ctx.consume_service::<dyn cog_core::MetricsBackend>() {
+                Some(mb) => {
+                    crate::event_stream_census::spawn(pool, mb, shutdown);
+                    info!(
+                        window_secs = crate::event_stream_census::WINDOW_SECONDS,
+                        "Event stream census started"
+                    );
+                }
+                None => info!("Event stream census disabled (no metrics backend)"),
+            }
+        } else {
+            info!("Event stream census disabled (no PostgreSQL pool)");
+        }
+
         // ── Checkpoint store capacity ──
         // A checkpoint round writes the new snapshot, points the task board at
         // it, and only then deletes the one it replaced — so the board is the

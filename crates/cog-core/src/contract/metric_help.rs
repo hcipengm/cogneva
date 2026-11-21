@@ -1877,6 +1877,14 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          and retirement removes whole streams rather than rows",
     ),
     (
+        "cogneva_event_stream_rows_per_day",
+        "Rows that entered the event stream in the last day, one series per \
+         kind. The stream is the account's source of truth, and \"nothing \
+         arrived\" and \"the writer is stuck\" read the same on every other \
+         surface; every kind in the closed set is published, zero included, so a \
+         series cannot disappear and look like nobody configured it",
+    ),
+    (
         "cogneva_event_undecodable_total",
         "Payloads this build could not decode, by kind and version. A row it \
          cannot decode is kept and marked `undecodable` rather than dropped: \

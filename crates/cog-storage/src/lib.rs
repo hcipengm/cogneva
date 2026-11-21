@@ -34,6 +34,7 @@ pub use cog_core::contract::dataset::{
 };
 pub mod etcd;
 pub mod event_filter;
+pub mod event_stream_census;
 pub mod inbox_orphan_readings;
 pub mod inbox_retirement;
 pub mod pool_readings;

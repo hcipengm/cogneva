@@ -249,6 +249,11 @@ metric_names! {
     // 哪一个种类、哪一版，决定补什么。
     EVENT_UNDECODABLE_TOTAL => "cogneva_event_undecodable_total",
 
+    // 事件流每天的进量，按 kind 分。流停了与流空了在别的读数上同形，而它们要做的活
+    // 相反；这一格是「这一天真的没有东西进流」与「流坏了」之间唯一的区别。
+    // 闭集里的每一条都印（没有行印 0），闭集之外出现过的也印。
+    EVENT_STREAM_ROWS_PER_DAY => "cogneva_event_stream_rows_per_day",
+
     // cog-observability — the prompt-and-response archive's retention.
     //
     // `gateway_llm_exchange` keeps the bodies of what the platform sent
