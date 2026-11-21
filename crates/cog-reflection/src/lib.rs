@@ -39,6 +39,7 @@ pub const SELF_REVIEW_INTERVAL: std::time::Duration = std::time::Duration::from_
 pub use cog_core::atomic_write;
 pub mod auto_promoter;
 pub mod baseline_port;
+pub mod cell_reuse;
 // The readings and the rules of the shared build cache live in cog-core: two
 // processes measure one and drop bytes from it (this deployment's builder and
 // the sandbox executor), and neither may depend on the other. See the module
