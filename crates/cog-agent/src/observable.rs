@@ -288,7 +288,7 @@ impl ContextWindowSource {
     /// 预算上），要么根本没人说过（没有界可裁）。所以它不是一个阈值，是一次来源判定：
     /// 型号说了 200K，而这一轮的预算还在 64K，说明那 64K 没有出处。
     pub fn narrower_than(self, window: Option<usize>, in_use: usize) -> bool {
-        matches!(self, Self::PublishedSpec) && window.is_some_and(|tokens| tokens < in_use)
+        matches!(self, Self::PublishedSpec) && window.is_some_and(|tokens| in_use < tokens)
     }
 
     /// The word this source is stored and read under. A reader taking its
