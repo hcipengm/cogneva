@@ -15,6 +15,9 @@ use crate::postgres::large_object;
 pub struct LargeObjectWriter {
     pool: PgPool,
     oid: u32,
+    /// 已经写进去多少字节。写入块是顺序的，这个数就是下一块的起点——从库里查长度
+    /// 要回读整段，而写者自己数得出来。
+    written: std::sync::atomic::AtomicU64,
 }
 
 #[async_trait]
@@ -24,7 +27,11 @@ impl BodyWriter for LargeObjectWriter {
     }
 
     async fn write(&self, chunk: &[u8]) -> SFResult<()> {
-        large_object::write_block(&self.pool, self.oid, chunk).await
+        let offset = self.written.load(std::sync::atomic::Ordering::SeqCst);
+        large_object::write_block(&self.pool, self.oid, offset, chunk).await?;
+        self.written
+            .fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 
     async fn seal(&self) -> SFResult<(String, u64)> {
@@ -54,6 +61,7 @@ impl BodyStore for PostgresBodyStore {
         Ok(Box::new(LargeObjectWriter {
             pool: self.pool.clone(),
             oid,
+            written: std::sync::atomic::AtomicU64::new(0),
         }))
     }
 }

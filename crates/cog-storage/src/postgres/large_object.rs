@@ -46,13 +46,19 @@ pub async fn open(pool: &PgPool) -> SFResult<u32> {
         .map_err(|e| SFError::Database(format!("lo_create returned nothing: {e}")))
 }
 
-/// 写一块。块就是这一拍收到的字节，不合并、不切分。
-pub async fn write_block(pool: &PgPool, oid: u32, bytes: &[u8]) -> SFResult<()> {
+/// 写一块，落在 `offset` 上。块就是这一拍收到的字节，不合并、不切分。
+///
+/// 偏移由写者自己数，不从库里查：`lo_lseek64` 要的是一个**文件描述符**（`lo_open`
+/// 的返回值），而 `lo_put` 要的是 `oid`——把两者接在一起，Postgres 的回答是
+/// 「没有这个函数」。原先那一行就是这么写的，于是每一块都写不进去。写者本来就知道
+/// 自己写了多少字节，数它比回读整段便宜，也不会在并发下拿到别人的长度。
+pub async fn write_block(pool: &PgPool, oid: u32, offset: u64, bytes: &[u8]) -> SFResult<()> {
     if bytes.is_empty() {
         return Ok(());
     }
-    sqlx::query("SELECT lo_put($1::oid, lo_lseek64($1::oid, 0::bigint, 2::int), $2::bytea)")
+    sqlx::query("SELECT lo_put($1::oid, $2::bigint, $3::bytea)")
         .bind(oid as i64)
+        .bind(offset as i64)
         .bind(bytes)
         .execute(pool)
         .await
