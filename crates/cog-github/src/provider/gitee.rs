@@ -81,7 +81,18 @@ impl GiteeProvider {
                 "gitee api returned HTTP {status}: {snippet}"
             )));
         }
-        Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
+        // 一段空正文是「这条接口没有东西要读」（合并、评论这类写接口），读成
+        // 空对象；而一段**非空却不是 JSON** 的正文（代理挡在前面答的一页 HTML）
+        // 是这份读数坏了——折成 `Null`，调用方会把每个字段都读成空串或 0。
+        if text.trim().is_empty() {
+            return Ok(serde_json::Value::Null);
+        }
+        serde_json::from_str(&text).map_err(|e| {
+            let snippet: String = text.chars().take(200).collect();
+            CogGitHubError::Provider(format!(
+                "gitee api answered {status} with a body that is not JSON ({e}): {snippet}"
+            ))
+        })
     }
 
     /// 一个带 query 参数的 GET。参数在这里编码：`url()` 拼出的地址已经可能
@@ -299,27 +310,28 @@ impl CodePlatformProvider for GiteeProvider {
         let pr = self
             .send(self.get(&format!("/pulls/{pr_number}"), &[]))
             .await?;
+        // 文件清单是这份详情的两格（改了哪些文件、改了几行），读不成的时候整份
+        // 报错：把读不成的清单当空的，交出去的是一句「这个 PR 一行没改」。同一个
+        // PR 在 GitHub 那侧走 `?`，两侧不该对同一件事给两个答案。
+        //
+        // 单条文件少了 `additions` / `deletions` 仍按 0 计：Gitee 对二进制文件
+        // 就是这么答的，「这个文件没有行数」是一个读到的数。
         let files = self
             .send(self.get(&format!("/pulls/{pr_number}/files"), &[]))
-            .await
-            .ok();
-        let (affected_files, changed_lines) = files
-            .as_ref()
-            .and_then(|f| f.as_array())
-            .map(|a| {
-                let names = a
-                    .iter()
-                    .filter_map(|f| f["filename"].as_str().map(String::from))
-                    .collect::<Vec<_>>();
-                let lines = a
-                    .iter()
-                    .map(|f| {
-                        f["additions"].as_u64().unwrap_or(0) + f["deletions"].as_u64().unwrap_or(0)
-                    })
-                    .sum::<u64>() as usize;
-                (names, lines)
-            })
-            .unwrap_or_default();
+            .await?;
+        let files = files.as_array().ok_or_else(|| {
+            CogGitHubError::Provider(format!(
+                "gitee /pulls/{pr_number}/files answered no array: {files}"
+            ))
+        })?;
+        let affected_files: Vec<String> = files
+            .iter()
+            .filter_map(|f| f["filename"].as_str().map(String::from))
+            .collect();
+        let changed_lines = files
+            .iter()
+            .map(|f| f["additions"].as_u64().unwrap_or(0) + f["deletions"].as_u64().unwrap_or(0))
+            .sum::<u64>() as usize;
 
         let merged = pr["merged"].as_bool().unwrap_or(false);
         let state = if merged {
@@ -451,5 +463,101 @@ mod tests {
         let before = chrono::Utc::now();
         let t = parse_time(&serde_json::json!("not-a-time"));
         assert!(t >= before);
+    }
+
+    /// A Gitee that answers per path: the PR object and the file list are two
+    /// reads, and the tests below need them to fail independently.
+    #[derive(Debug)]
+    struct PageByPath {
+        pr: (u16, String),
+        files: (u16, String),
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::HttpClient for PageByPath {
+        async fn execute(
+            &self,
+            req: cog_core::HttpRequest,
+        ) -> cog_core::SFResult<cog_core::HttpResponse> {
+            let (status, body) = if req.url.contains("/files") {
+                self.files.clone()
+            } else {
+                self.pr.clone()
+            };
+            Ok(cog_core::HttpResponse {
+                status,
+                headers: Default::default(),
+                body: body.into_bytes(),
+            })
+        }
+    }
+
+    fn provider(pr: (u16, &str), files: (u16, &str)) -> GiteeProvider {
+        GiteeProvider::new(
+            "o/r",
+            None,
+            None,
+            Arc::new(PageByPath {
+                pr: (pr.0, pr.1.to_string()),
+                files: (files.0, files.1.to_string()),
+            }),
+        )
+        .unwrap()
+    }
+
+    const PR_JSON: &str = r#"{"number":7,"title":"t","state":"open","merged":false,
+        "html_url":"https://gitee.com/o/r/pulls/7","head":{"sha":"abc"}}"#;
+
+    /// 文件清单读不成时，这份详情就是一整份读不成的读数——不许折成「这个 PR
+    /// 改动了 0 个文件、0 行」。旧代码 `.ok()` 正是那样：403 之后报的是一个
+    /// 什么都没改的 PR。
+    #[tokio::test]
+    async fn a_pull_request_whose_files_could_not_be_read_is_not_one_that_changed_nothing() {
+        let p = provider((200, PR_JSON), (403, r#"{"message":"forbidden"}"#));
+        let error = p
+            .get_pull_request(7)
+            .await
+            .expect_err("文件清单读不成，这份详情读不成");
+        let said = error.to_string();
+        assert!(said.contains("403"), "{said}");
+    }
+
+    /// 反例：两条读都成功时，行数是清单里加起来的那个数。
+    #[tokio::test]
+    async fn a_pull_request_detail_sums_the_files_it_read() {
+        let p = provider(
+            (200, PR_JSON),
+            (
+                200,
+                r#"[{"filename":"a.rs","additions":3,"deletions":1},
+                    {"filename":"b.rs","additions":0,"deletions":4}]"#,
+            ),
+        );
+        let detail = p.get_pull_request(7).await.expect("两条读都成功");
+        assert_eq!(detail.changed_lines, 8);
+        assert_eq!(detail.affected_files, vec!["a.rs", "b.rs"]);
+    }
+
+    /// 2xx 的正文不是 JSON（代理挡在前面答一页 HTML）：这份读数坏了，不是一
+    /// 个空对象。旧代码 `unwrap_or(Value::Null)` 把它读成「每个字段都空」。
+    #[tokio::test]
+    async fn an_answer_that_is_not_json_is_not_an_empty_object() {
+        let p = provider((200, "<html>upstream says ok</html>"), (200, "[]"));
+        let error = p
+            .get_pull_request(7)
+            .await
+            .expect_err("不是 JSON 的 200 不是一份读到的答案");
+        let said = error.to_string();
+        assert!(said.contains("not JSON"), "{said}");
+    }
+
+    /// 反例：空正文照旧读成「没有东西要读」，写接口（合并、评论）靠它。
+    #[tokio::test]
+    async fn an_empty_body_is_still_nothing_to_read() {
+        let p = provider((200, ""), (200, "[]"));
+        // 空正文的 PR 对象是一份空对象：字段全缺，但不再是读失败。
+        let detail = p.get_pull_request(7).await.expect("空正文不是坏读数");
+        assert_eq!(detail.number, 7, "响应里没有 number 时落回请求里的那个");
+        assert_eq!(detail.changed_lines, 0);
     }
 }
