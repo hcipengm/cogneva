@@ -1217,16 +1217,24 @@ impl QdrantHttp {
         Ok(resp.json().await?)
     }
 
+    /// 列出要快照的集合。
+    ///
+    /// 两种「没读到」都不折成空表：答了 200 却没有 `result.collections`，是这份
+    /// 清单坏了，不是这个部署没有向量数据；一个没有 `name` 的条目也一样——丢掉
+    /// 它，包就会从它的实体层里少一整个集合，而清单上写着这份包覆盖了什么。
+    /// 空数组仍然是合法的：一个真的没有集合的部署，没有什么可快照的。
     async fn collection_names(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let body = self.get_json("/collections").await?;
-        let names = body["result"]["collections"]
+        let entries = body["result"]["collections"]
             .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|c| c["name"].as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .ok_or_else(|| format!("qdrant /collections has no result.collections: {body}"))?;
+        let mut names = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let name = entry["name"]
+                .as_str()
+                .ok_or_else(|| format!("qdrant /collections entry has no name: {entry}"))?;
+            names.push(name.to_string());
+        }
         Ok(names)
     }
 
@@ -9204,6 +9212,59 @@ mod tests {
         let qdrant = QdrantHttp::new(&base).unwrap();
         let report = qdrant.snapshot_collection("c1", dir.path()).await.unwrap();
         assert_eq!(report.points, Some(0));
+        server.abort();
+    }
+
+    /// 集合清单读不到：答了 200 却没有 `result.collections`，这一趟备份必须停下，
+    /// 而不是打出一个「qdrant 是空的」的包——清单会把这句话抄进这一跑的账里，读的人
+    /// 会以为这个部署没有向量数据，而真相是它一份都没备到。
+    ///
+    /// 没有这一条，`unwrap_or_default()` 会把「没问到」写成「一个集合都没有」。
+    #[tokio::test]
+    async fn a_collection_list_nobody_could_read_refuses_the_backup() {
+        let (base, server) = serve_qdrant(r#"{"result":{"status":"green"}}"#).await;
+        let qdrant = QdrantHttp::new(&base).unwrap();
+        let error = qdrant
+            .collection_names()
+            .await
+            .expect_err("没有 result.collections 不是「没有集合」");
+        assert!(error.to_string().contains("result.collections"), "{error}");
+        server.abort();
+    }
+
+    /// 条目没有名字：丢掉它，包里就少一整个集合，而清单还写着这份包覆盖了什么。
+    #[tokio::test]
+    async fn a_collection_entry_without_a_name_refuses_the_backup() {
+        let (base, server) =
+            serve_qdrant(r#"{"result":{"collections":[{"name":"kept"},{"id":7}]}}"#).await;
+        let qdrant = QdrantHttp::new(&base).unwrap();
+        let error = qdrant
+            .collection_names()
+            .await
+            .expect_err("没有名字的条目不是一个能快照的集合");
+        assert!(error.to_string().contains("has no name"), "{error}");
+        server.abort();
+    }
+
+    /// 反例：真的一个集合都没有时备份照常跑。一个永远报错的「修法」也必须在这里红，
+    /// 否则这条改动让任何部署都备不成份。
+    #[tokio::test]
+    async fn a_deployment_with_no_collections_still_backs_up() {
+        let (base, server) = serve_qdrant(r#"{"result":{"collections":[]}}"#).await;
+        let qdrant = QdrantHttp::new(&base).unwrap();
+        let names = qdrant.collection_names().await.unwrap();
+        assert!(names.is_empty(), "{names:?}");
+        server.abort();
+    }
+
+    /// 顺序按服务端给的来：清单里排出来的是同一份，读的人按它对账。
+    #[tokio::test]
+    async fn the_collection_list_keeps_the_servers_order() {
+        let (base, server) =
+            serve_qdrant(r#"{"result":{"collections":[{"name":"beta"},{"name":"alpha"}]}}"#).await;
+        let qdrant = QdrantHttp::new(&base).unwrap();
+        let names = qdrant.collection_names().await.unwrap();
+        assert_eq!(names, vec!["beta".to_string(), "alpha".to_string()]);
         server.abort();
     }
 }
