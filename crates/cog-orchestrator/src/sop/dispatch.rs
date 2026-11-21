@@ -15,15 +15,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// The wall on one read of an SOP document from the source repository.
-///
-/// 等：一次 `fetch`（源码仓里的 SOP 原文）。
-/// 等不到：这一次派发以错误结束；**没有半份 SOP 被当成读到了**——正文要么整份到，
-/// 要么这一次就没有。
-/// 续跑：能。下一次派发重新拉一遍；源仓的 ref 与内容哈希决定读到的是不是同一份。
-// cap: bound — 一次源码仓的只读往返；比一次派发的编译短得多
-// wall: wait=one source-repository read; on-timeout=the dispatch fails with no partial SOP; resume=yes, next dispatch re-reads
-const SOP_SOURCE_READ_TIMEOUT_SECS: u64 = 30;
 
 use cog_core::{
     metric_names, ActionPlanner, HttpClient, HttpRequest, MetricName, MetricsBackend,
@@ -357,7 +348,7 @@ async fn fetch_sop(
     );
     let req = HttpRequest::get(url)
         .header("Accept", cog_core::CONTENT_TYPE_JSON)
-        .timeout(SOP_SOURCE_READ_TIMEOUT_SECS);
+        ;
     let resp = http.execute(req).await.map_err(|e| e.to_string())?;
     if !resp.is_success() {
         return Err(format!("platform returned HTTP {}", resp.status));
