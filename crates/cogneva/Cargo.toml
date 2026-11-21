@@ -97,7 +97,7 @@ redis = { workspace = true }
 sqlx = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
-dirs = "5"
+dirs = { workspace = true }
 sd-notify = "0.4"
 notify = "6"
 futures = { workspace = true }

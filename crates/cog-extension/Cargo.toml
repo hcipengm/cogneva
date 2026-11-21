@@ -25,7 +25,6 @@ uuid = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 async-trait = "0.1"
-urlencoding = "2.1"
 futures = { workspace = true }
 reqwest = { workspace = true }
 axum = { workspace = true }
