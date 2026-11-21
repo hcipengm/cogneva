@@ -6,8 +6,6 @@
 //!
 //! 默认忽略，需要 `COGNEVA_TEST_DATABASE_URL`。
 
-use sqlx::PgPool;
-
 use cog_test_support::{database_url, drop_schema, own_schema, schema_pool};
 
 #[tokio::test]
