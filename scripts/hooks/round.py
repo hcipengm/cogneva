@@ -35,10 +35,18 @@ import todo_source  # noqa: E402
 
 
 def ledger_repo(spec: str) -> pathlib.Path | None:
-    """`md:<路径>` 时，台账所在的那个 git 仓。change-ledger 没有 git rev，返回 None。"""
-    if not spec.startswith("md:"):
+    """台账所在的那个 git 仓。change-ledger 没有 git rev，返回 None。
+
+    `default_spec()` 给的是裸路径（`/…/specs/work-ledger-….md`），而别处给的是
+    `md:<路径>`。两种都收：此前只认带 `md:` 的那一种，于是 family／batch-gate
+    拿裸路径来问时永远得到 None，台账仓那一侧的触点（`specs/…`、台账仓里的
+    `scripts/…`）全被读成「树里不存在」，而这条分支从没真的跑过。
+    """
+    if spec.startswith("md:"):
+        spec = spec[3:]
+    elif ":" in spec:
         return None
-    path = pathlib.Path(spec[3:]).expanduser().resolve()
+    path = pathlib.Path(spec).expanduser().resolve()
     out = subprocess.run(
         ["git", "-C", str(path.parent), "rev-parse", "--show-toplevel"],
         capture_output=True, text=True,
