@@ -11,7 +11,6 @@ use cog_core::{
 use std::sync::Arc;
 use tracing::{info, warn};
 
-
 /// LiveKit media backend implementation.
 #[derive(Clone)]
 pub struct LiveKitMediaBackend {
@@ -113,8 +112,7 @@ impl MediaBackend for LiveKitMediaBackend {
             .map_err(|e| SFError::Adapter {
                 provider: "livekit".into(),
                 message: format!("create_room serialize failed: {}", e),
-            })?
-            ;
+            })?;
         let resp = self
             .client()?
             .execute(req)
@@ -154,8 +152,7 @@ impl MediaBackend for LiveKitMediaBackend {
             .map_err(|e| SFError::Adapter {
                 provider: "livekit".into(),
                 message: format!("delete_room serialize failed: {}", e),
-            })?
-            ;
+            })?;
         let resp = self
             .client()?
             .execute(req)
@@ -184,8 +181,7 @@ impl MediaBackend for LiveKitMediaBackend {
             .map_err(|e| SFError::Adapter {
                 provider: "livekit".into(),
                 message: format!("list_rooms serialize failed: {}", e),
-            })?
-            ;
+            })?;
         let resp = self
             .client()?
             .execute(req)
@@ -247,8 +243,7 @@ impl MediaBackend for LiveKitMediaBackend {
             .map_err(|e| SFError::Adapter {
                 provider: "livekit".into(),
                 message: format!("start_recording serialize failed: {}", e),
-            })?
-            ;
+            })?;
         let resp = self
             .client()?
             .execute(req)
@@ -282,8 +277,7 @@ impl MediaBackend for LiveKitMediaBackend {
             .map_err(|e| SFError::Adapter {
                 provider: "livekit".into(),
                 message: format!("stop_recording serialize failed: {}", e),
-            })?
-            ;
+            })?;
         let resp = self
             .client()?
             .execute(req)

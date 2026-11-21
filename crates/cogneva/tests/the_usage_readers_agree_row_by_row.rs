@@ -124,7 +124,23 @@ async fn the_stream_reader_and_the_row_reader_agree_row_by_row() {
             .expect("the event");
     }
 
-    let (row_total, row_by_actor) = usage.spend_by_actor_since(since).await.expect("row read");
+    // 行这一侧直接由 SQL 求和——`spend_by_actor_since` 自己已经切到流上了，
+    // 拿它当「行的读数」是同一个查询和自己比，永远相等、也永远判不出东西。
+    let row_rows = sqlx::query(
+        "SELECT actor, SUM(tokens_input + tokens_output)::BIGINT AS tokens \
+           FROM gateway_llm_usage GROUP BY actor",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read the rows");
+    let mut row_by_actor: std::collections::BTreeMap<String, u64> = Default::default();
+    for r in &row_rows {
+        let actor: String = sqlx::Row::get(r, "actor");
+        let tokens: i64 = sqlx::Row::get(r, "tokens");
+        row_by_actor.insert(actor, tokens.max(0) as u64);
+    }
+    let row_total: u64 = row_by_actor.values().sum();
+
     let (stream_total, stream_by_actor) = usage
         .spend_by_actor_since_from_stream(since)
         .await

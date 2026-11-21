@@ -98,7 +98,6 @@ fn input_content(blocks: &[ContentBlock], model: &Model) -> serde_json::Value {
     json!(content)
 }
 
-
 pub struct OpenAIResponsesProvider {
     client: Option<Arc<dyn cog_core::HttpClient>>,
     model: Model,
@@ -360,8 +359,7 @@ impl LLMProvider for OpenAIResponsesProvider {
                 .header("Content-Type", cog_core::CONTENT_TYPE_JSON)
                 .json(&body)
                 .map_err(|e| SFError::Agent(format!("JSON serialization failed: {}", e)))
-                .unwrap()
-                ;
+                .unwrap();
             for (key, value) in &headers {
                 req = req.header(key, value);
             }

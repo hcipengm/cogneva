@@ -3317,8 +3317,16 @@ mod tests {
         );
 
         // 下一份计划拿到的是重算后的窗口，不需要重启。
+        //
+        // 与上面那一格同一条口径：窗口是「实测最慢一次批准 × 1.25」导出的，而 scale
+        // 在两次实测之间会走一步，恰好落在 0.001 秒上。判等会把一次正确的重算判红
+        // （2026-11-22 实测 216002 对 216000）；判区间，允许一拍以内的漂移。
         let second = docs.stage("alice", &ops).await.unwrap();
-        assert_eq!(second.expires_at_unix - second.staged_at_unix, 216_000);
+        let window = second.expires_at_unix - second.staged_at_unix;
+        assert!(
+            (216_000..216_000 + 60).contains(&window),
+            "下一份计划的窗口应当是两天半（216000 秒，允许一拍漂移），实得 {window}"
+        );
 
         let evaluations = evaluations_count(&docs.metrics());
         assert!(

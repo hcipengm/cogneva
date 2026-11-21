@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-
 use cog_core::{
     metric_names, ActionPlanner, HttpClient, HttpRequest, MetricName, MetricsBackend,
     OwnerLeaseBroker, ShutdownSignal, SkillRegistry,
@@ -346,9 +345,7 @@ async fn fetch_sop(
         source.repo,
         source.sop_path
     );
-    let req = HttpRequest::get(url)
-        .header("Accept", cog_core::CONTENT_TYPE_JSON)
-        ;
+    let req = HttpRequest::get(url).header("Accept", cog_core::CONTENT_TYPE_JSON);
     let resp = http.execute(req).await.map_err(|e| e.to_string())?;
     if !resp.is_success() {
         return Err(format!("platform returned HTTP {}", resp.status));

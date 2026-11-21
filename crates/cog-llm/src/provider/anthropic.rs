@@ -70,7 +70,6 @@ fn mark_content_end(content: &mut serde_json::Value, marker: &serde_json::Value)
     }
 }
 
-
 pub struct AnthropicProvider {
     client: Option<Arc<dyn cog_core::HttpClient>>,
     model: Model,
@@ -394,8 +393,7 @@ impl LLMProvider for AnthropicProvider {
                 .header("Content-Type", cog_core::CONTENT_TYPE_JSON)
                 .json(&body)
                 .map_err(|e| SFError::Agent(format!("JSON serialization failed: {}", e)))
-                .unwrap()
-                ;
+                .unwrap();
 
             for (key, value) in &headers {
                 req = req.header(key, value);

@@ -1,10 +1,14 @@
-//! 汇总表不再被写：读的一切都从事件流来。
+//! 同一笔调用，行与事件两处都落，两个数必须相等。
 //!
-//! 判三件（S20.1 / S21 / S32 的共同底层）：
-//! - 调一次 `record()` 之后，`gateway_llm_usage` 里**没有新行**——那一侧停了；
-//! - 同一批事实在流里，按人的聚合等于逐笔求和；
-//! - 两条读路径（行/流）在同一窗口逐笔相等这件事，现在只剩流一条，所以「双写差值」
-//!   恒为零——不是因为两边算得一样，是因为只剩一份。
+//! 这是 S39 ②「读切换与停写汇总表同一笔」的**过渡态**判据：行还在被写，读者里已经
+//! 有一半切到流上，两边同时活着。判三件：
+//! - 一次 `record()` 加一次 `append()` 之后，行与事件各多一条（少一条就是有一侧停了）；
+//! - 两条路对同一批调用给出的 token 合计相等（`spend_by_actor_since` 走流，
+//!   `usage_by_actor` 走行）；
+//! - 按人聚合等于逐笔求和。
+//!
+//! 停写那一侧要等 16 个读者全部切完才能落——只停写不切读者，配速与会话花费会一起
+//! 读成 0，而没有任何一条现有测试会红（2026-11-22 复核发现的形状）。
 //!
 //! 默认忽略，需要 `COGNEVA_TEST_DATABASE_URL`。
 
@@ -82,7 +86,7 @@ fn call(id: &str, actor: &str, input: u64, output: u64) -> LlmCall {
 
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
-async fn the_rollup_row_is_gone_and_the_stream_answers_the_same_numbers() {
+async fn the_row_and_the_event_carry_the_same_numbers() {
     let url = database_url();
     let schema = own_schema(&url, "rollup_gone").await;
     let pool = schema_pool(&url, &schema).await;
@@ -106,24 +110,42 @@ async fn the_rollup_row_is_gone_and_the_stream_answers_the_same_numbers() {
             .expect("the event");
     }
 
-    // 一：汇总表里没有新行——那一侧停了。
+    // 一：两侧各多三条——少一条就是有一侧停了。
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM gateway_llm_usage")
         .fetch_one(&pool)
         .await
         .expect("count the rollup");
-    assert_eq!(rows, 0, "汇总表还在被写：停写没做到");
+    assert_eq!(
+        rows, 3,
+        "三次调用应当落下三行：停写与读切换必须同一笔，只做一半就是两侧各说各的"
+    );
+    let events: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cogneva_event WHERE kind = 'llm_call'")
+            .fetch_one(&pool)
+            .await
+            .expect("count the stream");
+    assert_eq!(events, 3, "三次调用应当落下三条事件");
 
-    // 二：流答出同样的数——按人聚合等于逐笔求和。
+    // 二：两条路对同一批调用给出同一个合计；按人聚合等于逐笔求和。
     let since = chrono::Utc::now().timestamp() - 60;
     let (total, by_actor) = usage
         .spend_by_actor_since(since)
         .await
-        .expect("read by actor");
-    assert_eq!(total, 90, "三笔各 30 token，合计不对");
+        .expect("read by actor (stream)");
+    assert_eq!(total, 90, "三笔各 30 token，流上的合计不对");
     assert_eq!(by_actor.get("gone-a"), Some(&90));
 
-    // 三：双写差值恒为零——不是两边算得一样，是只剩一份。
-    assert_eq!(rows, 0, "同一件事只剩流这一份");
+    let row_tokens: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(tokens_input + tokens_output), 0)::BIGINT FROM gateway_llm_usage",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("sum the rows");
+    assert_eq!(
+        row_tokens.max(0) as u64,
+        total,
+        "行与流对同一批调用给出了不同的合计：行 {row_tokens}，流 {total}"
+    );
 
     pool.close().await;
     drop_schema(&url, &schema).await;

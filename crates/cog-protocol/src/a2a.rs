@@ -39,7 +39,6 @@ pub use cog_core::{A2aTask, A2aVersion, MessagePart, TaskArtifact, TaskMessage};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-
 use serde_json::Value;
 
 /// JSON-RPC 的请求 id。对端原样回填，本客户端不靠它匹配回包（一次调用一次
@@ -255,8 +254,7 @@ impl A2aClient {
         let req = self.prepared(
             cog_core::HttpRequest::post(agent_url)
                 .json(&body)
-                .map_err(|e| anyhow::anyhow!("JSON serialization failed: {}", e))?
-                ,
+                .map_err(|e| anyhow::anyhow!("JSON serialization failed: {}", e))?,
             version,
         );
         let resp = self

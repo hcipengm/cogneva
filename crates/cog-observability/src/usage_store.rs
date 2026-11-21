@@ -722,12 +722,61 @@ impl LlmUsageStore {
     }
 
     pub async fn record(&self, r: &LlmUsageRecord) -> anyhow::Result<()> {
-        // **停写汇总表**（S39 ②）：这次调用的事实由写入口作为 `llm_call` 事件落流，
-        // 行只是它的投影。两处都写等于两份正本，口径一变就得回填，而流可以重算。
-        //
-        // 保留这个函数的形状是给调用方一条「记录这次调用」的入口：它现在只核一下
-        // 上游必填项，不做存储。存储失败也不再可能——没有存储。
-        let _ = r;
+        // **这一行仍是「这次调用花了多少」的读面**（S39 ②）。事件流是正本，但把行换成
+        // 一份投影要两步同一笔：读者全切到流上，与停写这一侧。只停了写、没切完读者，
+        // 配速、会话花费、按任务花费会一起读成 0——2026-11-22 复核发现 16 个读者仍在
+        // 读这张表，于是把停写退回来，等读切换做完再一起停。两条路给出的数由
+        // `the_rollup_is_gone_test` 逐笔对照，谁先漂一眼就看得见。
+        let pace_upstreams = r
+            .pace
+            .as_ref()
+            .and_then(|p| serde_json::to_string(&p.upstreams).ok());
+        sqlx::query(
+            r#"
+            INSERT INTO gateway_llm_usage
+                (id, upstream, api_style, model, result, actor, origin,
+                 tokens_input, tokens_output, tokens_cached, tokens_cache_created,
+                 estimated_input, task_id, latency_ms, refusal_kind, retry_after_secs,
+                 pace_measured_upstreams, pace_allowance_tokens, pace_spent_tokens,
+                 pace_reserve_tokens, pace_window_start_unix, pace_upstreams,
+                 usage_outcome, owner_id, refused_scope, cost_micros, price_book,
+                 tokens_reasoning, session_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                    $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27,
+                    $28, $29)
+            "#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(&r.upstream)
+        .bind(&r.api_style)
+        .bind(&r.model)
+        .bind(&r.result)
+        .bind(&r.actor)
+        .bind(&r.origin)
+        .bind(r.tokens_input as i64)
+        .bind(r.tokens_output as i64)
+        .bind(r.tokens_cached as i64)
+        .bind(r.tokens_cache_created.map(|n| n as i64))
+        .bind(r.estimated_input.map(|v| v as i64))
+        .bind(r.task.as_deref())
+        .bind(r.latency_ms as i64)
+        .bind(r.refusal_kind.as_deref())
+        .bind(r.retry_after_secs.map(|v| v as i64))
+        .bind(r.pace.as_ref().map(|p| p.measured_upstreams as i32))
+        .bind(r.pace.as_ref().map(|p| p.allowance_tokens as i64))
+        .bind(r.pace.as_ref().map(|p| p.spent_tokens as i64))
+        .bind(r.pace.as_ref().map(|p| p.reserve_tokens as i64))
+        .bind(r.pace.as_ref().map(|p| p.window_start_unix))
+        .bind(pace_upstreams)
+        .bind(r.usage_outcome.map(|o| o.as_str()))
+        .bind(r.owner.as_deref())
+        .bind(r.refused_scope.as_deref())
+        .bind(r.cost_micros)
+        .bind(r.price_book.as_deref())
+        .bind(r.tokens_reasoning.map(|n| n as i64))
+        .bind(r.session.as_deref())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

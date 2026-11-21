@@ -11,8 +11,6 @@ use crate::{
     model::Model, AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions, Usage,
 };
 
-
-
 pub struct OllamaProvider {
     client: Option<Arc<dyn cog_core::HttpClient>>,
     model: Model,
@@ -156,8 +154,7 @@ impl LLMProvider for OllamaProvider {
                 .header("Content-Type", cog_core::CONTENT_TYPE_JSON)
                 .json(&body)
                 .map_err(|e| SFError::Agent(format!("JSON serialization failed: {}", e)))
-                .unwrap()
-                ;
+                .unwrap();
 
             let http_response = match client.execute_stream(req).await {
                 Ok(r) => r,
@@ -500,8 +497,7 @@ impl LLMProvider for OllamaProvider {
             Some(c) => c,
             None => return false,
         };
-        let req = cog_core::HttpRequest::get(format!("{}/api/tags", self.model.base_url))
-            ;
+        let req = cog_core::HttpRequest::get(format!("{}/api/tags", self.model.base_url));
         match client.execute(req).await {
             Ok(r) => r.is_success(),
             Err(e) => {
