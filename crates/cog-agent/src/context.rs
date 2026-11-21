@@ -73,7 +73,10 @@ pub struct FoldPlan {
 /// 头部边界由调用方给：`head` 是 system 与目标那几条的条数（运行时会保证它们在最前）。
 /// 尾部从后往前攒到 `tail_tokens` 为止，攒不够就一条都不折。
 pub fn plan_fold(message_tokens: &[usize], head: usize, tail_tokens: usize) -> Option<FoldPlan> {
-    if message_tokens.len() <= head {
+    // `tail_tokens == 0` 是**量不到**那次往返：没有读数支撑的尾长会切掉刚刚发生的事。
+    // 缺了这一句，循环第一次就把最后一条算进尾巴（`tail >= 0` 恒真），于是「没量到」
+    // 被当成「尾长很小」，折掉了一整段中间。
+    if message_tokens.len() <= head || tail_tokens == 0 {
         return None;
     }
     let mut tail = 0usize;
