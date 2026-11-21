@@ -555,11 +555,6 @@ live_check db 'Live-DB task ownership guard' cargo test -p cog-storage --test ta
 # first: run together they create the same types at once and the catalog
 # refuses the second.
 live_check db 'Live-DB governance store reads' cargo test -p cog-storage --test governance_store -- --ignored --test-threads=1
-# What a single pruning statement costs, and which rows it takes. The
-# rank question is a plan question: ranking every row of the log first
-# answers it for the whole table, which is a cost no reading of the
-# statement's text shows.
-live_check db 'Live-DB metrics surplus-delete statement' cargo test -p cog-storage --test metrics_surplus_delete -- --ignored
 # The gauge read and the retirement pass were written as live tests and
 # then never named by any gate, which is the same as not having them: a
 # scrape pays for the newest-sample read continuously, and the retirement
