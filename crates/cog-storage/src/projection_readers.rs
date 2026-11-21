@@ -46,7 +46,7 @@ pub const PROJECTION_READERS: &[ProjectionReader] = &[
         table: "cog_metric_counter_totals",
         reader: "crates/cog-storage/src/postgres/metrics_backend.rs",
         why_not_the_source: "这一行是被观测的进程自己累加的数，真源是 Prometheus 里那条序列；从真源读一次要走一趟网络、并且 Prometheus 不在时读不到，而屏上的每一次刷新都在问它。库里的这一份是投影，用 `cogneva rebuild-metric-projections` 可以按真源整表重写。",
-        rebuilt_from: "Prometheus 里 `<name>_total` 那条序列（进程累加、由观测面保存）",
+        rebuilt_from: "Prometheus 里 `<name>_total` 那条序列",
         rebuild: "crates/cog-observability/src/metric_projection.rs",
         rebuild_test: "crates/cog-storage/tests/metric_projections_rebuild_from_prometheus.rs",
     },

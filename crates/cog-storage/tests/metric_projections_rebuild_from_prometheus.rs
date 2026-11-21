@@ -114,6 +114,17 @@ async fn the_three_metric_projections_rebuild_from_the_source() {
     .await
     .expect("the stale row is written");
 
+    // 重建**从表里读名字**问真源：直方图那一族要有名字才会被问。这里放一条旧的
+    // 和值，既给名字，也让「整表重写」这一格有东西可换掉。
+    sqlx::query(
+        "INSERT INTO cog_metric_histogram_sums (name, labels, upstream, as_of, sum) \
+         VALUES ($1, '{}', NULL, NOW(), 999)",
+    )
+    .bind(HISTOGRAM)
+    .execute(&pool)
+    .await
+    .expect("the histogram name is present");
+
     let http: Arc<dyn HttpClient> = Arc::new(FakePrometheus);
     let report = rebuild(
         &pool,
