@@ -1125,8 +1125,24 @@ impl LlmUsageStore {
         &self,
         since_unix: i64,
     ) -> anyhow::Result<(u64, std::collections::BTreeMap<String, u64>)> {
-        // 读切换（S39 ②）：正本是事件流，行是它的投影。
-        self.spend_by_actor_since_from_stream(since_unix).await
+        let rows = sqlx::query(&format!(
+            "SELECT actor, COALESCE(SUM(tokens_input + tokens_output), 0)::BIGINT AS tokens
+               FROM {LEDGER_TABLE}
+              WHERE ts >= to_timestamp($1::DOUBLE PRECISION)
+              GROUP BY actor
+              ORDER BY actor"
+        ))
+        .bind(since_unix as f64)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut by_actor = std::collections::BTreeMap::new();
+        let mut total = 0u64;
+        for row in &rows {
+            let tokens = row.get::<i64, _>("tokens").max(0) as u64;
+            total = total.saturating_add(tokens);
+            by_actor.insert(row.get::<String, _>("actor"), tokens);
+        }
+        Ok((total, by_actor))
     }
 
     /// 一次批量调用花掉的 token：按 `batch_id` 把同批的调用事实加起来。
@@ -1146,9 +1162,7 @@ impl LlmUsageStore {
         .bind(batch_id)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .first()
-            .and_then(|(_, tokens)| tokens.map(|t| t.max(0) as u64)))
+        Ok(rows.first().and_then(|(_, tokens)| tokens.map(|t| t.max(0) as u64)))
     }
 
     /// 同一个读数，**从事件流算**：读切换的第一条，按 kind 扫 `cogneva_event`。
@@ -1375,8 +1389,36 @@ impl LlmUsageStore {
         &self,
         since_unix: i64,
     ) -> anyhow::Result<Vec<(String, u64)>> {
-        // 读切换（S39 ②）：正本是事件流，行是它的投影。
-        self.spend_by_person_since_from_stream(since_unix).await
+        let rows = sqlx::query(&format!(
+            "SELECT person, SUM(tokens)::BIGINT AS tokens FROM (
+                 SELECT COALESCE(NULLIF(u.owner_id, ''), t.person) AS person,
+                        (u.tokens_input + u.tokens_output) AS tokens
+                   FROM {LEDGER_TABLE} u
+                   LEFT JOIN LATERAL (
+                        SELECT NULLIF(d.submitted_by, '') AS person
+                          FROM {TASK_GRAPH_TABLE} d
+                         WHERE d.task_id = u.task_id
+                         ORDER BY d.rev DESC
+                         LIMIT 1
+                   ) t ON TRUE
+                  WHERE u.ts >= to_timestamp($1::DOUBLE PRECISION)
+             ) s
+             WHERE person IS NOT NULL
+             GROUP BY person
+             ORDER BY person"
+        ))
+        .bind(since_unix as f64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("person"),
+                    row.get::<i64, _>("tokens").max(0) as u64,
+                )
+            })
+            .collect())
     }
 
     /// 同一读数，**从事件流算**：按人汇总。
@@ -1435,9 +1477,30 @@ impl LlmUsageStore {
         task_ids: &[String],
         since_unix: i64,
     ) -> anyhow::Result<Vec<(String, u64)>> {
-        // 读切换（S39 ②）：正本是事件流，行是它的投影。
-        self.spend_by_task_since_from_stream(task_ids, since_unix)
-            .await
+        if task_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(&format!(
+            "SELECT task_id, COALESCE(SUM(tokens_input + tokens_output), 0)::BIGINT AS tokens
+               FROM {LEDGER_TABLE}
+              WHERE task_id = ANY($1)
+                AND ts >= to_timestamp($2::DOUBLE PRECISION)
+              GROUP BY task_id
+              ORDER BY task_id"
+        ))
+        .bind(task_ids)
+        .bind(since_unix as f64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("task_id"),
+                    row.get::<i64, _>("tokens").max(0) as u64,
+                )
+            })
+            .collect())
     }
 
     /// 同一读数，**从事件流算**：按任务汇总。
@@ -1536,8 +1599,36 @@ impl LlmUsageStore {
         &self,
         since_unix: i64,
     ) -> anyhow::Result<Vec<(String, u64)>> {
-        // 读切换（S39 ②）：正本是事件流，行是它的投影。
-        self.spend_by_workspace_since_from_stream(since_unix).await
+        let rows = sqlx::query(&format!(
+            "SELECT workspace_id, SUM(tokens)::BIGINT AS tokens FROM (
+                 SELECT t.workspace_id AS workspace_id,
+                        (u.tokens_input + u.tokens_output) AS tokens
+                   FROM {LEDGER_TABLE} u
+                   JOIN LATERAL (
+                        SELECT d.workspace_id
+                          FROM {TASK_GRAPH_TABLE} d
+                         WHERE d.task_id = u.task_id
+                         ORDER BY d.rev DESC
+                         LIMIT 1
+                   ) t ON TRUE
+                  WHERE u.ts >= to_timestamp($1::DOUBLE PRECISION)
+             ) s
+             WHERE workspace_id IS NOT NULL AND workspace_id <> ''
+             GROUP BY workspace_id
+             ORDER BY workspace_id"
+        ))
+        .bind(since_unix as f64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("workspace_id"),
+                    row.get::<i64, _>("tokens").max(0) as u64,
+                )
+            })
+            .collect())
     }
 
     /// 同一读数，**从事件流算**：按工作区汇总。
