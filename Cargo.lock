@@ -1878,6 +1878,7 @@ dependencies = [
  "chrono",
  "clap",
  "cog-core",
+ "cog-observability",
  "cog-test-support",
  "etcd-client",
  "futures",

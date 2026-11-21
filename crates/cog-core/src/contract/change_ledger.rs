@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::contract::live_revision::LiveRevision;
 use crate::SFResult;
 
 /// What is outstanding about one named artifact.
@@ -701,6 +702,64 @@ impl ChangeLedgerRow {
     /// false, with nothing left behind to go stale.
     pub fn holds_the_line(&self) -> bool {
         self.delivered_rev.is_some() && self.state.is_outstanding() && self.retire_reason.is_none()
+    }
+
+    /// 这一行做到哪一步了：三格（代码 / 上线 / 验证）。
+    ///
+    /// 状态词（`landed` / `pending` / …）只回答一个问题，而「做完了没有」是三个：
+    /// **树里有没有实现**、**跑着的那一版有没有它**、**判据对着真东西量过没有**。
+    /// 一个 `landed` 把前两个混在一起，读的人于是把「diff 进了主线」当成「线上有」。
+    ///
+    /// 三格都由行自己的事实与那一刻的现网读数算出来，谁也不能被写进来：
+    ///
+    /// - `code`：有 `delivered_rev`（一次 diff 到了主线）或 `state == Landed`
+    ///   （判据在树上为真）。两者都是「树里有」。
+    /// - `live`：现网 revision 是可命名的，而且**这一次量就是在那个 revision 上做的**
+    ///   （`measured_rev == live`）。少这一条，一个几小时前在别的 revision 上做的量
+    ///   会被读成「线上有」。
+    /// - `verified`：`landed_at` 有值——有一次量判它为真。`measured_at` 不够：它只说
+    ///   「有人看过」，看的结果可能是没落。
+    pub fn cells(&self, live: &LiveRevision) -> ChangeCells {
+        let code = self.delivered_rev.is_some() || self.state == ChangeState::Landed;
+        let live_filled = match (live.known(), self.measured_rev.as_deref()) {
+            (Some(running), Some(measured)) => running == measured,
+            _ => false,
+        };
+        ChangeCells {
+            code,
+            live: live_filled,
+            verified: self.landed_at.is_some(),
+        }
+    }
+}
+
+/// 一件变更的三格：每一格「填了没有」。
+///
+/// 填了不等于好——它只说这一步有证据。判「终态」与「红了」的是
+/// [`ChangeCells::is_terminal`] 与 [`ChangeCells::unverified`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeCells {
+    /// 树里有实现。
+    pub code: bool,
+    /// 跑着的那一版里有它。
+    pub live: bool,
+    /// 判据对着真东西量过，而且为真。
+    pub verified: bool,
+}
+
+impl ChangeCells {
+    /// 终态：三格都填。这就是「做完了」——台账上的 `已落` 与它同义。
+    pub fn is_terminal(&self) -> bool {
+        self.code && self.live && self.verified
+    }
+
+    /// **写着做完了、却没有量过**：代码那一格填了，验证那一格空着。
+    ///
+    /// 这一条是红的判据，而不是「进度不足」：一个 `landed` 而没有一次量的行，读作
+    /// 「这件事成了」，而它实际说的是「有人改过、没人核过」。两件事在账面上同形，
+    /// 差别只在这一格。
+    pub fn unverified(&self) -> bool {
+        self.code && !self.verified
     }
 }
 
@@ -2457,5 +2516,111 @@ mod tests {
         row.delivered_rev = Some("abc123".into());
         row.state = ChangeState::Landed;
         assert!(!row.holds_the_line(), "a landed change holds nothing");
+    }
+
+    use crate::contract::live_revision::LiveRevisionGap;
+
+    fn cells_fixture() -> ChangeLedgerRow {
+        ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "crates/", "x"),
+            state: ChangeState::Landed,
+            title: None,
+            assertion: None,
+            sources: Vec::new(),
+            first_seen_at: Utc::now(),
+            measured_at: None,
+            measured_rev: None,
+            delivered_rev: Some("abc123".into()),
+            landed_at: None,
+            unsettled_reason: None,
+            retire_reason: None,
+            retired_at: None,
+        }
+    }
+
+    /// 代码那一格：`landed` 或有一次交付都算「树里有」。
+    #[test]
+    fn the_code_cell_is_filled_by_landing_or_by_a_delivered_diff() {
+        let mut row = cells_fixture();
+        assert!(
+            row.cells(&LiveRevision::Unmeasurable(
+                LiveRevisionGap::ClusterUnreadable
+            ))
+            .code
+        );
+        row.state = ChangeState::Pending;
+        assert!(
+            row.cells(&LiveRevision::Unmeasurable(
+                LiveRevisionGap::ClusterUnreadable
+            ))
+            .code
+        );
+        row.delivered_rev = None;
+        assert!(
+            !row.cells(&LiveRevision::Unmeasurable(
+                LiveRevisionGap::ClusterUnreadable
+            ))
+            .code
+        );
+    }
+
+    /// 上线那一格：现网 revision 命得出名字，而且**这一次量就是在它上面做的**。
+    /// 一条几小时前在别的 revision 上做的量，不能读成「线上有」。
+    #[test]
+    fn the_live_cell_needs_a_measurement_taken_on_the_running_revision() {
+        let mut row = cells_fixture();
+        let running = LiveRevision::Known("abc123".into());
+        row.measured_rev = Some("abc123".into());
+        assert!(row.cells(&running).live);
+
+        row.measured_rev = Some("older".into());
+        assert!(
+            !row.cells(&running).live,
+            "别的 revision 上的量不是「线上有」"
+        );
+
+        row.measured_rev = Some("abc123".into());
+        assert!(
+            !row.cells(&LiveRevision::Unmeasurable(
+                LiveRevisionGap::NoUnanimousMainTag
+            ))
+            .live,
+            "命名不出现网 revision 时，这一格不能填"
+        );
+    }
+
+    /// 验证那一格：有一次量判它为真。`measured_at` 不够——它只说有人看过。
+    #[test]
+    fn the_verified_cell_is_a_measurement_that_found_it_true() {
+        let mut row = cells_fixture();
+        let running = LiveRevision::Known("abc123".into());
+        row.measured_rev = Some("abc123".into());
+        assert!(!row.cells(&running).verified);
+        assert!(
+            row.cells(&running).unverified(),
+            "落了但没量过：这一行是红的那个形状"
+        );
+
+        row.landed_at = Some(Utc::now());
+        assert!(row.cells(&running).verified);
+        assert!(row.cells(&running).is_terminal());
+        assert!(!row.cells(&running).unverified());
+    }
+
+    /// 终态是三格齐，不是两格。少任何一格都不是「做完」。
+    #[test]
+    fn terminal_needs_all_three_cells() {
+        let running = LiveRevision::Known("abc123".into());
+        let mut row = cells_fixture();
+        row.measured_rev = Some("abc123".into());
+        row.landed_at = Some(Utc::now());
+        assert!(row.cells(&running).is_terminal());
+
+        row.measured_rev = None;
+        assert!(!row.cells(&running).is_terminal(), "缺上线格不是终态");
+        assert!(
+            !row.cells(&running).unverified(),
+            "缺的不是验证格，不该判红"
+        );
     }
 }
