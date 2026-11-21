@@ -58,7 +58,7 @@ async fn suspect_agent_transitioned_to_suspect() {
     // "From" is read before the CAS; read after and it is already the target,
     // so every row of this log would read Suspect -> Suspect and the frame on
     // the bus would report a transition out of a state the agent never held.
-    assert_eq!(result.transitioned[0].1, AgentState::Active);
+    assert_eq!(result.transitioned[0].1, Some(AgentState::Active));
     assert_eq!(result.transitioned[0].2, AgentState::Suspect);
 
     let state = backend.get_agent_state("a-1").await.unwrap();

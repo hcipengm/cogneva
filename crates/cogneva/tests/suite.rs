@@ -154,6 +154,8 @@ mod a_shared_query_is_spelt_once_test;
 mod a_successful_write_rings_the_bell;
 #[path = "a_tool_that_changes_things_asks_the_person_first_test.rs"]
 mod a_tool_that_changes_things_asks_the_person_first_test;
+#[path = "a_transition_nobody_could_read_is_not_judged_against_a_made_up_state_test.rs"]
+mod a_transition_nobody_could_read_is_not_judged_against_a_made_up_state_test;
 #[path = "a_waiting_reason_is_declared_once_test.rs"]
 mod a_waiting_reason_is_declared_once_test;
 #[path = "a_word_written_out_is_the_word_read_back_test.rs"]

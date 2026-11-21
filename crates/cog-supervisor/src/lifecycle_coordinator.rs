@@ -21,8 +21,12 @@ use cog_core::{AgentEvent, HealthIssue, SupervisorEvent};
 /// Outcome of a single lifecycle coordination pass.
 #[derive(Debug, Clone, Default)]
 pub struct LifecycleReport {
-    /// Agents whose state was successfully transitioned.
-    pub transitioned: Vec<(String, AgentState, AgentState)>,
+    /// Agents whose state was successfully transitioned: `(agent, from, to)`.
+    ///
+    /// `from` is `None` when the state could not be read before the CAS. That
+    /// is not the same reading as `Some(Init)`, and a report that printed
+    /// `Active` here said something nobody measured.
+    pub transitioned: Vec<(String, Option<AgentState>, AgentState)>,
     /// Agents where the transition failed (concurrent change or invalid).
     pub failed: Vec<(String, String)>,
     /// Checkpoints recovered for task handoff (dead agents).
@@ -104,11 +108,10 @@ impl LifecycleCoordinator {
             // Read "from" *before* the CAS, like the other two branches do:
             // read afterwards and the stored state is already the target, so
             // this row would always say Suspect -> Suspect and the frame would
-            // report a transition from a state the agent was never in.
-            let prev = self
-                .previous_state(agent_id)
-                .await
-                .unwrap_or(AgentState::Active);
+            // report a transition from a state the agent was never in. And when
+            // the read fails, the row and the frame say so (`None` / "unknown")
+            // rather than filling in `Active`, which no one measured.
+            let prev = self.previous_state(agent_id).await;
             if let Err(e) = self
                 .transition_if_allowed(agent_id, AgentState::Suspect)
                 .await
@@ -127,10 +130,7 @@ impl LifecycleCoordinator {
 
         // Dead -> Dead + checkpoint recovery
         for (agent_id, issue) in &report.dead {
-            let prev = self
-                .previous_state(agent_id)
-                .await
-                .unwrap_or(AgentState::Active);
+            let prev = self.previous_state(agent_id).await;
             if let Err(e) = self.transition_if_allowed(agent_id, AgentState::Dead).await {
                 out.failed.push((agent_id.clone(), e));
             } else {
@@ -178,10 +178,7 @@ impl LifecycleCoordinator {
         // Stuck -> Suspect (stuck is a sub-class of unhealthy; we mark Suspect
         // so the operator / automated system can decide whether to kill).
         for (agent_id, issue) in &report.stuck {
-            let prev = self
-                .previous_state(agent_id)
-                .await
-                .unwrap_or(AgentState::Active);
+            let prev = self.previous_state(agent_id).await;
             if let Err(e) = self
                 .transition_if_allowed(agent_id, AgentState::Suspect)
                 .await
@@ -208,13 +205,20 @@ impl LifecycleCoordinator {
         agent_id: &str,
         target: AgentState,
     ) -> Result<(), String> {
-        let current = self
-            .state_backend
-            .get_agent_state(agent_id)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or(AgentState::Init);
+        // A failed read is not `Init`. Judging the transition against a state
+        // nobody read puts a made-up "from" into the refusal ("invalid
+        // transition Init -> Suspect") and sends the reader looking for a
+        // state-machine bug while the store is the thing that did not answer.
+        let current = match self.state_backend.get_agent_state(agent_id).await {
+            Ok(Some(state)) => state,
+            Ok(None) => AgentState::Init,
+            Err(e) => {
+                return Err(format!(
+                    "could not read the state of agent {} (so no transition was judged): {}",
+                    agent_id, e
+                ))
+            }
+        };
 
         if !Self::is_valid_transition(current, target) {
             return Err(format!(
@@ -231,14 +235,18 @@ impl LifecycleCoordinator {
             .map_err(|e| e.to_string())?;
 
         if !swapped {
-            // Re-read and retry once.
-            let current = self
-                .state_backend
-                .get_agent_state(agent_id)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or(AgentState::Init);
+            // Re-read and retry once; same rule as the first read: an
+            // unreadable state is named, not turned into `Init`.
+            let current = match self.state_backend.get_agent_state(agent_id).await {
+                Ok(Some(state)) => state,
+                Ok(None) => AgentState::Init,
+                Err(e) => {
+                    return Err(format!(
+                        "could not re-read the state of agent {} (so no transition was judged): {}",
+                        agent_id, e
+                    ))
+                }
+            };
             if !Self::is_valid_transition(current, target) {
                 return Err(format!(
                     "invalid transition {:?} -> {:?} for agent {} (retry)",
@@ -283,7 +291,7 @@ impl LifecycleCoordinator {
     /// refused: a frame that says an agent went Suspect while the store still
     /// holds Active would put the screen and the state machine in disagreement,
     /// with the screen as the optimistic one.
-    fn announce_transition(&self, agent_id: &str, from: AgentState, to: AgentState) {
+    fn announce_transition(&self, agent_id: &str, from: Option<AgentState>, to: AgentState) {
         let Some(tx) = self.agent_events.as_ref() else {
             return;
         };
@@ -292,7 +300,11 @@ impl LifecycleCoordinator {
         let agent = self.registry.get_agent(agent_id);
         let event = AgentEvent::StateChange {
             agent_id: agent_id.to_string(),
-            from: wire_state(from).to_string(),
+            // "unknown" when the read before the CAS failed: a frame that names
+            // `active` here would be reporting a state nobody read, and a
+            // reader comparing the roster against the store would be told the
+            // agent moved out of a state it may never have held.
+            from: from.map(wire_state).unwrap_or("unknown").to_string(),
             to: wire_state(to).to_string(),
             crew_id: agent.as_ref().and_then(|a| a.crew_id.clone()),
             squad_id: agent.as_ref().and_then(|a| a.squad_id.clone()),
