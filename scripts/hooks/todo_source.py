@@ -49,6 +49,9 @@ def parse_cells(text: str) -> dict[str, str]:
     存在的全部意义是让机器判得出终态，猜出来的终态与没有终态是一样的。
     """
     hits = list(_CELL_RE.finditer(text))
+    # `判据读数: test = 文件::函数` 就是 `代码` 那一格的正式写法：读数由程序判，
+    # 不由人写。两个名字并存会让 family 看不到格、edit-reading 看得到——同一件事
+    # 两个答案（2026-11-21 实测：49 条全真而 family 报 32 条缺格）。
     cells: dict[str, str] = {}
     for index, hit in enumerate(hits):
         stop = hits[index + 1].start() if index + 1 < len(hits) else len(text)
@@ -57,6 +60,10 @@ def parse_cells(text: str) -> dict[str, str]:
         value = re.split(r"[|｜]", value)[0].strip().strip("｜|").strip()
         if value and hit.group(1) not in cells:
             cells[hit.group(1)] = value
+    # 一个名字：读数就是代码格。`test = ...` 的读数算作代码格已填。
+    reading = re.search(r"判据读数\s*:\s*([^｜|]+)", text)
+    if reading and "代码" not in cells:
+        cells["代码"] = reading.group(1).strip()
     return cells
 
 
