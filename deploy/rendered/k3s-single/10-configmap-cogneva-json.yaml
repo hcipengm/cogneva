@@ -410,6 +410,8 @@ data:
         "ready_task_poll_interval_secs": 5,
         "batch_persistence_enabled": false,
         "archive_enabled": true,
+        "archive_after_secs": 172800,
+        "_comment_archive_after_secs": "终态行在内存里保留多久才归档到对象存储：172800 秒（两天），与代码里 default_archive_after_secs 一致。它必须长于一次重驱动要等的那段（重启窗口），否则被归档的行读成「没有这件任务」，重驱动永远不会发生。",
         "_comment_ready_task_poll_interval_secs": "空闲时多久问一次「有没有就绪任务」。读侧把 0 夹到 1 秒（`.max(1)`），那等于常态忙轮询；5 秒是「就绪到被取走」的可接受延迟与空转代价之间的那一档。"
       },
       "gateway": {
