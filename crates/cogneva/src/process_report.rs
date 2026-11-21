@@ -116,13 +116,46 @@ impl Reporter {
         if processes.is_empty() {
             return;
         }
+        self.push(container_id, processes).await;
+    }
+
+    /// 这一拍的自报。发送与它的失败判词收在 [`push_report`] 里：测试要能直接喂一份
+    /// 读数进来，而不是先造一个 cgroup 与一整棵 `/proc`。
+    async fn push(&self, container_id: String, processes: Vec<ReportedProcess>) {
         let body = ReportBody {
             pod: self.pod.clone(),
             container_id,
             processes,
         };
-        // 报不上去不是这个进程的事：下一拍再说。
-        let _ = self.client.post(&self.url).json(&body).send().await;
+        push_report(&self.client, &self.url, &body).await;
+    }
+}
+
+/// 把一份自报推上去；推不上去要说出来。
+///
+/// 每一拍的章在发送**之前**就盖了（断章要说的是「循环停了」），所以一次持续失败的
+/// 推送在活体面上永远看不见：循环好好活着，屏上那一格只是冻在上一份读数上，而
+/// 「没有新读数」与「容器里一直就这些进程」从外面看一模一样。至少留下一句话，说出
+/// 这一拍没上去、以及为什么。
+///
+/// 报不上去仍然不是这个进程的事：这里只说不抛出，下一拍照报。
+pub(crate) async fn push_report<T: serde::Serialize>(
+    client: &reqwest::Client,
+    url: &str,
+    body: &T,
+) {
+    match client.post(url).json(body).send().await {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => tracing::warn!(
+            url,
+            status = %resp.status(),
+            "自报被拒收：这一拍没上去，屏上那一格停在上一份读数上"
+        ),
+        Err(error) => tracing::warn!(
+            url,
+            error = %error,
+            "自报没发出去：这一拍没上去，屏上那一格停在上一份读数上"
+        ),
     }
 }
 
@@ -258,6 +291,82 @@ mod tests {
                 .iter()
                 .all(|p| p.pid > 0 && !p.command.trim().is_empty()),
             "每一行都读全了才算"
+        );
+    }
+}
+
+#[cfg(test)]
+mod push_tests {
+    use super::*;
+    use crate::test_support::{serve_status, WarnText};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    fn reporter(url: String) -> Reporter {
+        Reporter {
+            pod: "pod-a".into(),
+            url,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    fn one_process() -> ReportedProcess {
+        ReportedProcess {
+            pid: 7,
+            parent_pid: 1,
+            command: "sleep".into(),
+            rss_bytes: 4096,
+        }
+    }
+
+    /// 对端收下了：什么都不说，这是常态。
+    #[tokio::test]
+    async fn an_accepted_push_says_nothing() {
+        let (base, server) = serve_status(200).await;
+        let warns = WarnText::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(warns.clone()));
+        reporter(base)
+            .push("c0ntainer".into(), vec![one_process()])
+            .await;
+        assert!(warns.said().is_empty(), "{:?}", warns.said());
+        server.abort();
+    }
+
+    /// 对端拒收：这一拍没上去。章已经盖过，所以活体面上看不出来，必须有一句话。
+    #[tokio::test]
+    async fn a_refused_push_says_the_window_did_not_land() {
+        let (base, server) = serve_status(500).await;
+        let warns = WarnText::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(warns.clone()));
+        reporter(base)
+            .push("c0ntainer".into(), vec![one_process()])
+            .await;
+        let said = warns.said();
+        assert!(
+            said.iter().any(|m| m.contains("没上去")),
+            "被拒收的一拍没有在日志里留下痕迹：{said:?}"
+        );
+        server.abort();
+    }
+
+    /// 根本发不出去（对端不在）：同一句话，带上原因。
+    #[tokio::test]
+    async fn a_push_that_cannot_reach_its_host_says_the_window_did_not_land() {
+        // 绑一个端口再放掉：这个地址上没有人在听。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let warns = WarnText::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(warns.clone()));
+        reporter(format!("http://{addr}"))
+            .push("c0ntainer".into(), vec![one_process()])
+            .await;
+        let said = warns.said();
+        assert!(
+            said.iter().any(|m| m.contains("没上去")),
+            "发不出去的一拍没有在日志里留下痕迹：{said:?}"
         );
     }
 }

@@ -300,8 +300,9 @@ impl Census {
             node: self.node.trim(),
             reports,
         };
-        // 报不上去不是这个进程的事：下一拍再说。
-        let _ = self.client.post(&self.url).json(&body).send().await;
+        // 报不上去不是这个进程的事：下一拍再说，但这一拍要说出来——章在发送之前
+        // 就盖了，一次持续失败的推送在活体面上与「这台节点上一直就这些容器」同形。
+        crate::process_report::push_report(&self.client, &self.url, &body).await;
     }
 }
 
@@ -430,5 +431,54 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         assert!(root_is_usable(&root).is_ok());
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod push_tests {
+    use super::*;
+    use crate::test_support::{serve_status, WarnText};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    fn census(url: String) -> (Census, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let census = Census {
+            root: dir.path().to_path_buf(),
+            node: "node-a".into(),
+            url,
+            client: reqwest::Client::new(),
+        };
+        (census, dir)
+    }
+
+    /// 对端收下了：什么都不说。
+    #[tokio::test]
+    async fn an_accepted_census_push_says_nothing() {
+        let (base, server) = serve_status(200).await;
+        let warns = WarnText::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(warns.clone()));
+        let (census, _dir) = census(base);
+        census.report_once().await;
+        assert!(warns.said().is_empty(), "{:?}", warns.said());
+        server.abort();
+    }
+
+    /// 对端拒收：这一拍没上去，而章已经盖过——网关那一格的 `process_census_at` 会
+    /// 冻在上一拍上，看着与「这台节点上一直就这些容器」一模一样。必须有这一句话。
+    #[tokio::test]
+    async fn a_refused_census_push_says_the_window_did_not_land() {
+        let (base, server) = serve_status(503).await;
+        let warns = WarnText::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(warns.clone()));
+        let (census, _dir) = census(base);
+        census.report_once().await;
+        let said = warns.said();
+        assert!(
+            said.iter().any(|m| m.contains("没上去")),
+            "被拒收的一拍没有在日志里留下痕迹：{said:?}"
+        );
+        server.abort();
     }
 }
