@@ -872,8 +872,10 @@ async fn handing_a_change_over_here_carries_the_accounts_own_judgement() {
     assert_eq!(anchor.goal_id, task.goal_id, "锚与变更不在同一个项目里");
 
     let acceptance = task.acceptance.join(" ");
+    // 账只有两个状态（`pending` / `landed`）：迁移 121 把 retired 并进了 landed，
+    // 所以判据只能点名 landed。点名一个账上已经没有的终态，那一行永远等不到。
     assert!(
-        acceptance.contains("landed 或 retired") && acceptance.contains("账"),
+        acceptance.contains("landed") && acceptance.contains("账"),
         "判据没有点账上那一行：{acceptance}"
     );
 }
