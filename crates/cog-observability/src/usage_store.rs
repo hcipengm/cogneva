@@ -1091,11 +1091,10 @@ impl LlmUsageStore {
     /// 「这一批没花钱」，而它可能是「这一批没记录」。
     pub async fn tokens_by_batch(&self, batch_id: &str) -> anyhow::Result<Option<u64>> {
         let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
-            "SELECT attributes::jsonb->>'batch_id' AS batch, \
-                    SUM(COALESCE((attributes::jsonb->>'input_tokens')::BIGINT, 0) \
-                      + COALESCE((attributes::jsonb->>'output_tokens')::BIGINT, 0))::BIGINT AS tokens \
+            "SELECT batch_id AS batch, \
+                    SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))::BIGINT AS tokens \
                FROM cogneva_event \
-              WHERE kind = 'llm_call' AND attributes::jsonb->>'batch_id' = $1 \
+              WHERE kind = 'llm_call' AND batch_id = $1 \
               GROUP BY 1",
         )
         .bind(batch_id)
@@ -1121,8 +1120,8 @@ impl LlmUsageStore {
         let rows = sqlx::query(
             "SELECT actor,
                     COALESCE(SUM(
-                        COALESCE((attributes::jsonb->>'input_tokens')::BIGINT, 0)
-                      + COALESCE((attributes::jsonb->>'output_tokens')::BIGINT, 0)
+                        COALESCE((input_tokens)::BIGINT, 0)
+                      + COALESCE((output_tokens)::BIGINT, 0)
                     ), 0)::BIGINT AS tokens
                FROM cogneva_event
               WHERE kind = 'llm_call'
@@ -1344,14 +1343,14 @@ impl LlmUsageStore {
     ) -> anyhow::Result<Vec<(String, u64)>> {
         let rows = sqlx::query(&format!(
             "SELECT person, SUM(tokens)::BIGINT AS tokens FROM (
-                 SELECT COALESCE(NULLIF(e.attributes::jsonb->>'owner', ''), t.person) AS person,
-                        (COALESCE((e.attributes::jsonb->>'input_tokens')::BIGINT, 0)
-                       + COALESCE((e.attributes::jsonb->>'output_tokens')::BIGINT, 0)) AS tokens
+                 SELECT COALESCE(NULLIF(e.owner_name, ''), t.person) AS person,
+                        (COALESCE((e.input_tokens)::BIGINT, 0)
+                       + COALESCE((e.output_tokens)::BIGINT, 0)) AS tokens
                    FROM cogneva_event e
                    LEFT JOIN LATERAL (
                         SELECT NULLIF(d.submitted_by, '') AS person
                           FROM {TASK_GRAPH_TABLE} d
-                         WHERE d.task_id = (e.attributes::jsonb->>'task_id')
+                         WHERE d.task_id = (e.task_id_text)
                          ORDER BY d.rev DESC
                          LIMIT 1
                    ) t ON TRUE
@@ -1406,14 +1405,14 @@ impl LlmUsageStore {
             return Ok(Vec::new());
         }
         let rows = sqlx::query(
-            "SELECT attributes::jsonb->>'task_id' AS task_id,
+            "SELECT task_id_text AS task_id,
                     COALESCE(SUM(
-                        COALESCE((attributes::jsonb->>'input_tokens')::BIGINT, 0)
-                      + COALESCE((attributes::jsonb->>'output_tokens')::BIGINT, 0)
+                        COALESCE((input_tokens)::BIGINT, 0)
+                      + COALESCE((output_tokens)::BIGINT, 0)
                     ), 0)::BIGINT AS tokens
                FROM cogneva_event
               WHERE kind = 'llm_call'
-                AND attributes::jsonb->>'task_id' = ANY($1)
+                AND task_id_text = ANY($1)
                 AND at >= to_timestamp($2::DOUBLE PRECISION)
               GROUP BY 1
               ORDER BY 1",
@@ -1442,13 +1441,13 @@ impl LlmUsageStore {
         &self,
     ) -> anyhow::Result<Vec<cog_core::UpstreamActorSpend>> {
         let rows = sqlx::query(
-            "SELECT attributes::jsonb->>'upstream'  AS upstream,
-                    attributes::jsonb->>'api_style' AS api_style,
+            "SELECT upstream_name  AS upstream,
+                    api_style AS api_style,
                     actor,
-                    COALESCE(SUM(COALESCE((attributes::jsonb->>'input_tokens')::BIGINT, 0)), 0)::BIGINT  AS tokens_input,
-                    COALESCE(SUM(COALESCE((attributes::jsonb->>'output_tokens')::BIGINT, 0)), 0)::BIGINT AS tokens_output,
-                    COALESCE(SUM(COALESCE((attributes::jsonb->>'cached_tokens')::BIGINT, 0)), 0)::BIGINT AS tokens_cached,
-                    SUM((attributes::jsonb->>'cache_created_tokens')::BIGINT)::BIGINT AS tokens_cache_created
+                    COALESCE(SUM(COALESCE((input_tokens)::BIGINT, 0)), 0)::BIGINT  AS tokens_input,
+                    COALESCE(SUM(COALESCE((output_tokens)::BIGINT, 0)), 0)::BIGINT AS tokens_output,
+                    COALESCE(SUM(COALESCE((cached_tokens)::BIGINT, 0)), 0)::BIGINT AS tokens_cached,
+                    SUM((cache_created_tokens)::BIGINT)::BIGINT AS tokens_cache_created
                FROM cogneva_event
               WHERE kind = 'llm_call'
               GROUP BY 1, 2, actor
@@ -1504,13 +1503,13 @@ impl LlmUsageStore {
         let rows = sqlx::query(&format!(
             "SELECT workspace_id, SUM(tokens)::BIGINT AS tokens FROM (
                  SELECT t.workspace_id AS workspace_id,
-                        (COALESCE((e.attributes::jsonb->>'input_tokens')::BIGINT, 0)
-                       + COALESCE((e.attributes::jsonb->>'output_tokens')::BIGINT, 0)) AS tokens
+                        (COALESCE((e.input_tokens)::BIGINT, 0)
+                       + COALESCE((e.output_tokens)::BIGINT, 0)) AS tokens
                    FROM cogneva_event e
                    JOIN LATERAL (
                         SELECT d.workspace_id
                           FROM {TASK_GRAPH_TABLE} d
-                         WHERE d.task_id = (e.attributes::jsonb->>'task_id')
+                         WHERE d.task_id = (e.task_id_text)
                          ORDER BY d.rev DESC
                          LIMIT 1
                    ) t ON TRUE

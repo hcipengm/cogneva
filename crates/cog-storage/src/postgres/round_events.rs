@@ -48,9 +48,7 @@ ON CONFLICT (writer, idempotency_key) DO NOTHING";
 
 /// 当前开着的那一轮：最后一条没有配对 `round_closed` 的开工事件。
 const CURRENT_SQL: &str = "\
-SELECT subject_id, attributes::jsonb->>'ledger_rev' AS ledger_rev, \
-       attributes::jsonb->>'code_rev' AS code_rev, \
-       attributes::jsonb->'batch' AS batch, actor \
+SELECT subject_id, ledger_rev, code_rev, batch, actor \
   FROM cogneva_event o \
  WHERE kind = 'round_opened' \
    AND NOT EXISTS (SELECT 1 FROM cogneva_event c \

@@ -1886,17 +1886,16 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             // 读事件流，不读汇总表：它是正本，且汇总表的写入已经停了（S39 ②）。
             "SELECT to_char((at AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS day, \
                     count(*) AS calls, \
-                    sum(COALESCE((attributes::jsonb->>'input_tokens')::bigint, 0) \
-                      + COALESCE((attributes::jsonb->>'output_tokens')::bigint, 0))::bigint AS tokens, \
-                    count((attributes::jsonb->>'cost_micros')::bigint) AS priced_calls, \
-                    coalesce(sum((attributes::jsonb->>'cost_micros')::bigint), 0)::bigint AS cost_micros, \
-                    count(DISTINCT split_part(attributes::jsonb->>'price_book', '@', 1)) \
-                        FILTER (WHERE (attributes::jsonb->>'cost_micros') IS NOT NULL) AS currencies, \
-                    min(split_part(attributes::jsonb->>'price_book', '@', 1)) \
-                        FILTER (WHERE (attributes::jsonb->>'cost_micros') IS NOT NULL) AS currency \
+                    sum(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))::bigint AS tokens, \
+                    count(cost_micros) AS priced_calls, \
+                    coalesce(sum(cost_micros), 0)::bigint AS cost_micros, \
+                    count(DISTINCT split_part(price_book, '@', 1)) \
+                        FILTER (WHERE cost_micros IS NOT NULL) AS currencies, \
+                    min(split_part(price_book, '@', 1)) \
+                        FILTER (WHERE cost_micros IS NOT NULL) AS currency \
                FROM cogneva_event \
               WHERE kind = 'llm_call' AND at >= $1 \
-                AND attributes::jsonb->>'result' = $2 \
+                AND call_result = $2 \
               GROUP BY 1",
         )
         .bind(since)

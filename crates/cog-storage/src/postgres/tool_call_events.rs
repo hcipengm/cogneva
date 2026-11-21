@@ -114,10 +114,10 @@ fn event_id_for(call_id: &str) -> String {
 /// 载体取正文。这是有意的：一个要解析正文才能回答的读取，会在正文缺失时变成
 /// 「什么都没碰过」，而那正是要防的形状。
 pub const TOOL_CALLS_FOR_WORK_SQL: &str = "\
-SELECT attributes::jsonb->>'path' AS path, at \
+SELECT tool_path AS path, at \
   FROM cogneva_event \
  WHERE kind = 'tool_call' AND unit_of_work = $1 \
-   AND attributes::jsonb->>'path' IS NOT NULL \
+   AND tool_path IS NOT NULL \
  ORDER BY at, subject_id";
 
 #[cfg(test)]
