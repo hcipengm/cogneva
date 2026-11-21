@@ -16,6 +16,7 @@ use sqlx::{PgPool, Row};
 use cog_core::{check as check_envelope, EnvelopeFields, SFError, SFResult};
 
 /// 一批回填的行数。批越小，单条语句持有的锁越短；回填是一次性作业，批数由行数决定。
+// cap: fixed —— 一次 INSERT…SELECT 的载荷，与行数规模无关；它不裁剪任何东西
 const BATCH: i64 = 500;
 
 /// 从行里读一页（按时间正序、按 id 断开），写成事件。返回写了多少条。
