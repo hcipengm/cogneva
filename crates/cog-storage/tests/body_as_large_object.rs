@@ -43,7 +43,8 @@ fn sha256(bytes: &[u8]) -> String {
 
 /// 库里这一段现在多长。封口之前读它，就是「已经到了的字节」。
 async fn object_len(pool: &PgPool, oid: u32) -> i64 {
-    let len: i64 = sqlx::query_scalar("SELECT COALESCE(length(lo_get($1::oid)), 0)")
+    // `length(bytea)` 是 int4：读成 i64 时类型对不上，转一次再读。
+    let len: i64 = sqlx::query_scalar("SELECT COALESCE(length(lo_get($1::oid)), 0)::bigint")
         .bind(oid as i64)
         .fetch_one(pool)
         .await
