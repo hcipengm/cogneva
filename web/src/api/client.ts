@@ -3413,6 +3413,12 @@ export interface TopologyNode {
   memory_requested_bytes: number;
   cpu_used_millicores: number | null;
   memory_used_bytes: number | null;
+  /**
+   * 上面那个用量和里漏了几个 Pod：这一拍还没采到样的那些（刚起来的容器要等
+   * 下一轮）。`null` ＝ 这一面没有用量来源，`0` ＝ 每个 Pod 都量到了。
+   * 不为 0 时那个和是一个下界，不是这台机器的用量。
+   */
+  pods_without_usage: number | null;
   /** Ready / MemoryPressure / DiskPressure …：压力条件为 true 才是坏消息。 */
   conditions: TopologyCondition[];
   /** 这台节点上进程采集器最后一次报到的时刻；`null` ＝ 这台节点上没有采集器。 */

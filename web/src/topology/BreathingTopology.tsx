@@ -732,6 +732,13 @@ function NodeDetail({
         </span>
       </div>
 
+      {node.pods_without_usage != null && node.pods_without_usage > 0 && (
+        <p className="text-[10.5px] text-[var(--muted)]">
+          用量和里少 <span className="mono">{node.pods_without_usage}</span> 个 Pod：这一拍还没采到样，
+          上面那个数是量到的那些加起来，是个下界。
+        </p>
+      )}
+
       {node.census_containers != null && (
         <p className="text-[10.5px] text-[var(--muted)]">
           采集器看到 <span className="mono">{node.census_containers}</span> 个容器

@@ -210,8 +210,17 @@ pub struct NodeView {
     pub cpu_requested_millicores: u64,
     pub memory_requested_bytes: u64,
     /// 节点上所有 Pod 的实际用量之和（来自 metrics-server）。
+    ///
+    /// 和里只装量到的那些 Pod：`None` 是没有用量来源或一个都没量到，不是零。
     pub cpu_used_millicores: Option<u64>,
     pub memory_used_bytes: Option<u64>,
+    /// 上面那个和里**没有**装进去几个 Pod——这一拍它们还没有样（刚起来的容器
+    /// 要等下一轮采集）。
+    ///
+    /// `None` ＝ 这一面根本没有用量来源（没装 metrics-server），这时上面两格本来
+    /// 也是空的；`Some(0)` ＝ 每个 Pod 都量到了，和就是整台机器的用量。两个读法
+    /// 分开写，是因为「没量」和「量了、这台机器就这么闲」要做的处置相反。
+    pub pods_without_usage: Option<usize>,
     /// Ready / MemoryPressure / DiskPressure / PIDPressure。压力条件为真时是坏事，
     /// 与 Pod 的条件语义相反，界面按名字分开解读。
     pub conditions: Vec<ConditionView>,
@@ -250,6 +259,8 @@ pub struct PodView {
     pub node: Option<String>,
     pub cpu_requested_millicores: u64,
     pub memory_requested_bytes: u64,
+    /// 实际用量，各容器之和。`None` ＝ 没有数据源，或这个 Pod 有一个容器这一拍
+    /// 还没量到——后者下和只是个下界，不写成读数。与「用了 0」不是一回事。
     pub cpu_used_millicores: Option<u64>,
     pub memory_used_bytes: Option<u64>,
     /// 这个 Pod 所在节点上的进程采集器最后一次报到的时刻。
@@ -498,17 +509,7 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
     }
 
     if view.usage_source.is_some() {
-        for node in &mut view.nodes {
-            let used: Vec<(u64, u64)> = node
-                .pods
-                .iter()
-                .filter_map(|pod| pod.cpu_used_millicores.zip(pod.memory_used_bytes))
-                .collect();
-            if !used.is_empty() {
-                node.cpu_used_millicores = Some(used.iter().map(|(cpu, _)| cpu).sum());
-                node.memory_used_bytes = Some(used.iter().map(|(_, memory)| memory).sum());
-            }
-        }
+        roll_up_node_usage(&mut view.nodes);
     }
 
     // 入口层：Service 与它解析到的 Endpoint 各读一次集合，按 (命名空间, 名字) 对齐。
@@ -672,14 +673,44 @@ fn service_view(service: &Value, endpoints: Option<&ServiceEndpoints>) -> Option
 
 pub const USAGE_FROM_METRICS: &str = "metrics-server";
 
-/// metrics-server 回的每个 Pod：各容器用量，加总成 Pod 的用量。
+/// 把每个节点上量到的 Pod 用量加成节点用量，并记下这个和里少了几个 Pod。
+///
+/// 少的那几个要说出来：一个刚起来的 Pod 这一拍还没有样，它的用量进不了和。
+/// 不说这句话，节点上那个数读起来就是「这台机器用了这么多」，而它其实是
+/// 「量到的那些加起来是这么多」——两个读法指着相反的动作（放宽 vs 扩容）。
+/// 一个都没量到时和留空，`Some(0)` 才是「这台机器就是这么闲」。
+fn roll_up_node_usage(nodes: &mut [NodeView]) {
+    for node in nodes {
+        let mut without_usage = 0usize;
+        let used: Vec<(u64, u64)> = node
+            .pods
+            .iter()
+            .filter_map(|pod| {
+                let pair = pod.cpu_used_millicores.zip(pod.memory_used_bytes);
+                if pair.is_none() {
+                    without_usage += 1;
+                }
+                pair
+            })
+            .collect();
+        if !used.is_empty() {
+            node.cpu_used_millicores = Some(used.iter().map(|(cpu, _)| cpu).sum());
+            node.memory_used_bytes = Some(used.iter().map(|(_, memory)| memory).sum());
+        }
+        node.pods_without_usage = Some(without_usage);
+    }
+}
+
+/// metrics-server 回的每个 Pod：量到的那些容器的用量。
 ///
 /// 只收容器粒度再自己加，是因为 Pod 那一级只有总数时，读者点进某个容器会看到
 /// 一个和 Pod 对不上的数——两个数并排出现在同一屏，就会有一个被当成错的。
+///
+/// 只装**量到了**的容器：一个容器的 cpu 或 memory 有一格读不出来，它就不在这张
+/// 表里。把读不出来的那格记成 0 会让「这一拍没采到样」变成「只用了 0」，而这两件
+/// 事在格子上同形——读者按后者放心的那个数，正好是他最不该放心的那个。
 #[derive(Debug, Default)]
 struct PodUsage {
-    cpu: u64,
-    memory: u64,
     containers: std::collections::HashMap<String, (u64, u64)>,
 }
 
@@ -716,20 +747,23 @@ fn usage_by_pod(list: &Value) -> std::collections::HashMap<String, PodUsage> {
             let Some(container_name) = container.get("name").and_then(Value::as_str) else {
                 continue;
             };
-            let cpu = container
-                .pointer("/usage/cpu")
-                .and_then(Value::as_str)
-                .and_then(millicores)
-                .unwrap_or(0);
-            let memory = container
-                .pointer("/usage/memory")
-                .and_then(Value::as_str)
-                .and_then(quantity_bytes)
-                .unwrap_or(0.0) as u64;
-            pod.cpu += cpu;
-            pod.memory += memory;
+            let (Some(cpu), Some(memory)) = (
+                container
+                    .pointer("/usage/cpu")
+                    .and_then(Value::as_str)
+                    .and_then(millicores),
+                container
+                    .pointer("/usage/memory")
+                    .and_then(Value::as_str)
+                    .and_then(quantity_bytes),
+            ) else {
+                continue;
+            };
             pod.containers
-                .insert(container_name.to_string(), (cpu, memory));
+                .insert(container_name.to_string(), (cpu, memory as u64));
+        }
+        if pod.containers.is_empty() {
+            continue;
         }
         usage.insert(namespaced_key(namespace, name), pod);
     }
@@ -1238,6 +1272,7 @@ fn node_view(node: &Value) -> NodeView {
         memory_requested_bytes: 0,
         cpu_used_millicores: None,
         memory_used_bytes: None,
+        pods_without_usage: None,
         census_containers: None,
         unclaimed_containers: None,
         unclaimed: Vec::new(),
@@ -1320,10 +1355,9 @@ fn pod_view(pod: &Value, sources: &Sources) -> PodView {
         .cloned()
         .unwrap_or_default();
 
-    let pod_usage = usage.get(&namespaced_key(&namespace, &name));
-    let container_usage = pod_usage
-        .map(|pod| pod.containers.clone())
-        .unwrap_or_default();
+    let container_usage = usage
+        .get(&namespaced_key(&namespace, &name))
+        .map(|pod| &pod.containers);
 
     let containers: Vec<ContainerView> = specs
         .iter()
@@ -1376,9 +1410,11 @@ fn pod_view(pod: &Value, sources: &Sources) -> PodView {
                     .filter(|probe| spec.get(*probe).is_some())
                     .map(|probe| probe.trim_end_matches("Probe").to_string())
                     .collect(),
-                cpu_used_millicores: container_usage.get(container_name).map(|(cpu, _)| *cpu),
+                cpu_used_millicores: container_usage
+                    .and_then(|usage| usage.get(container_name))
+                    .map(|(cpu, _)| *cpu),
                 memory_used_bytes: container_usage
-                    .get(container_name)
+                    .and_then(|usage| usage.get(container_name))
                     .map(|(_, memory)| *memory),
                 processes: status
                     .and_then(|status| status.get("containerID"))
@@ -1406,6 +1442,25 @@ fn pod_view(pod: &Value, sources: &Sources) -> PodView {
     let conditions = conditions_of(pod);
     let process_census_at = node.as_deref().and_then(crate::process_reports::census_at);
 
+    // Pod 的用量是它每个容器之和——一个容器这一拍没量到，和就不是这个 Pod 的
+    // 用量，而是一个下界。这时整格留空：一个偏低的数写成读数，读者没法把它和
+    // 「这个 Pod 真的用这么少」区分开，而两者该做的事相反。
+    let measured: Option<Vec<(u64, u64)>> = containers
+        .iter()
+        .map(|container| {
+            container
+                .cpu_used_millicores
+                .zip(container.memory_used_bytes)
+        })
+        .collect();
+    let (cpu_used, memory_used) = match measured {
+        Some(rows) if !rows.is_empty() => (
+            Some(rows.iter().map(|(cpu, _)| *cpu).sum()),
+            Some(rows.iter().map(|(_, memory)| *memory).sum()),
+        ),
+        _ => (None, None),
+    };
+
     PodView {
         namespace,
         name,
@@ -1417,8 +1472,8 @@ fn pod_view(pod: &Value, sources: &Sources) -> PodView {
         memory_requested_bytes: memory,
         containers,
         conditions,
-        cpu_used_millicores: pod_usage.map(|pod| pod.cpu),
-        memory_used_bytes: pod_usage.map(|pod| pod.memory),
+        cpu_used_millicores: cpu_used,
+        memory_used_bytes: memory_used,
         process_census_at,
         volumes,
         events: pod_events,
@@ -2933,6 +2988,112 @@ mod topology_tests {
             Some(120),
             "容器的数要与 Pod 对得上"
         );
+    }
+
+    /// 一个容器这一拍没有样（刚起来的容器要等下一轮采集），它就不是「只用了 0」：
+    /// 那一格留空，Pod 的和也不再是它的用量而是下界，一并留空。
+    #[test]
+    fn a_container_without_a_sample_leaves_its_cell_and_the_pod_total_unmeasured() {
+        let pod = json!({
+            "metadata": { "name": "api-1", "namespace": "cogneva" },
+            "spec": { "nodeName": "cogneva-01", "containers": [
+                { "name": "api" },
+                { "name": "sidecar" }
+            ]},
+            "status": { "phase": "Running", "containerStatuses": [] }
+        });
+
+        // metrics-server 只给了 api 的样：sidecar 还没报到。
+        let metrics = json!({ "items": [{
+            "metadata": { "name": "api-1", "namespace": "cogneva" },
+            "containers": [{ "name": "api", "usage": { "cpu": "120m", "memory": "300Mi" } }]
+        }]});
+        let view = pod_view(
+            &pod,
+            &Sources {
+                usage: usage_by_pod(&metrics),
+                ..Sources::default()
+            },
+        );
+
+        let by_name = |name: &str| {
+            view.containers
+                .iter()
+                .find(|container| container.name == name)
+                .expect("a container row")
+        };
+        assert_eq!(by_name("api").cpu_used_millicores, Some(120));
+        assert_eq!(
+            by_name("sidecar").cpu_used_millicores,
+            None,
+            "没有样不是 0 毫核"
+        );
+        assert_eq!(by_name("sidecar").memory_used_bytes, None);
+        assert_eq!(
+            view.cpu_used_millicores, None,
+            "少一个容器的和不写成这个 Pod 的用量"
+        );
+        assert_eq!(view.memory_used_bytes, None);
+
+        // 一格读不出来（这里 memory 缺失）也不许把 cpu 那一格当量到的记下来：
+        // 一个容器的两格是一起量的。
+        let half = json!({ "items": [{
+            "metadata": { "name": "api-1", "namespace": "cogneva" },
+            "containers": [{ "name": "api", "usage": { "cpu": "120m" } }]
+        }]});
+        let half = pod_view(
+            &pod,
+            &Sources {
+                usage: usage_by_pod(&half),
+                ..Sources::default()
+            },
+        );
+        assert_eq!(half.containers[0].cpu_used_millicores, None);
+        assert_eq!(half.containers[0].memory_used_bytes, None);
+    }
+
+    /// 节点那个和要说自己少装了谁：没说的时候，「用了这么多」与「量到的加起来
+    /// 这么多」在屏上同形，而两者该做的事相反。
+    #[test]
+    fn a_node_total_says_how_many_pods_it_could_not_measure() {
+        let pod_json = |name: &str| {
+            json!({
+                "metadata": { "name": name, "namespace": "cogneva" },
+                "spec": { "nodeName": "cogneva-01", "containers": [{ "name": "api" }] },
+                "status": { "phase": "Running", "containerStatuses": [] }
+            })
+        };
+        let metrics = json!({ "items": [{
+            "metadata": { "name": "api-1", "namespace": "cogneva" },
+            "containers": [{ "name": "api", "usage": { "cpu": "120m", "memory": "300Mi" } }]
+        }]});
+        let sources = Sources {
+            usage: usage_by_pod(&metrics),
+            ..Sources::default()
+        };
+
+        let mut node = node_view(&json!({ "metadata": { "name": "cogneva-01" } }));
+        node.pods = vec![
+            pod_view(&pod_json("api-1"), &sources),
+            pod_view(&pod_json("api-2"), &sources),
+        ];
+        roll_up_node_usage(std::slice::from_mut(&mut node));
+
+        assert_eq!(node.cpu_used_millicores, Some(120));
+        assert_eq!(node.memory_used_bytes, Some(300 * 1024 * 1024));
+        assert_eq!(
+            node.pods_without_usage,
+            Some(1),
+            "api-2 这一拍还没有样，和里没有它"
+        );
+
+        // 一个都没量到：和留空，但「少装了几个」照样说出来——这两格说的是两件事。
+        let mut blind = node_view(&json!({ "metadata": { "name": "cogneva-02" } }));
+        blind.pods = vec![pod_view(&pod_json("api-3"), &Sources::default())];
+        roll_up_node_usage(std::slice::from_mut(&mut blind));
+        assert_eq!(blind.cpu_used_millicores, None);
+        assert_eq!(blind.memory_used_bytes, None);
+        assert_eq!(blind.pods_without_usage, Some(1));
     }
 
     #[test]

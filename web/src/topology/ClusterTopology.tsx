@@ -371,6 +371,11 @@ function NodeCard({ node }: { node: TopologyNode }) {
           )}
         </div>
       )}
+      {node.pods_without_usage != null && node.pods_without_usage > 0 && (
+        <p className="px-3 pb-1 text-[10px] text-[var(--muted)]">
+          用量条里少 <span className="mono">{node.pods_without_usage}</span> 个 Pod 的样：条上那一段是量到的那些加起来，是个下界。
+        </p>
+      )}
       {pressures.length > 0 && (
         <p className="px-3 pb-1 text-[10px]" style={{ color: 'var(--danger)' }}>
           {pressures.join(' · ')}：这个节点在驱逐 Pod，光看申报量看不出来。
