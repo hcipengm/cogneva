@@ -366,6 +366,26 @@ pub fn with_chat_turns(turns: cog_gateway::ChatTurnHandle) -> Arc<GatewayState> 
     Arc::new(state)
 }
 
+/// The same state with the two components the plugin upload route asks for.
+///
+/// Both are supplied because the route's answer depends on each in turn: the
+/// registry is where the bytes come from and the backend is what compiles them.
+/// A suite that wants to judge the refusal behind them has to give the route
+/// everything a deployed build gives it, or it would be judging the missing
+/// component instead.
+pub fn with_plugin_pipeline(
+    registry: Arc<dyn cog_core::PluginRegistry>,
+    backend: Arc<dyn cog_core::SandboxBackend>,
+) -> Arc<GatewayState> {
+    let mut state = match Arc::try_unwrap(stateless()) {
+        Ok(state) => state,
+        Err(_) => panic!("the fixture just built it, so this is the only handle"),
+    };
+    state.plugin_registry = Some(registry);
+    state.sandbox_backend = Some(backend);
+    Arc::new(state)
+}
+
 fn build(
     datasets: Option<Arc<dyn cog_storage::DatasetStore>>,
     message_backend: Option<Arc<dyn cog_core::MessageBackend>>,

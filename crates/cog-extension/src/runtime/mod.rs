@@ -2,7 +2,6 @@
 
 pub mod cgroup;
 pub mod composite;
-pub mod loader;
 pub mod local;
 pub mod remote;
 #[cfg(feature = "rhai")]

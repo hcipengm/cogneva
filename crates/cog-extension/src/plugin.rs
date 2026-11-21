@@ -59,12 +59,9 @@ impl cog_core::SystemPlugin for ExtensionPlugin {
         ctx.publish_service(sandbox_backend.clone());
         info!("ExtensionPlugin sandbox backend published");
 
-        let plugin_registry: Arc<dyn cog_core::PluginRegistry> =
-            Arc::new(crate::registry::PluginRegistryImpl::new(
-                format!("{}/plugins", app_dir),
-                None,
-                sandbox_backend.clone(),
-            ));
+        let plugin_registry: Arc<dyn cog_core::PluginRegistry> = Arc::new(
+            crate::registry::PluginRegistryImpl::new(format!("{}/plugins", app_dir), None),
+        );
         ctx.publish_service(plugin_registry.clone());
         info!("ExtensionPlugin plugin registry published");
 

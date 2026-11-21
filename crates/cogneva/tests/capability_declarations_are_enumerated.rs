@@ -132,6 +132,14 @@ const KNOWN: &[(&str, usize, &str)] = &[
         1,
         "test fixture: a stand-in server's handshake reply",
     ),
+    (
+        "crates/cogneva/tests/a_plugin_upload_says_the_module_will_not_run_test.rs",
+        1,
+        "test fixture: the manifest a client uploads -- the plugin's own \
+         declaration of the tools it provides, which the upload route parses. \
+         Nothing here is a reply this tree sends: the route answers a status and \
+         a message, never the manifest back",
+    ),
 ];
 
 /// The two servers that advertise capabilities, and the constructor their reply

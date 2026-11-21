@@ -2605,16 +2605,6 @@ mod tests {
         async fn fetch(&self, _manifest: &cog_core::PluginManifest) -> SFResult<Vec<u8>> {
             Ok(vec![])
         }
-        async fn load(
-            &self,
-            _bytes: &[u8],
-            _manifest: &cog_core::PluginManifest,
-        ) -> SFResult<cog_core::PluginHandle> {
-            Err(cog_core::SFError::Agent("not loadable".into()))
-        }
-        async fn unload(&self, _handle: &cog_core::PluginHandle) -> SFResult<()> {
-            Ok(())
-        }
         async fn fetch_by_id(&self, _plugin_id: &str) -> SFResult<Vec<u8>> {
             Ok(vec![])
         }

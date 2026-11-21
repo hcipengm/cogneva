@@ -5,7 +5,7 @@
 //! and `cog-sandbox` (WASM + Rhai execution) into a single crate.
 //! | Feature | Runtime | Use-case |
 //! |---------|---------|----------|
-//! | `wasm`  | Wasmtime | Untrusted third-party code (plugins) |
+//! | `wasm`  | Wasmtime | Untrusted third-party code (plugins) — compiled, never run |
 //! | `rhai`  | Rhai     | Trusted inline scripting (prompt logic, glue) |
 
 pub mod build_cache;
