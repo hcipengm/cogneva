@@ -259,7 +259,12 @@ def main(argv: list[str]) -> int:
         cell = item.cells.get("代码")
         if not cell:
             continue
-        named = re.findall(r"(?:crates|deploy|scripts|web)/[A-Za-z0-9_./{},*-]+", cell)
+        # 路径从**一个**词边界开始：`<别的仓>/scripts/x.py` 里的那个
+        # `scripts/x.py` 是一段更长的路径，截出来判存在会把它读成「写错了」。
+        # `.github/scripts/` 是树里的第三个脚本落点，漏掉它会让那条格永远红。
+        named = re.findall(
+            r"(?<![\w./-])(?:\.github|crates|deploy|scripts|web)/[A-Za-z0-9_./{},*-]+", cell
+        )
         missing = [
             path
             for path in named

@@ -189,15 +189,33 @@ def _md_split(path: pathlib.Path) -> tuple[list[Item], list[Item]]:
     return out, debt
 
 
+def normalize(spec: str) -> str:
+    """裸路径与 `md:<路径>` 是同一个来源。
+
+    调用方有两种写法：`default_spec()` 给的是裸路径，别的几处给的是 `md:` 前缀。
+    代码曾经只认后者——于是 `spec[3:]` 把 `/home/...` 切成了 `me/...`，读写都落在一个
+    凭空造出来的相对路径上，而它长得像一个合法的台账地址。
+    """
+    if spec.startswith("md:") or spec == "change-ledger":
+        return spec
+    return "md:" + spec
+
+
+def spec_path(spec: str) -> pathlib.Path:
+    """台账文件本身（`md:` 与裸路径都收）。"""
+    return pathlib.Path(normalize(spec)[3:]).expanduser()
+
+
 def all_ids(spec: str) -> set[str]:
     """台账里出现过的**所有** id：未完成的与已落的都算。
 
     用途只有一个：判「钉住的那一条是不是还在台账里」。只 `load` 得到未完成的那些，
     而一条刚做完的待办会从那一侧消失——那是正常的收尾，不是丢了。
     """
+    spec = normalize(spec)
     if not spec.startswith("md:"):
         return {item.id for item in load(spec)}
-    path = pathlib.Path(spec[3:]).expanduser()
+    path = spec_path(spec)
     if not path.exists():
         raise Unreadable(f"{path} 不存在")
     ids: set[str] = set()
@@ -217,9 +235,10 @@ def terminal_debt(spec: str) -> list[Item]:
     （「触点在改动里」）留下的，而那一套已经不再是判据。这份清单是「还欠多少个终态」
     的唯一读数——没有它，那些行从此不再被任何门看。
     """
+    spec = normalize(spec)
     if not spec.startswith("md:"):
         return []
-    return _md_split(pathlib.Path(spec[3:]).expanduser())[1]
+    return _md_split(spec_path(spec))[1]
 
 
 def _change_ledger_items() -> list[Item]:
@@ -264,8 +283,9 @@ def _change_ledger_items() -> list[Item]:
 
 def load(spec: str) -> list[Item]:
     """`md:<path>` 或 `change-ledger`。读不到抛 [`Unreadable`]。"""
+    spec = normalize(spec)
     if spec.startswith("md:"):
-        return _md_items(pathlib.Path(spec[3:]).expanduser())
+        return _md_items(spec_path(spec))
     if spec == "change-ledger":
         return _change_ledger_items()
     raise Unreadable(f"不认识的台账来源：{spec}（只认 md:<路径> 与 change-ledger）")

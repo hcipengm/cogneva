@@ -76,7 +76,7 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv[1:])
 
     root = pathlib.Path(args.root).resolve()
-    ledger = pathlib.Path(args.ledger or todo_source.default_spec()[3:]).expanduser()
+    ledger = todo_source.spec_path(args.ledger or todo_source.default_spec())
     if not ledger.is_file():
         print(f"criterion_apply: 台账不在：{ledger}", file=sys.stderr)
         return 2

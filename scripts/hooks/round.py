@@ -121,7 +121,7 @@ def ledger_at(rev: str, spec: str) -> pathlib.Path:
     临时文件是**读**的中间物（`git show` 只写 stdout），不是状态：它不承载「这一轮
     是什么」，只承载「那一版台账的字节」。
     """
-    path = pathlib.Path(spec[3:]).expanduser().resolve()
+    path = todo_source.spec_path(spec).resolve()
     repo = ledger_repo(spec)
     if repo is None:
         raise todo_source.Unreadable("这个来源没有 git rev，读不出那一版台账")
@@ -157,7 +157,8 @@ def open_round(spec: str | None, allow_open: bool = False, code_rev_override: st
     # 定下来，否则「这一轮要改什么」由动手的人临场挑，默认全量就退成子集。
     import os
     import uuid
-    batch = todo_source.load(f"md:{source[3:]}") if source.startswith("md:") else []
+    source = todo_source.normalize(source)
+    batch = todo_source.load(source) if source.startswith("md:") else []
     if batch:
         print(f"round: 本批 {len(batch)} 条（同一批编辑，不挑子集）：")
         for item in batch:
@@ -184,7 +185,7 @@ def open_round(spec: str | None, allow_open: bool = False, code_rev_override: st
     if code_rev_override:
         code_rev = code_rev_override
     attrs_sql = (
-        f"jsonb_build_object('ledger_rev', '{rev}', 'ledger_path', '{source[3:]}', "
+        f"jsonb_build_object('ledger_rev', '{rev}', 'ledger_path', '{todo_source.spec_path(source)}', "
         f"'code_rev', '{code_rev}', 'batch', '{ids}', 'first_rev', '{first_rev}')::text"
     )
     psql(
