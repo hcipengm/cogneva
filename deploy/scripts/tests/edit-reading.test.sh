@@ -63,5 +63,29 @@ printf 'proves_it\n' >"$tmp/red.txt"
 out=$(run --stage final --passed "$tmp/passed.txt" --red-at-base "$tmp/red.txt"); rc=$?
 { [ "$rc" -eq 0 ]; } && ok "红→绿：终态真" || bad "红→绿被判假（rc=$rc）：$out"
 
+# 9. 计数型：普查面还有剩就不算改完，归零才算。
+cat >"$tmp/census.py" <<'CENSUS'
+import sys
+n = int(open(sys.argv[0] + ".count").read().strip())
+print("surface\tpath")
+for i in range(n):
+    print(f"state-file\tfile{i}.rs")
+print(f"  state-files: {n}")
+CENSUS
+printf '3' >"$tmp/census.py.count"
+printf '| S1 | x | 未落 | 判据读数: state-files → 0 | touches: crates/demo/src/lib.rs |\n' >"$ledger"
+out=$(run --census "$tmp/census.py"); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "还剩 3 处"; } \
+  && ok "计数型还有剩：false，并说出剩几处" || bad "计数没归零却过了（rc=$rc）：$out"
+
+printf '0' >"$tmp/census.py.count"
+out=$(run --census "$tmp/census.py"); rc=$?
+{ [ "$rc" -eq 0 ]; } && ok "计数归零：true" || bad "归零被判假（rc=$rc）：$out"
+
+# 10. 计数型但没给普查器：判不了，不是绿。
+out=$(run); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "没给 --census"; } \
+  && ok "计数型缺普查器：判不了" || bad "缺普查器被当成绿（rc=$rc）：$out"
+
 printf '\nedit-reading.test.sh: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

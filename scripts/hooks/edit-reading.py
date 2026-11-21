@@ -34,6 +34,23 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import todo_source  # noqa: E402
 
 CELL = re.compile(r"代码\s*:\s*test\s*=\s*([^\s:]+)::([A-Za-z0-9_]+)")
+# 计数型条目：`判据读数: <普查面> → <目标>`（`->` 也认）。
+COUNT = re.compile(r"判据读数\s*:\s*([a-z0-9-]+)\s*(?:→|->)\s*(\d+)")
+
+
+def surface_count(census: pathlib.Path, root: pathlib.Path, surface: str) -> int | None:
+    """跑一次普查，取那一面的条数。读不到返回 `None`：读不到不是 0。"""
+    out = subprocess.run(
+        [sys.executable, str(census), "--root", str(root), "--surface", surface, "--tsv"],
+        capture_output=True,
+        text=True,
+    )
+    if out.returncode != 0:
+        return None
+    rows = [line for line in out.stdout.splitlines() if line.strip() and "\t" in line]
+    # 只去掉列名那一行：计数行没有制表符，本来就不在这里面。
+    rows = [line for line in rows if not line.split("\t")[0].strip().endswith("surface")]
+    return len(rows)
 
 
 def parse_cell(item) -> tuple[str, str] | None:
@@ -76,6 +93,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--stage", choices=["edit", "final"], default="edit",
                         help="edit：2.4 之后、编译之前（不要求绿）；final：第 5 步之后（要绿，且要红过）")
     parser.add_argument("--passed", default=None, help="这次测试跑绿的测试名名单（一行一个）")
+    parser.add_argument("--census", default=None,
+                        help="普查器路径（计数型条目要它）：不给则计数型条目判不了")
     parser.add_argument("--red-at-base", default=None,
                         help="在 code_rev 上跑红的测试名名单：红过才算「没有这次改动就会红」")
     args = parser.parse_args(argv[1:])
@@ -110,9 +129,34 @@ def main(argv: list[str]) -> int:
         names = pathlib.Path(args.passed).read_text(errors="ignore").splitlines()
         passed = {name.strip() for name in names if name.strip()}
 
+    census: pathlib.Path | None = None
+    if args.census:
+        candidate = pathlib.Path(args.census)
+        census = candidate if candidate.is_file() else None
+        if census is None:
+            print(f"edit-reading: 普查器不在：{candidate} —— 计数型条目判不了。", file=sys.stderr)
+            return 2
+
     fake: list[str] = []
     real: list[str] = []
     for item in items:
+        # 计数型先判：它比形状硬，而且不用编译。
+        counted = COUNT.search(item.text)
+        if counted:
+            surface, target = counted.group(1), int(counted.group(2))
+            if census is None:
+                fake.append(f"{item.id}：计数型条目，但没给 --census —— 判不了")
+                continue
+            count = surface_count(census, root, surface)
+            if count is None:
+                fake.append(f"{item.id}：普查面 {surface} 跑不出来 —— 判不了")
+                continue
+            if count > target:
+                fake.append(f"{item.id}：{surface} 还剩 {count} 处（目标 {target}）")
+                continue
+            real.append(item.id)
+            continue
+
         parsed = parse_cell(item)
         if parsed is None:
             fake.append(f"{item.id}：`代码` 格不是 `test = 文件::函数` 的形状")
