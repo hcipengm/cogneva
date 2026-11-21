@@ -250,7 +250,33 @@ def main(argv: list[str]) -> int:
     # 就算，而是要改完算」）。触点在一条待办里是「该改哪些文件」的提示：碰巧落在同一条
     # 路径上的改动、改了一半的改动，在触点判据下与做完的改动同形。`代码` 格要求写的人
     # 点名「树里那条没了就会红的测试」，那是机器读得到的最小证据。
-    done = {i.id for i in todos if i.cells.get("代码")}
+    # 「填了」不等于「填得对」：那一格里点名的路径要真的在树里，否则这一格只是
+    # 一句关于证据的话，而它不是证据。判据只要求「写出的路径存在」——它不去猜哪条
+    # 测试该绿（那要跑，属于闸门），但它能让一个凭记忆写的路径当场红。
+    done: set[str] = set()
+    phantom: list[str] = []
+    for item in todos:
+        cell = item.cells.get("代码")
+        if not cell:
+            continue
+        named = re.findall(r"(?:crates|deploy|scripts|web)/[A-Za-z0-9_./{},*-]+", cell)
+        missing = [
+            path
+            for path in named
+            if "{" not in path and "}" not in path and "*" not in path
+            and not (root / path).exists()
+        ]
+        if missing:
+            phantom.append(f"{item.id}: " + ", ".join(sorted(set(missing))[:3]))
+            continue
+        done.add(item.id)
+    if phantom:
+        print(
+            "batch-gate: 这些待办的 `代码` 格点名了树里不存在的路径——那一格不是证据：\n  "
+            + "\n  ".join(phantom),
+            file=sys.stderr,
+        )
+        return 1
     untouched = [i.id for i in todos if i.id not in done]
 
     if not untouched:

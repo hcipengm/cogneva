@@ -119,6 +119,17 @@ git -C "$tree" add -A >/dev/null
 commit_with "touched every path but declared nothing"; out=$(run); rc=$?
 { [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "S1"; } && ok "触点全动到、代码格空着：仍红（改了文件不等于做完）" || bad "触点判据还在：没填代码格却绿了（rc=$rc）：$out"
 
+# 场景 3c：`代码` 格点了一个树里不存在的路径 ⇒ 红。填了不等于填得对：那一格
+# 必须是「树里有这个证据」，凭记忆写的路径与真的改动在读者眼里同形，除非有门去查。
+reset; rev=$(write_ledger "$ledger" S1 S2 S3); pin "$rev"
+sed -i 's|代码: crates/b/src/y.rs|代码: crates/b/tests/never_written.rs|' "$tree/ledger.md"
+git -C "$tree" add -A >/dev/null; git -C "$tree" commit -qm "a phantom path in the code cell" >/dev/null
+pin "$(git -C "$tree" rev-parse HEAD)"
+out=$(run); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "不存在"; } \
+  && ok "代码格点名了树里不存在的路径：红" \
+  || bad "凭空的代码格被放过了（rc=$rc）：$out"
+
 # 台账读不到：退 2。
 out=$(COGNEVA_EVENT_PSQL="$tmp/psql.sh" COGNEVA_TODO_LEDGER="$tmp/missing.md" python3 "$tree/scripts/hooks/batch-gate.py" --root "$tree" --base origin/main 2>&1); rc=$?
 [ "$rc" -eq 2 ] && ok "台账读不到：退 2（没判）" || bad "台账读不到时的行为不对（rc=$rc）：$out"

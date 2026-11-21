@@ -81,6 +81,7 @@ pub mod project_rate_limit;
 pub mod projects;
 pub mod prometheus_render;
 pub mod promotion_gate;
+pub mod prompt_prefix;
 pub mod raw_logs;
 pub mod readings;
 pub mod resource_frames;
