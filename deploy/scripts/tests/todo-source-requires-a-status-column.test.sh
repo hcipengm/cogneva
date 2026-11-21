@@ -49,12 +49,28 @@ out=$(run "$tmp/good.md"); rc=$?
     && ok "齐整的台账：读出两条" \
     || bad "齐整的台账没读对（rc=$rc）：$out"
 
-# 4. 已落的行不参与批次，但也不该被当成畸形行。
+# 4. 已落但没填三格：**不进本轮批次**（那是债），但也不读成做完。
 printf '| S1 | 内容 | 已落（2026-11-01） | 判据 | touches: crates/a.rs |\n' >"$tmp/closed.md"
 out=$(run "$tmp/closed.md"); rc=$?
 { [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "PARSED 0"; } \
-    && ok "已落的行：不拒、不进批次" \
-    || bad "已落的行被误判（rc=$rc）：$out"
+    && ok "已落却缺三格：不进批次" \
+    || bad "已落却缺三格进了批次（rc=$rc）：$out"
+out=$(python3 -c "
+import sys
+sys.path.insert(0, '$root/scripts/hooks')
+import todo_source
+print('DEBT', [i.id for i in todo_source.terminal_debt('md:$tmp/closed.md')])
+" 2>&1)
+{ printf '%s' "$out" | grep -q "DEBT \['S1'\]"; } \
+    && ok "已落却缺三格：进债的清单（不是做完）" \
+    || bad "债的清单里没有那一行：$out"
+
+# 4b. 已落且三格齐：不拒，也不进批次。
+printf '| S1 | 内容 | 已落 | 代码: crates/x/tests/y.rs 上线: abc1234 验证: 读数 | touches: crates/a.rs |\n' >"$tmp/closed-ok.md"
+out=$(run "$tmp/closed-ok.md"); rc=$?
+{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "PARSED 0"; } \
+    && ok "已落且三格齐：不拒、不进批次" \
+    || bad "已落且三格齐被误判（rc=$rc）：$out"
 
 printf 'todo-source-requires-a-status-column.test.sh: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

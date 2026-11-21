@@ -203,50 +203,62 @@ def other_repo_changes(repo: pathlib.Path, base: str | None) -> list[str]:
 
 
 def report(root: pathlib.Path, changed: list[str], batch: list[str], todos, missing_todos,
-           deferred=(), foreign=(), other: pathlib.Path | None = None) -> int:
+           deferred=(), foreign=(), other: pathlib.Path | None = None, debt=()) -> int:
     touched = set(changed)
     # 触点可以落在台账所在的那个仓里（这一族的产物本来就写在那儿）：那一侧的改动面
-    # 由 `foreign` 带进来。不带进来，那些行永远报缺口，而它们永远绿不了——这一批也就
-    # 永远编不了。
+    # 由 `foreign` 带进来。
     every = touched | set(foreign)
-    # 缺口按**待办**算，不按路径算：一条待办可以点名好几个触点，任何一个动了就算它这一
-    # 轮被改到。按路径算的话，多触点的那几条永远有剩——`touches` 里点名了一个这一轮
-    # 本来就不该动的文件，整批就永远编不了，而推之前那道门（按待办算）会放行：
-    # 两道门数出两个数，正是「同一件事有两份判据」的老毛病。
-    gaps = []
-    for name, paths in todos:
-        if not paths:
-            continue
-        # 判据是「**任何一个**触点动了就算这一条被改到」，与推之前那道门同一条：
-        # 一条待办点名三处、动了两处，两边都该读作「做了」。原来这里写成「有一处没动
-        # 就是缺口」，于是同一批在两道门上是 21 与 4 两个数（2026-11-20 实测）。
-        if not any(is_touched(path, every) for path in paths):
-            gaps.append((name, [path for path in paths if not is_touched(path, every)]))
+
+    # **判「做完没有」只认三格，不认触点**（属主 2026-11-21：「不能以触点发现有改动
+    # 就算，而是要改完算」）。触点回答的是「这一轮该改哪些文件」，一个文件改过不等于
+    # 那条待办做完了——改了一半、改错了地方、或者只是碰巧落在同一条路径上，三种都在
+    # 触点判据下读成「做了」。三格回答的是另一件事：树里有没有实现（`代码`）、跑着的
+    # 那一版有没有它（`上线`）、判据量过没有（`验证`）。
+    #
+    # 这道门（推之前 / 编译前）判的是 `代码` 那一格：这一推要带走的实现是不是都在树里。
+    # `上线` 与 `验证` 只能在推之后、在现网量，它们由 `round.py terminal` 判，判词是
+    # 「三格齐」——那时的「已落」才是终态。
+    gaps = [(name, miss) for name, _paths, miss in todos if "代码" in miss]
 
     owed: list[tuple[str, str]] = []
     for check in CHECKS:
         owed += check(root, touched)
 
-    print(f"family: 工作区改了 {len(changed)} 个文件；本轮默认批次 {len(batch)} 个；未完成待办 {len(todos)} 项")
-    for name, paths in todos:
-        print(f"  待办 {name}: {len(paths)} 个触点")
+    complete = sum(1 for _, _p, miss in todos if not miss)
+    if debt:
+        # 这一面不进批次：它是整本台账欠的终态，不是这一轮要改的文件。
+        print(
+            f"family: 台账上另有 {len(debt)} 行写着 `已落` 却没有三格（欠终态；"
+            f"`--terminal` 判它）：{', '.join(debt)}"
+        )
+    print(
+        f"family: 工作区改了 {len(changed)} 个文件；本轮默认批次 {len(batch)} 个；"
+        f"未完成待办 {len(todos)} 项（三格齐 {complete}，缺格 {len(gaps)}）"
+    )
+    for name, paths, miss in todos:
+        state = "三格齐" if not miss else "缺 " + "、".join(miss)
+        print(f"  待办 {name}: {len(paths)} 个触点；{state}")
     if missing_todos:
         print(f"  ⚠ 这些待办没写 `touches:`，批次算不出它们要动什么：{', '.join(missing_todos)}")
-    for name, missing in gaps:
-      for path in missing:
-        if (root / path).exists():
-            print(f"  TODO {path}  <- 待办 {name} 点名了它，这一轮还没改它")
-        elif other is not None and (other / path).exists():
-            # 这一条要动的东西在台账所在的那个仓里：那一侧还没改，不是这一侧的事，
-            # 但也不能读成「这个树里没有这条路」。
-            print(f"  TODO {path}  <- 待办 {name}：台账仓里还没改（这一条的产物不在这个树里）")
-        else:
-            # 两种缺口的修法不同：改一个错别字，与写一件还没写的活。一条「还没改」
-            # 把两者读成同一件事，而点不存在的路径的那条台账，等多久都不会自己变绿。
-            print(
-                f"  TODO {path}  <- 这个树里没有这条路：台账那一行要点名的触点写错了，"
-                "或者它指的是另一个仓的产物（那就不该由这道门判）"
-            )
+    for name, miss in gaps:
+        print(
+            f"  TODO 待办 {name} <- 缺 `代码` 格：这一条还没有「树里有了实现」的证据"
+            f"（缺 {'、'.join(miss)}）"
+        )
+
+    # 触点的读数照旧印出来：它不再是判据，但「这一轮该动哪儿」仍然要靠它看。
+    if gaps:
+        for name, paths, miss in todos:
+            if "代码" not in miss:
+                continue
+            for path in paths:
+                if is_touched(path, every):
+                    continue
+                where = "这个树里" if (root / path).exists() else (
+                    "台账仓里" if other is not None and (other / path).exists()
+                    else "（两棵树里都没有这条路）"
+                )
+                print(f"    待办 {name} 的触点 {path} 还没动（{where}）")
     for path, why in owed:
         print(f"  TODO {path}  <- {why}")
 
@@ -290,6 +302,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--changed", nargs="*", default=None)
     parser.add_argument("--from-git", action="store_true")
     parser.add_argument("--all-todos", action="store_true")
+    parser.add_argument("--terminal", action="store_true",
+                        help="判整本台账的欠终态：已落却缺格的行，一行都不许有")
     args = parser.parse_args(argv[1:])
 
     root = pathlib.Path(args.root).resolve()
@@ -335,7 +349,7 @@ def main(argv: list[str]) -> int:
 
     changed = args.changed or working_tree_changes(root)
     foreign: list[str] = []
-    todos: list[tuple[str, list[str]]] = []
+    todos: list[tuple[str, list[str], list[str]]] = []
     missing: list[str] = []
     deferred: list[str] = []
     batch = list(changed)
@@ -376,11 +390,11 @@ def main(argv: list[str]) -> int:
         except Exception:
             round_ids = set()
         todos_items = [i for i in todos_items if not round_ids or i.id in round_ids]
-        todos = [(i.id, i.touches) for i in todos_items]
+        todos = [(i.id, i.touches, i.missing_cells()) for i in todos_items]
         # 触点必须指得到东西：写错的路径与「凭记忆写的路径」在批次里同形，而后者是
         # 这一整套最初要治的病。指不到就挡住批次，让写的人去核对。
         bad: list[str] = []
-        checked: list[tuple[str, list[str]]] = []
+        checked: list[tuple[str, list[str], list[str]]] = []
         # 触点可以落在两棵树上：这棵代码树，或台账所在的那个仓（`specs/`、`scripts/` 等）。
         # 判存在要两棵都问，否则台账仓里的路径会被读成「写错了」。
         ledger_repo = None
@@ -390,7 +404,7 @@ def main(argv: list[str]) -> int:
             ledger_repo = round_mod.ledger_repo(todo_source.default_spec())
         except Exception:
             ledger_repo = None
-        for name, paths in todos:
+        for name, paths, miss in todos:
             gone = [
                 p for p in paths
                 if not (root / p).exists()
@@ -399,7 +413,7 @@ def main(argv: list[str]) -> int:
             if gone:
                 bad.append(f"{name}: {', '.join(gone)}")
                 continue
-            checked.append((name, paths))
+            checked.append((name, paths, miss))
         if bad:
             print("family: 这些待办的触点在树里不存在，批次算不出来：")
             for line in bad:
@@ -418,7 +432,20 @@ def main(argv: list[str]) -> int:
 
     if not changed and not todos:
         return 0
-    return report(root, changed, batch, todos, missing, deferred, foreign, ledger_repo)
+    debt: list[str] = []
+    try:
+        debt = [i.id for i in todo_source.terminal_debt(f"md:{resolve_ledger(args.ledger)}")]
+    except Exception:
+        debt = []
+    if args.terminal:
+        # 「欠终态」是它自己的判据：整本台账上再没有一行写着 `已落` 却缺格。
+        # 与批次门分开跑，因为它判的是另一个问题（台账的债，不是这一轮的范围）。
+        if debt:
+            print("FAIL: 这些行写着 `已落` 却没有三格（代码 / 上线 / 验证）：" + "、".join(debt))
+            return 1
+        print("terminal: 台账上没有欠终态的行。")
+        return 0
+    return report(root, changed, batch, todos, missing, deferred, foreign, ledger_repo, debt)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import sys
 import re
 import subprocess
 
@@ -34,11 +35,36 @@ import subprocess
 OPEN_STATUS = "未落"
 CLOSED_PREFIXES = ("已落",)
 
+# 一条待办的终态是三格都填：**代码**（树里有了实现，点名那条「没有它就会红」的测试）、
+# **上线**（跑着的那一版里有它，点名 rev 与那一次的读数）、**验证**（判据对着真东西量
+# 过一次）。三格缺任何一格都还不是终态——「改了文件」与「做完了」之间的差就在这三格里。
+CELL_TAGS = ("代码", "上线", "验证")
+_CELL_RE = re.compile(r"(?:^|[｜|\s])(代码|上线|验证)\s*[:：]\s*")
+
+
+def parse_cells(text: str) -> dict[str, str]:
+    """从一行里读出三格。每个标签取到下一个标签 / 单元格分隔符为止。
+
+    写得出来就读得出来，读不出来就是没写：没有「大概是这个意思」的余地——这一格
+    存在的全部意义是让机器判得出终态，猜出来的终态与没有终态是一样的。
+    """
+    hits = list(_CELL_RE.finditer(text))
+    cells: dict[str, str] = {}
+    for index, hit in enumerate(hits):
+        stop = hits[index + 1].start() if index + 1 < len(hits) else len(text)
+        value = text[hit.end():stop]
+        # 单元格分隔符之后的内容不属于这一格。
+        value = re.split(r"[|｜]", value)[0].strip().strip("｜|").strip()
+        if value and hit.group(1) not in cells:
+            cells[hit.group(1)] = value
+    return cells
+
 
 class Item:
-    __slots__ = ("id", "title", "text", "touches", "deferred")
+    __slots__ = ("id", "title", "text", "touches", "deferred", "cells")
 
-    def __init__(self, id: str, title: str, text: str, touches: list[str], deferred: bool = False):
+    def __init__(self, id: str, title: str, text: str, touches: list[str], deferred: bool = False,
+                 cells: dict[str, str] | None = None):
         self.id = id
         self.title = title
         # 整行原文（不截断）。`title` 是给人看的前 80 字，用来估「这一条读起来要多少
@@ -48,9 +74,19 @@ class Item:
         # `touches: unknown — 理由`：明确本轮不排。它不是「忘了写触点」——
         # 两者的修法不同（前者要 Split 点名，后者要先补触点），所以这里分开。
         self.deferred = deferred
+        # 三格：代码 / 上线 / 验证。**判「做没做完」只认这三格**，不认触点。
+        # 触点是「这一轮该改哪些文件」的提示；一个文件改了不等于那条待办做完了
+        # （改了一半、改错了地方、或者只是碰巧在同一条路径上），2026-11-21 属主定。
+        self.cells = cells or {}
+
+    def missing_cells(self) -> list[str]:
+        return [tag for tag in CELL_TAGS if not self.cells.get(tag)]
+
+    def is_complete(self) -> bool:
+        return not self.missing_cells()
 
     def __repr__(self) -> str:  # pragma: no cover - 只为读数好看
-        return f"Item({self.id!r}, {len(self.touches)} touches)"
+        return f"Item({self.id!r}, {len(self.touches)} touches, missing={self.missing_cells()})"
 
 
 class Unreadable(Exception):
@@ -58,10 +94,22 @@ class Unreadable(Exception):
 
 
 def _md_items(path: pathlib.Path) -> list[Item]:
+    """未完成的条目。**缺格的「已落」不在其中**：它们是另一面（`terminal_debt`）。
+
+    两面分开是因为它们回答两个不同的问题：这一轮要做什么（批次），与整本台账还欠
+    多少个终态（债）。混在一起，一个历史遗留的缺格会把本轮批次撑到几十条、把这一推
+    卡死；而完全不管，那 41 行假的「已落」就永远没人回头补。
+    """
+    return _md_split(path)[0]
+
+
+def _md_split(path: pathlib.Path) -> tuple[list[Item], list[Item]]:
     if not path.exists():
         raise Unreadable(f"{path} 不存在")
     out: list[Item] = []
+    debt: list[Item] = []
     bad_status: list[str] = []
+    bad_closed: list[str] = []
     malformed: list[str] = []
     for line in path.read_text(errors="ignore").splitlines():
         if not line.startswith("| S"):
@@ -74,9 +122,23 @@ def _md_items(path: pathlib.Path) -> list[Item]:
             malformed.append(f"{cells[0] if cells else line[:20]}（只有 {len(cells)} 列，没有状态列）")
             continue
         status = cells[2]
+        three = parse_cells(line)
+        want_debt = False
         if status.startswith(CLOSED_PREFIXES):
-            continue
-        if not status.startswith(OPEN_STATUS):
+            # 「已落」是**终态**：三格都填才允许这么写。缺一格的 `已落` 是这一族最坏的
+            # 形状——它把「文件改了」读成「做完了」，而且从那一刻起这一行不再被任何
+            # 门看（已落的行不进批次）。
+            #
+            # 缺格的一行**按未完成读**，不是跳过、也不是拒读：跳过就等于承认那个假的
+            # 「已落」，而拒读会让整本台账一个门都开不了——一条写错的旧记录不该把
+            # 别的活一起停掉。它进批次，读数里明写缺哪格，等补满三格再改回 `已落`。
+            missing = [tag for tag in CELL_TAGS if not three.get(tag)]
+            if missing:
+                bad_closed.append(f"{cells[0]}（缺 {'、'.join(missing)}）")
+                want_debt = True
+            else:
+                continue
+        if not status.startswith(OPEN_STATUS) and not status.startswith(CLOSED_PREFIXES):
             bad_status.append(f"{cells[0]}（状态：{status[:20]}）")
             continue
         # **取最后一个** `touches:`：正文里提到这个词（例如描述这条规则本身）不该
@@ -104,7 +166,11 @@ def _md_items(path: pathlib.Path) -> list[Item]:
                 if p.strip() and p.strip() != "unknown"
             ]
             touches = [p.strip(" ）)") for p in touches if p.strip(" ）)")]
-        out.append(Item(cells[0], cells[1][:80], line.strip(), touches, deferred))
+        item = Item(cells[0], cells[1][:80], line.strip(), touches, deferred, three)
+        if want_debt:
+            debt.append(item)
+        else:
+            out.append(item)
     if malformed:
         raise Unreadable(
             "这些行以 `| S` 开头却没有状态列，读不出它做没做：" + "、".join(malformed)
@@ -113,7 +179,19 @@ def _md_items(path: pathlib.Path) -> list[Item]:
         raise Unreadable(
             "状态词不在闭集里（**只有两个词**：`未落` / `已落`）：" + "、".join(bad_status)
         )
-    return out
+    return out, debt
+
+
+def terminal_debt(spec: str) -> list[Item]:
+    """整本台账上写着 `已落`、却没填满三格的那些行。
+
+    它们不是本轮批次的一部分，但它们**不是**终态：那个 `已落` 是从前的判据
+    （「触点在改动里」）留下的，而那一套已经不再是判据。这份清单是「还欠多少个终态」
+    的唯一读数——没有它，那些行从此不再被任何门看。
+    """
+    if not spec.startswith("md:"):
+        return []
+    return _md_split(pathlib.Path(spec[3:]).expanduser())[1]
 
 
 def _change_ledger_items() -> list[Item]:

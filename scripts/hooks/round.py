@@ -230,10 +230,40 @@ def status() -> int:
         return 1
     rev = current[1]
     left = remaining()
+    # 每一条缺哪一格就说哪一格：三格是本轮判「做没做完」的**唯一**判据（触点只提示
+    # 该改哪些文件）。只印一个 id 的话，读的人还得自己去台账里找缺的是哪一格。
+    cells: dict[str, list[str]] = {}
+    try:
+        items = {i.id: i for i in todo_source.load(todo_source.default_spec())}
+        cells = {i: items[i].missing_cells() for i in left if i in items}
+    except todo_source.Unreadable as e:
+        print(f"round: 台账读不到（{e}）；下面只列 id")
     print(f"round: 事件流里钉在 {rev[:12]}，还剩 {len(left)} 条")
+    terminal = 0
     for i in left:
-        print(f"  未完成 {i}")
-    return 0 if not left else 1
+        miss = cells.get(i)
+        if miss is None:
+            print(f"  未完成 {i}")
+        elif not miss:
+            terminal += 1
+            print(f"  三格齐 {i}")
+        else:
+            print(f"  未完成 {i}  缺 {'、'.join(miss)}")
+    if terminal:
+        print(f"round: 其中 {terminal} 条三格齐（终态）；台账里仍写 `未落` 的那些等提交换行。")
+    # 另一面：整本台账上写着 `已落`、却没填满三格的那些行。它们不在这一批里（不属于
+    # 这一轮的编辑范围），但它们**不是**终态——那个 `已落` 是旧判据留下的。不印出来，
+    # 它们就再也不会被任何人看第二眼。
+    try:
+        debt = todo_source.terminal_debt(todo_source.default_spec())
+    except todo_source.Unreadable:
+        debt = []
+    if debt:
+        print(
+            f"round: 台账上另有 {len(debt)} 行写着 `已落` 却没有三格（欠终态），"
+            f"不在本轮批次：{', '.join(i.id for i in debt)}"
+        )
+    return 0 if terminal == len(left) else 1
 
 
 def close() -> int:

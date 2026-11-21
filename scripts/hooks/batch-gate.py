@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """默认做完整批：没做的待办必须逐条点名，并给出四条理由之一。
 
-这一推里，台账上**所有未完成的待办**要么做了（它的触点在改动里），要么被
-`Split:` 逐条点名排除。两句判据：
+这一推里，台账上**所有未完成的待办**要么做完了（那一行填了 `代码` 格：树里有了实现，
+并点名了那条「没有它就会红」的测试），要么被 `Split:` 逐条点名排除。触点不是判据——
+「有文件改过」与「做完了」不是一件事（属主 2026-11-21 定）。两句判据：
 
   1. **没点名的排除 = 拒**。`Split:` 必须列出它排除的 S 号：
          Split: 1 — S48, S63 — <为什么这两条这一批做不了>
@@ -244,8 +245,12 @@ def main(argv: list[str]) -> int:
         if out.returncode == 0:
             touched = touched + [l.strip() for l in out.stdout.splitlines() if l.strip()]
     items = {item.id: item for item in todos}
-    done = {i.id for i in todos if i.touches and any(is_touched(p, touched) for p in i.touches)}
     todos = [i for i in todos if not round_ids or i.id in round_ids]
+    # 做完了没有**只认 `代码` 格**，不认触点（属主 2026-11-21：「不能以触点发现有改动
+    # 就算，而是要改完算」）。触点在一条待办里是「该改哪些文件」的提示：碰巧落在同一条
+    # 路径上的改动、改了一半的改动，在触点判据下与做完的改动同形。`代码` 格要求写的人
+    # 点名「树里那条没了就会红的测试」，那是机器读得到的最小证据。
+    done = {i.id for i in todos if i.cells.get("代码")}
     untouched = [i.id for i in todos if i.id not in done]
 
     if not untouched:
