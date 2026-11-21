@@ -16,7 +16,7 @@
 //! ```
 
 use chrono::Utc;
-use cog_core::{LlmCall, LlmCallEvents, LlmUsageLedger};
+use cog_core::{LlmCall, LlmCallEvents};
 use cog_observability::usage_store::{LlmUsageRecord, LlmUsageStore};
 use cog_storage::LlmCallEventStore;
 use cog_test_support::{database_url, drop_schema, own_schema, schema_pool};
