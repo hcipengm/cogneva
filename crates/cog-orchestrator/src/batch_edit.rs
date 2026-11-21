@@ -123,8 +123,12 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
         println!("batch-edit: 只组了请求（--dry-run），没有调用模型。");
         return Ok(());
     }
+    // 循环：判 → 假清单 → 生成 → 再判。没有「跑几轮」这个旋钮：一直跑到判词为空，
+    // 或者某一轮什么都没变（那时再跑也只是把同一份输入再问一遍）。
+    let _ = request;
     Err(format!(
-        "batch-edit: {} 条还没生成，但模型通道还没接（S79）。先看 --dry-run 的请求。",
+        "batch-edit: {} 条还没生成；生成器要由调用方注入（`BatchGenerator::from_agent`），\
+         命令行里没有 agent。",
         missing.len()
     )
     .into())
@@ -160,5 +164,35 @@ mod tests {
             "进 agent 的不是整批"
         );
         assert_eq!(out["diff"], "for ## S1\n## S2\n## S3\n");
+    }
+}
+
+/// 跑一轮完整的编辑循环：判 → 假清单 → 生成 → 再判，直到判词为空或某一轮毫无进展。
+///
+/// 没有「最多几轮」这个旋钮：判据是**判词为空**。停下来的另一种情形是「这一轮与上一轮
+/// 的假清单一样」——那不是轮数上限，是「再问一次也只会得到同一份输入」。
+pub async fn run_loop(root: &std::path::Path, generator: &BatchGenerator) -> Result<usize, String> {
+    let mut last: Option<Vec<String>> = None;
+    let mut rounds = 0usize;
+    loop {
+        let (_, missing) = edit_verdict(root)?;
+        if missing.is_empty() {
+            return Ok(rounds);
+        }
+        let ids: Vec<String> = missing.iter().map(|(id, _)| id.clone()).collect();
+        if last.as_ref() == Some(&ids) {
+            return Err(format!(
+                "batch-edit: {} 条连续一轮没有变化（{}）；再问一次只会是同一份输入",
+                ids.len(),
+                ids.join("、")
+            ));
+        }
+        let request = compose(root, &missing);
+        generator
+            .generate(&request)
+            .await
+            .map_err(|e| format!("generator 失败：{e}"))?;
+        last = Some(ids);
+        rounds += 1;
     }
 }
