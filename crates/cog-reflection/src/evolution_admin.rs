@@ -295,13 +295,21 @@ impl EvolutionAdminService {
         // two sources above win where they overlap: they carry the richer
         // record (the scan reads the diff text the listing summarizes, the
         // engine knows the live status), and this one states metadata only.
-        let records = self.pipeline.known_change_records().await;
-        let known: std::collections::HashSet<String> =
-            results.iter().map(|r| r.artifact_id.clone()).collect();
-        for record in records {
-            if !known.contains(&record.artifact_id) {
-                results.push(record);
+        match self.pipeline.known_change_records().await {
+            Ok(records) => {
+                let known: std::collections::HashSet<String> =
+                    results.iter().map(|r| r.artifact_id.clone()).collect();
+                for record in records {
+                    if !known.contains(&record.artifact_id) {
+                        results.push(record);
+                    }
+                }
             }
+            Err(e) => warn!(
+                error = %e,
+                "could not read the durable change records for the listing; \
+                 showing only the queue and the in-memory results"
+            ),
         }
 
         results

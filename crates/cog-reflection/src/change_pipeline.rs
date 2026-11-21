@@ -1567,20 +1567,24 @@ impl ChangePipeline {
     ///
     /// 这是列表能读的那一面：候选活在库里，不带进程内存的状态，因而重启不会让
     /// 一条已经判过的变更重新出现。
-    pub async fn known_change_records(&self) -> Vec<EvolutionResult> {
+    /// 队列里与已定案的全部变更，最新的在前。
+    ///
+    /// 读不出来要往上抛，不能折成一张空表：这份记录是列表里「已经退场的那一半」
+    /// 的唯一来源，因此「队列读不出」与「一条已退场的都没有」在调用方必须是两
+    /// 件事——折叠成空表时，一次读失败会让管理面安安静静地少掉每一条已落地的
+    /// 变更，而没有任何一处说得出少了什么。
+    pub async fn known_change_records(&self) -> SFResult<Vec<EvolutionResult>> {
         let Some(candidates) = self.candidate_store() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        candidates
+        let mut records: Vec<EvolutionResult> = candidates
             .all()
-            .await
-            .map(|candidates| {
-                let mut records: Vec<EvolutionResult> =
-                    candidates.iter().map(result_from_candidate).collect();
-                records.sort_by_key(|record| std::cmp::Reverse(record.created_at));
-                records
-            })
-            .unwrap_or_default()
+            .await?
+            .iter()
+            .map(result_from_candidate)
+            .collect();
+        records.sort_by_key(|record| std::cmp::Reverse(record.created_at));
+        Ok(records)
     }
 
     /// 这条变更是否已经离开待办队列。
@@ -8142,6 +8146,7 @@ index 1111111..2222222 100644
         let known: Vec<String> = pipeline
             .known_change_records()
             .await
+            .unwrap()
             .into_iter()
             .map(|r| r.artifact_id)
             .collect();
@@ -8149,6 +8154,68 @@ index 1111111..2222222 100644
             known,
             vec!["gone".to_string(), "waiting".to_string()],
             "both halves, newest first"
+        );
+    }
+
+    /// 一份只肯拒绝读取的队列。其余方法不在这些用例走的路上，直接说不可达，
+    /// 而不是悄悄回 `Ok`——一个处处答应的替身会让用例在队列真没读到时也绿。
+    #[derive(Debug)]
+    struct RefusingCandidates;
+
+    #[async_trait::async_trait]
+    impl ChangeCandidateStore for RefusingCandidates {
+        async fn record(&self, _candidate: &ChangeCandidate) -> SFResult<()> {
+            unimplemented!("RefusingCandidates stands in only for the refused read")
+        }
+
+        async fn transition(&self, _artifact_id: &str, _status: &str, _note: &str) -> SFResult<()> {
+            unimplemented!("RefusingCandidates stands in only for the refused read")
+        }
+
+        async fn decide(
+            &self,
+            _artifact_id: &str,
+            _outcome: CandidateOutcome,
+            _reason: &str,
+        ) -> SFResult<()> {
+            unimplemented!("RefusingCandidates stands in only for the refused read")
+        }
+
+        async fn pending(&self) -> SFResult<Vec<ChangeCandidate>> {
+            unimplemented!("RefusingCandidates stands in only for the refused read")
+        }
+
+        async fn all(&self) -> SFResult<Vec<ChangeCandidate>> {
+            Err(SFError::Internal(
+                "the candidate queue is unreadable".into(),
+            ))
+        }
+
+        async fn read(&self, _artifact_id: &str) -> SFResult<Option<ChangeCandidate>> {
+            unimplemented!("RefusingCandidates stands in only for the refused read")
+        }
+    }
+
+    /// 队列读不出时要说出来，不能折成一张空表。
+    ///
+    /// 这份记录是管理面列表里「已退场那一半」的唯一来源：折成空表时，一次读失败
+    /// 会让每一条已落地的变更从列表里安安静静地消失，与「一条都没落地过」读成
+    /// 同一个样子。
+    #[tokio::test]
+    async fn an_unreadable_queue_is_an_error_not_an_empty_listing() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let pipeline = ChangePipeline::new(temp.path(), &change_dir, true)
+            .with_candidates(Arc::new(RefusingCandidates));
+
+        let error = pipeline
+            .known_change_records()
+            .await
+            .expect_err("a read that failed must not be handed out as no records");
+        assert!(
+            error.to_string().contains("unreadable"),
+            "the error has to be the store's own: {error}"
         );
     }
 
