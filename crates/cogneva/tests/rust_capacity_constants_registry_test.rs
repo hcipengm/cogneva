@@ -743,7 +743,6 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-github/src/provider/github.rs", 3),
     ("crates/cog-guardrail/src/content_filter.rs", 1),
     ("crates/cog-llm/src/provider/mod.rs", 2),
-    ("crates/cog-llm/src/resilience.rs", 1),
     ("crates/cog-llm/src/routing.rs", 1),
     ("crates/cog-memory/src/bge_m3_sparse_linear.rs", 1),
     ("crates/cog-memory/src/config.rs", 7),

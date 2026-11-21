@@ -1,4 +1,4 @@
-//! LLM provider implementations, routing, resilience, and streaming backends.
+//! LLM provider implementations, routing, and streaming backends.
 pub mod config;
 pub mod hot_swap;
 pub mod model;
@@ -7,7 +7,6 @@ pub mod observed;
 pub mod origin;
 pub mod provider;
 pub mod registry;
-pub mod resilience;
 pub mod routing;
 pub mod stream;
 pub mod utils;
@@ -31,7 +30,6 @@ pub use observable::LlmObservable;
 pub use observed::ObservedLlmClient;
 pub use provider::{anthropic, google, ollama, openai, responses};
 pub use registry::ProviderRegistry;
-pub use resilience::{BackoffStrategy, ResilientProvider, RetryPolicy};
 pub use routing::RoutingProvider;
 pub use stream::{parse_sse_stream, LLMStream};
 
