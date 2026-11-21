@@ -33,15 +33,11 @@ pub fn prefix(body: &Map<String, Value>) -> Vec<u8> {
             stable.insert(field.to_string(), value.clone());
         }
     }
-    // 倒数一条消息是这一轮新说的，不属于前缀；空会话时这一格是空数组而不是缺席——
-    // 「没有历史」与「字段没带」在缓存看来是两串不同的字节。
-    if let Some(Value::Array(messages)) = body.get("messages") {
-        let history = if messages.is_empty() {
-            Vec::new()
-        } else {
-            messages[..messages.len() - 1].to_vec()
-        };
-        stable.insert("messages".to_string(), Value::Array(history));
+    // **全部历史都进前缀**：上一轮发出去的每一段字节都在缓存里，包括它最后一条。
+    // 把最后一条当「这一轮新说的」剔掉，上一轮的前缀就成不了这一轮的开头——
+    // 而那正是缓存唯一的判据。
+    if let Some(messages) = body.get("messages") {
+        stable.insert("messages".to_string(), messages.clone());
     }
     // `to_vec` 走的是同一套键序规则，所以这串字节两次算出来一样。
     serde_json::to_vec(&Value::Object(stable)).unwrap_or_default()
