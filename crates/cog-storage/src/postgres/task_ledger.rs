@@ -628,6 +628,43 @@ pub(crate) async fn append_transition(
     .fetch_one(&mut *conn)
     .await
     .map_err(|e| SFError::Database(e.to_string()))?;
+
+    // 同一条连接、同一个事务里再落一条事件：转移是事实，表是它的第一份读法，
+    // 流是正本。幂等键取「任务 + 序号」——重放写不出第二条。
+    let event_id = format!("{}{:0>20}", "T", seq)
+        .chars()
+        .rev()
+        .take(26)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    let attributes = serde_json::json!({
+        "from": move_.from.map(|s| s.as_str()),
+        "to": move_.to.as_str(),
+        "actor": move_.actor,
+        "cause": move_.cause,
+    })
+    .to_string();
+    sqlx::query(
+        "INSERT INTO cogneva_event (\
+            event_id, kind, subject_kind, subject_id, unit_of_work, step, outcome, attempt, \
+            idempotency_key, causation_id, batch_id, actor, writer, scope, payload_version, \
+            attributes, at) \
+         VALUES ($1, 'task_transition', 'task', $2, $2, $3, 'ok', 1, $4, NULL, NULL, $5, \
+                 'storage', 'task', 1, $6, NOW()) \
+         ON CONFLICT (writer, idempotency_key) DO NOTHING",
+    )
+    .bind(&event_id)
+    .bind(move_.task_id)
+    .bind(move_.to.as_str())
+    .bind(format!("{}:{}", move_.task_id, seq))
+    .bind(move_.actor)
+    .bind(attributes)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| SFError::Database(format!("append the task_transition event: {e}")))?;
+
     Ok(seq)
 }
 

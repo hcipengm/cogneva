@@ -33,7 +33,7 @@ pub struct EnvelopeFields {
 /// 写入口当场被拒（[`check`] 会拒 `Unknown`）。
 /// 名单按写入方分：轮次（`round_*`）、计划（`batch_planned`）、变更候选四个阶段
 /// （`change_*`）、两类调用事实（`llm_call`／`tool_call`）。
-pub const KINDS: [&str; 10] = [
+pub const KINDS: [&str; 11] = [
     "round_opened",
     "round_closed",
     "batch_planned",
@@ -43,6 +43,9 @@ pub const KINDS: [&str; 10] = [
     "change_rejected",
     "llm_call",
     "tool_call",
+    // 任务的每一次状态转移也是事实：它今天只在 `task_transition` 表里有一份，
+    // 于是「任务停在哪一步、从哪接着跑」要读那张表——而流才是正本。
+    "task_transition",
     // 擦除：一段正文被销毁了，而事件流里留下「谁在什么时候、因为什么、销毁了哪一段」。
     // 它**不改写**被擦那条事件：历史照旧，指向正文的哈希还在，只是那个哈希现在指不到
     // 可读的字节——这正是「擦除」与「改历史」的区别。
