@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -33,7 +34,9 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import todo_source  # noqa: E402
 
-CELL = re.compile(r"代码\s*:\s*test\s*=\s*([^\s:]+)::([A-Za-z0-9_]+)")
+# 一格两个名字曾经并存（`代码:` 与 `判据读数:`），而同一件事两个名字必然分叉：
+# 1.5 写进去的那个，2.5 必须读得出来。两个都认，写的时候只写 `判据读数`。
+CELL = re.compile(r"(?:代码|判据读数)\s*:\s*(?:test\s*=\s*)?([^\s:]+)::([A-Za-z0-9_]+)")
 # 计数型条目：`判据读数: <普查面> → <目标>`（`->` 也认）。
 COUNT = re.compile(r"判据读数\s*:\s*([a-z0-9-]+)\s*(?:→|->)\s*(\d+)")
 
@@ -62,6 +65,9 @@ def parse_cell(item) -> tuple[str, str] | None:
 
 
 def in_diff(root: pathlib.Path, base: str, path: str) -> bool:
+    # `brain:` 那几族不在这一棵树的 diff 里：它们由台账仓自己的门判，这里放行。
+    if path.startswith("brain:"):
+        return True
     out = subprocess.run(
         ["git", "-C", str(root), "diff", "--name-only", base],
         capture_output=True,
@@ -72,11 +78,26 @@ def in_diff(root: pathlib.Path, base: str, path: str) -> bool:
     return path in {line.strip() for line in out.stdout.splitlines()}
 
 
+def resolve_test_file(root: pathlib.Path, path: str) -> pathlib.Path:
+    """`brain:` 前缀指台账那个仓：几族的证据本来就在那儿（普查器、宿主侧的夹具）。
+    不认这个前缀，它们永远填不上——而「只认这一棵树」不是普适。"""
+    if path.startswith("brain:"):
+        repo = os.environ.get("COGNEVA_LEDGER_REPO") or str(
+            pathlib.Path.home() / "work/cogneva-brain"
+        )
+        return pathlib.Path(repo) / path[len("brain:") :]
+    return root / path
+
+
 def defines_test(root: pathlib.Path, path: str, name: str) -> bool:
-    file = root / path
+    file = resolve_test_file(root, path)
     if not file.is_file():
         return False
     text = file.read_text(errors="ignore")
+    # shell 夹具也是测试（`progress-watchdog.test.sh` 这类）：判据不认它们，等于几族
+    # 待办永远填不上。它们的「用例名」是文件里那些 `ok "..."` 行的标签。
+    if path.endswith((".sh", ".py")):
+        return name in text
     # 函数定义前 200 字里有测试属性：够近，又不会被别的函数借去。
     for match in re.finditer(rf"fn\s+{re.escape(name)}\s*\(", text):
         head = text[max(0, match.start() - 200) : match.start()]
