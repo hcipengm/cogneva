@@ -3945,7 +3945,9 @@ data:
           "pge": {
             "_comment": "PGE actor 输出契约。schemas 按 actor 名（planner/generator/evaluator/moderator/merger）配置 JSON Schema；配置后 schema 会注入 prompt 上下文并对 LLM 原始输出做校验，校验失败仅告警并回退宽松解析，不会中断流水线。默认为空 = 使用内置契约。",
             "_comment_local_repair_max": "局部修复预算：Evaluator 判失败后保持当前 Plan 不变、把 feedback 回传给 Generator 再生成的次数，耗尽才做全局重置（重跑 Planner）。0 = 关闭这条路径，于是每次失败都从新 Plan 重来。写在这里是因为 schemas 一旦配置就很难注意到这条键缺了，而缺了的读法是 0。",
-            "schemas": {}
+            "schemas": {},
+            "local_repair_max": 2,
+            "_comment_local_repair_max_value": "两条是默认值：Evaluator 判失败后先在原 Plan 上回传 feedback 让 Generator 重生成，两次都不过才重跑 Planner。改它要与代码里的 DEFAULT_LOCAL_REPAIR_MAX 一起改，否则部署里设的数与代码缺省不同源。"
           },
           "ralph": {
             "_comment": "Ralph Loop 的预算与停滞窗口。这两条界决定一条不收敛的链在什么位置停下：max_iterations 是单次执行的迭代硬上限，stagnation_window 是最近多少轮没有进展即终止。两条都按次计、不跨执行累计。"
