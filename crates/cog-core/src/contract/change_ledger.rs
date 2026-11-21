@@ -786,7 +786,7 @@ pub struct ChangeCellsCensus {
 ///
 /// 填了不等于好——它只说这一步有证据。判「终态」与「红了」的是
 /// [`ChangeCells::is_terminal`] 与 [`ChangeCells::unverified`]。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeCells {
     /// 树里有实现。
     pub code: bool,

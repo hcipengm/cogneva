@@ -56,6 +56,16 @@ impl BatchPlanner for LedgerBatchPlanner {
             "这一批的 {} 条在同一份验证下一起成立：一次编辑、一次编译、一次闸门",
             items.len()
         ));
+        // 终态是**三格齐**，不是「文件改过」。计划里写出来，是因为这是这一批做到什么
+        // 程度才算完的唯一一句话：缺验证格的那几条到了推上去、跑起来为止都还不是
+        // 「成了」，而这句话不说，一份全部「改过」的批次就会读作全部做完。
+        let terminal = items.iter().filter(|item| item.cells.is_terminal()).count();
+        let unverified = items.iter().filter(|item| item.cells.unverified()).count();
+        invariants.push(format!(
+            "这一批里三格齐（终态）{terminal} 条，缺格 {} 条；其中代码填了、验证空着的 {unverified} 条——\
+             它们读作做完了、实际没人核过，不是终态",
+            items.len() - terminal
+        ));
 
         Ok(Plan {
             input_type: "ledger-batch".to_string(),
@@ -70,6 +80,12 @@ impl BatchPlanner for LedgerBatchPlanner {
                     shape: "闸门".to_string(),
                     statement: "这一批整体过一次推送前的门，它跑绿并留下记账".to_string(),
                     check: "bash deploy/scripts/check-before-push.sh".to_string(),
+                },
+                PlanAcceptance {
+                    shape: "终态".to_string(),
+                    statement: "账上再没有一行写着 `已落` 却缺三格，而且这一轮的那几条三格齐"
+                        .to_string(),
+                    check: "python3 scripts/hooks/family.py --root . --terminal".to_string(),
                 },
             ],
             counterexamples: vec![
@@ -91,6 +107,7 @@ mod tests {
             id: id.to_string(),
             title: title.to_string(),
             touches: vec![format!("crates/{id}/src/lib.rs")],
+            cells: cog_core::ChangeCells::default(),
         }
     }
 
