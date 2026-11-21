@@ -76,12 +76,26 @@ def is_code(path: pathlib.Path) -> bool:
     return path.suffix in CODE_SUFFIXES
 
 
+class Unreadable(Exception):
+    """基线读不出来：这一批的边界没有答案，不是「没有改动」。"""
+
+
 def changed_since(root: pathlib.Path, base: str) -> list[pathlib.Path]:
-    out = subprocess.run(
-        ["git", "-C", str(root), "diff", "--name-only", f"{base}...HEAD"],
+    # 两点差（`<rev>` 到工作树），不是 `<base>...HEAD`：三点差取 merge-base，量的是
+    # 「与主线分叉以来」，而这一批的边界是开工那个 rev。工作树上有没提交的改动时，
+    # 三点差也看不见它们——而「改了没编译」正是要抓这个。
+    diff = subprocess.run(
+        ["git", "-C", str(root), "diff", "--name-only", base],
         capture_output=True,
         text=True,
-    ).stdout
+    )
+    if diff.returncode != 0:
+        # 读不到与「没有改动」是两件事：把前者读成后者，这一推就白判了——而它恰是
+        # 一份没人量过的字节。
+        raise Unreadable(
+            f"git diff {base} 读不出来（退出码 {diff.returncode}）：{diff.stderr.strip()[:160]}"
+        )
+    out = diff.stdout
     files = [root / line for line in out.splitlines() if line.strip()]
     files = [p for p in files if is_code(p)]
     head = subprocess.run(
@@ -92,12 +106,36 @@ def changed_since(root: pathlib.Path, base: str) -> list[pathlib.Path]:
     return files, head
 
 
+def round_baseline() -> str | None:
+    """这一轮开工时的代码 rev——与 family/batch-gate 用的是同一个基准。
+
+    三道门（编译前的垫片、推前的批次门、这道编译纪律）必须量同一个「自开工以来
+    改了什么」。这里原来只认 `--base`（`origin/main`），而其它两道按 `code_rev`
+    算：同一个批次在两边是两个数，2026-11-20 就是这么量出来的「4 条 / 10 条」。
+    读不到事件流或没有开着一轮时返回 `None`，由调用方退回 `--base`。
+    """
+    try:
+        import round as round_mod
+        current = round_mod.current_round()
+    except Exception:
+        return None
+    if current and len(current) > 2 and current[2]:
+        return current[2]
+    return None
+
+
 def check(root: pathlib.Path, base: str, ledger: pathlib.Path) -> int:
     times = ledgers(ledger, root)
     if not times:
         print("compile-discipline: 这棵树上没有编译记录，这一推不判。")
         return 0
-    files, commits = changed_since(root, base)
+    pinned = round_baseline()
+    baseline = pinned or base
+    try:
+        files, commits = changed_since(root, baseline)
+    except Unreadable as why:
+        print(f"compile-discipline: {why} —— 这一推没判。", file=sys.stderr)
+        return 3
     if not files:
         print("compile-discipline: 与基线相比没有改动，这一推不判。")
         return 0
@@ -141,7 +179,13 @@ def check(root: pathlib.Path, base: str, ledger: pathlib.Path) -> int:
             )
             return 1
 
-    print(f"compile-discipline: 一批 {len(in_batch)} 次编译，最后一次在全部编辑之后。")
+    # 基准要说出来：读的是「这一轮开工以来」还是「与主线的差」，是一句话的事，
+    # 而两个人拿两个基准去问同一批，量出来就是两个数。
+    source = "这一轮的 code_rev" if pinned else "基线"
+    print(
+        f"compile-discipline: 按{source} {baseline[:12]} 判；"
+        f"一批 {len(in_batch)} 次编译，最后一次在全部编辑之后。"
+    )
     return 0
 
 

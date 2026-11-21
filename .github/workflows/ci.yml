@@ -238,6 +238,18 @@ jobs:
         run: python3 deploy/scripts/check-manifest-duplicate-keys.py
       - name: Check the duplicate-key gate rejects what it should
         run: bash deploy/scripts/tests/manifest-duplicate-keys.test.sh
+      # 批次纪律那四道门各自的判据，在 CI 与本机跑同一份夹具：本机绿而 CI 红过一次
+      # （或者反过来），说明判据在两边不是同一条。
+      - name: Check the batch gate judges what it claims
+        run: bash deploy/scripts/tests/batch-gate.test.sh
+      - name: Check the compile-discipline gate judges what it claims
+        run: bash deploy/scripts/tests/compile-discipline.test.sh
+      - name: Check the ledger reader refuses a row it cannot judge
+        run: bash deploy/scripts/tests/todo-source-requires-a-status-column.test.sh
+      - name: Check "done" means three cells, not a touched file
+        run: bash deploy/scripts/tests/a-todo-is-done-only-when-three-cells-are-filled.test.sh
+      - name: Check a worker reads only its own ledger
+        run: bash deploy/scripts/tests/a-worker-reads-only-its-own-ledger.test.sh
       # 跑在共享测试库上的测试，不许把整张表数一遍。`COGNEVA_TEST_DATABASE_URL`
       # 把整个套件指向同一份库，整表数行数等于断言「别的测试此刻有没有行」；
       # 而且踩中的那一跑常常 panic 在自己的 cleanup 之前，把它写的行留在库里，

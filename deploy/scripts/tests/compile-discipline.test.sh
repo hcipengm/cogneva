@@ -74,5 +74,29 @@ record "2030-01-01T00:06:00Z" "check"
 out="$(run)"; rc=$?
 [ "$rc" -eq 0 ] && ok "写了 Recompiled 理由：绿" || bad "有理由仍被拒（rc=$rc）：$out"
 
+# 5. 开着一轮时用**这一轮的 code_rev**，不用 `origin/main`：三道门量同一件事。
+#    读数里要说得出来用的是哪个基准——两个人拿两个基准问同一批，量出来就是两个数。
+round_rev="$(git -C "$tree" rev-parse main)"
+cat >"$tree/scripts/hooks/round.py" <<ROUND
+def current_round():
+    return ("evt", "ledger-rev", "$round_rev", [], "ledger-rev")
+ROUND
+touch -d "2000-01-01T00:00:10Z" "$tree/crates/demo/src/lib.rs"
+record "2030-01-01T00:07:00Z" "check"
+out="$(COGNEVA_COMPILE_LEDGER="$ledger" python3 "$tree/scripts/hooks/compile-ledger.py" check --root "$tree" --base main --ledger "$ledger" 2>&1)"; rc=$?
+{ printf '%s' "$out" | grep -q "这一轮的 code_rev"; } \
+  && ok "开着一轮：基准是这一轮的 code_rev，而且说出来了" \
+  || bad "没按这一轮的 code_rev 判（rc=$rc）：$out"
+# 5b. 基线的 rev 在树里不存在：报「没判」（退 3），不能读成「没有改动」。
+cat >"$tree/scripts/hooks/round.py" <<'ROUND'
+def current_round():
+    return ("evt", "ledger-rev", "000000000000", [], "ledger-rev")
+ROUND
+out="$(python3 "$tree/scripts/hooks/compile-ledger.py" check --root "$tree" --base main --ledger "$ledger" 2>&1)"; rc=$?
+{ [ "$rc" -eq 3 ] && printf '%s' "$out" | grep -q "没判"; } \
+  && ok "基线读不出来：退 3（没判），不读成「没有改动」" \
+  || bad "基线读不出来时的行为不对（rc=$rc）：$out"
+rm -f "$tree/scripts/hooks/round.py"
+
 printf '\ncompile-discipline.test.sh: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
