@@ -735,4 +735,23 @@ mod tests {
             Err(PlanDefect::Unmeasurable("我的 markdown".into()))
         );
     }
+
+    /// 一批的每一条都必须在计划里被点到名：漏一条，这份计划说的就不是「这一批」，
+    /// 而份量不足的计划与一份完整的计划在别处长得一样。
+    #[test]
+    fn a_plan_must_name_every_item_of_its_batch() {
+        let plan = Plan {
+            input_type: "ledger-batch".into(),
+            invariants: vec!["S1：把 A 做完".into(), "S2：再把 B 做完".into()],
+            acceptance: Vec::new(),
+            counterexamples: Vec::new(),
+            one_shape_because: None,
+        };
+        assert!(plan.names_every(&["S1".into(), "S2".into()]));
+        assert!(
+            !plan.names_every(&["S1".into(), "S3".into()]),
+            "计划没提到 S3 却被判成点齐了"
+        );
+        assert!(plan.names_every(&[]), "空批次是点齐了，不是漏了");
+    }
 }
