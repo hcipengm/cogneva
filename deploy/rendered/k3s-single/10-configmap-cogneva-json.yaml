@@ -4073,6 +4073,9 @@ data:
         "_comment_discovery_enabled": "Whether THIS process takes part in discovery at all. One binary serves several deployments (main app, evolution pod, security gateway, sandbox executor) and each of the first two builds its own plugin table, so a process that takes part contends for the discovery role over the shared database: each participating replica asks the lease on its own cadence, only the holder scans and follows up, and the role moves to another replica on the next ask after a holder that was killed stops renewing its term. Without that arbitration two processes scan the same upstream items and ask the same clarification twice: intent guards are per-pod files, so neither can see the other already acted. The webhook event entry is deliberately not part of the lease — which process receives issue/comment events is a routing decision made where the events are delivered, and the periodic poll is the fallback for what the events do not reach. Deployment sets this false on the evolution pod, which therefore neither polls nor receives events.",
         "discovery_enabled": true,
         "discovery_mode": "both",
+        "poll_interval_secs": 300,
+        "max_issues_per_scan": 50,
+        "_comment_cadence": "轮询周期与单次扫描上限：300 秒 / 50 条，与代码里 GitHubIntegrationConfig 的缺省一致。webhook 是主路径，轮询只是它够不到时的兜底，所以周期不必更短；单次上限决定一轮最多跟进多少条，调大要让租约的续期节奏跟着看。",
         "repo": "hcipengm/cogneva",
         "base_branch": "main",
         "accounts": [
