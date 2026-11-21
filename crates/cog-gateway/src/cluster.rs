@@ -2574,6 +2574,7 @@ mod topology_tests {
                 command: command.to_string(),
                 rss_bytes: 1024,
             }],
+            processes_total: None,
         };
         crate::process_reports::record("aaaa", report("cogneva-app"));
         crate::process_reports::record("bbbb", report("cogneva-sidecar"));
@@ -2617,6 +2618,7 @@ mod topology_tests {
                     command: "x".to_string(),
                     rss_bytes: 0,
                 }],
+                processes_total: None,
             },
         );
         let pod = json!({

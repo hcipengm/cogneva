@@ -24,6 +24,10 @@ pub const DEFAULT_REPORT_URL: &str = "http://cogneva:8085/api/v1/cluster/process
 // cap: bound — 这一格答「现在跑着什么」不是时间序列；六十秒够让停掉的进程在下一拍消失，又不会把总线塞满
 pub const REPORT_INTERVAL: Duration = Duration::from_secs(60);
 /// 与网关收口的条数一致：读多了也没人要，`/proc` 很大时按 PID 从小到大取。
+///
+/// 收条数是一件事，把「收过」说出来是另一件：一份停在 64 条的表必须带上它本来
+/// 有几个（[`ScannedProc::processes_total`]），否则屏上读作「它就这么多」，而不是
+/// 「这一面只读这么多」。
 // cap: bound — 与网关收口的条数一致：读多了也没人要，/proc 很大时按 PID 从小到大取
 pub const MAX_PROCESSES: usize = 64;
 
@@ -35,11 +39,25 @@ pub struct ReportedProcess {
     pub rss_bytes: u64,
 }
 
+/// 一遍 `/proc`：读成行的进程表，与这一份表是从多少个 pid 里收出来的。
+#[derive(Debug, Default)]
+pub struct ScannedProc {
+    pub processes: Vec<ReportedProcess>,
+    /// 列出来的 pid 个数，在按 [`MAX_PROCESSES`] 收条数**之前**取。
+    ///
+    /// 没有它，`processes` 停在 64 条时屏上读作「它就跑着这 64 个」——而真正发生
+    /// 的事可能是「它跑着 137 个，这一面只收前 64 个」。界停在界上，与量到就是
+    /// 这个值，必须是两个读数。
+    pub processes_total: usize,
+}
+
 #[derive(Debug, Serialize)]
 struct ReportBody {
     pod: String,
     container_id: String,
     processes: Vec<ReportedProcess>,
+    /// 容器此刻列出来的进程数；`processes` 是其中读成行、且没被条数上限截掉的那些。
+    processes_total: usize,
 }
 
 /// 这条循环在 `loop_health` 里的名字。
@@ -112,22 +130,30 @@ impl Reporter {
         let Some(container_id) = own_container_id() else {
             return;
         };
-        let processes = scan_proc();
-        if processes.is_empty() {
+        let scanned = scan_proc();
+        // 一条都读不成行的一拍不报：空表会盖掉上一拍那份好读数，而「这一遍读不出
+        // 一行」不是「这个容器里没有进程」。
+        if scanned.processes.is_empty() {
             return;
         }
-        self.push(container_id, processes).await;
+        self.push(container_id, scanned).await;
     }
 
     /// 这一拍的自报。发送与它的失败判词收在 [`push_report`] 里：测试要能直接喂一份
     /// 读数进来，而不是先造一个 cgroup 与一整棵 `/proc`。
-    async fn push(&self, container_id: String, processes: Vec<ReportedProcess>) {
-        let body = ReportBody {
-            pod: self.pod.clone(),
-            container_id,
-            processes,
-        };
+    async fn push(&self, container_id: String, scanned: ScannedProc) {
+        let body = report_body(self.pod.clone(), container_id, scanned);
         push_report(&self.client, &self.url, &body).await;
+    }
+}
+
+/// 一份自报的身体。单独成一个函数，好让「表里几条、它本来几个」在测试里读得到。
+fn report_body(pod: String, container_id: String, scanned: ScannedProc) -> ReportBody {
+    ReportBody {
+        pod,
+        container_id,
+        processes: scanned.processes,
+        processes_total: scanned.processes_total,
     }
 }
 
@@ -180,17 +206,33 @@ pub fn container_id_in_cgroup_line(line: &str) -> Option<String> {
 }
 
 /// 读一遍 `/proc`：每个 PID 的父 PID、名字、常驻内存。
-pub fn scan_proc() -> Vec<ReportedProcess> {
+pub fn scan_proc() -> ScannedProc {
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
+        return ScannedProc::default();
     };
-    let mut pids: Vec<u32> = entries
+    let pids: Vec<u32> = entries
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
         .collect();
+    let (processes, processes_total) = assemble_table(pids);
+    ScannedProc {
+        processes,
+        processes_total,
+    }
+}
+
+/// 一列 pid 收成一张表：返回读成行的那些，与这一列本来有几个。
+///
+/// 个数在截断之前取。两条自报的路（容器里读 `/proc`、宿主上读 `cgroup.procs`）
+/// 共用这一处收口，所以「表停在 64 条」这个读数在哪条路上都说得出来。
+pub(crate) fn assemble_table(mut pids: Vec<u32>) -> (Vec<ReportedProcess>, usize) {
     pids.sort_unstable();
+    let processes_total = pids.len();
     pids.truncate(MAX_PROCESSES);
-    pids.into_iter().filter_map(read_process).collect()
+    (
+        pids.into_iter().filter_map(read_process).collect(),
+        processes_total,
+    )
 }
 
 /// 一个 PID 的三样东西：父 PID、名字、常驻内存。它退出得快时读不全，
@@ -324,14 +366,60 @@ mod tests {
 
     #[test]
     fn scanning_proc_returns_whole_rows_only() {
-        let processes = scan_proc();
-        assert!(!processes.is_empty(), "宿主上总有进程");
-        assert!(processes.len() <= MAX_PROCESSES, "条数按上限收");
+        let scanned = scan_proc();
+        assert!(!scanned.processes.is_empty(), "宿主上总有进程");
+        assert!(scanned.processes.len() <= MAX_PROCESSES, "条数按上限收");
         assert!(
-            processes
+            scanned
+                .processes
                 .iter()
                 .all(|p| p.pid > 0 && !p.command.trim().is_empty()),
             "每一行都读全了才算"
+        );
+        assert!(
+            scanned.processes_total >= scanned.processes.len(),
+            "它本来几个，不能比收进来的还少"
+        );
+    }
+
+    /// 表按上限收，但「收到上限」与「它只有这么多」必须是两个读数：只看条数，
+    /// 一个跑着 137 个进程的构建容器与一个正好跑 64 个的容器在屏上一模一样。
+    #[test]
+    fn a_table_cut_at_the_cap_states_how_many_it_could_see() {
+        // 自己的 pid 重复填满：这一格判的是计数与截断，不是容器里到底有哪些进程，
+        // 而重复的 pid 保证每一行都读得成（真的去凑 69 个存在的进程会在 CI 上抖动）。
+        let me = std::process::id();
+        let (rows, total) = assemble_table(vec![me; MAX_PROCESSES + 5]);
+        assert_eq!(total, MAX_PROCESSES + 5, "个数要在截断之前取");
+        assert_eq!(rows.len(), MAX_PROCESSES, "条数照旧按上限收");
+
+        let (rows, total) = assemble_table(vec![me]);
+        assert_eq!((rows.len(), total), (1, 1), "没撞上限时两个数是同一个");
+    }
+
+    /// 自报的身体里带着「本来几个」：这条读数要能走到网关那一侧，而不只是留在
+    /// 本进程的内存里。
+    #[test]
+    fn the_pushed_table_carries_the_count_it_was_cut_from() {
+        let body = report_body(
+            "pod-a".into(),
+            "c0ntainer".into(),
+            ScannedProc {
+                processes: vec![ReportedProcess {
+                    pid: 7,
+                    parent_pid: 1,
+                    command: "sleep".into(),
+                    rss_bytes: 4096,
+                }],
+                processes_total: 137,
+            },
+        );
+        let json = serde_json::to_value(&body).expect("自报的身体可序列化");
+        assert_eq!(json["processes_total"], serde_json::json!(137));
+        assert_eq!(
+            json["processes"].as_array().map(Vec::len),
+            Some(1),
+            "表里几条是另一回事"
         );
     }
 }
@@ -367,7 +455,13 @@ mod push_tests {
         let _guard =
             tracing::subscriber::set_default(tracing_subscriber::registry().with(warns.clone()));
         reporter(base)
-            .push("c0ntainer".into(), vec![one_process()])
+            .push(
+                "c0ntainer".into(),
+                ScannedProc {
+                    processes: vec![one_process()],
+                    processes_total: 1,
+                },
+            )
             .await;
         assert!(warns.said().is_empty(), "{:?}", warns.said());
         server.abort();
@@ -381,7 +475,13 @@ mod push_tests {
         let _guard =
             tracing::subscriber::set_default(tracing_subscriber::registry().with(warns.clone()));
         reporter(base)
-            .push("c0ntainer".into(), vec![one_process()])
+            .push(
+                "c0ntainer".into(),
+                ScannedProc {
+                    processes: vec![one_process()],
+                    processes_total: 1,
+                },
+            )
             .await;
         let said = warns.said();
         assert!(
@@ -402,7 +502,13 @@ mod push_tests {
         let _guard =
             tracing::subscriber::set_default(tracing_subscriber::registry().with(warns.clone()));
         reporter(format!("http://{addr}"))
-            .push("c0ntainer".into(), vec![one_process()])
+            .push(
+                "c0ntainer".into(),
+                ScannedProc {
+                    processes: vec![one_process()],
+                    processes_total: 1,
+                },
+            )
             .await;
         let said = warns.said();
         assert!(

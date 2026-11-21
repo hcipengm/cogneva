@@ -391,12 +391,17 @@ function NodeCard({ node }: { node: TopologyNode }) {
             个容器，其中 <span className="mono">{node.unclaimed_containers}</span>{' '}
             个没有任何 Pod 认领（构建容器、宿主上直接起的进程）：它们有进程读数，但没有
             Pod 这一格。下面按进程数从多到少列出是谁——cgroup 只给容器 id，进程名是这一面
-            唯一读得到的身份。
+            唯一读得到的身份。进程数按条数收：写成 <span className="mono">64/137</span>{' '}
+            时，斜杠前是这一面列出的条数，后面是它实际跑着几个。
           </p>
           <ul className="mt-1 space-y-0.5">
             {node.unclaimed.map((row) => (
               <li key={row.id} className="mono text-[10px] text-[var(--muted)]">
-                {row.id} · {row.processes} 个进程
+                {row.id} · {row.processes}
+                {row.processes_total != null && row.processes_total > row.processes
+                  ? `/${row.processes_total}`
+                  : ''}{' '}
+                个进程
                 {row.commands.length > 0 && <> · {row.commands.join(' / ')}</>}
               </li>
             ))}

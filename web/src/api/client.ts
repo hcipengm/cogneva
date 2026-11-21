@@ -3443,8 +3443,13 @@ export interface TopologyNode {
 export interface TopologyUnclaimedContainer {
   /** 容器实例 id 的前 12 个字符——够认出「同一台机器上刚才那两个」。 */
   id: string;
-  /** 里面跑着几个进程。 */
+  /** 这一面的表里读到了几条进程。 */
   processes: number;
+  /**
+   * 它本来跑着几个。表按上限收条数，所以 `processes` 可能只是前几十条；
+   * `null` ＝ 报上来的那一方没说（旧镜像），不是「就这么多」。
+   */
+  processes_total: number | null;
   /** 最占内存的那几个进程名，去重、最多 4 个。cgroup 只给 id，名字只能从进程来。 */
   commands: string[];
 }

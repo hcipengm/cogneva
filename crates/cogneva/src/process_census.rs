@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::process_report::{read_process, ReportedProcess, MAX_PROCESSES};
+use crate::process_report::ReportedProcess;
 
 /// 这条循环在 `loop_health` 里的名字。
 pub const LOOP_NAME: &str = "process-census";
@@ -82,6 +82,10 @@ struct ContainerReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pod_uid: Option<String>,
     processes: Vec<ReportedProcess>,
+    /// 这个容器此刻 cgroup 里列着几个 pid；`processes` 是其中读成行、且没被条数
+    /// 上限截掉的那些。宿主上的构建容器可以跑着上百个进程，而这一面只收前几十个
+    /// ——不说出这个数，屏上就把「只读了这么多」读成「就跑了这么多」。
+    processes_total: usize,
 }
 
 /// 一个 cgroup 目录名是不是某个容器实例的叶子；是就给出那串 id。
@@ -113,6 +117,8 @@ pub struct ScannedContainer {
     /// 它所在 Pod 的 uid（连字符形式，与 `metadata.uid` 一致）；不在 Pod 下的没有。
     pub pod_uid: Option<String>,
     pub processes: Vec<ReportedProcess>,
+    /// `cgroup.procs` 里列出来的 pid 个数，在按条数收表**之前**取。
+    pub processes_total: usize,
 }
 
 /// 一个目录名是不是某个 Pod 的 slice；是就给出那个 Pod 的 uid。
@@ -160,13 +166,14 @@ fn walk(
         };
         match container_id_of_dir(name) {
             Some(id) => {
-                let processes = cgroup_processes(&child);
+                let (processes, processes_total) = cgroup_processes(&child);
                 if !processes.is_empty() {
                     out.insert(
                         id,
                         ScannedContainer {
                             pod_uid: pod_uid.map(str::to_string),
                             processes,
+                            processes_total,
                         },
                     );
                 }
@@ -181,17 +188,19 @@ fn walk(
 }
 
 /// 一个容器 cgroup 里的进程。`cgroup.procs` 给出进程 id（不是线程 id），逐个读 `/proc`。
-fn cgroup_processes(dir: &Path) -> Vec<ReportedProcess> {
+///
+/// 返回「读成行的表」与「这一列本来有几个」：收条数的上限在
+/// [`crate::process_report::assemble_table`] 里，两个数一起出来，所以截断在这条
+/// 路上同样说得出口。
+fn cgroup_processes(dir: &Path) -> (Vec<ReportedProcess>, usize) {
     let Ok(text) = std::fs::read_to_string(dir.join("cgroup.procs")) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
-    let mut pids: Vec<u32> = text
+    let pids: Vec<u32> = text
         .lines()
         .filter_map(|line| line.trim().parse::<u32>().ok())
         .collect();
-    pids.sort_unstable();
-    pids.truncate(MAX_PROCESSES);
-    pids.into_iter().filter_map(read_process).collect()
+    crate::process_report::assemble_table(pids)
 }
 
 /// 宿主 cgroup 根挂进来了没有。空表不能同时表示「挂错」与「没有容器」。
@@ -292,6 +301,7 @@ impl Census {
                 container_id,
                 pod_uid: scanned.pod_uid,
                 processes: scanned.processes,
+                processes_total: scanned.processes_total,
             })
             .collect();
         // 一个容器都没有也照发：这一拍同时是「这台节点我在」的活体，而「采集器在跑、
@@ -418,6 +428,32 @@ mod tests {
             None,
             "不在 Pod slice 下的容器没有归属，不能被安到任何 Pod 上"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 宿主上的构建容器可以跑着上百个进程，而表只收前几十条：那一格必须跟着
+    /// 「本来几个」一起报出去，否则屏上把「只读了这么多」读成「就跑了这么多」。
+    #[test]
+    fn a_cgroup_with_more_pids_than_the_table_holds_states_how_many_it_saw() {
+        let root = std::env::temp_dir().join(format!("cog-census-capped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let leaf = root.join(format!("cri-containerd-{A}.scope"));
+        std::fs::create_dir_all(&leaf).unwrap();
+        // 自己的 pid 重复填满：这一格判的是计数与截断，而重复的 pid 保证每一行都
+        // 读得成——真去凑 69 个存在的进程会在 CI 上按机器抖动。
+        let me = std::process::id();
+        let cap = crate::process_report::MAX_PROCESSES;
+        let text = format!("{me}\n").repeat(cap + 5);
+        std::fs::write(leaf.join("cgroup.procs"), &text).unwrap();
+
+        let scanned = scan(&root);
+        let row = scanned.get(A).expect("这个叶子被认成一个容器");
+        assert_eq!(
+            row.processes_total,
+            cap + 5,
+            "列出来的 pid 个数要在截断之前取"
+        );
+        assert_eq!(row.processes.len(), cap, "条数照旧按上限收");
         let _ = std::fs::remove_dir_all(&root);
     }
 

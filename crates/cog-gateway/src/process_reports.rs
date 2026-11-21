@@ -72,6 +72,12 @@ pub struct Report {
     pub pod_uid: Option<String>,
     pub reported_at: DateTime<Utc>,
     pub processes: Vec<ReportedProcess>,
+    /// 发送方在收条数**之前**数到的进程个数；`processes` 是其中送过来的那些。
+    ///
+    /// `None` = 发送方没说（这一格出现之前写的镜像），不是「就这么多」：一个
+    /// 停在 [`MAX_REPORTS`] 条上的表，与一个正好这么多进程的容器，在屏上必须
+    /// 分得开。
+    pub processes_total: Option<usize>,
 }
 
 /// 进程表的落脚处。按**容器实例 id** 存最近一份——**最近一份就够**：这一面问的
@@ -96,9 +102,15 @@ pub fn record(container_id: &str, report: Report) -> bool {
     // 每个最多带 64 条进程；只写不删时这张表跟着开机时长长，而屏上一点都看不出来。
     // 清在写这一侧：写是一分钟一批，读是每次刷新都读。
     reports.retain(|_, previous| fresh(previous));
+    // 比的是这一面**读得出来**的全部读数，不只是表本身：一个容器一直在跑 137 个
+    // 进程、其中表里那 64 条没变，总数从 137 走到 150 时屏上那个数该变——只比表
+    // 就会让它停在 137，而落帧是屏重读的唯一信号。
     let changed = reports
         .get(container_id)
-        .map(|previous| previous.processes != report.processes)
+        .map(|previous| {
+            previous.processes != report.processes
+                || previous.processes_total != report.processes_total
+        })
         .unwrap_or(true);
     reports.insert(container_id.to_string(), report);
     changed
@@ -159,8 +171,13 @@ pub struct UnclaimedContainer {
     /// 容器实例 id 的前 12 个字符。完整 id 是六十来位十六进制，这一面没有地方用它
     /// ——读者要认的是「同一台机器上刚才那两个」，不是把它敲进 shell。
     pub id: String,
-    /// 里面跑着几个进程。
+    /// 这一面的表里读到了几条进程。
     pub processes: usize,
+    /// 它本来跑着几个；`None` = 发送方没说。
+    ///
+    /// 与 `processes` 分开是这一格的全部要点：表按 [`MAX_REPORTS`] 收条数，只看
+    /// `processes`，一个跑着 137 个进程的构建容器与一个正好 64 个的看起来一样。
+    pub processes_total: Option<usize>,
     /// 最占内存的那几个进程名，去重后最多 [`MAX_UNCLAIMED_COMMANDS`] 个。
     pub commands: Vec<String>,
 }
@@ -219,6 +236,7 @@ pub fn census_gap(node: &str, claims: &Claims) -> Option<CensusGap> {
             unclaimed.push(UnclaimedContainer {
                 id: id.chars().take(12).collect(),
                 processes: report.processes.len(),
+                processes_total: report.processes_total,
                 commands: commands_of(&report.processes),
             });
         }
@@ -292,6 +310,10 @@ pub struct ReportBody {
     #[serde(default)]
     pub pod_uid: Option<String>,
     pub processes: Vec<ReportedProcess>,
+    /// 发送方在收条数之前数到的进程个数。缺省（旧镜像）落 `None`：没说是
+    /// 「没量到」，不是「就这么多」。
+    #[serde(default)]
+    pub processes_total: Option<usize>,
 }
 
 /// 节点采集器一拍报上来的一批：这台节点上每一个容器实例各一份，外加节点名本身。
@@ -438,6 +460,7 @@ async fn ingest(
                     .map(|uid| uid.replace('_', "-")),
                 reported_at: Utc::now(),
                 processes,
+                processes_total: report.processes_total,
             },
         );
     }
@@ -520,6 +543,7 @@ mod tests {
                     command: "sh".to_string(),
                     rss_bytes: 0,
                 }],
+                processes_total: None,
             },
         );
         assert!(latest(container).is_none(), "过期的一份读作「没有读数」");
@@ -540,6 +564,7 @@ mod tests {
                     command: "old".to_string(),
                     rss_bytes: 0,
                 }],
+                processes_total: None,
             },
         );
         record(
@@ -554,6 +579,7 @@ mod tests {
                     command: "new".to_string(),
                     rss_bytes: 0,
                 }],
+                processes_total: None,
             },
         );
         let report = latest(container).expect("新鲜的这一份");
@@ -578,6 +604,7 @@ mod tests {
                     node: String::new(),
                     reported_at: Utc::now(),
                     processes: table.clone(),
+                    processes_total: None,
                 }
             ),
             "第一次报到，屏上还没有这一格"
@@ -590,6 +617,7 @@ mod tests {
                     node: String::new(),
                     reported_at: Utc::now(),
                     processes: table,
+                    processes_total: None,
                 }
             ),
             "同样的表再来一次，没有要屏重读的东西"
@@ -607,6 +635,7 @@ mod tests {
                         command: "sh".to_string(),
                         rss_bytes: 0,
                     }],
+                    processes_total: None,
                 }
             ),
             "多了一个进程，这才是该推的那一帧"
@@ -633,6 +662,7 @@ mod tests {
                     command: "sh".to_string(),
                     rss_bytes: 0,
                 }],
+                processes_total: None,
             },
         );
         record(
@@ -647,6 +677,7 @@ mod tests {
                     command: "sh".to_string(),
                     rss_bytes: 0,
                 }],
+                processes_total: None,
             },
         );
         let reports = REPORTS.read().unwrap_or_else(|e| e.into_inner());
@@ -696,6 +727,7 @@ mod tests {
                         command: "sh".to_string(),
                         rss_bytes: 0,
                     }],
+                    processes_total: None,
                 },
             );
         }
@@ -760,6 +792,7 @@ mod tests {
                 container_id: container_id.to_string(),
                 pod_uid: None,
                 processes,
+                processes_total: None,
             }],
         }
     }
@@ -782,6 +815,7 @@ mod tests {
                 command: command.to_string(),
                 rss_bytes: 4096,
             }],
+            processes_total: None,
         }
     }
 
@@ -914,6 +948,7 @@ mod tests {
                         pod: String::new(),
                         container_id: String::new(),
                         processes: one_process(),
+                        processes_total: None,
                     },
                 ],
             ),
@@ -975,6 +1010,7 @@ mod tests {
                 node: node.to_string(),
                 reported_at: Utc::now(),
                 processes: vec![process(1, "nginx", 100)],
+                processes_total: None,
             },
         );
         record(
@@ -992,6 +1028,7 @@ mod tests {
                     process(14, "ld", 500),
                     process(15, "cc", 400),
                 ],
+                processes_total: None,
             },
         );
         record(
@@ -1001,6 +1038,7 @@ mod tests {
                 node: node.to_string(),
                 reported_at: Utc::now() - chrono::Duration::seconds(FRESH_FOR.as_secs() as i64 + 5),
                 processes: vec![process(20, "left-behind", 100)],
+                processes_total: None,
             },
         );
         record(
@@ -1010,6 +1048,7 @@ mod tests {
                 node: "census-gap-node-elsewhere".to_string(),
                 reported_at: Utc::now(),
                 processes: vec![process(30, "other-node", 100)],
+                processes_total: None,
             },
         );
 
@@ -1026,6 +1065,104 @@ mod tests {
             row.commands,
             vec!["cargo", "rustc", "sh", "ld"],
             "按内存从大到小、去重、封顶"
+        );
+    }
+
+    /// 没有这次改动就会红：一张停在 [`MAX_REPORTS`] 条上的表，屏上只说得出「64
+    /// 个进程」，而那个容器可能跑着 137 个。表是收来的，个数是量到的，两个数都要走
+    /// 到缺口那一格，否则「只读了这么多」读作「就跑了这么多」。
+    #[tokio::test]
+    async fn a_capped_table_states_how_many_processes_the_container_runs() {
+        let node = "census-gap-node-capped";
+        let id = "d4d4d4d4d4d4d4";
+        record_census(node);
+        let rows: Vec<ReportedProcess> = (0..MAX_REPORTS)
+            .map(|pid| ReportedProcess {
+                pid: pid as u32 + 1,
+                parent_pid: 1,
+                command: format!("build-{pid}"),
+                rss_bytes: 4096,
+            })
+            .collect();
+        let (events, _rx) = tokio::sync::broadcast::channel(8);
+        let response = ingest(
+            batch(
+                node,
+                vec![ReportBody {
+                    pod: String::new(),
+                    container_id: id.to_string(),
+                    pod_uid: None,
+                    processes: rows,
+                    processes_total: Some(137),
+                }],
+            ),
+            &events,
+            &None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let row = latest(id).expect("这一份收下了");
+        assert_eq!(row.processes_total, Some(137), "送来的总数原样留着");
+
+        let gap = census_gap(node, &Claims::default()).expect("采集器报到过");
+        assert_eq!(gap.unclaimed.len(), 1);
+        assert_eq!(gap.unclaimed[0].processes, MAX_REPORTS, "表里就是这么多条");
+        assert_eq!(
+            gap.unclaimed[0].processes_total,
+            Some(137),
+            "屏上要说得出一共几个"
+        );
+    }
+
+    /// 发送方没说个数：这一格是「没量到」，不是「就这么多」——旧镜像报上来的
+    /// 一份表不能凭空长出一个总数。
+    #[tokio::test]
+    async fn a_sender_that_states_no_total_leaves_the_cell_unmeasured() {
+        let node = "census-gap-node-unstated";
+        let id = "e6e6e6e6e6e6e6";
+        record_census(node);
+        let (events, _rx) = tokio::sync::broadcast::channel(8);
+        let response = ingest(
+            batch(
+                node,
+                vec![ReportBody {
+                    pod: String::new(),
+                    container_id: id.to_string(),
+                    pod_uid: None,
+                    processes: one_process(),
+                    processes_total: None,
+                }],
+            ),
+            &events,
+            &None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let gap = census_gap(node, &Claims::default()).expect("采集器报到过");
+        assert_eq!(gap.unclaimed[0].processes_total, None);
+    }
+
+    /// 表没变、总数变了，屏上那个数就该重读：落帧是屏重读的唯一信号，只比表就
+    /// 会让它停在上一拍的数上。
+    #[test]
+    fn a_total_that_moved_reaches_the_screen_even_when_the_table_did_not() {
+        let container = "container-total-moves";
+        let table = one_process();
+        let report = |total: Option<usize>| Report {
+            pod_uid: None,
+            node: String::new(),
+            reported_at: Utc::now(),
+            processes: table.clone(),
+            processes_total: total,
+        };
+        assert!(record(container, report(Some(137))), "第一次报到");
+        assert!(
+            !record(container, report(Some(137))),
+            "两个数都没变，没有要屏重读的东西"
+        );
+        assert!(
+            record(container, report(Some(150))),
+            "同一个容器又在长进程：屏上那个数该跟着动"
         );
     }
 
@@ -1051,6 +1188,7 @@ mod tests {
                     command: "pause".to_string(),
                     rss_bytes: 0,
                 }],
+                processes_total: None,
             },
         );
 
@@ -1084,6 +1222,7 @@ mod tests {
                     container_id: id.to_string(),
                     pod_uid: Some("1288f852_f85f_4fce_a027_9fffbdcb0f26".to_string()),
                     processes: one_process(),
+                    processes_total: None,
                 }],
             },
             &events,
@@ -1121,6 +1260,7 @@ mod tests {
                     command: "app".to_string(),
                     rss_bytes: 1,
                 }],
+                processes_total: None,
             },
         );
         let mut claims = Claims::default();
