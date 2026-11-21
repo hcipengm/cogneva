@@ -1,5 +1,6 @@
 DROP INDEX IF EXISTS idx_cogneva_event_llm_call_at;
 ALTER TABLE cogneva_event
+    DROP COLUMN IF EXISTS round_batch,
     DROP COLUMN IF EXISTS tool_path,
     DROP COLUMN IF EXISTS cache_created_tokens,
     DROP COLUMN IF EXISTS cached_tokens,

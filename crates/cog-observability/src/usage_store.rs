@@ -620,7 +620,7 @@ CREATE TABLE IF NOT EXISTS gateway_llm_exchange (
     response_sha256     TEXT,
     request_bytes       BIGINT NOT NULL DEFAULT 0,
     response_seen_bytes BIGINT NOT NULL DEFAULT 0,
-    response_bytes      BIGINT NOT NULL DEFAULT 0,
+    response_bytes      BIGINT,
     request_raw         TEXT,
     response_raw        TEXT
 );
@@ -831,7 +831,7 @@ impl LlmUsageStore {
         .bind(r.response_sha256.as_deref())
         .bind(r.request_bytes as i64)
         .bind(r.response_seen_bytes as i64)
-        .bind(r.response_bytes as i64)
+        .bind(r.response_bytes.map(|v| v as i64))
         .bind(r.request_raw.as_deref())
         .bind(r.response_raw.as_deref())
         // 没有归档副本时的正文：老行用的是同样两列，读者不必分两种形状。

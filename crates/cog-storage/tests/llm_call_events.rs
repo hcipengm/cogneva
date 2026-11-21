@@ -110,6 +110,7 @@ fn call(id: &str) -> LlmCall {
         input_tokens: 10,
         output_tokens: 20,
         cached_tokens: 0,
+        cache_created_tokens: None,
         origin: "gateway_pool".into(),
         owner: None,
         latency_ms: Some(30),

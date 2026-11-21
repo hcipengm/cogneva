@@ -3564,6 +3564,7 @@ async fn land_usage_record(state: &AppState, record: LlmUsageRecord) {
                     input_tokens: record.tokens_input,
                     output_tokens: record.tokens_output,
                     cached_tokens: record.tokens_cached,
+                    cache_created_tokens: record.tokens_cache_created,
                     origin: record.origin.clone(),
                     owner: record.owner.clone(),
                     latency_ms: None,
@@ -4330,14 +4331,15 @@ async fn record_exchange(
     } else {
         response.map(sha256_hex)
     };
+    // 封口没成时是 `None`（没量到），不是 0（量到就是没有）——见 `response_bytes`
+    // 那一格的说明：`0` 与「不知道」写成同一个数，正是这一族最忌的形状。
     let response_bytes = if response_object.is_some() {
         response_object
             .as_ref()
             .and_then(|o| o.seal.as_ref())
             .map(|s| s.bytes)
-            .unwrap_or(0)
     } else {
-        response.map(|b| b.len() as u64).unwrap_or(0)
+        Some(response.map(|b| b.len() as u64).unwrap_or(0))
     };
     // 模型名从请求体里读：上游条目的 `model` 是被改写之后的真相，但调用方声明的
     // 那个名字在改写中丢了；两个都留着才回答得了"哪一边的模型在花钱"。

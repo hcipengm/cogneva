@@ -503,7 +503,11 @@ pub struct LlmExchangeRecord {
     /// How many response bytes the permanent copy holds. Equal to
     /// [`Self::response_seen_bytes`] unless the capture was cut, and `0` when
     /// there was no body at all.
-    pub response_bytes: u64,
+    ///
+    /// `None` 是**另一件事**：正文写进了大对象却没有封口（回读失败），这时副本长度
+    /// 量不到。写成 `0` 会让「副本一个字节也没有」与「没量到」在读数上同形，而前者是
+    /// 一次真实读数。
+    pub response_bytes: Option<u64>,
     /// 响应正文的大对象落点。**只有响应侧有指针**：请求正文在发出之前整段都在手上，
     /// 直接写行内那一列；响应是流进来的，逐块写进大对象，行里只留指针。两侧不对称
     /// 是因为两条路本来就不一样——给请求侧也开一段大对象，只是多三次数据库往返。

@@ -22,9 +22,23 @@ fn edit_verdict(root: &std::path::Path) -> Result<(Vec<String>, Vec<(String, Str
         .arg("edit")
         .output()
         .map_err(|e| format!("run {}: {e}", reader.display()))?;
-    if out.status.code() == Some(2) {
-        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+    // 判词脚本的契约是 0=全真、1=有假、2=读不到。**其余任何退出码都不是判词**：
+    // 未捕获异常是 1、被信号杀死是 `None`——把这两种读成「有假」都还好，读成「全真」
+    // 就是把一次崩溃报成了绿。所以只认 0 与 1，别的都当「判不了」。
+    match out.status.code() {
+        Some(0) | Some(1) => {}
+        _ => {
+            return Err(format!(
+                "{} 没有给出判词（退出码 {:?}）：{}",
+                reader.display(),
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
     }
+    // 退出码 1 有两种来路：判词说「有假」，或者脚本自己崩了（Python 未捕获异常也是
+    // 1）。前者一定有 `代码=false` 行，后者一行判词都没有——把后者读成「全真」正是
+    // 这一族最贵的形状，所以这里要求 1 必须带着判词回来。
     let text = String::from_utf8_lossy(&out.stdout);
     let mut ok = Vec::new();
     let mut missing = Vec::new();
@@ -36,6 +50,13 @@ fn edit_verdict(root: &std::path::Path) -> Result<(Vec<String>, Vec<(String, Str
             let (id, why) = rest.split_once('：').unwrap_or((rest, ""));
             missing.push((id.trim().to_string(), why.trim().to_string()));
         }
+    }
+    if out.status.code() == Some(1) && missing.is_empty() {
+        return Err(format!(
+            "{} 退出码是 1，却没有一行 `代码=false`——那是脚本崩了，不是判词：{}",
+            reader.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
     Ok((ok, missing))
 }
@@ -167,30 +188,40 @@ mod tests {
     }
 }
 
-/// 这一轮与上一轮的假清单一样 ⇒ 再问一次只会得到同一份输入，停。
+/// 这一轮的假清单**以前见过**（同一批 id、同一批理由）⇒ 再问一次只会得到同一份输入，停。
+///
+/// 判「见过」而不是「与上一轮相同」：只比相邻两轮时，`S1 → S2 → S1 → S2` 这种来回
+/// 每一对相邻项都不同，循环永远不停（2026-11-22 复核发现）。比「见过的集合」把这一族
+/// 都收进来，而理由也进指纹——同一批 id 的理由变了，说明喂给 generator 的输入变了，
+/// 那是进展，不该被当成停滞。
 ///
 /// 它不是「最多跑几轮」：轮数不是判据，判词为空才是；这一条只是无进展时的出口。
-pub fn no_progress(last: Option<&[String]>, current: &[String]) -> bool {
-    last.map(|prev| prev == current).unwrap_or(false)
+pub fn no_progress(seen: &std::collections::HashSet<String>, current: &[(String, String)]) -> bool {
+    seen.contains(&fingerprint(current))
 }
 
-/// 跑一轮完整的编辑循环：判 → 假清单 → 生成 → 再判，直到判词为空或某一轮毫无进展。
-///
-/// 没有「最多几轮」这个旋钮：判据是**判词为空**。停下来的另一种情形是「这一轮与上一轮
-/// 的假清单一样」——那不是轮数上限，是「再问一次也只会得到同一份输入」。
+/// 一轮假清单的身份：id ＋ 理由，排序后拼成一个串。
+fn fingerprint(missing: &[(String, String)]) -> String {
+    let mut parts: Vec<String> = missing
+        .iter()
+        .map(|(id, why)| format!("{id}\u{0}{why}"))
+        .collect();
+    parts.sort();
+    parts.join("\u{1e}")
+}
+
 pub async fn run_loop(root: &std::path::Path, generator: &BatchGenerator) -> Result<usize, String> {
-    let mut last: Option<Vec<String>> = None;
+    let mut seen: std::collections::HashSet<String> = Default::default();
     let mut rounds = 0usize;
     loop {
         let (_, missing) = edit_verdict(root)?;
         if missing.is_empty() {
             return Ok(rounds);
         }
-        let ids: Vec<String> = missing.iter().map(|(id, _)| id.clone()).collect();
-        if no_progress(last.as_deref(), &ids) {
+        if !seen.insert(fingerprint(&missing)) {
+            let ids: Vec<String> = missing.iter().map(|(id, _)| id.clone()).collect();
             return Err(format!(
-                "batch-edit: {} 条连续一轮没有变化（{}）；再问一次只会是同一份输入",
-                ids.len(),
+                "batch-edit: 这一批的假清单又回到了见过的状态（{}）；再问一次只会是同一份输入",
                 ids.join("、")
             ));
         }
@@ -199,7 +230,6 @@ pub async fn run_loop(root: &std::path::Path, generator: &BatchGenerator) -> Res
             .generate(&request)
             .await
             .map_err(|e| format!("generator 失败：{e}"))?;
-        last = Some(ids);
         rounds += 1;
     }
 }
@@ -208,24 +238,47 @@ pub async fn run_loop(root: &std::path::Path, generator: &BatchGenerator) -> Res
 mod loop_tests {
     use super::*;
 
-    /// 第一轮不算无进展，哪怕清单一样——上一轮还不存在。
+    fn pair(id: &str, why: &str) -> (String, String) {
+        (id.to_string(), why.to_string())
+    }
+
+    /// 第一次见到的那份清单不是停滞。
     #[test]
     fn the_first_round_is_never_stalled() {
-        assert!(!no_progress(None, &["S1".to_string()]));
+        let seen = std::collections::HashSet::new();
+        assert!(!no_progress(&seen, &[pair("S1", "缺测试")]));
     }
 
-    /// 两轮清单一样：无进展。
+    /// 同一份清单第二次出现：无进展。
     #[test]
     fn the_same_list_twice_is_a_stall() {
-        let a = vec!["S1".to_string()];
-        assert!(no_progress(Some(&a), &a));
+        let mut seen = std::collections::HashSet::new();
+        let missing = vec![pair("S1", "缺测试")];
+        assert!(!no_progress(&seen, &missing));
+        seen.insert(fingerprint(&missing));
+        assert!(no_progress(&seen, &missing));
     }
 
-    /// 清单变短了就是有进展，继续。
+    /// 来回的清单也是停滞：只比相邻两轮的话，`S1 → S2 → S1` 每一对都不同、
+    /// 循环永远不停。
     #[test]
-    fn a_shorter_list_is_progress() {
-        let before = vec!["S1".to_string(), "S2".to_string()];
-        let after = vec!["S1".to_string()];
-        assert!(!no_progress(Some(&before), &after));
+    fn a_list_that_comes_back_after_another_is_still_a_stall() {
+        let mut seen = std::collections::HashSet::new();
+        let first = vec![pair("S1", "缺测试")];
+        let second = vec![pair("S2", "缺测试")];
+        seen.insert(fingerprint(&first));
+        seen.insert(fingerprint(&second));
+        assert!(no_progress(&seen, &first));
+    }
+
+    /// 同一批 id、理由变了 = 喂进去的输入变了，那是进展。
+    #[test]
+    fn the_same_ids_with_new_reasons_are_progress() {
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(fingerprint(&[pair("S1", "缺测试")]));
+        assert!(!no_progress(
+            &seen,
+            &[pair("S1", "测试在树里但点名的是别的用例")]
+        ));
     }
 }

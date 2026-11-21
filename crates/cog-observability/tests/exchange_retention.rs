@@ -61,7 +61,7 @@ impl Scratch {
                  response_sha256 TEXT,
                  request_bytes BIGINT NOT NULL DEFAULT 0,
                  response_seen_bytes BIGINT NOT NULL DEFAULT 0,
-                 response_bytes BIGINT NOT NULL DEFAULT 0,
+                 response_bytes BIGINT,
                  request_raw  TEXT,
                  response_raw TEXT,
                  request_body TEXT,

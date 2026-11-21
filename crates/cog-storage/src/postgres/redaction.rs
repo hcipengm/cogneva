@@ -73,9 +73,6 @@ pub async fn redact_body(
         ));
     }
 
-    // 先销毁。删一段已经不存在的正文是成功（`unlink` 只在它还在时删），所以这一步可以重复。
-    large_object::unlink(pool, oid).await?;
-
     let event_id = event_id_for(oid, sha256);
     let subject = format!("body:{oid}");
     let attributes = serde_json::json!({
@@ -105,6 +102,12 @@ pub async fn redact_body(
             defect.as_str()
         ))
     })?;
+
+    // **先判信封、再销毁**。反过来的顺序里，一次被拒的信封（空 actor、非对象载荷）
+    // 会让正文已经被 `lo_unlink` 掉，而库里没有一条 `redacted` 事件说明它去了哪——
+    // 「被擦掉」与「坏了」从此分不开。销毁这一步可重复（`unlink` 只在它还在时删），
+    // 所以顺序换过来不损失重放安全。
+    large_object::unlink(pool, oid).await?;
 
     sqlx::query(
         "INSERT INTO cogneva_event (\

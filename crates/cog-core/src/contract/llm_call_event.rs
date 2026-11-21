@@ -44,6 +44,11 @@ pub struct LlmCall {
     pub output_tokens: u64,
     /// 命中前缀缓存的 token。读侧按人/按工作区判花销时要它（缓存便宜得多）。
     pub cached_tokens: u64,
+    /// **写进**缓存的那部分 token（Anthropic 的 cache_creation）。旧表的
+    /// `tokens_cache_created` 列有它，事件流原先没带——读切换后那一半读数会掉成
+    /// 「没人量过」，而它是命中率的分母之一。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_created_tokens: Option<u64>,
     /// 调用来源（`interactive`／`gateway_pool`／…）。读侧按来源分桶时要它。
     pub origin: String,
     /// 这次调用记在谁头上；`None` 是这条连接没有身份。按人判预算要它。
@@ -102,6 +107,7 @@ impl LlmCall {
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "cached_tokens": self.cached_tokens,
+            "cache_created_tokens": self.cache_created_tokens,
             "origin": self.origin,
             "owner": self.owner,
             "latency_ms": self.latency_ms,

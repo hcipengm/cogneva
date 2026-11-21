@@ -42,6 +42,7 @@ async fn call(events: &LlmCallEventStore, id: &str, batch: &str, input: u64, out
             input_tokens: input,
             output_tokens: output,
             cached_tokens: 0,
+            cache_created_tokens: None,
             origin: "gateway_pool".to_string(),
             owner: None,
             latency_ms: Some(1),
