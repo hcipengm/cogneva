@@ -842,6 +842,23 @@ async fn the_stream_reader_and_the_row_reader_agree_row_by_row() {
         .await
         .expect("init the schema");
 
+    // 事件流那张表**不由这个 store 建**：它属于迁移。所以这一条用例要把真身的迁移
+    // 跑一遍，而不是自己写一份形状——自己写的那份只能证明读者认得自己写的样本，
+    // 证明不了它认得线上的表。
+    let migrations =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cog-storage/migrations/postgres");
+    for file in [
+        "117_event_stream.up.sql",
+        "119_event_payload_is_json.up.sql",
+    ] {
+        let sql = std::fs::read_to_string(migrations.join(file))
+            .unwrap_or_else(|e| panic!("read the migration {file}: {e}"));
+        sqlx::raw_sql(&sql)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("apply the migration {file}: {e}"));
+    }
+
     let since = chrono::Utc::now().timestamp() - 60;
     let marker = format!("usage-ledger-equality:{}", uuid::Uuid::new_v4());
 
