@@ -446,6 +446,14 @@ mod network_policy_subjects_name_a_component_the_code_writes_test;
 mod no_fact_table_is_deleted_on_a_schedule_test;
 #[path = "no_loop_is_killed_by_a_clock_test.rs"]
 mod no_loop_is_killed_by_a_clock_test;
+#[path = "the_rollup_is_gone_test.rs"]
+mod the_rollup_is_gone_test;
+#[path = "metric_projections_rebuild_from_prometheus.rs"]
+mod metric_projections_rebuild_from_prometheus;
+#[path = "a_batch_id_answers_what_the_batch_cost_test.rs"]
+mod a_batch_id_answers_what_the_batch_cost_test;
+#[path = "the_usage_readers_agree_row_by_row.rs"]
+mod the_usage_readers_agree_row_by_row;
 #[path = "no_json_columns_test.rs"]
 mod no_json_columns_test;
 #[path = "notification_contract_matches_its_schema.rs"]
