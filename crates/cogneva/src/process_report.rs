@@ -195,19 +195,30 @@ pub fn scan_proc() -> Vec<ReportedProcess> {
 
 /// 一个 PID 的三样东西：父 PID、名字、常驻内存。它退出得快时读不全，
 /// 读不全就不算这一行——半个进程比没有更误导。
+///
+/// 常驻内存也在这句话里：读不到 `statm` 时不许记 0，那写出去的是「这个进程不占
+/// 内存」——一份没人量过的读数，而内存正是读这份进程表要找的那一样。
 pub fn read_process(pid: u32) -> Option<ReportedProcess> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let (parent_pid, _) = parse_stat(&stat)?;
-    let command = std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .map(|comm| comm.trim().to_string())
-        .unwrap_or_default();
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok();
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok();
+    let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok();
+    assemble_process(pid, stat.as_deref(), comm.as_deref(), statm.as_deref())
+}
+
+/// 三份读数凑成一行。缺哪一份都不成一行：父 PID 从 `stat` 来、名字从 `comm` 来、
+/// 常驻内存从 `statm` 来，缺了的那一格没有诚实的替代值。
+pub(crate) fn assemble_process(
+    pid: u32,
+    stat: Option<&str>,
+    comm: Option<&str>,
+    statm: Option<&str>,
+) -> Option<ReportedProcess> {
+    let (parent_pid, _) = parse_stat(stat?)?;
+    let command = comm?.trim().to_string();
     if command.is_empty() {
         return None;
     }
-    let rss_bytes = std::fs::read_to_string(format!("/proc/{pid}/statm"))
-        .ok()
-        .and_then(|statm| parse_statm(&statm))
-        .unwrap_or(0);
+    let rss_bytes = parse_statm(statm?)?;
     Some(ReportedProcess {
         pid,
         parent_pid,
@@ -279,6 +290,36 @@ mod tests {
         assert_eq!(process.pid, me);
         assert!(!process.command.is_empty(), "进程有名字");
         assert!(process.rss_bytes > 0, "进程占着内存");
+    }
+
+    /// 常驻内存读不到：这一行不成一行。记 0 的话，写出去的是一行「这个进程不占
+    /// 内存」——一份没人量过的读数，而内存正是读这份表要找的那一样。
+    #[test]
+    fn a_row_whose_resident_memory_could_not_be_read_is_not_a_zero_byte_process() {
+        let stat = "42 (sleep) S 1 42 42 0 -1 4194304";
+        assert!(
+            assemble_process(7, Some(stat), Some("sleep\n"), None).is_none(),
+            "读不到 statm 的行不许以 0 字节出现"
+        );
+        assert!(
+            assemble_process(7, Some(stat), Some("sleep\n"), Some("not numbers")).is_none(),
+            "statm 读成乱码也是没读到"
+        );
+    }
+
+    /// 反例：三份都在时这一行照常成形，常驻内存是量到的那个数。
+    #[test]
+    fn a_row_with_all_three_readings_is_assembled() {
+        let stat = "42 (sleep) S 1 42 42 0 -1 4194304";
+        let row = assemble_process(7, Some(stat), Some("sleep\n"), Some("100 3 2 1 0 0 0"))
+            .expect("三份都在的行是一行读数");
+        assert_eq!(row.pid, 7);
+        assert_eq!(row.parent_pid, 1);
+        assert_eq!(row.command, "sleep");
+        assert_eq!(row.rss_bytes, 3 * 4096);
+        // 名字与父 PID 缺了同样不成一行（这条行为没有变，钉住它）。
+        assert!(assemble_process(7, None, Some("sleep"), Some("100 3 2 1 0 0 0")).is_none());
+        assert!(assemble_process(7, Some(stat), Some(""), Some("100 3 2 1 0 0 0")).is_none());
     }
 
     #[test]
