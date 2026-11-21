@@ -304,14 +304,25 @@ def surface_index_rows(root: Path):
             continue
         body = cells[1]
         is_index = ("索引" in body) or ("见 §" in body) or ("见第" in body)
-        if is_index and "判据读数" not in line:
+        if not is_index or "判据读数" in line:
+            continue
+        # 容器行（只指向子项）本身没有独立终态，这不丢人；真正丢人的是**指向的东西
+        # 不存在**——索引与正文分叉。所以数的是「点了名却找不到行」的那些 id。
+        import re as _re
+        named = set(_re.findall(r"S\d+(?:\.\d+)?", body))
+        ledger_ids = set()
+        for row in Path(ledger).read_text(errors="ignore").splitlines():
+            if row.startswith("| S"):
+                ledger_ids.add(row.split("|")[1].strip())
+        dangling = sorted(n for n in named if n != cells[0] and n not in ledger_ids)
+        if dangling:
             yield {
                 "surface": "index-row",
                 "path": f"{Path(ledger).name}:{number}",
                 "line": number,
                 "kind": "no-own-criterion",
                 "name": cells[0],
-                "detail": "这一行只说「见某处」，自己说不出怎么判",
+                "detail": f"索引点名了不存在的行：{', '.join(dangling)}",
             }
 
 
