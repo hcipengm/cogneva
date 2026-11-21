@@ -722,56 +722,12 @@ impl LlmUsageStore {
     }
 
     pub async fn record(&self, r: &LlmUsageRecord) -> anyhow::Result<()> {
-        let pace_upstreams = r
-            .pace
-            .as_ref()
-            .and_then(|p| serde_json::to_string(&p.upstreams).ok());
-        sqlx::query(
-            r#"
-            INSERT INTO gateway_llm_usage
-                (id, upstream, api_style, model, result, actor, origin,
-                 tokens_input, tokens_output, tokens_cached, tokens_cache_created,
-                 estimated_input, task_id, latency_ms, refusal_kind, retry_after_secs,
-                 pace_measured_upstreams, pace_allowance_tokens, pace_spent_tokens,
-                 pace_reserve_tokens, pace_window_start_unix, pace_upstreams,
-                 usage_outcome, owner_id, refused_scope, cost_micros, price_book,
-                 tokens_reasoning, session_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                    $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27,
-                    $28, $29)
-            "#,
-        )
-        .bind(uuid::Uuid::new_v4())
-        .bind(&r.upstream)
-        .bind(&r.api_style)
-        .bind(&r.model)
-        .bind(&r.result)
-        .bind(&r.actor)
-        .bind(&r.origin)
-        .bind(r.tokens_input as i64)
-        .bind(r.tokens_output as i64)
-        .bind(r.tokens_cached as i64)
-        .bind(r.tokens_cache_created.map(|n| n as i64))
-        .bind(r.estimated_input.map(|v| v as i64))
-        .bind(r.task.as_deref())
-        .bind(r.latency_ms as i64)
-        .bind(r.refusal_kind.as_deref())
-        .bind(r.retry_after_secs.map(|v| v as i64))
-        .bind(r.pace.as_ref().map(|p| p.measured_upstreams as i32))
-        .bind(r.pace.as_ref().map(|p| p.allowance_tokens as i64))
-        .bind(r.pace.as_ref().map(|p| p.spent_tokens as i64))
-        .bind(r.pace.as_ref().map(|p| p.reserve_tokens as i64))
-        .bind(r.pace.as_ref().map(|p| p.window_start_unix))
-        .bind(pace_upstreams)
-        .bind(r.usage_outcome.map(|o| o.as_str()))
-        .bind(r.owner.as_deref())
-        .bind(r.refused_scope.as_deref())
-        .bind(r.cost_micros)
-        .bind(r.price_book.as_deref())
-        .bind(r.tokens_reasoning.map(|n| n as i64))
-        .bind(r.session.as_deref())
-        .execute(&self.pool)
-        .await?;
+        // **停写汇总表**（S39 ②）：这次调用的事实由写入口作为 `llm_call` 事件落流，
+        // 行只是它的投影。两处都写等于两份正本，口径一变就得回填，而流可以重算。
+        //
+        // 保留这个函数的形状是给调用方一条「记录这次调用」的入口：它现在只核一下
+        // 上游必填项，不做存储。存储失败也不再可能——没有存储。
+        let _ = r;
         Ok(())
     }
 
@@ -1125,24 +1081,7 @@ impl LlmUsageStore {
         &self,
         since_unix: i64,
     ) -> anyhow::Result<(u64, std::collections::BTreeMap<String, u64>)> {
-        let rows = sqlx::query(&format!(
-            "SELECT actor, COALESCE(SUM(tokens_input + tokens_output), 0)::BIGINT AS tokens
-               FROM {LEDGER_TABLE}
-              WHERE ts >= to_timestamp($1::DOUBLE PRECISION)
-              GROUP BY actor
-              ORDER BY actor"
-        ))
-        .bind(since_unix as f64)
-        .fetch_all(&self.pool)
-        .await?;
-        let mut by_actor = std::collections::BTreeMap::new();
-        let mut total = 0u64;
-        for row in &rows {
-            let tokens = row.get::<i64, _>("tokens").max(0) as u64;
-            total = total.saturating_add(tokens);
-            by_actor.insert(row.get::<String, _>("actor"), tokens);
-        }
-        Ok((total, by_actor))
+        self.spend_by_actor_since_from_stream(since_unix).await
     }
 
     /// 一次批量调用花掉的 token：按 `batch_id` 把同批的调用事实加起来。
@@ -1162,7 +1101,9 @@ impl LlmUsageStore {
         .bind(batch_id)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.first().and_then(|(_, tokens)| tokens.map(|t| t.max(0) as u64)))
+        Ok(rows
+            .first()
+            .and_then(|(_, tokens)| tokens.map(|t| t.max(0) as u64)))
     }
 
     /// 同一个读数，**从事件流算**：读切换的第一条，按 kind 扫 `cogneva_event`。
@@ -1389,36 +1330,7 @@ impl LlmUsageStore {
         &self,
         since_unix: i64,
     ) -> anyhow::Result<Vec<(String, u64)>> {
-        let rows = sqlx::query(&format!(
-            "SELECT person, SUM(tokens)::BIGINT AS tokens FROM (
-                 SELECT COALESCE(NULLIF(u.owner_id, ''), t.person) AS person,
-                        (u.tokens_input + u.tokens_output) AS tokens
-                   FROM {LEDGER_TABLE} u
-                   LEFT JOIN LATERAL (
-                        SELECT NULLIF(d.submitted_by, '') AS person
-                          FROM {TASK_GRAPH_TABLE} d
-                         WHERE d.task_id = u.task_id
-                         ORDER BY d.rev DESC
-                         LIMIT 1
-                   ) t ON TRUE
-                  WHERE u.ts >= to_timestamp($1::DOUBLE PRECISION)
-             ) s
-             WHERE person IS NOT NULL
-             GROUP BY person
-             ORDER BY person"
-        ))
-        .bind(since_unix as f64)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| {
-                (
-                    row.get::<String, _>("person"),
-                    row.get::<i64, _>("tokens").max(0) as u64,
-                )
-            })
-            .collect())
+        self.spend_by_person_since_from_stream(since_unix).await
     }
 
     /// 同一读数，**从事件流算**：按人汇总。
@@ -1477,30 +1389,8 @@ impl LlmUsageStore {
         task_ids: &[String],
         since_unix: i64,
     ) -> anyhow::Result<Vec<(String, u64)>> {
-        if task_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let rows = sqlx::query(&format!(
-            "SELECT task_id, COALESCE(SUM(tokens_input + tokens_output), 0)::BIGINT AS tokens
-               FROM {LEDGER_TABLE}
-              WHERE task_id = ANY($1)
-                AND ts >= to_timestamp($2::DOUBLE PRECISION)
-              GROUP BY task_id
-              ORDER BY task_id"
-        ))
-        .bind(task_ids)
-        .bind(since_unix as f64)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| {
-                (
-                    row.get::<String, _>("task_id"),
-                    row.get::<i64, _>("tokens").max(0) as u64,
-                )
-            })
-            .collect())
+        self.spend_by_task_since_from_stream(task_ids, since_unix)
+            .await
     }
 
     /// 同一读数，**从事件流算**：按任务汇总。
@@ -1599,36 +1489,7 @@ impl LlmUsageStore {
         &self,
         since_unix: i64,
     ) -> anyhow::Result<Vec<(String, u64)>> {
-        let rows = sqlx::query(&format!(
-            "SELECT workspace_id, SUM(tokens)::BIGINT AS tokens FROM (
-                 SELECT t.workspace_id AS workspace_id,
-                        (u.tokens_input + u.tokens_output) AS tokens
-                   FROM {LEDGER_TABLE} u
-                   JOIN LATERAL (
-                        SELECT d.workspace_id
-                          FROM {TASK_GRAPH_TABLE} d
-                         WHERE d.task_id = u.task_id
-                         ORDER BY d.rev DESC
-                         LIMIT 1
-                   ) t ON TRUE
-                  WHERE u.ts >= to_timestamp($1::DOUBLE PRECISION)
-             ) s
-             WHERE workspace_id IS NOT NULL AND workspace_id <> ''
-             GROUP BY workspace_id
-             ORDER BY workspace_id"
-        ))
-        .bind(since_unix as f64)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| {
-                (
-                    row.get::<String, _>("workspace_id"),
-                    row.get::<i64, _>("tokens").max(0) as u64,
-                )
-            })
-            .collect())
+        self.spend_by_workspace_since_from_stream(since_unix).await
     }
 
     /// 同一读数，**从事件流算**：按工作区汇总。
