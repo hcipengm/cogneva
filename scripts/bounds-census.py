@@ -279,8 +279,45 @@ def surface_facts_without_events(root: Path):
         }
 
 
+def surface_index_rows(root: Path):
+    """面：**纯索引行**——一行里没有可判的终态，只说「见某处」。
+
+    索引行与正文分处两地时，两边会分叉（正文改了、索引没改），而分叉没人看得出。
+    终态是这种行不再存在：每条待办自己说得出怎么判，而不是指向别处。
+
+    台账由 `--ledger` 给（默认这台机器那一本）；读不到就一条都不产出——读不到不是 0。
+    """
+    import os
+    ledger = os.environ.get("COGNEVA_TODO_LEDGER")
+    if not ledger:
+        host = Path.home() / ".config/cogneva/todo-ledger"
+        if host.exists():
+            first = host.read_text(errors="ignore").strip().splitlines()
+            ledger = first[0].strip() if first else None
+    if not ledger or not Path(ledger).is_file():
+        return
+    for number, line in enumerate(Path(ledger).read_text(errors="ignore").splitlines(), 1):
+        if not line.startswith("| S"):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) < 3:
+            continue
+        body = cells[1]
+        is_index = ("索引" in body) or ("见 §" in body) or ("见第" in body)
+        if is_index and "判据读数" not in line:
+            yield {
+                "surface": "index-row",
+                "path": f"{Path(ledger).name}:{number}",
+                "line": number,
+                "kind": "no-own-criterion",
+                "name": cells[0],
+                "detail": "这一行只说「见某处」，自己说不出怎么判",
+            }
+
+
 SURFACES = {
     "markers": surface_markers,
+    "index-rows": surface_index_rows,
     "state-files": surface_state_files,
     "facts-without-events": surface_facts_without_events,
     "walls": surface_walls,
