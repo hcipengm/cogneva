@@ -53,7 +53,9 @@ fn row(actor: &str, input: u64, output: u64) -> LlmUsageRecord {
         price_book: None,
         refusal_kind: None,
         retry_after_secs: None,
-        task: None,
+        // 花了 token 的行必须点名任务（S12 的库约束）；这一条测试判的是两条路
+        // 对同一批调用给出同一个数，不是归因，所以给个固定名字就够。
+        task: Some("rollup-gone-task".to_string()),
         owner: None,
         session: None,
         latency_ms: 1,
