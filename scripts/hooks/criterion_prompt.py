@@ -60,7 +60,12 @@ def main(argv: list[str]) -> int:
         print(f"criterion_prompt: 台账读不到：{e}", file=sys.stderr)
         return 2
 
-    need = [i for i in items if "判据读数" not in i.cells and "代码" not in i.cells]
+    # 判「有没有读数」看的是**行原文**：`判据读数` 不是三格之一，`cells` 里没有它。
+    # 用 `cells` 判断会得到「全都没读数」——一个与事实无关的数。
+    need = [
+        i for i in items
+        if "判据读数" not in i.text and "代码" not in i.cells
+    ]
     print(HEADER)
     print(f"# 树：{pathlib.Path(args.root).resolve()}")
     print(f"# 缺读数的条目：{len(need)} 条")
