@@ -33,14 +33,17 @@ pub fn prefix(body: &Map<String, Value>) -> Vec<u8> {
             stable.insert(field.to_string(), value.clone());
         }
     }
-    // **全部历史都进前缀**：上一轮发出去的每一段字节都在缓存里，包括它最后一条。
-    // 把最后一条当「这一轮新说的」剔掉，上一轮的前缀就成不了这一轮的开头——
-    // 而那正是缓存唯一的判据。
-    if let Some(messages) = body.get("messages") {
-        stable.insert("messages".to_string(), messages.clone());
+    // 前缀是**一串按顺序拼起来的字节**：先是那几个不动的字段，然后历史里的每一条
+    // 逐条拼接。不能把 `messages` 当一个 JSON 数组整体序列化——数组的 `]` 一旦出现，
+    // 上一轮的字节就不可能是这一轮的开头，而缓存认的正是「上一轮那串字节是这一轮的
+    // 开头」。逐条拼，追加第 N+1 条时前面的字节一个都没变。
+    let mut out = serde_json::to_vec(&Value::Object(stable)).unwrap_or_default();
+    if let Some(Value::Array(messages)) = body.get("messages") {
+        for message in messages {
+            out.extend_from_slice(&serde_json::to_vec(message).unwrap_or_default());
+        }
     }
-    // `to_vec` 走的是同一套键序规则，所以这串字节两次算出来一样。
-    serde_json::to_vec(&Value::Object(stable)).unwrap_or_default()
+    out
 }
 
 /// 前缀断了的时候，是哪一类稳定字段先变的。
