@@ -12,15 +12,6 @@ use crate::{
 };
 
 
-/// The wall on the liveness probe.
-///
-/// 等：本地运行时对一次 `/api/tags` 的答复。
-/// 等不到：这次探活读作「不健康」；**不产出读到数**——探活没有值可以缓存，所以也不会
-/// 留下一个过期的「健康」。
-/// 续跑：能，而且本来就该重试：探活是周期性的，下一次探活重新问一遍。
-// cap: bound — 探活是本地进程；这个界挡的是它挂起，不是它忙
-// wall: wait=the local runtime's tag list; on-timeout=unhealthy, no reading is produced; resume=yes, the next probe asks again
-const OLLAMA_PROBE_TIMEOUT_SECS: u64 = 10;
 
 pub struct OllamaProvider {
     client: Option<Arc<dyn cog_core::HttpClient>>,
@@ -510,7 +501,7 @@ impl LLMProvider for OllamaProvider {
             None => return false,
         };
         let req = cog_core::HttpRequest::get(format!("{}/api/tags", self.model.base_url))
-            .timeout(OLLAMA_PROBE_TIMEOUT_SECS);
+            ;
         match client.execute(req).await {
             Ok(r) => r.is_success(),
             Err(e) => {

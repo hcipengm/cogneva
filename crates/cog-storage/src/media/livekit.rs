@@ -11,16 +11,6 @@ use cog_core::{
 use std::sync::Arc;
 use tracing::{info, warn};
 
-/// The wall on one request to the LiveKit server.
-///
-/// 等：一次 LiveKit REST 往返（建房、删房、令牌、Egress 起停）。
-/// 等不到：这次调用以错误结束，调用方拿到 `SFError`；**没有半份房间或录制**被记成已创建
-/// ——重试是从调用方的下一次调用重新开始，不是从这里接着走。
-/// 续跑：能。房间是幂等的名字（同名重建即复用），录制起停各自一次调用；超时之后重来一遍
-/// 不会留下两间房。
-// cap: bound — 一次媒体服务端的往返；比一次房间的生命周期短得多，所以超时总在会话开始之前发生
-// wall: wait=one LiveKit REST round trip; on-timeout=error, nothing recorded as created; resume=yes, the call is retried whole
-const LIVEKIT_REQUEST_TIMEOUT_SECS: u64 = 30;
 
 /// LiveKit media backend implementation.
 #[derive(Clone)]
@@ -124,7 +114,7 @@ impl MediaBackend for LiveKitMediaBackend {
                 provider: "livekit".into(),
                 message: format!("create_room serialize failed: {}", e),
             })?
-            .timeout(LIVEKIT_REQUEST_TIMEOUT_SECS);
+            ;
         let resp = self
             .client()?
             .execute(req)
@@ -165,7 +155,7 @@ impl MediaBackend for LiveKitMediaBackend {
                 provider: "livekit".into(),
                 message: format!("delete_room serialize failed: {}", e),
             })?
-            .timeout(LIVEKIT_REQUEST_TIMEOUT_SECS);
+            ;
         let resp = self
             .client()?
             .execute(req)
@@ -195,7 +185,7 @@ impl MediaBackend for LiveKitMediaBackend {
                 provider: "livekit".into(),
                 message: format!("list_rooms serialize failed: {}", e),
             })?
-            .timeout(LIVEKIT_REQUEST_TIMEOUT_SECS);
+            ;
         let resp = self
             .client()?
             .execute(req)
@@ -258,7 +248,7 @@ impl MediaBackend for LiveKitMediaBackend {
                 provider: "livekit".into(),
                 message: format!("start_recording serialize failed: {}", e),
             })?
-            .timeout(LIVEKIT_REQUEST_TIMEOUT_SECS);
+            ;
         let resp = self
             .client()?
             .execute(req)
@@ -293,7 +283,7 @@ impl MediaBackend for LiveKitMediaBackend {
                 provider: "livekit".into(),
                 message: format!("stop_recording serialize failed: {}", e),
             })?
-            .timeout(LIVEKIT_REQUEST_TIMEOUT_SECS);
+            ;
         let resp = self
             .client()?
             .execute(req)
