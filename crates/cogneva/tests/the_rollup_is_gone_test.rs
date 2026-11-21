@@ -83,6 +83,7 @@ fn call(id: &str, actor: &str, input: u64, output: u64) -> LlmCall {
         actor: actor.to_string(),
         cost_micros: None,
         price_book: None,
+        batch_id: None,
         session: None,
         pace: None,
         at: chrono::Utc::now(),

@@ -64,6 +64,13 @@ pub struct LlmCall {
     /// 用哪本价目表的哪一档算的（`<book>@<currency>`）。没有它就算不出币种。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_book: Option<String>,
+    /// 这一笔调用属于哪一批（批量合并调用那一路打的戳）；`None` 是单独一次调用。
+    ///
+    /// 它写在**信封**上而不是载荷里：`batch_id` 本来就是信封的一列，问「这一批一起花了
+    /// 多少」是它的用途；放进 `attributes` 会让读者要么按列、要么按 JSON 取键，两条路
+    /// 各读一半（2026-11-22 实测：写的人放载荷、读的人按列，恒答「这一批没有记录」）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
     /// 这一次调用属于哪一段会话；`None` 是这条连接没有会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
@@ -103,6 +110,7 @@ impl LlmCall {
             "cost_micros": self.cost_micros,
             "price_book": self.price_book,
             "session": self.session,
+            "batch_id": self.batch_id,
         })
     }
 }

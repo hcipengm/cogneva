@@ -33,7 +33,7 @@ INSERT INTO cogneva_event (\
     event_id, kind, subject_kind, subject_id, unit_of_work, step, outcome, attempt, \
     idempotency_key, causation_id, batch_id, actor, writer, scope, payload_version, \
     attributes, at) \
-VALUES ($1, 'llm_call', 'llm_call', $2, $2, 'call', 'ok', 1, $3, NULL, NULL, $4, $5, $6, 1, $7, $8) \
+VALUES ($1, 'llm_call', 'llm_call', $2, $2, 'call', 'ok', 1, $3, NULL, $9, $4, $5, $6, 1, $7, $8) \
 ON CONFLICT (writer, idempotency_key) DO NOTHING";
 
 impl LlmCallEventStore {
@@ -82,6 +82,7 @@ impl LlmCallEvents for LlmCallEventStore {
             .bind(&self.writer)
             .bind(&call.model)
             .bind(call.attributes().to_string())
+            .bind(call.batch_id.clone())
             .bind(call.at)
             .execute(&self.pool)
             .await

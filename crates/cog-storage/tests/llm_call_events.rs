@@ -118,6 +118,7 @@ fn call(id: &str) -> LlmCall {
         cost_micros: None,
         price_book: None,
         session: None,
+        batch_id: None,
         pace: None,
         at: Utc::now(),
     }

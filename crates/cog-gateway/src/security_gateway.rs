@@ -3576,6 +3576,7 @@ async fn land_usage_record(state: &AppState, record: LlmUsageRecord) {
                     cost_micros: record.cost_micros,
                     price_book: record.price_book.clone(),
                     session: record.session.clone(),
+                    batch_id: None,
                     at: chrono::Utc::now(),
                 };
                 if let Err(e) = sink.append(&call).await {
