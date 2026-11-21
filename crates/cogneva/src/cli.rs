@@ -21,6 +21,8 @@ pub enum Command {
     HealthCheck,
     SecurityGateway,
     SandboxExecutor,
+    /// 2.1–2.4 的入口：把 2.5 的假清单变成一次生成请求。
+    BatchEdit,
     VolumeWalker,
     HostLedger,
     ProcessCensus,
@@ -106,6 +108,7 @@ const READ_ONLY_SUBCOMMANDS: &[Command] = &[
     Command::ValidateConfig,
     Command::HostLedger,
     Command::ClaimStore,
+    Command::BatchEdit,
     Command::VolumeWalker,
     Command::McpServe,
 ];

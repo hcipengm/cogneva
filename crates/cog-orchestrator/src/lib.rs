@@ -1,5 +1,6 @@
 pub mod action_planner;
 pub mod backup_runs;
+pub mod batch_edit;
 pub mod change_ledger;
 pub mod change_measure;
 pub mod dag_executor;
