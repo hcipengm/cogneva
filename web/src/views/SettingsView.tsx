@@ -547,7 +547,12 @@ export function SettingsView() {
                         : 'plain'
                   }
                 />
-                <Reading label="待提交变更" value={contrib.pending_count} />
+                {/* `null` 是「问不到队列」，不是 0：那一格在没有读数时写下来，
+                    而不是替所有者断言没有等他点头的变更。 */}
+                <Reading
+                  label="待提交变更"
+                  value={contrib.pending_count ?? '读不到'}
+                />
                 <Reading label="回流策略" value={contrib.policy} />
               </div>
             </Readings>

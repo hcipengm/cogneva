@@ -421,6 +421,22 @@ pub fn with_memory_pipeline(
     Arc::new(state)
 }
 
+/// The same state with the contribution control wired in.
+///
+/// Without one, every control-backed reading has no source at all; a suite that
+/// asks what the status screen says when the queue cannot be read has to give
+/// it a queue first.
+pub fn with_contribution_control(
+    control: Arc<dyn cog_core::ContributionControl>,
+) -> Arc<GatewayState> {
+    let mut state = match Arc::try_unwrap(stateless()) {
+        Ok(state) => state,
+        Err(_) => panic!("the fixture just built it, so this is the only handle"),
+    };
+    state.contribution_control = Some(control);
+    Arc::new(state)
+}
+
 /// The same state with the platform's own audit chain switched on.
 ///
 /// Without one the routes append nothing and there is nothing to judge: a

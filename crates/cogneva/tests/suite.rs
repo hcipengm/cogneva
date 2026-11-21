@@ -75,6 +75,8 @@ mod a_background_command_reports_back_test;
 mod a_cache_share_is_a_share_not_a_difference_test;
 #[path = "a_payload_field_becomes_a_column_not_a_query_test.rs"]
 mod a_payload_field_becomes_a_column_not_a_query_test;
+#[path = "a_pending_count_that_could_not_be_read_is_not_zero_test.rs"]
+mod a_pending_count_that_could_not_be_read_is_not_zero_test;
 
 #[path = "a_change_is_accepted_or_refused_before_it_lands_test.rs"]
 mod a_change_is_accepted_or_refused_before_it_lands_test;

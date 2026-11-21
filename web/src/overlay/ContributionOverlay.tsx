@@ -463,7 +463,11 @@ export function ContributionOverlay({ onClose }: { onClose: () => void }) {
               </p>
               {status && (
                 <p className="text-xs text-slate-500">
-                  待提交变更 {status.pending_count} 条 · 回流策略 {status.policy}
+                  待提交变更{' '}
+                  {status.pending_count === null
+                    ? '读不到（这一拍问不到队列）'
+                    : `${status.pending_count} 条`}{' '}
+                  · 回流策略 {status.policy}
                 </p>
               )}
             </div>

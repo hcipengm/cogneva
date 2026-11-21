@@ -613,7 +613,14 @@ export interface ContributionStatus {
   git_identity: GitIdentityStatus;
   github_app_configured: boolean;
   policy: string;
-  pending_count: number;
+  /**
+   * 待回流的变更条数。
+   *
+   * `null` 是第三种答案：这一刻问不到队列（控制面没接、或读失败）。它与 `0`
+   * （问到了，队列空着）不是一件事——把两者合成一个数，设置屏会在控制面打嗝的
+   * 那一拍告诉所有者「没有等你点头的变更」。
+   */
+  pending_count: number | null;
   /** GitHub 设备码通道可用（有 OAuth App client_id） */
   device_flow_available: boolean;
   /**
