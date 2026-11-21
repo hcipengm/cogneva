@@ -27,6 +27,7 @@ pub mod observability_gateway;
 pub mod pge_stage_store;
 pub mod principle_ledger_store;
 pub mod project_audit_log;
+pub mod projection_snapshot;
 pub mod raw_log_index_store;
 pub mod redaction;
 pub mod resource_event_store;
