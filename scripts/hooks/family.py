@@ -333,38 +333,11 @@ def main(argv: list[str]) -> int:
     # ── 台账在一轮开着的时候不许动 ────────────────────────────────────────────
     #
     # 这一轮钉住的是台账的**某一版**；批中途改台账，会让「这一批是哪几条」与
-    # 「自开工以来改了什么」两件事同时失效——而现场唯一的做法是重钉，重钉又把
-    # 改动基准重置（2026-11-21 实测：重钉一次，33 条里 32 条从「做过」变回「没做」）。
-    #
-    # 所以这条是硬的：**台账只能在一批推上去之后改**。要改台账，先 `round.py close`
-    # 并推送这一批；要改的是「这一批做哪几条」，那是 `rebound` 的事，而它不该由
-    # 中途改台账来触发。
-    if args.all_todos:
-        try:
-            import round as round_mod
-            cur = round_mod.current_round()
-            if cur and cur[1]:
-                spec = todo_source.default_spec()
-                repo = round_mod.ledger_repo(spec)
-                if repo is not None:
-                    ledger_rel = str(pathlib.Path(spec[3:]).resolve().relative_to(repo))
-                    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
-                                          capture_output=True, text=True).stdout.strip()
-                    if head and head != cur[1]:
-                        diff = subprocess.run(
-                            ["git", "-C", str(repo), "diff", "--name-only", cur[1], "HEAD", "--", ledger_rel],
-                            capture_output=True, text=True).stdout.strip()
-                        if diff:
-                            print(
-                                "family: 这一轮开着的时候台账被改过（" + ledger_rel + "）。\n"
-                                "  台账只能在一批**推上去之后**改：先把这一批编译、测试、闸门、推送，"
-                                "再改台账、再 `round.py open` 新一轮。\n"
-                                "  批中途改台账 ⇒ 必须重钉 ⇒ 改动基准被重置 ⇒ 做过的活读回没做。",
-                                file=sys.stderr,
-                            )
-                            return 2
-        except Exception:
-            pass
+    # 台账这一格判的是**批次清单**，不是台账字节：批次的 id 清单在开工那一刻已经钉进
+    # `round_opened`，中途改台账不会把批次改小或改大。所以中途改台账不再是「必须重钉」
+    # 的错——三格（代码 / 上线 / 验证）本来就写在那一行里，而它们只会在做活时被填上。
+    # 要防的是另一种：**已钉住的一条从这个 id 集里消失**（被删、被改名、被改成别的状态）。
+    # 那一条会让「这一批做完了没有」少判一条，而读数照样绿。
 
     changed = args.changed or working_tree_changes(root)
     foreign: list[str] = []
@@ -381,8 +354,23 @@ def main(argv: list[str]) -> int:
             if current:
                 # 台账仓的改动基准是**第一次开工**那个 rev，不是重钉后的那一格。
                 pinned_rev = current[4] if len(current) > 4 else current[1]
-                pinned = round_mod.ledger_at(current[1], args.ledger or todo_source.default_spec())
-                args.ledger = str(pinned)
+                # 读**此刻**的台账：三格是随活一起填的，读钉住那一版等于永远读不到它们。
+                # 批次清单由 `round_ids` 钉着，读新版不会把批次改掉。
+                pinned_ids = {str(i) for i in current[3]}
+                try:
+                    present = todo_source.all_ids(todo_source.default_spec())
+                except todo_source.Unreadable:
+                    present = pinned_ids
+                for missing_id in sorted(pinned_ids - present):
+                    # 钉住的一条不见了：它可能刚刚被填满三格写成 `已落`（这是正常的收尾），
+                    # 也可能被删掉或改名（那会让这一批少判一条）。前者查得到出处——
+                    # 它落在「已收」那一侧；查不到就点出来。
+                    if missing_id not in present:
+                        print(
+                            f"family: 本轮批次里的 {missing_id} 在台账里既不在未完成、也不在已落——"
+                            "它被删了、改名了，或者状态词写错了。这一批少判了一条。",
+                            file=sys.stderr,
+                        )
         except Exception:  # 读不到事件流就退回此刻的台账，并在下面说清楚
             pass
         ledger_path = resolve_ledger(args.ledger)

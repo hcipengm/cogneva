@@ -182,6 +182,27 @@ def _md_split(path: pathlib.Path) -> tuple[list[Item], list[Item]]:
     return out, debt
 
 
+def all_ids(spec: str) -> set[str]:
+    """台账里出现过的**所有** id：未完成的与已落的都算。
+
+    用途只有一个：判「钉住的那一条是不是还在台账里」。只 `load` 得到未完成的那些，
+    而一条刚做完的待办会从那一侧消失——那是正常的收尾，不是丢了。
+    """
+    if not spec.startswith("md:"):
+        return {item.id for item in load(spec)}
+    path = pathlib.Path(spec[3:]).expanduser()
+    if not path.exists():
+        raise Unreadable(f"{path} 不存在")
+    ids: set[str] = set()
+    for line in path.read_text(errors="ignore").splitlines():
+        if not line.startswith("| S"):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if cells and cells[0]:
+            ids.add(cells[0])
+    return ids
+
+
 def terminal_debt(spec: str) -> list[Item]:
     """整本台账上写着 `已落`、却没填满三格的那些行。
 
