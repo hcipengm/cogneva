@@ -73,7 +73,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--root", default=".")
     parser.add_argument("--source", default=None, help="台账来源（默认这台机器的那一本）")
     parser.add_argument("--base", default=None, help="这一轮的 code_rev；不给就问 round")
+    parser.add_argument("--stage", choices=["edit", "final"], default="edit",
+                        help="edit：2.4 之后、编译之前（不要求绿）；final：第 5 步之后（要绿，且要红过）")
     parser.add_argument("--passed", default=None, help="这次测试跑绿的测试名名单（一行一个）")
+    parser.add_argument("--red-at-base", default=None,
+                        help="在 code_rev 上跑红的测试名名单：红过才算「没有这次改动就会红」")
     args = parser.parse_args(argv[1:])
 
     root = pathlib.Path(args.root).resolve()
@@ -96,6 +100,11 @@ def main(argv: list[str]) -> int:
         print("edit-reading: 不知道这一批的起点（没有开着一轮，也没给 --base）—— 没判。", file=sys.stderr)
         return 2
 
+    red_at_base: set[str] | None = None
+    if args.red_at_base:
+        names = pathlib.Path(args.red_at_base).read_text(errors="ignore").splitlines()
+        red_at_base = {name.strip() for name in names if name.strip()}
+
     passed: set[str] | None = None
     if args.passed:
         names = pathlib.Path(args.passed).read_text(errors="ignore").splitlines()
@@ -115,8 +124,16 @@ def main(argv: list[str]) -> int:
         if not defines_test(root, path, name):
             fake.append(f"{item.id}：{path} 里没有带测试属性的 `fn {name}`")
             continue
+        if args.stage == "final" and passed is None:
+            fake.append(f"{item.id}：终态档要绿名单，没给 --passed —— 判不了")
+            continue
         if passed is not None and name not in passed:
             fake.append(f"{item.id}：`{name}` 没在这一次的绿名单里")
+            continue
+        if args.stage == "final" and red_at_base is not None and name not in red_at_base:
+            fake.append(
+                f"{item.id}：`{name}` 在 code_rev 上就是绿的——它没有测到这一次的改动"
+            )
             continue
         real.append(item.id)
 

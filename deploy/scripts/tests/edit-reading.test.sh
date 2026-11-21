@@ -47,5 +47,21 @@ printf 'proves_it\n' >"$tmp/passed.txt"
 out=$(run --passed "$tmp/passed.txt"); rc=$?
 { [ "$rc" -eq 0 ]; } && ok "绿名单里有它：true" || bad "跑绿的被判假（rc=$rc）：$out"
 
+# 6. 终态档要求绿名单：不给就判不了，不是绿。
+out=$(run --stage final); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "终态档要绿名单"; } \
+  && ok "终态档没给绿名单：判不了（不是绿）" || bad "终态档缺绿名单却过了（rc=$rc）：$out"
+
+# 7. 红→绿：在 code_rev 上就绿的测试，不算测到了这次改动。
+printf 'proves_it\n' >"$tmp/passed.txt"; printf 'other\n' >"$tmp/red.txt"
+out=$(run --stage final --passed "$tmp/passed.txt" --red-at-base "$tmp/red.txt"); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "就是绿的"; } \
+  && ok "基线就绿：不算终态" || bad "基线就绿的测试被认了（rc=$rc）：$out"
+
+# 8. 基线红、HEAD 绿 ⇒ 终态真。
+printf 'proves_it\n' >"$tmp/red.txt"
+out=$(run --stage final --passed "$tmp/passed.txt" --red-at-base "$tmp/red.txt"); rc=$?
+{ [ "$rc" -eq 0 ]; } && ok "红→绿：终态真" || bad "红→绿被判假（rc=$rc）：$out"
+
 printf '\nedit-reading.test.sh: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
