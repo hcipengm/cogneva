@@ -31,8 +31,23 @@ A = re.compile(r"判据读数\s*:\s*([a-z0-9-]+)\s*(?:→|->)\s*(\d+)\s*$")
 B = re.compile(r"判据读数\s*:\s*test\s*=\s*([^\s:]+)::([A-Za-z0-9_]+)")
 
 
+def plan_problem(text: str) -> str | None:
+    """**1.5** 的判词：读数写得够不够具体。这里**不要求**测试已经存在——那是 2.5 的事，
+    测试正是这件事要做出来的东西。要求存在，等于把 1.5 变成「做完了才能填」。"""
+    if m := A.search(text):
+        return None if m.group(1).strip() else "A 型缺面名"
+    if m := B.search(text):
+        path, name = m.group(1), m.group(2)
+        if "/" not in path:
+            return f"B 型的路径不像仓库里的路径：{path}"
+        if not name.strip():
+            return "B 型缺函数名"
+        return None
+    return "既不是 A 也不是 B"
+
+
 def shape_problem(root: pathlib.Path, text: str) -> str | None:
-    """固定程序对一行读数的形状判词；`None` 表示合格。"""
+    """**2.5 / 终态** 的判词：读数在树里落没落地；`None` 表示合格。"""
     if m := A.search(text):
         if not m.group(1).strip():
             return "A 型缺面名"
@@ -56,6 +71,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("answers", nargs="?", default="-", help="答案来源；默认 stdin（不落盘）")
     parser.add_argument("--root", default=".")
     parser.add_argument("--ledger", default=None)
+    parser.add_argument("--stage", choices=["plan", "landed"], default="plan",
+                        help="plan：1.5（只判写得具体不具体）；landed：2.5（要求测试真的在树里）")
     args = parser.parse_args(argv[1:])
 
     root = pathlib.Path(args.root).resolve()
@@ -82,7 +99,7 @@ def main(argv: list[str]) -> int:
         if text.startswith("信息不足"):
             pending_info.append(f"{ident}: {text}")
             continue
-        problem = shape_problem(root, text)
+        problem = plan_problem(text) if args.stage == "plan" else shape_problem(root, text)
         if problem:
             bad.append(f"{ident}: {problem}（{text[:60]}）")
             continue
