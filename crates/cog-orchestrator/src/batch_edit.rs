@@ -9,6 +9,7 @@
 //! 起点和终点都由判词给出。没有这一步，2.5 只是一个读数，不是一个能把活推下去的闸。
 
 use std::process::Command;
+use std::sync::Arc;
 
 /// 读一次 2.5 的判词，返回（通过的 id，未通过的「id + 理由」）。
 fn edit_verdict(root: &std::path::Path) -> Result<(Vec<String>, Vec<(String, String)>), String> {
@@ -54,7 +55,30 @@ fn compose(root: &std::path::Path, missing: &[(String, String)]) -> String {
     out
 }
 
-/// `cogneva batch-edit`。`--dry-run` 只打请求；没有模型通道时报错退出。
+/// **2.1–2.4 的 generator 侧**：把请求交给 agent，读回它在那次运行里留下的改动。
+///
+/// 走 `cog_core::Agent` 而不是裸 LLM：预算、重试、事件、工具都在 agent 那一层，
+/// 裸调等于把记账抄一份（S78/S79）。diff 也从**树**里读（`Agent` 有读 checkout 的
+/// 入口），不采信模型自己敲出来的补丁文本——那份是「关于文件的散文」。
+pub struct BatchGenerator {
+    agent: Arc<dyn cog_core::Agent>,
+}
+
+impl BatchGenerator {
+    pub fn new(agent: Arc<dyn cog_core::Agent>) -> Self {
+        Self { agent }
+    }
+
+    /// 整批一次进、拿回这次运行的结果。工具轮次由 agent 自己决定，判据是信息完备
+    /// （它够了才出 diff），这里不设上限。
+    pub async fn generate(&self, batch: &str) -> cog_core::SFResult<serde_json::Value> {
+        self.agent
+            .prompt(serde_json::json!({ "batch": batch, "role": "generator" }))
+            .await
+    }
+}
+
+/// `cogneva batch-edit`。`--dry-run` 只打请求；没有 agent 时明确报错，不假装生成。
 pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
     let root = std::env::current_dir()?;
     let dry = std::env::args().any(|a| a == "--dry-run");
