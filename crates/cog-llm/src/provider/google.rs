@@ -17,7 +17,7 @@ use crate::{
 /// 等不到：这一次调用以错误结束，**不记账、不留半份正文**——上游没开始回，就没有
 /// 可以丢的已生成内容。
 /// 续跑：能。调用方重发是一次新的调用（账上是第二条）；这一格不假装能从中途接着读。
-// cap: fixed —— 同 anthropic 面：这是连接建立阶段的挂死判定，由传输协议给定，不是可调的界
+// cap: bound — 同上：挡连接被挂死，不是慢生成。没有更小的实测值可用，等一条真实的「首字节耗时」读数落地后由它导出
 // wall: wait=the upstream's first byte for a streaming call; on-timeout=the call fails, nothing is billed, no partial text is kept; resume=yes, the caller makes a new call
 const GOOGLE_REQUEST_TIMEOUT_SECS: u64 = 120;
 
