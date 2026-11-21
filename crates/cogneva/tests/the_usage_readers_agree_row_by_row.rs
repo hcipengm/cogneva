@@ -23,7 +23,8 @@ use cog_test_support::{database_url, drop_schema, own_schema, schema_pool};
 
 /// 事件流那张表属于迁移，不属于任何一个 store：跑真身的迁移，而不是自己写一份形状。
 async fn apply_event_stream_migration(pool: &sqlx::PgPool) {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/postgres");
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cog-storage/migrations/postgres");
     for file in [
         "117_event_stream.up.sql",
         "119_event_payload_is_json.up.sql",

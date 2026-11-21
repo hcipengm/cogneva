@@ -11,7 +11,8 @@ use sqlx::PgPool;
 use cog_test_support::{database_url, drop_schema, own_schema, schema_pool};
 
 async fn event_stream(pool: &PgPool) {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/postgres");
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cog-storage/migrations/postgres");
     for file in [
         "117_event_stream.up.sql",
         "119_event_payload_is_json.up.sql",
