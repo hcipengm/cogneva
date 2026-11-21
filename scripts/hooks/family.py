@@ -203,7 +203,8 @@ def other_repo_changes(repo: pathlib.Path, base: str | None) -> list[str]:
 
 
 def report(root: pathlib.Path, changed: list[str], batch: list[str], todos, missing_todos,
-           deferred=(), foreign=(), other: pathlib.Path | None = None, debt=()) -> int:
+           deferred=(), foreign=(), other: pathlib.Path | None = None, debt=(),
+           editing: bool = False) -> int:
     touched = set(changed)
     # 触点可以落在台账所在的那个仓里（这一族的产物本来就写在那儿）：那一侧的改动面
     # 由 `foreign` 带进来。
@@ -219,6 +220,15 @@ def report(root: pathlib.Path, changed: list[str], batch: list[str], todos, miss
     # `上线` 与 `验证` 只能在推之后、在现网量，它们由 `round.py terminal` 判，判词是
     # 「三格齐」——那时的「已落」才是终态。
     gaps = [(name, miss) for name, _paths, miss in todos if "代码" in miss]
+    # `--editing` 问的是另一个问题：**这一遍编辑走完了没有**（触点到的地方都动过）。
+    # 编译前的垫片问的是这个——它要在「改完一遍再编译一次」这件事上把住门，而不是
+    # 在「做完没有」上（那是推之前与终态门的事）。两个问题分开判，因为答案是两件事：
+    # 一条待办的触点全都动过，也可能还没做完。
+    editing_gaps = [
+        (name, [p for p in paths if not is_touched(p, every)])
+        for name, paths, _miss in todos
+        if paths and not any(is_touched(p, every) for p in paths)
+    ]
 
     owed: list[tuple[str, str]] = []
     for check in CHECKS:
@@ -240,11 +250,18 @@ def report(root: pathlib.Path, changed: list[str], batch: list[str], todos, miss
         print(f"  待办 {name}: {len(paths)} 个触点；{state}")
     if missing_todos:
         print(f"  ⚠ 这些待办没写 `touches:`，批次算不出它们要动什么：{', '.join(missing_todos)}")
-    for name, miss in gaps:
-        print(
-            f"  TODO 待办 {name} <- 缺 `代码` 格：这一条还没有「树里有了实现」的证据"
-            f"（缺 {'、'.join(miss)}）"
-        )
+    if editing:
+        for name, missing_paths in editing_gaps:
+            print(
+                f"  TODO 待办 {name} <- 这一遍编辑还没动到它（触点 {', '.join(missing_paths[:3])}"
+                f"{'…' if len(missing_paths) > 3 else ''}）"
+            )
+    else:
+        for name, miss in gaps:
+            print(
+                f"  TODO 待办 {name} <- 缺 `代码` 格：这一条还没有「树里有了实现」的证据"
+                f"（缺 {'、'.join(miss)}）"
+            )
 
     # 触点的读数照旧印出来：它不再是判据，但「这一轮该动哪儿」仍然要靠它看。
     if gaps:
@@ -283,7 +300,7 @@ def report(root: pathlib.Path, changed: list[str], batch: list[str], todos, miss
         )
         return 1
 
-    if gaps or owed:
+    if (editing_gaps if editing else gaps) or owed:
         print(
             "\n默认是**合并**：把这一轮所有待办一次改完，再编译一次。要拆，必须点出四条之一：\n"
             "  1 验证面不同（CI/现场/另一台机器）  2 失败不可归因（同一批测试里红会互相掩盖）\n"
@@ -302,6 +319,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--changed", nargs="*", default=None)
     parser.add_argument("--from-git", action="store_true")
     parser.add_argument("--all-todos", action="store_true")
+    parser.add_argument("--editing", action="store_true",
+                        help="判「这一遍编辑走完了没有」（触点都动过）。编译前的垫片问的是这个")
     parser.add_argument("--terminal", action="store_true",
                         help="判整本台账的欠终态：已落却缺格的行，一行都不许有")
     args = parser.parse_args(argv[1:])
@@ -367,6 +386,9 @@ def main(argv: list[str]) -> int:
         except Exception:  # 读不到事件流就退回此刻的台账，并在下面说清楚
             pass
         ledger_path = resolve_ledger(args.ledger)
+        # 读的是哪一本、由谁读：两个 worker 在同一台机器上各有一本，读数不写身份，
+        # 出问题时就分不清「这一本是空的」还是「读错了别人的那一本」。
+        print(f"family: 台账 {ledger_path}（worker {todo_source.worker_name()}）")
         if not ledger_path.exists():
             # 「没有台账」与「台账里没有待办」不是同一件事。前者是这台 worker 本来就不
             # 记待办（批次只按工作区算），后者是「全做完了」。说清楚是哪一种，别让
@@ -422,7 +444,7 @@ def main(argv: list[str]) -> int:
         todos = checked
         if deferred:
             print(f"family: 本轮不排的待办（touches: unknown）{len(deferred)} 项：{', '.join(deferred)}")
-        for _, paths in todos:
+        for _name, paths, _miss in todos:
             batch += paths
         # 台账仓那一侧的改动面：从这一轮钉住的那个 rev 算起，含工作区。没有开着一轮
         # 时只看工作区——那正是「这一轮还没开始记」的形状，不能替它编一段历史。
@@ -445,7 +467,8 @@ def main(argv: list[str]) -> int:
             return 1
         print("terminal: 台账上没有欠终态的行。")
         return 0
-    return report(root, changed, batch, todos, missing, deferred, foreign, ledger_repo, debt)
+    return report(root, changed, batch, todos, missing, deferred, foreign, ledger_repo, debt,
+                  editing=args.editing)
 
 
 if __name__ == "__main__":

@@ -244,19 +244,40 @@ def load(spec: str) -> list[Item]:
 
 
 def default_spec() -> str:
-    """这台机器上，这个 worker 的台账是哪一本。"""
+    """这台机器上，**这个 worker** 的台账是哪一本。
+
+    解析顺序（S62）：显式 `COGNEVA_TODO_SOURCE` → `COGNEVA_WORKER_LEDGER` →
+    本机声明 `~/.config/cogneva/todo-ledger`。三者都没有，就返回一个不存在的路径，
+    让调用方报「读不到」——**不回落**到一份共享清单。回落会让两个 worker 读到同一本
+    台账：批次在两边都算得出来，而其中一边的活永远没人做。
+    """
     explicit = os.environ.get("COGNEVA_TODO_SOURCE")
     if explicit:
         return explicit
-    env = os.environ.get("COGNEVA_TODO_LEDGER")
-    if env:
-        return f"md:{env}"
+    for key in ("COGNEVA_WORKER_LEDGER", "COGNEVA_TODO_LEDGER"):
+        value = os.environ.get(key)
+        if value:
+            return f"md:{value}"
     host = pathlib.Path.home() / ".config/cogneva/todo-ledger"
     if host.exists():
         first = host.read_text(errors="ignore").strip().splitlines()
         if first and first[0].strip():
             return f"md:{first[0].strip()}"
     return f"md:{pathlib.Path.home() / '.local/state/cogneva/todo-ledger.md'}"
+
+
+def worker_name() -> str:
+    """这台机器上跑的是谁：显式 → tmux 会话名 → 主机名（S62 用来认领台账）。"""
+    explicit = os.environ.get("COGNEVA_WORKER")
+    if explicit and explicit.strip():
+        return explicit.strip()
+    tmux = os.environ.get("TMUX")
+    if tmux:
+        out = subprocess.run(["tmux", "display-message", "-p", "#S"], capture_output=True, text=True)
+        name = out.stdout.strip()
+        if out.returncode == 0 and name:
+            return name
+    return os.uname().nodename
 
 
 def partition(spec: str) -> tuple[list[Item], list[str], list[str]]:

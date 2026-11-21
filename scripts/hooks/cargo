@@ -81,7 +81,10 @@ fi
 
 if [ "$builds" = "1" ] && [ -f "$family" ] && [ -f "$toplevel/scripts/hooks/round.py" ]; then
   if [ -z "${COGNEVA_BATCH_SPLIT:-}" ]; then
-    if ! python3 "$family" --root "$toplevel" --all-todos; then
+    # 垫片问的是「这一遍编辑走完了没有」（`--editing`，按触点判），不是「做完没有」
+    # （三格，推之前与终态门判）。两者分开之后，编译不再等三格填满——而三格也永远
+    # 不会因为「文件改过」而被点亮。
+    if ! python3 "$family" --root "$toplevel" --all-todos --editing; then
       cat >&2 <<'EOF'
 
 cargo: 这一轮还有待办没改完，先别编译。
