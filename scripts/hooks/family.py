@@ -297,6 +297,42 @@ def main(argv: list[str]) -> int:
         print(f"family: {root} 不像这个仓库", file=sys.stderr)
         return 2
 
+    # ── 台账在一轮开着的时候不许动 ────────────────────────────────────────────
+    #
+    # 这一轮钉住的是台账的**某一版**；批中途改台账，会让「这一批是哪几条」与
+    # 「自开工以来改了什么」两件事同时失效——而现场唯一的做法是重钉，重钉又把
+    # 改动基准重置（2026-11-21 实测：重钉一次，33 条里 32 条从「做过」变回「没做」）。
+    #
+    # 所以这条是硬的：**台账只能在一批推上去之后改**。要改台账，先 `round.py close`
+    # 并推送这一批；要改的是「这一批做哪几条」，那是 `rebound` 的事，而它不该由
+    # 中途改台账来触发。
+    if args.all_todos:
+        try:
+            import round as round_mod
+            cur = round_mod.current_round()
+            if cur and cur[1]:
+                spec = todo_source.default_spec()
+                repo = round_mod.ledger_repo(spec)
+                if repo is not None:
+                    ledger_rel = str(pathlib.Path(spec[3:]).resolve().relative_to(repo))
+                    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                                          capture_output=True, text=True).stdout.strip()
+                    if head and head != cur[1]:
+                        diff = subprocess.run(
+                            ["git", "-C", str(repo), "diff", "--name-only", cur[1], "HEAD", "--", ledger_rel],
+                            capture_output=True, text=True).stdout.strip()
+                        if diff:
+                            print(
+                                "family: 这一轮开着的时候台账被改过（" + ledger_rel + "）。\n"
+                                "  台账只能在一批**推上去之后**改：先把这一批编译、测试、闸门、推送，"
+                                "再改台账、再 `round.py open` 新一轮。\n"
+                                "  批中途改台账 ⇒ 必须重钉 ⇒ 改动基准被重置 ⇒ 做过的活读回没做。",
+                                file=sys.stderr,
+                            )
+                            return 2
+        except Exception:
+            pass
+
     changed = args.changed or working_tree_changes(root)
     foreign: list[str] = []
     todos: list[tuple[str, list[str]]] = []
