@@ -4,7 +4,8 @@
 接在 `criterion_prompt.py` 之后：那个只发请求，这个负责把答案落账并让固定程序再看一次
 ——模型不能自称写对了，格式不符照样不过。
 
-答案文件每行一条：
+答案从 **stdin** 读（不落盘：盘上不留第二份记录，答案的持久副本是事件流里那条调用事件）。
+每行一条：
 
     S20.1	判据读数: state-files → 0
     S24	判据读数: test = crates/x/tests/y.rs::proves_it
@@ -52,7 +53,7 @@ def shape_problem(root: pathlib.Path, text: str) -> str | None:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("answers", help="答案文件")
+    parser.add_argument("answers", nargs="?", default="-", help="答案来源；默认 stdin（不落盘）")
     parser.add_argument("--root", default=".")
     parser.add_argument("--ledger", default=None)
     args = parser.parse_args(argv[1:])
@@ -64,7 +65,8 @@ def main(argv: list[str]) -> int:
         return 2
 
     answers: dict[str, str] = {}
-    for line in pathlib.Path(args.answers).read_text(errors="ignore").splitlines():
+    text = sys.stdin.read() if args.answers == "-" else pathlib.Path(args.answers).read_text(errors="ignore")
+    for line in text.splitlines():
         parts = line.split("\t", 1)
         if len(parts) != 2:
             continue
