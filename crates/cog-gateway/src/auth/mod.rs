@@ -1045,6 +1045,7 @@ pub async fn logout_handler(
             Ok(session_id) => {
                 if let Err(e) = sm.destroy(user_id, session_id).await {
                     warn!("Session destroy failed for {}: {}", session_id, e);
+                    return session_still_live(&e);
                 }
                 info!("User {} logged out session {}", user_id, session_id);
             }
@@ -1062,11 +1063,28 @@ pub async fn logout_handler(
     } else {
         if let Err(e) = sm.destroy_all(user_id).await {
             warn!("Session destroy_all failed for {}: {}", user_id, e);
+            return session_still_live(&e);
         }
         info!("User {} logged out all sessions", user_id);
     }
 
     (StatusCode::OK, Json(json!({ "status": "logged_out" }))).into_response()
+}
+
+/// 存储没有删掉会话时，登录状态还在。答复不能写 `logged_out`：调用方读到
+/// 它就会把手上的令牌当成废纸丢掉，而这条会话在存储里仍然有效。
+///
+/// 503 而不是 500：这一次没删掉的原因是会话存储此刻不可用，调用方稍后重试
+/// 是合理的；请求本身没有写错什么。
+fn session_still_live(error: &cog_core::SFError) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "session_destroy_failed",
+            "message": format!("会话没有被删除，登录状态仍然有效：{error}")
+        })),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------

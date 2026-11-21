@@ -386,6 +386,21 @@ pub fn with_plugin_pipeline(
     Arc::new(state)
 }
 
+/// The same state with the session store the logout route acts on.
+///
+/// Supplied because the route's answer now depends on what that store said:
+/// without it the route answers through its "no store configured" branch, and
+/// a suite that wants to judge the destroy failure would be judging the missing
+/// component instead.
+pub fn with_session_manager(sm: Arc<dyn cog_core::SessionManager>) -> Arc<GatewayState> {
+    let mut state = match Arc::try_unwrap(stateless()) {
+        Ok(state) => state,
+        Err(_) => panic!("the fixture just built it, so this is the only handle"),
+    };
+    state.session_manager = Some(sm);
+    Arc::new(state)
+}
+
 fn build(
     datasets: Option<Arc<dyn cog_storage::DatasetStore>>,
     message_backend: Option<Arc<dyn cog_core::MessageBackend>>,
