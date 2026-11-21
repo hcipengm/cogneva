@@ -32,6 +32,7 @@ pub use datasets::ObjectDatasetStore;
 pub use cog_core::contract::dataset::{
     DatasetCheck, DatasetEntry, DatasetOutcome, DatasetStore, DatasetVerification, DatasetWrite,
 };
+pub mod append_pressure;
 pub mod etcd;
 pub mod event_filter;
 pub mod event_stream_census;
