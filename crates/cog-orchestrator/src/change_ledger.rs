@@ -12453,10 +12453,10 @@ mod tests {
     /// 开着一轮时只发那一轮的：**这一条在没有钉批时是红的**——那版会把两条都发出去。
     #[tokio::test]
     async fn an_open_round_narrows_the_dispatch_to_its_own_batch() {
-        let rounds = FakeRounds::with(round_with(&[pending_row("crates/a")
-            .identity
-            .to_string()
-            .as_str()]));
+        // 批次里钉的是**派发任务号**（`handover_task_prefix`），不是身份串：
+        // 拿身份串去钉，这一轮永远匹配不到任何一条，测试就测的是「钉批失效」。
+        let pinned_id = handover_task_prefix(&pending_row("crates/a").identity);
+        let rounds = FakeRounds::with(round_with(&[pinned_id.as_str()]));
         let pending = vec![pending_row("crates/a"), pending_row("crates/b")];
         let pinned = pinned_batch(&rounds, &pending, pending.clone())
             .await
