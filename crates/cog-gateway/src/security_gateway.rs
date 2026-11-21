@@ -12335,7 +12335,7 @@ mod tests {
     fn a_scanner_with_no_writer_keeps_the_body() {
         let mut s = UsageScanner::default();
         s.feed(b"data: {\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n\n");
-        assert_eq!(s.seen, 49, "看见的字节数照旧计");
+        assert_eq!(s.seen, 54, "看见的字节数照旧计");
         assert!(
             !s.raw.is_empty(),
             "没有写者时正文必须留在内存里，否则这一行的正文就是空的"
