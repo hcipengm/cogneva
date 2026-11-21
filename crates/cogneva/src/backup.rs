@@ -1363,21 +1363,31 @@ impl QdrantHttp {
 /// 单独一个函数是因为它有两个读者：保留策略要按它裁，账要按它报「留下了几个、
 /// 最老的那个是哪一刻」。两处各自 `read_dir` 一遍会走出两个目录快照，而它们
 /// 说的是同一件事。
-pub fn packages_in(dir: &Path) -> Vec<PathBuf> {
-    let mut packages: Vec<PathBuf> = match std::fs::read_dir(dir) {
-        Ok(entries) => entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with(PACKAGE_PREFIX) && n.ends_with(PACKAGE_SUFFIX))
-            })
-            .collect(),
-        Err(_) => return Vec::new(),
+///
+/// 列不出来就抛错，不折成空表：空表说的是「看过了，一个包都没有」，而它与
+/// 「这一趟没看过」在每一个读者那里都得出相反的结论——保留策略会把「数不出
+/// 存量」读成「没有存量」，账会把「没量到」写成「留了 0 个」，卷外补缺会把
+/// 每一份都当成缺的。目录不存在是另一件事：那是这个安装还没有这个落点，按
+/// 空表算。逐条读一半失败同样抛错，半张表比没有更坏——它看起来是完整的。
+pub fn packages_in(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
     };
+    let mut packages: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(PACKAGE_PREFIX) && n.ends_with(PACKAGE_SUFFIX))
+        {
+            packages.push(path);
+        }
+    }
     packages.sort();
-    packages
+    Ok(packages)
 }
 
 /// 一个装着凭证材料的目录，有多少条权限违例。
@@ -1511,7 +1521,20 @@ pub fn keep_count_for_volume(capacity: Option<u64>, sizes: &[u64], seed: usize) 
 
 /// 本趟生效的保留数：从备份卷的容量和卷上现存包的大小现算。
 fn effective_keep_count(dir: &Path, seed: usize) -> usize {
-    let sizes: Vec<u64> = packages_in(dir)
+    let packages = match packages_in(dir) {
+        Ok(packages) => packages,
+        Err(e) => {
+            // 列不出来不是「一个包都没有」：这一趟按声明的数留，并在日志里点明
+            // 这个数是声明而不是量出来的。
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "备份卷列不出来，这一趟的保留数用声明值"
+            );
+            return seed;
+        }
+    };
+    let sizes: Vec<u64> = packages
         .iter()
         .filter_map(|path| std::fs::metadata(path).ok())
         .map(|metadata| metadata.len())
@@ -1522,7 +1545,18 @@ fn effective_keep_count(dir: &Path, seed: usize) -> usize {
 /// 保留策略：包名时间戳字典序即新旧序，留最新 N 份。删除旧包失败只告警——
 /// 保留失败绝不能反过来弄丢新包。
 pub fn enforce_retention(dir: &Path, keep: usize) -> Vec<PathBuf> {
-    let mut packages = packages_in(dir);
+    let mut packages = match packages_in(dir) {
+        Ok(packages) => packages,
+        Err(e) => {
+            // 删除不可逆：列不出来就一份也不裁，把决定留给下一趟能看见卷的跑。
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "备份卷列不出来，这一趟不裁任何包"
+            );
+            return Vec::new();
+        }
+    };
     let mut deleted = Vec::new();
     while packages.len() > keep {
         let victim = packages.remove(0);
@@ -1660,7 +1694,19 @@ struct LeftBehind {
 
 /// 这一次运行跑完之后，目录里还剩什么。两个数出自同一次枚举。
 fn retained_state(dir: &Path) -> (Option<i32>, Option<chrono::DateTime<Utc>>) {
-    let packages = packages_in(dir);
+    let packages = match packages_in(dir) {
+        Ok(packages) => packages,
+        Err(e) => {
+            // 两个数都记「没量到」。`Some(0)` 会被读成「这一趟跑完卷上一个包都不
+            // 剩」，而那是一次没有发生过的删除——账上的这种 0 不会自己消失。
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "备份目录列不出来，这一趟的留存数记作没量到"
+            );
+            return (None, None);
+        }
+    };
     let oldest = packages
         .first()
         .and_then(|p| p.file_name())
@@ -2031,12 +2077,35 @@ fn copy_offsite(dir: &Path, package: &Path, keep: usize) {
 /// 返回值——`copy_offsite` 把失败写成日志而不改这一跑的结局，那份日志不该被这里
 /// 读成「补好了」。
 fn backfill_offsite(volume: &Path, dir: &Path, keep: usize) -> usize {
-    let present: std::collections::HashSet<std::ffi::OsString> = packages_in(dir)
-        .into_iter()
-        .filter_map(|p| p.file_name().map(|n| n.to_os_string()))
-        .collect();
+    // 两张表都要：卷上那份读不出来就没有源，卷外那份读不出来就分不清「缺的」
+    // 与「已经有了的」，两种都会让这一趟把整卷重抄一遍或一份都不补。
+    let volume_packages = match packages_in(volume) {
+        Ok(packages) => packages,
+        Err(e) => {
+            tracing::warn!(
+                dir = %volume.display(),
+                error = %e,
+                "备份卷列不出来，这一趟不补卷外副本"
+            );
+            return 0;
+        }
+    };
+    let present: std::collections::HashSet<std::ffi::OsString> = match packages_in(dir) {
+        Ok(packages) => packages
+            .into_iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_os_string()))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "卷外目录列不出来，这一趟不补卷外副本"
+            );
+            return 0;
+        }
+    };
     let mut copied = 0;
-    for package in packages_in(volume).into_iter().rev() {
+    for package in volume_packages.into_iter().rev() {
         let Some(name) = package.file_name().map(|n| n.to_os_string()) else {
             continue;
         };
@@ -5146,7 +5215,21 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
 
     // 先自己走一遍目录。这一对数不取自写者的 kept_after：演练存在的理由之一
     // 就是「写者说自己留了几个」需要一个不靠它的读者。
-    let packages = packages_in(&cfg.backup_dir);
+    //
+    // 列不出来是这一趟的失败，不是「卷上一个包都没有」：折成空表时，点名了
+    // `package` 的那一趟照样会打开那一份、带着 `volume_packages=0` 报成功。
+    let volume_listing = packages_in(&cfg.backup_dir);
+    let packages = match &volume_listing {
+        Ok(packages) => packages.clone(),
+        Err(e) => {
+            tracing::warn!(
+                dir = %cfg.backup_dir.display(),
+                error = %e,
+                "演练：备份卷列不出来，这一趟记作失败"
+            );
+            Vec::new()
+        }
+    };
     drill.packages_on_volume = packages.len() as i32;
     drill.oldest_package_at = packages
         .first()
@@ -5158,18 +5241,41 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
     // 读者自己看见它在。没有配置落点时这一列留空，「从来没有过一份」与「复制
     // 停了」于是由两条不同的读数分开说。
     if let Some(dir) = &cfg.offsite_dir {
-        drill.offsite_newest_at = packages_in(dir)
-            .last()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .and_then(package_instant);
+        drill.offsite_newest_at = match packages_in(dir) {
+            // 列不出来时这一格留空：它是「没量到」，与「卷外一份都没有」用同一种
+            // 缺席表示，规则读缺席，不会把一个没量到的 0 当成读数。
+            Err(e) => {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "演练：卷外目录列不出来，这一面记作没量到"
+                );
+                None
+            }
+            Ok(packages) => packages
+                .last()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .and_then(package_instant),
+        };
     }
 
     // 卷外覆盖了窗口的多少份：卷上每一份去卷外目录找同名的那一份，找不到的就是
     // 「只有这一份」。只比最新那份回答不了这件事——复制是后来才打开的时候，更早
     // 写出来的几份从来没被复制过，而最新那一列照样是绿的、照样是今晚的。
     if let Some(dir) = &cfg.offsite_dir {
-        drill.offsite_missing_packages = Some(missing_from_window(&packages, &packages_in(dir)));
+        drill.offsite_missing_packages = match packages_in(dir) {
+            // 卷外那张表读不出来时，缺口数不是 0 也不等于卷上的份数：它是没量到。
+            Err(e) => {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "演练：卷外目录列不出来，缺口数记作没量到"
+                );
+                None
+            }
+            Ok(offsite) => Some(missing_from_window(&packages, &offsite)),
+        };
     }
 
     // 仓库侧的两个时刻：宿主那一跑把 `restic snapshots` / `restic key list` 读到的
@@ -5212,12 +5318,17 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
     )
     .await;
     let watch = PassWatch::new("开工");
-    let outcome = tokio::select! {
-        done = drill_once(cfg, live, packages, &mut drill, &watch) => Some(done),
-        (step, silent, bound) = watch.stalled() => {
-            mark_pass_silent(&mut drill, step, silent, bound);
-            None
-        }
+    let outcome = match volume_listing {
+        Err(e) => Some(Err::<(), Box<dyn std::error::Error>>(
+            format!("卷上的包列不出来：{e}").into(),
+        )),
+        Ok(_) => tokio::select! {
+            done = drill_once(cfg, live, packages, &mut drill, &watch) => Some(done),
+            (step, silent, bound) = watch.stalled() => {
+                mark_pass_silent(&mut drill, step, silent, bound);
+                None
+            }
+        },
     };
     if outcome.is_none() {
         // 临时库这一趟是收不了尾了。下一次开工本来也会先删它，但一份照着包大小
@@ -5414,10 +5525,21 @@ async fn drill_once(
     // 比的是卷上最新那份，不是这一趟打开的那份：读这一列的是「卷外那份是不是最新」
     // 的规则，点名开一份旧包时拿旧包去比，会把一条本来绿的规则判红。
     if let Some(dir) = &cfg.offsite_dir {
-        drill.offsite_matches_newest = packages_in(dir)
-            .last()
-            .zip(packages.last())
-            .map(|(copy, volume)| same_file(copy, volume));
+        drill.offsite_matches_newest = match packages_in(dir) {
+            // 读不出来时这一格留空：「是不是同一份」没有量到，不写成「不是」。
+            Err(e) => {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "演练：卷外目录列不出来，这一面记作没量到"
+                );
+                None
+            }
+            Ok(offsite) => offsite
+                .last()
+                .zip(packages.last())
+                .map(|(copy, volume)| same_file(copy, volume)),
+        };
     }
 
     // 解包先做：包本身坏了要在这里停，不能等到把库删了再发现。
@@ -5974,7 +6096,19 @@ pub async fn run_drill_from_env() -> Result<(), Box<dyn std::error::Error>> {
     // 旧包的失败会被随后一行的绿盖住，而读数读的正是最新那一行。
     let mut targets: Vec<Option<String>> = vec![cfg.package.clone()];
     if cfg.also_unproven {
-        let packages = packages_in(&cfg.backup_dir);
+        let packages = match packages_in(&cfg.backup_dir) {
+            Ok(packages) => packages,
+            Err(e) => {
+                // 没有第二趟的候选就不开第二趟：这一趟仍然跑最新那份，但日志要说
+                // 明第二趟是因为列不出来才没跑，而不是因为卷上没有别的包。
+                tracing::warn!(
+                    dir = %cfg.backup_dir.display(),
+                    error = %e,
+                    "演练：备份卷列不出来，这一趟不挑第二份包"
+                );
+                Vec::new()
+            }
+        };
         // 最新那份已经在第一趟里开过了，不参加第二趟的候选：否则「从没成功过」
         // 的排序会永远先把刚写出来的那份挑出来（它当然从没成功过），第二趟每次都
         // 空转，旧包一份也轮不到。
@@ -6824,7 +6958,7 @@ mod tests {
         std::fs::write(off.join(newest), vec![0u8; 10]).unwrap();
 
         let count = |vol: &std::path::Path, off: &std::path::Path| {
-            missing_from_window(&packages_in(vol), &packages_in(off))
+            missing_from_window(&packages_in(vol).unwrap(), &packages_in(off).unwrap())
         };
         assert_eq!(count(&vol, &off), 2);
 
@@ -7526,14 +7660,14 @@ mod tests {
         // 卷外复制是第三天才有的事：前两份写下时它还不存在，所以一直缺着。
         std::fs::copy(vol.join(names[2]), off.join(names[2])).unwrap();
         assert_eq!(
-            missing_from_window(&packages_in(&vol), &packages_in(&off)),
+            missing_from_window(&packages_in(&vol).unwrap(), &packages_in(&off).unwrap()),
             2
         );
 
         assert_eq!(backfill_offsite(&vol, &off, 7), 2);
         // 判据就是演练那一列：补完必须回到 0，否则这条修法只是把同样的缺口留给下一晚。
         assert_eq!(
-            missing_from_window(&packages_in(&vol), &packages_in(&off)),
+            missing_from_window(&packages_in(&vol).unwrap(), &packages_in(&off).unwrap()),
             0,
             "补完之后 offsite_missing_packages 必须读作 0"
         );
@@ -7889,10 +8023,60 @@ mod tests {
             b"new bytes"
         );
         assert_eq!(
-            packages_in(offsite.path()).len(),
+            packages_in(offsite.path()).unwrap().len(),
             2,
             "卷外也要按同一个份数裁，不然它只涨不落"
         );
+    }
+
+    /// 列不出来与「一个包都没有」必须是两种答案。
+    ///
+    /// 备份的每一个读者都从这张表往下算：保留策略数存量、账报「留了几个」、卷外
+    /// 补缺比窗口。折成空表时，一次读失败会让它们各自得出一个没有发生过的结论，
+    /// 而其中「留了 0 个」会随着账本落库活过写它的进程。
+    #[test]
+    fn a_directory_that_cannot_be_listed_is_an_error_not_an_empty_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        // 还没有这个落点：这是空表，不是错误。
+        assert!(packages_in(&dir.path().join("never-created"))
+            .unwrap()
+            .is_empty());
+
+        // 路径在那儿，但不是目录：读不出来。
+        let not_a_dir = dir.path().join("a-file");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        let error =
+            packages_in(&not_a_dir).expect_err("a path that is not a directory cannot be listed");
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+    }
+
+    /// 留存数读不出来时记「没量到」，不记 0。
+    ///
+    /// `Some(0)` 在账上读作「这一趟跑完卷上一个包都不剩」，与一次真实的清空同形。
+    #[test]
+    fn an_unlistable_directory_leaves_the_retained_count_unmeasured() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("a-file");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+
+        assert_eq!(
+            retained_state(&not_a_dir),
+            (None, None),
+            "列不出来不是留了 0 个"
+        );
+    }
+
+    /// 列不出来时一份也不删：保留策略的删除不可逆，看不见卷就不动手。
+    #[test]
+    fn an_unlistable_directory_deletes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("a-file");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+
+        assert!(enforce_retention(&not_a_dir, 0).is_empty());
+        assert!(not_a_dir.exists(), "看不见卷时什么都不该被删掉");
+        // 保留数退回声明值，而不是「0 份能装下」算出的 1。
+        assert_eq!(effective_keep_count(&not_a_dir, 7), 7);
     }
 
     #[test]
@@ -7903,7 +8087,7 @@ mod tests {
         let name = package_name(Utc.with_ymd_and_hms(2026, 10, 18, 3, 17, 0).unwrap());
         std::fs::write(dir.path().join(format!("{name}.partial")), b"half").unwrap();
 
-        assert!(packages_in(dir.path()).is_empty());
+        assert!(packages_in(dir.path()).unwrap().is_empty());
     }
 
     #[test]
