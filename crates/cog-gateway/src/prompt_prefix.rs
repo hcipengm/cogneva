@@ -47,6 +47,42 @@ pub fn prefix(body: &Map<String, Value>) -> Vec<u8> {
     serde_json::to_vec(&Value::Object(stable)).unwrap_or_default()
 }
 
+/// 前缀断了的时候，是哪一类稳定字段先变的。
+///
+/// 命中率低只是一个数；「为什么低」要能分开：工具定义变了、system 变了、还是根本没有
+/// 前缀（模型换了）。三者要做的活完全不同——工具定义变通常是装配顺序问题，system 变是
+/// 有人在里面注入了每轮都会变的东西，模型换则前缀本来就该重来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefixBreak {
+    /// 接得上，没有断。
+    None,
+    /// `tools` 变了。
+    Tools,
+    /// `system` 变了。
+    System,
+    /// 模型变了：前缀从这一格起本来就不同。
+    Model,
+    /// 只有历史变了（或历史被改写）：前一条要重发，而后一条会整段作废。
+    Messages,
+}
+
+/// 分类一次前缀断裂。
+pub fn classify_break(previous: &Map<String, Value>, next: &Map<String, Value>) -> PrefixBreak {
+    if extends(previous, next) {
+        return PrefixBreak::None;
+    }
+    for (field, which) in [
+        ("model", PrefixBreak::Model),
+        ("system", PrefixBreak::System),
+        ("tools", PrefixBreak::Tools),
+    ] {
+        if previous.get(field) != next.get(field) {
+            return which;
+        }
+    }
+    PrefixBreak::Messages
+}
+
 /// 前缀是不是**逐字节**接得上：上一轮那一串是否就是这一轮的开头。
 ///
 /// 用它而不是比较两份 `Value`：缓存认字节，不认「意思相同」。
@@ -121,6 +157,38 @@ mod tests {
             json!([{"name": "read_file", "description": "read a different way"}]),
         );
         assert!(!extends(&a, &b), "工具定义变了，前缀却读作没变");
+    }
+
+    /// 断在哪一格要说得出来：工具 / system / 模型 / 历史，四种分开。
+    #[test]
+    fn a_broken_prefix_names_the_field_that_broke_it() {
+        let base = body(json!([{"role": "user", "content": "问"}]));
+        let grown = body(json!([
+            {"role": "user", "content": "问"},
+            {"role": "assistant", "content": "答"},
+            {"role": "user", "content": "再问"},
+        ]));
+        assert_eq!(classify_break(&base, &grown), PrefixBreak::None);
+
+        let mut system_moved = grown.clone();
+        system_moved.insert("system".into(), json!("a different instruction"));
+        assert_eq!(classify_break(&base, &system_moved), PrefixBreak::System);
+
+        let mut model_moved = grown.clone();
+        model_moved.insert("model".into(), json!("m-2"));
+        assert_eq!(classify_break(&base, &model_moved), PrefixBreak::Model);
+
+        // 历史被改写（第一条变了）不是「接不上」，是「整段作废」——两者要分的活不同。
+        let mut rewritten = grown.clone();
+        rewritten.insert(
+            "messages".into(),
+            json!([
+                {"role": "user", "content": "改过的第一问"},
+                {"role": "assistant", "content": "答"},
+                {"role": "user", "content": "再问"},
+            ]),
+        );
+        assert_eq!(classify_break(&base, &rewritten), PrefixBreak::Messages);
     }
 
     /// 同一份请求算两次是同一串字节：键序固定是这条判据的前提，不是巧合。
