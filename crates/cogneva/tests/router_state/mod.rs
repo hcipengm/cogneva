@@ -421,6 +421,20 @@ pub fn with_memory_pipeline(
     Arc::new(state)
 }
 
+/// The same state, with action plans kept in `store` instead of a per-process
+/// map. The routes' answers are that store's answers, so this is what a suite
+/// supplies to judge them.
+pub fn with_action_plan_store(
+    store: cog_gateway::action_plan::ActionPlanStore,
+) -> Arc<GatewayState> {
+    let mut state = match Arc::try_unwrap(stateless()) {
+        Ok(state) => state,
+        Err(_) => panic!("the fixture just built it, so this is the only handle"),
+    };
+    state.action_plan_store = store;
+    Arc::new(state)
+}
+
 fn build(
     datasets: Option<Arc<dyn cog_storage::DatasetStore>>,
     message_backend: Option<Arc<dyn cog_core::MessageBackend>>,

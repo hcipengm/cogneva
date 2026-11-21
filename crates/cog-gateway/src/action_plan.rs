@@ -8,6 +8,13 @@
 //! [`cog_core::KeyValueStore`] when one is handed in at construction: that is
 //! what makes plans persist across restarts, and without it the map is the
 //! whole store.
+//!
+//! Configured with a shared store, every operation's answer is that store's
+//! answer. A write it refused, or a read it could not serve, is an error the
+//! routes report; it is never folded into "stored", "no such plan" or "no
+//! plans". The in-memory map is not a fallback in that mode -- it holds only
+//! what this process has touched, so answering from it would say things about
+//! the platform's state that nobody measured.
 
 use axum::{
     extract::{Path, State},
@@ -21,7 +28,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{error::ApiError, GatewayState};
-use cog_core::{validate_dag, ActionPlan, AtomicTask, KeyValueStore, Skill};
+use cog_core::{validate_dag, ActionPlan, AtomicTask, KeyValueStore, SFResult, Skill};
 
 /// Hybrid store for [`ActionPlan`] resources.
 /// When a shared key-value store is configured, all operations persist to it
@@ -70,58 +77,72 @@ impl ActionPlanStore {
         }
     }
 
-    pub async fn insert(&self, id: String, plan: StoredActionPlan) {
+    /// 写一份计划。共享存储拒了这次写入就是个错误，不是一次「记下了」：
+    /// 本进程的内存表不进任何询问者的视野，而模块文档说得很清楚——让计划活过
+    /// 一次重启的正是这份共享存储。先写它再写内存表，写不成就不留半份。
+    pub async fn insert(&self, id: String, plan: StoredActionPlan) -> SFResult<()> {
         if let Some(ref store) = self.shared {
-            let json = serde_json::to_string(&plan).unwrap_or_default();
-            let _ = store.hset(PLANS_KEY, &id, &json).await;
+            let json = serde_json::to_string(&plan)?;
+            store.hset(PLANS_KEY, &id, &json).await?;
         }
         self.inner.lock().await.insert(id, plan);
+        Ok(())
     }
 
-    pub async fn get(&self, id: &str) -> Option<StoredActionPlan> {
+    /// 读一份计划。配了共享存储时它是唯一的答案来源：内存表只有本进程碰过的
+    /// 那几行，在它那里读不到并不等于「没有这份计划」。`Ok(None)` 是「存储说
+    /// 没有这一行」，读不成则是 `Err`，两者不折叠。
+    pub async fn get(&self, id: &str) -> SFResult<Option<StoredActionPlan>> {
         if let Some(ref store) = self.shared {
-            if let Ok(Some(s)) = store.hget(PLANS_KEY, id).await {
-                if let Ok(plan) = serde_json::from_str::<StoredActionPlan>(&s) {
-                    return Some(plan);
-                }
+            return match store.hget(PLANS_KEY, id).await? {
+                Some(s) => Ok(Some(serde_json::from_str::<StoredActionPlan>(&s)?)),
+                None => Ok(None),
+            };
+        }
+        Ok(self.inner.lock().await.get(id).cloned())
+    }
+
+    /// 删一份计划，返回删掉的那一份（没有则 `None`）。
+    ///
+    /// 先读后删：答复要回答的是「删掉了什么」，而共享存储里的行可能根本没进过
+    /// 本进程的内存表（上一次重启之后它就是空的）。只看内存表的话，一次确实
+    /// 发生的删除会被答成 `404`。
+    pub async fn remove(&self, id: &str) -> SFResult<Option<StoredActionPlan>> {
+        if let Some(ref store) = self.shared {
+            let existing = match store.hget(PLANS_KEY, id).await? {
+                Some(s) => Some(serde_json::from_str::<StoredActionPlan>(&s)?),
+                None => None,
+            };
+            store.hdel(PLANS_KEY, id).await?;
+            self.inner.lock().await.remove(id);
+            return Ok(existing);
+        }
+        Ok(self.inner.lock().await.remove(id))
+    }
+
+    /// 列出全部计划。读不成就是一个错误：一份读不出来的账答成空表，读者会
+    /// 把「问不到」读成「一张都没有」。
+    pub async fn list(&self) -> SFResult<Vec<StoredActionPlan>> {
+        if let Some(ref store) = self.shared {
+            let values = store.hvals(PLANS_KEY).await?;
+            let mut plans = Vec::with_capacity(values.len());
+            for v in values {
+                plans.push(serde_json::from_str::<StoredActionPlan>(&v)?);
             }
+            return Ok(plans);
         }
-        self.inner.lock().await.get(id).cloned()
+        Ok(self.inner.lock().await.values().cloned().collect())
     }
 
-    pub async fn remove(&self, id: &str) -> Option<StoredActionPlan> {
+    pub async fn len(&self) -> SFResult<usize> {
         if let Some(ref store) = self.shared {
-            let _ = store.hdel(PLANS_KEY, id).await;
+            return Ok(store.hlen(PLANS_KEY).await? as usize);
         }
-        self.inner.lock().await.remove(id)
+        Ok(self.inner.lock().await.len())
     }
 
-    pub async fn list(&self) -> Vec<StoredActionPlan> {
-        if let Some(ref store) = self.shared {
-            if let Ok(values) = store.hvals(PLANS_KEY).await {
-                let mut plans = Vec::with_capacity(values.len());
-                for v in values {
-                    if let Ok(plan) = serde_json::from_str::<StoredActionPlan>(&v) {
-                        plans.push(plan);
-                    }
-                }
-                return plans;
-            }
-        }
-        self.inner.lock().await.values().cloned().collect()
-    }
-
-    pub async fn len(&self) -> usize {
-        if let Some(ref store) = self.shared {
-            if let Ok(n) = store.hlen(PLANS_KEY).await {
-                return n as usize;
-            }
-        }
-        self.inner.lock().await.len()
-    }
-
-    pub async fn is_empty(&self) -> bool {
-        self.len().await == 0
+    pub async fn is_empty(&self) -> SFResult<bool> {
+        Ok(self.len().await? == 0)
     }
 }
 
@@ -214,7 +235,17 @@ pub async fn create_action_plan_handler(
         created_at: chrono::Utc::now(),
         validation: Some(validation.clone()),
     };
-    state.action_plan_store.insert(id.clone(), stored).await;
+    // 存储拒了这次写入，就没有「建好了」这句话可说：答复里那个 id 指向的
+    // 是一份重启之后谁都不认识的计划。
+    state
+        .action_plan_store
+        .insert(id.clone(), stored)
+        .await
+        .map_err(|e| {
+            ApiError::internal(format!(
+                "计划没能写进存储（写不进去的计划不会在重启后还在）：{e}"
+            ))
+        })?;
 
     Ok((
         StatusCode::CREATED,
@@ -231,20 +262,27 @@ pub async fn get_action_plan_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
 ) -> Result<Json<StoredActionPlan>, ApiError> {
-    state
-        .action_plan_store
-        .get(&id)
-        .await
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found(format!("action plan '{}' not found", id)))
+    match state.action_plan_store.get(&id).await {
+        Ok(Some(plan)) => Ok(Json(plan)),
+        Ok(None) => Err(ApiError::not_found(format!(
+            "action plan '{}' not found",
+            id
+        ))),
+        Err(e) => Err(ApiError::internal(format!(
+            "读不到计划存储，所以确认不了这份计划在不在：{e}"
+        ))),
+    }
 }
 
 /// `GET /api/v1/action-plan` — list all stored plans.
 pub async fn list_action_plans_handler(
     State(state): State<Arc<GatewayState>>,
-) -> Json<ListActionPlansResponse> {
-    let plans = state.action_plan_store.list().await;
-    Json(ListActionPlansResponse { plans })
+) -> Result<Json<ListActionPlansResponse>, ApiError> {
+    let plans =
+        state.action_plan_store.list().await.map_err(|e| {
+            ApiError::internal(format!("读不到计划存储，所以列出来的不是全部：{e}"))
+        })?;
+    Ok(Json(ListActionPlansResponse { plans }))
 }
 
 /// `DELETE /api/v1/action-plan/:id` — remove a stored plan.
@@ -253,10 +291,13 @@ pub async fn delete_action_plan_handler(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     match state.action_plan_store.remove(&id).await {
-        Some(_) => Ok(Json(serde_json::json!({"deleted": id}))),
-        None => Err(ApiError::not_found(format!(
+        Ok(Some(_)) => Ok(Json(serde_json::json!({"deleted": id}))),
+        Ok(None) => Err(ApiError::not_found(format!(
             "action plan '{}' not found",
             id
+        ))),
+        Err(e) => Err(ApiError::internal(format!(
+            "计划存储拒了这次删除，所以它还在：{e}"
         ))),
     }
 }
@@ -296,16 +337,27 @@ mod tests {
             created_at: chrono::Utc::now(),
             validation: None,
         };
-        store.insert("p1".into(), plan.clone()).await;
-        assert_eq!(store.len().await, 1);
+        store
+            .insert("p1".into(), plan.clone())
+            .await
+            .expect("the in-memory store takes the write");
+        assert_eq!(store.len().await.expect("the map is readable"), 1);
 
-        let fetched = store.get("p1").await.expect("plan should exist");
+        let fetched = store
+            .get("p1")
+            .await
+            .expect("the in-memory store is readable")
+            .expect("plan should exist");
         assert_eq!(fetched.plan.goal, "g");
 
-        let removed = store.remove("p1").await;
+        let removed = store.remove("p1").await.expect("the map is readable");
         assert!(removed.is_some());
-        assert!(store.is_empty().await);
-        assert!(store.get("p1").await.is_none());
+        assert!(store.is_empty().await.expect("the map is readable"));
+        assert!(store
+            .get("p1")
+            .await
+            .expect("the in-memory store is readable")
+            .is_none());
     }
 
     #[tokio::test]
@@ -318,9 +370,12 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 validation: None,
             };
-            store.insert(format!("p{}", i), p).await;
+            store
+                .insert(format!("p{}", i), p)
+                .await
+                .expect("the in-memory store takes the write");
         }
-        let listed = store.list().await;
+        let listed = store.list().await.expect("the map is readable");
         assert_eq!(listed.len(), 3);
     }
 

@@ -112,6 +112,8 @@ mod a_missing_field_is_refused_or_fallen_back_by_what_the_field_reads_test;
 mod a_node_capacity_probe_is_written_once_test;
 #[path = "a_pg_integration_test_owns_its_schema_test.rs"]
 mod a_pg_integration_test_owns_its_schema_test;
+#[path = "a_plan_the_store_refused_is_not_reported_as_created_test.rs"]
+mod a_plan_the_store_refused_is_not_reported_as_created_test;
 #[path = "a_plugin_upload_says_the_module_will_not_run_test.rs"]
 mod a_plugin_upload_says_the_module_will_not_run_test;
 #[path = "a_pod_that_ships_its_own_logs_is_the_one_the_collector_skips_test.rs"]
