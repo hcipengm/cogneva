@@ -1,8 +1,8 @@
 //! Series names a PromQL expression reads.
 //!
-//! Both observability contract tests need this, and they need the same answer:
-//! a series one of them refuses to extract is a series that side of the
-//! contract silently stops checking. Included with `#[path]` rather than
+//! The alert-rule contract needs this, and needs it to see every name: a
+//! series the extraction refuses to read is a series the contract silently
+//! stops checking. Included with `#[path]` rather than
 //! through `common/mod.rs` so a test that only wants this does not have to
 //! compile the harness and mocks alongside it — though every caller mounts
 //! `common` anyway, which is why the bracket reader comes from there instead of
@@ -524,13 +524,14 @@ const BINARY_OPERATORS: &[&str] = &[
 /// Aggregations, i.e. the words a `by`/`without` clause may follow, and the
 /// words that turn several series into one reading.
 ///
-/// Published because the dashboard contract asks the second question of it
-/// (a panel showing one number owes an aggregation), and a second list of the
-/// same operators would answer that question differently from this one.
+/// The operator set the clause classifier reads, and the one the tests below
+/// pin: `sum(x)` and `sum by (k) (x)` both collapse their operands, and both
+/// have to be recognised as an aggregation rather than as a series name. The
+/// single-value-panel question that first published this list retired with the
+/// hand-written dashboard (`eeed08952`).
 pub const AGGREGATIONS: &[&str] = &[
     "sum",
     "avg",
-    "min",
     "min",
     "max",
     "count",
@@ -544,46 +545,6 @@ pub const AGGREGATIONS: &[&str] = &[
     "limitk",
     "limit_ratio",
 ];
-
-/// Whether the expression applies an aggregation.
-///
-/// A panel that shows one number draws one series: hand it an expression over
-/// a metric with three series and it shows three lines in a box the size of
-/// one, or the last one, depending on the renderer — never the reading the
-/// panel was written for. The operator that collapses them is the difference,
-/// so this asks whether one of [`AGGREGATIONS`] is *applied*.
-///
-/// Applies, not appears: `label_replace(sum, ...)` names a label `sum`, and a
-/// word followed by anything other than `(` or its clause is one. Both
-/// spellings of the operation count — `sum(x)` and `sum by (k) (x)` — because
-/// the clause says which labels survive, not whether the aggregation happens.
-pub fn uses_an_aggregation(expr: &str) -> bool {
-    // Neither a quoted label value nor a `{...}` matcher can hold an operator.
-    let s = strip_braces(&strip_quoted(expr));
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if !token_char(bytes[i]) {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < bytes.len() && token_char(bytes[i]) {
-            i += 1;
-        }
-        if !AGGREGATIONS.contains(&&s[start..i]) {
-            continue;
-        }
-        if s[i..]
-            .chars()
-            .next()
-            .is_some_and(|c| c == '(' || c.is_whitespace())
-        {
-            return true;
-        }
-    }
-    false
-}
 
 /// Which kind of unit a clause keyword is: one that selects the labels a binary
 /// operation matches on, or one that selects the labels an aggregation keeps.
@@ -729,11 +690,12 @@ fn range_selector_operand_complaints(stripped: &str) -> Vec<String> {
 /// What a reader can decide about a PromQL expression without a parser, on the
 /// side where the failure is silent.
 ///
-/// An expression Prometheus cannot parse draws a blank panel and fires no rule:
-/// the dashboard shows an empty graph that reads as "nothing happening" and the
-/// alert stays quiet through the incident it was written for. The name-level
-/// checks in both contract tests pass it, because every series in it is really
-/// produced — what is missing is the operator. That is the shape this catches:
+/// An expression Prometheus cannot parse fires no rule: the alert stays quiet
+/// through the incident it was written for, and the only thing that reports the
+/// problem is the eval-failure self-alert after the rule has shipped. The
+/// name-level checks in the alert-rule contract pass it, because every series
+/// in it is really produced — what is missing is the operator. That is the
+/// shape this catches:
 /// a matching or grouping clause with no binary operator before it, which is
 /// what a hand-edited `A{...} on(pod) (B{...} > 0)` looks like when the `/` is
 /// dropped. Unbalanced brackets are caught for the same reason.
@@ -756,7 +718,8 @@ fn range_selector_operand_complaints(stripped: &str) -> Vec<String> {
 /// unparseable. No other check in this repository decides those, and for a rule
 /// the only reading behind this one is the watcher's eval-failure self-alert,
 /// which is what fires once the expression has already shipped and keeps
-/// failing; a panel has nothing behind it at all.
+/// failing. A reading's query has nothing behind it at all: the computed panel
+/// goes blank and no rule names the cause.
 pub fn shape_complaints(expr: &str) -> Vec<String> {
     let stripped = strip_braces(&strip_quoted(expr));
     let mut out = range_selector_operand_complaints(&stripped);
@@ -1177,9 +1140,8 @@ pub fn all_windows(expr: &str) -> Vec<u64> {
 /// stamps is failed by a healthy writer sitting in that gap.
 ///
 /// The alert-rule contract is the only reader: it is where a guard's bound is
-/// compared to a writer's cadence, and the dashboard contract compares nothing
-/// to a heartbeat. Kept here rather than there so both sides of the contract
-/// read bounds through one function instead of two that drift.
+/// compared to a writer's cadence. Kept here rather than there so every rule
+/// check reads bounds through one function instead of two that drift.
 ///
 /// The bound is read off the compacted expression, so the rule may spell the
 /// arithmetic with any spacing; a `>` instead of a `<` is not an age bound but
@@ -2047,7 +2009,7 @@ pub fn difference_reads(expr: &str) -> BTreeSet<String> {
 mod tests {
     use super::*;
 
-    /// The shapes the two consumers really write. A gate that reports one of
+    /// The shapes the alert rules really write. A gate that reports one of
     /// these is a gate someone has to work around, and a worked-around gate is
     /// the one that stops being read.
     const WRITTEN_BY_HAND: &[&str] = &[
@@ -2070,7 +2032,7 @@ mod tests {
     ];
 
     #[test]
-    fn the_shapes_both_consumers_write_are_silent() {
+    fn the_shapes_the_alert_rules_write_are_silent() {
         for expr in WRITTEN_BY_HAND {
             assert!(
                 shape_complaints(expr).is_empty(),
@@ -2082,10 +2044,11 @@ mod tests {
 
     /// The names a rule reads are the ones a rule names.
     ///
-    /// Both contract tests build their reader set from this function, so a name
-    /// it fails to extract is a series neither contract checks -- and nothing
-    /// on any reading surface would say so, because the missing name is missing
-    /// from the list rather than wrong on it. The cases below are the positions
+    /// The alert-rule contract builds its reader set from this function, so a
+    /// name it fails to extract is a series that contract does not check -- and
+    /// nothing on any reading surface would say so, because the missing name is
+    /// missing from the list rather than wrong on it. The cases below are the
+    /// positions
     /// an identifier can sit in; the absence check is the one that prompted
     /// this: `absent(X)` reads X, and it reads it *by X being missing*, which is
     /// still a reader -- a series whose only reader is an absence check would
@@ -2177,7 +2140,7 @@ mod tests {
 
     /// The defect this gate was written for: the operator between the two
     /// operands was dropped, every series name survived, and the name-level
-    /// checks in both contract tests still pass.
+    /// check in the alert-rule contract still passes.
     #[test]
     fn a_matching_clause_with_no_operator_before_it_is_reported() {
         let complaints = shape_complaints(
@@ -2751,7 +2714,7 @@ mod tests {
     /// The two lists are read by different questions and neither is derived
     /// from the other, so they can only drift silently: an operator missing
     /// from `NOT_SERIES` is invented as a series name, and one missing from
-    /// `AGGREGATIONS` is an operator the single-value-panel check cannot see.
+    /// `AGGREGATIONS` is a clause the classifier reads as an operand.
     #[test]
     fn every_aggregation_is_a_word_that_names_no_series() {
         for op in AGGREGATIONS {
@@ -2759,34 +2722,6 @@ mod tests {
                 NOT_SERIES.contains(op),
                 "`{op}` 是聚合算子却在 NOT_SERIES 之外，它会被当成序列名读出来"
             );
-        }
-    }
-
-    /// Both directions, because either one alone is a gate that can be
-    /// satisfied by a wrong reading: dropping the appliedness test would count
-    /// a label called `sum`, and dropping the clause spelling would reject the
-    /// `by` form this repository writes.
-    #[test]
-    fn an_aggregation_counts_only_when_it_is_applied() {
-        for expr in [
-            "sum(ALERTS{alertstate=\"firing\"})",
-            "sum by (pod) (rate(x_total[5m]))",
-            "max\n\t(cogneva_build_seconds)",
-            "count(up)",
-        ] {
-            assert!(uses_an_aggregation(expr), "`{expr}` 是聚合却没被认出来");
-        }
-        for expr in [
-            // A label named after an operator, and one passed as an argument.
-            "label_replace(x_total, \"sum\", \"$1\", \"pod\", \"(.*)\")",
-            "x_total{sum=\"1\"}",
-            // Reads a series, reduces over time: no series is collapsed.
-            "sum_over_time(x_total[5m])",
-            "x_total",
-            // The clause is not the operation.
-            "x_total by (pod)",
-        ] {
-            assert!(!uses_an_aggregation(expr), "`{expr}` 没有聚合却被认成有");
         }
     }
 }

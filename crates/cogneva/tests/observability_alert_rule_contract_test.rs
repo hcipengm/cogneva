@@ -20,13 +20,14 @@
 //!
 //! A rule whose expression names a series nothing produces never fires. It does
 //! not error, it does not log, it does not show up anywhere except as an alert
-//! that stays quiet through exactly the incident it was written for — the same
-//! failure mode the dashboard contract covers, on the side that is supposed to
-//! wake someone up. The two sides drift for the same reason: nothing about
-//! editing one makes the other notice.
+//! that stays quiet through exactly the incident it was written for. A rule is
+//! the hand-written side of a reading: the gateway computes a panel for every
+//! renderable series (`eeed08952`), so a series that exists is drawn and one
+//! that stops existing loses its panel with nobody editing anything. A rule is
+//! named by hand, so it can name a series nothing produces and keep its silence.
 //!
-//! The dashboard contract test covers panels. This one covers
-//! `observability.infra_watch.rules` in the chart, which nothing checked before.
+//! This test covers `observability.infra_watch.rules` in the chart, which
+//! nothing checked before.
 //!
 //! The tables below are the contract. A series a rule reads must be either one
 //! this workspace publishes (recorded with the file that publishes it, so a
@@ -230,15 +231,16 @@ const PRODUCED: &[(&str, &str)] = &[
     // is judged by -- how long the cache has been over it against how long
     // between walks, so the threshold moves with a configured interval instead
     // of a constant that goes stale when the interval changes.
-    // `last_reclaim_seconds` is deliberately not here. It is still published and
-    // still has a panel, but no rule reads it: the age of the last pass is not
-    // how long the cap has gone unmet -- a cache that spent that time under its
-    // cap earns the same age by being fine -- and a rule that read one for the
-    // other woke someone about a cache whose excess was one walk old.
+    // `last_reclaim_seconds` is deliberately not here. It is still published
+    // (and so drawn by the catalogue), but no rule reads it: the age of the
+    // last pass is not how long the cap has gone unmet -- a cache that spent
+    // that time under its cap earns the same age by being fine -- and a rule
+    // that read one for the other woke someone about a cache whose excess was
+    // one walk old.
     // The names are named in the contract file rather than in either publisher:
     // two processes measure a cache of this shape on two volumes that are not
     // each other's, so a second spelling of any of them would leave a rule
-    // reading one process's cache and a panel the other's.
+    // reading one process's cache and the catalogue drawing the other's.
     (
         "cogneva_build_target_unmet_bytes",
         "crates/cog-core/src/build_cache.rs",
@@ -387,12 +389,15 @@ const PRODUCED: &[(&str, &str)] = &[
     // The ordinary lane's bound is derived from the pool's window, and a window
     // that does not move leaves the bound where it is: the target unchanged is
     // the correct answer, so only an evaluation count can say the loop is still
-    // recomputing rather than stopped. That count is a dashboard reading, not a
-    // rule input -- a quiet lane may owe it no evaluation, so a rule on the
-    // count would fire on a healthy host; the dashboard's beat panel reads it
-    // beside the bound instead, and the row lives in that contract's table.
-    // The two task-graph readings a rule on "the graph stopped moving" is
-    // built from, and they are a pair for the reason a stall is hard to read:
+    // recomputing rather than stopped. That count is a beat, not a rule input --
+    // a quiet lane may owe it no evaluation, so a rule on the count would fire
+    // on a healthy host -- and nothing reads it: it is published so that the
+    // recomputation has a series at all, and the scrape census covers it by the
+    // file it is published from rather than by a reader. That is why it has no
+    // row here, while the bound and the slots it is about do.
+    // These are the two task-graph readings a rule on "the graph stopped
+    // moving" is built from, and they are a pair for the reason a stall is hard
+    // to read:
     // the oldest-untouched age grows while everything else holds still, and
     // the last-success stamp is what separates a graph that looks the same
     // because nothing changed from one that looks the same because the reader
@@ -424,8 +429,9 @@ const PRODUCED: &[(&str, &str)] = &[
     // cadence, which is what the age is compared against here rather than a
     // constant written into the rule. The census series
     // (`cogneva_loop_registered`, and the loop-name label domain it makes
-    // countable) is not read by any rule and is registered with the dashboard
-    // contract instead.
+    // countable) is not read by any rule, and it has no row below: it is a
+    // renderable series rather than a store one, so the scrape census covers it
+    // by the file that publishes it instead of by a producer row here.
     (
         "cogneva_loop_period_seconds",
         "crates/cog-core/src/contract/loop_health.rs",
@@ -2278,8 +2284,8 @@ fn the_delivery_reader_check_separates_the_cell_a_notification_cannot_move() {
 /// A rule may read a name this build records, a name it *derives* from one, or
 /// a foreign series listed with its owner — nothing else, because a rule on any
 /// other name fires never. The derived half is decided by
-/// [`closed_set::a_series_this_build_publishes`], which owns it for both
-/// readers: the store renders `_observed_timestamp_seconds` beside every series
+/// [`closed_set::a_series_this_build_publishes`], which owns it: the store
+/// renders `_observed_timestamp_seconds` beside every series
 /// it serves and a histogram's `_bucket`/`_sum`/`_count` come from the name its
 /// producer records, so a rule naming either reads something that exists.
 /// Spelling the judgement here instead is what made the two readers disagree.
@@ -2651,8 +2657,8 @@ fn the_node_subject_gate_reports_the_rule_without_the_conjunct_and_allows_the_on
 }
 
 /// A rule whose expression does not parse never fires, and the check above
-/// passes it for the same reason a blank panel passes: every series it names is
-/// really produced.
+/// passes it for the same reason an unparseable reading query passes: every
+/// series it names is really produced.
 ///
 /// This is not a parser, and the name says so rather than claiming more: it
 /// recognises a finite set of shapes, each of them verified against a live
@@ -2665,8 +2671,8 @@ fn the_node_subject_gate_reports_the_rule_without_the_conjunct_and_allows_the_on
 /// A shape outside that set gets past this gate. The backstop for whatever
 /// ships anyway is the watcher's own eval-failure self-alert, which fires on a
 /// query that keeps failing -- slower, and heard only if someone reads the
-/// alerts. A rule and a panel fail the same way here, which is why both sides
-/// of this contract ask the same question about their text.
+/// alerts. A reading has no such backstop: its query failing comes back as an
+/// unavailable cell carrying Prometheus' reason, and no rule fires on it.
 #[test]
 fn no_rule_expression_has_a_known_unparseable_shape() {
     let mut complaints: Vec<String> = Vec::new();
@@ -4440,10 +4446,9 @@ fn a_cell_no_producer_writes_is_reported_and_one_that_exists_is_not() {
 /// keeps accepting any rule that reads it, and if the producer is deleted later
 /// nothing goes red.
 ///
-/// The reading lives in `common/closed_set.rs` rather than here: the dashboard
-/// contract sorts its series into the same two tables and has the same hole, so
-/// the criterion is one function with two call sites instead of two copies that
-/// drift apart.
+/// The reading lives in `common/closed_set.rs` rather than here: the criterion
+/// was shared with the dashboard contract while it existed, and it stays in the
+/// common helpers as the one place the derivation rule is decided.
 #[test]
 fn no_foreign_name_is_one_the_closed_set_publishes() {
     closed_set::assert_no_foreign_name_is_ours(FOREIGN);
@@ -4742,6 +4747,12 @@ fn the_pending_band_is_counted() {
 /// that says a bound is missing is worth re-reading against the rules before it
 /// is believed.
 ///
+/// Where an entry below says the reader it owes is "a panel", read that as a
+/// reading on the decision surface: the catalogue draws a reading's query as a
+/// panel, and the query is what reads the series. Panels stopped being a face
+/// of their own with `eeed08952` (2026-11-15), which is why the reasons here
+/// name a reading's content rather than a panel's title.
+///
 /// `Elsewhere` is a decision: the same fact is already stated by a surface that
 /// is read, named here. `Gap` is a debt: nothing states the fact, and the reason
 /// it could not be closed is what the entry carries -- a missing declared bound,
@@ -4939,7 +4950,7 @@ const UNREAD: &[(&str, Unread)] = &[
     (
         "llm_request_param_clamped_total",
         Unread::Gap(
-            "fields the gateway rewrote before sending, by field and upstream. This entry used to be an Elsewhere citing llm_usage_verdict_measured, and that citation is what kills it: the producer's own comment on the usage verdict states that the verdict has two readings and that neither of them is this series, so the sentence offered as the reason is the sentence that excludes it. The two facts are different -- the gauge answers whether one input to one of the adaptations was settled from evidence, the counter answers what happened to a request that was already sent. No rule and no panel on either face names it, and it is not a store series either: the durable face carries only the declared gauge list and this is a counter, so it lives and dies with the gateway process. A rewrite is not a fault by construction -- the temperature clamp fires only where the pool entry or the compat profile says the upstream demands 1, and the max_tokens, store, reasoning_effort, strict and stream_options adaptations follow that same profile -- so a rule would have to declare which rewrites are fault-worthy. What that declaration turns on is evidence, and that picture has moved twice since this entry was written. It used to read that of the three verdicts the admission probe settles (tool calls, temperature, usage) only usage publishes a reading at all, so a clamp decided from a probe result and one decided from a profile guess were the same shape on every series. All three publish now, and the role rewrite is recorded here too -- that was the one rewrite that happened nowhere, since a response never echoes the messages it was sent, so nothing on any series could have shown it. That moves the question rather than answering it: pairing this counter with llm_temperature_verdict_measured does say which of the two inputs decided a temperature clamp, but the counter alone does not, and the other four profile decisions (the max_tokens spelling, store, reasoning_effort, strict) have no probe behind them at all and so can never be decided from measurement. Until somebody states the condition, a rule would report the gateway's own adaptation habits back at us",
+            "fields the gateway rewrote before sending, by field and upstream. This entry used to be an Elsewhere citing llm_usage_verdict_measured, and that citation is what kills it: the producer's own comment on the usage verdict states that the verdict has two readings and that neither of them is this series, so the sentence offered as the reason is the sentence that excludes it. The two facts are different -- the gauge answers whether one input to one of the adaptations was settled from evidence, the counter answers what happened to a request that was already sent. No rule and no reading on either face names it, and it is not a store series either: the durable face carries only the declared gauge list and this is a counter, so it lives and dies with the gateway process. A rewrite is not a fault by construction -- the temperature clamp fires only where the pool entry or the compat profile says the upstream demands 1, and the max_tokens, store, reasoning_effort, strict and stream_options adaptations follow that same profile -- so a rule would have to declare which rewrites are fault-worthy. What that declaration turns on is evidence, and that picture has moved twice since this entry was written. It used to read that of the three verdicts the admission probe settles (tool calls, temperature, usage) only usage publishes a reading at all, so a clamp decided from a probe result and one decided from a profile guess were the same shape on every series. All three publish now, and the role rewrite is recorded here too -- that was the one rewrite that happened nowhere, since a response never echoes the messages it was sent, so nothing on any series could have shown it. That moves the question rather than answering it: pairing this counter with llm_temperature_verdict_measured does say which of the two inputs decided a temperature clamp, but the counter alone does not, and the other four profile decisions (the max_tokens spelling, store, reasoning_effort, strict) have no probe behind them at all and so can never be decided from measurement. Until somebody states the condition, a rule would report the gateway's own adaptation habits back at us",
         ),
     ),
     (
@@ -4965,13 +4976,14 @@ const UNREAD: &[(&str, Unread)] = &[
     // expected traffic rather than a fault -- a tool a task asks to dump a large
     // file will cross the window share on purpose -- so what a rule would need
     // is a bound on how much truncation is normal, and the right amount follows
-    // what the tasks read. The panel reads the three of them together instead,
+    // what the tasks read. The panel read the three of them together then,
     // which is the reading the pair actually supports: this counter is the
     // denominator of the landed-in-Raw share, and the character total is how
     // much was withheld. The fault in that family is the archive-failure
-    // counter, which keeps its rule. So the entry is gone rather than moved --
-    // the fact is read by a face, and leaving it here would be an exemption for
-    // a series that has a reader.
+    // counter, which keeps its rule. The panel is gone with `eeed08952`; the
+    // decision surface names all three counters in its readings, and the
+    // entries below still stand because what they owe is a bound this census
+    // would take as a rule.
     (
         "cogneva_tool_output_fetch_budget_exhausted_total",
         Unread::Gap(
@@ -5042,13 +5054,14 @@ const UNREAD: &[(&str, Unread)] = &[
     ),
     // The pair minted when the publisher started holding ready tasks back --
     // one on what the window can pay for, one on the board column that is full
-    // -- is not counted here any more: the dashboard's "Publisher Holds: The
-    // Window and the Board" panel draws both, which is the reader the window
-    // half was filed as owing. A rule still cannot take either: every nonzero
-    // is the gate working as designed, and what would make a hold a fault is
-    // one that outlasts what justified it. The window entry left with the
-    // panel; the board entry never had to be filed, because it arrived with its
-    // reader in the same pass -- which is why the count moves by one.
+    // -- is not counted here any more: each has a reading on the decision
+    // surface (`ready_admission_held`, `board_column_held`), which is the
+    // reader the window half was filed as owing. A rule still cannot take
+    // either: every nonzero is the gate working as designed, and what would
+    // make a hold a fault is one that outlasts what justified it. The window
+    // entry left with the panel that was its reader then; the board entry never
+    // had to be filed, because it arrived in the pass that wrote that panel --
+    // which is why the count moves by one.
     //
     // The write-window record, published for the first time in this pass because
     // the face that owes the reading had nowhere to get it from. Four cells, and
@@ -5268,13 +5281,14 @@ const UNREAD: &[(&str, Unread)] = &[
 /// It came down to 17 in the pass that gave the tool-output fidelity pair a
 /// panel. The truncation count had been filed as a debt whose reader was a bound
 /// nobody could declare -- how much truncation is normal follows what the tasks
-/// read -- and that reason was true and still is. What changed is that a reader
-/// arrived which does not need the bound: the panel draws the share of cuts whose
-/// tail landed, and that share is the count minus the failure counter, so the
-/// count is no longer read for its own level but as one operand of an identity.
+/// read -- and that reason was true and still is. What changed then was that a
+/// reader arrived which did not need the bound: the panel drew the share of cuts
+/// whose tail landed, computed from the count and the failure counter, so the
+/// count was read as one operand of an identity rather than for its own level.
 /// The character total went in beside it in the same pass and needed no entry of
 /// its own, which is the ordinary case for a new name added with its reader
-/// rather than before one.
+/// rather than before one. That share left with the panel in `eeed08952`; the
+/// readings on the decision surface name all three counters without it.
 /// It went to 18 in the pass that published `cogneva_project_kind_total`, the
 /// dispatch reading that says whether a change landed under the recipe its
 /// project declared or under the built-in. Its reader is a bound rather than a
@@ -5315,7 +5329,7 @@ const UNREAD: &[(&str, Unread)] = &[
 /// visible: what a drain took, what it handed on, and how many writes failed.
 /// Neither has a reader, and neither can have one of the kind this census
 /// counts -- their deciding operand is a row count in Postgres, which no rule or
-/// panel can query -- so both are filed as gaps whose reason names the
+/// reading can query -- so both are filed as gaps whose reason names the
 /// comparison a reading script has to make instead. They arrive together
 /// deliberately: one without the other still cannot say whether the fault is in
 /// the consumer or in the write.
@@ -5474,10 +5488,10 @@ const GAPS_AT_CENSUS: usize = 33;
 /// How many closed-set series are drawn with nothing acting on them.
 ///
 /// Measured 2026-11-13 after the generated catalogue replaced the hand-written
-/// dashboard: that file was the only surface for these, so removing it turned
-/// them into names no rule and no reading consumes. The ceiling only falls; a
-/// change that raises it has to say, in the same commit, why the new series
-/// can only be drawn.
+/// dashboard: that file was the only surface for these, so removing it left
+/// them as names no rule reads and no `UNREAD` row owes. The ceiling only
+/// falls; a change that raises it has to say, in the same commit, why the new
+/// series can only be drawn.
 const DRAWN_ONLY_AT_CENSUS: usize = 27;
 
 #[test]
@@ -5510,14 +5524,18 @@ fn every_series_the_closed_set_publishes_has_a_decided_reader() {
         .chain(FOREIGN_PENDING.iter().map(|(n, _)| *n))
         .collect();
 
-    // Two questions, two answers. "Does any decided surface consume this series"
-    // is the one this census has always asked. "Is it visible at all" is now
-    // answered by construction: the catalogue the gateway computes from the
-    // closed set draws every name in it, so a series cannot be invisible. That
-    // makes the second question worthless as a check and the first one the only
-    // one left standing -- so a name no rule and no reading consumes is not
-    // "unclassified", it is drawn with nothing acting on it, and that is a
-    // debt with a number rather than a missing verdict.
+    // Two questions, two answers. "Does a rule consume this series" is the one
+    // this census has always asked, and it is the narrower of the two the tree
+    // could ask: a reading's query names the series as well, and the scrape
+    // census counts readings beside rules on both of its populations. Here the
+    // debt is a name no rule reads and no `UNREAD` row owes. "Is it visible at
+    // all" is now answered by construction: the catalogue the gateway computes
+    // from the closed set draws every name in it, so a series cannot be
+    // invisible.
+    // That makes the second question worthless as a check and the first one the
+    // only one left standing -- so such a name is not "unclassified", it is
+    // drawn with nothing acting on it, and that is a debt with a number rather
+    // than a missing verdict.
     //
     // The number only comes down: every name under it is one whose owner has
     // not decided yet what its value would change. Raising it to make a change
@@ -5530,7 +5548,7 @@ fn every_series_the_closed_set_publishes_has_a_decided_reader() {
     assert_eq!(
         drawn_only.len(),
         DRAWN_ONLY_AT_CENSUS,
-        "闭集里没有决定消费的序列数变了（现在 {} 条，常数 {DRAWN_ONLY_AT_CENSUS}）。\n多一条：新序列要么被一条规则/读数消费，要么这个数跟着涨——涨要在同一笔里说清为什么它只能被画出来、不能被决定；\n少一条：补上了决定，这个数要跟着降。\n{}",
+        "闭集里没有决定消费的序列数变了（现在 {} 条，常数 {DRAWN_ONLY_AT_CENSUS}）。\n多一条：新序列要么被一条规则消费（或登记进 UNREAD），要么这个数跟着涨——涨要在同一笔里说清为什么它只能被画出来、不能被决定；\n少一条：补上了决定，这个数要跟着降。\n{}",
         drawn_only.len(),
         drawn_only.join("\n")
     );

@@ -1107,7 +1107,7 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          per boot, on both layers. On the wiki cell an increase can only be the \
          boot case, since a live backend never writes `absent` for wiki, and \
          that is the cell that tells the two apart. Because one cell counts \
-         boots where the rest count calls, no rule or panel may sum across \
+         boots where the rest count calls, no rule and no reading may sum across \
          `outcome` and report the total as a number of retrievals. So a reader \
          concludes \"no knowledge backend\" from the wiki cell and never from \
          the memory cell: the memory cell carries ordinary traffic (a live \

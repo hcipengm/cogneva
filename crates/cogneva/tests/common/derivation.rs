@@ -3,8 +3,9 @@
 //!
 //! This lives beside the contract tests rather than in the metric registry:
 //! the registry is a cross-crate contract that every crate rebuilds, and the
-//! only readers of this table are the two contracts below and the live probe.
-//! A metric that a production path ever needs to classify can move up then.
+//! only readers of this table are the contract tests that include this file and
+//! the live probe. A metric that a production path ever needs to classify can
+//! move up then.
 //!
 //! Each test target compiles this file into itself, and no target reads the
 //! whole of it: one asks for the table, another for the lookup. Being unused in
