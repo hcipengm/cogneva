@@ -136,7 +136,9 @@ export function EvalView() {
                 <span className="mono text-[11px]">{d.name}</span>
               ) },
               { key: 'cases', title: '用例', width: '80px', render: (d) => (
-                <span className="mono text-[11px]">{d.case_count}</span>
+                <span className="mono text-[11px]">
+                  {d.case_count == null ? '未计' : d.case_count}
+                </span>
               ) },
               { key: 'tags', title: '标签', width: '120px', render: (d) => (
                 <span className="text-[11px] text-[var(--muted)]">{d.tags.join(' · ') || '—'}</span>
@@ -163,6 +165,7 @@ export function EvalView() {
         )}
         <p className="px-4 pb-3 pt-2 text-[11px] text-[var(--muted)]">
           「跑一次」是真的跑：它会调模型、花时间，跑完的结论落进数据目录。这一面上别的都是读，只有这一下是写。
+          用例数只在 jsonl 上数——别的形状没有一行一个用例的约定，读不出来的文件也没有，所以那几行写「未计」，不是 0。
         </p>
         {runError && (
           <p className="px-4 pb-3 text-[11px] text-[var(--danger)]">跑不动：{runError}</p>

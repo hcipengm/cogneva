@@ -618,7 +618,9 @@ export function SettingsView() {
             columns={[
               { key: 'name', title: '名称', width: '220px', render: (d) => d.name },
               { key: 'cases', title: '用例', width: '90px', render: (d) => (
-                <span className="mono text-[11px]">{d.case_count}</span>
+                <span className="mono text-[11px]">
+                  {d.case_count == null ? '未计' : d.case_count}
+                </span>
               ) },
               { key: 'tags', title: '标签', width: '220px', render: (d) => (
                 <span className="text-[11px] text-[var(--muted)]">{d.tags.join(', ') || '—'}</span>
@@ -631,13 +633,13 @@ export function SettingsView() {
             rowKey={(d) => d.path}
           />
         )}
-        {(datasets.data?.datasets ?? []).length > 0 && (
+        {(datasets.data?.datasets ?? []).some((d) => d.case_count != null) && (
           <BarList
             label="每个评估集有几个用例"
-            note="按磁盘上实际存在的用例数（GET /api/v1/eval/datasets）；用例多不等于覆盖广，覆盖看标签"
-            rows={(datasets.data?.datasets ?? [])
-              .map((d) => ({ id: d.path, label: d.name, value: d.case_count }))
-              .sort((a, b) => b.value - a.value)}
+            note="按磁盘上实际存在的用例数（GET /api/v1/eval/datasets）；只列数得出来的那些——yaml 没有一行一个用例的约定，读不出来的文件也没有。用例多不等于覆盖广，覆盖看标签"
+            rows={(datasets.data?.datasets ?? []).flatMap((d) =>
+              d.case_count == null ? [] : [{ id: d.path, label: d.name, value: d.case_count }]
+            ).sort((a, b) => b.value - a.value)}
           />
         )}
       </section>

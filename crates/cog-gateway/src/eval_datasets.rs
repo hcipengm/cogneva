@@ -57,12 +57,15 @@ pub fn list_datasets(dir: &Path) -> ListedDatasets {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
+            // 数不出来就说数不出来：yaml 没有一行一个用例的约定，读不出内容的
+            // 文件更没有。写 0 会让「这个形状不数」与「这个数据集是空的」在屏上
+            // 同形——前者该换个格式读，后者该往里写用例。
             let case_count = if ext == "jsonl" {
                 std::fs::read_to_string(&path)
+                    .ok()
                     .map(|c| c.lines().filter(|l| !l.trim().is_empty()).count())
-                    .unwrap_or(0)
             } else {
-                0
+                None
             };
             datasets.push(EvalDatasetInfo {
                 name,
@@ -115,8 +118,46 @@ mod tests {
             vec!["humaneval", "suite"],
             "只认三种扩展名，且按名字排序"
         );
-        assert_eq!(listed.datasets[0].case_count, 2, "空行不算用例");
-        assert_eq!(listed.datasets[1].case_count, 0, "yaml 不数行");
+        assert_eq!(listed.datasets[0].case_count, Some(2), "空行不算用例");
+        assert_eq!(
+            listed.datasets[1].case_count, None,
+            "yaml 不数行：这里是「没数」，不是「0 个用例」"
+        );
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    /// 读不出内容的 jsonl 也不许报成 0 个用例：那与一个空文件在屏上同形。
+    ///
+    /// 「读不出来」用同名目录造：`x.jsonl/` 名字符合约定、`read_to_string` 必失败
+    /// （EISDIR），而这件事在 root 下也一样成立——权限位造出来的现场在 root 上
+    /// 不成立，那样的测试只有跑到非 root 身份时才真的在测。
+    #[test]
+    fn a_jsonl_this_process_cannot_read_is_unmeasured_not_empty() {
+        let scratch = std::env::temp_dir().join(format!(
+            "cog-eval-datasets-unreadable-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(scratch.join("secret.jsonl")).unwrap();
+        std::fs::write(scratch.join("empty.jsonl"), "").unwrap();
+
+        let listed = list_datasets(&scratch);
+        let unreadable = listed
+            .datasets
+            .iter()
+            .find(|d| d.name == "secret")
+            .expect("名字符合约定，就算读不出来也该在名单里");
+        assert_eq!(unreadable.case_count, None, "读不出来不是 0 个用例");
+        let empty = listed
+            .datasets
+            .iter()
+            .find(|d| d.name == "empty")
+            .expect("空文件是一个真的空数据集");
+        assert_eq!(
+            empty.case_count,
+            Some(0),
+            "读得出来、里面没有行，这才是量到的 0"
+        );
+
         std::fs::remove_dir_all(&scratch).ok();
     }
 }

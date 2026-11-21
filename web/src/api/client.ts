@@ -2360,7 +2360,12 @@ export async function getSourceLine(): Promise<SourceLineReport> {
 export interface EvalDatasetInfo {
   name: string;
   path: string;
-  case_count: number;
+  /**
+   * 这个数据集里有几个用例。`null` 是**没数**，不是 0：只有 jsonl 有一行一个
+   * 用例的约定，yaml 没有，读不出来的文件也没有。写 0 会让「不数」与「空数据集」
+   * 在屏上同形。
+   */
+  case_count: number | null;
   tags: string[];
 }
 
