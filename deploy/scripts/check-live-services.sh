@@ -228,13 +228,13 @@ live_check redis 'Live-Redis capped agent log' cargo test -p cog-storage --test 
 # 它读不出来，于是那两条等于没点名。
 live_check db 'Live-DB call events' cargo test -p cog-storage --test llm_call_events -- --ignored
 live_check db 'Live-DB transition events' cargo test -p cog-storage --test a_task_transition_leaves_one_event_test -- --ignored
-live_check db 'Live-DB usage readers agree' cargo test -p cog-storage --test the_usage_readers_agree_row_by_row -- --ignored
-live_check db 'Live-DB batch cost' cargo test -p cog-storage --test a_batch_id_answers_what_the_batch_cost_test -- --ignored
-live_check db 'Live-DB rollup is gone' cargo test -p cog-storage --test the_rollup_is_gone_test -- --ignored
+live_check db 'Live-DB usage readers agree' cargo test -p cogneva --test the_usage_readers_agree_row_by_row -- --ignored
+live_check db 'Live-DB batch cost' cargo test -p cogneva --test a_batch_id_answers_what_the_batch_cost_test -- --ignored
+live_check db 'Live-DB rollup is gone' cargo test -p cogneva --test the_rollup_is_gone_test -- --ignored
 live_check db 'Live-DB round events' cargo test -p cog-storage --test round_events -- --ignored
 live_check db 'Live-DB body as a large object' cargo test -p cog-storage --test body_as_large_object -- --ignored
 live_check db 'Live-DB erasure' cargo test -p cog-storage --test erasure_keeps_the_event_and_drops_the_body -- --ignored
-live_check db 'Live-DB metric projections rebuild' cargo test -p cog-storage --test metric_projections_rebuild_from_prometheus -- --ignored
+live_check db 'Live-DB metric projections rebuild' cargo test -p cogneva --test metric_projections_rebuild_from_prometheus -- --ignored
 live_check db 'Live-DB principle rows all decided' cargo test -p cog-storage --test no_principle_row_is_left_undecided_test -- --ignored
 # The two retirement passes are judged on the one thing a fixture cannot
 # hold: they work by asking the server what a key is now, and then acting

@@ -12,7 +12,7 @@
 //!
 //! ```text
 //! COGNEVA_TEST_DATABASE_URL=postgres://user:pw@127.0.0.1:5432/probe \
-//!   cargo test -p cog-storage --test the_usage_readers_agree_row_by_row -- --ignored
+//!   cargo test -p cogneva --test the_usage_readers_agree_row_by_row -- --ignored
 //! ```
 
 use chrono::Utc;

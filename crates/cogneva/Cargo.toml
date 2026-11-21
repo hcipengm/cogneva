@@ -45,6 +45,27 @@ path = "tests/memory_refusal_sweep_plugin_test.rs"
 name = "store_derived_reading"
 path = "tests/store_derived_reading.rs"
 
+# The four live-DB cases that read both stores: a test-only edge may not point
+# at a shipping crate, so they live in the assembly rather than in cog-storage.
+# They are their own targets instead of `suite` modules because the ignored
+# corpus contract names a case by `--test <stem>` and a step that names a
+# module target runs nothing.
+[[test]]
+name = "the_rollup_is_gone_test"
+path = "tests/the_rollup_is_gone_test.rs"
+
+[[test]]
+name = "metric_projections_rebuild_from_prometheus"
+path = "tests/metric_projections_rebuild_from_prometheus.rs"
+
+[[test]]
+name = "a_batch_id_answers_what_the_batch_cost_test"
+path = "tests/a_batch_id_answers_what_the_batch_cost_test.rs"
+
+[[test]]
+name = "the_usage_readers_agree_row_by_row"
+path = "tests/the_usage_readers_agree_row_by_row.rs"
+
 [[test]]
 name = "swe_pro_container"
 path = "tests/swe_pro_container.rs"
