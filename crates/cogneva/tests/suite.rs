@@ -442,6 +442,8 @@ mod model_facing_instructions_declare_their_source_test;
 mod multi_backend_consumer_reads_its_group_from_config_test;
 #[path = "network_policy_subjects_name_a_component_the_code_writes_test.rs"]
 mod network_policy_subjects_name_a_component_the_code_writes_test;
+#[path = "no_fact_table_is_deleted_on_a_schedule_test.rs"]
+mod no_fact_table_is_deleted_on_a_schedule_test;
 #[path = "no_json_columns_test.rs"]
 mod no_json_columns_test;
 #[path = "notification_contract_matches_its_schema.rs"]
