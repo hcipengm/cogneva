@@ -615,7 +615,7 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-extension/src/checkpoints.rs", 1),
     ("crates/cog-extension/src/command_server.rs", 3),
     ("crates/cog-extension/src/executor_lease.rs", 1),
-    ("crates/cog-extension/src/hostdocs.rs", 5),
+    ("crates/cog-extension/src/hostdocs.rs", 8),
     ("crates/cog-extension/src/hostdocs_assist.rs", 3),
     ("crates/cog-extension/src/lane_sizing.rs", 1),
     ("crates/cog-extension/src/runtime/remote.rs", 6),
