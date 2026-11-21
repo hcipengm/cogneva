@@ -4048,7 +4048,15 @@ impl MainlineDeployer {
         let prev = match state.last_seen_rev.clone() {
             None => {
                 state.last_seen_rev = Some(bare.to_string());
-                let _ = self.save_state(state);
+                if let Err(e) = self.save_state(state) {
+                    // 基线立不起来，下一拍会从「没有上一拍」重来一次：这一拍什么都没
+                    // 数，所以不是丢账；但状态文件写不进去这件事本身要说出来。
+                    warn!(
+                        error = %e,
+                        "could not persist the baseline this tick saw; the next tick starts from \
+                         scratch again and nothing is counted until it lands"
+                    );
+                }
                 return;
             }
             Some(prev) if prev == bare => return,
@@ -4077,7 +4085,13 @@ impl MainlineDeployer {
                 "the head seen last tick is not an ancestor of this one; restarting the skipped-rev count from here"
             );
             state.last_seen_rev = Some(bare.to_string());
-            let _ = self.save_state(state);
+            if let Err(e) = self.save_state(state) {
+                warn!(
+                    error = %e,
+                    "could not persist the rewritten baseline; the next tick re-reads the old \
+                     one and takes the same branch again (nothing is counted either way)"
+                );
+            }
             return;
         }
 
@@ -4090,6 +4104,25 @@ impl MainlineDeployer {
             return;
         };
         let skipped = commits.saturating_sub(1);
+        // 先落盘再计数：读数是「这一段被数过」，而「数过」的唯一记录就是基线。
+        // 基线没落盘时记下这个数，下一拍会从同一条旧基线把同一段再数一遍——
+        // 一次落盘失败被记成两次被跳过的 rev。落不下时不记、把基线退回原处，
+        // 留给落盘成功的那一拍只数一次。
+        let previous = state.last_seen_rev.clone();
+        state.last_seen_rev = Some(bare.to_string());
+        if let Err(e) = self.save_state(state) {
+            state.last_seen_rev = previous;
+            warn!(
+                error = %e,
+                previous = %rev12(&prev),
+                current = %rev12(bare),
+                skipped,
+                "could not persist the baseline, so this window is not counted: counting it \
+                 here and failing to move the baseline would count the same revisions again \
+                 next tick; the baseline stays put until a tick can write it"
+            );
+            return;
+        }
         if skipped > 0 {
             info!(
                 previous = %rev12(&prev),
@@ -4112,8 +4145,6 @@ impl MainlineDeployer {
                     .await;
             }
         }
-        state.last_seen_rev = Some(bare.to_string());
-        let _ = self.save_state(state);
     }
 
     fn save_state(&self, state: &MainlineState) -> SFResult<()> {
@@ -18431,6 +18462,121 @@ exit 0
             })
             .unwrap_or_else(|| panic!("没有 skipped 的计数：{counters:?}"));
         assert_eq!(sample.value, 1.0, "A..C 之间只有一个从没被看过");
+    }
+
+    /// 基线落不下盘的那一拍不计数，基线也不动。
+    ///
+    /// 「这一段被数过」的唯一记录就是基线文件：把数记进读数、基线却留在原处，
+    /// 下一拍会把同一段再数一遍（一次落盘失败被记成两次跳过的 rev）。所以判据
+    /// 两半：读数里没有这一段，基线退回原来的值；并且这件事要在日志里说出声，
+    /// 否则下一拍重数时没人知道前面那一拍白算过。
+    #[test]
+    fn a_skipped_window_whose_baseline_could_not_be_persisted_is_not_counted() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the current-thread runtime builds");
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry().with(MessageCapture {
+            messages: events.clone(),
+        });
+
+        let counters = tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                let _env = ENV_LOCK.lock().await;
+                let tmp = tempfile::tempdir().unwrap();
+                let root = tmp.path();
+                let (bare, work, rev_a, rev_b) = setup_repos(root).await;
+                let bin_dir = root.join("bin");
+                std::fs::create_dir_all(&bin_dir).unwrap();
+                let buildah = fake_buildah(&bin_dir, "");
+                let deployed = main_image("localhost:30500", &rev_a);
+                let kubectl = fake_kubectl(&bin_dir, &deployed);
+                let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
+
+                // 一个普通文件挡在状态目录该在的位置上：`create_dir_all` 连 root
+                // 都会拿到 ENOTDIR，所以「写不进去」不靠权限位成立。
+                let blocked = root.join("blocked");
+                std::fs::write(&blocked, b"not a directory").unwrap();
+                let mut cfg = test_config(root, &bare, &buildah, &kubectl);
+                cfg.state_dir = blocked.join("state").to_string_lossy().into_owned();
+                let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare))
+                    .with_metrics(metrics.clone());
+
+                // 与 `a_revision_superseded_between_ticks_is_counted_as_skipped` 同一个
+                // 走位：A..C 之间隔着 B，B 没有任何一拍看过。
+                real_git(&work, &["fetch", "local", "main"]).await;
+                real_git(&work, &["reset", "--hard", "FETCH_HEAD"]).await;
+                std::fs::write(work.join("lib.rs"), "fn c() {}\n").unwrap();
+                real_git(&work, &["add", "."]).await;
+                real_git(&work, &["commit", "-m", "c"]).await;
+                real_git(&work, &["push", "local", "HEAD:main"]).await;
+                let rev_c = real_git_stdout(&work, &["rev-parse", "HEAD"]).await;
+                assert_ne!(rev_c, rev_b, "夹具要走一个真的新 rev");
+
+                let mut state = deployer.load_state();
+                state.last_seen_rev = Some(rev_a.clone());
+                deployer.record_skipped_revs(&mut state, &rev_c).await;
+                assert_eq!(
+                    state.last_seen_rev.as_deref(),
+                    Some(rev_a.as_str()),
+                    "基线没落盘，内存里却已经挪走了：下一个落盘成功的调用会把它顺手写下去"
+                );
+
+                metrics
+                    .query_counter_totals(
+                        cog_core::metric_names::MAINLINE_REVS_SKIPPED_TOTAL.as_str(),
+                    )
+                    .await
+                    .unwrap()
+            })
+        });
+
+        assert!(
+            counters.is_empty(),
+            "基线没落盘，这一段却被记进了读数：下一拍会从同一条旧基线再数一遍 {counters:?}"
+        );
+        let messages = events.lock().unwrap().clone();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("could not persist the baseline")),
+            "这一段没计，日志里也没有一句话说为什么：{messages:?}"
+        );
+    }
+
+    struct MessageCapture {
+        messages: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for MessageCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Take(String);
+            impl tracing::field::Visit for Take {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "message" {
+                        self.0 = value.to_string();
+                    }
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut take = Take(String::new());
+            event.record(&mut take);
+            self.messages.lock().unwrap().push(take.0);
+        }
     }
 
     /// 基线没动（两拍之间没有新 rev）时什么都不记：同一段区间不能被数第二遍。
