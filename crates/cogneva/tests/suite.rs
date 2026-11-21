@@ -100,6 +100,8 @@ mod a_crate_is_a_component_not_a_bridge_test;
 mod a_day_is_named_by_one_clock_test;
 #[path = "a_default_table_names_its_numbers_test.rs"]
 mod a_default_table_names_its_numbers_test;
+#[path = "a_failed_login_that_was_not_counted_says_so_test.rs"]
+mod a_failed_login_that_was_not_counted_says_so_test;
 #[path = "a_job_inner_wait_budget_widens_the_job_deadline_test.rs"]
 mod a_job_inner_wait_budget_widens_the_job_deadline_test;
 #[path = "a_label_name_is_the_same_wherever_it_is_declared_test.rs"]

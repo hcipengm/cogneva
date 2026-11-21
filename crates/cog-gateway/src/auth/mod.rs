@@ -389,7 +389,17 @@ impl LoginRateLimiter {
 
     /// Clear attempts on successful login.
     pub async fn clear(&self, identifier: &str) {
-        let _ = self.store.del(&Self::key(identifier)).await;
+        if let Err(error) = self.store.del(&Self::key(identifier)).await {
+            // The login itself succeeded; what failed is the cleanup. Say so:
+            // the old count is still there, so this identity could be refused
+            // by its own history until the window expires, and a reader of the
+            // counter has no way to tell that from a genuine run of failures.
+            warn!(
+                identifier = %identifier,
+                error = %error,
+                "登录成功了，但失败计数没清掉：存储拒了这次删除，这个身份在窗口到期前会带着旧计数继续"
+            );
+        }
     }
 
     /// Generic rate-limit check with a custom prefix.
@@ -423,7 +433,17 @@ impl LoginRateLimiter {
         // creates it: a separate expiry would leave a window in which the key
         // exists without one, and a crash inside that window locks the
         // identifier out permanently.
-        let _ = self.store.incr_ex(&key, 1, self.window_seconds).await;
+        if let Err(error) = self.store.incr_ex(&key, 1, self.window_seconds).await {
+            // A counter that never got written reads the same as a counter at
+            // zero, and the read side deliberately treats zero as "not
+            // limited". So this failure means the limiter is off for as long
+            // as the store refuses writes -- the one moment it is most needed.
+            warn!(
+                key = %key,
+                error = %error,
+                "这次失败没记上：存储拒了计数，读侧把读不到的计数当 0，限流在这一拍对它是关着的"
+            );
+        }
     }
 }
 
