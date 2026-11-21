@@ -124,7 +124,12 @@ pub struct TableReport {
 pub struct CollectionReport {
     pub name: String,
     pub snapshot: String,
-    pub points: u64,
+    /// 这个集合里有多少点，`None` 是「数不出来」。
+    ///
+    /// 快照已经下下来了，数不出来只影响这一格读数，所以它不让整趟备份失败；但它
+    /// 也不能写成 0：0 读作「这个集合是空的」，那是另一个事实，而清单正是读这份
+    /// 包覆盖了什么的地方。
+    pub points: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1227,7 +1232,11 @@ impl QdrantHttp {
 
     async fn points_count(&self, collection: &str) -> Result<u64, Box<dyn std::error::Error>> {
         let body = self.get_json(&format!("/collections/{collection}")).await?;
-        Ok(body["result"]["points_count"].as_u64().unwrap_or(0))
+        // 少了这一格是「没读到」，不是「0 个点」：把两者折在一起，清单就会替一个
+        // 数不出来的集合作证说它是空的。
+        body["result"]["points_count"].as_u64().ok_or_else(|| {
+            format!("qdrant collection {collection} info has no result.points_count: {body}").into()
+        })
     }
 
     /// 服务端一致性快照：创建（wait=true 阻塞到落盘）→ 下载 → 删服务端副本
@@ -1296,10 +1305,21 @@ impl QdrantHttp {
             );
         }
 
+        let points = match self.points_count(collection).await {
+            Ok(points) => Some(points),
+            Err(error) => {
+                tracing::warn!(
+                    collection,
+                    error = %error,
+                    "快照已经下下来了，但这个集合的点数没读到：清单里这一格记作「数不出来」，不记 0——0 读作「这个集合是空的」"
+                );
+                None
+            }
+        };
         Ok(CollectionReport {
             name: collection.to_string(),
             snapshot: snap_name,
-            points: self.points_count(collection).await.unwrap_or(0),
+            points,
         })
     }
 
@@ -4392,7 +4412,8 @@ fn package_digest(path: &Path) -> std::io::Result<String> {
 ///
 /// 段名与清单里的段名一致（postgres／qdrant／objects／artifacts／secrets），空数组读作
 /// 「这一段一份都没有」，与「这一段没声明」分开：旧包的清单里本来就没有 artifacts 段，
-/// 而今天一段都没有是事实。
+/// 而今天一段都没有是事实。qdrant 那一格的点数同理分三态：一个数、`null`（数不出来）、
+/// 以及集合不在单子上——`null` 不许折成 0，0 读作「这个集合是空的」。
 fn package_coverage(manifest: &BackupManifest) -> String {
     serde_json::json!({
         "secrets": manifest.secrets_keys,
@@ -6554,11 +6575,19 @@ mod tests {
             },
         ];
         manifest.postgres.sequences = 3;
-        manifest.qdrant = vec![CollectionReport {
-            name: "code".into(),
-            snapshot: "code.snapshot".into(),
-            points: 1024,
-        }];
+        manifest.qdrant = vec![
+            CollectionReport {
+                name: "code".into(),
+                snapshot: "code.snapshot".into(),
+                points: Some(1024),
+            },
+            // 数不出来的集合也在单子上，读作 `null`：与「空的」（0）分开。
+            CollectionReport {
+                name: "drafts".into(),
+                snapshot: "drafts.snapshot".into(),
+                points: None,
+            },
+        ];
         manifest.objects = ObjectsReport {
             files: 7,
             bytes: 2048,
@@ -6588,7 +6617,10 @@ mod tests {
             serde_json::json!([["public.backup_runs", 42], ["public.empty_table", 0]])
         );
         assert_eq!(value["postgres"]["sequences"], 3);
-        assert_eq!(value["qdrant"], serde_json::json!([["code", 1024]]));
+        assert_eq!(
+            value["qdrant"],
+            serde_json::json!([["code", 1024], ["drafts", null]])
+        );
         assert_eq!(
             value["objects"],
             serde_json::json!({"files": 7, "bytes": 2048})
@@ -7640,7 +7672,7 @@ mod tests {
             qdrant: vec![CollectionReport {
                 name: "c1".into(),
                 snapshot: "c1-123.snapshot".into(),
-                points: 7,
+                points: Some(7),
             }],
             objects: ObjectsReport { files: 1, bytes: 5 },
             artifacts: Vec::new(),
@@ -9045,5 +9077,133 @@ mod tests {
             serde_json::json!([4, 3])
         );
         assert!(doc["groups"][0]["counts"].get("broken").is_none());
+    }
+
+    /// 只会说 Qdrant 快照接口那几句话的端点：建快照、下载、删快照，外加一个集合
+    /// 信息——最后这句的正文由用例给，要测的正是「数不出来」与「0 个点」分不分得开。
+    async fn serve_qdrant(info: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut chunk = [0u8; 512];
+                    loop {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&chunk[..n]),
+                        }
+                        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&head);
+                    let line = request.lines().next().unwrap_or_default();
+                    let body = if line.starts_with("POST ") {
+                        r#"{"result":{"name":"c1.snap"}}"#
+                    } else if line.starts_with("GET ") && line.contains("/snapshots/") {
+                        "snapshot-bytes"
+                    } else if line.starts_with("DELETE ") {
+                        r#"{"result":true}"#
+                    } else {
+                        info
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// 收一条 warn 的消息正文：这一格读不到时，屏幕上是哪句话。
+    #[derive(Clone, Default)]
+    struct WarnText(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    struct MessageField(String);
+
+    impl tracing::field::Visit for MessageField {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnText {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            let mut field = MessageField(String::new());
+            event.record(&mut field);
+            self.0.lock().unwrap().push(field.0);
+        }
+    }
+
+    /// 集合信息里没有 `points_count`：快照仍然是一份好快照（包不该为这一格丢掉），
+    /// 但清单里这一格必须记作「数不出来」，而且在屏幕上说得出是哪一件没读到。
+    ///
+    /// 没有这一条，`unwrap_or(0)` 会把「没读到」写成「这个集合是空的」——读这份包
+    /// 覆盖了什么的人，会以为向量层本来就没有数据。
+    #[test]
+    fn a_collection_whose_point_count_could_not_be_read_is_not_recorded_as_empty() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let warns = WarnText::default();
+        let captured = warns.clone();
+        let subscriber = tracing_subscriber::registry().with(warns);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let report = tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                let (base, server) = serve_qdrant(r#"{"result":{"status":"green"}}"#).await;
+                let dir = tempfile::tempdir().unwrap();
+                let qdrant = QdrantHttp::new(&base).unwrap();
+                let report = qdrant
+                    .snapshot_collection("c1", dir.path())
+                    .await
+                    .expect("快照本身是好的，数不出来只影响那一格");
+                assert!(
+                    dir.path().join("c1.snapshot").exists(),
+                    "快照已经下下来了，不该因为点数没读到就丢掉"
+                );
+                server.abort();
+                report
+            })
+        });
+        assert_eq!(report.points, None, "读不到的点数不许折成 0");
+        let said = captured.0.lock().unwrap().clone();
+        assert!(
+            said.iter().any(|m| m.contains("点数没读到")),
+            "数不出来这件事没有在日志里说出名字：{said:?}"
+        );
+    }
+
+    /// 反例：0 个点是量到的读数，不是「量不到」。一个永远记 `None` 的「修法」
+    /// 也必须在这里红，否则这条改动把一次真空集合读成了读不到。
+    #[tokio::test]
+    async fn an_empty_collection_is_still_counted_as_zero() {
+        let (base, server) = serve_qdrant(r#"{"result":{"points_count":0}}"#).await;
+        let dir = tempfile::tempdir().unwrap();
+        let qdrant = QdrantHttp::new(&base).unwrap();
+        let report = qdrant.snapshot_collection("c1", dir.path()).await.unwrap();
+        assert_eq!(report.points, Some(0));
+        server.abort();
     }
 }
