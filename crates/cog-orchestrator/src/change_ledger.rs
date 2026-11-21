@@ -3482,7 +3482,7 @@ async fn principle_readings(
 /// nothing is relocated on a pass whose reading failed.
 ///
 /// The root is the directory the declaring file sits in, and the directory is the
-/// identity: a row whose gate is `deploy/scripts/tests/x.test.sh` is asked of
+/// identity: a row whose gate is `deploy/scripts/tests/alert-rule-faces.test.sh` is asked of
 /// `deploy/scripts/tests`. A rule declared under the sources keeps the identity
 /// it has always had -- the reading that the same rule is now declared in two
 /// places must not rewrite the identity of a row that has been closing there for

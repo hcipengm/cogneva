@@ -230,6 +230,14 @@ jobs:
       # 新写的一条要么说清是谁的数（实测／本机／默认／例如），要么写机制与比例。
       - name: Check comments state whose capacity they quote
         run: bash deploy/scripts/check-comment-capacity-figures.sh
+      # 注释点名的测试文件必须还在。改名或退休之后那句话继续指着一片空地——读注释的
+      # 人跟不过去，而没有任何东西会红：跑一个改名的测试会立刻报「找不到」，读一句注释
+      # 不会。判词是「引用的名字落到树上」，落点三条（仓库根、引用文件所在目录、树上某处
+      # 的同名文件）；故意点名一份已不在的，在同一行标「已退休／已删／旧路径／待建」。
+      - name: Check comments cite tests the tree carries
+        run: python3 deploy/scripts/check-comment-test-references.py
+      - name: Check the comment-test-reference gate rejects what it should
+        run: bash deploy/scripts/tests/comment-test-references.test.sh
       # 同一份清单里一个键出现两次，apply 会以 `duplicate entries` 拒收整份，整轮滚动
       # 失败并把所有工作负载回滚到旧镜像——两笔改动各自都对，合起来才知道。2026-11-18
       # 现场：网关 env 里的 `COGNEVA_MEMORY_API_BASE`。parity 比的是「有没有这个字段」，
