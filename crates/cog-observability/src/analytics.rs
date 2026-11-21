@@ -307,22 +307,41 @@ impl AnalyticsBackend for ClickHouseAnalyticsBackend {
         let json: Value = resp
             .json()
             .map_err(|e| anyhow::anyhow!("JSON parse failed: {}", e))?;
-        let data = json
-            .get("data")
-            .and_then(|d| d.as_array())
-            .cloned()
-            .unwrap_or_default();
+        // `FORMAT JSON` 的回话一定带 `data`。少了它，是这份答案没读成，不是这个
+        // 时间窗里一条事件都没有——折成空表，读的人会以为那段时间没发生过任何事。
+        let data = json.get("data").and_then(Value::as_array).ok_or_else(|| {
+            anyhow::anyhow!("ClickHouse query_events answer has no data array: {json}")
+        })?;
 
         let mut events = Vec::new();
         for row in data {
-            let properties_str = row["properties"].as_str().unwrap_or("{}");
+            // 这几格是这一行自己的读数：缺了就是这一行没读成，不能拿空串、空表或
+            // 「此刻」去补——补出来的事件是一个没人记过的事件。
+            let text_col = |column: &str| -> anyhow::Result<String> {
+                row.get(column)
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ClickHouse query_events row has no {column}: {row}")
+                    })
+            };
+            let event_id = text_col("event_id")?;
+            let event_type = text_col("event_type")?;
+            let timestamp = parse_clickhouse_datetime(&row["timestamp"]).ok_or_else(|| {
+                anyhow::anyhow!("ClickHouse query_events row has no readable timestamp: {row}")
+            })?;
+            let properties_str = text_col("properties")?;
             let properties: HashMap<String, Value> =
-                serde_json::from_str(properties_str).unwrap_or_default();
+                serde_json::from_str(&properties_str).map_err(|e| {
+                    anyhow::anyhow!(
+                        "ClickHouse query_events row carries properties that are not JSON ({e}): {row}"
+                    )
+                })?;
 
             events.push(AnalyticsEvent {
-                event_id: row["event_id"].as_str().unwrap_or("").to_string(),
-                event_type: row["event_type"].as_str().unwrap_or("").to_string(),
-                timestamp: parse_clickhouse_datetime(&row["timestamp"]),
+                event_id,
+                event_type,
+                timestamp,
                 user_id: row["user_id"].as_str().map(String::from),
                 session_id: row["session_id"].as_str().map(String::from),
                 task_id: row["task_id"].as_str().map(String::from),
@@ -376,18 +395,24 @@ impl AnalyticsBackend for ClickHouseAnalyticsBackend {
         let json: Value = resp
             .json()
             .map_err(|e| anyhow::anyhow!("JSON parse failed: {}", e))?;
-        let data = json
-            .get("data")
-            .and_then(|d| d.as_array())
-            .cloned()
-            .unwrap_or_default();
+        // 同 `query_events`：没有 `data` 是答案没读成，不是这段时间里一次都没有。
+        let data = json.get("data").and_then(Value::as_array).ok_or_else(|| {
+            anyhow::anyhow!("ClickHouse aggregate_count answer has no data array: {json}")
+        })?;
 
         let mut buckets = Vec::new();
         for row in data {
-            buckets.push(TimeBucket {
-                bucket_time: parse_clickhouse_datetime(&row["bucket_time"]),
-                count: row["cnt"].as_u64().unwrap_or(0),
-            });
+            // 每一行都数了 `count()`，所以 `cnt` 一定在。少了它这一行就是一小格
+            // 「0 次」——一条从没量过的读数混进了时间线。
+            let count = row.get("cnt").and_then(Value::as_u64).ok_or_else(|| {
+                anyhow::anyhow!("ClickHouse aggregate_count row has no cnt: {row}")
+            })?;
+            // 桶的时间同理：读不出来就折成「此刻」的话，时间线上会多出一个没人
+            // 量过的时间点，而它看起来和别的点一模一样。
+            let bucket_time = parse_clickhouse_datetime(&row["bucket_time"]).ok_or_else(|| {
+                anyhow::anyhow!("ClickHouse aggregate_count row has no readable bucket_time: {row}")
+            })?;
+            buckets.push(TimeBucket { bucket_time, count });
         }
 
         Ok(buckets)
@@ -419,7 +444,12 @@ fn escape_clickhouse_string(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
-fn parse_clickhouse_datetime(value: &Value) -> DateTime<Utc> {
+/// 把 ClickHouse 的一格时间读成时刻；读不出来就是 `None`，不是「此刻」。
+///
+/// 这个函数以前在解析失败时退回 `Utc::now()`：一行没有时间的事件与一个没有时间的
+/// 桶会各自出现在时间线的当下，看着与真读数一模一样。缺一格的读法是 `None`，
+/// 由调用方决定是丢掉这一行还是报出来。
+fn parse_clickhouse_datetime(value: &Value) -> Option<DateTime<Utc>> {
     value
         .as_str()
         .and_then(|s| {
@@ -434,7 +464,6 @@ fn parse_clickhouse_datetime(value: &Value) -> DateTime<Utc> {
                     .map(|ndt| DateTime::from_naive_utc_and_offset(ndt, Utc))
             })
         })
-        .unwrap_or_else(Utc::now)
 }
 
 // ─── PostgreSQL Fallback Implementation ───────────────────────────
@@ -1007,6 +1036,148 @@ mod tests {
             increases_between(&first, &second),
             vec![("phase=born".to_string(), 2.0)],
             "only an increment with a real predecessor sample is visible to increase()"
+        );
+    }
+
+    /// 一份给定的应答：状态码与正文都由用例挑。
+    #[derive(Debug)]
+    struct CannedHttp {
+        status: u16,
+        body: String,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpClient for CannedHttp {
+        async fn execute(&self, _req: HttpRequest) -> cog_core::SFResult<cog_core::HttpResponse> {
+            Ok(cog_core::HttpResponse {
+                status: self.status,
+                headers: Default::default(),
+                body: self.body.clone().into_bytes(),
+            })
+        }
+    }
+
+    fn clickhouse(body: &str) -> ClickHouseAnalyticsBackend {
+        ClickHouseAnalyticsBackend::new("http://ch:8123", "cogneva").with_client(Arc::new(
+            CannedHttp {
+                status: 200,
+                body: body.to_string(),
+            },
+        ))
+    }
+
+    fn one_event_row() -> &'static str {
+        r#"{"data":[{"event_id":"e1","event_type":"llm_call","timestamp":"2026-01-01 00:00:00","properties":"{\"k\":1}"}]}"#
+    }
+
+    /// 答了 200 却没有 `data`：这不是「这段时间一条事件都没有」，是这份答案没读成。
+    /// 旧代码把它折成空表，读的人会以为那段时间什么都没发生。
+    #[tokio::test]
+    async fn a_query_answer_without_data_is_not_an_empty_event_table() {
+        let error = clickhouse(r#"{"meta":[]}"#)
+            .query_events(None, None, None, 10)
+            .await
+            .expect_err("没有 data 数组的 200 不是「没有事件」");
+        assert!(error.to_string().contains("no data array"), "{error}");
+    }
+
+    /// 反例：空数组是一份读到的答案，照常返回空表。
+    #[tokio::test]
+    async fn an_empty_data_array_is_still_no_events() {
+        let events = clickhouse(r#"{"data":[]}"#)
+            .query_events(None, None, None, 10)
+            .await
+            .expect("空数组是一份读到的答案");
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    /// 一行事件自带的那几格缺了：这一行没读成，不是一行「id 为空、时刻为此刻」的事件。
+    #[tokio::test]
+    async fn an_event_row_without_its_timestamp_is_not_placed_at_now() {
+        let body = r#"{"data":[{"event_id":"e1","event_type":"llm_call","properties":"{}"}]}"#;
+        let error = clickhouse(body)
+            .query_events(None, None, None, 10)
+            .await
+            .expect_err("没有时刻的行不是「此刻发生的事件」");
+        assert!(error.to_string().contains("timestamp"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_event_row_with_its_columns_is_read() {
+        let events = clickhouse(one_event_row())
+            .query_events(None, None, None, 10)
+            .await
+            .expect("每一格都在的行是一份读到的答案");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_id, "e1");
+        assert_eq!(events[0].event_type, "llm_call");
+        assert_eq!(events[0].properties.get("k"), Some(&serde_json::json!(1)));
+        assert_eq!(
+            events[0].timestamp.to_rfc3339(),
+            "2026-01-01T00:00:00+00:00"
+        );
+    }
+
+    /// 聚合回话同理：没有 `data` 不是「这段时间一次都没有」。
+    #[tokio::test]
+    async fn an_aggregate_answer_without_data_is_not_an_empty_timeline() {
+        let error = clickhouse(r#"{"meta":[]}"#)
+            .aggregate_count(
+                "llm_call",
+                DateTime::from_timestamp(0, 0).unwrap(),
+                DateTime::from_timestamp(60, 0).unwrap(),
+                Granularity::Hour,
+            )
+            .await
+            .expect_err("没有 data 数组的 200 不是「没有桶」");
+        assert!(error.to_string().contains("no data array"), "{error}");
+    }
+
+    /// 桶缺了 `cnt` 或时间：那不是一格「0 次」或「此刻」，是这一行没读成。
+    #[tokio::test]
+    async fn a_bucket_without_its_count_or_time_is_not_a_fabricated_point() {
+        let no_count = r#"{"data":[{"bucket_time":"2026-01-01 00:00:00"}]}"#;
+        let error = clickhouse(no_count)
+            .aggregate_count(
+                "llm_call",
+                DateTime::from_timestamp(0, 0).unwrap(),
+                DateTime::from_timestamp(60, 0).unwrap(),
+                Granularity::Hour,
+            )
+            .await
+            .expect_err("没有 cnt 的行不是 0 次");
+        assert!(error.to_string().contains("cnt"), "{error}");
+
+        let no_time = r#"{"data":[{"cnt":3}]}"#;
+        let error = clickhouse(no_time)
+            .aggregate_count(
+                "llm_call",
+                DateTime::from_timestamp(0, 0).unwrap(),
+                DateTime::from_timestamp(60, 0).unwrap(),
+                Granularity::Hour,
+            )
+            .await
+            .expect_err("没有时间的桶不许落到此刻");
+        assert!(error.to_string().contains("bucket_time"), "{error}");
+    }
+
+    /// 反例：两格都在的桶照常读出来。
+    #[tokio::test]
+    async fn a_bucket_with_its_count_and_time_is_read() {
+        let buckets = clickhouse(r#"{"data":[{"bucket_time":"2026-01-01 00:00:00","cnt":3}]}"#)
+            .aggregate_count(
+                "llm_call",
+                DateTime::from_timestamp(0, 0).unwrap(),
+                DateTime::from_timestamp(60, 0).unwrap(),
+                Granularity::Hour,
+            )
+            .await
+            .expect("两格都在的桶是一份读到的答案");
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].count, 3);
+        assert_eq!(
+            buckets[0].bucket_time.to_rfc3339(),
+            "2026-01-01T00:00:00+00:00"
         );
     }
 }
