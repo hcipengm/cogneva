@@ -4546,13 +4546,18 @@ fn extract_usage(json: &serde_json::Value) -> ReportedUsage {
                 // 的人，把 88% 的命中读成 1.1%，把「读回多少」读成「整个 prompt」。
                 // 减掉之后再记，两种口径就合成一句：`input` 是没被缓存服务的那部分，
                 // `input + cached` 是整个 prompt，命中率一律 `cached/(input+cached)`。
+                // `prompt_tokens` 含缓存命中，要减掉；`input_tokens` 本来就不含，
+                // 不减。两种写法在「没有 type 的尾帧」上都会出现，只认一种会让另一半
+                // 调用整条记成零。
                 usage
                     .and_then(|u| u.get("prompt_tokens"))
                     .and_then(as_u64)
-                    .map(|prompt| prompt.saturating_sub(cached.unwrap_or(0))),
+                    .map(|prompt| prompt.saturating_sub(cached.unwrap_or(0)))
+                    .or_else(|| usage.and_then(|u| u.get("input_tokens")).and_then(as_u64)),
                 usage
                     .and_then(|u| u.get("completion_tokens"))
-                    .and_then(as_u64),
+                    .and_then(as_u64)
+                    .or_else(|| usage.and_then(|u| u.get("output_tokens")).and_then(as_u64)),
                 cached,
                 None,
                 usage.and_then(reasoning_of),
