@@ -1,0 +1,75 @@
+//! 判停只有一条理由：**没有前进**。时钟不是理由。
+//!
+//! 「到点杀」的循环把「慢」当成「死」：一条编了很久的命令与一条卡死的命令在时钟眼里
+//! 同形，而它们要做的处置相反。这一条扫全树，要求：
+//!
+//! - 任何 `kill` 都发生在**销毁**的语境里（测试/沙箱清理、VM 销毁），不是判停；
+//! - 判停的唯一入口是 `declared_wall`（它读 beat 与静默窗口，且地板是两拍）。
+//!
+//! 白名单只有一份，写在下面；名单变长要被看见——加一处的理由必须说得出来。
+
+use std::path::{Path, PathBuf};
+
+fn rust_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// 允许出现 `kill` 的文件：它们杀的是**对象**，不是「这个进程是不是死了」。
+const DESTRUCTION_SITES: &[&str] = &[
+    "crates/cog-reflection/src/firecracker.rs", // 销毁 microVM
+];
+
+#[test]
+fn every_kill_is_a_destruction_and_none_of_them_judges_stalling() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("crates/cogneva is two levels under the workspace root")
+        .to_path_buf();
+
+    let mut offenders = Vec::new();
+    for file in rust_files(&root.join("crates")) {
+        let rel = file
+            .strip_prefix(&root)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .to_string();
+        // 测试文件里的 kill 是夹具，不是判停。
+        if rel.contains("/tests/") || rel.ends_with("_test.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        let production = match text.find("#[cfg(test)]") {
+            Some(at) => &text[..at],
+            None => &text[..],
+        };
+        if !production.contains(".kill()") {
+            continue;
+        }
+        if !DESTRUCTION_SITES.contains(&rel.as_str()) {
+            offenders.push(rel);
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "这些文件里有 `kill`，而它不在销毁语境里（判停只许走 declared_wall）：\n  {}",
+        offenders.join("\n  ")
+    );
+}
