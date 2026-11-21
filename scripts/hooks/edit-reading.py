@@ -188,7 +188,11 @@ def main(argv: list[str]) -> int:
             fake.append(f"{item.id}：`代码` 格不是 `test = 文件::函数` 的形状")
             continue
         path, name = parsed
-        if not in_diff(root, base, path):
+        # 开工之前就做完的那些条目：证据本来就不在这一批的 diff 里。它们要显式写
+        # `(preexisting)`，否则「借一个早就绿的测试冒充这一批」与「这一条早就做完了」
+        # 在判据下同形——前一版就分不开这两件事。
+        preexisting = "(preexisting)" in item.text
+        if not preexisting and not in_diff(root, base, path):
             fake.append(f"{item.id}：点名的 {path} 在这一批的 diff 里没有改动")
             continue
         if not defines_test(root, path, name):
