@@ -305,12 +305,21 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
         let skill_registry: Option<Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>> =
             ctx.consume::<tokio::sync::RwLock<cog_core::SkillRegistry>>();
 
+        // 三格快照的唯一一份：变更账那一趟写它（现网 revision 只有那边读得到），
+        // 变更账读面取它。同一个 `Arc` 两头接，两份快照会长成两个答案。
+        let change_cells_slot: Arc<tokio::sync::RwLock<Option<cog_core::ChangeCellsSnapshot>>> =
+            Arc::new(tokio::sync::RwLock::new(None));
+        // 同一个 `Arc` 也放开成服务：`start` 里那个循环不在 `init` 的作用域内，而
+        // 两份快照会长成两个答案。
+        ctx.publish(change_cells_slot.clone());
+
         // Build OrchestratorControlImpl with action_planner + skill_registry for auto-decomposition.
         let control_impl = Arc::new(
             crate::OrchestratorControlImpl::new(shared_orchestrator.clone())
                 .with_action_planner(planner.clone())
                 .with_skill_registry(skill_registry.clone())
-                .with_plan_store(state_backend.clone(), plan_workspace_id.clone()),
+                .with_plan_store(state_backend.clone(), plan_workspace_id.clone())
+                .with_change_cells(change_cells_slot.clone()),
         );
         let control: Arc<dyn cog_core::OrchestratorControl> = control_impl.clone();
         ctx.publish_service(control);
@@ -1011,6 +1020,8 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                     // 那几条。没有它时每拍临场挑一遍——挑哪些、挑几条都没有读数说得清。
                     // 可选，理由与其余协作者相同：没有事件流的部署没有可钉住的地方。
                     ctx.consume_service::<dyn cog_core::RoundEvents>(),
+                    // 三格快照的写端：接上之后变更账读面能回答「哪一行填了哪几格」。
+                    ctx.consume::<tokio::sync::RwLock<Option<cog_core::ChangeCellsSnapshot>>>(),
                 );
             }
             None => info!("change ledger loop not started: no ChangeLedgerStore published"),

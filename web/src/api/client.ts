@@ -2652,12 +2652,42 @@ export interface ChangeLedgerRow {
   /** 这一条落在哪一面；`none` 表示没有文档点名或点名不一致。 */
   block: string;
   /**
+   * 三格：代码 / 上线 / 验证，各填了没有。
+   *
+   * 不出现（`undefined`）是「这一页算不出三格」——平台读不到现网 revision。
+   * 那要印「量不到」，不能印成三格全空：全空读作「全都没做」，是另一个结论。
+   */
+  cells?: ChangeCells;
+  /** 这一条自己花掉的 token，按它的全部交接代际求和。
+  /**
    * 这一条自己花掉的 token，按它的全部交接代际求和。
    *
    * `null` 是「这一页量不了」，原因在响应上的 `cost_unreadable`；`0` 是量到的
    * 结论（这条没人接手过）。两者不能互相顶替。
    */
   cost: number | null;
+}
+
+/** 一件变更的三格。填了不等于好，只说明这一步有证据。 */
+export interface ChangeCells {
+  /** 树里有实现（交付过一次，或判据在树上为真）。 */
+  code: boolean;
+  /** 跑着的那一版里有它，而且那一次量就是在那一版上做的。 */
+  live: boolean;
+  /** 判据对着真东西量过，而且为真。 */
+  verified: boolean;
+}
+
+/** 一份三格快照按格数出来的行数。 */
+export interface ChangeCellsCensus {
+  rows: number;
+  code: number;
+  live: number;
+  verified: number;
+  /** 三格齐：终态。 */
+  terminal: number;
+  /** 代码填了、验证空着——读作做完了、实际没人核过。 */
+  unverified: number;
 }
 
 /**
@@ -2727,6 +2757,10 @@ export interface ChangesPage {
   /** 每次成本列读不到的原因；`null` 表示这一页每一行都有实测成本。 */
   cost_unreadable: string | null;
   outstanding_total: number;
+  /** 现网是哪一版（或为什么读不出来）。三格里的「上线」靠它算。 */
+  live_revision?: { Known?: string; Unmeasurable?: string };
+  /** 三格按格数出来的行数；不出现表示这一页没有可用快照。 */
+  cells_census?: ChangeCellsCensus;
   outstanding: ChangeLedgerRow[];
 }
 

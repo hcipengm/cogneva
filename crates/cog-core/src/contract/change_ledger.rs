@@ -733,6 +733,55 @@ impl ChangeLedgerRow {
     }
 }
 
+/// 一次「三格」快照：哪一刻、现网是哪一版、每一行填了哪几格。
+///
+/// 它是一份**读数**，不是一张表：由读得到现网 revision 的那一侧（编排层的
+/// `live_revision_pass`）周期性地算出来，读的那一侧只取最新的一份。存进账本会让
+/// 三格从「由事实算出来」变成「由谁写进去」，那正是这三格要防的。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeCellsSnapshot {
+    /// 这一份是哪一刻算的。
+    pub taken_at: DateTime<Utc>,
+    /// 算的时候，现网是哪一版（或为什么读不出来）。
+    pub live: LiveRevision,
+    /// 账本里每一行的三格。键是 [`ChangeIdentity::as_key`]。
+    pub cells: std::collections::BTreeMap<String, ChangeCells>,
+}
+
+impl ChangeCellsSnapshot {
+    /// 这一份里「代码填了、验证空着」的那几行——红的那一形状。
+    pub fn unverified(&self) -> impl Iterator<Item = (&String, &ChangeCells)> {
+        self.cells.iter().filter(|(_, cells)| cells.unverified())
+    }
+
+    /// 三格齐的行数、与各格填了的行数。**行数**而不是比例：比例在总量变化时
+    /// 会自己变好看，而行数不会。
+    pub fn census(&self) -> ChangeCellsCensus {
+        let mut census = ChangeCellsCensus::default();
+        for cells in self.cells.values() {
+            census.rows += 1;
+            census.code += u64::from(cells.code);
+            census.live += u64::from(cells.live);
+            census.verified += u64::from(cells.verified);
+            census.terminal += u64::from(cells.is_terminal());
+            census.unverified += u64::from(cells.unverified());
+        }
+        census
+    }
+}
+
+/// 一份快照按格数出来的行数。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeCellsCensus {
+    pub rows: u64,
+    pub code: u64,
+    pub live: u64,
+    pub verified: u64,
+    pub terminal: u64,
+    /// 代码填了、验证空着：读作做完了、实际没人核过。
+    pub unverified: u64,
+}
+
 /// 一件变更的三格：每一格「填了没有」。
 ///
 /// 填了不等于好——它只说这一步有证据。判「终态」与「红了」的是

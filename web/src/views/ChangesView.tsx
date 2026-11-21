@@ -6,6 +6,7 @@ import {
   getEvolutionMetrics,
   getGovernanceChanges,
   type ChangeFunnelDay,
+  type ChangeCells,
   type ChangeLedgerRow,
   type ChangeTimelineEvent,
 } from '@/api/client';
@@ -17,6 +18,53 @@ import { money } from '@/topology/format';
 import { Note } from '@/ui/Note';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Status, Table, ViewFrame } from '@/ui/primitives';
 import { Strip } from '@/ui/plots';
+
+
+/**
+ * 一条变更的三格：代码 / 上线 / 验证。
+ *
+ * 三格回答三个不同的问题，「已落」只回答了其中一个却常被读成三个答案。空格不
+ * 等于没进展——它是「这一步还没有证据」，这一句话比一个状态词长，但它是对的。
+ * 代码填了、验证空着的那一行是红的：它读作做完了，实际没人核过。
+ */
+function Cells({ cells }: { cells: ChangeCells | undefined }) {
+  if (!cells) {
+    // 平台这一页算不出三格（读不到现网 revision）：说出来，不印三个空格——
+    // 三个空格读作「全都没做」，那是另一个结论。
+    return <Note className="text-[11px] text-[var(--muted)]" text="这一页量不到三格">量不到</Note>;
+  }
+  const pieces: { label: string; filled: boolean; tone: 'plain' | 'warn' | 'good' }[] = [
+    { label: '码', filled: cells.code, tone: 'plain' },
+    { label: '线', filled: cells.live, tone: 'plain' },
+    {
+      label: '验',
+      filled: cells.verified,
+      tone: cells.code && !cells.verified ? 'warn' : 'plain',
+    },
+  ];
+  return (
+    <span
+      className="mono flex gap-1 text-[11px]"
+      title="代码 / 上线 / 验证：树里有实现、跑着的那一版有它、判据对着真东西量过"
+    >
+      {pieces.map((piece) => (
+        <span
+          key={piece.label}
+          className={
+            piece.filled
+              ? 'text-[var(--paper-dim)]'
+              : piece.tone === 'warn'
+                ? 'text-[var(--warn)]'
+                : 'text-[var(--muted)]'
+          }
+        >
+          {piece.filled ? piece.label : '□'}
+        </span>
+      ))}
+      {cells.code && !cells.verified && <span className="text-[var(--warn)]">!</span>}
+    </span>
+  );
+}
 
 /**
  * 一条变更的来路：它入账之后走过哪些状态，每一步由哪一次判读、因为什么。
@@ -393,6 +441,19 @@ export function ChangesView() {
           ))}
         </div>
       )}
+      {page?.cells_census && (
+        <div className="flex flex-wrap border-b border-[var(--line)] py-2">
+          <Reading label="代码填了" value={page.cells_census.code} tone="plain" />
+          <Reading label="上线填了" value={page.cells_census.live} tone="plain" />
+          <Reading label="验证填了" value={page.cells_census.verified} tone="plain" />
+          <Reading label="三格齐（终态）" value={page.cells_census.terminal} tone="plain" />
+          <Reading
+            label="落地却没量过"
+            value={page.cells_census.unverified}
+            tone={page.cells_census.unverified > 0 ? 'warn' : 'plain'}
+          />
+        </div>
+      )}
       <section className="border-b border-[var(--line)]">
         <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">台账欠账</h2>
         {ledger.error ? (
@@ -415,6 +476,7 @@ export function ChangesView() {
                 </Note>
               ) },
               { key: 'state', title: '状态', width: '120px', render: (r) => <Status value={r.state} /> },
+              { key: 'cells', title: '三格', width: '80px', render: (r) => <Cells cells={r.cells} /> },
               { key: 'title', title: '是什么', render: (r) => (
                 <span className="text-[12px]">{r.title ?? r.assertion ?? '—'}</span>
               ) },

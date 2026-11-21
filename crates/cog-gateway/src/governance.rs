@@ -286,6 +286,12 @@ pub struct ChangesResponse {
     /// below it. `outstanding.len()` is a page length and answering this
     /// question with it would make the backlog look as small as the page.
     pub outstanding_total: u64,
+    /// 现网是哪一版（或为什么读不出来）。三格里的「上线」靠它算。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_revision: Option<cog_core::LiveRevision>,
+    /// 三格按格数出来的行数；`None` 表示这一页没有可用快照。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cells_census: Option<cog_core::ChangeCellsCensus>,
     /// The rows the ledger hands out next, most urgent band first.
     pub outstanding: Vec<ChangeLedgerRowView>,
 }
@@ -353,6 +359,12 @@ pub struct ChangeLedgerRowView {
     /// The face this change is filed under, or `none` when the documents that
     /// ask for it name none or name different ones.
     pub block: String,
+    /// 三格：代码 / 上线 / 验证，各填了没有。
+    ///
+    /// `None` 表示这一页算不出三格（平台读不到现网 revision）：那要让读的人看到
+    /// 「量不到」，不是看到三格全空——后者读作「全都没做」，是另一个结论。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cells: Option<cog_core::ChangeCells>,
     /// What this one change cost, over every handover its identity fixes.
     ///
     /// `None` when the column could not be measured for this page at all; the
@@ -367,7 +379,12 @@ pub struct ChangeLedgerRowView {
 /// Split from the handler so the mapping has a reader that needs no database:
 /// which facts a row view keeps is about the row, not about whether the store
 /// answered.
-fn change_row_view(row: cog_core::ChangeLedgerRow, cost: Option<u64>) -> ChangeLedgerRowView {
+fn change_row_view(
+    row: cog_core::ChangeLedgerRow,
+    cost: Option<u64>,
+    live: Option<&cog_core::LiveRevision>,
+) -> ChangeLedgerRowView {
+    let cells = live.map(|live| row.cells(live));
     let priority = row.priority().as_str().to_string();
     let block = row.block().as_str().to_string();
     let holds_the_line = row.holds_the_line();
@@ -392,6 +409,7 @@ fn change_row_view(row: cog_core::ChangeLedgerRow, cost: Option<u64>) -> ChangeL
         unsettled_reason: row.unsettled_reason,
         priority,
         block,
+        cells,
         cost,
     }
 }
@@ -493,6 +511,13 @@ pub async fn changes_handler(
             (None, Some(reason))
         }
     };
+    // 三格是读数：由读得到现网 revision 的那一侧算出来，这里只取最新的一份。
+    // 取不到就给 `None`，页面因此印「量不到」。
+    let cells_snapshot = state.orchestrator.change_cells();
+    let live_revision = cells_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.live.clone());
+    let cells_census = cells_snapshot.as_ref().map(|snapshot| snapshot.census());
     let outstanding = rows
         .into_iter()
         .map(|row| {
@@ -502,7 +527,7 @@ pub async fn changes_handler(
                     .copied()
                     .unwrap_or(0)
             });
-            change_row_view(row, cost)
+            change_row_view(row, cost, live_revision.as_ref())
         })
         .collect();
 
@@ -515,6 +540,8 @@ pub async fn changes_handler(
         pending_retirements,
         cost_unreadable,
         outstanding_total,
+        live_revision,
+        cells_census,
         outstanding,
     }))
 }
@@ -1032,7 +1059,7 @@ mod tests {
     /// 都丢在台账行里。看见这两格才知道该去修树还是该去修判据。
     #[test]
     fn a_row_that_was_delivered_and_is_still_owed_says_so() {
-        let view = change_row_view(ledger_row(), None);
+        let view = change_row_view(ledger_row(), None, None);
         assert_eq!(view.delivered_rev.as_deref(), Some("def456"));
         assert!(view.holds_the_line);
         assert_eq!(
@@ -1045,13 +1072,35 @@ mod tests {
         assert_eq!(view.measured_rev.as_deref(), Some("abc123"));
     }
 
+    /// 三格随行一起交出去：读面看不到「上线」那一格时，`landed` 会被读成「线上有」。
+    #[test]
+    fn the_row_view_carries_the_three_cells_when_a_live_revision_is_known() {
+        let live = cog_core::LiveRevision::Known("abc123".into());
+        let view = change_row_view(ledger_row(), None, Some(&live));
+        let cells = view.cells.expect("三格随行交出去");
+        assert!(cells.code, "已落的那一行，代码格应当是填的");
+        assert!(cells.live, "量就是在现网那一版上做的：上线格应当填");
+        assert!(!cells.verified, "这一行还没被量过：验证格空着");
+        assert!(cells.unverified(), "代码填了、验证空着：这是红的那个形状");
+
+        // 现网 revision 读不出来时，这一格不能填——「不知道」被读成「有」是最贵的错。
+        let gap =
+            cog_core::LiveRevision::Unmeasurable(cog_core::LiveRevisionGap::ClusterUnreadable);
+        let view = change_row_view(ledger_row(), None, Some(&gap));
+        assert!(!view.cells.expect("仍然交出三格").live);
+
+        // 没有快照：不交三格，页面印「量不到」而不是一份全空的。
+        let view = change_row_view(ledger_row(), None, None);
+        assert!(view.cells.is_none());
+    }
+
     /// 没有交付过的那一行，`holds_the_line` 必须是假的：扣着线的行会按 P0 领序并挡住
     /// 同一 rev 上的其它行，多判一条就会把主线停在一笔从没送上去的变更后面。
     #[test]
     fn a_row_nothing_delivered_does_not_hold_the_line() {
         let mut row = ledger_row();
         row.delivered_rev = None;
-        let view = change_row_view(row, None);
+        let view = change_row_view(row, None, None);
         assert_eq!(view.delivered_rev, None);
         assert!(!view.holds_the_line);
     }

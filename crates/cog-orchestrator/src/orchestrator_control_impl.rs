@@ -19,6 +19,9 @@ pub struct OrchestratorControlImpl {
     /// 而不是一个空集合冒充「都没排期」。
     state_backend: Option<Arc<dyn cog_core::StateBackend>>,
     workspace_id: String,
+    /// 最近一次算出来的三格快照。由变更账的 `live_revision_pass` 每次覆盖写，
+    /// 读面只取最新这一份——三格是读数，不是账本里的一列。
+    change_cells: Option<Arc<tokio::sync::RwLock<Option<cog_core::ChangeCellsSnapshot>>>>,
 }
 
 impl OrchestratorControlImpl {
@@ -29,7 +32,18 @@ impl OrchestratorControlImpl {
             skill_registry: None,
             state_backend: None,
             workspace_id: "default".into(),
+            change_cells: None,
         }
+    }
+
+    /// 接上三格快照的唯一一份。谁产、谁读都拿同一个 `Arc`：两份快照会长成
+    /// 两个答案，而它们本来就该是同一件事。
+    pub fn with_change_cells(
+        mut self,
+        cells: Arc<tokio::sync::RwLock<Option<cog_core::ChangeCellsSnapshot>>>,
+    ) -> Self {
+        self.change_cells = Some(cells);
+        self
     }
 
     pub fn with_plan_store(
@@ -117,6 +131,13 @@ impl OrchestratorControl for OrchestratorControlImpl {
     /// unmeasurable rather than as zero.
     fn change_dispatch_ids(&self, identity: &cog_core::ChangeIdentity) -> Option<Vec<String>> {
         Some(crate::change_ledger::dispatch_task_ids(identity))
+    }
+
+    fn change_cells(&self) -> Option<cog_core::ChangeCellsSnapshot> {
+        // 没有接上快照（或一次都还没算过）就是 `None`：读面因此印「量不到」，
+        // 而不是印一份所有格都空着的快照——后者读作「全都没做」。
+        let slot = self.change_cells.as_ref()?;
+        slot.try_read().ok().and_then(|guard| guard.clone())
     }
 
     async fn get_ready_tasks(&self) -> Vec<Task> {

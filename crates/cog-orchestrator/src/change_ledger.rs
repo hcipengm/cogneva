@@ -2743,6 +2743,10 @@ pub fn spawn_change_ledger_loop(
     // 定批的写入器：这一轮的批次钉进事件流，下一拍按它下发。可选，与其余协作者同一
     // 个道理——没有事件流的部署没有可钉住的东西，而「没报出来」在启动那一行里说得清。
     rounds: Option<Arc<dyn RoundEvents>>,
+    // 三格快照的那一格：这一趟读得到现网 revision，而那条读数只有这里有。接上之后
+    // 变更账读面就有一份「哪一行填了哪几格」的最新读数；不接就是 `None`，读面印
+    // 「量不到」，而不是一份全空的快照。
+    cells: Option<Arc<tokio::sync::RwLock<Option<cog_core::ChangeCellsSnapshot>>>>,
 ) {
     info!(
         interval_secs = CHANGE_LEDGER_PASS_INTERVAL.as_secs(),
@@ -2815,6 +2819,7 @@ pub fn spawn_change_ledger_loop(
             let events = events.clone();
             let alert_source = alert_source.clone();
             let rounds = rounds.clone();
+            let cells = cells.clone();
             async move {
                 // The role is renewed on the lease contract's own cadence rather
                 // than once per pass: a pass can be long, and a term that ran out
@@ -3057,8 +3062,14 @@ pub fn spawn_change_ledger_loop(
                     // below carries no ordering: what it reads is the landed
                     // set, and the hand-over reads the pending one.
                     if let Some(ref live) = live_revision {
-                        let reading =
-                            live_revision_pass(&*store, &tree, &**live, &mut out_of_effect).await;
+                        let reading = live_revision_pass_with_cells(
+                            &*store,
+                            &tree,
+                            &**live,
+                            &mut out_of_effect,
+                            cells.clone().as_ref(),
+                        )
+                        .await;
                         publish_in_effect_reading(metrics.as_ref(), reading).await;
                     }
                     // Handing over comes last, and that order is the point: the
@@ -5077,6 +5088,21 @@ async fn live_revision_pass(
     source: &dyn LiveRevisionSource,
     out_of_effect: &mut HashMap<ChangeIdentity, String>,
 ) -> InEffectReading {
+    live_revision_pass_with_cells(store, tree, source, out_of_effect, None).await
+}
+
+/// 同一条读数，顺手把「三格」快照写给读面。
+///
+/// 三格里的 `live` 只有这一趟读得到（现网 revision 在 `source` 里）；`code` 与
+/// `verified` 是这一趟读到的那些行自己的事实。写出去的是**一份读数**：谁再算一遍
+/// 都会得到同一份，而它不会被任何写者改。
+async fn live_revision_pass_with_cells(
+    store: &dyn ChangeLedgerStore,
+    tree: &CheckTree,
+    source: &dyn LiveRevisionSource,
+    out_of_effect: &mut HashMap<ChangeIdentity, String>,
+    cells_out: Option<&std::sync::Arc<tokio::sync::RwLock<Option<cog_core::ChangeCellsSnapshot>>>>,
+) -> InEffectReading {
     let live = match source.live_revision().await {
         LiveRevision::Known(rev) => rev,
         LiveRevision::Unmeasurable(gap) => {
@@ -5149,6 +5175,10 @@ async fn live_revision_pass(
     let mut entered = 0usize;
     let mut recovered = 0usize;
     let mut no_revision = 0usize;
+    // 三格的账：这一趟读到的每一行填了哪几格。`code` 与 `verified` 都为真——
+    // 这一趟读的就是「已落」的那些行，而 `landed` 这个状态本来就是一次量判出来的。
+    let mut cells_by_row: std::collections::BTreeMap<String, cog_core::ChangeCells> =
+        std::collections::BTreeMap::new();
     for (identity, landed_rev) in rows {
         // The revision compared is the one the row *landed* at, not the one a
         // re-check last asked at. A landed row is re-checked on a timer, and
@@ -5172,6 +5202,14 @@ async fn live_revision_pass(
         // one question: two spellings of "is this on the line" is how a count
         // and the names it publishes come to disagree.
         let side = landed_side(&reach, landed_rev);
+        cells_by_row.insert(
+            identity.as_key(),
+            cog_core::ChangeCells {
+                code: true,
+                live: side == LandedSide::InLine,
+                verified: true,
+            },
+        );
         if side == LandedSide::InLine {
             in_effect += 1;
             if out_of_effect.remove(&identity).is_some() {
@@ -5253,6 +5291,16 @@ async fn live_revision_pass(
         "change ledger: checked the account's landed rows against the revision the workloads are \
          running"
     );
+    if let Some(slot) = cells_out {
+        let snapshot = cog_core::ChangeCellsSnapshot {
+            taken_at: chrono::Utc::now(),
+            live: LiveRevision::Known(reach.head().to_string()),
+            cells: cells_by_row,
+        };
+        if let Ok(mut guard) = slot.try_write() {
+            *guard = Some(snapshot);
+        }
+    }
     match oldest_seconds {
         Some(seconds) => InEffectReading::Waiting(seconds),
         None => InEffectReading::Shipped,
@@ -14088,6 +14136,8 @@ mod tests {
             None,
             Some(events),
             None,
+            None,
+            // 三格快照：这条路径的用例不读它。
             None,
         );
 

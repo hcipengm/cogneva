@@ -40,7 +40,7 @@ use async_trait::async_trait;
 /// A closed set, because these are read as counts and two rows a reader has to
 /// act on differently must not collapse into one number. Each one names a
 /// different thing to go and look at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum LiveRevisionGap {
     /// The workloads do not all carry the same main revision: a rollout is
     /// between them, or one is still on a floating tag. There is a revision
@@ -72,7 +72,7 @@ impl LiveRevisionGap {
 ///
 /// The revision is the project's own, not a version string: it is the same
 /// identity a measurement carries, so the two compare directly.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LiveRevision {
     /// Every workload is on one and the same main revision.
     Known(String),

@@ -287,6 +287,17 @@ pub trait OrchestratorControl: Send + Sync {
     fn change_dispatch_ids(&self, _identity: &crate::ChangeIdentity) -> Option<Vec<String>> {
         None
     }
+
+    /// 最近一次算出来的「三格」快照（代码 / 上线 / 验证）。
+    ///
+    /// 三格要靠现网 revision 才填得出中间那一格，而读得到现网的是编排层；读它的
+    /// 那一侧（变更账页面）只需要最新的一份。所以这里给的是**一份读数**，不是查询。
+    ///
+    /// 默认 `None`：没有这一份的实现，三格就答不出来——那要让读的人看到「量不到」，
+    /// 而不是看到一份所有格都空着的快照（那读作「全都没做」，是另一个结论）。
+    fn change_cells(&self) -> Option<crate::ChangeCellsSnapshot> {
+        None
+    }
 }
 
 /// Core DAG execution engine interface.
