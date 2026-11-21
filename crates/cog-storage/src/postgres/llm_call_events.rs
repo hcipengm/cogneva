@@ -82,8 +82,10 @@ impl LlmCallEvents for LlmCallEventStore {
             .bind(&self.writer)
             .bind(&call.model)
             .bind(call.attributes().to_string())
-            .bind(call.batch_id.clone())
             .bind(call.at)
+            // 第 9 个参数：sqlx 按**绑定顺序**编号（不是按语句里的 `$n`），所以批号
+            // 必须排在 `at` 之后才能对上 `$9`。
+            .bind(call.batch_id.clone())
             .execute(&self.pool)
             .await
             .map_err(|e| SFError::Database(format!("append llm_call event: {e}")))?;
