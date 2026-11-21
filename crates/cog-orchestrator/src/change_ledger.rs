@@ -504,7 +504,7 @@ fn dispatch_project_root_prefix() -> String {
 /// to choose -- so the reader that closes this task is the same account that
 /// filed it, and the two cannot drift into different opinions of "done".
 const DISPATCH_ACCEPTANCE: &str =
-    "这条变更在变更账上不再是 outstanding：同一身份的账行落到 landed，判据取账上那一行的状态";
+    "这条变更在变更账上不再是 outstanding：同一身份的账行落到 landed 或 retired，判据取账上那一行的状态";
 
 /// The name a pass writes into `sources_unread` when the principle ledger could
 /// not be read.
