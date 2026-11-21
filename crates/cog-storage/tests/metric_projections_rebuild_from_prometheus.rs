@@ -109,7 +109,9 @@ async fn the_three_metric_projections_rebuild_from_the_source() {
         "INSERT INTO cog_metric_counter_totals (name, labels, upstream, as_of, value) \
          VALUES ($1, '{}', NULL, NOW(), 7)",
     )
-    .bind(format!("{COUNTER}_stale"))
+    // 这个名字**不能**包含 `COUNTER`：假的真源按子串回答，含它的名字也会被答成
+    // 42，于是重建把它当成真源里有的一行重新写回去——那测的就不是「整表重写」了。
+    .bind("probe_stale_counter_total")
     .execute(&pool)
     .await
     .expect("the stale row is written");
@@ -151,7 +153,7 @@ async fn the_three_metric_projections_rebuild_from_the_source() {
     assert!(report.as_of.is_some(), "重建之后水位写上了：{:?}", report);
 
     let stale: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM cog_metric_counter_totals WHERE name LIKE '%_stale'",
+        "SELECT count(*) FROM cog_metric_counter_totals WHERE name = 'probe_stale_counter_total'",
     )
     .fetch_one(&pool)
     .await
