@@ -112,8 +112,10 @@ async fn the_stream_reader_and_the_row_reader_agree_row_by_row() {
             .record(&usage_row(actor, input, output, &marker))
             .await
             .expect("the row");
+        // 事件 id 取调用身份的前 26 个字母数字：三笔的调用身份要在**前 26 个字符里**
+        // 就分得开，否则它们在主键上撞成同一条事件（第一笔赢，后两笔报重复键）。
         events
-            .append(&call(&format!("{marker}-{n}"), actor, input, output))
+            .append(&call(&format!("c{n}{marker}"), actor, input, output))
             .await
             .expect("the event");
     }
