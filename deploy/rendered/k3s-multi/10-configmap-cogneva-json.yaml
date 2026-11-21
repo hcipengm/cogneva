@@ -3960,7 +3960,10 @@ data:
         "_comment_local_repair_max_value": "两条是默认值：Evaluator 判失败后先在原 Plan 上回传 feedback 让 Generator 重生成，两次都不过才重跑 Planner。改它要与代码里的 DEFAULT_LOCAL_REPAIR_MAX 一起改，否则部署里设的数与代码缺省不同源。"
       },
       "ralph": {
-        "_comment": "Ralph Loop 的预算与停滞窗口。这两条界决定一条不收敛的链在什么位置停下：max_iterations 是单次执行的迭代硬上限，stagnation_window 是最近多少轮没有进展即终止。两条都按次计、不跨执行累计。"
+        "_comment": "Ralph Loop 的预算与停滞窗口。这两条界决定一条不收敛的链在什么位置停下：max_iterations 是单次执行的迭代硬上限，stagnation_window 是最近多少轮没有进展即终止。两条都按次计、不跨执行累计。",
+        "max_iterations": 50,
+        "stagnation_window": 5,
+        "_comment_values": "两个默认值：与代码里 RalphSettings::default 一致（50 / 5）。部署里可以调小，但调大的那一侧没有人盯着流——不改代码缺省就别往大改。"
       },
       "agent": {
         "_comment": "Agent 注册与心跳。registration_ttl_secs 是注册表里一条 agent 记录的存活秒数（cog-storage 写注册时取它），heartbeat_interval_secs 是 worker 向注册表续约的间隔（cog-agent 建 worker 时取它）。两处都在进程启动时读，改一个值要重启工作负载才生效。",
