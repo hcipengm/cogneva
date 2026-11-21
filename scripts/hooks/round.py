@@ -132,7 +132,7 @@ def ledger_at(rev: str, spec: str) -> pathlib.Path:
     return tmp
 
 
-def open_round(spec: str | None, allow_open: bool = False) -> int:
+def open_round(spec: str | None, allow_open: bool = False, code_rev_override: str | None = None) -> int:
     if current_round() and not allow_open:
         print("round: 已经有一轮开着。先 `round.py close`。")
         return 1
@@ -166,7 +166,15 @@ def open_round(spec: str | None, allow_open: bool = False) -> int:
     # 重钉继承「第一次开工」那一格：重钉要的是按新台账重算批次清单，不是把
     # 「自开工以来改了什么」这条量程清零。
     _existing = current_round()
+    # **重钉不改量程，两个坐标都不改**：批次清单按新台账重算（这是重钉的用途），
+    # 而「自开工以来改了什么」的基准必须留在第一次开工那一刻。2026-11-21 实测：
+    # 只护住 first_rev（台账仓那一侧）而让 code_rev 跟着重钉走，结果 33 条里
+    # 只有 1 条读作「动过」——重钉一次，做过的活全部变回没做。
     first_rev = _existing[4] if _existing else rev
+    if _existing and _existing[2]:
+        code_rev = _existing[2]
+    if code_rev_override:
+        code_rev = code_rev_override
     attrs_sql = (
         f"jsonb_build_object('ledger_rev', '{rev}', 'ledger_path', '{source[3:]}', "
         f"'code_rev', '{code_rev}', 'batch', '{ids}', 'first_rev', '{first_rev}')::text"
@@ -336,6 +344,8 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument("--source", default=None)
     parser.add_argument("--file", default=None)
+    # 只给「校正被写坏的基准」用：重钉本身不改量程，所以正常不该给这个参数。
+    parser.add_argument("--code-rev", default=None)
     args = parser.parse_args(argv[1:])
     try:
         if args.action == "open":
@@ -343,7 +353,7 @@ def main(argv: list[str]) -> int:
         if args.action == "rebound":
             # 这一轮没变，变的是它钉的那一版台账（例如台账随后才提交）。重钉是一次
             # **计划修订**：追加一条新的 round_opened，读取方取最新的一条。
-            return open_round(args.source, allow_open=True)
+            return open_round(args.source, allow_open=True, code_rev_override=args.code_rev)
         if args.action == "plan":
             if not args.file:
                 print("round: plan 要一个 --file <plan.json>", file=sys.stderr)
