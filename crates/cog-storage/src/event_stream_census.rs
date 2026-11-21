@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 
 use cog_core::KINDS;
 use cog_core::{metric_names, MetricsBackend, SFResult, ShutdownSignal};
@@ -108,7 +108,7 @@ pub fn spawn(
                         tracing::warn!(error = %e, "event stream census: the window could not be read")
                     }
                 }
-                beat.tick();
+                beat.beat();
                 shutdown.wait().await;
             }
         },

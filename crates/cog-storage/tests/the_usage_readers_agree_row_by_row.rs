@@ -92,9 +92,9 @@ async fn the_stream_reader_and_the_row_reader_agree_row_by_row() {
     let pool = schema_pool(&url, &schema).await;
 
     apply_event_stream_migration(&pool).await;
-    let usage = LlmUsageStore::connect(&url)
-        .await
-        .expect("connect the rows");
+    // 借这一只已经带着 search_path 的池：另开一只池会连到 public，于是写进去的行
+    // 与读它们的那几格不在同一个 schema 上——两边都「成功」，比的是两份不同的库。
+    let usage = LlmUsageStore::from_pool(pool.clone());
     usage
         .init_schema(&cog_test_support::SchemaTextRunner::new(pool.clone()))
         .await
