@@ -9,7 +9,7 @@ import {
 } from '@/api/client';
 import { useResource, type Resource } from '@/hooks/useResource';
 import { BreathingTopology } from '@/topology/BreathingTopology';
-import { clusterName, formatBytes, formatCpu } from '@/topology/format';
+import { clusterName, formatBytes, formatCpu, formatUsedBytes } from '@/topology/format';
 import { ContainerRow, Dot, EventRow, VolumeRow } from '@/topology/rows';
 import { Empty, Loading, ReadError } from '@/ui/primitives';
 
@@ -449,7 +449,7 @@ function PodRow({ pod }: { pod: TopologyPod }) {
           {pod.cpu_used_millicores != null && (
             <span style={{ color: 'var(--paper-dim)' }}>
               {' '}
-              （实 {formatCpu(pod.cpu_used_millicores)} · {formatBytes(pod.memory_used_bytes ?? 0)}）
+              （实 {formatCpu(pod.cpu_used_millicores)} · {formatUsedBytes(pod.memory_used_bytes)}）
             </span>
           )}
         </span>

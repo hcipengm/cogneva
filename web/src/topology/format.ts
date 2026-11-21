@@ -27,6 +27,17 @@ export function formatBytes(bytes: number): string {
 }
 
 /**
+ * 一格用量读数：量到了写数，没量到写「无读数」。
+ *
+ * 服务端没有样本时发的是 `null`，不是 0——kubelet 的 summary 里没有这个容器，
+ * 与「这个容器一格内存都没吃」是两件事：前者要去查采集器，后者是正常。折成 0
+ * 的写法（`formatBytes(bytes ?? 0)`）让屏上这两件事长得一模一样，而该做的动作相反。
+ */
+export function formatUsedBytes(bytes: number | null | undefined): string {
+  return bytes == null ? '无读数' : formatBytes(bytes);
+}
+
+/**
  * 一个集群叫它什么。
  *
  * 只有一个时叫「本集群」——写「集群 1」会让读者以为还有第二个。多于一个时按位置
