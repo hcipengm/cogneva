@@ -1145,6 +1145,26 @@ impl LlmUsageStore {
         Ok((total, by_actor))
     }
 
+    /// 一次批量调用花掉的 token：按 `batch_id` 把同批的调用事实加起来。
+    ///
+    /// 「这 N 条一起打包花的钱」只有流答得出来：行上没有批号，而批号正是写入口在
+    /// 同一次打包里盖的那一戳。读不到批号（这一批没落流）就是 `None`——0 会说
+    /// 「这一批没花钱」，而它可能是「这一批没记录」。
+    pub async fn tokens_by_batch(&self, batch_id: &str) -> anyhow::Result<Option<u64>> {
+        let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT attributes::jsonb->>'batch_id' AS batch, \
+                    SUM(COALESCE((attributes::jsonb->>'input_tokens')::BIGINT, 0) \
+                      + COALESCE((attributes::jsonb->>'output_tokens')::BIGINT, 0))::BIGINT AS tokens \
+               FROM cogneva_event \
+              WHERE kind = 'llm_call' AND attributes::jsonb->>'batch_id' = $1 \
+              GROUP BY 1",
+        )
+        .bind(batch_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.first().and_then(|(_, tokens)| tokens.map(|t| t.max(0) as u64)))
+    }
+
     /// 同一个读数，**从事件流算**：读切换的第一条，按 kind 扫 `cogneva_event`。
     ///
     /// 与 `spend_by_actor_since` 并排存在一个切换周期：两个数在同一段时间上必须逐行
