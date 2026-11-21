@@ -41,6 +41,7 @@ async-nats = { version = "0.35", optional = true }
 
 [dev-dependencies]
 cog-test-support = { path = "../cog-test-support" }
+cog-observability = { path = "../cog-observability" }
 tempfile = "3"
 
 [features]

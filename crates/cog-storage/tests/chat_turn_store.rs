@@ -176,11 +176,12 @@ async fn a_session_that_was_never_recorded_reads_empty_and_a_limit_of_zero_asks_
     cleanup(&probe).await;
 }
 
-/// The bound is per session, and the transcript of another conversation is not
-/// what pays for it.
+/// The read window is per session, and the transcript of another conversation is
+/// not what pays for it. Rows outside the window are **kept and counted** -- the
+/// count is what says an archive is owed.
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
-async fn the_bound_trims_one_session_and_leaves_another_alone() {
+async fn the_window_is_per_session_and_the_overflow_is_counted_not_dropped() {
     let probe = probe().await;
     let busy = format!("{}-busy", probe.session);
     let quiet = format!("{}-quiet", probe.session);
@@ -225,9 +226,27 @@ async fn the_bound_trims_one_session_and_leaves_another_alone() {
         .expect("read the busy transcript");
     assert!(
         kept.len() <= ROWS_KEPT_PER_SESSION as usize,
-        "上界没生效：留着 {} 行，界是 {ROWS_KEPT_PER_SESSION}",
+        "读窗口没生效：留着 {} 行，界是 {ROWS_KEPT_PER_SESSION}",
         kept.len()
     );
+    // 窗口之外的行还在库里：删掉它们就是删掉「说过什么」的唯一一份。数出来的是
+    // 「该搬多少」，不是「删掉了多少」。
+    let overflow = probe
+        .store
+        .overflow_beyond_window(&busy, ROWS_KEPT_PER_SESSION)
+        .await
+        .expect("count the busy session's overflow");
+    assert!(
+        overflow > 0,
+        "越界的行被删掉了：计数为 0，而这一段对话写了 {} 行",
+        over * 2
+    );
+    let quiet_overflow = probe
+        .store
+        .overflow_beyond_window(&quiet, ROWS_KEPT_PER_SESSION)
+        .await
+        .expect("count the quiet session's overflow");
+    assert_eq!(quiet_overflow, 0, "另一段对话的行被算成了这一段的越界");
     // 留下的必须是最新的尾段：裁掉的新内容比留住的老内容的代价大得多。
     let last = kept.last().expect("the newest turn is always kept");
     assert_eq!(

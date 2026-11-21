@@ -56,6 +56,7 @@ fn every_projection_table_declares_its_reader_and_why_the_source_would_not_do() 
             reader,
             rebuild,
             rebuilt_from,
+            rebuild_test,
             ..
         } = table.shape
         else {
@@ -77,6 +78,12 @@ fn every_projection_table_declares_its_reader_and_why_the_source_would_not_do() 
                 "{}: 两份声明点名的重建路线不同（{} / {}）",
                 table.table, declaration.rebuild, rebuild
             )),
+            Some(declaration) if declaration.rebuild_test != rebuild_test => {
+                disputed.push(format!(
+                    "{}: 两份声明点名的重算测试不同（{} / {}）",
+                    table.table, declaration.rebuild_test, rebuild_test
+                ))
+            }
             Some(declaration) if declaration.rebuilt_from != rebuilt_from => {
                 disputed.push(format!(
                     "{}: 两份声明点名的「由什么重算」不同（{} / {}）",
@@ -108,6 +115,25 @@ fn every_projection_table_declares_its_reader_and_why_the_source_would_not_do() 
             unexplained.push(format!(
                 "{}: 点名的重写路线 {} 在树里不存在",
                 declaration.table, declaration.rebuild
+            ));
+            continue;
+        }
+        // 「能重算」的**证据**是一条真的重算测试：它在树里，而且它跑的是一个真库用例
+        // （`#[ignore]` 后面那一条，需要 COGNEVA_TEST_DATABASE_URL）。只写路径不写
+        // 测试，与不写这一格是一样的——声明没有证据。
+        let test_path = root.join(declaration.rebuild_test);
+        if !test_path.is_file() {
+            unexplained.push(format!(
+                "{}: 点名的重算测试 {} 在树里不存在",
+                declaration.table, declaration.rebuild_test
+            ));
+            continue;
+        }
+        let text = std::fs::read_to_string(&test_path).unwrap_or_default();
+        if !text.contains("#[ignore") || !text.contains("async fn") {
+            unexplained.push(format!(
+                "{}: {} 里没有一条需要真库的重算用例（`#[ignore]` + `async fn`）",
+                declaration.table, declaration.rebuild_test
             ));
         }
     }

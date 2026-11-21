@@ -255,28 +255,24 @@ impl PostgresObservabilityGateway {
 
     /// Record a structured log entry for the given task.
     ///
-    /// The insert is followed by a trim that keeps the task's newest
-    /// [`LOG_LINES_PER_TASK`] rows. Without it this table is append-only and
-    /// its size is the platform's uptime times its run rate — the shape the
-    /// event log already had to be bounded for, on a table a thousand times
-    /// larger.
+    /// The row is written and **nothing is deleted**. A log line is something the
+    /// platform said while running a task; the row is the only copy of it. The
+    /// earlier shape trimmed each task to its newest [`LOG_LINES_PER_TASK`] rows
+    /// on every write -- an age bound on a fact, and one that shrinks the table
+    /// exactly as fast whether or not an archive exists, so nobody notices the
+    /// moment the rows stop being recoverable.
+    ///
+    /// Readers still see a window: they ask for one task id and a count, and the
+    /// bound keeps a busy task from pushing a quiet one's only line out of that
+    /// read. What changed is that the window is where reading stops, not where
+    /// deleting starts. [`Self::lines_beyond_window`] counts what a reader will
+    /// never be shown again -- the part an archive owes.
     ///
     /// Per task rather than per table because the reader asks in tasks: it
     /// names one task id and a count. A table-wide capacity would let one busy
     /// task push a quiet task's only line out, and that task's reader would
-    /// then get an empty list — the exact false answer this table exists to
+    /// then get an empty list -- the exact false answer this table exists to
     /// stop giving.
-    ///
-    /// The trim is a separate statement from the insert because one statement
-    /// cannot see its own CTE's rows: a `DELETE` beside the `INSERT` in the
-    /// same statement counts the table as it was before the row landed and
-    /// would therefore take one line too many. Two statements can leave the
-    /// task one row over its bound between them, which is a row a reader can
-    /// see and the next write removes; losing the newest line is not.
-    ///
-    /// A failed trim does not fail the write. The line is in; the bound is the
-    /// part that did not hold, and saying so is more useful to the caller than
-    /// telling it the write it can already read back did not happen.
     pub async fn record_log(&self, task_id: &str, entry: LogEntry) -> SFResult<()> {
         sqlx::query(
             r#"
@@ -294,9 +290,18 @@ impl PostgresObservabilityGateway {
         .await
         .map_err(|e| SFError::Database(format!("record_log failed: {}", e)))?;
 
-        if let Err(e) = sqlx::query(
+        Ok(())
+    }
+
+    /// Log lines of `task_id` that fall outside its newest `keep` -- the part a
+    /// reader will never be shown again, and therefore the part an archive owes.
+    ///
+    /// Nothing is deleted: the count says "there is something to move", not
+    /// "there is something to drop".
+    pub async fn lines_beyond_window(&self, task_id: &str, keep: i64) -> SFResult<i64> {
+        sqlx::query_scalar(
             r#"
-            DELETE FROM cog_observability_logs
+            SELECT count(*) FROM cog_observability_logs
             WHERE task_id = $1
               AND id NOT IN (
                   SELECT id FROM cog_observability_logs
@@ -307,18 +312,10 @@ impl PostgresObservabilityGateway {
             "#,
         )
         .bind(task_id)
-        .bind(LOG_LINES_PER_TASK)
-        .execute(&self.pool)
+        .bind(keep)
+        .fetch_one(&self.pool)
         .await
-        {
-            tracing::warn!(
-                task_id,
-                error = %e,
-                kept = LOG_LINES_PER_TASK,
-                "this task's log lines were written but not trimmed to the bound"
-            );
-        }
-        Ok(())
+        .map_err(|e| SFError::Database(format!("count a task's log overflow: {}", e)))
     }
 
     /// Add one run's metrics to its task's row.

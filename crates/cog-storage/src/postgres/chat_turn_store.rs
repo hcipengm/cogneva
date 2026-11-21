@@ -15,10 +15,14 @@
 //! that invented owner are gone; when an authenticated chat arrives, the owner
 //! becomes a column on this table rather than a second table beside it.
 //!
-//! What is kept is a transcript, not an audit log: the oldest rows of a session
-//! fall off once it holds [`ROWS_KEPT_PER_SESSION`]. Unbounded growth is the
-//! other way a store like this dies, and a chat panel does not scroll back to
-//! last year.
+//! Reads are bounded to the newest [`ROWS_KEPT_PER_SESSION`] rows of a session --
+//! a chat panel does not scroll back to last year, and a prompt is built from the
+//! same window. Rows **outside** that window are no longer deleted: they are the
+//! only record of what was said, and an age/window bound that drops them is an
+//! age bound on a fact. They are counted instead (see
+//! [`PostgresChatTurnStore::overflow_beyond_window`]), and the count is what says
+//! an archive is owed. Deleting before that archive exists would make the table
+//! look smaller while the platform lost what it told a person.
 
 use async_trait::async_trait;
 use sqlx::PgPool;
@@ -125,19 +129,23 @@ impl PostgresChatTurnStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| SFError::Database(format!("record a chat turn: {e}")))?;
-        // Same transaction as the insert: a trim that ran on its own could
-        // delete a row another writer had just appended to a different session,
-        // and a crash between the two would leave the bound unenforced.
-        sqlx::query(TRIM_TURNS_SQL)
-            .bind(session_id)
-            .bind(ROWS_KEPT_PER_SESSION)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| SFError::Database(format!("trim the chat transcript: {e}")))?;
         tx.commit()
             .await
             .map_err(|e| SFError::Database(format!("commit the chat turn: {e}")))?;
         Ok(())
+    }
+
+    /// Rows of `session_id` older than its newest `keep` -- the part a reader
+    /// will never be shown again, and therefore the part an archive owes.
+    ///
+    /// The answer may be zero or large; either way nothing is deleted here.
+    pub async fn overflow_beyond_window(&self, session_id: &str, keep: i64) -> SFResult<i64> {
+        sqlx::query_scalar(COUNT_OVERFLOW_SQL)
+            .bind(session_id)
+            .bind(keep)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("count the chat transcript overflow: {e}")))
     }
 }
 
@@ -166,11 +174,15 @@ const INSERT_FAILED_TURN_SQL: &str = "\
 INSERT INTO chat_turns (session_id, owner, role, content, failure, attachments, tool_calls, agent_id) \
 VALUES ($1, $2, 'user', $3, $4, $5, NULL, NULL), ($1, $2, 'assistant', '', $4, NULL, $6, $7)";
 
-/// Drop what fell out of the window. `NOT IN` over the newest rows keeps the
-/// bound per session rather than global: one busy session must not push another
-/// one's history out.
-const TRIM_TURNS_SQL: &str = "\
-DELETE FROM chat_turns \
+/// How many rows of this session sit outside its window -- **counted, not
+/// deleted**.
+///
+/// `NOT IN` over the newest rows keeps the bound per session rather than
+/// global: one busy session must not push another one's history out. The count
+/// is the reading that says an archive is owed; the rows themselves stay until
+/// a readable copy exists and reads back byte for byte.
+const COUNT_OVERFLOW_SQL: &str = "\
+SELECT count(*) FROM chat_turns \
 WHERE session_id = $1 \
   AND id NOT IN ( \
       SELECT id FROM chat_turns WHERE session_id = $1 ORDER BY id DESC LIMIT $2 \

@@ -130,22 +130,33 @@ impl PostgresNotificationStore {
         Ok(())
     }
 
-    /// Drop read rows older than `keep_days`, leaving unread rows alone.
+    /// How many read rows are older than `keep_days`. **Counted, not deleted.**
     ///
-    /// Unread is the exception on purpose: a notification nobody has opened
-    /// yet is the only reason the table exists, and expiring it by age would
-    /// delete exactly the ones a person still has to see. Read rows are the
-    /// history — useful for a while, unbounded otherwise.
-    pub async fn prune_read(&self, keep_days: i64) -> SFResult<u64> {
-        let result = sqlx::query(
-            "DELETE FROM notifications \
+    /// The earlier shape of this pass was `DELETE … WHERE is_read AND
+    /// read_at < now() - keep_days`. That is an age bound on a fact: a
+    /// notification is something the platform told a person, and the row is
+    /// the only copy of it. Rows past the window are the ones nobody will be
+    /// shown again — which is why they are the ones an archive would take, not
+    /// the ones to drop. The deletion path belongs behind the same three steps
+    /// as the observability log's: write a readable copy, read it back and
+    /// check it, then delete. Until that path exists this pass only answers
+    /// "how many are due", and the answer is the reading that says the archive
+    /// is owed.
+    ///
+    /// Unread rows are excluded on purpose: a notification nobody has opened
+    /// yet is the only reason the table exists, and counting it as due would
+    /// make the reading say "archive these" about rows a person still has to
+    /// see.
+    pub async fn count_read_past_retention(&self, keep_days: i64) -> SFResult<i64> {
+        let due: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM notifications \
              WHERE is_read = true AND read_at < NOW() - make_interval(days => $1)",
         )
         .bind(keep_days as i32)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
         .map_err(to_sf)?;
-        Ok(result.rows_affected())
+        Ok(due)
     }
 
     async fn unread_count(&self, user_id: Uuid) -> SFResult<i64> {

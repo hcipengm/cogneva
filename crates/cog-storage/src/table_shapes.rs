@@ -15,6 +15,28 @@
 //! DDL 里算出表，从生产代码里算出被 `UPDATE` 的表，两头比——多一行（表已经不改了）、
 //! 少一行（新加了一张原地更新的表）都红。
 
+/// 事实表：一行就是那段事实的**唯一一份**，删掉就再也拿不回来。
+///
+/// 这张名单的用途只有一个：让「事实面不许有到点删」成为一条机器判得出的判据
+/// （`crates/cogneva/tests/no_fact_table_is_deleted_on_a_schedule_test.rs`）。名单本身
+/// 不是证据——判据还会去看那条 `DELETE` 所在的函数里有没有「归档写进去、读回来、
+/// 逐字节比过」这一步。名单漏了一张表，判据就在那张表上失效，所以加一张事实表时
+/// 要回到这里加一行。
+///
+/// 两类表不在这里：**投影**（可重建，删了能算回来，判据是水位与重建测试）与
+/// **权威文档**（行本身就是当前值，改它就是那条事实本身，见 [`MUTABLE_TABLES`]）。
+pub const FACT_TABLES: &[&str] = &[
+    "cogneva_event",
+    "cog_events",
+    "cog_observability_events",
+    "cog_observability_logs",
+    "cog_attempt_journal",
+    "chat_turns",
+    "agent_messages",
+    "notifications",
+    "gateway_llm_exchange",
+];
+
 /// 一张会被 `UPDATE` 的表，以及它为什么是这种形状。
 #[derive(Debug, Clone, Copy)]
 pub enum TableShape {
@@ -29,6 +51,9 @@ pub enum TableShape {
         /// 它由**哪些事实**重算出来。与 `projection_readers` 里同一张表的那一格
         /// 说的是同一句话，判据逐字比对——一份表两份声明各说各的，是这一族最老的病。
         rebuilt_from: &'static str,
+        /// 那条重算测试在树里的路径。声明「能重算」而拿不出一条重算测试，
+        /// 在库面上与「不能重算」同形——测试就是这句话的证据。
+        rebuild_test: &'static str,
     },
     /// 权威文档：行就是那段事实的当前值。
     Document {
@@ -56,6 +81,7 @@ pub const MUTABLE_TABLES: &[DeclaredTable] = &[
             watermark: "as_of_seq",
             rebuild: "crates/cog-storage/src/postgres/task_ledger.rs",
             rebuilt_from: "task 台账里只追加的转移行（每一条任务的完整历史）",
+            rebuild_test: "crates/cog-storage/tests/task_projection_rebuilds_from_the_ledger.rs",
         },
     },
     DeclaredTable {
@@ -65,6 +91,7 @@ pub const MUTABLE_TABLES: &[DeclaredTable] = &[
             watermark: "as_of",
             rebuild: "crates/cog-observability/src/metric_projection.rs",
             rebuilt_from: "Prometheus 里 `<name>_total` 那条序列",
+            rebuild_test: "crates/cog-storage/tests/metric_projections_rebuild_from_prometheus.rs",
         },
     },
     DeclaredTable {
@@ -74,6 +101,7 @@ pub const MUTABLE_TABLES: &[DeclaredTable] = &[
             watermark: "as_of",
             rebuild: "crates/cog-observability/src/metric_projection.rs",
             rebuilt_from: "Prometheus 里 `<name>_bucket` 那条序列的每一档",
+            rebuild_test: "crates/cog-storage/tests/metric_projections_rebuild_from_prometheus.rs",
         },
     },
     DeclaredTable {
@@ -83,6 +111,7 @@ pub const MUTABLE_TABLES: &[DeclaredTable] = &[
             watermark: "as_of",
             rebuild: "crates/cog-observability/src/metric_projection.rs",
             rebuilt_from: "Prometheus 里 `<name>_sum` 那条序列",
+            rebuild_test: "crates/cog-storage/tests/metric_projections_rebuild_from_prometheus.rs",
         },
     },
     DeclaredTable {

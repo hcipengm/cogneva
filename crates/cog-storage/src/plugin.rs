@@ -622,17 +622,21 @@ impl cog_core::SystemPlugin for StoragePlugin {
             let notification_store = crate::PostgresNotificationStore::new(pool.clone());
             match notification_store.init_schema().await {
                 Ok(()) => {
-                    // 已读通知有保留期，未读的永远留着：表只增不减的话，它的体积
-                    // 由告警抖动的次数决定，而抖动正是这张表记的东西。启动时清一次，
-                    // 与 LLM 调用留底同一办理——进程滚得勤，漏一拍只少清一轮。
-                    match notification_store.prune_read(NOTIFICATION_KEEP_DAYS).await {
-                        Ok(removed) if removed > 0 => info!(
-                            removed,
+                    // 已读通知过了保留期**只数不删**：一条通知是平台对某个人说过的
+                    // 一句话，行是它的唯一一份，按年龄删就是删事实。数出来的那个数
+                    // 才是这一趟的产出——它说「该搬了」，说不了「该丢」。搬迁路径
+                    // 与观测日志同形：先落一份读得回来的副本，逐字节校验，才允许删。
+                    match notification_store
+                        .count_read_past_retention(NOTIFICATION_KEEP_DAYS)
+                        .await
+                    {
+                        Ok(due) if due > 0 => info!(
+                            due,
                             days = NOTIFICATION_KEEP_DAYS,
-                            "read notifications past retention removed"
+                            "read notifications past retention are due for archiving (kept)"
                         ),
                         Ok(_) => {}
-                        Err(e) => warn!(error = %e, "notification retention pass failed"),
+                        Err(e) => warn!(error = %e, "notification retention reading failed"),
                     }
                     let store: Arc<dyn cog_core::NotificationStore> = Arc::new(notification_store);
                     ctx.publish_service(store);
