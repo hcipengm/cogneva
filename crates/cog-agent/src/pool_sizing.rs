@@ -234,10 +234,26 @@ pub fn next_slots(
 /// this container is not holding onto, and a pool that backed off because a
 /// file was read would be reading the wrong number.
 pub fn read_container_memory() -> Option<(u64, u64)> {
-    let used = read_number("/sys/fs/cgroup/memory.current")?;
-    let limit = read_number("/sys/fs/cgroup/memory.max")?;
-    let inactive_file =
-        read_memory_stat_field("/sys/fs/cgroup/memory.stat", "inactive_file").unwrap_or(0);
+    read_container_memory_at(
+        "/sys/fs/cgroup/memory.current",
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory.stat",
+    )
+}
+
+/// [`read_container_memory`] over three named files.
+///
+/// All three are required. A `memory.stat` that cannot be read, or that does not
+/// carry `inactive_file`, does not mean the cache is zero: folding it to zero
+/// subtracts nothing and reports the page cache as memory this container is
+/// holding, which is the number every sizing decision then uses -- the pool
+/// shrinks, and the log line states a fraction that was never measured. No
+/// working set is the honest answer there, and the caller already has a path for
+/// it: an unmeasured container grows only under a declared ceiling.
+fn read_container_memory_at(current: &str, max: &str, stat: &str) -> Option<(u64, u64)> {
+    let used = read_number(current)?;
+    let limit = read_number(max)?;
+    let inactive_file = read_memory_stat_field(stat, "inactive_file")?;
     Some((used.saturating_sub(inactive_file), limit))
 }
 
@@ -599,5 +615,51 @@ mod tests {
         assert_eq!(gate.in_use(), 0);
         assert!(gate.set_slots(4).await, "no cap means the count may move");
         assert_eq!(gate.slots(), 4);
+    }
+
+    /// 三份读数缺一份就没有工作集：缓存那份读不出来时，减 0 会把页缓存当成
+    /// 这个容器占着的内存报上去，而池子按这个数缩、日志按这个数印分数。
+    #[test]
+    fn a_missing_cache_reading_leaves_the_working_set_unmeasured() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("memory.current");
+        let max = dir.path().join("memory.max");
+        let stat = dir.path().join("memory.stat");
+        std::fs::write(&current, "1000\n").unwrap();
+        std::fs::write(&max, "4000\n").unwrap();
+
+        // 读得出来：工作集是占用减去缓存。
+        std::fs::write(&stat, "anon 700\ninactive_file 400\n").unwrap();
+        assert_eq!(
+            read_container_memory_at(
+                current.to_str().unwrap(),
+                max.to_str().unwrap(),
+                stat.to_str().unwrap()
+            ),
+            Some((600, 4000))
+        );
+
+        // 文件不在：说没说谎，两种都是「没量到」，不能报 (1000, 4000)。
+        std::fs::remove_file(&stat).unwrap();
+        assert_eq!(
+            read_container_memory_at(
+                current.to_str().unwrap(),
+                max.to_str().unwrap(),
+                stat.to_str().unwrap()
+            ),
+            None,
+            "缓存读不出来时工作集是没量到，不是整个占用"
+        );
+
+        // 文件在、但里面没有那一格：同一个答案。
+        std::fs::write(&stat, "anon 700\n").unwrap();
+        assert_eq!(
+            read_container_memory_at(
+                current.to_str().unwrap(),
+                max.to_str().unwrap(),
+                stat.to_str().unwrap()
+            ),
+            None
+        );
     }
 }
