@@ -28,3 +28,4 @@ unicode-normalization = "0.1"
 
 [dev-dependencies]
 tokio-test = "0.4"
+tracing-subscriber = { workspace = true }
