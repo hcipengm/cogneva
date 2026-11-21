@@ -72,7 +72,10 @@ pub async fn write_block(pool: &PgPool, oid: u32, offset: u64, bytes: &[u8]) -> 
 /// 进程死掉时没人调它，已到达的字节留在库里，孤儿扫描因此把「崩溃」与「被处理掉的
 /// 写失败」分开。
 pub async fn unlink(pool: &PgPool, oid: u32) -> SFResult<()> {
-    sqlx::query("SELECT lo_unlink($1::oid)")
+    // 只在它**确实还在**时删：`lo_unlink` 对不存在的 oid 不是返回 0，是**报错**
+    // （`large object N does not exist`）。擦除要能重放——销毁成功、追加事件失败之后
+    // 再跑一次是正常路径——所以这里先把「已经不在」当成成功：那正是要的终态。
+    sqlx::query("SELECT lo_unlink($1::oid) FROM pg_largeobject_metadata WHERE oid = $1")
         .bind(oid as i64)
         .execute(pool)
         .await
