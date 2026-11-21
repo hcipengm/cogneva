@@ -585,6 +585,10 @@ pub async fn watch_child(
     // 静默是一次实测——一段什么也没动、最后却跑完了的时间。不收它，样本群就只剩
     // 被判停的那些，界偏向窄，而窄界会误杀下一次正常的网络等待。
     let mut last_movement = tokio::time::Instant::now();
+    // 第一拍看到「它还在」不是**动**，是**在场**：那一次采样没有基线可比，把静默时钟
+    // 从这一拍重起，会让一段 2.5 秒的安静只量出 1.5 秒——样本永远比实际短一拍，
+    // 而界是从这些样本导出的，短一拍的界会误杀下一次正常的等待。
+    let mut seen_once = false;
     let status = loop {
         tokio::select! {
             status = child.wait() => break status?,
@@ -593,7 +597,10 @@ pub async fn watch_child(
                 // 但计数一直在涨。没有这一读，一份沉默的重活会在它自己最忙的时候被判成停住。
                 if let Some(pid) = child.id() {
                     if movement.sample(pid, id) {
-                        last_movement = tokio::time::Instant::now();
+                        if seen_once {
+                            last_movement = tokio::time::Instant::now();
+                        }
+                        seen_once = true;
                         if let Some(also) = &also {
                             also();
                         }
