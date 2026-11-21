@@ -167,6 +167,13 @@ mod tests {
     }
 }
 
+/// 这一轮与上一轮的假清单一样 ⇒ 再问一次只会得到同一份输入，停。
+///
+/// 它不是「最多跑几轮」：轮数不是判据，判词为空才是；这一条只是无进展时的出口。
+pub fn no_progress(last: Option<&[String]>, current: &[String]) -> bool {
+    last.map(|prev| prev == current).unwrap_or(false)
+}
+
 /// 跑一轮完整的编辑循环：判 → 假清单 → 生成 → 再判，直到判词为空或某一轮毫无进展。
 ///
 /// 没有「最多几轮」这个旋钮：判据是**判词为空**。停下来的另一种情形是「这一轮与上一轮
@@ -180,7 +187,7 @@ pub async fn run_loop(root: &std::path::Path, generator: &BatchGenerator) -> Res
             return Ok(rounds);
         }
         let ids: Vec<String> = missing.iter().map(|(id, _)| id.clone()).collect();
-        if last.as_ref() == Some(&ids) {
+        if no_progress(last.as_deref(), &ids) {
             return Err(format!(
                 "batch-edit: {} 条连续一轮没有变化（{}）；再问一次只会是同一份输入",
                 ids.len(),
@@ -194,5 +201,31 @@ pub async fn run_loop(root: &std::path::Path, generator: &BatchGenerator) -> Res
             .map_err(|e| format!("generator 失败：{e}"))?;
         last = Some(ids);
         rounds += 1;
+    }
+}
+
+#[cfg(test)]
+mod loop_tests {
+    use super::*;
+
+    /// 第一轮不算无进展，哪怕清单一样——上一轮还不存在。
+    #[test]
+    fn the_first_round_is_never_stalled() {
+        assert!(!no_progress(None, &["S1".to_string()]));
+    }
+
+    /// 两轮清单一样：无进展。
+    #[test]
+    fn the_same_list_twice_is_a_stall() {
+        let a = vec!["S1".to_string()];
+        assert!(no_progress(Some(&a), &a));
+    }
+
+    /// 清单变短了就是有进展，继续。
+    #[test]
+    fn a_shorter_list_is_progress() {
+        let before = vec!["S1".to_string(), "S2".to_string()];
+        let after = vec!["S1".to_string()];
+        assert!(!no_progress(Some(&before), &after));
     }
 }
