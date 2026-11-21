@@ -104,6 +104,8 @@ mod a_job_inner_wait_budget_widens_the_job_deadline_test;
 mod a_label_name_is_the_same_wherever_it_is_declared_test;
 #[path = "a_logout_that_could_not_end_the_session_does_not_report_one_test.rs"]
 mod a_logout_that_could_not_end_the_session_does_not_report_one_test;
+#[path = "a_memory_ingest_that_could_not_store_its_entries_does_not_report_them_test.rs"]
+mod a_memory_ingest_that_could_not_store_its_entries_does_not_report_them_test;
 #[path = "a_missing_field_is_refused_or_fallen_back_by_what_the_field_reads_test.rs"]
 mod a_missing_field_is_refused_or_fallen_back_by_what_the_field_reads_test;
 #[path = "a_node_capacity_probe_is_written_once_test.rs"]

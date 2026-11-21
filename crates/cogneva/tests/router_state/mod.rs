@@ -401,6 +401,26 @@ pub fn with_session_manager(sm: Arc<dyn cog_core::SessionManager>) -> Arc<Gatewa
     Arc::new(state)
 }
 
+/// The same state with the two components a learn-ingest route asks for: where
+/// the raw bytes and the derived entries are stored, and what extraction makes
+/// of a payload.
+///
+/// Both are supplied because the route's answer now depends on each in turn --
+/// the store decides what landed, the extractor decides what was asked to land.
+/// A suite that supplies only one would be judging the missing component.
+pub fn with_memory_pipeline(
+    backend: Arc<dyn cog_core::MemoryBackend>,
+    ingestor: Arc<dyn cog_core::MemoryIngestor>,
+) -> Arc<GatewayState> {
+    let mut state = match Arc::try_unwrap(stateless()) {
+        Ok(state) => state,
+        Err(_) => panic!("the fixture just built it, so this is the only handle"),
+    };
+    state.memory_backend = Some(backend);
+    state.memory_ingestor = Some(ingestor);
+    Arc::new(state)
+}
+
 fn build(
     datasets: Option<Arc<dyn cog_storage::DatasetStore>>,
     message_backend: Option<Arc<dyn cog_core::MessageBackend>>,
