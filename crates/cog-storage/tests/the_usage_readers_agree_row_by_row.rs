@@ -80,6 +80,9 @@ fn call(call_id: &str, actor: &str, input: u64, output: u64) -> LlmCall {
         latency_ms: Some(12),
         task_id: None,
         actor: actor.to_string(),
+        cost_micros: None,
+        price_book: None,
+        session: None,
         pace: None,
         at: Utc::now(),
     }

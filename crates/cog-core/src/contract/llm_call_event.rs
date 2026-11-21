@@ -58,6 +58,15 @@ pub struct LlmCall {
     pub task_id: Option<String>,
     /// 发起方身份。
     pub actor: String,
+    /// 这一笔花掉的钱（微单位），`None` 表示没有定价过。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micros: Option<i64>,
+    /// 用哪本价目表的哪一档算的（`<book>@<currency>`）。没有它就算不出币种。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_book: Option<String>,
+    /// 这一次调用属于哪一段会话；`None` 是这条连接没有会话。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
     /// 配速那一拍的读数，JSON 文本（`measured_upstreams / allowance / spent /
     /// reserve / window_start`）。它原先只存在汇总表的列里，而那正是「停写汇总表
     /// 就会丢掉的东西」——搬进事件之后，行才真的只是它的投影。
@@ -91,6 +100,9 @@ impl LlmCall {
             "latency_ms": self.latency_ms,
             "task_id": self.task_id,
             "pace": self.pace,
+            "cost_micros": self.cost_micros,
+            "price_book": self.price_book,
+            "session": self.session,
         })
     }
 }

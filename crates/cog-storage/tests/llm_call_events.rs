@@ -115,6 +115,9 @@ fn call(id: &str) -> LlmCall {
         latency_ms: Some(30),
         task_id: Some("task-1".into()),
         actor: "probe-actor".into(),
+        cost_micros: None,
+        price_book: None,
+        session: None,
         pace: None,
         at: Utc::now(),
     }

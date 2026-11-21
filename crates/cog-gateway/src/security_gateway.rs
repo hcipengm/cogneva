@@ -3573,6 +3573,9 @@ async fn land_usage_record(state: &AppState, record: LlmUsageRecord) {
                         .pace
                         .as_ref()
                         .and_then(|p| serde_json::to_string(&p.upstreams).ok()),
+                    cost_micros: record.cost_micros,
+                    price_book: record.price_book.clone(),
+                    session: record.session.clone(),
                     at: chrono::Utc::now(),
                 };
                 if let Err(e) = sink.append(&call).await {
