@@ -58,6 +58,11 @@ pub struct LlmCall {
     pub task_id: Option<String>,
     /// 发起方身份。
     pub actor: String,
+    /// 配速那一拍的读数，JSON 文本（`measured_upstreams / allowance / spent /
+    /// reserve / window_start`）。它原先只存在汇总表的列里，而那正是「停写汇总表
+    /// 就会丢掉的东西」——搬进事件之后，行才真的只是它的投影。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pace: Option<String>,
     /// 写入口取自己的钟填进来的时刻。
     pub at: DateTime<Utc>,
 }
@@ -85,6 +90,7 @@ impl LlmCall {
             "owner": self.owner,
             "latency_ms": self.latency_ms,
             "task_id": self.task_id,
+            "pace": self.pace,
         })
     }
 }

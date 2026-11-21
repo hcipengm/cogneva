@@ -3569,6 +3569,10 @@ async fn land_usage_record(state: &AppState, record: LlmUsageRecord) {
                     latency_ms: None,
                     task_id: record.task.clone(),
                     actor: record.actor.clone(),
+                    pace: record
+                        .pace
+                        .as_ref()
+                        .and_then(|p| serde_json::to_string(&p.upstreams).ok()),
                     at: chrono::Utc::now(),
                 };
                 if let Err(e) = sink.append(&call).await {
