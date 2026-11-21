@@ -189,7 +189,7 @@ mod from_bytes_tests {
         let other = call(b"{\"cmd\":\"rm\"}", Some(b"ok"));
         assert_eq!(one.arguments_sha256, two.arguments_sha256);
         assert_ne!(one.arguments_sha256, other.arguments_sha256);
-        assert_eq!(one.arguments_bytes, 13);
+        assert_eq!(one.arguments_bytes, 12, "`{{\"cmd\":\"ls\"}}` 是 12 个字节");
     }
 
     /// 没有结果时两个结果字段都空着：哈希 `None`、长度 0——而不是一个空串的哈希。
