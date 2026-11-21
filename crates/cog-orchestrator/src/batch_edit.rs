@@ -60,21 +60,48 @@ fn compose(root: &std::path::Path, missing: &[(String, String)]) -> String {
 /// 走 `cog_core::Agent` 而不是裸 LLM：预算、重试、事件、工具都在 agent 那一层，
 /// 裸调等于把记账抄一份（S78/S79）。diff 也从**树**里读（`Agent` 有读 checkout 的
 /// 入口），不采信模型自己敲出来的补丁文本——那份是「关于文件的散文」。
+/// 这次生成要的那一个动作。`Agent` 的整套生命周期（start/snapshot/steer…）在这一步
+/// 用不到，而把一个只有 `prompt` 的调用点钉在整套接口上，等于让每个用例去实现十四个
+/// 不相关的方法——那时测的就不是这一步了。
+#[async_trait::async_trait]
+pub trait GeneratorCall: Send + Sync {
+    async fn call(&self, batch: &str) -> cog_core::SFResult<serde_json::Value>;
+}
+
+/// 生产实现：交给 agent。
+pub struct AgentCall {
+    pub agent: Arc<dyn cog_core::Agent>,
+}
+
+#[async_trait::async_trait]
+impl GeneratorCall for AgentCall {
+    async fn call(&self, batch: &str) -> cog_core::SFResult<serde_json::Value> {
+        self.agent
+            .prompt(serde_json::json!({ "batch": batch, "role": "generator" }))
+            .await
+    }
+}
+
 pub struct BatchGenerator {
-    agent: Arc<dyn cog_core::Agent>,
+    call: Arc<dyn GeneratorCall>,
 }
 
 impl BatchGenerator {
-    pub fn new(agent: Arc<dyn cog_core::Agent>) -> Self {
-        Self { agent }
+    pub fn new(call: Arc<dyn GeneratorCall>) -> Self {
+        Self { call }
+    }
+
+    /// 生产构造：把一个 agent 包成这次生成要的那一个调用。
+    pub fn from_agent(agent: Arc<dyn cog_core::Agent>) -> Self {
+        Self {
+            call: Arc::new(AgentCall { agent }),
+        }
     }
 
     /// 整批一次进、拿回这次运行的结果。工具轮次由 agent 自己决定，判据是信息完备
     /// （它够了才出 diff），这里不设上限。
     pub async fn generate(&self, batch: &str) -> cog_core::SFResult<serde_json::Value> {
-        self.agent
-            .prompt(serde_json::json!({ "batch": batch, "role": "generator" }))
-            .await
+        self.call.call(batch).await
     }
 }
 
@@ -101,4 +128,37 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
         missing.len()
     )
     .into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一个只回显的调用：判的是「整批原样进、答案原样出」，与模型无关。
+    struct Echo(std::sync::Mutex<Option<String>>);
+
+    #[async_trait::async_trait]
+    impl GeneratorCall for Echo {
+        async fn call(&self, batch: &str) -> cog_core::SFResult<serde_json::Value> {
+            *self.0.lock().unwrap() = Some(batch.to_string());
+            Ok(serde_json::json!({ "diff": format!("for {batch}") }))
+        }
+    }
+
+    /// 整批一次进：请求里带的是整批，不是一条。
+    #[tokio::test]
+    async fn the_whole_batch_goes_in_as_one_request() {
+        let agent = Arc::new(Echo(std::sync::Mutex::new(None)));
+        let generator = BatchGenerator::new(agent.clone());
+        let out = generator
+            .generate("## S1\n## S2\n## S3\n")
+            .await
+            .expect("the agent answers");
+        assert_eq!(
+            agent.0.lock().unwrap().as_deref(),
+            Some("## S1\n## S2\n## S3\n"),
+            "进 agent 的不是整批"
+        );
+        assert_eq!(out["diff"], "for ## S1\n## S2\n## S3\n");
+    }
 }
