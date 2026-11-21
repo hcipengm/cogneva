@@ -209,11 +209,22 @@ impl VectorSummaryBackend {
         let started = std::time::Instant::now();
         let mut attempt: u32 = 1;
         loop {
-            let failure = match self
+            // 每一次创建都记下**它花了多久**：这个部署建一个集合要几秒，今天没有任何
+            // 读数回答过，而客户端超时该设多大正是由那个分布决定的。2026-11-21 实测同一条
+            // 请求两次差了五倍（12.15s / 2.40s），所以「调大超时」不是答案，先要有分布。
+            let attempt_started = std::time::Instant::now();
+            let outcome = self
                 .vector
                 .create_collection(&self.collection, self.embedding_dim)
-                .await
-            {
+                .await;
+            tracing::info!(
+                collection = %self.collection,
+                attempt,
+                elapsed_ms = attempt_started.elapsed().as_millis() as u64,
+                created = outcome.is_ok(),
+                "vector collection create finished"
+            );
+            let failure = match outcome {
                 Ok(()) => return Ok(()),
                 Err(e) => e,
             };
