@@ -25,6 +25,8 @@ async fn event_stream(pool: &PgPool) {
     for file in [
         "117_event_stream.up.sql",
         "119_event_payload_is_json.up.sql",
+        // 读者按生成列取 token 与花费；没有这一条迁移，流上那几个列名根本不存在。
+        "124_event_payload_query_columns.up.sql",
     ] {
         let sql = std::fs::read_to_string(dir.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
         sqlx::raw_sql(&sql)
