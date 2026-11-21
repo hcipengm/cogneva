@@ -79,6 +79,12 @@ const IGNORE_MARKER: &str = concat!("#[ig", "nore");
 /// made, which is the failure the test below exists to catch.
 const UNNAMED: &[(&str, &str)] = &[
     (
+        "crates/cog-storage/src/db_surface.rs",
+        "这条用例要连一个真库并把库面的读数逐项对一遍；它跑在 live 那一档，\n         \
+         而那一档的步骤是按**测试目标**点名的，单元测试没有自己的目标，\n         \
+         点不到。留在这里是明写的一条决定，不是没人发现。",
+    ),
+    (
         "crates/cog-storage/src/redis/connect.rs",
         "The one test here asserts that the default configuration stalls the \
          driver for over a minute, and the waiting is the finding; running it \

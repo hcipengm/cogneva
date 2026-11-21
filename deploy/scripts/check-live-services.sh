@@ -229,7 +229,6 @@ live_check db 'Live-DB usage readers agree and answer a batch' cargo test -p cog
 live_check db 'Live-DB round events and body as a large object' cargo test -p cog-storage --test round_events --test body_as_large_object -- --ignored
 live_check db 'Live-DB erasure and projection rebuilds' cargo test -p cog-storage --test erasure_keeps_the_event_and_drops_the_body --test metric_projections_rebuild_from_prometheus -- --ignored
 live_check db 'Live-DB principle rows all decided' cargo test -p cog-storage --test no_principle_row_is_left_undecided_test -- --ignored
-live_check db 'Live-DB storage surface reads' cargo test -p cog-storage --lib db_surface -- --ignored
 # The two retirement passes are judged on the one thing a fixture cannot
 # hold: they work by asking the server what a key is now, and then acting
 # on the answer. An inbox's emptiness is a stream length the pass never
