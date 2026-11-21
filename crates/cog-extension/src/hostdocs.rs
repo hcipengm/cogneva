@@ -3296,9 +3296,19 @@ mod tests {
             text.contains(APPROVAL_TTL_METRIC),
             "窗口必须作为读数发出去: {text}"
         );
+        // 窗口是「实测最慢一次批准 × 1.25」导出的。实测那一刻与改写记录那一刻之间
+        // 差几毫秒，值就会多出几秒——判等一个数会把一条正确的回路判红。判**区间**：
+        // 两天半，允许一拍以内的漂移。
+        let published: u64 = text
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(&format!("{APPROVAL_TTL_METRIC} "))
+                    .and_then(|v| v.trim().parse().ok())
+            })
+            .unwrap_or_else(|| panic!("窗口没有作为读数发出去: {text}"));
         assert!(
-            text.contains(&format!("{APPROVAL_TTL_METRIC} 216000")),
-            "两天最慢一次批准的窗口是两天半: {text}"
+            (216_000..216_000 + 60).contains(&published),
+            "两天最慢一次批准的窗口应当是两天半（216000 秒，允许一拍漂移），实得 {published}"
         );
         assert!(
             text.contains(APPROVAL_TTL_EVALUATIONS_METRIC),
