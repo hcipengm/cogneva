@@ -289,7 +289,12 @@ pub struct ChangesResponse {
     /// 现网是哪一版（或为什么读不出来）。三格里的「上线」靠它算。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live_revision: Option<cog_core::LiveRevision>,
-    /// 三格按格数出来的行数；`None` 表示这一页没有可用快照。
+    /// 三格按格数出来的行数，数的是**这一页**的 `outstanding`。
+    ///
+    /// 数这一页而不是数一份全账快照，是因为「代码填了、验证空着」这一格只可能出现在
+    /// 还没闭的行上：快照里有的是已落的行，那些行的验证格按定义就是填的，于是从快照
+    /// 数出来永远是 0——一条永远为 0 的判据比没有这条判据更坏。页是个节选，所以名字
+    /// 与注释都说清楚它数的是这一页。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cells_census: Option<cog_core::ChangeCellsCensus>,
     /// The rows the ledger hands out next, most urgent band first.
@@ -517,7 +522,15 @@ pub async fn changes_handler(
     let live_revision = cells_snapshot
         .as_ref()
         .map(|snapshot| snapshot.live.clone());
-    let cells_census = cells_snapshot.as_ref().map(|snapshot| snapshot.census());
+    // 数的是**这一页**的行，不是快照里的已落行：「代码填了、验证空着」只可能出现在
+    // 还没闭的行上，而已落行的验证格按定义是填的——从快照数，这一格永远是 0。
+    let cells_census = live_revision.as_ref().map(|live| {
+        let mut census = cog_core::ChangeCellsCensus::default();
+        for row in &rows {
+            census.add(&row.cells(live));
+        }
+        census
+    });
     let outstanding = rows
         .into_iter()
         .map(|row| {

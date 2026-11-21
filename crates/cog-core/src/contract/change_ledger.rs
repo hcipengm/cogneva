@@ -759,12 +759,7 @@ impl ChangeCellsSnapshot {
     pub fn census(&self) -> ChangeCellsCensus {
         let mut census = ChangeCellsCensus::default();
         for cells in self.cells.values() {
-            census.rows += 1;
-            census.code += u64::from(cells.code);
-            census.live += u64::from(cells.live);
-            census.verified += u64::from(cells.verified);
-            census.terminal += u64::from(cells.is_terminal());
-            census.unverified += u64::from(cells.unverified());
+            census.add(cells);
         }
         census
     }
@@ -773,6 +768,8 @@ impl ChangeCellsSnapshot {
 /// 一份快照按格数出来的行数。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeCellsCensus {
+    // 每一格数的是「填了的行数」，`rows` 是分母。行数而不是比例：比例在总量变化时
+    // 会自己变好看，行数不会。
     pub rows: u64,
     pub code: u64,
     pub live: u64,
@@ -780,6 +777,18 @@ pub struct ChangeCellsCensus {
     pub terminal: u64,
     /// 代码填了、验证空着：读作做完了、实际没人核过。
     pub unverified: u64,
+}
+
+impl ChangeCellsCensus {
+    /// 把一行的三格数进去。
+    pub fn add(&mut self, cells: &ChangeCells) {
+        self.rows += 1;
+        self.code += u64::from(cells.code);
+        self.live += u64::from(cells.live);
+        self.verified += u64::from(cells.verified);
+        self.terminal += u64::from(cells.is_terminal());
+        self.unverified += u64::from(cells.unverified());
+    }
 }
 
 /// 一件变更的三格：每一格「填了没有」。

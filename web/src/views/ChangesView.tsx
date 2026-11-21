@@ -443,12 +443,12 @@ export function ChangesView() {
       )}
       {page?.cells_census && (
         <div className="flex flex-wrap border-b border-[var(--line)] py-2">
-          <Reading label="代码填了" value={page.cells_census.code} tone="plain" />
-          <Reading label="上线填了" value={page.cells_census.live} tone="plain" />
-          <Reading label="验证填了" value={page.cells_census.verified} tone="plain" />
-          <Reading label="三格齐（终态）" value={page.cells_census.terminal} tone="plain" />
+          <Reading label="本页·代码" value={page.cells_census.code} tone="plain" />
+          <Reading label="本页·上线" value={page.cells_census.live} tone="plain" />
+          <Reading label="本页·验证" value={page.cells_census.verified} tone="plain" />
+          <Reading label="本页·三格齐" value={page.cells_census.terminal} tone="plain" />
           <Reading
-            label="落地却没量过"
+            label="本页·落地没量过"
             value={page.cells_census.unverified}
             tone={page.cells_census.unverified > 0 ? 'warn' : 'plain'}
           />
