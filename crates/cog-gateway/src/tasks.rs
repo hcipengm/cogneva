@@ -913,15 +913,15 @@ pub async fn create_task_handler(
             && !c.workspace_ids.contains(&req.workspace_id)
         {
             if let Some(ref stream) = state.audit_stream {
-                let _ = stream
-                    .append(
-                        cog_core::AuditKind::Authz,
-                        &c.sub,
-                        &req.workspace_id,
-                        "authz.workspace_denied",
-                        serde_json::json!({ "goal_id": goal_id }),
-                    )
-                    .await;
+                crate::audit::append_or_warn(
+                    stream,
+                    cog_core::AuditKind::Authz,
+                    &c.sub,
+                    &req.workspace_id,
+                    "authz.workspace_denied",
+                    serde_json::json!({ "goal_id": goal_id }),
+                )
+                .await;
             }
             return Err(ApiError::forbidden(format!(
                 "workspace '{}' is outside your workspace scope",
@@ -1022,18 +1022,18 @@ pub async fn create_task_handler(
         let decision = hierarchy.check(&quota_ctx, estimated).await;
         if !decision.allowed {
             if let Some(ref stream) = state.audit_stream {
-                let _ = stream
-                    .append(
-                        cog_core::AuditKind::QuotaEnforcement,
-                        quota_ctx.user_id.as_deref().unwrap_or("anonymous"),
-                        &goal_id,
-                        "quota.task_rejected",
-                        serde_json::json!({
-                            "estimated_tokens": estimated,
-                            "blocked_by": decision.blocked_by.len(),
-                        }),
-                    )
-                    .await;
+                crate::audit::append_or_warn(
+                    stream,
+                    cog_core::AuditKind::QuotaEnforcement,
+                    quota_ctx.user_id.as_deref().unwrap_or("anonymous"),
+                    &goal_id,
+                    "quota.task_rejected",
+                    serde_json::json!({
+                        "estimated_tokens": estimated,
+                        "blocked_by": decision.blocked_by.len(),
+                    }),
+                )
+                .await;
             }
             return Err(ApiError::too_many_requests(format!(
                 "quota exceeded: estimated {} tokens blocked by {} scope(s)",
@@ -1798,19 +1798,19 @@ pub async fn update_task_handler(
     state.orchestrator.replace_task(task.clone()).await?;
 
     if let Some(ref stream) = state.audit_stream {
-        let _ = stream
-            .append(
-                cog_core::AuditKind::Custom("project_task".into()),
-                claims.map(|c| c.sub.as_str()).unwrap_or("system"),
-                &task.id,
-                "project.task_updated",
-                serde_json::json!({
-                    "parent_task_id": task.parent_task_id,
-                    "title": crate::projects::task_title(&task),
-                    "acceptance": task.acceptance,
-                }),
-            )
-            .await;
+        crate::audit::append_or_warn(
+            stream,
+            cog_core::AuditKind::Custom("project_task".into()),
+            claims.map(|c| c.sub.as_str()).unwrap_or("system"),
+            &task.id,
+            "project.task_updated",
+            serde_json::json!({
+                "parent_task_id": task.parent_task_id,
+                "title": crate::projects::task_title(&task),
+                "acceptance": task.acceptance,
+            }),
+        )
+        .await;
     }
     // 哈希链记顺序与完整性，这张表记「这一张任务改过什么」——两份的读者不同。
     crate::project_audit::record(cog_core::AuditEntry {
@@ -1951,20 +1951,20 @@ pub async fn save_task_plan_handler(
     state.orchestrator.save_task_plan(&plan).await?;
 
     if let Some(ref stream) = state.audit_stream {
-        let _ = stream
-            .append(
-                cog_core::AuditKind::Custom("project_task".into()),
-                claims.map(|c| c.sub.as_str()).unwrap_or("system"),
-                &id,
-                "project.plan_saved",
-                serde_json::json!({
-                    "planned_start": plan.planned_start,
-                    "planned_end": plan.planned_end,
-                    "budget_tokens": plan.budget_tokens,
-                    "baseline_rev": plan.baseline_rev,
-                }),
-            )
-            .await;
+        crate::audit::append_or_warn(
+            stream,
+            cog_core::AuditKind::Custom("project_task".into()),
+            claims.map(|c| c.sub.as_str()).unwrap_or("system"),
+            &id,
+            "project.plan_saved",
+            serde_json::json!({
+                "planned_start": plan.planned_start,
+                "planned_end": plan.planned_end,
+                "budget_tokens": plan.budget_tokens,
+                "baseline_rev": plan.baseline_rev,
+            }),
+        )
+        .await;
     }
     crate::project_audit::record(cog_core::AuditEntry {
         actor: claims
@@ -2152,15 +2152,15 @@ pub async fn move_task_handler(
     broadcast_task_status(&state, &id, target, task.agent_id.clone());
 
     if let Some(ref stream) = state.audit_stream {
-        let _ = stream
-            .append(
-                cog_core::AuditKind::Custom("project_task".into()),
-                actor,
-                &id,
-                "project.card_moved",
-                serde_json::json!({ "from": task.status.as_str(), "to": target.as_str() }),
-            )
-            .await;
+        crate::audit::append_or_warn(
+            stream,
+            cog_core::AuditKind::Custom("project_task".into()),
+            actor,
+            &id,
+            "project.card_moved",
+            serde_json::json!({ "from": task.status.as_str(), "to": target.as_str() }),
+        )
+        .await;
     }
     // 「这片卡是哪一天被谁挪走的」——事故复盘问的第一个问题，按资源一秒查出来。
     crate::project_audit::record(cog_core::AuditEntry {

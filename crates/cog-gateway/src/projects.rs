@@ -1621,15 +1621,15 @@ pub async fn create_project_handler(
     if let Some(c) = claims {
         if !c.workspace_ids.is_empty() && !c.workspace_ids.contains(&workspace) {
             if let Some(ref stream) = state.audit_stream {
-                let _ = stream
-                    .append(
-                        cog_core::AuditKind::Authz,
-                        &c.sub,
-                        &workspace,
-                        "authz.workspace_denied",
-                        serde_json::json!({ "intent": "project.create" }),
-                    )
-                    .await;
+                crate::audit::append_or_warn(
+                    stream,
+                    cog_core::AuditKind::Authz,
+                    &c.sub,
+                    &workspace,
+                    "authz.workspace_denied",
+                    serde_json::json!({ "intent": "project.create" }),
+                )
+                .await;
             }
             return Err(ApiError::forbidden(format!(
                 "workspace '{workspace}' is outside your workspace scope"
@@ -1643,15 +1643,15 @@ pub async fn create_project_handler(
     state.orchestrator.add_task(root).await?;
 
     if let Some(ref stream) = state.audit_stream {
-        let _ = stream
-            .append(
-                cog_core::AuditKind::Custom("project".into()),
-                claims.map(|c| c.sub.as_str()).unwrap_or("system"),
-                &project_id,
-                "project.created",
-                serde_json::json!({ "name": name, "workspace_id": workspace }),
-            )
-            .await;
+        crate::audit::append_or_warn(
+            stream,
+            cog_core::AuditKind::Custom("project".into()),
+            claims.map(|c| c.sub.as_str()).unwrap_or("system"),
+            &project_id,
+            "project.created",
+            serde_json::json!({ "name": name, "workspace_id": workspace }),
+        )
+        .await;
     }
     crate::project_audit::record(cog_core::AuditEntry {
         actor: claims
@@ -1910,15 +1910,15 @@ pub async fn create_project_task_handler(
     if let Some(c) = claims {
         if !c.workspace_ids.is_empty() && !c.workspace_ids.contains(&workspace) {
             if let Some(ref stream) = state.audit_stream {
-                let _ = stream
-                    .append(
-                        cog_core::AuditKind::Authz,
-                        &c.sub,
-                        &workspace,
-                        "authz.workspace_denied",
-                        serde_json::json!({ "project_id": id }),
-                    )
-                    .await;
+                crate::audit::append_or_warn(
+                    stream,
+                    cog_core::AuditKind::Authz,
+                    &c.sub,
+                    &workspace,
+                    "authz.workspace_denied",
+                    serde_json::json!({ "project_id": id }),
+                )
+                .await;
             }
             return Err(ApiError::forbidden(format!(
                 "workspace '{workspace}' is outside your workspace scope"
@@ -1934,20 +1934,20 @@ pub async fn create_project_task_handler(
     // 写下来就要查得到「谁在什么时候把这片活放进了哪棵树」。审计流是这一面
     // 唯一不会被后续写覆盖的地方。
     if let Some(ref stream) = state.audit_stream {
-        let _ = stream
-            .append(
-                cog_core::AuditKind::Custom("project_task".into()),
-                claims.map(|c| c.sub.as_str()).unwrap_or("system"),
-                &task_id,
-                "project.task_created",
-                serde_json::json!({
-                    "project_id": id,
-                    "parent_task_id": parent,
-                    "workspace_id": workspace,
-                    "title": title,
-                }),
-            )
-            .await;
+        crate::audit::append_or_warn(
+            stream,
+            cog_core::AuditKind::Custom("project_task".into()),
+            claims.map(|c| c.sub.as_str()).unwrap_or("system"),
+            &task_id,
+            "project.task_created",
+            serde_json::json!({
+                "project_id": id,
+                "parent_task_id": parent,
+                "workspace_id": workspace,
+                "title": title,
+            }),
+        )
+        .await;
     }
     crate::project_audit::record(cog_core::AuditEntry {
         actor: claims

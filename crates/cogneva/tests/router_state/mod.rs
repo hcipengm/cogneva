@@ -421,6 +421,20 @@ pub fn with_memory_pipeline(
     Arc::new(state)
 }
 
+/// The same state with the platform's own audit chain switched on.
+///
+/// Without one the routes append nothing and there is nothing to judge: a
+/// suite that asks what a route does when the chain refuses has to hand it a
+/// chain first.
+pub fn with_audit_stream(stream: Arc<dyn cog_core::AuditStream>) -> Arc<GatewayState> {
+    let mut state = match Arc::try_unwrap(stateless()) {
+        Ok(state) => state,
+        Err(_) => panic!("the fixture just built it, so this is the only handle"),
+    };
+    state.audit_stream = Some(stream);
+    Arc::new(state)
+}
+
 /// The same state, with action plans kept in `store` instead of a per-process
 /// map. The routes' answers are that store's answers, so this is what a suite
 /// supplies to judge them.

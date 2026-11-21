@@ -15,6 +15,37 @@ use std::sync::Arc;
 use crate::error::ApiError;
 use crate::GatewayState;
 
+/// 往平台自己那本账上追加一条，写不成要说出来。
+///
+/// 这本账的用处就在「事后追查」：一条没落上去的记录不会自己补上来，而它漏掉的
+/// 恰恰是平台做过的一件真事（一次拒绝、一次保存、一次挪动）。`let _ = append`
+/// 把失败变成沉默，读账的人只会以为那件事没有发生——「没记」与「没做」在账面上
+/// 是同一个读数。动作连同目标与错误一起写进日志，这是唯一能把两者分开的地方。
+///
+/// 返回这条记录有没有落上：调用方的答复不因它而变（真事已经做了），但需要知道
+/// 的调用方拿得到。
+pub(crate) async fn append_or_warn(
+    stream: &Arc<dyn cog_core::AuditStream>,
+    kind: cog_core::AuditKind,
+    actor: &str,
+    target: &str,
+    action: &str,
+    detail: serde_json::Value,
+) -> bool {
+    match stream.append(kind, actor, target, action, detail).await {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(
+                action = %action,
+                target = %target,
+                error = %error,
+                "这件事做了，但审计链上没有它：写不进去的记录不会自己补上来"
+            );
+            false
+        }
+    }
+}
+
 /// Query parameters for audit event listing.
 ///
 /// 不派生 `Default`：派生出来的 `limit` 是 0，而没写这一格的查询串拿到的是共用

@@ -598,15 +598,15 @@ pub async fn llm_config_handler(
     // managedFields 与指标序列反推，而那里没有人的身份。
     if let Some(stream) = state.audit_stream.as_ref() {
         let actor = audit_actor(&claims);
-        let _ = stream
-            .append(
-                cog_core::AuditKind::Custom("llm_config".to_string()),
-                &actor,
-                SECRET_UPSTREAMS_KEY,
-                "llm.upstream_saved",
-                pool_change_detail(before.as_deref(), after.as_deref(), effective_min_healthy),
-            )
-            .await;
+        crate::audit::append_or_warn(
+            stream,
+            cog_core::AuditKind::Custom("llm_config".to_string()),
+            &actor,
+            SECRET_UPSTREAMS_KEY,
+            "llm.upstream_saved",
+            pool_change_detail(before.as_deref(), after.as_deref(), effective_min_healthy),
+        )
+        .await;
     }
 
     // restartedAt 注解触发网关滚动重启，新 Pod 启动时从 Secret 读
@@ -685,15 +685,15 @@ pub async fn remove_upstreams_handler(
             pool_change_detail(before.as_deref(), after.as_deref(), effective_min_healthy);
         detail["requested"] = json!(names);
         let actor = audit_actor(&claims);
-        let _ = stream
-            .append(
-                cog_core::AuditKind::Custom("llm_config".to_string()),
-                &actor,
-                SECRET_UPSTREAMS_KEY,
-                "llm.upstream_removed",
-                detail,
-            )
-            .await;
+        crate::audit::append_or_warn(
+            stream,
+            cog_core::AuditKind::Custom("llm_config".to_string()),
+            &actor,
+            SECRET_UPSTREAMS_KEY,
+            "llm.upstream_removed",
+            detail,
+        )
+        .await;
     }
 
     (

@@ -126,6 +126,8 @@ mod a_process_installs_one_global_subscriber_or_none_test;
 mod a_ready_message_starts_the_row_it_names;
 #[path = "a_reconnect_picks_up_where_the_answer_was_test.rs"]
 mod a_reconnect_picks_up_where_the_answer_was_test;
+#[path = "a_record_the_chain_refused_is_not_dropped_in_silence_test.rs"]
+mod a_record_the_chain_refused_is_not_dropped_in_silence_test;
 #[path = "a_relation_reading_is_one_query_test.rs"]
 mod a_relation_reading_is_one_query_test;
 #[path = "a_reopened_conversation_keeps_the_tools_it_ran_test.rs"]
