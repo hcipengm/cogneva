@@ -35,7 +35,9 @@ const VERIFY_CHUNK: i64 = 1_048_576;
 
 /// 开一段正文，拿到 oid。
 pub async fn open(pool: &PgPool) -> SFResult<u32> {
-    let row = sqlx::query("SELECT lo_create(0) AS oid")
+    // `lo_create` 返回 SQL 类型 `oid`，而 `try_get::<i64>` 读不了它：类型对不上，
+    // 每一段正文都会在**第一条语句**上失败。在 SQL 里转一次，读侧就只剩一种整数类型。
+    let row = sqlx::query("SELECT lo_create(0)::bigint AS oid")
         .fetch_one(pool)
         .await
         .map_err(|e| SFError::Database(format!("lo_create: {e}")))?;
