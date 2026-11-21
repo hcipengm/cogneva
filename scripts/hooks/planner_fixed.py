@@ -20,8 +20,8 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import todo_source  # noqa: E402
 
-A = re.compile(r"判据读数\s*:\s*([a-z0-9-]+)\s*(?:→|->)\s*(\d+)")
-B = re.compile(r"判据读数\s*:\s*(?:test\s*=\s*)?((?:brain:)?[^\s:]+)::([^\s:｜|]+)")
+A = re.compile(r"(?:判据读数|代码)\s*:\s*([a-z0-9-]+)\s*(?:→|->)\s*(\d+)")
+B = re.compile(r"(?:判据读数|代码)\s*:\s*(?:test\s*=\s*)?((?:brain:)?[^\s:]+)::([^\s:｜|]+)")
 
 
 def classify(item) -> tuple[str, str]:
