@@ -3560,7 +3560,30 @@ fn seed_evolution_bundle(
             .into());
         }
     };
-    seed_evolution_bundle_into(&bundle, report, &target)
+    seed_evolution_bundle_into(&bundle, report, &target).map(|_| ())
+}
+
+/// 种子那一步真正做了什么，而不是包里声明了什么。
+///
+/// 清单上的 `refs` 是出包那一刻 `bundle list-heads` 数出来的，里面既有
+/// `refs/heads/*`、`refs/tags/*`，也有远端跟踪 ref；种子只种前两类。两个数
+/// 并排才是这一段的读数：只报声明的那一个，「种回 N 个 ref」在一份只带了一个
+/// 远端跟踪 ref 的包上也是 N，而目标仓里一个 ref 都没有。
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SeededRefs {
+    created: usize,
+    fast_forward: usize,
+    same: usize,
+    diverged: usize,
+    /// 包里不属于权威面（既不是 heads 也不是 tags）的 ref：带了也不种。
+    outside: usize,
+}
+
+impl SeededRefs {
+    /// 现在目标仓里指着的、包里的那一份：新建、快进、本来就一样，都算。
+    fn seeded(&self) -> usize {
+        self.created + self.fast_forward + self.same
+    }
 }
 
 /// 种子本体，落点由调用方给出：恢复入口从 env 取，测试直接给临时目录。
@@ -3568,7 +3591,7 @@ fn seed_evolution_bundle_into(
     bundle: &Path,
     report: &EvolutionBundleReport,
     target: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<SeededRefs, Box<dyn std::error::Error>> {
     let meta = std::fs::metadata(bundle).map_err(|e| {
         format!(
             "包里有进化 bare 仓的 bundle 声明，但 {} 打不开：{e}",
@@ -3603,8 +3626,7 @@ fn seed_evolution_bundle_into(
             "+refs/tags/*:refs/restore/tags/*",
         ],
     )?;
-    let mut created = 0usize;
-    let mut fast_forward = 0usize;
+    let mut counts = SeededRefs::default();
     let mut diverged = Vec::new();
     let heads = git_ok(target, &["bundle", "list-heads", bundle_s])?;
     for line in heads.lines() {
@@ -3621,16 +3643,19 @@ fn seed_evolution_bundle_into(
         } else if let Some(name) = refname.strip_prefix("refs/tags/") {
             (format!("refs/restore/tags/{name}"), refname.to_string())
         } else {
-            // 远端跟踪之类不属于权威面的 ref：包里带了也不种。
+            // 远端跟踪之类不属于权威面的 ref：包里带了也不种，但要说出来——
+            // 声明数与种进去的数差的就是这几个。
+            counts.outside += 1;
             continue;
         };
         match merge_bundle_ref(target, &tmp, &target_ref)? {
-            BundleRefMerge::Created => created += 1,
-            BundleRefMerge::FastForwarded => fast_forward += 1,
-            BundleRefMerge::Same => {}
+            BundleRefMerge::Created => counts.created += 1,
+            BundleRefMerge::FastForwarded => counts.fast_forward += 1,
+            BundleRefMerge::Same => counts.same += 1,
             BundleRefMerge::Diverged => diverged.push(target_ref),
         }
     }
+    counts.diverged = diverged.len();
     // 临时命名空间不留在目标仓里：下一轮恢复再建一份，名字不会越攒越多。
     let leftovers = git_ok(
         target,
@@ -3662,21 +3687,36 @@ fn seed_evolution_bundle_into(
     tracing::info!(
         target = %target.display(),
         bytes = report.bytes,
-        refs = report.refs,
-        created,
-        fast_forward,
-        diverged = diverged.len(),
+        refs_declared = report.refs,
+        refs_seeded = counts.seeded(),
+        created = counts.created,
+        fast_forward = counts.fast_forward,
+        same = counts.same,
+        diverged = counts.diverged,
+        outside = counts.outside,
         head = %report.head,
         commit = %report.commit,
         "进化 bare 仓已从包里的 git bundle 种回"
     );
+    // 包里声明了 ref、目标仓里一个都没种上，而分叉那条警告也不会亮（没有一条
+    // 走到分叉）：恢复收尾照常写「完成」，而进化仓是空的。这不是包的错（`bundle
+    // verify` 已经过了），是包里那几个 ref 全在权威面之外。
+    if report.refs > 0 && counts.seeded() == 0 && counts.diverged == 0 {
+        tracing::warn!(
+            refs_declared = report.refs,
+            outside = counts.outside,
+            head = %report.head,
+            "包里声明了 ref，但没有一个属于 refs/heads 或 refs/tags：进化 bare 仓是空的，\
+             恢复收尾不会把这件事当成失败"
+        );
+    }
     if !diverged.is_empty() {
         tracing::warn!(
             refs = %diverged.join(","),
             "这些 ref 在目标仓里已有不同的历史，没有强推覆盖：包里的那份仍在包内"
         );
     }
-    Ok(())
+    Ok(counts)
 }
 
 enum BundleRefMerge {
@@ -8456,6 +8496,66 @@ mod tests {
         seed_evolution_bundle_into(&bundle, &report, target.path()).unwrap();
         assert_eq!(git(&["rev-parse", "refs/heads/main"]), head_commit);
         assert_eq!(git(&["symbolic-ref", "HEAD"]), "refs/heads/main");
+    }
+
+    /// 包里带着远端跟踪 ref 时，声明数与种进去的数不是一个数：日志里那个收货
+    /// 读数必须是后者，否则「种回 N 个 ref」在一份只带了一个远端跟踪 ref 的包上
+    /// 也是 N，而目标仓里一个 ref 都没有。
+    #[test]
+    fn a_bundle_with_a_remote_tracking_ref_says_what_it_seeded_not_what_was_declared() {
+        let src = tempfile::tempdir().unwrap();
+        let src_path = src.path();
+        let run = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(src_path, &["init", "-q"]);
+        run(src_path, &["config", "user.email", "t@example.com"]);
+        run(src_path, &["config", "user.name", "t"]);
+        run(src_path, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        std::fs::write(src_path.join("a"), b"a").unwrap();
+        run(src_path, &["add", "a"]);
+        run(src_path, &["commit", "-qm", "a", "--", "a"]);
+        let head_commit = run(src_path, &["rev-parse", "HEAD"]);
+
+        let bare = tempfile::tempdir().unwrap();
+        let clone = std::process::Command::new("git")
+            .args(["clone", "-q", "--bare"])
+            .arg(src_path)
+            .arg(bare.path())
+            .output()
+            .unwrap();
+        assert!(clone.status.success());
+        // `bundle create --all` 会把它一起打进去，而种子只种 heads/tags。
+        run(
+            bare.path(),
+            &["update-ref", "refs/remotes/origin/main", &head_commit],
+        );
+
+        let out = tempfile::tempdir().unwrap();
+        let report = bundle_evolution(Some(bare.path()), out.path())
+            .unwrap()
+            .expect("有提交的仓必须打得出 bundle");
+        assert_eq!(report.refs, 2, "main 与那个远端跟踪 ref 都在清单里");
+
+        let bundle = out.path().join("evolution.bundle");
+        let target = tempfile::tempdir().unwrap();
+        let counts = seed_evolution_bundle_into(&bundle, &report, target.path()).unwrap();
+        assert_eq!(counts.created, 1);
+        assert_eq!(counts.outside, 1, "远端跟踪 ref 带了也不种");
+        assert_eq!(counts.seeded(), 1, "种进去的是一个 ref，不是清单上的两个");
+        let refs = run(target.path(), &["for-each-ref", "--format=%(refname)"]);
+        assert_eq!(refs.lines().collect::<Vec<_>>(), vec!["refs/heads/main"]);
     }
 
     fn manifest_with_segments(segments: Vec<SegmentStamp>, bound: u64) -> BackupManifest {
