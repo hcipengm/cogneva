@@ -167,6 +167,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(provider_compat),
                 observability.pool,
                 observability.volume_footprint,
+                // 流式正文的落点：装配层连的库与账本、告警、池读数是同一个。
+                observability.body_store,
             )
             .await
         }

@@ -11341,6 +11341,10 @@ pub async fn run(
     provider_compat: Option<Arc<dyn cog_core::ProviderCompatTable>>,
     pool_obs: Arc<PoolObservability>,
     volume_footprint: Vec<VolumeFootprint>,
+    // 流式正文的落点。交进来的理由与其余几样相同：本 crate 不认具体实现，而
+    // 「正文写在大对象里」这件事只有装配层知道该连哪个库。`None` 时正文留在
+    // 扫描器的内存里——那是今天的行为，不是一个新的默认。
+    body_store: Option<Arc<dyn cog_core::BodyStore>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 本进程的出站客户端由装配层造好交进来（本 crate 不认具体实现）。交回给
     // `contribution_admin`，那些调 github/gitee 的请求与这里其余出站就确实是
@@ -11388,9 +11392,9 @@ pub async fn run(
             crate::spend_reading::Reading::default(),
         )),
         volume_footprint,
+        body_store,
         provider_compat,
         config: config.clone(),
-        body_store: None,
     };
     // 恢复逐上游证据必须发生在任何一拍探测之前：探测按表里的窗口决定谁该被试，
     // 表是空的时候每一条上游都算"没有记录"，锁存态下一轮就会把池内全部上游各试

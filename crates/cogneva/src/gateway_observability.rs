@@ -22,6 +22,9 @@ use cog_observability::usage_store::LlmUsageStore;
 pub struct GatewayObservability {
     pub pool: Arc<PoolObservability>,
     pub volume_footprint: Vec<VolumeFootprint>,
+    /// 流式正文的落点。`None` 表示这一代进程没有库可写，正文照旧留在扫描器的
+    /// 内存里——把它说成「正文进库了」是最贵的那种谎。
+    pub body_store: Option<Arc<dyn cog_core::BodyStore>>,
 }
 
 /// 造出安全网关的全部观测面，并把本进程的日志与卷走查一起装上。
@@ -69,9 +72,34 @@ pub async fn assemble(
         cog_core::ShutdownSignal::default(),
     );
 
+    // 流式正文的落点：与账本、告警、池读数同一个 `database_url`。正文写在大对象里，
+    // 行只留指针与封口时的哈希；不接上时正文留在进程内存里，而内存没有续跑。
+    //
+    // 这只池是本进程独立开的一只：账本与告警各自在 `connect_*` 里建自己的池，而
+    // 这里只要一个「写大对象」的句柄。代价是一条额外的连接预算，换来的是不必为了
+    // 一大对象去改那两条已经在跑的装配路径——真要省，该把 `build_pool_observability`
+    // 手里的池交出来共用，那是另一笔。
+    let body_store: Option<Arc<dyn cog_core::BodyStore>> = match config.database_url.as_deref() {
+        Some(url) => match sqlx::PgPool::connect(url).await {
+            Ok(pool) => Some(
+                std::sync::Arc::new(cog_storage::PostgresBodyStore::new(pool))
+                    as Arc<dyn cog_core::BodyStore>,
+            ),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "流式正文的落点建不出来（连不上库）：正文留在内存里，重启就没了"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
     GatewayObservability {
         pool,
         volume_footprint,
+        body_store,
     }
 }
 
