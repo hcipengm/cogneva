@@ -298,7 +298,11 @@ def report(root: pathlib.Path, changed: list[str], batch: list[str], todos, miss
             f"{', '.join(deferred)}\n"
             "推之前要在提交信息里用 `Split: <1-4> — <S 号…> — <理由>` 逐条点名，否则推不出去。"
         )
-        return 1
+        # 这一条**不挡编译**：`unknown` 说的是「这一条不属于这一遍编辑」，而编译垫片
+        # 问的正是「这一遍编辑走完了没有」。把它算成缺口，一条要等决定的待办就能让整
+        # 棵树永久编不了——那不是严格，是把可验证性关掉。推之前那一关照样要求点名。
+        if not editing:
+            return 1
 
     if (editing_gaps if editing else gaps) or owed:
         print(
