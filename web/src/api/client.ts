@@ -4094,8 +4094,13 @@ export interface BackupPackage {
 }
 
 export interface BackupPackages {
-  /** 现在有没有一趟导出在跑。页面靠它决定要不要继续轮询。 */
-  running: boolean;
+  /**
+   * 现在有没有一趟导出在跑。页面靠它决定要不要继续轮询。
+   *
+   * `null` = 问不到集群。那不是「没有在跑」：把两者折叠在一起，一趟真在跑的
+   * 导出会在 apiserver 打嗝的那一拍从页面上消失。
+   */
+  running: boolean | null;
   packages: BackupPackage[];
 }
 

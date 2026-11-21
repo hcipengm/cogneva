@@ -1605,6 +1605,23 @@ impl KubeClient {
 }
 
 #[cfg(test)]
+impl KubeClient {
+    /// 一个连不上任何东西的 client：给「问不到 apiserver 时调用方怎么办」
+    /// 这类判据用。
+    ///
+    /// 地址是本机回环上的 1 号端口，这个进程没在上面开任何东西：连过去立刻
+    /// 得到 ECONNREFUSED，而不是等一次超时。
+    pub(crate) fn unreachable() -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            base: "http://127.0.0.1:1".into(),
+            token: String::new(),
+            namespace: "test".into(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         api_base_from, apiserver_denies_ownership, classify_probe, classify_temperature_probe,

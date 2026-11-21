@@ -136,7 +136,12 @@ function BackupExportSection() {
   const [passphrase, setPassphrase] = useState('');
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
-  const running = packages.data?.running ?? false;
+  // 三种状态，不是两种：`null` 是「问不到集群」。把它折成 false，一趟真在跑的
+  // 导出会在 apiserver 打嗝的那一拍从页面上消失——轮询停掉，导出按钮又亮起来。
+  // 问不到时退回那条慢拍（`useResource` 自己每 30 秒重读），不做任何断言。
+  const runningState = packages.data?.running;
+  const running = runningState === true;
+  const runningUnknown = runningState === null;
 
   // 导出一趟要几分钟。只在「有 Job 在跑」时加快节奏，跑完就回到慢拍：
   // 常态下每 30 秒读一次目录没有意义，而轮询不会自己停。
@@ -198,7 +203,11 @@ function BackupExportSection() {
         <h2 className="text-[12px]">备份包</h2>
         <span className="text-[11px] text-[var(--muted)]">
           导出是一趟跑在集群里的备份；跑完包就出现在下面，可以直接下载
-          {running ? '；现在有一趟在跑' : ''}
+          {running
+            ? '；现在有一趟在跑'
+            : runningUnknown
+              ? '；读不到集群，确认不了现在有没有在跑'
+              : ''}
         </span>
         <div className="ml-auto">
           <Button onClick={packages.refresh}>重读</Button>

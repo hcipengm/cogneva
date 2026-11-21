@@ -266,7 +266,22 @@ pub async fn export_handler(Json(request): Json<ExportRequest>) -> Response {
             })),
         )
             .into_response(),
-        Err(e) => (
+        // 问不到集群与「已经有一趟在跑」是两件事，答复也分开：前者这次没做成是
+        // 因为读不到状态（503），后者是当前状态不允许（409）。
+        Err(StartRefusal::StateUnreadable(e)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "code": "export_state_unreadable", "message": e })),
+        )
+            .into_response(),
+        Err(StartRefusal::AlreadyRunning) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "code": "export_refused",
+                "message": "已经有一趟导出在跑；等它结束再起下一趟",
+            })),
+        )
+            .into_response(),
+        Err(StartRefusal::Failed(e)) => (
             StatusCode::CONFLICT,
             Json(json!({ "code": "export_refused", "message": e })),
         )
@@ -313,34 +328,37 @@ fn explain_forbidden_job_creation(error: &str) -> Option<String> {
     ))
 }
 
+/// 一趟导出为什么没有被起起来。
+///
+/// 「已经有一趟在跑」与「问不到有没有在跑」在调用方看来是两回事：前者是当前的
+/// 状态不允许，后者是这一次没读成。把它们压成同一个字符串，答复就会把读不到
+/// 说成冲突，而重试的时机完全不同。
+#[derive(Debug)]
+enum StartRefusal {
+    /// 集群里确实有一趟在跑。
+    AlreadyRunning,
+    /// 读不到 Job 列表，所以没能确认，按不冒险处理。
+    StateUnreadable(String),
+    /// 其它起不来的原因（CronJob 读不到、建 Job 被拒等）。
+    Failed(String),
+}
+
 async fn start_export(
     client: &KubeClient,
     passphrase: Option<&str>,
-) -> Result<(String, bool), String> {
+) -> Result<(String, bool), StartRefusal> {
     let namespace = client.namespace();
     // 一次只跑一趟。两趟同时跑时它们会各自对备份卷做保留裁剪，先跑完的那趟会把
     // 后跑完那趟刚写下的包当成「超出保留数」删掉——包没了，而两趟都自报成功。
-    if let Ok(jobs) = client
-        .get_json(&format!(
-            "/apis/batch/v1/namespaces/{namespace}/jobs?labelSelector={EXPORT_LABEL_KEY}%3D{EXPORT_LABEL_VALUE}"
+    //
+    // 读不到 Job 列表时也不能起：问不到「有没有在跑」不等于「没有在跑」，把
+    // 前者当后者放行，正是上面那件事发生的路。
+    if running_exports(client).await.map_err(|e| {
+        StartRefusal::StateUnreadable(format!(
+            "问不到集群里有没有一趟导出在跑，所以没有起第二趟：{e}"
         ))
-        .await
-    {
-        if jobs
-            .pointer("/items")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items.iter().any(|job| {
-                    job.pointer("/status/active")
-                        .and_then(Value::as_i64)
-                        .unwrap_or(0)
-                        > 0
-                })
-            })
-            .unwrap_or(false)
-        {
-            return Err("已经有一趟导出在跑；等它结束再起下一趟".into());
-        }
+    })? {
+        return Err(StartRefusal::AlreadyRunning);
     }
 
     let cronjob = client
@@ -349,7 +367,11 @@ async fn start_export(
             cronjob_name()
         ))
         .await
-        .map_err(|e| format!("读不到备份 CronJob：{e}。没有它就没有可克隆的 Pod 模板"))?;
+        .map_err(|e| {
+            StartRefusal::Failed(format!(
+                "读不到备份 CronJob：{e}。没有它就没有可克隆的 Pod 模板"
+            ))
+        })?;
 
     // 毫秒：秒级在「上一趟刚跑完、TTL 还没把它清掉」的窗口里会撞名，而 apiserver 对
     // 重名答 409——那次失败读起来像导出坏了，其实只是名字撞了。
@@ -357,14 +379,16 @@ async fn start_export(
         "cogneva-backup-export-{}",
         chrono::Utc::now().timestamp_millis()
     );
-    let job = export_job(&cronjob, &name, passphrase)?;
+    let job = export_job(&cronjob, &name, passphrase).map_err(StartRefusal::Failed)?;
     client
         .post_json(&format!("/apis/batch/v1/namespaces/{namespace}/jobs"), job)
         .await
         .map_err(|e| {
             let text = e.to_string();
-            explain_forbidden_job_creation(&text)
-                .unwrap_or_else(|| format!("起不来这一趟导出：{text}"))
+            StartRefusal::Failed(
+                explain_forbidden_job_creation(&text)
+                    .unwrap_or_else(|| format!("起不来这一趟导出：{text}")),
+            )
         })?;
     Ok((name, passphrase.is_some()))
 }
@@ -410,11 +434,24 @@ pub async fn list_handler() -> Response {
     // 新的在前：包名里的时间戳是定长 UTC，字典序就是时间序。
     packages.sort_by(|a, b| b["name"].as_str().cmp(&a["name"].as_str()));
 
+    // `null` 而不是 `false`：问不到 apiserver 与「没有一趟在跑」是两件事。
+    //
+    // 页面靠这个读数决定还要不要接着轮询、导出按钮能不能按。把读不到记成
+    // 「没有」，一趟真在跑的导出就会在 apiserver 打嗝的那一拍从页面上消失：
+    // 轮询停掉，按钮亮回来，读者被告知什么都没在跑——而 Job 就在那里跑着。
+    // 列表本身照常答（包的权威在卷上，读目录不经过 apiserver）。
     let running = match KubeClient::in_cluster() {
-        Ok(client) => export_running(&client).await,
-        // 不在集群里时列表照样可用（包的权威在卷上），只是没有可问的 apiserver：
-        // 这里按「不在跑」作答，页面因此不会再轮询——而这个进程本来也起不了 Job。
-        Err(_) => false,
+        Ok(client) => match running_exports(&client).await {
+            Ok(running) => Some(running),
+            Err(e) => {
+                tracing::warn!("读不到导出状态：{e}");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!("读不到导出状态（不在集群里）：{e}");
+            None
+        }
     };
     (
         StatusCode::OK,
@@ -423,27 +460,32 @@ pub async fn list_handler() -> Response {
         .into_response()
 }
 
-async fn export_running(client: &KubeClient) -> bool {
+/// 从一份 JobList 里读出有没有一趟标记过的导出在跑。
+///
+/// `items` 不是数组时不猜成「没有」：apiserver 答了 200 但对象不是 JobList，
+/// 是这份读数坏了，不是集群空了。
+fn active_export(jobs: &Value) -> Result<bool, String> {
+    let items = jobs
+        .pointer("/items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "apiserver 的 Job 列表里没有 items".to_string())?;
+    Ok(items.iter().any(|job| {
+        job.pointer("/status/active")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            > 0
+    }))
+}
+
+/// 问集群：现在有没有一趟导出在跑。读不到就是 `Err`，不折成 `false`。
+async fn running_exports(client: &KubeClient) -> Result<bool, String> {
     let namespace = client.namespace();
-    let Ok(jobs) = client
+    let jobs = client
         .get_json(&format!(
             "/apis/batch/v1/namespaces/{namespace}/jobs?labelSelector={EXPORT_LABEL_KEY}%3D{EXPORT_LABEL_VALUE}"
         ))
-        .await
-    else {
-        return false;
-    };
-    jobs.pointer("/items")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items.iter().any(|job| {
-                job.pointer("/status/active")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0)
-                    > 0
-            })
-        })
-        .unwrap_or(false)
+        .await?;
+    active_export(&jobs)
 }
 
 /// GET /api/v1/admin/backup/packages/{name} — 把一份包流回浏览器。
@@ -706,6 +748,42 @@ mod tests {
             EXPORT_LABEL_VALUE,
             "Pod 上也要有：日志与事件是按 Pod 标签找的"
         );
+    }
+
+    /// 问不到 apiserver 不是「没有一趟在跑」。
+    ///
+    /// 这条把 client 指向一个拒绝连接的地址：读 Job 列表必然失败。以前这里把
+    /// 失败折成 `false`，列表页于是把「问不到」画成「没在跑」。
+    #[tokio::test]
+    async fn an_unreadable_export_state_is_an_error_not_an_idle_cluster() {
+        let client = KubeClient::unreachable();
+        let reading = running_exports(&client).await;
+        assert!(
+            reading.is_err(),
+            "读不到 Job 列表时不能答出一个「跑 / 没跑」：{reading:?}"
+        );
+    }
+
+    /// 判重那一问读不到时，这一趟不许起。
+    ///
+    /// 两趟导出同时跑，会各自对备份卷做保留裁剪、把对方刚写下的包当成超出
+    /// 保留数删掉，而两趟都自报成功。
+    #[tokio::test]
+    async fn a_start_that_cannot_read_the_job_list_refuses_instead_of_starting() {
+        let client = KubeClient::unreachable();
+        let started = start_export(&client, None).await;
+        assert!(
+            matches!(started, Err(StartRefusal::StateUnreadable(_))),
+            "问不到有没有一趟在跑时就起了一趟：{started:?}"
+        );
+    }
+
+    /// Job 列表缺 `items` 不是「集群里没有导出」：那是一份坏读数。
+    #[test]
+    fn a_job_list_without_items_is_not_read_as_an_idle_cluster() {
+        assert!(active_export(&json!({ "kind": "JobList" })).is_err());
+        assert!(active_export(&json!({ "items": [{ "status": { "active": 1 } }] })).unwrap());
+        assert!(!active_export(&json!({ "items": [{ "status": { "active": 0 } }] })).unwrap());
     }
 
     #[test]
