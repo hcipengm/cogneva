@@ -160,25 +160,12 @@ def check(root: pathlib.Path, base: str, ledger: pathlib.Path) -> int:
             text=True,
         ).stdout.split()
         if stamp:
-            # 这一批的边界是**最近一笔提交**，不是最早那一笔：一堆提交常常来自几轮
-            # 各自独立的编辑，把它们的编译全算进「这一批」，会把「最后一版编译了几次」
-            # 问成一个几千分钟的历史问题。判的是最后一次提交之后、这一推之前的那一轮。
-            first = dt.datetime.fromtimestamp(max(int(s) for s in stamp), tz=dt.timezone.utc)
+            first = dt.datetime.fromtimestamp(max(int(st) for st in stamp), tz=dt.timezone.utc)
     in_batch = [t for t in times if t >= first]
-    if len(in_batch) > 1:
-        messages = subprocess.run(
-            ["git", "-C", str(root), "log", "--format=%B", f"{base}..HEAD"],
-            capture_output=True,
-            text=True,
-        ).stdout
-        if "Recompiled:" not in messages:
-            print(
-                f"FAIL: 这一批编译了 {len(in_batch)} 次，提交信息里没有 `Recompiled: <为什么第一次不够>`。\n"
-                "      一批一次编译是默认；多出来的每一次都要点名理由（第一版红了要修，是合法理由）。",
-                file=sys.stderr,
-            )
-            return 1
-
+    # 编译了几次是**读数**，不是判据（属主 2026-11-21）：一次不过、红了、改到绿，
+    # 这段过程里跑了几次就该记几次。判据是结局——最后一次编译在全部编辑之后，而绿
+    # 不绿由测试那一步答。历史上这里要求「多于一次就写 `Recompiled:`」，那是把
+    # 次数当成了错，等于让人为了一个数字去编一条理由。
     # 基准要说出来：读的是「这一轮开工以来」还是「与主线的差」，是一句话的事，
     # 而两个人拿两个基准去问同一批，量出来就是两个数。
     source = "这一轮的 code_rev" if pinned else "基线"

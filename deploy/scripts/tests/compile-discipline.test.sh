@@ -3,7 +3,7 @@
 #
 # 判的是「一批编辑只付一次编译」这条纪律的两个方向：
 #   1. 编辑在编译之后 ⇒ 红（改了没编译，就想推）。
-#   2. 一批里编译了不止一次、提交信息里没有 `Recompiled:` ⇒ 红。
+#   2. 一批里编译多次是读数：红的改到绿，跑几次记几次，不判红。
 #   3. 编辑在编译之前、一批只编译一次 ⇒ 绿。
 #   4. 账本读不到 ⇒ 不判（量不到不是零次），也不假绿成「通过」的措辞。
 set -uo pipefail
@@ -62,17 +62,15 @@ git -C "$tree" commit -q --allow-empty -m "no-op to move base time"
 out="$(run)"; rc=$?
 [ "$rc" -eq 0 ] && ok "编辑在前、编译在后、只编译一次：绿" || bad "正确的批次被拒（rc=$rc）：$out"
 
-# 4. 一批里编译两次，信息里没有 Recompiled ⇒ 红；写了理由 ⇒ 绿。
+# 4. 一批里编译多次是**读数**不是错：红了改到绿，跑几次记几次（属主 2026-11-21）。
 record "2030-01-01T00:05:00Z" "test"
-out="$(run)"; rc=$?
-{ [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "Recompiled"; } && ok "一批两次编译且无理由：红" || bad "两次编译没红（rc=$rc）：$out"
-git -C "$tree" commit -q --allow-empty -m "fix after red
-
-Recompiled: the first compile caught a type error"
-touch -d "2000-01-01T00:00:10Z" "$tree/crates/demo/src/lib.rs"
+out=$(run); rc=$?
+{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "2 次编译"; } \
+  && ok "多次编译：绿，并把次数印出来" || bad "多次编译被当成错（rc=$rc）：$out"
 record "2030-01-01T00:06:00Z" "check"
-out="$(run)"; rc=$?
-[ "$rc" -eq 0 ] && ok "写了 Recompiled 理由：绿" || bad "有理由仍被拒（rc=$rc）：$out"
+out=$(run); rc=$?
+{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "3 次编译"; } \
+  && ok "再跑一次：仍然绿，次数跟着涨" || bad "第三次编译被拒（rc=$rc）：$out"
 
 # 5. 开着一轮时用**这一轮的 code_rev**，不用 `origin/main`：三道门量同一件事。
 #    读数里要说得出来用的是哪个基准——两个人拿两个基准问同一批，量出来就是两个数。
