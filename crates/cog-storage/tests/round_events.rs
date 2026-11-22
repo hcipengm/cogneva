@@ -59,7 +59,7 @@ impl Scratch {
                  -- 它们，读的就不是同一个问题——2026-11-22 实测这一处夹具先红了。
                  ledger_rev      TEXT GENERATED ALWAYS AS (attributes::jsonb ->> 'ledger_rev') STORED,
                  code_rev        TEXT GENERATED ALWAYS AS (attributes::jsonb ->> 'code_rev') STORED,
-                 round_batch     TEXT GENERATED ALWAYS AS (attributes::jsonb ->> 'batch') STORED,
+                 round_batch     JSONB GENERATED ALWAYS AS (attributes::jsonb -> 'batch') STORED,
                  UNIQUE (writer, idempotency_key)
              )",
         )

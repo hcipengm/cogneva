@@ -26,7 +26,7 @@ ALTER TABLE cogneva_event
     ADD COLUMN IF NOT EXISTS tool_path TEXT GENERATED ALWAYS AS (attributes::jsonb ->> 'path') STORED,
     -- 这一轮开了哪些条：`round_opened` 把清单放在载荷的 `batch` 键上，读取方按列取。
     -- 原先那条 SELECT 点名的是一个从来不存在的 `batch` 列，每次调用都报「列不存在」。
-    ADD COLUMN IF NOT EXISTS round_batch TEXT GENERATED ALWAYS AS (attributes::jsonb ->> 'batch') STORED;
+    ADD COLUMN IF NOT EXISTS round_batch JSONB GENERATED ALWAYS AS (attributes::jsonb -> 'batch') STORED;
 
 CREATE INDEX IF NOT EXISTS idx_cogneva_event_llm_call_at
     ON cogneva_event (at) WHERE kind = 'llm_call';
