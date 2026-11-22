@@ -415,16 +415,15 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
     }
 
     match client.get_json("/api/v1/nodes").await {
-        Ok(nodes) => {
-            view.nodes = nodes
-                .get("items")
-                .and_then(Value::as_array)
-                .map(|items| items.iter().map(node_view).collect())
-                .unwrap_or_default();
-            if view.nodes.is_empty() {
-                view.error = Some("apiserver 回了空节点列表".to_string());
+        Ok(nodes) => match collection_items(&nodes, "节点") {
+            Ok(items) => {
+                view.nodes = items.iter().map(node_view).collect();
+                if view.nodes.is_empty() {
+                    view.error = Some("apiserver 回了空节点列表".to_string());
+                }
             }
-        }
+            Err(e) => view.error = Some(e),
+        },
         Err(e) => {
             view.reachable = false;
             view.error = Some(format!(
@@ -467,39 +466,45 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
 
     let pods_path = "/api/v1/pods".to_string();
     match client.get_json(&pods_path).await {
-        Ok(pods) => {
-            // 卷的实际占用来自平台自己的走查端：每台节点上都有一个 claim-store，
-            // 它量的是节点磁盘上每个卷的真实字节数。这条不经过 metrics-server，
-            // 也不经过 kubelet——它读的是这个平台自己记的账。
-            let measured = measured_claim_bytes(client.http(), pods.get("items"), &claims).await;
-            let sources = Sources {
-                events,
-                usage,
-                claims,
-                measured,
-            };
-            let parsed: Vec<PodView> = pods
-                .get("items")
-                .and_then(Value::as_array)
-                .map(|items| items.iter().map(|pod| pod_view(pod, &sources)).collect())
-                .unwrap_or_default();
-            place_pods(&mut view, parsed);
-            // 采集器读的是整台宿主上的每一个容器，这一面画的是每个有 Pod 的容器。
-            // 两者差出来的那些（宿主上的构建容器、不经 k8s 起的进程）有进程读数却没有
-            // 格子。差读在 Pod 读成功之后——读不到 Pod 时不知道谁被认领了，那时的差
-            // 不是差，是不知道。
-            let claims = claims_of_pods(pods.get("items"));
-            for node in &mut view.nodes {
-                if let Some(gap) = crate::process_reports::census_gap(&node.name, &claims) {
-                    node.census_containers = Some(gap.seen);
-                    // 计数从这一列里数出来，不另算一遍：两处各算一次，差一格的时候
-                    // 屏上会出现「3 个没有认领」而下面只列着 2 条的场面，而读者没有
-                    // 办法知道该信哪一个。
-                    node.unclaimed_containers = Some(gap.unclaimed.len());
-                    node.unclaimed = gap.unclaimed;
+        Ok(pods) => match collection_items(&pods, "Pod") {
+            Ok(items) => {
+                // 卷的实际占用来自平台自己的走查端：每台节点上都有一个 claim-store，
+                // 它量的是节点磁盘上每个卷的真实字节数。这条不经过 metrics-server，
+                // 也不经过 kubelet——它读的是这个平台自己记的账。
+                let measured =
+                    measured_claim_bytes(client.http(), pods.get("items"), &claims).await;
+                let sources = Sources {
+                    events,
+                    usage,
+                    claims,
+                    measured,
+                };
+                let parsed: Vec<PodView> =
+                    items.iter().map(|pod| pod_view(pod, &sources)).collect();
+                place_pods(&mut view, parsed);
+                // 采集器读的是整台宿主上的每一个容器，这一面画的是每个有 Pod 的容器。
+                // 两者差出来的那些（宿主上的构建容器、不经 k8s 起的进程）有进程读数却没有
+                // 格子。差读在 Pod 读成功之后——读不到 Pod 时不知道谁被认领了，那时的差
+                // 不是差，是不知道。
+                let claims = claims_of_pods(pods.get("items"));
+                for node in &mut view.nodes {
+                    if let Some(gap) = crate::process_reports::census_gap(&node.name, &claims) {
+                        node.census_containers = Some(gap.seen);
+                        // 计数从这一列里数出来，不另算一遍：两处各算一次，差一格的时候
+                        // 屏上会出现「3 个没有认领」而下面只列着 2 条的场面，而读者没有
+                        // 办法知道该信哪一个。
+                        node.unclaimed_containers = Some(gap.unclaimed.len());
+                        node.unclaimed = gap.unclaimed;
+                    }
                 }
             }
-        }
+            Err(e) => {
+                view.error = Some(match view.error {
+                    Some(previous) => format!("{previous}；{e}"),
+                    None => e,
+                });
+            }
+        },
         Err(e) => {
             view.error = Some(match view.error {
                 Some(previous) => format!("{previous}；读不到 Pod：{e}"),
@@ -516,7 +521,16 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
     // 两条读互相独立：没有 Endpoint 那条腿时 Service 照样列出来，只是地址数那一格
     // 写「没读到」——那时说 0 就是替一次没发生的读下一个结论。
     let endpoints = match client.get_json("/api/v1/endpoints").await {
-        Ok(list) => Some(endpoints_by_service(&list)),
+        Ok(list) => match collection_items(&list, "Endpoints") {
+            Ok(items) => Some(endpoints_by_service(items)),
+            Err(e) => {
+                view.error = Some(match view.error {
+                    Some(previous) => format!("{previous}；{e}"),
+                    None => e,
+                });
+                None
+            }
+        },
         Err(e) => {
             view.error = Some(match view.error {
                 Some(previous) => format!("{previous}；读不到 Endpoints：{e}"),
@@ -526,18 +540,20 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
         }
     };
     match client.get_json("/api/v1/services").await {
-        Ok(list) => {
-            view.services = list
-                .get("items")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| service_view(item, endpoints.as_ref()))
-                        .collect()
-                })
-                .unwrap_or_default();
-        }
+        Ok(list) => match collection_items(&list, "Service") {
+            Ok(items) => {
+                view.services = items
+                    .iter()
+                    .filter_map(|item| service_view(item, endpoints.as_ref()))
+                    .collect()
+            }
+            Err(e) => {
+                view.error = Some(match view.error {
+                    Some(previous) => format!("{previous}；{e}"),
+                    None => e,
+                });
+            }
+        },
         Err(e) => {
             view.error = Some(match view.error {
                 Some(previous) => format!("{previous}；读不到 Service：{e}"),
@@ -552,6 +568,19 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
     })
 }
 
+/// 集合回包里的 `items` 数组。
+///
+/// 回包里没有 `items` 不是「一个空集合」：apiserver 的字段会随版本改名、精简，
+/// 而把形状的变化折成 `[]`，这一面就会向看的人宣布「集群里没有节点 / 没有
+/// Pod / 没有 Service」——一句他照着去查集群、却查不出所以然的话。读不出列表
+/// 就该说读不出列表。
+fn collection_items<'a>(body: &'a Value, what: &str) -> Result<&'a [Value], String> {
+    body.get("items")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .ok_or_else(|| format!("{what} 的回包里没有 items 数组，这次读没读成列表"))
+}
+
 /// 每个 Service 此刻解析出的 (可服务地址数, 未就绪地址数)，按 (命名空间, 名字) 索引。
 ///
 /// 地址按 IP 去重：一个 Service 声明两个端口时 apiserver 会给出两个 subset，同一个
@@ -559,12 +588,9 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
 /// 一个读得通、画得出、对不上的数。
 type ServiceEndpoints = std::collections::HashMap<(String, String), (usize, usize)>;
 
-fn endpoints_by_service(list: &Value) -> ServiceEndpoints {
+fn endpoints_by_service(items: &[Value]) -> ServiceEndpoints {
     use std::collections::BTreeSet;
     let mut out: ServiceEndpoints = ServiceEndpoints::new();
-    let Some(items) = list.get("items").and_then(Value::as_array) else {
-        return out;
-    };
     for item in items {
         let key = (namespace_of(item), name_of(item));
         let mut ready: BTreeSet<&str> = BTreeSet::new();
@@ -2532,7 +2558,7 @@ mod topology_tests {
                 {"addresses": [{"ip": "10.0.0.1"}, {"ip": "10.0.0.2"}]}
             ]
         }]});
-        let map = endpoints_by_service(&list);
+        let map = endpoints_by_service(collection_items(&list, "Endpoints").unwrap());
         assert_eq!(
             map.get(&("cogneva".to_string(), "api".to_string())),
             Some(&(2, 0))
@@ -2551,10 +2577,11 @@ mod topology_tests {
                 "ports": [{"port": 80, "targetPort": 8080}]
             }
         });
-        let read = endpoints_by_service(&json!({"items": [{
+        let endpoints = json!({"items": [{
             "metadata": {"name": "api", "namespace": "cogneva"},
             "subsets": []
-        }]}));
+        }]});
+        let read = endpoints_by_service(collection_items(&endpoints, "Endpoints").unwrap());
         let view = service_view(&service, Some(&read)).expect("the service");
         assert_eq!(view.ready_addresses, Some(0));
         assert_eq!(view.not_ready_addresses, Some(0));
@@ -2578,10 +2605,26 @@ mod topology_tests {
                 {"notReadyAddresses": [{"ip": "10.0.0.1"}, {"ip": "10.0.0.9"}]}
             ]
         }]});
-        let map = endpoints_by_service(&list);
+        let map = endpoints_by_service(collection_items(&list, "Endpoints").unwrap());
         assert_eq!(
             map.get(&("cogneva".to_string(), "api".to_string())),
             Some(&(1, 1))
+        );
+    }
+
+    /// 回包里没有 `items` 不是空集合。这条读面把两者折成同一个 `[]` 时，屏幕上
+    /// 写的是「集群里没有节点」，读者照着去查集群，而真正出问题的是这一读没读懂
+    /// 回包的形状——一句话把人打发去查一个没毛病的地方。
+    #[test]
+    fn a_collection_without_its_items_array_is_not_an_empty_collection() {
+        let err = collection_items(&json!({"kind": "NodeList"}), "节点")
+            .expect_err("形状不对的回包不许折成空列表");
+        assert!(err.contains("节点"), "错误要点名问的是哪一族：{err}");
+        assert!(
+            collection_items(&json!({"items": []}), "节点")
+                .expect("真正空着的集合读得通")
+                .is_empty(),
+            "空集合本身是读到的结果，不是读失败"
         );
     }
 
