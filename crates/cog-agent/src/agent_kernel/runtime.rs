@@ -6311,7 +6311,12 @@ mod tests {
             think_stall_timeout_secs: 5,
             ..Default::default()
         };
-        AgentRuntime::new(config, tx)
+        // 自己的观测面：这几条用例的计费用量是刻意编的小数（10 token），而
+        // 窗口读数按答话的型号分桶、挂在进程级那份上——写进全局的「mock」
+        // 桶之后，同进程里任何一条刚构造的 runtime 都会把窗口定成 10，第一轮
+        // 就报「窗口装不下地板」。计费与窗口在这里量的不是同一件事，各用各的。
+        let observable = crate::observable::AgentObservable::new();
+        AgentRuntime::with_observable(config, tx, &observable)
     }
 
     /// Every billed call of a run lands in one row keyed by its task — both
