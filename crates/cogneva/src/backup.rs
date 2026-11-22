@@ -75,10 +75,6 @@ const BACKUP_OFFSITE_DIR_ENV: &str = "COGNEVA_BACKUP_OFFSITE_DIR";
 const QDRANT_HTTP_URL_ENV: &str = "COGNEVA_QDRANT_HTTP_URL";
 const IMAGE_REF_ENV: &str = "COGNEVA_IMAGE_REF";
 
-/// 落库的错误文本上限。错误本身通常只有一行，这个界是为了让一条失控的长错误
-/// （整段响应体、整张表名清单）不至于把行撑成不可读的东西。
-// cap: bound — 错误本身通常只有一行；这个界让一条失控的长错误（整段响应体、整张表名清单）不至于把行撑成不可读的东西
-
 /// 一次运行开出来时记下的期限：只落进账本，不杀任何东西。
 ///
 /// 容器的死活由备份 Job 的存活探针判——每走一步更新一次进展文件，超过实测到的
