@@ -186,7 +186,9 @@ def open_round(spec: str | None, allow_open: bool = False, code_rev_override: st
         code_rev = code_rev_override
     attrs_sql = (
         f"jsonb_build_object('ledger_rev', '{rev}', 'ledger_path', '{todo_source.spec_path(source)}', "
-        f"'code_rev', '{code_rev}', 'batch', '{ids}', 'first_rev', '{first_rev}')::text"
+        # `batch` 存**数组**，不是一段含数组的字符串：同一个键两种形状，Rust 那一侧
+        # 按数组读，读到现在这 33 条会当场报「这一轮没有清单」。2026-11-22 复核发现。
+        f"'code_rev', '{code_rev}', 'batch', '{ids}'::jsonb, 'first_rev', '{first_rev}')::text"
     )
     psql(
         "insert into cogneva_event (event_id, kind, subject_kind, subject_id, unit_of_work, "

@@ -137,6 +137,22 @@ impl RoundEvents for RoundEventStore {
                 .iter()
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect(),
+            // 2026-11-22 之前带外 `round.py` 把清单写成**一段含数组的字符串**，
+            // 这一侧读到的是 `String`。那一段字节是真实发生过的开工记录，丢掉它等于
+            // 把 33 轮判成「没有清单」——所以读得懂的旧形状就地读出来，写在注释里。
+            Ok(Some(serde_json::Value::String(text))) => {
+                match serde_json::from_str::<Vec<String>>(&text) {
+                    Ok(items) => items,
+                    Err(_) => {
+                        return Err(SFError::Database(
+                            "round_opened carries a `batch` string that is not a JSON array \
+                             of ids: a round whose batch reads as empty is indistinguishable \
+                             from one that is finished"
+                                .into(),
+                        ))
+                    }
+                }
+            }
             // 老行没有这一格、或者它不是数组：读成空清单会让「这一轮要做几条」答 0，
             // 而 0 条正是「做完了」的读数。所以这里报错，不答 0。
             Ok(_) => {
