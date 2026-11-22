@@ -1,3 +1,4 @@
+//! principle: feedback_a_default_meant_to_describe_a_cell_must_not_decide_about_it
 //! Integration tests for the 5-level quota hierarchy.
 //!
 //! The manager speaks the core key-value contract, so these tests run against

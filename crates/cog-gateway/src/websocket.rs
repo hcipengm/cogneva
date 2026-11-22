@@ -672,8 +672,14 @@ pub async fn handle_socket(
     // Server-side heartbeat: send ping every websocket_timeout_secs to keep connection alive
     // and detect dead peers.  First tick is delayed so it does not race
     // with the initial "connected" event.
-    let ws_timeout =
-        std::time::Duration::from_secs(state.config.read().unwrap().websocket_timeout_secs);
+    // 0 在这里不是「不心跳」：零周期的定时器构造即 panic，所以读侧把 0 换成内置值。
+    let ws_timeout = std::time::Duration::from_secs(
+        state
+            .config
+            .read()
+            .unwrap()
+            .effective_websocket_heartbeat_secs(),
+    );
     let mut heartbeat =
         tokio::time::interval_at(tokio::time::Instant::now() + ws_timeout, ws_timeout);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -685,7 +691,7 @@ pub async fn handle_socket(
             .config
             .read()
             .unwrap()
-            .websocket_inactivity_timeout_secs,
+            .effective_websocket_inactivity_timeout_secs(),
     );
     let mut last_activity = tokio::time::Instant::now();
 

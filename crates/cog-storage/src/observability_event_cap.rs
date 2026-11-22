@@ -623,6 +623,7 @@ mod tests {
         }
     }
 
+    // proves: observability.eventLog.maxRows
     /// 目标不变的一拍仍然是一拍：求值计数往上走，来源标签从 seed 变成
     /// derived。没有这一条，「回路在算」就只剩启动时那一次。
     #[tokio::test]
@@ -657,6 +658,7 @@ mod tests {
         }
     }
 
+    // proves: observability.eventLog.readWindowSeconds
     /// 地板跟着读者实际问过的跨度走：问得更宽，下一拍就变宽并标 derived；
     /// 问得比声明窄，声明仍是生效值。
     #[tokio::test]

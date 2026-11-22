@@ -20,6 +20,18 @@ pub struct FileObjectBackend {
     base_dir: std::path::PathBuf,
 }
 
+/// Whether the filesystem said the path cannot hold the object: nothing is
+/// there, or an ancestor is a regular file. That is a determinate "no".
+/// Anything else — a symlink cycle, a directory that cannot be searched — is a
+/// store that could not be looked at, and folding it into "absent" reports an
+/// unknown as a zero.
+fn cannot_hold_object(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
 impl FileObjectBackend {
     pub fn new(base_dir: impl Into<std::path::PathBuf>) -> Self {
         Self {
@@ -153,7 +165,11 @@ impl ObjectBackend for FileObjectBackend {
 
     async fn exists(&self, key: &str) -> SFResult<bool> {
         let path = self.object_path(key)?;
-        Ok(tokio::fs::metadata(&path).await.is_ok())
+        match tokio::fs::metadata(&path).await {
+            Ok(_) => Ok(true),
+            Err(e) if cannot_hold_object(&e) => Ok(false),
+            Err(e) => Err(SFError::IO(format!("checking {}: {}", path.display(), e))),
+        }
     }
 
     async fn list(&self, prefix: Option<&str>) -> SFResult<Vec<String>> {
@@ -162,8 +178,10 @@ impl ObjectBackend for FileObjectBackend {
             Some(p) => self.object_path(p)?,
             None => self.base_dir.clone(),
         };
-        if tokio::fs::metadata(&dir).await.is_err() {
-            return Ok(keys);
+        match tokio::fs::metadata(&dir).await {
+            Ok(_) => {}
+            Err(e) if cannot_hold_object(&e) => return Ok(keys),
+            Err(e) => return Err(SFError::IO(format!("listing {}: {}", dir.display(), e))),
         }
         self.list_recursive(&dir, &self.base_dir, &mut keys).await?;
         keys.sort();
@@ -183,12 +201,12 @@ impl FileObjectBackend {
         while let Some(dir) = dirs.pop() {
             let mut entries = tokio::fs::read_dir(&dir)
                 .await
-                .map_err(|e| SFError::IO(e.to_string()))?;
+                .map_err(|e| SFError::IO(format!("reading {}: {}", dir.display(), e)))?;
 
             while let Some(entry) = entries
                 .next_entry()
                 .await
-                .map_err(|e| SFError::IO(e.to_string()))?
+                .map_err(|e| SFError::IO(format!("reading {}: {}", dir.display(), e)))?
             {
                 let path = entry.path();
                 if path.is_dir() {
@@ -202,6 +220,68 @@ impl FileObjectBackend {
         }
         Ok(())
     }
+}
+
+// ─── What a deployment that was on `local-fs` leaves behind ───
+
+/// The path a deployment that once ran `local-fs` wrote its objects to, when
+/// the active provider reads somewhere else.
+///
+/// `None` means there is nothing to look for: either the local backend is the
+/// one running (it reads these files, so none of them is orphaned), or the
+/// deployment declares no `base_path` — in that case the local backend shared
+/// `data_dir` with everything else the process writes, and a walk there would
+/// count databases, backups and workspaces as objects to move.
+///
+/// This is the D7 switch: the document's `base_path` is where the objects are
+/// until someone copies them into the bucket, and counting them at startup is
+/// what turns "the switch happened, the data did not" from a thing to
+/// rediscover into a line in the log.
+pub fn local_object_base(storage: &cog_core::ProviderConfig) -> Option<std::path::PathBuf> {
+    if storage.provider == "local-fs" {
+        return None;
+    }
+    storage
+        .options
+        .get("base_path")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)
+}
+
+/// How many objects sit under `base`, counted by walking it without loading any.
+///
+/// A missing directory is zero, not an error: it is the end state the caller is
+/// looking for — the local tree is gone. Every other IO failure is returned, so
+/// the caller can say it did not manage to look; a count of zero and a failed
+/// look must never read the same, or a full volume under an unreadable path
+/// looks migrated.
+///
+/// The entries counted are the ones [`FileObjectBackend::list`] would return:
+/// regular files, symlinks followed, hidden files included. Sockets and other
+/// special entries are not objects and are not counted.
+pub async fn objects_on_disk(base: &std::path::Path) -> std::io::Result<usize> {
+    let mut objects = 0usize;
+    let mut dirs = vec![base.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            match tokio::fs::metadata(&path).await {
+                Ok(meta) if meta.is_dir() => dirs.push(path),
+                Ok(meta) if meta.is_file() => objects += 1,
+                Ok(_) => {}
+                // The entry vanished between readdir and stat; it is not there
+                // to migrate, which is the same reading as an empty one.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(objects)
 }
 
 // ─── S3-compatible object backend ───
@@ -1197,5 +1277,103 @@ mod tests {
         writer.write(b"half").await.expect("write");
         writer.abort().await.expect("abort");
         assert!(*http.aborted.lock().unwrap(), "放弃之后没有发 DELETE");
+    }
+
+    /// The count a deployment reads at startup is the same population `list`
+    /// returns, so "nothing left behind" can never mean "the walk missed them".
+    #[tokio::test]
+    async fn objects_on_disk_counts_what_list_would_return() {
+        let (objects, dir) = file_backend("left-behind");
+        assert_eq!(objects_on_disk(&dir).await.unwrap(), 0);
+        objects.put("files/a", b"1").await.unwrap();
+        objects.put("files/deep/b", b"2").await.unwrap();
+        objects.put("c", b"3").await.unwrap();
+        assert_eq!(objects_on_disk(&dir).await.unwrap(), 3);
+        assert_eq!(objects.list(None).await.unwrap().len(), 3);
+        objects.delete("files/deep/b").await.unwrap();
+        assert_eq!(objects_on_disk(&dir).await.unwrap(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tree that is gone reads as zero; a tree that cannot be looked at reads
+    /// as an error. Folding the two together would let an unreadable volume
+    /// report itself as already migrated.
+    #[tokio::test]
+    async fn objects_on_disk_tells_zero_apart_from_could_not_look() {
+        let missing = std::env::temp_dir().join(format!(
+            "cogneva-object-keys-missing-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&missing);
+        assert_eq!(objects_on_disk(&missing).await.unwrap(), 0);
+
+        // A path that is a file, not a directory: something is there that
+        // cannot be enumerated, which is not the same fact as an empty tree.
+        let (objects, dir) = file_backend("not-a-dir");
+        objects.put("file", b"x").await.unwrap();
+        assert!(objects_on_disk(&dir.join("file")).await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store that cannot be looked at is not an empty store. `exists` used to
+    /// answer `false` and `list` used to answer `[]` for every metadata error,
+    /// so a symlink cycle read as "nothing was ever written here".
+    #[tokio::test]
+    async fn file_backend_tells_absent_apart_from_could_not_look() {
+        let (objects, dir) = file_backend("could-not-look");
+        // A self-referential symlink: every walk through it fails with ELOOP,
+        // which is not the filesystem saying the object is absent.
+        let looped = dir.join("loop");
+        std::os::unix::fs::symlink("loop", &looped).unwrap();
+
+        let err = objects
+            .exists("loop/obj")
+            .await
+            .expect_err("a store that cannot be looked at must not answer `absent`");
+        assert!(err.to_string().contains("loop/obj"), "got: {err}");
+
+        let err = objects
+            .list(Some("loop/obj"))
+            .await
+            .expect_err("a store that cannot be looked at must not answer with an empty list");
+        assert!(err.to_string().contains("loop/obj"), "got: {err}");
+
+        // A missing object is still a determinate absence, and so is one under
+        // an ancestor that is a regular file.
+        assert!(!objects.exists("never-written").await.unwrap());
+        objects.put("plain", b"x").await.unwrap();
+        assert!(!objects.exists("plain/under-a-file").await.unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only a remote provider with a declared `base_path` has an orphaned tree
+    /// to look for: `local-fs` is reading it, and without `base_path` the local
+    /// backend shared `data_dir` with everything else this process writes.
+    #[test]
+    fn local_object_base_names_a_tree_only_a_remote_provider_orphans() {
+        let provider = |name: &str, options: serde_json::Value| cog_core::ProviderConfig {
+            provider: name.to_string(),
+            enabled: true,
+            options: serde_json::from_value(options).unwrap(),
+        };
+        assert_eq!(
+            local_object_base(&provider(
+                "local-fs",
+                serde_json::json!({ "base_path": "/var/lib/cogneva-data/storage" })
+            )),
+            None
+        );
+        assert_eq!(
+            local_object_base(&provider(
+                "seaweedfs",
+                serde_json::json!({ "base_path": "/var/lib/cogneva-data/storage" })
+            )),
+            Some(std::path::PathBuf::from("/var/lib/cogneva-data/storage"))
+        );
+        assert_eq!(
+            local_object_base(&provider("seaweedfs", serde_json::json!({}))),
+            None
+        );
     }
 }

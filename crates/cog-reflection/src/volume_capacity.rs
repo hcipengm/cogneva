@@ -1932,6 +1932,7 @@ mod tests {
         assert_eq!(growth_target(100 * GIB, 120 * GIB), None);
     }
 
+    // proves: appData.storage
     #[test]
     fn a_declaration_below_the_peak_is_raised_to_the_headroom_rounded_up() {
         // 149GiB peak, 72Gi declared: 149 * 1.2 = 178.8 -> 179Gi.
@@ -1945,6 +1946,20 @@ mod tests {
         assert_eq!(growth_target(0, 10 * GIB), None);
     }
 
+    // proves: backup.storage
+    // proves: securityGateway.gitMirror.storage
+    // proves: evolution.gitRemote.storage
+    // proves: evolution.sandboxStorage
+    // proves: evolution.sourceStorage
+    // proves: evolution.dataStorage
+    // proves: sandboxExecutor.storage
+    // proves: clusterRegistry.storage
+    // proves: backends.postgres.storage
+    // proves: backends.redis.storage
+    // proves: backends.qdrant.storage
+    // proves: backends.nats.storage
+    // proves: backends.meilisearch.storage
+    // proves: backends.seaweedfs.storage
     /// The declaration is a function of one measured input: the used bytes the
     /// loop read this round. Feed it a different reading and the target moves;
     /// that is what separates a derived declaration from a pinned one.

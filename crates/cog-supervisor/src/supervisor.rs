@@ -177,37 +177,35 @@ pub struct SupervisorConfig {
 
 /// 健康巡检周期：10s。
 ///
-/// 判据（可疑 15s、死亡 60s）都在秒级，巡检必须比它们密，否则判据被巡检自己
-/// 拖粗。
-// cap: bound — 判据（可疑 15s、死亡 60s）都在秒级，巡检必须比它们密，否则判据被巡检自己拖粗
-const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
+/// 判据（可疑、死亡）都是秒级的，巡检必须比它们密，否则判据被巡检自己拖粗。
+const HEALTH_INTERVAL: Duration =
+    Duration::from_secs(cog_core::config::SUPERVISOR_HEALTH_INTERVAL_SECS);
 
 /// 配额巡检周期：60s。
 ///
 /// 配额是按分钟算的额度，一分钟读一次就够；更密只是重复读同一批计数。
-// cap: bound — 配额是按分钟算的额度，一分钟读一次就够；更密只是重复读同一批计数
-const QUOTA_INTERVAL: Duration = Duration::from_secs(60);
+const QUOTA_INTERVAL: Duration =
+    Duration::from_secs(cog_core::config::SUPERVISOR_QUOTA_INTERVAL_SECS);
 
 /// 任务再平衡周期：300s。
 ///
 /// 再平衡会挪动在跑的任务，代价远高于一次巡检；五分钟一拍让舰队形状稳定下来，
 /// 而不是跟着一次抖动来回搬。
-// cap: bound — 再平衡会挪动在跑的任务，代价远高于一次巡检；五分钟一拍让舰队形状稳定下来而不是跟着一次抖动来回搬
-const REBALANCE_INTERVAL: Duration = Duration::from_secs(300);
+const REBALANCE_INTERVAL: Duration =
+    Duration::from_secs(cog_core::config::SUPERVISOR_REBALANCE_INTERVAL_SECS);
 
 /// 事件窗口：30s。
 ///
 /// 告警去重与突发判定都看这个窗口；它要长到能盖住一次真实的故障脉冲，短到
 /// 不会把两次独立故障并成一条。
-// cap: bound — 告警去重与突发判定都看它：要长到能盖住一次真实的故障脉冲，短到不会把两次独立故障并成一条
-const EVENT_WINDOW: Duration = Duration::from_secs(30);
+const EVENT_WINDOW: Duration = Duration::from_secs(cog_core::config::SUPERVISOR_EVENT_WINDOW_SECS);
 
 /// 控制面巡检周期：30s。
 ///
 /// 控制面地址是可选的外部依赖，读它的代价在网络往返上；30s 一拍足够发现
 /// 「控制面不在了」，而不会把监控面变成对它的压力源。
-// cap: bound — 控制面地址是可选的外部依赖，读它的代价在网络往返；30s 一拍够发现「控制面不在了」，又不会把监控面变成对它的压力源
-const CONTROL_PLANE_INTERVAL: Duration = Duration::from_secs(30);
+const CONTROL_PLANE_INTERVAL: Duration =
+    Duration::from_secs(cog_core::config::SUPERVISOR_CONTROL_PLANE_INTERVAL_SECS);
 
 impl Default for SupervisorConfig {
     fn default() -> Self {
@@ -216,37 +214,55 @@ impl Default for SupervisorConfig {
             quota_interval: QUOTA_INTERVAL,
             rebalance_interval: REBALANCE_INTERVAL,
             event_window: EVENT_WINDOW,
-            broadcast_capacity: 256,
+            broadcast_capacity: cog_core::config::SUPERVISOR_BROADCAST_DEPTH,
             health_checker: HealthCheckerConfig::default(),
             task_rebalancer: TaskRebalancerConfig::default(),
             autonomous: AutonomousConfig::default(),
-            quota_threshold: 1_000,
+            quota_threshold: cog_core::config::SUPERVISOR_QUOTA_PAUSE_REMAINING_TOKENS,
             control_plane_interval: CONTROL_PLANE_INTERVAL,
             control_plane_url: None,
-            behavior_history_max: 20,
-            heartbeat_history_max: 1_000,
-            alert_history_max: 10_000,
+            // 这三处本来各写一个数，而每个数在自己的读者那里已经有一个名字。
+            // 默认值只是那个名字的第二次声明，写第二遍只会让两处慢慢走散。
+            behavior_history_max: crate::behavior_monitor::BehaviorMonitor::DEFAULT_MAX_HISTORY,
+            heartbeat_history_max: crate::registry::HEARTBEAT_HISTORY_MAX,
+            alert_history_max: crate::alert_store::ALERT_HISTORY_MAX,
         }
     }
 }
 
-impl From<cog_core::SupervisorConfig> for SupervisorConfig {
-    fn from(c: cog_core::SupervisorConfig) -> Self {
+impl SupervisorConfig {
+    /// 从交付配置取这一段。
+    ///
+    /// `heartbeat_secs` 是这次生效的心跳：健康判据的三个阈值没写时跟着它走，
+    /// 所以它必须由调用方从整份配置里读出来递进来，而不是这里假定一个拍子。
+    pub fn from_core(c: cog_core::SupervisorConfig, heartbeat_secs: u64) -> Self {
         Self {
             health_interval: Duration::from_secs(c.health_interval_secs),
             quota_interval: Duration::from_secs(c.quota_interval_secs),
             rebalance_interval: Duration::from_secs(c.rebalance_interval_secs),
             event_window: Duration::from_secs(c.event_window_secs),
             broadcast_capacity: c.broadcast_capacity,
-            health_checker: c.health_checker.into(),
+            health_checker: HealthCheckerConfig::from_core(&c.health_checker, heartbeat_secs),
             task_rebalancer: c.task_rebalancer.into(),
             autonomous: AutonomousConfig::default(),
             quota_threshold: c.quota_threshold,
             control_plane_interval: Duration::from_secs(c.control_plane_interval_secs),
             control_plane_url: c.control_plane_url,
-            behavior_history_max: c.behavior_history_max,
-            heartbeat_history_max: c.heartbeat_history_max,
-            alert_history_max: c.alert_history_max,
+            behavior_history_max: if c.behavior_history_max == 0 {
+                crate::behavior_monitor::BehaviorMonitor::DEFAULT_MAX_HISTORY
+            } else {
+                c.behavior_history_max
+            },
+            heartbeat_history_max: if c.heartbeat_history_max == 0 {
+                crate::registry::HEARTBEAT_HISTORY_MAX
+            } else {
+                c.heartbeat_history_max
+            },
+            alert_history_max: if c.alert_history_max == 0 {
+                crate::alert_store::ALERT_HISTORY_MAX
+            } else {
+                c.alert_history_max
+            },
         }
     }
 }

@@ -161,6 +161,26 @@ fn collect_rules(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
     }
 }
 
+/// The numbers a rule compares against: its `condition`, plus any numeric
+/// comparison left in the query.
+///
+/// `condition` is where a rule states its bound — the process applies it to each
+/// value the query returns, and the alert fixture folds it back into the
+/// expression before asking promtool. The promql scan stays because a bound can
+/// also be a multiple of a measured quantity (`6 * max(scan_interval_seconds)`),
+/// which no `condition` can express.
+fn rule_bounds(rule: &serde_json::Value) -> Vec<f64> {
+    let mut out: Vec<f64> = rule
+        .get("condition")
+        .and_then(|c| c.as_object())
+        .map(|c| c.values().filter_map(|v| v.as_f64()).collect())
+        .unwrap_or_default();
+    out.extend(comparison_bounds(
+        rule.get("promql").and_then(|p| p.as_str()).unwrap_or(""),
+    ));
+    out
+}
+
 /// The numbers a promql compares against: `> 14400`, `>= 1`, `== 0`.
 ///
 /// The comparison is what makes a number a bound. Taken as a bare substring, the
@@ -223,10 +243,7 @@ fn the_ci_hold_reading_carries_the_bound_its_alert_rule_states() {
         spec.series
     );
     assert!(
-        naming.iter().any(|rule| comparison_bounds(
-            rule.get("promql").and_then(|p| p.as_str()).unwrap_or("")
-        )
-        .contains(&value)),
+        naming.iter().any(|rule| rule_bounds(rule).contains(&value)),
         "the board calls {value} critical for {} but no rule naming that series \
          compares against it: {:?}. Two surfaces, one series, different bounds — \
          whichever one the operator opens decides what they believe",
@@ -236,7 +253,7 @@ fn the_ci_hold_reading_carries_the_bound_its_alert_rule_states() {
             .map(|rule| {
                 (
                     rule.get("name").and_then(|n| n.as_str()).unwrap_or(""),
-                    comparison_bounds(rule.get("promql").and_then(|p| p.as_str()).unwrap_or("")),
+                    rule_bounds(rule),
                 )
             })
             .collect::<Vec<_>>()

@@ -2015,6 +2015,8 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
+    // proves: securityGateway.gitMirror.stallSecs
+    // proves: securityGateway.gitMirror.timeoutSecs
     /// 静默判死窗是**上一次成功传输教出来的**，不是钉住的数。
     ///
     /// 同一条「静默一秒再继续」的传输：执行体只知道种子（0.4s）时它被判死；

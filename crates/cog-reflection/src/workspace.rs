@@ -1974,6 +1974,7 @@ mod tests {
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
+    // proves: evolution.workspaces.ephemeralTtlSecs
     /// 临时工作树的界是卷、每棵树、到达率三个实测的函数：到达快一倍或卷小一半，
     /// 界各减半；量不到任何一项时落回种子。
     #[test]
@@ -2045,6 +2046,7 @@ mod tests {
         assert!(!derived);
     }
 
+    // proves: evolution.workspaces.orphanBranchTtlSecs
     /// 孤儿分支用同一条律：新实例分支来得快或仓库空间小，界就短。
     #[test]
     fn the_orphan_branch_ttl_follows_the_measured_repo_and_rotations() {

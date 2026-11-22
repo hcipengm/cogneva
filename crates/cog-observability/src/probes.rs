@@ -38,16 +38,20 @@ pub struct HttpProbe {
     pub ssl_expiry_threshold_days: u32,
 }
 
+/// HTTP 的「成功」状态码：协议定义的那一个，不是本仓挑的。
+// cap: fixed — RFC 9110：200 OK
+const HTTP_STATUS_OK: u16 = 200;
+
 impl Default for HttpProbe {
     fn default() -> Self {
         Self {
             url: String::new(),
             timeout: DEFAULT_PROBE_TIMEOUT,
-            expected_status: 200,
+            expected_status: HTTP_STATUS_OK,
             follow_redirects: true,
             headers: HashMap::new(),
             check_ssl_expiry: false,
-            ssl_expiry_threshold_days: 30,
+            ssl_expiry_threshold_days: cog_core::day::DAYS_PER_MONTH as u32,
         }
     }
 }

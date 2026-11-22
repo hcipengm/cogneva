@@ -32,7 +32,7 @@ tests:
   - interval: 1m
     input_series:
       - series: 'cogneva_agent_context_limit_refusals_total{outcome="limit_named"}'
-        values: '0x5 1x40'
+        values: '0x61 1x4'
     alert_rule_test:
       - eval_time: 3m
         alertname: agent_context_limit_refused

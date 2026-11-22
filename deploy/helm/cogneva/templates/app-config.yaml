@@ -124,15 +124,15 @@ metadata:
     {{- include "cogneva.labels" . | nindent 4 }}
     app.kubernetes.io/component: evolution
 data:
-  COGNEVA_SELF_EVOLUTION_ENABLED: "true"
+  {{- /* 进化开关、自动应用/部署、沙盒模式、切换模式与变更目录这一组不在这里写：
+         交接文档 `files/cogneva.json` 的 self_evolution 段已经写着同样的值，本 Pod
+         也挂那份文档。写第二遍的后果不是「多说一句」，而是两处一起改才生效——只改
+         文档，这里的字面量会沉默地盖回去，读文档的人以为改了行为，其实没有。 */}}
   # 本 Pod 是专用变更执行器：跑进化循环 / 基线移植 / 主线部署器。主应用 Pod 置
   # false 只留控制面（admin + GitOps 拉取端），两端不抢同一实例的工作树。
   COGNEVA_SELF_EVOLUTION_EXECUTOR_ENABLED: "true"
-  COGNEVA_SELF_EVOLUTION_AUTO_APPLY: "true"
-  COGNEVA_SELF_EVOLUTION_AUTO_DEPLOY: "true"
-  COGNEVA_SELF_EVOLUTION_SANDBOX_MODE: "true"
-  COGNEVA_SELF_EVOLUTION_SWITCH_MODE: "self_exec"
-  COGNEVA_SELF_EVOLUTION_CHANGE_DIR: "/opt/cogneva/sandbox/changes"
+  # 沙盒里的构建产物与备份目录是这份 Pod 与共享文档的**差**：文档写的是部署器那
+  # 棵稳定工作树的路径，这里换到沙盒自己的树下，所以它们留在这里，不是复述。
   COGNEVA_SELF_EVOLUTION_BINARY_DIR: "/opt/cogneva/sandbox/bin"
   COGNEVA_SELF_EVOLUTION_BACKUP_DIR: "/opt/cogneva/sandbox/backups"
   COGNEVA_SELF_EVOLUTION_POLL_INTERVAL_SECS: {{ .Values.evolution.pollIntervalSecs | int | quote }}
@@ -160,7 +160,7 @@ data:
   # 走 GitOps 发布（annotated tag + evolution-release 分支推中央 bare 仓库），
   # L2 留审批台。推送只写挂载的 bare 仓库 /host-git，不持任何集群凭证。
   COGNEVA_SELF_EVOLUTION_PROMOTION_ENABLED: "true"
-  COGNEVA_GITOPS_ENABLED: "true"
+  COGNEVA_GITOPS_ENABLED: {{ .Values.gitops.enabled | quote }}
   COGNEVA_GITOPS_REPO_URL: "/host-git"
   # 沙盒只推不拉：拉取端（poll/金丝雀/回滚）跑在主部署 Pod，那里有 kubectl
   # 与 RBAC；本 Pod 起拉取端只会每轮报错。

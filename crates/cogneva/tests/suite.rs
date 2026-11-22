@@ -80,6 +80,8 @@ mod a_background_command_reports_back_test;
 mod a_cache_share_is_a_share_not_a_difference_test;
 #[path = "a_payload_field_becomes_a_column_not_a_query_test.rs"]
 mod a_payload_field_becomes_a_column_not_a_query_test;
+#[path = "a_pending_count_that_could_not_be_read_is_not_zero_test.rs"]
+mod a_pending_count_that_could_not_be_read_is_not_zero_test;
 
 #[path = "a_change_is_accepted_or_refused_before_it_lands_test.rs"]
 mod a_change_is_accepted_or_refused_before_it_lands_test;
@@ -101,6 +103,10 @@ mod a_conversation_says_where_its_sandbox_bounds_it_test;
 mod a_crate_is_a_component_not_a_bridge_test;
 #[path = "a_day_is_named_by_one_clock_test.rs"]
 mod a_day_is_named_by_one_clock_test;
+#[path = "a_default_table_names_its_numbers_test.rs"]
+mod a_default_table_names_its_numbers_test;
+#[path = "a_failed_login_that_was_not_counted_says_so_test.rs"]
+mod a_failed_login_that_was_not_counted_says_so_test;
 #[path = "a_job_inner_wait_budget_widens_the_job_deadline_test.rs"]
 mod a_job_inner_wait_budget_widens_the_job_deadline_test;
 #[path = "the_event_stream_has_one_write_path_test.rs"]
@@ -119,12 +125,20 @@ mod every_envelope_column_has_a_reader_test;
 mod a_judged_out_row_stays_owed_and_carries_its_reason_test;
 #[path = "a_label_name_is_the_same_wherever_it_is_declared_test.rs"]
 mod a_label_name_is_the_same_wherever_it_is_declared_test;
+#[path = "a_logout_that_could_not_end_the_session_does_not_report_one_test.rs"]
+mod a_logout_that_could_not_end_the_session_does_not_report_one_test;
+#[path = "a_memory_ingest_that_could_not_store_its_entries_does_not_report_them_test.rs"]
+mod a_memory_ingest_that_could_not_store_its_entries_does_not_report_them_test;
 #[path = "a_missing_field_is_refused_or_fallen_back_by_what_the_field_reads_test.rs"]
 mod a_missing_field_is_refused_or_fallen_back_by_what_the_field_reads_test;
 #[path = "a_node_capacity_probe_is_written_once_test.rs"]
 mod a_node_capacity_probe_is_written_once_test;
 #[path = "a_pg_integration_test_owns_its_schema_test.rs"]
 mod a_pg_integration_test_owns_its_schema_test;
+#[path = "a_plan_the_store_refused_is_not_reported_as_created_test.rs"]
+mod a_plan_the_store_refused_is_not_reported_as_created_test;
+#[path = "a_plugin_upload_says_the_module_will_not_run_test.rs"]
+mod a_plugin_upload_says_the_module_will_not_run_test;
 #[path = "a_pod_that_ships_its_own_logs_is_the_one_the_collector_skips_test.rs"]
 mod a_pod_that_ships_its_own_logs_is_the_one_the_collector_skips_test;
 #[path = "a_process_has_one_outbound_client_test.rs"]
@@ -135,6 +149,8 @@ mod a_process_installs_one_global_subscriber_or_none_test;
 mod a_ready_message_starts_the_row_it_names;
 #[path = "a_reconnect_picks_up_where_the_answer_was_test.rs"]
 mod a_reconnect_picks_up_where_the_answer_was_test;
+#[path = "a_record_the_chain_refused_is_not_dropped_in_silence_test.rs"]
+mod a_record_the_chain_refused_is_not_dropped_in_silence_test;
 #[path = "a_relation_reading_is_one_query_test.rs"]
 mod a_relation_reading_is_one_query_test;
 #[path = "a_reopened_conversation_keeps_the_tools_it_ran_test.rs"]
@@ -157,6 +173,8 @@ mod a_successful_write_rings_the_bell;
 mod a_timeout_wall_is_a_named_value_test;
 #[path = "a_tool_that_changes_things_asks_the_person_first_test.rs"]
 mod a_tool_that_changes_things_asks_the_person_first_test;
+#[path = "a_transition_nobody_could_read_is_not_judged_against_a_made_up_state_test.rs"]
+mod a_transition_nobody_could_read_is_not_judged_against_a_made_up_state_test;
 #[path = "a_waiting_reason_is_declared_once_test.rs"]
 mod a_waiting_reason_is_declared_once_test;
 #[path = "a_wall_answers_when_nothing_arrives_test.rs"]
@@ -167,6 +185,8 @@ mod a_word_written_out_is_the_word_read_back_test;
 mod a_worker_can_ask_to_change_the_system_test;
 #[path = "a_workload_that_runs_a_standalone_command_can_reach_the_log_backend_test.rs"]
 mod a_workload_that_runs_a_standalone_command_can_reach_the_log_backend_test;
+#[path = "a_written_default_is_named_or_derived_test.rs"]
+mod a_written_default_is_named_or_derived_test;
 #[path = "agent_consumer_test.rs"]
 mod agent_consumer_test;
 #[path = "agent_context_test.rs"]

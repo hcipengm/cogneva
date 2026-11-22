@@ -527,19 +527,46 @@ fn matches_status(
 async fn ready_ids(
     state: &Arc<GatewayState>,
     filter: Option<TaskFilter>,
-) -> Option<HashSet<String>> {
+) -> Result<Option<HashSet<String>>, ApiError> {
     match filter {
-        Some(TaskFilter::Ready) => Some(
-            state
-                .orchestrator
-                .get_ready_tasks()
-                .await
-                .into_iter()
-                .map(|task| task.id)
-                .collect(),
-        ),
-        _ => None,
+        Some(TaskFilter::Ready) => {
+            let ids = ready_ids_from(state.orchestrator.get_ready_tasks_checked().await)?;
+            Ok(Some(ids))
+        }
+        _ => Ok(None),
     }
+}
+
+/// The ids a ready read carries, with a failed read refusing instead of
+/// answering an empty queue.
+///
+/// The `ready` filter asks for the queue itself, not for a state word, so the
+/// answer is a bare set of ids and the reader has no rows to compare it
+/// against: an empty set is exactly what a quiet deployment looks like. Folding
+/// a store error into it makes a gateway that cannot read the graph report
+/// "nothing waiting" to the tab and the count above it. Absence of the answer
+/// is a 503, the same way every other unreadable read on this surface answers.
+fn ready_ids_from(reading: cog_core::SFResult<Vec<Task>>) -> Result<HashSet<String>, ApiError> {
+    let tasks = reading.map_err(|e| {
+        ApiError::service_unavailable(format!("the ready queue could not be read: {e}"))
+    })?;
+    Ok(tasks.into_iter().map(|task| task.id).collect())
+}
+
+/// The graph a read carries, with a failed read refusing instead of answering
+/// an empty graph.
+///
+/// No nodes and no edges draws exactly like a deployment that has not made a
+/// task yet: the view is blank either way, so a store failure folded here is a
+/// graph view that says "nothing exists" about a graph it never read. Absence
+/// of the answer is a 503, the same way every other unreadable read on this
+/// surface answers.
+fn graph_from_reading(
+    reading: cog_core::SFResult<(Vec<Task>, Vec<(String, String)>)>,
+) -> Result<(Vec<Task>, Vec<(String, String)>), ApiError> {
+    reading.map_err(|e| {
+        ApiError::service_unavailable(format!("the task graph could not be read: {e}"))
+    })
 }
 
 /// Whether a reader holding `claims` may see `task`.
@@ -913,15 +940,15 @@ pub async fn create_task_handler(
             && !c.workspace_ids.contains(&req.workspace_id)
         {
             if let Some(ref stream) = state.audit_stream {
-                let _ = stream
-                    .append(
-                        cog_core::AuditKind::Authz,
-                        &c.sub,
-                        &req.workspace_id,
-                        "authz.workspace_denied",
-                        serde_json::json!({ "goal_id": goal_id }),
-                    )
-                    .await;
+                crate::audit::append_or_warn(
+                    stream,
+                    cog_core::AuditKind::Authz,
+                    &c.sub,
+                    &req.workspace_id,
+                    "authz.workspace_denied",
+                    serde_json::json!({ "goal_id": goal_id }),
+                )
+                .await;
             }
             return Err(ApiError::forbidden(format!(
                 "workspace '{}' is outside your workspace scope",
@@ -1022,18 +1049,18 @@ pub async fn create_task_handler(
         let decision = hierarchy.check(&quota_ctx, estimated).await;
         if !decision.allowed {
             if let Some(ref stream) = state.audit_stream {
-                let _ = stream
-                    .append(
-                        cog_core::AuditKind::QuotaEnforcement,
-                        quota_ctx.user_id.as_deref().unwrap_or("anonymous"),
-                        &goal_id,
-                        "quota.task_rejected",
-                        serde_json::json!({
-                            "estimated_tokens": estimated,
-                            "blocked_by": decision.blocked_by.len(),
-                        }),
-                    )
-                    .await;
+                crate::audit::append_or_warn(
+                    stream,
+                    cog_core::AuditKind::QuotaEnforcement,
+                    quota_ctx.user_id.as_deref().unwrap_or("anonymous"),
+                    &goal_id,
+                    "quota.task_rejected",
+                    serde_json::json!({
+                        "estimated_tokens": estimated,
+                        "blocked_by": decision.blocked_by.len(),
+                    }),
+                )
+                .await;
             }
             return Err(ApiError::too_many_requests(format!(
                 "quota exceeded: estimated {} tokens blocked by {} scope(s)",
@@ -1183,7 +1210,7 @@ pub async fn list_tasks_handler(
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
     let filter = status_filter(&query)?;
     let page = page_limit(&query)?;
-    let ready = ready_ids(&state, filter).await;
+    let ready = ready_ids(&state, filter).await?;
     let tasks = state.orchestrator.get_all_tasks().await;
     let mut rows: Vec<Task> = tasks
         .into_iter()
@@ -1585,8 +1612,8 @@ pub async fn get_task_graph_handler(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
     let filter = status_filter(&query)?;
-    let ready = ready_ids(&state, filter).await;
-    let (tasks, edges) = state.orchestrator.get_graph().await;
+    let ready = ready_ids(&state, filter).await?;
+    let (tasks, edges) = graph_from_reading(state.orchestrator.get_graph_checked().await)?;
     let kept: Vec<Task> = tasks
         .into_iter()
         .filter(|t| {
@@ -1798,19 +1825,19 @@ pub async fn update_task_handler(
     state.orchestrator.replace_task(task.clone()).await?;
 
     if let Some(ref stream) = state.audit_stream {
-        let _ = stream
-            .append(
-                cog_core::AuditKind::Custom("project_task".into()),
-                claims.map(|c| c.sub.as_str()).unwrap_or("system"),
-                &task.id,
-                "project.task_updated",
-                serde_json::json!({
-                    "parent_task_id": task.parent_task_id,
-                    "title": crate::projects::task_title(&task),
-                    "acceptance": task.acceptance,
-                }),
-            )
-            .await;
+        crate::audit::append_or_warn(
+            stream,
+            cog_core::AuditKind::Custom("project_task".into()),
+            claims.map(|c| c.sub.as_str()).unwrap_or("system"),
+            &task.id,
+            "project.task_updated",
+            serde_json::json!({
+                "parent_task_id": task.parent_task_id,
+                "title": crate::projects::task_title(&task),
+                "acceptance": task.acceptance,
+            }),
+        )
+        .await;
     }
     // 哈希链记顺序与完整性，这张表记「这一张任务改过什么」——两份的读者不同。
     crate::project_audit::record(cog_core::AuditEntry {
@@ -1951,20 +1978,20 @@ pub async fn save_task_plan_handler(
     state.orchestrator.save_task_plan(&plan).await?;
 
     if let Some(ref stream) = state.audit_stream {
-        let _ = stream
-            .append(
-                cog_core::AuditKind::Custom("project_task".into()),
-                claims.map(|c| c.sub.as_str()).unwrap_or("system"),
-                &id,
-                "project.plan_saved",
-                serde_json::json!({
-                    "planned_start": plan.planned_start,
-                    "planned_end": plan.planned_end,
-                    "budget_tokens": plan.budget_tokens,
-                    "baseline_rev": plan.baseline_rev,
-                }),
-            )
-            .await;
+        crate::audit::append_or_warn(
+            stream,
+            cog_core::AuditKind::Custom("project_task".into()),
+            claims.map(|c| c.sub.as_str()).unwrap_or("system"),
+            &id,
+            "project.plan_saved",
+            serde_json::json!({
+                "planned_start": plan.planned_start,
+                "planned_end": plan.planned_end,
+                "budget_tokens": plan.budget_tokens,
+                "baseline_rev": plan.baseline_rev,
+            }),
+        )
+        .await;
     }
     crate::project_audit::record(cog_core::AuditEntry {
         actor: claims
@@ -2152,15 +2179,15 @@ pub async fn move_task_handler(
     broadcast_task_status(&state, &id, target, task.agent_id.clone());
 
     if let Some(ref stream) = state.audit_stream {
-        let _ = stream
-            .append(
-                cog_core::AuditKind::Custom("project_task".into()),
-                actor,
-                &id,
-                "project.card_moved",
-                serde_json::json!({ "from": task.status.as_str(), "to": target.as_str() }),
-            )
-            .await;
+        crate::audit::append_or_warn(
+            stream,
+            cog_core::AuditKind::Custom("project_task".into()),
+            actor,
+            &id,
+            "project.card_moved",
+            serde_json::json!({ "from": task.status.as_str(), "to": target.as_str() }),
+        )
+        .await;
     }
     // 「这片卡是哪一天被谁挪走的」——事故复盘问的第一个问题，按资源一秒查出来。
     crate::project_audit::record(cog_core::AuditEntry {
@@ -2234,6 +2261,7 @@ pub async fn batch_complete_handler(
 mod tests {
     use super::*;
     use crate::test_support::claims;
+    use axum::response::IntoResponse;
 
     fn task(id: &str, status: cog_core::TaskStatus, task_type: &str, age_secs: i64) -> Task {
         let mut t = Task::new(
@@ -2301,6 +2329,84 @@ mod tests {
                 "the parameter always was case-insensitive"
             );
         }
+    }
+
+    /// 就绪队列读不出来，不是「队列是空的」。
+    ///
+    /// `ready` 是唯一一个没有行可以对照的筛法：它问的就是队列本身，所以空集
+    /// 合正是安静时的答案。读失败被折进去时，一个读不动图的网关会把「没有活
+    /// 等着」印在标签页和它上方的计数上——那是本节最不能给的数。读不出来要
+    /// 拒绝，理由带着原始错误，读得出来时要交回那些 id。
+    #[test]
+    fn an_unreadable_ready_queue_is_not_an_empty_queue() {
+        let unreadable: cog_core::SFResult<Vec<Task>> = Err(cog_core::SFError::Database(
+            "connection reset while reading the graph".into(),
+        ));
+        let refusal = ready_ids_from(unreadable).expect_err("读不出来时要交回拒绝，不能交回空集合");
+        assert!(
+            refusal.message.contains("connection reset"),
+            "拒绝的理由要带原始错误，让人看得出是读失败: {}",
+            refusal.message
+        );
+        assert_eq!(
+            refusal.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "图读不出来是「这个部署现在回答不了」，不是一场 200"
+        );
+
+        let quiet = ready_ids_from(Ok(Vec::new())).expect("一条都没有是一份读得出来的答案");
+        assert!(quiet.is_empty(), "空队列原样交回，不编造任何 id");
+
+        let ids = ready_ids_from(Ok(vec![task(
+            "t-ready",
+            cog_core::TaskStatus::Pending,
+            "t",
+            0,
+        )]))
+        .expect("读得出来时要交回队列里的那些 id");
+        assert_eq!(
+            ids,
+            HashSet::from(["t-ready".to_string()]),
+            "交回的必须是队列里的 id 本身"
+        );
+    }
+
+    /// 图画不出来，不是「图上什么都没有」。
+    ///
+    /// 图读接口交回的是一对集合，零节点零边在视图上正是一张干净的空图——
+    /// 与一个刚建好的部署同形。读失败被折进去时，任务图会把「读不动」画成
+    /// 「还没有任务」。读不出来要拒绝，读得出来时节点与边原样交回。
+    #[test]
+    fn an_unreadable_graph_read_is_not_an_empty_task_graph() {
+        let unreadable: cog_core::SFResult<(Vec<Task>, Vec<(String, String)>)> = Err(
+            cog_core::SFError::Database("connection reset while reading the graph".into()),
+        );
+        let refusal =
+            graph_from_reading(unreadable).expect_err("读不出来时要交回拒绝，不能画成一张空图");
+        assert!(
+            refusal.message.contains("connection reset"),
+            "拒绝的理由要带原始错误，让人看得出是读失败: {}",
+            refusal.message
+        );
+        assert_eq!(
+            refusal.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "图读不出来是「这个部署现在回答不了」，不是一场 200"
+        );
+
+        let (nodes, edges) =
+            graph_from_reading(Ok((Vec::new(), Vec::new()))).expect("空图是一份读得出来的答案");
+        assert!(
+            nodes.is_empty() && edges.is_empty(),
+            "空图原样交回，不编造任何节点或边"
+        );
+
+        let row = task("t-node", cog_core::TaskStatus::Scheduled, "t", 0);
+        let edge = ("t-upstream".to_string(), "t-node".to_string());
+        let (nodes, edges) =
+            graph_from_reading(Ok((vec![row], vec![edge.clone()]))).expect("读得出来时原样交回");
+        assert_eq!(nodes.len(), 1, "节点是读回来的那一行");
+        assert_eq!(edges, vec![edge], "边是读回来的那一条");
     }
 
     /// 状态词必须与读面印出来的那个词逐字一致：`TaskFilter` 用 `as_str` 印行，

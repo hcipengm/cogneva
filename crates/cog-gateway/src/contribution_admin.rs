@@ -981,9 +981,22 @@ pub(crate) async fn connect_contribution(
 pub async fn contribution_status_handler(
     State(state): State<Arc<crate::GatewayState>>,
 ) -> Response {
-    let pending_count = match &state.contribution_control {
-        Some(control) => control.pending().await.map(|v| v.len()).unwrap_or(0),
-        None => 0,
+    // 三态，与下面 `gitee_oauth_available` 同一个理由：`null` 是「这一刻问不到
+    // 待回流队列」，不是「一条都没有」。折成 0，这一屏就在控制面读失败的那一拍
+    // 告诉所有者「没有要你点头的变更」——而恰恰是那一拍，待批的变更最不该被当成
+    // 不存在。没有接控制面（集成未启用）也是同一句话：这一格没有读数。
+    let pending_count: Option<usize> = match &state.contribution_control {
+        Some(control) => match control.pending().await {
+            Ok(changes) => Some(changes.len()),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "待回流队列读不出来；这一格报「读不到」而不是 0——读失败与空队列不是同一件事"
+                );
+                None
+            }
+        },
+        None => None,
     };
     // 这一屏的每一个布尔位都来自那两片 Secret，而 Secret 只该由网关读。主应用
     // 保留的是它自己才知道的那几格（待回流条数、本进程的授权码能力），其余由

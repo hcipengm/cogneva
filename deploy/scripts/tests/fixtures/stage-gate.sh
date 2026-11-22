@@ -30,5 +30,13 @@ stage_gate() { # stage_gate <repo root> <fixture root>
     # Python ones go by glob, so a new one is staged without anyone remembering
     # this file.
     cp "${repo}/deploy/scripts/check-format.sh" "${dest}/deploy/scripts/check-format.sh"
+    # 2026-11-20：门的 CI 回放跑 `check-commit-attribution-ci.sh`（推的范围的提交信息
+    # 不带 AI 署名），它再按路径调 `check-commit-attribution.sh`。夹具里缺任一份，那一格
+    # 都红成 `No such file or directory`——又一次「staging 事故穿着判词的衣服」。
+    cp "${repo}/deploy/scripts/check-commit-attribution-ci.sh" "${dest}/deploy/scripts/check-commit-attribution-ci.sh"
+    cp "${repo}/deploy/scripts/check-commit-attribution.sh" "${dest}/deploy/scripts/check-commit-attribution.sh"
+    # 2026-11-20：私有标识那一面（判私有仓的名字不许出现在这棵树里）也是按路径调的同级
+    # 脚本；夹具里缺它，那一格红成 `No such file or directory`。
+    cp "${repo}/deploy/scripts/check-private-names.sh" "${dest}/deploy/scripts/check-private-names.sh"
     cp "${repo}/deploy/scripts/"*.py "${dest}/deploy/scripts/" 2>/dev/null || true
 }

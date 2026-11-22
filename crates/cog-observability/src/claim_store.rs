@@ -564,6 +564,7 @@ mod tests {
 
     const NODE: &str = "node-a";
 
+    // proves: claimStore.scanIntervalSecs
     #[test]
     fn the_wait_after_a_walk_follows_what_the_walk_cost() {
         // The loop's own arithmetic, driven with two walks of different cost:

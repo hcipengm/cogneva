@@ -613,7 +613,14 @@ export interface ContributionStatus {
   git_identity: GitIdentityStatus;
   github_app_configured: boolean;
   policy: string;
-  pending_count: number;
+  /**
+   * 待回流的变更条数。
+   *
+   * `null` 是第三种答案：这一刻问不到队列（控制面没接、或读失败）。它与 `0`
+   * （问到了，队列空着）不是一件事——把两者合成一个数，设置屏会在控制面打嗝的
+   * 那一拍告诉所有者「没有等你点头的变更」。
+   */
+  pending_count: number | null;
   /** GitHub 设备码通道可用（有 OAuth App client_id） */
   device_flow_available: boolean;
   /**
@@ -1181,11 +1188,48 @@ export interface AgentSummary {
   platform?: string | null;
   /** 同一台设备的同一个客户端，同样来自握手。 */
   device_id?: string | null;
+  /**
+   * 这一行背后站着的那个人。`null` 是读数，不是缺字段：它说的正是「这个座位
+   * 背后还没有人」——任务一多，座位能长到几百行，而人没变。
+   */
+  person_id?: string | null;
+}
+
+/** 名册按人收好后的一行：一个人一行，当前戴着的帽子挂在 `agent_ids` 里。 */
+export interface PersonSummary {
+  person_id: string | null;
+  /** 人那一行是「工号 姓名」；没派人的座位那组是「座位，尚未分配给人」。 */
+  display_name: string;
+  number?: string | null;
+  live: boolean;
+  retired: boolean;
+  roles: string[];
+  /** 这个人的帽子，也就是可寻址的 agent id。别丢——丢了这个人在对话页就点不到。 */
+  agent_ids: string[];
+  caps: number;
+}
+
+export interface AgentRosterPage {
+  agents: AgentSummary[];
+  /**
+   * 按人收好的名册。空 `person_id` 的那一行收着全部没派给人的座位，一次只出现
+   * 一行；名册读不到时服务端不编这一份，界面要能说出「没读到」。
+   */
+  people?: PersonSummary[] | null;
+  /**
+   * 读数：还有多少座位背后没有人。`null` 是「名册没读到」，`0` 是「量过了，
+   * 一个都没有」——两种答案不能画成同一个数。
+   */
+  seats_without_a_person?: number | null;
+}
+
+export async function getAgentRoster(): Promise<AgentRosterPage> {
+  const page = await api.get<AgentRosterPage>('/api/v1/agents');
+  return { ...page, agents: page.agents ?? [] };
 }
 
 export async function listAgents(): Promise<AgentSummary[]> {
-  const page = await api.get<{ agents: AgentSummary[] }>('/api/v1/agents');
-  return page.agents ?? [];
+  return (await getAgentRoster()).agents;
 }
 
 /**
@@ -2316,7 +2360,12 @@ export async function getSourceLine(): Promise<SourceLineReport> {
 export interface EvalDatasetInfo {
   name: string;
   path: string;
-  case_count: number;
+  /**
+   * 这个数据集里有几个用例。`null` 是**没数**，不是 0：只有 jsonl 有一行一个
+   * 用例的约定，yaml 没有，读不出来的文件也没有。写 0 会让「不数」与「空数据集」
+   * 在屏上同形。
+   */
+  case_count: number | null;
   tags: string[];
 }
 
@@ -3402,6 +3451,12 @@ export interface TopologyNode {
   memory_requested_bytes: number;
   cpu_used_millicores: number | null;
   memory_used_bytes: number | null;
+  /**
+   * 上面那个用量和里漏了几个 Pod：这一拍还没采到样的那些（刚起来的容器要等
+   * 下一轮）。`null` ＝ 这一面没有用量来源，`0` ＝ 每个 Pod 都量到了。
+   * 不为 0 时那个和是一个下界，不是这台机器的用量。
+   */
+  pods_without_usage: number | null;
   /** Ready / MemoryPressure / DiskPressure …：压力条件为 true 才是坏消息。 */
   conditions: TopologyCondition[];
   /** 这台节点上进程采集器最后一次报到的时刻；`null` ＝ 这台节点上没有采集器。 */
@@ -3432,8 +3487,13 @@ export interface TopologyNode {
 export interface TopologyUnclaimedContainer {
   /** 容器实例 id 的前 12 个字符——够认出「同一台机器上刚才那两个」。 */
   id: string;
-  /** 里面跑着几个进程。 */
+  /** 这一面的表里读到了几条进程。 */
   processes: number;
+  /**
+   * 它本来跑着几个。表按上限收条数，所以 `processes` 可能只是前几十条；
+   * `null` ＝ 报上来的那一方没说（旧镜像），不是「就这么多」。
+   */
+  processes_total: number | null;
   /** 最占内存的那几个进程名，去重、最多 4 个。cgroup 只给 id，名字只能从进程来。 */
   commands: string[];
 }
@@ -4090,8 +4150,13 @@ export interface BackupPackage {
 }
 
 export interface BackupPackages {
-  /** 现在有没有一趟导出在跑。页面靠它决定要不要继续轮询。 */
-  running: boolean;
+  /**
+   * 现在有没有一趟导出在跑。页面靠它决定要不要继续轮询。
+   *
+   * `null` = 问不到集群。那不是「没有在跑」：把两者折叠在一起，一趟真在跑的
+   * 导出会在 apiserver 打嗝的那一拍从页面上消失。
+   */
+  running: boolean | null;
   packages: BackupPackage[];
 }
 

@@ -32,9 +32,6 @@ statrs = "0.17"
 # Report generation
 comfy-table = "7"
 
-# Text similarity for semantic metrics
-strsim = "0.11"
-
 # LLM-as-a-Judge structured output
 schemars = { workspace = true }
 async-trait = "0.1"

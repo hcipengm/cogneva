@@ -15,21 +15,29 @@
 //! it. A comment block that is not attached to a leaf is red (a renamed key
 //! leaves its judgement behind), and a leaf with no block is red (a new dial
 //! nobody has judged). This test holds the blocks to the chart and to the code
-//! in four directions:
+//! in five directions:
 //! - every numeric leaf has exactly one block, and every block sits on a numeric
 //!   leaf. The set is read from `values.yaml` on every run, so a value that is
 //!   added without a block is a hole this test names rather than an absence
 //!   nobody notices -- "nobody has looked at this yet" has to be a missing block,
 //!   not a silently unjudged number.
-//! - every block says something. For `fixed` that is the reason the value is not
-//!   derived; for `derived` it is what the value reads.
-//! - a `derived` block names the reading its number lands on and a test that
-//!   shows the number following its input. A comment claiming a value tracks the
-//!   world is not evidence that it does; the test is the part of the claim a
-//!   machine can refuse.
+//! - **the block carries no class word.** `# tunable:` is the whole first line.
+//!   The class is computed: a block with a `proof:` line is a value somebody is
+//!   measuring; a block without one is a decision the deployment owns. A word
+//!   typed on the line is reported, because a word is the entry that used to let
+//!   a row shed its obligations by being edited -- `derived` becoming `fixed`
+//!   deleted the reading it had to name and the test it had to point at, and the
+//!   two rows read identically afterwards.
+//! - every block says something: the reading a measured value follows, or the
+//!   agreement a chosen value is.
+//! - a block with a proof names the reading its number lands on, a test that
+//!   shows the number following its input, and that test says `// proves:
+//!   <key>` back. A comment claiming a value tracks the world is not evidence
+//!   that it does; the test is the part of the claim a machine can refuse, and
+//!   two ends naming each other is what keeps a rename from leaving one behind.
 //! - a block that lands on a reading uses a word the reading can carry, and the
 //!   file it names publishes that metric and that label. A value registered as
-//!   derived while its publisher never says so reads as a number that tracks the
+//!   measured while its publisher never says so reads as a number that tracks the
 //!   world and is not one -- the failure this is here to catch, since a cap that
 //!   stopped tracking its volume is a steady number either way.
 //!
@@ -42,7 +50,7 @@
 //!
 //! A key with no block is the same hole as a key with no loop. A numeric leaf of
 //! `values.yaml` with no block is a number nobody has said a measurement should
-//! move; a `derived` block whose proof is missing, or names something that is
+//! move; a block with a proof whose test is missing, or names something that is
 //! not a test, is a number that claims a loop and has none. Both read as the same
 //! number on the page, and both are refused by the same test below -- a ledger
 //! that answered them in two voices would let a reader believe the half that
@@ -53,10 +61,11 @@
 //! through the chart, and `rust_capacity_constants_registry_test.rs` is where
 //! that is judged. What "has a loop" means is a fact about one row rather than a
 //! slogan: `evolution.buildGate.maxConcurrent` is the dial whose block carries
-//! both ends in place -- `derived`, published as `BUILD_GATE_CEILING`
-//! under the label `dimension`, proven by `the_ceiling_is_the_tightest_dimension`
-//! in `crates/cog-reflection/src/build_gate/mod.rs`, where the gate takes the
-//! tightest of the host's dimensions and names the one that decided it.
+//! both ends in place -- a `proof:`, published as `BUILD_GATE_CEILING` under the
+//! label `dimension`, proven by `the_ceiling_is_the_tightest_dimension` in
+//! `crates/cog-reflection/src/build_gate/mod.rs`, whose `// proves:` lines name
+//! this leaf and its siblings, and where the gate takes the tightest of the
+//! host's dimensions and names the one that decided it.
 
 use crate::common;
 
@@ -71,7 +80,6 @@ use cog_core::build_cache_readings::{
     BuildCacheReadings, CapSource, BUILD_TARGET_CAP_METRIC, SOURCE_LABEL,
 };
 use cog_core::Observable;
-use serde::Deserialize;
 
 /// The chart whose numeric leaves each carry their own judgement.
 const VALUES: &str = "deploy/helm/cogneva/values.yaml";
@@ -81,8 +89,7 @@ const VALUES: &str = "deploy/helm/cogneva/values.yaml";
 const CAP_METRIC: &str = "BUILD_TARGET_CAP_METRIC";
 
 /// Where a value comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Source {
     /// A measurement loop sets it, so it moves when the input it reads moves.
     Derived,
@@ -132,6 +139,31 @@ struct Row {
     published: Option<Published>,
     /// For a derived row: the test that shows the value following its input.
     proof: Option<Proof>,
+    /// For a number taken from one measurement rather than a loop: which
+    /// reading it came from, when it was taken, and what it read.
+    measured_once: Option<MeasuredOnce>,
+}
+
+/// A number whose basis is a reading somebody took once.
+///
+/// This is the shape between the other two: a `proof:` row is one a loop
+/// re-takes, and a row with neither line is a decision that never rested on a
+/// reading at all. A one-off measurement is neither -- the value really did
+/// come off the machine, so calling it a decision hides that, and there is no
+/// loop, so calling it derived would promise a re-take nobody runs. Naming the
+/// series, the day and the number read keeps the debt in a form a reader can
+/// check: the series must exist on the recorded producer surface, so the day
+/// the exporter stops emitting it this line goes red instead of reading as a
+/// measurement forever.
+#[derive(Debug)]
+struct MeasuredOnce {
+    /// The series the measurement was read off.
+    series: String,
+    /// `YYYY-MM-DD`: when it was taken. A bound with no date reads as a fact
+    /// that was always true.
+    date: String,
+    /// What the reading said, which is the observation the number rests on.
+    found: String,
 }
 
 #[derive(Debug)]
@@ -183,10 +215,23 @@ fn accounts() -> Accounts {
             continue;
         };
         let start = index;
-        let mut source = None;
         let mut why = String::new();
         let mut published = None;
         let mut proof = None;
+        let mut measured_once = None;
+        // The class is not a word on this line: it is whether the block carries
+        // the evidence. A word typed here is a judgement nobody reads, which is
+        // the shape this registry is here to take away -- so it is reported
+        // instead of honoured.
+        let word = rest.trim().to_string();
+        if !word.is_empty() {
+            accounts.stray.push(format!(
+                "{}:{}: `# tunable: {word}` 带着一个分类词。这一行的分类由证据算出——\
+                 块里有 `proof:` 就是 `derived`，没有就是部署自己的决定；词本身不再是入口",
+                VALUES,
+                start + 1
+            ));
+        }
         // The block is contiguous; anything else ends it.
         while index < lines.len() {
             let line = lines[index].trim_start();
@@ -195,8 +240,7 @@ fn accounts() -> Accounts {
             };
             let body = body.trim();
             if index == start {
-                let word = rest.trim();
-                source = Some(word.to_string());
+                // 第一行只有 `tunable:` 本身，词已在上面判过。
             } else if let Some(text) = body.strip_prefix("why:") {
                 if !why.is_empty() {
                     why.push(' ');
@@ -206,6 +250,8 @@ fn accounts() -> Accounts {
                 published = Some(published_from(field_map(text, start + 1)));
             } else if let Some(text) = body.strip_prefix("proof:") {
                 proof = Some(proof_from(field_map(text, start + 1)));
+            } else if let Some(text) = body.strip_prefix("measured-once:") {
+                measured_once = Some(measured_once_from(field_map(text, start + 1)));
             }
             index += 1;
         }
@@ -218,20 +264,13 @@ fn accounts() -> Accounts {
             ));
             continue;
         };
-        let Some(word) = source else { continue };
-        let source = match word.as_str() {
-            "derived" => Source::Derived,
-            "fixed" => Source::Fixed,
-            other => {
-                accounts.stray.push(format!(
-                    "{}:{}: `{other}` is not a word this account carries -- a value \
-                     either has a loop that measures it (`derived`) or is an \
-                     agreement no measurement should move (`fixed`)",
-                    VALUES,
-                    start + 1
-                ));
-                continue;
-            }
+        // 分类由证据算出：块里点了证明的那一行，就是「有人在量它」；没有这一行，
+        // 它就是部署自己的一个决定。两者都不是的（没人量、也没理由）由
+        // `every_row_says_why_it_is_not_derived` 判。
+        let source = if proof.is_some() {
+            Source::Derived
+        } else {
+            Source::Fixed
         };
         accounts.rows.push(Row {
             key: key.clone(),
@@ -239,6 +278,7 @@ fn accounts() -> Accounts {
             why,
             published,
             proof,
+            measured_once,
         });
     }
     accounts
@@ -288,6 +328,55 @@ fn proof_from(mut fields: BTreeMap<String, String>) -> Proof {
         beat: take(&mut fields, "beat"),
         evidence: take(&mut fields, "evidence"),
     }
+}
+
+fn measured_once_from(mut fields: BTreeMap<String, String>) -> MeasuredOnce {
+    let take = |fields: &mut BTreeMap<String, String>, name: &str| {
+        fields.remove(name).unwrap_or_else(|| {
+            panic!(
+                "{VALUES}: a `# measured-once:` line is missing `{name}=`; a measurement \
+                 that names neither its reading nor its day cannot be checked later"
+            )
+        })
+    };
+    MeasuredOnce {
+        series: take(&mut fields, "series"),
+        date: take(&mut fields, "date"),
+        found: take(&mut fields, "found"),
+    }
+}
+
+/// The series the postgres exporter was measured emitting, one per line under
+/// `series:` in its inventory. A trailing `*` is a prefix, as the inventory
+/// uses it (`pg_settings_*`).
+fn exporter_series() -> Vec<String> {
+    let path = repo_root().join("deploy/images/postgres-exporter.series.yaml");
+    let text = read(&path);
+    let mut series = Vec::new();
+    let mut in_list = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed == "series:" {
+            in_list = true;
+            continue;
+        }
+        if let Some(item) = trimmed.strip_prefix("- ") {
+            if in_list {
+                series.push(item.trim().trim_matches('"').to_string());
+            }
+            continue;
+        }
+        in_list = false;
+    }
+    assert!(
+        !series.is_empty(),
+        "{} names no series: the one-off measurements below cannot be checked",
+        path.display()
+    );
+    series
 }
 
 /// The dotted path of every numeric leaf, keyed by the line it is written on.
@@ -770,6 +859,92 @@ fn a_published_row_names_a_file_that_publishes_its_metric_and_label() {
     );
 }
 
+/// The leaves a proof test says it proves: `// proves: <values path>` lines.
+///
+/// The declaration lives in the test rather than only in `values.yaml` because
+/// the two ends then have to agree in both directions: a test that stops
+/// proving a leaf leaves the row claiming a loop nobody runs, and a leaf that
+/// claims a loop has to point at a test that says so when you open the file.
+fn proves_declarations(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let rest = line.strip_prefix("// proves:")?;
+            Some(rest.trim().to_string())
+        })
+        .filter(|key| !key.is_empty())
+        .collect()
+}
+
+/// A `derived` row and the test it names have to name each other.
+///
+/// `values.yaml` says "a loop sets this, here is the test"; the test says "I
+/// prove this leaf". One direction alone is the shape that rots quietly: rename
+/// the leaf and the test keeps proving the old string, delete the test and the
+/// row keeps its proof line until somebody happens to read it. Both directions
+/// are read here, and the population is whatever the chart ships.
+#[test]
+fn a_derived_row_and_its_proof_test_name_each_other() {
+    let accounts = accounts();
+    let mut silent = Vec::new();
+    let mut orphans = Vec::new();
+    let mut declared_total = 0;
+    for row in &accounts.rows {
+        if row.source != Source::Derived {
+            continue;
+        }
+        let Some(proof) = &row.proof else {
+            continue;
+        };
+        let text = read(&repo_root().join(&proof.file));
+        let declared = proves_declarations(&text);
+        declared_total += declared.len();
+        if !declared.iter().any(|key| key == &row.key) {
+            silent.push(format!(
+                "`{}` names `{}::{}` as its proof, and that file has no \
+                 `// proves: {}` line",
+                row.key, proof.file, proof.test, row.key
+            ));
+        }
+    }
+    let derived: BTreeSet<&str> = accounts
+        .rows
+        .iter()
+        .filter(|row| row.source == Source::Derived)
+        .map(|row| row.key.as_str())
+        .collect();
+    let mut sources = Vec::new();
+    walk_all(&repo_root().join("crates"), &mut sources);
+    for path in &sources {
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        for key in proves_declarations(&read(path)) {
+            if !derived.contains(key.as_str()) {
+                orphans.push(format!(
+                    "{}: `// proves: {}` 指向的叶子没有一条 `derived` 行",
+                    path.display(),
+                    key
+                ));
+            }
+        }
+    }
+    assert!(
+        declared_total > 0,
+        "一份 `// proves:` 都没读到：读法坏了，下面两条都会在空集上通过"
+    );
+    assert!(
+        silent.is_empty(),
+        "these rows claim a loop and the test they name does not say it proves \
+         them: {silent:#?}"
+    );
+    assert!(
+        orphans.is_empty(),
+        "these proof declarations point at a leaf that is not registered as \
+         derived, so the test proves something the chart does not ship: {orphans:#?}"
+    );
+}
+
 /// The value at a dotted path, if the chart has one.
 fn leaf_at<'a>(value: &'a serde_yaml::Value, key: &str) -> Option<&'a serde_yaml::Value> {
     let mut current = value;
@@ -836,36 +1011,124 @@ fn a_cap_rows_owner_does_not_publish_it_as_derived_unless_it_says_so() {
     );
 }
 
+/// 分类不再是一个词：`# tunable:` 后面带任何词都是红。
+///
+/// 这个词是这套登记面最薄的一处：把一格从 `derived` 写成 `fixed`，就卸掉了
+/// 「点名读数、点名证明测试」两条义务，而两行字长得一样。现在块自己不分类——
+/// 有 `proof:` 就是有人在量它，没有就是部署自己的决定——所以卸义务没有入口：
+/// 想让它不算被量，得把证据删掉，而删掉证据的那一格随后要由「值等于代码默认值」
+/// 与「模板里没有读者」两条判据接着问。
 #[test]
-fn the_registrys_words_are_the_labels_words() {
-    assert_eq!(
-        Source::Derived.as_label(),
-        Some(CapSource::Derived.as_str())
+fn the_tunable_line_carries_no_word_of_its_own() {
+    let text = read(&repo_root().join(VALUES));
+    let mut blocks = 0;
+    let mut offenders = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let Some(rest) = line.trim_start().strip_prefix("# tunable:") else {
+            continue;
+        };
+        blocks += 1;
+        if !rest.trim().is_empty() {
+            offenders.push(format!(
+                "{VALUES}:{}: `# tunable: {}`",
+                index + 1,
+                rest.trim()
+            ));
+        }
+    }
+    assert!(
+        blocks > 0,
+        "{VALUES} 里一个 `# tunable:` 块都没读到：下面那条判据会在空集上通过"
     );
-    // `fixed` is not a word a reading can carry: it lands nowhere, which is why
-    // a row that names a reading has to be `derived`.
-    assert_eq!(Source::Fixed.as_label(), None);
+    assert!(
+        offenders.is_empty(),
+        "这些块的 `# tunable:` 后面还带着分类词：\n{}\n\
+         分类由证据算出（有 `proof:` 行就是有人在量它），词本身不再是入口——\
+         写一个词既不能把一格变成闭环，也不能把它从闭环里放出来",
+        offenders.join("\n")
+    );
 }
 
-/// The third word is gone, and its absence is a rule rather than a count.
+/// 一次实测支撑的数，要点名读的是哪条序列、哪天量的、量到多少。
 ///
-/// `override` used to mean "the deployment pinned this number". Every such row
-/// was either turned into a loop that measures the value or deleted, so the
-/// word now has no meaning a row could carry: a number nothing measures is
-/// either an agreement (`fixed`) or not a dial. Re-adding the word re-opens the
-/// end state one row at a time, and the row itself looks entirely ordinary on
-/// the page -- so the vocabulary refuses it, and this test names the refusal
-/// instead of letting a block fall through the scanner as an unread word.
-/// 界形的数字，不许标成 `fixed`。
+/// 这是三种来源里最容易被读成另一种的一种：块里没有 `proof:`，所以它落在「部署
+/// 自己的决定」那一格；可它的数字**确实是从机器上量下来的**。只写散文（「2026-11-17
+/// 实测到 100」）时，这句话在读数面上与「随手拍的 200」一模一样，而且它永远读作
+/// 「量过」——哪怕那条读数早已没人发。所以它要有自己的一行：序列、日期、读数。
 ///
-/// 词表里只有两个词：`derived`（一条实测让它动）与 `fixed`（一项约定，不是旋钮）。
+/// 三条判据：
+/// 1. 序列必须在 `deploy/images/postgres-exporter.series.yaml` 的清单里。那份清单是
+///    从镜像身上量出来的；镜像某天不再发它时，这条线先红，而不是那个数继续读作实测。
+/// 2. 日期是 `YYYY-MM-DD`。没有日期的实测读作一直成立的事实。
+/// 3. 同一块里不许同时有 `proof:`：有闭环就由闭环重取，一次性的读数再挂着，
+///    读者分不清哪个在管这一格。
+#[test]
+fn a_one_off_measurement_names_its_reading_its_day_and_what_it_found() {
+    let series = exporter_series();
+    let emitted = |name: &str| {
+        series.iter().any(|listed| match listed.strip_suffix('*') {
+            Some(prefix) => name.starts_with(prefix),
+            None => listed == name,
+        })
+    };
+    let mut wrong = Vec::new();
+    for row in &accounts().rows {
+        let Some(once) = &row.measured_once else {
+            continue;
+        };
+        if row.proof.is_some() {
+            wrong.push(format!(
+                "`{}` 同时带着 `proof:` 与 `measured-once:`：有闭环就由闭环重取，\
+                 一次性的读数与它只有一个能管这一格",
+                row.key
+            ));
+        }
+        if !emitted(&once.series) {
+            wrong.push(format!(
+                "`{}` 说它的数来自 `{}`，而 postgres-exporter 的清单里没有这条序列\
+                 ——那条读数要么改了名，要么已经没人发它",
+                row.key, once.series
+            ));
+        }
+        let day = once.date.as_bytes();
+        let dated = day.len() == 10
+            && day[4] == b'-'
+            && day[7] == b'-'
+            && day
+                .iter()
+                .enumerate()
+                .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit());
+        if !dated {
+            wrong.push(format!(
+                "`{}` 的实测日期 `{}` 不是 `YYYY-MM-DD`",
+                row.key, once.date
+            ));
+        }
+        if once.found.trim().is_empty() {
+            wrong.push(format!("`{}` 的实测没有写下量到的数", row.key));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "这些一次性实测说不清自己的来处：\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// 界形的数字，不许是一格没人量着的值。
+///
 /// 一个**界**——副本数、重试上限、历史保留条数、失败阈值——既不是「实测让它动」，
 /// 也不是「约定不动的协议常数」；它是一条把未发生的事拦在外面的规则。这种数只有
-/// 两种合法归宿：被一条读数导出（`derived`，带「换输入值就变」的证明），或者
+/// 两种合法归宿：被一条读数导出（块里带 `proof:` 行，证明「换输入值就变」），或者
 /// **不存在**（那个界被删掉，改用进度检测与事实反馈）。
 ///
-/// 下面这份名单是 2026-11-16 的读数：18 行界形数字仍标着 `fixed`。名单**只减不增**
-/// ——新提出一条界形数字而标成 `fixed` 就是红，而那正是这条门要拦的那一笔。
+/// `override` 曾经是第三条路：部署把这个数钉住。它已经没了——钉一个数不是一种
+/// 来源；块里今天也不写词，分类由证据算出，所以一份没有 `proof:` 的块与一份带着
+/// 词的块在页面上一样普通。这条判据点名的因此不是「标着某个词的那一条」，而是
+/// 「没有证明的界形数字」。
+///
+/// 下面这份名单是 2026-11-16 的读数：18 行界形数字块里没有证明。名单**只减不增**
+/// ——新提出一条界形数字而不给证明就是红，而那正是这条门要拦的那一笔。
 const BOUND_SHAPED_FIXED_AT_CENSUS: &[&str] = &[
     "backends.meilisearch.replicas",
     "backends.postgres.replicas",
@@ -928,8 +1191,8 @@ fn a_bound_shaped_number_is_never_fixed() {
         .collect();
     assert!(
         new.is_empty(),
-        "这几条是界形的数字（副本数 / 重试上限 / 失败阈值 / 历史条数），却标着 `fixed`：\n{}\n\
-         界不是约定：它要么由一条读数导出（`derived`，带「换输入值就变」的证明），\
+        "这几条是界形的数字（副本数 / 重试上限 / 失败阈值 / 历史条数），块里却没有证明：\n{}\n\
+         界不是约定：它要么由一条读数导出（`proof:` 行，带「换输入值就变」的证明），\
          要么被删掉，改用进度检测与事实反馈。",
         new.iter()
             .map(|key| format!("  {key}"))
@@ -942,49 +1205,13 @@ fn a_bound_shaped_number_is_never_fixed() {
         .collect();
     assert!(
         stale.is_empty(),
-        "名单里这几条已经不再是界形 `fixed` 了（改成 derived 或删掉了），把名单里的行也删掉：\
+        "名单里这几条已经不再是「没有证明的界形数字」了（补了证明或删掉了），把名单里的行也删掉：\
          \n{}",
         stale
             .iter()
             .map(|key| format!("  {key}"))
             .collect::<Vec<_>>()
             .join("\n")
-    );
-}
-
-#[test]
-fn the_registry_vocabulary_has_no_override() {
-    assert_eq!(
-        serde_yaml::from_str::<Source>("derived").expect("`derived` is a source"),
-        Source::Derived
-    );
-    assert_eq!(
-        serde_yaml::from_str::<Source>("fixed").expect("`fixed` is a source"),
-        Source::Fixed
-    );
-    assert!(
-        serde_yaml::from_str::<Source>("override").is_err(),
-        "`override` is a source again: the end state has two words, `derived` \
-         (a measurement sets it) and `fixed` (an agreement, not a dial)"
-    );
-
-    let text = read(&repo_root().join(VALUES));
-    let offenders: Vec<String> = text
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| {
-            line.trim_start()
-                .strip_prefix("# tunable:")
-                .is_some_and(|rest| rest.trim() == "override")
-        })
-        .map(|(index, _)| format!("{VALUES}:{}", index + 1))
-        .collect();
-    assert!(
-        offenders.is_empty(),
-        "these rows are registered as `override`, a word this registry no longer \
-         carries -- a value either has a loop that measures it (`derived`) or is \
-         an agreement no measurement should move (`fixed`); a number nobody \
-         measures is not a third kind, it is an unfinished row: {offenders:#?}"
     );
 }
 

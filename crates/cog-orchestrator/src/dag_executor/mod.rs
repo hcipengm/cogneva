@@ -107,16 +107,63 @@ pub struct DagExecutorConfig {
 
 impl Default for DagExecutorConfig {
     fn default() -> Self {
+        // 每个数都在 `cog_core::DagExecutorConfig` 里有一份声明（生产装配就走那
+        // 一份）。这里再写一遍就是同一件事的第二个说法，改一处忘一处的那天，
+        // 兜底构造与部署读到的会是两个不同的执行器。
+        let core = cog_core::DagExecutorConfig::default();
         Self {
-            redis_url: String::new(),
-            workspace_id: String::new(),
-            consumer_group: String::new(),
-            max_retries: 3,
-            result_claim_idle_secs: 600,
-            result_claim_interval_secs: 60,
-            result_claim_batch: 16,
-            ready_task_poll_interval_secs: 0,
+            redis_url: core.redis_url,
+            workspace_id: core.workspace_id,
+            consumer_group: core.consumer_group,
+            max_retries: core.max_retries,
+            result_claim_idle_secs: core.result_claim_idle_secs,
+            result_claim_interval_secs: core.result_claim_interval_secs,
+            result_claim_batch: core.result_claim_batch,
+            ready_task_poll_interval_secs: core.ready_task_poll_interval_secs,
         }
+    }
+}
+
+/// 执行器用的重试矩阵：部署声明的节点重试次数就是 DAG 节点那一行的次数。
+///
+/// 矩阵的出厂值只是「没人声明」时的兜底。声明了还按出厂值跑，这个键就是个
+/// 摆设——部署把它改小，节点还是照出厂次数重试；改大，一次也不会多试。
+fn retry_matrix_for(config: &DagExecutorConfig) -> RetryMatrix {
+    let mut matrix = RetryMatrix::defaults();
+    let mut node = matrix.lookup(&cog_core::TaskType::DagNode).clone();
+    node.max_retries = config.max_retries;
+    matrix.set(cog_core::TaskType::DagNode, node);
+    matrix
+}
+
+#[cfg(test)]
+mod retry_matrix_wiring_tests {
+    use super::*;
+
+    /// 部署声明的节点重试次数必须落到矩阵上——这是这个键「生效」的意思。
+    /// 以前它只被拷进结构体，执行器读的是矩阵的出厂值：改这个键，一次重试
+    /// 都不会多也不会少。
+    #[test]
+    fn the_declared_node_retry_count_reaches_the_matrix() {
+        let declared = DagExecutorConfig {
+            max_retries: 7,
+            ..DagExecutorConfig::default()
+        };
+        assert_eq!(
+            retry_matrix_for(&declared).max_retries(&cog_core::TaskType::DagNode),
+            7
+        );
+    }
+
+    /// 没人声明时矩阵读执行器配置的出厂值，而不是自己再写一个数：两处各写
+    /// 一个 3，改一处的那天就分家了。
+    #[test]
+    fn the_factory_matrix_reads_the_executor_config_default() {
+        assert_eq!(
+            retry_matrix_for(&DagExecutorConfig::default())
+                .max_retries(&cog_core::TaskType::DagNode),
+            cog_core::DagExecutorConfig::default().max_retries
+        );
     }
 }
 
@@ -314,33 +361,23 @@ fn hold_back_message(admitted: u64) -> &'static str {
 }
 
 impl DagExecutorRuntime {
+    /// 具体后端类型的入口：与 [`Self::new_with_dyn_backend`] 同一套装配。
+    ///
+    /// 装配走同一条路，不是两段各写一遍的构造——两段会分家，第二段少配一样
+    /// 东西的那天，用哪个人口构造出来的执行器就是两个行为。
     pub fn new_with_backend(
         config: DagExecutorConfig,
         backend: impl MessageBackend + 'static,
     ) -> Self {
-        let orchestrator = DagExecutor::new(config.workspace_id.clone());
-        Self {
-            config,
-            backend: Arc::new(backend),
-            orchestrator: Arc::new(orchestrator),
-            action_planner: None,
-            skill_registry: None,
-            pool_source: Arc::new(tokio::sync::OnceCell::new()),
-            observability: Arc::new(tokio::sync::OnceCell::new()),
-            change_ledger: Arc::new(tokio::sync::OnceCell::new()),
-            gate_share: Arc::new(std::sync::Mutex::new(None)),
-            gate_last_admitted_unix: Arc::new(std::sync::atomic::AtomicI64::new(
-                chrono::Utc::now().timestamp(),
-            )),
-            board_wip_limits: load_board_wip_limits(),
-        }
+        Self::new_with_dyn_backend(config, Arc::new(backend))
     }
 
     pub fn new_with_dyn_backend(
         config: DagExecutorConfig,
         backend: Arc<dyn MessageBackend>,
     ) -> Self {
-        let orchestrator = DagExecutor::new(config.workspace_id.clone());
+        let orchestrator = DagExecutor::new(config.workspace_id.clone())
+            .with_retry_matrix(retry_matrix_for(&config));
         Self {
             config,
             backend,
@@ -536,7 +573,9 @@ impl DagExecutorRuntime {
                 return Ok(());
             }
         }
-        let work = self.orchestrator.ready_work().await;
+        // 读不出来就带着库的原话收口：折成空图的那一趟与一次正常的空扫描
+        // 同形，而派发恰恰是靠这一趟发现「没人可放」的。
+        let work = self.orchestrator.ready_work_checked().await?;
         let columns = work.columns;
         let (ready_tasks, in_flight) = (work.ready, work.in_flight);
         let window_jobs = pays_for.and_then(|bound| bound.window_jobs);

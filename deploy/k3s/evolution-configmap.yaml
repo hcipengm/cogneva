@@ -7,20 +7,17 @@ metadata:
     app.kubernetes.io/name: cogneva-evolution
     app.kubernetes.io/component: evolution
 # These env vars override fields in /etc/cogneva/cogneva.json via the
-# config_loader env-var layer. They enable the self-evolution sandbox mode
-# and point all directories into the mounted PVC.
+# config_loader env-var layer, and only where this pod differs from that
+# document: the sandbox switch, the auto-apply policy and the change directory
+# are already stated there, so restating them here would be a second decision
+# nobody reads. What stays is the executor role, the sandbox's own output
+# directories and the workspace split below.
 data:
-  COGNEVA_SELF_EVOLUTION_ENABLED: "true"
   # This pod is the dedicated change executor: it runs the evolution cycle,
   # baseline porter, and mainline deployer. The main app pod sets this false so
   # it stays a control plane (admin API + cluster-side GitOps puller) and the
   # two never race over the same instance's worktrees.
   COGNEVA_SELF_EVOLUTION_EXECUTOR_ENABLED: "true"
-  COGNEVA_SELF_EVOLUTION_AUTO_APPLY: "true"
-  COGNEVA_SELF_EVOLUTION_AUTO_DEPLOY: "true"
-  COGNEVA_SELF_EVOLUTION_SANDBOX_MODE: "true"
-  COGNEVA_SELF_EVOLUTION_SWITCH_MODE: "self_exec"
-  COGNEVA_SELF_EVOLUTION_CHANGE_DIR: "/opt/cogneva/sandbox/changes"
   COGNEVA_SELF_EVOLUTION_BINARY_DIR: "/opt/cogneva/sandbox/bin"
   COGNEVA_SELF_EVOLUTION_BACKUP_DIR: "/opt/cogneva/sandbox/backups"
   COGNEVA_SELF_EVOLUTION_POLL_INTERVAL_SECS: "300"

@@ -347,31 +347,19 @@ pub struct MemoryIngestorConfig {
 
 impl Default for MemoryIngestorConfig {
     fn default() -> Self {
-        Self {
-            max_retries: 3,
-            retry_base_delay_ms: 1000,
-            enable_dlq: true,
-            dlq_namespace: "dlq".into(),
-            extraction_concurrency: 4,
-            startup_reconcile: true,
-            reconcile_lookback_hours: 24,
-            aged_out_redrive_batch: 32,
-            reconcile_interval_secs: 600,
-            pull_pause_after_failures: 3,
-            pull_pause_initial_secs: 60,
-            pull_pause_max_secs: 1800,
-            pool_check_secs: 30,
-            pull_resume_observation_secs: 300,
-            backlog_warn_at: 64,
-            // 兜底构造不设闸：它只出现在单测里（测的是抽取本身），
-            // 装配路径一律走 `From<&IngestConfig>` 并把读侧声明带上。
-            read_namespaces: Vec::new(),
-            bus_group: "memory-ingestor".into(),
-            bus_claim_interval_secs: 30,
-            bus_claim_min_idle_ms: 900_000,
-            bus_claim_batch: 32,
-            benchmark_isolation: BenchmarkIsolation::default(),
-        }
+        // 每个数都取自 `IngestConfig` 的那一份声明——这里再写一遍就是同一件
+        // 事的第二个说法，改一处忘一处的那天，两处会各自以为是对方在管。
+        // 唯一例外是读侧命名空间：兜底构造不设闸（它只出现在单测里，测的是
+        // 抽取本身），装配路径一律走 `From<&IngestConfig>` 并把读侧声明带上。
+        //
+        // 写成「先取一份再清掉那一格」而不是结构体更新语法：`IngestConfig` 的
+        // 默认值大多不是零（重试次数、DLQ 开关、各种间隔），`#[derive(Default)]`
+        // 给出的是全零，两者不是同一个东西；更新语法又把那个非零的基准藏在
+        // `..` 后面，`clippy::derivable_impls` 读不到它，会把这个 impl 当成
+        // 可以派生的。清掉那一格写成一行，基准是什么在字面上就看得见。
+        let mut config = Self::from(&IngestConfig::default());
+        config.read_namespaces = Vec::new();
+        config
     }
 }
 

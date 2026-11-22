@@ -114,7 +114,6 @@ async fn spawn_app_full(
             cors_origins: vec!["*".into()],
             websocket_timeout_secs: 30,
             websocket_inactivity_timeout_secs: 90,
-            websocket_tick_secs: 5,
             notification_limit: 50,
             request_timeout_secs: 30,
             notification_webhook_url: None,
@@ -669,10 +668,11 @@ async fn e2e_memory_ingest_and_search() {
         ingest_body
     );
 
-    // Search
+    // Search. `limit` is the caller's decision on how many rows to ask for,
+    // and the handler requires it rather than inventing a default.
     let res = client
         .get(format!(
-            "http://{}/api/v1/memory/schema?query=alice",
+            "http://{}/api/v1/memory/schema?query=alice&limit=10",
             app.addr
         ))
         .header("Authorization", &token)

@@ -600,15 +600,15 @@ pub async fn llm_config_handler(
     // managedFields 与指标序列反推，而那里没有人的身份。
     if let Some(stream) = state.audit_stream.as_ref() {
         let actor = audit_actor(&claims);
-        let _ = stream
-            .append(
-                cog_core::AuditKind::Custom("llm_config".to_string()),
-                &actor,
-                SECRET_UPSTREAMS_KEY,
-                "llm.upstream_saved",
-                pool_change_detail(before.as_deref(), after.as_deref(), effective_min_healthy),
-            )
-            .await;
+        crate::audit::append_or_warn(
+            stream,
+            cog_core::AuditKind::Custom("llm_config".to_string()),
+            &actor,
+            SECRET_UPSTREAMS_KEY,
+            "llm.upstream_saved",
+            pool_change_detail(before.as_deref(), after.as_deref(), effective_min_healthy),
+        )
+        .await;
     }
 
     // restartedAt 注解触发网关滚动重启，新 Pod 启动时从 Secret 读
@@ -687,15 +687,15 @@ pub async fn remove_upstreams_handler(
             pool_change_detail(before.as_deref(), after.as_deref(), effective_min_healthy);
         detail["requested"] = json!(names);
         let actor = audit_actor(&claims);
-        let _ = stream
-            .append(
-                cog_core::AuditKind::Custom("llm_config".to_string()),
-                &actor,
-                SECRET_UPSTREAMS_KEY,
-                "llm.upstream_removed",
-                detail,
-            )
-            .await;
+        crate::audit::append_or_warn(
+            stream,
+            cog_core::AuditKind::Custom("llm_config".to_string()),
+            &actor,
+            SECRET_UPSTREAMS_KEY,
+            "llm.upstream_removed",
+            detail,
+        )
+        .await;
     }
 
     (
@@ -1603,6 +1603,23 @@ impl KubeClient {
             }),
         )
         .await
+    }
+}
+
+#[cfg(test)]
+impl KubeClient {
+    /// 一个连不上任何东西的 client：给「问不到 apiserver 时调用方怎么办」
+    /// 这类判据用。
+    ///
+    /// 地址是本机回环上的 1 号端口，这个进程没在上面开任何东西：连过去立刻
+    /// 得到 ECONNREFUSED，而不是等一次超时。
+    pub(crate) fn unreachable() -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            base: "http://127.0.0.1:1".into(),
+            token: String::new(),
+            namespace: "test".into(),
+        }
     }
 }
 

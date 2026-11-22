@@ -73,7 +73,7 @@ pub async fn list_notifications_handler(
         }
     };
 
-    let default_limit = state.config.read().unwrap().notification_limit as usize;
+    let default_limit = state.config.read().unwrap().effective_notification_limit() as usize;
     let filter = cog_core::NotificationFilter {
         unread_only: q.unread_only == Some(true),
         limit: q

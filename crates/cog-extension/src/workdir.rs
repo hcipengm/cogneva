@@ -4781,6 +4781,7 @@ pub(crate) mod tests {
         assert_eq!(workspace_cap(disk_with(4096), 0, 4), None);
     }
 
+    // proves: sandboxExecutor.maxTaskWorkspaces
     /// The cap is not a setting: a pass reads the volume, and when the
     /// footprint these trees occupy changes, the very next pass answers a
     /// different cap. No restart, no configuration.
@@ -4859,6 +4860,7 @@ pub(crate) mod tests {
         assert_eq!(warm_trees_from(2, 60, 3.4, 0), Some(0));
     }
 
+    // proves: sandboxExecutor.warmTrees
     /// The target is recomputed by every reclamation pass and published with
     /// the input set that chose it. The evaluation counter is what shows the
     /// beat is running when the number happens not to move.
@@ -4973,6 +4975,7 @@ pub(crate) mod tests {
         );
     }
 
+    // proves: sandboxExecutor.repoFetchIntervalSecs
     /// Polling is paid for by how often the thing being polled changes.
     #[test]
     fn the_fetch_period_follows_how_long_main_was_still() {
@@ -4991,6 +4994,7 @@ pub(crate) mod tests {
         );
     }
 
+    // proves: sandboxExecutor.buildCacheScanIntervalSecs
     /// The same law paces the cache walk, at its own floor: a walk that costs
     /// N seconds buys twenty times that period, never less than the shared
     /// floor. Both loops take their multiple from one constant, so tuning the
@@ -5224,6 +5228,7 @@ pub(crate) mod tests {
         );
     }
 
+    // proves: sandboxExecutor.workspaceGcIntervalSecs
     /// Reclamation's own cost is what the interval covers, so a volume that
     /// fills and makes the pass slower moves the interval with it instead of
     /// letting the loop's share of the process grow. The pass is timed as the
@@ -5255,6 +5260,7 @@ pub(crate) mod tests {
         );
     }
 
+    // proves: sandboxExecutor.workspaceTtlSecs
     /// The TTL is set by how fast trees arrive and how many fit -- never by how
     /// long trees have sat idle, which is the one input that cannot be observed
     /// independently of the TTL itself.

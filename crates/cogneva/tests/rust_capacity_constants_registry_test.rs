@@ -159,7 +159,64 @@ fn scan(root: &Path, files: &[PathBuf]) -> Vec<Row> {
 /// The name only decides the module when nothing guards it: under
 /// `#[cfg(test)]` the name is the author's.
 fn production_rows(text: &str, rel: &str) -> Vec<Row> {
+    let lines = production_lines(text);
     let mut rows = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let (line, block_above) = lines[i].clone();
+        i += 1;
+        // A declaration does not always close on the line it opens. An array
+        // constant writes one number per line, so reading declarations one line
+        // at a time made a whole table invisible -- the register read complete
+        // while the ladder in it had never been judged. The block above belongs
+        // to the opening line; the body is joined until the terminator.
+        let mut decl = line.trim_end().to_string();
+        if opens_a_multiline_declaration(&decl) {
+            while !decl.ends_with(';') && i < lines.len() {
+                decl.push(' ');
+                decl.push_str(lines[i].0.trim());
+                i += 1;
+            }
+        }
+        let Some(mut row) = parse_const(&decl, rel) else {
+            continue;
+        };
+        if let Some((source, reason)) = block_above {
+            row.source = source;
+            row.note = reason;
+        }
+        rows.push(row);
+    }
+    rows
+}
+
+/// Whether this line starts a constant whose body runs past its own end.
+///
+/// Only the array shape is joined: a scalar initializer that does not close on
+/// its line is not the thing this register is for, and guessing where it ends
+/// would put one constant's numbers under another constant's marker.
+fn opens_a_multiline_declaration(line: &str) -> bool {
+    if line.trim_end().ends_with(';') {
+        return false;
+    }
+    let Some(after) = line.trim_start().split_once("const ").map(|(_, r)| r) else {
+        return false;
+    };
+    let Some(ty) = after.split_once(':').map(|(_, r)| r.trim_start()) else {
+        return false;
+    };
+    ty.starts_with('[') || (ty.starts_with("&[") && ty.contains('=') && line.contains('['))
+}
+
+/// Every production line a file holds, paired with the `// cap:` block above it.
+///
+/// Split out from [`production_rows`] because a declaration is not the only
+/// thing written on one line: an array constant's numbers run across several,
+/// and a guard that only ever sees a single line cannot see the table at all.
+/// Both readers walk the same fixture-skipping state machine, so a number the
+/// register does not see is not one this misses either.
+fn production_lines(text: &str) -> Vec<(&str, Option<(String, String)>)> {
+    let mut lines = Vec::new();
     let mut depth: i32 = 0;
     let mut fixtures: Option<i32> = None;
     let mut expecting_test_module = false;
@@ -207,16 +264,9 @@ fn production_rows(text: &str, rel: &str) -> Vec<Row> {
         if in_fixtures || opens_tests {
             continue;
         }
-        let Some(mut row) = parse_const(line, rel) else {
-            continue;
-        };
-        if let Some((source, reason)) = block_above.marker.clone() {
-            row.source = source;
-            row.note = reason;
-        }
-        rows.push(row);
+        lines.push((line, block_above.marker.clone()));
     }
-    rows
+    lines
 }
 
 /// The comment block sitting immediately above a declaration.
@@ -416,6 +466,19 @@ fn parse_const(line: &str, file: &str) -> Option<Row> {
             None if holds_a_written_number(value) => value.to_string(),
             None => return None,
         },
+        // An array of numbers is a table of numbers, and a table is exactly
+        // where written numbers used to escape: the type read as `[u64; 4]`,
+        // no arm matched, and every rung of a retry ladder went unjudged while
+        // the register read complete. The element type decides whether these
+        // are quantities at all; a byte string (`b"openssh-key-v1\0"`) is text
+        // the bytes happen to spell, and the digits in it are not typed numbers.
+        _ if array_element_type(ty).is_some() => {
+            let value = without_string_literals(value);
+            if !holds_a_written_number(&value) {
+                return None;
+            }
+            value.to_string()
+        }
         _ => return None,
     };
     Some(Row {
@@ -563,6 +626,7 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-agent/src/agent_kernel/runtime.rs", 5),
     ("crates/cog-agent/src/archive.rs", 1),
     ("crates/cog-agent/src/background.rs", 3),
+    ("crates/cog-agent/src/config.rs", 1),
     ("crates/cog-agent/src/consumer.rs", 3),
     ("crates/cog-agent/src/context.rs", 3),
     ("crates/cog-agent/src/drain.rs", 1),
@@ -573,17 +637,23 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-agent/src/plugin.rs", 4),
     ("crates/cog-agent/src/tools.rs", 8),
     ("crates/cog-agent/src/web.rs", 2),
-    ("crates/cog-auth/src/keycloak.rs", 3),
+    ("crates/cog-auth/src/jwt.rs", 1),
+    ("crates/cog-auth/src/keycloak.rs", 2),
     ("crates/cog-auth/src/session.rs", 1),
     ("crates/cog-collaboration/src/collaboration_executor.rs", 2),
     ("crates/cog-collaboration/src/config.rs", 1),
     ("crates/cog-collaboration/src/profile.rs", 5),
-    ("crates/cog-collaboration/src/squad/executor.rs", 2),
-    ("crates/cog-collaboration/src/squad/ralph/ralph_loop.rs", 1),
+    ("crates/cog-collaboration/src/squad/executor.rs", 3),
+    ("crates/cog-collaboration/src/squad/pge/pipeline.rs", 1),
+    ("crates/cog-collaboration/src/squad/pge/roundtable.rs", 2),
+    ("crates/cog-collaboration/src/squad/pge/stall.rs", 1),
+    ("crates/cog-collaboration/src/squad/ralph/ralph_loop.rs", 3),
     ("crates/cog-core/src/build_cache.rs", 5),
     ("crates/cog-core/src/build_cache_readings.rs", 2),
     ("crates/cog-core/src/claim_footprint.rs", 2),
-    ("crates/cog-core/src/config.rs", 12),
+    // 13 而不是 12：钩子限流的速率原先只作为 `RateLimitConfig` 的两个字段各写一遍，
+    // 两份都不在册。现在它是一条 `bound`，所以这一格多了一。
+    ("crates/cog-core/src/config.rs", 43),
     ("crates/cog-core/src/config_sections.rs", 2),
     ("crates/cog-core/src/contract/alerts.rs", 1),
     ("crates/cog-core/src/contract/build_cache_reclaim.rs", 2),
@@ -592,12 +662,12 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-core/src/contract/face_registry.rs", 1),
     ("crates/cog-core/src/contract/governance_acts.rs", 1),
     ("crates/cog-core/src/contract/hook.rs", 1),
-    ("crates/cog-core/src/contract/loop_health.rs", 1),
+    ("crates/cog-core/src/contract/loop_health.rs", 3),
     ("crates/cog-core/src/contract/memory.rs", 2),
     ("crates/cog-core/src/contract/owner_lease.rs", 2),
     ("crates/cog-core/src/contract/reflection.rs", 4),
     ("crates/cog-core/src/contract/resilience.rs", 2),
-    ("crates/cog-core/src/contract/storage.rs", 4),
+    ("crates/cog-core/src/contract/storage.rs", 6),
     ("crates/cog-core/src/contract/taste.rs", 4),
     ("crates/cog-core/src/contract/work_item.rs", 1),
     ("crates/cog-core/src/day.rs", 1),
@@ -608,13 +678,19 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-core/src/retention.rs", 4),
     ("crates/cog-core/src/token_estimate.rs", 2),
     ("crates/cog-core/src/types/agent_state.rs", 2),
+    ("crates/cog-core/src/types/self_review.rs", 2),
     ("crates/cog-eval/src/adapters/swe_pro.rs", 1),
     ("crates/cog-eval/src/admission.rs", 9),
     ("crates/cog-eval/src/backoff.rs", 4),
     ("crates/cog-eval/src/exec_seam.rs", 2),
-    ("crates/cog-eval/src/long_run.rs", 2),
+    ("crates/cog-eval/src/harness.rs", 1),
+    ("crates/cog-eval/src/long_run.rs", 3),
     ("crates/cog-eval/src/rig.rs", 1),
+    ("crates/cog-eval/src/runner.rs", 1),
+    ("crates/cog-eval/src/scaffold.rs", 1),
+    ("crates/cog-eval/src/scaffolds/gepa.rs", 2),
     ("crates/cog-eval/src/scaffolds/mod.rs", 1),
+    ("crates/cog-eval/src/system_harness.rs", 1),
     ("crates/cog-eval/src/trend.rs", 3),
     ("crates/cog-extension/src/build_cache.rs", 1),
     ("crates/cog-extension/src/checkpoints.rs", 1),
@@ -639,8 +715,8 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-gateway/src/git_identity.rs", 2),
     ("crates/cog-gateway/src/git_mirror.rs", 15),
     ("crates/cog-gateway/src/git_routing.rs", 3),
-    ("crates/cog-gateway/src/github_app.rs", 4),
-    ("crates/cog-gateway/src/governance.rs", 5),
+    ("crates/cog-gateway/src/github_app.rs", 2),
+    ("crates/cog-gateway/src/governance.rs", 3),
     ("crates/cog-gateway/src/ide.rs", 10),
     ("crates/cog-gateway/src/knowledge.rs", 1),
     ("crates/cog-gateway/src/lib.rs", 2),
@@ -663,31 +739,35 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-gateway/src/usage_landing.rs", 2),
     ("crates/cog-gateway/src/venues.rs", 1),
     ("crates/cog-github/src/ci_refusals.rs", 1),
+    ("crates/cog-github/src/config.rs", 4),
     ("crates/cog-github/src/conversation.rs", 1),
     ("crates/cog-github/src/cross_validation.rs", 1),
     ("crates/cog-github/src/discovery_loop.rs", 10),
     ("crates/cog-github/src/landing.rs", 1),
     ("crates/cog-github/src/plugin.rs", 1),
     ("crates/cog-github/src/provider/github.rs", 3),
+    ("crates/cog-guardrail/src/content_filter.rs", 1),
     ("crates/cog-llm/src/provider/mod.rs", 2),
     ("crates/cog-llm/src/routing.rs", 1),
     ("crates/cog-memory/src/bge_m3_sparse_linear.rs", 1),
-    ("crates/cog-memory/src/config.rs", 1),
+    ("crates/cog-memory/src/config.rs", 7),
     ("crates/cog-memory/src/extractor.rs", 7),
     ("crates/cog-memory/src/ingestor.rs", 1),
     ("crates/cog-memory/src/maintenance.rs", 2),
     ("crates/cog-memory/src/pg_summary_pool.rs", 2),
     ("crates/cog-memory/src/vector_summary_backend.rs", 3),
+    ("crates/cog-net/src/config.rs", 2),
     ("crates/cog-observability/src/alert_store.rs", 1),
     ("crates/cog-observability/src/capability.rs", 3),
     ("crates/cog-observability/src/claim_store.rs", 2),
-    ("crates/cog-observability/src/config.rs", 4),
+    ("crates/cog-observability/src/config.rs", 11),
     ("crates/cog-observability/src/config_delivery.rs", 1),
     ("crates/cog-observability/src/exchange_retention.rs", 3),
     ("crates/cog-observability/src/host_ledger.rs", 1),
     ("crates/cog-observability/src/image_store.rs", 2),
     ("crates/cog-observability/src/infra_watch.rs", 2),
     ("crates/cog-observability/src/llm_usage_rollup.rs", 5),
+    ("crates/cog-observability/src/lib.rs", 2),
     ("crates/cog-observability/src/logs.rs", 1),
     ("crates/cog-observability/src/plugin.rs", 3),
     ("crates/cog-observability/src/probes.rs", 1),
@@ -699,9 +779,20 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
         "crates/cog-orchestrator/src/action_planner/action_plan_orchestrator.rs",
         3,
     ),
+    (
+        "crates/cog-orchestrator/src/action_planner/roundtable.rs",
+        2,
+    ),
     ("crates/cog-orchestrator/src/backup_runs.rs", 1),
     ("crates/cog-orchestrator/src/change_ledger.rs", 28),
     ("crates/cog-orchestrator/src/dag_executor/mod.rs", 5),
+    // 18 而不是 0：出厂策略表里的数原先写在 `fn defaults()` 的结构体字面量里，
+    // 两道门都不认这个形状（D5 只认 `fn default_*`，登记表只认 `const`）。给了
+    // 名字之后它们进册了——不是新增的界，是原先没被数上的界。
+    (
+        "crates/cog-orchestrator/src/dag_executor/retry_matrix.rs",
+        20,
+    ),
     (
         "crates/cog-orchestrator/src/dag_executor/orchestrator.rs",
         3,
@@ -722,6 +813,7 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-orchestrator/src/resource_ledger.rs", 4),
     ("crates/cog-orchestrator/src/subscribe_backoff.rs", 1),
     ("crates/cog-orchestrator/src/task_executor_router.rs", 6),
+    ("crates/cog-prompt/src/ab_test.rs", 1),
     ("crates/cog-prompt/src/loader.rs", 1),
     ("crates/cog-protocol/src/convert.rs", 1),
     ("crates/cog-protocol/src/plugin.rs", 1),
@@ -732,22 +824,25 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-reflection/src/build_rss_peak.rs", 3),
     ("crates/cog-reflection/src/change_execution.rs", 3),
     ("crates/cog-reflection/src/change_pipeline.rs", 10),
-    ("crates/cog-reflection/src/config.rs", 3),
+    ("crates/cog-reflection/src/config.rs", 14),
     ("crates/cog-reflection/src/evolution_build_readings.rs", 1),
     ("crates/cog-reflection/src/firecracker.rs", 1),
     ("crates/cog-reflection/src/gitops_puller.rs", 1),
     ("crates/cog-reflection/src/image_rollout.rs", 1),
-    ("crates/cog-reflection/src/lib.rs", 2),
-    ("crates/cog-reflection/src/mainline_deployer.rs", 20),
+    ("crates/cog-reflection/src/lib.rs", 6),
+    // 21 而不是 20：`CI_ASK_RETRY_DELAYS_MS` 是一张数组类型的阶梯，原先整行不进册。
+    // 表进册之后这一格才算进本文件——不是上限抬了，是漏数的一条被数上了。
+    ("crates/cog-reflection/src/mainline_deployer.rs", 21),
     ("crates/cog-reflection/src/mainline_rollout.rs", 11),
     ("crates/cog-reflection/src/meta_learning.rs", 1),
     ("crates/cog-reflection/src/observability_stack.rs", 2),
     ("crates/cog-reflection/src/platform_http.rs", 2),
     ("crates/cog-reflection/src/plugin.rs", 3),
+    ("crates/cog-reflection/src/policy_evolution.rs", 1),
     ("crates/cog-reflection/src/promotion_eval.rs", 3),
     ("crates/cog-reflection/src/promotion_trend.rs", 4),
     ("crates/cog-reflection/src/registry_footprint.rs", 2),
-    ("crates/cog-reflection/src/signal_watcher.rs", 3),
+    ("crates/cog-reflection/src/signal_watcher.rs", 6),
     ("crates/cog-reflection/src/store_readouts.rs", 2),
     ("crates/cog-reflection/src/volume_capacity.rs", 8),
     ("crates/cog-reflection/src/workload_resources.rs", 14),
@@ -756,8 +851,8 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-storage/src/backends/object_backends.rs", 3),
     ("crates/cog-storage/src/checkpoint_cap.rs", 2),
     ("crates/cog-storage/src/metrics_retirement.rs", 2),
-    ("crates/cog-storage/src/metrics_sample_cap.rs", 1),
-    ("crates/cog-storage/src/observability_event_cap.rs", 4),
+    ("crates/cog-storage/src/metrics_sample_cap.rs", 2),
+    ("crates/cog-storage/src/observability_event_cap.rs", 3),
     ("crates/cog-storage/src/partition_maintainer.rs", 2),
     ("crates/cog-storage/src/plugin.rs", 3),
     (
@@ -781,13 +876,12 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-storage/src/wal/mod.rs", 3),
     ("crates/cog-stream/src/redis.rs", 2),
     ("crates/cog-supervisor/src/alert_store.rs", 1),
-    ("crates/cog-supervisor/src/autonomous.rs", 1),
+    ("crates/cog-supervisor/src/autonomous.rs", 3),
     ("crates/cog-supervisor/src/behavior_monitor.rs", 1),
     ("crates/cog-supervisor/src/event_aggregator.rs", 1),
-    ("crates/cog-supervisor/src/health_checker.rs", 3),
     ("crates/cog-supervisor/src/multi_backend_consumer.rs", 1),
-    ("crates/cog-supervisor/src/registry.rs", 3),
-    ("crates/cog-supervisor/src/supervisor.rs", 7),
+    ("crates/cog-supervisor/src/registry.rs", 2),
+    ("crates/cog-supervisor/src/supervisor.rs", 2),
     ("crates/cog-supervisor/src/udp_heartbeat.rs", 2),
     ("crates/cog-wiki/src/bounds.rs", 1),
     ("crates/cog-wiki/src/distiller.rs", 3),
@@ -797,7 +891,7 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cogneva/src/backup.rs", 7),
     ("crates/cogneva/src/backup_crypto.rs", 4),
     ("crates/cogneva/src/checkpoints.rs", 1),
-    ("crates/cogneva/src/conversation.rs", 15),
+    ("crates/cogneva/src/conversation.rs", 14),
     ("crates/cogneva/src/eval_container.rs", 1),
     ("crates/cogneva/src/eval_mcp_in_pod.rs", 1),
     ("crates/cogneva/src/eval_platform.rs", 4),
@@ -1119,6 +1213,193 @@ const AFTER: u64 = 45;
         .map(|row| row.name)
         .collect();
     assert_eq!(names, vec!["AFTER".to_string(), "BEFORE".to_string()]);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 一张数字表也是常量，也必须有判词——它不能借「类型不是标量」这件事溜出登记表。
+///
+/// 登记表原先只认 `const NAME: <标量类型> = …`；`[u64; 3]`、`&[Duration]` 这类
+/// 类型一格都读不到，于是把一串档位写成数组就等于把它们从登记面移走：表还在
+/// 代码里，判词一格都没有，而登记表照样读绿。这条门用另一条路径（按文件把生产
+/// 行接起来、在整段文本里找声明）再数一遍数字表，要求每一张都在登记表里有行。
+/// 两条路径走的是同一台夹具跳过状态机，差集只可能是「接行接漏了」或「认类型的
+/// 口子又窄了」——两种都会让一张表在登记面消失。
+#[test]
+fn every_number_table_is_a_row_in_the_register() {
+    let root = repo_root();
+    let files = production_sources(&root);
+    let tables = array_constants_carrying_numbers(&root, &files);
+    let registered: std::collections::BTreeSet<(String, String)> = scan(&root, &files)
+        .into_iter()
+        .map(|row| (row.file, row.name))
+        .collect();
+    let missing: Vec<String> = tables
+        .iter()
+        .filter(|(file, name)| !registered.contains(&(file.clone(), name.clone())))
+        .map(|(file, name)| format!("{file} {name}"))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these constants write numbers into an array, and the register has no row for \
+         them: a table is a batch of numbers, and a batch nobody judged reads exactly \
+         like a batch that was judged:\n{}",
+        missing.join("\n")
+    );
+}
+
+/// 数组／切片类型、且初始化式里有写下来的数字的常量，按 `(文件, 名字)` 列出。
+///
+/// 判据只看生产行（夹具已按 `#[cfg(test)]` 的大括号切掉）：一条测试夹具里的
+/// 数字表是测试自己的输入，不是产物。字节串里的数字是文本恰好拼出来的字节，
+/// 不是谁写下的一个量。
+fn array_constants_carrying_numbers(root: &Path, files: &[PathBuf]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for entry in files {
+        let Ok(text) = std::fs::read_to_string(entry) else {
+            continue;
+        };
+        let rel = entry
+            .strip_prefix(root)
+            .unwrap_or(entry)
+            .to_string_lossy()
+            .to_string();
+        // 夹具切掉之后再把行接起来：数组的初始化式常常跨行，逐行看会把第二行
+        // 起的所有元素都漏掉，而漏掉的正是这张表本身。
+        let joined: String = production_lines(&text)
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut rest = joined.as_str();
+        while let Some(at) = rest.find("const ") {
+            rest = &rest[at + "const ".len()..];
+            let Some((name, after_name)) = rest.split_once(':') else {
+                continue;
+            };
+            let name = name.trim();
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            {
+                continue;
+            }
+            let Some((ty, initializer)) = after_name.split_once('=') else {
+                continue;
+            };
+            if array_element_type(strip_qualified(ty.trim())).is_none() {
+                continue;
+            }
+            // 一张表的第一段到这里为止就够了：`;` 之后是同一条声明的尾巴，
+            // 数组初始化式里的数字全在第一个 `;` 之前。
+            let initializer = initializer.split(';').next().unwrap_or(initializer);
+            if holds_a_written_number(&without_string_literals(initializer)) {
+                out.push((rel.clone(), name.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// 数组／切片的元素类型，当且仅当它是一条数值的量时。
+///
+/// `[u64; 4]` 是一张档位表；`[&str; 2]` 是一串词，`[f32; 1024]` 是一份权重。
+/// 三者的类型不同，判词也就不同——登记表只该收前一类和第三类，词不该进来。
+fn array_element_type(ty: &str) -> Option<&str> {
+    let tail = ty.strip_prefix("&[").or_else(|| ty.strip_prefix('['))?;
+    let element = tail.split([';', ']']).next()?.trim();
+    matches!(
+        element,
+        "u8" | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "f32"
+            | "f64"
+            | "Duration"
+    )
+    .then_some(element)
+}
+
+/// 把字符串与字节串字面量整段去掉，留下“谁真的在这里写下了一个量”。
+///
+/// 反斜杠转义按两格推进：`b"\0"` 的 `0` 是转义的一部分，不是数字 0；
+/// `b"openssh-key-v1\0"` 里那个 `1` 是协议名的一部分。
+fn without_string_literals(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            while let Some(inner) = chars.next() {
+                match inner {
+                    '\\' => {
+                        chars.next();
+                    }
+                    '"' => break,
+                    _ => {}
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// 这条门不是空转：夹具里只有带数字的表被点名，词表、字节串与标量都不进来；
+/// 跨行的那张表在登记表里成行，并且它的判词没有串到下一行去。
+#[test]
+fn the_array_guard_names_the_table_and_not_the_word_list() {
+    let root = std::env::temp_dir().join(format!("cog-array-guard-{}", std::process::id()));
+    let src = root.join("crates/probe/src");
+    std::fs::create_dir_all(&src).unwrap();
+    let fixture = r#"
+// cap: fixed — 夹具：这一行的判词属于它下面那张表
+const RUNGS: [u64; 3] = [
+    100,
+    200,
+    400,
+];
+const SLICE: &[Duration] = &[Duration::from_secs(1)];
+const WORDS: [&str; 2] = ["first", "second"];
+const MAGIC: &[u8] = b"openssh-key-v1\0";
+const ONE: u64 = 30;
+
+#[cfg(test)]
+mod tests {
+    const FIXTURE_RUNGS: [u64; 2] = [1, 2];
+}
+"#;
+    std::fs::write(src.join("ladder.rs"), fixture).unwrap();
+    let tables = array_constants_carrying_numbers(&root, &sources_of_tree(&root));
+    assert_eq!(
+        tables,
+        vec![
+            (
+                "crates/probe/src/ladder.rs".to_string(),
+                "RUNGS".to_string()
+            ),
+            (
+                "crates/probe/src/ladder.rs".to_string(),
+                "SLICE".to_string()
+            )
+        ]
+    );
+    // 同一个夹具过一遍登记表：跨行的表成行、判词跟着开头那一行走，词表与字节
+    // 串不成行，标量照旧成行。
+    let rows = production_rows(fixture, "ladder.rs");
+    let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+    assert_eq!(names, vec!["RUNGS", "SLICE", "ONE"]);
+    assert_eq!(rows[0].source, "fixed");
+    assert!(rows[0].note.starts_with("夹具"));
+    assert_eq!(rows[1].source, "");
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -1734,11 +2015,14 @@ const BOUND_SHAPED_FIXED_AT_CENSUS: &[&str] = &[
     "MAX_CHARS",
 ];
 
-/// 名字里出现这些片段，就算界形。
+/// 名字里出现这些片段，就算界形。按 `_` 分隔的**整段**比，不按裸子串：
+/// `SECONDS_PER_MINUTE` 里的 `MINUTE` 是分钟这个单位，不是「下界」；
+/// `TERMINATION_LOG` 里也没有界。裸子串比会把两个都不是界的名字判成界。
 const BOUND_SHAPED_NAME_PARTS: &[&str] = &[
     "MAX",
     "MIN",
     "CAP",
+    "CAPACITY",
     "LIMIT",
     "RETRY",
     "RETRIES",
@@ -1747,6 +2031,16 @@ const BOUND_SHAPED_NAME_PARTS: &[&str] = &[
     "THRESHOLD",
 ];
 
+/// 一个常量名是不是界形：看它的 `_` 分段里有没有界那个词。
+///
+/// `CAPACITY` 单列，是因为 `FORWARD_CAPACITY` 这种名字把界写成了整段；
+/// 裸子串比时它靠 `CAP` 命中，改成整段比就得把它自己写进词表，否则
+/// 这条界会悄悄从判据下溜走。
+fn is_bound_shaped(name: &str) -> bool {
+    name.split('_')
+        .any(|segment| BOUND_SHAPED_NAME_PARTS.contains(&segment))
+}
+
 #[test]
 fn a_bound_shaped_constant_is_never_fixed() {
     let root = repo_root();
@@ -1754,11 +2048,7 @@ fn a_bound_shaped_constant_is_never_fixed() {
     let flagged: Vec<String> = scanned
         .iter()
         .filter(|row| row.source == "fixed")
-        .filter(|row| {
-            BOUND_SHAPED_NAME_PARTS
-                .iter()
-                .any(|part| row.name.contains(part))
-        })
+        .filter(|row| is_bound_shaped(&row.name))
         .map(|row| format!("{} {} = {}", row.file, row.name, row.value))
         .collect();
     let known: std::collections::BTreeSet<&str> =
@@ -1780,4 +2070,34 @@ fn a_bound_shaped_constant_is_never_fixed() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+/// 判据按整段比，两个方向都要钉住：真界不许漏，单位与普通词不许误伤。
+///
+/// 改成整段比之前，`SECONDS_PER_MINUTE` 会被 `MIN` 命中——而它是一分钟这个
+/// 单位，于是「十分钟」这种量在仓里根本写不出来，只能退回裸 600。
+/// 反过来，换成整段比不能让 `FORWARD_CAPACITY` 溜掉，所以 `CAPACITY` 单列。
+#[test]
+fn a_bound_shaped_name_is_matched_by_its_segments() {
+    for name in [
+        "MAX_KEY_LEN",
+        "MIN_INTERVAL_SECS",
+        "SUSPECT_BACKOFF_CAP_SECS",
+        "FORWARD_CAPACITY",
+        "PUSH_TIMEOUT_SECS",
+        "MAX_RETRIES",
+        "MIN_REPLICAS",
+        "BATCH_LIMIT",
+    ] {
+        assert!(is_bound_shaped(name), "{name} 是界形，判据放它过去了");
+    }
+    for name in [
+        "SECONDS_PER_MINUTE",
+        "SECONDS_PER_HOUR",
+        "TERMINATION_LOG",
+        "DOMINANT_STRATEGY",
+        "SECONDS_PER_DAY",
+    ] {
+        assert!(!is_bound_shaped(name), "{name} 不是界形，判据误伤了它");
+    }
 }

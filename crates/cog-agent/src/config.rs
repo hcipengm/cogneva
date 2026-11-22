@@ -162,8 +162,11 @@ pub struct AgentLoopConfig {
 /// starts being a document: comfortably above what an API or a page summary
 /// returns, comfortably below the tool-return budget of the smallest window the
 /// loop is configured with.
+// cap: bound — 一头是 API/网页摘要的典型长度，另一头是最小窗口的工具返回预算
+const EXTERNAL_ARCHIVE_THRESHOLD_CHARS: usize = 8192;
+
 fn default_external_archive_threshold_chars() -> usize {
-    8192
+    EXTERNAL_ARCHIVE_THRESHOLD_CHARS
 }
 
 impl Default for AgentLoopConfig {
@@ -173,8 +176,10 @@ impl Default for AgentLoopConfig {
             role: cog_core::roles::PLANNER.into(),
             max_iterations: None,
             eval_max_iterations: None,
-            skill_cache_ttl_secs: 30,
-            think_stall_timeout_secs: 240,
+            skill_cache_ttl_secs: cog_core::config::SKILL_HOT_RELOAD_INTERVAL_SECS,
+            // 停滞窗的声明在运行时契约里（`cog_core::RuntimeConfig`），那边也
+            // 正是读它的地方；这里读那一份，不再抄一个 240。
+            think_stall_timeout_secs: cog_core::RuntimeConfig::default().think_stall_timeout_secs,
             memory_api_base: None,
             external_archive_threshold_chars: default_external_archive_threshold_chars(),
             web_search_base: None,
@@ -359,6 +364,7 @@ mod tests {
         // stores stay disjoint only while the threshold is below the budget of
         // the smallest window the loop runs with.
         let threshold = default_external_archive_threshold_chars();
+        assert_eq!(threshold, EXTERNAL_ARCHIVE_THRESHOLD_CHARS);
         assert!(threshold < crate::context::tool_result_budget_chars(Some(32000)));
     }
 

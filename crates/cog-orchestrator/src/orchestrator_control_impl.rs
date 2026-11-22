@@ -144,6 +144,10 @@ impl OrchestratorControl for OrchestratorControlImpl {
         self.dag_executor.get_ready_tasks().await
     }
 
+    async fn get_ready_tasks_checked(&self) -> SFResult<Vec<Task>> {
+        self.dag_executor.get_ready_tasks_checked().await
+    }
+
     async fn get_all_tasks(&self) -> Vec<Task> {
         self.dag_executor.get_all_tasks().await
     }
@@ -154,6 +158,10 @@ impl OrchestratorControl for OrchestratorControlImpl {
 
     async fn get_venue_tasks(&self) -> Vec<Task> {
         self.dag_executor.get_venue_tasks().await
+    }
+
+    async fn get_venue_tasks_checked(&self) -> SFResult<Vec<Task>> {
+        self.dag_executor.get_venue_tasks_checked().await
     }
 
     async fn task_plans(&self) -> SFResult<Vec<cog_core::TaskPlan>> {
@@ -252,6 +260,10 @@ impl OrchestratorControl for OrchestratorControlImpl {
 
     async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>) {
         self.dag_executor.get_graph().await
+    }
+
+    async fn get_graph_checked(&self) -> SFResult<(Vec<Task>, Vec<(String, String)>)> {
+        self.dag_executor.get_graph_checked().await
     }
 
     async fn delete_task(&self, task_id: &str) -> SFResult<()> {

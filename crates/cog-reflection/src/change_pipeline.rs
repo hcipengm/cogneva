@@ -315,8 +315,17 @@ fn stable_release_from_check(output: &str) -> Option<StableRelease> {
         if lowered.contains("up to date") {
             return Some(StableRelease::Current);
         }
-        if let Some((_, after)) = line.split_once("->") {
-            return version_token(after).map(StableRelease::Install);
+        if let Some((before, after)) = line.split_once("->") {
+            let after = version_token(after)?;
+            // 箭头两边同版：本机的 stable 就是「最新发布」，rustup 只是把同一次
+            // 发布又列了一遍，装出来的东西与 stable 逐字节同源。2026-11-19 实测
+            // 的现场：`stable-x86_64… - update available: 1.100.0 (0ef1bc386)
+            // -> 1.100.0 (0ef1bc386)`，而本机 `rustc --version` 正是 1.100.0。
+            // 按「装箭头后面那个」走会重新下载几百兆，装出来的仍与 stable 同一把。
+            if version_token(before).as_deref() == Some(after.as_str()) {
+                return Some(StableRelease::Current);
+            }
+            return Some(StableRelease::Install(after));
         }
         return None;
     }
@@ -345,6 +354,13 @@ fn version_token(text: &str) -> Option<String> {
 /// clippy 是要点名装的组件；一个残缺的目录在这里被读成「已经装好了」，指过去之后每一条
 /// 格式化命令都起不来，而判据会把「这一侧没有 rustfmt」判成「这笔改动的格式不对」。
 /// 装的那一趟本来就是幂等的（缺什么补什么），所以缺组件就让它再跑一趟。
+///
+/// 组件文件在也不算数：安装被超时或取消打断时，`bin/rustfmt` 与 `bin/cargo-clippy`
+/// 都已经落盘，缺的却是 rustc 那份共享库——2026-11-19 门禁实测的现场是
+/// `librustc_driver-*.so: cannot open shared object file`，而 `rustup component list`
+/// 同一份目录上报 `missing manifest`。judge 把 `RUSTUP_TOOLCHAIN` 指过去之后，每一条
+/// 格式化命令都起不来，14 条与格式无关的测试被读成「是这笔改动弄坏了它们」。
+/// 判它起得来，只能真起一次。
 fn provisioned_toolchain(release: &str) -> Option<PathBuf> {
     let home = std::env::var_os("RUSTUP_HOME")
         .map(PathBuf::from)
@@ -357,6 +373,14 @@ fn provisioned_toolchain(release: &str) -> Option<PathBuf> {
 /// 分成两层是为了让「装好了」这件事可以被数：往一个临时目录里摆一份工具链目录，
 /// 就能问出这个函数认的是什么——不必去动进程的环境变量（那条路会让并行的测试互相
 /// 踩，而且踩出来的失败与这条判据无关）。
+/// 工具链目录里判据要用的那两个组件二进制。
+///
+/// 名字各写一遍：这份判断与真正起它的那一处必须指的是同一段路径，两次各写一份时
+/// 改一处不会让另一处红——读不出来的那一侧只会安静地换成一棵空目录。
+const TOOLCHAIN_BIN_DIR: &str = "bin";
+const TOOLCHAIN_RUSTFMT: &str = "rustfmt";
+const TOOLCHAIN_CLIPPY: &str = "cargo-clippy";
+
 fn provisioned_toolchain_in(home: &Path, release: &str) -> Option<PathBuf> {
     let prefix = format!("{release}-");
     std::fs::read_dir(home.join("toolchains"))
@@ -370,9 +394,26 @@ fn provisioned_toolchain_in(home: &Path, release: &str) -> Option<PathBuf> {
                 .is_some_and(|name| name.starts_with(&prefix));
             // 组件只写一遍：两处各写一份时，改一边而漏掉另一边，这里就会读成
             // 「装好了」或「没装」——两边都是对同一棵树的两个说法。
-            let bin = path.join("bin");
-            named && bin.join("rustfmt").exists() && bin.join("cargo-clippy").exists()
+            let bin = path.join(TOOLCHAIN_BIN_DIR);
+            named
+                && bin.join(TOOLCHAIN_RUSTFMT).exists()
+                && bin.join(TOOLCHAIN_CLIPPY).exists()
+                && toolchain_starts(path)
         })
+}
+
+/// 这一份工具链起得来吗。
+///
+/// 起一次 `rustfmt --version` 看退出码：这是唯一不依赖 rustup 内部布局（manifest、
+/// 组件目录、共享库放在哪）的判法，而判据后续要跑的正是这一把二进制。
+fn toolchain_starts(dir: &Path) -> bool {
+    std::process::Command::new(dir.join(TOOLCHAIN_BIN_DIR).join(TOOLCHAIN_RUSTFMT))
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// Resolve the environment for the verification test process: the passthrough
@@ -1539,20 +1580,24 @@ impl ChangePipeline {
     ///
     /// 这是列表能读的那一面：候选活在库里，不带进程内存的状态，因而重启不会让
     /// 一条已经判过的变更重新出现。
-    pub async fn known_change_records(&self) -> Vec<EvolutionResult> {
+    /// 队列里与已定案的全部变更，最新的在前。
+    ///
+    /// 读不出来要往上抛，不能折成一张空表：这份记录是列表里「已经退场的那一半」
+    /// 的唯一来源，因此「队列读不出」与「一条已退场的都没有」在调用方必须是两
+    /// 件事——折叠成空表时，一次读失败会让管理面安安静静地少掉每一条已落地的
+    /// 变更，而没有任何一处说得出少了什么。
+    pub async fn known_change_records(&self) -> SFResult<Vec<EvolutionResult>> {
         let Some(candidates) = self.candidate_store() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        candidates
+        let mut records: Vec<EvolutionResult> = candidates
             .all()
-            .await
-            .map(|candidates| {
-                let mut records: Vec<EvolutionResult> =
-                    candidates.iter().map(result_from_candidate).collect();
-                records.sort_by_key(|record| std::cmp::Reverse(record.created_at));
-                records
-            })
-            .unwrap_or_default()
+            .await?
+            .iter()
+            .map(result_from_candidate)
+            .collect();
+        records.sort_by_key(|record| std::cmp::Reverse(record.created_at));
+        Ok(records)
     }
 
     /// 这条变更是否已经离开待办队列。
@@ -3957,6 +4002,19 @@ impl ChangePipeline {
         .collect();
         match self.run_verification_command(workdir, &argv).await {
             Ok((true, output)) => {
+                // 退出码 0 不是「这一份能用」：装到一半被打断的那一趟也可能留下一个
+                // 组件齐全、却起不来的目录。装完再问一次与「已经装好」同一个判据，
+                // 答不上来就退回镜像那一把，并在证据里写明。
+                if provisioned_toolchain(release.as_str()).is_none() {
+                    warn!(
+                        release = %release,
+                        output = output.trim(),
+                        "The installed toolchain does not start; judging with the toolchain this image carries"
+                    );
+                    return Some(format!(
+                        "判这一版用的不是 CI 那一把编译器：装好的 {release} 起不来（rustfmt --version 没有跑成）"
+                    ));
+                }
                 info!(
                     release = %release,
                     output = output.trim(),
@@ -8130,6 +8188,7 @@ index 1111111..2222222 100644
         let known: Vec<String> = pipeline
             .known_change_records()
             .await
+            .unwrap()
             .into_iter()
             .map(|r| r.artifact_id)
             .collect();
@@ -8137,6 +8196,68 @@ index 1111111..2222222 100644
             known,
             vec!["gone".to_string(), "waiting".to_string()],
             "both halves, newest first"
+        );
+    }
+
+    /// 一份只肯拒绝读取的队列。其余方法不在这些用例走的路上，直接说不可达，
+    /// 而不是悄悄回 `Ok`——一个处处答应的替身会让用例在队列真没读到时也绿。
+    #[derive(Debug)]
+    struct RefusingCandidates;
+
+    #[async_trait::async_trait]
+    impl ChangeCandidateStore for RefusingCandidates {
+        async fn record(&self, _candidate: &ChangeCandidate) -> SFResult<()> {
+            unimplemented!("RefusingCandidates stands in only for the refused read")
+        }
+
+        async fn transition(&self, _artifact_id: &str, _status: &str, _note: &str) -> SFResult<()> {
+            unimplemented!("RefusingCandidates stands in only for the refused read")
+        }
+
+        async fn decide(
+            &self,
+            _artifact_id: &str,
+            _outcome: CandidateOutcome,
+            _reason: &str,
+        ) -> SFResult<()> {
+            unimplemented!("RefusingCandidates stands in only for the refused read")
+        }
+
+        async fn pending(&self) -> SFResult<Vec<ChangeCandidate>> {
+            unimplemented!("RefusingCandidates stands in only for the refused read")
+        }
+
+        async fn all(&self) -> SFResult<Vec<ChangeCandidate>> {
+            Err(SFError::Internal(
+                "the candidate queue is unreadable".into(),
+            ))
+        }
+
+        async fn read(&self, _artifact_id: &str) -> SFResult<Option<ChangeCandidate>> {
+            unimplemented!("RefusingCandidates stands in only for the refused read")
+        }
+    }
+
+    /// 队列读不出时要说出来，不能折成一张空表。
+    ///
+    /// 这份记录是管理面列表里「已退场那一半」的唯一来源：折成空表时，一次读失败
+    /// 会让每一条已落地的变更从列表里安安静静地消失，与「一条都没落地过」读成
+    /// 同一个样子。
+    #[tokio::test]
+    async fn an_unreadable_queue_is_an_error_not_an_empty_listing() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let pipeline = ChangePipeline::new(temp.path(), &change_dir, true)
+            .with_candidates(Arc::new(RefusingCandidates));
+
+        let error = pipeline
+            .known_change_records()
+            .await
+            .expect_err("a read that failed must not be handed out as no records");
+        assert!(
+            error.to_string().contains("unreadable"),
+            "the error has to be the store's own: {error}"
         );
     }
 
@@ -8257,6 +8378,15 @@ index 1111111..2222222 100644
             None,
             "读不到不是绿：它要变成一句写进证据的话"
         );
+        // 箭头两边同版：rustup 把同一次发布又列了一遍。原样输出见 2026-11-19 本机
+        // `rustup check`。按「箭头后面那个」走会重新下载几百兆来装同一把编译器。
+        assert_eq!(
+            stable_release_from_check(
+                "stable-x86_64-unknown-linux-gnu - update available: 1.100.0 (0ef1bc386 2026-11-09) -> 1.100.0 (0ef1bc386 2026-11-09)"
+            ),
+            Some(StableRelease::Current),
+            "两边同版还去装，等于为同一把编译器再下一次几百兆"
+        );
     }
 
     /// 刷新的结果要真的递到判据那几条命令手上。
@@ -8294,6 +8424,7 @@ index 1111111..2222222 100644
     /// 两个方向都钉：缺件的目录不认，补齐了才认。只钉第一个方向的话，一个「永远不认」
     /// 的实现也能过，而那会让每一条变更都重装几百兆。
     #[test]
+    #[cfg(unix)]
     fn a_toolchain_directory_without_its_components_is_not_provisioned() {
         let home = tempfile::tempdir().unwrap();
         let dir = home
@@ -8308,8 +8439,8 @@ index 1111111..2222222 100644
             "只有 cargo 的目录被当成装好了：判据会指过去，然后每一条格式化命令都起不来"
         );
 
-        std::fs::write(dir.join("bin").join("rustfmt"), "").unwrap();
-        std::fs::write(dir.join("bin").join("cargo-clippy"), "").unwrap();
+        write_stub(&dir.join("bin"), "rustfmt", 0);
+        write_stub(&dir.join("bin"), "cargo-clippy", 0);
         assert_eq!(
             provisioned_toolchain_in(home.path(), "1.99.1"),
             Some(dir),
@@ -8320,6 +8451,49 @@ index 1111111..2222222 100644
             None,
             "按 1.98.1 问，答的却是 1.99.1 的目录——那样装的那一趟永远被跳过，判据停在旧那一把"
         );
+    }
+
+    /// 一个组件文件都在、却起不来的目录也不算「装好了」。
+    ///
+    /// 2026-11-19 门禁实测的现场：`rustup toolchain install 1.100.0` 被超时打断，
+    /// 目录里 `bin/rustfmt` 与 `bin/cargo-clippy` 都在，缺的是 `librustc_driver-*.so`。
+    /// 只查文件在不在的判据把它认成装好了，于是 14 条与格式无关的测试一起被读成
+    /// 「是这笔改动弄坏了它们」——一条从未被评判的变更被判为不合格，和「变更确实是
+    /// 坏的」在证据里同形。两个方向都钉：起不来的不认，换成起得来的才认。
+    #[test]
+    #[cfg(unix)]
+    fn a_toolchain_whose_rustfmt_cannot_start_is_not_provisioned() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home
+            .path()
+            .join("toolchains")
+            .join("1.100.0-x86_64-unknown-linux-gnu");
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        write_stub(&dir.join("bin"), "rustfmt", 1);
+        write_stub(&dir.join("bin"), "cargo-clippy", 0);
+        assert_eq!(
+            provisioned_toolchain_in(home.path(), "1.100.0"),
+            None,
+            "起不来的工具链被当成装好了：判据指过去之后每一条格式化命令都起不来"
+        );
+
+        write_stub(&dir.join("bin"), "rustfmt", 0);
+        assert_eq!(
+            provisioned_toolchain_in(home.path(), "1.100.0"),
+            Some(dir),
+            "两个组件都在、rustfmt 也起得来，还不认——同一笔变更会守着 RUSTUP_HOME 重装几百兆"
+        );
+    }
+
+    /// 在 `bin` 下放一个可执行、退 `exit` 的脚本，冒充一个组件二进制。
+    #[cfg(unix)]
+    fn write_stub(bin: &std::path::Path, name: &str, exit: i32) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = bin.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\nexit {exit}\n")).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
     }
 
     /// 编译器包装器不得进入判据进程，两个方向都钉死：白名单里现在没有，将来加回来

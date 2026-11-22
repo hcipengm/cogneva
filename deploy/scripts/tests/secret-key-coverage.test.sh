@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# principle: feedback_a_gate_must_name_the_defect_it_stops
 # principle: feedback_a_gate_whose_members_are_named_by_hand_must_scan_for_unlisted_members
 # `check-secret-key-coverage.sh` 的八个格子：树里两面、现网一面，加一个反例。
 #

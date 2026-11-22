@@ -300,6 +300,9 @@ impl PodRuntime {
     ///
     /// `Ok(None)` ＝ 命名空间里没有这只配额（治理关掉了，或者这不是那套安装）：
     /// 那时没有额度要抬，Pod 建不建得上由准入自己回答，这里不去替它编一个额度。
+    /// 但那是 apiserver 明确答 `NotFound` 才成立的读法：一次 403、一次连不上、一条
+    /// 被信号打断的命令都没读成，把没读成写成「没有这只配额」，这台机器就会在不知道
+    /// 额度的情况下继续往下走。
     async fn quota(&self) -> anyhow::Result<Option<(Quota, Quota)>> {
         let out = self
             .exec(&[
@@ -311,21 +314,42 @@ impl PodRuntime {
             ])
             .await?;
         if out.code != Some(0) {
-            return Ok(None);
+            if quota_is_absent(&out) {
+                return Ok(None);
+            }
+            anyhow::bail!(
+                "读不到 {QUOTA_NAME} 这只配额（kubectl 退出码 {:?}）：{}。\
+                 没读成不等于「没有这只配额」——后者是治理关掉的说法",
+                out.code,
+                out.stderr.trim()
+            );
         }
         let doc: serde_json::Value = serde_json::from_str(&out.stdout)
             .map_err(|e| anyhow::anyhow!("resourcequota {QUOTA_NAME}: {e}"))?;
-        let side = |pointer: &str| {
-            let map = &doc[pointer];
-            Quota {
-                cpu: map["limits.cpu"].as_str().and_then(cpu_millis).unwrap_or(0),
-                memory: map["limits.memory"]
-                    .as_str()
-                    .and_then(mem_bytes)
-                    .unwrap_or(0),
-            }
+        // 两维都要求是一个读得出来的量：缺了记 0，抬额度那一步就会从一个「用量是 0」
+        // 的假读数出发。
+        let side = |pointer: &str| -> anyhow::Result<Quota> {
+            // `doc[pointer]` 只按**整串**键名查，`"/status/used"` 于是永远查不到，
+            // 两维每次都读成 0——上面那两个 `unwrap_or(0)` 恰好把这件事盖住了。
+            let map = doc.pointer(pointer).ok_or_else(|| {
+                anyhow::anyhow!("resourcequota {QUOTA_NAME} has no {pointer}: {doc}")
+            })?;
+            let dimension = |field: &str, parse: fn(&str) -> Option<u64>| -> anyhow::Result<u64> {
+                let text = map[field].as_str().ok_or_else(|| {
+                    anyhow::anyhow!("resourcequota {QUOTA_NAME} has no {pointer}.{field}: {doc}")
+                })?;
+                parse(text).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "resourcequota {QUOTA_NAME} {pointer}.{field} is not a quantity: {text:?}"
+                    )
+                })
+            };
+            Ok(Quota {
+                cpu: dimension("limits.cpu", cpu_millis)?,
+                memory: dimension("limits.memory", mem_bytes)?,
+            })
         };
-        Ok(Some((side("/status/used"), side("/spec/hard"))))
+        Ok(Some((side("/status/used")?, side("/spec/hard")?)))
     }
 
     /// 把配额的 limits 两维抬到给的那组数（只抬、不降：降是下一次交付的事，
@@ -597,6 +621,15 @@ fn cpu_millis(text: &str) -> Option<u64> {
 
 fn cpu_text(millis: u64) -> String {
     format!("{millis}m")
+}
+
+/// `get resourcequota` 没拿到 0 时：这一格是「没这只配额」，还是「没问出来」。
+///
+/// 只有 apiserver 明确答 `NotFound`（带退出码 1）才是前者。403（没有读配额的权限）、
+/// 连不上、被信号打断（没有退出码）都是后者——把它们读成「没有这只配额」，这台机器
+/// 就会在不知道额度的情况下继续往下走。
+fn quota_is_absent(out: &RunOutcome) -> bool {
+    out.code == Some(1) && (out.stderr.contains("NotFound") || out.stderr.contains("not found"))
 }
 
 fn mem_bytes(text: &str) -> Option<u64> {
@@ -1290,6 +1323,83 @@ mod tests {
         let a = pod_name(&format!("toolathlon-{}a", "z".repeat(60)));
         let b = pod_name(&format!("toolathlon-{}b", "z".repeat(60)));
         assert_ne!(a, b);
+    }
+
+    /// 一条 `kubectl` 的回话：只看退出码与 stderr。
+    fn kubectl_said(code: Option<i32>, stderr: &str) -> RunOutcome {
+        RunOutcome {
+            stdout: String::new(),
+            stderr: stderr.into(),
+            code,
+        }
+    }
+
+    /// 没这只配额与没问出来是两件事：前者是治理关掉的说法，后者说明这一格没有读数。
+    #[test]
+    fn a_missing_quota_is_told_apart_from_a_lookup_that_failed() {
+        assert!(quota_is_absent(&kubectl_said(
+            Some(1),
+            "Error from server (NotFound): resourcequotas \"x\" not found"
+        )));
+        assert!(!quota_is_absent(&kubectl_said(
+            Some(1),
+            "Error from server (Forbidden): resourcequotas \"x\" is forbidden"
+        )));
+        assert!(!quota_is_absent(&kubectl_said(
+            Some(1),
+            "Unable to connect to the server: dial tcp 10.0.0.1:6443: i/o timeout"
+        )));
+        // 被信号打断：没有退出码，它连「apiserver 说了什么」都算不上。
+        assert!(!quota_is_absent(&kubectl_said(None, "not found")));
+    }
+
+    /// 一只只答一句话的 `kubectl`：脚本由用例给，`-n <namespace>` 落成 `$0`。
+    fn kubectl_script(script: &str) -> PodRuntime {
+        PodRuntime::for_test(vec!["/bin/sh".into(), "-c".into(), script.into()], "ns")
+    }
+
+    /// 403 不是「没有这只配额」：旧代码把它读成 `Ok(None)`，于是这台机器以为没有
+    /// 额度要抬，Pod 建不上时也没人知道额度从来没读到过。
+    #[tokio::test]
+    async fn a_forbidden_quota_lookup_is_an_error_not_an_absent_quota() {
+        let runner = kubectl_script(
+            "echo 'Error from server (Forbidden): resourcequotas \"x\" is forbidden: User cannot get' >&2; exit 1",
+        );
+        let error = runner.quota().await.expect_err("403 不是「没有这只配额」");
+        assert!(format!("{error:#}").contains("Forbidden"), "{error:#}");
+    }
+
+    /// 反例：apiserver 明确答 NotFound 时，`Ok(None)` 是诚实的读法。
+    #[tokio::test]
+    async fn a_namespace_without_the_quota_is_not_a_failure() {
+        let runner = kubectl_script(
+            "echo 'Error from server (NotFound): resourcequotas \"x\" not found' >&2; exit 1",
+        );
+        assert!(runner.quota().await.expect("没这只配额不是错").is_none());
+    }
+
+    /// 两维缺一格就是没读成，不许记 0——抬额度那一步会从一个「用量是 0」的假读数
+    /// 出发。
+    #[tokio::test]
+    async fn a_quota_answer_without_both_dimensions_is_not_read_as_zero() {
+        let runner = kubectl_script(
+            r#"printf '%s' '{"status":{"used":{"limits.cpu":"2"}},"spec":{"hard":{"limits.cpu":"4","limits.memory":"8Gi"}}}'"#,
+        );
+        let error = runner.quota().await.expect_err("缺一维不是「用量为 0」");
+        assert!(format!("{error:#}").contains("limits.memory"), "{error:#}");
+    }
+
+    /// 反例：两维都在的配额照常读出来。
+    #[tokio::test]
+    async fn a_quota_answer_is_read_from_its_limits() {
+        let runner = kubectl_script(
+            r#"printf '%s' '{"status":{"used":{"limits.cpu":"2","limits.memory":"4Gi"}},"spec":{"hard":{"limits.cpu":"4","limits.memory":"8Gi"}}}'"#,
+        );
+        let (used, hard) = runner.quota().await.unwrap().expect("有一份读数");
+        assert_eq!(used.cpu, 2000);
+        assert_eq!(used.memory, 4 * (1u64 << 30));
+        assert_eq!(hard.cpu, 4000);
+        assert_eq!(hard.memory, 8 * (1u64 << 30));
     }
 
     #[test]

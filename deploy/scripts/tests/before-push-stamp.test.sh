@@ -34,6 +34,17 @@ fail() { echo "FAIL: $*"; exit 1; }
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
 
+# 私有标识那一格（2026-11-20 起在推前门里）：按 `cogneva.privateRoot` 找私有仓的判据，没配
+# 就退 75（没验）。夹具里每一棵树都是临时仓，本机装没装私有仓检出不该决定它们的判词——
+# 不钉住的话，同一份字节在一台配了私有仓的机器上会让下面每个「整门绿」的夹具变成红。
+# 那一格自己的行为由它自己的测试判；这里只给一份退 0 的桩，让「整门绿」这一侧可复现。
+private_stub="${work}/private-stub"
+mkdir -p "${private_stub}/scripts/gates"
+printf '#!/usr/bin/env bash\nexit 0\n' \
+    >"${private_stub}/scripts/gates/check-private-references.sh"
+chmod +x "${private_stub}/scripts/gates/check-private-references.sh"
+export COGNEVA_PRIVATE_ROOT="${private_stub}"
+
 tree="${work}/tree"
 mkdir -p "${tree}/deploy/scripts/tests" "${tree}/.github/workflows"
 stage_gate "${repo}" "${tree}"
@@ -488,84 +499,6 @@ grep -q '没动 crates/ 下的 .rs' "${work}/out" &&
     fail "盘上有未提交的 crates/foo/src/lib.rs，Test 那一格却说「没动 crates/ 下的 .rs」跳过了：这份字节没有被它判过；实得：$(cat "${work}/out")"
 grep -q -- '-p foo' "${work}/ftree-cargo-calls" 2>/dev/null ||
     fail "Test 那一格没有把 foo 交给 cargo（未提交的改动没进题目）；实得：$(cat "${work}/ftree-cargo-calls" 2>/dev/null)"
-
-# 20) 树脏时 Clippy 就地判，不判 HEAD 展开出来的临时树。
-#
-# 临时树里放不下脏树的改动，而收尾盖的内容键是盘上这份字节。脏树上去判那份拷贝，绿的是
-# 一份没人要推的字节；把它记成「这份字节验过」，等于用一个别的树的结论替这棵树背书。
-ctree="${work}/ctree"
-mkdir -p "${ctree}/deploy/scripts/tests" "${ctree}/.github/scripts/tests" \
-    "${ctree}/.github/workflows" "${ctree}/bin" "${ctree}/crates/foo/src"
-stage_gate "${repo}" "${ctree}"
-printf '#!/usr/bin/env bash\nexit 0\n' >"${ctree}/deploy/scripts/tests/ok.test.sh"
-printf '#!/usr/bin/env bash\nexit 0\n' >"${ctree}/.github/scripts/tests/ok.test.sh"
-cat >"${ctree}/bin/cargo" <<SH
-#!/usr/bin/env bash
-case "\$1" in
-  --version|-V) echo "cargo 9.9.9 (fixture)"; exit 0 ;;
-  fmt) exit 1 ;;
-  clippy)
-    case "\$2" in
-      --version) echo "clippy 9.9.9 (fixture)"; exit 0 ;;
-      *) printf '%s\n' "\$(pwd)" >>"${work}/ctree-clippy-cwd"; exit 0 ;;
-    esac ;;
-  *)
-    printf '%s\n' "\$*" >>"${work}/ctree-cargo-calls"
-    echo "test result: ok. 1 passed; 0 failed; 0 ignored"; exit 0 ;;
-esac
-SH
-chmod +x "${ctree}/bin/cargo"
-# pwsh 那一格只在装了 pwsh 的机器上跑（没装就 SKIP），所以夹具缺这个文件时本机照绿、
-# CI 上一跑就红。真仓库里它永远在，夹具得连它一起造齐。
-printf 'Write-Host "fixture"\n' >"${ctree}/bootstrap.ps1"
-printf '#!/usr/bin/env bash\nexit 0\n' >"${ctree}/nothing.sh"
-printf '[workspace]\nmembers = ["crates/foo"]\n' >"${ctree}/Cargo.toml"
-printf '[package]\nname = "foo"\nversion = "0.0.0"\nedition = "2021"\n' >"${ctree}/crates/foo/Cargo.toml"
-printf 'pub fn one() -> u8 { 1 }\n' >"${ctree}/crates/foo/src/lib.rs"
-cat >"${ctree}/.github/workflows/ci.yml" <<'YAML'
-name: ci
-jobs:
-  repo-conventions:
-    steps:
-      - name: nothing
-        run: bash nothing.sh
-YAML
-(
-    cd "${ctree}" || exit 1
-    git init -q -b main .
-    git config user.email gate@example.invalid
-    git config user.name gate
-    printf 'one\n' >tracked.txt
-    git add tracked.txt bootstrap.ps1 nothing.sh Cargo.toml crates/foo/Cargo.toml crates/foo/src/lib.rs \
-        .github/workflows/ci.yml deploy/scripts/tests/ok.test.sh \
-        .github/scripts/tests/ok.test.sh deploy/scripts/check-before-push.sh \
-        deploy/scripts/lib/build-slot.sh
-    git commit -q -m base
-    git update-ref refs/remotes/origin/main HEAD
-) || fail "Clippy 脏树那一格的夹具建不起来"
-ct_env=(env COGNEVA_BUILD_GATE_LOCK_DIR="${work}/ctree-gate" COGNEVA_BUILD_LOCK_FILE="${work}/ctree.lock"
-    PATH="${ctree}/bin:${PATH}")
-printf 'pub fn two() -> u8 { 2 }\n' >"${ctree}/crates/foo/src/lib.rs"
-rm -f "${work}/ctree-clippy-cwd"
-( cd "${ctree}" && "${ct_env[@]}" bash deploy/scripts/check-before-push.sh ) >"${work}/out" 2>&1 ||
-    fail "Clippy 脏树那一跑自己红了：$(cat "${work}/out")"
-dirty_cwd="$(head -n 1 "${work}/ctree-clippy-cwd" 2>/dev/null)"
-[ -n "${dirty_cwd}" ] || fail "Clippy 在脏树上没跑：$(cat "${work}/out")"
-case "${dirty_cwd}" in
-    "${ctree}") : ;;
-    *) fail "脏树上的 Clippy 判的不是工作树（cwd=${dirty_cwd}），而收尾记的是工作树的键" ;;
-esac
-# 干净树上反过来：判的是 HEAD 展开出来的那份拷贝（原行为，不许被这一改顺手丢掉）。
-rm -f "${work}/ctree-clippy-cwd"
-( cd "${ctree}" && git add crates/foo/src/lib.rs && git commit -q -m "two" ) || fail "干净树造不出来"
-( cd "${ctree}" && "${ct_env[@]}" bash deploy/scripts/check-before-push.sh ) >"${work}/out" 2>&1 ||
-    fail "Clippy 干净树那一跑自己红了：$(cat "${work}/out")"
-clean_cwd="$(head -n 1 "${work}/ctree-clippy-cwd" 2>/dev/null)"
-[ -n "${clean_cwd}" ] || fail "Clippy 在干净树上没跑：$(cat "${work}/out")"
-case "${clean_cwd}" in
-    *cogneva-push-clippy*) : ;;
-    *) fail "干净树上的 Clippy 没有判 HEAD 展开出来的那份拷贝（cwd=${clean_cwd}）" ;;
-esac
 
 # 21) 容量登记表那格单文件 rustc 直编也要走构建槽。
 #

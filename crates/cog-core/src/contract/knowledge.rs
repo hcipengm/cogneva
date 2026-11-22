@@ -202,21 +202,26 @@ pub const RETRIEVAL_LAYERS: [&str; 2] = [RETRIEVAL_LAYER_MEMORY, RETRIEVAL_LAYER
 /// The cells a consulted layer's answer lands in.
 ///
 /// `hit` (the layer answered with rows), `empty` (it answered and had none),
-/// `error` (its backend refused), `absent` (this process holds no such layer).
-/// At every caller the first three are the same empty list, which is the whole
-/// reason the four are separated where they are written rather than where they
-/// are read.
+/// `error` (its backend refused), `absent` (this process holds no such layer),
+/// `partial` (it answered, and some of what its store held could not be decoded
+/// into the layer's own type). At every caller, everything except `hit` reaches
+/// the caller as an empty list or a shorter one, which is the whole reason the
+/// cells are separated where they are written rather than where they are read.
+/// `partial` is what keeps a store full of unreadable rows from being published
+/// as `empty`.
 pub const RETRIEVAL_OUTCOME_HIT: &str = "hit";
 pub const RETRIEVAL_OUTCOME_EMPTY: &str = "empty";
 pub const RETRIEVAL_OUTCOME_ERROR: &str = "error";
 pub const RETRIEVAL_OUTCOME_ABSENT: &str = "absent";
+pub const RETRIEVAL_OUTCOME_PARTIAL: &str = "partial";
 
-/// All four cells, for a writer that walks the set rather than naming one.
-pub const RETRIEVAL_OUTCOMES: [&str; 4] = [
+/// All five cells, for a writer that walks the set rather than naming one.
+pub const RETRIEVAL_OUTCOMES: [&str; 5] = [
     RETRIEVAL_OUTCOME_HIT,
     RETRIEVAL_OUTCOME_EMPTY,
     RETRIEVAL_OUTCOME_ERROR,
     RETRIEVAL_OUTCOME_ABSENT,
+    RETRIEVAL_OUTCOME_PARTIAL,
 ];
 
 /// Publish one cell of `cogneva_knowledge_retrieval_total`.

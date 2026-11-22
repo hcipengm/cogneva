@@ -30,6 +30,12 @@ pub struct TaskProfile {
     pub declaration_inputs: DeclarationInputs,
 }
 
+/// 整份预算：这一维归一化到 0.0..=1.0，一份就是一。
+///
+/// 不是挑出来的阈值——它是这个归一化的端点，和 0.0 一样是刻度的定义。
+// cap: fixed — 归一化区间的上端点：一份预算就是一
+pub const WHOLE_BUDGET: f64 = 1.0;
+
 impl Default for TaskProfile {
     fn default() -> Self {
         Self {
@@ -37,7 +43,7 @@ impl Default for TaskProfile {
             risk: 0.0,
             ambiguity: 0.0,
             dependency_count: 0.0,
-            token_budget: 1.0,
+            token_budget: WHOLE_BUDGET,
             declared_scale: DeclaredScale::Unknown,
             declaration_inputs: DeclarationInputs::empty(),
         }

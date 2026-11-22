@@ -160,11 +160,11 @@ spec:
               value: cogneva-sandbox-executor-egress
             # 每任务工作树路由：真实 task id 锚定命令 cwd 与相对文件路径。
             - name: SANDBOX_WORKSPACES_ROOT
-              value: /opt/cogneva/sandbox/workspaces
+              value: {{ .Values.evolution.workspaces.root }}
             - name: SANDBOX_BARE_REPO
               value: /opt/cogneva/sandbox/repo.git
             - name: CARGO_TARGET_DIR
-              value: /opt/cogneva/sandbox/src/target
+              value: {{ .Values.evolution.workspaces.targetDir }}
             # 镜像里的 /usr/local/cargo 归 root，本 Pod 以非 root 跑，cargo 连
             # registry 缓存目录都建不出来——每条 cargo 命令第一步就失败，工具
             # 调用只剩反复试错。指向自有卷上的目录：可写，且已拉取的 registry

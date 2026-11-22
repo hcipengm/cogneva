@@ -379,8 +379,9 @@ mod tests {
         assert!(!reading(5, None).over_capacity);
     }
 
-    /// A steady target is still a beat: the reading is written every pass, so
-    /// "nothing to do" and "the loop stopped" stay different readings.
+    // proves: checkpointStore.maxRows
+    /// 目标不变的一拍仍然是一拍：读数上的求值计数必须往上走，来源标签必须
+    /// 从 seed 变成 derived。没有这一条，「回路在算」就只剩启动时那一次。
     #[tokio::test]
     async fn a_beat_whose_target_does_not_move_still_counts() {
         let pool = sqlx::postgres::PgPoolOptions::new()

@@ -620,8 +620,18 @@ pub struct RawLoggerConfig {
     pub flush_interval_secs: u64,
 }
 
+// 一条记录的大小在几百字节量级：一千条留在内存里是几百 KB，是一次刷盘能背得动
+// 的量；再多，进程死掉时丢的那一段就不再是一瞬间的读数。
+// cap: bound — 一千条几百 KB：一次刷盘背得动，死掉时丢的只是一瞬间的读数
+const RAW_LOG_MAX_BUFFER_RECORDS: usize = 1000;
+
+// 一秒：计时器与条数两个触发谁先到谁刷，一秒是「事件驱动的一拍」的下限——再短
+// 就退化成每条记录一次刷盘。
+// cap: bound — 一秒：再短就退化成每条一次刷盘，一拍的下限就是这个节拍
+const RAW_LOG_FLUSH_INTERVAL_SECS: u64 = 1;
+
 fn default_flush_interval_secs() -> u64 {
-    1
+    RAW_LOG_FLUSH_INTERVAL_SECS
 }
 
 impl Default for RawLoggerConfig {
@@ -629,7 +639,7 @@ impl Default for RawLoggerConfig {
         Self {
             enabled: false,
             base_dir: String::new(),
-            max_buffer_size: 1000,
+            max_buffer_size: RAW_LOG_MAX_BUFFER_RECORDS,
             format: RawLoggerFormat::default(),
             zstd_level: None,
             flush_interval_secs: default_flush_interval_secs(),
@@ -1502,6 +1512,18 @@ const DEFAULT_HOT_DURATION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 // cap: bound — 一个季度之后的事件属于归档但仍要能查；这是分层策略的取舍，不是测量
 const DEFAULT_WARM_DURATION: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 
+/// zstd 的三档压缩级别：`0` 是库自己的默认档，`3` 是推荐区间里的快档，`9` 是
+/// 高压缩档。
+///
+/// 三个存储面说的是同一件事——原始日志、冷热分层迁移、可观测快照各写一份，改
+/// 一处忘一处，盘上就会出现「同一天的日志在两个 tier 用两种档压」。
+// cap: fixed — zstd 语义：0 = 库默认档
+pub const COMPRESSION_LEVEL_DEFAULT: i32 = 0;
+// cap: fixed — zstd 推荐压缩档（快档 3）
+pub const COMPRESSION_LEVEL_WARM: i32 = 3;
+// cap: fixed — zstd 推荐压缩档（高压缩档 9）
+pub const COMPRESSION_LEVEL_COLD: i32 = 9;
+
 /// 默认每小时扫一次分层：分层是按时间的判据，密到分钟级只会重复搬同一批对象。
 // cap: bound — 分层是按时间的判据，密到分钟级只会重复搬同一批对象
 const DEFAULT_TIER_SCAN_INTERVAL: Duration = Duration::from_secs(3600);
@@ -1511,8 +1533,8 @@ impl Default for TierPolicy {
         Self {
             hot_duration: DEFAULT_HOT_DURATION,
             warm_duration: DEFAULT_WARM_DURATION,
-            warm_compression_level: 3,
-            cold_compression_level: 9,
+            warm_compression_level: COMPRESSION_LEVEL_WARM,
+            cold_compression_level: COMPRESSION_LEVEL_COLD,
             scan_interval: DEFAULT_TIER_SCAN_INTERVAL,
             cold_key_prefix: "raw".into(),
         }
@@ -1608,5 +1630,41 @@ mod streaming_write_tests {
             text.contains("whole object in memory"),
             "判词要说出它现在是哪一种写：{text}"
         );
+    }
+}
+
+mod tests {
+    use super::*;
+
+    /// 原始日志的缓冲条数与刷盘间隔各只有一处声明：默认值读常量，常量上面写着
+    /// 它由什么钉住。`#[serde(default = …)]` 走的是同一个常量。
+    #[test]
+    fn the_raw_logger_reads_its_buffer_and_flush_interval() {
+        let cfg = RawLoggerConfig::default();
+        assert_eq!(cfg.max_buffer_size, RAW_LOG_MAX_BUFFER_RECORDS);
+        assert_eq!(cfg.flush_interval_secs, RAW_LOG_FLUSH_INTERVAL_SECS);
+        assert_eq!(default_flush_interval_secs(), RAW_LOG_FLUSH_INTERVAL_SECS);
+
+        let body = include_str!("storage.rs")
+            .split("impl Default for RawLoggerConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    let value = value.trim().trim_end_matches(',');
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.starts_with(|c: char| c.is_ascii_digit())
+                        && value != "0"
+                })
+            })
+            .map(str::trim)
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
     }
 }

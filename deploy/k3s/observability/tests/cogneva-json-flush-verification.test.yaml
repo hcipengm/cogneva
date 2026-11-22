@@ -109,11 +109,12 @@ tests:
       - series: 'audited_llm_requests_total{outcome="refused"}'
         values: '0x50 2x10'
       - series: 'cogneva_analytics_flush_total{outcome="failed",job="analytics"}'
-        values: '0x55 3x5'
-      # loki 那条的窗口是 5 分钟（分析是 30 分钟）：跳变要落在 (55, 60] 里面，
-      # 正好压在窗口起点上（t=55）increase 读出来是 0，这一格就不会响。
+        values: '0x57 3x3'
+      # loki 那条的窗口是 5 分钟（分析是 30 分钟）：窗口左端是开区间，跳变要落在 (55, 60] 里面，
+      # 而且窗口里得留一个跳变前的样本——正好压在起点上（t=55）时，窗口里第一个样本已经是新值，
+      # increase 读出来仍是 0，这一格就不会响。
       - series: 'cogneva_loki_flush_total{outcome="failed",job="loki"}'
-        values: '0x56 2x4'
+        values: '0x57 2x3'
       - series: 'cogneva_knowledge_retrieval_total{outcome="error",layer="vector"}'
         values: '0x50 4x10'
       - series: 'cogneva_backup_run_readings{readout="credential_surface_live"}'
@@ -183,11 +184,11 @@ tests:
   - interval: 1m
     input_series:
       - series: 'cogneva_analytics_flush_total{outcome="failed",job="analytics"}'
-        values: '0x55 3x5'
+        values: '0x57 3x3'
       - series: 'cogneva_analytics_flush_total{outcome="flushed",job="analytics"}'
         values: '0x56 1x4'
       - series: 'cogneva_loki_flush_total{outcome="failed",job="loki"}'
-        values: '0x56 2x4'
+        values: '0x57 2x3'
       - series: 'cogneva_loki_flush_total{outcome="flushed",job="loki"}'
         values: '0x57 1x3'
     alert_rule_test:

@@ -121,37 +121,42 @@ fn the_sandbox_workload_is_one_the_queue_is_allowed_to_resize() {
 /// 种子声明成「跟着读数走」，而不是一个由人挑的数。
 ///
 /// 安装时那个 1 是种子：第一拍读到队之前它生效，之后由队回答。它在该叶子上头那块
-/// `# tunable:` 里只要被写成 `derived`、理由里点名那条读数，读者就能看出它不是
-/// 一个天花板；写成 `fixed`，容量就又成了一次签字。
+/// `# tunable:` 里只要带着 `proof:`（有一场测试证明「换输入值就变」）、理由里点名
+/// 那条读数，读者就能看出它不是一个天花板；块里没有证明，容量就又成了一次签字。
 #[test]
 fn the_seed_count_is_declared_as_following_a_reading() {
     let values = std::fs::read_to_string(repo_root().join("deploy/helm/cogneva/values.yaml"))
         .expect("the chart's values are readable");
     let lines: Vec<&str> = values.lines().collect();
-    let mut found: Option<(&str, &str)> = None;
+    let mut found: Option<(bool, &str)> = None;
     for (index, line) in lines.iter().enumerate() {
-        let Some(word) = line.trim_start().strip_prefix("# tunable:") else {
+        if !line.trim_start().starts_with("# tunable:") {
             continue;
-        };
+        }
         let mut why = String::new();
+        let mut measured = false;
         let mut next = index;
         while next < lines.len() && lines[next].trim_start().starts_with('#') {
             if let Some(body) = lines[next].trim_start().strip_prefix('#') {
-                if let Some(text) = body.trim().strip_prefix("why:") {
+                let body = body.trim();
+                if let Some(text) = body.strip_prefix("why:") {
                     why.push_str(text.trim());
                     why.push(' ');
+                }
+                if body.starts_with("proof:") {
+                    measured = true;
                 }
             }
             next += 1;
         }
         if why.contains("GET /lane") {
-            found = Some((word.trim(), lines.get(next).copied().unwrap_or_default()));
+            found = Some((measured, lines.get(next).copied().unwrap_or_default()));
         }
     }
-    let (source, leaf) = found.expect("the executor's replica seed carries a judgement");
-    assert_eq!(
-        source, "derived",
-        "理由点名了 GET /lane，判词却不是 derived：容量又成了一次签字"
+    let (measured, leaf) = found.expect("the executor's replica seed carries a judgement");
+    assert!(
+        measured,
+        "理由点名了 GET /lane，块里却没有 `proof:`：容量又成了一次签字"
     );
     assert!(
         leaf.trim_start().starts_with("replicas:"),

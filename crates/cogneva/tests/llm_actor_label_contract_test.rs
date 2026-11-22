@@ -664,7 +664,6 @@ const CALL_SITES: &[(&str, ActorSource)] = &[
         "crates/cog-llm/src/provider/responses.rs",
         ActorSource::Forwards,
     ),
-    ("crates/cog-llm/src/resilience.rs", ActorSource::Forwards),
     ("crates/cog-llm/src/routing.rs", ActorSource::Forwards),
     ("crates/cogneva/src/eval_table.rs", ActorSource::Stamps),
 ];

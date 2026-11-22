@@ -162,7 +162,12 @@ def main() -> int:
         )
         return 1
 
-    bad = []
+    # Dockerfile 的 crate 名单与工作区成员必须逐名对上，两个方向都判：
+    # 删掉的 crate 还留在名单里，构建在这一层 `stat` 失败（实测：cog-redis 在
+    # 2026-10-29 被删、Dockerfile 没跟着改，直到 2026-11-19 元启动从源码建镜像
+    # 才第一次现形——那之前没有任何普通推送会走到这一步）；新加的成员漏进名单，
+    # 依赖预热层解析工作区时就找不到它，同样在这一层失败。
+    bad = crate_list_disagreements(repo)
     for rs, where, target in targets:
         crate = rs.relative_to(repo).parts[1]  # crates/<crate>/...
         if target.startswith(f"crates/{crate}/") or target in ALLOWED:
@@ -186,6 +191,28 @@ def main() -> int:
         return 1
     return 0
 
+
+def crate_list_disagreements(repo: Path) -> list[str]:
+    """Dockerfile 点名的 crate 与 Cargo.toml 的工作区成员之间的分叉。"""
+    manifest = (repo / "Cargo.toml").read_text()
+    members = set(re.findall(r'"crates/([A-Za-z0-9_-]+)"', manifest))
+    dockerfile = (repo / "Dockerfile").read_text()
+    copied = set(re.findall(r"^COPY crates/([A-Za-z0-9_-]+)/Cargo\.toml ", dockerfile, re.MULTILINE))
+    out: list[str] = []
+    for name in sorted(copied):
+        if not (repo / "crates" / name / "Cargo.toml").is_file():
+            out.append(
+                f"Dockerfile COPY 了 crates/{name}/Cargo.toml，树里没有这个 crate"
+                "（删掉的 crate 要同时从 COPY 与占位循环里删）"
+            )
+        elif name not in members:
+            out.append(f"crates/{name} 在 Dockerfile 里，但不是工作区成员")
+    for name in sorted(members - copied):
+        out.append(
+            f"工作区成员 crates/{name} 没有进 Dockerfile 的 COPY 名单："
+            "依赖预热层解析工作区时找不到它"
+        )
+    return out
 
 sys.exit(main())
 PY

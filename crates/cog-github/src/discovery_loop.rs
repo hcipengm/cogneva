@@ -542,15 +542,30 @@ fn intent_verdict_prefix(task_id: &str) -> Option<String> {
     }
 }
 
-/// Page size the platform providers request when listing open intents. A
+/// Page size a single-page provider requests when listing open intents. A
 /// listing that returns exactly this many entries may be truncated, so
 /// reaping requires a count below the cap on both surfaces to treat the open
 /// set as provably complete.
-// cap: bound — 两个面都要数到低于这个界，才能把开放集当作可证完整
+// cap: bound — 只读一页的 provider 两个面都要数到低于这个界，才能把开放集当作可证完整
 const PROVIDER_LIST_PAGE_SIZE: usize = 100;
 
 fn listings_complete(issue_count: usize, pr_count: usize) -> bool {
     issue_count < PROVIDER_LIST_PAGE_SIZE && pr_count < PROVIDER_LIST_PAGE_SIZE
+}
+
+/// 这两份列取能不能当「全部还开着的」用。
+///
+/// 翻页翻到不满一页的 provider 自己保证完整（[`lists_every_page`]）；只读一页
+/// 的实现只能按条数猜：撞上页长上限的名单可能是截断的，拿它去 reap 会删掉还
+/// 开着的意图的判词，而账看上去更干净了——干净是假的。
+///
+/// [`lists_every_page`]: crate::provider::CodePlatformProvider::lists_every_page
+fn listing_is_complete(
+    provider: &dyn crate::provider::CodePlatformProvider,
+    issue_count: usize,
+    pr_count: usize,
+) -> bool {
+    provider.lists_every_page() || listings_complete(issue_count, pr_count)
 }
 
 impl AssessVerdicts {
@@ -1280,7 +1295,11 @@ impl GitHubDiscoveryLoop {
             self.provider.list_open_pull_requests().await,
         ) {
             (Ok(open_issues), Ok(open_prs))
-                if listings_complete(open_issues.len(), open_prs.len()) =>
+                if listing_is_complete(
+                    self.provider.as_ref(),
+                    open_issues.len(),
+                    open_prs.len(),
+                ) =>
             {
                 let platform = self.provider.platform_kind();
                 let open: std::collections::HashSet<String> = open_issues
@@ -5687,6 +5706,49 @@ pub(crate) mod tests {
         ));
         assert!(listings_complete(PROVIDER_LIST_PAGE_SIZE - 1, 3));
         assert!(listings_complete(0, 0));
+    }
+
+    /// 一份自报「翻完了每一页」与一份只读一页的 provider：前者几百条意图也是
+    /// 完整名单，后者撞上单页上限就只能按截断算。这个区分是 reap 闸的全部意义
+    /// 所在——翻页之后还按条数猜，仓库一过 100 个开放意图就永远 reap 不了。
+    struct ListingScope {
+        every_page: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl CodePlatformProvider for ListingScope {
+        fn lists_every_page(&self) -> bool {
+            self.every_page
+        }
+        async fn list_open_issues(&self) -> Result<Vec<PlatformIssue>> {
+            Ok(Vec::new())
+        }
+        async fn create_pull_request(
+            &self,
+            _req: CreatePullRequest,
+        ) -> Result<PlatformPullRequest> {
+            unimplemented!()
+        }
+        async fn comment_on_issue(&self, _issue_number: u64, _body: String) -> Result<()> {
+            unimplemented!()
+        }
+        async fn merge_pull_request(&self, _pr_number: u64, _sha: String) -> Result<()> {
+            unimplemented!()
+        }
+        async fn get_pull_request(&self, _pr_number: u64) -> Result<PullRequestDetail> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn a_provider_that_reads_every_page_is_complete_at_any_count() {
+        let paged = ListingScope { every_page: true };
+        assert!(listing_is_complete(&paged, 500, 300));
+        assert!(listing_is_complete(&paged, PROVIDER_LIST_PAGE_SIZE, 0));
+
+        let one_page = ListingScope { every_page: false };
+        assert!(listing_is_complete(&one_page, 3, 0));
+        assert!(!listing_is_complete(&one_page, PROVIDER_LIST_PAGE_SIZE, 0));
     }
 
     #[test]

@@ -23,11 +23,26 @@ pub struct RunnerConfig {
     pub judge_enabled: bool,
 }
 
+/// 同时跑几例：这台机器能同时跑几个线程就几例。
+///
+/// 评测例是 CPU 密集的（跑 harness、算指标），并发上限就是核数——写成一个固定
+/// 数字，换一台机器就变成另一个数的猜测。
+fn default_max_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// 一例重跑一次：一次失败可能是环境抖动（镜像、网络），两次都失败就把它记成
+/// 失败——第三次只是在同一个坏环境里再多花一次的 token。
+// cap: bound — 一次：一次可能是环境抖动，两次都失败就记失败，第三次只是多花一份 token
+const DEFAULT_CASE_RETRIES: u32 = 1;
+
 impl Default for RunnerConfig {
     fn default() -> Self {
         Self {
-            max_concurrency: 4,
-            retry_count: 1,
+            max_concurrency: default_max_concurrency(),
+            retry_count: DEFAULT_CASE_RETRIES,
             judge_enabled: false,
         }
     }
@@ -545,6 +560,37 @@ fn retry_wait(last_error: Option<&str>) -> std::time::Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 一例的重跑次数只有一处声明：默认值读常量，常量上面写着它由什么钉住。
+    ///
+    /// 两面一起钉：运行时默认值等于常量（改常量就改默认值），源码面
+    /// `impl Default` 的字段里不再有数字（下一笔写回裸字面量就红）。
+    #[test]
+    fn the_runner_default_reads_its_case_retries() {
+        assert_eq!(RunnerConfig::default().retry_count, DEFAULT_CASE_RETRIES);
+        let body = include_str!("runner.rs")
+            .split("impl Default for RunnerConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    let value = value.trim().trim_end_matches(',');
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.starts_with(|c: char| c.is_ascii_digit())
+                        // 哨兵 0 与空串不是旋钮，是「没写」。
+                        && value != "0"
+                })
+            })
+            .map(str::trim)
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
+    }
 
     #[test]
     fn a_stated_wait_is_honoured_and_an_unstated_one_is_bounded() {

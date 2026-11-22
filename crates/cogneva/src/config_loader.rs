@@ -403,10 +403,6 @@ fn default_env_mappings() -> HashMap<String, String> {
         "gateway.websocket_inactivity_timeout_secs".into(),
     );
     m.insert(
-        "COGNEVA_WEBSOCKET_TICK_SECS".into(),
-        "gateway.websocket_tick_secs".into(),
-    );
-    m.insert(
         "COGNEVA_NOTIFICATION_LIMIT".into(),
         "gateway.notification_limit".into(),
     );
@@ -617,10 +613,28 @@ pub fn apply_env_overrides(config: &mut AppConfig) {
     }
     let mappings: Vec<(String, String)> = merged.into_iter().collect();
 
+    // 写下去之前先记下文档在这条路径上原本写着什么：env 赢，所以文档那一份在
+    // 这个进程里谁都不读，而这件事原先只有把两份文件摊开对看才看得出来——进程
+    // 自己知道两边的值，却一个字都不说。
+    let mut applied: Vec<(String, Option<String>, String)> = Vec::new();
     for (env_key, path) in mappings {
         if let Ok(env_val) = std::env::var(&env_key) {
+            applied.push((
+                path.clone(),
+                documented_text_at(&value, &path),
+                env_val.clone(),
+            ));
             cog_core::config::set_json_path(&mut value, &path, &env_val);
         }
+    }
+    let replaced = replaced_documented_paths(&applied);
+    if !replaced.is_empty() {
+        // 只点名路径，不打印值：这些变量里既有端口也有密钥，日志里出现的是
+        // 「哪一条被 env 层顶掉了」，不是被顶掉的那个词。
+        tracing::info!(
+            paths = ?replaced,
+            "env layer replaced documented values; the document's value is not used in this process"
+        );
     }
 
     // Special case: if wiki provider was set via env, auto-enable it.
@@ -640,6 +654,41 @@ pub fn apply_env_overrides(config: &mut AppConfig) {
     if let Ok(new_config) = serde_json::from_value::<AppConfig>(value) {
         *config = new_config;
     }
+}
+
+/// 配置树里某条点分路径上的标量，写成环境变量会带的那串文本。
+///
+/// 只认标量：环境变量只能送一个词，对象与数组那类路径本来就不是 env 层能表达的，
+/// 拿它们去比只会把「没法比」说成「不一样」。
+fn documented_text_at(root: &serde_json::Value, path: &str) -> Option<String> {
+    let mut cursor = root;
+    for segment in path.split('.') {
+        cursor = cursor.as_object()?.get(segment)?;
+    }
+    match cursor {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// env 层把哪些路径上文档的值换掉了：跑起来的是 env 送进去的那个。
+///
+/// 输入是写过 env 层之前记下的 `(路径, 文档的值, env 的值)`。只在文档本来有值时
+/// 才算数——文档没写这条路径，env 就是它唯一的声明，没有什么被换掉；两边写着同一个
+/// 词的也不算，那是同一件事的两种写法，跑起来没有差。
+fn replaced_documented_paths(applied: &[(String, Option<String>, String)]) -> Vec<String> {
+    let mut out: Vec<String> = applied
+        .iter()
+        .filter_map(|(path, documented, env_value)| match documented {
+            Some(documented) if documented != env_value => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Load configuration from a JSON file.
@@ -853,6 +902,46 @@ mod tests {
     use super::*;
     use crate::checkout::repo_root;
     use std::io::Write;
+
+    /// 跑起来的是 env 那个，文档那个没人读——进程自己知道，这条判据要它说出来。
+    ///
+    /// 三种情况都要分开：文档有值且不同（报）、文档没写这条路径（不报，env 是唯一
+    /// 声明）、两边写着同一个词（不报，跑起来没有差）。
+    #[test]
+    fn the_env_layer_names_the_documented_paths_its_values_replace() {
+        let applied = vec![
+            (
+                "providers.storage.provider".to_string(),
+                Some("seaweedfs".to_string()),
+                "local-fs".to_string(),
+            ),
+            (
+                "app.log_level".to_string(),
+                Some("info".to_string()),
+                "info".to_string(),
+            ),
+            ("gateway.only_env".to_string(), None, "x".to_string()),
+        ];
+        assert_eq!(
+            replaced_documented_paths(&applied),
+            vec!["providers.storage.provider".to_string()]
+        );
+        assert!(replaced_documented_paths(&[]).is_empty());
+    }
+
+    /// 标量才比；对象、数组、缺键都读作「没得比」，不许当成「不一样」。
+    #[test]
+    fn the_documented_text_reads_scalars_and_nothing_else() {
+        let doc = serde_json::json!({
+            "a": {"number": 1, "flag": true, "word": "x", "block": {"nested": 1}, "list": [1]},
+        });
+        assert_eq!(documented_text_at(&doc, "a.number").as_deref(), Some("1"));
+        assert_eq!(documented_text_at(&doc, "a.flag").as_deref(), Some("true"));
+        assert_eq!(documented_text_at(&doc, "a.word").as_deref(), Some("x"));
+        assert_eq!(documented_text_at(&doc, "a.block"), None);
+        assert_eq!(documented_text_at(&doc, "a.list"), None);
+        assert_eq!(documented_text_at(&doc, "a.missing"), None);
+    }
 
     #[test]
     fn test_set_json_path_indexes_arrays() {
@@ -1326,10 +1415,13 @@ mod tests {
             "one variable, two config paths — which one it writes becomes luck: {conflicts:?}"
         );
 
-        // A join over nothing always agrees. The built-in table and the
-        // delivered document share most of their names, so seeing far fewer
-        // than that means the comparison is reading an empty overlap rather
-        // than two copies of one table.
+        // A join over nothing always agrees. The floor here is only the guard
+        // against that: it does not pin how many names the two copies share,
+        // because the shared population moves whenever a dead knob is retired
+        // (the count that used to sit here said 80 until one was deleted, and
+        // a number that has to be re-typed after every deletion starts to look
+        // like a fact). Seeing no overlap at all is what means the comparison
+        // read nothing.
         let delivered = documents
             .iter()
             .find(|(tag, _)| *tag == "chart")
@@ -1340,7 +1432,7 @@ mod tests {
             .filter(|name| delivered.contains_key(*name))
             .count();
         assert!(
-            shared >= 80,
+            shared >= 1,
             "只有 {shared} 个名字同时出现在内置表与交付文档里——比较没看到东西"
         );
     }
@@ -2054,7 +2146,10 @@ mod tests {
             control_plane_interval_secs: 30,
             control_plane_url: None,
         };
-        let business: cog_supervisor::SupervisorConfig = cfg.into();
+        let business = cog_supervisor::SupervisorConfig::from_core(
+            cfg,
+            cog_core::config::AGENT_HEARTBEAT_INTERVAL_SECS,
+        );
         assert_eq!(business.health_interval, std::time::Duration::from_secs(7));
         assert_eq!(business.broadcast_capacity, 512);
         assert_eq!(business.quota_threshold, 2000);

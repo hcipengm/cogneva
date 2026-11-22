@@ -3632,7 +3632,8 @@ struct SnapshotsListQuery {
 }
 
 fn default_snapshot_limit() -> usize {
-    100
+    // 一屏：与 A2A 的 `page_size` 默认值同一个数，列表面共用页长。
+    cog_core::config::A2A_LIST_PAGE_SIZE as usize
 }
 
 async fn snapshots_list_handler(
@@ -3678,7 +3679,8 @@ struct TracesListQuery {
 }
 
 fn default_trace_limit() -> usize {
-    100
+    // 一屏：与 A2A 的 `page_size` 默认值同一个数，列表面共用页长。
+    cog_core::config::A2A_LIST_PAGE_SIZE as usize
 }
 
 async fn traces_list_handler(
@@ -3825,59 +3827,98 @@ async fn plugins_list_handler(State(state): State<Arc<GatewayState>>) -> Respons
     }
 }
 
+/// Register a plugin from its manifest.
+///
+/// **Status:** Not implemented -- the manifest is parsed, the entry file is
+/// fetched (which checks the manifest's signature over those bytes), and the
+/// module is compiled; the answer to a well-formed upload is then `501`. This
+/// build has no runtime that instantiates a module or calls its entry point, so
+/// there is nothing to load into and a module that arrived here would never run.
+/// The route used to answer `200` with `"status": "loaded"`: it called a `load`
+/// that compiled the module, dropped the module id it got back, and returned a
+/// handle for a module nobody kept. The three checks stay because they tell a
+/// caller what a real upload looks like; reporting that one was loaded is not
+/// one of the things this build can do.
 async fn plugin_upload_handler(State(state): State<Arc<GatewayState>>, body: String) -> Response {
-    match state.plugin_registry {
-        Some(ref registry) => match serde_json::from_str::<cog_core::PluginManifest>(&body) {
-            Ok(manifest) => match registry.fetch(&manifest).await {
-                Ok(bytes) => match registry.load(&bytes, &manifest).await {
-                    Ok(handle) => (
-                        StatusCode::OK,
-                        Json(json!({
-                            "plugin_id": handle.plugin_id,
-                            "name": handle.manifest.name,
-                            "status": "loaded"
-                        })),
-                    )
-                        .into_response(),
-                    Err(e) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "load_failed", "message": e.to_string()})),
-                    )
-                        .into_response(),
-                },
-                Err(e) => (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": "fetch_failed", "message": e.to_string()})),
-                )
-                    .into_response(),
-            },
-            Err(e) => (
+    let manifest = match serde_json::from_str::<cog_core::PluginManifest>(&body) {
+        Ok(manifest) => manifest,
+        Err(e) => {
+            return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": "invalid_manifest", "message": e.to_string()})),
             )
-                .into_response(),
-        },
-        None => (
+                .into_response()
+        }
+    };
+    let Some(registry) = state.plugin_registry.as_ref() else {
+        return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "plugin_registry_not_configured"})),
         )
-            .into_response(),
+            .into_response();
+    };
+    let Some(backend) = state.sandbox_backend.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "sandbox_backend_not_configured"})),
+        )
+            .into_response();
+    };
+
+    let bytes = match registry.fetch(&manifest).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "fetch_failed", "message": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+
+    // 签名对不上、模块编不动、后端根本不编 WASM，是三件不同的事，答复里
+    // 不能都写成「模块是坏的」：最后一种的模块可能完全合法，缺的是编译器。
+    if let Err(e) = backend.precompile(&bytes).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "module_not_compiled",
+                "message": format!("签名与清单一致，但后端没有把这个模块编译出来：{e}"),
+            })),
+        )
+            .into_response();
     }
+
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "error": "not_implemented",
+            "message": "签名校验与编译都通过了，但这个构建不实例化也不调用 WASM：\
+                        上传的插件不会运行",
+        })),
+    )
+        .into_response()
 }
 
+/// Unregister a plugin by id.
+///
+/// **Status:** Not implemented -- nothing is loaded, so there is nothing to
+/// unload. The route used to answer `200` with `"status": "unloaded"`, which was
+/// a receipt for a removal of something the process never held.
 async fn plugin_unload_handler(
     State(state): State<Arc<GatewayState>>,
     Path(plugin_id): Path<String>,
 ) -> Response {
     match state.plugin_registry {
-        Some(ref _registry) => {
-            // MVP: unload is a no-op until registry maintains loaded handles by id.
-            (
-                StatusCode::OK,
-                Json(json!({ "plugin_id": plugin_id, "status": "unloaded" })),
-            )
-                .into_response()
-        }
+        Some(_) => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "error": "not_implemented",
+                "plugin_id": plugin_id,
+                "message": "这个构建不加载插件：没有模块被装载，因此没有可卸载的东西",
+            })),
+        )
+            .into_response(),
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "plugin_registry_not_configured"})),
@@ -4143,7 +4184,20 @@ async fn eval_compare_handler(
 
 async fn eval_list_datasets_handler(State(state): State<Arc<GatewayState>>) -> Response {
     let dir = eval_datasets::datasets_dir(&state.data_dir);
-    let listed = eval_datasets::list_datasets(&dir);
+    let listed = match eval_datasets::list_datasets(&dir) {
+        Ok(listed) => listed,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "eval_datasets_unreadable",
+                    "dir": dir.display().to_string(),
+                    "message": e.to_string(),
+                })),
+            )
+                .into_response()
+        }
+    };
     let resp = cog_core::EvalListDatasetsResponse {
         datasets: listed.datasets,
         dir: dir.display().to_string(),

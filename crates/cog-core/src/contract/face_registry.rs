@@ -126,8 +126,12 @@ pub struct FaceSpec {
     pub revision: i64,
 }
 
+/// 修订号的第一版：从 1 起数，0 留给「没有修订」这件事。
+// cap: fixed — 计数从 1 起：0 是「没有」，不是第一版
+pub const FIRST_REVISION: i64 = 1;
+
 fn default_revision() -> i64 {
-    1
+    FIRST_REVISION
 }
 
 impl FaceSpec {

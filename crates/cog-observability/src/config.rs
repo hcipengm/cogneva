@@ -78,8 +78,8 @@ pub struct ConfigDeclarationConfig {
 impl Default for ConfigDeclarationConfig {
     fn default() -> Self {
         Self {
-            settle_secs: 60,
-            hold_secs: 300,
+            settle_secs: cog_core::day::SECONDS_PER_MINUTE as u64,
+            hold_secs: (5 * cog_core::day::SECONDS_PER_MINUTE) as u64,
         }
     }
 }
@@ -270,7 +270,7 @@ impl Default for InfraWatchConfig {
             enabled: false,
             prometheus_url: String::new(),
             poll_interval_secs: 0,
-            eval_failure_alert_after: 3,
+            eval_failure_alert_after: EVAL_FAILURE_ALERT_AFTER,
             rules: Vec::new(),
             retired_rules: Vec::new(),
             mirror_alerts: None,
@@ -341,6 +341,39 @@ impl InfraWatchConfig {
     pub const MIN_POLL_INTERVAL_SECS: u64 = 30;
 }
 
+/// 一次推送到观测出口的 HTTP 超时。
+///
+/// Loki 与 Alertmanager 都走集群网内的一次 POST：卡这么久只可能是对端没在答，
+/// 而超时的那一次重试不会比它更快成功。两个出口各写一个 10 就是两处会走散的
+/// 副本——把其中一个改成 30，另一个还在 10，而读代码的人看不出这是故意的。
+// cap: bound — 由对端的应答时延定：它要短于一次刷盘节拍的数倍，否则一批还没推完时机就过了
+const EXPORTER_TIMEOUT_SECS: u64 = 10;
+
+/// Loki 一批推多少行、多久推一批。
+///
+/// 两个数一起定的是推送速率：一批要在下一次刷盘之前推完，所以批大小由一拍的
+/// 时限定，而不是各自可拍的档位。
+// cap: bound — 由一拍内推得动的行数定：批大过一拍推得动，刷盘就积压
+const LOKI_BATCH: usize = 100;
+
+// cap: bound — 由采集端的产生速率定：刷盘间隔跟着写入侧走，改速率要一起看
+const LOKI_FLUSH_INTERVAL_SEC: u64 = 5;
+
+/// 一条日志在放弃之前重推几次。
+// cap: bound — 由对端的恢复时长定：重推跑完的时间要覆盖一次重启，又不能长过采集端的缓冲
+const LOKI_MAX_RETRIES: u32 = 3;
+
+/// ClickHouse 一批写多少行、多久写一批（同上：两个数一起定写入速率）。
+// cap: bound — 由一拍内写得动的行数定：批大过一拍写得动，刷盘就积压
+const CLICKHOUSE_BATCH: usize = 500;
+
+// cap: bound — 由采集端的产生速率定：刷盘间隔跟着写入侧走，改速率要一起看
+const CLICKHOUSE_FLUSH_INTERVAL_SEC: u64 = 10;
+
+/// 连续多少次求值失败才告警：一次失败是抓取抖动，连着失败才是判据坏了。
+// cap: bound — 由抓取的抖动率定：抖动一次就响会把告警面淹掉，太久则判据坏掉没人知道
+const EVAL_FAILURE_ALERT_AFTER: u32 = 3;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LokiConfig {
@@ -357,10 +390,10 @@ impl Default for LokiConfig {
         Self {
             enabled: false,
             endpoint: "http://localhost:3100".into(),
-            max_retries: 3,
-            timeout_secs: 10,
-            flush_interval_sec: 5,
-            max_batch_size: 100,
+            max_retries: LOKI_MAX_RETRIES,
+            timeout_secs: EXPORTER_TIMEOUT_SECS,
+            flush_interval_sec: LOKI_FLUSH_INTERVAL_SEC,
+            max_batch_size: LOKI_BATCH,
         }
     }
 }
@@ -421,8 +454,8 @@ impl Default for ClickHouseConfig {
             table: "events".into(),
             username: "default".into(),
             password: "".into(),
-            flush_interval_sec: 10,
-            max_batch_size: 500,
+            flush_interval_sec: CLICKHOUSE_FLUSH_INTERVAL_SEC,
+            max_batch_size: CLICKHOUSE_BATCH,
         }
     }
 }
@@ -450,7 +483,7 @@ impl Default for AlertmanagerConfig {
     fn default() -> Self {
         Self {
             webhook_url: String::new(),
-            timeout_secs: 10,
+            timeout_secs: EXPORTER_TIMEOUT_SECS,
             email: AlertEmailConfig::default(),
             slack: AlertSlackConfig::default(),
         }
@@ -486,7 +519,7 @@ impl Default for AlertEmailConfig {
         Self {
             recipients: String::new(),
             smtp_host: String::new(),
-            smtp_port: 587,
+            smtp_port: cog_core::alerts::SMTP_SUBMISSION_PORT,
             smtp_username: String::new(),
             smtp_password: String::new(),
             from_address: "alerts@cogneva.local".into(),
@@ -1258,5 +1291,46 @@ mod tests {
                 cfg.channel_names()
             );
         }
+    }
+    /// 出口的超时是一件事：Loki 与 Alertmanager 读同一个常量，改一处两处一起动。
+    #[test]
+    fn both_outlets_read_one_timeout() {
+        assert_eq!(LokiConfig::default().timeout_secs, EXPORTER_TIMEOUT_SECS);
+        assert_eq!(
+            AlertmanagerConfig::default().timeout_secs,
+            EXPORTER_TIMEOUT_SECS
+        );
+
+        let source = include_str!("config.rs");
+        let bare: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                line.starts_with("timeout_secs:")
+                    && line
+                        .split_once(':')
+                        .map(|(_, value)| {
+                            value.trim_start().starts_with(|c: char| c.is_ascii_digit())
+                        })
+                        .unwrap_or(false)
+            })
+            .collect();
+        assert!(bare.is_empty(), "出口超时不该各写一个数：{bare:?}");
+    }
+
+    /// 其余几条具名常量也要真的被读到。
+    #[test]
+    fn every_named_exporter_default_reads_its_constant() {
+        let loki = LokiConfig::default();
+        assert_eq!(loki.max_retries, LOKI_MAX_RETRIES);
+        assert_eq!(loki.flush_interval_sec, LOKI_FLUSH_INTERVAL_SEC);
+        assert_eq!(loki.max_batch_size, LOKI_BATCH);
+        let ch = ClickHouseConfig::default();
+        assert_eq!(ch.flush_interval_sec, CLICKHOUSE_FLUSH_INTERVAL_SEC);
+        assert_eq!(ch.max_batch_size, CLICKHOUSE_BATCH);
+        assert_eq!(
+            InfraWatchConfig::default().eval_failure_alert_after,
+            EVAL_FAILURE_ALERT_AFTER
+        );
     }
 }

@@ -70,7 +70,7 @@ root="$(case_dir config-drift)"
 python3 - "${root}" <<'PY'
 import sys, pathlib
 root = pathlib.Path(sys.argv[1])
-old, new = '"http_port": 8080', '"http_port": 8090'
+old, new = '"pg_max_connections": 16', '"pg_max_connections": 20'
 # 真树上是 render-deploy.sh 先重渲染、配置正文两侧一起变；夹具只改这两个文件。
 for rel in ("deploy/helm/cogneva/files/cogneva.json",
             "deploy/rendered/k3s-single/10-configmap-cogneva-json.yaml"):
@@ -99,7 +99,7 @@ assert projection is not None, "渲染产物里没有 ConfigMap/cogneva-json"
 doc = yaml.safe_load((root / "deploy/k3s/cogneva-json-configmap.yaml").read_text())
 body = json.loads(list(doc["data"].values())[0])
 assert body == projection, "写回去的正文与渲染投影的解析结果不一致"
-assert body["gateway"]["http_port"] == 8090, "写回去的是旧值"
+assert body["system"]["pg_max_connections"] == 20, "写回去的是旧值"
 PY
 
 # ---- 4. chart 改了但投影没重算：红在「投影落后」，不拿旧投影当对齐 ----
@@ -110,12 +110,12 @@ python3 - "${root}" <<'PY'
 import sys, pathlib
 p = pathlib.Path(sys.argv[1]) / "deploy/helm/cogneva/files/cogneva.json"
 s = p.read_text()
-assert '"http_port": 8080' in s, "夹具依赖的值不在 chart 配置里了"
-p.write_text(s.replace('"http_port": 8080', '"http_port": 8090', 1))
+assert '"pg_max_connections": 16' in s, "夹具依赖的值不在 chart 配置里了"
+p.write_text(s.replace('"pg_max_connections": 16', '"pg_max_connections": 20', 1))
 PY
 out="$(run "${root}" --check)" && fail "投影落后时 --check 应当非零：${out}"
 expect_red_naming "投影落后" "${out}" "deploy/k3s/cogneva-json-configmap.yaml"
-[[ "${out}" == *"http_port"* ]] || fail "应当点名落后的那个键：${out}"
+[[ "${out}" == *"pg_max_connections"* ]] || fail "应当点名落后的那个键：${out}"
 
 # ---- 5. 指纹改了：红，点名那一份 Deployment ----
 root="$(case_dir fingerprint-drift)"

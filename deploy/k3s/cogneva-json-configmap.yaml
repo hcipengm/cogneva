@@ -280,7 +280,6 @@ data:
             "COGNEVA_ANTHROPIC_DEFAULT_MAX_TOKENS": "system.anthropic_default_max_tokens",
             "COGNEVA_WEBSOCKET_TIMEOUT_SECS": "gateway.websocket_timeout_secs",
             "COGNEVA_WEBSOCKET_INACTIVITY_TIMEOUT_SECS": "gateway.websocket_inactivity_timeout_secs",
-            "COGNEVA_WEBSOCKET_TICK_SECS": "gateway.websocket_tick_secs",
             "COGNEVA_NOTIFICATION_LIMIT": "gateway.notification_limit",
             "COGNEVA_REQUEST_TIMEOUT_SECS": "gateway.request_timeout_secs",
             "COGNEVA_CONTRIBUTION_OAUTH_REFRESH_INTERVAL_SECS": "gateway.contribution_oauth_refresh_interval_secs",
@@ -295,7 +294,6 @@ data:
           },
           "app": {
             "name": "cogneva",
-            "version": "0.1.0",
             "log_level": "info",
             "data_dir": "/var/lib/cogneva-data",
             "app_dir": "/opt/cogneva"
@@ -397,7 +395,6 @@ data:
             },
             "workspace_id": "default",
             "consumer_group": "cogneva",
-            "ready_task_poll_interval_secs": 5,
             "batch_persistence_enabled": false,
             "archive_enabled": true,
             "_comment_archive_after_secs": "终态行在内存里保留多久才归档到对象存储：172800 秒（两天），与代码里 default_archive_after_secs 一致。它必须长于一次重驱动要等的那段（重启窗口），否则被归档的行读成「没有这件任务」，重驱动永远不会发生。",
@@ -411,10 +408,6 @@ data:
             "cors_origins": [
               "*"
             ],
-            "websocket_timeout_secs": 30,
-            "websocket_inactivity_timeout_secs": 90,
-            "notification_limit": 50,
-            "request_timeout_secs": 30,
             "notification_dingtalk": null,
             "notification_feishu": null,
             "notification_wechat_work": null,
@@ -422,11 +415,7 @@ data:
             "_comment_http_port": "chart 按 `templates/app-config.yaml` 的替换表改写这个数（源 `values.yaml` 的 `gateway.httpPort`）：文件里的值是不挂 chart 时的锚点，也是替换要逐字匹配的那一段。",
             "_comment_ws_port": "chart 按 `templates/app-config.yaml` 的替换表改写这个数（源 `values.yaml` 的 `gateway.wsPort`）：文件里的值是不挂 chart 时的锚点，也是替换要逐字匹配的那一段。",
             "_comment_metrics_port": "chart 按 `templates/app-config.yaml` 的替换表改写这个数（源 `values.yaml` 的 `gateway.metricsPort`）：文件里的值是不挂 chart 时的锚点，也是替换要逐字匹配的那一段。",
-            "_comment_internal_port": "chart 按 `templates/app-config.yaml` 的替换表改写这个数（源 `values.yaml` 的 `gateway.internalPort`）：文件里的值是不挂 chart 时的锚点，也是替换要逐字匹配的那一段。",
-            "_comment_notification_limit": "通知列表的默认页大小（客户端不传 `limit` 时用它）。0 会让默认页永远是空的，所以这里必须有一个正数。",
-            "_comment_request_timeout_secs": "请求在网关里的等待上界。0 在这里不是「不限」：中间件照样建一个 0 秒超时，每个请求立刻 408，所以这个数必须由部署给出。",
-            "_comment_websocket_inactivity_timeout_secs": "客户端多久没有消息就断开。取心跳周期的三倍：丢一拍心跳不算离线，连丢三拍才断（见 `_comment_websocket_timeout_secs`）。",
-            "_comment_websocket_timeout_secs": "服务端心跳周期：每隔这么久发一次 ping，用来发现死连接。0 会让 tokio 的定时器以零周期启动（构造即 panic），所以这个数必须由部署给出。"
+            "_comment_internal_port": "chart 按 `templates/app-config.yaml` 的替换表改写这个数（源 `values.yaml` 的 `gateway.internalPort`）：文件里的值是不挂 chart 时的锚点，也是替换要逐字匹配的那一段。"
           },
           "metrics": {
             "enabled": true,
@@ -481,7 +470,6 @@ data:
           "supervisor": {
             "control_plane_url": null
           },
-          "hook_engine": {},
           "boundary": {
             "rules": [
               {
@@ -673,9 +661,9 @@ data:
                 },
                 {
                   "name": "boot_phase_footprint_grew",
-                  "promql": "((max by (phase, job) (cogneva_boot_rss_bytes)) / min_over_time((max by (phase, job) (cogneva_boot_rss_bytes))[3d:5m]) > 1.05) and (max by (phase, job) (cogneva_boot_rss_bytes) > 1073741824) and (count_over_time((max by (phase, job) (cogneva_boot_rss_bytes))[6d:5m]) > count_over_time((max by (phase, job) (cogneva_boot_rss_bytes))[3d:5m]))",
+                  "promql": "((max by (phase, job) (cogneva_boot_rss_bytes)) / min_over_time((max by (phase, job) (cogneva_boot_rss_bytes))[3d:5m])) and (max by (phase, job) (cogneva_boot_rss_bytes) > 1073741824) and (count_over_time((max by (phase, job) (cogneva_boot_rss_bytes))[6d:5m]) > count_over_time((max by (phase, job) (cogneva_boot_rss_bytes))[3d:5m]))",
                   "condition": {
-                    "greater_than": 0.0
+                    "greater_than": 1.05
                   },
                   "for_seconds": 900,
                   "severity": "warning",
@@ -785,7 +773,7 @@ data:
                 },
                 {
                   "name": "aof_repair_gave_up_bytes",
-                  "promql": "max without (pod, container, instance) (cogneva_aof_repair_dropped_bytes) > 0",
+                  "promql": "max without (pod, container, instance) (cogneva_aof_repair_dropped_bytes)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -795,7 +783,7 @@ data:
                 },
                 {
                   "name": "aof_repair_untouched_torn_tail",
-                  "promql": "max without (pod, container, instance) (cogneva_aof_repair_untouched_torn_tail_bytes) > 0",
+                  "promql": "max without (pod, container, instance) (cogneva_aof_repair_untouched_torn_tail_bytes)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -805,7 +793,7 @@ data:
                 },
                 {
                   "name": "aof_repair_suspected_interior_holes",
-                  "promql": "max without (pod, container, instance) (cogneva_aof_repair_suspected_interior_holes) > 0",
+                  "promql": "max without (pod, container, instance) (cogneva_aof_repair_suspected_interior_holes)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -815,7 +803,7 @@ data:
                 },
                 {
                   "name": "aof_repair_unhandled_layout",
-                  "promql": "max without (pod, container, instance) (cogneva_aof_repair_unhandled_layout) > 0",
+                  "promql": "max without (pod, container, instance) (cogneva_aof_repair_unhandled_layout)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -825,7 +813,7 @@ data:
                 },
                 {
                   "name": "aof_repair_verdict_absent",
-                  "promql": "max without (pod, container, instance) (cogneva_aof_repair_verdict_published) < 1",
+                  "promql": "max without (pod, container, instance) (cogneva_aof_repair_verdict_published)",
                   "condition": {
                     "less_than": 1.0
                   },
@@ -909,7 +897,7 @@ data:
                 },
                 {
                   "name": "self_evolution_submitted_nothing",
-                  "promql": "((max without (pod, container, instance, job) (max_over_time((max without (pod, container, instance, job) (self_evolution_change_yield_total))[24h:1m]) - min_over_time((max without (pod, container, instance, job) (self_evolution_change_yield_total))[24h:1m])) > 0) unless on() (max without (pod, container, instance, job) (max_over_time((max without (pod, container, instance, job) (self_evolution_change_yield_total{outcome=\"submitted\"}))[24h:1m]) - min_over_time((max without (pod, container, instance, job) (self_evolution_change_yield_total{outcome=\"submitted\"}))[24h:1m])) > 0)) and (count_over_time((max without (pod, container, instance, job) (self_evolution_change_yield_total))[48h:1m]) > count_over_time((max without (pod, container, instance, job) (self_evolution_change_yield_total))[24h:1m]))",
+                  "promql": "((max without (pod, container, instance, job) (max_over_time((max without (pod, container, instance, job) (self_evolution_change_yield_total))[24h:1m]) - min_over_time((max without (pod, container, instance, job) (self_evolution_change_yield_total))[24h:1m]))) unless on() (max without (pod, container, instance, job) (max_over_time((max without (pod, container, instance, job) (self_evolution_change_yield_total{outcome=\"submitted\"}))[24h:1m]) - min_over_time((max without (pod, container, instance, job) (self_evolution_change_yield_total{outcome=\"submitted\"}))[24h:1m])) > 0)) and (count_over_time((max without (pod, container, instance, job) (self_evolution_change_yield_total))[48h:1m]) > count_over_time((max without (pod, container, instance, job) (self_evolution_change_yield_total))[24h:1m]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -919,7 +907,7 @@ data:
                 },
                 {
                   "name": "change_diff_never_harvested",
-                  "promql": "((max without (pod, container, instance, job) (max_over_time((max without (pod, container, instance, job) (collab_change_diff_source_total))[24h:1m]) - min_over_time((max without (pod, container, instance, job) (collab_change_diff_source_total))[24h:1m])) > 0) unless on() (max without (pod, container, instance, job) (max_over_time((max without (pod, container, instance, job) (collab_change_diff_source_total{source=\"tree\"}))[24h:1m]) - min_over_time((max without (pod, container, instance, job) (collab_change_diff_source_total{source=\"tree\"}))[24h:1m])) > 0)) and (count_over_time((max without (pod, container, instance, job) (collab_change_diff_source_total))[48h:1m]) > count_over_time((max without (pod, container, instance, job) (collab_change_diff_source_total))[24h:1m]))",
+                  "promql": "((max without (pod, container, instance, job) (max_over_time((max without (pod, container, instance, job) (collab_change_diff_source_total))[24h:1m]) - min_over_time((max without (pod, container, instance, job) (collab_change_diff_source_total))[24h:1m]))) unless on() (max without (pod, container, instance, job) (max_over_time((max without (pod, container, instance, job) (collab_change_diff_source_total{source=\"tree\"}))[24h:1m]) - min_over_time((max without (pod, container, instance, job) (collab_change_diff_source_total{source=\"tree\"}))[24h:1m])) > 0)) and (count_over_time((max without (pod, container, instance, job) (collab_change_diff_source_total))[48h:1m]) > count_over_time((max without (pod, container, instance, job) (collab_change_diff_source_total))[24h:1m]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -929,7 +917,7 @@ data:
                 },
                 {
                   "name": "self_evolution_rework_never_handed_off",
-                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_change_fate_total{fate=\"retired\"}[24h])) > 0) unless on() (sum without (pod, container, instance) (increase(self_evolution_change_rework_total{outcome=\"submitted\"}[24h])) > 0)",
+                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_change_fate_total{fate=\"retired\"}[24h]))) unless on() (sum without (pod, container, instance) (increase(self_evolution_change_rework_total{outcome=\"submitted\"}[24h])) > 0)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -939,7 +927,7 @@ data:
                 },
                 {
                   "name": "generated_change_discarded_in_full",
-                  "promql": "((max without (pod, container, instance, job) (increase(evolution_generated_change_files_total[24h]) - increase(evolution_generated_change_files_faithful[24h])) > 0) or (max without (pod, container, instance, job) (increase(evolution_generated_change_hunks_total[24h]) - increase(evolution_generated_change_hunks_faithful[24h])) > 0)) unless on () ((max without (pod, container, instance, job) (increase(evolution_generated_change_files_faithful[24h])) > 0) or (max without (pod, container, instance, job) (increase(evolution_generated_change_hunks_faithful[24h])) > 0))",
+                  "promql": "((max without (pod, container, instance, job) (increase(evolution_generated_change_files_total[24h]) - increase(evolution_generated_change_files_faithful[24h]))) or (max without (pod, container, instance, job) (increase(evolution_generated_change_hunks_total[24h]) - increase(evolution_generated_change_hunks_faithful[24h])) > 0)) unless on () ((max without (pod, container, instance, job) (increase(evolution_generated_change_files_faithful[24h])) > 0) or (max without (pod, container, instance, job) (increase(evolution_generated_change_hunks_faithful[24h])) > 0))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1112,7 +1100,7 @@ data:
                 },
                 {
                   "name": "volume_capacity_expansion_never_completes",
-                  "promql": "(min_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"declared\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[6h:1m]) > 0) and (max_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"declared\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[6h:1m]) == min_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"declared\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[6h:1m])) and (count_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"declared\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[12h:1m]) > count_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"declared\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[6h:1m]))",
+                  "promql": "(min_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"declared\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[6h:1m])) and (max_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"declared\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[6h:1m]) == min_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"declared\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[6h:1m])) and (count_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"declared\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[12h:1m]) > count_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"declared\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[6h:1m]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1122,7 +1110,7 @@ data:
                 },
                 {
                   "name": "volume_declared_ahead_of_granted",
-                  "promql": "(min_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"declared\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[6h:1m]) > 0) and (count_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"declared\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[12h:1m]) > count_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"declared\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[6h:1m]))",
+                  "promql": "(min_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"declared\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[6h:1m])) and (count_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"declared\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[12h:1m]) > count_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"declared\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[6h:1m]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1132,12 +1120,32 @@ data:
                 },
                 {
                   "name": "volume_holds_more_than_the_storage_granted",
-                  "promql": "(min_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"peak\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[6h:1m]) > 0) and (count_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"peak\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[12h:1m]) > count_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"peak\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[6h:1m]))",
+                  "promql": "(min_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"peak\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[6h:1m])) and (count_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"peak\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[12h:1m]) > count_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"peak\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[6h:1m]))",
                   "condition": {
                     "greater_than": 0.0
                   },
                   "severity": "warning",
                   "summary": "Claim {persistentvolumeclaim} already holds {value} bytes more than the storage granted it, every minute for six hours. `peak` is what the walk measured on the volume and `granted` is what the claim's status says it was given, so this is not a request that outran its grant -- it is bytes already on disk past the number the storage handed back. On a directory-backed class nothing enforces that number: the excess lands on the node's filesystem and the node's free space becomes the only bound the volume has, so the reading that should have been the ceiling (usage over the granted size) reads below one whenever the declaration happened to be raised to a size admission never gave. An expansion does not repair it either -- raising the request moves `declared`, and the volume keeps what it already holds -- so the gap stays true for as long as the contents do. What this rule adds to the pair beside it is the direction: a claim can be granted more than it holds and lose nothing by it, but a claim that holds more than it was granted has no ceiling at all until its contents move to a volume provisioned at the size that was measured",
+                  "face": "持久化存储"
+                },
+                {
+                  "name": "object_store_legacy_objects_left_behind",
+                  "promql": "max without (pod, container, instance, job) (cogneva_object_store_legacy_objects)",
+                  "condition": {
+                    "greater_than": 0.0
+                  },
+                  "severity": "warning",
+                  "summary": "对象后端已经不是 local-fs，而 `{path}` 下还留着 {value} 个在 local-fs 时期写下的对象。切换后端是一次数据搬迁，不是一次配置改动：远端后端读的是桶，这批对象在它眼里不存在，读回来就是空库。把它们搬进桶之后这条才会熄灭。这个数在进程启动时清点一次，`provider` 是正在跑的那一个后端。",
+                  "face": "持久化存储"
+                },
+                {
+                  "name": "object_store_legacy_tree_unreadable",
+                  "promql": "max without (pod, container, instance, job) (cogneva_object_store_legacy_scan_unreadable)",
+                  "condition": {
+                    "greater_than": 0.0
+                  },
+                  "severity": "warning",
+                  "summary": "对象后端已经不是 local-fs，但启动时读不出 `{path}` 下还剩多少对象——这不是「已经搬完」，是「不知道」。读不到的原因（没挂上、权限、路径写错）不修掉，搬没搬完这件事就没有答案；修好之后重启，清点重新数过才作数。",
                   "face": "持久化存储"
                 },
                 {
@@ -1212,7 +1220,7 @@ data:
                 },
                 {
                   "name": "build_gate_host_readings_unpublished",
-                  "promql": "(max without (pod, container, instance) (cogneva_build_gate_ceiling{role=\"builder\", dimension!=\"override\"}) >= 0) unless on (dir, role) ((present_over_time(cogneva_host_cpu_cores{role=\"builder\"}[10m])) and on (dir, role) (present_over_time(cogneva_host_memory_available_bytes{role=\"builder\"}[10m])) and on (dir, role) (present_over_time(cogneva_host_pressure_avg60{role=\"builder\"}[10m])) and on (dir, role) (present_over_time(cogneva_host_disk_free_bytes{role=\"builder\"}[10m])))",
+                  "promql": "(max without (pod, container, instance) (cogneva_build_gate_ceiling{role=\"builder\", dimension!=\"override\"})) unless on (dir, role) ((present_over_time(cogneva_host_cpu_cores{role=\"builder\"}[10m])) and on (dir, role) (present_over_time(cogneva_host_memory_available_bytes{role=\"builder\"}[10m])) and on (dir, role) (present_over_time(cogneva_host_pressure_avg60{role=\"builder\"}[10m])) and on (dir, role) (present_over_time(cogneva_host_disk_free_bytes{role=\"builder\"}[10m])))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1253,7 +1261,7 @@ data:
                 },
                 {
                   "name": "governance_ceiling_not_enforced",
-                  "promql": "(min_over_time((max without (pod, container, instance) (cogneva_governance_drift_fields))[30m:1m]) > 0) and (count_over_time((max without (pod, container, instance) (cogneva_governance_drift_fields))[1h:1m]) > count_over_time((max without (pod, container, instance) (cogneva_governance_drift_fields))[30m:1m]))",
+                  "promql": "(min_over_time((max without (pod, container, instance) (cogneva_governance_drift_fields))[30m:1m])) and (count_over_time((max without (pod, container, instance) (cogneva_governance_drift_fields))[1h:1m]) > count_over_time((max without (pod, container, instance) (cogneva_governance_drift_fields))[30m:1m]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1263,7 +1271,7 @@ data:
                 },
                 {
                   "name": "governance_comparison_unreadable",
-                  "promql": "sum by (namespace, reason) (increase(cogneva_governance_check_failures_total[6h])) > 6",
+                  "promql": "sum by (namespace, reason) (increase(cogneva_governance_check_failures_total[6h]))",
                   "condition": {
                     "greater_than": 6.0
                   },
@@ -1308,7 +1316,7 @@ data:
                     "reason": "lazy_counter",
                     "why": "只在动作规划器**拒收**修复目标时计数（cog-orchestrator/src/face_drift.rs 的 Err 支）；24 小时里一次都没被拒，这条序列就不存在，而「没被拒」与「没创建」在这种计数器上同形。"
                   },
-                  "promql": "max(increase(cogneva_face_drift_dispatch_failures_total[1h])) > 6",
+                  "promql": "max(increase(cogneva_face_drift_dispatch_failures_total[1h]))",
                   "condition": {
                     "greater_than": 6.0
                   },
@@ -1318,7 +1326,7 @@ data:
                 },
                 {
                   "name": "observability_stack_drift_not_repaired",
-                  "promql": "(min_over_time((max without (pod, container, instance) (cogneva_observability_drift_lines))[30m:1m]) > 0) and (count_over_time((max without (pod, container, instance) (cogneva_observability_drift_lines))[1h:1m]) > count_over_time((max without (pod, container, instance) (cogneva_observability_drift_lines))[30m:1m]))",
+                  "promql": "(min_over_time((max without (pod, container, instance) (cogneva_observability_drift_lines))[30m:1m])) and (count_over_time((max without (pod, container, instance) (cogneva_observability_drift_lines))[1h:1m]) > count_over_time((max without (pod, container, instance) (cogneva_observability_drift_lines))[30m:1m]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1328,7 +1336,7 @@ data:
                 },
                 {
                   "name": "orphans_unreaped",
-                  "promql": "(min_over_time(cogneva_process_zombies[30m]) > 0) and (count_over_time(cogneva_process_zombies[1h]) > count_over_time(cogneva_process_zombies[30m]))",
+                  "promql": "(min_over_time(cogneva_process_zombies[30m])) and (count_over_time(cogneva_process_zombies[1h]) > count_over_time(cogneva_process_zombies[30m]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1338,7 +1346,7 @@ data:
                 },
                 {
                   "name": "trace_tier_demotion_stalled",
-                  "promql": "(min_over_time(max without (pod, container, instance) (cogneva_trace_tier_overdue)[3h:1m]) > 0) and (max without (pod, container, instance) (count_over_time(cogneva_trace_tier_overdue[6h])) > max without (pod, container, instance) (count_over_time(cogneva_trace_tier_overdue[3h])))",
+                  "promql": "(min_over_time(max without (pod, container, instance) (cogneva_trace_tier_overdue)[3h:1m])) and (max without (pod, container, instance) (count_over_time(cogneva_trace_tier_overdue[6h])) > max without (pod, container, instance) (count_over_time(cogneva_trace_tier_overdue[3h])))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1486,7 +1494,7 @@ data:
                     "reason": "lazy_counter",
                     "why": "The counter is created by its first failure, not by the process starting: `crates/cog-orchestrator/src/observable.rs` publishes it only once `snapshot.measure_failures > 0`, because a graph nobody has read yet must publish no zeros. On a cluster where every read has succeeded, no series exists, and \"no read failed\" and \"the counter was never created\" are the same shape here. The rule still fires on the first failure; the counter is absent only while there is nothing to count."
                   },
-                  "promql": "sum by (namespace) (increase(cogneva_task_graph_measure_failures_total[15m])) > 0",
+                  "promql": "sum by (namespace) (increase(cogneva_task_graph_measure_failures_total[15m]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1501,7 +1509,7 @@ data:
                     "reason": "error_only_state",
                     "why": "Same gauge and same export rule; not_refreshed is absent because every checked asset matched its manifest."
                   },
-                  "promql": "max without (pod, container, instance) (cogneva_runtime_asset_state{state=\"not_refreshed\"}) > 0",
+                  "promql": "max without (pod, container, instance) (cogneva_runtime_asset_state{state=\"not_refreshed\"})",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1515,7 +1523,7 @@ data:
                     "reason": "error_only_state",
                     "why": "cog-reflection/src/runtime_assets.rs exports state gauges only for problem states of destinations that have one; a healthy asset is absent. The check's own timestamp is a separate series (cogneva_runtime_asset_check_seconds, present)."
                   },
-                  "promql": "max without (pod, container, instance) (cogneva_runtime_asset_state{state=\"content_drift\"}) > 0",
+                  "promql": "max without (pod, container, instance) (cogneva_runtime_asset_state{state=\"content_drift\"})",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1525,7 +1533,7 @@ data:
                 },
                 {
                   "name": "runtime_asset_manifest_absent",
-                  "promql": "max without (pod, container, instance) (cogneva_runtime_asset_manifest_absent) > 0",
+                  "promql": "max without (pod, container, instance) (cogneva_runtime_asset_manifest_absent)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1556,7 +1564,7 @@ data:
                 },
                 {
                   "name": "runtime_asset_manifest_unusable",
-                  "promql": "max without (pod, container, instance) (cogneva_runtime_asset_manifest_unusable) > 0",
+                  "promql": "max without (pod, container, instance) (cogneva_runtime_asset_manifest_unusable)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1606,7 +1614,7 @@ data:
                 },
                 {
                   "name": "change_funnel_never_lands",
-                  "promql": "max by (intent) (increase(cogneva_change_fate_total{fate=\"retired\"}[24h])) > 0 and on(intent) (max by (intent) (increase(cogneva_change_fate_total{fate=\"landed\"}[24h])) == 0)",
+                  "promql": "max by (intent) (increase(cogneva_change_fate_total{fate=\"retired\"}[24h])) and on(intent) (max by (intent) (increase(cogneva_change_fate_total{fate=\"landed\"}[24h])) == 0)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1616,7 +1624,7 @@ data:
                 },
                 {
                   "name": "change_funnel_unattributed",
-                  "promql": "sum(max by (intent, stage) (cogneva_change_funnel{intent=\"unattributed\"} and ((time() - cogneva_change_funnel_observed_timestamp_seconds) < 3600))) > 0",
+                  "promql": "sum(max by (intent, stage) (cogneva_change_funnel{intent=\"unattributed\"} and ((time() - cogneva_change_funnel_observed_timestamp_seconds) < 3600)))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1626,7 +1634,7 @@ data:
                 },
                 {
                   "name": "change_landing_failures",
-                  "promql": "max by (category) (increase(cogneva_landing_failures_total{category=~\"environment|rejected|path|unreadable_diff|oversized\"}[6h])) > 0",
+                  "promql": "max by (category) (increase(cogneva_landing_failures_total{category=~\"environment|rejected|path|unreadable_diff|oversized\"}[6h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1640,7 +1648,7 @@ data:
                     "reason": "lazy_counter",
                     "why": "Counted only when a mirror push is refused (cog-github/src/landing.rs record_counter on the failure branch); no refusal in 24h means the counter was never created. The rule fires on the first one."
                   },
-                  "promql": "sum by (mirror) (increase(cogneva_mirror_push_failures_total[6h])) > 0",
+                  "promql": "sum by (mirror) (increase(cogneva_mirror_push_failures_total[6h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1650,7 +1658,7 @@ data:
                 },
                 {
                   "name": "redrive_cause_exhausted",
-                  "promql": "max by (reason) (increase(cogneva_redrive_refusals_total{reason=\"cause_exhausted\"}[24h])) > 0",
+                  "promql": "max by (reason) (increase(cogneva_redrive_refusals_total{reason=\"cause_exhausted\"}[24h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1660,7 +1668,7 @@ data:
                 },
                 {
                   "name": "redrive_could_not_be_submitted",
-                  "promql": "max(increase(cogneva_redrive_dispatch_failures_total[24h])) > 0",
+                  "promql": "max(increase(cogneva_redrive_dispatch_failures_total[24h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1674,7 +1682,7 @@ data:
                 },
                 {
                   "name": "redrive_refused_without_evidence",
-                  "promql": "max by (reason) (increase(cogneva_redrive_refusals_total{reason=\"no_evidence\"}[24h])) > 0",
+                  "promql": "max by (reason) (increase(cogneva_redrive_refusals_total{reason=\"no_evidence\"}[24h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1688,7 +1696,7 @@ data:
                     "reason": "lazy_counter",
                     "why": "Read-side ledger loss is counted only when the ledger read fails (cog-github/src/landing.rs); today the read succeeds, so the {side=\"read\"} series does not exist."
                   },
-                  "promql": "max by (side) (increase(cogneva_redrive_budget_losses_total{side=\"read\"}[24h])) > 0",
+                  "promql": "max by (side) (increase(cogneva_redrive_budget_losses_total{side=\"read\"}[24h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1702,7 +1710,7 @@ data:
                     "reason": "lazy_counter",
                     "why": "Write-side ledger loss is counted only when the ledger write fails (cog-github/src/landing.rs); today the write succeeds, so the {side=\"write\"} series does not exist."
                   },
-                  "promql": "max by (side) (increase(cogneva_redrive_budget_losses_total{side=\"write\"}[24h])) > 0",
+                  "promql": "max by (side) (increase(cogneva_redrive_budget_losses_total{side=\"write\"}[24h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1766,7 +1774,7 @@ data:
                 },
                 {
                   "name": "build_gate_not_in_force",
-                  "promql": "(min_over_time((max by (dir, role) (cogneva_build_gate_slots{role=\"builder\"}))[5m:1m]) < 1) and (count_over_time((max by (dir, role) (cogneva_build_gate_slots{role=\"builder\"}))[10m:1m]) > count_over_time((max by (dir, role) (cogneva_build_gate_slots{role=\"builder\"}))[5m:1m]))",
+                  "promql": "(min_over_time((max by (dir, role) (cogneva_build_gate_slots{role=\"builder\"}))[5m:1m])) and (count_over_time((max by (dir, role) (cogneva_build_gate_slots{role=\"builder\"}))[10m:1m]) > count_over_time((max by (dir, role) (cogneva_build_gate_slots{role=\"builder\"}))[5m:1m]))",
                   "condition": {
                     "less_than": 1.0
                   },
@@ -1816,7 +1824,7 @@ data:
                 },
                 {
                   "name": "evolution_build_failed",
-                  "promql": "sum by (intent) (increase(cogneva_evolution_build_outcomes_total{outcome=\"failed\"}[6h])) > 0",
+                  "promql": "sum by (intent) (increase(cogneva_evolution_build_outcomes_total{outcome=\"failed\"}[6h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1826,9 +1834,9 @@ data:
                 },
                 {
                   "name": "evolution_learning_recurrence_never_climbs",
-                  "promql": "(sum(increase(cogneva_evolution_learning_recurrence_at_threshold_total{gate=\"hook\"}[7d])) > 20) and (sum(increase(cogneva_evolution_learning_recurrence_at_threshold_total{gate=\"hook\",recurrence=\"3\"}[7d])) + sum(increase(cogneva_evolution_learning_recurrence_at_threshold_total{gate=\"hook\",recurrence=\"4+\"}[7d])) == 0)",
+                  "promql": "(sum(increase(cogneva_evolution_learning_recurrence_at_threshold_total{gate=\"hook\"}[7d]))) and (sum(increase(cogneva_evolution_learning_recurrence_at_threshold_total{gate=\"hook\",recurrence=\"3\"}[7d])) + sum(increase(cogneva_evolution_learning_recurrence_at_threshold_total{gate=\"hook\",recurrence=\"4+\"}[7d])) == 0)",
                   "condition": {
-                    "greater_than": 0.0
+                    "greater_than": 20.0
                   },
                   "severity": "warning",
                   "summary": "The hook threshold has been consulted {value} time(s) in the last week and not one of those consultations was on a learning that had recurred three times or more. Recurrence is the count the store holds for a learning and it is the input the thresholds act on, so this says the counts are not accumulating: the pipeline is detecting learnings, the threshold is looking at them, and none is ever seen a third time. A threshold whose count is out of reach and a corpus in which nothing repeats read identically from every downstream decision, which is why this rule reads the count the threshold was consulted on rather than what the threshold decided. It is the state the store sat in for three weeks while every other reading stayed green -- the increment was computed and then dropped, because the write ran after the only writer of the column. Ceiling: this judges accumulation, not what follows it. A learning that does reach recurrence 3 and is then not acted on passes this rule and is not covered by it; the thresholds are values on the engine rather than published series, so the recurrence 3 named here is the one this rule was written against, not a number read from the deployment",
@@ -1856,7 +1864,7 @@ data:
                 },
                 {
                   "name": "build_cache_cap_unmet",
-                  "promql": "max without (pod, container, instance) (cogneva_build_target_unmet_bytes) > 0",
+                  "promql": "max without (pod, container, instance) (cogneva_build_target_unmet_bytes)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1876,7 +1884,7 @@ data:
                 },
                 {
                   "name": "build_cache_reclaim_ran",
-                  "promql": "max by (dir) (increase(cogneva_build_target_over_cap_total{outcome=\"reclaimed\"}[6h])) > 0",
+                  "promql": "max by (dir) (increase(cogneva_build_target_over_cap_total{outcome=\"reclaimed\"}[6h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1916,9 +1924,9 @@ data:
                 },
                 {
                   "name": "change_landed_but_not_running",
-                  "promql": "(max without (pod, container, instance) (cogneva_change_ledger_out_of_effect_oldest_seconds and ((time() - cogneva_change_ledger_out_of_effect_oldest_seconds_observed_timestamp_seconds) < 1800)) > 3600) and on () (max without (pod, container, instance) (cogneva_change_ledger_in_effect{state=\"waiting\"} and ((time() - cogneva_change_ledger_in_effect_observed_timestamp_seconds{state=\"waiting\"}) < 1800)) > 0)",
+                  "promql": "(max without (pod, container, instance) (cogneva_change_ledger_out_of_effect_oldest_seconds and ((time() - cogneva_change_ledger_out_of_effect_oldest_seconds_observed_timestamp_seconds) < 1800))) and on () (max without (pod, container, instance) (cogneva_change_ledger_in_effect{state=\"waiting\"} and ((time() - cogneva_change_ledger_in_effect_observed_timestamp_seconds{state=\"waiting\"}) < 1800)) > 0)",
                   "condition": {
-                    "greater_than": 0.0
+                    "greater_than": 3600.0
                   },
                   "severity": "warning",
                   "summary": "the oldest change this account calls landed has been waiting {value} second(s) to run, and the account says it is still waiting. Landed is a claim about the project line and running is a claim about the image, so the two are apart for the whole of every rollout -- and the wait is measured from the landing commit, not from when this process started, so a restart does not shorten it. The bound is an hour because the ordinary gap between the two is one CI run plus one rolling update; a wait past that is not the pipeline being slow but a rollout that stopped. Read cogneva_deployer or the mainline rollout jobs beside this: the account cannot say why the image is behind, only that it is, and the deployer is the surface that says which check it is holding on. This rule is silent while the reading itself cannot be taken -- change_ledger_in_effect_unmeasured is the rule for that state, and a blind pass must not read as a finished rollout. Both halves are read only while the account's writer is still stamping: the store hands back each series' newest row forever, so a loop that stopped would go on publishing its last wait and this rule would stay fired with nothing left to repair. The staleness bound is half an hour, six of the passes this family is written on",
@@ -1926,7 +1934,7 @@ data:
                 },
                 {
                   "name": "change_ledger_in_effect_unmeasured",
-                  "promql": "max without (pod, container, instance) (cogneva_change_ledger_in_effect{state=\"unmeasured\"} and ((time() - cogneva_change_ledger_in_effect_observed_timestamp_seconds{state=\"unmeasured\"}) < 1800)) > 0",
+                  "promql": "max without (pod, container, instance) (cogneva_change_ledger_in_effect{state=\"unmeasured\"} and ((time() - cogneva_change_ledger_in_effect_observed_timestamp_seconds{state=\"unmeasured\"}) < 1800))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -1936,9 +1944,9 @@ data:
                 },
                 {
                   "name": "change_ledger_measure_blind",
-                  "promql": "max by (reason) (increase(cogneva_change_ledger_measure_unsettled_total{half=\"outstanding\"}[30m])) >= 200",
+                  "promql": "max by (reason) (increase(cogneva_change_ledger_measure_unsettled_total{half=\"outstanding\"}[30m]))",
                   "condition": {
-                    "greater_than": 0.0
+                    "greater_than_or_equal": 200.0
                   },
                   "severity": "warning",
                   "summary": "in the last 30m, {value} of the account's rows became unmeasurable for one reason, counted as they entered that set rather than as the set's size. The bound is one batch: a pass judges at most 200 rows, so entering that many in a window means the look itself is broken -- git not answering, a revision that cannot be resolved, a tree that is not the one the rows were written against -- rather than some rows being unanswerable. Below that, a handful of rows behind a path this revision does not have is the ordinary state of a tree that moves, and the count by reason is what says which repair is owed. A half of the pass is not counted here on purpose: half=landed rows are ones the account already called done, and their becoming unanswerable is a claim being made without a look rather than work going unseen. This rule is quiet when the writer stops as well as when nothing is entering: increase() over a window holding no new samples is zero, so a dead loop is silent here, and the rule that watches whether the loop is running at all is change_landed_but_not_running, which reads the timestamps this family does not carry. That separation is why a zero here must not be read as health",
@@ -1946,9 +1954,9 @@ data:
                 },
                 {
                   "name": "change_ledger_remeasure_stuck",
-                  "promql": "max without (pod, container, instance) (cogneva_change_ledger_remeasure_oldest_seconds and ((time() - cogneva_change_ledger_remeasure_oldest_seconds_observed_timestamp_seconds) < 1800)) > 1800",
+                  "promql": "max without (pod, container, instance) (cogneva_change_ledger_remeasure_oldest_seconds and ((time() - cogneva_change_ledger_remeasure_oldest_seconds_observed_timestamp_seconds) < 1800))",
                   "condition": {
-                    "greater_than": 0.0
+                    "greater_than": 1800.0
                   },
                   "severity": "warning",
                   "summary": "the oldest request to measure a change again has been waiting {value} second(s), and the writer is still stamping. This intake is the only way a change retired under a rule that lives outside the measured tree comes back after that rule is corrected: the tree never moves, so a second reading of the tree would never revisit the row, and the account's own sweeps cannot reach it either. The writer folds its whole queue on the pass after the one that filled it, so the ordinary wait is under one interval -- five minutes -- and six of them is not slowness but a fold that is not reaching the request. Read the two numbers beside it: cogneva_change_ledger_remeasure_pending is how many are waiting and this is how long the oldest has, so a depth that turns over while this age climbs is one row the tree cannot settle, and a depth that does not move at all is the writer, whose liveness is cogneva_loop_tick_age_seconds. It is silent while the writer is not stamping -- the store serves each series' newest row forever, and a rule that stayed fired on a frozen sample is one no repair could put out",
@@ -1956,9 +1964,9 @@ data:
                 },
                 {
                   "name": "change_pool_block_stranded",
-                  "promql": "(max without (pod, container, instance) (cogneva_change_dispatch_pool_blocked_oldest_seconds and ((time() - cogneva_change_dispatch_pool_blocked_oldest_seconds_observed_timestamp_seconds) < 1800)) > 1800) and on () (max without (pod, container, instance) ((cogneva_change_dispatch_verdict{decision=\"proceed\", pool_reading=\"available\"}) and ((time() - cogneva_change_dispatch_verdict_observed_timestamp_seconds) < 1800)) == 1)",
+                  "promql": "(max without (pod, container, instance) (cogneva_change_dispatch_pool_blocked_oldest_seconds and ((time() - cogneva_change_dispatch_pool_blocked_oldest_seconds_observed_timestamp_seconds) < 1800))) and on () (max without (pod, container, instance) ((cogneva_change_dispatch_verdict{decision=\"proceed\", pool_reading=\"available\"}) and ((time() - cogneva_change_dispatch_verdict_observed_timestamp_seconds) < 1800)) == 1)",
                   "condition": {
-                    "greater_than": 0.0
+                    "greater_than": 1800.0
                   },
                   "severity": "warning",
                   "summary": "the oldest outstanding change stamped as waiting on the LLM pool has been waiting {value} second(s), while the latest dispatch pass says the pool serves. The stamp is written by a pass that found the pool down and taken off by the first pass that can hand work over, so one pass after the pool returns is the whole of its ordinary life: six passes with it still on the rows is not a slow release but a release that is not happening -- a pass that died between the stamp and the clear, a clear whose write failed with nothing to retry it, or a dispatcher that has stopped passing at all, whose own liveness is cogneva_loop_tick_age_seconds. This is the only reading that can see it, because every other family about the pool reports the pool and goes green the moment it recovers; a row left stamped behind that recovery is still counted as owed, still has no task, and reads exactly like work nobody has reached. Read cogneva_change_dispatch_pool_blocked_rows beside it for how much is stranded, and cogneva_change_ledger_remeasure_pending for whether the dispatcher's other intake is moving -- two intakes stuck together is the loop rather than either write. A pass that proceeds on an absent pool reading does not satisfy this rule: nothing measured the pool on that pass, so it says nothing about whether the stamps it kept are still owed. Silent while the writer is not stamping, for the same reason as its neighbours: the store serves each series' newest row forever, and a rule fired on a frozen sample cannot be put out. The same holds on the other side of the comparison, which is why the verdict is asked for with its own age: a dispatcher that stopped passing leaves its last verdict standing, and a frozen proceed would hold this rule lit over rows no pass is left to clear",
@@ -1986,7 +1994,7 @@ data:
                 },
                 {
                   "name": "background_loop_died",
-                  "promql": "sum without (pod, container, instance) (cogneva_loop_deaths_total) > 0",
+                  "promql": "sum without (pod, container, instance) (cogneva_loop_deaths_total)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2016,9 +2024,9 @@ data:
                 },
                 {
                   "name": "background_loop_role_split",
-                  "promql": "sum by (loop) (cogneva_loop_owner_held) > 1",
+                  "promql": "sum by (loop) (cogneva_loop_owner_held)",
                   "condition": {
-                    "greater_than": 0.0
+                    "greater_than": 1.0
                   },
                   "severity": "critical",
                   "summary": "two processes in this series hold the same single-writer role at once, which is the one state the arbitration exists to make impossible: both of them are acting, so whatever the role guards -- the pruning, the follow-up, the index write -- is being done twice. Read it as a defect in the arbitration rather than as contention, because each ask is answered from the row the two are contending over and that row can name one holder at a time. Two live holders mean one of two things: the term was taken over before its holder stopped renewing it (a clock the two do not share, which is why the row's term and its comparison are both read from the database's own clock), or a process is publishing a held reading it has already lost, which is what a holder wedged inside one pass looks like -- it took the role, never asked again, and the other replica took over on expiry while it was still deleting rows. Those two incidents are the same reading here, so background_loop_stalled on the same series is what tells them apart. An ordinary replacement does not reach this rule: a term outlives the window in which Prometheus keeps serving the last sample of a target that has gone, so a pod that was killed stops reading as a holder (up to five minutes) before its successor is allowed to take the role (six), and the two are never holders at the same time. It fires for as long as both readings are live -- a wedged holder keeps publishing until it is restarted -- so read it as naming the role to go and look at rather than as a count of incidents",
@@ -2047,7 +2055,7 @@ data:
                 },
                 {
                   "name": "notification_delivery_failing",
-                  "promql": "sum by (outlet, result) (increase(cogneva_notification_delivery_total{result!=\"ok\"}[1h])) > 0",
+                  "promql": "sum by (outlet, result) (increase(cogneva_notification_delivery_total{result!=\"ok\"}[1h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2067,7 +2075,7 @@ data:
                 },
                 {
                   "name": "registry_maintenance_round_incomplete",
-                  "promql": "max without (pod, container, instance, job) (increase(cogneva_registry_maintenance_runs_total[1h])) > 0 and (time() - max without (pod, container, instance, job) (cogneva_registry_maintenance_reading_unix)) > 3600",
+                  "promql": "max without (pod, container, instance, job) (increase(cogneva_registry_maintenance_runs_total[1h])) and (time() - max without (pod, container, instance, job) (cogneva_registry_maintenance_reading_unix)) > 3600",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2077,7 +2085,7 @@ data:
                 },
                 {
                   "name": "buildah_store_round_incomplete",
-                  "promql": "max without (pod, container, instance, job, outcome) (increase(cogneva_buildah_store_rounds_total[1h])) > 0 and (time() - max without (pod, container, instance, job, outcome) (cogneva_buildah_store_reading_unix)) > 43200",
+                  "promql": "max without (pod, container, instance, job, outcome) (increase(cogneva_buildah_store_rounds_total[1h])) and (time() - max without (pod, container, instance, job, outcome) (cogneva_buildah_store_reading_unix)) > 43200",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2091,7 +2099,7 @@ data:
                     "reason": "lazy_counter",
                     "why": "Counted only when a registry prune is refused (cog-reflection/src/mainline_deployer.rs); no refusal in the window."
                   },
-                  "promql": "sum without (pod, container, instance) (increase(cogneva_registry_prune_failures_total[1h])) > 0",
+                  "promql": "sum without (pod, container, instance) (increase(cogneva_registry_prune_failures_total[1h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2131,7 +2139,7 @@ data:
                 },
                 {
                   "name": "llm_upstream_rejecting_while_pool_reads_available",
-                  "promql": "(sum by (upstream) (changes(llm_upstream_client_errors_total{upstream=~\".+\"}[1h])) > 0) and on () (max(llm_pool_available and ((time() - llm_pool_available_observed_timestamp_seconds) < 3600)) == 1)",
+                  "promql": "(sum by (upstream) (changes(llm_upstream_client_errors_total{upstream=~\".+\"}[1h]))) and on () (max(llm_pool_available and ((time() - llm_pool_available_observed_timestamp_seconds) < 3600)) == 1)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2141,9 +2149,9 @@ data:
                 },
                 {
                   "name": "llm_pool_capacity_degraded",
-                  "promql": "(sum(max by (upstream) (llm_upstream_healthy{upstream=~\".+\"} and ((time() - llm_upstream_healthy_observed_timestamp_seconds) < 3600))) >= 1) and ((count(max by (upstream) (llm_upstream_healthy{upstream=~\".+\"} and ((time() - llm_upstream_healthy_observed_timestamp_seconds) < 3600))) - sum(max by (upstream) (llm_upstream_healthy{upstream=~\".+\"} and ((time() - llm_upstream_healthy_observed_timestamp_seconds) < 3600)))) >= 1)",
+                  "promql": "(sum(max by (upstream) (llm_upstream_healthy{upstream=~\".+\"} and ((time() - llm_upstream_healthy_observed_timestamp_seconds) < 3600)))) and ((count(max by (upstream) (llm_upstream_healthy{upstream=~\".+\"} and ((time() - llm_upstream_healthy_observed_timestamp_seconds) < 3600))) - sum(max by (upstream) (llm_upstream_healthy{upstream=~\".+\"} and ((time() - llm_upstream_healthy_observed_timestamp_seconds) < 3600)))) >= 1)",
                   "condition": {
-                    "greater_than": 0.0
+                    "greater_than_or_equal": 1.0
                   },
                   "severity": "warning",
                   "summary": "The pool is thinning without being empty: {value} upstream(s) are measured as serving while at least one other measured upstream is not. The number reported is the serving side, which is the reading a pool that loses members one at a time produces -- the pool's own down event fires only when the last one goes, and by then capacity has been zero for however long the approach took, so the approach itself had no reader. Only upstreams this gateway has measured are counted: a configured entry that has never been touched publishes no health series at all, so a pool of many where only a few have been asked reads as those few here and this rule says nothing about the rest. The count and the sum are taken over the whole fleet rather than per reporter for the same reason the series is a verdict: it is republished by every gateway pod, and a reading that kept the reporting pod would re-announce a standing thinning as a fresh alert on each rollout. Read it beside the per-upstream verdict rules, which say why a member left the serving side, and beside `llm_upstream_pool_down`, the pool's own down event, which says the serving side reached zero. Every member counted here has to have been measured within the last hour -- twice the durable heartbeat -- because the store keeps serving the last value a writer left behind: a gateway pod that stopped publishing days ago would otherwise still hold a seat in both the count and the sum, and the thinning reported would be a measurement that stopped rather than a member that left.",
@@ -2151,7 +2159,7 @@ data:
                 },
                 {
                   "name": "llm_pool_open_but_idle",
-                  "promql": "((max(llm_pool_allowance_tokens and ((time() - llm_pool_allowance_tokens_observed_timestamp_seconds) < 3600)) - max(llm_pool_spent_tokens and ((time() - llm_pool_spent_tokens_observed_timestamp_seconds) < 3600)) - max(llm_pool_reserve_tokens and ((time() - llm_pool_reserve_tokens_observed_timestamp_seconds) < 3600))) >= 0) and on () (max(llm_pool_paced_upstreams and ((time() - llm_pool_paced_upstreams_observed_timestamp_seconds) < 3600)) > 0) and on () (max(cogneva_ready_admission_readings{kind=\"ready\"} and ((time() - cogneva_ready_admission_readings_observed_timestamp_seconds{kind=\"ready\"}) < 1800)) > 0) and on () (sum(changes(llm_usage_readings_total{outcome=~\"read|absent|not_asked\"}[1h])) == 0) unless on () ((max(llm_upstream_refusal_kind{kind=\"quota_cycle\"} and ((time() - llm_upstream_refusal_kind_observed_timestamp_seconds{kind=\"quota_cycle\"}) < 3600)) == 1) and on () (max(llm_pool_available and ((time() - llm_pool_available_observed_timestamp_seconds) < 3600)) == 0))",
+                  "promql": "((max(llm_pool_allowance_tokens and ((time() - llm_pool_allowance_tokens_observed_timestamp_seconds) < 3600)) - max(llm_pool_spent_tokens and ((time() - llm_pool_spent_tokens_observed_timestamp_seconds) < 3600)) - max(llm_pool_reserve_tokens and ((time() - llm_pool_reserve_tokens_observed_timestamp_seconds) < 3600)))) and on () (max(llm_pool_paced_upstreams and ((time() - llm_pool_paced_upstreams_observed_timestamp_seconds) < 3600)) > 0) and on () (max(cogneva_ready_admission_readings{kind=\"ready\"} and ((time() - cogneva_ready_admission_readings_observed_timestamp_seconds{kind=\"ready\"}) < 1800)) > 0) and on () (sum(changes(llm_usage_readings_total{outcome=~\"read|absent|not_asked\"}[1h])) == 0) unless on () ((max(llm_upstream_refusal_kind{kind=\"quota_cycle\"} and ((time() - llm_upstream_refusal_kind_observed_timestamp_seconds{kind=\"quota_cycle\"}) < 3600)) == 1) and on () (max(llm_pool_available and ((time() - llm_pool_available_observed_timestamp_seconds) < 3600)) == 0))",
                   "condition": {
                     "greater_than_or_equal": 0.0
                   },
@@ -2186,7 +2194,7 @@ data:
                 },
                 {
                   "name": "llm_spend_reading_is_blind",
-                  "promql": "(max(llm_budget_spent_tokens) >= 0) and on () (max(llm_budget_measured_at_unix) > 0) and on () ((time() - max(llm_budget_measured_at_unix)) > 1800)",
+                  "promql": "(max(llm_budget_spent_tokens)) and on () (max(llm_budget_measured_at_unix) > 0) and on () ((time() - max(llm_budget_measured_at_unix)) > 1800)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2216,7 +2224,7 @@ data:
                 },
                 {
                   "name": "llm_pool_face_without_a_serving_member",
-                  "promql": "(max by (face) (llm_pool_face_upstreams and ((time() - llm_pool_face_upstreams_observed_timestamp_seconds) < 3600)) > 0) and on (face) (max by (face) (llm_pool_face_serving) == 0) and on (face) (max by (face) ((time() - llm_pool_face_serving_observed_timestamp_seconds) < 3600)) and on () (max(llm_pool_available and ((time() - llm_pool_available_observed_timestamp_seconds) < 3600)) == 1)",
+                  "promql": "(max by (face) (llm_pool_face_upstreams and ((time() - llm_pool_face_upstreams_observed_timestamp_seconds) < 3600))) and on (face) (max by (face) (llm_pool_face_serving) == 0) and on (face) (max by (face) ((time() - llm_pool_face_serving_observed_timestamp_seconds) < 3600)) and on () (max(llm_pool_available and ((time() - llm_pool_available_observed_timestamp_seconds) < 3600)) == 1)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2236,7 +2244,7 @@ data:
                 },
                 {
                   "name": "llm_calls_all_failing",
-                  "promql": "((sum by (upstream) (changes(llm_upstream_failures_total{upstream=~\".+\",source=\"caller\"}[6h])) > 0) or (sum by (upstream) (changes(llm_upstream_client_errors_total{upstream=~\".+\"}[6h])) > 0)) unless on () (sum(changes(llm_usage_readings_total{outcome=~\"read|absent|not_asked\"}[6h])) > 0)",
+                  "promql": "((sum by (upstream) (changes(llm_upstream_failures_total{upstream=~\".+\",source=\"caller\"}[6h]))) or (sum by (upstream) (changes(llm_upstream_client_errors_total{upstream=~\".+\"}[6h])) > 0)) unless on () (sum(changes(llm_usage_readings_total{outcome=~\"read|absent|not_asked\"}[6h])) > 0)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2256,7 +2264,7 @@ data:
                 },
                 {
                   "name": "pod_stuck_terminating",
-                  "promql": "(time() - max by (namespace, pod) (kube_pod_deletion_timestamp)) > 1800",
+                  "promql": "(time() - max by (namespace, pod) (kube_pod_deletion_timestamp))",
                   "condition": {
                     "greater_than": 1800.0
                   },
@@ -2266,7 +2274,7 @@ data:
                 },
                 {
                   "name": "notification_sign_refused",
-                  "promql": "sum by (outlet, outcome) (increase(cogneva_notification_sign_total{outcome!=\"signed\"}[1h])) > 0",
+                  "promql": "sum by (outlet, outcome) (increase(cogneva_notification_sign_total{outcome!=\"signed\"}[1h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2276,7 +2284,7 @@ data:
                 },
                 {
                   "name": "registry_reclaim_debt_unpaid",
-                  "promql": "(max without (pod, container, instance) (max_over_time(cogneva_registry_gc_owed[30m]) and ((time() - cogneva_registry_gc_owed_observed_timestamp_seconds) < 1800))) > 0",
+                  "promql": "(max without (pod, container, instance) (max_over_time(cogneva_registry_gc_owed[30m]) and ((time() - cogneva_registry_gc_owed_observed_timestamp_seconds) < 1800)))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2286,7 +2294,7 @@ data:
                 },
                 {
                   "name": "llm_pool_signal_undelivered",
-                  "promql": "max without (pod, container, instance) (max_over_time(llm_pool_signal_connected[1h])) < 1",
+                  "promql": "max without (pod, container, instance) (max_over_time(llm_pool_signal_connected[1h]))",
                   "condition": {
                     "less_than": 1.0
                   },
@@ -2296,7 +2304,7 @@ data:
                 },
                 {
                   "name": "gateway_durable_writes_failing",
-                  "promql": "(sum by (reason) (increase(cogneva_gateway_durable_write_failures_total[30m])) > 0) and on () ((time() - max(llm_pool_available_observed_timestamp_seconds)) > 3600)",
+                  "promql": "(sum by (reason) (increase(cogneva_gateway_durable_write_failures_total[30m]))) and on () ((time() - max(llm_pool_available_observed_timestamp_seconds)) > 3600)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2336,7 +2344,7 @@ data:
                 },
                 {
                   "name": "llm_usage_upstream_silent",
-                  "promql": "sum by (upstream) (increase(llm_usage_readings_total{outcome=\"absent\"}[1h])) > 0",
+                  "promql": "sum by (upstream) (increase(llm_usage_readings_total{outcome=\"absent\"}[1h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2346,7 +2354,7 @@ data:
                 },
                 {
                   "name": "llm_usage_landing_dropped",
-                  "promql": "sum by (reason) (increase(llm_usage_landing_dropped_total[15m])) > 0",
+                  "promql": "sum by (reason) (increase(llm_usage_landing_dropped_total[15m]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2356,9 +2364,9 @@ data:
                 },
                 {
                   "name": "llm_owner_budget_refusals_sustained",
-                  "promql": "sum by (scope, owner, workspace) (increase(llm_owner_budget_refusals_total[15m])) > 2",
+                  "promql": "sum by (scope, owner, workspace) (increase(llm_owner_budget_refusals_total[15m]))",
                   "condition": {
-                    "greater_than": 0.0
+                    "greater_than": 2.0
                   },
                   "severity": "info",
                   "summary": "Calls refused by a person's or a tenant's daily quota -- {value} of them in the last fifteen minutes for `owner`/`workspace` at `scope`. A single refusal is the ceiling doing its job and the caller was told when it resets, so it is not news. Three or more inside one window is not a caller being told once: it is a workload that keeps asking after it was stopped, and there are two ways to arrive here -- the ceiling is too low for the work it is supposed to fund, or the caller is retrying a call that cannot succeed until the next UTC midnight. The `scope` label names which repair: `user` is one person's ceiling (raise it, or move the work under a person with room), `ws` is the tenant's (raise the tenant's ceiling, or the work does not belong to a tenant with that budget), and `global` is the platform's whole day (raise it in the quota admin under `global/platform`, or find which work is spending past what the platform is meant to fund). The subject is split across `owner` and `workspace` rather than a single key because the two ids come from different tables, and a sum over one key holding both would merge a person with a tenant without saying so; the half that does not apply is empty, and an empty subject means the level enforced had no id to name. Refused calls spend nothing -- they never reached an upstream -- so this is not a spend reading, and `llm_calls_total` does not carry them. Counted at the refusal, so a gateway that rolled inside the window reads low here; the ledger rows are the durable record of each refusal, and today's refusals by subject are on the quota panel. Repair by finding the subject the labels name and asking why the work keeps asking: a ceiling that is right should be explained to the caller once, and one that is wrong is changed in the quota admin rather than by waiting for midnight.",
@@ -2366,7 +2374,7 @@ data:
                 },
                 {
                   "name": "llm_owner_budget_over_soft_limit",
-                  "promql": "sum by (scope, owner, workspace) (increase(llm_owner_budget_soft_crossings_total[30m])) > 0",
+                  "promql": "sum by (scope, owner, workspace) (increase(llm_owner_budget_soft_crossings_total[30m]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2376,7 +2384,7 @@ data:
                 },
                 {
                   "name": "llm_usage_ledger_incomplete",
-                  "promql": "sum by (upstream) (increase(llm_calls_total{result=\"ok\"}[1h] offset 15m)) - sum by (upstream) (increase(llm_usage_readings_total[1h15m])) > 0",
+                  "promql": "sum by (upstream) (increase(llm_calls_total{result=\"ok\"}[1h] offset 15m)) - sum by (upstream) (increase(llm_usage_readings_total[1h15m]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2386,7 +2394,7 @@ data:
                 },
                 {
                   "name": "llm_call_without_declared_actor",
-                  "promql": "sum(increase(llm_calls_total{actor=\"unknown\"}[1h])) > 0",
+                  "promql": "sum(increase(llm_calls_total{actor=\"unknown\"}[1h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2416,9 +2424,9 @@ data:
                 },
                 {
                   "name": "llm_upstream_reading_outlives_its_pool_entry",
-                  "promql": "((time() - max by (upstream) (llm_upstream_healthy_observed_timestamp_seconds)) > 3600) and on () (count(llm_upstream_healthy_observed_timestamp_seconds) > 0) and on () (count(llm_pool_face_upstreams_observed_timestamp_seconds and ((time() - llm_pool_face_upstreams_observed_timestamp_seconds) < 3600)) > 0)",
+                  "promql": "((time() - max by (upstream) (llm_upstream_healthy_observed_timestamp_seconds))) and on () (count(llm_upstream_healthy_observed_timestamp_seconds) > 0) and on () (count(llm_pool_face_upstreams_observed_timestamp_seconds and ((time() - llm_pool_face_upstreams_observed_timestamp_seconds) < 3600)) > 0)",
                   "condition": {
-                    "greater_than": 0.0
+                    "greater_than": 3600.0
                   },
                   "severity": "info",
                   "summary": "This upstream's healthy reading is still on the surface and nothing has written it for over an hour, while the pool-level count is being written in the same tick: that pair says the entry was taken out of the configuration rather than the writer stopping. The store serves a gauge's newest row forever, so a removed upstream goes on answering in the present tense with its last value, and a reader counting the upstream series on this surface counts the pool that used to be there. Measured on this deployment on 2026-10-26: the family carried five upstreams while the configuration held two, and the three that had been removed had not been written for 7.7 days. {value} is how many seconds ago the last write was, which is also the answer to when it left. Why it left is on the refusal family the same last pass wrote: {upstream} carries a kind there -- entitlement for an account that waiting cannot repair, quota_cycle for a window that expires -- and those two call for different people, one to fix the account and one to wait. This names the entry that stayed, not the departure: the tick that dropped it published nothing to say so, so the surface carries it and this reading is taken an hour later. A rename is one departure and not two: the old key stops being written while the new one starts in the same tick, and only the old one ages out here. When the pool's own count stops being written as well the last conjunct fails and this falls quiet -- that is a writer that stopped, which the pool rules beside this one already report, and saying 'it left the pool' about it would be the wrong repair. A pool this process has never published at all produces no series, so this cannot fire on a fresh deployment: absence is not a departure, and the count being absent leaves the conjunction empty rather than true.",
@@ -2426,7 +2434,7 @@ data:
                 },
                 {
                   "name": "metrics_log_at_floor_capacity",
-                  "promql": "(max without (pod, container, instance) (max_over_time(metrics_samples_over_capacity[30m]) and ((time() - metrics_samples_over_capacity_observed_timestamp_seconds) < 1800))) > 0",
+                  "promql": "(max without (pod, container, instance) (max_over_time(metrics_samples_over_capacity[30m]) and ((time() - metrics_samples_over_capacity_observed_timestamp_seconds) < 1800)))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2436,7 +2444,7 @@ data:
                 },
                 {
                   "name": "metrics_sample_sweep_failed",
-                  "promql": "(max without (pod, container, instance) (max_over_time(metrics_sample_sweep_failed[30m]) and ((time() - metrics_sample_sweep_failed_observed_timestamp_seconds) < 1800))) > 0",
+                  "promql": "(max without (pod, container, instance) (max_over_time(metrics_sample_sweep_failed[30m]) and ((time() - metrics_sample_sweep_failed_observed_timestamp_seconds) < 1800)))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2456,7 +2464,7 @@ data:
                 },
                 {
                   "name": "observability_event_log_over_capacity",
-                  "promql": "(max without (pod, container, instance) (max_over_time(cogneva_observability_events_over_capacity[30m]) and ((time() - cogneva_observability_events_over_capacity_observed_timestamp_seconds) < 1800))) > 0",
+                  "promql": "(max without (pod, container, instance) (max_over_time(cogneva_observability_events_over_capacity[30m]) and ((time() - cogneva_observability_events_over_capacity_observed_timestamp_seconds) < 1800)))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2476,7 +2484,7 @@ data:
                 },
                 {
                   "name": "observability_event_sweep_failed",
-                  "promql": "(max without (pod, container, instance) (max_over_time(cogneva_observability_event_sweep_failed[30m]) and ((time() - cogneva_observability_event_sweep_failed_observed_timestamp_seconds) < 1800))) > 0",
+                  "promql": "(max without (pod, container, instance) (max_over_time(cogneva_observability_event_sweep_failed[30m]) and ((time() - cogneva_observability_event_sweep_failed_observed_timestamp_seconds) < 1800)))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2486,7 +2494,7 @@ data:
                 },
                 {
                   "name": "checkpoint_store_over_capacity",
-                  "promql": "(max without (pod, container, instance) (max_over_time(cogneva_checkpoints_over_capacity[30m]) and ((time() - cogneva_checkpoints_over_capacity_observed_timestamp_seconds) < 1800))) > 0",
+                  "promql": "(max without (pod, container, instance) (max_over_time(cogneva_checkpoints_over_capacity[30m]) and ((time() - cogneva_checkpoints_over_capacity_observed_timestamp_seconds) < 1800)))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2506,7 +2514,7 @@ data:
                 },
                 {
                   "name": "checkpoint_store_sweep_failed",
-                  "promql": "(max without (pod, container, instance) (max_over_time(cogneva_checkpoint_sweep_failed[30m]) and ((time() - cogneva_checkpoint_sweep_failed_observed_timestamp_seconds) < 1800))) > 0",
+                  "promql": "(max without (pod, container, instance) (max_over_time(cogneva_checkpoint_sweep_failed[30m]) and ((time() - cogneva_checkpoint_sweep_failed_observed_timestamp_seconds) < 1800)))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2526,7 +2534,7 @@ data:
                 },
                 {
                   "name": "llm_exchange_retention_pass_failed",
-                  "promql": "(max without (pod, container, instance) (max_over_time(gateway_llm_exchange_sweep_failed[30m]) and ((time() - gateway_llm_exchange_sweep_failed_observed_timestamp_seconds) < 1800))) > 0",
+                  "promql": "(max without (pod, container, instance) (max_over_time(gateway_llm_exchange_sweep_failed[30m]) and ((time() - gateway_llm_exchange_sweep_failed_observed_timestamp_seconds) < 1800)))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2536,7 +2544,7 @@ data:
                 },
                 {
                   "name": "task_event_archive_pass_failed",
-                  "promql": "(max without (pod, container, instance) (max_over_time(cogneva_task_events_sweep_failed[30m]) and ((time() - cogneva_task_events_sweep_failed_observed_timestamp_seconds) < 1800))) > 0",
+                  "promql": "(max without (pod, container, instance) (max_over_time(cogneva_task_events_sweep_failed[30m]) and ((time() - cogneva_task_events_sweep_failed_observed_timestamp_seconds) < 1800)))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2556,7 +2564,7 @@ data:
                 },
                 {
                   "name": "llm_usage_fold_behind",
-                  "promql": "(max without (pod, container, instance) (cogneva_llm_usage_uncovered_rows and ((time() - cogneva_llm_usage_uncovered_rows_observed_timestamp_seconds) < 1800)) > 0) and (max without (pod, container, instance) (cogneva_llm_usage_uncovered_oldest_age_seconds and ((time() - cogneva_llm_usage_uncovered_oldest_age_seconds_observed_timestamp_seconds) < 1800)) > max without (pod, container, instance) (cogneva_llm_usage_keep_seconds and ((time() - cogneva_llm_usage_keep_seconds_observed_timestamp_seconds) < 1800)))",
+                  "promql": "(max without (pod, container, instance) (cogneva_llm_usage_uncovered_rows and ((time() - cogneva_llm_usage_uncovered_rows_observed_timestamp_seconds) < 1800))) and (max without (pod, container, instance) (cogneva_llm_usage_uncovered_oldest_age_seconds and ((time() - cogneva_llm_usage_uncovered_oldest_age_seconds_observed_timestamp_seconds) < 1800)) > max without (pod, container, instance) (cogneva_llm_usage_keep_seconds and ((time() - cogneva_llm_usage_keep_seconds_observed_timestamp_seconds) < 1800)))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2566,7 +2574,7 @@ data:
                 },
                 {
                   "name": "llm_usage_retention_pass_failed",
-                  "promql": "(max without (pod, container, instance) (max_over_time(cogneva_llm_usage_sweep_failed[30m]) and ((time() - cogneva_llm_usage_sweep_failed_observed_timestamp_seconds) < 1800))) > 0",
+                  "promql": "(max without (pod, container, instance) (max_over_time(cogneva_llm_usage_sweep_failed[30m]) and ((time() - cogneva_llm_usage_sweep_failed_observed_timestamp_seconds) < 1800)))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2576,7 +2584,7 @@ data:
                 },
                 {
                   "name": "memory_decay_passes_all_failed",
-                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_memory_decay_total{outcome=\"failed\"}[6h])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_memory_decay_total{outcome!=\"failed\"}[6h])) > 0)",
+                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_memory_decay_total{outcome=\"failed\"}[6h]))) unless on() (max without (pod, container, instance, job) (increase(cogneva_memory_decay_total{outcome!=\"failed\"}[6h])) > 0)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2586,7 +2594,7 @@ data:
                 },
                 {
                   "name": "memory_raw_backlog_aged_out",
-                  "promql": "(max without (pod, container, instance) (max_over_time(memory_unextracted_raw_aged_out[30m]) and ((time() - memory_unextracted_raw_aged_out_observed_timestamp_seconds) < 1800))) > 0 and (max without (pod, container, instance, operation) (increase(memory_operations_total{operation=\"aged_out_redrive\"}[30m])) == 0) unless on () (max without (operation) (cogneva_memory_pull_gate_holder{operation=~\"pull_gate_local|pull_gate_shared|pull_gate_both\"}) == 1)",
+                  "promql": "(max without (pod, container, instance) (max_over_time(memory_unextracted_raw_aged_out[30m]) and ((time() - memory_unextracted_raw_aged_out_observed_timestamp_seconds) < 1800))) and (max without (pod, container, instance, operation) (increase(memory_operations_total{operation=\"aged_out_redrive\"}[30m])) == 0) unless on () (max without (operation) (cogneva_memory_pull_gate_holder{operation=~\"pull_gate_local|pull_gate_shared|pull_gate_both\"}) == 1)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2606,7 +2614,7 @@ data:
                 },
                 {
                   "name": "memory_unextracted_scan_failed",
-                  "promql": "(max without (pod, container, instance) (max_over_time(memory_unextracted_scan_failed[30m]) and ((time() - memory_unextracted_scan_failed_observed_timestamp_seconds) < 1800))) > 0",
+                  "promql": "(max without (pod, container, instance) (max_over_time(memory_unextracted_scan_failed[30m]) and ((time() - memory_unextracted_scan_failed_observed_timestamp_seconds) < 1800)))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2616,7 +2624,7 @@ data:
                 },
                 {
                   "name": "memory_discarded_to_dead_letter",
-                  "promql": "(max without (pod, container, instance, operation) (increase(memory_operations_total{operation=\"dlq_written\"}[30m])) > 0)",
+                  "promql": "(max without (pod, container, instance, operation) (increase(memory_operations_total{operation=\"dlq_written\"}[30m])))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2626,7 +2634,7 @@ data:
                 },
                 {
                   "name": "benchmark_payload_refused_by_canary",
-                  "promql": "(max without (pod, container, instance, operation) (increase(memory_operations_total{operation=\"benchmark_canary_refused\"}[30m])) > 0)",
+                  "promql": "(max without (pod, container, instance, operation) (increase(memory_operations_total{operation=\"benchmark_canary_refused\"}[30m])))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2636,7 +2644,7 @@ data:
                 },
                 {
                   "name": "tool_output_archive_failing",
-                  "promql": "(max by (tool, cause) (increase(cogneva_tool_output_archive_failed_total[30m])) > 0)",
+                  "promql": "(max by (tool, cause) (increase(cogneva_tool_output_archive_failed_total[30m])))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2646,7 +2654,7 @@ data:
                 },
                 {
                   "name": "event_bus_losing_run_histories",
-                  "promql": "(max by (cause) (increase(cogneva_event_bus_dropped_total[30m])) > 0)",
+                  "promql": "(max by (cause) (increase(cogneva_event_bus_dropped_total[30m])))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2656,7 +2664,7 @@ data:
                 },
                 {
                   "name": "event_bus_consumer_falling_behind",
-                  "promql": "(max by (consumer) (increase(cogneva_event_bus_lagged_total[30m])) > 0)",
+                  "promql": "(max by (consumer) (increase(cogneva_event_bus_lagged_total[30m])))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2666,7 +2674,7 @@ data:
                 },
                 {
                   "name": "event_bus_consumer_stopped_taking",
-                  "promql": "(max without (pod, container, instance) (increase(cogneva_event_bus_emitted_total[30m])) > 0) unless on () (max without (pod, container, instance, consumer) (increase(cogneva_event_bus_consumed_total[30m])) > 0)",
+                  "promql": "(max without (pod, container, instance) (increase(cogneva_event_bus_emitted_total[30m]))) unless on () (max without (pod, container, instance, consumer) (increase(cogneva_event_bus_consumed_total[30m])) > 0)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2686,7 +2694,7 @@ data:
                 },
                 {
                   "name": "gitops_pull_failed",
-                  "promql": "(max without (pod, container, instance) (max_over_time(gitops_pull_failed[30m]) and ((time() - gitops_pull_failed_observed_timestamp_seconds) < 1800))) > 0",
+                  "promql": "(max without (pod, container, instance) (max_over_time(gitops_pull_failed[30m]) and ((time() - gitops_pull_failed_observed_timestamp_seconds) < 1800)))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2696,7 +2704,7 @@ data:
                 },
                 {
                   "name": "audited_request_refused",
-                  "promql": "sum by (outcome) (increase(audited_llm_requests_total{outcome!=\"released\"}[1h])) > 0",
+                  "promql": "sum by (outcome) (increase(audited_llm_requests_total{outcome!=\"released\"}[1h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2706,7 +2714,7 @@ data:
                 },
                 {
                   "name": "version_contract_violated",
-                  "promql": "max by (clause) (max_over_time(cogneva_version_contract_violations[1h]) and ((time() - cogneva_version_contract_violations_observed_timestamp_seconds) < 3600)) > 0",
+                  "promql": "max by (clause) (max_over_time(cogneva_version_contract_violations[1h]) and ((time() - cogneva_version_contract_violations_observed_timestamp_seconds) < 3600))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2716,7 +2724,7 @@ data:
                 },
                 {
                   "name": "version_contract_unjudged",
-                  "promql": "max(max_over_time(cogneva_version_contract_unjudged[1h]) and ((time() - cogneva_version_contract_unjudged_observed_timestamp_seconds) < 3600)) > 0",
+                  "promql": "max(max_over_time(cogneva_version_contract_unjudged[1h]) and ((time() - cogneva_version_contract_unjudged_observed_timestamp_seconds) < 3600))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2736,7 +2744,7 @@ data:
                 },
                 {
                   "name": "worktree_tree_about_to_rebuild",
-                  "promql": "max by (worktree) (max_over_time(cogneva_worktree_index_missing_files[30m]) and ((time() - cogneva_worktree_index_missing_files_observed_timestamp_seconds) < 10800)) > 0",
+                  "promql": "max by (worktree) (max_over_time(cogneva_worktree_index_missing_files[30m]) and ((time() - cogneva_worktree_index_missing_files_observed_timestamp_seconds) < 10800))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2746,7 +2754,7 @@ data:
                 },
                 {
                   "name": "worktree_index_absent",
-                  "promql": "((min_over_time(((min by (worktree) (cogneva_worktree_index_present)) and ((time() - (max by (worktree) (cogneva_worktree_index_present_observed_timestamp_seconds))) < 10800))[30m:1m]) < 1) and (count_over_time((min by (worktree) (cogneva_worktree_index_present))[1h:1m]) > count_over_time((min by (worktree) (cogneva_worktree_index_present))[30m:1m])))",
+                  "promql": "((min_over_time(((min by (worktree) (cogneva_worktree_index_present)) and ((time() - (max by (worktree) (cogneva_worktree_index_present_observed_timestamp_seconds))) < 10800))[30m:1m])) and (count_over_time((min by (worktree) (cogneva_worktree_index_present))[1h:1m]) > count_over_time((min by (worktree) (cogneva_worktree_index_present))[30m:1m])))",
                   "condition": {
                     "less_than": 1.0
                   },
@@ -2756,7 +2764,7 @@ data:
                 },
                 {
                   "name": "worktree_index_sample_incomplete",
-                  "promql": "max by (worktree) (max_over_time(cogneva_worktree_index_sample_incomplete[30m]) and ((time() - cogneva_worktree_index_sample_incomplete_observed_timestamp_seconds) < 10800)) > 0",
+                  "promql": "max by (worktree) (max_over_time(cogneva_worktree_index_sample_incomplete[30m]) and ((time() - cogneva_worktree_index_sample_incomplete_observed_timestamp_seconds) < 10800))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2766,7 +2774,7 @@ data:
                 },
                 {
                   "name": "buildah_store_live_refs_empty",
-                  "promql": "(min without (pod, container, instance) (max_over_time(cogneva_buildah_store_live_images[30m]) and ((time() - cogneva_buildah_store_live_images_observed_timestamp_seconds) < 43200))) < 1",
+                  "promql": "(min without (pod, container, instance) (max_over_time(cogneva_buildah_store_live_images[30m]) and ((time() - cogneva_buildah_store_live_images_observed_timestamp_seconds) < 43200)))",
                   "condition": {
                     "less_than": 1.0
                   },
@@ -2776,7 +2784,7 @@ data:
                 },
                 {
                   "name": "metrics_retired_rows_still_arriving",
-                  "promql": "((min_over_time(((max by (table) (metrics_retired_rows_removed)) and ((time() - (max by (table) (metrics_retired_rows_removed_observed_timestamp_seconds))) < 3600))[1h:1m]) > 0) and (count_over_time((max by (table) (metrics_retired_rows_removed))[2h:1m]) > count_over_time((max by (table) (metrics_retired_rows_removed))[1h:1m])))",
+                  "promql": "((min_over_time(((max by (table) (metrics_retired_rows_removed)) and ((time() - (max by (table) (metrics_retired_rows_removed_observed_timestamp_seconds))) < 3600))[1h:1m])) and (count_over_time((max by (table) (metrics_retired_rows_removed))[2h:1m]) > count_over_time((max by (table) (metrics_retired_rows_removed))[1h:1m])))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2786,7 +2794,7 @@ data:
                 },
                 {
                   "name": "metrics_retirement_release_failed",
-                  "promql": "(max without (pod, container, instance, job) (max_over_time(metrics_retirement_release_failed[1h]) and ((time() - metrics_retirement_release_failed_observed_timestamp_seconds) < 3600))) > 0",
+                  "promql": "(max without (pod, container, instance, job) (max_over_time(metrics_retirement_release_failed[1h]) and ((time() - metrics_retirement_release_failed_observed_timestamp_seconds) < 3600)))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2796,7 +2804,7 @@ data:
                 },
                 {
                   "name": "mainline_ci_verdict_failed",
-                  "promql": "max by (verdict) (increase(cogneva_mainline_ci_verdict_total{verdict=\"fail\"}[1h])) > 0",
+                  "promql": "max by (verdict) (increase(cogneva_mainline_ci_verdict_total{verdict=\"fail\"}[1h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2806,7 +2814,7 @@ data:
                 },
                 {
                   "name": "mainline_ci_verdict_unreadable",
-                  "promql": "max by (reason) (increase(cogneva_mainline_ci_no_verdict_reason_total{reason!=\"pending\",reason!=\"no_runs\"}[1h])) > 0",
+                  "promql": "max by (reason) (increase(cogneva_mainline_ci_no_verdict_reason_total{reason!=\"pending\",reason!=\"no_runs\"}[1h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2816,7 +2824,7 @@ data:
                 },
                 {
                   "name": "mainline_supersession_question_stopped",
-                  "promql": "max(increase(cogneva_mainline_rollout_attempts_total[6h]) - increase(cogneva_mainline_supersession_checks_total[6h])) > 0",
+                  "promql": "max(increase(cogneva_mainline_rollout_attempts_total[6h]) - increase(cogneva_mainline_supersession_checks_total[6h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2830,7 +2838,7 @@ data:
                     "reason": "lazy_counter",
                     "why": "Counted only when the preflight refuses a deploy (cog-reflection/src/mainline_deployer.rs); refused_total has no zero-value series until the first refusal."
                   },
-                  "promql": "max by (verb, resource) (increase(cogneva_mainline_preflight_refused_total[1h])) > 0",
+                  "promql": "max by (verb, resource) (increase(cogneva_mainline_preflight_refused_total[1h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2844,7 +2852,7 @@ data:
                     "reason": "lazy_counter",
                     "why": "Counted only when the cluster's authorization refuses one of the deployer's kubectl calls (cog-reflection/src/mainline_deployer.rs record_kubectl_refused, refusal branch only); labels are the server's own verb+resource, so the family is created by the first refusal and the rule fires on it. Emitter landed in 252fe47b, inside the running image main-93ebcda35e7a."
                   },
-                  "promql": "max by (verb, resource) (increase(cogneva_mainline_kubectl_refused_total[1h])) > 0",
+                  "promql": "max by (verb, resource) (increase(cogneva_mainline_kubectl_refused_total[1h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2858,7 +2866,7 @@ data:
                     "reason": "lazy_counter",
                     "why": "Counted only when the cluster's admission face keeps a rollout from creating a Pod (cog-reflection/src/mainline_deployer.rs record_rollout_refused, admission branch only); labels are the wall (quota/limitrange/podsecurity/admission), so the family is created by the first refusal and the rule fires on it. The emitter ships in the same change as this row, so the series stays absent until that build is running."
                   },
-                  "promql": "max by (reason) (increase(cogneva_mainline_rollout_refused_total[1h])) > 0",
+                  "promql": "max by (reason) (increase(cogneva_mainline_rollout_refused_total[1h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2872,7 +2880,7 @@ data:
                     "reason": "lazy_counter",
                     "why": "cog-reflection/src/mainline_deployer.rs records this labelled counter only on a pass where admission actually held the rollout, so the family is created by the first hold. A deployment that never waited has no series, and the rule fires the moment one appears."
                   },
-                  "promql": "max by (resource) (increase(cogneva_mainline_admission_held_total[1h])) > 0",
+                  "promql": "max by (resource) (increase(cogneva_mainline_admission_held_total[1h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2882,7 +2890,7 @@ data:
                 },
                 {
                   "name": "mainline_rollout_never_lands",
-                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_mainline_rollout_attempts_total[30m] offset 30m)) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_mainline_rollout_completed_total[1h])) > 0)",
+                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_mainline_rollout_attempts_total[30m] offset 30m))) unless on() (max without (pod, container, instance, job) (increase(cogneva_mainline_rollout_completed_total[1h])) > 0)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2892,7 +2900,7 @@ data:
                 },
                 {
                   "name": "mainline_build_slow",
-                  "promql": "max(cogneva_mainline_build_seconds{outcome=\"ok\"} and ((time() - cogneva_mainline_build_seconds_observed_timestamp_seconds) < 21600)) > 1200",
+                  "promql": "max(cogneva_mainline_build_seconds{outcome=\"ok\"} and ((time() - cogneva_mainline_build_seconds_observed_timestamp_seconds) < 21600))",
                   "condition": {
                     "greater_than": 1200.0
                   },
@@ -2902,7 +2910,7 @@ data:
                 },
                 {
                   "name": "mainline_ci_hold_too_long",
-                  "promql": "max(cogneva_mainline_ci_hold_seconds and ((time() - cogneva_mainline_ci_hold_seconds_observed_timestamp_seconds) < 3600)) > 14400",
+                  "promql": "max(cogneva_mainline_ci_hold_seconds and ((time() - cogneva_mainline_ci_hold_seconds_observed_timestamp_seconds) < 3600))",
                   "condition": {
                     "greater_than": 14400.0
                   },
@@ -2922,7 +2930,7 @@ data:
                 },
                 {
                   "name": "mainline_advance_starved",
-                  "promql": "max((time() - cogneva_mainline_advance_wait_since_unix) and (cogneva_mainline_advance_wait_since_unix > 0) and (time() - cogneva_mainline_advance_wait_since_unix_observed_timestamp_seconds < 1200)) > 1800",
+                  "promql": "max((time() - cogneva_mainline_advance_wait_since_unix) and (cogneva_mainline_advance_wait_since_unix > 0) and (time() - cogneva_mainline_advance_wait_since_unix_observed_timestamp_seconds < 1200))",
                   "condition": {
                     "greater_than": 1800.0
                   },
@@ -2952,7 +2960,7 @@ data:
                 },
                 {
                   "name": "mainline_poll_cycles_all_failed",
-                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_mainline_poll_cycles_total{outcome=\"failed\"}[1h])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_mainline_poll_cycles_total{outcome=\"ok\"}[1h])) > 0)",
+                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_mainline_poll_cycles_total{outcome=\"failed\"}[1h]))) unless on() (max without (pod, container, instance, job) (increase(cogneva_mainline_poll_cycles_total{outcome=\"ok\"}[1h])) > 0)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2972,7 +2980,7 @@ data:
                 },
                 {
                   "name": "partition_maintenance_round_came_up_short",
-                  "promql": "max without (pod, container, instance, job) (increase(cogneva_partition_maintenance_failures_total[1h])) > 0",
+                  "promql": "max without (pod, container, instance, job) (increase(cogneva_partition_maintenance_failures_total[1h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2982,7 +2990,7 @@ data:
                 },
                 {
                   "name": "policy_evolution_rounds_all_failed",
-                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_policy_evolution_rounds_total{outcome=\"failed\"}[6h])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_policy_evolution_rounds_total{outcome!=\"failed\"}[6h])) > 0)",
+                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_policy_evolution_rounds_total{outcome=\"failed\"}[6h]))) unless on() (max without (pod, container, instance, job) (increase(cogneva_policy_evolution_rounds_total{outcome!=\"failed\"}[6h])) > 0)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -2992,7 +3000,7 @@ data:
                 },
                 {
                   "name": "analytics_flush_batches_all_failed",
-                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_analytics_flush_total{outcome=\"failed\"}[5m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_analytics_flush_total{outcome!=\"failed\"}[5m])) > 0)",
+                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_analytics_flush_total{outcome=\"failed\"}[5m]))) unless on() (max without (pod, container, instance, job) (increase(cogneva_analytics_flush_total{outcome!=\"failed\"}[5m])) > 0)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -3002,7 +3010,7 @@ data:
                 },
                 {
                   "name": "loki_flush_batches_all_failed",
-                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_loki_flush_total{outcome=\"failed\"}[5m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_loki_flush_total{outcome!=\"failed\"}[5m])) > 0)",
+                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_loki_flush_total{outcome=\"failed\"}[5m]))) unless on() (max without (pod, container, instance, job) (increase(cogneva_loki_flush_total{outcome!=\"failed\"}[5m])) > 0)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -3012,7 +3020,7 @@ data:
                 },
                 {
                   "name": "memory_schema_repair_passes_all_failed",
-                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_memory_schema_repair_total{outcome=\"failed\"}[1h])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_memory_schema_repair_total{outcome!=\"failed\"}[1h])) > 0)",
+                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_memory_schema_repair_total{outcome=\"failed\"}[1h]))) unless on() (max without (pod, container, instance, job) (increase(cogneva_memory_schema_repair_total{outcome!=\"failed\"}[1h])) > 0)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -3022,7 +3030,7 @@ data:
                 },
                 {
                   "name": "memory_schema_orphans_unrepairable",
-                  "promql": "max without (pod, container, instance, job) (increase(cogneva_memory_schema_repair_total{outcome=\"unrepairable\"}[1h])) > 0",
+                  "promql": "max without (pod, container, instance, job) (increase(cogneva_memory_schema_repair_total{outcome=\"unrepairable\"}[1h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -3032,7 +3040,7 @@ data:
                 },
                 {
                   "name": "skill_hot_reload_passes_all_failed",
-                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_skill_hot_reload_total{outcome=\"failed\"}[5m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_skill_hot_reload_total{outcome!=\"failed\"}[5m])) > 0)",
+                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_skill_hot_reload_total{outcome=\"failed\"}[5m]))) unless on() (max without (pod, container, instance, job) (increase(cogneva_skill_hot_reload_total{outcome!=\"failed\"}[5m])) > 0)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -3042,7 +3050,7 @@ data:
                 },
                 {
                   "name": "skill_reload_failing_every_scan",
-                  "promql": "max without (pod, container, instance, job) (increase(cogneva_skill_hot_reload_total{outcome=\"reload_failed\"}[5m])) > 0",
+                  "promql": "max without (pod, container, instance, job) (increase(cogneva_skill_hot_reload_total{outcome=\"reload_failed\"}[5m]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -3052,7 +3060,7 @@ data:
                 },
                 {
                   "name": "supervisor_health_pass_failing",
-                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"health\", outcome=\"failed\"}[5m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"health\", outcome!=\"failed\"}[5m])) > 0)",
+                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"health\", outcome=\"failed\"}[5m]))) unless on() (max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"health\", outcome!=\"failed\"}[5m])) > 0)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -3062,7 +3070,7 @@ data:
                 },
                 {
                   "name": "supervisor_quota_pass_failing",
-                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"quota\", outcome=\"failed\"}[6m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"quota\", outcome!=\"failed\"}[6m])) > 0)",
+                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"quota\", outcome=\"failed\"}[6m]))) unless on() (max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"quota\", outcome!=\"failed\"}[6m])) > 0)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -3072,7 +3080,7 @@ data:
                 },
                 {
                   "name": "supervisor_rebalance_pass_failing",
-                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"rebalance\", outcome=\"failed\"}[30m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"rebalance\", outcome!=\"failed\"}[30m])) > 0)",
+                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"rebalance\", outcome=\"failed\"}[30m]))) unless on() (max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"rebalance\", outcome!=\"failed\"}[30m])) > 0)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -3082,7 +3090,7 @@ data:
                 },
                 {
                   "name": "supervisor_event_pass_failing",
-                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"event\", outcome=\"failed\"}[5m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"event\", outcome!=\"failed\"}[5m])) > 0)",
+                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"event\", outcome=\"failed\"}[5m]))) unless on() (max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"event\", outcome!=\"failed\"}[5m])) > 0)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -3092,7 +3100,7 @@ data:
                 },
                 {
                   "name": "supervisor_control_plane_pass_failing",
-                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"control_plane\", outcome=\"failed\"}[5m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"control_plane\", outcome!=\"failed\"}[5m])) > 0)",
+                  "promql": "(max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"control_plane\", outcome=\"failed\"}[5m]))) unless on() (max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"control_plane\", outcome!=\"failed\"}[5m])) > 0)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -3102,7 +3110,7 @@ data:
                 },
                 {
                   "name": "memory_bus_claim_rounds_all_failed",
-                  "promql": "(max without (pod, container, instance, job) (increase(memory_operations_total{operation=\"bus_claim_failed\"}[5m])) > 0) unless on() (max without (pod, container, instance, job) (increase(memory_operations_total{operation=\"bus_claim\"}[5m])) > 0)",
+                  "promql": "(max without (pod, container, instance, job) (increase(memory_operations_total{operation=\"bus_claim_failed\"}[5m]))) unless on() (max without (pod, container, instance, job) (increase(memory_operations_total{operation=\"bus_claim\"}[5m])) > 0)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -3116,7 +3124,7 @@ data:
                     "reason": "lazy_counter",
                     "why": "Counted only on a failed memory backend operation (cog-memory/src/metrics_instrumented.rs); no error in the window means no series. The rule also requires memory_operations_total, which is present on the success path."
                   },
-                  "promql": "((max by (operation) (max_over_time((max by (operation) (memory_operation_errors_total))[6h:1m]) - min_over_time((max by (operation) (memory_operation_errors_total))[6h:1m])) > 0) unless (max by (operation) ((max_over_time((max by (operation) (memory_operations_total))[6h:1m]) - min_over_time((max by (operation) (memory_operations_total))[6h:1m])) - (max_over_time((max by (operation) (memory_operation_errors_total))[6h:1m]) - min_over_time((max by (operation) (memory_operation_errors_total))[6h:1m]))) > 0)) and (count_over_time((max by (operation) (memory_operation_errors_total))[12h:1m]) > count_over_time((max by (operation) (memory_operation_errors_total))[6h:1m]))",
+                  "promql": "((max by (operation) (max_over_time((max by (operation) (memory_operation_errors_total))[6h:1m]) - min_over_time((max by (operation) (memory_operation_errors_total))[6h:1m]))) unless (max by (operation) ((max_over_time((max by (operation) (memory_operations_total))[6h:1m]) - min_over_time((max by (operation) (memory_operations_total))[6h:1m])) - (max_over_time((max by (operation) (memory_operation_errors_total))[6h:1m]) - min_over_time((max by (operation) (memory_operation_errors_total))[6h:1m]))) > 0)) and (count_over_time((max by (operation) (memory_operation_errors_total))[12h:1m]) > count_over_time((max by (operation) (memory_operation_errors_total))[6h:1m]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -3126,7 +3134,7 @@ data:
                 },
                 {
                   "name": "knowledge_retrieval_backend_errored",
-                  "promql": "(max by (layer) (increase(cogneva_knowledge_retrieval_total{outcome=\"error\"}[6h])) > 0) unless on(layer) (max by (layer) (increase(cogneva_knowledge_retrieval_total{outcome=~\"hit|empty\"}[6h])) > 0)",
+                  "promql": "(max by (layer) (increase(cogneva_knowledge_retrieval_total{outcome=\"error\"}[6h]))) unless on(layer) (max by (layer) (increase(cogneva_knowledge_retrieval_total{outcome=~\"hit|empty\"}[6h])) > 0)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -3156,7 +3164,7 @@ data:
                 },
                 {
                   "name": "host_ledger_slices_invisible",
-                  "promql": "(min_over_time((min by (node) (cogneva_host_ledger_slices_readable))[15m:1m]) < 3) and (count_over_time((min by (node) (cogneva_host_ledger_slices_readable))[30m:1m]) > count_over_time((min by (node) (cogneva_host_ledger_slices_readable))[15m:1m]))",
+                  "promql": "(min_over_time((min by (node) (cogneva_host_ledger_slices_readable))[15m:1m])) and (count_over_time((min by (node) (cogneva_host_ledger_slices_readable))[30m:1m]) > count_over_time((min by (node) (cogneva_host_ledger_slices_readable))[15m:1m]))",
                   "condition": {
                     "less_than": 3.0
                   },
@@ -3196,7 +3204,7 @@ data:
                 },
                 {
                   "name": "backup_never_succeeded",
-                  "promql": "(max(cogneva_backup_run_readings{readout=\"runs_failed\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds) < 1800)) > 0) and (max(cogneva_backup_run_readings{readout=\"runs_ok\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds) < 1800)) == 0)",
+                  "promql": "(max(cogneva_backup_run_readings{readout=\"runs_failed\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds) < 1800))) and (max(cogneva_backup_run_readings{readout=\"runs_ok\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds) < 1800)) == 0)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -3309,7 +3317,7 @@ data:
                 },
                 {
                   "name": "backup_restore_drill_attempt_never_finished",
-                  "promql": "max(increase(cogneva_backup_run_readings{readout=\"drill_attempts_never_seen\"}[26h]) and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"drill_attempts_never_seen\"}) < 1800)) > 0",
+                  "promql": "max(increase(cogneva_backup_run_readings{readout=\"drill_attempts_never_seen\"}[26h]) and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"drill_attempts_never_seen\"}) < 1800))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -3453,7 +3461,7 @@ data:
                 },
                 {
                   "name": "backup_run_abandoned",
-                  "promql": "max(increase(cogneva_backup_run_readings{readout=\"runs_abandoned\"}[1800s]) and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"runs_abandoned\"}) < 1800)) > 0",
+                  "promql": "max(increase(cogneva_backup_run_readings{readout=\"runs_abandoned\"}[1800s]) and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"runs_abandoned\"}) < 1800))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -3543,7 +3551,7 @@ data:
                 },
                 {
                   "name": "alert_batch_reached_no_outlet",
-                  "promql": "(max(increase(cogneva_alert_notifications_total{outcome=\"no_channel\"}[30m])) > 0) unless on() (max(cogneva_signal_watcher_running) == 1)",
+                  "promql": "(max(increase(cogneva_alert_notifications_total{outcome=\"no_channel\"}[30m]))) unless on() (max(cogneva_signal_watcher_running) == 1)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -3564,7 +3572,7 @@ data:
                 },
                 {
                   "name": "principle_refusals_sustained",
-                  "promql": "(min_over_time((max by (slug) (changes(cogneva_principle_refusals[24h])))[3d:1h]) > 0) and (max by (slug) (count_over_time(cogneva_principle_refusals[6d:1h])) > max by (slug) (count_over_time(cogneva_principle_refusals[3d:1h]))) and on() ((time() - max(cogneva_principle_refusals_observed_timestamp_seconds)) < 1800)",
+                  "promql": "(min_over_time((max by (slug) (changes(cogneva_principle_refusals[24h])))[3d:1h])) and (max by (slug) (count_over_time(cogneva_principle_refusals[6d:1h])) > max by (slug) (count_over_time(cogneva_principle_refusals[3d:1h]))) and on() ((time() - max(cogneva_principle_refusals_observed_timestamp_seconds)) < 1800)",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -3624,7 +3632,7 @@ data:
                 },
                 {
                   "name": "alert_channel_declared_without_recipients",
-                  "promql": "(max(increase(cogneva_alert_channel_resolution_total{result=\"no_recipients\"}[30m])) > 0)",
+                  "promql": "(max(increase(cogneva_alert_channel_resolution_total{result=\"no_recipients\"}[30m])))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -3634,7 +3642,7 @@ data:
                 },
                 {
                   "name": "alert_verdict_not_recorded",
-                  "promql": "(max(increase(cogneva_alert_assertion_write_total{outcome=\"failed\"}[15m])) > 0)",
+                  "promql": "(max(increase(cogneva_alert_assertion_write_total{outcome=\"failed\"}[15m])))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -3654,7 +3662,7 @@ data:
                 },
                 {
                   "name": "acceptance_census_never_completed",
-                  "promql": "max by (node) (cogneva_acceptance_present) == 0",
+                  "promql": "max by (node) (cogneva_acceptance_present)",
                   "condition": {
                     "equal": 0.0
                   },
@@ -3674,9 +3682,9 @@ data:
                 },
                 {
                   "name": "acceptance_snapshot_not_refreshed",
-                  "promql": "time() - max by (node) (cogneva_acceptance_observed_timestamp_seconds) > 3600",
+                  "promql": "time() - max by (node) (cogneva_acceptance_observed_timestamp_seconds)",
                   "condition": {
-                    "greater_than": 0.0
+                    "greater_than": 3600.0
                   },
                   "severity": "warning",
                   "summary": "验收面的普查一小时没有出新快照。序列还在、值也不动——这正是「停在最后一次的读数」那种形状：生产者活着、每拍把同一份旧快照印出去，退出码还是 0，面板上一片安静。普查 15 分钟一拍、一趟实测约 5 分钟，所以一小时等于连错过四趟，够长到不会因为某一趟恰好卡在别人半成品上误报。与上一条分工：族整条没了是生产者死，这一条是生产者活着但刷新那一半死了（读快照那一半是毫秒级的，写快照那一半才要跑几分钟）。修法先看生产者自己拉起的刷新进程还在不在、`flock` 是否被上次那趟占住。severity 取 warning。",
@@ -3694,7 +3702,7 @@ data:
                 },
                 {
                   "name": "acceptance_census_covered_no_specs",
-                  "promql": "max by (node) (cogneva_acceptance_specs) == 0",
+                  "promql": "max by (node) (cogneva_acceptance_specs)",
                   "condition": {
                     "equal": 0.0
                   },
@@ -3754,9 +3762,9 @@ data:
                 },
                 {
                   "name": "image_store_over_the_watermark_without_a_gc",
-                  "promql": "(100 - 100 * max by (node) (node_filesystem_avail_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"}) / max by (node) (node_filesystem_size_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"})) > 85 unless on(node) (max by (node) (increase(kubelet_image_garbage_collected_total{node!=\"\", reason=\"space\"}[1h])) > 0)",
+                  "promql": "(100 - 100 * max by (node) (node_filesystem_avail_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"}) / max by (node) (node_filesystem_size_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"})) unless on(node) (max by (node) (increase(kubelet_image_garbage_collected_total{node!=\"\", reason=\"space\"}[1h])) > 0)",
                   "condition": {
-                    "greater_than": 0.0
+                    "greater_than": 85.0
                   },
                   "severity": "warning",
                   "summary": "The disk on {node} is {value}% full -- past the 85% high watermark where the kubelet's image GC starts -- and the kubelet has run no space-driven collection in the last hour. The bars are the kubelet's defaults: it starts at 85% and stops at 80%, and this host's k3s config sets no image-gc arguments, so the defaults are what is in force. 80% is the bottom of the band, not the trigger -- an earlier version of this rule fired at 80% and asked for a collection before the runtime had any reason to start one. Only reason=\"space\" answers for this: reason=\"age\" collections are the timer and run regardless (380 over the seven days to 2026-10-22 here, none under space), so testing whether the kubelet had collected at all let the timer answer for the watermark path every window, and the rule could never speak. Both sides of the unless carry a node because the filesystem reading is relabeled from the pod's node name at scrape time; before that, max by (node) returned an empty label set and on(node) could not match anything. The disk reading is the node's root filesystem, which is where imagefs lives on this k3s (both are /); on a host with a separate imagefs this number is the wrong disk. If this fires, the disk is over the line and nothing is reclaiming: read the kubelet log for the image manager (an eviction that fails, a watermark set above the disk's reachable size), and treat the store as unbounded until a space collection shows up. image_store_bytes may be small while the disk is full -- the GC removes images, and what filled the disk may be a volume or a log",
@@ -3909,7 +3917,7 @@ data:
                 },
                 {
                   "name": "agent_context_limit_refused",
-                  "promql": "sum by (outcome) (increase(cogneva_agent_context_limit_refusals_total[1h])) > 0",
+                  "promql": "sum by (outcome) (increase(cogneva_agent_context_limit_refusals_total[1h]))",
                   "condition": {
                     "greater_than": 0.0
                   },
@@ -3919,9 +3927,9 @@ data:
                 }
               ],
               "_comment_poll_interval_secs": "采集周期：连续几拍取不到数才算「断档」（`eval_failure_alert_after` 按拍计），所以改它等于改所有告警的时间分辨率；读侧把 0 夹到 1 秒。",
-              "_comment_greater_than": "`greater_than` 里的数是这条告警的判定线本身：同一规则里的 `summary` 把它复述给看告警的人，两处说的是同一件事。线定在哪由这条规则要抓的问题定（例如根分区用到 75% 就该有人看），这一族不共用一条实测——每条规则的线各自对应它自己的判据。",
-              "_comment_less_than": "`less_than` 里的数是这条告警的判定线本身：同一规则里的 `summary` 把它复述给看告警的人，两处说的是同一件事。线定在哪由这条规则要抓的问题定（例如根分区用到 75% 就该有人看），这一族不共用一条实测——每条规则的线各自对应它自己的判据。方向相反：低于这条线就报。",
-              "_comment_greater_than_or_equal": "`greater_than_or_equal` 里的数是这条告警的判定线本身：同一规则里的 `summary` 把它复述给看告警的人，两处说的是同一件事。线定在哪由这条规则要抓的问题定（例如根分区用到 75% 就该有人看），这一族不共用一条实测——每条规则的线各自对应它自己的判据。边界包含：等于这条线就报。",
+              "_comment_greater_than": "`greater_than` 里的数是这条告警的判定线本身：同一规则里的 `summary` 把它复述给看告警的人，两处说的是同一件事。线定在哪由这条规则要抓的问题定（例如根分区用到 75% 就该有人看），这一族不共用一条实测——每条规则的线各自对应它自己的判据。 查询只取数：`promql` 不把这条线同向地再比一次，比一次的是 `condition` 这一格。",
+              "_comment_less_than": "`less_than` 里的数是这条告警的判定线本身：同一规则里的 `summary` 把它复述给看告警的人，两处说的是同一件事。线定在哪由这条规则要抓的问题定（例如根分区用到 75% 就该有人看），这一族不共用一条实测——每条规则的线各自对应它自己的判据。方向相反：低于这条线就报。 查询只取数：`promql` 不把这条线同向地再比一次，比一次的是 `condition` 这一格。",
+              "_comment_greater_than_or_equal": "`greater_than_or_equal` 里的数是这条告警的判定线本身：同一规则里的 `summary` 把它复述给看告警的人，两处说的是同一件事。线定在哪由这条规则要抓的问题定（例如根分区用到 75% 就该有人看），这一族不共用一条实测——每条规则的线各自对应它自己的判据。边界包含：等于这条线就报。 查询只取数：`promql` 不把这条线同向地再比一次，比一次的是 `condition` 这一格。",
               "_comment_equal": "`equal` 里的数是这条告警的判定线本身：同一规则里的 `summary` 把它复述给看告警的人，两处说的是同一件事。线定在哪由这条规则要抓的问题定（例如根分区用到 75% 就该有人看），这一族不共用一条实测——每条规则的线各自对应它自己的判据。判等：只有取到这个值才报。"
             },
             "trace_collector": {

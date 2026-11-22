@@ -26,7 +26,6 @@ tracing = { workspace = true }
 async-trait = "0.1"
 
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 
 [dev-dependencies]
 tokio-test = "0.4"

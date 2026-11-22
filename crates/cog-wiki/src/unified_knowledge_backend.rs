@@ -5,13 +5,13 @@ use async_trait::async_trait;
 use cog_core::contract::knowledge::{
     record_retrieval_cell, RETRIEVAL_LAYER_MEMORY as LAYER_MEMORY,
     RETRIEVAL_LAYER_WIKI as LAYER_WIKI, RETRIEVAL_OUTCOME_ABSENT, RETRIEVAL_OUTCOME_EMPTY,
-    RETRIEVAL_OUTCOME_ERROR, RETRIEVAL_OUTCOME_HIT,
+    RETRIEVAL_OUTCOME_ERROR, RETRIEVAL_OUTCOME_HIT, RETRIEVAL_OUTCOME_PARTIAL,
 };
 use cog_core::{
     EmbeddingProvider, FailurePattern, ImplementationExample, KnowledgeBackend, KnowledgeEntry,
-    MemoryBackend, MetricsBackend, RerankerProvider, SFResult, SchemaEntry, SchemaKind, SourceRef,
-    SummaryEntry, Task, TaskDecompositionPattern, TaskExecutionRecord, TaskResult,
-    UnifiedSearchResult, WikiBackend,
+    MemoryBackend, MetricsBackend, RerankerProvider, SFResult, SchemaEntry, SchemaKind,
+    SchemaSearchResult, SourceRef, SummaryEntry, Task, TaskDecompositionPattern,
+    TaskExecutionRecord, TaskResult, UnifiedSearchResult, WikiBackend,
 };
 
 /// Unified knowledge backend aggregating [`MemoryBackend`] (three-layer
@@ -33,23 +33,32 @@ pub struct UnifiedKnowledgeBackend {
 
 /// How one layer answered one retrieval.
 ///
-/// These four are the whole reason the series exists: everything except `Hit`
-/// reaches the caller as an empty list, so "this process holds no such layer",
-/// "the store refused" and "the store answered and matches nothing" are one
-/// answer downstream. See [`Self::record`].
+/// These five are the whole reason the series exists: everything except `Hit`
+/// reaches the caller as an empty list or a shorter one, so "this process holds
+/// no such layer", "the store refused", "the store answered and matches
+/// nothing" and "the store answered and some of what it held could not be
+/// read" would otherwise be one answer downstream. See [`Self::record`].
 #[derive(Clone, Copy)]
 enum Outcome {
     Hit,
     Empty,
+    Partial,
     Error,
     Absent,
 }
 
 impl Outcome {
     /// The cell a layer's answer lands in, from how many rows the layer
-    /// contributed.
-    fn of_rows(rows: usize) -> Self {
-        if rows == 0 {
+    /// contributed and how many of the rows its store held could not be decoded.
+    ///
+    /// `dropped` is not a detail to fold away: zero rows with rows dropped is
+    /// NOT `empty` -- `empty` says the layer answered and its store held
+    /// nothing, and that is a different fact from a store full of rows nobody
+    /// could read.
+    fn of_rows(rows: usize, dropped: usize) -> Self {
+        if dropped > 0 {
+            Outcome::Partial
+        } else if rows == 0 {
             Outcome::Empty
         } else {
             Outcome::Hit
@@ -60,6 +69,7 @@ impl Outcome {
         match self {
             Outcome::Hit => RETRIEVAL_OUTCOME_HIT,
             Outcome::Empty => RETRIEVAL_OUTCOME_EMPTY,
+            Outcome::Partial => RETRIEVAL_OUTCOME_PARTIAL,
             Outcome::Error => RETRIEVAL_OUTCOME_ERROR,
             Outcome::Absent => RETRIEVAL_OUTCOME_ABSENT,
         }
@@ -68,12 +78,49 @@ impl Outcome {
     /// The whole closed set, for the test that pins these cells to the series'
     /// vocabulary.
     #[cfg(test)]
-    const ALL: [Outcome; 4] = [
+    const ALL: [Outcome; 5] = [
         Outcome::Hit,
         Outcome::Empty,
         Outcome::Error,
         Outcome::Absent,
+        Outcome::Partial,
     ];
+}
+
+/// Decode a set of stored rows into the layer's own type, returning the rows
+/// that decoded and how many did not.
+///
+/// A row whose properties no longer fit the layer's type used to vanish without
+/// a trace: the caller saw a shorter list, and a store that held only unreadable
+/// rows was reported as `empty` -- the same cell as a namespace nothing was ever
+/// stored in. The count is returned rather than logged and forgotten so the
+/// retrieval can say `partial` instead.
+fn decode_rows<T: serde::de::DeserializeOwned>(
+    namespace: &str,
+    rows: Vec<SchemaSearchResult>,
+) -> (Vec<(String, T)>, usize) {
+    let mut kept = Vec::with_capacity(rows.len());
+    let mut dropped = 0usize;
+    let mut first_error: Option<String> = None;
+    for row in rows {
+        let id = row.entry.id.clone();
+        match serde_json::from_value::<T>(row.entry.properties) {
+            Ok(value) => kept.push((id, value)),
+            Err(error) => {
+                dropped += 1;
+                first_error.get_or_insert_with(|| error.to_string());
+            }
+        }
+    }
+    if dropped > 0 {
+        tracing::warn!(
+            namespace,
+            dropped,
+            error = first_error.as_deref().unwrap_or(""),
+            "这一层有行解不开：它们不算这一层的答案，读数记 partial"
+        );
+    }
+    (kept, dropped)
 }
 
 /// A service this backend may hold, and may only come to hold later.
@@ -554,7 +601,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
                             }
                         }
                     }
-                    self.record(LAYER_MEMORY, Outcome::of_rows(contributed))
+                    self.record(LAYER_MEMORY, Outcome::of_rows(contributed, 0))
                         .await;
                 }
                 Err(e) => {
@@ -628,7 +675,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
             let outcome = if refused {
                 Outcome::Error
             } else {
-                Outcome::of_rows(contributed)
+                Outcome::of_rows(contributed, 0)
             };
             self.record(LAYER_WIKI, outcome).await;
         } else {
@@ -728,20 +775,13 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
                 return Err(e);
             }
         };
-        let mut patterns: Vec<(String, TaskDecompositionPattern)> = results
-            .into_iter()
-            .filter_map(|r| {
-                let id = r.entry.id.clone();
-                serde_json::from_value::<TaskDecompositionPattern>(r.entry.properties.clone())
-                    .ok()
-                    .map(|pattern| (id, pattern))
-            })
-            .collect();
+        let (mut patterns, dropped) =
+            decode_rows::<TaskDecompositionPattern>(NS_DECOMPOSITION, results);
         patterns.sort_by(|a, b| {
             shared_terms(goal, &b.1.goal_summary).cmp(&shared_terms(goal, &a.1.goal_summary))
         });
         patterns.truncate(top_k);
-        self.record(LAYER_MEMORY, Outcome::of_rows(patterns.len()))
+        self.record(LAYER_MEMORY, Outcome::of_rows(patterns.len(), dropped))
             .await;
         let ids: Vec<String> = patterns.iter().map(|(id, _)| id.clone()).collect();
         self.stamp_schema_rows(&ids).await;
@@ -775,15 +815,8 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
                 return Err(e);
             }
         };
-        let mut examples: Vec<(String, ImplementationExample)> = results
-            .into_iter()
-            .filter_map(|r| {
-                let id = r.entry.id.clone();
-                serde_json::from_value::<ImplementationExample>(r.entry.properties.clone())
-                    .ok()
-                    .map(|example| (id, example))
-            })
-            .collect();
+        let (mut examples, dropped) =
+            decode_rows::<ImplementationExample>(NS_IMPLEMENTATION, results);
         // Rank what came back by how much of the summary it shares. The task
         // type alone cannot separate two runs of the same type, and it is the
         // only signal available: no vector layer on a host without the weights,
@@ -793,7 +826,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
                 .cmp(&shared_terms(input_summary, &a.1.input_summary))
         });
         examples.truncate(top_k);
-        self.record(LAYER_MEMORY, Outcome::of_rows(examples.len()))
+        self.record(LAYER_MEMORY, Outcome::of_rows(examples.len(), dropped))
             .await;
         let ids: Vec<String> = examples.iter().map(|(id, _)| id.clone()).collect();
         self.stamp_schema_rows(&ids).await;
@@ -817,16 +850,8 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
                 return Err(e);
             }
         };
-        let patterns: Vec<(String, FailurePattern)> = results
-            .into_iter()
-            .filter_map(|r| {
-                let id = r.entry.id.clone();
-                serde_json::from_value::<FailurePattern>(r.entry.properties.clone())
-                    .ok()
-                    .map(|pattern| (id, pattern))
-            })
-            .collect();
-        self.record(LAYER_MEMORY, Outcome::of_rows(patterns.len()))
+        let (patterns, dropped) = decode_rows::<FailurePattern>(NS_FAILURE, results);
+        self.record(LAYER_MEMORY, Outcome::of_rows(patterns.len(), dropped))
             .await;
         let ids: Vec<String> = patterns.iter().map(|(id, _)| id.clone()).collect();
         self.stamp_schema_rows(&ids).await;
@@ -846,16 +871,8 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
                 return Err(e);
             }
         };
-        let records: Vec<(String, TaskExecutionRecord)> = results
-            .into_iter()
-            .filter_map(|r| {
-                let id = r.entry.id.clone();
-                serde_json::from_value::<TaskExecutionRecord>(r.entry.properties.clone())
-                    .ok()
-                    .map(|record| (id, record))
-            })
-            .collect();
-        self.record(LAYER_MEMORY, Outcome::of_rows(records.len()))
+        let (records, dropped) = decode_rows::<TaskExecutionRecord>(NS_EXECUTION, results);
+        self.record(LAYER_MEMORY, Outcome::of_rows(records.len(), dropped))
             .await;
         let ids: Vec<String> = records.iter().map(|(id, _)| id.clone()).collect();
         self.stamp_schema_rows(&ids).await;
@@ -2299,6 +2316,273 @@ mod tests {
         assert_eq!(
             corrupt.retrieval_count, 0,
             "a row the reader could not decode never reached the caller"
+        );
+    }
+
+    // ── A store full of unreadable rows is not an empty store ─────────────
+
+    /// A metrics backend that answers the one question these tests ask: which
+    /// retrieval cells were recorded, and under which layer and outcome.
+    ///
+    /// The rest of the contract is not on the path a retrieval walks, and says
+    /// so rather than quietly answering `Ok` — a stand-in that answered
+    /// everywhere would let a test pass without the cell ever being written.
+    #[derive(Default)]
+    struct RecordedCells {
+        cells: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl RecordedCells {
+        fn outcomes(&self) -> Vec<String> {
+            self.cells
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, outcome)| outcome.clone())
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl cog_core::MetricsBackend for RecordedCells {
+        async fn record_gauge(
+            &self,
+            _name: cog_core::MetricName,
+            _value: f64,
+            _labels: HashMap<String, String>,
+        ) -> SFResult<()> {
+            unimplemented!("RecordedCells stands in only for the retrieval cell")
+        }
+
+        async fn record_counter(
+            &self,
+            _name: cog_core::MetricName,
+            _value: f64,
+            labels: HashMap<String, String>,
+        ) -> SFResult<()> {
+            let layer = labels
+                .get(cog_core::build_cache::LAYER_LABEL)
+                .cloned()
+                .unwrap_or_default();
+            let outcome = labels
+                .get(cog_core::build_cache::OUTCOME_LABEL)
+                .cloned()
+                .unwrap_or_default();
+            self.cells.lock().unwrap().push((layer, outcome));
+            Ok(())
+        }
+
+        async fn record_histogram(
+            &self,
+            _name: cog_core::MetricName,
+            _value: f64,
+            _labels: HashMap<String, String>,
+        ) -> SFResult<()> {
+            unimplemented!("RecordedCells stands in only for the retrieval cell")
+        }
+
+        async fn query_gauge_range(
+            &self,
+            _name: &str,
+            _start: DateTime<Utc>,
+            _end: DateTime<Utc>,
+        ) -> SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!("RecordedCells stands in only for the retrieval cell")
+        }
+
+        async fn query_gauge_latest(&self, _name: &str) -> SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!("RecordedCells stands in only for the retrieval cell")
+        }
+
+        async fn query_counter_range(
+            &self,
+            _name: &str,
+            _start: DateTime<Utc>,
+            _end: DateTime<Utc>,
+        ) -> SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!("RecordedCells stands in only for the retrieval cell")
+        }
+
+        async fn query_counter_totals(&self, _name: &str) -> SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!("RecordedCells stands in only for the retrieval cell")
+        }
+
+        async fn query_histogram_totals(
+            &self,
+            _name: &str,
+        ) -> SFResult<Vec<cog_core::HistogramTotals>> {
+            unimplemented!("RecordedCells stands in only for the retrieval cell")
+        }
+
+        async fn query_histogram_range(
+            &self,
+            _name: &str,
+            _start: DateTime<Utc>,
+            _end: DateTime<Utc>,
+        ) -> SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!("RecordedCells stands in only for the retrieval cell")
+        }
+
+        async fn list_metric_names(
+            &self,
+            _metric_type: cog_core::MetricType,
+        ) -> SFResult<Vec<String>> {
+            unimplemented!("RecordedCells stands in only for the retrieval cell")
+        }
+
+        async fn health_check(&self) -> SFResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A store that holds nothing this reader can decode reports `partial`,
+    /// not `empty`.
+    ///
+    /// `empty` says the layer answered and its store held nothing; a store full
+    /// of rows whose properties no longer fit the layer's type is the opposite
+    /// fact, and the two used to be the same cell because the undecodable rows
+    /// were dropped by `filter_map` without a count reaching the reading.
+    #[tokio::test]
+    async fn a_store_of_only_unreadable_rows_is_partial_not_empty() {
+        let memory = Arc::new(StampMemory::new());
+        memory
+            .store_schema(
+                NS_EXECUTION,
+                &cog_core::SchemaEntry::new(
+                    "exec-corrupt",
+                    NS_EXECUTION,
+                    cog_core::SchemaKind::Event,
+                    "task-42",
+                    "task-42",
+                    cog_core::SourceRef::new("exec-corrupt", "test/v1"),
+                )
+                .with_properties(serde_json::json!({"not": "a record"})),
+            )
+            .await
+            .unwrap();
+        let metrics = Arc::new(RecordedCells::default());
+        let backend = UnifiedKnowledgeBackend::new()
+            .with_memory(memory.clone() as Arc<dyn MemoryBackend>)
+            .with_metrics(metrics.clone() as Arc<dyn cog_core::MetricsBackend>);
+
+        let records = backend.retrieve_task_history("task-42").await.unwrap();
+
+        assert!(
+            records.is_empty(),
+            "nothing decoded, so nothing is handed out"
+        );
+        assert_eq!(
+            metrics.outcomes(),
+            vec![cog_core::contract::knowledge::RETRIEVAL_OUTCOME_PARTIAL.to_string()],
+            "the row was there and could not be read: that is not an empty layer"
+        );
+    }
+
+    /// A store with a readable row and an unreadable one is still `partial`:
+    /// the answer is shorter than the store, and the cell says so.
+    #[tokio::test]
+    async fn a_partly_readable_store_is_partial() {
+        let memory = Arc::new(StampMemory::new());
+        let good = cog_core::TaskExecutionRecord {
+            record_id: "exec-good".into(),
+            task_id: "task-42".into(),
+            task_type: "test".into(),
+            status: "succeeded".into(),
+            result_summary: "did the thing".into(),
+            executed_at: Utc::now(),
+            score: None,
+        };
+        memory
+            .store_schema(
+                NS_EXECUTION,
+                &cog_core::SchemaEntry::new(
+                    "exec-good",
+                    NS_EXECUTION,
+                    cog_core::SchemaKind::Event,
+                    "task-42",
+                    "task-42",
+                    cog_core::SourceRef::new("exec-good", "test/v1"),
+                )
+                .with_properties(serde_json::to_value(&good).unwrap()),
+            )
+            .await
+            .unwrap();
+        memory
+            .store_schema(
+                NS_EXECUTION,
+                &cog_core::SchemaEntry::new(
+                    "exec-corrupt",
+                    NS_EXECUTION,
+                    cog_core::SchemaKind::Event,
+                    "task-42",
+                    "task-42",
+                    cog_core::SourceRef::new("exec-corrupt", "test/v1"),
+                )
+                .with_properties(serde_json::json!({"not": "a record"})),
+            )
+            .await
+            .unwrap();
+        let metrics = Arc::new(RecordedCells::default());
+        let backend = UnifiedKnowledgeBackend::new()
+            .with_memory(memory.clone() as Arc<dyn MemoryBackend>)
+            .with_metrics(metrics.clone() as Arc<dyn cog_core::MetricsBackend>);
+
+        let records = backend.retrieve_task_history("task-42").await.unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            metrics.outcomes(),
+            vec![cog_core::contract::knowledge::RETRIEVAL_OUTCOME_PARTIAL.to_string()]
+        );
+    }
+
+    /// The negative that keeps the fix from being "always partial": a store
+    /// whose rows all decode still reads `hit`, and one that holds nothing
+    /// still reads `empty`.
+    #[tokio::test]
+    async fn a_clean_store_keeps_its_cell() {
+        let memory = Arc::new(StampMemory::new());
+        let metrics = Arc::new(RecordedCells::default());
+        let backend = UnifiedKnowledgeBackend::new()
+            .with_memory(memory.clone() as Arc<dyn MemoryBackend>)
+            .with_metrics(metrics.clone() as Arc<dyn cog_core::MetricsBackend>);
+
+        backend.retrieve_failure_patterns("test", 5).await.unwrap();
+        assert_eq!(
+            metrics.outcomes(),
+            vec![cog_core::contract::knowledge::RETRIEVAL_OUTCOME_EMPTY.to_string()]
+        );
+
+        let pattern = cog_core::FailurePattern {
+            pattern_id: "failure:test".into(),
+            task_type: "test".into(),
+            failure_summary: "the error".into(),
+            root_cause: "what to do".into(),
+            occurrence_count: 1,
+            last_occurrence: Utc::now(),
+        };
+        memory
+            .store_schema(
+                NS_FAILURE,
+                &cog_core::SchemaEntry::new(
+                    "failure:test",
+                    NS_FAILURE,
+                    cog_core::SchemaKind::ErrorPattern,
+                    "test",
+                    "test",
+                    cog_core::SourceRef::new("failure:test", "test/v1"),
+                )
+                .with_properties(serde_json::to_value(&pattern).unwrap()),
+            )
+            .await
+            .unwrap();
+        backend.retrieve_failure_patterns("test", 5).await.unwrap();
+        assert_eq!(
+            metrics.outcomes(),
+            vec![
+                cog_core::contract::knowledge::RETRIEVAL_OUTCOME_EMPTY.to_string(),
+                cog_core::contract::knowledge::RETRIEVAL_OUTCOME_HIT.to_string(),
+            ]
         );
     }
 }

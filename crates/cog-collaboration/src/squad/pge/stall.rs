@@ -96,6 +96,16 @@ fn criteria_improved(prev: &ProgressSignals, cur: &ProgressSignals) -> bool {
     gained
 }
 
+/// 连续几次没有进展就判这一轮在原地打转。
+///
+/// 流水线与圆桌都用一个 [`StallDetector`]，所以这是同一条界：两次是「读得出
+/// 趋势」的最小个数——一次没有进展说明不了什么（一次尝试本来就可能白花），
+/// 两次连续没有进展才是「它不会自己好」。两处配置各写一个 2 就是同一句话的
+/// 两次声明，改一处的下一次只会改一处。0 不是这个数的一个取值，是关掉检测
+/// （见 [`StallDetector::new`]）。
+// cap: bound — 「连续两次平」的判断，两个默认值读它；只往下调会更早判停
+pub const STALL_THRESHOLD: u32 = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StallVerdict {
     Progressing,
@@ -152,6 +162,31 @@ impl StallDetector {
 mod tests {
     use super::*;
     use crate::squad::pge::types::Criterion;
+
+    /// 两处默认值都读同一个声明：谁把其中一个改回字面量，这一条就红。
+    ///
+    /// 只比两个默认值相等不够——今天都等于 2，写死一个 2 也照样相等。
+    /// 所以看的是赋值那一侧，且在 `#[cfg(test)]` 之前截断：测试夹具里写 2
+    /// 是夹具自己的事。
+    #[test]
+    fn both_runs_read_one_stall_threshold() {
+        for (name, source) in [
+            ("pipeline.rs", include_str!("pipeline.rs")),
+            ("roundtable.rs", include_str!("roundtable.rs")),
+        ] {
+            let production = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+            let inlined: Vec<&str> = production
+                .lines()
+                .filter_map(|line| line.split_once("stall_threshold:"))
+                .map(|(_, value)| value.trim().trim_end_matches(',').trim())
+                .filter(|value| value.starts_with(|c: char| c.is_ascii_digit()))
+                .collect();
+            assert!(
+                inlined.is_empty(),
+                "{name} 又写死了一个判停阈值：{inlined:?}——它只该读 `STALL_THRESHOLD`"
+            );
+        }
+    }
 
     fn evaluation(score: u32, feedback: &str) -> EvaluationResult {
         EvaluationResult {

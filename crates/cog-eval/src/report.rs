@@ -56,9 +56,13 @@ pub struct MetricAggregate {
     pub min: f64,
     pub max: f64,
     pub stddev: f64,
-    pub pass_count: usize,
-    pub fail_count: usize,
-    pub pass_rate: f64,
+    /// 带判定的样本数。观测面报上来的原始读数没有判定，这里是 0——
+    /// 它既不是「全过」也不是「全没过」。
+    pub pass_count: Option<usize>,
+    pub fail_count: Option<usize>,
+    /// `None`：这批读数没有判定，不能拿它算通过率。写 0 或 1 都是替一次
+    /// 没发生的判定下结论。
+    pub pass_rate: Option<f64>,
 }
 
 /// 单个维度（D1-D9）的聚合摘要。
@@ -66,7 +70,9 @@ pub struct MetricAggregate {
 pub struct DimensionSummary {
     pub dimension: String,
     pub metric_count: usize,
-    pub overall_pass_rate: f64,
+    /// 只有带判定的指标参与。整条维度都没判定时是 `None`：那一格该读成
+    /// 「没判过」，不是 100%。
+    pub overall_pass_rate: Option<f64>,
     pub metrics: Vec<String>,
 }
 
@@ -123,19 +129,23 @@ impl EvalReport {
                 if values.is_empty() {
                     continue;
                 }
-                let mean = values.iter().sum::<f64>() / values.len() as f64;
+                // 观测面报上来的是原始读数，没有判定：分布照它自己算，
+                // 通过率留空。此前这里把均值抄进每一格、写上门门 100%，
+                // 于是 D5/D8/D9 的维度通过率恒为 1.0——一条从没人判过的
+                // 维度，在报告上比真判过的维度更干净。
+                let stats = distribution_of(values.as_slice());
                 let agg = MetricAggregate {
                     metric: name.clone(),
-                    mean,
-                    median: mean,
-                    p95: mean,
-                    p99: mean,
-                    min: mean,
-                    max: mean,
-                    stddev: 0.0,
-                    pass_count: values.len(),
-                    fail_count: 0,
-                    pass_rate: 1.0,
+                    mean: stats.mean,
+                    median: stats.median,
+                    p95: stats.p95,
+                    p99: stats.p99,
+                    min: stats.min,
+                    max: stats.max,
+                    stddev: stats.stddev,
+                    pass_count: None,
+                    fail_count: None,
+                    pass_rate: None,
                 };
                 report.metric_aggregates.insert(name.clone(), agg);
                 report
@@ -150,7 +160,7 @@ impl EvalReport {
                     .or_insert(DimensionSummary {
                         dimension: dimension.into(),
                         metric_count: 1,
-                        overall_pass_rate: 1.0,
+                        overall_pass_rate: None,
                         metrics: vec![name.clone()],
                     });
             }
@@ -294,7 +304,7 @@ impl EvalReport {
                 table.add_row(vec![
                     d.dimension.clone(),
                     d.metric_count.to_string(),
-                    format!("{:.1}%", d.overall_pass_rate * 100.0),
+                    rate_cell(d.overall_pass_rate),
                     d.metrics.join(", "),
                 ]);
             }
@@ -329,7 +339,7 @@ impl EvalReport {
                     format!("{:.4}", m.min),
                     format!("{:.4}", m.max),
                     format!("{:.4}", m.stddev),
-                    format!("{:.1}%", m.pass_rate * 100.0),
+                    rate_cell(m.pass_rate),
                 ]);
             }
             md.push_str(&table.to_string());
@@ -416,10 +426,10 @@ impl EvalReport {
             entries.sort_by(|a, b| a.dimension.cmp(&b.dimension));
             for d in entries {
                 html.push_str(&format!(
-                    "<tr><td>{}</td><td>{}</td><td>{:.1}%</td><td>{}</td></tr>",
+                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                     html_escape(&d.dimension),
                     d.metric_count,
-                    d.overall_pass_rate * 100.0,
+                    rate_cell(d.overall_pass_rate),
                     html_escape(&d.metrics.join(", ")),
                 ));
             }
@@ -439,7 +449,7 @@ impl EvalReport {
                 html.push_str(&format!(
                     "<tr><td>{}</td><td>{:.4}</td><td>{:.4}</td><td>{:.4}</td>\
                      <td>{:.4}</td><td>{:.4}</td><td>{:.4}</td><td>{:.4}</td>\
-                     <td>{:.1}%</td></tr>",
+                     <td>{}</td></tr>",
                     html_escape(&m.metric),
                     m.mean,
                     m.median,
@@ -448,7 +458,7 @@ impl EvalReport {
                     m.min,
                     m.max,
                     m.stddev,
-                    m.pass_rate * 100.0,
+                    rate_cell(m.pass_rate),
                 ));
             }
             html.push_str("</tbody></table>");
@@ -492,18 +502,8 @@ fn build_metric_aggregates(results: &[EvalResult]) -> HashMap<String, MetricAggr
 
     let mut out = HashMap::new();
     for (name, items) in buckets {
-        let mut values: Vec<f64> = items.iter().map(|m| m.value).collect();
-        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let n = values.len().max(1) as f64;
-        let sum: f64 = values.iter().copied().sum();
-        let mean = sum / n;
-        let variance: f64 = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
-        let stddev = variance.sqrt();
-        let median = percentile_f64(&values, 0.50);
-        let p95 = percentile_f64(&values, 0.95);
-        let p99 = percentile_f64(&values, 0.99);
-        let min = *values.first().unwrap_or(&0.0);
-        let max = *values.last().unwrap_or(&0.0);
+        let values: Vec<f64> = items.iter().map(|m| m.value).collect();
+        let stats = distribution_of(&values);
         let pass_count = items.iter().filter(|m| m.passed).count();
         let fail_count = items.len().saturating_sub(pass_count);
         let pass_rate = pass_count as f64 / items.len().max(1) as f64;
@@ -511,20 +511,61 @@ fn build_metric_aggregates(results: &[EvalResult]) -> HashMap<String, MetricAggr
             name.clone(),
             MetricAggregate {
                 metric: name,
-                mean,
-                median,
-                p95,
-                p99,
-                min,
-                max,
-                stddev,
-                pass_count,
-                fail_count,
-                pass_rate,
+                mean: stats.mean,
+                median: stats.median,
+                p95: stats.p95,
+                p99: stats.p99,
+                min: stats.min,
+                max: stats.max,
+                stddev: stats.stddev,
+                pass_count: Some(pass_count),
+                fail_count: Some(fail_count),
+                pass_rate: Some(pass_rate),
             },
         );
     }
     out
+}
+
+/// 通过率那一格：没判过的读数印「没判过」，不印一个百分比。
+fn rate_cell(rate: Option<f64>) -> String {
+    match rate {
+        Some(rate) => format!("{:.1}%", rate * 100.0),
+        None => "没判过".to_string(),
+    }
+}
+
+/// 一批读数的分布。
+///
+/// 两条聚合路径（数据集结果里的指标、观测面报上来的原始读数）量的是同
+/// 一件事，只是后者没有判定；分布本身两边都数得出来，所以只有一个算它的
+/// 地方——两个各算一遍，一处改了另一处会把均值当成分位数继续印。
+struct Distribution {
+    mean: f64,
+    median: f64,
+    p95: f64,
+    p99: f64,
+    min: f64,
+    max: f64,
+    stddev: f64,
+}
+
+fn distribution_of(values: &[f64]) -> Distribution {
+    let mut values = values.to_vec();
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = values.len().max(1) as f64;
+    let sum: f64 = values.iter().copied().sum();
+    let mean = sum / n;
+    let variance: f64 = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
+    Distribution {
+        mean,
+        median: percentile_f64(&values, 0.50),
+        p95: percentile_f64(&values, 0.95),
+        p99: percentile_f64(&values, 0.99),
+        min: *values.first().unwrap_or(&0.0),
+        max: *values.last().unwrap_or(&0.0),
+        stddev: variance.sqrt(),
+    }
 }
 
 fn build_dimension_summaries(
@@ -539,9 +580,14 @@ fn build_dimension_summaries(
     let mut out = HashMap::new();
     for (dim, items) in grouped {
         let metric_count = items.len();
-        let total_pass: usize = items.iter().map(|m| m.pass_count).sum();
-        let total: usize = items.iter().map(|m| m.pass_count + m.fail_count).sum();
-        let overall_pass_rate = total_pass as f64 / total.max(1) as f64;
+        // 只数带判定的指标。一条维度上全是观测读数时，这里没有分母，答案
+        // 是「没判过」——把 0 当分子、1 当兜底分母，印出来就是 0%。
+        let total_pass: usize = items.iter().filter_map(|m| m.pass_count).sum();
+        let total: usize = items
+            .iter()
+            .filter_map(|m| Some(m.pass_count? + m.fail_count?))
+            .sum();
+        let overall_pass_rate = (total > 0).then(|| total_pass as f64 / total as f64);
         let mut metrics: Vec<String> = items.iter().map(|m| m.metric.clone()).collect();
         metrics.sort();
         out.insert(
@@ -906,6 +952,89 @@ mod tests {
         assert!(report.dimension_summaries.contains_key("D1"));
         assert!(report.dimension_summaries.contains_key("D2"));
         assert_eq!(report.per_case_results.len(), 3);
+    }
+
+    /// 观测面报上来的是读数，不是判定。这些指标的分布要按读数自己算，通过率
+    /// 那一格必须留空——从前它被填成均值抄一遍、通过率 100%，于是没判过的
+    /// 维度在报告上比判过的还干净。
+    #[tokio::test]
+    async fn observable_samples_get_their_distribution_and_no_verdict() {
+        struct Fixed;
+        #[async_trait::async_trait]
+        impl cog_core::Observable for Fixed {
+            async fn collect_metrics(
+                &self,
+                dimension: &str,
+            ) -> cog_core::SFResult<Vec<cog_core::RawMetric>> {
+                if dimension != "D5" {
+                    return Ok(Vec::new());
+                }
+                Ok(vec![
+                    cog_core::RawMetric::new("snapshot_bytes", 1.0),
+                    cog_core::RawMetric::new("snapshot_bytes", 2.0),
+                    cog_core::RawMetric::new("snapshot_bytes", 100.0),
+                ])
+            }
+            async fn collect_trace(
+                &self,
+                _task_id: &str,
+            ) -> cog_core::SFResult<Vec<cog_core::TraceFragment>> {
+                Ok(Vec::new())
+            }
+            fn available_dimensions(&self) -> Vec<cog_core::DimensionSpec> {
+                Vec::new()
+            }
+        }
+
+        let report = EvalReport::from_results_with_observables(
+            "demo",
+            &[],
+            &[Arc::new(Fixed) as Arc<dyn cog_core::Observable>],
+        )
+        .await;
+
+        let agg = report
+            .metric_aggregates
+            .get("snapshot_bytes")
+            .expect("the observable reported a sample");
+        assert_eq!(agg.min, 1.0);
+        assert_eq!(agg.max, 100.0, "最大值是量出来的，不是均值抄过去的");
+        assert!(agg.stddev > 0.0, "三个不同的读数不可能标准差为零");
+        assert_eq!(agg.pass_rate, None, "没有判定就没有通过率");
+        assert_eq!(agg.pass_count, None);
+
+        let dim = report.dimension_summaries.get("D5").expect("D5 有一条读数");
+        assert_eq!(
+            dim.overall_pass_rate, None,
+            "一条没有判定的维度不许印成 100% 通过"
+        );
+    }
+
+    /// 维度通过率只在有判定样本时才有分母。全是观测读数的一条维度，答案是
+    /// 「没判过」；把 0 当分子、1 当兜底分母，印出来就是 0%，也是一个替读者
+    /// 下的结论。
+    #[test]
+    fn a_dimension_of_metrics_without_verdicts_has_no_pass_rate() {
+        let aggregates: HashMap<String, MetricAggregate> = [(
+            "snapshot_bytes".to_string(),
+            MetricAggregate {
+                metric: "snapshot_bytes".to_string(),
+                mean: 1.0,
+                median: 1.0,
+                p95: 1.0,
+                p99: 1.0,
+                min: 1.0,
+                max: 1.0,
+                stddev: 0.0,
+                pass_count: None,
+                fail_count: None,
+                pass_rate: None,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let dims = build_dimension_summaries(&aggregates);
+        assert_eq!(dims.get("D5").and_then(|d| d.overall_pass_rate), None);
     }
 
     #[test]

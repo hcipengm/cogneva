@@ -619,17 +619,34 @@ pub struct EvaluationResult {
 }
 
 impl EvaluationResult {
-    /// Whether the evaluator never judged anything because its own ReAct loop
-    /// spent its whole iteration budget. The raw payload is read structurally
-    /// rather than by scanning the feedback: that feedback is prose about
-    /// somebody else's work, so a deterministic-sounding failure named inside
-    /// it is a judgement the evaluator made, not a cause the evaluator suffered.
+    /// Whether the evaluator never judged anything because the environment took
+    /// the call away from it: its own ReAct loop spent its whole iteration
+    /// budget, or its prompt never reached the upstream.
     ///
-    /// Without this the exhausted run comes back as a bare `Fail` with empty
-    /// feedback — indistinguishable from an evaluator that read the attempt and
-    /// found it wanting — and buys a full round of local repairs plus every
-    /// configured retry, none of which can judge anything either.
+    /// The raw payload is read structurally rather than by scanning the
+    /// feedback: that feedback is prose about somebody else's work, so a
+    /// deterministic-sounding failure named inside it is a judgement the
+    /// evaluator made, not a cause the evaluator suffered. The cause a role
+    /// carries for its own failed call lives in a *string* `details` value, the
+    /// same shape [`PlannerOutput::is_terminal_env_failure`] gives its `plan`
+    /// slot; the iteration budget arrives as the object the runtime wrote.
+    ///
+    /// Without this an unanswered call comes back as a bare `Fail` —
+    /// indistinguishable from an evaluator that read the attempt and found it
+    /// wanting — and buys a full round of local repairs plus every configured
+    /// retry, none of which can judge anything either. It is also filed in the
+    /// ledger and counted in the roundtable's consensus as a verdict on the
+    /// work, which nobody ever judged.
     pub fn terminal_env_failure_reason(&self) -> Option<String> {
+        if let Some(detail) = self.details.as_ref().and_then(serde_json::Value::as_str) {
+            if names_a_deterministic_cause(detail) {
+                return Some(format!(
+                    "{}: evaluator {}",
+                    declaration_for_cause(detail),
+                    detail.trim()
+                ));
+            }
+        }
         let cause = iteration_budget_exhausted_reason(self.details.as_ref()?)?;
         Some(format!("{TERMINAL_ENV_FAILURE_PREFIX}: evaluator {cause}"))
     }
@@ -1119,6 +1136,43 @@ mod tests {
             reason.contains("evaluator") && reason.contains("iteration budget"),
             "the reason must say which role spent what, got: {reason}"
         );
+    }
+
+    /// 评委调用本身失败时，角色把真因按同一条线格带进 `details` 的字符串里
+    /// ——与 planner 的 `plan`、generator 的 `content` 是同一个形状。它必须被
+    /// 认成「没判定」；只有字符串确实点名了确定性病因时才算，模特写进
+    /// `details` 的散文（对象）不参与这条判据。
+    #[test]
+    fn a_carried_upstream_error_on_the_evaluator_is_not_a_verdict() {
+        let mut result = EvaluationResult {
+            verdict: Verdict::Fail,
+            feedback: "Evaluator prompt did not reach its upstream".into(),
+            score: None,
+            criteria: Vec::new(),
+            details: Some(serde_json::Value::String(
+                cog_core::contract::outcome::environment_error_content(
+                    "HTTP 503 upstream unavailable",
+                ),
+            )),
+        };
+        let reason = result
+            .terminal_env_failure_reason()
+            .expect("a call that never reached its upstream judged nothing");
+        assert!(
+            reason.contains("HTTP 503 upstream unavailable"),
+            "the real cause must survive into the reason, got: {reason}"
+        );
+        assert!(
+            reason.contains("evaluator"),
+            "the reason must name which role did not answer, got: {reason}"
+        );
+
+        // A string that names no cause is not a declaration, and an object
+        // payload is the evaluator's own review rather than its own failure.
+        result.details = Some(serde_json::Value::String("looks fine to me".into()));
+        assert_eq!(result.terminal_env_failure_reason(), None);
+        result.details = Some(serde_json::json!({"environment_error": "mentioned in a review"}));
+        assert_eq!(result.terminal_env_failure_reason(), None);
     }
 
     /// What came of asking the model straight out for an answer is part of the

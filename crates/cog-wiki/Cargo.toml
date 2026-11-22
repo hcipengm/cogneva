@@ -19,5 +19,4 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 async-trait = "0.1"
 regex = "1.10"
-pathdiff = "0.2"
 schemars = { workspace = true }

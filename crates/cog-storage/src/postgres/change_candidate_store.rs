@@ -325,12 +325,22 @@ fn candidate_from_events(input: &RowInput<'_>) -> SFResult<ChangeCandidate> {
     let text = |value: &serde_json::Value, key: &str| -> Option<String> {
         value.get(key).and_then(|v| v.as_str()).map(str::to_string)
     };
+    // 这一版写下的载荷恒有这三个键（`PAYLOAD_CATALOG` 的测试对着它）。缺一个，
+    // 说明这一行不是能按本版读的载荷：把它读成空串，「读不懂」就长成了「一条
+    // 内容为空的候选」，与这张表不猜不丢的规矩相反。
+    let (Some(kind), Some(description), Some(content)) = (
+        text(&origin, "kind"),
+        text(&origin, "description"),
+        text(&origin, "content"),
+    ) else {
+        return Ok(undecodable_row(subject_id, event_id, status));
+    };
 
     Ok(ChangeCandidate {
         artifact_id: subject_id.to_string(),
-        kind: text(&origin, "kind").unwrap_or_default(),
-        description: text(&origin, "description").unwrap_or_default(),
-        content: text(&origin, "content").unwrap_or_default(),
+        kind,
+        description,
+        content,
         created_at: text(&origin, "created_at")
             .and_then(|at| DateTime::parse_from_rfc3339(&at).ok())
             .map(|at| at.with_timezone(&Utc))
@@ -625,5 +635,36 @@ mod tests {
         .expect("an unreadable time is not an unreadable row");
         assert_eq!(row.created_at, DateTime::<Utc>::MIN_UTC);
         assert_eq!(row.content, "x");
+    }
+
+    /// 这一版写下的载荷恒有 `kind` / `description` / `content`。缺了一个，是这一行
+    /// 不按本版读得懂，不是一条内容为空的候选——空串会把「读不懂」写成「没有内容」。
+    #[test]
+    fn a_payload_missing_a_required_field_is_undecodable_not_empty() {
+        for missing in ["kind", "description", "content"] {
+            let mut origin = serde_json::json!({
+                "kind": "code_change",
+                "description": "d",
+                "content": "--- a\n+++ b\n",
+                "created_at": "2026-11-17T00:00:00Z",
+            });
+            origin.as_object_mut().unwrap().remove(missing);
+            let origin = origin.to_string();
+            let row = candidate_from_events(&RowInput {
+                subject_id: "c7",
+                event_id: "e7",
+                kind: CANDIDATE_KIND,
+                decision_attributes: &origin,
+                decision_version: 1,
+                origin_attributes: &origin,
+                origin_version: 1,
+            })
+            .expect("an unreadable payload is not an unreadable row");
+            assert_eq!(
+                row.recorded_status, "undecodable",
+                "缺 {missing} 的载荷必须标成读不懂，不能读成空字段"
+            );
+            assert_eq!(row.status, "candidate", "状态词照样从事件种类读出来");
+        }
     }
 }

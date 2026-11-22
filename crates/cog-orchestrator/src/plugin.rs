@@ -289,7 +289,10 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             result_claim_idle_secs: ctx.config().dag_executor.result_claim_idle_secs,
             result_claim_interval_secs: ctx.config().dag_executor.result_claim_interval_secs,
             result_claim_batch: ctx.config().dag_executor.result_claim_batch,
-            ready_task_poll_interval_secs: ctx.config().dag_executor.ready_task_poll_interval_secs,
+            ready_task_poll_interval_secs: ctx
+                .config()
+                .dag_executor
+                .effective_ready_task_poll_interval_secs(),
         };
         let skill_registry: Option<Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>> =
             ctx.consume::<tokio::sync::RwLock<cog_core::SkillRegistry>>();
@@ -527,8 +530,10 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                         let runtime = (*runtime_holder).clone();
                         let exec_loop = exec_loop.clone();
                         let workspace_id = ctx.config().dag_executor.workspace_id.clone();
-                        let ready_task_poll_interval_secs =
-                            ctx.config().dag_executor.ready_task_poll_interval_secs;
+                        let ready_task_poll_interval_secs = ctx
+                            .config()
+                            .dag_executor
+                            .effective_ready_task_poll_interval_secs();
                         // 变更生成的产物写进本进程的 change_dir，而扫它的循环只在
                         // 执行器部署里跑：谁执行生成，谁就得是扫得动那份产物的进程。
                         // 这个开关和执行器循环、基线移植、自我发现用的是同一个。

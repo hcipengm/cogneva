@@ -16,7 +16,7 @@
 
 use crate::actors::{EvaluatorActor, GeneratorActor, PlannerActor};
 use crate::squad::pge::stall::{
-    degenerate_loop_feedback, ProgressSignals, StallDetector, StallVerdict,
+    degenerate_loop_feedback, ProgressSignals, StallDetector, StallVerdict, STALL_THRESHOLD,
 };
 use crate::squad::pge::types::{
     EvaluationResult, GeneratorOutput, LocalRepairAttempt, PlannerOutput, Verdict,
@@ -48,13 +48,18 @@ pub struct PgePipelineConfig {
     pub independent_review: bool,
 }
 
+// 三次完整重跑：一次重跑是重规划、重生成、重评审，评审还带一遍独立复核；
+// 第三次仍然不过，说明问题不在一次生成的抖动里。
+// cap: bound — 三次：每次重跑都带独立复核，第三次不过就不是抖动了
+const PGE_FULL_PASSES: u32 = 3;
+
 impl Default for PgePipelineConfig {
     fn default() -> Self {
         Self {
-            max_retries: 3,
-            timeout_ms: 30_000,
+            max_retries: PGE_FULL_PASSES,
+            timeout_ms: (30 * cog_core::day::MILLIS_PER_SECOND) as u64,
             local_repair_max: 0,
-            stall_threshold: 2,
+            stall_threshold: STALL_THRESHOLD,
             independent_review: true,
         }
     }
@@ -1011,6 +1016,40 @@ mod tests {
     use cog_core::contract::outcome::{
         is_deterministic_failure, DEGENERATE_LOOP_PREFIX, EMPTY_GENERATION_PREFIX,
     };
+
+    /// 整链重跑的次数只有一处声明：默认值读常量，常量上面写着它由什么钉住。
+    ///
+    /// 两面一起钉：运行时默认值等于常量（改常量就改默认值），源码面
+    /// `impl Default` 的字段里不再有数字（下一笔写回裸字面量就红）。
+    #[test]
+    fn the_pipeline_default_reads_its_full_pass_count() {
+        assert_eq!(PgePipelineConfig::default().max_retries, PGE_FULL_PASSES);
+
+        let source = include_str!("pipeline.rs");
+        let body = source
+            .split("impl Default for PgePipelineConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    let value = value.trim().trim_end_matches(',');
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.starts_with(|c: char| c.is_ascii_digit())
+                        // 哨兵 0 不是旋钮，是「没写」：`local_repair_max` 的 0 关掉
+                        // 本地修复，它没有第二个取值要命名。
+                        && value != "0"
+                })
+            })
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
+    }
 
     /// Test-only mock implementing the object-level [`cog_core::Agent`] trait.
     /// All methods except [`prompt`] are no-op stubs.
@@ -2134,6 +2173,66 @@ mod tests {
             "计划侧已经失败，不该再为同一个上游买一次生成"
         );
         assert_eq!(result.attempts, 1, "环境类失败不该被重试");
+    }
+
+    /// 评委这一环没到上游，不是对作品的判决。把这次失败凭空写成一个
+    /// `Verdict::Fail` 会让终止守卫看不见环境故障：本地修复与全部重试照买，
+    /// 台账与共识票也会把「没人读到作品」记成「作品不合格」。
+    #[tokio::test]
+    async fn an_evaluator_that_never_reached_its_upstream_is_not_a_verdict_on_the_work() {
+        let pipeline = PgePipeline::new(PgePipelineConfig {
+            max_retries: 3,
+            timeout_ms: 5_000,
+            local_repair_max: 1,
+            stall_threshold: 2,
+            independent_review: false,
+        });
+        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({
+                "summary": "s",
+                "plan": {"steps": ["edit"]},
+                "sub_tasks": [],
+                "acceptance_criteria": []
+            }),
+        }));
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({"content": {"draft": "attempt output"}, "artifacts": []}),
+        }));
+        // 计划与生成都答得出，只有评委这一格没到上游。
+        let evaluator = EvaluatorActor::new(std::sync::Arc::new(FailingAgent));
+
+        let task = test_task("implement a hello world function");
+        let result = pipeline
+            .execute_task(
+                &task,
+                serde_json::json!({}),
+                &planner,
+                &generator,
+                &evaluator,
+            )
+            .await;
+
+        let reason = result
+            .terminal_reason
+            .as_deref()
+            .expect("评委没答上话，这一跑必须以终止性原因收口，而不是照常重试");
+        assert!(
+            reason.contains("HTTP 503 upstream unavailable"),
+            "终止原因必须指向真实的上游故障，实到: {reason}"
+        );
+        assert_eq!(result.attempts, 1, "环境类失败不该被重试");
+        assert_ne!(
+            result.final_evaluation.feedback, "Evaluation failed",
+            "「没判定」不能用一句对作品的判决顶替"
+        );
+        assert!(
+            result
+                .final_evaluation
+                .feedback
+                .contains("HTTP 503 upstream unavailable"),
+            "终止结果必须带着调用的真因，实到: {}",
+            result.final_evaluation.feedback
+        );
     }
 
     /// A generator whose ReAct loop spends its whole iteration budget still

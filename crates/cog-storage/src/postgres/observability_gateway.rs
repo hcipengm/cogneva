@@ -180,6 +180,76 @@ const EVENT_WRITE_QUEUE: usize = 4096;
 // cap: bound — 要明显短于一条告警的判定窗（分钟级），又够把「每次失败一行」压成「每 5 秒一行」
 const FAILURE_FLUSH_SECS: u64 = 5;
 
+/// The historical read's only bound is the caller's `since`.
+///
+/// That instant is not arbitrary: the gateway derives it from the retention
+/// registry — the deployment's declared window, widened by the longest question
+/// already asked — and the sweep keeps rows inside it for exactly this read.
+/// A second bound written here (`LIMIT 10000` was one) answered a well-formed
+/// query with the oldest ten thousand rows of a wider window, ending at the
+/// seam where the live stream takes over, and nothing in the answer said a row
+/// was missing. Refusing to answer and answering short are not the same thing.
+const HISTORICAL_EVENTS_SQL: &str = "SELECT payload, timestamp FROM cog_observability_events WHERE timestamp >= $1 ORDER BY timestamp ASC";
+
+/// One stored row back as the event it was written from.
+///
+/// A payload that does not parse used to be logged and skipped, so the
+/// subscriber received a gap it could not tell from events that never
+/// happened. The row is on the table's books either way, so it is an error —
+/// and the timestamp is what names it, the payload being the column that could
+/// not be read.
+fn decode_stored_event(payload: &str, timestamp: DateTime<Utc>) -> SFResult<AgentEvent> {
+    serde_json::from_str(payload).map_err(|e| {
+        SFError::Validation(format!(
+            "event stored at {timestamp} does not parse as an AgentEvent: {e}"
+        ))
+    })
+}
+
+/// The stored rows the subscriber asked for, or an error naming the row that
+/// would otherwise have been left out of them.
+fn filter_stored_events(
+    rows: Vec<(String, DateTime<Utc>)>,
+    filter: &EventFilter,
+) -> SFResult<Vec<AgentEvent>> {
+    let mut events = Vec::with_capacity(rows.len());
+    for (payload, timestamp) in rows {
+        let ev = decode_stored_event(&payload, timestamp)?;
+        if crate::event_filter::event_matches(filter, &ev) {
+            events.push(ev);
+        }
+    }
+    Ok(events)
+}
+
+/// One stored log line back as the entry it was written from.
+///
+/// `record_log` writes `metadata.to_string()`, so every row this gateway wrote
+/// parses. A row that does not parse was written by something else, and folding
+/// it to `Null` handed back a log line whose metadata read as "none given" —
+/// indistinguishable from an entry recorded without any.
+fn log_entry_from_row(
+    task_id: &str,
+    timestamp: DateTime<Utc>,
+    level: String,
+    source: String,
+    message: String,
+    metadata: String,
+) -> SFResult<LogEntry> {
+    let metadata: serde_json::Value = serde_json::from_str(&metadata).map_err(|e| {
+        SFError::Validation(format!(
+            "log line for task {task_id} at {timestamp}: stored metadata is not JSON, so the entry cannot be read ({e})"
+        ))
+    })?;
+    Ok(LogEntry {
+        timestamp,
+        level,
+        source,
+        message,
+        metadata,
+    })
+}
+
 impl PostgresObservabilityGateway {
     /// 接上指标面。缺席是正常的（嵌入式运行没有后端），不是错误。
     pub fn with_metrics(mut self, metrics: Option<Arc<dyn cog_core::MetricsBackend>>) -> Self {
@@ -493,28 +563,13 @@ impl PostgresObservabilityGateway {
                 - Duration::seconds(crate::observability_event_cap::DEFAULT_READ_WINDOW_SECS as i64)
         });
 
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT payload FROM cog_observability_events WHERE timestamp >= $1 ORDER BY timestamp ASC LIMIT 10000",
-        )
-        .bind(since)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(format!("query historical events failed: {}", e)))?;
+        let rows: Vec<(String, chrono::DateTime<Utc>)> = sqlx::query_as(HISTORICAL_EVENTS_SQL)
+            .bind(since)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("query historical events failed: {}", e)))?;
 
-        let mut events = Vec::with_capacity(rows.len());
-        for (payload,) in rows {
-            match serde_json::from_str::<AgentEvent>(&payload) {
-                Ok(ev) => {
-                    if crate::event_filter::event_matches(filter, &ev) {
-                        events.push(ev);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to deserialize historical event: {}", e);
-                }
-            }
-        }
-        Ok(events)
+        filter_stored_events(rows, filter)
     }
 }
 
@@ -631,13 +686,9 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
 
         let mut logs = Vec::with_capacity(rows.len());
         for (timestamp, level, source, message, metadata) in rows {
-            logs.push(LogEntry {
-                timestamp,
-                level,
-                source,
-                message,
-                metadata: serde_json::from_str(&metadata).unwrap_or_default(),
-            });
+            logs.push(log_entry_from_row(
+                task_id, timestamp, level, source, message, metadata,
+            )?);
         }
         logs.reverse();
         Ok(logs)
@@ -1266,5 +1317,89 @@ mod tests {
     #[tokio::test]
     async fn a_writer_without_a_backend_seeds_nothing_and_survives() {
         gateway_with(None).seed_persist_failure_series().await;
+    }
+
+    /// The read's bound is the instant the caller names, derived from the
+    /// retention registry. A cap written into the query would answer a wider
+    /// window with its oldest rows and no sign that the rest existed.
+    #[test]
+    fn the_historical_read_has_no_second_bound() {
+        let sql = HISTORICAL_EVENTS_SQL.to_ascii_uppercase();
+        assert!(
+            !sql.contains("LIMIT"),
+            "the caller's `since` is the bound; a written-in cap answers short: {HISTORICAL_EVENTS_SQL}"
+        );
+        assert!(
+            sql.contains("TIMESTAMP"),
+            "the error that names an unreadable row needs its timestamp selected"
+        );
+    }
+
+    /// A row that is there but does not parse used to be logged and skipped:
+    /// the subscriber saw a gap indistinguishable from nothing having happened.
+    #[test]
+    fn a_row_that_does_not_parse_fails_the_read_instead_of_leaving_a_gap() {
+        let at = Utc::now();
+        let rows = vec![
+            (r#"{"type":"agent_start","agent_id":"a-1"}"#.to_string(), at),
+            ("not an event".to_string(), at),
+        ];
+        let err = filter_stored_events(rows, &EventFilter::default())
+            .expect_err("an unreadable row must not be skipped");
+        assert!(
+            err.to_string().contains(&at.to_string()),
+            "the error must name the row, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_stored_event_decodes_back() {
+        let ev = decode_stored_event(r#"{"type":"agent_start","agent_id":"a-1"}"#, Utc::now())
+            .expect("a row this gateway wrote must decode");
+        assert!(matches!(ev, AgentEvent::AgentStart { ref agent_id, .. } if agent_id == "a-1"));
+    }
+
+    /// `record_log` writes the metadata it was handed, so a line this gateway
+    /// wrote comes back the same.
+    #[test]
+    fn a_stored_log_line_decodes_back_with_its_metadata() {
+        let at = Utc::now();
+        let entry = log_entry_from_row(
+            "task-1",
+            at,
+            "INFO".into(),
+            "kernel".into(),
+            "started".into(),
+            r#"{"iteration":3}"#.into(),
+        )
+        .expect("a row this gateway wrote must decode");
+        assert_eq!(entry.timestamp, at);
+        assert_eq!(entry.metadata, serde_json::json!({"iteration": 3}));
+    }
+
+    /// The metadata column used to be folded to `Null` when it would not
+    /// parse, so the caller read a log line that looked like it was recorded
+    /// without metadata. The read must refuse instead, naming the line.
+    #[test]
+    fn log_metadata_that_does_not_parse_is_not_folded_to_null() {
+        let at = Utc::now();
+        let err = log_entry_from_row(
+            "task-1",
+            at,
+            "INFO".into(),
+            "kernel".into(),
+            "started".into(),
+            "{ half".into(),
+        )
+        .expect_err("unreadable metadata must not become Null");
+        let text = err.to_string();
+        assert!(
+            text.contains("task-1"),
+            "the error must name the task: {text}"
+        );
+        assert!(
+            text.contains(&at.to_string()),
+            "the error must name the line: {text}"
+        );
     }
 }

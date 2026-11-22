@@ -1,0 +1,79 @@
+# 换对象后端之后，本地那棵树里还剩多少东西：两条读数、四种情形。
+#
+# 这两条走的是进程自己的抓取面而不是共享表，所以夹具里没有 `_observed_timestamp`
+# 那一类腿：序列随进程走，不存在「写者停了、最后一笔值还被当成观测」的读法。
+# 它们要分开的两个答案在值本身——数到 N 是多少个、读不出来是另一条名字上的 1。
+# 并成一条（读不出写 0，或者加个 `outcome` 标签共用一条名字），「没挂上」就会被
+# 读成「已经搬完了」，而这两种情形要做的动作正相反。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-object-store-migration.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: object_store_legacy_objects_left_behind
+# rule: object_store_legacy_tree_unreadable
+
+evaluation_interval: 1m
+
+tests:
+  # 后端还是 local-fs：没有「看不见的旧对象」这个问题，两条都不许响。
+  - interval: 1m
+    input_series: []
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: object_store_legacy_objects_left_behind
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: object_store_legacy_tree_unreadable
+        exp_alerts: []
+
+  # 已经切到远端后端，盘上数到 0：搬完了，安静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_object_store_legacy_objects{provider="seaweedfs",path="/var/lib/cogneva-data/storage"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: object_store_legacy_objects_left_behind
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: object_store_legacy_tree_unreadable
+        exp_alerts: []
+
+  # 切过去了，盘上还有 12 个：新后端看不见它们，读回来就是空库。告警要点名
+  # 哪个后端、哪棵树——去搬的人要的就是这两样。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_object_store_legacy_objects{provider="seaweedfs",path="/var/lib/cogneva-data/storage"}'
+        values: '12x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: object_store_legacy_objects_left_behind
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              provider: seaweedfs
+              path: /var/lib/cogneva-data/storage
+      - eval_time: 60m
+        alertname: object_store_legacy_tree_unreadable
+        exp_alerts: []
+
+  # 切过去了，但数不出来：不是「没有遗留」，是「不知道有没有」。这一条响，
+  # 而「还剩多少」那一条必须静——读不出来时不许报一个数。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_object_store_legacy_scan_unreadable{provider="seaweedfs",path="/var/lib/cogneva-data/storage"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: object_store_legacy_tree_unreadable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              provider: seaweedfs
+              path: /var/lib/cogneva-data/storage
+      - eval_time: 60m
+        alertname: object_store_legacy_objects_left_behind
+        exp_alerts: []

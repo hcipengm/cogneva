@@ -195,8 +195,8 @@ fn refused_view(row: cog_core::PrincipleRow) -> RefusedPrinciple {
 /// How many refused principles the route returns in the list. The totals are
 /// taken before the truncation, so this bounds the list without making either
 /// total a page count.
-// cap: bound — 一页拒绝记录的条数，界的是单次响应的体积
-const REFUSED_PAGE: usize = 50;
+// cap: fixed — 一屏就是 A2A 的 `page_size` 默认值：本仓列表面共用同一个页长，各写一个 50 只会让「一屏」慢慢走散
+const REFUSED_PAGE: usize = cog_core::config::A2A_LIST_PAGE_SIZE as usize;
 /// How many refused rows are read to compute the totals. The selection is
 /// `refusals > 0`, so this is a bound on how many principles have ever been
 /// refused by a single deployment; reading the whole set is what lets the two
@@ -573,7 +573,8 @@ pub struct ChangeFunnelQuery {
 /// A fortnight: long enough to see a week's shape twice, short enough that the
 /// query stays inside the event table's hot window.
 fn default_funnel_days() -> u32 {
-    14
+    // 两周：够看见一次完整的周节律，又还在事件表的热窗口里。
+    (2 * cog_core::day::DAYS_PER_WEEK) as u32
 }
 
 /// The attempt-to-landing ladder, one row per UTC day.
@@ -940,8 +941,8 @@ pub async fn change_cost(
 /// How many moves one history returns unless the caller asks for fewer. The
 /// steps come newest first, so the bound drops the oldest ones -- the account
 /// can be years deep and the question is "how did this get here".
-// cap: bound — 一页时间线的条数，界的是单次响应体积
-const TIMELINE_PAGE: usize = 50;
+// cap: fixed — 与拒绝列表同一屏：列表面共用一个页长，见 `A2A_LIST_PAGE_SIZE`
+const TIMELINE_PAGE: usize = cog_core::config::A2A_LIST_PAGE_SIZE as usize;
 // cap: bound — widest history a caller may ask for in one read
 const TIMELINE_MAX: usize = 200;
 

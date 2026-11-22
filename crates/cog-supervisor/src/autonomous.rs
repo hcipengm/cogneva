@@ -29,11 +29,21 @@ pub struct AutonomousConfig {
     pub decision_interval_secs: u64,
 }
 
+// 三次重试后进死信：自治编排里一次失败可能是调度冲突（会自己过去），三次都失败
+// 说明这件活需要人看一眼；再多轮只是把同一个坏任务在队列里来回搬。
+// cap: bound — 三次：调度冲突会自己过去，三次都失败就需要人看
+const AUTONOMOUS_MAX_TASK_RETRIES: u32 = 3;
+
+// 五秒一拍：编排决策读的是队列与 agent 的当前状态，一拍的下限要短于一次交接的
+// 往返，否则决策看到的是上一拍的现场。
+// cap: bound — 五秒：短于一次交接的往返，否则决策看到的是上一拍的现场
+const AUTONOMOUS_DECISION_INTERVAL_SECS: u64 = 5;
+
 impl Default for AutonomousConfig {
     fn default() -> Self {
         Self {
-            max_task_retries: 3,
-            decision_interval_secs: 5,
+            max_task_retries: AUTONOMOUS_MAX_TASK_RETRIES,
+            decision_interval_secs: AUTONOMOUS_DECISION_INTERVAL_SECS,
         }
     }
 }
@@ -441,5 +451,44 @@ impl AutonomousCollaborator {
             "{:?}",
             task.task_type
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 任务重试上限与决策节拍各只有一处声明：默认值读常量，源码面
+    /// `impl Default` 的字段里不再有数字（下一笔写回裸字面量就红）。
+    #[test]
+    fn the_autonomous_default_reads_its_names() {
+        let cfg = AutonomousConfig::default();
+        assert_eq!(cfg.max_task_retries, AUTONOMOUS_MAX_TASK_RETRIES);
+        assert_eq!(
+            cfg.decision_interval_secs,
+            AUTONOMOUS_DECISION_INTERVAL_SECS
+        );
+
+        let body = include_str!("autonomous.rs")
+            .split("impl Default for AutonomousConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    let value = value.trim().trim_end_matches(',');
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.starts_with(|c: char| c.is_ascii_digit())
+                        && value != "0"
+                })
+            })
+            .map(str::trim)
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
     }
 }

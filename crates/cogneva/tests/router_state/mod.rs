@@ -366,6 +366,105 @@ pub fn with_chat_turns(turns: cog_gateway::ChatTurnHandle) -> Arc<GatewayState> 
     Arc::new(state)
 }
 
+/// The same state with the two components the plugin upload route asks for.
+///
+/// Both are supplied because the route's answer depends on each in turn: the
+/// registry is where the bytes come from and the backend is what compiles them.
+/// A suite that wants to judge the refusal behind them has to give the route
+/// everything a deployed build gives it, or it would be judging the missing
+/// component instead.
+pub fn with_plugin_pipeline(
+    registry: Arc<dyn cog_core::PluginRegistry>,
+    backend: Arc<dyn cog_core::SandboxBackend>,
+) -> Arc<GatewayState> {
+    let mut state = match Arc::try_unwrap(stateless()) {
+        Ok(state) => state,
+        Err(_) => panic!("the fixture just built it, so this is the only handle"),
+    };
+    state.plugin_registry = Some(registry);
+    state.sandbox_backend = Some(backend);
+    Arc::new(state)
+}
+
+/// The same state with the session store the logout route acts on.
+///
+/// Supplied because the route's answer now depends on what that store said:
+/// without it the route answers through its "no store configured" branch, and
+/// a suite that wants to judge the destroy failure would be judging the missing
+/// component instead.
+pub fn with_session_manager(sm: Arc<dyn cog_core::SessionManager>) -> Arc<GatewayState> {
+    let mut state = match Arc::try_unwrap(stateless()) {
+        Ok(state) => state,
+        Err(_) => panic!("the fixture just built it, so this is the only handle"),
+    };
+    state.session_manager = Some(sm);
+    Arc::new(state)
+}
+
+/// The same state with the two components a learn-ingest route asks for: where
+/// the raw bytes and the derived entries are stored, and what extraction makes
+/// of a payload.
+///
+/// Both are supplied because the route's answer now depends on each in turn --
+/// the store decides what landed, the extractor decides what was asked to land.
+/// A suite that supplies only one would be judging the missing component.
+pub fn with_memory_pipeline(
+    backend: Arc<dyn cog_core::MemoryBackend>,
+    ingestor: Arc<dyn cog_core::MemoryIngestor>,
+) -> Arc<GatewayState> {
+    let mut state = match Arc::try_unwrap(stateless()) {
+        Ok(state) => state,
+        Err(_) => panic!("the fixture just built it, so this is the only handle"),
+    };
+    state.memory_backend = Some(backend);
+    state.memory_ingestor = Some(ingestor);
+    Arc::new(state)
+}
+
+/// The same state with the contribution control wired in.
+///
+/// Without one, every control-backed reading has no source at all; a suite that
+/// asks what the status screen says when the queue cannot be read has to give
+/// it a queue first.
+pub fn with_contribution_control(
+    control: Arc<dyn cog_core::ContributionControl>,
+) -> Arc<GatewayState> {
+    let mut state = match Arc::try_unwrap(stateless()) {
+        Ok(state) => state,
+        Err(_) => panic!("the fixture just built it, so this is the only handle"),
+    };
+    state.contribution_control = Some(control);
+    Arc::new(state)
+}
+
+/// The same state with the platform's own audit chain switched on.
+///
+/// Without one the routes append nothing and there is nothing to judge: a
+/// suite that asks what a route does when the chain refuses has to hand it a
+/// chain first.
+pub fn with_audit_stream(stream: Arc<dyn cog_core::AuditStream>) -> Arc<GatewayState> {
+    let mut state = match Arc::try_unwrap(stateless()) {
+        Ok(state) => state,
+        Err(_) => panic!("the fixture just built it, so this is the only handle"),
+    };
+    state.audit_stream = Some(stream);
+    Arc::new(state)
+}
+
+/// The same state, with action plans kept in `store` instead of a per-process
+/// map. The routes' answers are that store's answers, so this is what a suite
+/// supplies to judge them.
+pub fn with_action_plan_store(
+    store: cog_gateway::action_plan::ActionPlanStore,
+) -> Arc<GatewayState> {
+    let mut state = match Arc::try_unwrap(stateless()) {
+        Ok(state) => state,
+        Err(_) => panic!("the fixture just built it, so this is the only handle"),
+    };
+    state.action_plan_store = store;
+    Arc::new(state)
+}
+
 fn build(
     datasets: Option<Arc<dyn cog_storage::DatasetStore>>,
     message_backend: Option<Arc<dyn cog_core::MessageBackend>>,
@@ -389,7 +488,6 @@ fn build(
             cors_origins: vec!["*".into()],
             websocket_timeout_secs: 30,
             websocket_inactivity_timeout_secs: 90,
-            websocket_tick_secs: 5,
             notification_limit: 50,
             request_timeout_secs: 30,
             notification_webhook_url: None,

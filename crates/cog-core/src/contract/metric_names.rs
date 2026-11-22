@@ -29,11 +29,11 @@
 //! re-exported from here so the call site reads as before.
 //!
 //! A name added here with nothing that reads it is half a change, and the
-//! census test says so: it walks [`ALL`] against the alert rules and the
-//! dashboard panels and fails for any name that is read by neither and is not
-//! registered in that test's census with its own written verdict. So the entry
-//! arrives together with the reader — the rule or panel that consumes the
-//! series, or the census entry and whatever count the test holds against it.
+//! census test says so: it walks [`ALL`] against the alert rules and fails for
+//! any name that no rule reads and that is not registered in that test's census
+//! with its own written verdict. So the entry arrives together with the reader —
+//! the rule that consumes the series, or the census entry and whatever count the
+//! test holds against it.
 //! A series whose only reader is a count that can sit above zero for hours
 //! without naming which subject owes it is not read in that sense: it reports
 //! a state nobody can act on, which is the failure a `pending` counter left

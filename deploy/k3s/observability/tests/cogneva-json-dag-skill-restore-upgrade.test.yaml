@@ -222,7 +222,7 @@ tests:
   - interval: 1m
     input_series:
       - series: 'cogneva_skill_hot_reload_total{outcome="reload_failed",job="skills"}'
-        values: '0x55 2x5'
+        values: '0x56 2x4'
     alert_rule_test:
       - eval_time: 60m
         alertname: skill_reload_failing_every_scan

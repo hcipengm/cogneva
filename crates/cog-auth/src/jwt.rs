@@ -25,6 +25,11 @@ pub struct JwtConfig {
     pub public_key_pem: Option<String>,
 }
 
+// 十五分钟：一个访问令牌的泄露窗口——短到被盗的令牌很快自己失效，长到一次
+// 会话里不用反复刷新；刷新令牌另有它自己的寿命。
+// cap: bound — 十五分钟：被盗令牌很快失效，一次会话不用反复刷新
+const DEV_ACCESS_TOKEN_TTL_MINUTES: i64 = 15;
+
 impl Default for JwtConfig {
     fn default() -> Self {
         Self {
@@ -36,8 +41,8 @@ impl Default for JwtConfig {
             secret: format!("dev-only-{}-{}", Uuid::new_v4(), Uuid::new_v4()),
             issuer: "cogneva".into(),
             audience: "cogneva-api".into(),
-            access_token_ttl_minutes: 15,
-            refresh_token_ttl_days: 7,
+            access_token_ttl_minutes: DEV_ACCESS_TOKEN_TTL_MINUTES,
+            refresh_token_ttl_days: cog_core::day::DAYS_PER_WEEK,
             private_key_pem: None,
             public_key_pem: None,
         }
@@ -280,6 +285,37 @@ pub fn generate_test_rsa_keypair() -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 访问令牌的寿命只有一处声明：默认值读常量，源码面 `impl Default` 的字段里不再有数字。
+    #[test]
+    fn the_dev_token_ttl_reads_its_name() {
+        assert_eq!(
+            JwtConfig::default().access_token_ttl_minutes,
+            DEV_ACCESS_TOKEN_TTL_MINUTES
+        );
+        let body = include_str!("jwt.rs")
+            .split("impl Default for JwtConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    let value = value.trim().trim_end_matches(',');
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.starts_with(|c: char| c.is_ascii_digit())
+                        // 哨兵 0 与空串不是旋钮，是「没写」。
+                        && value != "0"
+                })
+            })
+            .map(str::trim)
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
+    }
 
     /// Strong, unique-per-run HS256 secret for the tests below. Never use a
     /// shared literal: a public test secret that reached a real config would

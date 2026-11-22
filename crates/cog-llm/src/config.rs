@@ -79,6 +79,13 @@ impl std::fmt::Debug for LLMBackendConfig {
     }
 }
 
+/// 一个后端的一份权重：均分。
+///
+/// 权重是份额，不是可以调的档位——一份就是「和其他后端一样多」，只有运维给了
+/// 不同份额时它才不是一。
+// cap: fixed — 份额的单位：一份就是均分
+pub const EQUAL_WEIGHT: u32 = 1;
+
 impl Default for LLMBackendConfig {
     fn default() -> Self {
         Self {
@@ -87,7 +94,7 @@ impl Default for LLMBackendConfig {
             base_url: None,
             model: String::new(),
             api_style: default_api_style(),
-            weight: 1,
+            weight: EQUAL_WEIGHT,
             enabled: true,
         }
     }

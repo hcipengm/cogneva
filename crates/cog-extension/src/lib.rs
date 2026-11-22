@@ -1,10 +1,11 @@
 //! `cog-extension` — Extension discovery, verification, registry,
-//! and execution runtime for WASM and Rhai.
+//! and the Rhai execution runtime; WASM modules are compiled here and not
+//! executed (the runtime refuses a WASM request rather than faking a run).
 //! This crate consolidates the former `cog-plugin` (discovery + registry)
 //! and `cog-sandbox` (WASM + Rhai execution) into a single crate.
 //! | Feature | Runtime | Use-case |
 //! |---------|---------|----------|
-//! | `wasm`  | Wasmtime | Untrusted third-party code (plugins) |
+//! | `wasm`  | Wasmtime | Untrusted third-party code (plugins) — compiled, never run |
 //! | `rhai`  | Rhai     | Trusted inline scripting (prompt logic, glue) |
 
 pub mod build_cache;

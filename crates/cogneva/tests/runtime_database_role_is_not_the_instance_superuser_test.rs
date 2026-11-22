@@ -1,4 +1,3 @@
-//! principle: feedback_a_gate_must_name_the_defect_it_stops
 //!
 //! 业务 Pod 连库用的角色不是实例的超级用户。
 //!

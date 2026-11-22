@@ -86,7 +86,12 @@ export function ViewFor({ view }: { view: string }) {
     case 'hooks':
       return <RecordsView path="/api/v1/hooks" what="钩子的增删查在，界面上没有编辑面" />;
     case 'plugins':
-      return <RecordsView path="/api/v1/plugins" what="插件的上传与卸载在，界面上没有入口" />;
+      return (
+        <RecordsView
+          path="/api/v1/plugins"
+          what="插件列表在；上传与卸载这个构建只校验不装载"
+        />
+      );
     case 'workspaces':
       return <RecordsView path="/api/v1/workspaces" what="工作区列表与成员在，界面上没有入口" />;
     case 'action-plan':

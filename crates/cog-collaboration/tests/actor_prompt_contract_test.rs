@@ -497,8 +497,8 @@ fn identity_claim(text: &str) -> Option<String> {
 /// both stale and the guard green. So the vocabulary is read out of the parsers
 /// here by running them, on the words the contract names. This is the one place
 /// the failure is silent: a decision word the moderator's parse does not
-/// recognize lands on its default `continue`, so a round would carry on and the
-/// reading would show a decision nobody made.
+/// recognize reads as no decision at all, so the round would record nothing
+/// where the contract promised one of the four.
 #[test]
 fn the_words_the_contracts_name_are_the_words_the_parsers_take() {
     // Every decision the contract offers has to come back as itself, not as the
@@ -511,7 +511,8 @@ fn the_words_the_contracts_name_are_the_words_the_parsers_take() {
     ] {
         let parsed = parse_moderator_output(&serde_json::json!({ "decision": word }));
         assert_eq!(
-            parsed.decision, expected,
+            parsed.decision,
+            Some(expected),
             "the moderator's contract tells the model to answer {word:?}, which its parse does not take"
         );
     }

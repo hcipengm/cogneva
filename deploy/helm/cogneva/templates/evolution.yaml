@@ -218,7 +218,7 @@ spec:
             - |
               set -e
               git config --global --add safe.directory /host-git
-              git config --global --add safe.directory /opt/cogneva/sandbox/workspaces
+              git config --global --add safe.directory {{ .Values.evolution.workspaces.root }}
               # 镜像按序尝试，第一个可达的胜出：可达性按主机不对称（实测本集群
               # github 间歇黑洞、gitee 秒级应答），只配一个地址时该主机不可达期间
               # 既 seed 不出空卷、也刷不到新 release tag。
@@ -265,7 +265,7 @@ spec:
               # 工作树由分配器按需从裸仓库切出（零克隆、共享对象库），这里只清掉
               # 崩溃留下的孤儿登记，并备好工作树根目录（app 容器的 workingDir）。
               git --git-dir=/host-git worktree prune
-              mkdir -p /opt/cogneva/sandbox/workspaces
+              mkdir -p {{ .Values.evolution.workspaces.root }}
           volumeMounts:
             - name: source
               mountPath: /opt/cogneva/sandbox/src
@@ -277,7 +277,7 @@ spec:
         - name: cogneva
           image: {{ include "cogneva.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          workingDir: /opt/cogneva/sandbox/workspaces
+          workingDir: {{ .Values.evolution.workspaces.root }}
           # 特权容器 = 文件系统沙盒边界（3.2 image-based 滚动更新后移除）
           securityContext:
             privileged: true
@@ -492,7 +492,7 @@ spec:
                   - -c
                   - |
                     git config --global --add safe.directory /host-git
-                    git config --global --add safe.directory /opt/cogneva/sandbox/workspaces
+                    git config --global --add safe.directory {{ .Values.evolution.workspaces.root }}
           ports:
             - name: http
               containerPort: {{ .Values.gateway.httpPort }}

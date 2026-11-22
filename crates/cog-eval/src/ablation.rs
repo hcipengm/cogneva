@@ -33,8 +33,14 @@ pub struct AblationGroup {
     pub runs: u32,
 }
 
+/// 一次就是不做重复：这是重复次数的单位，不是一个调过的档。
+///
+/// 要重复才写 2、3——零次跑不出均值，而「跑一次」是这里唯一不用选就有意义的数。
+// cap: fixed — 次数的单位：一次＝不重复
+const ONE_RUN: u32 = 1;
+
 fn default_runs() -> u32 {
-    1
+    ONE_RUN
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

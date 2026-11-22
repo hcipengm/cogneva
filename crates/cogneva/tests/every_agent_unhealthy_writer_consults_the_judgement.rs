@@ -1,5 +1,4 @@
 //! principle: feedback_the_half_that_is_easy_to_enumerate_is_not_the_half_that_fires
-//! principle: feedback_a_gate_at_one_of_n_writers_is_no_gate_at_all
 //!
 //! `AgentUnhealthy` has more than one writer, and a filter installed at one of
 //! them moved nothing.

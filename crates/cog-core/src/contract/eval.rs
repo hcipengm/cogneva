@@ -35,7 +35,10 @@ pub fn two_proportion_z_test(s1: usize, n1: usize, s2: usize, n2: usize) -> (f64
 pub struct EvalDatasetInfo {
     pub name: String,
     pub path: String,
-    pub case_count: usize,
+    /// 这个数据集里有几个用例。`None` 是**没数**，不是 0：只有 jsonl 有一行一个
+    /// 用例的约定，yaml 没有，读不出来的文件也没有。写 0 会让「不数」与「空数据集」
+    /// 在屏上同形，而后者要删、前者要换个格式读。
+    pub case_count: Option<usize>,
     pub tags: Vec<String>,
 }
 

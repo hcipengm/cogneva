@@ -153,11 +153,15 @@ fn default_true() -> bool {
     true
 }
 
+/// 邮件提交口：RFC 6409 给提交（而非中继）定的约定端口。
+// cap: fixed — RFC 6409 提交端口 587
+pub const SMTP_SUBMISSION_PORT: u16 = 587;
+
 impl Default for SmtpConfig {
     fn default() -> Self {
         Self {
             host: "localhost".into(),
-            port: 587,
+            port: SMTP_SUBMISSION_PORT,
             username: None,
             password: None,
             from_address: "alerts@cogneva.local".into(),

@@ -1327,6 +1327,7 @@ mod tests {
         assert!(msg.contains("读不到"), "{msg}");
     }
 
+    // proves: mainlineDeployer.observabilityStack.intervalSecs
     #[test]
     fn the_convergence_wait_follows_what_a_round_cost() {
         let readings = Arc::new(cog_core::pacing::PacingReadings::new());

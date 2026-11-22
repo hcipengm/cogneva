@@ -9,12 +9,16 @@
 //! 这个回路把答案补上，形状与卷容量那条一致：**取样 → 滚动窗口 → 算目标 →
 //! 量化/防抖 → 写回 → 发布读数**。
 //!
-//! - **测量入口**：kubelet 的 `stats/summary`（经 apiserver 代理
-//!   `/api/v1/nodes/<节点>/proxy/stats/summary`，权限 `nodes/stats` 已在
-//!   `cogneva-topology-reader` 里）。每个 Pod 的 `containers[]` 给容器级
-//!   `cpu.usageNanoCores` 与 `memory.workingSetBytes`——工作集正是内存压力与
-//!   OOM 判定看的那一个数。chart 不部署 Prometheus，也不假设 cAdvisor 采集，
-//!   所以策略不以那两者为前提。
+//! - **测量入口**：一处，metrics-server 的 `/apis/metrics.k8s.io/v1beta1/pods`
+//!   （chart 授的是 `metrics.k8s.io/pods`）。每个 Pod 的 `containers[].usage`
+//!   给容器级 CPU 与内存。曾经还有一条 kubelet `stats/summary` 的后备，它经
+//!   apiserver 代理读 `/api/v1/nodes/<节点>/proxy/stats/summary`——而 apiserver
+//!   按**子资源**授权，`/proxy/*` 落的是 `nodes/proxy`，不是 `nodes/stats`
+//!   （2026-11-19 在一台只授了 `nodes/stats` 的 k3s 上实测：每一读都 403）。
+//!   `nodes/proxy` 能代理到 kubelet 的每一个端点，chart 刻意不授。那条后备在
+//!   chart 自己的授权下永远不可达，留着它只会让「用量读不到」看起来像还有一条
+//!   路——已删。没有 metrics-server 的集群上，这一面诚实地报「量不到」，容量
+//!   目标不拿一次猜测去写。chart 不部署 Prometheus，也不假设 cAdvisor 采集。
 //! - **窗口**：7 天。样本落在数据卷上的一个 JSON 文件里，Pod 重启不丢；
 //!   窗口滚动，旧样本随拍子退出。
 //! - **律**：p95 决定请求，峰值 × 余量决定内存上限；CPU 上限取
@@ -838,7 +842,7 @@ impl WorkloadSpec {
 /// 解析一个数量字符串成 CPU 毫核。
 ///
 /// `500m`、`2`、`0.5` 是 chart 里出现过的三种写法；`u`/`n` 也收，因为
-/// kubelet summary 里能见到。
+/// Kubernetes 的数量格式允许它们，量出来的数不该因为换了单位就成 0。
 pub fn parse_cpu_millicores(text: &str) -> Option<u64> {
     let text = text.trim();
     let (number, factor) = if let Some(value) = text.strip_suffix('n') {
@@ -1109,17 +1113,29 @@ pub fn owner_map(list: &Value, owner_kind: &str) -> HashMap<String, String> {
     out
 }
 
-/// kubelet summary 里一个 Pod 的容器用量。
-pub fn parse_summary(summary: &Value, namespace: &str) -> HashMap<String, HashMap<String, Sample>> {
+/// metrics-server 的 Pod 用量列表（`/apis/metrics.k8s.io/v1beta1/pods`）。
+///
+/// 这是用量唯一的来源。kubelet summary 那条路（`/api/v1/nodes/<节点>/proxy/stats/summary`）
+/// 在 apiserver 那里要的是 `nodes/proxy`，而 apiserver 按**子资源**授权，`/proxy/*`
+/// 落的就是它，不是 `nodes/stats`。2026-11-19 在一台只授了 `nodes/stats` 的 k3s 上实测：
+/// 每一读都 403，回路第一句就 `no container usage was readable` 返回，容量读数一格也
+/// 没发出去。`nodes/proxy` 能代理到 kubelet 的每一个端点，chart 刻意不授——所以这一面
+/// 只认 metrics-server。
+///
+/// 内存为 0 的样本跳过：它不是「空闲」，是这一刻没读到。
+pub fn parse_metrics_pods(
+    list: &Value,
+    namespace: &str,
+) -> HashMap<String, HashMap<String, Sample>> {
     let mut out = HashMap::new();
-    let Some(pods) = summary.get("pods").and_then(Value::as_array) else {
+    let Some(pods) = list.get("items").and_then(Value::as_array) else {
         return out;
     };
     for pod in pods {
-        if pod.pointer("/podRef/namespace").and_then(Value::as_str) != Some(namespace) {
+        if pod.pointer("/metadata/namespace").and_then(Value::as_str) != Some(namespace) {
             continue;
         }
-        let Some(name) = pod.pointer("/podRef/name").and_then(Value::as_str) else {
+        let Some(name) = pod.pointer("/metadata/name").and_then(Value::as_str) else {
             continue;
         };
         let mut containers = HashMap::new();
@@ -1132,10 +1148,16 @@ pub fn parse_summary(summary: &Value, namespace: &str) -> HashMap<String, HashMa
             let Some(container_name) = container.get("name").and_then(Value::as_str) else {
                 continue;
             };
-            let cpu = nanocores(&container, "usageNanoCores");
-            let memory = bytes(container.pointer("/memory/workingSetBytes"));
-            // 内存为 0 的样本不是一个「空闲容器」，是 kubelet 这一刻没有给出
-            // 工作集。把它当 0 会让 p95 掉到地板，把请求写在解不出来的读数上。
+            let cpu = container
+                .pointer("/usage/cpu")
+                .and_then(Value::as_str)
+                .and_then(parse_cpu_millicores)
+                .unwrap_or(0);
+            let memory = container
+                .pointer("/usage/memory")
+                .and_then(Value::as_str)
+                .and_then(parse_memory_bytes)
+                .unwrap_or(0);
             if memory == 0 {
                 continue;
             }
@@ -1151,29 +1173,6 @@ pub fn parse_summary(summary: &Value, namespace: &str) -> HashMap<String, HashMa
         out.insert(name.to_string(), containers);
     }
     out
-}
-
-fn nanocores(container: &Value, field: &str) -> u64 {
-    let value = container.pointer(&format!("/cpu/{field}"));
-    let nanocores = value.and_then(|v| {
-        v.as_f64()
-            .or_else(|| v.as_str().and_then(|text| text.parse::<f64>().ok()))
-    });
-    match nanocores {
-        Some(nanocores) if nanocores.is_finite() && nanocores > 0.0 => {
-            (nanocores / 1_000_000.0).round() as u64
-        }
-        _ => 0,
-    }
-}
-
-fn bytes(value: Option<&Value>) -> u64 {
-    value
-        .and_then(|v| {
-            v.as_u64()
-                .or_else(|| v.as_str().and_then(|text| text.parse::<u64>().ok()))
-        })
-        .unwrap_or(0)
 }
 
 /// 一个容器要写回的资源块。
@@ -1920,24 +1919,14 @@ pub async fn round(
         .map(|(index, workload)| (workload.name.clone(), index))
         .collect();
     let mut usage: HashMap<String, HashMap<String, Sample>> = HashMap::new();
-    for node in nodes
-        .get("items")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-    {
-        let Some(name) = node.pointer("/metadata/name").and_then(Value::as_str) else {
-            continue;
-        };
-        let path = format!("/api/v1/nodes/{name}/proxy/stats/summary");
-        let Ok(body) = kubectl(&["get", "--raw", &path]).await else {
-            continue;
-        };
-        let Ok(summary) = serde_json::from_str::<Value>(&body) else {
-            continue;
-        };
-        for (pod, containers) in parse_summary(&summary, ns) {
-            usage.entry(pod).or_default().extend(containers);
+    // 用量只问 metrics-server：它读的是 `metrics.k8s.io/pods`，chart 授了。
+    // 读不到时 usage 留空，round 末尾按「这一拍量不到」返回——容量目标不拿一次
+    // 猜测去写。曾经还试过 kubelet summary（`/api/v1/nodes/<n>/proxy/stats/summary`），
+    // 那条路在 apiserver 那里要的是 `nodes/proxy`，而 chart 刻意不授；留着它只会
+    // 把一次必然的 403 画成「还有一条后备」。
+    if let Ok(body) = kubectl(&["get", "--raw", "/apis/metrics.k8s.io/v1beta1/pods"]).await {
+        if let Ok(list) = serde_json::from_str::<Value>(&body) {
+            usage = parse_metrics_pods(&list, ns);
         }
     }
 
@@ -1981,10 +1970,12 @@ pub async fn round(
     }
     window.prune(now);
 
-    // 每台节点读不到时 `fed` 为 0：不写回，只报告。
-    if fed == 0 {
-        return Err("no container usage was readable this round; nothing was written".to_string());
-    }
+    // 用量一条都读不到时 `fed` 为 0——但这只截断**资源目标**那一条律，不截断
+    // 队那条律：谁在等、几副副本、容量几位子，都不从那批样本里来。2026-11-19
+    // 实测到过反过来的情形（`nodes/stats` 授了、`nodes/proxy` 没授，summary
+    // 每次 403），那一版在下面这段之前就返回了，于是容量读数一格都没有，而
+    // 「读不到用量」在读数面上读起来像「没有这条律」。截断挪到这一函数末尾。
+    let usage_unreadable = fed == 0;
 
     // 队列这条律要问的地址：按工作负载归组，只收就绪的 Pod。地址在这一拍开始时
     // 定下，后面每个对象的判断读同一份——同一拍里读两次 Pods 会看到两份名单。
@@ -2301,6 +2292,15 @@ pub async fn round(
         ),
     }
 
+    // 报告的是「这一拍的用量没读到」；队与副本那几条律已经照样发出去了，
+    // 所以这句话不能再说成「什么都没发」。
+    if usage_unreadable {
+        return Err(
+            "no container usage was readable this round; resource targets were left as they were"
+                .to_string(),
+        );
+    }
+
     Ok(RoundSummary { evaluated, patched })
 }
 
@@ -2377,6 +2377,141 @@ mod tests {
         }
     }
 
+    /// metrics-server 的读数是字符串数量（例如 `12m`、`100Mi`）。内存读作 0 的那几格
+    /// 要丢掉：那是「这一刻没读到」，不是「这个容器不用内存」。
+    #[test]
+    fn metrics_server_usage_becomes_samples() {
+        let payload = serde_json::json!({
+            "items": [
+                {
+                    "metadata": {"name": "executor-0", "namespace": "cogneva"},
+                    "containers": [
+                        {"name": "sandbox-executor", "usage": {"cpu": "12m", "memory": "100Mi"}},
+                        {"name": "no-workset", "usage": {"cpu": "3m", "memory": "0"}}
+                    ]
+                },
+                {
+                    "metadata": {"name": "elsewhere-0", "namespace": "other"},
+                    "containers": [
+                        {"name": "c", "usage": {"cpu": "1", "memory": "1Gi"}}
+                    ]
+                }
+            ]
+        });
+        let usage = parse_metrics_pods(&payload, "cogneva");
+        let containers = usage
+            .get("executor-0")
+            .expect("this namespace's pod is kept");
+        assert_eq!(
+            containers.get("sandbox-executor"),
+            Some(&sample(12, 100 * 1024 * 1024))
+        );
+        assert!(
+            !containers.contains_key("no-workset"),
+            "内存为 0 的格子不是样本：留它会把这个容器的 p95 拉到地板"
+        );
+        assert!(
+            !usage.contains_key("elsewhere-0"),
+            "只收本命名空间的 Pod：别的命名空间的容器不归这条律管"
+        );
+    }
+
+    // proves: backup.resources.requests.cpu
+    // proves: backup.resources.requests.memory
+    // proves: backup.resources.limits.cpu
+    // proves: backup.resources.limits.memory
+    // proves: backup.drillResources.requests.cpu
+    // proves: backup.drillResources.requests.memory
+    // proves: backup.drillResources.limits.cpu
+    // proves: backup.drillResources.limits.memory
+    // proves: gateway.resources.requests.cpu
+    // proves: gateway.resources.requests.memory
+    // proves: gateway.resources.limits.cpu
+    // proves: gateway.resources.limits.memory
+    // proves: securityGateway.resources.requests.cpu
+    // proves: securityGateway.resources.requests.memory
+    // proves: securityGateway.resources.limits.cpu
+    // proves: securityGateway.resources.limits.memory
+    // proves: evolution.resources.requests.cpu
+    // proves: evolution.resources.requests.memory
+    // proves: evolution.resources.limits.cpu
+    // proves: evolution.resources.limits.memory
+    // proves: sandboxExecutor.resources.requests.cpu
+    // proves: sandboxExecutor.resources.requests.memory
+    // proves: sandboxExecutor.resources.limits.cpu
+    // proves: sandboxExecutor.resources.limits.memory
+    // proves: buildah.resources.requests.cpu
+    // proves: buildah.resources.requests.memory
+    // proves: buildah.resources.limits.cpu
+    // proves: buildah.resources.limits.memory
+    // proves: processCensus.resources.requests.cpu
+    // proves: processCensus.resources.requests.memory
+    // proves: processCensus.resources.limits.cpu
+    // proves: processCensus.resources.limits.memory
+    // proves: hostLedger.resources.requests.cpu
+    // proves: hostLedger.resources.requests.memory
+    // proves: hostLedger.resources.limits.cpu
+    // proves: hostLedger.resources.limits.memory
+    // proves: claimStore.resources.requests.cpu
+    // proves: claimStore.resources.requests.memory
+    // proves: claimStore.resources.limits.cpu
+    // proves: claimStore.resources.limits.memory
+    // proves: clusterRegistry.resources.requests.cpu
+    // proves: clusterRegistry.resources.requests.memory
+    // proves: clusterRegistry.resources.limits.cpu
+    // proves: clusterRegistry.resources.limits.memory
+    // proves: clusterRegistry.walkerResources.requests.cpu
+    // proves: clusterRegistry.walkerResources.requests.memory
+    // proves: clusterRegistry.walkerResources.limits.cpu
+    // proves: clusterRegistry.walkerResources.limits.memory
+    // proves: backends.postgres.resources.requests.cpu
+    // proves: backends.postgres.resources.requests.memory
+    // proves: backends.postgres.resources.limits.cpu
+    // proves: backends.postgres.resources.limits.memory
+    // proves: backends.postgres.exporterResources.requests.cpu
+    // proves: backends.postgres.exporterResources.requests.memory
+    // proves: backends.postgres.exporterResources.limits.cpu
+    // proves: backends.postgres.exporterResources.limits.memory
+    // proves: backends.redis.resources.requests.cpu
+    // proves: backends.redis.resources.requests.memory
+    // proves: backends.redis.resources.limits.cpu
+    // proves: backends.redis.resources.limits.memory
+    // proves: backends.redis.aofRepair.resources.requests.cpu
+    // proves: backends.redis.aofRepair.resources.requests.memory
+    // proves: backends.redis.aofRepair.resources.limits.cpu
+    // proves: backends.redis.aofRepair.resources.limits.memory
+    // proves: backends.redis.aofReportExporter.resources.requests.cpu
+    // proves: backends.redis.aofReportExporter.resources.requests.memory
+    // proves: backends.redis.aofReportExporter.resources.limits.cpu
+    // proves: backends.redis.aofReportExporter.resources.limits.memory
+    // proves: backends.redis.infoExporter.resources.requests.cpu
+    // proves: backends.redis.infoExporter.resources.requests.memory
+    // proves: backends.redis.infoExporter.resources.limits.cpu
+    // proves: backends.redis.infoExporter.resources.limits.memory
+    // proves: backends.qdrant.resources.requests.cpu
+    // proves: backends.qdrant.resources.requests.memory
+    // proves: backends.qdrant.resources.limits.cpu
+    // proves: backends.qdrant.resources.limits.memory
+    // proves: backends.nats.resources.requests.cpu
+    // proves: backends.nats.resources.requests.memory
+    // proves: backends.nats.resources.limits.cpu
+    // proves: backends.nats.resources.limits.memory
+    // proves: backends.meilisearch.resources.requests.cpu
+    // proves: backends.meilisearch.resources.requests.memory
+    // proves: backends.meilisearch.resources.limits.cpu
+    // proves: backends.meilisearch.resources.limits.memory
+    // proves: backends.seaweedfs.resources.requests.cpu
+    // proves: backends.seaweedfs.resources.requests.memory
+    // proves: backends.seaweedfs.resources.limits.cpu
+    // proves: backends.seaweedfs.resources.limits.memory
+    // proves: webSearch.resources.requests.cpu
+    // proves: webSearch.resources.requests.memory
+    // proves: webSearch.resources.limits.cpu
+    // proves: webSearch.resources.limits.memory
+    // proves: webFetch.resources.requests.cpu
+    // proves: webFetch.resources.requests.memory
+    // proves: webFetch.resources.limits.cpu
+    // proves: webFetch.resources.limits.memory
     #[test]
     fn a_request_follows_the_measured_draw() {
         // 同一个容器，两段不同的实测：请求与两个上限都必须跟着走。
@@ -2475,6 +2610,8 @@ mod tests {
         assert!(loaded.targets("Deployment/a/c").is_some());
     }
 
+    // proves: gateway.replicas
+    // proves: securityGateway.replicas
     /// Replicas are a function of the live failure domains: one node cannot
     /// lose a replica and still serve, so it gets one; two or more get two,
     /// because a second copy on a third node buys no new failure domain.
@@ -2520,6 +2657,7 @@ mod tests {
         }
     }
 
+    // proves: sandboxExecutor.replicas
     /// 执行器的副本数跟队走：需求是一副副本一条位子，涨是即时的。
     ///
     /// 这是登记表里 `sandboxExecutor.replicas` 那条 `derived` 的判据：把队的输入
@@ -2704,6 +2842,8 @@ mod tests {
         );
     }
 
+    // proves: healthProbes.appStartup.failureThreshold
+    // proves: healthProbes.claimStoreStartup.failureThreshold
     /// The startup budget covers the longest start that actually reached
     /// Ready, with headroom, and never goes below what the object already
     /// declared: a start too slow for the budget cannot be observed as a
@@ -3020,6 +3160,7 @@ mod tests {
         parse_workloads(&list).remove(0)
     }
 
+    // proves: webFetch.shmSize
     #[test]
     fn the_shm_size_follows_the_measured_memory() {
         // 同一份输入、两个不同的实测：写进 `sizeLimit` 的数必须跟着动。
@@ -3081,6 +3222,10 @@ mod tests {
         .is_some());
     }
 
+    // proves: resourceGovernance.limitRange.defaultCpu
+    // proves: resourceGovernance.limitRange.defaultMemory
+    // proves: resourceGovernance.limitRange.defaultRequestCpu
+    // proves: resourceGovernance.limitRange.defaultRequestMemory
     /// The namespace default is a function of the same measurement the
     /// per-container law reads, asked what a typical container here looks
     /// like: the median sets the request, the busy edge sets the limit.

@@ -449,6 +449,7 @@ mod tests {
         assert!(PERIOD.as_secs() <= 300);
     }
 
+    // proves: llmUsageRetention.keepDays
     /// 保留天数是当拍实测的函数；量不到时 seed 顶着。
     #[tokio::test]
     async fn the_retention_follows_the_measured_daily_write() {

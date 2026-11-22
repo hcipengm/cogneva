@@ -4048,7 +4048,15 @@ impl MainlineDeployer {
         let prev = match state.last_seen_rev.clone() {
             None => {
                 state.last_seen_rev = Some(bare.to_string());
-                let _ = self.save_state(state);
+                if let Err(e) = self.save_state(state) {
+                    // 基线立不起来，下一拍会从「没有上一拍」重来一次：这一拍什么都没
+                    // 数，所以不是丢账；但状态文件写不进去这件事本身要说出来。
+                    warn!(
+                        error = %e,
+                        "could not persist the baseline this tick saw; the next tick starts from \
+                         scratch again and nothing is counted until it lands"
+                    );
+                }
                 return;
             }
             Some(prev) if prev == bare => return,
@@ -4077,7 +4085,13 @@ impl MainlineDeployer {
                 "the head seen last tick is not an ancestor of this one; restarting the skipped-rev count from here"
             );
             state.last_seen_rev = Some(bare.to_string());
-            let _ = self.save_state(state);
+            if let Err(e) = self.save_state(state) {
+                warn!(
+                    error = %e,
+                    "could not persist the rewritten baseline; the next tick re-reads the old \
+                     one and takes the same branch again (nothing is counted either way)"
+                );
+            }
             return;
         }
 
@@ -4090,6 +4104,25 @@ impl MainlineDeployer {
             return;
         };
         let skipped = commits.saturating_sub(1);
+        // 先落盘再计数：读数是「这一段被数过」，而「数过」的唯一记录就是基线。
+        // 基线没落盘时记下这个数，下一拍会从同一条旧基线把同一段再数一遍——
+        // 一次落盘失败被记成两次被跳过的 rev。落不下时不记、把基线退回原处，
+        // 留给落盘成功的那一拍只数一次。
+        let previous = state.last_seen_rev.clone();
+        state.last_seen_rev = Some(bare.to_string());
+        if let Err(e) = self.save_state(state) {
+            state.last_seen_rev = previous;
+            warn!(
+                error = %e,
+                previous = %rev12(&prev),
+                current = %rev12(bare),
+                skipped,
+                "could not persist the baseline, so this window is not counted: counting it \
+                 here and failing to move the baseline would count the same revisions again \
+                 next tick; the baseline stays put until a tick can write it"
+            );
+            return;
+        }
         if skipped > 0 {
             info!(
                 previous = %rev12(&prev),
@@ -4112,8 +4145,6 @@ impl MainlineDeployer {
                     .await;
             }
         }
-        state.last_seen_rev = Some(bare.to_string());
-        let _ = self.save_state(state);
     }
 
     fn save_state(&self, state: &MainlineState) -> SFResult<()> {
@@ -5175,8 +5206,10 @@ impl MainlineDeployer {
     /// 可等的；而网关整个不在（副本正在被换、真断网）时，这几秒之后仍然拒，那时再
     /// 按 `connect_failed` 报上去，判据不变。
     ///
-    /// 四次复问把覆盖拉到容器起来后约 7 秒：实测窗口在 1~3 秒之间，留一倍余量是因为
-    /// 那条窗口的宽度由策略面的调度决定，不是我们能钉住的一个数。
+    /// 阶梯要盖住整条实测窗口并留余量：那条窗口的宽度由策略面的调度决定，不是我们能
+    /// 钉住的一个数，所以这里只保证一直复问到确认不是「刚起来」为止。
+    // cap: bound — 实测（2026-10-27）：连接被拒的窗口在 1~3 秒之间，这份阶梯从半秒起
+    // 翻倍、四档把覆盖拉到那之上；窗口变窄时要跟着下调
     const CI_ASK_RETRY_DELAYS_MS: [u64; 4] = [500, 1_000, 2_000, 4_000];
 
     /// 问一次，按这一次的回答给出结论（复问的循环在上面那一层）。
@@ -18431,6 +18464,121 @@ exit 0
         assert_eq!(sample.value, 1.0, "A..C 之间只有一个从没被看过");
     }
 
+    /// 基线落不下盘的那一拍不计数，基线也不动。
+    ///
+    /// 「这一段被数过」的唯一记录就是基线文件：把数记进读数、基线却留在原处，
+    /// 下一拍会把同一段再数一遍（一次落盘失败被记成两次跳过的 rev）。所以判据
+    /// 两半：读数里没有这一段，基线退回原来的值；并且这件事要在日志里说出声，
+    /// 否则下一拍重数时没人知道前面那一拍白算过。
+    #[test]
+    fn a_skipped_window_whose_baseline_could_not_be_persisted_is_not_counted() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the current-thread runtime builds");
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry().with(MessageCapture {
+            messages: events.clone(),
+        });
+
+        let counters = tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                let _env = ENV_LOCK.lock().await;
+                let tmp = tempfile::tempdir().unwrap();
+                let root = tmp.path();
+                let (bare, work, rev_a, rev_b) = setup_repos(root).await;
+                let bin_dir = root.join("bin");
+                std::fs::create_dir_all(&bin_dir).unwrap();
+                let buildah = fake_buildah(&bin_dir, "");
+                let deployed = main_image("localhost:30500", &rev_a);
+                let kubectl = fake_kubectl(&bin_dir, &deployed);
+                let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
+
+                // 一个普通文件挡在状态目录该在的位置上：`create_dir_all` 连 root
+                // 都会拿到 ENOTDIR，所以「写不进去」不靠权限位成立。
+                let blocked = root.join("blocked");
+                std::fs::write(&blocked, b"not a directory").unwrap();
+                let mut cfg = test_config(root, &bare, &buildah, &kubectl);
+                cfg.state_dir = blocked.join("state").to_string_lossy().into_owned();
+                let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare))
+                    .with_metrics(metrics.clone());
+
+                // 与 `a_revision_superseded_between_ticks_is_counted_as_skipped` 同一个
+                // 走位：A..C 之间隔着 B，B 没有任何一拍看过。
+                real_git(&work, &["fetch", "local", "main"]).await;
+                real_git(&work, &["reset", "--hard", "FETCH_HEAD"]).await;
+                std::fs::write(work.join("lib.rs"), "fn c() {}\n").unwrap();
+                real_git(&work, &["add", "."]).await;
+                real_git(&work, &["commit", "-m", "c"]).await;
+                real_git(&work, &["push", "local", "HEAD:main"]).await;
+                let rev_c = real_git_stdout(&work, &["rev-parse", "HEAD"]).await;
+                assert_ne!(rev_c, rev_b, "夹具要走一个真的新 rev");
+
+                let mut state = deployer.load_state();
+                state.last_seen_rev = Some(rev_a.clone());
+                deployer.record_skipped_revs(&mut state, &rev_c).await;
+                assert_eq!(
+                    state.last_seen_rev.as_deref(),
+                    Some(rev_a.as_str()),
+                    "基线没落盘，内存里却已经挪走了：下一个落盘成功的调用会把它顺手写下去"
+                );
+
+                metrics
+                    .query_counter_totals(
+                        cog_core::metric_names::MAINLINE_REVS_SKIPPED_TOTAL.as_str(),
+                    )
+                    .await
+                    .unwrap()
+            })
+        });
+
+        assert!(
+            counters.is_empty(),
+            "基线没落盘，这一段却被记进了读数：下一拍会从同一条旧基线再数一遍 {counters:?}"
+        );
+        let messages = events.lock().unwrap().clone();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("could not persist the baseline")),
+            "这一段没计，日志里也没有一句话说为什么：{messages:?}"
+        );
+    }
+
+    struct MessageCapture {
+        messages: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for MessageCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Take(String);
+            impl tracing::field::Visit for Take {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "message" {
+                        self.0 = value.to_string();
+                    }
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut take = Take(String::new());
+            event.record(&mut take);
+            self.messages.lock().unwrap().push(take.0);
+        }
+    }
+
     /// 基线没动（两拍之间没有新 rev）时什么都不记：同一段区间不能被数第二遍。
     #[tokio::test]
     async fn a_tick_that_sees_the_same_head_counts_nothing() {
@@ -24269,6 +24417,7 @@ exit 0
         assert_eq!(prunable_tags(&tags, 0, &HashSet::new()).len(), 3);
     }
 
+    // proves: mainlineDeployer.registryMaintenance.retention
     /// registry 保留窗口是这一拍实测的函数：声明的卷 ÷ 每个 rev 的边际字节。
     /// 边际字节只算这一个 rev 独有的层与它自己的元数据——共用的基底删掉一个 rev
     /// 也释放不了，摊进来会让容量随基底一起缩水。每算一拍求值计数都往上走，目标
@@ -24361,6 +24510,7 @@ exit 0
         assert_eq!(off.effective_registry_retention(&tags(), Some(1000)), 0);
     }
 
+    // proves: mainlineDeployer.registryMaintenance.threshold
     /// 回收阈值是这一拍实测的函数：窗里的增长越大、卷越小，阈值越低（回收来得越早），
     /// 且至少留出一个实测 rev 的空间。相邻两拍读数一变，下一拍的读数面就跟着变，
     /// 不需要重启；量不到时如实落回 seed。
@@ -33450,6 +33600,7 @@ exit 0
         }
     }
 
+    // proves: mainlineDeployer.pollIntervalSecs
     /// 主线轮询的下一拍跟着这一轮真正占用的时间走：跑得比种子久时等待为零（那一段
     /// 已经被这一轮用掉了），目标周期与求值计数一起说明回路在跑、而且跟着输入变。
     #[test]
@@ -33485,6 +33636,7 @@ exit 0
         assert_eq!(pacing.target(POLL_PACING).unwrap().1, 3);
     }
 
+    // proves: mainlineDeployer.failureCooldownSecs
     /// 环境类失败的冷却由「连着坏了几次」定：第一次是种子，之后每多一次拉开一档，
     /// 恢复后回到种子。次数是运行时量出来的，不是人钉的。
     #[test]
@@ -33512,6 +33664,7 @@ exit 0
         assert_eq!(pacing.target(FAILURE_COOLDOWN_PACING).unwrap().1, 4);
     }
 
+    // proves: mainlineDeployer.registryMaintenance.cooldownSecs
     /// 两轮回收之间的冷却由「一次回收重启真实让 tag 服务缺席了多久」定：下次不花得
     /// 比这次重启更频繁。换一次更长的重建，冷却跟着变。
     #[test]
@@ -33546,6 +33699,9 @@ exit 0
         assert_eq!(deployer.effective_registry_cooldown_secs(), before);
     }
 
+    // proves: mainlineDeployer.soakSecs
+    // proves: mainlineDeployer.startupTimeoutSecs
+    // proves: mainlineDeployer.rolloutTimeoutSecs
     /// 三段等待各自量到的时长跨过短命判定 Job 的边界回到部署器：下一轮派发按新的
     /// 尾部申报，三段各由自己那一段决定，互不牵连；并且读数面能看出这件事**又被**
     /// 算过一次——目标跟着输入走、求值次数只增，两半一起才说明回路在跑，而不是一次
@@ -33747,6 +33903,10 @@ exit 0
         }
     }
 
+    // proves: mainlineDeployer.rolloutJob.cpuRequest
+    // proves: mainlineDeployer.rolloutJob.memoryRequest
+    // proves: mainlineDeployer.rolloutJob.cpuLimit
+    // proves: mainlineDeployer.rolloutJob.memoryLimit
     /// 判定 Job 的尺寸与容器资源回路共用同一个读数面：运行史还不够一趟时是 chart 的
     /// 种子（`source=seed`），够一趟之后同一个量换成实测（`source=derived`）。求值计数
     /// 每一拍都走——目标不动时，这个计数是回路还在跑的唯一证据。

@@ -1,4 +1,3 @@
-//! principle: feedback_a_reading_must_not_let_two_different_things_share_one_cell
 //! 记账面把两个协议面的缓存口径归一了：`input` 只装**没被缓存服务**的那部分，
 //! 整个 prompt = `input + cached`，命中率一律 `cached / (input + cached)`。
 //! 归一之后 `cached` 在命中过半时**必然**大过 `input`——那是缓存干得好。

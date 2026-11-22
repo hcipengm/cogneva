@@ -122,7 +122,9 @@ impl QuotaManager {
         self.scope_reading(scope, target_id)
             .await
             .map(|reading| reading.limits)
-            .unwrap_or_default()
+            // 没有读数的格子落回层级库自己的那一对，不是合同里另写的一对：
+            // 「没人配过」的答案由持有起点的实现方给出。
+            .unwrap_or_else(|| self.hierarchy.default_limits())
     }
 
     /// Ask whether a call of `estimated_tokens` fits, without spending

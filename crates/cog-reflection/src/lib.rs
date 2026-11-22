@@ -394,6 +394,33 @@ fn rework_surface(l: &cog_core::Learning, named_files: &[String]) -> String {
     }
 }
 
+/// 同一个键两次演化触发之间至少隔多久。
+///
+/// 冷却挡的是「同一个键被反复触发」，不是触发本身：一次触发要花一次 LLM 调用，
+/// 而同一件事在一小时里再看一遍，看到的还是同一件事。
+// cap: bound — 一小时：同一键重看的间隔；只往下调会更频繁地重看同一件事
+const EVOLUTION_COOLDOWN_SECS: u64 = 3600;
+
+/// 同一个工具错几次才建议变体。
+///
+/// 一次是手误，两次还可能撞上同一段输入，三次重复才是这条路本身走不通。
+// cap: bound — 三次：一次手误、两次同一个输入的重复都还说明不了路走不通
+const TOOL_ERROR_THRESHOLD: u32 = 3;
+
+/// 同一件事重复几次才合成一个 hook。
+///
+/// 与工具错误同一个数、同一个理由：合成的是一条会一直跑下去的路，比错误本身
+/// 更值得等一次重复。
+// cap: bound — 三次重复才合成 hook，与工具错误阈值同一条理由
+const HOOK_RECURRENCE_THRESHOLD: u32 = 3;
+
+/// 同一件事重复几次才生成一个代码变更。
+///
+/// 比 hook 多等两次：改动生产代码的代价比装一条 hook 高得多，而重复五次的
+/// 那件事不会在第四、第五次之间忽然消失。
+// cap: bound — 五次：代码变更比 hook 贵，多等两次重复
+const CHANGE_RECURRENCE_THRESHOLD: u32 = 5;
+
 /// Convenience builder that wires together all Phase-1 components.
 pub struct ReflectionEngine {
     pub detector: Arc<dyn LearningDetector>,
@@ -519,11 +546,11 @@ impl ReflectionEngine {
             evolution_cooldowns: Arc::new(
                 tokio::sync::Mutex::new(std::collections::HashMap::new()),
             ),
-            evolution_cooldown_secs: 3600,
+            evolution_cooldown_secs: EVOLUTION_COOLDOWN_SECS,
             tool_error_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-            tool_error_threshold: 3,
-            hook_recurrence_threshold: 3,
-            change_recurrence_threshold: 5,
+            tool_error_threshold: TOOL_ERROR_THRESHOLD,
+            hook_recurrence_threshold: HOOK_RECURRENCE_THRESHOLD,
+            change_recurrence_threshold: CHANGE_RECURRENCE_THRESHOLD,
             recurrence_readings,
         }
     }
@@ -613,11 +640,11 @@ impl ReflectionEngine {
             evolution_cooldowns: Arc::new(
                 tokio::sync::Mutex::new(std::collections::HashMap::new()),
             ),
-            evolution_cooldown_secs: 3600,
+            evolution_cooldown_secs: EVOLUTION_COOLDOWN_SECS,
             tool_error_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-            tool_error_threshold: 3,
-            hook_recurrence_threshold: 3,
-            change_recurrence_threshold: 5,
+            tool_error_threshold: TOOL_ERROR_THRESHOLD,
+            hook_recurrence_threshold: HOOK_RECURRENCE_THRESHOLD,
+            change_recurrence_threshold: CHANGE_RECURRENCE_THRESHOLD,
             recurrence_readings,
         }
     }
@@ -659,11 +686,11 @@ impl ReflectionEngine {
             evolution_cooldowns: Arc::new(
                 tokio::sync::Mutex::new(std::collections::HashMap::new()),
             ),
-            evolution_cooldown_secs: 3600,
+            evolution_cooldown_secs: EVOLUTION_COOLDOWN_SECS,
             tool_error_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-            tool_error_threshold: 3,
-            hook_recurrence_threshold: 3,
-            change_recurrence_threshold: 5,
+            tool_error_threshold: TOOL_ERROR_THRESHOLD,
+            hook_recurrence_threshold: HOOK_RECURRENCE_THRESHOLD,
+            change_recurrence_threshold: CHANGE_RECURRENCE_THRESHOLD,
             // Nothing publishes this handle: this constructor builds a store,
             // not the deployment's engine. The count is still recorded, so the
             // call sites are one shape rather than two.
@@ -704,11 +731,11 @@ impl ReflectionEngine {
             evolution_cooldowns: Arc::new(
                 tokio::sync::Mutex::new(std::collections::HashMap::new()),
             ),
-            evolution_cooldown_secs: 3600,
+            evolution_cooldown_secs: EVOLUTION_COOLDOWN_SECS,
             tool_error_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-            tool_error_threshold: 3,
-            hook_recurrence_threshold: 3,
-            change_recurrence_threshold: 5,
+            tool_error_threshold: TOOL_ERROR_THRESHOLD,
+            hook_recurrence_threshold: HOOK_RECURRENCE_THRESHOLD,
+            change_recurrence_threshold: CHANGE_RECURRENCE_THRESHOLD,
             recurrence_readings: Arc::new(
                 crate::learning_recurrence_readings::LearningRecurrenceReadings::new(),
             ),
@@ -1461,6 +1488,39 @@ impl cog_core::ReflectionEngine for ReflectionEngine {
 mod tests {
     use super::*;
     use cog_core::{Area, Learning, LearningCategory, LearningSource, Priority, SkillRegistry};
+
+    /// 四个构造入口共用的那组数只留一个声明。
+    ///
+    /// 它们不在 `impl Default` 里，也不在 `fn default_*` 里，所以 D5 那条门和
+    /// 容量登记表都看不见它们——四个 `new`/`with_*` 各写一遍 3600／3／3／5，
+    /// 改一份的那天，四个入口建出来的引擎就是四种行为。
+    #[test]
+    fn every_constructor_reads_one_set_of_engine_thresholds() {
+        let fields = [
+            "evolution_cooldown_secs",
+            "tool_error_threshold",
+            "hook_recurrence_threshold",
+            "change_recurrence_threshold",
+        ];
+        let inlined: Vec<String> = include_str!("lib.rs")
+            .lines()
+            .filter_map(|line| {
+                let (field, value) = line.split_once(':')?;
+                let field = field.trim();
+                if !fields.contains(&field) {
+                    return None;
+                }
+                let value = value.trim().trim_end_matches(',');
+                value
+                    .starts_with(|c: char| c.is_ascii_digit())
+                    .then(|| format!("{field}: {value}"))
+            })
+            .collect();
+        assert!(
+            inlined.is_empty(),
+            "构造入口又写死了一组阈值：{inlined:?}——它们只该读各自那条常量"
+        );
+    }
 
     #[tokio::test]
     async fn test_reflection_engine_processes_learning() {

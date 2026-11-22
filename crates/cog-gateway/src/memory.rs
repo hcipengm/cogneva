@@ -147,12 +147,8 @@ pub struct BatchIngestError {
 #[derive(Debug, Deserialize)]
 pub struct SchemaSearchQuery {
     pub query: String,
-    #[serde(default = "default_limit")]
+    /// Required: how many rows the caller wants is the caller's decision.
     pub limit: usize,
-}
-
-fn default_limit() -> usize {
-    10
 }
 
 #[derive(Debug, Serialize)]
@@ -172,12 +168,8 @@ pub struct SchemaResult {
 #[derive(Debug, Deserialize)]
 pub struct SummarySearchRequest {
     pub embedding: Vec<f32>,
-    #[serde(default = "default_top_k")]
+    /// Required: how many neighbours the caller wants is the caller's decision.
     pub top_k: usize,
-}
-
-fn default_top_k() -> usize {
-    5
 }
 
 #[derive(Debug, Serialize)]
@@ -190,7 +182,7 @@ pub struct UnifiedSearchRequest {
     pub query: String,
     #[serde(default)]
     pub embedding: Vec<f32>,
-    #[serde(default = "default_top_k")]
+    /// Required: how many neighbours the caller wants is the caller's decision.
     pub top_k: usize,
 }
 
@@ -332,14 +324,47 @@ pub async fn ingest_handler(
         }
     };
 
+    // 派生条目是这次学习请求的产物：写不进存储就等于没交付。原文已经归档
+    // （上面那一步真做成了），所以答复要说清做到了哪一步——不能拿 200 把两件事
+    // 一起盖过去，也不能报一个读的人照着查不到条数的 `schema_count`。
+    let mut stored = 0;
+    let mut first_error: Option<cog_core::SFError> = None;
     for entry in &schema {
-        if let Err(e) = backend.store_schema(&ns, entry).await {
-            tracing::warn!("Schema store failed: {}", e);
+        match backend.store_schema(&ns, entry).await {
+            Ok(()) => stored += 1,
+            Err(e) => {
+                tracing::warn!("Schema store failed: {}", e);
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
         }
+    }
+    if let Some(e) = first_error {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": format!(
+                    "原文已归档到 {raw_uri}，但 schema 条目只写进 {stored}/{} 条：{e}",
+                    schema.len()
+                ),
+            })),
+        )
+            .into_response();
     }
 
     if let Err(e) = backend.store_summary(&ns, &summary).await {
         tracing::warn!("Summary store failed: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": format!(
+                    "原文已归档到 {raw_uri}，schema 已写入 {} 条，但摘要没有写进存储：{e}",
+                    schema.len()
+                ),
+            })),
+        )
+            .into_response();
     }
 
     (
@@ -457,14 +482,40 @@ pub async fn batch_ingest_handler(
 
         let (schema_count, summary_id) = match ingested {
             Some((schema, summary)) => {
+                let mut stored = 0;
+                let mut first_error: Option<cog_core::SFError> = None;
                 for entry in &schema {
-                    if let Err(e) = backend.store_schema(&ns, entry).await {
-                        tracing::warn!("Schema store failed: {}", e);
+                    match backend.store_schema(&ns, entry).await {
+                        Ok(()) => stored += 1,
+                        Err(e) => {
+                            tracing::warn!("Schema store failed: {}", e);
+                            if first_error.is_none() {
+                                first_error = Some(e);
+                            }
+                        }
                     }
                 }
-
-                if let Err(e) = backend.store_summary(&ns, &summary).await {
-                    tracing::warn!("Summary store failed: {}", e);
+                // 与单条入口同一条判据：原文归档了，派生条目没写进去，这条就
+                // 不算处理完——它要出现在 `errors` 里，而不是带着一份查不到的
+                // 条数混进 `results`。
+                let store_error = match first_error {
+                    Some(e) => Some(format!(
+                        "原文已归档到 {raw_uri}，但 schema 条目只写进 {stored}/{} 条：{e}",
+                        schema.len()
+                    )),
+                    None => match backend.store_summary(&ns, &summary).await {
+                        Ok(()) => None,
+                        Err(e) => {
+                            tracing::warn!("Summary store failed: {}", e);
+                            Some(format!(
+                                "原文已归档到 {raw_uri}，schema 已写入 {stored} 条，但摘要没有写进存储：{e}"
+                            ))
+                        }
+                    },
+                };
+                if let Some(error) = store_error {
+                    errors.push(BatchIngestError { id: item.id, error });
+                    continue;
                 }
 
                 (schema.len(), Some(summary.id))
@@ -1021,7 +1072,7 @@ pub struct MetricsQuery {
 }
 
 fn default_seconds() -> u64 {
-    60
+    cog_core::day::SECONDS_PER_MINUTE as u64
 }
 
 #[derive(Debug, Serialize)]

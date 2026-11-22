@@ -167,11 +167,22 @@ pub struct RalphLoopConfig {
     pub stagnation_window: u32,
 }
 
+// 真正的刹车是停滞窗口；五十轮是它坏掉时的最后一道硬上限。实证里不收敛的链
+// 跑到 600+ 轮零通过——那种链在五十轮时已经在重放同一个失败，剩下的轮次只是
+// 烧 token。
+// cap: bound — 五十轮：不收敛的链五十轮时已在重放同一失败，再跑只是烧 token
+const RALPH_MAX_ITERATIONS: u32 = 50;
+
+// 五轮不买进展即判停滞：一轮反馈要落到下一轮的产出上，两三轮还看得出是在
+// 修，五轮都平就是在换着说法重复同一个失败。
+// cap: bound — 五轮：反馈落到产出的滞后期是两三轮，五轮都平就是在重复同一失败
+const RALPH_STAGNATION_WINDOW: u32 = 5;
+
 impl Default for RalphLoopConfig {
     fn default() -> Self {
         Self {
-            max_iterations: 50,
-            stagnation_window: 5,
+            max_iterations: RALPH_MAX_ITERATIONS,
+            stagnation_window: RALPH_STAGNATION_WINDOW,
         }
     }
 }
@@ -1435,6 +1446,38 @@ mod tests {
     use crate::squad::pge::types::{StopCause, StoppedProduct};
     use crate::squad::pge::{PgePipeline, PgePipelineConfig, PgeRoundtable, PgeRoundtableConfig};
     use std::sync::Arc;
+
+    /// 迭代上限与停滞窗口各只有一处声明：默认值读常量，常量上面写着它由什么钉住。
+    ///
+    /// 两面一起钉：运行时默认值等于常量（改常量就改默认值），源码面
+    /// `impl Default` 的字段里不再有数字（下一笔写回裸字面量就红）。
+    #[test]
+    fn the_ralph_default_reads_its_budget_and_window() {
+        let cfg = RalphLoopConfig::default();
+        assert_eq!(cfg.max_iterations, RALPH_MAX_ITERATIONS);
+        assert_eq!(cfg.stagnation_window, RALPH_STAGNATION_WINDOW);
+
+        let source = include_str!("ralph_loop.rs");
+        let body = source
+            .split("impl Default for RalphLoopConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.trim().starts_with(|c: char| c.is_ascii_digit())
+                })
+            })
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
+    }
 
     /// 分类提示词不替模型指定身份。
     ///

@@ -73,6 +73,20 @@ pub trait OrchestratorControl: Send + Sync {
     /// Return all tasks whose dependencies are satisfied and are ready to run.
     async fn get_ready_tasks(&self) -> Vec<Task>;
 
+    /// The same queue as [`Self::get_ready_tasks`], with a read that failed
+    /// reported as such.
+    ///
+    /// "Ready" is the one filter whose answer is a set the caller cannot check
+    /// against the rows it already has: the `ready` tab asks for the queue
+    /// itself, not a state, so an empty answer is exactly what a quiet queue
+    /// looks like. Folding a store failure into it turns a gateway that cannot
+    /// read the graph into a deployment with no work waiting. The default
+    /// folds [`Self::get_ready_tasks`], which is honest for an orchestrator
+    /// holding its graph in memory; one backed by a store has to override it.
+    async fn get_ready_tasks_checked(&self) -> SFResult<Vec<Task>> {
+        Ok(self.get_ready_tasks().await)
+    }
+
     /// Return every task currently in the graph.
     async fn get_all_tasks(&self) -> Vec<Task>;
 
@@ -113,6 +127,22 @@ pub trait OrchestratorControl: Send + Sync {
             .into_iter()
             .filter(|task| task.venue_label().is_some())
             .collect()
+    }
+
+    /// The same rows as [`Self::get_venue_tasks`], with a read that failed
+    /// reported as such.
+    ///
+    /// An empty venue board is a real state: nothing carried a label, so
+    /// nothing is waiting anywhere. [`Self::get_venue_tasks`] answers that same
+    /// shape for a store that is down, so a board built on it cannot tell "no
+    /// work anywhere" from "we could not read the graph" -- and the reader in
+    /// front of three zeroed columns has no way to ask.
+    ///
+    /// The default folds [`Self::get_venue_tasks`], which is honest for an
+    /// orchestrator holding its graph in memory: it has no store to fail at.
+    /// One backed by a store has to override this.
+    async fn get_venue_tasks_checked(&self) -> SFResult<Vec<Task>> {
+        Ok(self.get_venue_tasks().await)
     }
 
     /// 这个 workspace 里每条任务的计划基线。
@@ -261,6 +291,17 @@ pub trait OrchestratorControl: Send + Sync {
 
     /// Return the full task graph as (nodes, edges).
     async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>);
+
+    /// The same graph, with a read that failed reported as such.
+    ///
+    /// An empty pair draws exactly like a deployment that has not made a task
+    /// yet, so a store failure folded into it is invisible on the graph view.
+    /// The default folds [`Self::get_graph`], which is honest for an
+    /// orchestrator holding its graph in memory; one backed by a store has to
+    /// override it.
+    async fn get_graph_checked(&self) -> SFResult<(Vec<Task>, Vec<(String, String)>)> {
+        Ok(self.get_graph().await)
+    }
 
     /// Delete a task from the graph.
     async fn delete_task(&self, task_id: &str) -> SFResult<()>;
@@ -418,6 +459,14 @@ pub trait DagExecutor: Send + Sync {
     /// Tasks that are Pending or Scheduled with all deps completed.
     async fn get_ready_tasks(&self) -> Vec<Task>;
 
+    /// The same queue, with a read that failed reported as such. The reason is
+    /// [`OrchestratorControl::get_ready_tasks_checked`]'s: the `ready` filter
+    /// answers with a set of ids, and an empty set is what a quiet queue looks
+    /// like, so a failure folded into it is invisible to the reader.
+    async fn get_ready_tasks_checked(&self) -> SFResult<Vec<Task>> {
+        Ok(self.get_ready_tasks().await)
+    }
+
     /// All tasks currently in the graph.
     async fn get_all_tasks(&self) -> Vec<Task>;
 
@@ -448,6 +497,14 @@ pub trait DagExecutor: Send + Sync {
             .collect()
     }
 
+    /// The same rows as [`Self::get_venue_tasks`], with a read that failed
+    /// reported as such. The reason is
+    /// [`OrchestratorControl::get_venue_tasks_checked`]'s: an empty board is a
+    /// real state, and a failure folded into it is not.
+    async fn get_venue_tasks_checked(&self) -> SFResult<Vec<Task>> {
+        Ok(self.get_venue_tasks().await)
+    }
+
     /// Look up a single task by id.
     async fn get_task(&self, task_id: &str) -> Option<Task>;
 
@@ -459,6 +516,13 @@ pub trait DagExecutor: Send + Sync {
 
     /// Return the full task graph as (nodes, edges).
     async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>);
+
+    /// The same graph, with a read that failed reported as such. The reason is
+    /// [`OrchestratorControl::get_graph_checked`]'s: an empty node and edge set
+    /// draws like a graph nobody has written to yet.
+    async fn get_graph_checked(&self) -> SFResult<(Vec<Task>, Vec<(String, String)>)> {
+        Ok(self.get_graph().await)
+    }
 
     // ─── Bulk / utility ──────────────────────────────────────────────────
 

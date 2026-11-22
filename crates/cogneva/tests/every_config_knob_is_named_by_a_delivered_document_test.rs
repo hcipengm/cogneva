@@ -539,9 +539,15 @@ fn surfaces(root: &std::path::Path) -> (BTreeSet<String>, BTreeSet<String>, usiz
             if reader.section == "_comment" {
                 continue;
             }
-            let Some(section) = doc.get(reader.section) else {
-                continue;
-            };
+            // A section the document does not carry is still a section the
+            // reader type produces: asking the type what it can read does not
+            // depend on whether this one document happens to write it. Skipping
+            // absent sections made `produced` a function of the document, so an
+            // emptied-out section (`"hook_engine": {}`) fell out of the census
+            // and every knob in it stopped being checked — the empty object was
+            // there only to keep the gate looking at it.
+            let empty = serde_json::json!({});
+            let section = doc.get(reader.section).unwrap_or(&empty);
             let mut shapes = Vec::new();
             section_shapes(&graph, &file, &reader, section, reader.section, &mut shapes);
             for shape in shapes {

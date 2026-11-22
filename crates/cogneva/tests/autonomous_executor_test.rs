@@ -129,7 +129,6 @@ async fn build_test_state() -> Option<AutonomousTestState> {
             cors_origins: vec!["*".into()],
             websocket_timeout_secs: 30,
             websocket_inactivity_timeout_secs: 90,
-            websocket_tick_secs: 5,
             notification_limit: 50,
             request_timeout_secs: 30,
             notification_webhook_url: None,

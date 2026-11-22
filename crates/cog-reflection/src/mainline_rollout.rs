@@ -304,6 +304,16 @@ const DIAGNOSIS_EVENT_LIMIT: usize = 3;
 // cap: bound — 预算是给这一段留的宽裕上界；另一半从活的探针配置推，换探针时这个数不跟着变
 const CONTAINER_STARTUP_ALLOWANCE_SECS: u64 = 15;
 
+// k8s 探针 API 的三格默认值（initialDelaySeconds 的 0 是「没写」，不是一条约定）。
+// 它们写成具名常量而不是结构体字面量里的三个字面数：容量登记表认得出一个声明，
+// 认不出一个字面量，三个字面数因此一个判词都不欠也一个都没有。
+// cap: fixed — k8s 探针 API 的默认 periodSeconds=10：不写 period 时 kubelet 用它
+const K8S_PROBE_DEFAULT_PERIOD_SECS: u64 = 10;
+// cap: fixed — k8s 探针 API 的默认 timeoutSeconds=1：不写 timeout 时 kubelet 用它
+const K8S_PROBE_DEFAULT_DEADLINE_SECS: u64 = 1;
+// cap: fixed — k8s 探针 API 的默认 failureThreshold=3：不写阈值时 kubelet 连判三次才判死
+const K8S_PROBE_DEFAULT_FAILURES: u64 = 3;
+
 /// 就绪探针自己的四个旋钮。门禁的预算从这里推，不拍固定秒数：探针调周期，
 /// 预算跟着动；判据的宽度窄于 kubelet 自己的判定周期，就会重演「比探针更早
 /// 开枪、把一个正在起来的版本判死」。
@@ -321,9 +331,9 @@ impl ProbeCycle {
     /// 而 running 即 ready 的容器本来就不存在"探针还没通过"的窗口。
     pub(crate) const DEFAULT: Self = Self {
         initial_delay: 0,
-        period: 10,
-        timeout: 1,
-        failure_threshold: 3,
+        period: K8S_PROBE_DEFAULT_PERIOD_SECS,
+        timeout: K8S_PROBE_DEFAULT_DEADLINE_SECS,
+        failure_threshold: K8S_PROBE_DEFAULT_FAILURES,
     };
 
     /// 解析采样行 `initialDelay|period|timeout|failureThreshold`。逐格兜底：

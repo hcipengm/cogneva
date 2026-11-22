@@ -451,6 +451,7 @@ mod tests {
         footprint
     }
 
+    // proves: taskRouter.localClaimConcurrency
     /// 界必须跟着容器上限走：同一个足迹下把 `memory.max` 抬上去，导出值要跟着抬。
     ///
     /// 这就是那条原则的判据——改动前界是配置里的一个数，`memory.max` 怎么改它都不动。

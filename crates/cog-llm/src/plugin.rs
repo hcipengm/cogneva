@@ -85,8 +85,94 @@ impl cog_core::SystemPlugin for LlmPlugin {
 // Internal helpers (moved from cogneva::assembly::llm)
 // ---------------------------------------------------------------------------
 
+/// 内置模型卡里随提供方公布值走的那几个数：上下文窗口、单次输出上限、每百万
+/// token 的价格。
+#[derive(Clone, Copy)]
+struct ModelCard {
+    context_window: u32,
+    max_tokens: u32,
+    input: f64,
+    output: f64,
+    cache_read: f64,
+    cache_write: f64,
+}
+
+impl ModelCard {
+    /// 唯一把两张表拼成一张卡的地方：位置的对应只写在这里。
+    ///
+    /// 两张表分开是因为它们的类型不同（条数 vs 每百万 token 价），而登记面
+    /// 读的是表本身——写成一个结构体字面量，登记面按类型一眼认不出来，这些
+    /// 数就借「类型不是标量也不是数组」从登记表里溜走了。
+    fn from_parts(
+        [context_window, max_tokens]: [u32; 2],
+        [input, output, cache_read, cache_write]: [f64; 4],
+    ) -> Self {
+        Self {
+            context_window,
+            max_tokens,
+            input,
+            output,
+            cache_read,
+            cache_write,
+        }
+    }
+
+    fn cost(self) -> crate::ModelCost {
+        crate::ModelCost {
+            input: self.input,
+            output: self.output,
+            cache_read: self.cache_read,
+            cache_write: self.cache_write,
+        }
+    }
+}
+
+// 四张卡是提供方公布的事实，不是这台集群的旋钮：部署要换模型，就在配置里写
+// 自己的模型卡。写成表是为了让每个数带一张「从哪来」的标签——它们会随提供方
+// 改窗口、改价而变，改的时候该去对公布值，而不是在这里拍一个。
+//
+// 每张卡两张表：`_LIMITS` 是 [上下文窗口, 单次输出上限]，`_PRICE` 是 [输入,
+// 输出, 缓存读, 缓存写] 的每百万 token 价。
+
+// cap: fixed — 提供方公布的模型卡（窗口、输出上限），随公布值更新
+const OPENAI_LIMITS: [u32; 2] = [128_000, 4096];
+
+// cap: fixed — 提供方公布的每百万 token 价（输入/输出/缓存读/缓存写）
+const OPENAI_PRICE: [f64; 4] = [2.5, 10.0, 1.25, 0.0];
+
+// cap: fixed — 提供方公布的模型卡（窗口、输出上限），随公布值更新
+const ANTHROPIC_LIMITS: [u32; 2] = [200_000, cog_core::config::ANTHROPIC_OUTPUT_TOKEN_DEFAULT];
+
+// cap: fixed — 提供方公布的每百万 token 价（输入/输出/缓存读/缓存写）
+const ANTHROPIC_PRICE: [f64; 4] = [3.0, 15.0, 0.0, 0.0];
+
+// cap: fixed — 提供方公布的模型卡（窗口、输出上限），随公布值更新
+const GOOGLE_LIMITS: [u32; 2] = [1_000_000, 8192];
+
+// cap: fixed — 提供方公布的每百万 token 价（输入/输出/缓存读/缓存写）
+const GOOGLE_PRICE: [f64; 4] = [1.25, 10.0, 0.0, 0.0];
+
+// 本地跑的模型不收钱：价格那几格是 0，不是「没写」。
+//
+// cap: fixed — 提供方公布的模型卡（窗口、输出上限），随公布值更新
+const OLLAMA_LIMITS: [u32; 2] = [128_000, 4096];
+
+// cap: fixed — 提供方公布的每百万 token 价（输入/输出/缓存读/缓存写）
+const OLLAMA_PRICE: [f64; 4] = [0.0, 0.0, 0.0, 0.0];
+
+/// 四张卡按提供方取。`default_model_for` 只从这里拿数，卡上写数，函数里不写。
+fn built_in_card(provider: crate::Provider) -> ModelCard {
+    match provider {
+        crate::Provider::OpenAI => ModelCard::from_parts(OPENAI_LIMITS, OPENAI_PRICE),
+        crate::Provider::Anthropic => ModelCard::from_parts(ANTHROPIC_LIMITS, ANTHROPIC_PRICE),
+        crate::Provider::Google => ModelCard::from_parts(GOOGLE_LIMITS, GOOGLE_PRICE),
+        crate::Provider::Ollama => ModelCard::from_parts(OLLAMA_LIMITS, OLLAMA_PRICE),
+    }
+}
+
 pub fn default_model_for(provider: crate::Provider) -> crate::Model {
-    use crate::{ApiType, Model, ModelCost};
+    use crate::{ApiType, Model};
+    let card = built_in_card(provider);
     match provider {
         crate::Provider::OpenAI => Model {
             id: "gpt-4o".into(),
@@ -94,18 +180,13 @@ pub fn default_model_for(provider: crate::Provider) -> crate::Model {
             api: ApiType::OpenAICompletions,
             provider,
             base_url: "https://api.openai.com/v1".into(),
-            context_window: 128_000,
-            max_tokens: 4096,
+            context_window: card.context_window,
+            max_tokens: card.max_tokens,
             supports_tools: true,
             supports_streaming: true,
             supports_vision: true,
             supports_reasoning: false,
-            cost: ModelCost {
-                input: 2.5,
-                output: 10.0,
-                cache_read: 1.25,
-                cache_write: 0.0,
-            },
+            cost: card.cost(),
             headers: HashMap::new(),
         },
         crate::Provider::Anthropic => Model {
@@ -116,18 +197,13 @@ pub fn default_model_for(provider: crate::Provider) -> crate::Model {
             // 版本段在 base 里：`AnthropicProvider` 只往后接 `/messages`，
             // 少一段就是 `https://api.anthropic.com/messages`——那个地址不存在。
             base_url: "https://api.anthropic.com/v1".into(),
-            context_window: 200_000,
-            max_tokens: 4096,
+            context_window: card.context_window,
+            max_tokens: card.max_tokens,
             supports_tools: true,
             supports_streaming: true,
             supports_vision: true,
             supports_reasoning: true,
-            cost: ModelCost {
-                input: 3.0,
-                output: 15.0,
-                cache_read: 0.0,
-                cache_write: 0.0,
-            },
+            cost: card.cost(),
             headers: HashMap::new(),
         },
         crate::Provider::Google => Model {
@@ -136,18 +212,13 @@ pub fn default_model_for(provider: crate::Provider) -> crate::Model {
             api: ApiType::GoogleGenerativeAI,
             provider,
             base_url: "https://generativelanguage.googleapis.com/v1beta".into(),
-            context_window: 1_000_000,
-            max_tokens: 8192,
+            context_window: card.context_window,
+            max_tokens: card.max_tokens,
             supports_tools: true,
             supports_streaming: true,
             supports_vision: true,
             supports_reasoning: true,
-            cost: ModelCost {
-                input: 1.25,
-                output: 10.0,
-                cache_read: 0.0,
-                cache_write: 0.0,
-            },
+            cost: card.cost(),
             headers: HashMap::new(),
         },
         crate::Provider::Ollama => Model {
@@ -156,18 +227,13 @@ pub fn default_model_for(provider: crate::Provider) -> crate::Model {
             api: ApiType::OllamaChat,
             provider,
             base_url: "http://localhost:11434".into(),
-            context_window: 128_000,
-            max_tokens: 4096,
+            context_window: card.context_window,
+            max_tokens: card.max_tokens,
             supports_tools: true,
             supports_streaming: true,
             supports_vision: false,
             supports_reasoning: false,
-            cost: ModelCost {
-                input: 0.0,
-                output: 0.0,
-                cache_read: 0.0,
-                cache_write: 0.0,
-            },
+            cost: card.cost(),
             headers: HashMap::new(),
         },
     }
@@ -371,5 +437,55 @@ mod tests {
                 "style {style}"
             );
         }
+    }
+
+    /// 四张内置模型卡上的数只有一处声明：`default_model_for` 读卡，卡上才写数。
+    ///
+    /// 两个面一起钉——运行时每个字段都与卡相等（改卡就改模型），守的是「没有
+    /// 第二份」；源码面 `default_model_for` 里不再有任何数字字面量（改回裸写就
+    /// 红），守的是「下一笔别把数写回来」。
+    #[test]
+    fn every_built_in_model_reads_its_card() {
+        use crate::Provider;
+        for provider in [
+            Provider::OpenAI,
+            Provider::Anthropic,
+            Provider::Google,
+            Provider::Ollama,
+        ] {
+            let card = built_in_card(provider);
+            let model = default_model_for(provider);
+            assert_eq!(model.context_window, card.context_window, "{provider:?}");
+            assert_eq!(model.max_tokens, card.max_tokens, "{provider:?}");
+            assert_eq!(model.cost.input, card.input, "{provider:?}");
+            assert_eq!(model.cost.output, card.output, "{provider:?}");
+            assert_eq!(model.cost.cache_read, card.cache_read, "{provider:?}");
+            assert_eq!(model.cost.cache_write, card.cache_write, "{provider:?}");
+        }
+
+        let source = include_str!("plugin.rs");
+        let body = source
+            .split("pub fn default_model_for")
+            .nth(1)
+            .and_then(|rest| rest.split("\n#[cfg(test)]").next())
+            .expect("the helper is in this file");
+        let bare: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                ["context_window:", "max_tokens:", "input:", "output:"]
+                    .iter()
+                    .any(|field| {
+                        line.starts_with(field)
+                            && line[field.len()..]
+                                .trim()
+                                .starts_with(|c: char| c.is_ascii_digit())
+                    })
+            })
+            .collect();
+        assert!(
+            bare.is_empty(),
+            "内置模型卡的数字要写在卡上，由这里读：{bare:?}"
+        );
     }
 }

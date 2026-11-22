@@ -52,9 +52,12 @@ pub struct TaskRebalancerConfig {
 
 impl Default for TaskRebalancerConfig {
     fn default() -> Self {
+        // 这两个数是 core 声明的同一件事（交付文档也走那一份），这里再写一遍
+        // 只是第二处会走散的副本。
+        let core = cog_core::TaskRebalancerConfig::default();
         Self {
-            max_tasks_per_agent: 4,
-            max_assignments_per_pass: 32,
+            max_tasks_per_agent: core.max_tasks_per_agent,
+            max_assignments_per_pass: core.max_assignments_per_pass,
         }
     }
 }

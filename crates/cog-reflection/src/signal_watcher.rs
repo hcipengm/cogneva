@@ -112,21 +112,34 @@ pub struct SignalWatcherConfig {
     pub taste_channel_max_per_tick: usize,
 }
 
+/// 一拍最多处理几条信号：告警通道与口味通道问的是同一件事（一拍的处理时长要
+/// 短于下一拍到点），所以两处读同一个数——各写一个 5，改一处另一处不懂。
+// cap: bound — 由一拍的处理时长定：处理完这一批要早于下一拍到点
+const MAX_SIGNALS_PER_TICK: usize = 5;
+
+/// 同一类失败连着出现几次才算「重现」：一次是抖动，连着几次才是判据。
+// cap: bound — 由同类失败的到达率定：抖动会自己消失，真问题会连着来
+const FAILURE_RECURRENCE_THRESHOLD: usize = 3;
+
+/// 积压深到什么程度才值得报：它问的是「几拍排得完」，所以随一拍的吞吐走。
+// cap: bound — 由一拍排得动的条数定：积压超过几拍的量才报
+const BACKLOG_THRESHOLD: usize = 100;
+
 impl Default for SignalWatcherConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            poll_interval_secs: 300,
-            failure_recurrence_threshold: 3,
-            failure_window_secs: 3600,
-            backlog_threshold: 100,
-            report_cooldown_secs: 86_400,
-            self_audit_interval_secs: 7 * 86_400,
+            poll_interval_secs: (5 * cog_core::day::SECONDS_PER_MINUTE) as u64,
+            failure_recurrence_threshold: FAILURE_RECURRENCE_THRESHOLD,
+            failure_window_secs: cog_core::day::SECONDS_PER_HOUR,
+            backlog_threshold: BACKLOG_THRESHOLD,
+            report_cooldown_secs: cog_core::day::SECONDS_PER_DAY,
+            self_audit_interval_secs: cog_core::day::SECONDS_PER_WEEK,
             alert_channel_enabled: true,
-            alert_channel_max_per_tick: 5,
+            alert_channel_max_per_tick: MAX_SIGNALS_PER_TICK,
             alert_label_max_chars: cog_core::ALERT_LABEL_VALUE_MAX_CHARS,
             taste_channel_enabled: true,
-            taste_channel_max_per_tick: 5,
+            taste_channel_max_per_tick: MAX_SIGNALS_PER_TICK,
         }
     }
 }
@@ -3964,15 +3977,21 @@ mod tests {
     /// section is there, the code default when it is not — the resolution
     /// `SignalWatcherConfig::load` performs, reproduced rather than trusted.
     fn retention_and_wait(document: &serde_json::Value) -> (bool, u64, i64) {
-        let enabled = document["dag_executor"]["archive_enabled"]
-            .as_bool()
-            .expect("dag_executor.archive_enabled");
-        // 模板不写「等于代码默认值」的叶子（那一族门：默认值不进文档），所以
-        // 文档里没有这一项时读到的是**代码默认值**——`serde(default = ...)` 那一条
-        // 就是部署实际走的解析，这里照着复现，而不是自己猜一个数。
-        let retention = document["dag_executor"]["archive_after_secs"]
-            .as_u64()
-            .unwrap_or_else(|| cog_core::Config::default().dag_executor.archive_after_secs);
+        // 缺席就是默认：这两个叶子在 `DagExecutorConfig` 上带着 `#[serde(default)]`，
+        // 文档里不写时部署读到的就是代码默认值。把缺席当成错（`expect`）会在这份文档
+        // 不再抄默认值之后把门自己弄红——判据量的是「部署读到的那一对」，不是「文档里
+        // 写了几个数」。
+        let defaults = cog_core::Config::default().dag_executor;
+        let enabled = document
+            .pointer("/dag_executor/archive_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(defaults.archive_enabled);
+        // 没有写这个叶子就是「按内置值」，和 cooldown 一样：文档不再抄一遍
+        // 代码里已经有的数，读的人不能把「没写」当成缺字段。
+        let retention = document
+            .pointer("/dag_executor/archive_after_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(defaults.archive_after_secs);
         let wait = document
             .pointer("/self_evolution/signal_watcher/report_cooldown_secs")
             .and_then(|v| v.as_i64())
@@ -4449,5 +4468,41 @@ mod tests {
             picked.superseded.is_empty(),
             "超上限的那一条不是重复，下一轮还要读它"
         );
+    }
+
+    /// 两条通道的每拍上限是一件事：改常量两处一起动，源码里不再各写一个数。
+    #[test]
+    fn both_channels_share_one_per_tick_cap() {
+        let cfg = SignalWatcherConfig::default();
+        assert_eq!(cfg.alert_channel_max_per_tick, MAX_SIGNALS_PER_TICK);
+        assert_eq!(cfg.taste_channel_max_per_tick, MAX_SIGNALS_PER_TICK);
+
+        let source = include_str!("signal_watcher.rs");
+        let bare: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                (line.starts_with("alert_channel_max_per_tick:")
+                    || line.starts_with("taste_channel_max_per_tick:"))
+                    && line
+                        .split_once(':')
+                        .map(|(_, value)| {
+                            value.trim_start().starts_with(|c: char| c.is_ascii_digit())
+                        })
+                        .unwrap_or(false)
+            })
+            .collect();
+        assert!(bare.is_empty(), "每拍上限不该各写一个数：{bare:?}");
+    }
+
+    /// 其余具名常量也要真的被读到。
+    #[test]
+    fn the_watcher_reads_its_named_defaults() {
+        let cfg = SignalWatcherConfig::default();
+        assert_eq!(
+            cfg.failure_recurrence_threshold,
+            FAILURE_RECURRENCE_THRESHOLD
+        );
+        assert_eq!(cfg.backlog_threshold, BACKLOG_THRESHOLD);
     }
 }

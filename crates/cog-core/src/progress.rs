@@ -634,7 +634,28 @@ pub async fn watch_child(
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     for (is_stdout, reader) in readers {
-        let chunk = reader.await.unwrap_or_default();
+        let side = if is_stdout { "stdout" } else { "stderr" };
+        let chunk = match reader.await {
+            Ok(Ok(chunk)) => chunk,
+            // 判停之后管子是我们自己打断的：那一侧读到错是这次收场的预期形状，
+            // 不是一段没读到的输出（而且 `Stalled` 本来就不带输出）。
+            Ok(Err(_)) if stalled.is_some() => Vec::new(),
+            // 没判停却读出错：交回的这段输出是被截断的，而调用方会把它当作完整
+            // 结果去解析。说不出「读到哪儿断了」的一侧，不能报成一个正常的结尾。
+            Ok(Err(e)) => {
+                forget(id);
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("reading the child's {side} failed: {e}"),
+                ));
+            }
+            Err(join) => {
+                forget(id);
+                return Err(std::io::Error::other(format!(
+                    "the reader for the child's {side} did not finish: {join}"
+                )));
+            }
+        };
         if is_stdout {
             stdout = chunk;
         } else {
@@ -806,11 +827,16 @@ fn parent_pid(pid: u32) -> Option<u32> {
     fields.get(1)?.parse().ok()
 }
 
+/// 把一条管子读到尽头，同时记拍。
+///
+/// 两种结尾必须分开：读到 0 字节是**管子那头关了**，交回读到的东西；读出错是
+/// **这一段没读到**，把错误交给调用方。把后者折成前者，交回的是一段被截断的
+/// 输出，而调用方拿它当完整结果去解析——错的那一半不会出现在任何读面上。
 async fn read_beating<R>(
     reader: &mut R,
     id: &str,
     also: Option<&(dyn Fn() + Send + Sync)>,
-) -> Vec<u8>
+) -> std::io::Result<Vec<u8>>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -827,10 +853,10 @@ where
                 }
                 collected.extend_from_slice(&buf[..n]);
             }
-            Err(_) => break,
+            Err(e) => return Err(e),
         }
     }
-    collected
+    Ok(collected)
 }
 
 /// Test hook: record a beat that happened `age` ago.
@@ -860,6 +886,22 @@ pub fn seed_gaps_for_tests(gap: Duration, count: usize) {
     for _ in 0..count {
         g.push(gap);
     }
+}
+
+/// Test hook: plant a beat that happened `age` ago.
+///
+/// A judgement needs silence longer than the measured window, and the window is
+/// never narrower than [`crate::declared_wall::MIN_DISCERNIBLE_SILENCE`] — so a
+/// test that beats now and expects a stall would have to sleep two ticks first.
+/// Backdating the beacon says the same thing without the wait: this attempt last
+/// moved `age` ago.
+#[doc(hidden)]
+pub fn seed_beat_for_tests(task_id: &str, age: Duration) {
+    let when = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+    beacons()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(task_id.to_string(), when);
 }
 
 /// The one lock the test hooks below hand out.
@@ -1129,6 +1171,33 @@ mod tests {
         assert!(
             sample >= Duration::from_secs(2),
             "样本只有 {sample:?}，比那段 2.5 秒的静默短得多"
+        );
+    }
+
+    /// 读出错不是一个正常的结尾。
+    ///
+    /// 一条管子的读有两种结尾：读到 0 字节（那一头关了）与读出错（EIO 之类）。
+    /// 把后者折成前者，交回的是一段**被截断的输出**，而调用方就像拿到完整结果
+    /// 一样去解析它——错的那一半不会出现在任何读面上。判据落在「错误穿出来了」
+    /// 上，因为一段截断的输出与一段完整的输出在类型上是同一个东西。
+    #[tokio::test]
+    async fn a_failed_read_is_not_the_end_of_a_childs_output() {
+        struct Unreadable;
+        impl tokio::io::AsyncRead for Unreadable {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::other("pipe gave EIO")))
+            }
+        }
+        let err = read_beating(&mut Unreadable, "unreadable-child", None)
+            .await
+            .expect_err("读出错不是读到结尾：折成空输出会让调用方拿一段截断当完整");
+        assert!(
+            err.to_string().contains("EIO"),
+            "错误要带管子那一侧的原话: {err}"
         );
     }
 

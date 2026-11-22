@@ -313,10 +313,14 @@ impl HostFacts {
     }
 }
 
-/// The declaration fitted to this process's host, or as written when the host
-/// cannot be read.
-fn fit_to_host(t: Tuning) -> Tuning {
-    match HostFacts::read() {
+/// The declaration fitted to `host`, or as written when the host cannot be read.
+///
+/// The reading is an argument rather than taken here so the gate can keep the
+/// one reading its figures were fitted to: the labels published beside those
+/// figures describe *that* fit, and a second reading taken at publication time
+/// would answer about a fit that may never have happened (or one that did).
+fn fit_to_host(t: Tuning, host: Option<HostFacts>) -> Tuning {
+    match host {
         Some(host) => t.on_host(host),
         None => t,
     }
@@ -1734,6 +1738,42 @@ const SOURCE_CONFIGURED: &str = "configured";
 /// is the only thing that says which input the loop moved.
 const SOURCE_DERIVED: &str = "derived";
 
+/// This input describes a machine, and this process could not read the machine
+/// it is running on.
+///
+/// The other four words all answer "where did this number come from" about a
+/// host that was read. For the two inputs [`Tuning::on_host`] computes, that is
+/// the wrong question on a box that could not be read: the declared figure is in
+/// force not because it is the right one for this machine but because nobody
+/// asked the machine. Read as `calibrated` it says the opposite -- that this box
+/// was measured and this is what it gave -- and read as `configured` it says a
+/// person settled it, when a person may have set it and the box never got its
+/// say. [`fit_to_host`] falls back to the declaration in that case, which is the
+/// right number to run with; the label's whole job is that the fallback is
+/// visible, because "量不到" and "量到就是这个值" must not look alike.
+const SOURCE_UNMEASURED: &str = "unmeasured";
+
+/// Which model inputs [`Tuning::on_host`] computes from the host.
+///
+/// Found by fitting the shipped declaration to a host that can pay for nothing
+/// and taking whatever moves, rather than naming the two fields here: a list of
+/// names would be a second declaration of what `on_host` reads, and the two
+/// would drift the first time it governs a third input.
+fn host_shaped_inputs() -> Vec<&'static str> {
+    let nothing = HostFacts {
+        cores: 1,
+        mem_total_bytes: 0,
+    };
+    let shipped = model_inputs(&Tuning::shipped());
+    let starved = model_inputs(&Tuning::shipped().on_host(nothing));
+    shipped
+        .into_iter()
+        .zip(starved)
+        .filter(|((_, _, before), (_, _, after))| (before - after).abs() > f64::EPSILON)
+        .map(|((field, _, _), _)| field)
+        .collect()
+}
+
 /// The model inputs as series, one per input, labelled by which one it is and
 /// by where the value came from.
 ///
@@ -1764,6 +1804,14 @@ fn tuning_readings(
         )
         .with_label(crate::LABEL_ROLE, origin.role.to_string())
     };
+    // A host that could not be read leaves the declaration in force through
+    // `fit_to_host`, and for the inputs that are a reading of the machine that
+    // is a fact about the reading, not a fact about the number.
+    let unmeasured = if host.is_none() {
+        host_shaped_inputs()
+    } else {
+        Vec::new()
+    };
     model_inputs(t)
         .into_iter()
         .map(|(field, key, value)| {
@@ -1771,21 +1819,25 @@ fn tuning_readings(
             // this table to `Tuning`, and reading it as the shipped value is the
             // fail-safe direction: it says "unchanged" about a number the table
             // could not compare.
-            let source = match shipped.iter().find(|(f, _, _)| *f == field) {
-                // The measured divisor is neither of the other two: nobody
-                // chose it and it was not frozen at build time. It says which
-                // input the loop moved on its own, which is the one thing the
-                // other two words cannot say.
-                Some(_) if field == "build_peak_rss_bytes" && measured_peak.is_some() => {
-                    SOURCE_DERIVED
-                }
-                Some((_, _, s)) if (*s - value).abs() > f64::EPSILON => {
-                    match fitted.iter().find(|(f, _, _)| *f == field) {
-                        Some((_, _, f)) if (*f - value).abs() <= f64::EPSILON => SOURCE_FITTED,
-                        _ => SOURCE_CONFIGURED,
+            let source = if unmeasured.contains(&field) {
+                SOURCE_UNMEASURED
+            } else {
+                match shipped.iter().find(|(f, _, _)| *f == field) {
+                    // The measured divisor is neither of the other two: nobody
+                    // chose it and it was not frozen at build time. It says
+                    // which input the loop moved on its own, which is the one
+                    // thing the other two words cannot say.
+                    Some(_) if field == "build_peak_rss_bytes" && measured_peak.is_some() => {
+                        SOURCE_DERIVED
                     }
+                    Some((_, _, s)) if (*s - value).abs() > f64::EPSILON => {
+                        match fitted.iter().find(|(f, _, _)| *f == field) {
+                            Some((_, _, f)) if (*f - value).abs() <= f64::EPSILON => SOURCE_FITTED,
+                            _ => SOURCE_CONFIGURED,
+                        }
+                    }
+                    _ => SOURCE_CALIBRATED,
                 }
-                _ => SOURCE_CALIBRATED,
             };
             label(
                 RawMetric::new(BUILD_GATE_TUNING, value)
@@ -2452,6 +2504,13 @@ pub struct BuildGate {
     /// core count does not change while the process lives, so the pinned gate
     /// can derive the cargo width without taking a host sample of its own.
     host_cores: u64,
+    /// The host reading the tuning was fitted to, kept beside it.
+    ///
+    /// `None` is the reading that failed, and it must travel with the figures:
+    /// the published labels say whether each input was fitted to this box, and
+    /// re-reading the box at publication time would describe a fit that did not
+    /// happen rather than the one that produced the number in force.
+    host_facts: Option<HostFacts>,
     /// The cargo job width the latest window derived; 0 before any window.
     job_width: AtomicU64,
     /// Windows in which that width was recomputed.
@@ -2630,7 +2689,8 @@ impl BuildGate {
             installed = create_slot_dir(&dir).is_ok();
         }
         let wait = Duration::from_secs(cfg.wait_secs);
-        let host_cores = HostFacts::read().map(|host| host.cores).unwrap_or(0);
+        let host = HostFacts::read();
+        let host_cores = host.map(|host| host.cores).unwrap_or(0);
         let pacing = Arc::new(cog_core::pacing::PacingReadings::new());
         // The seed is the declared budget and nothing else: a gate that has
         // never made anybody wait has no measurement to overrule it with. The
@@ -2644,7 +2704,8 @@ impl BuildGate {
             pacing,
             installed,
             dir,
-            tuning: fit_to_host(Tuning::from_config(cfg)),
+            tuning: fit_to_host(Tuning::from_config(cfg), host),
+            host_facts: host,
             derived: AtomicU64::new(0),
             measured_ceiling: AtomicU64::new(0),
             host_cores,
@@ -4722,7 +4783,7 @@ impl Observable for BuildGate {
             &tuning,
             measured_peak,
             origin,
-            HostFacts::read(),
+            self.host_facts,
         ));
         // The wait budget's own loop, on the shared pacing series: its target,
         // whether that came from the declaration or from a measured wait, and
@@ -4906,8 +4967,9 @@ mod tests {
     /// 「有人选过」的读数，等于把一个人的判断读成一次测量。
     #[test]
     fn a_model_input_that_differs_from_the_shipped_one_names_itself_configured() {
+        // 挑一条不由机器算出来的输入：那两条归 `unmeasured` 管，见下一个测试。
         let cfg = BuildGateConfig {
-            build_demand_cores: 8.0,
+            cpu_calm_pct: 30.0,
             ..BuildGateConfig::default()
         };
         let tuned = Tuning::from_config(&cfg);
@@ -4916,27 +4978,91 @@ mod tests {
             role: BUILD_GATE_ROLE_BUILDER,
         };
         let series = tuning_readings(&tuned, None, origin, None);
-        let demand = series
+        let calm_chosen = series
             .iter()
-            .find(|m| {
-                m.labels.get(crate::LABEL_INPUT).map(String::as_str) == Some("build_demand_cores")
-            })
-            .expect("改过的 build_demand_cores 没有出现在这一族里");
-        assert_eq!(demand.value, 8.0);
+            .find(|m| m.labels.get(crate::LABEL_INPUT).map(String::as_str) == Some("cpu_calm_pct"))
+            .expect("改过的 cpu_calm_pct 没有出现在这一族里");
+        assert_eq!(calm_chosen.value, 30.0);
         assert_eq!(
-            demand.labels.get(crate::LABEL_SOURCE).map(String::as_str),
+            calm_chosen
+                .labels
+                .get(crate::LABEL_SOURCE)
+                .map(String::as_str),
             Some(SOURCE_CONFIGURED)
         );
         // 同一份读法下没被改过的那几条仍是标定值：整族都翻成 configured
         // 就等于这个标签什么都没说。
-        let calm = series
+        let untouched = series
             .iter()
-            .find(|m| m.labels.get(crate::LABEL_INPUT).map(String::as_str) == Some("cpu_calm_pct"))
-            .expect("cpu_calm_pct 没有出现在这一族里");
+            .find(|m| m.labels.get(crate::LABEL_INPUT).map(String::as_str) == Some("io_calm_pct"))
+            .expect("io_calm_pct 没有出现在这一族里");
         assert_eq!(
-            calm.labels.get(crate::LABEL_SOURCE).map(String::as_str),
+            untouched
+                .labels
+                .get(crate::LABEL_SOURCE)
+                .map(String::as_str),
             Some(SOURCE_CALIBRATED)
         );
+    }
+
+    /// 机器读不到时，那两条由机器算出来的输入必须自己说读不到：它们的声明值
+    /// 之所以在生效，不是因为它是这台机器的答案，而是因为没人问过这台机器。
+    ///
+    /// 读成 `calibrated` 说的是反话（这台机器量过，就是这个值），读成
+    /// `configured` 则把「没人问过机器」藏进「有人选过」里。
+    #[test]
+    fn an_input_computed_from_a_host_says_it_when_the_host_could_not_be_read() {
+        let origin = Origin {
+            dir: "d",
+            role: BUILD_GATE_ROLE_BUILDER,
+        };
+        let shaped = host_shaped_inputs();
+        assert_eq!(
+            shaped,
+            vec!["build_demand_cores", "mem_floor_bytes"],
+            "由机器算的输入就是这个集合；它若变了，是 `on_host` 变了"
+        );
+        // 读数带的是配置里的键（`mem_floor_mib`），上面那个集合是字段名
+        // （`mem_floor_bytes`）：翻译一次，别在两个坐标系之间比。
+        let shaped_keys: Vec<&str> = model_inputs(&Tuning::shipped())
+            .into_iter()
+            .filter(|(field, _, _)| shaped.contains(field))
+            .map(|(_, key, _)| key)
+            .collect();
+
+        let series = tuning_readings(&Tuning::shipped(), None, origin, None);
+        for metric in &series {
+            let input = metric.labels.get(crate::LABEL_INPUT).map(String::as_str);
+            let source = metric.labels.get(crate::LABEL_SOURCE).map(String::as_str);
+            let expected = if shaped_keys.contains(&input.unwrap_or_default()) {
+                SOURCE_UNMEASURED
+            } else {
+                SOURCE_CALIBRATED
+            };
+            assert_eq!(source, Some(expected), "{input:?} 的出处说错了");
+        }
+    }
+
+    /// 机器读得到时就没有「量不到」这回事：同一个词不能同时出现在两种情形里，
+    /// 否则它读起来和没有一样。
+    #[test]
+    fn a_host_that_was_read_never_reads_as_unmeasured() {
+        let origin = Origin {
+            dir: "d",
+            role: BUILD_GATE_ROLE_BUILDER,
+        };
+        let host = HostFacts {
+            cores: 4,
+            mem_total_bytes: 16u64 << 30,
+        };
+        let series = tuning_readings(&Tuning::shipped(), None, origin, Some(host));
+        for metric in &series {
+            assert_ne!(
+                metric.labels.get(crate::LABEL_SOURCE).map(String::as_str),
+                Some(SOURCE_UNMEASURED),
+                "机器读到了，就不该有一行说读不到"
+            );
+        }
     }
 
     /// 一次测量不换除数。一次构建要么只链了个二进制、要么吃了个冷缓存，
@@ -5146,6 +5272,8 @@ mod tests {
         }))
     }
 
+    // proves: changeVerification.cargoBuildJobs
+    // proves: mainlineDeployer.cargoBuildJobs
     /// 编译宽度是宿主核数与单构建需求的函数：同样的机器上需求变大，宽度变小；
     /// 机器变小，宽度也变小；宽度不会超过核数，也不会小于一；量不到时不出数，
     /// 由调用方落回声明——不猜一个宽度。
@@ -6052,6 +6180,7 @@ mod tests {
         assert!(excluding.held());
     }
 
+    // proves: evolution.buildGate.maxConcurrent
     /// Every dimension is a count of builds: what is left of it, divided by what
     /// one build demands. The tightest is the answer, and which one it was is
     /// part of the reading — a bound of one on a saturated disk is a different
@@ -7946,6 +8075,7 @@ unevictable 28532736
         drop(slot_copy);
     }
 
+    // proves: evolution.buildGate.waitSecs
     /// The wait budget is the tail of the waits that actually happened.
     ///
     /// The declared budget is 2s. A wait of 1.5s is recorded the way `acquire`

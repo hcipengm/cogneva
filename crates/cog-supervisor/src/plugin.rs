@@ -110,17 +110,17 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
         }
 
         // Snapshot config values to drop immutable borrow before publishing.
-        let (
-            supervisor_config,
-            _observability_event_channel_capacity,
-            alert_history_max,
-            dag_executor_workspace_id,
-        ) = {
+        // 告警环的深度从**解析后**的那一份取：配置里没写是 0，换回默认值这一步
+        // 在 `from_core` 里，绕过它去读原始字段就是把环建成零深。
+        let (supervisor_config, alert_history_max, dag_executor_workspace_id) = {
             let config = ctx.config();
-            (
+            let supervisor_config = crate::SupervisorConfig::from_core(
                 config.supervisor.clone(),
-                config.system.observability_event_channel_capacity,
-                config.supervisor.alert_history_max,
+                config.agent.heartbeat_interval_secs,
+            );
+            (
+                supervisor_config.clone(),
+                supervisor_config.alert_history_max,
                 config.dag_executor.workspace_id.clone(),
             )
         };
@@ -163,7 +163,7 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
 
         // ── Build supervisor ──
         let (supervisor_config_tx, supervisor_config_rx) =
-            tokio::sync::watch::channel(supervisor_config.clone().into());
+            tokio::sync::watch::channel(supervisor_config.clone());
 
         let scheduler_gate = Arc::new(crate::SchedulerGate::new());
 
@@ -175,7 +175,7 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
         let metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
 
         let mut supervisor = crate::Supervisor::new(
-            supervisor_config.into(),
+            supervisor_config,
             supervisor_registry.clone(),
             state_backend.clone(),
             supervisor_orchestrator,

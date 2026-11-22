@@ -47,8 +47,8 @@ pub struct Panel {
     ///
     /// Written here rather than recovered from the expression: the two tests
     /// that judge coverage run in both directions, and a parser that has to
-    /// understand PromQL to answer them would be a second implementation of
-    /// what the dashboard contract already carries.
+    /// understand PromQL to answer them would be a second PromQL reader next to
+    /// the one the alert-rule contract already uses.
     pub series: Vec<String>,
 }
 

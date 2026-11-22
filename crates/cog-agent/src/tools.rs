@@ -1445,9 +1445,13 @@ mod tests {
     /// metadata read, and the content read, answered off the path the tool
     /// asked for. The content read encodes the payload the same way the API
     /// does, so the tool's pass-through is exercised end to end.
-    #[derive(Debug)]
+    #[derive(Debug, Default)]
     struct MemoryApiStub {
         raws: Vec<cog_core::RawSource>,
+        /// 用例挑的坏回话：清单里省掉 `items`。
+        omit_listing_items: bool,
+        /// 用例挑的坏回话：元数据里省掉 `payload_length`。
+        omit_payload_length: bool,
     }
 
     #[async_trait::async_trait]
@@ -1468,6 +1472,15 @@ mod tests {
             let find = |id: &str| self.raws.iter().find(|r| r.id == id);
 
             let body = if path_only == "/api/v1/memory/raw" {
+                if self.omit_listing_items {
+                    return Ok(cog_core::HttpResponse {
+                        status: 200,
+                        headers: Default::default(),
+                        body: serde_json::json!({ "total": self.raws.len() })
+                            .to_string()
+                            .into_bytes(),
+                    });
+                }
                 let items: Vec<serde_json::Value> = self
                     .raws
                     .iter()
@@ -1508,12 +1521,18 @@ mod tests {
                 let Some(r) = find(id) else {
                     return Ok(not_found());
                 };
-                serde_json::json!({
+                let mut meta = serde_json::json!({
                     "id": r.id,
                     "content_type": r.content_type,
                     "payload_length": r.payload.len(),
                     "created_at": r.created_at,
-                })
+                });
+                if self.omit_payload_length {
+                    meta.as_object_mut()
+                        .expect("an object")
+                        .remove("payload_length");
+                }
+                meta
             } else {
                 return Ok(not_found());
             };
@@ -1607,7 +1626,23 @@ mod tests {
         raws: Vec<cog_core::RawSource>,
         metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
     ) -> ToolRegistry {
-        let client: Arc<dyn cog_core::HttpClient> = Arc::new(MemoryApiStub { raws });
+        memory_registry_for(
+            base,
+            MemoryApiStub {
+                raws,
+                ..Default::default()
+            },
+            metrics,
+        )
+    }
+
+    /// 同一份注册表，但由一个用例挑好的桩来答（省掉哪一格、回什么状态码）。
+    fn memory_registry_for(
+        base: Option<&str>,
+        stub: MemoryApiStub,
+        metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
+    ) -> ToolRegistry {
+        let client: Arc<dyn cog_core::HttpClient> = Arc::new(stub);
         let registry = ToolRegistry::new();
         cog_core::ToolRegistry::register(
             &registry,
@@ -1692,6 +1727,58 @@ mod tests {
                 "the error must name the unset base, got: {text}"
             );
         }
+    }
+
+    /// 清单缺了 `items`：这不是「这个命名空间里什么都没有」，是这份清单没读成。
+    /// 旧代码折成空表，调用方会照着一个空命名空间行事。
+    #[tokio::test]
+    async fn a_listing_without_items_is_not_an_empty_namespace() {
+        let registry = memory_registry_for(
+            Some("http://mem"),
+            MemoryApiStub {
+                raws: vec![raw_source("notes", "default", "text/plain", b"hello raw")],
+                omit_listing_items: true,
+                ..Default::default()
+            },
+            None,
+        );
+        let error = registry
+            .execute("raw_list", serde_json::json!({}))
+            .await
+            .expect_err("没有 items 不是空命名空间");
+        assert!(error.to_string().contains("items"), "{error}");
+    }
+
+    /// 反例：真的没有归档时，空数组是一份读到的答案。
+    #[tokio::test]
+    async fn a_listing_of_nothing_is_still_an_empty_listing() {
+        let registry = memory_registry(Some("http://mem"), Vec::new(), None);
+        let listed = registry
+            .execute("raw_list", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(listed["count"], 0);
+        assert_eq!(listed["items"], serde_json::json!([]));
+    }
+
+    /// 元数据没有 `payload_length`：名额无从判起。折成 0 会让预算整段失效——结果
+    /// 里写着「没超预算」，拿回来的是没有上限的一整段。
+    #[tokio::test]
+    async fn metadata_without_a_payload_length_does_not_disable_the_budget() {
+        let registry = memory_registry_for(
+            Some("http://mem"),
+            MemoryApiStub {
+                raws: vec![raw_source("notes", "default", "text/plain", b"hello raw")],
+                omit_payload_length: true,
+                ..Default::default()
+            },
+            None,
+        );
+        let error = registry
+            .execute("raw_fetch", serde_json::json!({"id": "notes", "budget": 3}))
+            .await
+            .expect_err("没有长度就判不了名额，不许当 0 长度读下去");
+        assert!(error.to_string().contains("payload_length"), "{error}");
     }
 
     /// The id is checked before it reaches the URL: an id carrying a separator
@@ -2605,16 +2692,6 @@ mod tests {
         }
         async fn fetch(&self, _manifest: &cog_core::PluginManifest) -> SFResult<Vec<u8>> {
             Ok(vec![])
-        }
-        async fn load(
-            &self,
-            _bytes: &[u8],
-            _manifest: &cog_core::PluginManifest,
-        ) -> SFResult<cog_core::PluginHandle> {
-            Err(cog_core::SFError::Agent("not loadable".into()))
-        }
-        async fn unload(&self, _handle: &cog_core::PluginHandle) -> SFResult<()> {
-            Ok(())
         }
         async fn fetch_by_id(&self, _plugin_id: &str) -> SFResult<Vec<u8>> {
             Ok(vec![])
@@ -5788,7 +5865,12 @@ pub mod builtins {
                         url.push_str(&query.join("&"));
                     }
                     let body = get_json(&client, &url).await?;
-                    let items = body["items"].as_array().cloned().unwrap_or_default();
+                    // `items` 就是这份清单本身。缺了它是这一份回话没读成，不是「这个
+                    // 命名空间里什么都没有」——折成空表，调用方会照着一个空命名空间
+                    // 行事，而真相是这份清单没读成。
+                    let items = body["items"].as_array().cloned().ok_or_else(|| {
+                        SFError::Agent(format!("memory API listing has no items array: {body}"))
+                    })?;
                     let mut out = serde_json::json!({
                         "namespace": DEFAULT_MEMORY_NAMESPACE,
                         "count": items.len(),
@@ -5870,7 +5952,11 @@ pub mod builtins {
                     let item_url =
                         format!("{base}{}", MEMORY_RAW_ITEM_PATH.replace("{id}", &segment));
                     let meta = get_json(&client, &item_url).await?;
-                    let payload_length = meta["payload_length"].as_u64().unwrap_or(0);
+                    // 没有 `payload_length`，名额就无从判起。折成 0 等于把调用方的预算
+                    // 整段关掉：结果里写着「没超预算」，而拿回来的是没有上限的一整段。
+                    let payload_length = meta["payload_length"].as_u64().ok_or_else(|| {
+                        SFError::Agent(format!("memory API metadata has no payload_length: {meta}"))
+                    })?;
                     if let Some(budget) = budget.filter(|budget| payload_length > *budget) {
                         // The budget did its job: hand back an outcome a caller
                         // cannot mistake for the bytes, and count it so the

@@ -20677,6 +20677,10 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
     #[async_trait::async_trait]
     impl cog_core::HierarchyManager for StubHierarchy {
+        fn default_limits(&self) -> cog_core::QuotaLimits {
+            unimplemented!("替身不问落回哪一对")
+        }
+
         async fn check(
             &self,
             ctx: &cog_core::QuotaContext,

@@ -92,6 +92,16 @@ pub trait CodePlatformProvider: Send + Sync {
         "platform"
     }
 
+    /// 列表端点会不会把第 101 条起截掉。
+    ///
+    /// 默认 `false`：只问一页的实现（以及测试替身）交出来的名单，条数撞上页长
+    /// 上限就可能是截断的，调用方不能把它当「全部还开着的」。翻页翻到不满一页
+    /// 为止的实现报 `true`——它的名单里装多少条都仍然是全部，按条数猜截断对它
+    /// 是错的（会让裁决回收在一个几百条意图的仓库上永远不跑）。
+    fn lists_every_page(&self) -> bool {
+        false
+    }
+
     /// List open issues from the configured repository.
     async fn list_open_issues(&self) -> Result<Vec<PlatformIssue>>;
 

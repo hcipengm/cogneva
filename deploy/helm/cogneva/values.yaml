@@ -48,7 +48,7 @@ resourceGovernance:
     # 下面四项是**策略**而不是投影：它们管的是"没有声明 resources 的容器按什么
     # 算"。上限（max）与单卷上限由投影给，因为它们必须 ≥ 渲染集里最大的那份声明，
     # 低了那份声明在准入就被拒——那不是"更安全"，是那句话根本进不来。
-    # tunable: derived
+    # tunable:
     # why: The CPU limit a container that declares none gets. It is one more call of the same law the
     # why: per-container targets already use, on the same beat: the namespace's measured container requests are
     # why: collapsed into one typical container (median request, p95 limit with the same headroom), clamped
@@ -62,7 +62,7 @@ resourceGovernance:
     # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=DEFAULT_CPU_METRIC label=source cadence=periodic
     # proof: file=crates/cog-reflection/src/workload_resources.rs test=the_namespace_default_follows_the_measured_requests beat=the_default_beat_counts_even_when_the_value_does_not_move evidence=defaults_evaluations
     defaultCpu: 500m
-    # tunable: derived
+    # tunable:
     # why: The memory limit for the same containers: the same call of the same law (p95 over the window with
     # why: the configured headroom, quantized up), clamped into the LimitRange's admitted range and written
     # why: back with the full `spec.limits` array. Published per limitRange with its `source` and the
@@ -70,7 +70,7 @@ resourceGovernance:
     # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=DEFAULT_MEMORY_METRIC label=source cadence=periodic
     # proof: file=crates/cog-reflection/src/workload_resources.rs test=the_namespace_default_follows_the_measured_requests beat=the_default_beat_counts_even_when_the_value_does_not_move evidence=defaults_evaluations
     defaultMemory: 512Mi
-    # tunable: derived
+    # tunable:
     # why: The CPU request a container that declares none gets: the median of the namespace's measured
     # why: container requests, clamped into the LimitRange's admitted [min,max] with the limit kept at or above
     # why: it (a request above its limit is rejected at admission). Written back with the full `spec.limits`
@@ -78,14 +78,14 @@ resourceGovernance:
     # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=DEFAULT_REQUEST_CPU_METRIC label=source cadence=periodic
     # proof: file=crates/cog-reflection/src/workload_resources.rs test=the_namespace_default_follows_the_measured_requests beat=the_default_beat_counts_even_when_the_value_does_not_move evidence=defaults_evaluations
     defaultRequestCpu: 50m
-    # tunable: derived
+    # tunable:
     # why: The memory request for the same containers: the same median, quantized up to the loop's memory grid,
     # why: clamped into the LimitRange's admitted range with the limit at or above it, written back with the
     # why: full `spec.limits` array and published per limitRange with its `source`.
     # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=DEFAULT_REQUEST_MEMORY_METRIC label=source cadence=periodic
     # proof: file=crates/cog-reflection/src/workload_resources.rs test=the_namespace_default_follows_the_measured_requests beat=the_default_beat_counts_even_when_the_value_does_not_move evidence=defaults_evaluations
     defaultRequestMemory: 64Mi
-    # tunable: fixed
+    # tunable:
     # why: The admission floor for one container's CPU. It is the resource loop's own quantization grid
     # why: (`CPU_QUANTUM_MILLICORES`, 10m): the loop never writes a request below one quantum, so a floor at
     # why: that quantum refuses exactly what the loop cannot express. A different floor would be an admission
@@ -93,12 +93,12 @@ resourceGovernance:
     # why: could name.
     minCpu: 10m
     # tunable: fixed
-    # why: The admission floor for one container's memory: the same quantum (`MEMORY_QUANTUM_BYTES`, 16Mi) the（默认）
+    # why: The admission floor for one container's memory: the same quantum (`MEMORY_QUANTUM_BYTES`, 16Mi by default) the
     # why: resource loop rounds to, for the same reason as the CPU floor.
     minMemory: 16Mi
-    # tunable: fixed
+    # tunable:
     # why: The smallest PVC the namespace admits. It is the volume loop's own grid: `volume_capacity.rs` rounds
-    # why: a grown claim up to whole GiB, so a floor of 1Gi refuses exactly the claims that loop cannot（默认）
+    # why: a grown claim up to whole GiB, so a floor at that grid refuses exactly the claims that loop cannot
     # why: express. Nothing measures it, and nothing should: it is the scale at which the only writer of
     # why: storage requests works.
     pvcMinStorage: 1Gi
@@ -117,7 +117,7 @@ appData:
   # 卷不强制 requests.storage，声明与实际之间没有对账机制；应用自己把实测
   # 占用发成 cogneva_data_volume_used_bytes，由规则 data_volume_over_declared_size
   # 比对，这是唯一能发现声明写小的观测面。
-  # tunable: derived
+  # tunable:
   # why: The declaration the install starts from. The volume-capacity loop walks the claim, compares the peak
   # why: of `cogneva_data_volume_used_bytes` over its recent rounds against this request with the same
   # why: headroom the chart's declarations are sized by, and patches the claim up to it when the peak no
@@ -170,7 +170,7 @@ backup:
   # 运维约定，就该由这里定，不该被"这台机器现在几点"改写。
   timeZone: "Etc/UTC"
   # 保留最新 N 份，更老的落盘即删。
-  # tunable: derived
+  # tunable:
   # why: How many packages the volume keeps. Every backup run recomputes it from the volume's capacity
   # why: (statvfs) divided by the measured sizes of the packages already on it, newest first; the newest
   # why: package is kept even when it alone exceeds the volume. The declared 7 is only the seed for a run
@@ -186,7 +186,7 @@ backup:
   # （`backup_runs.run_deadline_seconds`），让「这一行没人收尾」有一个可判的时刻——
   # 一行开着的记录如果有人被杀，只有它自己被开出来时的那个数判得了。
   # 一小时的界比实测的几十秒高一个数量级，落在里面的是正常运行。
-  # tunable: fixed
+  # tunable:
   # why: A bookkeeping horizon, not a bound on anything: the container's liveness is judged by its progress
   # why: probe, and this number is written into the row it opens so a row left open by a killed run can later
   # why: be concluded abandoned. Each row carries the number it was opened under, so a conclusion about
@@ -198,7 +198,7 @@ backup:
   # 一个周期错过了多久还算数（秒）：控制器在错过起点后这段时间内仍会补跑一次，
   # 更早就直接放弃。两个 CronJob 读同一个数——它们错过的原因是同一类（节点忙、
   # Pod 排不上、前一次还没结束），一边宽一边窄只会让两种作业的漏跑时机不同。
-  # tunable: fixed
+  # tunable:
   # why: The Job controller's missed-schedule window: how late a scheduled run may still be started before
   # why: the controller records a miss. It is the cluster's own scheduling contract, and an operand of the
   # why: same static 26-hour alert bound as the schedule and the run deadline. The controller does not record
@@ -206,7 +206,7 @@ backup:
   startingDeadlineSeconds: 1800
   # 留几份成功 / 失败的 Job 供翻现场：失败的多留一份，连挂两晚才看得出是不是
   # 同一个原因，只留一份时第二晚的诊断对象已经被回收。
-  # tunable: fixed
+  # tunable:
   # why: How many finished Job objects stay for inspection. This is a diagnostic agreement, not a size: no
   # why: process in the platform reads a past backup Job -- a run's durable account is its `backup_runs` row,
   # why: and a package's evidence is the file on the volume plus the package index -- so a loop over "who
@@ -214,7 +214,7 @@ backup:
   # why: successes are kept because comparing the two most recent runs is the diagnosis the objects exist
   # why: for, and a success is the baseline a failure is compared against.
   successfulJobsHistoryLimit: 2
-  # tunable: fixed
+  # tunable:
   # why: The same inspection surface for failures, one higher than the successes: two consecutive failed
   # why: nights must both remain, with the last successful run beside them, so a repeat failure can be told
   # why: apart from a new one. No process reads these objects; the `backup_runs` ledger and the package index
@@ -223,13 +223,13 @@ backup:
   failedJobsHistoryLimit: 3
   # 失败重试几次：备份一次（下一晚自然再来，连着重试只会在同一个原因上撞几次），
   # 演练零次（答案已经落进 backup_drills 了，重试没有新信息）。
-  # tunable: fixed
+  # tunable:
   # why: The Job controller's retry contract for a daily run: one retry of the same scheduled run, never a
   # why: retry string that would push into the next day's schedule. concurrencyPolicy: Forbid already makes a
   # why: second run wait for the first, and a retry is the same run repeating with the same inputs; the
   # why: ledger records outcomes, not attempts, so there is no retry rate to derive it from.
   backoffLimit: 1
-  # tunable: fixed
+  # tunable:
   # why: Zero: a failed drill has already written its answer to backup_drills, and retrying the same package
   # why: against the same inputs cannot change the verdict. The controller contract is "attempt once"; there
   # why: is nothing measured to move it.
@@ -239,7 +239,7 @@ backup:
   # 写在 values 里才有判词（判词只挂在数值叶子上，非数值行不被枚举）。
   resources:
     requests:
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
       # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -249,10 +249,10 @@ backup:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 100m
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -260,7 +260,7 @@ backup:
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 64Mi
     limits:
-      # tunable: derived
+      # tunable:
       # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
       # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
       # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
@@ -270,9 +270,9 @@ backup:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 1000m
-      # tunable: derived
+      # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -281,7 +281,7 @@ backup:
       memory: 1Gi
   drillResources:
     requests:
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
       # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -292,10 +292,10 @@ backup:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 100m
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The drill CronJob's pods are resolved through the Jobs it creates, so the loop measures and
       # why: patches the Job template. The reading published under this key carries `source=derived` once the
       # why: window has enough samples, and `source=seed` with the declared value before that, so a reader can
@@ -304,7 +304,7 @@ backup:
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 64Mi
     limits:
-      # tunable: derived
+      # tunable:
       # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
       # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
       # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
@@ -315,9 +315,9 @@ backup:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 1000m
-      # tunable: derived
+      # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The drill CronJob's pods are resolved through the Jobs it creates, so the loop measures and
       # why: patches the Job template. The reading published under this key carries `source=derived` once the
       # why: window has enough samples, and `source=seed` with the declared value before that, so a reader can
@@ -325,7 +325,7 @@ backup:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_MEMORY_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 1Gi
-  # tunable: derived
+  # tunable:
   # why: The backup volume. Keep count times package size is the flow into it, and the loop does not assume
   # why: either: it reads the claim's used bytes from the walker and raises the declaration to the measured
   # why: peak x 120% (whole GiB). A shrinking keep count never shrinks the claim -- PVCs cannot shrink -- so
@@ -419,7 +419,7 @@ shutdown:
   # 它是一个 policy 而不是实测值：宽限期的两种代价——等一趟滚动、打断一个在飞的
   # 调用——是同一个事件的两侧，所以没有可搜索的最优；读数（排空耗时直方图与
   # 被打断的尝试数）的作用是证伪它，不是算出它。判据就是本行紧下方那块 `# tunable:`。
-  # tunable: fixed
+  # tunable:
   # why: The one number in the shutdown face: how long kubelet waits after SIGTERM before it kills the
   # why: process. Both workloads that run agent turns take it, and the process's drain budget is computed
   # why: from it rather than pinned beside it (`grace - shutdown.drainTeardownMarginMs`), so raising it is
@@ -441,7 +441,7 @@ shutdown:
   # 宽限期里留给收尾的那一段（毫秒）：日志刷盘、tokio 运行时退出、kubelet 观测到
   # 进程消失。它不是一个可以调的旋钮——收尾的成本不随排空耗时变——所以是 fixed，
   # 理由写在本行紧下方那块 `# tunable:` 里。排空预算 = 宽限期 - 它。
-  # tunable: fixed
+  # tunable:
   # why: The part of the grace that is not the drain: flushing logs, letting the tokio runtime unwind, and
   # why: the window between the process exiting and kubelet seeing it. It is not a dial -- the cost of
   # why: stopping does not move with how long the drain took -- and it is subtracted from the grace to give
@@ -455,7 +455,7 @@ gateway:
   # 种子：运行时副本数跟着集群就绪节点数走（一节点一个、多节点两个——两个是
   # 「任意一台可以不见」的最小集合，再多只是同一份凭证多存几份）。这个数只在
   # 回路第一次读到节点数之前生效，之后由 `cogneva_workload_replicas` 发布实际值。
-  # tunable: derived
+  # tunable:
   # why: Replicas are the number of failure domains that can be lost: one Ready node gets one replica, two or
   # why: more get two. Two is the smallest set that survives any single node going away, and a third copy on
   # why: a third node buys no new failure domain -- only another copy of the credential material. The
@@ -473,31 +473,31 @@ gateway:
   # NOTES.txt 里的 port-forward。改一个端口要手工改七处，漏一处只在真流量上现形
   # ——Service 与容器端口不一致时 Endpoints 照建、连接全被拒，读起来像"进程挂了"。
   # 现在只有这一份，模板与 JSON 都从它取。
-  # tunable: fixed
+  # tunable:
   # why: The app's main HTTP port. An address: the Service, the ingress backend, the network policy, the
   # why: port-forward note and the process's own cogneva.json all carry it.
   httpPort: 8080
   # WebSocket 面：WebUI 的长连接。与 httpPort 分开是为了让 ingress 能只把长连接
   # 那条路单独放行/加超时。
-  # tunable: fixed
+  # tunable:
   # why: The WebSocket face. An address, kept apart from httpPort so the ingress can give long connections
   # why: their own timeout.
   wsPort: 8081
   # 零凭证的集群内面：只挂 memory 的工具输出归档与 Raw 读。它与 httpPort 分开不是
   # 为了换路径，是为了换判据——主 API 的 memory 路由按角色判，跑 squad 的 Pod 零
   # 凭证恒吃 401，所以判据改成"按网络事实"，挂在网络策略上。0＝不开这个监听。
-  # tunable: fixed
+  # tunable:
   # why: The zero-credential in-cluster face (memory archive writes and Raw reads). An address: what makes it
   # why: a separate face is the network policy that decides who may reach it, not the number.
   internalPort: 8085
   # 平台 webhook 的转发入口：安全网关验签之后才递进来，因此它自己不再判签名。
-  # tunable: fixed
+  # tunable:
   # why: The webhook forward entry the security gateway hands verified platform events to. An address.
   webhookPort: 9091
   # 进程被告知的指标端口（cogneva.json 的 gateway.metrics_port，经 configmap 的
   # COGNEVA_METRICS_PORT 注入同一份配置）。抓取侧走 httpPort 的 /metrics，所以
   # 这两个数必须同源：改一处而漏另一处，只会让两边各说一半。
-  # tunable: fixed
+  # tunable:
   # why: The port the process is told to expose metrics on, through the env layer and cogneva.json. An
   # why: address; the scrape itself goes to httpPort/metrics, which is why the two must be read from one
   # why: file.
@@ -527,7 +527,7 @@ gateway:
   # 空间 requests 合计约等于稳态之和，仍在节点可分配量与配额之内（见投影产物）。
   resources:
     requests:
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
       # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -537,10 +537,10 @@ gateway:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 500m
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -548,7 +548,7 @@ gateway:
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 6Gi
     limits:
-      # tunable: derived
+      # tunable:
       # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
       # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
       # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
@@ -558,9 +558,9 @@ gateway:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 4000m
-      # tunable: derived
+      # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -584,7 +584,7 @@ securityGateway:
   enabled: true
   # 种子：与主应用同一条副本律（就绪节点数，一到二）。运行时的值由
   # `cogneva_workload_replicas` 发布。
-  # tunable: derived
+  # tunable:
   # why: The same failure-domain law as the main gateway: one Ready node gets one replica, two or more get
   # why: two, and the security gateway carries `cogneva.io/replica-policy: topology` so the
   # why: workload-resources loop patches it from the live node count. The seed applies only until the first
@@ -601,7 +601,7 @@ securityGateway:
   # 症状都是「凭证代持面不可达」，而它读起来像上游平台挂了。
   #
   # 出站代理（名称 egress-proxy）：git 传输与平台 API 透传走它。
-  # tunable: fixed
+  # tunable:
   # why: The gateway's egress proxy (container port name egress-proxy): git transport and platform API
   # why: passthrough. An address, and a listened-on one: the process takes it from COGNEVA_SG_EGRESS_PORT, so
   # why: the chart passes that env from this same key -- without it a moved value would move the Service and
@@ -609,13 +609,13 @@ securityGateway:
   egressProxyPort: 8080
   # LLM 代理（名称 llm-proxy）：全部上游模型调用与 /github、/gitee、/git、
   # /search-fallback 这些透传路由都在这个端口上——业务侧那九个 URL 写的就是它。
-  # tunable: fixed
+  # tunable:
   # why: The gateway's LLM proxy (container port name llm-proxy), which also carries the /github, /gitee,
   # why: /git and /search-fallback routes. An address, written into nine base URLs across the app and
   # why: evolution pods, and the port the process itself binds (COGNEVA_SG_LLM_PORT, passed from here).
   llmProxyPort: 8081
   # 平台 webhook 入口（名称 webhook）：GitHub/Gitee 回调进来先在这里验签。
-  # tunable: fixed
+  # tunable:
   # why: The gateway's platform webhook entry (container port name webhook), where GitHub and Gitee
   # why: signatures are verified before anything is forwarded. An address, and the port the process binds
   # why: (COGNEVA_SG_WEBHOOK_PORT, passed from here).
@@ -625,7 +625,7 @@ securityGateway:
   # 的直接下游；request 按常驻实耗给，limit 留突发余量。
   resources:
     requests:
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
       # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -635,10 +635,10 @@ securityGateway:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 100m
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -646,7 +646,7 @@ securityGateway:
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 128Mi
     limits:
-      # tunable: derived
+      # tunable:
       # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
       # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
       # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
@@ -656,9 +656,9 @@ securityGateway:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 500m
-      # tunable: derived
+      # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -668,7 +668,7 @@ securityGateway:
   # 观测通道端口：只挂 /health/* 与 /metrics，不含任何代理路由。与 8080/8081
   # 分列的原因是那两条通道会注入真实上游凭证，跨命名空间放行等于把凭证代持
   # 能力交给监控侧；观测通道没有代理面，可以只对它放行监控命名空间。
-  # tunable: fixed
+  # tunable:
   # why: The observability channel's port, deliberately separate from the proxy ports because those inject
   # why: upstream credentials. An address.
   metricsPort: 9090
@@ -681,7 +681,7 @@ securityGateway:
   # credentials, and only this port has both. A port of its own rather than folded into
   # 8080/8081: those two are reachable by any pod in the namespace, while this channel's
   # whole value is its small reachable set.
-  # tunable: fixed
+  # tunable:
   # why: The audited channel's own port, separate from 8080/8081 because its whole value is a small reachable
   # why: set. An address.
   auditedLlmPort: 8083
@@ -690,7 +690,7 @@ securityGateway:
   # document text may leave in one request, not a throughput figure. Deliberately not
   # shared with the document write bound: that one limits bytes written to disk
   # (storage), this one limits text entering a model (context).
-  # tunable: fixed
+  # tunable:
   # why: How much document text may leave in one request through the audited channel. Eight MiB is the HTTP
   # why: body convention, and it is deliberately not tied to the document write bound: that one limits bytes
   # why: written to disk, this one limits text entering a model.
@@ -709,7 +709,7 @@ securityGateway:
     # resource-policy: keep 的卷——内容全部可从一个外部真相源（GitHub）重建，
     # 标了 keep 只会在反复重装时堆出无主的陈旧镜像。5Gi 对 cogneva 仓库
     # （含历史与 LFS 外的全部对象）绰绰有余。
-    # tunable: derived
+    # tunable:
     # why: The mirror volume, rebuildable from upstream, so the volume is not a durability question but a
     # why: capacity one. The loop reads its peak from the claim-store walker and raises the declaration when
     # why: peak x 120% no longer fits.
@@ -723,7 +723,7 @@ securityGateway:
     #   timeoutSecs —— 单次 clone/fetch/push 的总上限，地板 60。防的是"一直在吐
     #                  进度却永远不结束"——那种形态静默判据永远不触发。
     # 默认值来自实测：本链路一次完整镜像克隆约 97 秒。
-    # tunable: derived
+    # tunable:
     # why: How long the SSH fallback may produce no output before the transfer is declared dead. The window
     # why: starts at the seed, floored by a structural minimum, and each successful transfer feeds its longest
     # why: measured silence back through a tail window: a link that talks in bursts widens the next window, so
@@ -731,7 +731,7 @@ securityGateway:
     # published: owner=crates/cog-gateway/src/git_mirror.rs file=crates/cog-core/src/pacing.rs metric=TARGET_METRIC label=source cadence=periodic
     # proof: file=crates/cog-gateway/src/git_mirror.rs test=a_measured_silence_widens_the_window_the_next_transfer_is_judged_by beat=a_measured_silence_widens_the_window_the_next_transfer_is_judged_by evidence=evaluations
     stallSecs: 180
-    # tunable: derived
+    # tunable:
     # why: The total bound on one clone/fetch/push, for the case that keeps emitting progress and never
     # why: finishes. The expectation follows the measured total duration of successful transfers (tail times
     # why: factor) from the seed, so it moves with the repository and the link instead of with a human reading
@@ -794,7 +794,7 @@ observability:
   # cogneva_observability_events_over_capacity 置 1。maxRows 置 0 = 本部署不清理。
   eventLog:
     # 行数上限。约三天常规量、一天半最坏量。
-    # tunable: derived
+    # tunable:
     # why: Rows the observability event log may hold. The sweep measures the table's held rows and bytes on
     # why: every pass and divides the table's share of the declared database volume by the measured bytes per
     # why: row; both directions move the answer without a restart -- a wider row buys fewer rows, a larger
@@ -806,7 +806,7 @@ observability:
     # proof: file=crates/cog-storage/src/observability_event_cap.rs test=a_beat_whose_target_does_not_move_still_counts beat=a_beat_whose_target_does_not_move_still_counts evidence=evaluations
     maxRows: 1000000
     # 不许删的时间窗（秒），与历史事件查询的默认窗口同值。
-    # tunable: derived
+    # tunable:
     # why: The window inside which no row may be deleted, whatever the capacity says. Not a second retention
     # why: knob: it is the floor, and it follows the widest span a historical query actually asked for -- the
     # why: gateway records each answered span, and the sweep recomputes the floor on its next pass. It can only
@@ -831,15 +831,16 @@ observability:
 # 地板」强。超了就是超了（cogneva_checkpoints_over_capacity=1），由人决定抬声明、退役
 # 已结束任务的板、还是不再声明容量。
 checkpointStore:
-  # 容量的部署声明（不是删除阈值）。2026-10-27 活着的那部分是 14842 行，四万行给它留了
-  # 翻几倍的空间。读数里的 target 每拍按卷容量与实测每行字节重算，这个数在卷没声明时顶着。
-  # tunable: derived
-  # why: Rows the checkpoint store is DECLARED to hold; nothing deletes past it. The loop measures held rows,
-  # why: bytes and this target on every pass and publishes whether the first exceeds them -- the target itself
-  # why: is divided out of the declared database volume by the measured bytes per row, so a larger volume buys
-  # why: more rows and a wider snapshot buys fewer, without a restart. The declared forty thousand is the seed
-  # why: while the volume is not declared. The evaluations counter is what separates "nothing to do" from "the
-  # why: loop stopped", and the verdict is a decision point rather than a fault.
+  # 行数上限的部署声明。2026-10-27 活着的那部分是 14842 行，四万行给它留了翻几倍
+  # 的空间，同时远低于当时表里的 54452 行，所以眼下这个界卡住的是残物。生效值每拍
+  # 按卷容量与实测每行字节重算，这个数在量到之前顶着。
+  # tunable:
+  # why: Rows the checkpoint store may hold. The sweep measures the table's held rows and bytes on every pass
+  # why: and divides the table's share of the declared database volume by the measured bytes per row; a wider
+  # why: snapshot buys fewer rows, a larger declared volume buys more, and both follow the next pass without
+  # why: a restart. The declared forty thousand is the seed while the table is empty or the volume is not
+  # why: declared. The published target carries `source`, and the evaluations counter is what separates
+  # why: "nothing to do" from "the sweep stopped".
   # published: owner=crates/cog-storage/src/checkpoint_cap.rs file=crates/cog-core/src/retention.rs metric=TARGET_METRIC label=source cadence=periodic
   # proof: file=crates/cog-storage/src/checkpoint_cap.rs test=a_beat_whose_target_does_not_move_still_counts beat=a_beat_whose_target_does_not_move_still_counts evidence=evaluations
   maxRows: 40000
@@ -856,7 +857,7 @@ checkpointStore:
 llmExchangeRetention:
   # 保留天数。1 以下的值退回 30：保留期归零会让表每趟被清空，读起来像「清理生效」，
   # 而这张表存在的理由——事后核对一次调用——就永远答不了。
-  # tunable: derived
+  # tunable:
   # why: Days the prompt-and-response archive keeps a body. The sweep measures the archive's bytes and its
   # why: oldest row's age on every pass and divides the table's share of the declared database volume by the
   # why: measured daily write; the declared 30 days is the seed while the archive is empty or the volume is
@@ -869,7 +870,29 @@ llmExchangeRetention:
   # proof: file=crates/cog-observability/src/exchange_retention.rs test=the_retention_follows_the_measured_daily_write beat=a_beat_whose_target_does_not_move_still_counts evidence=evaluations
   keepDays: 30
 
-# token 账（gateway_llm_usage）的**查询窗口**声明。
+# 任务事件档案（cog_events）的保留期。每个任务把 agent 循环的每一轮记在这里，好让一个
+# 没收敛的跑法事后能读回去；从来没删过一行，2026-10-27 实测 130,871 行 / 211 MB（同一天
+# 实测），约 3,800 行一天。退役的单位是整个任务的事件流而不是行：两个读者都从 offset 0
+# 重放一个任务的序列，删掉前缀会让「从这里开始」与「跑到这里」读成同一件事；被续跑点
+# （cog_checkpoints）指着的流一律不删。循环跑在主应用里，把「最老一行多老 / 保留多久 /
+# 多少行 / 多少条流」发布成读数，告警拿前两个比。
+taskEventRetention:
+  # 保留天数。超过这个天数没有追加过的任务流整条退役；不收敛的跑法在它上面还能读到。
+  # 0 = 本部署只量不删（把删除留给声明同一个数的另一个进程）；负数与读不出来的值退回 30。
+  # tunable:
+  # why: Days a task's event stream is kept after it last appended. The sweep measures the table's bytes and
+  # why: its oldest row's age on every pass and divides the table's share of the declared database volume by
+  # why: the measured daily write; the declared 30 days is the seed while the archive is empty or the volume
+  # why: is not declared. The unit stays the whole stream: a stream a checkpoint names is not deletable at
+  # why: all, and a deleted prefix would answer a replay with a gap shaped like the start of the run. The
+  # why: loop publishes the days in force as cogneva_task_events_keep_seconds, so `task_event_archive_behind`
+  # why: compares the archive against what this pass used. The published target carries `source`, and the
+  # why: evaluations counter separates a steady target from a stopped loop.
+  # published: owner=crates/cog-storage/src/task_event_retention.rs file=crates/cog-core/src/retention.rs metric=TARGET_METRIC label=source cadence=periodic
+  # proof: file=crates/cog-storage/src/task_event_retention.rs test=the_retention_follows_the_measured_daily_write beat=a_beat_whose_target_does_not_move_still_counts evidence=evaluations
+  keepDays: 30
+
+# token 账（gateway_llm_usage）的逐次调用明细保留期。
 #
 # 这张表每次上游调用一行；每小时的折叠面（cog_llm_usage_rollup）把窗口汇总一次并长期
 # 保留。从前这里是一条保留期：超过就按天删明细。那套东西的正确性靠一个两段条件撑着——
@@ -883,16 +906,15 @@ llmExchangeRetention:
 # 下面这个数是**对外承诺的查询窗口**（花费用量读的那一侧用它当上界），按卷大小与每天
 # 实测写入量导出；1 以下退回 30。
 llmUsageRetention:
-  # tunable: derived
-  # why: Days of per-call detail the spend reads promise to look back over. Nothing deletes past it: the loop
-  # why: measures the ledger's rows, bytes and oldest-row age every pass and publishes them, and a row older
-  # why: than this window is still there afterwards. The number itself is derived -- the ledger's bytes and
-  # why: oldest age give the daily write, the declared volume's share divides out a number of days, and the
-  # why: declared 30 is the seed while the ledger is empty or the volume is not declared. Rows the hourly fold
-  # why: never summed are published as cogneva_llm_usage_uncovered_rows beside the age of their oldest, which
-  # why: says which spans can only be answered from the detail. The days in force are published as
-  # why: gateway_llm_usage_keep_seconds, and the read side asks for the same value. The target carries
-  # why: `source`, and the evaluations counter is the beat evidence.
+  # tunable:
+  # why: Days the token ledger keeps its per-call rows. The sweep measures the ledger's bytes and its oldest
+  # why: row's age on every pass and divides the table's share of the declared database volume by the
+  # why: measured daily write; the declared 30 days is the seed while the ledger is empty or the volume is
+  # why: not declared. Age is not the only cutoff: a row that no hourly fold window summed is the only copy
+  # why: of that spend, so the sweep deletes only what is both past the derived age and inside the fold's own
+  # why: range, and publishes the rows it cannot touch as cogneva_llm_usage_uncovered_rows. The days in force
+  # why: are published as gateway_llm_usage_keep_seconds, and the read side asks for the same value. The
+  # why: target carries `source`, and the evaluations counter is the beat evidence.
   # published: owner=crates/cog-observability/src/usage_retention.rs file=crates/cog-core/src/retention.rs metric=TARGET_METRIC label=source cadence=periodic
   # proof: file=crates/cog-observability/src/usage_retention.rs test=the_retention_follows_the_measured_daily_write beat=a_beat_whose_target_does_not_move_still_counts evidence=evaluations
   keepDays: 30
@@ -909,7 +931,7 @@ llmUsageRetention:
 # 动——连接建立本身、以及握手之后每秒还过不过得了一千字节。
 workspaceFetch:
   # git 的 TCP 连接超时（秒）：镜像根本不答时别挂在连接上。
-  # tunable: fixed
+  # tunable:
   # why: A property of git's transport protocol, not a size: how long the client waits for the mirror to
   # why: answer the connection at all. The fetch runs in a one-shot init container that dies when it
   # why: finishes, so no process survives to measure connect latency and feed it back -- and the value is
@@ -917,13 +939,13 @@ workspaceFetch:
   # why: the behaviour is defined.
   connectTimeoutSecs: 15
   # 低于这个速率（字节/秒）持续 lowSpeedSecs 秒即判定传输已死。
-  # tunable: fixed
+  # tunable:
   # why: The transport protocol's own definition of a dead transfer: git aborts when throughput stays below
   # why: this rate for lowSpeedSecs. The evolution and sandbox init containers pass the same pair so one link
   # why: cannot be held to a different notion of "still moving". The bound is "is it moving", not "how long":
   # why: a slow but advancing fetch was measured at fourteen minutes and must not be killed.
   lowSpeedLimitBytesPerSec: 1000
-  # tunable: fixed
+  # tunable:
   # why: The other half of the same protocol threshold: how long throughput may stay under
   # why: lowSpeedLimitBytesPerSec before git gives up. A liveness window, not a duration budget for the
   # why: transfer itself; shared by both init containers so the same transfer is judged the same way on
@@ -938,11 +960,11 @@ evolution:
   # 判据是子进程还发不发进度（cog_core::progress），所以这里没有超时项。
   # 一个进化 worker：它按 Hold 那把构建槽的锁干活，第二个副本争的是同一把锁，
   # 收益是多一份排队而不是多一份吞吐。
-  # tunable: fixed
+  # tunable:
   # why: One evolution worker: a second copy would contend for the same build slot rather than add
   # why: throughput, because the slot is the shared resource. Not a reading.
   replicas: 1
-  # tunable: derived
+  # tunable:
   # why: How often the self-evolution loop looks for new work. The beat is the larger of the configured seed
   # why: and the round that just ran: a round stacks probes and waits for their outcomes, so the interval the
   # why: loop actually keeps is its own cost. The seed is the floor -- polling the same machinery faster than
@@ -969,14 +991,14 @@ evolution:
     seedUrls:
       - https://github.com/hcipengm/cogneva.git
       - https://gitee.com/hcipengm/cogneva.git
-    # tunable: derived
+    # tunable:
     # why: The bare git mirror. Its size is a function of the repositories it carries, which the loop does not
     # why: model: it reads the claim's peak from the claim-store walker and raises the declaration to peak x
     # why: 120% (whole GiB) when the peak has outgrown it.
     # published: owner=crates/cog-reflection/src/volume_capacity.rs file=crates/cog-reflection/src/volume_capacity.rs metric=BYTES_METRIC label=state cadence=periodic
     # proof: file=crates/cog-reflection/src/volume_capacity.rs test=a_claim_target_follows_the_measured_used_bytes beat=a_beat_whose_target_does_not_move_still_counts evidence=outcome_count
     storage: 5Gi
-  # tunable: derived
+  # tunable:
   # why: The sandbox working area for evolution tasks. The loop walks this claim from inside the process (it
   # why: is mounted) and raises the declaration when the measured peak x 120% exceeds it; task workspaces
   # why: come and go, so the window's peak, not the current reading, is the input.
@@ -993,9 +1015,9 @@ evolution:
   # `data_volume_over_declared_size` 一直开着——所以这个数按实测峰取，不按
   # 当年写下的值。191GiB 的峰值上限（峰×1.2）也落在它里面：上限与声明量是
   # 一对，缓存可以长到峰值的余量，但不能长到这张卷装不下。
-  # tunable: derived
+  # tunable:
   # why: Holds the shared CARGO_TARGET_DIR; measured at 149GiB on 2026-11-12 against a 72Gi declaration, and
-  # why: the loop raised it to 179Gi. The reading is the walk's peak times 120%, rounded up to whole GiB, and（默认）
+  # why: the loop raised it to 179Gi (120% of that measured peak). The reading is the walk's peak times 120%, rounded up to whole GiB, and
   # why: it only moves up because the claim cannot shrink.
   # published: owner=crates/cog-reflection/src/volume_capacity.rs file=crates/cog-reflection/src/volume_capacity.rs metric=BYTES_METRIC label=state cadence=periodic
   # proof: file=crates/cog-reflection/src/volume_capacity.rs test=a_claim_target_follows_the_measured_used_bytes beat=a_beat_whose_target_does_not_move_still_counts evidence=outcome_count
@@ -1004,7 +1026,7 @@ evolution:
   # 同一路径两个进程，各自的卷互不相干，共用一份声明必然对其中一个说谎。
   # 实测 49Gi（几乎全是 raw-logs 的存量轨迹），取 64Gi 留头寸。推导同
   # appData.storage：raw-logs 只降层不删除，存量会随冷层长期停留。
-  # tunable: derived
+  # tunable:
   # why: The evolution process's own data directory, a different claim from the app's. The loop measures it
   # why: from its own walk (this process mounts it) and raises the declaration to peak x 120%;
   # why: `cogneva_volume_capacity_bytes{claim,state}` publishes both the peak and what the round left
@@ -1019,7 +1041,7 @@ evolution:
     root: /opt/cogneva/sandbox/workspaces
     targetDir: /opt/cogneva/sandbox/src/target
     # 临时工作树存活上限；要容得下一整轮演进，进程号不足以判断任务是否还活着。
-    # tunable: derived
+    # tunable:
     # why: How long an ephemeral worktree may live. At every maintenance beat (the deployer's cycle, each poll
     # why: interval) the manager measures how many trees arrived over the last week, the bytes of the average
     # why: tree, and the free bytes of the volume they sit on, and takes half the time those arrivals need to
@@ -1035,7 +1057,7 @@ evolution:
     # 身份轮换后遗留的 `evol/<旧id>` 分支回收判据：已并入 main 的立即回收，
     # 未并入的等超过这个时长（默认 30 天）才回收。存活实例的分支每次移植都会
     # 被强推刷新，长期不动即说明所属实例已不在。
-    # tunable: derived
+    # tunable:
     # why: How long an `evol/<old-id>` branch may go untouched before reclamation. At every maintenance beat
     # why: the manager counts how many branch names appeared over the last week (the first census is zero
     # why: arrivals, not "all of them are new"), measures the bytes unique to those branches with `git rev-list
@@ -1050,7 +1072,7 @@ evolution:
     # 共享构建缓存的复测周期（秒）。缓存的占用按层读成 cogneva_build_target_bytes，
     # 是给容量上限用的读数；走一遍只取元数据，但树有几十万条、宿主同时在编译，
     # 比分钟更勤没有价值。有下限兜底，取小于它的值等于取下限。
-    # tunable: derived
+    # tunable:
     # why: How often the shared cache's size is re-read. The next wait follows what the last walk cost, times a
     # why: factor that keeps the walk the same proportion of the period, floored at the declared value so
     # why: scanning never becomes more frequent than the seed. The loop publishes its cadence and evaluation
@@ -1073,7 +1095,7 @@ evolution:
     # 超过时先放弃只花时间的层（`tmp` / `incremental` / `build`），编译结果排在其后；
     # 删除**只在持有构建槽位时**做，所以不会有构建正在读的文件被删掉。给得太小（小于每层
     # 留一份的下限）会被显式报成"到不了上限"。
-    # tunable: derived
+    # tunable:
     # why: The sentinel `auto` rather than a number: the cap is the pre-reclaim working set's peak over the
     # why: last week with 20% headroom, held under the free space of the volume the directory sits on, and
     # why: recomputed from every walk. A number here is the same measurement taken once by hand, and it stops
@@ -1103,7 +1125,7 @@ evolution:
   # 那会同时带回两个问题（fsGroup 互改属主、不受信方占住槽位），见 build_gate 的注解。
   buildGate:
     enabled: true
-    # tunable: derived
+    # tunable:
     # why: The zero sentinel means "derive it": the gate takes the tightest of the host's CPU, memory, IO-stall
     # why: and build-cgroup-memory dimensions and labels the published ceiling with the dimension that decided
     # why: it. A positive value is the override branch, and that branch is published as dimension="override" so
@@ -1111,7 +1133,7 @@ evolution:
     # published: owner=crates/cog-reflection/src/build_gate/mod.rs file=crates/cog-reflection/src/build_gate/mod.rs metric=BUILD_GATE_CEILING label=dimension cadence=periodic
     # proof: file=crates/cog-reflection/src/build_gate/mod.rs test=the_ceiling_is_the_tightest_dimension beat=the_cargo_width_is_recomputed_every_window_and_published evidence=BUILD_GATE_CARGO_JOBS_EVALUATIONS_TOTAL
     maxConcurrent: 0
-    # tunable: derived
+    # tunable:
     # why: How long one build waits for a slot. The effective wait is the tail of the waits that actually
     # why: outlasted a poll, doubled and floored at two polls: a gate that queues produces waits, not a number
     # why: someone picked. A refused wait is deliberately not fed back -- the caller's retry is what the gate
@@ -1123,7 +1145,7 @@ evolution:
     lockDir: /var/lib/cogneva-build-gate
   resources:
     requests:
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
       # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -1133,10 +1155,10 @@ evolution:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 500m
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1154,7 +1176,7 @@ evolution:
       # `limitsCpu` 也容得下（抬完稳态声明和 + 判据 Job 仍在 23 核以内）。
       # Falsification：抬完看主线构建的墙钟是否落到构建上限之下，以及这一格的
       # `nr_throttled` 增量是否明显下降。两个都没动，说明瓶颈不在配额，就抬回来。
-      # tunable: derived
+      # tunable:
       # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
       # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
       # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
@@ -1176,9 +1198,9 @@ evolution:
       # 真值要 rollout 后读 `cogneva_build_gate_ceiling{dimension="cgroup_memory"}`
       # 再定。抬这个数必须同批抬 LimitRange 的单容器上限（见 resourceGovernance），
       # 否则 Pod 在准入就被拒。
-      # tunable: derived
+      # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1192,7 +1214,7 @@ sandboxExecutor:
   enabled: true
   # 执行器的指标面：主应用与进化 Pod 都按它取执行器的读数。该 Pod 零凭证，
   # 指标面是它唯一对外的面。
-  # tunable: fixed
+  # tunable:
   # why: The executor's one outward face: it holds no credentials, so its readings are all it publishes. An
   # why: address.
   metricsPort: 9090
@@ -1204,7 +1226,7 @@ sandboxExecutor:
   # 回路问每副副本的 `GET /lane`，按「在跑 + 在等」除以单副位子数改 `spec.replicas`
   # （对象的 `replica-policy: queue` 就是这条律的标记）。所以这份值是**安装时的种子**，
   # 不是天花板：第一拍读到队之后，它由队回答。
-  # tunable: derived
+  # tunable:
   # why: The number of executor replicas carries the sandbox's capacity, not its topology: each replica owns
   # why: its own claim and a lane is pinned to one replica, so a second copy adds slots rather than splitting
   # why: "who owns this worktree". The workload-resources loop asks every Ready executor pod for its own `GET
@@ -1222,7 +1244,7 @@ sandboxExecutor:
   replicas: 1
   # 每副副本的卷：自有裸仓库 + 每任务工作树 + 共享 CARGO_TARGET_DIR，
   # 与进化侧卷物理分离，互不共享工作树。卷名 `<sandbox-data>-<sts 名>-<序号>`。
-  # tunable: derived
+  # tunable:
   # why: The executor's own volume. How full it is, is measured: the loop walks the claim from the executor
   # why: process and raises the declaration to the walk's peak x 120% (whole GiB). The number of task
   # why: worktrees is the input it follows, not a figure the declaration names.
@@ -1243,7 +1265,7 @@ sandboxExecutor:
   # 翻倍。现在用的是不依赖 TTL 的两头：卷实测能装多少棵树（见 maxTaskWorkspaces 那段）＋
   # 新树到达的间隔（元数据里的 created_at 算出来），取「新树把半个卷填满要多久」。
   # 树来得快、卷更小，TTL 就短；量不出来（不足两棵树）时才用这个数。
-  # tunable: derived
+  # tunable:
   # why: How long an idle task worktree may live. The reclamation pass derives it from the two readings that
   # why: do not depend on the TTL itself: how many trees the volume holds (the measured cap) and how far
   # why: apart new trees arrive (from the sidecars' creation times). The hold is as long as it takes arrivals
@@ -1261,7 +1283,7 @@ sandboxExecutor:
   # 一次 pass 越慢，间隔跟着拉长，而不是把固定周期一直付下去。pass 只计回收本身的工作，
   # 不含它被安排的等待，所以间隔不会反过来影响这个测量。循环按 30 秒的地板唤醒并上报
   # 心跳，没到期就空转，所以「回收间隔」变长不会被误读成循环停摆。
-  # tunable: derived
+  # tunable:
   # why: How long goes by between reclamation passes. The value the loop acts on is a multiple of the last
   # why: pass's own duration, so the walk's cost stays a fixed share of the process as the volume fills and
   # why: the pass gets slower; the floor is the pace the loop wakes at. This number is the seed used until a
@@ -1273,7 +1295,7 @@ sandboxExecutor:
   # 多久没动过，就按那个间隔的一半轮询（下限 30 秒，低于它就是在问同一个 commit）。
   # 上游一小时才推一次时，仍然每 5 分钟抓一遍是白花；反过来推得勤时又要跟上。循环
   # 本身按地板节奏唤醒并上报心跳，所以「抓取间隔」变了不会被误读成循环停摆。
-  # tunable: derived
+  # tunable:
   # why: How often the bare repository's main is fetched. The executor measures how long `main` stayed still
   # why: before its last move -- the only reading anyone here has of the upstream push rate -- and polls at
   # why: half that stillness, floored at 30s. The configured number is the seed: it applies until the first
@@ -1302,7 +1324,7 @@ sandboxExecutor:
   # 它是被上限挤掉的，不是空闲到期。
   # 取值 32：实测到达率约 28 棵/小时，32 覆盖一整小时的活跃任务；32 棵 ≈ 1.6 GiB，
   # 而这条卷所在的文件系统实测还有 329 GiB 可用。
-  # tunable: derived
+  # tunable:
   # why: How many task worktrees the volume can hold at the size these trees actually measure. Every
   # why: reclamation pass reads `df` available bytes on the workspaces root, divides by the size of one tree
   # why: measured in that same pass, and keeps one tree's worth of room free for the git writes of the next
@@ -1333,7 +1355,7 @@ sandboxExecutor:
   # 池子另有一道约束，不用这个数兜底：永不大于当轮实测上限的一半，没到达的任务不许
   # 挤掉正在跑的任务。
   # 取值 2 是种子：实测到达率约 1.1 个任务/分钟、补一次池约 3.4 秒。
-  # tunable: derived
+  # tunable:
   # why: How many trees are kept cut and waiting so an arriving task does not pay for a checkout. The size is
   # why: Little's law over two measurements: how many lanes get a tree per second (arrival timestamps kept in
   # why: a window), times how long one checkout costs (the median of the last successful `git worktree add`
@@ -1342,7 +1364,7 @@ sandboxExecutor:
   # why: exists to make arrivals cheap, and spending the capacity on trees no task has asked for would make
   # why: the tasks themselves wait. The configured number is the seed, and only applies until both
   # why: measurements exist. What it was measured at: a conversation's first tool call took 6.69 s end to
-  # why: end, 6.5 s of it `git worktree add` (3403 ms on its own for this 49 MB repository), against 0.128 s（默认）
+  # why: end, 6.5 s of it `git worktree add` (3403 ms on its own for this repository at its measured 49 MB), against 0.128 s
   # why: for the same command five minutes later in a tree that already existed. About 1.1 tasks a minute
   # why: against a 3.4 s refill is what made 2 the seed. 2026-11-07, one former bound was the other way
   # why: round: a refill stood down whenever the ceiling was full, and with the ceiling at 32 and the volume
@@ -1370,7 +1392,7 @@ sandboxExecutor:
   # 也就是让走这一遍最多占掉二十分之一的时间——缓存越大、走一遍越慢，周期自己拉长。
   # 发布出来的间隔是**实际生效的那个数**，不是这里的种子。循环按 60 秒地板唤醒并上报
   # 心跳，没到期就空转，所以周期变长不会被误读成循环停摆。
-  # tunable: derived
+  # tunable:
   # why: How often this executor's cache is re-walked and its cap re-enforced. The loop times each walk and
   # why: keeps the period at twenty times the last walk's cost, so the walk stays one twentieth of the
   # why: process as the cache grows, floored at the shared minimum. That floor also paces the loop's waking,
@@ -1435,7 +1457,7 @@ sandboxExecutor:
   # 抬完声明之和实测约 31 核 / 61 GiB，仍在配额内。
   resources:
     requests:
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
       # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -1445,10 +1467,10 @@ sandboxExecutor:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 100m
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1456,7 +1478,7 @@ sandboxExecutor:
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 512Mi
     limits:
-      # tunable: derived
+      # tunable:
       # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
       # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
       # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
@@ -1466,9 +1488,9 @@ sandboxExecutor:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 4000m
-      # tunable: derived
+      # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1492,7 +1514,7 @@ hostDocuments:
   journalDir: /opt/cogneva/sandbox/host-docs-journal
   # 单份文档的重写上限（字节）。回滚要留一份原文副本，这个上限同时界住了
   # 一次操作与一份日志的大小。
-  # tunable: fixed
+  # tunable:
   # why: The largest single rewrite, which also bounds the rollback journal's copy. An interface bound: the
   # why: operation is atomic in one call, not a stream.
   maxWriteBytes: 8388608
@@ -1501,7 +1523,7 @@ hostDocuments:
   # one limits the bytes the executor reads into memory at once. The two values being
   # close is a coincidence; tying them together would silently drag one side when the
   # other is adjusted.
-  # tunable: fixed
+  # tunable:
   # why: The largest single read. Deliberately not tied to the audited channel's body bound: that one limits
   # why: how much text leaves through a model, this one limits bytes read into memory at once. The two being
   # why: close is a coincidence, and tying them would drag one side when the other moves.
@@ -1519,7 +1541,7 @@ hostDocuments:
   # unattended in the middle of the night.
   # A floor of 60s (the executor clamps anything smaller): a value far below the floor is
   # almost certainly a unit mistake.
-  # tunable: derived
+  # tunable:
   # why: How long a staged plan stays approvable, which is also the validity of an approval. Every approval
   # why: records how long it sat between staging and approval; the window is 1.25x the slowest approval of
   # why: the last 30 days, never below the declared seed. Only the observed tail can widen it: an approval
@@ -1533,7 +1555,7 @@ hostDocuments:
   # The largest plan that may be staged for approval (bytes). Same order as a single read:
   # a plan carrying more text than a single write may carry would make "approved" mean
   # something other than what it says.
-  # tunable: fixed
+  # tunable:
   # why: A plan is staged for approval and has to be legible in one sitting, so it shares the single-read
   # why: order of magnitude rather than tracking storage. It is an interface bound, not a capacity dial.
   maxPlanBytes: 8388608
@@ -1550,7 +1572,7 @@ hostDocuments:
   # `sandbox_host_docs_assist_question_files` with a `source` label; a folder that does not
   # fit is not asked about at all, because a partial answer would make the plan depend on
   # which files happened to fit.
-  # tunable: derived
+  # tunable:
   # why: How many wire bytes of one body a classification question carries. The plan is recomputed on every
   # why: organize run that reaches the model station. Its window is the largest request this audited channel
   # why: answered, floored by the deployment's own practice (this seed times the candidate seed plus the
@@ -1568,7 +1590,7 @@ hostDocuments:
   # published: owner=crates/cog-extension/src/hostdocs.rs file=crates/cog-extension/src/hostdocs.rs metric=ASSIST_BODY_BYTES_METRIC label=source cadence=event
   # proof: file=crates/cog-extension/src/hostdocs.rs test=the_question_plan_follows_the_answered_question_and_the_beat_counts beat=the_question_plan_follows_the_answered_question_and_the_beat_counts evidence=ASSIST_PLAN_EVALUATIONS_METRIC
   assistBodyBytes: 2048
-  # tunable: derived
+  # tunable:
   # why: How many files one classification question covers. Same loop and same window as the body prefix
   # why: above: the count in force is the window's capacity at that prefix, raised by what the channel has
   # why: answered. A folder larger than the plan still covers is asked about in full only when a probe is
@@ -1602,7 +1624,7 @@ buildah:
     # 承接；request 按常驻实耗定，不为偶发构建常年锁住半 G 调度额度
     # （小节点上这会挤得短作业排不进来）。
     requests:
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
       # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -1612,10 +1634,10 @@ buildah:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 250m
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1623,7 +1645,7 @@ buildah:
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 64Mi
     limits:
-      # tunable: derived
+      # tunable:
       # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
       # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
       # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
@@ -1633,9 +1655,9 @@ buildah:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 2000m
-      # tunable: derived
+      # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1667,7 +1689,7 @@ processCensus:
   resources:
     # 每拍（60s）走一遍 cgroup 树、读几百个 /proc 小文件；常驻与尖峰都在噪声级。
     requests:
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
       # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -1677,10 +1699,10 @@ processCensus:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 10m
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1688,7 +1710,7 @@ processCensus:
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 32Mi
     limits:
-      # tunable: derived
+      # tunable:
       # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
       # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
       # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
@@ -1698,9 +1720,9 @@ processCensus:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 100m
-      # tunable: derived
+      # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1719,14 +1741,14 @@ hostLedger:
   # 生命周期里。两者都别按"反正宿主上也看得见"去理解。
   hostPath: /sys/fs/cgroup
   mountPath: /host/cgroup
-  # tunable: fixed
+  # tunable:
   # why: The scrape port of the per-node ledger. An address.
   port: 9100
   resources:
     # 每次抓取读三个小文件，常驻与尖峰都在噪声级；request 按实耗定，上限留一个
     # 足以容纳一次抓取的余量即可。
     requests:
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
       # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -1736,10 +1758,10 @@ hostLedger:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 10m
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1747,7 +1769,7 @@ hostLedger:
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 32Mi
     limits:
-      # tunable: derived
+      # tunable:
       # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
       # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
       # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
@@ -1757,9 +1779,9 @@ hostLedger:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 100m
-      # tunable: derived
+      # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1801,7 +1823,7 @@ claimStore:
   # 条目不会被猜着记到某张卷上，只计入 skipped。
   hostPath: /var/lib/rancher/k3s/storage
   mountPath: /host/storage
-  # tunable: fixed
+  # tunable:
   # why: The scrape port of the per-node account. An address; the headless Service and the container port are
   # why: both read from it.
   port: 9100
@@ -1809,7 +1831,7 @@ claimStore:
   # 跟着抓取跑，抓取读的是上一拍的结果；`cogneva_claim_scan_age_seconds` 把「上一拍」
   # 有多旧变成一条读数。规则 claim_scan_stale 的界是**三个这个节奏**，改这里要一起
   # 改那条规则——界若等于节奏，健康节点在两拍之间也会亮。
-  # tunable: derived
+  # tunable:
   # why: The claim walk's cadence. Each pass measures how long the walk took; the next beat is that pass
   # why: against the seed, floored at the seed because a walk over the same disk should not run more often
   # why: than declared, and the wait hands back what the pass left of the beat. The pacer is published with
@@ -1838,7 +1860,7 @@ claimStore:
       hostPath: /var/lib/cogneva-buildah
       mountPath: /host/buildah
   # 规则 image_store_scan_stale 的界是**三个这个节奏**，改这里要一起改那条规则。
-  # tunable: derived
+  # tunable:
   # why: The image store walk's cadence, slower than the claim walk because the tree is larger and changes on
   # why: image pulls. Same law: the beat is the larger of the seed and the pass, so a walk that outlasts its
   # why: seed sets the next cadence instead of stacking a seed on top of it. Published beside the claim
@@ -1893,7 +1915,7 @@ claimStore:
     # 在 200m 下 3m35s，给到 1 核（一整个周期的配额）后 34.5s，同一个进程、同一棵树。
     # 均值仍不到 0.3 核，空转时一分不花。
     requests:
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
       # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -1903,10 +1925,10 @@ claimStore:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 10m
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1914,7 +1936,7 @@ claimStore:
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 32Mi
     limits:
-      # tunable: derived
+      # tunable:
       # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
       # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
       # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
@@ -1924,9 +1946,9 @@ claimStore:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: "1"
-      # tunable: derived
+      # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1942,7 +1964,7 @@ claimStore:
 clusterRegistry:
   enabled: true
   # 一个仓库：它缓存的是这一簇的镜像层，第二个副本写同一张卷只会让两层布局互相踩。
-  # tunable: fixed
+  # tunable:
   # why: One registry: it caches this cluster's image layers on one volume, and a second writer would
   # why: interleave two layer layouts on it. Nothing measures push or pull pressure, so no loop moves this
   # why: number.
@@ -1951,7 +1973,7 @@ clusterRegistry:
   # 仓库在集群内的服务端口：Service、containerPort、部署器拼的 Service DNS、以及
   # network-policy 里放行的那条都读这一个值。四处各写 5000 时，改一处就有一条路径
   # 静默指向不存在的端口——push 报连接拒绝、或者更糟，策略放行了一个没人听的端口。
-  # tunable: fixed
+  # tunable:
   # why: An address, not a size: the Service port, the container port, the deployer's Service DNS and the
   # why: network policy all name this one number, so it is a protocol fact those four agree on. Nothing
   # why: measures how large it should be -- a derived value would have to read the port the registry bound,
@@ -1959,7 +1981,7 @@ clusterRegistry:
   port: 5000
   # 节点上以 localhost:<nodePort> pull（containerd 对 localhost 默认 http 免 TLS），
   # 部署器拼的 COGNEVA_MAINLINE_DEPLOYER_LOCAL_REGISTRY 也读它。
-  # tunable: fixed
+  # tunable:
   # why: The node port kubelets pull from (localhost:30500, http because containerd treats localhost as
   # why: plain). It is written into image.repository, so it is an address, not a dial.
   nodePort: 30500
@@ -1976,12 +1998,12 @@ clusterRegistry:
   # 两个容器的挂载点都取它，任一处改单边都会让走查量到空目录（读数变成 0）。
   rootDir: /var/lib/registry
   # 走查边车对外服务的端口。Service 端点名 http 指向它，监控按那个名字发现。
-  # tunable: fixed
+  # tunable:
   # why: The walker sidecar's scrape port, referenced by the Service endpoint that monitoring discovers. An
   # why: address, not a dial.
   walkerPort: 9100
   # 金丝雀 overlay 逐 rev 累积，实测已 7.4Gi，取 10Gi。
-  # tunable: derived
+  # tunable:
   # why: Canary overlays accumulate per revision, and 7.4Gi was measured on a working deployment. The
   # why: capacity loop reads the registry claim from the claim-store walker (the registry API reports
   # why: referenced layers, a different figure) and raises the declaration to the measured peak x 120% when
@@ -1991,7 +2013,7 @@ clusterRegistry:
   storage: 10Gi
   resources:
     requests:
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
       # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -2001,10 +2023,10 @@ clusterRegistry:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 20m
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -2018,7 +2040,7 @@ clusterRegistry:
       # 分发，限流一多就变成「按配额的速度分发」，而它下游站着部署器的滚动。
       # 同族处置：redis-info-exporter、claim-store、node-exporter 都是这条——
       # 按一个周期内的突发定，不按均值定。抬完配额仍有 7 核余量（配额 31，声明 23.6）。
-      # tunable: derived
+      # tunable:
       # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
       # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
       # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
@@ -2028,9 +2050,9 @@ clusterRegistry:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 500m
-      # tunable: derived
+      # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -2040,7 +2062,7 @@ clusterRegistry:
   # 走查是 readdir+stat，不吃 CPU；内存按目录树规模取，10Gi 的 store 远在这以内。
   walkerResources:
     requests:
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
       # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -2051,10 +2073,10 @@ clusterRegistry:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 20m
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. This is the registry-walker sidecar; the loop measures each container in the Pod
       # why: separately. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
@@ -2063,7 +2085,7 @@ clusterRegistry:
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 64Mi
     limits:
-      # tunable: derived
+      # tunable:
       # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
       # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
       # why: and never below the request; a run that keeps being throttled at the bound raises it further. This
@@ -2074,9 +2096,9 @@ clusterRegistry:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 200m
-      # tunable: derived
+      # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. This is the registry-walker sidecar; the loop measures each container in the Pod
       # why: separately. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
@@ -2095,15 +2117,15 @@ clusterRegistry:
 # 所以这里必须显式写全——"省略"本身就是按空闲节点取值。
 healthProbes:
   startup:
-    # tunable: fixed
+    # tunable:
     # why: The startup half of the probe contract. The startup budget as a whole is sized for the slowest
     # why: legitimate start (loading a large AOF, first initdb, building an index); it is a stated policy, and
     # why: no loop measures start durations back into it.
     periodSeconds: 5
-    # tunable: fixed
+    # tunable:
     # why: The startup half of the probe contract.
     timeoutSeconds: 5
-    # tunable: fixed
+    # tunable:
     # why: 60 attempts at 5 seconds is the five-minute startup budget. The number is the slowest legitimate
     # why: start written down, not a derived bound.
     failureThreshold: 60
@@ -2117,14 +2139,14 @@ healthProbes:
   # ——比预算更慢的启动走不到 Ready，也就永远不会成为一个样本，缩小预算就是
   # 把自己下次失败变成看不见的。值报在 `cogneva_workload_startup_failure_threshold`。
   appStartup:
-    # tunable: fixed
+    # tunable:
     # why: The probe contract's own period, kept equal to every other startup budget: the app's budget differs
     # why: in how many attempts it allows, not in how often it is asked.
     periodSeconds: 5
-    # tunable: fixed
+    # tunable:
     # why: The startup half of the probe contract, for the main app's own budget.
     timeoutSeconds: 5
-    # tunable: derived
+    # tunable:
     # why: Attempts at a 5 s probe, sized by how long this deployment's starts actually take: the
     # why: workload-resources loop reads every Ready pod's time from `status.startTime` to the transition that
     # why: made it Ready, keeps the longest in a seven-day window, adds 20% headroom and divides by the probe
@@ -2146,14 +2168,14 @@ healthProbes:
   # buildah 11 GB，200m 配额下），2026-10-26 那次 4m12s。
   # 与 appStartup 同一条律、同一个窗口：这个数是下限，实测最长启动把它抬高。
   claimStoreStartup:
-    # tunable: fixed
+    # tunable:
     # why: The same probe contract, kept at the same period as every other startup budget: the claim store's
     # why: budget differs in how many attempts it allows, not in how often it is asked.
     periodSeconds: 5
-    # tunable: fixed
+    # tunable:
     # why: The startup half of the probe contract, for the claim store's own budget.
     timeoutSeconds: 5
-    # tunable: derived
+    # tunable:
     # why: The same startup-budget law as the main app, applied to the claim store's own start: longest Ready
     # why: transition minus `status.startTime` over the seven-day window, 20% headroom, divided by the 5 s
     # why: probe period. The DaemonSet carries `cogneva.io/startup-policy: measured`, so the workload-resources
@@ -2165,26 +2187,26 @@ healthProbes:
     # proof: file=crates/cog-reflection/src/workload_resources.rs test=the_startup_budget_follows_the_longest_measured_start beat=the_startup_beat_counts_even_when_the_longest_start_does_not_move evidence=startup_evaluations
     failureThreshold: 120
   liveness:
-    # tunable: fixed
+    # tunable:
     # why: The kubelet probe contract. It is written out rather than omitted because the kubelet default is one
     # why: second -- an idle-node value that kills a backend on a busy node (redis was killed this way). The
     # why: period is the probe's own convention, not a capacity measurement.
     periodSeconds: 20
-    # tunable: fixed
+    # tunable:
     # why: Same contract, same reason for being explicit: the default timeout is the idle-node number.
     timeoutSeconds: 10
-    # tunable: fixed
+    # tunable:
     # why: The runtime budget, chosen so a busy node still gets answered. It is a practice written as a
     # why: constant; no measurement moves it.
     failureThreshold: 6
   readiness:
-    # tunable: fixed
+    # tunable:
     # why: The readiness half of the probe contract; explicit for the same reason as liveness.
     periodSeconds: 10
-    # tunable: fixed
+    # tunable:
     # why: The readiness half of the probe contract.
     timeoutSeconds: 10
-    # tunable: fixed
+    # tunable:
     # why: How many missed answers take a Pod out of the endpoints. A practice.
     failureThreshold: 6
   # 备份与演练两个 Job 的探针节奏。这一档和上面三档不同：上面判的是「进程能不能
@@ -2197,19 +2219,19 @@ healthProbes:
   #   failureThreshold 3 —— 一次读盘抖动不该变成一次重启，30s×3 才动手；
   #   initialDelaySeconds 120 —— 进程第一件事就是建这个文件，宽限只兜调度与挂卷的延迟。
   progressFile:
-    # tunable: fixed
+    # tunable:
     # why: The probe contract's own period. Asking more often cannot stop a Job any earlier than the first tick
     # why: after the age passes the window the file names, so a finer period buys nothing but probe noise.
     periodSeconds: 30
-    # tunable: fixed
+    # tunable:
     # why: The probe contract's timeout, written out for the same reason as every other probe here: the kubelet
     # why: default is the idle-node number.
     timeoutSeconds: 10
-    # tunable: fixed
+    # tunable:
     # why: Three misses at 30 seconds, so one flaky read of the progress file does not become a restart. A
     # why: practice, not a measurement.
     failureThreshold: 3
-    # tunable: fixed
+    # tunable:
     # why: The first thing the Job does is create the progress file, so the grace only covers scheduling and
     # why: volume mounting.
     initialDelaySeconds: 120
@@ -2220,14 +2242,14 @@ backends:
     enabled: true
     # 一个实例。库是单写的，多副本要么是主从（要另一套切换机制，不在这里）要么是
     # 两份互不相干的数据；声明成值是为了让「要不要两个」成为部署问题而不是改模板。
-    # tunable: fixed
+    # tunable:
     # why: One instance: the database is single-writer in this chart, so a second copy would be a second
     # why: dataset rather than a replica. Failover is not configured here, and no reading moves this number.
     replicas: 1
     # 库的服务端口。写在这里而不是各清单各写一遍：DSN 分散在四个工作负载的 env、
     # Service、容器端口与网络策略里，五处各写一个数时，改端口的那个部署会得到
     # "连接被拒"与"策略丢包"两种都读起来像宕机的症状。
-    # tunable: fixed
+    # tunable:
     # why: The database's port, carried by the container port, the Service and five DSNs in four workloads plus
     # why: the app's own config file. An address.
     port: 5432
@@ -2235,15 +2257,24 @@ backends:
     # 服务端自己的连接上限。它不是一个可以随便拍的数：存储插件启动时读这一格，把它
     # 按「同时在跑的进程数 × 每个进程的池数」分给每一池，所以它是那个分配式的分母。
     #
-    # 200 的来处：2026-11-17 实测，滚动期间新旧两代 Pod 同时在池里，`pg_stat_activity`
-    # 数到 100 就打满（连超级用户也进不去，新 Pod 连建表都连不上）。服务器上限必须盖住
-    # **两代**，所以取实测峰值的一倍余量。改它之前先读同一格读数：峰值若变了，这个数
-    # 该跟着变；读不到时 `pg_pool_ceiling_unmeasured` 会亮。
-    # tunable: fixed
-    # why: 这一格是 PostgreSQL 服务端自己的上限，不是本平台施加给工作的界：它的唯一作用 是当分母，让存储插件按「同时在跑的进程数 × 每进程池数」分出每一池的额度。 今天的值来自一次实测（滚动期间
-    # why: pg_stat_activity 到 100 就打满，新 Pod 连建表 都连不上），取峰值的一倍以盖住新旧两代同时在池里。它**还没有闭环**：闭环的
-    # why: 输入是「同时在跑的最大进程数」，那是一条进程普查读数，尚未接进这一格的计算， 所以现在标 fixed 而不是 derived——等那条读数接上，这一行改成 derived 并补一条 「换输入 ⇒
-    # why: 值跟着变」的证明。
+    # 200 的来处是 2026-11-17 的一次事故：滚动期间新旧两代 Pod 同时在池里，
+    # `pg_stat_activity` 数到 100 就打满（连超级用户也进不去，新 Pod 连建表都连不上），
+    # 于是取那次峰值的一倍，盖住两代同时在池里。那条读数今天仍然有生产者（下面
+    # `measured-once:` 点名的序列），但没有闭环重取它：服务端的上限改不改是一个部署
+    # 决定，`ALTER SYSTEM` 改 `max_connections` 还要重启数据库，所以它不是能跟着读数
+    # 走的那种数。运行时也不靠它保持正确——插件启动时读服务端真实的上限，按进程与池数
+    # 分摊并把是哪个界定的值发在池读数上；读不到时 `pg_pool_ceiling_unmeasured` 会亮。
+    # tunable:
+    # why: The server's own ceiling, not a bound this platform puts on its work: the storage plugin divides it
+    # why: across the processes and pools sharing the server, so it is the denominator of that division rather
+    # why: than a number anything obeys directly. 200 came from one incident -- a rolling update on 2026-11-17
+    # why: where pg_stat_activity reached 100 and took no one else, so the new pod could not even create its
+    # why: tables -- doubled to cover two generations sharing the server at once. The reading it rests on still
+    # why: has a producer, but no loop re-takes it: raising the server's own limit means restarting the
+    # why: database, which is a deployment decision rather than a value following a reading. The runtime does
+    # why: not lean on it staying right -- the plugin reads the server's real ceiling at start-up, divides it
+    # why: across the processes and pools, and publishes which bound decided.
+    # measured-once: series=pg_stat_activity_count date=2026-11-17 found=100
     maxConnections: 200
     # 读数边车与数据库同 Pod：抓数据库的读数要库口令，独立进程就得再存一份。
     # 这个 tag 是读数的生产者，不是实现细节：最老事务年龄那条读数读的
@@ -2253,10 +2284,10 @@ backends:
     # 边车上重抓一次 `deploy/images/postgres-exporter.series.yaml`。
     exporterImage: prometheuscommunity/postgres-exporter:v0.15.0
     # 边车自己监听的那个端口：抓取端的 ServiceMonitor/抓取注解按它取数。
-    # tunable: fixed
+    # tunable:
     # why: The metrics sidecar's port beside the database. An address the scraper names.
     exporterPort: 9187
-    # tunable: derived
+    # tunable:
     # why: The database volume: tables plus WAL. The capacity loop reads the claim's used bytes from the
     # why: claim-store walker and raises the declaration to the measured peak x 120% (whole GiB) when the peak
     # why: has outgrown it. It cannot read `pg_database_size` from inside the database and does not need to:
@@ -2278,7 +2309,7 @@ backends:
     # of its 38 cores free and the node 24 idle.
     resources:
       requests:
-        # tunable: derived
+        # tunable:
         # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
         # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
         # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -2288,10 +2319,10 @@ backends:
         # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
         # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
         cpu: 500m
-        # tunable: derived
+        # tunable:
         # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
         # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-        # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+        # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
         # why: quantum. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -2299,7 +2330,7 @@ backends:
         # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
         memory: 512Mi
       limits:
-        # tunable: derived
+        # tunable:
         # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
         # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
         # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
@@ -2309,9 +2340,9 @@ backends:
         # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
         # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
         cpu: 2000m
-        # tunable: derived
+        # tunable:
         # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
         # why: request. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -2324,7 +2355,7 @@ backends:
     # 没有连接」一样。
     exporterResources:
       requests:
-        # tunable: derived
+        # tunable:
         # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
         # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
         # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -2335,10 +2366,10 @@ backends:
         # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
         # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
         cpu: 10m
-        # tunable: derived
+        # tunable:
         # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
         # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-        # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+        # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
         # why: quantum. The metrics sidecar sits in the same Pod and is charged to the namespace ceiling like any
         # why: other container, so its own draw is measured the same way. The reading published under this key
         # why: carries `source=derived` once the window has enough samples, and `source=seed` with the declared
@@ -2347,7 +2378,7 @@ backends:
         # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
         memory: 32Mi
       limits:
-        # tunable: derived
+        # tunable:
         # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
         # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
         # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
@@ -2358,9 +2389,9 @@ backends:
         # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
         # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
         cpu: 200m
-        # tunable: derived
+        # tunable:
         # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
         # why: request. The metrics sidecar sits in the same Pod and is charged to the namespace ceiling like any
         # why: other container, so its own draw is measured the same way. The reading published under this key
         # why: carries `source=derived` once the window has enough samples, and `source=seed` with the declared
@@ -2372,18 +2403,18 @@ backends:
     enabled: true
     # 一个实例，且它的名字 redis-0 写进了几处 DSN：多副本要连的是一组哨兵或
     # 一个 Cluster，不是把这个数改大。
-    # tunable: fixed
+    # tunable:
     # why: One instance, and its name redis-0 is written into several DSNs. A second copy needs sentinels or
     # why: cluster mode, which this chart does not configure; no reading moves this number.
     replicas: 1
     # 服务端口。它同时出现在容器端口、Service、网络策略与三个 DSN（主应用、进化、
     # 安全网关）里；分成四份写就是四次机会让其中一处先动。
-    # tunable: fixed
+    # tunable:
     # why: The store's port, carried by the container port, the Service, four DSNs and the WAL census script
     # why: that polls INFO from beside it. An address.
     port: 6379
     image: redis:7-alpine
-    # tunable: derived
+    # tunable:
     # why: The persistence volume. An AOF rewrite can briefly need almost twice the resident set, so the loop
     # why: keeps the peak over its window and raises to peak x 120% rounded up to whole GiB; a transient spike
     # why: carried in the window is what the headroom is for. The reading is published per claim.
@@ -2400,7 +2431,7 @@ backends:
     # 对不上时，让正本跟随已经在跑、且已验证稳定的那个值。
     resources:
       requests:
-        # tunable: derived
+        # tunable:
         # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
         # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
         # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -2410,10 +2441,10 @@ backends:
         # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
         # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
         cpu: 100m
-        # tunable: derived
+        # tunable:
         # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
         # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-        # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+        # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
         # why: quantum. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -2421,7 +2452,7 @@ backends:
         # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
         memory: 128Mi
       limits:
-        # tunable: derived
+        # tunable:
         # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
         # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
         # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
@@ -2431,9 +2462,9 @@ backends:
         # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
         # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
         cpu: 500m
-        # tunable: derived
+        # tunable:
         # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
         # why: request. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -2445,7 +2476,7 @@ backends:
     aofRepair:
       resources:
         requests:
-          # tunable: derived
+          # tunable:
           # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
           # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
           # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -2455,10 +2486,10 @@ backends:
           # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
           # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
           cpu: 10m
-          # tunable: derived
+          # tunable:
           # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
           # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-          # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+          # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
           # why: quantum. The reading published under this key carries `source=derived` once the window has enough
           # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
           # why: side of the measurement it is looking at.
@@ -2466,7 +2497,7 @@ backends:
           # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
           memory: 32Mi
         limits:
-          # tunable: derived
+          # tunable:
           # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
           # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
           # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
@@ -2476,9 +2507,9 @@ backends:
           # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
           # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
           cpu: 200m
-          # tunable: derived
+          # tunable:
           # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-          # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+          # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
           # why: request. The reading published under this key carries `source=derived` once the window has enough
           # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
           # why: side of the measurement it is looking at.
@@ -2491,12 +2522,12 @@ backends:
     aofReportExporter:
       image: quay.io/prometheus/node-exporter:v1.12.1-distroless
       # 边车暴露 textfile 目录的那个端口：抓取端按它取回 AOF 修复的判词。
-      # tunable: fixed
+      # tunable:
       # why: The node-exporter sidecar's port that serves the AOF repair verdict textfile. An address.
       port: 9100
       resources:
         requests:
-          # tunable: derived
+          # tunable:
           # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
           # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
           # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -2506,10 +2537,10 @@ backends:
           # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
           # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
           cpu: 10m
-          # tunable: derived
+          # tunable:
           # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
           # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-          # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+          # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
           # why: quantum. The reading published under this key carries `source=derived` once the window has enough
           # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
           # why: side of the measurement it is looking at.
@@ -2517,7 +2548,7 @@ backends:
           # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
           memory: 16Mi
         limits:
-          # tunable: derived
+          # tunable:
           # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
           # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
           # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
@@ -2527,9 +2558,9 @@ backends:
           # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
           # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
           cpu: 100m
-          # tunable: derived
+          # tunable:
           # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-          # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+          # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
           # why: request. The reading published under this key carries `source=derived` once the window has enough
           # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
           # why: side of the measurement it is looking at.
@@ -2541,14 +2572,14 @@ backends:
     # the staleness bound is derived from the period the writer actually runs at
     # rather than from a constant written next to the alert rule.
     infoExporter:
-      # tunable: fixed
+      # tunable:
       # why: The scrape cadence agreement, not a measured size: a scraped reading only has to be newer than the
       # why: scrape interval to be a reading at all, and the monitoring stack scrapes at 30 s. A faster poll
       # why: returns the same INFO reply; a slower one makes two consecutive scrapes carry the same sample. The
       # why: value is published as cogneva_redis_info_interval_seconds, so the staleness rule derives its bound
       # why: from it instead of holding a second copy that can drift.
       intervalSeconds: 30
-      # tunable: fixed
+      # tunable:
       # why: A cost agreement with the store it reads: the census is one full keyspace walk with an LLEN per
       # why: matching key, so it runs on its own slower clock rather than with every INFO. Five minutes is far
       # why: slower than the cap it watches -- the longest log moves one append at a time -- so "is the cap
@@ -2559,7 +2590,7 @@ backends:
       walScanIntervalSeconds: 300
       resources:
         requests:
-          # tunable: derived
+          # tunable:
           # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
           # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
           # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -2569,10 +2600,10 @@ backends:
           # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
           # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
           cpu: 10m
-          # tunable: derived
+          # tunable:
           # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
           # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-          # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+          # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
           # why: quantum. The reading published under this key carries `source=derived` once the window has enough
           # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
           # why: side of the measurement it is looking at.
@@ -2586,7 +2617,7 @@ backends:
         # quota fits. 500m clears the burst and still lets a tight node
         # schedule the pod, because the request is what the scheduler reads.
         limits:
-          # tunable: derived
+          # tunable:
           # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
           # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
           # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
@@ -2596,9 +2627,9 @@ backends:
           # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
           # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
           cpu: 500m
-          # tunable: derived
+          # tunable:
           # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-          # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+          # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
           # why: request. The reading published under this key carries `source=derived` once the window has enough
           # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
           # why: side of the measurement it is looking at.
@@ -2608,21 +2639,21 @@ backends:
   qdrant:
     enabled: true
     # 一个实例。分片与副本要另配集群模式，这个数不是那条路。
-    # tunable: fixed
+    # tunable:
     # why: One instance: sharding and replication are a cluster mode this chart does not configure, and nothing
     # why: measures vector-store load.
     replicas: 1
     image: qdrant/qdrant:v1.13.4
     # REST 与 gRPC 两个面：REST 是主应用与备份用的那个，gRPC 只给批量写入，
     # 两者端口由 qdrant 自己定义、由 chart 声明，所以两个都在这里，不各写一份。
-    # tunable: fixed
+    # tunable:
     # why: Qdrant's REST port, the one the backup snapshots and the network policy use; gRPC has no snapshot
     # why: API. An address.
     port: 6333
-    # tunable: fixed
+    # tunable:
     # why: Qdrant's gRPC port, which the app's QDRANT_URL points at for batch writes. An address.
     grpcPort: 6334
-    # tunable: derived
+    # tunable:
     # why: The vector store volume. The capacity loop measures this claim's peak from the claim-store walker
     # why: and raises the declaration to peak x 120% (whole GiB). The number of indexed vectors decides it, but
     # why: that count is not the figure the declaration needs: the bytes on the volume are, and those are read
@@ -2632,7 +2663,7 @@ backends:
     storage: 10Gi
     resources:
       requests:
-        # tunable: derived
+        # tunable:
         # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
         # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
         # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -2642,10 +2673,10 @@ backends:
         # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
         # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
         cpu: 250m
-        # tunable: derived
+        # tunable:
         # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
         # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-        # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+        # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
         # why: quantum. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -2653,7 +2684,7 @@ backends:
         # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
         memory: 512Mi
       limits:
-        # tunable: derived
+        # tunable:
         # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
         # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
         # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
@@ -2663,9 +2694,9 @@ backends:
         # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
         # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
         cpu: 2000m
-        # tunable: derived
+        # tunable:
         # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
         # why: request. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -2676,20 +2707,20 @@ backends:
     enabled: true
     # 单节点总线：消息是进程间投递用的，不靠它做持久化队列，多副本要的是集群
     # 路由与流复制，不是把这个数加一。
-    # tunable: fixed
+    # tunable:
     # why: One instance: the bus carries process-to-process messages rather than a durable queue, so a second
     # why: node needs cluster routing and stream replication. Not a reading.
     replicas: 1
     image: nats:2.10-alpine
     # 客户端端口（进程间投递走它）与监控端口（/varz 一类的运维读数）。
-    # tunable: fixed
+    # tunable:
     # why: The bus's client port, used for inter-process delivery. An address.
     port: 4222
-    # tunable: fixed
+    # tunable:
     # why: The bus's monitoring endpoint (--http_port), carried in both the args and the container port. An
     # why: address.
     monitorPort: 8222
-    # tunable: derived
+    # tunable:
     # why: JetStream stream storage, bounded by the retention the streams carry. The capacity loop measures the
     # why: claim from the claim-store walker and raises the declaration when the measured peak, times the
     # why: shared 120% headroom, exceeds it; the reading under `cogneva_volume_capacity_bytes{claim,state}`
@@ -2699,7 +2730,7 @@ backends:
     storage: 10Gi
     resources:
       requests:
-        # tunable: derived
+        # tunable:
         # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
         # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
         # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -2709,10 +2740,10 @@ backends:
         # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
         # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
         cpu: 100m
-        # tunable: derived
+        # tunable:
         # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
         # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-        # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+        # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
         # why: quantum. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -2720,7 +2751,7 @@ backends:
         # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
         memory: 256Mi
       limits:
-        # tunable: derived
+        # tunable:
         # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
         # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
         # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
@@ -2730,9 +2761,9 @@ backends:
         # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
         # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
         cpu: 500m
-        # tunable: derived
+        # tunable:
         # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
         # why: request. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -2742,17 +2773,17 @@ backends:
   meilisearch:
     enabled: true
     # 一个实例：索引来自共享库的投影，多个副本要各自灌一遍同一份索引。
-    # tunable: fixed
+    # tunable:
     # why: One instance: the index is a projection of the shared database, so a second copy would ingest the
     # why: same rows again. Nothing measures query load on this store, so no loop moves this number.
     replicas: 1
     image: getmeili/meilisearch:v1.10.3
     # HTTP 端口：主应用的 wiki 检索与进化 Pod 的启动健康检查都按它取地址。
-    # tunable: fixed
+    # tunable:
     # why: Meilisearch's HTTP port, which the evolution pod health-checks at startup and the app reads the wiki
     # why: index from. An address.
     port: 7700
-    # tunable: derived
+    # tunable:
     # why: The search index volume. The capacity loop reads this claim's used bytes from the claim-store walker
     # why: (no process of ours runs inside the backend Pod), keeps the peak over its window, and raises the
     # why: declaration to peak x 120% rounded up to whole GiB when the peak no longer fits. A PVC cannot
@@ -2764,7 +2795,7 @@ backends:
     storage: 5Gi
     resources:
       requests:
-        # tunable: derived
+        # tunable:
         # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
         # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
         # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -2774,10 +2805,10 @@ backends:
         # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
         # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
         cpu: 100m
-        # tunable: derived
+        # tunable:
         # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
         # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-        # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+        # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
         # why: quantum. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -2785,7 +2816,7 @@ backends:
         # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
         memory: 256Mi
       limits:
-        # tunable: derived
+        # tunable:
         # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
         # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
         # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
@@ -2795,9 +2826,9 @@ backends:
         # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
         # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
         cpu: 1000m
-        # tunable: derived
+        # tunable:
         # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
         # why: request. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -2811,7 +2842,7 @@ backends:
     enabled: true
     # 一个实例：master、volume、filer、s3 四个进程同 Pod，多副本要的是它们各自
     # 的集群部署，不是把这个数加一。
-    # tunable: fixed
+    # tunable:
     # why: One instance: master, volume, filer and S3 run in one pod, and scaling them is a cluster deployment
     # why: of those roles rather than a replica count. Not a reading.
     replicas: 1
@@ -2820,22 +2851,22 @@ backends:
     # filer 是带目录结构的视图，s3 是主应用读写 Raw 层走的那一个。它们必须与
     # 启动参数里传给各进程的端口一致，所以参数也从这里取——写两份的话，改一处的
     # 那次里 s3 客户端连的是一个没人听的端口。
-    # tunable: fixed
+    # tunable:
     # why: The master's port in the four-process single pod (it allocates volumes). An address, written in both
     # why: the args and the container port.
     masterPort: 9333
-    # tunable: fixed
+    # tunable:
     # why: The volume server's port, where objects actually live. An address.
     volumePort: 8080
-    # tunable: fixed
+    # tunable:
     # why: The filer's port: the directory-shaped view over the volumes. An address.
     filerPort: 8888
-    # tunable: fixed
+    # tunable:
     # why: The S3 gateway's port, the one the app signs requests against and the readiness probe waits on. An
     # why: address.
     s3Port: 8333
     # 承载永久记忆的 Raw 层与冷层：只增不减，实测已 15Gi，取 20Gi。
-    # tunable: derived
+    # tunable:
     # why: Write-once object storage for the permanent-memory raw records and cache. The loop reads the claim
     # why: from the claim-store walker, keeps the peak, and raises the declaration when peak x 120% exceeds it;
     # why: objects are never rewritten, so the figure only grows and the declaration follows it up.
@@ -2844,7 +2875,7 @@ backends:
     storage: 20Gi
     resources:
       requests:
-        # tunable: derived
+        # tunable:
         # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
         # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
         # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -2854,10 +2885,10 @@ backends:
         # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
         # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
         cpu: 100m
-        # tunable: derived
+        # tunable:
         # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
         # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-        # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+        # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
         # why: quantum. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -2865,7 +2896,7 @@ backends:
         # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
         memory: 256Mi
       limits:
-        # tunable: derived
+        # tunable:
         # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
         # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
         # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
@@ -2875,9 +2906,9 @@ backends:
         # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
         # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
         cpu: 1000m
-        # tunable: derived
+        # tunable:
         # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
         # why: request. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -2984,7 +3015,7 @@ gitops:
 
 # 平台 webhook 集群入口（GitHub + Gitee 共用）：NodePort 转发安全网关 8082。
 webhook:
-  # tunable: fixed
+  # tunable:
   # why: The cluster entry point for the GitHub and Gitee webhooks, forwarded to the gateway's 8082. An
   # why: address that outside senders are configured against; a measurement must not move it.
   nodePort: 30991
@@ -3045,7 +3076,7 @@ alertmanager:
     # 逗号分隔的收件人。
     recipients: ""
     smtpHost: ""
-    # tunable: fixed
+    # tunable:
     # why: 587 is the SMTP submission port with STARTTLS. The number belongs to the protocol; a relay listening
     # why: elsewhere is an operator's --set, not a measurement for a loop to track.
     smtpPort: 587
@@ -3075,7 +3106,7 @@ ingress:
   host: ""
   # 读写超时（秒）。WebSocket 与 SSE 走这条路由：nginx 的默认 60s 会把一条空闲
   # 超过一分钟的长连接掐掉，而掐断在浏览器侧只表现为"重连"，看不出是入口干的。
-  # tunable: fixed
+  # tunable:
   # why: nginx's proxy-read/send-timeout is a protocol parameter at the edge: how long an idle proxied
   # why: connection may stay open. The WebSocket face and the live event stream are idle between frames by
   # why: design, and nginx's 60 s default severs them in a way the browser reports only as a reconnect. The
@@ -3188,7 +3219,7 @@ taskRouter:
   # （`reserve_tokens`，按已完成任务量），相除就是这一窗还付得起几条。这个数随窗口
   # 滚动，配置里写下的任何正数都只是写下那天的窗口；所以这里交给导出，每拍重算并
   # 写回 `cogneva_task_router_claim_slots` 与求值计数。正数仍是覆盖位。
-  # tunable: derived
+  # tunable:
   # why: How many tasks one executing process runs at once -- the number of concurrent spenders of the token
   # why: window, and the only global bound on parallelism: the board's column limits are per goal, so a
   # why: `running=1` there holds each goal to one and says nothing about eight goals running eight tasks. The
@@ -3246,7 +3277,7 @@ taskRouter:
   # 下降立即、上升每窗一格。上面那条判据因此不再需要有人手动抬——峰值下来之后，
   # 导出值自己会往上走；容器被抬到更大的上限时也一样。正数才是覆盖位：
   # 钉死它时，读数面上的 `claim_slots` 就是这里写的那个数。
-  # tunable: derived
+  # tunable:
   # why: How many change tasks the process-local lane runs at once -- the lane every change-generation task
   # why: travels, so this number is the platform's change throughput. The chart ships 0, which asks for the
   # why: bound to be derived: every window `crates/cog-orchestrator/src/lane_memory.rs` reads the container's
@@ -3255,10 +3286,10 @@ taskRouter:
   # why: divides the headroom by that price; the bound falls at once and climbs one step only after the
   # why: current bound was actually run full. A positive number is the override seat and pins it. The two
   # why: inputs are the reason it cannot be a constant: the 2026-11-07 reading that pinned it at 1 (peak
-  # why: 15.96 GiB of a 16 GiB ceiling, mean 8.27 GiB) is a fact about the container as it was sized that（默认）
+  # why: 15.96 GiB of a 16 GiB ceiling, mean 8.27 GiB, measured) is a fact about the container as it was sized that
   # why: day, and a number typed into the chart cannot see the container grow. What the loop cannot do is
   # why: raise the ceiling itself: the namespace quota measured the same day holds 78Gi of limits.memory with
-  # why: 59.6Gi in use plus a roll's replacement overlap, so the derived bound stays at one until somebody（默认）
+  # why: 59.6Gi measured in use plus a roll's replacement overlap, so the derived bound stays at one until somebody
   # why: raises the container and the loop reads the new `memory.max`.
   # published: owner=crates/cog-orchestrator/src/lane_memory.rs file=crates/cog-orchestrator/src/observable.rs metric=TASK_ROUTER_CLAIM_SLOTS_METRIC label=source cadence=periodic
   # proof: file=crates/cog-orchestrator/src/lane_memory.rs test=the_bound_follows_the_container_limit beat=the_bound_beat_counts_even_when_the_container_does_not_move evidence=bound_evaluations
@@ -3284,7 +3315,7 @@ changeLedger:
   # `source` 标签，每一拍记一次
   # `cogneva_change_ledger_rows_per_handover_evaluations_total`：界不动时，
   # 只有这条计数能说明回路还在算。正数仍是覆盖位（钉死它，读数面就报这个数）。
-  # tunable: derived
+  # tunable:
   # why: How many owed changes one hand-over carries, recomputed on every ledger pass from the batches the
   # why: pass itself handed over. The price of a task is mostly its fixed part -- a plan, a run's context, a
   # why: sandbox round over the whole tree -- and that part does not grow with what the task carries, so
@@ -3310,7 +3341,7 @@ webSearch:
   enabled: true
   # 检索后端的端口：`base` 里的地址、容器端口、Service 与 egree 放行都按它取，
   # 而 base 与策略各写一个字面量时，改一处的那次查询被策略静默丢弃。
-  # tunable: fixed
+  # tunable:
   # why: The self-hosted SearXNG port: the derived base URL, the container port, the Service and the egress
   # why: rule all read it. An address.
   port: 8080
@@ -3331,14 +3362,14 @@ webSearch:
   # 代价是额度与公众共用——它恰好会在最需要一条后备的时候被限流。
   fallbackBase: "http://cogneva-security-gateway:8081/search-fallback"
   image: docker.io/searxng/searxng:2026.9.8-3fdc6d753
-  # tunable: fixed
+  # tunable:
   # why: One in-cluster instance answers every agent's web_search call. A second replica would add capacity
   # why: that nothing measures: the call path caps how many results it reads, and no reading of queue depth
   # why: or query latency is fed back into this number. A deployment that runs it hot raises this by hand.
   replicas: 1
   resources:
     requests:
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
       # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -3348,10 +3379,10 @@ webSearch:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 100m
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -3359,7 +3390,7 @@ webSearch:
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 256Mi
     limits:
-      # tunable: derived
+      # tunable:
       # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
       # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
       # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
@@ -3369,9 +3400,9 @@ webSearch:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 1000m
-      # tunable: derived
+      # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -3388,14 +3419,14 @@ webFetch:
   enabled: true
   # 渲染后端的端口：与 webSearch.port 同一处置——地址、容器端口、Service、egress
   # 放行四处同源，否则改一处等于换了一条没人放行的路。
-  # tunable: fixed
+  # tunable:
   # why: The render backend's port, read the same way as webSearch.port. An address.
   port: 11235
   # 空值＋enabled=false＝这个部署不接渲染后端，`web_fetch` 回落到本进程读；
   # enabled=true 且 base 为空时从 port 与 Service 名派生，理由同 webSearch.base。
   base: ""
   image: docker.io/unclecode/crawl4ai:0.7.4
-  # tunable: fixed
+  # tunable:
   # why: One instance renders every page web_fetch asks for. A second replica would add capacity nothing
   # why: measures: the tool renders one page per call and no reading of render queue depth or page latency is
   # why: fed back into this number. A deployment that runs it hot raises this by hand.
@@ -3403,10 +3434,10 @@ webFetch:
   # Chromium 把共享内存当工作区用：默认的 64MiB /dev/shm 在中等页面上就会让
   # 渲染进程崩掉，而崩掉的表现是抓取超时，不是「这一页读不了」。一个页面的
   # 内存峰值 = 浏览器 + 这份 shm，limits 因此要比 shm 多出一份浏览器峰值。
-  # tunable: derived
+  # tunable:
   # why: The size of the tmpfs mounted at /dev/shm. It is memory, so it follows the renderer's own
   # why: measurement: the size law takes the container's memory peak x 120% from the kubelet summary,
-  # why: quantised to 16Mi, and that is what the volume's `sizeLimit` is patched to.（默认）
+  # why: quantised to the memory quantum (16Mi by default), and that is what the volume's `sizeLimit` is patched to.
   # why: `cogneva_workload_shm_size_bytes{workload,volume,source}` publishes the reading; `source=seed` until
   # why: the seven-day window has enough samples.
   # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=SHM_METRIC label=source cadence=periodic
@@ -3414,7 +3445,7 @@ webFetch:
   shmSize: 1Gi
   resources:
     requests:
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `cpu.usageNanoCores` from the kubelet summary every few minutes, keeps a seven-day window, and
       # why: patches the request to the window's p95, rounded up to 10m, whenever the move is at least one
@@ -3424,10 +3455,10 @@ webFetch:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 200m
-      # tunable: derived
+      # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to 16Mi, whenever the move is at least one（默认）
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -3435,7 +3466,7 @@ webFetch:
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 512Mi
     limits:
-      # tunable: derived
+      # tunable:
       # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
       # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
       # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
@@ -3445,9 +3476,9 @@ webFetch:
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 2000m
-      # tunable: derived
+      # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to 16Mi and never below the（默认）
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -3500,7 +3531,7 @@ changeVerification:
   # 下面这个数是**种子**：闸没装、或还没有一拍量到宿主时用它。历史依据是 2026-11-07
   # 进化 Pod 实测：峰值 15.6 GiB 顶着 16 GiB 容器上限，3 是让峰值落回上限之下的起点。
   # 量到宿主之后，宽度由实测取代，不再按这个数压。
-  # tunable: derived
+  # tunable:
   # why: The width the verification build fans out at, recomputed from the build gate's own measurement of
   # why: this host: the host's cores divided by what one build demands of them, the same division the gate
   # why: uses to decide how many builds fit. The verification process reads that width when it is spawned, so
@@ -3514,20 +3545,20 @@ changeVerification:
 
 mainlineDeployer:
   enabled: true
-  # tunable: derived
+  # tunable:
   # why: How often the bare repository is polled for a new main. The beat is the larger of the seed and the
   # why: cycle that just ran: a cycle can include a build and a rollout, so the wait is the remainder of the
   # why: beat the cycle consumed rather than the seed again.
   # published: owner=crates/cog-reflection/src/mainline_deployer.rs file=crates/cog-core/src/pacing.rs metric=TARGET_METRIC label=source cadence=periodic
   # proof: file=crates/cog-reflection/src/mainline_deployer.rs test=the_mainline_wait_follows_what_a_cycle_cost beat=the_mainline_wait_follows_what_a_cycle_cost evidence=evaluations
   pollIntervalSecs: 600
-  # tunable: derived
+  # tunable:
   # why: How long a rolled-out version runs before it is called good. Twice the measured soak phase, floored
   # why: at the protocol minimum for the host to schedule it, recomputed from each round's reading.
   # published: owner=crates/cog-reflection/src/mainline_deployer.rs file=crates/cog-core/src/pacing.rs metric=TARGET_METRIC label=source cadence=periodic
   # proof: file=crates/cog-reflection/src/mainline_deployer.rs test=a_measured_wait_turns_the_next_rollouts_declared_window beat=a_measured_wait_turns_the_next_rollouts_declared_window evidence=evaluations
   soakSecs: 120
-  # tunable: derived
+  # tunable:
   # why: How long after a failed rollout the deployer waits before trying the same revision again. The number
   # why: is the seed doubled once per consecutive environment failure and returned to the seed when one
   # why: converges; the count is measured by the loop, and the published target plus its evaluation count
@@ -3541,7 +3572,7 @@ mainlineDeployer:
   # 下面这个数是**种子**：闸没装、或还没有一拍量到宿主时用它。历史依据是 2026-10-19
   # 进化 Pod 内实测（jobs=2 时两个 rustc 各占一核、合计 RSS 0.7~1.1 GiB；Pod 上限
   # 8 核 / 16 GiB，取 6 = 8 核减去 Pod 自身要留的 2 核）。量到宿主之后由实测取代。
-  # tunable: derived
+  # tunable:
   # why: How many cargo jobs the mainline build runs, from the same build-gate window the verification build
   # why: reads: the host's cores divided by what one build demands, so the mainline and the verification
   # why: builds fan out over the share the gate booked for each. The width is read when the build is spawned,
@@ -3565,7 +3596,7 @@ mainlineDeployer:
   # 滚动启动阶段的上界（秒）：Pod 的 init 容器（仓库种子/镜像拉取）未结束时
   # 不吃就绪预算、只吃这个上界。种子是网络克隆，耗时随集群到上游的链路变化，
   # 链路慢就调大这里，不要靠放宽就绪预算。
-  # tunable: derived
+  # tunable:
   # why: The init-container phase's own budget: the seed is a network clone whose duration follows the link
   # why: to the upstream. Twice the measured startup phase from the previous round; the seed stands until one
   # why: round has reported its durations.
@@ -3574,7 +3605,7 @@ mainlineDeployer:
   startupTimeoutSecs: 900
   # 滚动就绪阶段的上界（秒）：init 全部结束后，单个 deployment 收敛的预算。
   # 默认值不改（300s），只把上界变成可调。
-  # tunable: derived
+  # tunable:
   # why: How long a single deployment gets to converge after init finishes. The declared window is twice the
   # why: rollout phase measured by the judging process on the previous round, from the same rollout-resource
   # why: reading that sizes the Job; the loop records the durations each round, so the budget follows the
@@ -3617,7 +3648,7 @@ mainlineDeployer:
   # step from an OOM kill, and Go's GC thrashes as the heap nears the cap. The
   # request covers the resident heap between kubectl bursts.
   rolloutJob:
-    # tunable: derived
+    # tunable:
     # why: The rollout judgement's own scheduling claim follows what its past runs measured of themselves: each
     # why: finished Job writes its average CPU and peak memory into its termination message, the deployer keeps
     # why: that run history on disk, and sizes the next Job by the same law. The request is the p95 of those
@@ -3627,17 +3658,17 @@ mainlineDeployer:
     # published: owner=crates/cog-reflection/src/mainline_deployer.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_CPU_METRIC label=source cadence=periodic
     # proof: file=crates/cog-reflection/src/mainline_deployer.rs test=the_rollout_jobs_sizing_lands_on_the_container_resource_surface beat=the_rollout_jobs_sizing_lands_on_the_container_resource_surface evidence=evaluations
     cpuRequest: 200m
-    # tunable: derived
+    # tunable:
     # why: The rollout judgement's own scheduling claim follows what its past runs measured of themselves: each
     # why: finished Job writes its average CPU and peak memory into its termination message, the deployer keeps
     # why: that run history on disk, and sizes the next Job by the same law. The request is the p95 of those
-    # why: runs, rounded up to 16Mi. The reading on `workload="mainline-rollout"` carries `source=derived` once（默认）
+    # why: runs, rounded up to the memory quantum (16Mi by default). The reading on `workload="mainline-rollout"` carries `source=derived` once
     # why: a run history exists and `source=seed` with the chart value until then; the first run therefore
     # why: keeps the seed.
     # published: owner=crates/cog-reflection/src/mainline_deployer.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_MEMORY_METRIC label=source cadence=periodic
     # proof: file=crates/cog-reflection/src/mainline_deployer.rs test=the_rollout_jobs_sizing_lands_on_the_container_resource_surface beat=the_rollout_jobs_sizing_lands_on_the_container_resource_surface evidence=evaluations
     memoryRequest: 64Mi
-    # tunable: derived
+    # tunable:
     # why: The rollout judgement's own CPU bound is the peak of its measured runs times the 120% headroom,
     # why: rounded up to 10m and never below the request; when the last few runs spent more than 10% of their
     # why: CFS periods throttled, the bound is raised by that ratio on top, so a limit that was biting stops
@@ -3647,9 +3678,9 @@ mainlineDeployer:
     # published: owner=crates/cog-reflection/src/mainline_deployer.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
     # proof: file=crates/cog-reflection/src/mainline_deployer.rs test=the_rollout_jobs_sizing_lands_on_the_container_resource_surface beat=the_rollout_jobs_sizing_lands_on_the_container_resource_surface evidence=evaluations
     cpuLimit: "2"
-    # tunable: derived
+    # tunable:
     # why: The rollout judgement's own memory bound is the peak of its measured runs times the 120% headroom,
-    # why: rounded up to 16Mi and never below the request. The reading on `workload="mainline-rollout"` carries（默认）
+    # why: rounded up to the memory quantum (16Mi by default) and never below the request. The reading on `workload="mainline-rollout"` carries
     # why: `source=derived` once a run history exists and `source=seed` with the chart value until then; the
     # why: first run therefore keeps the seed.
     # published: owner=crates/cog-reflection/src/mainline_deployer.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_MEMORY_METRIC label=source cadence=periodic
@@ -3669,7 +3700,7 @@ mainlineDeployer:
   # 且至少留出一个实测 rev 的边际字节。下面这个数是量不到时的种子，不是生效值——
   # 生效值每拍发布在 `cogneva_retention_target{knob="…threshold"}` 上。
   registryMaintenance:
-    # tunable: derived
+    # tunable:
     # why: The used-bytes-to-declared-bytes ratio that triggers reclamation, recomputed on every poll from the
     # why: volume's own readings: the growth between two consecutive walker readings, projected over one
     # why: measured cooldown window, sets the headroom the threshold must leave (1 - growth in the window /
@@ -3681,7 +3712,7 @@ mainlineDeployer:
     # published: owner=crates/cog-reflection/src/mainline_deployer.rs file=crates/cog-core/src/retention.rs metric=TARGET_METRIC label=source cadence=periodic
     # proof: file=crates/cog-reflection/src/mainline_deployer.rs test=the_reclaim_threshold_follows_the_measured_growth_and_window beat=the_reclaim_threshold_follows_the_measured_growth_and_window evidence=evaluations
     threshold: 0.5
-    # tunable: derived
+    # tunable:
     # why: The wait between two reclamations, so a volume whose resident floor stays above the threshold is not
     # why: restarted every poll. The cooldown follows how long the last reclamation actually held the tag
     # why: service away, doubled; a zero-length hold is not a sample and leaves the target where it was. No
@@ -3694,7 +3725,7 @@ mainlineDeployer:
     # 发生了什么"这两种回溯，又不至于让老链的层长期钉在盘上。删掉的只是保留窗外
     # **且**不在保留集里的：在飞、上一版好、四部署当前钉着的 rev 一个都不删
     # （见 prunable_tags）。
-    # tunable: derived
+    # tunable:
     # why: How many revisions the registry keeps, recomputed at every maintenance round: the PVC's declared
     # why: bytes divided by what one revision actually costs. The cost is measured from the tag manifests --
     # why: each revision's layers that no other tag references, plus its config and manifest bytes -- so the
@@ -3714,7 +3745,7 @@ mainlineDeployer:
   # 缺了会报出来而不是自己补（授权面自己给自己长权限是不允许的）。
   observabilityStack:
     enabled: true
-    # tunable: derived
+    # tunable:
     # why: How often the manifests are re-applied. The next wait is the beat minus what the pass actually took,
     # why: and the beat is the larger of the seed and the pass: a converge pass that outlasts the seed sets the
     # why: next cadence instead of having a seed stacked on top of it.

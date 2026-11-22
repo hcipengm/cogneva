@@ -128,11 +128,70 @@ pub struct FastEmbedProvider {
     dim: usize,
 }
 
+/// Whether a mounted cache directory actually holds weights.
+///
+/// fastembed's hub client answers a cache miss with a download, and that request has
+/// no timeout. In a cluster that cannot reach the hub the process hangs at init
+/// instead of starting without vectors -- 2026-11-19 on a single-node k3s, a profile
+/// that enabled the weights against an empty hostPath did exactly that, and the init
+/// probe reported only "not ready". A directory named by the deployment is therefore
+/// checked before fastembed sees it: the ONNX files are what the model cannot load
+/// without, and their absence is answered here, before any network call.
+///
+/// hf-hub's snapshot entries are symlinks into `blobs/`, so the walk follows links;
+/// a check that skipped them would miss every weight it was looking for.
+pub(crate) fn cache_dir_has_weights(dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let is_dir = if meta.is_symlink() {
+            std::fs::metadata(&path)
+                .map(|target| target.is_dir())
+                .unwrap_or(false)
+        } else {
+            meta.is_dir()
+        };
+        if is_dir {
+            if cache_dir_has_weights(&path) {
+                return true;
+            }
+        } else if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("onnx"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// 权重缓存目录的环境变量名。
+///
+/// 名字只写一份：embedding provider 与 reranker 在启动时都读它，两处各拼一遍时
+/// 改名只会改一处，另一处照旧读一个再也没人设置的名字——而「读不到」在调用点上
+/// 与「本来就没配」同形，权重目录静默退回默认位置。
+pub(crate) const FASTEMBED_CACHE_DIR_ENV: &str = "FASTEMBED_CACHE_DIR";
+
+/// 进程环境里点名的权重缓存目录。
+pub(crate) fn cache_dir_from_env() -> Option<std::path::PathBuf> {
+    std::env::var_os(FASTEMBED_CACHE_DIR_ENV).map(std::path::PathBuf::from)
+}
+
 impl FastEmbedProvider {
     /// Create a new provider using BGE-M3 for both dense and sparse embeddings,
     /// loading its weights from wherever fastembed's own cache setting points.
+    ///
+    /// `FASTEMBED_CACHE_DIR` is read here rather than left to fastembed, because a
+    /// directory named by the deployment is also a promise about what is in it:
+    /// [`Self::try_new_with_cache_dir`] refuses an empty one instead of letting the
+    /// hub client go and fetch the weights.
     pub fn try_new() -> Result<Self, String> {
-        Self::try_new_with_cache_dir(None)
+        Self::try_new_with_cache_dir(cache_dir_from_env())
     }
 
     /// The same, with the cache directory named here instead of falling back to
@@ -152,6 +211,16 @@ impl FastEmbedProvider {
     /// Both halves are set up from the same directory: the session and the sparse head
     /// read the same snapshot, down to the same weight files.
     pub fn try_new_with_cache_dir(cache_dir: Option<std::path::PathBuf>) -> Result<Self, String> {
+        if let Some(dir) = cache_dir.as_deref() {
+            if !cache_dir_has_weights(dir) {
+                return Err(format!(
+                    "no ONNX weights under the mounted cache directory {}: refusing to fetch \
+                     them from the model hub (that request has no timeout, so an unreachable \
+                     hub hangs this process instead of reporting a missing weight)",
+                    dir.display()
+                ));
+            }
+        }
         let mut dense_options = fastembed::InitOptions::new(fastembed::EmbeddingModel::BGEM3)
             .with_show_download_progress(true);
         let head_dir = cache_dir.clone();

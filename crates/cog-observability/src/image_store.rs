@@ -560,6 +560,7 @@ mod tests {
 
     const NODE: &str = "node-a";
 
+    // proves: claimStore.imageScanIntervalSecs
     #[test]
     fn the_wait_after_a_walk_follows_what_the_walk_cost() {
         // 一次 12 分钟的走查、种子 15 分钟：等待仍是种子的剩余；

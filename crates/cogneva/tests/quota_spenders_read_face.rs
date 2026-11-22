@@ -300,6 +300,10 @@ impl FakeCeilings {
 
 #[async_trait::async_trait]
 impl HierarchyManager for FakeCeilings {
+    fn default_limits(&self) -> QuotaLimits {
+        unimplemented!("只读替身：这里不问落回哪一对")
+    }
+
     async fn check(&self, _: &QuotaContext, _: u64) -> HierarchyDecision {
         unimplemented!("这一读不问判定")
     }

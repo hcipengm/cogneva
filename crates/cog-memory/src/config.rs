@@ -101,14 +101,23 @@ pub struct MaintenanceConfig {
     pub refusal_sweep_namespaces: Vec<String>,
 }
 
+/// 重要度低于它的记忆按衰减顺序清掉。
+///
+/// 一条记忆被回读时重要度会被抬高，所以这条阈值分的是「还会被回读」与「已经
+/// 不再被回读」两堆。它由衰减之后回读面里还剩多少被清掉的条目定：清错了就把
+/// 它调低，清不干净就调高——不是一个可以拍定的档位。
+// cap: bound — 由衰减后的回读率定：被清掉的条目还出现在回读里，就是它太高
+const DECAY_IMPORTANCE_THRESHOLD: f32 = 0.5;
+
 impl Default for MaintenanceConfig {
     fn default() -> Self {
         Self {
-            decay_interval_secs: 3600,
-            decay_age_threshold_secs: 7 * 24 * 3600,
-            decay_importance_threshold: 0.5,
+            // 两个时间长度按「几小时 / 几天」写：一个 3600 读不出它是几小时。
+            decay_interval_secs: cog_core::day::SECONDS_PER_HOUR as u64,
+            decay_age_threshold_secs: cog_core::day::SECONDS_PER_WEEK as u64,
+            decay_importance_threshold: DECAY_IMPORTANCE_THRESHOLD,
             decay_namespaces: vec!["default".into()],
-            refusal_sweep_interval_secs: 1800,
+            refusal_sweep_interval_secs: cog_core::day::SECONDS_PER_HOUR as u64 / 2,
             refusal_sweep_namespaces: vec!["reflection".into()],
         }
     }
@@ -208,29 +217,58 @@ pub struct IngestConfig {
     pub benchmark_canary_markers: Vec<String>,
 }
 
+/// 一条消息在进 DLQ 之前重试几次。
+///
+/// 它钉的是「一条消息从首投到终局要多久」与上游断供重放窗口的关系：重试跑完
+/// 的时间长过重放窗口，消息在队列里等的那段时间就白等了；短太多则一次抖动就
+/// 进 DLQ。
+// cap: bound — 由断供重放窗口定：一条消息从首投到进 DLQ 要短于这个窗
+const INGEST_MAX_RETRIES: u32 = 3;
+
+/// 同时在途的抽取请求条数。
+// cap: bound — 由提供方的速率上限与单条抽取时长定：被 429 顶住就是它太大
+const EXTRACTION_CONCURRENCY: usize = 4;
+
+/// 一拍搬运多少条：回看窗外的补驱动与 pending 认领问的是同一件事。
+///
+/// 批大小由一拍的时限定：这一批要在下一个认领间隔到点前走完，所以它不是两个
+/// 各自可拍的数，而是一个「一段时长里搬得动多少」的读数。
+// cap: bound — 由一拍的时限定：一批要在下一个认领间隔到点前走完
+const INGEST_BATCH: usize = 32;
+
+/// 连续多少次环境类抽取失败后暂停拉取。
+// cap: bound — 由上游断供的判定时长定：暂停要早于断供把事件面塞满
+const PULL_PAUSE_AFTER_FAILURES: u32 = 3;
+
+/// 积压深度告警起点：达到后每翻倍打一条 WARN。
+// cap: bound — 由一拍的抽取吞吐定：它是「几拍才清得完」的积压量
+const BACKLOG_WARN_AT: usize = 64;
+
 impl Default for IngestConfig {
     fn default() -> Self {
         Self {
-            max_retries: 3,
-            retry_base_delay_ms: 1000,
+            max_retries: INGEST_MAX_RETRIES,
+            retry_base_delay_ms: cog_core::day::MILLIS_PER_SECOND as u64,
             enable_dlq: true,
             dlq_namespace: "dlq".into(),
-            extraction_concurrency: 4,
+            extraction_concurrency: EXTRACTION_CONCURRENCY,
             extraction_input_budget_tokens: DEFAULT_EXTRACTION_INPUT_BUDGET_TOKENS,
             startup_reconcile: true,
-            reconcile_lookback_hours: 24,
-            aged_out_redrive_batch: 32,
-            reconcile_interval_secs: 600,
-            pull_pause_after_failures: 3,
-            pull_pause_initial_secs: 60,
-            pull_pause_max_secs: 1800,
-            pool_check_secs: 30,
-            pull_resume_observation_secs: 300,
-            backlog_warn_at: 64,
+            reconcile_lookback_hours: cog_core::day::HOURS_PER_DAY as u64,
+            aged_out_redrive_batch: INGEST_BATCH,
+            reconcile_interval_secs: (10 * cog_core::day::SECONDS_PER_MINUTE) as u64,
+            pull_pause_after_failures: PULL_PAUSE_AFTER_FAILURES,
+            pull_pause_initial_secs: cog_core::day::SECONDS_PER_MINUTE as u64,
+            pull_pause_max_secs: (30 * cog_core::day::SECONDS_PER_MINUTE) as u64,
+            pool_check_secs: (cog_core::day::SECONDS_PER_MINUTE / 2) as u64,
+            pull_resume_observation_secs: (5 * cog_core::day::SECONDS_PER_MINUTE) as u64,
+            backlog_warn_at: BACKLOG_WARN_AT,
             bus_group: "memory-ingestor".into(),
-            bus_claim_interval_secs: 30,
-            bus_claim_min_idle_ms: 900_000,
-            bus_claim_batch: 32,
+            bus_claim_interval_secs: (cog_core::day::SECONDS_PER_MINUTE / 2) as u64,
+            bus_claim_min_idle_ms: (15
+                * cog_core::day::SECONDS_PER_MINUTE
+                * cog_core::day::MILLIS_PER_SECOND) as u64,
+            bus_claim_batch: INGEST_BATCH,
             benchmark_namespaces: Vec::new(),
             benchmark_canary_markers: Vec::new(),
         }
@@ -298,5 +336,55 @@ mod tests {
         let cfg = MemoryConfig::load_from(std::path::Path::new("/nonexistent/x.json")).unwrap();
         assert!(!cfg.load_embedding_model);
         assert!(!cfg.load_reranker_model);
+    }
+
+    /// 补驱动与 pending 认领问的是同一件事：一拍搬得动多少条。两个字段读同一个
+    /// 常量，改一个数两处一起动；这里从两个面钉住它——值相等，且 `Default` 里
+    /// 两个字段后面都不是裸数字。
+    #[test]
+    fn both_claims_read_one_batch_constant() {
+        let ingest = IngestConfig::default();
+        assert_eq!(ingest.aged_out_redrive_batch, INGEST_BATCH);
+        assert_eq!(ingest.bus_claim_batch, INGEST_BATCH);
+
+        let source = include_str!("config.rs");
+        let bare: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                (line.starts_with("aged_out_redrive_batch:")
+                    || line.starts_with("bus_claim_batch:"))
+                    && line
+                        .split_once(':')
+                        .map(|(_, value)| {
+                            value.trim_start().starts_with(|c: char| c.is_ascii_digit())
+                        })
+                        .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            bare.is_empty(),
+            "这两个字段不该各自写一个数，要读 INGEST_BATCH：{bare:?}"
+        );
+    }
+
+    /// `Default` 里其余几条具名常量也要真的被读到：常量与默认值相等，改常量就
+    /// 改默认。
+    #[test]
+    fn every_named_ingest_default_reads_its_constant() {
+        assert_eq!(IngestConfig::default().max_retries, INGEST_MAX_RETRIES);
+        assert_eq!(
+            IngestConfig::default().extraction_concurrency,
+            EXTRACTION_CONCURRENCY
+        );
+        assert_eq!(
+            IngestConfig::default().pull_pause_after_failures,
+            PULL_PAUSE_AFTER_FAILURES
+        );
+        assert_eq!(IngestConfig::default().backlog_warn_at, BACKLOG_WARN_AT);
+        assert_eq!(
+            MaintenanceConfig::default().decay_importance_threshold,
+            DECAY_IMPORTANCE_THRESHOLD
+        );
     }
 }

@@ -19,7 +19,6 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 futures = { workspace = true }
-tonic = { workspace = true }
 
 [dev-dependencies]
 tokio-test = "0.4"

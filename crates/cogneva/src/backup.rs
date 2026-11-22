@@ -119,7 +119,12 @@ pub struct TableReport {
 pub struct CollectionReport {
     pub name: String,
     pub snapshot: String,
-    pub points: u64,
+    /// 这个集合里有多少点，`None` 是「数不出来」。
+    ///
+    /// 快照已经下下来了，数不出来只影响这一格读数，所以它不让整趟备份失败；但它
+    /// 也不能写成 0：0 读作「这个集合是空的」，那是另一个事实，而清单正是读这份
+    /// 包覆盖了什么的地方。
+    pub points: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1207,22 +1212,34 @@ impl QdrantHttp {
         Ok(resp.json().await?)
     }
 
+    /// 列出要快照的集合。
+    ///
+    /// 两种「没读到」都不折成空表：答了 200 却没有 `result.collections`，是这份
+    /// 清单坏了，不是这个部署没有向量数据；一个没有 `name` 的条目也一样——丢掉
+    /// 它，包就会从它的实体层里少一整个集合，而清单上写着这份包覆盖了什么。
+    /// 空数组仍然是合法的：一个真的没有集合的部署，没有什么可快照的。
     async fn collection_names(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let body = self.get_json("/collections").await?;
-        let names = body["result"]["collections"]
+        let entries = body["result"]["collections"]
             .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|c| c["name"].as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .ok_or_else(|| format!("qdrant /collections has no result.collections: {body}"))?;
+        let mut names = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let name = entry["name"]
+                .as_str()
+                .ok_or_else(|| format!("qdrant /collections entry has no name: {entry}"))?;
+            names.push(name.to_string());
+        }
         Ok(names)
     }
 
     async fn points_count(&self, collection: &str) -> Result<u64, Box<dyn std::error::Error>> {
         let body = self.get_json(&format!("/collections/{collection}")).await?;
-        Ok(body["result"]["points_count"].as_u64().unwrap_or(0))
+        // 少了这一格是「没读到」，不是「0 个点」：把两者折在一起，清单就会替一个
+        // 数不出来的集合作证说它是空的。
+        body["result"]["points_count"].as_u64().ok_or_else(|| {
+            format!("qdrant collection {collection} info has no result.points_count: {body}").into()
+        })
     }
 
     /// 服务端一致性快照：创建（wait=true 阻塞到落盘）→ 下载 → 删服务端副本
@@ -1291,10 +1308,21 @@ impl QdrantHttp {
             );
         }
 
+        let points = match self.points_count(collection).await {
+            Ok(points) => Some(points),
+            Err(error) => {
+                tracing::warn!(
+                    collection,
+                    error = %error,
+                    "快照已经下下来了，但这个集合的点数没读到：清单里这一格记作「数不出来」，不记 0——0 读作「这个集合是空的」"
+                );
+                None
+            }
+        };
         Ok(CollectionReport {
             name: collection.to_string(),
             snapshot: snap_name,
-            points: self.points_count(collection).await.unwrap_or(0),
+            points,
         })
     }
 
@@ -1330,21 +1358,31 @@ impl QdrantHttp {
 /// 单独一个函数是因为它有两个读者：保留策略要按它裁，账要按它报「留下了几个、
 /// 最老的那个是哪一刻」。两处各自 `read_dir` 一遍会走出两个目录快照，而它们
 /// 说的是同一件事。
-pub fn packages_in(dir: &Path) -> Vec<PathBuf> {
-    let mut packages: Vec<PathBuf> = match std::fs::read_dir(dir) {
-        Ok(entries) => entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with(PACKAGE_PREFIX) && n.ends_with(PACKAGE_SUFFIX))
-            })
-            .collect(),
-        Err(_) => return Vec::new(),
+///
+/// 列不出来就抛错，不折成空表：空表说的是「看过了，一个包都没有」，而它与
+/// 「这一趟没看过」在每一个读者那里都得出相反的结论——保留策略会把「数不出
+/// 存量」读成「没有存量」，账会把「没量到」写成「留了 0 个」，卷外补缺会把
+/// 每一份都当成缺的。目录不存在是另一件事：那是这个安装还没有这个落点，按
+/// 空表算。逐条读一半失败同样抛错，半张表比没有更坏——它看起来是完整的。
+pub fn packages_in(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
     };
+    let mut packages: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(PACKAGE_PREFIX) && n.ends_with(PACKAGE_SUFFIX))
+        {
+            packages.push(path);
+        }
+    }
     packages.sort();
-    packages
+    Ok(packages)
 }
 
 /// 一个装着凭证材料的目录，有多少条权限违例。
@@ -1478,7 +1516,20 @@ pub fn keep_count_for_volume(capacity: Option<u64>, sizes: &[u64], seed: usize) 
 
 /// 本趟生效的保留数：从备份卷的容量和卷上现存包的大小现算。
 fn effective_keep_count(dir: &Path, seed: usize) -> usize {
-    let sizes: Vec<u64> = packages_in(dir)
+    let packages = match packages_in(dir) {
+        Ok(packages) => packages,
+        Err(e) => {
+            // 列不出来不是「一个包都没有」：这一趟按声明的数留，并在日志里点明
+            // 这个数是声明而不是量出来的。
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "备份卷列不出来，这一趟的保留数用声明值"
+            );
+            return seed;
+        }
+    };
+    let sizes: Vec<u64> = packages
         .iter()
         .filter_map(|path| std::fs::metadata(path).ok())
         .map(|metadata| metadata.len())
@@ -1489,7 +1540,18 @@ fn effective_keep_count(dir: &Path, seed: usize) -> usize {
 /// 保留策略：包名时间戳字典序即新旧序，留最新 N 份。删除旧包失败只告警——
 /// 保留失败绝不能反过来弄丢新包。
 pub fn enforce_retention(dir: &Path, keep: usize) -> Vec<PathBuf> {
-    let mut packages = packages_in(dir);
+    let mut packages = match packages_in(dir) {
+        Ok(packages) => packages,
+        Err(e) => {
+            // 删除不可逆：列不出来就一份也不裁，把决定留给下一趟能看见卷的跑。
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "备份卷列不出来，这一趟不裁任何包"
+            );
+            return Vec::new();
+        }
+    };
     let mut deleted = Vec::new();
     while packages.len() > keep {
         let victim = packages.remove(0);
@@ -1627,7 +1689,19 @@ struct LeftBehind {
 
 /// 这一次运行跑完之后，目录里还剩什么。两个数出自同一次枚举。
 fn retained_state(dir: &Path) -> (Option<i32>, Option<chrono::DateTime<Utc>>) {
-    let packages = packages_in(dir);
+    let packages = match packages_in(dir) {
+        Ok(packages) => packages,
+        Err(e) => {
+            // 两个数都记「没量到」。`Some(0)` 会被读成「这一趟跑完卷上一个包都不
+            // 剩」，而那是一次没有发生过的删除——账上的这种 0 不会自己消失。
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "备份目录列不出来，这一趟的留存数记作没量到"
+            );
+            return (None, None);
+        }
+    };
     let oldest = packages
         .first()
         .and_then(|p| p.file_name())
@@ -1998,12 +2072,35 @@ fn copy_offsite(dir: &Path, package: &Path, keep: usize) {
 /// 返回值——`copy_offsite` 把失败写成日志而不改这一跑的结局，那份日志不该被这里
 /// 读成「补好了」。
 fn backfill_offsite(volume: &Path, dir: &Path, keep: usize) -> usize {
-    let present: std::collections::HashSet<std::ffi::OsString> = packages_in(dir)
-        .into_iter()
-        .filter_map(|p| p.file_name().map(|n| n.to_os_string()))
-        .collect();
+    // 两张表都要：卷上那份读不出来就没有源，卷外那份读不出来就分不清「缺的」
+    // 与「已经有了的」，两种都会让这一趟把整卷重抄一遍或一份都不补。
+    let volume_packages = match packages_in(volume) {
+        Ok(packages) => packages,
+        Err(e) => {
+            tracing::warn!(
+                dir = %volume.display(),
+                error = %e,
+                "备份卷列不出来，这一趟不补卷外副本"
+            );
+            return 0;
+        }
+    };
+    let present: std::collections::HashSet<std::ffi::OsString> = match packages_in(dir) {
+        Ok(packages) => packages
+            .into_iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_os_string()))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "卷外目录列不出来，这一趟不补卷外副本"
+            );
+            return 0;
+        }
+    };
     let mut copied = 0;
-    for package in packages_in(volume).into_iter().rev() {
+    for package in volume_packages.into_iter().rev() {
         let Some(name) = package.file_name().map(|n| n.to_os_string()) else {
             continue;
         };
@@ -3458,7 +3555,30 @@ fn seed_evolution_bundle(
             .into());
         }
     };
-    seed_evolution_bundle_into(&bundle, report, &target)
+    seed_evolution_bundle_into(&bundle, report, &target).map(|_| ())
+}
+
+/// 种子那一步真正做了什么，而不是包里声明了什么。
+///
+/// 清单上的 `refs` 是出包那一刻 `bundle list-heads` 数出来的，里面既有
+/// `refs/heads/*`、`refs/tags/*`，也有远端跟踪 ref；种子只种前两类。两个数
+/// 并排才是这一段的读数：只报声明的那一个，「种回 N 个 ref」在一份只带了一个
+/// 远端跟踪 ref 的包上也是 N，而目标仓里一个 ref 都没有。
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SeededRefs {
+    created: usize,
+    fast_forward: usize,
+    same: usize,
+    diverged: usize,
+    /// 包里不属于权威面（既不是 heads 也不是 tags）的 ref：带了也不种。
+    outside: usize,
+}
+
+impl SeededRefs {
+    /// 现在目标仓里指着的、包里的那一份：新建、快进、本来就一样，都算。
+    fn seeded(&self) -> usize {
+        self.created + self.fast_forward + self.same
+    }
 }
 
 /// 种子本体，落点由调用方给出：恢复入口从 env 取，测试直接给临时目录。
@@ -3466,7 +3586,7 @@ fn seed_evolution_bundle_into(
     bundle: &Path,
     report: &EvolutionBundleReport,
     target: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<SeededRefs, Box<dyn std::error::Error>> {
     let meta = std::fs::metadata(bundle).map_err(|e| {
         format!(
             "包里有进化 bare 仓的 bundle 声明，但 {} 打不开：{e}",
@@ -3501,8 +3621,7 @@ fn seed_evolution_bundle_into(
             "+refs/tags/*:refs/restore/tags/*",
         ],
     )?;
-    let mut created = 0usize;
-    let mut fast_forward = 0usize;
+    let mut counts = SeededRefs::default();
     let mut diverged = Vec::new();
     let heads = git_ok(target, &["bundle", "list-heads", bundle_s])?;
     for line in heads.lines() {
@@ -3519,16 +3638,19 @@ fn seed_evolution_bundle_into(
         } else if let Some(name) = refname.strip_prefix("refs/tags/") {
             (format!("refs/restore/tags/{name}"), refname.to_string())
         } else {
-            // 远端跟踪之类不属于权威面的 ref：包里带了也不种。
+            // 远端跟踪之类不属于权威面的 ref：包里带了也不种，但要说出来——
+            // 声明数与种进去的数差的就是这几个。
+            counts.outside += 1;
             continue;
         };
         match merge_bundle_ref(target, &tmp, &target_ref)? {
-            BundleRefMerge::Created => created += 1,
-            BundleRefMerge::FastForwarded => fast_forward += 1,
-            BundleRefMerge::Same => {}
+            BundleRefMerge::Created => counts.created += 1,
+            BundleRefMerge::FastForwarded => counts.fast_forward += 1,
+            BundleRefMerge::Same => counts.same += 1,
             BundleRefMerge::Diverged => diverged.push(target_ref),
         }
     }
+    counts.diverged = diverged.len();
     // 临时命名空间不留在目标仓里：下一轮恢复再建一份，名字不会越攒越多。
     let leftovers = git_ok(
         target,
@@ -3560,21 +3682,36 @@ fn seed_evolution_bundle_into(
     tracing::info!(
         target = %target.display(),
         bytes = report.bytes,
-        refs = report.refs,
-        created,
-        fast_forward,
-        diverged = diverged.len(),
+        refs_declared = report.refs,
+        refs_seeded = counts.seeded(),
+        created = counts.created,
+        fast_forward = counts.fast_forward,
+        same = counts.same,
+        diverged = counts.diverged,
+        outside = counts.outside,
         head = %report.head,
         commit = %report.commit,
         "进化 bare 仓已从包里的 git bundle 种回"
     );
+    // 包里声明了 ref、目标仓里一个都没种上，而分叉那条警告也不会亮（没有一条
+    // 走到分叉）：恢复收尾照常写「完成」，而进化仓是空的。这不是包的错（`bundle
+    // verify` 已经过了），是包里那几个 ref 全在权威面之外。
+    if report.refs > 0 && counts.seeded() == 0 && counts.diverged == 0 {
+        tracing::warn!(
+            refs_declared = report.refs,
+            outside = counts.outside,
+            head = %report.head,
+            "包里声明了 ref，但没有一个属于 refs/heads 或 refs/tags：进化 bare 仓是空的，\
+             恢复收尾不会把这件事当成失败"
+        );
+    }
     if !diverged.is_empty() {
         tracing::warn!(
             refs = %diverged.join(","),
             "这些 ref 在目标仓里已有不同的历史，没有强推覆盖：包里的那份仍在包内"
         );
     }
-    Ok(())
+    Ok(counts)
 }
 
 enum BundleRefMerge {
@@ -4387,7 +4524,8 @@ fn package_digest(path: &Path) -> std::io::Result<String> {
 ///
 /// 段名与清单里的段名一致（postgres／qdrant／objects／artifacts／secrets），空数组读作
 /// 「这一段一份都没有」，与「这一段没声明」分开：旧包的清单里本来就没有 artifacts 段，
-/// 而今天一段都没有是事实。
+/// 而今天一段都没有是事实。qdrant 那一格的点数同理分三态：一个数、`null`（数不出来）、
+/// 以及集合不在单子上——`null` 不许折成 0，0 读作「这个集合是空的」。
 fn package_coverage(manifest: &BackupManifest) -> String {
     serde_json::json!({
         "secrets": manifest.secrets_keys,
@@ -5112,7 +5250,21 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
 
     // 先自己走一遍目录。这一对数不取自写者的 kept_after：演练存在的理由之一
     // 就是「写者说自己留了几个」需要一个不靠它的读者。
-    let packages = packages_in(&cfg.backup_dir);
+    //
+    // 列不出来是这一趟的失败，不是「卷上一个包都没有」：折成空表时，点名了
+    // `package` 的那一趟照样会打开那一份、带着 `volume_packages=0` 报成功。
+    let volume_listing = packages_in(&cfg.backup_dir);
+    let packages = match &volume_listing {
+        Ok(packages) => packages.clone(),
+        Err(e) => {
+            tracing::warn!(
+                dir = %cfg.backup_dir.display(),
+                error = %e,
+                "演练：备份卷列不出来，这一趟记作失败"
+            );
+            Vec::new()
+        }
+    };
     drill.packages_on_volume = packages.len() as i32;
     drill.oldest_package_at = packages
         .first()
@@ -5124,18 +5276,41 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
     // 读者自己看见它在。没有配置落点时这一列留空，「从来没有过一份」与「复制
     // 停了」于是由两条不同的读数分开说。
     if let Some(dir) = &cfg.offsite_dir {
-        drill.offsite_newest_at = packages_in(dir)
-            .last()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .and_then(package_instant);
+        drill.offsite_newest_at = match packages_in(dir) {
+            // 列不出来时这一格留空：它是「没量到」，与「卷外一份都没有」用同一种
+            // 缺席表示，规则读缺席，不会把一个没量到的 0 当成读数。
+            Err(e) => {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "演练：卷外目录列不出来，这一面记作没量到"
+                );
+                None
+            }
+            Ok(packages) => packages
+                .last()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .and_then(package_instant),
+        };
     }
 
     // 卷外覆盖了窗口的多少份：卷上每一份去卷外目录找同名的那一份，找不到的就是
     // 「只有这一份」。只比最新那份回答不了这件事——复制是后来才打开的时候，更早
     // 写出来的几份从来没被复制过，而最新那一列照样是绿的、照样是今晚的。
     if let Some(dir) = &cfg.offsite_dir {
-        drill.offsite_missing_packages = Some(missing_from_window(&packages, &packages_in(dir)));
+        drill.offsite_missing_packages = match packages_in(dir) {
+            // 卷外那张表读不出来时，缺口数不是 0 也不等于卷上的份数：它是没量到。
+            Err(e) => {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "演练：卷外目录列不出来，缺口数记作没量到"
+                );
+                None
+            }
+            Ok(offsite) => Some(missing_from_window(&packages, &offsite)),
+        };
     }
 
     // 仓库侧的两个时刻：宿主那一跑把 `restic snapshots` / `restic key list` 读到的
@@ -5178,12 +5353,17 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
     )
     .await;
     let watch = PassWatch::new("开工");
-    let outcome = tokio::select! {
-        done = drill_once(cfg, live, packages, &mut drill, &watch) => Some(done),
-        (step, silent, bound) = watch.stalled() => {
-            mark_pass_silent(&mut drill, step, silent, bound);
-            None
-        }
+    let outcome = match volume_listing {
+        Err(e) => Some(Err::<(), Box<dyn std::error::Error>>(
+            format!("卷上的包列不出来：{e}").into(),
+        )),
+        Ok(_) => tokio::select! {
+            done = drill_once(cfg, live, packages, &mut drill, &watch) => Some(done),
+            (step, silent, bound) = watch.stalled() => {
+                mark_pass_silent(&mut drill, step, silent, bound);
+                None
+            }
+        },
     };
     if outcome.is_none() {
         // 临时库这一趟是收不了尾了。下一次开工本来也会先删它，但一份照着包大小
@@ -5380,10 +5560,21 @@ async fn drill_once(
     // 比的是卷上最新那份，不是这一趟打开的那份：读这一列的是「卷外那份是不是最新」
     // 的规则，点名开一份旧包时拿旧包去比，会把一条本来绿的规则判红。
     if let Some(dir) = &cfg.offsite_dir {
-        drill.offsite_matches_newest = packages_in(dir)
-            .last()
-            .zip(packages.last())
-            .map(|(copy, volume)| same_file(copy, volume));
+        drill.offsite_matches_newest = match packages_in(dir) {
+            // 读不出来时这一格留空：「是不是同一份」没有量到，不写成「不是」。
+            Err(e) => {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "演练：卷外目录列不出来，这一面记作没量到"
+                );
+                None
+            }
+            Ok(offsite) => offsite
+                .last()
+                .zip(packages.last())
+                .map(|(copy, volume)| same_file(copy, volume)),
+        };
     }
 
     // 解包先做：包本身坏了要在这里停，不能等到把库删了再发现。
@@ -5946,7 +6137,19 @@ pub async fn run_drill_from_env() -> Result<(), Box<dyn std::error::Error>> {
     // 旧包的失败会被随后一行的绿盖住，而读数读的正是最新那一行。
     let mut targets: Vec<Option<String>> = vec![cfg.package.clone()];
     if cfg.also_unproven {
-        let packages = packages_in(&cfg.backup_dir);
+        let packages = match packages_in(&cfg.backup_dir) {
+            Ok(packages) => packages,
+            Err(e) => {
+                // 没有第二趟的候选就不开第二趟：这一趟仍然跑最新那份，但日志要说
+                // 明第二趟是因为列不出来才没跑，而不是因为卷上没有别的包。
+                tracing::warn!(
+                    dir = %cfg.backup_dir.display(),
+                    error = %e,
+                    "演练：备份卷列不出来，这一趟不挑第二份包"
+                );
+                Vec::new()
+            }
+        };
         // 最新那份已经在第一趟里开过了，不参加第二趟的候选：否则「从没成功过」
         // 的排序会永远先把刚写出来的那份挑出来（它当然从没成功过），第二趟每次都
         // 空转，旧包一份也轮不到。
@@ -6555,11 +6758,19 @@ mod tests {
             },
         ];
         manifest.postgres.sequences = 3;
-        manifest.qdrant = vec![CollectionReport {
-            name: "code".into(),
-            snapshot: "code.snapshot".into(),
-            points: 1024,
-        }];
+        manifest.qdrant = vec![
+            CollectionReport {
+                name: "code".into(),
+                snapshot: "code.snapshot".into(),
+                points: Some(1024),
+            },
+            // 数不出来的集合也在单子上，读作 `null`：与「空的」（0）分开。
+            CollectionReport {
+                name: "drafts".into(),
+                snapshot: "drafts.snapshot".into(),
+                points: None,
+            },
+        ];
         manifest.objects = ObjectsReport {
             files: 7,
             bytes: 2048,
@@ -6589,7 +6800,10 @@ mod tests {
             serde_json::json!([["public.backup_runs", 42], ["public.empty_table", 0]])
         );
         assert_eq!(value["postgres"]["sequences"], 3);
-        assert_eq!(value["qdrant"], serde_json::json!([["code", 1024]]));
+        assert_eq!(
+            value["qdrant"],
+            serde_json::json!([["code", 1024], ["drafts", null]])
+        );
         assert_eq!(
             value["objects"],
             serde_json::json!({"files": 7, "bytes": 2048})
@@ -6785,7 +6999,7 @@ mod tests {
         std::fs::write(off.join(newest), vec![0u8; 10]).unwrap();
 
         let count = |vol: &std::path::Path, off: &std::path::Path| {
-            missing_from_window(&packages_in(vol), &packages_in(off))
+            missing_from_window(&packages_in(vol).unwrap(), &packages_in(off).unwrap())
         };
         assert_eq!(count(&vol, &off), 2);
 
@@ -6951,6 +7165,7 @@ mod tests {
         assert!(dir.path().join("notes.txt").exists(), "非包文件不许动");
     }
 
+    // proves: backup.keepCount
     /// 保留数是卷容量与实测包大小的函数：卷更大或包更小就多留几个；量不到卷
     /// 或一个包都还没有时，部署声明顶着。
     #[test]
@@ -7486,14 +7701,14 @@ mod tests {
         // 卷外复制是第三天才有的事：前两份写下时它还不存在，所以一直缺着。
         std::fs::copy(vol.join(names[2]), off.join(names[2])).unwrap();
         assert_eq!(
-            missing_from_window(&packages_in(&vol), &packages_in(&off)),
+            missing_from_window(&packages_in(&vol).unwrap(), &packages_in(&off).unwrap()),
             2
         );
 
         assert_eq!(backfill_offsite(&vol, &off, 7), 2);
         // 判据就是演练那一列：补完必须回到 0，否则这条修法只是把同样的缺口留给下一晚。
         assert_eq!(
-            missing_from_window(&packages_in(&vol), &packages_in(&off)),
+            missing_from_window(&packages_in(&vol).unwrap(), &packages_in(&off).unwrap()),
             0,
             "补完之后 offsite_missing_packages 必须读作 0"
         );
@@ -7640,7 +7855,7 @@ mod tests {
             qdrant: vec![CollectionReport {
                 name: "c1".into(),
                 snapshot: "c1-123.snapshot".into(),
-                points: 7,
+                points: Some(7),
             }],
             objects: ObjectsReport { files: 1, bytes: 5 },
             artifacts: Vec::new(),
@@ -7849,10 +8064,60 @@ mod tests {
             b"new bytes"
         );
         assert_eq!(
-            packages_in(offsite.path()).len(),
+            packages_in(offsite.path()).unwrap().len(),
             2,
             "卷外也要按同一个份数裁，不然它只涨不落"
         );
+    }
+
+    /// 列不出来与「一个包都没有」必须是两种答案。
+    ///
+    /// 备份的每一个读者都从这张表往下算：保留策略数存量、账报「留了几个」、卷外
+    /// 补缺比窗口。折成空表时，一次读失败会让它们各自得出一个没有发生过的结论，
+    /// 而其中「留了 0 个」会随着账本落库活过写它的进程。
+    #[test]
+    fn a_directory_that_cannot_be_listed_is_an_error_not_an_empty_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        // 还没有这个落点：这是空表，不是错误。
+        assert!(packages_in(&dir.path().join("never-created"))
+            .unwrap()
+            .is_empty());
+
+        // 路径在那儿，但不是目录：读不出来。
+        let not_a_dir = dir.path().join("a-file");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        let error =
+            packages_in(&not_a_dir).expect_err("a path that is not a directory cannot be listed");
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+    }
+
+    /// 留存数读不出来时记「没量到」，不记 0。
+    ///
+    /// `Some(0)` 在账上读作「这一趟跑完卷上一个包都不剩」，与一次真实的清空同形。
+    #[test]
+    fn an_unlistable_directory_leaves_the_retained_count_unmeasured() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("a-file");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+
+        assert_eq!(
+            retained_state(&not_a_dir),
+            (None, None),
+            "列不出来不是留了 0 个"
+        );
+    }
+
+    /// 列不出来时一份也不删：保留策略的删除不可逆，看不见卷就不动手。
+    #[test]
+    fn an_unlistable_directory_deletes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("a-file");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+
+        assert!(enforce_retention(&not_a_dir, 0).is_empty());
+        assert!(not_a_dir.exists(), "看不见卷时什么都不该被删掉");
+        // 保留数退回声明值，而不是「0 份能装下」算出的 1。
+        assert_eq!(effective_keep_count(&not_a_dir, 7), 7);
     }
 
     #[test]
@@ -7863,7 +8128,7 @@ mod tests {
         let name = package_name(Utc.with_ymd_and_hms(2026, 10, 18, 3, 17, 0).unwrap());
         std::fs::write(dir.path().join(format!("{name}.partial")), b"half").unwrap();
 
-        assert!(packages_in(dir.path()).is_empty());
+        assert!(packages_in(dir.path()).unwrap().is_empty());
     }
 
     #[test]
@@ -8232,6 +8497,66 @@ mod tests {
         seed_evolution_bundle_into(&bundle, &report, target.path()).unwrap();
         assert_eq!(git(&["rev-parse", "refs/heads/main"]), head_commit);
         assert_eq!(git(&["symbolic-ref", "HEAD"]), "refs/heads/main");
+    }
+
+    /// 包里带着远端跟踪 ref 时，声明数与种进去的数不是一个数：日志里那个收货
+    /// 读数必须是后者，否则「种回 N 个 ref」在一份只带了一个远端跟踪 ref 的包上
+    /// 也是 N，而目标仓里一个 ref 都没有。
+    #[test]
+    fn a_bundle_with_a_remote_tracking_ref_says_what_it_seeded_not_what_was_declared() {
+        let src = tempfile::tempdir().unwrap();
+        let src_path = src.path();
+        let run = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(src_path, &["init", "-q"]);
+        run(src_path, &["config", "user.email", "t@example.com"]);
+        run(src_path, &["config", "user.name", "t"]);
+        run(src_path, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        std::fs::write(src_path.join("a"), b"a").unwrap();
+        run(src_path, &["add", "a"]);
+        run(src_path, &["commit", "-qm", "a", "--", "a"]);
+        let head_commit = run(src_path, &["rev-parse", "HEAD"]);
+
+        let bare = tempfile::tempdir().unwrap();
+        let clone = std::process::Command::new("git")
+            .args(["clone", "-q", "--bare"])
+            .arg(src_path)
+            .arg(bare.path())
+            .output()
+            .unwrap();
+        assert!(clone.status.success());
+        // `bundle create --all` 会把它一起打进去，而种子只种 heads/tags。
+        run(
+            bare.path(),
+            &["update-ref", "refs/remotes/origin/main", &head_commit],
+        );
+
+        let out = tempfile::tempdir().unwrap();
+        let report = bundle_evolution(Some(bare.path()), out.path())
+            .unwrap()
+            .expect("有提交的仓必须打得出 bundle");
+        assert_eq!(report.refs, 2, "main 与那个远端跟踪 ref 都在清单里");
+
+        let bundle = out.path().join("evolution.bundle");
+        let target = tempfile::tempdir().unwrap();
+        let counts = seed_evolution_bundle_into(&bundle, &report, target.path()).unwrap();
+        assert_eq!(counts.created, 1);
+        assert_eq!(counts.outside, 1, "远端跟踪 ref 带了也不种");
+        assert_eq!(counts.seeded(), 1, "种进去的是一个 ref，不是清单上的两个");
+        let refs = run(target.path(), &["for-each-ref", "--format=%(refname)"]);
+        assert_eq!(refs.lines().collect::<Vec<_>>(), vec!["refs/heads/main"]);
     }
 
     fn manifest_with_segments(segments: Vec<SegmentStamp>, bound: u64) -> BackupManifest {
@@ -9045,5 +9370,186 @@ mod tests {
             serde_json::json!([4, 3])
         );
         assert!(doc["groups"][0]["counts"].get("broken").is_none());
+    }
+
+    /// 只会说 Qdrant 快照接口那几句话的端点：建快照、下载、删快照，外加一个集合
+    /// 信息——最后这句的正文由用例给，要测的正是「数不出来」与「0 个点」分不分得开。
+    async fn serve_qdrant(info: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut chunk = [0u8; 512];
+                    loop {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&chunk[..n]),
+                        }
+                        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&head);
+                    let line = request.lines().next().unwrap_or_default();
+                    let body = if line.starts_with("POST ") {
+                        r#"{"result":{"name":"c1.snap"}}"#
+                    } else if line.starts_with("GET ") && line.contains("/snapshots/") {
+                        "snapshot-bytes"
+                    } else if line.starts_with("DELETE ") {
+                        r#"{"result":true}"#
+                    } else {
+                        info
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// 收一条 warn 的消息正文：这一格读不到时，屏幕上是哪句话。
+    #[derive(Clone, Default)]
+    struct WarnText(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    struct MessageField(String);
+
+    impl tracing::field::Visit for MessageField {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnText {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            let mut field = MessageField(String::new());
+            event.record(&mut field);
+            self.0.lock().unwrap().push(field.0);
+        }
+    }
+
+    /// 集合信息里没有 `points_count`：快照仍然是一份好快照（包不该为这一格丢掉），
+    /// 但清单里这一格必须记作「数不出来」，而且在屏幕上说得出是哪一件没读到。
+    ///
+    /// 没有这一条，`unwrap_or(0)` 会把「没读到」写成「这个集合是空的」——读这份包
+    /// 覆盖了什么的人，会以为向量层本来就没有数据。
+    #[test]
+    fn a_collection_whose_point_count_could_not_be_read_is_not_recorded_as_empty() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let warns = WarnText::default();
+        let captured = warns.clone();
+        let subscriber = tracing_subscriber::registry().with(warns);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let report = tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                let (base, server) = serve_qdrant(r#"{"result":{"status":"green"}}"#).await;
+                let dir = tempfile::tempdir().unwrap();
+                let qdrant = QdrantHttp::new(&base).unwrap();
+                let report = qdrant
+                    .snapshot_collection("c1", dir.path())
+                    .await
+                    .expect("快照本身是好的，数不出来只影响那一格");
+                assert!(
+                    dir.path().join("c1.snapshot").exists(),
+                    "快照已经下下来了，不该因为点数没读到就丢掉"
+                );
+                server.abort();
+                report
+            })
+        });
+        assert_eq!(report.points, None, "读不到的点数不许折成 0");
+        let said = captured.0.lock().unwrap().clone();
+        assert!(
+            said.iter().any(|m| m.contains("点数没读到")),
+            "数不出来这件事没有在日志里说出名字：{said:?}"
+        );
+    }
+
+    /// 反例：0 个点是量到的读数，不是「量不到」。一个永远记 `None` 的「修法」
+    /// 也必须在这里红，否则这条改动把一次真空集合读成了读不到。
+    #[tokio::test]
+    async fn an_empty_collection_is_still_counted_as_zero() {
+        let (base, server) = serve_qdrant(r#"{"result":{"points_count":0}}"#).await;
+        let dir = tempfile::tempdir().unwrap();
+        let qdrant = QdrantHttp::new(&base).unwrap();
+        let report = qdrant.snapshot_collection("c1", dir.path()).await.unwrap();
+        assert_eq!(report.points, Some(0));
+        server.abort();
+    }
+
+    /// 集合清单读不到：答了 200 却没有 `result.collections`，这一趟备份必须停下，
+    /// 而不是打出一个「qdrant 是空的」的包——清单会把这句话抄进这一跑的账里，读的人
+    /// 会以为这个部署没有向量数据，而真相是它一份都没备到。
+    ///
+    /// 没有这一条，`unwrap_or_default()` 会把「没问到」写成「一个集合都没有」。
+    #[tokio::test]
+    async fn a_collection_list_nobody_could_read_refuses_the_backup() {
+        let (base, server) = serve_qdrant(r#"{"result":{"status":"green"}}"#).await;
+        let qdrant = QdrantHttp::new(&base).unwrap();
+        let error = qdrant
+            .collection_names()
+            .await
+            .expect_err("没有 result.collections 不是「没有集合」");
+        assert!(error.to_string().contains("result.collections"), "{error}");
+        server.abort();
+    }
+
+    /// 条目没有名字：丢掉它，包里就少一整个集合，而清单还写着这份包覆盖了什么。
+    #[tokio::test]
+    async fn a_collection_entry_without_a_name_refuses_the_backup() {
+        let (base, server) =
+            serve_qdrant(r#"{"result":{"collections":[{"name":"kept"},{"id":7}]}}"#).await;
+        let qdrant = QdrantHttp::new(&base).unwrap();
+        let error = qdrant
+            .collection_names()
+            .await
+            .expect_err("没有名字的条目不是一个能快照的集合");
+        assert!(error.to_string().contains("has no name"), "{error}");
+        server.abort();
+    }
+
+    /// 反例：真的一个集合都没有时备份照常跑。一个永远报错的「修法」也必须在这里红，
+    /// 否则这条改动让任何部署都备不成份。
+    #[tokio::test]
+    async fn a_deployment_with_no_collections_still_backs_up() {
+        let (base, server) = serve_qdrant(r#"{"result":{"collections":[]}}"#).await;
+        let qdrant = QdrantHttp::new(&base).unwrap();
+        let names = qdrant.collection_names().await.unwrap();
+        assert!(names.is_empty(), "{names:?}");
+        server.abort();
+    }
+
+    /// 顺序按服务端给的来：清单里排出来的是同一份，读的人按它对账。
+    #[tokio::test]
+    async fn the_collection_list_keeps_the_servers_order() {
+        let (base, server) =
+            serve_qdrant(r#"{"result":{"collections":[{"name":"beta"},{"name":"alpha"}]}}"#).await;
+        let qdrant = QdrantHttp::new(&base).unwrap();
+        let names = qdrant.collection_names().await.unwrap();
+        assert_eq!(names, vec!["beta".to_string(), "alpha".to_string()]);
+        server.abort();
     }
 }

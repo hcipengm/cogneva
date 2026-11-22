@@ -105,16 +105,28 @@ pub struct PromotionGateConfig {
     pub gitops: GitOpsConfig,
 }
 
+/// 每 24 小时自动晋级几条：超出的排队。
+// cap: bound — 由回退面（一天内出问题能回退到哪一版）与沙盒验证的吞吐定
+const PROMOTION_QUOTA_PER_DAY: u32 = 3;
+
+/// 连续晋级后回滚几次触发熔断（转人工）。
+// cap: bound — 由回滚的成因分布定：偶发一次是正常，连着两次同一类才是判据坏了
+const ROLLBACK_BREAKER_THRESHOLD: u32 = 2;
+
+/// 连续沙盒验证失败几次触发熔断。
+// cap: bound — 由沙盒环境的抖动率定：抖一次就停会把正常变更挡在外面
+const FAILURE_BREAKER_THRESHOLD: u32 = 3;
+
 impl Default for PromotionGateConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             max_diff_lines: None,
-            quota_per_day: 3,
-            rollback_breaker_threshold: 2,
-            failure_breaker_threshold: 3,
-            soak_secs: 600,
-            awaiting_review_timeout_secs: 86_400,
+            quota_per_day: PROMOTION_QUOTA_PER_DAY,
+            rollback_breaker_threshold: ROLLBACK_BREAKER_THRESHOLD,
+            failure_breaker_threshold: FAILURE_BREAKER_THRESHOLD,
+            soak_secs: (10 * cog_core::day::SECONDS_PER_MINUTE) as u64,
+            awaiting_review_timeout_secs: cog_core::day::SECONDS_PER_DAY as u64,
             // 白名单故意收窄（宁严勿宽）：只有纯工具实现、前端、文档。
             // 未列出的路径一律按 L2 转人工。
             // `docs/` 是仓库内的外部/产品文档目录（可入库）；内部文档
@@ -163,7 +175,7 @@ impl Default for PromotionGateConfig {
                 .map(|s| s.to_string())
                 .collect(),
             trend_report_enabled: true,
-            trend_report_interval_secs: 604_800,
+            trend_report_interval_secs: cog_core::day::SECONDS_PER_WEEK as u64,
             gitops: GitOpsConfig::default(),
         }
     }
@@ -345,14 +357,32 @@ pub struct ChangeJobConfig {
     pub kubectl_bin: String,
 }
 
+/// 派发方在 Job 结束之后还留给自己的收尾时间：读日志、记终止消息、清对象。
+// cap: fixed — 收尾那几步是分钟级的：十分钟够它跑完，再长只是白等
+const CHANGE_JOB_TEARDOWN_SECS: u64 = 600;
+
+/// 同时派几个执行 Job：进程内那条路一次只跑一个构建，并发窗口只有派发这一侧
+/// 才有意义，而它受命名空间配额约束。
+// cap: bound — 由命名空间 limits.cpu 的余量 ÷ 一个 Job 的请求量定
+const CHANGE_JOB_MAX_PARALLEL: usize = 1;
+
+/// 派发后多久看一次 Job 的状态：太密只是把同一个答案取回来。
+// cap: bound — 由一次 Job 的最短执行时长定：轮询要短于它，又不能比它密一个量级
+const CHANGE_JOB_POLL_INTERVAL_SECS: u64 = 10;
+
 impl Default for ChangeJobConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            max_parallel: 1,
-            deadline_secs: 9600,
-            ttl_secs_after_finished: 86400,
-            poll_interval_secs: 10,
+            max_parallel: CHANGE_JOB_MAX_PARALLEL,
+            // 算出来的，不是挑的：验证预算 ＋ 构建预算 ＋ 构建闸门排队 ＋ 收尾。
+            // 四段里改任何一段，这个上界跟着改（见字段上的注释）。
+            deadline_secs: crate::promotion_eval::DEFAULT_EVAL_TIMEOUT_SECS
+                + crate::build_gate::SWITCH_FIELD_WAIT.as_secs()
+                + cog_core::config::BuildGateConfig::default().wait_secs
+                + CHANGE_JOB_TEARDOWN_SECS,
+            ttl_secs_after_finished: cog_core::day::SECONDS_PER_DAY as u64,
+            poll_interval_secs: CHANGE_JOB_POLL_INTERVAL_SECS,
             job_cpu_request: "500m".into(),
             job_memory_request: "2Gi".into(),
             job_cpu_limit: "2000m".into(),
@@ -517,8 +547,8 @@ impl Default for BaselinePortConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            poll_interval_secs: 3600,
-            retry_cooldown_secs: 86_400,
+            poll_interval_secs: cog_core::day::SECONDS_PER_HOUR as u64,
+            retry_cooldown_secs: cog_core::day::SECONDS_PER_DAY as u64,
         }
     }
 }
@@ -627,13 +657,27 @@ pub struct GitOpsConfig {
     pub git_user_email: String,
 }
 
+/// 金丝雀看护的判定倍数：错误率超过基线的这么多倍算回归。
+// cap: bound — 由基线的抖动幅度定：倍数小于抖动，好版本会被判成回归
+const CANARY_ERROR_RATE_MULTIPLIER: f64 = 1.5;
+
+// cap: bound — 同上，按 P99 的抖动幅度定
+const CANARY_P99_MULTIPLIER: f64 = 1.3;
+
+/// 累加计数器下，两次抓取之间至少要新增多少请求才允许对错误率下结论。
+///
+/// 这是算出来的：一版的错误率下限是 1%，要把 1% 与 0% 分开需要百量级样本，
+/// 而增量太小时一条 5xx 就能把比值抬到任意高。
+// cap: bound — 由要分辨的最小错误率（1%）与置信所需的样本量定
+const CANARY_MIN_REQUESTS_FOR_RATE: f64 = 100.0;
+
 impl Default for GitOpsConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             repo_url: String::new(),
             branch: "evolution-release".into(),
-            poll_interval_secs: 120,
+            poll_interval_secs: (2 * cog_core::day::SECONDS_PER_MINUTE) as u64,
             registry: None,
             local_registry: String::new(),
             work_dir: cog_core::paths::app_path_str("gitops"),
@@ -643,9 +687,9 @@ impl Default for GitOpsConfig {
             deployment: cog_core::topology::MAIN_DEPLOYMENT.into(),
             container: cog_core::topology::MAIN_CONTAINER.into(),
             canary_watch_secs: DEFAULT_CANARY_WATCH_SECS,
-            canary_error_rate_multiplier: 1.5,
-            canary_p99_multiplier: 1.3,
-            canary_min_requests_for_rate: 100.0,
+            canary_error_rate_multiplier: CANARY_ERROR_RATE_MULTIPLIER,
+            canary_p99_multiplier: CANARY_P99_MULTIPLIER,
+            canary_min_requests_for_rate: CANARY_MIN_REQUESTS_FOR_RATE,
             puller_enabled: true,
             git_user_name: "Cogneva Self-Evolution".into(),
             git_user_email: "self-evolution@cogneva.ai".into(),
@@ -847,11 +891,38 @@ pub struct MainlineDeployerConfig {
     pub registry_maintenance_cooldown_secs: u64,
 }
 
+/// registry 走查读取器监听的端口：node exporter 的约定口，走查按它抓同一个
+/// 读数，换端口等于换一个抓取方。
+// cap: fixed — node exporter 约定端口 9100
+const REGISTRY_WALKER_PORT: u16 = 9100;
+
+/// 构建 Job 起几个 cargo 作业：这台构建机能同时跑几个线程就几个。
+///
+/// 构建是 CPU 密集的，作业数超过核数只会在同一台机器上互相抢；写死成 2 是
+/// 在替这台没量过的机器拍一个数。
+fn default_cargo_build_jobs() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1)
+}
+
+/// 新部署起来后被重启几次算「没起来」。
+// cap: bound — 由启动期的探针节奏定：一次重启是滚动的常态，两次就是没起来
+const MAINLINE_RESTART_THRESHOLD: u32 = 1;
+
+/// 注册表里留多少个 rev：这是回退面的深度，不是磁盘容量。
+// cap: bound — 由回退面要有多深定：真正的下界是 keep 集，这个数只管有多久的历史
+const REGISTRY_RETENTION: usize = 20;
+
+/// 回收在占用达到声明容量的这个比例时动手：规则在 1.0 开火，回收要走在它前面。
+// cap: bound — 由告警规则的触发线定：它是那条线的一半，中间留一倍余量
+const REGISTRY_MAINTENANCE_THRESHOLD: f64 = 0.5;
+
 impl Default for MainlineDeployerConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            poll_interval_secs: 600,
+            poll_interval_secs: (10 * cog_core::day::SECONDS_PER_MINUTE) as u64,
             bare_repo: cog_core::paths::TREE_REPO.into(),
             branch: "main".into(),
             upstreams: Vec::new(),
@@ -863,32 +934,32 @@ impl Default for MainlineDeployerConfig {
             kubectl_bin: "kubectl".into(),
             kubectl_host_path: String::new(),
             state_dir: cog_core::paths::app_path_str("sandbox/mainline"),
-            cargo_build_jobs: 2,
-            soak_secs: 120,
-            restart_threshold: 1,
-            failure_cooldown_secs: 3600,
-            rollout_timeout_secs: 300,
-            startup_timeout_secs: 900,
+            cargo_build_jobs: default_cargo_build_jobs(),
+            soak_secs: (2 * cog_core::day::SECONDS_PER_MINUTE) as u64,
+            restart_threshold: MAINLINE_RESTART_THRESHOLD,
+            failure_cooldown_secs: cog_core::day::SECONDS_PER_HOUR as u64,
+            rollout_timeout_secs: (5 * cog_core::day::SECONDS_PER_MINUTE) as u64,
+            startup_timeout_secs: (15 * cog_core::day::SECONDS_PER_MINUTE) as u64,
             job_cpu_request: "200m".into(),
             job_memory_request: "64Mi".into(),
             job_cpu_limit: "2".into(),
             job_memory_limit: "512Mi".into(),
-            heartbeat_log_secs: 3600,
+            heartbeat_log_secs: cog_core::day::SECONDS_PER_HOUR as u64,
             manifest_dir: "deploy/k3s".into(),
             deliver_manifests: true,
             observability_stack: ObservabilityStackConfig::default(),
-            registry_walker_port: 9100,
+            registry_walker_port: REGISTRY_WALKER_PORT,
             // 由 `COGNEVA_REGISTRY_CLAIM` 填（走查边车那条声明）；没声明就是不回收。
             registry_claim: String::new(),
             // 20 个 rev ≈ 20 次滚动的回退面，按每 rev 一层的叠层增量算约
             // 0.8 GB；比值本身不构成约束（10Gi 的卷装得下），定它的是"回退
             // 面要有多深"。真正的下界是 keep 集：在飞、上一版好、当前部署、
             // 仍被 Job 钉住的 rev 一律不删，与这个数无关。
-            registry_retention: 20,
+            registry_retention: REGISTRY_RETENTION,
             // 声明量的一半：规则 data_volume_over_declared_size 在 1.0 开火，
             // 回收在它之前把占用压回叠层基底的大小，中间留出一倍余量。
-            registry_maintenance_threshold: 0.5,
-            registry_maintenance_cooldown_secs: 21600,
+            registry_maintenance_threshold: REGISTRY_MAINTENANCE_THRESHOLD,
+            registry_maintenance_cooldown_secs: 6 * cog_core::day::SECONDS_PER_HOUR as u64,
             targets: vec![
                 RolloutTargetConfig {
                     deployment: cog_core::topology::SECURITY_GATEWAY.into(),
@@ -969,7 +1040,7 @@ impl Default for ObservabilityStackConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            interval_secs: 300,
+            interval_secs: (5 * cog_core::day::SECONDS_PER_MINUTE) as u64,
             manifest_dir: "deploy/k3s/observability/manifests".into(),
             namespace: "monitoring".into(),
             backends: true,
@@ -1717,5 +1788,63 @@ mod tests {
                 (k == "COGNEVA_GENERATION_MAX_CHANGED_LINES").then(|| "eighty".to_string())
             })
             .is_err());
+    }
+
+    /// 晋级、派发、金丝雀与主部署的十一条默认值都读具名常量。
+    #[test]
+    fn the_promotion_and_deployer_defaults_read_their_names() {
+        let gate = PromotionGateConfig::default();
+        assert_eq!(gate.quota_per_day, PROMOTION_QUOTA_PER_DAY);
+        assert_eq!(gate.rollback_breaker_threshold, ROLLBACK_BREAKER_THRESHOLD);
+        assert_eq!(gate.failure_breaker_threshold, FAILURE_BREAKER_THRESHOLD);
+        assert_eq!(
+            gate.gitops.canary_error_rate_multiplier,
+            CANARY_ERROR_RATE_MULTIPLIER
+        );
+        assert_eq!(gate.gitops.canary_p99_multiplier, CANARY_P99_MULTIPLIER);
+        assert_eq!(
+            gate.gitops.canary_min_requests_for_rate,
+            CANARY_MIN_REQUESTS_FOR_RATE
+        );
+
+        let job = ChangeJobConfig::default();
+        assert_eq!(job.max_parallel, CHANGE_JOB_MAX_PARALLEL);
+        assert_eq!(job.poll_interval_secs, CHANGE_JOB_POLL_INTERVAL_SECS);
+
+        let deployer = MainlineDeployerConfig::default();
+        assert_eq!(deployer.restart_threshold, MAINLINE_RESTART_THRESHOLD);
+        assert_eq!(deployer.registry_retention, REGISTRY_RETENTION);
+        assert_eq!(
+            deployer.registry_maintenance_threshold,
+            REGISTRY_MAINTENANCE_THRESHOLD
+        );
+
+        let source = include_str!("config.rs");
+        let names = [
+            "quota_per_day",
+            "rollback_breaker_threshold",
+            "failure_breaker_threshold",
+            "max_parallel",
+            "poll_interval_secs",
+            "canary_error_rate_multiplier",
+            "canary_p99_multiplier",
+            "canary_min_requests_for_rate",
+            "restart_threshold",
+            "registry_retention",
+            "registry_maintenance_threshold",
+        ];
+        let bare: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                names.iter().any(|name| {
+                    line.strip_prefix(name)
+                        .and_then(|rest| rest.strip_prefix(':'))
+                        .map(|value| value.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+                        .unwrap_or(false)
+                })
+            })
+            .collect();
+        assert!(bare.is_empty(), "这些默认值要读常量：{bare:?}");
     }
 }

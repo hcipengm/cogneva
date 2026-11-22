@@ -224,28 +224,21 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list"]
-  # 节点的实际用量同样来自 metrics-server。它没装时这条规则不会被用到，
-  # 也不会因此报错——读不到用量是「没有数据源」，不是权限问题。
-  - apiGroups: ["metrics.k8s.io"]
-    resources: ["nodes"]
-    verbs: ["get", "list"]
-  # Pod 与它们的实际用量：与上面同一条理由——这一面画的是整个集群的容器，
-  # 不是本命名空间的容器。
+  # Pod 与它们的实际用量：这一面画的是整个集群的容器，不是本命名空间的容器。
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list"]
-  - apiGroups: ["metrics.k8s.io"]
-    resources: ["pods"]
-    verbs: ["get", "list"]
-  # 没有 metrics-server 时的用量来源：kubelet 自带的 summary 接口，经 apiserver
-  # 代理读（`/api/v1/nodes/<节点>/proxy/stats/summary`）。apiserver 按路径把代理
-  # 请求映射到子资源，`/stats/*` 落到 `nodes/stats`，只读。
+  # 实际用量只来自 metrics-server。它没装时这条规则不会被用到，也不会因此报错——
+  # 读不到用量是「没有数据源」，不是权限问题。
   #
-  # 这里刻意不要 `nodes/proxy`：那一项连同 exec、run 一起授权，而这一面只需要读
-  # 用量。多一个只读子资源，就少一条能进任何 Pod 的路径。
-  - apiGroups: [""]
-    resources: ["nodes/stats"]
-    verbs: ["get"]
+  # 不授 `nodes/proxy`：曾经有一条经 apiserver 代理读 kubelet summary 的后备
+  # （`/api/v1/nodes/<节点>/proxy/stats/summary`），当时以为它落到 `nodes/stats`，
+  # 实测是 `nodes/proxy`（2026-11-19，只授 `nodes/stats` 时每一读 403）。`nodes/proxy`
+  # 能代理到 kubelet 的每一个端点，比读一份用量大得多——所以删掉的是那条后备，
+  # 不是放宽授权。
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
   # 资源面：命名空间的配额头寸与默认限额。配额对象是命名空间级的，但读它的身份
   # 已经在集群作用域里，加在这里不额外扩大范围——只是一条只读的命名空间集合。
   - apiGroups: [""]

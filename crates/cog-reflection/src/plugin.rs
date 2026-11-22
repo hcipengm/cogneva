@@ -659,45 +659,14 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         }
 
         // Tool bridge.
+        //
+        // 建议的产物已经由引擎写进 `change_dir/tools/` 下，状态是 `Generated`。
+        // 这里只决定它要不要进工具表；答案是不进，理由见 `take_tool_suggestion`。
         {
             let tool_registry = tool_registry.clone();
-            let evolution = engine.evolution.clone();
             tokio::spawn(async move {
                 while let Some(tool_json) = tool_rx.recv().await {
-                    if let Some(name) = tool_json.get("name").and_then(|v| v.as_str()) {
-                        let description = tool_json
-                            .get("description")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let parameters = tool_json.get("parameters").cloned().unwrap_or_else(
-                            || serde_json::json!({"type": "object", "properties": {}}),
-                        );
-                        let tool = cog_core::Tool {
-                            name: name.to_string(),
-                            description,
-                            parameters,
-                            implementation: cog_core::ToolImplementation::Native(Arc::new(
-                                |_args| {
-                                    Box::pin(async move {
-                                        Ok(serde_json::json!({
-                                            "error": "not implemented yet"
-                                        }))
-                                    })
-                                },
-                            )),
-                        };
-                        tool_registry.register(tool);
-                        info!("Evolution tool variant registered: {}", name);
-                        if let Some(ref evo) = evolution {
-                            if !evo
-                                .update_status(name, crate::EvolutionStatus::Registered)
-                                .await
-                            {
-                                error!("Evolution tool registered but status update failed for artifact_id={}", name);
-                            }
-                        }
-                    }
+                    take_tool_suggestion(&tool_json, tool_registry.as_ref());
                 }
             });
         }
@@ -2163,6 +2132,36 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         info!("ReflectionPlugin shutdown");
         Ok(())
     }
+}
+
+/// 收下一条工具建议，回答它要不要进工具表。
+///
+/// 答案是不进。生成侧交回来的是名字、描述和参数表（`suggest_tool_variant`
+/// 要的就是这三样），里面没有工具表能调用的实现——原生闭包、WASM 导出、
+/// 沙盒操作，一样都没有。此前这里给它套了一个只会回
+/// `{"error": "not implemented yet"}` 的原生闭包登记进去，再把产物标成
+/// `Registered`：模型因此看得见一个可调用的名字、调用一次失败一次，而读产物
+/// 状态的人会以为这件事做完了。
+///
+/// 产物留在 `Generated`：它确实生成并写盘了（引擎写进 `change_dir/tools/`），
+/// 仅此而已。要变成可调用的工具，得有人把实现写进代码、重新编译发布。
+fn take_tool_suggestion(tool_json: &serde_json::Value, tool_registry: &dyn cog_core::ToolRegistry) {
+    let Some(name) = tool_json.get("name").and_then(|v| v.as_str()) else {
+        warn!(
+            "Evolution tool variant carries no name; nothing was written that a reader could find"
+        );
+        return;
+    };
+    // 与在用的工具同名时更要说一句：这份建议改的是描述和参数，调用仍然会走到
+    // 旧实现上，「看起来换过了」比「没有建议」更难查。
+    let shadows_a_live_tool = tool_registry.names().iter().any(|n| n == name);
+    warn!(
+        artifact_id = name,
+        shadows_a_live_tool = shadows_a_live_tool,
+        "Evolution tool variant written for review is not registered: the artifact carries a \
+         name, a description and a parameter schema, and no implementation for the tool table \
+         to call"
+    );
 }
 
 /// 当前运行版本号：部署注入的 COGNEVA_VERSION 优先（进化 Pod 种子即按它
@@ -4860,6 +4859,75 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
 mod tests {
     use super::*;
 
+    /// A tool table that remembers what was registered into it. `execute` is
+    /// never reached by these cases, but has to exist to satisfy the trait.
+    #[derive(Default)]
+    struct RecordingRegistry {
+        registered: std::sync::Mutex<Vec<cog_core::Tool>>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::ToolExecutor for RecordingRegistry {
+        async fn execute(
+            &self,
+            name: &str,
+            _arguments: serde_json::Value,
+        ) -> cog_core::SFResult<serde_json::Value> {
+            Err(cog_core::SFError::Agent(format!(
+                "nothing is registered under {name}"
+            )))
+        }
+    }
+
+    impl cog_core::ToolRegistry for RecordingRegistry {
+        fn register(&self, tool: cog_core::Tool) {
+            self.registered.lock().expect("left unpoisoned").push(tool);
+        }
+
+        fn names(&self) -> Vec<String> {
+            let mut names: Vec<String> = self
+                .registered
+                .lock()
+                .expect("left unpoisoned")
+                .iter()
+                .map(|t| t.name.clone())
+                .collect();
+            names.sort();
+            names
+        }
+
+        fn definitions(&self) -> Vec<cog_core::Tool> {
+            self.registered.lock().expect("left unpoisoned").clone()
+        }
+
+        fn calls(&self) -> std::collections::BTreeMap<String, u64> {
+            self.names().into_iter().map(|n| (n, 0)).collect()
+        }
+    }
+
+    /// 生成侧只交回来名字、描述和参数表。这样的建议进不了工具表：没有实现可
+    /// 调用，登记进去只会多出一个「看得见、调用就失败」的名字。
+    #[tokio::test]
+    async fn a_tool_variant_without_an_implementation_does_not_enter_the_tool_table() {
+        use cog_core::ToolRegistry as _;
+
+        let registry = RecordingRegistry::default();
+        let suggestion = serde_json::json!({
+            "name": "improved_grep",
+            "description": "a better search",
+            "parameters": {"type": "object", "properties": {}}
+        });
+
+        take_tool_suggestion(&suggestion, &registry);
+
+        assert!(
+            registry.names().is_empty(),
+            "the suggestion has no implementation, so nothing may be callable under its name: {:?}",
+            registry.names()
+        );
+    }
+
+    // proves: evolution.pollIntervalSecs
     /// 发现循环的等待由上一轮实测决定：同一段代码换一次耗时，下一拍就换一个数，
     /// 并且求值计数在走——回路在跑，不是一次启动时算出来的常量。
     #[test]

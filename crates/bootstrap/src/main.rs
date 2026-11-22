@@ -19,44 +19,33 @@
 //! （未配置不可关闭）完成，无人值守自动化直接调向导背后的
 //! POST /api/v1/admin/llm-config（先登录拿 admin token）。
 
+use cog_core::declared_wall::Step;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-
-/// 装完 K3s 之后等 kubeconfig 能用的次数与间隔：30 × 2s = 60s。
-///
-/// 计时要覆盖「进程起来了但 apiserver 还没应答」这一段，而这一段在 NVMe 上是
-/// 几秒、在慢盘上接近一分钟；改成一次性的长 sleep 会让快机器白等，所以是
-/// 「短间隔 × 多次」而不是一个总墙。
-// cap: bound — 折成「短间隔 × 多次」而不是一个总墙：快机器不必空等，慢盘上仍接近一分钟
-const KUBECONFIG_READY_ATTEMPTS: usize = 30;
 
 /// 引导器据以定位仓库根的变量名。三条子命令各读一次，名字写在这里一次：
 /// 写两遍时改一处不会报错，另一处会读到一个再没人设置的名字，然后退回 `.`，
 /// 读出来的是进程当前目录而不是仓库。
 const REPO_ROOT_ENV: &str = "COGNEVA_REPO_ROOT";
 
-/// 上面那组里的间隔：2s 一次，短到快机器不必为这一次探测多等。
-// cap: bound — 上面那组里的间隔：2s 一次，短到快机器不必为这一次探测多等
+/// 等 apiserver 答话的轮询节拍：一拍是一次 `kubectl cluster-info` 加一次
+/// `systemctl is-active`。比它更密只是重复读同一份状态。
+// cap: bound — 一拍的代价是两次本地命令；更密只是重复读同一份状态
 const KUBECONFIG_READY_INTERVAL: Duration = Duration::from_secs(2);
 
-/// 等全部节点 Ready 的次数与间隔：60 × 5s = 5 分钟。
-///
-/// 多节点装机的最后一步是 kubelet 拉镜像，最慢的节点决定整条链路；5 分钟是
-/// 慢盘 + 冷镜像缓存的实测上界，超时后的报错文案与这个墙一致。
-// cap: bound — 多节点装机的最后一步是 kubelet 拉镜像，最慢的节点决定整条链路；5 分钟是慢盘加冷镜像缓存的实测上界，超时的报错文案与这个墙一致
-const NODES_READY_ATTEMPTS: usize = 60;
-
-/// 上面那组里的间隔：5s 一次，够一个节点把镜像拉完一层。
-// cap: bound — 上面那组里的间隔：5s 一次，够一个节点把镜像拉完一层
+/// 等节点 Ready 的轮询节拍：一拍是一次 `kubectl get nodes`。
+// cap: bound — 一拍的代价是一次 kubectl get；更密只是重复读同一份状态
 const NODES_READY_INTERVAL: Duration = Duration::from_secs(5);
 
-/// 集群内 registry 播种基镜像失败后的重试间隔。
+/// 集群内 registry 播种的一拍：一次 `ctr images push`。
 ///
-/// 播种走的是节点上的 containerd，失败通常是对方刚启动还没准备好；10s 够一次
-/// 重启，且三次重试的总等待仍在整条装机链路的预算里。
-// cap: bound — 失败通常是节点上的 containerd 刚启动还没准备好；10s 够一次重启，三次重试的总等待仍在整条装机链路的预算里
+/// 它不判结局（结局由推送本身与 registry 进程的状态说），只决定重试的疏密；
+/// 失败的推送通常立刻返回，10s 一拍既不会把刚起来的 registry 淹掉，也不会让
+/// 一次瞬断把整条装机拖很久。
+// cap: bound — 一拍是一次本地推送；更密只是把同一个失败再问一遍
 const REGISTRY_SEED_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
 /// 最佳努力的新版本探测单次上限。
@@ -320,6 +309,32 @@ async fn run(cmd: &str, args: &[&str]) -> Result<()> {
         .with_context(|| format!("无法执行 {cmd}"))?;
     if !status.success() {
         bail!("{cmd} {:?} 退出码 {:?}", args, status.code());
+    }
+    Ok(())
+}
+
+/// 与 `run` 相同，但把子进程自己的话（stdout / stderr）收进错误里，同时照原样
+/// 打到控制台。
+///
+/// `run` 的错误里只有命令行和退出码；一条失败的原因常常只写在那条命令自己的
+/// 输出里（helm 说 release Secret 超限、kubectl 说字段冲突），收进来的那一句
+/// 才是上层能据以判"这是不是换条路就装得下的失败"的证据。
+async fn run_capturing_output(cmd: &str, args: &[&str]) -> Result<()> {
+    let out = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .with_context(|| format!("无法执行 {cmd}"))?;
+    print!("{}", String::from_utf8_lossy(&out.stdout));
+    eprint!("{}", String::from_utf8_lossy(&out.stderr));
+    if !out.status.success() {
+        bail!(
+            "{cmd} {:?} 退出码 {:?}：{}",
+            args,
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(())
 }
@@ -761,6 +776,187 @@ async fn warn_if_nodes_hold_back_nothing() {
     }
 }
 
+/// 集群里所有节点能给 Pod 排的额度：合计与单节点最大各一份。
+///
+/// 合计回答「这台集群一共装得下多少」，单节点最大的那一份回答「一个副本有没有地方
+/// 落」——前者够而后者不够时（例如一个 6Gi 的 Pod 摆在两台 3Gi 的机器上），合计
+/// 是够的，可它一个节点都排不进去。
+struct NodeCapacity {
+    nodes: usize,
+    cpu_millicores: u64,
+    memory_bytes: u64,
+    largest_cpu_millicores: u64,
+    largest_memory_bytes: u64,
+}
+
+/// 读一次节点的 `status.allocatable`。读不到返回 `None`——调用方据此说“这一次没判”，
+/// 而不是把 0 当成“装不下”。
+async fn node_capacity() -> Option<NodeCapacity> {
+    let out = Command::new("kubectl")
+        .args(["get", "nodes", "-o", "json"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let list: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let items = list.get("items")?.as_array()?;
+    if items.is_empty() {
+        return None;
+    }
+    let mut capacity = NodeCapacity {
+        nodes: items.len(),
+        cpu_millicores: 0,
+        memory_bytes: 0,
+        largest_cpu_millicores: 0,
+        largest_memory_bytes: 0,
+    };
+    for node in items {
+        let allocatable = node.get("status")?.get("allocatable")?;
+        let cpu = allocatable.get("cpu").and_then(|v| v.as_str())?;
+        let memory = allocatable.get("memory").and_then(|v| v.as_str())?;
+        let cpu = cogneva_bootstrap::quantity_millicores(cpu)?;
+        let memory = cogneva_bootstrap::quantity_bytes(memory)?;
+        capacity.cpu_millicores += cpu;
+        capacity.memory_bytes += memory;
+        capacity.largest_cpu_millicores = capacity.largest_cpu_millicores.max(cpu);
+        capacity.largest_memory_bytes = capacity.largest_memory_bytes.max(memory);
+    }
+    Some(capacity)
+}
+
+/// 交付之前把这份 profile 的 request 与节点可分配量比一次。
+///
+/// 2026-11-19 真机实测：网关的 request 是 6Gi（按带模型权重时的稳态定的），而那台
+/// 机器的 allocatable 实测只有 5.5Gi。清单照样下发，新副本排在 Pending，十分钟后平台在自己的
+/// 进度死线上写下 ProgressDeadlineExceeded，安装以「部署未就绪」收尾——真正的病因
+/// （这台机器装不下这个 profile）一次都没被说出来，而它是下发之前就能读到的事实。
+///
+/// 判据是必要条件：不管机器上还跑着什么，剩余可排的量都不会超过 allocatable 合计；
+/// 清单要的比它还多，就一定有 Pod 排不上。读不到节点账时不判——没有读数不是干净读数。
+async fn ensure_profile_fits_nodes(profile: Profile) -> Result<()> {
+    let dir = rendered_manifest_dir(profile);
+    if !dir.is_dir() {
+        // 目录缺失由投递那一侧报（它知道缺的是哪条路径、该怎么补），这里不抢着说。
+        return Ok(());
+    }
+    let mut files: Vec<(String, String)> = Vec::new();
+    for entry in
+        std::fs::read_dir(&dir).with_context(|| format!("读不到渲染产物目录 {}", dir.display()))?
+    {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("读不到渲染产物 {}", path.display()))?;
+        files.push((name, text));
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let Some(capacity) = node_capacity().await else {
+        warn!(
+            "读不到节点的 allocatable（kubectl get nodes 没给出可解析的账）：\
+             这份 profile 的 request 合计装不装得下这台机器本次未被判定"
+        );
+        return Ok(());
+    };
+    let demands = cogneva_bootstrap::workload_requests(&files, capacity.nodes as u64)
+        .map_err(anyhow::Error::msg)?;
+    if demands.is_empty() {
+        warn!("渲染产物里没有任何常驻工作负载的 request 可读，装不装得下本次未被判定");
+        return Ok(());
+    }
+    let requested_cpu: u64 = demands.iter().map(|d| d.total_cpu_millicores()).sum();
+    let requested_memory: u64 = demands.iter().map(|d| d.total_memory_bytes()).sum();
+    let fits_in_total =
+        requested_memory <= capacity.memory_bytes && requested_cpu <= capacity.cpu_millicores;
+    // 合计够不等于排得上：一个副本要的量超过任何单个节点能给的，它就永远 Pending，
+    // 而所有副本都排好的账加起来可能仍然装得上。
+    let no_room_anywhere: Vec<&cogneva_bootstrap::WorkloadDemand> = demands
+        .iter()
+        .filter(|d| {
+            d.cpu_millicores > capacity.largest_cpu_millicores
+                || d.memory_bytes > capacity.largest_memory_bytes
+        })
+        .collect();
+    if fits_in_total && no_room_anywhere.is_empty() {
+        return Ok(());
+    }
+    let mut rows: Vec<&cogneva_bootstrap::WorkloadDemand> = demands.iter().collect();
+    rows.sort_by_key(|d| std::cmp::Reverse(d.total_memory_bytes()));
+    let listing: Vec<String> = rows
+        .iter()
+        .map(|d| {
+            format!(
+                "  {} ×{}：{} 核 / {}",
+                d.workload,
+                d.replicas,
+                format_millicores(d.total_cpu_millicores()),
+                format_gib(d.total_memory_bytes())
+            )
+        })
+        .collect();
+    let mut verdict = String::new();
+    if !fits_in_total {
+        verdict.push_str(&format!(
+            "按 request 合计要 {} 核 / {}，节点可分配量只有 {} 核 / {}。",
+            format_millicores(requested_cpu),
+            format_gib(requested_memory),
+            format_millicores(capacity.cpu_millicores),
+            format_gib(capacity.memory_bytes),
+        ));
+    }
+    if !no_room_anywhere.is_empty() {
+        let names: Vec<String> = no_room_anywhere
+            .iter()
+            .map(|d| {
+                format!(
+                    "{}（一个副本要 {} 核 / {}）",
+                    d.workload,
+                    format_millicores(d.cpu_millicores),
+                    format_gib(d.memory_bytes)
+                )
+            })
+            .collect();
+        verdict.push_str(&format!(
+            "其中 {} 的单个副本就超过最大的那一个节点的可分配量（{} 核 / {}），\
+             排不到任何节点上。",
+            names.join("、"),
+            format_millicores(capacity.largest_cpu_millicores),
+            format_gib(capacity.largest_memory_bytes),
+        ));
+    }
+    bail!(
+        "这个 profile 装不下这台机器（{} 个节点）：{verdict}\
+         清单下发后会有 Pod 长时间 Pending，而平台只会在自己的进度死线上判一次失败。\
+         各工作负载要的量：\n{}\n\
+         要么给机器加内存，要么把这些 request 降到这台机器量得下的值",
+        capacity.nodes,
+        listing.join("\n")
+    )
+}
+
+fn format_millicores(millicores: u64) -> String {
+    let cores = millicores as f64 / 1000.0;
+    if cores.fract() == 0.0 {
+        format!("{}", cores as u64)
+    } else {
+        format!("{cores:.2}")
+    }
+}
+
+fn format_gib(bytes: u64) -> String {
+    format!("{:.1}GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
 async fn install_k3s(hw: &Hardware) -> Result<()> {
     if cluster_ready().await {
         info!("检测到可用集群，跳过 K3s 安装");
@@ -782,15 +978,165 @@ async fn install_k3s(hw: &Hardware) -> Result<()> {
         ""
     };
     run_k3s_install_script(env).await?;
-    // 等待 kubeconfig 就绪
-    for _ in 0..KUBECONFIG_READY_ATTEMPTS {
-        if cluster_ready().await {
-            write_kubeconfig()?;
-            return Ok(());
+    // 等的是 apiserver 自己答话，不是「等满一分钟」。收尾只有两种：它答了，或者
+    // unit 自己说了失败（`systemctl is-active` 报 failed，或 k3s 二进制不在）。
+    // 「起得慢」不构成收尾——慢与起不来是两件事，前者不该被杀。
+    wait_for_evidence(
+        "K3s 集群",
+        "bootstrap:k3s-ready",
+        KUBECONFIG_READY_INTERVAL,
+        K3sSettle,
+    )
+    .await?;
+    write_kubeconfig()?;
+    Ok(())
+}
+
+/// 等一个外部系统自己说出结局：`Done` 或 `Failed`。这里没有「等多久」。
+///
+/// 从前这两处各有一道钟（30 拍 × 2 秒、60 拍 × 5 秒），越过就判装机失败；实测这台
+/// 4 核机器上 k3s 从起服务到答话用了一分多钟，第一次装机于是被自己的墙判死，而集群
+/// 一分钟后就自己好了。所以这一版没有墙可调：结局只有被等的那个系统说的话算数。
+///
+/// 每读到**新**状态印一行——那是读数，让人看见它走到哪一步；判停仍走同一条律：只有
+/// 量到过「它还在干活时静默过多久」才可能收尾（[`cog_core::declared_wall::stall_any`]），
+/// 量不到就一直等。读失败只说明这一眼看不清，不算「没动」。
+async fn wait_for_evidence<P>(
+    what: &str,
+    channel: &str,
+    poll: Duration,
+    mut probe: P,
+) -> Result<P::State>
+where
+    P: cog_core::declared_wall::SettleProbe,
+    P::State: std::fmt::Display,
+{
+    use cog_core::declared_wall::Step;
+    let started = std::time::Instant::now();
+    let mut last: Option<P::State> = None;
+    loop {
+        match probe.step().await {
+            Ok(Step::Done(done)) => {
+                info!("{what} 就绪（等了 {}s）", started.elapsed().as_secs());
+                return Ok(done);
+            }
+            Ok(Step::Failed(why)) => {
+                bail!(
+                    "{what} 没成，它自己说的：{why}（等了 {}s）",
+                    started.elapsed().as_secs()
+                )
+            }
+            Ok(Step::Moving(state)) => {
+                if last.as_ref() != Some(&state) {
+                    info!("{what} 还在等：{state}");
+                    cog_core::progress::mark(channel);
+                    last = Some(state);
+                }
+            }
+            Err(e) => warn!("读不到 {what} 的状态（这一拍不判，继续等）：{e}"),
         }
-        tokio::time::sleep(KUBECONFIG_READY_INTERVAL).await;
+        if let Some((silent, bound)) = cog_core::declared_wall::stall_any(&[channel]) {
+            bail!(
+                "{what} {} {}s, past the measured {}s window",
+                cog_core::declared_wall::STALL_VERDICT_MARKER,
+                silent.as_secs(),
+                bound.as_secs()
+            );
+        }
+        tokio::time::sleep(poll).await;
     }
-    bail!("K3s 安装后集群未就绪");
+}
+
+/// systemd 把 unit 判失败时 `ActiveState` 的那一格。写一次，两处读它：
+/// 第二次抄写不会跟着第一次改，而漂移的表现是「一边认得出失败、另一边永远等下去」。
+const K3S_UNIT_FAILED: &str = "ActiveState=failed";
+
+/// K3s 起来了没有：读 apiserver 答不答话，以及 unit 自己说不说失败。
+///
+/// 状态里带上 unit 的 `ActiveState` 与重启次数：它们变了就是「还在动」，控制律据此
+/// 记一拍。这两格也是判词里唯一能让「它还在爬」与「它卡在同一个地方」分开的读数。
+struct K3sSettle;
+
+impl cog_core::declared_wall::SettleProbe for K3sSettle {
+    type State = String;
+
+    async fn step(&mut self) -> Result<cog_core::declared_wall::Step<String>, String> {
+        use cog_core::declared_wall::Step;
+        if cluster_ready().await {
+            return Ok(Step::Done("apiserver answers".into()));
+        }
+        let out = Command::new("systemctl")
+            .args(["show", "-p", "ActiveState", "-p", "NRestarts", "k3s"])
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|e| format!("无法执行 systemctl show k3s: {e}"))?;
+        let readout = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let active_failed = readout.contains(K3S_UNIT_FAILED);
+        let unit_absent = readout.is_empty();
+        let binary_absent = !Path::new("/usr/local/bin/k3s").exists();
+        if active_failed || (unit_absent && binary_absent) {
+            return Ok(Step::Failed(if readout.is_empty() {
+                "k3s unit 不在，安装脚本也没留下 /usr/local/bin/k3s".to_string()
+            } else {
+                format!("k3s.service 报 failed（{readout}），看 journalctl -u k3s")
+            }));
+        }
+        Ok(Step::Moving(if readout.is_empty() {
+            "k3s unit 还没有状态可读".to_string()
+        } else {
+            readout
+        }))
+    }
+}
+
+/// K3s 落 kubeconfig 的位置。
+const K3S_KUBECONFIG: &str = "/etc/rancher/k3s/k3s.yaml";
+
+/// 这次运行里 KUBECONFIG 是引导器自己指的，不是操作者给的。
+///
+/// 与 `adopt_k3s_kubeconfig` 配套：`write_kubeconfig` 不能把它当成「操作者已指定」
+/// 而跳过落位——那样操作者自己在 shell 里敲 kubectl 时又找不到集群了。
+static KUBECONFIG_ADOPTED: AtomicBool = AtomicBool::new(false);
+
+/// 要不要把 KUBECONFIG 指到 K3s 落的那份上：没人指定（或指定成空）时，文件在就要。
+///
+/// 单独成函数是为了让判据能脱离环境变量被读：`cargo test` 里的环境是别的进程的，
+/// 改它只会让并行跑的用例互相看见。
+fn should_adopt_k3s_kubeconfig(explicit: Option<&str>, k3s_file: bool) -> bool {
+    let unset = explicit.is_none_or(|v| v.trim().is_empty());
+    unset && k3s_file
+}
+
+/// 操作者有没有指定 KUBECONFIG。
+///
+/// 名字只在这里写一遍：`adopt_k3s_kubeconfig` 与 `write_kubeconfig` 都读它。两处
+/// 各写一份时改名只会改一处，另一处照旧读一个再也没人设置的名字，而「读不到」
+/// 在调用点上与「本来就没配」同形。
+fn kubeconfig_env() -> Option<String> {
+    std::env::var("KUBECONFIG").ok()
+}
+
+/// 让子进程里的 kubectl / helm 找得到集群。
+///
+/// K3s 只写 `/etc/rancher/k3s/k3s.yaml`，kubectl 默认读 `$KUBECONFIG` 或
+/// `~/.kube/config`。宿主上若已经有一份**独立安装的** kubectl（不是 k3s 的软链），
+/// 它不会自己去读 K3s 那份，于是一个明明在答话的集群，从引导器看永远是
+/// "connection refused localhost:8080"——实测这台机器就是这样：k3s 装好后
+/// 节点早已 Ready，引导器却在「等集群答话」上永远等不到，而且越等越像「集群起不来」。
+fn adopt_k3s_kubeconfig() {
+    let explicit = kubeconfig_env();
+    if !should_adopt_k3s_kubeconfig(explicit.as_deref(), Path::new(K3S_KUBECONFIG).is_file()) {
+        return;
+    }
+    std::env::set_var("KUBECONFIG", K3S_KUBECONFIG);
+    KUBECONFIG_ADOPTED.store(true, Ordering::Relaxed);
+    info!("KUBECONFIG 未指定，改读 K3s 落下的 {K3S_KUBECONFIG}");
 }
 
 /// 把 K3s 生成的 kubeconfig 接到标准位置。
@@ -801,11 +1147,11 @@ async fn install_k3s(hw: &Hardware) -> Result<()> {
 /// 去哪找 kubeconfig。这里落一份标准位置的副本（权限 0600，kubeconfig 等价于
 /// 集群管理员凭证），k3s 的原始文件保持不动。
 fn write_kubeconfig() -> Result<()> {
-    let src = Path::new("/etc/rancher/k3s/k3s.yaml");
+    let src = Path::new(K3S_KUBECONFIG);
     if !src.is_file() {
         return Ok(());
     }
-    if std::env::var("KUBECONFIG").is_ok() {
+    if kubeconfig_env().is_some() && !KUBECONFIG_ADOPTED.load(Ordering::Relaxed) {
         info!("KUBECONFIG 已由环境显式指定，跳过 kubeconfig 落位");
         return Ok(());
     }
@@ -1121,28 +1467,71 @@ fn image_gc_remote_write() -> String {
 
 async fn wait_all_nodes_ready(expected: usize) -> Result<()> {
     info!("等待 {expected} 个节点全部 Ready...");
-    for _ in 0..NODES_READY_ATTEMPTS {
+    let state = wait_for_evidence(
+        "节点就绪",
+        "bootstrap:nodes-ready",
+        NODES_READY_INTERVAL,
+        NodesSettle { expected },
+    )
+    .await?;
+    info!("全部节点 Ready: {state}");
+    Ok(())
+}
+
+/// 节点齐了没有：读 `kubectl get nodes` 的逐行状态，读不出来算「这一眼看不清」。
+///
+/// 直接证据只有一条：本机这一副的 k3s unit 说自己失败（单节点装机时那副就是全部）。
+/// 别的节点的 kubelet 还没 Ready 不是失败，是还没到——它自己会把原因写在 Node 的
+/// 条件里，而那一条正是状态格里的内容：变了就算在动。
+struct NodesSettle {
+    expected: usize,
+}
+
+impl cog_core::declared_wall::SettleProbe for NodesSettle {
+    type State = String;
+
+    async fn step(&mut self) -> Result<cog_core::declared_wall::Step<String>, String> {
+        use cog_core::declared_wall::Step;
         let out = Command::new("kubectl")
             .args(["get", "nodes", "--no-headers"])
             .stdin(Stdio::null())
-            .stderr(Stdio::null())
             .output()
-            .await;
-        if let Ok(o) = out {
-            if o.status.success() {
-                let ready = String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .filter(|l| l.split_whitespace().nth(1) == Some("Ready"))
-                    .count();
-                if ready >= expected {
-                    info!("全部 {ready} 个节点 Ready");
-                    return Ok(());
-                }
+            .await
+            .map_err(|e| format!("无法执行 kubectl get nodes: {e}"))?;
+        if out.status.success() {
+            let readout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let ready = readout
+                .lines()
+                .filter(|line| line.split_whitespace().nth(1) == Some("Ready"))
+                .count();
+            if ready >= self.expected {
+                return Ok(Step::Done(readout));
             }
+            if self.expected == 1 && local_k3s_unit_failed().await {
+                return Ok(Step::Failed(format!(
+                    "本机 k3s.service 报 failed，节点不会自己变 Ready（{readout}）"
+                )));
+            }
+            return Ok(Step::Moving(readout));
         }
-        tokio::time::sleep(NODES_READY_INTERVAL).await;
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(if stderr.is_empty() {
+            "kubectl get nodes 没有报错也没有输出".to_string()
+        } else {
+            stderr
+        })
     }
-    bail!("agent 节点未在 5 分钟内全部 Ready，请检查各节点安装日志")
+}
+
+/// 本机这一副的 k3s unit 有没有自己说失败。只有它说失败才算证据；读不到不算。
+async fn local_k3s_unit_failed() -> bool {
+    let out = Command::new("systemctl")
+        .args(["show", "-p", "ActiveState", "k3s"])
+        .stdin(Stdio::null())
+        .output()
+        .await;
+    out.map(|o| String::from_utf8_lossy(&o.stdout).contains(K3S_UNIT_FAILED))
+        .unwrap_or(false)
 }
 
 async fn ensure_buildah() -> Result<()> {
@@ -1209,6 +1598,34 @@ const GIT_MIRROR_GITEE: &str = "https://gitee.com/hcipengm/cogneva.git";
 /// 改名只会让其中一处克隆到一棵空仓——进化那边读到的不是报错，而是「没有历史」，
 /// 与「这个部署还没 seed」同形。
 const GIT_REMOTE_SUBDIR: &str = "git-remote";
+
+/// 单节点 profile 把宿主上的权重目录直挂进网关 Pod（`modelWeights.hostPath`，
+/// 见 `profiles/k3s-single.yaml`）。卷声明是 `type: Directory`：目录不存在时
+/// Pod 直接 FailedMount，而空白机上还没有任何东西往这个目录里放过权重，于是
+/// 「权重还没落地」长成了「装不上」。
+///
+/// 这里先把目录建出来，但**建出空目录不等于有权重**：加载器在目录里找不到 ONNX
+/// 时明确拒绝并写下原因（`crates/cog-memory/tests/mounted_cache_dir_requires_weights.rs`），
+/// 向量能力缺席、进程照常起来。权重本身由 `deploy/scripts/fetch-model-weights.sh`
+/// 落地（bge-m3 与 reranker 各跑一次）。
+const MODEL_WEIGHTS_HOST_DIR: &str = "/srv/cogneva/models/fastembed";
+
+fn ensure_model_weights_dir() -> Result<()> {
+    let dir = Path::new(MODEL_WEIGHTS_HOST_DIR);
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("建不出权重挂载目录 {}", dir.display()))?;
+    let empty = std::fs::read_dir(dir)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(true);
+    if empty {
+        info!(
+            dir = %dir.display(),
+            "权重目录是空的：这个部署没有向量检索与精排；要启用就跑 \
+             deploy/scripts/fetch-model-weights.sh（bge-m3 与 reranker 各一次）"
+        );
+    }
+    Ok(())
+}
 
 /// chart 预渲染产物的目录：元启动按 profile 从这里读 standalone YAML。
 const RENDERED_DEPLOY_SUBDIR: &str = "deploy/rendered";
@@ -1977,31 +2394,8 @@ fn parse_declared_port(reading: &str, what: &str) -> Result<u16> {
 /// 该基镜像，缺失则工作负载只能 ImagePullBackOff。经宿主 containerd 客户端
 /// 直推 NodePort（localhost http 免 TLS，多节点每节点都通）。
 /// 失败是硬失败：清单 pin 已在 registry，播种不成功四部署拉不到镜像；
-/// 给足重试，仍失败则让引导器带着明确错误退出（可修复后重跑，幂等）。
+/// 收尾只认两件事（推成功了，或 registry 进程自己说它起不来），没有次数上限。
 async fn seed_cluster_registry(namespace: &str) -> Result<()> {
-    // This wait asks "has this machine got round to it yet", not "is the
-    // registry broken": a blank install has only just finished importing the
-    // image and the disk is still writing those pages back, so the registry
-    // Pod may not even have its image pulled. 300s expired on a 6-core /
-    // 12GiB machine whose install did finish, and the same wait passed on a
-    // 12-core one -- the budget was measuring the machine, not the registry.
-    // So there is no budget here any more: the wait ends when the object says
-    // it is whole, or when the platform declares it stalled.
-    if let Err(e) = wait_workload_ready(
-        namespace,
-        "deployment",
-        cog_core::topology::REGISTRY,
-        REGISTRY_DECLARED,
-        "cluster registry",
-    )
-    .await
-    {
-        // Print what was on the machine when the wait ended. Without it the log
-        // says only "not ready" -- the same words whether the registry is
-        // crash-looping or still pulling.
-        let _ = run("kubectl", &["-n", namespace, "get", "pods", "-o", "wide"]).await;
-        return Err(e).context("集群内 registry 未就绪（上面是判定那一刻的 Pod 现场）");
-    }
     // k3s 是多调用二进制（argv0=ctr），标准 containerd 直接用 ctr。
     let (program, ctr_prefix): (&str, &[&str]) = if command_exists("k3s").await {
         ("k3s", &["ctr"][..])
@@ -2020,37 +2414,149 @@ async fn seed_cluster_registry(namespace: &str) -> Result<()> {
     )
     .await?;
     let remote = format!("localhost:{node_port}/cogneva:local");
-    let object = "localhost/cogneva:local";
-    for attempt in 1..=3 {
-        let mut args: Vec<&str> = ctr_prefix.to_vec();
-        args.extend([
+    // 播种排在「等 Deployment 整体就绪」之前，顺序不是风格问题：这个 Deployment
+    // 里的 volume-walker 边车 pin 的正是本函数要播种的那个镜像，它拉得到镜像的
+    // 前提就是播种成功。先等 Deployment 就绪等于「等边车拉到镜像 = 等自己」，
+    // 2026-11-19 真机上就这么停住过。registry 容器本身（不是整个 Pod）起来就够
+    // 播种了，所以等的是「推成功」，不是「Deployment available」。
+    let seeded = wait_for_evidence(
+        "集群内 registry 播种",
+        "bootstrap:registry-seed",
+        REGISTRY_SEED_RETRY_INTERVAL,
+        RegistrySeed {
+            namespace: namespace.to_string(),
+            program: program.to_string(),
+            prefix: ctr_prefix.iter().map(|s| s.to_string()).collect(),
+            remote: remote.clone(),
+        },
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "四部署 pin {remote}，可在节点上手动执行 \
+             ctr -n k8s.io images push --plain-http {remote} localhost/cogneva:local \
+             后重跑引导器"
+        )
+    })?;
+    let _ = seeded;
+    info!("集群内 registry 已播种基镜像 {remote}");
+    // This wait asks "has this machine got round to it yet", not "is the
+    // registry broken": the registry Pod may not even have its image pulled yet.
+    // The wait ends when the object says it is whole, or when the platform
+    // declares it stalled.
+    if let Err(e) = wait_workload_ready(
+        namespace,
+        "deployment",
+        cog_core::topology::REGISTRY,
+        REGISTRY_DECLARED,
+        "cluster registry",
+    )
+    .await
+    {
+        // Print what was on the machine when the wait ended. Without it the log
+        // says only "not ready" -- the same words whether the registry is
+        // crash-looping or still pulling.
+        let _ = run("kubectl", &["-n", namespace, "get", "pods", "-o", "wide"]).await;
+        return Err(e).context("集群内 registry 未就绪（上面是判定那一刻的 Pod 现场）");
+    }
+    Ok(())
+}
+
+/// 播种探针：一拍是一次 `ctr images push`。
+///
+/// 收尾只认两种直接证据：推成功了；或者 registry 进程自己说它起不来（registry
+/// 容器 CrashLoopBackOff / 上次以非零码退出）——那之后每一拍都是推给一个不会
+/// 听的进程。连不上不构成收尾：registry 刚被调度起来、端口还没开时的报错，与
+/// 真坏时一字不差，区分它们的是 Pod 里的那份状态，不是这次推的失败。
+struct RegistrySeed {
+    namespace: String,
+    program: String,
+    prefix: Vec<String>,
+    remote: String,
+}
+
+impl cog_core::declared_wall::SettleProbe for RegistrySeed {
+    type State = String;
+
+    async fn step(&mut self) -> Result<Step<Self::State>, String> {
+        let mut args: Vec<String> = self.prefix.clone();
+        for arg in [
             "-n",
             "k8s.io",
             "images",
             "push",
             "--plain-http",
-            remote.as_str(),
-            object,
-        ]);
-        match run(program, &args).await {
-            Ok(()) => {
-                info!("集群内 registry 已播种基镜像 {remote}");
-                return Ok(());
-            }
-            Err(e) if attempt < 3 => {
-                warn!("registry 播种第 {attempt} 次失败（重试）: {e:#}");
-                tokio::time::sleep(REGISTRY_SEED_RETRY_INTERVAL).await;
-            }
-            Err(e) => {
-                bail!(
-                    "registry 基镜像播种三次失败: {e:#}。四部署 pin {remote}，\
-                     可在节点上手动执行 ctr -n k8s.io images push --plain-http {remote} {object} \
-                     后重跑引导器"
-                );
-            }
+            self.remote.as_str(),
+            "localhost/cogneva:local",
+        ] {
+            args.push(arg.to_string());
+        }
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = Command::new(&self.program)
+            .args(&refs)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|e| format!("无法执行 {}: {e}", self.program))?;
+        if out.status.success() {
+            return Ok(Step::Done(String::new()));
+        }
+        let reason = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if let Some(verdict) = registry_process_failed(&self.namespace).await {
+            return Ok(Step::Failed(format!(
+                "{reason}；registry 自己说：{verdict}"
+            )));
+        }
+        Ok(Step::Moving(reason))
+    }
+}
+
+/// registry 容器自己有没有说它起不来。读不到（这一拍看不清）不算它说失败。
+async fn registry_process_failed(namespace: &str) -> Option<String> {
+    // 选择器按 cog-core 的声明拼，不在这里重写对象键：键写错一个字符时选择器只
+    // 匹配不到东西，返回空名单、退出码 0，读出来与「registry 没有报错」同形。
+    let selector = format!(
+        "{}={},{}={}",
+        cog_core::topology::LABEL_NAME,
+        cog_core::topology::WORKLOAD_NAME,
+        cog_core::topology::LABEL_COMPONENT,
+        cog_core::topology::COMPONENT_REGISTRY
+    );
+    let out = Command::new("kubectl")
+        .args([
+            "-n",
+            namespace,
+            "get",
+            "pods",
+            "-l",
+            selector.as_str(),
+            "-o",
+            "jsonpath={range .items[*].status.containerStatuses[?(@.name=='registry')]}\
+             {.state.waiting.reason}|{.lastState.terminated.exitCode}{\"\\n\"}{end}",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let (waiting, exit) = line.split_once('|').unwrap_or((line, ""));
+        if waiting.trim() == "CrashLoopBackOff" {
+            return Some("registry 容器在 CrashLoopBackOff".to_string());
+        }
+        if exit
+            .trim()
+            .parse::<i32>()
+            .map(|code| code != 0)
+            .unwrap_or(false)
+        {
+            return Some(format!("registry 容器上次以退出码 {} 退出", exit.trim()));
         }
     }
-    Ok(())
+    None
 }
 
 /// registry 播种发生在清单 apply 之后：四部署首轮拉取 :local 时镜像可能还没进
@@ -2739,11 +3245,37 @@ fn release_authorizes_helm(status: Option<&str>) -> bool {
 
 async fn deploy_manifests(cluster_existed: bool, namespace: &str) -> Result<()> {
     let profile = detect_profile().await?;
+    ensure_profile_fits_nodes(profile).await?;
     ensure_ingress_class_serves(profile).await?;
     match detect_delivery(cluster_existed, namespace).await {
         Delivery::Apply => deploy_via_apply(profile, namespace).await,
-        Delivery::Helm => deploy_via_helm(profile, namespace).await,
+        Delivery::Helm => match deploy_via_helm(profile, namespace).await {
+            Ok(()) => Ok(()),
+            Err(e) if helm_release_exceeds_object_limit(&format!("{e:#}")) => {
+                // 这不是这台机器上的一次偶发失败：helm 把整份渲染集写进一个
+                // release Secret，而 API 对单个对象的上限默认是 1MiB。同一份渲染集
+                // 用 apply 交付时每个对象都各自装得下，所以换轨是**结构性**的，
+                // 重试或调大任何数都不会变。代价说清楚：这条集群上没有 release
+                // 记录，GitOps 工具接不了手。
+                warn!(
+                    "helm 装不下这次渲染集（release Secret 超过 API 单对象上限），\
+                     改由预渲染清单 apply 交付；代价是这台集群没有 helm release 记录，\
+                     GitOps 工具不能接管。原因：{e:#}"
+                );
+                deploy_via_apply(profile, namespace).await
+            }
+            Err(e) => Err(e),
+        },
     }
+}
+
+/// helm 失败里唯一一种该换投递方式的：它要写的那个对象超过 API 的单对象上限。
+///
+/// 判据盯的是 release Secret 自己的名字（`sh.helm.release.v1.*`），不是"Too long"
+/// 一句话：渲染产物的某个对象自己超限时，apply 也会以同样的原因失败，换轨只会把
+/// 一条真错变成两次；而 release Secret 超限时，对象本身一个都没超。
+fn helm_release_exceeds_object_limit(message: &str) -> bool {
+    message.contains(".helm.release.") && message.contains("Too long")
 }
 
 async fn deploy_via_apply(profile: Profile, namespace: &str) -> Result<()> {
@@ -2795,7 +3327,29 @@ async fn deploy_via_apply(profile: Profile, namespace: &str) -> Result<()> {
             "existing volume claims kept as bound (their spec is immutable, so they are not re-applied)"
         );
     }
-    run("kubectl", &["apply", "-f", &rendered.to_string_lossy()]).await
+    // 服务端 apply，不是客户端 apply。客户端 apply 会先把整份对象塞进
+    // `kubectl.kubernetes.io/last-applied-configuration` 注解再写回集群，而注解
+    // 的上限默认是 256KiB；投影出来的 cogneva-json 实测 709KB，客户端 apply 对它**永远**
+    // 失败（2026-11-19 真机：`ConfigMap "cogneva-json" is invalid:
+    // metadata.annotations: Too long`），而它前面的对象已经被写进去了——一次失败
+    // 留下半套清单。服务端 apply 不写这条注解，对象体量只受 API 单对象上限约束；
+    // helm 4 投递走的也是服务端 apply，两条路径因此落在同一种所有权模型上。
+    //
+    // `--force-conflicts`：换到服务端 apply 的第一轮，这些字段归旧写者所有
+    // （客户端 apply 的 `kubectl-client-side-apply`、手工编辑、或上一次 helm），
+    // 冲突会让整批中止。这份清单在 apply 投递的集群上是唯一写者，强制接管正是
+    // 单写者边界的意思。
+    run(
+        "kubectl",
+        &[
+            "apply",
+            "--server-side",
+            "--force-conflicts",
+            "-f",
+            &rendered.to_string_lossy(),
+        ],
+    )
+    .await
 }
 
 /// 卷声明是安装面对象，不是循环面对象：绑定后的 PVC spec 除 `resources.requests`
@@ -3067,7 +3621,9 @@ async fn deploy_via_helm(profile: Profile, namespace: &str) -> Result<()> {
         profile.dir_name()
     );
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    run("helm", &refs).await
+    // 收下 helm 自己的话：换投递方式的判据（release Secret 超过 API 单对象
+    // 上限）只写在它的 stderr 里，`run` 的错误值里看不到。
+    run_capturing_output("helm", &refs).await
 }
 
 /// `upgrade --install` 与 `template` 的公共入参（release 名、chart、命名空间、
@@ -3177,10 +3733,18 @@ fn cn_mirror_image(image: &str, mirror: &str) -> String {
     if let Some(rest) = image.strip_prefix("quay.io/") {
         return format!("quay.nju.edu.cn/{rest}");
     }
-    if image.contains('/') {
-        format!("{mirror}/{image}")
+    // 写出来的 `docker.io/` 与不写是同一个仓库。带着它加前缀会变成
+    // `<镜像站>/docker.io/<repo>`——镜像站上并不存在这个路径，实测 daocloud 直接回
+    // `denied: invalid repository: "docker.io/unclecode/crawl4ai"`，而 kubelet 只会
+    // 一直报 ImagePullBackOff，看不出是清单里的前缀写错了。
+    let hub = image
+        .strip_prefix("docker.io/")
+        .or_else(|| image.strip_prefix("index.docker.io/"))
+        .unwrap_or(image);
+    if hub.contains('/') {
+        format!("{mirror}/{hub}")
     } else {
-        format!("{mirror}/library/{image}")
+        format!("{mirror}/library/{hub}")
     }
 }
 
@@ -3500,11 +4064,29 @@ fn readout_number<'a>(parts: &mut impl Iterator<Item = &'a str>) -> Option<i64> 
     parts.next()?.trim().parse().ok()
 }
 
+/// 状态里的一个副本数：字段缺席按 0 读。
+///
+/// Deployment 的 `status.updatedReplicas` / `readyReplicas` / `unavailableReplicas`
+/// 都带 omitempty：值为 0 时 API 根本不写这一格。健康部署的现场读数因此是
+/// `2|2|1|1|1||NewReplicaSetAvailable`——`unavailableReplicas` 那一格是空的。
+/// 把「API 省掉一个 0」当成「没读到」会让一个已经 1/1 Running 的工作负载永远等不齐
+/// （空白机引导实测：registry 就绪后等待仍每 5 秒重读一次，直到申报工期过了还在等）。
+/// 读失败是另一条路：kubectl 非零退出，进不到这里。
+fn readout_count<'a>(parts: &mut impl Iterator<Item = &'a str>) -> i64 {
+    parts
+        .next()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
+}
+
 /// 这份读数说这个工作负载齐了没有。
 ///
 /// 期望值取自对象自己的读数，不在这里另抄一份——抄下来的数在 chart 改了之后会与
-/// 清单分叉，而这正是「按对象说齐了没有」要免掉的那类副本。任何一格读不出来都回答
-/// 「没齐」：读不到不是「已经够了」。
+/// 清单分叉，而这正是「按对象说齐了没有」要免掉的那类副本。
+///
+/// 副本数这几格的缺席按 0 读（见 [`readout_count`]），但**期望**那一格缺席回答「没齐」：
+/// spec 里那一格是平台缺省过的，读不到说明这份读数不是这个对象的。
+/// 期望为 0 也不算齐：它说的是这个组件没在跑，不是「跑够了」。
 fn workload_settled(kind: &str, readout: &str) -> bool {
     if !workload_generation_observed(readout) {
         return false;
@@ -3520,15 +4102,54 @@ fn workload_settled(kind: &str, readout: &str) -> bool {
         };
         ready >= desired && updated >= desired
     } else {
-        let (Some(want), Some(updated), Some(ready), Some(unavailable)) = (
-            readout_number(&mut parts),
-            readout_number(&mut parts),
-            readout_number(&mut parts),
-            readout_number(&mut parts),
-        ) else {
+        let Some(want) = readout_number(&mut parts) else {
             return false;
         };
-        ready >= want && updated >= want && unavailable == 0
+        let updated = readout_count(&mut parts);
+        let ready = readout_count(&mut parts);
+        let unavailable = readout_count(&mut parts);
+        want > 0 && ready >= want && updated >= want && unavailable == 0
+    }
+}
+
+#[cfg(test)]
+mod workload_settle_tests {
+    use super::*;
+
+    #[test]
+    fn a_healthy_deployment_whose_unavailable_count_is_omitted_is_settled() {
+        // 现场读数：registry 在 cogneva 命名空间里 1/1 Running 时看到的就是这一串。
+        // `unavailableReplicas` 等于 0，API 不写这一格，读数里留一个空段。
+        assert!(workload_settled(
+            "deployment",
+            "2|2|1|1|1||NewReplicaSetAvailable"
+        ));
+        assert!(!workload_settled(
+            "deployment",
+            "2|1|1|1|1||NewReplicaSetAvailable"
+        ));
+        // 仍在交替：新副本还没建齐，旧副本还占着，unavailable 出现在读数里。
+        assert!(!workload_settled(
+            "deployment",
+            "2|2|1|1|1|1|ReplicaSetUpdated"
+        ));
+        // 缺 ready/updated 两格说的是 0，不是「读到了够多」。
+        assert!(!workload_settled(
+            "deployment",
+            "2|2|1|||NewReplicaSetAvailable"
+        ));
+        // 期望副本为 0 的部署没有在跑，不能算齐。
+        assert!(!workload_settled("deployment", "2|2|0||||"));
+        // 期望那格读不到：不知道要几个，就不说齐了。
+        assert!(!workload_settled("deployment", "2|2||1|1||"));
+    }
+
+    #[test]
+    fn a_healthy_daemonset_still_needs_its_scheduled_and_updated_counts() {
+        // DaemonSet 的 `desiredNumberScheduled` / `numberReady` 不带 omitempty，
+        // 齐了的时候三格都在。
+        assert!(workload_settled("daemonset", "2|2|1|1|1|"));
+        assert!(!workload_settled("daemonset", "2|2|1|1||"));
     }
 }
 
@@ -3792,6 +4413,11 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // 在一切读集群的步骤之前把 kubeconfig 的位置定下来：`run` 的「复用现有集群」
+    // 探测、K3s 安装后的等待、`governance` 的 apply 都读同一个位置，晚一处就只
+    // 有那一处失败，而报错会指到「集群没起来」上。
+    adopt_k3s_kubeconfig();
+
     // `node-io` touches exactly one file and installs nothing, so it stops here:
     // before the asset unpacking below (which writes a work directory) and
     // before anything that reads the cluster.
@@ -3902,6 +4528,9 @@ async fn main() -> Result<()> {
         info!("多节点集群：git-remote 走集群卷，跳过宿主 bare 仓库 seed");
     } else {
         ensure_git_remote().await?;
+        // 单节点 profile 打开模型权重挂载（多节点 profile 关闭），hostPath 容量
+        // 不存在时网关 Pod 会 FailedMount。目录在、权重不在是另一回事，见函数注释。
+        ensure_model_weights_dir()?;
     }
     ensure_runtime_image(decision.distro, decision.multi, &namespace).await?;
     deploy_manifests(cluster_existed, &namespace).await?;
@@ -4188,17 +4817,33 @@ mod profile_tests {
     }
 
     #[test]
-    fn the_polls_still_add_up_to_the_wall_the_errors_promise() {
-        // 报错文案许诺的是总墙（1 分钟、5 分钟）；次数与间隔各自可调，但两者
-        // 相乘必须还是那个墙，否则「等 5 分钟」这句话就从某一版起变成了别的数。
-        assert_eq!(
-            super::KUBECONFIG_READY_ATTEMPTS as u64 * super::KUBECONFIG_READY_INTERVAL.as_secs(),
-            60
+    fn the_cluster_waits_by_evidence_and_not_by_the_clock() {
+        // 旧形状是「30 拍 × 2 秒 = 一分钟的墙」与「60 拍 × 5 秒 = 五分钟的墙」。实测
+        // 这台 4 核机器上 k3s 从起服务到答话用了一分多钟，第一道墙把一次本来会自己
+        // 好的装机判成了失败（`K3s 安装后集群未就绪` 之后一分钟节点才 Ready）。
+        // 现在两处都走 `declared_wall`：申报工期只说话，收尾只认直接证据（unit 说
+        // failed / apiserver 答话 / 节点齐了）。等待的对象是集群本身，所以按源码判。
+        const SRC: &str = include_str!("main.rs");
+        // 判针从两段拼出来：整串写在测试里，`include_str!` 会把测试自己也读进来，
+        // 于是测试永远看见自己要禁的那个词。
+        let gone = [
+            format!("{}{}", "KUBECONFIG_READY", "_ATTEMPTS"),
+            format!("{}{}", "NODES_READY", "_ATTEMPTS"),
+        ];
+        for gone in &gone {
+            assert!(!SRC.contains(gone.as_str()), "按钟收尾的旧形状还在: {gone}");
+        }
+        // 三处等待（K3s 答话、节点齐、工作负载滚动）走同一条控制律：一处抄一份，
+        // 就会有一处在某一版起悄悄换回「等满多久就判失败」。
+        // 这两处等的是集群自己说的话；它们不许再长出任何时长参数来。
+        let by_evidence = SRC.matches("wait_for_evidence(").count();
+        assert!(
+            by_evidence >= 3,
+            "按证据等待的调用只剩 {by_evidence} 处（定义一处 + 两处调用）"
         );
-        assert_eq!(
-            super::NODES_READY_ATTEMPTS as u64 * super::NODES_READY_INTERVAL.as_secs(),
-            5 * 60
-        );
+        for kept in ["wait_for_evidence", "K3sSettle", "NodesSettle"] {
+            assert!(SRC.contains(kept), "按证据等待的入口不见了: {kept}");
+        }
     }
 
     #[test]
@@ -4285,6 +4930,16 @@ mod profile_tests {
         assert_eq!(
             super::cn_mirror_image("qdrant/qdrant:v1.13.4", m),
             "docker.m.daocloud.io/qdrant/qdrant:v1.13.4"
+        );
+        // 显式写出的 docker.io 前缀不能再带进镜像站路径：2026-11-19 真机实测
+        // `docker.m.daocloud.io/docker.io/unclecode/crawl4ai` 被镜像站拒绝
+        assert_eq!(
+            super::cn_mirror_image("docker.io/unclecode/crawl4ai:0.7.4", m),
+            "docker.m.daocloud.io/unclecode/crawl4ai:0.7.4"
+        );
+        assert_eq!(
+            super::cn_mirror_image("index.docker.io/postgres:16-alpine", m),
+            "docker.m.daocloud.io/library/postgres:16-alpine"
         );
         // quay.io 固定走南大 quay 站（daocloud 系未收录 buildah）
         assert_eq!(
@@ -4859,6 +5514,32 @@ mod node_qos_wiring_tests {
         );
     }
 
+    /// 播种必须排在「等 registry Deployment 整体就绪」之前：那个 Deployment 里的
+    /// volume-walker 边车 pin 的正是要播种的镜像，它拉得到镜像的前提是播种成功。
+    /// 反过来写就是「等它拉到只有播种之后才存在的镜像」——2026-11-19 真机上
+    /// 一轮就停在这里，日志只显示 registry 一直没就绪。
+    #[test]
+    fn the_registry_is_seeded_before_anything_waits_for_the_whole_deployment() {
+        let src = include_str!("main.rs");
+        let body = src
+            .split("async fn seed_cluster_registry(")
+            .nth(1)
+            .expect("seed_cluster_registry 不在 main.rs 里")
+            .split("/// 播种探针")
+            .next()
+            .expect("seed_cluster_registry 之后没有下一段");
+        let seed_at = body
+            .find("RegistrySeed {")
+            .expect("seed_cluster_registry 没有走播种探针");
+        let ready_at = body
+            .find("wait_workload_ready(")
+            .expect("seed_cluster_registry 不等 Deployment 就绪");
+        assert!(
+            seed_at < ready_at,
+            "播种必须排在等 Deployment 就绪之前（边车 pin 的就是被播种的那个镜像）"
+        );
+    }
+
     /// kubespray 的节点配置是那次运行的输入：`host_vars` 必须在容器跑
     /// ansible-playbook 之前写好，事后写等于没写，节点会带着 kubespray 自己的
     /// 固定预留起来，要重跑 playbook 才会变。
@@ -4900,6 +5581,101 @@ mod node_qos_wiring_tests {
             ready_at < read_at,
             "内存账的读回必须排在 wait_ready 之后（否则节点还没注册）"
         );
+    }
+}
+
+#[cfg(test)]
+mod delivery_fallback_tests {
+    use super::*;
+
+    /// 判据拿 2026-11-19 真机上 helm 的原话当样本：只有 release Secret 自己超限
+    /// 才换轨。换成别的 helm 错（比如对象已存在）不换——那条错 apply 也救不了，
+    /// 换了只会把同一条错再报一次、还多一层掩盖。
+    #[test]
+    fn only_an_oversized_release_secret_moves_the_delivery_to_apply() {
+        let oversized =
+            "Error: create: failed to create: Secret \"sh.helm.release.v1.cogneva.v1\" \
+                         is invalid: data: Too long: may not be more than 1048576 bytes";
+        assert!(helm_release_exceeds_object_limit(oversized));
+        for other in [
+            "Error: UPGRADE FAILED: rendered manifests contain a resource that already exists",
+            "Error: INSTALLATION FAILED: unable to build kubernetes objects: error validating \"\": error validating data: apiVersion not set",
+            "Error: create: failed to create: ConfigMap \"cogneva-json\" is invalid: data: Too long: may not be more than 1048576 bytes",
+        ] {
+            assert!(
+                !helm_release_exceeds_object_limit(other),
+                "不该为这条换轨: {other}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod kubeconfig_adoption_tests {
+    use super::*;
+
+    /// 判据是一张表：谁指定了就不动谁；没人指定时文件在才指。
+    /// 反着来会安静地读错集群——环境给了 A 集群的配置，引导器却去读本机 B 的。
+    #[test]
+    fn the_k3s_kubeconfig_is_adopted_only_when_nobody_pointed_at_one() {
+        let cases = [
+            (Some("/etc/kubectl/other.yaml"), true, false),
+            (Some("/etc/kubectl/other.yaml"), false, false),
+            (Some(""), true, true),
+            (Some("   "), true, true),
+            (Some(""), false, false),
+            (None, true, true),
+            (None, false, false),
+        ];
+        for (explicit, k3s_file, expected) in cases {
+            assert_eq!(
+                should_adopt_k3s_kubeconfig(explicit, k3s_file),
+                expected,
+                "explicit={explicit:?} k3s_file={k3s_file}"
+            );
+        }
+    }
+
+    /// 指到 K3s 那份之后，标准位置的那份副本仍要落：操作者自己在 shell 里敲
+    /// kubectl 时不会带上引导器的环境变量，跳过落位等于把集群从他们眼前藏起来。
+    #[test]
+    fn an_adopted_kubeconfig_is_still_landed_at_the_standard_path() {
+        let src = include_str!("main.rs");
+        let body = src
+            .split("fn write_kubeconfig()")
+            .nth(1)
+            .expect("write_kubeconfig 不在 main.rs 里")
+            .split("/// 当前用户的家目录")
+            .next()
+            .expect("write_kubeconfig 之后没有下一段");
+        assert!(
+            body.contains("!KUBECONFIG_ADOPTED"),
+            "write_kubeconfig 把「引导器自己指的」当成了「操作者指定的」，会跳过落位"
+        );
+        assert!(
+            body.contains("K3S_KUBECONFIG"),
+            "write_kubeconfig 又硬写了一份 kubeconfig 路径"
+        );
+    }
+
+    /// 定位置必须排在任何读集群的步骤之前：`governance` 不装集群、直接 apply，
+    /// 它读不到位置就会把「集群在，只是没人告诉 kubectl 去哪找」报成「不是 K3s」。
+    #[test]
+    fn the_kubeconfig_is_adopted_before_the_first_cluster_read() {
+        let src = include_str!("main.rs");
+        let main = src
+            .split("async fn main()")
+            .nth(1)
+            .expect("main 不在 main.rs 里");
+        let adopt_at = main
+            .find("adopt_k3s_kubeconfig();")
+            .expect("main 没有把 kubeconfig 的位置定下来");
+        for later in ["governance_subcommand().await", "install_k3s("] {
+            let at = main
+                .find(later)
+                .unwrap_or_else(|| panic!("main 没有调用 {later}"));
+            assert!(adopt_at < at, "adopt_k3s_kubeconfig 必须排在 {later} 之前");
+        }
     }
 }
 

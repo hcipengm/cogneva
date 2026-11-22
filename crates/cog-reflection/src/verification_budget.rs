@@ -25,7 +25,7 @@ use cog_core::SFResult;
 ///
 /// One label value each, and the label values are the whole domain — a reader
 /// that sums them has thrown away the only thing that distinguishes the two
-/// knobs. Published so a rule or a panel can be checked against the same list
+/// knobs. Published so a rule or a reading can be checked against the same list
 /// this code emits instead of against a copy of it.
 pub const BUDGET_KINDS: &[&str] = &["test", "build"];
 

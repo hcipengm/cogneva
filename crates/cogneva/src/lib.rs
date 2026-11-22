@@ -484,6 +484,7 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         &gateway_state.config,
                         &new_config.gateway,
                         &gateway_state.request_timeout_secs,
+                        new_config.system.shutdown_timeout_ms,
                     );
                 applied.extend(gateway_applied);
                 need_restart.extend(gateway_restart.clone());
@@ -495,8 +496,10 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // 3. supervisor intervals
-                let new_supervisor_cfg: cog_supervisor::SupervisorConfig =
-                    new_config.supervisor.clone().into();
+                let new_supervisor_cfg = cog_supervisor::SupervisorConfig::from_core(
+                    new_config.supervisor.clone(),
+                    new_config.agent.heartbeat_interval_secs,
+                );
                 if let Err(e) = supervisor_config_tx.send(new_supervisor_cfg) {
                     tracing::warn!("Failed to send supervisor config reload: {}", e);
                 } else {

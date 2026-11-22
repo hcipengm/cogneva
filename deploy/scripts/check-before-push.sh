@@ -30,10 +30,10 @@
 # 命令是从 `.github/workflows/ci.yml` 里**取**的，不是在这里抄一份：抄一份的门会在
 # 有人加作业时静默变窄，而这条门唯一不能犯的错就是「它绿了，CI 却红了」。
 #
-# 不覆盖：Check / Code Coverage / Version Contract /
+# 不覆盖：Check / Code Coverage / Version Contract / Clippy /
 # Web Build / Bootstrap Cross-Platform —— 它们要编译或要 Node，本机跑一遍可能比 CI
-# 还慢。末尾会把这份清单印出来：**这条门绿不等于 CI 绿**，它只保证那几类「改动碰了
-# 别的面的读者」的判据不是推上去才发现的。
+# 还慢，或者在 CI 上按红修与在本机按红修是同一件事。末尾会把这份清单印出来：**这条门
+# 绿不等于 CI 绿**，它只保证那几类「改动碰了别的面的读者」的判据不是推上去才发现的。
 #
 # Test 是个折中：整棵工作区在本机是十几分钟起，所以只判**这次动过的包加装配件**。
 # 2026-11-06 20:26 那笔直接推到 main 的改动正是死在「改了包却没跑包自己的测试」上，
@@ -911,15 +911,13 @@ touched_crate_sources() {
     } | sed '/^[[:space:]]*$/d' | sort -u
 }
 
-# 这些字节里还有没有没提交的（已改／未跟踪都算）。Clippy 那一格问它：那一格原先判的是
-# HEAD 展开出来的临时树，而临时树里放不下脏树的改动——脏树上的绿会变成一份对
-# 「没人要推的字节」的判词，而末尾的戳记的却是盘上这份。
+# 这些字节里还有没有没提交的（已改／未跟踪都算）。Test 那一格问它：那一格判的是工作树，
+# 盘上有别人在飞的改动时要说明「判的比这一推多」，否则一份别人字节的判词会记到这一推头上。
 crate_sources_uncommitted() {
     git status --porcelain -- 'crates/*.rs' 2>/dev/null | sed '/^[[:space:]]*$/d'
 }
 
-# 整跑读一次，Clippy 与 Test 两格共用这一份。两格各读一次会在中间树变了的时候印出
-# 两个不一致的数——而收尾那把内容键本来就会让这一跑不记账，那时这两个数谁也不对。
+# 整跑读一次，Test 那一格读它（Clippy 交给 CI 之后，本机只剩这一个读它的格）。
 uncommitted_crate_sources="$(crate_sources_uncommitted)"
 
 # 数一次，两格共用。空表数出来是 0，不是 1：`printf '%s\n' ""` 仍然输出一个空行，
@@ -931,80 +929,12 @@ if [ -n "${uncommitted_crate_sources}" ]; then
     uncommitted_crate_count="$(printf '%s\n' "${uncommitted_crate_sources}" | wc -l | tr -d ' ')"
 fi
 
-# Clippy 那一格在 CI 里是整份 workspace 的 `--all-targets -- -D warnings`，红一格就判整轮
-# 四十分钟为红。它的红只值一行：2026-10-30 一次 `let mut` 的 `unused_mut` 就这样烧掉了一轮，
-# 而本机此前一条读数都看不见它——脚本末尾那句「未覆盖」里写着 Clippy。
-#
-# 本机不能整份跑：实测一次冷跑 214 秒。所以这一格的**题目**由 diff 推出来——这次要推的
-# 提交动过哪些 `crates/<dir>` 下的 `.rs`，就把那个计件包名（读 `crates/<dir>/Cargo.toml`
-# 的 `name`，不点名，`crates/bootstrap` 这种目录名与包名不一致的也不用另写一条）交给 cargo；
-# **每一个题目里跑的是 CI 的同一条命令与同一组 flag**，不挑 lint、不挑 target。CI 仍然整份跑。
-#
-# 判的是**提交**不是工作树：CI 编译的是推上去的那棵树，而共享工作树里别人飞到一半的字节
-# 会给这次推的判词投票——红的那个人往往不是推的人。所以 HEAD 展开到一个临时工作树里判，
-# 目标目录指向主树的 `target`：registry 依赖的指纹不随路径变，实测 `-p cog-quota` 在展开里
-# 1m27s，其中大部分是在等别人的构建锁，自己只花 22s CPU。
-if [ -n "${cargo_bin}" ]; then
-    if ! git rev-parse --verify --quiet 'origin/main^{commit}' >/dev/null; then
-        skip_step "Clippy" "本机没有 origin/main，推的范围判不出来（CI 的 Clippy 会整份跑）"
-    elif ! "${cargo_bin}" clippy --version >/dev/null 2>&1; then
-        skip_step "Clippy" "这个工具链没装 clippy 组件（CI 的 Clippy 会整份跑）"
-    else
-        mapfile -t touched_crates < <(
-            touched_crate_sources |
-                awk -F/ '$1 == "crates" && NF >= 3 { print $2 }' | sort -u
-        )
-        clippy_args=()
-        crate_count=0
-        for crate_dir in ${touched_crates[@]+"${touched_crates[@]}"}; do
-            package="$(sed -n 's/^name *= *"\([^"]*\)".*/\1/p' "crates/${crate_dir}/Cargo.toml" 2>/dev/null | head -1)"
-            if [ -n "${package}" ]; then
-                clippy_args+=(-p "${package}")
-                crate_count=$((crate_count + 1))
-            else
-                # 有 `.rs` 却读不到包名：那个目录不是工作区成员。另一条门
-                # （`crate_source_membership_contract_test`）判这件事，这里只说没判到。
-                skip_step "Clippy" "crates/${crate_dir} 下这次动过源码但读不到包名，这一份没判（CI 的 Clippy 会整份跑）"
-            fi
-        done
-        if [ "${crate_count}" -gt 0 ] && [ "${uncommitted_crate_count}" -gt 0 ]; then
-            # 树脏时就地判：临时树里放不下脏树的改动，而末尾盖的戳是盘上这份字节。
-            # 判一份没人要推的字节、再把结论记到这份字节头上，等于用一个别的树的
-            # 结论替这棵树背书。与 Test 那一格同一取舍：多判别人的在飞改动是不绿得
-            # 过头，不是假绿。
-            echo "== Clippy：这次动过 ${crate_count} 个 crate 的源码（其中 ${uncommitted_crate_count} 份还没提交），判的是工作树"
-            judge_worktree_clippy() {
-                build_slot_run "clippy ${clippy_args[*]}" \
-                    "${cargo_bin}" clippy "${clippy_args[@]}" --all-targets -- -D warnings
-            }
-            run_step "cargo clippy ${clippy_args[*]} --all-targets -- -D warnings" judge_worktree_clippy
-        elif [ "${crate_count}" -gt 0 ]; then
-            repo_toplevel="$(git rev-parse --show-toplevel)"
-            head_tree="$(mktemp -d "${TMPDIR:-/tmp}/cogneva-push-clippy.XXXXXX")"
-            git worktree prune 2>/dev/null
-            if git worktree add --detach --quiet "${head_tree}" HEAD 2>/dev/null; then
-                echo "== Clippy：这次要推的提交动过 ${crate_count} 个 crate 的源码，判的是 HEAD 展开出来的那棵树"
-                judge_head_tree_inner() {
-                    ( cd "${head_tree}" &&
-                        CARGO_TARGET_DIR="${repo_toplevel}/target" \
-                            "${cargo_bin}" clippy "${clippy_args[@]}" --all-targets -- -D warnings )
-                }
-                judge_head_tree() {
-                    build_slot_run "clippy ${clippy_args[*]}" judge_head_tree_inner
-                }
-                run_step "cargo clippy ${clippy_args[*]} --all-targets -- -D warnings" judge_head_tree
-                git worktree remove --force "${head_tree}" >/dev/null 2>&1 || rm -rf "${head_tree}"
-            else
-                rm -rf "${head_tree}"
-                skip_step "Clippy" "展开不出 HEAD 的临时工作树（${head_tree}），这一份没判（CI 的 Clippy 会整份跑）"
-            fi
-        else
-            echo "== Clippy：这次要推的提交与工作树都没动 crates/ 下的 .rs，跳过（CI 的 Clippy 会整份跑）"
-        fi
-    fi
-else
-    skip_step "Clippy" "本机没有可用的 cargo 或 python3（CI 的 Clippy 会整份跑）"
-fi
+# Clippy 这一格原先在本机跑：题目由 diff 缩到这次动过的 crate，命令与 flag 同 CI。属主
+# 2026-11-19 定把它交给 CI，理由是“红就在 CI 上按红修”——本机跑不跑都不改变要修的东西，
+# 而 CI 的日志里同样是 lint 名、文件与行号，本机这一格换来的只有几分钟的提前量。删掉它，
+# 这台 4 核 7G 的机器上最重的一次并行编译不再与别的活抢内存；代价是 clippy 红会落在 main
+# 上一次（部署器按设计在红期间不滚），所以末尾那句「未覆盖」里点名它，让读判词的人看得见
+# 这份绿不管 lint。
 
 # Test：CI 的 Test 作业跑 `cargo test --workspace --no-fail-fast`。整棵在本机是十几
 # 分钟起，而这一步要站在每一次推送前面，所以收窄到**这次要推的提交动过的包，加上
@@ -1078,6 +1008,21 @@ else
     skip_step "提交引用可达性" "本机没有 python3 或没有 origin/main（CI 的 Check 会跑编译）"
 fi
 
+# 私有仓的名字不许出现在要推的这份字节里。判据只有一份、住在私有仓（名单从它自己的仓名推；
+# 写进公开树就等于把它要防的东西放进被它守的树里），所以这一格只是一个**位置**。CI 那道
+# `.github/scripts/check-private-identifiers.sh` 的裸标识层名单从 secret 注入，本机没有 secret，
+# 它自己印「这一遍没跑」——2026-11-20 实测一次代价：`5a3137db3` 的一行注释点了私有仓的名字与
+# 路径，推到了两个远端，而推之前这一侧没有任何一层在问这个名字。
+# 没配私有仓检出的机器上这一格退 75，记成 UNJUDGED，不是绿。
+run_step "私有标识（公开树里不许出现私有仓的名字）" \
+    bash "${here}/check-private-names.sh" "${here}/.."
+
+# 提交信息不带 AI 署名（`Check commit messages carry no AI attribution`）：这一步不
+# 在这里另写一份。判的字节在提交信息里，一旦推上去能修的只剩历史，而 CI 那一步以前是
+# 多行块、本机回放不了，于是本机从来没判过它、判词里一直写着「这一面没验」。现在范围
+# 计算收在 `check-commit-attribution-ci.sh` 里，CI 那一步是单行，这里**回放的就是它**，
+# 本机与 CI 判的是同一段范围、同一份判据。
+
 # ShellCheck：清单同样由 git 推出来，与 CI 同一条命令。
 mapfile -t shell_scripts < <(git ls-files '*.sh')
 # 零个脚本时 shellcheck 没有参数，它读 stdin、读到空、退 0——「一个脚本都没读到」
@@ -1137,10 +1082,9 @@ if [ "${skipped_count}" -gt 0 ]; then
 else
     echo "PRE-PUSH: 上列的判据全绿。"
 fi
-echo "Clippy 只判这次要推的提交动过的 crate；其余 crate 的 lint 仍由 CI 整份跑。"
 echo "Test 只判这次动过的包加装配件 cogneva；其余 crate 的测试仍由 CI 整棵跑。"
 echo "未覆盖（要编译 / 要 Node，CI 才会跑）：Check / Code Coverage /"
-echo "Version Contract / Web Build / Bootstrap Cross-Platform。"
+echo "Version Contract / Clippy / Web Build / Bootstrap Cross-Platform。"
 
 # 绿了才记账。红的那一跑什么也不写：一份没验过的字节不能因为「上次跑过」就推得出去。
 #

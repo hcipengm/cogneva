@@ -3247,6 +3247,7 @@ mod tests {
         );
     }
 
+    // proves: hostDocuments.approvalTtlSecs
     /// 窗口跟着人实际花的审批时间走：一天的声明装得下就不动，装不下就按最慢那
     /// 一次加余量放宽；没有实测时声明就是全部。
     #[test]
@@ -3353,6 +3354,8 @@ mod tests {
             .unwrap_or(f64::NAN)
     }
 
+    // proves: hostDocuments.assistBodyBytes
+    // proves: hostDocuments.assistMaxCandidates
     /// 问题计划是通道答过的那道问句的函数：同一个进程里，下一拍按新的窗口重算，
     /// 不用重启。计数每一拍都走，数值不动时也是——「安静」与「停摆」只能靠它分开。
     #[tokio::test]

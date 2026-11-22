@@ -186,7 +186,8 @@ cell_stored() { # cell_stored <id> <字段> —— 读上次记下的那一行�
 cell_run() { # cell_run <说明> <命令…>
     local what="$1"
     shift
-    local id key stored verdict t0 status trace=""
+    local id key stored verdict t0 status trace="" capped=0 strace_pid="" trace_cap_bytes=""
+    local trace_poll_secs="" trace_kill_grace_secs=""
 
     id="$(cell_id "${what}" "$@")"
     if [ "${COGNEVA_CELL_STAMPS:-on}" = on ] && [ -n "$(cell_stamp_root)" ]; then
@@ -223,10 +224,47 @@ cell_run() { # cell_run <说明> <命令…>
         mkdir -p "$(cell_dir "${id}")" 2>/dev/null || true
         trace="${TMPDIR:-/tmp}/cogneva-cell.$$.trace"
         rm -f "${trace}"
-        strace -f -qq -y -e trace=openat -o "${trace}" "$@"
+        # 轨迹要有上限，追踪要能被停下：有的格子的被判对象就是宿主机——本仓的构建缓存
+        # 回收器按 /proc 枚举进程，而 `-y` 每解一个 fd 也读一遍 /proc，于是轨迹一边写
+        # 一边放大、放大又产生更多行。本机实测 2026-11-19：一格跑了 5 分钟、写了 256 MiB，
+        # 本机 70 GiB 的盘用量从 20 GiB 涨到 32 GiB —— 量作用域的仪器把「判」变成了
+        # 「填盘」，而它填的正是被它判的那条盘。
+        # 上限的数由本机实测 2026-11-19 的仓规模导出：可被这一格打开的路径 2782 个文件
+        # （`find . -path ./target -prune -o -type f`），一行 openat 至多数百字节 ⇒
+        # 整棵树全开一遍远不到 1 MiB；留 16 倍给夹具与重试，取本机 16 MiB 这个上限。
+        # 超过它的轨迹不再可能是一个格子的作用域，只可能是放大。
+        trace_cap_bytes="${COGNEVA_CELL_TRACE_MAX_BYTES:-16777216}"
+        # 采样间隔由那次的实测涨速导出，不是随手拍的。本机 2026-11-19 实测那次 5 分钟
+        # 写了 256 MiB ⇒ 约 0.85 MiB/s（本机实测）。间隔内最多再长
+        # 0.85 MiB/s × 0.2 s ≈ 174 KiB（本机实测），
+        # 不到默认 16 MiB 上限的 1.1%：超限量小到可以让「停下」与「刚好到线」同义。
+        # 再密只是空转 `stat`，再疏则超限量按比例放大。
+        trace_poll_secs="0.2"
+        # TERM 之后给它的时间：一次信号处理的工夫。它只是礼貌，KILL 才是兜底，
+        # 所以它按拍长的整数倍给，换宿主时跟着拍长走。
+        trace_kill_grace_secs="$(awk -v p="${trace_poll_secs}" 'BEGIN { printf "%d", (p * 5) + 0.5 }')"
+        capped=0
+        setsid strace -f -qq -y -e trace=openat -o "${trace}" "$@" &
+        strace_pid=$!
+        while kill -0 "${strace_pid}" 2>/dev/null; do
+            if [ "$(stat -c %s "${trace}" 2>/dev/null || echo 0)" -gt "${trace_cap_bytes}" ]; then
+                printf '%s\n' "（轨迹超过 ${trace_cap_bytes} 字节：停下追踪，改在不带追踪的条件下判一次）"
+                kill -TERM -- "-${strace_pid}" 2>/dev/null || kill -TERM "${strace_pid}" 2>/dev/null
+                sleep "${trace_kill_grace_secs}"
+                kill -KILL -- "-${strace_pid}" 2>/dev/null || true
+                capped=1
+                break
+            fi
+            sleep "${trace_poll_secs}"
+        done
+        wait "${strace_pid}" 2>/dev/null
         status=$?
         traced=1
-        if [ "${status}" -ne 75 ] && [ -n "$(cell_stamp_root)" ]; then
+        # 停下追踪的那一次没有判词，写出来的也只是半份轨迹——半份轨迹解出来的作用域
+        # 会让这一格「永不重判」，而永不重判与一直绿同形。所以它按「不是绿」处置：
+        # 下面那条「不带追踪重跑」的路会判一次真的，记的是那一次。
+        [ "${capped}" -eq 1 ] && status=1
+        if [ "${capped}" -eq 0 ] && [ "${status}" -ne 75 ] && [ -n "$(cell_stamp_root)" ]; then
             cell_scope_from_trace "${trace}" "$(cell_dir "${id}")/scope" 2>/dev/null || true
             # 量到的东西为空 = 这一次没能量（strace 没起得来、或轨迹解析失败），**不是**
             # 「这一格什么都不读」。两者在账上必须分得开：空作用域也是一个合法的键，记下来

@@ -170,11 +170,6 @@ pub const CONFIG_SECTIONS: &[ConfigSection] = &[
         "Rule set is read at startup."
     ),
     section!(
-        "hook_engine",
-        RestartRequired,
-        "Rate limits and dedup window are read at startup."
-    ),
-    section!(
         "agent",
         RestartRequired,
         "The registry record's TTL (cog-storage) and the worker heartbeat interval \

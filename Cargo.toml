@@ -66,14 +66,8 @@ redis = { version = "0.29", features = ["tokio-comp", "connection-manager"] }
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio", "mysql", "postgres", "json", "chrono", "uuid"] }
 
-# Vector database
-qdrant-client = "1.13"
-
 # Message streaming (production alternative to Redis Streams)
 async-nats = { version = "0.40" }
-
-# Distributed KV / Service discovery (production alternative to Redis for registry)
-etcd-client = { version = "0.14", features = ["tls"] }
 
 # Metrics
 prometheus = "0.13"
@@ -85,9 +79,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Error handling
 thiserror = "2.0"
 anyhow = "1.0"
-
-# Validation
-validator = { version = "0.20", features = ["derive"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }

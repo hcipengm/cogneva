@@ -215,13 +215,20 @@ impl EvaluatorActor {
             }
             Err(e) => {
                 tracing::warn!("Evaluator prompt failed: {}", e);
+                // 和 planner、generator 同一条：没到上游的 prompt 不是对作品的
+                // 判断。凭空写一个 `Fail` 会让 pipeline 的终止守卫看不见这次
+                // 环境故障，照常买完一轮本地修复与全部重试；台账与共识票也会把
+                // 「评委没读到作品」记成「作品判不合格」。真因按同一份线格带在
+                // `details` 里，「没判定」这件事才在判定面上跟「判了不合格」分开。
                 (
                     EvaluationResult {
                         verdict: Verdict::Fail,
-                        feedback: "Evaluation failed".into(),
+                        feedback: format!("Evaluator prompt did not reach its upstream: {e}"),
                         score: None,
                         criteria: Vec::new(),
-                        details: None,
+                        details: Some(serde_json::Value::String(
+                            cog_core::contract::outcome::environment_error_content(&e),
+                        )),
                     },
                     crate::actors::ReviewBasis::Passed(
                         crate::observable::SELF_REVIEW_DECIDED_BY_UPSTREAM_UNAVAILABLE,

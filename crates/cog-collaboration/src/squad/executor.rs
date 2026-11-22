@@ -64,13 +64,19 @@ pub struct SquadConfig {
     pub evaluator_skill_id: Option<String>,
 }
 
+// 一次策略升级：Pipeline 跑不通之后，唯一还能换的是拓扑——Roundtable 换的是
+// 评审的人，不是再跑一遍同样的生成轮次。升级第二次没有第三条拓扑可升，只是
+// 同一张桌子再吵一轮。
+// cap: fixed — 升级次数由拓扑数定：Pipeline 之后只有 Roundtable 这一种拓扑
+const SQUAD_POLICY_UPGRADES: u32 = 1;
+
 impl Default for SquadConfig {
     fn default() -> Self {
         Self {
             goal: String::new(),
             context: serde_json::json!({}),
             pge_mode: PgeMode::Pipeline,
-            max_retries: 1,
+            max_retries: SQUAD_POLICY_UPGRADES,
             profile: None,
             boundary_config: None,
             is_self_evolution: false,
@@ -1472,6 +1478,36 @@ mod tests {
     use super::*;
     use crate::squad::pge::types::{Criterion, EvaluationResult};
     use crate::squad::ralph::ralph_loop::{RalphIteration, ResetStrategy};
+
+    /// 策略升级次数只有一处声明：默认值读常量，常量上面写着它由什么钉住。
+    ///
+    /// 两面一起钉：运行时默认值等于常量（改常量就改默认值），源码面
+    /// `impl Default` 的字段里不再有数字（下一笔写回裸字面量就红）。
+    #[test]
+    fn the_squad_default_reads_its_policy_upgrade_count() {
+        assert_eq!(SquadConfig::default().max_retries, SQUAD_POLICY_UPGRADES);
+
+        let source = include_str!("executor.rs");
+        let body = source
+            .split("impl Default for SquadConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.trim().starts_with(|c: char| c.is_ascii_digit())
+                })
+            })
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
+    }
 
     fn evaluation_json(verdict: &str, feedback: &str) -> serde_json::Value {
         serde_json::to_value(EvaluationResult {
