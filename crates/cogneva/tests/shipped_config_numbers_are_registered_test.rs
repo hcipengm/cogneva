@@ -280,7 +280,7 @@ fn the_walk_reads_the_document_the_app_reads() {
     let doc = shipped_doc();
     let leaves = numeric_leaves(&doc);
     assert!(
-        leaves.len() >= 1,
+        !leaves.is_empty(),
         "数值叶子一个都没走读到：走查读法坏了，下面那条判据会在空集上通过"
     );
 

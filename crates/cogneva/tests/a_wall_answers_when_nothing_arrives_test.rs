@@ -77,10 +77,7 @@ fn wall_constant(line: &str) -> Option<&str> {
             None => rest,
         },
     };
-    let rest = match rest.strip_prefix("const ") {
-        Some(r) => r,
-        None => return None,
-    };
+    let rest = rest.strip_prefix("const ")?;
     let (name, tail) = rest.split_once(':')?;
     let name = name.trim();
     if !(name.contains("TIMEOUT") || name.contains("DEADLINE") || name.contains("WALL")) {
