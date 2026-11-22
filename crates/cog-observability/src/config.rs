@@ -347,6 +347,7 @@ impl InfraWatchConfig {
 /// 而超时的那一次重试不会比它更快成功。两个出口各写一个 10 就是两处会走散的
 /// 副本——把其中一个改成 30，另一个还在 10，而读代码的人看不出这是故意的。
 // cap: bound — 由对端的应答时延定：它要短于一次刷盘节拍的数倍，否则一批还没推完时机就过了
+// wall: wait=one exporter POST; on-timeout=this batch is dropped and the drop is counted; resume=yes, the next batch starts fresh
 const EXPORTER_TIMEOUT_SECS: u64 = 10;
 
 /// Loki 一批推多少行、多久推一批。

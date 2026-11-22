@@ -310,6 +310,7 @@ const CONTAINER_STARTUP_ALLOWANCE_SECS: u64 = 15;
 // cap: fixed — k8s 探针 API 的默认 periodSeconds=10：不写 period 时 kubelet 用它
 const K8S_PROBE_DEFAULT_PERIOD_SECS: u64 = 10;
 // cap: fixed — k8s 探针 API 的默认 timeoutSeconds=1：不写 timeout 时 kubelet 用它
+// wall: wait=kubelet exec probe; on-timeout=that probe reads as failed; resume=yes, the next period probes again
 const K8S_PROBE_DEFAULT_DEADLINE_SECS: u64 = 1;
 // cap: fixed — k8s 探针 API 的默认 failureThreshold=3：不写阈值时 kubelet 连判三次才判死
 const K8S_PROBE_DEFAULT_FAILURES: u64 = 3;

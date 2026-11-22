@@ -70,6 +70,7 @@ impl HttpClientConfig {
 // 十秒：TCP 三次握手在最坏的跨网段往返上的上限——再短，一次正常的网络抖动就被
 // 判成「对端不可达」；再长，「对端根本没起来」会一直拖到整体请求超时才暴露。
 // cap: bound — 十秒：跨网段握手的最坏往返；再短误判不可达，再长拖成整体超时
+// wall: wait=TCP handshake; on-timeout=the connect fails with a network error; resume=yes, the caller may retry
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 // 三十二：同时向同一个提供方在飞的请求数就是每个主机的空闲连接上限该覆盖的峰值，

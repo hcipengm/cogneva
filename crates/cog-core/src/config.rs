@@ -1270,6 +1270,7 @@ const DEFAULT_PG_MIN_CONNECTIONS: u32 = 2;
 
 /// 等一条连接的时间上限：超过就是这一请求失败了，等更久只是把失败推后。
 // cap: bound — 由一条请求的预算定：等连接的时间要短于整条请求的超时
+// wall: wait=pool acquire; on-timeout=the request fails with a database error; resume=yes, the next request asks again
 const DEFAULT_PG_ACQUIRE_TIMEOUT_SECS: u64 = 10;
 
 /// 记忆消息后端广播通道的缓冲深度（同 `AgentEvent`）。

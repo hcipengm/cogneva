@@ -92,7 +92,7 @@ resourceGovernance:
     # why: rule the measurements are not on the same grid as, and the two would disagree in a direction nobody
     # why: could name.
     minCpu: 10m
-    # tunable: fixed
+    # tunable:
     # why: The admission floor for one container's memory: the same quantum (`MEMORY_QUANTUM_BYTES`, 16Mi by default) the
     # why: resource loop rounds to, for the same reason as the CPU floor.
     minMemory: 16Mi
@@ -868,28 +868,6 @@ llmExchangeRetention:
   # why: measures but does not retire still expresses that through its seed, not through a pinned day count.
   # published: owner=crates/cog-observability/src/exchange_retention.rs file=crates/cog-core/src/retention.rs metric=TARGET_METRIC label=source cadence=periodic
   # proof: file=crates/cog-observability/src/exchange_retention.rs test=the_retention_follows_the_measured_daily_write beat=a_beat_whose_target_does_not_move_still_counts evidence=evaluations
-  keepDays: 30
-
-# 任务事件档案（cog_events）的保留期。每个任务把 agent 循环的每一轮记在这里，好让一个
-# 没收敛的跑法事后能读回去；从来没删过一行，2026-10-27 实测 130,871 行 / 211 MB（同一天
-# 实测），约 3,800 行一天。退役的单位是整个任务的事件流而不是行：两个读者都从 offset 0
-# 重放一个任务的序列，删掉前缀会让「从这里开始」与「跑到这里」读成同一件事；被续跑点
-# （cog_checkpoints）指着的流一律不删。循环跑在主应用里，把「最老一行多老 / 保留多久 /
-# 多少行 / 多少条流」发布成读数，告警拿前两个比。
-taskEventRetention:
-  # 保留天数。超过这个天数没有追加过的任务流整条退役；不收敛的跑法在它上面还能读到。
-  # 0 = 本部署只量不删（把删除留给声明同一个数的另一个进程）；负数与读不出来的值退回 30。
-  # tunable:
-  # why: Days a task's event stream is kept after it last appended. The sweep measures the table's bytes and
-  # why: its oldest row's age on every pass and divides the table's share of the declared database volume by
-  # why: the measured daily write; the declared 30 days is the seed while the archive is empty or the volume
-  # why: is not declared. The unit stays the whole stream: a stream a checkpoint names is not deletable at
-  # why: all, and a deleted prefix would answer a replay with a gap shaped like the start of the run. The
-  # why: loop publishes the days in force as cogneva_task_events_keep_seconds, so `task_event_archive_behind`
-  # why: compares the archive against what this pass used. The published target carries `source`, and the
-  # why: evaluations counter separates a steady target from a stopped loop.
-  # published: owner=crates/cog-storage/src/task_event_retention.rs file=crates/cog-core/src/retention.rs metric=TARGET_METRIC label=source cadence=periodic
-  # proof: file=crates/cog-storage/src/task_event_retention.rs test=the_retention_follows_the_measured_daily_write beat=a_beat_whose_target_does_not_move_still_counts evidence=evaluations
   keepDays: 30
 
 # token 账（gateway_llm_usage）的逐次调用明细保留期。

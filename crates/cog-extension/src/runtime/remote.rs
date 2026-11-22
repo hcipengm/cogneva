@@ -1917,7 +1917,9 @@ mod tests {
     #[tokio::test]
     async fn a_resolution_failure_keeps_the_replicas_last_seen() {
         use std::sync::atomic::Ordering;
-        let (first, first_hits) = serve_counting(2).await;
+        // 额度只决定夹具活多久，断言看的是计数；额度恰好等于请求数时，一次重试就把
+        // 监听器关掉，用例会读到「执行器不可达」。
+        let (first, first_hits) = serve_counting(8).await;
         let replicas = ChangingReplicas::new(vec![first]);
         let executor = discovering(replicas.clone(), std::time::Duration::ZERO);
         executor.execute(&for_agent("agent-a")).await.unwrap();
