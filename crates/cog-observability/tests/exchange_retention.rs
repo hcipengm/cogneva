@@ -123,8 +123,8 @@ async fn rows_past_the_window_are_measured_and_kept() {
         left, 2,
         "a row past the window was removed; nothing here deletes"
     );
+    scratch.done().await;
 }
-
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn a_copy_in_the_archive_does_not_change_what_is_kept() {
@@ -159,8 +159,8 @@ async fn a_copy_in_the_archive_does_not_change_what_is_kept() {
         left, 1,
         "an archived copy used to be the licence to delete; it is now only a fact"
     );
+    scratch.done().await;
 }
-
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn an_empty_archive_answers_zero_rather_than_nothing() {
@@ -179,4 +179,5 @@ async fn an_empty_archive_answers_zero_rather_than_nothing() {
         reading.oldest_age_secs, 0,
         "an empty archive is a reading, not an error"
     );
+    scratch.done().await;
 }

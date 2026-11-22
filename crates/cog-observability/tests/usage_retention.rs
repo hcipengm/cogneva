@@ -155,8 +155,8 @@ async fn a_row_past_the_window_is_measured_and_kept() {
         2,
         "a row past the window was removed; nothing here deletes"
     );
+    scratch.done().await;
 }
-
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
 async fn rows_below_the_folds_floor_are_reported_as_uncovered() {
@@ -177,8 +177,8 @@ async fn rows_below_the_folds_floor_are_reported_as_uncovered() {
         "the uncovered pair has to carry the oldest one's age: {reading:?}"
     );
     assert_eq!(scratch.rows(&pool).await, 2);
+    scratch.done().await;
 }
-
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
 async fn with_no_fold_every_row_is_uncovered_and_none_is_removed() {
@@ -195,8 +195,8 @@ async fn with_no_fold_every_row_is_uncovered_and_none_is_removed() {
         "no folded window, so every row is: {reading:?}"
     );
     assert_eq!(scratch.rows(&pool).await, 5);
+    scratch.done().await;
 }
-
 /// The declared window is recomputed from the measured daily write, and the
 /// reading keeps saying which input decided it.
 #[tokio::test]
@@ -216,4 +216,5 @@ async fn the_declared_window_follows_the_measured_write_volume() {
         "a declared volume and a measured write rate is a derived window: {reading:?}"
     );
     assert_eq!(scratch.rows(&pool).await, 20);
+    scratch.done().await;
 }
