@@ -19,6 +19,18 @@ pub struct FileObjectBackend {
     base_dir: std::path::PathBuf,
 }
 
+/// Whether the filesystem said the path cannot hold the object: nothing is
+/// there, or an ancestor is a regular file. That is a determinate "no".
+/// Anything else — a symlink cycle, a directory that cannot be searched — is a
+/// store that could not be looked at, and folding it into "absent" reports an
+/// unknown as a zero.
+fn cannot_hold_object(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
 impl FileObjectBackend {
     pub fn new(base_dir: impl Into<std::path::PathBuf>) -> Self {
         Self {
@@ -87,7 +99,11 @@ impl ObjectBackend for FileObjectBackend {
 
     async fn exists(&self, key: &str) -> SFResult<bool> {
         let path = self.object_path(key)?;
-        Ok(tokio::fs::metadata(&path).await.is_ok())
+        match tokio::fs::metadata(&path).await {
+            Ok(_) => Ok(true),
+            Err(e) if cannot_hold_object(&e) => Ok(false),
+            Err(e) => Err(SFError::IO(format!("checking {}: {}", path.display(), e))),
+        }
     }
 
     async fn list(&self, prefix: Option<&str>) -> SFResult<Vec<String>> {
@@ -96,8 +112,10 @@ impl ObjectBackend for FileObjectBackend {
             Some(p) => self.object_path(p)?,
             None => self.base_dir.clone(),
         };
-        if tokio::fs::metadata(&dir).await.is_err() {
-            return Ok(keys);
+        match tokio::fs::metadata(&dir).await {
+            Ok(_) => {}
+            Err(e) if cannot_hold_object(&e) => return Ok(keys),
+            Err(e) => return Err(SFError::IO(format!("listing {}: {}", dir.display(), e))),
         }
         self.list_recursive(&dir, &self.base_dir, &mut keys).await?;
         keys.sort();
@@ -117,12 +135,12 @@ impl FileObjectBackend {
         while let Some(dir) = dirs.pop() {
             let mut entries = tokio::fs::read_dir(&dir)
                 .await
-                .map_err(|e| SFError::IO(e.to_string()))?;
+                .map_err(|e| SFError::IO(format!("reading {}: {}", dir.display(), e)))?;
 
             while let Some(entry) = entries
                 .next_entry()
                 .await
-                .map_err(|e| SFError::IO(e.to_string()))?
+                .map_err(|e| SFError::IO(format!("reading {}: {}", dir.display(), e)))?
             {
                 let path = entry.path();
                 if path.is_dir() {
@@ -908,6 +926,38 @@ mod tests {
         let (objects, dir) = file_backend("not-a-dir");
         objects.put("file", b"x").await.unwrap();
         assert!(objects_on_disk(&dir.join("file")).await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store that cannot be looked at is not an empty store. `exists` used to
+    /// answer `false` and `list` used to answer `[]` for every metadata error,
+    /// so a symlink cycle read as "nothing was ever written here".
+    #[tokio::test]
+    async fn file_backend_tells_absent_apart_from_could_not_look() {
+        let (objects, dir) = file_backend("could-not-look");
+        // A self-referential symlink: every walk through it fails with ELOOP,
+        // which is not the filesystem saying the object is absent.
+        let looped = dir.join("loop");
+        std::os::unix::fs::symlink("loop", &looped).unwrap();
+
+        let err = objects
+            .exists("loop/obj")
+            .await
+            .expect_err("a store that cannot be looked at must not answer `absent`");
+        assert!(err.to_string().contains("loop/obj"), "got: {err}");
+
+        let err = objects
+            .list(Some("loop/obj"))
+            .await
+            .expect_err("a store that cannot be looked at must not answer with an empty list");
+        assert!(err.to_string().contains("loop/obj"), "got: {err}");
+
+        // A missing object is still a determinate absence, and so is one under
+        // an ancestor that is a regular file.
+        assert!(!objects.exists("never-written").await.unwrap());
+        objects.put("plain", b"x").await.unwrap();
+        assert!(!objects.exists("plain/under-a-file").await.unwrap());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
