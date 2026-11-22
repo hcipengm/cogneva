@@ -275,10 +275,8 @@ impl ExchangeRetention {
             let mut slot = self.last_sample.lock().map_err(|_| {
                 SFError::Database("exchange retention: sample lock poisoned".into())
             })?;
-            let rate = slot.and_then(|(rows_before, at_before)| {
-                let days = now.saturating_duration_since(at_before).as_secs_f64() / 86_400.0;
-                (days > 0.0).then(|| (held - rows_before) as f64 / days)
-            });
+            // 同一段算法只有一份：这里问 `rows_per_day`，不在调用点再写一遍。
+            let rate = rows_per_day(*slot, held, now);
             *slot = Some((held, now));
             rate
         };

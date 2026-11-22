@@ -5082,6 +5082,10 @@ fn landed_side(reach: &Reach, landed_rev: &str) -> LandedSide {
 /// event log records had landed at a commit the running image carried. The
 /// reading was a count of re-checks, and it would have rung the alert that this
 /// pass exists to feed.
+/// 只要读数、不要三格快照的那一侧：生产路径走的是
+/// [`live_revision_pass_with_cells`]，这一个只给用例（同一个函数体写两遍会在两边
+/// 分开长，所以它只是那个带格版本不带格的结果）。
+#[cfg(test)]
 async fn live_revision_pass(
     store: &dyn ChangeLedgerStore,
     tree: &CheckTree,

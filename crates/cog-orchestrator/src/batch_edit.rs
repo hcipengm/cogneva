@@ -11,8 +11,11 @@
 use std::process::Command;
 use std::sync::Arc;
 
+/// 一次 2.5 判词的两半：通过的 id，未通过的「id + 理由」。
+type EditVerdict = (Vec<String>, Vec<(String, String)>);
+
 /// 读一次 2.5 的判词，返回（通过的 id，未通过的「id + 理由」）。
-fn edit_verdict(root: &std::path::Path) -> Result<(Vec<String>, Vec<(String, String)>), String> {
+fn edit_verdict(root: &std::path::Path) -> Result<EditVerdict, String> {
     let reader = root.join("scripts/hooks/edit-reading.py");
     let out = Command::new("python3")
         .arg(&reader)

@@ -1262,12 +1262,12 @@ mod tests {
         ctx.add_message(Message::user("任务：把这一批做完"));
         for n in 0..6 {
             ctx.add_message(Message::assistant(vec![cog_core::ContentBlock::tool_call(
-                &format!("call_{n}"),
+                format!("call_{n}"),
                 "run_command",
                 serde_json::json!({"command": "ls"}),
             )]));
             ctx.add_message(Message::tool_result_text(
-                &format!("call_{n}"),
+                format!("call_{n}"),
                 "run_command",
                 &"输出 ".repeat(40),
             ));

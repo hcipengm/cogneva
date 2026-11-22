@@ -640,6 +640,37 @@ impl GiteeIntegrationConfig {
     }
 }
 
+// 下面这几个谓词让「等于代码默认值」的旋钮不出现在序列化里：模板因此不必把它
+// 抄一遍（抄件不为部署决定任何事），而部署真要改它时，写进去的那一格仍然生效。
+// 判据是「类型还产不产生这一格」——`defaults()` 走的就是这条序列化路径。
+fn is_the_shipped_poll_interval(v: &u64) -> bool {
+    *v == GitHubIntegrationConfig::default().poll_interval_secs
+}
+
+fn is_the_shipped_scan_cap(v: &usize) -> bool {
+    *v == GitHubIntegrationConfig::default().max_issues_per_scan
+}
+
+fn is_the_shipped_ci_watch_timeout(v: &u64) -> bool {
+    *v == LandingPolicy::default().ci_watch_timeout_secs
+}
+
+fn is_the_shipped_ci_poll_interval(v: &u64) -> bool {
+    *v == LandingPolicy::default().ci_poll_interval_secs
+}
+
+fn is_the_shipped_land_attempts(v: &u32) -> bool {
+    *v == LandingPolicy::default().max_land_attempts
+}
+
+fn is_the_shipped_redrive_rounds(v: &u32) -> bool {
+    *v == LandingPolicy::default().redrive_max_rounds_per_cause
+}
+
+fn is_the_shipped_redrive_window(v: &u64) -> bool {
+    *v == LandingPolicy::default().redrive_cause_window_secs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -891,35 +922,4 @@ mod tests {
             GiteeIntegrationConfig::load_from(std::path::Path::new("/nonexistent/x.json")).unwrap();
         assert!(!missing.enabled);
     }
-}
-
-// 下面这几个谓词让「等于代码默认值」的旋钮不出现在序列化里：模板因此不必把它
-// 抄一遍（抄件不为部署决定任何事），而部署真要改它时，写进去的那一格仍然生效。
-// 判据是「类型还产不产生这一格」——`defaults()` 走的就是这条序列化路径。
-fn is_the_shipped_poll_interval(v: &u64) -> bool {
-    *v == GitHubIntegrationConfig::default().poll_interval_secs
-}
-
-fn is_the_shipped_scan_cap(v: &usize) -> bool {
-    *v == GitHubIntegrationConfig::default().max_issues_per_scan
-}
-
-fn is_the_shipped_ci_watch_timeout(v: &u64) -> bool {
-    *v == LandingPolicy::default().ci_watch_timeout_secs
-}
-
-fn is_the_shipped_ci_poll_interval(v: &u64) -> bool {
-    *v == LandingPolicy::default().ci_poll_interval_secs
-}
-
-fn is_the_shipped_land_attempts(v: &u32) -> bool {
-    *v == LandingPolicy::default().max_land_attempts
-}
-
-fn is_the_shipped_redrive_rounds(v: &u32) -> bool {
-    *v == LandingPolicy::default().redrive_max_rounds_per_cause
-}
-
-fn is_the_shipped_redrive_window(v: &u64) -> bool {
-    *v == LandingPolicy::default().redrive_cause_window_secs
 }
