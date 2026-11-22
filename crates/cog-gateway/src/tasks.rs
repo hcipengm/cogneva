@@ -568,6 +568,34 @@ fn task_rows_from_reading(
     reading.map_err(|e| ApiError::service_unavailable(format!("the {what} could not be read: {e}")))
 }
 
+/// The task a write handler is about to change, read under the caller's scope.
+///
+/// The edit handlers used to find their row in the folded graph, so a store
+/// that could not be read made an existing task answer 404 "does not exist" --
+/// a statement about the task that is really a statement about the read, on
+/// paths that then wrote nothing and reported a missing resource. A failed read
+/// is a 503; 404 stays for a row that was looked for among the rows this caller
+/// may see and was not there.
+fn task_to_change_from_reading(
+    reading: cog_core::SFResult<Vec<Task>>,
+    claims: Option<&cog_core::Claims>,
+    id: &str,
+) -> Result<Task, ApiError> {
+    let rows: Vec<Task> = task_rows_from_reading(reading, "task list")?
+        .into_iter()
+        .filter(|t| visible_to_claims(claims, t))
+        .collect();
+    Ok(task_to_change(&rows, id)?.clone())
+}
+
+/// The same lookup once the rows are in hand: a row that is not among rows
+/// this caller may see is a 404, and only a completed read reaches here.
+fn task_to_change<'a>(rows: &'a [Task], id: &str) -> Result<&'a Task, ApiError> {
+    rows.iter()
+        .find(|t| t.id == id)
+        .ok_or_else(|| ApiError::not_found(format!("task '{id}' does not exist")))
+}
+
 /// The graph a read carries, with a failed read refusing instead of answering
 /// an empty graph.
 ///
@@ -1759,16 +1787,14 @@ pub async fn update_task_handler(
     Json(req): Json<UpdateTaskRequest>,
 ) -> Result<Json<UpdateTaskResponse>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
-    let all = state.orchestrator.get_all_tasks().await;
-    let visible: Vec<Task> = all
-        .into_iter()
-        .filter(|t| visible_to_claims(claims, t))
-        .collect();
-    let mut task = visible
-        .iter()
-        .find(|t| t.id == id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found(format!("task '{id}' does not exist")))?;
+    let visible: Vec<Task> = task_rows_from_reading(
+        state.orchestrator.get_all_tasks_checked().await,
+        "task list",
+    )?
+    .into_iter()
+    .filter(|t| visible_to_claims(claims, t))
+    .collect();
+    let mut task = task_to_change(&visible, &id)?.clone();
     // 改前的样子先留一份：审计问的是「改成了什么」，只有改后的值答不了。
     let before = serde_json::json!({
         "parent_task_id": task.parent_task_id,
@@ -1924,17 +1950,11 @@ pub async fn save_task_plan_handler(
     Json(req): Json<SaveTaskPlanRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
-    let tasks: Vec<Task> = state
-        .orchestrator
-        .get_all_tasks()
-        .await
-        .into_iter()
-        .filter(|t| visible_to_claims(claims, t))
-        .collect();
-    let task = tasks
-        .iter()
-        .find(|t| t.id == id)
-        .ok_or_else(|| ApiError::not_found(format!("task '{id}' does not exist")))?;
+    let task = task_to_change_from_reading(
+        state.orchestrator.get_all_tasks_checked().await,
+        claims,
+        &id,
+    )?;
 
     // 没有验收标准的工作包没有「做完」的判据：给它排一条期，等于给一件谁也
     // 说不清完成没有的活定一个计划价值。
@@ -2152,17 +2172,14 @@ pub async fn move_task_handler(
         .with_code("unknown_column")
     })?;
 
-    let tasks: Vec<Task> = state
-        .orchestrator
-        .get_all_tasks()
-        .await
-        .into_iter()
-        .filter(|t| visible_to_claims(claims, t))
-        .collect();
-    let task = tasks
-        .iter()
-        .find(|t| t.id == id)
-        .ok_or_else(|| ApiError::not_found(format!("task '{id}' does not exist")))?;
+    let tasks: Vec<Task> = task_rows_from_reading(
+        state.orchestrator.get_all_tasks_checked().await,
+        "task list",
+    )?
+    .into_iter()
+    .filter(|t| visible_to_claims(claims, t))
+    .collect();
+    let task = task_to_change(&tasks, &id)?;
 
     let step = move_step(task.status.as_str(), target.as_str())
         .map_err(|refusal| ApiError::bad_request(refusal.message()).with_code(refusal.code()))?;
@@ -2530,6 +2547,59 @@ mod tests {
         let empty = task_rows_from_reading(Ok(Vec::new()), "task list")
             .expect("一条都没有是一份读得出来的答案");
         assert!(empty.is_empty(), "空表原样交回，不编造任何行");
+    }
+
+    /// 读不出来的任务不是「不存在的任务」。
+    ///
+    /// 改任务、存计划、挪列这三条写路径都在同一读上找自己要改的那一行。旧读
+    /// 把库故障折成空表，于是一条真实存在的任务被告知「does not exist」——那是
+    /// 一句关于这条任务的话，而实际发生的是另一件事。读不出来要 503；404 留给
+    /// 「真读到了、而且在可见范围内确实没有这一行」。
+    #[test]
+    fn a_task_that_cannot_be_read_is_not_a_task_that_does_not_exist() {
+        let unreadable: cog_core::SFResult<Vec<Task>> = Err(cog_core::SFError::Database(
+            "connection refused while reading the tasks".into(),
+        ));
+        let refusal = task_to_change_from_reading(unreadable, None, "t-1")
+            .expect_err("读不出来时不能判这条任务不存在");
+        assert!(
+            refusal.message.contains("connection refused"),
+            "拒绝的理由要带原始错误，让人看得出是读失败: {}",
+            refusal.message
+        );
+        let response = refusal.into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "读不出来是「这个部署现在回答不了」，不是 404"
+        );
+
+        // 真读到、但没有这一行：仍是 404——那是读到的答案。
+        let missing = task_to_change_from_reading(Ok(Vec::new()), None, "t-1")
+            .expect_err("读过之后确实没有这一行");
+        assert_eq!(
+            missing.into_response().status(),
+            StatusCode::NOT_FOUND,
+            "见过这一份行、里面没有它，才是 404"
+        );
+
+        // 别人的任务读得到、但不是这个调用方可见的：照旧 404，不泄露存在性。
+        let scoped = claims(&["ws-a"]);
+        let hidden = task_to_change_from_reading(
+            Ok(vec![task("t-1", cog_core::TaskStatus::Pending, "t", 0)]),
+            Some(&scoped),
+            "t-1",
+        )
+        .expect_err("可见范围之外的行与不存在是同一种回答");
+        assert_eq!(hidden.into_response().status(), StatusCode::NOT_FOUND);
+
+        let found = task_to_change_from_reading(
+            Ok(vec![task("t-1", cog_core::TaskStatus::Pending, "t", 0)]),
+            None,
+            "t-1",
+        )
+        .expect("读得出来、读得到、也看得见，就该交回那一行");
+        assert_eq!(found.id, "t-1");
     }
 
     /// 状态词必须与读面印出来的那个词逐字一致：`TaskFilter` 用 `as_str` 印行，
