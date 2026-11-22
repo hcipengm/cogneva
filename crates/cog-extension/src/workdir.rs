@@ -3737,6 +3737,15 @@ pub(crate) mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
+    /// A directory's identity on one filesystem. `git worktree move` renames, so
+    /// the moved tree keeps it; a copy beside the slot would get a new one.
+    fn inode_of(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path)
+            .unwrap_or_else(|e| panic!("{} is unreadable: {e}", path.display()))
+            .ino()
+    }
+
     /// 给这一支的产物一次身份：检查点会跑 `git commit-tree`，而 commit-tree 在没有
     /// 名字与邮箱时直接失败（CI 的 runner 上没有全局 git 身份，本机有，于是这条
     /// 只在 CI 红）。设的是**本进程的环境**：被测代码起的子进程会继承它，而值对每
@@ -3951,14 +3960,25 @@ pub(crate) mod tests {
             path.join("README").exists(),
             "the handed tree is a real checkout"
         );
+        // `route` 在答复之后才排补池，补出来的那棵会占回刚交出去的那个槽位名——
+        // 所以这里问的是**这棵树的身份**（目录的 inode），不是那个路径还在不在：
+        // 按路径判，一次补池就能把「交出去了」读成「还留在池子里」（2026-11-22
+        // 实测：满负载下补池先于这两行断言完成，路径被新树占回去，红）。
+        let taken_id = inode_of(&taken);
         assert_eq!(
-            r.warm_slots().await.len(),
-            1,
-            "the tree came out of the pool instead of being cut beside it"
+            inode_of(&path),
+            taken_id,
+            "the handed tree is the one that was waiting; a copy is a checkout, not a hand-out"
         );
+        let still_waiting: Vec<_> = r
+            .warm_slots()
+            .await
+            .into_iter()
+            .filter(|slot| inode_of(slot) == taken_id)
+            .collect();
         assert!(
-            !taken.exists(),
-            "the pool slot moved to the task path; a copy left behind is a checkout, not a hand-out"
+            still_waiting.is_empty(),
+            "the tree came out of the pool instead of being cut beside it: {still_waiting:?}"
         );
         assert!(
             r.list_task_trees()
