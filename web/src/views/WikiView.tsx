@@ -143,11 +143,11 @@ export function WikiView() {
                   key: 'highlights',
                   title: '高亮',
                   render: (r) =>
-                    r.highlights.length === 0 ? (
+                    (r.highlights ?? []).length === 0 ? (
                       '—'
                     ) : (
                       <ul className="space-y-0.5 text-[11px] text-[var(--paper-dim)]">
-                        {r.highlights.map((line, i) => (
+                        {(r.highlights ?? []).map((line, i) => (
                           <li key={i} className="line-clamp-2">
                             {line}
                           </li>

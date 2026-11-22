@@ -4215,7 +4215,8 @@ export interface WikiSearchHit {
   document: WikiDocument;
   score: number;
   match_type?: string;
-  highlights: string[];
+  /** 服务端为空时整个字段不出现（`skip_serializing_if`），不是空数组。 */
+  highlights?: string[];
 }
 
 export interface WikiSearchResponse {
@@ -4837,6 +4838,6 @@ export interface UploadedFile {
 export async function uploadFile(file: File): Promise<UploadedFile> {
   const form = new FormData();
   form.append('file', file);
-  const res = await api.sendForm<{ code: number; data: UploadedFile }>('/api/v1/files/upload', form);
+  const res = await api.sendForm<{ code: string; data: UploadedFile }>('/api/v1/files/upload', form);
   return res.data;
 }

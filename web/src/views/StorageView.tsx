@@ -103,7 +103,13 @@ export function StorageView() {
     60_000
   );
   const stats = useResource('归档计数', getMemoryStats, 60_000);
-  const timeline = useResource(`记忆操作时序（${windowSecs}s）`, () => getMemoryMetrics(windowSecs), 30_000);
+  // 读数把窗口大小一起带回来：`useResource` 换 `what` 时不清旧数据，若只看
+  // `data` 是不是空，换窗口的头一拍会把上一个窗口的样本挂在新区间的标签下。
+  const timeline = useResource(
+    `记忆操作时序（${windowSecs}s）`,
+    async () => ({ secs: windowSecs, metrics: await getMemoryMetrics(windowSecs) }),
+    30_000
+  );
   const logs = useResource('日志索引', () => listRawLogs({ limit: PAGE }), 60_000);
   const schema = useResource('结构化记忆', listMemorySchema, 120_000);
   const summary = useResource('摘要记忆', listMemorySummary, 120_000);
@@ -353,7 +359,7 @@ function MemoryTimeline({
   setWindowSecs,
 }: {
   timeline: {
-    data: MemoryMetrics | null;
+    data: { secs: number; metrics: MemoryMetrics } | null;
     error: string | null;
     loading: boolean;
     refresh: () => void;
@@ -361,8 +367,10 @@ function MemoryTimeline({
   windowSecs: number;
   setWindowSecs: (secs: number) => void;
 }) {
-  const counters = aggregate(timeline.data?.counters ?? []);
-  const histograms = aggregate(timeline.data?.histograms ?? []);
+  // 只有当手上这份读数正是当前窗口的，才拿它画表；否则旧窗口的样本会挂在新标签下。
+  const fresh = timeline.data && timeline.data.secs === windowSecs ? timeline.data.metrics : null;
+  const counters = aggregate(fresh?.counters ?? []);
+  const histograms = aggregate(fresh?.histograms ?? []);
   const windows = [
     { secs: 60, label: '1 分钟' },
     { secs: 300, label: '5 分钟' },
@@ -387,7 +395,7 @@ function MemoryTimeline({
       </div>
       {timeline.error ? (
         <ReadError what="操作时序" error={timeline.error} onRetry={timeline.refresh} />
-      ) : !timeline.data && timeline.loading ? (
+      ) : !fresh ? (
         <Loading what="操作时序" />
       ) : counters.length === 0 && histograms.length === 0 ? (
         <Empty>
