@@ -3967,9 +3967,12 @@ mod tests {
         let enabled = document["dag_executor"]["archive_enabled"]
             .as_bool()
             .expect("dag_executor.archive_enabled");
+        // 模板不写「等于代码默认值」的叶子（那一族门：默认值不进文档），所以
+        // 文档里没有这一项时读到的是**代码默认值**——`serde(default = ...)` 那一条
+        // 就是部署实际走的解析，这里照着复现，而不是自己猜一个数。
         let retention = document["dag_executor"]["archive_after_secs"]
             .as_u64()
-            .expect("dag_executor.archive_after_secs");
+            .unwrap_or_else(|| cog_core::Config::default().dag_executor.archive_after_secs);
         let wait = document
             .pointer("/self_evolution/signal_watcher/report_cooldown_secs")
             .and_then(|v| v.as_i64())
