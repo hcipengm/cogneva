@@ -3954,17 +3954,18 @@ pub(crate) mod tests {
         let slots = r.warm_slots().await;
         assert_eq!(slots.len(), 2, "the pool fills ahead of demand");
         let taken = slots[0].clone();
+        // 身份在交树**之前**取：`route` 在答复之后才排补池，补出来的那棵会占回刚
+        // 交出去的那个槽位名——所以这里问的是**这棵树的身份**（目录的 inode），
+        // 不是那个路径还在不在。按路径判两个方向都会读错：补池先完成时「交出去了」
+        // 读成「还留在池子里」，补池没跟上的时候路径已经没了（2026-11-22 实测，
+        // 满负载下两种都出现过）。
+        let taken_id = inode_of(&taken);
 
         let (path, _, _) = r.route("warm-task").await.unwrap();
         assert!(
             path.join("README").exists(),
             "the handed tree is a real checkout"
         );
-        // `route` 在答复之后才排补池，补出来的那棵会占回刚交出去的那个槽位名——
-        // 所以这里问的是**这棵树的身份**（目录的 inode），不是那个路径还在不在：
-        // 按路径判，一次补池就能把「交出去了」读成「还留在池子里」（2026-11-22
-        // 实测：满负载下补池先于这两行断言完成，路径被新树占回去，红）。
-        let taken_id = inode_of(&taken);
         assert_eq!(
             inode_of(&path),
             taken_id,
