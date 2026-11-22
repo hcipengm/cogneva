@@ -35,7 +35,7 @@ pub struct ListedDatasets {
 /// 文件系统说「这个路径上不可能有数据集」：东西不在，或者某一级是普通文件。
 /// 这是确定的「没有」。别的错——符号链接成环、目录搜不了——是「看不到」，
 /// 折成「没有」就是把一次没量成报成 0。
-fn path_is_absent(e: &std::io::Error) -> bool {
+pub(crate) fn path_is_absent(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
         std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
