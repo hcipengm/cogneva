@@ -34,6 +34,7 @@ const FOLDED: &[&str] = &[
     "get_graph(",
     "get_dependents(",
     "get_dependencies(",
+    "get_task(",
 ];
 
 /// (文件, 函数锚点, 它该走的那条读, 折叠之后那一面会说什么)。
@@ -94,6 +95,12 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
     ),
     (
         TASKS,
+        "pub async fn get_task_handler",
+        "get_task_checked",
+        "一条还在跑的活被答成「已经被删了」",
+    ),
+    (
+        TASKS,
         "pub async fn get_task_graph_handler",
         "get_graph_checked",
         "任务图画成一张空图",
@@ -103,6 +110,12 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "pub async fn task_ledger_handler",
         "get_all_tasks_checked",
         "这一面账答成「在册 0 条、无事可做」",
+    ),
+    (
+        A2A,
+        "async fn rpc_tasks_get",
+        "get_task_checked",
+        "对端据 -32001 去换 id，而那一行可能还在",
     ),
     (
         A2A,

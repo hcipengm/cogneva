@@ -217,6 +217,10 @@ impl OrchestratorControl for OrchestratorControlImpl {
         self.dag_executor.get_task(task_id).await
     }
 
+    async fn get_task_checked(&self, task_id: &str) -> SFResult<Option<Task>> {
+        self.dag_executor.get_task_checked(task_id).await
+    }
+
     async fn schedule_task(&self, task_id: &str) -> SFResult<()> {
         self.dag_executor.schedule_task(task_id).await
     }

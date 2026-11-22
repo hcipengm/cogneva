@@ -562,6 +562,13 @@ fn ready_ids_from(reading: cog_core::SFResult<Vec<Task>>) -> Result<HashSet<Stri
 /// -- "0 tasks", "0 ready", "nothing to purge", an empty flow. Absence of the
 /// answer is a 503; an empty row set that was actually read stays a 200 with
 /// zeros.
+/// 一行任务的读：读失败留成 503，读到了才轮到「有没有这一行」。
+pub(crate) fn task_from_reading(
+    reading: cog_core::SFResult<Option<Task>>,
+) -> Result<Option<Task>, ApiError> {
+    reading.map_err(|e| ApiError::service_unavailable(format!("the task could not be read: {e}")))
+}
+
 pub(crate) fn task_rows_from_reading(
     reading: cog_core::SFResult<Vec<Task>>,
     what: &str,
@@ -1251,7 +1258,10 @@ pub async fn get_task_handler(
         wait_for_task_end(&state, &id, wait_ms.min(MAX_TASK_WAIT_MS)).await;
     }
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
-    match state.orchestrator.get_task(&id).await {
+    // 读失败不能被这一页答成「没有这条任务」：404 是一个对客户端有后果的答案
+    // （它据此判断那一行已经被删），而一次读不出来的库完全可能还压着这一行。
+    let task = task_from_reading(state.orchestrator.get_task_checked(&id).await)?;
+    match task {
         Some(task) if !visible_to_claims(claims, &task) => {
             Err(ApiError::not_found(format!("task '{id}' not found")))
         }
@@ -2391,6 +2401,20 @@ mod tests {
     /// 合正是安静时的答案。读失败被折进去时，一个读不动图的网关会把「没有活
     /// 等着」印在标签页和它上方的计数上——那是本节最不能给的数。读不出来要
     /// 拒绝，理由带着原始错误，读得出来时要交回那些 id。
+    /// 一行任务读不出来时，这一编要答 503，而不是「没有这条任务」。
+    ///
+    /// 判据：把 `task_from_reading` 换回 `unwrap_or(None)`，第一条断言会红。
+    #[test]
+    fn a_single_task_that_cannot_be_read_is_not_a_task_that_does_not_exist() {
+        let error = task_from_reading(Err(cog_core::SFError::Database("store unavailable".into())))
+            .expect_err("读失败不许折成「没有这一行」");
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(task_from_reading(Ok(None))
+            .expect("读到了「没有这一行」")
+            .is_none());
+    }
+
     #[test]
     fn an_unreadable_ready_queue_is_not_an_empty_queue() {
         let unreadable: cog_core::SFResult<Vec<Task>> = Err(cog_core::SFError::Database(
