@@ -15,7 +15,7 @@
 //! 这条判据不认注释、不认提交信息：它读的是同一个函数里有没有那三个动作的顺序。
 //! 一条注释可以撒谎，一段代码要做完三步才不红。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::common::rust_production::rust_files_under;
 

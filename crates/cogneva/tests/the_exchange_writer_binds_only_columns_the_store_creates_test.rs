@@ -13,8 +13,6 @@
 //! 判据是树判据：从源码里读出 `INSERT` 的列名集合与 DDL 的列名集合，前者必须是后者的
 //! 子集。反方向不判——老行留在表里的列比写入口用到的多，那是允许的（删列会销毁正文）。
 
-use std::path::{Path, PathBuf};
-
 // 仓库根只有一份算法（`common::routes::repo_root()`）：各写一遍时，根一漂读数就
 // 变成零，与「没有题目」同形。
 use crate::common::routes::repo_root;
