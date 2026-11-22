@@ -95,6 +95,18 @@ pub struct HealthCounts {
     pub dead: usize,
 }
 
+/// 死信队列的长度：读失败留成 503。
+///
+/// 这一格是「有多少件活压在死信里等人清」。读不出来时折成 0，画出来正是一个干净
+/// 的队列——与真的没人压活同形，而清死信这件事只有这一页会叫人来干。
+fn dlq_len_from_reading(reading: cog_core::SFResult<usize>) -> Result<usize, ApiError> {
+    reading.map_err(|e| {
+        ApiError::service_unavailable(format!(
+            "the dead-letter queue length could not be read: {e}"
+        ))
+    })
+}
+
 #[derive(Debug, Serialize)]
 pub struct ProcessOverview {
     pub timestamp: DateTime<Utc>,
@@ -282,7 +294,7 @@ pub async fn process_overview_handler(
         .unwrap_or_default();
     crews.sort_by(|a, b| a.crew_id.cmp(&b.crew_id));
 
-    let dlq_len = state.orchestrator.dlq_len().await.unwrap_or(0);
+    let dlq_len = dlq_len_from_reading(state.orchestrator.dlq_len().await)?;
 
     Ok(Json(ProcessOverview {
         timestamp: Utc::now(),
@@ -300,6 +312,23 @@ mod tests {
 
     fn index(tasks: &[cog_core::Task]) -> HashMap<&str, &cog_core::Task> {
         tasks.iter().map(|t| (t.id.as_str(), t)).collect()
+    }
+
+    /// 死信队列读不出来时，这一页要答 503，而不是「队列空着」。
+    ///
+    /// 判据：把 `dlq_len_from_reading` 换回 `unwrap_or(0)`，第一条断言会红。
+    #[test]
+    fn an_unreadable_dead_letter_queue_is_not_an_empty_one() {
+        use axum::response::IntoResponse;
+        let error =
+            dlq_len_from_reading(Err(cog_core::SFError::Database("store unavailable".into())))
+                .expect_err("读失败不许折成 0");
+        let response = error.into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(dlq_len_from_reading(Ok(7)).expect("读到了就是那个数"), 7);
     }
 
     #[test]

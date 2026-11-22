@@ -147,6 +147,12 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "get_all_tasks_checked",
         "流程总览画成「还没有派过活」",
     ),
+    (
+        PROCESSES,
+        "pub async fn process_overview_handler",
+        "dlq_len_from_reading(",
+        "死信队列画成一只干净的队列",
+    ),
 ];
 
 #[test]
