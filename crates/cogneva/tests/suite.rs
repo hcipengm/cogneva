@@ -148,10 +148,14 @@ mod a_shared_index_makes_every_writer_carry_every_memory_test;
 mod a_shared_query_is_spelt_once_test;
 #[path = "a_successful_write_rings_the_bell.rs"]
 mod a_successful_write_rings_the_bell;
+#[path = "a_timeout_wall_is_a_named_value_test.rs"]
+mod a_timeout_wall_is_a_named_value_test;
 #[path = "a_tool_that_changes_things_asks_the_person_first_test.rs"]
 mod a_tool_that_changes_things_asks_the_person_first_test;
 #[path = "a_waiting_reason_is_declared_once_test.rs"]
 mod a_waiting_reason_is_declared_once_test;
+#[path = "a_wall_answers_when_nothing_arrives_test.rs"]
+mod a_wall_answers_when_nothing_arrives_test;
 #[path = "a_word_written_out_is_the_word_read_back_test.rs"]
 mod a_word_written_out_is_the_word_read_back_test;
 #[path = "a_worker_can_ask_to_change_the_system_test.rs"]
@@ -228,6 +232,8 @@ mod boot_phase_marks_contract_test;
 mod bounds_registry_test;
 #[path = "shipped_config_numbers_are_registered_test.rs"]
 mod shipped_config_numbers_are_registered_test;
+#[path = "the_exchange_writer_binds_only_columns_the_store_creates_test.rs"]
+mod the_exchange_writer_binds_only_columns_the_store_creates_test;
 
 #[path = "builtin_tools_have_one_list.rs"]
 mod builtin_tools_have_one_list;
