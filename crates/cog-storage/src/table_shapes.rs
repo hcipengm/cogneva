@@ -91,7 +91,7 @@ pub const MUTABLE_TABLES: &[DeclaredTable] = &[
             watermark: "as_of",
             rebuild: "crates/cog-observability/src/metric_projection.rs",
             rebuilt_from: "Prometheus 里 `<name>_total` 那条序列",
-            rebuild_test: "crates/cog-storage/tests/metric_projections_rebuild_from_prometheus.rs",
+            rebuild_test: "crates/cogneva/tests/metric_projections_rebuild_from_prometheus.rs",
         },
     },
     DeclaredTable {
@@ -101,7 +101,7 @@ pub const MUTABLE_TABLES: &[DeclaredTable] = &[
             watermark: "as_of",
             rebuild: "crates/cog-observability/src/metric_projection.rs",
             rebuilt_from: "Prometheus 里 `<name>_bucket` 那条序列的每一档",
-            rebuild_test: "crates/cog-storage/tests/metric_projections_rebuild_from_prometheus.rs",
+            rebuild_test: "crates/cogneva/tests/metric_projections_rebuild_from_prometheus.rs",
         },
     },
     DeclaredTable {
@@ -111,7 +111,7 @@ pub const MUTABLE_TABLES: &[DeclaredTable] = &[
             watermark: "as_of",
             rebuild: "crates/cog-observability/src/metric_projection.rs",
             rebuilt_from: "Prometheus 里 `<name>_sum` 那条序列",
-            rebuild_test: "crates/cog-storage/tests/metric_projections_rebuild_from_prometheus.rs",
+            rebuild_test: "crates/cogneva/tests/metric_projections_rebuild_from_prometheus.rs",
         },
     },
     DeclaredTable {

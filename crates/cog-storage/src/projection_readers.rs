@@ -48,7 +48,7 @@ pub const PROJECTION_READERS: &[ProjectionReader] = &[
         why_not_the_source: "这一行是被观测的进程自己累加的数，真源是 Prometheus 里那条序列；从真源读一次要走一趟网络、并且 Prometheus 不在时读不到，而屏上的每一次刷新都在问它。库里的这一份是投影，用 `cogneva rebuild-metric-projections` 可以按真源整表重写。",
         rebuilt_from: "Prometheus 里 `<name>_total` 那条序列",
         rebuild: "crates/cog-observability/src/metric_projection.rs",
-        rebuild_test: "crates/cog-storage/tests/metric_projections_rebuild_from_prometheus.rs",
+        rebuild_test: "crates/cogneva/tests/metric_projections_rebuild_from_prometheus.rs",
     },
     ProjectionReader {
         table: "cog_metric_histogram_buckets",
@@ -56,7 +56,7 @@ pub const PROJECTION_READERS: &[ProjectionReader] = &[
         why_not_the_source: "直方图的每档观测数由进程累加、由 Prometheus 保存，从真源算一次 `histogram_quantile` 要读整条序列的历史；库里这一份是那一次累加的投影，重建命令按真源整表重写。",
         rebuilt_from: "Prometheus 里 `<name>_bucket` 那条序列的每一档",
         rebuild: "crates/cog-observability/src/metric_projection.rs",
-        rebuild_test: "crates/cog-storage/tests/metric_projections_rebuild_from_prometheus.rs",
+        rebuild_test: "crates/cogneva/tests/metric_projections_rebuild_from_prometheus.rs",
     },
     ProjectionReader {
         table: "cog_metric_histogram_sums",
@@ -64,7 +64,7 @@ pub const PROJECTION_READERS: &[ProjectionReader] = &[
         why_not_the_source: "观测值之和与每档计数同源：真源是 Prometheus 的 `<name>_sum`。库里这一份是投影，重建命令按真源整表重写。",
         rebuilt_from: "Prometheus 里 `<name>_sum` 那条序列",
         rebuild: "crates/cog-observability/src/metric_projection.rs",
-        rebuild_test: "crates/cog-storage/tests/metric_projections_rebuild_from_prometheus.rs",
+        rebuild_test: "crates/cogneva/tests/metric_projections_rebuild_from_prometheus.rs",
     },
     ProjectionReader {
         table: "task_current",
