@@ -53,14 +53,15 @@ inside=()
 rust=()
 while IFS= read -r f; do
     [ -n "$f" ] || continue
+    # `case` 的 `*` 是跨 `/` 的：`crates/*.rs` 已经收掉 `crates/a/b.rs`，再写一条
+    # `crates/**/*.rs` 是永不匹配的死分支（shellcheck SC2222）。两处都只留一条。
     case "$f" in
-    crates/*.rs | crates/**/*.rs)
+    crates/*.rs)
         inside+=("$f")
         rust+=("$f")
         ;;
     deploy/rendered/*) continue ;;
     deploy/*.yaml | deploy/*.yml | deploy/*.sh) inside+=("$f") ;;
-    deploy/**/*.yaml | deploy/**/*.yml | deploy/**/*.sh) inside+=("$f") ;;
     esac
 done <<<"$staged"
 

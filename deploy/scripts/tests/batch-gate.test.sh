@@ -34,7 +34,7 @@ git -C "$tree" branch -f origin/main "$BASE"
 ledger="$tree/ledger.md"
 # 一条待办的一行：`$1` 是 id，`$2` 是触点，`$3` 是 `done` 时带上 `代码` 格。
 row() {
-  if [ "${3:-}" = done ]; then
+  if [ "${3:-}" = "done" ]; then
     printf '| %s | 内容 | 未落 | 判据 代码: %s |｜round: current｜touches: %s\n' "$1" "$2" "$2"
   else
     printf '| %s | 内容 | 未落 | 判据 |｜round: current｜touches: %s\n' "$1" "$2"
@@ -52,7 +52,7 @@ write_ledger() { # $1 = path, rest = 已完成（带 `代码` 格）的 id
   for spec in $SPECS; do
     local id="${spec%%=*}" touch="${spec#*=}"
     case "$done_ids" in
-      *" $id "*) row "$id" "$touch" done ;;
+      *" $id "*) row "$id" "$touch" "done" ;;
       *) row "$id" "$touch" ;;
     esac
   done >>"$path"
@@ -141,7 +141,6 @@ out=$(COGNEVA_EVENT_PSQL="$tmp/psql.sh" COGNEVA_TODO_LEDGER="$tmp/missing.md" py
 ledger_code="$tree/ledger-code.md"
 ledger_irr="$tree/ledger-irr.md"
 SPECS_IRR="S1=crates/a/src/x.rs S2=crates/b/src/y.rs S3=deploy/manifest.yaml S4=crates/a/migrations/001_x.up.sql"
-SPECS_CODE="S1=crates/a/src/x.rs S2=crates/b/src/y.rs S3=deploy/manifest.yaml"
 long=$(printf '这一条要读的正文很长%.0s' $(seq 1 120))
 ledger_long="$tree/ledger-long.md"
 
@@ -189,7 +188,7 @@ out=$(run "$tree" "$ledger_code"); rc=$?
 # 第 4 条理由要拿**整行正文**去比窗口份额：标题截断到 80 字时，最长的几条会被
 # 估成同一个数，于是这条理由永远不成立。
 reset
-{ row S1 "crates/a/src/x.rs" done; printf '| S2 | %s | 未落 | 判据 |｜round: current｜touches: crates/b/src/y.rs\n' "$long"; } >"$ledger_long"
+{ row S1 "crates/a/src/x.rs" "done"; printf '| S2 | %s | 未落 | 判据 |｜round: current｜touches: crates/b/src/y.rs\n' "$long"; } >"$ledger_long"
 git -C "$tree" add -A >/dev/null; git -C "$tree" commit -qm "long ledger" >/dev/null
 pin "$(git -C "$tree" rev-parse HEAD)"
 commit_with "too much to read in one window

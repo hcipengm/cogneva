@@ -48,7 +48,6 @@ case "${1:-}" in
   *) case "${1:-}" in -*) echo "usage: $0 [--index|--tree] [repo]" >&2; exit 2 ;; esac ;;
 esac
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # `COGNEVA_PRIVATE_ROOT` 只给自检用：它要造一份「带随机后缀的临时工作树」，证明名单推的是
 # 仓而不是这个工作目录。生产路径永远从脚本自己的位置推。
 # 私有仓在哪：本脚本随公开仓走，推不出那个路径，只能问本机的配置。

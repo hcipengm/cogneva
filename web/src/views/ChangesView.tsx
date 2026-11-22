@@ -43,9 +43,9 @@ function Cells({ cells }: { cells: ChangeCells | undefined }) {
     },
   ];
   return (
-    <span
+    <Note
       className="mono flex gap-1 text-[11px]"
-      title="代码 / 上线 / 验证：树里有实现、跑着的那一版有它、判据对着真东西量过"
+      text="代码 / 上线 / 验证：树里有实现、跑着的那一版有它、判据对着真东西量过"
     >
       {pieces.map((piece) => (
         <span
@@ -62,7 +62,7 @@ function Cells({ cells }: { cells: ChangeCells | undefined }) {
         </span>
       ))}
       {cells.code && !cells.verified && <span className="text-[var(--warn)]">!</span>}
-    </span>
+    </Note>
   );
 }
 

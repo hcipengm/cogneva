@@ -47,7 +47,7 @@ STUB
 chmod +x "$tree/scripts/host/event-psql.sh"
 
 # 1. 没设环境变量，但仓库自带入口：读得到那一轮。
-out=$(COGNEVA_EVENT_PSQL= COGNEVA_TODO_LEDGER="$tree/ledger.md" \
+out=$(COGNEVA_EVENT_PSQL='' COGNEVA_TODO_LEDGER="$tree/ledger.md" \
       python3 "$tree/scripts/hooks/round.py" status 2>&1); rc=$?
 if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "还剩 1 条"; then
     ok "没设变量也能读：用仓库自带的事件流入口"
@@ -57,7 +57,7 @@ fi
 
 # 2. 两档都没有：退 3，并点名缺的是什么。
 mv "$tree/scripts/host/event-psql.sh" "$tree/scripts/host/event-psql.sh.off"
-out=$(COGNEVA_EVENT_PSQL= COGNEVA_TODO_LEDGER="$tree/ledger.md" \
+out=$(COGNEVA_EVENT_PSQL='' COGNEVA_TODO_LEDGER="$tree/ledger.md" \
       python3 "$tree/scripts/hooks/round.py" status 2>&1); rc=$?
 { [ "$rc" -eq 3 ] && printf '%s' "$out" | grep -q "COGNEVA_EVENT_PSQL"; } \
     && ok "两档都没有：退 3，并点名环境变量" \

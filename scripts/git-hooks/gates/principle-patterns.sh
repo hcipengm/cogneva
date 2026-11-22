@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034  # 这份文件是被 source 的库：下面这些名字是给调用方用的
 # The sentence shapes the permanent-memory principles forbid, read from their
 # single definition in the cogneva tree.
 #
@@ -53,12 +54,12 @@ _COGNEVA_BRAIN="$(env -u GIT_DIR -u GIT_WORK_TREE git -C "$(dirname "${BASH_SOUR
 _SHAPES_REL="crates/cog-guardrail/src/principle_shapes.rs"
 if [ -n "${COGNEVA_SHAPES_FILE:-}" ]; then
     _COGNEVA_SHAPES="$COGNEVA_SHAPES_FILE"
-    _COGNEVA_SHAPES_MODE=file
+    _COGNEVA_SHAPES_MODE="file"
     _COGNEVA_SHAPES_DESC="$_COGNEVA_SHAPES"
 else
     _COGNEVA_SHAPES_REPO="${COGNEVA_SHAPES_REPO:-$_COGNEVA_BRAIN/../cogneva}"
     _COGNEVA_SHAPES="$_COGNEVA_SHAPES_REPO/$_SHAPES_REL"
-    _COGNEVA_SHAPES_MODE=head
+    _COGNEVA_SHAPES_MODE="head"
     _COGNEVA_SHAPES_DESC="$_COGNEVA_SHAPES_REPO@HEAD:$_SHAPES_REL"
 fi
 

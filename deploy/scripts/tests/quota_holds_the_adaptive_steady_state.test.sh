@@ -15,13 +15,18 @@ set -uo pipefail
 
 command -v kubectl >/dev/null 2>&1 || { echo "quota: 没有 kubectl，这一条没判。" >&2; exit 3; }
 ns="${COGNEVA_NAMESPACE:-cogneva}"
+# 集群的连接凭据只有 root 读得到（`/etc/rancher/k3s/k3s.yaml`），宿主上的其余读数口
+# 都走这一条（`deploy/scripts/read-resource-account.sh` 的 `COGNEVA_KUBECTL` 同一个
+# 默认值）。按裸 `kubectl` 判，这一格在宿主上永远是「读不到」，而三档里的「读不到」
+# 与「不够」被压成同一个红——量不到的那一格看起来像判过了。
+kube() { if sudo -n true 2>/dev/null; then sudo -n kubectl "$@"; else kubectl "$@"; fi; }
 
-hard=$(kubectl -n "$ns" get quota cogneva-quota -o jsonpath='{.spec.hard.requests\.cpu}' 2>/dev/null) || exit 3
-used=$(kubectl -n "$ns" get quota cogneva-quota -o jsonpath='{.status.used.requests\.cpu}' 2>/dev/null) || exit 3
+hard=$(kube -n "$ns" get quota cogneva-quota -o jsonpath='{.spec.hard.requests\.cpu}' 2>/dev/null) || exit 3
+used=$(kube -n "$ns" get quota cogneva-quota -o jsonpath='{.status.used.requests\.cpu}' 2>/dev/null) || exit 3
 [ -n "$hard" ] && [ -n "$used" ] || { echo "quota: 配额读不出来，这一条没判。" >&2; exit 3; }
 
 # 一次滚动的重叠：取所有 Deployment 里最大的那份 requests（被替换的那一个）。
-largest=$(kubectl -n "$ns" get deploy -o jsonpath='{range .items[*]}{.spec.template.spec.containers[*].resources.requests.cpu}{"\n"}{end}' 2>/dev/null | sort -h | tail -1)
+largest=$(kube -n "$ns" get deploy -o jsonpath='{range .items[*]}{.spec.template.spec.containers[*].resources.requests.cpu}{"\n"}{end}' 2>/dev/null | sort -h | tail -1)
 [ -n "$largest" ] || { echo "quota: Deployment 的 requests 读不出来，这一条没判。" >&2; exit 3; }
 
 to_milli() { case "$1" in *m) echo "${1%m}";; *\.[0-9]) echo "$1" | awk '{printf "%d", $1*1000}';; *) echo "$1" | awk '{printf "%d", $1*1000}';; esac; }
