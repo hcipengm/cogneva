@@ -80,14 +80,22 @@ impl FileTraceStore {
     }
 
     /// Search all tiers for a trace and return which tier contains it.
-    async fn find_trace_tier(&self, trace_id: &str) -> Option<StorageTier> {
+    ///
+    /// A check that could not be answered is an error, not "no tier has it":
+    /// `None` is read by `load` as "this trace was never recorded", so folding
+    /// a permission or I/O failure into it would answer "no such trace" about
+    /// one that is still on disk.
+    async fn find_trace_tier(&self, trace_id: &str) -> SFResult<Option<StorageTier>> {
         for &tier in &[StorageTier::Hot, StorageTier::Warm, StorageTier::Cold] {
             let meta_path = self.meta_path(tier, trace_id);
-            if tokio::fs::try_exists(&meta_path).await.unwrap_or(false) {
-                return Some(tier);
+            let exists = tokio::fs::try_exists(&meta_path)
+                .await
+                .map_err(|e| SFError::IO(format!("checking {}: {}", meta_path.display(), e)))?;
+            if exists {
+                return Ok(Some(tier));
             }
         }
-        None
+        Ok(None)
     }
 
     /// Serialize trace data with optional compression.
@@ -140,21 +148,27 @@ impl FileTraceStore {
         Ok(())
     }
 
-    /// Read every parseable metadata file in one tier directory.
+    /// Read every metadata file in one tier directory.
     ///
-    /// Entries that cannot be read or parsed are skipped rather than failing
-    /// the listing: one unreadable file must not hide the tier's other
-    /// thousands, in particular not from a migration looking for its backlog.
+    /// A tier directory that does not exist is an empty tier. Anything else
+    /// that stops the read — the directory itself, or one of its sidecars — is
+    /// an error naming the path. Skipping it would answer "these are the
+    /// traces" about a set that was not fully seen; that answer reaches the
+    /// traces listing and the migrator's backlog count alike. Only a file that
+    /// vanished between the directory read and its own read is skipped: that
+    /// is a delete in flight, not a listing that failed.
     async fn tier_metas(&self, tier: StorageTier) -> SFResult<Vec<TraceMeta>> {
         let tier_dir = self.tier_dir(tier);
-        if !tokio::fs::try_exists(&tier_dir).await.unwrap_or(false) {
+        let dir_exists = tokio::fs::try_exists(&tier_dir)
+            .await
+            .map_err(|e| SFError::IO(format!("checking {}: {}", tier_dir.display(), e)))?;
+        if !dir_exists {
             return Ok(Vec::new());
         }
 
-        let mut entries = match tokio::fs::read_dir(&tier_dir).await {
-            Ok(e) => e,
-            Err(_) => return Ok(Vec::new()),
-        };
+        let mut entries = tokio::fs::read_dir(&tier_dir)
+            .await
+            .map_err(|e| SFError::IO(format!("reading {}: {}", tier_dir.display(), e)))?;
 
         let mut metas = Vec::new();
         while let Some(entry) = entries
@@ -170,11 +184,14 @@ impl FileTraceStore {
             {
                 continue;
             }
-            if let Ok(meta_json) = tokio::fs::read_to_string(&path).await {
-                if let Ok(meta) = serde_json::from_str::<TraceMeta>(&meta_json) {
-                    metas.push(meta);
-                }
-            }
+            let meta_json = match tokio::fs::read_to_string(&path).await {
+                Ok(json) => json,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(SFError::IO(format!("reading {}: {}", path.display(), e))),
+            };
+            let meta: TraceMeta = serde_json::from_str(&meta_json)
+                .map_err(|e| SFError::IO(format!("parsing {}: {}", path.display(), e)))?;
+            metas.push(meta);
         }
         Ok(metas)
     }
@@ -193,7 +210,7 @@ impl TraceStore for FileTraceStore {
         // destination exists: the search returns the first tier holding
         // metadata, so asked afterwards it would answer with the new one and
         // the old copy would be left behind to shadow it.
-        let previous_tier = self.find_trace_tier(&trace.trace_id).await;
+        let previous_tier = self.find_trace_tier(&trace.trace_id).await?;
 
         // Ensure destination tier directory exists
         let tier_dir = self.tier_dir(trace.tier);
@@ -204,15 +221,27 @@ impl TraceStore for FileTraceStore {
         // Destination first, metadata included. `load` reads a tier's metadata
         // to learn the compression level, so data without it is unreadable
         // while still looking like a trace that is present.
+        //
+        // Both files land through a temp-and-rename: a listing that reads a
+        // payload while it is being replaced must see either the old trace or
+        // the new one, never a truncated file. `SurvivesPowerLoss` because a
+        // trace is the only copy of the events it records — there is nothing
+        // to recompute it from.
         let trace_path = self.trace_path(trace.tier, &trace.trace_id);
-        tokio::fs::write(&trace_path, trace_bytes)
-            .await
-            .map_err(|e| SFError::IO(e.to_string()))?;
+        cog_core::atomic_write::write_bytes_async(
+            &trace_path,
+            &trace_bytes,
+            cog_core::atomic_write::Durability::SurvivesPowerLoss,
+        )
+        .await?;
 
         let meta_path = self.meta_path(trace.tier, &trace.trace_id);
-        tokio::fs::write(&meta_path, meta_json)
-            .await
-            .map_err(|e| SFError::IO(e.to_string()))?;
+        cog_core::atomic_write::write_bytes_async(
+            &meta_path,
+            meta_json.as_bytes(),
+            cog_core::atomic_write::Durability::SurvivesPowerLoss,
+        )
+        .await?;
 
         // Only now is the old copy redundant. Removing it is what makes the
         // move atomic in the direction that matters: a move that fails above
@@ -231,7 +260,7 @@ impl TraceStore for FileTraceStore {
 
     async fn load(&self, trace_id: &str) -> SFResult<Option<AgentTrace>> {
         // Search for the trace in all tiers
-        let Some(tier) = self.find_trace_tier(trace_id).await else {
+        let Some(tier) = self.find_trace_tier(trace_id).await? else {
             return Ok(None);
         };
 
@@ -276,9 +305,17 @@ impl TraceStore for FileTraceStore {
         // reading the heavy payload of every trace before sorting is work
         // thrown away. A trace whose metadata is gone cannot be loaded anyway
         // — `load` needs it for the compression level.
+        // `None` is the entry vanishing between the listing and this load — a
+        // delete in flight. An error is a payload that is on disk but cannot be
+        // read, and dropping it would make the listing answer with every trace
+        // except the damaged one, with nothing saying one is missing.
         let mut traces = Vec::new();
         for meta in self.list_meta(limit).await? {
-            if let Ok(Some(trace)) = self.load(&meta.trace_id).await {
+            let loaded = self
+                .load(&meta.trace_id)
+                .await
+                .map_err(|e| SFError::IO(format!("loading trace {}: {}", meta.trace_id, e)))?;
+            if let Some(trace) = loaded {
                 traces.push(trace);
             }
         }
@@ -486,6 +523,123 @@ mod tests {
         assert_eq!(
             loaded.event_count, 7,
             "the hot copy is the one that answers"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A tier directory that exists but cannot be listed is not an empty
+    /// tier. `read_dir` on a regular file fails with ENOTDIR whatever the
+    /// process's privileges; a volume that refuses the read takes the same
+    /// branch. Answering `Ok(vec![])` there says "no traces in this tier"
+    /// about entries nobody looked at.
+    #[tokio::test]
+    async fn a_listing_that_cannot_read_a_tier_directory_is_not_an_empty_list() {
+        let dir = std::env::temp_dir().join(format!("fts-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        // `hot` is a file, not a directory: it exists, so the existence check
+        // passes, and the directory read then fails.
+        tokio::fs::write(dir.join("hot"), b"not a directory")
+            .await
+            .unwrap();
+
+        let store = FileTraceStore::new(&dir);
+        assert!(
+            store.list_meta(10).await.is_err(),
+            "a tier that could not be read must not be reported as empty"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A sidecar that is there but is not a trace's metadata makes the
+    /// listing short by one entry. Reporting the path is the only way the
+    /// caller can tell this from a tier that genuinely holds fewer traces.
+    #[tokio::test]
+    async fn a_listing_reports_a_sidecar_it_cannot_parse() {
+        let dir = std::env::temp_dir().join(format!("fts-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(dir.join("hot")).await.unwrap();
+        tokio::fs::write(dir.join("hot/broken.meta.json"), b"{ not json")
+            .await
+            .unwrap();
+
+        let store = FileTraceStore::new(&dir);
+        let err = store
+            .list_meta(10)
+            .await
+            .expect_err("an unparseable sidecar must fail the listing");
+        let message = err.to_string();
+        assert!(
+            message.contains("broken.meta.json"),
+            "the error must name the file to inspect, got: {message}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// Metadata without a readable payload is a damaged entry, not an absent
+    /// one: the trace is on the listing's books either way. Omitting it made
+    /// the traces listing answer with every trace except the damaged one.
+    #[tokio::test]
+    async fn a_listing_reports_a_payload_it_cannot_deserialize() {
+        let dir = std::env::temp_dir().join(format!("fts-{}", uuid::Uuid::new_v4()));
+        let store = FileTraceStore::new(&dir);
+        store.save(&test_trace("t-damaged")).await.unwrap();
+        tokio::fs::write(dir.join("hot/t-damaged.trace"), b"not a trace")
+            .await
+            .unwrap();
+
+        let err = store
+            .list(10)
+            .await
+            .expect_err("a trace whose payload cannot be read must fail the listing");
+        assert!(
+            err.to_string().contains("t-damaged"),
+            "the error must name the trace, got: {err}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// The one skip that stays a skip: the payload disappeared between the
+    /// listing and its load, which is a delete in flight. Erroring here would
+    /// make every concurrent delete fail an unrelated reader's listing.
+    #[tokio::test]
+    async fn an_entry_deleted_between_the_listing_and_the_load_is_not_a_failed_listing() {
+        let dir = std::env::temp_dir().join(format!("fts-{}", uuid::Uuid::new_v4()));
+        let store = FileTraceStore::new(&dir);
+        store.save(&test_trace("t-going")).await.unwrap();
+        tokio::fs::remove_file(dir.join("hot/t-going.trace"))
+            .await
+            .unwrap();
+
+        let listed = store
+            .list(10)
+            .await
+            .expect("a delete in flight is not a listing failure");
+        assert!(listed.is_empty(), "the entry is gone, not broken");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// The atomic write publishes through a rename, so its temp sibling must
+    /// not survive a successful save and must never be listed as a trace.
+    #[tokio::test]
+    async fn a_save_leaves_no_temporary_file_beside_the_trace() {
+        let dir = std::env::temp_dir().join(format!("fts-{}", uuid::Uuid::new_v4()));
+        let store = FileTraceStore::new(&dir);
+        store.save(&test_trace("t-tmp")).await.unwrap();
+
+        let mut names = Vec::new();
+        let mut entries = tokio::fs::read_dir(dir.join("hot")).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["t-tmp.meta.json".to_string(), "t-tmp.trace".to_string()],
+            "a landed save leaves exactly its two files"
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
