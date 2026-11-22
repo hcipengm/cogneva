@@ -1542,21 +1542,29 @@ impl DagExecutor {
         self.venue_tasks_unified().await
     }
 
-    async fn venue_tasks_unified(&self) -> Vec<Task> {
+    /// 同上，但保留读失败。
+    ///
+    /// 场地看板把「读不出来」与「一块空板」分开画，而空板是一个真实状态：
+    /// 一行标签都没有时，板子上就是三栏零。把前一个折成后一个，看板会安静地
+    /// 显示「哪儿都没有活」，而图根本没读到。
+    pub async fn venue_tasks_checked(&self) -> SFResult<Vec<Task>> {
         if let Some(be) = self.fg() {
-            be.dag_get_venue_tasks(&self.workspace_id)
-                .await
-                .unwrap_or_default()
+            be.dag_get_venue_tasks(&self.workspace_id).await
         } else {
-            self.inner
+            Ok(self
+                .inner
                 .read()
                 .await
                 .tasks
                 .values()
                 .filter(|task| task.venue_label().is_some())
                 .cloned()
-                .collect()
+                .collect())
         }
+    }
+
+    async fn venue_tasks_unified(&self) -> Vec<Task> {
+        self.venue_tasks_checked().await.unwrap_or_default()
     }
 
     /// 同上，但保留读失败。
@@ -4677,6 +4685,10 @@ impl cog_core::DagExecutor for DagExecutor {
         self.get_venue_tasks().await
     }
 
+    async fn get_venue_tasks_checked(&self) -> SFResult<Vec<Task>> {
+        self.venue_tasks_checked().await
+    }
+
     async fn get_task(&self, task_id: &str) -> Option<Task> {
         self.get_task(task_id).await
     }
@@ -5325,6 +5337,9 @@ mod tests {
         /// 不出来」分开；只失败一次，才能让紧跟着的状态迁移照常读到那一行——否则
         /// 两条路径的错看起来一模一样，测不出守卫自己有没有跳过。
         task_read_fails: std::sync::atomic::AtomicBool,
+        /// 读场地那一列的那一问答不上来。看板要把「读不出来」与「一块空板」
+        /// 分开，这一格用来交出前者的形状。
+        venue_read_fails: std::sync::atomic::AtomicBool,
     }
 
     impl CountingTaskStore {
@@ -5462,6 +5477,26 @@ mod tests {
                 .await
                 .iter()
                 .filter(|t| t.status == status)
+                .cloned()
+                .collect())
+        }
+        /// 场地那一读，带一个开关：看板把「读不出来」与「一块空板」分开，
+        /// 这一格用来交出前者的形状。
+        async fn dag_get_venue_tasks(&self, _workspace_id: &str) -> SFResult<Vec<Task>> {
+            if self
+                .venue_read_fails
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(SFError::Database(
+                    "store unavailable: cannot read the venue rows".into(),
+                ));
+            }
+            Ok(self
+                .tasks
+                .lock()
+                .await
+                .iter()
+                .filter(|t| t.venue_label().is_some())
                 .cloned()
                 .collect())
         }
@@ -7563,6 +7598,41 @@ mod tests {
         assert!(
             message.contains(&next_id),
             "理由要点名是哪一条任务读不出来: {message}"
+        );
+    }
+
+    /// 场地那一读失败，在保留失败的那条路上仍然是失败。
+    ///
+    /// 看板把「读不出来」与「一块空板」分开画，分界就在这一读上：旧读把失败
+    /// 折成空集，两种形状于是同形；带检查的这一读必须让错误原样穿过去。空集
+    /// 本身是合法答案，所以判据落在 `is_err` 上，而不是「交回的行有几条」。
+    #[tokio::test]
+    async fn an_unreadable_venue_read_stays_unreadable() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag = DagExecutor::new("ws-venue-read".into()).with_state_backend(backend.clone());
+        let mut labelled = Task::new("t-memory", TaskType::DagNode, serde_json::json!({}));
+        labelled.venue = Some("memory".into());
+        backend.tasks.lock().await.push(labelled);
+
+        assert_eq!(
+            dag.venue_tasks_checked().await.unwrap().len(),
+            1,
+            "读得出来时这一读照常交回带标签的行"
+        );
+        backend
+            .venue_read_fails
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let failure = dag
+            .venue_tasks_checked()
+            .await
+            .expect_err("读不出来时带检查的这一读必须保留失败，不能折成一条空集");
+        assert!(
+            failure.to_string().contains("store unavailable"),
+            "错误要带着库那一边的原话: {failure}"
+        );
+        assert!(
+            dag.get_venue_tasks().await.is_empty(),
+            "旧的这一读仍然按折叠语义交回空集：改的是新读，不是它"
         );
     }
 

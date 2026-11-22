@@ -166,26 +166,42 @@ pub async fn venues_handler(
     State(state): State<std::sync::Arc<GatewayState>>,
     claims: Option<Extension<cog_core::Claims>>,
 ) -> Response {
-    let claims = claims.as_ref().map(|Extension(c)| c);
+    match board_from_reading(
+        state.orchestrator.get_venue_tasks_checked().await,
+        claims.as_ref().map(|Extension(c)| c),
+        Utc::now(),
+    ) {
+        Ok(board) => (StatusCode::OK, Json(board)).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// 一张看板要么是从图里读出来的，要么交回拒绝。
+///
+/// 空板是一个真实状态（没有行带标签），所以读失败不能折成它：一块三栏全零的
+/// 看板会让读者以为「哪儿都没有活」，而实际是这一页根本没读到图。两种形状在
+/// 这里分开，读失败答 `503`，理由带原始错误。
+fn board_from_reading(
+    reading: cog_core::SFResult<Vec<cog_core::Task>>,
+    claims: Option<&cog_core::Claims>,
+    now: DateTime<Utc>,
+) -> Result<VenuesResponse, crate::error::ApiError> {
+    let tasks = reading.map_err(|e| {
+        crate::error::ApiError::service_unavailable(format!(
+            "the venue board could not be read: {e}"
+        ))
+    })?;
     // 只要带场地标签的行：这张看板按标签折叠，别的行读进来只为扔掉。整图在
     // 2026-11-06 是 9,991 行 / 42 MB 里挑出 4 行，而这张看板每 20 秒被拉一次。
-    let tasks: Vec<cog_core::Task> = state
-        .orchestrator
-        .get_venue_tasks()
-        .await
+    let tasks: Vec<cog_core::Task> = tasks
         .into_iter()
         .filter(|t| visible_to_claims(claims, t))
         .collect();
-    let now = Utc::now();
-    (
-        StatusCode::OK,
-        Json(VenuesResponse {
-            generated_at: now,
-            write_back_window_secs: WRITE_BACK_WINDOW.num_seconds(),
-            venues: read_venues(&tasks, now),
-        }),
-    )
-        .into_response()
+    Ok(VenuesResponse {
+        generated_at: now,
+        write_back_window_secs: WRITE_BACK_WINDOW.num_seconds(),
+        venues: read_venues(&tasks, now),
+    })
 }
 
 #[cfg(test)]
@@ -287,6 +303,43 @@ mod tests {
             assert!(venue.latest.is_none(), "{} 还没有跑完过一件", venue.venue);
             assert_eq!(venue.written_back_bytes, 0);
         }
+    }
+
+    /// 读不出来不是一块空板。
+    ///
+    /// 一块全零的板子是一个真实状态：没有行带标签。读失败若折成同一块板子，
+    /// 读者看到的是「哪儿都没有活」，而那一页根本没读到图——两个方向相反的
+    /// 结论挤在同一个形状里。这里钉两头：`Err` 交回拒绝（带上原始错误），
+    /// `Ok(空)` 仍然是一块合法的空板。
+    #[test]
+    fn an_unreadable_graph_is_not_an_empty_board() {
+        let unreadable: cog_core::SFResult<Vec<Task>> = Err(cog_core::SFError::Database(
+            "connection reset while reading the venue rows".into(),
+        ));
+        let refusal = board_from_reading(unreadable, None, Utc::now())
+            .expect_err("读不出来时要交回拒绝，不能画成一块空板");
+        assert!(
+            refusal.message.contains("connection reset"),
+            "拒绝的理由要带原始错误，让人看得出是读失败: {}",
+            refusal.message
+        );
+        assert_eq!(
+            refusal.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "库读不出来是「这个部署现在回答不了」，不是一场 200"
+        );
+
+        let empty = board_from_reading(Ok(Vec::new()), None, Utc::now())
+            .expect("一行都没有是一份读得出来的答案，不是失败");
+        assert_eq!(
+            empty
+                .venues
+                .iter()
+                .map(|v| v.venue.as_str())
+                .collect::<Vec<_>>(),
+            vec!["eval", "memory", "wiki"],
+            "空板仍然摆着常驻三栏：它说的是「没有活」，不是「没读到」"
+        );
     }
 
     /// 一个不在常驻表上的标签，照样是多出来的一栏。

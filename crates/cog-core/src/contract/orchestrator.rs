@@ -115,6 +115,22 @@ pub trait OrchestratorControl: Send + Sync {
             .collect()
     }
 
+    /// The same rows as [`Self::get_venue_tasks`], with a read that failed
+    /// reported as such.
+    ///
+    /// An empty venue board is a real state: nothing carried a label, so
+    /// nothing is waiting anywhere. [`Self::get_venue_tasks`] answers that same
+    /// shape for a store that is down, so a board built on it cannot tell "no
+    /// work anywhere" from "we could not read the graph" -- and the reader in
+    /// front of three zeroed columns has no way to ask.
+    ///
+    /// The default folds [`Self::get_venue_tasks`], which is honest for an
+    /// orchestrator holding its graph in memory: it has no store to fail at.
+    /// One backed by a store has to override this.
+    async fn get_venue_tasks_checked(&self) -> SFResult<Vec<Task>> {
+        Ok(self.get_venue_tasks().await)
+    }
+
     /// 这个 workspace 里每条任务的计划基线。
     ///
     /// 与 [`Self::get_all_tasks`] 成对存在：任务图回答「现在是什么样」，基线回答
@@ -435,6 +451,14 @@ pub trait DagExecutor: Send + Sync {
             .into_iter()
             .filter(|task| task.venue_label().is_some())
             .collect()
+    }
+
+    /// The same rows as [`Self::get_venue_tasks`], with a read that failed
+    /// reported as such. The reason is
+    /// [`OrchestratorControl::get_venue_tasks_checked`]'s: an empty board is a
+    /// real state, and a failure folded into it is not.
+    async fn get_venue_tasks_checked(&self) -> SFResult<Vec<Task>> {
+        Ok(self.get_venue_tasks().await)
     }
 
     /// Look up a single task by id.

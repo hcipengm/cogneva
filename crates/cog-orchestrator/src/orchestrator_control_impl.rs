@@ -135,6 +135,10 @@ impl OrchestratorControl for OrchestratorControlImpl {
         self.dag_executor.get_venue_tasks().await
     }
 
+    async fn get_venue_tasks_checked(&self) -> SFResult<Vec<Task>> {
+        self.dag_executor.get_venue_tasks_checked().await
+    }
+
     async fn task_plans(&self) -> SFResult<Vec<cog_core::TaskPlan>> {
         match self.state_backend.as_ref() {
             Some(backend) => backend.task_plans(&self.workspace_id).await,
