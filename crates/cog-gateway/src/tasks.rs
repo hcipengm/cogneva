@@ -547,10 +547,25 @@ async fn ready_ids(
 /// "nothing waiting" to the tab and the count above it. Absence of the answer
 /// is a 503, the same way every other unreadable read on this surface answers.
 fn ready_ids_from(reading: cog_core::SFResult<Vec<Task>>) -> Result<HashSet<String>, ApiError> {
-    let tasks = reading.map_err(|e| {
-        ApiError::service_unavailable(format!("the ready queue could not be read: {e}"))
-    })?;
-    Ok(tasks.into_iter().map(|task| task.id).collect())
+    Ok(task_rows_from_reading(reading, "ready queue")?
+        .into_iter()
+        .map(|task| task.id)
+        .collect())
+}
+
+/// The rows a task read carries, with a failed read refusing instead of
+/// answering an empty list.
+///
+/// The task list, the summary above it and the purge preview all count rows;
+/// folding a store failure into an empty set makes each of them report the
+/// cleanest possible number about a graph nobody read -- "0 tasks", "0
+/// ready", "nothing to purge". Absence of the answer is a 503; an empty row
+/// set that was actually read stays a 200 with zeros.
+fn task_rows_from_reading(
+    reading: cog_core::SFResult<Vec<Task>>,
+    what: &str,
+) -> Result<Vec<Task>, ApiError> {
+    reading.map_err(|e| ApiError::service_unavailable(format!("the {what} could not be read: {e}")))
 }
 
 /// The graph a read carries, with a failed read refusing instead of answering
@@ -1228,7 +1243,10 @@ pub async fn list_tasks_handler(
     let filter = status_filter(&query)?;
     let page = page_limit(&query)?;
     let ready = ready_ids(&state, filter).await?;
-    let tasks = state.orchestrator.get_all_tasks().await;
+    let tasks = task_rows_from_reading(
+        state.orchestrator.get_all_tasks_checked().await,
+        "task list",
+    )?;
     let mut rows: Vec<Task> = tasks
         .into_iter()
         .filter(|t| {
@@ -1499,16 +1517,16 @@ pub async fn purge_tasks_handler(
         .older_than_secs
         .map(|s| chrono::Utc::now() - chrono::Duration::seconds(s));
 
-    let matched: Vec<Task> = state
-        .orchestrator
-        .get_all_tasks()
-        .await
-        .into_iter()
-        .filter(|t| {
-            visible_to_claims(claims, t)
-                && purge_matches(t, &statuses, req.task_type_prefix.as_deref(), cutoff)
-        })
-        .collect();
+    let matched: Vec<Task> = task_rows_from_reading(
+        state.orchestrator.get_all_tasks_checked().await,
+        "task list",
+    )?
+    .into_iter()
+    .filter(|t| {
+        visible_to_claims(claims, t)
+            && purge_matches(t, &statuses, req.task_type_prefix.as_deref(), cutoff)
+    })
+    .collect();
 
     let mut cancelled: Vec<String> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
@@ -1547,20 +1565,20 @@ pub async fn task_summary_handler(
     claims: Option<axum::Extension<cog_core::Claims>>,
 ) -> Result<Json<TaskSummary>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
-    let all: Vec<Task> = state
-        .orchestrator
-        .get_all_tasks()
-        .await
-        .into_iter()
-        .filter(|t| visible_to_claims(claims, t))
-        .collect();
-    let ready: Vec<Task> = state
-        .orchestrator
-        .get_ready_tasks()
-        .await
-        .into_iter()
-        .filter(|t| visible_to_claims(claims, t))
-        .collect();
+    let all: Vec<Task> = task_rows_from_reading(
+        state.orchestrator.get_all_tasks_checked().await,
+        "task list",
+    )?
+    .into_iter()
+    .filter(|t| visible_to_claims(claims, t))
+    .collect();
+    let ready: Vec<Task> = task_rows_from_reading(
+        state.orchestrator.get_ready_tasks_checked().await,
+        "ready queue",
+    )?
+    .into_iter()
+    .filter(|t| visible_to_claims(claims, t))
+    .collect();
     // Counted over what this reader can see, not the whole graph: a summary
     // whose totals and body disagree sends the reader looking for tasks it is
     // never shown.
@@ -2469,6 +2487,49 @@ mod tests {
         )
         .expect("读得出来时原样交回");
         assert_eq!(rows.len(), 1, "交回的是读回来的那一行");
+    }
+
+    /// 任务表读不出来，不是「一条任务都没有」。
+    ///
+    /// 任务列表、它上方那张汇总、以及清理接口的预览都在这同一读上数行：
+    /// 把这些数折成零，一个读不动库的部署会报告「0 条任务」「0 条就绪」「没
+    /// 有什么可清理」——本节里最干净、也最不可质疑的那几个数。读不出来要
+    /// 拒绝，读得出来的空行集仍是 200 的零。
+    #[test]
+    fn an_unreadable_task_list_is_not_an_empty_task_list() {
+        for what in ["task list", "ready queue"] {
+            let unreadable: cog_core::SFResult<Vec<Task>> = Err(cog_core::SFError::Database(
+                "connection reset while reading the tasks".into(),
+            ));
+            let refusal = task_rows_from_reading(unreadable, what)
+                .expect_err("读不出来时要交回拒绝，不能交回一张空表");
+            assert!(
+                refusal.message.contains("connection reset"),
+                "拒绝的理由要带原始错误，让人看得出是读失败: {}",
+                refusal.message
+            );
+            assert!(
+                refusal.message.contains(what),
+                "拒绝的理由要点名是哪一份读数读不出来: {}",
+                refusal.message
+            );
+            assert_eq!(
+                refusal.into_response().status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "任务表读不出来是「这个部署现在回答不了」，不是一场 200"
+            );
+        }
+
+        let rows = task_rows_from_reading(
+            Ok(vec![task("t-one", cog_core::TaskStatus::Pending, "t", 0)]),
+            "task list",
+        )
+        .expect("读得出来时照常交回");
+        assert_eq!(rows.len(), 1, "交回的是读回来的那一行");
+
+        let empty = task_rows_from_reading(Ok(Vec::new()), "task list")
+            .expect("一条都没有是一份读得出来的答案");
+        assert!(empty.is_empty(), "空表原样交回，不编造任何行");
     }
 
     /// 状态词必须与读面印出来的那个词逐字一致：`TaskFilter` 用 `as_str` 印行，
