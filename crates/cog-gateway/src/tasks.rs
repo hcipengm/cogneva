@@ -569,6 +569,23 @@ fn graph_from_reading(
     })
 }
 
+/// The rows a dependents or dependencies read carries, with a failed read
+/// refusing instead of answering an empty list.
+///
+/// On the task detail page a failed read and a task with no related rows draw
+/// the same empty list, so folding the failure in says "this task depends on
+/// nothing" about a graph nobody managed to read. `None` still answers an empty
+/// list: that is a read answer (no such relation), not a failure.
+fn related_tasks_from_reading(
+    reading: cog_core::SFResult<Option<Vec<Task>>>,
+    what: &str,
+) -> Result<Vec<Task>, ApiError> {
+    let rows = reading.map_err(|e| {
+        ApiError::service_unavailable(format!("the task's {what} could not be read: {e}"))
+    })?;
+    Ok(rows.unwrap_or_default())
+}
+
 /// Whether a reader holding `claims` may see `task`.
 ///
 /// An empty scope is the same convention the submission side already uses (a
@@ -1573,11 +1590,10 @@ pub async fn get_task_dependents_handler(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<TaskView>>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
-    let tasks = state
-        .orchestrator
-        .get_dependents(&id)
-        .await
-        .unwrap_or_default();
+    let tasks = related_tasks_from_reading(
+        state.orchestrator.get_dependents_checked(&id).await,
+        "dependents",
+    )?;
     let views: Vec<TaskView> = tasks
         .into_iter()
         .filter(|t| visible_to_claims(claims, t))
@@ -1592,11 +1608,10 @@ pub async fn get_task_dependencies_handler(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<TaskView>>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
-    let tasks = state
-        .orchestrator
-        .get_dependencies(&id)
-        .await
-        .unwrap_or_default();
+    let tasks = related_tasks_from_reading(
+        state.orchestrator.get_dependencies_checked(&id).await,
+        "dependencies",
+    )?;
     let views: Vec<TaskView> = tasks
         .into_iter()
         .filter(|t| visible_to_claims(claims, t))
@@ -2407,6 +2422,53 @@ mod tests {
             graph_from_reading(Ok((vec![row], vec![edge.clone()]))).expect("读得出来时原样交回");
         assert_eq!(nodes.len(), 1, "节点是读回来的那一行");
         assert_eq!(edges, vec![edge], "边是读回来的那一条");
+    }
+
+    /// 关联名单读不出来，不是「这条任务没有关联」。
+    ///
+    /// 详情页把「读不出来」与「没有下游 / 没有依赖」画成同一张空列表。读失败
+    /// 被折进去时，页面会替一条读都没读到的图作证「它谁也不依赖」。读不出来要
+    /// 拒绝，`None` 仍是一份读得到的答案（空列表），`Some` 原样交回。
+    #[test]
+    fn an_unreadable_relation_list_is_not_a_task_with_no_relations() {
+        for what in ["dependents", "dependencies"] {
+            let unreadable: cog_core::SFResult<Option<Vec<Task>>> = Err(
+                cog_core::SFError::Database("connection reset while reading the rows".into()),
+            );
+            let refusal = related_tasks_from_reading(unreadable, what)
+                .expect_err("读不出来时要交回拒绝，不能交回一张空列表");
+            assert!(
+                refusal.message.contains("connection reset"),
+                "拒绝的理由要带原始错误，让人看得出是读失败: {}",
+                refusal.message
+            );
+            assert!(
+                refusal.message.contains(what),
+                "拒绝的理由要点名是哪一份名单读不出来: {}",
+                refusal.message
+            );
+            assert_eq!(
+                refusal.into_response().status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "名单读不出来是「这个部署现在回答不了」，不是一场 200"
+            );
+        }
+
+        let none = related_tasks_from_reading(Ok(None), "dependents")
+            .expect("没有关联是一份读得出来的答案");
+        assert!(none.is_empty(), "空名单原样交回，不编造任何行");
+
+        let rows = related_tasks_from_reading(
+            Ok(Some(vec![task(
+                "t-up",
+                cog_core::TaskStatus::Completed,
+                "t",
+                0,
+            )])),
+            "dependencies",
+        )
+        .expect("读得出来时原样交回");
+        assert_eq!(rows.len(), 1, "交回的是读回来的那一行");
     }
 
     /// 状态词必须与读面印出来的那个词逐字一致：`TaskFilter` 用 `as_str` 印行，
