@@ -1,0 +1,62 @@
+# 项目控制回路的第二格原因：任务图读不出来时，覆盖率那一轮也一行没量。
+#
+# 为什么要有这一格：覆盖率五格的分母全部取自任务图那一次读。读失败若被折成空表，
+# 盖上的是「图上 0 行、覆盖 0 行」——与一个真的空部署逐字同形。代码那一侧已经把
+# 这一轮留成未量（不盖读数、记一格 `no_tasks`），但读数存在不等于有人会被叫醒：
+# 没有这条规则，`no_tasks` 会离开基线去一个没人看的地方。修复也要分开——
+# 基线读不到修 `task_plan` 那条路（`project_control_has_no_baseline`），任务图
+# 读不到修图那条读路，两条不同的修法不压进同一条规则。
+#
+# 夹具证明三件事：
+#   1. 安静：这一格长到 0 不动时它也安静——对一片零就响的规则，响的时候没人再看；
+#   2. 会响：这一格长到 1（读数按存在判）时它响，`reading` 标签留在身份上；
+#   3. 只认自己那一格：`no_baseline` 在动而 `no_tasks` 停在 0 时它必须安静——
+#      把选择器抄成兄弟那条的标签，第 2 格会红，把选择器放宽到不带 `reading`，
+#      第 3 格会红。
+#
+# 跑法（与兄弟夹具同一个跑者）：
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-project-control-no-tasks.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: project_control_has_no_tasks
+
+evaluation_interval: 1m
+
+tests:
+  # 一、回路在跑、任务图读得到：必须安静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_project_control_unmeasured_total{reading="no_tasks",pod="cogneva-0"}'
+        values: '0x70'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: project_control_has_no_tasks
+        exp_alerts: []
+
+  # 二、任务图读不到：按存在判，`reading` 留在身份上，把读者送去图那条读路。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_project_control_unmeasured_total{reading="no_tasks",pod="cogneva-0"}'
+        values: '0x5 1x65'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: project_control_has_no_tasks
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reading: no_tasks
+
+  # 三、只有兄弟那一格在动：这一条必须安静，否则两个不同的修法被一条规则盖住。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_project_control_unmeasured_total{reading="no_tasks",pod="cogneva-0"}'
+        values: '0x70'
+      - series: 'cogneva_project_control_unmeasured_total{reading="no_baseline",pod="cogneva-0"}'
+        values: '0x5 1x65'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: project_control_has_no_tasks
+        exp_alerts: []

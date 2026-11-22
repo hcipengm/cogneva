@@ -2333,6 +2333,16 @@ data:
               "face": "变更管理"
             },
             {
+              "name": "project_control_has_no_tasks",
+              "promql": "max without (pod, container, instance, job) (cogneva_project_control_unmeasured_total{reading=\"no_tasks\"})",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The gateway's project-control loop tried to read the task graph and could not, so it measured nothing at all: all five coverage cells take their population from that read, and a pass with no graph would otherwise publish a full set of zeros -- the reading a graph with no rows and a deployment that cannot read its graph produce is the same picture. Read as presence, not as a rate: a store refusing the query or a graph read that is not wired does not clear by waiting one more pass. The repair is the graph read itself, not the plan table: project_control_has_no_baseline is the sibling rule, and the reading label on the same counter separates the two, so an alert answered by patching the wrong table stays visible here. This loop only publishes readings; nothing on the graph moves when it fails.",
+              "face": "变更管理"
+            },
+            {
               "name": "project_audit_rows_not_landing",
               "promql": "max without (pod, container, instance, job) (increase(cogneva_project_audit_write_failures_total[1h])) / clamp_min(max without (pod, container, instance, job) (increase(cogneva_project_audit_writes_total[1h])), 1)",
               "condition": {
