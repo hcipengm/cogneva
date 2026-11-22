@@ -8,10 +8,9 @@ use crate::squad::pge::types::PgeRoundtableIteration;
 ///
 /// The moderator reviews the full debate history and decides whether to
 /// continue iterating, change strategy, accept a partial result, or escalate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ModeratorDecision {
     /// Continue to the next iteration with current strategy.
-    #[default]
     Continue,
     /// Pivot the discussion angle (e.g. reframe the goal, introduce new
     /// constraints, or ask agents to focus on a specific weakness).
@@ -25,7 +24,13 @@ pub enum ModeratorDecision {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModeratorOutput {
-    pub decision: ModeratorDecision,
+    /// What the moderator decided, or `None` when no decision could be read:
+    /// the call failed, or it answered in words this parser does not recognise
+    /// as one of the four. `None` is not [`ModeratorDecision::Continue`] — a
+    /// round that carried on because nobody could read the answer is a
+    /// different observation from one the moderator chose to continue, and the
+    /// roundtable publishes them in different cells.
+    pub decision: Option<ModeratorDecision>,
     pub reasoning: String,
     /// Concrete suggestions for the next iteration (e.g. "focus on error
     /// handling", "re-evaluate the schema design").
@@ -38,7 +43,7 @@ pub struct ModeratorOutput {
 impl Default for ModeratorOutput {
     fn default() -> Self {
         Self {
-            decision: ModeratorDecision::Continue,
+            decision: None,
             reasoning: String::new(),
             suggestions: Vec::new(),
             good_enough: false,
@@ -116,8 +121,9 @@ impl ModeratorActor {
         // them, not the way the enum variants are named: `parse_moderator_output`
         // lowercases the reply and matches `continue`, `change_strategy`,
         // `accept_partial`, `escalate`. A contract naming `ChangeStrategy` would
-        // be naming a spelling the parse reads as none of the four, and the round
-        // would continue by default — a decision taken by a word nobody wrote.
+        // be naming a spelling the parse reads as none of the four, and the
+        // round would carry on with no decision recorded — the roundtable
+        // publishes that as unreadable rather than as a choice to continue.
         //
         // The words are all that is here, together with the shape they arrive
         // in. What each one commits the round to is the platform's own reading of
@@ -192,6 +198,10 @@ impl ModeratorActor {
             }
             Err(e) => {
                 tracing::warn!("Moderator prompt failed: {}", e);
+                // 没答上话不是「主持人选择继续」。默认值里没有决策，调用方
+                // 才能把这一格和「问了、答案是 Continue」分开计数。真因在
+                // 上面那条 warn 里；这里不留一句话，是因为这个结构体的
+                // reasoning 没有任何读者，留着只会长出一段没人读的字。
                 (
                     ModeratorOutput::default(),
                     crate::actors::ReviewBasis::Passed(
@@ -235,8 +245,7 @@ pub fn parse_moderator_output(value: &serde_json::Value) -> ModeratorOutput {
             }
             "escalate" | "escalation" | "human" | "handoff" => Some(ModeratorDecision::Escalate),
             _ => None,
-        })
-        .unwrap_or_default();
+        });
 
     let reasoning = value
         .get("reasoning")
@@ -265,5 +274,35 @@ pub fn parse_moderator_output(value: &serde_json::Value) -> ModeratorOutput {
         reasoning,
         suggestions,
         good_enough,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 读不出决策的三种形状：散文、缺字段、类型不对。默认值是 `None`，
+    /// 不是 `Continue` —— 调用方据此把「问了没答上」与「选择继续」分开计数。
+    #[test]
+    fn a_reply_with_no_recognised_decision_reads_as_no_decision() {
+        for reply in [
+            serde_json::json!({"decision": "I think we should pivot to a different framing"}),
+            serde_json::json!({}),
+            serde_json::json!({"decision": 3}),
+        ] {
+            assert_eq!(
+                parse_moderator_output(&reply).decision,
+                None,
+                "reply {reply} names no decision the parser takes"
+            );
+        }
+    }
+
+    #[test]
+    fn a_contracted_word_still_reads_as_its_decision() {
+        assert_eq!(
+            parse_moderator_output(&serde_json::json!({"decision": "change_strategy"})).decision,
+            Some(ModeratorDecision::ChangeStrategy)
+        );
     }
 }

@@ -434,29 +434,33 @@ impl PgeRoundtable {
                 // writing it as one would file a round's own ending under the
                 // moderator's name.
                 let outcome = match mod_output.decision {
-                    crate::actors::moderator::ModeratorDecision::Continue => {
+                    Some(crate::actors::moderator::ModeratorDecision::Continue) => {
                         crate::observable::MODERATOR_CONTINUE
                     }
-                    crate::actors::moderator::ModeratorDecision::ChangeStrategy => {
+                    Some(crate::actors::moderator::ModeratorDecision::ChangeStrategy) => {
                         crate::observable::MODERATOR_CHANGE_STRATEGY
                     }
-                    crate::actors::moderator::ModeratorDecision::AcceptPartial => {
+                    Some(crate::actors::moderator::ModeratorDecision::AcceptPartial) => {
                         crate::observable::MODERATOR_ACCEPT_PARTIAL
                     }
-                    crate::actors::moderator::ModeratorDecision::Escalate => {
+                    Some(crate::actors::moderator::ModeratorDecision::Escalate) => {
                         crate::observable::MODERATOR_ESCALATE
                     }
+                    // 问了但没有可读的决策：调用失败，或答复里的词不在这四个
+                    // 之内。它有自己的格子——计成 continue 就是记下一次没人做过的
+                    // 决定，还会把一个读不懂合同的宿主藏进「继续」那一格。
+                    None => crate::observable::MODERATOR_UNREADABLE,
                 };
                 crate::observable::global_observable().record_moderator_consulted(outcome);
                 match mod_output.decision {
-                    crate::actors::moderator::ModeratorDecision::AcceptPartial => {
+                    Some(crate::actors::moderator::ModeratorDecision::AcceptPartial) => {
                         consensus_reached = true;
                         break;
                     }
-                    crate::actors::moderator::ModeratorDecision::Escalate => {
+                    Some(crate::actors::moderator::ModeratorDecision::Escalate) => {
                         break;
                     }
-                    crate::actors::moderator::ModeratorDecision::ChangeStrategy => {
+                    Some(crate::actors::moderator::ModeratorDecision::ChangeStrategy) => {
                         if let Ok(suggestions_json) = serde_json::to_value(&mod_output.suggestions)
                         {
                             board["moderator_suggestions"] = suggestions_json.clone();
@@ -464,7 +468,9 @@ impl PgeRoundtable {
                                 .await;
                         }
                     }
-                    crate::actors::moderator::ModeratorDecision::Continue => {}
+                    // 没有可读决策时按保守方向处置：和真正的 Continue 一样
+                    // 再走一轮，但这一轮已经落在 unreadable 格上，看得见。
+                    Some(crate::actors::moderator::ModeratorDecision::Continue) | None => {}
                 }
             } else {
                 // The other reason a round ends with no moderator decision: the
@@ -1601,6 +1607,10 @@ mod tests {
         }
     }
 
+    /// 让这个替身在被问到时代码路径拿到一个上游错误，而不是一个答案。
+    /// 主持人「问了但没答上」的那一格只能靠它走到。
+    const FAIL_ON_PROMPT: &str = "__fail_on_prompt__";
+
     #[async_trait::async_trait]
     impl cog_core::Agent for MockAgent {
         async fn prompt(&self, input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
@@ -1608,7 +1618,13 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(input);
-            Ok(self.next_response())
+            let response = self.next_response();
+            if response.as_str() == Some(FAIL_ON_PROMPT) {
+                return Err(cog_core::SFError::LLM(
+                    "HTTP 503 upstream unavailable".into(),
+                ));
+            }
+            Ok(response)
         }
         async fn start(&self) {}
         async fn snapshot(
@@ -2606,6 +2622,7 @@ mod tests {
             "MODERATOR_CHANGE_STRATEGY",
             "MODERATOR_ACCEPT_PARTIAL",
             "MODERATOR_ESCALATE",
+            "MODERATOR_UNREADABLE",
             "record_moderator_consulted",
         ] {
             assert!(
@@ -2731,6 +2748,75 @@ mod tests {
             .judgement()
             .expect("the round was judged");
         assert!(matches!(judgement.verdict, Verdict::Fail));
+    }
+
+    /// 问了主持人、却读不出决策，与「主持人选择了继续」是两件事。前者有两种
+    /// 来路：调用没答上，或答了一串不在这四个词之内的散文。两种都必须落进
+    /// `unreadable`，不能计成 `continue` —— 那会把一次没人做过的决定写进
+    /// 「继续」那一格，并让一个读不懂合同的宿主看起来一切正常。
+    #[tokio::test]
+    async fn a_moderator_with_no_readable_decision_is_not_a_continue() {
+        for reply in [
+            // 散文：模型违反了契约，决策词无法解析。
+            serde_json::json!({"decision": "I think we should pivot to a different framing"}),
+            // 调用本身没到上游。
+            serde_json::json!(FAIL_ON_PROMPT),
+        ] {
+            let rt = PgeRoundtable::new(
+                PgeRoundtableConfig {
+                    max_iterations: 2,
+                    consensus_threshold: 1.0,
+                    stall_threshold: 0,
+                    independent_review: false,
+                    moderator: Some(ModeratorActor::new(std::sync::Arc::new(MockAgent::fixed(
+                        reply.clone(),
+                    )))),
+                    ..Default::default()
+                },
+                PlannerActor::new(std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+                    "summary": "s",
+                    "plan": {},
+                    "sub_tasks": []
+                })))),
+                GeneratorActor::new(std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+                    "content": {"code": "draft"},
+                    "artifacts": []
+                })))),
+                EvaluatorActor::new(std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+                    "verdict": "fail", "score": 10, "feedback": "not yet", "criteria": []
+                })))),
+            );
+            let task = cog_core::Task::new(
+                format!("t-unreadable-{}", uuid::Uuid::new_v4()),
+                cog_core::TaskType::Custom("test".into()),
+                serde_json::json!({"goal": "g"}),
+            );
+
+            // Only this cell may move: it is written nowhere except the `None`
+            // arm, so an increment here is the None arm firing. `continue` is
+            // written by other tests sharing the process-wide observable, so a
+            // delta on it would be noise rather than a reading.
+            let unreadable_before = cell(
+                "pge_moderator_consulted_total",
+                crate::observable::MODERATOR_UNREADABLE,
+            )
+            .await;
+
+            rt.debate(&task, serde_json::json!({})).await;
+
+            let unreadable_after = cell(
+                "pge_moderator_consulted_total",
+                crate::observable::MODERATOR_UNREADABLE,
+            )
+            .await;
+
+            assert!(
+                unreadable_after > unreadable_before,
+                "a consulted moderator with no readable decision has its own cell, \
+                 not the continue cell: {unreadable_before} -> {unreadable_after} \
+                 (reply {reply})"
+            );
+        }
     }
 
     /// A round that produced nothing has nothing to judge, so the judge is not

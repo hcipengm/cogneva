@@ -132,11 +132,20 @@ pub const INDEPENDENT_REVIEW_OUTCOMES: [&str; 5] = [
 /// The moderator is consulted at the end of every round that did not reach
 /// consensus, and it is the one role handed the whole debate: one full
 /// iteration per round, so the document it reads grows with the run. Four of
-/// these cells are its decisions. The fifth counts the rounds where no
-/// moderator was configured at all, and it is the one that makes the other four
-/// readable — a deployment without a moderator writes no decision cell, which
-/// is indistinguishable from a moderator that was consulted and had nothing to
-/// say, unless the skip has a cell of its own.
+/// these cells are its decisions. `not_asked_disabled` counts the rounds where
+/// no moderator was configured at all, and `unreadable` counts the rounds where
+/// one was asked and no decision came back — the call failed, or it answered
+/// in words the parser does not recognise as one of the four. Both are the
+/// reason the decision cells are readable: a deployment without a moderator and
+/// a moderator that answered nothing write no decision cell, which is
+/// indistinguishable from a round the moderator chose to continue unless the
+/// two skips have cells of their own.
+///
+/// `unreadable` is not `continue`. A round that carried on because nobody could
+/// read the answer is not a round the moderator approved; filing it under
+/// `continue` would report a decision nobody made, and would hide a moderator
+/// that is failing or ignoring its contract behind the cell that means "keep
+/// going".
 ///
 /// Summed over a debate, the cells also count rounds: every round the moderator
 /// was consulted for lands in exactly one of them. A round that stopped before
@@ -149,15 +158,17 @@ pub const MODERATOR_CHANGE_STRATEGY: &str = "change_strategy";
 pub const MODERATOR_ACCEPT_PARTIAL: &str = "accept_partial";
 pub const MODERATOR_ESCALATE: &str = "escalate";
 pub const MODERATOR_NOT_ASKED_DISABLED: &str = "not_asked_disabled";
+pub const MODERATOR_UNREADABLE: &str = "unreadable";
 
 /// Every cell of the moderator consultation, published at zero as well. See
 /// [`MODERATOR_CONTINUE`].
-pub const MODERATOR_OUTCOMES: [&str; 5] = [
+pub const MODERATOR_OUTCOMES: [&str; 6] = [
     MODERATOR_CONTINUE,
     MODERATOR_CHANGE_STRATEGY,
     MODERATOR_ACCEPT_PARTIAL,
     MODERATOR_ESCALATE,
     MODERATOR_NOT_ASKED_DISABLED,
+    MODERATOR_UNREADABLE,
 ];
 
 /// What one round's judgement contributed to consensus: the configured
