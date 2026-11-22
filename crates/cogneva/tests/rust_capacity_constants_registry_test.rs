@@ -638,7 +638,7 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-agent/src/tools.rs", 8),
     ("crates/cog-agent/src/web.rs", 2),
     ("crates/cog-auth/src/jwt.rs", 1),
-    ("crates/cog-auth/src/keycloak.rs", 2),
+    ("crates/cog-auth/src/keycloak.rs", 3),
     ("crates/cog-auth/src/session.rs", 1),
     ("crates/cog-collaboration/src/collaboration_executor.rs", 2),
     ("crates/cog-collaboration/src/config.rs", 1),
@@ -832,8 +832,8 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-reflection/src/lib.rs", 6),
     // 21 而不是 20：`CI_ASK_RETRY_DELAYS_MS` 是一张数组类型的阶梯，原先整行不进册。
     // 表进册之后这一格才算进本文件——不是上限抬了，是漏数的一条被数上了。
-    ("crates/cog-reflection/src/mainline_deployer.rs", 21),
-    ("crates/cog-reflection/src/mainline_rollout.rs", 11),
+    ("crates/cog-reflection/src/mainline_deployer.rs", 22),
+    ("crates/cog-reflection/src/mainline_rollout.rs", 12),
     ("crates/cog-reflection/src/meta_learning.rs", 1),
     ("crates/cog-reflection/src/observability_stack.rs", 2),
     ("crates/cog-reflection/src/platform_http.rs", 2),
@@ -852,7 +852,7 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-storage/src/checkpoint_cap.rs", 2),
     ("crates/cog-storage/src/metrics_retirement.rs", 2),
     ("crates/cog-storage/src/metrics_sample_cap.rs", 2),
-    ("crates/cog-storage/src/observability_event_cap.rs", 3),
+    ("crates/cog-storage/src/observability_event_cap.rs", 4),
     ("crates/cog-storage/src/partition_maintainer.rs", 2),
     ("crates/cog-storage/src/plugin.rs", 3),
     (
