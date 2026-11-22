@@ -1795,8 +1795,53 @@ mod tests {
         match cursor {
             Some(serde_json::Value::Null) => true,
             Some(serde_json::Value::Array(arr)) if arr.is_empty() => true,
-            Some(serde_json::Value::Object(map)) => map.contains_key(*leaf),
+            Some(serde_json::Value::Object(map)) => {
+                map.contains_key(*leaf) || the_type_refuses_a_probe_at(value, path)
+            }
             _ => false,
+        }
+    }
+
+    /// A leaf missing from the default tree is either a typo or a leaf the
+    /// serializer omitted because its value equals its code default
+    /// (`skip_serializing_if`). The tree cannot tell them apart, so the type is
+    /// asked directly: write a probe into the path and deserialize. A real leaf
+    /// refuses a probe of the wrong shape; a segment the schema does not have is
+    /// *dropped silently* by serde (there is no `deny_unknown_fields`), so a typo
+    /// refuses neither probe and stays red. Two shapes, because a leaf typed as a
+    /// string accepts the string probe and one typed as a map accepts the object.
+    fn the_type_refuses_a_probe_at(schema: &serde_json::Value, path: &str) -> bool {
+        let probes = [
+            serde_json::json!("__probe__"),
+            serde_json::json!({ "__probe__": 0 }),
+        ];
+        probes.iter().any(|probe| {
+            let mut document = schema.clone();
+            write_path(&mut document, path, probe.clone());
+            serde_json::from_value::<AppConfig>(document).is_err()
+        })
+    }
+
+    /// Writes `value` at the dot-path whose parents are already known to be
+    /// objects in `document` (the caller resolved that chain first).
+    fn write_path(document: &mut serde_json::Value, path: &str, value: serde_json::Value) {
+        let segments: Vec<&str> = path.split('.').collect();
+        let (leaf, parents) = match segments.split_last() {
+            Some(pair) => pair,
+            None => return,
+        };
+        let mut cursor = document;
+        for segment in parents {
+            cursor = match cursor {
+                serde_json::Value::Object(map) => match map.get_mut(*segment) {
+                    Some(next) => next,
+                    None => return,
+                },
+                _ => return,
+            };
+        }
+        if let serde_json::Value::Object(map) = cursor {
+            map.insert((*leaf).to_string(), value);
         }
     }
 
