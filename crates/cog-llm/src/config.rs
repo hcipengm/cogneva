@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use cog_core::{SFError, SFResult};
 
+// 容量 0 建不出有界通道：这条兜底自己把 panic 藏起来了，所以要在编译期当场红。
+// 判的是常量自己的性质，写成运行期断言只会被 clippy 判成恒真。
+const _: () = assert!(crate::DEFAULT_STREAM_CAPACITY > 0);
+
 fn load_section<T: serde::de::DeserializeOwned + Default>(
     pointer: &str,
     env_map: &[(&str, &str)],
@@ -162,10 +166,6 @@ mod tests {
         assert_eq!(
             unset.stream_capacity_or_default(),
             crate::DEFAULT_STREAM_CAPACITY
-        );
-        assert!(
-            crate::DEFAULT_STREAM_CAPACITY > 0,
-            "容量 0 建不出有界通道：常量本身必须是正数，否则这条兜底把 panic 藏起来"
         );
         let written = TuningConfig {
             stream_capacity: 64,

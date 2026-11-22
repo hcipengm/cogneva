@@ -2406,7 +2406,7 @@ impl AgentRuntime {
             let result_bytes = result.to_string().into_bytes();
             let call = cog_core::ToolCallEvent::from_bytes(
                 format!("{tool_call_id}:{turn}:{frame}"),
-                task_id.unwrap_or_else(|| self.config.agent_id.as_str()),
+                task_id.unwrap_or(self.config.agent_id.as_str()),
                 tool_name,
                 self.config.agent_id.clone(),
                 &arguments_bytes,
@@ -2507,6 +2507,8 @@ impl AgentRuntime {
         None
     }
 
+    // 参数与事件信封的列一一对应：把它拆成一个结构体只是把同一组名字再写一遍。
+    #[allow(clippy::too_many_arguments)]
     async fn archive_tool_call(
         &self,
         task_id: Option<&str>,
