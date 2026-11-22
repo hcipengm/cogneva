@@ -163,7 +163,14 @@ export function DatasetsView() {
                     key: 'cases',
                     title: '用例数',
                     width: '80px',
-                    render: (d) => (d.case_count > 0 ? String(d.case_count) : <Note text="不是 jsonl 的行数能数的那一种">—</Note>),
+                    // `null` 是没数（yaml 没有一行一个用例的约定、读不出来的文件也没有），
+                    // 不是 0：写 0 会让「不数」与「空数据集」在这格上同形。
+                    render: (d) =>
+                      d.case_count === null ? (
+                        <Note text="没数：只有 jsonl 有一行一个用例的约定，yaml 与读不出来的文件没有">未计</Note>
+                      ) : (
+                        d.case_count.toLocaleString('zh-CN')
+                      ),
                   },
                   { key: 'tags', title: '标签', width: '180px', render: (d) => (d.tags.length ? d.tags.join('、') : '—') },
                 ]}
