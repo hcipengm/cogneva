@@ -6,6 +6,8 @@ import {
   type WorkspaceSummary,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { Empty, Loading, Moment, ReadError, Table, ViewFrame } from '@/ui/primitives';
 import { Note } from '@/ui/Note';
 
@@ -17,6 +19,10 @@ import { Note } from '@/ui/Note';
  *
  * 空列表要当心：存储没配时处理函数答的也是 `{items: []}`，与「配了但没有工作区」
  * 完全同形。所以空态把那两种情形都写出来，让读者知道这个空不是结论。
+ *
+ * 画面：这一面是容器与人的对照——左边列工作区，右边列这个工作区里的人及其角色。
+ * 一个工作区有几个成员是随容器变的，画柱状只是把一列数字重排一遍；读者要问的是
+ * 「谁在这个容器里、什么角色」，那是在表里找行。
  */
 
 interface WorkspaceDetail extends WorkspaceSummary {
@@ -41,6 +47,9 @@ export function WorkspacesView() {
     30_000,
     Boolean(selected)
   );
+  // 工作区面现在只有读，但写它的不止这一面：一次落在 `/api/v1/workspaces` 下的写
+  // （别的入口建的、改的）同样要让列表与选中那份重读。
+  useKindTickedRefresh([resourceKey('workspaces')], [list.refresh, detail.refresh]);
 
   const items = list.data ?? [];
 

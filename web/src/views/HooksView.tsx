@@ -11,6 +11,8 @@ import {
   type HookTriggerName,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { useShell } from '@/shell/store';
 import { Button, Empty, Loading, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 import { Check, FormRow, NumberInput, Select, TextArea, TextInput } from '@/ui/forms';
@@ -29,6 +31,10 @@ import { Check, FormRow, NumberInput, Select, TextArea, TextInput } from '@/ui/f
  *    而工具守卫对没有模式的决定型钩子不咨询，所以它同样是一条安静的钩子。
  *
  * 这两条不是界面发明的规则，是 `HookDef` 的文档说的；界面替读者挡在提交之前。
+ *
+ * 画面：这一面是触发点与动作的对照表——一行一条钩子。两边都是闭集（十几种触发点、
+ * 几种动作），画分布只会在十几个可能里数人；读者要问的是「哪个工具在调用前被挡住」，
+ * 那是一条一条读表的题。
  */
 
 const TRIGGER_LABEL: Record<HookTriggerName, string> = {
@@ -77,6 +83,9 @@ function actionSummary(action: HookDefView['action']): string {
 export function HooksView() {
   const page = useResource('钩子', listHooks, 30_000);
   const health = useResource('钩子引擎', getHooksHealth, 60_000);
+  // 钩子的增删都落在 `/api/v1/hooks` 前缀下；引擎健康也跟着这条面走——登记成功
+  // 之后读者要立刻看见它是不是真的被引擎收下了。
+  useKindTickedRefresh([resourceKey('hooks')], [page.refresh, health.refresh]);
   const appendOutput = useShell((s) => s.appendOutput);
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);

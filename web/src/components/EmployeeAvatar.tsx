@@ -4,6 +4,7 @@
 // 改名字不会换脸。
 
 import { avatarFor } from '../ui/avatar';
+import { Note } from '../ui/Note';
 
 export function EmployeeAvatar({
   employeeId,
@@ -16,10 +17,14 @@ export function EmployeeAvatar({
 }) {
   const face = avatarFor(employeeId, size);
   return (
-    <span
+    // 悬停提示走 `Note` 而不是原生 `title=`：`title` 由浏览器画在页面之外，
+    // 选不中、复制不了，令牌面那条门也点名禁止 DOM 上再出现它。头像本身不是
+    // 控件，所以 `Note` 就是这一格，不再套一层。
+    <Note
+      as="span"
+      text={name ? `${name}（${employeeId}）` : employeeId}
       className="inline-flex shrink-0 items-center justify-center overflow-hidden rounded-full"
       style={{ width: size, height: size, backgroundColor: face.background }}
-      title={name ? `${name}（${employeeId}）` : employeeId}
     >
       <img
         src={face.src}
@@ -29,6 +34,6 @@ export function EmployeeAvatar({
         loading="lazy"
         draggable={false}
       />
-    </span>
+    </Note>
   );
 }

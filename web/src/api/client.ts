@@ -4247,11 +4247,6 @@ export async function getSnapshotUrl(snapshotId: string): Promise<{ snapshot_id:
   return api.get(`/api/v1/snapshots/${encodeURIComponent(snapshotId)}`);
 }
 
-/** 按路径原样读一份 JSON。给「有接口没入口」的面用：它不解释结构，只把读到的东西列出来。 */
-export async function getJson(path: string): Promise<unknown> {
-  return api.get(path);
-}
-
 /** 知识检索：跨库按语义找。此前只有接口，界面上没有入口。 */
 export async function searchKnowledge(query: string, limit = 20): Promise<KnowledgeSearchResponse> {
   // 处理函数读的是 `query` 与 `top_k`：发一个它不认的键（`limit`）不会报错，
@@ -4382,12 +4377,8 @@ export async function getWorkspace(
   return res.data;
 }
 
-export async function listWorkspaceMembers(id: string): Promise<WorkspaceMemberView[]> {
-  const res = await api.get<WorkspaceEnvelope<{ workspace_id: string; items: WorkspaceMemberView[] }>>(
-    `/api/v1/workspaces/${encodeURIComponent(id)}/members`
-  );
-  return res.data?.items ?? [];
-}
+// `/api/v1/workspaces/{id}/members` 没有单独的客户端函数：`getWorkspace` 答的
+// 详情里已经带着 `members`，两处各声明一遍就有两处会漂。
 
 /** 动作计划：分解出的目标图。`validation` 是服务端按六条 DAG 规则算的，不是界面自己数的。 */
 export interface ActionPlanTaskView {
@@ -4625,10 +4616,9 @@ export async function applyEvolutionChange(id: string): Promise<unknown> {
   return api.post(`/api/v1/evolution/changes/${encodeURIComponent(id)}/apply`, {});
 }
 
-/** 提交、构建并切换到这个变更。 */
-export async function deployEvolutionChange(id: string): Promise<unknown> {
-  return api.post(`/api/v1/evolution/changes/${encodeURIComponent(id)}/deploy`, {});
-}
+// `/api/v1/evolution/changes/{id}/deploy` 没有对应的客户端函数：它是「应用 +
+// 提交 + 构建 + 切换」的无门版，跳过了人工审批。界面只给走审的「放行」
+// （`approveEvolutionChange`），不在别的入口上再画一个绕过它的按钮。
 
 export async function rollbackEvolution(): Promise<unknown> {
   return api.post('/api/v1/evolution/rollback', {});

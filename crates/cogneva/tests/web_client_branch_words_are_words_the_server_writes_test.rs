@@ -218,6 +218,95 @@ const SERVER_WORDS: &[ServerWord] = &[
         server_file: "crates/cog-gateway/src/llm_admin.rs",
         server_needle: "\"error\": \"llm_verify_failed\"",
     },
+    // 对象目录的校验报告：每一份的 `outcome` 由网关的那段 match 写出。客户端按这四个
+    // 词选颜色与细节格——拼错一个，那一份就落进兜底，看上去像服务端答了一种没人
+    // 认识的结果，而不是像客户端拼错了。
+    ServerWord {
+        field: "outcome",
+        word: "verified",
+        client_file: "web/src/views/DatasetsView.tsx",
+        server_file: "crates/cog-gateway/src/datasets.rs",
+        server_needle: "cog_core::DatasetOutcome::Verified => (\"verified\"",
+    },
+    ServerWord {
+        field: "outcome",
+        word: "mismatched",
+        client_file: "web/src/views/DatasetsView.tsx",
+        server_file: "crates/cog-gateway/src/datasets.rs",
+        server_needle: "                            \"mismatched\",",
+    },
+    ServerWord {
+        field: "outcome",
+        word: "missing",
+        client_file: "web/src/views/DatasetsView.tsx",
+        server_file: "crates/cog-gateway/src/datasets.rs",
+        server_needle: "cog_core::DatasetOutcome::Missing => (\"missing\"",
+    },
+    ServerWord {
+        field: "outcome",
+        word: "unreadable",
+        client_file: "web/src/views/DatasetsView.tsx",
+        server_file: "crates/cog-gateway/src/datasets.rs",
+        server_needle: "(\"unreadable\", json!({ \"error\": e }))",
+    },
+    // 晋级台账那一格：`PromotionStatus::as_str` 是这份词表的唯一拼写处，读写两侧
+    // 都走它。客户端按这三个词给色调——拼错的那个永远不相等，那一行就没有色调。
+    ServerWord {
+        field: "status",
+        word: "promoted",
+        client_file: "web/src/views/ChangesView.tsx",
+        server_file: "crates/cog-core/src/contract/promotion.rs",
+        server_needle: "PromotionStatus::Promoted => \"promoted\"",
+    },
+    ServerWord {
+        field: "status",
+        word: "rolled_back",
+        client_file: "web/src/views/ChangesView.tsx",
+        server_file: "crates/cog-core/src/contract/promotion.rs",
+        server_needle: "PromotionStatus::RolledBack => \"rolled_back\"",
+    },
+    ServerWord {
+        field: "status",
+        word: "awaiting_approval",
+        client_file: "web/src/views/ChangesView.tsx",
+        server_file: "crates/cog-core/src/contract/promotion.rs",
+        server_needle: "PromotionStatus::AwaitingApproval => \"awaiting_approval\"",
+    },
+    // 变更行上的 `status` 不是手写 match 写出的，是 `EvolutionStatus` 经
+    // `#[serde(rename_all = "snake_case")]` 序列化出来的（`evolution_admin.rs` 的
+    // `status_word` 就是 `serde_json::to_value`）。所以这里的针落在变体声明上：
+    // 变体名一改，serde 写出的词跟着变，这三条立刻过期。页面按它们决定「应用 /
+    // 放行」两个按钮出不出——拼错了按钮不出现，读起来像「这一步不需要」。
+    ServerWord {
+        field: "status",
+        word: "generated",
+        client_file: "web/src/views/ChangesView.tsx",
+        server_file: "crates/cog-reflection/src/types.rs",
+        server_needle: "    Generated,",
+    },
+    ServerWord {
+        field: "status",
+        word: "compile_checked",
+        client_file: "web/src/views/ChangesView.tsx",
+        server_file: "crates/cog-reflection/src/types.rs",
+        server_needle: "    CompileChecked,",
+    },
+    ServerWord {
+        field: "status",
+        word: "awaiting_review",
+        client_file: "web/src/views/ChangesView.tsx",
+        server_file: "crates/cog-reflection/src/types.rs",
+        server_needle: "    AwaitingReview,",
+    },
+    // `scheduled` 是 `TaskStatus::as_str` 的一臂；任务面的「待办」那一格把
+    // pending 与 scheduled 当成同一类（都还没开跑）。
+    ServerWord {
+        field: "status",
+        word: "scheduled",
+        client_file: "web/src/views/TasksView.tsx",
+        server_file: "crates/cog-core/src/types/task.rs",
+        server_needle: "TaskStatus::Scheduled => \"scheduled\"",
+    },
 ];
 
 /// Statuses the client writes into its own stores and then compares against.

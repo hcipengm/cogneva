@@ -9,6 +9,8 @@ import {
   type DatasetVersionView,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { useShell } from '@/shell/store';
 import { Button, Empty, Loading, Moment, ReadError, Table, ViewFrame } from '@/ui/primitives';
 import { FormRow, TextInput } from '@/ui/forms';
@@ -28,10 +30,21 @@ import { Note } from '@/ui/Note';
  *
  * 校验不通过时服务端答 409，但正文里那条逐项的检查表仍然有效——`verifyDatasets`
  * 把它捞出来，这里照常画，包括对不上的摘要。
+ *
+ * 画面：这一面是两个清单——评测文件、登记版本，再加一张逐项校验结论。版本按登记
+ * 时间排，校验一行一份；把「对得上 / 对不上」画成色块会丢掉是哪一份、对不上差在
+ * 哪几字节，而那正是迁移之后唯一要读的东西。
  */
 
 export function DatasetsView() {
   const evalDatasets = useResource('评测数据集', listEvalDatasets, 60_000);
+  // 这一面读的三个消费者各有一个前缀：评测目录在 `eval` 下，登记版本在 `datasets`
+  // 下，上传写在 `files` 下。任何一条成功的写都让这一面重读——上传完的那一份要
+  // 不重读，目录里已经多了字节而列表还是旧的那一版。
+  useKindTickedRefresh(
+    [resourceKey('eval'), resourceKey('datasets'), resourceKey('files')],
+    evalDatasets.refresh
+  );
   const appendOutput = useShell((s) => s.appendOutput);
 
   const [name, setName] = useState('');

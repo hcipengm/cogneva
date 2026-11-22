@@ -8,6 +8,8 @@ import {
   type StoredActionPlanView,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { useShell } from '@/shell/store';
 import { Button, Empty, Loading, Moment, ReadError, Table, ViewFrame } from '@/ui/primitives';
 import { FormRow, TextArea, TextInput } from '@/ui/forms';
@@ -24,6 +26,10 @@ import { Note } from '@/ui/Note';
  * - `edges` 是有向边 {@code [["a","b"]]}，含义是 b 等 a；
  * - `tasks` 里的每个节点要有唯一 `id`，边里出现没定义过的 id 会被 DAG 校验拒绝
  *   （400，原文落在输出格里）。
+ *
+ * 画面：这一面是一张目标图——节点表、边表、以及服务端算出的关键路径与连通分量。
+ * 同一张图用两处布局各画一遍，位置没有含义，读者要读的是「依赖成不成环、关键路径
+ * 多长」这类结论，所以这里按边与校验摘要排成表，而不是画一张每次都不一样的图。
  */
 
 function edgeText(edge: [string, string]): string {
@@ -50,6 +56,9 @@ export function ActionPlansView() {
     30_000,
     Boolean(chosen)
   );
+  // 计划的提交、删除都落在 `/api/v1/action-plan` 这一前缀下，一次成功的写就报一次
+  // 这个键：列表与选中那份的详情一起重读，免得刚提交的图停在上一份。
+  useKindTickedRefresh([resourceKey('action-plan')], [page.refresh, detail.refresh]);
 
   const submit = async () => {
     if (!goal.trim()) {

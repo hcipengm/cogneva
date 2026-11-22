@@ -1,6 +1,8 @@
 import { useState } from 'react';
 import { listPlugins, loadPlugin, unloadPlugin, type PluginSummary } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { useShell } from '@/shell/store';
 import { Button, Empty, Loading, ReadError, Table, ViewFrame } from '@/ui/primitives';
 import { FormRow, TextArea } from '@/ui/forms';
@@ -17,6 +19,10 @@ import { FormRow, TextArea } from '@/ui/forms';
  *   二进制；注册表没配、地址取不到时这一步答 400 或 503，原文落在输出格里。
  * - 卸载按名字寻址，而服务端现在的卸载是一个记录动作（MVP：不真正丢句柄）。
  *   界面照实说「已请求卸载」，不说「已停掉」。
+ *
+ * 画面：这一面是插件目录的清单——一行一个 manifest，以及它声明了哪些能力。一份
+ * 清单读出多长就是多长，没有连续的量可画；读者要问的是「这个能力由谁提供」，
+ * 那是在表里按能力找行。
  */
 
 function capabilityText(plugin: PluginSummary): string {
@@ -40,6 +46,9 @@ function capabilityText(plugin: PluginSummary): string {
 
 export function PluginsView() {
   const page = useResource('插件', listPlugins, 30_000);
+  // 装载、卸载都是 `/api/v1/plugins` 下的写：目录里多一份或少一份清单，这一面
+  // 要跟着帧重读，而不是等下一拍。
+  useKindTickedRefresh([resourceKey('plugins')], page.refresh);
   const appendOutput = useShell((s) => s.appendOutput);
   const [open, setOpen] = useState(false);
   const [manifest, setManifest] = useState('');
