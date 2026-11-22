@@ -1513,20 +1513,22 @@ impl DagExecutor {
     /// 一次。用整表读回答它，是读回近万行、几十 MB 的一整张图，只为数其中几行
     /// （本机实测 2026-11-06，见 [`Self::live_tasks_unified`] 旁边那条）：两者
     /// 差的是三个数量级，而答案一字不差。
-    async fn tasks_in_status_unified(&self, status: TaskStatus) -> Vec<Task> {
+    ///
+    /// 读失败照旧保留：这一问唯一的调用方是看板列准入守卫，那里零行正是
+    /// **放行**的答案——把「数不出来」折成零，坏掉的库就成了最宽的那道门。
+    async fn tasks_in_status_checked(&self, status: TaskStatus) -> SFResult<Vec<Task>> {
         if let Some(be) = self.fg() {
-            be.dag_get_tasks_in_status(&self.workspace_id, status)
-                .await
-                .unwrap_or_default()
+            be.dag_get_tasks_in_status(&self.workspace_id, status).await
         } else {
-            self.inner
+            Ok(self
+                .inner
                 .read()
                 .await
                 .tasks
                 .values()
                 .filter(|task| task.status == status)
                 .cloned()
-                .collect()
+                .collect())
         }
     }
 
@@ -2867,6 +2869,11 @@ impl DagExecutor {
     /// 「未超」。上限是准入控制，不是某一刻的快照，所以判在真正跨进去的那一步上。
     ///
     /// 没配 `running` 上限的进程在这里不读图：这条判据不给所有部署加一次全图读。
+    ///
+    /// 两次读都保留失败：任务那一读失败不是「没有这条任务」，列那一读失败不是
+    /// 「一条都没在跑」。前一个会把守卫整个跳过，后一个正好给出放行的答案——
+    /// 而放行恰恰是这道守卫存在要拦的方向。读不出来就按拒绝收口，理由带着原始
+    /// 错误，让调用方看得出这是库的问题、值得重试。
     async fn refuse_when_the_running_column_is_full(&self, task_id: &str) -> SFResult<()> {
         // 读一格只为拿一个数：守卫在这里就放掉，别让它跨过下面的 await。
         let limit = self
@@ -2878,14 +2885,25 @@ impl DagExecutor {
             return Ok(());
         };
         // 任务不存在时不在这里抢先判：接下来的转换会给出它自己那条更具体的理由，
-        // 而被这里说成「列满了」只会把人引到错误的方向。
-        let Some(task) = self.get_task(task_id).await else {
-            return Ok(());
+        // 而被这里说成「列满了」只会把人引到错误的方向。真不存在与读不出来必须
+        // 分开——只有前者该交给下一步。
+        let task = match self.fg() {
+            Some(_) => match self.store_task(task_id).await {
+                Ok(task) => task,
+                Err(SFError::TaskFailed { .. }) => return Ok(()),
+                Err(e) => return Err(e),
+            },
+            // 非存储权威模式下这一读只是内存查找，读不出来那一步由 `start_task`
+            // 紧接着的 `ensure_task_present` 报出来。
+            None => match self.get_task(task_id).await {
+                Some(task) => task,
+                None => return Ok(()),
+            },
         };
         let project = task.project_key();
         let running = self
-            .tasks_in_status_unified(TaskStatus::Running)
-            .await
+            .tasks_in_status_checked(TaskStatus::Running)
+            .await?
             .iter()
             .filter(|t| t.project_key() == project)
             .count();
@@ -5300,6 +5318,13 @@ mod tests {
         /// 问过整份 live 集几次。`wide_reads` 数的是整张表，这一格数的是判据只要
         /// 一个状态、却按「所有还能影响派发的行」去读的那一问。
         live_reads: std::sync::atomic::AtomicUsize,
+        /// 读一列的那一问答不上来。零行与读不出来在准入守卫那里是两个方向相反
+        /// 的结论，这一格就是用来把后者的形状交出来的。
+        status_read_fails: std::sync::atomic::AtomicBool,
+        /// 下一次读一行答不上来，只答一次。守卫靠这一读把「任务不存在」与「读
+        /// 不出来」分开；只失败一次，才能让紧跟着的状态迁移照常读到那一行——否则
+        /// 两条路径的错看起来一模一样，测不出守卫自己有没有跳过。
+        task_read_fails: std::sync::atomic::AtomicBool,
     }
 
     impl CountingTaskStore {
@@ -5381,6 +5406,14 @@ mod tests {
             Ok(None)
         }
         async fn dag_get_task(&self, _workspace_id: &str, task_id: &str) -> SFResult<Option<Task>> {
+            if self
+                .task_read_fails
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(SFError::Database(format!(
+                    "store unavailable: cannot read task {task_id}"
+                )));
+            }
             Ok(self
                 .tasks
                 .lock()
@@ -5415,6 +5448,14 @@ mod tests {
         ) -> SFResult<Vec<Task>> {
             self.narrow_reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self
+                .status_read_fails
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(SFError::Database(format!(
+                    "store unavailable: cannot read the {status:?} column"
+                )));
+            }
             Ok(self
                 .tasks
                 .lock()
@@ -7432,6 +7473,96 @@ mod tests {
         assert!(
             backend.narrow_reads() >= 1,
             "这一问至少要读一次 running 那些行，否则答案是从别处猜的"
+        );
+    }
+
+    /// 数不出来，不等于一条都没在跑。
+    ///
+    /// 准入守卫问的是「这一条能不能放行」，而「running 列有几条」读失败被折成零，
+    /// 给出的正是放行——库坏掉的时候，那道守卫反而成了最宽的门。两个形状必须分开：
+    /// 真读到零行才放行，读不出来按拒绝收口，理由带着原始错误，调用方才能看出这是
+    /// 库的问题、值得重试，而不是列真的满了。
+    ///
+    /// 库里放的是**真有一条在跑**：判据要拦的就是它。读不出来时它没有消失，只是
+    /// 数不出来。
+    #[tokio::test]
+    async fn a_running_column_that_cannot_be_read_does_not_admit() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag =
+            DagExecutor::new("ws-column-unreadable".into()).with_state_backend(backend.clone());
+        let (limits, problems) = cog_core::BoardWipLimits::from_spec("running=1");
+        assert!(problems.is_empty(), "这条规格发布侧读不动: {problems:?}");
+        dag.set_board_wip_limits(limits);
+
+        let mut running = Task::new(
+            "t-already-running",
+            TaskType::DagNode,
+            serde_json::json!({}),
+        );
+        running.status = TaskStatus::Running;
+        let next = Task::new("t-wants-to-run", TaskType::DagNode, serde_json::json!({}));
+        let next_id = next.id.clone();
+        backend.tasks.lock().await.extend([running, next]);
+
+        backend
+            .status_read_fails
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let refusal = dag
+            .start_task(&next_id)
+            .await
+            .expect_err("running 列数不出来时不能放行：零行正是这道守卫要拦的那个答案");
+        let message = refusal.to_string();
+        assert!(
+            message.contains("store unavailable"),
+            "拒绝的理由要带原始错误，让人看得出这是读失败而不是列满: {message}"
+        );
+        assert!(
+            !message.contains("running 列已满"),
+            "读失败不能说成列满——那是另一件事，而且可能是真的: {message}"
+        );
+    }
+
+    /// 任务那一读失败，不是「没有这条任务」。
+    ///
+    /// 守卫读这一行只为拿它的项目键，而「读不出来」与「真不存在」被折成同一个
+    /// `None` 时，守卫整个跳过的代价是：这一条绕过上限被开起来。两种形状在这里分得
+    /// 开，靠的是只让第一次读失败——下一读（状态迁移自己的那一读）照常应答。旧行为
+    /// 下守卫读到 `None` 就放行，迁移接着把任务开起来；新行为下守卫拒绝。
+    #[tokio::test]
+    async fn an_unreadable_task_row_does_not_skip_the_column_limit_check() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag = DagExecutor::new("ws-task-unreadable".into()).with_state_backend(backend.clone());
+        let (limits, problems) = cog_core::BoardWipLimits::from_spec("running=1");
+        assert!(problems.is_empty(), "这条规格发布侧读不动: {problems:?}");
+        dag.set_board_wip_limits(limits);
+
+        let mut running = Task::new(
+            "t-already-running",
+            TaskType::DagNode,
+            serde_json::json!({}),
+        );
+        running.status = TaskStatus::Running;
+        let mut next = Task::new("t-wants-to-run", TaskType::DagNode, serde_json::json!({}));
+        next.status = TaskStatus::Scheduled;
+        let next_id = next.id.clone();
+        backend.tasks.lock().await.extend([running, next]);
+
+        // 只让守卫那一读失败。
+        backend
+            .task_read_fails
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let refusal = dag
+            .start_task(&next_id)
+            .await
+            .expect_err("任务那一读失败不是「没有这条任务」：守卫不能因此整个跳过");
+        let message = refusal.to_string();
+        assert!(
+            message.contains("store unavailable"),
+            "理由要带原始错误: {message}"
+        );
+        assert!(
+            message.contains(&next_id),
+            "理由要点名是哪一条任务读不出来: {message}"
         );
     }
 
