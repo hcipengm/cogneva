@@ -2175,6 +2175,66 @@ mod tests {
         assert_eq!(result.attempts, 1, "环境类失败不该被重试");
     }
 
+    /// 评委这一环没到上游，不是对作品的判决。把这次失败凭空写成一个
+    /// `Verdict::Fail` 会让终止守卫看不见环境故障：本地修复与全部重试照买，
+    /// 台账与共识票也会把「没人读到作品」记成「作品不合格」。
+    #[tokio::test]
+    async fn an_evaluator_that_never_reached_its_upstream_is_not_a_verdict_on_the_work() {
+        let pipeline = PgePipeline::new(PgePipelineConfig {
+            max_retries: 3,
+            timeout_ms: 5_000,
+            local_repair_max: 1,
+            stall_threshold: 2,
+            independent_review: false,
+        });
+        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({
+                "summary": "s",
+                "plan": {"steps": ["edit"]},
+                "sub_tasks": [],
+                "acceptance_criteria": []
+            }),
+        }));
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({"content": {"draft": "attempt output"}, "artifacts": []}),
+        }));
+        // 计划与生成都答得出，只有评委这一格没到上游。
+        let evaluator = EvaluatorActor::new(std::sync::Arc::new(FailingAgent));
+
+        let task = test_task("implement a hello world function");
+        let result = pipeline
+            .execute_task(
+                &task,
+                serde_json::json!({}),
+                &planner,
+                &generator,
+                &evaluator,
+            )
+            .await;
+
+        let reason = result
+            .terminal_reason
+            .as_deref()
+            .expect("评委没答上话，这一跑必须以终止性原因收口，而不是照常重试");
+        assert!(
+            reason.contains("HTTP 503 upstream unavailable"),
+            "终止原因必须指向真实的上游故障，实到: {reason}"
+        );
+        assert_eq!(result.attempts, 1, "环境类失败不该被重试");
+        assert_ne!(
+            result.final_evaluation.feedback, "Evaluation failed",
+            "「没判定」不能用一句对作品的判决顶替"
+        );
+        assert!(
+            result
+                .final_evaluation
+                .feedback
+                .contains("HTTP 503 upstream unavailable"),
+            "终止结果必须带着调用的真因，实到: {}",
+            result.final_evaluation.feedback
+        );
+    }
+
     /// A generator whose ReAct loop spends its whole iteration budget still
     /// exploring comes back as the runtime's `max_iterations_reached` sentinel.
     /// Read as an ordinary empty output it buys an evaluator call, a full round
