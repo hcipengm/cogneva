@@ -41,6 +41,37 @@ impl PostgresSnapshotStore {
     }
 }
 
+/// One row as the store wrote it, decoded back into a checkpoint.
+///
+/// Both text columns are read with `?`. `agent_state` used to fall back to
+/// `Value::Null` on a parse failure: the load then handed back a checkpoint
+/// whose state was gone, `restore` found no known key in it, and the agent
+/// resumed from the default state while the log said "Agent state restored
+/// from checkpoint". A row that cannot be decoded is not a checkpoint to
+/// resume from; a caller that cannot resume must say so.
+#[allow(clippy::too_many_arguments)]
+fn checkpoint_from_row(
+    checkpoint_id: String,
+    task_id: String,
+    agent_state: String,
+    context_window: String,
+    event_offset: i64,
+    timestamp: chrono::DateTime<Utc>,
+) -> SFResult<AgentCheckpoint> {
+    let agent_state: serde_json::Value =
+        serde_json::from_str(&agent_state).map_err(SFError::Serialization)?;
+    let context_window: Vec<cog_core::Message> =
+        serde_json::from_str(&context_window).map_err(SFError::Serialization)?;
+    Ok(AgentCheckpoint {
+        checkpoint_id,
+        task_id,
+        agent_state,
+        context_window,
+        event_offset: event_offset as u64,
+        timestamp,
+    })
+}
+
 // ==========================================================================
 // CheckpointStore implementation
 // ==========================================================================
@@ -98,18 +129,14 @@ impl CheckpointStore for PostgresSnapshotStore {
                 context_window,
                 event_offset,
                 timestamp,
-            )) => {
-                let context_window: Vec<cog_core::Message> =
-                    serde_json::from_str(&context_window).map_err(SFError::Serialization)?;
-                Ok(Some(AgentCheckpoint {
-                    checkpoint_id,
-                    task_id,
-                    agent_state: serde_json::from_str(&agent_state).unwrap_or_default(),
-                    context_window,
-                    event_offset: event_offset as u64,
-                    timestamp,
-                }))
-            }
+            )) => Ok(Some(checkpoint_from_row(
+                checkpoint_id,
+                task_id,
+                agent_state,
+                context_window,
+                event_offset,
+                timestamp,
+            )?)),
             None => Ok(None),
         }
     }
@@ -140,17 +167,60 @@ impl CheckpointStore for PostgresSnapshotStore {
 
         let mut cps = Vec::new();
         for (checkpoint_id, task_id, agent_state, context_window, event_offset, timestamp) in rows {
-            let context_window: Vec<cog_core::Message> =
-                serde_json::from_str(&context_window).map_err(SFError::Serialization)?;
-            cps.push(AgentCheckpoint {
+            cps.push(checkpoint_from_row(
                 checkpoint_id,
                 task_id,
-                agent_state: serde_json::from_str(&agent_state).unwrap_or_default(),
+                agent_state,
                 context_window,
-                event_offset: event_offset as u64,
+                event_offset,
                 timestamp,
-            });
+            )?);
         }
         Ok(cps)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(agent_state: &str, context_window: &str) -> SFResult<AgentCheckpoint> {
+        checkpoint_from_row(
+            "snap-1".into(),
+            "task-1".into(),
+            agent_state.into(),
+            context_window.into(),
+            7,
+            Utc::now(),
+        )
+    }
+
+    #[test]
+    fn a_row_decodes_into_the_checkpoint_that_was_saved() {
+        let cp = row(r#"{"state":"running","agent_id":"a-1"}"#, "[]").unwrap();
+        assert_eq!(cp.checkpoint_id, "snap-1");
+        assert_eq!(cp.agent_state["state"], "running");
+        assert_eq!(cp.event_offset, 7);
+    }
+
+    /// The state column used to fall back to `Value::Null`: the checkpoint
+    /// came back looking whole, `restore` found none of its keys, and the agent
+    /// resumed from the default state with a log line saying it had been
+    /// restored. A row that does not decode is not one to resume from.
+    #[test]
+    fn a_snapshot_whose_state_cannot_be_parsed_is_not_resumed_from() {
+        let err = row("{ not json", "[]")
+            .expect_err("an undecodable state must not read as an empty one");
+        assert!(
+            matches!(err, SFError::Serialization(_)),
+            "the row's own bytes are the problem, not the database: {err}"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_whose_context_cannot_be_parsed_is_not_resumed_from() {
+        let err = row("{}", "[ not messages")
+            .expect_err("an undecodable context window must not be skipped");
+        assert!(matches!(err, SFError::Serialization(_)), "{err}");
     }
 }
