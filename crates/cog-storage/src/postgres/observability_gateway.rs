@@ -222,6 +222,34 @@ fn filter_stored_events(
     Ok(events)
 }
 
+/// One stored log line back as the entry it was written from.
+///
+/// `record_log` writes `metadata.to_string()`, so every row this gateway wrote
+/// parses. A row that does not parse was written by something else, and folding
+/// it to `Null` handed back a log line whose metadata read as "none given" —
+/// indistinguishable from an entry recorded without any.
+fn log_entry_from_row(
+    task_id: &str,
+    timestamp: DateTime<Utc>,
+    level: String,
+    source: String,
+    message: String,
+    metadata: String,
+) -> SFResult<LogEntry> {
+    let metadata: serde_json::Value = serde_json::from_str(&metadata).map_err(|e| {
+        SFError::Validation(format!(
+            "log line for task {task_id} at {timestamp}: stored metadata is not JSON, so the entry cannot be read ({e})"
+        ))
+    })?;
+    Ok(LogEntry {
+        timestamp,
+        level,
+        source,
+        message,
+        metadata,
+    })
+}
+
 impl PostgresObservabilityGateway {
     /// 接上指标面。缺席是正常的（嵌入式运行没有后端），不是错误。
     pub fn with_metrics(mut self, metrics: Option<Arc<dyn cog_core::MetricsBackend>>) -> Self {
@@ -661,13 +689,9 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
 
         let mut logs = Vec::with_capacity(rows.len());
         for (timestamp, level, source, message, metadata) in rows {
-            logs.push(LogEntry {
-                timestamp,
-                level,
-                source,
-                message,
-                metadata: serde_json::from_str(&metadata).unwrap_or_default(),
-            });
+            logs.push(log_entry_from_row(
+                task_id, timestamp, level, source, message, metadata,
+            )?);
         }
         logs.reverse();
         Ok(logs)
@@ -1336,5 +1360,49 @@ mod tests {
         let ev = decode_stored_event(r#"{"type":"agent_start","agent_id":"a-1"}"#, Utc::now())
             .expect("a row this gateway wrote must decode");
         assert!(matches!(ev, AgentEvent::AgentStart { ref agent_id, .. } if agent_id == "a-1"));
+    }
+
+    /// `record_log` writes the metadata it was handed, so a line this gateway
+    /// wrote comes back the same.
+    #[test]
+    fn a_stored_log_line_decodes_back_with_its_metadata() {
+        let at = Utc::now();
+        let entry = log_entry_from_row(
+            "task-1",
+            at,
+            "INFO".into(),
+            "kernel".into(),
+            "started".into(),
+            r#"{"iteration":3}"#.into(),
+        )
+        .expect("a row this gateway wrote must decode");
+        assert_eq!(entry.timestamp, at);
+        assert_eq!(entry.metadata, serde_json::json!({"iteration": 3}));
+    }
+
+    /// The metadata column used to be folded to `Null` when it would not
+    /// parse, so the caller read a log line that looked like it was recorded
+    /// without metadata. The read must refuse instead, naming the line.
+    #[test]
+    fn log_metadata_that_does_not_parse_is_not_folded_to_null() {
+        let at = Utc::now();
+        let err = log_entry_from_row(
+            "task-1",
+            at,
+            "INFO".into(),
+            "kernel".into(),
+            "started".into(),
+            "{ half".into(),
+        )
+        .expect_err("unreadable metadata must not become Null");
+        let text = err.to_string();
+        assert!(
+            text.contains("task-1"),
+            "the error must name the task: {text}"
+        );
+        assert!(
+            text.contains(&at.to_string()),
+            "the error must name the line: {text}"
+        );
     }
 }
