@@ -217,6 +217,25 @@ impl BoundaryConfig {
     }
 }
 
+// 等于代码默认值的旋钮不出现在序列化里：模板不必抄一遍，部署真要改它时写进去
+// 仍然生效。`defaults()` 读的就是这条路径，所以「类型还产不产生这一格」和
+// 「模板该不该写它」是同一个答案。
+fn is_the_default_local_repair_max(v: &u32) -> bool {
+    *v == DEFAULT_LOCAL_REPAIR_MAX
+}
+
+fn is_the_default_ralph_iterations(v: &u32) -> bool {
+    *v == RalphSettings::default().max_iterations
+}
+
+fn is_the_default_ralph_window(v: &u32) -> bool {
+    *v == RalphSettings::default().stagnation_window
+}
+
+fn is_the_default_self_review_iterations(v: &u32) -> bool {
+    *v == SelfReviewSettings::default().max_iterations
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,23 +665,4 @@ mod tests {
         assert_eq!(BoundaryConfig::load_from(&path).unwrap().rules.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
-}
-
-// 等于代码默认值的旋钮不出现在序列化里：模板不必抄一遍，部署真要改它时写进去
-// 仍然生效。`defaults()` 读的就是这条路径，所以「类型还产不产生这一格」和
-// 「模板该不该写它」是同一个答案。
-fn is_the_default_local_repair_max(v: &u32) -> bool {
-    *v == DEFAULT_LOCAL_REPAIR_MAX
-}
-
-fn is_the_default_ralph_iterations(v: &u32) -> bool {
-    *v == RalphSettings::default().max_iterations
-}
-
-fn is_the_default_ralph_window(v: &u32) -> bool {
-    *v == RalphSettings::default().stagnation_window
-}
-
-fn is_the_default_self_review_iterations(v: &u32) -> bool {
-    *v == SelfReviewSettings::default().max_iterations
 }

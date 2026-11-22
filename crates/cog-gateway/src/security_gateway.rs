@@ -4297,6 +4297,8 @@ async fn seal_stream_body(
     }
 }
 
+// 参数与交换表那一行的列一一对应：拆成结构体只是把同一组名字再写一遍一次。
+#[allow(clippy::too_many_arguments)]
 async fn record_exchange(
     state: &AppState,
     upstream: &LlmUpstream,

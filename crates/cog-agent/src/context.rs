@@ -1269,7 +1269,7 @@ mod tests {
             ctx.add_message(Message::tool_result_text(
                 format!("call_{n}"),
                 "run_command",
-                &"输出 ".repeat(40),
+                "输出 ".repeat(40),
             ));
         }
 

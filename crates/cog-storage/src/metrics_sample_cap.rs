@@ -375,7 +375,7 @@ mod tests {
     #[test]
     fn no_declared_capacity_is_not_a_capacity_of_zero() {
         assert!(!reading(5, None).over_capacity);
-        assert!(reading(5, Some(5)).over_capacity == false);
+        assert!(!reading(5, Some(5)).over_capacity);
         assert!(reading(5, Some(4)).over_capacity);
     }
 
