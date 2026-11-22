@@ -281,11 +281,33 @@ impl PostgresGovernanceStore {
         .fetch_optional(conn)
         .await
         .map_err(|e| SFError::Database(e.to_string()))?;
-        let revision = input
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-            .and_then(|value| value.pointer("/face/revision").and_then(|v| v.as_i64()));
-        Ok(revision.unwrap_or(1))
+        face_revision_of(task_id, input.as_deref())
     }
+}
+
+/// The revision a face's latest definition states, or `1` when it states none.
+///
+/// A face with no definition row yet is at its first revision, and a row whose
+/// payload carries no `/face/revision` is one written before the field existed;
+/// both answer `1` by convention. Payload text that is not JSON at all is a
+/// different thing: the revision is unknown, and returning `1` let a handover
+/// carrying `expected_revision = 1` win a compare-and-swap against a revision
+/// nobody could read. Refusing to answer is the only outcome that cannot be
+/// mistaken for a matching revision.
+fn face_revision_of(task_id: &str, input: Option<&str>) -> Result<i64, SFError> {
+    let Some(text) = input else {
+        return Ok(1);
+    };
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|e| {
+        SFError::Validation(format!(
+            "face {task_id}: the latest definition's input is not JSON, so its revision \
+             cannot be read ({e}); refusing to guess"
+        ))
+    })?;
+    Ok(value
+        .pointer("/face/revision")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(1))
 }
 
 #[async_trait]
@@ -630,5 +652,45 @@ mod status_templates {
         }
         // 没登记的槽不会被悄悄当成空串填掉。
         assert!(fill_statuses("status = '{nope}'").contains("{nope}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_first_definition_is_revision_one() {
+        assert_eq!(face_revision_of("face-1", None).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_payload_that_states_a_revision_answers_with_it() {
+        let input = r#"{"face":{"revision":7,"id":"face-1"}}"#;
+        assert_eq!(face_revision_of("face-1", Some(input)).unwrap(), 7);
+    }
+
+    /// Rows written before the field existed carry no `/face/revision`; they
+    /// are the convention's other half, not an unreadable row.
+    #[test]
+    fn a_payload_without_the_field_is_revision_one() {
+        assert_eq!(
+            face_revision_of("face-1", Some(r#"{"face":{"id":"x"}}"#)).unwrap(),
+            1
+        );
+    }
+
+    /// The compare-and-swap compares this number with what the caller read.
+    /// Reading an unreadable payload as `1` let a handover carrying
+    /// `expected_revision = 1` win against a revision nobody could see.
+    #[test]
+    fn an_unreadable_payload_is_not_revision_one() {
+        let err = face_revision_of("face-1", Some("{ not json"))
+            .expect_err("an unreadable revision must not be guessed");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("face-1"),
+            "the error must name the face, got: {rendered}"
+        );
     }
 }
