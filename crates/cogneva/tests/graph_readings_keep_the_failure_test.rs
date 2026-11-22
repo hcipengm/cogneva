@@ -22,6 +22,7 @@ use crate::common::rust_production::production_text;
 const TASKS: &str = "crates/cog-gateway/src/tasks.rs";
 const A2A: &str = "crates/cog-gateway/src/a2a.rs";
 const TASK_LEDGER: &str = "crates/cog-gateway/src/task_ledger.rs";
+const PROJECTS: &str = "crates/cog-gateway/src/projects.rs";
 const PROGRESS: &str = "crates/cog-gateway/src/progress.rs";
 const PROCESSES: &str = "crates/cog-gateway/src/processes.rs";
 
@@ -109,6 +110,12 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "对端唯一的视野答成「你有 0 条任务」",
     ),
     (
+        PROJECTS,
+        "async fn visible_tasks",
+        "get_all_tasks_checked",
+        "整个项目面答成「一个项目都没有」，导出写成一张空表",
+    ),
+    (
         PROGRESS,
         "async fn merged_from",
         "get_all_tasks_checked",
@@ -125,7 +132,7 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
 #[test]
 fn every_surface_that_draws_the_graph_keeps_the_failure() {
     let mut productions: std::collections::HashMap<&str, String> = Default::default();
-    for file in [TASKS, A2A, TASK_LEDGER, PROGRESS, PROCESSES] {
+    for file in [TASKS, A2A, TASK_LEDGER, PROJECTS, PROGRESS, PROCESSES] {
         productions.insert(file, production_text(&read_repo(file)));
     }
     for (file, anchor, checked, folded_page) in SURFACES {

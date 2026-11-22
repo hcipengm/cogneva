@@ -148,7 +148,7 @@ pub async fn export_csv_handler(
     axum::extract::Query(q): axum::extract::Query<ExportQuery>,
 ) -> Result<axum::response::Response, ApiError> {
     let claims = claims.as_ref().map(|Extension(c)| c);
-    let tasks = visible_tasks(&state, claims).await;
+    let tasks = visible_tasks(&state, claims).await?;
     let rows = tasks_of_project(&tasks, &id);
     if rows.is_empty() && id != UNGROUPED {
         return Err(ApiError::not_found(format!("project {id}")));
@@ -603,14 +603,22 @@ fn now_source(reader: &'static str) -> Source {
 
 /// 取读者能看到的全部任务。可见性判定与任务面同一个函数——项目面不该有自己
 /// 一套隔离规则，两套规则迟早会不一致，而不一致的那一天，一边会漏读。
-async fn visible_tasks(state: &Arc<GatewayState>, claims: Option<&cog_core::Claims>) -> Vec<Task> {
-    state
-        .orchestrator
-        .get_all_tasks()
-        .await
+///
+/// 读不出来的那一页留成 503，不折成空表：这一面下面每一条读（列表、看板、甘特、
+/// 挣值、WBS、审计、CSV）都按「有几条」作答，折出来的空表会让整个部署的项目面
+/// 报成「一个项目都没有」，而导出还会把它写成一份看起来完整、实则空白的表。
+async fn visible_tasks(
+    state: &Arc<GatewayState>,
+    claims: Option<&cog_core::Claims>,
+) -> Result<Vec<Task>, ApiError> {
+    let rows = crate::tasks::task_rows_from_reading(
+        state.orchestrator.get_all_tasks_checked().await,
+        "project task list",
+    )?;
+    Ok(rows
         .into_iter()
         .filter(|t| visible_to_claims(claims, t))
-        .collect()
+        .collect())
 }
 
 /// 读这个部署里的全部计划基线，读不到时返回 `None` 而不是空表。
@@ -741,7 +749,7 @@ pub async fn list_projects_handler(
     axum::extract::Query(page): axum::extract::Query<ListProjectsQuery>,
 ) -> Result<Json<ProjectsResponse>, ApiError> {
     let claims = claims.as_ref().map(|Extension(c)| c);
-    let tasks = visible_tasks(&state, claims).await;
+    let tasks = visible_tasks(&state, claims).await?;
     let total_tasks = tasks.len();
     let plans = readable_plans(&state.orchestrator).await;
 
@@ -871,7 +879,7 @@ pub async fn project_board_handler(
     Path(id): Path<String>,
 ) -> Result<Json<BoardResponse>, ApiError> {
     let claims = claims.as_ref().map(|Extension(c)| c);
-    let tasks = visible_tasks(&state, claims).await;
+    let tasks = visible_tasks(&state, claims).await?;
     let rows = tasks_of_project(&tasks, &id);
 
     // 项目不存在与项目为空是两件事：前者是路径写错了，后者是这个 goal 还没
@@ -911,7 +919,7 @@ pub async fn project_gantt_handler(
     Path(id): Path<String>,
 ) -> Result<Json<GanttResponse>, ApiError> {
     let claims = claims.as_ref().map(|Extension(c)| c);
-    let tasks = visible_tasks(&state, claims).await;
+    let tasks = visible_tasks(&state, claims).await?;
     let rows = tasks_of_project(&tasks, &id);
 
     if rows.is_empty() && id != UNGROUPED {
@@ -929,7 +937,7 @@ pub async fn project_evm_handler(
     Path(id): Path<String>,
 ) -> Result<Json<EvmResponse>, ApiError> {
     let claims = claims.as_ref().map(|Extension(c)| c);
-    let tasks = visible_tasks(&state, claims).await;
+    let tasks = visible_tasks(&state, claims).await?;
     let rows = tasks_of_project(&tasks, &id);
 
     if rows.is_empty() && id != UNGROUPED {
@@ -1490,7 +1498,7 @@ pub async fn project_wbs_handler(
     Path(id): Path<String>,
 ) -> Result<Json<WbsResponse>, ApiError> {
     let claims = claims.as_ref().map(|Extension(c)| c);
-    let tasks = visible_tasks(&state, claims).await;
+    let tasks = visible_tasks(&state, claims).await?;
     let rows = tasks_of_project(&tasks, &id);
     if rows.is_empty() && id != UNGROUPED {
         return Err(ApiError::not_found(format!("project {id}")));
@@ -1519,7 +1527,7 @@ pub async fn project_audit_handler(
     let claims = claims.as_ref().map(|Extension(c)| c);
     // 看不到的项目不给时间线：告诉一个租户「这个项目存在但你没权限」，
     // 与告诉它「不存在」是不同的信息泄漏。
-    let tasks = visible_tasks(&state, claims).await;
+    let tasks = visible_tasks(&state, claims).await?;
     if tasks_of_project(&tasks, &id).is_empty() && id != UNGROUPED {
         return Err(ApiError::not_found(format!("project {id}")));
     }
@@ -1895,7 +1903,7 @@ pub async fn create_project_task_handler(
         )));
     }
 
-    let tasks = visible_tasks(&state, claims).await;
+    let tasks = visible_tasks(&state, claims).await?;
     let rows = tasks_of_project(&tasks, &id);
     if rows.is_empty() && id != UNGROUPED {
         return Err(ApiError::not_found(format!("project {id}")));
