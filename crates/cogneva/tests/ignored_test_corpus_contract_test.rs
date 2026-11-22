@@ -38,6 +38,11 @@
 //! named by a step, or that no longer holds an ignored test, fails as well -- a
 //! list that only ever licenses is a list that stops describing the tree.
 
+// 这几个目标各自 `mod common;` 一次，`common/` 下的每一份因此被编进好几个二进制——
+// clippy 报 `duplicate_mod`。它建议的改法（留一个 `mod`，其余 `use`）在这里不成立：
+// 测试二进制之间没有共享的模块树，`use` 够不着别的目标里那一份。编两次是安全的，
+// 这些文件只放自由函数与夹具，不定义需要在副本之间保持同一身份的类型。
+#[allow(clippy::duplicate_mod)]
 mod common;
 
 use common::routes::{read_repo, repo_root, walk_files};

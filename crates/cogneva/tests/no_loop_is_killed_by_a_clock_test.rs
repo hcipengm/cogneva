@@ -8,7 +8,7 @@
 //!
 //! 白名单只有一份，写在下面；名单变长要被看见——加一处的理由必须说得出来。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::common::rust_production::rust_files_under;
 
