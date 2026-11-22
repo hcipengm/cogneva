@@ -2658,7 +2658,6 @@ export interface ChangeLedgerRow {
    * 那要印「量不到」，不能印成三格全空：全空读作「全都没做」，是另一个结论。
    */
   cells?: ChangeCells;
-  /** 这一条自己花掉的 token，按它的全部交接代际求和。
   /**
    * 这一条自己花掉的 token，按它的全部交接代际求和。
    *
