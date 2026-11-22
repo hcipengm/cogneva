@@ -78,10 +78,10 @@ fn every_fact_delete_sits_beside_the_archive_that_verifies_it() {
     for file in rust_files(&src) {
         let text = std::fs::read_to_string(&file).unwrap_or_default();
         // `#[cfg(test)]` 之后的部分不算：那里的 DELETE 是夹具，删的是它自己刚写的行。
-        let production = match text.find("#[cfg(test)]") {
-            Some(at) => &text[..at],
-            None => &text[..],
-        };
+        // 产出与夹具的切法只有一份（`common::rust_production`）：在第一个
+        // `#[cfg(test)]` 上切，会在文件中间带着 test-only 项时把后面的产出整段丢掉。
+        let production = crate::common::rust_production::production_text(&text);
+        let production = production.as_str();
         for table in cog_storage::table_shapes::FACT_TABLES {
             let needle = format!("DELETE FROM {table}");
             let mut search = 0;

@@ -11,13 +11,8 @@
 
 use std::path::{Path, PathBuf};
 
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("two levels below the root")
-        .to_path_buf()
-}
+// 仓库根只有一份算法（`common::routes::repo_root()`）。
+use crate::common::routes::repo_root;
 
 /// 生产源码里出现的 kind 字面量。
 fn kind_literals(root: &Path) -> Vec<(String, String)> {
@@ -68,6 +63,46 @@ fn kind_literals(root: &Path) -> Vec<(String, String)> {
     out
 }
 
+/// 名字以 `_KIND` 结尾、但判的是**别的东西**的常量：任务类型、subject 的种类、
+/// 信号类型。扫描只看名字，分不开它们与事件 kind，所以在这里登记，每条写清它是哪
+/// 一类。登记必须仍然指向树里存在的一条——常量改了名或删了，这条登记就成了对一处
+/// 没人再看的现场的作保（`the_excuses_are_still_needed` 判它）。
+const NOT_EVENT_KINDS: &[(&str, &str)] = &[
+    // 任务类型：派发时用它选执行器，不是事件的 kind。
+    (
+        "crates/cog-orchestrator/src/change_ledger.rs",
+        "change_ledger",
+    ),
+    (
+        "crates/cog-orchestrator/src/change_ledger.rs",
+        "change_ledger_project",
+    ),
+    (
+        "crates/cog-orchestrator/src/dag_executor/mod.rs",
+        "self_signal_project",
+    ),
+    (
+        "crates/cog-reflection/src/mainline_deployer.rs",
+        "ci_hold_fix",
+    ),
+    ("crates/cogneva/src/work.rs", "unit_work"),
+    // 信号类型：watcher 内部的分派词。
+    (
+        "crates/cog-reflection/src/signal_watcher.rs",
+        "config_defect",
+    ),
+    (
+        "crates/cog-reflection/src/signal_watcher.rs",
+        "rule_evaluation",
+    ),
+    ("crates/cog-reflection/src/signal_watcher.rs", "self_audit"),
+    // 信封 `subject_kind` 那一列：一条候选变更的 subject 是什么。
+    (
+        "crates/cog-storage/src/postgres/change_candidate_store.rs",
+        "change",
+    ),
+];
+
 /// 每个 `*_KIND` 常量写的词，都必须在闭集里。
 #[test]
 fn every_kind_constant_writes_a_word_the_closed_set_holds() {
@@ -81,6 +116,9 @@ fn every_kind_constant_writes_a_word_the_closed_set_holds() {
     let known: Vec<&str> = cog_core::contract::event_envelope::KINDS.to_vec();
     let mut unknown: Vec<String> = Vec::new();
     for (file, kind) in &found {
+        if NOT_EVENT_KINDS.iter().any(|(f, k)| f == file && k == kind) {
+            continue;
+        }
         if !known.contains(&kind.as_str()) {
             unknown.push(format!("{file}: {kind}"));
         }
@@ -89,5 +127,20 @@ fn every_kind_constant_writes_a_word_the_closed_set_holds() {
         unknown.is_empty(),
         "这些常量写下的 kind 不在闭集里：{unknown:?}。加上它（同时改 `KINDS`），\
          或者把那一族并进已有的拼写——两个词就是两族事件。"
+    );
+}
+
+/// 登记表里的每一条都还指得到一条真实的常量：常量改名或删掉之后，那条登记就成了
+/// 对一处没人再看的现场的作保。
+#[test]
+fn the_excuses_are_still_needed() {
+    let found = kind_literals(&repo_root());
+    let stale: Vec<&(&str, &str)> = NOT_EVENT_KINDS
+        .iter()
+        .filter(|(f, k)| !found.iter().any(|(ff, kk)| ff == f && kk == k))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "这些登记已经不指向树里的常量了：{stale:?}——删掉它们，别让登记表替空处作保"
     );
 }

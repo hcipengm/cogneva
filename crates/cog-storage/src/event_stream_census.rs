@@ -72,7 +72,7 @@ pub async fn pass(pool: &PgPool, metrics: &Arc<dyn MetricsBackend>) -> SFResult<
     let cells = census_cells(&counts);
     for (kind, rows) in &cells {
         let mut labels = std::collections::HashMap::new();
-        labels.insert("kind".to_string(), kind.clone());
+        labels.insert(crate::LABEL_KIND.to_string(), kind.clone());
         metrics
             .record_gauge(metric_names::EVENT_STREAM_ROWS_PER_DAY, *rows, labels)
             .await?;

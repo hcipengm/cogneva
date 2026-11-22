@@ -206,8 +206,6 @@ mod tests {
 
     #[test]
     fn the_event_id_is_always_the_envelope_width() {
-        for id in ["", "x", &"y".repeat(40)] {
-            assert_eq!(event_id_for(id).len(), 26, "{id:?}");
-        }
+        crate::postgres::assert_envelope_width(event_id_for);
     }
 }

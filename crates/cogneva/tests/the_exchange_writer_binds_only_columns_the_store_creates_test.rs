@@ -15,13 +15,9 @@
 
 use std::path::{Path, PathBuf};
 
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("the crate sits two levels below the repository root")
-        .to_path_buf()
-}
+// 仓库根只有一份算法（`common::routes::repo_root()`）：各写一遍时，根一漂读数就
+// 变成零，与「没有题目」同形。
+use crate::common::routes::repo_root;
 
 fn usage_store_source() -> String {
     let path = repo_root().join("crates/cog-observability/src/usage_store.rs");

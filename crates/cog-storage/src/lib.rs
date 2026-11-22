@@ -182,3 +182,9 @@ pub use cog_core::DAY_KEY_FORMAT;
 pub fn log_file_stem(day: chrono::NaiveDate) -> String {
     cog_core::day_key(day)
 }
+
+/// 指标标签位上那两个词。各 crate 各声明一份是既有形状（编译器不比较），本 crate
+/// 写标签时引用自己这一份，而不是在调用点再拼一遍字符串。
+pub const LABEL_KIND: &str = "kind";
+/// 见 [`LABEL_KIND`]。
+pub const LABEL_VERSION: &str = "version";

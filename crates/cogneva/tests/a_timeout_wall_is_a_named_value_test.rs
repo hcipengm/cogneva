@@ -16,13 +16,9 @@
 
 use std::path::{Path, PathBuf};
 
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("the crate sits two levels below the repository root")
-        .to_path_buf()
-}
+// 仓库根只有一份算法（`common::routes::repo_root()`）：各写一遍时，根一漂读数就
+// 变成零，与「没有题目」同形。
+use crate::common::routes::repo_root;
 
 fn production_files(root: &Path) -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
@@ -52,7 +48,7 @@ fn production_files(root: &Path) -> Vec<(PathBuf, String)> {
 }
 
 /// `.timeout(` 后面紧跟一个写死的数，无论有没有 `Duration::from_*` 包一层。
-fn literal_after_timeout(line: &str) -> bool {
+fn a_number_written_after_timeout(line: &str) -> bool {
     // 注释里写着 `.timeout(30)` 是在讲这件事，不是在做这件事。
     let trimmed = line.trim_start();
     if trimmed.starts_with("//") || trimmed.starts_with('*') {
@@ -102,7 +98,7 @@ fn no_timeout_passes_a_written_number() {
                 continue;
             }
             seen += 1;
-            if !literal_after_timeout(line) || line.contains("// wall: test") {
+            if !a_number_written_after_timeout(line) || line.contains("// wall: test") {
                 continue;
             }
             offenders.push(format!(
@@ -129,17 +125,27 @@ fn no_timeout_passes_a_written_number() {
 /// 判据本身要被判：包装过的字面量与裸字面量一样拦住，具名常量放行。
 #[test]
 fn the_rule_sees_through_a_duration_wrapper() {
-    assert!(literal_after_timeout("            .timeout(30);"));
-    assert!(literal_after_timeout(".timeout(Duration::from_secs(5))"));
-    assert!(literal_after_timeout(
+    assert!(a_number_written_after_timeout("            .timeout(30);"));
+    assert!(a_number_written_after_timeout(
+        ".timeout(Duration::from_secs(5))"
+    ));
+    assert!(a_number_written_after_timeout(
         ".timeout(std::time::Duration::from_millis(250))"
     ));
-    assert!(!literal_after_timeout(".timeout(REQUEST_TIMEOUT_SECS)"));
-    assert!(!literal_after_timeout(".timeout(self.timeout_secs)"));
-    assert!(!literal_after_timeout(".timeout(lease.remaining_secs())"));
-    assert!(!literal_after_timeout("// .timeout(30) 只是注释里的例子"));
+    assert!(!a_number_written_after_timeout(
+        ".timeout(REQUEST_TIMEOUT_SECS)"
+    ));
+    assert!(!a_number_written_after_timeout(
+        ".timeout(self.timeout_secs)"
+    ));
+    assert!(!a_number_written_after_timeout(
+        ".timeout(lease.remaining_secs())"
+    ));
+    assert!(!a_number_written_after_timeout(
+        "// .timeout(30) 只是注释里的例子"
+    ));
     // `def.timeout()` 是取值不是设界：参数位置是空的，同行后面的数字不属于它。
-    assert!(!literal_after_timeout(
+    assert!(!a_number_written_after_timeout(
         "assert_eq!(def.timeout(), Duration::from_millis(5000));"
     ));
 }

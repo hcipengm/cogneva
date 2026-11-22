@@ -15,13 +15,9 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("the crate sits two levels below the repository root")
-        .to_path_buf()
-}
+// 仓库根只有一份算法（`common::routes::repo_root()`）：各写一遍时，根一漂读数就
+// 变成零，与「没有题目」同形。
+use crate::common::routes::repo_root;
 
 /// 迁移里 `cogneva_event` 的列名，按出现顺序。
 fn envelope_columns(root: &Path) -> Vec<String> {

@@ -154,8 +154,8 @@ impl PgChangeCandidateStore {
             return;
         };
         let mut labels = std::collections::HashMap::new();
-        labels.insert("kind".to_string(), kind.to_string());
-        labels.insert("version".to_string(), version.to_string());
+        labels.insert(crate::LABEL_KIND.to_string(), kind.to_string());
+        labels.insert(crate::LABEL_VERSION.to_string(), version.to_string());
         let _ = metrics
             .record_counter(cog_core::metric_names::EVENT_UNDECODABLE_TOTAL, 1.0, labels)
             .await;

@@ -13,13 +13,8 @@
 
 use std::path::{Path, PathBuf};
 
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("two levels below the root")
-        .to_path_buf()
-}
+// 仓库根只有一份算法（`common::routes::repo_root()`）。
+use crate::common::routes::repo_root;
 
 /// 生产源码里每一处「表名是拼出来的」写入：`(相对路径, 语句片段)`。
 fn dynamic_inserts(root: &Path) -> Vec<(String, String)> {

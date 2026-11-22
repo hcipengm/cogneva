@@ -76,3 +76,13 @@ pub use state_backend::{
 };
 pub use taste_intent_store::PostgresTasteIntentStore;
 pub use user_store::PostgresUserStore;
+
+/// 信封里事件 id 那一列是定长的（26 个字母数字）：短的会被拒，或者被补齐到别人的
+/// 形状。三个写入口（调用、工具调用、轮次）各写一遍这段断言时，改一处不会有任何
+/// 报错——所以它只写这一份，用例调用它。
+#[cfg(test)]
+pub(crate) fn assert_envelope_width(make: impl Fn(&str) -> String) {
+    for id in ["", "x", &"y".repeat(40)] {
+        assert_eq!(make(id).len(), 26, "{id:?}");
+    }
+}

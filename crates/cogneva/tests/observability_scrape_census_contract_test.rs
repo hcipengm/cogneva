@@ -111,6 +111,18 @@ const NOT_A_SERIES: &[(&str, &str)] = &[
         "the same family: the moment a clippy verdict was observed, published by the run that judged it",
     ),
     (
+        "cogneva_event",
+        "the table the event stream lives in, declared in cog-storage/src/table_shapes.rs; the live scrape carries no series of that name",
+    ),
+    (
+        "cogneva_probe_total",
+        "a fixture series: the projection-rebuild case publishes it to prove a counter rebuilds, and no production write point uses the name",
+    ),
+    (
+        "cogneva_probe_seconds",
+        "the same fixture, the histogram half: it exists so the rebuild case can prove bucket families rebuild, not to be scraped",
+    ),
+    (
         "cogneva_owner_leases",
         "the Postgres table the owner-lease rows live in, declared as LEASE_TABLE in cog-storage/src/owner_lease.rs; the live scrape carries no series of that name",
     ),

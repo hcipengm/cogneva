@@ -33,13 +33,9 @@ use std::path::{Path, PathBuf};
 /// `// wall:`，要么当场红。表留着是为了下一次真有存量时接着用，而不是把「零」写成一个常量。
 const UNANSWERED: &[(&str, u32)] = &[];
 
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("the crate sits two levels below the repository root")
-        .to_path_buf()
-}
+// 仓库根只有一份算法（`common::routes::repo_root()`）：各写一遍时，根一漂读数就
+// 变成零，与「没有题目」同形。
+use crate::common::routes::repo_root;
 
 fn production_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();

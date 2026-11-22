@@ -691,10 +691,19 @@ mod workload_label_pairs_contract_test;
 /// beside it, so a file that starts doing either stops being eligible in the
 /// same change that makes it do so.
 fn cannot_share_a_process(text: &str) -> Option<&'static str> {
-    if text.contains("set_var(") {
+    if text.lines().any(|line| {
+        let t = line.trim_start();
+        !t.starts_with("//") && t.contains("set_var(")
+    }) {
         return Some("writes a process-global environment variable");
     }
-    if text.contains("#[ignore") {
+    // 判**属性位**，不判裸子串：一条注释里写着 `#[ignore]`（解释这条规则本身）或一段
+    // 字符串里含着它，都不是一条被忽略的用例。裸子串会把「提到」读成「就是」，
+    // 而前者恰恰出现在解释这条规则的文件里。
+    if text
+        .lines()
+        .any(|line| line.trim_start().starts_with("#[ignore"))
+    {
         return Some("carries an #[ignore]d case that CI runs on its own");
     }
     None

@@ -5488,7 +5488,19 @@ const GAPS_AT_CENSUS: usize = 34;
 /// such table at this hour is a page is the same kind of judgement, and the
 /// series is drawn beside the per-table numbers a face owner reads. Both have a
 /// reading on the panel; neither has a decided bound.
-const DRAWN_ONLY_AT_CENSUS: usize = 29;
+///
+/// Raised to 32 on 2026-11-22 by the event-stream work, for three series that are
+/// readings of the stream and the memory index rather than of a workload:
+/// `cogneva_event_stream_rows_per_day` is the volume the retention target is set
+/// against — a bound on it would be a picked number, and what it is for is
+/// plotted beside the age of the oldest row; `cogneva_event_undecodable_total`
+/// counts payloads a later version wrote that this reader cannot decode, which a
+/// gate keeps at zero by refusing unknown versions at the writer, so a rule
+/// would restate the gate; `cogneva_memory_dropped_entries_total` counts entries
+/// the vector index refused, and whether a drop is a fault depends on which
+/// backend refused it — the per-backend series beside it is what a person reads.
+/// All three are drawn with no decided bound, and none of them has a rule today.
+const DRAWN_ONLY_AT_CENSUS: usize = 32;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {

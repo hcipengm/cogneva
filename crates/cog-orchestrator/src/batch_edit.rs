@@ -98,7 +98,8 @@ pub struct AgentCall {
 impl GeneratorCall for AgentCall {
     async fn call(&self, batch: &str) -> cog_core::SFResult<serde_json::Value> {
         self.agent
-            .prompt(serde_json::json!({ "batch": batch, "role": "generator" }))
+            // 角色名从声明读，不在这里再写一遍：改名时改一处，这一侧跟着走。
+            .prompt(serde_json::json!({ "batch": batch, "role": cog_core::roles::GENERATOR }))
             .await
     }
 }
