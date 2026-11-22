@@ -136,11 +136,11 @@ fn the_reap_still_requires_a_provably_complete_listing() {
     // 去 reap，会把还开着的意图的判词删掉——那时账变干净了，而干净是假的。
     let block = reap_block();
     assert!(
-        block.contains("if listings_complete(open_issues.len(), open_prs.len())"),
+        block.contains("if listing_is_complete("),
         "reap 不再要求「两次列取都完整」这个前提。"
     );
     let guard = block
-        .find("if listings_complete(")
+        .find("if listing_is_complete(")
         .expect("上一个断言已经确认它在");
     let reap_call = block
         .find("self.verdicts_reap_closed(&open)")
@@ -148,6 +148,15 @@ fn the_reap_still_requires_a_provably_complete_listing() {
     assert!(
         guard < reap_call,
         "完整性判据出现在 reap 调用之后——那一次 reap 已经在不完整的列表上跑过了。"
+    );
+    // 判据的两个来源都在：provider 自己保证翻完了每一页，或者条数低于单页上限。
+    // 只留后者，翻页的 provider 在几百条意图的仓库上永远 reap 不了；只留前者，
+    // 只读一页的实现会把截断的名单当全份。
+    let whole = std::fs::read_to_string(std::path::Path::new(&repo_root()).join(SOURCE))
+        .expect("读得动 discovery_loop.rs");
+    assert!(
+        whole.contains("provider.lists_every_page() || listings_complete(issue_count, pr_count)"),
+        "完整性判据少了一个来源：翻页的 provider 与按条数猜的单页 provider 都该被判过。"
     );
 }
 

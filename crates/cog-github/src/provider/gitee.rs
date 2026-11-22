@@ -114,19 +114,53 @@ impl GiteeProvider {
             .body(form_body(fields).into_bytes())
     }
 
+    /// 取一整份名单：一页一页地问，直到某一页装不满为止。
+    ///
+    /// Gitee v5 的列表端点一次最多回 `per_page` 条，超出的部分要靠 `page` 再问
+    /// 一次。只问一次的读法把「第 101 条起」与「就这些」读成同一样，而调用方
+    /// 拿这份名单当开放集：处理循环按它去重、裁决回收按它判谁还开着、issue 编号
+    /// 翻译按它找号——少掉的那些不会以任何形式露头，读面看起来和完整的名单一样。
+    ///
+    /// 「问完了没有」由服务端自己给：一页不满 `per_page` 条就是最后一页；正好
+    /// 装满则可能是后面还有，再问下一页。页长 `PER_PAGE` 是接口的上限，不是
+    /// 我们挑的数，所以这里没有第二个要论证的界。
+    ///
+    /// 正文不是数组时整份读不成：一句错误对象或一页 HTML 不是一份空名单。
+    async fn list_all(&self, path: &str, base: &[(&str, &str)]) -> Result<Vec<serde_json::Value>> {
+        let per_page = PER_PAGE.to_string();
+        let mut all: Vec<serde_json::Value> = Vec::new();
+        let mut page: usize = 1;
+        loop {
+            let page_no = page.to_string();
+            let mut params: Vec<(&str, &str)> = base.to_vec();
+            params.push(("per_page", per_page.as_str()));
+            params.push(("page", page_no.as_str()));
+            let v = self.send(self.get(path, &params)).await?;
+            let batch = v.as_array().ok_or_else(|| {
+                CogGitHubError::Provider(format!("gitee {path} answered no array: {v}"))
+            })?;
+            let got = batch.len();
+            all.extend(batch.iter().cloned());
+            if got < PER_PAGE {
+                break;
+            }
+            page += 1;
+        }
+        Ok(all)
+    }
+
     /// trait 的 issue_number 是 u64，承载 Gitee issue 的数值 `id`；而
     /// Gitee 的 issue 子资源路径用的是字符串编号（形如 I1A2B3）。本函数
     /// 做一次列表扫描完成 id → 字符串编号翻译（发现循环低频调用，可接受）。
+    ///
+    /// 扫的是**全量**：第 101 个 issue 起不在第一页上，只扫一页的写法会把它们
+    /// 说成「没有这个 issue」，评论于是永远发不出去。
     async fn issue_string_number(&self, issue_id: u64) -> Result<String> {
-        let v = self
-            .send(self.get("/issues", &[("state", "all"), PER_PAGE]))
-            .await?;
-        v.as_array()
-            .and_then(|a| {
-                a.iter()
-                    .find(|i| i["id"].as_u64() == Some(issue_id))
-                    .and_then(|i| i["number"].as_str().map(String::from))
-            })
+        let listing = self.list_all("/issues", &[("state", "all")]).await?;
+        listing
+            .iter()
+            .find(|i| i["id"].as_u64() == Some(issue_id))
+            .and_then(|i| i["number"].as_str().map(String::from))
             .ok_or_else(|| CogGitHubError::Provider(format!("gitee issue id {issue_id} not found")))
     }
 }
@@ -156,6 +190,15 @@ fn parse_issue(v: &serde_json::Value) -> PlatformIssue {
     }
 }
 
+/// 从 Gitee 评论 JSON 提取平台无关表示（issue 与 PR 两条端点同形）。
+fn parse_comment(v: &serde_json::Value) -> PlatformComment {
+    PlatformComment {
+        author: v["user"]["login"].as_str().unwrap_or_default().to_string(),
+        body: v["body"].as_str().unwrap_or_default().to_string(),
+        created_at: parse_time(&v["created_at"]),
+    }
+}
+
 /// Gitee 时间戳为 ISO8601（+08:00 偏移）；解析失败退化为当前时间，
 /// 单个脏字段不应拖垮整个扫描轮次。
 fn parse_time(v: &serde_json::Value) -> chrono::DateTime<chrono::Utc> {
@@ -167,18 +210,17 @@ fn parse_time(v: &serde_json::Value) -> chrono::DateTime<chrono::Utc> {
 
 /// 一页最多取多少条。
 ///
-/// Gitee v5 的列表端点都认这个上限，六处调用各写一遍时，改一处就只让那一个
-/// 列表换了页长——返回的仍然是一个列表，读者看到的只是它比别处短。
-const PER_PAGE: (&str, &str) = ("per_page", "100");
+/// Gitee v5 的列表端点都认这个上限。它不只是「一页要多大」，还是**问完了没有**
+/// 的判据本身：一页正好这么多条，就说明后面可能还有，得再问一页。
+// cap: fixed — Gitee v5 列表端点的 per_page 上限：接口一次最多回 100 条，不是我们挑的数
+const PER_PAGE: usize = 100;
 
-/// 列「还开着的那一批」用的四个查询参数。
+/// 列「还开着的那一批」用的三个查询参数。
 ///
-/// issues 与 pulls 是两条端点，可「只要开着的、按创建时间倒序、取满一页」是
-/// 同一句话。分开写时，改一条只让其中一个列表换了次序或页长，而两边都仍然
-/// 返回一个像样的列表。
-const OPEN_LIST_QUERY: [(&str, &str); 4] = [
+/// issues 与 pulls 是两条端点，可「只要开着的、按创建时间倒序」是同一句话。
+/// 分开写时，改一条只让其中一个列表换了次序，而两边都仍然返回一个像样的列表。
+const OPEN_LIST_QUERY: [(&str, &str); 3] = [
     ("state", "open"),
-    ("per_page", "100"),
     ("sort", "created"),
     ("direction", "desc"),
 ];
@@ -189,11 +231,14 @@ impl CodePlatformProvider for GiteeProvider {
         crate::GITEE_PLATFORM
     }
 
+    /// 列表都经 `list_all` 翻到不满一页为止，交出去的名单就是全部。
+    fn lists_every_page(&self) -> bool {
+        true
+    }
+
     async fn list_open_issues(&self) -> Result<Vec<PlatformIssue>> {
-        let v = self.send(self.get("/issues", &OPEN_LIST_QUERY)).await?;
-        Ok(v.as_array()
-            .map(|a| a.iter().map(parse_issue).collect())
-            .unwrap_or_default())
+        let listing = self.list_all("/issues", &OPEN_LIST_QUERY).await?;
+        Ok(listing.iter().map(parse_issue).collect())
     }
 
     async fn create_pull_request(&self, req: CreatePullRequest) -> Result<PlatformPullRequest> {
@@ -214,10 +259,8 @@ impl CodePlatformProvider for GiteeProvider {
     }
 
     async fn list_open_pull_requests(&self) -> Result<Vec<PlatformPullRequest>> {
-        let v = self.send(self.get("/pulls", &OPEN_LIST_QUERY)).await?;
-        Ok(v.as_array()
-            .map(|a| a.iter().map(parse_pr_list_item).collect())
-            .unwrap_or_default())
+        let listing = self.list_all("/pulls", &OPEN_LIST_QUERY).await?;
+        Ok(listing.iter().map(parse_pr_list_item).collect())
     }
 
     async fn comment_on_issue(&self, issue_number: u64, body: String) -> Result<()> {
@@ -255,38 +298,18 @@ impl CodePlatformProvider for GiteeProvider {
 
     async fn list_issue_comments(&self, issue_number: u64) -> Result<Vec<PlatformComment>> {
         let number = self.issue_string_number(issue_number).await?;
-        let v = self
-            .send(self.get(&format!("/issues/{number}/comments"), &[PER_PAGE]))
+        let listing = self
+            .list_all(&format!("/issues/{number}/comments"), &[])
             .await?;
-        Ok(v.as_array()
-            .map(|a| {
-                a.iter()
-                    .map(|c| PlatformComment {
-                        author: c["user"]["login"].as_str().unwrap_or_default().to_string(),
-                        body: c["body"].as_str().unwrap_or_default().to_string(),
-                        created_at: parse_time(&c["created_at"]),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default())
+        Ok(listing.iter().map(parse_comment).collect())
     }
 
     async fn list_pull_comments(&self, pr_number: u64) -> Result<Vec<PlatformComment>> {
         // Gitee PR 评论端点与 issue 不同（PR 用数值 number，直接进路径）。
-        let v = self
-            .send(self.get(&format!("/pulls/{pr_number}/comments"), &[PER_PAGE]))
+        let listing = self
+            .list_all(&format!("/pulls/{pr_number}/comments"), &[])
             .await?;
-        Ok(v.as_array()
-            .map(|a| {
-                a.iter()
-                    .map(|c| PlatformComment {
-                        author: c["user"]["login"].as_str().unwrap_or_default().to_string(),
-                        body: c["body"].as_str().unwrap_or_default().to_string(),
-                        created_at: parse_time(&c["created_at"]),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default())
+        Ok(listing.iter().map(parse_comment).collect())
     }
 
     async fn comment_on_pull(&self, pr_number: u64, body: String) -> Result<()> {
@@ -420,6 +443,7 @@ fn parse_labels(v: &serde_json::Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn unused_http() -> std::sync::Arc<dyn cog_core::HttpClient> {
         std::sync::Arc::new(crate::provider::UnusedHttpClient)
@@ -559,5 +583,138 @@ mod tests {
         let detail = p.get_pull_request(7).await.expect("空正文不是坏读数");
         assert_eq!(detail.number, 7, "响应里没有 number 时落回请求里的那个");
         assert_eq!(detail.changed_lines, 0);
+    }
+
+    /// 一台按 `page`/`per_page` 分页的假 Gitee：手里有一份名单，问哪页给哪页。
+    ///
+    /// 真接口的规矩就是这个：不点名 `page` 时给第一页，一页最多 `per_page` 条
+    /// （缺省 20，上限 100），超出的部分不问就不给。所以「只问一次」与「问到
+    /// 问完」在这台假服务上拿到的是不同长度的名单——测试量的正是这一步。
+    #[derive(Debug)]
+    struct PagedGitee {
+        items: Vec<serde_json::Value>,
+        asked: Arc<AtomicUsize>,
+    }
+
+    fn paged(items: Vec<serde_json::Value>) -> (GiteeProvider, Arc<AtomicUsize>) {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let provider = GiteeProvider::new(
+            "o/r",
+            None,
+            None,
+            Arc::new(PagedGitee {
+                items,
+                asked: asked.clone(),
+            }),
+        )
+        .unwrap();
+        (provider, asked)
+    }
+
+    fn query_of(url: &str, name: &str) -> Option<String> {
+        let (_, query) = url.split_once('?')?;
+        query.split('&').find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            (k == name).then(|| v.to_string())
+        })
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::HttpClient for PagedGitee {
+        async fn execute(
+            &self,
+            req: cog_core::HttpRequest,
+        ) -> cog_core::SFResult<cog_core::HttpResponse> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            let page: usize = query_of(&req.url, "page")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            let per_page: usize = query_of(&req.url, "per_page")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20);
+            let start = (page.saturating_sub(1)) * per_page;
+            let slice: Vec<serde_json::Value> = if start < self.items.len() {
+                self.items[start..(start + per_page).min(self.items.len())].to_vec()
+            } else {
+                Vec::new()
+            };
+            Ok(cog_core::HttpResponse {
+                status: 200,
+                headers: Default::default(),
+                body: serde_json::to_vec(&slice).unwrap(),
+            })
+        }
+    }
+
+    fn issue_json(id: u64) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "number": format!("I{id}"), "title": format!("t{id}"), "body": "b",
+            "state": "open", "user": {"login": "alice"},
+            "created_at": "2026-08-01T10:00:00+08:00",
+            "updated_at": "2026-08-02T10:00:00+08:00"
+        })
+    }
+
+    /// 还开着的 issue 超过一页时，列出来的必须是全部：只问一次的老读法把
+    /// 第 101 条起与「就这些」读成同一样，而发现循环拿这份名单当开放集。
+    #[tokio::test]
+    async fn a_listing_does_not_stop_at_the_first_page() {
+        let (p, asked) = paged((1..=250).map(issue_json).collect());
+        let issues = p.list_open_issues().await.expect("250 条都答得出来");
+        assert_eq!(issues.len(), 250, "第 101 条起也必须在名单里");
+        assert_eq!(issues.last().map(|i| i.number), Some(250));
+        assert!(
+            asked.load(Ordering::SeqCst) >= 3,
+            "250 条按一页 100 要问三次，实际问了 {}",
+            asked.load(Ordering::SeqCst)
+        );
+    }
+
+    /// 正好装满一页不是「问完了」：得再问一页，拿到不满的一页才收手。
+    /// 「满了就停」的写法在这里少答一次，下一批名单的第一条会被当成名单的结尾。
+    #[tokio::test]
+    async fn a_full_page_is_not_the_end_of_the_list() {
+        let (p, asked) = paged((1..=100).map(issue_json).collect());
+        let issues = p.list_open_issues().await.expect("100 条");
+        assert_eq!(issues.len(), 100);
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            2,
+            "满页之后还要再问一页（空的那页）才敢说没有了"
+        );
+    }
+
+    /// issue 编号翻译要翻到最后一页：第 150 个 id 不在第一页上，只扫一页的
+    /// 写法会说「没有这个 issue」，于是它的评论永远发不出去。
+    #[tokio::test]
+    async fn translating_an_issue_id_reads_past_the_first_page() {
+        let (p, _) = paged((1..=150).map(issue_json).collect());
+        let number = p
+            .issue_string_number(150)
+            .await
+            .expect("第 150 个 id 在第二页上");
+        assert_eq!(number, "I150");
+    }
+
+    /// 2xx 的正文是一句对象（错误信封、代理的一页 HTML）时，这一份名单读不成：
+    /// 老写法 `.as_array()...unwrap_or_default()` 把它读成一份空名单——「一条
+    /// 还开着的 issue 都没有」，与真的没有是两件事。
+    #[tokio::test]
+    async fn an_answer_that_is_not_a_list_is_not_an_empty_list() {
+        let p = GiteeProvider::new(
+            "o/r",
+            None,
+            None,
+            Arc::new(PageByPath {
+                pr: (200, r#"{"message":"rate limited"}"#.into()),
+                files: (200, "[]".into()),
+            }),
+        )
+        .unwrap();
+        let error = p
+            .list_open_issues()
+            .await
+            .expect_err("一句对象不是一份名单");
+        assert!(error.to_string().contains("no array"), "{error}");
     }
 }
