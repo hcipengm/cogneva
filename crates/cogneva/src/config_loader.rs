@@ -993,6 +993,19 @@ mod tests {
             broken.is_empty(),
             "env mappings the config schema cannot hold: {broken:?}"
         );
+        // The absent-leaf branch above must not swallow typos: a leaf the type
+        // does not have is dropped by serde whichever probe is written, so it
+        // stays unholdable even though its parent object is there.
+        for typo in [
+            "dag_executor.archive_after_sec",
+            "dag_executor.no_such_knob",
+            "app.name.length",
+        ] {
+            assert!(
+                !holds_path(&value, typo),
+                "{typo} is not a path the config can hold, but the check accepted it"
+            );
+        }
     }
 
     /// Sections outside the core schema, with the env names their owning crate
