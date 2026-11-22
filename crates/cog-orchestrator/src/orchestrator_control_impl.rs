@@ -241,6 +241,10 @@ impl OrchestratorControl for OrchestratorControlImpl {
         self.dag_executor.get_graph().await
     }
 
+    async fn get_graph_checked(&self) -> SFResult<(Vec<Task>, Vec<(String, String)>)> {
+        self.dag_executor.get_graph_checked().await
+    }
+
     async fn delete_task(&self, task_id: &str) -> SFResult<()> {
         self.dag_executor.delete_task(task_id).await
     }

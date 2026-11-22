@@ -292,6 +292,17 @@ pub trait OrchestratorControl: Send + Sync {
     /// Return the full task graph as (nodes, edges).
     async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>);
 
+    /// The same graph, with a read that failed reported as such.
+    ///
+    /// An empty pair draws exactly like a deployment that has not made a task
+    /// yet, so a store failure folded into it is invisible on the graph view.
+    /// The default folds [`Self::get_graph`], which is honest for an
+    /// orchestrator holding its graph in memory; one backed by a store has to
+    /// override it.
+    async fn get_graph_checked(&self) -> SFResult<(Vec<Task>, Vec<(String, String)>)> {
+        Ok(self.get_graph().await)
+    }
+
     /// Delete a task from the graph.
     async fn delete_task(&self, task_id: &str) -> SFResult<()>;
 
@@ -494,6 +505,13 @@ pub trait DagExecutor: Send + Sync {
 
     /// Return the full task graph as (nodes, edges).
     async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>);
+
+    /// The same graph, with a read that failed reported as such. The reason is
+    /// [`OrchestratorControl::get_graph_checked`]'s: an empty node and edge set
+    /// draws like a graph nobody has written to yet.
+    async fn get_graph_checked(&self) -> SFResult<(Vec<Task>, Vec<(String, String)>)> {
+        Ok(self.get_graph().await)
+    }
 
     // ─── Bulk / utility ──────────────────────────────────────────────────
 

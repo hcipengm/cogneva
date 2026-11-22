@@ -4237,14 +4237,28 @@ impl DagExecutor {
     }
 
     pub async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>) {
-        let tasks = self.all_tasks_unified().await;
+        self.graph_checked().await.unwrap_or_default()
+    }
+
+    /// 同一张图，但保留读失败。
+    ///
+    /// 图读接口交回的是一对空集合时，画出来正是一张干净的空图：没有节点、没有
+    /// 边，与一个「一条任务都还没有」的部署同形。库读不出来时这一读要带着错误
+    /// 收口，读的人才有东西可以报。
+    pub async fn graph_checked(&self) -> SFResult<(Vec<Task>, Vec<(String, String)>)> {
+        let tasks = self.all_tasks_checked().await?;
+        Ok(Self::graph_from_tasks(&tasks))
+    }
+
+    /// 由行推出边：`blocked_by` 的每一项都是一条 `dep -> task` 的边。
+    fn graph_from_tasks(tasks: &[Task]) -> (Vec<Task>, Vec<(String, String)>) {
         let mut edges = Vec::new();
-        for t in &tasks {
+        for t in tasks {
             for dep_id in &t.blocked_by {
                 edges.push((dep_id.clone(), t.id.clone()));
             }
         }
-        (tasks, edges)
+        (tasks.to_vec(), edges)
     }
 
     pub async fn delete_task(&self, task_id: &str) -> SFResult<()> {
@@ -4740,6 +4754,10 @@ impl cog_core::DagExecutor for DagExecutor {
 
     async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>) {
         self.get_graph().await
+    }
+
+    async fn get_graph_checked(&self) -> SFResult<(Vec<Task>, Vec<(String, String)>)> {
+        self.graph_checked().await
     }
 
     async fn check_timeouts(&self) -> Vec<(String, bool, Vec<String>, bool)> {
@@ -7739,6 +7757,56 @@ mod tests {
         assert!(
             dag.get_ready_tasks().await.is_empty(),
             "旧的这一读仍然按折叠语义交回空集：改的是新读，不是它"
+        );
+    }
+
+    /// 图读不出来，不等于「图上什么都没有」。
+    ///
+    /// 图这一读交回的是一对集合，画出来时零节点零边与一个刚建好的部署同形：
+    /// 界面上一片空白，读起来正是一句「还没有任务」。旧读把库故障折成它，于是
+    /// 一次读失败以最干净的那个形状出现。判据落在 `is_err` 与错误原文上，空图
+    /// 本身仍是合法答案。
+    #[tokio::test]
+    async fn a_graph_read_that_cannot_be_read_is_not_an_empty_graph() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag = DagExecutor::new("ws-graph-read".into()).with_state_backend(backend.clone());
+        let mut row = Task::new("t-node", TaskType::DagNode, serde_json::json!({}));
+        row.blocked_by = vec!["t-upstream".into()];
+        backend.tasks.lock().await.push(row);
+
+        let (nodes, edges) = dag.graph_checked().await.expect("读得出来时照常交回图");
+        assert_eq!(nodes.len(), 1, "库里那一条本来就是一个节点");
+        assert_eq!(
+            edges,
+            vec![("t-upstream".to_string(), "t-node".to_string())],
+            "每条 blocked_by 都是一条 dep -> task 的边"
+        );
+
+        backend
+            .all_read_fails
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let failure = dag
+            .graph_checked()
+            .await
+            .expect_err("读不出来时带检查的这一读必须保留失败，不能交回一张空图");
+        assert!(
+            failure.to_string().contains("store unavailable"),
+            "错误要带着库那一边的原话: {failure}"
+        );
+        // 网关拿到的就是这个形状：默认实现会把失败折成零节点零边。
+        let as_executor: &dyn cog_core::DagExecutor = &dag;
+        let through_trait = as_executor
+            .get_graph_checked()
+            .await
+            .expect_err("走 trait 对象的那一条必须保留失败，不能被默认实现折成空图");
+        assert!(
+            through_trait.to_string().contains("store unavailable"),
+            "trait 那一条交回的也要是库的错误: {through_trait}"
+        );
+        let (folded_nodes, folded_edges) = dag.get_graph().await;
+        assert!(
+            folded_nodes.is_empty() && folded_edges.is_empty(),
+            "旧的这一读仍然按折叠语义交回空图：改的是新读，不是它"
         );
     }
 

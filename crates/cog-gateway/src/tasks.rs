@@ -553,6 +553,22 @@ fn ready_ids_from(reading: cog_core::SFResult<Vec<Task>>) -> Result<HashSet<Stri
     Ok(tasks.into_iter().map(|task| task.id).collect())
 }
 
+/// The graph a read carries, with a failed read refusing instead of answering
+/// an empty graph.
+///
+/// No nodes and no edges draws exactly like a deployment that has not made a
+/// task yet: the view is blank either way, so a store failure folded here is a
+/// graph view that says "nothing exists" about a graph it never read. Absence
+/// of the answer is a 503, the same way every other unreadable read on this
+/// surface answers.
+fn graph_from_reading(
+    reading: cog_core::SFResult<(Vec<Task>, Vec<(String, String)>)>,
+) -> Result<(Vec<Task>, Vec<(String, String)>), ApiError> {
+    reading.map_err(|e| {
+        ApiError::service_unavailable(format!("the task graph could not be read: {e}"))
+    })
+}
+
 /// Whether a reader holding `claims` may see `task`.
 ///
 /// An empty scope is the same convention the submission side already uses (a
@@ -1597,7 +1613,7 @@ pub async fn get_task_graph_handler(
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
     let filter = status_filter(&query)?;
     let ready = ready_ids(&state, filter).await?;
-    let (tasks, edges) = state.orchestrator.get_graph().await;
+    let (tasks, edges) = graph_from_reading(state.orchestrator.get_graph_checked().await)?;
     let kept: Vec<Task> = tasks
         .into_iter()
         .filter(|t| {
@@ -2353,6 +2369,44 @@ mod tests {
             HashSet::from(["t-ready".to_string()]),
             "交回的必须是队列里的 id 本身"
         );
+    }
+
+    /// 图画不出来，不是「图上什么都没有」。
+    ///
+    /// 图读接口交回的是一对集合，零节点零边在视图上正是一张干净的空图——
+    /// 与一个刚建好的部署同形。读失败被折进去时，任务图会把「读不动」画成
+    /// 「还没有任务」。读不出来要拒绝，读得出来时节点与边原样交回。
+    #[test]
+    fn an_unreadable_graph_read_is_not_an_empty_task_graph() {
+        let unreadable: cog_core::SFResult<(Vec<Task>, Vec<(String, String)>)> = Err(
+            cog_core::SFError::Database("connection reset while reading the graph".into()),
+        );
+        let refusal =
+            graph_from_reading(unreadable).expect_err("读不出来时要交回拒绝，不能画成一张空图");
+        assert!(
+            refusal.message.contains("connection reset"),
+            "拒绝的理由要带原始错误，让人看得出是读失败: {}",
+            refusal.message
+        );
+        assert_eq!(
+            refusal.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "图读不出来是「这个部署现在回答不了」，不是一场 200"
+        );
+
+        let (nodes, edges) =
+            graph_from_reading(Ok((Vec::new(), Vec::new()))).expect("空图是一份读得出来的答案");
+        assert!(
+            nodes.is_empty() && edges.is_empty(),
+            "空图原样交回，不编造任何节点或边"
+        );
+
+        let row = task("t-node", cog_core::TaskStatus::Scheduled, "t", 0);
+        let edge = ("t-upstream".to_string(), "t-node".to_string());
+        let (nodes, edges) =
+            graph_from_reading(Ok((vec![row], vec![edge.clone()]))).expect("读得出来时原样交回");
+        assert_eq!(nodes.len(), 1, "节点是读回来的那一行");
+        assert_eq!(edges, vec![edge], "边是读回来的那一条");
     }
 
     /// 状态词必须与读面印出来的那个词逐字一致：`TaskFilter` 用 `as_str` 印行，
