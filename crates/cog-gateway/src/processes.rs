@@ -7,6 +7,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::error::ApiError;
 use crate::GatewayState;
 
 #[derive(Debug, Serialize)]
@@ -107,8 +108,11 @@ pub struct ProcessOverview {
 
 pub async fn process_overview_handler(
     State(state): State<Arc<GatewayState>>,
-) -> Json<ProcessOverview> {
-    let tasks = state.orchestrator.get_all_tasks().await;
+) -> Result<Json<ProcessOverview>, ApiError> {
+    let tasks = crate::tasks::task_rows_from_reading(
+        state.orchestrator.get_all_tasks_checked().await,
+        "process overview",
+    )?;
     let task_status: HashMap<&str, &cog_core::TaskStatus> =
         tasks.iter().map(|t| (t.id.as_str(), &t.status)).collect();
     // 原始行按 id 索引：`ProcessTask` 是给线上看的投影，丢掉了 `result`，
@@ -282,14 +286,14 @@ pub async fn process_overview_handler(
 
     let dlq_len = state.orchestrator.dlq_len().await.unwrap_or(0);
 
-    Json(ProcessOverview {
+    Ok(Json(ProcessOverview {
         timestamp: Utc::now(),
         goals: goal_groups,
         crews,
         agents,
         health,
         dlq_len,
-    })
+    }))
 }
 
 #[cfg(test)]

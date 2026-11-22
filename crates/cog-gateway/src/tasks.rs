@@ -556,12 +556,13 @@ fn ready_ids_from(reading: cog_core::SFResult<Vec<Task>>) -> Result<HashSet<Stri
 /// The rows a task read carries, with a failed read refusing instead of
 /// answering an empty list.
 ///
-/// The task list, the summary above it and the purge preview all count rows;
-/// folding a store failure into an empty set makes each of them report the
-/// cleanest possible number about a graph nobody read -- "0 tasks", "0
-/// ready", "nothing to purge". Absence of the answer is a 503; an empty row
-/// set that was actually read stays a 200 with zeros.
-fn task_rows_from_reading(
+/// The task list, the summary above it, the purge preview and the process
+/// overview all count rows; folding a store failure into an empty set makes
+/// each of them report the cleanest possible number about a graph nobody read
+/// -- "0 tasks", "0 ready", "nothing to purge", an empty flow. Absence of the
+/// answer is a 503; an empty row set that was actually read stays a 200 with
+/// zeros.
+pub(crate) fn task_rows_from_reading(
     reading: cog_core::SFResult<Vec<Task>>,
     what: &str,
 ) -> Result<Vec<Task>, ApiError> {
@@ -1333,7 +1334,10 @@ pub async fn get_ready_tasks_handler(
     claims: Option<axum::Extension<cog_core::Claims>>,
 ) -> Result<Json<Vec<TaskView>>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
-    let tasks = state.orchestrator.get_ready_tasks().await;
+    let tasks = task_rows_from_reading(
+        state.orchestrator.get_ready_tasks_checked().await,
+        "ready queue",
+    )?;
     let views: Vec<TaskView> = tasks
         .into_iter()
         .filter(|t| visible_to_claims(claims, t))

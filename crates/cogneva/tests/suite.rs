@@ -380,6 +380,8 @@ mod gateway_answers_a_waited_prompt;
 mod gateway_refuses_a_caller_named_reply_stream;
 #[path = "governance_routes.rs"]
 mod governance_routes;
+#[path = "graph_readings_keep_the_failure_test.rs"]
+mod graph_readings_keep_the_failure_test;
 #[path = "host_paths_are_not_baked_in_test.rs"]
 mod host_paths_are_not_baked_in_test;
 #[path = "identity_is_written_once_test.rs"]

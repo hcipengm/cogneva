@@ -1,0 +1,142 @@
+//! principle: feedback_a_reading_folded_into_an_empty_value_answers_for_a_read_it_never_made
+//! Gate: 每个按任务图作答的页面都走带报错的那条读，读失败留成 503 而不是空页。
+//!
+//! 这一族病灶同一个形状：处理函数的读口是折叠过的那条（`get_all_tasks()` 之类，
+//! 失败时 `unwrap_or_default()`），于是库坏掉的时候，工作台画出一页零、总览画
+//! 出一块空流程、依赖列表画成「这个任务没有依赖」。这些画面与一个「真的什么都
+//! 没有」的部署逐字同形，读的人无从分辨，而分辨正是这一页存在的理由。
+//!
+//! 修法在上游：读口旁挂一条带报错的那条（`get_all_tasks_checked`），处理函数
+//! 把 `Err` 映射成 503。行为那一半在 `cog_gateway::tasks::tests` 与
+//! `cog_gateway::progress::tests` 里各自钉着；这里钉的是**接线**——哪几个处理
+//! 函数、走的是哪一条读。整个处理函数要一个完整的 `GatewayState` 才跑得起来，
+//! 所以只能在源码这一面钉，而引脚落在函数体上而不是整个文件：同一个文件里只要
+//! 还有一处走对了，文件级的正例就会替走错的那一处作证。
+//!
+//! 「产出面在哪里」由 `common::rust_production` 算，不在这里再切一次。
+
+use crate::common::routes::read_repo;
+use crate::common::rust_production::production_text;
+
+const TASKS: &str = "crates/cog-gateway/src/tasks.rs";
+const PROGRESS: &str = "crates/cog-gateway/src/progress.rs";
+const PROCESSES: &str = "crates/cog-gateway/src/processes.rs";
+
+/// 折叠过的那几条读。某一段正文里出现它们，就是那一面在替没读到的图作证。
+const FOLDED: &[&str] = &[
+    "get_all_tasks(",
+    "get_ready_tasks(",
+    "get_graph(",
+    "get_dependents(",
+    "get_dependencies(",
+];
+
+/// (文件, 函数锚点, 它该走的那条读, 折叠之后那一面会说什么)。
+const SURFACES: &[(&str, &str, &str, &str)] = &[
+    (
+        TASKS,
+        "pub async fn list_tasks_handler",
+        "get_all_tasks_checked",
+        "工作台画出一页零条任务",
+    ),
+    (
+        TASKS,
+        "pub async fn get_ready_tasks_handler",
+        "get_ready_tasks_checked",
+        "待办队列答成「没有可派的话」",
+    ),
+    (
+        TASKS,
+        "pub async fn task_summary_handler",
+        "get_all_tasks_checked",
+        "汇总把每一格都读成 0",
+    ),
+    (
+        TASKS,
+        "pub async fn purge_tasks_handler",
+        "get_all_tasks_checked",
+        "清理按一张空名单一样删不掉任何东西，还答成功",
+    ),
+    (
+        TASKS,
+        "pub async fn update_task_handler",
+        "get_all_tasks_checked",
+        "改一行答成「这行不存在」",
+    ),
+    (
+        TASKS,
+        "pub async fn save_task_plan_handler",
+        "get_all_tasks_checked",
+        "存计划答成「这行不存在」",
+    ),
+    (
+        TASKS,
+        "pub async fn move_task_handler",
+        "get_all_tasks_checked",
+        "挪一行答成「这行不存在」",
+    ),
+    (
+        TASKS,
+        "pub async fn get_task_dependents_handler",
+        "get_dependents_checked",
+        "依赖答成「这个任务谁也不等它」",
+    ),
+    (
+        TASKS,
+        "pub async fn get_task_dependencies_handler",
+        "get_dependencies_checked",
+        "前置答成「这个任务没有前置」",
+    ),
+    (
+        TASKS,
+        "pub async fn get_task_graph_handler",
+        "get_graph_checked",
+        "任务图画成一张空图",
+    ),
+    (
+        PROGRESS,
+        "async fn merged_from",
+        "get_all_tasks_checked",
+        "进度页画成一块空板",
+    ),
+    (
+        PROCESSES,
+        "pub async fn process_overview_handler",
+        "get_all_tasks_checked",
+        "流程总览画成「还没有派过活」",
+    ),
+];
+
+#[test]
+fn every_page_that_draws_the_graph_keeps_the_failure() {
+    let mut productions: std::collections::HashMap<&str, String> = Default::default();
+    for file in [TASKS, PROGRESS, PROCESSES] {
+        productions.insert(file, production_text(&read_repo(file)));
+    }
+    for (file, anchor, checked, folded_page) in SURFACES {
+        let production = productions
+            .get(file)
+            .unwrap_or_else(|| panic!("{file} 没有读进来"));
+        let body = body_after(production, anchor);
+        assert!(
+            body.contains(checked),
+            "{file} 的 {anchor} 没有走 {checked}：读失败会{folded_page}"
+        );
+        for folded in FOLDED {
+            assert!(
+                !body.contains(folded),
+                "{file} 的 {anchor} 换回了折叠的那条读（{folded}）：读失败会{folded_page}，\
+                 与真的什么都没有逐字同形"
+            );
+        }
+    }
+}
+
+/// 锚点之后到第一个顶格收尾的花括号为止——这个仓里这些函数都在顶格收尾。
+fn body_after<'a>(production: &'a str, anchor: &str) -> &'a str {
+    let rest = production
+        .split_once(anchor)
+        .unwrap_or_else(|| panic!("{anchor} 不在了：这一面对应的引脚要跟着改"))
+        .1;
+    rest.split("\n}\n").next().unwrap_or(rest)
+}
