@@ -17,38 +17,10 @@
 //! 判据是树判据，不是运行读数：`cogneva_event` 的写语句只出现在那一个 store 里，且
 //! 没有任何地方用 JetStream 发布这一类事件。
 
-use std::path::{Path, PathBuf};
-
 // 仓库根只有一份算法（`common::routes::repo_root()`）：各写一遍时，根一漂读数就
 // 变成零，与「没有题目」同形。
 use crate::common::routes::repo_root;
-
-fn production_files(root: &Path) -> Vec<(PathBuf, String)> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.join("crates")];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if path.file_name().and_then(|n| n.to_str()) != Some("tests") {
-                    stack.push(path);
-                }
-                continue;
-            }
-            if path.extension().and_then(|e| e.to_str()) == Some("rs")
-                && path.components().any(|c| c.as_os_str() == "src")
-            {
-                if let Ok(text) = std::fs::read_to_string(&path) {
-                    out.push((path, text));
-                }
-            }
-        }
-    }
-    out
-}
+use crate::common::rust_production::production_texts;
 
 /// 事件流的写入口：每一处 `INSERT INTO cogneva_event` 都必须是**登记在案的写者**，
 /// 而且必须落在 store 层（`crates/cog-storage/src/postgres/`）。
@@ -95,7 +67,7 @@ const WRITERS: &[(&str, &str)] = &[
 fn every_insert_site_is_a_registered_writer() {
     let root = repo_root();
     let mut inserts: Vec<String> = Vec::new();
-    for (path, text) in production_files(&root) {
+    for (path, text) in production_texts(&root) {
         let upper = text.to_uppercase();
         if upper.contains("INSERT INTO COGNEVA_EVENT") {
             inserts.push(
@@ -160,7 +132,7 @@ fn mentions_the_stream(text: &str) -> bool {
 fn no_bus_publishes_the_event_stream() {
     let root = repo_root();
     let mut publishers: Vec<String> = Vec::new();
-    for (path, text) in production_files(&root) {
+    for (path, text) in production_texts(&root) {
         if !text.contains("jetstream") && !text.contains("JetStream") {
             continue;
         }

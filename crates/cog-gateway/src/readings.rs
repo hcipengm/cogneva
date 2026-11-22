@@ -1336,8 +1336,70 @@ pub const DB_VACUUM_BEHIND_TABLES: ReadingSpec = ReadingSpec {
     produced_by: "crates/cog-storage/src/db_surface.rs",
 };
 
-pub const READINGS: [&ReadingSpec; 65] = [
+/// How many rows the event stream took in over the last day, all kinds together.
+///
+/// The per-kind breakdown is the census; this row answers the one question that
+/// has no threshold by itself: is the stream moving at all. A stream that
+/// stopped and a stream nothing writes to look the same on every other row, and
+/// they call for opposite work, so the volume is drawn beside the oldest row's
+/// age rather than judged against a number somebody would have to pick.
+pub const EVENT_STREAM_VOLUME: ReadingSpec = ReadingSpec {
+    id: "event_stream_rows_per_day",
+    title: "事件流每天的写入行数",
+    group: ReadingGroup::Delivery,
+    query: "sum(cogneva_event_stream_rows_per_day) or on() vector(0)",
+    unit: "行/天",
+    warn: None,
+    crit: None,
+    higher_is_worse: false,
+    series: "cogneva_event_stream_rows_per_day",
+    produced_by: "crates/cog-storage/src/event_stream_census.rs",
+};
+
+/// Payloads a reader met that it could not decode, counted at the writer.
+///
+/// The writer refuses a version it does not know, so this stays at zero by a
+/// gate and not by a rule; the row is here because "the gate is stricter now"
+/// and "an older writer is still publishing" both move it, and the second one
+/// is invisible everywhere else.
+pub const EVENT_UNDECODABLE: ReadingSpec = ReadingSpec {
+    id: "event_undecodable_total",
+    title: "读不出来的事件载荷",
+    group: ReadingGroup::Delivery,
+    query: "sum(cogneva_event_undecodable_total) or on() vector(0)",
+    unit: "条",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_event_undecodable_total",
+    produced_by: "crates/cog-storage/src/postgres/change_candidate_store.rs",
+};
+
+/// How many LLM exchange rows the gateway took in over the last day.
+///
+/// The retention loop derives the keep window from this rate; the row is what a
+/// person reads when the window and the volume disagree. The rate is published
+/// only once two readings have been compared, so an absent series means "not
+/// measured yet", not "no growth" — which is why this is a reading and not a
+/// zero.
+pub const LLM_EXCHANGE_RATE: ReadingSpec = ReadingSpec {
+    id: "llm_exchange_rows_per_day",
+    title: "LLM 交换表每天的新增行数",
+    group: ReadingGroup::Delivery,
+    query: "sum(gateway_llm_exchange_rows_per_day) or on() vector(0)",
+    unit: "行/天",
+    warn: None,
+    crit: None,
+    higher_is_worse: false,
+    series: "gateway_llm_exchange_rows_per_day",
+    produced_by: "crates/cog-observability/src/exchange_retention.rs",
+};
+
+pub const READINGS: [&ReadingSpec; 68] = [
     &DISK_FREE,
+    &EVENT_STREAM_VOLUME,
+    &EVENT_UNDECODABLE,
+    &LLM_EXCHANGE_RATE,
     &PG_CONNECTIONS,
     &DB_TIMEOUT_BOUND_SECONDS,
     &DB_VACUUM_BEHIND_TABLES,

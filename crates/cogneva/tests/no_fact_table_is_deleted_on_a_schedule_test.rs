@@ -17,25 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
-fn rust_files(root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                out.push(path);
-            }
-        }
-    }
-    out.sort();
-    out
-}
+use crate::common::rust_production::rust_files_under;
 
 /// 从 `delete_at` 往前找它所在的函数，返回那个函数的函数体（大括号配对到结尾）。
 fn enclosing_body(text: &str, delete_at: usize) -> Option<&str> {
@@ -75,7 +57,7 @@ fn every_fact_delete_sits_beside_the_archive_that_verifies_it() {
     let src = crate_dir.join("crates/cog-storage/src");
 
     let mut offenders = Vec::new();
-    for file in rust_files(&src) {
+    for file in rust_files_under(&src) {
         let text = std::fs::read_to_string(&file).unwrap_or_default();
         // `#[cfg(test)]` 之后的部分不算：那里的 DELETE 是夹具，删的是它自己刚写的行。
         // 产出与夹具的切法只有一份（`common::rust_production`）：在第一个

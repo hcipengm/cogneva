@@ -11,7 +11,7 @@
 //!   1. 树上每一处形如 `INSERT INTO {…}` 的写入，都必须在这张名单里点名（文件 + 行内容）；
 //!   2. 名单里的每一条都必须在树上还找得到——搬走或删掉之后要跟着划掉，不留死指针。
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 // 仓库根只有一份算法（`common::routes::repo_root()`）。
 use crate::common::routes::repo_root;

@@ -13,7 +13,7 @@
 //! 这不是「列名不许出现第二次」那种门：它只问「有没有人在用它」，不限制用几次、怎么用。
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 // 仓库根只有一份算法（`common::routes::repo_root()`）：各写一遍时，根一漂读数就
 // 变成零，与「没有题目」同形。

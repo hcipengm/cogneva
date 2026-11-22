@@ -10,25 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-fn rust_files(root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                out.push(path);
-            }
-        }
-    }
-    out.sort();
-    out
-}
+use crate::common::rust_production::rust_files_under;
 
 /// 允许出现 `kill` 的文件：它们杀的是**对象**，不是「这个进程是不是死了」。
 const DESTRUCTION_SITES: &[&str] = &[
@@ -44,7 +26,7 @@ fn every_kill_is_a_destruction_and_none_of_them_judges_stalling() {
         .to_path_buf();
 
     let mut offenders = Vec::new();
-    for file in rust_files(&root.join("crates")) {
+    for file in rust_files_under(&root.join("crates")) {
         let rel = file
             .strip_prefix(&root)
             .unwrap_or(&file)

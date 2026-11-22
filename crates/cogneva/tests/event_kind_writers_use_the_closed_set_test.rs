@@ -9,7 +9,7 @@
 //!
 //! 只判字面量：拼接出来的 kind 属于上一族（表名/名字拼在语句里），由它自己的登记表管。
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 // 仓库根只有一份算法（`common::routes::repo_root()`）。
 use crate::common::routes::repo_root;

@@ -169,6 +169,50 @@ pub fn sources_of_src_and_tests(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// `crates/` 下带 `src` 段的每一份 `.rs` 连同正文，`tests/` 目录整棵跳过。
+///
+/// 要正文而不是只要路径的那一族用它（「树里还有没有第二个写入口」这类）。人口与
+/// [`production_sources`] 差在 `build.rs`：那一份收构建脚本，这一份只收 `src` 段下的，
+/// 因为问的是「产物里会不会跑这段代码」，而构建脚本不进产物。
+pub fn production_texts(root: &Path) -> Vec<(PathBuf, String)> {
+    let mut paths = Vec::new();
+    let mut stack = vec![root.join("crates")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().and_then(|n| n.to_str()) != Some("tests") {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) == Some("rs")
+                && path.components().any(|c| c.as_os_str() == "src")
+            {
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                paths.push((path, text));
+            }
+        }
+    }
+    paths.sort();
+    paths
+}
+
+/// 某个目录下每一个 `.rs`，递归、排序；人口就是调用点给的那个目录。
+///
+/// 与 [`crate_files_of`] 的差在起点：那一份从仓库根出发去找 `crates/`，这一份给的是
+/// 「只看这一棵子树」的判据用（例如「这张表的 DELETE 只写在一个 crate 里」）。
+pub fn rust_files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    walk_files(dir, &["rs"], &["target", ".git"], &mut out);
+    out.sort();
+    out
+}
+
 /// 一个文件在树里的名字：repo 相对、`/` 分隔。
 ///
 /// 口径只有这一份。两套写法（`./a/b.rs` 与 `a/b.rs`）在读者眼里是同一个文件，在

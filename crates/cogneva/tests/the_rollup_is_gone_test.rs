@@ -15,26 +15,8 @@
 use cog_core::{LlmCall, LlmCallEvents};
 use cog_observability::usage_store::{LlmUsageRecord, LlmUsageStore};
 use cog_storage::LlmCallEventStore;
-use sqlx::PgPool;
 
 use cog_test_support::{database_url, drop_schema, own_schema, schema_pool};
-
-async fn event_stream(pool: &PgPool) {
-    let dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cog-storage/migrations/postgres");
-    for file in [
-        "117_event_stream.up.sql",
-        "119_event_payload_is_json.up.sql",
-        // 读者按生成列取 token 与花费；没有这一条迁移，流上那几个列名根本不存在。
-        "124_event_payload_query_columns.up.sql",
-    ] {
-        let sql = std::fs::read_to_string(dir.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
-        sqlx::raw_sql(&sql)
-            .execute(pool)
-            .await
-            .unwrap_or_else(|e| panic!("apply {file}: {e}"));
-    }
-}
 
 fn row(actor: &str, input: u64, output: u64) -> LlmUsageRecord {
     LlmUsageRecord {
@@ -97,7 +79,7 @@ async fn the_row_and_the_event_carry_the_same_numbers() {
     let url = database_url();
     let schema = own_schema(&url, "rollup_gone").await;
     let pool = schema_pool(&url, &schema).await;
-    event_stream(&pool).await;
+    cog_test_support::event_stream(&pool).await;
 
     let usage = LlmUsageStore::from_pool(pool.clone());
     usage

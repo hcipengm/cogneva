@@ -15,6 +15,7 @@ use sqlx::Connection as _;
 
 mod backends;
 mod change_candidates;
+mod event_stream;
 mod literals;
 mod message;
 mod metrics;
@@ -24,6 +25,7 @@ mod task_ledger;
 
 pub use backends::{MemoryObjectBackend, MemoryVectorBackend};
 pub use change_candidates::MemoryCandidateStore;
+pub use event_stream::event_stream;
 pub use literals::{literal_values, literals_in, standalone_numbers, Literal};
 pub use message::MemoryMessageBackend;
 pub use metrics::MemoryMetricsBackend;

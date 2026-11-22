@@ -14,38 +14,10 @@
 //! 唯一的例外写在行上：测试自己的等待（`// wall: test`）。用例里的等待是夹具的一部分，
 //! 不是这个系统的界——把它也钉成常量，只会让一条用例读起来像产品代码。
 
-use std::path::{Path, PathBuf};
-
 // 仓库根只有一份算法（`common::routes::repo_root()`）：各写一遍时，根一漂读数就
 // 变成零，与「没有题目」同形。
 use crate::common::routes::repo_root;
-
-fn production_files(root: &Path) -> Vec<(PathBuf, String)> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.join("crates")];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if path.file_name().and_then(|n| n.to_str()) != Some("tests") {
-                    stack.push(path);
-                }
-                continue;
-            }
-            if path.extension().and_then(|e| e.to_str()) == Some("rs")
-                && path.components().any(|c| c.as_os_str() == "src")
-            {
-                if let Ok(text) = std::fs::read_to_string(&path) {
-                    out.push((path, text));
-                }
-            }
-        }
-    }
-    out
-}
+use crate::common::rust_production::production_texts;
 
 /// `.timeout(` 后面紧跟一个写死的数，无论有没有 `Duration::from_*` 包一层。
 fn a_number_written_after_timeout(line: &str) -> bool {
@@ -92,7 +64,7 @@ fn no_timeout_passes_a_written_number() {
     let root = repo_root();
     let mut offenders: Vec<String> = Vec::new();
     let mut seen = 0usize;
-    for (path, text) in production_files(&root) {
+    for (path, text) in production_texts(&root) {
         for (index, line) in text.lines().enumerate() {
             if !line.contains(".timeout(") {
                 continue;

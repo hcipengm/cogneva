@@ -8,26 +8,8 @@
 use cog_core::{LlmCall, LlmCallEvents};
 use cog_observability::usage_store::LlmUsageStore;
 use cog_storage::LlmCallEventStore;
-use sqlx::PgPool;
 
 use cog_test_support::{database_url, drop_schema, own_schema, schema_pool};
-
-async fn event_stream(pool: &PgPool) {
-    let dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cog-storage/migrations/postgres");
-    for file in [
-        "117_event_stream.up.sql",
-        "119_event_payload_is_json.up.sql",
-        // 流上的读者按生成列取 token 与花费；缺这一条，列名根本不存在。
-        "124_event_payload_query_columns.up.sql",
-    ] {
-        let sql = std::fs::read_to_string(dir.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
-        sqlx::raw_sql(&sql)
-            .execute(pool)
-            .await
-            .unwrap_or_else(|e| panic!("apply {file}: {e}"));
-    }
-}
 
 async fn call(events: &LlmCallEventStore, id: &str, batch: &str, input: u64, output: u64) {
     // 走**写入口**而不是手写一条 INSERT：批号要落在信封那一列上，手写语句最容易
@@ -65,7 +47,7 @@ async fn the_cost_of_the_batch_is_found_by_its_batch_id() {
     let url = database_url();
     let schema = own_schema(&url, "batch_cost").await;
     let pool = schema_pool(&url, &schema).await;
-    event_stream(&pool).await;
+    cog_test_support::event_stream(&pool).await;
 
     let events = LlmCallEventStore::new(pool.clone(), "batch-cost-writer");
     call(&events, "B1", "batch-1", 10, 20).await;
