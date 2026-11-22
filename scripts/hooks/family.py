@@ -107,17 +107,21 @@ def show(root: pathlib.Path, path: str) -> str:
 
 
 def cap_markers(text: str) -> int:
-    return len(re.findall(r"//\s*cap:\s*(?:bound|fixed)", text))
+    # 行里记的是**答 `bound` 的那些**（`BOUND_AT_CENSUS` 自己的文档就是这么写的），
+    # `fixed` 不是这笔债：把它也数进来，一个文件只要有一处 `fixed` 就永远对不上自己的
+    # 行（2026-11-22 实测：workdir.rs 10 bound + 2 fixed，行是 10，门红）。
+    return len(re.findall(r"//\s*cap:\s*bound", text))
 
 
 def capacity_owed(root: pathlib.Path, changed: set[str]) -> list[tuple[str, str]]:
+    """比行**多**是红；比行少是还了债（测试那边印 STALE 让人把行降下来），不是红。"""
     rows = {
         m.group(1): int(m.group(2))
         for m in re.finditer(r'\(\s*"(crates/[^"]+\.rs)"\s*,\s*(\d+)\s*\)', show(root, REGISTRY))
     }
     owed: list[tuple[str, str]] = []
     for path in sorted(changed):
-        if path in rows and cap_markers(show(root, path)) != rows[path]:
+        if path in rows and cap_markers(show(root, path)) > rows[path]:
             owed.append((REGISTRY, f"the row for {path} no longer counts its bounds"))
     return owed
 
