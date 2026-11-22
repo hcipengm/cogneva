@@ -226,6 +226,11 @@ impl CodePlatformProvider for GitHubProvider {
         crate::GITHUB_PLATFORM
     }
 
+    /// 列表都经 `all_pages` 走到没有下一页为止，交出去的名单就是全部。
+    fn lists_every_page(&self) -> bool {
+        true
+    }
+
     async fn list_open_issues(&self) -> Result<Vec<PlatformIssue>> {
         let page = self
             .client
@@ -237,8 +242,17 @@ impl CodePlatformProvider for GitHubProvider {
             .await
             .map_err(|e| CogGitHubError::Provider(e.to_string()))?;
 
-        Ok(page
-            .items
+        // One page is a page, not the list: a repository with more than a
+        // hundred open issues had the rest handed to nobody, and the discovery
+        // loop takes this list as the open set. `all_pages` follows the `Link`
+        // header until GitHub stops saying there is a next page.
+        let items = self
+            .client
+            .all_pages(page)
+            .await
+            .map_err(|e| CogGitHubError::Provider(e.to_string()))?;
+
+        Ok(items
             .into_iter()
             // GitHub's issues API mixes pull requests into the list; PRs are
             // served by the dedicated PR path, processing them here too would
@@ -313,8 +327,13 @@ impl CodePlatformProvider for GitHubProvider {
             .await
             .map_err(|e| CogGitHubError::Provider(e.to_string()))?;
 
-        Ok(page
-            .items
+        let items = self
+            .client
+            .all_pages(page)
+            .await
+            .map_err(|e| CogGitHubError::Provider(e.to_string()))?;
+
+        Ok(items
             .into_iter()
             .map(|pr| PlatformPullRequest {
                 number: pr.number,
@@ -368,8 +387,16 @@ impl CodePlatformProvider for GitHubProvider {
             .await
             .map_err(|e| CogGitHubError::Provider(e.to_string()))?;
 
-        Ok(page
-            .items
+        // A busy thread is longer than one page, and the instruction the loop
+        // acts on is usually the newest comment -- the one a single page of the
+        // oldest hundred leaves out.
+        let items = self
+            .client
+            .all_pages(page)
+            .await
+            .map_err(|e| CogGitHubError::Provider(e.to_string()))?;
+
+        Ok(items
             .into_iter()
             .map(|c| PlatformComment {
                 author: c.user.login,
@@ -855,6 +882,169 @@ fn log_tail(text: &str, cap: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 一台按 GitHub 的规矩分页的假 API：一页 100 条，后面还有就在 `Link`
+    /// 头里给 `rel="next"`，没有了就不给。
+    ///
+    /// 这正是 `all_pages` 读的那个信号：只问一次的读法拿到的是第一页，而
+    /// 名单看起来和完整的没有区别。
+    async fn serve_issues(total: usize) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = asked.clone();
+        let root = base.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let mut read = 0;
+                loop {
+                    match socket.read(&mut buf[read..]).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => read += n,
+                    }
+                    if buf[..read].windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf[..read]).into_owned();
+                let target = head
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("")
+                    .to_string();
+                counter.fetch_add(1, Ordering::SeqCst);
+                let query = |name: &str| -> Option<usize> {
+                    let (_, q) = target.split_once('?')?;
+                    q.split('&').find_map(|kv| {
+                        let (k, v) = kv.split_once('=')?;
+                        (k == name).then(|| v.parse().ok()).flatten()
+                    })
+                };
+                let page = query("page").unwrap_or(1);
+                let per_page = query("per_page").unwrap_or(20);
+                let start = (page.saturating_sub(1)) * per_page;
+                let end = (start + per_page).min(total);
+                let items: Vec<serde_json::Value> = (start + 1..=end)
+                    .map(|n| github_issue_json(n as u64))
+                    .collect();
+                let body = serde_json::to_string(&items).unwrap();
+                let mut response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
+                    body.len()
+                );
+                if end < total {
+                    response.push_str(&format!(
+                        "Link: <{root}/repos/o/r/issues?state=open&per_page={per_page}&page={}>; rel=\"next\"\r\n",
+                        page + 1
+                    ));
+                }
+                response.push_str("\r\n");
+                response.push_str(&body);
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (base, asked)
+    }
+
+    fn github_issue_json(number: u64) -> serde_json::Value {
+        serde_json::json!({
+            "id": number,
+            "node_id": format!("I{number}"),
+            "url": format!("https://api.github.com/repos/o/r/issues/{number}"),
+            "repository_url": "https://api.github.com/repos/o/r",
+            "labels_url": format!("https://api.github.com/repos/o/r/issues/{number}/labels"),
+            "comments_url": format!("https://api.github.com/repos/o/r/issues/{number}/comments"),
+            "events_url": format!("https://api.github.com/repos/o/r/issues/{number}/events"),
+            "html_url": format!("https://github.com/o/r/issues/{number}"),
+            "number": number,
+            "state": "open",
+            "title": format!("t{number}"),
+            "body": "b",
+            "user": {
+                "login": "alice", "id": 1, "node_id": "u1",
+                "avatar_url": "https://avatars.example.invalid/u/1",
+                "gravatar_id": "",
+                "url": "https://api.github.com/users/alice",
+                "html_url": "https://github.com/alice",
+                "followers_url": "https://api.github.com/users/alice/followers",
+                "following_url": "https://api.github.com/users/alice/following{/other_user}",
+                "gists_url": "https://api.github.com/users/alice/gists{/gist_id}",
+                "starred_url": "https://api.github.com/users/alice/starred{/owner}{/repo}",
+                "subscriptions_url": "https://api.github.com/users/alice/subscriptions",
+                "organizations_url": "https://api.github.com/users/alice/orgs",
+                "repos_url": "https://api.github.com/users/alice/repos",
+                "events_url": "https://api.github.com/users/alice/events{/privacy}",
+                "received_events_url": "https://api.github.com/users/alice/received_events",
+                "type": "User", "site_admin": false
+            },
+            "labels": [],
+            "assignees": [],
+            "author_association": "NONE",
+            "locked": false,
+            "comments": 0,
+            "created_at": "2026-08-01T00:00:00Z",
+            "updated_at": "2026-08-02T00:00:00Z"
+        })
+    }
+
+    fn gateway_provider(base: &str) -> GitHubProvider {
+        // 测试进程不走 main.rs，rustls 无进程级默认 CryptoProvider，
+        // 构建 HTTPS client 会 panic——测试内自行安装（幂等）。
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let account = GitHubAccount::Bot(crate::config::BotAccount {
+            username: "bot".into(),
+            token_env: Some("COG_TEST_DEFINITELY_UNSET_TOKEN".into()),
+            token: None,
+            ..Default::default()
+        });
+        let http: Arc<dyn cog_core::HttpClient> = Arc::new(crate::provider::UnusedHttpClient);
+        GitHubProvider::new(&account, "o/r", "main", Some(base), http).unwrap()
+    }
+
+    /// 开放 issue 超过一页时，列出来的必须是全部：只读第一页的老写法把第
+    /// 101 条起交成「没有」，而发现循环拿这份名单当开放集。
+    #[tokio::test]
+    async fn a_listing_does_not_stop_at_the_first_page() {
+        let (base, asked) = serve_issues(250).await;
+        let provider = gateway_provider(&base);
+        let issues = provider.list_open_issues().await.expect("250 条都答得出来");
+        assert_eq!(issues.len(), 250, "第 101 条起也必须在名单里");
+        assert_eq!(issues.last().map(|i| i.number), Some(250));
+        assert!(
+            asked.load(Ordering::SeqCst) >= 3,
+            "250 条按一页 100 要问三次，实际问了 {}",
+            asked.load(Ordering::SeqCst)
+        );
+    }
+
+    /// 一条长讨论串超过一页时，读到的必须是全部：澄清循环要读的那条指令通常
+    /// 是最新的评论，而只读第一页的写法读到的是最早的那一百条。
+    #[tokio::test]
+    async fn a_thread_longer_than_a_page_is_read_to_its_end() {
+        let (base, asked) = serve_issues(150).await;
+        let provider = gateway_provider(&base);
+        let comments = provider.list_issue_comments(7).await.expect("150 条评论");
+        assert_eq!(comments.len(), 150);
+        assert_eq!(comments.last().map(|c| c.body.as_str()), Some("b"));
+        assert!(asked.load(Ordering::SeqCst) >= 2);
+    }
+
+    /// 反例：装得下一页的名单只问一次，不为了完整性多绕一圈。
+    #[tokio::test]
+    async fn a_listing_that_fits_one_page_asks_once() {
+        let (base, asked) = serve_issues(30).await;
+        let provider = gateway_provider(&base);
+        let issues = provider.list_open_issues().await.expect("30 条");
+        assert_eq!(issues.len(), 30);
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+    }
 
     fn run_summary(run_id: u64, head_sha: &str, conclusion: &str) -> CiRunSummary {
         CiRunSummary {
