@@ -24,6 +24,26 @@ fn agent_key(agent_id: &str) -> String {
     format!("{AGENT_KEY_PREFIX}{agent_id}")
 }
 
+/// 一条注册记录读回来，解不出来时点名是哪一条。
+///
+/// 注册记录与名册行都存在同一个键空间里，读的人拿到一句「expected value at
+/// line 1 column 1」既不知道是谁的，也不知道该清哪条。
+fn decode_registration(agent_id: &str, raw: &str) -> cog_core::SFResult<AgentRegistration> {
+    serde_json::from_str(raw).map_err(|e| {
+        cog_core::SFError::Validation(format!(
+            "registration {agent_id} does not parse as an AgentRegistration: {e}"
+        ))
+    })
+}
+
+fn decode_employee(agent_id: &str, text: &str) -> cog_core::SFResult<EmployeeRecord> {
+    serde_json::from_str(text).map_err(|e| {
+        cog_core::SFError::Validation(format!(
+            "roster row {agent_id} does not parse as an EmployeeRecord: {e}"
+        ))
+    })
+}
+
 const REGISTRY_INDEX_KEY: &str = "orchestrator:agents:index";
 
 /// 名册行住在哪。
@@ -296,8 +316,7 @@ impl AgentRegistry for RedisAgentRegistry {
                 "heartbeat: agent {agent_id} not registered (key expired?)"
             )));
         };
-        let mut reg: AgentRegistration =
-            serde_json::from_str(&raw).map_err(SFError::Serialization)?;
+        let mut reg = decode_registration(agent_id, &raw)?;
         reg.last_heartbeat = Utc::now();
         let payload = serde_json::to_string(&reg).map_err(SFError::Serialization)?;
         // Atomic, for the same reason as `register`: a beat that lands on a
@@ -407,7 +426,7 @@ impl AgentRegistry for RedisAgentRegistry {
             .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
         let mut out = Vec::with_capacity(rows.len());
         for (agent_id, text) in rows {
-            match serde_json::from_str::<EmployeeRecord>(&text) {
+            match decode_employee(&agent_id, &text) {
                 Ok(row) => out.push(row),
                 // 读不出来的行不能悄悄丢掉：名册少一个人与名册上本来没有这个
                 // 人是两件事，而丢掉之后它们在读面上长得一模一样。
@@ -430,17 +449,10 @@ impl AgentRegistry for RedisAgentRegistry {
             .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
         Ok(match text {
             None => None,
-            Some(text) => match serde_json::from_str(&text) {
-                Ok(row) => Some(row),
-                Err(e) => {
-                    tracing::warn!(
-                        agent_id,
-                        error = %e,
-                        "an employee row does not parse; the caller will read this person as not on the roster"
-                    );
-                    None
-                }
-            },
+            // 行在、读不懂：这是「读不到这一行」，不是「名册上没有这个人」。
+            // 折成 `None` 之后，上面两种情形在读面上同形——名册上少一个人与
+            // 这个人从没登记过，调用方只能当成后者往下走。
+            Some(text) => Some(decode_employee(agent_id, &text)?),
         })
     }
 }
@@ -804,5 +816,17 @@ mod tests {
             second.unwrap(),
             "重复注册把后面的号吃掉了"
         );
+    }
+
+    /// 解不出来的行要点名是哪一行；而且「行在、读不懂」不许折成「名册上没有
+    /// 这个人」——两种情形在读面上同形，调用方只能当成后者往下走。
+    #[test]
+    fn a_row_that_will_not_decode_is_named_instead_of_read_as_absent() {
+        let err = decode_employee("employee:9", "{ half")
+            .expect_err("a stored roster row that is not JSON must not decode");
+        assert!(err.to_string().contains("employee:9"), "got: {err}");
+        let err = decode_registration("agent-9", "not json")
+            .expect_err("a stored registration that is not JSON must not decode");
+        assert!(err.to_string().contains("agent-9"), "got: {err}");
     }
 }

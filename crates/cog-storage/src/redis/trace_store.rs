@@ -7,6 +7,25 @@ use super::backend::RedisBackend;
 
 const INDEX_KEY: &str = "trace:index";
 
+/// 一条存进热层的 trace 读回来。
+///
+/// 解不出来时点名是哪一条：列表是逐条读出来的，报一句「expected value at
+/// line 1 column 1」，读的人既不知道哪条坏了，也不知道该删哪条。
+fn decode_trace(trace_id: &str, bytes: &[u8]) -> SFResult<AgentTrace> {
+    serde_json::from_slice(bytes).map_err(|e| {
+        SFError::Validation(format!("trace {trace_id} in the hot tier is not JSON: {e}"))
+    })
+}
+
+/// 同上，索引里那条轻量元数据。
+fn decode_meta(trace_id: &str, bytes: &[u8]) -> SFResult<TraceMeta> {
+    serde_json::from_slice(bytes).map_err(|e| {
+        SFError::Validation(format!(
+            "trace {trace_id} in the hot tier has metadata that is not JSON: {e}"
+        ))
+    })
+}
+
 /// Redis-based trace store for the **hot tier**.
 /// - Sub-millisecond reads/writes
 /// - TTL auto-eviction (default 7 days)
@@ -39,7 +58,7 @@ impl RedisTraceStore {
     /// metadata key has expired but the trace itself has not.
     async fn meta_of(&self, trace_id: &str) -> SFResult<Option<TraceMeta>> {
         match self.backend.get_bytes(&Self::meta_key(trace_id)).await? {
-            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Some(bytes) => Ok(Some(decode_meta(trace_id, &bytes)?)),
             None => Ok(self
                 .load(trace_id)
                 .await?
@@ -102,10 +121,7 @@ impl TraceStore for RedisTraceStore {
             })?;
 
         match data {
-            Some(bytes) => {
-                let trace = serde_json::from_slice(&bytes)?;
-                Ok(Some(trace))
-            }
+            Some(bytes) => Ok(Some(decode_trace(trace_id, &bytes)?)),
             None => Ok(None),
         }
     }
@@ -190,5 +206,52 @@ impl TraceStore for RedisTraceStore {
             }
         }
         Ok(metas)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn trace(id: &str) -> AgentTrace {
+        AgentTrace {
+            trace_id: id.to_string(),
+            session_id: None,
+            task_id: "t-1".to_string(),
+            agent_id: "a-1".to_string(),
+            created_at: Utc::now(),
+            event_count: 0,
+            byte_size: 0,
+            version: "1".to_string(),
+            tier: cog_core::StorageTier::Hot,
+            compression: 0,
+            checksum: String::new(),
+            events: Vec::new(),
+            llm_requests: Vec::new(),
+            llm_responses: Vec::new(),
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// 列表是逐条读出来的。一条坏 trace 报出来时要点名是哪一条，否则读的人
+    /// 只拿到「expected value」，不知道该删哪条、也不知道这条列表为什么短了。
+    #[test]
+    fn a_trace_that_will_not_decode_is_named() {
+        let err = decode_trace("t-broken", b"{ half")
+            .expect_err("a stored value that is not JSON must not decode");
+        assert!(err.to_string().contains("t-broken"), "got: {err}");
+    }
+
+    #[test]
+    fn a_trace_this_store_wrote_decodes_back() {
+        let written = serde_json::to_vec(&trace("t-1")).unwrap();
+        assert_eq!(decode_trace("t-1", &written).unwrap().trace_id, "t-1");
+    }
+
+    #[test]
+    fn metadata_that_will_not_decode_is_named_too() {
+        let err = decode_meta("t-meta", b"[]").expect_err("an array is not a trace's metadata");
+        assert!(err.to_string().contains("t-meta"), "got: {err}");
     }
 }
