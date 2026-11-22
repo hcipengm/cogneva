@@ -1522,9 +1522,9 @@ mod tests {
     /// 而读日志的人不是正在用这棵树干活的智能体。
     #[tokio::test]
     async fn a_command_that_changed_replica_says_what_did_not_come_along() {
-        let (first, _) = serve_counting(2).await;
-        let (second, _) = serve_counting(2).await;
-        let (third, _) = serve_counting(2).await;
+        let (first, _) = serve_counting(8).await;
+        let (second, _) = serve_counting(8).await;
+        let (third, _) = serve_counting(8).await;
         let replicas = ChangingReplicas::new(vec![first.clone(), second.clone()]);
         let executor = discovering(replicas.clone(), std::time::Duration::ZERO);
 
@@ -1597,9 +1597,9 @@ mod tests {
     #[tokio::test]
     async fn the_move_notice_is_the_first_event_of_the_stream() {
         use futures::StreamExt;
-        let (first, _) = serve_counting(2).await;
-        let (second, _) = serve_counting(2).await;
-        let (third, _) = serve_counting(2).await;
+        let (first, _) = serve_counting(8).await;
+        let (second, _) = serve_counting(8).await;
+        let (third, _) = serve_counting(8).await;
         let replicas = ChangingReplicas::new(vec![first, second.clone()]);
         let executor = discovering(replicas.clone(), std::time::Duration::ZERO);
         executor.execute(&for_agent("agent-a")).await.unwrap();
@@ -1622,8 +1622,8 @@ mod tests {
     /// 不吭，车道在一棵没人说过的树上接着写。
     #[tokio::test]
     async fn a_replica_replaced_under_a_single_address_is_still_a_move() {
-        let before = serve_counting(2).await.0;
-        let after = serve_counting(2).await.0;
+        let before = serve_counting(8).await.0;
+        let after = serve_counting(8).await.0;
         let replicas = ChangingReplicas::new(vec![before.clone()]);
         let executor = discovering(replicas.clone(), std::time::Duration::ZERO);
 
@@ -1643,13 +1643,17 @@ mod tests {
         );
     }
 
+    // 假副本的额度给宽：它数的是「接到的执行请求」，而一次连接在负载下可能被
+    // 重试一次。额度恰好等于预期请求数时，一次重试就把监听器关掉，用例于是读到
+    // 「执行器不可达」——那是夹具的额度不够，不是被测行为（2026-11-22 实测：并行
+    // 跑整库时偶发）。额度只限制夹具活多久，断言不看它。
     /// 换到的这副报「树是刚为这次调用切的」，那句话就能说死：先前的改动不在
     /// 这棵树上。执行器报的来处让这句从条件句变成结论。
     #[tokio::test]
     async fn the_move_notice_is_definite_when_the_tree_was_cut_for_this_call() {
-        let first = serve_counting(2).await.0;
-        let second = serve_counting(2).await.0;
-        let third = serve_announcing(2, Some(cog_core::WorktreeOrigin::Created)).await;
+        let first = serve_counting(8).await.0;
+        let second = serve_counting(8).await.0;
+        let third = serve_announcing(8, Some(cog_core::WorktreeOrigin::Created)).await;
         let replicas = ChangingReplicas::new(vec![first, second.clone()]);
         let executor = discovering(replicas.clone(), std::time::Duration::ZERO);
         executor.execute(&for_agent("agent-a")).await.unwrap();
