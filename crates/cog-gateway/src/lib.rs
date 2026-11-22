@@ -4179,7 +4179,20 @@ async fn eval_compare_handler(
 
 async fn eval_list_datasets_handler(State(state): State<Arc<GatewayState>>) -> Response {
     let dir = eval_datasets::datasets_dir(&state.data_dir);
-    let listed = eval_datasets::list_datasets(&dir);
+    let listed = match eval_datasets::list_datasets(&dir) {
+        Ok(listed) => listed,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "eval_datasets_unreadable",
+                    "dir": dir.display().to_string(),
+                    "message": e.to_string(),
+                })),
+            )
+                .into_response()
+        }
+    };
     let resp = cog_core::EvalListDatasetsResponse {
         datasets: listed.datasets,
         dir: dir.display().to_string(),
