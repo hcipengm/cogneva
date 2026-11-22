@@ -410,7 +410,6 @@ data:
         "ready_task_poll_interval_secs": 5,
         "batch_persistence_enabled": false,
         "archive_enabled": true,
-        "archive_after_secs": 172800,
         "_comment_archive_after_secs": "终态行在内存里保留多久才归档到对象存储：172800 秒（两天），与代码里 default_archive_after_secs 一致。它必须长于一次重驱动要等的那段（重启窗口），否则被归档的行读成「没有这件任务」，重驱动永远不会发生。",
         "_comment_ready_task_poll_interval_secs": "空闲时多久问一次「有没有就绪任务」。读侧把 0 夹到 1 秒（`.max(1)`），那等于常态忙轮询；5 秒是「就绪到被取走」的可接受延迟与空转代价之间的那一档。"
       },
@@ -3949,7 +3948,6 @@ data:
         "_comment_revise": "revise=true 是完整循环：判完再让模型把整篇改写一次，再判改写。false 是只判不写：一次调用，把要求逐条判成 met／unmet／undetermined，判 met 的那条必须引正文原话，由代码逐字核对，查不到的按没满足算；分数由代码按「满足条数÷判过条数」算出来，不是模型报的。判据按角色分：计划按计划判（「没有回答任务」不算它的缺陷），判词按判词判，答案按答案判。正文原样交回调用方，未满足的条目进判词，由它自己的重试路径重做。改写约占一次评审的 64%，且它评判的标准与生产者已经拿到的标准是同一份。不写这一键的旧配置仍是 true。",
         "_comment_quality_threshold": "quality_threshold 只在 revise=true 的循环里起作用：那一路把模型自己报的分与它比。revise=false 的一次调用表判不看这个数——通过的条件是「没有一条 unmet，也没有一条自称 met 却引不出正文原话」，分数由代码按表算出来，是给人读的读数，不参与判定。",
         "enabled": true,
-        "max_iterations": 2,
         "quality_threshold": 0.8,
         "revise": false,
         "spec": null,
@@ -3959,13 +3957,10 @@ data:
         "_comment": "PGE actor 输出契约。schemas 按 actor 名（planner/generator/evaluator/moderator/merger）配置 JSON Schema；配置后 schema 会注入 prompt 上下文并对 LLM 原始输出做校验，校验失败仅告警并回退宽松解析，不会中断流水线。默认为空 = 使用内置契约。",
         "_comment_local_repair_max": "局部修复预算：Evaluator 判失败后保持当前 Plan 不变、把 feedback 回传给 Generator 再生成的次数，耗尽才做全局重置（重跑 Planner）。0 = 关闭这条路径，于是每次失败都从新 Plan 重来。写在这里是因为 schemas 一旦配置就很难注意到这条键缺了，而缺了的读法是 0。",
         "schemas": {},
-        "local_repair_max": 2,
         "_comment_local_repair_max_value": "两条是默认值：Evaluator 判失败后先在原 Plan 上回传 feedback 让 Generator 重生成，两次都不过才重跑 Planner。改它要与代码里的 DEFAULT_LOCAL_REPAIR_MAX 一起改，否则部署里设的数与代码缺省不同源。"
       },
       "ralph": {
         "_comment": "Ralph Loop 的预算与停滞窗口。这两条界决定一条不收敛的链在什么位置停下：max_iterations 是单次执行的迭代硬上限，stagnation_window 是最近多少轮没有进展即终止。两条都按次计、不跨执行累计。",
-        "max_iterations": 50,
-        "stagnation_window": 5,
         "_comment_values": "两个默认值：与代码里 RalphSettings::default 一致（50 / 5）。部署里可以调小，但调大的那一侧没有人盯着流——不改代码缺省就别往大改。"
       },
       "agent": {
@@ -4075,8 +4070,6 @@ data:
         "_comment_discovery_enabled": "Whether THIS process takes part in discovery at all. One binary serves several deployments (main app, evolution pod, security gateway, sandbox executor) and each of the first two builds its own plugin table, so a process that takes part contends for the discovery role over the shared database: each participating replica asks the lease on its own cadence, only the holder scans and follows up, and the role moves to another replica on the next ask after a holder that was killed stops renewing its term. Without that arbitration two processes scan the same upstream items and ask the same clarification twice: intent guards are per-pod files, so neither can see the other already acted. The webhook event entry is deliberately not part of the lease — which process receives issue/comment events is a routing decision made where the events are delivered, and the periodic poll is the fallback for what the events do not reach. Deployment sets this false on the evolution pod, which therefore neither polls nor receives events.",
         "discovery_enabled": true,
         "discovery_mode": "both",
-        "poll_interval_secs": 300,
-        "max_issues_per_scan": 50,
         "_comment_cadence": "轮询周期与单次扫描上限：300 秒 / 50 条，与代码里 GitHubIntegrationConfig 的缺省一致。webhook 是主路径，轮询只是它够不到时的兜底，所以周期不必更短；单次上限决定一轮最多跟进多少条，调大要让租约的续期节奏跟着看。",
         "repo": "hcipengm/cogneva",
         "base_branch": "main",
@@ -4123,12 +4116,7 @@ data:
           ],
           "_comment_forbidden_paths": "deploy/ is deliberately absent: deploy changes are judged by the deploy admission gate (render freshness, parity, rollback, dry-run on the applied tree), so forbidding the path here would refuse them before that gate could run. The entries that stay have no executable judge.",
           "revert_on_ci_failure": true,
-          "redrive_on_ci_failure": true,
-          "ci_watch_timeout_secs": 1800,
-          "ci_poll_interval_secs": 60,
-          "max_land_attempts": 3,
-          "redrive_max_rounds_per_cause": 1,
-          "redrive_cause_window_secs": 86400
+          "redrive_on_ci_failure": true
         },
         "human_required_labels": [
           "security",
