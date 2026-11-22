@@ -29,9 +29,6 @@ path = "tests/suite.rs"
 name = "backup_pg"
 path = "tests/backup_pg.rs"
 
-[[test]]
-name = "ignored_test_corpus_contract_test"
-path = "tests/ignored_test_corpus_contract_test.rs"
 
 [[test]]
 name = "memory_decay_plugin_test"

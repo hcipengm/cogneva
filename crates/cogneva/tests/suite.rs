@@ -230,6 +230,8 @@ mod board_wip_limit_wiring_test;
 mod boot_phase_marks_contract_test;
 #[path = "bounds_registry_test.rs"]
 mod bounds_registry_test;
+#[path = "ignored_test_corpus_contract_test.rs"]
+mod ignored_test_corpus_contract_test;
 #[path = "shipped_config_numbers_are_registered_test.rs"]
 mod shipped_config_numbers_are_registered_test;
 #[path = "the_exchange_writer_binds_only_columns_the_store_creates_test.rs"]
