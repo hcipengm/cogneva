@@ -182,12 +182,4 @@ impl AgentRegistry for EtcdAgentRegistry {
         let all = self.list().await?;
         Ok(all.into_iter().filter(|r| r.role == role).collect())
     }
-
-    async fn list_by_capability(&self, capability: &str) -> SFResult<Vec<AgentRegistration>> {
-        let all = self.list().await?;
-        Ok(all
-            .into_iter()
-            .filter(|r| r.capabilities.contains(&capability.to_string()))
-            .collect())
-    }
 }

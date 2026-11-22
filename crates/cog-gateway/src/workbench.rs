@@ -977,7 +977,6 @@ mod tests {
             runs_in: None,
             calls,
             allowed_roles: None,
-            holders: Vec::new(),
         };
         let inventory = crate::capabilities::Inventory {
             sources: vec![

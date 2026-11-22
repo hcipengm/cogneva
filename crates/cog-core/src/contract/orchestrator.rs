@@ -286,8 +286,26 @@ pub trait OrchestratorControl: Send + Sync {
     /// Return direct dependents of a task.
     async fn get_dependents(&self, task_id: &str) -> Option<Vec<Task>>;
 
+    /// The same list, with a read that failed reported as such.
+    ///
+    /// [`Self::get_dependents`] answers `None` for a task nobody depends on and
+    /// for a store that could not be read, and the task detail page draws both
+    /// as an empty list. The default folds the plain read, which is honest for
+    /// an orchestrator holding its graph in memory; one backed by a store has
+    /// to override it.
+    async fn get_dependents_checked(&self, task_id: &str) -> SFResult<Option<Vec<Task>>> {
+        Ok(self.get_dependents(task_id).await)
+    }
+
     /// Return direct dependencies of a task.
     async fn get_dependencies(&self, task_id: &str) -> Option<Vec<Task>>;
+
+    /// The same list, with a read that failed reported as such. The reason is
+    /// [`Self::get_dependents_checked`]'s: a task with no dependencies and a
+    /// task whose rows could not be read look the same on the detail page.
+    async fn get_dependencies_checked(&self, task_id: &str) -> SFResult<Option<Vec<Task>>> {
+        Ok(self.get_dependencies(task_id).await)
+    }
 
     /// Return the full task graph as (nodes, edges).
     async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>);
@@ -511,8 +529,21 @@ pub trait DagExecutor: Send + Sync {
     /// Direct dependents of a task.
     async fn get_dependents(&self, task_id: &str) -> Option<Vec<Task>>;
 
+    /// The same list, with a read that failed reported as such. The reason is
+    /// [`OrchestratorControl::get_dependents_checked`]'s: `None` covers both
+    /// "nobody depends on this" and "the rows could not be read".
+    async fn get_dependents_checked(&self, task_id: &str) -> SFResult<Option<Vec<Task>>> {
+        Ok(self.get_dependents(task_id).await)
+    }
+
     /// Direct dependencies of a task.
     async fn get_dependencies(&self, task_id: &str) -> Option<Vec<Task>>;
+
+    /// The same list, with a read that failed reported as such. The reason is
+    /// [`OrchestratorControl::get_dependencies_checked`]'s.
+    async fn get_dependencies_checked(&self, task_id: &str) -> SFResult<Option<Vec<Task>>> {
+        Ok(self.get_dependencies(task_id).await)
+    }
 
     /// Return the full task graph as (nodes, edges).
     async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>);

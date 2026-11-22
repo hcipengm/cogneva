@@ -296,12 +296,6 @@ mod tests {
         ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
             Ok(Vec::new())
         }
-        async fn list_by_capability(
-            &self,
-            _capability: &str,
-        ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
-            Ok(Vec::new())
-        }
     }
 
     fn lifecycle_service() -> crate::agent_lifecycle::agent_lifecycle_server::AgentLifecycleServer<

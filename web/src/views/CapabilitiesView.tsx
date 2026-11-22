@@ -99,10 +99,6 @@ export function CapabilitiesView() {
         data
           ? `${callable} 项能调${
               declaredOnly > 0 ? ` · ${declaredOnly} 项只有声明` : ''
-            } · ${
-              data.declaring_units === null
-                ? '名册这一拍没读到'
-                : `${data.declaring_units} 个单位自报了能力`
             } · 按 30 秒重读`
           : '这个系统此刻做得到的动作 · 按 30 秒重读'
       }
@@ -170,17 +166,6 @@ export function CapabilitiesView() {
           <p className="px-4 pb-2 text-[11px] leading-relaxed text-[var(--warn,var(--muted))]">
             工具只有一套：{unboundedRoles.join('、')} 拿的都是整张注册表，所以每一项都能点。
             「谁能点它」那一栏空着，不等于谁都不许。
-          </p>
-        ) : null}
-        {data && data.declaring_units !== null && data.declaring_units > 0 && callable + declaredOnly > 0 && data.entries.every((e) => e.holders.length === 0) ? (
-          // 名册这一拍确实有单位自报了能力，而没有一个名字对得上动作名：这不是「没人
-          // 会做」，是两边说的不是同一组词——名册自报的是角色（planner、generator），
-          // 这一栏要的是动作名（read_file）。不点破的话，读者会去查一个不存在的接线
-          // 问题，而真正要接的是「谁可以调它」这条来自角色分工表的读数。
-          <p className="px-4 pb-2 text-[11px] leading-relaxed text-[var(--warn,var(--muted))]">
-            {data.declaring_units} 个单位自报了能力，却没有一条与动作名对上：名册自报的是
-            角色，不是动作名。「谁可以调它」要看角色分工表（SkillConfig 的 tools），这一栏
-            今天没人填。
           </p>
         ) : null}
         {data && data.entries.length === 0 ? (
@@ -323,29 +308,6 @@ export function CapabilitiesView() {
                 render: (e) => (
                   <span className="text-[11px] text-[var(--muted)]">{e.description || '—'}</span>
                 ),
-              },
-              {
-                key: 'holders',
-                title: '自报持有它的单位',
-                width: '240px',
-                render: (e) =>
-                  data.declaring_units === null ? (
-                    // 名册没读到这一拍，「没有单位自报」这句话无从说起：它与「零个单位
-                    // 自报」在屏幕上同形，而一个要接线、一个要查读失败。
-                    <span className="text-[11px] text-[var(--muted)]">
-                      {data.roster_caveat
-                        ? `名册没读到：${data.roster_caveat}`
-                        : '名册没读到，这一栏无从判断'}
-                    </span>
-                  ) : e.holders.length === 0 ? (
-                    // 空集合不是「没有单位能用它」，是「没有单位这么自报」——名册上的
-                    // 能力标签与实际能点单的动作之间差着一次改名。
-                    <span className="text-[11px] text-[var(--muted)]">没有单位自报</span>
-                  ) : (
-                    <span className="text-[11px]">
-                      {e.holders.map((h) => `${h.unit}${h.live ? '' : '（不在岗）'}`).join(' · ')}
-                    </span>
-                  ),
               },
             ]}
             rows={data.entries}

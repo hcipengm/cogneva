@@ -389,11 +389,12 @@ pub struct GatewayState {
     /// (`SkillConfig::tools`), published by the skill plugin.
     ///
     /// Held so the capability inventory can answer "who may order this
-    /// action" from the same rows the runtime narrows a run against, instead
-    /// of from the agent roster's free-form `capabilities` list, which names
-    /// roles and never action names. `None` is a deployment without the shared
-    /// skill registry — the column then says the table could not be read, which
-    /// is not the same reading as "no role may call it".
+    /// action" from the same rows the runtime narrows a run against. The
+    /// roster cannot answer it: it names people and their roles, never action
+    /// names, and every digital employee carries the same capability set
+    /// anyway. `None` is a deployment without the shared skill registry — the
+    /// column then says the table could not be read, which is not the same
+    /// reading as "no role may call it".
     pub skill_registry: Option<Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>>,
     /// Global agent pool for production multi-agent parallelism.
     pub agent_pool: Option<Arc<dyn cog_core::AgentManager>>,

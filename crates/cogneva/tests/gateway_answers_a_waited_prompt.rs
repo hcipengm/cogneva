@@ -63,9 +63,6 @@ impl AgentRegistry for OneAgent {
     async fn list_by_role(&self, _role: &str) -> SFResult<Vec<AgentRegistration>> {
         Ok(vec![common::mocks::registration(AGENT)])
     }
-    async fn list_by_capability(&self, _capability: &str) -> SFResult<Vec<AgentRegistration>> {
-        Ok(vec![common::mocks::registration(AGENT)])
-    }
 }
 
 fn state(backend: Arc<dyn MessageBackend>) -> Arc<GatewayState> {

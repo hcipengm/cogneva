@@ -110,7 +110,7 @@ impl MessageBackend for Recording {
 }
 
 /// One live entry in the hand-written roster.
-type Entry = (&'static str, &'static str, &'static [&'static str]);
+type Entry = (&'static str, &'static str);
 
 /// A roster holding the names it was built with.
 ///
@@ -121,10 +121,10 @@ struct Roster {
 }
 
 impl Roster {
-    /// Entries that only need to exist: role `probe`, no capabilities.
+    /// Entries that only need to exist: role `probe`.
     fn new(live: &[&'static str]) -> Self {
         Self {
-            live: live.iter().map(|id| (*id, "probe", &[][..])).collect(),
+            live: live.iter().map(|id| (*id, "probe")).collect(),
         }
     }
 
@@ -153,15 +153,15 @@ impl AgentRegistry for Roster {
         Ok(self
             .live
             .iter()
-            .find(|(id, _, _)| *id == agent_id)
-            .map(|(id, role, caps)| registration(id, role, caps)))
+            .find(|(id, _)| *id == agent_id)
+            .map(|(id, role)| registration(id, role)))
     }
 
     async fn list(&self) -> SFResult<Vec<AgentRegistration>> {
         Ok(self
             .live
             .iter()
-            .map(|(id, role, caps)| registration(id, role, caps))
+            .map(|(id, role)| registration(id, role))
             .collect())
     }
 
@@ -169,17 +169,8 @@ impl AgentRegistry for Roster {
         Ok(self
             .live
             .iter()
-            .filter(|(_, r, _)| *r == role)
-            .map(|(id, role, caps)| registration(id, role, caps))
-            .collect())
-    }
-
-    async fn list_by_capability(&self, capability: &str) -> SFResult<Vec<AgentRegistration>> {
-        Ok(self
-            .live
-            .iter()
-            .filter(|(_, _, caps)| caps.contains(&capability))
-            .map(|(id, role, caps)| registration(id, role, caps))
+            .filter(|(_, r)| *r == role)
+            .map(|(id, role)| registration(id, role))
             .collect())
     }
 
@@ -190,7 +181,7 @@ impl AgentRegistry for Roster {
             .live
             .iter()
             .enumerate()
-            .map(|(slot, (id, role, _))| EmployeeRecord {
+            .map(|(slot, (id, role))| EmployeeRecord {
                 agent_id: (*id).to_string(),
                 number: Some(slot as u32 + 1),
                 role: (*role).to_string(),
@@ -203,13 +194,12 @@ impl AgentRegistry for Roster {
     }
 }
 
-fn registration(agent_id: &str, role: &str, capabilities: &[&str]) -> AgentRegistration {
+fn registration(agent_id: &str, role: &str) -> AgentRegistration {
     let now = chrono::Utc::now();
     AgentRegistration {
         agent_id: agent_id.to_string(),
         role: role.into(),
         workspace_id: "probe".into(),
-        capabilities: capabilities.iter().map(|c| (*c).to_string()).collect(),
         resources: ResourceInfo::default(),
         hostname: "probe".into(),
         pod_ip: "127.0.0.1".into(),
@@ -249,8 +239,8 @@ async fn call_list(roster: Arc<Roster>, args: serde_json::Value) -> SFResult<ser
 #[tokio::test]
 async fn an_id_the_directory_lists_is_an_id_the_send_tool_delivers_to() {
     let roster = Arc::new(Roster::with_roles(&[
-        ("squad:task-1-reviewer", "reviewer", &[]),
-        ("squad:task-1-coder", "coder", &[]),
+        ("squad:task-1-reviewer", "reviewer"),
+        ("squad:task-1-coder", "coder"),
     ]));
     let listed = call_list(roster.clone(), serde_json::json!({}))
         .await
@@ -289,8 +279,8 @@ async fn an_id_the_directory_lists_is_an_id_the_send_tool_delivers_to() {
 #[tokio::test]
 async fn every_row_in_the_directory_carries_the_name_the_board_shows() {
     let roster = Arc::new(Roster::with_roles(&[
-        ("squad:task-1-reviewer", "reviewer", &[]),
-        ("employee:0e2ba053", "employee", &[]),
+        ("squad:task-1-reviewer", "reviewer"),
+        ("employee:0e2ba053", "employee"),
     ]));
     let listed = call_list(roster, serde_json::json!({}))
         .await
@@ -315,12 +305,16 @@ async fn every_row_in_the_directory_carries_the_name_the_board_shows() {
 }
 
 /// Narrowing the search is a filter over the same list, not a second source.
+///
+/// Role is the only filter. "Capability" is gone with the per-person column: every
+/// digital employee has the same capabilities, so a capability filter could only
+/// ever name a role by another word.
 #[tokio::test]
-async fn the_directory_can_be_narrowed_by_role_and_capability() {
+async fn the_directory_can_be_narrowed_by_role() {
     let roster = Arc::new(Roster::with_roles(&[
-        ("squad:task-1-reviewer", "reviewer", &["code-review"]),
-        ("squad:task-1-coder", "coder", &["code-review", "shell"]),
-        ("squad:task-1-tester", "tester", &["shell"]),
+        ("squad:task-1-reviewer", "reviewer"),
+        ("squad:task-1-coder", "coder"),
+        ("squad:task-1-tester", "tester"),
     ]));
 
     let reviewers = call_list(roster.clone(), serde_json::json!({ "role": "reviewer" }))
@@ -331,33 +325,25 @@ async fn the_directory_can_be_narrowed_by_role_and_capability() {
         reviewers["agents"][0]["agent_id"],
         serde_json::json!("squad:task-1-reviewer")
     );
+}
 
-    let shells = call_list(roster.clone(), serde_json::json!({ "capability": "shell" }))
-        .await
-        .expect("listed");
-    let mut shell_ids: Vec<&str> = shells["agents"]
-        .as_array()
-        .expect("agents is a list")
-        .iter()
-        .map(|a| a["agent_id"].as_str().expect("agent_id"))
-        .collect();
-    shell_ids.sort();
-    assert_eq!(shell_ids, vec!["squad:task-1-coder", "squad:task-1-tester"]);
-
-    let both = call_list(
-        roster,
-        serde_json::json!({ "role": "coder", "capability": "shell" }),
-    )
-    .await
-    .expect("listed");
-    assert_eq!(
-        both["count"],
-        serde_json::json!(1),
-        "both filters apply: {both}"
+/// The directory no longer advertises a capability filter.
+///
+/// The parameter was a role name under another spelling; keeping it on the
+/// tool's schema would let a caller believe two employees can differ that way.
+/// This goes red the day the parameter comes back, before a caller is misled.
+#[tokio::test]
+async fn the_directory_advertises_no_capability_filter() {
+    let tool = list_agents(Arc::new(Roster::new(&["worker-a"])));
+    let properties = tool.parameters["properties"]
+        .as_object()
+        .expect("the schema has properties");
+    assert!(
+        !properties.contains_key("capability"),
+        "a capability filter is a role filter under another name: {properties:?}"
     );
 }
 
-/// The wire form the inbox consumer reads, on the stream it reads it from.
 #[tokio::test]
 async fn a_prompt_reaches_the_inbox_the_consumer_group_reads() {
     let backend = Arc::new(Recording::default());
@@ -525,8 +511,8 @@ async fn an_empty_message_is_refused() {
 #[tokio::test]
 async fn the_run_identity_reaches_the_receipt_and_the_directory_alike() {
     let roster = Arc::new(Roster::with_roles(&[
-        ("squad:task-1-coder", "coder", &[]),
-        ("squad:task-1-reviewer", "reviewer", &[]),
+        ("squad:task-1-coder", "coder"),
+        ("squad:task-1-reviewer", "reviewer"),
     ]));
     let backend = Arc::new(Recording::default());
 
@@ -574,8 +560,8 @@ async fn the_run_identity_reaches_the_receipt_and_the_directory_alike() {
 #[tokio::test]
 async fn a_member_of_one_squad_reaches_a_member_of_another_without_a_relay() {
     let roster = Arc::new(Roster::with_roles(&[
-        ("squad:task-1-reviewer", "reviewer", &[]),
-        ("squad:task-2-coder", "coder", &[]),
+        ("squad:task-1-reviewer", "reviewer"),
+        ("squad:task-2-coder", "coder"),
     ]));
     let backend = Arc::new(Recording::default());
 
@@ -620,8 +606,8 @@ async fn a_member_of_one_squad_reaches_a_member_of_another_without_a_relay() {
 #[tokio::test]
 async fn a_run_with_no_identity_reports_null_and_marks_nobody() {
     let roster = Arc::new(Roster::with_roles(&[
-        ("squad:task-1-coder", "coder", &[]),
-        ("squad:task-1-reviewer", "reviewer", &[]),
+        ("squad:task-1-coder", "coder"),
+        ("squad:task-1-reviewer", "reviewer"),
     ]));
     let backend = Arc::new(Recording::default());
 

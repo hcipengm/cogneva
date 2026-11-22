@@ -19,7 +19,6 @@ pub fn registration(agent_id: &str) -> AgentRegistration {
         pod_ip: "127.0.0.1".into(),
         role: "worker".into(),
         workspace_id: "default".into(),
-        capabilities: Vec::new(),
         resources: ResourceInfo::default(),
         registered_at: now,
         last_heartbeat: now,

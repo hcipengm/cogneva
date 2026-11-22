@@ -17,7 +17,7 @@
 //! 读。这一面只报账——包括「这一行自己写着多久算超时、它已经跑了多久」这种算术，
 //! 但绝不替它宣布这件事过没过。再判一遍就成了第二个判据来源。
 //!
-//! 代价写在明处：这条读走的是 [`cog_core::OrchestratorControl::get_all_tasks`]，
+//! 代价写在明处：这条读走的是 [`cog_core::OrchestratorControl::get_all_tasks_checked`]，
 //! 也就是整张图（2026-11-06 实测 9,991 行 / 42 MB 的 JSON），因为按状态与按类型
 //! 计数需要每一行。这与场地那一面不同——那一面按标签筛选后只剩四行，所以它走
 //! 了一条窄查询。这里的调用是**按需的**（一个智能体在规划前问一次），不是每二十
@@ -35,6 +35,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::error::ApiError;
 use crate::GatewayState;
 
 /// 一次能带回多少条最老的活。
@@ -337,10 +338,15 @@ fn row_of(task: &cog_core::Task, now: DateTime<Utc>) -> LedgerRow {
 pub async fn task_ledger_handler(
     State(state): State<std::sync::Arc<GatewayState>>,
     Query(query): Query<LedgerQuery>,
-) -> Response {
-    let tasks = state.orchestrator.get_all_tasks().await;
+) -> Result<Response, ApiError> {
+    // 读失败留成 503：把一整张图的读折成空表，这一面账就会在一个库读不出来
+    // 的部署上报「在册 0 条、无事可做」——而它正是要安排活的那个人唯一的凭据。
+    let tasks = crate::tasks::task_rows_from_reading(
+        state.orchestrator.get_all_tasks_checked().await,
+        "task ledger",
+    )?;
     let now = Utc::now();
-    (StatusCode::OK, Json(read_task_ledger(&tasks, now, &query))).into_response()
+    Ok((StatusCode::OK, Json(read_task_ledger(&tasks, now, &query))).into_response())
 }
 
 #[cfg(test)]

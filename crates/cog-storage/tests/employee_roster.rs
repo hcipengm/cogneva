@@ -34,7 +34,6 @@ fn registration(name: &str) -> AgentRegistration {
         "127.0.0.1",
         "probe",
         "probe",
-        vec![],
         ResourceInfo::default(),
     )
 }

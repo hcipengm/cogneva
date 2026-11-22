@@ -22,8 +22,7 @@
 //! - 谁能点它：共享技能表（`SkillRegistry`）里每个角色声明的 `tools`。读法与运行时
 //!   收窄一轮时一样——`skill_for_role` 决定一个角色的多行里哪一行算数——所以这一栏
 //!   不会报出运行时并不给的许可。没有声明 `tools` 的角色是「不设边界，拿整张注册
-//!   表」，单独一栏列出，不摊到每个动作上；
-//! - 持有人：`AgentRegistry::list()` 里每一行自报的 `capabilities` 与心跳。
+//!   表」，单独一栏列出，不摊到每个动作上。
 //!
 //! **使用次数只在有计数器的那一层是读数。** 内建这一层由 `cog-agent` 在派发点计
 //! （`execute_scoped_checked` 是每一次调用的唯一漏斗），所以那一栏的 0 是真的没人
@@ -225,16 +224,6 @@ pub struct Entry {
     /// 允许」——后者是 `Some(空)`。两种情形要的动作相反：一个去接表，一个是
     /// 「这一项没有角色点名」，读的人要能分清。
     pub allowed_roles: Option<Vec<String>>,
-    /// 自报了这一项的单位。空集合不是「没人会用」，是「没人这么自报」——这两句
-    /// 之间差着一次改名，读的人要能分清。
-    pub holders: Vec<Holder>,
-}
-
-/// 一个自报了某项能力的单位，以及它此刻在不在岗。
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Holder {
-    pub unit: String,
-    pub live: bool,
 }
 
 /// 一台机器上「会什么」的全貌。
@@ -245,19 +234,6 @@ pub struct Inventory {
     pub sources: Vec<(Source, SourceReading)>,
     /// 全部项，去重后按名字排。同名来自两个源的各占一行。
     pub entries: Vec<Entry>,
-    /// 自报过能力的单位数。0 且名册非空，说明这一栏没人填——那是接线缺口，不是
-    /// 「没有人有能力」。
-    ///
-    /// `None` 是名册这一拍没读到（没接上，或读失败了）：那时「没有人自报」这句话
-    /// 无从说起，而它与「0 个单位自报」要采取的动作相反，所以在读数上就分开。
-    pub declaring_units: Option<usize>,
-    /// 名册这一拍没读到时的原因。
-    ///
-    /// `None` 是读到了（含「读到但没有单位自报」）。名册读不到时，持有人那一栏
-    /// 无从判断，而「为什么无从判断」要能说出来——否则读者只知道这一栏空着，分
-    /// 不清是该去接名册还是该去查读失败。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub roster_caveat: Option<String>,
     /// 没有声明 `tools` 的角色，按角色名排。
     ///
     /// 分工表里空表的意思是「不设边界，拿整张注册表」，所以这些角色能调每一项。
@@ -277,8 +253,6 @@ impl Default for Inventory {
             generated_at: chrono::Utc::now(),
             sources: Vec::new(),
             entries: Vec::new(),
-            declaring_units: None,
-            roster_caveat: None,
             unbounded_roles: None,
         }
     }
@@ -372,7 +346,6 @@ pub async fn read(state: &GatewayState) -> Inventory {
                     }),
                     calls: calls.get(&tool.name).copied(),
                     allowed_roles: None,
-                    holders: Vec::new(),
                 });
             }
             SourceReading::Measured {
@@ -419,7 +392,6 @@ pub async fn read(state: &GatewayState) -> Inventory {
                                     // 读成「量过，没人用」。
                                     calls: None,
                                     allowed_roles: None,
-                                    holders: Vec::new(),
                                 });
                                 count += 1;
                             }
@@ -471,7 +443,6 @@ pub async fn read(state: &GatewayState) -> Inventory {
                         // 那张登记表，所以这一层没有数可报。
                         calls: None,
                         allowed_roles: None,
-                        holders: Vec::new(),
                     });
                 }
                 SourceReading::Measured {
@@ -487,10 +458,10 @@ pub async fn read(state: &GatewayState) -> Inventory {
     sources.push((Source::Mcp, mcp));
 
     // ── 谁能点它 ──
-    // 从角色分工表读，不从名册自报读：名册那一栏写的是角色名，这一面要的是动作
-    // 名，两边说的不是同一组词（下面 `holders` 就是这件事的现场）。读法与运行时
-    // 收窄一轮时一样——`skill_configs` 数出有哪些角色，`skill_for_role` 决定同一个
-    // 角色有多行时哪一行算数。用别的读法，这一栏会报出运行时并不会给的许可。
+    // 从角色分工表读：名册自报那一栏写的是工号与角色名，这一面要的是动作名，两
+    // 边说的不是同一组词。读法与运行时收窄一轮时一样——`skill_configs` 数出有哪
+    // 些角色，`skill_for_role` 决定同一个角色有多行时哪一行算数。用别的读法，这
+    // 一栏会报出运行时并不会给的许可。
     let (allowed, unbounded_roles) = match state.skill_registry.as_ref() {
         None => (None, None),
         Some(registry) => {
@@ -500,49 +471,7 @@ pub async fn read(state: &GatewayState) -> Inventory {
         }
     };
 
-    // ── 持有人 ──
-    // 名册读不到时 `declaring_units` 是 `None`，不是 0：那时两种情形在读数上同形，
-    // 而它们要的动作相反——一栏没人填是接线缺口，名册没读到是这一拍读失败。
-    let (declared, declaring_units, roster_caveat) = match state.agent_registry.as_ref() {
-        None => (
-            BTreeMap::new(),
-            None,
-            Some("这个部署没有员工名册".to_string()),
-        ),
-        Some(registry) => match registry.list().await {
-            Ok(agents) => {
-                let mut declared: BTreeMap<String, Vec<Holder>> = BTreeMap::new();
-                let mut declaring = 0usize;
-                let now = chrono::Utc::now();
-                for agent in agents {
-                    if agent.capabilities.is_empty() {
-                        continue;
-                    }
-                    declaring += 1;
-                    // 心跳多久算在岗：用的是面主那套判据，不另造一个界。同一个
-                    // 「这人还在不在」在两张表上给出两个答案，读的人只会记住先
-                    // 看到的那个。
-                    let live = (now - agent.last_heartbeat).num_seconds()
-                        < cog_core::contract::face_registry::OWNER_IDLE_AFTER_SECS;
-                    for capability in &agent.capabilities {
-                        declared
-                            .entry(capability.clone())
-                            .or_default()
-                            .push(Holder {
-                                unit: agent.agent_id.clone(),
-                                live,
-                            });
-                    }
-                }
-                (declared, Some(declaring), None)
-            }
-            Err(e) => (BTreeMap::new(), None, Some(format!("读员工名册失败：{e}"))),
-        },
-    };
     for entry in entries.iter_mut() {
-        if let Some(holders) = declared.get(&entry.name) {
-            entry.holders = holders.clone();
-        }
         if let Some(allowed) = allowed.as_ref() {
             // 分工表读到了，这一项有没有角色点名都要写成 `Some`：空表是读数
             // （没有角色点名它），`None` 才是没读到。
@@ -550,13 +479,7 @@ pub async fn read(state: &GatewayState) -> Inventory {
         }
     }
 
-    finish(
-        entries,
-        sources,
-        declaring_units,
-        roster_caveat,
-        unbounded_roles,
-    )
+    finish(entries, sources, unbounded_roles)
 }
 
 /// 分工表里「谁能点它」：没有角色声明边界，所以每个角色都能点每一项。
@@ -587,8 +510,6 @@ fn callers_by_tool(
 fn finish(
     mut entries: Vec<Entry>,
     mut sources: Vec<(Source, SourceReading)>,
-    declaring_units: Option<usize>,
-    roster_caveat: Option<String>,
     unbounded_roles: Option<Vec<String>>,
 ) -> Inventory {
     entries.sort_by(|a, b| {
@@ -622,8 +543,6 @@ fn finish(
         generated_at: chrono::Utc::now(),
         sources,
         entries,
-        declaring_units,
-        roster_caveat,
         unbounded_roles,
     }
 }
@@ -650,7 +569,6 @@ mod tests {
             runs_in: None,
             calls: None,
             allowed_roles: None,
-            holders: Vec::new(),
         };
         let inventory = finish(
             vec![
@@ -673,8 +591,6 @@ mod tests {
                     },
                 ),
             ],
-            Some(0),
-            None, // roster_caveat
             None, // unbounded_roles
         );
         assert_eq!(inventory.entry_count(), 2);
@@ -728,7 +644,6 @@ mod tests {
             runs_in: None,
             calls: None,
             allowed_roles: None,
-            holders: Vec::new(),
         };
         let inventory = finish(
             vec![entry("第一个插件"), entry("第二个插件")],
@@ -739,8 +654,6 @@ mod tests {
                     callable: 0,
                 },
             )],
-            Some(0),
-            None, // roster_caveat
             None, // unbounded_roles
         );
         assert_eq!(inventory.entry_count(), 1);
@@ -869,7 +782,6 @@ mod tests {
             runs_in: None,
             calls: None,
             allowed_roles: None,
-            holders: Vec::new(),
         })
         .unwrap();
         assert!(uncounted["calls"].is_null());
@@ -883,7 +795,6 @@ mod tests {
             runs_in: Some(RunsIn::Native),
             calls: Some(0),
             allowed_roles: None,
-            holders: Vec::new(),
         })
         .unwrap();
         assert_eq!(counted["calls"], 0);
@@ -904,7 +815,6 @@ mod tests {
             runs_in: None,
             calls,
             allowed_roles: None,
-            holders: Vec::new(),
         };
         let inventory = |entries: Vec<Entry>| Inventory {
             entries,
@@ -953,7 +863,6 @@ mod tests {
             runs_in: None,
             calls: None,
             allowed_roles: None,
-            holders: Vec::new(),
         };
         let inventory = finish(
             vec![
@@ -969,8 +878,6 @@ mod tests {
                     callable: 3,
                 },
             )],
-            Some(0),
-            None, // roster_caveat
             None, // unbounded_roles
         );
         assert_eq!(inventory.entry_count(), 2);
@@ -996,8 +903,8 @@ mod tests {
 
     /// 点了名允许调它的角色按动作列开：这一栏答的是「运行时会不会放它进去」。
     ///
-    /// 名册那一栏（`holders`）写的是角色名或自由文本，这一栏要的是动作名；两边
-    /// 没有角色声明边界之后，每个角色都落在「不设边界」那一侧。
+    /// 名册自报那一栏写的是角色名，这一栏要的是动作名；两边没有角色声明边界之后，
+    /// 每个角色都落在「不设边界」那一侧。
     ///
     /// 这一栏从分工表读而不是从名册自报读，理由没变：两处说的不是同一组词。变的是
     /// 分工表里不再有边界——工具只有一套，谁拿到的都是整张注册表。
@@ -1049,7 +956,6 @@ mod tests {
             runs_in: None,
             calls: Some(0),
             allowed_roles: None,
-            holders: Vec::new(),
         })
         .unwrap();
         assert!(absent["allowed_roles"].is_null());
@@ -1063,7 +969,6 @@ mod tests {
             runs_in: None,
             calls: Some(0),
             allowed_roles: Some(Vec::new()),
-            holders: Vec::new(),
         })
         .unwrap();
         assert_eq!(named_none["allowed_roles"], serde_json::json!([]));

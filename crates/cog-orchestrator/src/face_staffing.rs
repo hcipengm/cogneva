@@ -1032,7 +1032,6 @@ mod tests {
                         "",
                         FACE_HOLDER_ROLE,
                         "default",
-                        Vec::new(),
                         cog_core::ResourceInfo::default(),
                     )
                 }))
@@ -1049,7 +1048,6 @@ mod tests {
                         "",
                         FACE_HOLDER_ROLE,
                         "default",
-                        Vec::new(),
                         cog_core::ResourceInfo::default(),
                     )
                 })
@@ -1061,13 +1059,6 @@ mod tests {
             _role: &str,
         ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
             self.list().await
-        }
-
-        async fn list_by_capability(
-            &self,
-            _capability: &str,
-        ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
-            Ok(Vec::new())
         }
     }
 

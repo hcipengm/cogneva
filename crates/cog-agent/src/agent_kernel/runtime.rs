@@ -4842,12 +4842,6 @@ mod tests {
         ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
             Ok(Vec::new())
         }
-        async fn list_by_capability(
-            &self,
-            _: &str,
-        ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
-            Ok(Vec::new())
-        }
         async fn employee(
             &self,
             agent_id: &str,
@@ -4934,12 +4928,6 @@ mod tests {
                 Ok(Vec::new())
             }
             async fn list_by_role(
-                &self,
-                _: &str,
-            ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
-                Ok(Vec::new())
-            }
-            async fn list_by_capability(
                 &self,
                 _: &str,
             ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
@@ -6386,9 +6374,10 @@ mod tests {
             think_stall_timeout_secs: 5,
             ..Default::default()
         };
-        // 自己的观测面：这几条用例的假上游回报的 prompt 只有 10 个 token，写进
-        // 进程那一份读数就成了「这个进程量到的窗口是 10」，同一进程里别的用例
-        // 一起读成「连地板都装不下」——2026-11-22 实测，并行跑时三条用例因此红。
+        // 自己的观测面：这几条用例的计费用量是刻意编的小数（10 token），而
+        // 窗口读数按答话的型号分桶、挂在进程级那份上——写进全局的「mock」
+        // 桶之后，同进程里任何一条刚构造的 runtime 都会把窗口定成 10，第一轮
+        // 就报「窗口装不下地板」。计费与窗口在这里量的不是同一件事，各用各的。
         let observable = crate::observable::AgentObservable::new();
         AgentRuntime::with_observable(config, tx, &observable)
     }

@@ -151,7 +151,6 @@ impl ListingRegistry {
                         agent_id: (*id).into(),
                         role: "worker".into(),
                         workspace_id: "ws".into(),
-                        capabilities: Vec::new(),
                         resources: ResourceInfo {
                             cpu_cores: 1,
                             memory_gb: 1,
@@ -211,17 +210,6 @@ impl cog_core::AgentRegistry for ListingRegistry {
             .unwrap()
             .iter()
             .filter(|registration| registration.role == role)
-            .cloned()
-            .collect())
-    }
-
-    async fn list_by_capability(&self, capability: &str) -> SFResult<Vec<AgentRegistration>> {
-        Ok(self
-            .listed
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|registration| registration.capabilities.iter().any(|c| c == capability))
             .cloned()
             .collect())
     }

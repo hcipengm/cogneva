@@ -408,7 +408,6 @@ pub struct AgentRegistration {
     pub agent_id: String,
     pub role: String,
     pub workspace_id: String,
-    pub capabilities: Vec<String>,
     pub resources: ResourceInfo,
     pub hostname: String,
     pub pod_ip: String,
@@ -426,7 +425,6 @@ impl AgentRegistration {
         pod_ip: impl Into<String>,
         role: impl Into<String>,
         workspace_id: impl Into<String>,
-        capabilities: Vec<String>,
         resources: ResourceInfo,
     ) -> Self {
         let now = Utc::now();
@@ -434,7 +432,6 @@ impl AgentRegistration {
             agent_id: agent_id.into(),
             role: role.into(),
             workspace_id: workspace_id.into(),
-            capabilities,
             resources,
             hostname: hostname.into(),
             pod_ip: pod_ip.into(),
@@ -525,8 +522,6 @@ pub trait AgentRegistry: Send + Sync {
     async fn list(&self) -> SFResult<Vec<AgentRegistration>>;
     /// List agents filtered by role.
     async fn list_by_role(&self, role: &str) -> SFResult<Vec<AgentRegistration>>;
-    /// List agents that have all the given capabilities.
-    async fn list_by_capability(&self, capability: &str) -> SFResult<Vec<AgentRegistration>>;
     /// 名册上的全部行，在岗的与退役的都在里面。
     ///
     /// 默认实现返回空：没有名册的实现（测试替身、嵌入式装配）不该被迫编一份
@@ -554,7 +549,6 @@ pub trait AgentRegistry: Send + Sync {
 pub struct WorkerInfo {
     pub agent_id: String,
     pub role: String,
-    pub capabilities: Vec<String>,
     /// The task this worker was created for, when it has one.
     ///
     /// `None` is the worker that lives as long as the process — an employee of
@@ -780,7 +774,6 @@ mod tests {
             "10.0.0.1",
             "planner",
             "ws-1",
-            vec!["llm".into()],
             ResourceInfo::default(),
         );
         assert_eq!(reg.agent_id, "id-1");

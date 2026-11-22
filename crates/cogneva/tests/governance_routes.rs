@@ -477,18 +477,23 @@ async fn the_capability_and_output_faces_answer_and_name_their_missing_layers() 
             "a missing layer names itself: {body}"
         );
     }
-    // "Who may order this action" and "why can it not be judged" must say which
-    // of the two they are on the wire: the fixture has neither a role table nor
-    // a roster, so both are "not read", and the roster names why. An empty list
-    // here would read as "no role may call it and nobody declares it", which is
-    // a different deployment.
+    // "Who may order this action" must distinguish "not read" from "no role":
+    // the fixture has no role table, so the field is null. An empty list here
+    // would read as "no role may call it", which is a different deployment.
     assert!(
         body["unbounded_roles"].is_null(),
         "no skill registry means the role table was not read, not that no role is unbounded: {body}"
     );
+    // The roster no longer answers "who declares this action": capability was a
+    // per-person column, and every digital employee has the same one. A body
+    // that still carries a roster-sourced column is reading a table that no
+    // longer exists.
     assert!(
-        body["roster_caveat"].is_string(),
-        "a missing roster says why the column cannot be judged: {body}"
+        !body
+            .as_object()
+            .expect("the inventory is an object")
+            .contains_key("roster_caveat"),
+        "the capability face no longer reads a roster: {body}"
     );
 
     let (status, body) = ask(&app, "GET", "/api/v1/output", &token, "{}").await;

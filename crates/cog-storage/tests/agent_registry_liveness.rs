@@ -46,7 +46,6 @@ fn registration(name: &str, beaten_at: chrono::DateTime<Utc>) -> AgentRegistrati
         agent_id: format!("{PROBE}:{name}"),
         role: "probe".into(),
         workspace_id: "probe".into(),
-        capabilities: vec![],
         resources: ResourceInfo::default(),
         hostname: "probe".into(),
         pod_ip: "127.0.0.1".into(),

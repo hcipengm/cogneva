@@ -287,7 +287,6 @@ async fn the_executor_count_is_the_live_registry() {
                 "10.42.0.10",
                 "worker",
                 "cogneva",
-                Vec::new(),
                 ResourceInfo {
                     cpu_cores: 1,
                     memory_gb: 1,

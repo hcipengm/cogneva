@@ -254,8 +254,16 @@ impl OrchestratorControl for OrchestratorControlImpl {
         self.dag_executor.get_dependents(task_id).await
     }
 
+    async fn get_dependents_checked(&self, task_id: &str) -> SFResult<Option<Vec<Task>>> {
+        self.dag_executor.get_dependents_checked(task_id).await
+    }
+
     async fn get_dependencies(&self, task_id: &str) -> Option<Vec<Task>> {
         self.dag_executor.get_dependencies(task_id).await
+    }
+
+    async fn get_dependencies_checked(&self, task_id: &str) -> SFResult<Option<Vec<Task>>> {
+        self.dag_executor.get_dependencies_checked(task_id).await
     }
 
     async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>) {

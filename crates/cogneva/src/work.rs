@@ -1151,7 +1151,6 @@ async fn presence(unit: &str, workspace: &str, redis_url: &str) -> Result<(), Bo
         "",
         cog_supervisor::registry::EXTERNAL_WORKER_ROLE,
         workspace,
-        Vec::new(),
         cog_core::ResourceInfo::default(),
     );
     use cog_core::AgentRegistry as _;

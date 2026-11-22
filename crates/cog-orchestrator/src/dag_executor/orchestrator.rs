@@ -4194,46 +4194,66 @@ impl DagExecutor {
     }
 
     pub async fn get_dependents(&self, task_id: &str) -> Option<Vec<Task>> {
+        self.dependents_checked(task_id).await.unwrap_or_default()
+    }
+
+    /// 同一份名单，但保留读失败。
+    ///
+    /// 旧读把三层失败都折成 `None`：名单那一读、名单里每一行的逐条读、以及
+    /// 「这一条根本读不出来」。`None` 在任务详情页上画成一张空的关联列表，
+    /// 也就是「这条任务没有下游」。库读不出来时这一读要带着错误收口。
+    ///
+    /// 名单点名的一行真的不在库里时照旧跳过：那是读到了「没有这个答案」，不是
+    /// 读失败。
+    pub async fn dependents_checked(&self, task_id: &str) -> SFResult<Option<Vec<Task>>> {
         if let Some(be) = self.fg() {
-            let ids = be
-                .dag_get_dependents(&self.workspace_id, task_id)
-                .await
-                .ok()?;
+            let ids = be.dag_get_dependents(&self.workspace_id, task_id).await?;
             let mut out = Vec::with_capacity(ids.len());
             for id in ids {
-                if let Ok(Some(t)) = be.dag_get_task(&self.workspace_id, &id).await {
+                if let Some(t) = be.dag_get_task(&self.workspace_id, &id).await? {
                     out.push(t);
                 }
             }
-            return Some(out);
+            return Ok(Some(out));
         }
         let inner = self.inner.read().await;
-        inner.dependents.get(task_id).map(|ids| {
+        Ok(inner.dependents.get(task_id).map(|ids| {
             ids.iter()
                 .filter_map(|id| inner.tasks.get(id).cloned())
                 .collect()
-        })
+        }))
     }
 
     pub async fn get_dependencies(&self, task_id: &str) -> Option<Vec<Task>> {
+        self.dependencies_checked(task_id).await.unwrap_or_default()
+    }
+
+    /// 同一份名单，但保留读失败。理由同 [`Self::dependents_checked`]：旧读把
+    /// 任务行那一读与整图那一读的失败折成 `None`，详情页上于是显示「不依赖
+    /// 任何任务」。任务真不存在时仍然是 `None`——那是读到的答案。
+    pub async fn dependencies_checked(&self, task_id: &str) -> SFResult<Option<Vec<Task>>> {
         if self.fg().is_some() {
-            let t = self.store_task(task_id).await.ok()?;
-            let tasks = self.all_tasks_unified().await;
+            let t = match self.store_task(task_id).await {
+                Ok(t) => t,
+                Err(SFError::TaskFailed { .. }) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            let tasks = self.all_tasks_checked().await?;
             let by_id: std::collections::HashMap<&str, &Task> =
                 tasks.iter().map(|t| (t.id.as_str(), t)).collect();
-            return Some(
+            return Ok(Some(
                 t.blocked_by
                     .iter()
                     .filter_map(|id| by_id.get(id.as_str()).map(|t| (*t).clone()))
                     .collect(),
-            );
+            ));
         }
         let inner = self.inner.read().await;
-        inner.dependencies.get(task_id).map(|ids| {
+        Ok(inner.dependencies.get(task_id).map(|ids| {
             ids.iter()
                 .filter_map(|id| inner.tasks.get(id).cloned())
                 .collect()
-        })
+        }))
     }
 
     pub async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>) {
@@ -4748,8 +4768,16 @@ impl cog_core::DagExecutor for DagExecutor {
         self.get_dependents(task_id).await
     }
 
+    async fn get_dependents_checked(&self, task_id: &str) -> SFResult<Option<Vec<Task>>> {
+        self.dependents_checked(task_id).await
+    }
+
     async fn get_dependencies(&self, task_id: &str) -> Option<Vec<Task>> {
         self.get_dependencies(task_id).await
+    }
+
+    async fn get_dependencies_checked(&self, task_id: &str) -> SFResult<Option<Vec<Task>>> {
+        self.dependencies_checked(task_id).await
     }
 
     async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>) {
@@ -5401,6 +5429,9 @@ mod tests {
         /// 读整张图的那一问答不上来。就绪队列是把整张图按判据筛出来的，筛不出来
         /// 与「没有一条就绪」在集合面上同形，这一格用来交出前者的形状。
         all_read_fails: std::sync::atomic::AtomicBool,
+        /// 读下游名单的那一问答不上来。详情页把「读不出来」与「没有下游」
+        /// 画成同一张空列表，这一格用来交出前者的形状。
+        dependents_read_fails: std::sync::atomic::AtomicBool,
     }
 
     impl CountingTaskStore {
@@ -5510,6 +5541,30 @@ mod tests {
                 ));
             }
             Ok(self.tasks.lock().await.clone())
+        }
+        /// 下游名单：扫一遍行，谁的 `blocked_by` 点到这条任务，谁就是它的下游。
+        /// 带一个开关，详情页把「读不出来」与「没有下游」画成同一张空列表。
+        async fn dag_get_dependents(
+            &self,
+            _workspace_id: &str,
+            task_id: &str,
+        ) -> SFResult<Vec<String>> {
+            if self
+                .dependents_read_fails
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(SFError::Database(format!(
+                    "store unavailable: cannot read the dependents of {task_id}"
+                )));
+            }
+            Ok(self
+                .tasks
+                .lock()
+                .await
+                .iter()
+                .filter(|t| t.blocked_by.iter().any(|dep| dep == task_id))
+                .map(|t| t.id.clone())
+                .collect())
         }
         async fn dag_get_live_tasks(&self, _workspace_id: &str) -> SFResult<Vec<Task>> {
             self.live_reads
@@ -7807,6 +7862,145 @@ mod tests {
         assert!(
             folded_nodes.is_empty() && folded_edges.is_empty(),
             "旧的这一读仍然按折叠语义交回空图：改的是新读，不是它"
+        );
+    }
+
+    /// 下游名单读不出来，不等于「这条任务没有下游」。
+    ///
+    /// 详情页把「读不出来」与「一条下游都没有」画成同一张空列表。旧读把名单
+    /// 那一读、名单里每一行的逐条读都折成 `None`，于是一个读不动库的网关会
+    /// 说「这条任务没人等它」。判据落在 `is_err` 上：`None` 仍是合法答案。
+    #[tokio::test]
+    async fn an_unreadable_dependents_read_is_not_a_task_with_no_dependents() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag = DagExecutor::new("ws-dependents-read".into()).with_state_backend(backend.clone());
+        let mut child = Task::new("t-child", TaskType::DagNode, serde_json::json!({}));
+        child.blocked_by = vec!["t-parent".into()];
+        backend.tasks.lock().await.push(child);
+
+        let rows = dag
+            .dependents_checked("t-parent")
+            .await
+            .expect("读得出来时照常交回")
+            .expect("库里有这条下游关系");
+        assert_eq!(
+            rows.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["t-child"],
+            "读得出来时名单里就是那条点了它的行"
+        );
+
+        // 名单读得出来、名单里某一行的逐条读失败：那一行不是「不存在」，是没
+        // 读到。交回一份少了一行的名单，与交回一份空名单是同一句假话。
+        backend
+            .task_read_fails
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let failure = dag
+            .dependents_checked("t-parent")
+            .await
+            .expect_err("名单里那一行读不出来时要保留失败，不能悄悄少一行");
+        assert!(
+            failure.to_string().contains("store unavailable"),
+            "错误要带着库那一边的原话: {failure}"
+        );
+
+        backend
+            .dependents_read_fails
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let failure = dag
+            .dependents_checked("t-parent")
+            .await
+            .expect_err("读不出来时带检查的这一读必须保留失败，不能交回「没有下游」");
+        assert!(
+            failure.to_string().contains("store unavailable"),
+            "错误要带着库那一边的原话: {failure}"
+        );
+        let as_executor: &dyn cog_core::DagExecutor = &dag;
+        as_executor
+            .get_dependents_checked("t-parent")
+            .await
+            .expect_err("走 trait 对象的那一条必须保留失败，不能被默认实现折成空名单");
+        assert!(
+            dag.get_dependents("t-parent").await.is_none(),
+            "旧的这一读仍然按折叠语义交回 None：改的是新读，不是它"
+        );
+    }
+
+    /// 依赖名单读不出来，不等于「这条任务不依赖任何任务」。
+    ///
+    /// 这一读在存储模式下要读两处：任务自己那一行、以及整张图（按 id 找回
+    /// blocker 的行）。旧读把两处的失败都折成 `None`，详情页上于是显示一张
+    /// 空的依赖列表。任务真不存在时仍然是 `None`——那是读到的答案。
+    #[tokio::test]
+    async fn an_unreadable_dependencies_read_is_not_a_task_with_no_dependencies() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag =
+            DagExecutor::new("ws-dependencies-read".into()).with_state_backend(backend.clone());
+        let parent = Task::new("t-parent", TaskType::DagNode, serde_json::json!({}));
+        let mut child = Task::new("t-child", TaskType::DagNode, serde_json::json!({}));
+        child.blocked_by = vec!["t-parent".into()];
+        backend.tasks.lock().await.extend([parent, child]);
+
+        let rows = dag
+            .dependencies_checked("t-child")
+            .await
+            .expect("读得出来时照常交回")
+            .expect("库里有这条依赖关系");
+        assert_eq!(
+            rows.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["t-parent"],
+            "读得出来时名单里就是那条 blocker 的行"
+        );
+
+        // 整图那一读失败：找不回 blocker 的行，不等于它不存在。
+        backend
+            .all_read_fails
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let failure = dag
+            .dependencies_checked("t-child")
+            .await
+            .expect_err("图读不出来时要保留失败，不能交回「不依赖任何任务」");
+        assert!(
+            failure.to_string().contains("store unavailable"),
+            "错误要带着库那一边的原话: {failure}"
+        );
+        let as_executor: &dyn cog_core::DagExecutor = &dag;
+        as_executor
+            .get_dependencies_checked("t-child")
+            .await
+            .expect_err("走 trait 对象的那一条必须保留失败，不能被默认实现折成空名单");
+        assert!(
+            dag.get_dependencies("t-child").await.is_none(),
+            "旧的这一读仍然按折叠语义交回 None：改的是新读，不是它"
+        );
+        backend
+            .all_read_fails
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // 任务自己那一行读失败：只失败一次，好让后面那一读照常应答。
+        backend
+            .task_read_fails
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let failure = dag
+            .dependencies_checked("t-child")
+            .await
+            .expect_err("任务行读失败不是「没有这条任务」");
+        let message = failure.to_string();
+        assert!(
+            message.contains("store unavailable"),
+            "理由要带原始错误: {message}"
+        );
+        assert!(
+            message.contains("t-child"),
+            "理由要点名是哪一条任务读不出来: {message}"
+        );
+
+        // 真读到「没有这条任务」才是 `None`。
+        assert!(
+            dag.dependencies_checked("t-missing")
+                .await
+                .unwrap()
+                .is_none(),
+            "任务真不存在时是读到的答案，不是失败"
         );
     }
 

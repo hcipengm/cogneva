@@ -410,14 +410,6 @@ impl AgentRegistry for RedisAgentRegistry {
         Ok(all.into_iter().filter(|r| r.role == role).collect())
     }
 
-    async fn list_by_capability(&self, capability: &str) -> SFResult<Vec<AgentRegistration>> {
-        let all = self.list().await?;
-        Ok(all
-            .into_iter()
-            .filter(|r| r.capabilities.contains(&capability.to_string()))
-            .collect())
-    }
-
     async fn employees(&self) -> SFResult<Vec<EmployeeRecord>> {
         let mut conn = self.connection.clone();
         let rows: HashMap<String, String> = conn
@@ -609,14 +601,6 @@ impl AgentRegistry for MemoryAgentRegistry {
         Ok(all.into_iter().filter(|r| r.role == role).collect())
     }
 
-    async fn list_by_capability(&self, capability: &str) -> SFResult<Vec<AgentRegistration>> {
-        let all = self.list().await?;
-        Ok(all
-            .into_iter()
-            .filter(|r| r.capabilities.contains(&capability.to_string()))
-            .collect())
-    }
-
     async fn employees(&self) -> SFResult<Vec<EmployeeRecord>> {
         let store = self
             .store
@@ -660,7 +644,6 @@ mod tests {
             "10.0.0.1",
             "planner",
             "ws-1",
-            vec!["code".into()],
             cog_core::ResourceInfo {
                 cpu_cores: 4,
                 memory_gb: 8,
@@ -697,7 +680,6 @@ mod tests {
             "10.0.0.1",
             "planner",
             "ws-1",
-            vec![],
             cog_core::ResourceInfo::default(),
         );
         reg.register(&r).await.unwrap();
@@ -717,7 +699,6 @@ mod tests {
             "10.0.0.1",
             "worker",
             "ws-1",
-            vec![],
             cog_core::ResourceInfo::default(),
         )
     }

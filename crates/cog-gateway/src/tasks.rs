@@ -547,10 +547,54 @@ async fn ready_ids(
 /// "nothing waiting" to the tab and the count above it. Absence of the answer
 /// is a 503, the same way every other unreadable read on this surface answers.
 fn ready_ids_from(reading: cog_core::SFResult<Vec<Task>>) -> Result<HashSet<String>, ApiError> {
-    let tasks = reading.map_err(|e| {
-        ApiError::service_unavailable(format!("the ready queue could not be read: {e}"))
-    })?;
-    Ok(tasks.into_iter().map(|task| task.id).collect())
+    Ok(task_rows_from_reading(reading, "ready queue")?
+        .into_iter()
+        .map(|task| task.id)
+        .collect())
+}
+
+/// The rows a task read carries, with a failed read refusing instead of
+/// answering an empty list.
+///
+/// The task list, the summary above it, the purge preview and the process
+/// overview all count rows; folding a store failure into an empty set makes
+/// each of them report the cleanest possible number about a graph nobody read
+/// -- "0 tasks", "0 ready", "nothing to purge", an empty flow. Absence of the
+/// answer is a 503; an empty row set that was actually read stays a 200 with
+/// zeros.
+pub(crate) fn task_rows_from_reading(
+    reading: cog_core::SFResult<Vec<Task>>,
+    what: &str,
+) -> Result<Vec<Task>, ApiError> {
+    reading.map_err(|e| ApiError::service_unavailable(format!("the {what} could not be read: {e}")))
+}
+
+/// The task a write handler is about to change, read under the caller's scope.
+///
+/// The edit handlers used to find their row in the folded graph, so a store
+/// that could not be read made an existing task answer 404 "does not exist" --
+/// a statement about the task that is really a statement about the read, on
+/// paths that then wrote nothing and reported a missing resource. A failed read
+/// is a 503; 404 stays for a row that was looked for among the rows this caller
+/// may see and was not there.
+fn task_to_change_from_reading(
+    reading: cog_core::SFResult<Vec<Task>>,
+    claims: Option<&cog_core::Claims>,
+    id: &str,
+) -> Result<Task, ApiError> {
+    let rows: Vec<Task> = task_rows_from_reading(reading, "task list")?
+        .into_iter()
+        .filter(|t| visible_to_claims(claims, t))
+        .collect();
+    Ok(task_to_change(&rows, id)?.clone())
+}
+
+/// The same lookup once the rows are in hand: a row that is not among rows
+/// this caller may see is a 404, and only a completed read reaches here.
+fn task_to_change<'a>(rows: &'a [Task], id: &str) -> Result<&'a Task, ApiError> {
+    rows.iter()
+        .find(|t| t.id == id)
+        .ok_or_else(|| ApiError::not_found(format!("task '{id}' does not exist")))
 }
 
 /// The graph a read carries, with a failed read refusing instead of answering
@@ -567,6 +611,23 @@ fn graph_from_reading(
     reading.map_err(|e| {
         ApiError::service_unavailable(format!("the task graph could not be read: {e}"))
     })
+}
+
+/// The rows a dependents or dependencies read carries, with a failed read
+/// refusing instead of answering an empty list.
+///
+/// On the task detail page a failed read and a task with no related rows draw
+/// the same empty list, so folding the failure in says "this task depends on
+/// nothing" about a graph nobody managed to read. `None` still answers an empty
+/// list: that is a read answer (no such relation), not a failure.
+fn related_tasks_from_reading(
+    reading: cog_core::SFResult<Option<Vec<Task>>>,
+    what: &str,
+) -> Result<Vec<Task>, ApiError> {
+    let rows = reading.map_err(|e| {
+        ApiError::service_unavailable(format!("the task's {what} could not be read: {e}"))
+    })?;
+    Ok(rows.unwrap_or_default())
 }
 
 /// Whether a reader holding `claims` may see `task`.
@@ -1211,7 +1272,10 @@ pub async fn list_tasks_handler(
     let filter = status_filter(&query)?;
     let page = page_limit(&query)?;
     let ready = ready_ids(&state, filter).await?;
-    let tasks = state.orchestrator.get_all_tasks().await;
+    let tasks = task_rows_from_reading(
+        state.orchestrator.get_all_tasks_checked().await,
+        "task list",
+    )?;
     let mut rows: Vec<Task> = tasks
         .into_iter()
         .filter(|t| {
@@ -1270,7 +1334,10 @@ pub async fn get_ready_tasks_handler(
     claims: Option<axum::Extension<cog_core::Claims>>,
 ) -> Result<Json<Vec<TaskView>>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
-    let tasks = state.orchestrator.get_ready_tasks().await;
+    let tasks = task_rows_from_reading(
+        state.orchestrator.get_ready_tasks_checked().await,
+        "ready queue",
+    )?;
     let views: Vec<TaskView> = tasks
         .into_iter()
         .filter(|t| visible_to_claims(claims, t))
@@ -1482,16 +1549,16 @@ pub async fn purge_tasks_handler(
         .older_than_secs
         .map(|s| chrono::Utc::now() - chrono::Duration::seconds(s));
 
-    let matched: Vec<Task> = state
-        .orchestrator
-        .get_all_tasks()
-        .await
-        .into_iter()
-        .filter(|t| {
-            visible_to_claims(claims, t)
-                && purge_matches(t, &statuses, req.task_type_prefix.as_deref(), cutoff)
-        })
-        .collect();
+    let matched: Vec<Task> = task_rows_from_reading(
+        state.orchestrator.get_all_tasks_checked().await,
+        "task list",
+    )?
+    .into_iter()
+    .filter(|t| {
+        visible_to_claims(claims, t)
+            && purge_matches(t, &statuses, req.task_type_prefix.as_deref(), cutoff)
+    })
+    .collect();
 
     let mut cancelled: Vec<String> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
@@ -1530,20 +1597,20 @@ pub async fn task_summary_handler(
     claims: Option<axum::Extension<cog_core::Claims>>,
 ) -> Result<Json<TaskSummary>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
-    let all: Vec<Task> = state
-        .orchestrator
-        .get_all_tasks()
-        .await
-        .into_iter()
-        .filter(|t| visible_to_claims(claims, t))
-        .collect();
-    let ready: Vec<Task> = state
-        .orchestrator
-        .get_ready_tasks()
-        .await
-        .into_iter()
-        .filter(|t| visible_to_claims(claims, t))
-        .collect();
+    let all: Vec<Task> = task_rows_from_reading(
+        state.orchestrator.get_all_tasks_checked().await,
+        "task list",
+    )?
+    .into_iter()
+    .filter(|t| visible_to_claims(claims, t))
+    .collect();
+    let ready: Vec<Task> = task_rows_from_reading(
+        state.orchestrator.get_ready_tasks_checked().await,
+        "ready queue",
+    )?
+    .into_iter()
+    .filter(|t| visible_to_claims(claims, t))
+    .collect();
     // Counted over what this reader can see, not the whole graph: a summary
     // whose totals and body disagree sends the reader looking for tasks it is
     // never shown.
@@ -1573,11 +1640,10 @@ pub async fn get_task_dependents_handler(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<TaskView>>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
-    let tasks = state
-        .orchestrator
-        .get_dependents(&id)
-        .await
-        .unwrap_or_default();
+    let tasks = related_tasks_from_reading(
+        state.orchestrator.get_dependents_checked(&id).await,
+        "dependents",
+    )?;
     let views: Vec<TaskView> = tasks
         .into_iter()
         .filter(|t| visible_to_claims(claims, t))
@@ -1592,11 +1658,10 @@ pub async fn get_task_dependencies_handler(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<TaskView>>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
-    let tasks = state
-        .orchestrator
-        .get_dependencies(&id)
-        .await
-        .unwrap_or_default();
+    let tasks = related_tasks_from_reading(
+        state.orchestrator.get_dependencies_checked(&id).await,
+        "dependencies",
+    )?;
     let views: Vec<TaskView> = tasks
         .into_iter()
         .filter(|t| visible_to_claims(claims, t))
@@ -1726,16 +1791,14 @@ pub async fn update_task_handler(
     Json(req): Json<UpdateTaskRequest>,
 ) -> Result<Json<UpdateTaskResponse>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
-    let all = state.orchestrator.get_all_tasks().await;
-    let visible: Vec<Task> = all
-        .into_iter()
-        .filter(|t| visible_to_claims(claims, t))
-        .collect();
-    let mut task = visible
-        .iter()
-        .find(|t| t.id == id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found(format!("task '{id}' does not exist")))?;
+    let visible: Vec<Task> = task_rows_from_reading(
+        state.orchestrator.get_all_tasks_checked().await,
+        "task list",
+    )?
+    .into_iter()
+    .filter(|t| visible_to_claims(claims, t))
+    .collect();
+    let mut task = task_to_change(&visible, &id)?.clone();
     // 改前的样子先留一份：审计问的是「改成了什么」，只有改后的值答不了。
     let before = serde_json::json!({
         "parent_task_id": task.parent_task_id,
@@ -1891,17 +1954,11 @@ pub async fn save_task_plan_handler(
     Json(req): Json<SaveTaskPlanRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
-    let tasks: Vec<Task> = state
-        .orchestrator
-        .get_all_tasks()
-        .await
-        .into_iter()
-        .filter(|t| visible_to_claims(claims, t))
-        .collect();
-    let task = tasks
-        .iter()
-        .find(|t| t.id == id)
-        .ok_or_else(|| ApiError::not_found(format!("task '{id}' does not exist")))?;
+    let task = task_to_change_from_reading(
+        state.orchestrator.get_all_tasks_checked().await,
+        claims,
+        &id,
+    )?;
 
     // 没有验收标准的工作包没有「做完」的判据：给它排一条期，等于给一件谁也
     // 说不清完成没有的活定一个计划价值。
@@ -2119,17 +2176,14 @@ pub async fn move_task_handler(
         .with_code("unknown_column")
     })?;
 
-    let tasks: Vec<Task> = state
-        .orchestrator
-        .get_all_tasks()
-        .await
-        .into_iter()
-        .filter(|t| visible_to_claims(claims, t))
-        .collect();
-    let task = tasks
-        .iter()
-        .find(|t| t.id == id)
-        .ok_or_else(|| ApiError::not_found(format!("task '{id}' does not exist")))?;
+    let tasks: Vec<Task> = task_rows_from_reading(
+        state.orchestrator.get_all_tasks_checked().await,
+        "task list",
+    )?
+    .into_iter()
+    .filter(|t| visible_to_claims(claims, t))
+    .collect();
+    let task = task_to_change(&tasks, &id)?;
 
     let step = move_step(task.status.as_str(), target.as_str())
         .map_err(|refusal| ApiError::bad_request(refusal.message()).with_code(refusal.code()))?;
@@ -2407,6 +2461,149 @@ mod tests {
             graph_from_reading(Ok((vec![row], vec![edge.clone()]))).expect("读得出来时原样交回");
         assert_eq!(nodes.len(), 1, "节点是读回来的那一行");
         assert_eq!(edges, vec![edge], "边是读回来的那一条");
+    }
+
+    /// 关联名单读不出来，不是「这条任务没有关联」。
+    ///
+    /// 详情页把「读不出来」与「没有下游 / 没有依赖」画成同一张空列表。读失败
+    /// 被折进去时，页面会替一条读都没读到的图作证「它谁也不依赖」。读不出来要
+    /// 拒绝，`None` 仍是一份读得到的答案（空列表），`Some` 原样交回。
+    #[test]
+    fn an_unreadable_relation_list_is_not_a_task_with_no_relations() {
+        for what in ["dependents", "dependencies"] {
+            let unreadable: cog_core::SFResult<Option<Vec<Task>>> = Err(
+                cog_core::SFError::Database("connection reset while reading the rows".into()),
+            );
+            let refusal = related_tasks_from_reading(unreadable, what)
+                .expect_err("读不出来时要交回拒绝，不能交回一张空列表");
+            assert!(
+                refusal.message.contains("connection reset"),
+                "拒绝的理由要带原始错误，让人看得出是读失败: {}",
+                refusal.message
+            );
+            assert!(
+                refusal.message.contains(what),
+                "拒绝的理由要点名是哪一份名单读不出来: {}",
+                refusal.message
+            );
+            assert_eq!(
+                refusal.into_response().status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "名单读不出来是「这个部署现在回答不了」，不是一场 200"
+            );
+        }
+
+        let none = related_tasks_from_reading(Ok(None), "dependents")
+            .expect("没有关联是一份读得出来的答案");
+        assert!(none.is_empty(), "空名单原样交回，不编造任何行");
+
+        let rows = related_tasks_from_reading(
+            Ok(Some(vec![task(
+                "t-up",
+                cog_core::TaskStatus::Completed,
+                "t",
+                0,
+            )])),
+            "dependencies",
+        )
+        .expect("读得出来时原样交回");
+        assert_eq!(rows.len(), 1, "交回的是读回来的那一行");
+    }
+
+    /// 任务表读不出来，不是「一条任务都没有」。
+    ///
+    /// 任务列表、它上方那张汇总、以及清理接口的预览都在这同一读上数行：
+    /// 把这些数折成零，一个读不动库的部署会报告「0 条任务」「0 条就绪」「没
+    /// 有什么可清理」——本节里最干净、也最不可质疑的那几个数。读不出来要
+    /// 拒绝，读得出来的空行集仍是 200 的零。
+    #[test]
+    fn an_unreadable_task_list_is_not_an_empty_task_list() {
+        for what in ["task list", "ready queue"] {
+            let unreadable: cog_core::SFResult<Vec<Task>> = Err(cog_core::SFError::Database(
+                "connection reset while reading the tasks".into(),
+            ));
+            let refusal = task_rows_from_reading(unreadable, what)
+                .expect_err("读不出来时要交回拒绝，不能交回一张空表");
+            assert!(
+                refusal.message.contains("connection reset"),
+                "拒绝的理由要带原始错误，让人看得出是读失败: {}",
+                refusal.message
+            );
+            assert!(
+                refusal.message.contains(what),
+                "拒绝的理由要点名是哪一份读数读不出来: {}",
+                refusal.message
+            );
+            assert_eq!(
+                refusal.into_response().status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "任务表读不出来是「这个部署现在回答不了」，不是一场 200"
+            );
+        }
+
+        let rows = task_rows_from_reading(
+            Ok(vec![task("t-one", cog_core::TaskStatus::Pending, "t", 0)]),
+            "task list",
+        )
+        .expect("读得出来时照常交回");
+        assert_eq!(rows.len(), 1, "交回的是读回来的那一行");
+
+        let empty = task_rows_from_reading(Ok(Vec::new()), "task list")
+            .expect("一条都没有是一份读得出来的答案");
+        assert!(empty.is_empty(), "空表原样交回，不编造任何行");
+    }
+
+    /// 读不出来的任务不是「不存在的任务」。
+    ///
+    /// 改任务、存计划、挪列这三条写路径都在同一读上找自己要改的那一行。旧读
+    /// 把库故障折成空表，于是一条真实存在的任务被告知「does not exist」——那是
+    /// 一句关于这条任务的话，而实际发生的是另一件事。读不出来要 503；404 留给
+    /// 「真读到了、而且在可见范围内确实没有这一行」。
+    #[test]
+    fn a_task_that_cannot_be_read_is_not_a_task_that_does_not_exist() {
+        let unreadable: cog_core::SFResult<Vec<Task>> = Err(cog_core::SFError::Database(
+            "connection refused while reading the tasks".into(),
+        ));
+        let refusal = task_to_change_from_reading(unreadable, None, "t-1")
+            .expect_err("读不出来时不能判这条任务不存在");
+        assert!(
+            refusal.message.contains("connection refused"),
+            "拒绝的理由要带原始错误，让人看得出是读失败: {}",
+            refusal.message
+        );
+        let response = refusal.into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "读不出来是「这个部署现在回答不了」，不是 404"
+        );
+
+        // 真读到、但没有这一行：仍是 404——那是读到的答案。
+        let missing = task_to_change_from_reading(Ok(Vec::new()), None, "t-1")
+            .expect_err("读过之后确实没有这一行");
+        assert_eq!(
+            missing.into_response().status(),
+            StatusCode::NOT_FOUND,
+            "见过这一份行、里面没有它，才是 404"
+        );
+
+        // 别人的任务读得到、但不是这个调用方可见的：照旧 404，不泄露存在性。
+        let scoped = claims(&["ws-a"]);
+        let hidden = task_to_change_from_reading(
+            Ok(vec![task("t-1", cog_core::TaskStatus::Pending, "t", 0)]),
+            Some(&scoped),
+            "t-1",
+        )
+        .expect_err("可见范围之外的行与不存在是同一种回答");
+        assert_eq!(hidden.into_response().status(), StatusCode::NOT_FOUND);
+
+        let found = task_to_change_from_reading(
+            Ok(vec![task("t-1", cog_core::TaskStatus::Pending, "t", 0)]),
+            None,
+            "t-1",
+        )
+        .expect("读得出来、读得到、也看得见，就该交回那一行");
+        assert_eq!(found.id, "t-1");
     }
 
     /// 状态词必须与读面印出来的那个词逐字一致：`TaskFilter` 用 `as_str` 印行，

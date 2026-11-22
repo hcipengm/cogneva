@@ -1552,6 +1552,24 @@ async fn rpc_tasks_get(
     }
 }
 
+/// 读任务表；读不到就回一帧 JSON-RPC 内部错误。
+///
+/// 分页是对「已经读到的那一页」做的。先把读失败折成空表，`ListTasks` 就会在库
+/// 读不出来的时候答「你有 0 条任务」——对端唯一的视野，被一句它无法分辨的
+/// 谎话填满：与一个真的还没建过活的部署逐字同形。
+fn task_rows_or_error(
+    reading: cog_core::SFResult<Vec<Task>>,
+    rpc_id: &Value,
+) -> Result<Vec<Task>, Value> {
+    reading.map_err(|e| {
+        rpc_error(
+            rpc_id,
+            -32603,
+            format!("the task list could not be read: {e}"),
+        )
+    })
+}
+
 /// `ListTasks`（1.0）：翻一页对端能看见的任务。
 ///
 /// 没有这条方法时，对端对它建过的任务只有一个视野：`message/send` 当时回给它的
@@ -1574,7 +1592,11 @@ async fn rpc_list_tasks(
         }
     };
 
-    let (page, next, total) = list_page(state.orchestrator.get_all_tasks().await, &query);
+    let tasks = match task_rows_or_error(state.orchestrator.get_all_tasks_checked().await, rpc_id) {
+        Ok(tasks) => tasks,
+        Err(error) => return (StatusCode::OK, Json(error)).into_response(),
+    };
+    let (page, next, total) = list_page(tasks, &query);
     let tasks: Vec<Value> = page
         .iter()
         .map(|task| {
@@ -2448,6 +2470,37 @@ mod tests {
         assert_eq!(page[0].id, "g-old");
         assert_eq!(next, "", "the last page says there is no next one");
         assert_eq!(total, 3, "the total counts the whole filter, not the page");
+    }
+
+    /// 读不出来的一张表不能答成「你有 0 条任务」。
+    ///
+    /// 判据：把 `task_rows_or_error` 换回 `unwrap_or_default()`，这条会红——而那
+    /// 正是对端唯一的视野被一句它无法分辨的谎话填满的样子。
+    #[test]
+    fn a_task_list_that_cannot_be_read_is_not_zero_tasks() {
+        let error = task_rows_or_error(
+            Err(cog_core::SFError::Database("store unavailable".into())),
+            &json!("ask-1"),
+        )
+        .expect_err("读失败不许折成一张空表");
+        assert_eq!(error["jsonrpc"], json!("2.0"));
+        assert_eq!(error["id"], json!("ask-1"));
+        assert_eq!(error["error"]["code"], json!(-32603));
+        let message = error["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("could not be read"), "{message}");
+        assert!(message.contains("store unavailable"), "{message}");
+    }
+
+    /// 真读到的一页原样过去，条数不改写。
+    #[test]
+    fn a_task_list_that_was_read_passes_through() {
+        let rows = task_rows_or_error(
+            Ok(vec![Task::goal_row("g-1".to_string(), "a goal")]),
+            &json!(7),
+        )
+        .expect("读到的一页");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "g-1");
     }
 
     /// 过滤是过滤，写错的东西要报错，不能静默变成「没有过滤」。

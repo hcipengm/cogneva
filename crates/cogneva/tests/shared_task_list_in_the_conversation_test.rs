@@ -2,7 +2,7 @@
 //!
 //! 从前的形状是「账本共享、对话内无面板」：智能体在这一轮挂上任务图一行，人要看
 //! 「谁在做、做到哪」，得离开这段对话去工作台。两处读的本来就是同一张表
-//! （`OrchestratorControl::get_all_tasks`），没有第二个出处可言。
+//! （`OrchestratorControl::get_all_tasks_checked`），没有第二个出处可言。
 //!
 //! 与 E8 的单轮待办分开：那一份是「这一轮自己要做的几步」，这一份是「这一段对话
 //! 挂上了任务图上的哪几行」。两样东西的寿命不同，画在一起会让读的人以为它们一起
@@ -14,8 +14,8 @@
 //!    在那里认它——工具自己不知道「这一段对话」这个概念；
 //! 2. **只写那一刻已确定的事**：哪一行、什么活、派给谁、属于哪个 goal。状态不抄
 //!    进对话——那是任务图随时间的读数，抄一份就成了永远停在入队的副本；
-//! 3. **同一张表**：列表拿 id 去 `/api/v1/tasks/list?ids=` 读回，与工作台同一个
-//!    `get_all_tasks`，不是另一份账；
+//! 3. **同一张表**：列表拿 id 去 `/api/v1/tasks/list?ids=` 读回，与工作台同一条
+//!    `get_all_tasks_checked`，不是另一份账；
 //! 4. **页面上画成一片**，叠上总线上已经到过的状态变迁。
 //!
 //! 行为那一半在 `cog_gateway::tasks::tests::an_id_filter_keeps_exactly_the_rows_it_names`；
@@ -117,7 +117,7 @@ fn the_list_reads_the_same_graph_the_workbench_reads() {
         "{TASKS} 的 id 过滤没有挂进读口的判据：`?ids=` 会被静默忽略"
     );
     assert!(
-        tasks.contains("state.orchestrator.get_all_tasks().await"),
+        tasks.contains("state.orchestrator.get_all_tasks_checked().await"),
         "{TASKS} 换了一条读源：对话里的列表与工作台从此不是同一份账"
     );
 }

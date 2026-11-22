@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { useAgentConversation } from '@/hooks/useAgentConversation';
+import { EmployeeAvatar } from '@/components/EmployeeAvatar';
 import type { AgentConversationLine } from '@/api/client';
 
 /**
@@ -123,15 +124,18 @@ export function AgentsOverlay({ onClose }: { onClose: () => void }) {
               <button
                 key={agent.agent_id}
                 onClick={() => select(agent.agent_id)}
-                className={`mb-1 block w-full rounded-lg px-2 py-1.5 text-left text-xs transition ${
+                className={`mb-1 flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs transition ${
                   selected === agent.agent_id
                     ? 'bg-sky-500/15 text-sky-200'
                     : 'text-slate-300 hover:bg-slate-800/70'
                 }`}
               >
-                <div className="font-medium">{agent.agent_id}</div>
-                <div className="text-slate-500">
-                  {agent.role} · {agent.workspace_id}
+                <EmployeeAvatar employeeId={agent.agent_id} size={28} />
+                <div className="min-w-0">
+                  <div className="truncate font-medium">{agent.agent_id}</div>
+                  <div className="truncate text-slate-500">
+                    {agent.role} · {agent.workspace_id}
+                  </div>
                 </div>
               </button>
             ))}

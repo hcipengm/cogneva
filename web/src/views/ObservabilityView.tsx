@@ -1,5 +1,14 @@
 import { useState } from 'react';
-import { getClusterComponents, getClusterOverview, getSupervisorStatus, type ClusterOverview } from '@/api/client';
+import {
+  getClusterComponents,
+  getClusterOverview,
+  getSupervisorGate,
+  getSupervisorQueueStats,
+  getSupervisorStatus,
+  pauseSupervisorGate,
+  resumeSupervisorGate,
+  type ClusterOverview,
+} from '@/api/client';
 import { useResource, type Resource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
@@ -120,13 +129,45 @@ export function ObservabilityView() {
 function OverviewBoard({ overview }: { overview: Resource<ClusterOverview> }) {
   const setActivity = useShell((s) => s.setActivity);
   const supervisor = useResource('监管者状态', getSupervisorStatus, 20_000);
+  const gate = useResource('派发闸门', getSupervisorGate, 20_000);
+  const queue = useResource('监管者队列', getSupervisorQueueStats, 20_000);
   const components = useResource('工作负载存活', getClusterComponents, 30_000);
+  const appendOutput = useShell((s) => s.appendOutput);
   // 三块并排，变的原因常常是同一件事（一次派发让监管者多了一批要管的、让工作负载
   // 多起一个 Pod），所以一起重读——分两次读，画面会先变一半再变另一半。
   useKindTickedRefresh(
     ['tasks', 'agents', 'alerts', 'usage', resourceKey('cluster'), resourceKey('supervisor')],
-    [supervisor.refresh, components.refresh]
+    [supervisor.refresh, gate.refresh, queue.refresh, components.refresh]
   );
+
+  /**
+   * 停 / 恢复派发。
+   *
+   * 这一下不是改一张表：闸门一合，已经就绪的任务不再被派给谁；闸门开着时按
+   * 「继续」只解除「暂停」，不会把已经卡住的活重新点一遍。所以先要人确认，
+   * 两种结局（真改变了 / 本来就是这个状态）都念出来。
+   */
+  const flipGate = async (pause: boolean) => {
+    const what = pause ? '暂停派发' : '恢复派发';
+    if (!window.confirm(`${what}？${pause ? '已就绪的任务将不再被派给任何人。' : '闸门打开后，就绪的任务会重新开始被派发。'}`))
+      return;
+    try {
+      let changed: boolean;
+      if (pause) {
+        const result = await pauseSupervisorGate();
+        changed = !result.was_already_paused;
+      } else {
+        const result = await resumeSupervisorGate();
+        changed = result.was_paused;
+      }
+      appendOutput(changed ? `${what}：已生效` : `${what}：闸门本来就是这个状态，没有改变`);
+      gate.refresh();
+      supervisor.refresh();
+    } catch (e) {
+      const err = e as { status?: number; message?: string };
+      appendOutput(`${what}失败（HTTP ${err.status ?? '?'}）：${err.message ?? '未知原因'}`);
+    }
+  };
 
   const o = overview.data;
   const s = supervisor.data;
@@ -177,6 +218,65 @@ function OverviewBoard({ overview }: { overview: Resource<ClusterOverview> }) {
         )}
         {/* 「健全的占多少」是这一屏最要紧的一句话，而它散在七个格子里的前三格里：
             三格各是一个数，读者要自己把它们加起来才知道这一池子有几成是好的。 */}
+        {/* 队列读数与上面那七格不是同一份快照：上面答「这一池人各怎样」，下面答
+            「还有多少活在等、有几条掉进死信、最近一次扩充建议是何时为什么」。两者
+            分开读，因为它们来自不同的事实源（状态快照 vs 事件缓存），合并会把
+            「没有建议」和「巡检还没跑」说成同一件事——那是 `cycle` 这一格的用处。 */}
+        {queue.data ? (
+          <Readings
+            from={queue}
+            source="GET /api/v1/supervisor/queue_stats"
+            caveat="扩充建议记的是最近一条事件，不是「现在负载高不高」；看它是一秒前还是十分钟前的，要读 decided_at。"
+          >
+            <div className="flex flex-wrap border-t border-[var(--line)] py-2">
+              <Reading label="待交接" value={queue.data.pending_handoffs} />
+              <Reading
+                label="重试中"
+                value={queue.data.retry_count}
+                tone={queue.data.retry_count > 0 ? 'warn' : 'plain'}
+              />
+              <Reading
+                label="死信"
+                value={queue.data.dlq_count}
+                tone={queue.data.dlq_count > 0 ? 'danger' : 'plain'}
+              />
+              <Reading
+                label="就绪任务"
+                value={queue.data.ready_tasks}
+                note="等待被派发的分母"
+              />
+              <Reading
+                label="扩充建议"
+                value={queue.data.scale_recommendation ? `+${queue.data.scale_recommendation.recommended_agents}` : '无'}
+                tone={queue.data.scale_recommendation ? 'warn' : 'plain'}
+                note={
+                  queue.data.scale_recommendation
+                    ? `${queue.data.scale_recommendation.reason} · ${new Date(
+                        queue.data.scale_recommendation.decided_at
+                      ).toLocaleTimeString('zh-CN')}`
+                    : queue.data.cycle === 0
+                      ? '巡检还没跑过第一拍'
+                      : '巡检跑过，这次没有越线'
+                }
+              />
+              <Reading label="巡检轮次" value={queue.data.cycle} note="与上面那一格同一份缓存" />
+            </div>
+          </Readings>
+        ) : queue.error ? (
+          <ReadError what="监管者队列" error={queue.error} onRetry={queue.refresh} />
+        ) : null}
+        {s && (
+          <div className="flex items-center gap-2 px-4 pb-2 text-[11px]">
+            <Button tone={s.scheduler_paused ? 'accent' : 'plain'} onClick={() => void flipGate(!s.scheduler_paused)}>
+              {s.scheduler_paused ? '恢复派发' : '暂停派发'}
+            </Button>
+            <span className="text-[var(--muted)]">
+              闸门 {gate.error ? '读不到（上面那一格取自监管者状态）' : gate.data?.paused ? '合着' : '开着'}
+              {gate.data ? ` · 读于 ${new Date(gate.data.timestamp).toLocaleTimeString('zh-CN')}` : ''}
+              · POST /supervisor/gate/pause|resume
+            </span>
+          </div>
+        )}
         {s && (
           <Strip
             label="这一池执行者各处在什么状态"

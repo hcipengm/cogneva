@@ -152,7 +152,6 @@ async fn every_registered_employee_has_a_number() {
                 "127.0.0.1",
                 role.to_string(),
                 "default",
-                vec![role.to_string()],
                 cog_core::ResourceInfo::default(),
             ))
             .await
@@ -223,7 +222,6 @@ async fn one_employee_is_the_same_name_everywhere() {
             "127.0.0.1",
             "planner".to_string(),
             "default",
-            vec!["planner".to_string()],
             cog_core::ResourceInfo::default(),
         ))
         .await

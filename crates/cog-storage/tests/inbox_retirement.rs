@@ -131,7 +131,6 @@ async fn register(agent_id: &str) {
             agent_id: agent_id.to_string(),
             role: "probe".into(),
             workspace_id: "probe".into(),
-            capabilities: vec![],
             resources: ResourceInfo::default(),
             hostname: "probe".into(),
             pod_ip: "127.0.0.1".into(),
