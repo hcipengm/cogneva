@@ -1,7 +1,8 @@
-import { listSnapshots } from '@/api/client';
+import { getSnapshotUrl, listSnapshots } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
-import { Empty, Loading, ReadError, Table, ViewFrame } from '@/ui/primitives';
+import { useShell } from '@/shell/store';
+import { Button, Empty, Loading, ReadError, Table, ViewFrame } from '@/ui/primitives';
 
 /**
  * 快照面：任务在哪个事件偏移上留过一份可回到的点。
@@ -16,6 +17,23 @@ export function SnapshotsView() {
   // 快照不是谁写出来的，是任务跑到某一步留下的点：读它该订任务那一族帧，而不是
   // 等 30 秒一拍。任务在跑的时候，新落点跟着任务帧一起到。
   useKindTickedRefresh(['tasks'], page.refresh);
+  const appendOutput = useShell((s) => s.appendOutput);
+
+  /**
+   * 取一份快照的取回地址。地址由观测后端现签，过了有效期就取不回来——所以它被
+   * 念在输出格里，而不是挂在页面上当链接：一条看起来永久、点下去 403 的地址比
+   * 没有更坏。
+   */
+  const fetchUrl = async (snapshotId: string) => {
+    try {
+      const res = await getSnapshotUrl(snapshotId);
+      appendOutput(`快照 ${snapshotId} 的取回地址：${res.url}（现签，可能过期）`);
+    } catch (e) {
+      const err = e as { status?: number; message?: string };
+      appendOutput(`取快照 ${snapshotId} 的地址失败（HTTP ${err.status ?? '?'}）：${err.message ?? '未知原因'}`);
+    }
+  };
+
   if (page.error) return <ReadError what="快照" error={page.error} onRetry={page.refresh} />;
   if (!page.data) return <Loading what="快照" />;
   const rows = page.data.snapshots ?? [];
@@ -30,6 +48,12 @@ export function SnapshotsView() {
             { key: 'task', title: '任务', render: (r) => r.task_id },
             { key: 'off', title: '事件偏移', width: '110px', render: (r) => String(r.event_offset) },
             { key: 'at', title: '时间', width: '190px', render: (r) => r.timestamp },
+            {
+              key: 'url',
+              title: '',
+              width: '90px',
+              render: (r) => <Button onClick={() => void fetchUrl(r.snapshot_id)}>取地址</Button>,
+            },
           ]}
           rows={rows}
           rowKey={(r) => r.snapshot_id}

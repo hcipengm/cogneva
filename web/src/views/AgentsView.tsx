@@ -9,6 +9,7 @@ import {
   type LiveAgentRow,
 } from '@/store/liveAgents';
 import { useLiveAgentStore } from '@/store/liveAgentStore';
+import { EmployeeAvatar } from '@/components/EmployeeAvatar';
 import { Button, Empty, Loading, Moment, ReadError, Reading, Readings, Table } from '@/ui/primitives';
 import { BarList, Strip, type Tone } from '@/ui/plots';
 
@@ -275,16 +276,23 @@ export function EmployeeRoster({ onPick }: { onPick?: (agentId: string) => void 
                 key: 'person',
                 title: '员工',
                 render: (g) => (
-                  <span className="inline-flex items-baseline gap-1.5">
-                    <Note
-                      className="text-[12px]"
-                      text={g.personId ?? `${g.caps} 个座位，都还没有人`}
-                    >
-                      {g.displayName}
-                    </Note>
-                    {g.retired && (
-                      <span className="text-[10px] text-[var(--muted)]">离职</span>
-                    )}
+                  <span className="inline-flex items-center gap-2">
+                    <EmployeeAvatar
+                      employeeId={g.personId ?? g.displayName}
+                      name={g.displayName}
+                      size={24}
+                    />
+                    <span className="inline-flex items-baseline gap-1.5">
+                      <Note
+                        className="text-[12px]"
+                        text={g.personId ?? `${g.caps} 个座位，都还没有人`}
+                      >
+                        {g.displayName}
+                      </Note>
+                      {g.retired && (
+                        <span className="text-[10px] text-[var(--muted)]">离职</span>
+                      )}
+                    </span>
                   </span>
                 ),
               },
@@ -301,15 +309,10 @@ export function EmployeeRoster({ onPick }: { onPick?: (agentId: string) => void 
               { key: 'caps', title: '帽子', width: '64px', render: (g) => (
                 <span className="mono text-[11px] text-[var(--muted)]">{g.caps}</span>
               ) },
-              // 主机、Pod IP、能力是「进程」那一层的，一个人的几顶帽子可以落在不
-              // 同进程里；只有一顶时它就是那个人的地址，多顶时这一格不属于某一个人。
-              { key: 'cap', title: '能力', render: (g) => (
-                <span className="text-[11px] text-[var(--paper-dim)]">
-                  {g.caps === 1 && g.lead?.capabilities.length
-                    ? g.lead.capabilities.join(' · ')
-                    : '—'}
-                </span>
-              ) },
+              // 主机、Pod IP 是「进程」那一层的，一个人的几个座位可以落在不同进程里；
+              // 只有一个时它就是那个人的地址，多个时这一格不属于某一个人。
+              // 能力不列：它是这个类（数字员工）的属性，人人同一份，写在一行里
+              // 不区分谁——要读它去看那个类，不看名册。
               { key: 'host', title: '主机', width: '160px', render: (g) => (
                 <span className="mono text-[11px] text-[var(--muted)]">
                   {g.caps === 1 ? g.lead?.hostname ?? '' : '—'}

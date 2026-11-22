@@ -2,12 +2,13 @@ import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useAgentConversation } from '@/hooks/useAgentConversation';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
-import { hireEmployee, type AgentConversationLine } from '@/api/client';
+import { hireEmployee, killAgent, restartAgent, type AgentConversationLine } from '@/api/client';
 import { ConversationPane } from '@/conversation/ConversationPane';
 import { SessionDock } from '@/conversation/SessionDock';
 import { conversationNames } from '@/conversation/callsign';
 import { useChatStore } from '@/store/chatStore';
 import { useServices } from '@/shell/context';
+import { useShell } from '@/shell/store';
 import { USE_MOCK } from '@/runtime';
 import { useLiveAgentStore } from '@/store/liveAgentStore';
 import { useStreamStore, type Message as StreamedMessage, type ToolCallRecord } from '@/store/streamStore';
@@ -330,6 +331,25 @@ export function PeopleView() {
     await send(text);
   };
 
+  /**
+   * 让 supervisor 重启 / 终止选中的这个执行者。
+   *
+   * 只有 supervisor 拉起来的进程才答得到：对话员工名下没有常驻进程，接口会答
+   * 404，这里把原文落进输出格，不把它说成「操作成功」。202 也只表示命令已发出。
+   */
+  const appendOutput = useShell((s) => s.appendOutput);
+  const control = async (label: string, action: (id: string) => Promise<void>, confirmText: string) => {
+    if (!selected || !window.confirm(confirmText)) return;
+    try {
+      await action(selected);
+      appendOutput(`${label}：命令已发给 ${selected}（进程何时真的退出由它自己决定）`);
+      refreshAgents();
+    } catch (e) {
+      const err = e as { status?: number; message?: string };
+      appendOutput(`${label}失败（${selected}，HTTP ${err.status ?? '?'}）：${err.message ?? '未知原因'}`);
+    }
+  };
+
   const hire = async () => {
     setHiring(true);
     setHireError(null);
@@ -470,7 +490,35 @@ export function PeopleView() {
                 {chosen ? `与 ${chosen.display_name} 的会话` : '先选一个员工'}
                 {loading && ' · 读取中…'}
               </span>
-              <Button onClick={refreshConversation}>刷新会话</Button>
+              <span className="flex items-center gap-2">
+                {chosen && (
+                  <>
+                    <Button
+                      onClick={() =>
+                        void control(
+                          '重启进程',
+                          restartAgent,
+                          `让 supervisor 重启 ${chosen.display_name}？它手上的活会被打断。`
+                        )
+                      }
+                    >
+                      重启进程
+                    </Button>
+                    <Button
+                      onClick={() =>
+                        void control(
+                          '终止进程',
+                          killAgent,
+                          `终止 ${chosen.display_name} 的进程？这不是离职——工号不回收，重启后还是同一个人。`
+                        )
+                      }
+                    >
+                      终止进程
+                    </Button>
+                  </>
+                )}
+                <Button onClick={refreshConversation}>刷新会话</Button>
+              </span>
             </div>
 
             <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2">

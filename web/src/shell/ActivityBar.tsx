@@ -37,13 +37,11 @@ const ITEMS: { id: ActivityId; label: string; icon: IconName }[] = [
   { id: 'token', label: 'Token', icon: 'token' },
   { id: 'resources', label: '资源', icon: 'resources' },
   { id: 'storage', label: '存储', icon: 'storage' },
-  { id: 'hooks', label: '钩子的增删查在，界面上没有编辑面', icon: 'storage' },
-  // 上传与卸载两条路由在，但这个构建只做解析、签名与编译：不装载模块，
-  // 所以它们答的是 501 而不是回执。这一格能读到的只有清单列表。
-  { id: 'plugins', label: '插件列表在；上传与卸载这个构建只校验不装载', icon: 'storage' },
-  { id: 'workspaces', label: '工作区列表与成员在，界面上没有入口', icon: 'storage' },
-  { id: 'action-plan', label: '动作计划只在 API 上', icon: 'storage' },
-  { id: 'datasets', label: '数据集列表与校验在，界面上没有入口', icon: 'storage' },
+  { id: 'hooks', label: '钩子', icon: 'governance' },
+  { id: 'plugins', label: '插件', icon: 'capabilities' },
+  { id: 'workspaces', label: '工作区', icon: 'projects' },
+  { id: 'action-plan', label: '动作计划', icon: 'flow' },
+  { id: 'datasets', label: '数据集', icon: 'eval' },
   { id: 'snapshots', label: '快照', icon: 'storage' },
   { id: 'wiki', label: '知识', icon: 'wiki' },
   { id: 'eval', label: '评测', icon: 'eval' },

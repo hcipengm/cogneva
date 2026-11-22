@@ -1,11 +1,15 @@
 import { useState } from 'react';
 import {
+  getMemoryMetrics,
   getMemoryRawContent,
   getMemoryStats,
   listMemoryRaw,
   listMemorySchema,
   listMemorySummary,
   listRawLogs,
+  searchMemory,
+  type MemoryMetrics,
+  type MemorySearchHit,
   type RawContent,
   type RawLogEntry,
   type RawMetadata,
@@ -13,7 +17,7 @@ import {
 import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
-import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
+import { Button, Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 import { BarList } from '@/ui/plots';
 
 import { Note } from '@/ui/Note';
@@ -88,6 +92,9 @@ function RawPreview({ item, onClose }: { item: RawMetadata; onClose: () => void 
 export function StorageView() {
   const [prefix, setPrefix] = useState('');
   const [picked, setPicked] = useState<RawMetadata | null>(null);
+  // 窗口是这次查询的一部分，不是一份新的事实：换窗口就重读，不留一份旧窗口的数
+  // 在旁边让人以为是同一段时间的。
+  const [windowSecs, setWindowSecs] = useState(60);
 
   // 筛选条件进标签：这个读面按名字重开，闭包里换参数不会触发重读。
   const raw = useResource(
@@ -96,6 +103,7 @@ export function StorageView() {
     60_000
   );
   const stats = useResource('归档计数', getMemoryStats, 60_000);
+  const timeline = useResource(`记忆操作时序（${windowSecs}s）`, () => getMemoryMetrics(windowSecs), 30_000);
   const logs = useResource('日志索引', () => listRawLogs({ limit: PAGE }), 60_000);
   const schema = useResource('结构化记忆', listMemorySchema, 120_000);
   const summary = useResource('摘要记忆', listMemorySummary, 120_000);
@@ -103,7 +111,7 @@ export function StorageView() {
   // 重读——上半页的条目与下半页的计数是同一批东西的两个视角，分两次读会自相矛盾。
   useKindTickedRefresh(
     [resourceKey('memory'), resourceKey('raw_logs')],
-    [raw.refresh, stats.refresh, logs.refresh, schema.refresh, summary.refresh]
+    [raw.refresh, stats.refresh, timeline.refresh, logs.refresh, schema.refresh, summary.refresh]
   );
 
   const listing = raw.data;
@@ -161,6 +169,8 @@ export function StorageView() {
           />
         </div>
       )}
+      <MemoryTimeline timeline={timeline} windowSecs={windowSecs} setWindowSecs={setWindowSecs} />
+      <MemorySearch />
       <section className="border-b border-[var(--line)]">
         <div className="flex items-baseline gap-2 px-4 py-2">
           <h2 className="text-[11px] uppercase tracking-wider text-[var(--muted)]">原始来源</h2>
@@ -322,4 +332,285 @@ export function StorageView() {
       </section>
     </ViewFrame>
   );
+}
+
+/**
+ * 记忆操作在最近一个窗口里的时序，按操作名聚起来。
+ *
+ * 两个 metric 的样本语义不同，所以两张表分开算、分开说：
+ * - `memory_operations_total` 的每条样本是**一次增量**，窗口内求和才是这段时间
+ *   发生了几次；直接把最后一条当累计数读，会把「十秒内写了 3 次」读成「总共 3 次」。
+ * - `memory_operation_latency_ms` 的每条样本是**一次观测**（毫秒），窗口内取条数、
+ *   均值、最大值；这里的均值是样本均值，不是分位数。
+ *
+ * 空数组有两种来源：窗口内真的没有操作，或者后端把样本清掉了。它们的形状一样，
+ * 所以空态不写成「什么都没发生」；能区分的那一种（后端没装配）走的是 503，
+ * 落在「读不到」上，不会走到这里。
+ */
+function MemoryTimeline({
+  timeline,
+  windowSecs,
+  setWindowSecs,
+}: {
+  timeline: {
+    data: MemoryMetrics | null;
+    error: string | null;
+    loading: boolean;
+    refresh: () => void;
+  };
+  windowSecs: number;
+  setWindowSecs: (secs: number) => void;
+}) {
+  const counters = aggregate(timeline.data?.counters ?? []);
+  const histograms = aggregate(timeline.data?.histograms ?? []);
+  const windows = [
+    { secs: 60, label: '1 分钟' },
+    { secs: 300, label: '5 分钟' },
+    { secs: 900, label: '15 分钟' },
+  ];
+
+  return (
+    <section className="border-b border-[var(--line)]">
+      <div className="flex flex-wrap items-center gap-2 px-4 py-2">
+        <h2 className="text-[11px] uppercase tracking-wider text-[var(--muted)]">操作时序</h2>
+        <span className="text-[11px] text-[var(--muted)]">窗口</span>
+        {windows.map((w) => (
+          <Button
+            key={w.secs}
+            tone={w.secs === windowSecs ? 'accent' : 'plain'}
+            onClick={() => setWindowSecs(w.secs)}
+          >
+            {w.label}
+          </Button>
+        ))}
+        <span className="mono ml-auto text-[10px] text-[var(--muted)]">GET /api/v1/memory/metrics?seconds=</span>
+      </div>
+      {timeline.error ? (
+        <ReadError what="操作时序" error={timeline.error} onRetry={timeline.refresh} />
+      ) : !timeline.data && timeline.loading ? (
+        <Loading what="操作时序" />
+      ) : counters.length === 0 && histograms.length === 0 ? (
+        <Empty>
+          这个窗口里一条记忆操作样本都没有。它可能是这段时间真的没人读写记忆，也可能是
+          后端把样本清掉了——两种在这里同形。指标后端没装配时这条路由答 503，会走「读不到」，
+          所以这个空不是「没配」。
+        </Empty>
+      ) : (
+        <>
+          {counters.length > 0 && (
+            <Table
+              columns={[
+                {
+                  key: 'op',
+                  title: '操作',
+                  render: (r) => <span className="mono text-[11px]">{r.op || '（没带 operation 标签）'}</span>,
+                },
+                {
+                  key: 'times',
+                  title: '次数',
+                  width: '110px',
+                  render: (r) => <span className="mono text-[11px]">{r.sum.toLocaleString('zh-CN')}</span>,
+                },
+                {
+                  key: 'samples',
+                  title: '样本',
+                  width: '90px',
+                  render: (r) => <span className="mono text-[11px]">{r.count}</span>,
+                },
+                {
+                  key: 'latest',
+                  title: '最后一次',
+                  width: '110px',
+                  render: (r) => <Moment iso={r.latest} />,
+                },
+              ]}
+              rows={counters}
+              rowKey={(r) => `counter:${r.op}`}
+            />
+          )}
+          {histograms.length > 0 && (
+            <Table
+              columns={[
+                {
+                  key: 'op',
+                  title: '操作的延迟',
+                  render: (r) => <span className="mono text-[11px]">{r.op || '（没带 operation 标签）'}</span>,
+                },
+                {
+                  key: 'n',
+                  title: '观测数',
+                  width: '90px',
+                  render: (r) => <span className="mono text-[11px]">{r.count}</span>,
+                },
+                {
+                  key: 'avg',
+                  title: '均值',
+                  width: '100px',
+                  render: (r) => <span className="mono text-[11px]">{r.sum / r.count >= 100 ? Math.round(r.sum / r.count) : (r.sum / r.count).toFixed(1)} ms</span>,
+                },
+                {
+                  key: 'max',
+                  title: '最大',
+                  width: '100px',
+                  render: (r) => <span className="mono text-[11px]">{r.max >= 100 ? Math.round(r.max) : r.max.toFixed(1)} ms</span>,
+                },
+                {
+                  key: 'latest',
+                  title: '最后一次',
+                  width: '110px',
+                  render: (r) => <Moment iso={r.latest} />,
+                },
+              ]}
+              rows={histograms}
+              rowKey={(r) => `hist:${r.op}`}
+            />
+          )}
+          <p className="px-4 pb-2 text-[11px] text-[var(--muted)]">
+            次数是窗口内样本求和（每条样本是一次增量）；延迟的均值是样本均值，不是分位数。
+          </p>
+        </>
+      )}
+    </section>
+  );
+}
+
+/**
+ * 记忆检索：一次查询同时问 schema 与摘要两层。
+ *
+ * 两层分开画：schema 命中的是「一条结构化的判断」，摘要命中的是「一段话」；它
+ * 们的身份与可比性都不一样，合成一张按得分排序的表会把两种东西当成同一种。这个
+ * 入口此前只有 API，界面能看存量、不能检索。
+ */
+function MemorySearch() {
+  const [query, setQuery] = useState('');
+  const [hits, setHits] = useState<MemorySearchHit[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const run = async () => {
+    const q = query.trim();
+    if (!q) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await searchMemory(q);
+      setHits(res.results);
+    } catch (e) {
+      const err = e as { status?: number; message?: string };
+      setHits(null);
+      setError(`检索失败（HTTP ${err.status ?? '?'}）：${err.message ?? '未知原因'}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="border-b border-[var(--line)]">
+      <div className="flex flex-wrap items-center gap-2 px-4 py-2">
+        <h2 className="text-[11px] uppercase tracking-wider text-[var(--muted)]">检索记忆</h2>
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') void run();
+          }}
+          placeholder="按文本检索 schema 与摘要"
+          className="mono w-72 border border-[var(--line)] bg-[var(--ink-900)] px-2 py-1 text-[11px] text-[var(--paper)] outline-none focus:border-[var(--brass)]"
+        />
+        <Button tone="accent" disabled={busy || !query.trim()} onClick={() => void run()}>
+          {busy ? '检索中…' : '检索'}
+        </Button>
+        <span className="mono ml-auto text-[10px] text-[var(--muted)]">POST /api/v1/memory/search</span>
+      </div>
+      {error && (
+        <div className="px-4 pb-2 text-[11px]" style={{ color: 'var(--danger)' }}>
+          {error}
+        </div>
+      )}
+      {hits && hits.length === 0 && (
+        <Empty>
+          两层都没有召回。空结果不等于「记忆里没有」——它只说明这次查询没有命中；
+          记忆后端没配时这条路由答 503，会走「读不到」。
+        </Empty>
+      )}
+      {hits && hits.length > 0 && (
+        <Table
+          columns={[
+            {
+              key: 'layer',
+              title: '层',
+              width: '90px',
+              render: (h: MemorySearchHit) => (
+                <span className="mono text-[11px]">{h.kind === 'schema' ? 'schema' : '摘要'}</span>
+              ),
+            },
+            {
+              key: 'name',
+              title: '是什么',
+              width: '200px',
+              render: (h: MemorySearchHit) =>
+                h.kind === 'schema' ? (
+                  <span className="mono text-[11px]">
+                    {h.data.kind} · {h.data.name}
+                  </span>
+                ) : (
+                  <span className="mono text-[10px] text-[var(--muted)]">{h.data.id}</span>
+                ),
+            },
+            {
+              key: 'body',
+              title: '内容',
+              render: (h: MemorySearchHit) =>
+                h.kind === 'schema' ? (
+                  <Note text={h.data.key} className="mono text-[11px] text-[var(--paper-dim)]">
+                    <span className="line-clamp-2">{h.data.key}</span>
+                  </Note>
+                ) : (
+                  <span className="line-clamp-2 text-[11px] text-[var(--paper-dim)]">{h.data.text}</span>
+                ),
+            },
+            {
+              key: 'confidence',
+              title: '置信度',
+              width: '90px',
+              render: (h: MemorySearchHit) => <span className="mono text-[11px]">{h.data.confidence.toFixed(2)}</span>,
+            },
+            {
+              key: 'score',
+              title: '相关度',
+              width: '90px',
+              render: (h: MemorySearchHit) =>
+                h.kind === 'summary' ? (
+                  <span className="mono text-[11px]">{h.data.score.toFixed(3)}</span>
+                ) : (
+                  <span className="text-[11px] text-[var(--muted)]">—</span>
+                ),
+            },
+          ]}
+          rows={hits}
+          rowKey={(h) => `${h.kind}:${h.data.id}`}
+        />
+      )}
+    </section>
+  );
+}
+
+/** 按操作名把样本聚成一格：条数、求和、最大、最后一次的时间。 */
+function aggregate(samples: { operation: string; value: number; timestamp: string }[]): {
+  op: string;
+  count: number;
+  sum: number;
+  max: number;
+  latest: string;
+}[] {
+  const byOp = new Map<string, { op: string; count: number; sum: number; max: number; latest: string }>();
+  for (const s of samples) {
+    const row = byOp.get(s.operation) ?? { op: s.operation, count: 0, sum: 0, max: 0, latest: s.timestamp };
+    row.count += 1;
+    row.sum += s.value;
+    row.max = Math.max(row.max, s.value);
+    if (s.timestamp > row.latest) row.latest = s.timestamp;
+    byOp.set(s.operation, row);
+  }
+  return [...byOp.values()].sort((a, b) => b.sum - a.sum);
 }
