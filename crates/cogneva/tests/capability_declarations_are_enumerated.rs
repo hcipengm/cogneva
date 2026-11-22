@@ -56,31 +56,6 @@ const KEY: &str = "\"capabilities\":";
 /// new line.
 const KNOWN: &[(&str, usize, &str)] = &[
     (
-        "crates/cog-agent/src/tools.rs",
-        1,
-        "a roster entry, not an advertisement: `list_agents` echoes each \
-         registered agent's own `capabilities` exactly as the registry holds \
-         them, which is the same field the send path checks before publishing. \
-         Nothing in it claims what this process can be asked to do, and there \
-         is no serving table to build it from -- the value belongs to the agent \
-         it describes, not to the server returning it",
-    ),
-    (
-        "crates/cog-gateway/src/agents.rs",
-        3,
-        "three roster entries, not advertisements, and for the same reason the \
-         `list_agents` echo above is one: the idle branch builds a row for a \
-         person who only exists while talking, the hired branch builds one for a \
-         name the roster holds with no live process behind it, and the employee \
-         branch builds one for a name that only the durable roster remembers -- \
-         a retired employee, or a task-scoped member the registry, the people \
-         store and the hire list never saw. The registry never held a capability \
-         list for any of them -- there is nothing to echo, so the field is the \
-         empty list the interface reads as 'claimed nothing'. Building it from a \
-         serving table would invent a claim about a process that does not exist. \
-         What the entries are, not what this tree can be asked to do",
-    ),
-    (
         "crates/cog-gateway/src/a2a.rs",
         2,
         "two server replies, one per version served (the 0.3 card and the 1.0 \

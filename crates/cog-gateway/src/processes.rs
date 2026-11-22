@@ -78,7 +78,6 @@ pub struct CrewProgress {
 pub struct AgentLoad {
     pub agent_id: String,
     pub role: String,
-    pub capabilities: Vec<String>,
     /// healthy / suspect / stuck / dead / unknown (no supervisor verdict).
     pub health: String,
     /// Running tasks currently assigned to this agent.
@@ -227,7 +226,6 @@ pub async fn process_overview_handler(
                     load_score: latest_hb.map(|hb| hb.load_score),
                     agent_id: r.agent_id,
                     role: r.role,
-                    capabilities: r.capabilities,
                     last_heartbeat: r.last_heartbeat,
                 });
             }

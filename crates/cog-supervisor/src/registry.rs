@@ -600,19 +600,6 @@ impl AgentRegistry {
             None => Ok(Vec::new()),
         }
     }
-
-    /// List agents by capability from the global registry, if attached.
-    pub async fn list_registered_agents_by_capability(
-        &self,
-        capability: &str,
-    ) -> SupervisorResult<Vec<cog_core::AgentRegistration>> {
-        match self.agent_registry.as_ref() {
-            Some(reg) => reg.list_by_capability(capability).await.map_err(|e| {
-                SupervisorError::Registry(format!("global registry list_by_capability failed: {e}"))
-            }),
-            None => Ok(Vec::new()),
-        }
-    }
 }
 
 impl cog_core::HeartbeatRegistry for AgentRegistry {

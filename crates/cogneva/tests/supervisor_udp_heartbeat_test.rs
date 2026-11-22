@@ -13,7 +13,6 @@ async fn udp_heartbeat_end_to_end() {
         "10.0.0.1",
         "planner",
         "ws-1",
-        vec!["code".into()],
         ResourceInfo {
             cpu_cores: 4,
             memory_gb: 8,

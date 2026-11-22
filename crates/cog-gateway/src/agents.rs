@@ -26,8 +26,6 @@ pub struct RegisterRequest {
     pub role: String,
     pub workspace_id: String,
     #[serde(default)]
-    pub capabilities: Vec<String>,
-    #[serde(default)]
     pub resources: ResourceInfo,
     /// Optional client-supplied uuid for deterministic agent_id.  When `None`
     /// we generate a fresh `uuid_v4` so multiple instances of the same pod
@@ -61,7 +59,6 @@ pub async fn register_handler(
         agent_id: agent_id.clone(),
         role: req.role,
         workspace_id: req.workspace_id,
-        capabilities: req.capabilities,
         resources: req.resources,
         hostname: req.hostname,
         pod_ip: req.pod_ip,
@@ -2028,7 +2025,6 @@ fn roster_with_people(
             "display_name": cog_core::unregistered_label(&agent_id),
             "role": "chat",
             "workspace_id": "default",
-            "capabilities": Vec::<String>::new(),
             "hostname": String::new(),
             "pod_ip": String::new(),
             "registered_at": row.first_seen,
@@ -2061,7 +2057,6 @@ fn roster_with_people(
             "display_name": cog_core::unregistered_label(&agent_id),
             "role": row.role,
             "workspace_id": "default",
-            "capabilities": Vec::<String>::new(),
             "hostname": String::new(),
             "pod_ip": String::new(),
             "registered_at": row.hired_at,
@@ -2098,7 +2093,6 @@ fn roster_with_people(
             "person_id": row.person(),
             "role": row.role,
             "workspace_id": "default",
-            "capabilities": Vec::<String>::new(),
             "hostname": String::new(),
             "pod_ip": String::new(),
             "registered_at": row.first_seen,
@@ -2709,7 +2703,6 @@ mod tests {
             "127.0.0.1",
             "planner",
             "default",
-            vec![],
             cog_core::ResourceInfo::default(),
         );
         let squad = cog_core::AgentRegistration::new(
@@ -2718,7 +2711,6 @@ mod tests {
             "127.0.0.1",
             "generator",
             "default",
-            vec![],
             cog_core::ResourceInfo::default(),
         );
         assert_eq!(roster_split(&[pool, squad]), (1, 1));
@@ -2732,7 +2724,6 @@ mod tests {
             "127.0.0.1",
             "planner",
             "default",
-            vec!["planner".into()],
             cog_core::ResourceInfo::default(),
         );
         let view = agent_view(&reg);
@@ -2754,7 +2745,6 @@ mod tests {
             "127.0.0.1",
             "planner",
             "default",
-            vec!["planner".into()],
             cog_core::ResourceInfo::default(),
         );
         let now = chrono::Utc::now();
@@ -3008,7 +2998,6 @@ mod tests {
             "127.0.0.1",
             "kai-a9ab11fc",
             "default",
-            vec![],
             cog_core::ResourceInfo::default(),
         );
         let row = PersonRow {
@@ -3060,7 +3049,6 @@ mod tests {
             "127.0.0.1",
             "employee:abc123",
             "default",
-            vec![],
             cog_core::ResourceInfo::default(),
         );
         let views = roster_with_people(&[reg], Vec::new(), hired, Vec::new());

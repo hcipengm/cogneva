@@ -49,7 +49,6 @@ pub async fn runtime_config_for(
 pub struct WorkerHandle {
     pub agent_id: String,
     pub role: String,
-    pub capabilities: Vec<String>,
     pub agent: Arc<Agent>,
     /// When this object was put on the roster.
     ///
@@ -390,7 +389,7 @@ impl GlobalAgentManager {
     /// * `agent_id` — unique worker identifier
     /// * `role` — agent role (planner, generator, evaluator)
     /// * `llm` — shared LLM provider
-    /// * `registration` — registry payload (capabilities, resources, etc.)
+    /// * `registration` — registry payload (resources, host, etc.)
     /// * `handler` — closure invoked for each [`InboxMessage`]
     pub async fn spawn_worker<F, Fut>(
         &self,
@@ -406,8 +405,6 @@ impl GlobalAgentManager {
     {
         let agent_id = agent_id.into();
         let config = self.runtime_config_for(&agent_id, &role).await;
-
-        let capabilities = registration.capabilities.clone();
 
         let agent = {
             let mut a = Agent::new(config, llm)
@@ -458,7 +455,6 @@ impl GlobalAgentManager {
         let handle = WorkerHandle {
             agent_id: agent_id.clone(),
             role: role.to_string(),
-            capabilities,
             agent: Arc::new(agent),
             created_at: std::time::Instant::now(),
             // A worker spawned with a caller-supplied handler is not tied to a
@@ -620,7 +616,6 @@ pub(crate) fn task_agent_registration(agent_id: &str, role: &str) -> cog_core::A
         "127.0.0.1",
         role.to_string(),
         "default",
-        vec![role.to_string()],
         cog_core::ResourceInfo::default(),
     )
 }
@@ -690,7 +685,6 @@ impl cog_core::AgentManager for GlobalAgentManager {
         // 自己去读，理由与上一句相同——运行时够不到任务，读不到就没得判。
         config.stated_directions = stated_directions;
 
-        let capabilities = vec![role.to_string()];
         let registration = task_agent_registration(agent_id, role);
 
         let agent = {
@@ -753,7 +747,6 @@ impl cog_core::AgentManager for GlobalAgentManager {
         let handle = WorkerHandle {
             agent_id: agent_id.into(),
             role: role.to_string(),
-            capabilities,
             agent: agent.clone(),
             created_at: std::time::Instant::now(),
             task_id: task_id.map(str::to_string),
@@ -794,7 +787,6 @@ impl cog_core::AgentManager for GlobalAgentManager {
             .map(|w| cog_core::WorkerInfo {
                 agent_id: w.agent_id,
                 role: w.role,
-                capabilities: w.capabilities,
                 owner_task: w.task_id,
             })
             .collect())
@@ -906,7 +898,6 @@ mod tests {
 
         assert_eq!(reg.hostname, "cogneva-647bb49dcd-4cttc");
         assert_eq!(reg.role, "planner");
-        assert_eq!(reg.capabilities, vec!["planner".to_string()]);
 
         match previous {
             Some(v) => std::env::set_var("COGNEVA_POD_NAME", v),

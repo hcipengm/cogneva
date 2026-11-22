@@ -1098,7 +1098,6 @@ impl ConversationTurn for PlatformConversation {
                     session: request.session_id.clone(),
                 },
             ));
-            let capabilities = tools.names();
             let mut runtime = cog_agent::AgentRuntime::new(config, events).with_tools(tools);
             // 属主写下的约定：只在这条连接既是某个登录身份、又接上了键值存储时
             // 才挂读面。没有身份就没有「属主」，读不到任何一个人的话——不挂，
@@ -1245,9 +1244,7 @@ impl ConversationTurn for PlatformConversation {
             // 说话的这一段时间它在名册上活着：续约间隔比名册的过期短，否则一轮
             // 长对话会在自己还在说的时候从名册上消失。
             let lease = match self.roster.as_ref() {
-                Some(roster) => {
-                    Some(EmployeeLease::take(roster.clone(), &employee, capabilities).await)
-                }
+                Some(roster) => Some(EmployeeLease::take(roster.clone(), &employee).await),
                 None => None,
             };
 
@@ -1508,7 +1505,6 @@ impl EmployeeLease {
     async fn take(
         roster: Arc<dyn cog_core::AgentRegistry>,
         employee: &cog_agent::identity::AgentName,
-        capabilities: Vec<String>,
     ) -> Self {
         // 第四个参数是用途标签，不是身份：写 `employee.id` 会让名册上这一列读音
         // 成 `kai-a9ab11fc`——一串机器码占着「这个人在做什么」的位置，而下线之后
@@ -1520,7 +1516,6 @@ impl EmployeeLease {
             "127.0.0.1",
             "chat",
             "default",
-            capabilities,
             cog_core::ResourceInfo::default(),
         );
         if let Err(e) = roster.register(&registration).await {
@@ -4965,12 +4960,6 @@ mod tests {
             ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
                 Ok(Vec::new())
             }
-            async fn list_by_capability(
-                &self,
-                _capability: &str,
-            ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
-                Ok(Vec::new())
-            }
         }
 
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4978,7 +4967,7 @@ mod tests {
         let roster = Arc::new(CountingRoster::default());
         let employee = employee_named(Some("inst-7f3a"), "cancelled-turn");
         let registry: Arc<dyn cog_core::AgentRegistry> = roster.clone();
-        let lease = EmployeeLease::take(registry, &employee, vec![]).await;
+        let lease = EmployeeLease::take(registry, &employee).await;
         // 心跳的第一拍是立刻到的：先让它真的开始续约，再把它放下。
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(

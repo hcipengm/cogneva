@@ -204,7 +204,6 @@ impl PoolSpawner {
             "127.0.0.1",
             &self.role,
             &self.workspace,
-            vec!["plan".into(), "generate".into(), "evaluate".into()],
             cog_core::ResourceInfo::default(),
         );
         let worker = PoolWorkerCell::default();

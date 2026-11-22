@@ -303,17 +303,12 @@ fn the_employee_is_on_the_roster_and_listens_before_it_speaks() {
         text.contains("EmployeeLease::take"),
         "说话的时候没有把自己登记进名册：这一轮里它不可达"
     );
-    // 名册上的「它能做什么」= 这一轮手上真有的工具。这里曾经填的是
-    // `vec![employee.id.clone()]`：能力字段里装着自己的 id，读出来是
-    // 「mira 的能力是 mira」，按能力找人的那一步什么也筛不出来——而员工
-    // 本来就没有预设，它有的只是这个进程给它的工具。
+    // 名册上曾经有一栏「它能做什么」，填的是这一轮的工具集。工具集对每个数字
+    // 员工都是同一份——同一个进程给同一套工具——所以按人列一列不区分谁，它已
+    // 经从名册负载里去掉。这条判据钉住它不再被传进来。
     assert!(
-        text.contains("let capabilities = tools.names();"),
-        "名册上的能力不是这一轮的工具集：那一位在名单上又退回成一个共同标签"
-    );
-    assert!(
-        !text.contains("vec![employee.id.clone()]"),
-        "能力字段里装着自己的 id：这不是能力声明，是一个名字占了两格"
+        !text.contains("capabilities"),
+        "名册负载里又出现了按人列的能力：这个类人人同一份，列出来只是把同一样东西写 N 遍"
     );
     assert!(
         text.contains("lease.release()"),

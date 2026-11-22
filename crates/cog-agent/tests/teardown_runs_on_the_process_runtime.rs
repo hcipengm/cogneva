@@ -92,10 +92,6 @@ impl AgentRegistry for RecordingRegistry {
     async fn list_by_role(&self, _role: &str) -> SFResult<Vec<AgentRegistration>> {
         Ok(Vec::new())
     }
-
-    async fn list_by_capability(&self, _capability: &str) -> SFResult<Vec<AgentRegistration>> {
-        Ok(Vec::new())
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

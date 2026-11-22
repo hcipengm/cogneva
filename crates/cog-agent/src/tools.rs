@@ -3703,12 +3703,12 @@ pub mod builtins {
         Tool {
             name: "list_agents".into(),
             description: "List the live agents this platform has registered, optionally \
-                          filtered by role or capability. Only live agents appear: a \
-                          registration that has expired is not listed. Every entry \
-                          carries the agent's `display_name` -- the name the workbench \
-                          shows, derived from the id. When the run established an \
-                          identity, your own entry carries `is_me: true` and the result \
-                          repeats your id as `caller`."
+                          filtered by role. Only live agents appear: a registration \
+                          that has expired is not listed. Every entry carries the \
+                          agent's `display_name` -- the name the workbench shows, \
+                          derived from the id. When the run established an identity, \
+                          your own entry carries `is_me: true` and the result repeats \
+                          your id as `caller`."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -3716,10 +3716,6 @@ pub mod builtins {
                     "role": {
                         "type": "string",
                         "description": "Only agents playing this role"
-                    },
-                    "capability": {
-                        "type": "string",
-                        "description": "Only agents declaring this capability"
                     }
                 }
             }),
@@ -3727,7 +3723,6 @@ pub mod builtins {
                 let registry = registry.clone();
                 Box::pin(async move {
                     let role = args["role"].as_str();
-                    let capability = args["capability"].as_str();
                     // The caller's own row is marked, because an id derived
                     // from a task and a role is not something an agent can
                     // reconstruct from its prompt: without the mark the only
@@ -3756,9 +3751,6 @@ pub mod builtins {
                     let agents: Vec<serde_json::Value> = live
                         .into_iter()
                         .filter(|r| role.is_none_or(|role| r.role == role))
-                        .filter(|r| {
-                            capability.is_none_or(|cap| r.capabilities.iter().any(|c| c == cap))
-                        })
                         .map(|r| {
                             let is_me = me.as_deref() == Some(r.agent_id.as_str());
                             // 与员工页同一个来源：名册行。目录和名单读到的是
@@ -3777,7 +3769,6 @@ pub mod builtins {
                                 "number": number,
                                 "role": r.role,
                                 "workspace_id": r.workspace_id,
-                                "capabilities": r.capabilities,
                                 "last_heartbeat": r.last_heartbeat.to_rfc3339(),
                                 "is_me": is_me,
                             })

@@ -722,10 +722,6 @@ mod tests {
         async fn list_by_role(&self, _role: &str) -> SFResult<Vec<AgentRegistration>> {
             Ok(Vec::new())
         }
-
-        async fn list_by_capability(&self, _capability: &str) -> SFResult<Vec<AgentRegistration>> {
-            Ok(Vec::new())
-        }
     }
 
     fn registration(agent_id: &str) -> AgentRegistration {
@@ -735,7 +731,6 @@ mod tests {
             "10.0.0.1",
             "worker",
             "ws-1",
-            Vec::new(),
             ResourceInfo::default(),
         )
     }

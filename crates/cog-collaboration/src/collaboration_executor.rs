@@ -3086,7 +3086,6 @@ mod employee_dispatch_tests {
                 .map(|(id, _)| cog_core::WorkerInfo {
                     agent_id: id.clone(),
                     role: "employee".into(),
-                    capabilities: vec!["employee".into()],
                     owner_task: self.owner_of(id),
                 })
                 .collect())

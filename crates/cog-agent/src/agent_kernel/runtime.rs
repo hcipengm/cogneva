@@ -4779,12 +4779,6 @@ mod tests {
         ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
             Ok(Vec::new())
         }
-        async fn list_by_capability(
-            &self,
-            _: &str,
-        ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
-            Ok(Vec::new())
-        }
         async fn employee(
             &self,
             agent_id: &str,
@@ -4871,12 +4865,6 @@ mod tests {
                 Ok(Vec::new())
             }
             async fn list_by_role(
-                &self,
-                _: &str,
-            ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
-                Ok(Vec::new())
-            }
-            async fn list_by_capability(
                 &self,
                 _: &str,
             ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
