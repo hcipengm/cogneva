@@ -2408,7 +2408,24 @@ impl DagExecutor {
     /// Unlike [`Self::find_ready_tasks`], this includes tasks that have already
     /// been transitioned to `Scheduled` — useful for query endpoints.
     pub async fn get_ready_tasks(&self) -> Vec<Task> {
-        let tasks = self.all_tasks_unified().await;
+        self.ready_tasks_checked().await.unwrap_or_default()
+    }
+
+    /// 同一份队列，但保留读失败。
+    ///
+    /// `ready` 这一个筛法交回的是一份 id 集合，读的人手上没有行可以拿它对：空
+    /// 集合正是队列安静时的答案。把读失败折进去，库坏掉的部署与一个没有活等的
+    /// 部署在标签页和计数上是同一个形状。库读不出来时这一读要带着错误收口。
+    pub async fn ready_tasks_checked(&self) -> SFResult<Vec<Task>> {
+        let tasks = self.all_tasks_checked().await?;
+        Ok(Self::ready_from_tasks(&tasks))
+    }
+
+    /// 就绪判据本身：Pending / Scheduled，且每个 blocker 都已 Completed。
+    ///
+    /// 抽出来是为了让两类调用方读的是同一段判据——计数端点按它算数、任务表按它
+    /// 选行，第二份写法会让「上面那个数」与「下面那些行」在有人改动一边时分开。
+    fn ready_from_tasks(tasks: &[Task]) -> Vec<Task> {
         let by_id: std::collections::HashMap<&str, &Task> =
             tasks.iter().map(|t| (t.id.as_str(), t)).collect();
         let mut ready: Vec<Task> = tasks
@@ -4687,6 +4704,10 @@ impl cog_core::DagExecutor for DagExecutor {
         self.get_ready_tasks().await
     }
 
+    async fn get_ready_tasks_checked(&self) -> SFResult<Vec<Task>> {
+        self.ready_tasks_checked().await
+    }
+
     async fn get_all_tasks(&self) -> Vec<Task> {
         self.get_all_tasks().await
     }
@@ -5359,6 +5380,9 @@ mod tests {
         /// 读还能派发的那些行的那一问答不上来。派发那一趟要把「读不出来」与
         /// 「队列是空的」分开，这一格用来交出前者的形状。
         live_read_fails: std::sync::atomic::AtomicBool,
+        /// 读整张图的那一问答不上来。就绪队列是把整张图按判据筛出来的，筛不出来
+        /// 与「没有一条就绪」在集合面上同形，这一格用来交出前者的形状。
+        all_read_fails: std::sync::atomic::AtomicBool,
     }
 
     impl CountingTaskStore {
@@ -5459,6 +5483,14 @@ mod tests {
         async fn dag_get_all_tasks(&self, _workspace_id: &str) -> SFResult<Vec<Task>> {
             self.wide_reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self
+                .all_read_fails
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(SFError::Database(
+                    "store unavailable: cannot read the graph".into(),
+                ));
+            }
             Ok(self.tasks.lock().await.clone())
         }
         async fn dag_get_live_tasks(&self, _workspace_id: &str) -> SFResult<Vec<Task>> {
@@ -7659,6 +7691,53 @@ mod tests {
         );
         assert!(
             dag.get_venue_tasks().await.is_empty(),
+            "旧的这一读仍然按折叠语义交回空集：改的是新读，不是它"
+        );
+    }
+
+    /// 就绪队列读不出来，不等于「没有一条就绪」。
+    ///
+    /// `ready` 这一个筛法交回的是一份 id 集合，读的人手上没有行可以拿它对：
+    /// 空集合正是队列安静时的答案。旧读把库故障折成它，于是一个读不动图的网关
+    /// 在标签页和计数上看起来与一个没活等的部署一模一样。判据落在 `is_err` 上：
+    /// 真读到空队列是合法答案，读失败不是它。
+    #[tokio::test]
+    async fn a_ready_queue_that_cannot_be_read_is_not_an_empty_queue() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag = DagExecutor::new("ws-ready-queue".into()).with_state_backend(backend.clone());
+        let waiting = Task::new("t-waiting", TaskType::DagNode, serde_json::json!({}));
+        backend.tasks.lock().await.push(waiting);
+
+        let ready = dag
+            .ready_tasks_checked()
+            .await
+            .expect("读得出来时照常交回队列");
+        assert_eq!(ready.len(), 1, "库里那一条本来就在就绪队列里");
+
+        backend
+            .all_read_fails
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let failure = dag
+            .ready_tasks_checked()
+            .await
+            .expect_err("读不出来时带检查的这一读必须保留失败，不能交回一个空队列");
+        assert!(
+            failure.to_string().contains("store unavailable"),
+            "错误要带着库那一边的原话: {failure}"
+        );
+        // 网关拿到的就是这个形状：trait 上的默认实现会把失败折成空队列，
+        // 所以 override 必须真的接上，否则调用方那一层看起来永远是绿的。
+        let as_executor: &dyn cog_core::DagExecutor = &dag;
+        let through_trait = as_executor
+            .get_ready_tasks_checked()
+            .await
+            .expect_err("走 trait 对象的那一条必须保留失败，不能被默认实现折成空队列");
+        assert!(
+            through_trait.to_string().contains("store unavailable"),
+            "trait 那一条交回的也要是库的错误: {through_trait}"
+        );
+        assert!(
+            dag.get_ready_tasks().await.is_empty(),
             "旧的这一读仍然按折叠语义交回空集：改的是新读，不是它"
         );
     }

@@ -123,6 +123,10 @@ impl OrchestratorControl for OrchestratorControlImpl {
         self.dag_executor.get_ready_tasks().await
     }
 
+    async fn get_ready_tasks_checked(&self) -> SFResult<Vec<Task>> {
+        self.dag_executor.get_ready_tasks_checked().await
+    }
+
     async fn get_all_tasks(&self) -> Vec<Task> {
         self.dag_executor.get_all_tasks().await
     }

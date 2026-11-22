@@ -527,19 +527,30 @@ fn matches_status(
 async fn ready_ids(
     state: &Arc<GatewayState>,
     filter: Option<TaskFilter>,
-) -> Option<HashSet<String>> {
+) -> Result<Option<HashSet<String>>, ApiError> {
     match filter {
-        Some(TaskFilter::Ready) => Some(
-            state
-                .orchestrator
-                .get_ready_tasks()
-                .await
-                .into_iter()
-                .map(|task| task.id)
-                .collect(),
-        ),
-        _ => None,
+        Some(TaskFilter::Ready) => {
+            let ids = ready_ids_from(state.orchestrator.get_ready_tasks_checked().await)?;
+            Ok(Some(ids))
+        }
+        _ => Ok(None),
     }
+}
+
+/// The ids a ready read carries, with a failed read refusing instead of
+/// answering an empty queue.
+///
+/// The `ready` filter asks for the queue itself, not for a state word, so the
+/// answer is a bare set of ids and the reader has no rows to compare it
+/// against: an empty set is exactly what a quiet deployment looks like. Folding
+/// a store error into it makes a gateway that cannot read the graph report
+/// "nothing waiting" to the tab and the count above it. Absence of the answer
+/// is a 503, the same way every other unreadable read on this surface answers.
+fn ready_ids_from(reading: cog_core::SFResult<Vec<Task>>) -> Result<HashSet<String>, ApiError> {
+    let tasks = reading.map_err(|e| {
+        ApiError::service_unavailable(format!("the ready queue could not be read: {e}"))
+    })?;
+    Ok(tasks.into_iter().map(|task| task.id).collect())
 }
 
 /// Whether a reader holding `claims` may see `task`.
@@ -1183,7 +1194,7 @@ pub async fn list_tasks_handler(
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
     let filter = status_filter(&query)?;
     let page = page_limit(&query)?;
-    let ready = ready_ids(&state, filter).await;
+    let ready = ready_ids(&state, filter).await?;
     let tasks = state.orchestrator.get_all_tasks().await;
     let mut rows: Vec<Task> = tasks
         .into_iter()
@@ -1585,7 +1596,7 @@ pub async fn get_task_graph_handler(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
     let filter = status_filter(&query)?;
-    let ready = ready_ids(&state, filter).await;
+    let ready = ready_ids(&state, filter).await?;
     let (tasks, edges) = state.orchestrator.get_graph().await;
     let kept: Vec<Task> = tasks
         .into_iter()
@@ -2234,6 +2245,7 @@ pub async fn batch_complete_handler(
 mod tests {
     use super::*;
     use crate::test_support::claims;
+    use axum::response::IntoResponse;
 
     fn task(id: &str, status: cog_core::TaskStatus, task_type: &str, age_secs: i64) -> Task {
         let mut t = Task::new(
@@ -2301,6 +2313,46 @@ mod tests {
                 "the parameter always was case-insensitive"
             );
         }
+    }
+
+    /// 就绪队列读不出来，不是「队列是空的」。
+    ///
+    /// `ready` 是唯一一个没有行可以对照的筛法：它问的就是队列本身，所以空集
+    /// 合正是安静时的答案。读失败被折进去时，一个读不动图的网关会把「没有活
+    /// 等着」印在标签页和它上方的计数上——那是本节最不能给的数。读不出来要
+    /// 拒绝，理由带着原始错误，读得出来时要交回那些 id。
+    #[test]
+    fn an_unreadable_ready_queue_is_not_an_empty_queue() {
+        let unreadable: cog_core::SFResult<Vec<Task>> = Err(cog_core::SFError::Database(
+            "connection reset while reading the graph".into(),
+        ));
+        let refusal = ready_ids_from(unreadable).expect_err("读不出来时要交回拒绝，不能交回空集合");
+        assert!(
+            refusal.message.contains("connection reset"),
+            "拒绝的理由要带原始错误，让人看得出是读失败: {}",
+            refusal.message
+        );
+        assert_eq!(
+            refusal.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "图读不出来是「这个部署现在回答不了」，不是一场 200"
+        );
+
+        let quiet = ready_ids_from(Ok(Vec::new())).expect("一条都没有是一份读得出来的答案");
+        assert!(quiet.is_empty(), "空队列原样交回，不编造任何 id");
+
+        let ids = ready_ids_from(Ok(vec![task(
+            "t-ready",
+            cog_core::TaskStatus::Pending,
+            "t",
+            0,
+        )]))
+        .expect("读得出来时要交回队列里的那些 id");
+        assert_eq!(
+            ids,
+            HashSet::from(["t-ready".to_string()]),
+            "交回的必须是队列里的 id 本身"
+        );
     }
 
     /// 状态词必须与读面印出来的那个词逐字一致：`TaskFilter` 用 `as_str` 印行，

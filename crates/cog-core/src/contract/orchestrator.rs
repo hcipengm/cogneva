@@ -73,6 +73,20 @@ pub trait OrchestratorControl: Send + Sync {
     /// Return all tasks whose dependencies are satisfied and are ready to run.
     async fn get_ready_tasks(&self) -> Vec<Task>;
 
+    /// The same queue as [`Self::get_ready_tasks`], with a read that failed
+    /// reported as such.
+    ///
+    /// "Ready" is the one filter whose answer is a set the caller cannot check
+    /// against the rows it already has: the `ready` tab asks for the queue
+    /// itself, not a state, so an empty answer is exactly what a quiet queue
+    /// looks like. Folding a store failure into it turns a gateway that cannot
+    /// read the graph into a deployment with no work waiting. The default
+    /// folds [`Self::get_ready_tasks`], which is honest for an orchestrator
+    /// holding its graph in memory; one backed by a store has to override it.
+    async fn get_ready_tasks_checked(&self) -> SFResult<Vec<Task>> {
+        Ok(self.get_ready_tasks().await)
+    }
+
     /// Return every task currently in the graph.
     async fn get_all_tasks(&self) -> Vec<Task>;
 
@@ -422,6 +436,14 @@ pub trait DagExecutor: Send + Sync {
 
     /// Tasks that are Pending or Scheduled with all deps completed.
     async fn get_ready_tasks(&self) -> Vec<Task>;
+
+    /// The same queue, with a read that failed reported as such. The reason is
+    /// [`OrchestratorControl::get_ready_tasks_checked`]'s: the `ready` filter
+    /// answers with a set of ids, and an empty set is what a quiet queue looks
+    /// like, so a failure folded into it is invisible to the reader.
+    async fn get_ready_tasks_checked(&self) -> SFResult<Vec<Task>> {
+        Ok(self.get_ready_tasks().await)
+    }
 
     /// All tasks currently in the graph.
     async fn get_all_tasks(&self) -> Vec<Task>;
