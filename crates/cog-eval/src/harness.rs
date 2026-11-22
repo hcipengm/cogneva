@@ -114,13 +114,22 @@ impl RegressionHarness {
         // 2. 检查各维度通过率
         for (dim, threshold) in &self.config.per_dimension_thresholds {
             if let Some(summary) = report.dimension_summaries.get(dim) {
-                if summary.overall_pass_rate < *threshold {
-                    failures.push(format!(
+                match summary.overall_pass_rate {
+                    Some(rate) if rate < *threshold => failures.push(format!(
                         "Dimension {} pass rate {:.1}% < threshold {:.1}%",
                         dim,
-                        summary.overall_pass_rate * 100.0,
+                        rate * 100.0,
                         threshold * 100.0
-                    ));
+                    )),
+                    // 有人给这条维度定了门槛，手上却没有任何判定样本：过不了
+                    // 「≥ 门槛」这条要求，因为它根本没被判过。从前这里读到的
+                    // 是一个恒为 1.0 的兜底，门槛年年过、没有一次真的判过。
+                    None => failures.push(format!(
+                        "Dimension {} has a threshold of {:.1}% but no case carried a verdict for it",
+                        dim,
+                        threshold * 100.0
+                    )),
+                    Some(_) => {}
                 }
             }
         }
