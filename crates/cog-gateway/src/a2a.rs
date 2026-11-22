@@ -1535,8 +1535,10 @@ async fn rpc_tasks_get(
             .into_response();
     };
 
-    match state.orchestrator.get_task(task_id).await {
-        Some(task) => (
+    // 「没有这条任务」是读到的答案；读失败是另一件事，不能答成同一个 -32001：
+    // 对端据这个码决定是换 id 还是重试，而库读不出来时 id 完全可能还在。
+    match state.orchestrator.get_task_checked(task_id).await {
+        Ok(Some(task)) => (
             StatusCode::OK,
             Json(jsonrpc_result(
                 rpc_id,
@@ -1544,9 +1546,18 @@ async fn rpc_tasks_get(
             )),
         )
             .into_response(),
-        None => (
+        Ok(None) => (
             StatusCode::OK,
             Json(rpc_error(rpc_id, -32001, format!("no task '{task_id}'"))),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::OK,
+            Json(rpc_error(
+                rpc_id,
+                -32603,
+                format!("the task could not be read: {e}"),
+            )),
         )
             .into_response(),
     }

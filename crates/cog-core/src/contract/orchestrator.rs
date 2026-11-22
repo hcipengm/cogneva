@@ -263,6 +263,17 @@ pub trait OrchestratorControl: Send + Sync {
     /// Look up a single task by id.
     async fn get_task(&self, task_id: &str) -> Option<Task>;
 
+    /// The same lookup, with a read that failed reported as such.
+    ///
+    /// [`Self::get_task`] folds "there is no such row" and "the store could not
+    /// be read" into the same `None`; a caller that answers 404 on `None` then
+    /// tells the client a task was deleted while it is still there. The default
+    /// is honest only where the read cannot fail (an in-memory graph); an
+    /// implementation backed by a store overrides it.
+    async fn get_task_checked(&self, task_id: &str) -> SFResult<Option<Task>> {
+        Ok(self.get_task(task_id).await)
+    }
+
     /// Schedule a pending task (move to scheduled state).
     async fn schedule_task(&self, task_id: &str) -> SFResult<()>;
 
@@ -525,6 +536,13 @@ pub trait DagExecutor: Send + Sync {
 
     /// Look up a single task by id.
     async fn get_task(&self, task_id: &str) -> Option<Task>;
+
+    /// The same lookup, with a read that failed reported as such. The reason is
+    /// [`OrchestratorControl::get_task_checked`]'s: `None` covers both "no such
+    /// row" and "the row could not be read".
+    async fn get_task_checked(&self, task_id: &str) -> SFResult<Option<Task>> {
+        Ok(self.get_task(task_id).await)
+    }
 
     /// Direct dependents of a task.
     async fn get_dependents(&self, task_id: &str) -> Option<Vec<Task>>;

@@ -4177,16 +4177,26 @@ impl DagExecutor {
     }
 
     pub async fn get_task(&self, task_id: &str) -> Option<Task> {
+        self.get_task_checked(task_id).await.unwrap_or_default()
+    }
+
+    /// 同一行，但把读失败留成错误。
+    ///
+    /// 旧读把三层失败都折成 `None`：库那一次读、「这一行读不出来」、以及真的
+    /// 没有这一行。任务详情页在 `None` 上答 404，于是库坏掉的时候，一条还在
+    /// 跑的任务被答成「已经被删了」。内存模式下 `ensure_task_present` 的
+    /// `TaskFailed` 是「没找到」那一句的载体，照旧读成 `None`；别的错误收口。
+    pub async fn get_task_checked(&self, task_id: &str) -> SFResult<Option<Task>> {
         if let Some(be) = self.fg() {
-            return be
-                .dag_get_task(&self.workspace_id, task_id)
-                .await
-                .ok()
-                .flatten();
+            return be.dag_get_task(&self.workspace_id, task_id).await;
         }
-        self.ensure_task_present(task_id).await.ok()?;
+        match self.ensure_task_present(task_id).await {
+            Ok(()) => {}
+            Err(SFError::TaskFailed { .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        }
         let inner = self.inner.read().await;
-        inner.tasks.get(task_id).cloned()
+        Ok(inner.tasks.get(task_id).cloned())
     }
 
     pub async fn get_all_tasks(&self) -> Vec<Task> {
@@ -4762,6 +4772,10 @@ impl cog_core::DagExecutor for DagExecutor {
 
     async fn get_task(&self, task_id: &str) -> Option<Task> {
         self.get_task(task_id).await
+    }
+
+    async fn get_task_checked(&self, task_id: &str) -> SFResult<Option<Task>> {
+        self.get_task_checked(task_id).await
     }
 
     async fn get_dependents(&self, task_id: &str) -> Option<Vec<Task>> {
@@ -8000,6 +8014,60 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none(),
+            "任务真不存在时是读到的答案，不是失败"
+        );
+    }
+
+    /// 一行任务读不出来，不是「没有这条任务」。
+    ///
+    /// 详情页在 `None` 上答 404，而 404 对客户端是有后果的：它据此认为那一行
+    /// 已经被删。库读不出来时这一行完全可能还在跑，旧读却把两者答成同一个形状。
+    #[tokio::test]
+    async fn a_task_that_cannot_be_read_is_not_a_task_that_does_not_exist() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag = DagExecutor::new("ws-task-read".into()).with_state_backend(backend.clone());
+        let row = Task::new("t-1", TaskType::DagNode, serde_json::json!({}));
+        backend.tasks.lock().await.push(row);
+
+        let found = dag
+            .get_task_checked("t-1")
+            .await
+            .expect("读得出来时照常交回")
+            .expect("库里有这一行");
+        assert_eq!(found.id, "t-1");
+
+        // 库那一次读失败：不能交回 `None`。
+        backend
+            .task_read_fails
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let failure = dag
+            .get_task_checked("t-1")
+            .await
+            .expect_err("读失败不是「没有这条任务」");
+        assert!(
+            failure.to_string().contains("store unavailable"),
+            "错误要带着库那一边的原话: {failure}"
+        );
+
+        // 走 trait 对象的那一条必须保留失败，不能被默认实现折掉。
+        backend
+            .task_read_fails
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let as_executor: &dyn cog_core::DagExecutor = &dag;
+        as_executor
+            .get_task_checked("t-1")
+            .await
+            .expect_err("trait 对象的读也要保留失败");
+
+        // 旧的这一读仍然按折叠语义交回 `None`：改的是新读，不是它。
+        backend
+            .task_read_fails
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(dag.get_task("t-1").await.is_none(), "旧的这一读仍然折叠");
+
+        // 真读到「没有这一行」才是 `None`。
+        assert!(
+            dag.get_task_checked("t-missing").await.unwrap().is_none(),
             "任务真不存在时是读到的答案，不是失败"
         );
     }
