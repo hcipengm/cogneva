@@ -36,7 +36,7 @@ import todo_source  # noqa: E402
 
 # 一格两个名字曾经并存（`代码:` 与 `判据读数:`），而同一件事两个名字必然分叉：
 # 1.5 写进去的那个，2.5 必须读得出来。两个都认，写的时候只写 `判据读数`。
-CELL = re.compile(r"(?:代码|判据读数)\s*:\s*(?:test\s*=\s*)?((?:brain:)?[^\s:]+)::([^\s:｜|]+)")
+CELL = re.compile(r"(?:代码|判据读数)\s*:\s*(?:test\s*=\s*)?((?:elsewhere:)?[^\s:]+)::([^\s:｜|]+)")
 # 计数型条目：`判据读数: <普查面> → <目标>`（`->` 也认）。
 COUNT = re.compile(r"判据读数\s*:\s*([a-z0-9-]+)\s*(?:→|->)\s*(\d+)")
 
@@ -65,8 +65,8 @@ def parse_cell(item) -> tuple[str, str] | None:
 
 
 def in_diff(root: pathlib.Path, base: str, path: str) -> bool:
-    # `brain:` 那几族不在这一棵树的 diff 里：它们由台账仓自己的门判，这里放行。
-    if path.startswith("brain:"):
+    # `elsewhere:` 那几族不在这一棵树的 diff 里：它们由台账仓自己的门判，这里放行。
+    if path.startswith("elsewhere:"):
         return True
     out = subprocess.run(
         ["git", "-C", str(root), "diff", "--name-only", base],
@@ -78,19 +78,24 @@ def in_diff(root: pathlib.Path, base: str, path: str) -> bool:
     return path in {line.strip() for line in out.stdout.splitlines()}
 
 
-def resolve_test_file(root: pathlib.Path, path: str) -> pathlib.Path:
-    """`brain:` 前缀指台账那个仓：几族的证据本来就在那儿（普查器、宿主侧的夹具）。
+def resolve_test_file(root: pathlib.Path, path: str) -> pathlib.Path | None:
+    """`elsewhere:` 前缀指台账那个仓：几族的证据本来就在那儿（普查器、宿主侧的夹具）。
     不认这个前缀，它们永远填不上——而「只认这一棵树」不是普适。"""
-    if path.startswith("brain:"):
-        repo = os.environ.get("COGNEVA_LEDGER_REPO") or str(
-            pathlib.Path.home() / "work/cogneva-brain"
-        )
-        return pathlib.Path(repo) / path[len("brain:") :]
+    if path.startswith("elsewhere:"):
+        # 那一棵树在哪由环境给：公开树里不许写它的路径，写进去就是这条判据要防的事。
+        # 没给 = 判不了，不是「文件不在」。
+        repo = os.environ.get("COGNEVA_LEDGER_REPO")
+        if not repo:
+            return None
+        return pathlib.Path(repo) / path[len("elsewhere:") :]
     return root / path
 
 
-def defines_test(root: pathlib.Path, path: str, name: str) -> bool:
+def defines_test(root: pathlib.Path, path: str, name: str) -> bool | None:
+    """`None` = 判不了（那一棵树没配），与「文件里没有这个函数」分开。"""
     file = resolve_test_file(root, path)
+    if file is None:
+        return None
     if not file.is_file():
         return False
     text = file.read_text(errors="ignore")
@@ -150,7 +155,7 @@ def main(argv: list[str]) -> int:
         names = pathlib.Path(args.passed).read_text(errors="ignore").splitlines()
         passed = {name.strip() for name in names if name.strip()}
 
-    # 普查器跟着树走：判的是这棵树的面，工具就该在这棵树里（带外那本 brain 仓里的
+    # 普查器跟着树走：判的是这棵树的面，工具就该在这棵树里（带外那一棵树里的
     # 是同一个脚本，但一道门依赖仓外的东西时，它随时会因为「那边没同步」而判不了）。
     census: pathlib.Path | None = None
     default_census = root / "scripts/bounds-census.py"
@@ -195,7 +200,11 @@ def main(argv: list[str]) -> int:
         if not preexisting and not in_diff(root, base, path):
             fake.append(f"{item.id}：点名的 {path} 在这一批的 diff 里没有改动")
             continue
-        if not defines_test(root, path, name):
+        defined = defines_test(root, path, name)
+        if defined is None:
+            fake.append(f"{item.id}：`elsewhere:` 那一棵树没配（COGNEVA_LEDGER_REPO）—— 判不了")
+            continue
+        if not defined:
             fake.append(f"{item.id}：{path} 里没有带测试属性的 `fn {name}`")
             continue
         if args.stage == "final" and passed is None:

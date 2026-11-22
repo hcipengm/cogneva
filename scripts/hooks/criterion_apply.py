@@ -9,7 +9,7 @@
 
     S20.1	判据读数: state-files → 0
     S24	判据读数: test = crates/x/tests/y.rs::proves_it
-    S30	信息不足：2026-11-18 的现场记录 在 brain 的 internal-docs 里
+    S30	信息不足：2026-11-18 的现场记录 在另一棵树的 internal-docs 里
 
 写回之后跑的形状检查与前一步同一套：A 型要求面名非空且目标是整数；B 型要求文件在树里、
 函数带测试属性。C 型不写格，原样打印出来——它是「还差哪份输入」，不是读数。
@@ -28,7 +28,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import todo_source  # noqa: E402
 
 A = re.compile(r"判据读数\s*:\s*([a-z0-9-]+)\s*(?:→|->)\s*(\d+)\s*$")
-B = re.compile(r"判据读数\s*:\s*test\s*=\s*((?:brain:)?[^\s:]+)::([^\s:｜|]+)")
+B = re.compile(r"判据读数\s*:\s*test\s*=\s*((?:elsewhere:)?[^\s:]+)::([^\s:｜|]+)")
 
 
 def plan_problem(text: str) -> str | None:

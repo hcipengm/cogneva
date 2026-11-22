@@ -321,7 +321,7 @@ jobs:
       # 不冒充通过。配上 secret 之后要转 fail-closed，是把上面那行 env 加回来。
       # 名单缺席时这一层是**没跑**，不是通过。secret 在不在从这棵树里读不出来，
       # 所以它一直没打开 fail-closed——但那意味着「私有仓名写进公开文件」这半条
-      # 判据在主线上默认是关着的（2026-11-19 实测：`cogneva-brain` 就这样被我写进了
+      # 判据在主线上默认是关着的（2026-11-19 实测：那个名字就这样被写进了
       # 两个公开文件）。配好 secret 之后把下面这行打开，这一层才真的在看。
       - name: Check public surface carries no private identifier
         env:
