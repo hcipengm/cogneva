@@ -573,7 +573,9 @@ impl DagExecutorRuntime {
                 return Ok(());
             }
         }
-        let work = self.orchestrator.ready_work().await;
+        // 读不出来就带着库的原话收口：折成空图的那一趟与一次正常的空扫描
+        // 同形，而派发恰恰是靠这一趟发现「没人可放」的。
+        let work = self.orchestrator.ready_work_checked().await?;
         let columns = work.columns;
         let (ready_tasks, in_flight) = (work.ready, work.in_flight);
         let window_jobs = pays_for.and_then(|bound| bound.window_jobs);

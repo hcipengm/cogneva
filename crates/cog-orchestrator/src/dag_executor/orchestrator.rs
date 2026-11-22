@@ -1489,20 +1489,23 @@ impl DagExecutor {
     /// 见 [`cog_core::TaskStatus::affects_dispatch`]。这不是省点内存：一个跑了一周
     /// 的工作区九成是历史，2026-11-05 实测一次派发读回 9,916 行、其中 5,843 行
     /// 改不了它的答案，一次 1.9 秒，而它每几秒就要问一次。
-    async fn live_tasks_unified(&self) -> Vec<Task> {
+    ///
+    /// 读失败照旧保留：派发那一趟问的是「现在还有什么能开工」，而空图给出的
+    /// 答案正是「一条都没有」——那是队列安静时的常态。折成它，库坏掉的那一趟
+    /// 看起来与一次正常的空扫描一模一样。
+    async fn live_tasks_checked(&self) -> SFResult<Vec<Task>> {
         if let Some(be) = self.fg() {
-            be.dag_get_live_tasks(&self.workspace_id)
-                .await
-                .unwrap_or_default()
+            be.dag_get_live_tasks(&self.workspace_id).await
         } else {
-            self.inner
+            Ok(self
+                .inner
                 .read()
                 .await
                 .tasks
                 .values()
                 .filter(|task| task.status.affects_dispatch())
                 .cloned()
-                .collect()
+                .collect())
         }
     }
 
@@ -1511,7 +1514,7 @@ impl DagExecutor {
     /// 看板列上限那一问只取决于同状态的行（「这个项目的 running 列满了吗」），
     /// 而它在每一次开工尝试上都会被问一次——积压时一条就绪消息每被重投一次就是
     /// 一次。用整表读回答它，是读回近万行、几十 MB 的一整张图，只为数其中几行
-    /// （本机实测 2026-11-06，见 [`Self::live_tasks_unified`] 旁边那条）：两者
+    /// （本机实测 2026-11-06，见 [`Self::live_tasks_checked`] 旁边那条）：两者
     /// 差的是三个数量级，而答案一字不差。
     ///
     /// 读失败照旧保留：这一问唯一的调用方是看板列准入守卫，那里零行正是
@@ -1535,7 +1538,7 @@ impl DagExecutor {
     /// 只有带场地标签的那些行。
     ///
     /// 场地看板按这一列折叠，没有标签的行读进来只为扔掉；任务图跑上几天之后
-    /// 九成以上都是这种行，见 [`Self::live_tasks_unified`] 旁边那条实测。
+    /// 九成以上都是这种行，见 [`Self::live_tasks_checked`] 旁边那条实测。
     /// 读的结果与「取全图再筛」逐行相同，筛的位置不同——一条是 SQL 替它筛，
     /// 一条是内存里筛。
     pub async fn get_venue_tasks(&self) -> Vec<Task> {
@@ -2316,7 +2319,20 @@ impl DagExecutor {
     /// work finish in between and refuse against a column that has already
     /// drained.
     pub async fn ready_work(&self) -> ReadyWork {
-        let tasks = self.live_tasks_unified().await;
+        self.ready_work_checked().await.unwrap_or_default()
+    }
+
+    /// 同上，但保留读失败。
+    ///
+    /// 派发那一趟拿这份答案去决定放谁出去；读不出来时折成一块白板，那一趟
+    /// 看上去就是一次「队列里什么都没有」的正常扫描，谁也不会去重读。保留失败
+    /// 之后，那一趟带着库的原话收口，调用方能在自己的警告里看见它。
+    pub async fn ready_work_checked(&self) -> SFResult<ReadyWork> {
+        let tasks = self.live_tasks_checked().await?;
+        Ok(self.ready_work_from(tasks))
+    }
+
+    fn ready_work_from(&self, tasks: Vec<Task>) -> ReadyWork {
         let mut columns: std::collections::HashMap<
             String,
             std::collections::BTreeMap<&'static str, u64>,
@@ -5340,6 +5356,9 @@ mod tests {
         /// 读场地那一列的那一问答不上来。看板要把「读不出来」与「一块空板」
         /// 分开，这一格用来交出前者的形状。
         venue_read_fails: std::sync::atomic::AtomicBool,
+        /// 读还能派发的那些行的那一问答不上来。派发那一趟要把「读不出来」与
+        /// 「队列是空的」分开，这一格用来交出前者的形状。
+        live_read_fails: std::sync::atomic::AtomicBool,
     }
 
     impl CountingTaskStore {
@@ -5447,6 +5466,14 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.narrow_reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self
+                .live_read_fails
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(SFError::Database(
+                    "store unavailable: cannot read the live rows".into(),
+                ));
+            }
             Ok(self
                 .tasks
                 .lock()
@@ -7633,6 +7660,36 @@ mod tests {
         assert!(
             dag.get_venue_tasks().await.is_empty(),
             "旧的这一读仍然按折叠语义交回空集：改的是新读，不是它"
+        );
+    }
+
+    /// 派发那一趟读不出图，不是「队列空了」。
+    ///
+    /// 一趟正常的空扫描与一次库故障，在 `ReadyWork` 上是同一块白板：零条就绪、
+    /// 零条在飞、每列零占。派发正是靠这一趟决定放谁出去，所以两种形状要分开——
+    /// 读不出来时那一趟得带着错误收口，调用方才有东西可以记。
+    #[tokio::test]
+    async fn a_ready_scan_that_cannot_read_the_graph_is_not_an_empty_queue() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag = DagExecutor::new("ws-ready-read".into()).with_state_backend(backend.clone());
+        let work = dag.ready_work_checked().await.expect("读得出来时照常交回");
+        assert!(work.ready.is_empty(), "库里本来就没有行");
+
+        backend
+            .live_read_fails
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let failure = dag
+            .ready_work_checked()
+            .await
+            .expect_err("读不出来时这一趟必须保留失败，不能交回一块白板");
+        assert!(
+            failure.to_string().contains("store unavailable"),
+            "错误要带着库那一边的原话: {failure}"
+        );
+        let folded = dag.ready_work().await;
+        assert!(
+            folded.ready.is_empty() && folded.columns.is_empty(),
+            "旧的这一读仍然按折叠语义交回白板：改的是新读，不是它"
         );
     }
 
