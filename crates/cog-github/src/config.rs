@@ -214,8 +214,10 @@ pub struct GitHubIntegrationConfig {
     /// used as the primary actor.
     pub accounts: Vec<GitHubAccount>,
     /// Polling interval in seconds when discovery mode includes polling.
+    #[serde(skip_serializing_if = "is_the_shipped_poll_interval")]
     pub poll_interval_secs: u64,
     /// Maximum number of issues to scan per polling round.
+    #[serde(skip_serializing_if = "is_the_shipped_scan_cap")]
     pub max_issues_per_scan: usize,
     /// Whether an actionable issue is turned into a fix task automatically.
     /// Off means the intent is only recorded, never acted on.
@@ -350,12 +352,15 @@ pub struct LandingPolicy {
     /// How long a landed commit's CI verdict is expected to take (seconds).
     /// Past it the watch loop logs once and keeps watching — a CI run that has
     /// not reported yet is not a CI run that will never report.
+    #[serde(skip_serializing_if = "is_the_shipped_ci_watch_timeout")]
     pub ci_watch_timeout_secs: u64,
     /// How often the landing loop re-reads the base branch's CI state (seconds).
+    #[serde(skip_serializing_if = "is_the_shipped_ci_poll_interval")]
     pub ci_poll_interval_secs: u64,
     /// How many times a landing is retried when the push loses a race against
     /// a newer base tip. Each retry re-fetches and re-applies the change onto
     /// the new tip.
+    #[serde(skip_serializing_if = "is_the_shipped_land_attempts")]
     pub max_land_attempts: u32,
     /// How many generation rounds one CI failure cause may be given inside
     /// `redrive_cause_window_secs` before the channel stops generating against
@@ -365,8 +370,10 @@ pub struct LandingPolicy {
     /// tests, errors, or compiler codes it named — not the change: the fix a
     /// round produces is a new change with its own re-drive allowance, so a
     /// per-change flag cannot bound the chain.
+    #[serde(skip_serializing_if = "is_the_shipped_redrive_rounds")]
     pub redrive_max_rounds_per_cause: u32,
     /// The window those rounds are counted over (seconds).
+    #[serde(skip_serializing_if = "is_the_shipped_redrive_window")]
     pub redrive_cause_window_secs: u64,
 }
 
@@ -884,4 +891,35 @@ mod tests {
             GiteeIntegrationConfig::load_from(std::path::Path::new("/nonexistent/x.json")).unwrap();
         assert!(!missing.enabled);
     }
+}
+
+// 下面这几个谓词让「等于代码默认值」的旋钮不出现在序列化里：模板因此不必把它
+// 抄一遍（抄件不为部署决定任何事），而部署真要改它时，写进去的那一格仍然生效。
+// 判据是「类型还产不产生这一格」——`defaults()` 走的就是这条序列化路径。
+fn is_the_shipped_poll_interval(v: &u64) -> bool {
+    *v == GitHubIntegrationConfig::default().poll_interval_secs
+}
+
+fn is_the_shipped_scan_cap(v: &usize) -> bool {
+    *v == GitHubIntegrationConfig::default().max_issues_per_scan
+}
+
+fn is_the_shipped_ci_watch_timeout(v: &u64) -> bool {
+    *v == LandingPolicy::default().ci_watch_timeout_secs
+}
+
+fn is_the_shipped_ci_poll_interval(v: &u64) -> bool {
+    *v == LandingPolicy::default().ci_poll_interval_secs
+}
+
+fn is_the_shipped_land_attempts(v: &u32) -> bool {
+    *v == LandingPolicy::default().max_land_attempts
+}
+
+fn is_the_shipped_redrive_rounds(v: &u32) -> bool {
+    *v == LandingPolicy::default().redrive_max_rounds_per_cause
+}
+
+fn is_the_shipped_redrive_window(v: &u64) -> bool {
+    *v == LandingPolicy::default().redrive_cause_window_secs
 }

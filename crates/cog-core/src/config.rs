@@ -254,6 +254,7 @@ pub struct DagExecutorConfig {
     /// weighed against this value; `cog-reflection` holds the pair together
     /// with a gate.
     #[serde(default = "default_archive_after_secs")]
+    #[serde(skip_serializing_if = "is_the_default_archive_after_secs")]
     pub archive_after_secs: u64,
     /// Interval between archive scans (seconds).
     #[serde(default = "default_archive_poll_interval_secs")]
@@ -2361,4 +2362,9 @@ mod tests {
             std::time::Duration::from_millis(DEFAULT_REDIS_RESPONSE_TIMEOUT_MS)
         );
     }
+}
+
+// 等于默认值的归档保留期不出现在序列化里：模板不必抄一遍代码自己给的答案。
+fn is_the_default_archive_after_secs(v: &u64) -> bool {
+    *v == default_archive_after_secs()
 }

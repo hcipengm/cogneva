@@ -38,6 +38,7 @@ fn load_section_from<T: serde::de::DeserializeOwned + Default>(
 #[serde(default)]
 pub struct SelfReviewSettings {
     pub enabled: bool,
+    #[serde(skip_serializing_if = "is_the_default_self_review_iterations")]
     pub max_iterations: u32,
     pub quality_threshold: f32,
     /// Whether a verdict below the threshold buys a rewrite of the output.
@@ -106,6 +107,7 @@ pub struct PgeSettings {
     /// escalate to a global reset, which re-runs the planner. Zero turns the
     /// path off, and then every failure pays for a fresh plan even when the
     /// failure lies in a generation the plan already described.
+    #[serde(skip_serializing_if = "is_the_default_local_repair_max")]
     pub local_repair_max: u32,
 }
 
@@ -160,10 +162,12 @@ impl PgeSettings {
 pub struct RalphSettings {
     /// 单次执行的迭代预算硬上限。预算按次计，不跨执行累计：同一个目标被
     /// 重新调度时重新起步，已归档的历史只提供反馈与停滞证据。
+    #[serde(skip_serializing_if = "is_the_default_ralph_iterations")]
     pub max_iterations: u32,
     /// 停滞窗口：最近这么多轮不买进展即终止——归一化反馈逐字相同（同一失败
     /// 原样重放），或分数未升且产物未增长的改写重放（读数不足两个不下结论）。
     /// 这个值同时决定归档历史保留的尾部长度。0 = 关闭停滞检测。
+    #[serde(skip_serializing_if = "is_the_default_ralph_window")]
     pub stagnation_window: u32,
 }
 
@@ -642,4 +646,23 @@ mod tests {
         assert_eq!(BoundaryConfig::load_from(&path).unwrap().rules.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
+}
+
+// 等于代码默认值的旋钮不出现在序列化里：模板不必抄一遍，部署真要改它时写进去
+// 仍然生效。`defaults()` 读的就是这条路径，所以「类型还产不产生这一格」和
+// 「模板该不该写它」是同一个答案。
+fn is_the_default_local_repair_max(v: &u32) -> bool {
+    *v == DEFAULT_LOCAL_REPAIR_MAX
+}
+
+fn is_the_default_ralph_iterations(v: &u32) -> bool {
+    *v == RalphSettings::default().max_iterations
+}
+
+fn is_the_default_ralph_window(v: &u32) -> bool {
+    *v == RalphSettings::default().stagnation_window
+}
+
+fn is_the_default_self_review_iterations(v: &u32) -> bool {
+    *v == SelfReviewSettings::default().max_iterations
 }
