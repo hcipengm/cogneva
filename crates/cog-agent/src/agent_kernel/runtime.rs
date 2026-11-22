@@ -6385,7 +6385,11 @@ mod tests {
             think_stall_timeout_secs: 5,
             ..Default::default()
         };
-        AgentRuntime::new(config, tx)
+        // 自己的观测面：这几条用例的假上游回报的 prompt 只有 10 个 token，写进
+        // 进程那一份读数就成了「这个进程量到的窗口是 10」，同一进程里别的用例
+        // 一起读成「连地板都装不下」——2026-11-22 实测，并行跑时三条用例因此红。
+        let observable = crate::observable::AgentObservable::new();
+        AgentRuntime::with_observable(config, tx, &observable)
     }
 
     /// Every billed call of a run lands in one row keyed by its task — both
