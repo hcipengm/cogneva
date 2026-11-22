@@ -1038,8 +1038,11 @@ mod tests {
                     serde_json::to_string(&CommandEvent::Stdout { data: "ok".into() }).unwrap(),
                     serde_json::to_string(&CommandEvent::Exit { code: 0 }).unwrap()
                 );
+                // `connection: close`：这副替身每条连接只读一次请求。不写它，客户端会
+                // 按 keep-alive 在**同一条连接**上再发一次，而这一侧已经不再读——那一次
+                // 会一直等到超时，报出来是「执行器不可达」（2026-11-23 并行跑整库时偶发）。
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
                     body.len(),
                     body
                 );
