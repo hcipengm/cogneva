@@ -1,10 +1,11 @@
 //! principle: feedback_a_reading_folded_into_an_empty_value_answers_for_a_read_it_never_made
-//! Gate: 每个按任务图作答的页面都走带报错的那条读，读失败留成 503 而不是空页。
+//! Gate: 每个按任务图作答的面都走带报错的那条读，读失败留成错误而不是空答案。
 //!
 //! 这一族病灶同一个形状：处理函数的读口是折叠过的那条（`get_all_tasks()` 之类，
 //! 失败时 `unwrap_or_default()`），于是库坏掉的时候，工作台画出一页零、总览画
-//! 出一块空流程、依赖列表画成「这个任务没有依赖」。这些画面与一个「真的什么都
-//! 没有」的部署逐字同形，读的人无从分辨，而分辨正是这一页存在的理由。
+//! 出一块空流程、依赖列表画成「这个任务没有依赖」、对外的 `ListTasks` 答「你有
+//! 0 条任务」。这些画面与一个「真的什么都没有」的部署逐字同形，读的人无从分辨，
+//! 而分辨正是这一面存在的理由。
 //!
 //! 修法在上游：读口旁挂一条带报错的那条（`get_all_tasks_checked`），处理函数
 //! 把 `Err` 映射成 503。行为那一半在 `cog_gateway::tasks::tests` 与
@@ -19,6 +20,7 @@ use crate::common::routes::read_repo;
 use crate::common::rust_production::production_text;
 
 const TASKS: &str = "crates/cog-gateway/src/tasks.rs";
+const A2A: &str = "crates/cog-gateway/src/a2a.rs";
 const PROGRESS: &str = "crates/cog-gateway/src/progress.rs";
 const PROCESSES: &str = "crates/cog-gateway/src/processes.rs";
 
@@ -94,6 +96,12 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "任务图画成一张空图",
     ),
     (
+        A2A,
+        "async fn rpc_list_tasks",
+        "get_all_tasks_checked",
+        "对端唯一的视野答成「你有 0 条任务」",
+    ),
+    (
         PROGRESS,
         "async fn merged_from",
         "get_all_tasks_checked",
@@ -108,9 +116,9 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
 ];
 
 #[test]
-fn every_page_that_draws_the_graph_keeps_the_failure() {
+fn every_surface_that_draws_the_graph_keeps_the_failure() {
     let mut productions: std::collections::HashMap<&str, String> = Default::default();
-    for file in [TASKS, PROGRESS, PROCESSES] {
+    for file in [TASKS, A2A, PROGRESS, PROCESSES] {
         productions.insert(file, production_text(&read_repo(file)));
     }
     for (file, anchor, checked, folded_page) in SURFACES {
