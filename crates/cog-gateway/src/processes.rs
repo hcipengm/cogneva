@@ -98,8 +98,9 @@ pub struct HealthCounts {
 /// 死信队列的长度：读失败留成 503。
 ///
 /// 这一格是「有多少件活压在死信里等人清」。读不出来时折成 0，画出来正是一个干净
-/// 的队列——与真的没人压活同形，而清死信这件事只有这一页会叫人来干。
-fn dlq_len_from_reading(reading: cog_core::SFResult<usize>) -> Result<usize, ApiError> {
+/// 的队列——与真的没人压活同形，而清死信这件事只有这一页会叫人来干。队列统计
+/// 那一页（`crate::supervisor_queue_stats_handler`）读的是同一格，走同一条映射。
+pub(crate) fn dlq_len_from_reading(reading: cog_core::SFResult<usize>) -> Result<usize, ApiError> {
     reading.map_err(|e| {
         ApiError::service_unavailable(format!(
             "the dead-letter queue length could not be read: {e}"

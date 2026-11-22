@@ -11,6 +11,8 @@ use axum::{
 use base64::Engine as _;
 use cog_core::contract::observability::METRICS_PATH;
 use cog_core::TraceContext;
+
+use crate::error::ApiError;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap};
@@ -3114,30 +3116,40 @@ async fn hooks_health_handler(State(state): State<Arc<GatewayState>>) -> Respons
 
 // ─── Supervisor Queue Stats Handler ───
 
-async fn supervisor_queue_stats_handler(State(state): State<Arc<GatewayState>>) -> Response {
-    match state.supervisor {
-        Some(ref supervisor) => {
-            let pending_handoffs = supervisor.autonomous_pending_count().await;
-            let retry_count = supervisor.autonomous_retry_count().await;
-            let dlq_count = supervisor.orchestrator_dlq_len().await.unwrap_or(0);
-            let ready_tasks = state.orchestrator.get_ready_tasks().await.len();
-            let stats = supervisor_control::QueueStats {
-                pending_handoffs,
-                retry_count,
-                dlq_count,
-                ready_tasks,
-                cycle: state.supervisor_event_cache.cycle(),
-                scale_recommendation: state.supervisor_event_cache.scale_recommendation(),
-                timestamp: chrono::Utc::now(),
-            };
-            (StatusCode::OK, Json(stats)).into_response()
-        }
-        None => (
+/// 队列这一页的两格读数：死信几条、待办几条。
+///
+/// 两格都是「现在有多少活压着」。读失败折成 0，画出来正是一副排空了的队列——
+/// 与真的没有活压着逐字同形，而这一页正是运维决定要不要清死信、要不要催派活
+/// 的地方。读不出来是 503；读到了就是那个数。
+async fn supervisor_queue_stats_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Response, ApiError> {
+    let Some(supervisor) = state.supervisor.as_ref() else {
+        return Ok((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "supervisor not configured"})),
         )
-            .into_response(),
-    }
+            .into_response());
+    };
+    let pending_handoffs = supervisor.autonomous_pending_count().await;
+    let retry_count = supervisor.autonomous_retry_count().await;
+    let dlq_count =
+        crate::processes::dlq_len_from_reading(supervisor.orchestrator_dlq_len().await)?;
+    let ready_tasks = crate::tasks::task_rows_from_reading(
+        state.orchestrator.get_ready_tasks_checked().await,
+        "supervisor queue stats",
+    )?
+    .len();
+    let stats = supervisor_control::QueueStats {
+        pending_handoffs,
+        retry_count,
+        dlq_count,
+        ready_tasks,
+        cycle: state.supervisor_event_cache.cycle(),
+        scale_recommendation: state.supervisor_event_cache.scale_recommendation(),
+        timestamp: chrono::Utc::now(),
+    };
+    Ok((StatusCode::OK, Json(stats)).into_response())
 }
 
 // ─── Supervisor Gate Handler ───
