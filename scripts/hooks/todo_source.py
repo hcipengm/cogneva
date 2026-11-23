@@ -281,7 +281,10 @@ def all_ids(spec: str) -> set[str]:
         raise Unreadable(f"{path} 不存在")
     ids: set[str] = set()
     for line in path.read_text(errors="ignore").splitlines():
-        if not line.startswith("| S"):
+        # 两种行形状都读（与 `_md_split` 同一套）：只认 `| S` 那一族，会让五格台账
+        # 的每一条都读成「不在台账里」——钉住的批次于是整批报缺，而它们就在那儿
+        # （2026-11-23 实测：新台账 7 条全被报成缺失）。
+        if not line.startswith("| S") and not _FIXED_ROW.match(line):
             continue
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
         if cells and cells[0]:
