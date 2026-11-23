@@ -36,23 +36,19 @@ import todo_source  # noqa: E402
 
 DEFAULT_LEDGER = pathlib.Path.home() / ".local/state/cogneva/todo-ledger.md"
 def resolve_ledger(explicit: str | None) -> pathlib.Path:
-    """台账路径：显式 → 环境变量 → 本机配置文件 → 默认（不存在就是没有台账）。
+    """台账路径：显式 → [`todo_source.default_spec`]（一份不存在就是没有台账）。
 
-    本机那一格是 `~/.config/cogneva/todo-ledger`，一行路径。台账在哪里是这台机器的
-    事实，写进公开仓就成了「谁的机器」的猜测。
+    解析顺序只有一份，在 `todo_source` 里：本机仓配置的两格（`cogneva.privateRoot`
+    与 `cogneva.workLedger`）都是在那儿读的。这一道门自己再解一遍时，换了机器之后
+    它会读到另一本——或者什么都读不到，而「读不到」在这里被报成「这台 worker 本来
+    就不记待办」，缺口于是整批看不见（2026-11-23 实测：配了本机仓的两格、台账就在
+    那儿，这一道门却按不存在处理）。
     """
     if explicit:
         text = str(explicit)
         return pathlib.Path(text[3:] if text.startswith("md:") else text)
-    env = os.environ.get("COGNEVA_TODO_LEDGER")
-    if env:
-        return pathlib.Path(env)
-    host = pathlib.Path.home() / ".config/cogneva/todo-ledger"
-    if host.exists():
-        line = host.read_text(errors="ignore").strip().splitlines()
-        if line and line[0].strip():
-            return pathlib.Path(line[0].strip()).expanduser()
-    return pathlib.Path.home() / ".local/state/cogneva/todo-ledger.md"
+    spec = todo_source.default_spec()
+    return pathlib.Path(spec[3:] if spec.startswith("md:") else spec)
 
 
 OPEN_WORDS = ("未落", "部分", "进行中", "待落", "待裁")
@@ -393,6 +389,11 @@ def main(argv: list[str]) -> int:
                 f"family: 没有配置 worker 台账（{ledger_path} 不存在）——"
                 "本轮批次只按工作区改动算，不假装台账是空的"
             )
+            # 没有台账时批次只有工作区改动：下面按 `round_ids` 筛的是**条目**，
+            # 条目一条都没有。这一格不初始化的话，下一次真的走到这条分支会在这里
+            # 崩掉（`UnboundLocalError`），读起来是工具坏了，而不是「这台 worker
+            # 不记待办」。
+            todos_items = []
             todos, missing, deferred = [], [], []
         else:
             todos_items, missing, deferred = todo_source.partition(f"md:{ledger_path}")
