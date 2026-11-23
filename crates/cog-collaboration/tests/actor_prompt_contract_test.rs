@@ -146,6 +146,7 @@ fn a_branch(branch_id: u32) -> PgeBranchResult {
             sub_tasks: Vec::new(),
             acceptance_criteria: Vec::new(),
             targets: Vec::new(),
+            items: Vec::new(),
         },
         generation: GeneratorOutput::none(),
         outcome: RoundOutcome::Stopped {
