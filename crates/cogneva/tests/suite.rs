@@ -613,6 +613,8 @@ mod supervisor_health_checker_test;
 mod supervisor_judges_the_live_agents;
 #[path = "supervisor_lifecycle_coordinator_test.rs"]
 mod supervisor_lifecycle_coordinator_test;
+#[path = "supervisor_rebalancer_reads_report_failures_test.rs"]
+mod supervisor_rebalancer_reads_report_failures_test;
 #[path = "supervisor_registry_test.rs"]
 mod supervisor_registry_test;
 #[path = "supervisor_respawner_test.rs"]

@@ -25,6 +25,9 @@ pub struct TaskGraphStub {
     /// and the folding read answers an empty graph -- the shape a store-backed
     /// orchestrator has when its store is unreachable.
     read_failure: Option<String>,
+    /// 只有**待派队列**那一路读失败：同一个后端里这两条读能各自坏，判它们的人也要能
+    /// 分开看。设了 `read_failure` 时这一条跟着一起坏。
+    ready_failure: Option<String>,
 }
 
 impl TaskGraphStub {
@@ -33,6 +36,7 @@ impl TaskGraphStub {
         Self {
             tasks: Mutex::new(Vec::new()),
             read_failure: None,
+            ready_failure: None,
         }
     }
 
@@ -41,6 +45,30 @@ impl TaskGraphStub {
         Self {
             tasks: Mutex::new(tasks),
             read_failure: None,
+            ready_failure: None,
+        }
+    }
+
+    /// A graph whose **task table** cannot be read while the ready queue still
+    /// answers: the two reads fail separately in a store-backed orchestrator, and
+    /// a reader that fixes only one of them must show up as still broken.
+    pub fn whose_task_read_fails(reason: impl Into<String>) -> Self {
+        let reason: String = reason.into();
+        Self {
+            tasks: Mutex::new(Vec::new()),
+            read_failure: Some(reason),
+            ready_failure: None,
+        }
+    }
+
+    /// A graph whose **ready queue** cannot be read: the task table still answers,
+    /// so the caller can tell which read a failure came from.
+    pub fn whose_ready_read_fails(reason: impl Into<String>) -> Self {
+        let reason: String = reason.into();
+        Self {
+            tasks: Mutex::new(Vec::new()),
+            read_failure: None,
+            ready_failure: Some(reason),
         }
     }
 
@@ -50,6 +78,7 @@ impl TaskGraphStub {
         Self {
             tasks: Mutex::new(Vec::new()),
             read_failure: Some(reason.into()),
+            ready_failure: None,
         }
     }
 
@@ -87,6 +116,13 @@ impl OrchestratorControl for TaskGraphStub {
 
     async fn get_ready_tasks(&self) -> Vec<Task> {
         Vec::new()
+    }
+
+    async fn get_ready_tasks_checked(&self) -> SFResult<Vec<Task>> {
+        match self.ready_failure.as_ref().or(self.read_failure.as_ref()) {
+            Some(reason) => Err(SFError::IO(reason.clone())),
+            None => Ok(self.get_ready_tasks().await),
+        }
     }
 
     async fn get_all_tasks(&self) -> Vec<Task> {
