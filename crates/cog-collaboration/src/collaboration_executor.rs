@@ -1954,6 +1954,58 @@ mod tests {
         }
     }
 
+    /// 任务行上带着三格的，结果里就把判完之后的它带回去：状态跟着结局走，差距原样。
+    ///
+    /// 判的是「入口那一侧读得到『这条到了没有』」——只读「这次跑成了没有」的话，
+    /// 一次成功的运行会被读成一条到了终态的待办，而它可能只差着最后一件。
+    #[test]
+    fn a_task_carrying_an_item_hands_it_back_with_its_state() {
+        use cog_core::contract::ledger_item::{LedgerItem, LedgerState, ITEM_INPUT_KEY};
+        let item = LedgerItem {
+            id: "N77".into(),
+            terminal: "窗口里每一轮都带着它需要的全部".into(),
+            now: "地板还装不下".into(),
+            gap: "缺的是：地板外置".into(),
+            state: LedgerState::Open,
+        };
+        let mut task = Task::new("t1", TaskType::DagNode, serde_json::json!({}));
+        task.input = serde_json::json!({ ITEM_INPUT_KEY: serde_json::to_value(&item).unwrap() });
+
+        let mut ok = squad_failure(None);
+        ok.success = true;
+        let meta = CollaborationExecutor::carry_ledger_item(
+            &task,
+            &ok,
+            TaskResultMetadata::new("collaboration"),
+        );
+        let back: LedgerItem = serde_json::from_value(
+            meta.extensions
+                .as_ref()
+                .and_then(|e| e.get(ITEM_INPUT_KEY))
+                .cloned()
+                .expect("结果里没有带回来的那条待办"),
+        )
+        .unwrap();
+        assert_eq!(back.state, LedgerState::Reached, "跑成了，状态跟着到终态");
+        assert_eq!(back.gap, item.gap, "差距不由这一次自报");
+
+        let failed = CollaborationExecutor::carry_ledger_item(
+            &task,
+            &squad_failure(Some("boom")),
+            TaskResultMetadata::new("collaboration"),
+        );
+        let back: LedgerItem = serde_json::from_value(
+            failed
+                .extensions
+                .as_ref()
+                .and_then(|e| e.get(ITEM_INPUT_KEY))
+                .cloned()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(back.state, LedgerState::Open, "失败保持原状");
+    }
+
     /// A run that failed reaches the archive as a failure, with the reason the
     /// run itself gave. This is the production source of the failure-pattern
     /// namespace: without it the archive's failure arm is unreachable and the
