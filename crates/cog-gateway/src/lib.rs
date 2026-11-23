@@ -3050,33 +3050,37 @@ async fn security_headers_middleware(req: Request, next: Next) -> Response {
 
 // ─── Supervisor Status Handler ───
 
-async fn supervisor_status_handler(State(state): State<Arc<GatewayState>>) -> Response {
-    match state.supervisor {
-        Some(ref supervisor) => {
-            let report = supervisor.run_health_pass().await.unwrap_or_default();
-            let snapshot = supervisor_status::SupervisorStatusSnapshot {
-                cycle: state.supervisor_event_cache.cycle(),
-                healthy_agents: report.healthy.len(),
-                dead_agents: report.dead.len(),
-                suspect_agents: report.suspect.len(),
-                stuck_agents: report.stuck.len(),
-                pending_handoffs: supervisor.autonomous_pending_count().await,
-                scheduler_paused: supervisor.gate().is_paused(),
-                // Read off the event channel, not the supervisor's mutex: that
-                // mutex is on no trait method, and the only event carrying a
-                // rebalance is `SupervisorEvent::Rebalance`. See
-                // `SupervisorEventCache::last_plan_emitted_at`.
-                last_plan_emitted_at: state.supervisor_event_cache.last_plan_emitted_at(),
-                timestamp: chrono::Utc::now(),
-            };
-            (StatusCode::OK, Json(snapshot)).into_response()
-        }
-        None => (
+/// 巡检快照：报告跑不出来是 503，不是「四个都是 0」。
+///
+/// 折成默认报告，四格计数一起落到 0，读的人看到的是「四个没病」——与一轮
+/// 查过、确实没有异常逐字同形，而这一页存在的理由就是让人看见异常。
+async fn supervisor_status_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Response, ApiError> {
+    let Some(supervisor) = state.supervisor.as_ref() else {
+        return Ok((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "supervisor not configured"})),
         )
-            .into_response(),
-    }
+            .into_response());
+    };
+    let report = crate::processes::health_report_from_reading(supervisor.run_health_pass().await)?;
+    let snapshot = supervisor_status::SupervisorStatusSnapshot {
+        cycle: state.supervisor_event_cache.cycle(),
+        healthy_agents: report.healthy.len(),
+        dead_agents: report.dead.len(),
+        suspect_agents: report.suspect.len(),
+        stuck_agents: report.stuck.len(),
+        pending_handoffs: supervisor.autonomous_pending_count().await,
+        scheduler_paused: supervisor.gate().is_paused(),
+        // Read off the event channel, not the supervisor's mutex: that
+        // mutex is on no trait method, and the only event carrying a
+        // rebalance is `SupervisorEvent::Rebalance`. See
+        // `SupervisorEventCache::last_plan_emitted_at`.
+        last_plan_emitted_at: state.supervisor_event_cache.last_plan_emitted_at(),
+        timestamp: chrono::Utc::now(),
+    };
+    Ok((StatusCode::OK, Json(snapshot)).into_response())
 }
 
 // ─── HookEngine Health Handler ───

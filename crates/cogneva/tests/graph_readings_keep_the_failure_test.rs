@@ -178,6 +178,12 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "dlq_len_from_reading(",
         "死信队列画成一只干净的队列",
     ),
+    (
+        LIB,
+        "async fn supervisor_status_handler",
+        "health_report_from_reading(",
+        "健康四格一起落到 0，读成「四个都没病」",
+    ),
 ];
 
 #[test]

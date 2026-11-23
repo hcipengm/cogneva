@@ -124,7 +124,7 @@ fn registry_from_reading(
 ///
 /// 折成「查过了、没有异常」，健康计数四格一起落到 0；读的人看到的是「四个
 /// 没病」，而不是「这一轮没查成」。
-fn health_report_from_reading(
+pub(crate) fn health_report_from_reading(
     reading: cog_core::SFResult<cog_core::HealthReport>,
 ) -> Result<cog_core::HealthReport, ApiError> {
     reading.map_err(|e| {
