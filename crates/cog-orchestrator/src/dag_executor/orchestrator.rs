@@ -1911,7 +1911,7 @@ impl DagExecutor {
 
         // 与内存路径同一个判据：不能靠重跑清除的失败不给重试预算。两处调的是
         // 同一个函数，所以「同一个判据」是结构上成立的，不是靠两边都写对。
-        let max_retries = self.effective_max_retries(&error, cause, &task.task_type);
+        let max_retries = self.effective_max_retries(&error, cause, &task);
         // 退避随任务一起落库，不留在调度循环的内存里：判定重试的进程与之后
         // 重新投递它的进程可能不是同一个。
         let retry_delay =
@@ -3261,17 +3261,35 @@ impl DagExecutor {
     /// verdict and an in-memory one that disagreed about the same failure would
     /// be two retry semantics wearing one name, and both would look right on
     /// whichever backend the reader happened to be looking at.
+    /// 还允不允许再跑一次。
+    ///
+    /// 判据是「这一轮有没有拿到新东西」，不是「已经试了几次」（属主 2026-11-23）：
+    /// 重试的全部价值在「下一轮拿着上一轮的判词能做得不一样」。所以
+    /// - 不可重试的失败（类型上就注定重跑同一道题）：0；
+    /// - 与行上记着的上一次失败**逐字相同**：0——一个字节都没变的输入重放，
+    ///   买回来的是同一个答案，而每一次都要付钱；
+    /// - 变了：允许再跑一次，不设次数上限。跑完若又没进展，下一轮的判据照样会拦。
     fn effective_max_retries(
         &self,
         error: &str,
         cause: Option<UpstreamFailure>,
-        task_type: &TaskType,
+        task: &Task,
     ) -> u32 {
-        if Self::is_retryable_failure(error, cause) {
-            self.retry_matrix.max_retries(task_type)
-        } else {
-            0
+        if !Self::is_retryable_failure(error, cause) {
+            return 0;
         }
+        let normalize = |s: &str| {
+            s.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase()
+        };
+        if let Some(previous) = task.error.as_deref() {
+            if normalize(previous) == normalize(error) {
+                return 0;
+            }
+        }
+        1
     }
 
     /// 这笔账谁付：任务，还是它撞上的环境。
@@ -3569,7 +3587,7 @@ impl DagExecutor {
         // 确定性失败不受重试预算约束：同样的输入在同一环境里再来一次必然同样
         // 失败，多付的只是那一轮烧掉的 token 和上游调用。预算清零比"重试三次
         // 都白跑"更省，也让失败原因在第一轮就浮出来而不是被三次重试盖住。
-        let max_retries = self.effective_max_retries(&error, cause, &task_type);
+        let max_retries = self.effective_max_retries(&error, cause, &task);
 
         let task = inner.tasks.get_mut(task_id).expect("task exists");
         // 落库的那份预算写成这一次判决真正用的那份。任务上原带的数只是提交者
@@ -9247,7 +9265,9 @@ mod tests {
         dag.schedule_task(&task_id).await.unwrap();
         dag.start_task(&task_id).await.unwrap();
 
-        let effective = dag.retry_matrix().max_retries(&TaskType::ToolCall);
+        // 判决现在看的是「这一轮有没有拿到新东西」：第一次失败没有上一次可比，
+        // 于是允许再跑一次，行上写回的就是这个 1——不是矩阵里那个声明值。
+        let effective = 1u32;
         assert_ne!(
             declared, effective,
             "用例只有在声明的数与生效的数不同时才有意义"
@@ -9272,37 +9292,51 @@ mod tests {
         assert_eq!(view.retry_count, 1);
     }
 
-    /// 行里带的界与判决用的界是两个数，差在失败类上：靠重跑清除不了的失败拿
-    /// 不到预算，因为重跑改变不了它。判据钉在这里——哪天有人让判决改读行里那
-    /// 个字段，这条会红。
+    /// 重试的判据是「这一轮有没有拿到新东西」，不是「试了几次」。
+    ///
+    /// 同一份失败原样回来：不重试（再跑一次买的是同一个答案，而每一次都付钱）。
+    /// 失败变了：允许再跑一次，且不拿次数封顶。
     #[test]
-    fn a_failure_a_rerun_cannot_clear_is_judged_by_no_budget() {
+    fn a_retry_is_bought_only_by_a_changed_failure() {
         let orchestrator = DagExecutor::new("ws".to_string());
         let task_type = TaskType::Custom("change_ledger".to_string());
-        let declared = orchestrator.retry_matrix().max_retries(&task_type);
-        assert!(
-            declared > 0,
-            "the case only means anything while the declared budget is a real one"
-        );
-
-        // 暂态失败：判决用的就是声明值。
+        let mut task = Task::new("t-retry", task_type.clone(), serde_json::json!({}));
         assert_eq!(
             orchestrator.effective_max_retries(
                 "upstream_unavailable",
                 Some(UpstreamFailure::ServerError),
-                &task_type,
+                &task,
             ),
-            declared
+            1,
+            "第一次失败没有上一次可比：允许再跑一次"
         );
-
-        // 判死的失败：声明值一格不动，判决用的是 0。
+        task.error = Some("upstream_unavailable: 429 from the pool".into());
+        assert_eq!(
+            orchestrator.effective_max_retries(
+                "upstream_unavailable:  429 FROM the pool",
+                Some(UpstreamFailure::ServerError),
+                &task,
+            ),
+            0,
+            "逐字相同（只差空白与大小写）就是没拿到新东西，不重试"
+        );
+        assert_eq!(
+            orchestrator.effective_max_retries(
+                "the generator produced no artifacts",
+                Some(UpstreamFailure::ServerError),
+                &task,
+            ),
+            1,
+            "失败变了：再跑一次，判据看的是变化，不是次数"
+        );
         assert_eq!(
             orchestrator.effective_max_retries(
                 "terminal_env_failure: environment_error",
                 Some(UpstreamFailure::Auth),
-                &task_type,
+                &task,
             ),
-            0
+            0,
+            "靠重跑清除不了的失败，一次也不给"
         );
     }
 
