@@ -1911,7 +1911,15 @@ impl DagExecutor {
 
         // 与内存路径同一个判据：不能靠重跑清除的失败不给重试预算。两处调的是
         // 同一个函数，所以「同一个判据」是结构上成立的，不是靠两边都写对。
-        let max_retries = self.effective_max_retries(&error, cause, &task);
+        // 落库那一格同样写「允许的话就是已经跑过的次数 + 1」：库里的判决比对的是
+        // `retry_count < max_retries`，而「变了就再跑一次」不设次数上限——写裸的 1 会
+        // 在第二次换了内容的失败上把门关死。
+        let allowed = self.effective_max_retries(&error, cause, &task);
+        let max_retries = if allowed == 0 {
+            0
+        } else {
+            task.retry_count.saturating_add(allowed)
+        };
         // 退避随任务一起落库，不留在调度循环的内存里：判定重试的进程与之后
         // 重新投递它的进程可能不是同一个。
         let retry_delay =
