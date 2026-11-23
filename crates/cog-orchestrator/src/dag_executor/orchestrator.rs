@@ -3603,10 +3603,10 @@ impl DagExecutor {
         // `retry_count < max_retries`：允许时写 `已经跑过的次数 + 1`，于是「变了就
         // 再跑一次、不设次数上限」在行上仍然是一个数，而不是让累计次数自己把路堵死。
         task.max_retries = max_retries;
-        // 计数只数「连续重复同一句」：买到的这次把计数清零，于是它不会自己把下一次
-        // 换内容的失败堵死；同一句原样再来时 `effective_max_retries` 给 0，判决当场关。
+        // 判决只看「这一轮有没有拿到新东西」（`effective_max_retries` 给出 0/1），
+        // 不看已经试过几次；`retry_count` 照旧累加，读它的地方读到的是「试过几次」。
         if max_retries > 0 {
-            task.retry_count = 0;
+            task.retry_count = retry_count + 1;
             task.status = TaskStatus::Pending;
             task.error = Some(error.clone());
             task.error_cause = cause;

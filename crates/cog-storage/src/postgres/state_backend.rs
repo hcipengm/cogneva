@@ -1886,11 +1886,11 @@ SELECT t.to_state, COUNT(*)::bigint
         task.max_retries = max_retries;
         task.updated_at = Utc::now();
 
-        let should_retry = task.retry_count < max_retries;
+        // 判决只看「有没有拿到新东西」：调用方给 0 就是不买，给 1 就是再跑一次。
+        // `retry_count` 照旧累加——它回答的是「试过几次」，不是「还准不准试」。
+        let should_retry = max_retries > 0;
         let not_before = if should_retry {
-            // 计数只数「连续重复同一句」：买到的这次把它清零，下一次换内容的失败
-            // 不会被累计次数自己堵死；同一句原样再来时调用方给的是 0，判决当场关。
-            task.retry_count = 0;
+            task.retry_count += 1;
             task.status = cog_core::TaskStatus::Pending;
             task.retry_not_before = chrono::Duration::from_std(retry_delay)
                 .ok()
