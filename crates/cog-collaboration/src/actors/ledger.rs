@@ -91,8 +91,9 @@ pub fn run() -> i32 {
         Some("close") => close(),
         Some("gate") => gate(),
         Some("editing") => editing(),
+        Some("stop-gate") => stop_gate(),
         Some(other) => {
-            eprintln!("ledger: 不认识的动作 `{other}`（今天有 `status`、`next`、`open`、`close`、`gate` 与 `editing`）");
+            eprintln!("ledger: 不认识的动作 `{other}`（今天有 `status`、`next`、`open`、`close`、`gate`、`editing` 与 `stop-gate`）");
             2
         }
     }
@@ -129,6 +130,45 @@ pub enum GateOutcome {
     Allow(String),
     Refuse(String),
     Unreadable(String),
+}
+
+/// `cogneva ledger stop-gate`：收工钩子要的那一问——**现在能不能停**。
+///
+/// 三态是它自己的协议，不由人挑：0 可以停（没有开着的一轮，或这一轮已做完）、
+/// 2 不许停（开着的一轮还有缺口）、3 判不了（书读不出来）。`status` 的裸往返码答不了
+/// 这一问：那边「没有轮」与「有缺口」都是非零，按码分支会把「没有轮」读成「没关」。
+pub fn stop_gate() -> i32 {
+    let path = match ledger_path() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ledger: {e}");
+            return 3;
+        }
+    };
+    let ledger_dir = path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+    let (repo, ok) = git(&ledger_dir, &["rev-parse", "--show-toplevel"]);
+    if !ok || repo.is_empty() {
+        eprintln!("ledger: 台账不在一个 git 仓里（{ledger_dir}）");
+        return 3;
+    }
+    let (sha, ok) = git(&repo, &["rev-parse", "--verify", "--quiet", ROUND_REF]);
+    if !ok || sha.is_empty() {
+        return 0;
+    }
+    match gate_verdict() {
+        GateOutcome::Allow(summary) => {
+            println!("{summary}");
+            0
+        }
+        GateOutcome::Refuse(message) => {
+            eprintln!("{message}");
+            2
+        }
+        GateOutcome::Unreadable(message) => {
+            eprintln!("ledger: {message}");
+            3
+        }
+    }
 }
 
 /// `cogneva ledger editing`：提交之前的那一问——这一遍编辑，台账上每条待办说的触点都动到了没有。
