@@ -101,10 +101,8 @@ pub(crate) fn warn_text() -> WarnText {
     static SINK: std::sync::OnceLock<WarnSink> = std::sync::OnceLock::new();
     let sink = SINK.get_or_init(|| {
         let sink = WarnSink::default();
-        tracing::subscriber::set_global_default(
-            tracing_subscriber::registry().with(sink.clone()),
-        )
-        .expect("这个测试二进制里不该有别人先装全局订阅者");
+        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(sink.clone()))
+            .expect("这个测试二进制里不该有别人先装全局订阅者");
         sink
     });
     WarnText {

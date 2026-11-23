@@ -22,27 +22,16 @@ use crate::common;
 use chrono::Utc;
 use std::sync::Arc;
 
-use cog_core::{AgentState, OrchestratorControl, SFError, SFResult, StateBackend, Task, TaskCheckpoint, TaskType};
+use cog_core::{
+    AgentState, OrchestratorControl, SFError, SFResult, StateBackend, Task, TaskCheckpoint,
+    TaskType,
+};
 use cog_supervisor::lifecycle_coordinator::RecoveredCheckpoint;
-use cog_supervisor::registry::{AgentInfo, AgentRegistry};
+use cog_supervisor::registry::AgentRegistry;
 use cog_supervisor::task_rebalancer::{TaskRebalancer, TaskRebalancerConfig};
 use cog_test_support::{MemoryStateBackend, TaskGraphStub};
 
 const UNANSWERED: &str = "the state store did not answer";
-
-fn make_agent(id: &str) -> AgentInfo {
-    let now = Utc::now();
-    AgentInfo {
-        agent_id: id.into(),
-        role: None,
-        crew_id: None,
-        squad_id: None,
-        task_ids: Vec::new(),
-        last_heartbeat: now,
-        state_since: now,
-        registered_at: now,
-    }
-}
 
 fn rebalancer_with(
     reg: Arc<AgentRegistry>,
@@ -145,8 +134,9 @@ impl StateBackend for UnreadableFor {
 async fn a_ready_queue_that_cannot_be_read_fails_the_pass() {
     let reg = Arc::new(AgentRegistry::new());
     let backend: Arc<dyn StateBackend> = Arc::new(MemoryStateBackend::new());
-    let orch: Arc<dyn OrchestratorControl> =
-        Arc::new(TaskGraphStub::whose_ready_read_fails("ready queue unreachable"));
+    let orch: Arc<dyn OrchestratorControl> = Arc::new(TaskGraphStub::whose_ready_read_fails(
+        "ready queue unreachable",
+    ));
 
     let err = rebalancer_with(reg, backend, orch)
         .plan()
@@ -162,7 +152,7 @@ async fn a_ready_queue_that_cannot_be_read_fails_the_pass() {
 #[tokio::test]
 async fn a_task_table_that_cannot_be_read_fails_the_pass() {
     let reg = Arc::new(AgentRegistry::new());
-    reg.register_agent(make_agent("agent-1"));
+    reg.register_agent(common::orchestrator::agent("agent-1"));
 
     let backend = MemoryStateBackend::new();
     backend
@@ -171,8 +161,9 @@ async fn a_task_table_that_cannot_be_read_fails_the_pass() {
         .unwrap();
     let backend: Arc<dyn StateBackend> = Arc::new(backend);
 
-    let orch: Arc<dyn OrchestratorControl> =
-        Arc::new(TaskGraphStub::whose_task_read_fails("task table unreachable"));
+    let orch: Arc<dyn OrchestratorControl> = Arc::new(TaskGraphStub::whose_task_read_fails(
+        "task table unreachable",
+    ));
 
     let err = rebalancer_with(reg, backend, orch)
         .plan()
@@ -223,8 +214,8 @@ async fn a_graph_that_cannot_be_read_fails_the_recovery_plan() {
 #[tokio::test]
 async fn an_agent_whose_state_cannot_be_read_is_left_out_of_the_pass() {
     let reg = Arc::new(AgentRegistry::new());
-    reg.register_agent(make_agent("agent-1"));
-    reg.register_agent(make_agent("agent-2"));
+    reg.register_agent(common::orchestrator::agent("agent-1"));
+    reg.register_agent(common::orchestrator::agent("agent-2"));
 
     let backend: Arc<dyn StateBackend> = Arc::new(UnreadableFor {
         inner: MemoryStateBackend::new(),
@@ -253,9 +244,6 @@ async fn an_agent_whose_state_cannot_be_read_is_left_out_of_the_pass() {
     );
     assert_eq!(plan.assignments.len(), 2, "活照排给读得到的那个");
     for (agent_id, task_id) in &plan.assignments {
-        assert_eq!(
-            agent_id, "agent-1",
-            "{task_id} 派给了状态读不到的 agent-2"
-        );
+        assert_eq!(agent_id, "agent-1", "{task_id} 派给了状态读不到的 agent-2");
     }
 }

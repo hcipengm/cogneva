@@ -2601,10 +2601,7 @@ mod tests {
 
         /// 读这一行的那一问答不上来。
         fn fail_read_of(&self, id: &str) {
-            self.unreadable
-                .lock()
-                .unwrap()
-                .insert(id.to_string());
+            self.unreadable.lock().unwrap().insert(id.to_string());
         }
 
         fn filed(&self) -> Vec<Task> {
@@ -3563,10 +3560,7 @@ mod tests {
 
         assert_eq!(settled.criteria, 0, "{settled:?}");
         assert_eq!(settled.failed, 0, "读不到不是「写失败」：{settled:?}");
-        assert_eq!(
-            settled.remaining, 1,
-            "读不到的行要留到下一拍：{settled:?}"
-        );
+        assert_eq!(settled.remaining, 1, "读不到的行要留到下一拍：{settled:?}");
         let after = orch.get_all_tasks().await;
         assert!(
             after[0].acceptance.is_empty(),
@@ -3594,15 +3588,9 @@ mod tests {
         fill_rework_criteria(&orch, std::slice::from_ref(&row), &mut settled).await;
 
         assert_eq!(settled.rework_criteria, 0, "{settled:?}");
-        assert_eq!(
-            settled.remaining, 1,
-            "读不到的行要留到下一拍：{settled:?}"
-        );
+        assert_eq!(settled.remaining, 1, "读不到的行要留到下一拍：{settled:?}");
         let after = orch.get_all_tasks().await;
-        assert!(
-            after[0].acceptance.is_empty(),
-            "读不到的一行什么都没写"
-        );
+        assert!(after[0].acceptance.is_empty(), "读不到的一行什么都没写");
     }
 
     /// 「先读后判」那一问答不上来时，不能当作「库里没有这一行」。

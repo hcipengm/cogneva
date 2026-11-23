@@ -6,9 +6,10 @@
 # released when the free space on their filesystem is smaller than the space
 # they occupy. At that point the machine is keeping more throwaway build output
 # than it has room for, and the next build is the one that runs out -- which is
-# exactly what happened on 2026-11-23: a scratch worktree's target grew until
-# the disk read 0 MB free, and the half-hour cache reclaimer had run before the
-# build started. Below that reading nothing is released: a small leftover costs
+# exactly what happened on 2026-11-23 (实测, 本机): a scratch worktree's target
+# grew until the filesystem had no free space left, and the half-hour cache
+# reclaimer had run before the build started. Below that reading nothing is
+# released: a small leftover costs
 # nothing to keep, and deleting trees another session may still be using is not
 # a thing to do for tidiness.
 #

@@ -8702,7 +8702,9 @@ mod tests {
         );
         let control: Arc<dyn OrchestratorControl> = graph.clone();
 
-        let settled = settle_dispatch_parents(&control).await.expect("the graph is readable here");
+        let settled = settle_dispatch_parents(&control)
+            .await
+            .expect("the graph is readable here");
 
         assert_eq!(
             settled.anchored, 1,
@@ -8739,9 +8741,13 @@ mod tests {
                 .holding_root_change("change-b", "change-ledger:crates"),
         );
         let control: Arc<dyn OrchestratorControl> = graph.clone();
-        settle_dispatch_parents(&control).await.expect("the graph is readable here");
+        settle_dispatch_parents(&control)
+            .await
+            .expect("the graph is readable here");
 
-        let settled = settle_dispatch_parents(&control).await.expect("the graph is readable here");
+        let settled = settle_dispatch_parents(&control)
+            .await
+            .expect("the graph is readable here");
 
         assert_eq!(
             settled,
@@ -8768,7 +8774,9 @@ mod tests {
         );
         let control: Arc<dyn OrchestratorControl> = graph.clone();
 
-        let settled = settle_dispatch_parents(&control).await.expect("the graph is readable here");
+        let settled = settle_dispatch_parents(&control)
+            .await
+            .expect("the graph is readable here");
 
         assert_eq!(settled.criteria, 1, "{settled:?}");
         assert_eq!(settled.failed, 0, "{settled:?}");
@@ -8790,7 +8798,9 @@ mod tests {
             "a row of another kind is not this pass's to fill"
         );
         assert_eq!(
-            settle_dispatch_parents(&control).await.expect("the graph is readable here"),
+            settle_dispatch_parents(&control)
+                .await
+                .expect("the graph is readable here"),
             SettledProjects::default(),
             "a second settle finds nothing left to do"
         );
@@ -8809,11 +8819,15 @@ mod tests {
         }
         let control: Arc<dyn OrchestratorControl> = Arc::new(graph);
 
-        let settled = settle_dispatch_parents(&control).await.expect("the graph is readable here");
+        let settled = settle_dispatch_parents(&control)
+            .await
+            .expect("the graph is readable here");
         assert_eq!(settled.criteria, SETTLE_BATCH, "{settled:?}");
         assert_eq!(settled.remaining, 3, "{settled:?}");
 
-        let settled = settle_dispatch_parents(&control).await.expect("the graph is readable here");
+        let settled = settle_dispatch_parents(&control)
+            .await
+            .expect("the graph is readable here");
         assert_eq!(settled.criteria, 3, "{settled:?}");
         assert_eq!(settled.remaining, 0, "{settled:?}");
 
@@ -8863,10 +8877,7 @@ mod tests {
 
         assert_eq!(settled.criteria, 0, "{settled:?}");
         assert_eq!(settled.failed, 0, "读不到不是写失败：{settled:?}");
-        assert_eq!(
-            settled.remaining, 1,
-            "读不到的行要留到下一拍：{settled:?}"
-        );
+        assert_eq!(settled.remaining, 1, "读不到的行要留到下一拍：{settled:?}");
     }
 
     /// 下发这一趟读不到图，就一条都不下发。
@@ -8932,9 +8943,8 @@ mod tests {
             rows: vec![row.clone()],
             ..Default::default()
         };
-        let graph = Arc::new(
-            FakeGraph::default().with_unreadable(&dispatch_task_id(&row.identity, 0)),
-        );
+        let graph =
+            Arc::new(FakeGraph::default().with_unreadable(&dispatch_task_id(&row.identity, 0)));
         let control: Arc<dyn OrchestratorControl> = graph.clone();
 
         dispatch_pass(

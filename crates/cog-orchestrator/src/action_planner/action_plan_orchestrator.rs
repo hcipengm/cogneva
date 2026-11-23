@@ -3415,7 +3415,10 @@ mod tests {
             .process_goal_impl("run the probe as written", vec![probe], &registry)
             .await
             .expect("a held row is an idempotent no-op, not a refusal");
-        assert!(ids.is_empty(), "nothing was queued: the id was already held");
+        assert!(
+            ids.is_empty(),
+            "nothing was queued: the id was already held"
+        );
         assert!(
             warns.any("unreadable"),
             "the log line must say the row could not be read, not that no row exists"

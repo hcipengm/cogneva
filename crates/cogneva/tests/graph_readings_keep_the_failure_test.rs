@@ -31,7 +31,8 @@ const EXECUTOR: &str = "crates/cog-gateway/src/executor.rs";
 const REBALANCER: &str = "crates/cog-supervisor/src/task_rebalancer.rs";
 const DAG_EXECUTOR: &str = "crates/cog-orchestrator/src/dag_executor/orchestrator.rs";
 const DAG_CONSUMER: &str = "crates/cog-orchestrator/src/dag_executor/mod.rs";
-const ACTION_PLANNER: &str = "crates/cog-orchestrator/src/action_planner/action_plan_orchestrator.rs";
+const ACTION_PLANNER: &str =
+    "crates/cog-orchestrator/src/action_planner/action_plan_orchestrator.rs";
 const SIGNAL_WATCHER: &str = "crates/cog-reflection/src/signal_watcher.rs";
 const CHANGE_LEDGER: &str = "crates/cog-orchestrator/src/change_ledger.rs";
 const DISCOVERY_LOOP: &str = "crates/cog-github/src/discovery_loop.rs";

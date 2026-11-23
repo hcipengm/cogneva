@@ -5012,10 +5012,10 @@ fn claim_refusal_as_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::warn_text;
     use cog_core::{
         AgentState, ContextBoard, Event, MetricsBackend, StateBackend, TaskCheckpoint, TaskType,
     };
-    use crate::test_support::warn_text;
 
     /// 本部署读哪些就绪队列——清扫器的范围判据，与运行期同一个函数。
     fn served(workspace: &str, executor_role: bool) -> Vec<String> {
@@ -5638,7 +5638,11 @@ mod tests {
                 .task_reads_taken
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
-            if self.task_read_fail_on.load(std::sync::atomic::Ordering::Relaxed) == nth {
+            if self
+                .task_read_fail_on
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == nth
+            {
                 return Err(SFError::Database(format!(
                     "store unavailable: cannot read task {task_id}"
                 )));
@@ -7722,7 +7726,6 @@ mod tests {
         );
     }
 
-
     /// 只记下「撤过哪一行」的告警落点。
     ///
     /// 这一族里「撤掉」是唯一不可逆的一步：撤了，下一趟的采纳看不到它，它再也不会
@@ -7799,12 +7802,16 @@ mod tests {
             .task_read_fail_on
             .store(1, std::sync::atomic::Ordering::Relaxed);
         runtime
-            .handle_result_message("results:ws-owner-unreadable", "grp-owner-unreadable", "m-1", &body)
+            .handle_result_message(
+                "results:ws-owner-unreadable",
+                "grp-owner-unreadable",
+                "m-1",
+                &body,
+            )
             .await;
 
         assert!(
-            warns
-                .any("cannot read the task this result names; leaving it for redelivery"),
+            warns.any("cannot read the task this result names; leaving it for redelivery"),
             "读不到就要说出来，调用方凭这一行知道它被留着重投：{:?}",
             warns.said()
         );
@@ -7865,10 +7872,7 @@ mod tests {
             log.0.lock().unwrap().is_empty(),
             "读不到不是「任务没了」：这一条告警不能被收掉"
         );
-        assert!(
-            firing.contains_key(&key),
-            "它还在响，下一趟就该还看得见它"
-        );
+        assert!(firing.contains_key(&key), "它还在响，下一趟就该还看得见它");
     }
 
     /// WBS 判词重算读不到整份行表：判词维持原样，不下「不再成立」的结论。
@@ -7877,8 +7881,9 @@ mod tests {
     #[tokio::test]
     async fn a_wbs_verdict_that_cannot_read_the_rows_stands() {
         let backend = Arc::new(CountingTaskStore::default());
-        let dag =
-            Arc::new(DagExecutor::new("ws-wbs-unreadable".into()).with_state_backend(backend.clone()));
+        let dag = Arc::new(
+            DagExecutor::new("ws-wbs-unreadable".into()).with_state_backend(backend.clone()),
+        );
 
         let warns = warn_text();
         backend

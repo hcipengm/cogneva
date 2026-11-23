@@ -115,11 +115,7 @@ impl TaskRebalancer {
             // 读不到状态与「没有状态」是两件事：前者说明这一格此刻量不出来，把它读成
             // 「这个 agent 空闲」会让它在状态后端失联时继续接活——而那正是最不该派活的
             // 时刻。读不到就这一趟不排它，并把读数打出来。
-            let backend_state = match self
-                .state_backend
-                .get_agent_state(&agent.agent_id)
-                .await
-            {
+            let backend_state = match self.state_backend.get_agent_state(&agent.agent_id).await {
                 Ok(state) => state,
                 Err(err) => {
                     warn!(
@@ -217,10 +213,7 @@ impl TaskRebalancer {
 
     /// Count the number of running tasks owned by an agent according
     /// to the orchestrator.
-    async fn count_running_tasks_for_agent(
-        &self,
-        agent_id: &str,
-    ) -> SupervisorResult<usize> {
+    async fn count_running_tasks_for_agent(&self, agent_id: &str) -> SupervisorResult<usize> {
         // 读不到图就不数：数成 0 条在跑会让这个 agent 看起来空闲，于是往一个并不空闲的
         // agent 上派活。读不到的答案是把这一趟算不成，不是「它没有活」。
         let count = self
