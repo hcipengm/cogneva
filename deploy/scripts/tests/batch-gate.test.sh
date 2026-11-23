@@ -191,19 +191,35 @@ Split: 3 — S2 — 两侧都是纯代码"
 out=$(run "$tree" "$ledger_code"); rc=$?
 { [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "两侧都没碰"; } && ok "两侧都不碰不可回退的面：红" || bad "两侧都不碰却没红（rc=$rc）：$out"
 
-# 第 4 条理由要拿**整行正文**去比窗口份额：标题截断到 80 字时，最长的几条会被
-# 估成同一个数，于是这条理由永远不成立。
+# 第 4 条理由（一次读不完）的界是**这个宿主真的收过的最大一批**，不是谁报的窗口：
+# 那条读数由 `round.py close` 写在 `rounds-closed.tsv` 里。
 reset
-{ row S1 "crates/a/src/x.rs" "done"; printf '| S2 | %s | 未落 | 判据 |｜round: current｜touches: crates/b/src/y.rs\n' "$long"; } >"$ledger_long"
-git -C "$tree" add -A >/dev/null; git -C "$tree" commit -qm "long ledger" >/dev/null
+ledger_two="$tree/ledger_two.md"
+{ row S1 "crates/a/src/x.rs" "done"; printf '| S2 | 内容 | 未落 | 判据 |｜round: current｜touches: crates/b/src/y.rs\n'; } >"$ledger_two"
+git -C "$tree" add -A >/dev/null; git -C "$tree" commit -qm "two" >/dev/null
 pin "$(git -C "$tree" rev-parse HEAD)"
-commit_with "too much to read in one window
+commit_with "split by size
 
 Split: 4 — S2 — 这一条读不完"
-out=$(run "$tree" "$ledger_long" --window-tokens 400); rc=$?
-[ "$rc" -eq 0 ] && ok "第 4 条：正文超过窗口份额的一半，成立" || bad "第 4 条合格却仍被拒（rc=$rc）：$out"
-out=$(run "$tree" "$ledger_long" --window-tokens 8000); rc=$?
-{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "窗口份额"; } && ok "第 4 条：正文远小于窗口份额，红" || bad "第 4 条不合格却没红（rc=$rc）：$out"
+
+closed="$tmp/rounds-closed.tsv"
+printf '2026-11-01T00:00:00Z\tabc123\t0\t\n' >"$closed"
+out=$(COGNEVA_CLOSED_ROUNDS="$closed" run "$tree" "$ledger_two"); rc=$?
+[ "$rc" -eq 0 ] \
+    && ok "第 4 条：排掉的那一侧比收过的最大一批多，成立" \
+    || bad "第 4 条合格却仍被拒（rc=$rc）：$out"
+
+printf '2026-11-02T00:00:00Z\tabc456\t5\tA,B,C,D,E\n' >>"$closed"
+out=$(COGNEVA_CLOSED_ROUNDS="$closed" run "$tree" "$ledger_two"); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "收过 5 条一批"; } \
+    && ok "第 4 条：这一侧收得下（宿主收过 5 条一批），红" \
+    || bad "第 4 条不合格却没红（rc=$rc）：$out"
+
+rm -f "$closed"
+out=$(COGNEVA_CLOSED_ROUNDS="$closed" run "$tree" "$ledger_two"); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "量不到"; } \
+    && ok "第 4 条：没有任何收过的批——量不到，不当成读得完" \
+    || bad "量不到却当成读得完（rc=$rc）：$out"
 
 # ---- 提交那一刻的门（`pre-commit.d/55-batch-edited-before-commit.sh`） ----
 #

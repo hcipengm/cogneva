@@ -440,6 +440,36 @@ def status() -> int:
     return 0 if terminal == len(left) else 1
 
 
+CLOSED_ROUNDS_ENV = "COGNEVA_CLOSED_ROUNDS"
+DEFAULT_CLOSED_ROUNDS = pathlib.Path.home() / ".local/state/cogneva/rounds-closed.tsv"
+
+
+def closed_rounds_path() -> pathlib.Path:
+    return pathlib.Path(os.environ.get(CLOSED_ROUNDS_ENV, str(DEFAULT_CLOSED_ROUNDS)))
+
+
+def record_closed_round(payload: dict) -> None:
+    """把「这一批真的收过」记成一行读数。
+
+    书是当前那一轮，关了之后会被下一轮覆盖——而「这个宿主最多一次收过几条」正是
+    `Split: 4`（一次读不完）该拿来说话的界：它由**收过的批**导出，不由谁报一个窗口。
+    没有这条记录时那道门说「量不到」，而不是说「读得完」。
+    """
+    path = closed_rounds_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    batch = payload.get("batch") or []
+    line = "\t".join(
+        [
+            dt.datetime.now(dt.timezone.utc).isoformat(),
+            str(payload.get("ledger_rev", ""))[:12],
+            str(len(batch)),
+            ",".join(batch),
+        ]
+    )
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+
+
 def close() -> int:
     current = current_round()
     if current is None:
@@ -457,6 +487,7 @@ def close() -> int:
         sha, payload = found
         payload["closed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
         write_git_round(repo, payload, sha)
+        record_closed_round(payload)
         print(f"round: 这一轮关了（书=git {ROUND_REF}@{repo}；关的时刻在同一份载荷里）。")
         return 0
     import os

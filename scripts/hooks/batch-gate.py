@@ -14,7 +14,8 @@
                       deploy/、migrations/、scripts/host/（回滚一次提交回不到原状
                       的那一侧必须单独落地）；两侧都碰或都不碰 ⇒ 假；
      - 4 一次读不完   被排除那几行的正文估算 token 必须超过窗口里它能占的份额
-                      （窗口由模型声明导出，`--window-tokens` 或 `COGNEVA_CONTEXT_WINDOW`）。
+                      （界是把这一批与**这个宿主真的收过的最大一批**比：那条读数由
+                      `round.py close` 写进 `rounds-closed.tsv`，不由谁报一个窗口）。
 
 台账由 `COGNEVA_TODO_LEDGER` 指定（或 `--ledger`）。读不到 ⇒ 退 2「没判」，不是绿。
 
@@ -126,7 +127,36 @@ def packages(paths: list[str]) -> set[str]:
     return {"/".join(p.split("/")[:2]) for p in paths if "/" in p}
 
 
-def judge(kind: str, excluded: list[str], detail: str, touched: list[str], items: dict, window: int) -> str | None:
+def closed_batch_bound() -> int | None:
+    """这个宿主上真的收过的最大一批是几条。
+
+    读数由 `round.py close` 写在 `rounds-closed.tsv` 里（一个关得掉的轮，按定义是
+    批里每一条都到了终态的那一轮）。它替代了「模型自报一个窗口」：窗口不是树上能
+    量到的东西，而「这个宿主一次收过几条」能——有人真收过 7 条，那 7 条一批就不是
+    「读不完」。读不到就是 None（量不到），不是 0。
+    """
+    path = pathlib.Path(
+        os.environ.get(
+            "COGNEVA_CLOSED_ROUNDS",
+            str(pathlib.Path.home() / ".local/state/cogneva/rounds-closed.tsv"),
+        )
+    )
+    if not path.is_file():
+        return None
+    best: int | None = None
+    for line in path.read_text(errors="ignore").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        try:
+            size = int(parts[2])
+        except ValueError:
+            continue
+        best = size if best is None else max(best, size)
+    return best
+
+
+def judge(kind: str, excluded: list[str], detail: str, touched: list[str], items: dict) -> str | None:
     if kind == "3":
         # 这条理由的全部内容是「被拆开的两侧里，恰有一侧动的是回不去的东西」：
         # 那一侧必须单独落地，因为回滚一次提交回不到原状，混在别人里面会让别人
@@ -152,14 +182,17 @@ def judge(kind: str, excluded: list[str], detail: str, touched: list[str], items
             )
         return None
     if kind == "4":
-        if window <= 0:
-            return "Split: 4 要拿窗口份额比，但没给窗口（--window-tokens 或 COGNEVA_CONTEXT_WINDOW）"
-        cost = sum(
-            estimate_tokens(getattr(items.get(name), "text", "")) for name in excluded
-        )
-        share = window // 2
-        if cost <= share:
-            return f"Split: 4 说这些读不完，但它们估算只有 {cost} token ≤ 窗口份额 {share}"
+        bound = closed_batch_bound()
+        if bound is None:
+            return (
+                "Split: 4 说这些一次读不完，但这个宿主还没有收过任何一批——量不到，"
+                "不许当成读得完"
+            )
+        if len(excluded) <= bound:
+            return (
+                f"Split: 4 说这些读不完，但这个宿主收过 {bound} 条一批："
+                f"这一侧只有 {len(excluded)} 条，不算读不完"
+            )
         return None
     if kind == "2":
         if not re.search(r"[a-z0-9_]+\.rs|tests?/", detail):
@@ -173,8 +206,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--root", default=".")
     parser.add_argument("--base", default="origin/main")
     parser.add_argument("--source", default=None)
-    parser.add_argument("--window-tokens", type=int,
-                        default=int(os.environ.get("COGNEVA_CONTEXT_WINDOW", "0")))
+    # 没有窗口旋钮：`Split: 4` 的界来自 `rounds-closed.tsv`（见 `closed_batch_bound`）。
     args = parser.parse_args(argv[1:])
 
     root = pathlib.Path(args.root).resolve()
@@ -300,7 +332,7 @@ def main(argv: list[str]) -> int:
         )
         return 1
 
-    problem = judge(kind, declared, detail, touched, items, args.window_tokens)
+    problem = judge(kind, declared, detail, touched, items)
     if problem:
         print(f"FAIL: {problem}", file=sys.stderr)
         return 1
