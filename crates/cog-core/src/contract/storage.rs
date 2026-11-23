@@ -1583,6 +1583,7 @@ pub trait RawLogIndexStore: Send + Sync {
 
 #[cfg(test)]
 mod streaming_write_tests {
+    use super::*;
 
     /// 一个只实现了整段写的后端：它没有流式入口，于是第一次开写就必须**如实报错**。
     ///
@@ -1633,8 +1634,6 @@ mod streaming_write_tests {
 }
 
 mod tests {
-    use super::*;
-
     /// 原始日志的缓冲条数与刷盘间隔各只有一处声明：默认值读常量，常量上面写着
     /// 它由什么钉住。`#[serde(default = …)]` 走的是同一个常量。
     #[test]
