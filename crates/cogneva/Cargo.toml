@@ -26,6 +26,10 @@ name = "suite"
 path = "tests/suite.rs"
 
 [[test]]
+name = "planner_schema_matches_the_ledger_item"
+path = "tests/planner_schema_matches_the_ledger_item.rs"
+
+[[test]]
 name = "backup_pg"
 path = "tests/backup_pg.rs"
 
