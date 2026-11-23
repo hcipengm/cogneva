@@ -1557,8 +1557,8 @@ mod tests {
 
     /// 停滞窗口只有一处声明：默认值读常量，常量上面写着它由什么钉住。
     ///
-    /// 两面一起钉：运行时默认值等于常量（改常量就改默认值），源码面
-    /// `impl Default` 的字段里不再有数字（下一笔写回裸字面量就红）。
+    /// 运行时默认值等于常量（改常量就改默认值）；源码面 `impl Default` 的字段
+    /// 里不再有数字（下一笔写回裸字面量就红）。
     #[test]
     fn the_ralph_default_reads_its_window() {
         let cfg = RalphLoopConfig::default();
