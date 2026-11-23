@@ -108,5 +108,26 @@ out=$(COGNEVA_TODO_SOURCE="md:$tmp/loose/ledger.md" python3 "$tree/scripts/hooks
     && ok "台账不在 git 仓里：退 3，不改读事件流" \
     || bad "无仓台账的判词不对（rc=$rc）：$out"
 
+# 6. 关掉一轮时写下「这一批真有这么大」那行读数：`Split: 4` 的界读的就是它。
+#    开一轮（两条未落）→ 两条都做到终态 → 关轮，读数文件里要有一行 size=2。
+printf '| S1 | 终态一 | 现在 | 差距 ｜touches: l1.md | 未落 |\n| S2 | 终态二 | 现在 | 差距 ｜touches: l2.md | 未落 |\n' >"$tree/ledger.md"
+git -C "$tree" add ledger.md >/dev/null; git -C "$tree" commit -qm "two open" >/dev/null
+git -C "$tree" update-ref -d refs/cogneva/round 2>/dev/null
+closed="$tmp/rounds-closed.tsv"
+rm -f "$closed"
+out=$(COGNEVA_CLOSED_ROUNDS="$closed" run open 2>&1); rc=$?
+[ "$rc" -eq 0 ] || bad "开不出一轮（rc=$rc）：$out"
+
+printf '| S1 | 终态一 | 现在 | — | 已落 |\n| S2 | 终态二 | 现在 | — | 已落 |\n' >"$tree/ledger.md"
+git -C "$tree" add ledger.md >/dev/null; git -C "$tree" commit -qm "both reached" >/dev/null
+# 关得掉的前提是**钉住的那一版**台账里整批都到了终态：把钉重钉到改完的这一版，
+# 再关。重钉继承 `first_rev`，所以「开门时那批有几条」仍然读得出来。
+out=$(COGNEVA_CLOSED_ROUNDS="$closed" run rebound 2>&1); rc=$?
+[ "$rc" -eq 0 ] || bad "重钉失败（rc=$rc）：$out"
+out=$(COGNEVA_CLOSED_ROUNDS="$closed" run close 2>&1); rc=$?
+{ [ "$rc" -eq 0 ] && [ -f "$closed" ] && awk -F'\t' '$3==2' "$closed" | grep -q .; } \
+    && ok "关一轮：写下这一批的大小（2）" \
+    || bad "关轮没写读数（rc=$rc）：$out 文件：$(cat "$closed" 2>/dev/null)"
+
 printf 'round-git-store.test.sh: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

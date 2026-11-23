@@ -451,23 +451,42 @@ def closed_rounds_path() -> pathlib.Path:
 def record_closed_round(payload: dict) -> None:
     """把「这一批真的收过」记成一行读数。
 
-    书是当前那一轮，关了之后会被下一轮覆盖——而「这个宿主最多一次收过几条」正是
-    `Split: 4`（一次读不完）该拿来说话的界：它由**收过的批**导出，不由谁报一个窗口。
-    没有这条记录时那道门说「量不到」，而不是说「读得完」。
+    记的是**这一轮开门时那一批**有几条，而不是关轮那一刻还算得出来的那几条：轮关得掉
+    的前提是整批都到了终态，于是重钉之后现算的批是空的——按它记，这条读数永远是 0，
+    而它正是 `Split: 4`（一次读不完）的界。所以原始清单从 `first_rev` 上取：那一版台账
+    里还开着的那几条，就是这一轮开门时点下的那几条。
     """
     path = closed_rounds_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    batch = payload.get("batch") or []
+    carried = original_batch(payload)
     line = "\t".join(
         [
             dt.datetime.now(dt.timezone.utc).isoformat(),
-            str(payload.get("ledger_rev", ""))[:12],
-            str(len(batch)),
-            ",".join(batch),
+            str(payload.get("first_rev") or payload.get("ledger_rev", ""))[:12],
+            str(len(carried)),
+            ",".join(carried),
         ]
     )
     with path.open("a", encoding="utf-8") as fh:
         fh.write(line + "\n")
+
+
+def original_batch(payload: dict) -> list[str]:
+    """这一轮开门时点下的那几条：从 `first_rev` 那一版台账里现算。
+
+    读不到（那一版没了、或台账不在 git 仓里）就退回载荷里记的 `batch`——两种都是
+    「这一批有几条」的读法，只是取的地方不同；静默返回空会让这条读数看起来像
+    「这一轮什么也没收」。
+    """
+    source = todo_source.default_spec()
+    first = payload.get("first_rev")
+    if first:
+        try:
+            path = ledger_at(first, source)
+            return [i.id for i in todo_source.load(f"md:{path}")]
+        except (todo_source.Unreadable, OSError):
+            pass
+    return list(payload.get("batch") or [])
 
 
 def close() -> int:
