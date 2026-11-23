@@ -81,14 +81,15 @@ pub fn status() -> i32 {
     }
 }
 
-/// `cogneva ledger <action>` 的分派。今天有 `status` 与 `next`；别的名字点名说没有，
+/// `cogneva ledger <action>` 的分派。今天有 `status`、`next` 与 `open`；别的名字点名说没有，
 /// 不静默成功——一个不认识的子命令退 0 会被读成「跑过了」。
 pub fn run() -> i32 {
     match std::env::args().nth(2).as_deref() {
         Some("status") | None => status(),
         Some("next") => next(),
+        Some("open") => open(),
         Some(other) => {
-            eprintln!("ledger: 不认识的动作 `{other}`（今天有 `status` 与 `next`）");
+            eprintln!("ledger: 不认识的动作 `{other}`（今天有 `status`、`next` 与 `open`）");
             2
         }
     }
@@ -120,6 +121,24 @@ pub fn decide(open_rows: usize, dirty: bool, compiled_head: Option<&str>, head: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 书的载荷带着这一批、这一批每条的缺口、两个坐标与第一次开工的基准。
+    #[test]
+    fn the_round_payload_carries_the_batch_and_every_gap() {
+        let batch = vec!["N01".to_string(), "N02".to_string()];
+        let mut gaps = serde_json::Map::new();
+        gaps.insert("N01".into(), serde_json::Value::String("缺的是：接线".into()));
+        gaps.insert("N02".into(), serde_json::Value::String("—".into()));
+        let payload = round_payload(&batch, &gaps, "abcdef123456", "fedcba654321", "111111111111");
+        assert_eq!(payload["batch"].as_array().map(|a| a.len()), Some(2));
+        assert_eq!(payload["gaps"]["N01"], "缺的是：接线");
+        assert_eq!(payload["ledger_rev"], "abcdef123456");
+        assert_eq!(
+            payload["first_rev"], "111111111111",
+            "重钉不该清零「自开工以来」的基准"
+        );
+        assert!(payload["opened_at"].as_str().is_some_and(|s| s.contains('T')));
+    }
+
 
     /// 顺序就是流程：先改完，再提交，再编一次，最后才谈推。
     #[test]
@@ -205,4 +224,128 @@ pub fn next() -> i32 {
         decide(open, !status.is_empty(), compiled.as_deref(), &head)
     );
     0
+}
+
+/// 书：这一轮钉在哪一版台账上。载荷是 JSON，住在台账那个仓的 `refs/cogneva/round`。
+pub const ROUND_REF: &str = "refs/cogneva/round";
+
+/// `cogneva ledger open`：把这一批钉进书里。
+///
+/// 一批是什么由台账现算（未完成、且没写 `touches: unknown` 的那些），三格里的「差距」
+/// 随行走——接着做的人打开轮就读得到每条还差什么，不必把整本台账重判一遍。
+/// 重钉继承 `first_rev`：那一格是「自开工以来」的基准，不能因为重钉被清零。
+pub fn open() -> i32 {
+    let path = match ledger_path() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ledger: {e}");
+            return 2;
+        }
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("ledger: 台账读不到：{}（{e}）", path.display());
+            return 2;
+        }
+    };
+    let items = match cog_core::contract::ledger_item::parse_md(&text) {
+        Ok(items) => items,
+        Err(e) => {
+            eprintln!("ledger: {e}");
+            return 2;
+        }
+    };
+    let ledger_dir = path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+    let (repo, ok) = git(&ledger_dir, &["rev-parse", "--show-toplevel"]);
+    if !ok || repo.is_empty() {
+        eprintln!("ledger: 台账不在一个 git 仓里（{ledger_dir}）：这一轮钉不到任何一版上");
+        return 2;
+    }
+    let (ledger_rev, ok) = git(&repo, &["rev-parse", "HEAD"]);
+    if !ok {
+        eprintln!("ledger: 台账仓读不到 HEAD（{repo}）");
+        return 2;
+    }
+    let (code_rev, _) = git(
+        &std::env::current_dir()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default(),
+        &["rev-parse", "HEAD"],
+    );
+    // 重钉继承第一次开工的基准。
+    let first_rev = existing_first_rev(&repo).unwrap_or_else(|| ledger_rev.clone());
+    let batch: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+    let gaps: serde_json::Map<String, serde_json::Value> = items
+        .iter()
+        .map(|i| (i.id.clone(), serde_json::Value::String(i.gap.clone())))
+        .collect();
+    let payload = round_payload(&batch, &gaps, &ledger_rev, &code_rev, &first_rev);
+    let body = payload.to_string();
+    let blob = std::process::Command::new("git")
+        .args(["-C", &repo, "hash-object", "-w", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut c| {
+            use std::io::Write;
+            c.stdin.as_mut().expect("stdin").write_all(body.as_bytes())?;
+            c.wait_with_output()
+        });
+    let sha = match blob {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => {
+            eprintln!("ledger: 书写不进去（{repo}）");
+            return 2;
+        }
+    };
+    let (_, ok) = git(&repo, &["update-ref", "--create-reflog", ROUND_REF, &sha]);
+    if !ok {
+        eprintln!("ledger: {ROUND_REF} 没写成");
+        return 2;
+    }
+    println!(
+        "ledger: 轮开在 {}@{}，这一批 {} 条",
+        ROUND_REF,
+        &payload["ledger_rev"].as_str().unwrap_or("").chars().take(12).collect::<String>(),
+        payload["batch"].as_array().map(|a| a.len()).unwrap_or(0)
+    );
+    0
+}
+
+/// 书的载荷。拆出来是因为它是这一轮「是什么」的全部可判内容：批、每条的缺口、两个
+/// 坐标与第一次开工的基准。写进去的是什么，读的人就该读到什么。
+fn round_payload(
+    batch: &[String],
+    gaps: &serde_json::Map<String, serde_json::Value>,
+    ledger_rev: &str,
+    code_rev: &str,
+    first_rev: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "event_id": format!("round-{}", ledger_rev.chars().take(12).collect::<String>()),
+        "ledger_rev": ledger_rev,
+        "code_rev": code_rev,
+        "batch": batch,
+        "gaps": gaps,
+        "first_rev": first_rev,
+        "opened_at": chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+/// 书里已经记着的 `first_rev`（没有书或读不到：`None`）。
+fn existing_first_rev(repo: &str) -> Option<String> {
+    let (sha, ok) = git(repo, &["rev-parse", "--verify", "--quiet", ROUND_REF]);
+    if !ok || sha.is_empty() {
+        return None;
+    }
+    let (body, ok) = git(repo, &["cat-file", "-p", &sha]);
+    if !ok {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&body)
+        .ok()?
+        .get("first_rev")?
+        .as_str()
+        .map(str::to_string)
 }
