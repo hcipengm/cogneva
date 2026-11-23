@@ -3284,6 +3284,7 @@ impl DagExecutor {
                 .join(" ")
                 .to_lowercase()
         };
+        eprintln!("PROBE effective_max_retries: previous={:?} incoming={:?}", task.error, error);
         if let Some(previous) = task.error.as_deref() {
             if normalize(previous) == normalize(error) {
                 return 0;
