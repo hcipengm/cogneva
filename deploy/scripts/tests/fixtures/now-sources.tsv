@@ -1,0 +1,8 @@
+source	2026-11-23 跑 `scripts/bounds-census.py`：标记一〇二九
+source	test = deploy/scripts/tests/batch-gate.test.sh::某一格
+source	判据读数: gateway_llm_usage → 0
+source	信息不足：没有可用的测试库
+source	crates/cog-agent/src/context.rs:464 的地板压进窗口已经落
+none	还没做
+none	plan 的产出已带上待办
+none	等部署

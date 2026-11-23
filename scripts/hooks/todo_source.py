@@ -68,10 +68,10 @@ def parse_cells(text: str) -> dict[str, str]:
 
 
 class Item:
-    __slots__ = ("id", "title", "text", "touches", "deferred", "cells", "gap")
+    __slots__ = ("id", "title", "text", "touches", "deferred", "cells", "gap", "now")
 
     def __init__(self, id: str, title: str, text: str, touches: list[str], deferred: bool = False,
-                 cells: dict[str, str] | None = None, gap: str = ""):
+                 cells: dict[str, str] | None = None, gap: str = "", now: str = ""):
         self.id = id
         self.title = title
         # 整行原文（不截断）。`title` 是给人看的前 80 字，用来估「这一条读起来要多少
@@ -88,6 +88,8 @@ class Item:
         # 五格行里那一格「还差什么」。它随轮一起走（写进轮的载荷）：接着做的人
         # 打开轮就看得见缺口，不必把整本台账重判一遍（S68）。
         self.gap = gap
+        # 「现在」那一格：它必须带出处（`now_has_source`）。
+        self.now = now
 
     def missing_cells(self) -> list[str]:
         return [tag for tag in CELL_TAGS if not self.cells.get(tag)]
@@ -161,7 +163,7 @@ def _fixed_item(line: str, notouch: list[str]) -> tuple[Item, bool] | None:
         notouch.append(cells[0])
         return None
     three = parse_cells(line)
-    item = Item(cells[0], cells[1][:80], line.strip(), touches, deferred, three, gap)
+    item = Item(cells[0], cells[1][:80], line.strip(), touches, deferred, three, gap, cells[2])
     # 未落的行进批次；写着已落却留着差距的按未完成读（debt），与三格那种同一处置。
     return item, status.startswith(CLOSED_PREFIXES)
 
@@ -452,6 +454,27 @@ def worker_name() -> str:
         if out.returncode == 0 and name:
             return name
     return os.uname().nodename
+
+
+# 「现在」那一格必须有出处：这一条与带内 `cog_core::contract::ledger_item::
+# now_names_its_source` 是**同一条判据**，两面各写一份就会漂（一边认、一边不认，
+# 而两边都不会报错）。认的形状就是仓里已经在用的那四种机器可读写法。
+_SOURCE_FORMS = (
+    re.compile(r"test\s*=\s*[^\s`]+::[^\s`]+"),           # test = <file>::<fn>
+    re.compile(r"判据读数\s*[:：]"),                        # 判据读数: <surface> → N
+    re.compile(r"信息不足\s*[:：]"),                        # 信息不足：<哪条输入>
+    re.compile(r"[\w./-]+\.(?:rs|py|sh|sql|yaml|yml|json|md|toml):\d+"),  # <file>:<line>
+    re.compile(r"`[^`]*(?:/|\.(?:rs|py|sh|sql|yaml|yml|json|md|toml))[^`]*`"),  # `路径`
+)
+
+
+def now_has_source(now: str) -> bool:
+    """「现在」这一格有没有写出处。
+
+    「从树上读到的」不是一句形容词：读的人要能照着它去读同一处。所以这一格至少要
+    出现上面某一种写法；写不出出处的那一格，就是没读（`未落` 的行尤其不能这么写）。
+    """
+    return any(form.search(now) for form in _SOURCE_FORMS)
 
 
 def partition(spec: str) -> tuple[list[Item], list[str], list[str]]:
