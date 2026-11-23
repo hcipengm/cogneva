@@ -1758,11 +1758,7 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .is_some_and(|s| s.contains("judge the terminal description"));
             // 夹具自己写了判词的（审不过的那几条反例），照它写的答。
-            let has_own_verdicts = self
-                .response
-                .get("verdicts")
-                .and_then(|v| v.as_array())
-                .is_some_and(|v| !v.is_empty());
+            let has_own_verdicts = self.response.get("verdicts").is_some();
             if asks_about_terminals && !has_own_verdicts {
                 let verdicts: Vec<serde_json::Value> = input
                     .get("items")
@@ -1904,8 +1900,20 @@ mod tests {
     }
 
     fn pass_evaluator() -> MockAgent {
+        // 计划里写了验收，判词就必须逐条落下来：只给一个「通过」而不给任何一条
+        // 判据的答复会被 `enforce_criteria_evidence` 降级成失败——那是它在守
+        // 「声明的门有没有真的被看一眼」，不是夹具的噪音。
         MockAgent {
-            response: serde_json::json!({"verdict": "pass", "score": 92, "feedback": "good", "criteria": []}),
+            response: serde_json::json!({
+                "verdict": "pass",
+                "score": 92,
+                "feedback": "good",
+                "criteria": [{
+                    "name": "the output states the exact version number",
+                    "score": 92,
+                    "comment": "the answer names the version",
+                }],
+            }),
         }
     }
 
