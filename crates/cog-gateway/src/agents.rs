@@ -2126,12 +2126,13 @@ fn roster_with_people(
 /// 一眼认出它不是某个叫这个名字的员工，所以它不像一个人名那样带工号。
 const UNASSIGNED_SEATS_LABEL: &str = "座位，尚未分配给人";
 
-/// 按人把名册收成一列：一个人一行，当前戴着的帽子挂在后面。
+/// 按人把名册收成一列：一个人一行，他此刻占着的地址挂在后面。
 ///
 /// 座位是地址，人是身份。按座位展开的名册在任务一多时会长出成百上千行「人」，
 /// 读的人分不出哪个是真员工、哪个是某件活临时起的座位——而任务一结束，那个
-/// 「人」就消失了。这里按 `person_id` 收成一行人，帽子（`agent_ids`）一个
-/// 不少地列出来：地址不能丢，丢了这个人在对话页就点不到了。
+/// 「人」就消失了。这里按 `person_id` 收成一行人，地址（`agent_ids`）一个
+/// 不少地列出来：地址不能丢，丢了这个人在对话页就点不到了。地址有几个就是
+/// 几个，不再另发一个数——数两次的两个数迟早对不上。
 ///
 /// `person_id` 为空的那一组收成单独一行，名字是
 /// [`UNASSIGNED_SEATS_LABEL`]：它们不是很多人，是一个读数——还有多少座位背后
@@ -2168,7 +2169,7 @@ fn people_of(views: &[serde_json::Value]) -> Vec<serde_json::Value> {
             let live = rows
                 .iter()
                 .any(|v| v.get("live").and_then(|l| l.as_bool()) == Some(true));
-            // 一个人的全部帽子都退役了，他才算离职；还有一顶在役就不是。
+            // 这个人的全部地址都退役了，他才算离职；还有一个在役就不是。
             let retired = rows
                 .iter()
                 .all(|v| v.get("retired").and_then(|r| r.as_bool()) == Some(true));
@@ -2203,7 +2204,6 @@ fn people_of(views: &[serde_json::Value]) -> Vec<serde_json::Value> {
                 "retired": retired,
                 "roles": roles,
                 "agent_ids": agent_ids,
-                "caps": agent_ids.len(),
             })
         })
         .collect()
@@ -2225,7 +2225,8 @@ fn seats_without_a_person(roster_read: bool, people_rows: &[serde_json::Value]) 
         people_rows
             .iter()
             .find(|row| row.get("person_id").is_none_or(|v| v.is_null()))
-            .and_then(|row| row.get("caps").and_then(|caps| caps.as_u64()))
+            .and_then(|row| row.get("agent_ids").and_then(|ids| ids.as_array()))
+            .map(|ids| ids.len() as u64)
             .unwrap_or(0),
     )
 }
@@ -2848,12 +2849,12 @@ mod tests {
         );
     }
 
-    /// 一个人戴两顶帽子，名册上仍是一行；没派给人的座位收成单独一行。
+    /// 一个人占着两个地址，名册上仍是一行；没派给人的座位收成单独一行。
     ///
     /// 判据原话：「给一个人派两条任务 ⇒ 名册里是一行」。按座位展开时同一个人
     /// 会出现两次，读的人以为撞了名；而没派人的座位不是「很多人」，是一个读数。
     #[test]
-    fn a_person_with_two_caps_is_one_row_and_the_unassigned_seats_are_another() {
+    fn a_person_with_two_seats_is_one_row_and_the_unassigned_seats_are_another() {
         let view = |agent_id: String, role: &str, person: Option<&str>| {
             serde_json::json!({
                 "agent_id": agent_id,
@@ -2878,20 +2879,22 @@ mod tests {
         let people = people_of(&views);
         assert_eq!(people.len(), 2, "一个人一行，加没派人的座位一组");
         assert_eq!(people[0]["person_id"], "employee:1");
-        assert_eq!(people[0]["caps"], 2);
         assert_eq!(
             people[0]["agent_ids"],
             serde_json::json!([first, second]),
-            "帽子（地址）一个都不能丢，丢了这个人在对话页就点不到"
+            "地址一个都不能丢，丢了这个人在对话页就点不到"
+        );
+        assert!(
+            people[0].get("caps").is_none(),
+            "地址数就是 agent_ids 的长度，服务端不再另发一个数"
         );
         assert_eq!(
             people[0]["roles"],
             serde_json::json!(["generator", "evaluator"]),
-            "角色随任务变，一个人可以同时戴几顶不同的帽子"
+            "角色随任务变，一个人可以同时占着几个地址"
         );
         assert_eq!(people[1]["person_id"], serde_json::Value::Null);
         assert_eq!(people[1]["display_name"], UNASSIGNED_SEATS_LABEL);
-        assert_eq!(people[1]["caps"], 2);
         assert_eq!(
             seats_without_a_person(true, &people),
             Some(2),

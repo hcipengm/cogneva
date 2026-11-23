@@ -107,17 +107,17 @@ function LiveState({ live }: { live: LiveAgentRow | null }) {
 type RosterGroup = {
   personId: string | null;
   displayName: string;
+  /** 这个人此刻占着的地址（座位）。一个地址是他在对话页能被点到的唯一入口。 */
   agentIds: string[];
-  caps: number;
   live: boolean;
   retired: boolean;
-  /** 画状态、心跳、主机用的代表行：多顶帽子时取第一顶；没派人的那组取第一个座位。 */
+  /** 画状态、心跳、主机用的代表行：占着几个地址时取第一个；没派人的那组取第一个座位。 */
   lead: AgentSummary | null;
   leadLive: LiveAgentRow | null;
 };
 
 export function EmployeeRoster({ onPick }: { onPick?: (agentId: string) => void }) {
-  // 名册按人收好后再交给界面：座位是地址，人是身份。同一个人戴两顶帽子时，
+  // 名册按人收好后再交给界面：座位是地址，人是身份。同一个人占着两个地址时，
   // 按座位展开的表会出现两次同一个人，读的人以为撞了名；而任务一多，座位能长
   // 到几百行，人却没变。收在服务端做一次（`people` / `seats_without_a_person`），
   // 这里不再自己数一遍——两处各数一次，两个数迟早会对不上。
@@ -146,7 +146,6 @@ export function EmployeeRoster({ onPick }: { onPick?: (agentId: string) => void 
           personId: p.person_id,
           displayName: p.display_name,
           agentIds: p.agent_ids,
-          caps: p.caps,
           live: p.live,
           retired: p.retired,
           lead,
@@ -201,13 +200,13 @@ export function EmployeeRoster({ onPick }: { onPick?: (agentId: string) => void 
         </Empty>
       ) : (
         <>
-          <Readings from={resources} source="GET /api/v1/agents 按人收好的名册" caveat="按人这一列由服务端收好：同一个人戴几顶帽子也只占一行；座位背后的人只记在名册（cogneva:employees）那一份上，名册读不到时「没派人的座位」这一格是空的，不是 0。">
+          <Readings from={resources} source="GET /api/v1/agents 按人收好的名册" caveat="按人这一列由服务端收好：同一个人占着几个地址也只占一行；座位背后的人只记在名册（cogneva:employees）那一份上，名册读不到时「没派人的座位」这一格是空的，不是 0。">
           <div className="flex flex-wrap border-b border-[var(--line)] py-2">
             <Reading label="人" value={groups.length} />
             <Reading
-              label="帽子"
+              label="地址"
               value={agents.length}
-              note="可寻址的地址数：一个人可以同时戴几顶"
+              note="可寻址的地址数：一个人可以同时占着几个"
             />
             <Reading
               label="比快照新"
@@ -269,7 +268,7 @@ export function EmployeeRoster({ onPick }: { onPick?: (agentId: string) => void 
                     <span className="inline-flex items-baseline gap-1.5">
                       <Note
                         className="text-[12px]"
-                        text={g.personId ?? `${g.caps} 个座位，都还没有人`}
+                        text={g.personId ?? `${g.agentIds.length} 个座位，都还没有人`}
                       >
                         {g.displayName}
                       </Note>
@@ -285,21 +284,20 @@ export function EmployeeRoster({ onPick }: { onPick?: (agentId: string) => void 
                   <span className="text-[11px] text-[var(--muted)]">休息中</span>
                 )
               ) },
-              { key: 'caps', title: '帽子', width: '64px', render: (g) => (
-                <span className="mono text-[11px] text-[var(--muted)]">{g.caps}</span>
-              ) },
               // 主机、Pod IP 是「进程」那一层的，一个人的几个座位可以落在不同进程里；
-              // 只有一个时它就是那个人的地址，多个时这一格不属于某一个人。
+              // 这个人只占一个地址时它就是那个人的地址，占着多个时这一格不属于
+              // 某一个人。判据是这个人自己的地址数，不是一个另外数出来的数——两处
+              // 各数一次，迟早会对不上。
               // 能力不列：它是这个类（数字员工）的属性，人人同一份，写在一行里
               // 不区分谁——要读它去看那个类，不看名册。
               { key: 'host', title: '主机', width: '160px', render: (g) => (
                 <span className="mono text-[11px] text-[var(--muted)]">
-                  {g.caps === 1 ? g.lead?.hostname ?? '' : '—'}
+                  {g.agentIds.length === 1 ? g.lead?.hostname ?? '' : '—'}
                 </span>
               ) },
               { key: 'ip', title: 'Pod IP', width: '130px', render: (g) => (
                 <span className="mono text-[11px] text-[var(--muted)]">
-                  {g.caps === 1 ? g.lead?.pod_ip ?? '' : '—'}
+                  {g.agentIds.length === 1 ? g.lead?.pod_ip ?? '' : '—'}
                 </span>
               ) },
               { key: 'beat', title: '最后一次心跳', width: '130px', render: (g) => {
@@ -319,8 +317,8 @@ export function EmployeeRoster({ onPick }: { onPick?: (agentId: string) => void 
                 );
               } },
               // 名册与对话在同一个页面里，点一行就切到那个人的对话框：两页之间
-              // 跳转曾要重新找人，而两边读的是同一份名单。帽子多于一时，这一行
-              // 不指向某一个地址，按钮不出现——点哪一顶都由读的人自己说。
+              // 跳转曾要重新找人，而两边读的是同一份名单。占着不止一个地址时，
+              // 这一行不指向某一个地址，按钮不出现——点哪一个都由读的人自己说。
               ...(onPick
                 ? [
                     {
@@ -328,7 +326,7 @@ export function EmployeeRoster({ onPick }: { onPick?: (agentId: string) => void 
                       title: '',
                       width: '64px',
                       render: (g: RosterGroup) =>
-                        g.caps === 1 ? (
+                        g.agentIds.length === 1 ? (
                           <Button onClick={() => onPick(g.agentIds[0])}>对话</Button>
                         ) : null,
                     },

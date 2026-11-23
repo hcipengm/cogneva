@@ -65,14 +65,18 @@ fn reading_labels(text: &str) -> Vec<String> {
     out
 }
 
-/// 名册表渲染的列是一个闭集：员工、状态、帽子（座位数）、主机、Pod IP、
-/// 最后一次心跳，加上条件出现的「对话」按钮列。角色与能力不在里面，任何一列
-/// 以「人有什么属性」的口吻被加回来，这条就红。
+/// 名册表渲染的列是一个闭集：员工、状态、主机、Pod IP、最后一次心跳，加上条件
+/// 出现的「对话」按钮列。角色与能力不在里面，任何一列以「人有什么属性」的口吻
+/// 被加回来，这条就红。
+///
+/// 「帽子」（这个人此刻占着几个座位）也删了：属主 2026-11-22 判「帽子没有存在
+/// 的必要，它能带来什么好处没看到」。地址数不画成列——主机与 Pod IP 两列只在
+/// 这个人只占一个地址时才有意义，那两列自己判得出这件事。
 #[test]
 fn the_roster_table_renders_exactly_these_columns() {
     let text = source(&root(), "web/src/views/AgentsView.tsx");
     let titles = column_titles(&text);
-    let mut expected = vec!["", "Pod IP", "主机", "最后一次心跳", "员工", "状态", "帽子"];
+    let mut expected = vec!["", "Pod IP", "主机", "最后一次心跳", "员工", "状态"];
     expected.sort();
     assert_eq!(
         titles,
@@ -86,14 +90,14 @@ fn the_roster_table_renders_exactly_these_columns() {
     );
 }
 
-/// 名册顶上那排读数也是一个闭集：人、帽子、比快照新、没派人的座位。
+/// 名册顶上那排读数也是一个闭集：人、地址、比快照新、没派人的座位。
 /// 「N 种角色」与「每个角色在岗几人」两张角色读数已随角色列一起删掉：它们按角色
 /// 把人分堆，而平台上的角色是活的职务，不是人的分类。
 #[test]
 fn the_roster_reads_exactly_these_figures() {
     let text = source(&root(), "web/src/views/AgentsView.tsx");
     let labels = reading_labels(&text);
-    let mut expected = vec!["人", "帽子", "比快照新", "没派人的座位"];
+    let mut expected = vec!["人", "地址", "比快照新", "没派人的座位"];
     expected.sort();
     assert_eq!(
         labels,
@@ -111,4 +115,12 @@ fn the_roster_reads_exactly_these_figures() {
             "名册里还有「{gone}」：按角色把人分堆的读数删干净，角色不是人的属性"
         );
     }
+    // 「帽子」不是换个名字留着就行的词：属主判的是这个概念没有存在的必要。
+    // 判的是去掉注释之后的源码——改一句说明不该让这一条变红，但把这一列换个
+    // 名字加回来，或者把地址数换个说法再画一遍，都在这里红。
+    assert!(
+        !text.contains("帽子"),
+        "员工页还有「帽子」：这个概念属主 2026-11-22 判过没有存在的必要，\
+         占着几个地址由地址列自己数，不另画一格"
+    );
 }
