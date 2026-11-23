@@ -821,9 +821,12 @@ pub async fn backup_postgres(
     report.sequences = sequences.len();
     // 正文段：同一个 REPEATABLE READ 快照里读，与那些引用它的表行是同一刻的样子。
     let lo_dir = out_dir.join(LARGE_OBJECTS_DIR);
-    let oids: Vec<i64> = sqlx::query_scalar("SELECT oid FROM pg_largeobject_metadata ORDER BY oid")
-        .fetch_all(&mut *tx)
-        .await?;
+    // `oid` 这一列的类型是 OID，不是 INT8：sqlx 不会把它解成 `i64`（真库上
+    // `mismatched types ... INT8 vs OID`，2026-11-24 实测），所以在 SQL 里转一次。
+    let oids: Vec<i64> =
+        sqlx::query_scalar("SELECT oid::bigint FROM pg_largeobject_metadata ORDER BY oid")
+            .fetch_all(&mut *tx)
+            .await?;
     if !oids.is_empty() {
         std::fs::create_dir_all(&lo_dir)?;
     }
