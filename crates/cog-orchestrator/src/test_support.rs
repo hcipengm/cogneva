@@ -35,12 +35,40 @@ pub(crate) fn declarations(lines: &[(&str, &str)]) -> Declarations {
 #[derive(Clone, Default)]
 pub(crate) struct WarnSink(std::sync::Arc<std::sync::Mutex<Vec<(std::thread::ThreadId, String)>>>);
 
-pub(crate) struct MessageField(String);
+/// 一条事件的正文与它带的那几个字段。
+///
+/// 正文是这一族断言的主语，字段跟着印在后面：`status` 这类字段正是「读到了」
+/// 与「没读到」分开的地方，只收正文就看不见它。
+#[derive(Default)]
+pub(crate) struct MessageField {
+    message: String,
+    fields: Vec<String>,
+}
+
+impl MessageField {
+    fn line(self) -> String {
+        if self.fields.is_empty() {
+            self.message
+        } else {
+            format!("{} [{}]", self.message, self.fields.join(" "))
+        }
+    }
+}
 
 impl tracing::field::Visit for MessageField {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
-            self.0 = format!("{value:?}");
+            self.message = format!("{value:?}");
+        } else {
+            self.fields.push(format!("{}={value:?}", field.name()));
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        } else {
+            self.fields.push(format!("{}={value}", field.name()));
         }
     }
 }
@@ -54,12 +82,12 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnSink {
         if *event.metadata().level() != tracing::Level::WARN {
             return;
         }
-        let mut field = MessageField(String::new());
+        let mut field = MessageField::default();
         event.record(&mut field);
         self.0
             .lock()
             .unwrap()
-            .push((std::thread::current().id(), field.0));
+            .push((std::thread::current().id(), field.line()));
     }
 }
 
