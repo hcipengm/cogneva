@@ -485,6 +485,9 @@ pub struct SilenceCause {
     pub wchan: String,
     /// 由上面两样算出的处置。
     pub action: SilenceAction,
+    /// 等锁时点名到的那几个持锁进程。空 = 没点出来（不是「没有人持锁」：
+    /// 内核 futex 那一类读不出持锁者，见 [`file_lock_holders`]）。
+    pub holders: Vec<u32>,
 }
 
 /// 一份静默的处置。
@@ -501,15 +504,101 @@ pub enum SilenceAction {
 }
 
 impl SilenceCause {
-    /// 一句话写清：状态、等待对象、处置。
+    /// 一句话写清：状态、等待对象、处置，以及（点得出来时）持锁的是谁。
     pub fn describe(&self) -> String {
         let action = match self.action {
             SilenceAction::Wait => "waiting on an object; keep running",
-            SilenceAction::WaitOnLock => "waiting on a lock; keep running and name the holder",
+            SilenceAction::WaitOnLock => {
+                if self.holders.is_empty() {
+                    "waiting on a lock; keep running, and the holder is not readable from /proc \
+                     (a kernel futex does not name it)"
+                } else {
+                    "waiting on a lock; keep running and ask the holder"
+                }
+            }
             SilenceAction::Spin => "running with no movement; this is a defect, not a wait",
             SilenceAction::Unknown => "unreadable; not guessed",
         };
-        format!("{}; in {}; {action}", self.state, self.wchan)
+        if self.holders.is_empty() {
+            format!("{}; in {}; {action}", self.state, self.wchan)
+        } else {
+            let who: Vec<String> = self.holders.iter().map(|p| format!("pid {p}")).collect();
+            format!(
+                "{}; in {}; {action}: held by {}",
+                self.state,
+                self.wchan,
+                who.join(", ")
+            )
+        }
+    }
+}
+
+/// 等文件锁时点名持锁者：拿它自己打开的普通文件去 `/proc/locks` 里对上同一把锁。
+///
+/// 只有文件锁点得出——`flock` 与 `fcntl` 的记录在 `/proc/locks` 里，带着持锁的 pid，
+/// 而一个等锁的进程手里通常握着那把锁的文件（打开之后才加锁）。内核 futex 那一类
+/// 读不出持锁者：那需要一个内核里没有的名字，所以这里返回空，`describe` 照实说
+/// 「读不出」，而不是编一个 pid。
+pub fn file_lock_holders(pid: u32) -> Vec<u32> {
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        Vec::new()
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // 内核的 dev_t 编码：major = (dev & 0xfff00) >> 8；minor 是低字节加上高位的后 12 位。
+        let split = |dev: u64| ((dev & 0xfff00) >> 8, (dev & 0xff) | ((dev >> 12) & 0xfff00));
+        let mut wanted: Vec<(u64, u64, u64)> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
+            for entry in entries.flatten() {
+                let Ok(target) = std::fs::read_link(entry.path()) else {
+                    continue;
+                };
+                let Ok(meta) = std::fs::metadata(&target) else {
+                    continue;
+                };
+                if !meta.is_file() {
+                    continue;
+                }
+                let (major, minor) = split(meta.dev());
+                wanted.push((major, minor, meta.ino()));
+            }
+        }
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        let Ok(locks) = std::fs::read_to_string("/proc/locks") else {
+            return Vec::new();
+        };
+        let mut holders: Vec<u32> = Vec::new();
+        for line in locks.lines() {
+            // `1: FLOCK  ADVISORY  WRITE 1234 08:01:1234567 0 EOF`
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 6 {
+                continue;
+            }
+            let Ok(holder) = fields[4].parse::<u32>() else {
+                continue;
+            };
+            let mut parts = fields[5].split(':');
+            let (Some(major), Some(minor), Some(inode)) = (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let (Ok(major), Ok(minor), Ok(inode)) = (
+                major.parse::<u64>(),
+                minor.parse::<u64>(),
+                inode.parse::<u64>(),
+            ) else {
+                continue;
+            };
+            if wanted.contains(&(major, minor, inode)) && !holders.contains(&holder) {
+                holders.push(holder);
+            }
+        }
+        holders
     }
 }
 
@@ -531,10 +620,18 @@ pub fn describe_silence(pid: u32) -> SilenceCause {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unreadable".to_string());
     let action = classify_silence(&state, &wchan);
+    // 点名持锁者只在「在等锁」这一档做：别的等待没有一把可以点名的锁，
+    // 而读 `/proc/locks` 是一个要遍历自己的 fd 的动作，不该给每一种静默都付。
+    let holders = if action == SilenceAction::WaitOnLock {
+        file_lock_holders(pid)
+    } else {
+        Vec::new()
+    };
     SilenceCause {
         state,
         wchan,
         action,
+        holders,
     }
 }
 
@@ -722,6 +819,7 @@ pub async fn watch_child(
                             state: "State: no pid".to_string(),
                             wchan: "unreadable".to_string(),
                             action: crate::progress::SilenceAction::Unknown,
+                            holders: Vec::new(),
                         });
                     let where_it_stopped = cause.describe();
                     tracing::warn!(
@@ -1431,6 +1529,33 @@ mod tests {
             classify_silence("State: unreadable", "unreadable"),
             SilenceAction::Unknown
         );
+    }
+
+    /// 等文件锁时点得出持锁者：自己开一把 `flock`，再问「谁持着这把锁」。
+    ///
+    /// 这条证的是「对得上的那把锁被认出来」。内核 futex 那一类读不出持锁者——
+    /// 那种情形由 `describe` 里那句「读不出」回答，而不是编一个 pid。
+    #[cfg(unix)]
+    #[test]
+    fn a_file_lock_names_its_holder() {
+        use std::os::unix::io::AsRawFd;
+        let path = std::env::temp_dir().join(format!("cog-lock-{}", std::process::id()));
+        std::fs::write(&path, b"x").expect("建不了夹具文件");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("开不了文件");
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        assert_eq!(rc, 0, "加不上锁");
+
+        let holders = file_lock_holders(std::process::id());
+        assert!(
+            holders.contains(&std::process::id()),
+            "自己持着那把锁，却点不出自己：{holders:?}"
+        );
+
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        let _ = std::fs::remove_file(&path);
     }
 
     /// 一个刚起的进程没有自己的样本，只有上一次运行留下的实测值；判据必须跟着它走。

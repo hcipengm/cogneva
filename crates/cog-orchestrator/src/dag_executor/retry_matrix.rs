@@ -65,8 +65,10 @@ pub struct CircuitBreakerConfig {
 const UNCLASSIFIED_FAILURE_THRESHOLD: u32 = 5;
 // cap: bound — 半开放三次探测：一次分不清抖动与真坏，三次全失败才判死
 const UNCLASSIFIED_HALF_OPEN_CALLS: u32 = 3;
-// cap: bound — 三次重试，与节点档同一个次数；等待更长（1s 起步、30s 封顶）是因为不知道失败在哪
-const UNCLASSIFIED_RETRIES: u32 = 3;
+// 三次重试，与节点档同一个次数；等待更长（1s 起步、30s 封顶）是因为不知道失败在哪。
+// 这个数只在一处定义：任务行上那一列的初值也是它（`cog_core::types::task::DEFAULT_MAX_RETRIES`），
+// 判决与落库读同一个名字，改一边不会悄悄让另一边说别的。
+const UNCLASSIFIED_RETRIES: u32 = cog_core::types::task::DEFAULT_MAX_RETRIES;
 
 impl Default for CircuitBreakerConfig {
     fn default() -> Self {

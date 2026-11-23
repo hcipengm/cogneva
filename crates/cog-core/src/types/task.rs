@@ -1127,6 +1127,22 @@ impl std::fmt::Display for DeclarationState {
 /// mean something here rather than only describing the order of a list.
 pub const READY_LANE_STOP_THE_LINE: &str = "stop_the_line";
 
+/// 交活方没声明重试预算时，任务行上的初值。
+///
+/// 判决读的是 `retry_matrix` 的「未分类」档（`effective_max_retries`），行上这一列
+/// 只被落库与读回；两处各写一个 3 的那一版，改一边不会让另一边红。这里只留一份，
+/// 两边读同一个名字。
+// cap: bound — 三次重试：与 retry_matrix 未分类档同源（角色失败多是上游抖动，三次之后每次只是把同一个失败拖得更久）
+pub const DEFAULT_MAX_RETRIES: u32 = 3;
+
+/// 交活方没说「这件活预计多久」时，任务行上的声明值（秒）。
+///
+/// 它不是刀：平台从不拿它砍正在跑的活。它被读成「这条活预计多久」，探针那一侧的
+/// `outcome_deadline` 用它算「多久没有结局算欠着」。与 `DISCOVERY_PROBE_CONTRACT_SECS`
+/// 是同一个数，两边读同一个名字。
+// cap: fixed — 与探针那一侧的「一轮工期」约定同值（五分钟），不是测出来的量
+pub const DEFAULT_DECLARED_DURATION_SECS: u64 = 300;
+
 impl Task {
     pub fn new(id: impl Into<String>, task_type: TaskType, input: serde_json::Value) -> Self {
         let now = Utc::now();
@@ -1147,10 +1163,10 @@ impl Task {
             agent_id: None,
             workspace_id: None,
             retry_count: 0,
-            max_retries: 3,
+            max_retries: DEFAULT_MAX_RETRIES,
             retry_not_before: None,
             started_at: None,
-            declared_duration_seconds: 300,
+            declared_duration_seconds: DEFAULT_DECLARED_DURATION_SECS,
             lease_owner: None,
             lease_expires_at: None,
             action_planner_meta: None,
@@ -1583,6 +1599,24 @@ impl Task {
 mod tests {
     use super::*;
     use crate::checkout::repo_root;
+
+    /// 行上那两个数各有一个名字：重试预算与声明时长。
+    ///
+    /// 它们不是「这条用例挑的值」——判决（`retry_matrix`）与探针的欠结判据
+    /// （`DISCOVERY_PROBE_CONTRACT_SECS`）读的都是同一对名字。谁想调它们，调的是
+    /// 那个常量；两处各写一个 3、一个 300 的那一版，改一边另一边不会红。
+    #[test]
+    fn a_new_task_carries_the_named_defaults() {
+        let task = Task::new("t1", TaskType::DagNode, serde_json::json!({}));
+        assert_eq!(
+            task.max_retries, DEFAULT_MAX_RETRIES,
+            "重试预算要读那个名字，不是写一个数"
+        );
+        assert_eq!(
+            task.declared_duration_seconds, DEFAULT_DECLARED_DURATION_SECS,
+            "声明时长要读那个名字，不是写一个数"
+        );
+    }
 
     /// 一个场地标签只有一种「算有」的拼法。
     ///

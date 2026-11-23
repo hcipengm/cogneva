@@ -127,10 +127,24 @@ pub struct CollectionReport {
     pub points: Option<u64>,
 }
 
+/// 一段正文在包里的读数：oid 与字节数。
+///
+/// 正文落在 `pg_largeobject` 里，表行只存 oid。oid 是行的引用键，恢复必须把它
+/// 原样建回去——换一个 oid，表里的引用就指向空处；字节数进清单，核包时才判得出
+/// 「这一段在包里是全的」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LargeObjectReport {
+    pub oid: u32,
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PostgresReport {
     pub tables: Vec<TableReport>,
     pub sequences: usize,
+    /// 正文段。旧包没有这一段（`serde(default)` 读成空），核包按「当年没声明」跳过。
+    #[serde(default)]
+    pub large_objects: Vec<LargeObjectReport>,
 }
 
 /// 一个策略库的打包读数：版本数、链头、当前激活版本。
@@ -752,6 +766,7 @@ pub async fn backup_postgres(
     let mut report = PostgresReport {
         tables: Vec::with_capacity(tables.len()),
         sequences: 0,
+        large_objects: Vec::new(),
     };
 
     for table in &tables {
@@ -804,6 +819,40 @@ pub async fn backup_postgres(
     }
     std::fs::write(out_dir.join(SEQUENCES_FILE), &sql)?;
     report.sequences = sequences.len();
+    // 正文段：同一个 REPEATABLE READ 快照里读，与那些引用它的表行是同一刻的样子。
+    let lo_dir = out_dir.join(LARGE_OBJECTS_DIR);
+    let oids: Vec<i64> = sqlx::query_scalar("SELECT oid FROM pg_largeobject_metadata ORDER BY oid")
+        .fetch_all(&mut *tx)
+        .await?;
+    if !oids.is_empty() {
+        std::fs::create_dir_all(&lo_dir)?;
+    }
+    for oid in oids {
+        let oid = oid as u32;
+        let path = lo_dir.join(format!("{oid}.bin"));
+        let mut file = std::fs::File::create(&path)?;
+        let mut offset: i64 = 0;
+        loop {
+            let chunk: Vec<u8> = sqlx::query_scalar(
+                "SELECT COALESCE(substring(lo_get($1::oid, $2::bigint, $3::int) from 1), ''::bytea)",
+            )
+            .bind(oid as i64)
+            .bind(offset)
+            .bind(BODY_EXPORT_CHUNK)
+            .fetch_one(&mut *tx)
+            .await?;
+            if chunk.is_empty() {
+                break;
+            }
+            use std::io::Write;
+            file.write_all(&chunk)?;
+            offset += chunk.len() as i64;
+            cog_core::progress::beat(DATA_PROGRESS_TASK);
+        }
+        report
+            .large_objects
+            .push(LargeObjectReport { oid, bytes: offset as u64 });
+    }
     // 出错时 tx 在 drop 时回滚；成功路径显式提交，把快照释放掉。
     tx.commit().await?;
     Ok(report)
@@ -827,6 +876,8 @@ pub struct RestoreReport {
     /// 按旧导出点名它。跳过它必须留名字——静默跳过会让「装回去的序列数」看起来与
     /// 清单一致，而实际上少的那一条正是被删表的自增计数器。
     pub sequences_without_a_home: Vec<String>,
+    /// 装回去的正文段。空 = 包里这一段本来就没有（旧包），不是「装失败了」。
+    pub large_objects: Vec<LargeObjectReport>,
 }
 
 /// PG 恢复：整包表一次性 TRUNCATE ... RESTART IDENTITY CASCADE，
@@ -849,6 +900,9 @@ pub async fn restore_postgres(
 ) -> Result<RestoreReport, Box<dyn std::error::Error>> {
     let mut tables = Vec::new();
     let mut recomputed = Vec::new();
+    // 正文段先建回去：表行里存的就是这些 oid，先有字节再有引用，中途失败时不会
+    // 留下「行指着一段不存在的正文」的半成品。
+    let large_objects = restore_large_objects(pool, &pkg_pg_dir.join(LARGE_OBJECTS_DIR)).await?;
     for entry in std::fs::read_dir(pkg_pg_dir)? {
         let name = entry?.file_name().to_string_lossy().into_owned();
         if let Some(rest) = name.strip_prefix("public.") {
@@ -1043,7 +1097,71 @@ pub async fn restore_postgres(
         recomputed,
         tables_without_a_home,
         sequences_without_a_home,
+        large_objects,
     })
+}
+
+/// 把包里的正文段按原 oid 建回目标库。
+///
+/// 先丢后建：目标里若已经有同一个 oid，`lo_create(oid)` 会失败，而这一趟的语义
+/// 是「把目标做成包里那一刻的样子」——同名的那一段本来就该被包里那份取代。
+///
+/// 包里有 `pg/largeobjects/` 而这一段读不出来，就是错：正文不是可以悄悄少掉的
+/// 装饰，少了它的表行还指着那个 oid，读的人拿到的是「有引用、没有字节」。
+pub async fn restore_large_objects(
+    pool: &PgPool,
+    dir: &Path,
+) -> Result<Vec<LargeObjectReport>, Box<dyn std::error::Error>> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut oids: Vec<u32> = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        if let Some(oid) = name
+            .strip_suffix(".bin")
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            oids.push(oid);
+        }
+    }
+    oids.sort_unstable();
+    let mut out = Vec::with_capacity(oids.len());
+    for oid in oids {
+        let bytes = std::fs::read(dir.join(format!("{oid}.bin")))?;
+        let mut tx = pool.begin().await?;
+        sqlx::query("SELECT lo_unlink($1) FROM pg_largeobject_metadata WHERE oid = $1::oid")
+            .bind(oid as i64)
+            .execute(&mut *tx)
+            .await?;
+        let created: i64 = sqlx::query_scalar("SELECT lo_create($1::oid)::bigint")
+            .bind(oid as i64)
+            .fetch_one(&mut *tx)
+            .await?;
+        if created as u32 != oid {
+            return Err(format!(
+                "asked for oid {oid} and got {created}: the rows point at {oid}"
+            )
+            .into());
+        }
+        let mut offset = 0usize;
+        for chunk in bytes.chunks(BODY_EXPORT_CHUNK as usize) {
+            sqlx::query("SELECT lo_put($1::oid, $2::bigint, $3)")
+                .bind(oid as i64)
+                .bind(offset as i64)
+                .bind(chunk)
+                .execute(&mut *tx)
+                .await?;
+            offset += chunk.len();
+            cog_core::progress::beat(DATA_PROGRESS_TASK);
+        }
+        tx.commit().await?;
+        out.push(LargeObjectReport {
+            oid,
+            bytes: offset as u64,
+        });
+    }
+    Ok(out)
 }
 
 /// Secret 卷（只读挂载，key 一文件）打成 apply-able manifest。
@@ -2401,6 +2519,19 @@ const PACKAGE_PG_DIR: &str = "pg";
 /// PG 段里那串序列语句的文件名。写包的一侧拼它，核包与恢复的一侧再拼一遍。
 const SEQUENCES_FILE: &str = "sequences.sql";
 
+/// 包里正文段：一段一个文件，名字是它的 oid。
+///
+/// 表行只存 oid，字节在 `pg_largeobject` 里。只导表不导大对象，恢复之后每一段
+/// 正文都还是「有引用、没有字节」，而清单逐表逐行对得上——这是最坏的一种绿。
+const LARGE_OBJECTS_DIR: &str = "largeobjects";
+
+/// 读一段正文时一次取多少字节。
+///
+/// 一次数据库往返的载荷（`lo_get` 返回一个 `bytea`），与正文大小无关：正文多大
+/// 由上游说了算，这个数只决定进程内存跟着走多远。
+// cap: fixed — 一次 lo_get 往返的载荷（单值 bytea），与正文大小无关
+const BODY_EXPORT_CHUNK: i32 = 1_048_576;
+
 /// 数据根下装对象的那一级。
 pub const OBJECTS_SUBDIR: &str = "storage";
 
@@ -3330,6 +3461,47 @@ fn verify_package_against_manifest(
                 "pg: manifest declares {} sequence(s), sequences.sql holds {seqs}",
                 manifest.postgres.sequences
             ));
+        }
+        // 正文段：声明的 oid 集与包内文件集相等，每段字节数相等。只核表行的那一版
+        // 让一份「表全、正文全丢」的包读起来是完整的——行在，字节没了。
+        if !manifest.postgres.large_objects.is_empty() {
+            let lo_dir = pg_dir.join(LARGE_OBJECTS_DIR);
+            let mut found: BTreeMap<u32, u64> = BTreeMap::new();
+            if lo_dir.is_dir() {
+                for entry in std::fs::read_dir(&lo_dir)? {
+                    let entry = entry?;
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if let Some(oid) = name
+                        .strip_suffix(".bin")
+                        .and_then(|s| s.parse::<u32>().ok())
+                    {
+                        found.insert(oid, entry.metadata()?.len());
+                    }
+                }
+            }
+            for declared in &manifest.postgres.large_objects {
+                match found.get(&declared.oid) {
+                    None => problems.push(format!(
+                        "pg: declared body {} is not in the package",
+                        declared.oid
+                    )),
+                    Some(len) if *len != declared.bytes => problems.push(format!(
+                        "pg: body {} declared {} byte(s), package holds {len}",
+                        declared.oid, declared.bytes
+                    )),
+                    Some(_) => {}
+                }
+            }
+            for oid in found.keys() {
+                if !manifest
+                    .postgres
+                    .large_objects
+                    .iter()
+                    .any(|d| d.oid == *oid)
+                {
+                    problems.push(format!("pg: package body {oid} is not in the manifest"));
+                }
+            }
         }
     }
 
@@ -7922,6 +8094,7 @@ mod tests {
                     rows: 2,
                 }],
                 sequences: 1,
+                large_objects: Vec::new(),
             },
             qdrant: vec![CollectionReport {
                 name: "c1".into(),

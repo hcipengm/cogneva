@@ -2497,8 +2497,8 @@ const OUTCOME_QUEUE_MARGIN_ROUNDS: u32 = 3;
 /// 每一次交接等的是同一条流水线，那条流水线对「最多跑多久」的声明就是它。真值仍在
 /// `Task::new` 里：`discovery_probe_declares_the_contract_its_round_is_sized_from`
 /// 那条测试盯着两处一致，那边改了而这里没跟，它会红。
-// cap: fixed — 与 `Task::new` 给每条任务写的 `declared_duration_seconds` 同源，两处一致由那条测试盯着
-const DISCOVERY_PROBE_CONTRACT_SECS: u64 = 300;
+// cap: fixed — 直接读 `Task::new` 写进去的那个名字，两处不再是两个数
+const DISCOVERY_PROBE_CONTRACT_SECS: u64 = cog_core::types::task::DEFAULT_DECLARED_DURATION_SECS;
 
 /// 一轮最多能把多久花在「开始新的交接」上。
 ///
