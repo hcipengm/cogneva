@@ -69,5 +69,20 @@ else
   bad "读到的不是那一本，或者条目没进来：$out"
 fi
 
+# 3. 一条 `touches: unknown` 的长期条目：不进批次，但也不挡编译。
+#    它说的是「这一条不属于任何一遍编辑」；把它算成缺口，一条长期条目就能让整棵树
+#    永久编不了。2026-11-23 实测：垫片从不带 `--editing`，而这一支只在非 `--editing`
+#    时退 1——于是每一次 `cargo test` 都被挡在门口。
+printf '| CC01 | 长期条目 | 已收口两处 ｜ touches: unknown — 长期：按面开新行 | 余下逐面 | 未落 |\n' \
+  >"$tree/specs/ledger.md"
+out=$(run); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "一条 touches: unknown 的长期条目把编译门挡住了（rc=$rc）：$out"
+elif printf '%s' "$out" | grep -q "不在任何一批里" && printf '%s' "$out" | grep -q "CC01"; then
+  ok "长期条目不进批次，也不挡编译；点名说它在哪一类"
+else
+  bad "长期条目没被说明白：$out"
+fi
+
 printf '\nfamily-reads-the-same-ledger-as-the-round.test.sh: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

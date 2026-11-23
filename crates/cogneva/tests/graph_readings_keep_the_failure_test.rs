@@ -292,11 +292,34 @@ fn every_surface_that_draws_the_graph_keeps_the_failure() {
     }
 }
 
-/// 锚点之后到第一个顶格收尾的花括号为止——这个仓里这些函数都在顶格收尾。
+/// 锚点那一段的正文：从函数名之后第一个 `{` 起，到括号回到零的那一行止。
+///
+/// 以前切在「第一个顶格收尾的花括号」上，理由是「这些函数都在顶格收尾」——住进
+/// `impl` 里的方法不是，它们的收尾是四个空格。于是那一段一直量到 impl 结束，把同一
+/// 个文件里后面所有方法都算进来：`impl DagExecutor` 里的三个引脚，量的是它自己加上
+/// 后面几千行，`get_all_tasks(` 这样的**定义**也会触发「换回了折叠的那条读」
+/// （2026-11-23 实测：改对了也红，理由是隔壁方法的签名）。括号按行数，字符串与注释
+/// 里的括号由 `lex` 剔掉——`&'a str` 那个撇号也算对。
 fn body_after<'a>(production: &'a str, anchor: &str) -> &'a str {
+    use crate::common::lex::{scan, Dialect};
     let rest = production
         .split_once(anchor)
         .unwrap_or_else(|| panic!("{anchor} 不在了：这一面对应的引脚要跟着改"))
         .1;
-    rest.split("\n}\n").next().unwrap_or(rest)
+    let body = &rest[rest
+        .find('{')
+        .unwrap_or_else(|| panic!("{anchor} 之后没有函数体"))..];
+    let scan = scan(body, Dialect::Rust);
+    let mut depth = 0i32;
+    let mut end = body.len();
+    let mut at = 0usize;
+    for (line, shape) in body.split_inclusive('\n').zip(scan.lines.iter()) {
+        depth += shape.delta;
+        at += line.len();
+        if depth == 0 {
+            end = at;
+            break;
+        }
+    }
+    &body[..end]
 }

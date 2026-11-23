@@ -290,19 +290,21 @@ def report(root: pathlib.Path, changed: list[str], batch: list[str], todos, miss
         )
         return 1
 
-    # `touches: unknown` 的待办不在批次里，但它必须被 `Split:` 逐条点名——所以它也
-    # 让这一批「没清空」。两个门（编译前、推之前）因此数出同一个数。
+    # `touches: unknown` 的待办不在批次里：它说的是「这一条不属于任何一遍编辑，
+    # 按面开新行」。所以它**不挡编译，也不挡推送**——把它算成缺口，一条长期条目就
+    # 能让整棵树永久编不了，那不是严格，是把可验证性关掉（上面 `missing_todos`
+    # 那一支不同：写漏了 `touches:` 是这一条本身还没准备好进批次）。
+    #
+    # 2026-11-23 之前这里在非 `--editing` 调用下退 1，而编译垫片调用时从不带
+    # `--editing`（没人带）：一条 `touches: unknown` 从此让每一次 `cargo test` 都
+    # 被挡在门口。说它是「推之前点名」的那句话也没有任何门去判——推之前那道门
+    # （`batch-gate.py`）把 `deferred` 整列丢掉。
     if deferred:
         print(
-            f"\n有 {len(deferred)} 条待办写了 `touches: unknown`（本轮不排）："
+            f"\n有 {len(deferred)} 条待办写了 `touches: unknown`（不在任何一批里）："
             f"{', '.join(deferred)}\n"
-            "推之前要在提交信息里用 `Split: <1-4> — <S 号…> — <理由>` 逐条点名，否则推不出去。"
+            "要做的时候按面开新行：每开一面，一条带触点的五格行。"
         )
-        # 这一条**不挡编译**：`unknown` 说的是「这一条不属于这一遍编辑」，而编译垫片
-        # 问的正是「这一遍编辑走完了没有」。把它算成缺口，一条要等决定的待办就能让整
-        # 棵树永久编不了——那不是严格，是把可验证性关掉。推之前那一关照样要求点名。
-        if not editing:
-            return 1
 
     if (editing_gaps if editing else gaps) or owed:
         print(
