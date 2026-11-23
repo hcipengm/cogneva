@@ -239,14 +239,6 @@ impl PodRuntime {
         let id = format!("eval-toolathlon:{}", next_exec_id());
         let out = match cog_core::progress::run_child_watched(cmd, &id).await {
             Ok(cog_core::progress::ChildOutcome::Exited(out)) => out,
-            Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => anyhow::bail!(
-                "`{} {}` stopped moving: no output for {:?}, and this deployment's measured \
-                 any gap this deployment has ever seen between steps is {:?}",
-                self.prefix.join(" "),
-                args.first().map(String::as_str).unwrap_or(""),
-                silent,
-                window
-            ),
             Err(e) => {
                 anyhow::bail!("cannot run `{}`: {e}", self.prefix.join(" "))
             }

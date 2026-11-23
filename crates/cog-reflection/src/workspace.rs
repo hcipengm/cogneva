@@ -1385,12 +1385,6 @@ impl WorkspaceManager {
             .map_err(|e| SFError::IO(format!("failed to run git: {e}")))?
         {
             cog_core::progress::ChildOutcome::Exited(out) => out,
-            cog_core::progress::ChildOutcome::Stalled { silent, window } => {
-                return Err(SFError::IO(format!(
-                    "git {line} 停住了：{silent:?} 里没有输出、也没有 CPU 时间，\
-                     比这套部署见过的任何一段仍在干活的步间隔（{window:?}）都长；已杀掉"
-                )))
-            }
         };
         if !out.status.success() {
             return Err(SFError::IO(format!(

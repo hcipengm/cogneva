@@ -1252,12 +1252,6 @@ async fn scrape_occupancy(
     .kill_on_drop(true);
     let out = match cog_core::progress::run_child_watched(cmd, &format!("curl {url}")).await {
         Ok(cog_core::progress::ChildOutcome::Exited(out)) => out,
-        Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
-            return Err(format!(
-                "curl {url} 停住了：{silent:?} 没有收到字节，比这份部署见过的任何一次\
-                 「还在干活」的两次推进之间的最长间隔都长（{window:?}）；已杀掉"
-            ))
-        }
         Err(e) => return Err(format!("curl {url} could not run: {e}")),
     };
     if !out.status.success() {
@@ -1281,12 +1275,6 @@ async fn kubectl(args: &[&str]) -> Result<String, String> {
     cmd.args(args).kill_on_drop(true);
     let out = match cog_core::progress::run_child_watched(cmd, &cmdline).await {
         Ok(cog_core::progress::ChildOutcome::Exited(out)) => out,
-        Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
-            return Err(format!(
-                "{cmdline} 停住了：{silent:?} 没有输出、也没有消耗 CPU，比这份部署见过的\
-                 任何一次「还在干活」的两次推进之间的最长间隔都长（{window:?}）；已杀掉"
-            ))
-        }
         Err(e) => return Err(format!("{cmdline} could not run: {e}")),
     };
     if !out.status.success() {

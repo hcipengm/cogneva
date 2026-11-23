@@ -1319,9 +1319,6 @@ impl CheckTree {
         let cmdline = format!("git {}", args.join(" "));
         let out = match cog_core::progress::run_child_watched(cmd, &cmdline).await {
             Ok(cog_core::progress::ChildOutcome::Exited(out)) => out,
-            Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
-                return Err(cog_core::progress::went_silent(&cmdline, silent, window))
-            }
             Err(e) => {
                 return Err(format!(
                     "git could not be run against {}: {e}",

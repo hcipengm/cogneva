@@ -371,18 +371,6 @@ impl BuildahRuntime {
         let id = format!("eval-container:{}", next_exec_id());
         let out = match cog_core::progress::run_child_watched(cmd, &id).await {
             Ok(cog_core::progress::ChildOutcome::Exited(out)) => out,
-            Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => anyhow::bail!(
-                "{}",
-                cog_core::progress::went_silent(
-                    &format!(
-                        "`{} {}`",
-                        self.prefix.join(" "),
-                        args.first().map(String::as_str).unwrap_or("")
-                    ),
-                    silent,
-                    window,
-                )
-            ),
             Err(e) => anyhow::bail!("cannot run `{}`: {e}", self.prefix.join(" ")),
         };
         Ok(RunOutcome {

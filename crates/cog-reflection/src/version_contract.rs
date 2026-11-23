@@ -46,11 +46,6 @@ async fn git_out(git_dir: &str, args: &[&str]) -> SFResult<String> {
     let cmdline = format!("git {}", args.join(" "));
     let output = match cog_core::progress::run_child_watched(cmd, &cmdline).await {
         Ok(cog_core::progress::ChildOutcome::Exited(output)) => output,
-        Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
-            return Err(SFError::IO(crate::cmd_timeout::went_silent(
-                &cmdline, silent, window,
-            )))
-        }
         Err(e) => return Err(SFError::IO(format!("failed to run git: {e}"))),
     };
     if !output.status.success() {

@@ -438,23 +438,6 @@ impl EvolutionDeployer {
                 }
                 output
             }
-            Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
-                // 它停了，不是「时候到了」。宿主时间是真的（它确实占了这么久），
-                // 但那个数不是这件活的长度；它停之前占到的内存仍然是一次实测，
-                // 照报。
-                self.record_build(
-                    change_id,
-                    intent,
-                    BuildEnding::Stalled { silent, window },
-                    peak_rss_bytes,
-                );
-                return Err(SFError::IO(format!(
-                    "cargo build --release stopped moving: no output and no CPU time for \
-                     {:?}, longer than any gap this deployment has ever seen between steps \
-                     of a build that was still working ({:?}); it was killed",
-                    silent, window
-                )));
-            }
             Err(e) => {
                 // cargo could not be spawned at all, so no build happened: same
                 // class as a build the gate refused, and no duration is

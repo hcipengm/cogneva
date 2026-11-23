@@ -206,14 +206,6 @@ async fn run_git(root: &Path, args: &[&str], accept: &[i32]) -> Result<GitRun, A
                 )))
             }
         }
-        Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
-            // 看门狗判停时已经对整组发过 SIGKILL（git 自己起的孙子进程——打包、
-            // 分页器——一起收），这里再让守卫发一次就会打到一个可能已被复用的 pid 上。
-            guard.disarm();
-            Err(ApiError::internal(cog_core::progress::went_silent(
-                &cmdline, silent, window,
-            )))
-        }
         Err(e) => Err(ApiError::internal(format!("git did not finish: {e}"))),
     }
 }

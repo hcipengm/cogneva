@@ -4232,13 +4232,6 @@ impl MainlineDeployer {
         .map_err(|e| SFError::IO(format!("failed to run {program}: {e}")))?;
         let output = match outcome {
             cog_core::progress::ChildOutcome::Exited(output) => output,
-            cog_core::progress::ChildOutcome::Stalled { silent, window } => {
-                return Err(SFError::IO(format!(
-                    "{cmdline} stopped moving: no output and no CPU time for {silent:?}, \
-                     longer than any gap this deployment has ever seen between steps of a \
-                     command that was still working ({window:?}); it was killed"
-                )));
-            }
         };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -4431,13 +4424,6 @@ impl MainlineDeployer {
         let output =
             match cog_core::progress::watch_child(&mut child, "kubectl auth can-i", None).await {
                 Ok(cog_core::progress::ChildOutcome::Exited(output)) => output,
-                Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
-                    return Err(SFError::IO(crate::cmd_timeout::went_silent(
-                        "kubectl auth can-i",
-                        silent,
-                        window,
-                    )))
-                }
                 Err(e) => return Err(SFError::IO(format!("kubectl auth can-i: {e}"))),
             };
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -9728,13 +9714,6 @@ impl MainlineDeployer {
         };
         let output = match outcome {
             Ok(cog_core::progress::ChildOutcome::Exited(output)) => output,
-            Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
-                return Err(SFError::IO(format!(
-                    "{cmdline} stopped moving: no output and no CPU time for {silent:?}, \
-                     longer than any gap this deployment has ever seen between steps of a \
-                     build that was still working ({window:?}); it was killed"
-                )));
-            }
             Err(e) => return Err(SFError::IO(format!("failed to run cargo: {e}"))),
         };
         if !output.status.success() {
@@ -10448,11 +10427,6 @@ impl MainlineDeployer {
         let cmdline = format!("kubectl apply -f - ({what})");
         let output = match cog_core::progress::watch_child(&mut child, &cmdline, None).await {
             Ok(cog_core::progress::ChildOutcome::Exited(output)) => output,
-            Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
-                return Err(SFError::IO(crate::cmd_timeout::went_silent(
-                    &cmdline, silent, window,
-                )))
-            }
             Err(e) => return Err(SFError::IO(format!("kubectl apply: {e}"))),
         };
         if !output.status.success() {
@@ -10532,13 +10506,6 @@ impl MainlineDeployer {
         let output =
             match cog_core::progress::watch_child(&mut child, "kubectl apply -f -", None).await {
                 Ok(cog_core::progress::ChildOutcome::Exited(output)) => output,
-                Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
-                    return Err(SFError::IO(crate::cmd_timeout::went_silent(
-                        "kubectl apply -f -",
-                        silent,
-                        window,
-                    )))
-                }
                 Err(e) => return Err(SFError::IO(format!("kubectl apply: {e}"))),
             };
         Ok((
@@ -10581,13 +10548,6 @@ impl MainlineDeployer {
         let output =
             match cog_core::progress::watch_child(&mut child, "kubectl diff -f -", None).await {
                 Ok(cog_core::progress::ChildOutcome::Exited(output)) => output,
-                Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
-                    return Err(SFError::IO(crate::cmd_timeout::went_silent(
-                        "kubectl diff -f -",
-                        silent,
-                        window,
-                    )))
-                }
                 Err(e) => return Err(SFError::IO(format!("kubectl diff: {e}"))),
             };
         Ok((

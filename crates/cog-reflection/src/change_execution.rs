@@ -1348,11 +1348,6 @@ async fn kubectl_apply_stdin(
     let cmdline = format!("kubectl apply -f - ({what})");
     let output = match cog_core::progress::watch_child(&mut child, &cmdline, None).await {
         Ok(cog_core::progress::ChildOutcome::Exited(output)) => output,
-        Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
-            return Err(SFError::IO(crate::cmd_timeout::went_silent(
-                &cmdline, silent, window,
-            )))
-        }
         Err(e) => return Err(SFError::IO(format!("kubectl apply {what}: {e}"))),
     };
     if !output.status.success() {
@@ -1384,11 +1379,6 @@ async fn run_kubectl(
     let cmdline = format!("kubectl {}", args.join(" "));
     let output = match cog_core::progress::watch_child(&mut child, &cmdline, None).await {
         Ok(cog_core::progress::ChildOutcome::Exited(output)) => output,
-        Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
-            return Err(SFError::IO(crate::cmd_timeout::went_silent(
-                &cmdline, silent, window,
-            )))
-        }
         Err(e) => return Err(SFError::IO(format!("kubectl {}: {e}", args.join(" ")))),
     };
     if !output.status.success() {

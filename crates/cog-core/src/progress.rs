@@ -459,8 +459,6 @@ pub fn went_silent(cmdline: &str, silent: Duration, window: Duration) -> String 
 pub enum ChildOutcome {
     /// 进程自己退出了。`output` 是它的 stdout/stderr 与退出码。
     Exited(std::process::Output),
-    /// 它在 `silent` 那么久里一个字节都没产出，而这套部署量出来的静默窗口是 `window`。
-    Stalled { silent: Duration, window: Duration },
 }
 
 /// 跑一个子进程，按**它还在不在产出**判它停没停——不按一个声明的钟。
@@ -596,7 +594,6 @@ pub async fn watch_child(
         readers.push((false, handle));
     }
 
-    let mut stalled = None;
     // 「什么算还在动」这条口径住在 `declared_wall`，与判据同处：读的是子进程的 CPU 与
     // 读写字节，动一次记一拍。写在这里而不是 `run_child_watched` 的调用方里，是因为
     // 只有这里握着那个 pid。
@@ -655,8 +652,7 @@ pub async fn watch_child(
         let chunk = match reader.await {
             Ok(Ok(chunk)) => chunk,
             // 判停之后管子是我们自己打断的：那一侧读到错是这次收场的预期形状，
-            // 不是一段没读到的输出（而且 `Stalled` 本来就不带输出）。
-            Ok(Err(_)) if stalled.is_some() => Vec::new(),
+            // 不是一段没读到的输出。
             // 没判停却读出错：交回的这段输出是被截断的，而调用方会把它当作完整
             // 结果去解析。说不出「读到哪儿断了」的一侧，不能报成一个正常的结尾。
             Ok(Err(e)) => {
@@ -681,9 +677,6 @@ pub async fn watch_child(
     }
     forget(id);
 
-    if let Some((silent, window)) = stalled {
-        return Ok(ChildOutcome::Stalled { silent, window });
-    }
     // 正常结束：最后那一段静默是这条命令**干活时能有多安静**的一条实测。低于一拍的
     // 那一段不记——它是采样网格本身，不是关于这段活的读数。
     let quiet = last_movement.elapsed();
@@ -1149,10 +1142,6 @@ mod tests {
         // alive, which is the point.
         match run_child_watched(cmd, "chatty").await.expect("spawn") {
             ChildOutcome::Exited(out) => assert!(out.status.success()),
-            ChildOutcome::Stalled { silent, window } => panic!(
-                "a child that printed a line every 40 ms was stopped after {silent:?} \
-                 against a {window:?} window: elapsed time came back in as a criterion"
-            ),
         }
     }
 
@@ -1174,9 +1163,6 @@ mod tests {
         cmd.args(["-c", "sleep 2.5"]);
         match run_child_watched(cmd, "quiet-normal").await.expect("spawn") {
             ChildOutcome::Exited(out) => assert!(out.status.success(), "子进程没跑完：{out:?}"),
-            ChildOutcome::Stalled { silent, window } => {
-                panic!("窗口还没量到就把一个安静的子进程判停了：{silent:?} / {window:?}")
-            }
         }
 
         assert!(
@@ -1289,35 +1275,41 @@ mod tests {
         );
     }
 
-    /// A child that goes quiet is stopped at the measured window, and the verdict
-    /// carries both numbers — how long it was silent, and the window it crossed.
+    /// 静默**不杀**：同样量到 2.5 秒窗口，同样一段远超窗口的安静，子进程跑完，
+    /// 结局是它自己的退出，而那段静默进了样本群与归因。
     ///
-    /// The child's own sleep is many times the window, so a verdict that arrives
-    /// at all came from the watchdog rather than from the child ending on its own.
+    /// 「不动」与「该停」是两件事（属主 2026-11-23）：它可能在等一把锁、一个永远
+    /// 不会来的输入、一条被丢掉的回包。杀掉它把这些成因一起销毁，事后只剩「被判停」
+    /// 一条读数。所以这里判的是**没有杀**：子进程的 sleep 比窗口长得多，而它仍然
+    /// 跑到了自己的结尾。
     #[tokio::test]
-    async fn a_child_that_goes_quiet_is_stopped_at_the_measured_window() {
+    async fn a_child_that_goes_quiet_is_described_not_stopped() {
         let _serial = async_test_lock().await;
         reset_for_tests();
-        // 窗口必须宽于读数能分辨的两拍，否则判据把它抬到两拍（见
-        // [`crate::declared_wall::MIN_DISCERNIBLE_SILENCE`]），这条量到的就不是它自己播的种子。
         seed_gaps_for_tests(Duration::from_millis(2500), SAMPLE_FLOOR);
 
         let mut cmd = tokio::process::Command::new("sh");
-        cmd.args(["-c", "sleep 30"]);
+        cmd.args(["-c", "sleep 4"]);
         let started = std::time::Instant::now();
-        match run_child_watched(cmd, "silent").await.expect("spawn") {
-            ChildOutcome::Stalled { silent, window } => {
-                assert_eq!(window, Duration::from_millis(2500));
-                assert!(silent > window, "a stop is silence past the window");
-            }
-            ChildOutcome::Exited(out) => panic!(
-                "a child silent for 30 s against a 2.5 s window was not stopped: {:?}",
-                out.status
-            ),
-        }
+        let outcome = run_child_watched(cmd, "silent").await.expect("spawn");
+        let ChildOutcome::Exited(out) = outcome;
         assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "the verdict came from the child ending, not from the watchdog"
+            out.status.success(),
+            "安静的子进程应当自己跑完，而不是被抓停：{:?}",
+            out.status
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(4),
+            "结局来自子进程自己的结尾，不是看门狗：只用了 {:?}",
+            started.elapsed()
+        );
+        assert!(
+            gap_sample_count() >= 1,
+            "那段静默没有进样本群：下一次正常的等待就没有基线可比"
+        );
+        assert!(
+            !describe_silence(std::process::id()).is_empty(),
+            "归因那一条读数要能写出来（哪怕说的是「读不到」）"
         );
     }
 

@@ -3880,13 +3880,6 @@ impl ChangePipeline {
             .map_err(|e| SFError::IO(format!("Failed to run {line}: {e}")))?
         {
             cog_core::progress::ChildOutcome::Exited(output) => output,
-            cog_core::progress::ChildOutcome::Stalled { silent, window } => {
-                return Err(SFError::IO(format!(
-                    "{line} stopped moving: no output and no CPU time for {silent:?}, \
-                     longer than any gap this deployment has ever seen between steps of a \
-                     command that was still working ({window:?}); it was killed"
-                )))
-            }
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -4232,7 +4225,6 @@ impl ChangePipeline {
             .ok()?
         {
             cog_core::progress::ChildOutcome::Exited(output) => output,
-            cog_core::progress::ChildOutcome::Stalled { .. } => return None,
         };
         if !output.status.success() {
             return None;
@@ -4309,13 +4301,6 @@ impl ChangePipeline {
             .map_err(|e| SFError::IO(format!("Failed to run {line}: {e}")))?
         {
             cog_core::progress::ChildOutcome::Exited(output) => output,
-            cog_core::progress::ChildOutcome::Stalled { silent, window } => {
-                return Err(SFError::IO(format!(
-                    "{line} stopped moving: no output and no CPU time for {silent:?}, \
-                     longer than any gap this deployment has ever seen between steps of a \
-                     command that was still working ({window:?}); it was killed"
-                )))
-            }
         };
         if let Some(budget) = &self.budget {
             budget.record_run(
@@ -4718,10 +4703,6 @@ impl ChangePipeline {
                     run.not_asked
                         .push((line, format!("could not be launched: {e}")));
                     continue;
-                }
-                Ok(cog_core::progress::ChildOutcome::Stalled { .. }) => {
-                    run.interrupted = true;
-                    break;
                 }
             };
             run.asked.push(line.clone());

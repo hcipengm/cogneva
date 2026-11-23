@@ -183,15 +183,6 @@ impl FirecrackerSandbox {
                 }
                 true
             }
-            Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
-                warn!(
-                    vm_id = %vm.id,
-                    ?silent,
-                    ?window,
-                    "microvm stopped moving; destroying"
-                );
-                false
-            }
             Err(e) => {
                 self.destroy(vm).await.ok();
                 return Err(SFError::IO(format!("wait firecracker: {e}")));

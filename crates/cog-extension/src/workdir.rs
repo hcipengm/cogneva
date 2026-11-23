@@ -2969,13 +2969,6 @@ impl WorkdirRouter {
             .map_err(|e| SFError::IO(format!("failed to run git: {e}")))?
         {
             cog_core::progress::ChildOutcome::Exited(out) => out,
-            cog_core::progress::ChildOutcome::Stalled { silent, window } => {
-                return Err(SFError::IO(format!(
-                    "git {line} stopped moving: no output and no CPU time for {silent:?}, \
-                     longer than any gap this deployment has ever seen between steps of a \
-                     command that was still working ({window:?}); it was killed"
-                )))
-            }
         };
         if !out.status.success() {
             return Err(SFError::IO(format!(
