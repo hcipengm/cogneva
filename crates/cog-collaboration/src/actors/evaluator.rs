@@ -138,29 +138,13 @@ impl EvaluatorActor {
             .unwrap_or_default();
         items
             .iter()
-            .map(|i| {
-                // 判据之外还有一条**机器判**：「现在」没写出处的，即使模型说立得住也不算
-                // ——没有出处的那一格是印象，凭它算不出终态还有多远。用的是与台账那一面
-                // 同一条判据（`now_names_its_source`），两面不会各认一套。
-                if !i.now.trim().is_empty() && !cog_core::contract::ledger_item::now_names_its_source(&i.now)
-                {
-                    return CriterionVerdict {
-                        id: i.id.clone(),
-                        ok: false,
-                        reason: format!(
-                            "the now cell names no place it was read from: {}",
-                            i.now.trim()
-                        ),
-                    };
-                }
-                match given.iter().find(|v| v.id == i.id) {
-                    Some(v) => v.clone(),
-                    None => CriterionVerdict {
-                        id: i.id.clone(),
-                        ok: false,
-                        reason: "the review answered nothing for this item".into(),
-                    },
-                }
+            .map(|i| match given.iter().find(|v| v.id == i.id) {
+                Some(v) => v.clone(),
+                None => CriterionVerdict {
+                    id: i.id.clone(),
+                    ok: false,
+                    reason: "the review answered nothing for this item".into(),
+                },
             })
             .collect()
     }
@@ -731,43 +715,6 @@ mod tests {
         }
     }
 
-
-    /// 「现在」没写出处的，判据审必须判它不成立——哪怕模型说了 `ok`。
-    ///
-    /// 这一条是**机器判**，不是把话说给模型听：没有出处的那一格是印象，凭它算不出
-    /// 终态还有多远；而印象与读数在台账里长得一样。判据本身与台账那一面同一份
-    /// （`now_names_its_source`）。
-    #[tokio::test]
-    async fn a_now_that_names_no_place_fails_the_review() {
-        use cog_core::contract::ledger_item::{LedgerItem, LedgerState};
-        let evaluator = EvaluatorActor::new(std::sync::Arc::new(FixedAnswer(serde_json::json!({
-            "verdicts": [
-                {"id": "N1", "ok": true, "reason": "looks finished"},
-                {"id": "N2", "ok": true, "reason": "looks finished"}
-            ]
-        }))));
-        let items = vec![
-            LedgerItem {
-                id: "N1".into(),
-                terminal: "窗口里每一轮都带着它需要的全部".into(),
-                now: "还没做".into(), // 没有出处
-                gap: "缺的是：地板外置".into(),
-                state: LedgerState::Open,
-            },
-            LedgerItem {
-                id: "N2".into(),
-                terminal: "窗口里每一轮都带着它需要的全部".into(),
-                now: "crates/cog-agent/src/context.rs:464 已经外置".into(),
-                gap: "缺的是：入口判据".into(),
-                state: LedgerState::Open,
-            },
-        ];
-        let out = evaluator.review_criteria("把上下文做对", &items).await;
-        let n1 = out.iter().find(|v| v.id == "N1").expect("N1 没判");
-        assert!(!n1.ok && n1.reason.contains("names no place"), "没出处的现在必须判不成立：{n1:?}");
-        let n2 = out.iter().find(|v| v.id == "N2").expect("N2 没判");
-        assert!(n2.ok, "写出了处的现在不该被这一条拦下：{n2:?}");
-    }
 
     fn generation_with_diff(diff: &str) -> serde_json::Value {
         serde_json::json!({

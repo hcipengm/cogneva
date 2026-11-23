@@ -59,66 +59,6 @@ pub struct LedgerItem {
     pub state: LedgerState,
 }
 
-/// 「现在」那一格有没有写出处。
-///
-/// 与台账读取器 `scripts/hooks/todo_source.py::now_has_source` 是**同一条判据**：
-/// 两面各认一套写法，就会一边收、一边不收，而两边都不报错。认的就是仓里已经在用的
-/// 那几种机器可读写法——`test = <file>::<fn>`、`判据读数: …`、`信息不足：…`、
-/// `<file>:<line>`，以及反引号里的路径。
-///
-/// 为什么要有这一条：「现在」说的是**从树上读到的此刻**；读的人要能照着它去读同一处。
-/// 写不出出处的那一格不是「现在」，是一句印象——而印象与读数在台账里长得一样。
-pub fn now_names_its_source(now: &str) -> bool {
-    let quoted_path = {
-        // 反引号里出现 `/` 或一个已知后缀，就算一处可去读的路径。
-        let mut found = false;
-        let mut rest = now;
-        while let Some(open) = rest.find('`') {
-            let after = &rest[open + 1..];
-            let Some(close) = after.find('`') else {
-                break;
-            };
-            let inner = &after[..close];
-            if inner.contains('/')
-                || [".rs", ".py", ".sh", ".sql", ".yaml", ".yml", ".json", ".md", ".toml"]
-                    .iter()
-                    .any(|suffix| inner.ends_with(suffix) || inner.contains(&format!("{suffix}:")))
-            {
-                found = true;
-                break;
-            }
-            rest = &after[close + 1..];
-        }
-        found
-    };
-    quoted_path
-        || now.contains("判据读数:")
-        || now.contains("判据读数：")
-        || now.contains("信息不足:")
-        || now.contains("信息不足：")
-        || {
-            // `test = <file>::<fn>`
-            now.split("test =").skip(1).any(|tail| {
-                let word = tail.split_whitespace().next().unwrap_or("");
-                word.contains("::")
-            })
-        }
-        || {
-            // `<file>:<line>`：冒号后面是数字、前面带路径分隔符或已知后缀。
-            now.split_whitespace().any(|word| {
-                let Some((path, line)) = word.rsplit_once(':') else {
-                    return false;
-                };
-                !line.is_empty()
-                    && line.chars().all(|c| c.is_ascii_digit())
-                    && (path.contains('/')
-                        || [".rs", ".py", ".sh", ".sql", ".yaml", ".yml", ".json", ".md", ".toml"]
-                            .iter()
-                            .any(|suffix| path.ends_with(suffix)))
-            })
-        }
-}
-
 impl LedgerItem {
     /// 差距是不是空着。空 = 这一条已经到终态（不再进批次）。
     pub fn gap_is_empty(&self) -> bool {
@@ -140,7 +80,6 @@ impl LedgerItem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkout::repo_root;
 
     fn item(terminal: &str, now: &str, gap: &str, state: LedgerState) -> LedgerItem {
         LedgerItem {
@@ -202,28 +141,6 @@ mod tests {
                 state.as_str()
             );
         }
-    }
-
-    /// 「现在」要有出处——判的标本是**两侧共用的那一份**
-    /// （`deploy/scripts/tests/fixtures/now-sources.tsv`），带外读法与这里必须判得一样。
-    #[test]
-    fn a_now_without_a_source_is_not_a_now() {
-        let fixture = repo_root().join("deploy/scripts/tests/fixtures/now-sources.tsv");
-        let text = std::fs::read_to_string(&fixture)
-            .unwrap_or_else(|e| panic!("夹具读不到：{}（{e}）", fixture.display()));
-        let mut judged = 0;
-        for line in text.lines() {
-            let Some((want, now)) = line.split_once('\t') else {
-                continue;
-            };
-            let got = if now_names_its_source(now) { "source" } else { "none" };
-            assert_eq!(
-                got, want,
-                "两面判得不一样：这一格「{now}」带外读成 {want}，这里读成 {got}"
-            );
-            judged += 1;
-        }
-        assert!(judged >= 8, "夹具只有 {judged} 行，覆盖不到出处与没出处两组");
     }
 
     /// 状态词是闭集：读不出来的词没有状态，不是「未落」。

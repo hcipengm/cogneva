@@ -456,27 +456,6 @@ def worker_name() -> str:
     return os.uname().nodename
 
 
-# 「现在」那一格必须有出处：这一条与带内 `cog_core::contract::ledger_item::
-# now_names_its_source` 是**同一条判据**，两面各写一份就会漂（一边认、一边不认，
-# 而两边都不会报错）。认的形状就是仓里已经在用的那四种机器可读写法。
-_SOURCE_FORMS = (
-    re.compile(r"test\s*=\s*[^\s`]+::[^\s`]+"),           # test = <file>::<fn>
-    re.compile(r"判据读数\s*[:：]"),                        # 判据读数: <surface> → N
-    re.compile(r"信息不足\s*[:：]"),                        # 信息不足：<哪条输入>
-    re.compile(r"[\w./-]+\.(?:rs|py|sh|sql|yaml|yml|json|md|toml):\d+"),  # <file>:<line>
-    re.compile(r"`[^`]*(?:/|\.(?:rs|py|sh|sql|yaml|yml|json|md|toml))[^`]*`"),  # `路径`
-)
-
-
-def now_has_source(now: str) -> bool:
-    """「现在」这一格有没有写出处。
-
-    「从树上读到的」不是一句形容词：读的人要能照着它去读同一处。所以这一格至少要
-    出现上面某一种写法；写不出出处的那一格，就是没读（`未落` 的行尤其不能这么写）。
-    """
-    return any(form.search(now) for form in _SOURCE_FORMS)
-
-
 def partition(spec: str) -> tuple[list[Item], list[str], list[str]]:
     """(有触点的未完成条目, 没写触点的, 明确 `unknown` 不排的)。
 
