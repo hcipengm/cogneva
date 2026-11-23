@@ -208,6 +208,7 @@ mod tests {
             sub_tasks,
             acceptance_criteria: Vec::new(),
             targets: Vec::new(),
+            items: Vec::new(),
         }
     }
 

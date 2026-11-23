@@ -940,6 +940,7 @@ mod tests {
             sub_tasks: Vec::new(),
             acceptance_criteria: vec!["answer states the exact version".into()],
             targets: Vec::new(),
+            items: Vec::new(),
         };
         let value = serde_json::to_value(&output).unwrap();
         let back: PlannerOutput = serde_json::from_value(value).unwrap();
@@ -956,6 +957,7 @@ mod tests {
             sub_tasks: Vec::new(),
             acceptance_criteria: Vec::new(),
             targets: Vec::new(),
+            items: Vec::new(),
         };
         assert!(!output.is_terminal_env_failure());
         assert!(output.terminal_env_failure_reason().is_none());
@@ -972,6 +974,7 @@ mod tests {
             sub_tasks: Vec::new(),
             acceptance_criteria: Vec::new(),
             targets: Vec::new(),
+            items: Vec::new(),
         };
         assert!(output.is_terminal_env_failure());
         let reason = output.terminal_env_failure_reason().unwrap();
@@ -1009,6 +1012,7 @@ mod tests {
             sub_tasks: Vec::new(),
             acceptance_criteria: Vec::new(),
             targets: Vec::new(),
+            items: Vec::new(),
         };
 
         // 环境自己会清掉的三档：占位关系不变（下游照样不能当交付物），但声明

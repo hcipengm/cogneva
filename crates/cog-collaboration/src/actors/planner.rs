@@ -397,6 +397,7 @@ impl PlannerActor {
                     sub_tasks: Vec::new(),
                     acceptance_criteria: Vec::new(),
                     targets: Vec::new(),
+                    items: Vec::new(),
                 }
             }
         };

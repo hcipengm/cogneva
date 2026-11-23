@@ -857,6 +857,34 @@ impl RalphLoop {
         // 存不住。请求与尝试分开，两半才各自成立。
         let request = context.clone();
 
+        // **计划只做一次**：循环里的两拍是「生成」与「判定」。每轮重跑 planner
+        // 会让终态每轮被重写，判词追着一个移动的目标——那样永远收敛不了，而且
+        // 每重写一次就重买一次 planner 的 token。要改终态，只能发一条
+        // `terminal_revised` 带理由，判据被换过这件事读得见。
+        let planned_once: Option<PlannerOutput> = match scope {
+            PlanScope::Planned(planner) => {
+                let plan_task = Task::new(
+                    self.iteration_task_id("plan", 0),
+                    TaskType::Custom("ralph_plan_goal".into()),
+                    {
+                        let mut seed = request.clone();
+                        seed["goal"] = serde_json::json!(goal);
+                        seed
+                    },
+                );
+                Some(
+                    planner
+                        .plan_judged_downstream(&plan_task, 0, None, None, None, None)
+                        .await,
+                )
+            }
+            PlanScope::Declared(_) => None,
+        };
+        let scope = match (&planned_once, scope) {
+            (Some(plan), PlanScope::Planned(_)) => PlanScope::Declared(plan),
+            (_, declared) => declared,
+        };
+
         // 本轮自己的预算：归档历史提供反馈与停滞证据，不从预算里扣。
         // 起算点跟着历史走曾让预算变成目标的终身配额——攒满之后每次重驱
         // 都瞬间"耗尽"且一轮都不跑，连已经能通过的目标也被永久判死。
@@ -2856,6 +2884,7 @@ mod tests {
                 sub_tasks: Vec::new(),
                 acceptance_criteria: Vec::new(),
                 targets: Vec::new(),
+                items: Vec::new(),
             },
             final_generation: GeneratorOutput {
                 content: serde_json::json!({}),
@@ -2888,6 +2917,7 @@ mod tests {
             sub_tasks: Vec::new(),
             acceptance_criteria: Vec::new(),
             targets: Vec::new(),
+            items: Vec::new(),
         };
         result.final_generation = GeneratorOutput::none();
         result.final_outcome = RoundOutcome::Stopped {

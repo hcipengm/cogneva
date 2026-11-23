@@ -2620,6 +2620,7 @@ mod tests {
                 sub_tasks: Vec::new(),
                 acceptance_criteria: Vec::new(),
                 targets: Vec::new(),
+                items: Vec::new(),
             },
             final_generation: GeneratorOutput {
                 content: serde_json::json!({}),
