@@ -1261,21 +1261,39 @@ fn delivered_revision<'a>(
     deliveries: &'a HashMap<String, String>,
     carried: &HashMap<ChangeIdentity, Vec<String>>,
 ) -> Option<&'a str> {
+    delivered_under_its_own_id(identity, deliveries)
+        .into_iter()
+        .chain(delivered_under_a_batch(identity, deliveries, carried))
+        .max_by(|a, b| a.0.cmp(b.0))
+        .map(|(_, rev)| rev)
+}
+
+/// The delivery a commit names under this change's own id, if one does.
+fn delivered_under_its_own_id<'a>(
+    identity: &ChangeIdentity,
+    deliveries: &'a HashMap<String, String>,
+) -> Option<(&'a str, &'a str)> {
     let prefix = handover_task_prefix(identity);
-    let by_own_id = deliveries
+    deliveries
         .iter()
         .filter(|(id, _)| id.starts_with(&prefix))
-        .map(|(id, rev)| (id.as_str(), rev.as_str()));
-    let by_the_batch = carried
+        .map(|(id, rev)| (id.as_str(), rev.as_str()))
+        .max_by(|a, b| a.0.cmp(b.0))
+}
+
+/// The delivery a commit names under an id a batch carried this change in.
+fn delivered_under_a_batch<'a>(
+    identity: &ChangeIdentity,
+    deliveries: &'a HashMap<String, String>,
+    carried: &HashMap<ChangeIdentity, Vec<String>>,
+) -> Option<(&'a str, &'a str)> {
+    carried
         .get(identity)
         .into_iter()
         .flatten()
         .filter_map(|id| deliveries.get_key_value(id))
-        .map(|(id, rev)| (id.as_str(), rev.as_str()));
-    by_own_id
-        .chain(by_the_batch)
+        .map(|(id, rev)| (id.as_str(), rev.as_str()))
         .max_by(|a, b| a.0.cmp(b.0))
-        .map(|(_, rev)| rev)
 }
 
 /// Which hand-over carried each change, for the changes carried by a batch.
@@ -1302,6 +1320,41 @@ fn carried_handovers(tasks: &[Task]) -> HashMap<ChangeIdentity, Vec<String>> {
         }
     }
     carried
+}
+
+/// The batch map the delivery stamp needs, with "could not read it" kept
+/// apart from "there is nothing to carry".
+///
+/// The stamp asks two different questions of this map: whether a change was
+/// delivered under its own id, and whether a batch delivered it. The second
+/// question is only answerable when the graph was read. Folded, a failed read
+/// answers "no batch carried it", which is the same answer a change nothing
+/// dispatched would get -- so every row a batch carried keeps reading as never
+/// delivered, stays owed, and is handed over a second time. `None` is that
+/// unread graph; the stamp then answers the question it can and says how many
+/// rows it could not answer for.
+///
+/// A deployment with no goal path is `Some` of the empty map and not `None`:
+/// with nothing to hand anything over, no batch exists, and that is a reading
+/// rather than a failure to read.
+async fn carried_batches(
+    orchestrator: Option<&Arc<dyn OrchestratorControl>>,
+) -> Option<HashMap<ChangeIdentity, Vec<String>>> {
+    let Some(orchestrator) = orchestrator else {
+        return Some(HashMap::new());
+    };
+    match orchestrator.get_all_tasks_checked().await {
+        Ok(tasks) => Some(carried_handovers(&tasks)),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the task graph could not be read, so which batch carried a \
+                 change is unmeasured this pass; deliveries under a change's own id are still \
+                 stamped"
+            );
+            None
+        }
+    }
 }
 
 /// The name a run's deliverable carries.
@@ -3086,13 +3139,13 @@ pub fn spawn_change_ledger_loop(
                         // batches' rows after the measurement, which is exactly
                         // the ordering the comment above says records the rows
                         // that did not land and misses the ones that did.
-                        // No graph is no hand-over, so no batch: the empty map
-                        // is the right answer here rather than a degraded one.
-                        let carried_by_batch = match orchestrator.as_ref() {
-                            Some(o) => carried_handovers(&o.get_all_tasks().await),
-                            None => HashMap::new(),
-                        };
-                        stamp_deliveries(&*store, deliveries, &carried_by_batch).await;
+                        // `None` from here is a graph that could not be read,
+                        // which the stamp must not hear as "no batch carried
+                        // anything": that reading keeps every batched row owed
+                        // and hands it over again. A deployment with no goal path
+                        // is the empty map -- there, no batch exists.
+                        let carried_by_batch = carried_batches(orchestrator.as_ref()).await;
+                        stamp_deliveries(&*store, deliveries, carried_by_batch.as_ref()).await;
                     }
                     measure_pass(&*store, &tree, &mut unsettled, &changed, metrics.as_ref()).await;
                     // The second face of "is it done", read after the
@@ -5545,8 +5598,11 @@ fn dispatchable(
 async fn stamp_deliveries(
     store: &dyn ChangeLedgerStore,
     deliveries: &HashMap<String, String>,
-    carried_by_batch: &HashMap<ChangeIdentity, Vec<String>>,
-) -> usize {
+    // `None` when the task graph could not be read. A row with no delivery under
+    // its own id may then have been delivered by a batch this pass cannot name,
+    // so it is counted as unmeasured rather than left reading as never delivered.
+    carried_by_batch: Option<&HashMap<ChangeIdentity, Vec<String>>>,
+) -> Stamped {
     let outstanding_total = match store.census().await {
         Ok(census) => census
             .iter()
@@ -5558,7 +5614,7 @@ async fn stamp_deliveries(
                 error = %e,
                 "change ledger: the census could not be read, so no delivery was stamped this pass"
             );
-            return 0;
+            return Stamped::default();
         }
     };
     let rows = match store.outstanding(outstanding_total as usize).await {
@@ -5568,19 +5624,33 @@ async fn stamp_deliveries(
                 error = %e,
                 "change ledger: the owed set could not be read, so no delivery was stamped this pass"
             );
-            return 0;
+            return Stamped::default();
         }
     };
-    let mut recorded = 0usize;
+    let mut stamped = Stamped::default();
     for row in &rows {
         if row.delivered_rev.is_some() {
             continue;
         }
-        let Some(rev) = delivered_revision(&row.identity, deliveries, carried_by_batch) else {
+        let rev = match carried_by_batch {
+            Some(carried) => delivered_revision(&row.identity, deliveries, carried),
+            None => {
+                // Neither edge can be asked here but one: the batch map is the
+                // edge the graph would have named. A row with no delivery under
+                // its own id is then a row nothing can say anything about, and
+                // counting it keeps it out of the "not delivered" tally.
+                let own = delivered_under_its_own_id(&row.identity, deliveries);
+                if own.is_none() {
+                    stamped.unmeasured += 1;
+                }
+                own.map(|(_, rev)| rev)
+            }
+        };
+        let Some(rev) = rev else {
             continue;
         };
         match store.record_delivery(&row.identity, rev).await {
-            Ok(()) => recorded += 1,
+            Ok(()) => stamped.recorded += 1,
             Err(e) => warn!(
                 change = %row.identity,
                 error = %e,
@@ -5589,13 +5659,31 @@ async fn stamp_deliveries(
             ),
         }
     }
-    if recorded > 0 {
+    if stamped.recorded > 0 {
         info!(
-            recorded,
+            recorded = stamped.recorded,
             "change ledger: owed changes a commit on the line names as landed"
         );
     }
-    recorded
+    if stamped.unmeasured > 0 {
+        warn!(
+            unmeasured = stamped.unmeasured,
+            "change ledger: the task graph could not be read, so whether a batch delivered these \
+             owed changes went unmeasured this pass; a later pass that reads the batch list \
+             stamps them from the same sliding window"
+        );
+    }
+    stamped
+}
+
+/// What one pass of the delivery stamp managed to say.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct Stamped {
+    /// Deliveries a commit on the line names, written to the account.
+    recorded: usize,
+    /// Owed rows with no delivery under their own id, in a pass that could not
+    /// read the batch list: the graph may hold the hand-over that carried them.
+    unmeasured: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14527,7 +14615,7 @@ mod tests {
         );
 
         // The pass's own order: stamp, then measure.
-        stamp_deliveries(&fake, &deliveries, &HashMap::new()).await;
+        stamp_deliveries(&fake, &deliveries, Some(&HashMap::new())).await;
         let mut unsettled = HashMap::new();
         measure_pass(&fake, &tree, &mut unsettled, &[], None).await;
 
@@ -14546,6 +14634,78 @@ mod tests {
             measurements[0].measured_rev.as_deref(),
             Some(rev.as_str()),
             "the measurement is taken at the revision the log was read at"
+        );
+    }
+
+    /// 读不到批次清单时，只有批次带过的那一条说不出来——按自己 id 能盖的照盖，
+    /// 盖不了的那条记成「没量出来」，不记成「没交付」。
+    ///
+    /// 折叠读在这里的代价是那一条永远读作「从没交付」：它留在欠账集里，下一趟
+    /// 再被交出去一次，而库里其实已经有一笔跑完的活。
+    #[tokio::test]
+    async fn a_change_only_a_batch_carried_is_unmeasured_when_the_batch_list_cannot_be_read() {
+        let anchor = pending_row("file");
+        let behind = ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "file", "fn other"),
+            ..pending_row("file")
+        };
+        let batch = dispatch_task(&[anchor.clone(), behind.clone()], 0);
+        let mut deliveries = HashMap::new();
+        deliveries.insert(batch.id.clone(), "rev-1".to_string());
+        let fake = FakeLedger {
+            rows: vec![anchor.clone(), behind.clone()],
+            ..Default::default()
+        };
+        let carried = carried_handovers(std::slice::from_ref(&batch));
+
+        let stamped = stamp_deliveries(&fake, &deliveries, None).await;
+        assert_eq!(
+            stamped.unmeasured, 1,
+            "只有批次带过的那一条说不出话来：{stamped:?}"
+        );
+        assert_eq!(
+            fake.deliveries(),
+            vec![(anchor.identity.clone(), "rev-1".to_string())],
+            "自己 id 名字下的那一笔照盖，读不到批次不影响它：{:?}",
+            fake.deliveries()
+        );
+
+        // The same pass with the batch list read: the row behind the anchor is
+        // reachable through the batch, so it is stamped and nothing is left
+        // unmeasured. A test that only asserted the `None` half would stay green
+        // if the batch edge stopped working altogether.
+        //
+        // The fake records every stamp without writing back through the row, so
+        // the anchor is stamped a second time here; what this half pins is that
+        // the row behind it is reachable and that nothing went unmeasured.
+        let stamped = stamp_deliveries(&fake, &deliveries, Some(&carried)).await;
+        assert_eq!(stamped.unmeasured, 0, "{:?}", fake.deliveries());
+        assert!(stamped.recorded >= 1, "{:?}", fake.deliveries());
+        assert!(
+            fake.deliveries()
+                .contains(&(behind.identity.clone(), "rev-1".to_string())),
+            "批次带过的那一条要能被盖到：{:?}",
+            fake.deliveries()
+        );
+    }
+
+    /// 那一次读本身：读失败交 `None`，没有目标通路交 `Some(空)`。
+    ///
+    /// 两件事在折叠读里是一个答案，而这一个答案让被批次带过的每条欠账都读成
+    /// 「从没交付」。
+    #[tokio::test]
+    async fn a_graph_that_cannot_be_read_is_not_a_graph_with_no_batches() {
+        let no_goal_path = carried_batches(None).await;
+        assert_eq!(
+            no_goal_path,
+            Some(HashMap::new()),
+            "没有目标通路时确实没有批次，这是读数不是读失败"
+        );
+        let unreadable: Arc<dyn OrchestratorControl> =
+            Arc::new(FakeGraph::default().forgetting_the_graph());
+        assert!(
+            carried_batches(Some(&unreadable)).await.is_none(),
+            "读不到图不能答成「一条批次都没有」"
         );
     }
 

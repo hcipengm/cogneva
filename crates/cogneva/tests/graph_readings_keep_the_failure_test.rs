@@ -353,6 +353,12 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "get_task_checked",
         "读不到那条交接被读成「从没开始」，一条可能已经在跑的任务被取消掉",
     ),
+    (
+        CHANGE_LEDGER,
+        "async fn carried_batches",
+        "get_all_tasks_checked",
+        "读不到图被读成「一条批次都没有」，被批次带过的每条交付都读成「从没交付」，留着欠账、再交一次",
+    ),
 ];
 
 #[test]
