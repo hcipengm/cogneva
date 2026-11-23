@@ -61,6 +61,10 @@ const WRITERS: &[(&str, &str)] = &[
         "crates/cog-storage/src/postgres/usage_backfill.rs",
         "旧用量行回填成调用事实（`llm_call`）",
     ),
+    (
+        "crates/cog-storage/src/postgres/intent_events.rs",
+        "一句到达与它的接手（`intent_received` / `intent_triaged`）",
+    ),
 ];
 
 #[test]

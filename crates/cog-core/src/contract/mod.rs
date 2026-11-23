@@ -27,6 +27,7 @@ pub mod governance_acts;
 pub mod guardrail;
 pub mod hook;
 pub mod host_documents;
+pub mod intent_events;
 pub mod knowledge;
 pub mod kv;
 pub mod ledger_item;

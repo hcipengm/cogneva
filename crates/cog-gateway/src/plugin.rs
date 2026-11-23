@@ -221,6 +221,15 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         // 外部提交的价值判定落到存储面，由持有共用库的插件发布；本进程只拿写面。
         let taste_intent_sink: Option<Arc<dyn cog_core::TasteIntentSink>> =
             ctx.consume_service::<dyn cog_core::TasteIntentSink>();
+        // 对话作为意图入口：这一屏在每一轮进门时写一条 `intent_received`。装成
+        // 进程级单例的理由与审计出口相同——那个结构每加一格要跟着改五处夹具，
+        // 而漏掉的那一处不会报错，它会让入口安静地不写。缺席时计数里看得见。
+        if let Some(intent_sink) = ctx.consume_service::<dyn cog_core::IntentEvents>() {
+            crate::intent::install(intent_sink);
+            info!("chat intent entry wired");
+        } else {
+            warn!("no IntentEvents published: chat turns stay conversations only");
+        }
         // 组装好的知识层（memory + wiki 的合成体，含混合检索与重排），由 wiki 插件发布。
         // 它和上面那两个 backend 不是一回事：那两个是各自的店，这个是检索真正去问的那一层。
         let knowledge_backend: Option<Arc<dyn cog_core::KnowledgeBackend>> =

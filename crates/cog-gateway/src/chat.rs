@@ -2184,6 +2184,19 @@ pub async fn run_chat_turn(
         }
     };
 
+    // 0. 这一句先落成一条意图，再去回答它。
+    //
+    //    记录回答「这里有过一段对话」，不回答「这里有一件要办的事」——需要有人去
+    //    做的那句话，只要属主不再提起，就再没有一方会去做它。所以进门的这一句先
+    //    落到事件流上，由接手那一侧把它变成待办；落不进去不让这一轮失败，但计数
+    //    里看得见（见 [`crate::intent`]）。
+    //
+    //    `/命令` 是界面动作而不是一句要说的话：它展开成的是这一屏自己的操作，
+    //    记成意图会让每一次点命令都变成一件要办的事。
+    if command.is_none() {
+        crate::intent::record_turn(&session_id, &owner, "", &content).await;
+    }
+
     // 1. Echo the user message so the UI renders it (the real transport has
     //    no local echo, unlike the mock client).
     let user_mid = format!("user-{}", uuid::Uuid::new_v4());

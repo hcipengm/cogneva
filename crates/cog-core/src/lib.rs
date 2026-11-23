@@ -59,6 +59,7 @@ pub use contract::governance_acts::*;
 pub use contract::guardrail::*;
 pub use contract::hook::*;
 pub use contract::host_documents;
+pub use contract::intent_events::*;
 pub use contract::knowledge::*;
 pub use contract::kv::*;
 pub use contract::live_revision::*;

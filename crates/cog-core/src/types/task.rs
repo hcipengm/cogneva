@@ -893,6 +893,14 @@ pub const INPUT_SIGNAL: &str = "signal";
 /// to have a `payload` key be read as a stated direction.
 pub const TASTE_SIGNAL_KIND: &str = "taste_intent";
 
+/// The detail's own `kind` for a batch of chat intents taken up for triage.
+///
+/// One task carries a batch rather than one task per sentence: a conversation
+/// turn is cheap to say and expensive to run end to end, so the judgement of
+/// which turns ask for work happens once per batch. The task reads the kind
+/// back to know the detail is a list of the owner's own words.
+pub const CHAT_INTENT_TASK_KIND: &str = "chat_intents";
+
 /// What a piece of work delivers.
 ///
 /// The closed set the treatment of the work follows: the rubric that judges it,

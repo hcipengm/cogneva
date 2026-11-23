@@ -110,6 +110,16 @@ pub struct SignalWatcherConfig {
     pub taste_channel_enabled: bool,
     /// Max taste submissions acted on per tick (flood guard).
     pub taste_channel_max_per_tick: usize,
+    /// Channel 6: 属主在对话里说的话。它是这条流水线上唯一一种「有人指名要什么」
+    /// 的输入：别的通道都只能在系统自己身上发现哪里疼，只有这一条带来了外面的人
+    /// 想要的东西。
+    ///
+    /// 它按批接手而不是按句：一段对话里大多数句子是回答或追问，不是活；把每一句
+    /// 都派成一条待办，等于让使用者每说一句就花掉一个 squad。判「哪几句是活」的
+    /// 那一次判断由接手的那条待办的 planner 一起做——它本来就要读这段原文。
+    pub intent_channel_enabled: bool,
+    /// Max chat intents quoted into one triage task per tick (flood guard).
+    pub intent_channel_max_per_tick: usize,
 }
 
 /// 一拍最多处理几条信号：告警通道与口味通道问的是同一件事（一拍的处理时长要
@@ -140,6 +150,8 @@ impl Default for SignalWatcherConfig {
             alert_label_max_chars: cog_core::ALERT_LABEL_VALUE_MAX_CHARS,
             taste_channel_enabled: true,
             taste_channel_max_per_tick: MAX_SIGNALS_PER_TICK,
+            intent_channel_enabled: true,
+            intent_channel_max_per_tick: MAX_SIGNALS_PER_TICK,
         }
     }
 }
@@ -736,6 +748,78 @@ fn taste_intent(intent: &cog_core::TasteIntent) -> (String, serde_json::Value) {
         "submitted_at": intent.submitted_at.to_rfc3339(),
         "intent_id": intent.id,
         "payload": intent.payload,
+    });
+    (goal, detail)
+}
+
+/// The report key a batch of chat intents is filed under, for the counters.
+fn intent_triage_key(batch: &[cog_core::IntentRow]) -> String {
+    match batch.first() {
+        Some(first) => format!("chat-intent:{}", first.identity),
+        None => "chat-intent:empty".to_string(),
+    }
+}
+
+/// The task a batch of chat intents is triaged under.
+///
+/// Derived from the first intent in the batch rather than minted. Rows are read
+/// by "not yet triaged", so a round that died between filing the task and
+/// marking the rows reads the same rows again on the next tick; deriving the id
+/// from them makes that retry land on the task already in hand instead of a
+/// second one. Two live batches never share a first row: a batch can only be
+/// read while its rows are unmarked.
+fn intent_triage_task_id(batch: &[cog_core::IntentRow]) -> String {
+    match batch.first() {
+        Some(first) => format!("self-signal-chat-intent-{}", short_hash(&first.identity)),
+        None => "self-signal-chat-intent-empty".to_string(),
+    }
+}
+
+/// Turn a batch of the owner's messages into the intent that will act on them.
+///
+/// Every message is quoted verbatim, with who said it and when. The work is
+/// asked to decide per message whether it asks for work or is a remark — that
+/// judgement is the whole point of routing chat through the task layer, because
+/// the conversation that answers a question cannot also file the change it was
+/// asked for. Rewriting the text would replace the requirement with our reading
+/// of it, so the quoted block is the requirement.
+fn intent_triage(batch: &[cog_core::IntentRow]) -> (String, serde_json::Value) {
+    let mut quoted = String::new();
+    for intent in batch {
+        quoted.push_str(&format!(
+            "\n- {} at {} said: {}",
+            intent.said_by,
+            intent.at.to_rfc3339(),
+            intent.text
+        ));
+    }
+    let goal = format!(
+        "Take up {} message(s) said in the WebUI conversation\n\nThe owner typed \
+         the messages quoted below in the conversation. For each one, decide \
+         whether it asks for work — a change, a fix, something to be made or \
+         checked — or is a question or remark the conversation already answered: \
+         file every message that asks for work as work and see it through, and \
+         say in the change description why each of the others asked for none. \
+         Do not drop a message for being short, and do not restate one as a \
+         different task: the quoted text is the requirement exactly as it was \
+         stated.{}",
+        batch.len(),
+        quoted
+    );
+    let detail = serde_json::json!({
+        "kind": cog_core::CHAT_INTENT_TASK_KIND,
+        "intent_id": batch.first().map(|first| first.identity.clone()),
+        "intents": batch
+            .iter()
+            .map(|intent| serde_json::json!({
+                "identity": intent.identity,
+                "source": intent.source,
+                "said_by": intent.said_by,
+                "addressed_to": intent.addressed_to,
+                "text": intent.text,
+                "at": intent.at.to_rfc3339(),
+            }))
+            .collect::<Vec<_>>(),
     });
     (goal, detail)
 }
@@ -1569,6 +1653,8 @@ async fn tick(
     config: &SignalWatcherConfig,
     alert_source: Option<&Arc<dyn cog_core::ActiveAlertSource>>,
     taste_source: Option<&Arc<dyn cog_core::TasteIntentSource>>,
+    intent_reader: Option<&Arc<dyn cog_core::IntentReader>>,
+    intent_writer: Option<&Arc<dyn cog_core::IntentEvents>>,
     readings: &SignalWatcherReadings,
     held: bool,
     parents_settled: &mut bool,
@@ -1941,6 +2027,73 @@ async fn tick(
         }
     }
 
+    // 6. Chat turns taken up for triage. Every turn the owner types in the WebUI
+    // is already a row in the event stream (`intent_received`); what was
+    // missing is the reader that turns a row into work. Rows are read by "not
+    // yet triaged", so a marked batch is never read again, and a round that
+    // died between filing and marking rereads the same rows and lands on the
+    // same task id instead of filing twice (see `intent_triage_task_id`).
+    //
+    // One task per batch rather than one per sentence: any turn may be work,
+    // and the call that tells which is the same call that then does the work.
+    // The batch is capped like the other channels and quoted verbatim, because
+    // a paraphrase of the owner's words is not the requirement.
+    if config.intent_channel_enabled {
+        if let (Some(reader), Some(writer)) = (intent_reader, intent_writer) {
+            // A read that failed says nothing about the rows ("nothing was
+            // said" and "the store did not answer" are different facts, and
+            // only the second one has rows waiting), so it marks nothing and
+            // the next round is the one that acts on them.
+            match reader
+                .undispatched(config.intent_channel_max_per_tick as i64)
+                .await
+            {
+                Ok(batch) if !batch.is_empty() => {
+                    let key = intent_triage_key(&batch);
+                    let task_id = intent_triage_task_id(&batch);
+                    let (goal, detail) = intent_triage(&batch);
+                    let outcome = submit_intent(
+                        orch,
+                        task_id.clone(),
+                        cog_core::CHAT_INTENT_TASK_KIND,
+                        goal,
+                        detail,
+                        true,
+                    )
+                    .await;
+                    // Marked on every outcome that reached the task layer,
+                    // including "already in hand": those rows are being triaged
+                    // by the task that is running, and rereading them would ask
+                    // for a second task for the same work. Only a submission
+                    // that never got there leaves the rows unmarked, so the
+                    // retry is the next round's.
+                    if report_outcome(&mut state, &key, outcome, now, readings) {
+                        dirty = true;
+                        let identities: Vec<String> =
+                            batch.iter().map(|intent| intent.identity.clone()).collect();
+                        if let Err(e) = writer
+                            .mark_triaged(&identities, &task_id, "signal-watcher")
+                            .await
+                        {
+                            warn!(
+                                task_id = %task_id,
+                                error = %e,
+                                "chat intents filed but not marked; the next round reads them again"
+                            );
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "chat intent store unreadable; no chat work this round"
+                    );
+                }
+            }
+        }
+    }
+
     // The store's own size is published every round, whatever this round did:
     // it is the only reading that says whether keys are accumulating, and a
     // store that only ever grows is how it went unnoticed for weeks. It is a
@@ -2129,6 +2282,8 @@ pub fn spawn_signal_watcher_loop(
     shutdown: cog_core::ShutdownSignal,
     alert_source: Option<Arc<dyn cog_core::ActiveAlertSource>>,
     taste_source: Option<Arc<dyn cog_core::TasteIntentSource>>,
+    intent_reader: Option<Arc<dyn cog_core::IntentReader>>,
+    intent_writer: Option<Arc<dyn cog_core::IntentEvents>>,
     readings: Arc<SignalWatcherReadings>,
     llm_gate: Option<Arc<dyn cog_core::SchedulerGate>>,
 ) -> tokio::task::JoinHandle<()> {
@@ -2140,6 +2295,8 @@ pub fn spawn_signal_watcher_loop(
         self_audit_interval_secs = config.self_audit_interval_secs,
         alert_channel = alert_source.is_some() && config.alert_channel_enabled,
         taste_channel = taste_source.is_some() && config.taste_channel_enabled,
+        intent_channel =
+            intent_reader.is_some() && intent_writer.is_some() && config.intent_channel_enabled,
         "self-discovery signal watcher started"
     );
     // Self-discovery: if this loop stops, the system stops noticing its own
@@ -2156,6 +2313,8 @@ pub fn spawn_signal_watcher_loop(
             let shutdown = shutdown.clone();
             let alert_source = alert_source.clone();
             let taste_source = taste_source.clone();
+            let intent_reader = intent_reader.clone();
+            let intent_writer = intent_writer.clone();
             let readings = readings.clone();
             let llm_gate = llm_gate.clone();
             async move {
@@ -2195,6 +2354,8 @@ pub fn spawn_signal_watcher_loop(
                                 &config,
                                 alert_source.as_ref(),
                                 taste_source.as_ref(),
+                                intent_reader.as_ref(),
+                                intent_writer.as_ref(),
                                 &readings,
                                 standing_down,
                                 &mut parents_settled,
@@ -4743,6 +4904,7 @@ mod tests {
         let cfg = SignalWatcherConfig::default();
         assert_eq!(cfg.alert_channel_max_per_tick, MAX_SIGNALS_PER_TICK);
         assert_eq!(cfg.taste_channel_max_per_tick, MAX_SIGNALS_PER_TICK);
+        assert_eq!(cfg.intent_channel_max_per_tick, MAX_SIGNALS_PER_TICK);
 
         let source = include_str!("signal_watcher.rs");
         let bare: Vec<&str> = source
@@ -4750,7 +4912,8 @@ mod tests {
             .map(str::trim)
             .filter(|line| {
                 (line.starts_with("alert_channel_max_per_tick:")
-                    || line.starts_with("taste_channel_max_per_tick:"))
+                    || line.starts_with("taste_channel_max_per_tick:")
+                    || line.starts_with("intent_channel_max_per_tick:"))
                     && line
                         .split_once(':')
                         .map(|(_, value)| {
@@ -4771,5 +4934,55 @@ mod tests {
             FAILURE_RECURRENCE_THRESHOLD
         );
         assert_eq!(cfg.backlog_threshold, BACKLOG_THRESHOLD);
+    }
+
+    fn chat_row(identity: &str, text: &str) -> cog_core::IntentRow {
+        cog_core::IntentRow {
+            identity: identity.to_string(),
+            source: "chat".into(),
+            said_by: "owner".into(),
+            addressed_to: String::new(),
+            text: text.to_string(),
+            parent: None,
+            at: Utc::now(),
+        }
+    }
+
+    /// 交给 triage 任务的是属主原话：不缩写、不改写，一句一行；任务身份跟着
+    /// 这批的第一句走，重读同一批落回同一个任务而不是第二个。
+    #[test]
+    fn the_triage_task_quotes_the_owner_verbatim_and_keeps_one_identity() {
+        let batch = vec![
+            chat_row("chat:s1:aa", "员工和角色要解绑"),
+            chat_row("chat:s1:bb", "今天几号"),
+        ];
+        let (goal, detail) = intent_triage(&batch);
+        assert!(goal.contains("员工和角色要解绑"));
+        assert!(goal.contains("今天几号"));
+        assert_eq!(
+            detail.get("kind").and_then(|v| v.as_str()),
+            Some(cog_core::CHAT_INTENT_TASK_KIND)
+        );
+        assert_eq!(
+            detail
+                .get("intents")
+                .and_then(|v| v.as_array())
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            detail.get("intent_id").and_then(|v| v.as_str()),
+            Some("chat:s1:aa")
+        );
+
+        let again = vec![
+            chat_row("chat:s1:aa", "员工和角色要解绑"),
+            chat_row("chat:s1:cc", "第三句"),
+        ];
+        assert_eq!(intent_triage_task_id(&batch), intent_triage_task_id(&again));
+        assert_ne!(
+            intent_triage_task_id(&batch),
+            intent_triage_task_id(&[chat_row("chat:s2:aa", "别的会话里的一句话")])
+        );
     }
 }

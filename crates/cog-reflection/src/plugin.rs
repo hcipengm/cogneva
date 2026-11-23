@@ -1578,12 +1578,22 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             if taste_source.is_none() {
                 info!("signal watcher: no TasteIntentSource; taste channel off");
             }
+            // 对话意图通道：读「还没被接手的那几句」，把接手的去向写回去。读与写
+            // 由持有库的插件一同发布，所以两半要么都在、要么都不在；只到一半时
+            // 通道关掉而不是读了不写——读了不写会让同一批话每拍被派一次。
+            let intent_reader = ctx.consume_service::<dyn cog_core::IntentReader>();
+            let intent_writer = ctx.consume_service::<dyn cog_core::IntentEvents>();
+            if intent_reader.is_none() || intent_writer.is_none() {
+                info!("signal watcher: no chat intent store; intent channel off");
+            }
             drop(crate::spawn_signal_watcher_loop(
                 orch,
                 sw_config,
                 shutdown,
                 alert_source,
                 taste_source,
+                intent_reader,
+                intent_writer,
                 self.signal_readings.clone(),
                 // 本循环产出的每个意图都会落到一个 squad，池全灭时跑一轮只买到一次 503。
                 llm_gate.clone(),

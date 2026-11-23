@@ -32,8 +32,9 @@ pub struct EnvelopeFields {
 /// 时，答案取决于谁碰巧写了一段。这一格把全集收在一处：新 kind 要么加进来，要么
 /// 写入口当场被拒（[`check`] 会拒 `Unknown`）。
 /// 名单按写入方分：轮次（`round_*`）、计划（`batch_planned`）、变更候选四个阶段
-/// （`change_*`）、两类调用事实（`llm_call`／`tool_call`）。
-pub const KINDS: [&str; 11] = [
+/// （`change_*`）、两类调用事实（`llm_call`／`tool_call`）、意图的到达与接手
+/// （`intent_*`）。
+pub const KINDS: [&str; 13] = [
     "round_opened",
     "round_closed",
     "batch_planned",
@@ -50,6 +51,10 @@ pub const KINDS: [&str; 11] = [
     // 它**不改写**被擦那条事件：历史照旧，指向正文的哈希还在，只是那个哈希现在指不到
     // 可读的字节——这正是「擦除」与「改历史」的区别。
     "redacted",
+    // 意图到达：一句进入流水线的话，原文与来源。与之配对的是它什么时候被哪一条待办
+    // 接手，记在第二条事件上而不是改写这一条——到达是事实，接手是后来发生的事。
+    "intent_received",
+    "intent_triaged",
 ];
 
 /// 这个 kind 在闭集里吗。

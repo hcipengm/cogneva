@@ -19,6 +19,7 @@ pub mod dataset_catalog;
 pub mod decision_stats_store;
 pub mod governance_store;
 pub mod hook_archive;
+pub mod intent_events;
 pub mod large_object;
 pub mod llm_call_events;
 pub mod metrics_backend;
