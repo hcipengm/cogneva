@@ -447,6 +447,12 @@ def status() -> int:
             f"round: 台账上另有 {len(debt)} 行写着 `已落` 却没有三格（欠终态），"
             f"不在本轮批次：{', '.join(i.id for i in debt)}"
         )
+    try:
+        tree = pathlib.Path(subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                                           capture_output=True, text=True).stdout.strip())
+    except OSError:
+        tree = pathlib.Path(".")
+    print(f"round: 下一步 —— {next_step(tree)}")
     return 0 if terminal == len(left) else 1
 
 
@@ -497,6 +503,64 @@ def original_batch(payload: dict) -> list[str]:
         except (todo_source.Unreadable, OSError):
             pass
     return list(payload.get("batch") or [])
+
+
+COMPILE_LEDGER_ENV = "COGNEVA_COMPILE_LEDGER"
+DEFAULT_COMPILE_LEDGER = pathlib.Path.home() / ".local/state/cogneva/compile-ledger.tsv"
+
+
+def _last_compile_line(tree: pathlib.Path) -> list[str] | None:
+    """这一棵树最后一次编译的账行；读不到返回 None（量不到，不是没编过）。"""
+    path = pathlib.Path(os.environ.get(COMPILE_LEDGER_ENV, str(DEFAULT_COMPILE_LEDGER)))
+    if not path.is_file():
+        return None
+    last = None
+    for line in path.read_text(errors="ignore").splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 4 and parts[1] == str(tree):
+            last = parts
+    return last
+
+
+def next_step(tree: pathlib.Path) -> str:
+    """**下一步是什么**，由读数算出来，不由人记着。
+
+    读的三样：`family.py --editing`（还有哪几行点名的文件没动到）、编译账里这一棵树
+    的最后一条（什么时候编的、编的哪个 HEAD）、以及工作区此刻的 HEAD。顺序就是流程的
+    顺序——先改完，再编一次，最后才谈推；读不到的那一格说「量不到」，不猜。
+    """
+    family = tree / "scripts/hooks/family.py"
+    if not family.is_file():
+        return "量不到（这棵树里没有 family.py）"
+    try:
+        proc = subprocess.run(
+            ["python3", str(family), "--root", str(tree), "--all-todos", "--editing"],
+            capture_output=True, text=True,
+        )
+    except OSError:
+        return "量不到（family.py 跑不起来）"
+    todo_lines = [l for l in proc.stdout.splitlines() if l.strip().startswith("TODO ")]
+    if proc.returncode == 0 and not todo_lines:
+        pass
+    elif todo_lines:
+        return f"继续编辑——还有 {len(todo_lines)} 条没动到它们点名的文件"
+    else:
+        return "量不到（family.py 没判成：见上面那行）"
+    # 编辑完了、还没提交时**不能**编：垫片在脏树上拒绝编译，理由是没有推上去的字节
+    # 与编出来的是两份。这一步在次序里真实存在，所以它也要被说出来。
+    dirty = subprocess.run(["git", "-C", str(tree), "status", "--porcelain"],
+                           capture_output=True, text=True).stdout.strip()
+    if dirty:
+        return "先提交（这一批的编辑已到位，编译垫片在脏树上不编）"
+    head = subprocess.run(["git", "-C", str(tree), "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+    ledger = _last_compile_line(tree)
+    if ledger is None:
+        return "编译一次（这个宿主还没有这棵树的编译账）"
+    compiled_head = ledger[3]
+    if compiled_head != head:
+        return f"编译一次（账上最后一次编的是 {compiled_head[:12]}，此刻 HEAD 是 {head[:12]}）"
+    return "推（先跑 `deploy/scripts/check-before-push.sh`；绿了才推）"
 
 
 def close() -> int:
