@@ -89,5 +89,13 @@ out=$(run "$tmp/reached.md"); rc=$?
     && ok "已落且差距为空：没有触点也不拒" \
     || bad "做到终态的行因为没有触点被拒（rc=$rc）：$out"
 
+# 8. 旧形状的三格 S 行仍按三格读：状态在第 3 格，不是「末格」。按形状判的那一版
+#    如果把这些行当成五格，末格是判据文案，整行会被当成「状态写成散文」拒掉。
+printf '| S99 | 旧格式现在格 | 未落 | 判据 ｜touches: crates/a/src/x.rs\n' >"$tmp/legacy.md"
+out=$(run "$tmp/legacy.md"); rc=$?
+{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "PARSED 1 S99"; } \
+    && ok "旧三格行：状态仍从第 3 格读" \
+    || bad "旧三格行被当成五格读（rc=$rc）：$out"
+
 printf 'todo-source-fixed-format.test.sh: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
