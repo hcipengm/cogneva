@@ -1633,6 +1633,7 @@ mod streaming_write_tests {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
 
