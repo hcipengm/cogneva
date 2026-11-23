@@ -416,8 +416,15 @@ def status() -> int:
         print(f"round: 台账读不到（{e}）；下面只列 id")
     book = "事件流" if round_book() == "event" else f"git {ROUND_REF}"
     print(f"round: 书={book}，钉在 {rev[:12]}，还剩 {len(left)} 条")
+    gaps = {i.id: i.gap for i in items.values()} if items else {}
     terminal = 0
     for i in left:
+        gap = gaps.get(i) or ""
+        if gap and gap.strip("—–- "):
+            # 五格台账的「还差什么」就在那一行里：直接印它，比把三格的空位
+            # 重新数一遍更接近读的人要知道的那件事。
+            print(f"  未完成 {i}  {gap}")
+            continue
         miss = cells.get(i)
         if miss is None:
             print(f"  未完成 {i}")

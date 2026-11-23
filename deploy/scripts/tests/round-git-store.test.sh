@@ -138,6 +138,10 @@ payload=$(git -C "$tree" cat-file -p refs/cogneva/round 2>/dev/null)
 { [ "$rc" -eq 0 ] && printf '%s' "$payload" | grep -q '"S1": "缺的是：一半"'; } \
     && ok "缺口随行走：轮里带着每条还差什么" \
     || bad "轮的载荷里没有缺口（rc=$rc）：$payload"
+out=$(run status); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "未完成 S1  缺的是：一半"; } \
+    && ok "status 直接印出缺口，不必重读整本台账" \
+    || bad "status 没印缺口（rc=$rc）：$out"
 
 printf 'round-git-store.test.sh: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
