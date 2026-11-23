@@ -63,6 +63,7 @@ pub struct CollaborationExecutor {
     pge_schemas: Option<std::collections::HashMap<String, serde_json::Value>>,
     skill_registry: Option<Arc<dyn cog_core::ExternalSkillRegistry>>,
     state_backend: Option<Arc<dyn cog_core::StateBackend>>,
+    intent_reader: Option<Arc<dyn cog_core::IntentReader>>,
     /// 决策结果的写侧：每个任务现建的 SquadExecutor 都要拿到它，否则
     /// 引擎只读不写，表永远空。
     meta_learning: Option<Arc<dyn cog_core::MetaLearning>>,
@@ -186,6 +187,7 @@ impl CollaborationExecutor {
             pge_schemas: None,
             skill_registry: None,
             state_backend: None,
+            intent_reader: None,
             meta_learning: None,
             ralph: None,
             local_repair_max: None,
@@ -297,6 +299,12 @@ impl CollaborationExecutor {
     /// history across restarts.
     pub fn with_state_backend(mut self, backend: Arc<dyn cog_core::StateBackend>) -> Self {
         self.state_backend = Some(backend);
+        self
+    }
+
+    /// 装上未派生意图的读面：planner 的那一次调用把它带进请求。
+    pub fn with_intent_reader(mut self, reader: Arc<dyn cog_core::IntentReader>) -> Self {
+        self.intent_reader = Some(reader);
         self
     }
 
@@ -651,6 +659,9 @@ impl CollaborationExecutor {
         if let Some(ref kb) = self.knowledge_backend {
             squad_executor = squad_executor.with_knowledge_backend(kb.clone());
         }
+        if let Some(ref reader) = self.intent_reader {
+            squad_executor = squad_executor.with_intent_reader(reader.clone());
+        }
         if let Some(ref cfg) = self.self_review {
             squad_executor = squad_executor.with_self_review(cfg.clone());
         }
@@ -871,6 +882,9 @@ impl CollaborationExecutor {
         }
         if let Some(ref kb) = self.knowledge_backend {
             squad_executor = squad_executor.with_knowledge_backend(kb.clone());
+        }
+        if let Some(ref reader) = self.intent_reader {
+            squad_executor = squad_executor.with_intent_reader(reader.clone());
         }
         if let Some(ref cfg) = self.self_review {
             squad_executor = squad_executor.with_self_review(cfg.clone());

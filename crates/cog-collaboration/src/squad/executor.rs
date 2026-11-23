@@ -152,6 +152,8 @@ pub struct SquadExecutor {
     skill_registry: Option<Arc<dyn cog_core::ExternalSkillRegistry>>,
     /// State backend — 持久化 RalphLoop 迭代历史（ContextBoard 载体），重启后可续跑。
     state_backend: Option<Arc<dyn cog_core::StateBackend>>,
+    /// 未派生意图的读面：planner 的那一次调用把它们一起读进来判。
+    intent_reader: Option<Arc<dyn cog_core::IntentReader>>,
     /// Ralph Loop 预算与停滞窗口（来自配置面 `ralph` 段，默认见 RalphLoopConfig）。
     ralph: RalphLoopConfig,
     /// 局部修复预算（来自配置面 `pge` 段）。None = 由
@@ -176,6 +178,8 @@ pub(crate) struct SquadDeps {
     pub pge_schemas: Option<std::collections::HashMap<String, serde_json::Value>>,
     pub skill_registry: Option<Arc<dyn cog_core::ExternalSkillRegistry>>,
     pub state_backend: Option<Arc<dyn cog_core::StateBackend>>,
+    /// 未派生意图的读面（planner 的一次调用读它）。
+    pub intent_reader: Option<Arc<dyn cog_core::IntentReader>>,
     pub ralph: RalphLoopConfig,
     /// 局部修复预算（配置面 `pge` 段）。None = [`crate::DEFAULT_LOCAL_REPAIR_MAX`]。
     pub local_repair_max: Option<u32>,
@@ -277,6 +281,12 @@ impl SquadExecutor {
 
     /// Inject a state backend so RalphLoop can persist iteration history
     /// across restarts (stored on the task's ContextBoard).
+    /// 装上未派生意图的读面：planner 的那一次调用用它读「还没派生的意图」。
+    pub fn with_intent_reader(mut self, reader: Arc<dyn cog_core::IntentReader>) -> Self {
+        self.intent_reader = Some(reader);
+        self
+    }
+
     pub fn with_state_backend(mut self, backend: Arc<dyn cog_core::StateBackend>) -> Self {
         self.state_backend = Some(backend);
         self
@@ -363,6 +373,7 @@ impl SquadExecutor {
             pge_schemas: self.pge_schemas.clone(),
             skill_registry: self.skill_registry.clone(),
             state_backend: self.state_backend.clone(),
+            intent_reader: self.intent_reader.clone(),
             ralph: self.ralph,
             local_repair_max: self.local_repair_max,
             stage_store: self.stage_store.clone(),
@@ -495,6 +506,9 @@ impl SquadExecutor {
                 }
             };
             let mut planner_actor = PlannerActor::new(planner);
+            if let Some(reader) = deps.intent_reader.as_ref() {
+                planner_actor = planner_actor.with_intent_reader(Arc::clone(reader));
+            }
             if let Some(ref kb) = knowledge_backend {
                 planner_actor = planner_actor.with_knowledge(kb.clone());
             }
@@ -711,6 +725,9 @@ impl SquadExecutor {
                 match (planner.as_ref(), generator.as_ref(), evaluator.as_ref()) {
                     (Some(p), Some(g), Some(e)) => {
                         let mut planner_actor = PlannerActor::new(Arc::clone(p));
+                        if let Some(reader) = deps.intent_reader.as_ref() {
+                            planner_actor = planner_actor.with_intent_reader(Arc::clone(reader));
+                        }
                         let mut generator_actor = GeneratorActor::new(Arc::clone(g));
                         let mut evaluator_actor = EvaluatorActor::new(Arc::clone(e));
                         if let Some(ref kb) = knowledge_backend {
@@ -816,6 +833,9 @@ impl SquadExecutor {
                         }
                     }
                     let mut planner_actor = PlannerActor::new(p);
+                    if let Some(reader) = deps.intent_reader.as_ref() {
+                        planner_actor = planner_actor.with_intent_reader(Arc::clone(reader));
+                    }
                     let mut generator_actor = GeneratorActor::new(g);
                     let mut evaluator_actor = EvaluatorActor::new(e);
                     if let Some(ref kb) = knowledge_backend {

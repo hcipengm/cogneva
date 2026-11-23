@@ -1141,12 +1141,14 @@ impl cog_core::SystemPlugin for StoragePlugin {
         // 意图进门那一条事件的写者。没有池就不发布：网关那一侧取不到它时写意图那一步
         // 必须显式「没有收件台」，而不是静默把意图丢掉。
         if let Some(pool) = self.pg_pool.clone() {
-            let store: Arc<dyn cog_core::IntentEvents> =
+            let concrete =
                 Arc::new(crate::postgres::intent_events::IntentEventStore::new(
                     pool,
                     "cogneva-gateway",
                 ));
-            ctx.publish_service(store);
+            // 同一份存储发布两次：入口写（`IntentEvents`）、planner 读（`IntentReader`）。
+            ctx.publish_service(concrete.clone() as Arc<dyn cog_core::IntentEvents>);
+            ctx.publish_service(concrete as Arc<dyn cog_core::IntentReader>);
             info!("StoragePlugin intent events published");
         }
 

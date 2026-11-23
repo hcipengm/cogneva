@@ -146,6 +146,10 @@ impl cog_core::SystemPlugin for CollaborationPlugin {
             if let Some(ref backend) = state_backend {
                 collab = collab.with_state_backend(backend.clone());
             }
+            // 意图的读面：planner 的那一次调用读「还没派生的意图」，分类不另买一次调用。
+            if let Some(reader) = ctx.consume_service::<dyn cog_core::IntentReader>() {
+                collab = collab.with_intent_reader(reader);
+            }
             // 名册接上之后，账与日志里的署名读的是名册行的工号＋名字，而不是
             // 按 id 现算的第二个名字。
             if let Some(roster) = ctx.consume_service::<dyn cog_core::AgentRegistry>() {
