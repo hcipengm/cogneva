@@ -13,13 +13,16 @@
 # 读不到就退 3（没判）：这台机器没配置集群时，「量不到」不是「够了」。
 set -uo pipefail
 
-command -v kubectl >/dev/null 2>&1 || { echo "quota: 没有 kubectl，这一条没判。" >&2; exit 3; }
 ns="${COGNEVA_NAMESPACE:-cogneva}"
 # 集群的连接凭据只有 root 读得到（`/etc/rancher/k3s/k3s.yaml`），宿主上的其余读数口
 # 都走这一条（`deploy/scripts/read-resource-account.sh` 的 `COGNEVA_KUBECTL` 同一个
-# 默认值）。按裸 `kubectl` 判，这一格在宿主上永远是「读不到」，而三档里的「读不到」
-# 与「不够」被压成同一个红——量不到的那一格看起来像判过了。
-kube() { if sudo -n true 2>/dev/null; then sudo -n kubectl "$@"; else kubectl "$@"; fi; }
+# 默认值：`sudo -n k3s kubectl`，k3s 自己带 kubeconfig）。按裸 `kubectl` 判，这一格在
+# 宿主上永远是「读不到」——2026-11-23 实测：裸 `kubectl` 连的是 `127.0.0.1:8080`，
+# 集群明明就在，而三档里的「读不到」与「不够」被压成同一个红，量不到的那一格看起来
+# 像判过了。
+kubectl_cmd="${COGNEVA_KUBECTL:-sudo -n k3s kubectl}"
+command -v "${kubectl_cmd%% *}" >/dev/null 2>&1 || { echo "quota: 没有 ${kubectl_cmd%% *}，这一条没判。" >&2; exit 3; }
+kube() { ${kubectl_cmd} "$@"; }
 
 hard=$(kube -n "$ns" get quota cogneva-quota -o jsonpath='{.spec.hard.requests\.cpu}' 2>/dev/null) || exit 3
 used=$(kube -n "$ns" get quota cogneva-quota -o jsonpath='{.status.used.requests\.cpu}' 2>/dev/null) || exit 3
