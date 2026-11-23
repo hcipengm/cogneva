@@ -27,6 +27,7 @@ const PROJECT_CONTROL: &str = "crates/cog-gateway/src/project_control.rs";
 const PROGRESS: &str = "crates/cog-gateway/src/progress.rs";
 const PROCESSES: &str = "crates/cog-gateway/src/processes.rs";
 const LIB: &str = "crates/cog-gateway/src/lib.rs";
+const EXECUTOR: &str = "crates/cog-gateway/src/executor.rs";
 
 /// 折叠过的那几条读。某一段正文里出现它们，就是那一面在替没读到的图作证。
 const FOLDED: &[&str] = &[
@@ -125,6 +126,12 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "对端唯一的视野答成「你有 0 条任务」",
     ),
     (
+        A2A,
+        "async fn rpc_tasks_cancel",
+        "get_task_checked",
+        "对端据 -32001 去换 id，而那一行可能还在",
+    ),
+    (
         PROJECT_CONTROL,
         "async fn coverage_this_pass",
         "get_all_tasks_checked",
@@ -184,6 +191,30 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "health_report_from_reading(",
         "健康四格一起落到 0，读成「四个都没病」",
     ),
+    (
+        LIB,
+        "async fn task_timeline_handler",
+        "get_task_checked",
+        "一条还在跑的活的时间线被答成「已经被删了」",
+    ),
+    (
+        EXECUTOR,
+        "async fn owner_from_graph",
+        "get_graph_checked",
+        "交接边的「谁干的」一列留空，读成「没人经手」",
+    ),
+    (
+        EXECUTOR,
+        "pub fn spawn_collaboration_listener",
+        "get_dependents_checked",
+        "完成的任务没有交接边，读成「它没有下游」",
+    ),
+    (
+        EXECUTOR,
+        "pub fn spawn_collaboration_listener",
+        "get_graph_checked",
+        "一次重启没有留下任何被打断的边，读成「没打断任何在跑的活」",
+    ),
 ];
 
 #[test]
@@ -198,6 +229,7 @@ fn every_surface_that_draws_the_graph_keeps_the_failure() {
         PROGRESS,
         PROCESSES,
         LIB,
+        EXECUTOR,
     ] {
         productions.insert(file, production_text(&read_repo(file)));
     }

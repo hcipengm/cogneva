@@ -3301,16 +3301,15 @@ async fn backends_health_handler(State(state): State<Arc<GatewayState>>) -> Resp
 async fn task_timeline_handler(
     State(state): State<Arc<GatewayState>>,
     Path(task_id): Path<String>,
-) -> Response {
-    let task = match state.orchestrator.get_task(&task_id).await {
-        Some(t) => t,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "task_not_found", "task_id": task_id})),
-            )
-                .into_response();
-        }
+) -> Result<Response, ApiError> {
+    let Some(task) =
+        crate::tasks::task_from_reading(state.orchestrator.get_task_checked(&task_id).await)?
+    else {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "task_not_found", "task_id": task_id})),
+        )
+            .into_response());
     };
 
     let mut milestones = Vec::new();
@@ -3343,14 +3342,14 @@ async fn task_timeline_handler(
         }));
     }
 
-    (
+    Ok((
         StatusCode::OK,
         Json(json!({
             "task_id": task_id,
             "milestones": milestones,
         })),
     )
-        .into_response()
+        .into_response())
 }
 
 // ─── Agent Heartbeats Handler ───

@@ -1176,7 +1176,7 @@ impl GitHubDiscoveryLoop {
                         "settled the criteria on rows filed before their kind wrote one"
                     );
                 }
-                self.criteria_settled = settled.remaining == 0;
+                self.criteria_settled = criteria_backfill_is_done(&settled);
             }
         }
         // 先取这一轮的池实证纪元，再判任何退避窗：它决定的是"窗的前提还在不在"，
@@ -1593,7 +1593,23 @@ impl GitHubDiscoveryLoop {
 
         // 一次只修一条：这个分支的这条工作流上已经有一张修复单在做时，再开一张
         // 只是把同一份日志交给第二个执行者，两张单还要互相踩同一批文件。
-        let repairs_in_flight = orchestrator.get_all_tasks().await.into_iter().any(|row| {
+        //
+        // 读不出来时不开新单：折叠的那条读答「图是空的」，于是同一份日志会被
+        // 交给第二个执行者。这一条是「不知道」而不是「没有」，事件不记入
+        // `ci_submitted`，下一次驱动还能再问一次。
+        let rows = match orchestrator.get_all_tasks_checked().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    run_id = event.run_id,
+                    error = %e,
+                    "cannot read the task graph to tell whether a repair is in flight; \
+                     skipping this failure event"
+                );
+                return Ok(false);
+            }
+        };
+        let repairs_in_flight = rows.into_iter().any(|row| {
             matches!(
                 row.status,
                 TaskStatus::Pending | TaskStatus::Scheduled | TaskStatus::Running
@@ -2655,7 +2671,13 @@ pub(crate) struct SettledCriteria {
     pub(crate) filled: usize,
     pub(crate) failed: usize,
     /// Rows still without a criterion after this pass.
+    ///
+    /// Only meaningful when the graph was read: an unreadable graph answers
+    /// zero here, and `remaining == 0` would otherwise read as "nothing left
+    /// to back-fill" and stop the pass for the life of the process.
     pub(crate) remaining: usize,
+    /// The graph could not be read, so no count in this pass is an answer.
+    pub(crate) unread: bool,
 }
 
 /// One pass of closing CI fixes whose failure the branch has left behind.
@@ -2665,6 +2687,17 @@ pub(crate) struct SettledCiFixes {
     pub(crate) failed: usize,
     /// CI repair rows still open after this pass.
     pub(crate) remaining: usize,
+    /// The graph could not be read; no row was examined.
+    pub(crate) unread: bool,
+}
+
+/// Whether the criteria back-fill has nothing left to do.
+///
+/// An unreadable graph answers `remaining == 0` without having read a row, so
+/// the count alone would retire the pass for the life of the process; the pass
+/// has to run again once the graph can be read.
+fn criteria_backfill_is_done(settled: &SettledCriteria) -> bool {
+    !settled.unread && settled.remaining == 0
 }
 
 /// How many rows one pass may close. A backlog of dead rows costs one GitHub
@@ -2760,9 +2793,18 @@ impl GitHubDiscoveryLoop {
     ) -> SettledCriteria {
         let mut settled = SettledCriteria::default();
         let platform = self.provider.platform_kind();
-        let candidates: Vec<Task> = orch
-            .get_all_tasks()
-            .await
+        let rows = match orch.get_all_tasks_checked().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                settled.unread = true;
+                tracing::warn!(
+                    error = %e,
+                    "cannot read the task graph; the criteria back-fill stays pending"
+                );
+                return settled;
+            }
+        };
+        let candidates: Vec<Task> = rows
             .into_iter()
             .filter(|row| row.acceptance.is_empty())
             .filter(|row| criterion_for_row(platform, row).is_some())
@@ -2824,9 +2866,18 @@ impl GitHubDiscoveryLoop {
         orch: &Arc<dyn OrchestratorControl>,
     ) -> SettledCiFixes {
         let mut settled = SettledCiFixes::default();
-        let candidates: Vec<Task> = orch
-            .get_all_tasks()
-            .await
+        let rows = match orch.get_all_tasks_checked().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                settled.unread = true;
+                tracing::warn!(
+                    error = %e,
+                    "cannot read the task graph; the CI fixes that may be superseded stay open"
+                );
+                return settled;
+            }
+        };
+        let candidates: Vec<Task> = rows
             .into_iter()
             .filter(
                 |row| matches!(&row.task_type, TaskType::Custom(kind) if kind == CI_FIX_TASK_TYPE),
@@ -3619,6 +3670,9 @@ pub(crate) mod tests {
         /// 提交一律失败，模拟编排器这一侧根本不收——上游全 503 那天就是这样，
         /// 每个派发点在日志里各写一行、读数面上什么也看不见。
         refuse_submissions: std::sync::atomic::AtomicBool,
+        /// 带报错的那条读一律失败，模拟一个读不动任务图的编排器：折叠的那条
+        /// 这时答「图是空的」，而真相是没人读到过它。
+        unreadable_graph: std::sync::atomic::AtomicBool,
     }
 
     impl MockOrchestrator {
@@ -3644,12 +3698,20 @@ pub(crate) mod tests {
                 assess_failure_cause: Mutex::new(None),
                 intent_rows: Mutex::new(HashMap::new()),
                 refuse_submissions: std::sync::atomic::AtomicBool::new(false),
+                unreadable_graph: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
         /// 让这个假的编排器像不通事的编排器那样拒收每一次提交。
         pub(crate) fn refusing_submissions(self) -> Self {
             self.refuse_submissions
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self
+        }
+
+        /// 让带报错的那条读失败：任务图此刻读不动。
+        pub(crate) fn with_unreadable_graph(self) -> Self {
+            self.unreadable_graph
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             self
         }
@@ -3751,6 +3813,17 @@ pub(crate) mod tests {
         }
         async fn get_all_tasks(&self) -> Vec<Task> {
             self.rows.lock().unwrap().clone()
+        }
+        async fn get_all_tasks_checked(&self) -> cog_core::SFResult<Vec<Task>> {
+            if self
+                .unreadable_graph
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(cog_core::SFError::Database(
+                    "mock graph is unreadable".to_string(),
+                ));
+            }
+            Ok(self.rows.lock().unwrap().clone())
         }
         async fn replace_task(&self, task: Task) -> cog_core::SFResult<()> {
             let mut rows = self.rows.lock().unwrap();
@@ -4458,6 +4531,44 @@ pub(crate) mod tests {
         assert!(goals[0].contains("clippy::question_mark"));
     }
 
+    /// 图读不动的时候，不再开一张修复单——折叠的那条读答「图是空的」，于是
+    /// 同一份日志会被交给第二个执行者，两张单还要互相踩同一批文件。
+    #[tokio::test]
+    async fn a_graph_that_cannot_be_read_files_no_repair_it_cannot_rule_out() {
+        let provider = Arc::new(MockProvider {
+            issues: vec![],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![CiJobLog {
+                job_id: 42,
+                job_name: "Clippy".into(),
+                log_tail: "error: clippy::question_mark".into(),
+            }],
+            ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
+            prs: vec![],
+            pr_details: HashMap::new(),
+        });
+        let orchestrator = Arc::new(MockOrchestrator::new().with_unreadable_graph());
+
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider,
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+
+        assert!(!loop_.process_ci_failure(ci_event(1002)).await.unwrap());
+        assert!(
+            orchestrator.goals.lock().unwrap().is_empty(),
+            "读不出在途的那张单，不等于没有在途的单：这里不该再开一张"
+        );
+        assert!(
+            !loop_.ci_submitted.contains(&1002),
+            "这一条没被读成「没有在途的单」，它只是没问出来：图能读之后还要能再问一次"
+        );
+    }
+
     /// 一个能用来读「分支上还有什么在跑」的 provider：CI 那份还是红的，只是
     /// 提交的时间比事件里那一版新。
     fn moving_branch_provider(finished: Vec<(&str, CiRunSummary)>) -> Arc<MockProvider> {
@@ -5085,6 +5196,87 @@ pub(crate) mod tests {
         let again = loop_.settle_filed_criteria(&as_control).await;
         assert_eq!(again.filled, 0, "{again:?}");
         assert_eq!(again.remaining, 1, "{again:?}");
+    }
+
+    /// 读不动任务图的那一趟，不能把自己读成「没有要补的行」。
+    ///
+    /// 折叠的那条读答一份空名单，`remaining == 0`，于是这趟回填以「做完了」
+    /// 退场——进程活多久就退多久，而库里那些空着判据的行一条也没被问过。
+    #[tokio::test]
+    async fn a_criteria_backfill_that_cannot_read_the_graph_does_not_retire_itself() {
+        let orch = Arc::new(MockOrchestrator::new().with_unreadable_graph());
+        let loop_ = GitHubDiscoveryLoop::new(
+            Arc::new(MockProvider {
+                issues: vec![],
+                comments: Mutex::new(vec![]),
+                ci_logs: vec![],
+                ci_runs: Mutex::new(vec![]),
+                ci_green_runs: Mutex::new(Vec::new()),
+                prs: vec![],
+                pr_details: HashMap::new(),
+            }),
+            IssueTriage::rules_only(),
+            config(),
+            Some(orch.clone()),
+            None,
+        );
+        let as_control: Arc<dyn OrchestratorControl> = orch.clone();
+
+        let settled = loop_.settle_filed_criteria(&as_control).await;
+        assert!(settled.unread, "{settled:?}");
+        assert_eq!(settled.filled, 0, "{settled:?}");
+        assert!(
+            !criteria_backfill_is_done(&settled),
+            "图没读到不等于没有要补的行：这一趟要留到下一轮再问"
+        );
+
+        // 另一个方向也钉住：真的读完了才退场，账面上还有行就还接着问。
+        assert!(criteria_backfill_is_done(&SettledCriteria {
+            unread: false,
+            remaining: 0,
+            ..Default::default()
+        }));
+        assert!(!criteria_backfill_is_done(&SettledCriteria {
+            unread: false,
+            remaining: 1,
+            ..Default::default()
+        }));
+    }
+
+    /// 读不动任务图的那一趟结案，也要说出来：它一张单都没看过，不能读成
+    /// 「没有前提已经消失的修复单」。
+    #[tokio::test]
+    async fn a_ci_settle_pass_that_cannot_read_the_graph_says_so() {
+        let orch = Arc::new(
+            MockOrchestrator::holding(vec![ci_fix_row(
+                "github-ci-run-1001",
+                "main",
+                "CI",
+                1001,
+                None,
+            )])
+            .with_unreadable_graph(),
+        );
+        let loop_ = GitHubDiscoveryLoop::new(
+            Arc::new(MockProvider {
+                issues: vec![],
+                comments: Mutex::new(vec![]),
+                ci_logs: vec![],
+                ci_runs: Mutex::new(vec![]),
+                ci_green_runs: Mutex::new(Vec::new()),
+                prs: vec![],
+                pr_details: HashMap::new(),
+            }),
+            IssueTriage::rules_only(),
+            config(),
+            Some(orch.clone()),
+            None,
+        );
+        let as_control: Arc<dyn OrchestratorControl> = orch.clone();
+
+        let settled = loop_.settle_superseded_ci_fixes(&as_control).await;
+        assert!(settled.unread, "{settled:?}");
+        assert_eq!(settled.closed, 0, "{settled:?}");
     }
 
     /// 一条 issue 在路上会交两行：先判定、再修复。两行各自都要说清怎样算做完，

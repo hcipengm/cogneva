@@ -778,6 +778,9 @@ fn workspace_limit_bytes() -> u64 {
 
 /// 走一遍用户根，累加文件数与字节。不跟符号链接：链接可以指向根外，把它算进
 /// 用量等于让用户用一条链接占别人的空间。
+/// 读不动的目录、取不到元数据的文件都是错误，不是「大小 0」：这个数正是写之前
+/// 那道卡的输入，读少了就等于替一份装不下的写放行。只有「扫的这一瞬间它被删掉
+/// 了」不算失败——那一片确实不在用量里。
 async fn measure_usage(root: &Path) -> Result<(u64, u64), ApiError> {
     let mut files = 0u64;
     let mut bytes = 0u64;
@@ -785,16 +788,14 @@ async fn measure_usage(root: &Path) -> Result<(u64, u64), ApiError> {
     while let Some(dir) = stack.pop() {
         let mut reader = match tokio::fs::read_dir(&dir).await {
             Ok(reader) => reader,
-            Err(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(unreadable_usage(e)),
         };
-        while let Some(entry) = reader
-            .next_entry()
-            .await
-            .map_err(|e| ApiError::internal(format!("cannot measure the workspace: {e}")))?
-        {
+        while let Some(entry) = reader.next_entry().await.map_err(unreadable_usage)? {
             let file_type = match entry.file_type().await {
                 Ok(t) => t,
-                Err(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(unreadable_usage(e)),
             };
             if file_type.is_symlink() {
                 continue;
@@ -802,14 +803,22 @@ async fn measure_usage(root: &Path) -> Result<(u64, u64), ApiError> {
             if file_type.is_dir() {
                 stack.push(entry.path());
             } else if file_type.is_file() {
-                if let Ok(meta) = entry.metadata().await {
-                    files += 1;
-                    bytes += meta.len();
-                }
+                let meta = match entry.metadata().await {
+                    Ok(meta) => meta,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(unreadable_usage(e)),
+                };
+                files += 1;
+                bytes += meta.len();
             }
         }
     }
     Ok((files, bytes))
+}
+
+/// 用量读不出来：这一页与写前那道卡都不能拿一个少了几个文件的数当答案。
+fn unreadable_usage(e: std::io::Error) -> ApiError {
+    ApiError::internal(format!("cannot measure the workspace: {e}"))
 }
 
 /// 写之前先问「写完还装得下吗」。
@@ -1774,6 +1783,34 @@ mod tests {
 
         assert_eq!(files, 2, "链接后面的文件不算我的用量");
         assert_eq!(bytes, 7);
+    }
+
+    /// 列不动的目录不许当作用量里的 0：写之前那道卡会按这个数放行。
+    ///
+    /// 判据：把 `read_dir` 那一支换回 `Err(_) => continue`，这条会红
+    /// （读到的是 `(0, 0)`，与一个空工作区同形）。
+    #[tokio::test]
+    async fn a_directory_that_cannot_be_listed_is_not_an_empty_one() {
+        let dir = tempdir();
+        let not_a_dir = dir.path().join("a-file");
+        tokio::fs::write(&not_a_dir, b"x").await.unwrap();
+        let err = measure_usage(&not_a_dir).await.expect_err("列不动要报错");
+        assert!(
+            err.message.contains("cannot measure the workspace"),
+            "错误要让读的人看出是用量读不出来：{}",
+            err.message
+        );
+    }
+
+    /// 扫的这一瞬间它被删掉了：那一片确实不在用量里，不是读失败。
+    #[tokio::test]
+    async fn a_directory_that_vanished_counts_as_absent_not_as_a_failure() {
+        let dir = tempdir();
+        let gone = dir.path().join("gone");
+        let (files, bytes) = measure_usage(&gone)
+            .await
+            .expect("不存在就是没有，不是读失败");
+        assert_eq!((files, bytes), (0, 0));
     }
 
     #[tokio::test]

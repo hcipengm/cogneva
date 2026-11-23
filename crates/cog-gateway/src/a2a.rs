@@ -1702,19 +1702,35 @@ async fn rpc_tasks_cancel(
             .into_response();
     };
 
-    if state.orchestrator.get_task(task_id).await.is_none() {
-        return (
-            StatusCode::OK,
-            Json(rpc_error(rpc_id, -32001, format!("no task '{task_id}'"))),
-        )
-            .into_response();
+    match state.orchestrator.get_task_checked(task_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::OK,
+                Json(rpc_error(rpc_id, -32001, format!("no task '{task_id}'"))),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            // 读失败不是「这个 id 不存在」：对端会拿 -32001 去换一个 id，
+            // 而那一行可能还在，只是这一侧读不动它。
+            return (
+                StatusCode::OK,
+                Json(rpc_error(
+                    rpc_id,
+                    -32603,
+                    format!("task '{task_id}' could not be read: {e}"),
+                )),
+            )
+                .into_response();
+        }
     }
 
     match state.orchestrator.cancel_task(task_id).await {
         Ok(cascaded) => {
             tracing::info!(task_id, cascaded = cascaded.len(), "a2a tasks/cancel");
-            match state.orchestrator.get_task(task_id).await {
-                Some(task) => (
+            match state.orchestrator.get_task_checked(task_id).await {
+                Ok(Some(task)) => (
                     StatusCode::OK,
                     Json(jsonrpc_result(
                         rpc_id,
@@ -1722,12 +1738,21 @@ async fn rpc_tasks_cancel(
                     )),
                 )
                     .into_response(),
-                None => (
+                Ok(None) => (
                     StatusCode::OK,
                     Json(rpc_error(
                         rpc_id,
                         -32603,
                         format!("task '{task_id}' was cancelled but can no longer be read"),
+                    )),
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::OK,
+                    Json(rpc_error(
+                        rpc_id,
+                        -32603,
+                        format!("task '{task_id}' was cancelled but could not be read: {e}"),
                     )),
                 )
                     .into_response(),
