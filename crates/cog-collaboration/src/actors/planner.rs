@@ -96,6 +96,9 @@ pub struct PlannerActor {
     output_schema: Option<serde_json::Value>,
     prompt_skill: Option<cog_core::PromptSkillDef>,
     context_builder: Option<Arc<dyn cog_core::TaskContextBuilder>>,
+    /// 还没被派生成任务的意图。planner 的那一次调用把它们一起读进来判——哪几条只是
+    /// 回答、哪几条是活，都在这一次里定，不另买一次调用的 token。
+    intent_reader: Option<Arc<dyn cog_core::IntentReader>>,
 }
 
 impl PlannerActor {
@@ -107,7 +110,14 @@ impl PlannerActor {
             output_schema: None,
             prompt_skill: None,
             context_builder: None,
+            intent_reader: None,
         }
+    }
+
+    /// 装上意图的读面：这一批还没派生的意图会随计划的请求一起交进去。
+    pub fn with_intent_reader(mut self, reader: Arc<dyn cog_core::IntentReader>) -> Self {
+        self.intent_reader = Some(reader);
+        self
     }
 
     pub fn with_knowledge(mut self, knowledge: Arc<dyn KnowledgeBackend>) -> Self {
@@ -240,6 +250,32 @@ impl PlannerActor {
                 ..Default::default()
             },
         );
+
+        // 还没派生的意图随这一次请求一起进去：它们是意图这一侧的输入，而「哪几条只是
+        // 回答、哪几条是活」正由这一次调用一并判。读不到就说出来——把读失败读成「没有
+        // 意图」，会让每一次计划都在没有输入的情况下启动。
+        if let Some(reader) = self.intent_reader.as_ref() {
+            match reader.undispatched(i64::MAX).await {
+                Ok(rows) if !rows.is_empty() => {
+                    let list: Vec<serde_json::Value> = rows
+                        .iter()
+                        .map(|r| {
+                            serde_json::json!({
+                                "source": r.source,
+                                "external_id": r.external_id,
+                                "text": r.text,
+                                "parent": r.parent,
+                            })
+                        })
+                        .collect();
+                    ctx["intents"] = serde_json::json!(list);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "intents could not be read; the plan has none of them")
+                }
+            }
+        }
 
         // The stable half: the answer contract (this role's instructions, output
         // schema, format). None of it depends on this attempt, so it must be
