@@ -752,6 +752,24 @@ fn taste_intent(intent: &cog_core::TasteIntent) -> (String, serde_json::Value) {
     (goal, detail)
 }
 
+/// 有没有一批对话意图正被接手。
+///
+/// 有就不派下一批：接手是一个 squad 任务，属主在一段对话里连着说十句就派十个 squad
+/// 是把「说一句话」的价钱绑到「跑一件活」上。正在办的那一批读的是快照——它读到的那几
+/// 句都已被标成接手过——所以没读到的留在流上，等这一批办完再一起读。
+fn chat_triage_in_hand(tasks: &[Task]) -> bool {
+    tasks.iter().any(|task| {
+        matches!(
+            task.status,
+            TaskStatus::Pending | TaskStatus::Scheduled | TaskStatus::Running
+        ) && task
+            .input
+            .get(cog_core::INPUT_TASK_KIND)
+            .and_then(|value| value.as_str())
+            == Some(cog_core::CHAT_INTENT_TASK_KIND)
+    })
+}
+
 /// The report key a batch of chat intents is filed under, for the counters.
 fn intent_triage_key(batch: &[cog_core::IntentRow]) -> String {
     match batch.first() {
@@ -2047,8 +2065,10 @@ async fn tick(
     // One task per batch rather than one per sentence: any turn may be work,
     // and the call that tells which is the same call that then does the work.
     // The batch is capped like the other channels and quoted verbatim, because
-    // a paraphrase of the owner's words is not the requirement.
-    if config.intent_channel_enabled {
+    // a paraphrase of the owner's words is not the requirement. And no new
+    // batch while one is being taken up (`chat_triage_in_hand`): a burst of
+    // sentences is one conversation, not one squad run per sentence.
+    if config.intent_channel_enabled && !chat_triage_in_hand(&tasks) {
         if let (Some(reader), Some(writer)) = (intent_reader, intent_writer) {
             // A read that failed says nothing about the rows ("nothing was
             // said" and "the store did not answer" are different facts, and
@@ -5001,5 +5021,28 @@ mod tests {
             intent_triage_task_id(&batch),
             intent_triage_task_id(&[chat_row("chat:s2:aa", "别的会话里的一句话")])
         );
+    }
+
+    /// 一批正在办时按住下一批；办完了才读——否则连着说十句就派十个 squad。
+    #[test]
+    fn a_batch_in_hand_holds_the_next_one() {
+        let mut batch_task = Task::new(
+            "self-signal-chat-intent-x".into(),
+            TaskType::Custom(cog_core::CHAT_INTENT_TASK_KIND.into()),
+            serde_json::json!({ cog_core::INPUT_TASK_KIND: cog_core::CHAT_INTENT_TASK_KIND }),
+        );
+        batch_task.status = TaskStatus::Running;
+        assert!(chat_triage_in_hand(&[batch_task.clone()]));
+        batch_task.status = TaskStatus::Completed;
+        assert!(!chat_triage_in_hand(&[batch_task.clone()]));
+
+        // 别的活不算：按住下一批的只有对话批次这一类。
+        let mut alert = Task::new(
+            "self-signal-alert-x".into(),
+            TaskType::Custom(SIGNAL_TASK_TYPE.into()),
+            serde_json::json!({ cog_core::INPUT_TASK_KIND: SIGNAL_TASK_TYPE }),
+        );
+        alert.status = TaskStatus::Running;
+        assert!(!chat_triage_in_hand(&[alert]));
     }
 }
