@@ -1247,8 +1247,23 @@ async fn fill_signal_criteria(
         // running this moment is left to the next tick rather than written over.
         // `replace_task` writes the whole row, so there is no narrower write to
         // fall back on.
-        let Some(mut filled) = orch.get_task(&row.id).await else {
-            continue;
+        let mut filled = match orch.get_task_checked(&row.id).await {
+            Ok(Some(filled)) => filled,
+            // The row is gone: there is nothing left to fill.
+            Ok(None) => continue,
+            Err(e) => {
+                // Not "gone": a read that failed cannot say that. The row stays
+                // a candidate for the next tick, and `remaining` stays up so a
+                // pass that could not read it does not claim it filled
+                // everything.
+                settled.remaining += 1;
+                warn!(
+                    task = %row.id,
+                    error = %e,
+                    "signal watcher: a signal row could not be read; it is left for the next tick"
+                );
+                continue;
+            }
         };
         if !filled.acceptance.is_empty() {
             continue;
@@ -1303,8 +1318,20 @@ async fn fill_rework_criteria(
     for row in candidates.into_iter().take(SIGNAL_SETTLE_BATCH) {
         // Read again before writing, for the same reason as the signal rows: the
         // snapshot is a minute old and `replace_task` writes the whole row.
-        let Some(mut filled) = orch.get_task(&row.id).await else {
-            continue;
+        let mut filled = match orch.get_task_checked(&row.id).await {
+            Ok(Some(filled)) => filled,
+            Ok(None) => continue,
+            Err(e) => {
+                // Same as the signal rows: a failed read is not "this row is
+                // gone", and the row has to stay a candidate.
+                settled.remaining += 1;
+                warn!(
+                    task = %row.id,
+                    error = %e,
+                    "signal watcher: a rework row could not be read; it is left for the next tick"
+                );
+                continue;
+            }
         };
         if !filled.acceptance.is_empty() {
             continue;
@@ -1404,7 +1431,14 @@ async fn submit_intent(
     detail: serde_json::Value,
     may_redrive: bool,
 ) -> IntentOutcome {
-    let existing = orch.get_task(&task_id).await;
+    // Submitting without this read is what the idempotence exists to prevent:
+    // if the store still holds the row, the submission raises on the duplicate
+    // id every tick after this one. So a read that failed is reported as a
+    // failed attempt, retried next tick -- never as "no row".
+    let existing = match orch.get_task_checked(&task_id).await {
+        Ok(existing) => existing,
+        Err(e) => return IntentOutcome::Failed(format!("read {task_id}: {e}")),
+    };
     let action = intent_action(existing.as_ref(), may_redrive);
     let resubmitting = action == IntentAction::Resubmit;
     match action {
@@ -1545,7 +1579,22 @@ async fn tick(
     // a broken watcher look like a quiet system.
     readings.tick();
     let now = Utc::now();
-    let tasks = orch.get_all_tasks().await;
+    // The graph is read once and every signal below is derived from this one
+    // read, so a read that failed would be judged as a graph with no failures,
+    // no backlog and nothing to settle -- which is what a quiet system looks
+    // like. The round has happened (the tick above is counted); it is counted
+    // apart, and it judges nothing.
+    let tasks = match orch.get_all_tasks_checked().await {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            readings.unread_round();
+            warn!(
+                error = %e,
+                "signal watcher: the task graph could not be read; this round judges nothing"
+            );
+            return;
+        }
+    };
     // Until it stops finding anything to fill, on the graph this round already
     // read: see `settle_filings`. Before the held-round return, because shaping
     // the tree spends no LLM call and a pool outage is no reason to leave a
@@ -2529,13 +2578,33 @@ mod tests {
     /// to rather than off the return value of any one call.
     struct FilingOrchestrator {
         tasks: std::sync::Mutex<Vec<Task>>,
+        /// 测试用：整份行表读不成（模拟一个读不出来的 store）。
+        graph_unreadable: std::sync::atomic::AtomicBool,
+        /// 测试用：读到这些 id 的那一问答不上来。
+        unreadable: std::sync::Mutex<std::collections::HashSet<String>>,
     }
 
     impl FilingOrchestrator {
         fn holding(tasks: Vec<Task>) -> Self {
             Self {
                 tasks: std::sync::Mutex::new(tasks),
+                graph_unreadable: std::sync::atomic::AtomicBool::new(false),
+                unreadable: std::sync::Mutex::new(std::collections::HashSet::new()),
             }
+        }
+
+        /// 整份行表这一问问不上来。
+        fn forget_the_graph(&self) {
+            self.graph_unreadable
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        /// 读这一行的那一问答不上来。
+        fn fail_read_of(&self, id: &str) {
+            self.unreadable
+                .lock()
+                .unwrap()
+                .insert(id.to_string());
         }
 
         fn filed(&self) -> Vec<Task> {
@@ -2567,6 +2636,28 @@ mod tests {
 
         async fn get_all_tasks(&self) -> Vec<Task> {
             self.filed()
+        }
+
+        /// 如实报错的那两条读：只有 store 读不出来时才走 `Err`，其余照内存答。
+        async fn get_all_tasks_checked(&self) -> cog_core::SFResult<Vec<Task>> {
+            if self
+                .graph_unreadable
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(cog_core::SFError::Database(
+                    "store unavailable: cannot read the task graph".into(),
+                ));
+            }
+            Ok(self.filed())
+        }
+
+        async fn get_task_checked(&self, task_id: &str) -> cog_core::SFResult<Option<Task>> {
+            if self.unreadable.lock().unwrap().contains(task_id) {
+                return Err(cog_core::SFError::Database(format!(
+                    "store unavailable: cannot read task {task_id}"
+                )));
+            }
+            Ok(self.get_task(task_id).await)
         }
 
         async fn get_task(&self, task_id: &str) -> Option<Task> {
@@ -3365,6 +3456,192 @@ mod tests {
                 "{untouched} 不该被补：它没有可用的现场，或者正在跑"
             );
         }
+    }
+
+    /// 一轮读不到整份行表，就不是「安静的一轮」。
+    ///
+    /// 这一轮里每一个信号都从这一次读里派生，读不到就等于图上一个失败、一段积压、
+    /// 一条待补的行都没有——与一个真的没事的系统逐字同形。所以它不判任何信号，
+    /// 并且要在读数面单独记一笔（`unread`）：`ticks` 照涨、信号照零的那种瘦身版
+    /// 读数，正是这一族要拆掉的那一层。
+    ///
+    /// 断言落在读数上：审计与告警通道都关掉之后，这一轮本来什么也不会写，折叠读那
+    /// 一版照常往下走、`unread` 停在 0，这条测试就红。
+    #[tokio::test]
+    async fn a_round_that_cannot_read_the_graph_judges_nothing_and_says_so() {
+        let orch = Arc::new(FilingOrchestrator::holding(vec![intent_row(
+            TaskStatus::Failed,
+            true,
+        )]));
+        orch.forget_the_graph();
+        let orch: Arc<dyn OrchestratorControl> = orch;
+        let mut config = SignalWatcherConfig::default();
+        config.self_audit_interval_secs = 0;
+        config.alert_channel_enabled = false;
+        let readings = SignalWatcherReadings::new();
+        readings.mark_running();
+        let mut parents_settled = false;
+
+        tick(
+            &orch,
+            &config,
+            None,
+            None,
+            &readings,
+            false,
+            &mut parents_settled,
+        )
+        .await;
+
+        assert_eq!(
+            orch.get_all_tasks().await.len(),
+            1,
+            "读不到图的一轮不该写出任何东西"
+        );
+        assert!(
+            !parents_settled,
+            "没读到图就没法说「这一趟已经补完」，下一拍要接着问"
+        );
+
+        use cog_core::Observable;
+        let metrics = readings.collect_metrics("").await.unwrap();
+        let value = |name: &str| {
+            metrics
+                .iter()
+                .find(|m| m.name == name)
+                .map(|m| m.value)
+                .unwrap_or(-1.0)
+        };
+        assert_eq!(
+            value(crate::signal_readings::SIGNAL_TICKS_METRIC),
+            1.0,
+            "这一轮发生过，节拍要数上"
+        );
+        assert_eq!(
+            value(crate::signal_readings::SIGNAL_UNREAD_METRIC),
+            1.0,
+            "读不到图的那一轮要单独记一笔，否则它与安静的一轮读数一样"
+        );
+        for outcome in crate::signal_readings::SIGNAL_OUTCOMES {
+            let counted = metrics
+                .iter()
+                .filter(|m| m.name == crate::signal_readings::SIGNAL_OUTCOMES_METRIC)
+                .filter(|m| {
+                    m.labels
+                        .get(crate::signal_readings::OUTCOME_LABEL)
+                        .map(String::as_str)
+                        == Some(*outcome)
+                })
+                .map(|m| m.value)
+                .next()
+                .unwrap_or(-1.0);
+            assert_eq!(counted, 0.0, "{outcome} 在没读到图的一轮里不该动");
+        }
+    }
+
+    /// 补写判据的那一趟，行本身读不出来时不是「这行不在了」。
+    ///
+    /// 读不出来就把这一行留到下一拍，`remaining` 照实加一：一读失败就当作行没了，
+    /// 等于让这一趟宣布自己已经补完，而下一拍也永远不会再来问它。
+    #[tokio::test]
+    async fn a_signal_row_whose_read_fails_is_left_for_the_next_tick() {
+        let mut row = Task::new(
+            "self-signal-unreadable".to_string(),
+            TaskType::Custom(SIGNAL_TASK_TYPE.into()),
+            serde_json::json!({
+                "goal": "g",
+                "signal": {"kind": "persisted_alert", "rule": "PoolDown"},
+            }),
+        );
+        row.status = TaskStatus::Pending;
+        let orch = Arc::new(FilingOrchestrator::holding(vec![row.clone()]));
+        orch.fail_read_of(&row.id);
+        let orch: Arc<dyn OrchestratorControl> = orch;
+        let mut settled = SettledSignals::default();
+
+        fill_signal_criteria(&orch, std::slice::from_ref(&row), &mut settled).await;
+
+        assert_eq!(settled.criteria, 0, "{settled:?}");
+        assert_eq!(settled.failed, 0, "读不到不是「写失败」：{settled:?}");
+        assert_eq!(
+            settled.remaining, 1,
+            "读不到的行要留到下一拍：{settled:?}"
+        );
+        let after = orch.get_all_tasks().await;
+        assert!(
+            after[0].acceptance.is_empty(),
+            "读不到的一行什么都没写，不该凭空长出一条判据"
+        );
+    }
+
+    /// 回流行同理：读不出来不是「这行不在了」，留到下一拍。
+    #[tokio::test]
+    async fn a_rework_row_whose_read_fails_is_left_for_the_next_tick() {
+        let mut row = Task::new(
+            "rework-unreadable".to_string(),
+            TaskType::Custom(crate::change_rework::REWORK_TASK_KIND.into()),
+            serde_json::json!({
+                "rejection_cause": "tests_failed",
+                "named_files": ["crates/x/src/lib.rs"],
+            }),
+        );
+        row.status = TaskStatus::Pending;
+        let orch = Arc::new(FilingOrchestrator::holding(vec![row.clone()]));
+        orch.fail_read_of(&row.id);
+        let orch: Arc<dyn OrchestratorControl> = orch;
+        let mut settled = SettledSignals::default();
+
+        fill_rework_criteria(&orch, std::slice::from_ref(&row), &mut settled).await;
+
+        assert_eq!(settled.rework_criteria, 0, "{settled:?}");
+        assert_eq!(
+            settled.remaining, 1,
+            "读不到的行要留到下一拍：{settled:?}"
+        );
+        let after = orch.get_all_tasks().await;
+        assert!(
+            after[0].acceptance.is_empty(),
+            "读不到的一行什么都没写"
+        );
+    }
+
+    /// 「先读后判」那一问答不上来时，不能当作「库里没有这一行」。
+    ///
+    /// 读的结果决定这一投是 Tracked 还是 Submit；读失败被读成 None，就会照着同一
+    /// 个固定 id 再投一次，而真实 store 对重复 id 是直接报错的——此后每拍都投、
+    /// 每拍都报错。所以它按一次失败的上报处理（下一拍重试），不重投。
+    #[tokio::test]
+    async fn an_intent_whose_row_cannot_be_read_is_reported_failed_not_resubmitted() {
+        let id = "self-signal-backlog".to_string();
+        let mut row = Task::new(
+            id.clone(),
+            TaskType::Custom(SIGNAL_TASK_TYPE.into()),
+            serde_json::json!({}),
+        );
+        row.status = TaskStatus::Running;
+        let orch = Arc::new(FilingOrchestrator::holding(vec![row]));
+        orch.fail_read_of(&id);
+        let orch: Arc<dyn OrchestratorControl> = orch;
+
+        let outcome = submit_intent(
+            &orch,
+            id.clone(),
+            SIGNAL_TASK_TYPE,
+            "goal".to_string(),
+            serde_json::json!({"kind": "queue_backlog"}),
+            true,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, IntentOutcome::Failed(_)),
+            "读不到在手的行时这一投要报失败、下一拍重试：{outcome:?}"
+        );
+        assert_eq!(
+            orch.get_all_tasks().await.len(),
+            1,
+            "读不到在手的行时不该再投一次（真实 store 会按重复 id 报错）"
+        );
     }
 
     /// 周期性自审不是「不再成立」那一族：它每一期都会再提交一次，所以

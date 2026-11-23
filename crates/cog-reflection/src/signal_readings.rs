@@ -23,7 +23,7 @@
 //! throttled by its own cooldown, is blind in exactly the way a stopped watcher
 //! is blind.
 //!
-//! Six series, and the division between them is deliberate:
+//! Seven series, and the division between them is deliberate:
 //!
 //! - `cogneva_signal_watcher_running` -- 1 on the process that armed the
 //!   watcher loop, 0 on every other. Published by every process, because the
@@ -45,6 +45,13 @@
 //!   spent not watching. A pause left to be read off a denominator that stopped
 //!   moving would not be distinguishable from a loop that died, and the two want
 //!   opposite responses.
+//! - `cogneva_signal_watcher_unread_total` -- rounds that could not read the
+//!   task graph, so they judged nothing at all. Six of these seven reasons for
+//!   silence are a watcher that looked; this one is a watcher that did not, and
+//!   the graph is read once per round and drives every signal, so a failed read
+//!   would otherwise show up as a perfectly quiet system. `ticks - held -
+//!   unread` is the rounds that actually looked, and a reader that cannot take
+//!   that subtraction is being told a quiet number by a blind watcher.
 //! - `cogneva_signal_watcher_signals_total{outcome}` -- one increment per signal
 //!   the watcher found, by what it did with it.
 //! - `cogneva_signal_watcher_guard_entries` -- keys the report-cooldown store
@@ -90,6 +97,9 @@ pub const SIGNAL_TICKS_METRIC: &str = "cogneva_signal_watcher_ticks_total";
 
 /// Rounds that stood down on the LLM pool gate instead of watching.
 pub const SIGNAL_HELD_METRIC: &str = "cogneva_signal_watcher_held_total";
+
+/// Rounds whose task-graph read failed, so the round judged no signal at all.
+pub const SIGNAL_UNREAD_METRIC: &str = "cogneva_signal_watcher_unread_total";
 
 /// Signals the watcher found, by what it did with each one.
 pub const SIGNAL_OUTCOMES_METRIC: &str = "cogneva_signal_watcher_signals_total";
@@ -193,6 +203,7 @@ impl SignalOutcome {
 pub struct SignalWatcherReadings {
     running: AtomicBool,
     held: AtomicU64,
+    unread: AtomicU64,
     ticks: AtomicU64,
     signals: [AtomicU64; SIGNAL_OUTCOMES.len()],
     guard_entries: AtomicU64,
@@ -210,6 +221,7 @@ impl SignalWatcherReadings {
         Self {
             running: AtomicBool::new(false),
             held: AtomicU64::new(0),
+            unread: AtomicU64::new(0),
             ticks: AtomicU64::new(0),
             signals: std::array::from_fn(|_| AtomicU64::new(0)),
             guard_entries: AtomicU64::new(0),
@@ -246,6 +258,18 @@ impl SignalWatcherReadings {
     /// question the two want answered together.
     pub fn held_round(&self) {
         self.held.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One round whose task-graph read failed, so it judged nothing.
+    ///
+    /// The graph is read once per round and every signal is derived from that
+    /// one read, so a failed read turns the whole round silent -- which is the
+    /// same shape as a system with nothing wrong. It counts here, at the tick
+    /// count's cadence, for the reason `held` does: without it the denominator
+    /// keeps growing while nothing is judged, and that is what a quiet system
+    /// looks like too.
+    pub fn unread_round(&self) {
+        self.unread.fetch_add(1, Ordering::Relaxed);
     }
 
     /// One signal and what became of it.
@@ -307,6 +331,15 @@ impl Observable for SignalWatcherReadings {
         out.push(RawMetric::new(
             SIGNAL_HELD_METRIC,
             self.held.load(Ordering::Relaxed) as f64,
+        ));
+        // Same reasoning as the held count: zero rounds that could not read the
+        // graph is a true statement about a watcher that has run and read. A
+        // series that appeared only after the first failed read would leave
+        // "never failed to read" and "never published the question" the same
+        // absence.
+        out.push(RawMetric::new(
+            SIGNAL_UNREAD_METRIC,
+            self.unread.load(Ordering::Relaxed) as f64,
         ));
         for outcome in SIGNAL_OUTCOMES {
             out.push(
@@ -384,6 +417,7 @@ mod tests {
         );
         assert!(values(&readings, SIGNAL_TICKS_METRIC).await.is_empty());
         assert!(values(&readings, SIGNAL_HELD_METRIC).await.is_empty());
+        assert!(values(&readings, SIGNAL_UNREAD_METRIC).await.is_empty());
         assert!(values(&readings, SIGNAL_OUTCOMES_METRIC).await.is_empty());
     }
 
@@ -412,6 +446,40 @@ mod tests {
             assert_eq!(
                 value, 0.0,
                 "{label} moved on a round that looked at nothing"
+            );
+        }
+    }
+
+    /// A round that could not read the graph is not a quiet round. It ticks and
+    /// counts as unread, and it must not count as a signal: the whole point is
+    /// that the round judged nothing, so `ticks - held - unread` is the rounds
+    /// that looked, and a watcher whose graph read is failing cannot be read as
+    /// a system with nothing wrong.
+    #[tokio::test]
+    async fn a_round_that_could_not_read_the_graph_ticks_and_counts_as_unread() {
+        let readings = SignalWatcherReadings::new();
+        readings.mark_running();
+        // Published from the start, like the stood-down count: zero rounds that
+        // could not read is a true statement about a running watcher.
+        assert_eq!(
+            values(&readings, SIGNAL_UNREAD_METRIC).await,
+            vec![(None, 0.0)]
+        );
+
+        readings.tick();
+        readings.unread_round();
+        readings.tick();
+        // A round that read the graph: it ticks and adds nothing to the unread
+        // count.
+        readings.tick();
+
+        assert_eq!(values(&readings, SIGNAL_TICKS_METRIC).await[0].1, 3.0);
+        assert_eq!(values(&readings, SIGNAL_UNREAD_METRIC).await[0].1, 1.0);
+        assert_eq!(values(&readings, SIGNAL_HELD_METRIC).await[0].1, 0.0);
+        for (label, value) in outcome_values(&readings).await {
+            assert_eq!(
+                value, 0.0,
+                "{label} moved on a round that could not read the graph"
             );
         }
     }

@@ -32,6 +32,7 @@ const REBALANCER: &str = "crates/cog-supervisor/src/task_rebalancer.rs";
 const DAG_EXECUTOR: &str = "crates/cog-orchestrator/src/dag_executor/orchestrator.rs";
 const DAG_CONSUMER: &str = "crates/cog-orchestrator/src/dag_executor/mod.rs";
 const ACTION_PLANNER: &str = "crates/cog-orchestrator/src/action_planner/action_plan_orchestrator.rs";
+const SIGNAL_WATCHER: &str = "crates/cog-reflection/src/signal_watcher.rs";
 
 /// 折叠过的那几条读。某一段正文里出现它们，就是那一面在替没读到的图作证。
 const FOLDED: &[&str] = &[
@@ -297,6 +298,30 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "held_status(",
         "判退那一行被顶掉时，日志把「读不到」与「没有这一行」印成同一个值",
     ),
+    (
+        SIGNAL_WATCHER,
+        "async fn tick",
+        "get_all_tasks_checked",
+        "读不到图的一轮被读成一个没事的系统：没有失败、没有积压、没有待补的行",
+    ),
+    (
+        SIGNAL_WATCHER,
+        "async fn fill_signal_criteria",
+        "get_task_checked",
+        "读不到那一行被读成「这行不在了」，一条候选从回填里悄悄消失",
+    ),
+    (
+        SIGNAL_WATCHER,
+        "async fn fill_rework_criteria",
+        "get_task_checked",
+        "读不到那一行被读成「这行不在了」，一条回流行永远补不上判据",
+    ),
+    (
+        SIGNAL_WATCHER,
+        "async fn submit_intent",
+        "get_task_checked",
+        "读不到在手的行被读成「库里没有」，同一 id 每拍重投一次、每拍报重复",
+    ),
 ];
 
 #[test]
@@ -316,6 +341,7 @@ fn every_surface_that_draws_the_graph_keeps_the_failure() {
         DAG_EXECUTOR,
         DAG_CONSUMER,
         ACTION_PLANNER,
+        SIGNAL_WATCHER,
     ] {
         productions.insert(file, production_text(&read_repo(file)));
     }
