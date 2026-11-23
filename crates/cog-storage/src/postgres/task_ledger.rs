@@ -630,15 +630,12 @@ pub(crate) async fn append_transition(
     .map_err(|e| SFError::Database(e.to_string()))?;
 
     // 同一条连接、同一个事务里再落一条事件：转移是事实，表是它的第一份读法，
-    // 流是正本。幂等键取「任务 + 序号」——重放写不出第二条。
-    let event_id = format!("{}{:0>20}", "T", seq)
-        .chars()
-        .rev()
-        .take(26)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>();
+    // 流是正本。主键与幂等键都取「任务 + 序号」——重放写不出第二条。
+    //
+    // 只拿序号做主键是不够的：**每个任务的第一次转移序号都是 1**，第二条任务
+    // 落下时主键就撞了（2026-11-23 CI 实测：三条真库用例都死在
+    // `duplicate key value violates unique constraint "cogneva_event_pkey"`）。
+    let event_id = transition_event_id(move_.task_id, seq);
     let attributes = serde_json::json!({
         "from": move_.from.map(|s| s.as_str()),
         "to": move_.to.as_str(),
@@ -666,6 +663,18 @@ pub(crate) async fn append_transition(
     .map_err(|e| SFError::Database(format!("append the task_transition event: {e}")))?;
 
     Ok(seq)
+}
+
+/// 一条转移事件的 id：由「任务身份 + 序号」哈希出 26 位，不足补 `0`。
+///
+/// 与别的写入器同一条派生法：由身份算出，重放同一个转移得到同一个主键。
+/// **要用哈希而不是直接截断**：任务 id 很长时，直接截断会把序号截掉，同一个任务的
+/// 第二次转移就会与第一次撞主键。
+fn transition_event_id(task_id: &str, seq: i64) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("task_transition:{task_id}:{seq}").as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02X}")).collect();
+    hex.chars().take(26).collect()
 }
 
 /// The state the last transition left the task in, if the task has one.

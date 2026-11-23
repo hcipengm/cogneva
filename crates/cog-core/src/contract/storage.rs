@@ -1583,7 +1583,6 @@ pub trait RawLogIndexStore: Send + Sync {
 
 #[cfg(test)]
 mod streaming_write_tests {
-    use super::*;
 
     /// 一个只实现了整段写的后端：它没有流式入口，于是第一次开写就必须**如实报错**。
     ///
