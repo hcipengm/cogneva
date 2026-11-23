@@ -1,4 +1,4 @@
-//! principle: feedback_a_reading_folded_into_an_empty_value_answers_for_a_read_it_never_made
+//! principle: feedback_absent_reading_fix_must_walk_to_its_input
 //! Gate: 每个按任务图作答的面都走带报错的那条读，读失败留成错误而不是空答案。
 //!
 //! 这一族病灶同一个形状：处理函数的读口是折叠过的那条（`get_all_tasks()` 之类，
