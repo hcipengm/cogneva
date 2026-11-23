@@ -294,9 +294,15 @@ def open_round(spec: str | None, allow_open: bool = False, code_rev_override: st
     import os
     import uuid
     source = todo_source.normalize(source)
-    # 批次是**这一轮要改的那一批**：`touches: unknown` 的行明确本轮不排，钉进批次就等于
-    # 用一个自己写过「不排」的词把它排进来——那一条后来永远关不掉这一轮。
-    batch = todo_source.partition(source)[0] if source.startswith("md:") else []
+    # 批次用 `partition`，不用 `load`：`touches: unknown` 的行明确本轮不排，钉进批次
+    # 就等于用一个自己写过「不排」的词把它排进来——那一条后来永远关不掉这一轮。它与
+    # 两道编译门用的是同一个函数（`partition` 的 docstring），批次在三个地方是同一个数。
+    if source.startswith("md:"):
+        batch, _without, deferred = todo_source.partition(source)
+    else:
+        batch, deferred = [], []
+    if deferred:
+        print(f"round: 本轮不排（`touches: unknown`）{len(deferred)} 条：{', '.join(deferred)}")
     if batch:
         batch_plan_holds(batch)
         print(f"round: 本批 {len(batch)} 条（同一批编辑，不挑子集）：")
@@ -445,14 +451,24 @@ def status() -> int:
     if current is None:
         print("round: 没有开着的一轮。动手之前先 `round.py open`。")
         return 1
+    return status_report(current)
+
+
+def status_report(current: tuple[str, str, str, list[str], str]) -> int:
     rev = current[1]
     left = remaining()
     # 每一条缺哪一格就说哪一格：三格是本轮判「做没做完」的**唯一**判据（触点只提示
     # 该改哪些文件）。只印一个 id 的话，读的人还得自己去台账里找缺的是哪一格。
     cells: dict[str, list[str]] = {}
+    known: set[str] | None = None
+    spec = todo_source.default_spec()
     try:
-        items = {i.id: i for i in todo_source.load(todo_source.default_spec())}
+        items = {i.id: i for i in todo_source.load(spec)}
         cells = {i: items[i].missing_cells() for i in left if i in items}
+        # 「不在未完成那一侧」有两个意思：这一条做完了（行还在台账里，落在终态那一侧），
+        # 或者它被人从台账里删了。判它们的是同一本台账的 id 全集；读不到就不判，也不猜。
+        # 不查这一问的话，做完的条目会从批次里消失、读数写「未完成」，于是**每一轮都关不掉**。
+        known = todo_source.all_ids(spec)
     except todo_source.Unreadable as e:
         print(f"round: 台账读不到（{e}）；下面只列 id")
     book = "事件流" if round_book() == "event" else f"git {ROUND_REF}"
@@ -467,9 +483,17 @@ def status() -> int:
             print(f"  未完成 {i}  {gap}")
             continue
         miss = cells.get(i)
+        if miss is None and known is not None and i in known:
+            # 在台账里、但不在「未完成」那一侧：它已经落在终态那一侧（五格行的
+            # `已落`＋空差距，或三格行的三格齐＋`已落`）。这一轮钉的清单来自开工那一刻，
+            # 行做完就从那一侧消失——消失是收尾，不是丢件。
+            terminal += 1
+            print(f"  已落 {i}")
+            continue
         if miss is None:
-            print(f"  未完成 {i}")
-        elif not miss:
+            print(f"  未完成 {i}（未完成那一侧没有它，台账里也没有这一行）")
+            continue
+        if not miss:
             terminal += 1
             print(f"  三格齐 {i}")
         else:
@@ -620,6 +644,24 @@ def next_step(tree: pathlib.Path) -> str:
     return "推（先跑 `deploy/scripts/check-before-push.sh`；绿了才推）"
 
 
+def stop_gate() -> int:
+    """收工钩子要的那一问：**现在能不能停**。
+
+    `status` 的往返码答的是「这一批做完了没有」，而「压根没有开着的一轮」与
+    「开着的一轮还有缺口」都退 1——按裸往返码分支的读者把这两件事读成了一件：
+    收工钩子于是把「没有轮」读成「这一轮没关」，关完一轮之后照样退 2 拦人
+    （2026-11-23 实测：`close` 成功，钩子下一行印的就是「没有开着的一轮」）。
+    这一问只答三态，往返码是它自己的协议，不由人挑：
+      0 = 可以停（没有开着的一轮，或这一轮已终态）；
+      2 = 不许停（开着的一轮还有缺口，缺口照 `status` 原样打印）；
+      3 = 判不了（书读不出来，由 `main` 统一退）——读不出来不是「可以停」。
+    """
+    current = current_round()
+    if current is None:
+        return 0
+    return 0 if status_report(current) == 0 else 2
+
+
 def close() -> int:
     current = current_round()
     if current is None:
@@ -758,7 +800,8 @@ def planned() -> int:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "action", choices=["open", "status", "close", "rebound", "plan", "planned"]
+        "action",
+        choices=["open", "status", "stop-gate", "close", "rebound", "plan", "planned"],
     )
     parser.add_argument("--source", default=None)
     parser.add_argument("--file", default=None)
@@ -781,6 +824,8 @@ def main(argv: list[str]) -> int:
             return planned()
         if args.action == "status":
             return status()
+        if args.action == "stop-gate":
+            return stop_gate()
         return close()
     except todo_source.Unreadable as e:
         # 读不到不是「没有」：退 3，调用方分得开这两种情况。

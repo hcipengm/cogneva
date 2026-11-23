@@ -2719,8 +2719,8 @@ pub(crate) const GLOBAL_QUOTA_TARGET: &str = "platform";
 /// 三处各写一份的话，改了一处另两处就开始说谎。
 fn scope_enforcement(scope: cog_core::QuotaScope) -> Option<&'static str> {
     match scope {
-        // 代理路径按「调用方声明的属主，否则是任务提交人」判，与账本折叠花销
-        // 用的是同一条解析。
+        // 代理路径按「调用方声明的属主，否则是这一发所在那次尝试的工号，再否则
+        // 是任务提交人」判，与账本折叠花销用的是同一条解析。
         cog_core::QuotaScope::User => Some("the LLM proxy path judges the call's person"),
         // 代理路径按任务行上的 `workspace_id` 判：这一级的标识只有任务图知道。
         cog_core::QuotaScope::Workspace => {

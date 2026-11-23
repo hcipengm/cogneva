@@ -2175,7 +2175,11 @@ pub async fn run_chat_turn(
                 text: content.clone(),
                 parent: String::new(),
             };
-            let actor = if owner.is_empty() { "anonymous" } else { &owner };
+            let actor = if owner.is_empty() {
+                "anonymous"
+            } else {
+                &owner
+            };
             if let Err(e) = events.record(&row, actor).await {
                 // 写不进去不当成「这一轮不跑」：意图还在这一轮里，丢的是一条可判的行。
                 // 但要在读数面上说出来——静默丢掉的意图与「没人说过」同形。

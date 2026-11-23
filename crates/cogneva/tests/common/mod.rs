@@ -16,6 +16,6 @@ pub mod rules;
 pub mod rust_production;
 pub mod rust_text;
 pub mod service_topology;
+pub mod supervisor;
 pub mod temp_tree;
 pub mod yaml;
-pub mod supervisor;

@@ -1214,7 +1214,7 @@ export interface AgentSummary {
   person_id?: string | null;
 }
 
-/** 名册按人收好后的一行：一个人一行，当前戴着的帽子挂在 `agent_ids` 里。 */
+/** 名册按人收好后的一行：一个人一行，他此刻占着的地址挂在 `agent_ids` 里。 */
 export interface PersonSummary {
   person_id: string | null;
   /** 人那一行是「工号 姓名」；没派人的座位那组是「座位，尚未分配给人」。 */
@@ -1223,9 +1223,12 @@ export interface PersonSummary {
   live: boolean;
   retired: boolean;
   roles: string[];
-  /** 这个人的帽子，也就是可寻址的 agent id。别丢——丢了这个人在对话页就点不到。 */
+  /**
+   * 这个人此刻占着的地址（可寻址的 agent id）。别丢——丢了这个人在对话页就
+   * 点不到。数目就是这一列的长度，服务端不再另发一个数：两个数各数一次，迟早
+   * 会对不上。
+   */
   agent_ids: string[];
-  caps: number;
 }
 
 export interface AgentRosterPage {

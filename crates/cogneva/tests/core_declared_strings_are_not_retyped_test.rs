@@ -364,7 +364,6 @@ fn every_shared_string_is_spelled_in_the_place_it_is_declared() {
 /// 改其中一个名字不需要动另一个，而两次「成功」的改动加在一起，就是同一个文件
 /// 在部署里叫两个名字。
 const SAME_WORD_DIFFERENT_THING: &[(&str, &str)] = &[
-
     (
         "cogneva",
         "二进制名、默认命名空间、主容器名、主 Deployment 名与工作负载名是五个不同的\

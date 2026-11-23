@@ -132,10 +132,14 @@ mod a_label_name_is_the_same_wherever_it_is_declared_test;
 mod a_logout_that_could_not_end_the_session_does_not_report_one_test;
 #[path = "a_memory_ingest_that_could_not_store_its_entries_does_not_report_them_test.rs"]
 mod a_memory_ingest_that_could_not_store_its_entries_does_not_report_them_test;
+#[path = "a_message_reaches_any_roster_row_whatever_its_role_test.rs"]
+mod a_message_reaches_any_roster_row_whatever_its_role_test;
 #[path = "a_missing_field_is_refused_or_fallen_back_by_what_the_field_reads_test.rs"]
 mod a_missing_field_is_refused_or_fallen_back_by_what_the_field_reads_test;
 #[path = "a_node_capacity_probe_is_written_once_test.rs"]
 mod a_node_capacity_probe_is_written_once_test;
+#[path = "a_person_keeps_one_id_whatever_their_post_test.rs"]
+mod a_person_keeps_one_id_whatever_their_post_test;
 #[path = "a_pg_integration_test_owns_its_schema_test.rs"]
 mod a_pg_integration_test_owns_its_schema_test;
 #[path = "a_plan_the_store_refused_is_not_reported_as_created_test.rs"]
@@ -646,6 +650,8 @@ mod the_production_cut_is_defined_once_test;
 mod the_quota_cells_are_written_by_a_projection_test;
 #[path = "the_repo_root_is_computed_in_one_place_test.rs"]
 mod the_repo_root_is_computed_in_one_place_test;
+#[path = "the_roster_reads_people_not_roles_test.rs"]
+mod the_roster_reads_people_not_roles_test;
 #[path = "the_token_counters_are_a_projection_of_the_ledger_test.rs"]
 mod the_token_counters_are_a_projection_of_the_ledger_test;
 #[path = "todo_panel_shows_one_list_test.rs"]

@@ -1261,21 +1261,39 @@ fn delivered_revision<'a>(
     deliveries: &'a HashMap<String, String>,
     carried: &HashMap<ChangeIdentity, Vec<String>>,
 ) -> Option<&'a str> {
+    delivered_under_its_own_id(identity, deliveries)
+        .into_iter()
+        .chain(delivered_under_a_batch(identity, deliveries, carried))
+        .max_by(|a, b| a.0.cmp(b.0))
+        .map(|(_, rev)| rev)
+}
+
+/// The delivery a commit names under this change's own id, if one does.
+fn delivered_under_its_own_id<'a>(
+    identity: &ChangeIdentity,
+    deliveries: &'a HashMap<String, String>,
+) -> Option<(&'a str, &'a str)> {
     let prefix = handover_task_prefix(identity);
-    let by_own_id = deliveries
+    deliveries
         .iter()
         .filter(|(id, _)| id.starts_with(&prefix))
-        .map(|(id, rev)| (id.as_str(), rev.as_str()));
-    let by_the_batch = carried
+        .map(|(id, rev)| (id.as_str(), rev.as_str()))
+        .max_by(|a, b| a.0.cmp(b.0))
+}
+
+/// The delivery a commit names under an id a batch carried this change in.
+fn delivered_under_a_batch<'a>(
+    identity: &ChangeIdentity,
+    deliveries: &'a HashMap<String, String>,
+    carried: &HashMap<ChangeIdentity, Vec<String>>,
+) -> Option<(&'a str, &'a str)> {
+    carried
         .get(identity)
         .into_iter()
         .flatten()
         .filter_map(|id| deliveries.get_key_value(id))
-        .map(|(id, rev)| (id.as_str(), rev.as_str()));
-    by_own_id
-        .chain(by_the_batch)
+        .map(|(id, rev)| (id.as_str(), rev.as_str()))
         .max_by(|a, b| a.0.cmp(b.0))
-        .map(|(_, rev)| rev)
 }
 
 /// Which hand-over carried each change, for the changes carried by a batch.
@@ -1302,6 +1320,41 @@ fn carried_handovers(tasks: &[Task]) -> HashMap<ChangeIdentity, Vec<String>> {
         }
     }
     carried
+}
+
+/// The batch map the delivery stamp needs, with "could not read it" kept
+/// apart from "there is nothing to carry".
+///
+/// The stamp asks two different questions of this map: whether a change was
+/// delivered under its own id, and whether a batch delivered it. The second
+/// question is only answerable when the graph was read. Folded, a failed read
+/// answers "no batch carried it", which is the same answer a change nothing
+/// dispatched would get -- so every row a batch carried keeps reading as never
+/// delivered, stays owed, and is handed over a second time. `None` is that
+/// unread graph; the stamp then answers the question it can and says how many
+/// rows it could not answer for.
+///
+/// A deployment with no goal path is `Some` of the empty map and not `None`:
+/// with nothing to hand anything over, no batch exists, and that is a reading
+/// rather than a failure to read.
+async fn carried_batches(
+    orchestrator: Option<&Arc<dyn OrchestratorControl>>,
+) -> Option<HashMap<ChangeIdentity, Vec<String>>> {
+    let Some(orchestrator) = orchestrator else {
+        return Some(HashMap::new());
+    };
+    match orchestrator.get_all_tasks_checked().await {
+        Ok(tasks) => Some(carried_handovers(&tasks)),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the task graph could not be read, so which batch carried a \
+                 change is unmeasured this pass; deliveries under a change's own id are still \
+                 stamped"
+            );
+            None
+        }
+    }
 }
 
 /// The name a run's deliverable carries.
@@ -2101,10 +2154,23 @@ async fn fold_handover(
     task_id: &str,
     identity: &ChangeIdentity,
 ) -> bool {
-    match orchestrator.get_task(task_id).await {
-        Some(task) if task.status == TaskStatus::Pending && task.started_at.is_none() => {}
-        Some(_) => return false,
-        None => return false,
+    match orchestrator.get_task_checked(task_id).await {
+        Ok(Some(task)) if task.status == TaskStatus::Pending && task.started_at.is_none() => {}
+        Ok(_) => return false,
+        Err(e) => {
+            // Not "gone": a read that failed cannot say the row is untouched,
+            // and taking the row back from a task that may have started is the
+            // one thing this check exists to prevent. The row is left alone
+            // this pass and the next pass asks again.
+            warn!(
+                change = %identity,
+                task = task_id,
+                error = %e,
+                "change ledger: a hand-over could not be read, so it is left holding its row \
+                 this pass"
+            );
+            return false;
+        }
     }
     let reason = format!(
         "{FOLDED_HANDOVER_PREFIX}: 这条交接从没开始过、只占着 {identity} 一行，\
@@ -2501,12 +2567,28 @@ impl SettledProjects {
 /// read on every beat would be a cost paid forever for a defect that can no
 /// longer recur. The stop is the settle's own `remaining` count rather than a
 /// fixed number of passes, because how many beats the back-fill takes depends on
-/// how many rows the graph holds. A graph read that comes back empty is
-/// indistinguishable from a graph with nothing in it, and both mean there is
-/// nothing to settle.
-async fn settle_dispatch_parents(orchestrator: &Arc<dyn OrchestratorControl>) -> SettledProjects {
+/// how many rows the graph holds.
+///
+/// `None` is a beat that could not read the graph: it settled nothing, and it
+/// is not a beat that found nothing to settle. The caller leaves its
+/// `parents_settled` flag down on it, because a folded read here would come
+/// back with an empty graph, report `remaining == 0`, and stop the back-fill
+/// for the life of the process on the strength of a read that never happened.
+async fn settle_dispatch_parents(
+    orchestrator: &Arc<dyn OrchestratorControl>,
+) -> Option<SettledProjects> {
     let mut settled = SettledProjects::default();
-    let tasks = orchestrator.get_all_tasks().await;
+    let tasks = match orchestrator.get_all_tasks_checked().await {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the graph could not be read, so this beat settles nothing and \
+                 asks again on the next one"
+            );
+            return None;
+        }
+    };
     let mut projects: HashMap<&str, Vec<&Task>> = HashMap::new();
     for task in &tasks {
         if let Some(project) = task
@@ -2565,7 +2647,7 @@ async fn settle_dispatch_parents(orchestrator: &Arc<dyn OrchestratorControl>) ->
         }
     }
     fill_dispatch_criteria(orchestrator, &tasks, &mut settled).await;
-    settled
+    Some(settled)
 }
 
 /// Give every dispatched change row the criterion the hand-over now writes.
@@ -2601,8 +2683,23 @@ async fn fill_dispatch_criteria(
         // running this moment is left to the next pass rather than written
         // over. `replace_task` writes the whole row, so there is no narrower
         // write to fall back on.
-        let Some(mut filled) = orchestrator.get_task(&row.id).await else {
-            continue;
+        let mut filled = match orchestrator.get_task_checked(&row.id).await {
+            Ok(Some(filled)) => filled,
+            // The row is gone: there is nothing left to fill.
+            Ok(None) => continue,
+            Err(e) => {
+                // Not "gone": a read that failed cannot say that, and dropping
+                // the row here would leave it out of shape for good -- while
+                // `remaining` would report the back-fill finished.
+                settled.remaining += 1;
+                warn!(
+                    task = %row.id,
+                    error = %e,
+                    "change ledger: a dispatched change could not be read, so it keeps its \
+                     empty criterion this beat"
+                );
+                continue;
+            }
         };
         if !filled.acceptance.is_empty() {
             continue;
@@ -3042,13 +3139,13 @@ pub fn spawn_change_ledger_loop(
                         // batches' rows after the measurement, which is exactly
                         // the ordering the comment above says records the rows
                         // that did not land and misses the ones that did.
-                        // No graph is no hand-over, so no batch: the empty map
-                        // is the right answer here rather than a degraded one.
-                        let carried_by_batch = match orchestrator.as_ref() {
-                            Some(o) => carried_handovers(&o.get_all_tasks().await),
-                            None => HashMap::new(),
-                        };
-                        stamp_deliveries(&*store, deliveries, &carried_by_batch).await;
+                        // `None` from here is a graph that could not be read,
+                        // which the stamp must not hear as "no batch carried
+                        // anything": that reading keeps every batched row owed
+                        // and hands it over again. A deployment with no goal path
+                        // is the empty map -- there, no batch exists.
+                        let carried_by_batch = carried_batches(orchestrator.as_ref()).await;
+                        stamp_deliveries(&*store, deliveries, carried_by_batch.as_ref()).await;
                     }
                     measure_pass(&*store, &tree, &mut unsettled, &changed, metrics.as_ref()).await;
                     // The second face of "is it done", read after the
@@ -3079,14 +3176,18 @@ pub fn spawn_change_ledger_loop(
                     // the same pass that found it, rather than one period later.
                     if let Some(ref orchestrator) = orchestrator {
                         if !parents_settled {
-                            let settled = settle_dispatch_parents(orchestrator).await;
-                            if settled.moved_anything() {
-                                info!("change ledger: {}", settled.line());
+                            // A beat that could not read the graph settles
+                            // nothing, and `None` must not read as "nothing
+                            // left to settle": the flag stays down so the next
+                            // beat asks again. A settle that left rows to fill
+                            // asks again too; one that reached everything is
+                            // done for the life of the process.
+                            if let Some(settled) = settle_dispatch_parents(orchestrator).await {
+                                if settled.moved_anything() {
+                                    info!("change ledger: {}", settled.line());
+                                }
+                                parents_settled = settled.remaining == 0;
                             }
-                            // A settle that left rows to fill asks again on the
-                            // next beat; one that reached everything is done for
-                            // the life of the process.
-                            parents_settled = settled.remaining == 0;
                         }
                         let pool = pool.as_deref();
                         // Work with nobody's name on it shows up in the rows
@@ -5497,8 +5598,11 @@ fn dispatchable(
 async fn stamp_deliveries(
     store: &dyn ChangeLedgerStore,
     deliveries: &HashMap<String, String>,
-    carried_by_batch: &HashMap<ChangeIdentity, Vec<String>>,
-) -> usize {
+    // `None` when the task graph could not be read. A row with no delivery under
+    // its own id may then have been delivered by a batch this pass cannot name,
+    // so it is counted as unmeasured rather than left reading as never delivered.
+    carried_by_batch: Option<&HashMap<ChangeIdentity, Vec<String>>>,
+) -> Stamped {
     let outstanding_total = match store.census().await {
         Ok(census) => census
             .iter()
@@ -5510,7 +5614,7 @@ async fn stamp_deliveries(
                 error = %e,
                 "change ledger: the census could not be read, so no delivery was stamped this pass"
             );
-            return 0;
+            return Stamped::default();
         }
     };
     let rows = match store.outstanding(outstanding_total as usize).await {
@@ -5520,19 +5624,33 @@ async fn stamp_deliveries(
                 error = %e,
                 "change ledger: the owed set could not be read, so no delivery was stamped this pass"
             );
-            return 0;
+            return Stamped::default();
         }
     };
-    let mut recorded = 0usize;
+    let mut stamped = Stamped::default();
     for row in &rows {
         if row.delivered_rev.is_some() {
             continue;
         }
-        let Some(rev) = delivered_revision(&row.identity, deliveries, carried_by_batch) else {
+        let rev = match carried_by_batch {
+            Some(carried) => delivered_revision(&row.identity, deliveries, carried),
+            None => {
+                // Neither edge can be asked here but one: the batch map is the
+                // edge the graph would have named. A row with no delivery under
+                // its own id is then a row nothing can say anything about, and
+                // counting it keeps it out of the "not delivered" tally.
+                let own = delivered_under_its_own_id(&row.identity, deliveries);
+                if own.is_none() {
+                    stamped.unmeasured += 1;
+                }
+                own.map(|(_, rev)| rev)
+            }
+        };
+        let Some(rev) = rev else {
             continue;
         };
         match store.record_delivery(&row.identity, rev).await {
-            Ok(()) => recorded += 1,
+            Ok(()) => stamped.recorded += 1,
             Err(e) => warn!(
                 change = %row.identity,
                 error = %e,
@@ -5541,13 +5659,31 @@ async fn stamp_deliveries(
             ),
         }
     }
-    if recorded > 0 {
+    if stamped.recorded > 0 {
         info!(
-            recorded,
+            recorded = stamped.recorded,
             "change ledger: owed changes a commit on the line names as landed"
         );
     }
-    recorded
+    if stamped.unmeasured > 0 {
+        warn!(
+            unmeasured = stamped.unmeasured,
+            "change ledger: the task graph could not be read, so whether a batch delivered these \
+             owed changes went unmeasured this pass; a later pass that reads the batch list \
+             stamps them from the same sliding window"
+        );
+    }
+    stamped
+}
+
+/// What one pass of the delivery stamp managed to say.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct Stamped {
+    /// Deliveries a commit on the line names, written to the account.
+    recorded: usize,
+    /// Owed rows with no delivery under their own id, in a pass that could not
+    /// read the batch list: the graph may hold the hand-over that carried them.
+    unmeasured: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5619,7 +5755,23 @@ async fn dispatch_pass(
     // Read before the delivery stamp below rather than beside the sweep: the
     // stamp is the first reader that needs it, and the graph it comes from is
     // the same one the hand-over later takes.
-    let graph_tasks = orchestrator.get_all_tasks().await;
+    //
+    // A read that failed hands nothing over. Folded, it would be an empty graph:
+    // the hand-over index would hold no generation for any change, so every owed
+    // row would be filed again under generation 0 -- an id the store may still
+    // hold, which the goal path treats as a fault -- and the sweep would find
+    // nothing to close. The same answer the census and the outstanding set
+    // already give above, for the same reason.
+    let graph_tasks = match orchestrator.get_all_tasks_checked().await {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the graph could not be read, so this pass handed nothing over"
+            );
+            return None;
+        }
+    };
     // Taken off that one reading, for the same reason the index is: what a
     // batch carries is on the tasks this pass already holds.
     let carried_by_batch = carried_handovers(&graph_tasks);
@@ -5962,8 +6114,26 @@ async fn dispatch_pass(
             other => other,
         };
         let owed = match held {
-            Some(handover) => Owed::Held(handover),
+            Some(handover) => Ok(Owed::Held(handover)),
             None => owed_row(orchestrator, row, rearm_limit).await,
+        };
+        // Owed, no task known to hold it, and this pass does not hand it over:
+        // that is the row fact `held_back` states, and the warn is what says
+        // this pass's reason was a read rather than a decision. Handing it over
+        // blind is the move the generation walk exists to prevent -- under an
+        // id the store may still hold, the goal path raises every pass.
+        let owed = match owed {
+            Ok(owed) => owed,
+            Err(e) => {
+                counts.held_back += 1;
+                warn!(
+                    change = %row.identity,
+                    error = %e,
+                    "change ledger: the graph could not be read for this row, so it is left \
+                     owed rather than handed over under an id something may still hold"
+                );
+                continue;
+            }
         };
         match owed {
             Owed::Held(Handover::DeadEnvironment) => counts.dead_environment += 1,
@@ -6270,11 +6440,19 @@ async fn owed_row(
     orchestrator: &Arc<dyn OrchestratorControl>,
     row: &ChangeLedgerRow,
     rearm_limit: u32,
-) -> Owed {
+) -> SFResult<Owed> {
     let mut generation = 0u32;
     while generation <= rearm_limit {
         let id = dispatch_task_id(&row.identity, generation);
-        let Some(task) = orchestrator.get_task(&id).await else {
+        // A read that failed is not "no row holds this generation": the walk
+        // would stop here and the row would be handed over under an id the
+        // store may still hold, which the goal path treats as a fault. The
+        // caller counts the row as owed-and-not-handed-over and says why.
+        let task = match orchestrator.get_task_checked(&id).await {
+            Ok(task) => task,
+            Err(e) => return Err(e),
+        };
+        let Some(task) = task else {
             break;
         };
         match classify_handover(&task) {
@@ -6302,10 +6480,10 @@ async fn owed_row(
             {
                 generation += 1
             }
-            verdict => return Owed::Held(verdict),
+            verdict => return Ok(Owed::Held(verdict)),
         }
     }
-    Owed::NoTask { generation }
+    Ok(Owed::NoTask { generation })
 }
 
 /// One pass's own counts, as the account records them and the reading face
@@ -8524,7 +8702,9 @@ mod tests {
         );
         let control: Arc<dyn OrchestratorControl> = graph.clone();
 
-        let settled = settle_dispatch_parents(&control).await;
+        let settled = settle_dispatch_parents(&control)
+            .await
+            .expect("the graph is readable here");
 
         assert_eq!(
             settled.anchored, 1,
@@ -8561,9 +8741,13 @@ mod tests {
                 .holding_root_change("change-b", "change-ledger:crates"),
         );
         let control: Arc<dyn OrchestratorControl> = graph.clone();
-        settle_dispatch_parents(&control).await;
+        settle_dispatch_parents(&control)
+            .await
+            .expect("the graph is readable here");
 
-        let settled = settle_dispatch_parents(&control).await;
+        let settled = settle_dispatch_parents(&control)
+            .await
+            .expect("the graph is readable here");
 
         assert_eq!(
             settled,
@@ -8590,7 +8774,9 @@ mod tests {
         );
         let control: Arc<dyn OrchestratorControl> = graph.clone();
 
-        let settled = settle_dispatch_parents(&control).await;
+        let settled = settle_dispatch_parents(&control)
+            .await
+            .expect("the graph is readable here");
 
         assert_eq!(settled.criteria, 1, "{settled:?}");
         assert_eq!(settled.failed, 0, "{settled:?}");
@@ -8612,7 +8798,9 @@ mod tests {
             "a row of another kind is not this pass's to fill"
         );
         assert_eq!(
-            settle_dispatch_parents(&control).await,
+            settle_dispatch_parents(&control)
+                .await
+                .expect("the graph is readable here"),
             SettledProjects::default(),
             "a second settle finds nothing left to do"
         );
@@ -8631,11 +8819,15 @@ mod tests {
         }
         let control: Arc<dyn OrchestratorControl> = Arc::new(graph);
 
-        let settled = settle_dispatch_parents(&control).await;
+        let settled = settle_dispatch_parents(&control)
+            .await
+            .expect("the graph is readable here");
         assert_eq!(settled.criteria, SETTLE_BATCH, "{settled:?}");
         assert_eq!(settled.remaining, 3, "{settled:?}");
 
-        let settled = settle_dispatch_parents(&control).await;
+        let settled = settle_dispatch_parents(&control)
+            .await
+            .expect("the graph is readable here");
         assert_eq!(settled.criteria, 3, "{settled:?}");
         assert_eq!(settled.remaining, 0, "{settled:?}");
 
@@ -8644,6 +8836,198 @@ mod tests {
             tasks.iter().filter(|t| t.acceptance.is_empty()).count(),
             0,
             "after the second settle every change says what closes it"
+        );
+    }
+
+    /// 结算读不到图，不是「已经补完了」。
+    ///
+    /// 这一趟的进度只看 `remaining`：折叠读回一份空图，`remaining` 就是 0，
+    /// 调用方据此把 `parents_settled` 立起来，这一趟回填此后一辈子不再跑。所以
+    /// 读不到要有自己的答案（`None`），调用方见到它就不立这一格。
+    #[tokio::test]
+    async fn a_settle_that_cannot_read_the_graph_is_not_a_settle_that_finished() {
+        let graph = Arc::new(FakeGraph::default().forgetting_the_graph());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        assert!(
+            settle_dispatch_parents(&control).await.is_none(),
+            "读不到图的一拍既没补上什么、也没法说还剩多少——它不该答成「补完了」"
+        );
+    }
+
+    /// 回填普通行时读不到那一行，不是「这行不在了」：它留到下一拍。
+    ///
+    /// 当作行没了就会 `continue`，`remaining` 停在 0 —— 这一趟于是宣布自己补完了，
+    /// 而那一行的判据此后没人再写。
+    #[tokio::test]
+    async fn a_dispatched_row_that_cannot_be_read_keeps_the_back_fill_asking() {
+        let row = ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "crates/x", "fn a"),
+            ..row(ChangeState::Pending, None)
+        };
+        // 今天写下的行自带判据（by construction），这里要的是那一代之前写下的
+        // 行：判据空着，才在回填的射程里。
+        let mut orphan = dispatch_one(&row, 0);
+        orphan.acceptance.clear();
+        let graph = Arc::new(FakeGraph::default().forgetting_the_graph());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+        let mut settled = SettledProjects::default();
+
+        fill_dispatch_criteria(&control, std::slice::from_ref(&orphan), &mut settled).await;
+
+        assert_eq!(settled.criteria, 0, "{settled:?}");
+        assert_eq!(settled.failed, 0, "读不到不是写失败：{settled:?}");
+        assert_eq!(settled.remaining, 1, "读不到的行要留到下一拍：{settled:?}");
+    }
+
+    /// 下发这一趟读不到图，就一条都不下发。
+    ///
+    /// 折叠读会让交接索引空着：每一行欠账都被当成「图上没有」，于是照 generation 0
+    /// 再投一次 —— 那个 id 很可能还在库里，目标那条路对重复 id 是直接报错的。与
+    /// 上面普查、欠账集读不到时给的是同一个答案：这一趟什么也不交出去。
+    #[tokio::test]
+    async fn a_pass_that_cannot_read_the_graph_hands_nothing_over() {
+        let rows: Vec<ChangeLedgerRow> = ["fn a", "fn b"]
+            .iter()
+            .map(|literal| ChangeLedgerRow {
+                identity: ChangeIdentity::new("grep", "crates/x", *literal),
+                ..row(ChangeState::Pending, None)
+            })
+            .collect();
+        let store = FakeLedger {
+            rows: rows.clone(),
+            ..Default::default()
+        };
+        let graph = Arc::new(FakeGraph::default().forgetting_the_graph());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            graph.submitted().is_empty(),
+            "读不到图的一趟不该把欠账按 generation 0 再投一次：{:?}",
+            graph.submitted()
+        );
+        assert!(
+            store.written().is_empty(),
+            "读不到图的一趟没有可写的读数，不该写出一行"
+        );
+    }
+
+    /// 代次那一问答不上来时，欠账留在账上，不按 generation 0 投出去。
+    ///
+    /// 代次走查的每一步都是「这一代有没有被占着」。读不出来当成「没有」，走查就断在
+    /// 这里、照那一代投出去——而那个 id 很可能还在库里，目标那条路对重复 id 是直接
+    /// 报错的，此后每一趟都报。所以读不到时这一行按「欠着、这一趟没交出去」记账。
+    #[tokio::test]
+    async fn an_owed_row_whose_generation_cannot_be_read_is_left_owed() {
+        let row = ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "crates/x", "fn a"),
+            ..row(ChangeState::Pending, None)
+        };
+        let store = FakeLedger {
+            rows: vec![row.clone()],
+            ..Default::default()
+        };
+        let graph =
+            Arc::new(FakeGraph::default().with_unreadable(&dispatch_task_id(&row.identity, 0)));
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            graph.submitted().is_empty(),
+            "代次读不到时不该照那一代投出去：{:?}",
+            graph.submitted()
+        );
+        let state = store.written().pop().expect("the pass wrote its row");
+        assert_eq!(
+            state.held_back, 1,
+            "这一行是「欠着、这一趟没交出去」：{state:?}"
+        );
+        assert_eq!(state.submitted, 0, "{state:?}");
+        assert_eq!(state.failed, 0, "读不到不是投递失败：{state:?}");
+    }
+
+    /// 放回交接之前的那一读问不上来时，这一条不收回。
+    ///
+    /// 收回是照着「这条从没开始」的结论去取消一行；读不出来就不能得出这个结论，
+    /// 而 store 那边取消一条已经在跑的任务是不会抱怨的——这一读就是拦它的那道门。
+    #[tokio::test]
+    async fn a_hand_over_that_cannot_be_read_is_not_taken_back() {
+        let rows: Vec<ChangeLedgerRow> = ["fn a", "fn b", "fn c"]
+            .iter()
+            .map(|literal| ChangeLedgerRow {
+                identity: ChangeIdentity::new("grep", "crates/x", *literal),
+                ..row(ChangeState::Pending, None)
+            })
+            .collect();
+        let store = FakeLedger {
+            rows: rows.clone(),
+            ..Default::default()
+        };
+        let mut graph = FakeGraph::default();
+        for row in &rows {
+            graph = graph.holding_handover(row, TaskStatus::Pending);
+        }
+        let unreadable = dispatch_task_id(&rows[0].identity, 0);
+        let graph = Arc::new(graph.with_unreadable(&unreadable));
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        let kept = graph.held(&unreadable).expect("它还拿着那一行");
+        assert_eq!(
+            kept.status,
+            TaskStatus::Pending,
+            "读不到「从没开始」的那一条不能被收回"
+        );
+        assert!(
+            !graph.cancelled().iter().any(|(id, _)| id == &unreadable),
+            "读不到的一条不该被取消：{:?}",
+            graph.cancelled()
         );
     }
 
@@ -10563,6 +10947,10 @@ mod tests {
         /// gave. Kept apart from the row so a test can read *why* a row was
         /// closed without parsing the sentence back out of its error column.
         cancelled: std::sync::Mutex<Vec<(String, String)>>,
+        /// 测试用：读图的那几条都问不上来（模拟一个读不出来的 store）。
+        graph_unreadable: bool,
+        /// 测试用：整份行表读得出，但读这些 id 的那一问答不上来。
+        unreadable_ids: std::sync::Mutex<std::collections::HashSet<String>>,
     }
 
     impl FakeGraph {
@@ -10709,6 +11097,18 @@ mod tests {
             self
         }
 
+        /// 读图的那几条这一拍都问不上来：一个读不出来的 store 的形状。
+        fn forgetting_the_graph(mut self) -> Self {
+            self.graph_unreadable = true;
+            self
+        }
+
+        /// 整份行表照常读得出，只有这一个 id 的那一问答不上来。
+        fn with_unreadable(self, id: &str) -> Self {
+            self.unreadable_ids.lock().unwrap().insert(id.to_string());
+            self
+        }
+
         fn submitted(&self) -> Vec<String> {
             self.submitted.lock().unwrap().clone()
         }
@@ -10755,6 +11155,23 @@ mod tests {
         }
         async fn get_all_tasks(&self) -> Vec<Task> {
             self.tasks.lock().unwrap().values().cloned().collect()
+        }
+        /// 如实报错的那两条读：只有 store 读不出来时才走 `Err`，其余照内存答。
+        async fn get_all_tasks_checked(&self) -> SFResult<Vec<Task>> {
+            if self.graph_unreadable {
+                return Err(SFError::Database(
+                    "store unavailable: cannot read the task graph".into(),
+                ));
+            }
+            Ok(self.get_all_tasks().await)
+        }
+        async fn get_task_checked(&self, task_id: &str) -> SFResult<Option<Task>> {
+            if self.graph_unreadable || self.unreadable_ids.lock().unwrap().contains(task_id) {
+                return Err(SFError::Database(format!(
+                    "store unavailable: cannot read task {task_id}"
+                )));
+            }
+            Ok(self.get_task(task_id).await)
         }
         async fn push_to_dlq(&self, _task_id: &str, _error: String) -> SFResult<bool> {
             Ok(false)
@@ -13965,14 +14382,14 @@ mod tests {
         let empty: Arc<dyn OrchestratorControl> = Arc::new(FakeGraph::default());
         assert!(matches!(
             owed_row(&empty, &row, limit).await,
-            Owed::NoTask { generation: 0 }
+            Ok(Owed::NoTask { generation: 0 })
         ));
 
         let killed_once = FakeGraph::default().holding(&id(0), TaskStatus::Failed);
         let killed_once: Arc<dyn OrchestratorControl> = Arc::new(killed_once);
         assert!(matches!(
             owed_row(&killed_once, &row, limit).await,
-            Owed::NoTask { generation: 1 }
+            Ok(Owed::NoTask { generation: 1 })
         ));
 
         // The re-armed handover is in flight: the row is placed, and no third
@@ -13983,7 +14400,7 @@ mod tests {
         let in_flight: Arc<dyn OrchestratorControl> = Arc::new(in_flight);
         assert!(matches!(
             owed_row(&in_flight, &row, limit).await,
-            Owed::Held(Handover::InFlight)
+            Ok(Owed::Held(Handover::InFlight))
         ));
 
         // The work's own failure is the change's answer, and it is not re-armed:
@@ -13992,7 +14409,7 @@ mod tests {
             Arc::new(FakeGraph::default().holding_dead_work(&id(0)));
         assert!(matches!(
             owed_row(&dead_work, &row, limit).await,
-            Owed::Held(Handover::DeadWork)
+            Ok(Owed::Held(Handover::DeadWork))
         ));
 
         // A row this loop itself closed because the account had already settled
@@ -14011,7 +14428,7 @@ mod tests {
             Arc::new(FakeGraph::default().holding_closed_as_settled(&settled_version));
         assert!(matches!(
             owed_row(&settled, &reopened, limit).await,
-            Owed::NoTask { generation: 1 }
+            Ok(Owed::NoTask { generation: 1 })
         ));
 
         // The same closure in the form the sweep used before it declared itself.
@@ -14025,7 +14442,7 @@ mod tests {
             ));
         assert!(matches!(
             owed_row(&unnamed, &reopened, limit).await,
-            Owed::NoTask { generation: 1 }
+            Ok(Owed::NoTask { generation: 1 })
         ));
 
         // A cancellation for any other reason is still the row's answer.
@@ -14036,7 +14453,7 @@ mod tests {
             ));
         assert!(matches!(
             owed_row(&cancelled_by_hand, &reopened, limit).await,
-            Owed::Held(Handover::DeadWork)
+            Ok(Owed::Held(Handover::DeadWork))
         ));
 
         // Every generation the budget allows was refused by the environment, so
@@ -14048,7 +14465,7 @@ mod tests {
         let spent: Arc<dyn OrchestratorControl> = Arc::new(spent);
         assert!(matches!(
             owed_row(&spent, &row, limit).await,
-            Owed::Held(Handover::DeadEnvironment)
+            Ok(Owed::Held(Handover::DeadEnvironment))
         ));
     }
 
@@ -14208,7 +14625,7 @@ mod tests {
         );
 
         // The pass's own order: stamp, then measure.
-        stamp_deliveries(&fake, &deliveries, &HashMap::new()).await;
+        stamp_deliveries(&fake, &deliveries, Some(&HashMap::new())).await;
         let mut unsettled = HashMap::new();
         measure_pass(&fake, &tree, &mut unsettled, &[], None).await;
 
@@ -14227,6 +14644,78 @@ mod tests {
             measurements[0].measured_rev.as_deref(),
             Some(rev.as_str()),
             "the measurement is taken at the revision the log was read at"
+        );
+    }
+
+    /// 读不到批次清单时，只有批次带过的那一条说不出来——按自己 id 能盖的照盖，
+    /// 盖不了的那条记成「没量出来」，不记成「没交付」。
+    ///
+    /// 折叠读在这里的代价是那一条永远读作「从没交付」：它留在欠账集里，下一趟
+    /// 再被交出去一次，而库里其实已经有一笔跑完的活。
+    #[tokio::test]
+    async fn a_change_only_a_batch_carried_is_unmeasured_when_the_batch_list_cannot_be_read() {
+        let anchor = pending_row("file");
+        let behind = ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "file", "fn other"),
+            ..pending_row("file")
+        };
+        let batch = dispatch_task(&[anchor.clone(), behind.clone()], 0);
+        let mut deliveries = HashMap::new();
+        deliveries.insert(batch.id.clone(), "rev-1".to_string());
+        let fake = FakeLedger {
+            rows: vec![anchor.clone(), behind.clone()],
+            ..Default::default()
+        };
+        let carried = carried_handovers(std::slice::from_ref(&batch));
+
+        let stamped = stamp_deliveries(&fake, &deliveries, None).await;
+        assert_eq!(
+            stamped.unmeasured, 1,
+            "只有批次带过的那一条说不出话来：{stamped:?}"
+        );
+        assert_eq!(
+            fake.deliveries(),
+            vec![(anchor.identity.clone(), "rev-1".to_string())],
+            "自己 id 名字下的那一笔照盖，读不到批次不影响它：{:?}",
+            fake.deliveries()
+        );
+
+        // The same pass with the batch list read: the row behind the anchor is
+        // reachable through the batch, so it is stamped and nothing is left
+        // unmeasured. A test that only asserted the `None` half would stay green
+        // if the batch edge stopped working altogether.
+        //
+        // The fake records every stamp without writing back through the row, so
+        // the anchor is stamped a second time here; what this half pins is that
+        // the row behind it is reachable and that nothing went unmeasured.
+        let stamped = stamp_deliveries(&fake, &deliveries, Some(&carried)).await;
+        assert_eq!(stamped.unmeasured, 0, "{:?}", fake.deliveries());
+        assert!(stamped.recorded >= 1, "{:?}", fake.deliveries());
+        assert!(
+            fake.deliveries()
+                .contains(&(behind.identity.clone(), "rev-1".to_string())),
+            "批次带过的那一条要能被盖到：{:?}",
+            fake.deliveries()
+        );
+    }
+
+    /// 那一次读本身：读失败交 `None`，没有目标通路交 `Some(空)`。
+    ///
+    /// 两件事在折叠读里是一个答案，而这一个答案让被批次带过的每条欠账都读成
+    /// 「从没交付」。
+    #[tokio::test]
+    async fn a_graph_that_cannot_be_read_is_not_a_graph_with_no_batches() {
+        let no_goal_path = carried_batches(None).await;
+        assert_eq!(
+            no_goal_path,
+            Some(HashMap::new()),
+            "没有目标通路时确实没有批次，这是读数不是读失败"
+        );
+        let unreadable: Arc<dyn OrchestratorControl> =
+            Arc::new(FakeGraph::default().forgetting_the_graph());
+        assert!(
+            carried_batches(Some(&unreadable)).await.is_none(),
+            "读不到图不能答成「一条批次都没有」"
         );
     }
 

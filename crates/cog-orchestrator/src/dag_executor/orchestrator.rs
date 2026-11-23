@@ -97,6 +97,18 @@ pub struct DagExecutor {
     /// retires nothing and the roster keeps growing — which is the state this
     /// field exists to end, so it is wired in the same place the pool is.
     agent_manager: std::sync::RwLock<Option<Arc<dyn cog_core::AgentManager>>>,
+    /// 员工名册：座位背后坐着谁，只有名册行答得出来。
+    ///
+    /// 任务行的 `owner_unit` 写的是**工号**；来认领或交活的可能是那个人这一
+    /// 段的座位（`squad:<任务>-<座位>`），而座位名里没有工号。判「这一手是不是
+    /// 行上那位」要它，所以它和池子挂在一起：池子建的都是座位，座位背后的人
+    /// 写在名册上。没挂的时候座位形认领按旧口径判（名字要比得一模一样），
+    /// 那是这个进程读不到名册，不是判据说「不行」。
+    roster: std::sync::RwLock<Option<Arc<dyn cog_core::AgentRegistry>>>,
+    /// 测试用：读到这些 id 的那一问答不上来。它交出的正是存储坏掉时的形状，
+    /// 让「读不到」与「没有这一行」在测试里分得开；生产构建里没有这一格。
+    #[cfg(test)]
+    unreadable_tasks: std::sync::Mutex<std::collections::HashSet<String>>,
     /// 看板每一列的在制品上限。
     ///
     /// 发布侧（`DagExecutorRuntime::publish_ready_tasks`）拿它拦「进 `scheduled`」，
@@ -343,6 +355,9 @@ impl DagExecutor {
             archive_poll_interval_secs: 300,
             metrics: std::sync::RwLock::new(None),
             agent_manager: std::sync::RwLock::new(None),
+            roster: std::sync::RwLock::new(None),
+            #[cfg(test)]
+            unreadable_tasks: Default::default(),
             board_wip_limits: std::sync::RwLock::new(cog_core::BoardWipLimits::from_env().0),
         }
     }
@@ -360,6 +375,47 @@ impl DagExecutor {
             .agent_manager
             .write()
             .unwrap_or_else(|e| e.into_inner()) = Some(manager);
+    }
+
+    /// 挂上员工名册：座位背后是谁只写在那儿。
+    ///
+    /// 与 `attach_agent_manager` 同一次装配里挂：池子建的是座位，名册行是座位
+    /// 注册时写下的那一行。没挂的时候，座位形认领与结果按旧口径判（名字要比得
+    /// 一模一样），这读作「这个进程读不到名册」，不读作「那个人不该干」。
+    pub fn attach_roster(&self, roster: Arc<dyn cog_core::AgentRegistry>) {
+        *self.roster.write().unwrap_or_else(|e| e.into_inner()) = Some(roster);
+    }
+
+    /// 一个名字代表的工号：人形 id 就是他自己，座位形问名册行。
+    ///
+    /// `None` 是读数：名册没挂、座位还没有人、或者名册读失败都落在这里。三种
+    /// 都让调用方退回旧口径，而不是把「读不到」当成「不是他」。
+    pub(crate) async fn claimant_person(&self, claimant: &str) -> Option<String> {
+        // 与控制面判「谁在认领」的那一处同一个口径：认领判据比对的是去空白后的
+        // 名字（[`crate::ready_queue::approve_claim_for`]）。这里不去，派工就会
+        // 把带空白的名字写进行上的负责人格，而之后任何一次认领都比不上它——
+        // 那条行既出不了共享队列（有主），也没有人接得走。
+        let claimant = claimant.trim();
+        if let Some(person) = cog_core::person_id_for(claimant) {
+            return Some(person.to_string());
+        }
+        let roster = self
+            .roster
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()?;
+        match roster.employee(claimant).await {
+            Ok(Some(row)) => row.person().map(str::to_string),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    claimant,
+                    error = %e,
+                    "the roster could not be read for this name; judging the claim by the name alone"
+                );
+                None
+            }
+        }
     }
 
     /// Attach the metrics backend the DAG's own repairs report to. Called once
@@ -528,7 +584,18 @@ impl DagExecutor {
         let stall_after_secs =
             stall_after_secs.max(cog_core::config::DEFAULT_READY_CLAIM_IDLE_SECS);
         let stall_before = chrono::Utc::now() - chrono::Duration::seconds(stall_after_secs as i64);
-        let stalled = self.find_stalled_scheduled_tasks(stall_before).await;
+        let stalled = match self.find_stalled_scheduled_tasks(stall_before).await {
+            Ok(stalled) => stalled,
+            // 清扫没有返回错误的渠道，所以这一趟的读数只能是这一行：读不到整份
+            // 名单时它什么都没做，与「名单是空的」是同一条返回值、不同的处境。
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "cannot read the Scheduled rows to sweep them; this pass reclaims nothing"
+                );
+                return 0;
+            }
+        };
         let mut reclaimed = 0usize;
         let mut unserved = 0usize;
         let mut deferred = 0usize;
@@ -626,7 +693,9 @@ impl DagExecutor {
     /// another sweep already picked up, fails the precondition and is left
     /// alone.
     async fn reclaim_one_stalled(&self, task_id: &str, error: String) -> SFResult<bool> {
-        let Some(task) = self.get_task(task_id).await else {
+        // 读不到与「这一行不在了」不是同一句话：前者这一趟没法判它停没停住，
+        // 交给清扫打一行 warn；后者是另一趟已经处理过它。
+        let Some(task) = self.get_task_checked(task_id).await? else {
             return Ok(false);
         };
         if task.status != TaskStatus::Scheduled {
@@ -649,8 +718,23 @@ impl DagExecutor {
                     // the task moved on. Only a write that did not land while
                     // the row still reads `Scheduled` means the store refused
                     // work it had just accepted.
+                    //
+                    // 复核也读不出来时不能判它「走开了」：那正是让一次存储拒绝
+                    // 静默收场的那一步。这一趟交回「写被拒」，上一行 warn 里带着
+                    // 两份错误。
+                    let after = match self.get_task_checked(task_id).await {
+                        Ok(after) => after,
+                        Err(read_err) => {
+                            tracing::warn!(
+                                task_id = %task_id,
+                                write_error = %e,
+                                "cannot re-read the row after a refused conditional write: {read_err}"
+                            );
+                            return Err(read_err);
+                        }
+                    };
                     if matches!(
-                        self.get_task(task_id).await,
+                        after,
                         Some(cur) if cur.status == TaskStatus::Scheduled
                     ) {
                         return Err(e);
@@ -1911,8 +1995,7 @@ impl DagExecutor {
 
         // 与内存路径同一个判据：不能靠重跑清除的失败不给重试预算。两处调的是
         // 同一个函数，所以「同一个判据」是结构上成立的，不是靠两边都写对。
-        let max_retries =
-            self.effective_max_retries(&error, cause, task.error.as_deref());
+        let max_retries = self.effective_max_retries(&error, cause, task.error.as_deref());
         // 退避随任务一起落库，不留在调度循环的内存里：判定重试的进程与之后
         // 重新投递它的进程可能不是同一个。
         let retry_delay =
@@ -2213,11 +2296,20 @@ impl DagExecutor {
             .await
         {
             // 只有「写没落上、行还停在原状态」才是存储拒绝了刚接受的工作；
-            // 否则就是任务已经走到别处去了。
-            if matches!(
-                self.get_task(task_id).await,
-                Some(c) if expected.contains(&c.status)
-            ) {
+            // 否则就是任务已经走到别处去了。复核读不出来时同样不能判它走开：
+            // 那种读法把一次存储拒绝折成「任务自己走了」。
+            let after = match self.get_task_checked(task_id).await {
+                Ok(after) => after,
+                Err(read_err) => {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        write_error = %e,
+                        "cannot re-read the row after a refused conditional write: {read_err}"
+                    );
+                    return Err(read_err);
+                }
+            };
+            if matches!(after, Some(c) if expected.contains(&c.status)) {
                 return Err(e);
             }
             return Ok(false);
@@ -2523,10 +2615,15 @@ impl DagExecutor {
     ///
     /// 读不出那一列时退回整张图：少一个查询不会让判据错，只会让它贵，而贵不是
     /// 「这一拍不清扫」的理由。
+    ///
+    /// 两条读都失败时带着错误上去，不折成一张空名单。空的名单在这一面说的是「一条
+    /// 都不用收」，而读不出来说的是「这一趟没看见」——清扫的返回值、日志与三个计数
+    /// 格都只有后一种能解释，折了之后前者替后者作答，库坏掉的那一趟与一次干净的空
+    /// 扫描逐字同形（2026-11-23 CC08）。
     pub async fn find_stalled_scheduled_tasks(
         &self,
         stall_before: chrono::DateTime<chrono::Utc>,
-    ) -> Vec<Task> {
+    ) -> SFResult<Vec<Task>> {
         if let Some(be) = self.fg() {
             match be
                 .dag_get_tasks_in_status(&self.workspace_id, TaskStatus::Scheduled)
@@ -2537,7 +2634,7 @@ impl DagExecutor {
                         Self::stalled_scheduled(&tasks, stall_before)
                             .into_iter()
                             .collect();
-                    return tasks.into_iter().filter(|t| ids.contains(&t.id)).collect();
+                    return Ok(tasks.into_iter().filter(|t| ids.contains(&t.id)).collect());
                 }
                 Err(e) => tracing::debug!(
                     error = %e,
@@ -2545,11 +2642,11 @@ impl DagExecutor {
                 ),
             }
         }
-        let tasks = self.all_tasks_unified().await;
+        let tasks = self.all_tasks_checked().await?;
         let ids: std::collections::HashSet<String> = Self::stalled_scheduled(&tasks, stall_before)
             .into_iter()
             .collect();
-        tasks.into_iter().filter(|t| ids.contains(&t.id)).collect()
+        Ok(tasks.into_iter().filter(|t| ids.contains(&t.id)).collect())
     }
 
     /// Pure classifier for Pending tasks that nothing can ever unblock.
@@ -2753,12 +2850,24 @@ impl DagExecutor {
         let now = chrono::Utc::now();
         let lease = self.task_lease;
         let expected = [TaskStatus::Pending, TaskStatus::Scheduled];
+        // 认领者代表的那个人：派工写的就是这个人（见下面 `owner_unit` 那一笔）。
+        let person = self.claimant_person(claimant).await;
 
         if self.fg().is_some() {
             let be = self.fg().expect("store mode");
             let task = self.store_task(task_id).await?;
-            let claimed = crate::ready_queue::approve_claim(&task, claimant, lease, now)
-                .map_err(|refusal| claim_refusal_as_error(task_id, claimant, refusal))?;
+            let claimed = crate::ready_queue::approve_claim_for(
+                &task,
+                claimant,
+                person.as_deref(),
+                lease,
+                now,
+            )
+            .map_err(|refusal| claim_refusal_as_error(task_id, claimant, refusal))?;
+            // 派工写人：这一行还没有负责人、而且它是一件会被指定归属的活时，
+            // 接走它的人就是它的负责人。写进同一笔认领里，读面不会看到「有人
+            // 在跑，却没有负责人」的那一瞬。
+            let claimed = with_the_dispatch_person(claimed, person.as_deref());
             be.dag_claim_task(&self.workspace_id, task_id, &expected, &claimed)
                 .await?;
             if claimed.status != task.status {
@@ -2780,8 +2889,10 @@ impl DagExecutor {
                 task_id: task_id.into(),
                 reason: "Task not found".into(),
             })?;
-        let claimed = crate::ready_queue::approve_claim(task, claimant, lease, now)
-            .map_err(|refusal| claim_refusal_as_error(task_id, claimant, refusal))?;
+        let claimed =
+            crate::ready_queue::approve_claim_for(task, claimant, person.as_deref(), lease, now)
+                .map_err(|refusal| claim_refusal_as_error(task_id, claimant, refusal))?;
+        let claimed = with_the_dispatch_person(claimed, person.as_deref());
         let was_pending = task.status == TaskStatus::Pending;
         *task = claimed.clone();
         drop(inner);
@@ -3024,8 +3135,20 @@ impl DagExecutor {
     /// 只有它等于本任务的 id 时才抄。读的是声明，不是「谁没有下游」——按后者全局重算，会把
     /// 别的目标的行、单独提交的行一起算成汇点，那正是声明要替掉的那种算法。
     async fn on_task_terminal(&self, task_id: &str) {
-        let Some(mut sink) = self.get_task(task_id).await else {
-            return;
+        // 读不出来时不能按「这一行不在了」收场：目标行会一直停在 Pending，
+        // 而屏幕上一个字都没有，读的人只能等孤儿对账器兜底，却不知道兜的是
+        // 什么。两条读不到的路各说一句，说完才返回。
+        let mut sink = match self.get_task_checked(task_id).await {
+            Ok(Some(sink)) => sink,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    "cannot read the task that reached a terminal state: {e}; \
+                     its goal row's terminal state was not derived"
+                );
+                return;
+            }
         };
         if !matches!(
             sink.status,
@@ -3042,8 +3165,18 @@ impl DagExecutor {
         let Some(parent_id) = sink.parent_task_id.clone() else {
             return;
         };
-        let Some(mut row) = self.get_task(&parent_id).await else {
-            return;
+        let mut row = match self.get_task_checked(&parent_id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(
+                    goal_row = %parent_id,
+                    sink = %task_id,
+                    "cannot read the goal row this sink is declared on: {e}; \
+                     its terminal state was not derived"
+                );
+                return;
+            }
         };
         if row.sink_task_id.as_deref() != Some(task_id) {
             return;
@@ -4229,6 +4362,17 @@ impl DagExecutor {
     /// 跑的任务被答成「已经被删了」。内存模式下 `ensure_task_present` 的
     /// `TaskFailed` 是「没找到」那一句的载体，照旧读成 `None`；别的错误收口。
     pub async fn get_task_checked(&self, task_id: &str) -> SFResult<Option<Task>> {
+        #[cfg(test)]
+        if self
+            .unreadable_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(task_id)
+        {
+            return Err(SFError::Database(format!(
+                "store unavailable: cannot read task {task_id}"
+            )));
+        }
         if let Some(be) = self.fg() {
             return be.dag_get_task(&self.workspace_id, task_id).await;
         }
@@ -4239,6 +4383,18 @@ impl DagExecutor {
         }
         let inner = self.inner.read().await;
         Ok(inner.tasks.get(task_id).cloned())
+    }
+
+    /// 测试用：让读到这些 id 的那一问答不上来。生产构建里不存在。
+    ///
+    /// 存储坏掉时读口答 `Err`，内存模式下这条读答 `None`——两种形状在这一格里
+    /// 各自如实交出，调用方才分得清它处理的是哪一条。
+    #[cfg(test)]
+    pub(crate) fn fail_task_reads_of(&self, task_id: &str) {
+        self.unreadable_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(task_id.to_string());
     }
 
     pub async fn get_all_tasks(&self) -> Vec<Task> {
@@ -4920,6 +5076,27 @@ fn name_unclosable_kinds(unclosable: &std::collections::BTreeMap<String, Vec<Str
     }
 }
 
+/// 派工写人：这一行还没有负责人时，接走它的人的工号就是负责人。
+///
+/// 只在三个条件同时成立时写：认领者背后答得出一个工号（人形 id 就是他自己；
+/// 座位形 id 问名册行，问不到就没有）；这一行还没有负责人；它不是急件——那一
+/// 列是「谁空谁跑」，在它上面写一个负责人等于给一条谁都能跑的行钉上一把谁都
+/// 看不见的锁，读面还会把「谁跑了它」读成「它属于那个人」。
+///
+/// 已经有负责人的行不动：那一格是别人指定下来的路由决定，或者上一段尝试写下
+/// 的同一个人。认领能走到这里，已经由 [`crate::ready_queue::approve_claim_for`]
+/// 判过「认领者代表得了他」，再写一遍只会把同一个事实写成两种来源。
+fn with_the_dispatch_person(mut claimed: Task, person: Option<&str>) -> Task {
+    let Some(person) = person else {
+        return claimed;
+    };
+    if claimed.owner_unit.is_some() || crate::ready_queue::is_stop_the_line(&claimed) {
+        return claimed;
+    }
+    claimed.owner_unit = Some(person.to_string());
+    claimed
+}
+
 /// 一次被拒的认领，翻成调用方要分得清的那两种错。
 ///
 /// 「别人先接了」「这条行已经跑起来了」是竞争，不是坏掉：读的人该重读一次或者
@@ -4961,8 +5138,10 @@ fn claim_refusal_as_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::warn_text;
     use cog_core::{
-        AgentState, ContextBoard, Event, MetricsBackend, StateBackend, TaskCheckpoint, TaskType,
+        AgentRegistry, AgentState, ContextBoard, Event, MetricsBackend, StateBackend,
+        TaskCheckpoint, TaskType,
     };
 
     /// 本部署读哪些就绪队列——清扫器的范围判据，与运行期同一个函数。
@@ -5488,6 +5667,15 @@ mod tests {
         /// 读下游名单的那一问答不上来。详情页把「读不出来」与「没有下游」
         /// 画成同一张空列表，这一格用来交出前者的形状。
         dependents_read_fails: std::sync::atomic::AtomicBool,
+        /// 第几次读一行答不上来（从 1 数；0 是关）。`task_read_fails` 只错第一读，
+        /// 而「写被拒之后的复核读不出来」要的是第一读成功、第二读失败——次序
+        /// 反过来的那一支只能按第几次来点。
+        task_read_fail_on: std::sync::atomic::AtomicUsize,
+        /// 读过一行几次。与上一格配成一对，两格合起来判的是次序。
+        task_reads_taken: std::sync::atomic::AtomicUsize,
+        /// 条件写答不上来。终态的写被拒之后紧跟着要复核那一行，复核读不出来的
+        /// 那一支只有先让写失败才走得到。
+        transition_fails: std::sync::atomic::AtomicBool,
     }
 
     impl CountingTaskStore {
@@ -5499,6 +5687,10 @@ mod tests {
         }
         fn live_reads(&self) -> usize {
             self.live_reads.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn task_reads_taken(&self) -> usize {
+            self.task_reads_taken
+                .load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
@@ -5569,6 +5761,19 @@ mod tests {
             Ok(None)
         }
         async fn dag_get_task(&self, _workspace_id: &str, task_id: &str) -> SFResult<Option<Task>> {
+            let nth = self
+                .task_reads_taken
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if self
+                .task_read_fail_on
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == nth
+            {
+                return Err(SFError::Database(format!(
+                    "store unavailable: cannot read task {task_id}"
+                )));
+            }
             if self
                 .task_read_fails
                 .swap(false, std::sync::atomic::Ordering::Relaxed)
@@ -5723,6 +5928,19 @@ mod tests {
                 .cloned()
                 .collect())
         }
+        async fn dag_set_task(
+            &self,
+            _workspace_id: &str,
+            task_id: &str,
+            task: &Task,
+        ) -> SFResult<()> {
+            let mut tasks = self.tasks.lock().await;
+            match tasks.iter_mut().find(|t| t.id == task_id) {
+                Some(row) => *row = task.clone(),
+                None => tasks.push(task.clone()),
+            }
+            Ok(())
+        }
         async fn dag_transition_task(
             &self,
             _workspace_id: &str,
@@ -5730,6 +5948,14 @@ mod tests {
             _expected: &[TaskStatus],
             _updated: &Task,
         ) -> SFResult<()> {
+            if self
+                .transition_fails
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(SFError::Conflict(
+                    "store refused the conditional write".into(),
+                ));
+            }
             Ok(())
         }
         async fn dag_append_retry(
@@ -5889,6 +6115,120 @@ mod tests {
             row.claimed_by(),
             Some(holder),
             "两个 pod 之后读到的必须是同一个认领者"
+        );
+    }
+
+    /// 一件待接的活，带验收标准（没有它认领会被「关不掉的活」拦下）。
+    fn claimable(id: &str) -> Task {
+        let mut task = Task::new(id, TaskType::DagNode, serde_json::json!({}));
+        task.acceptance = vec!["the row is done when it says so".to_string()];
+        task
+    }
+
+    /// R17 的判据：同一个人换一把座位再做同一件活，行上写的始终是工号。
+    ///
+    /// 座位名（`squad:<任务>-<座位>`）里没有工号，只有名册行答得出来。第一段
+    /// 尝试失败、行回到待接之后，第二段尝试坐在另一把椅子上：认领必须被批准
+    /// ——那是同一个人——而行上的负责人不能因为他换了椅子就变成那把椅子的名
+    /// 字。两把座位的角色不同（`planner` 对 `generator`），所以这一条判的不是
+    /// 「名字一样」，是「人一样」。
+    #[tokio::test]
+    async fn the_same_person_taking_a_row_twice_keeps_their_number_on_it() {
+        let seats = Arc::new(crate::test_support::Seats::default());
+        let task_id = "t-person";
+        let first = cog_core::agent_id_for(task_id, cog_core::roles::PLANNER);
+        let second = cog_core::agent_id_for(task_id, cog_core::roles::GENERATOR);
+        seats.assign_person(&first, "E0412").await.unwrap();
+        seats.assign_person(&second, "E0412").await.unwrap();
+        assert_ne!(first, second, "这条用例的前提是两把椅子不是一个名字");
+
+        let dag = DagExecutor::new("ws-person".into());
+        dag.attach_roster(seats);
+        dag.add_task(claimable(task_id)).await.unwrap();
+
+        let claimed = dag.claim_task(task_id, &first).await.unwrap();
+        assert_eq!(
+            claimed.owner_unit.as_deref(),
+            Some("E0412"),
+            "派工写人：认领之后行上的负责人是认领者背后的工号，不是座位名"
+        );
+        assert_eq!(claimed.claimed_by(), Some(first.as_str()));
+
+        // 第一段尝试失败，行回到待接：负责人留在行上，租约清掉。
+        let (retried, _, _) = dag.fail_task(task_id, "boom".into(), None).await.unwrap();
+        assert!(retried, "第一次失败还有重试预算，行必须回到待接");
+
+        let again = dag.claim_task(task_id, &second).await.unwrap();
+        assert_eq!(
+            again.owner_unit.as_deref(),
+            Some("E0412"),
+            "换一把椅子的人不是另一个人：行上的工号不能变"
+        );
+        assert_eq!(again.claimed_by(), Some(second.as_str()));
+    }
+
+    /// 工号不同就是另一个人：座位形认领按名册判，不按名字长得像判。
+    #[tokio::test]
+    async fn a_seat_of_another_person_cannot_take_an_owned_row() {
+        let seats = Arc::new(crate::test_support::Seats::default());
+        let task_id = "t-owned";
+        let other = cog_core::agent_id_for(task_id, cog_core::roles::EVALUATOR);
+        seats.assign_person(&other, "E0455").await.unwrap();
+
+        let dag = DagExecutor::new("ws-owned".into());
+        dag.attach_roster(seats);
+        let mut task = claimable(task_id);
+        task.owner_unit = Some("E0412".to_string());
+        dag.add_task(task).await.unwrap();
+
+        let err = dag.claim_task(task_id, &other).await.unwrap_err();
+        assert!(
+            err.to_string().contains("E0412"),
+            "拒绝里要点名行上的那个人，实得 {err}"
+        );
+    }
+
+    /// 名册上还没有这一把座位时，不写负责人：读不到不是「他不是那个人」。
+    #[tokio::test]
+    async fn a_seat_without_a_person_leaves_the_row_unowned() {
+        let seats = Arc::new(crate::test_support::Seats::default());
+        let task_id = "t-unbound";
+        let seat = cog_core::agent_id_for(task_id, cog_core::roles::GENERATOR);
+
+        let dag = DagExecutor::new("ws-unbound".into());
+        dag.attach_roster(seats);
+        dag.add_task(claimable(task_id)).await.unwrap();
+
+        let claimed = dag.claim_task(task_id, &seat).await.unwrap();
+        assert_eq!(
+            claimed.owner_unit, None,
+            "名册答不出这一把座位背后是谁时，行上不写一个猜出来的人"
+        );
+        assert_eq!(claimed.claimed_by(), Some(seat.as_str()));
+    }
+
+    /// 认领判据比对的是去空白后的名字，写进负责人格的那一格也必须去。
+    ///
+    /// 写进去的与之后比对用的不是同一个字符串，那条行就再也接不走：它有主
+    /// （出不了共享队列），而「` E0412`」与「`E0412`」谁都不是对方。
+    #[tokio::test]
+    async fn a_padded_name_is_written_down_without_its_padding() {
+        let dag = DagExecutor::new("ws-pad".into());
+        dag.add_task(claimable("t-pad")).await.unwrap();
+
+        let claimed = dag.claim_task("t-pad", "  E0412  ").await.unwrap();
+        assert_eq!(
+            claimed.owner_unit.as_deref(),
+            Some("E0412"),
+            "负责人格上写的必须是之后比对时读得回来的那个名字"
+        );
+        let (retried, _, _) = dag.fail_task("t-pad", "boom".into(), None).await.unwrap();
+        assert!(retried, "第一次失败还有重试预算，行必须回到待接");
+        let again = dag.claim_task("t-pad", "E0412").await.unwrap();
+        assert_eq!(
+            again.owner_unit.as_deref(),
+            Some("E0412"),
+            "同一个人用没带空白的名字接回来，行上那一格必须还是他"
         );
     }
 
@@ -6278,7 +6618,10 @@ mod tests {
         dag.schedule_task("child-2").await.unwrap();
         dag.start_task("child-2").await.unwrap();
         let terminal = "terminal_env_failure: environment_error";
-        let (retried, _, _) = dag.fail_task("child-2", terminal.into(), None).await.unwrap();
+        let (retried, _, _) = dag
+            .fail_task("child-2", terminal.into(), None)
+            .await
+            .unwrap();
         assert!(!retried);
         let row = dag.get_task("goal-1").await.unwrap();
         assert_eq!(row.status, TaskStatus::Failed);
@@ -7614,7 +7957,8 @@ mod tests {
 
         let found = dag
             .find_stalled_scheduled_tasks(chrono::Utc::now() - chrono::Duration::minutes(10))
-            .await;
+            .await
+            .expect("读得到的时候这一问没有第二种答案");
         assert_eq!(found.len(), 1, "只有那一条进了 Scheduled 又过了窗");
         assert_eq!(found[0].id, "t-stalled");
         assert_eq!(
@@ -7625,6 +7969,390 @@ mod tests {
         assert!(
             backend.narrow_reads() >= 1,
             "这一问至少要读一次 Scheduled 那些行"
+        );
+    }
+
+    /// 只记下「撤过哪一行」的告警落点。
+    ///
+    /// 这一族里「撤掉」是唯一不可逆的一步：撤了，下一趟的采纳看不到它，它再也不会
+    /// 以原来那个理由响回来。所以这一面判的是它**没被**调过。
+    #[derive(Default)]
+    struct ResolveLog(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    #[async_trait::async_trait]
+    impl cog_core::PersistentAlertSink for ResolveLog {
+        async fn set_persistent_alert(
+            &self,
+            condition: bool,
+            draft: &cog_core::PersistentAlertDraft,
+        ) -> Result<cog_core::AlertTransition, String> {
+            if !condition {
+                self.0.lock().unwrap().push(draft.dedup_key.clone());
+            }
+            Ok(cog_core::AlertTransition::NoChange)
+        }
+
+        async fn firing_key_for_rule(&self, _rule: &str) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+
+        async fn list_active_persistent_alerts(
+            &self,
+            _rule_prefix: &str,
+            _limit: i64,
+        ) -> Vec<cog_core::PersistedAlert> {
+            Vec::new()
+        }
+    }
+
+    /// 归属核对读不到那一行：三条出路各说各的话。
+    ///
+    /// 别人的行 ⇒ 丢掉并 ack；自己的行 ⇒ 照常往下走；读不到 ⇒ **不 ack**。
+    /// 第三条是最要紧的那条：ack 是唯一不可逆的一步，ack 之后这条结果再也不会
+    /// 被重投。折成「不是别的单元的」让它照常应用，是替别人把工作做掉；折成
+    /// 「是别的单元的」直接丢，是把别人的结果扔掉。
+    #[tokio::test]
+    async fn a_result_whose_owner_cannot_be_read_is_left_for_redelivery() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag = Arc::new(
+            DagExecutor::new("ws-owner-unreadable".into()).with_state_backend(backend.clone()),
+        );
+        let runtime = crate::dag_executor::DagExecutorRuntime::new_with_backend(
+            crate::dag_executor::DagExecutorConfig {
+                redis_url: "memory".into(),
+                workspace_id: "ws-owner-unreadable".into(),
+                consumer_group: "grp-owner-unreadable".into(),
+                max_retries: 1,
+                ..Default::default()
+            },
+            cog_test_support::MemoryMessageBackend::new(),
+        )
+        .with_orchestrator(dag.clone());
+
+        // 行真的在那儿，而且真是别人的：这一问要拦的正是它。
+        let mut row = Task::new("t-unread", TaskType::DagNode, serde_json::json!({}));
+        row.owner_unit = Some("unit-8b".into());
+        backend.tasks.lock().await.push(row);
+
+        let warns = warn_text();
+        let body = serde_json::to_vec(&cog_core::DagMessage::TaskComplete {
+            message_id: "m-1".into(),
+            timestamp: chrono::Utc::now(),
+            task_id: "t-unread".into(),
+            result: serde_json::json!({"ok": true}),
+            sender: "unit-8b".into(),
+            recipient: "executor".into(),
+        })
+        .expect("这条消息按契约写得出来");
+        backend
+            .task_read_fail_on
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        runtime
+            .handle_result_message(
+                "results:ws-owner-unreadable",
+                "grp-owner-unreadable",
+                "m-1",
+                &body,
+            )
+            .await;
+
+        assert!(
+            warns.any("cannot read the task this result names; leaving it for redelivery"),
+            "读不到就要说出来，调用方凭这一行知道它被留着重投：{:?}",
+            warns.said()
+        );
+        assert_eq!(
+            backend.task_reads_taken(),
+            1,
+            "读不到之后再读第二次，就是把它当成「没有这一行」照常往下走了"
+        );
+        assert_eq!(
+            backend.tasks.lock().await[0].status,
+            TaskStatus::Pending,
+            "结果没有被写进那一行"
+        );
+    }
+
+    /// 告警收口读不到父行：这一趟跳过它，不把它读成「任务已经不在了」。
+    ///
+    /// 「行真的没了」与「读不出来」在返回值上同形，而收掉一条正在响的告警是这一趟
+    /// 里唯一不可逆的决定——下一趟的采纳不会再看到它。
+    #[tokio::test]
+    async fn an_alert_whose_parent_cannot_be_read_keeps_firing() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag = Arc::new(
+            DagExecutor::new("ws-alert-unreadable".into()).with_state_backend(backend.clone()),
+        );
+        let log = Arc::new(ResolveLog::default());
+        let sink: Arc<dyn cog_core::PersistentAlertSink> = log.clone();
+        let key = "decomposition_wbs:goal-1:t-1".to_string();
+        let mut firing = HashMap::new();
+        firing.insert(
+            key.clone(),
+            crate::dag_executor::OrphanWatch {
+                parent_id: "t-parent".into(),
+                goal_id: Some("goal-1".into()),
+                resolve_after: chrono::Utc::now() - chrono::Duration::minutes(1),
+            },
+        );
+
+        let warns = warn_text();
+        backend
+            .task_read_fail_on
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        crate::dag_executor::orphan_reconcile_tick(
+            &dag,
+            Some(&sink),
+            &chrono::Duration::minutes(30),
+            &chrono::Duration::minutes(5),
+            &mut firing,
+        )
+        .await;
+
+        assert!(
+            warns.any("cannot read the task this alert watches"),
+            "读不出来要自己说出来：{:?}",
+            warns.said()
+        );
+        assert!(
+            log.0.lock().unwrap().is_empty(),
+            "读不到不是「任务没了」：这一条告警不能被收掉"
+        );
+        assert!(firing.contains_key(&key), "它还在响，下一趟就该还看得见它");
+    }
+
+    /// WBS 判词重算读不到整份行表：判词维持原样，不下「不再成立」的结论。
+    ///
+    /// 空计划与读不出来在返回值上同形，而「不再成立」会让下一段把告警撤掉。
+    #[tokio::test]
+    async fn a_wbs_verdict_that_cannot_read_the_rows_stands() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag = Arc::new(
+            DagExecutor::new("ws-wbs-unreadable".into()).with_state_backend(backend.clone()),
+        );
+
+        let warns = warn_text();
+        backend
+            .all_read_fails
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let no_longer_holds =
+            crate::dag_executor::wbs_verdict_no_longer_holds(&dag, Some("goal-1")).await;
+
+        assert!(
+            !no_longer_holds,
+            "读不到行表时不能答「判词不再成立」：那会撤掉一条仍然成立的告警"
+        );
+        assert!(
+            warns.any("cannot read the rows to re-check a WBS verdict"),
+            "读不出来要自己说出来，不能借用「没有行」那条返回值：{:?}",
+            warns.said()
+        );
+    }
+
+    /// 清扫读不到自己那份行表时，说的是「这一趟没看见」，不是「没有要收的行」。
+    ///
+    /// 两种处境给同一个返回值 0，屏幕上那一行是唯一的区别。折了之后，库坏掉的
+    /// 那一趟与一次干净的空扫描逐字同形——而清扫存在的理由正是把「队列没动」
+    /// 与「没人读」分开。
+    #[tokio::test]
+    async fn a_sweep_that_cannot_read_its_rows_says_so() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag =
+            DagExecutor::new("ws-unreadable-sweep".into()).with_state_backend(backend.clone());
+        let mut stalled = Task::new("t-stalled", TaskType::DagNode, serde_json::json!({}));
+        stalled.status = TaskStatus::Scheduled;
+        stalled.updated_at = chrono::Utc::now() - chrono::Duration::minutes(30);
+        backend.tasks.lock().await.push(stalled);
+        let streams = served("ws-unreadable-sweep", true);
+
+        let warns = warn_text();
+
+        // 两读都答不上来：先按状态读那一列，退到整张图也读不出。
+        backend
+            .status_read_fails
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        backend
+            .all_read_fails
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(sweep(&dag, 600, &streams).await, 0);
+        assert!(
+            warns.any("cannot read the Scheduled rows"),
+            "读不出来要自己说出来，不能借用「没有要收的行」那条返回值：{:?}",
+            warns.said()
+        );
+
+        // 读回来之后同一趟收得下它：那条 warn 不是「收不动」的替身。
+        backend
+            .status_read_fails
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        backend
+            .all_read_fails
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            sweep(&dag, 600, &streams).await,
+            1,
+            "行还是那一行，读回来之后它就该被收"
+        );
+    }
+
+    /// 名单读到了、逐行动手前那一读答不上来：这一趟什么都没收，但要有人知道
+    /// 是「没看见」而不是「它已经走开了」。
+    #[tokio::test]
+    async fn a_reclaim_that_cannot_read_the_row_says_so() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag = DagExecutor::new("ws-unreadable-row".into()).with_state_backend(backend.clone());
+        let mut stalled = Task::new("t-stalled", TaskType::DagNode, serde_json::json!({}));
+        stalled.status = TaskStatus::Scheduled;
+        stalled.updated_at = chrono::Utc::now() - chrono::Duration::minutes(30);
+        backend.tasks.lock().await.push(stalled);
+
+        let warns = warn_text();
+
+        backend
+            .task_read_fail_on
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            sweep(&dag, 600, &served("ws-unreadable-row", true)).await,
+            0
+        );
+        assert!(
+            warns.any("cannot reclaim a task stalled in Scheduled"),
+            "逐行那一读失败要有自己的那一行：{:?}",
+            warns.said()
+        );
+        assert_eq!(
+            backend.tasks.lock().await[0].status,
+            TaskStatus::Scheduled,
+            "没收就是没收：行留在原地，别把它说成已经走开了"
+        );
+    }
+
+    /// 条件写被拒之后复核那一读也答不上来：那是「复核不了」，不是「任务已经
+    /// 走到别处去了」。后一种读法让一次存储拒绝静默收场。
+    #[tokio::test]
+    async fn a_refused_write_whose_row_cannot_be_re_read_is_not_the_task_moving_on() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag = DagExecutor::new("ws-reread".into()).with_state_backend(backend.clone());
+        let mut stalled = Task::new("t-reread", TaskType::DagNode, serde_json::json!({}));
+        stalled.status = TaskStatus::Scheduled;
+        stalled.updated_at = chrono::Utc::now() - chrono::Duration::minutes(30);
+        backend.tasks.lock().await.push(stalled);
+
+        let warns = warn_text();
+
+        // 第一读（动手前那一行）照常，写被拒，复核那一次答不上来。
+        backend
+            .transition_fails
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        backend
+            .task_read_fail_on
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        let outcome = dag
+            .reclaim_one_stalled("t-reread", "never started".into())
+            .await;
+        assert!(
+            outcome.is_err(),
+            "复核读不出来时不能答「它已经走开了」：那正是让一次存储拒绝静默收场的那一步"
+        );
+        assert!(
+            warns.any("cannot re-read the row after a refused conditional write"),
+            "两份错误都要留在屏幕上：{:?}",
+            warns.said()
+        );
+    }
+
+    /// 终态任务那一读答不上来：目标行没有拿到终态，这件事要有人知道。
+    ///
+    /// 折了之后唯一的痕迹是目标行一直停在 Pending——那与「它还没跑完」同形，
+    /// 读的人只能等孤儿对账器兜底，却不知道兜的是什么。
+    #[tokio::test]
+    async fn a_terminal_task_that_cannot_be_read_says_the_goal_row_got_nothing() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag = DagExecutor::new("ws-terminal-read".into()).with_state_backend(backend.clone());
+        let mut sink = Task::new("sink", TaskType::DagNode, serde_json::json!({}));
+        sink.status = TaskStatus::Completed;
+        sink.parent_task_id = Some("goal".into());
+        let mut goal = Task::new("goal", TaskType::DagNode, serde_json::json!({}));
+        goal.sink_task_id = Some("sink".into());
+        backend.tasks.lock().await.extend([sink, goal]);
+
+        let warns = warn_text();
+
+        backend
+            .task_read_fail_on
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        dag.on_task_terminal("sink").await;
+        assert!(
+            warns.any("its goal row's terminal state was not derived"),
+            "读不到时要说的是「没有抄过去」，不是什么都不说：{:?}",
+            warns.said()
+        );
+        assert_eq!(
+            backend
+                .tasks
+                .lock()
+                .await
+                .iter()
+                .find(|t| t.id == "goal")
+                .unwrap()
+                .status,
+            TaskStatus::Pending,
+            "读不到时目标行确实没有拿到终态：这条 warn 说的是真的发生的事"
+        );
+
+        // 读回来之后同一件事做得成：那条 warn 不是「本来就不抄」的替身。
+        backend
+            .task_read_fail_on
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        dag.on_task_terminal("sink").await;
+        assert_eq!(
+            backend
+                .tasks
+                .lock()
+                .await
+                .iter()
+                .find(|t| t.id == "goal")
+                .unwrap()
+                .status,
+            TaskStatus::Completed,
+            "读得到的时候终态照抄：修法改的只是读不到那一支"
+        );
+    }
+
+    /// 目标行（父占位）那一读答不上来：同一个意思，换一行说。
+    #[tokio::test]
+    async fn a_goal_row_that_cannot_be_read_says_it_got_nothing() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag = DagExecutor::new("ws-goal-unreadable".into()).with_state_backend(backend.clone());
+        let mut sink = Task::new("sink", TaskType::DagNode, serde_json::json!({}));
+        sink.status = TaskStatus::Completed;
+        sink.parent_task_id = Some("goal".into());
+        let mut goal = Task::new("goal", TaskType::DagNode, serde_json::json!({}));
+        goal.sink_task_id = Some("sink".into());
+        backend.tasks.lock().await.extend([sink, goal]);
+
+        let warns = warn_text();
+
+        // sink 那一读照常，父行那一次答不上来。
+        backend
+            .task_read_fail_on
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        dag.on_task_terminal("sink").await;
+        assert!(
+            warns.any("cannot read the goal row this sink is declared on"),
+            "父行读不出来要按它自己的名字说：{:?}",
+            warns.said()
+        );
+        assert_eq!(
+            backend
+                .tasks
+                .lock()
+                .await
+                .iter()
+                .find(|t| t.id == "goal")
+                .unwrap()
+                .status,
+            TaskStatus::Pending
         );
     }
 

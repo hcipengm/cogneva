@@ -250,6 +250,8 @@ CREATE TABLE IF NOT EXISTS task_attempt (
                 error_code TEXT,
                 error_text TEXT,
                 result TEXT,
+                role TEXT,
+                person TEXT,
                 PRIMARY KEY (task_id, attempt_no)
             )
 ;
@@ -658,8 +660,13 @@ impl PostgresStateBackend {
         if updated.status != current {
             match updated.status {
                 cog_core::TaskStatus::Running => {
-                    task_ledger::open_attempt(&mut tx, task_id, updated.lease_owner.as_deref())
-                        .await?;
+                    task_ledger::open_attempt(
+                        &mut tx,
+                        task_id,
+                        updated.lease_owner.as_deref(),
+                        updated.owner_unit.as_deref(),
+                    )
+                    .await?;
                 }
                 landed => {
                     if current == cog_core::TaskStatus::Running {

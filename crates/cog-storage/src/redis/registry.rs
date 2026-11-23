@@ -168,11 +168,17 @@ impl RedisAgentRegistry {
     /// 判（[`cog_core::person_id_for`]），脚本只写它被告知的值，不在脚本里再拼
     /// 一遍前缀——两侧各拼一次时改名只会改一侧，脚本会安静地把所有座位都写成
     /// 一个人。座位形 id 传进来的是空串，脚本遇到空串**不写**这一格：座位背后
-    /// 的人要到派活那一刻才存在，在此之前空着就是读数；而写上之后，这条路径
+    /// 的人要到派活那一刻才存在，在此之前空着是读数；而写上之后，这条路径
     /// 也不能把它擦掉——座位重新注册时把已派的人抹了，人就从名册上消失了。
+    ///
+    /// **工号只发给一个人，不发给一把椅子**（`ARGV[5] == '1'` 才是人形 id）：
+    /// 座位随任务生灭，每次接活都注册一次，给它发号就是每接一件活多一个「员工」
+    /// ——名册行数会长到任务数，而工号是编制。座位行照建（派工要往上面写人），
+    /// 只是没有号：名册上「有号的行」正好是可以叫做人的那些行。
     async fn touch_employee(&self, registration: &AgentRegistration) {
         let mut conn = self.connection.clone();
         let now = Utc::now().to_rfc3339();
+        let person = cog_core::person_id_for(&registration.agent_id);
         let script = redis::Script::new(
             "local cur = redis.call('HGET', KEYS[1], ARGV[1]) \
              local row \
@@ -181,7 +187,7 @@ impl RedisAgentRegistry {
              else \
                  row = { first_seen = ARGV[2] } \
              end \
-             if row.number == nil or row.number == cjson.null then \
+             if (row.number == nil or row.number == cjson.null) and ARGV[5] == '1' then \
                  row.number = redis.call('INCR', KEYS[2]) \
              end \
              row.agent_id = ARGV[1] \
@@ -201,7 +207,8 @@ impl RedisAgentRegistry {
             .arg(&registration.agent_id)
             .arg(&now)
             .arg(&registration.role)
-            .arg(cog_core::person_id_for(&registration.agent_id).unwrap_or(""))
+            .arg(person.unwrap_or(""))
+            .arg(if person.is_some() { "1" } else { "0" })
             .invoke_async::<i64>(&mut conn)
             .await
         {
@@ -242,6 +249,40 @@ impl RedisAgentRegistry {
                 "the retirement could not be written to the roster; this person stays on it as active"
             );
         }
+    }
+
+    /// 把工号写进这一把座位的名册行；行不在就不写。
+    ///
+    /// 一次脚本而不是「读、改、写」：中间那一刻读名册的人会看到一把没有人的
+    /// 座位，而「还没有人」正是这一格要说的另一件事——两者同形，读的人分不出
+    /// 是派工还没到，还是这一笔写丢了。
+    ///
+    /// 行不在返回 `Err`：对从没注册过的名字造一行等于凭空造出一个人（见
+    /// `tombstone_employee`）。座位先注册、派工再写人，顺序反了是一处缺陷，
+    /// 应当报出来而不是安静地补一行。
+    async fn write_person(&self, agent_id: &str, person_id: &str) -> SFResult<()> {
+        let mut conn = self.connection.clone();
+        let script = redis::Script::new(
+            "local cur = redis.call('HGET', KEYS[1], ARGV[1]) \
+             if not cur then return 0 end \
+             local row = cjson.decode(cur) \
+             row.person_id = ARGV[2] \
+             redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(row)) \
+             return 1",
+        );
+        let written: i64 = script
+            .key(EMPLOYEES_KEY)
+            .arg(agent_id)
+            .arg(person_id)
+            .invoke_async(&mut conn)
+            .await
+            .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
+        if written == 0 {
+            return Err(SFError::Agent(format!(
+                "{agent_id} has no roster row: a person can be bound to a seat that registered first"
+            )));
+        }
+        Ok(())
     }
 
     /// Take the index entry off a name whose record has already gone.
@@ -447,6 +488,10 @@ impl AgentRegistry for RedisAgentRegistry {
             Some(text) => Some(decode_employee(agent_id, &text)?),
         })
     }
+
+    async fn assign_person(&self, agent_id: &str, person_id: &str) -> SFResult<()> {
+        self.write_person(agent_id, person_id).await
+    }
 }
 
 // ─── In-memory implementation ───
@@ -517,18 +562,23 @@ impl AgentRegistry for MemoryAgentRegistry {
                 row.person_id = Some(person.to_string());
             }
         } else {
-            store.next_number += 1;
-            let number = store.next_number;
+            // 工号只发给一个人，不发给一把椅子——与 Redis 那段脚本同一判据。
+            // 座位行照建（派工要往上面写人），号那一格空着。
+            let person = cog_core::person_id_for(&registration.agent_id);
+            let number = person.map(|_| {
+                store.next_number += 1;
+                store.next_number
+            });
             store.employees.insert(
                 registration.agent_id.clone(),
                 EmployeeRecord {
                     agent_id: registration.agent_id.clone(),
-                    number: Some(number),
+                    number,
                     role: registration.role.clone(),
                     first_seen: now,
                     last_seen: now,
                     retired_at: None,
-                    person_id: cog_core::person_id_for(&registration.agent_id).map(str::to_string),
+                    person_id: person.map(str::to_string),
                 },
             );
         }
@@ -618,6 +668,20 @@ impl AgentRegistry for MemoryAgentRegistry {
             .map_err(|_| SFError::Agent("memory registry lock poisoned".into()))?;
         Ok(store.employees.get(agent_id).cloned())
     }
+
+    async fn assign_person(&self, agent_id: &str, person_id: &str) -> SFResult<()> {
+        let mut store = self
+            .store
+            .write()
+            .map_err(|_| SFError::Agent("memory registry lock poisoned".into()))?;
+        let row = store.employees.get_mut(agent_id).ok_or_else(|| {
+            SFError::Agent(format!(
+                "{agent_id} has no roster row: a person can be bound to a seat that registered first"
+            ))
+        })?;
+        row.person_id = Some(person_id.to_string());
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -637,7 +701,7 @@ mod tests {
     #[tokio::test]
     async fn memory_registry_register_get_list_heartbeat() {
         let reg: Arc<dyn AgentRegistry> = Arc::new(MemoryAgentRegistry::new());
-        let agent_id = crate::generate_agent_id("host-1", "10.0.0.1", "planner", "uuid-1");
+        let agent_id = cog_core::agent_id_for_identity("uuid-1");
         let r = AgentRegistration::new(
             agent_id.clone(),
             "host-1",
@@ -673,7 +737,7 @@ mod tests {
     #[tokio::test]
     async fn memory_registry_ttl_expiry_filters_stale_entries() {
         let reg: Arc<dyn AgentRegistry> = Arc::new(MemoryAgentRegistry::new().with_ttl_seconds(0));
-        let agent_id = crate::generate_agent_id("host-1", "10.0.0.1", "planner", "uuid-1");
+        let agent_id = cog_core::agent_id_for_identity("uuid-1");
         let r = AgentRegistration::new(
             agent_id,
             "host-1",
@@ -717,6 +781,31 @@ mod tests {
         let b = reg.employee("probe-2").await.unwrap().expect("名册行");
         assert!(a.number.is_some() && b.number.is_some(), "名册行没有工号");
         assert_ne!(a.number, b.number, "两个员工共用一个工号");
+    }
+
+    /// 工号只发给一个人，不发给一把椅子。
+    ///
+    /// 座位随任务生灭，每接一件活注册一次；发号的话名册行数会长到任务数，
+    /// 「员工」这个读数就不再是编制，而是跑过多少件活。座位行照建（派工要往
+    /// 上面写人），号那一格空着：名册上**有号的行数**正好是可以叫做人的行数。
+    #[tokio::test]
+    async fn a_seat_gets_a_row_but_no_number() {
+        let reg = MemoryAgentRegistry::new();
+        reg.register(&reg_row("employee:1")).await.unwrap();
+        let seat = cog_core::agent_id_for("task-1", "generator");
+        reg.register(&reg_row(&seat)).await.unwrap();
+        reg.register(&reg_row(&cog_core::agent_id_for("task-2", "planner")))
+            .await
+            .unwrap();
+
+        let seat_row = reg.employee(&seat).await.unwrap().expect("座位行照建");
+        assert_eq!(seat_row.number, None, "一把椅子拿到了工号");
+        assert_eq!(seat_row.person_id, None, "座位还没派人，却写上了人");
+
+        let rows = reg.employees().await.unwrap();
+        assert_eq!(rows.len(), 3, "三个注册过的地址就是三行");
+        let numbered = rows.iter().filter(|row| row.number.is_some()).count();
+        assert_eq!(numbered, 1, "有号的行数应当等于人数，不是地址数");
     }
 
     /// 离职留行：注销之后这个人还在名册上，工号与入职时间都不变，只多一块

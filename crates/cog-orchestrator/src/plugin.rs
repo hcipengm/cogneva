@@ -425,6 +425,15 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             } else {
                 warn!("no AgentManager; task-scoped agents are never retired at task end");
             }
+            // 名册：座位背后坐着谁只写在名册行上。判「这一手是不是行上那位」
+            // 要它，所以与池子在同一次装配里挂。没挂的时候座位形认领与结果按
+            // 旧口径判（名字要比得一模一样）——那是这个进程读不到名册，不是
+            // 判据说「那个人不行」。
+            if let Some(roster) = ctx.consume_service::<dyn cog_core::AgentRegistry>() {
+                orch.attach_roster(roster);
+            } else {
+                warn!("no AgentRegistry; a seat's claim is judged by its name alone");
+            }
             // Start archive background loop
             if ctx.config().dag_executor.archive_enabled {
                 orch.start_archive_loop();

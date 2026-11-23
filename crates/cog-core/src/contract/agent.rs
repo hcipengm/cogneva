@@ -454,9 +454,14 @@ impl AgentRegistration {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EmployeeRecord {
     pub agent_id: String,
-    /// 工号。建行时从全局计数器上取一个，此后不改、不回收——退役的人留着它，
-    /// 正如离职员工保留工号。缺省是 `None`：这一格是后加的，早于它的名册行
-    /// 里没有工号，读到 `None` 的人要说「还没编号」，不能拿 0 冒充。
+    /// 工号。人形 id 建行时从全局计数器上取一个，此后不改、不回收——退役的
+    /// 人留着它，正如离职员工保留工号。
+    ///
+    /// **只发给一个人，不发给一把椅子**：座位行（`squad:<任务>-<座位>`）照建
+    /// ——派工要往上面写人——但没有号。座位随任务生灭，每接一件活注册一次，
+    /// 给它发号的话名册行数会长到任务数，「员工」这个读数就不再是编制。所以
+    /// 读到 `None` 有两种实情：这一行是座位（本来就不该有号），或者这一行是
+    /// 早于本列的旧人形行（还没编号）。两者都不许拿 0 冒充。
     #[serde(default)]
     pub number: Option<u32>,
     /// 建行时注册表上写的用途标签。它随注册更新，因为它描述的是「此刻这个人
@@ -537,6 +542,20 @@ pub trait AgentRegistry: Send + Sync {
     /// 名册搬过来：入职接口、对话页的称呼都在调用最频繁的那条路上。
     async fn employee(&self, _agent_id: &str) -> SFResult<Option<EmployeeRecord>> {
         Ok(None)
+    }
+
+    /// 把一个人写进这一把座位的名册行：派工时定下谁做，执行时座位记下是谁。
+    ///
+    /// 人不是座位的属性，这件事只有一层写下来的地方，因为它的形状答不出来：
+    /// `squad:<task>-<role>` 里没有工号，`person_id_for` 对它只能答 `None`。
+    /// 派工那一刻写下的人，必须在这里落进名册，否则同一个工号与同一把座位之间
+    /// 唯一的联系只活在任务行上，名册读不出「坐在这儿的是谁」。
+    ///
+    /// 没有名册行的实现返回 `NotImplemented` 而不是静默成功：「记下了」与
+    /// 「这面名册根本不记事」在调用方那一侧是两句话，前者可以当作已落，后者
+    /// 只能作为一条读数的缺口报出去。
+    async fn assign_person(&self, _agent_id: &str, _person_id: &str) -> SFResult<()> {
+        Err(crate::SFError::NotImplemented("assign_person".into()))
     }
 }
 
@@ -656,16 +675,22 @@ pub trait AgentManager: Send + Sync {
     }
 }
 
-/// Generate a deterministic agent_id from the four input dimensions.
-pub fn generate_agent_id(hostname: &str, pod_ip: &str, role: &str, uuid: &str) -> String {
+/// 一个员工的 id：只由「这个人是谁」算出来。
+///
+/// 身份的输入只有一格：调用方自报的稳定编号（uuid），或安装期指纹——两者都是
+/// 跨重装、跨滚动不变的那一格。姓名、主机名、Pod IP、此刻担的职务都不进来：
+/// 它们会变，而 id 是别的账页上记着的那个人的主键。把职务掺进来的旧写法
+/// （`hostname|pod_ip|role|uuid`）让同一个人换个岗位就变成一个新员工——名下
+/// 的活、账、提交记录全留在旧 id 上，读起来是「老人离岗、新人到岗」。
+///
+/// 这里也是全树唯一一份派生：原来 `cog-storage` 另有一份同函数拷贝，改一处
+/// 另一处不跟着动，两个"同一个人"就分家了。门：
+/// `crates/cogneva/tests/a_person_keeps_one_id_whatever_their_post_test.rs`。
+pub fn agent_id_for_identity(identity: &str) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(hostname.as_bytes());
-    hasher.update(b"|");
-    hasher.update(pod_ip.as_bytes());
-    hasher.update(b"|");
-    hasher.update(role.as_bytes());
-    hasher.update(b"|");
-    hasher.update(uuid.as_bytes());
+    // 域分隔：同一份 blake3 还被别的键用着，前缀把两个命名空间分开。
+    hasher.update(b"cogneva/agent-id/v1\n");
+    hasher.update(identity.as_bytes());
     let hash = hasher.finalize();
     hash.to_hex().to_string()
 }

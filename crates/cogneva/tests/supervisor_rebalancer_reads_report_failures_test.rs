@@ -28,12 +28,11 @@ use cog_core::{
     TaskType,
 };
 use cog_supervisor::lifecycle_coordinator::RecoveredCheckpoint;
-use cog_supervisor::registry::{AgentInfo, AgentRegistry};
+use cog_supervisor::registry::AgentRegistry;
 use cog_supervisor::task_rebalancer::{TaskRebalancer, TaskRebalancerConfig};
 use cog_test_support::{MemoryStateBackend, TaskGraphStub};
 
 const UNANSWERED: &str = "the state store did not answer";
-
 
 fn rebalancer_with(
     reg: Arc<AgentRegistry>,
@@ -154,7 +153,7 @@ async fn a_ready_queue_that_cannot_be_read_fails_the_pass() {
 #[tokio::test]
 async fn a_task_table_that_cannot_be_read_fails_the_pass() {
     let reg = Arc::new(AgentRegistry::new());
-    reg.register_agent(make_agent("agent-1"));
+    reg.register_agent(common::orchestrator::agent("agent-1"));
 
     let backend = MemoryStateBackend::new();
     backend
@@ -216,8 +215,8 @@ async fn a_graph_that_cannot_be_read_fails_the_recovery_plan() {
 #[tokio::test]
 async fn an_agent_whose_state_cannot_be_read_is_left_out_of_the_pass() {
     let reg = Arc::new(AgentRegistry::new());
-    reg.register_agent(make_agent("agent-1"));
-    reg.register_agent(make_agent("agent-2"));
+    reg.register_agent(common::orchestrator::agent("agent-1"));
+    reg.register_agent(common::orchestrator::agent("agent-2"));
 
     let backend: Arc<dyn StateBackend> = Arc::new(UnreadableFor {
         inner: MemoryStateBackend::new(),

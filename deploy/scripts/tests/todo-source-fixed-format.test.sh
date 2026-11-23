@@ -66,7 +66,20 @@ out=$(run "$tmp/notouch.md"); rc=$?
     && ok "没有触点：拒读并点名" \
     || bad "没有触点的行被静默丢掉（rc=$rc）：$out"
 
-# 5. 序号带 `S` 前缀、带子号：仍按五格读。按前缀分形状的读法会把它们交给三格
+# 5. 已落行的差距格带着触点尾巴：那是写法不是差距，读成债就等于这条永远欠着。
+printf '| CC05 | 终态 | 已落（971c92db5） | — ｜touches: scripts/hooks/round.py | 已落 |\n' >"$tmp/closed-touches.md"
+out=$(python3 -c "
+import sys
+sys.path.insert(0, '$root/scripts/hooks')
+import todo_source
+debt = todo_source.terminal_debt('md:$tmp/closed-touches.md')
+print('DEBT', len(debt), ' '.join(i.id for i in debt))
+" 2>&1); rc=$?
+{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "DEBT 0"; } \
+    && ok "已落行的触点尾巴不算差距：不进债" \
+    || bad "做完的行被读成了债（rc=$rc）：$out"
+
+# 6. 序号带 `S` 前缀、带子号：仍按五格读。按前缀分形状的读法会把它们交给三格
 #    分支，于是「现在」那一格成了状态词，整族 S 账读不成。
 printf '| S20.7 | 终态 | 现在不是状态词 | 差距 ｜ touches: crates/a/src/x.rs | 未落 |\n| S77 | 终态 | 现在 | 差 ｜ touches: crates/b/src/y.rs | 未落 |\n' >"$tmp/prefixed.md"
 out=$(run "$tmp/prefixed.md"); rc=$?
@@ -74,14 +87,14 @@ out=$(run "$tmp/prefixed.md"); rc=$?
     && ok "S 前缀与带子号的序号按五格读" \
     || bad "S 开头的五格行被当成三格读（rc=$rc）：$out"
 
-# 6. 五格行把状态写成散文：拒读并点名。静默丢掉的读数与「本条不在台账里」同形。
+# 7. 五格行把状态写成散文：拒读并点名。静默丢掉的读数与「本条不在台账里」同形。
 printf '| N07 | 终态 | 现在 | 差距 ｜ touches: crates/a/src/x.rs | 树里：还没做 |\n' >"$tmp/prose.md"
 out=$(run "$tmp/prose.md"); rc=$?
 { [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q "N07"; } \
     && ok "五格行状态写成散文：拒读并点名" \
     || bad "状态写坏的 N 行被静默算成没有（rc=$rc）：$out"
 
-# 7. 做到终态的行不需要触点：它不进任何一批，触点对它没有意义。反过来的顺序会把
+# 8. 做到终态的行不需要触点：它不进任何一批，触点对它没有意义。反过来的顺序会把
 #    台账里做得最干净的那几行报成「算不出批次」，整本台账因此读不动。
 printf '| N09 | 终态 | 现在 | — | 已落 |\n' >"$tmp/reached.md"
 out=$(run "$tmp/reached.md"); rc=$?
@@ -89,7 +102,7 @@ out=$(run "$tmp/reached.md"); rc=$?
     && ok "已落且差距为空：没有触点也不拒" \
     || bad "做到终态的行因为没有触点被拒（rc=$rc）：$out"
 
-# 8. 旧形状的三格 S 行仍按三格读：状态在第 3 格，不是「末格」。按形状判的那一版
+# 9. 旧形状的三格 S 行仍按三格读：状态在第 3 格，不是「末格」。按形状判的那一版
 #    如果把这些行当成五格，末格是判据文案，整行会被当成「状态写成散文」拒掉。
 printf '| S99 | 旧格式现在格 | 未落 | 判据 ｜touches: crates/a/src/x.rs\n' >"$tmp/legacy.md"
 out=$(run "$tmp/legacy.md"); rc=$?

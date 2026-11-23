@@ -1,5 +1,6 @@
-//! 名册行在真的 Redis 上成立的三件事：注册即发一个工号、同一个 id 不重复
-//! 吃号、退役之后行还在且号不变。
+//! 名册行在真的 Redis 上成立的几件事：注册即发一个工号、同一个 id 不重复
+//! 吃号、退役之后行还在且号不变，以及**座位行照建、号不发**——工号发给一个
+//! 人，不发给一把椅子。最后这一条尤其要在脚本上测：发号那一格住在 Lua 里。
 //!
 //! 内存实现里也有同一组断言（`redis::registry::tests`），但那证明不了这里：
 //! 发号那一步住在 Lua 脚本里，而内存实现根本没有脚本。两套实现各写一遍时，
@@ -79,6 +80,47 @@ async fn two_employees_hold_different_numbers() {
     let nb = reg.employee(&b.agent_id).await.unwrap().unwrap().number;
     assert!(na.is_some() && nb.is_some());
     assert_ne!(na, nb, "两个员工共用一个工号");
+}
+
+/// 座位行照建、号不发：工号发给一个人，不发给一把椅子。
+///
+/// 座位随任务生灭，每接一件活注册一次。发号的话名册行数会长到任务数，「员工」
+/// 这个读数就不再是编制。座位行必须照建——派工要往上面写人；号那一格空着，
+/// 名册上「有号的行数」才正好等于人数。
+#[tokio::test]
+#[ignore = "needs a throwaway Redis: set COGNEVA_TEST_REDIS_URL"]
+async fn a_seat_gets_a_row_but_no_number() {
+    let reg = registry().await;
+    let seat = cog_core::agent_id_for(&format!("{PROBE}:seat-task"), cog_core::roles::GENERATOR);
+    let row = AgentRegistration::new(
+        &seat,
+        "probe-host",
+        "127.0.0.1",
+        "probe",
+        "probe",
+        ResourceInfo::default(),
+    );
+    reg.register(&row).await.unwrap();
+
+    let seat_row = reg
+        .employee(&seat)
+        .await
+        .unwrap()
+        .expect("座位行被省掉了：派工没有地方写人");
+    assert_eq!(seat_row.number, None, "一把椅子领了工号");
+
+    // 座位不占号：同一个人照常领号，号也不因为座位注册过而跳一格。
+    let person = registration("seat-neighbour");
+    reg.register(&person).await.unwrap();
+    assert!(
+        reg.employee(&person.agent_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .number
+            .is_some(),
+        "座位注册之后，人领不到号"
+    );
 }
 
 /// 退役留行、留号、留入职时间；回来上班也不换号。

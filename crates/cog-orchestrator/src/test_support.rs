@@ -5,6 +5,7 @@
 //! 形状一变，两份不会同时红。
 
 use crate::principle_measure::Declarations;
+use tracing_subscriber::prelude::*;
 
 /// 把 `(路径, 文本)` 的行解析成一份声明账。
 pub(crate) fn declarations(lines: &[(&str, &str)]) -> Declarations {
@@ -14,4 +15,169 @@ pub(crate) fn declarations(lines: &[(&str, &str)]) -> Declarations {
             .map(|(path, text)| (path.to_string(), text.to_string()))
             .collect::<Vec<_>>(),
     )
+}
+
+/// 收下 warn 级事件的正文，供断言「这一件事在屏幕上说出来了没有」。
+///
+/// 这一族里的几处修法不改变返回值：读不到时那一趟仍然什么都不做，与「确实
+/// 没有要做的事」给的是同一个返回。屏幕上那几行就是唯一能分开两者的地方，
+/// 断言只能落在它上面。
+///
+/// 订阅者**装一次、装成进程级的，不撤下**。`tracing` 对每条 callsite 算一份
+/// 兴趣缓存，算的是「这个进程里此刻注册着哪些订阅者」；`set_default` 是线程
+/// 局部的，而且只有一条订阅者注册着时它算的是**命中那条线程**上的默认订阅者。
+/// 别的测试线程先命中同一条 warn 时，那一次算出来的是 `NoSubscriber` 的 never
+/// ——之后我们这一层就再也收不到（2026-11-23 实测：同一批测试单跑绿、整套并行
+/// 跑红，`said()` 空着）。装成全局的，任何线程上的默认订阅者都是它。
+///
+/// 每条事件按 `ThreadId` 分桶，每个测试只读自己那一桶：`#[tokio::test]` 默认的
+/// current-thread runtime 不换线程，它 spawn 出来的任务也在同一条线程上跑。
+#[derive(Clone, Default)]
+pub(crate) struct WarnSink(std::sync::Arc<std::sync::Mutex<Vec<(std::thread::ThreadId, String)>>>);
+
+/// 一条事件的正文与它带的那几个字段。
+///
+/// 正文是这一族断言的主语，字段跟着印在后面：`status` 这类字段正是「读到了」
+/// 与「没读到」分开的地方，只收正文就看不见它。
+#[derive(Default)]
+pub(crate) struct MessageField {
+    message: String,
+    fields: Vec<String>,
+}
+
+impl MessageField {
+    fn line(self) -> String {
+        if self.fields.is_empty() {
+            self.message
+        } else {
+            format!("{} [{}]", self.message, self.fields.join(" "))
+        }
+    }
+}
+
+impl tracing::field::Visit for MessageField {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        } else {
+            self.fields.push(format!("{}={value:?}", field.name()));
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        } else {
+            self.fields.push(format!("{}={value}", field.name()));
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnSink {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if *event.metadata().level() != tracing::Level::WARN {
+            return;
+        }
+        let mut field = MessageField::default();
+        event.record(&mut field);
+        self.0
+            .lock()
+            .unwrap()
+            .push((std::thread::current().id(), field.line()));
+    }
+}
+
+pub(crate) struct WarnText {
+    sink: WarnSink,
+    thread: std::thread::ThreadId,
+}
+
+/// 这一条测试线程上收到的那几行 warn。
+pub(crate) fn warn_text() -> WarnText {
+    static SINK: std::sync::OnceLock<WarnSink> = std::sync::OnceLock::new();
+    let sink = SINK.get_or_init(|| {
+        let sink = WarnSink::default();
+        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(sink.clone()))
+            .expect("这个测试二进制里不该有别人先装全局订阅者");
+        sink
+    });
+    WarnText {
+        sink: sink.clone(),
+        thread: std::thread::current().id(),
+    }
+}
+
+impl WarnText {
+    pub(crate) fn said(&self) -> Vec<String> {
+        self.sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(thread, _)| *thread == self.thread)
+            .map(|(_, line)| line.clone())
+            .collect()
+    }
+
+    pub(crate) fn any(&self, needle: &str) -> bool {
+        self.said().iter().any(|line| line.contains(needle))
+    }
+}
+
+/// 只答得出「某把座位背后是谁」的名册：认领判据与结果判据读的就是这一格。
+///
+/// 名册的其余接口在用到它的用例里不判，所以它们答「没有」；`assign_person`
+/// 与 `employee` 必须成对——判据读的是后者，而它只能由前者写出来。
+#[derive(Default)]
+pub(crate) struct Seats(pub(crate) std::sync::Mutex<std::collections::HashMap<String, String>>);
+
+#[async_trait::async_trait]
+impl cog_core::AgentRegistry for Seats {
+    async fn register(&self, _r: &cog_core::AgentRegistration) -> cog_core::SFResult<()> {
+        Ok(())
+    }
+    async fn heartbeat(&self, _id: &str) -> cog_core::SFResult<()> {
+        Ok(())
+    }
+    async fn deregister(&self, _id: &str) -> cog_core::SFResult<()> {
+        Ok(())
+    }
+    async fn get(&self, _id: &str) -> cog_core::SFResult<Option<cog_core::AgentRegistration>> {
+        Ok(None)
+    }
+    async fn list(&self) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
+        Ok(Vec::new())
+    }
+    async fn list_by_role(
+        &self,
+        _role: &str,
+    ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
+        Ok(Vec::new())
+    }
+    async fn employee(
+        &self,
+        agent_id: &str,
+    ) -> cog_core::SFResult<Option<cog_core::EmployeeRecord>> {
+        let person = self.0.lock().unwrap().get(agent_id).cloned();
+        Ok(person.map(|person_id| cog_core::EmployeeRecord {
+            agent_id: agent_id.to_string(),
+            number: None,
+            role: cog_core::roles::GENERATOR.to_string(),
+            first_seen: chrono::Utc::now(),
+            last_seen: chrono::Utc::now(),
+            retired_at: None,
+            person_id: Some(person_id),
+        }))
+    }
+    async fn assign_person(&self, agent_id: &str, person_id: &str) -> cog_core::SFResult<()> {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(agent_id.to_string(), person_id.to_string());
+        Ok(())
+    }
 }

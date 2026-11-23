@@ -27,9 +27,11 @@ pub struct RegisterRequest {
     pub workspace_id: String,
     #[serde(default)]
     pub resources: ResourceInfo,
-    /// Optional client-supplied uuid for deterministic agent_id.  When `None`
-    /// we generate a fresh `uuid_v4` so multiple instances of the same pod
-    /// don't collide on `blake3(hostname|ip|role)`.
+    /// 这个人的稳定编号：跨重装、跨滚动不变的那一格。
+    ///
+    /// 必填。缺了它服务端拒绝登记，不再随机发一个「人」——随机发的那个 id
+    /// 下一次滚动就找不回来，名下的活与账全成了无主。宿主名、Pod IP、role
+    /// 只是这一次注册行上的事实，不进 id。
     #[serde(default)]
     pub uuid: Option<String>,
 }
@@ -52,8 +54,19 @@ pub async fn register_handler(
             .into_response();
     };
 
-    let uuid = req.uuid.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let agent_id = cog_core::generate_agent_id(&req.hostname, &req.pod_ip, &req.role, &uuid);
+    // id 只由稳定身份派生；role／hostname／pod_ip 留在注册行上，是这一次注册
+    // 的事实，不是这个人是谁。原来这里没有 uuid 就现发一个随机的，于是同一个
+    // 进程每重装一次都在名册上多一个「新人」。
+    let Some(identity) = req.uuid.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "registration must name a stable identity (`uuid`): a person keeps one id across restarts, and an id invented here would be lost on the next one",
+            })),
+        )
+            .into_response();
+    };
+    let agent_id = cog_core::agent_id_for_identity(identity);
     let now = chrono::Utc::now();
     let registration = AgentRegistration {
         agent_id: agent_id.clone(),
@@ -2023,7 +2036,9 @@ fn roster_with_people(
         let mut view = serde_json::json!({
             "agent_id": agent_id.clone(),
             "display_name": cog_core::unregistered_label(&agent_id),
-            "role": "chat",
+            // 下线的对话员工也是个人：角色格写「一个员工」，不写「这一轮在说」。
+            // 后者是一种状态，不是人的身份，而名册这一格只答「是谁」。
+            "role": EMPLOYEE_ROLE,
             "workspace_id": "default",
             "hostname": String::new(),
             "pod_ip": String::new(),
@@ -2111,12 +2126,13 @@ fn roster_with_people(
 /// 一眼认出它不是某个叫这个名字的员工，所以它不像一个人名那样带工号。
 const UNASSIGNED_SEATS_LABEL: &str = "座位，尚未分配给人";
 
-/// 按人把名册收成一列：一个人一行，当前戴着的帽子挂在后面。
+/// 按人把名册收成一列：一个人一行，他此刻占着的地址挂在后面。
 ///
 /// 座位是地址，人是身份。按座位展开的名册在任务一多时会长出成百上千行「人」，
 /// 读的人分不出哪个是真员工、哪个是某件活临时起的座位——而任务一结束，那个
-/// 「人」就消失了。这里按 `person_id` 收成一行人，帽子（`agent_ids`）一个
-/// 不少地列出来：地址不能丢，丢了这个人在对话页就点不到了。
+/// 「人」就消失了。这里按 `person_id` 收成一行人，地址（`agent_ids`）一个
+/// 不少地列出来：地址不能丢，丢了这个人在对话页就点不到了。地址有几个就是
+/// 几个，不再另发一个数——数两次的两个数迟早对不上。
 ///
 /// `person_id` 为空的那一组收成单独一行，名字是
 /// [`UNASSIGNED_SEATS_LABEL`]：它们不是很多人，是一个读数——还有多少座位背后
@@ -2153,7 +2169,7 @@ fn people_of(views: &[serde_json::Value]) -> Vec<serde_json::Value> {
             let live = rows
                 .iter()
                 .any(|v| v.get("live").and_then(|l| l.as_bool()) == Some(true));
-            // 一个人的全部帽子都退役了，他才算离职；还有一顶在役就不是。
+            // 这个人的全部地址都退役了，他才算离职；还有一个在役就不是。
             let retired = rows
                 .iter()
                 .all(|v| v.get("retired").and_then(|r| r.as_bool()) == Some(true));
@@ -2188,7 +2204,6 @@ fn people_of(views: &[serde_json::Value]) -> Vec<serde_json::Value> {
                 "retired": retired,
                 "roles": roles,
                 "agent_ids": agent_ids,
-                "caps": agent_ids.len(),
             })
         })
         .collect()
@@ -2210,7 +2225,8 @@ fn seats_without_a_person(roster_read: bool, people_rows: &[serde_json::Value]) 
         people_rows
             .iter()
             .find(|row| row.get("person_id").is_none_or(|v| v.is_null()))
-            .and_then(|row| row.get("caps").and_then(|caps| caps.as_u64()))
+            .and_then(|row| row.get("agent_ids").and_then(|ids| ids.as_array()))
+            .map(|ids| ids.len() as u64)
             .unwrap_or(0),
     )
 }
@@ -2740,7 +2756,7 @@ mod tests {
     #[test]
     fn a_roster_row_prints_its_employee_number_and_name() {
         let reg = cog_core::AgentRegistration::new(
-            cog_core::agent_id_for("task-1", "planner"),
+            "luna-1822ab0e",
             "cog-agent",
             "127.0.0.1",
             "planner",
@@ -2779,7 +2795,7 @@ mod tests {
     fn a_retired_employee_keeps_its_row_and_its_number() {
         let now = chrono::Utc::now();
         let row = cog_core::EmployeeRecord {
-            agent_id: "squad:gone-1-2026-11-07-planner".into(),
+            agent_id: "kai-a9ab11fc".into(),
             number: Some(41),
             role: "planner".into(),
             first_seen: now,
@@ -2801,9 +2817,11 @@ mod tests {
     fn a_row_says_whether_a_person_stands_behind_it() {
         let now = chrono::Utc::now();
         let seat = cog_core::agent_id_for("task-1", "generator");
-        let row = |agent_id: &str, role: &str| cog_core::EmployeeRecord {
+        // 座位行没有工号——工号只发给一个人。这一格照实例写：人形行有号，
+        // 座位行没有，两个 id 之外唯一的差别就是这一格与背后的人。
+        let row = |agent_id: &str, role: &str, number: Option<u32>| cog_core::EmployeeRecord {
             agent_id: agent_id.into(),
-            number: Some(3),
+            number,
             role: role.into(),
             first_seen: now,
             last_seen: now,
@@ -2811,8 +2829,8 @@ mod tests {
             person_id: None,
         };
         let roster: std::collections::HashMap<String, cog_core::EmployeeRecord> = vec![
-            row("employee:0e2ba053", "employee"),
-            row(&seat, "generator"),
+            row("employee:0e2ba053", "employee", Some(3)),
+            row(&seat, "generator", None),
         ]
         .into_iter()
         .map(|r| (r.agent_id.clone(), r))
@@ -2833,12 +2851,12 @@ mod tests {
         );
     }
 
-    /// 一个人戴两顶帽子，名册上仍是一行；没派给人的座位收成单独一行。
+    /// 一个人占着两个地址，名册上仍是一行；没派给人的座位收成单独一行。
     ///
     /// 判据原话：「给一个人派两条任务 ⇒ 名册里是一行」。按座位展开时同一个人
     /// 会出现两次，读的人以为撞了名；而没派人的座位不是「很多人」，是一个读数。
     #[test]
-    fn a_person_with_two_caps_is_one_row_and_the_unassigned_seats_are_another() {
+    fn a_person_with_two_seats_is_one_row_and_the_unassigned_seats_are_another() {
         let view = |agent_id: String, role: &str, person: Option<&str>| {
             serde_json::json!({
                 "agent_id": agent_id,
@@ -2863,20 +2881,22 @@ mod tests {
         let people = people_of(&views);
         assert_eq!(people.len(), 2, "一个人一行，加没派人的座位一组");
         assert_eq!(people[0]["person_id"], "employee:1");
-        assert_eq!(people[0]["caps"], 2);
         assert_eq!(
             people[0]["agent_ids"],
             serde_json::json!([first, second]),
-            "帽子（地址）一个都不能丢，丢了这个人在对话页就点不到"
+            "地址一个都不能丢，丢了这个人在对话页就点不到"
+        );
+        assert!(
+            people[0].get("caps").is_none(),
+            "地址数就是 agent_ids 的长度，服务端不再另发一个数"
         );
         assert_eq!(
             people[0]["roles"],
             serde_json::json!(["generator", "evaluator"]),
-            "角色随任务变，一个人可以同时戴几顶不同的帽子"
+            "角色随任务变，一个人可以同时占着几个地址"
         );
         assert_eq!(people[1]["person_id"], serde_json::Value::Null);
         assert_eq!(people[1]["display_name"], UNASSIGNED_SEATS_LABEL);
-        assert_eq!(people[1]["caps"], 2);
         assert_eq!(
             seats_without_a_person(true, &people),
             Some(2),

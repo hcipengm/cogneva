@@ -364,6 +364,10 @@ fn production_numbered_impl(text: &str, keep_comments: bool) -> Vec<(usize, &str
     let shapes = brace_shapes(text);
     let mut out = Vec::new();
     let mut gated = false;
+    // 这一行是不是被门装饰的那一项的第一行。字段与枚举支是**一行**、以逗号收尾，
+    // 续行里的逗号（`fn f(` 之后的一个参数）后面还有这一项的身子，所以只有第一行
+    // 上的逗号能算收尾。
+    let mut head = false;
     let mut skipping: Option<(i32, bool)> = None;
     let mut waiting = 0usize;
     for (index, line) in lines.iter().copied().enumerate() {
@@ -388,6 +392,7 @@ fn production_numbered_impl(text: &str, keep_comments: bool) -> Vec<(usize, &str
                 }
                 gated = false;
                 skipping = Some((0, false));
+                head = true;
                 waiting = 0;
             } else {
                 if trimmed.starts_with("//") && !keep_comments {
@@ -401,7 +406,15 @@ fn production_numbered_impl(text: &str, keep_comments: bool) -> Vec<(usize, &str
         let (depth, opened) = skipping.take().unwrap_or((0, false));
         let next = depth + shape.delta;
         let opened = opened || shape.opens;
-        let ended = (opened && next <= 0) || (!opened && trimmed.ends_with(';'));
+        // 字段、枚举支、结构体字面量里的一格：门装饰的那一项就是这一行，它以逗号
+        // 收尾、不带身子。不认识这种形状时这一项要等五十行才被放弃，而放弃之后
+        // 真实的收尾括号（`}`）已经落在被跳过的一段里——从这里往下读到的正文括号
+        // 净差三格，`impl` 的配平于是永远收不拢（实测：orchestrator.rs 里带
+        // `#[cfg(test)]` 的那个字段）。
+        let field_form = head && !shape.opens && trimmed.trim_end().ends_with(',');
+        head = false;
+        let ended =
+            (opened && next <= 0) || (!opened && (trimmed.trim_end().ends_with(';') || field_form));
         if ended {
             waiting = 0;
         } else if !opened {

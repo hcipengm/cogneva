@@ -898,7 +898,6 @@ fn submitted_tasks(
     goal_id: &str,
     submitted_by: Option<&str>,
 ) -> Vec<Task> {
-
     let mut rows: Vec<Task> = req
         .tasks
         .as_ref()

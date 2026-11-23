@@ -320,6 +320,13 @@ live_check db 'Live-DB metering readings' cargo test -p cog-observability --test
 # of the evidence makes a ceiling that never moves on the path that spends
 # the most -- in production, where no fixture can see it.
 live_check db 'Live-DB person and task spend' cargo test -p cog-observability --test person_and_task_spend -- --ignored
+# An attempt row is where "who did this stretch of work, in what role" is
+# written, and the write goes through one statement whose columns a fixture
+# cannot check: the role is reverse-derived from the seat address and the
+# person from the row's owner cell. A migration that adds the column, a
+# startup schema that adds it, and a statement that never fills it all pass
+# every reading that runs without a server.
+live_check db 'Live-DB attempts record the person and role' cargo test -p cog-storage --test task_attempt_records_the_seat -- --ignored
 # The quota path asks the task graph who submitted a task once per request,
 # and that read is served by an index whose first column has to be the one
 # the lookup filters on. Neither half can be answered without a server: an

@@ -68,10 +68,11 @@ def parse_cells(text: str) -> dict[str, str]:
 
 
 class Item:
-    __slots__ = ("id", "title", "text", "touches", "deferred", "cells", "gap", "now")
+    __slots__ = ("id", "title", "text", "touches", "deferred", "cells", "fixed", "gap", "now")
 
     def __init__(self, id: str, title: str, text: str, touches: list[str], deferred: bool = False,
-                 cells: dict[str, str] | None = None, gap: str = "", now: str = ""):
+                 cells: dict[str, str] | None = None, fixed: bool = False, gap: str = "",
+                 now: str = ""):
         self.id = id
         self.title = title
         # 整行原文（不截断）。`title` 是给人看的前 80 字，用来估「这一条读起来要多少
@@ -83,15 +84,24 @@ class Item:
         self.deferred = deferred
         # 三格：代码 / 上线 / 验证。**判「做没做完」只认这三格**，不认触点。
         # 触点是「这一轮该改哪些文件」的提示；一个文件改了不等于那条待办做完了
-        # （改了一半、改错了地方、或者只是碰巧在同一条路径上），2026-11-21 属主定。
+        # （改了一半、改错了地方、或者只是碰巧在同一条路径上）；判据见
+        # `deploy/scripts/tests/batch-gate.test.sh` 的场景 3b。
         self.cells = cells or {}
+        # 五格行（`序号 | 终态 | 现在 | 差距 | 状态`）的判据不在三格上：它自己写出了
+        # 「差距」那一格。走到这里的五格行都是未落——`已落` 且差距为空的行在
+        # `_fixed_item` 里就返回 None（不进批次），所以这里不必再判一次终态。
+        self.fixed = fixed
         # 五格行里那一格「还差什么」。它随轮一起走（写进轮的载荷）：接着做的人
         # 打开轮就看得见缺口，不必把整本台账重判一遍（S68）。
         self.gap = gap
-        # 「现在」那一格：它必须带出处（`now_has_source`）。
+        # 「现在」那一格：随行去平台，与终态、差距同一种形状。
         self.now = now
 
     def missing_cells(self) -> list[str]:
+        if self.fixed:
+            # 五格行缺的永远是它自己写的那一格。借三格的标签去报「缺 代码、上线、
+            # 验证」会把读数人引到一格这一行根本没有的列上。
+            return ["差距"]
         return [tag for tag in CELL_TAGS if not self.cells.get(tag)]
 
     def is_complete(self) -> bool:
@@ -123,18 +133,35 @@ _FIXED_STATUS = ("未落", "已落")
 _GAP_EMPTY = ("", "—", "-", "–")
 
 
-def _fixed_item(line: str, notouch: list[str]) -> tuple[Item, bool] | None:
+def _fixed_item(line: str, notouch: list[str], malformed: list[str],
+                legacy_status: list[str]) -> tuple[Item, bool] | None:
     """读一行五格台账。返回 (条目, 是否按未完成读)；不是这个形状时返回 None。
 
-    「已落」只在差距那一格为空时才成立（属主 2026-11-23 定）。写着已落却还留着差距的行，
+    「已落」只在差距那一格为空时才成立。写着已落却还留着差距的行，
     按未完成读并进 debt——与三格那种「填不满的已落」同一处置：跳过它等于承认那个假的终态，
     而拒读会让整本台账一个门都开不开。
+
+    形状不对（列数不足）与状态词不在闭集里的行**点名拒读**：静默跳过它们，这一行就从
+    每一个批次里消失了，而读数照样绿——「读不到」被读成「没有」。
+
+    但「列数不足」只对**长得像五格行**的那些行成立：同一本台账里还有更早的
+    `| id | 一句话 | 状态 | 证据 |` 四列表格（历史现场），它们的末格是证据路径、不是状态词。
+    把那些也拒掉，整本台账就一个门都开不开——门判的是「这一条做到没有」，不是「每一个
+    历史表格都合今天的形状」。
     """
     cells = [c.strip() for c in line.strip().strip("|").split("|")]
     if len(cells) < 5:
+        if cells and cells[-1] in _FIXED_STATUS:
+            # 末格是状态词却只有四格：这是五格行，少了一列。它读不出做没做，点名。
+            malformed.append(f"{cells[0]}（五格行只有 {len(cells)} 列）")
         return None
     status = cells[-1]
     if status not in _FIXED_STATUS:
+        # 同一本台账里还有更早的几代 `| id | … | 状态 |` 四列表格，最后一格是自由文字
+        # （「部分已落；剩余移交」）。它们的格数本就不足五格，在上一段里已经有名字。
+        # 到了这里还有五格以上、末格却不是状态词的行，是**五格行写坏了**：拒读并点名。
+        # 把写坏的当旧表略过，等于让一条待办整族地从每个批次里消失，而读数照样绿。
+        malformed.append(f"{cells[0]}（状态：{status[:16]}）")
         return None
     found = None
     for found in re.finditer(r"[｜|]\s*touches:\s*([^|｜\n]+)", line):
@@ -150,30 +177,44 @@ def _fixed_item(line: str, notouch: list[str]) -> tuple[Item, bool] | None:
             if p.strip() and p.strip() != "unknown"
         ]
         touches = [p.strip(" ）)") for p in touches if p.strip(" ）)")]
-    # 触点写在差距格里（行尾那一格），判「差距是不是空」要先把它切掉：
-    # `— ｜ touches: …` 的差距是空的，它不是「还差什么」。
+    # 差距那一格可以带触点尾巴（`— ｜touches: …`）：五格行的触点没有第六列可放，写在
+    # 差距格尾。判终态时先把它剥掉——不剥的话，一条真正做完的行会被读成「写着已落却
+    # 留着差距」的债，结束一轮时它会一直欠在那里，而它欠的东西其实只是触点提示。
     gap = re.split(r"[｜|]\s*touches:", cells[3])[0].strip()
-    # 「已落且差距为空」这一档**不需要触点**：它不进任何一批，触点对它没有意义。
-    # 先判这一档、再要求触点——反过来的版本会把一条做到终态的行报成「算不出批次」，
-    # 于是台账里做得最干净的那几行反而让整本读不动（2026-11-23 实测：N04／S57／N38）。
+    # 「已落且差距为空」这一档**不需要触点**：终态真的到了，它不进任何一批，触点对它
+    # 没有意义。先判这一档、再要求触点——反过来的版本会把一条做到终态的行报成
+    # 「算不出批次」，于是台账里做得最干净的那几行反而让整本读不动
+    # （2026-11-23 实测：N04／S57／N38）。
     if status.startswith(CLOSED_PREFIXES) and gap in _GAP_EMPTY:
-        return None  # 终态真的到了：不进批次。
+        return None
     if not touches and not deferred:
-        # 没有触点的行算不出批次。留空让它「不在批次里」是最坏的形状：它看起来像做完了。
+        # 没有触点的行算不出批次。
         notouch.append(cells[0])
         return None
-    three = parse_cells(line)
-    item = Item(cells[0], cells[1][:80], line.strip(), touches, deferred, three, gap, cells[2])
+    item = Item(cells[0], cells[1][:80], line.strip(), touches, deferred,
+                fixed=True, gap=gap, now=cells[2])
     # 未落的行进批次；写着已落却留着差距的按未完成读（debt），与三格那种同一处置。
     return item, status.startswith(CLOSED_PREFIXES)
+
+
+# 一次判读里同一本台账会被读两遍（`load()` 与 `terminal_debt()` 各一次）。不缓存的话，
+# 每次读数都印两遍同一句「按旧格式略过」——读的人会以为台账里有两份。键里带 mtime，
+# 台账一改就重读；缓存只留最后一份。
+_SPLIT_CACHE: dict[tuple[str, int, int], tuple[list[Item], list[Item]]] = {}
 
 
 def _md_split(path: pathlib.Path) -> tuple[list[Item], list[Item]]:
     if not path.exists():
         raise Unreadable(f"{path} 不存在")
+    st = path.stat()
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    cached = _SPLIT_CACHE.get(key)
+    if cached is not None:
+        return cached
     out: list[Item] = []
     debt: list[Item] = []
     bad_status: list[str] = []
+    legacy_status: list[str] = []
     bad_closed: list[str] = []
     malformed: list[str] = []
     notouch: list[str] = []
@@ -187,21 +228,21 @@ def _md_split(path: pathlib.Path) -> tuple[list[Item], list[Item]]:
         # 按前缀把它们分给三格分支，读的人就把「现在」那一格当成了状态词，整本
         # S 账读不成（2026-11-23 实测：round.py 直接拒读，逐条报「状态：树里……」）。
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if _FIXED_ROW.match(line) and len(cells) >= 5:
-            if cells[-1] in _FIXED_STATUS:
-                item = _fixed_item(line, notouch)
-                if item is not None:
-                    (debt if item[1] else out).append(item[0])
-                continue
-            if not line.startswith("| S"):
-                # 五格行把状态写成散文：点名拒掉。退回三格分支读，等于把
-                # 「现在」当状态词，错的那一格还看起来像读成功了；静默跳过则
-                # 更坏——「读不到」会与「本条不在台账里」同形。
-                bad_status.append(f"{cells[0]}（状态：{cells[-1][:20]}）")
-                continue
-            # 以 `| S` 开头、最后一格不是状态词的还有第三种形状：三格 + 行尾的
-            # round/touches 段，格数凑巧也是五格。它靠 cells[2] 认自己，落到
-            # 下面那条分支去读。
+        if not line.startswith("| S") and _FIXED_ROW.match(line):
+            # 不是 S 序号的表：五格行、四列的旧表、以及写坏的行都从这里过一遍。
+            # 旧表在 `_fixed_item` 里按旧格式略过（印计数），写坏的进 malformed 拒读。
+            item = _fixed_item(line, notouch, malformed, legacy_status)
+            if item is not None:
+                (debt if item[1] else out).append(item[0])
+            continue
+        if _FIXED_ROW.match(line) and len(cells) >= 5 and cells[-1] in _FIXED_STATUS:
+            item = _fixed_item(line, notouch, malformed, legacy_status)
+            if item is not None:
+                (debt if item[1] else out).append(item[0])
+            continue
+        # 以 `| S` 开头、最后一格不是状态词的还有第三种形状：三格 + 行尾的
+        # round/touches 段，格数凑巧也是五格。它靠 cells[2] 认自己，落到
+        # 下面那条分支去读。
         if not line.startswith("| S"):
             continue
         if len(cells) < 3:
@@ -265,14 +306,24 @@ def _md_split(path: pathlib.Path) -> tuple[list[Item], list[Item]]:
             "这些行没有 `touches:`，批次算不出来（要么点名它要动的文件，要么写 `touches: unknown — 理由`）："
             + "、".join(notouch)
         )
+    if legacy_status:
+        print(
+            f"todo_source: {len(legacy_status)} 行不是五格行（状态不是 `未落`/`已落`），按旧格式略过："
+            + "、".join(legacy_status[:6])
+            + ("…" if len(legacy_status) > 6 else ""),
+            file=sys.stderr,
+        )
     if malformed:
         raise Unreadable(
-            "这些行以 `| S` 开头却没有状态列，读不出它做没做：" + "、".join(malformed)
+            "这些行短得读不出它做没做（`| S` 行缺状态列，或五格行不足 5 列）："
+            + "、".join(malformed)
         )
     if bad_status:
         raise Unreadable(
             "状态词不在闭集里（**只有两个词**：`未落` / `已落`）：" + "、".join(bad_status)
         )
+    _SPLIT_CACHE.clear()
+    _SPLIT_CACHE[key] = (out, debt)
     return out, debt
 
 
@@ -307,9 +358,9 @@ def all_ids(spec: str) -> set[str]:
         raise Unreadable(f"{path} 不存在")
     ids: set[str] = set()
     for line in path.read_text(errors="ignore").splitlines():
-        # 两种行形状都读（与 `_md_split` 同一套）：只认 `| S` 那一族，会让五格台账
-        # 的每一条都读成「不在台账里」——钉住的批次于是整批报缺，而它们就在那儿
-        # （2026-11-23 实测：新台账 7 条全被报成缺失）。
+        # 两种行形状都算（与 `_md_split` 同一套）。只认 `| S…` 那一种时，五格台账里
+        # 的每一条都答「不在台账里」——而这个函数的唯一用途就是分辨「做完了从批次里
+        # 消失」与「被人删掉了」（2026-11-23 实测：新台账 7 条全被报成缺失）。
         if not line.startswith("| S") and not _FIXED_ROW.match(line):
             continue
         cells = [c.strip() for c in line.strip().strip("|").split("|")]

@@ -1,4 +1,4 @@
-//! principle: feedback_a_reading_folded_into_an_empty_value_answers_for_a_read_it_never_made
+//! principle: feedback_absent_reading_fix_must_walk_to_its_input
 //! Gate: 每个按任务图作答的面都走带报错的那条读，读失败留成错误而不是空答案。
 //!
 //! 这一族病灶同一个形状：处理函数的读口是折叠过的那条（`get_all_tasks()` 之类，
@@ -29,6 +29,14 @@ const PROCESSES: &str = "crates/cog-gateway/src/processes.rs";
 const LIB: &str = "crates/cog-gateway/src/lib.rs";
 const EXECUTOR: &str = "crates/cog-gateway/src/executor.rs";
 const REBALANCER: &str = "crates/cog-supervisor/src/task_rebalancer.rs";
+const DAG_EXECUTOR: &str = "crates/cog-orchestrator/src/dag_executor/orchestrator.rs";
+const DAG_CONSUMER: &str = "crates/cog-orchestrator/src/dag_executor/mod.rs";
+const ACTION_PLANNER: &str =
+    "crates/cog-orchestrator/src/action_planner/action_plan_orchestrator.rs";
+const SIGNAL_WATCHER: &str = "crates/cog-reflection/src/signal_watcher.rs";
+const CHANGE_LEDGER: &str = "crates/cog-orchestrator/src/change_ledger.rs";
+const DISCOVERY_LOOP: &str = "crates/cog-github/src/discovery_loop.rs";
+const PROMOTION_EVAL: &str = "crates/cog-reflection/src/promotion_eval.rs";
 
 /// 折叠过的那几条读。某一段正文里出现它们，就是那一面在替没读到的图作证。
 const FOLDED: &[&str] = &[
@@ -234,6 +242,162 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "get_all_tasks_checked",
         "读失败让每个检查点都读成「任务已不在图里」，恢复计划悄悄空掉",
     ),
+    (
+        DAG_EXECUTOR,
+        "pub async fn find_stalled_scheduled_tasks",
+        "all_tasks_checked",
+        "清扫读成「没有停住的行」，一整轮什么都没收也算完",
+    ),
+    (
+        DAG_EXECUTOR,
+        "async fn reclaim_one_stalled",
+        "get_task_checked",
+        "逐行那一读失败被读成「它已经走开了」，清扫静默跳过这一行",
+    ),
+    (
+        DAG_EXECUTOR,
+        "async fn on_task_terminal",
+        "get_task_checked",
+        "读不到被读成「这一行不在了」，目标行永远停在 Pending 而没人知道为什么",
+    ),
+    (
+        DAG_CONSUMER,
+        "async fn result_names_another_owner",
+        "get_task_checked",
+        "读不到被读成「不是别的单元的」，别人的结果被照常应用",
+    ),
+    (
+        DAG_CONSUMER,
+        "async fn orphan_reconcile_tick",
+        "get_task_checked",
+        "读不到被读成「任务已经不在了」，一条正在响的告警被收掉",
+    ),
+    (
+        DAG_CONSUMER,
+        "async fn wbs_verdict_no_longer_holds",
+        "all_tasks_checked",
+        "读不到被读成「没有行」，一条仍然成立的判词被撤掉",
+    ),
+    (
+        ACTION_PLANNER,
+        "pub async fn process_goal_impl",
+        "get_task_checked",
+        "读不到那一行被读成「还没计划过」，同一条目标每次重投都重付一次完整分解",
+    ),
+    (
+        ACTION_PLANNER,
+        "async fn stranded_placeholders",
+        "get_task_checked",
+        "读不到子任务被读成「占位没有挂上谁」，一条健康的行被删掉再改写 Failed",
+    ),
+    (
+        ACTION_PLANNER,
+        "async fn held_status",
+        "get_task_checked",
+        "日志把「读不到」与「没有这一行」印成同一个值",
+    ),
+    (
+        ACTION_PLANNER,
+        "async fn fail_submission",
+        "held_status(",
+        "判退那一行被顶掉时，日志把「读不到」与「没有这一行」印成同一个值",
+    ),
+    (
+        SIGNAL_WATCHER,
+        "async fn tick",
+        "get_all_tasks_checked",
+        "读不到图的一轮被读成一个没事的系统：没有失败、没有积压、没有待补的行",
+    ),
+    (
+        SIGNAL_WATCHER,
+        "async fn fill_signal_criteria",
+        "get_task_checked",
+        "读不到那一行被读成「这行不在了」，一条候选从回填里悄悄消失",
+    ),
+    (
+        SIGNAL_WATCHER,
+        "async fn fill_rework_criteria",
+        "get_task_checked",
+        "读不到那一行被读成「这行不在了」，一条回流行永远补不上判据",
+    ),
+    (
+        SIGNAL_WATCHER,
+        "async fn submit_intent",
+        "get_task_checked",
+        "读不到在手的行被读成「库里没有」，同一 id 每拍重投一次、每拍报重复",
+    ),
+    (
+        CHANGE_LEDGER,
+        "async fn dispatch_pass",
+        "get_all_tasks_checked",
+        "读不到图的一趟把每条欠账按 generation 0 再投一次，重复 id 每拍报错",
+    ),
+    (
+        CHANGE_LEDGER,
+        "async fn settle_dispatch_parents",
+        "get_all_tasks_checked",
+        "空图被读成「已经补完了」，一趟回填此后一辈子不再跑",
+    ),
+    (
+        CHANGE_LEDGER,
+        "async fn fill_dispatch_criteria",
+        "get_task_checked",
+        "读不到那一行被读成「这行不在了」，一条变更的判据永远空着",
+    ),
+    (
+        CHANGE_LEDGER,
+        "async fn owed_row",
+        "get_task_checked",
+        "读不到那一代被读成「没人占着」，欠账按一个可能还在库里的 id 投出去，每趟报重复",
+    ),
+    (
+        CHANGE_LEDGER,
+        "async fn fold_handover",
+        "get_task_checked",
+        "读不到那条交接被读成「从没开始」，一条可能已经在跑的任务被取消掉",
+    ),
+    (
+        CHANGE_LEDGER,
+        "async fn carried_batches",
+        "get_all_tasks_checked",
+        "读不到图被读成「一条批次都没有」，被批次带过的每条交付都读成「从没交付」，留着欠账、再交一次",
+    ),
+    (
+        DISCOVERY_LOOP,
+        "async fn intent_decision",
+        "get_task_checked",
+        "读不到被读成「没有这一行」，同一条意图照同一个 id 再交一次",
+    ),
+    (
+        DISCOVERY_LOOP,
+        "async fn run_assess_task",
+        "get_task_checked",
+        "读不到被读成「还没跑完」，等到超时再把「判定没回来」当成答案",
+    ),
+    (
+        DISCOVERY_LOOP,
+        "async fn poll_cross_validation",
+        "get_task_checked",
+        "读不到被读成「这一行不在了」，一次读失败静默地把这张 PR 的判词吞掉",
+    ),
+    (
+        DISCOVERY_LOOP,
+        "pub(crate) async fn settle_filed_criteria",
+        "get_task_checked",
+        "读不到那一行被读成「它不在了」，remaining 少算一条，回填以「补完了」退场",
+    ),
+    (
+        PROMOTION_EVAL,
+        "pub(crate) async fn withdraw_abandoned",
+        "get_all_tasks_checked",
+        "清扫读成「图上没有孤儿」，答「收走 0 条」，与真的没有孤儿逐字同形",
+    ),
+    (
+        PROMOTION_EVAL,
+        "pub(crate) async fn submit_and_wait",
+        "get_task_checked",
+        "提交前那一读读成「没有旧行挡着」，这一次提交被当重投静默跳过；等待里那一读读成「还在跑」，无上限地等下去",
+    ),
 ];
 
 #[test]
@@ -250,6 +414,13 @@ fn every_surface_that_draws_the_graph_keeps_the_failure() {
         LIB,
         EXECUTOR,
         REBALANCER,
+        DAG_EXECUTOR,
+        DAG_CONSUMER,
+        ACTION_PLANNER,
+        SIGNAL_WATCHER,
+        CHANGE_LEDGER,
+        DISCOVERY_LOOP,
+        PROMOTION_EVAL,
     ] {
         productions.insert(file, production_text(&read_repo(file)));
     }
@@ -272,11 +443,34 @@ fn every_surface_that_draws_the_graph_keeps_the_failure() {
     }
 }
 
-/// 锚点之后到第一个顶格收尾的花括号为止——这个仓里这些函数都在顶格收尾。
+/// 锚点那一段的正文：从函数名之后第一个 `{` 起，到括号回到零的那一行止。
+///
+/// 以前切在「第一个顶格收尾的花括号」上，理由是「这些函数都在顶格收尾」——住进
+/// `impl` 里的方法不是，它们的收尾是四个空格。于是那一段一直量到 impl 结束，把同一
+/// 个文件里后面所有方法都算进来：`impl DagExecutor` 里的三个引脚，量的是它自己加上
+/// 后面几千行，`get_all_tasks(` 这样的**定义**也会触发「换回了折叠的那条读」
+/// （2026-11-23 实测：改对了也红，理由是隔壁方法的签名）。括号按行数，字符串与注释
+/// 里的括号由 `lex` 剔掉——`&'a str` 那个撇号也算对。
 fn body_after<'a>(production: &'a str, anchor: &str) -> &'a str {
+    use crate::common::lex::{scan, Dialect};
     let rest = production
         .split_once(anchor)
         .unwrap_or_else(|| panic!("{anchor} 不在了：这一面对应的引脚要跟着改"))
         .1;
-    rest.split("\n}\n").next().unwrap_or(rest)
+    let body = &rest[rest
+        .find('{')
+        .unwrap_or_else(|| panic!("{anchor} 之后没有函数体"))..];
+    let scan = scan(body, Dialect::Rust);
+    let mut depth = 0i32;
+    let mut end = body.len();
+    let mut at = 0usize;
+    for (line, shape) in body.split_inclusive('\n').zip(scan.lines.iter()) {
+        depth += shape.delta;
+        at += line.len();
+        if depth == 0 {
+            end = at;
+            break;
+        }
+    }
+    &body[..end]
 }

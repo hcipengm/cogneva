@@ -97,55 +97,15 @@ fn open_brace_after(text: &str, from: usize) -> Option<usize> {
     None
 }
 
-/// 从 `open`（一个 `{`）起找配对的 `}`，跳过字符串、字符字面量、生命周期与原始字符串。
+/// 从 `open`（一个 `{`）起找配对的 `}`。
+///
+/// 配平问的是「哪里是代码」，那是 [`common::lex`] 那台状态机的题目，不是每个夹具
+/// 各写一遍的：这里原来自己走字节，只跳字符串、字符字面量、生命周期与原始字符串，
+/// 不跳注释。`impl` 体里一句注释中出现的花括号就能把配平挪进半句话中间，此后读到
+/// 的「函数体」不是那个函数——判词上它以「括号不闭合」收口，红在一条英文文案
+/// 上，而它想判的是类型的词表。方言表只留一份，从这里调它。
 fn body_end(text: &str, open: usize) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut depth = 0i32;
-    let mut i = open;
-    while i < bytes.len() {
-        if let Some(end) = raw_string_end(bytes, i) {
-            i = end;
-            continue;
-        }
-        match bytes[i] {
-            b'"' => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'"' {
-                    if bytes[i] == b'\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-                if i >= bytes.len() {
-                    return None;
-                }
-            }
-            b'\'' => {
-                if i + 2 < bytes.len() && bytes[i + 2] == b'\'' {
-                    i += 2;
-                } else if i + 3 < bytes.len() && bytes[i + 1] == b'\\' && bytes[i + 3] == b'\'' {
-                    i += 3;
-                } else {
-                    i += 1;
-                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-                    {
-                        i += 1;
-                    }
-                    continue;
-                }
-            }
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
+    common::routes::matching_brace(text, open, Dialect::Rust)
 }
 
 /// `from` 之后第一个**作为独立词**出现在代码里的 `needle`，跳过注释与字符串字面量。

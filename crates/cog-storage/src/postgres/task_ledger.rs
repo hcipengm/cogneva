@@ -693,22 +693,34 @@ pub(crate) async fn current_state(
 }
 
 /// Open the attempt a move into `running` starts.
+///
+/// 这一段的职务从执行地址里读：进 `running` 那一刻手里只有租约持有者，而角色
+/// 只写在座位上（`squad:<任务>-<座位>`）。带外员工报的是人形地址，它是人不是
+/// 座位，这一格因此为空——那是「这一段没有座位角色」，不是「角色没读到」。
+///
+/// 做这一段的人由调用方给出：派工那一刻已经把工号写进任务行的 owner 格，执行
+/// 开始时抄到这一行上。座位地址自己答不出人（`squad:<任务>-<座位>` 里没有工号），
+/// 所以这里不猜，只记调用方知道的那一个——`None` 是「没记人」，不是「人未知」。
 pub(crate) async fn open_attempt(
     conn: &mut PgConnection,
     task_id: &str,
     owner: Option<&str>,
+    person: Option<&str>,
 ) -> Result<i32, SFError> {
+    let role = owner.and_then(|owner| cog_core::role_of_seat(task_id, owner));
     let (no,): (i32,) = sqlx::query_as(
         r#"
-        INSERT INTO task_attempt (task_id, attempt_no, started_at, owner)
+        INSERT INTO task_attempt (task_id, attempt_no, started_at, owner, role, person)
         SELECT $1,
                COALESCE((SELECT MAX(attempt_no) FROM task_attempt WHERE task_id = $1), 0) + 1,
-               NOW(), $2
+               NOW(), $2, $3, $4
         RETURNING attempt_no
         "#,
     )
     .bind(task_id)
     .bind(owner)
+    .bind(role)
+    .bind(person)
     .fetch_one(&mut *conn)
     .await
     .map_err(|e| SFError::Database(e.to_string()))?;
@@ -850,7 +862,13 @@ pub(crate) async fn write_task(
     if current != Some(task.status) {
         match (current, task.status) {
             (_, TaskStatus::Running) => {
-                open_attempt(tx, &task.id, task.lease_owner.as_deref()).await?;
+                open_attempt(
+                    tx,
+                    &task.id,
+                    task.lease_owner.as_deref(),
+                    task.owner_unit.as_deref(),
+                )
+                .await?;
             }
             (Some(TaskStatus::Running), landed) => {
                 close_attempt(

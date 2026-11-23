@@ -129,4 +129,13 @@ if [ "$ledger" != "/dev/null" ]; then
   } 2>/dev/null || true
 fi
 
+# 每次构建之前先放一遍临时工作树的整棵树。磁盘被填满的正是**某一次构建**，而定时
+# 扫的那一拍可能刚好落在它开始之前（2026-11-23：缓存回收器 14:43 跑完，14:45 那棵
+# 临时树开始长，15:15 下一拍之前磁盘读到 0 MB）。判据全在那份脚本里（空闲空间小于
+# 临时树自己占的空间、没有进程持有、只认 cargo 的缓存标记）；这里只负责在正确的
+# 时刻问它。它删不掉正在编译的那一棵——它的 cwd 就是本进程。
+if [ "$builds" = "1" ] && [ -n "$toplevel" ] && [ -x "$toplevel/deploy/scripts/host-scratch-gc.sh" ]; then
+  "$toplevel/deploy/scripts/host-scratch-gc.sh" >/dev/null 2>&1 || true
+fi
+
 exec "$real_cargo" "$@"

@@ -1383,19 +1383,38 @@ impl LlmUsageStore {
 
     /// 同一读数，**从事件流算**：按人汇总。
     ///
-    /// 「算在谁头上」的口径与账本那条一致：行上写了 `owner` 就用它，没写才退到任务
-    /// 图里这条任务的提交人。两处都是**最新一版**的提交人（`ORDER BY rev DESC`），
-    /// 普通 join 会按版本数重复计数，而按人判预算只会表现为更早被拦。
+    /// 「算在谁头上」的口径三层，从最具体的那一条往下退：
+    ///
+    /// 1. 行上写了 `owner` 就用它——那是调用方自己声明的付款人（带身份的一次对话）；
+    /// 2. 没写就看这一发落在哪一次尝试里：`task_attempt.person` 是派工那一刻写下的
+    ///    工号，**座位不是人**——`squad:<任务>-<座位>` 会随任务生灭，按座位记账会让同
+    ///    一个人在十件活里变成十个人；
+    /// 3. 都没有才退到任务图里这条任务的提交人（`ORDER BY rev DESC`：最新一版，普通
+    ///    join 会按版本数重复计数，而按人判预算只会表现为更早被拦）。
+    ///
+    /// 第二层用 `LATERAL ... LIMIT 1` 取这一发所在的那次尝试（`attempt_no` 最大，
+    /// 窗口是 `started_at` 到 `ended_at`，未结束的尝试窗口开到此刻）。一次调用同时
+    /// 落在两次尝试的窗口里只会算一次——窗口重叠时账不能被数两遍。
     pub async fn spend_by_person_since_from_stream(
         &self,
         since_unix: i64,
     ) -> anyhow::Result<Vec<(String, u64)>> {
         let rows = sqlx::query(&format!(
             "SELECT person, SUM(tokens)::BIGINT AS tokens FROM (
-                 SELECT COALESCE(NULLIF(e.owner_name, ''), t.person) AS person,
+                 SELECT COALESCE(NULLIF(e.owner_name, ''), a.person, t.person) AS person,
                         (COALESCE((e.input_tokens)::BIGINT, 0)
                        + COALESCE((e.output_tokens)::BIGINT, 0)) AS tokens
                    FROM cogneva_event e
+                   LEFT JOIN LATERAL (
+                        SELECT NULLIF(x.person, '') AS person
+                          FROM task_attempt x
+                         WHERE x.task_id = (e.task_id_text)
+                           AND x.started_at IS NOT NULL
+                           AND e.at >= x.started_at
+                           AND (x.ended_at IS NULL OR e.at <= x.ended_at)
+                         ORDER BY x.attempt_no DESC
+                         LIMIT 1
+                   ) a ON TRUE
                    LEFT JOIN LATERAL (
                         SELECT NULLIF(d.submitted_by, '') AS person
                           FROM {TASK_GRAPH_TABLE} d
@@ -1418,6 +1437,61 @@ impl LlmUsageStore {
             .map(|row| {
                 (
                     row.get::<String, _>("person"),
+                    row.get::<i64, _>("tokens").max(0) as u64,
+                )
+            })
+            .collect())
+    }
+
+    /// 从 `since_unix` 起，按「（人，角色）」汇总的花销，`(person, role, tokens)`。
+    ///
+    /// 一个人在同一天里可能做两件分工不同的活：上午当 planner、下午当 generator。
+    /// 这两段的分工写在 `task_attempt.role` 上，人写在 `task_attempt.person` 上，同一
+    /// 行上有两格，所以「这个人今天在哪种分工上花了多少」是一次分组，不是两次读。
+    ///
+    /// 每一发调用只算一次：先按时间窗把调用落到它那一次尝试（`attempt_no` 最大、
+    /// `started_at` 到 `ended_at`）上，再按那一行的（人，角色）分组。窗口重叠时普通
+    /// join 会把同一笔数进两行，而这里取 `LIMIT 1`。
+    ///
+    /// `role` 为空是读数：带外员工报的人形地址没有座位角色，那不是「角色没读到」。
+    /// 没有人（`person` 为空）的尝试不出现——与按人那份同一个理由：读它的是一份覆盖
+    /// 写的投影，替它编一个名字等于给不存在的人建格子。
+    pub async fn spend_by_person_and_role_since(
+        &self,
+        since_unix: i64,
+    ) -> anyhow::Result<Vec<(String, Option<String>, u64)>> {
+        let rows = sqlx::query(
+            "SELECT person, role, SUM(tokens)::BIGINT AS tokens FROM (
+                 SELECT a.person AS person, a.role AS role,
+                        (COALESCE((e.input_tokens)::BIGINT, 0)
+                       + COALESCE((e.output_tokens)::BIGINT, 0)) AS tokens
+                   FROM cogneva_event e
+                   LEFT JOIN LATERAL (
+                        SELECT NULLIF(x.person, '') AS person, x.role AS role
+                          FROM task_attempt x
+                         WHERE x.task_id = (e.task_id_text)
+                           AND x.started_at IS NOT NULL
+                           AND e.at >= x.started_at
+                           AND (x.ended_at IS NULL OR e.at <= x.ended_at)
+                         ORDER BY x.attempt_no DESC
+                         LIMIT 1
+                   ) a ON TRUE
+                  WHERE e.kind = 'llm_call'
+                    AND e.at >= to_timestamp($1::DOUBLE PRECISION)
+                    AND a.person IS NOT NULL
+             ) s
+             GROUP BY person, role
+             ORDER BY person, role",
+        )
+        .bind(since_unix as f64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("person"),
+                    row.get::<Option<String>, _>("role"),
                     row.get::<i64, _>("tokens").max(0) as u64,
                 )
             })
@@ -1596,8 +1670,9 @@ impl LlmUsageStore {
     /// 在花销账上要么不出现，要么是一行 0——而 0 与「今天没来过」长得一模一样。
     /// 拒绝行是唯一记得「上限咬到了」的地方，这一读就是把它按主体摊开。
     ///
-    /// 归属规则与 [`Self::spend_by_person_since`] 逐字相同（`COALESCE(owner,
-    /// 任务提交人)`）：两处各认各的，会出现「按 A 记了花销、按 B 数了拒绝」。
+    /// 归属规则与 [`Self::spend_by_person_since`] 逐字相同（声明属主 → 这一发所在
+    /// 那次尝试的工号 → 任务提交人）：两处各认各的，会出现「按 A 记了花销、按 B
+    /// 数了拒绝」，而那张排行里同一行上的两个数会互相矛盾。
     pub async fn refusals_by_person_since(
         &self,
         since_unix: i64,
@@ -1605,8 +1680,18 @@ impl LlmUsageStore {
         let refused = cog_core::UsageResult::RefusedByOwnerBudget.as_str();
         let rows = sqlx::query(&format!(
             "SELECT person, COUNT(*)::BIGINT AS refusals FROM (
-                 SELECT COALESCE(NULLIF(u.owner_id, ''), t.person) AS person
+                 SELECT COALESCE(NULLIF(u.owner_id, ''), a.person, t.person) AS person
                    FROM {LEDGER_TABLE} u
+                   LEFT JOIN LATERAL (
+                        SELECT NULLIF(x.person, '') AS person
+                          FROM task_attempt x
+                         WHERE x.task_id = u.task_id
+                           AND x.started_at IS NOT NULL
+                           AND u.ts >= x.started_at
+                           AND (x.ended_at IS NULL OR u.ts <= x.ended_at)
+                         ORDER BY x.attempt_no DESC
+                         LIMIT 1
+                   ) a ON TRUE
                    LEFT JOIN LATERAL (
                         SELECT NULLIF(d.submitted_by, '') AS person
                           FROM {TASK_GRAPH_TABLE} d

@@ -443,7 +443,19 @@ impl PromotionEval {
     pub(crate) async fn withdraw_abandoned(&self) -> SFResult<usize> {
         let now = chrono::Utc::now();
         let mut withdrawn = 0usize;
-        for task in self.orchestrator.get_all_tasks().await {
+        // 读不到图时这一趟不能答「收走 0 条」：那句与「图上真没有孤儿」逐字同形，
+        // 而孤儿行不会自己消失，下一拍还得再清。把错误交出去，让调用方说出来。
+        let tasks = self
+            .orchestrator
+            .get_all_tasks_checked()
+            .await
+            .map_err(|e| {
+                SFError::Internal(format!(
+                    "the task graph could not be read, so no abandoned A/B row was withdrawn \
+                 this pass: {e}"
+                ))
+            })?;
+        for task in tasks {
             if !is_abandoned_promotion_eval(&task, now) {
                 continue;
             }
@@ -563,7 +575,14 @@ pub(crate) async fn submit_and_wait(
     // 不读新交上去的那一份。上一次尝试留下的终态行（超时被收回、或失败）说的正是
     // 「那次没有答案」；让它挡在这里，同一个变更就再也跑不成 A/B，而且读起来是
     // 「门没跑」而不是「门被一行旧记录挡住了」。
-    if let Some(held) = orch.get_task(&task_id).await {
+    // 读不到时不能当成「没有旧行挡着」：那一行可能还在，而提交撞上已有 id 会被
+    // 当重投跳过——这一次 A/B 就静默地没跑，读起来像「门没跑」。
+    let held = orch.get_task_checked(&task_id).await.map_err(|e| {
+        SFError::Internal(format!(
+            "the row that might hold {task_id} could not be read: {e}"
+        ))
+    })?;
+    if let Some(held) = held {
         if matches!(held.status, TaskStatus::Cancelled | TaskStatus::Failed) {
             if let Err(e) = orch.delete_task(&task_id).await {
                 warn!(
@@ -585,7 +604,12 @@ pub(crate) async fn submit_and_wait(
     // 是持有者租约与它上次动的时间）回答。等待方按秒数把它收走，收的是一件可能
     // 正在干活的活——那正是这里删掉的那个东西。
     loop {
-        if let Some(t) = orch.get_task(&id).await {
+        // 等待方没有钟：把「读不到」当成「还在跑」就是无上限地等下去，而那条
+        // 活可能早就结束了。读不到就当场按读不到回去。
+        let polled = orch.get_task_checked(&id).await.map_err(|e| {
+            SFError::Internal(format!("promotion eval row {id} could not be read: {e}"))
+        })?;
+        if let Some(t) = polled {
             match t.status {
                 TaskStatus::Completed => return Ok(Ok(t)),
                 TaskStatus::Failed => {
@@ -637,6 +661,10 @@ mod tests {
         /// 读第一次之后把这一行推到终态：模拟「活自己结束了」。等待方不再有钟，
         /// 所以测试里让它结束的必须是活本身，而不是等待方的耐心。
         finish_on_first_read: Mutex<Option<TaskStatus>>,
+        /// 图读失败：问什么都答「读不到」，与「图上没有这一行」分开。
+        unreadable: Mutex<bool>,
+        /// 这一次提交落图之后把图推成读不到：模拟提交与轮询之间库坏掉。
+        unreadable_after_submit: Mutex<bool>,
     }
 
     fn pending_row(id: &str, since: chrono::DateTime<chrono::Utc>) -> Task {
@@ -667,6 +695,9 @@ mod tests {
                 ids.push(task.id.clone());
                 held.insert(task.id.clone(), task);
             }
+            if *self.unreadable_after_submit.lock().unwrap() {
+                *self.unreadable.lock().unwrap() = true;
+            }
             Ok(ids)
         }
         async fn assign_task(&self, _task_id: &str, _agent_id: &str) -> SFResult<()> {
@@ -686,6 +717,12 @@ mod tests {
         }
         async fn get_all_tasks(&self) -> Vec<Task> {
             self.tasks.lock().unwrap().values().cloned().collect()
+        }
+        async fn get_all_tasks_checked(&self) -> SFResult<Vec<Task>> {
+            if *self.unreadable.lock().unwrap() {
+                return Err(SFError::Database("mock graph cannot be read".into()));
+            }
+            Ok(self.get_all_tasks().await)
         }
         async fn push_to_dlq(&self, _task_id: &str, _error: String) -> SFResult<bool> {
             unimplemented!()
@@ -743,6 +780,14 @@ mod tests {
                 }
             }
             Some(task.clone())
+        }
+        async fn get_task_checked(&self, task_id: &str) -> SFResult<Option<Task>> {
+            if *self.unreadable.lock().unwrap() {
+                return Err(SFError::Database(format!(
+                    "mock graph cannot answer for {task_id}"
+                )));
+            }
+            Ok(self.get_task(task_id).await)
         }
         async fn schedule_task(&self, _task_id: &str) -> SFResult<()> {
             unimplemented!()
@@ -896,6 +941,71 @@ mod tests {
 
         assert_eq!(withdrawn, 1, "收走的条数不对");
         assert_eq!(*graph.cancelled.lock().unwrap(), vec![stale.id.clone()]);
+    }
+
+    /// 清扫读不到图时不能答「收走 0 条」：那句与「图上真没有孤儿」逐字同形，而
+    /// 孤儿行不会自己消失，下一拍还得再清。
+    #[tokio::test]
+    async fn a_sweep_that_cannot_read_the_graph_withdraws_nothing_and_says_so() {
+        let graph = Arc::new(GateGraph::default());
+        let stale = pending_row(
+            "promotion-eval-change-ledger-ec0fc6a8c301bbf3-6862a991a1ff",
+            chrono::Utc::now() - chrono::Duration::hours(20),
+        );
+        graph.tasks.lock().unwrap().insert(stale.id.clone(), stale);
+        *graph.unreadable.lock().unwrap() = true;
+
+        let orch: Arc<dyn OrchestratorControl> = graph.clone();
+        let eval = PromotionEval::new(orch, DEFAULT_EVAL_TIMEOUT_SECS, 1, None);
+        let outcome = eval.withdraw_abandoned().await;
+
+        assert!(outcome.is_err(), "读不到图被答成了「这一趟收走 0 条」");
+        assert!(
+            graph.cancelled.lock().unwrap().is_empty(),
+            "图都没读到，却动了行"
+        );
+    }
+
+    /// 提交前那一读读不到时，别把一行可能还在的旧记录当成没有：交上去撞上已有
+    /// id 会被当重投跳过，这一次 A/B 就静默地没跑。
+    #[tokio::test]
+    async fn an_attempt_that_cannot_be_read_is_not_submitted_over() {
+        let graph = Arc::new(GateGraph::default());
+        *graph.unreadable.lock().unwrap() = true;
+        let row = promotion_eval_task(
+            "change-ledger-abc",
+            "deadbeef",
+            Path::new("/workspace/cogneva"),
+            900,
+        );
+
+        let orch: Arc<dyn OrchestratorControl> = graph.clone();
+        let outcome = submit_and_wait(&orch, 0, row.clone(), "goal".into()).await;
+
+        assert!(outcome.is_err(), "读不到却照样提交了");
+        assert!(
+            graph.tasks.lock().unwrap().is_empty(),
+            "读不到的那一行可能还在，却又交了一次"
+        );
+    }
+
+    /// 轮询里读不到时当场按读不到回去：等待方没有钟，把读失败当成「还在跑」
+    /// 就是无上限地等下去。
+    #[tokio::test]
+    async fn a_poll_that_cannot_read_the_row_answers_instead_of_waiting() {
+        let graph = Arc::new(GateGraph::default());
+        *graph.unreadable_after_submit.lock().unwrap() = true;
+        let row = promotion_eval_task(
+            "change-ledger-abc",
+            "deadbeef",
+            Path::new("/workspace/cogneva"),
+            900,
+        );
+
+        let orch: Arc<dyn OrchestratorControl> = graph.clone();
+        let outcome = submit_and_wait(&orch, 0, row.clone(), "goal".into()).await;
+
+        assert!(outcome.is_err(), "读不到那一行，却把它继续当成还在跑");
     }
 }
 

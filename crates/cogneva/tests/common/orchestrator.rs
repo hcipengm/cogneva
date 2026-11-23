@@ -11,6 +11,26 @@
 use std::sync::Arc;
 
 use cog_core::OrchestratorControl;
+use cog_supervisor::registry::AgentInfo;
+
+/// 名册上的一行：只有一个 id，其余字段都是「这一刻刚登记」。
+///
+/// 两份 supervisor 契约各写过一遍逐字相同的这一份。它们问的是同一个问题（再平衡
+/// 器拿这份名册算出了什么），两份若在字段上各自漂一点——比如一边填了 `crew_id`、
+/// 另一边没填——它们就不再描述同一个对象，而两边都还是绿的。
+pub fn agent(id: &str) -> AgentInfo {
+    let now = chrono::Utc::now();
+    AgentInfo {
+        agent_id: id.into(),
+        role: None,
+        crew_id: None,
+        squad_id: None,
+        task_ids: Vec::new(),
+        last_heartbeat: now,
+        state_since: now,
+        registered_at: now,
+    }
+}
 
 /// 挂在 `workspace` 的空 DAG 执行器后面的控制面。
 ///

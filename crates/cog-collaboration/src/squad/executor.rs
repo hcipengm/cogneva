@@ -163,6 +163,13 @@ pub struct SquadExecutor {
     stage_store: Option<Arc<dyn cog_core::PgeStageStore>>,
     /// 上游池的暂停开关。None = 这个进程不认识那道闸，行为与从前一样。
     pub(crate) pause_gate: Option<Arc<dyn cog_core::SchedulerGate>>,
+    /// 员工名册：座位建出来之后要把「背后坐着谁」写进名册行。
+    roster: Option<Arc<dyn cog_core::AgentRegistry>>,
+    /// 这一段座位背后的人（工号），来自任务行的 `owner_unit`。
+    ///
+    /// 与 [`Self::roster`] 成对：没有名册就没有地方写，没有工号就没有可写的。
+    /// 两者都缺时座位照建，判归属退回旧口径（名字要比得一模一样）。
+    person: Option<String>,
 }
 
 /// Optional service dependencies shared by squad execution stages.
@@ -187,6 +194,10 @@ pub(crate) struct SquadDeps {
     pub stage_store: Option<Arc<dyn cog_core::PgeStageStore>>,
     /// 上游池的暂停开关，原样交给每一条 Ralph 循环。
     pub pause_gate: Option<Arc<dyn cog_core::SchedulerGate>>,
+    /// 员工名册：座位建出来之后把「背后坐着谁」写进名册行。
+    pub roster: Option<Arc<dyn cog_core::AgentRegistry>>,
+    /// 这一段座位背后的人（工号），来自任务行的 `owner_unit`。
+    pub person: Option<String>,
 }
 
 /// 给流水线挂上阶段产物的记录位置。
@@ -319,6 +330,20 @@ impl SquadExecutor {
         self
     }
 
+    /// 挂上员工名册与这一段座位背后的人（工号）。
+    ///
+    /// 两个一起给才有意义：座位建好之后要有人可写、有名册可写。只给一个时
+    /// 座位照建，只是名册行上不会多出这一格——判归属退回旧口径。
+    pub fn with_person(
+        mut self,
+        roster: Option<Arc<dyn cog_core::AgentRegistry>>,
+        person: Option<String>,
+    ) -> Self {
+        self.roster = roster;
+        self.person = person;
+        self
+    }
+
     /// 直接执行一个 Squad，返回执行结果。
     pub async fn execute_squad(&self, task_id: String, config: SquadConfig) -> SquadResult {
         let squad_id = cog_core::squad_id_for(&task_id);
@@ -378,6 +403,8 @@ impl SquadExecutor {
             local_repair_max: self.local_repair_max,
             stage_store: self.stage_store.clone(),
             pause_gate: self.pause_gate.clone(),
+            roster: self.roster.clone(),
+            person: self.person.clone(),
         };
         let result = Self::run_squad_with_retries(squad, deps).await;
         let squad_latency_ms = squad_start.elapsed().as_millis() as u64;
@@ -488,6 +515,8 @@ impl SquadExecutor {
                 manager,
                 llm,
                 deps.state_backend.as_ref(),
+                deps.roster.as_ref(),
+                deps.person.as_deref(),
                 &squad.task_id,
                 cog_core::roles::PLANNER,
                 cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Plan),
@@ -545,6 +574,8 @@ impl SquadExecutor {
                 manager,
                 llm,
                 deps.state_backend.as_ref(),
+                deps.roster.as_ref(),
+                deps.person.as_deref(),
                 &squad.task_id,
                 cog_core::roles::GENERATOR,
                 squad.config.deliverable.clone(),
@@ -566,6 +597,8 @@ impl SquadExecutor {
                 manager,
                 llm,
                 deps.state_backend.as_ref(),
+                deps.roster.as_ref(),
+                deps.person.as_deref(),
                 &squad.task_id,
                 cog_core::roles::EVALUATOR,
                 cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Judgement),
@@ -642,6 +675,8 @@ impl SquadExecutor {
                     manager,
                     llm,
                     state,
+                    deps.roster.as_ref(),
+                    deps.person.as_deref(),
                     &squad.task_id,
                     cog_core::roles::PLANNER,
                     cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Plan),
@@ -652,6 +687,8 @@ impl SquadExecutor {
                     manager,
                     llm,
                     state,
+                    deps.roster.as_ref(),
+                    deps.person.as_deref(),
                     &squad.task_id,
                     cog_core::roles::GENERATOR,
                     squad.config.deliverable.clone(),
@@ -662,6 +699,8 @@ impl SquadExecutor {
                     manager,
                     llm,
                     state,
+                    deps.roster.as_ref(),
+                    deps.person.as_deref(),
                     &squad.task_id,
                     cog_core::roles::EVALUATOR,
                     cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Judgement),
@@ -673,6 +712,8 @@ impl SquadExecutor {
                     manager,
                     llm,
                     state,
+                    deps.roster.as_ref(),
+                    deps.person.as_deref(),
                     &squad.task_id,
                     cog_core::roles::MODERATOR,
                     cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Answer),
@@ -807,6 +848,8 @@ impl SquadExecutor {
                                 manager,
                                 llm,
                                 deps.state_backend.as_ref(),
+                                deps.roster.as_ref(),
+                                deps.person.as_deref(),
                                 &squad.task_id,
                                 cog_core::roles::MERGER,
                                 cog_core::DeliverableDeclaration::protocol(
