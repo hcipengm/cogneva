@@ -13,7 +13,7 @@ use chrono::Utc;
 use sqlx::{PgPool, Row};
 
 use cog_core::contract::intent_events::{
-    IntentEvents, IntentReader, IntentRow, INTENT_ID_KEY, INTENT_RECEIVED,
+    IntentEvents, IntentReader, IntentRow, INTENT_RECEIVED,
 };
 use cog_core::{SFError, SFResult};
 
@@ -43,13 +43,29 @@ impl IntentEventStore {
     /// 还没有被派生成任务的意图：流里收到过 `intent_received`，而任务行里没有一条带着
     /// 它的身份。读不到就是读不到（`Err`），不返回空表——空表与「全都处理完了」同形。
     pub async fn undispatched_intents(&self, limit: i64) -> SFResult<Vec<IntentRow>> {
+        // 两处都按**真表的列型**写：`cogneva_event.attributes` 与
+        // `task_defined.input` 都是 TEXT（迁移 110 把 JSON 列改成文本），要 `::jsonb`
+        // 才谈得上取键；而 `cog_dag_tasks` 是台账改版前那张 JSONB 投影，今天的投影是
+        // `task_current`，定义在 `task_defined`（每版一行）。
+        //
+        // 2026-11-24 实测：照旧写法在真库上两条都不成立（`text ->> unknown`，
+        // `cog_dag_tasks` 根本不存在），而树上没有一条用例对着真库问过它。
+        //
+        // `input` 先只对「看起来是 JSON」的行做类型转换：CASE 保证转换只在那一支上
+        // 求值，一行历史上不是 JSON 的输入不会把整张收件台读崩。
         let rows = sqlx::query(
-            "SELECT attributes->>'source' AS source, attributes->>'external_id' AS external_id, \
-                    attributes->>'text' AS text, coalesce(attributes->>'parent', '') AS parent \
+            "SELECT e.attributes::jsonb->>'source' AS source, \
+                    e.attributes::jsonb->>'external_id' AS external_id, \
+                    e.attributes::jsonb->>'text' AS text, \
+                    coalesce(e.attributes::jsonb->>'parent', '') AS parent \
                FROM cogneva_event e \
               WHERE e.kind = 'intent_received' \
-                AND NOT EXISTS (SELECT 1 FROM cog_dag_tasks t \
-                                 WHERE t.task->'input'->>'intent_id' = e.subject_id) \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM ( \
+                        SELECT CASE WHEN d.input ~ '^[[:space:]]*[\\[{]' \
+                                    THEN d.input::jsonb END AS body \
+                          FROM task_defined d) t \
+                     WHERE t.body->>'intent_id' = e.subject_id) \
               ORDER BY e.at ASC, e.event_id ASC \
               LIMIT $1",
         )
