@@ -406,6 +406,10 @@ def status() -> int:
     if current is None:
         print("round: 没有开着的一轮。动手之前先 `round.py open`。")
         return 1
+    return status_report(current)
+
+
+def status_report(current: tuple[str, str, str, list[str], str]) -> int:
     rev = current[1]
     left = remaining()
     # 每一条缺哪一格就说哪一格：三格是本轮判「做没做完」的**唯一**判据（触点只提示
@@ -457,6 +461,24 @@ def status() -> int:
             f"不在本轮批次：{', '.join(i.id for i in debt)}"
         )
     return 0 if terminal == len(left) else 1
+
+
+def stop_gate() -> int:
+    """收工钩子要的那一问：**现在能不能停**。
+
+    `status` 的往返码答的是「这一批做完了没有」，而「压根没有开着的一轮」与
+    「开着的一轮还有缺口」都退 1——按裸往返码分支的读者把这两件事读成了一件：
+    收工钩子于是把「没有轮」读成「这一轮没关」，关完一轮之后照样退 2 拦人
+    （2026-11-23 实测：`close` 成功，钩子下一行印的就是「没有开着的一轮」）。
+    这一问只答三态，往返码是它自己的协议，不由人挑：
+      0 = 可以停（没有开着的一轮，或这一轮已终态）；
+      2 = 不许停（开着的一轮还有缺口，缺口照 `status` 原样打印）；
+      3 = 判不了（书读不出来，由 `main` 统一退）——读不出来不是「可以停」。
+    """
+    current = current_round()
+    if current is None:
+        return 0
+    return 0 if status_report(current) == 0 else 2
 
 
 def close() -> int:
@@ -596,7 +618,8 @@ def planned() -> int:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "action", choices=["open", "status", "close", "rebound", "plan", "planned"]
+        "action",
+        choices=["open", "status", "stop-gate", "close", "rebound", "plan", "planned"],
     )
     parser.add_argument("--source", default=None)
     parser.add_argument("--file", default=None)
@@ -619,6 +642,8 @@ def main(argv: list[str]) -> int:
             return planned()
         if args.action == "status":
             return status()
+        if args.action == "stop-gate":
+            return stop_gate()
         return close()
     except todo_source.Unreadable as e:
         # 读不到不是「没有」：退 3，调用方分得开这两种情况。
