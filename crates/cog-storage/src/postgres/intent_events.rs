@@ -51,8 +51,14 @@ impl IntentEventStore {
         // 2026-11-24 实测：照旧写法在真库上两条都不成立（`text ->> unknown`，
         // `cog_dag_tasks` 根本不存在），而树上没有一条用例对着真库问过它。
         //
-        // `input` 先只对「看起来是 JSON」的行做类型转换：CASE 保证转换只在那一支上
-        // 求值，一行历史上不是 JSON 的输入不会把整张收件台读崩。
+        // `input` 先只对「看起来是 JSON 且带着这个键」的行做类型转换：CASE 保证
+        // 转换只在那一支上求值，一行历史上不是 JSON 的输入不会把整张收件台读崩；
+        // 而 `LIKE` 是这一步的**价格**判据——真库里 46,745 行定义逐一 `::jsonb`
+        // 要 32 秒（2026-11-24 实测），先按子串筛一遍再转换是 1.3 秒。子串命中但
+        // 不认识这个键的行，`->>` 回 NULL，被下面那句过滤掉。
+        //
+        // 已派生的身份集合算**一次**（`NOT IN`），不是每条事件各扫一遍定义表。
+        // 集合里过滤掉 NULL：`NOT IN` 碰到一个 NULL 会把整张收件台读成空的。
         let rows = sqlx::query(
             "SELECT e.attributes::jsonb->>'source' AS source, \
                     e.attributes::jsonb->>'external_id' AS external_id, \
@@ -60,12 +66,13 @@ impl IntentEventStore {
                     coalesce(e.attributes::jsonb->>'parent', '') AS parent \
                FROM cogneva_event e \
               WHERE e.kind = 'intent_received' \
-                AND NOT EXISTS ( \
-                    SELECT 1 FROM ( \
-                        SELECT CASE WHEN d.input ~ '^[[:space:]]*[\\[{]' \
+                AND e.subject_id NOT IN ( \
+                    SELECT t.body->>'intent_id' FROM ( \
+                        SELECT CASE WHEN d.input LIKE '%\"intent_id\"%' \
+                                     AND d.input ~ '^[[:space:]]*[\\[{]' \
                                     THEN d.input::jsonb END AS body \
                           FROM task_defined d) t \
-                     WHERE t.body->>'intent_id' = e.subject_id) \
+                     WHERE t.body->>'intent_id' IS NOT NULL) \
               ORDER BY e.at ASC, e.event_id ASC \
               LIMIT $1",
         )
