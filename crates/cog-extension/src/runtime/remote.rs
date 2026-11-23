@@ -1947,15 +1947,22 @@ mod tests {
                 let mut buf = vec![0u8; 4096];
                 let read = candidate.read(&mut buf).await.unwrap_or(0);
                 if asked_path(&buf[..read]).starts_with("/worktree/") {
+                    // `connection: close` 是这一格的判据，不是装饰：这具夹具在答完
+                    // 这一问就把连接丢掉，不写它，HTTP/1.1 的默认假设是保活，客户端
+                    // 于是在同一条已被关掉的连接上发下一条命令，报出来的是
+                    // 「executor unreachable」——一个关于服务不存在的结论，而真相是
+                    // 这条连接已经不在了（2026-11-24 实测：满负载那一跑只有它红）。
                     let _ = candidate
-                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\n\r\nno tree!!")
+                        .write_all(
+                            b"HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 9\r\n\r\nno tree!!",
+                        )
                         .await;
                     continue;
                 }
                 break candidate;
             };
             let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
                 body.len(),
                 body
             );
