@@ -109,24 +109,29 @@ batch = json.loads(payload).get("batch")
 sys.exit(0 if batch == ["CC02"] else 1)
 PY
 
-# 5. 状态词不在闭集里：点名拒读。
+# 5. 状态词不在闭集里：按旧格式略过，但**点名印出来**，不静默。
+#    真台账里还留着几代以自由文字作状态的表格（「部分已落；剩余移交」），所以这一支
+#    不能整本拒读；但一个打错字的 `已落` 也不能就这么消失。
 printf '| CC01 | 内容 | 现在 ｜ touches: crates/a/src/x.rs | 差距 | 进行中 |\n' >"$tree/bad-status.md"
-out=$(COGNEVA_TODO_SOURCE="md:$tree/bad-status.md" python3 - "$tree" <<'PY'
-import sys, pathlib
+out=$(python3 - "$tree" <<'PY' 2>&1
+import sys
 sys.path.insert(0, sys.argv[1] + "/scripts/hooks")
 import todo_source
 try:
-    todo_source.load("md:" + sys.argv[1] + "/bad-status.md")
+    items = todo_source.load("md:" + sys.argv[1] + "/bad-status.md")
 except todo_source.Unreadable as e:
-    print(e); sys.exit(0)
-print("LOADED")
-sys.exit(1)
+    print("REFUSED", e); sys.exit(1)
+print("IDS", [i.id for i in items])
 PY
-) && printf '%s' "$out" | grep -q "CC01" \
-  && ok "状态词不在闭集：点名拒读" || bad "坏状态词被静默跳过：$out"
+) && printf '%s' "$out" | grep -q "按旧格式略过" && printf '%s' "$out" | grep -q "CC01" \
+  && printf '%s' "$out" | grep -q 'IDS \[\]' \
+  && ok "状态词不在闭集：略过但点名，不进批次" || bad "坏状态词被静默跳过：$out"
 
-# 6. 列数不足：同样点名拒读。
-printf '| CC01 | 内容 | 现在\n' >"$tree/short.md"
+# 6. 末格是状态词、却只有四格：五格行少了一列，同样点名拒读。
+#
+# 同一本台账里还留着更早的 `| id | 一句话 | 状态 | 证据 |` 四列表格（历史现场）：
+# 它们的末格是路径，不是状态词，不能被当成「坏掉的五格行」——那样整本台账都会拒读。
+printf '| CC01 | 内容 | 现在 | 未落 |\n' >"$tree/short.md"
 out=$(python3 - "$tree" <<'PY'
 import sys
 sys.path.insert(0, sys.argv[1] + "/scripts/hooks")

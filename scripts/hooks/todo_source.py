@@ -127,7 +127,7 @@ _GAP_EMPTY = ("", "—", "-", "–")
 
 
 def _fixed_item(line: str, notouch: list[str], malformed: list[str],
-                bad_status: list[str]) -> tuple[Item, bool] | None:
+                legacy_status: list[str]) -> tuple[Item, bool] | None:
     """读一行五格台账。返回 (条目, 是否按未完成读)；不是这个形状时返回 None。
 
     「已落」只在差距那一格为空时才成立。写着已落却还留着差距的行，
@@ -136,14 +136,24 @@ def _fixed_item(line: str, notouch: list[str], malformed: list[str],
 
     形状不对（列数不足）与状态词不在闭集里的行**点名拒读**：静默跳过它们，这一行就从
     每一个批次里消失了，而读数照样绿——「读不到」被读成「没有」。
+
+    但「列数不足」只对**长得像五格行**的那些行成立：同一本台账里还有更早的
+    `| id | 一句话 | 状态 | 证据 |` 四列表格（历史现场），它们的末格是证据路径、不是状态词。
+    把那些也拒掉，整本台账就一个门都开不开——门判的是「这一条做到没有」，不是「每一个
+    历史表格都合今天的形状」。
     """
     cells = [c.strip() for c in line.strip().strip("|").split("|")]
     if len(cells) < 5:
-        malformed.append(f"{cells[0] if cells else line[:20]}（五格行只有 {len(cells)} 列）")
+        if cells and cells[-1] in _FIXED_STATUS:
+            # 末格是状态词却只有四格：这是五格行，少了一列。它读不出做没做，点名。
+            malformed.append(f"{cells[0]}（五格行只有 {len(cells)} 列）")
         return None
     status = cells[-1]
     if status not in _FIXED_STATUS:
-        bad_status.append(f"{cells[0]}（状态：{status[:20]}）")
+        # 同一本台账里还有更早的几代 `| id | … | 状态 |` 表格，最后一格是自由文字
+        # （「部分已落；剩余移交」）。它们不是五格行，按旧格式略过——但**不是静默**：
+        # 下面印一行计数，否则一个打错字的 `已落` 就变成「这一条不存在」。
+        legacy_status.append(f"{cells[0]}（{status[:12]}）")
         return None
     found = None
     for found in re.finditer(r"[｜|]\s*touches:\s*([^|｜\n]+)", line):
@@ -172,12 +182,24 @@ def _fixed_item(line: str, notouch: list[str], malformed: list[str],
     return item, status.startswith(CLOSED_PREFIXES)
 
 
+# 一次判读里同一本台账会被读两遍（`load()` 与 `terminal_debt()` 各一次）。不缓存的话，
+# 每次读数都印两遍同一句「按旧格式略过」——读的人会以为台账里有两份。键里带 mtime，
+# 台账一改就重读；缓存只留最后一份。
+_SPLIT_CACHE: dict[tuple[str, int, int], tuple[list[Item], list[Item]]] = {}
+
+
 def _md_split(path: pathlib.Path) -> tuple[list[Item], list[Item]]:
     if not path.exists():
         raise Unreadable(f"{path} 不存在")
+    st = path.stat()
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    cached = _SPLIT_CACHE.get(key)
+    if cached is not None:
+        return cached
     out: list[Item] = []
     debt: list[Item] = []
     bad_status: list[str] = []
+    legacy_status: list[str] = []
     bad_closed: list[str] = []
     malformed: list[str] = []
     notouch: list[str] = []
@@ -187,7 +209,7 @@ def _md_split(path: pathlib.Path) -> tuple[list[Item], list[Item]]:
         # 是显式写出来的，而不是从三格缺哪几格推出来。两形状都读，因为台账正在换格式，
         # 只认一种就会把另一种**整族读成没有待办**，而那个读数看起来是绿的。
         if not line.startswith("| S") and _FIXED_ROW.match(line):
-            item = _fixed_item(line, notouch, malformed, bad_status)
+            item = _fixed_item(line, notouch, malformed, legacy_status)
             if item is not None:
                 (debt if item[1] else out).append(item[0])
             continue
@@ -255,6 +277,13 @@ def _md_split(path: pathlib.Path) -> tuple[list[Item], list[Item]]:
             "这些行没有 `touches:`，批次算不出来（要么点名它要动的文件，要么写 `touches: unknown — 理由`）："
             + "、".join(notouch)
         )
+    if legacy_status:
+        print(
+            f"todo_source: {len(legacy_status)} 行不是五格行（状态不是 `未落`/`已落`），按旧格式略过："
+            + "、".join(legacy_status[:6])
+            + ("…" if len(legacy_status) > 6 else ""),
+            file=sys.stderr,
+        )
     if malformed:
         raise Unreadable(
             "这些行短得读不出它做没做（`| S` 行缺状态列，或五格行不足 5 列）："
@@ -264,6 +293,8 @@ def _md_split(path: pathlib.Path) -> tuple[list[Item], list[Item]]:
         raise Unreadable(
             "状态词不在闭集里（**只有两个词**：`未落` / `已落`）：" + "、".join(bad_status)
         )
+    _SPLIT_CACHE.clear()
+    _SPLIT_CACHE[key] = (out, debt)
     return out, debt
 
 
