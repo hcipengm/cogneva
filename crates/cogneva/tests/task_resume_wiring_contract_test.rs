@@ -116,9 +116,17 @@ fn the_two_ends_agree_on_which_agents_belong_to_a_task() {
     assert_eq!(agent_id_for("t-1", "planner"), "squad:t-1-planner");
     assert_eq!(checkpoint_field("planner"), "checkpoint:planner");
 
+    // A worker is `(agent_id, role, owner_task)`; ownership is the row's task,
+    // and the id has to be the seat that task's roster builds for that role.
+    let worker = |agent_id: String, role: &str, owner_task: &str| cog_core::WorkerInfo {
+        agent_id,
+        role: role.to_string(),
+        owner_task: Some(owner_task.to_string()),
+    };
+
     for role in ["planner", "generator", "evaluator", "moderator", "merger"] {
         assert!(
-            belongs_to_task(&agent_id_for("t-1", role), role, "t-1"),
+            belongs_to_task(&worker(agent_id_for("t-1", role), role, "t-1"), "t-1"),
             "the task holder does not accept the {role} the dispatcher builds"
         );
     }
@@ -126,11 +134,28 @@ fn the_two_ends_agree_on_which_agents_belong_to_a_task() {
     // Task ids that are prefixes of each other must not claim one another's
     // agents, and a parallel branch's agent is not the task-level role.
     assert!(!belongs_to_task(
-        &agent_id_for("t-11", "planner"),
-        "planner",
+        &worker(agent_id_for("t-11", "planner"), "planner", "t-1"),
         "t-1"
     ));
-    assert!(!belongs_to_task("t-1-branch-0-planner", "planner", "t-1"));
+    assert!(!belongs_to_task(
+        &worker("t-1-branch-0-planner".into(), "planner", "t-1"),
+        "t-1"
+    ));
+    // A seat whose row belongs to another task is not this task's either.
+    assert!(!belongs_to_task(
+        &worker(agent_id_for("t-1", "planner"), "planner", "t-2"),
+        "t-1"
+    ));
+    // The platform's long-lived employee has no owning task and is nobody's
+    // hand: it must never be resumed as this task's role.
+    assert!(!belongs_to_task(
+        &cog_core::WorkerInfo {
+            agent_id: "E0412".into(),
+            role: "planner".into(),
+            owner_task: None,
+        },
+        "t-1"
+    ));
 }
 
 /// The bound on the store, asserted where it can be read: the producer deletes
