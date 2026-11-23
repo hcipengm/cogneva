@@ -452,12 +452,16 @@ if [ -x "$(dirname "${BASH_SOURCE[0]}")/check-claims.sh" ]; then
     bash "$(dirname "${BASH_SOURCE[0]}")/check-claims.sh" || exit 1
 fi
 # 默认做完整批：义务清单没做完又没有 Split 就拒；Split 的四条理由逐条判真假。
-# 仓库根问 git，不数级数：`..` 从 deploy/scripts 往上只到 deploy，这条门自己就是
-# 「往上数几级」普查盯着的那一类。
+# 判词在产品里（`cogneva ledger gate`）：同一套读数、同一份台账，带外不再有第二份实现。
+# 没有二进制就是**没判**（退 2），不是绿——`.test.sh` 那套用例判的是同一批判据。
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-batch_gate="${repo_root:+$repo_root/scripts/hooks/batch-gate.py}"
-if [ -n "$batch_gate" ] && [ -f "$batch_gate" ]; then
-    python3 "$batch_gate" --root "$repo_root" || exit 1
+batch_gate="${COGNEVA_BIN:-${repo_root:+$repo_root/target/debug/cogneva}}"
+if [ -n "$batch_gate" ] && [ -x "$batch_gate" ]; then
+    "$batch_gate" ledger gate || exit 1
+else
+    printf 'check-before-push: 后台没有平台二进制（%s），这一推的批次没有判。\n' \
+        "${batch_gate:-未找到}" >&2
+    exit 2
 fi
 
 # 「没判」与「判红」是两件事，读数上也得是两个：一格没进构建槽就跑，判词写成红是把
