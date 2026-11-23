@@ -789,6 +789,16 @@ mod tests {
             instructions.contains("not ok"),
             "请求里没写「读不出来就不算通过」：{instructions}"
         );
+        // 三格各有它的那一问：「现在」要判「照着它能不能读到同一处」，「差距」要判
+        // 「是不是恰好只差那一件」。少任何一问，判者就只判了终态那一格。
+        assert!(
+            instructions.contains("now cell reads like what the tree"),
+            "请求里没让判者判「现在」是不是树上读来的：{instructions}"
+        );
+        assert!(
+            instructions.contains("gap is exactly what the terminal still lacks"),
+            "请求里没让判者判「差距是不是只差那一件」：{instructions}"
+        );
     }
 
     fn generation_with_diff(diff: &str) -> serde_json::Value {
