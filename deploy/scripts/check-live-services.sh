@@ -232,6 +232,10 @@ live_check db 'Live-DB usage readers agree' cargo test -p cogneva --test the_usa
 live_check db 'Live-DB batch cost' cargo test -p cogneva --test a_batch_id_answers_what_the_batch_cost_test -- --ignored
 live_check db 'Live-DB rollup is gone' cargo test -p cogneva --test the_rollup_is_gone_test -- --ignored
 live_check db 'Live-DB round events' cargo test -p cog-storage --test round_events -- --ignored
+# 收件台与 planner 的读者问的是同一条身份：意图写进去、读得回来、重投不写第二条，
+# 派生的任务行带上 `input.intent_id` 之后它不再出现在「未派生」里。这三件都只能
+# 对着真库问——夹具里那张表可以长得一样，而两条 SQL 的 `->>` 与生成列是库的事。
+live_check db 'Live-DB intent receipt desk' cargo test -p cog-storage --test intent_receipt_desk -- --ignored
 live_check db 'Live-DB bodies in the backup package' cargo test -p cogneva --test backup_large_objects -- --ignored
 live_check db 'Live-DB body as a large object' cargo test -p cog-storage --test body_as_large_object -- --ignored
 live_check db 'Live-DB erasure' cargo test -p cog-storage --test erasure_keeps_the_event_and_drops_the_body -- --ignored
