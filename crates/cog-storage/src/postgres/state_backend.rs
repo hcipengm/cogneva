@@ -1888,7 +1888,9 @@ SELECT t.to_state, COUNT(*)::bigint
 
         let should_retry = task.retry_count < max_retries;
         let not_before = if should_retry {
-            task.retry_count += 1;
+            // 计数只数「连续重复同一句」：买到的这次把它清零，下一次换内容的失败
+            // 不会被累计次数自己堵死；同一句原样再来时调用方给的是 0，判决当场关。
+            task.retry_count = 0;
             task.status = cog_core::TaskStatus::Pending;
             task.retry_not_before = chrono::Duration::from_std(retry_delay)
                 .ok()

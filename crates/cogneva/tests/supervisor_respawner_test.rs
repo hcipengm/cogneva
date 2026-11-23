@@ -61,7 +61,11 @@ async fn dead_agent_with_retryable_tasks_triggers_retry() {
         }
         orch.schedule_task(id).await.unwrap();
         orch.start_task(id).await.unwrap();
-        let (retried, _, _) = orch.fail_task(id, "boom".into(), None).await.unwrap();
+        // 永久失败由「同一句原样再来一次」给出：变了就再跑，不变就不买。
+        let (retried, _, _) = orch
+            .fail_task(id, "boom attempt 2".into(), None)
+            .await
+            .unwrap();
         assert!(
             !retried,
             "expected permanent failure after exhausting retries"

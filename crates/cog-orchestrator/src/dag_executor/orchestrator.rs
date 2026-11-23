@@ -1911,15 +1911,7 @@ impl DagExecutor {
 
         // 与内存路径同一个判据：不能靠重跑清除的失败不给重试预算。两处调的是
         // 同一个函数，所以「同一个判据」是结构上成立的，不是靠两边都写对。
-        // 落库那一格同样写「允许的话就是已经跑过的次数 + 1」：库里的判决比对的是
-        // `retry_count < max_retries`，而「变了就再跑一次」不设次数上限——写裸的 1 会
-        // 在第二次换了内容的失败上把门关死。
-        let allowed = self.effective_max_retries(&error, cause, &task);
-        let max_retries = if allowed == 0 {
-            0
-        } else {
-            task.retry_count.saturating_add(allowed)
-        };
+        let max_retries = self.effective_max_retries(&error, cause, &task);
         // 退避随任务一起落库，不留在调度循环的内存里：判定重试的进程与之后
         // 重新投递它的进程可能不是同一个。
         let retry_delay =
@@ -3610,16 +3602,11 @@ impl DagExecutor {
         // 行上那一格记的是「这一刻还允不允许再跑一次」，判决比对的是
         // `retry_count < max_retries`：允许时写 `已经跑过的次数 + 1`，于是「变了就
         // 再跑一次、不设次数上限」在行上仍然是一个数，而不是让累计次数自己把路堵死。
-        let budget = if max_retries == 0 {
-            0
-        } else {
-            retry_count.saturating_add(1)
-        };
-        task.max_retries = budget;
-        // 比的是**写下那一格的那个数**：否则行里说还剩一次、判决按另一个数收账。
-        let _ = max_retries;
-        if retry_count < budget {
-            task.retry_count = retry_count + 1;
+        task.max_retries = max_retries;
+        // 计数只数「连续重复同一句」：买到的这次把计数清零，于是它不会自己把下一次
+        // 换内容的失败堵死；同一句原样再来时 `effective_max_retries` 给 0，判决当场关。
+        if max_retries > 0 {
+            task.retry_count = 0;
             task.status = TaskStatus::Pending;
             task.error = Some(error.clone());
             task.error_cause = cause;
