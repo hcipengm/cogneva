@@ -169,13 +169,19 @@ def _fixed_item(line: str, notouch: list[str], malformed: list[str],
             if p.strip() and p.strip() != "unknown"
         ]
         touches = [p.strip(" ）)") for p in touches if p.strip(" ）)")]
+    # 差距那一格可以带触点尾巴（`— ｜touches: …`）：五格行的触点没有第六列可放，写在
+    # 差距格尾。判终态时先把它剥掉——不剥的话，一条真正做完的行会被读成「写着已落却
+    # 留着差距」的债，结束一轮时它会一直欠在那里，而它欠的东西其实只是触点提示。
+    gap = re.split(r"[｜|]\s*touches:", cells[3])[0].strip()
+    if status.startswith(CLOSED_PREFIXES) and gap in _GAP_EMPTY:
+        # 终态真的到了：不进批次，也就没有「这一轮要动哪些文件」可算——做完的行不必写
+        # 触点。缺触点的拒读只针对**会被读成未完成**的行：留空让它们「不在批次里」才是
+        # 最坏的形状，因为它看起来像做完了。
+        return None
     if not touches and not deferred:
-        # 没有触点的行算不出批次。留空让它「不在批次里」是最坏的形状：它看起来像做完了。
+        # 没有触点的行算不出批次。
         notouch.append(cells[0])
         return None
-    gap = cells[3].strip()
-    if status.startswith(CLOSED_PREFIXES) and gap in _GAP_EMPTY:
-        return None  # 终态真的到了：不进批次。
     item = Item(cells[0], cells[1][:80], line.strip(), touches, deferred,
                 fixed=True, gap=gap)
     # 未落的行进批次；写着已落却留着差距的按未完成读（debt），与三格那种同一处置。

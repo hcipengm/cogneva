@@ -64,5 +64,25 @@ out=$(run "$tmp/notouch.md"); rc=$?
     && ok "没有触点：拒读并点名" \
     || bad "没有触点的行被静默丢掉（rc=$rc）：$out"
 
+# 5. 已落行的差距格带着触点尾巴：那是写法不是差距，读成债就等于这条永远欠着。
+printf '| CC05 | 终态 | 已落（971c92db5） | — ｜touches: scripts/hooks/round.py | 已落 |\n' >"$tmp/closed-touches.md"
+out=$(python3 -c "
+import sys
+sys.path.insert(0, '$root/scripts/hooks')
+import todo_source
+debt = todo_source.terminal_debt('md:$tmp/closed-touches.md')
+print('DEBT', len(debt), ' '.join(i.id for i in debt))
+" 2>&1); rc=$?
+{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "DEBT 0"; } \
+    && ok "已落行的触点尾巴不算差距：不进债" \
+    || bad "做完的行被读成了债（rc=$rc）：$out"
+
+# 6. 已落且差距为空的行不必写触点：它不进批次，就没有「这一轮动哪些文件」可算。
+printf '| CC06 | 终态 | 已落（971c92db5） | — | 已落 |\n' >"$tmp/closed-plain.md"
+out=$(run "$tmp/closed-plain.md"); rc=$?
+{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "PARSED 0"; } \
+    && ok "已落且差距为空：不写触点也读得出来" \
+    || bad "做完的行被当成缺触点拒读（rc=$rc）：$out"
+
 printf 'todo-source-fixed-format.test.sh: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
