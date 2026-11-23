@@ -471,6 +471,111 @@ pub enum ChildOutcome {
 /// 这和 `tokio::time::timeout(cmd.wait_with_output())` 的差别不是宽严，是判据：
 /// 后者看见的只有一个数——跑了多久——于是一个流式输出了一小时的进程与一个第一秒
 /// 就卡死的进程在它眼里是同一个读数。
+/// 一个进程此刻停在哪，以及这份停法该怎么处置。
+///
+/// 静默不杀的代价是「得有人解释它」，这份结构就是那个解释：`/proc` 读得到的
+/// 状态、它在等的对象，以及由这两样算出的**动作**。动作只有三种——
+/// 继续等（正常的等待，例如等对端的字节）、点名持锁者（在等一把锁，成因可见）、
+/// 报缺陷（在空转：没有任何对象可等，却是热的）。读不到时是「判不了」，不猜。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SilenceCause {
+    /// `/proc/<pid>/status` 的 `State:` 那一行，原样。
+    pub state: String,
+    /// `/proc/<pid>/wchan`，它此刻睡在哪个内核函数里。
+    pub wchan: String,
+    /// 由上面两样算出的处置。
+    pub action: SilenceAction,
+}
+
+/// 一份静默的处置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SilenceAction {
+    /// 在等一个对象（I/O、锁、子进程）：继续跑，把「在等谁」写进读数。
+    Wait,
+    /// 在等一把锁：继续跑，但点名它等的那把锁，让读的人知道该找谁。
+    WaitOnLock,
+    /// 是热的却没有对象可等：空转，按缺陷报出来。
+    Spin,
+    /// 读不到：判不了，不猜。
+    Unknown,
+}
+
+impl SilenceCause {
+    /// 一句话写清：状态、等待对象、处置。
+    pub fn describe(&self) -> String {
+        let action = match self.action {
+            SilenceAction::Wait => "waiting on an object; keep running",
+            SilenceAction::WaitOnLock => "waiting on a lock; keep running and name the holder",
+            SilenceAction::Spin => "running with no movement; this is a defect, not a wait",
+            SilenceAction::Unknown => "unreadable; not guessed",
+        };
+        format!("{}; in {}; {action}", self.state, self.wchan)
+    }
+}
+
+/// 一个进程此刻停在哪：`/proc` 能读到的状态与它在等的对象，加上由这两样算出的处置。
+///
+/// 静默不杀之后，这份归因就是那条读数：说得出「在 S 状态、睡在 fifo_wait」，
+/// 与「不知道它为什么不动」是两件事——前者能让人去补那把锁或那条输入，后者只能再杀一次。
+pub fn describe_silence(pid: u32) -> SilenceCause {
+    let read = |path: String| std::fs::read_to_string(path).ok();
+    let state = read(format!("/proc/{pid}/status"))
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("State:"))
+                .map(|l| l.trim().to_string())
+        })
+        .unwrap_or_else(|| "State: unreadable".to_string());
+    let wchan = read(format!("/proc/{pid}/wchan"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unreadable".to_string());
+    let action = classify_silence(&state, &wchan);
+    SilenceCause {
+        state,
+        wchan,
+        action,
+    }
+}
+
+/// 由状态与等待对象算处置。
+///
+/// 判据只看两样：内核说它在等什么（`wchan`），以及它是不是可中断地睡着。
+/// 名字里带 `lock`／`mutex`／`futex` 的是锁；带 `pipe`／`fifo`／`sock`／`tcp`
+/// 的是 I/O；`running` 而没有对象可等，是空转；其余一律按「在等一个对象」——
+/// 宁可把它当成正常的等待，也不把一段没读懂的内核函数名当成缺陷。
+pub fn classify_silence(state: &str, wchan: &str) -> SilenceAction {
+    if state.ends_with("unreadable") || wchan == "unreadable" {
+        return SilenceAction::Unknown;
+    }
+    let w = wchan.to_ascii_lowercase();
+    if w.contains("lock") || w.contains("mutex") || w.contains("futex") {
+        return SilenceAction::WaitOnLock;
+    }
+    if w.contains("pipe")
+        || w.contains("fifo")
+        || w.contains("sock")
+        || w.contains("tcp")
+        || w.contains("wait")
+    {
+        return SilenceAction::Wait;
+    }
+    if state.contains('R') {
+        return SilenceAction::Spin;
+    }
+    SilenceAction::Wait
+}
+
+/// 跑一个子进程，按**它还在不在产出**判它停没停——不按一个声明的钟。
+///
+/// 进程每写出一段 stdout/stderr 就是一拍，所以「慢但一直在印」的不会被判，「一声
+/// 不响」的会。判据与编排侧的回收、执行路由的守护读的是同一条（[`crate::declared_wall::stall`]），因此
+/// 三处的判词不会漂移。**量不到窗口时它不判**（这一套部署还没跑够步数去量），
+/// 那一刻没有证据，进程继续跑——「量不到」与「停住」在这里同样是两件事。
+///
+/// 这和 `tokio::time::timeout(cmd.wait_with_output())` 的差别不是宽严，是判据：
+/// 后者看见的只有一个数——跑了多久——于是一个流式输出了一小时的进程与一个第一秒
+/// 就卡死的进程在它眼里是同一个读数。
 /// 一个进程此刻停在哪：`/proc` 能读到的状态与它在等的对象。
 ///
 /// 静默不杀之后，这份归因就是那条读数：说得出「在 S 状态、wchan 是 fifo_wait」，
@@ -630,10 +735,15 @@ pub async fn watch_child(
                     // 所以这里只**归因并说出来**：卡在哪、等了多久、界是多少。
                     // 进程继续跑，租约继续持有；要收，由调用方拿到这份归因之后决定。
                     // 只有一种收场是这里的：它自己退出（`child.wait()` 那一支）。
-                    let where_it_stopped = child
+                    let cause = child
                         .id()
-                        .map(|pid| crate::progress::describe_silence(pid))
-                        .unwrap_or_else(|| "the child has no pid".to_string());
+                        .map(crate::progress::describe_silence)
+                        .unwrap_or_else(|| crate::progress::SilenceCause {
+                            state: "State: no pid".to_string(),
+                            wchan: "unreadable".to_string(),
+                            action: crate::progress::SilenceAction::Unknown,
+                        });
+                    let where_it_stopped = cause.describe();
                     tracing::warn!(
                         silent_secs = silent.as_secs_f64(),
                         window_secs = window.as_secs_f64(),
@@ -1307,9 +1417,39 @@ mod tests {
             gap_sample_count() >= 1,
             "那段静默没有进样本群：下一次正常的等待就没有基线可比"
         );
+        let cause = describe_silence(std::process::id());
         assert!(
-            !describe_silence(std::process::id()).is_empty(),
+            !cause.describe().is_empty(),
             "归因那一条读数要能写出来（哪怕说的是「读不到」）"
+        );
+        assert!(
+            cause.action != SilenceAction::Unknown,
+            "本进程的状态读得出来，处置不该是「判不了」"
+        );
+    }
+
+    /// 静默的归因：不同的等待对象给不同的处置，读不到不猜。
+    #[test]
+    fn a_silence_says_what_it_waits_on_and_what_to_do() {
+        assert_eq!(
+            classify_silence("State: S (sleeping)", "fifo_wait"),
+            SilenceAction::Wait
+        );
+        assert_eq!(
+            classify_silence("State: S (sleeping)", "sock_recvmsg"),
+            SilenceAction::Wait
+        );
+        assert_eq!(
+            classify_silence("State: S (sleeping)", "futex_wait_queue"),
+            SilenceAction::WaitOnLock
+        );
+        assert_eq!(
+            classify_silence("State: R (running)", "0"),
+            SilenceAction::Spin
+        );
+        assert_eq!(
+            classify_silence("State: unreadable", "unreadable"),
+            SilenceAction::Unknown
         );
     }
 

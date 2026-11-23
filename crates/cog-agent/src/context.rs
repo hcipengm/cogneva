@@ -450,6 +450,66 @@ impl ContextWindow {
         self.messages.len() <= 2 && self.current_tokens > self.budget()
     }
 
+    /// 地板装不下时把它压进预算：截断首条 user（任务输入），窗口里只留它的开头。
+    ///
+    /// 「窗口有限、任务无界」靠的正是这一步：任务正文本该先落到可寻址的存储里、
+    /// 窗口里只放指针。这里做的是同一件事的最小形态——保留开头，截掉尾部，
+    /// 并在结尾写明被截了多少。压得进去返回 `true`，压完仍装不下返回 `false`：
+    /// 那时缺的是入口那一侧的尺寸判据（任务把整本书塞进一句话），不是运行时的错。
+    pub fn shrink_floor_to_fit(&mut self) -> bool {
+        let Some(budget) = self.max_tokens else {
+            return true; // 没人说过窗口多大：地板无所谓「装不下」
+        };
+        let Some(index) = self.messages.iter().position(|m| m.role() == "user") else {
+            return !self.floor_exceeds_budget();
+        };
+        let original = self.messages[index].content();
+        let chars: Vec<char> = original.chars().collect();
+        // 二分出能装下的最长前缀：估算与裁剪用同一套字符计数。
+        let (mut low, mut high) = (0usize, chars.len());
+        while low < high {
+            let mid = (low + high + 1) / 2;
+            let head: String = chars[..mid].iter().collect();
+            let text = format!(
+                "{head}\n…（任务正文被截到窗口里能放下的长度：共 {} 个字符）",
+                chars.len()
+            );
+            let candidate = Message::user(&text);
+            let total: usize = self
+                .messages
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    if i == index {
+                        estimate_tokens(&candidate.content())
+                    } else {
+                        estimate_tokens(&m.content())
+                    }
+                })
+                .sum();
+            if total <= budget {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        if low == 0 {
+            return false;
+        }
+        let head: String = chars[..low].iter().collect();
+        let text = format!(
+            "{head}\n…（任务正文被截到窗口里能放下的长度：共 {} 个字符）",
+            chars.len()
+        );
+        self.messages[index] = Message::user(&text);
+        self.current_tokens = self
+            .messages
+            .iter()
+            .map(|m| estimate_tokens(&m.content()))
+            .sum();
+        !self.floor_exceeds_budget()
+    }
+
     /// The character budget one tool result may occupy in this window.
     ///
     /// The tool-return path uses it to decide whether a result is oversized

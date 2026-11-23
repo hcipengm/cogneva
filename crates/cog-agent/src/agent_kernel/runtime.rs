@@ -3648,33 +3648,45 @@ impl AgentRuntime {
             // 2026-11-06 实测：一件自进化任务这样发了 1,563 次同样的请求体、
             // 跑满一小时、零产出，而它每一次的结局都被读成「预算用完了」。
             if self.context.floor_exceeds_budget() {
-                self.state = RuntimeState::Complete;
-                tracing::warn!(
-                    agent_id = %self.config.agent_id,
-                    budget = self.config.context_window_size,
-                    estimated = self.context.token_count(),
-                    "the context window cannot hold the task input and one result at once; \
-                     every result is evicted the moment it arrives, so the run ends here \
-                     instead of re-sending an identical request until the budget is spent"
-                );
-                self.note_run_ending(
-                    crate::observable::RunOutcome::Unreadable,
-                    iteration + 1 - first_turn,
-                );
-                self.emit_event(AgentEvent::AgentEnd {
-                    agent_id: self.config.agent_id.clone(),
-                    messages: self.published_messages(),
-                    crew_id: None,
-                    squad_id: None,
-                    timestamp: chrono::Utc::now(),
-                })
-                .await?;
-                return Ok(serde_json::json!({
-                    "status": cog_core::contract::outcome::CONTEXT_FLOOR_EXCEEDS_WINDOW_STATUS,
-                    "budget": self.config.context_window_size,
-                    "estimated": self.context.token_count(),
-                    "iterations": iteration + 1 - first_turn,
-                }));
+                // 先试着让地板装得下：窗口有限、任务无界，靠的正是这一步——
+                // 任务正文压到窗口能放下的长度，运行继续（2026-11-23 属主：
+                // 「超窗应该可以继续，不是实现了有限窗口做无限任务吗」）。
+                if self.context.shrink_floor_to_fit() {
+                    tracing::warn!(
+                        agent_id = %self.config.agent_id,
+                        budget = self.config.context_window_size,
+                        "the floor did not fit the window; the task input was cut to what fits \
+                         and the run continues instead of ending here"
+                    );
+                } else {
+                    self.state = RuntimeState::Complete;
+                    tracing::warn!(
+                        agent_id = %self.config.agent_id,
+                        budget = self.config.context_window_size,
+                        estimated = self.context.token_count(),
+                        "the context window cannot hold the task input and one result at once; \
+                         every result is evicted the moment it arrives, so the run ends here \
+                         instead of re-sending an identical request until the budget is spent"
+                    );
+                    self.note_run_ending(
+                        crate::observable::RunOutcome::Unreadable,
+                        iteration + 1 - first_turn,
+                    );
+                    self.emit_event(AgentEvent::AgentEnd {
+                        agent_id: self.config.agent_id.clone(),
+                        messages: self.published_messages(),
+                        crew_id: None,
+                        squad_id: None,
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .await?;
+                    return Ok(serde_json::json!({
+                        "status": cog_core::contract::outcome::CONTEXT_FLOOR_EXCEEDS_WINDOW_STATUS,
+                        "budget": self.config.context_window_size,
+                        "estimated": self.context.token_count(),
+                        "iterations": iteration + 1 - first_turn,
+                    }));
+                }
             }
 
             // 一直在读、一直在搜、被提醒过两次之后又走满一整段仍然不写：这条运行
