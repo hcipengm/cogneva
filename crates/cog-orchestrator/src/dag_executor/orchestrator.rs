@@ -3875,7 +3875,9 @@ impl DagExecutor {
                     |t| {
                         t.status = TaskStatus::Pending;
                         t.retry_count = 0;
-                        t.error = None;
+                        // 上一次的失败**留着**：重试按「这一轮有没有拿到新东西」判，
+                        // 比对的就是它。把这一格清掉，下一次同样的失败会被读成「变了」，
+                        // 重试的判据当场失效（2026-11-24 实测：supervisor 的两条用例）。
                         t.error_cause = None;
                         t.clear_run();
                     },
