@@ -187,6 +187,10 @@ COMMANDS:
                            inbox
     principles <SUB>       Read the rules the platform's employees work by, and decide
                            them; <SUB> is one of list, propose, approve, reject, retire
+    batch-edit             Turn the current edit verdict into one generation request
+    batch-plan             Write the plan for a batch of ledger rows read from stdin
+    ledger <SUB>           Read the five-cell ledger, say what the next step is, or
+                           open a round on it; <SUB> is one of status, next, open
 
     With no COMMAND the full application starts.
 
