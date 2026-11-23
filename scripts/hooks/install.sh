@@ -55,5 +55,19 @@ else
   echo "install-hooks: 跳过 /usr/local/bin（没有写权限）；此时 ~/.local/bin 必须在 PATH 上" >&2
 fi
 
+# 装完再问一句：PATH 上第一个 cargo 是不是刚才装的那个转发器？
+#
+# 不装这一问，本脚本只有一个结论——「装好了」；而 rustup 的 `~/.cargo/bin` 常常排在
+# 前面，垫片一次也不会被调用，compile-ledger 永远是空的。两种情况的后果相反，
+# 读数却同形，所以判据要从「装没装」换成「PATH 首位认不认它」。
+#
+# 退 3 = 量不出（PATH 上没有 cargo）；退 1 = 首位不是转发器。两种都不算装成。
+if ! check_out="$(bash "$(dirname "$0")/check-cargo-path.sh" 2>&1)"; then
+  printf '%s\n' "$check_out" >&2
+  echo "install-hooks: 没装成——这一问的答案不是「会被调用」。修好 PATH 顺序后重跑。" >&2
+  exit 3
+fi
+printf '%s\n' "$check_out"
+
 echo "install-hooks: 完成。账本：${COGNEVA_COMPILE_LEDGER:-$HOME/.local/state/cogneva/compile-ledger.tsv}"
 echo "install-hooks: 待办台账路径由 COGNEVA_TODO_LEDGER 指定（默认 $HOME/.local/state/cogneva/todo-ledger.md）"

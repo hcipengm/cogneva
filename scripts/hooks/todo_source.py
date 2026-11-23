@@ -110,6 +110,52 @@ def _md_items(path: pathlib.Path) -> list[Item]:
     return _md_split(path)[0]
 
 
+# 五格行：`| 序号 | 终态 | 现在 | 差距 | 状态 |`。序号是字母加数字（N01、CC02、S12 都收）。
+_FIXED_ROW = re.compile(r"^\|\s*[A-Za-z]+[0-9]+\s*\|")
+_FIXED_STATUS = ("未落", "已落")
+_GAP_EMPTY = ("", "—", "-", "–")
+
+
+def _fixed_item(line: str, notouch: list[str]) -> tuple[Item, bool] | None:
+    """读一行五格台账。返回 (条目, 是否按未完成读)；不是这个形状时返回 None。
+
+    「已落」只在差距那一格为空时才成立（属主 2026-11-23 定）。写着已落却还留着差距的行，
+    按未完成读并进 debt——与三格那种「填不满的已落」同一处置：跳过它等于承认那个假的终态，
+    而拒读会让整本台账一个门都开不开。
+    """
+    cells = [c.strip() for c in line.strip().strip("|").split("|")]
+    if len(cells) < 5:
+        return None
+    status = cells[-1]
+    if status not in _FIXED_STATUS:
+        return None
+    found = None
+    for found in re.finditer(r"[｜|]\s*touches:\s*([^|｜\n]+)", line):
+        pass
+    touches: list[str] = []
+    deferred = False
+    if found:
+        raw = found.group(1).strip()
+        deferred = raw.startswith("unknown")
+        touches = [
+            re.split(r"[（(]", p.strip())[0].strip()
+            for p in re.split(r"[,，]", raw)
+            if p.strip() and p.strip() != "unknown"
+        ]
+        touches = [p.strip(" ）)") for p in touches if p.strip(" ）)")]
+    if not touches and not deferred:
+        # 没有触点的行算不出批次。留空让它「不在批次里」是最坏的形状：它看起来像做完了。
+        notouch.append(cells[0])
+        return None
+    gap = cells[3].strip()
+    if status.startswith(CLOSED_PREFIXES) and gap in _GAP_EMPTY:
+        return None  # 终态真的到了：不进批次。
+    three = parse_cells(line)
+    item = Item(cells[0], cells[1][:80], line.strip(), touches, deferred, three)
+    # 未落的行进批次；写着已落却留着差距的按未完成读（debt），与三格那种同一处置。
+    return item, status.startswith(CLOSED_PREFIXES)
+
+
 def _md_split(path: pathlib.Path) -> tuple[list[Item], list[Item]]:
     if not path.exists():
         raise Unreadable(f"{path} 不存在")
@@ -118,7 +164,17 @@ def _md_split(path: pathlib.Path) -> tuple[list[Item], list[Item]]:
     bad_status: list[str] = []
     bad_closed: list[str] = []
     malformed: list[str] = []
+    notouch: list[str] = []
     for line in path.read_text(errors="ignore").splitlines():
+        # 第二种行形状（属主 2026-11-23 定）：`| 序号 | 终态 | 现在 | 差距 | 状态 |`。
+        # 它与 `| S…` 那一种判的是同一件事——这一条做到终态没有；差别只在「差距」这一格
+        # 是显式写出来的，而不是从三格缺哪几格推出来。两形状都读，因为台账正在换格式，
+        # 只认一种就会把另一种**整族读成没有待办**，而那个读数看起来是绿的。
+        if not line.startswith("| S") and _FIXED_ROW.match(line):
+            item = _fixed_item(line, notouch)
+            if item is not None:
+                (debt if item[1] else out).append(item[0])
+            continue
         if not line.startswith("| S"):
             continue
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
@@ -178,6 +234,11 @@ def _md_split(path: pathlib.Path) -> tuple[list[Item], list[Item]]:
             debt.append(item)
         else:
             out.append(item)
+    if notouch:
+        raise Unreadable(
+            "这些行没有 `touches:`，批次算不出来（要么点名它要动的文件，要么写 `touches: unknown — 理由`）："
+            + "、".join(notouch)
+        )
     if malformed:
         raise Unreadable(
             "这些行以 `| S` 开头却没有状态列，读不出它做没做：" + "、".join(malformed)
@@ -291,13 +352,48 @@ def load(spec: str) -> list[Item]:
     raise Unreadable(f"不认识的台账来源：{spec}（只认 md:<路径> 与 change-ledger）")
 
 
+def _git_config(key: str) -> str | None:
+    """当前工作树那个仓里的一条配置；没有、或读不了，都是 None。"""
+    try:
+        out = subprocess.run(["git", "config", "--get", key], capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
+
+
+def ledger_from_repo_config() -> str | None:
+    """本机仓配置给的两格：地址 `cogneva.privateRoot` 与文件名 `cogneva.workLedger`。
+
+    为什么走配置而不是走常量：带外 worker 的台账住在一个私有仓里，它的**名字和位置**
+    都不该写进公开树——写进去等于把要藏的东西放进被它守的那棵树。地址与文件名各是一
+    条本机配置，换机器只改配置；公开树里一个字都不留。
+
+    `cogneva.workLedger` 是绝对路径就原样用；是相对路径就接在 `cogneva.privateRoot`
+    后面。只有地址没有文件名时返回 None——「有一个仓」与「知道是哪本台账」是两件事，
+    不拿仓里随便一本顶替（那会让两个 worker 读同一本，其中一边的活永远没人做）。
+    """
+    ledger = _git_config("cogneva.workLedger")
+    if not ledger:
+        return None
+    path = pathlib.Path(ledger).expanduser()
+    if not path.is_absolute():
+        root = _git_config("cogneva.privateRoot")
+        if not root:
+            return None
+        path = pathlib.Path(root).expanduser() / path
+    return str(path)
+
+
 def default_spec() -> str:
     """这台机器上，**这个 worker** 的台账是哪一本。
 
     解析顺序（S62）：显式 `COGNEVA_TODO_SOURCE` → `COGNEVA_WORKER_LEDGER` →
-    本机声明 `~/.config/cogneva/todo-ledger`。三者都没有，就返回一个不存在的路径，
-    让调用方报「读不到」——**不回落**到一份共享清单。回落会让两个 worker 读到同一本
-    台账：批次在两边都算得出来，而其中一边的活永远没人做。
+    本机仓配置（`cogneva.privateRoot` ＋ `cogneva.workLedger`）→ 本机声明
+    `~/.config/cogneva/todo-ledger`。都没有，就返回一个不存在的路径，让调用方报
+    「读不到」——**不回落**到一份共享清单。回落会让两个 worker 读到同一本台账：
+    批次在两边都算得出来，而其中一边的活永远没人做。
     """
     explicit = os.environ.get("COGNEVA_TODO_SOURCE")
     if explicit:
@@ -306,6 +402,9 @@ def default_spec() -> str:
         value = os.environ.get(key)
         if value:
             return f"md:{value}"
+    from_config = ledger_from_repo_config()
+    if from_config:
+        return f"md:{from_config}"
     host = pathlib.Path.home() / ".config/cogneva/todo-ledger"
     if host.exists():
         first = host.read_text(errors="ignore").strip().splitlines()
