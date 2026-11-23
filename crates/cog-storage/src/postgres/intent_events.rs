@@ -195,9 +195,22 @@ impl IntentReader for IntentEventStore {
             let identity: String = row
                 .try_get("subject_id")
                 .map_err(|e| SFError::Database(format!("intent row: {e}")))?;
-            let attributes: serde_json::Value = row
+            // 信封的列是 TEXT（约束只保证里面是 JSON 对象），与其它读事件流的
+            // store 一样在 Rust 里解码。
+            let attributes_text: String = row
                 .try_get("attributes")
                 .map_err(|e| SFError::Database(format!("intent row: {e}")))?;
+            let attributes: serde_json::Value = match serde_json::from_str(&attributes_text) {
+                Ok(value) => value,
+                Err(e) => {
+                    tracing::warn!(
+                        identity = %identity,
+                        error = %e,
+                        "an intent row's attributes do not decode; it is left alone"
+                    );
+                    continue;
+                }
+            };
             let at: DateTime<Utc> = row
                 .try_get("at")
                 .map_err(|e| SFError::Database(format!("intent row: {e}")))?;
