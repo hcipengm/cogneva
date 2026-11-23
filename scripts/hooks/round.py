@@ -4,23 +4,31 @@
 「这一轮从哪一版账开始」是唯一必须留下来的信息。它不进文件、不抄清单——清单抄一份
 到别处就多一份会漂的副本，而正本只有台账。所以：
 
-    round.py open      # 记下台账此刻的 git rev（refs/cogneva/round）
-    round.py status    # 按那个 rev 读台账，现算还剩哪些
-    round.py close     # 全部做完才能删掉这个 ref
+    round.py open      # 记下台账此刻的 git rev，开一条轮
+    round.py status    # 按那条轮钉住的清单读台账，现算还剩哪些
+    round.py close     # 全部做完才能关掉这一轮
 
-坐标住在 git 对象库里（`refs/cogneva/round`），不在工作树上：不随 commit 走、不是文档、
-不是第二份状态；时间在 reflog 里（`git reflog show refs/cogneva/round`）。
+**这一轮住在哪本书里由台账来源导出，不由人挑**：
 
-批次由 `family.py` / `batch-gate.py` 用同一个 ref 现算：读那个 rev 上的台账，取所有
-未完成条目。台账在工作过程中怎么变，这一轮的批次都不变——它钉在 rev 上。
+  - 带外 worker 的台账（`md:<路径>`，住在一个与其远端对齐的 git 仓里）
+    ⇒ 书是**那个仓的 `refs/cogneva/round`**，载荷就是同一组键。它不需要集群；
+  - 平台自己的变更账本（`change-ledger`，在库里、没有 git rev）⇒ 书是**集群事件流**里
+    的一条 `round_opened`。
 
-**终态**：ref 那一层退休，换成事件流里的一条 `round_opened`（载荷就是同一个 rev）。
-今天流还是空的，所以坐标先寄在 git 里。
+「事件流连不上就悄悄改读 git」正是这一族在修的缺陷：读不到一本书不等于另一本书里没有
+那一轮。所以书只有一本，且是从「这本台账住哪儿」算出来的，没有开关、没有回退。
+
+坐标住在 git 对象库里，不在工作树上：不随 commit 走、不是文档、不是第二份状态。上一
+版 docstring 写着「坐标先寄在 git 里」而这本根本没实现，门便只能在有集群的机器上跑。
+
+批次由 `family.py` / `batch-gate.py` 用同一个读数现算：读那条轮钉住的清单，取所有
+未完成条目。台账在工作过程中怎么变，这一轮的批次都不变。
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import json
 import os
@@ -30,6 +38,7 @@ import subprocess
 import sys
 
 PSQL_ENV = "COGNEVA_EVENT_PSQL"
+ROUND_REF = "refs/cogneva/round"
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import todo_source  # noqa: E402
 
@@ -83,7 +92,117 @@ def psql(sql: str) -> str:
     return result.stdout
 
 
+def round_book(source: str | None = None) -> str:
+    """这一轮住哪本书：由**台账来源**导出，不由人挑。
+
+    `md:<路径>` 的台账住在一个 git 仓里（带外 worker 的台账：会话与平台共用的那本，
+    远端本地对齐），书就是那个仓的 `refs/cogneva/round`；`change-ledger` 是平台自己
+    的账，在库里、没有 rev，书是事件流。没有第三种台账，所以也没有开关与回退。
+    """
+    spec = todo_source.normalize(todo_source.default_spec() if source is None else source)
+    if spec == "change-ledger":
+        return "event"
+    if ledger_repo(spec) is None:
+        raise todo_source.Unreadable(
+            f"台账 {spec} 不在一个 git 仓里，也不是平台的变更账本——这一轮钉不到任何一本书上"
+        )
+    return "git"
+
+
+def git_round_repo(spec: str | None = None) -> pathlib.Path:
+    """git 书住的那个仓：台账所在的那个 git 仓。
+
+    轮钉的是台账的 rev，所以书与台账必须在同一个仓；没有 rev 的台账（平台的
+    change-ledger 在库里）用不了这本书，要明说，不能悄悄换成事件流。
+    """
+    source = todo_source.default_spec() if spec is None else spec
+    repo = ledger_repo(todo_source.normalize(source))
+    if repo is None:
+        raise todo_source.Unreadable(
+            f"git 书要一本有 git rev 的台账；{source} 没有——这台机器上的轮要钉在台账仓"
+        )
+    return repo
+
+
+def git_round_payload(repo: pathlib.Path) -> tuple[str, dict] | None:
+    """(blob sha, 载荷)；这个 ref 不存在返回 None。
+
+    ref 在而载荷读不出 ⇒ Unreadable：那是书坏了，不是「没有开着的一轮」。
+    """
+    probe = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", ROUND_REF],
+        capture_output=True, text=True,
+    )
+    if probe.returncode != 0:
+        if probe.stderr.strip():
+            raise todo_source.Unreadable(
+                f"git 书读不到 {ROUND_REF}：{probe.stderr.strip()[:200]}"
+            )
+        return None
+    sha = probe.stdout.strip()
+    if not sha:
+        return None
+    body = subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "-p", sha], capture_output=True, text=True,
+    )
+    if body.returncode != 0:
+        raise todo_source.Unreadable(
+            f"{ROUND_REF} 指向的 {sha[:12]} 读不出字节：{body.stderr.strip()[:200]}"
+        )
+    try:
+        payload = json.loads(body.stdout)
+    except ValueError as e:
+        raise todo_source.Unreadable(f"{ROUND_REF} 的载荷不是 JSON：{e}")
+    if not isinstance(payload, dict):
+        raise todo_source.Unreadable(f"{ROUND_REF} 的载荷不是一份对象读法")
+    return sha, payload
+
+
+def write_git_round(repo: pathlib.Path, payload: dict, old: str | None) -> str:
+    """把载荷写进 ref（CAS：`old` 是期望的当前值，None 表示「此刻必须不存在」）。"""
+    body = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    blob = subprocess.run(
+        ["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
+        input=body, capture_output=True, text=True,
+    )
+    if blob.returncode != 0:
+        raise todo_source.Unreadable(f"写不进 git 书：{blob.stderr.strip()[:200]}")
+    new = blob.stdout.strip()
+    result = subprocess.run(
+        ["git", "-C", str(repo), "update-ref", "--create-reflog", ROUND_REF, new, old or ""],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise todo_source.Unreadable(
+            f"{ROUND_REF} 没写成（期望旧值 {str(old)[:12] or '不存在'}）：{result.stderr.strip()[:200]}"
+        )
+    return new
+
+
 def current_round() -> tuple[str, str, str, list[str], str] | None:
+    """(event_id, ledger_rev, code_rev, batch ids, first_rev)；没有开着的一轮返回 None。"""
+    if round_book() == "git":
+        found = git_round_payload(git_round_repo())
+        if found is None:
+            return None
+        _sha, payload = found
+        if payload.get("closed_at"):
+            return None
+        batch = payload.get("batch") or []
+        if not isinstance(batch, list):
+            raise todo_source.Unreadable(f"{ROUND_REF} 的 batch 不是数组：{batch!r}")
+        rev = str(payload.get("ledger_rev") or "")
+        return (
+            str(payload.get("event_id") or ""),
+            rev,
+            str(payload.get("code_rev") or ""),
+            [str(b) for b in batch],
+            str(payload.get("first_rev") or rev),
+        )
+    return current_round_in_stream()
+
+
+def current_round_in_stream() -> tuple[str, str, str, list[str], str] | None:
     """(event_id, ledger_rev)；没有开着的一轮返回 None。
 
     「开着」＝流里最后一条 `round_opened` 没有配对的 `round_closed`（按 subject_id 配）。
@@ -184,6 +303,30 @@ def open_round(spec: str | None, allow_open: bool = False, code_rev_override: st
         code_rev = _existing[2]
     if code_rev_override:
         code_rev = code_rev_override
+    if round_book(source) == "git":
+        repo = git_round_repo(source)
+        # 读的那一侧按 default_spec 找书。两处不是同一个仓，写下的轮谁也读不到——
+        # 那会是一个「开过」而处处读作「没开」的轮，比拒开更坏。
+        if repo != git_round_repo():
+            raise todo_source.Unreadable(
+                f"这一轮钉在 {repo}，而本机读的是 {git_round_repo()}：两处不是同一本书"
+            )
+        found = git_round_payload(repo)
+        payload = {
+            "event_id": event_id,
+            "ledger_rev": rev,
+            "ledger_path": str(todo_source.spec_path(source)),
+            "code_rev": code_rev,
+            "batch": [i.id for i in batch],
+            "first_rev": first_rev,
+            "opened_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        write_git_round(repo, payload, found[0] if found else None)
+        print(
+            f"round: 书=git {ROUND_REF}@{repo}；开了一条钉在台账仓 {rev[:12]} 的轮；"
+            "批次由那个 rev 现算。"
+        )
+        return 0
     attrs_sql = (
         f"jsonb_build_object('ledger_rev', '{rev}', 'ledger_path', '{todo_source.spec_path(source)}', "
         # `batch` 存**数组**，不是一段含数组的字符串：同一个键两种形状，Rust 那一侧
@@ -197,7 +340,7 @@ def open_round(spec: str | None, allow_open: bool = False, code_rev_override: st
         f"'{event_id}','{os.environ.get('COGNEVA_ACTOR', 'worker')}',"
         f"'{os.environ.get('COGNEVA_WRITER', 'worker')}',{attrs_sql})"
     )
-    print(f"round: 开了一条 round_opened 事件（钉在台账仓 {rev[:12]}）；批次由那个 rev 现算。")
+    print(f"round: 书=事件流；开了一条 round_opened 事件（钉在台账仓 {rev[:12]}）；批次由那个 rev 现算。")
     return 0
 
 
@@ -249,7 +392,8 @@ def status() -> int:
         cells = {i: items[i].missing_cells() for i in left if i in items}
     except todo_source.Unreadable as e:
         print(f"round: 台账读不到（{e}）；下面只列 id")
-    print(f"round: 事件流里钉在 {rev[:12]}，还剩 {len(left)} 条")
+    book = "事件流" if round_book() == "event" else f"git {ROUND_REF}"
+    print(f"round: 书={book}，钉在 {rev[:12]}，还剩 {len(left)} 条")
     terminal = 0
     for i in left:
         miss = cells.get(i)
@@ -285,6 +429,17 @@ def close() -> int:
     if status() != 0:
         print("round: 还有没做完的条目，这一轮关不掉。", file=sys.stderr)
         return 1
+    if round_book() == "git":
+        repo = git_round_repo()
+        found = git_round_payload(repo)
+        if found is None:
+            print("round: 没有开着的一轮。")
+            return 1
+        sha, payload = found
+        payload["closed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        write_git_round(repo, payload, sha)
+        print(f"round: 这一轮关了（书=git {ROUND_REF}@{repo}；关的时刻在同一份载荷里）。")
+        return 0
     import os
     import uuid
     event_id = uuid.uuid4().hex[:26]
@@ -345,6 +500,18 @@ def record_plan(plan_path: str) -> int:
         return 2
     import uuid
     event_id = uuid.uuid4().hex[:26]
+    if round_book() == "git":
+        repo = git_round_repo()
+        found = git_round_payload(repo)
+        if found is None or found[1].get("closed_at"):
+            print("round: 没有开着的一轮。", file=sys.stderr)
+            return 1
+        sha, payload = found
+        payload["plan"] = plan
+        payload["planned_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        write_git_round(repo, payload, sha)
+        print(f"round: 计划已记进 git 书（覆盖 {len(batch)} 条）；编辑只认这一份。")
+        return 0
     attrs = json.dumps(plan, ensure_ascii=False).replace("'", "''")
     psql(
         "insert into cogneva_event (event_id, kind, subject_kind, subject_id, unit_of_work, "
@@ -363,6 +530,16 @@ def planned() -> int:
     current = current_round()
     if current is None:
         print("round: 没有开着的一轮。", file=sys.stderr)
+        return 1
+    if round_book() == "git":
+        found = git_round_payload(git_round_repo())
+        if found and found[1].get("plan"):
+            return 0
+        print(
+            "round: 这一轮还没有计划。整批必须先变成编辑的输入："
+            "`round.py plan --file <plan.json>`（覆盖全部待办、每条至少两种来源形状）。",
+            file=sys.stderr,
+        )
         return 1
     out = psql(
         "select count(*) from cogneva_event where kind='batch_planned' "
@@ -407,7 +584,7 @@ def main(argv: list[str]) -> int:
         return close()
     except todo_source.Unreadable as e:
         # 读不到不是「没有」：退 3，调用方分得开这两种情况。
-        print(f"round: 事件流读不到 —— {e}", file=sys.stderr)
+        print(f"round: 这一轮的书读不到 —— {e}", file=sys.stderr)
         return 3
 
 

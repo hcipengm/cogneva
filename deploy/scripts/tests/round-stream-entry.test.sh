@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # `scripts/hooks/round.py` 的事件流入口：它从哪儿拿到那条命令，拿不到时说不说得清。
 #
+# 这一面只在**平台的变更账本**（`change-ledger`，在库里、没有 git rev）上成立：
+# 带外 worker 的台账是 `md:<路径>`，住在台账仓里，轮的书是那个仓的 ref（见
+# `round-git-store.test.sh`）。书由台账来源导出，所以这里的来源必须是 change-ledger。
+#
 # 判三件事：
 #   1. 没有 `COGNEVA_EVENT_PSQL` 时，用仓库自带的 `scripts/host/event-psql.sh`。
 #      没有这一档，每个调用方都要自己把环境变量拼对；拼错与「流里没有开着的一轮」
@@ -46,8 +50,16 @@ esac
 STUB
 chmod +x "$tree/scripts/host/event-psql.sh"
 
-# 1. 没设环境变量，但仓库自带入口：读得到那一轮。
-out=$(COGNEVA_EVENT_PSQL='' COGNEVA_TODO_LEDGER="$tree/ledger.md" \
+# 平台变更账本的替身：来源是 `change-ledger`，书才会导出成事件流。
+cat >"$tmp/change-ledger.sh" <<'CL'
+#!/bin/sh
+printf 'S1\tcrates/a/src/x.rs\t内容\tpending\n'
+CL
+chmod +x "$tmp/change-ledger.sh"
+
+# 1. 没设事件流变量，但仓库自带入口：读得到那一轮。
+out=$(COGNEVA_EVENT_PSQL='' COGNEVA_TODO_SOURCE=change-ledger \
+      COGNEVA_CHANGE_LEDGER_CMD="$tmp/change-ledger.sh" \
       python3 "$tree/scripts/hooks/round.py" status 2>&1); rc=$?
 if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "还剩 1 条"; then
     ok "没设变量也能读：用仓库自带的事件流入口"
@@ -57,7 +69,8 @@ fi
 
 # 2. 两档都没有：退 3，并点名缺的是什么。
 mv "$tree/scripts/host/event-psql.sh" "$tree/scripts/host/event-psql.sh.off"
-out=$(COGNEVA_EVENT_PSQL='' COGNEVA_TODO_LEDGER="$tree/ledger.md" \
+out=$(COGNEVA_EVENT_PSQL='' COGNEVA_TODO_SOURCE=change-ledger \
+      COGNEVA_CHANGE_LEDGER_CMD="$tmp/change-ledger.sh" \
       python3 "$tree/scripts/hooks/round.py" status 2>&1); rc=$?
 { [ "$rc" -eq 3 ] && printf '%s' "$out" | grep -q "COGNEVA_EVENT_PSQL"; } \
     && ok "两档都没有：退 3，并点名环境变量" \
@@ -70,7 +83,8 @@ echo "connection refused" >&2
 exit 2
 BROKEN
 chmod +x "$tmp/broken.sh"
-out=$(COGNEVA_EVENT_PSQL="$tmp/broken.sh" COGNEVA_TODO_LEDGER="$tree/ledger.md" \
+out=$(COGNEVA_EVENT_PSQL="$tmp/broken.sh" COGNEVA_TODO_SOURCE=change-ledger \
+      COGNEVA_CHANGE_LEDGER_CMD="$tmp/change-ledger.sh" \
       python3 "$tree/scripts/hooks/round.py" status 2>&1); rc=$?
 { [ "$rc" -eq 3 ] && printf '%s' "$out" | grep -q "connection refused"; } \
     && ok "命令失败：退 3，并把 stderr 原样带出来" \

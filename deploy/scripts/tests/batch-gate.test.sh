@@ -61,14 +61,15 @@ write_ledger() { # $1 = path, rest = 已完成（带 `代码` 格）的 id
   git -C "$tree" rev-parse HEAD
 }
 
-# 事件流的替身：round 现在住在流里。钉住的台账 rev 每个场景不同（写在文件里），
-# 代码基准固定为 `BASE`——两个基准分开，改了哪些文件才读得出来。
+# 事件流的替身：这一面的来源是 md 台账，轮的书由**台账来源导出**——台账在这个 git
+# 仓里，书就是 `refs/cogneva/round`（见 `round-git-store.test.sh`）。夹具每个场景
+# 重钉这一轮：钉住的台账 rev 不同，代码基准固定为 `BASE`——两个基准分开，改了哪些
+# 文件才读得出来。
 : >"$tmp/ledger_rev"
 cat >"$tmp/psql.sh" <<STUB
 #!/bin/sh
 case "\$*" in
   *batch_planned*) printf '1\n' ;;
-  *round_opened*) printf '%s\t%s\t%s\n' "round-test" "\$(cat $tmp/ledger_rev)" "$BASE" ;;
   *) : ;;
 esac
 STUB
@@ -80,7 +81,12 @@ bad() { printf 'FAIL- %s\n' "$1" >&2; fail=$((fail + 1)); }
 reset() { git -C "$tree" reset -q --hard "$BASE"; }
 run() { COGNEVA_EVENT_PSQL="$tmp/psql.sh" COGNEVA_TODO_LEDGER="${2:-$ledger}" python3 "$tree/scripts/hooks/batch-gate.py" --root "$tree" --base origin/main "${@:3}" 2>&1; }
 commit_with() { git -C "$tree" commit -q --allow-empty -F - < <(printf '%s\n' "$1"); }
-pin() { printf '%s' "$1" >"$tmp/ledger_rev"; }
+pin() { # $1 = 钉住的台账 rev：写进 git 书的载荷
+  printf '%s' "$1" >"$tmp/ledger_rev"
+  payload=$(printf '{"event_id":"round-test","ledger_rev":"%s","code_rev":"%s","batch":[],"first_rev":"%s"}' "$1" "$BASE" "$1")
+  sha=$(printf '%s' "$payload" | git -C "$tree" hash-object -w --stdin)
+  git -C "$tree" update-ref refs/cogneva/round "$sha"
+}
 
 # 场景 0：一条都没做完。台账判「全没做」，与改了哪些文件无关。
 reset; rev=$(write_ledger "$ledger"); pin "$rev"
