@@ -1756,7 +1756,7 @@ mod tests {
             let asks_about_terminals = input
                 .get("instructions")
                 .and_then(|v| v.as_str())
-                .is_some_and(|s| s.contains("judge the terminal description"));
+                .is_some_and(|s| s.contains("Judge against this run's working tree"));
             // 夹具自己写了判词的（审不过的那几条反例），照它写的答。
             let has_own_verdicts = self.response.get("verdicts").is_some();
             if asks_about_terminals && !has_own_verdicts {
