@@ -866,6 +866,8 @@ impl RalphLoop {
             PlanScope::Planned(planner) => Some(planner),
             PlanScope::Declared(_) => None,
         };
+        // 审终态是 evaluator 的角色：它与写终态的 planner、与判完成的自己都不是同一次
+        // 调用，所以那两问由这个角色发起，程序在定批之后、开生成之前调它一次。
         let planned_once: Option<PlannerOutput> = match scope {
             PlanScope::Planned(planner) => {
                 let plan_task = Task::new(
@@ -889,7 +891,7 @@ impl RalphLoop {
         // 改完仍不成立，那是**缺属主那份输入**，带着判词去问，条目开着。
         let planned_once = match (planner_for_review, planned_once) {
             (Some(planner), Some(plan)) => {
-                let findings = planner.review_criteria(goal, plan.ledger_items()).await;
+                let findings = evaluator.review_criteria(goal, plan.ledger_items()).await;
                 if findings.iter().any(|f| !f.ok) {
                     let feedback = findings
                         .iter()
@@ -911,7 +913,9 @@ impl RalphLoop {
                             None,
                         )
                         .await;
-                    let second = planner.review_criteria(goal, revised.ledger_items()).await;
+                    let second = evaluator
+                        .review_criteria(goal, revised.ledger_items())
+                        .await;
                     if second.iter().any(|f| !f.ok) {
                         let cause = second
                             .iter()
@@ -2560,7 +2564,7 @@ mod tests {
     #[tokio::test]
     async fn a_terminal_that_is_not_a_finished_state_is_refused() {
         use cog_core::contract::ledger_item::{LedgerItem, LedgerState};
-        let planner = PlannerActor::new(Arc::new(MockAgent {
+        let evaluator = EvaluatorActor::new(Arc::new(MockAgent {
             response: serde_json::json!({
                 "verdicts": [{"id": "N1", "ok": false, "reason": "describes an activity, not a finished state"}]
             }),
@@ -2572,7 +2576,7 @@ mod tests {
             gap: String::new(),
             state: LedgerState::Open,
         }];
-        let out = planner.review_criteria("把它做对", &items).await;
+        let out = evaluator.review_criteria("把它做对", &items).await;
         assert_eq!(out.len(), 1);
         assert!(
             !out[0].ok,
@@ -2589,7 +2593,7 @@ mod tests {
     #[tokio::test]
     async fn a_review_that_answers_nothing_is_not_a_pass() {
         use cog_core::contract::ledger_item::{LedgerItem, LedgerState};
-        let planner = PlannerActor::new(Arc::new(MockAgent {
+        let evaluator = EvaluatorActor::new(Arc::new(MockAgent {
             response: serde_json::json!({ "verdicts": [] }),
         }));
         let items = vec![LedgerItem {
@@ -2599,7 +2603,7 @@ mod tests {
             gap: String::new(),
             state: LedgerState::Open,
         }];
-        let out = planner.review_criteria("统一正本", &items).await;
+        let out = evaluator.review_criteria("统一正本", &items).await;
         assert_eq!(out.len(), 1);
         assert!(!out[0].ok, "没答的条目按不成立读，而不是默认通过");
     }

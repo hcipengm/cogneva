@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use cog_core::{Agent, KnowledgeBackend, Task};
+use cog_core::{Agent, KnowledgeBackend, Task, TaskType};
 
 use crate::squad::pge::types::{Criterion, EvaluationResult, Verdict};
 
@@ -65,6 +65,78 @@ impl EvaluatorActor {
     }
 
     /// Run the Evaluator phase: assess plan and generation quality.
+    /// 判据审：另一次调用，只读「意图 + 每条的终态」，答三问——
+    /// 是不是一个「做完的样子」、能不能被证据判、是不是意图要的那件事。
+    ///
+    /// 这是「终态写得对不对」的**他律**：写终态的与审终态的不是同一次调用。
+    /// 它不看树、不判完成，所以很便宜：两段文字进，一串判词出。答不出判词的
+    /// 条目按**不成立**读——判不了不是通过。
+    pub async fn review_criteria(
+        &self,
+        goal: &str,
+        items: &[cog_core::contract::ledger_item::LedgerItem],
+    ) -> Vec<crate::squad::pge::types::CriterionVerdict> {
+        use crate::squad::pge::types::CriterionVerdict;
+        if items.is_empty() {
+            return Vec::new();
+        }
+        let payload = serde_json::json!({
+            "goal": goal,
+            "items": items
+                .iter()
+                .map(|i| serde_json::json!({ "id": &i.id, "terminal": &i.terminal }))
+                .collect::<Vec<_>>(),
+            "instructions": "For each item, judge the terminal description alone: (1) is it a \
+                description of a finished state, not of an activity; (2) can a reader tell from \
+                evidence whether it holds; (3) is it what the goal asks for. Answer one JSON \
+                object: {\"verdicts\": [{\"id\": \"...\", \"ok\": true|false, \"reason\": \"...\"}]}. \
+                A terminal that is not one of the three is not ok, and the reason names which.",
+        });
+        let task = Task::new(
+            "criterion-review",
+            TaskType::Custom("criterion_review".into()),
+            payload,
+        );
+        let answer = match self
+            .agent
+            .prompt_for_task(&task.id, task.input.clone())
+            .await
+        {
+            Ok(value) => value,
+            Err(e) => {
+                // 审不到不是通过：一次没到上游的调用与「全部立得住」在读数上不能同形。
+                return items
+                    .iter()
+                    .map(|i| CriterionVerdict {
+                        id: i.id.clone(),
+                        ok: false,
+                        reason: format!("the criterion review did not reach a model: {e}"),
+                    })
+                    .collect();
+            }
+        };
+        let given: Vec<CriterionVerdict> = answer
+            .get("verdicts")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| serde_json::from_value::<CriterionVerdict>(v.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        items
+            .iter()
+            .map(|i| match given.iter().find(|v| v.id == i.id) {
+                Some(v) => v.clone(),
+                None => CriterionVerdict {
+                    id: i.id.clone(),
+                    ok: false,
+                    reason: "the review answered nothing for this item".into(),
+                },
+            })
+            .collect()
+    }
+
     pub async fn evaluate(
         &self,
         task: &Task,

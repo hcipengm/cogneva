@@ -353,6 +353,10 @@ def main(argv: list[str]) -> int:
     deferred: list[str] = []
     batch = list(changed)
     pinned_rev = None
+    # 台账仓在两处用到（判触点存在、算它那一侧的改动面），而它只在「台账存在」那一支
+    # 里被赋值。别的支路走到 `report(...)` 时它还没绑定——2026-11-23 实测：提交钩子
+    # 用 `--editing` 调它，直接 UnboundLocalError。先给 None，再让那一支去填。
+    ledger_repo = None
     if args.all_todos:
         # 有开着的一轮：批次＝那一轮钉住的 rev 上的台账，不是此刻的台账。
         try:
