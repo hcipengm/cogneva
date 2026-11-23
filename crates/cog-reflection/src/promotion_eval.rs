@@ -445,12 +445,16 @@ impl PromotionEval {
         let mut withdrawn = 0usize;
         // 读不到图时这一趟不能答「收走 0 条」：那句与「图上真没有孤儿」逐字同形，
         // 而孤儿行不会自己消失，下一拍还得再清。把错误交出去，让调用方说出来。
-        let tasks = self.orchestrator.get_all_tasks_checked().await.map_err(|e| {
-            SFError::Internal(format!(
-                "the task graph could not be read, so no abandoned A/B row was withdrawn \
+        let tasks = self
+            .orchestrator
+            .get_all_tasks_checked()
+            .await
+            .map_err(|e| {
+                SFError::Internal(format!(
+                    "the task graph could not be read, so no abandoned A/B row was withdrawn \
                  this pass: {e}"
-            ))
-        })?;
+                ))
+            })?;
         for task in tasks {
             if !is_abandoned_promotion_eval(&task, now) {
                 continue;
@@ -948,11 +952,7 @@ mod tests {
             "promotion-eval-change-ledger-ec0fc6a8c301bbf3-6862a991a1ff",
             chrono::Utc::now() - chrono::Duration::hours(20),
         );
-        graph
-            .tasks
-            .lock()
-            .unwrap()
-            .insert(stale.id.clone(), stale);
+        graph.tasks.lock().unwrap().insert(stale.id.clone(), stale);
         *graph.unreadable.lock().unwrap() = true;
 
         let orch: Arc<dyn OrchestratorControl> = graph.clone();
