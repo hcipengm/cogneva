@@ -576,26 +576,6 @@ pub fn classify_silence(state: &str, wchan: &str) -> SilenceAction {
 /// 这和 `tokio::time::timeout(cmd.wait_with_output())` 的差别不是宽严，是判据：
 /// 后者看见的只有一个数——跑了多久——于是一个流式输出了一小时的进程与一个第一秒
 /// 就卡死的进程在它眼里是同一个读数。
-/// 一个进程此刻停在哪：`/proc` 能读到的状态与它在等的对象。
-///
-/// 静默不杀之后，这份归因就是那条读数：说得出「在 S 状态、wchan 是 fifo_wait」，
-/// 与「不知道它为什么不动」是两件事，前者能让人去补那把锁或那条输入，后者只能再杀一次。
-pub fn describe_silence(pid: u32) -> String {
-    let read = |path: String| std::fs::read_to_string(path).ok();
-    let state = read(format!("/proc/{pid}/status"))
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("State:"))
-                .map(|l| l.trim().to_string())
-        })
-        .unwrap_or_else(|| "state unreadable".to_string());
-    let wchan = read(format!("/proc/{pid}/wchan"))
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "wchan unreadable".to_string());
-    format!("{state}; waiting in {wchan}")
-}
-
 pub async fn run_child_watched(
     cmd: tokio::process::Command,
     id: &str,
