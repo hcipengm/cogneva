@@ -1259,6 +1259,10 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                             shutdown,
                             config,
                             outward_census,
+                            // 收件台与网关那一侧是同一份：外循环找到的东西也落成
+                            // 一行意图，而不是在流程旁边直接下单。没有装配时交
+                            // `None`——循环照常把条目交给目标路径。
+                            ctx.consume_service::<dyn cog_core::IntentEvents>(),
                         );
                     }
                     (orchestrator, http) => warn!(

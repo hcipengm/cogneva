@@ -37,6 +37,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use cog_core::contract::intent_events::{IntentEvents, IntentRow};
 use cog_core::observability::{DimensionSpec, Observable, RawMetric};
 use cog_core::{
     HttpClient, HttpRequest, OrchestratorControl, OwnerLeaseBroker, SFResult, ShutdownSignal, Task,
@@ -623,10 +624,30 @@ impl Handover {
 /// looked like it avoided. `get_task` is the cheap question; the id is what
 /// makes it answerable.
 async fn hand_over(
+    desk: Option<&Arc<dyn IntentEvents>>,
     orchestrator: &Arc<dyn OrchestratorControl>,
     source: &OutwardSource,
     item: &OutwardItem,
 ) -> Handover {
+    // 先落收件台：入口只有一种写法（来源、外部身份、原文、因果父行），下游不必
+    // 知道它是从会话里说出来的还是检索找到的。落不进去不挡交接——交接是另一条
+    // 路，丢的是「这条发现被看见过」的那一行，而它会在 census 之外只留一条 warn。
+    if let Some(desk) = desk {
+        let row = IntentRow {
+            source: source.name.clone(),
+            external_id: task_id_for(&item.url),
+            text: goal_for(source, item),
+            parent: item.url.clone(),
+        };
+        if let Err(e) = desk.record(&row, OUTWARD_ROLE).await {
+            warn!(
+                source = %source.name,
+                url = %item.url,
+                error = %e,
+                "outward: an item could not be recorded on the intent desk"
+            );
+        }
+    }
     let id = task_id_for(&item.url);
     if orchestrator.get_task(&id).await.is_some() {
         return Handover::AlreadyHeld;
@@ -682,6 +703,7 @@ struct Retry {
 /// this pass found and what became of it" into a count of tries, and the pass
 /// reading beside it already says how often the source was asked.
 async fn drain_retries(
+    desk: Option<&Arc<dyn IntentEvents>>,
     orchestrator: &Arc<dyn OrchestratorControl>,
     sources: &[OutwardSource],
     pending: &mut Vec<Retry>,
@@ -703,7 +725,7 @@ async fn drain_retries(
             );
             continue;
         };
-        let outcome = hand_over(orchestrator, source, &retry.item).await;
+        let outcome = hand_over(desk, orchestrator, source, &retry.item).await;
         if outcome == Handover::Failed && retry.attempts + 1 < HANDOVER_ATTEMPTS {
             retry.attempts += 1;
             still.push(retry);
@@ -726,6 +748,7 @@ pub fn spawn_outward_loop(
     shutdown: ShutdownSignal,
     config: OutwardConfig,
     census: Arc<OutwardCensus>,
+    intents: Option<Arc<dyn IntentEvents>>,
 ) {
     let period = config.period();
     let wake = config.wake_interval();
@@ -752,6 +775,7 @@ pub fn spawn_outward_loop(
             let sources = sources.clone();
             let base = base.clone();
             let census = census.clone();
+            let intents = intents.clone();
             async move {
                 // Only one replica asks and hands over at a time. The ids would
                 // make a second replica's work harmless, but the reads and the
@@ -785,7 +809,14 @@ pub fn spawn_outward_loop(
                     if !hold.may_act().await {
                         continue;
                     }
-                    drain_retries(&orchestrator, &sources, &mut pending, &census).await;
+                    drain_retries(
+                        intents.as_ref(),
+                        &orchestrator,
+                        &sources,
+                        &mut pending,
+                        &census,
+                    )
+                    .await;
                     let now = Instant::now();
                     for (index, (source, due)) in
                         sources.iter().zip(next_due.iter_mut()).enumerate()
@@ -802,7 +833,8 @@ pub fn spawn_outward_loop(
                             )
                             .await;
                         for item in &tick.items {
-                            let outcome = hand_over(&orchestrator, source, item).await;
+                            let outcome =
+                                hand_over(intents.as_ref(), &orchestrator, source, item).await;
                             if outcome == Handover::Failed && HANDOVER_ATTEMPTS > 1 {
                                 pending.push(Retry {
                                     source: index,
@@ -1041,6 +1073,7 @@ mod tests {
             ShutdownSignal::new(),
             config,
             Arc::new(OutwardCensus::new()),
+            None,
         );
         // Let the loop reach its first wait before moving the clock: a ticker
         // created after the clock moved would be one full wake later.
@@ -1120,6 +1153,53 @@ mod tests {
         /// How many more submissions to refuse before the graph starts taking
         /// them: a refusal that passes, which is what the retry is for.
         refusals_left: StdMutex<usize>,
+    }
+
+    /// 收件台的替身：只把交给它的行记下来。
+    #[derive(Default)]
+    struct RecordingDesk(StdMutex<Vec<IntentRow>>);
+
+    #[async_trait]
+    impl cog_core::IntentEvents for RecordingDesk {
+        async fn record(&self, row: &IntentRow, _actor: &str) -> SFResult<()> {
+            self.0.lock().unwrap().push(row.clone());
+            Ok(())
+        }
+    }
+
+    /// 检索到的那一条也走同一个入口：来源、外部身份、原文、因果父行。
+    /// 身份与目标路径用的是同一个 id——收件台与图问的是同一条身份。
+    #[tokio::test]
+    async fn an_item_found_outside_lands_on_the_same_intent_desk() {
+        let recording = Arc::new(RecordingDesk::default());
+        let desk: Arc<dyn cog_core::IntentEvents> = recording.clone();
+        let orchestrator: Arc<dyn OrchestratorControl> =
+            Arc::new(RememberingOrchestrator::default());
+        let source = OutwardSource {
+            name: "ai-news".into(),
+            query: "new inference kernels".into(),
+            ..Default::default()
+        };
+        let item = OutwardItem {
+            url: "https://example.com/paper".into(),
+            title: "A faster kernel".into(),
+            excerpt: "measured on two cards".into(),
+        };
+
+        let first = hand_over(Some(&desk), &orchestrator, &source, &item).await;
+        assert_eq!(first, Handover::Handed);
+        // 重放同一页：图说「已经拿着了」，而收件台照样收到同一个身份——
+        // 「收到过没有」由库的幂等键回答，不由这里的调用次数回答。
+        let again = hand_over(Some(&desk), &orchestrator, &source, &item).await;
+        assert_eq!(again, Handover::AlreadyHeld);
+
+        let rows = recording.0.lock().unwrap();
+        assert_eq!(rows.len(), 2, "每一次发现都该落一行：{rows:?}");
+        assert_eq!(rows[0].source, "ai-news");
+        assert_eq!(rows[0].identity(), rows[1].identity());
+        assert_eq!(rows[0].external_id, task_id_for(&item.url));
+        assert!(rows[0].text.contains("https://example.com/paper"));
+        assert_eq!(rows[0].parent, item.url);
     }
 
     impl RememberingOrchestrator {
@@ -1260,9 +1340,9 @@ mod tests {
             excerpt: "c".into(),
         };
 
-        assert_eq!(hand_over(&control, &source, &item).await, Handover::Handed);
+        assert_eq!(hand_over(None, &control, &source, &item).await, Handover::Handed);
         assert_eq!(
-            hand_over(&control, &source, &item).await,
+            hand_over(None, &control, &source, &item).await,
             Handover::AlreadyHeld
         );
         // The second pass never reached the submission path: the graph answered
@@ -1313,14 +1393,14 @@ mod tests {
             attempts: 1,
         }];
 
-        drain_retries(&control, &sources, &mut pending, &census).await;
+        drain_retries(None, &control, &sources, &mut pending, &census).await;
         assert_eq!(pending.len(), 1, "被拒的那一条留在队里等下一拍");
         assert!(
             census_items(&census).await.is_empty(),
             "还没定局的东西不记进 items：这一格数的是发现的下场，不是尝试次数"
         );
 
-        drain_retries(&control, &sources, &mut pending, &census).await;
+        drain_retries(None, &control, &sources, &mut pending, &census).await;
         assert!(pending.is_empty());
         assert_eq!(
             census_items(&census).await,
@@ -1380,7 +1460,7 @@ mod tests {
         }];
 
         for _ in 0..HANDOVER_ATTEMPTS {
-            drain_retries(&control, &sources, &mut pending, &census).await;
+            drain_retries(None, &control, &sources, &mut pending, &census).await;
         }
         assert!(pending.is_empty(), "给过的尝试次数用完就不再占着队");
         assert_eq!(
