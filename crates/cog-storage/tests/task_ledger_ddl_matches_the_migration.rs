@@ -142,7 +142,46 @@ fn add_column(text: &str, table: &str, column: &str, definition: &str) -> String
     )
 }
 
-/// 095 的文本，按顺序走完后面那些改列（新列与改名）。
+/// 095 之后给账本表加的索引，按版本顺序。
+///
+/// 与「加列」分开收：列要折进建表语句再比，索引本来就是独立语句，原样追加即可。
+/// 不收这一族的后果是 2026-11-24 实测的那一类：127 给 `task_defined` 加的索引
+/// 只在升级路径上有，全新安装靠启动 schema 建——而这条门只看 095，于是两边都
+/// 「一样」（它根本没看见新索引）。
+fn indexes_added_after_the_ledger() -> Vec<String> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/postgres");
+    let mut files: Vec<(u32, std::path::PathBuf)> = std::fs::read_dir(&dir)
+        .expect("the migrations directory is part of this crate")
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let name = path.file_name()?.to_str()?.to_string();
+            let (version, rest) = name.split_once('_')?;
+            if !rest.ends_with(".up.sql") {
+                return None;
+            }
+            let version: u32 = version.parse().ok()?;
+            (version > 95).then_some((version, path))
+        })
+        .collect();
+    files.sort();
+    let mut out = Vec::new();
+    for (_, path) in files {
+        let text = std::fs::read_to_string(&path).expect("a migration file is readable");
+        for statement in split_statements(&text).unwrap_or_default() {
+            let shape = normalize(&statement);
+            let shape = shape.trim_end_matches(';').trim();
+            if LEDGER_TABLES
+                .iter()
+                .any(|table| shape.starts_with(&format!("create index if not exists idx_{table}_")))
+            {
+                out.push(statement);
+            }
+        }
+    }
+    out
+}
+
+/// 095 的文本，按顺序走完后面那些改列（新列、新索引与改名）。
 fn migration_ledger_text() -> String {
     let mut text = MIGRATION.to_string();
     for (table, column, definition) in columns_added_after_the_ledger() {
@@ -150,6 +189,10 @@ fn migration_ledger_text() -> String {
     }
     for (old, new) in renames_after_the_ledger() {
         text = text.replace(&old, &new);
+    }
+    for index in indexes_added_after_the_ledger() {
+        text.push_str("\n;\n");
+        text.push_str(&index);
     }
     text
 }
