@@ -23,4 +23,4 @@ ALTER TABLE task_defined
     ) STORED;
 
 CREATE INDEX IF NOT EXISTS idx_task_defined_intent_id
-    ON task_defined (intent_id) WHERE intent_id IS NOT NULL;
+    ON task_defined(intent_id) WHERE intent_id IS NOT NULL;
