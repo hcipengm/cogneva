@@ -205,5 +205,45 @@ out=$(run "$tree" "$ledger_long" --window-tokens 400); rc=$?
 out=$(run "$tree" "$ledger_long" --window-tokens 8000); rc=$?
 { [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "窗口份额"; } && ok "第 4 条：正文远小于窗口份额，红" || bad "第 4 条不合格却没红（rc=$rc）：$out"
 
+# ---- 提交那一刻的门（`pre-commit.d/55-batch-edited-before-commit.sh`） ----
+#
+# 判的是另一件事：**这一遍编辑走完了没有**。planner／generator／evaluator 是同一个
+# 模型在扮，流程对它唯一的约束就落在它能自己敲的 `git add` / `git commit` 上——
+# 「改一条提交一条」与「整批改完再编译一次」在读数上完全同形，这条门把那句话变成事实。
+# 每一格都先 reset 再放钩子：`write_ledger` 会 `git add -A` 把钩子一起提交进去，
+# 下一次 `reset --hard` 就把它删了——那样「没拒」读起来像门坏了，其实是夹具没了。
+arm_hook() {
+  hook="$tree/scripts/git-hooks/pre-commit.d/55-batch-edited-before-commit.sh"
+  mkdir -p "$(dirname "$hook")"
+  cp "$root/scripts/git-hooks/pre-commit.d/55-batch-edited-before-commit.sh" "$hook"
+  # 钩子跑的是 `family.py`；它在夹具里没有就退 0，而「没拒」与「都改完了」同形。
+  cp "$root/scripts/hooks/family.py" "$tree/scripts/hooks/family.py"
+}
+
+run_hook() { ( cd "$tree" && COGNEVA_TODO_LEDGER="$ledger" bash "$hook" ) 2>&1; }
+
+# 一条都没动：拒，并把两条都点名。
+reset; write_ledger "$ledger" >/dev/null; arm_hook
+out=$(run_hook); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "S1" && printf '%s' "$out" | grep -q "S2"; } \
+    && ok "批没动：提交被拒，并逐条点名" \
+    || bad "批没动却放行（rc=$rc）：$out"
+
+# 只改了一半：仍然拒，点名没动的那一条——改了一半不是做完。
+reset; write_ledger "$ledger" >/dev/null; arm_hook
+echo half >>"$tree/crates/a/src/x.rs"
+out=$(run_hook); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "S2"; } \
+    && ok "改了一半：仍拒，点名没动的那一条" \
+    || bad "改了一半却放行（rc=$rc）：$out"
+
+# 触点全动过：放行。这条与编译垫片问的是同一个问题、走的是同一段代码。
+reset; write_ledger "$ledger" >/dev/null; arm_hook
+echo half >>"$tree/crates/a/src/x.rs"; echo half >>"$tree/crates/b/src/y.rs"; echo half >>"$tree/deploy/manifest.yaml"
+out=$(run_hook); rc=$?
+{ [ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep -q "^TODO "; } \
+    && ok "整批都动过：放行" \
+    || bad "整批都动过却仍被拒（rc=$rc）：$out"
+
 printf '\nbatch-gate.test.sh: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

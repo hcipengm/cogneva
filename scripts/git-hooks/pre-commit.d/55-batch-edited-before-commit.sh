@@ -25,9 +25,12 @@ case "$rc" in
     printf 'pre-commit（批次）：这一轮判不了，提交不拦——%s\n' "$(printf '%s' "$out" | tail -1)" >&2
     exit 0 ;;
 esac
-if printf '%s' "$out" | grep -q '^TODO '; then
+# `family.py` 的 TODO 行是缩进两格的（它与「待办 N: …」那一列对齐）。按列零锚定
+# 匹配的那一版**一条也匹配不到**：这道门看起来在、实际从不拒绝，而「没拒」与
+# 「这一批都改完了」在读数上同形（2026-11-23 由 `batch-gate.test.sh` 的那三格钉出来）。
+if printf '%s' "$out" | grep -q '^[[:space:]]*TODO '; then
     printf 'pre-commit（批次）：这一轮的批还没编辑完，先别提交。\n' >&2
-    printf '%s\n' "$out" | grep '^TODO ' | sed 's/^/  /' >&2
+    printf '%s\n' "$out" | grep '^[[:space:]]*TODO ' | sed 's/^[[:space:]]*/  /' >&2
     cat >&2 <<'MSG'
   流程是：planner 产出待办 → 立刻定批 → generator 把**整批**一次改完 → 编译一次 →
   测试一次 → 门一次 → 推。改一条提交一条，等于把同一份验证付了 N 次，而且
