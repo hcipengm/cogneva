@@ -189,11 +189,20 @@ CREATE TABLE IF NOT EXISTS task_defined (
                 planner_source TEXT,
                 planner_confidence DOUBLE PRECISION,
                 planner_at TIMESTAMPTZ,
+                -- 收件台按意图身份问「这一条派生了没有」。与迁移 127 是同一列表述：
+                -- 全新安装与升级路径必须长出同一张表，由
+                -- `task_ledger_ddl_matches_the_migration` 逐条比对。
+                intent_id TEXT GENERATED ALWAYS AS (
+                    (CASE WHEN input ~ '^[[:space:]]*[\[{]' THEN input::jsonb END) ->> 'intent_id'
+                ) STORED,
                 PRIMARY KEY (task_id, rev)
             )
 ;
 CREATE INDEX IF NOT EXISTS idx_task_defined_latest
             ON task_defined(task_id, rev DESC)
+;
+CREATE INDEX IF NOT EXISTS idx_task_defined_intent_id
+            ON task_defined(intent_id) WHERE intent_id IS NOT NULL
 ;
 CREATE INDEX IF NOT EXISTS idx_task_defined_blocked_by
             ON task_defined USING GIN (blocked_by)
