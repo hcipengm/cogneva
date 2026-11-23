@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use sqlx::{PgPool, Row};
 
-use cog_core::contract::intent_events::{IntentEvents, IntentRow, INTENT_RECEIVED};
+use cog_core::contract::intent_events::{IntentEvents, IntentReader, IntentRow, INTENT_RECEIVED};
 use cog_core::{SFError, SFResult};
 
 /// 任务行上带着「它是从哪条意图派生的」的那个键。
@@ -116,6 +116,13 @@ impl IntentEvents for IntentEventStore {
             .await
             .map_err(|e| SFError::Database(format!("{INTENT_RECEIVED}: {e}")))?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl IntentReader for IntentEventStore {
+    async fn undispatched(&self, limit: i64) -> SFResult<Vec<IntentRow>> {
+        self.undispatched_intents(limit).await
     }
 }
 

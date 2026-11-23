@@ -41,6 +41,13 @@ pub trait IntentEvents: Send + Sync {
     async fn record(&self, row: &IntentRow, actor: &str) -> SFResult<()>;
 }
 
+/// 读那些还没有被派生成任务的意图。写者与读者是两个面：入口只写，planner 只读。
+#[async_trait]
+pub trait IntentReader: Send + Sync {
+    /// 还没派生的意图，按到达先后。读不到返回 `Err`，不返回空表。
+    async fn undispatched(&self, limit: i64) -> SFResult<Vec<IntentRow>>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
