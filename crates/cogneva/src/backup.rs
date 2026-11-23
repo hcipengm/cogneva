@@ -1394,8 +1394,8 @@ pub fn packages_in(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 /// 计数按条目数：目录本身不合记一条，每个不合的包文件各记一条。子目录不递归，
 /// 旧包里的 tar 条目不打开——这条读数量的是落盘的现场，不是包里的历史。
 ///
-/// 返回 `None` 是三件不同的事：目录不存在（这个安装没有这个落点）、不是目录、
-/// 或者列不出来。三种都不该印成 0——0 说的是「看了，干净」。
+/// 返回 `None` 是四件不同的事：目录不存在（这个安装没有这个落点）、不是目录、
+/// 列不出来、或者里面有一条读不出来。四种都不该印成 0——0 说的是「看了，干净」。
 fn credential_violations_in(dir: &Path) -> Option<i32> {
     let meta = match std::fs::symlink_metadata(dir) {
         Ok(meta) => meta,
@@ -1411,7 +1411,7 @@ fn credential_violations_in(dir: &Path) -> Option<i32> {
         return None;
     }
 
-    let mut violations = i32::from(meta.permissions().mode() & 0o777 != 0o700);
+    let base = i32::from(meta.permissions().mode() & 0o777 != 0o700);
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
@@ -1419,22 +1419,48 @@ fn credential_violations_in(dir: &Path) -> Option<i32> {
             return None;
         }
     };
-    for entry in entries.filter_map(|e| e.ok()) {
-        let name_is_package = entry
-            .file_name()
-            .to_str()
-            .is_some_and(|n| n.ends_with(PACKAGE_SUFFIX));
-        if !name_is_package {
-            continue;
+    match credential_violations_from(base, entries) {
+        Some(violations) => Some(violations),
+        None => {
+            tracing::warn!(path = %dir.display(), "凭证目录里有一条读不出来，这一类按没量过记");
+            None
         }
-        let Ok(file_meta) = entry.metadata() else {
-            continue;
-        };
-        if !file_meta.is_file() {
-            continue;
-        }
-        if file_meta.permissions().mode() & 0o777 != 0o600 {
-            violations += 1;
+    }
+}
+
+/// 一条条目的判词：`Ok(None)` 不是要看的包，`Ok(Some(true/false))` 是判过的包，
+/// `Err` 是这一条量不出来。
+fn package_violation(entry: std::io::Result<std::fs::DirEntry>) -> std::io::Result<Option<bool>> {
+    use std::os::unix::fs::PermissionsExt;
+    let entry = entry?;
+    let name_is_package = entry
+        .file_name()
+        .to_str()
+        .is_some_and(|n| n.ends_with(PACKAGE_SUFFIX));
+    if !name_is_package {
+        return Ok(None);
+    }
+    let file_meta = entry.metadata()?;
+    if !file_meta.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(file_meta.permissions().mode() & 0o777 != 0o600))
+}
+
+/// 计数本身：`None` 是「这一格没量全」。
+///
+/// 读不出来的一条与「目录列不出来」是同一类：跳过它，这一格就从「没量过」滑成
+/// 「看了，干净」——而这一格唯一要回答的正是「有没有别人读得到」。
+fn credential_violations_from(
+    base: i32,
+    entries: impl Iterator<Item = std::io::Result<std::fs::DirEntry>>,
+) -> Option<i32> {
+    let mut violations = base;
+    for entry in entries {
+        match package_violation(entry) {
+            Ok(Some(open)) => violations += i32::from(open),
+            Ok(None) => {}
+            Err(_) => return None,
         }
     }
     Some(violations)
@@ -1852,7 +1878,18 @@ fn tighten_one_surface(dir: &Path) -> std::io::Result<()> {
         return Ok(());
     }
     restrict_to_owner(dir, 0o700)?;
-    for entry in std::fs::read_dir(dir)?.filter_map(|e| e.ok()) {
+    tighten_entries(std::fs::read_dir(dir)?)
+}
+
+/// 收紧列出来的条目；一条读不出来就整面报错。
+///
+/// 跳过它而答 `Ok`，这一趟就宣称收紧过一个其实没碰到的条目——下一趟演练再从 0
+/// 之外读到它时，没有人知道上一趟根本没看它。
+fn tighten_entries(
+    entries: impl Iterator<Item = std::io::Result<std::fs::DirEntry>>,
+) -> std::io::Result<()> {
+    for entry in entries {
+        let entry = entry?;
         let is_package = entry
             .file_name()
             .to_str()
@@ -7437,6 +7474,32 @@ mod tests {
 
         // 没有这个落点不是 0：那一格要说的是「有没有量」，不是「干净」。
         assert_eq!(credential_violations_in(&root.path().join("absent")), None);
+    }
+
+    /// 读不出来的一条不许被跳过：跳过就把这一格从「没量过」滑成 0「干净」。
+    ///
+    /// 判据：把 `credential_violations_from` 换回 `filter_map(|e| e.ok())`，这条会红
+    /// （读到的是 `Some(0)`）。
+    #[test]
+    fn an_entry_that_cannot_be_read_is_not_a_clean_credential_surface() {
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        assert_eq!(
+            credential_violations_from(0, vec![Err(denied)].into_iter()),
+            None,
+            "读不出来的一条要记成没量过，不是跳过之后印 0"
+        );
+    }
+
+    /// 收紧时读不出来的一条也不许被跳过：跳过等于宣称这一面收紧过。
+    ///
+    /// 判据：把 `tighten_entries` 换回 `filter_map(|e| e.ok())`，`is_err` 会红。
+    #[test]
+    fn tightening_cannot_report_success_over_an_entry_it_could_not_read() {
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        assert!(
+            tighten_entries(vec![Err(denied)].into_iter()).is_err(),
+            "读不出来的一条要让这一面报错，不是答 Ok"
+        );
     }
 
     #[test]
