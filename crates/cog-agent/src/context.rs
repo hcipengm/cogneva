@@ -473,7 +473,7 @@ impl ContextWindow {
         // 正文外置到哪个文件先算出来：内容是寻址的，写与不写都落在同一个路径上。
         // 二分里的候选正文必须**已经**带上这个路径——截完的正文与预算判的要是
         // 同一段字，否则补上那句话又把窗口顶出去，落回「压不进」。
-        let spill_at = spill_path(&self.spill_dir, original);
+        let spill_at = spill_path(&self.spill_dir, &original);
         let tail = format!(
             "\n…（任务正文被截到窗口里能放下的长度：共 {} 个字符；整段正文：{}）",
             chars.len(),
@@ -513,7 +513,7 @@ impl ContextWindow {
         let head: String = chars[..low].iter().collect();
         // 写不进去时不能留一个指向空处的路径：退回到「只在这条任务行上」——
         // 这句话比路径短，二分定下的前缀仍然装得下。
-        let text = if spill_floor(&spill_at, original) {
+        let text = if spill_floor(&spill_at, &original) {
             format!("{head}{tail}")
         } else {
             format!(
