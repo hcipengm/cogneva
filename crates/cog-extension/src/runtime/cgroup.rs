@@ -64,11 +64,14 @@ impl CgroupFacts {
     /// missing counter is no evidence in either direction, so it never reads
     /// as "not an OOM".
     /// `memory.current` less the page cache the kernel would drop anyway, or
-    /// `None` when the current reading could not be taken -- an unreadable
-    /// container stays unreadable rather than reading as an empty one.
+    /// `None` when either reading could not be taken -- an unreadable
+    /// container stays unreadable rather than reading as an empty one, and a
+    /// missing `memory.stat` leaves the cache unmeasured rather than defaulting
+    /// it to zero, which would count the whole page cache as resident.
     pub fn working_set_bytes(&self) -> Option<u64> {
         self.current_bytes
-            .map(|current| current.saturating_sub(self.inactive_file_bytes.unwrap_or(0)))
+            .zip(self.inactive_file_bytes)
+            .map(|(current, inactive)| current.saturating_sub(inactive))
     }
 
     pub fn oom_kill_between(before: &Self, after: &Self) -> bool {
@@ -544,6 +547,16 @@ mod tests {
 
         let dir = fixture(&[("memory.stat", "inactive_file 250\n")]);
         assert_eq!(read_at(dir.path()).working_set_bytes(), None);
+
+        // 反向那一格同一条：`memory.current` 读得到、`memory.stat` 缺
+        // `inactive_file`，报出来的工作集是整份 `memory.current`，也就是把
+        // 页缓存算成了实占。量不到就是量不到，不是换个数顶上。
+        let dir = fixture(&[("memory.current", "1000\n")]);
+        assert_eq!(
+            read_at(dir.path()).working_set_bytes(),
+            None,
+            "缺 inactive_file 时工作集是量不到，不是整个 memory.current"
+        );
     }
 
     #[test]
