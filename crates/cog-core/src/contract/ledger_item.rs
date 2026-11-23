@@ -108,7 +108,10 @@ mod tests {
         assert!(!item("到", "到", "", LedgerState::Reached).is_in_batch());
         assert!(item("到", "还差一步", "还差一步", LedgerState::Reached).is_in_batch());
         for dash in ["—", "-", "–", "  "] {
-            assert!(!item("到", "到", dash, LedgerState::Reached).gap_is_empty());
+            assert!(
+                item("到", "到", dash, LedgerState::Reached).gap_is_empty(),
+                "破折号是排版，不是缺口：{dash:?}"
+            );
         }
     }
 
