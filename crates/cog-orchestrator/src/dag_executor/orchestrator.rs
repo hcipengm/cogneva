@@ -3491,6 +3491,13 @@ impl DagExecutor {
             reg.record_failure(&task_type)?;
         }
 
+        // 判据要用**这一次之前**的那条失败：下面这一推会把它盖住，所以先取下来。
+        let previous_failure = inner
+            .retry_history
+            .get(task_id)
+            .and_then(|v| v.last())
+            .map(|a| a.error.clone());
+
         // Track retry history
         inner
             .retry_history
@@ -3591,15 +3598,10 @@ impl DagExecutor {
         // 预算要读这一行**上一次**留下的失败原因（同样的失败再来一次不算新的一次），
         // 所以在把 `task` 借成可变之前先问。
         let max_retries = {
-            // 上一次的失败从**重试史**里取：`task.error` 会被人工重试那条路改写，
-            // 而这一格只追加。比对基准丢了，「没变化」就会被读成「变了」
-            // （2026-11-24 实测：probe 两次都是 previous=None）。
-            let previous = inner
-                .retry_history
-                .get(task_id)
-                .and_then(|v| v.last())
-                .map(|a| a.error.clone());
-            self.effective_max_retries(&error, cause, previous.as_deref())
+            // 上一次的失败从**重试史**里取（进这一趟时先取下的那一条）：`task.error`
+            // 会被人工重试那条路改写，而这一格只追加（2026-11-24 实测：比对基准丢了，
+            // 「没变化」被读成「变了」）。
+            self.effective_max_retries(&error, cause, previous_failure.as_deref())
         };
 
         let task = inner.tasks.get_mut(task_id).expect("task exists");
