@@ -634,7 +634,7 @@ pub(crate) async fn append_transition(
     //
     // 只拿序号做主键是不够的：**每个任务的第一次转移序号都是 1**，第二条任务
     // 落下时主键就撞了（2026-11-23 CI 实测：三条真库用例都死在
-    // `duplicate key value violates unique constraint "cogneva_event_pkey"`）。
+    // 主键冲突（`duplicate key value violates unique constraint`，撞的是流的主键））。
     let event_id = transition_event_id(move_.task_id, seq);
     let attributes = serde_json::json!({
         "from": move_.from.map(|s| s.as_str()),
