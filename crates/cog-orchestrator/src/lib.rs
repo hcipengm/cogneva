@@ -11,7 +11,6 @@ pub mod face_staffing;
 pub mod governance_acts;
 pub mod landing_rate;
 pub mod lane_memory;
-pub mod ledger;
 pub mod observable;
 pub mod orchestrator_control_impl;
 pub mod outward;
