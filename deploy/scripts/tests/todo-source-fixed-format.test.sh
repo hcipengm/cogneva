@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # 五格台账行：`| 序号 | 终态 | 现在 | 差距 | 状态 |`（属主 2026-11-23 定）。
 #
-# 判四件事：
+# 判六件事：
 #   1. 差距非空的 `未落` 行进批次，触点照读；
 #   2. 差距为空的 `已落` 行不进批次（终态到了）；
 #   3. 写着 `已落` 却还留着差距的行按**未完成**读：跳过它等于承认那个假的终态；
-#   4. 没有 `touches:` 的行拒读并点名——留空让它「不在批次里」，那是看起来像做完的最坏形状。
+#   4. 没有 `touches:` 的行拒读并点名——留空让它「不在批次里」，那是看起来像做完的最坏形状；
+#   5. 序号带 `S` 前缀或带子号（`S20.7`）也按五格读：形状由格数定，不由前缀定；
+#   6. 五格行把状态写成散文时拒读并点名，不许静默算作「没有这条」。
 set -uo pipefail
 root=$(git rev-parse --show-toplevel)
 loader="$root/scripts/hooks/todo_source.py"
@@ -63,6 +65,21 @@ out=$(run "$tmp/notouch.md"); rc=$?
 { [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q "CC04"; } \
     && ok "没有触点：拒读并点名" \
     || bad "没有触点的行被静默丢掉（rc=$rc）：$out"
+
+# 5. 序号带 `S` 前缀、带子号：仍按五格读。按前缀分形状的读法会把它们交给三格
+#    分支，于是「现在」那一格成了状态词，整族 S 账读不成。
+printf '| S20.7 | 终态 | 现在不是状态词 | 差距 ｜ touches: crates/a/src/x.rs | 未落 |\n| S77 | 终态 | 现在 | 差 ｜ touches: crates/b/src/y.rs | 未落 |\n' >"$tmp/prefixed.md"
+out=$(run "$tmp/prefixed.md"); rc=$?
+{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "PARSED 2 S20.7 S77"; } \
+    && ok "S 前缀与带子号的序号按五格读" \
+    || bad "S 开头的五格行被当成三格读（rc=$rc）：$out"
+
+# 6. 五格行把状态写成散文：拒读并点名。静默丢掉的读数与「本条不在台账里」同形。
+printf '| N07 | 终态 | 现在 | 差距 ｜ touches: crates/a/src/x.rs | 树里：还没做 |\n' >"$tmp/prose.md"
+out=$(run "$tmp/prose.md"); rc=$?
+{ [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q "N07"; } \
+    && ok "五格行状态写成散文：拒读并点名" \
+    || bad "状态写坏的 N 行被静默算成没有（rc=$rc）：$out"
 
 printf 'todo-source-fixed-format.test.sh: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

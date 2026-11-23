@@ -2541,6 +2541,14 @@ pub const DATA_ROOT_SUBDIRS: &[DataRootSubdir] = &[
         what: "评测数据集（{data_dir}/eval/datasets）",
         why: "`deploy/scripts/fetch-benchmark-data.sh` 可从公开来源重取",
     },
+    DataRootSubdir {
+        name: "context-spill",
+        roots: &["main"],
+        class: SubdirClass::Discardable,
+        what: "地板压进窗口时被截掉的那段任务正文（内容寻址，一条正文一个文件）",
+        why: "原文就在任务行上，这里只是它的副本；换机后下一次同样的超界地板\
+              写回同一个路径（文件名是正文的哈希）",
+    },
 ];
 
 /// 按子目录名取判词。

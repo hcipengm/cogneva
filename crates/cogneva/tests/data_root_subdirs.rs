@@ -441,6 +441,15 @@ fn the_census_reads_every_shape_the_code_uses() {
         root_joins("let dir = data_dir().join(\"landing\");", &consts),
         vec!["landing".to_string()]
     );
+    // `Path::new(&data_dir()).join(…)`：调用写在别的 crate 的路径函数上，接收者
+    // 与 `.join(` 之间隔着 `())`——`context-spill` 就是这么写的。
+    assert_eq!(
+        root_joins(
+            "spill_dir: std::path::Path::new(&cog_core::paths::data_dir()).join(\"context-spill\"),",
+            &consts
+        ),
+        vec!["context-spill".to_string()]
+    );
     assert_eq!(
         format_segments("let p = format!(\"{}/warehouse\", cfg.data_dir);"),
         vec!["warehouse".to_string()]

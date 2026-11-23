@@ -21,6 +21,10 @@ pub struct ContextWindow {
     /// 最近观察到的一次正常往返占多少 token。折中间段时，尾部要留够这么多，
     /// 否则刚发生的事会被折掉。`None` 表示还没量到——那时一条也不折。
     round_trip_tokens: Option<usize>,
+    /// 地板压进窗口时，被截掉的正文外置到哪个目录。数据根下的 `context-spill`：
+    /// 内容是原文的副本，`DATA_ROOT_SUBDIRS` 里的一句判词说它换机后能不能丢。
+    /// 测试把它指到临时目录，别往装好的那棵树上写。
+    spill_dir: std::path::PathBuf,
 }
 
 /// 一次（或一轮里几次）提示词裁剪的现场。
@@ -197,6 +201,7 @@ impl ContextWindow {
             current_tokens: 0,
             compaction: None,
             round_trip_tokens: None,
+            spill_dir: std::path::Path::new(&cog_core::paths::data_dir()).join("context-spill"),
         }
     }
 
@@ -465,15 +470,21 @@ impl ContextWindow {
         };
         let original = self.messages[index].content();
         let chars: Vec<char> = original.chars().collect();
+        // 正文外置到哪个文件先算出来：内容是寻址的，写与不写都落在同一个路径上。
+        // 二分里的候选正文必须**已经**带上这个路径——截完的正文与预算判的要是
+        // 同一段字，否则补上那句话又把窗口顶出去，落回「压不进」。
+        let spill_at = spill_path(&self.spill_dir, original);
+        let tail = format!(
+            "\n…（任务正文被截到窗口里能放下的长度：共 {} 个字符；整段正文：{}）",
+            chars.len(),
+            spill_at.display()
+        );
         // 二分出能装下的最长前缀：估算与裁剪用同一套字符计数。
         let (mut low, mut high) = (0usize, chars.len());
         while low < high {
             let mid = (low + high + 1) / 2;
             let head: String = chars[..mid].iter().collect();
-            let text = format!(
-                "{head}\n…（任务正文被截到窗口里能放下的长度：共 {} 个字符）",
-                chars.len()
-            );
+            let text = format!("{head}{tail}");
             let candidate = Message::user(&text);
             let total: usize = self
                 .messages
@@ -496,11 +507,20 @@ impl ContextWindow {
         if low == 0 {
             return false;
         }
+        // 截掉的那一段**不能就这么丢**：正文外置到可寻址的文件里，窗口里留它的
+        // 路径，模型用 `read_file` 就能取回整段（属主 2026-11-23：「窗口有限、
+        // 任务无界」，靠的正是这一步，而不是把任务砍短了事）。
         let head: String = chars[..low].iter().collect();
-        let text = format!(
-            "{head}\n…（任务正文被截到窗口里能放下的长度：共 {} 个字符）",
-            chars.len()
-        );
+        // 写不进去时不能留一个指向空处的路径：退回到「只在这条任务行上」——
+        // 这句话比路径短，二分定下的前缀仍然装得下。
+        let text = if spill_floor(&spill_at, original) {
+            format!("{head}{tail}")
+        } else {
+            format!(
+                "{head}\n…（任务正文被截到窗口里能放下的长度：共 {} 个字符；整段正文只在这条任务行上）",
+                chars.len()
+            )
+        };
         self.messages[index] = Message::user(&text);
         self.current_tokens = self
             .messages
@@ -730,6 +750,25 @@ const TOOL_RESULT_WINDOW_SHARE_DIVISOR: usize = 2;
 // cap: bound — 同样按窗口的一半：裁剪之后要隔半个窗口才再发生一次，中间每一轮都是纯追加
 const TRIM_LOW_WATER_DIVISOR: usize = 2;
 
+/// 一段过大的任务正文外置到哪个文件：内容寻址，同一段正文永远落在同一条路径上，
+/// 重跑不会堆出第二份。
+fn spill_path(dir: &std::path::Path, text: &str) -> std::path::PathBuf {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(text.as_bytes());
+    dir.join(format!("{}.txt", hex::encode(&digest[..16])))
+}
+
+/// 把正文写到 [`spill_path`] 算出的位置上。已经在了就不再写（同一段正文只写一次）。
+///
+/// 写不进去返回 `false`——那时窗口里只剩「整段正文只在这条任务行上」：说得出取
+/// 不回，比给一个指向空处的路径要好。
+fn spill_floor(path: &std::path::Path, text: &str) -> bool {
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    std::fs::create_dir_all(dir).is_ok() && (path.exists() || std::fs::write(path, text).is_ok())
+}
+
 /// 一条工具结果最多带多少字符，无论窗口有多大。
 ///
 /// 窗口份额那道界回答的是「装不装得下」，这道界回答的是「值不值得每一轮都
@@ -870,6 +909,38 @@ pub fn truncate_to_chars(text: &str, budget_chars: usize, reference: Option<&str
 pub use cog_core::estimate_tokens;
 
 #[cfg(test)]
+/// 地板压进窗口之后，被截掉的那一段有着落：内容寻址的文件里能读回整段。
+#[test]
+fn a_shrunk_floor_names_where_the_full_text_lives() {
+    let big = "任务正文".repeat(4_000);
+    let mut ctx = ContextWindow::new(Some(2_000));
+    // 外置目录指到临时目录：这条测的是「截掉的正文去哪了」，不该往装好的数据根里写。
+    let spill_dir = std::env::temp_dir().join(format!("cog-agent-spill-{}", std::process::id()));
+    ctx.spill_dir = spill_dir.clone();
+    ctx.add_message(Message::system("你是执行者。"));
+    ctx.add_message(Message::user(&big));
+    assert!(ctx.floor_exceeds_budget(), "前提：地板装不下");
+    assert!(ctx.shrink_floor_to_fit(), "压不进窗口");
+    let text = ctx.messages()[1].content();
+    let path = text
+        .split("整段正文：")
+        .nth(1)
+        .and_then(|s| s.split('）').next())
+        .unwrap_or("");
+    assert!(!path.is_empty(), "截断之后没说去哪取回：{text}");
+    let recovered = std::fs::read_to_string(path).expect("正文应当读得回来");
+    assert_eq!(recovered, big, "读回来的不是同一段正文");
+    // 内容寻址：同一条正文再压一次，落在同一个文件上，不堆第二份。
+    let before = std::fs::read_dir(&spill_dir).unwrap().count();
+    let mut again = ContextWindow::new(Some(2_000));
+    again.spill_dir = spill_dir.clone();
+    again.add_message(Message::system("你是执行者。"));
+    again.add_message(Message::user(&big));
+    assert!(again.shrink_floor_to_fit());
+    assert_eq!(std::fs::read_dir(&spill_dir).unwrap().count(), before);
+    let _ = std::fs::remove_dir_all(&spill_dir);
+}
+
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};

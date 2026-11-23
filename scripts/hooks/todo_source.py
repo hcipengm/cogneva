@@ -110,8 +110,10 @@ def _md_items(path: pathlib.Path) -> list[Item]:
     return _md_split(path)[0]
 
 
-# 五格行：`| 序号 | 终态 | 现在 | 差距 | 状态 |`。序号是字母加数字（N01、CC02、S12 都收）。
-_FIXED_ROW = re.compile(r"^\|\s*[A-Za-z]+[0-9]+\s*\|")
+# 五格行：`| 序号 | 终态 | 现在 | 差距 | 状态 |`。序号是字母加数字，子号带点
+# （N01、CC02、S12、S20.7 都收）——只认 `字母+数字` 会把 S20.1 那十三行整族留给
+# 三格分支，于是「现在」那一格被当成状态词，整本台账读出四十几条假红。
+_FIXED_ROW = re.compile(r"^\|\s*[A-Za-z]+[0-9]+(?:\.[0-9]+)*\s*\|")
 _FIXED_STATUS = ("未落", "已落")
 _GAP_EMPTY = ("", "—", "-", "–")
 
@@ -172,14 +174,28 @@ def _md_split(path: pathlib.Path) -> tuple[list[Item], list[Item]]:
         # 它与 `| S…` 那一种判的是同一件事——这一条做到终态没有；差别只在「差距」这一格
         # 是显式写出来的，而不是从三格缺哪几格推出来。两形状都读，因为台账正在换格式，
         # 只认一种就会把另一种**整族读成没有待办**，而那个读数看起来是绿的。
-        if not line.startswith("| S") and _FIXED_ROW.match(line):
-            item = _fixed_item(line, notouch)
-            if item is not None:
-                (debt if item[1] else out).append(item[0])
-            continue
+        #
+        # 形状由**格数**决定，不由序号前缀决定：`| S` 那几行已经整族改写成五格，
+        # 按前缀把它们分给三格分支，读的人就把「现在」那一格当成了状态词，整本
+        # S 账读不成（2026-11-23 实测：round.py 直接拒读，逐条报「状态：树里……」）。
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if _FIXED_ROW.match(line) and len(cells) >= 5:
+            if cells[-1] in _FIXED_STATUS:
+                item = _fixed_item(line, notouch)
+                if item is not None:
+                    (debt if item[1] else out).append(item[0])
+                continue
+            if not line.startswith("| S"):
+                # 五格行把状态写成散文：点名拒掉。退回三格分支读，等于把
+                # 「现在」当状态词，错的那一格还看起来像读成功了；静默跳过则
+                # 更坏——「读不到」会与「本条不在台账里」同形。
+                bad_status.append(f"{cells[0]}（状态：{cells[-1][:20]}）")
+                continue
+            # 以 `| S` 开头、最后一格不是状态词的还有第三种形状：三格 + 行尾的
+            # round/touches 段，格数凑巧也是五格。它靠 cells[2] 认自己，落到
+            # 下面那条分支去读。
         if not line.startswith("| S"):
             continue
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
         if len(cells) < 3:
             # 一行以 `| S` 开头却没有状态列，**不能当它不在**：静默跳过会让一条待办
             # 整族地从批次里消失，而读数照样绿。这与「状态词不在闭集里」是同一类
