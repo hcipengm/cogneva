@@ -374,6 +374,35 @@ pub struct Declared {
     pub memory_limit_bytes: Option<u64>,
 }
 
+/// 上限只往上抬，从不往下压。
+///
+/// 请求是调度器的一次预约，量到多少就写多少：把预约报大了只是白占节点，报小了
+/// 也只是排得挤一点，一次采样就能把它改回来。上限不是这个形状——它是一个进程
+/// 被掐死之前能用到的那一格，而这个窗口报得出的是**它做过的最多**，不是**它会
+/// 做的最多**：每五分钟一拍，一拍看的是采样间隔内的平均，一次超过拍长的突发
+/// 只要没落进某一拍就根本不在读数里。于是「拿窗口里的峰值去压上限」压掉的是
+/// 没被看见的那一截。
+///
+/// 2026-11-24 的现网就是这一条：seaweedfs 空闲时 2m，窗口按 p95×1.2 把它的
+/// CPU 上限从 1000m 压到 10m；它连启动都不止这 10m，于是起不来、样本更小、
+/// 上限更小——一个容器被自己的空闲读数关在门外。同时被压到 10m 的还有 nats、
+/// qdrant、meilisearch 与 registry。
+///
+/// 所以上限的起点是对象上已经声明的那个数：**量到的峰值只能证明上限不够，
+/// 证明不了上限太高**。这一条不挡抬——量到的峰值乘余量高过声明值时照样抬起来。
+pub fn limits_only_rise(targets: &mut Targets, declared: &Declared) {
+    if let Some(limit) = declared.cpu_limit_millicores {
+        targets.cpu_limit_millicores = targets.cpu_limit_millicores.max(limit);
+    }
+    if let Some(limit) = declared.memory_limit_bytes {
+        targets.memory_limit_bytes = targets.memory_limit_bytes.max(limit);
+    }
+    targets.cpu_limit_millicores = targets
+        .cpu_limit_millicores
+        .max(targets.cpu_request_millicores);
+    targets.memory_limit_bytes = targets.memory_limit_bytes.max(targets.memory_request_bytes);
+}
+
 /// 目标与现值差得够不够一次写回。
 pub fn wants_write(current: Option<u64>, target: u64, quantum: u64) -> bool {
     match current {
@@ -2108,7 +2137,8 @@ pub async fn round(
             readings.note_evaluated(&workload.name, &container.name);
             let samples = window.samples(&key);
             match window.targets(&key) {
-                Some(targets) => {
+                Some(mut targets) => {
+                    limits_only_rise(&mut targets, &declared);
                     resolved.insert(container.name.clone(), targets);
                     namespace_cpu_requests.push(targets.cpu_request_millicores);
                     namespace_memory_requests.push(targets.memory_request_bytes);
@@ -2523,6 +2553,44 @@ mod tests {
         assert_eq!(busy.memory_request_bytes, 912 * 1024 * 1024);
         assert!(busy.cpu_limit_millicores > quiet.cpu_limit_millicores);
         assert!(busy.memory_limit_bytes > quiet.memory_limit_bytes);
+    }
+
+    #[test]
+    fn a_limit_is_never_lowered_below_what_the_object_declares() {
+        // 例如一个闲着的容器：窗口说 2m / 20MiB，而对象上声明的是 1000m / 1Gi。
+        // 请求跟着量到的走（小一点没关系），上限留在声明的那一格：峰值只能
+        // 证明上限不够，证明不了上限太高。
+        let declared = Declared {
+            cpu_request_millicores: Some(100),
+            memory_request_bytes: Some(256 * 1024 * 1024),
+            cpu_limit_millicores: Some(1000),
+            memory_limit_bytes: Some(1024 * 1024 * 1024),
+        };
+        let mut targets = size_targets(&[2; 12], &[20 * 1024 * 1024; 12]).unwrap();
+        limits_only_rise(&mut targets, &declared);
+        assert_eq!(targets.cpu_request_millicores, 10);
+        assert_eq!(targets.memory_request_bytes, 32 * 1024 * 1024);
+        assert_eq!(targets.cpu_limit_millicores, 1000);
+        assert_eq!(targets.memory_limit_bytes, 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_limit_still_rises_when_the_measured_peak_exceeds_it() {
+        let declared = Declared {
+            cpu_limit_millicores: Some(100),
+            memory_limit_bytes: Some(64 * 1024 * 1024),
+            ..Declared::default()
+        };
+        let mut targets = size_targets(&[800; 12], &[900 * 1024 * 1024; 12]).unwrap();
+        limits_only_rise(&mut targets, &declared);
+        assert!(
+            targets.cpu_limit_millicores >= 800,
+            "量到的峰值高过声明值时上限要抬起来"
+        );
+        assert!(
+            targets.memory_limit_bytes >= 900 * 1024 * 1024,
+            "内存上限同样要抬起来"
+        );
     }
 
     #[test]
