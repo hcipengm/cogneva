@@ -2756,7 +2756,7 @@ mod tests {
     #[test]
     fn a_roster_row_prints_its_employee_number_and_name() {
         let reg = cog_core::AgentRegistration::new(
-            cog_core::agent_id_for("task-1", "planner"),
+            "luna-1822ab0e",
             "cog-agent",
             "127.0.0.1",
             "planner",
@@ -2795,7 +2795,7 @@ mod tests {
     fn a_retired_employee_keeps_its_row_and_its_number() {
         let now = chrono::Utc::now();
         let row = cog_core::EmployeeRecord {
-            agent_id: "squad:gone-1-2026-11-07-planner".into(),
+            agent_id: "kai-a9ab11fc".into(),
             number: Some(41),
             role: "planner".into(),
             first_seen: now,
@@ -2817,9 +2817,11 @@ mod tests {
     fn a_row_says_whether_a_person_stands_behind_it() {
         let now = chrono::Utc::now();
         let seat = cog_core::agent_id_for("task-1", "generator");
-        let row = |agent_id: &str, role: &str| cog_core::EmployeeRecord {
+        // 座位行没有工号——工号只发给一个人。这一格照实例写：人形行有号，
+        // 座位行没有，两个 id 之外唯一的差别就是这一格与背后的人。
+        let row = |agent_id: &str, role: &str, number: Option<u32>| cog_core::EmployeeRecord {
             agent_id: agent_id.into(),
-            number: Some(3),
+            number,
             role: role.into(),
             first_seen: now,
             last_seen: now,
@@ -2827,8 +2829,8 @@ mod tests {
             person_id: None,
         };
         let roster: std::collections::HashMap<String, cog_core::EmployeeRecord> = vec![
-            row("employee:0e2ba053", "employee"),
-            row(&seat, "generator"),
+            row("employee:0e2ba053", "employee", Some(3)),
+            row(&seat, "generator", None),
         ]
         .into_iter()
         .map(|r| (r.agent_id.clone(), r))

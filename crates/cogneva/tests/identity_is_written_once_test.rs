@@ -135,7 +135,8 @@ fn the_roster_has_exactly_one_write_point() {
 /// 正常路径上的员工都有工号与名字；「待编」只在真正没登记过的串上出现。
 ///
 /// 前半条读一份真名册：登记两个人，两行都要有号、要读成两个不同的名字、且都
-/// 等于「工号 → 姓名」这条唯一派生。
+/// 等于「工号 → 姓名」这条唯一派生。再登记一把椅子：行照建，号不发——工号是
+/// 编制，不是注册次数。名册上「有号的行数」必须正好等于人数。
 ///
 /// 后半条普查的是 `unregistered_label` 的用法：它是给「这个 id 还没走过登记」
 /// 用的，用它的地方必须紧挨着一次名册读（`employee(` / `roster.get(`）。谁把它
@@ -163,8 +164,31 @@ async fn every_registered_employee_has_a_number() {
 
     let rows = registry.employees().await.expect("roster readable");
     assert_eq!(rows.len(), 2, "登记的两个人各一行");
+
+    // 一把椅子：行照建（派工要往上面写人），工号不发。座位随任务生灭，每接
+    // 一件活注册一次，发号的话名册行数会长到任务数。
+    let seat = cog_core::agent_id_for("task-1", cog_core::roles::GENERATOR);
+    registry
+        .register(&cog_core::AgentRegistration::new(
+            &seat,
+            "test-host",
+            "127.0.0.1",
+            cog_core::roles::GENERATOR.to_string(),
+            "default",
+            cog_core::ResourceInfo::default(),
+        ))
+        .await
+        .expect("registration lands");
+    let rows = registry.employees().await.expect("roster readable");
+    assert_eq!(rows.len(), 3, "三个注册过的地址就是三行");
+    assert_eq!(
+        rows.iter().filter(|row| row.number.is_some()).count(),
+        2,
+        "有号的行数应当等于人数，不是地址数：座位不该领工号"
+    );
+
     let mut labels = BTreeSet::new();
-    for row in &rows {
+    for row in rows.iter().filter(|row| row.number.is_some()) {
         let number = row.number.expect("每一位登记过的员工都有工号");
         assert_eq!(
             row.label(),

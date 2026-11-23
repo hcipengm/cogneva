@@ -168,11 +168,17 @@ impl RedisAgentRegistry {
     /// 判（[`cog_core::person_id_for`]），脚本只写它被告知的值，不在脚本里再拼
     /// 一遍前缀——两侧各拼一次时改名只会改一侧，脚本会安静地把所有座位都写成
     /// 一个人。座位形 id 传进来的是空串，脚本遇到空串**不写**这一格：座位背后
-    /// 的人要到派活那一刻才存在，在此之前空着就是读数；而写上之后，这条路径
+    /// 的人要到派活那一刻才存在，在此之前空着是读数；而写上之后，这条路径
     /// 也不能把它擦掉——座位重新注册时把已派的人抹了，人就从名册上消失了。
+    ///
+    /// **工号只发给一个人，不发给一把椅子**（`ARGV[5] == '1'` 才是人形 id）：
+    /// 座位随任务生灭，每次接活都注册一次，给它发号就是每接一件活多一个「员工」
+    /// ——名册行数会长到任务数，而工号是编制。座位行照建（派工要往上面写人），
+    /// 只是没有号：名册上「有号的行」正好是可以叫做人的那些行。
     async fn touch_employee(&self, registration: &AgentRegistration) {
         let mut conn = self.connection.clone();
         let now = Utc::now().to_rfc3339();
+        let person = cog_core::person_id_for(&registration.agent_id);
         let script = redis::Script::new(
             "local cur = redis.call('HGET', KEYS[1], ARGV[1]) \
              local row \
@@ -181,7 +187,7 @@ impl RedisAgentRegistry {
              else \
                  row = { first_seen = ARGV[2] } \
              end \
-             if row.number == nil or row.number == cjson.null then \
+             if (row.number == nil or row.number == cjson.null) and ARGV[5] == '1' then \
                  row.number = redis.call('INCR', KEYS[2]) \
              end \
              row.agent_id = ARGV[1] \
@@ -201,7 +207,8 @@ impl RedisAgentRegistry {
             .arg(&registration.agent_id)
             .arg(&now)
             .arg(&registration.role)
-            .arg(cog_core::person_id_for(&registration.agent_id).unwrap_or(""))
+            .arg(person.unwrap_or(""))
+            .arg(if person.is_some() { "1" } else { "0" })
             .invoke_async::<i64>(&mut conn)
             .await
         {
@@ -555,18 +562,23 @@ impl AgentRegistry for MemoryAgentRegistry {
                 row.person_id = Some(person.to_string());
             }
         } else {
-            store.next_number += 1;
-            let number = store.next_number;
+            // 工号只发给一个人，不发给一把椅子——与 Redis 那段脚本同一判据。
+            // 座位行照建（派工要往上面写人），号那一格空着。
+            let person = cog_core::person_id_for(&registration.agent_id);
+            let number = person.map(|_| {
+                store.next_number += 1;
+                store.next_number
+            });
             store.employees.insert(
                 registration.agent_id.clone(),
                 EmployeeRecord {
                     agent_id: registration.agent_id.clone(),
-                    number: Some(number),
+                    number,
                     role: registration.role.clone(),
                     first_seen: now,
                     last_seen: now,
                     retired_at: None,
-                    person_id: cog_core::person_id_for(&registration.agent_id).map(str::to_string),
+                    person_id: person.map(str::to_string),
                 },
             );
         }
@@ -769,6 +781,31 @@ mod tests {
         let b = reg.employee("probe-2").await.unwrap().expect("名册行");
         assert!(a.number.is_some() && b.number.is_some(), "名册行没有工号");
         assert_ne!(a.number, b.number, "两个员工共用一个工号");
+    }
+
+    /// 工号只发给一个人，不发给一把椅子。
+    ///
+    /// 座位随任务生灭，每接一件活注册一次；发号的话名册行数会长到任务数，
+    /// 「员工」这个读数就不再是编制，而是跑过多少件活。座位行照建（派工要往
+    /// 上面写人），号那一格空着：名册上**有号的行数**正好是可以叫做人的行数。
+    #[tokio::test]
+    async fn a_seat_gets_a_row_but_no_number() {
+        let reg = MemoryAgentRegistry::new();
+        reg.register(&reg_row("employee:1")).await.unwrap();
+        let seat = cog_core::agent_id_for("task-1", "generator");
+        reg.register(&reg_row(&seat)).await.unwrap();
+        reg.register(&reg_row(&cog_core::agent_id_for("task-2", "planner")))
+            .await
+            .unwrap();
+
+        let seat_row = reg.employee(&seat).await.unwrap().expect("座位行照建");
+        assert_eq!(seat_row.number, None, "一把椅子拿到了工号");
+        assert_eq!(seat_row.person_id, None, "座位还没派人，却写上了人");
+
+        let rows = reg.employees().await.unwrap();
+        assert_eq!(rows.len(), 3, "三个注册过的地址就是三行");
+        let numbered = rows.iter().filter(|row| row.number.is_some()).count();
+        assert_eq!(numbered, 1, "有号的行数应当等于人数，不是地址数");
     }
 
     /// 离职留行：注销之后这个人还在名册上，工号与入职时间都不变，只多一块
