@@ -34,11 +34,21 @@ fn the_configured_answer_shape_names_the_same_fields_as_the_ledger_item() {
         .filter_map(|v| v.as_str())
         .collect();
 
-    let generated = schemars::schema_for!(cog_core::contract::ledger_item::LedgerItem);
-    let expected: BTreeSet<&str> = generated
-        .schema
-        .required
-        .iter()
+    // 用**序列化出去的**字段名比，而不是编译期的字段名：改名、改 serde 的写法都会让
+    // 接口那一侧变，而读的人看到的正是序列化后的那一份。
+    use cog_core::contract::ledger_item::{LedgerItem, LedgerState};
+    let sample = LedgerItem {
+        id: String::new(),
+        terminal: String::new(),
+        now: String::new(),
+        gap: String::new(),
+        state: LedgerState::Open,
+    };
+    let value = serde_json::to_value(&sample).expect("这一条序列化不了");
+    let expected: BTreeSet<&str> = value
+        .as_object()
+        .expect("一个对象")
+        .keys()
         .map(|s| s.as_str())
         .collect();
 
