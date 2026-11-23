@@ -95,6 +95,7 @@ impl EvaluatorActor {
                     })
                 })
                 .collect::<Vec<_>>(),
+            // prompt: consumed by crates/cog-collaboration/src/actors/evaluator.rs::review_criteria
             "instructions": "Judge against this run's working tree, not against the prose alone: \
                 read the files the terminal and the now cell name (read_file) before you answer, \
                 and judge (1) whether the terminal describes a finished state rather than an \
