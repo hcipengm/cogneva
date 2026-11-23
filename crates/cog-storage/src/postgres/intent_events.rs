@@ -1,8 +1,8 @@
 //! 意图进流程那一刻的那一条事件：`intent_received`。
 //!
 //! 二十六处入口（对话、外部仓库、外部世界、系统自发现、账本自己的结构来源）交上来
-//! 的东西，先落成**同一种行**：来源、外部身份、原文、因果父行。判官随后按机械判据
-//! 把它分成回答／任务／变更／原则——分类不在入口做，入口只翻译。
+//! 的东西，先落成**同一种行**：来源、外部身份、原文、因果父行。判官随后按机械判据把
+//! 它分成回答／任务／变更／原则——分类不在入口做，入口只翻译。
 //!
 //! 落在事件流上而不是另起一张表：事件流已经是唯一正本（每一件事先落一条事件），
 //! 再建一张「意图表」就是给同一件事开第二份记录。`writer` 与幂等键沿用同一个信封，
@@ -10,10 +10,16 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 
 use cog_core::contract::intent_events::{IntentEvents, IntentRow, INTENT_RECEIVED};
 use cog_core::{SFError, SFResult};
+
+/// 任务行上带着「它是从哪条意图派生的」的那个键。
+///
+/// 与 `ITEM_INPUT_KEY` 同一个道理：写它的人（planner 派生的任务）与读它的人（收件台
+/// 判「处理过没有」）各拼一次字面量就会漂，所以名字只在这里出现一次。
+pub const INTENT_ID_KEY: &str = "intent_id";
 
 const INSERT_SQL: &str = "\
 INSERT INTO cogneva_event (\
@@ -38,6 +44,49 @@ impl IntentEventStore {
         }
     }
 
+    /// 还没有被派生成任务的意图：流里收到过 `intent_received`，而任务行里没有一条带着
+    /// 它的身份。读不到就是读不到（`Err`），不返回空表——空表与「全都处理完了」同形。
+    pub async fn undispatched_intents(&self, limit: i64) -> SFResult<Vec<IntentRow>> {
+        let rows = sqlx::query(
+            "SELECT attributes->>'source' AS source, attributes->>'external_id' AS external_id, \
+                    attributes->>'text' AS text, coalesce(attributes->>'parent', '') AS parent \
+               FROM cogneva_event e \
+              WHERE e.kind = 'intent_received' \
+                AND NOT EXISTS (SELECT 1 FROM cog_dag_tasks t \
+                                 WHERE t.task->'input'->>'intent_id' = e.subject_id) \
+              ORDER BY e.at ASC, e.event_id ASC \
+              LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(format!("undispatched intents: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| IntentRow {
+                source: row
+                    .try_get::<Option<String>, _>("source")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+                external_id: row
+                    .try_get::<Option<String>, _>("external_id")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+                text: row
+                    .try_get::<Option<String>, _>("text")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+                parent: row
+                    .try_get::<Option<String>, _>("parent")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+            })
+            .collect())
+    }
 }
 
 #[async_trait]
