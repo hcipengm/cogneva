@@ -31,6 +31,7 @@ const EXECUTOR: &str = "crates/cog-gateway/src/executor.rs";
 const REBALANCER: &str = "crates/cog-supervisor/src/task_rebalancer.rs";
 const DAG_EXECUTOR: &str = "crates/cog-orchestrator/src/dag_executor/orchestrator.rs";
 const DAG_CONSUMER: &str = "crates/cog-orchestrator/src/dag_executor/mod.rs";
+const ACTION_PLANNER: &str = "crates/cog-orchestrator/src/action_planner/action_plan_orchestrator.rs";
 
 /// 折叠过的那几条读。某一段正文里出现它们，就是那一面在替没读到的图作证。
 const FOLDED: &[&str] = &[
@@ -272,6 +273,30 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "all_tasks_checked",
         "读不到被读成「没有行」，一条仍然成立的判词被撤掉",
     ),
+    (
+        ACTION_PLANNER,
+        "pub async fn process_goal_impl",
+        "get_task_checked",
+        "读不到那一行被读成「还没计划过」，同一条目标每次重投都重付一次完整分解",
+    ),
+    (
+        ACTION_PLANNER,
+        "async fn stranded_placeholders",
+        "get_task_checked",
+        "读不到子任务被读成「占位没有挂上谁」，一条健康的行被删掉再改写 Failed",
+    ),
+    (
+        ACTION_PLANNER,
+        "async fn held_status",
+        "get_task_checked",
+        "日志把「读不到」与「没有这一行」印成同一个值",
+    ),
+    (
+        ACTION_PLANNER,
+        "async fn fail_submission",
+        "held_status(",
+        "判退那一行被顶掉时，日志把「读不到」与「没有这一行」印成同一个值",
+    ),
 ];
 
 #[test]
@@ -290,6 +315,7 @@ fn every_surface_that_draws_the_graph_keeps_the_failure() {
         REBALANCER,
         DAG_EXECUTOR,
         DAG_CONSUMER,
+        ACTION_PLANNER,
     ] {
         productions.insert(file, production_text(&read_repo(file)));
     }

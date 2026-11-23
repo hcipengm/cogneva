@@ -97,6 +97,10 @@ pub struct DagExecutor {
     /// retires nothing and the roster keeps growing — which is the state this
     /// field exists to end, so it is wired in the same place the pool is.
     agent_manager: std::sync::RwLock<Option<Arc<dyn cog_core::AgentManager>>>,
+    /// 测试用：读到这些 id 的那一问答不上来。它交出的正是存储坏掉时的形状，
+    /// 让「读不到」与「没有这一行」在测试里分得开；生产构建里没有这一格。
+    #[cfg(test)]
+    unreadable_tasks: std::sync::Mutex<std::collections::HashSet<String>>,
     /// 看板每一列的在制品上限。
     ///
     /// 发布侧（`DagExecutorRuntime::publish_ready_tasks`）拿它拦「进 `scheduled`」，
@@ -343,6 +347,8 @@ impl DagExecutor {
             archive_poll_interval_secs: 300,
             metrics: std::sync::RwLock::new(None),
             agent_manager: std::sync::RwLock::new(None),
+            #[cfg(test)]
+            unreadable_tasks: Default::default(),
             board_wip_limits: std::sync::RwLock::new(cog_core::BoardWipLimits::from_env().0),
         }
     }
@@ -4251,6 +4257,17 @@ impl DagExecutor {
     /// 跑的任务被答成「已经被删了」。内存模式下 `ensure_task_present` 的
     /// `TaskFailed` 是「没找到」那一句的载体，照旧读成 `None`；别的错误收口。
     pub async fn get_task_checked(&self, task_id: &str) -> SFResult<Option<Task>> {
+        #[cfg(test)]
+        if self
+            .unreadable_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(task_id)
+        {
+            return Err(SFError::Database(format!(
+                "store unavailable: cannot read task {task_id}"
+            )));
+        }
         if let Some(be) = self.fg() {
             return be.dag_get_task(&self.workspace_id, task_id).await;
         }
@@ -4261,6 +4278,18 @@ impl DagExecutor {
         }
         let inner = self.inner.read().await;
         Ok(inner.tasks.get(task_id).cloned())
+    }
+
+    /// 测试用：让读到这些 id 的那一问答不上来。生产构建里不存在。
+    ///
+    /// 存储坏掉时读口答 `Err`，内存模式下这条读答 `None`——两种形状在这一格里
+    /// 各自如实交出，调用方才分得清它处理的是哪一条。
+    #[cfg(test)]
+    pub(crate) fn fail_task_reads_of(&self, task_id: &str) {
+        self.unreadable_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(task_id.to_string());
     }
 
     pub async fn get_all_tasks(&self) -> Vec<Task> {
@@ -4986,7 +5015,7 @@ mod tests {
     use cog_core::{
         AgentState, ContextBoard, Event, MetricsBackend, StateBackend, TaskCheckpoint, TaskType,
     };
-    use tracing_subscriber::prelude::*;
+    use crate::test_support::warn_text;
 
     /// 本部署读哪些就绪队列——清扫器的范围判据，与运行期同一个函数。
     fn served(workspace: &str, executor_role: bool) -> Vec<String> {
@@ -7693,90 +7722,6 @@ mod tests {
         );
     }
 
-    /// 收下 warn 级事件的正文，供断言「这一件事在屏幕上说出来了没有」。
-    ///
-    /// 这一族里的几处修法不改变返回值：读不到时那一趟仍然什么都不做，与「确实
-    /// 没有要做的事」给的是同一个返回。屏幕上那几行就是唯一能分开两者的地方，
-    /// 断言只能落在它上面。
-    ///
-    /// 订阅者**装一次、装成进程级的，不撤下**。`tracing` 对每条 callsite 算一份
-    /// 兴趣缓存，算的是「这个进程里此刻注册着哪些订阅者」；`set_default` 是线程
-    /// 局部的，而且只有一条订阅者注册着时它算的是**命中那条线程**上的默认订阅者。
-    /// 别的测试线程先命中同一条 warn 时，那一次算出来的是 `NoSubscriber` 的 never
-    /// ——之后我们这一层就再也收不到（2026-11-23 实测：同一批测试单跑绿、整套并行
-    /// 跑红，`said()` 空着）。装成全局的，任何线程上的默认订阅者都是它。
-    ///
-    /// 每条事件按 `ThreadId` 分桶，每个测试只读自己那一桶：`#[tokio::test]` 默认的
-    /// current-thread runtime 不换线程，它 spawn 出来的任务也在同一条线程上跑。
-    #[derive(Clone, Default)]
-    struct WarnSink(std::sync::Arc<std::sync::Mutex<Vec<(std::thread::ThreadId, String)>>>);
-
-    struct MessageField(String);
-
-    impl tracing::field::Visit for MessageField {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.0 = format!("{value:?}");
-            }
-        }
-    }
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnSink {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if *event.metadata().level() != tracing::Level::WARN {
-                return;
-            }
-            let mut field = MessageField(String::new());
-            event.record(&mut field);
-            self.0
-                .lock()
-                .unwrap()
-                .push((std::thread::current().id(), field.0));
-        }
-    }
-
-    struct WarnText {
-        sink: WarnSink,
-        thread: std::thread::ThreadId,
-    }
-
-    /// 这一条测试线程上收到的那几行 warn。
-    fn warn_text() -> WarnText {
-        static SINK: std::sync::OnceLock<WarnSink> = std::sync::OnceLock::new();
-        let sink = SINK.get_or_init(|| {
-            let sink = WarnSink::default();
-            tracing::subscriber::set_global_default(
-                tracing_subscriber::registry().with(sink.clone()),
-            )
-            .expect("这个测试二进制里不该有别人先装全局订阅者");
-            sink
-        });
-        WarnText {
-            sink: sink.clone(),
-            thread: std::thread::current().id(),
-        }
-    }
-
-    impl WarnText {
-        fn said(&self) -> Vec<String> {
-            self.sink
-                .0
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(thread, _)| *thread == self.thread)
-                .map(|(_, line)| line.clone())
-                .collect()
-        }
-
-        fn any(&self, needle: &str) -> bool {
-            self.said().iter().any(|line| line.contains(needle))
-        }
-    }
 
     /// 只记下「撤过哪一行」的告警落点。
     ///

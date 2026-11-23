@@ -867,6 +867,70 @@ impl ActionPlanOrchestrator {
                 .is_some_and(|kind| !kind.trim().is_empty())
     }
 
+    /// 那一行的状态，读失败时说明读失败。
+    ///
+    /// 日志里的 `status: None` 有两种来源：图里没有这一行，和这一行读不出来。
+    /// 读的人只有这一个字段可看，两种来源印成同一个值，这一面就在替一次没发生的
+    /// 读作答。读走带报错的那条，失败连同原因一起印出来。
+    async fn held_status(dag: &dyn cog_core::DagExecutor, task_id: &str) -> String {
+        match dag.get_task_checked(task_id).await {
+            Ok(Some(row)) => format!("{:?}", row.status),
+            Ok(None) => "absent".to_string(),
+            Err(e) => format!("unreadable: {e}"),
+        }
+    }
+
+    /// 这一批新入图的占位，哪些在图里找不到挂上来的子任务。
+    ///
+    /// 读不到子任务时不判：父子关系只在这一读里，读不到与「没挂上」同形，而
+    /// 按「没挂上」处理会把一条健康的行删除再改写 Failed——不可逆，孤儿收口
+    /// 按停摆阈值再看一遍是代价小得多的那一支。读不到占位的那一行同样跳过。
+    async fn stranded_placeholders(
+        dag: &dyn cog_core::DagExecutor,
+        goal_id: &str,
+        child_ids: &[String],
+        placeholder_ids: &[String],
+        queued: &[String],
+    ) -> Vec<Task> {
+        let mut parented: HashSet<String> = HashSet::new();
+        for child_id in child_ids {
+            match dag.get_task_checked(child_id).await {
+                Ok(Some(child)) => {
+                    if let Some(parent) = child.parent_task_id {
+                        parented.insert(parent);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        goal_id = %goal_id,
+                        task_id = %child_id,
+                        error = %e,
+                        "cannot read a child of this decomposition; no placeholder is judged stranded this pass"
+                    );
+                    return Vec::new();
+                }
+            }
+        }
+        let mut stranded: Vec<Task> = Vec::new();
+        for pid in placeholder_ids.iter().filter(|pid| queued.contains(*pid)) {
+            if parented.contains(pid) {
+                continue;
+            }
+            match dag.get_task_checked(pid).await {
+                Ok(Some(row)) => stranded.push(row),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    goal_id = %goal_id,
+                    placeholder = %pid,
+                    error = %e,
+                    "cannot read a placeholder that may be stranded; it is left for the orphan reconciler"
+                ),
+            }
+        }
+        stranded
+    }
+
     /// High-level entry point: process a goal with optional pre-existing tasks,
     /// in this order:
     ///
@@ -972,10 +1036,10 @@ impl ActionPlanOrchestrator {
                 // held ids and their state so the drop is at least attributable
                 // when it is noticed downstream.
                 for held in requested.iter().filter(|id| !queued.contains(id)) {
-                    let status = dag.get_task(held).await.map(|t| t.status);
+                    let status = Self::held_status(dag.as_ref(), held).await;
                     tracing::warn!(
                         task_id = %held,
-                        ?status,
+                        status = %status,
                         "self-evolution submission held by an existing task; nothing was queued"
                     );
                 }
@@ -1030,10 +1094,10 @@ impl ActionPlanOrchestrator {
                 );
                 let queued = dag.add_tasks_batch(batch).await?;
                 for held in requested.iter().filter(|id| !queued.contains(id)) {
-                    let status = dag.get_task(held).await.map(|t| t.status);
+                    let status = Self::held_status(dag, held).await;
                     tracing::warn!(
                         task_id = %held,
-                        ?status,
+                        status = %status,
                         "stated-work submission held by an existing task; nothing was queued"
                     );
                 }
@@ -1078,10 +1142,10 @@ impl ActionPlanOrchestrator {
             let queued = if let Some(ref dag) = self.dag_executor {
                 let queued = dag.add_tasks_batch(tasks).await?;
                 for held in requested.iter().filter(|id| !queued.contains(id)) {
-                    let status = dag.get_task(held).await.map(|t| t.status);
+                    let status = Self::held_status(dag.as_ref(), held).await;
                     tracing::warn!(
                         task_id = %held,
-                        ?status,
+                        status = %status,
                         "verified submission held by an existing task; nothing was queued"
                     );
                 }
@@ -1129,7 +1193,23 @@ impl ActionPlanOrchestrator {
         // 已经排上的答复是 `Ok(空)`，与「这一批都已经被别的行持有」同一条口径：
         // 调用方问的是「这次提交排上了什么」，答案是一条也没有。
         if let (Some(dag), Some(first)) = (self.dag_executor.as_deref(), tasks.first()) {
-            if let Some(held) = dag.get_task(&first.id).await {
+            // 读不到那一行时这一问没有答案，而两个候选答案都不便宜：按「没这一行」
+            // 处理要再付一次完整分解（这一问就是为拦住它而存在的），按「已计划」
+            // 处理会吞掉一次还没落下工作的提交。交回给调用方，按它自己的节拍重投。
+            let held = match dag.get_task_checked(&first.id).await {
+                Ok(held) => held,
+                Err(e) => {
+                    tracing::warn!(
+                        goal = %goal,
+                        task_id = %first.id,
+                        error = %e,
+                        "cannot read the row that says whether this goal is already planned; \
+                         leaving the submission for redelivery rather than decomposing again"
+                    );
+                    return Err(e);
+                }
+            };
+            if let Some(held) = held {
                 let already_planned = held
                     .action_planner_meta
                     .as_ref()
@@ -1479,10 +1559,10 @@ impl ActionPlanOrchestrator {
                 }
             }
             for held in all_injected_ids.iter().filter(|id| !queued.contains(id)) {
-                let status = dag.get_task(held).await.map(|t| t.status);
+                let status = Self::held_status(dag.as_ref(), held).await;
                 tracing::warn!(
                     task_id = %held,
-                    ?status,
+                    status = %status,
                     "decomposed submission held by an existing task; nothing was queued"
                 );
             }
@@ -1493,22 +1573,14 @@ impl ActionPlanOrchestrator {
             // orphan reconciler only finds after the stall threshold. Check
             // real DAG state (not the returned queued list): a child that
             // was already there keeps an idempotent replay a no-op.
-            let mut parented: HashSet<String> = HashSet::new();
-            for child_id in child_ids {
-                if let Some(child) = dag.get_task(child_id).await {
-                    if let Some(parent) = child.parent_task_id {
-                        parented.insert(parent);
-                    }
-                }
-            }
-            let mut stranded: Vec<Task> = Vec::new();
-            for pid in &placeholder_ids {
-                if queued.contains(pid) && !parented.contains(pid) {
-                    if let Some(row) = dag.get_task(pid).await {
-                        stranded.push(row);
-                    }
-                }
-            }
+            let stranded = Self::stranded_placeholders(
+                dag.as_ref(),
+                &goal_id,
+                child_ids,
+                &placeholder_ids,
+                &queued,
+            )
+            .await;
             if !stranded.is_empty() {
                 let held_children: Vec<&str> = child_ids
                     .iter()
@@ -1719,10 +1791,10 @@ impl ActionPlanOrchestrator {
         // write skips rows that already landed instead of erroring.
         let queued = dag.add_tasks_batch(failed_rows).await?;
         for held in failed_ids.iter().filter(|id| !queued.contains(id)) {
-            let status = dag.get_task(held).await.map(|t| t.status);
+            let status = Self::held_status(dag.as_ref(), held).await;
             tracing::warn!(
                 task_id = %held,
-                ?status,
+                status = %status,
                 "failed-outcome row held by an existing task; the verdict was not recorded"
             );
         }
@@ -3218,6 +3290,135 @@ mod tests {
         assert!(
             dag.get_task("face-gap-CI-1").await.is_some(),
             "the held row stays the row the first submission wrote"
+        );
+    }
+
+    /// 读不到那一行时，这一问没有答案：不能按「没这一行」去分解。
+    ///
+    /// 上一笔的判据只防住了「已经在图里」那一支；读口一坏，同一条面漂移目标每次
+    /// 重投都会先付一次完整分解——而这一问本来就是为拦住这笔开销加的。
+    #[tokio::test]
+    async fn a_goal_whose_row_cannot_be_read_is_not_decomposed_again() {
+        let inner = Arc::new(crate::DagExecutor::new("ws-unreadable-goal".to_string()));
+        let dag: Arc<dyn cog_core::DagExecutor> = inner.clone();
+        let executor = Arc::new(CountingPlanExecutor::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(executor.clone())
+            .with_dag_executor(dag)
+            .with_decomposition_max_attempts(1);
+        let registry = SkillRegistry::new();
+        let asked = || executor.calls.load(std::sync::atomic::Ordering::SeqCst);
+        let goal = "face-gap: CI/构建/部署 drifted_binding";
+
+        planner
+            .process_goal_impl(goal, vec![hint_task("face-gap-CI-1")], &registry)
+            .await
+            .expect("the first submission decomposes and lands");
+        assert_eq!(asked(), 1);
+
+        inner.fail_task_reads_of("face-gap-CI-1");
+        let second = planner
+            .process_goal_impl(goal, vec![hint_task("face-gap-CI-1")], &registry)
+            .await;
+        assert!(
+            second.is_err(),
+            "a read that did not happen must not be answered as 'not planned yet'"
+        );
+        assert_eq!(asked(), 1, "no second decomposition may be paid for");
+    }
+
+    /// 子任务读不到时不判占位是孤儿：父子关系只在这一读里，读不到与「没挂上」同形，
+    /// 而按「没挂上」处理要把一条健康的行删掉再改写 Failed——不可逆。
+    #[tokio::test]
+    async fn a_placeholder_is_not_judged_stranded_when_a_child_cannot_be_read() {
+        let inner = Arc::new(crate::DagExecutor::new("ws-unreadable-child".to_string()));
+        let dag: Arc<dyn cog_core::DagExecutor> = inner.clone();
+
+        let mut child = hint_task("goal/child-1");
+        child.parent_task_id = Some("goal".to_string());
+        dag.add_task(child).await.expect("the child lands");
+        dag.add_task(hint_task("goal"))
+            .await
+            .expect("the placeholder lands");
+
+        inner.fail_task_reads_of("goal/child-1");
+        let stranded = ActionPlanOrchestrator::stranded_placeholders(
+            &*dag,
+            "goal",
+            &["goal/child-1".to_string()],
+            &["goal".to_string()],
+            &["goal".to_string()],
+        )
+        .await;
+        assert!(
+            stranded.is_empty(),
+            "a child nobody could read is not a childless placeholder"
+        );
+    }
+
+    /// 读不到占位本身时同样跳过这一趟，并说出跳过的是哪一条。
+    ///
+    /// 这一支返回的仍然是空表，与「它确实挂上了子任务」同形，屏幕上那一行是唯一
+    /// 能分开两者的地方。
+    #[tokio::test]
+    async fn a_placeholder_that_cannot_be_read_is_left_for_the_reconciler() {
+        let warns = crate::test_support::warn_text();
+        let inner = Arc::new(crate::DagExecutor::new(
+            "ws-unreadable-placeholder".to_string(),
+        ));
+        let dag: Arc<dyn cog_core::DagExecutor> = inner.clone();
+        dag.add_task(hint_task("goal"))
+            .await
+            .expect("the placeholder lands");
+
+        inner.fail_task_reads_of("goal");
+        let stranded = ActionPlanOrchestrator::stranded_placeholders(
+            &*dag,
+            "goal",
+            &[],
+            &["goal".to_string()],
+            &["goal".to_string()],
+        )
+        .await;
+        assert!(stranded.is_empty());
+        assert!(
+            warns.any("cannot read a placeholder that may be stranded"),
+            "读不到要占屏幕一行；否则这一趟与「它挂了子任务」逐字同形"
+        );
+    }
+
+    /// 入图时被同一 id 顶掉的那一行，日志里要说出「读不到」而不是 `None`。
+    #[tokio::test]
+    async fn a_held_row_whose_state_cannot_be_read_says_so_in_the_log() {
+        let warns = crate::test_support::warn_text();
+        let inner = Arc::new(crate::DagExecutor::new("ws-unreadable-held".to_string()));
+        let dag: Arc<dyn cog_core::DagExecutor> = inner.clone();
+        dag.add_task(hint_task("probe-1"))
+            .await
+            .expect("the held row lands");
+
+        let executor = Arc::new(CountingPlanExecutor::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(executor)
+            .with_dag_executor(dag);
+        let registry = SkillRegistry::new();
+
+        let mut probe = hint_task("probe-1");
+        probe.is_executable = true;
+        probe
+            .acceptance
+            .push("探针跑完并带回一条可判的结局".to_string());
+        probe.input["task_kind"] = serde_json::json!("capability_discovery");
+
+        inner.fail_task_reads_of("probe-1");
+        let ids = planner
+            .process_goal_impl("run the probe as written", vec![probe], &registry)
+            .await
+            .expect("a held row is an idempotent no-op, not a refusal");
+        assert!(ids.is_empty(), "nothing was queued: the id was already held");
+        assert!(
+            warns.any("unreadable"),
+            "the log line must say the row could not be read, not that no row exists"
         );
     }
 
