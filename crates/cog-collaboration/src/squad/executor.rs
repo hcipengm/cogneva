@@ -869,6 +869,56 @@ impl SquadExecutor {
         }
     }
 
+    /// 从后端取回这一队点名的那份快照，取不回来就答 `None`。
+    ///
+    /// 三种失败都要留痕，因为它们与「这次本来就没有续跑点」在日志之外同形：
+    /// 指针指着一条不存在的路标、快照取不出来、取到了但反序列化不出来。
+    /// [`crate::resume::resume_if_checkpointed`] 的同族路径把同一件事写进
+    /// `collab_task_resume_total{outcome="failed"}`，这一队不能例外——尤其是
+    /// 反序列化那一支：滚动升级之后旧快照读不出来，重跑整队而 `snapshot_id`
+    /// 还会原样进 OnSquadRetry 的 hook payload，读的人会以为这一趟是从那份
+    /// 快照续上的。
+    async fn restore_snapshot(
+        backend: &Arc<dyn cog_core::ObjectBackend>,
+        snapshot_id: &str,
+    ) -> Option<cog_core::AgentCheckpoint> {
+        let bytes = match backend.get(snapshot_id).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                tracing::warn!(
+                    snapshot = snapshot_id,
+                    "the squad snapshot is named but not in the backend; this run starts from the beginning"
+                );
+                crate::observable::global_observable().record_resume("failed");
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    snapshot = snapshot_id,
+                    error = %e,
+                    "the squad snapshot could not be read; this run starts from the beginning"
+                );
+                crate::observable::global_observable().record_resume("failed");
+                return None;
+            }
+        };
+        match serde_json::from_slice::<cog_core::AgentCheckpoint>(&bytes) {
+            Ok(snapshot) => {
+                crate::observable::global_observable().record_resume("restored");
+                Some(snapshot)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    snapshot = snapshot_id,
+                    error = %e,
+                    "the squad snapshot could not be decoded; this run starts from the beginning"
+                );
+                crate::observable::global_observable().record_resume("failed");
+                None
+            }
+        }
+    }
+
     /// 运行单个 Squad。
     /// Ralph Loop 由配置面的迭代预算与停滞窗口止损（默认 50 轮/5 轮停滞窗），
     /// Squad 层不再做无意义重试。
@@ -897,20 +947,8 @@ impl SquadExecutor {
 
         // 若 Squad 已携带快照，先从后端恢复
         if let (Some(ref backend), Some(ref snap_id)) = (&object_backend, &squad.snapshot_id) {
-            match backend.get(snap_id).await {
-                Ok(Some(bytes)) => {
-                    if let Ok(snapshot) =
-                        serde_json::from_slice::<cog_core::AgentCheckpoint>(&bytes)
-                    {
-                        squad.snapshot = Some(snapshot);
-                    }
-                }
-                Ok(None) => {
-                    tracing::warn!("Snapshot {} not found in backend", snap_id);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to load snapshot {}: {}", snap_id, e);
-                }
+            if let Some(snapshot) = Self::restore_snapshot(backend, snap_id).await {
+                squad.snapshot = Some(snapshot);
             }
         }
 
@@ -1844,5 +1882,110 @@ mod tests {
         assert_eq!(generator.learnings[0].summary, "broken");
         assert_eq!(generator.learnings[0].details, "broken");
         assert_eq!(generator.errors.len(), 1);
+    }
+
+    /// 一个只存一份字节的后端：够 `restore_snapshot` 走三条路。
+    struct OneObject(Option<Vec<u8>>);
+
+    #[async_trait::async_trait]
+    impl cog_core::ObjectBackend for OneObject {
+        async fn put(&self, key: &str, _data: &[u8]) -> cog_core::SFResult<String> {
+            Ok(key.to_string())
+        }
+        async fn get(&self, _key: &str) -> cog_core::SFResult<Option<Vec<u8>>> {
+            Ok(self.0.clone())
+        }
+        async fn delete(&self, _key: &str) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        async fn presign_url(&self, key: &str, _expiry_secs: u64) -> cog_core::SFResult<String> {
+            Ok(key.to_string())
+        }
+        async fn exists(&self, _key: &str) -> cog_core::SFResult<bool> {
+            Ok(self.0.is_some())
+        }
+        async fn list(&self, _prefix: Option<&str>) -> cog_core::SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// 这一格当前的值；断言用增量，进程里别的测试同时记数也不会让判定漂。
+    async fn resume_failed_cell() -> f64 {
+        use cog_core::observability::Observable;
+        crate::observable::global_observable()
+            .collect_metrics("D8")
+            .await
+            .unwrap()
+            .iter()
+            .filter(|m| {
+                m.name == "collab_task_resume_total"
+                    && m.labels.get(crate::LABEL_OUTCOME).map(String::as_str) == Some("failed")
+            })
+            .map(|m| m.value)
+            .sum()
+    }
+
+    /// 有指针、快照也取到了，但读不出来：这一队从零重跑，而这件事要留痕。
+    ///
+    /// 判据：把反序列化那一支改回 `if let Ok(...)` 静默丢弃，
+    /// `collab_task_resume_total{outcome="failed"}` 不会涨，这条红。
+    #[tokio::test]
+    async fn an_undecodable_snapshot_is_not_a_resume_that_never_happened() {
+        let backend: Arc<dyn cog_core::ObjectBackend> =
+            Arc::new(OneObject(Some(b"{\"checkpoint_id\": \"snap-1\"}".to_vec())));
+        let before = resume_failed_cell().await;
+        let restored = SquadExecutor::restore_snapshot(&backend, "squad-snap-1").await;
+        let after = resume_failed_cell().await;
+        assert!(
+            restored.is_none(),
+            "读不出来的快照没有可续的状态，这一队只能从零重跑"
+        );
+        assert!(
+            after > before,
+            "有指针却恢复失败要在 failed 格里留痕：{before} -> {after}"
+        );
+    }
+
+    /// 正向那一格：能读出来的快照要真的接上，并在 restored 格里留痕。
+    #[tokio::test]
+    async fn a_readable_snapshot_is_handed_back_and_counted_as_restored() {
+        use cog_core::observability::Observable;
+        let checkpoint = cog_core::AgentCheckpoint {
+            checkpoint_id: "snap-1".into(),
+            task_id: "task-1".into(),
+            agent_state: serde_json::json!({}),
+            context_window: Vec::new(),
+            event_offset: 0,
+            timestamp: chrono::Utc::now(),
+        };
+        let backend: Arc<dyn cog_core::ObjectBackend> = Arc::new(OneObject(Some(
+            serde_json::to_vec(&checkpoint).expect("checkpoint serialises"),
+        )));
+        let restored_cell = |metrics: Vec<cog_core::RawMetric>| {
+            metrics
+                .iter()
+                .filter(|m| {
+                    m.name == "collab_task_resume_total"
+                        && m.labels.get(crate::LABEL_OUTCOME).map(String::as_str)
+                            == Some("restored")
+                })
+                .map(|m| m.value)
+                .sum::<f64>()
+        };
+        let before = restored_cell(
+            crate::observable::global_observable()
+                .collect_metrics("D8")
+                .await
+                .unwrap(),
+        );
+        let restored = SquadExecutor::restore_snapshot(&backend, "squad-snap-1").await;
+        let after = restored_cell(
+            crate::observable::global_observable()
+                .collect_metrics("D8")
+                .await
+                .unwrap(),
+        );
+        assert_eq!(restored.map(|c| c.checkpoint_id), Some("snap-1".into()));
+        assert!(after > before, "接上的续跑要在 restored 格里留痕");
     }
 }
