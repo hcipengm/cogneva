@@ -104,15 +104,22 @@ async fn retryable_failed_tasks_trigger_crew_retry() {
 
     let task = Task::new("t-1", TaskType::Planner, serde_json::json!({}));
     orch.submit_goal("g", vec![task]).await.unwrap();
-    // 同上：每一轮的失败都带着不同的内容，重试才买得到；预算耗尽之后停在 Failed。
-    for attempt in 0..4 {
-        orch.schedule_task("t-1").await.unwrap();
-        orch.start_task("t-1").await.unwrap();
-        let _ = orch
-            .fail_task("t-1", format!("boom attempt {attempt}"), None)
-            .await
-            .unwrap();
-    }
+    // 换了内容的失败买得到下一次；同一句原样再来一次就买不到（重试按变化判）。
+    orch.schedule_task("t-1").await.unwrap();
+    orch.start_task("t-1").await.unwrap();
+    let (retried, _, _) = orch
+        .fail_task("t-1", "boom attempt 0".into(), None)
+        .await
+        .unwrap();
+    assert!(retried, "换了内容的失败该买得到下一次");
+
+    orch.schedule_task("t-1").await.unwrap();
+    orch.start_task("t-1").await.unwrap();
+    let (retried, _, _) = orch
+        .fail_task("t-1", "boom attempt 0".into(), None)
+        .await
+        .unwrap();
+    assert!(!retried, "同一句原样再来一次不该买重试");
     assert_eq!(
         orch.get_task("t-1").await.unwrap().status,
         cog_core::TaskStatus::Failed
