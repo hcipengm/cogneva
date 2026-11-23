@@ -36,6 +36,7 @@ const ACTION_PLANNER: &str =
 const SIGNAL_WATCHER: &str = "crates/cog-reflection/src/signal_watcher.rs";
 const CHANGE_LEDGER: &str = "crates/cog-orchestrator/src/change_ledger.rs";
 const DISCOVERY_LOOP: &str = "crates/cog-github/src/discovery_loop.rs";
+const PROMOTION_EVAL: &str = "crates/cog-reflection/src/promotion_eval.rs";
 
 /// 折叠过的那几条读。某一段正文里出现它们，就是那一面在替没读到的图作证。
 const FOLDED: &[&str] = &[
@@ -385,6 +386,18 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "get_task_checked",
         "读不到那一行被读成「它不在了」，remaining 少算一条，回填以「补完了」退场",
     ),
+    (
+        PROMOTION_EVAL,
+        "pub(crate) async fn withdraw_abandoned",
+        "get_all_tasks_checked",
+        "清扫读成「图上没有孤儿」，答「收走 0 条」，与真的没有孤儿逐字同形",
+    ),
+    (
+        PROMOTION_EVAL,
+        "pub(crate) async fn submit_and_wait",
+        "get_task_checked",
+        "提交前那一读读成「没有旧行挡着」，这一次提交被当重投静默跳过；等待里那一读读成「还在跑」，无上限地等下去",
+    ),
 ];
 
 #[test]
@@ -407,6 +420,7 @@ fn every_surface_that_draws_the_graph_keeps_the_failure() {
         SIGNAL_WATCHER,
         CHANGE_LEDGER,
         DISCOVERY_LOOP,
+        PROMOTION_EVAL,
     ] {
         productions.insert(file, production_text(&read_repo(file)));
     }
