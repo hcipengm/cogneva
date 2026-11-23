@@ -568,20 +568,19 @@ mod tests {
         .unwrap();
     }
 
-    /// 一条停在半路、既不输出也烧不动 CPU 的构建要被执行器停掉，且错误里把
-    /// 「静了多久」「这个部署见过的最长一步有多长」两个数都写出来。
+    /// 一条停在半路、既不输出也烧不动 CPU 的构建：静默是一条**归因**，不是一次判决。
     ///
-    /// 这两处痕缺一不可：点了名，事后读这条变更的人才分得清「没判过」与「判
-    /// 停住」；结局记成 `Stalled` 而不是「构建失败」，因为两者的宿主时间含义相
-    /// 反——停住的构建占掉的时间不是这件活的长度。
+    /// 静默不杀之后（属主 2026-11-23），执行器不会因为它安静而收掉它——它跑完就是
+    /// 跑完，结局是 `Built` 而不是 `Stalled`。归因那一侧（卡在什么状态、等在哪、该
+    /// 做什么）由 `cog-core` 的 `a_child_that_goes_quiet_is_described_not_stopped`
+    /// 钉住；这条用例钉的是执行器这一侧不再拿时钟把它砍掉。
     ///
-    /// 真跑一次 `cargo build --release`：这个夹具的 `build.rs` 睡 30 秒，期间
-    /// 一个字节都不输出、CPU 时间一 tick 都不涨。种子只种在这个测试里，并持着
-    /// 进程级的那把锁——别的同样真跑构建的测试不会读到这里的窗口。
+    /// 真跑一次 `cargo build --release`：夹具的 `build.rs` 睡 30 秒，期间一个字节都不
+    /// 输出、CPU 时间一 tick 都不涨。种子只种在这个测试里，并持着进程级的那把锁。
     ///
     /// 槽位传 `None`：这个测试量的是判据本身，不是闸门。
     #[tokio::test]
-    async fn a_build_that_stops_moving_is_stopped_and_the_error_names_the_window() {
+    async fn a_build_that_goes_quiet_is_waited_on_instead_of_killed() {
         let _guard = cog_core::progress::async_test_lock().await;
         cog_core::progress::reset_for_tests();
         cog_core::progress::seed_gaps_for_tests(
@@ -595,38 +594,15 @@ mod tests {
         let deployer = EvolutionDeployer::new(root.path(), root.path(), root.path())
             .with_binary_name("budget-probe");
 
-        let err = deployer
-            .run_cargo_build(root.path(), None, "change-stall-probe", None)
+        deployer
+            .run_cargo_build(root.path(), None, "change-quiet-probe", None)
             .await
-            .expect_err("a build that stops moving must not be waited on forever");
-
-        let text = err.to_string();
+            .expect("安静不是判停的理由：构建跑完就是跑完");
         assert!(
-            text.contains("stopped moving"),
-            "the rejection has to say the build was judged stopped: {text}"
+            matches!(deployer.last_build_ending(), Some(BuildEnding::Built(_))),
+            "安静地跑完的构建，结局是 Built，不是被砍掉：{:?}",
+            deployer.last_build_ending()
         );
-        // 判词里那个数要与判据用的那个数是同一个：界只跟这一趟量到的间隔取大
-        // （见 `longest_gap`），所以它可能比种下的 50ms 宽——cargo 自己的两拍之间
-        // 就有一段真实的间隔。认死 50ms 会让这条用例在判词完全正确时红。
-        match deployer.last_build_ending() {
-            Some(BuildEnding::Stalled { silent, window }) => {
-                assert!(
-                    window >= Duration::from_millis(50),
-                    "界不能比种下的样本还窄：{window:?}"
-                );
-                assert!(
-                    text.contains(&format!("{window:?}")),
-                    "the rejection has to name the longest gap this deployment has \
-                     seen ({window:?}), otherwise nobody can tell what it was compared \
-                     against: {text}"
-                );
-                assert!(
-                    silent > window,
-                    "judged stopped means silent beats the window"
-                );
-            }
-            other => panic!("a build stopped mid-step is Stalled, not {other:?}"),
-        }
         cog_core::progress::reset_for_tests();
     }
 
