@@ -293,7 +293,14 @@ def open_round(spec: str | None, allow_open: bool = False, code_rev_override: st
     import os
     import uuid
     source = todo_source.normalize(source)
-    batch = todo_source.load(source) if source.startswith("md:") else []
+    # 批次用 `partition`，不用 `load`：写了 `touches: unknown` 的条目是「本轮不排」，
+    # 它与两道编译门用的是同一个函数（`partition` 的 docstring），批次在三个地方是同一个数。
+    if source.startswith("md:"):
+        batch, _without, deferred = todo_source.partition(source)
+    else:
+        batch, deferred = [], []
+    if deferred:
+        print(f"round: 本轮不排（`touches: unknown`）{len(deferred)} 条：{', '.join(deferred)}")
     if batch:
         print(f"round: 本批 {len(batch)} 条（同一批编辑，不挑子集）：")
         for item in batch:
@@ -404,9 +411,15 @@ def status() -> int:
     # 每一条缺哪一格就说哪一格：三格是本轮判「做没做完」的**唯一**判据（触点只提示
     # 该改哪些文件）。只印一个 id 的话，读的人还得自己去台账里找缺的是哪一格。
     cells: dict[str, list[str]] = {}
+    known: set[str] | None = None
+    spec = todo_source.default_spec()
     try:
-        items = {i.id: i for i in todo_source.load(todo_source.default_spec())}
+        items = {i.id: i for i in todo_source.load(spec)}
         cells = {i: items[i].missing_cells() for i in left if i in items}
+        # 「不在未完成那一侧」有两个意思：这一条做完了（行还在台账里，落在终态那一侧），
+        # 或者它被人从台账里删了。判它们的是同一本台账的 id 全集；读不到就不判，也不猜。
+        # 不查这一问的话，做完的条目会从批次里消失、读数写「未完成」，于是**每一轮都关不掉**。
+        known = todo_source.all_ids(spec)
     except todo_source.Unreadable as e:
         print(f"round: 台账读不到（{e}）；下面只列 id")
     book = "事件流" if round_book() == "event" else f"git {ROUND_REF}"
@@ -414,9 +427,17 @@ def status() -> int:
     terminal = 0
     for i in left:
         miss = cells.get(i)
+        if miss is None and known is not None and i in known:
+            # 在台账里、但不在「未完成」那一侧：它已经落在终态那一侧（五格行的
+            # `已落`＋空差距，或三格行的三格齐＋`已落`）。这一轮钉的清单来自开工那一刻，
+            # 行做完就从那一侧消失——消失是收尾，不是丢件。
+            terminal += 1
+            print(f"  已落 {i}")
+            continue
         if miss is None:
-            print(f"  未完成 {i}")
-        elif not miss:
+            print(f"  未完成 {i}（未完成那一侧没有它，台账里也没有这一行）")
+            continue
+        if not miss:
             terminal += 1
             print(f"  三格齐 {i}")
         else:

@@ -68,10 +68,10 @@ def parse_cells(text: str) -> dict[str, str]:
 
 
 class Item:
-    __slots__ = ("id", "title", "text", "touches", "deferred", "cells")
+    __slots__ = ("id", "title", "text", "touches", "deferred", "cells", "fixed", "gap")
 
     def __init__(self, id: str, title: str, text: str, touches: list[str], deferred: bool = False,
-                 cells: dict[str, str] | None = None):
+                 cells: dict[str, str] | None = None, fixed: bool = False, gap: str = ""):
         self.id = id
         self.title = title
         # 整行原文（不截断）。`title` 是给人看的前 80 字，用来估「这一条读起来要多少
@@ -83,10 +83,20 @@ class Item:
         self.deferred = deferred
         # 三格：代码 / 上线 / 验证。**判「做没做完」只认这三格**，不认触点。
         # 触点是「这一轮该改哪些文件」的提示；一个文件改了不等于那条待办做完了
-        # （改了一半、改错了地方、或者只是碰巧在同一条路径上），2026-11-21 属主定。
+        # （改了一半、改错了地方、或者只是碰巧在同一条路径上）；判据见
+        # `deploy/scripts/tests/batch-gate.test.sh` 的场景 3b。
         self.cells = cells or {}
+        # 五格行（`序号 | 终态 | 现在 | 差距 | 状态`）的判据不在三格上：它自己写出了
+        # 「差距」那一格。走到这里的五格行都是未落——`已落` 且差距为空的行在
+        # `_fixed_item` 里就返回 None（不进批次），所以这里不必再判一次终态。
+        self.fixed = fixed
+        self.gap = gap
 
     def missing_cells(self) -> list[str]:
+        if self.fixed:
+            # 五格行缺的永远是它自己写的那一格。借三格的标签去报「缺 代码、上线、
+            # 验证」会把读数人引到一格这一行根本没有的列上。
+            return ["差距"]
         return [tag for tag in CELL_TAGS if not self.cells.get(tag)]
 
     def is_complete(self) -> bool:
@@ -116,18 +126,24 @@ _FIXED_STATUS = ("未落", "已落")
 _GAP_EMPTY = ("", "—", "-", "–")
 
 
-def _fixed_item(line: str, notouch: list[str]) -> tuple[Item, bool] | None:
+def _fixed_item(line: str, notouch: list[str], malformed: list[str],
+                bad_status: list[str]) -> tuple[Item, bool] | None:
     """读一行五格台账。返回 (条目, 是否按未完成读)；不是这个形状时返回 None。
 
-    「已落」只在差距那一格为空时才成立（属主 2026-11-23 定）。写着已落却还留着差距的行，
+    「已落」只在差距那一格为空时才成立。写着已落却还留着差距的行，
     按未完成读并进 debt——与三格那种「填不满的已落」同一处置：跳过它等于承认那个假的终态，
     而拒读会让整本台账一个门都开不开。
+
+    形状不对（列数不足）与状态词不在闭集里的行**点名拒读**：静默跳过它们，这一行就从
+    每一个批次里消失了，而读数照样绿——「读不到」被读成「没有」。
     """
     cells = [c.strip() for c in line.strip().strip("|").split("|")]
     if len(cells) < 5:
+        malformed.append(f"{cells[0] if cells else line[:20]}（五格行只有 {len(cells)} 列）")
         return None
     status = cells[-1]
     if status not in _FIXED_STATUS:
+        bad_status.append(f"{cells[0]}（状态：{status[:20]}）")
         return None
     found = None
     for found in re.finditer(r"[｜|]\s*touches:\s*([^|｜\n]+)", line):
@@ -150,8 +166,8 @@ def _fixed_item(line: str, notouch: list[str]) -> tuple[Item, bool] | None:
     gap = cells[3].strip()
     if status.startswith(CLOSED_PREFIXES) and gap in _GAP_EMPTY:
         return None  # 终态真的到了：不进批次。
-    three = parse_cells(line)
-    item = Item(cells[0], cells[1][:80], line.strip(), touches, deferred, three)
+    item = Item(cells[0], cells[1][:80], line.strip(), touches, deferred,
+                fixed=True, gap=gap)
     # 未落的行进批次；写着已落却留着差距的按未完成读（debt），与三格那种同一处置。
     return item, status.startswith(CLOSED_PREFIXES)
 
@@ -171,7 +187,7 @@ def _md_split(path: pathlib.Path) -> tuple[list[Item], list[Item]]:
         # 是显式写出来的，而不是从三格缺哪几格推出来。两形状都读，因为台账正在换格式，
         # 只认一种就会把另一种**整族读成没有待办**，而那个读数看起来是绿的。
         if not line.startswith("| S") and _FIXED_ROW.match(line):
-            item = _fixed_item(line, notouch)
+            item = _fixed_item(line, notouch, malformed, bad_status)
             if item is not None:
                 (debt if item[1] else out).append(item[0])
             continue
@@ -241,7 +257,8 @@ def _md_split(path: pathlib.Path) -> tuple[list[Item], list[Item]]:
         )
     if malformed:
         raise Unreadable(
-            "这些行以 `| S` 开头却没有状态列，读不出它做没做：" + "、".join(malformed)
+            "这些行短得读不出它做没做（`| S` 行缺状态列，或五格行不足 5 列）："
+            + "、".join(malformed)
         )
     if bad_status:
         raise Unreadable(
@@ -281,7 +298,9 @@ def all_ids(spec: str) -> set[str]:
         raise Unreadable(f"{path} 不存在")
     ids: set[str] = set()
     for line in path.read_text(errors="ignore").splitlines():
-        if not line.startswith("| S"):
+        # 两种行形状都算。只认 `| S…` 那一种时，五格台账里的每一条都答「不在台账里」——
+        # 而这个函数的唯一用途就是分辨「做完了从批次里消失」与「被人删掉了」。
+        if not (line.startswith("| S") or _FIXED_ROW.match(line)):
             continue
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
         if cells and cells[0]:
