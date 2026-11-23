@@ -3599,7 +3599,14 @@ impl DagExecutor {
         // 声明的，判决读的是这张矩阵（失败类还会把预算压到 0）；不写回来的话，
         // 行里 `retry_count < max_retries` 读的是一个从没参与过判决的新数，
         // 而同一个任务在"还要不要再来一次"上有两个答案。
-        task.max_retries = max_retries;
+        // 行上那一格记的是「这一刻还允不允许再跑一次」，判决比对的是
+        // `retry_count < max_retries`：允许时写 `已经跑过的次数 + 1`，于是「变了就
+        // 再跑一次、不设次数上限」在行上仍然是一个数，而不是让累计次数自己把路堵死。
+        task.max_retries = if max_retries == 0 {
+            0
+        } else {
+            retry_count.saturating_add(1)
+        };
         if retry_count < max_retries {
             task.retry_count = retry_count + 1;
             task.status = TaskStatus::Pending;
