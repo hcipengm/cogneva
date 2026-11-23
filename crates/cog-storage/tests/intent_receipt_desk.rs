@@ -19,15 +19,32 @@ use cog_storage::postgres::intent_events::IntentEventStore;
 
 const WORKSPACE: &str = "probe-intent-desk";
 
+/// 事件流那张表由迁移建；任务那一侧的表由 `init_schema` 建。两处都是产品自己的
+/// DDL——这里不手抄一份列清单，手抄的那份只能证明这条 SQL 认得自己。
+async fn apply_event_stream_migration(pool: &sqlx::PgPool) {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/postgres");
+    for file in [
+        "117_event_stream.up.sql",
+        "119_event_payload_is_json.up.sql",
+    ] {
+        let sql =
+            std::fs::read_to_string(dir.join(file)).unwrap_or_else(|e| panic!("read {file}: {e}"));
+        sqlx::raw_sql(&sql)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("apply {file}: {e}"));
+    }
+}
+
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn an_intent_stops_being_undispatched_once_a_task_carries_its_identity() {
     let url = cog_test_support::database_url();
     let schema = cog_test_support::own_schema(&url, "intent_receipt_desk").await;
     let pool = cog_test_support::schema_pool(&url, &schema).await;
-    cog_storage::schema_ddl::apply(&pool, &schema)
-        .await
-        .expect("平台的表在这一次的 schema 里建出来");
+    let backend = cog_storage::PostgresStateBackend::new(pool.clone());
+    backend.init_schema().await.expect("任务那一侧的表建出来");
+    apply_event_stream_migration(&pool).await;
 
     let desk = IntentEventStore::new(pool.clone(), "probe-intent-desk");
     let row = IntentRow {
@@ -47,7 +64,6 @@ async fn an_intent_stops_being_undispatched_once_a_task_carries_its_identity() {
     assert_eq!(open[0].text, row.text, "读回来的原文与写进去的不是同一段");
 
     // 派生的那一条任务：输入的写法与协作那一侧一致（`INTENT_ID_KEY`）。
-    let backend = cog_storage::PostgresStateBackend::new(pool.clone());
     let mut task = Task::new(identity.clone(), TaskType::DagNode, serde_json::json!({}));
     task.input
         .as_object_mut()
