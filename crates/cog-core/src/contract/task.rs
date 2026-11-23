@@ -215,12 +215,21 @@ pub struct BatchItem {
     /// 这一条要动哪些文件。空表示「说不出来」——它进不了批次，要么先被拆细，要么被
     /// `Split` 逐条点名排除。
     pub touches: Vec<String>,
-    /// 这一条做到哪一步了（代码 / 上线 / 验证）。
+    /// 这一条的三格：终态、现在、差距（`LedgerItem`）。状态由它自己带。
     ///
-    /// 计划要判的是「这一批能不能一起成立」，而一条缺了验证格的行与一条三格齐的
-    /// 行，在同一份验收下的答案不同：前者只能说「改完了」，说不了「成了」。把这
-    /// 一格留在账本里、让计划再去猜，就等于让同一件事有两个答案。
-    pub cells: crate::contract::change_ledger::ChangeCells,
+    /// 计划判的是「这一批能不能一起成立」，而一条差距还写着的行与一条差距清空的行，
+    /// 在同一份验收下的答案不同：前者只能说「还在改」，说不了「成了」。把这一格留在
+    /// 账本里、让计划再去猜，就等于让同一件事有两个答案。
+    #[serde(default)]
+    pub item: crate::contract::ledger_item::LedgerItem,
+}
+
+impl BatchItem {
+    /// 这一条到了终态没有：状态是 `已落` **且**差距为空。
+    pub fn is_terminal(&self) -> bool {
+        self.item.state == crate::contract::ledger_item::LedgerState::Reached
+            && self.item.gap_is_empty()
+    }
 }
 
 /// 给一批活写计划：这一批的「这一类」是什么、必须成立什么、怎么量。

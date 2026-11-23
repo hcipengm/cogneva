@@ -12,10 +12,11 @@
 ///
 /// 序列化写的就是台账上的那两个词：planner 的产出直接是一行台账，读它与写它的
 /// 人用同一套词，多一个 `Open`／`Reached` 的旁名就多一处要对照的翻译。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum LedgerState {
-    /// 还差着什么。
+    /// 还差着什么。默认态：一条什么也没写的待办还没到任何地方。
     #[serde(rename = "未落")]
+    #[default]
     Open,
     /// 终态到了：差距那一格空着才成立。
     #[serde(rename = "已落")]
@@ -52,7 +53,7 @@ pub const ITEM_INPUT_KEY: &str = "ledger_item";
 const EMPTY_GAP: [&str; 4] = ["", "—", "-", "–"];
 
 /// 一条待办。字段与台账的五格一一对应。
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct LedgerItem {
     /// 序号：稳定、永不复用。
     pub id: String,

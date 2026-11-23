@@ -59,11 +59,18 @@ impl BatchPlanner for LedgerBatchPlanner {
         // 终态是**三格齐**，不是「文件改过」。计划里写出来，是因为这是这一批做到什么
         // 程度才算完的唯一一句话：缺验证格的那几条到了推上去、跑起来为止都还不是
         // 「成了」，而这句话不说，一份全部「改过」的批次就会读作全部做完。
-        let terminal = items.iter().filter(|item| item.cells.is_terminal()).count();
-        let unverified = items.iter().filter(|item| item.cells.unverified()).count();
+        let terminal = items.iter().filter(|item| item.is_terminal()).count();
+        // 「写了已落、差距却还在」：账上最坏的一种形状——读作做完了，实际没到。
+        let unverified = items
+            .iter()
+            .filter(|item| {
+                item.item.state == cog_core::contract::ledger_item::LedgerState::Reached
+                    && !item.item.gap_is_empty()
+            })
+            .count();
         invariants.push(format!(
-            "这一批里三格齐（终态）{terminal} 条，缺格 {} 条；其中代码填了、验证空着的 {unverified} 条——\
-             它们读作做完了、实际没人核过，不是终态",
+            "这一批里到终态（差距清空）{terminal} 条，没到的 {} 条；其中写着已落却还留着差距的 {unverified} 条——\
+             它们读作做完了、实际没到，不是终态",
             items.len() - terminal
         ));
 
@@ -107,7 +114,7 @@ mod tests {
             id: id.to_string(),
             title: title.to_string(),
             touches: vec![format!("crates/{id}/src/lib.rs")],
-            cells: cog_core::ChangeCells::default(),
+            item: Default::default(),
         }
     }
 
