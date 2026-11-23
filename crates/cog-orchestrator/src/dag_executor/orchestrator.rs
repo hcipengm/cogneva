@@ -7693,10 +7693,19 @@ mod tests {
     ///
     /// 这一族里的几处修法不改变返回值：读不到时那一趟仍然什么都不做，与「确实
     /// 没有要做的事」给的是同一个返回。屏幕上那几行就是唯一能分开两者的地方，
-    /// 断言只能落在它上面。`set_default` 是线程局部的，`#[tokio::test]` 默认的
-    /// current-thread runtime 不换线程，guard 活着的整段 `.await` 都在收。
+    /// 断言只能落在它上面。
+    ///
+    /// 订阅者**装一次、装成进程级的，不撤下**。`tracing` 对每条 callsite 算一份
+    /// 兴趣缓存，算的是「这个进程里此刻注册着哪些订阅者」；`set_default` 是线程
+    /// 局部的，而且只有一条订阅者注册着时它算的是**命中那条线程**上的默认订阅者。
+    /// 别的测试线程先命中同一条 warn 时，那一次算出来的是 `NoSubscriber` 的 never
+    /// ——之后我们这一层就再也收不到（2026-11-23 实测：同一批测试单跑绿、整套并行
+    /// 跑红，`said()` 空着）。装成全局的，任何线程上的默认订阅者都是它。
+    ///
+    /// 每条事件按 `ThreadId` 分桶，每个测试只读自己那一桶：`#[tokio::test]` 默认的
+    /// current-thread runtime 不换线程，它 spawn 出来的任务也在同一条线程上跑。
     #[derive(Clone, Default)]
-    struct WarnText(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+    struct WarnSink(std::sync::Arc<std::sync::Mutex<Vec<(std::thread::ThreadId, String)>>>);
 
     struct MessageField(String);
 
@@ -7708,7 +7717,7 @@ mod tests {
         }
     }
 
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnText {
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnSink {
         fn on_event(
             &self,
             event: &tracing::Event<'_>,
@@ -7719,13 +7728,45 @@ mod tests {
             }
             let mut field = MessageField(String::new());
             event.record(&mut field);
-            self.0.lock().unwrap().push(field.0);
+            self.0
+                .lock()
+                .unwrap()
+                .push((std::thread::current().id(), field.0));
+        }
+    }
+
+    struct WarnText {
+        sink: WarnSink,
+        thread: std::thread::ThreadId,
+    }
+
+    /// 这一条测试线程上收到的那几行 warn。
+    fn warn_text() -> WarnText {
+        static SINK: std::sync::OnceLock<WarnSink> = std::sync::OnceLock::new();
+        let sink = SINK.get_or_init(|| {
+            let sink = WarnSink::default();
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::registry().with(sink.clone()),
+            )
+            .expect("这个测试二进制里不该有别人先装全局订阅者");
+            sink
+        });
+        WarnText {
+            sink: sink.clone(),
+            thread: std::thread::current().id(),
         }
     }
 
     impl WarnText {
         fn said(&self) -> Vec<String> {
-            self.0.lock().unwrap().clone()
+            self.sink
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(thread, _)| *thread == self.thread)
+                .map(|(_, line)| line.clone())
+                .collect()
         }
 
         fn any(&self, needle: &str) -> bool {
@@ -7749,9 +7790,7 @@ mod tests {
         backend.tasks.lock().await.push(stalled);
         let streams = served("ws-unreadable-sweep", true);
 
-        let warns = WarnText::default();
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(warns.clone()));
+        let warns = warn_text();
 
         // 两读都答不上来：先按状态读那一列，退到整张图也读不出。
         backend
@@ -7792,9 +7831,7 @@ mod tests {
         stalled.updated_at = chrono::Utc::now() - chrono::Duration::minutes(30);
         backend.tasks.lock().await.push(stalled);
 
-        let warns = WarnText::default();
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(warns.clone()));
+        let warns = warn_text();
 
         backend
             .task_read_fail_on
@@ -7826,9 +7863,7 @@ mod tests {
         stalled.updated_at = chrono::Utc::now() - chrono::Duration::minutes(30);
         backend.tasks.lock().await.push(stalled);
 
-        let warns = WarnText::default();
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(warns.clone()));
+        let warns = warn_text();
 
         // 第一读（动手前那一行）照常，写被拒，复核那一次答不上来。
         backend
@@ -7866,9 +7901,7 @@ mod tests {
         goal.sink_task_id = Some("sink".into());
         backend.tasks.lock().await.extend([sink, goal]);
 
-        let warns = WarnText::default();
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(warns.clone()));
+        let warns = warn_text();
 
         backend
             .task_read_fail_on
@@ -7923,9 +7956,7 @@ mod tests {
         goal.sink_task_id = Some("sink".into());
         backend.tasks.lock().await.extend([sink, goal]);
 
-        let warns = WarnText::default();
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(warns.clone()));
+        let warns = warn_text();
 
         // sink 那一读照常，父行那一次答不上来。
         backend
