@@ -718,6 +718,10 @@ impl CollaborationExecutor {
         if let Some(s) = score {
             metadata = metadata.with_score(s);
         }
+        // 交上来的那条待办若带着三格，就把**判完之后的它**带回去：状态跟着这一次
+        // 运行的结果走，差距原样（改没改掉由下一次读树的人说，不由这一次自报）。
+        // 入口那一侧因此拿得到「这条到了没有」，而不只是「这次跑成了没有」。
+        metadata = Self::carry_ledger_item(task, &result, metadata);
         let task_result = TaskResult {
             success: true,
             output,
@@ -726,6 +730,35 @@ impl CollaborationExecutor {
         self.archive_execution(task, &task_result);
         self.archive_decomposition(task, sub_task_types);
         Ok(task_result)
+    }
+
+    /// 把任务行上那条待办的三格带进结果的 `extensions`。
+    ///
+    /// 三格从 `input[ITEM_INPUT_KEY]` 来（意图入口写的），状态按这一次的结局写：
+    /// 成功记 `已落`、失败保持 `未落`。差距不改：这一段改没改掉，要由下一位读树的人说。
+    fn carry_ledger_item(
+        task: &Task,
+        result: &SquadResult,
+        mut metadata: TaskResultMetadata,
+    ) -> TaskResultMetadata {
+        use cog_core::contract::ledger_item::{LedgerItem, LedgerState, ITEM_INPUT_KEY};
+        let Some(raw) = task.input.get(ITEM_INPUT_KEY) else {
+            return metadata;
+        };
+        let Ok(mut item) = serde_json::from_value::<LedgerItem>(raw.clone()) else {
+            return metadata;
+        };
+        if result.success {
+            item.state = LedgerState::Reached;
+        }
+        if let Ok(value) = serde_json::to_value(&item) {
+            let mut extensions = metadata.extensions.clone().unwrap_or(serde_json::json!({}));
+            if let Some(obj) = extensions.as_object_mut() {
+                obj.insert(ITEM_INPUT_KEY.to_string(), value);
+            }
+            metadata.extensions = Some(extensions);
+        }
+        metadata
     }
 
     /// 这一次运行的产出要不要走抽取与落地那条路。
