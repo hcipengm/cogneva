@@ -178,6 +178,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 卷占用走查：挂在只由第三方进程写入的卷上的边车，把该卷的盘上字节发布成
         // 卷族序列（deploy/k3s/cluster-registry.yaml 的 volume-walker 容器）。
         Command::BatchEdit => cog_orchestrator::batch_edit::run_from_env().await,
+        Command::BatchPlan => cog_orchestrator::batch_plan::run_from_stdin().await,
         Command::VolumeWalker => cogneva::volume_walker::run_from_env().await,
         // 宿主账本的拆解面：每节点一个只读进程，把宿主 cgroup v2 的三个 slice 各按
         // anon / file 拆开（deploy/k3s/host-ledger-daemonset.yaml 的启动命令）。

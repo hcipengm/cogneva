@@ -23,6 +23,7 @@ pub enum Command {
     SandboxExecutor,
     /// 2.1–2.4 的入口：把 2.5 的假清单变成一次生成请求。
     BatchEdit,
+    BatchPlan,
     VolumeWalker,
     HostLedger,
     ProcessCensus,
@@ -50,7 +51,7 @@ pub enum Command {
 
 /// Subcommands, in the order they appear in [`USAGE`]. A command added here but
 /// not documented fails the usage test.
-const SUBCOMMANDS: [(&str, Command); 24] = [
+const SUBCOMMANDS: [(&str, Command); 26] = [
     ("security-gateway", Command::SecurityGateway),
     ("sandbox-executor", Command::SandboxExecutor),
     ("volume-walker", Command::VolumeWalker),
@@ -78,6 +79,11 @@ const SUBCOMMANDS: [(&str, Command); 24] = [
     ("governance", Command::Governance),
     ("work", Command::Work),
     ("principles", Command::Principles),
+    // `batch-edit` 与 `batch-plan` 一直不在表里：枚举里有、分发里有，而 `parse` 查的是
+    // 这张表——于是「这条命令不存在」，而代码看起来写完了（2026-11-23 实测：`BatchEdit`
+    // 的 match 臂从加进来那天起没有一条命令能走到）。
+    ("batch-edit", Command::BatchEdit),
+    ("batch-plan", Command::BatchPlan),
 ];
 
 /// Flags that take effect wherever they appear in the argument list.
@@ -109,6 +115,7 @@ const READ_ONLY_SUBCOMMANDS: &[Command] = &[
     Command::HostLedger,
     Command::ClaimStore,
     Command::BatchEdit,
+    Command::BatchPlan,
     Command::VolumeWalker,
     Command::McpServe,
 ];
