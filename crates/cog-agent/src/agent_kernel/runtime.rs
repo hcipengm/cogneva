@@ -4085,12 +4085,27 @@ impl AgentRuntime {
         let mut stream_error: Option<String> = None;
 
         // Iterate over the streaming events. Each await is stall-guarded: an
-        // event arriving resets the clock, so long generations survive while a
-        // hung stream is aborted after one quiet window.
+        // event arriving resets the clock. But **一个安静窗口不是终点**（属主
+        // 2026-11-23）：流还开着、上游还在算，与流已经死了，在读数上是两件事。
+        // 第一段静默只记一笔并继续等；第二段仍然静默才说得上「这条流不再前进」。
+        let mut quiet_windows = 0u32;
         loop {
             let event = match tokio::time::timeout(stall_timeout, stream.next()).await {
-                Ok(Some(event)) => event,
+                Ok(Some(event)) => {
+                    quiet_windows = 0;
+                    event
+                }
                 Ok(None) => break,
+                Err(_) if quiet_windows == 0 => {
+                    quiet_windows = 1;
+                    tracing::warn!(
+                        agent_id = %self.config.agent_id,
+                        window_secs = stall_timeout.as_secs(),
+                        "the stream has been quiet for one window while still open; \
+                         waiting one more window before judging it stopped"
+                    );
+                    continue;
+                }
                 Err(_) => {
                     let err = stall_err("streaming events");
                     tracing::warn!(agent_id = %self.config.agent_id, error = %err, "AgentRuntime think_stream stall timeout");
@@ -4123,13 +4138,17 @@ impl AgentRuntime {
         // Get the final response. The stream has already ended, so this
         // normally resolves instantly; the stall guard only covers a producer
         // that closed the event channel without ever completing the result.
+        // 同一条口径：第一次等不到只说明「还没来」，不是「不会来」。
         let response = match tokio::time::timeout(stall_timeout, stream.result()).await {
             Ok(response) => response,
-            Err(_) => {
-                let err = stall_err("awaiting the final response");
-                tracing::warn!(agent_id = %self.config.agent_id, error = %err, "AgentRuntime think_stream stall timeout");
-                return Err(err);
-            }
+            Err(_) => match tokio::time::timeout(stall_timeout, stream.result()).await {
+                Ok(response) => response,
+                Err(_) => {
+                    let err = stall_err("awaiting the final response");
+                    tracing::warn!(agent_id = %self.config.agent_id, error = %err, "AgentRuntime think_stream stall timeout");
+                    return Err(err);
+                }
+            },
         };
         // Bill this call to the run before anything can drop the response: the
         // assistant message built below carries no usage, so this line is the
