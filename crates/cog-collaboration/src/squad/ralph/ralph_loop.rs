@@ -1747,7 +1747,34 @@ mod tests {
 
     #[async_trait::async_trait]
     impl cog_core::Agent for MockAgent {
-        async fn prompt(&self, _input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
+        async fn prompt(&self, input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
+            // 判据审问的是另一件事：这段终态立不立得住。夹具按**被问到的那个问题**答，
+            // 而不是把「这一次判定通过」原样丢回去——那一份里面没有 `verdicts`，
+            // 审读它等于每条终态都不成立，于是每一次计划都被判回属主。
+            let asks_about_terminals = input
+                .get("instructions")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains("judge the terminal description"));
+            if asks_about_terminals {
+                let verdicts: Vec<serde_json::Value> = input
+                    .get("items")
+                    .and_then(|v| v.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|i| i.get("id"))
+                            .map(|id| {
+                                serde_json::json!({
+                                    "id": id,
+                                    "ok": true,
+                                    "reason": "a finished state a reader can check",
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                return Ok(serde_json::json!({ "verdicts": verdicts }));
+            }
             Ok(self.response.clone())
         }
 
@@ -2332,11 +2359,14 @@ mod tests {
 
     /// 空分解不是终止性失败：没有任何观测到的证据排除下一轮成功，第一轮就收摊
     /// 等于按一个从没看见过的事实结账。这里量的是"它到底有没有接着试"。
+    ///
+    /// 迭代预算删掉之后，这个循环没有任何"跑够几轮就停"的出口：它只在终态到了、
+    /// 或者停滞换满三档之后带着根因去问属主时停下。这条用例用后者给一个可判的
+    /// 结尾——窗口取 1，于是每一轮同样空洞的分解都算一次没买到进展。
     #[tokio::test]
     async fn an_empty_decomposition_retries_instead_of_terminating() {
         let mut ralph = RalphLoop::with_config(RalphLoopConfig {
-            // 关掉停滞检测，这条用例只量"空交付物会不会被当成终止性失败"。
-            stagnation_window: 0,
+            stagnation_window: 1,
         });
         let planner = PlannerActor::new(Arc::new(MockAgent {
             response: serde_json::json!({"summary": "n/a", "plan": {}, "sub_tasks": []}),
@@ -2352,22 +2382,28 @@ mod tests {
                 iterations,
                 history,
             } => {
-                assert_eq!(
-                    iterations, 3,
-                    "an empty deliverable must be retried, not terminated on the first attempt"
+                assert!(
+                    iterations > 1,
+                    "an empty deliverable must be retried, not terminated on the first attempt \
+                     (stopped after {iterations} round(s))"
                 );
                 assert!(
                     !cog_core::contract::outcome::is_deterministic_failure(&reason),
                     "{reason}"
                 );
                 assert!(
-                    history.iter().all(|it| it
-                        .feedback
-                        .contains(crate::squad::plan::EMPTY_DECOMPOSITION_PREFIX)),
+                    reason.contains("input only the owner can give"),
+                    "停下来时必须说清缺的是属主那份输入：{reason}"
+                );
+                assert!(
+                    !history.is_empty()
+                        && history.iter().all(|it| it
+                            .feedback
+                            .contains(crate::squad::plan::EMPTY_DECOMPOSITION_PREFIX)),
                     "every retry must carry the cause it is retrying on: {history:?}"
                 );
             }
-            other => panic!("Expected Unrecoverable budget exhaustion, got {:?}", other),
+            other => panic!("Expected the loop to ask the owner, got {:?}", other),
         }
     }
 
@@ -2469,12 +2505,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ralph_budget_exhaustion_triggers_unrecoverable() {
+    /// 圆桌永远达不成共识时，停下来靠的是停滞（换满三档去问属主），不是轮数。
+    ///
+    /// 迭代预算删掉之后，"跑够两轮就收摊"这个结局不存在了：一个每轮都在重复同
+    /// 一个结论的圆桌会一直转。这条钉的是它最终确实停、且停的理由说得清缺什么。
+    #[tokio::test]
+    async fn a_roundtable_that_never_reaches_consensus_asks_the_owner() {
         let mut ralph = RalphLoop::with_config(RalphLoopConfig {
-            ..Default::default()
+            stagnation_window: 2,
         });
-        // roundtable 只给一轮，凑不出「连续两轮」这个前提，共识无从谈起——地板
-        // （1.0 要 100 分，mock 返回 92）只是又拦一道。Ralph 两轮后耗尽迭代预算。
+        // 共识地板 1.0 要 100 分，mock 给 92：永远差那一次抬升。
         let config = PgeRoundtableConfig {
             consensus_threshold: 1.0,
             skill_ids: Vec::new(),
@@ -2493,10 +2533,19 @@ mod tests {
             .await;
 
         match verdict {
-            RalphVerdict::Unrecoverable { iterations, .. } => {
-                assert_eq!(iterations, 2);
+            RalphVerdict::Unrecoverable {
+                reason, iterations, ..
+            } => {
+                assert!(
+                    iterations > 1,
+                    "一轮就收摊等于按一个从没看见过的结论结账（{iterations}）"
+                );
+                assert!(
+                    reason.contains("input only the owner can give"),
+                    "停下来时必须说清缺的是属主那份输入：{reason}"
+                );
             }
-            other => panic!("Expected Unrecoverable at safety limit, got {:?}", other),
+            other => panic!("Expected the loop to ask the owner, got {:?}", other),
         }
     }
 
@@ -4082,12 +4131,14 @@ mod tests {
         assert_eq!(stored.len(), 2);
     }
 
-    /// 回归：历史攒满预算后重驱仍然要跑完本轮预算。曾经的起算点跟着
-    /// `history.len()` 走，于是 `max_iterations` 变成目标的终身配额——攒满
-    /// 之后每次重驱都在第一轮之前就"预算耗尽"，一轮都不执行，连已经能通过
-    /// 的目标也被永久判死。
+    /// 回归：历史很长时，重驱照样跑它自己的轮次。曾经的起算点跟着
+    /// `history.len()` 走，于是轮数预算退化成目标的终身配额——攒满之后每次
+    /// 重驱都在第一轮之前就"耗尽"，一轮都不执行，连已经能通过的目标也被永久判死。
+    ///
+    /// 预算本身已经不在了（停的理由只有终态到了，或停滞换满三档去问属主）；
+    /// 这条钉的是剩下那一半：本轮自己的编号从 1 起算，历史只决定留多少上下文。
     #[tokio::test]
-    async fn ralph_budget_is_per_run_not_a_lifetime_quota() {
+    async fn ralph_history_is_context_not_a_lifetime_quota() {
         let backend = Arc::new(BoardMockBackend::new());
         // 旧账法下攒满的目标：历史饱和在 50 条。
         let saturated: Vec<RalphIteration> = (1..=50)
@@ -4129,12 +4180,23 @@ mod tests {
             RalphVerdict::Unrecoverable { history, .. } => history,
             other => panic!("expected Unrecoverable, got {:?}", other),
         };
-        // 50 条饱和历史只保留最后一窗作为上下文，本轮自己的 2 轮照跑：
-        // 起算点若仍跟着历史走，这里会是 3（0 轮执行）而不是 5。
+        // 50 条饱和历史只保留最后一窗作为上下文，本轮自己的轮次照跑、编号从 1 起：
+        // 起算点若仍跟着历史走，本轮一条都跑不出来（那正是旧 `max_iterations` 的
+        // 终身配额）。这里不钉本轮跑了几轮——没有预算之后，跑几轮由停滞判据决定。
         assert_eq!(ralph.history_keep(), 3);
-        assert_eq!(history.len(), 5);
-        assert_eq!(history[3].iteration, 1);
-        assert_eq!(history[4].iteration, 2);
+        let first_new = history
+            .iter()
+            .position(|it| it.iteration == 1)
+            .expect("本轮自己的轮次要从 1 起算");
+        assert!(
+            first_new >= 3,
+            "饱和历史只该作为上下文被带进来，不能变成本轮之前的轮次：{first_new}"
+        );
+        assert!(
+            history.len() - first_new >= 2,
+            "本轮至少跑了两轮，实得 {}",
+            history.len() - first_new
+        );
     }
 
     /// 生成器报出确定性环境/协议失败时，终止原因是那条失败本身，而不是
