@@ -99,7 +99,10 @@ impl EvaluatorActor {
                 read the files the terminal and the now cell name (read_file) before you answer, \
                 and judge (1) whether the terminal describes a finished state rather than an \
                 activity, (2) whether what you actually read makes it hold, (3) whether it is \
-                what the goal asks for. Answer one JSON object: {\"verdicts\": [{\"id\": \"...\", \
+                what the goal asks for, (4) whether the now cell reads like what the tree \
+                shows - a reader following it would land on the same place, (5) whether the \
+                gap is exactly what the terminal still lacks and nothing else. \
+                Answer one JSON object: {\"verdicts\": [{\"id\": \"...\", \
                 \"ok\": true|false, \"reason\": \"...\"}]}. The reason says what you read: a file and \
                 what it showed, or that you could not read it - an item you could not check is \
                 not ok, because \"could not look\" and \"looked and it holds\" cannot read the same.",
