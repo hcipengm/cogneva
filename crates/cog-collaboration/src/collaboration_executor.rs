@@ -1996,7 +1996,7 @@ mod tests {
             gap: "缺的是：换输入不会跟着变".into(),
             state: LedgerState::Open,
         };
-        let spec = |id: &str| cog_core::TaskSpec {
+        let spec = |id: &str| crate::squad::pge::types::TaskSpec {
             id: id.into(),
             name: id.into(),
             task_type: "generate".into(),
