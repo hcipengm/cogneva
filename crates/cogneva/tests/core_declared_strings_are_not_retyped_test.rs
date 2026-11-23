@@ -84,6 +84,12 @@ fn owning_crate(file: &str) -> &str {
 /// rename turns both gates red rather than one.
 const EXEMPT: &[Exemption] = &[
     Exemption::new(
+        "crates/cog-reflection/src/signal_watcher.rs",
+        "intent_id",
+        "那里的 intent 是一条信号意图的 id；账上派生的那条待办用的是 `INTENT_ID_KEY`，\
+         两件事同名不同物",
+    ),
+    Exemption::new(
         "crates/cog-agent/src/agent_kernel/runtime.rs",
         "guardrail_blocked",
         "错误载荷里的布尔字段名与错误分类标签，不是拼进 reason 文本的那个前缀；\
@@ -358,11 +364,7 @@ fn every_shared_string_is_spelled_in_the_place_it_is_declared() {
 /// 改其中一个名字不需要动另一个，而两次「成功」的改动加在一起，就是同一个文件
 /// 在部署里叫两个名字。
 const SAME_WORD_DIFFERENT_THING: &[(&str, &str)] = &[
-    (
-        "intent_id",
-        "crates/cog-reflection/src/signal_watcher.rs：那里的 intent 是一条信号意图的 id；\
-         账上派生的那条待办用的是 `INTENT_ID_KEY`，两件事同名不同物",
-    ),
+
     (
         "cogneva",
         "二进制名、默认命名空间、主容器名、主 Deployment 名与工作负载名是五个不同的\
