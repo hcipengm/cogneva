@@ -27,6 +27,7 @@ const PROJECT_CONTROL: &str = "crates/cog-gateway/src/project_control.rs";
 const PROGRESS: &str = "crates/cog-gateway/src/progress.rs";
 const PROCESSES: &str = "crates/cog-gateway/src/processes.rs";
 const LIB: &str = "crates/cog-gateway/src/lib.rs";
+const EXECUTOR: &str = "crates/cog-gateway/src/executor.rs";
 
 /// 折叠过的那几条读。某一段正文里出现它们，就是那一面在替没读到的图作证。
 const FOLDED: &[&str] = &[
@@ -184,6 +185,24 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "health_report_from_reading(",
         "健康四格一起落到 0，读成「四个都没病」",
     ),
+    (
+        EXECUTOR,
+        "async fn owner_from_graph",
+        "get_graph_checked",
+        "交接边的「谁干的」一列留空，读成「没人经手」",
+    ),
+    (
+        EXECUTOR,
+        "pub fn spawn_collaboration_listener",
+        "get_dependents_checked",
+        "完成的任务没有交接边，读成「它没有下游」",
+    ),
+    (
+        EXECUTOR,
+        "pub fn spawn_collaboration_listener",
+        "get_graph_checked",
+        "一次重启没有留下任何被打断的边，读成「没打断任何在跑的活」",
+    ),
 ];
 
 #[test]
@@ -198,6 +217,7 @@ fn every_surface_that_draws_the_graph_keeps_the_failure() {
         PROGRESS,
         PROCESSES,
         LIB,
+        EXECUTOR,
     ] {
         productions.insert(file, production_text(&read_repo(file)));
     }
