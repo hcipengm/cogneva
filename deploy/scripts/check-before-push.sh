@@ -627,6 +627,27 @@ run_cell_step() { # run_cell_step <说明> <外部命令…>
         record_cell "${t0}" "${wait0}" UNJUDGED "${what}"
         return 0
     fi
+    # 三态是脚本自己说的：0 绿、1 红、3「这一条没判」。现网判据（读集群的配额与占用）
+    # 连得上集群却读不出配额时退 3；把它记成红，下一次真撞线时那一格与它逐字同形。
+    # 判词由脚本自己印在上面的输出里，这里记「没判」，不替它说成绿。
+    # 连不上集群是另一回事（退 4）：那台机器不是判这一格的地方，见下。
+    if [ "${status}" -eq 3 ]; then
+        printf 'UNJUDGED  %s：退 3（这一条没判），判词见上一行。\n' "${what}" >&2
+        unjudged=$((unjudged + 1))
+        record_cell "${t0}" "${wait0}" UNJUDGED "${what}"
+        return 0
+    fi
+    # 退 4 是格子自己说的「这一格不该在这台机器上判」：读数只在平台宿主上存在（现网配额、
+    # 集群占用）。它与退 3 的区别是「这里不是判它的地方」与「这里判过但没判成」；前者
+    # 与没装 pwsh 的那一步同一处置——点名记进没验的面，不拦推送。拦推送的仍是红，与
+    # 「本该在这里判却没判成」。
+    if [ "${status}" -eq 4 ]; then
+        # 走 skip_step 而不是自己印一行：印 SKIP 与记账必须同一个名单，否则判词里的
+        # 面数会少一个而看不出来（`skipped-faces-are-censused.test.sh` 钉的就是这件事）。
+        skip_step "${what}" "这一格只在平台宿主上判（判词见上一行）"
+        record_cell "${t0}" "${wait0}" SKIP "${what}"
+        return 0
+    fi
     printf 'RED  %s\n' "${what}" >&2
     failures=$((failures + 1))
     record_cell "${t0}" "${wait0}" RED "${what}"

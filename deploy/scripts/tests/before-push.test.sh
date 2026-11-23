@@ -273,4 +273,71 @@ bare="$(git -C "${loc}/caller" rev-parse --is-bare-repository 2>/dev/null || ech
     fail "调用方那棵树被跑成了裸库（is-bare=${bare}），之后它里面每条 git 命令都会失败：$(tail -5 "${loc}/out")"
 echo "OK: 脚本测试手里的 git init --bare 落在自己的夹具上，调用方那棵树仍是工作树（rc=${rc}）"
 
+# 脚本自己的三态：0 绿、1 红、3「这一条没判」。现网判据（读集群的配额与占用）在没有
+# 集群凭据的宿主上只能退 3——「量不到」与「撞线了」在读数上必须分得开，而把 3 记成红，
+# 下一次真撞线时那一格与它逐字同形。这一格给它一条退 3 的夹具脚本，判词要落在
+# UNJUDGED 那一行，且不许同时出现 RED 那一行。
+three="${work}/three-way"
+mkdir -p "${three}/deploy/scripts/tests" "${three}/.github/workflows"
+stage_gate "${repo}" "${three}"
+cat >"${three}/deploy/scripts/tests/quota-like.test.sh" <<'SH'
+#!/usr/bin/env bash
+set -uo pipefail
+echo "quota-like: 这台机器上没有集群凭据，这一条没判。" >&2
+exit 3
+SH
+cat >"${three}/.github/workflows/ci.yml" <<'YAML'
+name: ci
+jobs:
+  repo-conventions:
+    steps:
+      - name: A step this gate can replay
+        run: bash -n deploy/scripts/check-before-push.sh
+YAML
+rc=0
+out="$(cd "${three}" && HOME="${work}/nohome" bash deploy/scripts/check-before-push.sh 2>&1)" || rc=$?
+case "${out}" in
+  *"UNJUDGED  deploy/scripts/tests/quota-like.test.sh"*) ;;
+  *) fail "退 3 的脚本没有被记成「没判」—— ${out}" ;;
+esac
+case "${out}" in
+  *"RED  deploy/scripts/tests/quota-like.test.sh"*) fail "退 3 的脚本被记成了红，量不到与撞线同形 —— ${out}" ;;
+  *) ;;
+esac
+echo "OK: 退 3 的脚本记成 UNJUDGED，不是红（rc=${rc}）"
+
+# 与退 3 相邻的第四种：格子自己说「这里不是判它的地方」（连不上集群这类位置事实）。
+# 它与退 3 的动作相反：退 3 要人去看，退 4 是换一台机器判。把它记成 UNJUDGED，每一次从
+# 开发机推送都会被一条只在平台宿主上存在的读数挡住；记成红，会把「不在判它的地方」说成
+# 「撞线了」。判词要落在 SKIP 那一行，且这一格不拦推送。
+four="${work}/four-way"
+mkdir -p "${four}/deploy/scripts/tests" "${four}/.github/workflows"
+stage_gate "${repo}" "${four}"
+cat >"${four}/deploy/scripts/tests/platform-only-like.test.sh" <<'SH'
+#!/usr/bin/env bash
+set -uo pipefail
+echo "platform-only-like: 本机连不上集群，这一格只在平台宿主上判。" >&2
+exit 4
+SH
+cat >"${four}/.github/workflows/ci.yml" <<'YAML'
+name: ci
+jobs:
+  repo-conventions:
+    steps:
+      - name: A step this gate can replay
+        run: bash -n deploy/scripts/check-before-push.sh
+YAML
+rc=0
+out="$(cd "${four}" && HOME="${work}/nohome" bash deploy/scripts/check-before-push.sh 2>&1)" || rc=$?
+case "${out}" in
+  *"SKIP  deploy/scripts/tests/platform-only-like.test.sh"*) ;;
+  *) fail "退 4 的脚本没有被记成「只在平台宿主上判」—— ${out}" ;;
+esac
+case "${out}" in
+  *"UNJUDGED  deploy/scripts/tests/platform-only-like.test.sh"*|*"RED  deploy/scripts/tests/platform-only-like.test.sh"*)
+      fail "退 4 的脚本被记成了没判或红，换地方与看现场同形 —— ${out}" ;;
+  *) ;;
+esac
+echo "OK: 退 4 的脚本记成 SKIP，不是没判、也不是红（rc=${rc}）"
+
 echo "before-push.test: all checks passed"

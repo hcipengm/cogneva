@@ -10,7 +10,8 @@
 #
 # 用例名（读数点它）：quota_covers_steady_state_plus_one_rollover
 #
-# 读不到就退 3（没判）：这台机器没配置集群时，「量不到」不是「够了」。
+# 连不上集群退 4：这一格只在平台宿主上判，开发机不是判它的地方。连上了却读不出来
+# 退 3（没判）——「量不到」不是「够了」，「这里不是判它的地方」也不是「没判成」。
 set -uo pipefail
 
 ns="${COGNEVA_NAMESPACE:-cogneva}"
@@ -21,8 +22,15 @@ ns="${COGNEVA_NAMESPACE:-cogneva}"
 # 集群明明就在，而三档里的「读不到」与「不够」被压成同一个红，量不到的那一格看起来
 # 像判过了。
 kubectl_cmd="${COGNEVA_KUBECTL:-sudo -n k3s kubectl}"
-command -v "${kubectl_cmd%% *}" >/dev/null 2>&1 || { echo "quota: 没有 ${kubectl_cmd%% *}，这一条没判。" >&2; exit 3; }
+command -v "${kubectl_cmd%% *}" >/dev/null 2>&1 ||
+    { echo "quota: 没有 ${kubectl_cmd%% *}，这一格只在平台宿主上判。" >&2; exit 4; }
 kube() { ${kubectl_cmd} "$@"; }
+
+# 「连不上集群」与「连上了但配额读不出来」是两件事：前者是这台机器不是判这一格的地方
+# （平台宿主判），后者是判了但没判成。前者退 4（这一格不在这里判），后者退 3（没判成）——
+# 两者都答不出「够了没有」，但动作相反：前者换地方，后者要人去看。
+kube version --request-timeout=5s >/dev/null 2>&1 ||
+    { echo "quota: 本机连不上集群，这一格只在平台宿主上判。" >&2; exit 4; }
 
 hard=$(kube -n "$ns" get quota cogneva-quota -o jsonpath='{.spec.hard.requests\.cpu}' 2>/dev/null) || exit 3
 used=$(kube -n "$ns" get quota cogneva-quota -o jsonpath='{.status.used.requests\.cpu}' 2>/dev/null) || exit 3
