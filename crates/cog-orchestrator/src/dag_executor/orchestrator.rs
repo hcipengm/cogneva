@@ -1911,7 +1911,8 @@ impl DagExecutor {
 
         // 与内存路径同一个判据：不能靠重跑清除的失败不给重试预算。两处调的是
         // 同一个函数，所以「同一个判据」是结构上成立的，不是靠两边都写对。
-        let max_retries = self.effective_max_retries(&error, cause, &task);
+        let max_retries =
+            self.effective_max_retries(&error, cause, task.error.as_deref());
         // 退避随任务一起落库，不留在调度循环的内存里：判定重试的进程与之后
         // 重新投递它的进程可能不是同一个。
         let retry_delay =
@@ -3273,7 +3274,7 @@ impl DagExecutor {
         &self,
         error: &str,
         cause: Option<UpstreamFailure>,
-        task: &Task,
+        previous: Option<&str>,
     ) -> u32 {
         if !Self::is_retryable_failure(error, cause) {
             return 0;
@@ -3284,8 +3285,7 @@ impl DagExecutor {
                 .join(" ")
                 .to_lowercase()
         };
-        eprintln!("PROBE effective_max_retries: previous={:?} incoming={:?}", task.error, error);
-        if let Some(previous) = task.error.as_deref() {
+        if let Some(previous) = previous {
             if normalize(previous) == normalize(error) {
                 return 0;
             }
@@ -3591,8 +3591,15 @@ impl DagExecutor {
         // 预算要读这一行**上一次**留下的失败原因（同样的失败再来一次不算新的一次），
         // 所以在把 `task` 借成可变之前先问。
         let max_retries = {
-            let task = inner.tasks.get(task_id).expect("task exists");
-            self.effective_max_retries(&error, cause, task)
+            // 上一次的失败从**重试史**里取：`task.error` 会被人工重试那条路改写，
+            // 而这一格只追加。比对基准丢了，「没变化」就会被读成「变了」
+            // （2026-11-24 实测：probe 两次都是 previous=None）。
+            let previous = inner
+                .retry_history
+                .get(task_id)
+                .and_then(|v| v.last())
+                .map(|a| a.error.clone());
+            self.effective_max_retries(&error, cause, previous.as_deref())
         };
 
         let task = inner.tasks.get_mut(task_id).expect("task exists");
