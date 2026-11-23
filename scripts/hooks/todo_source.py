@@ -134,7 +134,7 @@ _GAP_EMPTY = ("", "—", "-", "–")
 
 
 def _fixed_item(line: str, notouch: list[str], malformed: list[str],
-                legacy_status: list[str]) -> tuple[Item, bool] | None:
+                legacy_status: list[str], bad_status: list[str]) -> tuple[Item, bool] | None:
     """读一行五格台账。返回 (条目, 是否按未完成读)；不是这个形状时返回 None。
 
     「已落」只在差距那一格为空时才成立。写着已落却还留着差距的行，
@@ -159,9 +159,12 @@ def _fixed_item(line: str, notouch: list[str], malformed: list[str],
     if status not in _FIXED_STATUS:
         # 同一本台账里还有更早的几代 `| id | … | 状态 |` 四列表格，最后一格是自由文字
         # （「部分已落；剩余移交」）。它们的格数本就不足五格，在上一段里已经有名字。
-        # 到了这里还有五格以上、末格却不是状态词的行，是**五格行写坏了**：拒读并点名。
-        # 把写坏的当旧表略过，等于让一条待办整族地从每个批次里消失，而读数照样绿。
-        malformed.append(f"{cells[0]}（状态：{status[:16]}）")
+        # 末格不是状态词：同一本台账里还留着更早的几代表格（`| id | … | 状态 |`），
+        # 它们的最后一格是自由文字（「部分已落；剩余移交」）。按旧格式略过——但**不是
+        # 静默**：`_md_split` 结尾把条数与 id 一起印出来，否则一个打错的 `已落` 就变成
+        # 「这一条不存在」。拒读在这里是更坏的一档：一行历史表格会让整本台账一个门都
+        # 开不了（2026-11-23 实测：N04／S57／N38）。
+        legacy_status.append(f"{cells[0]}（{status[:16]}）")
         return None
     found = None
     for found in re.finditer(r"[｜|]\s*touches:\s*([^|｜\n]+)", line):
@@ -231,12 +234,12 @@ def _md_split(path: pathlib.Path) -> tuple[list[Item], list[Item]]:
         if not line.startswith("| S") and _FIXED_ROW.match(line):
             # 不是 S 序号的表：五格行、四列的旧表、以及写坏的行都从这里过一遍。
             # 旧表在 `_fixed_item` 里按旧格式略过（印计数），写坏的进 malformed 拒读。
-            item = _fixed_item(line, notouch, malformed, legacy_status)
+            item = _fixed_item(line, notouch, malformed, legacy_status, bad_status)
             if item is not None:
                 (debt if item[1] else out).append(item[0])
             continue
         if _FIXED_ROW.match(line) and len(cells) >= 5 and cells[-1] in _FIXED_STATUS:
-            item = _fixed_item(line, notouch, malformed, legacy_status)
+            item = _fixed_item(line, notouch, malformed, legacy_status, bad_status)
             if item is not None:
                 (debt if item[1] else out).append(item[0])
             continue

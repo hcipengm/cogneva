@@ -39,6 +39,20 @@ chmod +x "$tmp/psql.sh"
 export COGNEVA_TODO_SOURCE="md:$tree/ledger.md"
 export COGNEVA_EVENT_PSQL="$tmp/psql.sh"
 
+# 平台的批计划器替身：`open` 把这一批交给 `cogneva batch-plan` 判。这一族判的是
+# 「open 有没有问它、它说不时开不开得出来」；计划合不合格由 Rust 那一侧的用例判。
+cat >"$tmp/cogneva" <<STUB
+#!/bin/sh
+if [ "\$1" = "batch-plan" ]; then
+    cat >/dev/null
+    if [ -n "\${STUB_REFUSE:-}" ]; then echo '这一批不成立' >&2; exit 1; fi
+    exit 0
+fi
+exit 2
+STUB
+chmod +x "$tmp/cogneva"
+export COGNEVA_BIN="$tmp/cogneva"
+
 pass=0; fail=0
 ok()  { printf 'ok    - %s\n' "$1"; pass=$((pass + 1)); }
 bad() { printf 'FAIL- %s\n' "$1" >&2; fail=$((fail + 1)); }
@@ -56,8 +70,10 @@ git -C "$tree" add -A >/dev/null; git -C "$tree" commit -qm base
 out=$(run open); rc=$?
 { [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "CC01"; } && ok "open 钉住了这条五格行" || bad "open 没钉住（rc=$rc）：$out"
 out=$(run status); rc=$?
-{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "缺 差距" && ! printf '%s' "$out" | grep -q "缺 代码"; } \
-  && ok "未落的五格行：退 1，缺的是它自己那一格「差距」" \
+# 五格行的「还差什么」就是它自己那一格：status 直接印那一行的差距，不把三格的
+# 空位重新数一遍（三格的标签在这一行上根本不存在）。
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "余下一处" && ! printf '%s' "$out" | grep -q "缺 代码"; } \
+  && ok "未落的五格行：退 1，印出它自己那一格「差距」" \
   || bad "未落五格行的判词不对（rc=$rc）：$out"
 
 # 2. 已落＋空差距 ⇒ 终态，关得掉。

@@ -329,45 +329,6 @@ def open_round(spec: str | None, allow_open: bool = False, code_rev_override: st
         code_rev = _existing[2]
     if code_rev_override:
         code_rev = code_rev_override
-def batch_plan_holds(batch) -> None:
-    """把这一批交给平台的 planner 判一次：计划站不住就不开这一轮。
-
-    定批归 planner（默认全量、只按三条判据拆），固定程序判合格。这里只做转交与
-    判词透传；没有平台二进制就**开不了**——一个「没判过」的轮会被读成「判过了」。
-    """
-    binary = os.environ.get("COGNEVA_BIN") or shutil.which("cogneva")
-    if not binary:
-        raise todo_source.Unreadable(
-            "这一轮开不了：没有平台二进制（`COGNEVA_BIN` 或 PATH 上的 `cogneva`）。"
-            "定批与计划由 planner 判，Python 这一侧不再自己算一份"
-        )
-    payload = [
-        {
-            "id": i.id,
-            "title": i.title,
-            "touches": list(i.touches),
-            "item": {
-                "id": i.id,
-                "terminal": i.title,
-                "now": getattr(i, "now", ""),
-                "gap": getattr(i, "gap", ""),
-                "state": "未落",
-            },
-        }
-        for i in batch
-    ]
-    proc = subprocess.run(
-        [binary, "batch-plan"],
-        input=json.dumps(payload, ensure_ascii=False),
-        capture_output=True,
-        text=True,
-    )
-    if proc.returncode != 0:
-        raise todo_source.Unreadable(
-            f"这一批不成立，开不出轮：{proc.stderr.strip() or proc.returncode}"
-        )
-
-
     if round_book(source) == "git":
         repo = git_round_repo(source)
         # 读的那一侧按 default_spec 找书。两处不是同一个仓，写下的轮谁也读不到——
@@ -411,6 +372,46 @@ def batch_plan_holds(batch) -> None:
     )
     print(f"round: 书=事件流；开了一条 round_opened 事件（钉在台账仓 {rev[:12]}）；批次由那个 rev 现算。")
     return 0
+
+
+
+def batch_plan_holds(batch) -> None:
+    """把这一批交给平台的 planner 判一次：计划站不住就不开这一轮。
+
+    定批归 planner（默认全量、只按三条判据拆），固定程序判合格。这里只做转交与
+    判词透传；没有平台二进制就**开不了**——一个「没判过」的轮会被读成「判过了」。
+    """
+    binary = os.environ.get("COGNEVA_BIN") or shutil.which("cogneva")
+    if not binary:
+        raise todo_source.Unreadable(
+            "这一轮开不了：没有平台二进制（`COGNEVA_BIN` 或 PATH 上的 `cogneva`）。"
+            "定批与计划由 planner 判，Python 这一侧不再自己算一份"
+        )
+    payload = [
+        {
+            "id": i.id,
+            "title": i.title,
+            "touches": list(i.touches),
+            "item": {
+                "id": i.id,
+                "terminal": i.title,
+                "now": getattr(i, "now", ""),
+                "gap": getattr(i, "gap", ""),
+                "state": "未落",
+            },
+        }
+        for i in batch
+    ]
+    proc = subprocess.run(
+        [binary, "batch-plan"],
+        input=json.dumps(payload, ensure_ascii=False),
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise todo_source.Unreadable(
+            f"这一批不成立，开不出轮：{proc.stderr.strip() or proc.returncode}"
+        )
 
 
 def remaining() -> list[str]:

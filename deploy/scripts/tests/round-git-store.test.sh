@@ -46,6 +46,21 @@ chmod +x "$tmp/tripwire.sh"
 export COGNEVA_TODO_SOURCE="md:$tree/ledger.md"
 export COGNEVA_EVENT_PSQL="$tmp/tripwire.sh"
 
+# 平台的批计划器替身。`open` 现在把这一批交给 `cogneva batch-plan` 判：这一族
+# 判的是「open 有没有问它、它说不时开不开得出来」，所以替身只答这两件事。
+# 真正的计划合不合格由 Rust 那一侧的用例判，不在这里造第二份。
+cat >"$tmp/cogneva" <<STUB
+#!/bin/sh
+if [ "\$1" = "batch-plan" ]; then
+    cat >/dev/null
+    if [ -n "\${STUB_REFUSE:-}" ]; then echo '这一批不成立' >&2; exit 1; fi
+    exit 0
+fi
+exit 2
+STUB
+chmod +x "$tmp/cogneva"
+export COGNEVA_BIN="$tmp/cogneva"
+
 run() { python3 "$tree/scripts/hooks/round.py" "$@" 2>&1; }
 
 # 1. 开一轮：清单写进 ref。
