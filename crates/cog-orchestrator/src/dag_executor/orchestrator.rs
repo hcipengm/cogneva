@@ -5532,6 +5532,10 @@ mod tests {
         fn live_reads(&self) -> usize {
             self.live_reads.load(std::sync::atomic::Ordering::Relaxed)
         }
+        fn task_reads_taken(&self) -> usize {
+            self.task_reads_taken
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
     }
 
     #[async_trait::async_trait]
@@ -7772,6 +7776,177 @@ mod tests {
         fn any(&self, needle: &str) -> bool {
             self.said().iter().any(|line| line.contains(needle))
         }
+    }
+
+    /// 只记下「撤过哪一行」的告警落点。
+    ///
+    /// 这一族里「撤掉」是唯一不可逆的一步：撤了，下一趟的采纳看不到它，它再也不会
+    /// 以原来那个理由响回来。所以这一面判的是它**没被**调过。
+    #[derive(Default)]
+    struct ResolveLog(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    #[async_trait::async_trait]
+    impl cog_core::PersistentAlertSink for ResolveLog {
+        async fn set_persistent_alert(
+            &self,
+            condition: bool,
+            draft: &cog_core::PersistentAlertDraft,
+        ) -> Result<cog_core::AlertTransition, String> {
+            if !condition {
+                self.0.lock().unwrap().push(draft.dedup_key.clone());
+            }
+            Ok(cog_core::AlertTransition::NoChange)
+        }
+
+        async fn list_active_persistent_alerts(
+            &self,
+            _rule_prefix: &str,
+            _limit: i64,
+        ) -> Vec<cog_core::PersistedAlert> {
+            Vec::new()
+        }
+    }
+
+    /// 归属核对读不到那一行：三条出路各说各的话。
+    ///
+    /// 别人的行 ⇒ 丢掉并 ack；自己的行 ⇒ 照常往下走；读不到 ⇒ **不 ack**。
+    /// 第三条是最要紧的那条：ack 是唯一不可逆的一步，ack 之后这条结果再也不会
+    /// 被重投。折成「不是别的单元的」让它照常应用，是替别人把工作做掉；折成
+    /// 「是别的单元的」直接丢，是把别人的结果扔掉。
+    #[tokio::test]
+    async fn a_result_whose_owner_cannot_be_read_is_left_for_redelivery() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag = Arc::new(
+            DagExecutor::new("ws-owner-unreadable".into()).with_state_backend(backend.clone()),
+        );
+        let runtime = crate::dag_executor::DagExecutorRuntime::new_with_backend(
+            crate::dag_executor::DagExecutorConfig {
+                redis_url: "memory".into(),
+                workspace_id: "ws-owner-unreadable".into(),
+                consumer_group: "grp-owner-unreadable".into(),
+                max_retries: 1,
+                ..Default::default()
+            },
+            cog_test_support::MemoryMessageBackend::new(),
+        )
+        .with_orchestrator(dag.clone());
+
+        // 行真的在那儿，而且真是别人的：这一问要拦的正是它。
+        let mut row = Task::new("t-unread", TaskType::DagNode, serde_json::json!({}));
+        row.owner_unit = Some("unit-8b".into());
+        backend.tasks.lock().await.push(row);
+
+        let warns = warn_text();
+        let body = serde_json::to_vec(&cog_core::DagMessage::TaskComplete {
+            message_id: "m-1".into(),
+            timestamp: chrono::Utc::now(),
+            task_id: "t-unread".into(),
+            result: serde_json::json!({"ok": true}),
+            sender: "unit-8b".into(),
+            recipient: "executor".into(),
+        })
+        .expect("这条消息按契约写得出来");
+        backend
+            .task_read_fail_on
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        runtime
+            .handle_result_message("results:ws-owner-unreadable", "grp-owner-unreadable", "m-1", &body)
+            .await;
+
+        assert!(
+            warns
+                .any("cannot read the task this result names; leaving it for redelivery"),
+            "读不到就要说出来，调用方凭这一行知道它被留着重投：{:?}",
+            warns.said()
+        );
+        assert_eq!(
+            backend.task_reads_taken(),
+            1,
+            "读不到之后再读第二次，就是把它当成「没有这一行」照常往下走了"
+        );
+        assert_eq!(
+            backend.tasks.lock().await[0].status,
+            TaskStatus::Pending,
+            "结果没有被写进那一行"
+        );
+    }
+
+    /// 告警收口读不到父行：这一趟跳过它，不把它读成「任务已经不在了」。
+    ///
+    /// 「行真的没了」与「读不出来」在返回值上同形，而收掉一条正在响的告警是这一趟
+    /// 里唯一不可逆的决定——下一趟的采纳不会再看到它。
+    #[tokio::test]
+    async fn an_alert_whose_parent_cannot_be_read_keeps_firing() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag = Arc::new(
+            DagExecutor::new("ws-alert-unreadable".into()).with_state_backend(backend.clone()),
+        );
+        let log = Arc::new(ResolveLog::default());
+        let sink: Arc<dyn cog_core::PersistentAlertSink> = log.clone();
+        let key = "decomposition_wbs:goal-1:t-1".to_string();
+        let mut firing = HashMap::new();
+        firing.insert(
+            key.clone(),
+            crate::dag_executor::OrphanWatch {
+                parent_id: "t-parent".into(),
+                goal_id: Some("goal-1".into()),
+                resolve_after: chrono::Utc::now() - chrono::Duration::minutes(1),
+            },
+        );
+
+        let warns = warn_text();
+        backend
+            .task_read_fail_on
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        crate::dag_executor::orphan_reconcile_tick(
+            &dag,
+            Some(&sink),
+            &chrono::Duration::minutes(30),
+            &chrono::Duration::minutes(5),
+            &mut firing,
+        )
+        .await;
+
+        assert!(
+            warns.any("cannot read the task this alert watches"),
+            "读不出来要自己说出来：{:?}",
+            warns.said()
+        );
+        assert!(
+            log.0.lock().unwrap().is_empty(),
+            "读不到不是「任务没了」：这一条告警不能被收掉"
+        );
+        assert!(
+            firing.contains_key(&key),
+            "它还在响，下一趟就该还看得见它"
+        );
+    }
+
+    /// WBS 判词重算读不到整份行表：判词维持原样，不下「不再成立」的结论。
+    ///
+    /// 空计划与读不出来在返回值上同形，而「不再成立」会让下一段把告警撤掉。
+    #[tokio::test]
+    async fn a_wbs_verdict_that_cannot_read_the_rows_stands() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag =
+            Arc::new(DagExecutor::new("ws-wbs-unreadable".into()).with_state_backend(backend.clone()));
+
+        let warns = warn_text();
+        backend
+            .all_read_fails
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let no_longer_holds =
+            crate::dag_executor::wbs_verdict_no_longer_holds(&dag, Some("goal-1")).await;
+
+        assert!(
+            !no_longer_holds,
+            "读不到行表时不能答「判词不再成立」：那会撤掉一条仍然成立的告警"
+        );
+        assert!(
+            warns.any("cannot read the rows to re-check a WBS verdict"),
+            "读不出来要自己说出来，不能借用「没有行」那条返回值：{:?}",
+            warns.said()
+        );
     }
 
     /// 清扫读不到自己那份行表时，说的是「这一趟没看见」，不是「没有要收的行」。

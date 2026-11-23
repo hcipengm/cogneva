@@ -30,6 +30,7 @@ const LIB: &str = "crates/cog-gateway/src/lib.rs";
 const EXECUTOR: &str = "crates/cog-gateway/src/executor.rs";
 const REBALANCER: &str = "crates/cog-supervisor/src/task_rebalancer.rs";
 const DAG_EXECUTOR: &str = "crates/cog-orchestrator/src/dag_executor/orchestrator.rs";
+const DAG_CONSUMER: &str = "crates/cog-orchestrator/src/dag_executor/mod.rs";
 
 /// 折叠过的那几条读。某一段正文里出现它们，就是那一面在替没读到的图作证。
 const FOLDED: &[&str] = &[
@@ -253,6 +254,24 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "get_task_checked",
         "读不到被读成「这一行不在了」，目标行永远停在 Pending 而没人知道为什么",
     ),
+    (
+        DAG_CONSUMER,
+        "async fn result_names_another_owner",
+        "get_task_checked",
+        "读不到被读成「不是别的单元的」，别人的结果被照常应用",
+    ),
+    (
+        DAG_CONSUMER,
+        "async fn orphan_reconcile_tick",
+        "get_task_checked",
+        "读不到被读成「任务已经不在了」，一条正在响的告警被收掉",
+    ),
+    (
+        DAG_CONSUMER,
+        "async fn wbs_verdict_no_longer_holds",
+        "all_tasks_checked",
+        "读不到被读成「没有行」，一条仍然成立的判词被撤掉",
+    ),
 ];
 
 #[test]
@@ -270,6 +289,7 @@ fn every_surface_that_draws_the_graph_keeps_the_failure() {
         EXECUTOR,
         REBALANCER,
         DAG_EXECUTOR,
+        DAG_CONSUMER,
     ] {
         productions.insert(file, production_text(&read_repo(file)));
     }

@@ -1729,8 +1729,8 @@ impl DagExecutorRuntime {
     /// restaffing pass wrote onto the row -- is the one that has the result.
     /// Asking [`crate::ready_queue::carries_an_owner`] rather than testing the
     /// lane again keeps this check and the two dispatch gates on one answer.
-    async fn result_names_another_owner(&self, task_id: &str, sender: &str) -> bool {
-        match self.orchestrator.get_task(task_id).await {
+    async fn result_names_another_owner(&self, task_id: &str, sender: &str) -> SFResult<bool> {
+        Ok(match self.orchestrator.get_task_checked(task_id).await? {
             Some(task) if crate::ready_queue::carries_an_owner(&task) => {
                 match task.owner_unit.as_deref() {
                     Some(owner) => owner != sender,
@@ -1741,7 +1741,7 @@ impl DagExecutorRuntime {
             // An unknown task is not this check's business: the transition
             // below rejects it on its own terms, with its own log line.
             None => false,
-        }
+        })
     }
 
     async fn handle_result_message(
@@ -1790,13 +1790,26 @@ impl DagExecutorRuntime {
                 sender,
                 ..
             } => {
-                if self.result_names_another_owner(&task_id, &sender).await {
-                    tracing::warn!(
-                        task_id = %task_id, sender = %sender, msg_id = %msg_id,
-                        "result message names a task owned by another unit; dropping it"
-                    );
-                    self.ack_result(result_stream, group_name, msg_id).await;
-                    return;
+                match self.result_names_another_owner(&task_id, &sender).await {
+                    Ok(true) => {
+                        tracing::warn!(
+                            task_id = %task_id, sender = %sender, msg_id = %msg_id,
+                            "result message names a task owned by another unit; dropping it"
+                        );
+                        self.ack_result(result_stream, group_name, msg_id).await;
+                        return;
+                    }
+                    Ok(false) => {}
+                    // 读不到就判不了「这一行是不是别人的」。丢是唯一不可逆的那一步
+                    // ——ack 之后这条结果再也不会回来——所以不 ack，让重投再来一次：
+                    // 与本函数下面 `complete_task` 的其它错误同一处置。
+                    Err(e) => {
+                        tracing::warn!(
+                            task_id = %task_id, sender = %sender, msg_id = %msg_id,
+                            "cannot read the task this result names; leaving it for redelivery: {e}"
+                        );
+                        return;
+                    }
                 }
                 match self
                     .orchestrator
@@ -1841,13 +1854,23 @@ impl DagExecutorRuntime {
                 sender,
                 ..
             } => {
-                if self.result_names_another_owner(&task_id, &sender).await {
-                    tracing::warn!(
-                        task_id = %task_id, sender = %sender, msg_id = %msg_id,
-                        "failure message names a task owned by another unit; dropping it"
-                    );
-                    self.ack_result(result_stream, group_name, msg_id).await;
-                    return;
+                match self.result_names_another_owner(&task_id, &sender).await {
+                    Ok(true) => {
+                        tracing::warn!(
+                            task_id = %task_id, sender = %sender, msg_id = %msg_id,
+                            "failure message names a task owned by another unit; dropping it"
+                        );
+                        self.ack_result(result_stream, group_name, msg_id).await;
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            task_id = %task_id, sender = %sender, msg_id = %msg_id,
+                            "cannot read the task this failure names; leaving it for redelivery: {e}"
+                        );
+                        return;
+                    }
                 }
                 match self
                     .orchestrator
@@ -2357,7 +2380,19 @@ async fn orphan_reconcile_tick(
         if now < watch.resolve_after {
             continue;
         }
-        let task = orchestrator.get_task(&watch.parent_id).await;
+        // 读不到父行时不能把这一条当成「任务已经不在了」收掉：那正是这一族
+        // 的缺陷——读失败与「行真的没了」在返回值上同形，而收掉一条正在响的
+        // 告警是这一趟里唯一不可逆的决定。这一趟跳过它，下一趟再问。
+        let task = match orchestrator.get_task_checked(&watch.parent_id).await {
+            Ok(task) => task,
+            Err(e) => {
+                tracing::warn!(
+                    alert = %key, parent = %watch.parent_id,
+                    "cannot read the task this alert watches; it keeps firing this pass: {e}"
+                );
+                continue;
+            }
+        };
         // An anchor is re-filed every round and never settles, so it is not a
         // placeholder anything is waiting on: retire the row rather than leave
         // it firing on a verdict -- "nothing will ever finish this" -- that is
@@ -2429,9 +2464,20 @@ async fn wbs_verdict_no_longer_holds(
     let Some(goal_id) = goal_id else {
         return false;
     };
-    let plan: Vec<cog_core::AtomicTask> = orchestrator
-        .get_all_tasks()
-        .await
+    // 行表读不出来时不能答「判词不再成立」：那会把一条仍然成立的告警撤掉，
+    // 而撤掉是这一趟里唯一不可逆的一步。也答不出「成立」以外的第三种答案，
+    // 所以这一趟维持原样、把读失败说出来，下一趟再判。
+    let rows = match orchestrator.all_tasks_checked().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                goal_id = %goal_id,
+                "cannot read the rows to re-check a WBS verdict; it stands this pass: {e}"
+            );
+            return false;
+        }
+    };
+    let plan: Vec<cog_core::AtomicTask> = rows
         .iter()
         .filter(|task| task.goal_id.as_deref() == Some(goal_id))
         .map(|task| cog_core::AtomicTask {
@@ -3377,20 +3423,23 @@ mod consumer_ack_tests {
         assert!(
             !runtime
                 .result_names_another_owner("task-lane", "unit-8b")
-                .await,
+                .await
+                .expect("读得到的时候这一问没有第二种答案"),
             "the lane's whole point is that whoever is free runs it, so that \
              unit's result is the row's result"
         );
         assert!(
             runtime
                 .result_names_another_owner("task-plain", "unit-8b")
-                .await,
+                .await
+                .expect("读得到的时候这一问没有第二种答案"),
             "outside the lane the owner check still refuses a stranger's result"
         );
         assert!(
             !runtime
                 .result_names_another_owner("task-plain", "unit-f5")
-                .await,
+                .await
+                .expect("读得到的时候这一问没有第二种答案"),
             "and the owner's own result is still accepted"
         );
     }
