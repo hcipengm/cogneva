@@ -95,14 +95,14 @@ impl EvaluatorActor {
                     })
                 })
                 .collect::<Vec<_>>(),
-            "instructions": "For each item, judge the terminal description alone: (1) is it a \
-                description of a finished state, not of an activity; (2) can a reader tell from \
-                evidence whether it holds; (3) is it what the goal asks for. Answer one JSON \
-                object: {\"verdicts\": [{\"id\": \"...\", \"ok\": true|false, \"reason\": \"...\"}]}. \
-                A terminal that is not one of the three is not ok, and the reason names which. \
-                Also say not ok when the \"now\" cell names no place it was read from (a test, a \
-                reading, a file and line, or the missing input): a now that names nothing is an \
-                impression, and an impression cannot tell you how far the terminal still is.",
+            "instructions": "Judge against this run's working tree, not against the prose alone: \
+                read the files the terminal and the now cell name (read_file) before you answer, \
+                and judge (1) whether the terminal describes a finished state rather than an \
+                activity, (2) whether what you actually read makes it hold, (3) whether it is \
+                what the goal asks for. Answer one JSON object: {\"verdicts\": [{\"id\": \"...\", \
+                \"ok\": true|false, \"reason\": \"...\"}]}. The reason says what you read: a file and \
+                what it showed, or that you could not read it - an item you could not check is \
+                not ok, because \"could not look\" and \"looked and it holds\" cannot read the same.",
         });
         let task = Task::new(
             "criterion-review",
@@ -715,6 +715,81 @@ mod tests {
         }
     }
 
+
+    /// 判据审现在要**去树上取证**：它读终态与「现在」点名的文件，判词说它读到了什么。
+    ///
+    /// 这条钉的是请求的形状，不是模型的判断：请求里必须出现「读这一轮的工作树」与
+    /// 「读不出来就不算通过」。没有这两句，判词只能对着描述说，而描述与树是两件事。
+    #[tokio::test]
+    async fn the_review_asks_the_judge_to_read_the_tree() {
+        use std::sync::{Arc, Mutex};
+        struct Recorder(Arc<Mutex<Vec<String>>>);
+        #[async_trait::async_trait]
+        impl cog_core::Agent for Recorder {
+            async fn prompt(&self, input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(input.get("instructions").and_then(|v| v.as_str()).unwrap_or("").to_string());
+                Ok(serde_json::json!({"verdicts": []}))
+            }
+            async fn start(&self) {}
+            async fn snapshot(&self, _t: String) -> cog_core::SFResult<cog_core::snapshot::AgentCheckpoint> {
+                Err(cog_core::SFError::NotImplemented("snapshot".into()))
+            }
+            async fn restore(&self, _s: &cog_core::snapshot::AgentCheckpoint) -> cog_core::SFResult<()> {
+                Ok(())
+            }
+            async fn continue_(&self, input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
+                Ok(input)
+            }
+            async fn steer(&self, _i: String) -> cog_core::SFResult<()> { Ok(()) }
+            async fn abort(&self) -> cog_core::SFResult<()> { Ok(()) }
+            async fn reset(&self) -> cog_core::SFResult<()> { Ok(()) }
+            async fn state(&self) -> cog_core::SFResult<cog_core::AgentState> {
+                Err(cog_core::SFError::NotImplemented("state".into()))
+            }
+            async fn wait_for_idle(&self) -> cog_core::SFResult<()> { Ok(()) }
+            async fn restore_from_id(&self, _c: &str) -> cog_core::SFResult<()> { Ok(()) }
+            fn subscribe(&self) -> tokio::sync::broadcast::Receiver<cog_core::AgentEvent> {
+                let (_tx, rx) = tokio::sync::broadcast::channel(1);
+                rx
+            }
+            async fn chat_stream(&self, _m: &[cog_core::Message], _o: &cog_core::ChatOptions)
+                -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+                Err(cog_core::SFError::NotImplemented("chat_stream".into()))
+            }
+            async fn complete_stream(&self, _p: &str, _o: &cog_core::CompleteOptions)
+                -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+                Err(cog_core::SFError::NotImplemented("complete_stream".into()))
+            }
+            async fn read_board(&self, _t: &str, _f: &str) -> cog_core::SFResult<Option<String>> { Ok(None) }
+            async fn write_board(&self, _t: &str, _f: &str, _v: &str) -> cog_core::SFResult<()> { Ok(()) }
+            async fn receive_message(&self, _m: cog_core::InboxMessage) -> cog_core::SFResult<()> { Ok(()) }
+            async fn review_and_revise(&self, output: &str, _c: &cog_core::SelfReviewConfig)
+                -> cog_core::SFResult<(String, cog_core::SelfReviewResult)> {
+                Ok((output.to_string(), cog_core::SelfReviewResult::Pass { score: 0.9, summary: "ok".into() }))
+            }
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let evaluator = EvaluatorActor::new(Arc::new(Recorder(seen.clone())));
+        use cog_core::contract::ledger_item::{LedgerItem, LedgerState};
+        let items = vec![LedgerItem {
+            id: "N1".into(),
+            terminal: "窗口里每一轮都带着它需要的全部".into(),
+            now: "还没做".into(),
+            gap: "缺的是：地板外置".into(),
+            state: LedgerState::Open,
+        }];
+        let _ = evaluator.review_criteria("把上下文做对", &items).await;
+        let instructions = seen.lock().unwrap().join("\n");
+        assert!(instructions.contains("working tree"), "请求里没让它去读树：{instructions}");
+        assert!(instructions.contains("read_file"), "请求里没让它读文件：{instructions}");
+        assert!(
+            instructions.contains("not ok"),
+            "请求里没写「读不出来就不算通过」：{instructions}"
+        );
+    }
 
     fn generation_with_diff(diff: &str) -> serde_json::Value {
         serde_json::json!({
