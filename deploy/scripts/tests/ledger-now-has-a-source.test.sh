@@ -7,8 +7,7 @@
 # 写不出出处的那一格不是「现在」，是一句印象——而印象与读数在台账里长得一样，
 # 于是「没读」会被当成「读了、没变化」。
 #
-# 存量只许减：真实台账里今天还有 N 行没有出处，这个数钉在下面，**只许往下走**。
-# 每改好一行就把这个数减一；涨上去就红。数字不是目标，是棘轮。
+# 不是棘轮：真实台账里**一行**没有出处就红。
 set -uo pipefail
 root=$(git rev-parse --show-toplevel)
 loader="$root/scripts/hooks/todo_source.py"
@@ -42,7 +41,7 @@ PY
 printf '%s' "$out" | grep -q "WRONG \[\]" \
     && ok "带外的判词与夹具一致（出处／没出处各判对）" || bad "带外判词与夹具不一致：$out"
 
-# 2. 棘轮：真实台账里没有出处的未完成行，不得超过下面这个数。
+# 2. 真实台账：没有出处的未完成行必须为 0。
 ledger="${COGNEVA_TODO_LEDGER:-}"
 if [ -z "$ledger" ]; then
   host="$HOME/.config/cogneva/todo-ledger"
@@ -60,12 +59,10 @@ items = m.load("md:" + sys.argv[2])
 print(sum(1 for i in items if not m.now_has_source(getattr(i, "now", ""))))
 PY
 )
-  # 2026-11-23 实测：78 条未完成里有 63 条没写出处。只许减。
-  max_unsourced=63
-  if [ "${unsourced:-0}" -le "$max_unsourced" ]; then
-    ok "没有出处的未完成行 ${unsourced} 条，不超过棘轮 ${max_unsourced}"
+  if [ "${unsourced:-1}" -eq 0 ]; then
+    ok "每一条未完成行的「现在」都写出了处"
   else
-    bad "没有出处的未完成行涨到 ${unsourced} 条（棘轮 ${max_unsourced}）：先把新写的那些补上出处，或把棘轮往下调"
+    bad "还有 ${unsourced} 条未完成行的「现在」没写出处：那一格不是「现在」，是一句印象"
   fi
 fi
 
