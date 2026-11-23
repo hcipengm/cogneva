@@ -71,6 +71,7 @@ impl EvaluatorActor {
     /// 这是「终态写得对不对」的**他律**：写终态的与审终态的不是同一次调用。
     /// 它不看树、不判完成，所以很便宜：两段文字进，一串判词出。答不出判词的
     /// 条目按**不成立**读——判不了不是通过。
+    // prompt: contract — enforced by crates/cog-collaboration/src/actors/evaluator.rs::the_review_asks_the_judge_to_read_the_tree
     pub async fn review_criteria(
         &self,
         goal: &str,
@@ -80,7 +81,6 @@ impl EvaluatorActor {
         if items.is_empty() {
             return Vec::new();
         }
-        // prompt: consumed by crates/cog-collaboration/src/actors/evaluator.rs::review_criteria
         let payload = serde_json::json!({
             "goal": goal,
             "items": items
