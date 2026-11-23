@@ -248,8 +248,6 @@ jobs:
         run: bash deploy/scripts/tests/manifest-duplicate-keys.test.sh
       # 批次纪律那四道门各自的判据，在 CI 与本机跑同一份夹具：本机绿而 CI 红过一次
       # （或者反过来），说明判据在两边不是同一条。
-      - name: Check the batch gate judges what it claims
-        run: bash deploy/scripts/tests/batch-gate.test.sh
       - name: Check the compile-discipline gate judges what it claims
         run: bash deploy/scripts/tests/compile-discipline.test.sh
       - name: Check the ledger reader refuses a row it cannot judge

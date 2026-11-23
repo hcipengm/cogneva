@@ -642,7 +642,7 @@ mod tests {
                 PlanAcceptance {
                     shape: "平台的变更账本".into(),
                     statement: "pending 条目被逐条点名".into(),
-                    check: "scripts/hooks/batch-gate.py --source change-ledger".into(),
+                    check: "cogneva ledger gate".into(),
                 },
             ],
             counterexamples: vec!["子集被当成默认批次".into()],
