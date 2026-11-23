@@ -493,7 +493,15 @@ def status() -> int:
                                            capture_output=True, text=True).stdout.strip())
     except OSError:
         tree = pathlib.Path(".")
-    print(f"round: 下一步 —— {next_step(tree)}")
+    # 下一步由平台的 `ledger next` 算（同一套读数：台账、工作树、编译账）。没有二进制
+    # 就说「量不到」——这一侧不再自己算一份，两份算法迟早各说各的。
+    binary = os.environ.get("COGNEVA_BIN") or shutil.which("cogneva")
+    if binary:
+        proc = subprocess.run([binary, "ledger", "next"], capture_output=True, text=True)
+        step = (proc.stdout.strip() or proc.stderr.strip() or "量不到").removeprefix("ledger: ")
+        print(f"round: 下一步 —— {step}")
+    else:
+        print("round: 下一步 —— 量不到（没有平台二进制：`COGNEVA_BIN` 或 PATH 上的 `cogneva`）")
     return 0 if terminal == len(left) else 1
 
 
