@@ -13,6 +13,10 @@
 
 use std::path::PathBuf;
 
+/// 「这一批真有这么大」那本读数在哪。名字只写一次：读的人与写的人各拼一遍，
+/// 改名时只改一处不会有任何东西红，只让那一侧永远读一个没人写的名字。
+const CLOSED_ROUNDS_ENV: &str = "COGNEVA_CLOSED_ROUNDS";
+
 /// 这台机器上这一本台账在哪。
 pub fn ledger_path() -> Result<PathBuf, String> {
     for key in ["COGNEVA_TODO_SOURCE", "COGNEVA_TODO_LEDGER"] {
@@ -545,7 +549,7 @@ fn touches_by_id(text: &str) -> std::collections::HashMap<String, Vec<String>> {
 /// 读不到就是 `None`（量不到），不是 0。
 fn closed_batch_bound() -> Option<usize> {
     let path = std::path::PathBuf::from(
-        std::env::var("COGNEVA_CLOSED_ROUNDS").unwrap_or_else(|_| {
+        std::env::var(CLOSED_ROUNDS_ENV).unwrap_or_else(|_| {
             format!("{}/.local/state/cogneva/rounds-closed.tsv", home())
         }),
     );
@@ -1019,7 +1023,7 @@ pub fn close() -> i32 {
         .to_string();
     let line = closed_round_line(&now, &first_rev, &batch);
     let ledger_path_file = std::path::PathBuf::from(
-        std::env::var("COGNEVA_CLOSED_ROUNDS").unwrap_or_else(|_| {
+        std::env::var(CLOSED_ROUNDS_ENV).unwrap_or_else(|_| {
             format!("{}/.local/state/cogneva/rounds-closed.tsv", home())
         }),
     );
