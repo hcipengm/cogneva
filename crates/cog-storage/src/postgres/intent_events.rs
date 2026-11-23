@@ -12,14 +12,10 @@ use async_trait::async_trait;
 use chrono::Utc;
 use sqlx::{PgPool, Row};
 
-use cog_core::contract::intent_events::{IntentEvents, IntentReader, IntentRow, INTENT_RECEIVED};
+use cog_core::contract::intent_events::{
+    IntentEvents, IntentReader, IntentRow, INTENT_ID_KEY, INTENT_RECEIVED,
+};
 use cog_core::{SFError, SFResult};
-
-/// 任务行上带着「它是从哪条意图派生的」的那个键。
-///
-/// 与 `ITEM_INPUT_KEY` 同一个道理：写它的人（planner 派生的任务）与读它的人（收件台
-/// 判「处理过没有」）各拼一次字面量就会漂，所以名字只在这里出现一次。
-pub const INTENT_ID_KEY: &str = "intent_id";
 
 const INSERT_SQL: &str = "\
 INSERT INTO cogneva_event (\

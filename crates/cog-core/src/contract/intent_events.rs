@@ -14,6 +14,12 @@ use crate::SFResult;
 /// 意图这一族的 kind。闭集里的一个词。
 pub const INTENT_RECEIVED: &str = "intent_received";
 
+/// 任务行上带着「它是从哪条意图派生的」的那个键。
+///
+/// 写它的人（planner 派生的任务）与读它的人（收件台判「处理过没有」）各拼一次
+/// 字面量就会漂，所以名字只在这里出现一次：存储侧与协作侧都读它。
+pub const INTENT_ID_KEY: &str = "intent_id";
+
 /// 一条进门时的意图行。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntentRow {

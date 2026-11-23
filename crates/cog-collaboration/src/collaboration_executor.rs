@@ -1640,6 +1640,12 @@ impl CollaborationExecutor {
                     match task.input.as_object_mut() {
                         Some(obj) => {
                             obj.insert(ITEM_INPUT_KEY.to_string(), value);
+                            // 这条任务是从哪条意图派生的：收件台靠它判「处理过没有」。
+                            // 待办的 id 就是意图的身份（planner 按 `identity` 命名）。
+                            obj.insert(
+                                cog_core::contract::intent_events::INTENT_ID_KEY.to_string(),
+                                serde_json::Value::String(item.id.clone()),
+                            );
                         }
                         None => {
                             task.input = serde_json::json!({ ITEM_INPUT_KEY: value });
