@@ -77,6 +77,114 @@ impl LedgerItem {
     }
 }
 
+/// 台账里的一条行是不是这一族的：`| S12 |`、`| N01 |`、`| S20.7 |` 都算。
+fn is_ledger_row(line: &str) -> bool {
+    let mut rest = line.trim_start();
+    let Some(after) = rest.strip_prefix('|') else {
+        return false;
+    };
+    rest = after.trim_start();
+    let mut chars = rest.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    let digits: String = rest
+        .chars()
+        .skip_while(|c| c.is_ascii_alphabetic())
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    if digits.is_empty() || digits.ends_with('.') {
+        return false;
+    }
+    rest.trim_start_matches(|c: char| c.is_ascii_alphabetic())
+        .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.')
+        .trim_start()
+        .starts_with('|')
+}
+
+/// 一行台账的格子（去掉首尾的竖线后按 `|` 切）。`｜` 是全角的，不切。
+fn cells_of(line: &str) -> Vec<String> {
+    line.trim()
+        .trim_matches('|')
+        .split('|')
+        .map(|c| c.trim().to_string())
+        .collect()
+}
+
+/// 「差距」那一格：把行尾的 `｜ touches: …` 切掉，剩下的才是差距。
+fn gap_of(cell: &str) -> String {
+    match cell.find('｜') {
+        Some(at) if cell[at..].trim_start_matches('｜').trim_start().starts_with("touches:") => {
+            cell[..at].trim().to_string()
+        }
+        _ => match cell.find("| touches:") {
+            Some(at) => cell[..at].trim().to_string(),
+            None => cell.trim().to_string(),
+        },
+    }
+}
+
+/// 读一整本台账。**两种行形状都读**，形状由格子里的内容判，不由序号前缀判：
+///
+/// - 五格 `| 序号 | 终态 | 现在 | 差距 | 状态 |`：最后一格是状态词；
+/// - 旧三格 `| S… | 描述 | 状态 | …`：第三格是状态词（搬迁前的写法还在用）。
+///
+/// 读不出的行**点名拒掉**，不静默跳过：一行被丢掉之后，它既不在批次里、也不在任何
+/// 读数里，而「它不在」与「它做完了」在读的人眼里是同一件事。
+pub fn parse_md(text: &str) -> Result<Vec<LedgerItem>, String> {
+    let mut out = Vec::new();
+    let mut bad: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if !is_ledger_row(line) {
+            continue;
+        }
+        let cells = cells_of(line);
+        if cells.len() >= 5 {
+            if let Some(state) = LedgerState::parse(cells.last().map(String::as_str).unwrap_or("")) {
+                let gap = gap_of(&cells[3]);
+                if state == LedgerState::Reached && EMPTY_GAP.contains(&gap.trim()) {
+                    continue; // 终态真的到了：不进批次。
+                }
+                out.push(LedgerItem {
+                    id: cells[0].clone(),
+                    terminal: cells[1].clone(),
+                    now: cells[2].clone(),
+                    gap,
+                    state,
+                });
+                continue;
+            }
+            if !cells[0].starts_with('S') {
+                bad.push(format!("{}（状态：{}）", cells[0], cells.last().cloned().unwrap_or_default()));
+                continue;
+            }
+        }
+        if cells.len() >= 3 {
+            if let Some(state) = LedgerState::parse(&cells[2]) {
+                out.push(LedgerItem {
+                    id: cells[0].clone(),
+                    terminal: cells[1].clone(),
+                    now: String::new(),
+                    gap: String::new(),
+                    state,
+                });
+                continue;
+            }
+        }
+        bad.push(cells.first().cloned().unwrap_or_else(|| line.to_string()));
+    }
+    if !bad.is_empty() {
+        return Err(format!(
+            "这些行的状态词不在闭集里（只有 `未落` / `已落`）：{}",
+            bad.join("、")
+        ));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +197,32 @@ mod tests {
             gap: gap.into(),
             state,
         }
+    }
+
+    /// 五格行、旧三格行、做到终态的行，三种形状各读一次。
+    ///
+    /// 判的是「这一行做没做完」读得对不对，不是它的排版：形状由格数判，状态由闭集判，
+    /// 读不出的点名拒掉。
+    #[test]
+    fn the_ledger_reader_takes_both_shapes_and_skips_a_reached_row() {
+        let text = "\
+| S1 | 终态一 | 现在一 | 差距一 ｜ touches: a.rs | 未落 |
+| S20.7 | 终态二 | 现在二 | — ｜ touches: b.rs | 已落 |
+| N3 | 终态三 | 现在三 | 差距三 | 未落 |
+| S9 | 旧格式 | 未落 | 判据 ｜touches: c.rs |
+";
+        let items = parse_md(text).expect("这本台账该读得出来");
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["S1", "N3", "S9"], "进批的应当只有未落的那几条");
+        assert_eq!(items[0].gap, "差距一");
+        assert_eq!(items[2].terminal, "旧格式");
+    }
+
+    /// 状态写成散文的行：点名拒掉，不静默丢掉。
+    #[test]
+    fn a_row_whose_status_is_prose_is_named_not_dropped() {
+        let err = parse_md("| N7 | 终态 | 现在 | 差距 | 树里：还没做 |\n").expect_err("该拒");
+        assert!(err.contains("N7"), "拒的时候要点名：{err}");
     }
 
     /// 只有散文终态、没有机器读数的一条，仍然算得出「差距非空」。
