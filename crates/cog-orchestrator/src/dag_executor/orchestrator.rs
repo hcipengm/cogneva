@@ -6262,7 +6262,8 @@ mod tests {
         add_goal_and_sink(&dag, "goal-1", "child-2", "child-1").await;
         let mut declared = Task::new("child-2", TaskType::Generator, serde_json::json!({}));
         declared.parent_task_id = Some("goal-1".into());
-        declared.retry_count = u32::MAX - 1; // 超过任何 max_retries，fail 必终败
+        // 终败由**失败类**给出：靠重跑清除不了的失败一次也不给（重试不再按次数判，
+        // 拿 `retry_count` 逼近上限的写法在新口径下不再意味着终败）。
         dag.add_task(declared).await.unwrap();
 
         dag.schedule_task("child-1").await.unwrap();
@@ -6276,11 +6277,12 @@ mod tests {
 
         dag.schedule_task("child-2").await.unwrap();
         dag.start_task("child-2").await.unwrap();
-        let (retried, _, _) = dag.fail_task("child-2", "boom".into(), None).await.unwrap();
+        let terminal = "terminal_env_failure: environment_error";
+        let (retried, _, _) = dag.fail_task("child-2", terminal.into(), None).await.unwrap();
         assert!(!retried);
         let row = dag.get_task("goal-1").await.unwrap();
         assert_eq!(row.status, TaskStatus::Failed);
-        assert_eq!(row.error.as_deref(), Some("boom"));
+        assert_eq!(row.error.as_deref(), Some(terminal));
         assert_eq!(row.result, None, "判死的行不留半个结果");
     }
 
