@@ -1027,7 +1027,7 @@ mod tests {
                     // 问树的问题不占命令额度：客户端刚起来时会先问一遍，
                     // 假副本要像真副本那样答，而且这一问不是一条命令。
                     let _ = socket
-                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\n\r\nno tree!!")
+                        .write_all(b"HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 9\r\n\r\nno tree!!")
                         .await;
                     continue;
                 }
@@ -1042,7 +1042,7 @@ mod tests {
                 // 按 keep-alive 在**同一条连接**上再发一次，而这一侧已经不再读——那一次
                 // 会一直等到超时，报出来是「执行器不可达」（2026-11-23 并行跑整库时偶发）。
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
                     body.len(),
                     body
                 );
@@ -1106,18 +1106,18 @@ mod tests {
                     let _ = match answer {
                         TreeAnswer::Holds => socket
                             .write_all(
-                                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\n\
                                   content-length: 30\r\n\r\n{\"lane\":\"agent-a\",\"tree\":true}",
                             )
                             .await,
                         TreeAnswer::Empty => socket
                             .write_all(
-                                b"HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\n\r\nno tree!!",
+                                b"HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 9\r\n\r\nno tree!!",
                             )
                             .await,
                         TreeAnswer::Broken => socket
                             .write_all(
-                                b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 3\r\n\r\nbad",
+                                b"HTTP/1.1 500 Internal Server Error\r\nconnection: close\r\ncontent-length: 3\r\n\r\nbad",
                             )
                             .await,
                     };
@@ -1125,7 +1125,7 @@ mod tests {
                 }
                 if asked_path(&buf[..read]).starts_with("/worktree/") {
                     let _ = socket
-                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\n\r\nno tree!!")
+                        .write_all(b"HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 9\r\n\r\nno tree!!")
                         .await;
                     continue;
                 }
@@ -1137,7 +1137,7 @@ mod tests {
                     serde_json::to_string(&CommandEvent::Exit { code: 0 }).unwrap()
                 );
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
                     body.len(),
                     body
                 );
@@ -1165,7 +1165,7 @@ mod tests {
                 if asked_path(&buf[..read]).starts_with("/worktree/") {
                     // 问树的问题不占命令额度，答法与真副本一致：没有就是 404。
                     let _ = socket
-                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\n\r\nno tree!!")
+                        .write_all(b"HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 9\r\n\r\nno tree!!")
                         .await;
                     continue;
                 }
@@ -1188,7 +1188,7 @@ mod tests {
                 body.push_str(&serde_json::to_string(&CommandEvent::Exit { code: 0 }).unwrap());
                 body.push('\n');
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
                     body.len(),
                     body
                 );
@@ -1262,7 +1262,7 @@ mod tests {
                 if path.starts_with("/worktree/has") {
                     // 找树那一问不占额度：它问的不是「搬」，答法与真副本一致。
                     let _ = socket
-                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\n\r\nno tree!!")
+                        .write_all(b"HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 9\r\n\r\nno tree!!")
                         .await;
                     continue;
                 }
@@ -1270,7 +1270,7 @@ mod tests {
                 let response: Vec<u8> = if path.starts_with("/worktree/export") {
                     seen.lock().unwrap().handed_out = BUNDLE.to_vec();
                     let mut out = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/x-git-bundle\r\n\
+                        "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/x-git-bundle\r\n\
                          content-length: {}\r\n\r\n",
                         BUNDLE.len()
                     )
@@ -1281,7 +1281,7 @@ mod tests {
                     seen.lock().unwrap().received.push(body);
                     let payload = br#"{"lane":"agent-a","files":3}"#;
                     let mut out = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                        "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\n\
                          content-length: {}\r\n\r\n",
                         payload.len()
                     )
@@ -1300,7 +1300,7 @@ mod tests {
                         serde_json::to_string(&CommandEvent::Exit { code: 0 }).unwrap()
                     );
                     format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\n\
+                        "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/x-ndjson\r\n\
                          transfer-encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
                         ndjson.len(),
                         ndjson
@@ -1327,12 +1327,12 @@ mod tests {
                 let read = probe.read(&mut buf).await.unwrap_or(0);
                 if asked_path(&buf[..read]).starts_with("/worktree/") {
                     let _ = probe
-                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\n\r\nno tree!!")
+                        .write_all(b"HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 9\r\n\r\nno tree!!")
                         .await;
                     continue;
                 }
                 let _ = probe
-                    .write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n")
+                    .write_all(b"HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-length: 0\r\n\r\n")
                     .await;
                 break;
             }
@@ -1349,7 +1349,7 @@ mod tests {
                 serde_json::to_string(&CommandEvent::Exit { code: 0 }).unwrap(),
             );
             let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
                 body.len(),
                 body
             );
@@ -2011,14 +2011,14 @@ mod tests {
                 let read = candidate.read(&mut buf).await.unwrap_or(0);
                 if asked_path(&buf[..read]).starts_with("/worktree/") {
                     let _ = candidate
-                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\n\r\nno tree!!")
+                        .write_all(b"HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 9\r\n\r\nno tree!!")
                         .await;
                     continue;
                 }
                 break candidate;
             };
             socket
-                .write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 3\r\n\r\nbad")
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nconnection: close\r\ncontent-length: 3\r\n\r\nbad")
                 .await
                 .unwrap();
         });
@@ -2058,7 +2058,7 @@ mod tests {
                 serde_json::to_string(&CommandEvent::Exit { code: 0 }).unwrap()
             );
             let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
                 body.len(),
                 body
             );
