@@ -5,7 +5,7 @@
 //! clarification question, escalate, or skip. Then poll tracked PRs and
 //! record outcomes into the reflection engine.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -171,6 +171,12 @@ enum IntentTaskAction {
     Blocked(String),
     /// The attempt is live: pending, scheduled or running.
     InHand,
+    /// The row could not be read. Not "no row carries the id": filing again
+    /// under the same id would buy a second attempt for an intent that may
+    /// already be running, and the idempotent insert cannot tell the two apart
+    /// from the intake side. The intent is left for the next round, when the
+    /// graph may answer again.
+    Unreadable,
     /// The attempt finished successfully. The intent is answered.
     ///
     /// The row is what says so while it exists, but the answer outlives it:
@@ -892,10 +898,21 @@ impl GitHubDiscoveryLoop {
         let Some(ref orchestrator) = self.orchestrator else {
             return IntentTaskAction::Submit;
         };
-        let existing = orchestrator
-            .get_task(&self.intent_task_id(kind, number))
-            .await;
-        intent_task_action(existing.as_ref())
+        let task_id = self.intent_task_id(kind, number);
+        match orchestrator.get_task_checked(&task_id).await {
+            Ok(existing) => intent_task_action(existing.as_ref()),
+            Err(e) => {
+                // 读不到不是「没有这一行」：那一行可能在跑，也可能已经答完了。
+                // 照「没有」处理就是同一个 id 再交一次，而那条路分不出重交。
+                tracing::warn!(
+                    task_id = %task_id,
+                    error = %e,
+                    "intent attempt could not be read; leaving the intent for the next round \
+                     rather than filing it again"
+                );
+                IntentTaskAction::Unreadable
+            }
+        }
     }
 
     /// Report an intent whose attempt cannot clear by re-running, once per
@@ -1000,6 +1017,9 @@ impl GitHubDiscoveryLoop {
                 false
             }
             IntentTaskAction::InHand => false,
+            // 问不上来的那一行既不是空的也不是在手的：这一轮不提交、不记答完，
+            // 下一轮再问。`intent_decision` 已经把原因写进日志了。
+            IntentTaskAction::Unreadable => false,
             IntentTaskAction::Redrive => {
                 if self.in_redrive_backoff(key) {
                     return false;
@@ -2014,7 +2034,20 @@ impl GitHubDiscoveryLoop {
 
         let deadline = Instant::now() + Duration::from_secs(ASSESS_WAIT_TIMEOUT_SECS);
         loop {
-            if let Some(t) = orchestrator.get_task(&id).await {
+            // A failed read is not "the row is not there yet": waiting it out
+            // ends as a timeout, and a timeout says the judgement never came
+            // back -- when the truth is that nobody could read whether it had.
+            // Answering now keeps the reason; the caller treats it as the
+            // transient failure it is and re-judges next round.
+            let polled = match orchestrator.get_task_checked(&id).await {
+                Ok(task) => task,
+                Err(e) => {
+                    return Err(crate::error::CogGitHubError::Provider(format!(
+                        "assess task {id} could not be read: {e}"
+                    )));
+                }
+            };
+            if let Some(t) = polled {
                 match t.status {
                     TaskStatus::Completed => {
                         let verdict = t.result.unwrap_or_default();
@@ -2417,8 +2450,20 @@ impl GitHubDiscoveryLoop {
             .map(|(pr, v)| (*pr, v.task_id.clone(), v.head_sha.clone()))
             .collect();
         for (pr, task_id, head_sha) in inflight {
-            let Some(task) = orchestrator.get_task(&task_id).await else {
-                continue;
+            // 读不到不是「这一行不在了」：留在在途表里、下一轮再收，别让一次
+            // 读失败静默地把这张 PR 的判词吞掉。
+            let task = match orchestrator.get_task_checked(&task_id).await {
+                Ok(Some(task)) => task,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        pr,
+                        task = %task_id,
+                        error = %e,
+                        "cross-validation task could not be read; leaving it in flight for the next round"
+                    );
+                    continue;
+                }
             };
             match task.status {
                 TaskStatus::Completed => {
@@ -2815,8 +2860,21 @@ impl GitHubDiscoveryLoop {
             // worker can move a row in between. `replace_task` writes the whole
             // row, so writing the snapshot back would undo a status the
             // executor had just set.
-            let Some(mut filled) = orch.get_task(&row.id).await else {
-                continue;
+            // 读不到那一行不是「它不在了」：它仍然是一条要补的行，这一趟补不上，
+            // 但 `remaining` 要照实加一——不然这一趟会以「补完了」退场，而库里
+            // 那条空着判据的行谁也没问过。
+            let mut filled = match orch.get_task_checked(&row.id).await {
+                Ok(Some(filled)) => filled,
+                Ok(None) => continue,
+                Err(e) => {
+                    settled.remaining += 1;
+                    tracing::warn!(
+                        task = %row.id,
+                        error = %e,
+                        "a platform row could not be read; the criteria back-fill keeps it asking"
+                    );
+                    continue;
+                }
             };
             if !filled.acceptance.is_empty() {
                 continue;
@@ -3279,6 +3337,50 @@ pub(crate) mod tests {
         std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
+    /// 读不到那一行时不再交一次：同一个 id 的重交在编排器那一侧分不出「同一条
+    /// 意图再跑一次」与「一条已经在跑的意图被再交一次」，而这一问正是分辨它的地方。
+    #[tokio::test]
+    async fn an_attempt_that_cannot_be_read_is_not_filed_again_under_the_same_id() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
+        let orchestrator = Arc::new(MockOrchestrator::new());
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            Arc::new(MockProvider {
+                issues: vec![],
+                comments: Mutex::new(vec![]),
+                ci_logs: vec![],
+                ci_runs: Mutex::new(vec![]),
+                ci_green_runs: Mutex::new(Vec::new()),
+                prs: vec![],
+                pr_details: HashMap::new(),
+            }),
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+        let id = loop_.intent_task_id(IntentKind::Issue, 77);
+        orchestrator.with_unreadable_id(&id);
+
+        assert_eq!(
+            loop_.intent_decision(IntentKind::Issue, 77).await,
+            IntentTaskAction::Unreadable,
+            "那一问答不上来，不能答成「没有这一行」"
+        );
+        assert!(
+            !loop_
+                .apply_fix_decision("issue:77", IntentKind::Issue, 77)
+                .await,
+            "读不到不是没交过：这一轮不交、也不记成答完了"
+        );
+        assert!(
+            orchestrator.goals.lock().unwrap().is_empty(),
+            "同一个 id 不能照着「没有」再交一次"
+        );
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
     /// A finished attempt is a verdict about the intent, and the verdict has
     /// to outlive the row it was read from: the archive pass drops terminal
     /// rows on a retention that exists to bound how long a row stays readable,
@@ -3491,6 +3593,55 @@ pub(crate) mod tests {
         assert!(matches!(err, CogGitHubError::Provider(_)), "{err}");
     }
 
+    /// 那一行读不到时当场作答，不等到超时：等下去最后的判词是「判定没回来」，
+    /// 而真相是没人读得到它回来没有——两句话的错处不同，查到的东西也不同。
+    #[tokio::test]
+    async fn an_assess_task_that_cannot_be_read_answers_now_instead_of_timing_out() {
+        let provider: Arc<dyn CodePlatformProvider> = Arc::new(MockProvider {
+            issues: vec![],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
+            prs: vec![],
+            pr_details: HashMap::new(),
+        });
+        let orchestrator = Arc::new(MockOrchestrator::new().with_unreadable_graph());
+        let loop_ = GitHubDiscoveryLoop::new(
+            provider,
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+        let title = "the issue list is slow".to_string();
+        let body = "curl /health takes 500ms".to_string();
+        let labels: Vec<String> = vec![];
+        let intent = IntentContext {
+            kind: IntentKind::Issue,
+            number: 43,
+            title: &title,
+            body: &body,
+            labels: &labels,
+            author: "alice",
+        };
+        let control: Arc<dyn OrchestratorControl> = orchestrator;
+        let started = Instant::now();
+        let err = loop_
+            .run_assess_task(&control, &intent, "thread", &[])
+            .await
+            .expect_err("读不到那一行时没有判词");
+        assert!(
+            started.elapsed() < Duration::from_secs(ASSESS_WAIT_TIMEOUT_SECS),
+            "这一问读不到就该当场退，别把一整个等待窗口睡完"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("could not be read"),
+            "判词要说的是「读不到」，不是「超时」：{text}"
+        );
+    }
+
     #[test]
     fn terminal_backoff_grows_exponentially_and_caps() {
         let d = |n: u32| terminal_backoff_delay(n, 300).as_secs();
@@ -3673,6 +3824,8 @@ pub(crate) mod tests {
         /// 带报错的那条读一律失败，模拟一个读不动任务图的编排器：折叠的那条
         /// 这时答「图是空的」，而真相是没人读到过它。
         unreadable_graph: std::sync::atomic::AtomicBool,
+        /// 整份行表照常读得出，只有这些 id 的那一问答不上来。
+        unreadable_ids: Mutex<HashSet<String>>,
     }
 
     impl MockOrchestrator {
@@ -3699,6 +3852,7 @@ pub(crate) mod tests {
                 intent_rows: Mutex::new(HashMap::new()),
                 refuse_submissions: std::sync::atomic::AtomicBool::new(false),
                 unreadable_graph: std::sync::atomic::AtomicBool::new(false),
+                unreadable_ids: Mutex::new(HashSet::new()),
             }
         }
 
@@ -3714,6 +3868,11 @@ pub(crate) mod tests {
             self.unreadable_graph
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             self
+        }
+
+        /// 让这一个 id 的那一问答不上来，其余行照常读得出。
+        pub(crate) fn with_unreadable_id(&self, id: &str) {
+            self.unreadable_ids.lock().unwrap().insert(id.to_string());
         }
 
         /// What the archive pass does to a terminal row once its retention
@@ -3813,6 +3972,18 @@ pub(crate) mod tests {
         }
         async fn get_all_tasks(&self) -> Vec<Task> {
             self.rows.lock().unwrap().clone()
+        }
+        async fn get_task_checked(&self, id: &str) -> cog_core::SFResult<Option<Task>> {
+            if self
+                .unreadable_graph
+                .load(std::sync::atomic::Ordering::Relaxed)
+                || self.unreadable_ids.lock().unwrap().contains(id)
+            {
+                return Err(cog_core::SFError::Database(format!(
+                    "mock graph cannot answer for {id}"
+                )));
+            }
+            Ok(self.get_task(id).await)
         }
         async fn get_all_tasks_checked(&self) -> cog_core::SFResult<Vec<Task>> {
             if self
@@ -5198,6 +5369,57 @@ pub(crate) mod tests {
         assert_eq!(again.remaining, 1, "{again:?}");
     }
 
+    /// 一行问不上来时，这一趟不把它当作补完：`remaining` 照实加一，
+    /// 否则这一趟会以「补完了」退场，而库里那条空着判据的行谁也没问过。
+    #[tokio::test]
+    async fn a_row_that_cannot_be_read_keeps_the_criteria_backfill_asking() {
+        let orch = Arc::new(MockOrchestrator::holding(vec![Task::new(
+            "github-issue-7".to_string(),
+            TaskType::Custom("platform_issue_fix".into()),
+            serde_json::json!({"issue_number": 7}),
+        )]));
+        let loop_ = GitHubDiscoveryLoop::new(
+            Arc::new(MockProvider {
+                issues: vec![],
+                comments: Mutex::new(vec![]),
+                ci_logs: vec![],
+                ci_runs: Mutex::new(vec![]),
+                ci_green_runs: Mutex::new(Vec::new()),
+                prs: vec![],
+                pr_details: HashMap::new(),
+            }),
+            IssueTriage::rules_only(),
+            config(),
+            Some(orch.clone()),
+            None,
+        );
+        let as_control: Arc<dyn OrchestratorControl> = orch.clone();
+        // 整份行表读得出（那条候选还在名单里），只有逐行那一问答不上来。
+        orch.with_unreadable_id("github-issue-7");
+
+        let settled = loop_.settle_filed_criteria(&as_control).await;
+        assert!(!settled.unread, "整份名单是读到了的：{settled:?}");
+        assert_eq!(settled.filled, 0, "{settled:?}");
+        assert_eq!(
+            settled.remaining, 1,
+            "这一条还欠着：这一趟没补上不能读成补完了：{settled:?}"
+        );
+        assert!(
+            !criteria_backfill_is_done(&settled),
+            "还有一条问不上来，回填不能退场"
+        );
+        let after = orch.get_all_tasks().await;
+        assert!(
+            after
+                .iter()
+                .find(|r| r.id == "github-issue-7")
+                .unwrap()
+                .acceptance
+                .is_empty(),
+            "读不到就没写：判据还是空的"
+        );
+    }
+
     /// 读不动任务图的那一趟，不能把自己读成「没有要补的行」。
     ///
     /// 折叠的那条读答一份空名单，`remaining == 0`，于是这趟回填以「做完了」
@@ -5648,6 +5870,65 @@ pub(crate) mod tests {
             1
         );
 
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    /// 收在途任务的那一读问不上来时，这张 PR 留在在途表里：`continue` 是同一个
+    /// 动作，但判词不一样——不读的话，一次读失败与「这一行不在了」在日志里同形，
+    /// 而后者会让这张 PR 永远没人再收。
+    #[tokio::test]
+    async fn a_cross_validation_task_that_cannot_be_read_stays_in_flight() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
+        let (_workdir_tmp, workdir) = git_workdir_with_pr_branch();
+        let cfg = cv_config(&workdir);
+        let head_sha = "deadbeefcafebabe000000000000000000000032";
+        let provider = Arc::new(MockProvider {
+            issues: vec![],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
+            prs: vec![cv_pr(32, "cogneva-bot", "Bob#b81c0e9f")],
+            pr_details: HashMap::from([(32u64, cv_detail(32, head_sha))]),
+        });
+        let orchestrator = Arc::new(MockOrchestrator::new());
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider.clone(),
+            IssueTriage::rules_only(),
+            cfg,
+            Some(orchestrator.clone()),
+            None,
+        );
+
+        // 第一轮把它交出去，在途表里有它了。
+        loop_.run_once().await.unwrap();
+        let task_id = loop_
+            .cv_inflight
+            .get(&32)
+            .expect("第一轮该把它交出去")
+            .task_id
+            .clone();
+
+        // 第二轮收不回来：那一行读不到。
+        orchestrator.with_unreadable_id(&task_id);
+        loop_.run_once().await.unwrap();
+        assert!(
+            loop_.cv_inflight.contains_key(&32),
+            "读不到不是「不在了」：它还得留在在途表里，等下一轮再收"
+        );
+        assert!(
+            provider
+                .comments
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(n, _)| *n == 32)
+                .next()
+                .is_none(),
+            "没读到判词就不该有判词评论"
+        );
         std::env::remove_var("COGNEVA_DATA_DIR");
     }
 

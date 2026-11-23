@@ -34,6 +34,7 @@ const DAG_CONSUMER: &str = "crates/cog-orchestrator/src/dag_executor/mod.rs";
 const ACTION_PLANNER: &str = "crates/cog-orchestrator/src/action_planner/action_plan_orchestrator.rs";
 const SIGNAL_WATCHER: &str = "crates/cog-reflection/src/signal_watcher.rs";
 const CHANGE_LEDGER: &str = "crates/cog-orchestrator/src/change_ledger.rs";
+const DISCOVERY_LOOP: &str = "crates/cog-github/src/discovery_loop.rs";
 
 /// 折叠过的那几条读。某一段正文里出现它们，就是那一面在替没读到的图作证。
 const FOLDED: &[&str] = &[
@@ -359,6 +360,30 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "get_all_tasks_checked",
         "读不到图被读成「一条批次都没有」，被批次带过的每条交付都读成「从没交付」，留着欠账、再交一次",
     ),
+    (
+        DISCOVERY_LOOP,
+        "async fn intent_decision",
+        "get_task_checked",
+        "读不到被读成「没有这一行」，同一条意图照同一个 id 再交一次",
+    ),
+    (
+        DISCOVERY_LOOP,
+        "async fn run_assess_task",
+        "get_task_checked",
+        "读不到被读成「还没跑完」，等到超时再把「判定没回来」当成答案",
+    ),
+    (
+        DISCOVERY_LOOP,
+        "async fn poll_cross_validation",
+        "get_task_checked",
+        "读不到被读成「这一行不在了」，一次读失败静默地把这张 PR 的判词吞掉",
+    ),
+    (
+        DISCOVERY_LOOP,
+        "pub(crate) async fn settle_filed_criteria",
+        "get_task_checked",
+        "读不到那一行被读成「它不在了」，remaining 少算一条，回填以「补完了」退场",
+    ),
 ];
 
 #[test]
@@ -380,6 +405,7 @@ fn every_surface_that_draws_the_graph_keeps_the_failure() {
         ACTION_PLANNER,
         SIGNAL_WATCHER,
         CHANGE_LEDGER,
+        DISCOVERY_LOOP,
     ] {
         productions.insert(file, production_text(&read_repo(file)));
     }
