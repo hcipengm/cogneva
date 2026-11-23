@@ -12,30 +12,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use sqlx::PgPool;
 
+use cog_core::contract::intent_events::{IntentEvents, IntentRow, INTENT_RECEIVED};
 use cog_core::{SFError, SFResult};
-
-/// 意图这一族的 kind。闭集里的一个词，写死在这一句里。
-pub const INTENT_RECEIVED: &str = "intent_received";
-
-/// 一条进门时的意图行。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IntentRow {
-    /// 谁把它带进来的：`webui`、`cli`、`github`、`outward`、`self_signal`、`ledger`…
-    pub source: String,
-    /// 来源那边的身份（会话 id、issue 号、URL、任务 id）。同一个来源里唯一。
-    pub external_id: String,
-    /// 原文。**不摘要、不改写**：判官要判的就是这段话本身。
-    pub text: String,
-    /// 因果父行：这一条是被哪一条引出来的（上一轮、上一条事件）。空表示没有父。
-    pub parent: String,
-}
-
-impl IntentRow {
-    /// 这条意图的行身份：来源＋外部身份。幂等键由它派生，重投不会写第二行。
-    pub fn identity(&self) -> String {
-        format!("{}:{}", self.source, self.external_id)
-    }
-}
 
 const INSERT_SQL: &str = "\
 INSERT INTO cogneva_event (\
@@ -60,9 +38,13 @@ impl IntentEventStore {
         }
     }
 
+}
+
+#[async_trait]
+impl IntentEvents for IntentEventStore {
     /// 记下一条意图。重投同一个 (writer, identity) 不写第二行——意图的「收到过」
     /// 由库回答，不由调用方记。
-    pub async fn record(&self, row: &IntentRow, actor: &str) -> SFResult<()> {
+    async fn record(&self, row: &IntentRow, actor: &str) -> SFResult<()> {
         let identity = row.identity();
         let idempotency_key = format!("{identity}:received");
         let event_id = format!("intent-{}", uuid_like(&identity));
@@ -83,7 +65,7 @@ impl IntentEventStore {
             .bind(Utc::now())
             .execute(&self.pool)
             .await
-            .map_err(|e| SFError::Database(format!("intent_received: {e}")))?;
+            .map_err(|e| SFError::Database(format!("{INTENT_RECEIVED}: {e}")))?;
         Ok(())
     }
 }

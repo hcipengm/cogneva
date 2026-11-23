@@ -29,6 +29,7 @@ pub mod hook;
 pub mod host_documents;
 pub mod knowledge;
 pub mod kv;
+pub mod intent_events;
 pub mod ledger_item;
 pub mod live_revision;
 pub mod llm;
