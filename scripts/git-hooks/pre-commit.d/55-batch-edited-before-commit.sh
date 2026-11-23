@@ -7,30 +7,27 @@
 # 都是一串绿提交——区别只在后者要等到最后才编得动。这道门把那句话变成事实：
 # 开着的一轮里，批内还有待办没被触到，任何提交都停下。
 #
-# 判词借用 `family.py --editing`：它问的正是「这一遍编辑走点到的地方都动过没有」，
-# 与编译垫片问同一个问题、走同一段代码。两处各写一份判据，改一处另一处不会红。
+# 判词向产品要（`cogneva ledger editing`）：它问的正是「这一遍编辑走点到的地方都动过
+# 没有」，与编译垫片问同一个问题。带外不再有第二份实现——两份判据改一处另一处不会红。
 #
-# 没有开着的一轮、或台账读不到：**不阻**，印一行说明。那不是「编完了」，
+# 没有开着的一轮、或台账读不到（退 2）：**不阻**，印一行说明。那不是「编完了」，
 # 是这道门判不了——判不了不该表现得像通过，但也不该把一个不做这件事的人拦下。
 set -u
 root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
-family="$root/scripts/hooks/family.py"
-[ -f "$family" ] || exit 0
+bin="${COGNEVA_BIN:-$root/target/debug/cogneva}"
+[ -x "$bin" ] || { printf 'pre-commit（批次）：没有平台二进制（%s），这一问没判，提交不拦。\n' "$bin" >&2; exit 0; }
 
-out="$(python3 "$family" --all-todos --editing 2>&1)"
+out="$("$bin" ledger editing 2>&1)"
 rc=$?
 case "$rc" in
   0) exit 0 ;;
-  3)
+  2)
     printf 'pre-commit（批次）：这一轮判不了，提交不拦——%s\n' "$(printf '%s' "$out" | tail -1)" >&2
     exit 0 ;;
 esac
-# `family.py` 的 TODO 行是缩进两格的（它与「待办 N: …」那一列对齐）。按列零锚定
-# 匹配的那一版**一条也匹配不到**：这道门看起来在、实际从不拒绝，而「没拒」与
-# 「这一批都改完了」在读数上同形（2026-11-23 由 `batch-gate.test.sh` 的那三格钉出来）。
-if printf '%s' "$out" | grep -q '^[[:space:]]*TODO '; then
+if [ "$rc" -ne 0 ]; then
     printf 'pre-commit（批次）：这一轮的批还没编辑完，先别提交。\n' >&2
-    printf '%s\n' "$out" | grep '^[[:space:]]*TODO ' | sed 's/^[[:space:]]*/  /' >&2
+    printf '%s\n' "$out" | grep 'TODO ' | sed 's/^[[:space:]]*/  /' >&2
     cat >&2 <<'MSG'
   流程是：planner 产出待办 → 立刻定批 → generator 把**整批**一次改完 → 编译一次 →
   测试一次 → 门一次 → 推。改一条提交一条，等于把同一份验证付了 N 次，而且
