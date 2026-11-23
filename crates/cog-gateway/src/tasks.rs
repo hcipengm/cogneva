@@ -1024,8 +1024,7 @@ fn submitted_tasks(
     }
     // 按顺序把三格挂上去：第 i 条待办挂第 i 行。
     for (task, item) in rows.iter_mut().zip(carried.iter()) {
-        *task = std::mem::replace(task, Task::new("", TaskType::DagNode, serde_json::json!({})))
-            .carrying(item);
+        *task = task.clone().carrying(item);
     }
     rows
 }
