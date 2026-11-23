@@ -230,16 +230,22 @@ def surface_state_files(root: Path):
     而分叉时没人知道哪份对。终态是盘上不再有这类记录文件——计数必须归零。
 
     判的是**写法**不是文件名：`format!("{...}.json")` / `join(format!(...json))` 这类
-    「拼出来的文件名」，以及 `.json` 字面量配上 `write` / `create` 的写路径。一个固定的
-    `config.json` 不是这一类（它不是「每个 id 一份」），所以只有拼出来的才算。
+    「拼出来的文件名」，以及写路径里**带占位符**的那个 `format!`。一个固定的
+    `config.json`（或测试夹具里那些 `broken.json`）不是这一类——它不是「每个 id 一份」，
+    所以只有拼出来的才算；按 `.json` 一刀切会把它们一起数进来。
     """
     import re as _re
     dynamic = _re.compile(r'format!\(\s*"[^"]*\{[^"]*\.json"')
-    fixed_write = _re.compile(r'(write|create|File::create)\s*\([^;]{0,120}\.json')
+    # 写路径也要**带占位符**才算：`write(dir.join("config.json"))` 是一个固定名字，
+    # 它不是「每个 id 一份」的那一类，按 `.json` 一刀切会把它数进来（2026-11-23 由
+    # `bounds-census-shapes.test.sh` 那一格钉出来：面自己的判词与它自己的实现不一致）。
+    dynamic_write = _re.compile(
+        r'(write|create|File::create)\s*\([^;]{0,160}format!\([^)]*\{[^)]*\.json'
+    )
     for path in rust_files(root):
         lines = path.read_text(errors="ignore").splitlines()
         for index, line in enumerate(lines):
-            if dynamic.search(line) or fixed_write.search(line):
+            if dynamic.search(line) or dynamic_write.search(line):
                 yield {
                     "surface": "state-file",
                     "path": str(path.relative_to(root)),
