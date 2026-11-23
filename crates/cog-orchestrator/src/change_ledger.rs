@@ -2101,10 +2101,23 @@ async fn fold_handover(
     task_id: &str,
     identity: &ChangeIdentity,
 ) -> bool {
-    match orchestrator.get_task(task_id).await {
-        Some(task) if task.status == TaskStatus::Pending && task.started_at.is_none() => {}
-        Some(_) => return false,
-        None => return false,
+    match orchestrator.get_task_checked(task_id).await {
+        Ok(Some(task)) if task.status == TaskStatus::Pending && task.started_at.is_none() => {}
+        Ok(_) => return false,
+        Err(e) => {
+            // Not "gone": a read that failed cannot say the row is untouched,
+            // and taking the row back from a task that may have started is the
+            // one thing this check exists to prevent. The row is left alone
+            // this pass and the next pass asks again.
+            warn!(
+                change = %identity,
+                task = task_id,
+                error = %e,
+                "change ledger: a hand-over could not be read, so it is left holding its row \
+                 this pass"
+            );
+            return false;
+        }
     }
     let reason = format!(
         "{FOLDED_HANDOVER_PREFIX}: 这条交接从没开始过、只占着 {identity} 一行，\
@@ -6013,8 +6026,26 @@ async fn dispatch_pass(
             other => other,
         };
         let owed = match held {
-            Some(handover) => Owed::Held(handover),
+            Some(handover) => Ok(Owed::Held(handover)),
             None => owed_row(orchestrator, row, rearm_limit).await,
+        };
+        // Owed, no task known to hold it, and this pass does not hand it over:
+        // that is the row fact `held_back` states, and the warn is what says
+        // this pass's reason was a read rather than a decision. Handing it over
+        // blind is the move the generation walk exists to prevent -- under an
+        // id the store may still hold, the goal path raises every pass.
+        let owed = match owed {
+            Ok(owed) => owed,
+            Err(e) => {
+                counts.held_back += 1;
+                warn!(
+                    change = %row.identity,
+                    error = %e,
+                    "change ledger: the graph could not be read for this row, so it is left \
+                     owed rather than handed over under an id something may still hold"
+                );
+                continue;
+            }
         };
         match owed {
             Owed::Held(Handover::DeadEnvironment) => counts.dead_environment += 1,
@@ -6321,11 +6352,19 @@ async fn owed_row(
     orchestrator: &Arc<dyn OrchestratorControl>,
     row: &ChangeLedgerRow,
     rearm_limit: u32,
-) -> Owed {
+) -> SFResult<Owed> {
     let mut generation = 0u32;
     while generation <= rearm_limit {
         let id = dispatch_task_id(&row.identity, generation);
-        let Some(task) = orchestrator.get_task(&id).await else {
+        // A read that failed is not "no row holds this generation": the walk
+        // would stop here and the row would be handed over under an id the
+        // store may still hold, which the goal path treats as a fault. The
+        // caller counts the row as owed-and-not-handed-over and says why.
+        let task = match orchestrator.get_task_checked(&id).await {
+            Ok(task) => task,
+            Err(e) => return Err(e),
+        };
+        let Some(task) = task else {
             break;
         };
         match classify_handover(&task) {
@@ -6353,10 +6392,10 @@ async fn owed_row(
             {
                 generation += 1
             }
-            verdict => return Owed::Held(verdict),
+            verdict => return Ok(Owed::Held(verdict)),
         }
     }
-    Owed::NoTask { generation }
+    Ok(Owed::NoTask { generation })
 }
 
 /// One pass's own counts, as the account records them and the reading face
@@ -8790,6 +8829,110 @@ mod tests {
         );
     }
 
+    /// 代次那一问答不上来时，欠账留在账上，不按 generation 0 投出去。
+    ///
+    /// 代次走查的每一步都是「这一代有没有被占着」。读不出来当成「没有」，走查就断在
+    /// 这里、照那一代投出去——而那个 id 很可能还在库里，目标那条路对重复 id 是直接
+    /// 报错的，此后每一趟都报。所以读不到时这一行按「欠着、这一趟没交出去」记账。
+    #[tokio::test]
+    async fn an_owed_row_whose_generation_cannot_be_read_is_left_owed() {
+        let row = ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "crates/x", "fn a"),
+            ..row(ChangeState::Pending, None)
+        };
+        let store = FakeLedger {
+            rows: vec![row.clone()],
+            ..Default::default()
+        };
+        let graph = Arc::new(
+            FakeGraph::default().with_unreadable(&dispatch_task_id(&row.identity, 0)),
+        );
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            graph.submitted().is_empty(),
+            "代次读不到时不该照那一代投出去：{:?}",
+            graph.submitted()
+        );
+        let state = store.written().pop().expect("the pass wrote its row");
+        assert_eq!(
+            state.held_back, 1,
+            "这一行是「欠着、这一趟没交出去」：{state:?}"
+        );
+        assert_eq!(state.submitted, 0, "{state:?}");
+        assert_eq!(state.failed, 0, "读不到不是投递失败：{state:?}");
+    }
+
+    /// 放回交接之前的那一读问不上来时，这一条不收回。
+    ///
+    /// 收回是照着「这条从没开始」的结论去取消一行；读不出来就不能得出这个结论，
+    /// 而 store 那边取消一条已经在跑的任务是不会抱怨的——这一读就是拦它的那道门。
+    #[tokio::test]
+    async fn a_hand_over_that_cannot_be_read_is_not_taken_back() {
+        let rows: Vec<ChangeLedgerRow> = ["fn a", "fn b", "fn c"]
+            .iter()
+            .map(|literal| ChangeLedgerRow {
+                identity: ChangeIdentity::new("grep", "crates/x", *literal),
+                ..row(ChangeState::Pending, None)
+            })
+            .collect();
+        let store = FakeLedger {
+            rows: rows.clone(),
+            ..Default::default()
+        };
+        let mut graph = FakeGraph::default();
+        for row in &rows {
+            graph = graph.holding_handover(row, TaskStatus::Pending);
+        }
+        let unreadable = dispatch_task_id(&rows[0].identity, 0);
+        let graph = Arc::new(graph.with_unreadable(&unreadable));
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        let kept = graph.held(&unreadable).expect("它还拿着那一行");
+        assert_eq!(
+            kept.status,
+            TaskStatus::Pending,
+            "读不到「从没开始」的那一条不能被收回"
+        );
+        assert!(
+            !graph.cancelled().iter().any(|(id, _)| id == &unreadable),
+            "读不到的一条不该被取消：{:?}",
+            graph.cancelled()
+        );
+    }
+
     /// A dispatched change declares a rank below the one a task lands on by
     /// default, and the rest of the row is unchanged by that.
     ///
@@ -10708,6 +10851,8 @@ mod tests {
         cancelled: std::sync::Mutex<Vec<(String, String)>>,
         /// 测试用：读图的那几条都问不上来（模拟一个读不出来的 store）。
         graph_unreadable: bool,
+        /// 测试用：整份行表读得出，但读这些 id 的那一问答不上来。
+        unreadable_ids: std::sync::Mutex<std::collections::HashSet<String>>,
     }
 
     impl FakeGraph {
@@ -10860,6 +11005,12 @@ mod tests {
             self
         }
 
+        /// 整份行表照常读得出，只有这一个 id 的那一问答不上来。
+        fn with_unreadable(self, id: &str) -> Self {
+            self.unreadable_ids.lock().unwrap().insert(id.to_string());
+            self
+        }
+
         fn submitted(&self) -> Vec<String> {
             self.submitted.lock().unwrap().clone()
         }
@@ -10917,7 +11068,7 @@ mod tests {
             Ok(self.get_all_tasks().await)
         }
         async fn get_task_checked(&self, task_id: &str) -> SFResult<Option<Task>> {
-            if self.graph_unreadable {
+            if self.graph_unreadable || self.unreadable_ids.lock().unwrap().contains(task_id) {
                 return Err(SFError::Database(format!(
                     "store unavailable: cannot read task {task_id}"
                 )));
@@ -14133,14 +14284,14 @@ mod tests {
         let empty: Arc<dyn OrchestratorControl> = Arc::new(FakeGraph::default());
         assert!(matches!(
             owed_row(&empty, &row, limit).await,
-            Owed::NoTask { generation: 0 }
+            Ok(Owed::NoTask { generation: 0 })
         ));
 
         let killed_once = FakeGraph::default().holding(&id(0), TaskStatus::Failed);
         let killed_once: Arc<dyn OrchestratorControl> = Arc::new(killed_once);
         assert!(matches!(
             owed_row(&killed_once, &row, limit).await,
-            Owed::NoTask { generation: 1 }
+            Ok(Owed::NoTask { generation: 1 })
         ));
 
         // The re-armed handover is in flight: the row is placed, and no third
@@ -14151,7 +14302,7 @@ mod tests {
         let in_flight: Arc<dyn OrchestratorControl> = Arc::new(in_flight);
         assert!(matches!(
             owed_row(&in_flight, &row, limit).await,
-            Owed::Held(Handover::InFlight)
+            Ok(Owed::Held(Handover::InFlight))
         ));
 
         // The work's own failure is the change's answer, and it is not re-armed:
@@ -14160,7 +14311,7 @@ mod tests {
             Arc::new(FakeGraph::default().holding_dead_work(&id(0)));
         assert!(matches!(
             owed_row(&dead_work, &row, limit).await,
-            Owed::Held(Handover::DeadWork)
+            Ok(Owed::Held(Handover::DeadWork))
         ));
 
         // A row this loop itself closed because the account had already settled
@@ -14179,7 +14330,7 @@ mod tests {
             Arc::new(FakeGraph::default().holding_closed_as_settled(&settled_version));
         assert!(matches!(
             owed_row(&settled, &reopened, limit).await,
-            Owed::NoTask { generation: 1 }
+            Ok(Owed::NoTask { generation: 1 })
         ));
 
         // The same closure in the form the sweep used before it declared itself.
@@ -14193,7 +14344,7 @@ mod tests {
             ));
         assert!(matches!(
             owed_row(&unnamed, &reopened, limit).await,
-            Owed::NoTask { generation: 1 }
+            Ok(Owed::NoTask { generation: 1 })
         ));
 
         // A cancellation for any other reason is still the row's answer.
@@ -14204,7 +14355,7 @@ mod tests {
             ));
         assert!(matches!(
             owed_row(&cancelled_by_hand, &reopened, limit).await,
-            Owed::Held(Handover::DeadWork)
+            Ok(Owed::Held(Handover::DeadWork))
         ));
 
         // Every generation the budget allows was refused by the environment, so
@@ -14216,7 +14367,7 @@ mod tests {
         let spent: Arc<dyn OrchestratorControl> = Arc::new(spent);
         assert!(matches!(
             owed_row(&spent, &row, limit).await,
-            Owed::Held(Handover::DeadEnvironment)
+            Ok(Owed::Held(Handover::DeadEnvironment))
         ));
     }
 

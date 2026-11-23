@@ -341,6 +341,18 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "get_task_checked",
         "读不到那一行被读成「这行不在了」，一条变更的判据永远空着",
     ),
+    (
+        CHANGE_LEDGER,
+        "async fn owed_row",
+        "get_task_checked",
+        "读不到那一代被读成「没人占着」，欠账按一个可能还在库里的 id 投出去，每趟报重复",
+    ),
+    (
+        CHANGE_LEDGER,
+        "async fn fold_handover",
+        "get_task_checked",
+        "读不到那条交接被读成「从没开始」，一条可能已经在跑的任务被取消掉",
+    ),
 ];
 
 #[test]
