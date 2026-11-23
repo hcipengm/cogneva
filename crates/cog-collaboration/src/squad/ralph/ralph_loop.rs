@@ -3970,10 +3970,17 @@ mod tests {
             history[restart_at].iteration, 1,
             "重启的编号从 1 起算，不接着上一任数"
         );
+        // 重启之后跑几轮不由这条用例定：恢复出来的那几条会立刻落进「同一个失败
+        // 原样重放」的判据——那正是「接着上一手做」而不是「从头瞎跑」的样子。
         assert!(
-            history.len() - restart_at >= 2,
-            "重启之后至少跑两轮，实得 {}",
-            history.len() - restart_at
+            history.len() > restart_at,
+            "重启之后至少要留下一条自己的条目"
+        );
+        let own: Vec<u32> = history[restart_at..].iter().map(|it| it.iteration).collect();
+        assert_eq!(own.first().copied(), Some(1), "自己的轮次从 1 起算：{own:?}");
+        assert!(
+            own.windows(2).all(|w| w[1] == w[0] + 1),
+            "自己的轮次连续编号：{own:?}"
         );
 
         // The board itself holds the full resumed history.
