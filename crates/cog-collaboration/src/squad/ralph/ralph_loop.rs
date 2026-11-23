@@ -4021,14 +4021,19 @@ mod tests {
                 }
             }
         }
-        assert_eq!(ordinals, vec![1, 2, 2]);
+        // 第一任是第 1 任；重启之后每一条都是第 2 任——不论各自跑了几轮。
+        assert_eq!(ordinals[0], 1, "第一任的序号：{ordinals:?}");
+        assert!(
+            ordinals[restart_at..].iter().all(|o| *o == 2),
+            "重启之后的每一条都该是第 2 任：{ordinals:?}"
+        );
 
         // 绝对序号读的是归档、不是 board：board 只留尾窗，一件活被跑过很多任
         // 之后，尾窗里数出来的「第 1 任」其实是第 N 任。归档按 offset 读全量。
         let archived = archived_iterations(backend.as_ref(), "task-1", 100)
             .await
             .expect("cold archive must be readable");
-        assert_eq!(archived.len(), 3);
+        assert_eq!(archived.len(), stored.len());
         assert_eq!(archived[0].run_id, stored[0].run_id);
         assert_eq!(archived[2].run_id, stored[2].run_id);
 
