@@ -2494,6 +2494,68 @@ mod tests {
 
     // -----------------------------------------------------------------
 
+    /// 这条循环**没有**迭代预算：轮数不是「停」的理由。
+    ///
+    /// 判的是源码面，因为要证的是「那个旋钮不存在」：类型上没有字段、配置面
+    /// 上没有键、循环上没有上界。三条任一条回来，都会让一条还在收敛的活被
+    /// 一个拍出来的数掐死，而那一刻与「本来就不收敛」在读数上同形。
+    #[test]
+    fn the_loop_carries_no_iteration_budget() {
+        let source = include_str!("ralph_loop.rs");
+        // 判的词在这里拼出来，不写字面量：写出来的话，这条断言会先命中它自己。
+        let banned = [
+            ["self.config.max_", "iterations"].concat(),
+            ["pub max_", "iterations: u32"].concat(),
+            ["RALPH_MAX_", "ITERATIONS"].concat(),
+        ];
+        for word in &banned {
+            assert!(
+                !source.contains(word.as_str()),
+                "迭代预算又回来了（{word}）：轮数不是停的理由，停的理由只有终态到了"
+            );
+        }
+        let unbounded = ["for iteration in 1.. ", "{"].concat();
+        assert!(
+            source.matches(unbounded.as_str()).count() >= 3,
+            "至少三个入口都该是无上界的循环"
+        );
+    }
+
+    /// 停滞先改一处，改满三档仍无进展才带着根因去问属主。
+    ///
+    /// 三档是重置策略闭集的词数，不是轮数：`Identical`（同题重试）、
+    /// `Modified`（改上下文）、`Escalated`（换执行者）。这条用例钉的是顺序——
+    /// 每一停都必须先换一处，而不是直接宣布结束。
+    #[tokio::test]
+    async fn stalling_changes_one_thing_before_asking_the_owner() {
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            stagnation_window: 2,
+        });
+        ralph.history.push(failed_iteration(
+            1,
+            ResetStrategy::Identical,
+            "same failure",
+        ));
+        ralph.history.push(failed_iteration(
+            2,
+            ResetStrategy::Identical,
+            "same failure",
+        ));
+        for attempt in 1..=MAX_STALL_ESCALATIONS {
+            assert!(
+                ralph.change_one_thing().is_none(),
+                "第 {attempt} 次停滞就该先换一处，而不是直接问属主"
+            );
+        }
+        let cause = ralph
+            .change_one_thing()
+            .expect("三档都换过仍无进展，才轮到问属主");
+        assert!(
+            cause.contains("same failure"),
+            "问属主的那句话要带上根因，实到：{cause}"
+        );
+    }
+
     /// 失败分析的提示词只带归档同一条界内的尾部，不带整段历史。
     ///
     /// 这条界决定了分类器的提示词会不会随一次已经注定不收敛的运行一直长；
