@@ -1634,6 +1634,8 @@ mod streaming_write_tests {
 }
 
 mod tests {
+    use super::*;
+
     /// 原始日志的缓冲条数与刷盘间隔各只有一处声明：默认值读常量，常量上面写着
     /// 它由什么钉住。`#[serde(default = …)]` 走的是同一个常量。
     #[test]
