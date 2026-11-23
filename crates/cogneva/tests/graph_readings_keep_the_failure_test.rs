@@ -126,6 +126,12 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "对端唯一的视野答成「你有 0 条任务」",
     ),
     (
+        A2A,
+        "async fn rpc_tasks_cancel",
+        "get_task_checked",
+        "对端据 -32001 去换 id，而那一行可能还在",
+    ),
+    (
         PROJECT_CONTROL,
         "async fn coverage_this_pass",
         "get_all_tasks_checked",
@@ -184,6 +190,12 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "async fn supervisor_status_handler",
         "health_report_from_reading(",
         "健康四格一起落到 0，读成「四个都没病」",
+    ),
+    (
+        LIB,
+        "async fn task_timeline_handler",
+        "get_task_checked",
+        "一条还在跑的活的时间线被答成「已经被删了」",
     ),
     (
         EXECUTOR,
