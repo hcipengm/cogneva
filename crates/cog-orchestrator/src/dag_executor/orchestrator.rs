@@ -7798,6 +7798,10 @@ mod tests {
             Ok(cog_core::AlertTransition::NoChange)
         }
 
+        async fn firing_key_for_rule(&self, _rule: &str) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+
         async fn list_active_persistent_alerts(
             &self,
             _rule_prefix: &str,
