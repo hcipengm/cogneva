@@ -1071,6 +1071,16 @@ fn signal_acceptance(detail: &serde_json::Value, project: Option<&str>) -> Strin
              而不是任务跑完就算",
             text("period")
         ),
+        // 「这一批都处理完了」不是它做完的意思：接手那一侧一批一批地读，下一批永远
+        // 已在路上，按它判等于这条活第一次交卷就永远闭得上。做完是每一句都有去向。
+        cog_core::CHAT_INTENT_TASK_KIND => format!(
+            "这批 {} 句每一句都各有去向：要办的派成了待办，不办的写出了为什么——\
+             不是这一批行被接手就算",
+            detail
+                .get("intents")
+                .and_then(|value| value.as_array())
+                .map_or(0, |rows| rows.len())
+        ),
         _ => format!(
             "条件「{}」不再成立：下一轮不再为它建行",
             project.unwrap_or(kind)
@@ -4973,6 +4983,13 @@ mod tests {
         assert_eq!(
             detail.get("intent_id").and_then(|v| v.as_str()),
             Some("chat:s1:aa")
+        );
+        // 「不再有新行」这一类默认验收在这条活上是空话——接手侧每拍都在读，新的一批
+        // 随时会来；这条活的止损条件必须是每句都有去向。
+        let acceptance = signal_acceptance(&detail, None);
+        assert!(
+            acceptance.contains("每一句都各有去向"),
+            "chat 批次的验收不该退回默认那句：{acceptance}"
         );
 
         let again = vec![
