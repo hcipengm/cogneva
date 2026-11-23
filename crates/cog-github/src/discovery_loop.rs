@@ -6,8 +6,6 @@
 //! record outcomes into the reflection engine.
 
 use std::collections::HashMap;
-#[cfg(test)]
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
