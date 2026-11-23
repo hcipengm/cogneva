@@ -71,6 +71,21 @@ pub fn agent_id_for(task_id: &str, role: &str) -> String {
     format!("{}-{role}", squad_id_for(task_id))
 }
 
+/// [`agent_id_for`] 的反向：这个地址是 `task_id` 的哪一把座位。
+///
+/// 账本要在「进 running」那一刻记下这一段的角色，而那一刻手里只有执行地址
+/// ——角色没有第二处可读，它只写在地址里。所以反解与正拼放在一起，一次测试
+/// 管住两头：名字的形状改了而这里没改，两段尝试会各自记下自己的角色，读的
+/// 人却看不出哪个是哪个。
+///
+/// `None` 是「这不是这件任务的座位」：一个人的工号、别的任务的座位、或者
+/// 空座位名，都不该被认成这里的职务。
+pub fn role_of_seat<'a>(task_id: &str, agent_id: &'a str) -> Option<&'a str> {
+    let prefix = format!("{}-", squad_id_for(task_id));
+    let role = agent_id.strip_prefix(prefix.as_str())?;
+    (!role.is_empty()).then_some(role)
+}
+
 /// 一个 id 背后站着的那个人；座位形的 id 背后还没有人。
 ///
 /// 人与座位是两件事：人是稳定的身份，座位是 `(task, role)` 的一段执行地址。
@@ -344,6 +359,31 @@ mod naming_tests {
         );
         // 前缀是唯一的分界线：名字里带 squad 但不在开头的是一个人，不是座位。
         assert_eq!(person_id_for("squad-member-kai"), Some("squad-member-kai"));
+    }
+
+    /// 角色能从执行地址里原样读回来：账本记「这一段是谁的哪把椅子」时只有地址。
+    ///
+    /// 两条错法各判一次：把别的任务（或别人的工号）认成本任务的座位，会让一处
+    /// 尝试记上别处的职务；任务 id 互为前缀时（`t-1` 与 `t-11`）少判一个分隔符
+    /// 就会把 `t-11` 的座位算成 `t-1` 的。
+    #[test]
+    fn a_seat_reads_back_the_role_it_was_built_with() {
+        for (task, role) in [
+            ("t-1", "planner"),
+            ("t-11", "generator"),
+            ("DSC-1A2B", "evaluator"),
+        ] {
+            let seat = agent_id_for(task, role);
+            assert_eq!(role_of_seat(task, &seat), Some(role));
+        }
+        assert_eq!(role_of_seat("t-1", &agent_id_for("t-11", "planner")), None);
+        assert_eq!(role_of_seat("t-11", &agent_id_for("t-1", "planner")), None);
+        assert_eq!(role_of_seat("t-1", "mira-512bfc48"), None);
+        assert_eq!(
+            role_of_seat("t-1", &squad_id_for("t-1")),
+            None,
+            "空座位名不是职务"
+        );
     }
 
     /// 车道名只由 id 决定，且落在目录名允许的那一组字节里。

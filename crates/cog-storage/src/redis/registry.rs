@@ -244,6 +244,40 @@ impl RedisAgentRegistry {
         }
     }
 
+    /// 把工号写进这一把座位的名册行；行不在就不写。
+    ///
+    /// 一次脚本而不是「读、改、写」：中间那一刻读名册的人会看到一把没有人的
+    /// 座位，而「还没有人」正是这一格要说的另一件事——两者同形，读的人分不出
+    /// 是派工还没到，还是这一笔写丢了。
+    ///
+    /// 行不在返回 `Err`：对从没注册过的名字造一行等于凭空造出一个人（见
+    /// `tombstone_employee`）。座位先注册、派工再写人，顺序反了是一处缺陷，
+    /// 应当报出来而不是安静地补一行。
+    async fn write_person(&self, agent_id: &str, person_id: &str) -> SFResult<()> {
+        let mut conn = self.connection.clone();
+        let script = redis::Script::new(
+            "local cur = redis.call('HGET', KEYS[1], ARGV[1]) \
+             if not cur then return 0 end \
+             local row = cjson.decode(cur) \
+             row.person_id = ARGV[2] \
+             redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(row)) \
+             return 1",
+        );
+        let written: i64 = script
+            .key(EMPLOYEES_KEY)
+            .arg(agent_id)
+            .arg(person_id)
+            .invoke_async(&mut conn)
+            .await
+            .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
+        if written == 0 {
+            return Err(SFError::Agent(format!(
+                "{agent_id} has no roster row: a person can be bound to a seat that registered first"
+            )));
+        }
+        Ok(())
+    }
+
     /// Take the index entry off a name whose record has already gone.
     ///
     /// The expiry is the writer's, so a record usually disappears without any
@@ -447,6 +481,10 @@ impl AgentRegistry for RedisAgentRegistry {
             Some(text) => Some(decode_employee(agent_id, &text)?),
         })
     }
+
+    async fn assign_person(&self, agent_id: &str, person_id: &str) -> SFResult<()> {
+        self.write_person(agent_id, person_id).await
+    }
 }
 
 // ─── In-memory implementation ───
@@ -617,6 +655,20 @@ impl AgentRegistry for MemoryAgentRegistry {
             .read()
             .map_err(|_| SFError::Agent("memory registry lock poisoned".into()))?;
         Ok(store.employees.get(agent_id).cloned())
+    }
+
+    async fn assign_person(&self, agent_id: &str, person_id: &str) -> SFResult<()> {
+        let mut store = self
+            .store
+            .write()
+            .map_err(|_| SFError::Agent("memory registry lock poisoned".into()))?;
+        let row = store.employees.get_mut(agent_id).ok_or_else(|| {
+            SFError::Agent(format!(
+                "{agent_id} has no roster row: a person can be bound to a seat that registered first"
+            ))
+        })?;
+        row.person_id = Some(person_id.to_string());
+        Ok(())
     }
 }
 

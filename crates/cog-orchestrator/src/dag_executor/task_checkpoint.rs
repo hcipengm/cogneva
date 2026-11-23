@@ -22,17 +22,31 @@ use cog_core::{AgentManager, CheckpointStore, SFResult, StateBackend};
 // 板上的续跑指针字段名与 agent 的命名，词汇定义在 `cog-core`：产出侧（本模块）
 // 与恢复侧（派发时建 agent 的那一端）各写一份字面量不会报错，只会让两边认领的
 // 不是同一批 agent，而整条链看起来就像「从来没有可续跑的进度」。
-use cog_core::{agent_id_for, checkpoint_field};
+use cog_core::checkpoint_field;
 
-/// `agent_id` 是不是 `task_id` 这个任务的 agent。
+/// 这个执行体是不是 `task_id` 这件任务现起的。
 ///
-/// 任务与 agent 的唯一关联是命名约定（[`agent_id_for`]）——没有映射表，注册表
-/// 里那份 `task_ids` 在生产里也没有产出方。角色不从这个 id 里解析，而是由
-/// agent 自己声明（`WorkerInfo.role`）后拼回去精确比对：解析式（取任务 id 之后
-/// 的全部）在任务 id 互为前缀时会互相认领，`t-1` 会把 `t-11-planner` 算成自己
-/// 的 `1-planner`，于是写下去的指针挂到了别人的板上。
-pub fn belongs_to_task(agent_id: &str, role: &str, task_id: &str) -> bool {
-    !role.is_empty() && agent_id == agent_id_for(task_id, role)
+/// 读的是名册行上那一格 `owner_task`——「它替哪件任务干活」写在行上，不由名字
+/// 推。从名字推要解析出角色再拼回去比，任务 id 互为前缀时就会互相认领（`t-1`
+/// 把 `t-11-planner` 算成自己的 `1-planner`），写下去的指针挂到别人的板上。
+/// 名册行是建这个执行体的人写的，它答得比任何一个字符串形状都准：座位换了名
+/// 字（同一件活换一把椅子）归属不该跟着丢，换了任务归属必须跟着变，而这两件
+/// 事都只有那一格说得清。
+///
+/// 常驻员工的行上 `owner_task` 是空的：它不属于任何一件活，也不会被任何一件
+/// 活的续跑点名。
+///
+/// 答案还要再看一层名字：并行分支的执行体（`<任务>-branch-<n>-<座位>`）行上
+/// 写的也是这件任务，但它们不是任务级的座位。续跑指针在板上只按角色取一格
+/// （`checkpoint:<角色>`），分支的 planner 与任务级的 planner 同名，放进来就会
+/// 互相覆盖，恢复时读到的是另一支的对话。分支的进度由 roundtable 自己那一支
+/// 收着，不在这张板的这一格。所以「行说它替这件活干」之外，名字必须是这件活
+/// 现起的那把座位——比的是 [`agent_id_for`] 拼出来的整串，不是从名字里解析，
+/// 任务 id 互为前缀时也就不会互相认领。
+pub fn belongs_to_task(worker: &cog_core::WorkerInfo, task_id: &str) -> bool {
+    worker.owner_task.as_deref() == Some(task_id)
+        && !worker.role.is_empty()
+        && worker.agent_id == cog_core::agent_id_for(task_id, &worker.role)
 }
 
 /// 一轮产出侧动作的读数。
@@ -141,7 +155,7 @@ impl CheckpointAgents for LiveCheckpointAgents {
         let workers = self.manager.list_workers().await?;
         Ok(workers
             .into_iter()
-            .filter(|w| belongs_to_task(&w.agent_id, &w.role, task_id))
+            .filter(|w| belongs_to_task(w, task_id))
             .map(|w| (w.agent_id, w.role))
             .collect())
     }
@@ -576,22 +590,55 @@ mod tests {
             );
     }
 
+    fn worker(agent_id: &str, role: &str, owner_task: Option<&str>) -> cog_core::WorkerInfo {
+        cog_core::WorkerInfo {
+            agent_id: agent_id.to_string(),
+            role: role.to_string(),
+            owner_task: owner_task.map(str::to_string),
+        }
+    }
+
     #[test]
-    fn an_agent_belongs_to_the_task_its_id_names() {
-        assert!(belongs_to_task("squad:t-1-planner", "planner", "t-1"));
-        assert!(belongs_to_task("squad:t-1-evaluator", "evaluator", "t-1"));
+    fn an_agent_belongs_to_the_task_its_roster_row_names() {
+        assert!(belongs_to_task(
+            &worker("squad:t-1-planner", "planner", Some("t-1")),
+            "t-1"
+        ));
+        // 换一把椅子还是同一件活：归属读名册行，身份读座位的名字。
+        assert!(belongs_to_task(
+            &worker("squad:t-1-generator", "generator", Some("t-1")),
+            "t-1"
+        ));
         // 任务 id 互为前缀时不许互相认领：这条错了，写下去的就是别人的续跑点。
-        assert!(!belongs_to_task("squad:t-11-planner", "planner", "t-1"));
-        assert!(!belongs_to_task("squad:t-1-planner", "planner", "t-11"));
-        assert!(!belongs_to_task("squad:t-2-planner", "planner", "t-1"));
-        // 少了 squad 前缀的裸任务名不是这个词汇里的一个 id。
-        assert!(!belongs_to_task("t-1", "planner", "t-1"));
-        assert!(!belongs_to_task("t-1-planner", "planner", "t-1"));
-        // 角色必须与 id 的尾段一致：声明是 planner 的 agent 不该被按 generator 认领。
-        assert!(!belongs_to_task("squad:t-1-planner", "generator", "t-1"));
-        assert!(!belongs_to_task("squad:t-1-planner", "", "t-1"));
-        // 并行分支的 agent 有自己的一段后缀，不属于任务级的这个角色。
-        assert!(!belongs_to_task("t-1-branch-0-planner", "planner", "t-1"));
+        assert!(!belongs_to_task(
+            &worker("squad:t-11-planner", "planner", Some("t-11")),
+            "t-1"
+        ));
+        assert!(!belongs_to_task(
+            &worker("squad:t-1-planner", "planner", Some("t-1")),
+            "t-11"
+        ));
+        // 名字看着像这件任务的座位、行上却说替别人干活：行说了算。
+        assert!(!belongs_to_task(
+            &worker("squad:t-1-planner", "planner", Some("t-2")),
+            "t-1"
+        ));
+        // 常驻员工不属于任何一件活。
+        assert!(!belongs_to_task(
+            &worker("mira-512bfc48", "planner", None),
+            "t-1"
+        ));
+        // 并行分支的执行体也替这件活干活，但它不是任务级的座位：板的续跑指针
+        // 按角色一格，放它进来就会与任务级同名角色互相覆盖。
+        assert!(!belongs_to_task(
+            &worker("t-1-branch-0-planner", "planner", Some("t-1")),
+            "t-1"
+        ));
+        // 行说替这件活干，名字的尾段却是另一个角色：不是这件活的座位。
+        assert!(!belongs_to_task(
+            &worker("squad:t-1-generator", "planner", Some("t-1")),
+            "t-1"
+        ));
     }
 
     #[test]
@@ -601,7 +648,10 @@ mod tests {
 
     #[test]
     fn the_agent_id_is_derived_not_spelled() {
-        assert_eq!(agent_id_for("t-1", "planner"), "squad:t-1-planner");
+        assert_eq!(
+            cog_core::agent_id_for("t-1", "planner"),
+            "squad:t-1-planner"
+        );
     }
 
     #[tokio::test]

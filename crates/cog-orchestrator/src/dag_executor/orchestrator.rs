@@ -97,6 +97,14 @@ pub struct DagExecutor {
     /// retires nothing and the roster keeps growing — which is the state this
     /// field exists to end, so it is wired in the same place the pool is.
     agent_manager: std::sync::RwLock<Option<Arc<dyn cog_core::AgentManager>>>,
+    /// 员工名册：座位背后坐着谁，只有名册行答得出来。
+    ///
+    /// 任务行的 `owner_unit` 写的是**工号**；来认领或交活的可能是那个人这一
+    /// 段的座位（`squad:<任务>-<座位>`），而座位名里没有工号。判「这一手是不是
+    /// 行上那位」要它，所以它和池子挂在一起：池子建的都是座位，座位背后的人
+    /// 写在名册上。没挂的时候座位形认领按旧口径判（名字要比得一模一样），
+    /// 那是这个进程读不到名册，不是判据说「不行」。
+    roster: std::sync::RwLock<Option<Arc<dyn cog_core::AgentRegistry>>>,
     /// 测试用：读到这些 id 的那一问答不上来。它交出的正是存储坏掉时的形状，
     /// 让「读不到」与「没有这一行」在测试里分得开；生产构建里没有这一格。
     #[cfg(test)]
@@ -347,6 +355,7 @@ impl DagExecutor {
             archive_poll_interval_secs: 300,
             metrics: std::sync::RwLock::new(None),
             agent_manager: std::sync::RwLock::new(None),
+            roster: std::sync::RwLock::new(None),
             #[cfg(test)]
             unreadable_tasks: Default::default(),
             board_wip_limits: std::sync::RwLock::new(cog_core::BoardWipLimits::from_env().0),
@@ -366,6 +375,47 @@ impl DagExecutor {
             .agent_manager
             .write()
             .unwrap_or_else(|e| e.into_inner()) = Some(manager);
+    }
+
+    /// 挂上员工名册：座位背后是谁只写在那儿。
+    ///
+    /// 与 `attach_agent_manager` 同一次装配里挂：池子建的是座位，名册行是座位
+    /// 注册时写下的那一行。没挂的时候，座位形认领与结果按旧口径判（名字要比得
+    /// 一模一样），这读作「这个进程读不到名册」，不读作「那个人不该干」。
+    pub fn attach_roster(&self, roster: Arc<dyn cog_core::AgentRegistry>) {
+        *self.roster.write().unwrap_or_else(|e| e.into_inner()) = Some(roster);
+    }
+
+    /// 一个名字代表的工号：人形 id 就是他自己，座位形问名册行。
+    ///
+    /// `None` 是读数：名册没挂、座位还没有人、或者名册读失败都落在这里。三种
+    /// 都让调用方退回旧口径，而不是把「读不到」当成「不是他」。
+    pub(crate) async fn claimant_person(&self, claimant: &str) -> Option<String> {
+        // 与控制面判「谁在认领」的那一处同一个口径：认领判据比对的是去空白后的
+        // 名字（[`crate::ready_queue::approve_claim_for`]）。这里不去，派工就会
+        // 把带空白的名字写进行上的负责人格，而之后任何一次认领都比不上它——
+        // 那条行既出不了共享队列（有主），也没有人接得走。
+        let claimant = claimant.trim();
+        if let Some(person) = cog_core::person_id_for(claimant) {
+            return Some(person.to_string());
+        }
+        let roster = self
+            .roster
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()?;
+        match roster.employee(claimant).await {
+            Ok(Some(row)) => row.person().map(str::to_string),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    claimant,
+                    error = %e,
+                    "the roster could not be read for this name; judging the claim by the name alone"
+                );
+                None
+            }
+        }
     }
 
     /// Attach the metrics backend the DAG's own repairs report to. Called once
@@ -2800,12 +2850,24 @@ impl DagExecutor {
         let now = chrono::Utc::now();
         let lease = self.task_lease;
         let expected = [TaskStatus::Pending, TaskStatus::Scheduled];
+        // 认领者代表的那个人：派工写的就是这个人（见下面 `owner_unit` 那一笔）。
+        let person = self.claimant_person(claimant).await;
 
         if self.fg().is_some() {
             let be = self.fg().expect("store mode");
             let task = self.store_task(task_id).await?;
-            let claimed = crate::ready_queue::approve_claim(&task, claimant, lease, now)
-                .map_err(|refusal| claim_refusal_as_error(task_id, claimant, refusal))?;
+            let claimed = crate::ready_queue::approve_claim_for(
+                &task,
+                claimant,
+                person.as_deref(),
+                lease,
+                now,
+            )
+            .map_err(|refusal| claim_refusal_as_error(task_id, claimant, refusal))?;
+            // 派工写人：这一行还没有负责人、而且它是一件会被指定归属的活时，
+            // 接走它的人就是它的负责人。写进同一笔认领里，读面不会看到「有人
+            // 在跑，却没有负责人」的那一瞬。
+            let claimed = with_the_dispatch_person(claimed, person.as_deref());
             be.dag_claim_task(&self.workspace_id, task_id, &expected, &claimed)
                 .await?;
             if claimed.status != task.status {
@@ -2827,8 +2889,10 @@ impl DagExecutor {
                 task_id: task_id.into(),
                 reason: "Task not found".into(),
             })?;
-        let claimed = crate::ready_queue::approve_claim(task, claimant, lease, now)
-            .map_err(|refusal| claim_refusal_as_error(task_id, claimant, refusal))?;
+        let claimed =
+            crate::ready_queue::approve_claim_for(task, claimant, person.as_deref(), lease, now)
+                .map_err(|refusal| claim_refusal_as_error(task_id, claimant, refusal))?;
+        let claimed = with_the_dispatch_person(claimed, person.as_deref());
         let was_pending = task.status == TaskStatus::Pending;
         *task = claimed.clone();
         drop(inner);
@@ -4971,6 +5035,27 @@ fn name_unclosable_kinds(unclosable: &std::collections::BTreeMap<String, Vec<Str
     }
 }
 
+/// 派工写人：这一行还没有负责人时，接走它的人的工号就是负责人。
+///
+/// 只在三个条件同时成立时写：认领者背后答得出一个工号（人形 id 就是他自己；
+/// 座位形 id 问名册行，问不到就没有）；这一行还没有负责人；它不是急件——那一
+/// 列是「谁空谁跑」，在它上面写一个负责人等于给一条谁都能跑的行钉上一把谁都
+/// 看不见的锁，读面还会把「谁跑了它」读成「它属于那个人」。
+///
+/// 已经有负责人的行不动：那一格是别人指定下来的路由决定，或者上一段尝试写下
+/// 的同一个人。认领能走到这里，已经由 [`crate::ready_queue::approve_claim_for`]
+/// 判过「认领者代表得了他」，再写一遍只会把同一个事实写成两种来源。
+fn with_the_dispatch_person(mut claimed: Task, person: Option<&str>) -> Task {
+    let Some(person) = person else {
+        return claimed;
+    };
+    if claimed.owner_unit.is_some() || crate::ready_queue::is_stop_the_line(&claimed) {
+        return claimed;
+    }
+    claimed.owner_unit = Some(person.to_string());
+    claimed
+}
+
 /// 一次被拒的认领，翻成调用方要分得清的那两种错。
 ///
 /// 「别人先接了」「这条行已经跑起来了」是竞争，不是坏掉：读的人该重读一次或者
@@ -5014,7 +5099,8 @@ mod tests {
     use super::*;
     use crate::test_support::warn_text;
     use cog_core::{
-        AgentState, ContextBoard, Event, MetricsBackend, StateBackend, TaskCheckpoint, TaskType,
+        AgentRegistry, AgentState, ContextBoard, Event, MetricsBackend, StateBackend,
+        TaskCheckpoint, TaskType,
     };
 
     /// 本部署读哪些就绪队列——清扫器的范围判据，与运行期同一个函数。
@@ -5988,6 +6074,120 @@ mod tests {
             row.claimed_by(),
             Some(holder),
             "两个 pod 之后读到的必须是同一个认领者"
+        );
+    }
+
+    /// 一件待接的活，带验收标准（没有它认领会被「关不掉的活」拦下）。
+    fn claimable(id: &str) -> Task {
+        let mut task = Task::new(id, TaskType::DagNode, serde_json::json!({}));
+        task.acceptance = vec!["the row is done when it says so".to_string()];
+        task
+    }
+
+    /// R17 的判据：同一个人换一把座位再做同一件活，行上写的始终是工号。
+    ///
+    /// 座位名（`squad:<任务>-<座位>`）里没有工号，只有名册行答得出来。第一段
+    /// 尝试失败、行回到待接之后，第二段尝试坐在另一把椅子上：认领必须被批准
+    /// ——那是同一个人——而行上的负责人不能因为他换了椅子就变成那把椅子的名
+    /// 字。两把座位的角色不同（`planner` 对 `generator`），所以这一条判的不是
+    /// 「名字一样」，是「人一样」。
+    #[tokio::test]
+    async fn the_same_person_taking_a_row_twice_keeps_their_number_on_it() {
+        let seats = Arc::new(crate::test_support::Seats::default());
+        let task_id = "t-person";
+        let first = cog_core::agent_id_for(task_id, cog_core::roles::PLANNER);
+        let second = cog_core::agent_id_for(task_id, cog_core::roles::GENERATOR);
+        seats.assign_person(&first, "E0412").await.unwrap();
+        seats.assign_person(&second, "E0412").await.unwrap();
+        assert_ne!(first, second, "这条用例的前提是两把椅子不是一个名字");
+
+        let dag = DagExecutor::new("ws-person".into());
+        dag.attach_roster(seats);
+        dag.add_task(claimable(task_id)).await.unwrap();
+
+        let claimed = dag.claim_task(task_id, &first).await.unwrap();
+        assert_eq!(
+            claimed.owner_unit.as_deref(),
+            Some("E0412"),
+            "派工写人：认领之后行上的负责人是认领者背后的工号，不是座位名"
+        );
+        assert_eq!(claimed.claimed_by(), Some(first.as_str()));
+
+        // 第一段尝试失败，行回到待接：负责人留在行上，租约清掉。
+        let (retried, _, _) = dag.fail_task(task_id, "boom".into(), None).await.unwrap();
+        assert!(retried, "第一次失败还有重试预算，行必须回到待接");
+
+        let again = dag.claim_task(task_id, &second).await.unwrap();
+        assert_eq!(
+            again.owner_unit.as_deref(),
+            Some("E0412"),
+            "换一把椅子的人不是另一个人：行上的工号不能变"
+        );
+        assert_eq!(again.claimed_by(), Some(second.as_str()));
+    }
+
+    /// 工号不同就是另一个人：座位形认领按名册判，不按名字长得像判。
+    #[tokio::test]
+    async fn a_seat_of_another_person_cannot_take_an_owned_row() {
+        let seats = Arc::new(crate::test_support::Seats::default());
+        let task_id = "t-owned";
+        let other = cog_core::agent_id_for(task_id, cog_core::roles::EVALUATOR);
+        seats.assign_person(&other, "E0455").await.unwrap();
+
+        let dag = DagExecutor::new("ws-owned".into());
+        dag.attach_roster(seats);
+        let mut task = claimable(task_id);
+        task.owner_unit = Some("E0412".to_string());
+        dag.add_task(task).await.unwrap();
+
+        let err = dag.claim_task(task_id, &other).await.unwrap_err();
+        assert!(
+            err.to_string().contains("E0412"),
+            "拒绝里要点名行上的那个人，实得 {err}"
+        );
+    }
+
+    /// 名册上还没有这一把座位时，不写负责人：读不到不是「他不是那个人」。
+    #[tokio::test]
+    async fn a_seat_without_a_person_leaves_the_row_unowned() {
+        let seats = Arc::new(crate::test_support::Seats::default());
+        let task_id = "t-unbound";
+        let seat = cog_core::agent_id_for(task_id, cog_core::roles::GENERATOR);
+
+        let dag = DagExecutor::new("ws-unbound".into());
+        dag.attach_roster(seats);
+        dag.add_task(claimable(task_id)).await.unwrap();
+
+        let claimed = dag.claim_task(task_id, &seat).await.unwrap();
+        assert_eq!(
+            claimed.owner_unit, None,
+            "名册答不出这一把座位背后是谁时，行上不写一个猜出来的人"
+        );
+        assert_eq!(claimed.claimed_by(), Some(seat.as_str()));
+    }
+
+    /// 认领判据比对的是去空白后的名字，写进负责人格的那一格也必须去。
+    ///
+    /// 写进去的与之后比对用的不是同一个字符串，那条行就再也接不走：它有主
+    /// （出不了共享队列），而「` E0412`」与「`E0412`」谁都不是对方。
+    #[tokio::test]
+    async fn a_padded_name_is_written_down_without_its_padding() {
+        let dag = DagExecutor::new("ws-pad".into());
+        dag.add_task(claimable("t-pad")).await.unwrap();
+
+        let claimed = dag.claim_task("t-pad", "  E0412  ").await.unwrap();
+        assert_eq!(
+            claimed.owner_unit.as_deref(),
+            Some("E0412"),
+            "负责人格上写的必须是之后比对时读得回来的那个名字"
+        );
+        let (retried, _, _) = dag.fail_task("t-pad", "boom".into(), None).await.unwrap();
+        assert!(retried, "第一次失败还有重试预算，行必须回到待接");
+        let again = dag.claim_task("t-pad", "E0412").await.unwrap();
+        assert_eq!(
+            again.owner_unit.as_deref(),
+            Some("E0412"),
+            "同一个人用没带空白的名字接回来，行上那一格必须还是他"
         );
     }
 

@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use cog_core::{Agent, AgentManager, LlmClient, SFResult, StateBackend};
+use cog_core::{Agent, AgentManager, AgentRegistry, LlmClient, SFResult, StateBackend};
 
 /// 恢复端可能的结局，闭集。
 ///
@@ -32,18 +32,25 @@ pub const RESUME_OUTCOMES: [&str; 2] = ["restored", "failed"];
 /// `stated_directions` 是同一份声明里来自人的那半（`Task::stated_directions`）：
 /// 有人就这件活说过「往哪儿算好」。它跟着声明一起走，因为它改的也是判活的标准，
 /// 而每个座位都要按它判自己的产出——不只产出改动的那一个。
+///
+/// `roster` 与 `person` 是这一段座位背后的人：任务行上写的是工号，执行地址是
+/// `squad:<任务>-<座位>`，座位名里没有工号。建完座位就把这一格写进名册行，
+/// 判「认领与交活的是不是行上那位」时才有一处问得出来。
 pub(crate) async fn create_role_agent(
     manager: &Arc<dyn AgentManager>,
     llm: &Arc<dyn LlmClient>,
     state: Option<&Arc<dyn StateBackend>>,
+    roster: Option<&Arc<dyn AgentRegistry>>,
+    person: Option<&str>,
     task_id: &str,
     role: &str,
     deliverable: cog_core::DeliverableDeclaration,
     stated_directions: Vec<String>,
 ) -> SFResult<Arc<dyn Agent>> {
+    let agent_id = cog_core::agent_id_for(task_id, role);
     let agent = manager
         .create_agent_declaring(
-            &cog_core::agent_id_for(task_id, role),
+            &agent_id,
             role,
             llm.clone(),
             Some(task_id),
@@ -51,8 +58,66 @@ pub(crate) async fn create_role_agent(
             stated_directions,
         )
         .await?;
+    bind_the_seat_to_its_person(roster, &agent_id, person).await;
     resume_if_checkpointed(state, &agent, task_id, role).await;
     Ok(agent)
+}
+
+/// 把这一把座位记为那个人的：名册行是唯一答得出「座位背后坐着谁」的地方。
+///
+/// 座位名里没有工号，所以任务行上的负责人（`owner_unit`）与交活、认领时报上
+/// 来的座位名之间，只有这一格能把两者连起来。没有它就退回「名字要比得一模
+/// 一样」的旧口径：同一个人换一把椅子交回结果，会被判成别人在交。
+///
+/// 写失败只记一行日志，不拦这一趟。座位已经建好、能干活，缺的是归属的读数；
+/// 为一次名册写失败让整件任务不能跑，代价比「这一次归属读不到」大得多，而读
+/// 不到的那一侧本来就有旧口径兜着，不是把活判死。
+async fn bind_the_seat_to_its_person(
+    roster: Option<&Arc<dyn AgentRegistry>>,
+    agent_id: &str,
+    person: Option<&str>,
+) {
+    let (Some(roster), Some(person)) = (roster, person) else {
+        return;
+    };
+    let person = person.trim();
+    if person.is_empty() {
+        return;
+    }
+    // 任务行上那一格在旧行里还可能是单元名或座位名（这一列在人是执行对象之前
+    // 装过那些东西）。写进名册行会让这把座位「代表」那个单元，而认领判据从此
+    // 对同一件活的每一把座位放行——那不是同一个人，是一条谁都能拿的锁。所以
+    // 只有名册上答得出、且答的就是这个人的名字才写得下。读不到名册按旧口径判
+    // （名字要比得一模一样），与认领与交活两处读数失败时的退法一致。
+    match roster.employee(person).await {
+        Ok(Some(row)) if row.person() == Some(person) => {}
+        Ok(_) => {
+            tracing::debug!(
+                agent_id,
+                person,
+                "the task row names nobody in the roster; leaving this seat unattached"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                agent_id,
+                person,
+                error = %e,
+                "the roster could not be read for the task's owner; leaving this seat unattached"
+            );
+            return;
+        }
+    }
+    if let Err(e) = roster.assign_person(agent_id, person).await {
+        tracing::warn!(
+            agent_id,
+            person,
+            error = %e,
+            "the seat was created but its person could not be written to the roster; \
+             ownership checks fall back to comparing names"
+        );
+    }
 }
 
 /// 板上有这个角色的续跑指针就恢复，返回是否真的恢复了。

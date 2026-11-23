@@ -1729,11 +1729,21 @@ impl DagExecutorRuntime {
     /// restaffing pass wrote onto the row -- is the one that has the result.
     /// Asking [`crate::ready_queue::carries_an_owner`] rather than testing the
     /// lane again keeps this check and the two dispatch gates on one answer.
+    ///
+    /// 行上那一格写的是**工号**，交活的人可能是同一个人这一段的座位
+    /// （`squad:<任务>-<座位>`）。座位名里没有工号，只有名册行答得出来，所以
+    /// 「是不是他」要问 [`DagExecutor::claimant_person`]；名册读不到时它答
+    /// `None`，这里就退回旧口径（名字要比得一模一样）——读不到名册不是判据
+    /// 说「不行」。
     async fn result_names_another_owner(&self, task_id: &str, sender: &str) -> SFResult<bool> {
         Ok(match self.orchestrator.get_task_checked(task_id).await? {
             Some(task) if crate::ready_queue::carries_an_owner(&task) => {
                 match task.owner_unit.as_deref() {
-                    Some(owner) => owner != sender,
+                    Some(owner) => {
+                        owner != sender
+                            && self.orchestrator.claimant_person(sender).await.as_deref()
+                                != Some(owner)
+                    }
                     None => false,
                 }
             }
@@ -2512,7 +2522,7 @@ async fn wbs_verdict_no_longer_holds(
 mod consumer_ack_tests {
     use super::*;
     use async_trait::async_trait;
-    use cog_core::{MessageStream, Observable};
+    use cog_core::{AgentRegistry, MessageStream, Observable};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -3441,6 +3451,66 @@ mod consumer_ack_tests {
                 .await
                 .expect("读得到的时候这一问没有第二种答案"),
             "and the owner's own result is still accepted"
+        );
+    }
+
+    /// 座位交回的结果算它背后那个人的：行上写的是工号，交活的是座位。
+    ///
+    /// 同一个人的另一把椅子、以及这个人的工号本身都算行上那位；另一个人的
+    /// 座位不算。名册读不到时退回旧口径（名字要比得一模一样），这条用例钉的
+    /// 是读得到的那一半。
+    #[tokio::test]
+    async fn a_seats_result_counts_as_its_persons() {
+        let backend = ScriptedBackend::default();
+        let config = DagExecutorConfig {
+            redis_url: "memory".into(),
+            workspace_id: "ws-seat-result".into(),
+            consumer_group: "grp-seat-result".into(),
+            max_retries: 1,
+            ..DagExecutorConfig::default()
+        };
+        let runtime = test_runtime_with(backend.clone(), config);
+        runtime
+            .orchestrator()
+            .submit_goal(
+                "goal-seat-result",
+                vec![ready_task("task-seat", serde_json::json!({}))],
+            )
+            .await
+            .unwrap();
+        runtime
+            .orchestrator()
+            .assign_task("task-seat", "E0412")
+            .await
+            .expect("a pending task takes a binding");
+
+        let same_person = cog_core::agent_id_for("task-seat", cog_core::roles::GENERATOR);
+        let other_person = cog_core::agent_id_for("task-seat", cog_core::roles::EVALUATOR);
+        let seats = Arc::new(crate::test_support::Seats::default());
+        seats.assign_person(&same_person, "E0412").await.unwrap();
+        seats.assign_person(&other_person, "E0455").await.unwrap();
+        runtime.orchestrator().attach_roster(seats);
+
+        assert!(
+            !runtime
+                .result_names_another_owner("task-seat", &same_person)
+                .await
+                .expect("读得到的时候这一问没有第二种答案"),
+            "同一个人换一把椅子交活，交的仍是行上那位的活"
+        );
+        assert!(
+            runtime
+                .result_names_another_owner("task-seat", &other_person)
+                .await
+                .expect("读得到的时候这一问没有第二种答案"),
+            "另一个人的座位交的不是行上那位的活"
+        );
+        assert!(
+            !runtime
+                .result_names_another_owner("task-seat", "E0412")
+                .await
+                .expect("读得到的时候这一问没有第二种答案"),
+            "工号本人交活照旧算数"
         );
     }
 

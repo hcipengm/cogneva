@@ -201,6 +201,25 @@ pub fn approve_claim(
     lease: chrono::Duration,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Task, ClaimRefusal> {
+    approve_claim_for(task, claimant, None, lease, now)
+}
+
+/// 同上，外加「认领者代表谁」。
+///
+/// 任务行上写的负责人是一个**工号**（人），来的可能是那个人自己，也可能是
+/// 他这一段的座位（`squad:<任务>-<座位>`）——同一个人的两把椅子。后者只有
+/// 名册行答得出来（`EmployeeRecord::person_id`），所以由调用方读了名册再传进
+/// 来：这一层是判据，不是读面，它判的是「这个人是不是行上那位」。
+///
+/// `claimant_person` 为 `None` 时退回旧口径（认领者就是行上那个名字）：没有
+/// 名册的实现、旧行（`owner_unit` 里写的是座位）都按这一条走。
+pub fn approve_claim_for(
+    task: &Task,
+    claimant: &str,
+    claimant_person: Option<&str>,
+    lease: chrono::Duration,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Task, ClaimRefusal> {
     let claimant = claimant.trim();
     if claimant.is_empty() {
         return Err(ClaimRefusal::Anonymous);
@@ -228,7 +247,8 @@ pub fn approve_claim(
     // 「谁空谁跑」，它上面留着的归属不拦人（见 [`carries_an_owner`]）。
     if carries_an_owner(task) {
         if let Some(owner) = task.owner_unit.as_deref() {
-            if owner != claimant {
+            let acts_for_owner = owner == claimant || claimant_person == Some(owner);
+            if !acts_for_owner {
                 return Err(ClaimRefusal::NamesAnotherOwner(owner.to_string()));
             }
         }
@@ -1699,6 +1719,42 @@ mod tests {
             "急件行上的归属是一次路由偏好，不是锁"
         );
         assert!(approve_claim(&urgent, "E0412", lease, now).is_ok());
+    }
+
+    /// 行上的负责人是工号，来认领的是那个人这一段坐的椅子。
+    ///
+    /// 座位名（`squad:<任务>-<座位>`）里没有工号，所以判据不能只比名字：判据
+    /// 收的是调用方读完名册后说的「这个认领者代表谁」。代表的正是行上那位时
+    /// 认；代表另一个人、或者读不到时（`None`），退回旧口径按名字比。
+    #[test]
+    fn a_seat_claims_for_the_person_its_roster_row_names() {
+        let now = chrono::Utc::now();
+        let lease = chrono::Duration::seconds(300);
+        let mut designated = task("t1", TaskType::DagNode, serde_json::json!({}));
+        designated.acceptance = vec!["the build passes".into()];
+        designated.owner_unit = Some("E0412".into());
+        let seat = cog_core::agent_id_for("t1", cog_core::roles::PLANNER);
+
+        assert!(
+            approve_claim_for(&designated, &seat, Some("E0412"), lease, now).is_ok(),
+            "同一个人换一把椅子坐下，接的仍是他的活"
+        );
+        assert_eq!(
+            approve_claim_for(&designated, &seat, Some("E0455"), lease, now),
+            Err(ClaimRefusal::NamesAnotherOwner("E0412".into())),
+            "另一个人的椅子接不走这条行"
+        );
+        assert_eq!(
+            approve_claim_for(&designated, &seat, None, lease, now),
+            Err(ClaimRefusal::NamesAnotherOwner("E0412".into())),
+            "读不到名册不是「是他」：退回旧口径，名字要比得一模一样"
+        );
+        assert_eq!(
+            approve_claim_for(&designated, "E0412", None, lease, now)
+                .map(|claimed| claimed.claimed_by().map(str::to_string)),
+            Ok(Some("E0412".to_string())),
+            "工号本人认领照旧走名字这一条"
+        );
     }
 
     /// 两类各自保序：类内部打乱会让同一类里等得最久的那条排到最后。

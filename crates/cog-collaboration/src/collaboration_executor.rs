@@ -556,6 +556,11 @@ impl CollaborationExecutor {
 
     /// 这条活该交给谁——与派工侧认领时问的是同一个函数。
     ///
+    /// 行上写了负责人（`owner_unit`，派工写下的工号）就是那个人：这是一次路由
+    /// 决定，重试的回程也得走它。不问他的话，第二次派工会挑另一个人，而认领
+    /// 判据会以「不归你」把这次派发挡回去——那条行就此停在待接，谁也不再试。
+    /// 那个人不在名册上（走了、或那是一把旧行上的座位名）时往下走，按旧口径挑。
+    ///
     /// 行上写了名字就是那个人（认得他的名册行才算：写着一个已经走了的人的名字
     /// 是「这条活没人」，不是「这个人」）。没写名字时挑**手头活最少**的常驻员工；
     /// 手头一样少时按游标轮流，谁都不会因为排在名册第一行而永远先接。
@@ -568,6 +573,11 @@ impl CollaborationExecutor {
         manager: &dyn cog_core::AgentManager,
         task: &Task,
     ) -> Option<String> {
+        if let Some(owner) = task.owner_unit.as_deref().map(str::trim) {
+            if !owner.is_empty() && matches!(manager.get_agent(owner).await, Ok(Some(_))) {
+                return Some(owner.to_string());
+            }
+        }
         if let Some(id) = named_employee(task) {
             // 名册上的一行不等于一个能接活的活对象：退役随时发生，名字还在纸上
             // 的那个人可能刚好在这之前走了。那时他不是「这个人」，是「没人」。
@@ -678,6 +688,9 @@ impl CollaborationExecutor {
         if let Some(ref gate) = self.pause_gate {
             squad_executor = squad_executor.with_pause_gate(gate.clone());
         }
+        // 这一段座位是谁的：行上写了工号就是那个人。座位建出来之后写进名册行，
+        // 判「认领与交活的是不是行上那位」时才有一处问得出来。
+        squad_executor = squad_executor.with_person(self.roster.clone(), task.owner_unit.clone());
 
         let result = squad_executor
             .execute_squad(
@@ -866,6 +879,8 @@ impl CollaborationExecutor {
         if let Some(ref gate) = self.pause_gate {
             squad_executor = squad_executor.with_pause_gate(gate.clone());
         }
+        // 同分解路径：行上写的工号是这一段座位的主人。
+        squad_executor = squad_executor.with_person(self.roster.clone(), task.owner_unit.clone());
 
         let mut context = Self::goal_context(task);
         if is_self_evolution {

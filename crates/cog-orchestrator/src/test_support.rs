@@ -127,3 +127,57 @@ impl WarnText {
         self.said().iter().any(|line| line.contains(needle))
     }
 }
+
+/// 只答得出「某把座位背后是谁」的名册：认领判据与结果判据读的就是这一格。
+///
+/// 名册的其余接口在用到它的用例里不判，所以它们答「没有」；`assign_person`
+/// 与 `employee` 必须成对——判据读的是后者，而它只能由前者写出来。
+#[derive(Default)]
+pub(crate) struct Seats(pub(crate) std::sync::Mutex<std::collections::HashMap<String, String>>);
+
+#[async_trait::async_trait]
+impl cog_core::AgentRegistry for Seats {
+    async fn register(&self, _r: &cog_core::AgentRegistration) -> cog_core::SFResult<()> {
+        Ok(())
+    }
+    async fn heartbeat(&self, _id: &str) -> cog_core::SFResult<()> {
+        Ok(())
+    }
+    async fn deregister(&self, _id: &str) -> cog_core::SFResult<()> {
+        Ok(())
+    }
+    async fn get(&self, _id: &str) -> cog_core::SFResult<Option<cog_core::AgentRegistration>> {
+        Ok(None)
+    }
+    async fn list(&self) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
+        Ok(Vec::new())
+    }
+    async fn list_by_role(
+        &self,
+        _role: &str,
+    ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
+        Ok(Vec::new())
+    }
+    async fn employee(
+        &self,
+        agent_id: &str,
+    ) -> cog_core::SFResult<Option<cog_core::EmployeeRecord>> {
+        let person = self.0.lock().unwrap().get(agent_id).cloned();
+        Ok(person.map(|person_id| cog_core::EmployeeRecord {
+            agent_id: agent_id.to_string(),
+            number: None,
+            role: cog_core::roles::GENERATOR.to_string(),
+            first_seen: chrono::Utc::now(),
+            last_seen: chrono::Utc::now(),
+            retired_at: None,
+            person_id: Some(person_id),
+        }))
+    }
+    async fn assign_person(&self, agent_id: &str, person_id: &str) -> cog_core::SFResult<()> {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(agent_id.to_string(), person_id.to_string());
+        Ok(())
+    }
+}

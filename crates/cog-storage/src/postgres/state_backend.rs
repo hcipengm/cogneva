@@ -250,6 +250,7 @@ CREATE TABLE IF NOT EXISTS task_attempt (
                 error_code TEXT,
                 error_text TEXT,
                 result TEXT,
+                role TEXT,
                 PRIMARY KEY (task_id, attempt_no)
             )
 ;

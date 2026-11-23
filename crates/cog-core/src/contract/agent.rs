@@ -538,6 +538,20 @@ pub trait AgentRegistry: Send + Sync {
     async fn employee(&self, _agent_id: &str) -> SFResult<Option<EmployeeRecord>> {
         Ok(None)
     }
+
+    /// 把一个人写进这一把座位的名册行：派工时定下谁做，执行时座位记下是谁。
+    ///
+    /// 人不是座位的属性，这件事只有一层写下来的地方，因为它的形状答不出来：
+    /// `squad:<task>-<role>` 里没有工号，`person_id_for` 对它只能答 `None`。
+    /// 派工那一刻写下的人，必须在这里落进名册，否则同一个工号与同一把座位之间
+    /// 唯一的联系只活在任务行上，名册读不出「坐在这儿的是谁」。
+    ///
+    /// 没有名册行的实现返回 `NotImplemented` 而不是静默成功：「记下了」与
+    /// 「这面名册根本不记事」在调用方那一侧是两句话，前者可以当作已落，后者
+    /// 只能作为一条读数的缺口报出去。
+    async fn assign_person(&self, _agent_id: &str, _person_id: &str) -> SFResult<()> {
+        Err(crate::SFError::NotImplemented("assign_person".into()))
+    }
 }
 
 // ─── Agent Manager ─────────────────────────────────────────────────────────

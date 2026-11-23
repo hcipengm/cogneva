@@ -69,9 +69,85 @@ fn renames_after_the_ledger() -> Vec<(String, String)> {
     out
 }
 
-/// 095 的文本，按顺序走完后面那些改名。
+/// 095 之后落在账本上的**新列**：`(表, 列, 定义)`，按版本顺序。
+///
+/// 与改名同一份理由：读目录而不是抄一份。一条 `ALTER TABLE … ADD COLUMN` 不在
+/// 095 的文本里，不把它算进来，「升级上来的账本」与「刚装出来的账本」就差这一
+/// 列，而这个门判的正是两者逐条相同。
+fn columns_added_after_the_ledger() -> Vec<(String, String, String)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/postgres");
+    let mut files: Vec<(u32, std::path::PathBuf)> = std::fs::read_dir(&dir)
+        .expect("the migrations directory is part of this crate")
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let name = path.file_name()?.to_str()?.to_string();
+            let (version, rest) = name.split_once('_')?;
+            if !rest.ends_with(".up.sql") {
+                return None;
+            }
+            let version: u32 = version.parse().ok()?;
+            (version > 95).then_some((version, path))
+        })
+        .collect();
+    files.sort();
+    let mut out = Vec::new();
+    for (_, path) in files {
+        let text = std::fs::read_to_string(&path).expect("a migration file is readable");
+        for statement in split_statements(&text).unwrap_or_default() {
+            let text = normalize(&statement);
+            let text = text.trim_end_matches(';').trim();
+            let Some(rest) = text.strip_prefix("alter table ") else {
+                continue;
+            };
+            let mut words = rest.split_whitespace();
+            let Some(table) = words.next() else { continue };
+            if !LEDGER_TABLES.contains(&table) {
+                continue;
+            }
+            let (Some("add"), Some("column")) = (words.next(), words.next()) else {
+                continue;
+            };
+            let mut rest: Vec<&str> = words.collect();
+            if rest.starts_with(&["if", "not", "exists"]) {
+                rest.drain(0..3);
+            }
+            let Some(column) = rest.first() else { continue };
+            let definition = rest[1..].join(" ");
+            if definition.is_empty() {
+                continue;
+            }
+            out.push((table.to_string(), column.to_string(), definition));
+        }
+    }
+    out
+}
+
+/// 把一列追进 095 文本里那张建表语句：落在主键约束之前，也就是
+/// `ALTER TABLE … ADD COLUMN` 在库里实际追加到的位置（最后一列）。
+fn add_column(text: &str, table: &str, column: &str, definition: &str) -> String {
+    let head = format!("create table if not exists {table} (");
+    let lower = text.to_ascii_lowercase();
+    let Some(start) = lower.find(&head) else {
+        return text.to_string();
+    };
+    let Some(pk) = lower[start..].find("primary key") else {
+        return text.to_string();
+    };
+    let at = start + pk;
+    let line_start = text[..at].rfind('\n').map(|i| i + 1).unwrap_or(at);
+    format!(
+        "{}{column} {definition},\n    {}",
+        &text[..line_start],
+        &text[line_start..]
+    )
+}
+
+/// 095 的文本，按顺序走完后面那些改列（新列与改名）。
 fn migration_ledger_text() -> String {
     let mut text = MIGRATION.to_string();
+    for (table, column, definition) in columns_added_after_the_ledger() {
+        text = add_column(&text, &table, &column, &definition);
+    }
     for (old, new) in renames_after_the_ledger() {
         text = text.replace(&old, &new);
     }
