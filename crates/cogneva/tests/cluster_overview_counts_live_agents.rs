@@ -207,6 +207,7 @@ fn state_with(
         governance_store: None,
         principle_ledger: None,
         change_ledger: None,
+        intent_events: None,
         key_value: key_value.map(|kv| kv as Arc<dyn cog_core::KeyValueStore>),
         external_skill_registry: None,
         tool_registry: None,

@@ -306,6 +306,7 @@ fn state_with(
         governance_store,
         principle_ledger,
         change_ledger: None,
+        intent_events: None,
         key_value: None,
         external_skill_registry: None,
         tool_registry: None,

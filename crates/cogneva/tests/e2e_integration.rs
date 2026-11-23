@@ -181,6 +181,7 @@ async fn spawn_app_full(
         governance_store: None,
         principle_ledger: None,
         change_ledger: None,
+        intent_events: None,
         key_value: None,
         external_skill_registry: None,
         tool_registry: None,

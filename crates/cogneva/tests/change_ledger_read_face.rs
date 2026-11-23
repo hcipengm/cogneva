@@ -613,6 +613,7 @@ fn state_with(
         governance_store: None,
         principle_ledger: None,
         change_ledger: change_ledger.map(|ledger| ledger as Arc<dyn ChangeLedgerStore>),
+        intent_events: None,
         key_value: None,
         external_skill_registry: None,
         tool_registry: None,
