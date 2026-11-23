@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""默认做完整批：没做的待办必须逐条点名，并给出四条理由之一。
+"""默认做完整批：没做的待办必须逐条点名，并给出三条理由之一。
 
 这一推里，台账上**所有未完成的待办**要么做完了（那一行填了 `代码` 格：树里有了实现，
 并点名了那条「没有它就会红」的测试），要么被 `Split:` 逐条点名排除。触点不是判据——
 「有文件改过」与「做完了」不是一件事（属主 2026-11-21 定）。两句判据：
 
   1. **没点名的排除 = 拒**。`Split:` 必须列出它排除的 S 号：
-         Split: 1 — S48, S63 — <为什么这两条这一批做不了>
+         Split: 2 — S48, S63 — <为什么这两条这一批做不了>
      没有被点名的未完成待办出现在「没做」的集合里 ⇒ 拒，并把它们列出来。
   2. **理由要过真假判定**（四条里三条可机检）：
-     - 1 验证面不同   两侧映射到的 cargo 包集合必须不同，相同即假；
      - 2 失败不可归因 机器判不了真假，但必须点名会重叠的测试目标，记进历史；
      - 3 不可逆/不对称 被排除的那几条与这一批之间，**恰有一侧**碰
                       deploy/、migrations/、scripts/host/（回滚一次提交回不到原状
@@ -128,15 +127,6 @@ def packages(paths: list[str]) -> set[str]:
 
 
 def judge(kind: str, excluded: list[str], detail: str, touched: list[str], items: dict, window: int) -> str | None:
-    if kind == "1":
-        sides = [s.strip() for s in re.split(r"[|｜]", detail)]
-        if len(sides) != 2:
-            return "Split: 1 要写两侧边界（`Split: 1 — <S 号…> — <一侧路径> | <另一侧路径>`）"
-        left = [p for p in touched if p.startswith(sides[0])]
-        right = [p for p in touched if p.startswith(sides[1])]
-        if not left or not right or packages(left) == packages(right):
-            return f"Split: 1 说验证面不同，但两侧落在同一批 cargo 包（{sorted(packages(left))}）"
-        return None
     if kind == "3":
         # 这条理由的全部内容是「被拆开的两侧里，恰有一侧动的是回不去的东西」：
         # 那一侧必须单独落地，因为回滚一次提交回不到原状，混在别人里面会让别人
@@ -175,7 +165,7 @@ def judge(kind: str, excluded: list[str], detail: str, touched: list[str], items
         if not re.search(r"[a-z0-9_]+\.rs|tests?/", detail):
             return "Split: 2 要点名会重叠的测试目标（文件或测试名）"
         return None
-    return f"Split: {kind} 不在四条里（只认 1 验证面 / 2 归因 / 3 不可逆 / 4 读不完）"
+    return f"Split: {kind} 不在三条里（只认 2 归因 / 3 不可逆 / 4 读不完）"
 
 
 def main(argv: list[str]) -> int:

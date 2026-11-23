@@ -293,7 +293,9 @@ def open_round(spec: str | None, allow_open: bool = False, code_rev_override: st
     import os
     import uuid
     source = todo_source.normalize(source)
-    batch = todo_source.load(source) if source.startswith("md:") else []
+    # 批次是**这一轮要改的那一批**：`touches: unknown` 的行明确本轮不排，钉进批次就等于
+    # 用一个自己写过「不排」的词把它排进来——那一条后来永远关不掉这一轮。
+    batch = todo_source.partition(source)[0] if source.startswith("md:") else []
     if batch:
         print(f"round: 本批 {len(batch)} 条（同一批编辑，不挑子集）：")
         for item in batch:
