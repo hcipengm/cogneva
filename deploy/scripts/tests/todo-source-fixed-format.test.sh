@@ -81,5 +81,13 @@ out=$(run "$tmp/prose.md"); rc=$?
     && ok "五格行状态写成散文：拒读并点名" \
     || bad "状态写坏的 N 行被静默算成没有（rc=$rc）：$out"
 
+# 7. 做到终态的行不需要触点：它不进任何一批，触点对它没有意义。反过来的顺序会把
+#    台账里做得最干净的那几行报成「算不出批次」，整本台账因此读不动。
+printf '| N09 | 终态 | 现在 | — | 已落 |\n' >"$tmp/reached.md"
+out=$(run "$tmp/reached.md"); rc=$?
+{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "PARSED 0"; } \
+    && ok "已落且差距为空：没有触点也不拒" \
+    || bad "做到终态的行因为没有触点被拒（rc=$rc）：$out"
+
 printf 'todo-source-fixed-format.test.sh: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

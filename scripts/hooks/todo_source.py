@@ -145,15 +145,18 @@ def _fixed_item(line: str, notouch: list[str]) -> tuple[Item, bool] | None:
             if p.strip() and p.strip() != "unknown"
         ]
         touches = [p.strip(" ）)") for p in touches if p.strip(" ）)")]
+    # 触点写在差距格里（行尾那一格），判「差距是不是空」要先把它切掉：
+    # `— ｜ touches: …` 的差距是空的，它不是「还差什么」。
+    gap = re.split(r"[｜|]\s*touches:", cells[3])[0].strip()
+    # 「已落且差距为空」这一档**不需要触点**：它不进任何一批，触点对它没有意义。
+    # 先判这一档、再要求触点——反过来的版本会把一条做到终态的行报成「算不出批次」，
+    # 于是台账里做得最干净的那几行反而让整本读不动（2026-11-23 实测：N04／S57／N38）。
+    if status.startswith(CLOSED_PREFIXES) and gap in _GAP_EMPTY:
+        return None  # 终态真的到了：不进批次。
     if not touches and not deferred:
         # 没有触点的行算不出批次。留空让它「不在批次里」是最坏的形状：它看起来像做完了。
         notouch.append(cells[0])
         return None
-    # 触点写在差距格里（行尾那一格），判「差距是不是空」要先把它切掉：
-    # `— ｜ touches: …` 的差距是空的，它不是「还差什么」。
-    gap = re.split(r"[｜|]\s*touches:", cells[3])[0].strip()
-    if status.startswith(CLOSED_PREFIXES) and gap in _GAP_EMPTY:
-        return None  # 终态真的到了：不进批次。
     three = parse_cells(line)
     item = Item(cells[0], cells[1][:80], line.strip(), touches, deferred, three)
     # 未落的行进批次；写着已落却留着差距的按未完成读（debt），与三格那种同一处置。
