@@ -110,6 +110,52 @@ def _md_items(path: pathlib.Path) -> list[Item]:
     return _md_split(path)[0]
 
 
+# 五格行：`| 序号 | 终态 | 现在 | 差距 | 状态 |`。序号是字母加数字（N01、CC02、S12 都收）。
+_FIXED_ROW = re.compile(r"^\|\s*[A-Za-z]+[0-9]+\s*\|")
+_FIXED_STATUS = ("未落", "已落")
+_GAP_EMPTY = ("", "—", "-", "–")
+
+
+def _fixed_item(line: str, notouch: list[str]) -> tuple[Item, bool] | None:
+    """读一行五格台账。返回 (条目, 是否按未完成读)；不是这个形状时返回 None。
+
+    「已落」只在差距那一格为空时才成立（属主 2026-11-23 定）。写着已落却还留着差距的行，
+    按未完成读并进 debt——与三格那种「填不满的已落」同一处置：跳过它等于承认那个假的终态，
+    而拒读会让整本台账一个门都开不开。
+    """
+    cells = [c.strip() for c in line.strip().strip("|").split("|")]
+    if len(cells) < 5:
+        return None
+    status = cells[-1]
+    if status not in _FIXED_STATUS:
+        return None
+    found = None
+    for found in re.finditer(r"[｜|]\s*touches:\s*([^|｜\n]+)", line):
+        pass
+    touches: list[str] = []
+    deferred = False
+    if found:
+        raw = found.group(1).strip()
+        deferred = raw.startswith("unknown")
+        touches = [
+            re.split(r"[（(]", p.strip())[0].strip()
+            for p in re.split(r"[,，]", raw)
+            if p.strip() and p.strip() != "unknown"
+        ]
+        touches = [p.strip(" ）)") for p in touches if p.strip(" ）)")]
+    if not touches and not deferred:
+        # 没有触点的行算不出批次。留空让它「不在批次里」是最坏的形状：它看起来像做完了。
+        notouch.append(cells[0])
+        return None
+    gap = cells[3].strip()
+    if status.startswith(CLOSED_PREFIXES) and gap in _GAP_EMPTY:
+        return None  # 终态真的到了：不进批次。
+    three = parse_cells(line)
+    item = Item(cells[0], cells[1][:80], line.strip(), touches, deferred, three)
+    # 未落的行进批次；写着已落却留着差距的按未完成读（debt），与三格那种同一处置。
+    return item, status.startswith(CLOSED_PREFIXES)
+
+
 def _md_split(path: pathlib.Path) -> tuple[list[Item], list[Item]]:
     if not path.exists():
         raise Unreadable(f"{path} 不存在")
@@ -118,7 +164,17 @@ def _md_split(path: pathlib.Path) -> tuple[list[Item], list[Item]]:
     bad_status: list[str] = []
     bad_closed: list[str] = []
     malformed: list[str] = []
+    notouch: list[str] = []
     for line in path.read_text(errors="ignore").splitlines():
+        # 第二种行形状（属主 2026-11-23 定）：`| 序号 | 终态 | 现在 | 差距 | 状态 |`。
+        # 它与 `| S…` 那一种判的是同一件事——这一条做到终态没有；差别只在「差距」这一格
+        # 是显式写出来的，而不是从三格缺哪几格推出来。两形状都读，因为台账正在换格式，
+        # 只认一种就会把另一种**整族读成没有待办**，而那个读数看起来是绿的。
+        if not line.startswith("| S") and _FIXED_ROW.match(line):
+            item = _fixed_item(line, notouch)
+            if item is not None:
+                (debt if item[1] else out).append(item[0])
+            continue
         if not line.startswith("| S"):
             continue
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
@@ -178,6 +234,11 @@ def _md_split(path: pathlib.Path) -> tuple[list[Item], list[Item]]:
             debt.append(item)
         else:
             out.append(item)
+    if notouch:
+        raise Unreadable(
+            "这些行没有 `touches:`，批次算不出来（要么点名它要动的文件，要么写 `touches: unknown — 理由`）："
+            + "、".join(notouch)
+        )
     if malformed:
         raise Unreadable(
             "这些行以 `| S` 开头却没有状态列，读不出它做没做：" + "、".join(malformed)
