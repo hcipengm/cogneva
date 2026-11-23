@@ -140,6 +140,14 @@ script_identity() {
 
 [ -n "${work_root}" ] || die "COGNEVA_HOST_WORK_ROOT is unset: this script never guesses which filesystem to judge"
 [ -d "${work_root}" ] || die "COGNEVA_HOST_WORK_ROOT=${work_root} is not a directory"
+
+# 临时工作树的整棵树先放掉：它不承载任何东西（没有进程持有时才动），比这份缓存里的
+# 任何一层都便宜，而且它的判据不是水位线（见 host-scratch-gc.sh：空闲 < 它们自己占
+# 的空间才动手）。放在这里，半小时那一拍也会同一趟把临时树收掉。
+scratch_gc="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/host-scratch-gc.sh"
+if [ -x "${scratch_gc}" ]; then
+    "${scratch_gc}" || true
+fi
 # Resolve once so that paths read out of /proc compare against it textually.
 work_root="$(cd "${work_root}" && pwd -P)"
 
