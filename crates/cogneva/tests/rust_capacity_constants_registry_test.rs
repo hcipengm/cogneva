@@ -612,6 +612,9 @@ fn every_capacity_number_in_rust_says_where_it_comes_from() {
 ///
 /// The rows are the measured population, not a budget somebody chose.
 const BOUND_AT_CENSUS: &[(&str, u64)] = &[
+    // 任务行上的重试初值：它唯一的值由 `retry_matrix` 的未分类档读它（同一个名字），
+    // 判决与落库因此只有一个来源；这条不是「又拍了一个数」，是把既有的一条集中到一处。
+    ("crates/cog-core/src/types/task.rs", 1),
     // 这两条是**由实测导出**的墙（不是没人管的债）：qdrant 建集合实测最慢 12.15 秒、
     // 取 ×5；控制平面一次应答的实测上限 30 秒。它们的值跟着读数走，所以进基线的是
     // 「这里有一条被读数量过的界」，不是「这里又加了一条拍出来的数」。

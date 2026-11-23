@@ -167,7 +167,7 @@ pub struct RalphLoopConfig {
 
 // 停滞时最多换三档（同题重试 → 改上下文 → 换执行者）。这是**策略的档数**，
 // 不是轮数：换完这三档仍没买到进展，缺的就是属主手里的那份输入。
-// cap: fixed — 三档：重置策略的闭集只有 Identical / Modified / Escalated 三个词
+// cap: bound — 三档＝重置策略闭集的词数（Identical / Modified / Escalated）：换一处只能换这三档之一，换完就是问属主
 const MAX_STALL_ESCALATIONS: u8 = 3;
 
 // 五轮不买进展即判停滞：一轮反馈要落到下一轮的产出上，两三轮还看得出是在
