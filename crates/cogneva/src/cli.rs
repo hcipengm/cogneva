@@ -24,6 +24,8 @@ pub enum Command {
     /// 2.1–2.4 的入口：把 2.5 的假清单变成一次生成请求。
     BatchEdit,
     BatchPlan,
+    /// 五格台账的读法与批次规则：`cogneva ledger status`。
+    Ledger,
     VolumeWalker,
     HostLedger,
     ProcessCensus,
@@ -51,7 +53,7 @@ pub enum Command {
 
 /// Subcommands, in the order they appear in [`USAGE`]. A command added here but
 /// not documented fails the usage test.
-const SUBCOMMANDS: [(&str, Command); 26] = [
+const SUBCOMMANDS: [(&str, Command); 27] = [
     ("security-gateway", Command::SecurityGateway),
     ("sandbox-executor", Command::SandboxExecutor),
     ("volume-walker", Command::VolumeWalker),
@@ -84,6 +86,7 @@ const SUBCOMMANDS: [(&str, Command); 26] = [
     // 的 match 臂从加进来那天起没有一条命令能走到）。
     ("batch-edit", Command::BatchEdit),
     ("batch-plan", Command::BatchPlan),
+    ("ledger", Command::Ledger),
 ];
 
 /// Flags that take effect wherever they appear in the argument list.
@@ -116,6 +119,7 @@ const READ_ONLY_SUBCOMMANDS: &[Command] = &[
     Command::ClaimStore,
     Command::BatchEdit,
     Command::BatchPlan,
+    Command::Ledger,
     Command::VolumeWalker,
     Command::McpServe,
 ];

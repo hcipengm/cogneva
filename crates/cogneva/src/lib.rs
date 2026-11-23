@@ -10,6 +10,7 @@ pub mod bootstrap;
 pub mod build_info;
 pub mod checkpoints;
 pub mod claim_store;
+pub mod ledger;
 pub mod cli;
 pub mod config_loader;
 pub mod config_watcher;
