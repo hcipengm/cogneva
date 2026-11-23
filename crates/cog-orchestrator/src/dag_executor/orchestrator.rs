@@ -3913,7 +3913,9 @@ impl DagExecutor {
 
         task.status = TaskStatus::Pending;
         task.retry_count = 0;
-        task.error = None;
+        // 上一次的失败**留着**：重试按「这一轮有没有拿到新东西」判，而比对的就是
+        // 它。人工重试清掉这一格，下一次同样的失败就会被读成「换了内容」，重试的
+        // 判据当场失效（2026-11-24 实测：夹具里同一句连续两次都买到了重试）。
         task.error_cause = None;
         task.clear_run();
         task.updated_at = chrono::Utc::now();
