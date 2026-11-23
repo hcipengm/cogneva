@@ -232,6 +232,7 @@ live_check db 'Live-DB usage readers agree' cargo test -p cogneva --test the_usa
 live_check db 'Live-DB batch cost' cargo test -p cogneva --test a_batch_id_answers_what_the_batch_cost_test -- --ignored
 live_check db 'Live-DB rollup is gone' cargo test -p cogneva --test the_rollup_is_gone_test -- --ignored
 live_check db 'Live-DB round events' cargo test -p cog-storage --test round_events -- --ignored
+live_check db 'Live-DB bodies in the backup package' cargo test -p cogneva --test backup_large_objects -- --ignored
 live_check db 'Live-DB body as a large object' cargo test -p cog-storage --test body_as_large_object -- --ignored
 live_check db 'Live-DB erasure' cargo test -p cog-storage --test erasure_keeps_the_event_and_drops_the_body -- --ignored
 live_check db 'Live-DB metric projections rebuild' cargo test -p cogneva --test metric_projections_rebuild_from_prometheus -- --ignored
