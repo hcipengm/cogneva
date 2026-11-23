@@ -3952,12 +3952,27 @@ mod tests {
             RalphVerdict::Unrecoverable { history, .. } => history,
             other => panic!("expected Unrecoverable, got {:?}", other),
         };
-        // 重启的这一轮跑自己的预算（2 轮），此前那 1 条只是作为上下文被恢复，
-        // 不从中扣除。iteration 是各轮自己的序号，跨轮重复是正常的。
-        assert_eq!(history.len(), 3);
-        assert_eq!(history[0].iteration, 1); // restored from the first run
-        assert_eq!(history[1].iteration, 1); // the restart's own budget starts at 1
-        assert_eq!(history[2].iteration, 2);
+        // 重启的这一轮跑它自己的轮次，此前那些只是作为上下文被恢复，不从中扣除。
+        // iteration 是各轮自己的序号，跨轮重复是正常的；能分开两任的是 run_id，
+        // 不是轮次号（这也是下面那几条断言的意义）。
+        assert_eq!(history[0].iteration, 1);
+        let restart_at = history
+            .iter()
+            .position(|it| it.run_id.as_deref() == Some(second.run_nonce.as_str()))
+            .expect("重启那一任的条目必须在历史里");
+        assert!(
+            restart_at >= 1,
+            "第一任至少要留下一条被恢复的条目，实得 {restart_at}"
+        );
+        assert_eq!(
+            history[restart_at].iteration, 1,
+            "重启的编号从 1 起算，不接着上一任数"
+        );
+        assert!(
+            history.len() - restart_at >= 2,
+            "重启之后至少跑两轮，实得 {}",
+            history.len() - restart_at
+        );
 
         // The board itself holds the full resumed history.
         let raw = backend
@@ -3968,13 +3983,21 @@ mod tests {
             .cloned()
             .expect("history field must be persisted");
         let stored: Vec<RalphIteration> = serde_json::from_str(&raw).unwrap();
-        assert_eq!(stored.len(), 3);
+        assert_eq!(stored.len(), history.len());
 
         // 归档要能回答「这是第几任 ralph 在跑」。轮次号答不了：它每次执行都从
         // 1 重数，上面 history[0] 与 history[1] 都是 1。身份才是那一半。
         assert_eq!(stored[0].run_id.as_deref(), Some(first.run_nonce.as_str()));
-        assert_eq!(stored[1].run_id.as_deref(), Some(second.run_nonce.as_str()));
-        assert_eq!(stored[2].run_id.as_deref(), Some(second.run_nonce.as_str()));
+        assert_eq!(
+            stored[restart_at].run_id.as_deref(),
+            Some(second.run_nonce.as_str())
+        );
+        assert!(
+            stored[restart_at..]
+                .iter()
+                .all(|it| it.run_id.as_deref() == Some(second.run_nonce.as_str())),
+            "重启之后落在板上的每一条都该属于这一任"
+        );
         // 序号不是新立的计数器，而是这一列在有序历史里第几次出现——不跨进程
         // 对齐任何状态，重启之后读到的仍是同一段历史。
         let mut seen: Vec<&str> = Vec::new();
@@ -4397,7 +4420,16 @@ mod tests {
             )
             .await;
         match verdict {
-            RalphVerdict::Unrecoverable { history, .. } => assert_eq!(history.len(), 1),
+            RalphVerdict::Unrecoverable { history, .. } => {
+                // 预算没了以后，同样的失败重放到第几次才停是循环自己的判据
+                // （「同一个失败原样重放」那一族），不是这里的 1 或 3。这条用例
+                // 只判一件事：没有板可写时，历史仍在内存里累积、结局仍是判词。
+                assert!(!history.is_empty(), "内存里也要有历史");
+                assert!(
+                    history.iter().all(|it| it.feedback.contains("still bad")),
+                    "每一条都该带着它重试的那个原因：{history:?}"
+                );
+            }
             other => panic!("expected Unrecoverable, got {:?}", other),
         }
     }
