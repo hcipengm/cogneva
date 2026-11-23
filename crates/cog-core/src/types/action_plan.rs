@@ -637,7 +637,7 @@ mod tests {
                 PlanAcceptance {
                     shape: "worker 的 markdown 台账".into(),
                     statement: "缺口被列出".into(),
-                    check: "scripts/hooks/family.py --all-todos".into(),
+                    check: "cogneva ledger editing".into(),
                 },
                 PlanAcceptance {
                     shape: "平台的变更账本".into(),
@@ -660,7 +660,7 @@ mod tests {
             acceptance: vec![PlanAcceptance {
                 shape: "我的 markdown".into(),
                 statement: "缺口被列出".into(),
-                check: "scripts/hooks/family.py".into(),
+                check: "cogneva ledger editing".into(),
             }],
             counterexamples: vec![],
             one_shape_because: None,

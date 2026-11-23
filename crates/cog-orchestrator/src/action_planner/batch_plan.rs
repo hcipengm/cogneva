@@ -13,7 +13,7 @@
 //!
 //! **验收恰好两种形状，而且都不是「人看一眼」**：
 //!
-//! - **工作树**：这一批每一条的触点在树上都改到了。量法是 `family.py --all-todos`，
+//! - **工作树**：这一批每一条的触点在树上都改到了。量法是 `cogneva ledger editing`，
 //!   它退出码为零就是「缺口清空」。
 //! - **闸门**：这一批整体过一次 `check-before-push.sh`。量法是那条命令跑绿并记账。
 
@@ -81,7 +81,7 @@ impl BatchPlanner for LedgerBatchPlanner {
                 PlanAcceptance {
                     shape: "工作树".to_string(),
                     statement: "这一批每一条的触点在树上都改到了，缺口为空".to_string(),
-                    check: "python3 scripts/hooks/family.py --root . --all-todos".to_string(),
+                    check: "cogneva ledger editing".to_string(),
                 },
                 PlanAcceptance {
                     shape: "闸门".to_string(),
