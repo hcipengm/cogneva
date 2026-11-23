@@ -44,6 +44,9 @@
 //! admission condition. A name in a list is only a promise that the path was
 //! right once.
 
+#[path = "planner_schema_matches_the_ledger_item.rs"]
+mod planner_schema_matches_the_ledger_item;
+
 #[path = "common/cells_written.rs"]
 pub mod cells_written;
 #[path = "common/closed_set.rs"]

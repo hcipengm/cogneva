@@ -30,9 +30,6 @@ path = "tests/suite.rs"
 name = "backup_large_objects"
 path = "tests/backup_large_objects.rs"
 
-[[test]]
-name = "planner_schema_matches_the_ledger_item"
-path = "tests/planner_schema_matches_the_ledger_item.rs"
 
 [[test]]
 name = "backup_pg"

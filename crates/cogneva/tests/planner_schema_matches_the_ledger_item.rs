@@ -11,9 +11,9 @@
 use std::collections::BTreeSet;
 
 fn config() -> serde_json::Value {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("deploy/helm/cogneva/files/cogneva.json");
+    // 仓库根只有一份算法（`common::routes::repo_root()`）：这里自己往上找两级
+    // 就等于第二个答案，根一漂读数就变成零，与「没有这份配置」同形。
+    let path = crate::common::routes::repo_root().join("deploy/helm/cogneva/files/cogneva.json");
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("配置读不到：{}（{e}）", path.display()));
     serde_json::from_str(&text).expect("配置不是 JSON")
