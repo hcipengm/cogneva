@@ -4028,29 +4028,35 @@ impl AgentRuntime {
         };
 
         tracing::info!(agent_id = %self.config.agent_id, message_count = messages.len(), "AgentRuntime::think_stream calling LLM chat_stream");
-        let mut stream = match tokio::time::timeout(
-            stall_timeout,
-            llm.chat_stream(&messages, &options),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => {
-                self.remember_refusal(&request, &e);
-                // 建流就被拒是一种「上游直接说了话、我们一个字都没收到」的形态：
-                // 有些协议面把超窗的拒绝原样以错误返回，正文里就带着它的界。
-                let wording = e.to_string();
-                // 这次没拿到响应，手里最新的型号是上一次响应回报的那一个；
-                // 没有就不用型号定起点。
-                let model = self.run_usage.model.clone();
-                self.note_context_measurement(model.as_deref(), None, Some(&wording))
-                    .await;
-                return Err(e);
-            }
-            Err(_) => {
-                let err = stall_err("establishing the stream");
-                tracing::warn!(agent_id = %self.config.agent_id, error = %err, "AgentRuntime think_stream stall timeout");
-                return Err(err);
+        // 「等不到第一个事件」有两种成因：连接死了，与首字节慢。两种都按「判死这一轮」
+        // 处理，会把第二种当成第一种（2026-11-23 复核）。所以先**重连一次**再判：
+        // 重连接上了，这一轮照常往下走；两次都没等到，才说得上是连接建立不起来。
+        let mut attempt = 1u32;
+        let mut stream = loop {
+            match tokio::time::timeout(stall_timeout, llm.chat_stream(&messages, &options)).await {
+                Ok(Ok(stream)) => break stream,
+                Ok(Err(e)) => {
+                    self.remember_refusal(&request, &e);
+                    let wording = e.to_string();
+                    let model = self.run_usage.model.clone();
+                    self.note_context_measurement(model.as_deref(), None, Some(&wording))
+                        .await;
+                    return Err(e);
+                }
+                Err(_) if attempt < 2 => {
+                    tracing::warn!(
+                        agent_id = %self.config.agent_id,
+                        window_secs = stall_timeout.as_secs(),
+                        "no first stream event inside the window; reconnecting once before judging the connection dead"
+                    );
+                    attempt += 1;
+                    continue;
+                }
+                Err(_) => {
+                    let err = stall_err("establishing the stream");
+                    tracing::warn!(agent_id = %self.config.agent_id, error = %err, "AgentRuntime think_stream stall timeout");
+                    return Err(err);
+                }
             }
         };
         tracing::info!(agent_id = %self.config.agent_id, "AgentRuntime::think_stream LLM chat_stream returned");

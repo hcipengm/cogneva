@@ -473,6 +473,26 @@ pub enum ChildOutcome {
 /// 这和 `tokio::time::timeout(cmd.wait_with_output())` 的差别不是宽严，是判据：
 /// 后者看见的只有一个数——跑了多久——于是一个流式输出了一小时的进程与一个第一秒
 /// 就卡死的进程在它眼里是同一个读数。
+/// 一个进程此刻停在哪：`/proc` 能读到的状态与它在等的对象。
+///
+/// 静默不杀之后，这份归因就是那条读数：说得出「在 S 状态、wchan 是 fifo_wait」，
+/// 与「不知道它为什么不动」是两件事，前者能让人去补那把锁或那条输入，后者只能再杀一次。
+pub fn describe_silence(pid: u32) -> String {
+    let read = |path: String| std::fs::read_to_string(path).ok();
+    let state = read(format!("/proc/{pid}/status"))
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("State:"))
+                .map(|l| l.trim().to_string())
+        })
+        .unwrap_or_else(|| "state unreadable".to_string());
+    let wchan = read(format!("/proc/{pid}/wchan"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "wchan unreadable".to_string());
+    format!("{state}; waiting in {wchan}")
+}
+
 pub async fn run_child_watched(
     cmd: tokio::process::Command,
     id: &str,
@@ -607,26 +627,23 @@ pub async fn watch_child(
                     }
                 }
                 if let Some((silent, window)) = crate::declared_wall::stall(id) {
-                    stalled = Some((silent, window));
-                    // 判停之后才动手：在这之前它的每一下产出与每一段 CPU 都被读到了。
-                    #[cfg(unix)]
-                    if let Some(pid) = child.id() {
-                        // SAFETY: one pid and one signal constant; no pointers.
-                        //
-                        // 只有它自己是组长时才按组收。调用方没给它自己的进程组时，
-                        // `-pid` 落在一个更大的组上——很可能就是我们自己的组，整组
-                        // SIGKILL 会把常驻进程连同兄弟一起杀掉。收一个停住的子进程
-                        // 不该有这种失手，所以判据在这里，而不是靠每个调用方记得设组。
-                        let own_group = unsafe { libc::getpgid(pid as i32) } == pid as i32;
-                        unsafe {
-                            let target = if own_group { -(pid as i32) } else { pid as i32 };
-                            libc::kill(target, libc::SIGKILL);
-                        }
-                    }
-                    // 非 unix 上没有进程组这个概念：收的就是那一个子进程，由下面的
-                    // `start_kill` 做。判据本身（沉默窗口 + 没有动作）三平台同一句。
-                    let _ = child.start_kill();
-                    break child.wait().await?;
+                    // **静默不杀。**「不动」不等于「该停」：它可能在等一把锁、一个
+                    // 永远不会来的输入、或一条被丢掉的网络回包，而杀掉它把这些成因
+                    // 一起销毁了——事后只剩「被判停」这一条读数，谁也归因不了。
+                    // 所以这里只**归因并说出来**：卡在哪、等了多久、界是多少。
+                    // 进程继续跑，租约继续持有；要收，由调用方拿到这份归因之后决定。
+                    // 只有一种收场是这里的：它自己退出（`child.wait()` 那一支）。
+                    let where_it_stopped = child
+                        .id()
+                        .map(|pid| crate::progress::describe_silence(pid))
+                        .unwrap_or_else(|| "the child has no pid".to_string());
+                    tracing::warn!(
+                        silent_secs = silent.as_secs_f64(),
+                        window_secs = window.as_secs_f64(),
+                        cause = %where_it_stopped,
+                        "the child has made no observable movement for the whole measured window; \
+                         naming where it stopped instead of killing it"
+                    );
                 }
             }
         }
