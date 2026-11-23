@@ -9329,7 +9329,7 @@ mod tests {
             orchestrator.effective_max_retries(
                 "upstream_unavailable",
                 Some(UpstreamFailure::ServerError),
-                &task,
+                task.error.as_deref(),
             ),
             1,
             "第一次失败没有上一次可比：允许再跑一次"
@@ -9339,7 +9339,7 @@ mod tests {
             orchestrator.effective_max_retries(
                 "upstream_unavailable:  429 FROM the pool",
                 Some(UpstreamFailure::ServerError),
-                &task,
+                task.error.as_deref(),
             ),
             0,
             "逐字相同（只差空白与大小写）就是没拿到新东西，不重试"
@@ -9348,7 +9348,7 @@ mod tests {
             orchestrator.effective_max_retries(
                 "the generator produced no artifacts",
                 Some(UpstreamFailure::ServerError),
-                &task,
+                task.error.as_deref(),
             ),
             1,
             "失败变了：再跑一次，判据看的是变化，不是次数"
@@ -9357,7 +9357,7 @@ mod tests {
             orchestrator.effective_max_retries(
                 "terminal_env_failure: environment_error",
                 Some(UpstreamFailure::Auth),
-                &task,
+                task.error.as_deref(),
             ),
             0,
             "靠重跑清除不了的失败，一次也不给"
