@@ -43,36 +43,27 @@ impl IntentEventStore {
     /// 还没有被派生成任务的意图：流里收到过 `intent_received`，而任务行里没有一条带着
     /// 它的身份。读不到就是读不到（`Err`），不返回空表——空表与「全都处理完了」同形。
     pub async fn undispatched_intents(&self, limit: i64) -> SFResult<Vec<IntentRow>> {
-        // 两处都按**真表的列型**写：`cogneva_event.attributes` 与
-        // `task_defined.input` 都是 TEXT（迁移 110 把 JSON 列改成文本），要 `::jsonb`
-        // 才谈得上取键；而 `cog_dag_tasks` 是台账改版前那张 JSONB 投影，今天的投影是
-        // `task_current`，定义在 `task_defined`（每版一行）。
+        // 两处查询面都是**列**，不是载荷里的键：
+        // - `cogneva_event` 的四格由迁移 127 升成生成列（`intent_source` 等），
+        //   与 124 对 `llm_call` 那几格是同一个做法；
+        // - 「有没有一条任务带着这条身份」读的是 `task_defined.intent_id`，同样是
+        //   迁移 127 升出来的生成列，带条件索引。
+        // 查询里不 cast 载荷（那条门 `no_production_query_reads_into_the_payload`
+        // 盯着），也不碰 `cog_dag_tasks`——那是台账改版前的 JSONB 投影，真库里早就不存在。
         //
-        // 2026-11-24 实测：照旧写法在真库上两条都不成立（`text ->> unknown`，
-        // `cog_dag_tasks` 根本不存在），而树上没有一条用例对着真库问过它。
+        // 2026-11-24 实测：改版前的写法在真库上两条都不成立（`text ->> unknown`、
+        // 表不存在），而树上没有一条用例对着真库问过它。
         //
-        // `input` 先只对「看起来是 JSON 且带着这个键」的行做类型转换：CASE 保证
-        // 转换只在那一支上求值，一行历史上不是 JSON 的输入不会把整张收件台读崩；
-        // 而 `LIKE` 是这一步的**价格**判据——真库里 46,745 行定义逐一 `::jsonb`
-        // 要 32 秒（2026-11-24 实测），先按子串筛一遍再转换是 1.3 秒。子串命中但
-        // 不认识这个键的行，`->>` 回 NULL，被下面那句过滤掉。
-        //
-        // 已派生的身份集合算**一次**（`NOT IN`），不是每条事件各扫一遍定义表。
-        // 集合里过滤掉 NULL：`NOT IN` 碰到一个 NULL 会把整张收件台读成空的。
+        // 已派生的身份集合算**一次**（`NOT IN`），不是每条事件各扫一遍定义表；
+        // 集合里过滤掉 NULL——`NOT IN` 碰到一个 NULL 会把整张收件台读成空的。
         let rows = sqlx::query(
-            "SELECT e.attributes::jsonb->>'source' AS source, \
-                    e.attributes::jsonb->>'external_id' AS external_id, \
-                    e.attributes::jsonb->>'text' AS text, \
-                    coalesce(e.attributes::jsonb->>'parent', '') AS parent \
+            "SELECT e.intent_source AS source, e.intent_external_id AS external_id, \
+                    e.intent_text AS text, coalesce(e.intent_parent, '') AS parent \
                FROM cogneva_event e \
               WHERE e.kind = 'intent_received' \
                 AND e.subject_id NOT IN ( \
-                    SELECT t.body->>'intent_id' FROM ( \
-                        SELECT CASE WHEN d.input LIKE '%\"intent_id\"%' \
-                                     AND d.input ~ '^[[:space:]]*[\\[{]' \
-                                    THEN d.input::jsonb END AS body \
-                          FROM task_defined d) t \
-                     WHERE t.body->>'intent_id' IS NOT NULL) \
+                    SELECT d.intent_id FROM task_defined d \
+                     WHERE d.intent_id IS NOT NULL) \
               ORDER BY e.at ASC, e.event_id ASC \
               LIMIT $1",
         )

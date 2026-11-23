@@ -26,6 +26,9 @@ async fn apply_event_stream_migration(pool: &sqlx::PgPool) {
     for file in [
         "117_event_stream.up.sql",
         "119_event_payload_is_json.up.sql",
+        // 收件台读的那几格（`intent_source` 等）与 `task_defined.intent_id`
+        // 是这一版加上来的生成列；不应用它，读的还是载荷。
+        "127_intent_columns.up.sql",
     ] {
         let sql =
             std::fs::read_to_string(dir.join(file)).unwrap_or_else(|e| panic!("read {file}: {e}"));
