@@ -26,6 +26,7 @@ const PROJECTS: &str = "crates/cog-gateway/src/projects.rs";
 const PROJECT_CONTROL: &str = "crates/cog-gateway/src/project_control.rs";
 const PROGRESS: &str = "crates/cog-gateway/src/progress.rs";
 const PROCESSES: &str = "crates/cog-gateway/src/processes.rs";
+const LIB: &str = "crates/cog-gateway/src/lib.rs";
 
 /// 折叠过的那几条读。某一段正文里出现它们，就是那一面在替没读到的图作证。
 const FOLDED: &[&str] = &[
@@ -153,6 +154,36 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "dlq_len_from_reading(",
         "死信队列画成一只干净的队列",
     ),
+    (
+        PROCESSES,
+        "pub async fn process_overview_handler",
+        "registry_from_reading(",
+        "agent 一栏答成「一个 agent 都没注册」",
+    ),
+    (
+        PROCESSES,
+        "pub async fn process_overview_handler",
+        "health_report_from_reading(",
+        "健康四格一起落到 0，读成「四个都没病」",
+    ),
+    (
+        LIB,
+        "async fn supervisor_queue_stats_handler",
+        "get_ready_tasks_checked",
+        "待办队列答成「早就排空了」",
+    ),
+    (
+        LIB,
+        "async fn supervisor_queue_stats_handler",
+        "dlq_len_from_reading(",
+        "死信队列画成一只干净的队列",
+    ),
+    (
+        LIB,
+        "async fn supervisor_status_handler",
+        "health_report_from_reading(",
+        "健康四格一起落到 0，读成「四个都没病」",
+    ),
 ];
 
 #[test]
@@ -166,6 +197,7 @@ fn every_surface_that_draws_the_graph_keeps_the_failure() {
         PROJECT_CONTROL,
         PROGRESS,
         PROCESSES,
+        LIB,
     ] {
         productions.insert(file, production_text(&read_repo(file)));
     }

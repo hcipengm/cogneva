@@ -98,12 +98,37 @@ pub struct HealthCounts {
 /// 死信队列的长度：读失败留成 503。
 ///
 /// 这一格是「有多少件活压在死信里等人清」。读不出来时折成 0，画出来正是一个干净
-/// 的队列——与真的没人压活同形，而清死信这件事只有这一页会叫人来干。
-fn dlq_len_from_reading(reading: cog_core::SFResult<usize>) -> Result<usize, ApiError> {
+/// 的队列——与真的没人压活同形，而清死信这件事只有这一页会叫人来干。队列统计
+/// 那一页（`crate::supervisor_queue_stats_handler`）读的是同一格，走同一条映射。
+pub(crate) fn dlq_len_from_reading(reading: cog_core::SFResult<usize>) -> Result<usize, ApiError> {
     reading.map_err(|e| {
         ApiError::service_unavailable(format!(
             "the dead-letter queue length could not be read: {e}"
         ))
+    })
+}
+
+/// agent 注册表那一格：读失败留成 503。
+///
+/// 折成空表，这一页的 agent 一栏就是「一个 agent 都没注册」——与一个真的空部署
+/// 逐字同形，而这一栏正是看出「谁在跑、谁该在跑却没在跑」的地方。
+fn registry_from_reading(
+    reading: cog_core::SFResult<Vec<cog_core::AgentRegistration>>,
+) -> Result<Vec<cog_core::AgentRegistration>, ApiError> {
+    reading.map_err(|e| {
+        ApiError::service_unavailable(format!("the agent registry could not be read: {e}"))
+    })
+}
+
+/// 巡检那一格：跑不出报告也留成 503。
+///
+/// 折成「查过了、没有异常」，健康计数四格一起落到 0；读的人看到的是「四个
+/// 没病」，而不是「这一轮没查成」。
+pub(crate) fn health_report_from_reading(
+    reading: cog_core::SFResult<cog_core::HealthReport>,
+) -> Result<cog_core::HealthReport, ApiError> {
+    reading.map_err(|e| {
+        ApiError::service_unavailable(format!("the health pass could not be run: {e}"))
     })
 }
 
@@ -189,23 +214,22 @@ pub async fn process_overview_handler(
         dead: 0,
     };
     if let Some(supervisor) = &state.supervisor {
-        if let Ok(report) = supervisor.run_health_pass().await {
-            health.healthy = report.healthy.len();
-            health.suspect = report.suspect.len();
-            health.stuck = report.stuck.len();
-            health.dead = report.dead.len();
-            for id in report.healthy {
-                health_of.insert(id, "healthy");
-            }
-            for id in report.suspect {
-                health_of.insert(id, "suspect");
-            }
-            for id in report.stuck {
-                health_of.insert(id, "stuck");
-            }
-            for id in report.dead {
-                health_of.insert(id, "dead");
-            }
+        let report = health_report_from_reading(supervisor.run_health_pass().await)?;
+        health.healthy = report.healthy.len();
+        health.suspect = report.suspect.len();
+        health.stuck = report.stuck.len();
+        health.dead = report.dead.len();
+        for id in report.healthy {
+            health_of.insert(id, "healthy");
+        }
+        for id in report.suspect {
+            health_of.insert(id, "suspect");
+        }
+        for id in report.stuck {
+            health_of.insert(id, "stuck");
+        }
+        for id in report.dead {
+            health_of.insert(id, "dead");
         }
     }
 
@@ -220,27 +244,26 @@ pub async fn process_overview_handler(
     }
     let mut agents: Vec<AgentLoad> = Vec::new();
     if let Some(registry) = &state.agent_registry {
-        if let Ok(registrations) = registry.list().await {
-            for r in registrations {
-                let latest_hb = state
-                    .heartbeat_history
-                    .as_ref()
-                    .and_then(|h| h.get_heartbeat_history(&r.agent_id).last().cloned());
-                agents.push(AgentLoad {
-                    health: health_of
-                        .get(&r.agent_id)
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "unknown".into()),
-                    running_tasks: running_by_agent
-                        .get(r.agent_id.as_str())
-                        .copied()
-                        .unwrap_or(0),
-                    load_score: latest_hb.map(|hb| hb.load_score),
-                    agent_id: r.agent_id,
-                    role: r.role,
-                    last_heartbeat: r.last_heartbeat,
-                });
-            }
+        let registrations = registry_from_reading(registry.list().await)?;
+        for r in registrations {
+            let latest_hb = state
+                .heartbeat_history
+                .as_ref()
+                .and_then(|h| h.get_heartbeat_history(&r.agent_id).last().cloned());
+            agents.push(AgentLoad {
+                health: health_of
+                    .get(&r.agent_id)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                running_tasks: running_by_agent
+                    .get(r.agent_id.as_str())
+                    .copied()
+                    .unwrap_or(0),
+                load_score: latest_hb.map(|hb| hb.load_score),
+                agent_id: r.agent_id,
+                role: r.role,
+                last_heartbeat: r.last_heartbeat,
+            });
         }
     }
     agents.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
@@ -329,6 +352,42 @@ mod tests {
             axum::http::StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(dlq_len_from_reading(Ok(7)).expect("读到了就是那个数"), 7);
+    }
+
+    /// agent 注册表读不出来时，这一页要答 503，而不是「一个 agent 都没注册」。
+    ///
+    /// 判据：把 `registry_from_reading` 换回 `unwrap_or_default()`，第一条
+    /// 断言会红。
+    #[test]
+    fn an_unreadable_agent_registry_is_not_an_empty_one() {
+        use axum::response::IntoResponse;
+        let error =
+            registry_from_reading(Err(cog_core::SFError::Database("store unavailable".into())))
+                .expect_err("读失败不许折成空表");
+        assert_eq!(
+            error.into_response().status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(registry_from_reading(Ok(Vec::new()))
+            .expect("读到了空表就是空表")
+            .is_empty());
+    }
+
+    /// 巡检跑不出来时，四格健康计数不许一起落成 0 当「四个都没病」。
+    ///
+    /// 判据：把 `health_report_from_reading` 换回 `if let Ok(...)` 的折叠，
+    /// 第一条断言会红。
+    #[test]
+    fn a_health_pass_that_could_not_run_is_not_four_zero_counts() {
+        use axum::response::IntoResponse;
+        let error = health_report_from_reading(Err(cog_core::SFError::Database(
+            "store unavailable".into(),
+        )))
+        .expect_err("跑不出报告不许折成四个 0");
+        assert_eq!(
+            error.into_response().status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[test]
