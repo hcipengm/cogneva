@@ -28,6 +28,7 @@ const PROGRESS: &str = "crates/cog-gateway/src/progress.rs";
 const PROCESSES: &str = "crates/cog-gateway/src/processes.rs";
 const LIB: &str = "crates/cog-gateway/src/lib.rs";
 const EXECUTOR: &str = "crates/cog-gateway/src/executor.rs";
+const REBALANCER: &str = "crates/cog-supervisor/src/task_rebalancer.rs";
 
 /// 折叠过的那几条读。某一段正文里出现它们，就是那一面在替没读到的图作证。
 const FOLDED: &[&str] = &[
@@ -215,6 +216,24 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "get_graph_checked",
         "一次重启没有留下任何被打断的边，读成「没打断任何在跑的活」",
     ),
+    (
+        REBALANCER,
+        "pub async fn plan",
+        "get_ready_tasks_checked",
+        "待派队列答成「没有可派的任务」，每一趟调度都空转",
+    ),
+    (
+        REBALANCER,
+        "async fn count_running_tasks_for_agent",
+        "get_all_tasks_checked",
+        "每个 agent 都读成 0 条在跑，负载永远平衡，谁也不让谁",
+    ),
+    (
+        REBALANCER,
+        "pub async fn recovery_plan",
+        "get_all_tasks_checked",
+        "读失败让每个检查点都读成「任务已不在图里」，恢复计划悄悄空掉",
+    ),
 ];
 
 #[test]
@@ -230,6 +249,7 @@ fn every_surface_that_draws_the_graph_keeps_the_failure() {
         PROCESSES,
         LIB,
         EXECUTOR,
+        REBALANCER,
     ] {
         productions.insert(file, production_text(&read_repo(file)));
     }

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use cog_core::{AgentState, OrchestratorControl, StateBackend, TaskCheckpoint, TaskStatus};
+use tracing::warn;
 
 use crate::error::SupervisorResult;
 use crate::lifecycle_coordinator::RecoveredCheckpoint;
@@ -111,12 +112,24 @@ impl TaskRebalancer {
         let mut available: Vec<(AgentInfo, usize)> = Vec::with_capacity(agents.len());
 
         for agent in agents {
-            let backend_state = self
+            // 读不到状态与「没有状态」是两件事：前者说明这一格此刻量不出来，把它读成
+            // 「这个 agent 空闲」会让它在状态后端失联时继续接活——而那正是最不该派活的
+            // 时刻。读不到就这一趟不排它，并把读数打出来。
+            let backend_state = match self
                 .state_backend
                 .get_agent_state(&agent.agent_id)
                 .await
-                .ok()
-                .flatten();
+            {
+                Ok(state) => state,
+                Err(err) => {
+                    warn!(
+                        agent_id = %agent.agent_id,
+                        error = %err,
+                        "rebalance: 读不到 agent 状态，这一趟不排它（读不到不是「空闲」）"
+                    );
+                    continue;
+                }
+            };
 
             let allowed = matches!(
                 backend_state,
@@ -127,7 +140,7 @@ impl TaskRebalancer {
                 continue;
             }
 
-            let in_flight = self.count_running_tasks_for_agent(&agent.agent_id).await;
+            let in_flight = self.count_running_tasks_for_agent(&agent.agent_id).await?;
 
             if in_flight > self.cfg.max_tasks_per_agent {
                 plan.overloaded_agents
@@ -152,8 +165,8 @@ impl TaskRebalancer {
         // each one cost a read of a row that could not change.
         let ready: Vec<String> = self
             .orchestrator
-            .get_ready_tasks()
-            .await
+            .get_ready_tasks_checked()
+            .await?
             .into_iter()
             .filter(|t| t.status != TaskStatus::Scheduled)
             .map(|t| t.id.clone())
@@ -204,14 +217,21 @@ impl TaskRebalancer {
 
     /// Count the number of running tasks owned by an agent according
     /// to the orchestrator.
-    async fn count_running_tasks_for_agent(&self, agent_id: &str) -> usize {
-        self.orchestrator
-            .get_all_tasks()
-            .await
+    async fn count_running_tasks_for_agent(
+        &self,
+        agent_id: &str,
+    ) -> SupervisorResult<usize> {
+        // 读不到图就不数：数成 0 条在跑会让这个 agent 看起来空闲，于是往一个并不空闲的
+        // agent 上派活。读不到的答案是把这一趟算不成，不是「它没有活」。
+        let count = self
+            .orchestrator
+            .get_all_tasks_checked()
+            .await?
             .into_iter()
             .filter(|t| t.agent_id.as_deref() == Some(agent_id))
             .filter(|t| matches!(t.status, TaskStatus::Scheduled | TaskStatus::Running))
-            .count()
+            .count();
+        Ok(count)
     }
 
     /// Build a recovery plan for tasks whose agents were declared Dead.
@@ -230,11 +250,15 @@ impl TaskRebalancer {
     ) -> SupervisorResult<RebalancePlan> {
         let mut plan = RebalancePlan::default();
 
+        // 一次读清楚这一趟的图。读不到就整份计划算不成——`get_all_tasks()` 读失败会给一个
+        // 空表，于是下面每一条检查点都读成「这条任务已经不在图里了」，恢复计划悄悄空掉，
+        // 而调用方看到的是一个成功的、什么也不做的计划。
+        let tasks = self.orchestrator.get_all_tasks_checked().await?;
+
         for rc in recovered {
             // Verify the task is still in the orchestrator and not already
             // completed or assigned to another agent.
-            let tasks = self.orchestrator.get_all_tasks().await;
-            let still_relevant = tasks.into_iter().any(|t| {
+            let still_relevant = tasks.iter().any(|t| {
                 t.id == rc.task_id
                     && !matches!(t.status, TaskStatus::Completed | TaskStatus::Failed)
             });
