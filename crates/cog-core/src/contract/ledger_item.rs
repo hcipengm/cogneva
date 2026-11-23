@@ -202,9 +202,52 @@ pub fn parse_md(text: &str) -> Result<Vec<LedgerItem>, String> {
     Ok(out)
 }
 
+/// 台账上**写着到终态**的那几条的序号：五格行、末格是 `已落`、差距那格空着。
+///
+/// 与 [`parse_md`] 是同一把尺子的两面：那一面只交「还进批次的」，这一面只交「已经到
+/// 了的」。两个函数读同一组格子规则，一处改了另一处也必须改——所以这里带一条用例，
+/// 拿同一本台账比对两面的答案，免得「做完了」与「还在做」各读各的。
+pub fn reached_ids(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if !is_ledger_row(line) {
+            continue;
+        }
+        let cells = cells_of(line);
+        if cells.len() < 5 {
+            continue;
+        }
+        if LedgerState::parse(cells.last().map(String::as_str).unwrap_or(""))
+            != Some(LedgerState::Reached)
+        {
+            continue;
+        }
+        if EMPTY_GAP.contains(&gap_of(&cells[3]).trim()) {
+            out.push(cells[0].clone());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 同一本台账：`parse_md` 交的是「还在做」，`reached_ids` 交的是「到了」，
+    /// 两边合起来正好是整本，且不重叠。
+    #[test]
+    fn the_two_readers_split_the_ledger_between_them() {
+        let text = "\
+| S1 | 终态一 | 现在一 | 差距一 ｜ touches: a.rs | 未落 |
+| S2 | 终态二 | 现在二 | — ｜ touches: b.rs | 已落 |
+| S3 | 终态三 | 现在三 | 还差一点 ｜ touches: c.rs | 已落 |
+| S4 | 终态四 | 现在四 | — | 已落 |
+";
+        let open: Vec<String> = parse_md(text).unwrap().into_iter().map(|i| i.id).collect();
+        let done = reached_ids(text);
+        assert_eq!(open, vec!["S1", "S3"]);
+        assert_eq!(done, vec!["S2", "S4"]);
+    }
 
     fn item(terminal: &str, now: &str, gap: &str, state: LedgerState) -> LedgerItem {
         LedgerItem {
