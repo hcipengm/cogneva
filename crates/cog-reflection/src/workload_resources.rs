@@ -547,6 +547,27 @@ pub fn bounded_defaults(shape: Targets, range: &DefaultRange) -> Targets {
     }
 }
 
+/// 这一拍要写进默认层的形状。
+///
+/// 默认层是同一套律的第二个调用点，所以它按同一个顺序走两步：先夹进对象自己
+/// 声明的准入区间，再让上限只往上抬。第二步的对象是 LimitRange 上此刻写着的
+/// 默认上限——一个还没声明资源的容器正是按它被掐的，而窗口里的请求只说明这些
+/// 容器闲时占多少，说明不了默认值该给的突发余量。请求那一侧不受这一步影响，
+/// 仍按量到的写。
+pub fn default_layer_shape(measured: Targets, reading: &DefaultsReading) -> Targets {
+    let mut shape = bounded_defaults(measured, &reading.range);
+    let non_zero = |value: u64| Some(value).filter(|declared| *declared > 0);
+    limits_only_rise(
+        &mut shape,
+        &Declared {
+            cpu_limit_millicores: non_zero(reading.current.cpu_limit_millicores),
+            memory_limit_bytes: non_zero(reading.current.memory_limit_bytes),
+            ..Declared::default()
+        },
+    );
+    shape
+}
+
 /// 一只 LimitRange 对象当前说的默认值与区间。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DefaultsReading {
@@ -2274,7 +2295,7 @@ pub async fn round(
                     readings.note_defaults_evaluated(LIMIT_RANGE_NAME);
                     match default_shape(&namespace_cpu_requests, &namespace_memory_requests) {
                         Some(shape) => {
-                            let shape = bounded_defaults(shape, &reading.range);
+                            let shape = default_layer_shape(shape, &reading);
                             readings.observe_defaults(LIMIT_RANGE_NAME, shape, SOURCE_DERIVED);
                             if let Some(body) = limit_range_patch_body(&object, &shape) {
                                 let body = body.to_string();
@@ -3445,6 +3466,36 @@ mod tests {
         let pvc_only = json!({"spec": {"limits": [{"type": "PersistentVolumeClaim"}]}});
         assert!(parse_limit_range(&pvc_only).is_none());
         assert!(limit_range_patch_body(&pvc_only, &shape).is_none());
+    }
+
+    // proves: resourceGovernance.limitRange.defaultCpu
+    // proves: resourceGovernance.limitRange.defaultMemory
+    /// 默认层与容器那一层是同一条律：请求跟着量到的走，上限不落到对象已经
+    /// 声明的那个数之下。这里的声明值是 LimitRange 上此刻写着的默认上限
+    /// （例如测试对象里的 500m / 512Mi），闲置的请求读数（例如 10m / 32Mi）
+    /// 压不动它。
+    #[test]
+    fn the_default_layer_keeps_the_limit_it_declares_when_the_requests_are_idle() {
+        let mib = 1024 * 1024;
+        let object = limit_range_object();
+        let reading = parse_limit_range(&object).unwrap();
+        let idle_cpu = vec![10u64; 8];
+        let idle_memory = vec![32 * mib; 8];
+        let measured = default_shape(&idle_cpu, &idle_memory).unwrap();
+        assert!(
+            bounded_defaults(measured, &reading.range).cpu_limit_millicores
+                < reading.current.cpu_limit_millicores,
+            "这一拍本来会把默认上限压到声明值之下，否则这条测试判不到东西"
+        );
+        let shape = default_layer_shape(measured, &reading);
+        assert_eq!(
+            shape.cpu_limit_millicores,
+            reading.current.cpu_limit_millicores
+        );
+        assert_eq!(shape.memory_limit_bytes, reading.current.memory_limit_bytes);
+        // 请求仍按量到的写：默认层压上限的那一侧不再动，请求那一侧照常跟随。
+        assert_eq!(shape.cpu_request_millicores, 10);
+        assert_eq!(shape.memory_request_bytes, 32 * mib);
     }
 
     /// The beat is the evidence: the value may not move, the counter does.

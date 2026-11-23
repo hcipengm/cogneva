@@ -54,21 +54,25 @@ resourceGovernance:
     # why: collapsed into one typical container (median request, p95 limit with the same headroom), clamped
     # why: into the LimitRange's own admitted [min,max], and written back onto the `cogneva-limits` object as a
     # why: merge patch carrying the full `spec.limits` array (the PVC entry and the max/min ride along; a
-    # why: partial patch would drop them). Admission reads the object, not this reading -- not writing back
+    # why: partial patch would drop them). The bound starts at the default the object already declares and only
+    # why: rises: requests fall towards idle when nothing is running, and an idle request reading cannot say how
+    # why: much burst this default has to cover -- so it can prove the default is too low, never too high.
+    # why: Admission reads the object, not this reading -- not writing back
     # why: would leave the measured shape on the reading face only. Until any container has been measured the
     # why: object's own declared default is published as the seed. The value in force and its `source` are
     # why: published per limitRange, and every evaluation is counted, so "the value did not move" and "the loop
     # why: did not run" are different readings.
     # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=DEFAULT_CPU_METRIC label=source cadence=periodic
-    # proof: file=crates/cog-reflection/src/workload_resources.rs test=the_namespace_default_follows_the_measured_requests beat=the_default_beat_counts_even_when_the_value_does_not_move evidence=defaults_evaluations
+    # proof: file=crates/cog-reflection/src/workload_resources.rs test=the_default_layer_keeps_the_limit_it_declares_when_the_requests_are_idle beat=the_default_beat_counts_even_when_the_value_does_not_move evidence=defaults_evaluations
     defaultCpu: 500m
     # tunable:
     # why: The memory limit for the same containers: the same call of the same law (p95 over the window with
     # why: the configured headroom, quantized up), clamped into the LimitRange's admitted range and written
-    # why: back with the full `spec.limits` array. Published per limitRange with its `source` and the
-    # why: evaluation counter beside the other three defaults.
+    # why: back with the full `spec.limits` array. Like the CPU default it only rises: the starting point is
+    # why: the default the object declares, and an idle reading never lowers it. Published per limitRange with
+    # why: its `source` and the evaluation counter beside the other three defaults.
     # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=DEFAULT_MEMORY_METRIC label=source cadence=periodic
-    # proof: file=crates/cog-reflection/src/workload_resources.rs test=the_namespace_default_follows_the_measured_requests beat=the_default_beat_counts_even_when_the_value_does_not_move evidence=defaults_evaluations
+    # proof: file=crates/cog-reflection/src/workload_resources.rs test=the_default_layer_keeps_the_limit_it_declares_when_the_requests_are_idle beat=the_default_beat_counts_even_when_the_value_does_not_move evidence=defaults_evaluations
     defaultMemory: 512Mi
     # tunable:
     # why: The CPU request a container that declares none gets: the median of the namespace's measured
