@@ -515,12 +515,6 @@ impl RalphLoop {
         if tail.iter().any(|it| it.pge_passed) {
             return false;
         }
-        if tail
-            .iter()
-            .any(|it| it.reset_strategy != ResetStrategy::Identical)
-        {
-            return false;
-        }
         let normalize = |s: &str| {
             s.split_whitespace()
                 .collect::<Vec<_>>()
@@ -528,7 +522,15 @@ impl RalphLoop {
                 .to_lowercase()
         };
         let first = normalize(&tail[0].feedback);
-        let identical_failure = tail.iter().all(|it| normalize(&it.feedback) == first);
+        // 「同一句失败原样重放」要求这一窗连策略都没换过；「这一窗买到进展了吗」
+        // 只看读数。后者不能以「换过策略」为前提：换一处是停滞之后要做的事，不是
+        // 停滞不成立的证据——按那个前提判的版本里，一个每轮都换策略、却一条读数
+        // 也没抬起来的循环会永远转下去（2026-11-23 实测：圆桌的共识永远差一次时
+        // 就是这样，删掉迭代预算之后它没有别的出口）。
+        let identical_failure = tail
+            .iter()
+            .all(|it| it.reset_strategy == ResetStrategy::Identical)
+            && tail.iter().all(|it| normalize(&it.feedback) == first);
         identical_failure || self.tail_bought_no_progress(tail)
     }
 
@@ -1755,7 +1757,13 @@ mod tests {
                 .get("instructions")
                 .and_then(|v| v.as_str())
                 .is_some_and(|s| s.contains("judge the terminal description"));
-            if asks_about_terminals {
+            // 夹具自己写了判词的（审不过的那几条反例），照它写的答。
+            let has_own_verdicts = self
+                .response
+                .get("verdicts")
+                .and_then(|v| v.as_array())
+                .is_some_and(|v| !v.is_empty());
+            if asks_about_terminals && !has_own_verdicts {
                 let verdicts: Vec<serde_json::Value> = input
                     .get("items")
                     .and_then(|v| v.as_array())
