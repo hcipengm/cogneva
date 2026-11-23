@@ -29,6 +29,7 @@ const PROCESSES: &str = "crates/cog-gateway/src/processes.rs";
 const LIB: &str = "crates/cog-gateway/src/lib.rs";
 const EXECUTOR: &str = "crates/cog-gateway/src/executor.rs";
 const REBALANCER: &str = "crates/cog-supervisor/src/task_rebalancer.rs";
+const DAG_EXECUTOR: &str = "crates/cog-orchestrator/src/dag_executor/orchestrator.rs";
 
 /// 折叠过的那几条读。某一段正文里出现它们，就是那一面在替没读到的图作证。
 const FOLDED: &[&str] = &[
@@ -234,6 +235,24 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "get_all_tasks_checked",
         "读失败让每个检查点都读成「任务已不在图里」，恢复计划悄悄空掉",
     ),
+    (
+        DAG_EXECUTOR,
+        "pub async fn find_stalled_scheduled_tasks",
+        "all_tasks_checked",
+        "清扫读成「没有停住的行」，一整轮什么都没收也算完",
+    ),
+    (
+        DAG_EXECUTOR,
+        "async fn reclaim_one_stalled",
+        "get_task_checked",
+        "逐行那一读失败被读成「它已经走开了」，清扫静默跳过这一行",
+    ),
+    (
+        DAG_EXECUTOR,
+        "async fn on_task_terminal",
+        "get_task_checked",
+        "读不到被读成「这一行不在了」，目标行永远停在 Pending 而没人知道为什么",
+    ),
 ];
 
 #[test]
@@ -250,6 +269,7 @@ fn every_surface_that_draws_the_graph_keeps_the_failure() {
         LIB,
         EXECUTOR,
         REBALANCER,
+        DAG_EXECUTOR,
     ] {
         productions.insert(file, production_text(&read_repo(file)));
     }
