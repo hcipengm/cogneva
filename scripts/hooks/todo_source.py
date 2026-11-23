@@ -352,13 +352,48 @@ def load(spec: str) -> list[Item]:
     raise Unreadable(f"不认识的台账来源：{spec}（只认 md:<路径> 与 change-ledger）")
 
 
+def _git_config(key: str) -> str | None:
+    """当前工作树那个仓里的一条配置；没有、或读不了，都是 None。"""
+    try:
+        out = subprocess.run(["git", "config", "--get", key], capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
+
+
+def ledger_from_repo_config() -> str | None:
+    """本机仓配置给的两格：地址 `cogneva.privateRoot` 与文件名 `cogneva.workLedger`。
+
+    为什么走配置而不是走常量：带外 worker 的台账住在一个私有仓里，它的**名字和位置**
+    都不该写进公开树——写进去等于把要藏的东西放进被它守的那棵树。地址与文件名各是一
+    条本机配置，换机器只改配置；公开树里一个字都不留。
+
+    `cogneva.workLedger` 是绝对路径就原样用；是相对路径就接在 `cogneva.privateRoot`
+    后面。只有地址没有文件名时返回 None——「有一个仓」与「知道是哪本台账」是两件事，
+    不拿仓里随便一本顶替（那会让两个 worker 读同一本，其中一边的活永远没人做）。
+    """
+    ledger = _git_config("cogneva.workLedger")
+    if not ledger:
+        return None
+    path = pathlib.Path(ledger).expanduser()
+    if not path.is_absolute():
+        root = _git_config("cogneva.privateRoot")
+        if not root:
+            return None
+        path = pathlib.Path(root).expanduser() / path
+    return str(path)
+
+
 def default_spec() -> str:
     """这台机器上，**这个 worker** 的台账是哪一本。
 
     解析顺序（S62）：显式 `COGNEVA_TODO_SOURCE` → `COGNEVA_WORKER_LEDGER` →
-    本机声明 `~/.config/cogneva/todo-ledger`。三者都没有，就返回一个不存在的路径，
-    让调用方报「读不到」——**不回落**到一份共享清单。回落会让两个 worker 读到同一本
-    台账：批次在两边都算得出来，而其中一边的活永远没人做。
+    本机仓配置（`cogneva.privateRoot` ＋ `cogneva.workLedger`）→ 本机声明
+    `~/.config/cogneva/todo-ledger`。都没有，就返回一个不存在的路径，让调用方报
+    「读不到」——**不回落**到一份共享清单。回落会让两个 worker 读到同一本台账：
+    批次在两边都算得出来，而其中一边的活永远没人做。
     """
     explicit = os.environ.get("COGNEVA_TODO_SOURCE")
     if explicit:
@@ -367,6 +402,9 @@ def default_spec() -> str:
         value = os.environ.get(key)
         if value:
             return f"md:{value}"
+    from_config = ledger_from_repo_config()
+    if from_config:
+        return f"md:{from_config}"
     host = pathlib.Path.home() / ".config/cogneva/todo-ledger"
     if host.exists():
         first = host.read_text(errors="ignore").strip().splitlines()
