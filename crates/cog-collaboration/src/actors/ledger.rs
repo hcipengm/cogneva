@@ -81,15 +81,16 @@ pub fn status() -> i32 {
     }
 }
 
-/// `cogneva ledger <action>` 的分派。今天有 `status`、`next` 与 `open`；别的名字点名说没有，
+/// `cogneva ledger <action>` 的分派。今天有 `status`、`next`、`open` 与 `close`；别的名字点名说没有，
 /// 不静默成功——一个不认识的子命令退 0 会被读成「跑过了」。
 pub fn run() -> i32 {
     match std::env::args().nth(2).as_deref() {
         Some("status") | None => status(),
         Some("next") => next(),
         Some("open") => open(),
+        Some("close") => close(),
         Some(other) => {
-            eprintln!("ledger: 不认识的动作 `{other}`（今天有 `status`、`next` 与 `open`）");
+            eprintln!("ledger: 不认识的动作 `{other}`（今天有 `status`、`next`、`open` 与 `close`）");
             2
         }
     }
@@ -121,6 +122,22 @@ pub fn decide(open_rows: usize, dirty: bool, compiled_head: Option<&str>, head: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 关轮那一行读数：时刻、第一次开工的基准、这一批几条、都是谁——四格用制表符分开，
+    /// 读的人按第 3 格取「这个宿主收过多大的一批」。
+    #[test]
+    fn a_closed_round_writes_its_size_on_one_line() {
+        let line = closed_round_line(
+            "2026-11-24T01:02:03Z",
+            "abcdef1234567890",
+            &["N01".to_string(), "N02".to_string()],
+        );
+        let cells: Vec<&str> = line.split('\t').collect();
+        assert_eq!(cells.len(), 4);
+        assert_eq!(cells[1], "abcdef123456");
+        assert_eq!(cells[2], "2");
+        assert_eq!(cells[3], "N01,N02");
+    }
+
     /// 书的载荷带着这一批、这一批每条的缺口、两个坐标与第一次开工的基准。
     #[test]
     fn the_round_payload_carries_the_batch_and_every_gap() {
@@ -281,21 +298,10 @@ pub fn open() -> i32 {
         .map(|i| (i.id.clone(), serde_json::Value::String(i.gap.clone())))
         .collect();
     let payload = round_payload(&batch, &gaps, &ledger_rev, &code_rev, &first_rev);
-    let body = payload.to_string();
-    let blob = std::process::Command::new("git")
-        .args(["-C", &repo, "hash-object", "-w", "--stdin"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut c| {
-            use std::io::Write;
-            c.stdin.as_mut().expect("stdin").write_all(body.as_bytes())?;
-            c.wait_with_output()
-        });
-    let sha = match blob {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        _ => {
-            eprintln!("ledger: 书写不进去（{repo}）");
+    let sha = match write_book(&repo, &payload.to_string()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ledger: {e}（{repo}）");
             return 2;
         }
     };
@@ -348,4 +354,124 @@ fn existing_first_rev(repo: &str) -> Option<String> {
         .get("first_rev")?
         .as_str()
         .map(str::to_string)
+}
+
+/// `cogneva ledger close`：把这一轮合上，并把「这一批真有这么大」记成一行读数。
+///
+/// 关轮不改批：书里写着开门那一刻的清单，这里只加一个 `closed_at`。读数文件记的是
+/// **书里那一批**的大小——它是 `Split: 4`（一次读不完）的界，按关轮那一刻现算的批
+/// （已全部到终态，故为空）记，那条读数就永远是 0。
+pub fn close() -> i32 {
+    let path = match ledger_path() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ledger: {e}");
+            return 2;
+        }
+    };
+    let ledger_dir = path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+    let (repo, ok) = git(&ledger_dir, &["rev-parse", "--show-toplevel"]);
+    if !ok || repo.is_empty() {
+        eprintln!("ledger: 台账不在一个 git 仓里（{ledger_dir}）");
+        return 2;
+    }
+    let (sha, ok) = git(&repo, &["rev-parse", "--verify", "--quiet", ROUND_REF]);
+    if !ok || sha.is_empty() {
+        eprintln!("ledger: 没有开着的一轮");
+        return 1;
+    }
+    let (body, ok) = git(&repo, &["cat-file", "-p", &sha]);
+    let mut payload: serde_json::Value = match ok.then(|| serde_json::from_str(&body)).transpose() {
+        Ok(Some(v)) => v,
+        _ => {
+            eprintln!("ledger: {ROUND_REF} 的载荷读不出来");
+            return 2;
+        }
+    };
+    if payload.get("closed_at").and_then(|v| v.as_str()).is_some() {
+        eprintln!("ledger: 这一轮已经关了");
+        return 1;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("closed_at".into(), serde_json::Value::String(now.clone()));
+    }
+    let new_sha = match write_book(&repo, &payload.to_string()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ledger: {e}");
+            return 2;
+        }
+    };
+    if !git(&repo, &["update-ref", "--create-reflog", ROUND_REF, &new_sha]).1 {
+        eprintln!("ledger: {ROUND_REF} 没写成");
+        return 2;
+    }
+    let batch: Vec<String> = payload
+        .get("batch")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let first_rev = payload
+        .get("first_rev")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let line = closed_round_line(&now, &first_rev, &batch);
+    let ledger_path_file = std::path::PathBuf::from(
+        std::env::var("COGNEVA_CLOSED_ROUNDS").unwrap_or_else(|_| {
+            format!("{}/.local/state/cogneva/rounds-closed.tsv", home())
+        }),
+    );
+    if let Some(dir) = ledger_path_file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    use std::io::Write;
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&ledger_path_file)
+    {
+        Ok(mut f) => {
+            let _ = writeln!(f, "{line}");
+        }
+        Err(e) => eprintln!(
+            "ledger: 读数没写进去：{}（{e}）——这一轮关了，但那条界没有新增样本",
+            ledger_path_file.display()
+        ),
+    }
+    println!("ledger: 这一轮关了，本批 {} 条", batch.len());
+    0
+}
+
+/// 关轮那一刻写下的那一行读数：时刻、第一次开工的基准、这一批几条、都是谁。
+fn closed_round_line(now: &str, first_rev: &str, batch: &[String]) -> String {
+    format!(
+        "{now}\t{}\t{}\t{}",
+        first_rev.chars().take(12).collect::<String>(),
+        batch.len(),
+        batch.join(",")
+    )
+}
+
+/// 把一份载荷写成 blob 并返回它的 sha。
+fn write_book(repo: &str, body: &str) -> Result<String, String> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("git")
+        .args(["-C", repo, "hash-object", "-w", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("书写不进去：{e}"))?;
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(body.as_bytes())
+        .map_err(|e| format!("书写不进去：{e}"))?;
+    let out = child.wait_with_output().map_err(|e| format!("书写不进去：{e}"))?;
+    if !out.status.success() {
+        return Err("书写不进去".to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
