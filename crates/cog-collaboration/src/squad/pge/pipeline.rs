@@ -653,13 +653,23 @@ impl PgePipeline {
                 .and_then(|v| v.as_array())
                 .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
-            let criteria: Vec<&str> = if plan.acceptance_criteria.is_empty() {
-                context_criteria
+            // 判据只读**终态**：计划带着待办时，每条的 `terminal` 就是这一份
+            // 计划要判的那段描述；`acceptance_criteria` 是同一件事的另一份写法，
+            // 只在计划还没产出待办时作为兼容输入读一次，并记一条读数。
+            let items = plan.ledger_items();
+            let criteria: Vec<&str> = if items.is_empty() {
+                if plan.acceptance_criteria.is_empty() {
+                    context_criteria
+                } else {
+                    crate::observable::global_observable()
+                        .record_ralph_termination("plan_without_items");
+                    plan.acceptance_criteria
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect()
+                }
             } else {
-                plan.acceptance_criteria
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect()
+                items.iter().map(|i| i.terminal.as_str()).collect()
             };
 
             // An empty envelope is not a terminal failure, and it is nothing to

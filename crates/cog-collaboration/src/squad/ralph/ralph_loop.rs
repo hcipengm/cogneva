@@ -165,6 +165,11 @@ pub struct RalphLoopConfig {
     pub stagnation_window: u32,
 }
 
+// 停滞时最多换三档（同题重试 → 改上下文 → 换执行者）。这是**策略的档数**，
+// 不是轮数：换完这三档仍没买到进展，缺的就是属主手里的那份输入。
+// cap: fixed — 三档：重置策略的闭集只有 Identical / Modified / Escalated 三个词
+const MAX_STALL_ESCALATIONS: u8 = 3;
+
 // 五轮不买进展即判停滞：一轮反馈要落到下一轮的产出上，两三轮还看得出是在
 // 修，五轮都平就是在换着说法重复同一个失败。
 // cap: bound — 五轮：反馈落到产出的滞后期是两三轮，五轮都平就是在重复同一失败
@@ -269,6 +274,9 @@ pub struct RalphLoop {
     /// 发的那一个），只是没人问它。没有闸对象时不改变任何行为——一个不认识
     /// 这道闸的进程，与从前一模一样。
     pause_gate: Option<Arc<dyn cog_core::SchedulerGate>>,
+    /// 这一跑里已经为「停滞」换过几次档。换档是**改一处**的证据：同题重试 →
+    /// 改上下文 → 换执行者，换完仍无进展就是缺属主那份输入。
+    stall_escalations: u8,
 }
 
 impl Default for RalphLoop {
@@ -278,6 +286,7 @@ impl Default for RalphLoop {
             llm_provider: None,
             history: Vec::new(),
             task_id: None,
+            stall_escalations: 0,
             state_backend: None,
             run_nonce: uuid::Uuid::new_v4().simple().to_string()[..8].to_string(),
             pause_gate: None,
@@ -569,22 +578,41 @@ impl RalphLoop {
         }
     }
 
-    /// 停滞终止的统一形态：Warn 日志 + 指标 + Unrecoverable 判定，
-    /// 历史与结论随 verdict 归档，不是无声消失。
-    fn stagnated_verdict(&self) -> RalphVerdict {
-        let total_iterations = self.history.len() as u32;
+    /// 停滞时改的那一处：每停一次换一档——同题重试 → 改上下文 → 换执行者。
+    ///
+    /// 返回 `Some(根因)` 表示三档都换过了仍没买到进展：这时缺的通常不是重试
+    /// 策略，而是一个只有属主能给的输入，于是带着根因去问，条目开着不关闭。
+    fn change_one_thing(&mut self) -> Option<String> {
+        self.stall_escalations = self.stall_escalations.saturating_add(1);
+        let cause = self
+            .history
+            .last()
+            .map(|it| it.feedback.clone())
+            .unwrap_or_default();
         tracing::warn!(
-            iterations = total_iterations,
             window = self.config.stagnation_window,
-            "Ralph Loop stagnated: no progress across the window; terminating"
+            escalation = self.stall_escalations,
+            %cause,
+            "Ralph Loop bought no progress across the window; changing one thing and continuing"
         );
-        crate::observable::global_observable().record_ralph_termination("stagnated");
+        if self.stall_escalations > MAX_STALL_ESCALATIONS {
+            return Some(cause);
+        }
+        None
+    }
+
+    /// 带着根因问属主：这不是「不可修复」的判决，是一个问题。条目仍开着，
+    /// 属主补上那份输入之后可以从这一轮继续。
+    fn question_verdict(&self, cause: String) -> RalphVerdict {
+        let iterations = self.history.len() as u32;
+        crate::observable::global_observable().record_ralph_termination("stalled_asked_owner");
         RalphVerdict::Unrecoverable {
             reason: format!(
-                "Ralph Loop stagnated: no progress signal across the last {} iterations",
+                "no progress across {} rounds and every strategy was tried; the missing piece \
+                 is an input only the owner can give: {cause}",
                 self.config.stagnation_window
             ),
-            iterations: total_iterations,
+            iterations,
             history: self.history.clone(),
         }
     }
@@ -719,7 +747,15 @@ impl RalphLoop {
             }
 
             if self.is_stagnated() {
-                return self.stagnated_verdict();
+                // 停滞不是结束：说出根因，换一处，然后继续。三档都换过还没买到
+                // 进展，才带着这个根因去问属主（条目仍开着，可续跑）。
+                match self.change_one_thing() {
+                    Some(cause) => return self.question_verdict(cause),
+                    None => {
+                        context["ralph_escalation"] = serde_json::json!(self.stall_escalations);
+                        continue;
+                    }
+                }
             }
 
             // 交了一份计划，被判词逐条点名之后又交了**同一份**：这一轮什么都没
@@ -940,7 +976,15 @@ impl RalphLoop {
             }
 
             if self.is_stagnated() {
-                return self.stagnated_verdict();
+                // 停滞不是结束：说出根因，换一处，然后继续。三档都换过还没买到
+                // 进展，才带着这个根因去问属主（条目仍开着，可续跑）。
+                match self.change_one_thing() {
+                    Some(cause) => return self.question_verdict(cause),
+                    None => {
+                        context["ralph_escalation"] = serde_json::json!(self.stall_escalations);
+                        continue;
+                    }
+                }
             }
 
             if let FailureAnalysis::Recoverable(strategy) = analysis {
@@ -1057,7 +1101,15 @@ impl RalphLoop {
             }
 
             if self.is_stagnated() {
-                return self.stagnated_verdict();
+                // 停滞不是结束：说出根因，换一处，然后继续。三档都换过还没买到
+                // 进展，才带着这个根因去问属主（条目仍开着，可续跑）。
+                match self.change_one_thing() {
+                    Some(cause) => return self.question_verdict(cause),
+                    None => {
+                        context["ralph_escalation"] = serde_json::json!(self.stall_escalations);
+                        continue;
+                    }
+                }
             }
 
             if let FailureAnalysis::Recoverable(strategy) = analysis {

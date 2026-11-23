@@ -72,6 +72,24 @@ pub struct PlannerOutput {
     /// emit targets yet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub targets: Vec<String>,
+    /// 这一份计划要人做的那几条**待办**，每条只带三样：终态、现在、差距。
+    ///
+    /// 判词只读 `terminal`——它是讨论里说定的那段描述，允许散文；`acceptance_criteria`
+    /// 与 `targets` 是同一件事的另外两份写法（一个说判什么、一个说要改哪），
+    /// 三份并存就会漂：判的地方与改的地方对不上，而谁也不会红。这一格存在之后，
+    /// 那两格只作为兼容输入读，不再作为判据。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<cog_core::contract::ledger_item::LedgerItem>,
+}
+
+impl PlannerOutput {
+    /// 这一份计划要判的那几条待办。
+    ///
+    /// 计划没写 `items` 时**不是空批**，是「这一版 planner 还没产出待办」：调用方
+    /// 据此走它原来的判法，并把这件事记成一条读数，而不是把「没写」读成「没有要判的」。
+    pub fn ledger_items(&self) -> &[cog_core::contract::ledger_item::LedgerItem] {
+        &self.items
+    }
 }
 
 /// Whether an in-band cause says this role produced nothing: the transport never

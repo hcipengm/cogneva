@@ -115,6 +115,29 @@ mod tests {
         }
     }
 
+    /// 带外台账写的那两个词，与这里的两个词逐字相同。
+    ///
+    /// 这一条钉的是「两面一套推进词」：`todo_source` 只认 `未落`/`已落`，
+    /// `LedgerState::parse` 也只认这两个；任一边改了词而另一边没改，
+    /// 两边就会把同一条读成两个状态，而两边都不会报错。
+    #[test]
+    fn the_state_words_are_the_ones_the_ledger_writes() {
+        let ledger = ["未落", "已落"];
+        for word in ledger {
+            assert!(
+                LedgerState::parse(word).is_some(),
+                "台账写的 {word} 在这里读不出来"
+            );
+        }
+        for state in [LedgerState::Open, LedgerState::Reached] {
+            assert!(
+                ledger.contains(&state.as_str()),
+                "这里写的 {} 台账不认",
+                state.as_str()
+            );
+        }
+    }
+
     /// 状态词是闭集：读不出来的词没有状态，不是「未落」。
     #[test]
     fn the_state_words_are_a_closed_set() {
