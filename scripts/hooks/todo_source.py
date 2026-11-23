@@ -68,10 +68,10 @@ def parse_cells(text: str) -> dict[str, str]:
 
 
 class Item:
-    __slots__ = ("id", "title", "text", "touches", "deferred", "cells")
+    __slots__ = ("id", "title", "text", "touches", "deferred", "cells", "gap")
 
     def __init__(self, id: str, title: str, text: str, touches: list[str], deferred: bool = False,
-                 cells: dict[str, str] | None = None):
+                 cells: dict[str, str] | None = None, gap: str = ""):
         self.id = id
         self.title = title
         # 整行原文（不截断）。`title` 是给人看的前 80 字，用来估「这一条读起来要多少
@@ -85,6 +85,9 @@ class Item:
         # 触点是「这一轮该改哪些文件」的提示；一个文件改了不等于那条待办做完了
         # （改了一半、改错了地方、或者只是碰巧在同一条路径上），2026-11-21 属主定。
         self.cells = cells or {}
+        # 五格行里那一格「还差什么」。它随轮一起走（写进轮的载荷）：接着做的人
+        # 打开轮就看得见缺口，不必把整本台账重判一遍（S68）。
+        self.gap = gap
 
     def missing_cells(self) -> list[str]:
         return [tag for tag in CELL_TAGS if not self.cells.get(tag)]
@@ -158,7 +161,7 @@ def _fixed_item(line: str, notouch: list[str]) -> tuple[Item, bool] | None:
         notouch.append(cells[0])
         return None
     three = parse_cells(line)
-    item = Item(cells[0], cells[1][:80], line.strip(), touches, deferred, three)
+    item = Item(cells[0], cells[1][:80], line.strip(), touches, deferred, three, gap)
     # 未落的行进批次；写着已落却留着差距的按未完成读（debt），与三格那种同一处置。
     return item, status.startswith(CLOSED_PREFIXES)
 

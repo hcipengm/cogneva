@@ -337,6 +337,9 @@ def open_round(spec: str | None, allow_open: bool = False, code_rev_override: st
             "ledger_file": str(todo_source.spec_path(source).resolve().relative_to(repo.resolve())),
             "code_rev": code_rev,
             "batch": [i.id for i in batch],
+            # 缺口随行走（S68）：接着做的人打开轮就看得见每条还差什么，不必把
+            # 整本台账重判一遍。空串是「这一条没有缺口」（五格行的差距为空）。
+            "gaps": {i.id: i.gap for i in batch},
             "first_rev": first_rev,
             "opened_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         }

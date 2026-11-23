@@ -108,7 +108,7 @@ out=$(COGNEVA_TODO_SOURCE="md:$tmp/loose/ledger.md" python3 "$tree/scripts/hooks
     && ok "台账不在 git 仓里：退 3，不改读事件流" \
     || bad "无仓台账的判词不对（rc=$rc）：$out"
 
-# 6. 关掉一轮时写下「这一批真有这么大」那行读数：`Split: 4` 的界读的就是它。
+# 7. 关掉一轮时写下「这一批真有这么大」那行读数：`Split: 4` 的界读的就是它。
 #    开一轮（两条未落）→ 两条都做到终态 → 关轮，读数文件里要有一行 size=2。
 printf '| S1 | 终态一 | 现在 | 差距 ｜touches: l1.md | 未落 |\n| S2 | 终态二 | 现在 | 差距 ｜touches: l2.md | 未落 |\n' >"$tree/ledger.md"
 git -C "$tree" add ledger.md >/dev/null; git -C "$tree" commit -qm "two open" >/dev/null
@@ -128,6 +128,16 @@ out=$(COGNEVA_CLOSED_ROUNDS="$closed" run close 2>&1); rc=$?
 { [ "$rc" -eq 0 ] && [ -f "$closed" ] && awk -F'\t' '$3==2' "$closed" | grep -q .; } \
     && ok "关一轮：写下这一批的大小（2）" \
     || bad "关轮没写读数（rc=$rc）：$out 文件：$(cat "$closed" 2>/dev/null)"
+
+# 8. 缺口随行走：开一轮时，每条待办的「还差什么」写进轮的载荷。
+printf '| S1 | 终态一 | 现在 | 缺的是：一半 ｜touches: l1.md | 未落 |\n| S2 | 终态二 | 现在 | 缺的是：另一半 ｜touches: l2.md | 未落 |\n' >"$tree/ledger.md"
+git -C "$tree" add ledger.md >/dev/null; git -C "$tree" commit -qm "gaps" >/dev/null
+git -C "$tree" update-ref -d refs/cogneva/round 2>/dev/null
+out=$(run open 2>&1); rc=$?
+payload=$(git -C "$tree" cat-file -p refs/cogneva/round 2>/dev/null)
+{ [ "$rc" -eq 0 ] && printf '%s' "$payload" | grep -q '"S1": "缺的是：一半"'; } \
+    && ok "缺口随行走：轮里带着每条还差什么" \
+    || bad "轮的载荷里没有缺口（rc=$rc）：$payload"
 
 printf 'round-git-store.test.sh: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
