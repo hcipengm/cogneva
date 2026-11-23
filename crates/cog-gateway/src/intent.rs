@@ -151,6 +151,13 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Mutex;
 
+    /// 写者与三个计数都是进程级的：并行跑的用例会互相装上/摘下写者、把失败数加在
+    /// 别人的分母上。用例一个接一个地跑，同一条线程上的装配才说得清是谁装上的。
+    fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[derive(Default)]
     struct Recorder {
         rows: Mutex<Vec<IntentRow>>,
@@ -182,6 +189,7 @@ mod tests {
     /// 回答落在「已经记下」之后：这一轮先成为一条意图，再去回答它。
     #[tokio::test]
     async fn a_turn_is_recorded_before_it_is_answered() {
+        let _gate = one_at_a_time();
         let recorder = Arc::new(Recorder::default());
         install_for_test(Some(recorder.clone()));
         record_turn("s1", "owner", "", "把这批门禁的归属改回来").await;
@@ -196,6 +204,7 @@ mod tests {
     /// 同一句重投是同一行：身份只取会话与原文。
     #[test]
     fn the_same_sentence_in_the_same_session_has_one_identity() {
+        let _gate = one_at_a_time();
         assert_eq!(
             intent_identity("s1", "把这批门禁的归属改回来"),
             intent_identity("s1", "把这批门禁的归属改回来")
@@ -213,6 +222,7 @@ mod tests {
     /// 空白的一句不是到达；写不进去记成失败，不让它静默变成「没有说过」。
     #[tokio::test]
     async fn an_empty_turn_is_not_an_intent_and_a_failure_is_counted() {
+        let _gate = one_at_a_time();
         let recorder = Arc::new(Recorder {
             rows: Mutex::default(),
             fail: true,

@@ -3677,6 +3677,8 @@ mod tests {
             &config,
             None,
             None,
+            None,
+            None,
             &readings,
             false,
             &mut parents_settled,
@@ -5027,8 +5029,8 @@ mod tests {
     #[test]
     fn a_batch_in_hand_holds_the_next_one() {
         let mut batch_task = Task::new(
-            "self-signal-chat-intent-x".into(),
-            TaskType::Custom(cog_core::CHAT_INTENT_TASK_KIND.into()),
+            "self-signal-chat-intent-x",
+            TaskType::Custom(cog_core::CHAT_INTENT_TASK_KIND.to_string()),
             serde_json::json!({ cog_core::INPUT_TASK_KIND: cog_core::CHAT_INTENT_TASK_KIND }),
         );
         batch_task.status = TaskStatus::Running;
@@ -5038,8 +5040,8 @@ mod tests {
 
         // 别的活不算：按住下一批的只有对话批次这一类。
         let mut alert = Task::new(
-            "self-signal-alert-x".into(),
-            TaskType::Custom(SIGNAL_TASK_TYPE.into()),
+            "self-signal-alert-x",
+            TaskType::Custom(SIGNAL_TASK_TYPE.to_string()),
             serde_json::json!({ cog_core::INPUT_TASK_KIND: SIGNAL_TASK_TYPE }),
         );
         alert.status = TaskStatus::Running;
