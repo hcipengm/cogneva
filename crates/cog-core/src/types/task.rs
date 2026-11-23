@@ -1144,6 +1144,31 @@ pub const DEFAULT_MAX_RETRIES: u32 = 3;
 pub const DEFAULT_DECLARED_DURATION_SECS: u64 = 300;
 
 impl Task {
+    /// 把一条待办的三格挂到任务行上（`input[ITEM_INPUT_KEY]`）。
+    ///
+    /// 意图的入口不止一处——对话、GitHub 发现、A2A、信号、变更再修——它们都要把
+    /// 「做完是什么样、现在什么样、还差什么」一起交进来；否则协作层拿到的只有一句
+    /// 目标，判者判完之后也没有东西可以写回去。入口各拼一次键名就会漂，所以键与这一
+    /// 句都住在这里。
+    pub fn carrying(mut self, item: &crate::contract::ledger_item::LedgerItem) -> Self {
+        if let Ok(value) = serde_json::to_value(item) {
+            match self.input.as_object_mut() {
+                Some(obj) => {
+                    obj.insert(
+                        crate::contract::ledger_item::ITEM_INPUT_KEY.to_string(),
+                        value,
+                    );
+                }
+                None => {
+                    self.input = serde_json::json!({
+                        crate::contract::ledger_item::ITEM_INPUT_KEY: value
+                    });
+                }
+            }
+        }
+        self
+    }
+
     pub fn new(id: impl Into<String>, task_type: TaskType, input: serde_json::Value) -> Self {
         let now = Utc::now();
         Task {
@@ -1605,6 +1630,25 @@ mod tests {
     /// 它们不是「这条用例挑的值」——判决（`retry_matrix`）与探针的欠结判据
     /// （`DISCOVERY_PROBE_CONTRACT_SECS`）读的都是同一对名字。谁想调它们，调的是
     /// 那个常量；两处各写一个 3、一个 300 的那一版，改一边另一边不会红。
+    /// 入口把三格挂上行：键是同一个名字，读它的人按那个名字取。
+    #[test]
+    fn a_task_can_carry_its_ledger_item() {
+        use crate::contract::ledger_item::{LedgerItem, LedgerState, ITEM_INPUT_KEY};
+        let item = LedgerItem {
+            id: "N1".into(),
+            terminal: "窗口里每一轮都带着它需要的全部".into(),
+            now: "地板还装不下".into(),
+            gap: "缺的是：地板外置".into(),
+            state: LedgerState::Open,
+        };
+        let task = Task::new("t1", TaskType::DagNode, serde_json::json!({"goal": "g"}))
+            .carrying(&item);
+        let back: LedgerItem =
+            serde_json::from_value(task.input.get(ITEM_INPUT_KEY).cloned().expect("没挂上")).unwrap();
+        assert_eq!(back, item);
+        assert_eq!(task.input.get("goal").and_then(|v| v.as_str()), Some("g"), "原有字段不该丢");
+    }
+
     #[test]
     fn a_new_task_carries_the_named_defaults() {
         let task = Task::new("t1", TaskType::DagNode, serde_json::json!({}));
