@@ -1961,6 +1961,7 @@ mod tests {
     #[test]
     fn a_task_carrying_an_item_hands_it_back_with_its_state() {
         use cog_core::contract::ledger_item::{LedgerItem, LedgerState, ITEM_INPUT_KEY};
+        use cog_core::TaskResultMetadata;
         let item = LedgerItem {
             id: "N77".into(),
             terminal: "窗口里每一轮都带着它需要的全部".into(),
