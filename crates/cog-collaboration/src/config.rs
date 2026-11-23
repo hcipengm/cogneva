@@ -158,15 +158,11 @@ impl PgeSettings {
     }
 }
 
-/// Ralph Loop 预算与停滞窗口配置。不收敛的链必须在预算内终止——
-/// 无人值守场景没有操作者盯流调 prompt，"视为无限"等于无限烧 token。
+/// Ralph Loop 的停滞窗口配置。**没有迭代预算**：轮数不是「停」的理由，
+/// 停的理由只有一个——终态到了；停滞是诊断的触发，不是结束。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RalphSettings {
-    /// 单次执行的迭代预算硬上限。预算按次计，不跨执行累计：同一个目标被
-    /// 重新调度时重新起步，已归档的历史只提供反馈与停滞证据。
-    #[serde(skip_serializing_if = "is_the_default_ralph_iterations")]
-    pub max_iterations: u32,
     /// 停滞窗口：最近这么多轮不买进展即终止——归一化反馈逐字相同（同一失败
     /// 原样重放），或分数未升且产物未增长的改写重放（读数不足两个不下结论）。
     /// 这个值同时决定归档历史保留的尾部长度。0 = 关闭停滞检测。
@@ -176,11 +172,10 @@ pub struct RalphSettings {
 
 impl Default for RalphSettings {
     fn default() -> Self {
-        // 轮数与停滞窗由循环自己声明（`RalphLoopConfig`）：两处各写一份，
-        // 改一处忘一处的那天，配置说五十轮、循环说别的。
+        // 停滞窗由循环自己声明（`RalphLoopConfig`）：两处各写一份，改一处忘一处
+        // 的那天，配置说五轮、循环说别的。
         let loop_defaults = crate::squad::ralph::ralph_loop::RalphLoopConfig::default();
         Self {
-            max_iterations: loop_defaults.max_iterations,
             stagnation_window: loop_defaults.stagnation_window,
         }
     }
@@ -198,7 +193,6 @@ impl RalphSettings {
     /// Convert to the loop-level config struct.
     pub fn to_loop_config(&self) -> crate::squad::ralph::RalphLoopConfig {
         crate::squad::ralph::RalphLoopConfig {
-            max_iterations: self.max_iterations,
             stagnation_window: self.stagnation_window,
         }
     }
@@ -228,10 +222,6 @@ impl BoundaryConfig {
 // 「模板该不该写它」是同一个答案。
 fn is_the_default_local_repair_max(v: &u32) -> bool {
     *v == DEFAULT_LOCAL_REPAIR_MAX
-}
-
-fn is_the_default_ralph_iterations(v: &u32) -> bool {
-    *v == RalphSettings::default().max_iterations
 }
 
 fn is_the_default_ralph_window(v: &u32) -> bool {
@@ -600,11 +590,12 @@ mod tests {
     }
 
     #[test]
-    fn ralph_settings_defaults_bound_the_loop() {
+    fn ralph_settings_defaults_carry_the_window_and_no_budget() {
         let p = Path::new("/nonexistent/cogneva.json");
         let r = RalphSettings::load_from(p).unwrap();
-        assert_eq!(r.max_iterations, 50);
         assert_eq!(r.stagnation_window, 5);
+        // 预算已经不存在：配置文件里再写 `ralph.max_iterations` 也不该有字段接它，
+        // 那一条由「每个配置键都被一份交付文档点名」那一族门负责。
     }
 
     /// 只判不写是配置里的一个开关，而且缺省仍是原来的完整循环。

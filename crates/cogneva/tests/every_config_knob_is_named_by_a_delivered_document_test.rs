@@ -159,12 +159,8 @@ const CODE_ONLY: &[CodeOnly] = &[
         "本地修复的每轮上限：随部署的分区规模走；代码默认是唯一的声明，样例副本\n         2026-11-19 删除",
     ),
     code_only(
-        "ralph.max_iterations",
-        "Ralph Loop 的迭代上限与停滞窗口由同一条预算决定（见该节 `_comment`）：两条\n         都按次计、不跨执行累计；样例副本 2026-11-19 删除",
-    ),
-    code_only(
         "ralph.stagnation_window",
-        "同上：停滞窗口与迭代上限是一对，写死一个数会把另一半藏起来",
+        "停滞窗口是循环唯一还留着的那个旋钮：轮数不是「停」的理由，所以没有预算与它成对",
     ),
     code_only(
         "self_evolution.artifact_evolution.interval_secs",

@@ -928,11 +928,6 @@ impl SquadExecutor {
         let object_backend = &deps.object_backend;
         let squad_reflection = &deps.squad_reflection;
         let mut ralph = RalphLoop::with_config(RalphLoopConfig {
-            max_iterations: if squad.config.is_self_evolution {
-                2
-            } else {
-                deps.ralph.max_iterations
-            },
             stagnation_window: deps.ralph.stagnation_window,
         });
         if let Some(ref llm) = deps.llm_provider {
