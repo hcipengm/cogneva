@@ -22,7 +22,7 @@ pub enum ModeratorDecision {
     Escalate,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ModeratorOutput {
     /// What the moderator decided, or `None` when no decision could be read:
     /// the call failed, or it answered in words this parser does not recognise
@@ -38,17 +38,6 @@ pub struct ModeratorOutput {
     /// Optional flag indicating whether the moderator believes the current
     /// result is "good enough" despite not reaching formal consensus.
     pub good_enough: bool,
-}
-
-impl Default for ModeratorOutput {
-    fn default() -> Self {
-        Self {
-            decision: None,
-            reasoning: String::new(),
-            suggestions: Vec::new(),
-            good_enough: false,
-        }
-    }
 }
 
 /// Moderator Actor — semantic wrapper around a `dyn Agent`.

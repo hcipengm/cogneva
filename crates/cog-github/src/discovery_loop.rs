@@ -3827,7 +3827,7 @@ pub(crate) mod tests {
         /// 这时答「图是空的」，而真相是没人读到过它。
         unreadable_graph: std::sync::atomic::AtomicBool,
         /// 整份行表照常读得出，只有这些 id 的那一问答不上来。
-        unreadable_ids: Mutex<HashSet<String>>,
+        unreadable_ids: Mutex<std::collections::HashSet<String>>,
     }
 
     impl MockOrchestrator {
@@ -3854,7 +3854,7 @@ pub(crate) mod tests {
                 intent_rows: Mutex::new(HashMap::new()),
                 refuse_submissions: std::sync::atomic::AtomicBool::new(false),
                 unreadable_graph: std::sync::atomic::AtomicBool::new(false),
-                unreadable_ids: Mutex::new(HashSet::new()),
+                unreadable_ids: Mutex::new(std::collections::HashSet::new()),
             }
         }
 
@@ -5921,14 +5921,12 @@ pub(crate) mod tests {
             "读不到不是「不在了」：它还得留在在途表里，等下一轮再收"
         );
         assert!(
-            provider
+            !provider
                 .comments
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(n, _)| *n == 32)
-                .next()
-                .is_none(),
+                .any(|(n, _)| *n == 32),
             "没读到判词就不该有判词评论"
         );
         std::env::remove_var("COGNEVA_DATA_DIR");

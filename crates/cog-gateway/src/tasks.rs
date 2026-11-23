@@ -612,9 +612,12 @@ fn task_to_change<'a>(rows: &'a [Task], id: &str) -> Result<&'a Task, ApiError> 
 /// graph view that says "nothing exists" about a graph it never read. Absence
 /// of the answer is a 503, the same way every other unreadable read on this
 /// surface answers.
+/// The tasks and the edges between them, as the store hands both over.
+type TaskGraphRows = (Vec<Task>, Vec<(String, String)>);
+
 fn graph_from_reading(
-    reading: cog_core::SFResult<(Vec<Task>, Vec<(String, String)>)>,
-) -> Result<(Vec<Task>, Vec<(String, String)>), ApiError> {
+    reading: cog_core::SFResult<TaskGraphRows>,
+) -> Result<TaskGraphRows, ApiError> {
     reading.map_err(|e| {
         ApiError::service_unavailable(format!("the task graph could not be read: {e}"))
     })
@@ -2456,9 +2459,9 @@ mod tests {
     /// 「还没有任务」。读不出来要拒绝，读得出来时节点与边原样交回。
     #[test]
     fn an_unreadable_graph_read_is_not_an_empty_task_graph() {
-        let unreadable: cog_core::SFResult<(Vec<Task>, Vec<(String, String)>)> = Err(
-            cog_core::SFError::Database("connection reset while reading the graph".into()),
-        );
+        let unreadable: cog_core::SFResult<TaskGraphRows> = Err(cog_core::SFError::Database(
+            "connection reset while reading the graph".into(),
+        ));
         let refusal =
             graph_from_reading(unreadable).expect_err("读不出来时要交回拒绝，不能画成一张空图");
         assert!(

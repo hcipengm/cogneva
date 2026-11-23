@@ -36,6 +36,9 @@ pub const RESUME_OUTCOMES: [&str; 2] = ["restored", "failed"];
 /// `roster` 与 `person` 是这一段座位背后的人：任务行上写的是工号，执行地址是
 /// `squad:<任务>-<座位>`，座位名里没有工号。建完座位就把这一格写进名册行，
 /// 判「认领与交活的是不是行上那位」时才有一处问得出来。
+// 参数多是因为这一环的每个入参都来自不同的地方（运行时句柄、名册、任务声明），
+// 把它们捆成结构体只是把「谁给了什么」藏进构造点；八个调用点也各要多写一次同样的包。
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_role_agent(
     manager: &Arc<dyn AgentManager>,
     llm: &Arc<dyn LlmClient>,

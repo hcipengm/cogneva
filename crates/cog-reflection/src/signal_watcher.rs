@@ -3472,9 +3472,11 @@ mod tests {
         )]));
         orch.forget_the_graph();
         let orch: Arc<dyn OrchestratorControl> = orch;
-        let mut config = SignalWatcherConfig::default();
-        config.self_audit_interval_secs = 0;
-        config.alert_channel_enabled = false;
+        let config = SignalWatcherConfig {
+            self_audit_interval_secs: 0,
+            alert_channel_enabled: false,
+            ..Default::default()
+        };
         let readings = SignalWatcherReadings::new();
         readings.mark_running();
         let mut parents_settled = false;
