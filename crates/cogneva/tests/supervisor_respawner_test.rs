@@ -47,10 +47,16 @@ async fn dead_agent_with_retryable_tasks_triggers_retry() {
     orch.submit_goal("g", vec![t1, t2]).await.unwrap();
 
     for id in ["t-1", "t-2"] {
-        for _ in 0..3 {
+        // 每一次重试都要有「新东西」：同一句话原样再来一次不买重试（重试按变化判，
+        // 不按次数判）。所以这里每轮的失败原因都不同——模拟死掉的员工每次带回的
+        // 新证据。
+        for attempt in 0..3 {
             orch.schedule_task(id).await.unwrap();
             orch.start_task(id).await.unwrap();
-            let (retried, _, _) = orch.fail_task(id, "boom".into(), None).await.unwrap();
+            let (retried, _, _) = orch
+                .fail_task(id, format!("boom attempt {attempt}"), None)
+                .await
+                .unwrap();
             assert!(retried, "expected retry within budget");
         }
         orch.schedule_task(id).await.unwrap();
@@ -98,10 +104,14 @@ async fn retryable_failed_tasks_trigger_crew_retry() {
 
     let task = Task::new("t-1", TaskType::Planner, serde_json::json!({}));
     orch.submit_goal("g", vec![task]).await.unwrap();
-    for _ in 0..4 {
+    // 同上：每一轮的失败都带着不同的内容，重试才买得到；预算耗尽之后停在 Failed。
+    for attempt in 0..4 {
         orch.schedule_task("t-1").await.unwrap();
         orch.start_task("t-1").await.unwrap();
-        let _ = orch.fail_task("t-1", "boom".into(), None).await.unwrap();
+        let _ = orch
+            .fail_task("t-1", format!("boom attempt {attempt}"), None)
+            .await
+            .unwrap();
     }
     assert_eq!(
         orch.get_task("t-1").await.unwrap().status,
