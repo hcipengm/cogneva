@@ -5,7 +5,9 @@
 //! clarification question, escalate, or skip. Then poll tracked PRs and
 //! record outcomes into the reflection engine.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
