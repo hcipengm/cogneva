@@ -179,6 +179,11 @@ pub async fn build_gateway_state(
         observables,
         metrics_dimensions: config.metrics.scrape_dimensions.clone(),
         mcp_client: mcp_client.clone(),
+        // 有客户端才有计数器：没有客户端时这一层连行都没有，装一个空计数器只会
+        // 让「没接」与「接了但没人点」互换位置。
+        mcp_call_counts: mcp_client
+            .as_ref()
+            .map(|_| Arc::new(crate::mcp_calls::McpCallCounts::new())),
         object_backend: object_backend.clone(),
         notification_store: notification_store.clone(),
         notification_dispatcher: notification_dispatcher.clone(),

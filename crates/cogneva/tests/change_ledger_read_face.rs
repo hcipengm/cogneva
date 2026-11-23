@@ -608,6 +608,7 @@ fn state_with(
         observables: Vec::new(),
         metrics_dimensions: Vec::new(),
         mcp_client: None,
+        mcp_call_counts: None,
         workspace_store: None,
         governance_store: None,
         principle_ledger: None,

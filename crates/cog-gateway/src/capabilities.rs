@@ -315,6 +315,18 @@ impl Inventory {
     }
 }
 
+/// 一行的 `calls` 从哪来：这一层有计数器就报它的数（**没点过是 0**），没有就 `None`。
+///
+/// 分成两个答案而不是一个 0，是因为它们要的动作不同：`None` 是「这一层还没接计数器」，
+/// 要去接；`Some(0)` 是「接了，量过，没人点」，要去问用的人为什么不来。合成 0 之后
+/// 第二种会被当成第一种，而第一种会被当成「没人用」。
+fn calls_of_this_layer(
+    counts: Option<&crate::mcp_calls::McpCallCounts>,
+    tool: &str,
+) -> Option<u64> {
+    counts.and_then(|counts| counts.count(tool))
+}
+
 /// 拼出这份清单。任何一个来源读不到都不影响其余来源——缺的那一层在 `sources` 里
 /// 自报，其余照常给出。
 pub async fn read(state: &GatewayState) -> Inventory {
@@ -414,6 +426,7 @@ pub async fn read(state: &GatewayState) -> Inventory {
     sources.push((Source::Plugin, plugin));
 
     // ── MCP ──
+    let mcp_calls = state.mcp_call_counts.clone();
     let mcp = match state.mcp_client.as_ref() {
         None => SourceReading::Unwired {
             because: "这个部署没有配置 MCP 对端（COGNEVA_MCP_ENDPOINT / _COMMAND）".into(),
@@ -440,8 +453,10 @@ pub async fn read(state: &GatewayState) -> Inventory {
                         // 这一栏是 `None`。
                         runs_in: None,
                         // 远端调用走网关的 `/protocol/mcp/tools/call`，不经过内建
-                        // 那张登记表，所以这一层没有数可报。
-                        calls: None,
+                        // 那张登记表；网关在那条路上自己数（`mcp_calls`），所以这一
+                        // 层有自己的计数器。计数器缺席（这个部署没走到装配那条路）
+                        // 时仍是 `None`——「没接」与「接了、没人点」在这一栏上要分得开。
+                        calls: calls_of_this_layer(mcp_calls.as_deref(), name),
                         allowed_roles: None,
                     });
                 }
@@ -798,6 +813,57 @@ mod tests {
         })
         .unwrap();
         assert_eq!(counted["calls"], 0);
+    }
+
+    /// 一次派发数进来之后，那一层就从「没有计数器」变成「有计数器」。
+    ///
+    /// 这一格钉的是计数器与能力行之间那条缝：MCP 的派发点在网关自己的路由上
+    /// （`/api/v1/protocol/mcp/tools/call`），不经过内建那张登记表，所以它此前
+    /// 在这一栏上永远是 `null`——读的人分不清「这一层没接计数器」与「接了、没人点」。
+    /// 没有这条改动时，`counts.count()` 的数进不了 `call_total()` 的和。
+    #[test]
+    fn a_call_from_a_layer_with_a_counter_adds_one_to_the_total() {
+        let counts = crate::mcp_calls::McpCallCounts::new();
+        let row = |name: &str, calls| Entry {
+            name: name.into(),
+            source: Source::Mcp,
+            reach: Reach::Callable,
+            description: None,
+            boundary: None,
+            runs_in: None,
+            calls,
+            allowed_roles: None,
+        };
+
+        // 派发之前：有计数器，量到 0。
+        let before = Inventory {
+            entries: vec![row("search", calls_of_this_layer(Some(&counts), "search"))],
+            ..Default::default()
+        };
+        assert_eq!(
+            before.call_total(),
+            Some((0, Vec::new())),
+            "接了计数器的层在没人点时是量到的 0，不是缺口"
+        );
+
+        // 派发一次：那一行变 1，和也跟着变。
+        counts.record("search");
+        let after = Inventory {
+            entries: vec![row("search", calls_of_this_layer(Some(&counts), "search"))],
+            ..Default::default()
+        };
+        assert_eq!(
+            after.call_total(),
+            Some((1, Vec::new())),
+            "一次派发要进到那一行的数、再进到总和"
+        );
+
+        // 没有计数器时仍是 None：这两件事在线上一眼要分得开。
+        assert_eq!(
+            calls_of_this_layer(None, "search"),
+            None,
+            "这一层根本没有计数器"
+        );
     }
 
     /// 次数之和按行加，缺计数器的层要点名；一层都没有计数器时不算出 0。

@@ -64,6 +64,7 @@ pub mod hooks;
 pub mod ide;
 pub mod knowledge;
 pub mod llm_admin;
+pub mod mcp_calls;
 pub mod memory;
 pub mod notifications;
 pub mod observability;
@@ -344,6 +345,10 @@ pub struct GatewayState {
     pub metrics_dimensions: Vec<String>,
     /// MCP client — discover and call external MCP tools.
     pub mcp_client: Option<Arc<dyn cog_core::McpClient>>,
+    /// MCP 这一层的调用计数。与 `mcp_client` 同生共死：没有客户端时不装计数器，
+    /// 能力格那一栏就答 `null`（没有计数器），而不是 `0`（量过、没人用）。
+    /// 口径是进程内、累计——与内建注册表的 `calls()` 同一条。
+    pub mcp_call_counts: Option<Arc<crate::mcp_calls::McpCallCounts>>,
     /// Object storage backend for file uploads/downloads.
     pub object_backend: Option<Arc<dyn cog_core::ObjectBackend>>,
     /// Notification store (per-process in-memory by default; replace with persistent store when needed).
@@ -4318,14 +4323,22 @@ async fn mcp_tool_call_handler(
     Json(req): Json<McpToolCallRequest>,
 ) -> Response {
     match state.mcp_client {
-        Some(ref client) => match client.call_tool(&req.name, req.arguments).await {
-            Ok(result) => (StatusCode::OK, Json(json!({ "result": result }))).into_response(),
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"error": "mcp_call_failed", "message": e.to_string()})),
-            )
-                .into_response(),
-        },
+        Some(ref client) => {
+            // 数的是**派发**，不是成功：能力格那一栏问的是「有没有人在点这项」，
+            // 一次打到端点上、对端报错的调用照样是有人在点它。成功与否在
+            // `mcp_call_failed` 那一支上有自己的读数，两个问题不合成一个。
+            if let Some(counts) = state.mcp_call_counts.as_ref() {
+                counts.record(&req.name);
+            }
+            match client.call_tool(&req.name, req.arguments).await {
+                Ok(result) => (StatusCode::OK, Json(json!({ "result": result }))).into_response(),
+                Err(e) => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": "mcp_call_failed", "message": e.to_string()})),
+                )
+                    .into_response(),
+            }
+        }
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "mcp_client_not_configured"})),
