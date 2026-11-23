@@ -973,14 +973,23 @@ pub trait LlmUsageLedger: Send + Sync {
 
     /// Tokens spent since `since_unix`, per person, `(person, tokens)`.
     ///
-    /// Two rows resolve to the same person by different evidence, and both are
-    /// written down at the moment the call is made rather than reconstructed
-    /// here: a call that stated an owner carries it on the row; a call made for
-    /// a task carries the task, and the person is whoever submitted that task.
-    /// The second half is a join rather than a second accumulator because the
-    /// task row is where a submitter is written once for a whole piece of work
-    /// — asking every call site to restate it would be the same fact kept in
-    /// two places, and the two disagree the first time one is forgotten.
+    /// Three layers of evidence resolve a call to a person, from the most
+    /// specific down, and every one of them is written down at the moment the
+    /// call or the attempt is made rather than reconstructed here:
+    ///
+    /// 1. a call that stated an owner carries it on the row — that is the
+    ///    payer the caller itself named (an identified conversation);
+    /// 2. failing that, the attempt the call falls inside carries the person:
+    ///    `task_attempt.person` is the employee number the dispatch wrote when
+    ///    the row was claimed. The seat is not a person — `squad:<task>-<seat>`
+    ///    is born and dies with the task, so keying spend on it turns one
+    ///    employee into as many people as the tasks they touched;
+    /// 3. failing that, the task's submitter.
+    ///
+    /// The latter two are joins rather than second accumulators because each
+    /// fact is written once, on its own row — asking every call site to restate
+    /// a person would be the same fact kept in two places, and the two disagree
+    /// the first time one is forgotten.
     ///
     /// People who spent nothing are absent, not zero: this feeds a projection
     /// that rewrites cells a ceiling is judged against, and writing a zero for
