@@ -532,9 +532,17 @@ def next_step(tree: pathlib.Path) -> str:
     family = tree / "scripts/hooks/family.py"
     if not family.is_file():
         return "量不到（这棵树里没有 family.py）"
+    # 台账地址必须和这一轮读到的是同一本：不传 `--ledger` 时 family 读它自己的默认
+    # 解析（本机的 worker 台账），于是「下一步」会按**另一本账**算出来——读数是对的，
+    # 判的不是这一轮（2026-11-23 实测：夹具里它对着真台账说「还有 41 条」）。
+    spec = todo_source.default_spec()
+    ledger_arg = todo_source.normalize(spec)
+    if ledger_arg.startswith("md:"):
+        ledger_arg = ledger_arg[3:]
     try:
         proc = subprocess.run(
-            ["python3", str(family), "--root", str(tree), "--all-todos", "--editing"],
+            ["python3", str(family), "--root", str(tree), "--ledger", ledger_arg,
+             "--all-todos", "--editing"],
             capture_output=True, text=True,
         )
     except OSError:

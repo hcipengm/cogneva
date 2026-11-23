@@ -21,6 +21,7 @@ tree="$tmp/tree"
 mkdir -p "$tree/scripts/hooks"
 cp "$round" "$tree/scripts/hooks/round.py"
 cp "$todo" "$tree/scripts/hooks/todo_source.py"
+cp "$(dirname "$round")/family.py" "$tree/scripts/hooks/family.py"
 
 git -C "$tree" init -q
 git -C "$tree" config user.email t@t
