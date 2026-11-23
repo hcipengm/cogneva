@@ -90,8 +90,9 @@ pub fn run() -> i32 {
         Some("open") => open(),
         Some("close") => close(),
         Some("gate") => gate(),
+        Some("editing") => editing(),
         Some(other) => {
-            eprintln!("ledger: 不认识的动作 `{other}`（今天有 `status`、`next`、`open`、`close` 与 `gate`）");
+            eprintln!("ledger: 不认识的动作 `{other}`（今天有 `status`、`next`、`open`、`close`、`gate` 与 `editing`）");
             2
         }
     }
@@ -128,6 +129,109 @@ pub enum GateOutcome {
     Allow(String),
     Refuse(String),
     Unreadable(String),
+}
+
+/// `cogneva ledger editing`：提交之前的那一问——这一遍编辑，台账上每条待办说的触点都动到了没有。
+///
+/// 与 [`gate`] 问的是同一件事的两个时刻：这一问管「编辑完了没有」（提交前），那一问管
+/// 「到了终态没有」（推之前）。判据都是台账自己写的：这里只看触点，因为编辑还没结束，
+/// 状态还不可能改；到了推的那一步，触点不再算数。
+pub fn editing() -> i32 {
+    match editing_verdict() {
+        GateOutcome::Allow(summary) => {
+            println!("{summary}");
+            0
+        }
+        GateOutcome::Refuse(message) => {
+            eprintln!("{message}");
+            1
+        }
+        GateOutcome::Unreadable(message) => {
+            eprintln!("ledger: {message}");
+            2
+        }
+    }
+}
+
+fn editing_verdict() -> GateOutcome {
+    let path = match ledger_path() {
+        Ok(p) => p,
+        Err(e) => return GateOutcome::Unreadable(e),
+    };
+    let ledger_dir = path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+    let (repo, ok) = git(&ledger_dir, &["rev-parse", "--show-toplevel"]);
+    if !ok || repo.is_empty() {
+        return GateOutcome::Unreadable(format!("台账不在一个 git 仓里（{ledger_dir}）"));
+    }
+    let (sha, ok) = git(&repo, &["rev-parse", "--verify", "--quiet", ROUND_REF]);
+    if !ok || sha.is_empty() {
+        return GateOutcome::Unreadable("没有开着的一轮：这一步判不了".into());
+    }
+    let (body, ok) = git(&repo, &["cat-file", "-p", &sha]);
+    let payload: serde_json::Value = match ok.then(|| serde_json::from_str(&body)).transpose() {
+        Ok(Some(v)) => v,
+        _ => return GateOutcome::Unreadable(format!("{ROUND_REF} 的载荷读不出来")),
+    };
+    let code_rev = payload
+        .get("code_rev")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            return GateOutcome::Unreadable(format!("台账读不到：{}（{e}）", path.display()))
+        }
+    };
+    let items = match cog_core::contract::ledger_item::parse_md(&text) {
+        Ok(items) => items,
+        Err(e) => return GateOutcome::Unreadable(e),
+    };
+    let touches = touches_by_id(&text);
+    let tree = std::env::current_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_default();
+    let touched: Vec<String> = match git(&tree, &["diff", "--name-only", &code_rev]) {
+        (out, true) => out.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect(),
+        _ => return GateOutcome::Unreadable(format!("工作树的改动读不到（对比 {code_rev}）")),
+    };
+    let pairs: Vec<(String, Vec<String>)> = items
+        .iter()
+        .map(|i| (i.id.clone(), touches.get(&i.id).cloned().unwrap_or_default()))
+        .collect();
+    match judge_editing(&pairs, &touched) {
+        Ok(()) => GateOutcome::Allow(format!("ledger: 这一批 {} 条的触点都动到了。", pairs.len())),
+        Err(missing) => GateOutcome::Refuse(format!(
+            "pre-commit（批次）：这一轮的批还没编辑完，先别提交。\n  {}",
+            missing.join("\n  ")
+        )),
+    }
+}
+
+/// 每一条的触点都动到了没有。没有触点的条目**不在这里判**（它是台账读不出来那一类，
+/// `parse_md` 之前就点了名）；这里只回答「写了触点的，动到了没有」。
+pub fn judge_editing(items: &[(String, Vec<String>)], touched: &[String]) -> Result<(), Vec<String>> {
+    let hit = |path: &str| {
+        let p = path.trim_end_matches('/');
+        touched.iter().any(|f| f == p || f.starts_with(&format!("{p}/")))
+    };
+    let mut missing = Vec::new();
+    for (id, paths) in items {
+        if paths.is_empty() {
+            continue;
+        }
+        if !paths.iter().any(|p| hit(p)) {
+            missing.push(format!(
+                "TODO {id}（触点 {} 一处都没动）",
+                paths.iter().take(3).cloned().collect::<Vec<_>>().join("、")
+            ));
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(missing)
+    }
 }
 
 /// 这一批做完了没有。IO 与判定分开：判定是纯函数，能拿夹具逐条问。
@@ -498,6 +602,22 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// 触点动过才算编辑过；目录触点读作「它下面任何一个文件动了」。
+    #[test]
+    fn an_edit_is_done_when_every_touch_it_names_moved() {
+        let items = vec![
+            ("N01".to_string(), vec!["crates/a".to_string()]),
+            ("N02".to_string(), vec!["crates/b/src/x.rs".to_string()]),
+        ];
+        assert_eq!(
+            judge_editing(&items, &["crates/a/src/lib.rs".into(), "crates/b/src/x.rs".into()]),
+            Ok(())
+        );
+        let missing = judge_editing(&items, &["crates/a/src/lib.rs".into()]).unwrap_err();
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].contains("N02"), "{missing:?}");
     }
 
     /// 整批到终态：不问提交信息。
