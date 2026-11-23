@@ -2556,6 +2556,40 @@ mod tests {
         );
     }
 
+    /// 计划在循环**外面**做一次，循环里只剩生成与判定。
+    ///
+    /// 判的是结构而不是行为：`run_pipeline_scoped` 里 planner 的那次调用必须
+    /// 出现在无上界循环之前，循环拿到的是 `PlanScope::Declared`（一份固定的
+    /// 计划）。每轮重跑 planner 会把终态每轮重写一次，判词就追着一个移动的
+    /// 目标——那种不收敛在任何读数上都看不出来。
+    #[test]
+    fn the_plan_is_made_once_before_the_loop() {
+        let source = include_str!("ralph_loop.rs");
+        let pipeline = source
+            .split("async fn run_pipeline_scoped")
+            .nth(1)
+            .expect("the pipeline loop is in this file");
+        let planned_at = pipeline
+            .find("let planned_once")
+            .expect("计划那一次调用不见了");
+        let loop_at = pipeline
+            .find("for iteration in 1.. {")
+            .expect("无上界的循环不见了");
+        assert!(
+            planned_at < loop_at,
+            "planner 又回到循环里了：终态会每轮被重写一次"
+        );
+        let before_loop = &pipeline[planned_at..loop_at];
+        assert!(
+            before_loop.contains("review_criteria"),
+            "判据审要在循环之前跑：终态写得对不对先问一次，再开始生成"
+        );
+        assert!(
+            before_loop.contains("PlanScope::Declared(plan)"),
+            "循环里拿到的该是一份固定的计划（Declared），不是每轮现问的 planner"
+        );
+    }
+
     /// 失败分析的提示词只带归档同一条界内的尾部，不带整段历史。
     ///
     /// 这条界决定了分类器的提示词会不会随一次已经注定不收敛的运行一直长；
