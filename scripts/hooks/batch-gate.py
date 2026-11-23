@@ -79,11 +79,6 @@ def irreversible(path: str) -> bool:
     )
 
 
-def estimate_tokens(text: str) -> int:
-    cjk = len(re.findall(r"[一-鿿]", text))
-    return cjk + max(0, len(text) - cjk) // 4
-
-
 def open_todos(spec: str):
     """台账 → 未完成条目。来源的形状见 `todo_source.py`；读不到抛 Unreadable。"""
     return todo_source.load(spec)
