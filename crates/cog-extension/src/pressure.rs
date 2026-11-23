@@ -1057,10 +1057,20 @@ mod tests {
         );
     }
 
+    /// 读数面那几格共用的一把锁。
+    ///
+    /// 每个测试各写一个 `static SERIAL` 时锁的是**自己**：三个测试互相看不见对方的
+    /// 预留，而它们读的 `render()` 是同一份进程级读数——一个测试正持着 2 GiB，另一个
+    /// 刚把自己的那一格放下，读到的却不是 0（2026-11-23 实测：偶发红在
+    /// `sandbox_command_reservation_open 0`）。所以锁只有一把，凡是预留或读那一面的
+    /// 测试都拿它。
+    static PRESSURE_SURFACE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A reservation is room taken until the work that took it ends; dropping
     /// it is what gives the room back, so a caller cannot forget to.
     #[test]
     fn a_reservation_is_held_until_it_is_dropped() {
+        let _serial = PRESSURE_SURFACE.lock().unwrap_or_else(|p| p.into_inner());
         let ledger = Ledger::new();
         assert_eq!(ledger.reserved_bytes(), 0);
         let held = ledger.reserve(2 * GIB);
@@ -1076,6 +1086,7 @@ mod tests {
     /// reservation it takes is visible to whatever plans next.
     #[tokio::test]
     async fn waiting_ends_when_the_room_is_given_back() {
+        let _serial = PRESSURE_SURFACE.lock().unwrap_or_else(|p| p.into_inner());
         let ledger = Ledger::new();
         let held = ledger.reserve(6 * GIB);
         let demand = Demand::from_samples(&[2 * GIB]);
@@ -1151,8 +1162,7 @@ mod tests {
     /// room" and "holding nothing" read the same.
     #[test]
     fn the_verdicts_and_the_open_reservations_are_on_the_scrape_surface() {
-        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = PRESSURE_SURFACE.lock().unwrap_or_else(|p| p.into_inner());
         let ledger = Ledger::new();
         let held = ledger.reserve(1024);
         let text = render();
@@ -1170,8 +1180,7 @@ mod tests {
     /// 那一条：读者能把「用钉子留住的」「被导向的」「靠加副本接住的」分开。
     #[test]
     fn each_placement_reason_is_its_own_series() {
-        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = PRESSURE_SURFACE.lock().unwrap_or_else(|p| p.into_inner());
         let before = render();
         for reason in ["nailed", "headroom", "added_replica", "only_one"] {
             assert!(
@@ -1280,8 +1289,7 @@ mod tests {
     /// 读者分得清 0 是量到的零还是这一格没有数。
     #[test]
     fn the_price_of_both_shapes_reaches_the_scrape_surface() {
-        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = PRESSURE_SURFACE.lock().unwrap_or_else(|p| p.into_inner());
 
         publish_shape_cost(&sandbox_shape_cost(&shared_readings(0.1)));
         let text = render();
