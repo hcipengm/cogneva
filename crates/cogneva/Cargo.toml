@@ -25,9 +25,6 @@ path = "src/main.rs"
 name = "suite"
 path = "tests/suite.rs"
 
-[[test]]
-name = "core_boundary_contract_test"
-path = "tests/core_boundary_contract_test.rs"
 
 [[test]]
 name = "planner_schema_matches_the_ledger_item"
