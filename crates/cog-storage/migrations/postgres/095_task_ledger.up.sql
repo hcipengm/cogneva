@@ -54,12 +54,22 @@ CREATE TABLE IF NOT EXISTS task_defined (
     planner_source       TEXT,
     planner_confidence   DOUBLE PRECISION,
     planner_at           TIMESTAMPTZ,
+    -- 收件台按意图身份问「这一条派生了没有」。`input` 是 JSON 的文本形态；
+    -- 先认形状再转换，一行历史上不是 JSON 的输入不该让加列那一刻失败。
+    -- 127 对已经升级过的库补同一列；两处表述必须逐字相同，由
+    -- `task_ledger_ddl_matches_the_migration` 与启动 schema 三方比对。
+    intent_id            TEXT        GENERATED ALWAYS AS (
+        (CASE WHEN input ~ '^[[:space:]]*[\[{]' THEN input::jsonb END) ->> 'intent_id'
+    ) STORED,
     PRIMARY KEY (task_id, rev)
 );
 
 -- "The definition of this task" is the newest revision, and this is that read.
 CREATE INDEX IF NOT EXISTS idx_task_defined_latest
     ON task_defined(task_id, rev DESC)
+;
+CREATE INDEX IF NOT EXISTS idx_task_defined_intent_id
+    ON task_defined(intent_id) WHERE intent_id IS NOT NULL
 ;
 -- The dependency question is asked in both directions: what blocks this task
 -- is a column, what this task blocks is the same column read backwards.
