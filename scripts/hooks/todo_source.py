@@ -147,7 +147,9 @@ def _fixed_item(line: str, notouch: list[str]) -> tuple[Item, bool] | None:
         # 没有触点的行算不出批次。留空让它「不在批次里」是最坏的形状：它看起来像做完了。
         notouch.append(cells[0])
         return None
-    gap = cells[3].strip()
+    # 触点写在差距格里（行尾那一格），判「差距是不是空」要先把它切掉：
+    # `— ｜ touches: …` 的差距是空的，它不是「还差什么」。
+    gap = re.split(r"[｜|]\s*touches:", cells[3])[0].strip()
     if status.startswith(CLOSED_PREFIXES) and gap in _GAP_EMPTY:
         return None  # 终态真的到了：不进批次。
     three = parse_cells(line)
