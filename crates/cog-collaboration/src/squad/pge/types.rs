@@ -92,6 +92,21 @@ impl PlannerOutput {
     }
 }
 
+/// 判据审的判词：这一条终态是不是「做完的样子」、能不能被证据判、是不是意图要的那件事。
+///
+/// 与完成判分开：完成判答「终态到了没有」，判据审答「这段描述本身立不立得住」。
+/// 两问由两次不同的调用回答，谁都不替对方作证。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CriterionVerdict {
+    /// 这一条待办。
+    pub id: String,
+    /// 立不立得住。
+    pub ok: bool,
+    /// 不成立时，缺的是什么（点名到「不是做完的样子 / 判不了 / 不是意图要的」哪一问）。
+    #[serde(default)]
+    pub reason: String,
+}
+
 /// Whether an in-band cause says this role produced nothing: the transport never
 /// reached the upstream, tools never ran, or the loop spent its budget. One
 /// predicate for every role output so the planner and the generator cannot

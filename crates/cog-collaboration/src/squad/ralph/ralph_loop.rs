@@ -861,6 +861,11 @@ impl RalphLoop {
         // 会让终态每轮被重写，判词追着一个移动的目标——那样永远收敛不了，而且
         // 每重写一次就重买一次 planner 的 token。要改终态，只能发一条
         // `terminal_revised` 带理由，判据被换过这件事读得见。
+        // 判据审要用 planner 这一侧发起，而 `scope` 下面会被换掉，所以先留下引用。
+        let planner_for_review = match scope {
+            PlanScope::Planned(planner) => Some(planner),
+            PlanScope::Declared(_) => None,
+        };
         let planned_once: Option<PlannerOutput> = match scope {
             PlanScope::Planned(planner) => {
                 let plan_task = Task::new(
@@ -879,6 +884,52 @@ impl RalphLoop {
                 )
             }
             PlanScope::Declared(_) => None,
+        };
+        // 判据审：终态写得对不对，由另一次调用答。不成立就退回 planner 改一次；
+        // 改完仍不成立，那是**缺属主那份输入**，带着判词去问，条目开着。
+        let planned_once = match (planner_for_review, planned_once) {
+            (Some(planner), Some(plan)) => {
+                let findings = planner.review_criteria(goal, plan.ledger_items()).await;
+                if findings.iter().any(|f| !f.ok) {
+                    let feedback = findings
+                        .iter()
+                        .filter(|f| !f.ok)
+                        .map(|f| format!("{}: {}", f.id, f.reason))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let revised = planner
+                        .plan_judged_downstream(
+                            &Task::new(
+                                self.iteration_task_id("plan-revised", 1),
+                                TaskType::Custom("ralph_plan_goal".into()),
+                                serde_json::json!({ "goal": goal, "ralph_feedback": &feedback }),
+                            ),
+                            1,
+                            Some(feedback.as_str()),
+                            None,
+                            None,
+                            None,
+                        )
+                        .await;
+                    let second = planner.review_criteria(goal, revised.ledger_items()).await;
+                    if second.iter().any(|f| !f.ok) {
+                        let cause = second
+                            .iter()
+                            .filter(|f| !f.ok)
+                            .map(|f| format!("{}: {}", f.id, f.reason))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        return self.question_verdict(format!(
+                            "the terminal description does not hold up and the planner could \
+                             not revise it: {cause}"
+                        ));
+                    }
+                    Some(revised)
+                } else {
+                    Some(plan)
+                }
+            }
+            (_, planned) => planned,
         };
         let scope = match (&planned_once, scope) {
             (Some(plan), PlanScope::Planned(_)) => PlanScope::Declared(plan),
