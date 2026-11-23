@@ -1583,6 +1583,7 @@ impl CollaborationExecutor {
                 for spec in &plan_run.plan.sub_tasks {
                     tasks.push(Self::task_spec_to_atomic(spec));
                 }
+                Self::attach_items(&mut tasks, &plan_run.plan);
                 return tasks;
             }
             // Try to parse as PgePipelineResult first.
@@ -1592,6 +1593,7 @@ impl CollaborationExecutor {
                 for spec in &pipeline.final_plan.sub_tasks {
                     tasks.push(Self::task_spec_to_atomic(spec));
                 }
+                Self::attach_items(&mut tasks, &pipeline.final_plan);
                 return tasks;
             }
             // Try PgeRoundtableResult.
@@ -1601,9 +1603,37 @@ impl CollaborationExecutor {
                 for spec in &roundtable.final_plan.sub_tasks {
                     tasks.push(Self::task_spec_to_atomic(spec));
                 }
+                Self::attach_items(&mut tasks, &roundtable.final_plan);
             }
         }
         tasks
+    }
+
+    /// 把 planner 给每条待办写下的三格挂到它拆出来的那条原子任务上。
+    ///
+    /// 三格**不是入口交上来的**：意图是模糊的，玩家语义分析之后才知道「做完是什么样、
+    /// 现在什么样、还差什么」。所以它们由 `PlannerOutput.items` 给出，在这里按 id 落到
+    /// 原子任务行的 `input[ITEM_INPUT_KEY]` 上——下游（判据审、判定、结果回带）读的就是
+    /// 那一格，而不是再回头去猜。
+    fn attach_items(tasks: &mut [AtomicTask], plan: &crate::squad::pge::types::PlannerOutput) {
+        use cog_core::contract::ledger_item::ITEM_INPUT_KEY;
+        for item in plan.judged_items() {
+            for task in tasks.iter_mut() {
+                if task.id != item.id {
+                    continue;
+                }
+                if let Ok(value) = serde_json::to_value(&item) {
+                    match task.input.as_object_mut() {
+                        Some(obj) => {
+                            obj.insert(ITEM_INPUT_KEY.to_string(), value);
+                        }
+                        None => {
+                            task.input = serde_json::json!({ ITEM_INPUT_KEY: value });
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// The sub-task types a decomposition produced, as the namespace records
