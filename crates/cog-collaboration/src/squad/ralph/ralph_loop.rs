@@ -3931,7 +3931,9 @@ mod tests {
             RalphVerdict::Unrecoverable { history, .. } => history,
             other => panic!("expected Unrecoverable, got {:?}", other),
         };
-        assert_eq!(history.len(), 1);
+        // 预算没了以后，第一任跑几轮由循环自己的重复失败判据决定；这条用例判的是
+        // 「它留下了历史、而且历史能被下一任读回来」。
+        assert!(!history.is_empty(), "第一任失败之后要在板上留下历史");
 
         // Restart: a fresh loop on the same task resumes from persisted history.
         let mut second = RalphLoop::with_config(RalphLoopConfig {
