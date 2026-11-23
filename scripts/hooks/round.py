@@ -63,6 +63,22 @@ def ledger_repo(spec: str) -> pathlib.Path | None:
     return pathlib.Path(out) if out else None
 
 
+def git_origin_address(repo: pathlib.Path) -> str | None:
+    """台账仓的地址（`remote.origin.url`）。没有配 origin 就是 None。
+
+    载荷里记**地址**而不是本机路径：同一本书在不同机器上有不同的检出路径，地址才是
+    跨机器认得出的那个身份。没有地址是「这台机器上的这个仓不指向任何远端」这条事实，
+    不拿本地路径顶替它——两种情况的读者要做的事不同。
+    """
+    out = subprocess.run(
+        ["git", "-C", str(repo), "config", "--get", "remote.origin.url"],
+        capture_output=True, text=True,
+    )
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
+
+
 def psql_command() -> str:
     """读/写事件流的那条命令：环境变量优先，其次是仓库自带的那个入口。
 
@@ -315,7 +331,8 @@ def open_round(spec: str | None, allow_open: bool = False, code_rev_override: st
         payload = {
             "event_id": event_id,
             "ledger_rev": rev,
-            "ledger_path": str(todo_source.spec_path(source)),
+            "ledger_address": git_origin_address(repo),
+            "ledger_file": str(todo_source.spec_path(source).resolve().relative_to(repo.resolve())),
             "code_rev": code_rev,
             "batch": [i.id for i in batch],
             "first_rev": first_rev,

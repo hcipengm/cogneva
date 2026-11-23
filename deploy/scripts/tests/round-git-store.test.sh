@@ -25,6 +25,8 @@ cp "$todo" "$tree/scripts/hooks/todo_source.py"
 git -C "$tree" init -q
 git -C "$tree" config user.email t@t
 git -C "$tree" config user.name t
+# 台账仓的**地址**：载荷里记它，不记这台机器上的检出路径（同一本书各机器路径不同）。
+git -C "$tree" remote add origin git@ledger.invalid:owner/book.git
 printf '| S1 | 内容 | 未落 | touches: crates/a/src/x.rs\n' >"$tree/ledger.md"
 git -C "$tree" add -A >/dev/null
 git -C "$tree" commit -qm base
@@ -50,6 +52,14 @@ out=$(run open); rc=$?
 if [ "$rc" -eq 0 ] && git -C "$tree" rev-parse --verify --quiet refs/cogneva/round >/dev/null \
    && git -C "$tree" cat-file -p refs/cogneva/round | grep -q '"batch": \["S1"\]'; then
     ok "open 把这一批写进了 refs/cogneva/round"
+fi
+
+# 1b. 载荷记的是台账仓的**地址**，不是本机的检出路径：换一台机器读同一本载荷，
+#     路径一定不同，而地址不变。检出路径写进 ref 等于把一台机器的布局当成这本书的身份。
+payload=$(git -C "$tree" cat-file -p refs/cogneva/round)
+if printf '%s' "$payload" | grep -q '"ledger_address": "git@ledger.invalid:owner/book.git"' \
+   && ! printf '%s' "$payload" | grep -qF "$tree"; then
+    ok "载荷带地址、不带本机检出路径"
 else
     bad "open 没把清单写进 ref（rc=$rc）：$out"
 fi
