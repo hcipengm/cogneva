@@ -3610,12 +3610,15 @@ impl DagExecutor {
         // 行上那一格记的是「这一刻还允不允许再跑一次」，判决比对的是
         // `retry_count < max_retries`：允许时写 `已经跑过的次数 + 1`，于是「变了就
         // 再跑一次、不设次数上限」在行上仍然是一个数，而不是让累计次数自己把路堵死。
-        task.max_retries = if max_retries == 0 {
+        let budget = if max_retries == 0 {
             0
         } else {
             retry_count.saturating_add(1)
         };
-        if retry_count < max_retries {
+        task.max_retries = budget;
+        // 比的是**写下那一格的那个数**：否则行里说还剩一次、判决按另一个数收账。
+        let _ = max_retries;
+        if retry_count < budget {
             task.retry_count = retry_count + 1;
             task.status = TaskStatus::Pending;
             task.error = Some(error.clone());
