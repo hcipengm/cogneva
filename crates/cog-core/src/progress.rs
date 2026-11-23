@@ -587,9 +587,12 @@ pub fn file_lock_holders(pid: u32) -> Vec<u32> {
             else {
                 continue;
             };
+            // `/proc/locks` 里的 `major:minor` 是**十六进制**（`fc:00` 就是 252:0），
+            // 而 inode 是十进制——两段不同的底数写在同一个字段里。按十进制读主次设备号
+            // 会在 `fc` 上解析失败，于是「一个持锁者都没有」，与「没人持锁」同形。
             let (Ok(major), Ok(minor), Ok(inode)) = (
-                major.parse::<u64>(),
-                minor.parse::<u64>(),
+                u64::from_str_radix(major, 16),
+                u64::from_str_radix(minor, 16),
                 inode.parse::<u64>(),
             ) else {
                 continue;
