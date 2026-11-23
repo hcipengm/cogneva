@@ -325,6 +325,9 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             // it the tree has been measured to hold, and how much intake is
             // still queued had no exit other than SQL against the deployment.
             &ctx.consume_service::<dyn cog_core::ChangeLedgerStore>(),
+            // 意图进门那一条事件的写者：与变更账同一处取，缺席时写意图那一步显式报
+            // 「没有收件台」。
+            &ctx.consume_service::<dyn cog_core::IntentEvents>(),
             &key_value,
             &chat_turns,
             conversation,

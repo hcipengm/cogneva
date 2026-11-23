@@ -374,6 +374,9 @@ pub struct GatewayState {
     /// that there is no account rather than answer an empty one, because an
     /// empty answer is the claim that nothing is owed.
     pub change_ledger: Option<Arc<dyn cog_core::ChangeLedgerStore>>,
+    /// 意图进门那一条事件的写者。对话收尾用它把这一轮落成一条意图行；缺席时写意图
+    /// 的那一步显式报「没有收件台」，不把「没地方交」读成「没有意图」。
+    pub intent_events: Option<Arc<dyn cog_core::IntentEvents>>,
     /// The shared key-value face this deployment's processes publish to.
     ///
     /// The gateway that holds the upstream credentials writes the LLM pool's

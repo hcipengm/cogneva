@@ -1137,6 +1137,19 @@ impl cog_core::SystemPlugin for StoragePlugin {
             warn!("No PostgreSQL pool; the change ledger is unavailable in this deployment");
         }
 
+        // ── IntentEvents ──
+        // 意图进门那一条事件的写者。没有池就不发布：网关那一侧取不到它时写意图那一步
+        // 必须显式「没有收件台」，而不是静默把意图丢掉。
+        if let Some(pool) = self.pg_pool.clone() {
+            let store: Arc<dyn cog_core::IntentEvents> =
+                Arc::new(crate::postgres::intent_events::IntentEventStore::new(
+                    pool,
+                    "cogneva-gateway",
+                ));
+            ctx.publish_service(store);
+            info!("StoragePlugin intent events published");
+        }
+
         // ── RoundEvents ──
         // 定批的落点：这一轮做哪几条，钉进事件流。与账本同池、同一条链：账本说
         // 「欠着什么」，这一族说「这一轮做的是哪几条」。没有池就不发布，循环按
