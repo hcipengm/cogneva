@@ -25,6 +25,13 @@ pub async fn run_from_stdin() -> Result<(), Box<dyn std::error::Error>> {
     let plan = crate::action_planner::LedgerBatchPlanner::new()
         .plan_batch(&items)
         .await?;
+    // 计划要自己站得住（至少一条不变量、两种来源形状的验收、或写明为什么只有一种），
+    // 才把它打出来。站不住时**退非零并点名哪一处分不合规**——一个只印出计划的退出码
+    // 会让调用方把「这份计划不成立」读成「这一批可以开」。
+    if let Err(defect) = plan.validate() {
+        eprintln!("batch-plan: 这一批不成立：{defect:?}");
+        return Err("plan does not hold".into());
+    }
     println!("{}", serde_json::to_string_pretty(&plan)?);
     Ok(())
 }
