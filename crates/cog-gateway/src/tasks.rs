@@ -118,6 +118,13 @@ pub struct CreateTaskRequest {
     /// meaning.
     #[serde(default)]
     pub intent_kind: IntentKind,
+    /// 提交方带来的待办三格（终态／现在／差距），可选。
+    ///
+    /// 意图从十六处入口进来，行上带不带三格决定了后面能不能判「这条到了没有」：
+    /// 只带一句 goal 时，协作层只能判「这次跑成了没有」。带了就按顺序挂到这一次提交
+    /// 的任务行上（`Task::carrying`），多出来的**点名报出**，不静默丢。
+    #[serde(default)]
+    pub items: Option<Vec<cog_core::contract::ledger_item::LedgerItem>>,
 }
 
 /// The two input forms. A `Goal` is decomposed: the platform decides which
@@ -898,6 +905,17 @@ fn submitted_tasks(
     goal_id: &str,
     submitted_by: Option<&str>,
 ) -> Vec<Task> {
+    // 提交方带来的三格：按顺序挂到这一次提交的任务行上。多了就报出来——一条点了名
+    // 却没有行可挂的待办，静默丢掉之后与「这一条没提交」在读的人眼里是同一件事。
+    let mut carried = req.items.clone().unwrap_or_default();
+    if carried.len() > req.tasks.as_ref().map(|t| t.len()).unwrap_or(carried.len()) {
+        let extra: Vec<&str> = carried
+            .iter()
+            .skip(req.tasks.as_ref().map(|t| t.len()).unwrap_or(carried.len()))
+            .map(|i| i.id.as_str())
+            .collect();
+        tracing::warn!(goal_id, ignored = ?extra, "提交里有点了名却没有任务行可挂的待办");
+    }
     let mut rows: Vec<Task> = req
         .tasks
         .as_ref()
@@ -983,10 +1001,31 @@ fn submitted_tasks(
                 .collect()
         })
         .unwrap_or_default();
+    // 带了 id 却没带行的（`tasks` 为空但 `items` 有），一条待办一行：提交方已经说清
+    // 了这件事做完是什么样，平台没有理由再把它折成一句 goal。
     if rows.is_empty() {
-        let mut goal_row = Task::goal_row(goal_id, &req.goal);
-        goal_row.workspace_id = Some(req.workspace_id.clone());
-        rows.push(goal_row);
+        if !carried.is_empty() {
+            for item in carried.iter() {
+                let mut task = Task::new(
+                    item.id.clone(),
+                    TaskType::DagNode,
+                    serde_json::json!({ "goal": req.goal }),
+                );
+                task.workspace_id = Some(req.workspace_id.clone());
+                task.goal_id = Some(goal_id.to_string());
+                task.submitted_by = submitted_by.map(str::to_string);
+                rows.push(task);
+            }
+        } else {
+            let mut goal_row = Task::goal_row(goal_id, &req.goal);
+            goal_row.workspace_id = Some(req.workspace_id.clone());
+            rows.push(goal_row);
+        }
+    }
+    // 按顺序把三格挂上去：第 i 条待办挂第 i 行。
+    for (task, item) in rows.iter_mut().zip(carried.iter()) {
+        *task = std::mem::replace(task, Task::new("", TaskType::DagNode, serde_json::json!({})))
+            .carrying(item);
     }
     rows
 }
