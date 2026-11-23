@@ -887,19 +887,24 @@ impl RalphLoop {
             }
             PlanScope::Declared(_) => None,
         };
-        // 判据审：终态写得对不对，由另一次调用答。不成立就退回 planner 改一次；
-        // 改完仍不成立，那是**缺属主那份输入**，带着判词去问，条目开着。
+        // **审终态在定批之前**（属主 2026-11-23）：终态写歪了，差距就是按歪的算出来的，
+        // 批次也跟着错。所以先把每条终态交给另一次调用判「立不立得住」，再谈批。
+        //
+        // 审不过的处理是**把那条挡在批外**，不是整批退回：一条描述写坏不该让其余
+        // 各条一起停下。被挡的那几条带着判词留在这里、条目开着——它们的差距从此写着
+        // 「终态不成立：哪一问」。只有一条都审不过时，才带着判词去问属主。
         let planned_once = match (planner_for_review, planned_once) {
             (Some(planner), Some(plan)) => {
-                let findings = evaluator.review_criteria(goal, plan.ledger_items()).await;
+                let mut findings = evaluator.review_criteria(goal, plan.ledger_items()).await;
                 if findings.iter().any(|f| !f.ok) {
+                    // 退回 planner 改一次：把不成立的那几条作为反馈问一次。
                     let feedback = findings
                         .iter()
                         .filter(|f| !f.ok)
                         .map(|f| format!("{}: {}", f.id, f.reason))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    let revised = planner
+                    let mut revised = planner
                         .plan_judged_downstream(
                             &Task::new(
                                 self.iteration_task_id("plan-revised", 1),
@@ -913,20 +918,35 @@ impl RalphLoop {
                             None,
                         )
                         .await;
-                    let second = evaluator
+                    findings = evaluator
                         .review_criteria(goal, revised.ledger_items())
                         .await;
-                    if second.iter().any(|f| !f.ok) {
-                        let cause = second
+                    if findings.iter().any(|f| !f.ok) {
+                        let refused: Vec<String> = findings
                             .iter()
                             .filter(|f| !f.ok)
                             .map(|f| format!("{}: {}", f.id, f.reason))
-                            .collect::<Vec<_>>()
-                            .join("; ");
-                        return self.question_verdict(format!(
-                            "the terminal description does not hold up and the planner could \
-                             not revise it: {cause}"
-                        ));
+                            .collect();
+                        if refused.len() >= findings.len() {
+                            // 一条都立不住：缺的是属主那份输入，带判词去问，条目开着。
+                            return self.question_verdict(format!(
+                                "no terminal description holds up after one revision: {}",
+                                refused.join("; ")
+                            ));
+                        }
+                        // 挡在批外：从计划里摘掉，并留一条读数说明这一批为什么少了几条。
+                        let kept: std::collections::HashSet<String> = findings
+                            .iter()
+                            .filter(|f| f.ok)
+                            .map(|f| f.id.clone())
+                            .collect();
+                        revised.items.retain(|i| kept.contains(i.id.as_str()));
+                        tracing::warn!(
+                            refused = %refused.join("; "),
+                            kept = kept.len(),
+                            "these terminals did not hold up and stay out of this batch; \
+                             the rest go on"
+                        );
                     }
                     Some(revised)
                 } else {
@@ -2635,6 +2655,10 @@ mod tests {
         assert!(
             before_loop.contains("review_criteria"),
             "判据审要在循环之前跑：终态写得对不对先问一次，再开始生成"
+        );
+        assert!(
+            before_loop.contains("revised.items.retain"),
+            "审不过的那几条要从批里摘掉，而不是整批退回：一条描述写坏不该让其余各条一起停"
         );
         assert!(
             before_loop.contains("PlanScope::Declared(plan)"),
