@@ -735,7 +735,7 @@ async fn one_person_day_splits_by_role_and_adds_back_up_to_the_person() {
     .await;
     event_row(
         &pool,
-        day + chrono::Duration::minutes(150),
+        day + chrono::Duration::minutes(110),
         None,
         Some(&planning),
         5,
