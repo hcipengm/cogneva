@@ -6,24 +6,9 @@
 //!
 //! 默认忽略，需要 `COGNEVA_TEST_DATABASE_URL`。
 
-use sqlx::PgPool;
+mod common;
 
 use cog_test_support::{database_url, drop_schema, own_schema, schema_pool};
-
-async fn apply_event_stream_migration(pool: &PgPool) {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/postgres");
-    for file in [
-        "117_event_stream.up.sql",
-        "119_event_payload_is_json.up.sql",
-    ] {
-        let sql =
-            std::fs::read_to_string(dir.join(file)).unwrap_or_else(|e| panic!("read {file}: {e}"));
-        sqlx::raw_sql(&sql)
-            .execute(pool)
-            .await
-            .unwrap_or_else(|e| panic!("apply {file}: {e}"));
-    }
-}
 
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
@@ -31,7 +16,11 @@ async fn a_task_transition_leaves_one_event() {
     let url = database_url();
     let schema = own_schema(&url, "task_transition_event").await;
     let pool = schema_pool(&url, &schema).await;
-    apply_event_stream_migration(&pool).await;
+    common::apply_migration_files(
+        &pool,
+        &["117_event_stream.up.sql", "119_event_payload_is_json.up.sql"],
+    )
+    .await;
 
     // 表由 state backend 的 DDL 建；这里只建这一族需要的那张，够判「两处一致」。
     sqlx::raw_sql(
