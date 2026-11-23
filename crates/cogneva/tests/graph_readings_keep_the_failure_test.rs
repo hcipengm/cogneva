@@ -155,6 +155,18 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "死信队列画成一只干净的队列",
     ),
     (
+        PROCESSES,
+        "pub async fn process_overview_handler",
+        "registry_from_reading(",
+        "agent 一栏答成「一个 agent 都没注册」",
+    ),
+    (
+        PROCESSES,
+        "pub async fn process_overview_handler",
+        "health_report_from_reading(",
+        "健康四格一起落到 0，读成「四个都没病」",
+    ),
+    (
         LIB,
         "async fn supervisor_queue_stats_handler",
         "get_ready_tasks_checked",
