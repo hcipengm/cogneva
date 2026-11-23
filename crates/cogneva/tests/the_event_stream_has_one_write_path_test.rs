@@ -34,6 +34,10 @@ use crate::common::rust_production::production_texts;
 /// 被哪个开关挡着——开关默认关着的写路径，与没有这条路径，在树里长得不一样。
 const WRITERS: &[(&str, &str)] = &[
     (
+        "crates/cog-storage/src/postgres/intent_events.rs",
+        "一条意图进门（`intent_received`：来源、外部身份、原文、因果父行）",
+    ),
+    (
         "crates/cog-storage/src/postgres/llm_call_events.rs",
         "一次上游调用（`llm_call`）",
     ),
