@@ -2556,6 +2556,54 @@ mod tests {
         );
     }
 
+    /// 判据审：终态不是「做完的样子」时，判词必须说不成立并点名哪一问。
+    #[tokio::test]
+    async fn a_terminal_that_is_not_a_finished_state_is_refused() {
+        use cog_core::contract::ledger_item::{LedgerItem, LedgerState};
+        let planner = PlannerActor::new(Arc::new(MockAgent {
+            response: serde_json::json!({
+                "verdicts": [{"id": "N1", "ok": false, "reason": "describes an activity, not a finished state"}]
+            }),
+        }));
+        let items = vec![LedgerItem {
+            id: "N1".into(),
+            terminal: "继续改进这个模块".into(),
+            now: String::new(),
+            gap: String::new(),
+            state: LedgerState::Open,
+        }];
+        let out = planner.review_criteria("把它做对", &items).await;
+        assert_eq!(out.len(), 1);
+        assert!(
+            !out[0].ok,
+            "一段「继续改进」不是做完的样子，判词必须说不成立"
+        );
+        assert!(
+            out[0].reason.contains("activity"),
+            "判词要点名是哪一问不成立，实到：{}",
+            out[0].reason
+        );
+    }
+
+    /// 判据审答不出某一条时，那一条按**不成立**读：判不了不是通过。
+    #[tokio::test]
+    async fn a_review_that_answers_nothing_is_not_a_pass() {
+        use cog_core::contract::ledger_item::{LedgerItem, LedgerState};
+        let planner = PlannerActor::new(Arc::new(MockAgent {
+            response: serde_json::json!({ "verdicts": [] }),
+        }));
+        let items = vec![LedgerItem {
+            id: "N2".into(),
+            terminal: "三本账都只从事件流重建，删掉表能重建".into(),
+            now: String::new(),
+            gap: String::new(),
+            state: LedgerState::Open,
+        }];
+        let out = planner.review_criteria("统一正本", &items).await;
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].ok, "没答的条目按不成立读，而不是默认通过");
+    }
+
     /// 计划在循环**外面**做一次，循环里只剩生成与判定。
     ///
     /// 判的是结构而不是行为：`run_pipeline_scoped` 里 planner 的那次调用必须
