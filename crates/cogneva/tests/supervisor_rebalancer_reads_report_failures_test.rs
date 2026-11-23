@@ -18,6 +18,7 @@
 //! `Ok`，后一半在旧写法下会把失联的那个算进可用名单。
 
 use crate::common;
+use crate::common::supervisor::make_agent;
 
 use chrono::Utc;
 use std::sync::Arc;
@@ -33,19 +34,6 @@ use cog_test_support::{MemoryStateBackend, TaskGraphStub};
 
 const UNANSWERED: &str = "the state store did not answer";
 
-fn make_agent(id: &str) -> AgentInfo {
-    let now = Utc::now();
-    AgentInfo {
-        agent_id: id.into(),
-        role: None,
-        crew_id: None,
-        squad_id: None,
-        task_ids: Vec::new(),
-        last_heartbeat: now,
-        state_since: now,
-        registered_at: now,
-    }
-}
 
 fn rebalancer_with(
     reg: Arc<AgentRegistry>,

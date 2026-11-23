@@ -18,3 +18,4 @@ pub mod rust_text;
 pub mod service_topology;
 pub mod temp_tree;
 pub mod yaml;
+pub mod supervisor;

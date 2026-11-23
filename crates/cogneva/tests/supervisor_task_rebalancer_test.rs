@@ -1,4 +1,5 @@
 use crate::common;
+use crate::common::supervisor::make_agent;
 
 use common::orchestrator::control;
 
@@ -11,19 +12,6 @@ use cog_supervisor::task_rebalancer::{TaskRebalancer, TaskRebalancerConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-fn make_agent(id: &str) -> AgentInfo {
-    let now = Utc::now();
-    AgentInfo {
-        agent_id: id.into(),
-        role: None,
-        crew_id: None,
-        squad_id: None,
-        task_ids: Vec::new(),
-        last_heartbeat: now,
-        state_since: now,
-        registered_at: now,
-    }
-}
 
 #[tokio::test]
 async fn empty_orchestrator_yields_empty_plan() {
