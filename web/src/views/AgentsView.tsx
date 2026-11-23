@@ -11,7 +11,7 @@ import {
 import { useLiveAgentStore } from '@/store/liveAgentStore';
 import { EmployeeAvatar } from '@/components/EmployeeAvatar';
 import { Button, Empty, Loading, Moment, ReadError, Reading, Readings, Table } from '@/ui/primitives';
-import { BarList, Strip, type Tone } from '@/ui/plots';
+import { Strip, type Tone } from '@/ui/plots';
 
 import { Note } from '@/ui/Note';
 /**
@@ -107,7 +107,6 @@ function LiveState({ live }: { live: LiveAgentRow | null }) {
 type RosterGroup = {
   personId: string | null;
   displayName: string;
-  roles: string[];
   agentIds: string[];
   caps: number;
   live: boolean;
@@ -146,7 +145,6 @@ export function EmployeeRoster({ onPick }: { onPick?: (agentId: string) => void 
         return {
           personId: p.person_id,
           displayName: p.display_name,
-          roles: p.roles,
           agentIds: p.agent_ids,
           caps: p.caps,
           live: p.live,
@@ -161,12 +159,6 @@ export function EmployeeRoster({ onPick }: { onPick?: (agentId: string) => void 
   // 合成一个「在岗」数，读者分不出「没人干活」和「人都下线了」。
   const liveCount = groups.filter((group) => group.live).length;
   const restCount = groups.length - liveCount;
-  const roles = new Map<string, number>();
-  for (const group of groups) {
-    for (const role of group.roles) {
-      roles.set(role, (roles.get(role) ?? 0) + 1);
-    }
-  }
   const fromFrame = rows.filter(({ row, live }) =>
     seenAfterSnapshot(row.last_heartbeat, live)
   ).length + unseen.length;
@@ -191,7 +183,7 @@ export function EmployeeRoster({ onPick }: { onPick?: (agentId: string) => void 
     <div className="flex h-full min-h-0 flex-col overflow-auto">
       <div className="flex flex-wrap items-baseline gap-2 border-b border-[var(--line)] px-4 py-1.5 text-[11px] text-[var(--muted)]">
         <span>
-          {`${liveCount} 人在岗${restCount > 0 ? ` · ${restCount} 人休息中` : ''} · ${roles.size} 种角色 · ${fromFrame} 条有比这次轮询更新的帧 · 快照按 15 秒重读`}
+          {`${liveCount} 人在岗${restCount > 0 ? ` · ${restCount} 人休息中` : ''} · ${fromFrame} 条有比这次轮询更新的帧 · 快照按 15 秒重读`}
         </span>
         <span className="ml-auto">
           <Button onClick={refresh}>重读</Button>
@@ -217,7 +209,6 @@ export function EmployeeRoster({ onPick }: { onPick?: (agentId: string) => void 
               value={agents.length}
               note="可寻址的地址数：一个人可以同时戴几顶"
             />
-            <Reading label="角色" value={roles.size} />
             <Reading
               label="比快照新"
               value={fromFrame}
@@ -234,17 +225,10 @@ export function EmployeeRoster({ onPick }: { onPick?: (agentId: string) => void 
             />
           </div>
           </Readings>
-          {/* 名单这一屏要回答的第二问是「这一拨人是怎么构成的」：哪个角色人多、有几个人
-              在跑。角色在表里是一列名字，读不出谁多谁少；状态分散在几十行里，读不出
-              整体的分布——所以这两问画出来，确切的名字仍去表里查。 */}
+          {/* 名单这一屏要回答的第二问是「这一拨人怎么构成」：有几个人在跑。角色不在
+              这里分：角色是这一段活里的职务分工，记在任职与账行上，不是人的属性；
+              按它把人分堆只会把「同一个人今天当 planner、明天当 generator」读成两种人。 */}
           <div className="border-b border-[var(--line)]">
-            <BarList
-              label="每个角色几人"
-              note="按人算：一个人同时戴几顶不同角色的帽子，就在几个角色里各算一次"
-              rows={[...roles.entries()]
-                .sort((a, b) => b[1] - a[1])
-                .map(([role, count]) => ({ label: role, value: count }))}
-            />
             <Strip
               label="这一拨人现在处在哪个状态"
               note="状态由总线上的帧折出来；「没有状态帧」是这一轮没听到过它，不是它空闲"
@@ -300,11 +284,6 @@ export function EmployeeRoster({ onPick }: { onPick?: (agentId: string) => void 
                 g.live ? <LiveState live={g.leadLive} /> : (
                   <span className="text-[11px] text-[var(--muted)]">休息中</span>
                 )
-              ) },
-              { key: 'role', title: '角色', width: '160px', render: (g) => (
-                <span className="text-[11px] text-[var(--paper-dim)]">
-                  {g.roles.length ? g.roles.join(' · ') : '—'}
-                </span>
               ) },
               { key: 'caps', title: '帽子', width: '64px', render: (g) => (
                 <span className="mono text-[11px] text-[var(--muted)]">{g.caps}</span>

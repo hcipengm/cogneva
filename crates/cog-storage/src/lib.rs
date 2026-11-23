@@ -20,7 +20,6 @@ pub mod redis;
 
 #[cfg(feature = "qdrant")]
 pub use qdrant::QdrantVectorBackend;
-pub mod agent_id;
 pub mod audit_stream;
 pub mod backends;
 pub(crate) mod consumer_lag;
@@ -101,7 +100,6 @@ pub use redis::{
     MemoryAgentRegistry, RedisAgentRegistry, RedisBackend, RedisKeyValueStore, RedisTraceStore,
 };
 
-pub use agent_id::generate_agent_id;
 pub use etcd::registry::EtcdAgentRegistry;
 
 #[cfg(feature = "redis")]

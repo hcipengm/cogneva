@@ -27,9 +27,11 @@ pub struct RegisterRequest {
     pub workspace_id: String,
     #[serde(default)]
     pub resources: ResourceInfo,
-    /// Optional client-supplied uuid for deterministic agent_id.  When `None`
-    /// we generate a fresh `uuid_v4` so multiple instances of the same pod
-    /// don't collide on `blake3(hostname|ip|role)`.
+    /// 这个人的稳定编号：跨重装、跨滚动不变的那一格。
+    ///
+    /// 必填。缺了它服务端拒绝登记，不再随机发一个「人」——随机发的那个 id
+    /// 下一次滚动就找不回来，名下的活与账全成了无主。宿主名、Pod IP、role
+    /// 只是这一次注册行上的事实，不进 id。
     #[serde(default)]
     pub uuid: Option<String>,
 }
@@ -52,8 +54,19 @@ pub async fn register_handler(
             .into_response();
     };
 
-    let uuid = req.uuid.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let agent_id = cog_core::generate_agent_id(&req.hostname, &req.pod_ip, &req.role, &uuid);
+    // id 只由稳定身份派生；role／hostname／pod_ip 留在注册行上，是这一次注册
+    // 的事实，不是这个人是谁。原来这里没有 uuid 就现发一个随机的，于是同一个
+    // 进程每重装一次都在名册上多一个「新人」。
+    let Some(identity) = req.uuid.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "registration must name a stable identity (`uuid`): a person keeps one id across restarts, and an id invented here would be lost on the next one",
+            })),
+        )
+            .into_response();
+    };
+    let agent_id = cog_core::agent_id_for_identity(identity);
     let now = chrono::Utc::now();
     let registration = AgentRegistration {
         agent_id: agent_id.clone(),
@@ -2023,7 +2036,9 @@ fn roster_with_people(
         let mut view = serde_json::json!({
             "agent_id": agent_id.clone(),
             "display_name": cog_core::unregistered_label(&agent_id),
-            "role": "chat",
+            // 下线的对话员工也是个人：角色格写「一个员工」，不写「这一轮在说」。
+            // 后者是一种状态，不是人的身份，而名册这一格只答「是谁」。
+            "role": EMPLOYEE_ROLE,
             "workspace_id": "default",
             "hostname": String::new(),
             "pod_ip": String::new(),

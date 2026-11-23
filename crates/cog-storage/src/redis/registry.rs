@@ -637,7 +637,7 @@ mod tests {
     #[tokio::test]
     async fn memory_registry_register_get_list_heartbeat() {
         let reg: Arc<dyn AgentRegistry> = Arc::new(MemoryAgentRegistry::new());
-        let agent_id = crate::generate_agent_id("host-1", "10.0.0.1", "planner", "uuid-1");
+        let agent_id = cog_core::agent_id_for_identity("uuid-1");
         let r = AgentRegistration::new(
             agent_id.clone(),
             "host-1",
@@ -673,7 +673,7 @@ mod tests {
     #[tokio::test]
     async fn memory_registry_ttl_expiry_filters_stale_entries() {
         let reg: Arc<dyn AgentRegistry> = Arc::new(MemoryAgentRegistry::new().with_ttl_seconds(0));
-        let agent_id = crate::generate_agent_id("host-1", "10.0.0.1", "planner", "uuid-1");
+        let agent_id = cog_core::agent_id_for_identity("uuid-1");
         let r = AgentRegistration::new(
             agent_id,
             "host-1",

@@ -1507,15 +1507,17 @@ impl EmployeeLease {
         roster: Arc<dyn cog_core::AgentRegistry>,
         employee: &cog_agent::identity::AgentName,
     ) -> Self {
-        // 第四个参数是用途标签，不是身份：写 `employee.id` 会让名册上这一列读音
-        // 成 `kai-a9ab11fc`——一串机器码占着「这个人在做什么」的位置，而下线之后
-        // 同一个人又被别处标成 `chat`，两次读数对不上。对话员工做的就是说，就叫
-        // `chat`。
+        // 第四个参数是名册上的角色格。对话员工是个人，登记的就该是人这个角色：
+        // 曾经写 `chat`（「这一轮在说」当作角色），于是名册上同一个人上线一次是
+        // `chat`、别处读到的又是别的词，两次读数对不上，而且「名册上的角色」这
+        // 一格从此有两种量——人的身份与这一轮在干什么。现在角色只有一个来源：
+        // 这一段活里的职务分工写在任职与账行上（`task_attempt.role`），人自己的
+        // 名册行只答「是谁」，`EMPLOYEE_ROLE` 就是「一个员工」。
         let registration = cog_core::AgentRegistration::new(
             employee.id.clone(),
             cog_agent::identity::agent_instance(),
             "127.0.0.1",
-            "chat",
+            cog_gateway::agents::EMPLOYEE_ROLE,
             "default",
             cog_core::ResourceInfo::default(),
         );
@@ -4995,6 +4997,82 @@ mod tests {
             beats,
             "心跳还在替一个已经不在的人续约"
         );
+    }
+
+    /// 对话员工在名册上登记成「一个人」，不是「这一轮在说」。
+    ///
+    /// 角色格曾经写 `chat`——那是「这一轮正在说话」这个状态，被读成名册上的角色。
+    /// 于是同一个工号上线一次是 `chat`、别处读到的是另一个词，两次读数对不上；而且
+    /// 名册这一格从此同时装两种量：人的身份与这一轮在干什么。定稿模型里角色是这一段
+    /// 活里的职务分工，写在任职与账行（`task_attempt.role`）上；人自己的名册行只答
+    /// 「是谁」。所以对话员工登记成 `EMPLOYEE_ROLE`，而且名册角色的闭集里不再有
+    /// `chat` 与 `probe`——前者是状态，后者只在测试夹具里出现过。
+    #[tokio::test]
+    async fn a_conversation_registers_as_a_person_not_as_a_purpose_label() {
+        #[derive(Default)]
+        struct RecordingRoster {
+            roles: std::sync::Mutex<Vec<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl cog_core::AgentRegistry for RecordingRoster {
+            async fn register(&self, r: &cog_core::AgentRegistration) -> cog_core::SFResult<()> {
+                self.roles
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(r.role.clone());
+                Ok(())
+            }
+            async fn heartbeat(&self, _agent_id: &str) -> cog_core::SFResult<()> {
+                Ok(())
+            }
+            async fn deregister(&self, _agent_id: &str) -> cog_core::SFResult<()> {
+                Ok(())
+            }
+            async fn get(
+                &self,
+                _agent_id: &str,
+            ) -> cog_core::SFResult<Option<cog_core::AgentRegistration>> {
+                Ok(None)
+            }
+            async fn list(&self) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
+                Ok(Vec::new())
+            }
+            async fn list_by_role(
+                &self,
+                _role: &str,
+            ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let roster = Arc::new(RecordingRoster::default());
+        let employee = employee_named(Some("inst-9c21"), "role-turn");
+        let registry: Arc<dyn cog_core::AgentRegistry> = roster.clone();
+        let lease = EmployeeLease::take(registry, &employee).await;
+        drop(lease);
+
+        let roles = roster
+            .roles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(
+            roles,
+            vec![cog_gateway::agents::EMPLOYEE_ROLE.to_string()],
+            "对话员工登记的角色应是人这个角色"
+        );
+        for role in &roles {
+            assert!(
+                role == cog_gateway::agents::EMPLOYEE_ROLE
+                    || cog_core::roles::ALL.contains(&role.as_str()),
+                "名册角色是闭集：人的身份词或小队／带外单元的角色名，出现「{role}」就是又一种角色"
+            );
+            assert!(
+                role != "chat" && role != "probe",
+                "「{role}」不是角色：前者是这一轮在说的状态，后者只在测试夹具里出现"
+            );
+        }
     }
 
     /// 账缺席时两只工具都如实说「读不到」，不假装提案成功或拍板成功。

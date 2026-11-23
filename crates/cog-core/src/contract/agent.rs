@@ -656,16 +656,22 @@ pub trait AgentManager: Send + Sync {
     }
 }
 
-/// Generate a deterministic agent_id from the four input dimensions.
-pub fn generate_agent_id(hostname: &str, pod_ip: &str, role: &str, uuid: &str) -> String {
+/// 一个员工的 id：只由「这个人是谁」算出来。
+///
+/// 身份的输入只有一格：调用方自报的稳定编号（uuid），或安装期指纹——两者都是
+/// 跨重装、跨滚动不变的那一格。姓名、主机名、Pod IP、此刻担的职务都不进来：
+/// 它们会变，而 id 是别的账页上记着的那个人的主键。把职务掺进来的旧写法
+/// （`hostname|pod_ip|role|uuid`）让同一个人换个岗位就变成一个新员工——名下
+/// 的活、账、提交记录全留在旧 id 上，读起来是「老人离岗、新人到岗」。
+///
+/// 这里也是全树唯一一份派生：原来 `cog-storage` 另有一份同函数拷贝，改一处
+/// 另一处不跟着动，两个"同一个人"就分家了。门：
+/// `crates/cogneva/tests/a_person_keeps_one_id_whatever_their_post_test.rs`。
+pub fn agent_id_for_identity(identity: &str) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(hostname.as_bytes());
-    hasher.update(b"|");
-    hasher.update(pod_ip.as_bytes());
-    hasher.update(b"|");
-    hasher.update(role.as_bytes());
-    hasher.update(b"|");
-    hasher.update(uuid.as_bytes());
+    // 域分隔：同一份 blake3 还被别的键用着，前缀把两个命名空间分开。
+    hasher.update(b"cogneva/agent-id/v1\n");
+    hasher.update(identity.as_bytes());
     let hash = hasher.finalize();
     hash.to_hex().to_string()
 }
