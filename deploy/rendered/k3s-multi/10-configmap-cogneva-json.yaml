@@ -3974,7 +3974,7 @@ data:
       "pge": {
         "_comment": "PGE actor 输出契约。schemas 按 actor 名（planner/generator/evaluator/moderator/merger）配置 JSON Schema；配置后 schema 会注入 prompt 上下文并对 LLM 原始输出做校验，校验失败仅告警并回退宽松解析，不会中断流水线。默认为空 = 使用内置契约。",
         "_comment_local_repair_max": "局部修复预算：Evaluator 判失败后保持当前 Plan 不变、把 feedback 回传给 Generator 再生成的次数，耗尽才做全局重置（重跑 Planner）。0 = 关闭这条路径，于是每次失败都从新 Plan 重来。写在这里是因为 schemas 一旦配置就很难注意到这条键缺了，而缺了的读法是 0。",
-        "schemas": {},
+        "schemas": {"planner": {"type": "object", "required": ["summary"], "properties": {"summary": {"type": "string"}, "sub_tasks": {"type": "array"}, "items": {"type": "array", "description": "每一条待办三格。terminal＝这件事做完之后世界是什么样子：自然语言、精确、不举例，不是读数、不是判据清单、不是样板。now＝此刻树上的样子，读这一轮的工作树之后写成话。gap＝终态减现在，只写差的那一件。", "items": {"type": "object", "required": ["id", "terminal", "now", "gap", "state"], "properties": {"id": {"type": "string"}, "terminal": {"type": "string"}, "now": {"type": "string"}, "gap": {"type": "string"}, "state": {"type": "string", "enum": ["未落", "已落"]}}}}}}},
         "_comment_local_repair_max_value": "两条是默认值：Evaluator 判失败后先在原 Plan 上回传 feedback 让 Generator 重生成，两次都不过才重跑 Planner。改它要与代码里的 DEFAULT_LOCAL_REPAIR_MAX 一起改，否则部署里设的数与代码缺省不同源。"
       },
       "ralph": {
