@@ -1984,6 +1984,49 @@ mod tests {
         }
     }
 
+    /// planner 拆完才有的三格，落在它拆出来的那条原子任务上（按 id）。
+    #[test]
+    fn the_planner_items_land_on_the_atomic_tasks_it_decomposed_into() {
+        use crate::squad::pge::types::PlannerOutput;
+        use cog_core::contract::ledger_item::{LedgerItem, LedgerState, ITEM_INPUT_KEY};
+        let item = LedgerItem {
+            id: "t1".into(),
+            terminal: "那一处的界跟着实测走".into(),
+            now: "界还是写死的".into(),
+            gap: "缺的是：换输入不会跟着变".into(),
+            state: LedgerState::Open,
+        };
+        let spec = |id: &str| cog_core::TaskSpec {
+            id: id.into(),
+            name: id.into(),
+            task_type: "generate".into(),
+            input: serde_json::json!({}),
+            blocked_by: Vec::new(),
+            acceptance: vec!["x".into()],
+            delivers: None,
+        };
+        let plan = PlannerOutput {
+            summary: "s".into(),
+            plan: serde_json::json!({}),
+            sub_tasks: vec![spec("t1"), spec("t2")],
+            acceptance_criteria: Vec::new(),
+            targets: Vec::new(),
+            items: vec![item.clone()],
+        };
+        let mut tasks: Vec<cog_core::AtomicTask> =
+            plan.sub_tasks.iter().map(CollaborationExecutor::task_spec_to_atomic).collect();
+        CollaborationExecutor::attach_items(&mut tasks, &plan);
+
+        let carried: LedgerItem =
+            serde_json::from_value(tasks[0].input.get(ITEM_INPUT_KEY).cloned().expect("t1 没挂上"))
+                .unwrap();
+        assert_eq!(carried, item);
+        assert!(
+            tasks[1].input.get(ITEM_INPUT_KEY).is_none(),
+            "没有对应待办的那条不该被塞进别人的三格"
+        );
+    }
+
     /// 任务行上带着三格的，结果里就把判完之后的它带回去：状态跟着结局走，差距原样。
     ///
     /// 判的是「入口那一侧读得到『这条到了没有』」——只读「这次跑成了没有」的话，
