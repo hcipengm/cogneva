@@ -895,7 +895,7 @@ impl RalphLoop {
         // 「终态不成立：哪一问」。只有一条都审不过时，才带着判词去问属主。
         let planned_once = match (planner_for_review, planned_once) {
             (Some(planner), Some(plan)) => {
-                let mut findings = evaluator.review_criteria(goal, plan.ledger_items()).await;
+                let mut findings = evaluator.review_criteria(goal, &plan.judged_items()).await;
                 if findings.iter().any(|f| !f.ok) {
                     // 退回 planner 改一次：把不成立的那几条作为反馈问一次。
                     let feedback = findings
@@ -919,7 +919,7 @@ impl RalphLoop {
                         )
                         .await;
                     findings = evaluator
-                        .review_criteria(goal, revised.ledger_items())
+                        .review_criteria(goal, &revised.judged_items())
                         .await;
                     if findings.iter().any(|f| !f.ok) {
                         let refused: Vec<String> = findings

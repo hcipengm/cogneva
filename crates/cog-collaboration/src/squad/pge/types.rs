@@ -85,10 +85,40 @@ pub struct PlannerOutput {
 impl PlannerOutput {
     /// 这一份计划要判的那几条待办。
     ///
-    /// 计划没写 `items` 时**不是空批**，是「这一版 planner 还没产出待办」：调用方
-    /// 据此走它原来的判法，并把这件事记成一条读数，而不是把「没写」读成「没有要判的」。
+    /// 计划没写 `items` 时**不是空批**：那是「这一版 planner 的契约还没点名这一格」
+    /// （部署侧的 prompt skill 决定答案形状，平台改不了它）。这时从每一片的
+    /// `acceptance` 派生出待办——那本来就是这一片「怎样算做完」的那句话，判据仍是
+    /// 它，只是换了个更窄的载体。派生出来的是**借用**：`items` 为空时，调用方用
+    /// [`Self::derived_items`] 拿到那份借来的清单。
     pub fn ledger_items(&self) -> &[cog_core::contract::ledger_item::LedgerItem] {
         &self.items
+    }
+
+    /// 契约没点名 `items` 时，从每一片的 `acceptance` 派生出的待办。
+    ///
+    /// 返回空表示这一份计划既没有 `items`、也没有任何一片写了验收：那是真的没有
+    /// 可判的东西，不是「全部通过」。
+    pub fn derived_items(&self) -> Vec<cog_core::contract::ledger_item::LedgerItem> {
+        self.sub_tasks
+            .iter()
+            .filter(|t| !t.acceptance.is_empty())
+            .map(|t| cog_core::contract::ledger_item::LedgerItem {
+                id: t.id.clone(),
+                terminal: t.acceptance.join("；"),
+                now: String::new(),
+                gap: String::new(),
+                state: cog_core::contract::ledger_item::LedgerState::Open,
+            })
+            .collect()
+    }
+
+    /// 这一份计划要判的待办：契约写的优先，没写就从各片的验收派生。
+    pub fn judged_items(&self) -> Vec<cog_core::contract::ledger_item::LedgerItem> {
+        if self.items.is_empty() {
+            self.derived_items()
+        } else {
+            self.items.clone()
+        }
     }
 }
 
@@ -105,6 +135,43 @@ pub struct CriterionVerdict {
     /// 不成立时，缺的是什么（点名到「不是做完的样子 / 判不了 / 不是意图要的」哪一问）。
     #[serde(default)]
     pub reason: String,
+}
+
+#[cfg(test)]
+mod ledger_items_tests {
+    use super::*;
+
+    /// 契约没点名 `items` 时，从每一片的 `acceptance` 派生：判据仍是那一句，
+    /// 只是换了个更窄的载体。派生不出来（没有一片写了验收）就是空，不是「全过」。
+    #[test]
+    fn items_are_derived_from_the_acceptance_when_the_contract_names_none() {
+        let mut plan = PlannerOutput {
+            summary: "s".into(),
+            plan: serde_json::json!({}),
+            sub_tasks: vec![TaskSpec {
+                id: "t1".into(),
+                name: "n".into(),
+                task_type: "generate".into(),
+                input: serde_json::json!({}),
+                blocked_by: Vec::new(),
+                acceptance: vec!["the answer names the exact version".into()],
+                delivers: None,
+            }],
+            acceptance_criteria: Vec::new(),
+            targets: Vec::new(),
+            items: Vec::new(),
+        };
+        let derived = plan.judged_items();
+        assert_eq!(derived.len(), 1);
+        assert_eq!(derived[0].id, "t1");
+        assert_eq!(derived[0].terminal, "the answer names the exact version");
+
+        plan.sub_tasks[0].acceptance.clear();
+        assert!(
+            plan.judged_items().is_empty(),
+            "没有验收可派生的计划不该被读成「全部通过」"
+        );
+    }
 }
 
 /// Whether an in-band cause says this role produced nothing: the transport never

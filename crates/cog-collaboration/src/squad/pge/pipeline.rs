@@ -657,7 +657,8 @@ impl PgePipeline {
             // 判据只读**终态**：计划带着待办时，每条的 `terminal` 就是这一份
             // 计划要判的那段描述；`acceptance_criteria` 是同一件事的另一份写法，
             // 只在计划还没产出待办时作为兼容输入读一次，并记一条读数。
-            let items = plan.ledger_items();
+            let judged = plan.judged_items();
+            let items = &judged;
             let criteria: Vec<&str> = if items.is_empty() {
                 if plan.acceptance_criteria.is_empty() {
                     context_criteria
