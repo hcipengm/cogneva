@@ -152,6 +152,15 @@ pub fn parse_md(text: &str) -> Result<Vec<LedgerItem>, String> {
         let cells = cells_of(line);
         if cells.len() >= 5 {
             if let Some(state) = LedgerState::parse(cells.last().map(String::as_str).unwrap_or("")) {
+                // `touches: unknown — 理由`：这一条明确本轮不排。它不是批次的一部分，
+                // 与「还没做」分开——把它数进未完成会让每一轮的批都虚高。
+                if cells[3]
+                    .split_once("touches:")
+                    .map(|(_, rest)| rest.trim_start().starts_with("unknown"))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 let gap = gap_of(&cells[3]);
                 if state == LedgerState::Reached && EMPTY_GAP.contains(&gap.trim()) {
                     continue; // 终态真的到了：不进批次。
@@ -224,6 +233,18 @@ mod tests {
         assert_eq!(ids, vec!["S1", "N3", "S9"], "进批的应当只有未落的那几条");
         assert_eq!(items[0].gap, "差距一");
         assert_eq!(items[2].terminal, "旧格式");
+    }
+
+    /// 写了 `touches: unknown` 的行本轮不排，不数进未完成。
+    #[test]
+    fn a_deferred_row_is_not_counted_as_open() {
+        let text = "\
+| S1 | 终态 | 现在 | 差距 ｜ touches: unknown — 与 N31 同一批 | 未落 |
+| S2 | 终态 | 现在 | 差距 ｜ touches: a.rs | 未落 |
+";
+        let items = parse_md(text).expect("该读得出来");
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["S2"], "不排的那条不该进批");
     }
 
     /// 状态写成散文的行：点名拒掉，不静默丢掉。
