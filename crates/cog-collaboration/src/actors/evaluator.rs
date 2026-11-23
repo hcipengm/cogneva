@@ -674,6 +674,61 @@ mod tests {
         async fn state(&self) -> cog_core::SFResult<cog_core::AgentState> {
             Err(cog_core::SFError::NotImplemented("state".into()))
         }
+        async fn wait_for_idle(&self) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        async fn restore_from_id(&self, _checkpoint_id: &str) -> cog_core::SFResult<()> {
+            Err(cog_core::SFError::NotImplemented("restore_from_id".into()))
+        }
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<cog_core::AgentEvent> {
+            let (_tx, rx) = tokio::sync::broadcast::channel(1);
+            rx
+        }
+        async fn chat_stream(
+            &self,
+            _messages: &[cog_core::Message],
+            _options: &cog_core::ChatOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            Err(cog_core::SFError::NotImplemented("chat_stream".into()))
+        }
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            Err(cog_core::SFError::NotImplemented("complete_stream".into()))
+        }
+        async fn read_board(
+            &self,
+            _task_id: &str,
+            _field: &str,
+        ) -> cog_core::SFResult<Option<String>> {
+            Ok(None)
+        }
+        async fn write_board(
+            &self,
+            _task_id: &str,
+            _field: &str,
+            _value: &str,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        async fn receive_message(&self, _msg: cog_core::InboxMessage) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        async fn review_and_revise(
+            &self,
+            output: &str,
+            _config: &cog_core::SelfReviewConfig,
+        ) -> cog_core::SFResult<(String, cog_core::SelfReviewResult)> {
+            Ok((
+                output.to_string(),
+                cog_core::SelfReviewResult::Pass {
+                    score: 0.9,
+                    summary: "fixed".into(),
+                },
+            ))
+        }
     }
 
 
