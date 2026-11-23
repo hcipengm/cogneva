@@ -2501,12 +2501,28 @@ impl SettledProjects {
 /// read on every beat would be a cost paid forever for a defect that can no
 /// longer recur. The stop is the settle's own `remaining` count rather than a
 /// fixed number of passes, because how many beats the back-fill takes depends on
-/// how many rows the graph holds. A graph read that comes back empty is
-/// indistinguishable from a graph with nothing in it, and both mean there is
-/// nothing to settle.
-async fn settle_dispatch_parents(orchestrator: &Arc<dyn OrchestratorControl>) -> SettledProjects {
+/// how many rows the graph holds.
+///
+/// `None` is a beat that could not read the graph: it settled nothing, and it
+/// is not a beat that found nothing to settle. The caller leaves its
+/// `parents_settled` flag down on it, because a folded read here would come
+/// back with an empty graph, report `remaining == 0`, and stop the back-fill
+/// for the life of the process on the strength of a read that never happened.
+async fn settle_dispatch_parents(
+    orchestrator: &Arc<dyn OrchestratorControl>,
+) -> Option<SettledProjects> {
     let mut settled = SettledProjects::default();
-    let tasks = orchestrator.get_all_tasks().await;
+    let tasks = match orchestrator.get_all_tasks_checked().await {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the graph could not be read, so this beat settles nothing and \
+                 asks again on the next one"
+            );
+            return None;
+        }
+    };
     let mut projects: HashMap<&str, Vec<&Task>> = HashMap::new();
     for task in &tasks {
         if let Some(project) = task
@@ -2565,7 +2581,7 @@ async fn settle_dispatch_parents(orchestrator: &Arc<dyn OrchestratorControl>) ->
         }
     }
     fill_dispatch_criteria(orchestrator, &tasks, &mut settled).await;
-    settled
+    Some(settled)
 }
 
 /// Give every dispatched change row the criterion the hand-over now writes.
@@ -2601,8 +2617,23 @@ async fn fill_dispatch_criteria(
         // running this moment is left to the next pass rather than written
         // over. `replace_task` writes the whole row, so there is no narrower
         // write to fall back on.
-        let Some(mut filled) = orchestrator.get_task(&row.id).await else {
-            continue;
+        let mut filled = match orchestrator.get_task_checked(&row.id).await {
+            Ok(Some(filled)) => filled,
+            // The row is gone: there is nothing left to fill.
+            Ok(None) => continue,
+            Err(e) => {
+                // Not "gone": a read that failed cannot say that, and dropping
+                // the row here would leave it out of shape for good -- while
+                // `remaining` would report the back-fill finished.
+                settled.remaining += 1;
+                warn!(
+                    task = %row.id,
+                    error = %e,
+                    "change ledger: a dispatched change could not be read, so it keeps its \
+                     empty criterion this beat"
+                );
+                continue;
+            }
         };
         if !filled.acceptance.is_empty() {
             continue;
@@ -3079,14 +3110,18 @@ pub fn spawn_change_ledger_loop(
                     // the same pass that found it, rather than one period later.
                     if let Some(ref orchestrator) = orchestrator {
                         if !parents_settled {
-                            let settled = settle_dispatch_parents(orchestrator).await;
-                            if settled.moved_anything() {
-                                info!("change ledger: {}", settled.line());
+                            // A beat that could not read the graph settles
+                            // nothing, and `None` must not read as "nothing
+                            // left to settle": the flag stays down so the next
+                            // beat asks again. A settle that left rows to fill
+                            // asks again too; one that reached everything is
+                            // done for the life of the process.
+                            if let Some(settled) = settle_dispatch_parents(orchestrator).await {
+                                if settled.moved_anything() {
+                                    info!("change ledger: {}", settled.line());
+                                }
+                                parents_settled = settled.remaining == 0;
                             }
-                            // A settle that left rows to fill asks again on the
-                            // next beat; one that reached everything is done for
-                            // the life of the process.
-                            parents_settled = settled.remaining == 0;
                         }
                         let pool = pool.as_deref();
                         // Work with nobody's name on it shows up in the rows
@@ -5619,7 +5654,23 @@ async fn dispatch_pass(
     // Read before the delivery stamp below rather than beside the sweep: the
     // stamp is the first reader that needs it, and the graph it comes from is
     // the same one the hand-over later takes.
-    let graph_tasks = orchestrator.get_all_tasks().await;
+    //
+    // A read that failed hands nothing over. Folded, it would be an empty graph:
+    // the hand-over index would hold no generation for any change, so every owed
+    // row would be filed again under generation 0 -- an id the store may still
+    // hold, which the goal path treats as a fault -- and the sweep would find
+    // nothing to close. The same answer the census and the outstanding set
+    // already give above, for the same reason.
+    let graph_tasks = match orchestrator.get_all_tasks_checked().await {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the graph could not be read, so this pass handed nothing over"
+            );
+            return None;
+        }
+    };
     // Taken off that one reading, for the same reason the index is: what a
     // batch carries is on the tasks this pass already holds.
     let carried_by_batch = carried_handovers(&graph_tasks);
@@ -8524,7 +8575,7 @@ mod tests {
         );
         let control: Arc<dyn OrchestratorControl> = graph.clone();
 
-        let settled = settle_dispatch_parents(&control).await;
+        let settled = settle_dispatch_parents(&control).await.expect("the graph is readable here");
 
         assert_eq!(
             settled.anchored, 1,
@@ -8561,9 +8612,9 @@ mod tests {
                 .holding_root_change("change-b", "change-ledger:crates"),
         );
         let control: Arc<dyn OrchestratorControl> = graph.clone();
-        settle_dispatch_parents(&control).await;
+        settle_dispatch_parents(&control).await.expect("the graph is readable here");
 
-        let settled = settle_dispatch_parents(&control).await;
+        let settled = settle_dispatch_parents(&control).await.expect("the graph is readable here");
 
         assert_eq!(
             settled,
@@ -8590,7 +8641,7 @@ mod tests {
         );
         let control: Arc<dyn OrchestratorControl> = graph.clone();
 
-        let settled = settle_dispatch_parents(&control).await;
+        let settled = settle_dispatch_parents(&control).await.expect("the graph is readable here");
 
         assert_eq!(settled.criteria, 1, "{settled:?}");
         assert_eq!(settled.failed, 0, "{settled:?}");
@@ -8612,7 +8663,7 @@ mod tests {
             "a row of another kind is not this pass's to fill"
         );
         assert_eq!(
-            settle_dispatch_parents(&control).await,
+            settle_dispatch_parents(&control).await.expect("the graph is readable here"),
             SettledProjects::default(),
             "a second settle finds nothing left to do"
         );
@@ -8631,11 +8682,11 @@ mod tests {
         }
         let control: Arc<dyn OrchestratorControl> = Arc::new(graph);
 
-        let settled = settle_dispatch_parents(&control).await;
+        let settled = settle_dispatch_parents(&control).await.expect("the graph is readable here");
         assert_eq!(settled.criteria, SETTLE_BATCH, "{settled:?}");
         assert_eq!(settled.remaining, 3, "{settled:?}");
 
-        let settled = settle_dispatch_parents(&control).await;
+        let settled = settle_dispatch_parents(&control).await.expect("the graph is readable here");
         assert_eq!(settled.criteria, 3, "{settled:?}");
         assert_eq!(settled.remaining, 0, "{settled:?}");
 
@@ -8644,6 +8695,98 @@ mod tests {
             tasks.iter().filter(|t| t.acceptance.is_empty()).count(),
             0,
             "after the second settle every change says what closes it"
+        );
+    }
+
+    /// 结算读不到图，不是「已经补完了」。
+    ///
+    /// 这一趟的进度只看 `remaining`：折叠读回一份空图，`remaining` 就是 0，
+    /// 调用方据此把 `parents_settled` 立起来，这一趟回填此后一辈子不再跑。所以
+    /// 读不到要有自己的答案（`None`），调用方见到它就不立这一格。
+    #[tokio::test]
+    async fn a_settle_that_cannot_read_the_graph_is_not_a_settle_that_finished() {
+        let graph = Arc::new(FakeGraph::default().forgetting_the_graph());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        assert!(
+            settle_dispatch_parents(&control).await.is_none(),
+            "读不到图的一拍既没补上什么、也没法说还剩多少——它不该答成「补完了」"
+        );
+    }
+
+    /// 回填普通行时读不到那一行，不是「这行不在了」：它留到下一拍。
+    ///
+    /// 当作行没了就会 `continue`，`remaining` 停在 0 —— 这一趟于是宣布自己补完了，
+    /// 而那一行的判据此后没人再写。
+    #[tokio::test]
+    async fn a_dispatched_row_that_cannot_be_read_keeps_the_back_fill_asking() {
+        let row = ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "crates/x", "fn a"),
+            ..row(ChangeState::Pending, None)
+        };
+        // 今天写下的行自带判据（by construction），这里要的是那一代之前写下的
+        // 行：判据空着，才在回填的射程里。
+        let mut orphan = dispatch_one(&row, 0);
+        orphan.acceptance.clear();
+        let graph = Arc::new(FakeGraph::default().forgetting_the_graph());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+        let mut settled = SettledProjects::default();
+
+        fill_dispatch_criteria(&control, std::slice::from_ref(&orphan), &mut settled).await;
+
+        assert_eq!(settled.criteria, 0, "{settled:?}");
+        assert_eq!(settled.failed, 0, "读不到不是写失败：{settled:?}");
+        assert_eq!(
+            settled.remaining, 1,
+            "读不到的行要留到下一拍：{settled:?}"
+        );
+    }
+
+    /// 下发这一趟读不到图，就一条都不下发。
+    ///
+    /// 折叠读会让交接索引空着：每一行欠账都被当成「图上没有」，于是照 generation 0
+    /// 再投一次 —— 那个 id 很可能还在库里，目标那条路对重复 id 是直接报错的。与
+    /// 上面普查、欠账集读不到时给的是同一个答案：这一趟什么也不交出去。
+    #[tokio::test]
+    async fn a_pass_that_cannot_read_the_graph_hands_nothing_over() {
+        let rows: Vec<ChangeLedgerRow> = ["fn a", "fn b"]
+            .iter()
+            .map(|literal| ChangeLedgerRow {
+                identity: ChangeIdentity::new("grep", "crates/x", *literal),
+                ..row(ChangeState::Pending, None)
+            })
+            .collect();
+        let store = FakeLedger {
+            rows: rows.clone(),
+            ..Default::default()
+        };
+        let graph = Arc::new(FakeGraph::default().forgetting_the_graph());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            graph.submitted().is_empty(),
+            "读不到图的一趟不该把欠账按 generation 0 再投一次：{:?}",
+            graph.submitted()
+        );
+        assert!(
+            store.written().is_empty(),
+            "读不到图的一趟没有可写的读数，不该写出一行"
         );
     }
 
@@ -10563,6 +10706,8 @@ mod tests {
         /// gave. Kept apart from the row so a test can read *why* a row was
         /// closed without parsing the sentence back out of its error column.
         cancelled: std::sync::Mutex<Vec<(String, String)>>,
+        /// 测试用：读图的那几条都问不上来（模拟一个读不出来的 store）。
+        graph_unreadable: bool,
     }
 
     impl FakeGraph {
@@ -10709,6 +10854,12 @@ mod tests {
             self
         }
 
+        /// 读图的那几条这一拍都问不上来：一个读不出来的 store 的形状。
+        fn forgetting_the_graph(mut self) -> Self {
+            self.graph_unreadable = true;
+            self
+        }
+
         fn submitted(&self) -> Vec<String> {
             self.submitted.lock().unwrap().clone()
         }
@@ -10755,6 +10906,23 @@ mod tests {
         }
         async fn get_all_tasks(&self) -> Vec<Task> {
             self.tasks.lock().unwrap().values().cloned().collect()
+        }
+        /// 如实报错的那两条读：只有 store 读不出来时才走 `Err`，其余照内存答。
+        async fn get_all_tasks_checked(&self) -> SFResult<Vec<Task>> {
+            if self.graph_unreadable {
+                return Err(SFError::Database(
+                    "store unavailable: cannot read the task graph".into(),
+                ));
+            }
+            Ok(self.get_all_tasks().await)
+        }
+        async fn get_task_checked(&self, task_id: &str) -> SFResult<Option<Task>> {
+            if self.graph_unreadable {
+                return Err(SFError::Database(format!(
+                    "store unavailable: cannot read task {task_id}"
+                )));
+            }
+            Ok(self.get_task(task_id).await)
         }
         async fn push_to_dlq(&self, _task_id: &str, _error: String) -> SFResult<bool> {
             Ok(false)

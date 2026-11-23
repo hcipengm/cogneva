@@ -33,6 +33,7 @@ const DAG_EXECUTOR: &str = "crates/cog-orchestrator/src/dag_executor/orchestrato
 const DAG_CONSUMER: &str = "crates/cog-orchestrator/src/dag_executor/mod.rs";
 const ACTION_PLANNER: &str = "crates/cog-orchestrator/src/action_planner/action_plan_orchestrator.rs";
 const SIGNAL_WATCHER: &str = "crates/cog-reflection/src/signal_watcher.rs";
+const CHANGE_LEDGER: &str = "crates/cog-orchestrator/src/change_ledger.rs";
 
 /// 折叠过的那几条读。某一段正文里出现它们，就是那一面在替没读到的图作证。
 const FOLDED: &[&str] = &[
@@ -322,6 +323,24 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "get_task_checked",
         "读不到在手的行被读成「库里没有」，同一 id 每拍重投一次、每拍报重复",
     ),
+    (
+        CHANGE_LEDGER,
+        "async fn dispatch_pass",
+        "get_all_tasks_checked",
+        "读不到图的一趟把每条欠账按 generation 0 再投一次，重复 id 每拍报错",
+    ),
+    (
+        CHANGE_LEDGER,
+        "async fn settle_dispatch_parents",
+        "get_all_tasks_checked",
+        "空图被读成「已经补完了」，一趟回填此后一辈子不再跑",
+    ),
+    (
+        CHANGE_LEDGER,
+        "async fn fill_dispatch_criteria",
+        "get_task_checked",
+        "读不到那一行被读成「这行不在了」，一条变更的判据永远空着",
+    ),
 ];
 
 #[test]
@@ -342,6 +361,7 @@ fn every_surface_that_draws_the_graph_keeps_the_failure() {
         DAG_CONSUMER,
         ACTION_PLANNER,
         SIGNAL_WATCHER,
+        CHANGE_LEDGER,
     ] {
         productions.insert(file, production_text(&read_repo(file)));
     }
