@@ -941,6 +941,7 @@ fn a_shrunk_floor_names_where_the_full_text_lives() {
     let _ = std::fs::remove_dir_all(&spill_dir);
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};

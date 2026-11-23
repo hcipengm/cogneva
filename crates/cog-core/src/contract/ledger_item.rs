@@ -9,11 +9,16 @@
 //! 不是相等比较。
 
 /// 一条待办的状态。闭集只有两个词，与台账那一面同字。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// 序列化写的就是台账上的那两个词：planner 的产出直接是一行台账，读它与写它的
+/// 人用同一套词，多一个 `Open`／`Reached` 的旁名就多一处要对照的翻译。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum LedgerState {
     /// 还差着什么。
+    #[serde(rename = "未落")]
     Open,
     /// 终态到了：差距那一格空着才成立。
+    #[serde(rename = "已落")]
     Reached,
 }
 
@@ -40,7 +45,7 @@ impl LedgerState {
 const EMPTY_GAP: [&str; 4] = ["", "—", "-", "–"];
 
 /// 一条待办。字段与台账的五格一一对应。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct LedgerItem {
     /// 序号：稳定、永不复用。
     pub id: String,
@@ -145,5 +150,23 @@ mod tests {
         assert_eq!(LedgerState::parse("已落"), Some(LedgerState::Reached));
         assert_eq!(LedgerState::parse("进行中"), None);
         assert_eq!(LedgerState::Open.as_str(), "未落");
+    }
+
+    /// 线上那两个词与台账上的那两个词是同一对：planner 的答案直接是一行台账，
+    /// 序列化出一份 `Open`／`Reached` 就等于让读它的人再翻一次词典，而翻错不会报错。
+    #[test]
+    fn a_ledger_item_on_the_wire_speaks_the_ledger_words() {
+        let item = LedgerItem {
+            id: "N01".into(),
+            terminal: "到终态的样子".into(),
+            now: "此刻的样子".into(),
+            gap: "缺的那一件".into(),
+            state: LedgerState::Open,
+        };
+        let wire = serde_json::to_string(&item).expect("序列化不了");
+        assert!(wire.contains("未落"), "线上写的不是台账的词：{wire}");
+        assert!(!wire.contains("Open"), "线上出现了台账不认的旁名：{wire}");
+        let back: LedgerItem = serde_json::from_str(&wire).expect("读不回来");
+        assert_eq!(back, item);
     }
 }

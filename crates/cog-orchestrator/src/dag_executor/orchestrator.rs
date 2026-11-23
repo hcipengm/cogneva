@@ -3587,7 +3587,12 @@ impl DagExecutor {
         // 确定性失败不受重试预算约束：同样的输入在同一环境里再来一次必然同样
         // 失败，多付的只是那一轮烧掉的 token 和上游调用。预算清零比"重试三次
         // 都白跑"更省，也让失败原因在第一轮就浮出来而不是被三次重试盖住。
-        let max_retries = self.effective_max_retries(&error, cause, &task);
+        // 预算要读这一行**上一次**留下的失败原因（同样的失败再来一次不算新的一次），
+        // 所以在把 `task` 借成可变之前先问。
+        let max_retries = {
+            let task = inner.tasks.get(task_id).expect("task exists");
+            self.effective_max_retries(&error, cause, task)
+        };
 
         let task = inner.tasks.get_mut(task_id).expect("task exists");
         // 落库的那份预算写成这一次判决真正用的那份。任务上原带的数只是提交者
