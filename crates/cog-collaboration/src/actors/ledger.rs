@@ -81,14 +81,128 @@ pub fn status() -> i32 {
     }
 }
 
-/// `cogneva ledger <action>` 的分派。今天只有 `status`；别的名字点名说没有，
+/// `cogneva ledger <action>` 的分派。今天有 `status` 与 `next`；别的名字点名说没有，
 /// 不静默成功——一个不认识的子命令退 0 会被读成「跑过了」。
 pub fn run() -> i32 {
     match std::env::args().nth(2).as_deref() {
         Some("status") | None => status(),
+        Some("next") => next(),
         Some(other) => {
-            eprintln!("ledger: 不认识的动作 `{other}`（今天只有 `status`）");
+            eprintln!("ledger: 不认识的动作 `{other}`（今天有 `status` 与 `next`）");
             2
         }
     }
+}
+
+/// 「下一步是什么」，由三样读数算出来：这一本的未完成条数、工作树干不干净、
+/// 编译账里这一棵树的最后一条。
+///
+/// 与台账读者放在一起，是因为它们读的是同一件事的四面：写了什么（台账）、动没动
+/// （工作树）、编没编（编译账）。顺序就是流程的顺序——先改完，再编一次，最后才谈推。
+pub fn decide(open_rows: usize, dirty: bool, compiled_head: Option<&str>, head: &str) -> String {
+    if open_rows > 0 {
+        return format!("继续编辑——还有 {open_rows} 条未完成");
+    }
+    if dirty {
+        return "先提交（编译垫片在脏树上不编）".to_string();
+    }
+    match compiled_head {
+        None => "编译一次（这个宿主还没有这棵树的编译账）".to_string(),
+        Some(compiled) if compiled != head => format!(
+            "编译一次（账上最后一次编的是 {}，此刻 HEAD 是 {}）",
+            &compiled[..compiled.len().min(12)],
+            &head[..head.len().min(12)]
+        ),
+        Some(_) => "推（先跑 `deploy/scripts/check-before-push.sh`；绿了才推）".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 顺序就是流程：先改完，再提交，再编一次，最后才谈推。
+    #[test]
+    fn the_next_step_follows_the_order_of_the_flow() {
+        assert!(decide(3, false, None, "abc").starts_with("继续编辑"));
+        assert!(decide(0, true, None, "abc").starts_with("先提交"));
+        assert!(decide(0, false, None, "abc").contains("还没有这棵树的编译账"));
+        assert!(decide(0, false, Some("old"), "new").contains("编译一次"));
+        assert!(decide(0, false, Some("same"), "same").starts_with("推"));
+    }
+}
+
+/// 这一棵树在这本编译账里的最后一条（时间、树、参数、HEAD、指纹）。
+fn last_compile_for(tree: &str) -> Option<String> {
+    let path = std::path::PathBuf::from(
+        std::env::var("COGNEVA_COMPILE_LEDGER")
+            .unwrap_or_else(|_| format!("{}/.local/state/cogneva/compile-ledger.tsv", home())),
+    );
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut found = None;
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 4 && parts[1] == tree {
+            found = Some(parts[3].to_string());
+        }
+    }
+    found
+}
+
+fn home() -> String {
+    std::env::var("HOME").unwrap_or_default()
+}
+
+/// 跑一次 `git -C <tree> <args>`，返回 stdout（失败给空串：读不到不是「没有」，
+/// 调用方按「量不到」处理——这里只把空串与退出码交上去）。
+fn git(tree: &str, args: &[&str]) -> (String, bool) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(tree)
+        .args(args)
+        .output();
+    match out {
+        Ok(o) => (String::from_utf8_lossy(&o.stdout).trim().to_string(), o.status.success()),
+        Err(_) => (String::new(), false),
+    }
+}
+
+/// `cogneva ledger next`：把下一步打出来。退 0 表示有下一步（总有），退 2 读不到台账。
+pub fn next() -> i32 {
+    let path = match ledger_path() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ledger: {e}");
+            return 2;
+        }
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("ledger: 台账读不到：{}（{e}）", path.display());
+            return 2;
+        }
+    };
+    let open = match cog_core::contract::ledger_item::parse_md(&text) {
+        Ok(items) => items.iter().filter(|i| i.is_in_batch()).count(),
+        Err(e) => {
+            eprintln!("ledger: {e}");
+            return 2;
+        }
+    };
+    let tree = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let (status, ok) = git(&tree, &["status", "--porcelain"]);
+    if !ok {
+        eprintln!("ledger: 工作树读不到（{tree}）");
+        return 2;
+    }
+    let (head, _) = git(&tree, &["rev-parse", "HEAD"]);
+    let compiled = last_compile_for(&tree);
+    println!(
+        "ledger: {}",
+        decide(open, !status.is_empty(), compiled.as_deref(), &head)
+    );
+    0
 }
