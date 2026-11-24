@@ -98,6 +98,7 @@ fn start_chat_turn(
     content: String,
     command: Option<crate::commands::Invocation>,
     attachments: Vec<cog_core::ChatAttachment>,
+    addressed_to: String,
 ) {
     let state = state.clone();
     let session = session_id.unwrap_or_else(|| "default".into());
@@ -129,6 +130,7 @@ fn start_chat_turn(
             command,
             attachments,
             owner,
+            addressed_to,
             origin,
             mode,
             Some(bridge),
@@ -267,6 +269,7 @@ async fn handle_type_message(
         ClientMessage::ChatMessage {
             session_id,
             content,
+            addressed_to,
             attachments,
             ..
         } => {
@@ -290,6 +293,7 @@ async fn handle_type_message(
                 content,
                 None,
                 attachments,
+                addressed_to.unwrap_or_default(),
             );
         }
         ClientMessage::Command {
@@ -316,6 +320,7 @@ async fn handle_type_message(
                 return Ok(());
             }
             watch_session(state, watched, session_id.as_deref(), out_tx);
+            // 命令这一路没有收件人：命令是这一屏自己的动作，不是对某个人说的话。
             start_chat_turn(
                 state,
                 out_tx,
@@ -325,6 +330,7 @@ async fn handle_type_message(
                 invocation.line(),
                 Some(invocation),
                 attachments,
+                String::new(),
             );
         }
         ClientMessage::PermissionResponse {
