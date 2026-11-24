@@ -166,12 +166,38 @@ def render_docs(rendered):
     return load_docs(paths)
 
 
-def pod_footprint(spec):
+def admission_defaults(docs):
+    """准入会给「没有声明的容器」填上的那组值（LimitRange 的 Container 条目）。
+
+    缺省是 0：渲染集里没有 LimitRange 时，未声明的容器就是 0——与准入一致。
+    """
+    for doc in docs:
+        if doc.get("kind") != "LimitRange":
+            continue
+        for entry in (doc.get("spec") or {}).get("limits") or []:
+            if entry.get("type") != "Container":
+                continue
+            default = entry.get("default") or {}
+            request = entry.get("defaultRequest") or {}
+            return (
+                cpu_cores(request.get("cpu")),
+                mem_bytes(request.get("memory")),
+                cpu_cores(default.get("cpu")),
+                mem_bytes(default.get("memory")),
+            )
+    return (0.0, 0.0, 0.0, 0.0)
+
+
+def pod_footprint(spec, defaults=(0.0, 0.0, 0.0, 0.0)):
     """一个 Pod 的 (requests.cpu, requests.mem, limits.cpu, limits.mem)。
 
     与 kubelet 的记账同一口径：业务容器求和，init 容器取最大值，两者再取大者。
+    容器**没有声明**的那一维按准入会给它填的那组值算（[`admission_defaults`]）：
+    按 0 算的那一版把额度投影得比实际准入的小，差额恰好等于默认层——于是「工作
+    负载长大了、额度没跟」在下一次滚动时表现为「这一版永远滚不上去」。
     """
     pod = spec.get("template", {}).get("spec") or {}
+    d_cpu_r, d_mem_r, d_cpu_l, d_mem_l = defaults
 
     def tally(containers):
         cpu_r = cpu_l = 0.0
@@ -180,10 +206,11 @@ def pod_footprint(spec):
             res = c.get("resources") or {}
             req = res.get("requests") or {}
             lim = res.get("limits") or {}
-            cpu_r += cpu_cores(req.get("cpu"))
-            mem_r += mem_bytes(req.get("memory"))
-            cpu_l += cpu_cores(lim.get("cpu"))
-            mem_l += mem_bytes(lim.get("memory"))
+            # 一维一维地取：只声明了 cpu 的容器，内存那一维仍由准入的默认值填。
+            cpu_r += cpu_cores(req.get("cpu")) if req.get("cpu") is not None else d_cpu_r
+            mem_r += mem_bytes(req.get("memory")) if req.get("memory") is not None else d_mem_r
+            cpu_l += cpu_cores(lim.get("cpu")) if lim.get("cpu") is not None else d_cpu_l
+            mem_l += mem_bytes(lim.get("memory")) if lim.get("memory") is not None else d_mem_l
         return cpu_r, mem_r, cpu_l, mem_l
 
     (c_r, m_r, c_l, m_l) = tally(pod.get("containers") or [])
@@ -208,7 +235,7 @@ def surge_extra(doc, replicas):
     return int(raw)
 
 
-def declared_workloads(docs, nodes):
+def declared_workloads(docs, nodes, defaults=(0.0, 0.0, 0.0, 0.0)):
     """(副本数, Pod 占用, 滚动重叠份数) 的逐对象清单。"""
     rows = []
     for doc in docs:
@@ -228,7 +255,7 @@ def declared_workloads(docs, nodes):
         pod_spec = spec
         if kind == "CronJob":
             pod_spec = spec.get("jobTemplate", {}).get("spec") or {}
-        cpu_r, mem_r, cpu_l, mem_l = pod_footprint(pod_spec)
+        cpu_r, mem_r, cpu_l, mem_l = pod_footprint(pod_spec, defaults)
         surge = surge_extra(doc, replicas) if kind == "Deployment" else 0
         rows.append(
             {
@@ -311,7 +338,7 @@ def deployer_job_size(docs):
 
 
 def project(docs, nodes, default_cpu="500m", default_memory="512Mi", pvc_min="1Gi"):
-    rows = declared_workloads(docs, nodes)
+    rows = declared_workloads(docs, nodes, admission_defaults(docs))
     if not rows:
         raise SystemExit("渲染集里没有工作负载，投影没有输入")
 

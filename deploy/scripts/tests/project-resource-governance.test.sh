@@ -139,3 +139,56 @@ case "${out}" in
 esac
 
 echo "project-resource-governance.test: all checks passed"
+
+# --- 没声明资源的容器按准入会给它填的默认值算。
+#
+# 投影按 0 算的那一版，额度会比准入实际记的小，差额恰好是默认层；下一次滚动时
+# 准入先拒掉新 Pod，现场读作「这一版永远滚不上去」（2026-11-24 实撞：namespace
+# 的 requests.cpu 硬上限 5、已用 2.66，而库的模板要 3.04，Pod 一直建不出来）。
+probe="${work}/probe"
+mkdir -p "${probe}"
+cat >"${probe}/plain.yaml" <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: probe}
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: c
+          image: busybox
+YAML
+cat >"${probe}/with-defaults.yaml" <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: probe}
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: c
+          image: busybox
+---
+apiVersion: v1
+kind: LimitRange
+metadata: {name: cogneva-limits}
+spec:
+  limits:
+    - type: Container
+      default: {cpu: 750m, memory: 256Mi}
+      defaultRequest: {cpu: 500m, memory: 128Mi}
+YAML
+requests_of() { # <rendered 文件>
+    python3 "${gate}" --rendered "$1" --nodes 1 --write-values "${work}/probe/out.yaml" --quiet 2>/dev/null
+    awk -F'"' '/requestsCpu:/ {print $2; exit}' "${work}/probe/out.yaml"
+}
+plain="$(requests_of "${probe}/plain.yaml")"
+with_defaults="$(requests_of "${probe}/with-defaults.yaml")"
+if [ "${plain}" = "0" ] && [ "${with_defaults}" = "2" ]; then
+    echo "ok    - 未声明的容器按准入默认值计（0 → 2 核）"
+else
+    printf 'FAIL: 未声明的容器没有按准入默认值计：无默认 %s，有默认 %s\n' "${plain}" "${with_defaults}" >&2
+    exit 1
+fi
