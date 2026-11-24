@@ -1119,16 +1119,18 @@ async fn message_stream_for(
         goal_row.workspace_id = None;
         goal_row.input["origin"] =
             a2a_origin(caller.as_ref().map(|Extension(claims)| claims), request.message_id.as_deref());
-        let intent = a2a_intent(
-            &goal_id,
-            caller.as_ref().map(|Extension(claims)| claims),
+        let intent = cog_core::IntentRow::new(
+            "a2a",
+            cog_core::intent_identity("a2a", &goal_id),
+            caller
+                .as_ref()
+                .map(|Extension(claims)| claims.sub.clone())
+                .unwrap_or_default(),
+            "",
             &request.goal,
+            None,
         );
-        if let Some(desk) = state.intent_events.as_ref() {
-            if let Err(e) = desk.record(&intent).await {
-                tracing::warn!(goal_id = %goal_id, error = %e, "an a2a goal did not land on the intent desk");
-            }
-        }
+        crate::intent::record(state.intent_events.as_ref(), intent).await;
         // 提交在开流之前等它落地，理由与 `message/send` 是同一个：这一行要读不回来，
         // 流能给出的只有「这一行从没出现过」——而那与「提交被拒」是两件事，对端要等
         // 满一个截止时间才能听到前者。拒了就当场报一帧，理由照实说。
@@ -1451,16 +1453,18 @@ async fn rpc_message_send(
     goal_row.workspace_id = None;
     goal_row.input["origin"] =
         a2a_origin(caller.as_ref().map(|Extension(claims)| claims), request.message_id.as_deref());
-    let intent = a2a_intent(
-        &goal_id,
-        caller.as_ref().map(|Extension(claims)| claims),
+    let intent = cog_core::IntentRow::new(
+        "a2a",
+        cog_core::intent_identity("a2a", &goal_id),
+        caller
+            .as_ref()
+            .map(|Extension(claims)| claims.sub.clone())
+            .unwrap_or_default(),
+        "",
         &request.goal,
+        None,
     );
-    if let Some(desk) = state.intent_events.as_ref() {
-        if let Err(e) = desk.record(&intent).await {
-            tracing::warn!(goal_id = %goal_id, error = %e, "an a2a goal did not land on the intent desk");
-        }
-    }
+    crate::intent::record(state.intent_events.as_ref(), intent).await;
     // 回执读的是库里的那一行，不是本地构造的这一份：受理之后状态可能已经被派工
     // 改过，对端要的是它现在是什么样。
     let row = match accept_goal(&orchestrator, &request.goal, goal_row).await {
@@ -1518,21 +1522,6 @@ async fn send_result(
         .into_response()
 }
 
-/// 这一条消息的意图行：三种来源进同一本账，A2A 只是其中一格。
-///
-/// 身份取 goal id（同一 messageId 重投同一条），原文是 goal 本身；`said_by` 取
-/// 验过的认证主体，`addressed_to` 为空——A2A 请求不指名某个员工，平台就是收件人。
-fn a2a_intent(goal_id: &str, caller: Option<&Claims>, goal: &str) -> cog_core::IntentRow {
-    cog_core::IntentRow {
-        identity: format!("a2a:{goal_id}"),
-        source: "a2a".into(),
-        said_by: caller.map(|c| c.sub.clone()).unwrap_or_default(),
-        addressed_to: String::new(),
-        text: goal.to_string(),
-        parent: None,
-        at: chrono::Utc::now(),
-    }
-}
 
 /// 这一次 `SendMessage` 要不要阻塞到任务结束。
 ///
@@ -1865,18 +1854,24 @@ mod tests {
         }
     }
 
-    /// 同一条消息重投是同一行；原文一个字节不改；主体取验过的那一份。
+    /// A2A 的身份形状与统一写入口同形：同一条消息重投是同一行，原文不改写。
     #[test]
     fn an_a2a_message_lands_as_one_intent_row() {
-        let row = a2a_intent("goal-9", Some(&claims("u-1", "owner")), "刷新接口未区分访问令牌");
-        assert_eq!(row.identity, "a2a:goal-9");
-        assert_eq!(row.source, "a2a");
-        assert_eq!(row.said_by, "u-1");
+        let identity = cog_core::intent_identity("a2a", "goal-9");
+        assert_eq!(identity, "a2a:goal-9");
+        let row = cog_core::IntentRow::new(
+            "a2a",
+            identity.clone(),
+            "u-1",
+            "",
+            "刷新接口未区分访问令牌",
+            None,
+        );
+        assert_eq!(row.idempotency_key(), identity);
         assert_eq!(row.text, "刷新接口未区分访问令牌");
         assert!(row.addressed_to.is_empty());
-        let anonymous = a2a_intent("goal-9", None, "same");
-        assert_eq!(anonymous.said_by, "");
-        assert_eq!(anonymous.idempotency_key(), row.idempotency_key());
+        let replay = cog_core::IntentRow::new("a2a", identity.clone(), "u-1", "", "同一条", None);
+        assert_eq!(replay.idempotency_key(), row.idempotency_key());
     }
 
     /// 契约写在对端读得到的那张名片上：每一条 message 都落成一条 goal（问题也是
