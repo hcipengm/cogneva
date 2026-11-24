@@ -150,9 +150,10 @@ mod tests {
     #[tokio::test]
     async fn a_row_reaches_the_one_sink_with_its_addressee() {
         let _gate = one_at_a_time();
-        let recorder: Arc<dyn IntentEvents> = Arc::new(Recorder::default());
+        let recorder = Arc::new(Recorder::default());
+        let sink: Arc<dyn IntentEvents> = recorder.clone();
         record(
-            Some(&recorder),
+            Some(&sink),
             chat_row("s1", "owner", "luna-1", "把这批门禁的归属改回来"),
         )
         .await;
@@ -168,19 +169,16 @@ mod tests {
     #[tokio::test]
     async fn an_empty_turn_is_not_an_intent_and_a_failure_is_counted() {
         let _gate = one_at_a_time();
-        let recorder: Arc<dyn IntentEvents> = Arc::new(Recorder {
+        let recorder = Arc::new(Recorder {
             rows: Mutex::default(),
             fail: true,
         });
+        let sink: Arc<dyn IntentEvents> = recorder.clone();
         let before = counters().received.load(Ordering::Relaxed);
-        record(Some(&recorder), chat_row("s1", "owner", "luna-1", "   ")).await;
+        record(Some(&sink), chat_row("s1", "owner", "luna-1", "   ")).await;
         assert_eq!(counters().received.load(Ordering::Relaxed), before);
         let failures = counters().failures.load(Ordering::Relaxed);
-        record(
-            Some(&recorder),
-            chat_row("s1", "owner", "luna-1", "这是一句话"),
-        )
-        .await;
+        record(Some(&sink), chat_row("s1", "owner", "luna-1", "这是一句话")).await;
         assert!(counters().failures.load(Ordering::Relaxed) > failures);
         assert!(recorder.rows.lock().unwrap().is_empty());
     }
