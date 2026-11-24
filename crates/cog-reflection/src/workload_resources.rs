@@ -607,6 +607,22 @@ async fn quota_headroom(ns: &str) -> Option<Targets> {
     })
 }
 
+/// 一次抬价能从这一拍的额度余量里拿到多少：`requested` 不超过 `declared` 时不花
+/// 预算；超过时最多花剩下的（`budget` 用完就停在声明值上）。
+///
+/// 这是把「工作负载那一层」和「命名空间额度那一层」接成一对的那一步。此前只有
+/// 前者跟测量走：2026-11-24 实测，闭环把库的 requests 抬到 3040m，而额度仍是渲染时
+/// 按它 500m 的声明算出的 5 核，Pod 重建时被准入拒掉（`FailedCreate`），数据库
+/// 因此不在。抬价不花预算的那条路，就是让闭环自己撞自己设的闸。
+fn spend_raise(declared: u64, requested: u64, budget: &mut u64) -> u64 {
+    if requested <= declared {
+        return requested;
+    }
+    let grant = (requested - declared).min(*budget);
+    *budget -= grant;
+    declared + grant
+}
+
 /// 把默认层夹进 namespace 还剩下的准入余量：一个新 Pod 用这组值必须进得去。
 ///
 /// `None` 是「量不到」（没有配额对象、或读失败）——量不到不改，也不假装能装下：
@@ -1996,6 +2012,20 @@ pub async fn round(
     let workloads = parse_workloads(&workload_list);
     let known: std::collections::BTreeSet<String> =
         workloads.iter().map(|w| w.name.clone()).collect();
+    // 这一拍还能往 requests 上抬多少：`hard − used`。量不到（没有配额对象或读失败）
+    // 就不夹——但那是「量不到」，不是一个可以默认成无穷大的数，所以同时留一条 warn。
+    let mut cpu_raise_budget: Option<u64> = None;
+    let mut memory_raise_budget: Option<u64> = None;
+    match quota_headroom(ns).await {
+        Some(headroom) => {
+            cpu_raise_budget = Some(headroom.cpu_request_millicores);
+            memory_raise_budget = Some(headroom.memory_request_bytes);
+        }
+        None => warn!(
+            namespace = %ns,
+            "workload resources: the namespace quota's headroom is unreadable; this pass does not cap its raises"
+        ),
+    }
 
     let pods: Value =
         serde_json::from_str(&kubectl(&["get", "pods", "-n", ns, "-o", "json"]).await?)
@@ -2279,6 +2309,55 @@ pub async fn round(
                         readings.observe_shm(&workload.name, &volume.volume, declared, SOURCE_SEED);
                     }
                 }
+            }
+        }
+        // 抬价这一边也要花额度：闭环抬上去的请求先向这一拍剩下的余量借，借不到
+        // 就停在放得下的地方。放在出 patch body 之前，是因为写下去的那一份就是
+        // 准入随后记账的那一份——两处两个数时，Pod 会在重建时被自己的旧闸门拒掉。
+        if let Some(budget) = cpu_raise_budget.as_mut() {
+            for (name, targets) in changes.iter_mut() {
+                let Some(declared) = workload
+                    .containers
+                    .iter()
+                    .find(|c| &c.name == name)
+                    .and_then(|c| c.declared)
+                else {
+                    continue;
+                };
+                let before = targets.cpu_request_millicores;
+                targets.cpu_request_millicores = spend_raise(
+                    declared.cpu_request_millicores.unwrap_or(0),
+                    before,
+                    budget,
+                );
+                if targets.cpu_request_millicores != before {
+                    warn!(
+                        workload = %workload.name,
+                        container = %name,
+                        declared = declared.cpu_request_millicores.unwrap_or(0),
+                        wanted = before,
+                        granted = targets.cpu_request_millicores,
+                        "workload resources: the quota cannot admit this raise; the request is capped at what still fits"
+                    );
+                    readings.observe(&workload.name, name, *targets, SOURCE_QUOTA, 0);
+                }
+            }
+        }
+        if let Some(budget) = memory_raise_budget.as_mut() {
+            for (name, targets) in changes.iter_mut() {
+                let Some(declared) = workload
+                    .containers
+                    .iter()
+                    .find(|c| &c.name == name)
+                    .and_then(|c| c.declared)
+                else {
+                    continue;
+                };
+                targets.memory_request_bytes = spend_raise(
+                    declared.memory_request_bytes.unwrap_or(0),
+                    targets.memory_request_bytes,
+                    budget,
+                );
             }
         }
         let Some(body) = patch_body(
@@ -3385,6 +3464,19 @@ mod tests {
     /// per-container law reads, asked what a typical container here looks
     /// like: the median sets the request, the busy edge sets the limit.
     #[test]
+    /// 抬价先向这一拍剩下的额度借：不超过声明的部分不花，超过的部分最多花到
+    /// 余量为 0；借不到就停在声明值上。2026-11-24 那次事故的数：声明 500m、
+    /// 想抬到 3040m、余量 2340m ⇒ 落到 2840m，随后的准入正好顶到 5000m 的硬上限。
+    #[test]
+    fn a_raise_spends_only_the_headroom_the_quota_still_has() {
+        let mut budget = 2_340;
+        assert_eq!(spend_raise(500, 400, &mut budget), 400, "不抬就不花预算");
+        assert_eq!(budget, 2_340);
+        assert_eq!(spend_raise(500, 3_040, &mut budget), 2_840, "抬价被余量夹住");
+        assert_eq!(budget, 0);
+        assert_eq!(spend_raise(500, 3_040, &mut budget), 500, "余量用完就停在声明值");
+    }
+
     /// 默认层被配额顶住时取「还装得下」的那组值；量不到时原样交回。
     #[test]
     fn the_default_is_capped_by_what_the_quota_can_still_admit() {
