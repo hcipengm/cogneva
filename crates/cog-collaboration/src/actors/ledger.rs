@@ -717,7 +717,7 @@ fn judge_split(
 }
 
 /// 台账每一行写着它要动哪些文件（`｜ touches: a, b`）。判第 3 条理由要用。
-fn touches_by_id(text: &str) -> std::collections::HashMap<String, Vec<String>> {
+pub fn touches_by_id(text: &str) -> std::collections::HashMap<String, Vec<String>> {
     let mut out = std::collections::HashMap::new();
     for line in text.lines() {
         let row = line.trim();

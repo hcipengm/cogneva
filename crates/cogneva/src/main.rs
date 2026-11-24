@@ -180,6 +180,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::BatchEdit => cog_orchestrator::batch_edit::run_from_env().await,
         Command::BatchPlan => cog_orchestrator::batch_plan::run_from_stdin().await,
         Command::Ledger => {
+            // 开轮之前先让平台的批计划器判这一批（流程第 4 步）：定批是固定程序，
+            // 计划站不住就不该开出一条轮——一套验证付在这一批上，而这一批不成立。
+            if std::env::args().nth(2).as_deref() == Some("open") {
+                match ledger_batch_holds().await {
+                    Ok(0) => println!("ledger: 台账里没有未完成的待办。"),
+                    Ok(n) => println!("ledger: 这一批的计划成立（{n} 条，两种验收形状）。"),
+                    Err(defect) => {
+                        eprintln!("ledger: 这一批不成立，开不出轮：{defect}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             // 事件流那本书：台账不在 git 里时（平台自己的变更账）由这条流来钉。
             // 连接不上只是这本书不可用，git 那本书照常；「读不到」由调用它的那个动作说。
             let events = ledger_round_events().await;
@@ -320,4 +332,32 @@ async fn ledger_round_events() -> Option<std::sync::Arc<dyn cog_core::RoundEvent
             None
         }
     }
+}
+
+/// 这一批交给 `LedgerBatchPlanner`，再按固定程序校一遍。返回的是计划站不住的那一句。
+async fn ledger_batch_holds() -> Result<usize, String> {
+    use cog_core::BatchPlanner;
+    let path = cog_collaboration::actors::ledger::ledger_path()?;
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("台账读不到：{}（{e}）", path.display()))?;
+    let items = cog_core::contract::ledger_item::parse_md(&text)?;
+    let touches = cog_collaboration::actors::ledger::touches_by_id(&text);
+    let batch: Vec<cog_core::BatchItem> = items
+        .iter()
+        .map(|i| cog_core::BatchItem {
+            id: i.id.clone(),
+            title: i.terminal.clone(),
+            touches: touches.get(&i.id).cloned().unwrap_or_default(),
+            item: i.clone(),
+        })
+        .collect();
+    if batch.is_empty() {
+        return Ok(0);
+    }
+    let plan = cog_orchestrator::action_planner::LedgerBatchPlanner::new()
+        .plan_batch(&batch)
+        .await
+        .map_err(|e| e.to_string())?;
+    plan.validate().map_err(|defect| format!("{defect:?}"))?;
+    Ok(batch.len())
 }
