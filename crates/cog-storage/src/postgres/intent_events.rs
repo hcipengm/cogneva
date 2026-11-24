@@ -185,6 +185,13 @@ impl IntentEvents for IntentEventStore {
     }
 }
 
+const ONE_INTENT: &str = "\
+SELECT i.attributes, i.at \
+  FROM cogneva_event i \
+ WHERE i.kind = 'intent_received' AND i.subject_id = $1 \
+ ORDER BY i.at ASC, i.event_id ASC \
+ LIMIT 1";
+
 #[async_trait]
 impl IntentReader for IntentEventStore {
     async fn undispatched(&self, limit: i64) -> SFResult<Vec<IntentRow>> {
@@ -228,6 +235,35 @@ impl IntentReader for IntentEventStore {
             }
         }
         Ok(out)
+    }
+
+    async fn by_identity(&self, identity: &str) -> SFResult<Option<IntentRow>> {
+        let row = sqlx::query(ONE_INTENT)
+            .bind(identity)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("read one intent: {e}")))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let attributes_text: String = row
+            .try_get("attributes")
+            .map_err(|e| SFError::Database(format!("intent row: {e}")))?;
+        let at: DateTime<Utc> = row
+            .try_get("at")
+            .map_err(|e| SFError::Database(format!("intent row: {e}")))?;
+        let attributes: serde_json::Value = match serde_json::from_str(&attributes_text) {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::warn!(identity = %identity, error = %e, "an intent row's attributes do not decode");
+                return Ok(None);
+            }
+        };
+        Ok(IntentRow::from_attributes(
+            identity.to_string(),
+            &attributes,
+            at,
+        ))
     }
 }
 

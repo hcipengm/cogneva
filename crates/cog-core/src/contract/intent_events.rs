@@ -116,6 +116,13 @@ pub trait IntentReader: Send + Sync {
     /// 读不出来是 `Err`，不是空清单：把一次读失败读成「没有人说过话」，会让这一段
     /// 里的每一句都在下一拍被当成新到达，或者在下一拍之前一直没有人看见。
     async fn undispatched(&self, limit: i64) -> SFResult<Vec<IntentRow>>;
+
+    /// 按身份取回那一行。派生的任务要知道「这句话是谁说的、说给谁」——它手上
+    /// 只有身份（待办的 id 就是身份），而这张脸给的就是那一条。
+    ///
+    /// 读不出来是 `Err`，找不到是 `Ok(None)`：两者分开，「库没答」不该读成
+    /// 「这条意图不存在」。
+    async fn by_identity(&self, identity: &str) -> SFResult<Option<IntentRow>>;
 }
 
 #[cfg(test)]
