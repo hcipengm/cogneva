@@ -2097,20 +2097,6 @@ pub async fn round(
     let workloads = parse_workloads(&workload_list);
     let known: std::collections::BTreeSet<String> =
         workloads.iter().map(|w| w.name.clone()).collect();
-    // 这一拍还能往 requests 上抬多少：`hard − used`。量不到（没有配额对象或读失败）
-    // 就不夹——但那是「量不到」，不是一个可以默认成无穷大的数，所以同时留一条 warn。
-    let mut cpu_raise_budget: Option<u64> = None;
-    let mut memory_raise_budget: Option<u64> = None;
-    match quota_headroom(ns).await {
-        Some(headroom) => {
-            cpu_raise_budget = Some(headroom.cpu_request_millicores);
-            memory_raise_budget = Some(headroom.memory_request_bytes);
-        }
-        None => warn!(
-            namespace = %ns,
-            "workload resources: the namespace quota's headroom is unreadable; this pass does not cap its raises"
-        ),
-    }
     // 额度重算的输入：所有工作负载「实测请求 × 副本」之和（稳态），以及最大一份
     // 单副本（滚动重叠：换版时新旧两个副本同时站着）。
     //
@@ -2136,10 +2122,6 @@ pub async fn round(
             reading.current.memory_request_bytes,
         )
     });
-    let mut steady_cpu: u64 = 0;
-    let mut steady_memory: u64 = 0;
-    let mut overlap_cpu: u64 = 0;
-    let mut overlap_memory: u64 = 0;
 
     let pods: Value =
         serde_json::from_str(&kubectl(&["get", "pods", "-n", ns, "-o", "json"]).await?)
@@ -2244,6 +2226,116 @@ pub async fn round(
     }
     let mut evaluated = 0usize;
     let mut patched = 0usize;
+    // 额度先按**上一拍实测下来的声明值**重算，再让这一拍去调；先抬闸、后调价，
+    // 否则同一拍里调出来的目标会被旧闸夹住，要等下一拍才生效。
+    //
+    // 输入是稳态：每个工作负载「声明值（＝上一拍的实测目标；没有声明的按 LimitRange
+    // 当下默认值）× 副本数」之和，加最大一份单副本作滚动重叠（换版时新旧两个副本
+    // 同时站着，Kubernetes 的滚动更新就是按这个算的）。只升不降，卡在节点可分配量。
+    {
+        let (fallback_cpu, fallback_mem) = default_requests.unwrap_or((0, 0));
+        let mut steady_cpu: u64 = 0;
+        let mut steady_memory: u64 = 0;
+        let mut overlap_cpu: u64 = 0;
+        let mut overlap_memory: u64 = 0;
+        for workload in &workloads {
+            let replicas = workload.replicas.unwrap_or(1).max(1) as u64;
+            let per_cpu: u64 = workload
+                .containers
+                .iter()
+                .map(|c| {
+                    c.declared
+                        .and_then(|d| d.cpu_request_millicores)
+                        .unwrap_or(fallback_cpu)
+                })
+                .sum();
+            let per_mem: u64 = workload
+                .containers
+                .iter()
+                .map(|c| {
+                    c.declared
+                        .and_then(|d| d.memory_request_bytes)
+                        .unwrap_or(fallback_mem)
+                })
+                .sum();
+            steady_cpu = steady_cpu.saturating_add(per_cpu.saturating_mul(replicas));
+            steady_memory = steady_memory.saturating_add(per_mem.saturating_mul(replicas));
+            overlap_cpu = overlap_cpu.max(per_cpu);
+            overlap_memory = overlap_memory.max(per_mem);
+        }
+        if let Some((hard, _used)) = quota_hard_and_used(ns).await {
+            let cap_cpu = node_allocatable(AllocatableUnit::Cpu).await;
+            let cap_mem = node_allocatable(AllocatableUnit::Memory).await;
+            let mut hard_patch = serde_json::Map::new();
+            if let Some(wanted) =
+                raised_ceiling(hard.cpu_request_millicores, steady_cpu, overlap_cpu, cap_cpu)
+            {
+                info!(
+                    namespace = %ns,
+                    from = hard.cpu_request_millicores,
+                    to = wanted,
+                    steady = steady_cpu,
+                    overlap = overlap_cpu,
+                    "workload resources: raising the namespace's request ceiling to the measured steady state plus one rollout overlap"
+                );
+                hard_patch.insert(
+                    "requests.cpu".to_string(),
+                    Value::String(format!("{wanted}m")),
+                );
+            }
+            if let Some(wanted) = raised_ceiling(
+                hard.memory_request_bytes,
+                steady_memory,
+                overlap_memory,
+                cap_mem,
+            ) {
+                hard_patch.insert(
+                    "requests.memory".to_string(),
+                    Value::String(format!("{wanted}")),
+                );
+            }
+            if !hard_patch.is_empty() {
+                let body = serde_json::json!({"spec": {"hard": Value::Object(hard_patch)}});
+                let body = body.to_string();
+                match kubectl(&[
+                    "patch",
+                    "resourcequota",
+                    QUOTA_NAME,
+                    "-n",
+                    ns,
+                    "--type",
+                    "merge",
+                    "-p",
+                    &body,
+                ])
+                .await
+                {
+                    Ok(_) => patched += 1,
+                    Err(e) => warn!(
+                        namespace = %ns,
+                        error = %e,
+                        "workload resources: the quota patch was refused; the ceiling keeps the value it had"
+                    ),
+                }
+            }
+        }
+    }
+    // 抬完闸再算这一拍还能抬多少：`hard − used`，读的是刚写下去的那一版。
+    // 量不到（没有配额对象或读失败）就不夹——但那是「量不到」，不是一个可以默认成
+    // 无穷大的数，所以同时留一条 warn。
+    let mut cpu_raise_budget: Option<u64> = None;
+    let mut memory_raise_budget: Option<u64> = None;
+    match quota_headroom(ns).await {
+        Some(headroom) => {
+            cpu_raise_budget = Some(headroom.cpu_request_millicores);
+            memory_raise_budget = Some(headroom.memory_request_bytes);
+        }
+        None => warn!(
+            namespace = %ns,
+            "workload resources: the namespace quota's headroom is unreadable; this pass does not cap its raises"
+        ),
+    }
+
     // 这一拍给每个声明了资源的容器算出的请求。默认层问的是同一份测量的
     // 另一个问题（见 `default_shape`），所以在下面那段循环里顺手收起来，
     // 不另读一次集群。
@@ -2428,35 +2520,6 @@ pub async fn round(
         // 抬价这一边也要花额度：闭环抬上去的请求先向这一拍剩下的余量借，借不到
         // 就停在放得下的地方。放在出 patch body 之前，是因为写下去的那一份就是
         // 准入随后记账的那一份——两处两个数时，Pod 会在重建时被自己的旧闸门拒掉。
-        // 这一段是「最大的一份装不装得下」要用的读数：按本拍抬过之后的值 × 副本数。
-        {
-            let replicas = workload.replicas.unwrap_or(1).max(1) as u64;
-            let (fallback_cpu, fallback_mem) = default_requests.unwrap_or((0, 0));
-            let total_cpu: u64 = workload
-                .containers
-                .iter()
-                .map(|c| {
-                    resolved
-                        .get(&c.name)
-                        .map(|t| t.cpu_request_millicores)
-                        .unwrap_or(fallback_cpu)
-                })
-                .sum();
-            let total_mem: u64 = workload
-                .containers
-                .iter()
-                .map(|c| {
-                    resolved
-                        .get(&c.name)
-                        .map(|t| t.memory_request_bytes)
-                        .unwrap_or(fallback_mem)
-                })
-                .sum();
-            steady_cpu = steady_cpu.saturating_add(total_cpu.saturating_mul(replicas));
-            steady_memory = steady_memory.saturating_add(total_mem.saturating_mul(replicas));
-            overlap_cpu = overlap_cpu.max(total_cpu);
-            overlap_memory = overlap_memory.max(total_mem);
-        }
         if let Some(budget) = cpu_raise_budget.as_mut() {
             for (name, targets) in changes.iter_mut() {
                 let Some(declared) = workload
@@ -2638,70 +2701,6 @@ pub async fn round(
             "no container usage was readable this round; resource targets were left as they were"
                 .to_string(),
         );
-    }
-
-    // 额度自己跟着实测涨：`used + 最大那一份`，只升不降，卡在节点可分配量下。
-    // 这一步放在最后：它读的是这一拍**已经写下去**的值，与准入随后看到的同一份。
-    if let (Some((hard, _used)), Some(cap_cpu)) = (
-        quota_hard_and_used(ns).await,
-        node_allocatable(AllocatableUnit::Cpu).await,
-    ) {
-        let mut hard_patch = serde_json::Map::new();
-        if let Some(wanted) = raised_ceiling(
-            hard.cpu_request_millicores,
-            steady_cpu,
-            overlap_cpu,
-            Some(cap_cpu),
-        ) {
-            info!(
-                namespace = %ns,
-                from = hard.cpu_request_millicores,
-                to = wanted,
-                steady = steady_cpu,
-                overlap = overlap_cpu,
-                "workload resources: raising the namespace's request ceiling to the measured steady state plus one rollout overlap"
-            );
-            hard_patch.insert(
-                "requests.cpu".to_string(),
-                Value::String(format!("{wanted}m")),
-            );
-        }
-        let cap_mem = node_allocatable(AllocatableUnit::Memory).await;
-        if let Some(wanted) = raised_ceiling(
-            hard.memory_request_bytes,
-            steady_memory,
-            overlap_memory,
-            cap_mem,
-        ) {
-            hard_patch.insert(
-                "requests.memory".to_string(),
-                Value::String(format!("{wanted}")),
-            );
-        }
-        if !hard_patch.is_empty() {
-            let body = serde_json::json!({"spec": {"hard": Value::Object(hard_patch)}});
-            let body = body.to_string();
-            match kubectl(&[
-                "patch",
-                "resourcequota",
-                QUOTA_NAME,
-                "-n",
-                ns,
-                "--type",
-                "merge",
-                "-p",
-                &body,
-            ])
-            .await
-            {
-                Ok(_) => patched += 1,
-                Err(e) => warn!(
-                    namespace = %ns,
-                    error = %e,
-                    "workload resources: the quota patch was refused; the ceiling keeps the value it had"
-                ),
-            }
-        }
     }
 
     Ok(RoundSummary { evaluated, patched })
