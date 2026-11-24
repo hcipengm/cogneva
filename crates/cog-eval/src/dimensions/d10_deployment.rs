@@ -123,10 +123,14 @@ mod tests {
         assert!(!p);
     }
 
+    /// 旧的契约在这一条上写的是 `(0.0, true)`——「没有读数」记成「通过」。
+    /// 契约改了：缺键是「没量到」，判不通过（这一条与上面的
+    /// `d10_missing_measurement_is_not_a_pass` 是同一个判据的两种输入形状：
+    /// 空对象与 Null）。
     #[test]
-    fn missing_measurement_is_placeholder() {
+    fn a_missing_measurement_is_not_a_placeholder_pass() {
         let result = mk_result_for_output(serde_json::Value::Null);
         let metric = EvalMetric::MttrPodCrash { threshold_ms: 5000 };
-        assert_eq!(compute(&metric, &mk_case(), &result), (0.0, true));
+        assert_eq!(compute(&metric, &mk_case(), &result), (0.0, false));
     }
 }
