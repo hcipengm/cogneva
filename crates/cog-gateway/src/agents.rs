@@ -800,6 +800,24 @@ pub async fn get_handler(
 /// answer goes to `reply_stream` rather than to this response. A name that
 /// resolves to no live agent anywhere is a 404, because queueing a command for
 /// a process that will never read it is indistinguishable from losing it.
+/// 这个收件箱此刻有没有读者：名册上有一条以它注册、心跳还没过期的行。
+///
+/// 名册缺席或读失败都返回 `Err`——「读不到」与「没有人读」是两件事，前者不能
+/// 被说成后者，否则一次库抖动就会把一条本来走得到的留言判成死信。
+async fn live_reader(
+    registry: Option<&Arc<dyn cog_core::AgentRegistry>>,
+    agent_id: &str,
+) -> Result<bool, String> {
+    let Some(registry) = registry else {
+        return Err("no agent registry is configured in this process".into());
+    };
+    match registry.get(agent_id).await {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 pub async fn send_message_handler(
     State(state): State<Arc<GatewayState>>,
     Path(agent_id): Path<String>,
@@ -897,6 +915,40 @@ pub async fn send_message_handler(
     // reader and the wait would run to its deadline with the answer already
     // on the wire.
     //
+    // 收件箱不是投递即送达：读者是「以这个 id 注册、并且正在跑」的那个进程。
+    // 没有一个在跑的读者时，202 的「已送达」是一句假话——这句话进队列后没有
+    // 任何一方会读它。这里在投递前问一次名册，答不出就不说送达。
+    match live_reader(state.agent_registry.as_ref(), &agent_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            let reason = "no live process is reading this inbox: the message would \
+                          sit in a queue nobody reads";
+            record_send(&state, &sent, SendOutcome::Refused, None, Some(reason)).await;
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "delivered": false,
+                    "agent_id": agent_id,
+                    "error": reason,
+                })),
+            )
+                .into_response();
+        }
+        Err(reason) => {
+            let reason = format!("cannot tell whether anyone is reading this inbox: {reason}");
+            record_send(&state, &sent, SendOutcome::Refused, None, Some(&reason)).await;
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "delivered": false,
+                    "agent_id": agent_id,
+                    "error": reason,
+                })),
+            )
+                .into_response();
+        }
+    }
+
     // Every prompt gets a stream, not only the ones this request waits for.
     // The answer is what the agent produced, and an agent that answers after
     // the request returned has still answered this question: without a stream
@@ -3208,5 +3260,80 @@ mod role_of_record_tests {
 
         let live = registration("squad:task-1-generator", "planner");
         assert_eq!(role_of_record(&seat, &[live]), "planner");
+    }
+}
+
+#[cfg(test)]
+mod live_reader_tests {
+    use super::live_reader;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    struct ReaderRegistry {
+        row: Option<cog_core::AgentRegistration>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl cog_core::AgentRegistry for ReaderRegistry {
+        async fn register(&self, _r: &cog_core::AgentRegistration) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+        async fn heartbeat(&self, _id: &str) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+        async fn deregister(&self, _id: &str) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+        async fn get(&self, _id: &str) -> cog_core::SFResult<Option<cog_core::AgentRegistration>> {
+            if self.fail {
+                return Err(cog_core::SFError::Agent("boom".into()));
+            }
+            Ok(self.row.clone())
+        }
+        async fn list(&self) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
+            unimplemented!()
+        }
+        async fn list_by_role(
+            &self,
+            _role: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
+            unimplemented!()
+        }
+    }
+
+    fn registration() -> cog_core::AgentRegistration {
+        cog_core::AgentRegistration::new(
+            "employee:1",
+            "host",
+            "127.0.0.1",
+            "employee",
+            "default",
+            cog_core::ResourceInfo::default(),
+        )
+    }
+
+    /// 有在跑的行才是读者；没有行是「没人读」；读不到不能读成「没人读」；
+    /// 名册缺席也不能。
+    #[tokio::test]
+    async fn only_a_live_registration_counts_as_a_reader() {
+        let live: Arc<dyn cog_core::AgentRegistry> = Arc::new(ReaderRegistry {
+            row: Some(registration()),
+            fail: false,
+        });
+        assert_eq!(live_reader(Some(&live), "employee:1").await, Ok(true));
+
+        let idle: Arc<dyn cog_core::AgentRegistry> = Arc::new(ReaderRegistry {
+            row: None,
+            fail: false,
+        });
+        assert_eq!(live_reader(Some(&idle), "employee:1").await, Ok(false));
+
+        let broken: Arc<dyn cog_core::AgentRegistry> = Arc::new(ReaderRegistry {
+            row: None,
+            fail: true,
+        });
+        assert!(live_reader(Some(&broken), "employee:1").await.is_err());
+        assert!(live_reader(None, "employee:1").await.is_err());
     }
 }
