@@ -40,7 +40,13 @@ data:
   # 向量后端的地址直接由代码读 QDRANT_URL；没有第二个 provider 开关要同步。
   QDRANT_URL: {{ printf "http://qdrant.%s.svc.cluster.local:%d" (include "cogneva.namespace" .) (int .Values.backends.qdrant.grpcPort) | quote }}
   COGNEVA_MEDIA_PROVIDER: {{ $doc.providers.media.provider | quote }}
-  COGNEVA_STORAGE_PROVIDER: "local-fs"
+  {{- /* 存储的 provider 只有 `files/cogneva.json` 一处声明：那份文件里
+         `providers.storage.provider` 是 `seaweedfs`，而 seaweedfs 段默认 `enabled: true`
+         就是照着它开的。这里曾经写死 `"local-fs"`，于是同一个 provider 在树上有了两个
+         声明，且 env 层按 `files/cogneva.json` 的 env→配置路径映射盖住那份文件——
+         集群里跑着 SeaweedFS，进程读到的却是本地文件系统，Raw 层与冷层写去卷上而不是
+         桶里。两处相等不等于一处在说：改一处、另一处沉默地盖回去。 */}}
+  COGNEVA_STORAGE_PROVIDER: {{ $doc.providers.storage.provider | quote }}
 
   COGNEVA_WORKSPACE_ID: {{ $doc.dag_executor.workspace_id | quote }}
   # 每个用户工作区的字节上限。这里**不写默认值**：网关自己有同一条界（它的

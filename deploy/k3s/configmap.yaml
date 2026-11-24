@@ -35,8 +35,11 @@ data:
   # Media provider (local-sfu / trtc)
   COGNEVA_MEDIA_PROVIDER: "local-sfu"
 
-  # Storage provider (local-fs / cos)
-  COGNEVA_STORAGE_PROVIDER: "local-fs"
+  # Storage provider：与 `deploy/helm/cogneva/files/cogneva.json` 的
+  # `providers.storage.provider` 同值——那一处是唯一声明，这里只是把它摆到 env 层。
+  # 曾经写死 `local-fs`，env 映射优先级高于 json，于是集群里开着 SeaweedFS、进程却
+  # 写本地卷：两处声明差一个值，读的人看不出哪一处是死的。
+  COGNEVA_STORAGE_PROVIDER: "seaweedfs"
 
   # Redis URL 由 cogneva.json 的 dag_executor.redis_url 给出（含 ${REDIS_PASSWORD}
   # 插值占位），不在此明文配置；env 映射优先级高于 json，置在这里会盖掉认证。
