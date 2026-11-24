@@ -142,6 +142,35 @@ fn fingerprint() -> Option<String> {
 /// 写回时两边都写：会话那一行让同一段对话接着是这个人，身份那一行让他的下一段
 /// 对话也是这个人。没有第二句，「同一个人开两段对话就是两个人」这个病会从另一
 /// 个门原样回来。
+/// 会话 id 的派生前缀：员工页点谁，就用谁的 id 算出这一段会话。
+///
+/// WebUI 那一侧用同一个前缀算 id；后端只认这一个前缀，不另收一个「我在跟谁
+/// 说话」的客户端字段。同一个人从主对话入口和员工页入口进来，落到同一个
+/// `agent:<员工 id>` 上，历史因此是同一段。
+const SESSION_FOR_AGENT_PREFIX: &str = "agent:";
+
+fn session_for_employee(agent_id: &str) -> String {
+    format!("{SESSION_FOR_AGENT_PREFIX}{agent_id}")
+}
+
+fn session_target(session_id: &str) -> Option<&str> {
+    session_id
+        .strip_prefix(SESSION_FOR_AGENT_PREFIX)
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+}
+
+/// 被点名的那个员工：id 就是名册上的 id，显示名先用 id，名册行会覆盖它。
+fn employee_for_target(agent_id: &str) -> cog_agent::identity::AgentName {
+    cog_agent::identity::AgentName {
+        persona: agent_id.to_string(),
+        short: String::new(),
+        handle: agent_id.to_string(),
+        id: agent_id.to_string(),
+        stable: true,
+    }
+}
+
 async fn bound_employee(
     kv: &Arc<dyn cog_core::KeyValueStore>,
     fingerprint: Option<&str>,
@@ -157,6 +186,21 @@ async fn bound_employee(
         stable: row.stable,
     };
 
+    // 这一段会话已经钉了人：会话绑定先于属主，员工页点谁就以谁为准。
+    if let Some(row) = cog_gateway::agents::read_bound_session(&**kv, session_id).await {
+        let employee = as_name(row);
+        // 这个属主从前没有绑定：把他记下来，下一段普通会话才认得回同一个人。
+        bind_user(kv, owner, &employee).await;
+        return employee;
+    }
+    // 员工页点出来的会话：id 本身就是「跟谁说话」。没有绑定就按 id 钉住，
+    // 第一轮之后上面那条会话绑定就会接住它。
+    if let Some(target) = session_target(session_id) {
+        let employee = employee_for_target(target);
+        bind_session(kv, session_id, &employee).await;
+        bind_user(kv, owner, &employee).await;
+        return employee;
+    }
     if let Some(owner) = owner {
         if let Some(row) = cog_gateway::agents::read_bound_user(&**kv, owner).await {
             let employee = as_name(row);
@@ -165,13 +209,6 @@ async fn bound_employee(
             bind_session(kv, session_id, &employee).await;
             return employee;
         }
-    }
-    if let Some(row) = cog_gateway::agents::read_bound_session(&**kv, session_id).await {
-        let employee = as_name(row);
-        // 这一段对话的人已经有了，而这个属主从前没有绑定：把他记下来，下一段
-        // 会话才认得回同一个人。
-        bind_user(kv, owner, &employee).await;
-        return employee;
     }
     // 老会话：名册行上的 id 与名字就是它的人，按那一行认，不再重算。
     let existing = cog_gateway::agents::person_for_session(kv, session_id).await;
@@ -5491,5 +5528,32 @@ mod chat_intent_row_tests {
         assert_eq!(a.identity, b.identity);
         assert_ne!(a.identity, c.identity);
         assert_ne!(a.identity, d.identity);
+    }
+}
+
+#[cfg(test)]
+mod session_for_employee_tests {
+    use super::{employee_for_target, session_for_employee, session_target};
+
+    /// 员工页的会话 id 由员工 id 派生：同一员工永远同一段，换员工才换会话。
+    #[test]
+    fn the_session_id_is_derived_from_the_employee_id() {
+        let session = session_for_employee("employee:1");
+        assert_eq!(session, "agent:employee:1");
+        assert_eq!(session_target(&session), Some("employee:1"));
+        assert_eq!(session_for_employee("employee:1"), session);
+        assert_ne!(
+            session_for_employee("employee:1"),
+            session_for_employee("employee:2")
+        );
+        assert_eq!(session_target("随机会话"), None);
+    }
+
+    /// 目标会话钉住的就是被点名的那个员工，不是属主的默认员工。
+    #[test]
+    fn a_target_employee_keeps_the_id_it_was_addressed_by() {
+        let employee = employee_for_target("employee:1");
+        assert_eq!(employee.id, "employee:1");
+        assert_eq!(employee.handle, "employee:1");
     }
 }
