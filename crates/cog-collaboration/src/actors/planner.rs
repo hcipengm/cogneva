@@ -254,7 +254,9 @@ impl PlannerActor {
         // 还没派生的意图随这一次请求一起进去：它们是意图这一侧的输入，而「哪几条只是
         // 回答、哪几条是活」正由这一次调用一并判。读不到就说出来——把读失败读成「没有
         // 意图」，会让每一次计划都在没有输入的情况下启动。
-        if let Some(reader) = self.intent_reader.as_ref() {
+        // 收件台只给**意图那一批**的 planner 调用读：普通目标的那一跑看见别人的话，
+        // 会把无关的意图塞进这一份计划（2026-11-24 合流后的口径）。
+        if let Some(reader) = self.intent_reader.as_ref().filter(|_| task.is_chat_intent_batch()) {
             match reader.undispatched(i64::MAX).await {
                 Ok(rows) if !rows.is_empty() => {
                     let list: Vec<serde_json::Value> = rows

@@ -1401,6 +1401,20 @@ impl Task {
     /// input under `input` and the evaluator omits it — so a predicate that
     /// inspects the built context silently never matches, and change generation
     /// degrades into ordinary narrative output.
+    /// 这一跑是不是「把收件台上的意图变成工作」的那一批。
+    ///
+    /// 收件台只能有**一个**读它并处置它的角色：两个读者各接一次时，同一句话会
+    /// 被两边各派一次活（2026-11-24 合流时撞到）。所以 planner 只在跑这一类任务
+    /// 时把未派生的意图读进请求——普通目标的那一跑不该看见别人说的话。
+    pub fn is_chat_intent_batch(&self) -> bool {
+        matches!(&self.task_type, TaskType::Custom(s) if s == CHAT_INTENT_TASK_KIND)
+            || self
+                .input
+                .get(INPUT_TASK_KIND)
+                .and_then(|v| v.as_str())
+                == Some(CHAT_INTENT_TASK_KIND)
+    }
+
     pub fn is_self_evolution(&self) -> bool {
         matches!(&self.task_type, TaskType::Custom(s) if s == "self_evolution")
             || self
@@ -1640,6 +1654,26 @@ mod tests {
     /// 那个常量；两处各写一个 3、一个 300 的那一版，改一边另一边不会红。
     /// 入口把三格挂上行：键是同一个名字，读它的人按那个名字取。
     #[test]
+    /// 只有「意图那一批」的任务算这一类：普通目标带着 `task_kind` 的旧写法也算，
+    /// 而 `self_evolution` 不算——两族各读各的输入。
+    #[test]
+    fn only_the_intent_batch_reads_the_receipt_desk() {
+        let batch = Task::new(
+            "t1",
+            TaskType::Custom(CHAT_INTENT_TASK_KIND.into()),
+            serde_json::json!({}),
+        );
+        assert!(batch.is_chat_intent_batch());
+        let by_input = Task::new(
+            "t2",
+            TaskType::Custom("dag_node".into()),
+            serde_json::json!({ INPUT_TASK_KIND: CHAT_INTENT_TASK_KIND }),
+        );
+        assert!(by_input.is_chat_intent_batch());
+        let goal = Task::new("t3", TaskType::Custom("dag_node".into()), serde_json::json!({}));
+        assert!(!goal.is_chat_intent_batch());
+    }
+
     fn a_task_can_carry_its_ledger_item() {
         use crate::contract::ledger_item::{LedgerItem, LedgerState, ITEM_INPUT_KEY};
         let item = LedgerItem {
