@@ -39,6 +39,11 @@ case_dir() { # case_dir <名字> -> 打印一份可以随便改的树根
     local d="${work}/$1"
     mkdir -p "${d}"
     cp -a "${repo}/deploy" "${d}/deploy"
+    # 渲染产物不进仓，CI 里真树没有它：先让副本自带一棵，后面的用例才有对象可以
+    # 摆成「静态清单落后于渲染产物」。摘要按树内相对路径算，副本与真树同值，
+    # 生成一次之后 --check 不会再重渲（重渲会把夹具覆盖掉）。
+    bash "${d}/deploy/scripts/lib/rendered-cache.sh" --ensure "${d}" >/dev/null 2>&1 \
+        || { echo "case_dir: 副本的渲染产物生成失败：${d}" >&2; exit 1; }
     printf '%s' "${d}"
 }
 

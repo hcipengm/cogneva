@@ -19,7 +19,7 @@
 
 use crate::common;
 
-use common::routes::repo_root;
+use common::routes::{rendered_root, repo_root};
 
 use std::path::{Path, PathBuf};
 
@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 /// file while the rest kept passing — the same second declaration these tests
 /// exist to catch, one level up. Empty is a failure, not an empty pass.
 fn rendered_profiles() -> Vec<String> {
-    let dir = repo_root().join("deploy/rendered");
+    let dir = rendered_root();
     let mut out: Vec<String> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("{} 读不到：{e}", dir.display()))
         .map(|entry| entry.expect("目录项可读").path())
@@ -55,9 +55,7 @@ fn rendered_profiles() -> Vec<String> {
 fn main_app_mounts() -> Vec<String> {
     let mut out = Vec::new();
     for profile in rendered_profiles() {
-        let path = repo_root().join(format!(
-            "deploy/rendered/{profile}/41-deployment-cogneva.yaml"
-        ));
+        let path = rendered_root().join(format!("{profile}/41-deployment-cogneva.yaml"));
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("{} 读不到：{e}", path.display()));
         let mut found = 0;

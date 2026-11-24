@@ -17,7 +17,7 @@
 use crate::common;
 
 use cogneva::backup::{SubdirClass, DATA_ROOT_SUBDIRS};
-use common::routes::{repo_root, walk};
+use common::routes::{rendered_root, repo_root, walk};
 use common::rust_production::production_text_keeping_comments;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -333,11 +333,7 @@ fn census(root: &Path, mount: &str) -> BTreeMap<String, String> {
         }
     }
     let mut rendered = Vec::new();
-    walk(
-        &root.join("deploy/rendered"),
-        &["yaml", "yml"],
-        &mut rendered,
-    );
+    walk(&rendered_root(), &["yaml", "yml"], &mut rendered);
     for path in rendered {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;

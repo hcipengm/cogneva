@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # principle: feedback_a_new_rule_lands_in_three_places_and_the_render_freshness_gate_names_the_one_you_forgot
-# render-deploy.sh --check 的定向测试。
+# render-deploy.sh --out 的定向测试。
 #
-# 为什么要有这份测试：这条命令是**判定管线里的准入条件**——触及 deploy/** 的变更要
-# 落在树上之前，部署声明（self_evolution.deploy_admission）会跑它，退出码非零才拒收。
-# 准入条件最坏的形状是「看着在判、实际永远绿」：脚本还在、输出还像样、退出码恒 0，
-# 于是每次拓扑变更都被放行，却没有任何东西被检查过。所以这条门禁必须自己证明它会红：
-# 在一个**人为造的漂移**上退出非零，并且报出的正是那一处漂移。
+# 这条命令是渲染产物的**唯一**入口：产物不进仓，读者（引导器构建、契约测试、部署
+# 门、集群内落地端、回滚）在读的那一刻调它现场生成。所以它必须证明三件事：
+#   1. 它真的写出了一整棵（每个 profile 都有清单），而且**一个字节都不改树**——
+#      仓库里的渲染链是只读的，否则读者会互相踩，或者把「读过一次」变成一次提交；
+#   2. 同样输入渲两遍字节相同——读者拿到的产物不随「谁先跑到」变；
+#   3. 解析不了的产物直接拒绝写出（重复键、超 15 字符的端口名）。这两条在
+#      `deploy/rendered` 还进仓时由新鲜度门顺带守着，现在写出点是唯一的守卫。
 #
-# 每个用例都在真树的一份副本上跑（脚本按自身位置算 REPO_ROOT，副本自成一体）：
-#   1. 原样副本 -> 绿，并报出 RENDER FRESHNESS OK（空跑也是绿的，所以要看到读数）；
-#   2. 渲染产物改一个字段 -> 红，diff 里正是那个字段；
-#   3. chart 侧改一个值、产物没重渲染 -> 红（反向漂移同样要被看见）。
+# 旧的 `--check`（重渲染后与已提交产物 diff）随产物一起退场：没有已提交的产物，
+# 就没有「新鲜」这件事可言。这一个用例断言它真的不在了——留一个只判半边的开关，
+# 下一个人会以为产物还在被比对。
+#
+# 每个用例都在真树 deploy/ 的一份副本上跑（脚本按自身位置算 REPO_ROOT）。
 #
 # 用法：bash deploy/scripts/tests/render-freshness.test.sh
 set -euo pipefail
@@ -24,12 +27,15 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 for bin in helm python3; do
   command -v "${bin}" >/dev/null || { echo "缺少依赖：${bin}" >&2; exit 2; }
 done
+python3 -c 'import yaml' 2>/dev/null || {
+  echo "缺少依赖：python3-yaml" >&2
+  exit 2
+}
 
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
 
-# 基线是**真树的 deploy/**：门禁只读 chart、profiles 与 rendered 三处，复制别的目录
-# 只会让「只改了一处」这件事变得难以相信。
+# 基线是**真树的 deploy/**：门只读 chart、profiles 与 scripts 三处。
 case_dir() { # case_dir <名字> -> 打印一份可以随便改的树根
   local d="${work}/$1"
   mkdir -p "${d}"
@@ -37,9 +43,13 @@ case_dir() { # case_dir <名字> -> 打印一份可以随便改的树根
   printf '%s' "${d}"
 }
 
-run() { # run <树根> -> 打印合并输出，回传退出码
+tree_digest() { # tree_digest <树根> -> deploy/ 下每个文件的路径与内容摘要
+  ( cd "$1" && find deploy -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}' )
+}
+
+render_out() { # render_out <树根> <输出目录> -> 合并输出，回传退出码
   local out
-  if out="$(bash "$1/${gate_rel}" --check 2>&1)"; then
+  if out="$(bash "$1/${gate_rel}" --out "$2" 2>&1)"; then
     printf '%s\n' "${out}"; return 0
   else
     printf '%s\n' "${out}"; return 1
@@ -59,45 +69,43 @@ open(path, "w", encoding="utf-8").write(text.replace(old, new, 1))
 PY
 }
 
-# 用例 1：真树副本必须绿，且给出读数。
+# 用例 1：真树副本渲出一整棵，且树一个字节都没变。
 d="$(case_dir copy)"
-if out="$(run "${d}")"; then
-  grep -q 'RENDER FRESHNESS OK' <<<"${out}" \
-    || fail "绿的副本没有给出 RENDER FRESHNESS OK 读数：${out}"
-else
-  fail "真树副本本身就是漂移的（基线先红了，后面的用例都不成立）：${out}"
+before="$(tree_digest "${d}")"
+if ! out="$(render_out "${d}" "${work}/out-1")"; then
+  fail "真树副本渲染失败（基线先红了，后面的用例都不成立）：${out}"
 fi
+after="$(tree_digest "${d}")"
+[ "${before}" = "${after}" ] \
+  || fail "--out 改了树：渲染输入被写回仓，读者之间会互相踩（差在 deploy/ 下，逐文件比对）"
+profiles="$(find "${d}/deploy/helm/cogneva/profiles" -maxdepth 1 -name '*.yaml' -type f | wc -l)"
+[ "${profiles}" -gt 0 ] || fail "chart 里一个 profile 都没有，这个用例没有题目"
+for p in "${d}/deploy/helm/cogneva/profiles"/*.yaml; do
+  name="$(basename "$p" .yaml)"
+  count="$(find "${work}/out-1/${name}" -maxdepth 1 -name '*.yaml' -type f 2>/dev/null | wc -l || true)"
+  [ "${count}" -gt 0 ] || fail "${name} 渲染后一个清单都没有（空目录读作「本来就没有东西」）"
+done
 
-# 用例 2：产物被改一个字段 -> 红，且 diff 里正是那个字段。
-d="$(case_dir rendered-drift)"
-edit_once "${d}/deploy/rendered/k3s-single/10-configmap-cogneva-json.yaml" \
-  '"pg_max_connections": 16' '"pg_max_connections": 20'
-if out="$(run "${d}")"; then
-  fail "渲染产物被改了一个字段，--check 仍然绿（准入条件永远不会红）：${out}"
+# 用例 2：同样输入渲两遍，字节相同。
+if ! render_out "${d}" "${work}/out-2" >/dev/null; then
+  fail "第二次渲染失败：${d}"
 fi
-grep -q 'pg_max_connections' <<<"${out}" \
-  || fail "红了，但没报出被改的那一处：${out}"
+diff -r "${work}/out-1" "${work}/out-2" >/dev/null \
+  || fail "两次渲染的字节不同：读者拿到的产物随「谁先跑到」变"
 
-# 用例 3：chart 侧改了值、产物没重渲染 -> 红（这条命令存在的理由）。
-# 改的是 profile 而不是 values.yaml：同一项在两边都写着，profile 覆盖 values，
-# 只动 values 那一份渲染结果不变——那是一条**空变异**，用例会假绿。
-d="$(case_dir chart-drift)"
-edit_once "${d}/deploy/helm/cogneva/profiles/k3s-single.yaml" \
-  'hostPath: /usr/local/bin/helm' 'hostPath: /usr/local/bin/helm-probe'
-if out="$(run "${d}")"; then
-  fail "chart 改了值而产物没重渲染，--check 仍然绿：${out}"
+# 用例 3：`--check` 不在了（产物不提交，没有可比的另一边）。
+if out="$(bash "${d}/${gate_rel}" --check 2>&1)"; then
+  fail "--check 还在且绿着：新鲜度门已经随产物退场，它不该继续存在：${out}"
 fi
-grep -q 'helm-probe' <<<"${out}" \
-  || fail "红了，但没报出 chart 侧的那处改动：${out}"
+grep -q 'usage' <<<"${out}" || fail "拒绝 --check 时没说它是用法错：${out}"
 
 # 用例 4：模板里写重了一个键 -> 渲染直接拒绝写产物。
 #
-# 为什么这一条在「新鲜度」的测试里：重复键的产物**能渲染出来也能提交上去**，
-# 它不违反新鲜度——chart 和 rendered 完全一致。它违反的是「产物能被解析」，
-# 而这两件事共用同一个写出点。真实故障：一份 NetworkPolicy 的 metadata.labels
-# 先由 chart 助手写了 app.kubernetes.io/name，模板里又手写了一遍，helm template
-# 成功、文件写进了树，等到 API server 与部署器的清单读取器解析时才被整份拒绝，
-# 装机和 4 条部署器测试同时红。所以写出点自己先把每份文档解析一遍。
+# 重复键的产物**能渲染出来也能提交上去**；它违反的是「产物能被解析」。真实故障：
+# 一份 NetworkPolicy 的 metadata.labels 先由 chart 助手写了 app.kubernetes.io/name，
+# 模板里又手写了一遍，helm template 成功、文件写进了树，等到 API server 与部署器的
+# 清单读取器解析时才被整份拒绝，装机和 4 条部署器测试同时红。写出点自己先把每份
+# 文档解析一遍——现在这是唯一的守卫。
 d="$(case_dir duplicate-key)"
 edit_once "${d}/deploy/helm/cogneva/templates/network-policy.yaml" \
   '  name: crawl4ai-ingress
@@ -113,9 +121,7 @@ edit_once "${d}/deploy/helm/cogneva/templates/network-policy.yaml" \
     app.kubernetes.io/name: crawl4ai
     app.kubernetes.io/component: fetch
 '
-# 写这一遍要重算额度，而额度里的节点数在真机上取自 live cluster；这份用例是一棵
-# 没有集群的副本，按脚本给离线渲染留的口子显式给拓扑（与 CI 上重渲染同一条件）。
-if out="$(COGNEVA_NODES=1 bash "${d}/${gate_rel}" 2>&1)"; then
+if out="$(render_out "${d}" "${work}/out-dup" 2>&1)"; then
   fail "模板里写重了键，渲染仍然写出了产物（解析不了的清单会一直被提交）：${out}"
 fi
 grep -q "duplicate key 'app.kubernetes.io/name'" <<<"${out}" \
@@ -123,49 +129,18 @@ grep -q "duplicate key 'app.kubernetes.io/name'" <<<"${out}" \
 
 # 用例 5：容器端口名超过 15 字符 -> 渲染直接拒绝写产物。
 #
-# 名字的合法性是 API server 的判据：`postgres-metrics` 有 16 个字符，yaml 层面
-# 完全合法，CI 也全绿，直到部署器把这批清单 apply 上去时整份 StatefulSet 被拒
-# ——落地通道为此停了 12 小时。所以写出点把 API server 会拒的形状先判一遍。
+# `postgres-metrics` 有 16 个字符，yaml 层面完全合法，CI 也全绿，直到部署器把这批
+# 清单 apply 上去时整份 StatefulSet 被拒——落地通道为此停了 12 小时。
 d="$(case_dir long-port-name)"
 edit_once "${d}/deploy/helm/cogneva/templates/postgres.yaml" \
   '            - name: pg-metrics
 ' \
   '            - name: postgres-metrics
 '
-if out="$(COGNEVA_NODES=1 bash "${d}/${gate_rel}" 2>&1)"; then
+if out="$(render_out "${d}" "${work}/out-port" 2>&1)"; then
   fail "端口名超过 15 字符，渲染仍然写出了产物（apply 会整份拒掉）：${out}"
 fi
 grep -q "超过 15 的上限" <<<"${out}" \
   || fail "红了，但没报出超长的是哪个端口：${out}"
 
-# 用例 6：多出一个 profile 文件而没人渲染它 -> 红。
-#
-# profile 的集合是目录里的文件，不是脚本里的一份名单。名单时代，新增的 profile 连
-# 「该渲染它」都不知道：产物不出现、新鲜度不判、下游按目录读 profile 的门也看不见它，
-# 而三处都读作「本来就没有这个 profile」。
-d="$(case_dir new-profile)"
-cp "${d}/deploy/helm/cogneva/profiles/k3s-single.yaml" \
-  "${d}/deploy/helm/cogneva/profiles/k3s-airgap.yaml"
-# 额度投影也一并备好：没有它的新 profile 连渲染都过不去（那是另一条判据：
-# 「额度是投影出来的，不写在 values 里」），而这里要验的是「渲了却没有产物」。
-cp "${d}/deploy/helm/cogneva/values.resource-governance.k3s-single.yaml" \
-  "${d}/deploy/helm/cogneva/values.resource-governance.k3s-airgap.yaml"
-if out="$(run "${d}")"; then
-  fail "新增的 profile 没被渲染，--check 仍然绿（它从此不在任何一条判据里）：${out}"
-fi
-grep -q 'k3s-airgap' <<<"${out}" \
-  || fail "红了，但没点名那个新增的 profile：${out}"
-
-# 用例 7：profile 删了而产物留在树里 -> 红。
-#
-# 反向的漂移同样看不见：新鲜度只问「每个 profile 都有产物」。那棵没有 profile 的树
-# 会一直被提交，还会被下游按目录读 profile 的门当成一条真的投递路径去判。
-d="$(case_dir stray-tree)"
-rm "${d}/deploy/helm/cogneva/profiles/k8s-standard.yaml"
-if out="$(run "${d}")"; then
-  fail "没有 profile 的产物树仍在树里，--check 仍然绿：${out}"
-fi
-grep -q 'deploy/rendered/k8s-standard' <<<"${out}" \
-  || fail "红了，但没点名那棵没有出处的树：${out}"
-
-echo "OK: render freshness 门禁在两种漂移上都红，在干净树上绿；模板写重键、端口名超长时渲染拒绝写出；profile 集合从目录读（新增的没渲染红、删了 profile 的产物树也红）"
+echo "OK: --out 写出每个 profile 的整棵、不改树、两次渲染字节相同；--check 已退场；模板写重键与超长端口名时渲染拒绝写出"

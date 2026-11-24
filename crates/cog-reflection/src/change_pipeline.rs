@@ -252,8 +252,8 @@ const CI_GATE_LAUNCHERS: &[&str] = &["bash", "sh", "python3", "python", "node"];
 /// 厂商名平等、README 的 trait 成员）。
 const CI_GATE_SCRIPT_MARKER: &str = "scripts/check-";
 
-/// 「只判不写」的调用旗标。`render-deploy.sh --check` 这类脚本名里没有 `check-`，
-/// 可它跑起来做的正是同一件事：把树渲染一遍，与提交的那份比。
+/// 「只判不写」的调用旗标。`sync-static-manifests.sh --check` 这类脚本名里没有
+/// `check-`，可它跑起来做的正是同一件事：把树里的东西与源比一遍，红了也不写。
 const CI_GATE_JUDGE_FLAG: &str = "--check";
 
 /// 一条变更上不受节拍约束的那几段活能有多长——一个心跳到下一个心跳之间最长的
@@ -8803,8 +8803,8 @@ index 1111111..2222222 100644
                 "        run: bash deploy/scripts/check-one.sh\n",
                 "      - name: a gate that lives outside deploy\n",
                 "        run: bash .github/scripts/check-three.sh\n",
-                "      - name: judge the rendered manifests\n",
-                "        run: bash deploy/scripts/render-deploy.sh --check\n",
+                "      - name: judge the static manifests\n",
+                "        run: bash deploy/scripts/sync-static-manifests.sh --check\n",
                 "      - name: with an argument\n",
                 "        run: bash deploy/scripts/check-four.sh \"${range}\"\n",
                 "      - name: a test, not a judgement\n",
@@ -8827,7 +8827,7 @@ index 1111111..2222222 100644
                 ("python3 deploy/scripts/check-two.py".to_string(), false),
                 ("bash .github/scripts/check-three.sh".to_string(), false),
                 (
-                    "bash deploy/scripts/render-deploy.sh --check".to_string(),
+                    "bash deploy/scripts/sync-static-manifests.sh --check".to_string(),
                     false
                 ),
                 (

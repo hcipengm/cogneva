@@ -11,9 +11,9 @@
 #
 # So this script owns the copies: `--check` fails when any carrier is not
 # byte-identical to its source, and the gate runs it in that mode. The edit goes
-# into `prompts/`, then `sync-prompts.sh` writes the carriers, then
-# `render-deploy.sh` refreshes `deploy/rendered/` (those are build products of
-# the k3s/Helm manifests, not of this script).
+# into `prompts/`, then `sync-prompts.sh` writes the carriers; readers
+# regenerate `deploy/rendered/` on demand (those are build products of the
+# k3s/Helm manifests, not of this script, and they are not committed).
 #
 #   sync-prompts.sh            write the carriers from the sources
 #   sync-prompts.sh --check    report drift, exit 1, write nothing

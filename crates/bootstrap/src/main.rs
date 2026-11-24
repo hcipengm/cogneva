@@ -1796,8 +1796,9 @@ async fn ensure_default_storage_class() -> Result<()> {
 ///
 /// 声明的那个名字从**渲染产物**里读，不在这里另抄一份常量——同一份事实两处声明会
 /// 各自漂，而这条门只在「清单说的」与「集群有的」对不上时才有话说。两个投递路径
-/// 交付的是同一份声明（apply 读渲染目录、helm 读同一 profile 的 values），渲染产物
-/// 与 profile 的一致性由 CI 的 render 新鲜度门禁与 deploy parity 两者守着。
+/// 交付的是同一份声明（apply 读渲染目录、helm 读同一 profile 的 values），而渲染目录
+/// 由 chart/profile 在读取时生成，两者同源；CI 的 deploy parity 再判静态清单没有偏离
+/// 这份生成结果。
 ///
 /// 为什么必须报错而不是警告：声明了集群没有的 class，ingress 就没有任何控制器认领
 /// ——对象照样 apply 成功、Pod 照样 Running、`kubectl get ingress` 也照样打得出来，
@@ -3130,10 +3131,9 @@ fn rendered_object_ids(text: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// helm 客户端版本的唯一权威源。安装期按它下载 helm，CI 的部署 parity /
-/// 渲染新鲜度门禁也按它装同一个版本——那两处门禁是**字节级**比对渲染产物的，
-/// 而不同 helm 版本渲染块标量的尾随空白不同，放任 CI 自行取版本会让门禁在
-/// 与代码无关的地方红。
+/// helm 客户端版本的唯一权威源。安装期按它下载 helm，CI 的部署 parity 与渲染产物
+/// 门禁也按它装同一个版本——它们从 chart 现场渲染再比对清单，而不同 helm 版本渲染
+/// 块标量的尾随空白不同，放任 CI 自行取版本会让门禁在与代码无关的地方红。
 const HELM_VERSION: &str = "v4.2.4";
 
 /// 确保 helm 客户端可用。仅在"复用既有集群、绿地部署、需要 helm 投递"时调用——
@@ -4582,7 +4582,7 @@ mod home_dir_tests {
 #[cfg(test)]
 mod namespace_tests {
     use super::*;
-    use crate::checkout::repo_root;
+    use crate::checkout::{rendered_root, repo_root};
 
     fn tree() -> std::path::PathBuf {
         repo_root()
@@ -4598,7 +4598,8 @@ mod namespace_tests {
     fn every_rendered_profile_delivers_the_declared_namespace() {
         let declared = declared_namespace_in(&tree()).unwrap();
         assert!(!declared.trim().is_empty(), "声明的命名空间是空串");
-        let root = tree().join("deploy/rendered");
+        // 预渲染目录不提交：读之前现场生成。
+        let root = rendered_root();
         let mut checked = 0;
         let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&root)
             .unwrap_or_else(|e| panic!("{}: {e}", root.display()))
@@ -4701,7 +4702,7 @@ mod namespace_tests {
 #[cfg(test)]
 mod profile_tests {
     use super::Profile;
-    use crate::checkout::repo_root;
+    use crate::checkout::{rendered_root, repo_root};
 
     /// 名字的判据不在这里手抄一份：从磁盘上把 renderer 真正产出的三处读出来，
     /// 与代码里那一份比较。改 profile 文件、改渲染目录、改 render-deploy.sh 的
@@ -4730,7 +4731,7 @@ mod profile_tests {
             "Helm profile 文件名与代码里的名字不一致"
         );
 
-        let rendered = root.join("deploy/rendered");
+        let rendered = rendered_root();
         let mut on_rendered: Vec<String> = std::fs::read_dir(&rendered)
             .unwrap_or_else(|e| panic!("{}: {e}", rendered.display()))
             .filter_map(|entry| {
@@ -4744,7 +4745,7 @@ mod profile_tests {
         on_rendered.sort_unstable();
         assert_eq!(
             on_rendered, declared,
-            "预渲染目录名与代码里的名字不一致：提交前先跑 deploy/scripts/render-deploy.sh"
+            "渲染目录名与代码里的名字不一致：目录是按 chart 的 profile 现场生成的，差的那一个就是代码里多写或漏写的名字"
         );
 
         // 脚本的 profile 集合现在是从目录里读出来的，所以这里判的不是「两份名单一样」，
@@ -4775,7 +4776,7 @@ mod profile_tests {
             assignment("PROFILES"),
             "()",
             "render-deploy.sh 的 PROFILES 又变回一份写死的名单了：新加的 profile 不会渲染、\
-             不会有产物树、也没人判它的新鲜度，而这一切读起来都只是「这个 profile 不存在」"
+             不会有产物树、也没有任何判据去读它，而这一切读起来都只是「这个 profile 不存在」"
         );
         assert!(
             text.contains("for profile_file in \"$PROFILES_DIR\"/*.yaml"),
@@ -4846,6 +4847,9 @@ mod profile_tests {
         }
     }
 
+    // 交付清单只内嵌进 Linux 目标（build.rs 按目标平台判）：别的平台上的二进制
+    // 本来就不往集群里投这一份，问它「嵌没嵌」问的是一个不存在的承诺。
+    #[cfg(target_os = "linux")]
     #[test]
     fn embedded_assets_cover_apply_and_helm_inputs() {
         let assets: Vec<&str> = super::embedded_assets::EMBEDDED_ASSETS
@@ -4868,7 +4872,7 @@ mod profile_tests {
         // 每个 profile 的渲染产物必须成套（38/39/37 量级，这里只断言下限防漏嵌）。
         // 形态的集合从树里读：写死三个名字，新增的那一种漏嵌了也没人问——它不在
         // 名单里，而「不在名单里」与「嵌齐了」在这里读起来一样。
-        let rendered = repo_root().join("deploy/rendered");
+        let rendered = rendered_root();
         let mut profiles: Vec<String> = std::fs::read_dir(&rendered)
             .unwrap_or_else(|e| panic!("{}: {e}", rendered.display()))
             .map(|entry| entry.expect("readable entry").path())
@@ -4898,9 +4902,12 @@ mod profile_tests {
         let dir = super::materialize_assets().expect("资产解包成功");
         assert!(dir.join("deploy/scripts/init-secrets.sh").is_file());
         assert!(dir.join("deploy/helm/cogneva/Chart.yaml").is_file());
-        assert!(dir
-            .join("deploy/rendered/k3s-single/00-namespace-cogneva.yaml")
-            .is_file());
+        // 交付清单只内嵌进 Linux 目标，与上面那条断言同一个理由。
+        if cfg!(target_os = "linux") {
+            assert!(dir
+                .join("deploy/rendered/k3s-single/00-namespace-cogneva.yaml")
+                .is_file());
+        }
     }
 
     #[test]
@@ -5125,6 +5132,8 @@ mod cn_image_tests {
     /// 镜像地址由它自己处理。
     fn deployed_manifests() -> Vec<PathBuf> {
         let mut files = Vec::new();
+        // 预渲染那一半由 chart 现场生成，读之前先让它就位。
+        let _ = crate::checkout::rendered_root();
         for dir in ["deploy/rendered", "deploy/k3s"] {
             let root = repo_file(dir);
             let Ok(entries) = std::fs::read_dir(&root) else {
@@ -5330,7 +5339,8 @@ mod install_trace_tests {
     /// 否则这条判据会随对象改名安静地变成空转。
     #[test]
     fn a_hook_the_trace_probe_covers_survives_its_own_success() {
-        let rendered = repo_file("deploy/rendered");
+        // 产物不进仓：这条判据读的就是「此刻 chart 渲染出来的字节」，读之前先让它就位。
+        let rendered = crate::checkout::rendered_root();
         let mut judged = 0;
         let mut deleted = Vec::new();
         let mut profiles: Vec<std::path::PathBuf> = std::fs::read_dir(&rendered)

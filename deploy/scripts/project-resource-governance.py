@@ -461,7 +461,7 @@ def refuse(message):
 
 
 def recorded_nodes(path):
-    """生成文件首部记下的拓扑。`--check` 在无集群的 CI 上按它重算。"""
+    """生成文件首部记下的拓扑。`--out`（CI 与构建期）在无集群时按它重算。"""
     with open(path) as fh:
         m = _TOPOLOGY_RE.search(fh.read())
     if not m:

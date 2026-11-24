@@ -19,9 +19,9 @@ Kubernetes 节）。用户不需要在 K3s / 标准 K8s / Helm 之间做选择�
 | 目录 | 做什么 / 实现什么功能 | 角色与消费方 |
 |---|---|---|
 | **`helm/cogneva/`** | **应用拓扑唯一权威源（Helm chart）**：`values.yaml` 默认参数、`profiles/` 三种形态（`k3s-single`/`k3s-multi`/`k8s-standard`）、`templates/` 全部 K8s 资源、`files/` ConfigMap 原文（cogneva.json、prompts） | **唯一手改入口**；改应用拓扑只改这里 |
-| **`rendered/<profile>/`** | chart 的 **CI 预渲染产物**（38/39/38 个 standalone YAML），由 `scripts/render-deploy.sh` 生成、随仓库提交 | 元启动 **apply 投递**消费；CI 新鲜度门禁防漂移；**不要手改** |
+| **`rendered/<profile>/`** | chart 的渲染产物（每个 profile 一整棵 standalone YAML）。**不进仓**：读者在读的那一刻由 `scripts/lib/rendered-cache.sh` 从 chart 现场生成到原路径（输入没变只是一次摘要比较；引导器在构建期渲染并内嵌进二进制） | 元启动 **apply 投递**、契约测试、部署门、集群内落地端与回滚消费；树里只有 chart，**没有可手改的副本** |
 | **`k3s/`** | **K3s 静态清单**：完整应用拓扑的静态 YAML + `observability/` 监控栈（Prometheus/Grafana/Loki/Jaeger 的 helm values 与装卸脚本）+ `examples/`、`swap-image.sh`、`sync-git-remote.sh` | **不是权威源**：是 chart k3s profile 的 **parity 基线**，兼集群内自进化 GitOps 拉取端的**运行时消费物**（cog-reflection 运行时 apply 克隆仓库里的这些文件）；由 `scripts/check-deploy-parity.sh` 字段级门禁对齐 |
-| **`k8s/`** | **标准 K8s 的基础设施参考清单**（不是应用拓扑）：`longhorn`/`argocd`/`cert-manager`/`ingress-nginx`/`metallb`/`velero`/`monitoring/` 集群级组件按需单独 apply；`image-distributor.yaml` 多节点镜像分发器（**元启动 `include_str!` 内嵌模板**）；`meilisearch.yaml` 可选搜索参考；`cogneva.service` systemd 参考副本 | 标准 K8s 的**应用拓扑不在这里**——走 chart 的 `k8s-standard` profile（渲染在 `rendered/k8s-standard/`）；本目录只有集群周边设施 |
+| **`k8s/`** | **标准 K8s 的基础设施参考清单**（不是应用拓扑）：`longhorn`/`argocd`/`cert-manager`/`ingress-nginx`/`metallb`/`velero`/`monitoring/` 集群级组件按需单独 apply；`image-distributor.yaml` 多节点镜像分发器（**元启动 `include_str!` 内嵌模板**）；`meilisearch.yaml` 可选搜索参考；`cogneva.service` systemd 参考副本 | 标准 K8s 的**应用拓扑不在这里**——走 chart 的 `k8s-standard` profile（渲染成 `rendered/k8s-standard/`，消费点现场生成）；本目录只有集群周边设施 |
 | **`site-overlays/`** | **安装期私有事实的 kustomize overlay**（当前一处：`host-documents/`——宿主文档整理的 scope 挂载）。scope 的宿主路径是某台机器自己的事实，而 `k3s/` 会被集群内 GitOps 循环 apply 到每台机器上、挂载又是 `type: Directory`（路径不对 Pod 起不来），所以它不能待在基座里；与已删除的 `deploy/kustomize/`（按环境复制拓扑）不同，这里不复制拓扑，只有一条无处可写的私有事实 | 运维按需 `kubectl kustomize deploy/site-overlays/host-documents \| kubectl apply -f -`；与 chart 的字段级对齐由 `scripts/tests/host-documents-wiring.test.sh` 断言 |
 | **`runtime-pods.yaml`** | **运行时创建的 Pod 的标签登记**（当前一处：评测台，由宿主上的评测臂 `cogneva eval-table` 拉起，不归 chart 管）。NetworkPolicy 的对端选择器必须选中真的存在的 Pod，而这些 Pod 的创建现场不在本仓——标签写在这里，控制面可达性门禁才读得到 | `scripts/check-control-plane-reachability.sh` 读它匹配对端；只登记 name / namespace / labels |
 | **`scripts/`** | 部署工具脚本（见下表） | CI 与元启动调用 |
@@ -32,7 +32,8 @@ Kubernetes 节）。用户不需要在 K3s / 标准 K8s / Helm 之间做选择�
 
 | 脚本 | 功能 |
 |---|---|
-| `render-deploy.sh` | 用 `helm template -f profiles/<p>.yaml` 把 chart 渲染进 `rendered/<profile>/`；`--check` 做 CI 新鲜度门禁（重渲染有 diff 即红） |
+| `render-deploy.sh` | 用 `helm template -f profiles/<p>.yaml` 把 chart 渲染进 `rendered/<profile>/`（写回）或 `--out DIR`（hermetic，节点数取树里已提交的投影首部）。产物不提交，读者经 `lib/rendered-cache.sh --ensure` 现场生成；`check-rendered-trees.sh` 判「仓里没有产物，且每个 profile 都生成得出来」 |
+| `check-rendered-trees.sh` | 渲染产物**不在仓里**：`git ls-files -- deploy/rendered` 必须为空（提交了就是第二份正本），且每个 chart profile 都能现场渲染出一整棵。取代已退场的 `render-deploy.sh --check`——没有已提交的产物，就没有「新鲜」可比。CI 强制 |
 | `gen-example-config.py` | 从 chart 的 `files/cogneva.json` 投影出一份可放置的配置，**写到 stdout**：换首行说明、把 `github_integration.repo` 换成占位符、把告警规则裁到十条示例，其余逐字照抄（键序也照抄）。仓库里不再有示例副本；需要独立文件的在消费点现场生成（`> /etc/cogneva/cogneva.json` 或临时文件），生成物不提交 |
 | `check-deploy-parity.sh` | chart k3s profile 渲染 vs `k3s/` 静态清单的**字段级 parity** 门禁：资源集合、每工作负载的 Pod 模板标签与容器内外全部字段、Service/NetworkPolicy/Ingress/StorageClass/Namespace/ServiceAccount/CronJob 的整份对象、治理对象与 ConfigMap 的整份 spec（安装来源标签除外）。比了多少资源、多少类由脚本自己报（资源随拓扑增减，别在文档里钉死），CI 强制 |
 | `check-pg-sharing-processes.sh` | Postgres 连接分摊门禁：渲染产物里 `COGNEVA_PG_SHARING_PROCESSES` 必须 ≥ 带 `COGNEVA_DATABASE_URL` 的常驻 Deployment 副本数之和 + 1（滚动影子）。这个数决定每个进程把服务器连接上限摊成每池几条；少算的那份平时是余量、滚动时被新 Pod 当成自己的，实测新 Pod 报 `pool timed out while waiting for an open connection`。读渲染产物而不是模板，表达式写对没生效也会红。CI 强制 |
@@ -50,8 +51,9 @@ Kubernetes 节）。用户不需要在 K3s / 标准 K8s / Helm 之间做选择�
 
 ### 关于 `k3s/` `k8s/` `helm/` 三个文件夹（不是三条可选路径）
 
-- **`helm/` 是权威源**，`rendered/` 是它渲染出来的产物，`k3s/` 是它在 K3s 形态下的
-  静态基线 + 自进化运行时消费物——三者是"源 → 产物 → 基线/消费物"的关系，不是三选一。
+- **`helm/` 是权威源**，`rendered/` 是从它推得出来的产物（**不进仓**，读者在读的
+  那一刻现场生成），`k3s/` 是它在 K3s 形态下的静态基线 + 自进化运行时消费物——
+  三者是"源 → 推导 → 基线/消费物"的关系，不是三选一。
 - **`k8s/` 不放应用清单**，只放标准 K8s 集群周边的基础设施参考；标准 K8s 部署应用走
   chart 的 `k8s-standard` profile。
 - **环境差异全部通过 chart 的 profile values 表达**（containerd socket、存储类、
@@ -74,8 +76,9 @@ apply；已有 release 自动 `helm upgrade`，已 apply 部署的保持 apply �
 复用这两条等价命令）：
 
 ```bash
-# 机制 1：预渲染清单（无需本机装 helm；CI 从 chart 渲染、随仓库提交）
+# 机制 1：现场渲染清单（元启动应用前自己渲染，宿主机不用装 helm；手动路径需要一次）
 bash deploy/scripts/init-secrets.sh                     # 幂等随机生成内部密钥
+bash deploy/scripts/lib/rendered-cache.sh --ensure       # 从 chart 生成 deploy/rendered/（不提交）
 kubectl apply -f deploy/rendered/k3s-single/            # 或 k3s-multi / k8s-standard
 
 # 机制 2：Helm 直接安装（本机有 helm；元启动缺 helm 时自动安装）
@@ -93,15 +96,17 @@ StorageClass，如 Longhorn）。渲染检查：`helm template cogneva deploy/he
 关键 values：`backends.{postgres,redis,qdrant,nats,meilisearch}.enabled` 控制是否随 chart 部署后端（禁用即使用外部服务）；`evolution.enabled` 控制自进化 worker，`evolution.gitRemote.mode`（`hostPath` 单节点 / `pvc` 多节点）控制中央 bare 仓库供给；`sandboxExecutor.enabled` / `buildah.enabled` 控制沙盒执行器与节点镜像构建 DaemonSet；`buildah.containerdSocket` 适配发行版（K3s 为 `/run/k3s/containerd`，标准 containerd 为 `/run/containerd`）；`storage.localRetainClass.create`（K3s 专有 Retain StorageClass，标准 K8s 置 false）与 `storage.evolution`/`storage.retain` 控制各卷存储类（留空跟随集群默认 SC）；`gitops.kubectlBin.enabled`+`gitops.kubectlBin.hostPath` 控制主应用 GitOps 拉取端的 Pod 内 kubectl（K3s 挂宿主 k3s 二进制，节点无可用二进制时置 false）；`webhook.nodePort` 为平台 webhook 入口；`ingress.className`（values 默认 `nginx` 是中立默认值；K3s 两个 profile 覆盖为 `traefik`——K3s 自带 traefik 并把它标成默认 IngressClass；取 `traefik` 时自动附带 WebSocket/安全头 Middleware）；`networkPolicy.enabled` 控制沙盒出站隔离。内部密钥留空即安装时自动随机生成；预渲染清单路径用 `secrets.create=false`，密钥改由 init-secrets.sh 生成（bootstrap 自动调用）。
 
 > **维护者注意**：应用拓扑唯一权威源是 Helm chart（`deploy/helm/cogneva/`）。
-> `deploy/rendered/<profile>/` 是 chart 的 CI 渲染产物（`bash
-> deploy/scripts/render-deploy.sh` 重新生成，CI 新鲜度门禁防漂移）；
+> `deploy/rendered/<profile>/` 是从 chart 在消费点现场生成的产物，**不进仓**
+> （`bash deploy/scripts/lib/rendered-cache.sh --ensure`；引导器构建期渲染并内嵌，
+> 集群内落地端按 rev 用那一版自己的渲染器现渲，运行镜像里带着同一版 helm）；
 > `deploy/k3s/` 静态清单是 parity 基线兼集群内 GitOps 拉取端的运行时消费物，
 > 必须与 chart k3s profile 字段级对齐，由 CI 与 `deploy/scripts/check-deploy-parity.sh`
 > 强制（覆盖多少资源与资源类型以脚本自报为准）。改拓扑的顺序见 `deploy/k3s/README.md`。
 
 ### 升级与回滚
 
-升级就是重跑安装那一步：apply 投递的集群重新 `kubectl apply -f deploy/rendered/<profile>/`，
+升级就是重跑安装那一步：apply 投递的集群先
+`bash deploy/scripts/lib/rendered-cache.sh --ensure` 再 `kubectl apply -f deploy/rendered/<profile>/`，
 helm 投递的集群 `helm upgrade cogneva deploy/helm/cogneva -f ...`。两条路都幂等。
 
 回滚（apply 投递）：
@@ -111,10 +116,12 @@ bash deploy/scripts/rollback.sh --to <上一版 rev>              # 只出计划
 bash deploy/scripts/rollback.sh --to <上一版 rev> --apply --wait
 ```
 
-单位是**那一版的 `deploy/rendered/<profile>/`**，也就是升级时吃进去的那份清单：
-它把拓扑送回那一版，不动数据（PVC、库里的行），也不改仓库。它拒绝往前/旁支的版本
-（那是变更，走评审），也拒绝那一版没有清单目录、或目录里没有 yaml（apply 空目录会
-退出 0，读起来像回滚成功）。默认只打印计划，写集群要显式 `--apply`。
+单位是**那一版渲染出来的 `deploy/rendered/<profile>/`**，也就是升级时吃进去的那份
+清单：那一版提交过产物就直接读那些字节（重渲不会更忠实），没有就用那一版自己的渲染器
+现场渲染（渲染机需要 helm，集群仍然不需要）。它把拓扑送回那一版，不动数据（PVC、
+库里的行），也不改仓库。它拒绝往前/旁支的版本（那是变更，走评审），也拒绝那一版既没有
+清单目录、也没有对应 chart profile，或渲染出来没有 yaml（apply 空目录会退出 0，读起来
+像回滚成功）。默认只打印计划，写集群要显式 `--apply`。
 
 从 apply 投递迁到 helm 托管时，现网对象此前没有 helm 归属三件套，`helm upgrade` 会在
 归属校验上整单拒收。先用 `helm upgrade cogneva deploy/helm/cogneva -f

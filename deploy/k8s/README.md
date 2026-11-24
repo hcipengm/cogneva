@@ -38,8 +38,10 @@ kubectl patch storageclass longhorn -p \
 元启动内部的两种投递机制（同源同能力，无需人工执行；CI / 自动化流水线可直接复用）：
 
 ```bash
-# 机制 1：预渲染清单——chart 在 CI 渲染好的独立 YAML，kubectl 直接 apply
-#         （元启动 apply 前自动跑 init-secrets.sh 随机生成内部密钥，幂等不覆盖）
+# 机制 1：现场渲染清单——chart 渲染出的独立 YAML，kubectl 直接 apply
+#         （元启动应用前自己从 chart 渲染；手动路径先跑一次 --ensure）
+#         （apply 前自动跑 init-secrets.sh 随机生成内部密钥，幂等不覆盖）
+bash deploy/scripts/lib/rendered-cache.sh --ensure
 kubectl apply -f deploy/rendered/k8s-standard/
 
 # 机制 2：Helm——本机有 helm 时装 chart（元启动在复用集群上自动选择，缺 helm 自动装）
@@ -49,8 +51,9 @@ helm install cogneva deploy/helm/cogneva \
 # 平台 token / LLM 上游：首次打开 WebUI 经配置向导写入（只注入安全网关）
 ```
 
-> `deploy/rendered/<profile>/` 是 chart 的 CI 渲染产物（随仓库提交），改 chart 后
-> 跑 `bash deploy/scripts/render-deploy.sh` 重新生成，CI 新鲜度门禁防漂移。
+> `deploy/rendered/<profile>/` 是从 chart 现场生成的产物，**不进仓**；改 chart 后，
+> 下一次读取（`lib/rendered-cache.sh --ensure`——引导器构建期、部署门、集群内落地端
+> 走同一个入口）自己生成新的那一棵，没有已提交的旧副本可漂。
 
 监控栈（Prometheus / Grafana / Loki / Jaeger / Alertmanager）见 `monitoring/`，
 按需单独 `kubectl apply`。
@@ -58,7 +61,7 @@ helm install cogneva deploy/helm/cogneva \
 ## 一键路径（bootstrap 使用）
 
 bootstrap 按集群环境自动适配：检测发行版（K3s 节点标签 / `/run/k3s`）、节点数、
-默认 StorageClass，从 `deploy/rendered/` 选对应 profile 目录 apply；apply 前自动
+默认 StorageClass，从 `deploy/rendered/`（按 chart 现场渲染）选对应 profile 目录 apply；apply 前自动
 跑 `deploy/scripts/init-secrets.sh`；CN 模式公开镜像统一走 daocloud 前缀。
 
 1. **镜像分发器** `image-distributor.yaml`（本目录，bootstrap 内嵌为模板）：
@@ -166,8 +169,8 @@ deploy/scripts/distribute-image.sh dist/cogneva-image-vX.Y.Z-linux-x86_64.tar.gz
 > 历史：本目录曾有 cogneva-deployment / postgres / redis / qdrant /
 > llm-admin-rbac 等与 `deploy/k3s/` 重复且残缺的应用清单（缺网关/进化/沙盒），
 > 已删除；也曾有一个复用 `deploy/k3s/` 的 kustomize overlay 来表达标准 K8s 差异，
-> 在 chart 成为拓扑唯一权威源后由 `profiles/k8s-standard.yaml` +
-> `deploy/rendered/k8s-standard/` 取代，一并删除——环境差异只在 chart values
+> 在 chart 成为拓扑唯一权威源后由 `profiles/k8s-standard.yaml`（渲染成
+> `deploy/rendered/k8s-standard/`，消费点生成）取代，一并删除——环境差异只在 chart values
 > 维护一份，不再有第二份会腐烂的适配清单。
 
 ## 密钥与凭证

@@ -176,7 +176,7 @@ const PARTLY_ENFORCED: &[(&str, &str, &str)] = &[
     ),
     (
         "deploy-parity",
-        "`check-deploy-parity.sh`, `render-deploy.sh --check`, \
+        "`check-deploy-parity.sh`, `check-rendered-trees.sh`, \
          `sync-static-manifests.sh --check` and the rest of the job's \
          twenty-two single-line readings are the stage's gates by the same \
          rule: a path under `scripts/check-`, or an argument that is exactly \

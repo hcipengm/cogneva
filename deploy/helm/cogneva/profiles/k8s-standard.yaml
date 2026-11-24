@@ -1,7 +1,7 @@
 # 部署 profile：标准 K8s 生产集群（非 K3s：kubeadm/EKS/自管 containerd）。
 #
 # 渲染：bash deploy/scripts/render-deploy.sh
-# 产物：deploy/rendered/k8s-standard/
+# 产物：deploy/rendered/k8s-standard/（消费点现场生成，不进仓）
 #
 # 与 K3s profile 的环境差异全部固化在本文件：
 # - 不创建 cogneva-local-retain StorageClass（其 provisioner

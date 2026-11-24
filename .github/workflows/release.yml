@@ -54,6 +54,23 @@ jobs:
         # prost-build (etcd-client) shells out to protoc during the build.
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
+      # The release binaries embed the rendered deployment trees, and those are
+      # not committed: bootstrap's build script generates them from the chart at
+      # build time (the deployed host must not need helm). The version comes from
+      # the same HELM_VERSION the bootstrapper downloads, so the release's bytes
+      # are the ones that version produces.
+      - name: Resolve pinned Helm version
+        id: helmver
+        run: |
+          v=$(grep -oP 'const HELM_VERSION: &str = "\K[^"]+' crates/bootstrap/src/main.rs)
+          [ -n "$v" ] || { echo "Could not read HELM_VERSION from crates/bootstrap/src/main.rs"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ steps.helmver.outputs.version }}
+      - name: Install pyyaml
+        run: sudo apt-get update && sudo apt-get install -y python3-yaml
+
       - name: Build release binary
         # --locked: resolve from the committed Cargo.lock; fresh resolution
         # pulls crate releases that may require a newer rustc than pinned.

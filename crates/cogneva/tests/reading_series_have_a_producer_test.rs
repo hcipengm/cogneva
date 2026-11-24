@@ -22,7 +22,7 @@
 
 use crate::common;
 
-use common::routes::repo_root;
+use common::routes::{rendered_root, repo_root};
 
 use std::path::Path;
 
@@ -87,7 +87,7 @@ fn inventory() -> Inventory {
 /// The `args:` of the postgres exporter sidecar, as the single-node profile
 /// renders them.
 fn postgres_exporter_args() -> Vec<String> {
-    let path = repo_root().join("deploy/rendered/k3s-single/42-statefulset-postgres.yaml");
+    let path = rendered_root().join("k3s-single/42-statefulset-postgres.yaml");
     let text = read_file(&path);
     let indent_of = |line: &str| line.len() - line.trim_start().len();
     let mut args = Vec::new();

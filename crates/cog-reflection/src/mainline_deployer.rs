@@ -158,6 +158,10 @@ const OVERLAY_ASSET_LIST_PATH: &str = "deploy/overlay-assets.json";
 /// 直到下一次全量构建——要改这一条，得先让 overlay 也有一步把它拷进镜像。
 const OVERLAY_UNREFRESHABLE: &[(&str, &str)] = &[
     (
+        "/usr/local/bin/helm",
+        "构建期按引导器的 HELM_VERSION 下载的工具链，不是检出里的产物，overlay 不从检出重建它；集群内渲染必须与构建期内嵌产物用同一版 helm，换版本会改变块标量渲染的字节，所以它跟着镜像走、不跟着 rev 走",
+    ),
+    (
         "/usr/local/bin/node",
         "来自 node:22-slim 基础镜像，不是检出里的产物；overlay 刷新前端产物走的是 node 构建容器（见 OVERLAY_BUILT_ASSETS），运行镜像里这份 node 只给沙盒的 WebUI 准入用",
     ),
@@ -10878,15 +10882,33 @@ impl MainlineDeployer {
     /// 是同一份文本，各读一遍就给了同一份事实两种拼写各自漂移的机会。
     async fn release_set_at(&self, rev: &str) -> SFResult<ReleaseSet> {
         let dir = self.cfg.manifest_dir.trim_end_matches('/');
-        // 列不出来（目录在这个 rev 下不存在、rev 本身不可解）与"目录存在但读不出
-        // 发布面"是两件事，读数要说清是哪一件，并把底层那条 git 报错带上。
-        let names = self.git_ls_dir(rev, dir).await.map_err(|e| {
-            SFError::Config(format!(
-                "cannot read the release set at {dir} in {}: {e}; expected either a \
-                 {KUSTOMIZATION_FILE} listing resources or a flat directory of manifests",
-                rev12(rev)
-            ))
-        })?;
+        // 渲染产物不进仓：`deploy/rendered/<profile>` 在那个 rev 下没有可读的字节，
+        // 它由那个 rev 自己的 chart 现场渲染。先问这份树在不在——老 rev 把产物
+        // 提交过，那几版读的仍然是它们当时交付的那份字节，重渲染不会更忠实
+        // （helm 版本也能让同一份 chart 产出不同字节）；新 rev 没有这份树，
+        // 走到渲染那一路。
+        let names = match self.git_ls_dir(rev, dir).await {
+            Ok(names) => names,
+            Err(listing) => {
+                let Some(profile) = rendered_profile_of(dir) else {
+                    return Err(SFError::Config(format!(
+                        "cannot read the release set at {dir} in {}: {listing}; expected either a \
+                         {KUSTOMIZATION_FILE} listing resources or a flat directory of manifests",
+                        rev12(rev)
+                    )));
+                };
+                return self
+                    .render_release_set_at(rev, dir, profile)
+                    .await
+                    .map_err(|e| {
+                        SFError::Config(format!(
+                        "cannot read the release set at {dir} in {}: {listing}; rendering that \
+                         revision's chart into {dir} also failed: {e}",
+                        rev12(rev)
+                    ))
+                    });
+            }
+        };
         let set = if names.iter().any(|n| n == KUSTOMIZATION_FILE) {
             let kustomization = self
                 .git_show(rev, &format!("{dir}/{KUSTOMIZATION_FILE}"))
@@ -10914,6 +10936,81 @@ impl MainlineDeployer {
             )));
         }
         Ok(set)
+    }
+
+    /// 在 `rev` 的 chart 上现场渲染出它的发布集。
+    ///
+    /// 树里没有 `deploy/rendered/<profile>` 的字节（它不是源，见
+    /// [`Self::release_set_at`]），而落地端手里只有一个 bare 仓库：把这个 rev 的
+    /// 渲染输入取到临时目录，让**那个 rev 自己的**渲染器写一份出来。用那一版的
+    /// 渲染器而不是当前二进制里的，是因为「这一版交付的是哪份清单」由它当时的树
+    /// 决定——渲染器改了，重渲染的产物跟着改才是对的。
+    async fn render_release_set_at(
+        &self,
+        rev: &str,
+        dir: &str,
+        profile: &str,
+    ) -> SFResult<ReleaseSet> {
+        let work = tempfile::tempdir()
+            .map_err(|e| SFError::IO(format!("create a scratch directory: {e}")))?;
+        let work_s = work.path().to_string_lossy().into_owned();
+        let tar_s = work.path().join("rev.tar").to_string_lossy().into_owned();
+        self.run_cmd(
+            "git",
+            &[
+                "--git-dir",
+                &self.cfg.bare_repo,
+                "archive",
+                "--format=tar",
+                &format!("--output={tar_s}"),
+                rev,
+                "deploy/helm",
+                "deploy/scripts",
+                "deploy/k3s",
+            ],
+            None,
+        )
+        .await?;
+        self.run_cmd("tar", &["-xf", &tar_s, "-C", &work_s], None)
+            .await?;
+        let rendered = work.path().join("rendered");
+        let script_s = work
+            .path()
+            .join("deploy/scripts/render-deploy.sh")
+            .to_string_lossy()
+            .into_owned();
+        let rendered_s = rendered.to_string_lossy().into_owned();
+        self.run_cmd("bash", &[&script_s, "--out", &rendered_s], None)
+            .await?;
+        let out = rendered.join(profile);
+        let entries = std::fs::read_dir(&out).map_err(|e| {
+            SFError::Config(format!(
+                "the render at {} produced no {dir}: {e}",
+                rev12(rev)
+            ))
+        })?;
+        let mut files = BTreeMap::new();
+        for entry in entries {
+            let path = entry
+                .map_err(|e| SFError::IO(format!("read {}: {e}", out.display())))?
+                .path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !path.is_file() || !is_manifest_file(name) {
+                continue;
+            }
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| SFError::IO(format!("read {}: {e}", path.display())))?;
+            files.insert(name.to_string(), content);
+        }
+        if files.is_empty() {
+            return Err(SFError::Config(format!(
+                "the render at {} produced no manifest for {dir}",
+                rev12(rev)
+            )));
+        }
+        Ok(ReleaseSet::from_flat_dir(files))
     }
 
     /// 清单包发布成 per-rev ConfigMap（Job 挂载消费）。先按 label 清理
@@ -12286,9 +12383,22 @@ fn is_cluster_scoped_kind(kind: &str) -> bool {
 /// 平铺的预渲染目录读。
 const KUSTOMIZATION_FILE: &str = "kustomization.yaml";
 
+/// `deploy/rendered/<profile>` 里的那个 profile；别的形状给 `None`。
+///
+/// 只认一层。这个名字要拼进临时目录里的路径，也决定「这份目录由渲染器负责」
+/// 这句话对谁成立——`deploy/rendered/a/b` 不是任何 profile 的产物。
+fn rendered_profile_of(dir: &str) -> Option<&str> {
+    let profile = dir.strip_prefix("deploy/rendered/")?;
+    if profile.is_empty() || profile.contains('/') {
+        return None;
+    }
+    Some(profile)
+}
+
 /// The manifest trees a deployment can be pointed at: the static release set the
-/// in-cluster deployer reads out of the repository, and one pre-rendered
-/// directory per profile.
+/// in-cluster deployer reads out of the repository, and one rendered directory
+/// per profile (generated from that revision's chart at read time -- the bytes
+/// are not committed).
 ///
 /// Written once because three places ask the same question -- the walk that
 /// judges the shipped manifests, the gate that judges the authorization face,
@@ -13511,7 +13621,7 @@ impl ConfigConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkout::repo_root;
+    use crate::checkout::{rendered_root, repo_root};
 
     /// 一条被判 `cancelled` 的检查。`completed_unix` 在判窗口那几条判据里是输入，
     /// 在只看「跑没跑过」的那几条里不参与，所以这里显式给。
@@ -30893,6 +31003,19 @@ exit 0
         assert!(err.contains("c.yaml:9"), "{err}");
     }
 
+    /// 现场渲染那一路只对「一层深的 `deploy/rendered/<profile>`」成立：这个名字
+    /// 要拼进临时目录里的路径，也决定「这份目录由渲染器负责」这句话对谁成立。
+    #[test]
+    fn only_a_one_level_rendered_dir_names_a_profile() {
+        assert_eq!(
+            rendered_profile_of("deploy/rendered/k3s-single"),
+            Some("k3s-single")
+        );
+        assert_eq!(rendered_profile_of("deploy/rendered/"), None);
+        assert_eq!(rendered_profile_of("deploy/rendered/a/b"), None);
+        assert_eq!(rendered_profile_of("deploy/k3s"), None);
+    }
+
     /// 门禁的输入是发布集里的文件内容，所以要在**真的会进滚动包的那些清单**上
     /// 验一遍：一个误伤就把整条落地通道卡死在一个与本次版本无关的理由上。
     /// 清单名从 `kustomization.yaml` 反查，不手写文件名——手写的清单会随新增
@@ -30900,6 +31023,7 @@ exit 0
     #[test]
     fn the_shipped_manifests_pass_the_dialect_gate() {
         let root = repo_root();
+        let _ = rendered_root();
         // `deploy/k3s` 是部署器默认读的发布集；预渲染目录也在内，因为发布集目录
         // 是配置面（`manifest_dir`），把它指到任一预渲染目录是受支持的用法，
         // 那些文件同样会被重排后再 apply。
@@ -32266,7 +32390,6 @@ exit 0
     /// 一次都跑不到。
     #[test]
     fn a_rendered_profile_directory_delivers_every_rollout_target() {
-        let root = repo_root();
         let targets = MainlineDeployerConfig::default().targets;
         assert_eq!(
             targets.len(),
@@ -32276,7 +32399,8 @@ exit 0
         // The profile set is the directory listing: listed here instead, a
         // profile added later would be walked by nothing and every assertion
         // below would still pass over the remaining ones.
-        let rendered = root.join("deploy/rendered");
+        // 预渲染目录不提交：读之前由 chart 现场生成。
+        let rendered = rendered_root();
         let mut profiles: Vec<String> = std::fs::read_dir(&rendered)
             .unwrap_or_else(|e| panic!("{}: {e}", rendered.display()))
             .map(|entry| entry.expect("readable entry").path())
@@ -32293,7 +32417,7 @@ exit 0
             rendered.display()
         );
         for profile in &profiles {
-            let dir = root.join("deploy/rendered").join(profile);
+            let dir = rendered.join(profile);
             let set = flat_set_from_disk(&dir);
             // 发布面就是目录自己的清单文件：产出侧新加一份，消费侧自动带上，
             // 不靠任何手写清单。
@@ -32454,7 +32578,11 @@ exit 0
                 .and_then(|v| v.as_str())
                 .unwrap_or(&default_dir)
                 .to_string();
-            let abs = root.join(&dir);
+            // 渲染产物不进仓：路径还是那个名字，读之前让 chart 现场生成。
+            let abs = match dir.strip_prefix("deploy/rendered/") {
+                Some(rest) => rendered_root().join(rest),
+                None => root.join(&dir),
+            };
             assert!(abs.is_dir(), "{profile}: manifestDir {dir} does not exist");
             // 发布面不能跨拓扑：这个部署的清单目录要么是它自己的预渲染目录，
             // 要么是与它逐字段对齐的静态基线（`deploy/k3s` 对 k3s-single，两级
@@ -32613,6 +32741,8 @@ exit 0
     fn the_evolution_role_covers_every_document_the_loop_will_apply() {
         const EVOLUTION: &str = "cogneva-evolution";
         let root = repo_root();
+        // 预渲染的三棵由 chart 现场生成，读之前先让它们就位。
+        let _ = rendered_root();
         let mut checked: Vec<&str> = Vec::new();
 
         for rel in DELIVERABLE_MANIFEST_TREES {
@@ -32911,6 +33041,7 @@ exit 0
     #[test]
     fn the_workload_table_covers_every_shape_the_manifests_deliver() {
         let root = repo_root();
+        let _ = rendered_root();
         let mut seen: Vec<(String, String)> = Vec::new();
 
         for rel in DELIVERABLE_MANIFEST_TREES {

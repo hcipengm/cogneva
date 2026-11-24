@@ -43,7 +43,7 @@
 
 use crate::common;
 
-use common::routes::{read_repo, repo_root};
+use common::routes::{read_repo, rendered_root, repo_root};
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -327,6 +327,8 @@ fn env_value(container: &serde_yaml::Mapping, name: &str) -> Option<String> {
 /// Every declaration the delivered manifests carry, beside the claim behind each
 /// mount of the container that made it.
 fn declarations() -> Vec<(Declaration, BTreeMap<String, ClaimSource>)> {
+    // 渲染产物不进仓：读之前现场生成。
+    rendered_root();
     let mut found = Vec::new();
     for dir in DELIVERED {
         let manifest_dir = repo_root().join(dir);
@@ -504,6 +506,8 @@ fn every_declaration_names_a_volume_that_container_actually_mounts() {
 /// and at least one manifest in it declares a volume.
 #[test]
 fn the_scan_covers_every_delivered_directory() {
+    // 渲染产物不进仓：读之前现场生成。
+    rendered_root();
     let declared = declarations();
     for dir in DELIVERED {
         let path = repo_root().join(dir);
@@ -531,6 +535,8 @@ struct DeliveryFacts {
 }
 
 fn delivery_facts() -> BTreeMap<&'static str, DeliveryFacts> {
+    // 渲染产物不进仓：读之前现场生成。
+    rendered_root();
     let mut facts = BTreeMap::new();
     for dir in DELIVERED {
         let mut entry = DeliveryFacts::default();

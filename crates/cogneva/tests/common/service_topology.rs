@@ -222,7 +222,9 @@ fn labels_at(value: &serde_yaml::Value, path: &[&str]) -> BTreeMap<String, Strin
 /// profile 不需要改任何判据。
 pub fn manifest_trees(root: &Path) -> Vec<PathBuf> {
     let mut trees = vec![root.join(APPLY_TREE)];
-    let mut profiles: Vec<PathBuf> = std::fs::read_dir(root.join(RENDERED))
+    // 预渲染目录不提交：读之前让 chart 现场生成（见 [`super::root::rendered_at`]）。
+    // 生成作用在**被判的那棵树**上：夹具树的 `deploy/rendered` 是它自己摆的题目。
+    let mut profiles: Vec<PathBuf> = std::fs::read_dir(super::root::rendered_at(root))
         .map(|entries| {
             entries
                 .flatten()
