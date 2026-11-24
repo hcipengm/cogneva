@@ -24,7 +24,12 @@ pub fn base_rev(root: &Path) -> String {
     for name in BASE_NAMES {
         let out = std::process::Command::new("git")
             .current_dir(root)
-            .args(["rev-parse", "--verify", "--quiet", &format!("{name}^{{commit}}")])
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{name}^{{commit}}"),
+            ])
             .output()
             .unwrap_or_else(|e| panic!("could not run git in {}: {e}", root.display()));
         if out.status.success() {

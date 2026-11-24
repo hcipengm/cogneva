@@ -123,11 +123,7 @@ impl QuotaManager {
     /// anyone chose for it. Returning it here would make every top-up start
     /// from an invented base and write that base back as if an operator had
     /// declared it.
-    async fn declared_ceiling(
-        &self,
-        scope: QuotaScope,
-        target_id: &str,
-    ) -> Option<QuotaLimits> {
+    async fn declared_ceiling(&self, scope: QuotaScope, target_id: &str) -> Option<QuotaLimits> {
         self.scope_reading(scope, target_id)
             .await
             .filter(|reading| reading.enforced)

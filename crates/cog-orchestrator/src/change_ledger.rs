@@ -1763,10 +1763,7 @@ pub fn parse_rows_per_handover(raw: &str) -> Result<Option<usize>, String> {
 /// bound. With no proof at all the bound stands at [`MIN_ROWS_PER_BATCH`], and
 /// with no refusal it climbs one size per landing, which is the only rate the
 /// measurement supports.
-pub fn rows_per_handover_bound(
-    landed_max: Option<usize>,
-    refused_min: Option<usize>,
-) -> usize {
+pub fn rows_per_handover_bound(landed_max: Option<usize>, refused_min: Option<usize>) -> usize {
     let grown = landed_max.map_or(MIN_ROWS_PER_BATCH, |landed| {
         landed.saturating_add(1).max(MIN_ROWS_PER_BATCH)
     });

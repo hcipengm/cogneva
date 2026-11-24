@@ -20,8 +20,8 @@
 use crate::common;
 
 use common::routes::read;
-use common::routes::{rendered_root, repo_root};
 use common::routes::walk;
+use common::routes::{rendered_root, repo_root};
 use common::yaml;
 
 fn env_pairs(container: &serde_yaml::Mapping) -> Vec<(String, Option<String>)> {

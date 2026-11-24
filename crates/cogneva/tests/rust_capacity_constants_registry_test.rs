@@ -673,7 +673,6 @@ fn bound_counts(rows: &[Row]) -> BTreeMap<String, u64> {
     by_file
 }
 
-
 /// Compare the tree against the baseline: files over their count, and files below
 /// what the baseline holds.
 ///
