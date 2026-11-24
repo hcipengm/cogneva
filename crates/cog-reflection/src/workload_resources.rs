@@ -607,15 +607,24 @@ async fn quota_headroom(ns: &str) -> Option<Targets> {
     })
 }
 
-/// 额度该抬到哪：`used + 最大那一份（按实测抬过之后）`，只升不降，且不超过节点
+/// 额度该抬到哪：**按实测的稳态加叠**——所有工作负载「实测请求 × 副本数」之和，
+/// 加最大一次滚动重叠（再一份最大的单副本），加部署作业；只升不降，且不超过节点
 /// 可分配量。`None` 是「不用动」。
 ///
-/// 这是把额度那一层接进闭环的那条律：今天的 `hard` 由渲染集按模板声明值投影，
-/// 只在部署时重算——模板里库声明 500m，投影得 5 核；而闭环后来把它抬到 3.04，
-/// 额度没跟着抬，Pod 重建时被自己的闸门拒掉（2026-11-24 数据库不在的那一次）。
-/// 判据只有一句：**任何时候要重建最大那一份，都装得下**。
-fn raised_ceiling(hard: u64, used: u64, largest: u64, allocatable: Option<u64>) -> Option<u64> {
-    let wanted = used.saturating_add(largest);
+/// 这是把额度那一层接进闭环的那条律。今天的 `hard` 由渲染集按模板声明值投影，只在
+/// 部署时重算：模板里库声明 500m，投影得 5 核；闭环后来把它抬到 3.04，额度没跟，
+/// Pod 重建时被自己的闸门拒掉（2026-11-24 数据库不在的那一次）。
+///
+/// 输入**不是**当下的 `used`：那里面混着滚动中的新副本、部署作业与正要被替换的旧
+/// 副本，拿它当输入会让一次尖峰把额度永久顶高。稳态之和才与「这一套清单该占多少」
+/// 是同一个东西。
+fn raised_ceiling(
+    hard: u64,
+    steady_total: u64,
+    overlap: u64,
+    allocatable: Option<u64>,
+) -> Option<u64> {
+    let wanted = steady_total.saturating_add(overlap);
     if wanted <= hard {
         return None;
     }
@@ -2102,9 +2111,12 @@ pub async fn round(
             "workload resources: the namespace quota's headroom is unreadable; this pass does not cap its raises"
         ),
     }
-    // 这一拍抬过之后，「最大的一份」有多大（× 副本数）。额度要按它重算。
-    let mut largest_cpu: u64 = 0;
-    let mut largest_memory: u64 = 0;
+    // 额度重算的输入：所有工作负载「实测请求 × 副本」之和（稳态），以及最大一份
+    // 单副本（滚动重叠：换版时新旧两个副本同时站着）。
+    let mut steady_cpu: u64 = 0;
+    let mut steady_memory: u64 = 0;
+    let mut overlap_cpu: u64 = 0;
+    let mut overlap_memory: u64 = 0;
 
     let pods: Value =
         serde_json::from_str(&kubectl(&["get", "pods", "-n", ns, "-o", "json"]).await?)
@@ -2408,8 +2420,10 @@ pub async fn round(
                 .filter_map(|c| resolved.get(&c.name))
                 .map(|t| t.memory_request_bytes)
                 .sum();
-            largest_cpu = largest_cpu.max(total_cpu.saturating_mul(replicas));
-            largest_memory = largest_memory.max(total_mem.saturating_mul(replicas));
+            steady_cpu = steady_cpu.saturating_add(total_cpu.saturating_mul(replicas));
+            steady_memory = steady_memory.saturating_add(total_mem.saturating_mul(replicas));
+            overlap_cpu = overlap_cpu.max(total_cpu);
+            overlap_memory = overlap_memory.max(total_mem);
         }
         if let Some(budget) = cpu_raise_budget.as_mut() {
             for (name, targets) in changes.iter_mut() {
@@ -2596,21 +2610,24 @@ pub async fn round(
 
     // 额度自己跟着实测涨：`used + 最大那一份`，只升不降，卡在节点可分配量下。
     // 这一步放在最后：它读的是这一拍**已经写下去**的值，与准入随后看到的同一份。
-    if let (Some((hard, used)), Some(cap_cpu)) = (
+    if let (Some((hard, _used)), Some(cap_cpu)) = (
         quota_hard_and_used(ns).await,
         node_allocatable(AllocatableUnit::Cpu).await,
     ) {
         let mut hard_patch = serde_json::Map::new();
-        if let Some(wanted) =
-            raised_ceiling(hard.cpu_request_millicores, used.cpu_request_millicores, largest_cpu, Some(cap_cpu))
-        {
+        if let Some(wanted) = raised_ceiling(
+            hard.cpu_request_millicores,
+            steady_cpu,
+            overlap_cpu,
+            Some(cap_cpu),
+        ) {
             info!(
                 namespace = %ns,
                 from = hard.cpu_request_millicores,
                 to = wanted,
-                used = used.cpu_request_millicores,
-                largest = largest_cpu,
-                "workload resources: raising the namespace's request ceiling so the largest workload can be recreated"
+                steady = steady_cpu,
+                overlap = overlap_cpu,
+                "workload resources: raising the namespace's request ceiling to the measured steady state plus one rollout overlap"
             );
             hard_patch.insert(
                 "requests.cpu".to_string(),
@@ -2620,8 +2637,8 @@ pub async fn round(
         let cap_mem = node_allocatable(AllocatableUnit::Memory).await;
         if let Some(wanted) = raised_ceiling(
             hard.memory_request_bytes,
-            used.memory_request_bytes,
-            largest_memory,
+            steady_memory,
+            overlap_memory,
             cap_mem,
         ) {
             hard_patch.insert(
@@ -3626,7 +3643,9 @@ mod tests {
     /// 用 2026-11-24 的实测：硬 5000m、已用 2660m、最大一份 3040m、节点 23860m
     /// ⇒ 5700m；如果硬已经是 6000m 就不动；如果节点只有 5000m 也不写。
     #[test]
-    fn the_ceiling_follows_the_largest_workload_but_never_the_node() {
+    fn the_ceiling_is_measured_steady_state_plus_one_overlap() {
+        // 稳态和 2660、最大一份单副本 3040 ⇒ 5700；硬 5000 时抬，硬 6000 时不动；
+        // 节点只有 5000 时不写；量不到节点上限时照写。
         assert_eq!(raised_ceiling(5_000, 2_660, 3_040, Some(23_860)), Some(5_700));
         assert_eq!(raised_ceiling(6_000, 2_660, 3_040, Some(23_860)), None);
         assert_eq!(raised_ceiling(5_000, 2_660, 3_040, Some(5_000)), None);
