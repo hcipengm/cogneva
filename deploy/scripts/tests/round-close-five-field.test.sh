@@ -10,7 +10,7 @@
 #   1. 未落的五格行：status 退 1，缺口写的是「差距」，不是三格那套；
 #   2. 改成 `已落`＋空差距：status 退 0、点名「已落 CC01」，`close` 关得掉；
 #   3. 被钉住的行从台账里删掉：status 退 1 并点名「台账里也没有这一行」（删件 ≠ 收尾）；
-#   4. 写着 `touches: unknown` 的条目不进批次（`open` 明写本轮不排，不钉它）；
+#   4. 写着 `touches: unknown` 的条目仍在本批（触点不是判据，只把读数说出来）；
 #   5. 状态词不在闭集里的五格行：点名拒读，不静默跳过；
 #   6. 列数不足的五格行：同样点名拒读。
 set -uo pipefail
@@ -92,21 +92,21 @@ out=$(run status); rc=$?
 # 这一轮关不掉（正确行为），下一个场景要干净的书：直接把 ref 删掉。
 git -C "$tree" update-ref -d refs/cogneva/round
 
-# 4. `touches: unknown` 不排进批次。
+# 4. `touches: unknown` 仍在本批（属主 2026-11-24：触点不是判据）。
 printf '| CC01 | 长期条目 | 已收口两处 ｜ touches: unknown — 长期：按面开新行 | 余下逐面 | 未落 |\n| CC02 | 这一批要做的 | 还没动 ｜ touches: crates/b/src/y.rs | 改三处 | 未落 |\n' >"$tree/ledger.md"
-git -C "$tree" add -A >/dev/null; git -C "$tree" commit -qm "one deferred, one scheduled" >/dev/null
+git -C "$tree" add -A >/dev/null; git -C "$tree" commit -qm "one unknown-touch, one scheduled" >/dev/null
 out=$(run open); rc=$?
-{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "本轮不排" && printf '%s' "$out" | grep -q "CC01" \
+{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "没写触点" && printf '%s' "$out" | grep -q "CC01" \
    && printf '%s' "$out" | grep -q "CC02"; } \
-  && ok "unknown 的那条不排进批次，明写本轮不排" \
+  && ok "unknown 的那条仍在本批，只把触点读数说出来" \
   || bad "deferred 处理不对（rc=$rc）：$out"
-python3 - "$tree" <<'PY' && ok "批次载荷里只有 CC02" || bad "批次载荷里混进了不排的条目"
+python3 - "$tree" <<'PY' && ok "批次载荷里两条都在" || bad "unknown 的条目被挪出了批次"
 import json, subprocess, sys
 tree = sys.argv[1]
 payload = subprocess.run(["git", "-C", tree, "cat-file", "-p", "refs/cogneva/round"],
                          capture_output=True, text=True).stdout
 batch = json.loads(payload).get("batch")
-sys.exit(0 if batch == ["CC02"] else 1)
+sys.exit(0 if sorted(batch) == ["CC01", "CC02"] else 1)
 PY
 
 # 5. 状态词不在闭集里：按旧格式略过，但**点名印出来**，不静默。

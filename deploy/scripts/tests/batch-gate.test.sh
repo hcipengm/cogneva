@@ -4,13 +4,16 @@
 # 判的是「默认做完整批，没做的要逐条点名」：
 #   1. 有未完成待办、提交里没有 Split ⇒ 红，并把它列出来。
 #   2. Split 点名了别的待办、没点名它 ⇒ 红（没点名的排除不算排除）。
-#   3. Split 点名了它、理由在这一批里成立 ⇒ 绿。
+#   3. Split 点名了它、理由在这一批里成立（只认 2 归因 / 4 读不完）⇒ 绿。
 #   4. 本轮的待办**都填了 `代码` 格** ⇒ 绿，不看 Split。
 #   5. 台账读不到 ⇒ 退 2（没判），不是绿。
+#   6. 没有触点 / 写了 `touches: unknown` 的待办**仍在本批**：没做完照样红。
+#   7. 五格行以「现在这本台账」的状态判完成：改成 `已落` 且差距为空就不欠了。
 #
-# 「做完了」只认台账那一行的 `代码` 格，**不认触点**（属主 2026-11-21 定）。夹具因此
-# 每个场景自带一本台账：写死了哪些条做完了，就是哪些条做完了；改了文件不等于做完，
-# 这正是第 6 条要钉的形状。
+# 「做完了」只认台账那一行的 `代码` 格（三格行）或 `已落`+空差距（五格行），
+# **不认触点**（属主 2026-11-21 定）；批次成员也不按触点筛（属主 2026-11-24 定）。
+# 夹具因此每个场景自带一本台账：写死了哪些条做完了，就是哪些条做完了；改了文件不等于
+# 做完，这正是第 3b 场景要钉的形状。
 set -uo pipefail
 # 夹具仓通过 `git -C <dir>` 写，外层带进的绝对 GIT_DIR 会让它写进调用方的仓。
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR COGNEVA_COMMIT_INDEX
@@ -100,16 +103,16 @@ nothing else"; out=$(run); rc=$?
 reset; rev=$(write_ledger "$ledger" S1 S3); pin "$rev"
 commit_with "split, wrong todo
 
-Split: 3 — S1 — 点名了已经做了的那条"; out=$(run); rc=$?
+Split: 2 — S1 — 点名了已经做了的那条，x.rs 的测试目标会重叠"; out=$(run); rc=$?
 { [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "既没做也没被"; } && ok "Split 没点名真正没做的：红" || bad "点名错对象没红（rc=$rc）：$out"
 
-# 场景 2：S1、S3 做完，这一批碰了 deploy/，Split 把纯代码的 S2 留到下一批。
+# 场景 2：S1、S3 做完，S2 没做；Split: 2 点名它并写出会重叠的测试目标。
 reset; rev=$(write_ledger "$ledger" S1 S3); pin "$rev"
 echo d2 >>"$tree/deploy/manifest.yaml"; git -C "$tree" add -A >/dev/null
-commit_with "split by irreversibility
+commit_with "split by attribution
 
-Split: 3 — S2 — 这一批要动 deploy 清单，S2 是纯代码，留着下一批"; out=$(run); rc=$?
-[ "$rc" -eq 0 ] && ok "Split 点名了真正没做的 S2，且这一批碰了 deploy/：绿" || bad "合格的 Split 被拒（rc=$rc）：$out"
+Split: 2 — S2 — 与这一批共用 crates/b/src/y.rs 的测试目标，红会互相掩盖"; out=$(run); rc=$?
+[ "$rc" -eq 0 ] && ok "Split: 2 点名了真正没做的 S2：绿" || bad "合格的 Split 被拒（rc=$rc）：$out"
 
 # 场景 3：三条都填了 `代码` 格 ⇒ 绿，不看 Split、也不看改了哪些文件。
 reset; rev=$(write_ledger "$ledger" S1 S2 S3); pin "$rev"
@@ -140,56 +143,53 @@ out=$(run); rc=$?
 out=$(COGNEVA_EVENT_PSQL="$tmp/psql.sh" COGNEVA_TODO_LEDGER="$tmp/missing.md" python3 "$tree/scripts/hooks/batch-gate.py" --root "$tree" --base origin/main 2>&1); rc=$?
 [ "$rc" -eq 2 ] && ok "台账读不到：退 2（没判）" || bad "台账读不到时的行为不对（rc=$rc）：$out"
 
-# ---- 第 3 条理由判的是两侧的不对称，不是「这一批有没有碰 deploy/」-----------
+# ---- 只认两条理由（属主 2026-11-24）：2 失败不可归因 / 4 一次读不完 ----------
 #
-# 这几组各用一本自己的台账：主台账要做到「这一批全做完」，多出来的不可回退条目
-# 会把它变成红。
+# 1（验证面不同）与 3（不可逆/不对称）不再能把一条待办拆离批次——默认全部是一批。
 ledger_code="$tree/ledger-code.md"
-ledger_irr="$tree/ledger-irr.md"
-SPECS_IRR="S1=crates/a/src/x.rs S2=crates/b/src/y.rs S3=deploy/manifest.yaml S4=crates/a/migrations/001_x.up.sql"
 long=$(printf '这一条要读的正文很长%.0s' $(seq 1 120))
 ledger_long="$tree/ledger-long.md"
 
-# 不可回退的那几条在**被排除**的一侧：这一批是纯代码，deploy/ 与迁移留到下一批。
-reset; SPECS="$SPECS_IRR" rev_irr=$(write_ledger "$ledger_irr" S1 S2); pin "$rev_irr"
-echo a6 >>"$tree/crates/a/src/x.rs"; echo b6 >>"$tree/crates/b/src/y.rs"
-git -C "$tree" add -A >/dev/null
-commit_with "irreversible side is the excluded one
+# Split: 1 不再成立。
+reset; SPECS="S1=crates/a/src/x.rs S2=crates/b/src/y.rs" rev_code=$(write_ledger "$ledger_code" S1); pin "$rev_code"
+echo a6 >>"$tree/crates/a/src/x.rs"; git -C "$tree" add -A >/dev/null
+commit_with "the old validation-face reason
 
-Split: 3 — S3, S4 — 这一批是纯代码；deploy 与迁移要单独落地，回滚一次提交回不到原状"
-out=$(run "$tree" "$ledger_irr"); rc=$?
-[ "$rc" -eq 0 ] && ok "不可回退的那一侧被排除、这一批是纯代码：绿" || bad "正确的不对称被拒（rc=$rc）：$out"
+Split: 1 — S2 — 这一条只在 CI 上判"
+out=$(run "$tree" "$ledger_code"); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "不再是合法理由"; } && ok "Split: 1 不再是合法理由：红" || bad "Split: 1 还被当成理由（rc=$rc）：$out"
 
-# 两侧都碰：拆开并没有把不可回退的那一侧单独拎出来。
-reset; SPECS="$SPECS_IRR" rev_irr=$(write_ledger "$ledger_irr" S1 S2); pin "$rev_irr"
+# Split: 3 不再成立。
+reset; SPECS="S1=crates/a/src/x.rs S2=crates/b/src/y.rs" rev_code=$(write_ledger "$ledger_code" S1); pin "$rev_code"
 echo a7 >>"$tree/crates/a/src/x.rs"; echo d7 >>"$tree/deploy/manifest.yaml"
 git -C "$tree" add -A >/dev/null
-commit_with "both sides irreversible
+commit_with "the old irreversibility reason
 
-Split: 3 — S3, S4 — 两侧都有不可回退的东西"
-out=$(run "$tree" "$ledger_irr"); rc=$?
-{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "两侧都碰"; } && ok "两侧都碰不可回退的面：红" || bad "两侧都碰却没红（rc=$rc）：$out"
-
-# 改的是 deploy/ 下的一个**测试夹具**：它不改任何已部署的东西，回滚一次提交就回到
-# 原状。按目录前缀一刀切会把它读成一次滚动，于是这条理由又能被借去排除别人。
-reset; SPECS="S1=crates/a/src/x.rs S2=crates/b/src/y.rs" rev_code=$(write_ledger "$ledger_code" S1); pin "$rev_code"
-echo a75 >>"$tree/crates/a/src/x.rs"; mkdir -p "$tree/deploy/scripts/tests"
-printf '#!/bin/sh\n' >"$tree/deploy/scripts/tests/x.test.sh"
-git -C "$tree" add -A >/dev/null
-commit_with "a test fixture under deploy is not a rollout
-
-Split: 3 — S2 — 这一批只是改了 deploy/ 下的夹具"
+Split: 3 — S2 — deploy 要单独落地"
 out=$(run "$tree" "$ledger_code"); rc=$?
-{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "两侧都没碰"; } && ok "deploy/ 下的夹具不算不可逆：理由不成立" || bad "夹具被当成滚动（rc=$rc）：$out"
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "不再是合法理由"; } && ok "Split: 3 不再是合法理由：红" || bad "Split: 3 还被当成理由（rc=$rc）：$out"
 
-# 两侧都不碰：没有「回滚一次提交回不到原状」的东西，理由不成立。
-reset; SPECS="S1=crates/a/src/x.rs S2=crates/b/src/y.rs" rev_code=$(write_ledger "$ledger_code" S1); pin "$rev_code"
-echo a8 >>"$tree/crates/a/src/x.rs"; git -C "$tree" add -A >/dev/null
-commit_with "neither side irreversible
+# 没有触点 / 写了 `touches: unknown` 的待办仍在本批：没做完照样红。
+reset
+printf '| S1 | 没有触点的那条 | 未落 | 判据 |\n| S2 | 写了 unknown 的那条 | 未落 | 判据 ｜ touches: unknown — 还没定 |\n' >"$ledger_code"
+git -C "$tree" add -A >/dev/null; git -C "$tree" commit -qm "rows without usable touches" >/dev/null
+pin "$(git -C "$tree" rev-parse HEAD)"
+commit_with "no split, and no usable touches"; out=$(run "$tree" "$ledger_code"); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "S1" && printf '%s' "$out" | grep -q "S2"; } \
+  && ok "没有触点 / unknown 的待办仍在本批：没做完就红" \
+  || bad "触点缺失把待办挪出了批次（rc=$rc）：$out"
 
-Split: 3 — S2 — 两侧都是纯代码"
-out=$(run "$tree" "$ledger_code"); rc=$?
-{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "两侧都没碰"; } && ok "两侧都不碰不可回退的面：红" || bad "两侧都不碰却没红（rc=$rc）：$out"
+# 五格行按**现在这本**台账的状态判完成：改成 `已落` 且差距为空，就不欠了。
+reset
+printf '| CC01 | 做完的那条 | 读数已落 ｜ touches: crates/a/src/x.rs | — | 已落 |\n' >"$ledger_code"
+git -C "$tree" add -A >/dev/null; git -C "$tree" commit -qm "the ledger at open: one open row" >/dev/null
+printf '| CC01 | 先写成未落的那条 | 还没动 ｜ touches: crates/a/src/x.rs | 改三处 | 未落 |\n' >"$ledger_code"
+git -C "$tree" add -A >/dev/null; git -C "$tree" commit -qm "the row is open when the round opens" >/dev/null
+pin "$(git -C "$tree" rev-parse HEAD)"
+printf '| CC01 | 做完的那条 | 读数已落 ｜ touches: crates/a/src/x.rs | — | 已落 |\n' >"$ledger_code"
+git -C "$tree" add -A >/dev/null; git -C "$tree" commit -qm "and done in the live ledger" >/dev/null
+commit_with "no split needed"; out=$(run "$tree" "$ledger_code"); rc=$?
+[ "$rc" -eq 0 ] && ok "五格行按现在这本台账判：改成已落就不欠" || bad "做完了仍按钉住的那版读成没做（rc=$rc）：$out"
 
 # 第 4 条理由要拿**整行正文**去比窗口份额：标题截断到 80 字时，最长的几条会被
 # 估成同一个数，于是这条理由永远不成立。

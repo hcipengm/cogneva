@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""默认做完整批：没做的待办必须逐条点名，并给出四条理由之一。
+"""默认做完整批：没做的待办必须逐条点名，并给出两条理由之一。
 
-这一推里，台账上**所有未完成的待办**要么做完了（那一行填了 `代码` 格：树里有了实现，
-并点名了那条「没有它就会红」的测试），要么被 `Split:` 逐条点名排除。触点不是判据——
-「有文件改过」与「做完了」不是一件事（属主 2026-11-21 定）。两句判据：
+这一推里，本轮批次里的**所有未完成待办**要么做完了（五格行改成 `已落` 且差距为空；
+三格行填了 `代码` 格），要么被 `Split:` 逐条点名排除。触点不是判据——「有文件改过」
+与「做完了」不是一件事（属主 2026-11-21 定），「能不能写出终态」才是批次成员资格的
+判据（属主 2026-11-24 定）。两句判据：
 
   1. **没点名的排除 = 拒**。`Split:` 必须列出它排除的 S 号：
-         Split: 1 — S48, S63 — <为什么这两条这一批做不了>
+         Split: 2 — S48, S63 — <为什么这两条这一批做不了>
      没有被点名的未完成待办出现在「没做」的集合里 ⇒ 拒，并把它们列出来。
-  2. **理由要过真假判定**（四条里三条可机检）：
-     - 1 验证面不同   两侧映射到的 cargo 包集合必须不同，相同即假；
+  2. **理由要过真假判定**（只认两条）：
      - 2 失败不可归因 机器判不了真假，但必须点名会重叠的测试目标，记进历史；
-     - 3 不可逆/不对称 被排除的那几条与这一批之间，**恰有一侧**碰
-                      deploy/、migrations/、scripts/host/（回滚一次提交回不到原状
-                      的那一侧必须单独落地）；两侧都碰或都不碰 ⇒ 假；
      - 4 一次读不完   被排除那几行的正文估算 token 必须超过窗口里它能占的份额
                       （窗口由模型声明导出，`--window-tokens` 或 `COGNEVA_CONTEXT_WINDOW`）。
+
+批次成员由这一轮钉住的那版台账定；**做没做完读现在这本台账**——钉住的那版只回答
+「这一批有哪几条」，拿它判完成度会把刚做完的行永远读成没做。
 
 台账由 `COGNEVA_TODO_LEDGER` 指定（或 `--ledger`）。读不到 ⇒ 退 2「没判」，不是绿。
 
@@ -56,27 +56,6 @@ OPEN_WORDS = ("未落", "部分", "进行中", "待落", "待裁", "未开始")
 # 台账上的「这一轮」：行里写 `round: current` 的算本轮批次，其余是积压。积压不会被
 # 悄悄丢掉——工具每次运行都把它的条数印出来，而且它一旦被选中就必须写回 `round:`。
 # 没有一行标 `round:` 时，全部未完成待办都算本轮（默认全量）。
-
-
-def irreversible(path: str) -> bool:
-    """这个路径动的是**不可回退**的面：回滚一次提交回不到原状。
-
-    三种：`deploy/`（推下去就滚动）、`scripts/host/`（现场的工具）、迁移目录。
-    迁移目录按**目录段**判而不是按前缀：迁移住在 `crates/<crate>/migrations/` 里，
-    按前缀判的话这条理由永远匹配不到任何迁移。
-    """
-    p = path.lstrip("./")
-    # 测试文件不算：它们不改任何已部署的东西，回滚一次提交就回到原状。按目录前缀
-    # 一刀切会把「改了 deploy/ 下的一个夹具」读成一次滚动，于是这条理由又能被借。
-    segments = p.split("/")
-    if "tests" in segments or p.endswith(".test.sh"):
-        return False
-    return (
-        p.startswith("deploy/")
-        or p.startswith("scripts/host/")
-        or p.startswith("migrations/")
-        or "/migrations/" in p
-    )
 
 
 def estimate_tokens(text: str) -> int:
@@ -123,44 +102,14 @@ def messages(root: pathlib.Path, base: str) -> str:
     ).stdout
 
 
-def packages(paths: list[str]) -> set[str]:
-    return {"/".join(p.split("/")[:2]) for p in paths if "/" in p}
-
-
 def judge(kind: str, excluded: list[str], detail: str, touched: list[str], items: dict, window: int) -> str | None:
-    if kind == "1":
-        sides = [s.strip() for s in re.split(r"[|｜]", detail)]
-        if len(sides) != 2:
-            return "Split: 1 要写两侧边界（`Split: 1 — <S 号…> — <一侧路径> | <另一侧路径>`）"
-        left = [p for p in touched if p.startswith(sides[0])]
-        right = [p for p in touched if p.startswith(sides[1])]
-        if not left or not right or packages(left) == packages(right):
-            return f"Split: 1 说验证面不同，但两侧落在同一批 cargo 包（{sorted(packages(left))}）"
-        return None
-    if kind == "3":
-        # 这条理由的全部内容是「被拆开的两侧里，恰有一侧动的是回不去的东西」：
-        # 那一侧必须单独落地，因为回滚一次提交回不到原状，混在别人里面会让别人
-        # 也没法单独回滚。所以判的是**两侧的不对称**，不是「这批里有没有 deploy/」：
-        # 两侧都碰 ⇒ 拆开没有把不可回退的那一侧拎出来，理由不成立；
-        # 两侧都不碰 ⇒ 没有回不去的东西，理由更不成立。
-        batch_irr = sorted(p for p in touched if irreversible(p))
-        excl_irr = sorted(
-            p for name in excluded for p in getattr(items.get(name), "touches", []) if irreversible(p)
+    if kind in ("1", "3"):
+        # 这两条在 2026-11-24 之前可以用；属主收掉了：默认全部是一批，只有
+        # 「失败不可归因」与「一次读不完」能把一条拆离。
+        return (
+            f"Split: {kind} 不再是合法理由（只认 2 失败不可归因 / 4 一次读不完）："
+            "默认全部是一批，不能按验证面或不可逆性挑子集"
         )
-        if batch_irr and excl_irr:
-            return (
-                "Split: 3 说不可逆或不对称，但两侧都碰了不可回退的面：这一批动了 "
-                + "、".join(batch_irr[:3])
-                + "，被排除的那几条也要动 "
-                + "、".join(excl_irr[:3])
-                + "。两侧都回不去，拆开并没有把不可回退的那一侧单独拎出来"
-            )
-        if not batch_irr and not excl_irr:
-            return (
-                "Split: 3 说不可逆或不对称，但两侧都没碰 deploy/、migrations/、scripts/host/——"
-                "没有「回滚一次提交回不到原状」的东西，这条理由不成立"
-            )
-        return None
     if kind == "4":
         if window <= 0:
             return "Split: 4 要拿窗口份额比，但没给窗口（--window-tokens 或 COGNEVA_CONTEXT_WINDOW）"
@@ -175,7 +124,7 @@ def judge(kind: str, excluded: list[str], detail: str, touched: list[str], items
         if not re.search(r"[a-z0-9_]+\.rs|tests?/", detail):
             return "Split: 2 要点名会重叠的测试目标（文件或测试名）"
         return None
-    return f"Split: {kind} 不在四条里（只认 1 验证面 / 2 归因 / 3 不可逆 / 4 读不完）"
+    return f"Split: {kind} 不是合法理由（只认 2 失败不可归因 / 4 一次读不完）"
 
 
 def main(argv: list[str]) -> int:
@@ -204,28 +153,40 @@ def main(argv: list[str]) -> int:
         print("batch-gate: 事件流里没有开着的一轮（先 `scripts/hooks/round.py open`），这一推没判。",
               file=sys.stderr)
         return 2
+    # 这一轮钉住的只是**清单**（这一批有哪几条）；做没做完读**现在这本**台账。
+    # 拿钉住的那一版判完成度，刚做完的行会永远读成没做——那一版写的时候它们还没做。
+    live = todo_source.normalize(args.source or todo_source.default_spec())
     try:
         pinned = round_mod.ledger_at(current[1], todo_source.default_spec())
         round_ids = {i.id for i in todo_source.load(f"md:{pinned}")}
+        items, without, deferred = todo_source.partition(live)
+        known = todo_source.all_ids(live)
     except todo_source.Unreadable as e:
-        print(f"batch-gate: 这一轮钉住的那版台账读不到：{e} —— 这一推没判。", file=sys.stderr)
+        print(f"batch-gate: 台账读不到：{e} —— 这一推没判。", file=sys.stderr)
         return 2
 
-    try:
-        items, without, _deferred = todo_source.partition(args.source or f"md:{pinned}")
-        if without:
-            print(
-                "batch-gate: 这些未完成待办没有 `touches:`，它们既做不了也判不了："
-                + "、".join(without),
-                file=sys.stderr,
-            )
-            return 2
-        todos = items
-    except todo_source.Unreadable as e:
-        print(f"batch-gate: {e} —— 这一推没判。", file=sys.stderr)
-        return 2
+    vanished = sorted(round_ids - known)
+    if vanished:
+        # 被删掉不等于做完：钉住过的那条从台账里消失，要么是有人做完了却删了行，
+        # 要么是它被悄悄拿掉了。两种都要人来看，不能读成「这一批全绿」。
+        print(
+            "FAIL: 这一轮钉住的条目在台账里被删掉了（删掉不当作做完）："
+            + "、".join(vanished),
+            file=sys.stderr,
+        )
+        return 1
+
+    # 触点不是判据（属主 2026-11-24）：没写触点、写了 `unknown` 的行都在本批里，
+    # 只是「这一遍该动哪些文件」读不出来。它们照旧要按终态做完或被 Split 点名。
+    if without or deferred:
+        print(
+            f"batch-gate: {len(without) + len(deferred)} 条没写触点（`unknown` {len(deferred)} 条），"
+            "仍在本批，按终态判。",
+            file=sys.stderr,
+        )
+    todos = [i for i in items if not round_ids or i.id in round_ids]
     if not todos:
-        print("batch-gate: 台账里没有未完成的待办。")
+        print("batch-gate: 本轮批次里没有未完成的待办。")
         return 0
 
     touched = changed(root, current[2] or "")
@@ -285,15 +246,15 @@ def main(argv: list[str]) -> int:
     untouched = [i.id for i in todos if i.id not in done]
 
     if not untouched:
-        print(f"batch-gate: 台账上 {len(todos)} 条未完成待办，这一推全部动到了。")
+        print(f"batch-gate: 本轮批次 {len(todos)} 条未完成待办，这一推全部做完了。")
         return 0
 
     msg = messages(root, args.base)
     split = re.search(r"^Split:\s*([1-4])\s*—\s*([^—\n]*)—\s*(.*)$", msg, re.M)
     if not split:
         print(
-            f"FAIL: 台账上还有 {len(untouched)} 条未完成待办没动，提交信息里也没有 "
-            "`Split: <1-4> — <S 号…> — <理由>`。\n      "
+            f"FAIL: 台账上还有 {len(untouched)} 条未完成待办没做，提交信息里也没有 "
+            "`Split: <2|4> — <S 号…> — <理由>`（只认 2 失败不可归因 / 4 一次读不完）。\n      "
             + "、".join(untouched),
             file=sys.stderr,
         )

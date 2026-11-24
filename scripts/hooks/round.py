@@ -293,14 +293,18 @@ def open_round(spec: str | None, allow_open: bool = False, code_rev_override: st
     import os
     import uuid
     source = todo_source.normalize(source)
-    # 批次用 `partition`，不用 `load`：写了 `touches: unknown` 的条目是「本轮不排」，
-    # 它与两道编译门用的是同一个函数（`partition` 的 docstring），批次在三个地方是同一个数。
+    # 批次用 `partition`，与两道编译门同一个函数（见它的 docstring）：**全部**未完成
+    # 条目都在本批。触点不是判据（属主 2026-11-24），`touches: unknown` 只说明「这一遍
+    # 该动哪儿还说不准」，不是「本轮不排」。
     if source.startswith("md:"):
-        batch, _without, deferred = todo_source.partition(source)
+        batch, without, deferred = todo_source.partition(source)
     else:
-        batch, deferred = [], []
-    if deferred:
-        print(f"round: 本轮不排（`touches: unknown`）{len(deferred)} 条：{', '.join(deferred)}")
+        batch, without, deferred = [], [], []
+    if deferred or without:
+        print(
+            "round: 本批里有 %d 条没写触点（`unknown` %d 条）：这一遍该动哪儿读不出来，"
+            "做没做完按终态判。" % (len(without) + len(deferred), len(deferred))
+        )
     if batch:
         print(f"round: 本批 {len(batch)} 条（同一批编辑，不挑子集）：")
         for item in batch:

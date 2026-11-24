@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """这一轮的默认批次：所有未完成的待办，一次改完，再编译一次。
 
-默认是**合并**：把所有还没做完的待办要点名的文件取并集，这就是本轮该改的全部。
-拆分不是常规动作，是必须举证的例外，只认四条理由（写在拒绝信息里，也写进提交历史）：
+默认是**合并**：把所有还没做完的待办放进同一批，一次改完。拆分不是常规动作，是必须
+举证的例外，只认两条理由（写在拒绝信息里，也写进提交历史）：
 
-  1. 验证面不同     一个要 CI 才判、一个要现场数据、一个要另一台机器
-  2. 失败不可归因   两处改动会在同一批测试里互相掩盖，红了说不清是谁
-  3. 不可逆/不对称  一处只改代码，另一处要滚动、要迁移、要动现场
-  4. 一次读不完     触点多到一遍读不完，半改的风险上升——沿家族边界拆，每份自身闭合
+  2. 失败不可归因   两处改动会在同一批测试里红得互相掩盖，红了说不清是谁
+  4. 一次读不完     正文长到一遍读不完，半改的风险上升——沿家族边界拆，每份自身闭合
 
-待办的来源是一张台账（路径由 `COGNEVA_TODO_LEDGER` 指定；它不在本仓）：每一项未完成的待办在自己的行里写
-`touches: <路径>[, <路径>…]`。没有这一段的未完成待办会被当场点名——没有触点的
-待办不是一个可执行的批次，它只是一句话。
+触点不是判据（属主 2026-11-24）：能不能写出终态才是。待办的来源是一张台账（路径由
+`COGNEVA_TODO_LEDGER` 指定；它不在本仓），未完成的行在自己的行里写 `touches:
+<路径>[, <路径>…]` 只是告诉这一遍该动哪些文件；没写或写 `unknown` 的行仍在批次里，
+只是那个读数缺失。
 
 用法：
 
@@ -92,7 +91,10 @@ def working_tree_changes(root: pathlib.Path) -> list[str]:
 
 
 def open_todos(ledger: pathlib.Path):
-    """(带触点的未完成待办, 没写触点的, 明确 unknown 不排的)——与推之前那道门同一段代码。"""
+    """(全部未完成待办, 没写触点的, 写了 unknown 的)——与推之前那道门同一段代码。
+
+    后两项是读数：那几条仍在批次里，只是「这一遍该动哪儿」读不出来。
+    """
     items, without, deferred = todo_source.partition(f"md:{ledger}")
     return [(i.id, i.touches) for i in items], without, deferred
 
@@ -249,7 +251,7 @@ def report(root: pathlib.Path, changed: list[str], batch: list[str], todos, miss
         state = "三格齐" if not miss else "缺 " + "、".join(miss)
         print(f"  待办 {name}: {len(paths)} 个触点；{state}")
     if missing_todos:
-        print(f"  ⚠ 这些待办没写 `touches:`，批次算不出它们要动什么：{', '.join(missing_todos)}")
+        print(f"  ⚠ 这些待办没写 `touches:`，读不出它们要动什么（仍在本批）：{', '.join(missing_todos)}")
     if editing:
         for name, missing_paths in editing_gaps:
             print(
@@ -279,39 +281,25 @@ def report(root: pathlib.Path, changed: list[str], batch: list[str], todos, miss
     for path, why in owed:
         print(f"  TODO {path}  <- {why}")
 
-    # 没有触点的待办让「默认批次」算不出来。它不是一条警告：一条算不出来的待办
-    # 可以悄悄漏过去，而漏过去的正是「这一轮没做的那些」。
+    # 触点不是判据（属主 2026-11-24）：没写触点、写了 `unknown` 的待办**仍在批次里**，
+    # 只是「这一遍该动哪些文件」读不出来——做没做完按终态那一格判。所以这两种都只印
+    # 读数，不挡编译：把它们算成缺口，一条长期条目就能让整棵树永久编不了。
     if missing_todos:
         print(
-            f"\n这些未完成待办没有 `touches:`，本轮批次算不出来（{len(missing_todos)} 项）："
-            f"{', '.join(missing_todos)}\n"
-            "每条待办在自己的行里写 `touches: <路径>[, <路径>…]`，路径从树里推导（引用它的"
-            "装配点、测试、注册表、chart、夹具），推不出来就写 `touches: unknown` 并挡住批次。"
+            f"\n有 {len(missing_todos)} 条待办没写 `touches:`（仍在本批，按终态判）："
+            f"{', '.join(missing_todos)}"
         )
-        return 1
-
-    # `touches: unknown` 的待办不在批次里：它说的是「这一条不属于任何一遍编辑，
-    # 按面开新行」。所以它**不挡编译，也不挡推送**——把它算成缺口，一条长期条目就
-    # 能让整棵树永久编不了，那不是严格，是把可验证性关掉（上面 `missing_todos`
-    # 那一支不同：写漏了 `touches:` 是这一条本身还没准备好进批次）。
-    #
-    # 2026-11-23 之前这里在非 `--editing` 调用下退 1，而编译垫片调用时从不带
-    # `--editing`（没人带）：一条 `touches: unknown` 从此让每一次 `cargo test` 都
-    # 被挡在门口。说它是「推之前点名」的那句话也没有任何门去判——推之前那道门
-    # （`batch-gate.py`）把 `deferred` 整列丢掉。
     if deferred:
         print(
-            f"\n有 {len(deferred)} 条待办写了 `touches: unknown`（不在任何一批里）："
-            f"{', '.join(deferred)}\n"
-            "要做的时候按面开新行：每开一面，一条带触点的五格行。"
+            f"\n有 {len(deferred)} 条待办写了 `touches: unknown`（仍在本批，按终态判）："
+            f"{', '.join(deferred)}"
         )
 
     if (editing_gaps if editing else gaps) or owed:
         print(
-            "\n默认是**合并**：把这一轮所有待办一次改完，再编译一次。要拆，必须点出四条之一：\n"
-            "  1 验证面不同（CI/现场/另一台机器）  2 失败不可归因（同一批测试里红会互相掩盖）\n"
-            "  3 不可逆或代价不对称（要滚动/迁移/动现场）  4 一次读不完（沿家族边界拆，每份自身闭合）\n"
-            "写法：提交信息里一行  Split: <1|2|3|4> — <拆分边界>\n"
+            "\n默认是**合并**：把这一轮所有待办一次改完，再编译一次。要拆，只有两条理由：\n"
+            "  2 失败不可归因（同一批测试里红会互相掩盖）  4 一次读不完（沿家族边界拆，每份自身闭合）\n"
+            "写法：提交信息里一行  Split: <2|4> — <拆分边界>\n"
             "确实不需要改的单个文件：  Skip: <path> — <为什么这一族不动它>"
         )
         return 1
@@ -436,13 +424,13 @@ def main(argv: list[str]) -> int:
                 continue
             checked.append((name, paths, miss))
         if bad:
-            print("family: 这些待办的触点在树里不存在，批次算不出来：")
+            # 触点不是判据：写错了一个路径是读数有错，不是这一条不该做。
+            print("family: 这些待办写的触点在树里不存在（读数有错，仍在本批）：")
             for line in bad:
                 print(f"  {line}")
-            return 2
         todos = checked
         if deferred:
-            print(f"family: 本轮不排的待办（touches: unknown）{len(deferred)} 项：{', '.join(deferred)}")
+            print(f"family: 这些待办写了 `touches: unknown`（仍在本批）：{', '.join(deferred)}")
         for _name, paths, _miss in todos:
             batch += paths
         # 台账仓那一侧的改动面：从这一轮钉住的那个 rev 算起，含工作区。没有开着一轮

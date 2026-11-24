@@ -78,8 +78,8 @@ class Item:
         # token」会把最长的几条估成同一个数——一条待办的正文都在标题之外。
         self.text = text
         self.touches = touches
-        # `touches: unknown — 理由`：明确本轮不排。它不是「忘了写触点」——
-        # 两者的修法不同（前者要 Split 点名，后者要先补触点），所以这里分开。
+        # `touches: unknown — 理由`：这一遍该动哪儿还说不准。它与「忘了写触点」都
+        # **仍在批次里**（属主 2026-11-24：触点不是判据），分开只为把读数说准。
         self.deferred = deferred
         # 三格：代码 / 上线 / 验证。**判「做没做完」只认这三格**，不认触点。
         # 触点是「这一轮该改哪些文件」的提示；一个文件改了不等于那条待办做完了
@@ -179,9 +179,9 @@ def _fixed_item(line: str, notouch: list[str], malformed: list[str],
         # 最坏的形状，因为它看起来像做完了。
         return None
     if not touches and not deferred:
-        # 没有触点的行算不出批次。
+        # 触点不是判据（属主 2026-11-24）：没写触点的行照样进批次——它只是让「这一遍
+        # 编辑该动哪些文件」读不出来；做没做完由终态那一格判。这里只记一笔读数。
         notouch.append(cells[0])
-        return None
     item = Item(cells[0], cells[1][:80], line.strip(), touches, deferred,
                 fixed=True, gap=gap)
     # 未落的行进批次；写着已落却留着差距的按未完成读（debt），与三格那种同一处置。
@@ -254,15 +254,10 @@ def _md_split(path: pathlib.Path) -> tuple[list[Item], list[Item]]:
         for found in re.finditer(r"[｜|]\s*touches:\s*([^|｜\n]+)", line):
             pass
         touches: list[str] = []
-        # `touches: unknown — 理由` 是「这一条不进批次」的正式写法，但**理由里不能有逗号**：
-        # 下面先按逗号切触点，切完第一段就不是 `unknown` 了，整句又被当成一个路径，于是
-        # 每一道读台账的门都报「这个路径不在树里」，而且报的是理由那半句——2026-11-20 实测，
-        # 一条我刚写下的待办把整批卡死了两次。逗号在这里是分隔符，不是标点。
-        #
-        # 没有 `unknown` 这个后门：一行待办要么点得出它要动的文件，要么批次算不出来。
-        # `touches: unknown — 理由`：明确本轮不排。这一支此前**只写在注释里、没有实现**——
-        # 解析器只是把恰好等于 `unknown` 的那一段丢掉，于是那一行变成「没有触点」，
-        # 每一道读台账的门都报「算不出批次」。2026-11-20 实测：一条待办因此卡了整批三次。
+        # `touches: unknown — 理由` 说的是「这一遍该动哪儿还说不准」，条目本身仍在批次里
+        # （属主 2026-11-24），但**理由里不能有逗号**：下面先按逗号切触点，切完第一段就
+        # 不是 `unknown` 了，整句又被当成一个路径。2026-11-20 实测，一条我刚写下的待办
+        # 把整批卡死了两次。逗号在这里是分隔符，不是标点。
         deferred = bool(found) and found.group(1).strip().startswith("unknown")
         if found:
             raw = found.group(1).strip()
@@ -279,9 +274,13 @@ def _md_split(path: pathlib.Path) -> tuple[list[Item], list[Item]]:
         else:
             out.append(item)
     if notouch:
-        raise Unreadable(
-            "这些行没有 `touches:`，批次算不出来（要么点名它要动的文件，要么写 `touches: unknown — 理由`）："
-            + "、".join(notouch)
+        # 触点不是判据（属主 2026-11-24）：没有触点的行照样进批次，做没做完按终态判。
+        # 这一行是读数——「这一遍编辑该动哪些文件」还没写，不是「这一条不存在」。
+        print(
+            f"todo_source: {len(notouch)} 条没写 `touches:`，这一遍编辑该动哪儿读不出来"
+            "（仍在本批，按终态判）：" + "、".join(notouch[:6])
+            + ("…" if len(notouch) > 6 else ""),
+            file=sys.stderr,
         )
     if legacy_status:
         print(
@@ -484,21 +483,16 @@ def worker_name() -> str:
 
 
 def partition(spec: str) -> tuple[list[Item], list[str], list[str]]:
-    """(有触点的未完成条目, 没写触点的, 明确 `unknown` 不排的)。
+    """(全部未完成条目, 没写触点的, 写了 `unknown` 的)。
+
+    后两项是**读数**，不是排除名单（属主 2026-11-24：触点不是判据，能不能写出终态
+    才是；默认全部是一批，只有「失败不可归因」与「一次读不完」能按 `Split: 2/4` 拆离）。
+    触点回答的是「这一遍编辑该动哪些文件」，不回答「这一条要不要做」——`touches:
+    unknown` 说的是「还说不准动哪儿」，不是「这一轮不排」。
 
     两道门（编译前、推之前）必须用这**一个**函数，否则同一个批次在两道门上是两个数。
     """
     items = load(spec)
-    with_touch: list[Item] = []
-    without: list[str] = []
-    deferred: list[str] = []
-    for item in items:
-        if item.deferred:
-            deferred.append(item.id)
-            continue
-        if not item.touches:
-            # `unknown` 不带理由的，按「没写触点」算：那是漏，不是明确的推迟。
-            without.append(item.id)
-            continue
-        with_touch.append(item)
-    return with_touch, without, deferred
+    without = [item.id for item in items if not item.touches and not item.deferred]
+    deferred = [item.id for item in items if item.deferred]
+    return items, without, deferred

@@ -5,7 +5,7 @@
 #   1. 差距非空的 `未落` 行进批次，触点照读；
 #   2. 差距为空的 `已落` 行不进批次（终态到了）；
 #   3. 写着 `已落` 却还留着差距的行按**未完成**读：跳过它等于承认那个假的终态；
-#   4. 没有 `touches:` 的行拒读并点名——留空让它「不在批次里」，那是看起来像做完的最坏形状。
+#   4. 没有 `touches:` 的行照读（触点不是判据，属主 2026-11-24），只印一条读数。
 set -uo pipefail
 root=$(git rev-parse --show-toplevel)
 loader="$root/scripts/hooks/todo_source.py"
@@ -57,12 +57,12 @@ print('DEBT', len(debt), ' '.join(i.id for i in debt))
     && ok "已落但差距非空：按未完成读，进 debt" \
     || bad "假的已落被当成终态（rc=$rc）：$out"
 
-# 4. 没有触点：拒读并点名。
+# 4. 没有触点：照读进批次，只印一条读数（触点不是判据）。
 printf '| CC04 | 终态 | 现在 | 差距 | 未落 |\n' >"$tmp/notouch.md"
 out=$(run "$tmp/notouch.md"); rc=$?
-{ [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q "CC04"; } \
-    && ok "没有触点：拒读并点名" \
-    || bad "没有触点的行被静默丢掉（rc=$rc）：$out"
+{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "PARSED 1 CC04"; } \
+    && ok "没有触点：照读进批次，只印读数" \
+    || bad "没有触点的行被丢出了批次（rc=$rc）：$out"
 
 # 5. 已落行的差距格带着触点尾巴：那是写法不是差距，读成债就等于这条永远欠着。
 printf '| CC05 | 终态 | 已落（971c92db5） | — ｜touches: scripts/hooks/round.py | 已落 |\n' >"$tmp/closed-touches.md"
