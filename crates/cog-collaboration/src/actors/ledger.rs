@@ -821,6 +821,34 @@ mod tests {
             .collect()
     }
 
+    /// 重钉：批次按新台账重算，而「自开工以来」的两个坐标留在第一次开工那一刻。
+    /// 拿真仓问，因为这条判据读的是 ref 上那一份载荷。
+    #[test]
+    fn re_pinning_recomputes_the_batch_but_not_the_range() {
+        let dir = std::env::temp_dir().join(format!("ledger-repin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.display().to_string();
+        git(&d, &["init", "-q"]);
+        git(&d, &["config", "user.email", "t@t"]);
+        git(&d, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("ledger.md"), "| N01 | t | n | g | 未落 |\n").unwrap();
+        git(&d, &["add", "-A"]);
+        git(&d, &["commit", "-qm", "base"]);
+
+        let gaps = serde_json::Map::new();
+        let first = record_git_book(&d, &ids(&["N01"]), &gaps, "rev-A", "code-A").unwrap();
+        assert_eq!(first["code_rev"], "code-A");
+        assert_eq!(first["first_rev"], "rev-A");
+
+        let again = record_git_book(&d, &ids(&["N01", "N02"]), &gaps, "rev-B", "code-B").unwrap();
+        assert_eq!(again["code_rev"], "code-A", "重钉把「自开工以来」清零了");
+        assert_eq!(again["first_rev"], "rev-A");
+        assert_eq!(again["ledger_rev"], "rev-B", "批次没有按新台账重算");
+        assert_eq!(again["batch"].as_array().map(|a| a.len()), Some(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 事件流那本书：批次原样带着，`ledger_rev` 是空串（这本台账没有版本坐标）。
     #[test]
     fn the_event_book_carries_the_batch_and_no_version() {
@@ -1128,21 +1156,13 @@ pub async fn open(events: Option<&std::sync::Arc<dyn cog_core::RoundEvents>>) ->
             .unwrap_or_default(),
         &["rev-parse", "HEAD"],
     );
-    // 重钉继承第一次开工的基准。
-    let first_rev = existing_first_rev(&repo).unwrap_or_else(|| ledger_rev.clone());
-    let payload = round_payload(&batch, &gaps, &ledger_rev, &code_rev, &first_rev);
-    let sha = match write_book(&repo, &payload.to_string()) {
-        Ok(s) => s,
+    let payload = match record_git_book(&repo, &batch, &gaps, &ledger_rev, &code_rev) {
+        Ok(payload) => payload,
         Err(e) => {
-            eprintln!("ledger: {e}（{repo}）");
+            eprintln!("ledger: {e}");
             return 2;
         }
     };
-    let (_, ok) = git(&repo, &["update-ref", "--create-reflog", ROUND_REF, &sha]);
-    if !ok {
-        eprintln!("ledger: {ROUND_REF} 没写成");
-        return 2;
-    }
     println!(
         "ledger: 轮开在 {}@{}，这一批 {} 条",
         ROUND_REF,
@@ -1150,6 +1170,32 @@ pub async fn open(events: Option<&std::sync::Arc<dyn cog_core::RoundEvents>>) ->
         payload["batch"].as_array().map(|a| a.len()).unwrap_or(0)
     );
     0
+}
+
+/// 把这一轮的书写进 git 那本，返回写进去的载荷。
+///
+/// **重钉不改量程，两个坐标都不改**：批次清单按新台账重算（这是重钉的用途），而
+/// 「自开工以来改了什么」的基准必须留在第一次开工那一刻。2026-11-21 实测：只护住
+/// `first_rev` 而让 `code_rev` 跟着重钉走，结果 33 条里只有 1 条读作「动过」——
+/// 重钉一次，做过的活全部变回没做。
+fn record_git_book(
+    repo: &str,
+    batch: &[String],
+    gaps: &serde_json::Map<String, serde_json::Value>,
+    ledger_rev: &str,
+    fresh_code_rev: &str,
+) -> Result<serde_json::Value, String> {
+    let code_rev =
+        existing_payload_field(repo, "code_rev").unwrap_or_else(|| fresh_code_rev.to_string());
+    let first_rev =
+        existing_payload_field(repo, "first_rev").unwrap_or_else(|| ledger_rev.to_string());
+    let payload = round_payload(batch, gaps, ledger_rev, &code_rev, &first_rev);
+    let sha = write_book(repo, &payload.to_string()).map_err(|e| format!("{e}（{repo}）"))?;
+    let (_, ok) = git(repo, &["update-ref", "--create-reflog", ROUND_REF, &sha]);
+    if !ok {
+        return Err(format!("{ROUND_REF} 没写成"));
+    }
+    Ok(payload)
 }
 
 /// 事件流那本书上的一轮：批次、代码坐标、发起方。`ledger_rev` 是空串——平台自己的
@@ -1188,8 +1234,8 @@ fn round_payload(
     })
 }
 
-/// 书里已经记着的 `first_rev`（没有书或读不到：`None`）。
-fn existing_first_rev(repo: &str) -> Option<String> {
+/// 书里已经记着的那一格（没有书、读不到、或那一格是空的：`None`）。
+fn existing_payload_field(repo: &str, key: &str) -> Option<String> {
     let (sha, ok) = git(repo, &["rev-parse", "--verify", "--quiet", ROUND_REF]);
     if !ok || sha.is_empty() {
         return None;
@@ -1198,10 +1244,11 @@ fn existing_first_rev(repo: &str) -> Option<String> {
     if !ok {
         return None;
     }
-    serde_json::from_str::<serde_json::Value>(&body)
-        .ok()?
-        .get("first_rev")?
+    let value = serde_json::from_str::<serde_json::Value>(&body).ok()?;
+    value
+        .get(key)?
         .as_str()
+        .filter(|s| !s.is_empty())
         .map(str::to_string)
 }
 
