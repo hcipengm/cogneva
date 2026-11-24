@@ -328,19 +328,23 @@ pub fn stop_gate() -> i32 {
     if !ok || sha.is_empty() {
         return 0;
     }
-    match gate_verdict() {
-        GateOutcome::Allow(summary) => {
-            println!("{summary}");
-            0
-        }
-        GateOutcome::Refuse(message) => {
-            eprintln!("{message}");
-            2
-        }
-        GateOutcome::Unreadable(message) => {
-            eprintln!("ledger: {message}");
-            3
-        }
+    let outcome = gate_verdict();
+    let code = stop_exit(&outcome);
+    match outcome {
+        GateOutcome::Allow(summary) => println!("{summary}"),
+        GateOutcome::Refuse(message) => eprintln!("{message}"),
+        GateOutcome::Unreadable(message) => eprintln!("ledger: {message}"),
+    }
+    code
+}
+
+/// 收工门的三种结局各退什么。0 可以停、2 不许停、3 判不了——「没有轮」在调用方
+/// 更早的一步就退 0 了（那是「可以停」，不是「判不了」）。
+fn stop_exit(outcome: &GateOutcome) -> i32 {
+    match outcome {
+        GateOutcome::Allow(_) => 0,
+        GateOutcome::Refuse(_) => 2,
+        GateOutcome::Unreadable(_) => 3,
     }
 }
 
@@ -825,6 +829,14 @@ mod tests {
         assert_eq!(round.ledger_rev, "");
         assert_eq!(round.code_rev, "abc123");
         assert!(!round.round.is_empty());
+    }
+
+    /// 收工门的三态码：允许 0、拒 2、判不了 3。裸 `status` 的往返码分不出这三件事。
+    #[test]
+    fn the_stop_gate_answers_in_three_codes() {
+        assert_eq!(stop_exit(&GateOutcome::Allow("ok".into())), 0);
+        assert_eq!(stop_exit(&GateOutcome::Refuse("no".into())), 2);
+        assert_eq!(stop_exit(&GateOutcome::Unreadable("?".into())), 3);
     }
 
     /// 哪些 cargo 调用算「一次编译」：只读的元数据查询不算，也不要求它们之后重编。
