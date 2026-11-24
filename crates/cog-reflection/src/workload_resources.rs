@@ -102,10 +102,11 @@ pub const SOURCE_SEED: &str = "seed";
 /// 默认值被**配额**夹住了：这一拍量到的形状装不进 namespace 还剩下的准入余量，
 /// 写下去的那组值是「新 Pod 此刻进得去」的最大值。读数面上它与 `derived` 分开，
 /// 否则「跟测量走」与「被额度顶住」在屏上是同一行。
-pub const SOURCE_QUOTA: &str = "quota";
+pub const SOURCE_QUOTA: &str = "quota_headroom";
 
-/// namespace 额度的对象名，与 LimitRange 一样由部署给定。
-const QUOTA_NAME: &str = "cogneva-quota";
+/// namespace 额度的对象名：与清单那边同一处声明（`cog_core::topology::QUOTA`），
+/// 这里只借这个名字，不另抄一份。
+const QUOTA_NAME: &str = cog_core::topology::QUOTA;
 
 /// 判定 Job 在这个读数面上的身份。
 ///
@@ -3415,6 +3416,7 @@ mod tests {
         assert_eq!(bounded_by_headroom(shape, Some(roomy)), shape);
     }
 
+    #[test]
     fn the_namespace_default_follows_the_measured_requests() {
         let mib = 1024 * 1024;
         let quiet = default_shape(
