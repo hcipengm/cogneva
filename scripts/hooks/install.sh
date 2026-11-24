@@ -4,7 +4,7 @@
 # 机制全在仓库里，只有一件事必须在机器上落地——**编译要被看见**。垫片做两件事：
 #
 #   1. 记一行：时间、工作树、参数、HEAD、树指纹（`cogneva ledger compiled` 读它）；
-#   2. 在脏树上编译前问 `family.py --all-todos`：这一轮的默认批次还有哪些文件没改。
+#   2. 在脏树上编译前问 `cogneva ledger editing`：这一轮的默认批次还有哪些文件没改。
 #      有缺口就不编译，并把缺口打出来。
 #
 # 不需要装 git 钩子：判据在推之前那道门上（`deploy/scripts/check-compile-discipline.sh`），

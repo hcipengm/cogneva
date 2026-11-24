@@ -1,7 +1,7 @@
 //! principle: feedback_the_unit_of_work_is_the_batch_not_the_turn
 //! 开工事件：一条 `round_opened`，载荷是这一批的 id 清单。
 //!
-//! 与带外 `round.py` 写的是**同一张表、同一种形状**：那边用一条 `INSERT`，这边用一句
+//! 与带外那一版写的是**同一张表、同一种形状**：那边用一条 `INSERT`，这边用一句
 //! 参数化的 SQL；两边把 `ledger_rev` / `code_rev` / `batch` 放在同样的三个键上，于是
 //! 谁读都一样。两侧各写一套键名，就等于让「这一轮是什么」有两个答案。
 //!
@@ -137,7 +137,7 @@ impl RoundEvents for RoundEventStore {
                 .iter()
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect(),
-            // 2026-11-22 之前带外 `round.py` 把清单写成**一段含数组的字符串**，
+            // 2026-11-22 之前带外那一版把清单写成**一段含数组的字符串**，
             // 这一侧读到的是 `String`。那一段字节是真实发生过的开工记录，丢掉它等于
             // 把 33 轮判成「没有清单」——所以读得懂的旧形状就地读出来，写在注释里。
             Ok(Some(serde_json::Value::String(text))) => {

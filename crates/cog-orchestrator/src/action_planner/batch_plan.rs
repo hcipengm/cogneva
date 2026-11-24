@@ -92,7 +92,7 @@ impl BatchPlanner for LedgerBatchPlanner {
                     shape: "终态".to_string(),
                     statement: "账上再没有一行写着 `已落` 却缺三格，而且这一轮的那几条三格齐"
                         .to_string(),
-                    check: "python3 scripts/hooks/family.py --root . --terminal".to_string(),
+                    check: "cogneva ledger status".to_string(),
                 },
             ],
             counterexamples: vec![

@@ -1,7 +1,7 @@
 //! principle: feedback_the_unit_of_work_is_the_batch_not_the_turn
 //! 定批：这一轮要做的是**哪几条**，在开工那一刻钉进事件流。
 //!
-//! 带外 worker 的 `round.py` 就是这么做的：开一轮写一条 `round_opened`，载荷里是台账
+//! 轮书的带外那一版就是这么做的：开一轮写一条 `round_opened`，载荷里是台账
 //! 那一版的 rev 与**这一批的 id 清单**。清单不进文件、不抄副本——清单抄一份到别处就
 //! 多一份会漂的副本，而正本只有事件流。
 //!
@@ -55,7 +55,7 @@ impl RoundOpened {
         self.round.clone()
     }
 
-    /// 载荷。键名与带外 `round.py` 写的那一条**逐字相同**：两侧读同一张表，键名不同
+    /// 载荷。键名与带外那一版写下的**逐字相同**：两侧读同一张表，键名不同
     /// 就等于两个形状，而它们只会有一个是对的。
     pub fn attributes(&self) -> serde_json::Value {
         serde_json::json!({
