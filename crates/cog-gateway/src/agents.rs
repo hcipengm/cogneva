@@ -1973,6 +1973,26 @@ fn merge_fields(view: &mut serde_json::Value, extra: serde_json::Value) {
 /// 第四份来源是持久名册（`cog_storage::EMPLOYEES_KEY` 那张 hash）：注册表会
 /// 过期，people 与 roster 只覆盖走过对话与招人这两条路的人，按任务现起的成员
 /// （探针、小队角色）三条路都不经过。名册行还回答「在职还是离职」。
+///
+/// 这一行的职务不是身份的一部分：注册表在岗时读注册那一行，座位地址
+/// （`squad:<任务>-<职务>`）能解出职务，其余人形行回答 `employee`。
+fn role_of_record(row: &cog_core::EmployeeRecord, regs: &[cog_core::AgentRegistration]) -> String {
+    if let Some(reg) = regs.iter().find(|reg| reg.agent_id == row.agent_id) {
+        return reg.role.clone();
+    }
+    if let Some(seat) = row
+        .agent_id
+        .strip_prefix(cog_core::types::agent_state::SQUAD_ID_PREFIX)
+    {
+        if let Some((_, role)) = seat.rsplit_once('-') {
+            if cog_core::roles::ALL.contains(&role) {
+                return role.to_string();
+            }
+        }
+    }
+    EMPLOYEE_ROLE.to_string()
+}
+
 fn roster_with_people(
     regs: &[cog_core::AgentRegistration],
     people: Vec<(String, PersonRow)>,
@@ -2106,7 +2126,7 @@ fn roster_with_people(
                 .map(|n| format!("{}{n:04}", cog_core::EMPLOYEE_NUMBER_PREFIX)),
             "person_name": row.number.map(cog_core::employee_name),
             "person_id": row.person(),
-            "role": row.role,
+            "role": role_of_record(&row, regs),
             "workspace_id": "default",
             "hostname": String::new(),
             "pod_ip": String::new(),
@@ -2767,7 +2787,6 @@ mod tests {
         let row = cog_core::EmployeeRecord {
             agent_id: reg.agent_id.clone(),
             number: Some(7),
-            role: "planner".into(),
             first_seen: now,
             last_seen: now,
             retired_at: None,
@@ -2797,7 +2816,6 @@ mod tests {
         let row = cog_core::EmployeeRecord {
             agent_id: "kai-a9ab11fc".into(),
             number: Some(41),
-            role: "planner".into(),
             first_seen: now,
             last_seen: now,
             retired_at: Some(now),
@@ -2819,22 +2837,19 @@ mod tests {
         let seat = cog_core::agent_id_for("task-1", "generator");
         // 座位行没有工号——工号只发给一个人。这一格照实例写：人形行有号，
         // 座位行没有，两个 id 之外唯一的差别就是这一格与背后的人。
-        let row = |agent_id: &str, role: &str, number: Option<u32>| cog_core::EmployeeRecord {
+        let row = |agent_id: &str, number: Option<u32>| cog_core::EmployeeRecord {
             agent_id: agent_id.into(),
             number,
-            role: role.into(),
             first_seen: now,
             last_seen: now,
             retired_at: None,
             person_id: None,
         };
-        let roster: std::collections::HashMap<String, cog_core::EmployeeRecord> = vec![
-            row("employee:0e2ba053", "employee", Some(3)),
-            row(&seat, "generator", None),
-        ]
-        .into_iter()
-        .map(|r| (r.agent_id.clone(), r))
-        .collect();
+        let roster: std::collections::HashMap<String, cog_core::EmployeeRecord> =
+            vec![row("employee:0e2ba053", Some(3)), row(&seat, None)]
+                .into_iter()
+                .map(|r| (r.agent_id.clone(), r))
+                .collect();
         assert_eq!(
             identity_of("employee:0e2ba053", &roster)["person_id"],
             "employee:0e2ba053",
@@ -3151,5 +3166,47 @@ mod tests {
                 "a caller cannot put words in an employee's mouth: {msg:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod role_of_record_tests {
+    use super::{role_of_record, EMPLOYEE_ROLE};
+    use chrono::Utc;
+
+    fn record(agent_id: &str) -> cog_core::EmployeeRecord {
+        cog_core::EmployeeRecord {
+            agent_id: agent_id.into(),
+            number: None,
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+            retired_at: None,
+            person_id: None,
+        }
+    }
+
+    fn registration(agent_id: &str, role: &str) -> cog_core::AgentRegistration {
+        cog_core::AgentRegistration::new(
+            agent_id,
+            "host",
+            "127.0.0.1",
+            role,
+            "default",
+            cog_core::ResourceInfo::default(),
+        )
+    }
+
+    /// 职务来自任命，不来自身份：同一条人形记录没有注册时回答 employee，
+    /// 座位地址能解出职务，在岗注册优先。
+    #[test]
+    fn the_role_comes_from_the_assignment_not_the_identity() {
+        let person = record("employee:1");
+        assert_eq!(role_of_record(&person, &[]), EMPLOYEE_ROLE);
+
+        let seat = record("squad:task-1-generator");
+        assert_eq!(role_of_record(&seat, &[]), "generator");
+
+        let live = registration("squad:task-1-generator", "planner");
+        assert_eq!(role_of_record(&seat, &[live]), "planner");
     }
 }

@@ -166,7 +166,6 @@ impl cog_core::AgentRegistry for Seats {
         Ok(person.map(|person_id| cog_core::EmployeeRecord {
             agent_id: agent_id.to_string(),
             number: None,
-            role: cog_core::roles::GENERATOR.to_string(),
             first_seen: chrono::Utc::now(),
             last_seen: chrono::Utc::now(),
             retired_at: None,

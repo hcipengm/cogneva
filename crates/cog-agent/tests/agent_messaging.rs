@@ -181,10 +181,9 @@ impl AgentRegistry for Roster {
             .live
             .iter()
             .enumerate()
-            .map(|(slot, (id, role))| EmployeeRecord {
+            .map(|(slot, (id, _role))| EmployeeRecord {
                 agent_id: (*id).to_string(),
                 number: Some(slot as u32 + 1),
-                role: (*role).to_string(),
                 first_seen: now,
                 last_seen: now,
                 retired_at: None,

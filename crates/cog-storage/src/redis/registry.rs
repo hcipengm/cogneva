@@ -171,7 +171,7 @@ impl RedisAgentRegistry {
     /// 的人要到派活那一刻才存在，在此之前空着是读数；而写上之后，这条路径
     /// 也不能把它擦掉——座位重新注册时把已派的人抹了，人就从名册上消失了。
     ///
-    /// **工号只发给一个人，不发给一把椅子**（`ARGV[5] == '1'` 才是人形 id）：
+    /// **工号只发给一个人，不发给一把椅子**（`ARGV[4] == '1'` 才是人形 id）：
     /// 座位随任务生灭，每次接活都注册一次，给它发号就是每接一件活多一个「员工」
     /// ——名册行数会长到任务数，而工号是编制。座位行照建（派工要往上面写人），
     /// 只是没有号：名册上「有号的行」正好是可以叫做人的那些行。
@@ -187,12 +187,11 @@ impl RedisAgentRegistry {
              else \
                  row = { first_seen = ARGV[2] } \
              end \
-             if (row.number == nil or row.number == cjson.null) and ARGV[5] == '1' then \
+             if (row.number == nil or row.number == cjson.null) and ARGV[4] == '1' then \
                  row.number = redis.call('INCR', KEYS[2]) \
              end \
              row.agent_id = ARGV[1] \
-             row.role = ARGV[3] \
-             if ARGV[4] ~= '' then row.person_id = ARGV[4] end \
+             if ARGV[3] ~= '' then row.person_id = ARGV[3] end \
              row.last_seen = ARGV[2] \
              row.retired_at = nil \
              redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(row)) \
@@ -206,7 +205,6 @@ impl RedisAgentRegistry {
             .key(EMPLOYEE_SEQ_KEY)
             .arg(&registration.agent_id)
             .arg(&now)
-            .arg(&registration.role)
             .arg(person.unwrap_or(""))
             .arg(if person.is_some() { "1" } else { "0" })
             .invoke_async::<i64>(&mut conn)
@@ -551,7 +549,6 @@ impl AgentRegistry for MemoryAgentRegistry {
         );
         let now = Utc::now();
         if let Some(row) = store.employees.get_mut(&registration.agent_id) {
-            row.role = registration.role.clone();
             row.last_seen = now;
             // 回来上班的人不再是离职：墓碑擦掉，`first_seen` 与工号都留着
             // ——工号是发出去的编制，换一次上岗不该换号。
@@ -574,7 +571,6 @@ impl AgentRegistry for MemoryAgentRegistry {
                 EmployeeRecord {
                     agent_id: registration.agent_id.clone(),
                     number,
-                    role: registration.role.clone(),
                     first_seen: now,
                     last_seen: now,
                     retired_at: None,

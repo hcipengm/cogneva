@@ -4887,7 +4887,6 @@ mod tests {
             Ok(Some(cog_core::EmployeeRecord {
                 agent_id: agent_id.to_string(),
                 number: Some(self.0),
-                role: "chat".into(),
                 first_seen: now,
                 last_seen: now,
                 retired_at: None,
