@@ -207,7 +207,7 @@ impl OutwardConfig {
             .map(str::trim)
             .filter(|r| !r.is_empty())
             .ok_or(ConfigFault::Unset)?;
-        let mut sources: Vec<OutwardSource> =
+        let sources: Vec<OutwardSource> =
             serde_json::from_str(raw).map_err(|_| ConfigFault::Unparsable)?;
         if sources.is_empty() {
             return Err(ConfigFault::Empty);
