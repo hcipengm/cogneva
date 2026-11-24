@@ -102,11 +102,7 @@ pub async fn run_infra_watch_loop(
     http: Arc<dyn cog_core::HttpClient>,
     shutdown: cog_core::ShutdownSignal,
 ) {
-    let interval = Duration::from_secs(
-        config
-            .poll_interval_secs
-            .max(InfraWatchConfig::MIN_POLL_INTERVAL_SECS),
-    );
+    let interval = Duration::from_secs(config.effective_poll_interval_secs());
     // Everything this loop reports is a judgement about other people's series, so
     // its death is the one failure it cannot report: the rules it evaluates go
     // quiet, and a rule that is quiet because nothing is wrong looks exactly like
@@ -520,8 +516,10 @@ async fn close_unattended(
     // One tick of margin either side of the count: a writer that reports every
     // tick leaves a clock at most one interval old, while a key this process
     // stopped seeing carries a clock at least this many intervals old.
+    // 与循环同一个节拍读数：声明 10 秒时循环实际按 30 跑，缺报窗也必须按 30
+    // 算，否则「这条规则没人再报」会比它真的停报早三倍触发。
     let stale_after = chrono::Duration::seconds(
-        (config.poll_interval_secs.max(1) * u64::from(MISSING_TICKS_BEFORE_CLOSE)) as i64,
+        (config.effective_poll_interval_secs() * u64::from(MISSING_TICKS_BEFORE_CLOSE)) as i64,
     );
     let (closing, present): (Unattended, HashSet<String>) = match &outlets.store {
         Some(store) => {

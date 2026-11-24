@@ -321,17 +321,20 @@ where
         }
     };
 
+    // 三格原样生效：`max_retries = 0` 是「不重试」的合法声明（首投失败即返回），
+    // 另外两格声明 0 在 `ObservabilityExportersConfig::load_from` 按字段名拒绝
+    // ——0 秒的刷盘间隔会让 `tokio::time::interval` panic，0 条的批则永远凑不满。
     let push_client = Arc::new(
         LokiPushClient::new(&config.loki.endpoint)
-            .with_max_retries(config.loki.max_retries.max(1))
+            .with_max_retries(config.loki.max_retries)
             .with_timeout(config.loki.timeout_secs)
             .with_label(crate::LABEL_SERVICE, service)
             .with_client(client),
     );
     let pusher = Arc::new(LokiBackgroundPusher::new(
         push_client,
-        std::time::Duration::from_secs(config.loki.flush_interval_sec.max(1)),
-        config.loki.max_batch_size.max(1),
+        std::time::Duration::from_secs(config.loki.flush_interval_sec),
+        config.loki.max_batch_size,
     ));
     let handle = init_subscriber_with_pusher(&level, format, Some(pusher.clone()), service);
 
