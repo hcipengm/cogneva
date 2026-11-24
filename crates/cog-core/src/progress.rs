@@ -44,11 +44,23 @@ pub const SILENCE_QUANTILE: f64 = 0.999;
 ///
 /// One sample per quantile point: an estimate of the q-quantile carries no
 /// information about the tail until there is at least one observation beyond it.
-/// Derived from [`SILENCE_QUANTILE`] rather than picked, so the two cannot
-/// disagree — a floor that stayed at 100 while the quantile moved to 0.9999
-/// would report a window from a sample that cannot support it.
-// cap: bound — 1 / (1 - SILENCE_QUANTILE)：估 0.999 分位要至少有一个落在它之外的点
-pub const SAMPLE_FLOOR: usize = 1000;
+/// Computed from [`SILENCE_QUANTILE`] rather than typed as `1000`: a typed floor
+/// reads the same while the quantile moves to 0.9999, and then the window is
+/// reported from a sample that cannot support it. The value is still settled at
+/// compile time -- what follows the quantile is the expression, not when it is
+/// read.
+// cap: bound — 由 SILENCE_QUANTILE 算出：1 / (1 - q)，估 q 分位要至少有一个落在它之外的点
+pub const SAMPLE_FLOOR: usize = sample_floor(SILENCE_QUANTILE);
+
+/// The sample floor a quantile implies: `ceil(1 / (1 - q))`.
+///
+/// A function, not an expression buried in the constant above, so the law can be
+/// asked with another input: `sample_floor(0.9999)` is ten times
+/// `sample_floor(0.999)`, and a test holding both is what proves the constant
+/// follows the quantile instead of agreeing with it today.
+const fn sample_floor(quantile: f64) -> usize {
+    (1.0 / (1.0 - quantile)).ceil() as usize
+}
 
 fn beacons() -> &'static Mutex<HashMap<String, Instant>> {
     static B: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
@@ -997,11 +1009,21 @@ mod tests {
     /// The sample floor is the number of quantile points, not a number anybody
     /// picked: `1 / (1 - q)`. A floor that stopped following the quantile would
     /// let the window be reported from a sample that cannot support it.
+    ///
+    /// Asked with a second input as well: one input can only show the floor
+    /// agrees with the quantile today, and agreement today is exactly what a
+    /// typed 1000 also has.
     #[test]
     fn the_sample_floor_follows_from_the_quantile() {
-        let from_quantile = (1.0 / (1.0 - SILENCE_QUANTILE)).round() as usize;
+        assert_eq!(sample_floor(0.999), 1000);
         assert_eq!(
-            SAMPLE_FLOOR, from_quantile,
+            sample_floor(0.9999),
+            10_000,
+            "a tighter quantile needs ten times the sample"
+        );
+        assert_eq!(
+            SAMPLE_FLOOR,
+            sample_floor(SILENCE_QUANTILE),
             "the floor must be one sample per quantile point"
         );
     }
