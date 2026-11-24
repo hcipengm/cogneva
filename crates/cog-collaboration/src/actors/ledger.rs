@@ -17,6 +17,9 @@ use std::path::PathBuf;
 /// 改名时只改一处不会有任何东西红，只让那一侧永远读一个没人写的名字。
 const CLOSED_ROUNDS_ENV: &str = "COGNEVA_CLOSED_ROUNDS";
 
+/// 编译账本在哪。垫片写它、`compiled` 与「下一步」都读它——名字只写一次。
+const COMPILE_LEDGER_ENV: &str = "COGNEVA_COMPILE_LEDGER";
+
 /// 这一笔是谁做的。读不到就是默认的那个词——它不是权限，是事件上的署名。
 const ACTOR_ENV: &str = "COGNEVA_ACTOR";
 
@@ -158,7 +161,7 @@ pub fn compiled() -> i32 {
         .unwrap_or_default();
     let mut base = std::env::var("COGNEVA_PUSH_BASE").unwrap_or_else(|_| "origin/main".to_string());
     let mut ledger = std::path::PathBuf::from(
-        std::env::var("COGNEVA_COMPILE_LEDGER").unwrap_or_else(|_| {
+        std::env::var(COMPILE_LEDGER_ENV).unwrap_or_else(|_| {
             format!("{}/.local/state/cogneva/compile-ledger.tsv", home())
         }),
     );
@@ -1005,7 +1008,7 @@ mod tests {
 /// 这一棵树在这本编译账里的最后一条（时间、树、参数、HEAD、指纹）。
 fn last_compile_for(tree: &str) -> Option<String> {
     let path = std::path::PathBuf::from(
-        std::env::var("COGNEVA_COMPILE_LEDGER")
+        std::env::var(COMPILE_LEDGER_ENV)
             .unwrap_or_else(|_| format!("{}/.local/state/cogneva/compile-ledger.tsv", home())),
     );
     let text = std::fs::read_to_string(path).ok()?;
