@@ -4017,7 +4017,15 @@ impl AgentRuntime {
         // Stall-based hang protection: the clock resets on every stream event,
         // so a slow-but-alive generation is never aborted — only a connection
         // that stops making progress for the full window is treated as dead.
-        let stall_timeout = Duration::from_secs(self.config.think_stall_timeout_secs.max(1));
+        // 声明的窗原样生效：0 秒不是「立刻算死」的另一种写法，而是一个读不出
+        // 「多久没吭声」的窗。拒绝它，不在这一层悄悄换成一个数。
+        let stall_secs = self.config.think_stall_timeout_secs;
+        if stall_secs == 0 {
+            return Err(SFError::Config(
+                "think_stall_timeout_secs 为 0 秒：停滞窗要一个周期才能判「多久没吭声」。".into(),
+            ));
+        }
+        let stall_timeout = Duration::from_secs(stall_secs);
         let stall_err = |phase: &str| {
             SFError::Agent(format!(
                 "{STREAM_STALL_PREFIX} for {}s while {} for agent {}",
