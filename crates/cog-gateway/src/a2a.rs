@@ -428,13 +428,15 @@ fn max_stream() -> Duration {
 /// 「读得到这一行」，接口就只该说这件事。
 #[async_trait::async_trait]
 pub trait GoalReader: Send + Sync {
-    async fn goal(&self, goal_id: &str) -> Option<Task>;
+    /// `Ok(None)` 是「图里没有这一行」，`Err` 是「读不到」——对端据这个区别决定
+    /// 换 id 还是重试，所以这一层不能把两者并成一个 `None`（CC20）。
+    async fn goal(&self, goal_id: &str) -> cog_core::SFResult<Option<Task>>;
 }
 
 #[async_trait::async_trait]
 impl GoalReader for Arc<dyn OrchestratorControl> {
-    async fn goal(&self, goal_id: &str) -> Option<Task> {
-        self.get_task(goal_id).await
+    async fn goal(&self, goal_id: &str) -> cog_core::SFResult<Option<Task>> {
+        self.get_task_checked(goal_id).await
     }
 }
 
@@ -465,9 +467,15 @@ async fn accept_goal(sink: &dyn GoalSink, goal: &str, row: Task) -> Result<Task,
     let goal_id = row.id.clone();
     let submitted = sink.submit(goal, row).await;
     accepted(&goal_id, submitted)?;
-    sink.goal(&goal_id)
-        .await
-        .ok_or_else(|| format!("the goal '{goal_id}' was submitted but cannot be read back"))
+    match sink.goal(&goal_id).await {
+        Ok(Some(task)) => Ok(task),
+        Ok(None) => Err(format!(
+            "the goal '{goal_id}' was submitted but cannot be read back"
+        )),
+        Err(e) => Err(format!(
+            "the goal '{goal_id}' was submitted but the graph could not answer: {e}"
+        )),
+    }
 }
 
 // ─── 状态映射 ─────────────────────────────────────────────────────────────
@@ -1021,7 +1029,28 @@ fn goal_stream(state: StreamState) -> impl Stream<Item = Result<Bytes, std::io::
             }
 
             let reader = s.reader.clone();
-            let row = reader.goal(&s.goal_id).await;
+            // 读不到不能在这里静默重试到截止：到点时它会答「这一行从没出现过」，
+            // 而那是一句关于任务的断言——库读不出来时它完全可能一直在那里（CC20）。
+            // 当场报一帧、收流，与上面那条「到点零帧」同一条理由。
+            let row = match reader.goal(&s.goal_id).await {
+                Ok(row) => row,
+                Err(e) => {
+                    s.done = true;
+                    tracing::warn!(goal_id = %s.goal_id, error = %e,
+                        "the goal row could not be read; the stream answers the read failure");
+                    let frame = sse_frame(&json!({
+                        "jsonrpc": "2.0",
+                        "id": s.rpc_id,
+                        "error": {
+                            "code": -32603,
+                            "message": format!(
+                                "the goal '{}' could not be read: {e}", s.goal_id
+                            ),
+                        },
+                    }));
+                    return Some((Ok(frame), s));
+                }
+            };
             if let Some(task) = row {
                 s.seen_row = true;
                 let state = a2a_state(task.status);
@@ -1105,7 +1134,32 @@ async fn message_stream_for(
     // 存在的缺陷。重发的判据也与 `message/send` 同一个：这一行已经在，就订阅
     // 它，不再分解一次。
     let already = if request.message_id.is_some() {
-        GoalReader::goal(&state.orchestrator, &goal_id).await
+        // 这条消息是不是已经受理过，只能由图来答；图读不出来时既不当作「没受理过」
+        // 再去提交一份，也不当作「受理过」去订阅——两句话都是关于那一行的断言（CC20）。
+        match GoalReader::goal(&state.orchestrator, &goal_id).await {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::error!(goal_id = %goal_id, error = %e,
+                    "a2a message/stream cannot tell whether this message was already accepted");
+                let frame = sse_frame(&json!({
+                    "jsonrpc": "2.0",
+                    "id": request.rpc_id,
+                    "error": {
+                        "code": -32603,
+                        "message": format!("the graph could not be read: {e}"),
+                    },
+                }));
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .header("x-accel-buffering", "no")
+                    .body(Body::from(frame))
+                    .unwrap_or_else(|_| {
+                        (StatusCode::OK, "the graph could not be read").into_response()
+                    });
+            }
+        }
     } else {
         None
     };
@@ -1120,10 +1174,13 @@ async fn message_stream_for(
         if let Err(reason) = accept_goal(&state.orchestrator, &request.goal, goal_row).await {
             // 同一个 `messageId` 的两份请求可以同时到：先到的插了行，后到的在批量
             // 注入里被跳过。库里有这一行就照样订阅，不把一次已受理读成拒收。
+            // 读失败在这里按「没看到那一行」算：这一支本来要答的就是「没受理」，
+            // 读不出来只是让这个答案少了那一半的旁证，不会据此多提交一份。
             let raced = request.message_id.is_some()
-                && GoalReader::goal(&state.orchestrator, &goal_id)
-                    .await
-                    .is_some();
+                && matches!(
+                    GoalReader::goal(&state.orchestrator, &goal_id).await,
+                    Ok(Some(_))
+                );
             if !raced {
                 tracing::error!(goal_id = %goal_id, reason = %reason, "a2a message/stream was not accepted");
                 let frame = sse_frame(&json!({
@@ -1395,9 +1452,28 @@ async fn rpc_message_send(
     // 重发先读、后提交：提交会经过分解，那是一次要花配额的上游调用——先读一行
     // 比再分解一次便宜得多，而这一行在，就说明这条消息已经被受理过。
     if request.message_id.is_some() {
-        if let Some(existing) = GoalReader::goal(&orchestrator, &goal_id).await {
-            tracing::info!(goal_id = %goal_id, "a2a message/send repeated a message already accepted");
-            return send_result(rpc_id, version, &orchestrator, &goal_id, existing, body).await;
+        match GoalReader::goal(&orchestrator, &goal_id).await {
+            Ok(Some(existing)) => {
+                tracing::info!(goal_id = %goal_id, "a2a message/send repeated a message already accepted");
+                return send_result(rpc_id, version, &orchestrator, &goal_id, existing, body)
+                    .await;
+            }
+            Ok(None) => {}
+            // 读不到就既不能答「重发」也不能再提交一份：那一行可能就在图里，
+            // 再交一次就是同一条消息的两份分解（CC20）。
+            Err(e) => {
+                tracing::error!(goal_id = %goal_id, error = %e,
+                    "a2a message/send cannot tell whether this message was already accepted");
+                return (
+                    StatusCode::OK,
+                    Json(rpc_error(
+                        rpc_id,
+                        -32603,
+                        format!("the graph could not be read: {e}"),
+                    )),
+                )
+                    .into_response();
+            }
         }
     }
 
@@ -1411,16 +1487,31 @@ async fn rpc_message_send(
         // 把行插进去，后到的那份在批量注入里按 id 被跳过、回执里没有这个 id。
         // 这不等于「没受理」——库里有这一行就是受理了，回它。
         Err(reason) => match GoalReader::goal(&orchestrator, &goal_id).await {
-            Some(existing) if request.message_id.is_some() => {
+            Ok(Some(existing)) if request.message_id.is_some() => {
                 tracing::info!(
                     goal_id = %goal_id,
                     "a2a message/send lost the race to the same message and answers the row it found"
                 );
                 return send_result(rpc_id, version, &orchestrator, &goal_id, existing, body).await;
             }
-            _ => {
+            Ok(_) => {
                 tracing::error!(goal_id = %goal_id, reason = %reason, "a2a message/send was not accepted");
                 return (StatusCode::OK, Json(rpc_error(rpc_id, -32603, reason))).into_response();
+            }
+            // 提交被拒、图又读不出来：两句一起说，否则对端会以为「只是没受理」，
+            // 而真正的原因可能是那一行其实已经在了（CC20）。
+            Err(e) => {
+                tracing::error!(goal_id = %goal_id, reason = %reason, error = %e,
+                    "a2a message/send was not accepted and the graph could not be read");
+                return (
+                    StatusCode::OK,
+                    Json(rpc_error(
+                        rpc_id,
+                        -32603,
+                        format!("{reason}; the graph could not be read either: {e}"),
+                    )),
+                )
+                    .into_response();
             }
         },
     };
@@ -1442,7 +1533,14 @@ async fn send_result(
     body: &Value,
 ) -> Response {
     let row = if blocks_until_done(body, version) {
-        wait_until_done(orchestrator, goal_id, &row).await
+        match wait_until_done(orchestrator, goal_id, &row).await {
+            Ok(row) => row,
+            // 等的过程里读不出来：答「读不到」，不拿等待前那一刻的旧行当终局递回去
+            // ——那会让对端把一次读故障读成「任务还在这一步」（CC20）。
+            Err(e) => {
+                return (StatusCode::OK, Json(rpc_error(rpc_id, -32603, e))).into_response();
+            }
+        }
     } else {
         row
     };
@@ -1487,7 +1585,7 @@ async fn wait_until_done(
     orchestrator: &Arc<dyn OrchestratorControl>,
     goal_id: &str,
     first: &Task,
-) -> Task {
+) -> Result<Task, String> {
     let deadline = tokio::time::Instant::now() + max_stream();
     let mut current = first.clone();
     // 停止点是「终态，或被打断」：规范把 `INPUT_REQUIRED`/`AUTH_REQUIRED` 也算作
@@ -1506,15 +1604,22 @@ async fn wait_until_done(
                 goal_id,
                 "a blocking SendMessage hit its wait ceiling; answering with the row as it stands"
             );
-            return current;
+            return Ok(current);
         }
         tokio::time::sleep(poll_interval()).await;
-        match orchestrator.get_task(goal_id).await {
-            Some(row) => current = row,
-            None => return current,
+        match orchestrator.get_task_checked(goal_id).await {
+            Ok(Some(row)) => current = row,
+            // 读到了「没有这一行」：等不到终局了，回手里的那一行。
+            Ok(None) => return Ok(current),
+            // 读不到不是「它没了」，也不是「它还在动」：交给上面的读口作答。
+            Err(e) => {
+                return Err(format!(
+                    "the task '{goal_id}' could not be read while waiting for it to end: {e}"
+                ));
+            }
         }
     }
-    current
+    Ok(current)
 }
 
 /// `tasks/get`：按 id 读一行，带上它已有的结果与失败原因。
@@ -1670,10 +1775,21 @@ async fn rpc_tasks_resubscribe(
     };
 
     match GoalReader::goal(&state.orchestrator, task_id).await {
-        Some(_) => goal_stream_response(state, task_id.to_string(), rpc_id.clone(), version),
-        None => (
+        Ok(Some(_)) => goal_stream_response(state, task_id.to_string(), rpc_id.clone(), version),
+        Ok(None) => (
             StatusCode::OK,
             Json(rpc_error(rpc_id, -32001, format!("no task '{task_id}'"))),
+        )
+            .into_response(),
+        // 「读不到」不能答成「没有这条任务」：对端据那个码决定换 id，而库里
+        // 可能正压着它（CC20）。
+        Err(e) => (
+            StatusCode::OK,
+            Json(rpc_error(
+                rpc_id,
+                -32603,
+                format!("the task could not be read: {e}"),
+            )),
         )
             .into_response(),
     }
@@ -1811,21 +1927,19 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GoalReader for ScriptedReader {
-        async fn goal(&self, goal_id: &str) -> Option<Task> {
+        async fn goal(&self, goal_id: &str) -> cog_core::SFResult<Option<Task>> {
             let mut asks = self.asks.lock().unwrap();
             let nth = *asks;
             *asks += 1;
             let script = self.script.lock().unwrap();
-            let step = script
-                .get(nth)
-                .or_else(|| script.last())
-                .cloned()
-                .flatten()?;
+            let Some(step) = script.get(nth).or_else(|| script.last()).cloned().flatten() else {
+                return Ok(None);
+            };
             let mut row = Task::goal_row(goal_id.to_string(), "a goal");
             row.status = step;
             row.result = self.result.clone();
             row.error = self.error.clone();
-            Some(row)
+            Ok(Some(row))
         }
     }
 
@@ -2190,8 +2304,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GoalReader for ScriptedSink {
-        async fn goal(&self, _goal_id: &str) -> Option<Task> {
-            self.row.clone()
+        async fn goal(&self, _goal_id: &str) -> cog_core::SFResult<Option<Task>> {
+            Ok(self.row.clone())
         }
     }
 

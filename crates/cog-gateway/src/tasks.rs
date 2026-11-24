@@ -1214,8 +1214,20 @@ fn task_reached_an_end(status: Option<cog_core::TaskStatus>) -> bool {
 /// 掉队说明的是读者跟不上，这一行的终局可能就在掉队的那几条里；重读一次状态
 /// 比「等一个已经发生过的终局」便宜。
 async fn wait_for_task_end(state: &GatewayState, id: &str, wait_ms: u64) {
-    let Some(task) = state.orchestrator.get_task(id).await else {
-        return;
+    // 读失败不是「它到终局了」，也不是「没有这条任务」：这一等就此结束，让下面
+    // 那次带错误的读去回答 503（CC21）；把读不出来当成已到点，调用方会按
+    // 「已经等到」行事，而它其实什么也没等到。
+    let task = match state.orchestrator.get_task_checked(id).await {
+        Ok(Some(task)) => task,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(
+                task_id = id,
+                error = %e,
+                "the task could not be read; the wait ends here and the read answers"
+            );
+            return;
+        }
     };
     if task_reached_an_end(Some(task.status)) {
         return;
@@ -1450,11 +1462,14 @@ pub async fn assign_task_handler(
     Path(id): Path<String>,
     Json(req): Json<AssignTaskRequest>,
 ) -> Result<StatusCode, ApiError> {
-    // Checked before the write: an unreadable task is one the caller may not
-    // assign either, and answering "not found" for both keeps the route from
-    // confirming which ids exist elsewhere.
+    // Checked before the write: a task outside the caller's scope is answered
+    // "not found" so the route does not confirm which ids exist elsewhere.
+    // A store that failed to answer is a different sentence -- it is a 503,
+    // not a claim that this id is absent.
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
-    match state.orchestrator.get_task(&id).await {
+    // 读失败不是「没有这条任务」：404 会让调用方以为这个 id 不存在，而一次读
+    // 不出来的库完全可能压着它（CC21）。读到了才轮到「有没有这一行」。
+    match task_from_reading(state.orchestrator.get_task_checked(&id).await)? {
         Some(task) if visible_to_claims(claims, &task) => {}
         _ => return Err(ApiError::not_found(format!("task '{id}' not found"))),
     }

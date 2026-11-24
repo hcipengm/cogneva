@@ -6264,7 +6264,20 @@ impl MainlineDeployer {
             since_unix,
         );
         let evidence = self.ci_failure_evidence(&id, rev, failed_checks).await;
-        let (attempted, stopped) = self.ci_hold_attempts(orchestrator, prior_rows).await;
+        // 列不出前几轮时说清楚是列不出，不拿一份空名单冒充「第一次动手」：这一轮
+        // 照样要开单（扣住本身还成立），但题面里那句「前面几轮」只能缺席，日志里
+        // 得留下它为什么缺席（CC19）。
+        let (attempted, stopped) = match self.ci_hold_attempts(orchestrator, prior_rows).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!(
+                    rev = %rev12(rev),
+                    error = %e,
+                    "the earlier repair rounds could not be read; this round's goal cannot list them"
+                );
+                (Vec::new(), 0)
+            }
+        };
         if !attempted.is_empty() {
             info!(
                 rev = %rev12(rev),
@@ -6326,13 +6339,24 @@ impl MainlineDeployer {
         &self,
         orchestrator: &std::sync::Arc<dyn cog_core::OrchestratorControl>,
         prior_rows: &[String],
-    ) -> (Vec<CiHoldAttempt>, usize) {
+    ) -> cog_core::SFResult<(Vec<CiHoldAttempt>, usize)> {
         let start = prior_rows.len().saturating_sub(CI_HOLD_ATTEMPTS_SHOWN);
         let mut out = Vec::new();
         let mut stopped = 0usize;
         for (offset, id) in prior_rows[start..].iter().enumerate() {
-            let Some(task) = orchestrator.get_task(id).await else {
-                continue;
+            // 读不到**不是**「这一行不在」：前者说的是这一轮列不出尝试，后者说的是
+            // 那一行从没落过库。把前者按后者跳过，题面会读成「第一次动手」（CC19）。
+            let task = match orchestrator.get_task_checked(id).await {
+                Ok(Some(task)) => task,
+                Ok(None) => continue,
+                Err(e) => {
+                    warn!(
+                        task_id = %id,
+                        error = %e,
+                        "an earlier repair round could not be read; this round cannot list the attempts"
+                    );
+                    return Err(e);
+                }
             };
             // 目标锚点也在这份名单里，而它不是一次尝试：它不执行，永远停在原处。
             // 把它算进轮次会让「第几轮」与实际派发次数对不上。
@@ -6345,7 +6369,7 @@ impl MainlineDeployer {
             }
             out.push(ci_hold_attempt(&task, start + offset + 1));
         }
-        (out, stopped)
+        Ok((out, stopped))
     }
 
     /// 这一次扣住该落在哪一行上。
@@ -6373,9 +6397,21 @@ impl MainlineDeployer {
             } else {
                 format!("{base}-r{round}")
             };
-            match orchestrator.get_task(&id).await {
-                Some(task) if task.status.is_terminal() => last = id,
-                _ => return id,
+            match orchestrator.get_task_checked(&id).await {
+                Ok(Some(task)) if task.status.is_terminal() => last = id,
+                Ok(Some(_)) => return id, // 还活着：这一轮就落在它身上（幂等空操作）
+                Ok(None) => return id,    // 还没人开过：新开
+                // 读不到**不沿用**：这个 id 上可能还挂着一行活着的，而图对已持有的 id
+                // 是幂等空操作——沿用下去，这一轮一张单也开不出来，扣住就成了没有人
+                // 接的空扣（CC19）。往后跳一轮，实在读不出来还有按此刻计时的新 id。
+                Err(e) => {
+                    warn!(
+                        task_id = %id,
+                        error = %e,
+                        "this repair round's id could not be read; it is not reused"
+                    );
+                    continue;
+                }
             }
         }
         // 一天里把这条扣住修满这么多轮仍然没修好，就已经不是「这一行办完了」而是
@@ -6497,9 +6533,20 @@ impl MainlineDeployer {
             return;
         };
         for id in rows {
-            let Some(task) = orchestrator.get_task(id).await else {
-                // 记下的 id 不一定真的落过库：兜底那一次提交也可能被拒。
-                continue;
+            // 记下的 id 不一定真的落过库：兜底那一次提交也可能被拒——那是 `Ok(None)`。
+            // 读不到是另一句话：那一行可能还在队列里等着，不能按「从没落库」跳过，
+            // 否则它带着一个已经不成立的判词留下来，而这一拍说它从没来过（CC19）。
+            let task = match orchestrator.get_task_checked(id).await {
+                Ok(Some(task)) => task,
+                Ok(None) => continue,
+                Err(e) => {
+                    warn!(
+                        task_id = %id,
+                        error = %e,
+                        "a CI hold's row could not be read; it keeps its place rather than being read as never landed"
+                    );
+                    continue;
+                }
             };
             if !matches!(
                 task.status,
@@ -6604,7 +6651,20 @@ impl MainlineDeployer {
         keep: &[&str],
     ) -> usize {
         let mut retired = 0;
-        for task in orchestrator.get_all_tasks().await {
+        // 读不到**不是**「图里一行都没有」：后者会让这一拍安静地什么都不收，而它
+        // 看起来与「确实没有要收的」逐字相同（CC19）。收不了就直说收不了。
+        let tasks = match orchestrator.get_all_tasks_checked().await {
+            Ok(tasks) => tasks,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    kept = keep.len(),
+                    "the task graph could not be read; this pass retires nothing and says so"
+                );
+                return retired;
+            }
+        };
+        for task in tasks {
             let cog_core::TaskType::Custom(kind) = &task.task_type else {
                 continue;
             };

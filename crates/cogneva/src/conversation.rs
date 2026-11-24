@@ -2711,9 +2711,11 @@ fn dispatch_change_tool(
                 // 变更的」做出的判断；一段对话看得到的是「这条还没落地」，看不到
                 // 那个分类。按一下开一代，就会按一下多烧一份同一条变更的活，而读
                 // 面只会看到「交出去了」。
+                // 读不到不是「还没有人交过」：那会让一次库抖动再交一份同一条变更的活。
+                // 读错误原样答给模型（CC28）。
                 let held: std::collections::HashSet<String> = orchestrator
-                    .get_all_tasks()
-                    .await
+                    .get_all_tasks_checked()
+                    .await?
                     .into_iter()
                     .map(|task| task.id)
                     .collect();
@@ -3577,7 +3579,8 @@ fn list_handler(orchestrator: Arc<dyn OrchestratorControl>) -> ToolHandler {
                 .map(|n| (n as usize).clamp(1, LIST_TASKS_LIMIT))
                 .unwrap_or(LIST_TASKS_DEFAULT);
 
-            let mut rows = orchestrator.get_all_tasks().await;
+            // 读不到不是「0 条」：一次库抖动会被答成「你没有任务」（CC28）。
+            let mut rows = orchestrator.get_all_tasks_checked().await?;
             if let Some(status) = status {
                 rows.retain(|task| task.status.as_str() == status);
             }
@@ -3603,7 +3606,8 @@ fn get_handler(orchestrator: Arc<dyn OrchestratorControl>) -> ToolHandler {
         let orchestrator = orchestrator.clone();
         async move {
             let id = require_str(&args, "task_id")?.to_string();
-            match orchestrator.get_task(&id).await {
+            // 读不到不是「图里没有这条任务」：后者是一句关于任务的断言（CC28）。
+            match orchestrator.get_task_checked(&id).await? {
                 Some(task) => Ok(serde_json::to_value(&task)?),
                 None => Ok(serde_json::json!({
                     "found": false,

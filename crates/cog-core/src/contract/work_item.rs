@@ -48,8 +48,11 @@ pub const WORK_ITEM_POLL: Duration = Duration::from_millis(500);
 pub trait WorkItemGraph: Send + Sync {
     /// 把活投进图里，返回真正落下的行 id（已存在时可能只有返回、没有插入）。
     async fn submit(&self, goal: &str, tasks: Vec<crate::Task>) -> crate::SFResult<Vec<String>>;
-    /// 按 id 读回一行；图里没有这一行时是 `None`，不是错误。
-    async fn row(&self, id: &str) -> Option<crate::Task>;
+    /// 按 id 读回一行；图里没有这一行时是 `Ok(None)`，读不到是 `Err`。
+    ///
+    /// 两个答案分开，是这一口存在的理由：把「读不到」折成 `None`，交接的一方
+    /// 读不出「那一行不在」与「这一拍没能读到」的差别（见 CC25）。
+    async fn row(&self, id: &str) -> crate::SFResult<Option<crate::Task>>;
 }
 
 /// 编排器就是这样一个任务图：窄口的两问都已经是它公开的两问。
@@ -59,8 +62,8 @@ impl<T: crate::OrchestratorControl + ?Sized> WorkItemGraph for T {
         self.submit_goal_auto(goal, tasks).await
     }
 
-    async fn row(&self, id: &str) -> Option<crate::Task> {
-        self.get_task(id).await
+    async fn row(&self, id: &str) -> crate::SFResult<Option<crate::Task>> {
+        self.get_task_checked(id).await
     }
 }
 
@@ -84,7 +87,7 @@ pub async fn run_work_item<G: WorkItemGraph + ?Sized>(
     let id = submitted.into_iter().next().unwrap_or(id);
     let deadline = tokio::time::Instant::now() + wait;
     loop {
-        if let Some(row) = graph.row(&id).await {
+        if let Some(row) = graph.row(&id).await? {
             match row.status {
                 crate::TaskStatus::Completed => {
                     return row.result.ok_or_else(|| {
@@ -196,7 +199,7 @@ mod tests {
             Ok(vec!["item-1".into()])
         }
 
-        async fn row(&self, id: &str) -> Option<crate::Task> {
+        async fn row(&self, id: &str) -> crate::SFResult<Option<crate::Task>> {
             let mut polls = self.polls.lock().unwrap();
             *polls += 1;
             let poll = *polls;
@@ -205,7 +208,7 @@ mod tests {
                 row.status = crate::TaskStatus::Completed;
                 row.result = Some(self.answer.clone());
             }
-            (row.id == id).then_some(row)
+            Ok((row.id == id).then_some(row))
         }
     }
 

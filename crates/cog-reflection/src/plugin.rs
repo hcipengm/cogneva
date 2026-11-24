@@ -2544,12 +2544,27 @@ async fn settle_discovery_outcomes<G, FutG>(
 ) -> OutcomeTally
 where
     G: Fn(String) -> FutG,
-    FutG: std::future::Future<Output = Option<cog_core::Task>>,
+    FutG: std::future::Future<Output = cog_core::SFResult<Option<cog_core::Task>>>,
 {
     let mut tally = OutcomeTally::default();
     let mut kept: Vec<PendingProbe> = Vec::with_capacity(pending.len());
     for entry in pending.drain(..) {
-        let row = fetch(entry.task_id.clone()).await;
+        // 读不到不是「这一条没带判词回来」，也不是「这一行不在」：这一条留在在途，
+        // 把读失败说出来——计数落在 row_missing 上会让一次库抖动看起来像探针丢了（CC26）。
+        let row = match fetch(entry.task_id.clone()).await {
+            Ok(row) => row,
+            Err(e) => {
+                let task_id = entry.task_id.clone();
+                tally.still_open += 1;
+                kept.push(entry);
+                warn!(
+                    task_id = %task_id,
+                    error = %e,
+                    "discovery probe outcome could not be read; it stays on the books"
+                );
+                continue;
+            }
+        };
         match row.as_ref().map(|t| t.status) {
             None => tally.row_missing += 1,
             Some(cog_core::TaskStatus::Completed) => {
@@ -2908,7 +2923,9 @@ fn spawn_discovery_loop(
                             &readings,
                             |id| {
                                 let orchestrator = orchestrator.clone();
-                                async move { orchestrator.get_task(&id).await }
+                                // 读失败留成错误：结算那边把它留在在途，而不是读成
+                                // 「这一条没带判词回来」（CC26）。
+                                async move { orchestrator.get_task_checked(&id).await }
                             },
                         )
                         .await;
@@ -6307,7 +6324,7 @@ mod tests {
 
         let readings = DiscoveryOutcomeReadings::new();
         let tally = settle_discovery_outcomes(&engine, &mut pending, &readings, |id| async move {
-            match id.as_str() {
+            Ok(match id.as_str() {
                 "p-unmeasured" => Some(task_row(
                     "p-unmeasured",
                     cog_core::TaskStatus::Completed,
@@ -6327,7 +6344,7 @@ mod tests {
                     Some(serde_json::json!({ DISCOVERY_VERDICT_FIELD: "looks-good" })),
                 )),
                 _ => Some(task_row("p-running", cog_core::TaskStatus::Running, None)),
-            }
+            })
         })
         .await;
 

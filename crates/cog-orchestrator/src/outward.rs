@@ -628,8 +628,20 @@ async fn hand_over(
     item: &OutwardItem,
 ) -> Handover {
     let id = task_id_for(&item.url);
-    if orchestrator.get_task(&id).await.is_some() {
-        return Handover::AlreadyHeld;
+    // 读不到**不是**「没人拿着」：那一行可能还在图里。读失败这一拍不交，
+    // 按 Failed 记下、等下一次唤醒——否则一次库抖动会交出第二份同一 id 的目标（CC23）。
+    match orchestrator.get_task_checked(&id).await {
+        Ok(Some(_)) => return Handover::AlreadyHeld,
+        Ok(None) => {}
+        Err(e) => {
+            warn!(
+                source = %source.name,
+                url = %item.url,
+                error = %e,
+                "outward: could not read whether this item is already held; leaving it for the next wake"
+            );
+            return Handover::Failed;
+        }
     }
     let goal = goal_for(source, item);
     let row = Task::goal_row(id.clone(), &goal);

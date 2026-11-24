@@ -96,6 +96,13 @@ if [ "$(stat -f -c %T "${work}")" = "$(stat -f -c %T "${repo}")" ]; then
   printf 'note: fixtures share the filesystem of the checkout the host reclaimer judges\n' >&2
 fi
 fake_pids=()
+# The slot gate's directory is read by every run of the script under test (it
+# is where a run that has started but not compiled yet says which tree it is
+# about to read). Point every run at a fixture directory: on a host that is
+# running a gate -- which is exactly the host this suite runs on -- the real
+# one would otherwise put *its* live runs into the readings and every assertion
+# about `left_alone` would depend on what else the machine was doing.
+export COGNEVA_BUILD_GATE_LOCK_DIR="${work}/gate"
 cleanup() {
   for pid in "${fake_pids[@]+"${fake_pids[@]}"}"; do kill "${pid}" 2>/dev/null || true; done
   rm -rf "${work}"
@@ -381,6 +388,59 @@ if grep -q 'a process of ours is unreadable' <<<"${out}"; then
 fi
 grep -q 'unreadable=0' <<<"${out}" \
   || fail "结束的进程被计成了无法归属的读数：${out}"
+
+# --- 6c) a gate run that has started but has not compiled yet ----------------
+# A gate takes its `.running` record before its first `cargo` (see
+# `lib/gate-run-record.sh`), so there is a window in which it holds the tree its
+# next step will read and no process in `writer_processes` is running yet. On
+# 2026-11-23 23:44 a reclaim landed in exactly that window: `build/ring-*/out`
+# was released, the same gate's `rustc` failed eight seconds later with
+# `could not find native static library ring-core`, and cargo's fingerprints
+# still called those artifacts fresh (recovery took a `cargo clean -p` per
+# package). The record names the run's pid; that pid being alive is what says
+# the next build will read this tree.
+#
+# The stand-in is deliberately *not* named like a builder: a process named
+# `cargo` in that worktree would be caught by the by-name leg, and then this
+# case would pass with the leg under test removed.
+pending="$(new_tree pending "${signature}")"
+deadrec="$(new_tree deadrec "${signature}")"
+mkdir -p "${COGNEVA_BUILD_GATE_LOCK_DIR}/runs"
+fake_cargo "${work}/gate-shell"
+( cd "${work}/host/pending" && exec "${work}/gate-shell" -c 'sleep 60; :' ) &
+gate_pid=$!
+fake_pids+=("${gate_pid}")
+waited=0
+while [ "${waited}" -lt 10 ]; do
+  [ "$(readlink "/proc/${gate_pid}/cwd" 2>/dev/null || true)" = "${work}/host/pending" ] && break
+  sleep 0.5
+  waited=$((waited + 1))
+done
+[ "$(readlink "/proc/${gate_pid}/cwd" 2>/dev/null || true)" = "${work}/host/pending" ] \
+  || fail "自检失败：待办构建的夹具进程没落到它的工作树里，下面几条断言会永远通过"
+gate_tag="$(printf '%s' "${work}/host/pending" | sed 's|^/||; s|/|_|g')"
+: >"${COGNEVA_BUILD_GATE_LOCK_DIR}/runs/${gate_tag}-gate-$(date +%s)-${gate_pid}.running"
+# And the other half: a record whose run was killed. The pid is gone, so the
+# file is evidence of a run that ended, not a build that is about to read the
+# tree -- a stale record must not pin a cache forever.
+dead_pid="$(bash -c 'printf "%s" "$$"')"
+waited=0
+while [ -d "/proc/${dead_pid}" ] && [ "${waited}" -lt 10 ]; do
+  sleep 0.5
+  waited=$((waited + 1))
+done
+[ -d "/proc/${dead_pid}" ] &&
+  fail "自检失败：死记录用的 pid ${dead_pid} 还活着，第二条断言会永远通过"
+dead_tag="$(printf '%s' "${work}/host/deadrec" | sed 's|^/||; s|/|_|g')"
+: >"${COGNEVA_BUILD_GATE_LOCK_DIR}/runs/${dead_tag}-gate-$(date +%s)-${dead_pid}.running"
+
+out="$(run_gc COGNEVA_TARGET_GC_PROFILE_TRIGGER_PCT=1 COGNEVA_TARGET_GC_TRIGGER_PCT=1 COGNEVA_TARGET_GC_FLOOR_PCT=0)"
+grep -q "leaving ${pending} alone: pid ${gate_pid}" <<<"${out}" \
+  || fail "开跑还没编译的那一跑没挡住清扫：它的下一次 rustc 会读这棵树（${pending}）：${out}"
+[ -f "${pending}/debug/deps/libstale.rlib" ] \
+  || fail "待办构建会读的树被删了；记录那条腿 fail-open"
+[ ! -e "${deadrec}/debug/deps/libstale.rlib" ] \
+  || fail "被杀掉的那一跑的记录把树钉住了；一条旧记录不该永远挡住回收（${deadrec}）：${out}"
 
 # --- 7) no cache at all is a reading, not a failure --------------------------
 empty="$work/empty"
