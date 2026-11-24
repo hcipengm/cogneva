@@ -267,15 +267,6 @@ fn workflow() -> String {
     read_repo(WORKFLOW)
 }
 
-/// The names the base branch goes by, in the order they are tried.
-///
-/// The name differs by checkout and the difference means nothing: CI's checkout
-/// calls it `origin/main`, the deployer's clone keeps the base branch as a local
-/// `main` and names the forge it pulls from `upstream`, and a developer's clone
-/// has `origin`. Every one of them is the base branch, so the first that
-/// resolves is the one to read.
-const BASE_NAMES: &[&str] = &["origin/main", "main", "upstream/main", "local/main"];
-
 /// The declaration as it stands on the base branch.
 ///
 /// `workflow()` reads the tree under judgment, and so do the tables above: they
@@ -287,25 +278,24 @@ const BASE_NAMES: &[&str] = &["origin/main", "main", "upstream/main", "local/mai
 ///
 /// Not resolving it is a failure rather than a fallback to the tree under
 /// judgment: a contract that reads nothing agrees with everything.
+///
+/// Which names the base branch goes by is not restated here: `common::base_tree`
+/// is the one place that answers it, and the capacity registries read the base
+/// branch through the same helper.
 fn base_workflow() -> String {
     let root = repo_root();
-    for name in BASE_NAMES {
-        let out = std::process::Command::new("git")
-            .current_dir(&root)
-            .args(["show", &format!("{name}:{WORKFLOW}")])
-            .output()
-            .unwrap_or_else(|e| panic!("could not run git in {}: {e}", root.display()));
-        if out.status.success() {
-            return String::from_utf8(out.stdout)
-                .unwrap_or_else(|e| panic!("{name}:{WORKFLOW} is not utf-8: {e}"));
+    for name in common::base_tree::BASE_NAMES {
+        if let Some(text) = common::base_tree::base_text(&root, name, WORKFLOW) {
+            return text;
         }
     }
     panic!(
-        "none of {BASE_NAMES:?} resolves {WORKFLOW} in {}; this contract judges a \
+        "none of {:?} resolves {WORKFLOW} in {}; this contract judges a \
          change against the gating set the base branch declares, so a checkout \
          that cannot see the base branch cannot tell whether the change dropped \
          one of its jobs. Fetch the base branch rather than letting the contract \
          pass by reading nothing.",
+        common::base_tree::BASE_NAMES,
         root.display()
     );
 }

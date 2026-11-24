@@ -202,7 +202,14 @@ struct Proof {
 /// population is whatever the chart ships, and a leaf with no block is reported
 /// by the caller as a hole rather than as an unknown row.
 fn accounts() -> Accounts {
-    let text = read(&repo_root().join(VALUES));
+    accounts_from(&read(&repo_root().join(VALUES)))
+}
+
+/// 同一套判读，作用在**给的那份 `values.yaml` 文本**上。
+///
+/// 拆出这一层是为了能读基分支上的那一份：判据要问「这一笔有没有多出一个界形却
+/// 没有证明的数」，那要拿基分支的叶子过同一台判读机，而不是在这里留一份豁免名单。
+fn accounts_from(text: &str) -> Accounts {
     let lines: Vec<&str> = text.lines().collect();
     let leaves = leaf_lines(&lines);
 
@@ -1127,29 +1134,6 @@ fn a_one_off_measurement_names_its_reading_its_day_and_what_it_found() {
 /// 词的块在页面上一样普通。这条判据点名的因此不是「标着某个词的那一条」，而是
 /// 「没有证明的界形数字」。
 ///
-/// 下面这份名单是 2026-11-16 的读数：18 行界形数字块里没有证明。名单**只减不增**
-/// ——新提出一条界形数字而不给证明就是红，而那正是这条门要拦的那一笔。
-const BOUND_SHAPED_FIXED_AT_CENSUS: &[&str] = &[
-    "backends.meilisearch.replicas",
-    "backends.postgres.replicas",
-    "backends.redis.replicas",
-    "backends.qdrant.replicas",
-    "backends.nats.replicas",
-    "backends.seaweedfs.replicas",
-    "backup.successfulJobsHistoryLimit",
-    "backup.failedJobsHistoryLimit",
-    "backup.backoffLimit",
-    "backup.drillBackoffLimit",
-    "clusterRegistry.replicas",
-    "evolution.replicas",
-    "healthProbes.liveness.failureThreshold",
-    "healthProbes.readiness.failureThreshold",
-    "healthProbes.startup.failureThreshold",
-    "healthProbes.progressFile.failureThreshold",
-    "webSearch.replicas",
-    "webFetch.replicas",
-];
-
 /// 界形的最后一段名字。
 const BOUND_SHAPED_SEGMENTS: &[&str] = &[
     "replicas",
@@ -1166,10 +1150,13 @@ const BOUND_SHAPED_SEGMENTS: &[&str] = &[
     "timeout",
 ];
 
-#[test]
-fn a_bound_shaped_number_is_never_fixed() {
+/// 界形、又没有证明的那些叶子。
+///
+/// 这一问的两个来源（今天这棵树、基分支）共用同一个函数：基线用一套判据、今天用
+/// 另一套，两个数就没有可比性了。
+fn bound_shaped_without_proof(accounts: &Accounts) -> Vec<String> {
     let mut flagged: Vec<String> = Vec::new();
-    for row in &accounts().rows {
+    for row in &accounts.rows {
         let segment = row
             .key
             .rsplit('.')
@@ -1184,31 +1171,37 @@ fn a_bound_shaped_number_is_never_fixed() {
             flagged.push(row.key.clone());
         }
     }
-    let known: BTreeSet<&str> = BOUND_SHAPED_FIXED_AT_CENSUS.iter().copied().collect();
+    flagged
+}
+
+/// 基分支上的那份 `values.yaml`，过同一台判读机——豁免的名额就是它量出来的
+/// 那一组界形叶子。
+fn base_accounts() -> Accounts {
+    let root = repo_root();
+    let rev = crate::common::base_tree::base_rev(&root);
+    let text = crate::common::base_tree::base_text(&root, &rev, VALUES).unwrap_or_else(|| {
+        panic!("{VALUES} 在基分支 {rev} 上读不到：这一问的基线就是它，读不到就不能判")
+    });
+    accounts_from(&text)
+}
+
+#[test]
+fn a_bound_shaped_number_is_never_fixed() {
+    let flagged = bound_shaped_without_proof(&accounts());
+    let known: BTreeSet<String> = bound_shaped_without_proof(&base_accounts())
+        .into_iter()
+        .collect();
     let new: Vec<&String> = flagged
         .iter()
         .filter(|key| !known.contains(key.as_str()))
         .collect();
     assert!(
         new.is_empty(),
-        "这几条是界形的数字（副本数 / 重试上限 / 失败阈值 / 历史条数），块里却没有证明：\n{}\n\
+        "这几条是界形的数字（副本数 / 重试上限 / 失败阈值 / 历史条数），块里却没有证明，\
+         而基分支上也没有它们：\n{}\n\
          界不是约定：它要么由一条读数导出（`proof:` 行，带「换输入值就变」的证明），\
          要么被删掉，改用进度检测与事实反馈。",
         new.iter()
-            .map(|key| format!("  {key}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-    let stale: Vec<&&str> = known
-        .iter()
-        .filter(|key| !flagged.iter().any(|found| found == **key))
-        .collect();
-    assert!(
-        stale.is_empty(),
-        "名单里这几条已经不再是「没有证明的界形数字」了（补了证明或删掉了），把名单里的行也删掉：\
-         \n{}",
-        stale
-            .iter()
             .map(|key| format!("  {key}"))
             .collect::<Vec<_>>()
             .join("\n")

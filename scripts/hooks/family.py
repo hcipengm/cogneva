@@ -52,8 +52,11 @@ def resolve_ledger(explicit: str | None) -> pathlib.Path:
 
 OPEN_WORDS = ("未落", "部分", "进行中", "待落", "待裁")
 
-# 四张配套表：改了一处，另一处必须跟着改，否则那道门会红。
-REGISTRY = "crates/cogneva/tests/rust_capacity_constants_registry_test.rs"
+# 三张配套表：改了一处，另一处必须跟着改，否则那道门会红。
+#
+# 容量登记表原来也在这张单上（改了一处 `bound`，就得改它那一行）。那一行已经不在了：
+# 基线改由基分支上现量，改 `bound` 与「改哪一行」之间不再有配对关系，配不配对由那条
+# 判据自己在推之前问。
 CHART = "deploy/helm/cogneva"
 RULE_CONFIG = "deploy/helm/cogneva/files/cogneva.json"
 FIXTURES = "deploy/k3s/observability/tests"
@@ -104,26 +107,6 @@ def show(root: pathlib.Path, path: str) -> str:
     return file.read_text(errors="ignore") if file.exists() else ""
 
 
-def cap_markers(text: str) -> int:
-    # 行里记的是**答 `bound` 的那些**（`BOUND_AT_CENSUS` 自己的文档就是这么写的），
-    # `fixed` 不是这笔债：把它也数进来，一个文件只要有一处 `fixed` 就永远对不上自己的
-    # 行（2026-11-22 实测：workdir.rs 10 bound + 2 fixed，行是 10，门红）。
-    return len(re.findall(r"//\s*cap:\s*bound", text))
-
-
-def capacity_owed(root: pathlib.Path, changed: set[str]) -> list[tuple[str, str]]:
-    """比行**多**是红；比行少是还了债（测试那边印 STALE 让人把行降下来），不是红。"""
-    rows = {
-        m.group(1): int(m.group(2))
-        for m in re.finditer(r'\(\s*"(crates/[^"]+\.rs)"\s*,\s*(\d+)\s*\)', show(root, REGISTRY))
-    }
-    owed: list[tuple[str, str]] = []
-    for path in sorted(changed):
-        if path in rows and cap_markers(show(root, path)) > rows[path]:
-            owed.append((REGISTRY, f"the row for {path} no longer counts its bounds"))
-    return owed
-
-
 def static_owed(root: pathlib.Path, changed: set[str]) -> list[tuple[str, str]]:
     if not any(path.startswith(CHART) for path in changed):
         return []
@@ -167,7 +150,7 @@ def metrics_owed(root: pathlib.Path, changed: set[str]) -> list[tuple[str, str]]
     ]
 
 
-CHECKS = (capacity_owed, static_owed, rules_owed, metrics_owed)
+CHECKS = (static_owed, rules_owed, metrics_owed)
 
 
 
