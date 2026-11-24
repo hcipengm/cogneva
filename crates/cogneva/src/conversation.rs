@@ -452,6 +452,57 @@ async fn close_checkpoints(
     }
 }
 
+/// 会话开头那张快照与这一轮的第一道命令之间的闸。
+///
+/// 拍快照那一趟在开跑时就被派出去（见 `turn` 里那一段），这一层包在工具面的
+/// 执行器外面：不碰树的调用原样透传，第一次真要动树时才等那一趟走完。
+/// 不变量因此没变——命令仍然排在那张快照之后；变的是**回答不排在它后面**。
+struct OpeningSnapshot {
+    inner: Arc<dyn cog_core::SandboxBackend>,
+    /// 那一趟走完了没有。拍不下来也算走完：它的出路是记下「这个会话没有
+    /// 开头快照」，不是把这一轮的命令永远扣住。
+    landed: tokio::sync::watch::Receiver<bool>,
+}
+
+impl OpeningSnapshot {
+    /// 等那一趟走完。已经有结论的闸不再等：第一次读到的就是 `true`。
+    async fn settled(&self) {
+        let mut landed = self.landed.clone();
+        // 发送端随那一趟一起丢掉（任务 panic 也一样）：那时闸跟着消失，命令
+        // 照过——一张拍不下来的快照不该变成一张永远不落地的门。
+        while !*landed.borrow() && landed.changed().await.is_ok() {}
+    }
+}
+
+#[async_trait::async_trait]
+impl cog_core::SandboxBackend for OpeningSnapshot {
+    async fn execute(&self, req: &cog_core::SandboxRequest) -> SFResult<cog_core::SandboxResult> {
+        self.settled().await;
+        self.inner.execute(req).await
+    }
+
+    async fn execute_stream(
+        &self,
+        req: &cog_core::SandboxRequest,
+    ) -> SFResult<cog_core::CommandEventStream> {
+        self.settled().await;
+        self.inner.execute_stream(req).await
+    }
+
+    // 下面三问不碰树：队列、边界、预编译照当时的样子答，不排在快照后面。
+    async fn boundary(&self) -> SFResult<cog_core::SandboxBoundary> {
+        self.inner.boundary().await
+    }
+
+    async fn lane(&self) -> SFResult<cog_core::BuildLaneReading> {
+        self.inner.lane().await
+    }
+
+    async fn precompile(&self, bytes: &[u8]) -> SFResult<String> {
+        self.inner.precompile(bytes).await
+    }
+}
+
 /// 这一轮那句话是从哪儿来的。
 ///
 /// 名字是哈希出来的，读的人从名字上分不出人跟探针。来源是在握手时客户端自报的，
@@ -942,20 +993,35 @@ impl ConversationTurn for PlatformConversation {
                 ..Default::default()
             };
             // 会话开头的那棵树：只在第一次进到这里时真的拍（之后读一行 KV 就
-            // 知道已经有了）。这一句要等，是因为它必须落在动手之前——放到开跑
-            // 之后，拍到的就是这一轮改了一半的树，而读数上它叫「会话开头」。
-            if let (Some(owner_name), Some(sandbox), Some(kv)) =
-                (owner, self.sandbox.as_ref(), self.people.as_ref())
-            {
-                open_checkpoints(
-                    Arc::clone(sandbox),
-                    Arc::clone(kv),
-                    owner_name.to_string(),
-                    request.session_id.clone(),
-                    employee.id.clone(),
-                )
-                .await;
-            }
+            // 知道已经有了）。
+            //
+            // 这一趟派出去跑，不在这里等。它是附加能力，拍不下来时这一趟自己
+            // 会把「这个会话没有开头快照」记进账（`mark_unavailable`）；把它放在
+            // 回答的必经之路上，等到的只是执行器换版的那整个重试窗口——2026-11-24
+            // 实测一轮因此停在 `message.start` 上 3 分 26 秒，最后落的还是一句
+            // 与快照毫无关系的上游拒绝。
+            //
+            // 但它仍要落在这一轮动手之前：放到开跑之后，拍到的就是这一轮改了
+            // 一半的树，读数上却还叫「会话开头」。所以闸装在**命令**那一侧
+            // （见 `OpeningSnapshot`）：不碰树的回答不等它，要动树的时候才等。
+            let opening = match (owner, self.sandbox.as_ref(), self.people.as_ref()) {
+                (Some(owner_name), Some(sandbox), Some(kv)) => {
+                    let (landed_tx, landed) = tokio::sync::watch::channel(false);
+                    let who = owner_name.to_string();
+                    let session = request.session_id.clone();
+                    let agent = employee.id.clone();
+                    let capturing = Arc::clone(sandbox);
+                    let kv = Arc::clone(kv);
+                    tokio::spawn(async move {
+                        open_checkpoints(capturing, kv, who, session, agent).await;
+                        // 拍到了、拍不下来、这个会话本来就有开头快照，都是这一趟
+                        // 走完了：闸放下，命令照常过。
+                        let _ = landed_tx.send(true);
+                    });
+                    Some((landed, Arc::clone(sandbox)))
+                }
+                _ => None,
+            };
             // 工具面 = 这个进程装配好的那一份 ＋ 控制面五只。
             //
             // 复制的是**整张注册表**（`fork`），不是工具清单：哪些工具存在只是
@@ -967,10 +1033,19 @@ impl ConversationTurn for PlatformConversation {
             //
             // 表本身仍是这一轮私有的：控制面五只只属于这一段对话，注册进共用表里
             // 会变成每个 agent 都能派活。
-            let tools = match self.tools.as_ref() {
+            let mut tools = match self.tools.as_ref() {
                 Some(shared) => shared.fork(),
                 None => cog_agent::ToolRegistry::new(),
             };
+            // 命令那一侧的闸：第一次真要动树的时候，先等会话开头那张快照。
+            // 子任务复制的是这张已经上过闸的表（`tools.fork()`），所以子任务
+            // 的第一道命令排的也是同一张快照之后。
+            if let Some((landed, sandbox)) = opening {
+                tools.set_sandbox_backend(Arc::new(OpeningSnapshot {
+                    inner: sandbox,
+                    landed,
+                }));
+            }
             // 三本只读账与控制面五只同一处装：它们读的也是这个进程里已发布的
             // 服务，缺的那本由进程如实缺席，而工具会把它说出来。
             for tool in ledger_tools(&self.ledgers) {
