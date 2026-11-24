@@ -39,7 +39,7 @@ data:
   # 向量后端的地址直接由代码读 QDRANT_URL；没有第二个 provider 开关要同步。
   QDRANT_URL: "http://qdrant.cogneva.svc.cluster.local:6334"
   COGNEVA_MEDIA_PROVIDER: "local-sfu"
-  COGNEVA_STORAGE_PROVIDER: "local-fs"
+  COGNEVA_STORAGE_PROVIDER: "seaweedfs"
 
   COGNEVA_WORKSPACE_ID: "default"
   # 每个用户工作区的字节上限。这里**不写默认值**：网关自己有同一条界（它的
