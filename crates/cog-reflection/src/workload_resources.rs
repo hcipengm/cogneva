@@ -607,6 +607,82 @@ async fn quota_headroom(ns: &str) -> Option<Targets> {
     })
 }
 
+/// 额度该抬到哪：`used + 最大那一份（按实测抬过之后）`，只升不降，且不超过节点
+/// 可分配量。`None` 是「不用动」。
+///
+/// 这是把额度那一层接进闭环的那条律：今天的 `hard` 由渲染集按模板声明值投影，
+/// 只在部署时重算——模板里库声明 500m，投影得 5 核；而闭环后来把它抬到 3.04，
+/// 额度没跟着抬，Pod 重建时被自己的闸门拒掉（2026-11-24 数据库不在的那一次）。
+/// 判据只有一句：**任何时候要重建最大那一份，都装得下**。
+fn raised_ceiling(hard: u64, used: u64, largest: u64, allocatable: Option<u64>) -> Option<u64> {
+    let wanted = used.saturating_add(largest);
+    if wanted <= hard {
+        return None;
+    }
+    // 节点装不下的值不写：写上去只是把拒绝从「额度」挪到「调度」。
+    if let Some(cap) = allocatable {
+        if wanted > cap {
+            return None;
+        }
+    }
+    Some(wanted)
+}
+
+/// 节点可分配量的合计（一维：cpu 毫核 / 内存字节）。
+async fn node_allocatable(unit: AllocatableUnit) -> Option<u64> {
+    let raw = kubectl(&["get", "nodes", "-o", "json"]).await.ok()?;
+    let nodes: Value = serde_json::from_str(&raw).ok()?;
+    let items = nodes.get("items")?.as_array()?;
+    let mut total = 0u64;
+    for node in items {
+        let value = node.pointer("/status/allocatable")?;
+        let text = match unit {
+            AllocatableUnit::Cpu => value.get("cpu")?.as_str()?,
+            AllocatableUnit::Memory => value.get("memory")?.as_str()?,
+        };
+        let parsed = match unit {
+            AllocatableUnit::Cpu => parse_cpu_millicores(text)?,
+            AllocatableUnit::Memory => parse_memory_bytes(text)?,
+        };
+        total = total.saturating_add(parsed);
+    }
+    Some(total)
+}
+
+#[derive(Clone, Copy)]
+enum AllocatableUnit {
+    Cpu,
+    Memory,
+}
+
+/// 额度的 `hard` 与 `used` 两列，按四个维度。
+async fn quota_hard_and_used(ns: &str) -> Option<(Targets, Targets)> {
+    let raw = kubectl(&["get", "resourcequota", QUOTA_NAME, "-n", ns, "-o", "json"])
+        .await
+        .ok()?;
+    let object: Value = serde_json::from_str(&raw).ok()?;
+    let read = |path: &str| -> Option<Targets> {
+        let block = object.pointer(path)?;
+        let one = |dimension: &str, parse: fn(&str) -> Option<u64>| -> Option<u64> {
+            block.get(dimension)?.as_str().and_then(parse)
+        };
+        Some(Targets {
+            cpu_request_millicores: one("requests.cpu", parse_cpu_millicores)?,
+            memory_request_bytes: one("requests.memory", parse_memory_bytes)?,
+            cpu_limit_millicores: one("limits.cpu", parse_cpu_millicores).unwrap_or(0),
+            memory_limit_bytes: one("limits.memory", parse_memory_bytes).unwrap_or(0),
+        })
+    };
+    let hard = read("/spec/hard")?;
+    let used = read("/status/used").unwrap_or(Targets {
+        cpu_request_millicores: 0,
+        memory_request_bytes: 0,
+        cpu_limit_millicores: 0,
+        memory_limit_bytes: 0,
+    });
+    Some((hard, used))
+}
+
 /// 一次抬价能从这一拍的额度余量里拿到多少：`requested` 不超过 `declared` 时不花
 /// 预算；超过时最多花剩下的（`budget` 用完就停在声明值上）。
 ///
@@ -2026,6 +2102,9 @@ pub async fn round(
             "workload resources: the namespace quota's headroom is unreadable; this pass does not cap its raises"
         ),
     }
+    // 这一拍抬过之后，「最大的一份」有多大（× 副本数）。额度要按它重算。
+    let mut largest_cpu: u64 = 0;
+    let mut largest_memory: u64 = 0;
 
     let pods: Value =
         serde_json::from_str(&kubectl(&["get", "pods", "-n", ns, "-o", "json"]).await?)
@@ -2314,6 +2393,24 @@ pub async fn round(
         // 抬价这一边也要花额度：闭环抬上去的请求先向这一拍剩下的余量借，借不到
         // 就停在放得下的地方。放在出 patch body 之前，是因为写下去的那一份就是
         // 准入随后记账的那一份——两处两个数时，Pod 会在重建时被自己的旧闸门拒掉。
+        // 这一段是「最大的一份装不装得下」要用的读数：按本拍抬过之后的值 × 副本数。
+        {
+            let replicas = workload.replicas.unwrap_or(1).max(1) as u64;
+            let total_cpu: u64 = workload
+                .containers
+                .iter()
+                .filter_map(|c| resolved.get(&c.name))
+                .map(|t| t.cpu_request_millicores)
+                .sum();
+            let total_mem: u64 = workload
+                .containers
+                .iter()
+                .filter_map(|c| resolved.get(&c.name))
+                .map(|t| t.memory_request_bytes)
+                .sum();
+            largest_cpu = largest_cpu.max(total_cpu.saturating_mul(replicas));
+            largest_memory = largest_memory.max(total_mem.saturating_mul(replicas));
+        }
         if let Some(budget) = cpu_raise_budget.as_mut() {
             for (name, targets) in changes.iter_mut() {
                 let Some(declared) = workload
@@ -2495,6 +2592,67 @@ pub async fn round(
             "no container usage was readable this round; resource targets were left as they were"
                 .to_string(),
         );
+    }
+
+    // 额度自己跟着实测涨：`used + 最大那一份`，只升不降，卡在节点可分配量下。
+    // 这一步放在最后：它读的是这一拍**已经写下去**的值，与准入随后看到的同一份。
+    if let (Some((hard, used)), Some(cap_cpu)) = (
+        quota_hard_and_used(ns).await,
+        node_allocatable(AllocatableUnit::Cpu).await,
+    ) {
+        let mut hard_patch = serde_json::Map::new();
+        if let Some(wanted) =
+            raised_ceiling(hard.cpu_request_millicores, used.cpu_request_millicores, largest_cpu, Some(cap_cpu))
+        {
+            info!(
+                namespace = %ns,
+                from = hard.cpu_request_millicores,
+                to = wanted,
+                used = used.cpu_request_millicores,
+                largest = largest_cpu,
+                "workload resources: raising the namespace's request ceiling so the largest workload can be recreated"
+            );
+            hard_patch.insert(
+                "requests.cpu".to_string(),
+                Value::String(format!("{wanted}m")),
+            );
+        }
+        let cap_mem = node_allocatable(AllocatableUnit::Memory).await;
+        if let Some(wanted) = raised_ceiling(
+            hard.memory_request_bytes,
+            used.memory_request_bytes,
+            largest_memory,
+            cap_mem,
+        ) {
+            hard_patch.insert(
+                "requests.memory".to_string(),
+                Value::String(format!("{wanted}")),
+            );
+        }
+        if !hard_patch.is_empty() {
+            let body = serde_json::json!({"spec": {"hard": Value::Object(hard_patch)}});
+            let body = body.to_string();
+            match kubectl(&[
+                "patch",
+                "resourcequota",
+                QUOTA_NAME,
+                "-n",
+                ns,
+                "--type",
+                "merge",
+                "-p",
+                &body,
+            ])
+            .await
+            {
+                Ok(_) => patched += 1,
+                Err(e) => warn!(
+                    namespace = %ns,
+                    error = %e,
+                    "workload resources: the quota patch was refused; the ceiling keeps the value it had"
+                ),
+            }
+        }
     }
 
     Ok(RoundSummary { evaluated, patched })
@@ -3464,6 +3622,17 @@ mod tests {
     /// per-container law reads, asked what a typical container here looks
     /// like: the median sets the request, the busy edge sets the limit.
     #[test]
+    /// 额度的重算律：`used + 最大那一份`，只升不降；节点装不下的值不写。
+    /// 用 2026-11-24 的实测：硬 5000m、已用 2660m、最大一份 3040m、节点 23860m
+    /// ⇒ 5700m；如果硬已经是 6000m 就不动；如果节点只有 5000m 也不写。
+    #[test]
+    fn the_ceiling_follows_the_largest_workload_but_never_the_node() {
+        assert_eq!(raised_ceiling(5_000, 2_660, 3_040, Some(23_860)), Some(5_700));
+        assert_eq!(raised_ceiling(6_000, 2_660, 3_040, Some(23_860)), None);
+        assert_eq!(raised_ceiling(5_000, 2_660, 3_040, Some(5_000)), None);
+        assert_eq!(raised_ceiling(5_000, 2_660, 3_040, None), Some(5_700));
+    }
+
     /// 抬价先向这一拍剩下的额度借：不超过声明的部分不花，超过的部分最多花到
     /// 余量为 0；借不到就停在声明值上。2026-11-24 那次事故的数：声明 500m、
     /// 想抬到 3040m、余量 2340m ⇒ 落到 2840m，随后的准入正好顶到 5000m 的硬上限。
