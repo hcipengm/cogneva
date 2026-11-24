@@ -129,7 +129,6 @@ done
 
 # 跑。命令这一条是测试用的缝：设了就按它跑，参数照旧接在后面。
 cmd="${COGNEVA_RED_PROOF_TEST_CMD:-cargo test}"
-rc_all=0
 failed=()
 for t in "${targets[@]}"; do
     IFS='|' read -r crate name kind <<<"${t}"
