@@ -50,6 +50,8 @@ impl cog_core::SystemPlugin for StreamPlugin {
                 config.dag_executor.redis_read_resume_block_ms,
             )
         };
+        // 兜底后端的广播窗口按声明原样生效；0 在这里按字段名拒绝。
+        declared_broadcast_window(&ctx.config().system)?;
         let health = Arc::new(crate::ReadHealth::new(read_block_ms));
         ctx.publish_observable(Arc::new(crate::StreamReadObservable::new(Arc::clone(
             &health,
@@ -203,12 +205,30 @@ impl cog_core::SystemPlugin for StreamPlugin {
 ///
 /// `system.memory_message_broadcast_capacity` is the bound on how far a slow
 /// subscriber may fall behind before the channel reports a lag instead of
-/// holding more for it. The floor is not cosmetic: `broadcast::channel(0)`
-/// panics, and a deployment that writes 0 should lose the buffering, not the
-/// process at startup.
+/// holding more for it. The value is used as declared: `broadcast::channel(0)`
+/// panics, so 0 is refused by name in `init` rather than quietly turned into 1
+/// — a rewrite would leave the config surface reading a value that never took
+/// effect.
 fn memory_fallback(config: &cog_core::config::SystemConfig) -> crate::MemoryMessageBackend {
     crate::MemoryMessageBackend::new()
-        .with_broadcast_capacity(config.memory_message_broadcast_capacity.max(1))
+        .with_broadcast_capacity(config.memory_message_broadcast_capacity)
+}
+
+/// The declared broadcast window, or a named refusal for 0.
+///
+/// `tokio::sync::broadcast::channel(0)` panics, so 0 is not a smaller window —
+/// it is not a window at all. The old `.max(1)` turned the declared 0 into a
+/// silent 1, which left the config surface showing a number that never took
+/// effect; the refusal keeps the declaration and the behavior on one value.
+fn declared_broadcast_window(
+    config: &cog_core::config::SystemConfig,
+) -> cog_core::SFResult<usize> {
+    if config.memory_message_broadcast_capacity == 0 {
+        return Err(cog_core::SFError::Config(
+            "system.memory_message_broadcast_capacity 声明为 0：广播窗口要一个槽位才能缓冲，0 不是更小的窗口（tokio 的 broadcast 通道会直接 panic）。给它一个条数。".into(),
+        ));
+    }
+    Ok(config.memory_message_broadcast_capacity)
 }
 
 /// Static descriptor for auto-discovery.
@@ -255,6 +275,29 @@ mod tests {
         assert!(
             roomy.next().await.unwrap().is_ok(),
             "eight slots hold two pending messages, so this reader must not report a lag"
+        );
+    }
+
+    /// 声明的窗口原样交给通道，0 在装配处按字段名拒绝。
+    ///
+    /// 没有这条测试，`.max(1)` 回来时没人会红：声明的 0 被换成 1，配置面读到
+    /// 的仍是「生效值」，而部署写下的那个数再也没人看得见。
+    #[test]
+    fn a_declared_broadcast_window_survives_and_zero_is_refused() {
+        let declared = cog_core::config::SystemConfig {
+            memory_message_broadcast_capacity: 3,
+            ..Default::default()
+        };
+        assert_eq!(super::declared_broadcast_window(&declared).unwrap(), 3);
+
+        let zero = cog_core::config::SystemConfig {
+            memory_message_broadcast_capacity: 0,
+            ..Default::default()
+        };
+        let err = super::declared_broadcast_window(&zero).unwrap_err().to_string();
+        assert!(
+            err.contains("memory_message_broadcast_capacity"),
+            "声明 0 的错误要点名这个字段，实际是：{err}"
         );
     }
 }
