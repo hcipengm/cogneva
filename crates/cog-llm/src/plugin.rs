@@ -47,6 +47,15 @@ impl cog_core::SystemPlugin for LlmPlugin {
             &llm_routing,
             ctx.consume_service::<dyn cog_core::HttpClient>(),
         )?;
+    // 每一发调用也写成事件流上的一行（正本）；进程内计数仍是旁路的读数。
+    // 取不到那一条流不挡这一路：只留计数，装配时告警说清。
+    if let Some(sink) = ctx.consume_service::<dyn cog_core::LlmCallEvents>() {
+        crate::observable::global_observable().attach_call_events(sink);
+    } else {
+        tracing::warn!(
+            "no LlmCallEvents store in this process: calls are counted in memory but leave no event row"
+        );
+    }
         let hot_swap = Arc::new(crate::HotSwappableLlmClient::new(provider));
         ctx.publish(hot_swap.clone());
         info!("LlmPlugin LLM provider published");

@@ -60,6 +60,10 @@ impl CallFailure {
 /// LLM-layer observable state.
 #[derive(Default)]
 pub struct LlmObservable {
+    /// 每一笔调用也落成事件流上的一行（正本）。没有装配时（部署里没有那条流）
+    /// 就只留进程内计数——「这一路没记账」与「记了零笔」在读数上是两件事，
+    /// 前者由装配时的告警说出，后者由计数说出。
+    call_events: OnceLock<Arc<dyn cog_core::LlmCallEvents>>,
     call_count: AtomicU64,
     token_in: AtomicU64,
     token_out: AtomicU64,
@@ -74,6 +78,16 @@ impl LlmObservable {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 装配事件流那一侧的写者。全局计数器只有进程里那一份，装配一次即可；
+    /// 再装一次以第一次为准（第二份写者只会把同一笔写成两行）。
+    pub fn attach_call_events(&self, sink: Arc<dyn cog_core::LlmCallEvents>) {
+        let _ = self.call_events.set(sink);
+    }
+
+    pub fn call_events(&self) -> Option<Arc<dyn cog_core::LlmCallEvents>> {
+        self.call_events.get().cloned()
     }
 
     pub fn record_call(&self, tokens_in: u64, tokens_out: u64, latency_ms: u64) {
