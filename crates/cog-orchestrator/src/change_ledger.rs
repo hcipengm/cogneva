@@ -1683,7 +1683,7 @@ pub const ROWS_PER_HANDOVER_ENV: &str = "COGNEVA_CHANGE_LEDGER_ROWS_PER_HANDOVER
 /// rate the evidence supports; a number like the old seed of five was one
 /// generation's observation frozen into the tree, and the graph that was
 /// supposed to measure it already answers that question live.
-// cap: fixed — 「一批」的最小行数：单行交接是聊天回合那一种形状，不是批次；测量与界的起点共用这一个门槛
+// cap: bound — 「一批」的最小行数，由单行交接的形状钉住：一行的那一种交接是聊天回合「把这一行交出去」，不是批次，测量读不到它
 const MIN_ROWS_PER_BATCH: usize = 2;
 
 /// How long a refused batch speaks about what one generation in front of us can
