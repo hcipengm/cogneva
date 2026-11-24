@@ -176,9 +176,8 @@ pub fn compiled() -> i32 {
         .unwrap_or_default();
     let mut base = std::env::var("COGNEVA_PUSH_BASE").unwrap_or_else(|_| "origin/main".to_string());
     let mut ledger = std::path::PathBuf::from(
-        std::env::var(COMPILE_LEDGER_ENV).unwrap_or_else(|_| {
-            format!("{}/.local/state/cogneva/compile-ledger.tsv", home())
-        }),
+        std::env::var(COMPILE_LEDGER_ENV)
+            .unwrap_or_else(|_| format!("{}/.local/state/cogneva/compile-ledger.tsv", home())),
     );
     let args: Vec<String> = std::env::args().skip(3).collect();
     let mut i = 0;
@@ -203,16 +202,21 @@ pub fn compiled() -> i32 {
 }
 
 /// 垫片记下的那些编译时刻（只这一棵树、只编译类的子命令）。
-fn compile_times(ledger: &std::path::Path, worktree: &str) -> Option<Vec<chrono::DateTime<chrono::Utc>>> {
+fn compile_times(
+    ledger: &std::path::Path,
+    worktree: &str,
+) -> Option<Vec<chrono::DateTime<chrono::Utc>>> {
     let text = std::fs::read_to_string(ledger).ok()?;
-    let here = std::fs::canonicalize(worktree).unwrap_or_else(|_| std::path::PathBuf::from(worktree));
+    let here =
+        std::fs::canonicalize(worktree).unwrap_or_else(|_| std::path::PathBuf::from(worktree));
     let mut times = Vec::new();
     for line in text.lines() {
         let parts: Vec<&str> = line.split('\t').collect();
         if parts.len() < 3 || !is_compile_argv(parts[2]) {
             continue;
         }
-        let where_ = std::fs::canonicalize(parts[1]).unwrap_or_else(|_| std::path::PathBuf::from(parts[1]));
+        let where_ =
+            std::fs::canonicalize(parts[1]).unwrap_or_else(|_| std::path::PathBuf::from(parts[1]));
         if where_ != here {
             continue;
         }
@@ -230,7 +234,15 @@ fn is_compile_argv(argv: &str) -> bool {
         "check", "build", "test", "clippy", "run", "bench", "doc", "nextest", "install", "fix",
     ];
     const SKIPS: [&str; 9] = [
-        "fmt", "metadata", "tree", "locate-project", "pkgid", "vendor", "search", "login", "publish",
+        "fmt",
+        "metadata",
+        "tree",
+        "locate-project",
+        "pkgid",
+        "vendor",
+        "search",
+        "login",
+        "publish",
     ];
     let sub = argv.split_whitespace().find(|t| !t.starts_with('-'));
     match sub {
@@ -295,7 +307,11 @@ fn judge_compile_discipline(root: &str, base: &str, ledger: &std::path::Path) ->
         .and_then(|s| chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0))
         .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
     let in_batch = times.iter().filter(|t| **t >= first).count();
-    let source = if pinned.is_some() { "这一轮的 code_rev" } else { "基线" };
+    let source = if pinned.is_some() {
+        "这一轮的 code_rev"
+    } else {
+        "基线"
+    };
     println!(
         "compile-discipline: 按{source} {} 判；一批 {in_batch} 次编译，最后一次在全部编辑之后。",
         &baseline[..baseline.len().min(12)]
@@ -342,7 +358,10 @@ pub fn stop_gate() -> i32 {
             return 3;
         }
     };
-    let ledger_dir = path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+    let ledger_dir = path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     let (repo, ok) = git(&ledger_dir, &["rev-parse", "--show-toplevel"]);
     if !ok || repo.is_empty() {
         eprintln!("ledger: 台账不在一个 git 仓里（{ledger_dir}）");
@@ -399,7 +418,10 @@ fn editing_verdict() -> GateOutcome {
         Ok(p) => p,
         Err(e) => return GateOutcome::Unreadable(e),
     };
-    let ledger_dir = path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+    let ledger_dir = path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     let (repo, ok) = git(&ledger_dir, &["rev-parse", "--show-toplevel"]);
     if !ok || repo.is_empty() {
         return GateOutcome::Unreadable(format!("台账不在一个 git 仓里（{ledger_dir}）"));
@@ -420,9 +442,7 @@ fn editing_verdict() -> GateOutcome {
         .to_string();
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
-        Err(e) => {
-            return GateOutcome::Unreadable(format!("台账读不到：{}（{e}）", path.display()))
-        }
+        Err(e) => return GateOutcome::Unreadable(format!("台账读不到：{}（{e}）", path.display())),
     };
     let items = match cog_core::contract::ledger_item::parse_md(&text) {
         Ok(items) => items,
@@ -433,12 +453,21 @@ fn editing_verdict() -> GateOutcome {
         .map(|d| d.display().to_string())
         .unwrap_or_default();
     let touched: Vec<String> = match git(&tree, &["diff", "--name-only", &code_rev]) {
-        (out, true) => out.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect(),
+        (out, true) => out
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
         _ => return GateOutcome::Unreadable(format!("工作树的改动读不到（对比 {code_rev}）")),
     };
     let pairs: Vec<(String, Vec<String>)> = items
         .iter()
-        .map(|i| (i.id.clone(), touches.get(&i.id).cloned().unwrap_or_default()))
+        .map(|i| {
+            (
+                i.id.clone(),
+                touches.get(&i.id).cloned().unwrap_or_default(),
+            )
+        })
         .collect();
     match judge_editing(&pairs, &touched) {
         Ok(()) => {
@@ -458,10 +487,15 @@ fn editing_verdict() -> GateOutcome {
 
 /// 每一条的触点都动到了没有。没有触点的条目**不在这里判**（它是台账读不出来那一类，
 /// `parse_md` 之前就点了名）；这里只回答「写了触点的，动到了没有」。
-pub fn judge_editing(items: &[(String, Vec<String>)], touched: &[String]) -> Result<(), Vec<String>> {
+pub fn judge_editing(
+    items: &[(String, Vec<String>)],
+    touched: &[String],
+) -> Result<(), Vec<String>> {
     let hit = |path: &str| {
         let p = path.trim_end_matches('/');
-        touched.iter().any(|f| f == p || f.starts_with(&format!("{p}/")))
+        touched
+            .iter()
+            .any(|f| f == p || f.starts_with(&format!("{p}/")))
     };
     let mut missing = Vec::new();
     for (id, paths) in items {
@@ -488,14 +522,19 @@ fn gate_verdict() -> GateOutcome {
         Ok(p) => p,
         Err(e) => return GateOutcome::Unreadable(e),
     };
-    let ledger_dir = path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+    let ledger_dir = path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     let (repo, ok) = git(&ledger_dir, &["rev-parse", "--show-toplevel"]);
     if !ok || repo.is_empty() {
         return GateOutcome::Unreadable(format!("台账不在一个 git 仓里（{ledger_dir}）"));
     }
     let (sha, ok) = git(&repo, &["rev-parse", "--verify", "--quiet", ROUND_REF]);
     if !ok || sha.is_empty() {
-        return GateOutcome::Unreadable("事件流里没有开着的一轮（先 `cogneva ledger open`）".into());
+        return GateOutcome::Unreadable(
+            "事件流里没有开着的一轮（先 `cogneva ledger open`）".into(),
+        );
     }
     let (body, ok) = git(&repo, &["cat-file", "-p", &sha]);
     let payload: serde_json::Value = match ok.then(|| serde_json::from_str(&body)).transpose() {
@@ -505,7 +544,11 @@ fn gate_verdict() -> GateOutcome {
     let batch: Vec<String> = payload
         .get("batch")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
     if batch.is_empty() {
         return GateOutcome::Refuse("这一轮的批次是空的：没有一条待办说过要做什么".into());
@@ -523,19 +566,23 @@ fn gate_verdict() -> GateOutcome {
 
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
-        Err(e) => {
-            return GateOutcome::Unreadable(format!("台账读不到：{}（{e}）", path.display()))
-        }
+        Err(e) => return GateOutcome::Unreadable(format!("台账读不到：{}（{e}）", path.display())),
     };
     let reached: std::collections::HashSet<String> =
-        cog_core::contract::ledger_item::reached_ids(&text).into_iter().collect();
+        cog_core::contract::ledger_item::reached_ids(&text)
+            .into_iter()
+            .collect();
     let item_touches = touches_by_id(&text);
 
     let tree = std::env::current_dir()
         .map(|d| d.display().to_string())
         .unwrap_or_default();
     let mut touched: Vec<String> = match git(&tree, &["diff", "--name-only", &code_rev]) {
-        (out, true) => out.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect(),
+        (out, true) => out
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
         _ => Vec::new(),
     };
     // 台账仓那一侧也在这一轮里被改：那一侧的改动面同样算「这一批动了什么」。
@@ -586,7 +633,11 @@ pub fn judge_gate(
             "FAIL: 台账上还有 {} 条未完成待办没做完，提交信息里也没有 \
              `Split: <1-4> — <S 号…> — <理由>`。\n      {}",
             untouched.len(),
-            untouched.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("、")
+            untouched
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join("、")
         ));
     }
     // 点名看**并集**：每一条声明各自豁免它点的那几条，后一笔的窄声明不该把前一
@@ -601,7 +652,11 @@ pub fn judge_gate(
     if !unaccounted.is_empty() {
         return Err(format!(
             "FAIL: 这些未完成待办既没做完也没被 `Split:` 点名：{}",
-            unaccounted.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("、")
+            unaccounted
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join("、")
         ));
     }
     // 理由各自再判一次真假：一条早已不成立的旧理由不能永远替人豁免。
@@ -696,8 +751,16 @@ fn judge_split(
                 return Err(format!(
                     "FAIL: Split: 3 说不可逆或不对称，但两侧都碰了不可回退的面：这一批动了 {}，\
                      被排除的那几条也要动 {}。两侧都回不去，拆开并没有把不可回退的那一侧单独拎出来",
-                    batch_irr.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("、"),
-                    excl_irr.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("、"),
+                    batch_irr
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join("、"),
+                    excl_irr
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join("、"),
                 ));
             }
             if batch_irr.is_empty() && excl_irr.is_empty() {
@@ -727,8 +790,9 @@ fn judge_split(
             Ok(())
         }
         '2' => {
-            let names_a_target =
-                split.detail.contains(".rs") || split.detail.contains("tests/") || split.detail.contains("test_");
+            let names_a_target = split.detail.contains(".rs")
+                || split.detail.contains("tests/")
+                || split.detail.contains("test_");
             if !names_a_target {
                 return Err("FAIL: Split: 2 要点名会重叠的测试目标（文件或测试名）".into());
             }
@@ -777,9 +841,8 @@ pub fn touches_by_id(text: &str) -> std::collections::HashMap<String, Vec<String
 /// 读不到就是 `None`（量不到），不是 0。
 fn closed_batch_bound() -> Option<usize> {
     let path = std::path::PathBuf::from(
-        std::env::var(CLOSED_ROUNDS_ENV).unwrap_or_else(|_| {
-            format!("{}/.local/state/cogneva/rounds-closed.tsv", home())
-        }),
+        std::env::var(CLOSED_ROUNDS_ENV)
+            .unwrap_or_else(|_| format!("{}/.local/state/cogneva/rounds-closed.tsv", home())),
     );
     let text = std::fs::read_to_string(path).ok()?;
     let mut best: Option<usize> = None;
@@ -837,14 +900,39 @@ mod tests {
         assert_eq!(cells[3], "N01,N02");
     }
 
+    /// 读数只数这一批里真的到了终态的那几条：钉进去 3 条、到位 1 条的轮记 1，不记 3。
+    /// 记 3 的话，下一个 `Split: 4` 的界就被抬到 3，而那一轮并没有读到 3 条。
+    #[test]
+    fn a_half_finished_round_counts_only_what_it_reached() {
+        let batch = vec!["N01".to_string(), "N02".to_string(), "N03".to_string()];
+        let reached: std::collections::HashSet<String> = ["N02".to_string()].into_iter().collect();
+        assert_eq!(reached_of(&batch, &reached), vec!["N02".to_string()]);
+        let line = closed_round_line(
+            "2026-11-24T01:02:03Z",
+            "abcdef1234567890",
+            &reached_of(&batch, &reached),
+        );
+        assert_eq!(line.split('\t').nth(2), Some("1"));
+        assert_eq!(line.split('\t').nth(3), Some("N02"));
+    }
+
     /// 书的载荷带着这一批、这一批每条的缺口、两个坐标与第一次开工的基准。
     #[test]
     fn the_round_payload_carries_the_batch_and_every_gap() {
         let batch = vec!["N01".to_string(), "N02".to_string()];
         let mut gaps = serde_json::Map::new();
-        gaps.insert("N01".into(), serde_json::Value::String("缺的是：接线".into()));
+        gaps.insert(
+            "N01".into(),
+            serde_json::Value::String("缺的是：接线".into()),
+        );
         gaps.insert("N02".into(), serde_json::Value::String("—".into()));
-        let payload = round_payload(&batch, &gaps, "abcdef123456", "fedcba654321", "111111111111");
+        let payload = round_payload(
+            &batch,
+            &gaps,
+            "abcdef123456",
+            "fedcba654321",
+            "111111111111",
+        );
         assert_eq!(payload["batch"].as_array().map(|a| a.len()), Some(2));
         assert_eq!(payload["gaps"]["N01"], "缺的是：接线");
         assert_eq!(payload["ledger_rev"], "abcdef123456");
@@ -852,9 +940,10 @@ mod tests {
             payload["first_rev"], "111111111111",
             "重钉不该清零「自开工以来」的基准"
         );
-        assert!(payload["opened_at"].as_str().is_some_and(|s| s.contains('T')));
+        assert!(payload["opened_at"]
+            .as_str()
+            .is_some_and(|s| s.contains('T')));
     }
-
 
     fn ids(words: &[&str]) -> Vec<String> {
         words.iter().map(|s| s.to_string()).collect()
@@ -960,7 +1049,10 @@ mod tests {
             ("N02".to_string(), vec!["crates/b/src/x.rs".to_string()]),
         ];
         assert_eq!(
-            judge_editing(&items, &["crates/a/src/lib.rs".into(), "crates/b/src/x.rs".into()]),
+            judge_editing(
+                &items,
+                &["crates/a/src/lib.rs".into(), "crates/b/src/x.rs".into()]
+            ),
             Ok(())
         );
         let missing = judge_editing(&items, &["crates/a/src/lib.rs".into()]).unwrap_err();
@@ -973,7 +1065,10 @@ mod tests {
     fn a_batch_that_reached_its_terminal_passes_without_a_split() {
         let batch = ids(&["N01", "N02"]);
         let reached = set(&["N01", "N02"]);
-        assert_eq!(judge_gate(&batch, &reached, &[], "", &Default::default(), None), Ok(2));
+        assert_eq!(
+            judge_gate(&batch, &reached, &[], "", &Default::default(), None),
+            Ok(2)
+        );
     }
 
     /// 没做完又没点名：拒，而且把没做完的逐条列出来。
@@ -993,7 +1088,14 @@ mod tests {
         let reached = set(&["N01"]);
         let touched = ids(&["deploy/helm/values.yaml"]);
         let messages = "Split: 3 — N02 — 迁移要单独落地\n";
-        let verdict = judge_gate(&batch, &reached, &touched, messages, &Default::default(), None);
+        let verdict = judge_gate(
+            &batch,
+            &reached,
+            &touched,
+            messages,
+            &Default::default(),
+            None,
+        );
         assert_eq!(verdict, Ok(1));
     }
 
@@ -1005,8 +1107,8 @@ mod tests {
         let touched = ids(&["deploy/helm/values.yaml"]);
         let item_touches = touches(&[("N02", &["migrations/postgres/127_x.up.sql"])]);
         let messages = "Split: 3 — N02 — 迁移要单独落地\n";
-        let verdict = judge_gate(&batch, &reached, &touched, messages, &item_touches, None)
-            .unwrap_err();
+        let verdict =
+            judge_gate(&batch, &reached, &touched, messages, &item_touches, None).unwrap_err();
         assert!(verdict.contains("两侧都碰"), "{verdict}");
     }
 
@@ -1017,8 +1119,15 @@ mod tests {
         let reached = set(&["N01"]);
         let touched = ids(&["crates/a/src/lib.rs"]);
         let messages = "Split: 3 — N02 — 迁移要单独落地\n";
-        let verdict = judge_gate(&batch, &reached, &touched, messages, &Default::default(), None)
-            .unwrap_err();
+        let verdict = judge_gate(
+            &batch,
+            &reached,
+            &touched,
+            messages,
+            &Default::default(),
+            None,
+        )
+        .unwrap_err();
         assert!(verdict.contains("两侧都没碰"), "{verdict}");
     }
 
@@ -1029,12 +1138,27 @@ mod tests {
         let reached = set(&["N01"]);
         let messages = "Split: 4 — N02, N03 — 一次读不完\n";
         // 收过 5 条一批：这一侧只有 2 条，不算读不完。
-        assert!(judge_gate(&batch, &reached, &[], messages, &Default::default(), Some(5)).is_err());
+        assert!(judge_gate(
+            &batch,
+            &reached,
+            &[],
+            messages,
+            &Default::default(),
+            Some(5)
+        )
+        .is_err());
         // 量不到：不许当成读得完。
         assert!(judge_gate(&batch, &reached, &[], messages, &Default::default(), None).is_err());
         // 收过 1 条一批：2 条确实比它大。
         assert_eq!(
-            judge_gate(&batch, &reached, &[], messages, &Default::default(), Some(1)),
+            judge_gate(
+                &batch,
+                &reached,
+                &[],
+                messages,
+                &Default::default(),
+                Some(1)
+            ),
             Ok(1)
         );
     }
@@ -1082,8 +1206,15 @@ mod tests {
         // 那条理由今天不成立。新声明用第 2 条，理由成立。
         let messages = "Split: 4 — N02 — 一次读不完\n\
                         Split: 2 — N02 — 与 crates/a/tests/x.rs 重叠\n";
-        let verdict =
-            judge_gate(&batch, &reached, &[], messages, &Default::default(), Some(5)).unwrap_err();
+        let verdict = judge_gate(
+            &batch,
+            &reached,
+            &[],
+            messages,
+            &Default::default(),
+            Some(5),
+        )
+        .unwrap_err();
         assert!(verdict.contains("读不完"), "{verdict}");
     }
 
@@ -1138,7 +1269,10 @@ fn git(tree: &str, args: &[&str]) -> (String, bool) {
         .args(args)
         .output();
     match out {
-        Ok(o) => (String::from_utf8_lossy(&o.stdout).trim().to_string(), o.status.success()),
+        Ok(o) => (
+            String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            o.status.success(),
+        ),
         Err(_) => (String::new(), false),
     }
 }
@@ -1213,7 +1347,10 @@ pub async fn open(events: Option<&std::sync::Arc<dyn cog_core::RoundEvents>>) ->
             return 2;
         }
     };
-    let ledger_dir = path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+    let ledger_dir = path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     let (repo, ok) = git(&ledger_dir, &["rev-parse", "--show-toplevel"]);
     let batch: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
     let gaps: serde_json::Map<String, serde_json::Value> = items
@@ -1272,7 +1409,12 @@ pub async fn open(events: Option<&std::sync::Arc<dyn cog_core::RoundEvents>>) ->
     println!(
         "ledger: 轮开在 {}@{}，这一批 {} 条",
         ROUND_REF,
-        &payload["ledger_rev"].as_str().unwrap_or("").chars().take(12).collect::<String>(),
+        &payload["ledger_rev"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .take(12)
+            .collect::<String>(),
         payload["batch"].as_array().map(|a| a.len()).unwrap_or(0)
     );
     0
@@ -1371,7 +1513,10 @@ pub async fn close(events: Option<&std::sync::Arc<dyn cog_core::RoundEvents>>) -
             return 2;
         }
     };
-    let ledger_dir = path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+    let ledger_dir = path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     let (repo, ok) = git(&ledger_dir, &["rev-parse", "--show-toplevel"]);
     if !ok || repo.is_empty() {
         // 事件流那本书：关轮就是把当前开着的那一轮记成 closed。
@@ -1434,25 +1579,53 @@ pub async fn close(events: Option<&std::sync::Arc<dyn cog_core::RoundEvents>>) -
             return 2;
         }
     };
-    if !git(&repo, &["update-ref", "--create-reflog", ROUND_REF, &new_sha]).1 {
+    if !git(
+        &repo,
+        &["update-ref", "--create-reflog", ROUND_REF, &new_sha],
+    )
+    .1
+    {
         eprintln!("ledger: {ROUND_REF} 没写成");
         return 2;
     }
     let batch: Vec<String> = payload
         .get("batch")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
     let first_rev = payload
         .get("first_rev")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let line = closed_round_line(&now, &first_rev, &batch);
+    // 读数记的是「这个宿主收过多少条一批」：只数这一批里**真的到了终态**的那几条。
+    // 书里钉的是开门那一刻的批，没做完的那几条留到后面的轮，不算这一轮读到过。
+    // 2026-11-24 实测：钉 81 条、到位 21 条的轮若照钉的量记 81，下一次 `Split: 4`
+    // 的界就被抬到 81——此后没有一轮满足得了它，这条界等于作废。
+    let reached: std::collections::HashSet<String> = match ledger_path().and_then(|p| {
+        std::fs::read_to_string(&p).map_err(|e| format!("台账读不到：{}（{e}）", p.display()))
+    }) {
+        Ok(text) => cog_core::contract::ledger_item::reached_ids(&text)
+            .into_iter()
+            .collect(),
+        Err(e) => {
+            eprintln!(
+                "ledger: {e}——这一轮关了，但那条界没有新增样本（量不到，不当成 0，也不当成 {}）",
+                batch.len()
+            );
+            println!("ledger: 这一轮关了，本批 {} 条（读数没写）", batch.len());
+            return 0;
+        }
+    };
+    let done = reached_of(&batch, &reached);
+    let line = closed_round_line(&now, &first_rev, &done);
     let ledger_path_file = std::path::PathBuf::from(
-        std::env::var(CLOSED_ROUNDS_ENV).unwrap_or_else(|_| {
-            format!("{}/.local/state/cogneva/rounds-closed.tsv", home())
-        }),
+        std::env::var(CLOSED_ROUNDS_ENV)
+            .unwrap_or_else(|_| format!("{}/.local/state/cogneva/rounds-closed.tsv", home())),
     );
     if let Some(dir) = ledger_path_file.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -1471,8 +1644,21 @@ pub async fn close(events: Option<&std::sync::Arc<dyn cog_core::RoundEvents>>) -
             ledger_path_file.display()
         ),
     }
-    println!("ledger: 这一轮关了，本批 {} 条", batch.len());
+    println!(
+        "ledger: 这一轮关了，本批 {} 条，到了 {} 条",
+        batch.len(),
+        done.len()
+    );
     0
+}
+
+/// 这一批里真的到了终态的那几条（读数的分子）。
+fn reached_of(batch: &[String], reached: &std::collections::HashSet<String>) -> Vec<String> {
+    batch
+        .iter()
+        .filter(|id| reached.contains(*id))
+        .cloned()
+        .collect()
 }
 
 /// 关轮那一刻写下的那一行读数：时刻、第一次开工的基准、这一批几条、都是谁。
@@ -1500,7 +1686,9 @@ fn write_book(repo: &str, body: &str) -> Result<String, String> {
         .expect("stdin")
         .write_all(body.as_bytes())
         .map_err(|e| format!("书写不进去：{e}"))?;
-    let out = child.wait_with_output().map_err(|e| format!("书写不进去：{e}"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("书写不进去：{e}"))?;
     if !out.status.success() {
         return Err("书写不进去".to_string());
     }
