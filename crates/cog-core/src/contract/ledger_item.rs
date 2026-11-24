@@ -76,12 +76,12 @@ impl LedgerItem {
     /// 这一条该不该进这一批。
     ///
     /// 三条规矩，与台账那一面同一套：
-    /// - `未落` 且差距非空：进批；
+    /// - `未落`：进批（旧三格行没有「差距」这一格，空着也不等于做完了）；
     /// - `已落` 且差距为空：终态到了，不进批；
     /// - 写着 `已落` 却还留着差距：**按未完成读**——跳过它等于承认那个假的终态，
     ///   而那个假的终态从此不会被任何门看第二眼。
     pub fn is_in_batch(&self) -> bool {
-        !self.gap_is_empty()
+        self.state == LedgerState::Open || !self.gap_is_empty()
     }
 }
 
@@ -232,6 +232,16 @@ pub fn reached_ids(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 旧三格行没有「差距」这一格：它写着 `未落` 就进批，空差距不等于做完了。
+    /// 只按差距判的那一版会把整族旧行读成「不在批次里」，而读数照样绿。
+    #[test]
+    fn an_old_three_cell_row_that_is_open_is_in_the_batch() {
+        let text = "| S9 | 旧格式 | 未落 | 判据 ｜touches: c.rs |\n";
+        let items = parse_md(text).unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].is_in_batch());
+    }
 
     /// 同一本台账：`parse_md` 交的是「还在做」，`reached_ids` 交的是「到了」，
     /// 两边合起来正好是整本，且不重叠。
