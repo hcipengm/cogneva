@@ -486,7 +486,7 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
     ),
     (
         WORK_ITEM,
-        "impl WorkItemGraph for Arc<dyn OrchestratorControl>",
+        "impl<T: crate::OrchestratorControl + ?Sized> WorkItemGraph for T",
         "get_task_checked",
         "读口把读失败折成 `None`，调用者没有地方取那个区别",
     ),
