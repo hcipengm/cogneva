@@ -12481,7 +12481,7 @@ mod tests {
     /// would leave the row looking answered for the rest of the account's life.
     #[tokio::test]
     async fn a_one_row_handover_that_never_started_is_taken_back_for_its_batch() {
-        let rows: Vec<ChangeLedgerRow> = ["fn a", "fn b", "fn c"]
+        let rows: Vec<ChangeLedgerRow> = ["fn a", "fn b"]
             .iter()
             .map(|literal| ChangeLedgerRow {
                 identity: ChangeIdentity::new("grep", "crates/x", *literal),
@@ -12530,16 +12530,16 @@ mod tests {
         }
 
         let state = store.written().pop().expect("the pass wrote its row");
-        assert_eq!(state.submitted, 3, "三条欠账该在这一拍全部出去");
+        assert_eq!(state.submitted, 2, "两条欠账该在这一拍全部出去");
         assert_the_counts_add_up(&state);
 
         let batch = graph
             .handed()
             .into_iter()
             .find(|task| task.input.get(cog_core::INPUT_CHANGE_IDENTITIES).is_some())
-            .expect("三条欠账该由一笔交接承载");
+            .expect("两条欠账该由一笔交接承载");
         let carried = dispatched_identities(&batch);
-        assert_eq!(carried.len(), 3, "三条挂在同一个任务上：{carried:?}");
+        assert_eq!(carried.len(), 2, "两条挂在同一个任务上：{carried:?}");
         assert_eq!(
             batch.id,
             dispatch_task_id(&carried[0], 1),
@@ -13643,9 +13643,13 @@ mod tests {
     /// each, and the queue held 1,957 rows, so the same work was priced 1,957
     /// times. What the counts keep saying is the row: `submitted` is still rows
     /// handed over, so the pass's arithmetic closes on the set it read.
+    ///
+    /// This graph has landed nothing, so the bound is the smallest batch the
+    /// measurement can read; the claim is that the project's owed rows share a
+    /// hand-over instead of each getting one.
     #[tokio::test]
     async fn a_pass_files_one_task_for_a_project_however_many_rows_it_owes() {
-        let rows: Vec<ChangeLedgerRow> = ["fn a", "fn b", "fn c"]
+        let rows: Vec<ChangeLedgerRow> = ["fn a", "fn b"]
             .iter()
             .map(|literal| ChangeLedgerRow {
                 identity: ChangeIdentity::new("grep", "crates/x", *literal),
@@ -13677,8 +13681,8 @@ mod tests {
 
         let state = store.written().pop().expect("the pass wrote its row");
         assert_eq!(
-            state.submitted, 3,
-            "读数按行算：派出去的是三条账，不是一个任务"
+            state.submitted, 2,
+            "读数按行算：派出去的是两条账，不是一个任务"
         );
         assert_the_counts_add_up(&state);
         assert_eq!(
@@ -13695,8 +13699,8 @@ mod tests {
         let carried = dispatched_identities(&task);
         assert_eq!(
             carried.len(),
-            3,
-            "一个项目这一拍欠的三条都挂在同一个任务上：{carried:?}"
+            2,
+            "一个项目这一拍欠的两条都挂在同一个任务上：{carried:?}"
         );
         assert_eq!(
             task.id,
