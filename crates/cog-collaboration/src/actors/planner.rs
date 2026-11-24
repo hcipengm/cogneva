@@ -263,9 +263,12 @@ impl PlannerActor {
                             serde_json::json!({
                                 // 身份的写法与收件台一致：一条从意图派生的待办用这个
                                 // 值当 id，任务行与收件台于是说得出「它处理过了」。
-                                "identity": r.identity(),
+                                "identity": r.identity,
                                 "source": r.source,
-                                "external_id": r.external_id,
+                                // 谁说的、说给谁：判官判「这只是问一句」还是「这是一件
+                                // 活」时，这两格是它手里的原文的一部分。
+                                "said_by": r.said_by,
+                                "addressed_to": r.addressed_to,
                                 "text": r.text,
                                 "parent": r.parent,
                             })

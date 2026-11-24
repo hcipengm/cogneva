@@ -12,7 +12,17 @@
 ///
 /// 序列化写的就是台账上的那两个词：planner 的产出直接是一行台账，读它与写它的
 /// 人用同一套词，多一个 `Open`／`Reached` 的旁名就多一处要对照的翻译。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
 pub enum LedgerState {
     /// 还差着什么。默认态：一条什么也没写的待办还没到任何地方。
     #[serde(rename = "未落")]
@@ -53,7 +63,9 @@ pub const ITEM_INPUT_KEY: &str = "ledger_item";
 const EMPTY_GAP: [&str; 4] = ["", "—", "-", "–"];
 
 /// 一条待办。字段与台账的五格一一对应。
-#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 pub struct LedgerItem {
     /// 序号：稳定、永不复用。
     pub id: String,
@@ -125,7 +137,12 @@ fn cells_of(line: &str) -> Vec<String> {
 /// 「差距」那一格：把行尾的 `｜ touches: …` 切掉，剩下的才是差距。
 fn gap_of(cell: &str) -> String {
     match cell.find('｜') {
-        Some(at) if cell[at..].trim_start_matches('｜').trim_start().starts_with("touches:") => {
+        Some(at)
+            if cell[at..]
+                .trim_start_matches('｜')
+                .trim_start()
+                .starts_with("touches:") =>
+        {
             cell[..at].trim().to_string()
         }
         _ => match cell.find("| touches:") {
@@ -151,7 +168,8 @@ pub fn parse_md(text: &str) -> Result<Vec<LedgerItem>, String> {
         }
         let cells = cells_of(line);
         if cells.len() >= 5 {
-            if let Some(state) = LedgerState::parse(cells.last().map(String::as_str).unwrap_or("")) {
+            if let Some(state) = LedgerState::parse(cells.last().map(String::as_str).unwrap_or(""))
+            {
                 // `touches: unknown — 理由`：这一条明确本轮不排。它不是批次的一部分，
                 // 与「还没做」分开——把它数进未完成会让每一轮的批都虚高。
                 if cells[3]
@@ -175,7 +193,11 @@ pub fn parse_md(text: &str) -> Result<Vec<LedgerItem>, String> {
                 continue;
             }
             if !cells[0].starts_with('S') {
-                bad.push(format!("{}（状态：{}）", cells[0], cells.last().cloned().unwrap_or_default()));
+                bad.push(format!(
+                    "{}（状态：{}）",
+                    cells[0],
+                    cells.last().cloned().unwrap_or_default()
+                ));
                 continue;
             }
         }

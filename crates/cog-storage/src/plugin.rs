@@ -424,10 +424,20 @@ impl cog_core::SystemPlugin for StoragePlugin {
             ctx.publish_service::<dyn cog_core::ToolCallEvents>(std::sync::Arc::new(
                 crate::postgres::tool_call_events::ToolCallEventStore::new(
                     pool.clone(),
-                    deployment,
+                    deployment.clone(),
                 ),
             ));
             info!("StoragePlugin call-event sinks published");
+
+            // 意图到达与接手：同一个 store 出两个面。写面给对话那一屏，读面给把
+            // 意图变成待办的那条循环——两面落同一张表，于是「哪些还没有人接手」
+            // 是一次存在性判断，而不是两个存储之间的一次对账。
+            let intents = std::sync::Arc::new(
+                crate::postgres::intent_events::IntentEventStore::new(pool.clone(), deployment),
+            );
+            ctx.publish_service::<dyn cog_core::IntentEvents>(intents.clone());
+            ctx.publish_service::<dyn cog_core::IntentReader>(intents);
+            info!("StoragePlugin intent event store published");
         } else {
             info!("no PostgreSQL pool: the change candidate queue has no writer in this process");
         }
@@ -1135,20 +1145,6 @@ impl cog_core::SystemPlugin for StoragePlugin {
             ));
         } else {
             warn!("No PostgreSQL pool; the change ledger is unavailable in this deployment");
-        }
-
-        // ── IntentEvents ──
-        // 意图进门那一条事件的写者。没有池就不发布：网关那一侧取不到它时写意图那一步
-        // 必须显式「没有收件台」，而不是静默把意图丢掉。
-        if let Some(pool) = self.pg_pool.clone() {
-            let concrete = Arc::new(crate::postgres::intent_events::IntentEventStore::new(
-                pool,
-                "cogneva-gateway",
-            ));
-            // 同一份存储发布两次：入口写（`IntentEvents`）、planner 读（`IntentReader`）。
-            ctx.publish_service(concrete.clone() as Arc<dyn cog_core::IntentEvents>);
-            ctx.publish_service(concrete as Arc<dyn cog_core::IntentReader>);
-            info!("StoragePlugin intent events published");
         }
 
         // ── RoundEvents ──

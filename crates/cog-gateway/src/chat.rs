@@ -2164,34 +2164,6 @@ pub async fn run_chat_turn(
     //
     // 写不进去就不发：这条消息发出去只能被窗口切掉一半，而「原文没被截断」是这个
     // 平台对每一句话的承诺，不是能拿「反正模型也读不完」换掉的东西。
-    // 意图进门那一刻就落一行：属主与任意员工的对话是意图最重的一处来源，而这一
-    // 行是判官唯一能判的东西——只留在会话里的一段文本，判官看不见。原文不改写、
-    // 不摘要；行身份是「会话＋这句话」，同一句话重投不写第二行。
-    match state.intent_events.as_ref() {
-        Some(events) => {
-            let row = cog_core::IntentRow {
-                source: "webui".to_string(),
-                external_id: format!("{session_id}:{}", intent_suffix(&content)),
-                text: content.clone(),
-                parent: String::new(),
-            };
-            let actor = if owner.is_empty() {
-                "anonymous"
-            } else {
-                &owner
-            };
-            if let Err(e) = events.record(&row, actor).await {
-                // 写不进去不当成「这一轮不跑」：意图还在这一轮里，丢的是一条可判的行。
-                // 但要在读数面上说出来——静默丢掉的意图与「没人说过」同形。
-                tracing::warn!(session_id = %session_id, error = %e, "intent row was not recorded");
-            }
-        }
-        None => tracing::warn!(
-            session_id = %session_id,
-            "no intent desk in this deployment: this turn is not readable to the judge"
-        ),
-    }
-
     let archived = match archive_if_oversized(&state, &session_id, &content).await {
         Ok(archived) => archived,
         Err(reason) => {
@@ -2222,6 +2194,19 @@ pub async fn run_chat_turn(
             return;
         }
     };
+
+    // 0. 这一句先落成一条意图，再去回答它。
+    //
+    //    记录回答「这里有过一段对话」，不回答「这里有一件要办的事」——需要有人去
+    //    做的那句话，只要属主不再提起，就再没有一方会去做它。所以进门的这一句先
+    //    落到事件流上，由接手那一侧把它变成待办；落不进去不让这一轮失败，但计数
+    //    里看得见（见 [`crate::intent`]）。
+    //
+    //    `/命令` 是界面动作而不是一句要说的话：它展开成的是这一屏自己的操作，
+    //    记成意图会让每一次点命令都变成一件要办的事。
+    if command.is_none() {
+        crate::intent::record_turn(&session_id, &owner, "", &content).await;
+    }
 
     // 1. Echo the user message so the UI renders it (the real transport has
     //    no local echo, unlike the mock client).

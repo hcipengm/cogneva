@@ -468,14 +468,19 @@ export function PeopleView() {
                       </Note>
                     ) : null}
                   </div>
-                  <div className="text-[10px] text-[var(--muted)]">
-                    {agent.role} · {agent.workspace_id}
-                    {/* 来源只对「说过话的人」有意义：池里的 worker 没有会话，
-                        给它印一行「来源未声明」只是噪音。有会话而没声明平台的
-                        是探针、脚本、老版本界面——说出来比留白好。 */}
-                    {agent.session_id &&
-                      (agent.platform ? ` · 来自 ${agent.platform}` : ' · 来源未声明')}
-                  </div>
+                  {(agent.workspace_id || agent.session_id) && (
+                    <div className="text-[10px] text-[var(--muted)]">
+                      {/* 这一行说的是这个人在哪、从哪来，不说他此刻扮演什么：
+                          分工记在那一段执行上（尝试行），名册上的一个人可以
+                          先后做过不同的活，把人按角色标一行就把两件事混了。 */}
+                      {agent.workspace_id}
+                      {/* 来源只对「说过话的人」有意义：池里的 worker 没有会话，
+                          给它印一行「来源未声明」只是噪音。有会话而没声明平台的
+                          是探针、脚本、老版本界面——说出来比留白好。 */}
+                      {agent.session_id &&
+                        (agent.platform ? ` · 来自 ${agent.platform}` : ' · 来源未声明')}
+                    </div>
+                  )}
                 </button>
               );
             })}

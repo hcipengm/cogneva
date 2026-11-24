@@ -374,6 +374,35 @@ pub struct Declared {
     pub memory_limit_bytes: Option<u64>,
 }
 
+/// 上限只往上抬，从不往下压。
+///
+/// 请求是调度器的一次预约，量到多少就写多少：把预约报大了只是白占节点，报小了
+/// 也只是排得挤一点，一次采样就能把它改回来。上限不是这个形状——它是一个进程
+/// 被掐死之前能用到的那一格，而这个窗口报得出的是**它做过的最多**，不是**它会
+/// 做的最多**：每五分钟一拍，一拍看的是采样间隔内的平均，一次超过拍长的突发
+/// 只要没落进某一拍就根本不在读数里。于是「拿窗口里的峰值去压上限」压掉的是
+/// 没被看见的那一截。
+///
+/// 2026-11-24 的现网就是这一条：seaweedfs 空闲时 2m，窗口按 p95×1.2 把它的
+/// CPU 上限从 1000m 压到 10m；它连启动都不止这 10m，于是起不来、样本更小、
+/// 上限更小——一个容器被自己的空闲读数关在门外。同时被压到 10m 的还有 nats、
+/// qdrant、meilisearch 与 registry。
+///
+/// 所以上限的起点是对象上已经声明的那个数：**量到的峰值只能证明上限不够，
+/// 证明不了上限太高**。这一条不挡抬——量到的峰值乘余量高过声明值时照样抬起来。
+pub fn limits_only_rise(targets: &mut Targets, declared: &Declared) {
+    if let Some(limit) = declared.cpu_limit_millicores {
+        targets.cpu_limit_millicores = targets.cpu_limit_millicores.max(limit);
+    }
+    if let Some(limit) = declared.memory_limit_bytes {
+        targets.memory_limit_bytes = targets.memory_limit_bytes.max(limit);
+    }
+    targets.cpu_limit_millicores = targets
+        .cpu_limit_millicores
+        .max(targets.cpu_request_millicores);
+    targets.memory_limit_bytes = targets.memory_limit_bytes.max(targets.memory_request_bytes);
+}
+
 /// 目标与现值差得够不够一次写回。
 pub fn wants_write(current: Option<u64>, target: u64, quantum: u64) -> bool {
     match current {
@@ -516,6 +545,27 @@ pub fn bounded_defaults(shape: Targets, range: &DefaultRange) -> Targets {
         cpu_limit_millicores: cpu_limit,
         memory_limit_bytes: memory_limit,
     }
+}
+
+/// 这一拍要写进默认层的形状。
+///
+/// 默认层是同一套律的第二个调用点，所以它按同一个顺序走两步：先夹进对象自己
+/// 声明的准入区间，再让上限只往上抬。第二步的对象是 LimitRange 上此刻写着的
+/// 默认上限——一个还没声明资源的容器正是按它被掐的，而窗口里的请求只说明这些
+/// 容器闲时占多少，说明不了默认值该给的突发余量。请求那一侧不受这一步影响，
+/// 仍按量到的写。
+pub fn default_layer_shape(measured: Targets, reading: &DefaultsReading) -> Targets {
+    let mut shape = bounded_defaults(measured, &reading.range);
+    let non_zero = |value: u64| Some(value).filter(|declared| *declared > 0);
+    limits_only_rise(
+        &mut shape,
+        &Declared {
+            cpu_limit_millicores: non_zero(reading.current.cpu_limit_millicores),
+            memory_limit_bytes: non_zero(reading.current.memory_limit_bytes),
+            ..Declared::default()
+        },
+    );
+    shape
 }
 
 /// 一只 LimitRange 对象当前说的默认值与区间。
@@ -2102,7 +2152,8 @@ pub async fn round(
             readings.note_evaluated(&workload.name, &container.name);
             let samples = window.samples(&key);
             match window.targets(&key) {
-                Some(targets) => {
+                Some(mut targets) => {
+                    limits_only_rise(&mut targets, &declared);
                     resolved.insert(container.name.clone(), targets);
                     namespace_cpu_requests.push(targets.cpu_request_millicores);
                     namespace_memory_requests.push(targets.memory_request_bytes);
@@ -2238,7 +2289,7 @@ pub async fn round(
                     readings.note_defaults_evaluated(LIMIT_RANGE_NAME);
                     match default_shape(&namespace_cpu_requests, &namespace_memory_requests) {
                         Some(shape) => {
-                            let shape = bounded_defaults(shape, &reading.range);
+                            let shape = default_layer_shape(shape, &reading);
                             readings.observe_defaults(LIMIT_RANGE_NAME, shape, SOURCE_DERIVED);
                             if let Some(body) = limit_range_patch_body(&object, &shape) {
                                 let body = body.to_string();
@@ -2517,6 +2568,44 @@ mod tests {
         assert_eq!(busy.memory_request_bytes, 912 * 1024 * 1024);
         assert!(busy.cpu_limit_millicores > quiet.cpu_limit_millicores);
         assert!(busy.memory_limit_bytes > quiet.memory_limit_bytes);
+    }
+
+    #[test]
+    fn a_limit_is_never_lowered_below_what_the_object_declares() {
+        // 例如一个闲着的容器：窗口说 2m / 20MiB，而对象上声明的是 1000m / 1Gi。
+        // 请求跟着量到的走（小一点没关系），上限留在声明的那一格：峰值只能
+        // 证明上限不够，证明不了上限太高。
+        let declared = Declared {
+            cpu_request_millicores: Some(100),
+            memory_request_bytes: Some(256 * 1024 * 1024),
+            cpu_limit_millicores: Some(1000),
+            memory_limit_bytes: Some(1024 * 1024 * 1024),
+        };
+        let mut targets = size_targets(&[2; 12], &[20 * 1024 * 1024; 12]).unwrap();
+        limits_only_rise(&mut targets, &declared);
+        assert_eq!(targets.cpu_request_millicores, 10);
+        assert_eq!(targets.memory_request_bytes, 32 * 1024 * 1024);
+        assert_eq!(targets.cpu_limit_millicores, 1000);
+        assert_eq!(targets.memory_limit_bytes, 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_limit_still_rises_when_the_measured_peak_exceeds_it() {
+        let declared = Declared {
+            cpu_limit_millicores: Some(100),
+            memory_limit_bytes: Some(64 * 1024 * 1024),
+            ..Declared::default()
+        };
+        let mut targets = size_targets(&[800; 12], &[900 * 1024 * 1024; 12]).unwrap();
+        limits_only_rise(&mut targets, &declared);
+        assert!(
+            targets.cpu_limit_millicores >= 800,
+            "量到的峰值高过声明值时上限要抬起来"
+        );
+        assert!(
+            targets.memory_limit_bytes >= 900 * 1024 * 1024,
+            "内存上限同样要抬起来"
+        );
     }
 
     #[test]
@@ -3371,6 +3460,36 @@ mod tests {
         let pvc_only = json!({"spec": {"limits": [{"type": "PersistentVolumeClaim"}]}});
         assert!(parse_limit_range(&pvc_only).is_none());
         assert!(limit_range_patch_body(&pvc_only, &shape).is_none());
+    }
+
+    // proves: resourceGovernance.limitRange.defaultCpu
+    // proves: resourceGovernance.limitRange.defaultMemory
+    /// 默认层与容器那一层是同一条律：请求跟着量到的走，上限不落到对象已经
+    /// 声明的那个数之下。这里的声明值是 LimitRange 上此刻写着的默认上限
+    /// （例如测试对象里的 500m / 512Mi），闲置的请求读数（例如 10m / 32Mi）
+    /// 压不动它。
+    #[test]
+    fn the_default_layer_keeps_the_limit_it_declares_when_the_requests_are_idle() {
+        let mib = 1024 * 1024;
+        let object = limit_range_object();
+        let reading = parse_limit_range(&object).unwrap();
+        let idle_cpu = vec![10u64; 8];
+        let idle_memory = vec![32 * mib; 8];
+        let measured = default_shape(&idle_cpu, &idle_memory).unwrap();
+        assert!(
+            bounded_defaults(measured, &reading.range).cpu_limit_millicores
+                < reading.current.cpu_limit_millicores,
+            "这一拍本来会把默认上限压到声明值之下，否则这条测试判不到东西"
+        );
+        let shape = default_layer_shape(measured, &reading);
+        assert_eq!(
+            shape.cpu_limit_millicores,
+            reading.current.cpu_limit_millicores
+        );
+        assert_eq!(shape.memory_limit_bytes, reading.current.memory_limit_bytes);
+        // 请求仍按量到的写：默认层压上限的那一侧不再动，请求那一侧照常跟随。
+        assert_eq!(shape.cpu_request_millicores, 10);
+        assert_eq!(shape.memory_request_bytes, 32 * mib);
     }
 
     /// The beat is the evidence: the value may not move, the counter does.

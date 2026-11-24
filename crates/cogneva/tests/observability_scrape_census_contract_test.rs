@@ -459,6 +459,29 @@ const UNREGISTERED: &[(&str, Unread)] = &[
     //   and says nothing about the spread, and an overridden ceiling is the case
     //   where it says only that; the panel draws the four against the ceiling in
     //   force.
+    // The chat intent entry's three counters, published on 2026-11-24 with the
+    // path that writes them. The pair that matters is `failures` against
+    // `unwired`: a turn whose sentence did not land is still answered in the
+    // conversation, so nothing downstream can tell it from a turn that was
+    // never a request at all -- which is the exact shape of the bug this entry
+    // exists to close, one level down. The reader owed is a rule on both, an
+    // increase over the alert window, so a store refusing writes or a process
+    // assembled without a sink reaches a person instead of sitting in
+    // `/metrics` unread; `received` is the denominator those two shares are read
+    // against. No panel is owed for them today -- at zero traffic a drawn line is
+    // the only thing that moves, and that is not what these say.
+    (
+        "cogneva_intent_received_total",
+        Unread::Gap("one per chat turn that was asked to land as an intent, the denominator the two counters below are read against; nothing draws it yet, and on its own it answers only whether the entry is in use"),
+    ),
+    (
+        "cogneva_intent_receive_failures_total",
+        Unread::Gap("turns whose intent write was refused by the store; unread today, which is the bad case here -- the conversation is answered either way, so a store refusing every write is invisible until something reads this beside its denominator, and the reader owed is a rule on the increase over the alert window"),
+    ),
+    (
+        "cogneva_intent_unwired_total",
+        Unread::Gap("turns that met a process with no intent sink installed, which is an assembly mistake rather than a store fault and is why it is a counter of its own; unread today, and the reader owed is the same rule on the increase, so an assembled-without-a-sink deploy is told apart from one that simply had no traffic"),
+    ),
 ];
 
 /// How many `Gap` entries this census left.
@@ -593,7 +616,15 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// is -- so the debt is a reader rather than a threshold, and it is filed here
 /// instead of exempted because the count is exactly the reading a person would
 /// expect to find drawn.
-const GAPS_AT_SCRAPE_CENSUS: usize = 6;
+///
+/// Back to nine on 2026-11-24: the chat intent entry publishes three counters
+/// and nothing reads them. The debt is filed rather than waived for the reason
+/// the entry itself exists -- a chat turn that did not land as an intent looks
+/// exactly like a turn that was never a request, and the counter that says so
+/// is worthless while nobody reads it. The reader owed for the two that matter
+/// is a rule on the increase over the alert window; the third is their
+/// denominator.
+const GAPS_AT_SCRAPE_CENSUS: usize = 9;
 
 /// How many scrape-only series are carried by a produced table and by nothing
 /// that reads them.

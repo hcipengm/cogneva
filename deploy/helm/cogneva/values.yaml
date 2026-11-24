@@ -54,21 +54,25 @@ resourceGovernance:
     # why: collapsed into one typical container (median request, p95 limit with the same headroom), clamped
     # why: into the LimitRange's own admitted [min,max], and written back onto the `cogneva-limits` object as a
     # why: merge patch carrying the full `spec.limits` array (the PVC entry and the max/min ride along; a
-    # why: partial patch would drop them). Admission reads the object, not this reading -- not writing back
+    # why: partial patch would drop them). The bound starts at the default the object already declares and only
+    # why: rises: requests fall towards idle when nothing is running, and an idle request reading cannot say how
+    # why: much burst this default has to cover -- so it can prove the default is too low, never too high.
+    # why: Admission reads the object, not this reading -- not writing back
     # why: would leave the measured shape on the reading face only. Until any container has been measured the
     # why: object's own declared default is published as the seed. The value in force and its `source` are
     # why: published per limitRange, and every evaluation is counted, so "the value did not move" and "the loop
     # why: did not run" are different readings.
     # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=DEFAULT_CPU_METRIC label=source cadence=periodic
-    # proof: file=crates/cog-reflection/src/workload_resources.rs test=the_namespace_default_follows_the_measured_requests beat=the_default_beat_counts_even_when_the_value_does_not_move evidence=defaults_evaluations
+    # proof: file=crates/cog-reflection/src/workload_resources.rs test=the_default_layer_keeps_the_limit_it_declares_when_the_requests_are_idle beat=the_default_beat_counts_even_when_the_value_does_not_move evidence=defaults_evaluations
     defaultCpu: 500m
     # tunable:
     # why: The memory limit for the same containers: the same call of the same law (p95 over the window with
     # why: the configured headroom, quantized up), clamped into the LimitRange's admitted range and written
-    # why: back with the full `spec.limits` array. Published per limitRange with its `source` and the
-    # why: evaluation counter beside the other three defaults.
+    # why: back with the full `spec.limits` array. Like the CPU default it only rises: the starting point is
+    # why: the default the object declares, and an idle reading never lowers it. Published per limitRange with
+    # why: its `source` and the evaluation counter beside the other three defaults.
     # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=DEFAULT_MEMORY_METRIC label=source cadence=periodic
-    # proof: file=crates/cog-reflection/src/workload_resources.rs test=the_namespace_default_follows_the_measured_requests beat=the_default_beat_counts_even_when_the_value_does_not_move evidence=defaults_evaluations
+    # proof: file=crates/cog-reflection/src/workload_resources.rs test=the_default_layer_keeps_the_limit_it_declares_when_the_requests_are_idle beat=the_default_beat_counts_even_when_the_value_does_not_move evidence=defaults_evaluations
     defaultMemory: 512Mi
     # tunable:
     # why: The CPU request a container that declares none gets: the median of the namespace's measured
@@ -261,21 +265,25 @@ backup:
       memory: 64Mi
     limits:
       # tunable:
-      # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
-      # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
-      # why: reading published under this key carries `source=derived` once the window has enough samples, and
-      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
-      # why: measurement it is looking at.
+      # why: The CPU bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      # why: volume-capacity loop also uses, rounded up to 10m, but a window that only ever saw the container
+      # why: idle cannot prove a bound is too high -- a five-minute sample misses any burst shorter than the
+      # why: grid, and 2026-11-24 showed the cost: an idle seaweedfs (2m) had its bound pressed to 10m, below
+      # why: what its own start needs, so it never came back. The reading published under this key carries
+      # why: `source=derived` once the window has enough samples, and `source=seed` with the declared value
+      # why: before that, so a reader can always tell which side of the measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 1000m
       # tunable:
-      # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
-      # why: request. The reading published under this key carries `source=derived` once the window has enough
-      # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
-      # why: side of the measurement it is looking at.
+      # why: The memory bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      # why: rounded up to the memory quantum (16Mi by default), but a peak observed on a five-minute grid is a
+      # why: lower bound of the bursts a bound has to allow, so it can raise this number and never lower it. The
+      # why: reading published under this key carries `source=derived` once the window has enough samples, and
+      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
+      # why: measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_MEMORY_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 1Gi
@@ -549,21 +557,25 @@ gateway:
       memory: 6Gi
     limits:
       # tunable:
-      # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
-      # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
-      # why: reading published under this key carries `source=derived` once the window has enough samples, and
-      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
-      # why: measurement it is looking at.
+      # why: The CPU bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      # why: volume-capacity loop also uses, rounded up to 10m, but a window that only ever saw the container
+      # why: idle cannot prove a bound is too high -- a five-minute sample misses any burst shorter than the
+      # why: grid, and 2026-11-24 showed the cost: an idle seaweedfs (2m) had its bound pressed to 10m, below
+      # why: what its own start needs, so it never came back. The reading published under this key carries
+      # why: `source=derived` once the window has enough samples, and `source=seed` with the declared value
+      # why: before that, so a reader can always tell which side of the measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 4000m
       # tunable:
-      # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
-      # why: request. The reading published under this key carries `source=derived` once the window has enough
-      # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
-      # why: side of the measurement it is looking at.
+      # why: The memory bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      # why: rounded up to the memory quantum (16Mi by default), but a peak observed on a five-minute grid is a
+      # why: lower bound of the bursts a bound has to allow, so it can raise this number and never lower it. The
+      # why: reading published under this key carries `source=derived` once the window has enough samples, and
+      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
+      # why: measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_MEMORY_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 12Gi
@@ -647,21 +659,25 @@ securityGateway:
       memory: 128Mi
     limits:
       # tunable:
-      # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
-      # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
-      # why: reading published under this key carries `source=derived` once the window has enough samples, and
-      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
-      # why: measurement it is looking at.
+      # why: The CPU bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      # why: volume-capacity loop also uses, rounded up to 10m, but a window that only ever saw the container
+      # why: idle cannot prove a bound is too high -- a five-minute sample misses any burst shorter than the
+      # why: grid, and 2026-11-24 showed the cost: an idle seaweedfs (2m) had its bound pressed to 10m, below
+      # why: what its own start needs, so it never came back. The reading published under this key carries
+      # why: `source=derived` once the window has enough samples, and `source=seed` with the declared value
+      # why: before that, so a reader can always tell which side of the measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 500m
       # tunable:
-      # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
-      # why: request. The reading published under this key carries `source=derived` once the window has enough
-      # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
-      # why: side of the measurement it is looking at.
+      # why: The memory bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      # why: rounded up to the memory quantum (16Mi by default), but a peak observed on a five-minute grid is a
+      # why: lower bound of the bursts a bound has to allow, so it can raise this number and never lower it. The
+      # why: reading published under this key carries `source=derived` once the window has enough samples, and
+      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
+      # why: measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_MEMORY_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 512Mi
@@ -1155,12 +1171,14 @@ evolution:
       # Falsification：抬完看主线构建的墙钟是否落到构建上限之下，以及这一格的
       # `nr_throttled` 增量是否明显下降。两个都没动，说明瓶颈不在配额，就抬回来。
       # tunable:
-      # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
-      # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
-      # why: reading published under this key carries `source=derived` once the window has enough samples, and
-      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
-      # why: measurement it is looking at.
+      # why: The CPU bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      # why: volume-capacity loop also uses, rounded up to 10m, but a window that only ever saw the container
+      # why: idle cannot prove a bound is too high -- a five-minute sample misses any burst shorter than the
+      # why: grid, and 2026-11-24 showed the cost: an idle seaweedfs (2m) had its bound pressed to 10m, below
+      # why: what its own start needs, so it never came back. The reading published under this key carries
+      # why: `source=derived` once the window has enough samples, and `source=seed` with the declared value
+      # why: before that, so a reader can always tell which side of the measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 8000m
@@ -1177,11 +1195,13 @@ evolution:
       # 再定。抬这个数必须同批抬 LimitRange 的单容器上限（见 resourceGovernance），
       # 否则 Pod 在准入就被拒。
       # tunable:
-      # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
-      # why: request. The reading published under this key carries `source=derived` once the window has enough
-      # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
-      # why: side of the measurement it is looking at.
+      # why: The memory bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      # why: rounded up to the memory quantum (16Mi by default), but a peak observed on a five-minute grid is a
+      # why: lower bound of the bursts a bound has to allow, so it can raise this number and never lower it. The
+      # why: reading published under this key carries `source=derived` once the window has enough samples, and
+      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
+      # why: measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_MEMORY_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 16Gi
@@ -1457,21 +1477,25 @@ sandboxExecutor:
       memory: 512Mi
     limits:
       # tunable:
-      # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
-      # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
-      # why: reading published under this key carries `source=derived` once the window has enough samples, and
-      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
-      # why: measurement it is looking at.
+      # why: The CPU bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      # why: volume-capacity loop also uses, rounded up to 10m, but a window that only ever saw the container
+      # why: idle cannot prove a bound is too high -- a five-minute sample misses any burst shorter than the
+      # why: grid, and 2026-11-24 showed the cost: an idle seaweedfs (2m) had its bound pressed to 10m, below
+      # why: what its own start needs, so it never came back. The reading published under this key carries
+      # why: `source=derived` once the window has enough samples, and `source=seed` with the declared value
+      # why: before that, so a reader can always tell which side of the measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 4000m
       # tunable:
-      # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
-      # why: request. The reading published under this key carries `source=derived` once the window has enough
-      # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
-      # why: side of the measurement it is looking at.
+      # why: The memory bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      # why: rounded up to the memory quantum (16Mi by default), but a peak observed on a five-minute grid is a
+      # why: lower bound of the bursts a bound has to allow, so it can raise this number and never lower it. The
+      # why: reading published under this key carries `source=derived` once the window has enough samples, and
+      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
+      # why: measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_MEMORY_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 8Gi
@@ -1624,21 +1648,25 @@ buildah:
       memory: 64Mi
     limits:
       # tunable:
-      # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
-      # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
-      # why: reading published under this key carries `source=derived` once the window has enough samples, and
-      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
-      # why: measurement it is looking at.
+      # why: The CPU bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      # why: volume-capacity loop also uses, rounded up to 10m, but a window that only ever saw the container
+      # why: idle cannot prove a bound is too high -- a five-minute sample misses any burst shorter than the
+      # why: grid, and 2026-11-24 showed the cost: an idle seaweedfs (2m) had its bound pressed to 10m, below
+      # why: what its own start needs, so it never came back. The reading published under this key carries
+      # why: `source=derived` once the window has enough samples, and `source=seed` with the declared value
+      # why: before that, so a reader can always tell which side of the measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 2000m
       # tunable:
-      # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
-      # why: request. The reading published under this key carries `source=derived` once the window has enough
-      # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
-      # why: side of the measurement it is looking at.
+      # why: The memory bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      # why: rounded up to the memory quantum (16Mi by default), but a peak observed on a five-minute grid is a
+      # why: lower bound of the bursts a bound has to allow, so it can raise this number and never lower it. The
+      # why: reading published under this key carries `source=derived` once the window has enough samples, and
+      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
+      # why: measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_MEMORY_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 4Gi
@@ -1689,21 +1717,25 @@ processCensus:
       memory: 32Mi
     limits:
       # tunable:
-      # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
-      # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
-      # why: reading published under this key carries `source=derived` once the window has enough samples, and
-      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
-      # why: measurement it is looking at.
+      # why: The CPU bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      # why: volume-capacity loop also uses, rounded up to 10m, but a window that only ever saw the container
+      # why: idle cannot prove a bound is too high -- a five-minute sample misses any burst shorter than the
+      # why: grid, and 2026-11-24 showed the cost: an idle seaweedfs (2m) had its bound pressed to 10m, below
+      # why: what its own start needs, so it never came back. The reading published under this key carries
+      # why: `source=derived` once the window has enough samples, and `source=seed` with the declared value
+      # why: before that, so a reader can always tell which side of the measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 100m
       # tunable:
-      # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
-      # why: request. The reading published under this key carries `source=derived` once the window has enough
-      # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
-      # why: side of the measurement it is looking at.
+      # why: The memory bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      # why: rounded up to the memory quantum (16Mi by default), but a peak observed on a five-minute grid is a
+      # why: lower bound of the bursts a bound has to allow, so it can raise this number and never lower it. The
+      # why: reading published under this key carries `source=derived` once the window has enough samples, and
+      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
+      # why: measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_MEMORY_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 128Mi
@@ -1748,21 +1780,25 @@ hostLedger:
       memory: 32Mi
     limits:
       # tunable:
-      # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
-      # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
-      # why: reading published under this key carries `source=derived` once the window has enough samples, and
-      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
-      # why: measurement it is looking at.
+      # why: The CPU bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      # why: volume-capacity loop also uses, rounded up to 10m, but a window that only ever saw the container
+      # why: idle cannot prove a bound is too high -- a five-minute sample misses any burst shorter than the
+      # why: grid, and 2026-11-24 showed the cost: an idle seaweedfs (2m) had its bound pressed to 10m, below
+      # why: what its own start needs, so it never came back. The reading published under this key carries
+      # why: `source=derived` once the window has enough samples, and `source=seed` with the declared value
+      # why: before that, so a reader can always tell which side of the measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 100m
       # tunable:
-      # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
-      # why: request. The reading published under this key carries `source=derived` once the window has enough
-      # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
-      # why: side of the measurement it is looking at.
+      # why: The memory bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      # why: rounded up to the memory quantum (16Mi by default), but a peak observed on a five-minute grid is a
+      # why: lower bound of the bursts a bound has to allow, so it can raise this number and never lower it. The
+      # why: reading published under this key carries `source=derived` once the window has enough samples, and
+      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
+      # why: measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_MEMORY_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 128Mi
@@ -1915,21 +1951,25 @@ claimStore:
       memory: 32Mi
     limits:
       # tunable:
-      # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
-      # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
-      # why: reading published under this key carries `source=derived` once the window has enough samples, and
-      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
-      # why: measurement it is looking at.
+      # why: The CPU bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      # why: volume-capacity loop also uses, rounded up to 10m, but a window that only ever saw the container
+      # why: idle cannot prove a bound is too high -- a five-minute sample misses any burst shorter than the
+      # why: grid, and 2026-11-24 showed the cost: an idle seaweedfs (2m) had its bound pressed to 10m, below
+      # why: what its own start needs, so it never came back. The reading published under this key carries
+      # why: `source=derived` once the window has enough samples, and `source=seed` with the declared value
+      # why: before that, so a reader can always tell which side of the measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: "1"
       # tunable:
-      # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
-      # why: request. The reading published under this key carries `source=derived` once the window has enough
-      # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
-      # why: side of the measurement it is looking at.
+      # why: The memory bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      # why: rounded up to the memory quantum (16Mi by default), but a peak observed on a five-minute grid is a
+      # why: lower bound of the bursts a bound has to allow, so it can raise this number and never lower it. The
+      # why: reading published under this key carries `source=derived` once the window has enough samples, and
+      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
+      # why: measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_MEMORY_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 2Gi
@@ -2019,21 +2059,25 @@ clusterRegistry:
       # 同族处置：redis-info-exporter、claim-store、node-exporter 都是这条——
       # 按一个周期内的突发定，不按均值定。抬完配额仍有 7 核余量（配额 31，声明 23.6）。
       # tunable:
-      # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
-      # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
-      # why: reading published under this key carries `source=derived` once the window has enough samples, and
-      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
-      # why: measurement it is looking at.
+      # why: The CPU bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      # why: volume-capacity loop also uses, rounded up to 10m, but a window that only ever saw the container
+      # why: idle cannot prove a bound is too high -- a five-minute sample misses any burst shorter than the
+      # why: grid, and 2026-11-24 showed the cost: an idle seaweedfs (2m) had its bound pressed to 10m, below
+      # why: what its own start needs, so it never came back. The reading published under this key carries
+      # why: `source=derived` once the window has enough samples, and `source=seed` with the declared value
+      # why: before that, so a reader can always tell which side of the measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 500m
       # tunable:
-      # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
-      # why: request. The reading published under this key carries `source=derived` once the window has enough
-      # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
-      # why: side of the measurement it is looking at.
+      # why: The memory bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      # why: rounded up to the memory quantum (16Mi by default), but a peak observed on a five-minute grid is a
+      # why: lower bound of the bursts a bound has to allow, so it can raise this number and never lower it. The
+      # why: reading published under this key carries `source=derived` once the window has enough samples, and
+      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
+      # why: measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_MEMORY_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 256Mi
@@ -3369,21 +3413,25 @@ webSearch:
       memory: 256Mi
     limits:
       # tunable:
-      # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
-      # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
-      # why: reading published under this key carries `source=derived` once the window has enough samples, and
-      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
-      # why: measurement it is looking at.
+      # why: The CPU bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      # why: volume-capacity loop also uses, rounded up to 10m, but a window that only ever saw the container
+      # why: idle cannot prove a bound is too high -- a five-minute sample misses any burst shorter than the
+      # why: grid, and 2026-11-24 showed the cost: an idle seaweedfs (2m) had its bound pressed to 10m, below
+      # why: what its own start needs, so it never came back. The reading published under this key carries
+      # why: `source=derived` once the window has enough samples, and `source=seed` with the declared value
+      # why: before that, so a reader can always tell which side of the measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 1000m
       # tunable:
-      # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
-      # why: request. The reading published under this key carries `source=derived` once the window has enough
-      # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
-      # why: side of the measurement it is looking at.
+      # why: The memory bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      # why: rounded up to the memory quantum (16Mi by default), but a peak observed on a five-minute grid is a
+      # why: lower bound of the bursts a bound has to allow, so it can raise this number and never lower it. The
+      # why: reading published under this key carries `source=derived` once the window has enough samples, and
+      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
+      # why: measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_MEMORY_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 1Gi
@@ -3445,21 +3493,25 @@ webFetch:
       memory: 512Mi
     limits:
       # tunable:
-      # why: The CPU bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `cpu.usageNanoCores` times the 120% headroom the volume-capacity loop also uses, rounded up to 10m
-      # why: and never below the request; a run that keeps being throttled at the bound raises it further. The
-      # why: reading published under this key carries `source=derived` once the window has enough samples, and
-      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
-      # why: measurement it is looking at.
+      # why: The CPU bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      # why: volume-capacity loop also uses, rounded up to 10m, but a window that only ever saw the container
+      # why: idle cannot prove a bound is too high -- a five-minute sample misses any burst shorter than the
+      # why: grid, and 2026-11-24 showed the cost: an idle seaweedfs (2m) had its bound pressed to 10m, below
+      # why: what its own start needs, so it never came back. The reading published under this key carries
+      # why: `source=derived` once the window has enough samples, and `source=seed` with the declared value
+      # why: before that, so a reader can always tell which side of the measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_CPU_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       cpu: 2000m
       # tunable:
-      # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
-      # why: request. The reading published under this key carries `source=derived` once the window has enough
-      # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
-      # why: side of the measurement it is looking at.
+      # why: The memory bound rises with the measured draw and never falls below this declared value: the loop
+      # why: patches the limit up to the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      # why: rounded up to the memory quantum (16Mi by default), but a peak observed on a five-minute grid is a
+      # why: lower bound of the bursts a bound has to allow, so it can raise this number and never lower it. The
+      # why: reading published under this key carries `source=derived` once the window has enough samples, and
+      # why: `source=seed` with the declared value before that, so a reader can always tell which side of the
+      # why: measurement it is looking at.
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_MEMORY_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
       memory: 3Gi

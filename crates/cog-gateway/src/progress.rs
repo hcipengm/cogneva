@@ -407,7 +407,7 @@ async fn merged_from(
 }
 
 pub async fn read_progress(state: &GatewayState) -> Result<Progress, ApiError> {
-    Ok(progress_from(
+    progress_from(
         state.orchestrator.as_ref(),
         state.governance_store.as_deref(),
         Sources {
@@ -419,7 +419,7 @@ pub async fn read_progress(state: &GatewayState) -> Result<Progress, ApiError> {
             registry: state.agent_registry.as_deref(),
         },
     )
-    .await?)
+    .await
 }
 
 /// 进度这一页的两步：把行合流，再数成一张账。

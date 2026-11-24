@@ -634,12 +634,15 @@ async fn hand_over(
     // 路，丢的是「这条发现被看见过」的那一行，而它会在 census 之外只留一条 warn。
     if let Some(desk) = desk {
         let row = IntentRow {
+            identity: format!("outward:{}", task_id_for(&item.url)),
             source: source.name.clone(),
-            external_id: task_id_for(&item.url),
+            said_by: String::new(),
+            addressed_to: String::new(),
             text: goal_for(source, item),
-            parent: item.url.clone(),
+            parent: Some(item.url.clone()),
+            at: chrono::Utc::now(),
         };
-        if let Err(e) = desk.record(&row, OUTWARD_ROLE).await {
+        if let Err(e) = desk.record(&row).await {
             warn!(
                 source = %source.name,
                 url = %item.url,
@@ -1161,8 +1164,21 @@ mod tests {
 
     #[async_trait]
     impl cog_core::IntentEvents for RecordingDesk {
-        async fn record(&self, row: &IntentRow, _actor: &str) -> SFResult<()> {
+        fn writer(&self) -> &str {
+            "outward-probe"
+        }
+
+        async fn record(&self, row: &IntentRow) -> SFResult<()> {
             self.0.lock().unwrap().push(row.clone());
+            Ok(())
+        }
+
+        async fn mark_triaged(
+            &self,
+            _identities: &[String],
+            _task_id: &str,
+            _actor: &str,
+        ) -> SFResult<()> {
             Ok(())
         }
     }
@@ -1196,10 +1212,13 @@ mod tests {
         let rows = recording.0.lock().unwrap();
         assert_eq!(rows.len(), 2, "每一次发现都该落一行：{rows:?}");
         assert_eq!(rows[0].source, "ai-news");
-        assert_eq!(rows[0].identity(), rows[1].identity());
-        assert_eq!(rows[0].external_id, task_id_for(&item.url));
+        assert_eq!(rows[0].identity, rows[1].identity);
+        assert_eq!(
+            rows[0].identity,
+            format!("outward:{}", task_id_for(&item.url))
+        );
         assert!(rows[0].text.contains("https://example.com/paper"));
-        assert_eq!(rows[0].parent, item.url);
+        assert_eq!(rows[0].parent.as_deref(), Some(item.url.as_str()));
     }
 
     impl RememberingOrchestrator {
@@ -1340,7 +1359,10 @@ mod tests {
             excerpt: "c".into(),
         };
 
-        assert_eq!(hand_over(None, &control, &source, &item).await, Handover::Handed);
+        assert_eq!(
+            hand_over(None, &control, &source, &item).await,
+            Handover::Handed
+        );
         assert_eq!(
             hand_over(None, &control, &source, &item).await,
             Handover::AlreadyHeld

@@ -62,6 +62,7 @@ pub mod heartbeat_history;
 pub mod hook_forwarder;
 pub mod hooks;
 pub mod ide;
+pub mod intent;
 pub mod knowledge;
 pub mod llm_admin;
 pub mod mcp_calls;
@@ -2316,6 +2317,16 @@ async fn prometheus_metrics_handler(State(state): State<Arc<GatewayState>>) -> R
             body.push('\n');
         }
         body.push_str(&prometheus_render::render_raw_metrics(&audit_readings));
+    }
+
+    // 意图入口的三个计数：进来多少句、其中几句没落成、这台进程有没有落点。
+    // 与审计出口同一种接线（进程级单例、装配处一处），理由也相同。
+    let intent_readings = intent::readings();
+    if !intent_readings.is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&prometheus_render::render_raw_metrics(&intent_readings));
     }
 
     // Self-observation: registry 按静态 TypeId 登记服务，某个 observable 若
