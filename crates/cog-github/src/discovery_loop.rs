@@ -210,7 +210,10 @@ fn intent_task_action(existing: Option<&Task>) -> IntentTaskAction {
 /// the configured poll interval and the observed failure streak, not from a
 /// flat per-intent quota.
 fn terminal_backoff_delay(consecutive: u32, base_secs: u64) -> std::time::Duration {
-    let base = base_secs.max(30);
+    // `base_secs` 就是部署声明的轮询周期，原样用：从前这里把它抬到至少 30 秒，
+    // 于是声明 5 秒的部署拿到的是另一条节拍，而这条函数自己的说明还写着
+    // 「由配置的轮询周期导出」。
+    let base = base_secs;
     let exp = consecutive.saturating_sub(1).min(20);
     let secs = base
         .saturating_mul(1u64 << exp)
@@ -1453,7 +1456,7 @@ impl GitHubDiscoveryLoop {
 
     /// Run forever with the configured poll interval.
     pub async fn run(&mut self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-        let interval = std::time::Duration::from_secs(self.config.poll_interval_secs.max(30));
+        let interval = std::time::Duration::from_secs(self.config.poll_interval_secs);
         loop {
             tokio::select! {
                 _ = shutdown.changed() => {
@@ -3650,8 +3653,9 @@ pub(crate) mod tests {
         assert_eq!(d(3), 1200);
         assert_eq!(d(10), TERMINAL_BACKOFF_CAP_SECS);
         assert_eq!(d(u32::MAX), TERMINAL_BACKOFF_CAP_SECS);
-        // Tiny poll intervals still back off at least 30s per step.
-        assert_eq!(terminal_backoff_delay(1, 5).as_secs(), 30);
+        // 声明多短的周期，退避就从多短起步：节拍由部署声明，不由这里另立一个数。
+        assert_eq!(terminal_backoff_delay(1, 5).as_secs(), 5);
+        assert_eq!(terminal_backoff_delay(2, 5).as_secs(), 10);
     }
 
     #[test]

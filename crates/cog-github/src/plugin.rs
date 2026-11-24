@@ -55,6 +55,18 @@ pub const STAGED_CHANGE_DRAIN_LOOP: &str = "github_staged_change_drain";
 /// 循环名，见 [`GITHUB_DISCOVERY_POLL_LOOP`] 的说明。
 pub const LANDING_CI_WATCH_LOOP: &str = "github_landing_ci_watch";
 
+/// 一条部署声明的节拍要么原样生效，要么被点名拒绝；不替换成另一个数。
+///
+/// 零秒不是「越快越好」的极端，是忙等：循环会在上一轮刚结束时就起下一轮。
+fn declared_cadence(name: &str, secs: u64) -> cog_core::SFResult<u64> {
+    if secs == 0 {
+        return Err(cog_core::SFError::Validation(format!(
+            "{name} 声明为 0 秒：读侧会把这条循环变成忙等。给它一个周期，或关掉这条循环。"
+        )));
+    }
+    Ok(secs)
+}
+
 /// 平台轮询任务：间隔触发 run_once，shutdown 信号退出。
 ///
 /// `role` 是共用库上那行租约的仲裁者（没有共用库时为 None）。发现循环的属主
@@ -68,7 +80,7 @@ fn spawn_polling_loop(
     role: Option<Arc<dyn cog_core::OwnerLeaseBroker>>,
     shutdown: cog_core::shutdown::ShutdownSignal,
 ) -> tokio::task::JoinHandle<()> {
-    let interval = std::time::Duration::from_secs(interval_secs.max(30));
+    let interval = std::time::Duration::from_secs(interval_secs);
     let name = if platform == crate::GITEE_PLATFORM {
         GITEE_DISCOVERY_POLL_LOOP
     } else {
@@ -184,7 +196,7 @@ fn spawn_landing_watch(
     interval_secs: u64,
     shutdown: cog_core::shutdown::ShutdownSignal,
 ) -> tokio::task::JoinHandle<()> {
-    let interval = std::time::Duration::from_secs(interval_secs.max(30));
+    let interval = std::time::Duration::from_secs(interval_secs);
     let stop = shutdown.clone();
     cog_core::loop_health::spawn(
         LANDING_CI_WATCH_LOOP,
@@ -284,6 +296,27 @@ impl cog_core::SystemPlugin for GitHubPlugin {
         // github/gitee_integration 是 cog-github 自有配置段，自读 cogneva.json。
         let mut config = crate::config::GitHubIntegrationConfig::load()?;
         let gitee_config = crate::config::GiteeIntegrationConfig::load()?;
+
+        // 声明的节拍原样生效。从前各处把它静默抬到至少 30 秒，于是部署声明的
+        // 10 秒拿到的是另一条节拍，而配置面没有任何一处说它被改写过。这里只拦
+        // 「0 秒」——那不是「越快越好」的极端，是忙等——并且拒绝而不是替换成
+        // 一个没人声明的数。
+        if config.enabled {
+            declared_cadence(
+                "github_integration.poll_interval_secs",
+                config.poll_interval_secs,
+            )?;
+            declared_cadence(
+                "github_integration.landing_policy.ci_poll_interval_secs",
+                config.landing_policy.ci_poll_interval_secs,
+            )?;
+        }
+        if gitee_config.enabled {
+            declared_cadence(
+                "gitee_integration.poll_interval_secs",
+                gitee_config.poll_interval_secs,
+            )?;
+        }
 
         // Outbound HTTP comes from the assembly's client: the timeouts, pool and
         // proxy that turn an upstream which stops answering into a failure
@@ -691,3 +724,24 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     optional_requires: &["supervisor"],
     factory: || Box::new(GitHubPlugin::new()),
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 声明的周期原样回来；只有 0 被点名拒绝，而不是被换成一个没人声明的数。
+    #[test]
+    fn a_declared_cadence_survives_and_zero_is_refused() {
+        assert_eq!(
+            declared_cadence("github_integration.poll_interval_secs", 45).unwrap(),
+            45,
+            "声明的节拍不许被改写"
+        );
+        let refused = declared_cadence("github_integration.poll_interval_secs", 0)
+            .expect_err("0 秒是忙等，不是一条节拍");
+        assert!(
+            refused.to_string().contains("github_integration.poll_interval_secs"),
+            "拒绝要点名是哪一格：{refused}"
+        );
+    }
+}
