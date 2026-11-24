@@ -1437,10 +1437,6 @@ async fn rpc_message_send(
         }
     }
 
-    let mut goal_row = Task::goal_row(goal_id.clone(), &request.goal);
-    goal_row.workspace_id = None;
-    goal_row.input["origin"] =
-        a2a_origin(caller.as_ref().map(|Extension(claims)| claims), request.message_id.as_deref());
     // 回执读的是库里的那一行，不是本地构造的这一份：受理之后状态可能已经被派工
     // 改过，对端要的是它现在是什么样。
     let row = match accept_goal(&orchestrator, &request.goal, goal_row).await {
