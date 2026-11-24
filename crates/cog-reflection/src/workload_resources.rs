@@ -99,6 +99,14 @@ pub const SOURCE_DERIVED: &str = "derived";
 /// 目标还没成立，当前生效的是 chart 的种子。
 pub const SOURCE_SEED: &str = "seed";
 
+/// 默认值被**配额**夹住了：这一拍量到的形状装不进 namespace 还剩下的准入余量，
+/// 写下去的那组值是「新 Pod 此刻进得去」的最大值。读数面上它与 `derived` 分开，
+/// 否则「跟测量走」与「被额度顶住」在屏上是同一行。
+pub const SOURCE_QUOTA: &str = "quota";
+
+/// namespace 额度的对象名，与 LimitRange 一样由部署给定。
+const QUOTA_NAME: &str = "cogneva-quota";
+
 /// 判定 Job 在这个读数面上的身份。
 ///
 /// Job 活不过一轮、名字每轮都不同，主回路看不见它；它由部署器在 Job 结束后把
@@ -566,6 +574,52 @@ pub fn default_layer_shape(measured: Targets, reading: &DefaultsReading) -> Targ
         },
     );
     shape
+}
+
+/// namespace 的 ResourceQuota 上还剩下的准入余量（hard − used），按四个维度。
+///
+/// 读不到就是 `None`（量不到），不是零：零会让默认层被压到最小，而那不是读数
+/// 说的意思。配额名与本文件的 LimitRange 名一样，是部署给定的那个。
+async fn quota_headroom(ns: &str) -> Option<Targets> {
+    let raw = kubectl(&["get", "resourcequota", QUOTA_NAME, "-n", ns, "-o", "json"])
+        .await
+        .ok()?;
+    let object: Value = serde_json::from_str(&raw).ok()?;
+    let hard = object.pointer("/status/hard")?;
+    let used = object.pointer("/status/used").unwrap_or(&Value::Null);
+    // 配额的每一维是 Kubernetes 的数量串（`"5"`、`"19Gi"`），与本文件读 LimitRange
+    // 时同一组解析函数：两处各写一份，`0.5` 与 `500m` 迟早会有一处读成 0。
+    let left = |dimension: &str, parse: fn(&str) -> Option<u64>| -> Option<u64> {
+        let h = parse(hard.get(dimension)?.as_str()?)?;
+        let u = used
+            .get(dimension)
+            .and_then(Value::as_str)
+            .and_then(parse)
+            .unwrap_or(0);
+        Some(h.saturating_sub(u))
+    };
+    Some(Targets {
+        cpu_request_millicores: left("requests.cpu", parse_cpu_millicores)?,
+        memory_request_bytes: left("requests.memory", parse_memory_bytes)?,
+        cpu_limit_millicores: left("limits.cpu", parse_cpu_millicores)?,
+        memory_limit_bytes: left("limits.memory", parse_memory_bytes)?,
+    })
+}
+
+/// 把默认层夹进 namespace 还剩下的准入余量：一个新 Pod 用这组值必须进得去。
+///
+/// `None` 是「量不到」（没有配额对象、或读失败）——量不到不改，也不假装能装下：
+/// 改与不改都说得出是哪一条决定的。
+pub fn bounded_by_headroom(shape: Targets, headroom: Option<Targets>) -> Targets {
+    let Some(h) = headroom else {
+        return shape;
+    };
+    Targets {
+        cpu_request_millicores: shape.cpu_request_millicores.min(h.cpu_request_millicores),
+        memory_request_bytes: shape.memory_request_bytes.min(h.memory_request_bytes),
+        cpu_limit_millicores: shape.cpu_limit_millicores.min(h.cpu_limit_millicores),
+        memory_limit_bytes: shape.memory_limit_bytes.min(h.memory_limit_bytes),
+    }
 }
 
 /// 一只 LimitRange 对象当前说的默认值与区间。
@@ -2290,7 +2344,24 @@ pub async fn round(
                     match default_shape(&namespace_cpu_requests, &namespace_memory_requests) {
                         Some(shape) => {
                             let shape = default_layer_shape(shape, &reading);
-                            readings.observe_defaults(LIMIT_RANGE_NAME, shape, SOURCE_DERIVED);
+                            // 两条界在这里是**一对**：LimitRange 的区间说「默认值
+                            // 能在哪」，namespace 的配额说「还装得下多大」。只夹
+                            // 前者的那一版会让默认层长到配额之外，下一次滚动先被
+                            // 准入拒掉——2026-11-24 实测：requests.cpu 硬上限 5、
+                            // 已用 2.66，而库的模板要 3.04，Pod 一直建不出来。
+                            let headroom = quota_headroom(ns).await;
+                            let capped = bounded_by_headroom(shape, headroom);
+                            let source = if capped == shape {
+                                SOURCE_DERIVED
+                            } else {
+                                warn!(
+                                    limit_range = LIMIT_RANGE_NAME,
+                                    "resource defaults: the measured shape does not fit the namespace quota; the default is capped to what one new pod can still admit"
+                                );
+                                SOURCE_QUOTA
+                            };
+                            let shape = capped;
+                            readings.observe_defaults(LIMIT_RANGE_NAME, shape, source);
                             if let Some(body) = limit_range_patch_body(&object, &shape) {
                                 let body = body.to_string();
                                 match kubectl(&[
@@ -3313,6 +3384,37 @@ mod tests {
     /// per-container law reads, asked what a typical container here looks
     /// like: the median sets the request, the busy edge sets the limit.
     #[test]
+    /// 默认层被配额顶住时取「还装得下」的那组值；量不到时原样交回。
+    #[test]
+    fn the_default_is_capped_by_what_the_quota_can_still_admit() {
+        let shape = Targets {
+            cpu_request_millicores: 3_040,
+            memory_request_bytes: 2 << 30,
+            cpu_limit_millicores: 3_650,
+            memory_limit_bytes: 4 << 30,
+        };
+        // 量不到：不改，也不假装能装下。
+        assert_eq!(bounded_by_headroom(shape, None), shape);
+        // 余量比形状小：四个维度一起被压到余量上。
+        let tight = Targets {
+            cpu_request_millicores: 2_340,
+            memory_request_bytes: 1 << 30,
+            cpu_limit_millicores: 500,
+            memory_limit_bytes: 1 << 30,
+        };
+        let capped = bounded_by_headroom(shape, Some(tight));
+        assert_eq!(capped.cpu_request_millicores, 2_340);
+        assert_eq!(capped.memory_limit_bytes, 1 << 30);
+        // 余量宽裕：原样。
+        let roomy = Targets {
+            cpu_request_millicores: 20_000,
+            memory_request_bytes: 40 << 30,
+            cpu_limit_millicores: 20_000,
+            memory_limit_bytes: 40 << 30,
+        };
+        assert_eq!(bounded_by_headroom(shape, Some(roomy)), shape);
+    }
+
     fn the_namespace_default_follows_the_measured_requests() {
         let mib = 1024 * 1024;
         let quiet = default_shape(
