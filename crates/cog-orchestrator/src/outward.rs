@@ -251,7 +251,10 @@ impl OutwardConfig {
             .map(|s| s.cadence_secs)
             .min()
             .unwrap_or(DEFAULT_CADENCE_SECS);
-        Duration::from_secs(least.max(60))
+        // 最短的那条声明就是节拍：解析时已经不再改写它，这里若再抬到 60 秒，
+        // 一条声明 5 秒的来源仍然只会在每分钟被看一眼——同一段改写只是换了个
+        // 位置。0 到不了这里：解析已经点名拒绝过。
+        Duration::from_secs(least)
     }
 
     /// How long the loop may sleep between wakes: its shortest source cadence,
@@ -970,6 +973,12 @@ mod tests {
         .expect("a complete configuration with values this loop can run");
         assert_eq!(declared.sources[0].cadence_secs, 5);
         assert_eq!(declared.sources[0].max_items, 50);
+        assert_eq!(
+            declared.period(),
+            Duration::from_secs(5),
+            "最短的那条声明就是 ticker 的节拍：解析之后还有一层把它抬到 60 秒，\
+             声明的 5 秒在跑起来之后一样不存在"
+        );
 
         for raw in [
             r#"[{"name":"a","query":"b","cadence_secs":0}]"#,
