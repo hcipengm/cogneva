@@ -8,7 +8,8 @@
 fn both_a2a_goal_rows_carry_who_asked() {
     let root = crate::common::routes::repo_root();
     let path = root.join("crates/cog-gateway/src/a2a.rs");
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("读不到 {}：{e}", path.display()));
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("读不到 {}：{e}", path.display()));
     // 只看生产代码：测试里也建 goal 行，它们不该被这条门要求带归属。
     let production = text.split("mod tests {").next().unwrap_or(&text);
 
@@ -26,7 +27,10 @@ fn both_a2a_goal_rows_carry_who_asked() {
             "这一处 goal 行没有先落一条意图行（统一写入口 `intent::record`）：三种来源要进同一本账"
         );
     }
-    assert_eq!(sites, 2, "A2A 的生产路径应当有两处 goal 行构造（流与 send），实际 {sites}");
+    assert_eq!(
+        sites, 2,
+        "A2A 的生产路径应当有两处 goal 行构造（流与 send），实际 {sites}"
+    );
     assert_eq!(
         production.matches("Option<Extension<Claims>>").count(),
         4,

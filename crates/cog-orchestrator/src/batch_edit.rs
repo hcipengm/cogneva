@@ -104,9 +104,30 @@ fn compose(root: &std::path::Path, missing: &[(String, String)]) -> String {
 /// 这次生成要的那一个动作。`Agent` 的整套生命周期（start/snapshot/steer…）在这一步
 /// 用不到，而把一个只有 `prompt` 的调用点钉在整套接口上，等于让每个用例去实现十四个
 /// 不相关的方法——那时测的就不是这一步了。
+/// 这一批的身份：整批一次生成写下的每一笔调用、每一次工具调用都挂在它上面。
+///
+/// 名字由**这一批的 id 排序拼出**，不由谁发起、不由时刻决定：同一批重放，名字相同，
+/// 于是「这一批花了几次调用」是一次按名字的查询；换一批就是另一个名字，不会把两批
+/// 的账混成一本。理由不进名字——同一批 id 理由变了是同一个工作集，那是进展不是新批。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchId(String);
+
+impl BatchId {
+    pub fn from_ids(ids: impl IntoIterator<Item = String>) -> Self {
+        let mut ids: Vec<String> = ids.into_iter().collect();
+        ids.sort();
+        ids.dedup();
+        Self(format!("batch-{}", ids.join("-")))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[async_trait::async_trait]
 pub trait GeneratorCall: Send + Sync {
-    async fn call(&self, batch: &str) -> cog_core::SFResult<serde_json::Value>;
+    async fn call(&self, batch: &BatchId, request: &str) -> cog_core::SFResult<serde_json::Value>;
 }
 
 /// 生产实现：交给 agent。
@@ -116,10 +137,16 @@ pub struct AgentCall {
 
 #[async_trait::async_trait]
 impl GeneratorCall for AgentCall {
-    async fn call(&self, batch: &str) -> cog_core::SFResult<serde_json::Value> {
+    async fn call(&self, batch: &BatchId, request: &str) -> cog_core::SFResult<serde_json::Value> {
         self.agent
+            // 身份不是可选的一层：`prompt` 不带任务，运行时写的每一行调用只有模型，
+            // 按批号查「这一批花了几次」永远查不到。`prompt_for_task` 把批号挂进这次
+            // 运行的作用域，运行时的 stamp 再把它写成每一笔调用上的任务头。
             // 角色名从声明读，不在这里再写一遍：改名时改一处，这一侧跟着走。
-            .prompt(serde_json::json!({ "batch": batch, "role": cog_core::roles::GENERATOR }))
+            .prompt_for_task(
+                batch.as_str(),
+                serde_json::json!({ "batch": request, "role": cog_core::roles::GENERATOR }),
+            )
             .await
     }
 }
@@ -142,8 +169,12 @@ impl BatchGenerator {
 
     /// 整批一次进、拿回这次运行的结果。工具轮次由 agent 自己决定，判据是信息完备
     /// （它够了才出 diff），这里不设上限。
-    pub async fn generate(&self, batch: &str) -> cog_core::SFResult<serde_json::Value> {
-        self.call.call(batch).await
+    pub async fn generate(
+        &self,
+        batch: &BatchId,
+        request: &str,
+    ) -> cog_core::SFResult<serde_json::Value> {
+        self.call.call(batch, request).await
     }
 }
 
@@ -180,14 +211,19 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
-    /// 一个只回显的调用：判的是「整批原样进、答案原样出」，与模型无关。
-    struct Echo(std::sync::Mutex<Option<String>>);
+    /// 一个只回显的调用：判的是「整批原样进、答案原样出」，与模型无关。它同时记下
+    /// 这一问带的批号——批号没传到调用这一层的话，写下的调用事件就归不了批。
+    struct Echo(std::sync::Mutex<Option<(String, String)>>);
 
     #[async_trait::async_trait]
     impl GeneratorCall for Echo {
-        async fn call(&self, batch: &str) -> cog_core::SFResult<serde_json::Value> {
-            *self.0.lock().unwrap() = Some(batch.to_string());
-            Ok(serde_json::json!({ "diff": format!("for {batch}") }))
+        async fn call(
+            &self,
+            batch: &BatchId,
+            request: &str,
+        ) -> cog_core::SFResult<serde_json::Value> {
+            *self.0.lock().unwrap() = Some((batch.as_str().to_string(), request.to_string()));
+            Ok(serde_json::json!({ "diff": format!("for {request}") }))
         }
     }
 
@@ -209,21 +245,40 @@ mod tests {
         assert!(parse_editing(Some(2), "", "台账读不到", "x").is_err());
     }
 
-    /// 整批一次进：请求里带的是整批，不是一条。
+    /// 整批一次进：请求里带的是整批，不是一条；同一问带着这一批的名字。
     #[tokio::test]
     async fn the_whole_batch_goes_in_as_one_request() {
         let agent = Arc::new(Echo(std::sync::Mutex::new(None)));
         let generator = BatchGenerator::new(agent.clone());
+        let batch = BatchId::from_ids(["S1".to_string(), "S2".to_string(), "S3".to_string()]);
         let out = generator
-            .generate("## S1\n## S2\n## S3\n")
+            .generate(&batch, "## S1\n## S2\n## S3\n")
             .await
             .expect("the agent answers");
+        let seen = agent.0.lock().unwrap().clone();
         assert_eq!(
-            agent.0.lock().unwrap().as_deref(),
+            seen.as_ref().map(|(_, request)| request.as_str()),
             Some("## S1\n## S2\n## S3\n"),
             "进 agent 的不是整批"
         );
+        assert_eq!(
+            seen.as_ref().map(|(id, _)| id.as_str()),
+            Some("batch-S1-S2-S3"),
+            "生成这一问没有带着这一批的名字：写下的调用事件归不到批"
+        );
         assert_eq!(out["diff"], "for ## S1\n## S2\n## S3\n");
+    }
+
+    /// 批号由 id 现算，与顺序无关，重复的 id 不产生第二个名字。
+    ///
+    /// 与顺序无关是必需的：台账里同一批的次序会随编辑变化，名字跟着变的话，「这一批
+    /// 花了几次调用」每次都是新的一本账，重放也就对不上上一次。
+    #[test]
+    fn the_batch_name_is_the_same_whatever_order_the_rows_came_in() {
+        let a = BatchId::from_ids(["S2".to_string(), "S1".to_string(), "S2".to_string()]);
+        let b = BatchId::from_ids(["S1".to_string(), "S2".to_string()]);
+        assert_eq!(a, b);
+        assert_eq!(a.as_str(), "batch-S1-S2");
     }
 }
 
@@ -265,8 +320,11 @@ pub async fn run_loop(root: &std::path::Path, generator: &BatchGenerator) -> Res
             ));
         }
         let request = compose(root, &missing);
+        // 批号按这一批的 id 现算：同一批重放得到同一个名字，调用事件才按批查得到；
+        // 名字里不含理由，理由变了是同一个工作集在动，不是另一批。
+        let batch = BatchId::from_ids(missing.iter().map(|(id, _)| id.clone()));
         generator
-            .generate(&request)
+            .generate(&batch, &request)
             .await
             .map_err(|e| format!("generator 失败：{e}"))?;
         rounds += 1;

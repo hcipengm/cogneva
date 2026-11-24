@@ -374,6 +374,8 @@ mod env_names_are_declared_once_test;
 #[path = "no_ceiling_that_kills_work_without_a_registered_bound_test.rs"]
 mod no_ceiling_that_kills_work_without_a_registered_bound_test;
 
+#[path = "a2a_goals_carry_their_origin_test.rs"]
+mod a2a_goals_carry_their_origin_test;
 #[path = "eval_report_is_readable_after_a_run.rs"]
 mod eval_report_is_readable_after_a_run;
 #[path = "eval_table_determinism.rs"]
@@ -710,6 +712,8 @@ mod web_websocket_channels_are_published_test;
 mod web_websocket_envelope_vocabulary_test;
 #[path = "web_workbench_shows_people_venues_tasks_test.rs"]
 mod web_workbench_shows_people_venues_tasks_test;
+#[path = "whole_batch_generation_carries_its_batch_test.rs"]
+mod whole_batch_generation_carries_its_batch_test;
 #[path = "wiki_indexer_test.rs"]
 mod wiki_indexer_test;
 #[path = "wiki_integration_test.rs"]
@@ -726,8 +730,6 @@ mod wire_words_are_not_derived_from_debug_test;
 mod word_constants_with_the_same_name_say_the_same_word_test;
 #[path = "work_on_the_tree_is_declared_by_the_task_test.rs"]
 mod work_on_the_tree_is_declared_by_the_task_test;
-#[path = "a2a_goals_carry_their_origin_test.rs"]
-mod a2a_goals_carry_their_origin_test;
 #[path = "workload_label_pairs_contract_test.rs"]
 mod workload_label_pairs_contract_test;
 /// Whether a file can share this process with the others.
