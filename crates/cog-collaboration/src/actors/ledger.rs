@@ -29,19 +29,34 @@ fn actor() -> String {
 
 /// 这台机器上这一本台账在哪。
 pub fn ledger_path() -> Result<PathBuf, String> {
-    for key in ["COGNEVA_TODO_SOURCE", "COGNEVA_TODO_LEDGER"] {
-        if let Ok(value) = std::env::var(key) {
-            let value = value.trim();
-            if !value.is_empty() {
-                let path = value.strip_prefix("md:").unwrap_or(value);
-                return Ok(PathBuf::from(path));
-            }
+    let source = std::env::var("COGNEVA_TODO_SOURCE").ok();
+    let ledger = std::env::var("COGNEVA_TODO_LEDGER").ok();
+    let declared = std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".config/cogneva/todo-ledger"));
+    resolve_ledger_path(source.as_deref(), ledger.as_deref(), declared.as_deref())
+}
+
+/// 台账地址的解析顺序：两个环境变量 → 本机声明文件的第一行。
+///
+/// 拆出来是因为顺序本身就是判据：「这个 worker 读的是不是**它自己那一本**」靠这一条，
+/// 而它只在环境里可测。两个变量都在时前者优先；空串与 `md:` 前缀都是同一个地址的
+/// 两种写法，不切前缀的那一版会把 `/home/...` 切成 `me/...`，读写都落在一个凭空造
+/// 出来的相对路径上。
+pub fn resolve_ledger_path(
+    source: Option<&str>,
+    ledger: Option<&str>,
+    declared: Option<&std::path::Path>,
+) -> Result<PathBuf, String> {
+    for value in [source, ledger].into_iter().flatten() {
+        let value = value.trim();
+        if !value.is_empty() {
+            let path = value.strip_prefix("md:").unwrap_or(value);
+            return Ok(PathBuf::from(path));
         }
     }
-    let host = std::env::var("HOME")
-        .map(|h| PathBuf::from(h).join(".config/cogneva/todo-ledger"))
-        .map_err(|_| "没有 HOME，也没有显式台账地址".to_string())?;
-    let first = std::fs::read_to_string(&host)
+    let host = declared.ok_or_else(|| "没有 HOME，也没有显式台账地址".to_string())?;
+    let first = std::fs::read_to_string(host)
         .map_err(|e| format!("台账地址读不到：{}（{e}）", host.display()))?;
     let line = first
         .lines()
@@ -835,6 +850,25 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// 这个 worker 读它自己那一本：两个变量先于本机声明，`md:` 只是写法不是目录。
+    #[test]
+    fn the_ledger_address_is_resolved_in_one_order() {
+        let declared = std::path::PathBuf::from("/nowhere/todo-ledger");
+        assert_eq!(
+            resolve_ledger_path(Some("md:/a/one.md"), Some("/b/two.md"), Some(&declared)),
+            Ok(std::path::PathBuf::from("/a/one.md")),
+            "两个变量都在时，前者优先，且 md: 不是路径的一部分"
+        );
+        assert_eq!(
+            resolve_ledger_path(None, Some("/b/two.md"), Some(&declared)),
+            Ok(std::path::PathBuf::from("/b/two.md"))
+        );
+        // 声明文件读不到：报「读不到」，不是回落到别的台账——两个工人读同一本，
+        // 其中一边的活永远没人做。
+        assert!(resolve_ledger_path(None, None, Some(&declared)).is_err());
+        assert!(resolve_ledger_path(None, None, None).is_err());
     }
 
     /// 重钉：批次按新台账重算，而「自开工以来」的两个坐标留在第一次开工那一刻。
