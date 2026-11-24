@@ -39,6 +39,9 @@ out=$(run test); rc=$?
 out=$(run build); rc=$?
 { [ "$rc" -eq 0 ]; } && ok "同一 HEAD 上换一种命令（build）：放行" || bad "build 被误拒（rc=$rc）：$out"
 
+out=$(run test -p cog-core); rc=$?
+{ [ "$rc" -eq 0 ]; } && ok "同一 HEAD 上另一条命令（不同目标）：放行" || bad "不同目标的 test 被误拒（rc=$rc）：$out"
+
 out=$(run check); rc=$?
 out2=$(run check); rc=$?
 { [ "$rc" -eq 0 ]; } && ok "check 不受限：编辑期随时可用" || bad "check 被拒（rc=$rc）：$out2"
