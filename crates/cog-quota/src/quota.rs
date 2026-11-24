@@ -116,15 +116,22 @@ impl QuotaManager {
             .unwrap_or(0)
     }
 
-    /// The ceiling in force for one cell: the declared pair, or the
-    /// hierarchy's default when nobody declared one.
-    async fn ceiling(&self, scope: QuotaScope, target_id: &str) -> QuotaLimits {
+    /// The pair an operator declared for one cell, or `None` when nobody did.
+    ///
+    /// A cell with no declared pair has no ceiling to raise: the fallback pair
+    /// the hierarchy answers with is what the cell *reads* as, not a number
+    /// anyone chose for it. Returning it here would make every top-up start
+    /// from an invented base and write that base back as if an operator had
+    /// declared it.
+    async fn declared_ceiling(
+        &self,
+        scope: QuotaScope,
+        target_id: &str,
+    ) -> Option<QuotaLimits> {
         self.scope_reading(scope, target_id)
             .await
+            .filter(|reading| reading.enforced)
             .map(|reading| reading.limits)
-            // 没有读数的格子落回层级库自己的那一对，不是合同里另写的一对：
-            // 「没人配过」的答案由持有起点的实现方给出。
-            .unwrap_or_else(|| self.hierarchy.default_limits())
     }
 
     /// Ask whether a call of `estimated_tokens` fits, without spending
@@ -292,7 +299,14 @@ impl QuotaManager {
                  declare the ceiling for the period you mean with the limits route instead"
             )));
         }
-        let current = self.ceiling(scope, target_id).await;
+        let Some(current) = self.declared_ceiling(scope, target_id).await else {
+            return Err(QuotaError::InvalidArgument(format!(
+                "{} {:?} 还没有任何人声明过上限：先声明一对上限（limits 路由），再充值。\
+                 抬一个没人声明过的格子，起点只能是一个凭空写下的数",
+                scope.as_str(),
+                target_id
+            )));
+        };
         let raised = QuotaLimits::new(
             current.soft_limit.saturating_add(tokens),
             current.hard_limit.saturating_add(tokens),

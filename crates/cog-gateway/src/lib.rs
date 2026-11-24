@@ -2556,11 +2556,15 @@ async fn quota_usage_handler(
         .unwrap_or_else(|| "anonymous".to_string());
 
     let summary = state.quota_manager.get_user_summary(&user_id).await;
+    // 没人声明过的格子读到「没有上限」（`QuotaLimits::unlimited`）。这一面对
+    // 它写 `null` 而不是把 `u64::MAX` 印出去：没有上限就没有「还剩多少」，而
+    // 一个十八位整数在读数面上与「额度真的这么多」同形。
+    let unlimited = summary.total_quota == u64::MAX;
     let mut body = serde_json::json!({
         "user_id": user_id,
-        "remaining": summary.remaining,
+        "remaining": if unlimited { None } else { Some(summary.remaining) },
         "used_today": summary.used_today,
-        "total_quota": summary.total_quota,
+        "total_quota": if unlimited { None } else { Some(summary.total_quota) },
     });
 
     if let Some(hier) = state.hierarchy_manager.as_ref() {

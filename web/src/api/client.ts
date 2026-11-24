@@ -3891,9 +3891,11 @@ export async function listAuditEvents(query: AuditQuery = {}): Promise<AuditEven
 
 export interface QuotaUsage {
   user_id: string;
-  remaining: number;
+  /** `null` ＝ 没有任何人给这一格声明过上限，所以没有「还剩多少」可报。 */
+  remaining: number | null;
   used_today: number;
-  total_quota: number;
+  /** `null` ＝ 同上：没有上限，不是一个很大的上限。 */
+  total_quota: number | null;
 }
 
 /** 我这一份 token 额度今天用了多少、还剩多少。 */

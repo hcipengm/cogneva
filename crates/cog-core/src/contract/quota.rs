@@ -72,11 +72,12 @@ impl<'de> Deserialize<'de> for QuotaScope {
 
 /// Soft / hard limit pair for a single scope.
 ///
-/// 没有 `Default`：一对上限是某一格的声明，不存在「通用的那一对」。谁要给
-/// 未配置的格子一个起点，起点在 `cog-quota` 的 `HierarchyManager::from_store`
-/// 里有唯一一处（`from_hard(PLATFORM_DAILY_TOKENS, …)`）。合同里原先还写着一
-/// 对 80k/100k，与那一处的 40k/50k 差了一倍，而没有任何人量过其中哪一个——
-/// 删掉比让它们继续分叉好。
+/// 没有 `Default`：一对上限是某一格的声明，不存在「通用的那一对」。未配置的格
+/// 子读到的是 [`QuotaLimits::unlimited`]——**没有上限**，不是某个平台默认值：
+/// 一个谁都没声明过的天花板不是「宽松的默认」，它是一条没有出处的界，读的人
+/// 分不出「这格花完了」与「这格从来没人配过」（现场：默认 50k 对着一天
+/// 47_746_019 的花销，默认工作区被一律 429）。合同里原先还写过一对 80k/100k、
+/// `from_store` 那一处是 40k/50k，两个数没有任何人量过其中哪一个。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuotaLimits {
     pub soft_limit: u64,
@@ -95,6 +96,18 @@ impl QuotaLimits {
         Self {
             soft_limit: ((hard_limit as f64) * soft_ratio) as u64,
             hard_limit,
+        }
+    }
+
+    /// 没有上限：未声明的格子读到的那一对。
+    ///
+    /// 它不是一把「很大的尺」而是一种缺席——`u64::MAX` 花不完，所以任何按
+    /// 「花销 / 上限」算出的比例都是零，判定不会在这里拦人；`ScopeStatus::enforced`
+    /// 另有一格说清这一格有没有人声明过。两者合起来，读者不必从数值大小去猜。
+    pub const fn unlimited() -> Self {
+        Self {
+            soft_limit: u64::MAX,
+            hard_limit: u64::MAX,
         }
     }
 }
@@ -254,8 +267,9 @@ pub trait HierarchyManager: Send + Sync {
     /// 一个没人配过的格子读到的那一对上下限。
     ///
     /// 与 [`limits`](Self::limits) 的 `None` 成对：那里说「没人配过」，这里说
-    /// 「于是它读到什么」。这一对只有实现方持有（它的起点由部署声明），读的人
-    /// 不该自己再猜一对——两份答案没有任何人量过谁对，却会在读数面上分叉。
+    /// 「于是它读到什么」。这一对只有实现方持有，读的人不该自己再猜一对——两份
+    /// 答案没有任何人量过谁对，却会在读数面上分叉。真实现答的是
+    /// [`QuotaLimits::unlimited`]：没有人声明过，就没有上限可读。
     fn default_limits(&self) -> QuotaLimits;
 
     /// Configure the daily soft/hard ceilings for one `(scope, target)` cell.
