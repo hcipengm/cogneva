@@ -38,6 +38,9 @@ git -C "$tree" add -A >/dev/null; git -C "$tree" commit -qm base
 git -C "$tree" branch -f main HEAD
 
 ledger="$tmp/ledger.tsv"
+# 默认台账指到夹具自己的空处：轮书住在台账仓里，不指开的话这一门会读到这台机器上
+# **真的**那一轮，拿它的 code_rev 去量夹具树（不在那棵树里的 rev ⇒ 判不了）。
+export COGNEVA_TODO_LEDGER="$tmp/no-ledger.md"
 stamp() { date -u -d "$1" +%Y-%m-%dT%H:%M:%SZ; }
 record() { printf '%s\t%s\t%s\t-\t-\n' "$(stamp "$1")" "$tree" "$2" >>"$ledger"; }
 
