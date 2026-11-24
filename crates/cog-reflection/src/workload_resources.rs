@@ -607,34 +607,26 @@ async fn quota_headroom(ns: &str) -> Option<Targets> {
     })
 }
 
-/// 额度该抬到哪：**按实测的稳态加叠**——所有工作负载「实测请求 × 副本数」之和，
-/// 加最大一次滚动重叠（再一份最大的单副本），加部署作业；只升不降，且不超过节点
-/// 可分配量。`None` 是「不用动」。
+/// 额度该怎么动：实测需要的值装得下就抬到它，装不下硬件就告警。
 ///
-/// 这是把额度那一层接进闭环的那条律。今天的 `hard` 由渲染集按模板声明值投影，只在
-/// 部署时重算：模板里库声明 500m，投影得 5 核；闭环后来把它抬到 3.04，额度没跟，
-/// Pod 重建时被自己的闸门拒掉（2026-11-24 数据库不在的那一次）。
-///
-/// 输入**不是**当下的 `used`：那里面混着滚动中的新副本、部署作业与正要被替换的旧
-/// 副本，拿它当输入会让一次尖峰把额度永久顶高。稳态之和才与「这一套清单该占多少」
-/// 是同一个东西。
-fn raised_ceiling(
-    hard: u64,
-    steady_total: u64,
-    overlap: u64,
-    allocatable: Option<u64>,
-) -> Option<u64> {
-    let wanted = steady_total.saturating_add(overlap);
-    if wanted <= hard {
-        return None;
+/// 需要的值 = 每个程序实测要的 × 份数之和 ＋ 一份滚动重叠 ＋ 其他正在运行的值。
+/// 判据只有一句：`required ≤ 硬件` 就接受并抬到 `required`；否则不动，并**说出来**
+/// ——「装不下」必须有一条读数，静默不动与「额度本来够」在屏上同形。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CeilingDecision {
+    Keep,
+    Raise(u64),
+    ExceedsNode { required: u64, cap: u64 },
+}
+
+fn ceiling_decision(hard: u64, required: u64, allocatable: Option<u64>) -> CeilingDecision {
+    if required <= hard {
+        return CeilingDecision::Keep;
     }
-    // 节点装不下的值不写：写上去只是把拒绝从「额度」挪到「调度」。
-    if let Some(cap) = allocatable {
-        if wanted > cap {
-            return None;
-        }
+    match allocatable {
+        Some(cap) if required > cap => CeilingDecision::ExceedsNode { required, cap },
+        _ => CeilingDecision::Raise(required),
     }
-    Some(wanted)
 }
 
 /// 节点可分配量的合计（一维：cpu 毫核 / 内存字节）。
@@ -2263,36 +2255,64 @@ pub async fn round(
             overlap_cpu = overlap_cpu.max(per_cpu);
             overlap_memory = overlap_memory.max(per_mem);
         }
-        if let Some((hard, _used)) = quota_hard_and_used(ns).await {
+        if let Some((hard, used)) = quota_hard_and_used(ns).await {
             let cap_cpu = node_allocatable(AllocatableUnit::Cpu).await;
             let cap_mem = node_allocatable(AllocatableUnit::Memory).await;
+            // 「其他正在运行的值」：此刻的 used 里，除这些工作负载之外的份额（部署
+            // 作业、临时 Pod）。它们也要算进「装不装得下」。
+            let others_cpu = used.cpu_request_millicores.saturating_sub(steady_cpu);
+            let others_mem = used.memory_request_bytes.saturating_sub(steady_memory);
+            let required_cpu = steady_cpu
+                .saturating_add(overlap_cpu)
+                .saturating_add(others_cpu);
+            let required_mem = steady_memory
+                .saturating_add(overlap_memory)
+                .saturating_add(others_mem);
             let mut hard_patch = serde_json::Map::new();
-            if let Some(wanted) =
-                raised_ceiling(hard.cpu_request_millicores, steady_cpu, overlap_cpu, cap_cpu)
-            {
-                info!(
+            match ceiling_decision(hard.cpu_request_millicores, required_cpu, cap_cpu) {
+                CeilingDecision::Raise(wanted) => {
+                    info!(
+                        namespace = %ns,
+                        from = hard.cpu_request_millicores,
+                        to = wanted,
+                        steady = steady_cpu,
+                        overlap = overlap_cpu,
+                        others = others_cpu,
+                        "workload resources: raising the namespace's request ceiling to what the measured workloads plus the rest actually need"
+                    );
+                    hard_patch.insert(
+                        "requests.cpu".to_string(),
+                        Value::String(format!("{wanted}m")),
+                    );
+                }
+                CeilingDecision::ExceedsNode { required, cap } => warn!(
                     namespace = %ns,
-                    from = hard.cpu_request_millicores,
-                    to = wanted,
-                    steady = steady_cpu,
-                    overlap = overlap_cpu,
-                    "workload resources: raising the namespace's request ceiling to the measured steady state plus one rollout overlap"
-                );
-                hard_patch.insert(
-                    "requests.cpu".to_string(),
-                    Value::String(format!("{wanted}m")),
-                );
+                    dimension = "requests.cpu",
+                    required,
+                    cap,
+                    "workload resources: the measured need does not fit the node; the ceiling was not raised"
+                ),
+                CeilingDecision::Keep => {}
             }
-            if let Some(wanted) = raised_ceiling(
+            match ceiling_decision(
                 hard.memory_request_bytes,
-                steady_memory,
-                overlap_memory,
+                required_mem,
                 cap_mem,
             ) {
-                hard_patch.insert(
-                    "requests.memory".to_string(),
-                    Value::String(format!("{wanted}")),
-                );
+                CeilingDecision::Raise(wanted) => {
+                    hard_patch.insert(
+                        "requests.memory".to_string(),
+                        Value::String(format!("{wanted}")),
+                    );
+                }
+                CeilingDecision::ExceedsNode { required, cap } => warn!(
+                    namespace = %ns,
+                    dimension = "requests.memory",
+                    required,
+                    cap,
+                    "workload resources: the measured need does not fit the node; the ceiling was not raised"
+                ),
+                CeilingDecision::Keep => {}
             }
             if !hard_patch.is_empty() {
                 let body = serde_json::json!({"spec": {"hard": Value::Object(hard_patch)}});
@@ -3673,14 +3693,16 @@ mod tests {
     /// 额度的重算律：`used + 最大那一份`，只升不降；节点装不下的值不写。
     /// 用 2026-11-24 的实测：硬 5000m、已用 2660m、最大一份 3040m、节点 23860m
     /// ⇒ 5700m；如果硬已经是 6000m 就不动；如果节点只有 5000m 也不写。
+    /// 需要的值装得下就抬到它；装不下硬件就**说出来**（不是静默不动）。
     #[test]
-    fn the_ceiling_is_measured_steady_state_plus_one_overlap() {
-        // 稳态和 2660、最大一份单副本 3040 ⇒ 5700；硬 5000 时抬，硬 6000 时不动；
-        // 节点只有 5000 时不写；量不到节点上限时照写。
-        assert_eq!(raised_ceiling(5_000, 2_660, 3_040, Some(23_860)), Some(5_700));
-        assert_eq!(raised_ceiling(6_000, 2_660, 3_040, Some(23_860)), None);
-        assert_eq!(raised_ceiling(5_000, 2_660, 3_040, Some(5_000)), None);
-        assert_eq!(raised_ceiling(5_000, 2_660, 3_040, None), Some(5_700));
+    fn the_ceiling_rises_to_the_measured_need_or_names_the_hardware_limit() {
+        assert_eq!(ceiling_decision(5_000, 5_700, Some(23_860)), CeilingDecision::Raise(5_700));
+        assert_eq!(ceiling_decision(6_000, 5_700, Some(23_860)), CeilingDecision::Keep);
+        assert_eq!(
+            ceiling_decision(5_000, 5_700, Some(5_000)),
+            CeilingDecision::ExceedsNode { required: 5_700, cap: 5_000 }
+        );
+        assert_eq!(ceiling_decision(5_000, 5_700, None), CeilingDecision::Raise(5_700));
     }
 
     /// 抬价先向这一拍剩下的额度借：不超过声明的部分不花，超过的部分最多花到
