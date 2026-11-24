@@ -217,6 +217,8 @@ mod agent_tools_test;
 mod agent_wal_test;
 #[path = "agent_wrapper_test.rs"]
 mod agent_wrapper_test;
+#[path = "an_answer_never_waits_on_a_snapshot_that_never_lands_test.rs"]
+mod an_answer_never_waits_on_a_snapshot_that_never_lands_test;
 #[path = "an_employee_can_search_and_commit_test.rs"]
 mod an_employee_can_search_and_commit_test;
 #[path = "an_employee_works_in_its_own_checkout_test.rs"]
