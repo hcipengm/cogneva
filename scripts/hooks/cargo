@@ -110,6 +110,49 @@ EOF
   fi
 fi
 
+# 同一份字节不许编第二次：这一棵树在当前 HEAD 上已经把**同一种**编译命令跑过了，
+# 再来一次买的是同一个答案。判据只读账本里已有的事实（时间、工作树、参数、HEAD）：
+# 同一棵树、同一个 HEAD、同一个子命令（`build`／`test`／…）出现过，就拒；`check`
+# 不算——它不产出可推的字节，编辑期随时可用。
+#
+# 2026-11-24 属主指出：这条判据 2026-11-21 被降成「读数」之后，反复「改一段编一段」
+# 没有任何东西拦得住；`Split` 管的是排除哪几条，不是可以多编几次，所以这里不再给
+# `Split` 留口子。改完之后再编只有两条路：先提交（新 HEAD 就是新的一批），或在提交
+# 信息里写一行 `Recompiled: <为什么上一次不够>`。
+if [ "$builds" = "1" ] && [ "$ledger" != "/dev/null" ] && [ -f "$ledger" ]; then
+  head_now="$(git rev-parse HEAD 2>/dev/null || echo no-head)"
+  sub_now=""
+  for token in $*; do
+    case "$token" in -*) ;; *) sub_now="$token"; break ;; esac
+  done
+  # 变量名避开 awk 的内建函数（`sub` 就是一个）：撞上的那一版每次都在这里 fatal，
+  # 而错误被重定向吞掉，判据就静默地读成「没有前一次编译」——门在、从不拒绝。
+  if ! seen="$(awk -F'\t' -v tree="$PWD" -v cmd="$sub_now" -v head="$head_now" '
+    $2 == tree && $4 == head {
+      n = split($3, parts, " ")
+      first = ""
+      for (i = 1; i <= n; i++) if (parts[i] !~ /^-/) { first = parts[i]; break }
+      if (first == cmd) found = 1
+    }
+    END { print found + 0 }' "$ledger")"; then
+    echo "cargo: 编译账读不出来（$ledger），这一问没判——不当作「没有编过」。" >&2
+    exit 1
+  fi
+  if [ "$seen" = "1" ]; then
+    if ! git log -1 --format='%B' 2>/dev/null | grep -q '^Recompiled:'; then
+      cat >&2 <<MSG
+
+cargo: 这一批已经在这份字节上把 \`$sub_now\` 跑过一次了（HEAD ${head_now}），不再跑第二次。
+
+  一份字节只买一次编译：改完再编要么先提交（新 HEAD＝新的一批），要么在提交信息里写
+      Recompiled: <为什么上一次不够>
+  编辑期要确认类型，用 \`cargo check\`（它不产出可推送的字节，不受这一条限制）。
+MSG
+      exit 1
+    fi
+  fi
+fi
+
 fingerprint() {
   {
     git rev-parse HEAD 2>/dev/null || echo "no-head"
