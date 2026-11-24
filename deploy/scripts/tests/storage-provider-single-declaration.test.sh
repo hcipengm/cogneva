@@ -27,14 +27,11 @@ command -v python3 >/dev/null || { echo "缺少依赖：python3" >&2; exit 2; }
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
 
-want="$(python3 -I -c '
+provider="$(python3 -I -c '
 import json,sys
 d=json.load(open(sys.argv[1]))
-p=d.get("providers",{}).get("storage",{})
-print(p.get("provider",""), int(bool(p.get("enabled"))))
+print(d.get("providers",{}).get("storage",{}).get("provider",""))
 ' "${chart}/files/cogneva.json")"
-provider="${want% *}"
-enabled="${want#* }"
 [ -n "${provider}" ] || fail "cogneva.json 里没有 providers.storage.provider：那这份声明本身不在，下面四条都不成立"
 
 # 1. 模板那一行是投影，不是字面量。
