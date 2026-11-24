@@ -1401,6 +1401,16 @@ impl Task {
     /// input under `input` and the evaluator omits it — so a predicate that
     /// inspects the built context silently never matches, and change generation
     /// degrades into ordinary narrative output.
+    /// 这一条是谁提的：各入口写同一组键（`input.origin`），读的人不必按入口分叉。
+    /// 空串与缺失都读作「这条连接没有身份」——不编一个匿名的人。
+    pub fn said_by(&self) -> Option<&str> {
+        self.input
+            .get("origin")?
+            .get("said_by")?
+            .as_str()
+            .filter(|s| !s.is_empty())
+    }
+
     /// 这一跑是不是「把收件台上的意图变成工作」的那一批。
     ///
     /// 收件台只能有**一个**读它并处置它的角色：两个读者各接一次时，同一句话会
@@ -1654,6 +1664,17 @@ mod tests {
     /// 那个常量；两处各写一个 3、一个 300 的那一版，改一边另一边不会红。
     /// 入口把三格挂上行：键是同一个名字，读它的人按那个名字取。
     #[test]
+    /// 「谁提的」读同一个键；缺失与空串都读作没有身份。
+    #[test]
+    fn who_filed_it_is_read_from_one_key() {
+        let mut task = Task::new("t", TaskType::Custom("dag_node".into()), serde_json::json!({}));
+        assert_eq!(task.said_by(), None);
+        task.input["origin"] = serde_json::json!({"source": "a2a", "said_by": ""});
+        assert_eq!(task.said_by(), None, "空串是「没有身份」，不是一个匿名的人");
+        task.input["origin"] = serde_json::json!({"source": "a2a", "said_by": "u-1"});
+        assert_eq!(task.said_by(), Some("u-1"));
+    }
+
     /// 只有「意图那一批」的任务算这一类：普通目标带着 `task_kind` 的旧写法也算，
     /// 而 `self_evolution` 不算——两族各读各的输入。
     #[test]

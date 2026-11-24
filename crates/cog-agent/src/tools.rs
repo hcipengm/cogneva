@@ -4695,6 +4695,13 @@ pub mod builtins {
         if let Some(assignee) = assignee.as_deref() {
             input["agent_id"] = serde_json::json!(assignee);
         }
+        // 谁提的：与 A2A 同一种写法（`origin`），读面不必按入口分叉。空串是
+        // 「这条连接没有身份」，不是编一个匿名的人。
+        input["origin"] = serde_json::json!({
+            "source": "internal_tool",
+            "said_by": caller.unwrap_or_default(),
+            "addressed_to": assignee.clone().unwrap_or_default(),
+        });
         let mut row = serde_json::json!({
             "id": task_id,
             "task_type": cog_core::contract::work_item::PLATFORM_AGENT_TASK,
@@ -6131,6 +6138,20 @@ pub mod builtins {
 
         fn filing(args: serde_json::Value) -> SFResult<StartTaskFiling> {
             start_task_filing(&args, Some("agent-caller"))
+        }
+
+        /// 归属写在行上：与 A2A 同一个键（`input.origin`），入口不同而读面不必分叉。
+        #[test]
+        fn a_filed_task_carries_who_filed_it() {
+            let filed = filing(serde_json::json!({
+                "goal": "把这批门禁的归属改回它判的那个对象",
+                "acceptance": ["跑一次门"],
+            }))
+            .expect("a well-formed call files");
+            let origin = &filed.body["tasks"][0]["input"]["origin"];
+            assert_eq!(origin["source"], "internal_tool");
+            assert_eq!(origin["said_by"], "agent-caller");
+            assert_eq!(origin["addressed_to"], "");
         }
 
         /// 任务读口的替身：每一条等待都回同一个状态词。
