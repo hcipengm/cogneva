@@ -87,12 +87,12 @@ pub fn status() -> i32 {
 
 /// `cogneva ledger <action>` 的分派。今天有 `status`、`next`、`open` 与 `close`；别的名字点名说没有，
 /// 不静默成功——一个不认识的子命令退 0 会被读成「跑过了」。
-pub fn run() -> i32 {
+pub async fn run(events: Option<std::sync::Arc<dyn cog_core::RoundEvents>>) -> i32 {
     match std::env::args().nth(2).as_deref() {
         Some("status") | None => status(),
         Some("next") => next(),
-        Some("open") => open(),
-        Some("close") => close(),
+        Some("open") => open(events.as_ref()).await,
+        Some("close") => close(events.as_ref()).await,
         Some("gate") => gate(),
         Some("editing") => editing(),
         Some("stop-gate") => stop_gate(),
@@ -648,6 +648,16 @@ mod tests {
             .collect()
     }
 
+    /// 事件流那本书：批次原样带着，`ledger_rev` 是空串（这本台账没有版本坐标）。
+    #[test]
+    fn the_event_book_carries_the_batch_and_no_version() {
+        let round = event_round(&ids(&["N01", "N02"]), "abc123");
+        assert_eq!(round.batch, ids(&["N01", "N02"]));
+        assert_eq!(round.ledger_rev, "");
+        assert_eq!(round.code_rev, "abc123");
+        assert!(!round.round.is_empty());
+    }
+
     /// 触点动过才算编辑过；目录触点读作「它下面任何一个文件动了」。
     #[test]
     fn an_edit_is_done_when_every_touch_it_names_moved() {
@@ -855,7 +865,7 @@ pub const ROUND_REF: &str = "refs/cogneva/round";
 /// 一批是什么由台账现算（未完成、且没写 `touches: unknown` 的那些），三格里的「差距」
 /// 随行走——接着做的人打开轮就读得到每条还差什么，不必把整本台账重判一遍。
 /// 重钉继承 `first_rev`：那一格是「自开工以来」的基准，不能因为重钉被清零。
-pub fn open() -> i32 {
+pub async fn open(events: Option<&std::sync::Arc<dyn cog_core::RoundEvents>>) -> i32 {
     let path = match ledger_path() {
         Ok(p) => p,
         Err(e) => {
@@ -879,9 +889,41 @@ pub fn open() -> i32 {
     };
     let ledger_dir = path.parent().map(|p| p.display().to_string()).unwrap_or_default();
     let (repo, ok) = git(&ledger_dir, &["rev-parse", "--show-toplevel"]);
+    let batch: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+    let gaps: serde_json::Map<String, serde_json::Value> = items
+        .iter()
+        .map(|i| (i.id.clone(), serde_json::Value::String(i.gap.clone())))
+        .collect();
     if !ok || repo.is_empty() {
-        eprintln!("ledger: 台账不在一个 git 仓里（{ledger_dir}）：这一轮钉不到任何一版上");
-        return 2;
+        // 这本台账没有版本坐标（平台自己的变更账在库里）。书就写到事件流上：
+        // 同一个接口、同一种载荷，读的人不必知道这本书住在哪。
+        let Some(events) = events else {
+            eprintln!(
+                "ledger: 台账不在一个 git 仓里（{ledger_dir}），也没有事件流那本书：这一轮钉不到任何一版上"
+            );
+            return 2;
+        };
+        let (code_rev, _) = git(
+            &std::env::current_dir()
+                .map(|d| d.display().to_string())
+                .unwrap_or_default(),
+            &["rev-parse", "HEAD"],
+        );
+        let round = event_round(&batch, &code_rev);
+        return match events.open(&round).await {
+            Ok(()) => {
+                println!(
+                    "ledger: 轮开在事件流上（{}），这一批 {} 条",
+                    round.round,
+                    batch.len()
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("ledger: 这一轮没写进事件流：{e}");
+                2
+            }
+        };
     }
     let (ledger_rev, ok) = git(&repo, &["rev-parse", "HEAD"]);
     if !ok {
@@ -896,11 +938,6 @@ pub fn open() -> i32 {
     );
     // 重钉继承第一次开工的基准。
     let first_rev = existing_first_rev(&repo).unwrap_or_else(|| ledger_rev.clone());
-    let batch: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
-    let gaps: serde_json::Map<String, serde_json::Value> = items
-        .iter()
-        .map(|i| (i.id.clone(), serde_json::Value::String(i.gap.clone())))
-        .collect();
     let payload = round_payload(&batch, &gaps, &ledger_rev, &code_rev, &first_rev);
     let sha = match write_book(&repo, &payload.to_string()) {
         Ok(s) => s,
@@ -921,6 +958,22 @@ pub fn open() -> i32 {
         payload["batch"].as_array().map(|a| a.len()).unwrap_or(0)
     );
     0
+}
+
+/// 事件流那本书上的一轮：批次、代码坐标、发起方。`ledger_rev` 是空串——平台自己的
+/// 变更账在库里，没有版本坐标；空串说的是这件事，不是「没有台账」。
+fn event_round(batch: &[String], code_rev: &str) -> cog_core::RoundOpened {
+    cog_core::RoundOpened {
+        round: format!(
+            "round-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ),
+        ledger_rev: String::new(),
+        code_rev: code_rev.to_string(),
+        batch: batch.to_vec(),
+        actor: std::env::var("COGNEVA_ACTOR").unwrap_or_else(|_| "worker".to_string()),
+        at: chrono::Utc::now(),
+    }
 }
 
 /// 书的载荷。拆出来是因为它是这一轮「是什么」的全部可判内容：批、每条的缺口、两个
@@ -965,7 +1018,7 @@ fn existing_first_rev(repo: &str) -> Option<String> {
 /// 关轮不改批：书里写着开门那一刻的清单，这里只加一个 `closed_at`。读数文件记的是
 /// **书里那一批**的大小——它是 `Split: 4`（一次读不完）的界，按关轮那一刻现算的批
 /// （已全部到终态，故为空）记，那条读数就永远是 0。
-pub fn close() -> i32 {
+pub async fn close(events: Option<&std::sync::Arc<dyn cog_core::RoundEvents>>) -> i32 {
     let path = match ledger_path() {
         Ok(p) => p,
         Err(e) => {
@@ -976,8 +1029,37 @@ pub fn close() -> i32 {
     let ledger_dir = path.parent().map(|p| p.display().to_string()).unwrap_or_default();
     let (repo, ok) = git(&ledger_dir, &["rev-parse", "--show-toplevel"]);
     if !ok || repo.is_empty() {
-        eprintln!("ledger: 台账不在一个 git 仓里（{ledger_dir}）");
-        return 2;
+        // 事件流那本书：关轮就是把当前开着的那一轮记成 closed。
+        let Some(events) = events else {
+            eprintln!("ledger: 台账不在一个 git 仓里（{ledger_dir}），也没有事件流那本书");
+            return 2;
+        };
+        let current = match events.current().await {
+            Ok(Some(round)) => round,
+            Ok(None) => {
+                eprintln!("ledger: 没有开着的一轮");
+                return 1;
+            }
+            Err(e) => {
+                eprintln!("ledger: 事件流读不到：{e}");
+                return 2;
+            }
+        };
+        let actor = std::env::var("COGNEVA_ACTOR").unwrap_or_else(|_| "worker".to_string());
+        return match events.close(&current.round, &actor).await {
+            Ok(()) => {
+                println!(
+                    "ledger: 这一轮关了（事件流，{}，{} 条）",
+                    current.round,
+                    current.batch.len()
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("ledger: 这一轮没关成：{e}");
+                2
+            }
+        };
     }
     let (sha, ok) = git(&repo, &["rev-parse", "--verify", "--quiet", ROUND_REF]);
     if !ok || sha.is_empty() {

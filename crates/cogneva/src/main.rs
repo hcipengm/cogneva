@@ -179,7 +179,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 卷族序列（deploy/k3s/cluster-registry.yaml 的 volume-walker 容器）。
         Command::BatchEdit => cog_orchestrator::batch_edit::run_from_env().await,
         Command::BatchPlan => cog_orchestrator::batch_plan::run_from_stdin().await,
-        Command::Ledger => std::process::exit(cog_collaboration::actors::ledger::run()),
+        Command::Ledger => {
+            // 事件流那本书：台账不在 git 里时（平台自己的变更账）由这条流来钉。
+            // 连接不上只是这本书不可用，git 那本书照常；「读不到」由调用它的那个动作说。
+            let events = ledger_round_events().await;
+            std::process::exit(cog_collaboration::actors::ledger::run(events).await)
+        }
         Command::VolumeWalker => cogneva::volume_walker::run_from_env().await,
         // 宿主账本的拆解面：每节点一个只读进程，把宿主 cgroup v2 的三个 slice 各按
         // anon / file 拆开（deploy/k3s/host-ledger-daemonset.yaml 的启动命令）。
@@ -298,3 +303,21 @@ const STANDALONE_LOG_SERVICES: &[(Command, &str)] = &[
     (Command::Restore, "cogneva-restore"),
     (Command::BackupDrill, "cogneva-backup-drill"),
 ];
+
+/// `cogneva ledger` 的事件流书。没有配置库就是没有这本书（`None`），不是错误：
+/// 台账在 git 里时根本用不到它。
+async fn ledger_round_events() -> Option<std::sync::Arc<dyn cog_core::RoundEvents>> {
+    let url = std::env::var(cog_core::env::DATABASE_URL).ok()?;
+    let writer = std::env::var("COGNEVA_WRITER").unwrap_or_else(|_| "worker".to_string());
+    match sqlx::PgPool::connect(&url).await {
+        Ok(pool) => {
+            let store: std::sync::Arc<dyn cog_core::RoundEvents> =
+                std::sync::Arc::new(cog_storage::RoundEventStore::new(pool, writer));
+            Some(store)
+        }
+        Err(e) => {
+            eprintln!("ledger: 事件流连不上（{e}）；这一侧没有那本书");
+            None
+        }
+    }
+}
