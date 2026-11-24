@@ -30,6 +30,19 @@ fn checkpoint_round_budget(cadence: std::time::Duration) -> std::time::Duration 
     )
 }
 
+/// 声明的清扫节拍原样生效；0 秒是忙等，不是一个节拍，点名拒绝。
+///
+/// 读到它的那一层从前把它换成 1 秒，声明的值与生效的值于是有两个。
+fn declared_claim_cadence(secs: u64) -> cog_core::SFResult<u64> {
+    if secs == 0 {
+        return Err(cog_core::SFError::Config(
+            "dag_executor.result_claim_interval_secs 为 0 秒：那是忙等，不是一个节拍。给它一个周期。"
+                .into(),
+        ));
+    }
+    Ok(secs)
+}
+
 pub const DAG_CHECKPOINT_LOOP: &str = "orchestrator_dag_checkpoint";
 /// Loop name reported through the background-loop liveness family.
 pub const READY_TASK_PUBLISHER_LOOP: &str = "orchestrator_ready_task_publisher";
@@ -281,6 +294,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                 ));
             }
         };
+        declared_claim_cadence(ctx.config().dag_executor.result_claim_interval_secs)?;
         let runtime_config = crate::DagExecutorConfig {
             redis_url,
             workspace_id,
@@ -1309,6 +1323,17 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
 mod round_budget_tests {
     use super::*;
     use std::time::Duration;
+
+    /// 声明的清扫节拍原样回来；只有 0 被点名拒绝，而不是被换成一个数。
+    #[test]
+    fn a_declared_claim_cadence_survives_and_zero_is_refused() {
+        assert_eq!(declared_claim_cadence(45).unwrap(), 45);
+        let refused = declared_claim_cadence(0).expect_err("0 秒是忙等");
+        assert!(
+            refused.to_string().contains("result_claim_interval_secs"),
+            "{refused}"
+        );
+    }
 
     #[test]
     fn a_longer_cadence_lengthens_the_round_and_a_short_one_is_floored() {

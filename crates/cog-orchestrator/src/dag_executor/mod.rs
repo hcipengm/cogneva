@@ -1564,7 +1564,7 @@ impl DagExecutorRuntime {
         // 阈值必须大于最长处理时长，否则正在处理的消息会被并发重投；重投是
         // at-least-once，已终态任务会被上面的拒绝分支 ack 丢弃，不会重复迁移。
         let claim_idle_ms = self.config.result_claim_idle_secs.saturating_mul(1000);
-        let interval_secs = self.config.result_claim_interval_secs.max(1);
+        let interval_secs = self.config.result_claim_interval_secs;
         // 观测面单独成任务，不搭清扫器的节拍：这个循环会在 tick 里就地 await
         // 一条重投消息的完整处理（可能几十分钟），测量挂在同一根节拍上就等于
         // "处理得越久，指标越静止"，而抓取面上一条静止的序列和一条干净流量的
