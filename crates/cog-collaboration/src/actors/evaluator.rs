@@ -102,7 +102,11 @@ impl EvaluatorActor {
                 activity, (2) whether what you actually read makes it hold, (3) whether it is \
                 what the goal asks for, (4) whether the now cell reads like what the tree \
                 shows - a reader following it would land on the same place, (5) whether the \
-                gap is exactly what the terminal still lacks and nothing else. \
+                gap is exactly what the terminal still lacks and nothing else, and \
+                (6) whether the terminal is the shortest description that still decides \
+                the same finished state - one that names steps or repeats the goal is \
+                longer than it has to be, and a reader of either lands in the same \
+                place. \
                 Answer one JSON object: {\"verdicts\": [{\"id\": \"...\", \
                 \"ok\": true|false, \"reason\": \"...\"}]}. The reason says what you read: a file and \
                 what it showed, or that you could not read it - an item you could not check is \
