@@ -149,7 +149,7 @@ fn fingerprint() -> Option<String> {
 /// `agent:<员工 id>` 上，历史因此是同一段。
 const SESSION_FOR_AGENT_PREFIX: &str = "agent:";
 
-fn session_for_employee(agent_id: &str) -> String {
+pub fn session_for_employee(agent_id: &str) -> String {
     format!("{SESSION_FOR_AGENT_PREFIX}{agent_id}")
 }
 

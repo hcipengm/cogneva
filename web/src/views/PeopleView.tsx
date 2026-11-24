@@ -40,6 +40,15 @@ import { Note } from '@/ui/Note';
  */
 
 /** 每种结局一句话，键取自端点类型本身：没配话的结局会把英文原词贴在灰字里。 */
+/**
+ * 员工页的会话 id：由员工 id 派生，同一员工永远同一段。
+ *
+ * 前缀必须与 `crates/cogneva/src/conversation.rs` 的
+ * `SESSION_FOR_AGENT_PREFIX` 一致（`agent:`）；后端按它把会话钉到被点名的
+ * 员工，不另收一个客户端字段。没有会话说过的池员工，也从这里得到第一段。
+ */
+const sessionFor = (agentId: string) => `agent:${agentId}`;
+
 const OUTCOME_LABEL: Record<AgentConversationLine['outcome'], { text: string; color: string }> = {
   queued: { text: '已送达，等它自己回', color: 'var(--muted)' },
   replied: { text: '已回', color: 'var(--ok)' },
@@ -225,7 +234,7 @@ function ChatLane({
         clientRef={clientRef}
       />
       <p className="px-3 pb-2 text-[10px] text-[var(--muted)]">
-        同时开着几段就排成几个名字，段与段互不打扰。每个人只在说话的那一段时间里活着，名下没有常驻进程；能接着跟他聊，是因为名字由会话 id 算出来。
+        同时开着几段就排成几个名字，段与段互不打扰。这一段是平台以这个员工身份跑的回合，不是池里的进程；能接着跟他聊，是因为会话 id 由他的工号/身份算出来。
       </p>
     </section>
   );
@@ -486,8 +495,11 @@ export function PeopleView() {
             })}
           </aside>
 
-          {chosen?.session_id ? (
-            <ChatLane employeeSessionId={chosen.session_id} employeeName={chosen.display_name} />
+          {chosen ? (
+            <ChatLane
+              employeeSessionId={chosen.session_id ?? sessionFor(chosen.agent_id)}
+              employeeName={chosen.display_name}
+            />
           ) : (
           <section className="flex min-h-0 flex-1 flex-col">
             <div className="flex shrink-0 items-center justify-between border-b border-[var(--line)] px-3 py-1.5 text-[11px] text-[var(--muted)]">
