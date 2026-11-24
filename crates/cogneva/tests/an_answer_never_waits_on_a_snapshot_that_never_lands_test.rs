@@ -18,12 +18,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use crate::common::kv::MemoryStore;
 use crate::common::orchestrator::control;
 
 use cog_core::{
-    AssistantMessageEvent, ChatOptions, ChatResponse, LlmClient, Message, SFError, SFResult,
-    SandboxBackend, SandboxPayload, SandboxRequest, SandboxResult, StopReason,
+    AssistantMessageEvent, ChatOptions, ChatResponse, KeyValueStore, LlmClient, Message, SFError,
+    SFResult, SandboxBackend, SandboxPayload, SandboxRequest, SandboxResult, StopReason,
 };
 use cog_gateway::chat::{ConversationRequest, ConversationTurn};
 use cogneva::conversation::{Ledgers, PlatformConversation};
@@ -111,6 +110,137 @@ impl LlmClient for Refusing {
     }
 }
 
+/// 这一段对话的「说过话的人 / 检查点」那一格：标量与哈希都收。
+///
+/// 这里不用套件里那个只做配额算术的替身：它在哈希字段上 `unreachable!()`，
+/// 而检查点正是按哈希存的——拿它当存储，失败的是夹具而不是被测的那一轮。
+#[derive(Default)]
+struct Store {
+    scalars: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    hashes: std::sync::Mutex<
+        std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    >,
+}
+
+#[async_trait]
+impl KeyValueStore for Store {
+    async fn get(&self, key: &str) -> SFResult<Option<String>> {
+        Ok(self.scalars.lock().unwrap().get(key).cloned())
+    }
+
+    async fn set(&self, key: &str, value: &str) -> SFResult<()> {
+        self.scalars
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), value.to_string());
+        Ok(())
+    }
+
+    async fn set_ex(&self, key: &str, value: &str, _ttl_secs: u64) -> SFResult<()> {
+        self.set(key, value).await
+    }
+
+    async fn del(&self, key: &str) -> SFResult<()> {
+        self.scalars.lock().unwrap().remove(key);
+        Ok(())
+    }
+
+    async fn expire(&self, _key: &str, _ttl_secs: i64) -> SFResult<()> {
+        Ok(())
+    }
+
+    async fn ttl(&self, _key: &str) -> SFResult<i64> {
+        Ok(-1)
+    }
+
+    async fn incr(&self, key: &str, by: i64) -> SFResult<i64> {
+        let mut scalars = self.scalars.lock().unwrap();
+        let next = scalars
+            .get(key)
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0)
+            + by;
+        scalars.insert(key.to_string(), next.to_string());
+        Ok(next)
+    }
+
+    async fn incr_ex(&self, key: &str, by: i64, _ttl_secs: u64) -> SFResult<i64> {
+        self.incr(key, by).await
+    }
+
+    async fn decr(&self, key: &str, by: i64) -> SFResult<i64> {
+        self.incr(key, -by).await
+    }
+
+    async fn sadd(&self, _key: &str, _member: &str) -> SFResult<()> {
+        Ok(())
+    }
+
+    async fn srem(&self, _key: &str, _member: &str) -> SFResult<()> {
+        Ok(())
+    }
+
+    async fn smembers(&self, _key: &str) -> SFResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    async fn hset(&self, key: &str, field: &str, value: &str) -> SFResult<()> {
+        self.hashes
+            .lock()
+            .unwrap()
+            .entry(key.to_string())
+            .or_default()
+            .insert(field.to_string(), value.to_string());
+        Ok(())
+    }
+
+    async fn hget(&self, key: &str, field: &str) -> SFResult<Option<String>> {
+        Ok(self
+            .hashes
+            .lock()
+            .unwrap()
+            .get(key)
+            .and_then(|hash| hash.get(field).cloned()))
+    }
+
+    async fn hdel(&self, key: &str, field: &str) -> SFResult<()> {
+        if let Some(hash) = self.hashes.lock().unwrap().get_mut(key) {
+            hash.remove(field);
+        }
+        Ok(())
+    }
+
+    async fn hvals(&self, key: &str) -> SFResult<Vec<String>> {
+        Ok(self
+            .hashes
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|hash| hash.values().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    async fn hgetall(&self, key: &str) -> SFResult<Vec<(String, String)>> {
+        Ok(self
+            .hashes
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|hash| hash.iter().map(|(f, v)| (f.clone(), v.clone())).collect())
+            .unwrap_or_default())
+    }
+
+    async fn hlen(&self, key: &str) -> SFResult<u64> {
+        Ok(self
+            .hashes
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|hash| hash.len() as u64)
+            .unwrap_or(0))
+    }
+}
+
 fn conversation(
     sandbox: Arc<dyn SandboxBackend>,
     people: Arc<dyn cog_core::KeyValueStore>,
@@ -139,7 +269,7 @@ async fn a_turn_ends_with_its_own_failure_while_the_opening_snapshot_never_lands
     let asked = Arc::clone(&executor);
     let conversation = conversation(
         executor,
-        Arc::new(MemoryStore::default()) as Arc<dyn cog_core::KeyValueStore>,
+        Arc::new(Store::default()) as Arc<dyn cog_core::KeyValueStore>,
     );
     let (events, mut seen) = tokio::sync::mpsc::channel(64);
     let outcome = conversation.turn(
