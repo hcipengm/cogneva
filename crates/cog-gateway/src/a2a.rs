@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
+use axum::Extension;
 use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -34,7 +35,7 @@ use futures::stream::Stream;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use cog_core::{
+use cog_core::{Claims, 
     A2aTask, A2aTaskStatus, A2aVersion, MessagePart, OrchestratorControl, Task, TaskArtifact,
     TaskMessage, TaskStatus,
 };
@@ -1060,6 +1061,7 @@ pub async fn message_stream_handler(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
     uri: Uri,
+    caller: Option<Extension<Claims>>,
     Json(body): Json<Value>,
 ) -> Response {
     let version = match requested_version(&headers, &uri) {
@@ -1072,7 +1074,7 @@ pub async fn message_stream_handler(
             return (StatusCode::OK, Json(rpc_error(&rpc_id, -32009, message))).into_response();
         }
     };
-    message_stream_for(state, body, version).await
+    message_stream_for(state, body, version, caller).await
 }
 
 /// 版本已经定下来之后的流式受理。
@@ -1084,6 +1086,7 @@ async fn message_stream_for(
     state: Arc<GatewayState>,
     body: Value,
     version: A2aVersion,
+    caller: Option<Extension<Claims>>,
 ) -> Response {
     let request = match parse_message_stream(&body) {
         Ok(request) => request,
@@ -1114,6 +1117,8 @@ async fn message_stream_for(
     } else {
         let mut goal_row = Task::goal_row(goal_id.clone(), &request.goal);
         goal_row.workspace_id = None;
+        goal_row.input["origin"] =
+            a2a_origin(caller.as_ref().map(|Extension(claims)| claims), request.message_id.as_deref());
         // 提交在开流之前等它落地，理由与 `message/send` 是同一个：这一行要读不回来，
         // 流能给出的只有「这一行从没出现过」——而那与「提交被拒」是两件事，对端要等
         // 满一个截止时间才能听到前者。拒了就当场报一帧，理由照实说。
@@ -1255,6 +1260,7 @@ pub async fn rpc_handler(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
     uri: Uri,
+    caller: Option<Extension<Claims>>,
     Json(body): Json<Value>,
 ) -> Response {
     let rpc_id = body.get("id").cloned().unwrap_or(Value::Null);
@@ -1266,10 +1272,10 @@ pub async fn rpc_handler(
     };
     match body.get("method").and_then(Value::as_str) {
         Some("message/send") | Some("SendMessage") => {
-            rpc_message_send(&state, &body, &rpc_id, version).await
+            rpc_message_send(&state, &body, &rpc_id, version, caller).await
         }
         Some("message/stream") | Some("SendStreamingMessage") => {
-            message_stream_for(state, body, version).await
+            message_stream_for(state, body, version, caller).await
         }
         Some("tasks/get") | Some("GetTask") => rpc_tasks_get(&state, &body, &rpc_id, version).await,
         Some("tasks/cancel") | Some("CancelTask") => {
@@ -1370,6 +1376,35 @@ fn accepted(goal_id: &str, submitted: cog_core::SFResult<Vec<String>>) -> Result
 ///
 /// **1.0 的 `SendMessage` 还有一层**：那一版规定不带 `configuration.returnImmediately`
 /// 时默认**阻塞**到任务进入终态或被打断（`INPUT_REQUIRED`/`AUTH_REQUIRED`）。这不是
+/// 这一条 A2A 请求的归属：谁提的、说给谁、哪一条消息。
+///
+/// 认证主体取的是中间件已经验过的那一份（`Claims`），不在这里再读一次
+/// `Authorization`——两处各验一次，第二次的结果没人保证与第一次相同。
+/// `addressed_to` 今天在 A2A 请求里没有显式目标（名片就是平台），写空串并在
+/// 字段说明里讲清；不拿 `messageId` 冒充「说给谁」。
+pub fn a2a_origin(caller: Option<&Claims>, message_id: Option<&str>) -> serde_json::Value {
+    let (said_by, said_by_name) = match caller {
+        Some(claims) => (
+            claims.sub.clone(),
+            Some(claims.preferred_username.clone()),
+        ),
+        // 没有令牌：这条连接没有身份。空串是「没有身份的那条连接」，不是「匿名用户」。
+        None => (String::new(), None),
+    };
+    let mut origin = json!({
+        "source": "a2a",
+        "said_by": said_by,
+        "addressed_to": "",
+    });
+    if let Some(name) = said_by_name {
+        origin["said_by_name"] = Value::String(name);
+    }
+    if let Some(id) = message_id {
+        origin["message_id"] = Value::String(id.to_string());
+    }
+    origin
+}
+
 /// 可选的风格差异，是同一份请求在两版里承诺不同的东西：0.3 的 `message/send` 回的是
 /// 「受理了」，1.0 回的是「跑完了」。按 0.3 的样子回给 1.0 的对端，它会拿一个
 /// `submitted` 当最终答复收工——比报错更糟，因为它不报错。
@@ -1378,6 +1413,7 @@ async fn rpc_message_send(
     body: &Value,
     rpc_id: &Value,
     version: A2aVersion,
+    caller: Option<Extension<Claims>>,
 ) -> Response {
     let request = match parse_message_stream(body) {
         Ok(request) => request,
@@ -1403,6 +1439,8 @@ async fn rpc_message_send(
 
     let mut goal_row = Task::goal_row(goal_id.clone(), &request.goal);
     goal_row.workspace_id = None;
+    goal_row.input["origin"] =
+        a2a_origin(caller.as_ref().map(|Extension(claims)| claims), request.message_id.as_deref());
     // 回执读的是库里的那一行，不是本地构造的这一份：受理之后状态可能已经被派工
     // 改过，对端要的是它现在是什么样。
     let row = match accept_goal(&orchestrator, &request.goal, goal_row).await {
@@ -1772,6 +1810,43 @@ async fn rpc_tasks_cancel(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn claims(sub: &str, name: &str) -> Claims {
+        Claims {
+            sub: sub.into(),
+            iss: "https://issuer".into(),
+            aud: "cogneva".into(),
+            exp: 0,
+            iat: 0,
+            jti: "j".into(),
+            token_use: Default::default(),
+            preferred_username: name.into(),
+            user_type: cog_core::UserType::Standard,
+            workspace_ids: Vec::new(),
+            permissions: Vec::new(),
+            roles: Vec::new(),
+        }
+    }
+
+    /// 归属写在 goal 行的 input 里：谁提的、说给谁、哪一条消息。空串是「这条连接
+    /// 没有身份」，不是编一个匿名用户；`addressed_to` 没有显式目标时就是空串，
+    /// 不拿 messageId 冒充。
+    #[test]
+    fn an_a2a_goal_carries_who_asked() {
+        let named = a2a_origin(Some(&claims("u-1", "owner")), Some("msg-7"));
+        assert_eq!(named["source"], "a2a");
+        assert_eq!(named["said_by"], "u-1");
+        assert_eq!(named["said_by_name"], "owner");
+        assert_eq!(named["addressed_to"], "");
+        assert_eq!(named["message_id"], "msg-7");
+
+        let anonymous = a2a_origin(None, None);
+        assert_eq!(anonymous["said_by"], "");
+        assert!(anonymous.get("message_id").is_none());
+        assert!(anonymous.get("said_by_name").is_none());
+    }
+
     use super::*;
     use axum::http::HeaderValue;
     use futures::StreamExt;
