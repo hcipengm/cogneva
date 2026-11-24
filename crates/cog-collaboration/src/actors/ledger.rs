@@ -17,6 +17,13 @@ use std::path::PathBuf;
 /// 改名时只改一处不会有任何东西红，只让那一侧永远读一个没人写的名字。
 const CLOSED_ROUNDS_ENV: &str = "COGNEVA_CLOSED_ROUNDS";
 
+/// 这一笔是谁做的。读不到就是默认的那个词——它不是权限，是事件上的署名。
+const ACTOR_ENV: &str = "COGNEVA_ACTOR";
+
+fn actor() -> String {
+    std::env::var(ACTOR_ENV).unwrap_or_else(|_| "worker".to_string())
+}
+
 /// 这台机器上这一本台账在哪。
 pub fn ledger_path() -> Result<PathBuf, String> {
     for key in ["COGNEVA_TODO_SOURCE", "COGNEVA_TODO_LEDGER"] {
@@ -971,7 +978,7 @@ fn event_round(batch: &[String], code_rev: &str) -> cog_core::RoundOpened {
         ledger_rev: String::new(),
         code_rev: code_rev.to_string(),
         batch: batch.to_vec(),
-        actor: std::env::var("COGNEVA_ACTOR").unwrap_or_else(|_| "worker".to_string()),
+        actor: actor(),
         at: chrono::Utc::now(),
     }
 }
@@ -1045,7 +1052,7 @@ pub async fn close(events: Option<&std::sync::Arc<dyn cog_core::RoundEvents>>) -
                 return 2;
             }
         };
-        let actor = std::env::var("COGNEVA_ACTOR").unwrap_or_else(|_| "worker".to_string());
+        let actor = actor();
         return match events.close(&current.round, &actor).await {
             Ok(()) => {
                 println!(
