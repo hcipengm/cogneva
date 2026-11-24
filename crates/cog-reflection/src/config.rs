@@ -437,6 +437,21 @@ impl ChangeJobConfig {
             Err(e) => return Err(SFError::Config(format!("{}: {e}", path.display()))),
         };
         cfg.apply_env_with(|k| std::env::var(k).ok())?;
+        if cfg.enabled {
+            // 声明了要派 Job，这两个数就是这份声明的执行面：0 秒是忙等，
+            // 0 个并发窗口等于一次也派不出去。读到它们的那一层从前各换成一个数，
+            // 声明的值与生效的值于是有两个。
+            declared_cadence(
+                "self_evolution.change_job.poll_interval_secs",
+                cfg.poll_interval_secs,
+            )?;
+            if cfg.max_parallel == 0 {
+                return Err(SFError::Config(
+                    "self_evolution.change_job.max_parallel 声明为 0：一次也派不出去的并发窗口不是一个窗口。至少给 1。"
+                        .into(),
+                ));
+            }
+        }
         Ok(cfg)
     }
 
@@ -1708,6 +1723,53 @@ mod tests {
         // 默认走 PATH 上的 kubectl：本 Pod 把 k3s 多调用二进制挂成
         // /usr/local/bin/kubectl（argv[0]=kubectl 即 kubectl），正好在 PATH 上。
         assert_eq!(ChangeJobConfig::default().kubectl_bin, "kubectl");
+    }
+
+    /// 声明要派 Job 时，节拍与并发窗口原样生效；0 秒与 0 个窗口被点名拒绝，
+    /// 而不是在读它们的那一层被换成 1。
+    #[test]
+    fn a_declared_change_job_cadence_and_window_survive_and_zero_is_refused() {
+        let dir =
+            std::env::temp_dir().join(format!("cog-reflection-cj-zero-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cogneva.json");
+
+        std::fs::write(
+            &path,
+            r#"{"self_evolution": {"change_job": {"enabled": true, "max_parallel": 2, "poll_interval_secs": 7}}}"#,
+        )
+        .unwrap();
+        let declared = ChangeJobConfig::load_from(&path).unwrap();
+        assert_eq!(declared.max_parallel, 2);
+        assert_eq!(declared.poll_interval_secs, 7);
+
+        std::fs::write(
+            &path,
+            r#"{"self_evolution": {"change_job": {"enabled": true, "poll_interval_secs": 0}}}"#,
+        )
+        .unwrap();
+        let refused = ChangeJobConfig::load_from(&path).unwrap_err().to_string();
+        assert!(
+            refused.contains("change_job.poll_interval_secs"),
+            "{refused}"
+        );
+
+        std::fs::write(
+            &path,
+            r#"{"self_evolution": {"change_job": {"enabled": true, "max_parallel": 0}}}"#,
+        )
+        .unwrap();
+        let refused = ChangeJobConfig::load_from(&path).unwrap_err().to_string();
+        assert!(refused.contains("max_parallel"), "{refused}");
+
+        // 关着的时候那两个数不执行任何东西，也就没有可拒的声明。
+        std::fs::write(
+            &path,
+            r#"{"self_evolution": {"change_job": {"enabled": false, "max_parallel": 0, "poll_interval_secs": 0}}}"#,
+        )
+        .unwrap();
+        assert!(ChangeJobConfig::load_from(&path).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
 
         let bad: HashMap<&str, &str> = [("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_MAX_PARALLEL", "nope")]
             .into_iter()

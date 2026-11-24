@@ -4034,7 +4034,7 @@ impl<'a> ChangeExecutor<'a> {
     fn window(&self) -> usize {
         match &self.job {
             None => 1,
-            Some(ctx) => ctx.config.max_parallel.max(1),
+            Some(ctx) => ctx.config.max_parallel,
         }
     }
 
