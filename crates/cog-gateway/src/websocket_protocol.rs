@@ -49,11 +49,6 @@ pub enum ClientMessage {
         #[serde(default)]
         session_id: Option<String>,
         content: String,
-        /// 这句话说给哪个员工。空是「这段对话没有指名某个人」——今天界面上
-        /// 还没有选人那一格，而「这句话是谁的待办」要靠它答；写下来比替它
-        /// 编一个名字强。
-        #[serde(default)]
-        addressed_to: Option<String>,
         #[serde(default)]
         attachments: Vec<cog_core::ChatAttachment>,
         #[serde(default)]
@@ -667,32 +662,6 @@ pub fn event_channels(event: &cog_core::AgentEvent) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    /// 一句话可以指名它说给哪个员工；不写就是没有指名——两种都是合法的到达，
-    /// 而「是谁的待办」只在写了的时候答得出来。
-    #[test]
-    fn a_chat_message_may_name_the_employee_it_is_for() {
-        let named: ClientMessage = serde_json::from_value(serde_json::json!({
-            "type": "chat_message",
-            "content": "把这批门禁的归属改回来",
-            "addressed_to": "emp-7",
-        }))
-        .expect("a well-formed chat message");
-        match named {
-            ClientMessage::ChatMessage { addressed_to, .. } => {
-                assert_eq!(addressed_to.as_deref(), Some("emp-7"))
-            }
-            other => panic!("解析成了别的形状：{other:?}"),
-        }
-        let unnamed: ClientMessage = serde_json::from_value(serde_json::json!({
-            "type": "chat_message",
-            "content": "把这批门禁的归属改回来",
-        }))
-        .expect("没有收件人也是合法的一句话");
-        match unnamed {
-            ClientMessage::ChatMessage { addressed_to, .. } => assert!(addressed_to.is_none()),
-            other => panic!("解析成了别的形状：{other:?}"),
-        }
-    }
 
     use super::*;
 

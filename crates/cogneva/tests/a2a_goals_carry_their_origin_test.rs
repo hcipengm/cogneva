@@ -21,6 +21,10 @@ fn both_a2a_goal_rows_carry_who_asked() {
             "这一处 goal 行没有写归属：{}",
             window.lines().next().unwrap_or("")
         );
+        assert!(
+            window.contains("intent_events"),
+            "这一处 goal 行没有先落一条意图行：三种来源要进同一本账"
+        );
     }
     assert_eq!(sites, 2, "A2A 的生产路径应当有两处 goal 行构造（流与 send），实际 {sites}");
     assert_eq!(

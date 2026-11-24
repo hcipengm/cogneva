@@ -2144,9 +2144,6 @@ pub async fn run_chat_turn(
     // 随这一句上来的图片 / PDF / 音频。数据保持 base64：交给循环的媒体块就是
     // 这个形状，网关不拆包也不重编。
     attachments: Vec<cog_core::ChatAttachment>,
-    // 这句话说给哪个员工。空是「没有指名某个人」：它照样是一条意图，只是
-    // 待办暂时不属于某一个员工。
-    addressed_to: String,
     // 这次对话属于谁。空串是「这条连接没有身份」——那时调用方不声明人，账落在
     // 没有人的那一格，与「声明了某个人」分开。
     owner: String,
@@ -2197,19 +2194,6 @@ pub async fn run_chat_turn(
             return;
         }
     };
-
-    // 0. 这一句先落成一条意图，再去回答它。
-    //
-    //    记录回答「这里有过一段对话」，不回答「这里有一件要办的事」——需要有人去
-    //    做的那句话，只要属主不再提起，就再没有一方会去做它。所以进门的这一句先
-    //    落到事件流上，由接手那一侧把它变成待办；落不进去不让这一轮失败，但计数
-    //    里看得见（见 [`crate::intent`]）。
-    //
-    //    `/命令` 是界面动作而不是一句要说的话：它展开成的是这一屏自己的操作，
-    //    记成意图会让每一次点命令都变成一件要办的事。
-    if command.is_none() {
-        crate::intent::record_turn(&session_id, &owner, &addressed_to, &content).await;
-    }
 
     // 1. Echo the user message so the UI renders it (the real transport has
     //    no local echo, unlike the mock client).

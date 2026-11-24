@@ -871,6 +871,15 @@ impl ConversationTurn for PlatformConversation {
             // 算出来的那个名字。
             let owner = Some(request.owner.as_str()).filter(|owner| !owner.trim().is_empty());
             let employee = self.employee_here(owner, &request.session_id).await;
+            if let Some(text) = last_user_text(&request.messages) {
+                cog_gateway::intent::record_turn(
+                    &request.session_id,
+                    request.owner.as_str(),
+                    &employee.id,
+                    &text,
+                )
+                .await;
+            }
             // 先把他记进「说过话的人」名册：注册表上的心跳在他闭嘴几十秒后就
             // 过期，而人要找的是「那个跟我聊过的人」。写不进去不是这一轮的
             // 失败——他照样能说话，只是名单上从此少一个人；这一句是那个差别的
@@ -5408,4 +5417,22 @@ mod tests {
             "撤掉全部规则之后，同类调用要重新问人"
         );
     }
+}
+
+/// 这一轮里属主说的那一句（最后一条用户消息里的文字块）。没有文字（只带了附件）
+/// 就不算「说了一句话」——意图行要的是原文。
+fn last_user_text(messages: &[cog_core::Message]) -> Option<String> {
+    messages.iter().rev().find_map(|message| match message {
+        cog_core::Message::User { content, .. } => {
+            let text: String = content
+                .iter()
+                .filter_map(|block| match block {
+                    cog_core::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            (!text.trim().is_empty()).then_some(text)
+        }
+        _ => None,
+    })
 }
