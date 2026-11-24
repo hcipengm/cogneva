@@ -250,6 +250,8 @@ jobs:
       # （或者反过来），说明判据在两边不是同一条。
       - name: Check the compile-discipline gate judges what it claims
         run: bash deploy/scripts/tests/compile-discipline.test.sh
+      - name: Check opening a round asks the batch planner
+        run: bash deploy/scripts/tests/ledger-open-asks-the-planner.test.sh
       # 跑在共享测试库上的测试，不许把整张表数一遍。`COGNEVA_TEST_DATABASE_URL`
       # 把整个套件指向同一份库，整表数行数等于断言「别的测试此刻有没有行」；
       # 而且踩中的那一跑常常 panic 在自己的 cleanup 之前，把它写的行留在库里，
