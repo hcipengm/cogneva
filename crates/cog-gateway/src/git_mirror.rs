@@ -117,11 +117,12 @@ const DEFAULT_MIRROR_OP_TIMEOUT_SECS: u64 = 1800;
 // cap: bound — lowest the deployment may set the operation timeout to; below it a large legitimate fetch is cut
 // wall: 等=不适用——这是别人被等多久的下限 / 等不到=不适用 / 续跑=不适用：低于它的配置会把一次正常的大 fetch 砍断，所以它挡的是配置，不是一次等待
 const MIRROR_OP_TIMEOUT_FLOOR_SECS: u64 = 60;
-/// 看门狗巡检间隔的上限；实际间隔按静默窗的四分之一取（见
-/// [`GitTransport::watchdog_interval`]），这样测试里把窗口压到秒级仍然判得准。
-// cap: bound — 巡检间隔的上限；要跟着静默窗走，测试把窗压到秒级仍判得准
-const MIRROR_WATCHDOG_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 /// 巡检间隔的下限：静默窗压到毫秒级（测试）时，别让巡检变成忙等。
+///
+/// 上限没有另立一个数：间隔就是静默窗的四分之一（见
+/// [`GitTransport::watchdog_interval`]），由它派生。曾经封顶五秒，那条上限让巡检
+/// 与窗口脱钩——窗口由实测沉默长到几百秒，巡检仍每五秒醒一次，比这条判据自己
+/// 说出的粒度细一个数量级。
 // cap: bound — 巡检间隔的下限；静默窗压到毫秒级（测试）时别让巡检变成忙等
 const MIRROR_WATCHDOG_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 /// 失败信息里保留的 stderr 尾巴长度：传输失败的**原因在最后几行**，而前几千行
@@ -807,11 +808,12 @@ impl GitExec {
         Ok(self.bounded(args, ssh, false).await?.stdout)
     }
 
-    /// 看门狗巡检间隔：静默窗的四分之一（封顶五秒）。由静默窗**派生**而不是
+    /// 看门狗巡检间隔：静默窗的四分之一，只有忙等的下限。由静默窗**派生**而不是
     /// 另立一个旋钮——两个独立旋钮必然会出现"窗口 30s、巡检 60s"这种判据比
-    /// 被判断的对象还粗的组合；测试里把窗口压到秒级时它也跟着变细。
+    /// 被判断的对象还粗的组合；测试里把窗口压到秒级时它也跟着变细，窗口被实测
+    /// 沉默拉长时它跟着变粗。
     fn watchdog_interval(&self) -> std::time::Duration {
-        (self.stall_window() / 4).clamp(MIRROR_WATCHDOG_MIN_INTERVAL, MIRROR_WATCHDOG_MAX_INTERVAL)
+        (self.stall_window() / 4).max(MIRROR_WATCHDOG_MIN_INTERVAL)
     }
 
     /// 跑一条 git 命令，等到它自己结束。
