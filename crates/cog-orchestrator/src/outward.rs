@@ -143,6 +143,8 @@ pub enum ConfigFault {
     Incomplete,
     /// Sources are configured but no search backend is named.
     NoEndpoint,
+    /// A source declares a cadence of zero or a hand-over of zero items.
+    Unusable,
 }
 
 impl ConfigFault {
@@ -154,6 +156,7 @@ impl ConfigFault {
             ConfigFault::Empty => "empty",
             ConfigFault::Incomplete => "incomplete",
             ConfigFault::NoEndpoint => "no_endpoint",
+            ConfigFault::Unusable => "unusable",
         }
     }
 
@@ -176,6 +179,11 @@ impl ConfigFault {
                 "outward queries are configured but no search backend is named, so there is \
                  nowhere to ask"
             }
+            ConfigFault::Unusable => {
+                "an outward source declares a cadence of zero seconds or a hand-over of zero \
+                 items: the first spins the loop and the second asks the backend for results \
+                 only to throw them away, so neither can be what its author meant"
+            }
         }
     }
 }
@@ -185,7 +193,7 @@ impl OutwardConfig {
     ///
     /// Fail-closed, like the other configuration-gated loops here: anything
     /// short of a complete list is not started, and the reason is returned
-    /// rather than swallowed, so the caller can record which of the five it was.
+    /// rather than swallowed, so the caller can record which of the six it was.
     pub fn from_env() -> Result<Self, ConfigFault> {
         let raw = std::env::var(QUERIES_ENV).ok();
         let base = std::env::var(SEARCH_BASE_ENV).ok();
@@ -213,9 +221,16 @@ impl OutwardConfig {
         {
             return Err(ConfigFault::Incomplete);
         }
-        for source in &mut sources {
-            source.cadence_secs = source.cadence_secs.max(60);
-            source.max_items = source.max_items.clamp(1, 20);
+        // 声明的值就是生效的值：这里不再把它们夹回区间。曾经 `max(60)` 与
+        // `clamp(1, 20)` 把部署写下的数悄悄换掉，读数面照旧报配置的样子，而跑的是
+        // 另一个数——同一个数在两边不一样，读的人只能靠猜。只剩两种值读不成任何
+        // 东西：0 秒的节奏是忙等，0 条的交接是「问完就扔」，都不是写它的人说得出口
+        // 的意思。
+        if sources
+            .iter()
+            .any(|s| s.cadence_secs == 0 || s.max_items == 0)
+        {
+            return Err(ConfigFault::Unusable);
         }
         let search_base = search_base
             .map(str::trim)
@@ -939,6 +954,35 @@ mod tests {
         assert_eq!(ok.sources[0].max_items, DEFAULT_MAX_ITEMS);
     }
 
+    /// A number the deployment states is the number in force.
+    ///
+    /// It used to be clamped back into a range on the way in: a source asking
+    /// for a five-second cadence or fifty items was run at sixty seconds and
+    /// twenty, and the configuration line still read as written. A zero is the
+    /// one value that cannot mean anything -- no interval at all, or results
+    /// asked for and thrown away -- so it is refused by name instead.
+    #[test]
+    fn a_declared_cadence_and_handover_survive_resolution() {
+        let declared = OutwardConfig::resolve(
+            Some(r#"[{"name":"a","query":"b","cadence_secs":5,"max_items":50}]"#),
+            Some("http://s"),
+        )
+        .expect("a complete configuration with values this loop can run");
+        assert_eq!(declared.sources[0].cadence_secs, 5);
+        assert_eq!(declared.sources[0].max_items, 50);
+
+        for raw in [
+            r#"[{"name":"a","query":"b","cadence_secs":0}]"#,
+            r#"[{"name":"a","query":"b","max_items":0}]"#,
+        ] {
+            assert_eq!(
+                OutwardConfig::resolve(Some(raw), Some("http://s")),
+                Err(ConfigFault::Unusable),
+                "{raw} 是两种读不成任何东西的值之一，必须点名拒绝而不是被悄悄换成别的数"
+            );
+        }
+    }
+
     #[test]
     fn every_refusal_has_its_own_cell_and_a_reason() {
         let cells: Vec<&str> = [
@@ -947,6 +991,7 @@ mod tests {
             ConfigFault::Empty,
             ConfigFault::Incomplete,
             ConfigFault::NoEndpoint,
+            ConfigFault::Unusable,
         ]
         .iter()
         .map(|f| f.cell())
