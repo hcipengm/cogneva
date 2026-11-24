@@ -11,8 +11,11 @@
 //!
 //! 这里判的就是那个次序：执行器的快照永远不回时，这一轮仍然按它自己的结局收尾，
 //! 而且是**当场**收尾。把同步等待放回去，这一条当场红（十秒的界都过不去）。
+//!
+//! 另一半同样在这里判：回答不等它，**命令仍然等**。快照拍的是这一轮动手之前的
+//! 树，命令赶在它前面就拍不到那张树了。两条合起来才是这次改动的那条次序。
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,8 +24,9 @@ use async_trait::async_trait;
 use crate::common::orchestrator::control;
 
 use cog_core::{
-    AssistantMessageEvent, ChatOptions, ChatResponse, KeyValueStore, LlmClient, Message, SFError,
-    SFResult, SandboxBackend, SandboxPayload, SandboxRequest, SandboxResult, StopReason,
+    AssistantMessageEvent, ChatOptions, ChatResponse, ContentBlock, KeyValueStore, LlmClient,
+    Message, SFError, SFResult, SandboxBackend, SandboxPayload, SandboxRequest, SandboxResult,
+    StopReason, ToolRegistry as _,
 };
 use cog_gateway::chat::{ConversationRequest, ConversationTurn};
 use cogneva::conversation::{Ledgers, PlatformConversation};
@@ -244,12 +248,13 @@ impl KeyValueStore for Store {
 fn conversation(
     sandbox: Arc<dyn SandboxBackend>,
     people: Arc<dyn cog_core::KeyValueStore>,
+    tools: Option<Arc<cog_agent::ToolRegistry>>,
 ) -> PlatformConversation {
     PlatformConversation::new(
         control("test-workspace"),
         None,
         None,
-        None,
+        tools,
         None,
         None,
         Some(people),
@@ -270,6 +275,7 @@ async fn a_turn_ends_with_its_own_failure_while_the_opening_snapshot_never_lands
     let conversation = conversation(
         executor,
         Arc::new(Store::default()) as Arc<dyn cog_core::KeyValueStore>,
+        None,
     );
     let (events, mut seen) = tokio::sync::mpsc::channel(64);
     let outcome = conversation.turn(
@@ -312,5 +318,155 @@ async fn a_turn_ends_with_its_own_failure_while_the_opening_snapshot_never_lands
     assert!(
         error.to_string().contains("503"),
         "收尾的那句话不是上游拒绝的原文：{error}"
+    );
+}
+
+/// 一张拍得很慢的快照：命令那一侧必须等它，它自己不等任何人。
+///
+/// 它把「命令是不是赶在快照前面动了手」记在自己身上——这个次序没有别处读得出。
+#[derive(Default)]
+struct SlowSnapshot {
+    snapshot_done: AtomicBool,
+    commands: AtomicUsize,
+    command_came_first: AtomicBool,
+}
+
+fn empty_result() -> SandboxResult {
+    SandboxResult {
+        stdout: String::new(),
+        stderr: String::new(),
+        exit_code: 0,
+        output: None,
+        duration_ms: 0,
+        resource_usage: Default::default(),
+        workdir: None,
+    }
+}
+
+#[async_trait]
+impl SandboxBackend for SlowSnapshot {
+    async fn execute(&self, req: &SandboxRequest) -> SFResult<SandboxResult> {
+        match &req.payload {
+            SandboxPayload::CaptureCheckpoint { .. } => {
+                // 真后端拍一张也要走一趟换版的远端读盘：慢，但不是永远不回。
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                self.snapshot_done.store(true, Ordering::SeqCst);
+                Ok(empty_result())
+            }
+            _ => {
+                self.commands.fetch_add(1, Ordering::SeqCst);
+                if !self.snapshot_done.load(Ordering::SeqCst) {
+                    self.command_came_first.store(true, Ordering::SeqCst);
+                }
+                Ok(empty_result())
+            }
+        }
+    }
+
+    async fn precompile(&self, _bytes: &[u8]) -> SFResult<String> {
+        Err(SFError::Agent("这一条不编 wasm".into()))
+    }
+}
+
+/// 第一轮就要跑一条命令、第二轮收尾的模型。
+struct WantsACommand {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl LlmClient for WantsACommand {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _options: &ChatOptions,
+    ) -> SFResult<cog_core::AssistantMessageEventStream> {
+        let nth = self.calls.fetch_add(1, Ordering::SeqCst);
+        let (content, stop_reason) = if nth == 0 {
+            (
+                vec![ContentBlock::ToolCall {
+                    id: "call-1".into(),
+                    name: "run_command".into(),
+                    arguments: serde_json::json!({ "command": "echo hi" }),
+                    thought_signature: None,
+                }],
+                StopReason::ToolUse,
+            )
+        } else {
+            (vec![ContentBlock::text("命令跑完了。")], StopReason::Stop)
+        };
+        let (stream, mut producer) = cog_core::EventStream::with_capacity(4);
+        tokio::spawn(async move {
+            producer.end(ChatResponse {
+                content,
+                stop_reason,
+                api: "mock".into(),
+                provider: "mock".into(),
+                model: "mock".into(),
+                ..ChatResponse::default()
+            });
+        });
+        Ok(stream)
+    }
+
+    async fn complete_stream(
+        &self,
+        _prompt: &str,
+        _options: &cog_core::CompleteOptions,
+    ) -> SFResult<cog_core::AssistantMessageEventStream> {
+        Err(SFError::Agent("这一条不发补全".into()))
+    }
+
+    async fn chat(&self, _messages: &[Message], _options: &ChatOptions) -> SFResult<ChatResponse> {
+        Err(SFError::Agent("这一条不走非流式".into()))
+    }
+
+    async fn health_check(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn the_first_command_still_waits_for_the_opening_snapshot() {
+    let executor = Arc::new(SlowSnapshot::default());
+    let counter = Arc::clone(&executor);
+    let tools = cog_agent::ToolRegistry::new();
+    cog_core::ToolRegistry::register(&tools, cog_agent::tools::builtins::run_command());
+    let conversation = conversation(
+        executor,
+        Arc::new(Store::default()) as Arc<dyn cog_core::KeyValueStore>,
+        Some(Arc::new(tools)),
+    );
+    let (events, mut seen) = tokio::sync::mpsc::channel(64);
+    // 这一轮发的事件比一轮纯回答多，有人要在场把它读掉，不然发送端会顶住。
+    tokio::spawn(async move { while seen.recv().await.is_some() {} });
+    let outcome = conversation.turn(
+        ConversationRequest {
+            session_id: "s-command-after-snapshot".into(),
+            owner: "alice".into(),
+            messages: vec![Message::user("跑一条命令")],
+            llm: Arc::new(WantsACommand {
+                calls: AtomicUsize::new(0),
+            }),
+            platform: Some("web".into()),
+            device_id: None,
+            model: None,
+            // 跑命令在默认模式下要问人；这条判的是次序，模式取不问人的那一档。
+            permission_mode: "bypass".into(),
+            permissions: None,
+        },
+        events,
+    );
+    let settled = tokio::time::timeout(Duration::from_secs(10), outcome)
+        .await
+        .expect("这一轮在十秒内没有收尾");
+    settled.expect("这一轮应当跑完并交出答案");
+    assert_eq!(
+        counter.commands.load(Ordering::SeqCst),
+        1,
+        "这一轮没有真的跑过那条命令：命令那一侧的次序判不了"
+    );
+    assert!(
+        !counter.command_came_first.load(Ordering::SeqCst),
+        "命令赶在会话开头那张快照之前动了手：这张快照不再是「会话开头的树」"
     );
 }
