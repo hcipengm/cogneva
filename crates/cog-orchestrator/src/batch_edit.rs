@@ -15,50 +15,67 @@ use std::sync::Arc;
 type EditVerdict = (Vec<String>, Vec<(String, String)>);
 
 /// 读一次 2.5 的判词，返回（通过的 id，未通过的「id + 理由」）。
+///
+/// 判词向产品自己问（`cogneva ledger editing`），不再 `python3` 调一份带外脚本：
+/// 同一问在两处实现，改一处另一处不会红，而两边的答案在读数上同形。这里只做转交与
+/// 解析——「哪几条改完了」的判据在产品里。
 fn edit_verdict(root: &std::path::Path) -> Result<EditVerdict, String> {
-    let reader = root.join("scripts/hooks/edit-reading.py");
-    let out = Command::new("python3")
-        .arg(&reader)
-        .arg("--root")
-        .arg(root)
-        .arg("--stage")
-        .arg("edit")
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("找不到自己的可执行文件，问不了这一批：{e}"))?;
+    let out = Command::new(&exe)
+        .current_dir(root)
+        .arg("ledger")
+        .arg("editing")
         .output()
-        .map_err(|e| format!("run {}: {e}", reader.display()))?;
-    // 判词脚本的契约是 0=全真、1=有假、2=读不到。**其余任何退出码都不是判词**：
-    // 未捕获异常是 1、被信号杀死是 `None`——把这两种读成「有假」都还好，读成「全真」
-    // 就是把一次崩溃报成了绿。所以只认 0 与 1，别的都当「判不了」。
-    match out.status.code() {
-        Some(0) | Some(1) => {}
-        _ => {
-            return Err(format!(
-                "{} 没有给出判词（退出码 {:?}）：{}",
-                reader.display(),
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ))
-        }
+        .map_err(|e| format!("run {}: {e}", exe.display()))?;
+    // 契约：0 全真、1 有假、2 判不了。别的退出码都不是判词（崩了、被信号杀死）。
+    let code = out.status.code();
+    if !matches!(code, Some(0) | Some(1) | Some(2)) {
+        return Err(format!(
+            "{} 没有给出判词（退出码 {code:?}）：{}",
+            exe.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
-    // 退出码 1 有两种来路：判词说「有假」，或者脚本自己崩了（Python 未捕获异常也是
-    // 1）。前者一定有 `代码=false` 行，后者一行判词都没有——把后者读成「全真」正是
-    // 这一族最贵的形状，所以这里要求 1 必须带着判词回来。
-    let text = String::from_utf8_lossy(&out.stdout);
+    parse_editing(
+        code,
+        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&out.stderr),
+        &exe.display().to_string(),
+    )
+}
+
+/// 把 `ledger editing` 那一问的判词读成两半。拆出来是因为它是这一段里唯一有形状的
+/// 地方：退出码、两种行、以及「一却没有 TODO 行 ⇒ 崩了」那条。
+fn parse_editing(
+    code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    who: &str,
+) -> Result<EditVerdict, String> {
+    if code == Some(2) {
+        return Err(stderr.trim().to_string());
+    }
+    let text = stdout;
     let mut ok = Vec::new();
     let mut missing = Vec::new();
     for line in text.lines() {
-        let line = line.trim_start();
-        if let Some(rest) = line.strip_prefix("代码=true") {
-            ok.push(rest.trim().to_string());
-        } else if let Some(rest) = line.strip_prefix("代码=false") {
-            let (id, why) = rest.split_once('：').unwrap_or((rest, ""));
-            missing.push((id.trim().to_string(), why.trim().to_string()));
+        let line = line.trim();
+        if let Some(id) = line.strip_prefix("可以 ") {
+            ok.push(id.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("TODO ") {
+            let (id, why) = rest.split_once('（').unwrap_or((rest, ""));
+            missing.push((
+                id.trim().to_string(),
+                why.trim_end_matches('）').trim().to_string(),
+            ));
         }
     }
-    if out.status.code() == Some(1) && missing.is_empty() {
+    // 退出码 1 必须带着判词回来：一行 `TODO` 都没有的一，是崩了，不是判词。
+    if code == Some(1) && missing.is_empty() {
         return Err(format!(
-            "{} 退出码是 1，却没有一行 `代码=false`——那是脚本崩了，不是判词：{}",
-            reader.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
+            "{who} 退出码是 1，却没有一行 `TODO`——那不是判词：{}",
+            stderr.trim()
         ));
     }
     Ok((ok, missing))
@@ -172,6 +189,24 @@ mod tests {
             *self.0.lock().unwrap() = Some(batch.to_string());
             Ok(serde_json::json!({ "diff": format!("for {batch}") }))
         }
+    }
+
+    /// 判词的两种行各读一半；一却没有 `TODO` 行是崩了，不是「全真」。
+    #[test]
+    fn the_edit_verdict_reads_both_lines_and_refuses_a_bare_one() {
+        let (ok, missing) = parse_editing(
+            Some(1),
+            "可以 N01\nTODO N02（触点 crates/a 一处都没动）\n",
+            "",
+            "x",
+        )
+        .unwrap();
+        assert_eq!(ok, vec!["N01".to_string()]);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0, "N02");
+        assert!(missing[0].1.contains("crates/a"));
+        assert!(parse_editing(Some(1), "", "boom", "x").is_err());
+        assert!(parse_editing(Some(2), "", "台账读不到", "x").is_err());
     }
 
     /// 整批一次进：请求里带的是整批，不是一条。

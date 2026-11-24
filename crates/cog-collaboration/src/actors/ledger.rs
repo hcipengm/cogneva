@@ -426,7 +426,14 @@ fn editing_verdict() -> GateOutcome {
         .map(|i| (i.id.clone(), touches.get(&i.id).cloned().unwrap_or_default()))
         .collect();
     match judge_editing(&pairs, &touched) {
-        Ok(()) => GateOutcome::Allow(format!("ledger: 这一批 {} 条的触点都动到了。", pairs.len())),
+        Ok(()) => {
+            // 逐条印「可以 id」：调用方（`cogneva batch-edit`）要知道这一批是哪几条，
+            // 一个总数说不出「谁」。
+            for (id, _) in &pairs {
+                println!("可以 {id}");
+            }
+            GateOutcome::Allow(format!("ledger: 这一批 {} 条的触点都动到了。", pairs.len()))
+        }
         Err(missing) => GateOutcome::Refuse(format!(
             "pre-commit（批次）：这一轮的批还没编辑完，先别提交。\n  {}",
             missing.join("\n  ")
