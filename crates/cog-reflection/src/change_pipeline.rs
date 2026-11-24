@@ -8467,14 +8467,21 @@ index 1111111..2222222 100644
     }
 
     /// 在 `bin` 下放一个可执行、退 `exit` 的脚本，冒充一个组件二进制。
+    ///
+    /// 先写临时名再 `rename`：并行跑的别的测试线程正在 `fork`/`exec` 时，那个孩子会
+    /// 继承这里打开着的写句柄；直接写在最终名下，紧接着的 `exec` 会拿到 `ETXTBSY`——
+    /// 2026-11-24 全量跑里这一条就这样红过一次（单跑绿）。换名后写到的是另一个 inode，
+    /// 孩子手里的句柄不再挡最终那个名字。
     #[cfg(unix)]
     fn write_stub(bin: &std::path::Path, name: &str, exit: i32) {
         use std::os::unix::fs::PermissionsExt;
-        let path = bin.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\nexit {exit}\n")).unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        let staged = bin.join(format!(".{name}.staged"));
+        std::fs::write(&staged, format!("#!/bin/sh\nexit {exit}\n")).unwrap();
+        let mut perms = std::fs::metadata(&staged).unwrap().permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
+        std::fs::set_permissions(&staged, perms).unwrap();
+        let path = bin.join(name);
+        std::fs::rename(&staged, &path).unwrap();
     }
 
     /// 编译器包装器不得进入判据进程，两个方向都钉死：白名单里现在没有，将来加回来
