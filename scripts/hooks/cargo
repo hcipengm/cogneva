@@ -4,7 +4,7 @@
 # 默认是**全量编辑**：这一轮所有未完成的待办，一次改完，再编译一次。所以这个垫片在
 # 脏树上做两件事：
 #
-#   1. 跑 `family.py --all-todos`：把「未完成待办的触点 ∪ 工作区改动」作为默认批次，
+#   1. 跑 `cogneva ledger editing`：把「未完成待办的触点」作为默认批次，
 #      有缺口（待办点名了但还没改的文件、或者没写触点的待办）就**拒绝编译**，
 #      并把缺口打出来——它给的不是禁令，是下一步该改什么。
 #   2. 记一行账：时间、工作树、参数、HEAD、树指纹。推之前那道门用它判两件事——
@@ -21,9 +21,10 @@ set -u
 real_cargo="${REAL_CARGO:-$HOME/.cargo/bin/cargo}"
 ledger="${COGNEVA_COMPILE_LEDGER:-$HOME/.local/state/cogneva/compile-ledger.tsv}"
 # 这个垫片被装在 PATH 上（/usr/local/bin 或 ~/.local/bin），所以它**不能**从自己的
-# 位置找 `family.py`——那份工具跟着仓库走，位置由当前工作树决定。
+# 位置找判词——判词在产品里（`cogneva ledger ...`），二进制跟着仓库走，位置由当前
+# 工作树决定（`COGNEVA_BIN` 可以覆盖）。
 toplevel="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-family="${toplevel:+$toplevel/scripts/hooks/family.py}"
+ledger_bin="${COGNEVA_BIN:-${toplevel:+$toplevel/target/debug/cogneva}}"
 
 sub="${1:-}"
 # 两类命令分开：**只读类型检查**（`check`）随时可以跑——它不产出可推送的
@@ -44,19 +45,18 @@ fi
 
 # 判据是「这一轮开工以来改了什么」，不是「工作树干不干净」：每做完一小块就提交的人，
 # 工作树永远是干净的，按脏树判等于把门整个跳过——而漏下的子集正是这样漏掉的。
-# 没有开着一轮、或者事件流读不到：**判不了**，不是「没有缺口」。判不了就不许编译——
-# 没有轮的时候 family 会退回「与 origin/main 的差」，那是整段历史，看起来毫无缺口。
-if [ -f "$toplevel/scripts/hooks/round.py" ]; then
-  if ! round_out=$(python3 "$toplevel/scripts/hooks/round.py" status 2>&1); then
+# 没有开着一轮、或者事件流读不到：**判不了**，不是「没有缺口」。判不了就不许编译。
+if [ -n "$ledger_bin" ] && [ -x "$ledger_bin" ]; then
+  if ! round_out=$("$ledger_bin" ledger status 2>&1); then
     case "$round_out" in
-      *"还剩"*) : ;;
+      *"条未完成"*) : ;;
       *)
         printf '%s\n' "$round_out" >&2
         cat >&2 <<'EOF'
 
 cargo: 这一轮判不了，先别编译。
 
-  要么没有开着一轮（`scripts/hooks/round.py open`），要么事件流读不到。
+  要么没有开着一轮（`cogneva ledger open`），要么台账或事件流读不到。
   「判不了」与「没有缺口」是两件事：退回「与 origin/main 的差」会把整段历史
   当成这一轮的改动，缺口一律看不见。
 EOF
@@ -79,7 +79,7 @@ EOF
   exit 1
 fi
 
-if [ "$builds" = "1" ] && [ -f "$family" ] && [ -f "$toplevel/scripts/hooks/round.py" ]; then
+if [ "$builds" = "1" ] && [ -n "$ledger_bin" ] && [ -x "$ledger_bin" ]; then
   if [ -z "${COGNEVA_BATCH_SPLIT:-}" ]; then
     # 垫片按**三格**判，不按触点判（属主 2026-11-21：「先把整批编辑完，再编译一次」）。
     # 按触点判的版本让「改一条、编一次、再改下一条」变成合法的，而那正是把同一份验证
@@ -88,13 +88,13 @@ if [ "$builds" = "1" ] && [ -f "$family" ] && [ -f "$toplevel/scripts/hooks/roun
     #
     # `cargo check` 不受此限（它不产出可推送的字节），编辑期间随时可用；`build`/`test`
     # 要等整批填完。这不是禁令，是把「一次编译」从习惯变成判据。
-    if ! python3 "$family" --root "$toplevel" --all-todos; then
+    if ! "$ledger_bin" ledger editing; then
       cat >&2 <<'EOF'
 
 cargo: 这一轮还有待办没改完，先别编译。
 
-  上面每一条 TODO 都是「这一轮该改、但还没改」的地方：待办点名的触点、或者从仓库
-  那几张配套表反查出来的缺口。默认的做法是把它们一次改完，再编译一次。
+  上面每一条 TODO 都是「这一轮该改、但还没改」的地方（待办点名的触点）。默认的做法
+  是把它们一次改完，再编译一次。
 
   如果这一轮确实要拆，就在编译前声明三条理由之一（会随提交进历史，推之前还要被判一次）：
 
