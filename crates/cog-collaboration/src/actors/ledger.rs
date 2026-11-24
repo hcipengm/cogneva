@@ -103,8 +103,9 @@ pub async fn run(events: Option<std::sync::Arc<dyn cog_core::RoundEvents>>) -> i
         Some("gate") => gate(),
         Some("editing") => editing(),
         Some("stop-gate") => stop_gate(),
+        Some("compiled") => compiled(),
         Some(other) => {
-            eprintln!("ledger: 不认识的动作 `{other}`（今天有 `status`、`next`、`open`、`close`、`gate`、`editing` 与 `stop-gate`）");
+            eprintln!("ledger: 不认识的动作 `{other}`（今天有 `status`、`next`、`open`、`close`、`gate`、`editing`、`stop-gate` 与 `compiled`）");
             2
         }
     }
@@ -141,6 +142,167 @@ pub enum GateOutcome {
     Allow(String),
     Refuse(String),
     Unreadable(String),
+}
+
+/// `cogneva ledger compiled`：编译纪律——这一推的内容，是不是在最后一次编辑之后编过；
+/// 这一批编了几次。
+///
+/// 账本由编译垫片每调用一次记一行（时间、工作树、参数、HEAD、指纹）。判据两条：
+/// 涉及的文件里最新的一次修改晚于这棵树上最后一次编译 ⇒ 拒；次数是**读数**不是判据
+/// （属主 2026-11-21：红了改到绿，跑几次就记几次）。
+///
+/// 返回码：0 过、1 拒、3 没判（账本读不到、基线读不出、没有改动——「量不到」不是零次）。
+pub fn compiled() -> i32 {
+    let mut root = std::env::current_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_default();
+    let mut base = std::env::var("COGNEVA_PUSH_BASE").unwrap_or_else(|_| "origin/main".to_string());
+    let mut ledger = std::path::PathBuf::from(
+        std::env::var("COGNEVA_COMPILE_LEDGER").unwrap_or_else(|_| {
+            format!("{}/.local/state/cogneva/compile-ledger.tsv", home())
+        }),
+    );
+    let args: Vec<String> = std::env::args().skip(3).collect();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--root" if i + 1 < args.len() => {
+                root = args[i + 1].clone();
+                i += 2;
+            }
+            "--base" if i + 1 < args.len() => {
+                base = args[i + 1].clone();
+                i += 2;
+            }
+            "--ledger" if i + 1 < args.len() => {
+                ledger = std::path::PathBuf::from(&args[i + 1]);
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    judge_compile_discipline(&root, &base, &ledger)
+}
+
+/// 垫片记下的那些编译时刻（只这一棵树、只编译类的子命令）。
+fn compile_times(ledger: &std::path::Path, worktree: &str) -> Option<Vec<chrono::DateTime<chrono::Utc>>> {
+    let text = std::fs::read_to_string(ledger).ok()?;
+    let here = std::fs::canonicalize(worktree).unwrap_or_else(|_| std::path::PathBuf::from(worktree));
+    let mut times = Vec::new();
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 3 || !is_compile_argv(parts[2]) {
+            continue;
+        }
+        let where_ = std::fs::canonicalize(parts[1]).unwrap_or_else(|_| std::path::PathBuf::from(parts[1]));
+        if where_ != here {
+            continue;
+        }
+        if let Ok(at) = chrono::DateTime::parse_from_rfc3339(parts[0]) {
+            times.push(at.with_timezone(&chrono::Utc));
+        }
+    }
+    times.sort();
+    Some(times)
+}
+
+/// 这一条 cargo 参数是不是「一次编译」：第一个不是选项的词是 `check`/`build`/`test` 之类。
+fn is_compile_argv(argv: &str) -> bool {
+    const COUNTS: [&str; 10] = [
+        "check", "build", "test", "clippy", "run", "bench", "doc", "nextest", "install", "fix",
+    ];
+    const SKIPS: [&str; 9] = [
+        "fmt", "metadata", "tree", "locate-project", "pkgid", "vendor", "search", "login", "publish",
+    ];
+    let sub = argv.split_whitespace().find(|t| !t.starts_with('-'));
+    match sub {
+        Some(word) if !SKIPS.contains(&word) => COUNTS.contains(&word),
+        _ => false,
+    }
+}
+
+fn judge_compile_discipline(root: &str, base: &str, ledger: &std::path::Path) -> i32 {
+    let Some(times) = compile_times(ledger, root) else {
+        println!("compile-discipline: 这台机器没有编译账本（未装垫片），这一推没判。");
+        return 3;
+    };
+    if times.is_empty() {
+        println!("compile-discipline: 这棵树上没有编译记录，这一推不判。");
+        return 0;
+    }
+    // 基准：这一轮开工时的代码 rev（与另外两道门同一个数），没有就用 `--base`。
+    let (repo, ok) = git(root, &["rev-parse", "--show-toplevel"]);
+    let pinned = if ok && !repo.is_empty() {
+        round_code_rev(&repo)
+    } else {
+        None
+    };
+    let baseline = pinned.clone().unwrap_or_else(|| base.to_string());
+    let (diff, ok) = git(root, &["diff", "--name-only", &baseline]);
+    if !ok {
+        eprintln!("compile-discipline: git diff {baseline} 读不出来 —— 这一推没判。");
+        return 3;
+    }
+    let files: Vec<std::path::PathBuf> = diff
+        .lines()
+        .filter(|l| l.trim().ends_with(".rs"))
+        .map(|l| std::path::Path::new(root).join(l.trim()))
+        .collect();
+    if files.is_empty() {
+        println!("compile-discipline: 与基线相比没有改动，这一推不判。");
+        return 0;
+    }
+    let newest = files
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok()?.modified().ok())
+        .map(chrono::DateTime::<chrono::Utc>::from)
+        .max();
+    let last = *times.last().expect("checked non-empty");
+    let Some(newest) = newest else {
+        println!("compile-discipline: 涉及的文件都读不到修改时间，这一推不判。");
+        return 3;
+    };
+    if newest > last {
+        eprintln!(
+            "FAIL: 这一推涉及的文件在最后一次编译之后又改过。\n      最新的修改：{}；最后一次编译：{}\n      先把这一批编辑全部做完，再编译一次；这就是「默认全量编辑」的判据。",
+            newest.to_rfc3339(),
+            last.to_rfc3339()
+        );
+        return 1;
+    }
+    // 这一批最早的提交时刻：`<base>..HEAD` 里最大的那一个。
+    let (stamps, _) = git(root, &["log", "--format=%ct", &format!("{base}..HEAD")]);
+    let first = stamps
+        .split_whitespace()
+        .filter_map(|s| s.parse::<i64>().ok())
+        .max()
+        .and_then(|s| chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0))
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+    let in_batch = times.iter().filter(|t| **t >= first).count();
+    let source = if pinned.is_some() { "这一轮的 code_rev" } else { "基线" };
+    println!(
+        "compile-discipline: 按{source} {} 判；一批 {in_batch} 次编译，最后一次在全部编辑之后。",
+        &baseline[..baseline.len().min(12)]
+    );
+    0
+}
+
+/// 轮书上记着的代码 rev（没有开着一轮或读不到：`None`）。
+fn round_code_rev(repo: &str) -> Option<String> {
+    let (sha, ok) = git(repo, &["rev-parse", "--verify", "--quiet", ROUND_REF]);
+    if !ok || sha.is_empty() {
+        return None;
+    }
+    let (body, ok) = git(repo, &["cat-file", "-p", &sha]);
+    if !ok {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&body)
+        .ok()?
+        .get("code_rev")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// `cogneva ledger stop-gate`：收工钩子要的那一问——**现在能不能停**。
@@ -663,6 +825,17 @@ mod tests {
         assert_eq!(round.ledger_rev, "");
         assert_eq!(round.code_rev, "abc123");
         assert!(!round.round.is_empty());
+    }
+
+    /// 哪些 cargo 调用算「一次编译」：只读的元数据查询不算，也不要求它们之后重编。
+    #[test]
+    fn only_a_compile_counts_as_a_compile() {
+        assert!(is_compile_argv("test --workspace"));
+        assert!(is_compile_argv("check -p cog-core"));
+        assert!(is_compile_argv("-v build"));
+        assert!(!is_compile_argv("metadata --format-version 1"));
+        assert!(!is_compile_argv("fmt"));
+        assert!(!is_compile_argv("--version"));
     }
 
     /// 触点动过才算编辑过；目录触点读作「它下面任何一个文件动了」。
