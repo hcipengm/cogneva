@@ -492,7 +492,7 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
     ),
     (
         EVOLUTION,
-        "impl WorkItemGraph for LateWorkGraph",
+        "impl cog_core::contract::work_item::WorkItemGraph for LateWorkGraph",
         "get_task_checked",
         "读不到被读成「没有这一行」，一条自进化的任务被当成不存在",
     ),
