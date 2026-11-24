@@ -70,7 +70,8 @@ use crate::signal_readings::{SignalOutcome, SignalWatcherReadings};
 pub struct SignalWatcherConfig {
     /// Master switch.
     pub enabled: bool,
-    /// Poll interval (seconds); floor 60.
+    /// Poll interval (seconds). 声明的值原样生效；0 秒在加载时点名拒绝
+    /// （那是忙等，不是一个节拍）。
     pub poll_interval_secs: u64,
     /// Same-signature failures within the window that trigger an intent.
     pub failure_recurrence_threshold: usize,
@@ -191,6 +192,10 @@ impl SignalWatcherConfig {
                 cog_core::SFError::Config(format!("COGNEVA_SELF_AUDIT_INTERVAL_SECS: {v}"))
             })?;
         }
+        crate::config::declared_cadence(
+            "self_evolution.signal_watcher.poll_interval_secs",
+            cfg.poll_interval_secs,
+        )?;
         Ok(cfg)
     }
 }
@@ -2317,7 +2322,7 @@ pub fn spawn_signal_watcher_loop(
     readings: Arc<SignalWatcherReadings>,
     llm_gate: Option<Arc<dyn cog_core::SchedulerGate>>,
 ) -> tokio::task::JoinHandle<()> {
-    let interval = Duration::from_secs(config.poll_interval_secs.max(60));
+    let interval = Duration::from_secs(config.poll_interval_secs);
     info!(
         interval_secs = interval.as_secs(),
         failure_recurrence_threshold = config.failure_recurrence_threshold,

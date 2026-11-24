@@ -33,7 +33,8 @@ pub struct PolicyEvolutionConfig {
     /// 总开关。默认开：这条循环的输入全部是本进程已记录的结果，副作用只
     /// 落在本进程自己的策略目录里，不需要按部署指定属主。
     pub enabled: bool,
-    /// 相邻两轮之间的间隔（秒），下限 60。
+    /// 相邻两轮之间的间隔（秒）。声明的值原样生效；0 秒在加载时点名拒绝
+    /// （那是忙等，不是一个节拍）。
     pub interval_secs: u64,
     /// 演化的策略名。参数语义由该策略的读取方决定，换名字等于换策略。
     ///
@@ -97,6 +98,10 @@ impl PolicyEvolutionConfig {
                 SFError::Config(format!("COGNEVA_POLICY_EVOLUTION_INTERVAL_SECS: {v}"))
             })?;
         }
+        crate::config::declared_cadence(
+            "self_evolution.artifact_evolution.interval_secs",
+            cfg.interval_secs,
+        )?;
         Ok(cfg)
     }
 }
@@ -312,7 +317,7 @@ pub async fn run_policy_evolution_loop(
     driver: Arc<PolicyEvolutionDriver>,
     shutdown: cog_core::ShutdownSignal,
 ) {
-    let interval = Duration::from_secs(driver.config.interval_secs.max(60));
+    let interval = Duration::from_secs(driver.config.interval_secs);
     info!(
         interval_secs = interval.as_secs(),
         policy = %driver.config.policy_name,

@@ -12232,7 +12232,7 @@ pub async fn run_mainline_loop(
         Ok(_) => {}
         Err(e) => warn!(error = %e, "workspace gc failed"),
     }
-    let interval = Duration::from_secs(deployer.cfg.poll_interval_secs.max(30));
+    let interval = Duration::from_secs(deployer.cfg.poll_interval_secs);
     info!(
         interval_secs = interval.as_secs(),
         push_endpoint = %deployer.push_endpoint(),

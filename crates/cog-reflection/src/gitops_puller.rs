@@ -1238,7 +1238,10 @@ impl GitOpsPuller {
                 // 只有「完成」与「平台声明失败」两种读法能结束这一段：
                 // 读回来的读数变了就是还在动，过了申报的墙只留一行字。
                 // puller 中途被杀则台账留 Pending，由 reconcile_pending 收尾。
-                let declared = Duration::from_secs(self.config.canary_watch_secs.max(300));
+                // 声明的看护时长就是这里的墙：从前它被抬到 300 秒，而配置面
+                // 与另一处（`canary_watch_secs + CANARY_PAUSE_GRACE_SECS`）读的是
+                // 声明值——同一个字段两处两个数。
+                let declared = Duration::from_secs(self.config.canary_watch_secs);
                 let rolled_out = cog_core::declared_wall::wait_for_settled(
                     declared,
                     "the full rollout after the canary",
@@ -1800,7 +1803,7 @@ pub async fn run_puller_loop(puller: Arc<GitOpsPuller>, shutdown: cog_core::Shut
             .output()
             .await;
     }
-    let interval = Duration::from_secs(puller.config.poll_interval_secs.max(15));
+    let interval = Duration::from_secs(puller.config.poll_interval_secs);
     info!(
         repo = %puller.config.repo_url,
         branch = %puller.config.branch,
