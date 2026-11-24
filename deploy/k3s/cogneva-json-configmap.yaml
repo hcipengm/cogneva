@@ -3936,7 +3936,7 @@ data:
                   "face": "资源管理"
                 }
               ],
-              "_comment_poll_interval_secs": "采集周期：连续几拍取不到数才算「断档」（`eval_failure_alert_after` 按拍计），所以改它等于改所有告警的时间分辨率；读侧把 0 夹到 1 秒。",
+              "_comment_poll_interval_secs": "采集周期：连续几拍取不到数才算「断档」（`eval_failure_alert_after` 按拍计），所以改它等于改所有告警的时间分辨率；读侧取它和下限 30 秒（抓取间隔决定的新鲜度上限）中较大的那个，循环周期与规则停报的判定窗读同一个生效值。",
               "_comment_greater_than": "`greater_than` 里的数是这条告警的判定线本身：同一规则里的 `summary` 把它复述给看告警的人，两处说的是同一件事。线定在哪由这条规则要抓的问题定（例如根分区用到 75% 就该有人看），这一族不共用一条实测——每条规则的线各自对应它自己的判据。 查询只取数：`promql` 不把这条线同向地再比一次，比一次的是 `condition` 这一格。",
               "_comment_less_than": "`less_than` 里的数是这条告警的判定线本身：同一规则里的 `summary` 把它复述给看告警的人，两处说的是同一件事。线定在哪由这条规则要抓的问题定（例如根分区用到 75% 就该有人看），这一族不共用一条实测——每条规则的线各自对应它自己的判据。方向相反：低于这条线就报。 查询只取数：`promql` 不把这条线同向地再比一次，比一次的是 `condition` 这一格。",
               "_comment_greater_than_or_equal": "`greater_than_or_equal` 里的数是这条告警的判定线本身：同一规则里的 `summary` 把它复述给看告警的人，两处说的是同一件事。线定在哪由这条规则要抓的问题定（例如根分区用到 75% 就该有人看），这一族不共用一条实测——每条规则的线各自对应它自己的判据。边界包含：等于这条线就报。 查询只取数：`promql` 不把这条线同向地再比一次，比一次的是 `condition` 这一格。",
@@ -3948,7 +3948,7 @@ data:
             "data_volume_watch": {
               "_comment": "应用数据目录的占用量由写它的进程自己量成 gauge cogneva_data_volume_used_bytes 并带上卷名，规则拿它除以 kube-state-metrics 报的 requests.storage。同一份 cogneva.json 挂给多个 Pod，各自挂的卷不是同一张，所以卷名由各部署用自己的 env 指名（COGNEVA_DATA_VOLUME_CLAIM），不写在这里；claim 为空即整个观测关闭。没有应用数据目录、只有挂载表的进程（独立子命令与边车）用 COGNEVA_DATA_VOLUME_MOUNTS 的 claim=路径 列表声明，卷名就在那一行里；这条序列只能由挂载着该卷的进程走查产出——问得出来的那份是另一个量（引用字节），不是盘上占用。",
               "interval_secs": 300,
-              "_comment_interval_secs": "数据量扫描周期。扫描要遍历整个数据目录，代价随数据量涨，所以取分钟级；读侧把 0 夹到 `MIN_SCAN_INTERVAL_SECS`。"
+              "_comment_interval_secs": "数据量扫描周期。扫描要遍历整个数据目录，代价随数据量涨，所以取分钟级；读侧取它和下限 `MIN_SCAN_INTERVAL_SECS`（30 秒，与抓取间隔对齐）中较大的那个。"
             }
           },
           "self_review": {
