@@ -460,9 +460,7 @@ impl AutonomousCollaborator {
         Ok(tasks
             .into_iter()
             .find(|t| t.id == task_id)
-            .map(|task| {
-                cog_core::DecisionGroupKey::by_task_type(format!("{:?}", task.task_type))
-            }))
+            .map(|task| cog_core::DecisionGroupKey::by_task_type(format!("{:?}", task.task_type))))
     }
 
     /// 读不到分组时**不把观察记进那一组**，并把读失败说出来：那与「任务不在图里」

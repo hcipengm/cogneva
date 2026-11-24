@@ -95,7 +95,8 @@ impl cog_core::contract::work_item::WorkItemGraph for LateWorkGraph {
             // 「图里没有这一行」——那正是这一族要分开的两个答案（CC25）。
             Some(graph) => graph.get_task_checked(id).await,
             None => Err(cog_core::SFError::Agent(
-                "the task graph is not published in this process, so this row cannot be read".into(),
+                "the task graph is not published in this process, so this row cannot be read"
+                    .into(),
             )),
         }
     }

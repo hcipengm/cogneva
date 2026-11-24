@@ -1455,8 +1455,7 @@ async fn rpc_message_send(
         match GoalReader::goal(&orchestrator, &goal_id).await {
             Ok(Some(existing)) => {
                 tracing::info!(goal_id = %goal_id, "a2a message/send repeated a message already accepted");
-                return send_result(rpc_id, version, &orchestrator, &goal_id, existing, body)
-                    .await;
+                return send_result(rpc_id, version, &orchestrator, &goal_id, existing, body).await;
             }
             Ok(None) => {}
             // 读不到就既不能答「重发」也不能再提交一份：那一行可能就在图里，
