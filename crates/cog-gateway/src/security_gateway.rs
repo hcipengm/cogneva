@@ -19688,21 +19688,6 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         );
     }
 
-    /// 耐久面的序列清单必须与真正走耐久面的调用点一致。
-    ///
-    /// 告警规则的窗口判据按 [`DURABLE_POOL_GAUGES`] 取心跳，所以这份清单少一条
-    /// 就是一条规则的窗口没人查，多一条就是一条不在耐久面的序列被套上不该有的
-    /// 下限。判据读的是本文件的调用点：只有 `record_gauge` 一个函数把 gauge 送
-    /// 进耐久面（先写进程内、再写共享表），所以这个函数的调用点就是全体。
-    #[test]
-    fn durable_pool_gauges_is_exactly_what_the_funnel_is_called_with() {
-        let source = include_str!("security_gateway.rs");
-        // 生产段才是判据：测试模块里有一份真值 + 一份 `MetricsBackend` 的桩实现，
-        // 两者都会命中 `record_gauge(`，而文件里另有一处 `#[cfg(test)]` 的辅助方法，
-        // 所以按测试模块的开口切，不按第一个 `cfg(test)` 切。
-        let production = source
-            .split_once("\n#[cfg(test)]\nmod tests {
-
     /// 代理写下的每一笔调用都挂回触发它的那条任务：批号就是任务 id。
     /// 空着的任务照空写——「没说是为哪件事花的」不是「挂到某一件事上」。
     #[test]
@@ -19727,7 +19712,21 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         );
         assert!(llm_call_from(&without).batch_id.is_none());
     }
-")
+
+    /// 耐久面的序列清单必须与真正走耐久面的调用点一致。
+    ///
+    /// 告警规则的窗口判据按 [`DURABLE_POOL_GAUGES`] 取心跳，所以这份清单少一条
+    /// 就是一条规则的窗口没人查，多一条就是一条不在耐久面的序列被套上不该有的
+    /// 下限。判据读的是本文件的调用点：只有 `record_gauge` 一个函数把 gauge 送
+    /// 进耐久面（先写进程内、再写共享表），所以这个函数的调用点就是全体。
+    #[test]
+    fn durable_pool_gauges_is_exactly_what_the_funnel_is_called_with() {
+        let source = include_str!("security_gateway.rs");
+        // 生产段才是判据：测试模块里有一份真值 + 一份 `MetricsBackend` 的桩实现，
+        // 两者都会命中 `record_gauge(`，而文件里另有一处 `#[cfg(test)]` 的辅助方法，
+        // 所以按测试模块的开口切，不按第一个 `cfg(test)` 切。
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
             .map(|(before, _)| before)
             .expect("测试模块的开头变了，这条判据会扫到自己的桩实现");
 
