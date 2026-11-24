@@ -543,10 +543,12 @@ impl PullGate {
     ) -> Self {
         Self {
             pool,
-            after_failures: config.pull_pause_after_failures.max(1),
-            initial_secs: config.pull_pause_initial_secs.max(1),
-            max_secs: config.pull_pause_max_secs.max(1),
-            check_secs: config.pool_check_secs.max(1),
+            // 值原样生效：这四格在 `MemoryConfig::load_from` 按字段名拒绝 0，
+            // 到这里还夹一次就是同一件事的第二个说法，而它会把声明的值悄悄换掉。
+            after_failures: config.pull_pause_after_failures,
+            initial_secs: config.pull_pause_initial_secs,
+            max_secs: config.pull_pause_max_secs,
+            check_secs: config.pool_check_secs,
             resume_observation_secs: config.pull_resume_observation_secs,
             metrics,
             state: std::sync::Mutex::new(PullGateState::default()),
