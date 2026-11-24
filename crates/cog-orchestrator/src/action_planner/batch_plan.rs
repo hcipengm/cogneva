@@ -96,7 +96,7 @@ impl BatchPlanner for LedgerBatchPlanner {
                 },
             ],
             counterexamples: vec![
-                "只改了其中几条就编译：缺口还在，`family.py` 退出码非零".to_string(),
+                "只改了其中几条就编译：缺口还在，`cogneva ledger status` 非零".to_string(),
                 "逐条各编译一次：同一份验证付了多次，而批次的意义正是只付一次".to_string(),
                 "把没做的几条从台账上改成已落以消掉缺口".to_string(),
             ],

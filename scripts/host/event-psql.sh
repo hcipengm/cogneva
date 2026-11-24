@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # 事件流的读写口：把一段 SQL 交给集群里的 Postgres，行按制表符拼接、没有表头。
 #
-# `scripts/hooks/round.py` 与 `deploy/scripts/batch-gate.py` 都经环境变量
-# `COGNEVA_EVENT_PSQL` 找这条命令，而它必须满足两个形状：**接收一段 SQL 作为第
-# 一个参数**、**把结果行原样印到 stdout**。这个脚本就是那个形状，宿主上的用法：
+# 轮书那几条路由产品二进制直接连库，这条命令留给人在宿主上查一次读数；仍在的
+# `scripts/hooks/round.py` 也经它读事件流那本书。它必须满足两个形状：**接收一段 SQL 作为第一个参数**、
+# **把结果行原样印到 stdout**。用法：
 #
 #     export COGNEVA_EVENT_PSQL=$PWD/scripts/host/event-psql.sh
 #
