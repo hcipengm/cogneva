@@ -52,14 +52,18 @@ pub const SILENCE_QUANTILE: f64 = 0.999;
 // cap: bound — 由 SILENCE_QUANTILE 算出：1 / (1 - q)，估 q 分位要至少有一个落在它之外的点
 pub const SAMPLE_FLOOR: usize = sample_floor(SILENCE_QUANTILE);
 
-/// The sample floor a quantile implies: `ceil(1 / (1 - q))`.
+/// The sample floor a quantile implies: one sample per quantile point.
 ///
 /// A function, not an expression buried in the constant above, so the law can be
 /// asked with another input: `sample_floor(0.9999)` is ten times
 /// `sample_floor(0.999)`, and a test holding both is what proves the constant
 /// follows the quantile instead of agreeing with it today.
+///
+/// Rounded, not ceiling-ed: `0.999` cannot be stored exactly, so the division
+/// lands a hair either side of 1000 (0.9999 divides to 10000.0000000011), and a
+/// ceiling would turn that hair into a whole extra sample.
 const fn sample_floor(quantile: f64) -> usize {
-    (1.0 / (1.0 - quantile)).ceil() as usize
+    (1.0 / (1.0 - quantile)).round() as usize
 }
 
 fn beacons() -> &'static Mutex<HashMap<String, Instant>> {
