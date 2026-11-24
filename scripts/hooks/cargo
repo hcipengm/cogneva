@@ -110,6 +110,10 @@ EOF
   fi
 fi
 
+# 账本的时间戳带亚秒（`%N`）：整秒的话，同一秒内「改文件 → 编译」会被读成
+# 「编译之后又改过」，那条判据在快的机器上自己红自己（2026-11-24 实测）。
+# 读的一侧用 RFC3339 解析，两种精度都认。
+
 # 同一份字节不许编第二次：这一棵树在当前 HEAD 上已经把**同一种**编译命令跑过了，
 # 再来一次买的是同一个答案。判据只读账本里已有的事实（时间、工作树、参数、HEAD）：
 # 同一棵树、同一个 HEAD、同一个子命令（`build`／`test`／…）出现过，就拒；`check`
@@ -161,7 +165,7 @@ if [ "$ledger" != "/dev/null" ]; then
   {
     mkdir -p "$(dirname "$ledger")" 2>/dev/null || true
     printf '%s\t%s\t%s\t%s\t%s\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" "$*" \
+      "$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)" "$PWD" "$*" \
       "$(git rev-parse HEAD 2>/dev/null || echo no-head)" "$(fingerprint 2>/dev/null || echo no-tree)" \
       >>"$ledger"
   } 2>/dev/null || true
