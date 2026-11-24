@@ -1666,23 +1666,25 @@ fn dispatch_priority(row: &ChangeLedgerRow) -> i32 {
 /// batches set it.
 pub const ROWS_PER_HANDOVER_ENV: &str = "COGNEVA_CHANGE_LEDGER_ROWS_PER_HANDOVER";
 
-/// How many rows one hand-over carries when nothing has measured a bigger one.
+/// The fewest rows that are a batch at all.
 ///
 /// Not the landing cap, and not the pass's slice: the slice
-/// ([`HANDOVERS_PER_PASS`]) is how many rows a pass may *start*, and this is how
-/// many of them one change can carry. The two differ because the price of a
-/// hand-over is mostly its fixed part -- a plan, a run's context, a sandbox
-/// round that validates the whole tree -- and that part is paid once per task
-/// whatever the task carries. So the rows are gathered until a batch is worth
-/// paying it for.
+/// ([`HANDOVERS_PER_PASS`]) is how many rows a pass may *start*, and this is
+/// where the bound on rows per hand-over starts. The two differ because the
+/// price of a hand-over is mostly its fixed part -- a plan, a run's context, a
+/// sandbox round that validates the whole tree -- and that part is paid once
+/// per task whatever the task carries.
 ///
-/// The starting point, not a boundary this code believes in: the dominant shape
-/// of the queue is one gate per row (a test, a header and a check), and a batch
-/// of five is what one generation has been observed to write whole. Above it the
-/// bound is what the graph measured -- see [`rows_per_handover_bound`] -- and
-/// this number only stands while no batch bigger than it has completed.
-// cap: bound — 一批太大时生成会被截断、整批报废；这是「还没量到更大的批次」时用的起点，不是界本身
-const DEFAULT_ROWS_PER_HANDOVER: usize = 5;
+/// The start is the smallest batch the measurement can read, not a size someone
+/// copied into a constant: a hand-over of one row is the chat turn's "hand this
+/// row over" shape, so [`measured_batch_sizes`] cannot read it, and a bound
+/// below it would hand out one row for ever, climbing nothing. Every landing
+/// then buys one row more (see [`rows_per_handover_bound`]), which is the only
+/// rate the evidence supports; a number like the old seed of five was one
+/// generation's observation frozen into the tree, and the graph that was
+/// supposed to measure it already answers that question live.
+// cap: fixed — 「一批」的最小行数：单行交接是聊天回合那一种形状，不是批次；测量与界的起点共用这一个门槛
+const MIN_ROWS_PER_BATCH: usize = 2;
 
 /// How long a refused batch speaks about what one generation in front of us can
 /// write.
@@ -1758,20 +1760,23 @@ pub fn parse_rows_per_handover(raw: &str) -> Result<Option<usize>, String> {
 ///
 /// A refusal below what has already landed says nothing about size -- the
 /// proven size still works -- so only refusals above the landed proof cap the
-/// bound. With no proof at all the seed stands, and with no refusal the bound
-/// climbs one size per landing, which is the only rate the measurement supports.
+/// bound. With no proof at all the bound stands at [`MIN_ROWS_PER_BATCH`], and
+/// with no refusal it climbs one size per landing, which is the only rate the
+/// measurement supports.
 pub fn rows_per_handover_bound(
-    seed: usize,
     landed_max: Option<usize>,
     refused_min: Option<usize>,
 ) -> usize {
-    let seed = seed.max(1);
-    let grown = landed_max.map_or(seed, |landed| seed.max(landed.saturating_add(1)));
+    let grown = landed_max.map_or(MIN_ROWS_PER_BATCH, |landed| {
+        landed.saturating_add(1).max(MIN_ROWS_PER_BATCH)
+    });
     let proven = landed_max.unwrap_or(0);
     let capped = refused_min
         .filter(|refused| *refused > proven)
         .map(|refused| refused.saturating_sub(1));
-    capped.map_or(grown, |cap| grown.min(cap)).max(1)
+    capped
+        .map_or(grown, |cap| grown.min(cap))
+        .max(MIN_ROWS_PER_BATCH)
 }
 
 /// The batch sizes the graph answers for: the largest a hand-over carried to
@@ -1792,7 +1797,7 @@ fn measured_batch_sizes(tasks: &[Task], now_unix: i64) -> (Option<usize>, Option
             continue;
         }
         let carried = dispatched_identities(task).len();
-        if carried < 2 {
+        if carried < MIN_ROWS_PER_BATCH {
             continue;
         }
         if task.status == TaskStatus::Completed {
@@ -1825,7 +1830,7 @@ fn batch_size_for_this_pass(tasks: &[Task], now_unix: i64) -> (usize, &'static s
         Some(pinned) => (pinned, crate::observable::SOURCE_OVERRIDE),
         None => {
             let (landed_max, refused_min) = measured_batch_sizes(tasks, now_unix);
-            let bound = rows_per_handover_bound(DEFAULT_ROWS_PER_HANDOVER, landed_max, refused_min);
+            let bound = rows_per_handover_bound(landed_max, refused_min);
             crate::observable::rows_per_handover_observable().record_evaluation();
             (bound, crate::observable::SOURCE_DERIVED)
         }
@@ -13475,27 +13480,35 @@ mod tests {
     /// The bound follows the graph's own batches: one above the largest that
     /// landed whole, and never a size a generation refused.
     ///
-    /// Four measurements, one law. Nothing measured keeps the seed. A batch of
-    /// five landing argues for six. A six that comes back refused puts the bound
-    /// back to five -- the largest proven size -- and a refusal of four, below
-    /// what has already landed, does not shrink the proof, because five has been
-    /// observed to work and four failing says something else was wrong. With no
-    /// landing at all the seed stands for six rows.
+    /// One law, and nothing in it that a person picked. With nothing measured it
+    /// stands at the smallest batch the reading can see. A batch of five landing
+    /// argues for six. A six that comes back refused puts the bound back to five
+    /// -- the largest proven size -- and a refusal of four, below what has
+    /// already landed, does not shrink the proof, because five has been observed
+    /// to work and four failing says something else was wrong. With no landing
+    /// at all a refusal can only cap down to the floor: the bound never leaves
+    /// the sizes the measurement can read.
     #[test]
     fn the_batch_bound_follows_the_graphs_batch_outcomes() {
-        assert_eq!(rows_per_handover_bound(5, None, None), 5);
-        assert_eq!(rows_per_handover_bound(5, Some(5), None), 6);
-        assert_eq!(rows_per_handover_bound(5, Some(5), Some(6)), 5);
-        assert_eq!(rows_per_handover_bound(5, Some(5), Some(4)), 6);
-        assert_eq!(rows_per_handover_bound(5, Some(9), Some(7)), 10);
-        assert_eq!(rows_per_handover_bound(5, None, Some(5)), 4);
-        assert_eq!(rows_per_handover_bound(5, None, Some(1)), 1);
+        assert_eq!(rows_per_handover_bound(None, None), MIN_ROWS_PER_BATCH);
+        assert_eq!(rows_per_handover_bound(Some(2), None), 3);
+        assert_eq!(rows_per_handover_bound(Some(3), None), 4);
+        assert_eq!(rows_per_handover_bound(Some(5), None), 6);
+        assert_eq!(rows_per_handover_bound(Some(5), Some(6)), 5);
+        assert_eq!(rows_per_handover_bound(Some(5), Some(4)), 6);
+        assert_eq!(rows_per_handover_bound(Some(9), Some(7)), 10);
+        assert_eq!(rows_per_handover_bound(None, Some(5)), MIN_ROWS_PER_BATCH);
+        assert_eq!(
+            rows_per_handover_bound(None, Some(1)),
+            MIN_ROWS_PER_BATCH,
+            "一条都被算作「批次」的拒绝不是关于批大小的证据，界不许掉到读不到的行数上"
+        );
     }
 
     /// Every pass asks for the bound, whether or not the graph moved, and the
     /// observable's evaluation count is the evidence of it.
     ///
-    /// Two passes over a graph with nothing measured keep the seed both times.
+    /// Two passes over a graph with nothing measured keep the floor both times.
     /// Without the count, that steady bound and a loop that stopped after the
     /// first pass publish the same number.
     #[test]
@@ -13508,7 +13521,7 @@ mod tests {
         let before = observable.evaluations();
         let (first, first_source) = batch_size_for_this_pass(&[], now);
         let (second, second_source) = batch_size_for_this_pass(&[], now);
-        assert_eq!(first, DEFAULT_ROWS_PER_HANDOVER);
+        assert_eq!(first, MIN_ROWS_PER_BATCH);
         assert_eq!(second, first, "nothing measured is the same answer");
         assert_eq!(first_source, crate::observable::SOURCE_DERIVED);
         assert_eq!(second_source, first_source);

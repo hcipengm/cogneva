@@ -3336,7 +3336,8 @@ changeLedger:
   # 验证的尝试，落地了就成为新证据）；**因工作本身被退回的最小条数 - 1** 给界封
   # 顶，退回的证据 30 天后过期（换模型/抬输出预算没有事件可订阅，旧证据不该永久
   # 钉住界）。低于已落地条数的退回不封顶——那说明问题不在批大小。还没有任何批次
-  # 落地时用 5 作起点。界写回 `cogneva_change_ledger_rows_per_handover` 并带
+  # 落地时界停在「能称为批次的最小条数」（2 条），每落地一次涨一条。界写回
+  # `cogneva_change_ledger_rows_per_handover` 并带
   # `source` 标签，每一拍记一次
   # `cogneva_change_ledger_rows_per_handover_evaluations_total`：界不动时，
   # 只有这条计数能说明回路还在算。正数仍是覆盖位（钉死它，读数面就报这个数）。
@@ -3353,8 +3354,9 @@ changeLedger:
   # why: batch a generation refused for the work's own reason caps the bound one below its size, so a refused
   # why: shape is not repeated while the evidence is younger than 30 days; a refusal below what has already
   # why: landed caps nothing, because the proven size still works. A refusal paid to the environment is the
-  # why: pool's answer and moves nothing. While no batch bigger than the seed has completed, the seed (5)
-  # why: stands. The pass writes the bound and its `source` to `cogneva_change_ledger_rows_per_handover` and
+  # why: pool's answer and moves nothing. While no batch has landed the bound stands at the smallest batch the
+  # why: reading can see (2), and each landing argues for one row more. The pass writes the bound and its
+  # why: `source` to `cogneva_change_ledger_rows_per_handover` and
   # why: counts every recomputation on `cogneva_change_ledger_rows_per_handover_evaluations_total`, because a
   # why: bound that only moves with its inputs cannot show that the loop behind it is still running. The
   # why: deployment's 0 means derive; a positive number pins the batch and is reported as `override`.

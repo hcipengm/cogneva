@@ -101,8 +101,8 @@ data:
   # 生成写得完的量就会截断、整批报废。
   #
   # 0 = 按图里的批次导出：每拍读一次它自己交出去的批次，落地整批的最大条数 + 1
-  # 就是下一拍的界，被工作本身退回的批次给界封顶（证据 30 天后过期）；还没量到
-  # 更大的批次时用 5 作起点。界写回 `cogneva_change_ledger_rows_per_handover`
+  # 就是下一拍的界，被工作本身退回的批次给界封顶（证据 30 天后过期）；还没有任何
+  # 批次落地时界停在「能称为批次的最小条数」（2 条），每落地一次涨一条。界写回 `cogneva_change_ledger_rows_per_handover`
   # 并带 `source`，每拍记一次 `_evaluations_total`。正数是钉死的覆盖位。
   COGNEVA_CHANGE_LEDGER_ROWS_PER_HANDOVER: "0"
 
