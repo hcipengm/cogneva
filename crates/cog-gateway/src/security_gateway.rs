@@ -3514,6 +3514,45 @@ async fn pooled_refusal(
 /// 自愈），失败连续到要放弃时经耐久告警面喊一次、恢复时关掉——见
 /// [`crate::usage_landing`]。每一次失败都在读数上留痕（`write_failed` /
 /// `no_ledger`），所以「答复已经发出而账没进库」不会只剩下一句日志。
+/// 一次代理调用的事实行。拆出来是因为它是这一族里唯一有形状的地方：哪几格来自
+/// 用量记录、哪一格是这次调用自己的身份、以及**批号**。
+///
+/// 批号今天取这条记录上的任务 id：一次运行花的每一笔调用都挂回触发它的那条任务，
+/// 「这一批花了几次调用」于是按批号查得到（读面 `a_batch_id_answers_what_the_batch_cost`）。
+/// 换「批」的定义时只改这里一处。
+fn llm_call_from(record: &cog_core::LlmUsageRecord) -> cog_core::LlmCall {
+    cog_core::LlmCall {
+        call_id: format!(
+            "{}:{}",
+            record.actor,
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ),
+        upstream: record.upstream.clone(),
+        api_style: record.api_style.clone(),
+        model: record.model.clone(),
+        result: record.result.clone(),
+        input_tokens: record.tokens_input,
+        output_tokens: record.tokens_output,
+        cached_tokens: record.tokens_cached,
+        cache_created_tokens: record.tokens_cache_created,
+        origin: record.origin.clone(),
+        owner: record.owner.clone(),
+        latency_ms: None,
+        task_id: record.task.clone(),
+        actor: record.actor.clone(),
+        pace: record
+            .pace
+            .as_ref()
+            .and_then(|p| serde_json::to_string(&p.upstreams).ok()),
+        cost_micros: record.cost_micros,
+        price_book: record.price_book.clone(),
+        session: record.session.clone(),
+        // 批号：这一笔挂回触发它的那条任务。
+        batch_id: record.task.clone(),
+        at: chrono::Utc::now(),
+    }
+}
+
 async fn land_usage_record(state: &AppState, record: LlmUsageRecord) {
     let Some(store) = state.pool_obs.usage.clone() else {
         // 这一格只在部署里根本没配账本时走到（`database_url` 为空）：配了但连不上
@@ -3551,35 +3590,7 @@ async fn land_usage_record(state: &AppState, record: LlmUsageRecord) {
             // 在答复离开之前——两处的顺序与 S38 的理由一样：宁可多一次同步写，
             // 也不要「答复发了、事实还在队列里」。
             if let Some(sink) = state.pool_obs.llm_call_events.clone() {
-                let call = cog_core::LlmCall {
-                    call_id: format!(
-                        "{}:{}",
-                        record.actor,
-                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-                    ),
-                    upstream: record.upstream.clone(),
-                    api_style: record.api_style.clone(),
-                    model: record.model.clone(),
-                    result: record.result.clone(),
-                    input_tokens: record.tokens_input,
-                    output_tokens: record.tokens_output,
-                    cached_tokens: record.tokens_cached,
-                    cache_created_tokens: record.tokens_cache_created,
-                    origin: record.origin.clone(),
-                    owner: record.owner.clone(),
-                    latency_ms: None,
-                    task_id: record.task.clone(),
-                    actor: record.actor.clone(),
-                    pace: record
-                        .pace
-                        .as_ref()
-                        .and_then(|p| serde_json::to_string(&p.upstreams).ok()),
-                    cost_micros: record.cost_micros,
-                    price_book: record.price_book.clone(),
-                    session: record.session.clone(),
-                    batch_id: None,
-                    at: chrono::Utc::now(),
-                };
+                let call = llm_call_from(&record);
                 if let Err(e) = sink.append(&call).await {
                     tracing::warn!(
                         error = %e,
@@ -19690,7 +19701,33 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         // 两者都会命中 `record_gauge(`，而文件里另有一处 `#[cfg(test)]` 的辅助方法，
         // 所以按测试模块的开口切，不按第一个 `cfg(test)` 切。
         let production = source
-            .split_once("\n#[cfg(test)]\nmod tests {")
+            .split_once("\n#[cfg(test)]\nmod tests {
+
+    /// 代理写下的每一笔调用都挂回触发它的那条任务：批号就是任务 id。
+    /// 空着的任务照空写——「没说是为哪件事花的」不是「挂到某一件事上」。
+    #[test]
+    fn a_proxied_call_is_attributed_to_the_task_that_caused_it() {
+        let with_task = unidentified_refusal_usage(
+            "openai",
+            "test",
+            crate::actor_labels::Unidentified::Missing,
+            Some("t-1"),
+            None,
+        );
+        let call = llm_call_from(&with_task);
+        assert_eq!(call.task_id.as_deref(), Some("t-1"));
+        assert_eq!(call.batch_id.as_deref(), Some("t-1"));
+
+        let without = unidentified_refusal_usage(
+            "openai",
+            "test",
+            crate::actor_labels::Unidentified::Missing,
+            None,
+            None,
+        );
+        assert!(llm_call_from(&without).batch_id.is_none());
+    }
+")
             .map(|(before, _)| before)
             .expect("测试模块的开头变了，这条判据会扫到自己的桩实现");
 
