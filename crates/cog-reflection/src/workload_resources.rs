@@ -2113,6 +2113,29 @@ pub async fn round(
     }
     // 额度重算的输入：所有工作负载「实测请求 × 副本」之和（稳态），以及最大一份
     // 单副本（滚动重叠：换版时新旧两个副本同时站着）。
+    //
+    // 没有声明资源的容器也算：准入会给它按 LimitRange 的默认值记请求，按 0 算就
+    // 会把额度投影得比实际小——2026-11-24 那次事故在渲染端的同一个缺陷，这里不能
+    // 再出现一遍。
+    let default_requests: Option<(u64, u64)> = kubectl(&[
+        "get",
+        "limitrange",
+        LIMIT_RANGE_NAME,
+        "-n",
+        ns,
+        "-o",
+        "json",
+    ])
+    .await
+    .ok()
+    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+    .and_then(|object| parse_limit_range(&object))
+    .map(|reading| {
+        (
+            reading.current.cpu_request_millicores,
+            reading.current.memory_request_bytes,
+        )
+    });
     let mut steady_cpu: u64 = 0;
     let mut steady_memory: u64 = 0;
     let mut overlap_cpu: u64 = 0;
@@ -2408,17 +2431,26 @@ pub async fn round(
         // 这一段是「最大的一份装不装得下」要用的读数：按本拍抬过之后的值 × 副本数。
         {
             let replicas = workload.replicas.unwrap_or(1).max(1) as u64;
+            let (fallback_cpu, fallback_mem) = default_requests.unwrap_or((0, 0));
             let total_cpu: u64 = workload
                 .containers
                 .iter()
-                .filter_map(|c| resolved.get(&c.name))
-                .map(|t| t.cpu_request_millicores)
+                .map(|c| {
+                    resolved
+                        .get(&c.name)
+                        .map(|t| t.cpu_request_millicores)
+                        .unwrap_or(fallback_cpu)
+                })
                 .sum();
             let total_mem: u64 = workload
                 .containers
                 .iter()
-                .filter_map(|c| resolved.get(&c.name))
-                .map(|t| t.memory_request_bytes)
+                .map(|c| {
+                    resolved
+                        .get(&c.name)
+                        .map(|t| t.memory_request_bytes)
+                        .unwrap_or(fallback_mem)
+                })
                 .sum();
             steady_cpu = steady_cpu.saturating_add(total_cpu.saturating_mul(replicas));
             steady_memory = steady_memory.saturating_add(total_mem.saturating_mul(replicas));
