@@ -1117,8 +1117,6 @@ async fn message_stream_for(
     } else {
         let mut goal_row = Task::goal_row(goal_id.clone(), &request.goal);
         goal_row.workspace_id = None;
-        goal_row.input["origin"] =
-            a2a_origin(caller.as_ref().map(|Extension(claims)| claims), request.message_id.as_deref());
         // 提交在开流之前等它落地，理由与 `message/send` 是同一个：这一行要读不回来，
         // 流能给出的只有「这一行从没出现过」——而那与「提交被拒」是两件事，对端要等
         // 满一个截止时间才能听到前者。拒了就当场报一帧，理由照实说。
