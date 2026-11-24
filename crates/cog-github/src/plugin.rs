@@ -67,6 +67,19 @@ fn declared_cadence(name: &str, secs: u64) -> cog_core::SFResult<u64> {
     Ok(secs)
 }
 
+/// 一条部署声明的条数要么原样生效，要么被点名拒绝；不替换成另一个数。
+///
+/// 零次不是「最快」的极端，是这件事从不发生：读到它的那一层从前把它换成一次，
+/// 于是声明的值与生效的值有两个。
+fn declared_at_least_once(name: &str, count: u32) -> cog_core::SFResult<u32> {
+    if count == 0 {
+        return Err(cog_core::SFError::Validation(format!(
+            "{name} 声明为 0 次：这件事至少要发生一次，0 次等于它从不发生。"
+        )));
+    }
+    Ok(count)
+}
+
 /// 平台轮询任务：间隔触发 run_once，shutdown 信号退出。
 ///
 /// `role` 是共用库上那行租约的仲裁者（没有共用库时为 None）。发现循环的属主
@@ -309,6 +322,10 @@ impl cog_core::SystemPlugin for GitHubPlugin {
             declared_cadence(
                 "github_integration.landing_policy.ci_poll_interval_secs",
                 config.landing_policy.ci_poll_interval_secs,
+            )?;
+            declared_at_least_once(
+                "github_integration.landing_policy.max_land_attempts",
+                config.landing_policy.max_land_attempts,
             )?;
         }
         if gitee_config.enabled {
@@ -740,7 +757,29 @@ mod tests {
         let refused = declared_cadence("github_integration.poll_interval_secs", 0)
             .expect_err("0 秒是忙等，不是一条节拍");
         assert!(
-            refused.to_string().contains("github_integration.poll_interval_secs"),
+            refused
+                .to_string()
+                .contains("github_integration.poll_interval_secs"),
+            "拒绝要点名是哪一格：{refused}"
+        );
+    }
+
+    /// 声明的尝试次数原样回来；0 次被点名拒绝，而不是被换成一次。
+    #[test]
+    fn a_declared_attempt_count_survives_and_zero_is_refused() {
+        assert_eq!(
+            declared_at_least_once("github_integration.landing_policy.max_land_attempts", 3)
+                .unwrap(),
+            3,
+            "声明的次数不许被改写"
+        );
+        let refused =
+            declared_at_least_once("github_integration.landing_policy.max_land_attempts", 0)
+                .expect_err("0 次等于这件事从不发生");
+        assert!(
+            refused
+                .to_string()
+                .contains("github_integration.landing_policy.max_land_attempts"),
             "拒绝要点名是哪一格：{refused}"
         );
     }

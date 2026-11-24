@@ -658,7 +658,7 @@ impl MainChannel {
     ) -> std::result::Result<String, LandingError> {
         self.check_policy(change, owner_approved)?;
         let base = self.config.base_branch.clone();
-        let attempts = self.config.landing_policy.max_land_attempts.max(1);
+        let attempts = self.config.landing_policy.max_land_attempts;
         let _guard = self.gate.lock().await;
 
         let mut last_race = None;
