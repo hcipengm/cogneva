@@ -181,11 +181,30 @@ pub fn parse_md(text: &str) -> Result<Vec<LedgerItem>, String> {
         }
         if cells.len() >= 3 {
             if let Some(state) = LedgerState::parse(&cells[2]) {
+                // 旧三格行写着 `已落`：三格齐才是终态。缺格的 `已落` 是这一族最坏的
+                // 形状——它把「文件改了」读成「做完了」，而从那一刻起这一行不再被任何
+                // 门看。缺格按**未完成**读（`state = Open`、差距留一句），不是跳过，
+                // 也不是拒读：跳过等于承认那个假的终态，拒读会让一条写错的旧记录把
+                // 别的活一起停掉。
+                let filled = ["代码", "上线", "验证"]
+                    .iter()
+                    .filter(|tag| line.contains(*tag))
+                    .count();
+                let state = if state == LedgerState::Reached && filled < 3 {
+                    LedgerState::Open
+                } else {
+                    state
+                };
+                let gap = if state == LedgerState::Open && cells[2].starts_with("已落") {
+                    format!("旧三格行缺格（{} 格齐）", filled)
+                } else {
+                    String::new()
+                };
                 out.push(LedgerItem {
                     id: cells[0].clone(),
                     terminal: cells[1].clone(),
                     now: String::new(),
-                    gap: String::new(),
+                    gap,
                     state,
                 });
                 continue;
@@ -232,6 +251,20 @@ pub fn reached_ids(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 旧三格行写着 `已落` 却没有三格：按未完成读。跳过它会承认一个假的终态。
+    #[test]
+    fn an_old_row_that_says_reached_without_three_cells_is_not_reached() {
+        let text = "| S9 | 旧格式 | 已落 | 代码: a |\n";
+        let items = parse_md(text).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].state, LedgerState::Open);
+        assert!(items[0].is_in_batch());
+        let full = "| S9 | 旧格式 | 已落 | 代码: a | 上线: b | 验证: c |\n";
+        let items = parse_md(full).unwrap();
+        assert_eq!(items[0].state, LedgerState::Reached);
+        assert!(!items[0].is_in_batch());
+    }
 
     /// 旧三格行没有「差距」这一格：它写着 `未落` 就进批，空差距不等于做完了。
     /// 只按差距判的那一版会把整族旧行读成「不在批次里」，而读数照样绿。
