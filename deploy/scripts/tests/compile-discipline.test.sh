@@ -13,9 +13,9 @@ set -uo pipefail
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR COGNEVA_COMMIT_INDEX
 root=$(git rev-parse --show-toplevel)
 gate="$root/deploy/scripts/check-compile-discipline.sh"
-reader="$root/scripts/hooks/compile-ledger.py"
+bin="${COGNEVA_BIN:-$root/target/debug/cogneva}"
 [ -f "$gate" ] || { echo "FAIL: 门脚本不在：$gate" >&2; exit 1; }
-[ -f "$reader" ] || { echo "FAIL: 读数脚本不在：$reader" >&2; exit 1; }
+[ -x "$bin" ] || { echo "FAIL: 平台二进制不在：$bin" >&2; exit 1; }
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -27,7 +27,6 @@ bad() { printf 'FAIL- %s\n' "$1" >&2; fail=$((fail + 1)); }
 tree="$tmp/tree"
 mkdir -p "$tree/deploy/scripts" "$tree/scripts/hooks" "$tree/crates/demo/src"
 cp "$gate" "$tree/deploy/scripts/check-compile-discipline.sh"
-cp "$reader" "$tree/scripts/hooks/compile-ledger.py"
 echo "fn main() {}" >"$tree/crates/demo/src/lib.rs"
 cat >"$tree/Cargo.toml" <<'TOML'
 [workspace]
@@ -42,10 +41,10 @@ ledger="$tmp/ledger.tsv"
 stamp() { date -u -d "$1" +%Y-%m-%dT%H:%M:%SZ; }
 record() { printf '%s\t%s\t%s\t-\t-\n' "$(stamp "$1")" "$tree" "$2" >>"$ledger"; }
 
-run() { COGNEVA_COMPILE_LEDGER="$ledger" COGNEVA_PUSH_BASE=main bash "$tree/deploy/scripts/check-compile-discipline.sh" 2>&1; }
+run() { COGNEVA_BIN="$bin" COGNEVA_COMPILE_LEDGER="$ledger" COGNEVA_PUSH_BASE=main bash "$tree/deploy/scripts/check-compile-discipline.sh" 2>&1; }
 
 # 1. 没有账本：不判。
-out="$(COGNEVA_COMPILE_LEDGER="$tmp/missing.tsv" COGNEVA_PUSH_BASE=main bash "$tree/deploy/scripts/check-compile-discipline.sh" 2>&1)"; rc=$?
+out="$(COGNEVA_BIN="$bin" COGNEVA_COMPILE_LEDGER="$tmp/missing.tsv" COGNEVA_PUSH_BASE=main bash "$tree/deploy/scripts/check-compile-discipline.sh" 2>&1)"; rc=$?
 { [ "$rc" -eq 3 ] && printf '%s' "$out" | grep -q "没判"; } && ok "账本读不到：退 3（没判），不假绿" || bad "账本读不到时的行为不对（rc=$rc）：$out"
 
 # 2. 编译之后又改了文件 ⇒ 红。
@@ -75,26 +74,26 @@ out=$(run); rc=$?
 # 5. 开着一轮时用**这一轮的 code_rev**，不用 `origin/main`：三道门量同一件事。
 #    读数里要说得出来用的是哪个基准——两个人拿两个基准问同一批，量出来就是两个数。
 round_rev="$(git -C "$tree" rev-parse main)"
-cat >"$tree/scripts/hooks/round.py" <<ROUND
-def current_round():
-    return ("evt", "ledger-rev", "$round_rev", [], "ledger-rev")
-ROUND
+# 轮书：git ref 上的一版载荷。`code_rev` 就是这一轮开工时的代码 rev——
+# 与另外两道门量的是同一个数。
+set_round() { # $1 = code_rev
+  blob=$(printf '{"code_rev":"%s"}' "$1" | git -C "$tree" hash-object -w --stdin)
+  git -C "$tree" update-ref refs/cogneva/round "$blob"
+}
+set_round "$round_rev"
 touch -d "2000-01-01T00:00:10Z" "$tree/crates/demo/src/lib.rs"
 record "2030-01-01T00:07:00Z" "check"
-out="$(COGNEVA_COMPILE_LEDGER="$ledger" python3 "$tree/scripts/hooks/compile-ledger.py" check --root "$tree" --base main --ledger "$ledger" 2>&1)"; rc=$?
+out="$(COGNEVA_BIN="$bin" COGNEVA_COMPILE_LEDGER="$ledger" "$bin" ledger compiled --root "$tree" --base main --ledger "$ledger" 2>&1)"; rc=$?
 { printf '%s' "$out" | grep -q "这一轮的 code_rev"; } \
   && ok "开着一轮：基准是这一轮的 code_rev，而且说出来了" \
   || bad "没按这一轮的 code_rev 判（rc=$rc）：$out"
 # 5b. 基线的 rev 在树里不存在：报「没判」（退 3），不能读成「没有改动」。
-cat >"$tree/scripts/hooks/round.py" <<'ROUND'
-def current_round():
-    return ("evt", "ledger-rev", "000000000000", [], "ledger-rev")
-ROUND
-out="$(python3 "$tree/scripts/hooks/compile-ledger.py" check --root "$tree" --base main --ledger "$ledger" 2>&1)"; rc=$?
+set_round "000000000000"
+out="$(COGNEVA_BIN="$bin" "$bin" ledger compiled --root "$tree" --base main --ledger "$ledger" 2>&1)"; rc=$?
 { [ "$rc" -eq 3 ] && printf '%s' "$out" | grep -q "没判"; } \
   && ok "基线读不出来：退 3（没判），不读成「没有改动」" \
   || bad "基线读不出来时的行为不对（rc=$rc）：$out"
-rm -f "$tree/scripts/hooks/round.py"
+git -C "$tree" update-ref -d refs/cogneva/round
 
 printf '\ncompile-discipline.test.sh: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

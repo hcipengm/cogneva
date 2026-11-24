@@ -16,10 +16,10 @@ set -uo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="${1:-$(cd "$here/../.." && pwd)}"
 ledger="${COGNEVA_COMPILE_LEDGER:-$HOME/.local/state/cogneva/compile-ledger.tsv}"
-reader="$root/scripts/hooks/compile-ledger.py"
+bin="${COGNEVA_BIN:-$root/target/debug/cogneva}"
 
-if [ ! -f "$reader" ]; then
-  echo "compile-discipline: 读数脚本不在：$reader —— 没判。" >&2
+if [ ! -x "$bin" ]; then
+  echo "compile-discipline: 平台二进制不在：$bin —— 没判。" >&2
   exit 3
 fi
 
@@ -35,4 +35,4 @@ if ! git -C "$root" rev-parse --verify "$base" >/dev/null 2>&1; then
   exit 3
 fi
 
-python3 "$reader" check --root "$root" --base "$base" --ledger "$ledger"
+"$bin" ledger compiled --root "$root" --base "$base" --ledger "$ledger"
