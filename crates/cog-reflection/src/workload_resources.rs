@@ -607,25 +607,24 @@ async fn quota_headroom(ns: &str) -> Option<Targets> {
     })
 }
 
-/// 额度该怎么动：实测需要的值装得下就抬到它，装不下硬件就告警。
+/// 额度该怎么动：单个程序的需要一变，整本的准用就跟着**同步到同一个值**——可升
+/// 可降，只要还装得下硬件；顶到硬件就告警，不动。
 ///
 /// 需要的值 = 每个程序实测要的 × 份数之和 ＋ 一份滚动重叠 ＋ 其他正在运行的值。
-/// 判据只有一句：`required ≤ 硬件` 就接受并抬到 `required`；否则不动，并**说出来**
-/// ——「装不下」必须有一条读数，静默不动与「额度本来够」在屏上同形。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CeilingDecision {
+enum SyncDecision {
     Keep,
-    Raise(u64),
+    Set(u64),
     ExceedsNode { required: u64, cap: u64 },
 }
 
-fn ceiling_decision(hard: u64, required: u64, allocatable: Option<u64>) -> CeilingDecision {
-    if required <= hard {
-        return CeilingDecision::Keep;
+fn sync_decision(hard: u64, required: u64, allocatable: Option<u64>) -> SyncDecision {
+    if required == hard {
+        return SyncDecision::Keep;
     }
     match allocatable {
-        Some(cap) if required > cap => CeilingDecision::ExceedsNode { required, cap },
-        _ => CeilingDecision::Raise(required),
+        Some(cap) if required > cap => SyncDecision::ExceedsNode { required, cap },
+        _ => SyncDecision::Set(required),
     }
 }
 
@@ -2218,143 +2217,58 @@ pub async fn round(
     }
     let mut evaluated = 0usize;
     let mut patched = 0usize;
-    // 额度先按**上一拍实测下来的声明值**重算，再让这一拍去调；先抬闸、后调价，
-    // 否则同一拍里调出来的目标会被旧闸夹住，要等下一拍才生效。
-    //
-    // 输入是稳态：每个工作负载「声明值（＝上一拍的实测目标；没有声明的按 LimitRange
-    // 当下默认值）× 副本数」之和，加最大一份单副本作滚动重叠（换版时新旧两个副本
-    // 同时站着，Kubernetes 的滚动更新就是按这个算的）。只升不降，卡在节点可分配量。
-    {
-        let (fallback_cpu, fallback_mem) = default_requests.unwrap_or((0, 0));
-        let mut steady_cpu: u64 = 0;
-        let mut steady_memory: u64 = 0;
-        let mut overlap_cpu: u64 = 0;
-        let mut overlap_memory: u64 = 0;
-        for workload in &workloads {
-            let replicas = workload.replicas.unwrap_or(1).max(1) as u64;
-            let per_cpu: u64 = workload
-                .containers
-                .iter()
-                .map(|c| {
-                    c.declared
-                        .and_then(|d| d.cpu_request_millicores)
-                        .unwrap_or(fallback_cpu)
-                })
-                .sum();
-            let per_mem: u64 = workload
-                .containers
-                .iter()
-                .map(|c| {
-                    c.declared
-                        .and_then(|d| d.memory_request_bytes)
-                        .unwrap_or(fallback_mem)
-                })
-                .sum();
-            steady_cpu = steady_cpu.saturating_add(per_cpu.saturating_mul(replicas));
-            steady_memory = steady_memory.saturating_add(per_mem.saturating_mul(replicas));
-            overlap_cpu = overlap_cpu.max(per_cpu);
-            overlap_memory = overlap_memory.max(per_mem);
-        }
-        if let Some((hard, used)) = quota_hard_and_used(ns).await {
-            let cap_cpu = node_allocatable(AllocatableUnit::Cpu).await;
-            let cap_mem = node_allocatable(AllocatableUnit::Memory).await;
-            // 「其他正在运行的值」：此刻的 used 里，除这些工作负载之外的份额（部署
-            // 作业、临时 Pod）。它们也要算进「装不装得下」。
-            let others_cpu = used.cpu_request_millicores.saturating_sub(steady_cpu);
-            let others_mem = used.memory_request_bytes.saturating_sub(steady_memory);
-            let required_cpu = steady_cpu
-                .saturating_add(overlap_cpu)
-                .saturating_add(others_cpu);
-            let required_mem = steady_memory
-                .saturating_add(overlap_memory)
-                .saturating_add(others_mem);
-            let mut hard_patch = serde_json::Map::new();
-            match ceiling_decision(hard.cpu_request_millicores, required_cpu, cap_cpu) {
-                CeilingDecision::Raise(wanted) => {
-                    info!(
-                        namespace = %ns,
-                        from = hard.cpu_request_millicores,
-                        to = wanted,
-                        steady = steady_cpu,
-                        overlap = overlap_cpu,
-                        others = others_cpu,
-                        "workload resources: raising the namespace's request ceiling to what the measured workloads plus the rest actually need"
-                    );
-                    hard_patch.insert(
-                        "requests.cpu".to_string(),
-                        Value::String(format!("{wanted}m")),
-                    );
-                }
-                CeilingDecision::ExceedsNode { required, cap } => warn!(
-                    namespace = %ns,
-                    dimension = "requests.cpu",
-                    required,
-                    cap,
-                    "workload resources: the measured need does not fit the node; the ceiling was not raised"
-                ),
-                CeilingDecision::Keep => {}
-            }
-            match ceiling_decision(
-                hard.memory_request_bytes,
-                required_mem,
-                cap_mem,
-            ) {
-                CeilingDecision::Raise(wanted) => {
-                    hard_patch.insert(
-                        "requests.memory".to_string(),
-                        Value::String(format!("{wanted}")),
-                    );
-                }
-                CeilingDecision::ExceedsNode { required, cap } => warn!(
-                    namespace = %ns,
-                    dimension = "requests.memory",
-                    required,
-                    cap,
-                    "workload resources: the measured need does not fit the node; the ceiling was not raised"
-                ),
-                CeilingDecision::Keep => {}
-            }
-            if !hard_patch.is_empty() {
-                let body = serde_json::json!({"spec": {"hard": Value::Object(hard_patch)}});
-                let body = body.to_string();
-                match kubectl(&[
-                    "patch",
-                    "resourcequota",
-                    QUOTA_NAME,
-                    "-n",
-                    ns,
-                    "--type",
-                    "merge",
-                    "-p",
-                    &body,
-                ])
-                .await
-                {
-                    Ok(_) => patched += 1,
-                    Err(e) => warn!(
-                        namespace = %ns,
-                        error = %e,
-                        "workload resources: the quota patch was refused; the ceiling keeps the value it had"
-                    ),
-                }
-            }
-        }
+    // 每个工作负载「每副本请求」的读数（＝上一拍的实测目标；没有声明的按 LimitRange
+    // 当下默认值），以及这一拍开始时整本额度的读数。**一个程序的需要一变，整本的
+    // 准用就在同一笔里跟着重算**：可升可降，单个与整体的需要始终相等；顶到硬件才
+    // 告警。这里只把基准读出来，写回发生在每个工作负载要 patch 的那一刻。
+    let default_pair = default_requests.unwrap_or((0, 0));
+    let mut workload_totals: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut steady_cpu: u64 = 0;
+    let mut steady_memory: u64 = 0;
+    let mut overlap_cpu: u64 = 0;
+    let mut overlap_memory: u64 = 0;
+    for workload in &workloads {
+        let replicas = workload.replicas.unwrap_or(1).max(1) as u64;
+        let per_cpu: u64 = workload
+            .containers
+            .iter()
+            .map(|c| {
+                c.declared
+                    .and_then(|d| d.cpu_request_millicores)
+                    .unwrap_or(default_pair.0)
+            })
+            .sum();
+        let per_mem: u64 = workload
+            .containers
+            .iter()
+            .map(|c| {
+                c.declared
+                    .and_then(|d| d.memory_request_bytes)
+                    .unwrap_or(default_pair.1)
+            })
+            .sum();
+        steady_cpu = steady_cpu.saturating_add(per_cpu.saturating_mul(replicas));
+        steady_memory = steady_memory.saturating_add(per_mem.saturating_mul(replicas));
+        overlap_cpu = overlap_cpu.max(per_cpu);
+        overlap_memory = overlap_memory.max(per_mem);
+        workload_totals.insert(workload.name.clone(), (per_cpu, per_mem));
     }
-    // 抬完闸再算这一拍还能抬多少：`hard − used`，读的是刚写下去的那一版。
-    // 量不到（没有配额对象或读失败）就不夹——但那是「量不到」，不是一个可以默认成
-    // 无穷大的数，所以同时留一条 warn。
-    let mut cpu_raise_budget: Option<u64> = None;
-    let mut memory_raise_budget: Option<u64> = None;
-    match quota_headroom(ns).await {
-        Some(headroom) => {
-            cpu_raise_budget = Some(headroom.cpu_request_millicores);
-            memory_raise_budget = Some(headroom.memory_request_bytes);
-        }
-        None => warn!(
-            namespace = %ns,
-            "workload resources: the namespace quota's headroom is unreadable; this pass does not cap its raises"
+    // 这一拍开始时整本额度的读数与节点的可分配量：每个工作负载写回之前按它们现算。
+    let quota_now = quota_hard_and_used(ns).await;
+    let node_cap_cpu = node_allocatable(AllocatableUnit::Cpu).await;
+    let node_cap_mem = node_allocatable(AllocatableUnit::Memory).await;
+    // 除这些工作负载之外正在跑的（部署作业、临时 Pod）：它们也算进「装不装得下」。
+    let (others_cpu, others_mem) = match &quota_now {
+        Some((_, used)) => (
+            used.cpu_request_millicores.saturating_sub(steady_cpu),
+            used.memory_request_bytes.saturating_sub(steady_memory),
         ),
-    }
+        None => (0, 0),
+    };
+    let mut hard_now_cpu = quota_now.map(|(hard, _)| hard.cpu_request_millicores);
+    let mut hard_now_mem = quota_now.map(|(hard, _)| hard.memory_request_bytes);
+    let used_now_cpu = quota_now.map(|(_, used)| used.cpu_request_millicores);
+    let used_now_mem = quota_now.map(|(_, used)| used.memory_request_bytes);
 
     // 这一拍给每个声明了资源的容器算出的请求。默认层问的是同一份测量的
     // 另一个问题（见 `default_shape`），所以在下面那段循环里顺手收起来，
@@ -2537,53 +2451,171 @@ pub async fn round(
                 }
             }
         }
-        // 抬价这一边也要花额度：闭环抬上去的请求先向这一拍剩下的余量借，借不到
-        // 就停在放得下的地方。放在出 patch body 之前，是因为写下去的那一份就是
-        // 准入随后记账的那一份——两处两个数时，Pod 会在重建时被自己的旧闸门拒掉。
-        if let Some(budget) = cpu_raise_budget.as_mut() {
-            for (name, targets) in changes.iter_mut() {
-                let Some(declared) = workload
-                    .containers
-                    .iter()
-                    .find(|c| &c.name == name)
-                    .and_then(|c| c.declared)
-                else {
-                    continue;
-                };
-                let before = targets.cpu_request_millicores;
-                targets.cpu_request_millicores = spend_raise(
-                    declared.cpu_request_millicores.unwrap_or(0),
-                    before,
-                    budget,
+        // 一个程序的需要一变，整本的准用就在同一笔里跟着重算：按「其他工作负载的
+        // 基准值 ＋ 这一份的新值 × 副本数 ＋ 一份滚动重叠 ＋ 其他在跑的」得出需要的
+        // 总量，装得下硬件就把它写成新的上限（**可升可降**），装不下就告警并把这一
+        // 份压到此刻还放得下的地方——写下去的那一份就是准入随后记账的那一份。
+        if let (Some(old), Some(hard_cpu), Some(hard_mem)) = (
+            workload_totals.get(&workload.name).copied(),
+            hard_now_cpu,
+            hard_now_mem,
+        ) {
+            let replicas = workload.replicas.unwrap_or(1).max(1) as u64;
+            let new_cpu: u64 = workload
+                .containers
+                .iter()
+                .map(|c| {
+                    resolved
+                        .get(&c.name)
+                        .map(|t| t.cpu_request_millicores)
+                        .unwrap_or_else(|| {
+                            c.declared
+                                .and_then(|d| d.cpu_request_millicores)
+                                .unwrap_or(default_pair.0)
+                        })
+                })
+                .sum();
+            let new_mem: u64 = workload
+                .containers
+                .iter()
+                .map(|c| {
+                    resolved
+                        .get(&c.name)
+                        .map(|t| t.memory_request_bytes)
+                        .unwrap_or_else(|| {
+                            c.declared
+                                .and_then(|d| d.memory_request_bytes)
+                                .unwrap_or(default_pair.1)
+                        })
+                })
+                .sum();
+            let required_cpu = steady_cpu
+                .saturating_sub(old.0.saturating_mul(replicas))
+                .saturating_add(new_cpu.saturating_mul(replicas))
+                .saturating_add(overlap_cpu)
+                .saturating_add(others_cpu);
+            let required_mem = steady_memory
+                .saturating_sub(old.1.saturating_mul(replicas))
+                .saturating_add(new_mem.saturating_mul(replicas))
+                .saturating_add(overlap_memory)
+                .saturating_add(others_mem);
+            let cpu_move = sync_decision(hard_cpu, required_cpu, node_cap_cpu);
+            let mem_move = sync_decision(hard_mem, required_mem, node_cap_mem);
+            let mut hard_patch = serde_json::Map::new();
+            if let SyncDecision::Set(wanted) = cpu_move {
+                hard_patch.insert(
+                    "requests.cpu".to_string(),
+                    Value::String(format!("{wanted}m")),
                 );
-                if targets.cpu_request_millicores != before {
-                    warn!(
-                        workload = %workload.name,
-                        container = %name,
-                        declared = declared.cpu_request_millicores.unwrap_or(0),
-                        wanted = before,
-                        granted = targets.cpu_request_millicores,
-                        "workload resources: the quota cannot admit this raise; the request is capped at what still fits"
-                    );
-                    readings.observe(&workload.name, name, *targets, SOURCE_QUOTA, 0);
+            }
+            if let SyncDecision::Set(wanted) = mem_move {
+                hard_patch.insert(
+                    "requests.memory".to_string(),
+                    Value::String(format!("{wanted}")),
+                );
+            }
+            if !hard_patch.is_empty() {
+                let body = serde_json::json!({"spec": {"hard": Value::Object(hard_patch)}});
+                let body = body.to_string();
+                match kubectl(&[
+                    "patch",
+                    "resourcequota",
+                    QUOTA_NAME,
+                    "-n",
+                    ns,
+                    "--type",
+                    "merge",
+                    "-p",
+                    &body,
+                ])
+                .await
+                {
+                    Ok(_) => {
+                        patched += 1;
+                        if let SyncDecision::Set(wanted) = cpu_move {
+                            hard_now_cpu = Some(wanted);
+                        }
+                        if let SyncDecision::Set(wanted) = mem_move {
+                            hard_now_mem = Some(wanted);
+                        }
+                        info!(
+                            namespace = %ns,
+                            workload = %workload.name,
+                            required_cpu,
+                            required_mem,
+                            "workload resources: the namespace ceiling follows this workload's measured need"
+                        );
+                    }
+                    Err(e) => warn!(
+                        namespace = %ns,
+                        error = %e,
+                        "workload resources: the quota patch was refused; the ceiling keeps the value it had"
+                    ),
                 }
             }
-        }
-        if let Some(budget) = memory_raise_budget.as_mut() {
-            for (name, targets) in changes.iter_mut() {
-                let Some(declared) = workload
-                    .containers
-                    .iter()
-                    .find(|c| &c.name == name)
-                    .and_then(|c| c.declared)
-                else {
-                    continue;
-                };
-                targets.memory_request_bytes = spend_raise(
-                    declared.memory_request_bytes.unwrap_or(0),
-                    targets.memory_request_bytes,
-                    budget,
-                );
+            for (decision, dimension) in [(cpu_move, "requests.cpu"), (mem_move, "requests.memory")] {
+                if let SyncDecision::ExceedsNode { required, cap } = decision {
+                    warn!(
+                        namespace = %ns,
+                        dimension,
+                        required,
+                        cap,
+                        "workload resources: the measured need does not fit the node; the ceiling was not raised"
+                    );
+                }
+            }
+            // 装不下时把这一份压到「hard − used」还放得下的地方：留一条能重建的
+            // 请求，而不是写一个准入必拒的数。
+            if matches!(cpu_move, SyncDecision::ExceedsNode { .. }) {
+                if let (Some(hard_cpu), Some(used_cpu)) = (hard_now_cpu, used_now_cpu) {
+                    let mut budget = hard_cpu.saturating_sub(used_cpu);
+                    for (name, targets) in changes.iter_mut() {
+                        let Some(declared) = workload
+                            .containers
+                            .iter()
+                            .find(|c| &c.name == name)
+                            .and_then(|c| c.declared)
+                        else {
+                            continue;
+                        };
+                        let before = targets.cpu_request_millicores;
+                        targets.cpu_request_millicores = spend_raise(
+                            declared.cpu_request_millicores.unwrap_or(0),
+                            before,
+                            &mut budget,
+                        );
+                        if targets.cpu_request_millicores != before {
+                            warn!(
+                                workload = %workload.name,
+                                container = %name,
+                                wanted = before,
+                                granted = targets.cpu_request_millicores,
+                                "workload resources: capped at what the ceiling can still admit"
+                            );
+                            readings.observe(&workload.name, name, *targets, SOURCE_QUOTA, 0);
+                        }
+                    }
+                }
+            }
+            if matches!(mem_move, SyncDecision::ExceedsNode { .. }) {
+                if let (Some(hard_mem), Some(used_mem)) = (hard_now_mem, used_now_mem) {
+                    let mut budget = hard_mem.saturating_sub(used_mem);
+                    for (name, targets) in changes.iter_mut() {
+                        let Some(declared) = workload
+                            .containers
+                            .iter()
+                            .find(|c| &c.name == name)
+                            .and_then(|c| c.declared)
+                        else {
+                            continue;
+                        };
+                        targets.memory_request_bytes = spend_raise(
+                            declared.memory_request_bytes.unwrap_or(0),
+                            targets.memory_request_bytes,
+                            &mut budget,
+                        );
+                    }
+                }
             }
         }
         let Some(body) = patch_body(
@@ -3695,14 +3727,17 @@ mod tests {
     /// ⇒ 5700m；如果硬已经是 6000m 就不动；如果节点只有 5000m 也不写。
     /// 需要的值装得下就抬到它；装不下硬件就**说出来**（不是静默不动）。
     #[test]
-    fn the_ceiling_rises_to_the_measured_need_or_names_the_hardware_limit() {
-        assert_eq!(ceiling_decision(5_000, 5_700, Some(23_860)), CeilingDecision::Raise(5_700));
-        assert_eq!(ceiling_decision(6_000, 5_700, Some(23_860)), CeilingDecision::Keep);
+    fn the_ceiling_moves_with_the_measured_need_or_names_the_hardware_limit() {
+        // 需要的比硬的大：抬到它；一样大：不动；需要的比硬的小：**降下来**——
+        // 单个与整体的需要始终相等，不是只许涨；超过节点就告警、不动。
+        assert_eq!(sync_decision(5_000, 5_700, Some(23_860)), SyncDecision::Set(5_700));
+        assert_eq!(sync_decision(5_700, 5_700, Some(23_860)), SyncDecision::Keep);
+        assert_eq!(sync_decision(5_700, 4_100, Some(23_860)), SyncDecision::Set(4_100));
         assert_eq!(
-            ceiling_decision(5_000, 5_700, Some(5_000)),
-            CeilingDecision::ExceedsNode { required: 5_700, cap: 5_000 }
+            sync_decision(5_000, 5_700, Some(5_000)),
+            SyncDecision::ExceedsNode { required: 5_700, cap: 5_000 }
         );
-        assert_eq!(ceiling_decision(5_000, 5_700, None), CeilingDecision::Raise(5_700));
+        assert_eq!(sync_decision(5_000, 5_700, None), SyncDecision::Set(5_700));
     }
 
     /// 抬价先向这一拍剩下的额度借：不超过声明的部分不花，超过的部分最多花到
