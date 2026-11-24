@@ -334,7 +334,7 @@ collect_process_views() {
     # 上面两腿问的都是「此刻有没有写者」，而一次门从开跑到第一个 `rustc` 之间有一段
     # 空档：它已经占住了接下来要读的树，可那一刻没有任何 cargo/rustc 进程。按写者判，
     # 这段空档里的树是可删的——2026-11-23 23:44 就是这么删掉了 `target/debug/build/ring-*/out`
-    # （9.2 GiB 整批），八秒后同一道推前门的 `rustc` 报 `could not find native static
+    # （实测 2026-11-23 本机整批 9.2 GiB），八秒后同一道推前门的 `rustc` 报 `could not find native static
     # library ring-core`，而 cargo 的指纹仍把那批产物记成新的，连重构都要先
     # `cargo clean -p`（CC63）。
     #
