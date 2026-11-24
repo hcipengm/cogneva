@@ -237,7 +237,7 @@ fn card_v03(base: &str) -> Value {
     json!({
         "protocolVersion": "0.3",
         "name": "cogneva",
-        "description": "Cogneva autonomous multi-agent collaboration platform",
+        "description": "Cogneva autonomous multi-agent collaboration platform. Every message becomes a goal that is decomposed into work; a goal may be a question, and it is still filed as work — this endpoint has no separate conversation channel.",
         "url": format!("{base}{A2A_RPC}"),
         "version": env!("CARGO_PKG_VERSION"),
         "capabilities": capabilities_wire(),
@@ -258,7 +258,7 @@ fn card_v10(base: &str) -> Value {
     let endpoint = format!("{base}{A2A_RPC}");
     json!({
         "name": "cogneva",
-        "description": "Cogneva autonomous multi-agent collaboration platform",
+        "description": "Cogneva autonomous multi-agent collaboration platform. Every message becomes a goal that is decomposed into work; a goal may be a question, and it is still filed as work — this endpoint has no separate conversation channel.",
         "supportedInterfaces": [
             {"url": endpoint, "protocolBinding": "JSONRPC", "protocolVersion": "1.0"},
             {"url": endpoint, "protocolBinding": "JSONRPC", "protocolVersion": "0.3"},
@@ -1826,6 +1826,17 @@ mod tests {
             workspace_ids: Vec::new(),
             permissions: Vec::new(),
             roles: Vec::new(),
+        }
+    }
+
+    /// 契约写在对端读得到的那张名片上：每一条 message 都落成一条 goal（问题也是
+    /// 一条要回答的活），这里没有单独的对话通道。对端据此决定要不要在这里「聊」。
+    #[test]
+    fn the_card_says_what_an_a2a_message_becomes() {
+        for card in [card_v03("http://x"), card_v10("http://x")] {
+            let text = card["description"].as_str().expect("a description");
+            assert!(text.contains("no separate conversation channel"), "{text}");
+            assert!(text.contains("decomposed into work"), "{text}");
         }
     }
 
