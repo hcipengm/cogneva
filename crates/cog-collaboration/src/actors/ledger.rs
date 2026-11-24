@@ -234,12 +234,10 @@ fn judge_compile_discipline(root: &str, base: &str, ledger: &std::path::Path) ->
         return 0;
     }
     // 基准：这一轮开工时的代码 rev（与另外两道门同一个数），没有就用 `--base`。
-    let (repo, ok) = git(root, &["rev-parse", "--show-toplevel"]);
-    let pinned = if ok && !repo.is_empty() {
-        round_code_rev(&repo)
-    } else {
-        None
-    };
+    // 轮书住在**台账仓**里，不在代码仓：这一问要问的那本书由台账路径决定。
+    // 在代码仓里找那个 ref 的版本会永远读不到，于是退回 `--base` 量整段历史——
+    // 读数照印，口径却是错的（2026-11-24 实测：这门在推前门上按 origin/main 判）。
+    let pinned = ledger_repo().and_then(|repo| round_code_rev(&repo));
     let baseline = pinned.clone().unwrap_or_else(|| base.to_string());
     let (diff, ok) = git(root, &["diff", "--name-only", &baseline]);
     if !ok {
@@ -288,6 +286,14 @@ fn judge_compile_discipline(root: &str, base: &str, ledger: &std::path::Path) ->
         &baseline[..baseline.len().min(12)]
     );
     0
+}
+
+/// 台账所在的那个 git 仓（台账不在 git 里：`None`）。
+fn ledger_repo() -> Option<String> {
+    let path = ledger_path().ok()?;
+    let dir = path.parent()?.display().to_string();
+    let (repo, ok) = git(&dir, &["rev-parse", "--show-toplevel"]);
+    (ok && !repo.is_empty()).then_some(repo)
 }
 
 /// 轮书上记着的代码 rev（没有开着一轮或读不到：`None`）。

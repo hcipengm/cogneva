@@ -80,6 +80,10 @@ set_round() { # $1 = code_rev
   blob=$(printf '{"code_rev":"%s"}' "$1" | git -C "$tree" hash-object -w --stdin)
   git -C "$tree" update-ref refs/cogneva/round "$blob"
 }
+# 轮书住在台账所在的那个仓：把台账指到夹具树里，那一版 ref 才是这一门该读的。
+printf '| S1 | 终态 | 现在 | — | 未落 |\n' >"$tree/ledger.md"
+git -C "$tree" add ledger.md >/dev/null; git -C "$tree" commit -qm "a ledger"
+export COGNEVA_TODO_LEDGER="$tree/ledger.md"
 set_round "$round_rev"
 touch -d "2000-01-01T00:00:10Z" "$tree/crates/demo/src/lib.rs"
 record "2030-01-01T00:07:00Z" "check"
