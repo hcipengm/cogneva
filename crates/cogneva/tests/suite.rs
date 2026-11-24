@@ -727,6 +727,7 @@ mod word_constants_with_the_same_name_say_the_same_word_test;
 #[path = "work_on_the_tree_is_declared_by_the_task_test.rs"]
 mod work_on_the_tree_is_declared_by_the_task_test;
 #[path = "workload_label_pairs_contract_test.rs"]
+mod a2a_goals_carry_their_origin_test;
 mod workload_label_pairs_contract_test;
 /// Whether a file can share this process with the others.
 ///
