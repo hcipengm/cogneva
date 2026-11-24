@@ -2122,17 +2122,6 @@ async fn record_failed_turn(
 /// 结构体只是把同一组参数挪进另一个括号，而按签名读正文的那些普查（回声的正文来自
 /// 哪个参数、记录的写入在哪一步）会因此失去抓手。
 #[allow(clippy::too_many_arguments)]
-/// 一句话在会话里的稳定后缀：同一句重投得同一个值，不同的句子几乎不撞
-/// （FNV-1a）。它让「这条意图收到过」由库回答，不由调用方记。
-fn intent_suffix(text: &str) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in text.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{hash:016x}")
-}
-
 pub async fn run_chat_turn(
     state: Arc<GatewayState>,
     out: crate::chat_stream::ChatStream,
@@ -4534,17 +4523,5 @@ mod tests {
             out_rx.try_recv().is_err(),
             "没派活的一轮发了一帧：界面上会出现一片空列表"
         );
-    }
-}
-
-#[cfg(test)]
-mod intent_row_tests {
-    use super::intent_suffix;
-
-    /// 同一句话重投得同一个后缀（幂等），换一句话就换（不串）。
-    #[test]
-    fn the_same_sentence_gets_the_same_suffix() {
-        assert_eq!(intent_suffix("先看日志"), intent_suffix("先看日志"));
-        assert_ne!(intent_suffix("先看日志"), intent_suffix("再看指标"));
     }
 }

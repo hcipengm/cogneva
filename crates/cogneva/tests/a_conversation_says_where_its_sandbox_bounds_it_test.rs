@@ -171,6 +171,7 @@ fn conversation(sandbox: Option<Arc<dyn SandboxBackend>>) -> PlatformConversatio
         None,
         None,
         sandbox,
+        None,
     )
 }
 

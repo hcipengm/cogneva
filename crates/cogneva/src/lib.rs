@@ -298,6 +298,9 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // 没装的部署照实缺席，界面读到的是「做不了检查点」。远程执行器
             // 配了的时候这里拿到的是转发那一层，落盘仍在执行器上。
             let sandbox = ctx.consume_service::<dyn cog_core::SandboxBackend>();
+            // 对话那一侧写意图用的同一份落点：与网关的 `GatewayState.intent_events`
+            // 是同一个服务，不另装一个进程级全局槽。
+            let intent_events = ctx.consume_service::<dyn cog_core::IntentEvents>();
             // 平台上每个智能体开头读到的那段话是部署声明的，不是编译进二进制的
             // 一句。声明在 `prompts/` 里，随 ConfigMap 挂进进程；这里把本子交给
             // 内核，任务尝试与界面上的对话都从同一处取。没装提示词插件的进程
@@ -321,6 +324,7 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     mcp,
                     hooks,
                     sandbox,
+                    intent_events,
                 )))
                 .is_err()
             {

@@ -14,37 +14,10 @@
 //! 网关插件里发生一次。
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 
-use chrono::Utc;
 use cog_core::{IntentEvents, IntentRow};
 use tracing::warn;
-
-/// 装好的那个写者。`None` 是「这个进程没接上意图落点」，与「接上了但一句没说」不同。
-fn sink_slot() -> &'static RwLock<Option<Arc<dyn IntentEvents>>> {
-    static SLOT: OnceLock<RwLock<Option<Arc<dyn IntentEvents>>>> = OnceLock::new();
-    SLOT.get_or_init(|| RwLock::new(None))
-}
-
-/// 接线：网关插件从存储插件手里拿到写者时调一次。
-pub fn install(sink: Arc<dyn IntentEvents>) {
-    if let Ok(mut slot) = sink_slot().write() {
-        *slot = Some(sink);
-    }
-}
-
-/// 这台进程的写者，没接上时 `None`。
-pub fn sink() -> Option<Arc<dyn IntentEvents>> {
-    sink_slot().read().ok().and_then(|s| s.clone())
-}
-
-/// 只给测试用：装上/摘下写者，让同一进程里的用例互不污染。
-#[doc(hidden)]
-pub fn install_for_test(sink: Option<Arc<dyn IntentEvents>>) {
-    if let Ok(mut slot) = sink_slot().write() {
-        *slot = sink;
-    }
-}
 
 /// 三个计数。
 ///
@@ -86,60 +59,37 @@ pub fn readings() -> Vec<cog_core::observability::RawMetric> {
     ]
 }
 
-/// 一句话的身份：会话 ＋ 原文的稳定摘要。
+/// 把一行意图写到这个进程的同一个落点。
 ///
-/// 后缀取自原文而不是序号或时刻：同一句重投要落在同一行，否则重连一次、重试一次
-/// 就在事件流里多出一条「属主又说了一遍」。不取时刻的代价是：同一段会话里隔很久
-/// 一字不差地说两遍，只会有一行——那一行仍然在，仍然会被接手，只是第二遍不另算。
-pub fn intent_identity(session_id: &str, text: &str) -> String {
-    format!("chat:{session_id}:{:016x}", fnv1a(text))
-}
-
-/// FNV-1a：只要求稳定与散得开，不要求抗碰撞——它是行身份的后缀，不是凭证。
-fn fnv1a(bytes: &str) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x1000_0000_01b3);
-    }
-    hash
-}
-
-/// 记下这一句。调用方在回声与回答之前调它，**不**因为它失败而中止这一轮。
+/// 写者由调用方交进来（`GatewayState.intent_events`、对话那条路手里的同一份），
+/// 这里不再藏一个进程级全局槽：同一份 sink 只有一个入口，漏装时 `None` 会计进
+/// `unwired`，不会让某一条路安静地不写。
 ///
-/// 空白的一句不是一次到达：没有内容可办，记下来只会让接手那一侧每次都要判一次
-/// 「这是空的」。发出去的那个 `/命令` 是界面动作，不是一句要说的话。
-pub async fn record_turn(session_id: &str, said_by: &str, addressed_to: &str, text: &str) {
-    if text.trim().is_empty() {
+/// 空白的一句不是一次到达；写不进去也不中止调用方那一轮，但失败与未接线分开计数。
+pub async fn record(sink: Option<&Arc<dyn IntentEvents>>, row: IntentRow) {
+    if row.text.trim().is_empty() {
         return;
     }
     let c = counters();
     c.received.fetch_add(1, Ordering::Relaxed);
-    let row = IntentRow {
-        identity: intent_identity(session_id, text),
-        source: "chat".into(),
-        said_by: said_by.to_string(),
-        addressed_to: addressed_to.to_string(),
-        text: text.to_string(),
-        parent: None,
-        at: Utc::now(),
-    };
-    match sink() {
+    match sink {
         Some(sink) => {
             if let Err(e) = sink.record(&row).await {
                 c.failures.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     error = %e,
+                    source = %row.source,
                     identity = %row.identity,
-                    "chat: this turn did not land as an intent; it stays a conversation only"
+                    "this intent did not land; it stays only where it was said"
                 );
             }
         }
         None => {
             c.unwired.fetch_add(1, Ordering::Relaxed);
             warn!(
+                source = %row.source,
                 identity = %row.identity,
-                "chat: no intent sink in this process; this turn stays a conversation only"
+                "no intent sink in this process; this turn stays a conversation only"
             );
         }
     }
@@ -151,8 +101,7 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Mutex;
 
-    /// 写者与三个计数都是进程级的：并行跑的用例会互相装上/摘下写者、把失败数加在
-    /// 别人的分母上。用例一个接一个地跑，同一条线程上的装配才说得清是谁装上的。
+    /// 三个计数是进程级的：并行用例会把失败数加在别人的分母上。
     fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
         static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
         GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -186,55 +135,62 @@ mod tests {
         }
     }
 
-    /// 回答落在「已经记下」之后：这一轮先成为一条意图，再去回答它。
-    #[tokio::test]
-    async fn a_turn_is_recorded_before_it_is_answered() {
-        let _gate = one_at_a_time();
-        let recorder = Arc::new(Recorder::default());
-        install_for_test(Some(recorder.clone()));
-        record_turn("s1", "owner", "", "把这批门禁的归属改回来").await;
-        install_for_test(None);
-        let rows = recorder.rows.lock().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].text, "把这批门禁的归属改回来");
-        assert_eq!(rows[0].source, "chat");
-        assert_eq!(rows[0].said_by, "owner");
+    fn chat_row(session: &str, owner: &str, addressed_to: &str, text: &str) -> IntentRow {
+        IntentRow::new(
+            "chat",
+            cog_core::chat_intent_identity(session, text),
+            owner,
+            addressed_to,
+            text,
+            None,
+        )
     }
 
-    /// 同一句重投是同一行：身份只取会话与原文。
-    #[test]
-    fn the_same_sentence_in_the_same_session_has_one_identity() {
+    /// 一行交给同一个落点；写进去的是入口给的收件人，不是空的。
+    #[tokio::test]
+    async fn a_row_reaches_the_one_sink_with_its_addressee() {
         let _gate = one_at_a_time();
-        assert_eq!(
-            intent_identity("s1", "把这批门禁的归属改回来"),
-            intent_identity("s1", "把这批门禁的归属改回来")
-        );
-        assert_ne!(
-            intent_identity("s1", "把这批门禁的归属改回来"),
-            intent_identity("s2", "把这批门禁的归属改回来")
-        );
-        assert_ne!(
-            intent_identity("s1", "把这批门禁的归属改回来"),
-            intent_identity("s1", "把门禁的归属改回来")
-        );
+        let recorder: Arc<dyn IntentEvents> = Arc::new(Recorder::default());
+        record(
+            Some(&recorder),
+            chat_row("s1", "owner", "luna-1", "把这批门禁的归属改回来"),
+        )
+        .await;
+        let rows = recorder.rows.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, "chat");
+        assert_eq!(rows[0].said_by, "owner");
+        assert_eq!(rows[0].addressed_to, "luna-1");
+        assert_eq!(rows[0].text, "把这批门禁的归属改回来");
     }
 
     /// 空白的一句不是到达；写不进去记成失败，不让它静默变成「没有说过」。
     #[tokio::test]
     async fn an_empty_turn_is_not_an_intent_and_a_failure_is_counted() {
         let _gate = one_at_a_time();
-        let recorder = Arc::new(Recorder {
+        let recorder: Arc<dyn IntentEvents> = Arc::new(Recorder {
             rows: Mutex::default(),
             fail: true,
         });
-        install_for_test(Some(recorder.clone()));
         let before = counters().received.load(Ordering::Relaxed);
-        record_turn("s1", "owner", "", "   ").await;
+        record(Some(&recorder), chat_row("s1", "owner", "luna-1", "   ")).await;
         assert_eq!(counters().received.load(Ordering::Relaxed), before);
         let failures = counters().failures.load(Ordering::Relaxed);
-        record_turn("s1", "owner", "", "这是一句话").await;
-        install_for_test(None);
+        record(
+            Some(&recorder),
+            chat_row("s1", "owner", "luna-1", "这是一句话"),
+        )
+        .await;
         assert!(counters().failures.load(Ordering::Relaxed) > failures);
         assert!(recorder.rows.lock().unwrap().is_empty());
+    }
+
+    /// 没有装写者与写失败是两件事：前者是装配，后者是库。
+    #[tokio::test]
+    async fn an_unwired_process_counts_the_miss() {
+        let _gate = one_at_a_time();
+        let before = counters().unwired.load(Ordering::Relaxed);
+        record(None, chat_row("s1", "owner", "luna-1", "把这件事办了")).await;
+        assert!(counters().unwired.load(Ordering::Relaxed) > before);
     }
 }

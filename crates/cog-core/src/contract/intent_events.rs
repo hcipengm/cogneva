@@ -45,6 +45,29 @@ pub struct IntentRow {
 }
 
 impl IntentRow {
+    /// 一个入口交上来的那一行：身份、谁说的、说给谁、原话、父意图。
+    ///
+    /// `at` 在这里取钟，`identity` 就是幂等键：入口不再自己补两格，否则每多一个
+    /// 入口就多一份「时间怎么取、键怎么拼」的写法。
+    pub fn new(
+        source: impl Into<String>,
+        identity: impl Into<String>,
+        said_by: impl Into<String>,
+        addressed_to: impl Into<String>,
+        text: impl Into<String>,
+        parent: Option<String>,
+    ) -> Self {
+        Self {
+            identity: identity.into(),
+            source: source.into(),
+            said_by: said_by.into(),
+            addressed_to: addressed_to.into(),
+            text: text.into(),
+            parent,
+            at: Utc::now(),
+        }
+    }
+
     /// 幂等键：这一句话的身份。重投拿到同一个键，事件流不写第二行。
     pub fn idempotency_key(&self) -> String {
         self.identity.clone()
@@ -88,6 +111,34 @@ impl IntentRow {
             at,
         })
     }
+}
+
+/// 一条意图的身份：来源加这个来源自己的外部 id。
+///
+/// 来源决定「这句话被谁听见」，外部 id 决定「在这个来源里是哪一句」。两个入口
+/// 用同一个拼法，读面才不必按入口分叉；A2A 的 `goal_id`、对话的
+/// `会话＋原文摘要` 都是这一格。
+pub fn intent_identity(source: &str, external_id: &str) -> String {
+    format!("{source}:{external_id}")
+}
+
+/// 对话那一侧的外部 id：会话加原文的稳定摘要。
+///
+/// 后缀取自原文而不是序号或时刻：同一句重投要落在同一行，否则重连一次、重试一次
+/// 就在事件流里多出一条「属主又说了一遍」。不取时刻的代价是：同一段会话里隔很久
+/// 一字不差地说两遍，只会有一行——那一行仍然在，仍然会被接手，只是第二遍不另算。
+pub fn chat_intent_identity(session_id: &str, text: &str) -> String {
+    intent_identity("chat", &format!("{session_id}:{:016x}", fnv1a(text)))
+}
+
+/// FNV-1a：只要求稳定与散得开，不要求抗碰撞——它是行身份的后缀，不是凭证。
+fn fnv1a(bytes: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
 }
 
 /// 记一条意图。
@@ -169,5 +220,42 @@ mod tests {
     #[test]
     fn the_idempotency_key_is_the_identity() {
         assert_eq!(row().idempotency_key(), "chat:s1:9f2a");
+    }
+
+    /// 身份是「来源＋外部 id」：换来源或换外部 id 都是另一条。
+    #[test]
+    fn identity_is_source_plus_external_id() {
+        assert_eq!(intent_identity("a2a", "goal-7"), "a2a:goal-7");
+        assert_eq!(intent_identity("chat", "s1:9f2a"), "chat:s1:9f2a");
+        assert_ne!(intent_identity("a2a", "g"), intent_identity("agent", "g"));
+    }
+
+    /// 对话的外部 id 只由会话和原文决定；空白不是到达。
+    #[test]
+    fn the_chat_identity_is_stable_and_text_shaped() {
+        let a = chat_intent_identity("s1", "改回来");
+        assert_eq!(a, chat_intent_identity("s1", "改回来"));
+        assert_ne!(a, chat_intent_identity("s2", "改回来"));
+        assert_ne!(a, chat_intent_identity("s1", "改回去"));
+        assert!(a.starts_with("chat:s1:"));
+    }
+
+    /// 构造器把身份与时刻一起补上，入口不再各拼一份。
+    #[test]
+    fn the_constructor_fills_the_identity_time_and_key() {
+        let made = IntentRow::new(
+            "a2a",
+            intent_identity("a2a", "g1"),
+            "u1",
+            "",
+            "写回来",
+            None,
+        );
+        assert_eq!(made.source, "a2a");
+        assert_eq!(made.identity, "a2a:g1");
+        assert_eq!(made.said_by, "u1");
+        assert_eq!(made.addressed_to, "");
+        assert_eq!(made.text, "写回来");
+        assert_eq!(made.idempotency_key(), "a2a:g1");
     }
 }

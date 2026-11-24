@@ -852,9 +852,10 @@ pub async fn backup_postgres(
             offset += chunk.len() as i64;
             cog_core::progress::beat(DATA_PROGRESS_TASK);
         }
-        report
-            .large_objects
-            .push(LargeObjectReport { oid, bytes: offset as u64 });
+        report.large_objects.push(LargeObjectReport {
+            oid,
+            bytes: offset as u64,
+        });
     }
     // 出错时 tx 在 drop 时回滚；成功路径显式提交，把快照释放掉。
     tx.commit().await?;
@@ -1142,10 +1143,9 @@ pub async fn restore_large_objects(
             .fetch_one(&mut *tx)
             .await?;
         if created as u32 != oid {
-            return Err(format!(
-                "asked for oid {oid} and got {created}: the rows point at {oid}"
-            )
-            .into());
+            return Err(
+                format!("asked for oid {oid} and got {created}: the rows point at {oid}").into(),
+            );
         }
         let mut offset = 0usize;
         for chunk in bytes.chunks(BODY_EXPORT_CHUNK as usize) {

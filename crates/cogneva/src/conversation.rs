@@ -317,10 +317,14 @@ pub struct PlatformConversation {
     /// 执行器那一侧。检查点拍的是**那棵树**，所以这件事只能问它；没有接执行器
     /// 的进程照实缺席，界面读到的是「这个部署做不了检查点」，而不是一张空列表。
     sandbox: Option<Arc<dyn cog_core::SandboxBackend>>,
+    /// 意图落点：与网关的 `GatewayState.intent_events` 是同一份。这里只借来写
+    /// 属主在对话里说的那一句；缺席时 `record(None, ...)` 会计进 `unwired`，
+    /// 不会让这一轮安静地不写。
+    intent_events: Option<Arc<dyn cog_core::IntentEvents>>,
 }
 
 impl PlatformConversation {
-    // 十一个入参各自是一件可选能力，没有哪几件天然该合成一个名词：会话要的是
+    // 这些入参各自是一件可选能力，没有哪几件天然该合成一个名词：会话要的是
     // 「这个部署里装了哪些」，把其中几个打包只会让调用方多记一个类型名，
     // 而少掉的参数个数并不能让这行更好读。构造完就各归各位，没有第二处
     // 地方再按这个分组使用它们。
@@ -340,6 +344,7 @@ impl PlatformConversation {
         mcp: Option<Arc<dyn cog_core::McpClient>>,
         hooks: Option<Arc<dyn cog_core::HookEngine>>,
         sandbox: Option<Arc<dyn cog_core::SandboxBackend>>,
+        intent_events: Option<Arc<dyn cog_core::IntentEvents>>,
     ) -> Self {
         Self {
             orchestrator,
@@ -356,6 +361,7 @@ impl PlatformConversation {
             mcp,
             hooks,
             sandbox,
+            intent_events,
         }
     }
 
@@ -872,11 +878,14 @@ impl ConversationTurn for PlatformConversation {
             let owner = Some(request.owner.as_str()).filter(|owner| !owner.trim().is_empty());
             let employee = self.employee_here(owner, &request.session_id).await;
             if let Some(text) = last_user_text(&request.messages) {
-                cog_gateway::intent::record_turn(
-                    &request.session_id,
-                    request.owner.as_str(),
-                    &employee.id,
-                    &text,
+                cog_gateway::intent::record(
+                    self.intent_events.as_ref(),
+                    chat_intent_row(
+                        &request.session_id,
+                        request.owner.as_str(),
+                        &employee.id,
+                        &text,
+                    ),
                 )
                 .await;
             }
@@ -5435,4 +5444,52 @@ fn last_user_text(messages: &[cog_core::Message]) -> Option<String> {
         }
         _ => None,
     })
+}
+
+/// 这一段对话说出口的那一句，落到哪一行意图上。
+///
+/// `addressed_to` 是**正在和属主对话的那个智能体**，不是某个员工的泛指，也不是
+/// 客户端自报的字段；身份只由会话和原文决定，同一句重投是同一行。
+fn chat_intent_row(
+    session_id: &str,
+    owner: &str,
+    employee_id: &str,
+    text: &str,
+) -> cog_core::IntentRow {
+    cog_core::IntentRow::new(
+        "chat",
+        cog_core::chat_intent_identity(session_id, text),
+        owner,
+        employee_id,
+        text,
+        None,
+    )
+}
+
+#[cfg(test)]
+mod chat_intent_row_tests {
+    use super::chat_intent_row;
+
+    /// 收件人是正在和属主对话的那个智能体，不是空的，也不是客户端自报的字段。
+    #[test]
+    fn the_row_names_the_agent_in_the_conversation() {
+        let row = chat_intent_row("s1", "owner", "luna-1", "把这件事办了");
+        assert_eq!(row.source, "chat");
+        assert_eq!(row.said_by, "owner");
+        assert_eq!(row.addressed_to, "luna-1");
+        assert_eq!(row.text, "把这件事办了");
+        assert!(row.identity.starts_with("chat:s1:"));
+    }
+
+    /// 同一段会话里的同一句是同一行；换会话或换原文才是另一行。
+    #[test]
+    fn the_same_sentence_in_the_same_session_is_one_row() {
+        let a = chat_intent_row("s1", "owner", "luna-1", "改回来");
+        let b = chat_intent_row("s1", "owner", "luna-1", "改回来");
+        let c = chat_intent_row("s2", "owner", "luna-1", "改回来");
+        let d = chat_intent_row("s1", "owner", "luna-1", "改回去");
+        assert_eq!(a.identity, b.identity);
+        assert_ne!(a.identity, c.identity);
+        assert_ne!(a.identity, d.identity);
+    }
 }
