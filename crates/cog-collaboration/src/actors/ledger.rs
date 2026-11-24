@@ -580,18 +580,23 @@ pub fn judge_gate(
     if untouched.is_empty() {
         return Ok(done);
     }
-    let Some(split) = split_of(messages) else {
+    let splits = splits_of(messages);
+    if splits.is_empty() {
         return Err(format!(
             "FAIL: 台账上还有 {} 条未完成待办没做完，提交信息里也没有 \
              `Split: <1-4> — <S 号…> — <理由>`。\n      {}",
             untouched.len(),
             untouched.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("、")
         ));
-    };
+    }
+    // 点名看**并集**：每一条声明各自豁免它点的那几条，后一笔的窄声明不该把前一
+    // 笔的豁免一起取消。
+    let declared: std::collections::HashSet<&String> =
+        splits.iter().flat_map(|s| s.declared.iter()).collect();
     let unaccounted: Vec<&String> = untouched
         .iter()
         .copied()
-        .filter(|id| !split.declared.contains(*id))
+        .filter(|id| !declared.contains(id))
         .collect();
     if !unaccounted.is_empty() {
         return Err(format!(
@@ -599,7 +604,10 @@ pub fn judge_gate(
             unaccounted.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("、")
         ));
     }
-    judge_split(&split, touched, item_touches, closed_bound)?;
+    // 理由各自再判一次真假：一条早已不成立的旧理由不能永远替人豁免。
+    for split in &splits {
+        judge_split(split, touched, item_touches, closed_bound)?;
+    }
     Ok(done)
 }
 
@@ -613,14 +621,30 @@ pub struct Split {
 
 /// 从提交信息里读 `Split: <1-4> — <S 号…> — <理由>`；读不到就是没有声明。
 pub fn split_of(messages: &str) -> Option<Split> {
+    splits_of(messages).into_iter().next()
+}
+
+/// 提交信息里的**每一条**拆批声明，按出现顺序（新到旧）。
+///
+/// 每一条都留下来，因为台账说「拆的理由与它排除的那几条一起进历史」，而推之前每
+/// 一条理由都要**再判一次真假**：只认最新一条时，后一笔一个更窄的声明会把更早那
+/// 笔的豁免整条盖掉（2026-11-24 实测：一笔只点名 3 条的声明让另一笔点名的 18 条
+/// 全部变回「既没做也没点名」）；反过来，只取并集而不判理由，会让一条早已不成立
+/// 的旧理由永远替人豁免。
+pub fn splits_of(messages: &str) -> Vec<Split> {
+    let mut out = Vec::new();
     for line in messages.lines() {
         let rest = match line.trim().strip_prefix("Split:") {
             Some(r) => r.trim(),
             None => continue,
         };
         let mut parts = rest.splitn(3, '—');
-        let kind = parts.next()?.trim().chars().next()?;
-        let declared_raw = parts.next()?;
+        let Some(kind) = parts.next().map(|k| k.trim()).filter(|k| !k.is_empty()) else {
+            continue;
+        };
+        let Some(declared_raw) = parts.next() else {
+            continue;
+        };
         let detail = parts.next().unwrap_or("").trim().to_string();
         let declared: Vec<String> = declared_raw
             .split(|c: char| c == ',' || c == '，' || c.is_whitespace())
@@ -628,13 +652,13 @@ pub fn split_of(messages: &str) -> Option<Split> {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect();
-        return Some(Split {
-            kind,
+        out.push(Split {
+            kind: kind.chars().next().unwrap_or('?'),
             declared,
             detail,
         });
     }
-    None
+    out
 }
 
 /// 这条路径动的是回不去的东西：回滚一次提交回不到原状。
@@ -1029,6 +1053,38 @@ mod tests {
         );
         let out_of_set = "Split: 5 — N02 — 随便\n";
         assert!(judge_gate(&batch, &reached, &[], out_of_set, &Default::default(), None).is_err());
+    }
+
+    /// 两条声明各自点名一样：并集算数，后一笔的窄声明不取消前一笔记的豁免。
+    #[test]
+    fn every_split_line_counts_toward_the_same_batch() {
+        let batch = ids(&["N01", "N02", "N03"]);
+        let reached = set(&["N01"]);
+        let messages = "Split: 2 — N02 — 与 crates/a/tests/x.rs 重叠\n\
+                        Split: 2 — N03 — 与 crates/b/tests/y.rs 重叠\n";
+        assert_eq!(
+            judge_gate(&batch, &reached, &[], messages, &Default::default(), None),
+            Ok(1)
+        );
+        // 并集漏一条时仍拒，并点名漏掉的那一条。
+        let narrow = "Split: 2 — N02 — 与 crates/a/tests/x.rs 重叠\n";
+        let verdict =
+            judge_gate(&batch, &reached, &[], narrow, &Default::default(), None).unwrap_err();
+        assert!(verdict.contains("N03"), "{verdict}");
+    }
+
+    /// 每条理由各自再判一次：一条早已不成立的旧理由不能永远替人豁免。
+    #[test]
+    fn an_old_reason_that_no_longer_holds_is_refused() {
+        let batch = ids(&["N01", "N02"]);
+        let reached = set(&["N01"]);
+        // 旧声明用第 4 条（一次读不完），而这一侧只有 1 条、宿主收过 5 条一批：
+        // 那条理由今天不成立。新声明用第 2 条，理由成立。
+        let messages = "Split: 4 — N02 — 一次读不完\n\
+                        Split: 2 — N02 — 与 crates/a/tests/x.rs 重叠\n";
+        let verdict =
+            judge_gate(&batch, &reached, &[], messages, &Default::default(), Some(5)).unwrap_err();
+        assert!(verdict.contains("读不完"), "{verdict}");
     }
 
     /// 声明那一行的形状：编号、点名的条、理由三段，缺一段就是没有声明。
