@@ -67,6 +67,22 @@ pub fn outlet_names() -> Vec<&'static str> {
         .collect()
 }
 
+/// The declared WebSocket event window, or a named refusal for 0.
+///
+/// `tokio::sync::broadcast::channel(0)` panics, so 0 is not a smaller window —
+/// it is not a window at all. The old `.max(16)` turned a declared 0 into a
+/// silent 16, leaving the config surface showing a number that never took
+/// effect.
+fn declared_event_window(config: &cog_core::Config) -> cog_core::SFResult<usize> {
+    let capacity = config.system.websocket_event_cache_capacity;
+    if capacity == 0 {
+        return Err(cog_core::SFError::Config(
+            "system.websocket_event_cache_capacity 声明为 0：WebSocket 事件缓存要一个槽位才能留消息，0 不是更小的窗口（tokio 的 broadcast 通道会直接 panic）。给它一个条数。".into(),
+        ));
+    }
+    Ok(capacity)
+}
+
 /// Names of the outlets this configuration enables, in registration order.
 ///
 /// Built from the same two predicates the registration below uses, so the
@@ -116,8 +132,9 @@ impl cog_core::SystemPlugin for NotificationPlugin {
     async fn init(&mut self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
         let config = ctx.config();
 
-        let broadcast =
-            crate::BroadcastDispatcher::new(config.system.websocket_event_cache_capacity.max(16));
+        // 声明的窗口原样生效；0 在这里按字段名拒绝——广播通道的容量 0 会让
+        // tokio 直接 panic，而 `.max(16)` 会把部署写下的数悄悄换成 16。
+        let broadcast = crate::BroadcastDispatcher::new(declared_event_window(config)?);
         let tx = broadcast.sender();
 
         // 广播出口不进投递读数：它没有"投递失败"这回事，没有 WebSocket 订阅者
@@ -271,6 +288,24 @@ mod tests {
         let config = cog_core::Config::default();
         assert!(enabled_outlets(&config).is_empty());
         assert_eq!(address(&config.gateway.notification_webhook_url), None);
+    }
+
+    /// 声明的 WebSocket 事件窗口原样生效，0 在装配处按字段名拒绝。
+    ///
+    /// 没有这条测试，`.max(16)` 回来时没人会红：部署写下的 0 被换成 16，
+    /// 配置面读到的仍是「生效值」。
+    #[test]
+    fn a_declared_event_window_survives_and_zero_is_refused() {
+        let mut config = cog_core::Config::default();
+        config.system.websocket_event_cache_capacity = 7;
+        assert_eq!(declared_event_window(&config).unwrap(), 7);
+
+        config.system.websocket_event_cache_capacity = 0;
+        let err = declared_event_window(&config).unwrap_err().to_string();
+        assert!(
+            err.contains("websocket_event_cache_capacity"),
+            "声明 0 的错误要点名这个字段，实际是：{err}"
+        );
     }
 
     /// An empty address is an absent address: manifests render unset keys as
