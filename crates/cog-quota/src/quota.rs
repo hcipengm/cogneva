@@ -398,6 +398,19 @@ impl QuotaChecker {
     }
 }
 
+/// 把配额层的拒绝折进接口层的错误类型，**保留它是哪一类**。
+///
+/// 从前两个充值入口一律折成 `Internal`，于是「抬一个没人声明过的格子」这种
+/// 调用方错误到网关时与数据库故障长得一样，网关只能答 500；即便它多写一个
+/// 400 分支也没有东西可匹配。`InvalidArgument` 说的是「这份请求本身不成立」，
+/// 对到 `Validation`（接口层译为 400）；其余的仍是服务端故障。
+fn refusal_kind(error: QuotaError) -> cog_core::SFError {
+    match error {
+        QuotaError::InvalidArgument(message) => cog_core::SFError::Validation(message),
+        other => cog_core::SFError::Internal(other.to_string()),
+    }
+}
+
 #[async_trait::async_trait]
 impl cog_core::QuotaManager for QuotaManager {
     async fn pre_check(
@@ -458,7 +471,7 @@ impl cog_core::QuotaManager for QuotaManager {
     ) -> cog_core::SFResult<()> {
         self.recharge(user_id, tokens, valid_until)
             .await
-            .map_err(|e| cog_core::SFError::Internal(e.to_string()))
+            .map_err(refusal_kind)
     }
 
     async fn recharge_workspace(
@@ -469,6 +482,6 @@ impl cog_core::QuotaManager for QuotaManager {
     ) -> cog_core::SFResult<()> {
         self.recharge_workspace(workspace_id, tokens, valid_until)
             .await
-            .map_err(|e| cog_core::SFError::Internal(e.to_string()))
+            .map_err(refusal_kind)
     }
 }

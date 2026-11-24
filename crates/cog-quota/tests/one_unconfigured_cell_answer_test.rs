@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use cog_core::{
-    HierarchyDecision, HierarchyManager, QuotaContext, QuotaLimits, QuotaScope, SFResult,
-    UsageHistoryEntry,
+    HierarchyDecision, HierarchyManager, QuotaContext, QuotaLimits, QuotaScope, QuotaManager as _,
+    SFError, SFResult, UsageHistoryEntry,
 };
 use cog_quota::QuotaManager;
 
@@ -101,5 +101,15 @@ async fn a_cell_nobody_declared_cannot_be_raised_from_a_default() {
     assert!(
         hierarchy.written.lock().unwrap().is_none(),
         "被拒的充值不许留下任何一对上限：落回默认值写下去，就等于替属主声明了一个没人量过的数"
+    );
+
+    // 同一条拒绝穿过接口层（网关拿到的就是这一层的返回值）时仍要是「这份请求
+    // 不成立」，而不是「服务端故障」：折成 `Internal` 的话网关只能答 500，
+    // 调用方读不到缺的是「先声明一对上限」这一步。
+    let through_the_trait =
+        <QuotaManager as cog_core::QuotaManager>::recharge(&manager, "someone", 10, None).await;
+    assert!(
+        matches!(through_the_trait, Err(SFError::Validation(_))),
+        "调用方错误到接口层要仍是调用方错误：{through_the_trait:?}"
     );
 }
