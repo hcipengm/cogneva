@@ -49,3 +49,7 @@ evolution-patches/
 deploy/.rendered.lock
 
 __pycache__/
+
+# Per-checkout Claude Code settings: a hook that only this working copy wants
+# is not part of what the repository ships.
+.claude/
