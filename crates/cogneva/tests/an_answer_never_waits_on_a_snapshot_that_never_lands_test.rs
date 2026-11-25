@@ -26,7 +26,7 @@ use crate::common::orchestrator::control;
 use cog_core::{
     AssistantMessageEvent, ChatOptions, ChatResponse, ContentBlock, KeyValueStore, LlmClient,
     Message, SFError, SFResult, SandboxBackend, SandboxPayload, SandboxRequest, SandboxResult,
-    StopReason, ToolRegistry as _,
+    StopReason,
 };
 use cog_gateway::chat::{ConversationRequest, ConversationTurn};
 use cogneva::conversation::{Ledgers, PlatformConversation};
