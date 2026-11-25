@@ -292,6 +292,11 @@ jobs:
       # 判据：换版脚本 apply 这一份时必须带 --server-side，且这一步不许整个消失。
       - name: Check the big ConfigMap is applied server-side
         run: bash deploy/scripts/tests/big-configmap-applies-server-side.test.sh
+      # StatefulSet 的 `spec.volumeClaimTemplates` 不可变：整份 apply 一份由 chart 建出来
+      # 的对象会被 apiserver 以 `field is immutable` 拒收，换版停在这一步（实测 2026-11-25）。
+      # 判据：换版脚本对这一份先判存在性，在则只 patch Pod 模板。
+      - name: Check the executor StatefulSet is patched, not re-applied
+        run: bash deploy/scripts/tests/executor-statefulset-is-patched-not-reapplied.test.sh
       # 批次纪律那四道门各自的判据，在 CI 与本机跑同一份夹具：本机绿而 CI 红过一次
       # （或者反过来），说明判据在两边不是同一条。
       - name: Check the batch gate judges what it claims

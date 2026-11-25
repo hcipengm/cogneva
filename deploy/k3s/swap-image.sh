@@ -395,9 +395,26 @@ if [ "$DO_DEPLOY" = 1 ]; then
   # 被拒（`metadata.annotations: Too long: may not be more than 262144 bytes`），
   # 换版停在那儿。server-side 不写这条注解，对象本身仍受 etcd 默认的 1.5MiB 上限约束。
   kubectl apply --server-side -f deploy/k3s/cogneva-json-configmap.yaml
-  # 沙箱执行器（第 5 Pod）：statefulset+service 幂等 apply，主应用经
-  # system.sandbox_executor_url 路由 run_command/read_file/write_file 到此。
-  kubectl apply -f deploy/k3s/sandbox-executor-statefulset.yaml
+  # 沙箱执行器（第 5 Pod）：主应用经 system.sandbox_executor_url 路由
+  # run_command/read_file/write_file 到此。
+  #
+  # 对象**已存在**时不能整份 apply：`spec.volumeClaimTemplates` 是不可变字段，而它
+  # 上面带的是安装来源标签（chart 装出来的那份有 instance/managed-by，静态清单没有）。
+  # apply 想改这个字段，apiserver 以 `spec.volumeClaimTemplates: Invalid value: …:
+  # field is immutable` 拒收——client-side 与 server-side 同一条（实测 2026-11-25，
+  # 换版跑到这一步会停；这台集群是 helm 装的，静态清单是从那以后第一次 apply 它）。
+  # 已存在 ⇒ 只 patch 能变的那棵子树（Pod 模板里就是镜像、env、资源声明）；不存在
+  # ⇒ 照常 apply，对象由静态清单建出来。
+  if kubectl -n "$NS" get statefulset cogneva-sandbox-executor >/dev/null 2>&1; then
+    exec_patch="$(kubectl create --dry-run=client -o json \
+      -f deploy/k3s/sandbox-executor-statefulset.yaml \
+      | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({"spec": {"template": d["spec"]["template"]}}))')"
+    kubectl -n "$NS" patch statefulset cogneva-sandbox-executor \
+      --type=strategic -p "$exec_patch" >/dev/null
+    echo "    执行器 StatefulSet 已存在：patch Pod 模板（卷模板不可变，整份 apply 会被拒）"
+  else
+    kubectl apply -f deploy/k3s/sandbox-executor-statefulset.yaml
+  fi
   kubectl apply -f deploy/k3s/sandbox-executor-service.yaml
   # 集群内镜像仓库（金丝雀 overlay 秒级分发通道），随换版幂等落地存量集群
   kubectl apply -f deploy/k3s/cluster-registry.yaml
