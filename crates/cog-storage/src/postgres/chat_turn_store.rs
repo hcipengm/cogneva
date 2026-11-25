@@ -360,6 +360,11 @@ impl ChatTurnStore for PostgresChatTurnStore {
     }
 
     async fn history(&self, session_id: &str, limit: usize) -> SFResult<Vec<ChatTurn>> {
+        // `limit` is the caller's ask, not the store's bound: the window is the
+        // per-session bound, and a caller asking for more than it is served the
+        // window. Without this clamp the HTTP layer's own 500 would read 500
+        // lines of a session the constant says is kept to 200.
+        let limit = limit.min(ROWS_KEPT_PER_SESSION as usize);
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -386,6 +391,9 @@ impl ChatTurnStore for PostgresChatTurnStore {
     }
 
     async fn transcript(&self, session_id: &str, limit: usize) -> SFResult<Vec<ChatTurnRecord>> {
+        // The same window as `history`: the reader's page size may narrow it,
+        // never widen it. The HTTP layer's `limit` comes from the client.
+        let limit = limit.min(ROWS_KEPT_PER_SESSION as usize);
         if limit == 0 {
             return Ok(Vec::new());
         }
