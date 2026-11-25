@@ -107,16 +107,21 @@ assert body == projection, "写回去的正文与渲染投影的解析结果不�
 assert body["system"]["pg_max_connections"] == 20, "写回去的是旧值"
 PY
 
-# ---- 4. chart 改了但投影没重算：红在「投影落后」，不拿旧投影当对齐 ----
-# 静态基线抄投影，所以源文件动了、投影没动时，写回只会把旧投影再抄一遍。
-# 这条必须是红的：否则「配置改了、忘了重渲染」会一路绿到集群里。
+# ---- 4. 投影落后于源文件：红在「投影落后」，不拿旧投影当对齐 ----
+# 静态基线抄投影，两侧不一致时写回只会把其中一侧再抄一遍，而另一侧的话没有人说。
+# 这条必须是红的：否则一处没跟上的投影会一路绿到集群里。
+#
+# 摆的是**投影**那一侧，不是源文件：改了 chart 之后，`--check` 自己会先重渲一遍
+# （生成器按输入摘要决定要不要重来），于是「源文件动了、投影没跟上」在带生成器的
+# 树上根本摆不出来——那正是它存在的理由。留下来的形态是两侧不一致本身（换了
+# helm、手改过产物、某次摘要读错）：判词对它就够了——不一致 ⇒ 红，并点名哪个键。
 root="$(case_dir config-unrendered)"
 python3 - "${root}" <<'PY'
 import sys, pathlib
-p = pathlib.Path(sys.argv[1]) / "deploy/helm/cogneva/files/cogneva.json"
+p = pathlib.Path(sys.argv[1]) / "deploy/rendered/k3s-single/10-configmap-cogneva-json.yaml"
 s = p.read_text()
-assert '"pg_max_connections": 16' in s, "夹具依赖的值不在 chart 配置里了"
-p.write_text(s.replace('"pg_max_connections": 16', '"pg_max_connections": 20', 1))
+assert '"pg_max_connections": 16' in s, "夹具依赖的值不在渲染投影里了"
+p.write_text(s.replace('"pg_max_connections": 16', '"pg_max_connections": 15', 1))
 PY
 out="$(run "${root}" --check)" && fail "投影落后时 --check 应当非零：${out}"
 expect_red_naming "投影落后" "${out}" "deploy/k3s/cogneva-json-configmap.yaml"
