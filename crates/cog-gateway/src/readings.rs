@@ -1168,6 +1168,28 @@ pub const WORKLOAD_MEMORY_DERIVED: ReadingSpec = ReadingSpec {
     produced_by: "crates/cog-reflection/src/workload_resources.rs",
 };
 
+/// A container the kernel killed for exceeding its memory limit, with the raise
+/// not yet landed.
+///
+/// The working-set half cannot see this: a sample says how much the container
+/// used, and a kill says the cap was below what it needed — the second is a
+/// measurement of the limit being wrong, and no usage reading produces it. While
+/// this reads 1 the loop holds evidence it has not spent; a limit that sits
+/// still with this at 0 is a limit that measured sufficient, not one whose
+/// write failed.
+pub const WORKLOAD_OOM_KILLED: ReadingSpec = ReadingSpec {
+    id: "workload_oom_killed",
+    title: "被内存上限杀掉、上限还没抬的容器",
+    group: ReadingGroup::Infra,
+    query: "max(cogneva_workload_oom_killed) or on() max(cogneva_workload_resources_evaluations_total)",
+    unit: "个容器",
+    warn: Some(1.0),
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_workload_oom_killed",
+    produced_by: "crates/cog-reflection/src/workload_resources.rs",
+};
+
 /// The default resources the namespace's LimitRange hands to containers that
 /// declare none.
 ///
@@ -1395,7 +1417,7 @@ pub const LLM_EXCHANGE_RATE: ReadingSpec = ReadingSpec {
     produced_by: "crates/cog-observability/src/exchange_retention.rs",
 };
 
-pub const READINGS: [&ReadingSpec; 68] = [
+pub const READINGS: [&ReadingSpec; 69] = [
     &DISK_FREE,
     &EVENT_STREAM_VOLUME,
     &EVENT_UNDECODABLE,
@@ -1457,6 +1479,7 @@ pub const READINGS: [&ReadingSpec; 68] = [
     &PRINCIPLE_LEDGER_ROWS,
     &WORKLOAD_CPU_DERIVED,
     &WORKLOAD_MEMORY_DERIVED,
+    &WORKLOAD_OOM_KILLED,
     &LIMIT_RANGE_DEFAULTS,
     &PACING_TARGET,
     &RETENTION_TARGET_ROWS,
