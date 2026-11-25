@@ -1681,6 +1681,11 @@ fn report_outcome(
 }
 
 /// One watcher tick: scan task state, emit intents for active signals.
+// Each argument is an independent source the tick reads or a coordinate of the
+// one round (which orchestrator, which config, which set of sources is wired,
+// and the two pieces of state carried between rounds); bundling them into a
+// carrier would move the same count behind a name.
+#[allow(clippy::too_many_arguments)]
 async fn tick(
     orch: &Arc<dyn OrchestratorControl>,
     config: &SignalWatcherConfig,
@@ -2311,6 +2316,9 @@ fn round_ticker(interval: Duration) -> tokio::time::Interval {
 
 /// Background loop; follows the same shutdown pattern as the baseline port
 /// trigger loop.
+// Same shape as `tick`: the sources are wired independently and the caller is
+// the composition root, so a carrier struct here would only rename the wiring.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_signal_watcher_loop(
     orchestrator: Arc<dyn OrchestratorControl>,
     config: SignalWatcherConfig,

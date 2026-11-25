@@ -188,6 +188,9 @@ mod tests {
 
     /// 回答落在「已经记下」之后：这一轮先成为一条意图，再去回答它。
     #[tokio::test]
+    // 这道闸是串行器，不是共享状态：装上去的是一条进程全局，锁要跨过测试里的
+    // 每一个 await，别的测试才不会在它中途把它换掉。std 锁跨 await 是这里的目的。
+    #[allow(clippy::await_holding_lock)]
     async fn a_turn_is_recorded_before_it_is_answered() {
         let _gate = one_at_a_time();
         let recorder = Arc::new(Recorder::default());
@@ -221,6 +224,8 @@ mod tests {
 
     /// 空白的一句不是到达；写不进去记成失败，不让它静默变成「没有说过」。
     #[tokio::test]
+    // 同一道串行器：计数与那个进程全局都得整段测试独占。
+    #[allow(clippy::await_holding_lock)]
     async fn an_empty_turn_is_not_an_intent_and_a_failure_is_counted() {
         let _gate = one_at_a_time();
         let recorder = Arc::new(Recorder {

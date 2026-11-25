@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use cog_core::{
-    HierarchyDecision, HierarchyManager, QuotaContext, QuotaLimits, QuotaManager as _, QuotaScope,
-    SFError, SFResult, UsageHistoryEntry,
+    HierarchyDecision, HierarchyManager, QuotaContext, QuotaLimits, QuotaScope, SFError, SFResult,
+    UsageHistoryEntry,
 };
 use cog_quota::QuotaManager;
 
