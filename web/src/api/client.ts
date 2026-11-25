@@ -3103,7 +3103,12 @@ export async function getWorkbench(): Promise<WorkbenchPage> {
 // ── 能力 ──
 
 /** 一项动作从哪来。同名不同源是两行。 */
-export type CapabilitySource = 'builtin' | 'plugin' | 'mcp';
+export type CapabilitySource =
+  | 'builtin'
+  | 'plugin'
+  | 'mcp'
+  /** 对话层在一轮里装上去的工具：只属于那一段对话，共用注册表里没有它们。 */
+  | 'conversation';
 
 /**
  * 这一项此刻能不能真的被调起来。

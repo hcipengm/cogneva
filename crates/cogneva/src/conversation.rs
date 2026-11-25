@@ -317,6 +317,13 @@ pub struct PlatformConversation {
     /// 执行器那一侧。检查点拍的是**那棵树**，所以这件事只能问它；没有接执行器
     /// 的进程照实缺席，界面读到的是「这个部署做不了检查点」，而不是一张空列表。
     sandbox: Option<Arc<dyn cog_core::SandboxBackend>>,
+    /// 最近一轮交给模型的那张表，相对进程共用表多出来的那几只。
+    ///
+    /// 能力页读的就是这一格（`ConversationTurn::offered_tools`）。它由**那一轮
+    /// 自己**在装上工具之后写下，不是另列一张清单：清单会漂，而这一格是那一轮
+    /// 实际递出去的东西本身。还没有一轮跑过时是 `None`，读的人看到的是
+    /// 「还没跑过一轮」，不是「这一层零项」。
+    surface: std::sync::Mutex<Option<Vec<Tool>>>,
 }
 
 impl PlatformConversation {
@@ -356,6 +363,7 @@ impl PlatformConversation {
             mcp,
             hooks,
             sandbox,
+            surface: std::sync::Mutex::new(None),
         }
     }
 
@@ -787,6 +795,14 @@ impl ConversationTurn for PlatformConversation {
         })
     }
 
+    /// 最近一轮交给模型的那张表里，共用表之外的那几只。
+    ///
+    /// 没有一轮跑过时是 `None`：这一格答的是「那一轮里手上真有什么」，还没跑过
+    /// 就没有答案，而不是零项。
+    fn offered_tools(&self) -> Option<Vec<Tool>> {
+        self.surface.lock().ok().and_then(|slot| slot.clone())
+    }
+
     fn choose_model<'a>(
         &'a self,
         owner: &'a str,
@@ -1098,10 +1114,12 @@ impl ConversationTurn for PlatformConversation {
             // 而不是启动时缓存：远端那张表是会变的，缓存一份等于把「今天有
             // 什么」钉在进程启动的那一刻。问不到时就一只也没有——这一轮如实
             // 少掉它们，而不是拿昨天的表冒充今天的。
+            let mut mcp_names: Vec<String> = Vec::new();
             let mcp_report = match self.mcp.as_ref() {
                 Some(client) => {
                     let listed = crate::mcp_tools::tools(Arc::clone(client)).await;
                     for tool in &listed.tools {
+                        mcp_names.push(tool.name.clone());
                         tools.register(tool.clone());
                     }
                     Some(listed.report())
@@ -1174,6 +1192,28 @@ impl ConversationTurn for PlatformConversation {
                     files_seen: None,
                 },
             ));
+            // 能力页要读的那一格：这一轮交给模型的表里，共用表之外多出来的那几只。
+            // 在 `with_tools` 之前写，读到的就是**这一轮实际递出去**的那一份；再晚
+            // 一步，表已经进了运行时，这一格与屏幕上说的就不再是同一个东西。
+            //
+            // 远端 MCP 的那几只不算这一层的增量：能力页上它们是独立的一层，算进来
+            // 同一个名字会在两处各印一遍。
+            {
+                let shared: std::collections::BTreeSet<String> = self
+                    .tools
+                    .as_ref()
+                    .map(|shared| shared.names().into_iter().collect())
+                    .unwrap_or_default();
+                let remote: std::collections::BTreeSet<String> = mcp_names.into_iter().collect();
+                let offered: Vec<Tool> = tools
+                    .definitions()
+                    .into_iter()
+                    .filter(|tool| !shared.contains(&tool.name) && !remote.contains(&tool.name))
+                    .collect();
+                if let Ok(mut slot) = self.surface.lock() {
+                    *slot = Some(offered);
+                }
+            }
             let mut runtime = cog_agent::AgentRuntime::new(config, events).with_tools(tools);
             // 属主写下的约定：只在这条连接既是某个登录身份、又接上了键值存储时
             // 才挂读面。没有身份就没有「属主」，读不到任何一个人的话——不挂，
