@@ -940,6 +940,23 @@ fn is_stream_stall(error: &SFError) -> bool {
     matches!(error, SFError::Agent(msg) if msg.starts_with(STREAM_STALL_PREFIX))
 }
 
+/// 声明的停滞窗变成运行时的窗。
+///
+/// 声明的窗原样生效：0 秒不是「立刻算死」的另一种写法，而是一个读不出
+/// 「多久没吭声」的窗——时钟每收到一个流事件就拨回，0 秒让每条流在第一个静默
+/// 瞬间判死。按名字拒绝它，不在这一层悄悄换成一个数。
+///
+/// 拒绝的那句话写给运维看，不写给模型看；放在 `think_stream_with` 外面，
+/// 那个函数整段字面量都算模型每回合要付的字节。
+fn declared_stall_window(secs: u64) -> SFResult<Duration> {
+    if secs == 0 {
+        return Err(SFError::Config(
+            "think_stall_timeout_secs 为 0 秒：停滞窗要一个周期才能判「多久没吭声」。".into(),
+        ));
+    }
+    Ok(Duration::from_secs(secs))
+}
+
 /// The status a conversation turn's result carries when it ends on an answer.
 ///
 /// The other endings name themselves in the result already (the budget one is
@@ -4017,15 +4034,7 @@ impl AgentRuntime {
         // Stall-based hang protection: the clock resets on every stream event,
         // so a slow-but-alive generation is never aborted — only a connection
         // that stops making progress for the full window is treated as dead.
-        // 声明的窗原样生效：0 秒不是「立刻算死」的另一种写法，而是一个读不出
-        // 「多久没吭声」的窗。拒绝它，不在这一层悄悄换成一个数。
-        let stall_secs = self.config.think_stall_timeout_secs;
-        if stall_secs == 0 {
-            return Err(SFError::Config(
-                "think_stall_timeout_secs 为 0 秒：停滞窗要一个周期才能判「多久没吭声」。".into(),
-            ));
-        }
-        let stall_timeout = Duration::from_secs(stall_secs);
+        let stall_timeout = declared_stall_window(self.config.think_stall_timeout_secs)?;
         let stall_err = |phase: &str| {
             SFError::Agent(format!(
                 "{STREAM_STALL_PREFIX} for {}s while {} for agent {}",
@@ -4822,6 +4831,26 @@ mod tests {
         assert_eq!(restored.state, RuntimeState::Observing);
         assert_eq!(restored.role(), "reviewer");
         assert_eq!(restored.config.agent_id, "before-the-snapshot");
+    }
+
+    /// 声明的窗原样生效；0 秒被点名拒绝，而不是在这一层被换成 1 秒。
+    ///
+    /// 配置装配面已经拒过同一个 0（`AgentLoopConfig`），但 `RuntimeConfig` 也能
+    /// 不经那一层直接构造——读它的这一层若不拒，那类调用者拿到的是一个它没声明的窗。
+    #[test]
+    fn a_declared_stall_window_survives_and_zero_is_refused() {
+        assert_eq!(
+            declared_stall_window(7).expect("7 秒是一个窗"),
+            Duration::from_secs(7)
+        );
+        let err = declared_stall_window(0).expect_err("0 秒不是一个窗");
+        match err {
+            SFError::Config(msg) => assert!(
+                msg.contains("think_stall_timeout_secs"),
+                "拒绝要点名是哪一格：{msg}"
+            ),
+            other => panic!("0 秒应以配置错误拒绝，得到 {other:?}"),
+        }
     }
 
     /// 名册上只有这一位，工号由测试指定。
