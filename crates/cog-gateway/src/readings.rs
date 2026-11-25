@@ -1181,7 +1181,8 @@ pub const WORKLOAD_OOM_KILLED: ReadingSpec = ReadingSpec {
     id: "workload_oom_killed",
     title: "被内存上限杀掉、上限还没抬的容器",
     group: ReadingGroup::Infra,
-    query: "max(cogneva_workload_oom_killed) or on() max(cogneva_workload_resources_evaluations_total)",
+    query:
+        "max(cogneva_workload_oom_killed) or on() max(cogneva_workload_resources_evaluations_total)",
     unit: "个容器",
     warn: Some(1.0),
     crit: None,

@@ -3000,7 +3000,8 @@ mod tests {
         assert_eq!(limit_after_oom(1392 * mib), 1680 * mib);
         // 换一个被杀上限，给出的目标跟着走——它由输入决定。
         assert!(limit_after_oom(2048 * mib) > limit_after_oom(1392 * mib));
-        // 2048 × 1.2 = 2457.6Mi，量化到 16Mi 的整数倍 ⇒ 2464Mi。
+        // 例如 2048 × 1.2 = 2457.6Mi，量化到 16Mi 的整数倍 ⇒ 2464Mi——这是算式，
+        // 不是哪台机器的容量。
         assert_eq!(limit_after_oom(2048 * mib), 2464 * mib);
         // 抬，不压：任何被杀过的上限都不会被它缩小。
         for limit in [16 * mib, 64 * mib, 1392 * mib, 4 * 1024 * mib] {
