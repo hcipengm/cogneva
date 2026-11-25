@@ -309,7 +309,7 @@ impl SecurityGatewayConfig {
             domain_denylist: list("COGNEVA_SG_DOMAIN_DENYLIST"),
             llm_upstreams: upstreams_from_env(),
             llm_pool_min_healthy: min_healthy_from_env(),
-            llm_health_probe_secs: env_u64("COGNEVA_LLM_HEALTH_PROBE_SECS", 300),
+            llm_health_probe_secs: env_u64(LLM_HEALTH_PROBE_SECS_ENV, 300),
             github_token: token("COGNEVA_GITHUB_TOKEN"),
             gitee_token: token("COGNEVA_GITEE_TOKEN"),
             search_fallback_upstreams: crate::search_fallback::upstreams_from_env(),
@@ -407,6 +407,10 @@ fn upstreams_from_env() -> Vec<LlmUpstream> {
 /// 而「没配」与「配在另一个拼法的名字下」在结果上同形。
 pub(crate) const GITHUB_OAUTH_CLIENT_ID_ENV: &str = "COGNEVA_GITHUB_OAUTH_CLIENT_ID";
 pub(crate) const LLM_POOL_MIN_HEALTHY_ENV: &str = "COGNEVA_LLM_POOL_MIN_HEALTHY";
+/// 上游健康探测间隔那一格的部署名。配置装配读它取值、`run` 读它做「0 秒按名字拒绝」，
+/// 测试也拿它断言错误文本点名了哪一格——三处各写一遍时，改名只改一处不会报错，
+/// 而拒绝那一步会指着一个再也没人设置的名字。
+pub(crate) const LLM_HEALTH_PROBE_SECS_ENV: &str = "COGNEVA_LLM_HEALTH_PROBE_SECS";
 
 /// 声明的冗余下限：上面那个环境变量，与上游池同一次写入 Secret 的那个值
 /// （llm-config 单入口里的一个整数）。
@@ -11380,10 +11384,7 @@ pub async fn run(
     // 两个节拍都是部署声明的：声明 1 秒就跑 1 秒，0 秒是忙等不是一个节拍，
     // 在这里按名字拒绝——不在读它的那一层悄悄抬成 5 秒或 30 秒。
     declared_cadence(cog_core::env::LLM_POOL_CHECK_SECS, config.pool_check_secs)?;
-    declared_cadence(
-        "COGNEVA_LLM_HEALTH_PROBE_SECS",
-        config.llm_health_probe_secs,
-    )?;
+    declared_cadence(LLM_HEALTH_PROBE_SECS_ENV, config.llm_health_probe_secs)?;
     // 本进程的出站客户端由装配层造好交进来（本 crate 不认具体实现）。交回给
     // `contribution_admin`，那些调 github/gitee 的请求与这里其余出站就确实是
     // 同一份设置，而不是各自从配置造出来的第二份。
@@ -11571,11 +11572,8 @@ mod tests {
             declared_cadence("COGNEVA_LLM_POOL_CHECK_SECS", 300).unwrap(),
             300
         );
-        let refused = declared_cadence("COGNEVA_LLM_HEALTH_PROBE_SECS", 0).unwrap_err();
-        assert!(
-            refused.contains("COGNEVA_LLM_HEALTH_PROBE_SECS"),
-            "{refused}"
-        );
+        let refused = declared_cadence(LLM_HEALTH_PROBE_SECS_ENV, 0).unwrap_err();
+        assert!(refused.contains(LLM_HEALTH_PROBE_SECS_ENV), "{refused}");
     }
 
     /// A proxied call that names its caller, which every real caller does.

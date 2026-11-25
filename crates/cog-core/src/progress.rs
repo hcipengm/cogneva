@@ -63,7 +63,9 @@ pub const SAMPLE_FLOOR: usize = sample_floor(SILENCE_QUANTILE);
 /// lands a hair either side of 1000 (0.9999 divides to 10000.0000000011), and a
 /// ceiling would turn that hair into a whole extra sample.
 const fn sample_floor(quantile: f64) -> usize {
-    (1.0 / (1.0 - quantile)).round() as usize
+    // `.round()` is only const-stable since 1.90, above this tree's MSRV; adding
+    // half before the truncating cast rounds the same way for a positive value.
+    (1.0 / (1.0 - quantile) + 0.5) as usize
 }
 
 fn beacons() -> &'static Mutex<HashMap<String, Instant>> {
