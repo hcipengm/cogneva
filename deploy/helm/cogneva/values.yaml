@@ -530,9 +530,14 @@ gateway:
   # 若下一代仍贴住这一档，说明增长没有界，那时候要查的是权重共享（dense 与
   # sparse 两个 session 各装一份同一份权重文件）或泄漏，而不是再抬一次天花板。
   #
-  # requests 6Gi：request 声明的是调度器为这个 Pod 预留多少，而实测暖机后的稳态
-  # 实测就在 6.46GiB 上下——低于它等于把本 Pod 排到节点压力的第一个驱逐位。这次抬完命名
-  # 空间 requests 合计约等于稳态之和，仍在节点可分配量与配额之内（见投影产物）。
+  # requests 是种子，不是稳态声明。这张表不描述任何一台机器（同一份 values 会被排到
+  # 单节点、多节点、别人的集群上），所以写进 request 的数只能是与机器无关的量；而
+  # 6.46GiB 这份稳态恰恰是在一台机器上量出来的。实测 2026-11-24：6Gi 的种子在一台
+  # allocatable 5.55GiB 的节点上让新副本一直 Pending，而把 request 写回实测值的正是
+  # 那条按 p95 回写的闭环——闭环要靠 Pod 跑起来才拿得到样本。种子写大了，纠正它的
+  # 那条环永远启动不了。所以种子取闭环自己的量化格（`MEMORY_QUANTUM_BYTES`，默认 16Mi）：
+  # 它是这条律能从种子上动起来的最小一步，也是任何节点都排得下的最小声明。稳态由闭环
+  # 按 p95 写回，天花板由 limits 兜住（见上）。
   resources:
     requests:
       # tunable:
@@ -552,9 +557,12 @@ gateway:
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
+      # why: The declared seed is the loop's own quantum (`MEMORY_QUANTUM_BYTES`), not a footprint: this
+      # why: chart sees no node, and a seed above a node's allocatable leaves the pod Pending -- the loop that
+      # why: would replace the seed with the measured p95 then never gets its first sample (live: 2026-11-24).
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_MEMORY_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
-      memory: 6Gi
+      memory: 16Mi
     limits:
       # tunable:
       # why: The CPU bound rises with the measured draw and never falls below this declared value: the loop
