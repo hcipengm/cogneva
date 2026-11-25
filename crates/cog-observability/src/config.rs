@@ -1422,9 +1422,8 @@ mod tests {
         );
 
         for field in ["flush_interval_sec", "max_batch_size"] {
-            let zero = format!(
-                r#"{{"observability": {{"loki": {{"enabled": true, "{field}": 0}}}}}}"#
-            );
+            let zero =
+                format!(r#"{{"observability": {{"loki": {{"enabled": true, "{field}": 0}}}}}}"#);
             std::fs::write(&path, zero).unwrap();
             let err = ObservabilityExportersConfig::load_from(&path)
                 .unwrap_err()

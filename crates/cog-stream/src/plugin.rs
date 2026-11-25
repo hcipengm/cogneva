@@ -220,9 +220,7 @@ fn memory_fallback(config: &cog_core::config::SystemConfig) -> crate::MemoryMess
 /// it is not a window at all. The old `.max(1)` turned the declared 0 into a
 /// silent 1, which left the config surface showing a number that never took
 /// effect; the refusal keeps the declaration and the behavior on one value.
-fn declared_broadcast_window(
-    config: &cog_core::config::SystemConfig,
-) -> cog_core::SFResult<usize> {
+fn declared_broadcast_window(config: &cog_core::config::SystemConfig) -> cog_core::SFResult<usize> {
     if config.memory_message_broadcast_capacity == 0 {
         return Err(cog_core::SFError::Config(
             "system.memory_message_broadcast_capacity 声明为 0：广播窗口要一个槽位才能缓冲，0 不是更小的窗口（tokio 的 broadcast 通道会直接 panic）。给它一个条数。".into(),
@@ -294,7 +292,9 @@ mod tests {
             memory_message_broadcast_capacity: 0,
             ..Default::default()
         };
-        let err = super::declared_broadcast_window(&zero).unwrap_err().to_string();
+        let err = super::declared_broadcast_window(&zero)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("memory_message_broadcast_capacity"),
             "声明 0 的错误要点名这个字段，实际是：{err}"

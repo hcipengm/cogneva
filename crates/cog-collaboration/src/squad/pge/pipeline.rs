@@ -972,10 +972,9 @@ impl PgePipeline {
             }
         }
 
-        let last = history
-            .last()
-            .cloned()
-            .expect("PgePipeline::execute always runs at least one attempt: full_passes is nonzero");
+        let last = history.last().cloned().expect(
+            "PgePipeline::execute always runs at least one attempt: full_passes is nonzero",
+        );
 
         PgePipelineResult {
             attempts: history.len() as u32,
