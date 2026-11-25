@@ -391,7 +391,7 @@ fn squad_config(goal: &str, task: &Task, pge_mode: PgeMode) -> SquadConfig {
         pge_mode,
         // No strategy escalation: this test is about the two topologies the
         // routing picked, and a run that escalated would be a third one.
-        max_retries: 0,
+        policy_upgrades: 0,
         profile: Some(derive_task_profile(task)),
         is_self_evolution: task.is_self_evolution(),
         deliverable: task.deliverable_declaration(),

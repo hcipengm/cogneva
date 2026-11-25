@@ -12,7 +12,10 @@
 //!   the plan remains fixed.
 //! - Evaluator cannot mutate the artifact — it only emits [`EvaluationResult`].
 //! - When local repair is exhausted, the pipeline performs a global reset
-//!   (re-runs the Planner) up to [`PgePipelineConfig::max_retries`] times.
+//!   (re-runs the Planner) until it has run [`PgePipelineConfig::full_passes`]
+//!   passes.
+
+use std::num::NonZeroU32;
 
 use crate::actors::{EvaluatorActor, GeneratorActor, PlannerActor};
 use crate::squad::pge::stall::{
@@ -25,9 +28,15 @@ use crate::squad::pge::types::{
 /// Configuration for [`PgePipeline`].
 #[derive(Debug)]
 pub struct PgePipelineConfig {
-    /// Maximum number of full Planner→Generator→Evaluator passes before
+    /// Number of full Planner→Generator→Evaluator passes to run before
     /// returning the last attempt regardless of evaluator outcome.
-    pub max_retries: u32,
+    ///
+    /// At least one by construction. The field used to be a `u32` named
+    /// `max_retries` and read as `max_retries.max(1)`: a caller who declared 0
+    /// silently got one pass, under a name that said "passes" and a value that
+    /// said "retries". Zero passes is not a smaller pipeline — there is no
+    /// attempt to return — so it is unrepresentable here rather than raised.
+    pub full_passes: NonZeroU32,
     /// Soft timeout for a single full pass, in milliseconds.
     /// Currently advisory — the agents themselves drive their own timeouts;
     /// this is exposed so callers and orchestrators can record/respect it.
@@ -53,10 +62,14 @@ pub struct PgePipelineConfig {
 // cap: bound — 三次：每次重跑都带独立复核，第三次不过就不是抖动了
 const PGE_FULL_PASSES: u32 = 3;
 
+// 上面那个数进 `NonZeroU32` 之前先在这里判一次：改成 0 是编译错误，不是运行期的
+// `max(1)` 悄悄把它换成一次。
+const _: () = assert!(PGE_FULL_PASSES > 0);
+
 impl Default for PgePipelineConfig {
     fn default() -> Self {
         Self {
-            max_retries: PGE_FULL_PASSES,
+            full_passes: NonZeroU32::new(PGE_FULL_PASSES).expect("checked above"),
             timeout_ms: (30 * cog_core::day::MILLIS_PER_SECOND) as u64,
             local_repair_max: 0,
             stall_threshold: STALL_THRESHOLD,
@@ -108,7 +121,7 @@ pub struct PgePipelineResult {
 /// On evaluator failure the pipeline first tries to repair the generation
 /// while keeping the plan fixed, up to [`PgePipelineConfig::local_repair_max`]
 /// times. Only when local repair is exhausted does it perform a global reset
-/// (re-run the Planner) up to [`PgePipelineConfig::max_retries`] times.
+/// (re-run the Planner) until [`PgePipelineConfig::full_passes`] passes are spent.
 #[derive(Debug)]
 pub struct PgePipeline {
     config: PgePipelineConfig,
@@ -530,7 +543,7 @@ impl PgePipeline {
         let mut history: Vec<PgePipelineAttempt> = Vec::new();
         let mut last_evaluation: Option<EvaluationResult> = None;
         let mut last_generation: Option<GeneratorOutput> = None;
-        let max_attempts = self.config.max_retries.max(1);
+        let max_attempts = self.config.full_passes.get();
         let mut stall = StallDetector::new(self.config.stall_threshold);
 
         for attempt in 1..=max_attempts {
@@ -959,9 +972,10 @@ impl PgePipeline {
             }
         }
 
-        let last = history.last().cloned().expect(
-            "PgePipeline::execute always runs at least one attempt because max_retries.max(1)",
-        );
+        let last = history
+            .last()
+            .cloned()
+            .expect("PgePipeline::execute always runs at least one attempt: full_passes is nonzero");
 
         PgePipelineResult {
             attempts: history.len() as u32,
@@ -1017,13 +1031,22 @@ mod tests {
         is_deterministic_failure, DEGENERATE_LOOP_PREFIX, EMPTY_GENERATION_PREFIX,
     };
 
+    /// 一份声明的整链通过次数。0 在这里就 panic：`full_passes` 是 `NonZeroU32`，
+    /// 构造一个零次的流水线不是「少跑一次」，是没有结果可返回。
+    fn passes(n: u32) -> NonZeroU32 {
+        NonZeroU32::new(n).expect("full passes must be at least one")
+    }
+
     /// 整链重跑的次数只有一处声明：默认值读常量，常量上面写着它由什么钉住。
     ///
     /// 两面一起钉：运行时默认值等于常量（改常量就改默认值），源码面
     /// `impl Default` 的字段里不再有数字（下一笔写回裸字面量就红）。
     #[test]
     fn the_pipeline_default_reads_its_full_pass_count() {
-        assert_eq!(PgePipelineConfig::default().max_retries, PGE_FULL_PASSES);
+        assert_eq!(
+            PgePipelineConfig::default().full_passes.get(),
+            PGE_FULL_PASSES
+        );
 
         let source = include_str!("pipeline.rs");
         let body = source
@@ -1181,7 +1204,7 @@ mod tests {
     #[tokio::test]
     async fn pipeline_executes_three_stages_in_order() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
+            full_passes: passes(1),
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
@@ -1226,7 +1249,7 @@ mod tests {
     #[tokio::test]
     async fn pipeline_records_full_history_when_failing() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 2,
+            full_passes: passes(2),
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
@@ -1286,43 +1309,21 @@ mod tests {
         assert!(!result.history.is_empty());
     }
 
-    #[tokio::test]
-    async fn pipeline_zero_retries_still_runs_once() {
-        let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 0,
-            timeout_ms: 5_000,
-            local_repair_max: 0,
-            stall_threshold: 2,
-            independent_review: false,
-        });
-        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
-            response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
-        }));
-        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
-            response: serde_json::json!({"content": {"draft": "attempt output"}, "artifacts": []}),
-        }));
-        let evaluator = EvaluatorActor::new(std::sync::Arc::new(MockAgent {
-            response: serde_json::json!({"verdict": "pass", "score": 92, "feedback": "", "criteria": []}),
-        }));
-
-        let task = test_task("any");
-        let result = pipeline
-            .execute_task(
-                &task,
-                serde_json::json!({}),
-                &planner,
-                &generator,
-                &evaluator,
-            )
-            .await;
-
-        assert_eq!(result.attempts, 1);
+    /// 零次不是一个更小的流水线。这条测试以前钉的是反面：
+    /// `pipeline_zero_retries_still_runs_once` 声明 0 次、跑一次，把
+    /// `max_retries.max(1)` 的静默改写写成了契约。现在 `full_passes` 是
+    /// `NonZeroU32`，0 在构造处就过不去——这个形状连编译都写不出来，
+    /// 运行期只剩这一条「拒绝」的现场。
+    #[test]
+    #[should_panic(expected = "full passes must be at least one")]
+    fn a_pipeline_cannot_be_asked_for_zero_passes() {
+        let _ = passes(0);
     }
 
     #[tokio::test]
     async fn pipeline_attempts_are_numbered_sequentially() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 3,
+            full_passes: passes(3),
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
@@ -1455,7 +1456,7 @@ mod tests {
     #[tokio::test]
     async fn pipeline_local_repair_succeeds_without_global_reset() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
+            full_passes: passes(1),
             timeout_ms: 5_000,
             local_repair_max: 2,
             stall_threshold: 2,
@@ -1507,7 +1508,7 @@ mod tests {
     #[tokio::test]
     async fn pipeline_local_repair_exhausts_then_global_reset() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 2,
+            full_passes: passes(2),
             timeout_ms: 5_000,
             local_repair_max: 1,
             stall_threshold: 2,
@@ -1550,7 +1551,7 @@ mod tests {
     #[tokio::test]
     async fn pipeline_stops_degenerate_loop_early() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 5,
+            full_passes: passes(5),
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
@@ -1597,7 +1598,7 @@ mod tests {
     #[tokio::test]
     async fn pipeline_progressing_attempts_are_not_stalled() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 4,
+            full_passes: passes(4),
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
@@ -1646,7 +1647,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_envelope_fails_under_its_own_cause_without_evaluating() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
+            full_passes: passes(1),
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
@@ -1696,7 +1697,7 @@ mod tests {
     #[tokio::test]
     async fn a_blank_string_content_is_the_same_empty_envelope() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
+            full_passes: passes(1),
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
@@ -1731,7 +1732,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_repair_is_judged_under_its_own_cause_too() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
+            full_passes: passes(1),
             timeout_ms: 5_000,
             local_repair_max: 1,
             stall_threshold: 2,
@@ -1804,7 +1805,7 @@ mod tests {
     #[tokio::test]
     async fn independent_review_rejection_fails_the_attempt() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 2,
+            full_passes: passes(2),
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 0,
@@ -1846,7 +1847,7 @@ mod tests {
     #[tokio::test]
     async fn independent_review_agreement_passes_and_records_review() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 2,
+            full_passes: passes(2),
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 0,
@@ -1895,7 +1896,7 @@ mod tests {
     #[tokio::test]
     async fn a_first_attempt_pass_is_not_re_sampled() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 2,
+            full_passes: passes(2),
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 0,
@@ -2003,7 +2004,7 @@ mod tests {
     #[tokio::test]
     async fn a_disabled_gate_does_not_ask_the_reviewer_where_it_would_have() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 2,
+            full_passes: passes(2),
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 0,
@@ -2132,7 +2133,7 @@ mod tests {
     #[tokio::test]
     async fn a_planner_that_never_reached_its_upstream_ends_the_run_and_says_why() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 3,
+            full_passes: passes(3),
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
@@ -2181,7 +2182,7 @@ mod tests {
     #[tokio::test]
     async fn an_evaluator_that_never_reached_its_upstream_is_not_a_verdict_on_the_work() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 3,
+            full_passes: passes(3),
             timeout_ms: 5_000,
             local_repair_max: 1,
             stall_threshold: 2,
@@ -2243,7 +2244,7 @@ mod tests {
     #[tokio::test]
     async fn a_generator_that_ran_out_of_iterations_ends_the_run_before_the_evaluator() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 3,
+            full_passes: passes(3),
             timeout_ms: 5_000,
             local_repair_max: 2,
             stall_threshold: 2,
@@ -2307,7 +2308,7 @@ mod tests {
     #[tokio::test]
     async fn an_evaluator_that_ran_out_of_iterations_ends_the_run_before_repairs() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 3,
+            full_passes: passes(3),
             timeout_ms: 5_000,
             local_repair_max: 2,
             stall_threshold: 2,
@@ -2430,7 +2431,7 @@ mod tests {
 
     fn config() -> PgePipelineConfig {
         PgePipelineConfig {
-            max_retries: 1,
+            full_passes: passes(1),
             timeout_ms: 5_000,
             local_repair_max: 2,
             stall_threshold: 2,

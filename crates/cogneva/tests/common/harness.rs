@@ -371,7 +371,7 @@ impl TestHarness {
             goal: goal.into(),
             context: serde_json::json!({}),
             pge_mode: PgeMode::Pipeline,
-            max_retries: 1,
+            policy_upgrades: 1,
             profile: None,
             boundary_config: None,
             is_self_evolution: false,

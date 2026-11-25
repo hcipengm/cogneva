@@ -511,7 +511,7 @@ async fn execute_ready_task(state: &AutonomousTestState, task_id: &str) {
         goal: format!("Execute task: {}", task_id),
         context: task.input.clone(),
         pge_mode: cog_collaboration::select_mode(&derive_task_profile(&task)).mode,
-        max_retries: 3,
+        policy_upgrades: 3,
         profile: None,
         boundary_config: None,
         is_self_evolution: false,
@@ -609,14 +609,14 @@ async fn test_squad_retry_mechanism() {
     };
     let task_id = submit_goal(&state, "task that will trigger retry").await;
 
-    // Execute squad with max_retries=0 so failures are terminal.
+    // Execute squad with policy_upgrades=0 so failures are terminal.
     // Since stub agents always pass, we verify the retry infrastructure is wired.
     let config = SquadConfig {
         stated_directions: Vec::new(),
         goal: format!("Execute task: {}", task_id),
         context: serde_json::json!({"goal": "task that will trigger retry"}),
         pge_mode: PgeMode::Pipeline,
-        max_retries: 0,
+        policy_upgrades: 0,
         profile: None,
         boundary_config: None,
         is_self_evolution: false,

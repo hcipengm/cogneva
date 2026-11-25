@@ -4,6 +4,7 @@
 //! - Ralph Loop 判定"不可修复"时，触发 Squad 级自动重试（默认 3 次）。
 //! - 重试耗尽后原子任务终止。
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use crate::actors::{EvaluatorActor, GeneratorActor, PlannerActor};
@@ -29,7 +30,11 @@ pub struct SquadConfig {
     pub pge_mode: PgeMode,
     /// Squad 被 Ralph Loop 判定不可修复后的最大策略升级次数。
     /// 0 = 只做一次尝试（不升级），1 = 允许一次 Pipeline → Roundtable 升级。
-    pub max_retries: u32,
+    ///
+    /// 名字说的是升级，不是重试：每一次升级换的是拓扑（Pipeline → Roundtable），
+    /// 同一套拓扑再跑一遍不是升级。此前的 `max_retries` 让读者以为它是次数预算，
+    /// 而 `SQUAD_POLICY_UPGRADES` 的出处正是「还能换几种拓扑」。
+    pub policy_upgrades: u32,
     /// 可选的任务 profile，用于在没有 MetaLearningEngine 时通过静态规则选择 PGE 模式。
     pub profile: Option<crate::profile::TaskProfile>,
     /// Optional BoundaryConfig, carried into the squad run with the task.
@@ -76,7 +81,7 @@ impl Default for SquadConfig {
             goal: String::new(),
             context: serde_json::json!({}),
             pge_mode: PgeMode::Pipeline,
-            max_retries: SQUAD_POLICY_UPGRADES,
+            policy_upgrades: SQUAD_POLICY_UPGRADES,
             profile: None,
             boundary_config: None,
             is_self_evolution: false,
@@ -635,8 +640,8 @@ impl SquadExecutor {
             let mut pipeline_config = PgePipelineConfig::default();
             if squad.config.is_self_evolution {
                 // 与 Pipeline 同一条：自进化任务对延迟敏感，一次尝试交给外层
-                // Ralph 做全局重置就够。
-                pipeline_config.max_retries = 1;
+                // Ralph 做全局重置就够（`NonZeroU32::MIN` 就是一次）。
+                pipeline_config.full_passes = NonZeroU32::MIN;
             }
             pipeline_config.local_repair_max = deps
                 .local_repair_max
@@ -737,8 +742,9 @@ impl SquadExecutor {
                 let mut pipeline_config = PgePipelineConfig::default();
                 if squad.config.is_self_evolution {
                     // Self-evolution tasks are latency-sensitive: one attempt per
-                    // Ralph iteration is enough; rely on Ralph for global reset.
-                    pipeline_config.max_retries = 1;
+                    // Ralph iteration is enough; rely on Ralph for global reset
+                    // (`NonZeroU32::MIN` is that one pass).
+                    pipeline_config.full_passes = NonZeroU32::MIN;
                 }
                 // The repair loop is what lets the evaluator's feedback reach the
                 // generator without paying for a new plan, so it is set for every
@@ -1061,7 +1067,7 @@ impl SquadExecutor {
         // degenerate loops cannot be fixed by a strategy upgrade — Roundtable
         // would burn the same tokens to the same empty/flat result.
         let is_terminal = declared_unfixable(&verdict);
-        let can_upgrade = squad.config.max_retries > 0 && !is_terminal;
+        let can_upgrade = squad.config.policy_upgrades > 0 && !is_terminal;
         let should_upgrade = can_upgrade
             && if let Some(ref r) = reflection {
                 if r.upgrade_recommended && is_pipeline {
@@ -1566,7 +1572,10 @@ mod tests {
     /// `impl Default` 的字段里不再有数字（下一笔写回裸字面量就红）。
     #[test]
     fn the_squad_default_reads_its_policy_upgrade_count() {
-        assert_eq!(SquadConfig::default().max_retries, SQUAD_POLICY_UPGRADES);
+        assert_eq!(
+            SquadConfig::default().policy_upgrades,
+            SQUAD_POLICY_UPGRADES
+        );
 
         let source = include_str!("executor.rs");
         let body = source

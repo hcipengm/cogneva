@@ -1445,6 +1445,7 @@ mod tests {
     use super::*;
     use crate::squad::pge::types::{StopCause, StoppedProduct};
     use crate::squad::pge::{PgePipeline, PgePipelineConfig, PgeRoundtable, PgeRoundtableConfig};
+    use std::num::NonZeroU32;
     use std::sync::Arc;
 
     /// 迭代上限与停滞窗口各只有一处声明：默认值读常量，常量上面写着它由什么钉住。
@@ -1833,7 +1834,7 @@ mod tests {
             ..Default::default()
         });
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
+            full_passes: NonZeroU32::MIN,
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
@@ -3586,7 +3587,7 @@ mod tests {
     async fn ralph_history_persists_across_loop_instances() {
         let backend = Arc::new(BoardMockBackend::new());
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
+            full_passes: NonZeroU32::MIN,
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
@@ -3717,7 +3718,7 @@ mod tests {
     async fn every_iteration_is_archived_even_when_the_board_keeps_only_the_tail() {
         let backend = Arc::new(BoardMockBackend::new());
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
+            full_passes: NonZeroU32::MIN,
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
@@ -3788,7 +3789,7 @@ mod tests {
     async fn an_archive_that_cannot_be_written_does_not_fail_the_loop() {
         let backend = Arc::new(BoardMockBackend::rejecting_appends());
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
+            full_passes: NonZeroU32::MIN,
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
@@ -3850,7 +3851,7 @@ mod tests {
         );
 
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
+            full_passes: NonZeroU32::MIN,
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
@@ -3897,7 +3898,7 @@ mod tests {
     #[tokio::test]
     async fn a_terminal_environment_failure_outranks_stagnation() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
+            full_passes: NonZeroU32::MIN,
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 0,
@@ -3949,7 +3950,7 @@ mod tests {
     #[tokio::test]
     async fn a_planner_that_spent_its_budget_is_not_reported_as_a_generator_defect() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
+            full_passes: NonZeroU32::MIN,
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 0,
@@ -4060,7 +4061,7 @@ mod tests {
             ..Default::default()
         });
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
+            full_passes: NonZeroU32::MIN,
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,

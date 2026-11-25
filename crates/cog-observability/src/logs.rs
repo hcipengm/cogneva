@@ -251,6 +251,34 @@ pub fn level_and_format() -> (String, crate::LogFormat) {
     (level, format)
 }
 
+/// 由声明的 `observability.loki` 建出推送端与它的循环载体：三格原样生效。
+///
+/// 这份配置有三个装配点——本文件的 `init_from_env`、观测插件的 `init`、网关自己的
+/// 日志装配——它们曾各写一遍同样的链，于是各写一遍同样的 `.max(1)`：声明
+/// `max_retries = 0`（合法的「不重试」，配置加载处专门为它留了这条路）在这两处被
+/// 悄悄换成一次重试。同一格有几个消费者，就有几处把它改写成别的数的地方；造在
+/// 这里，消费者只剩一处。刷盘间隔与批大小声明 0 在配置加载时按字段名拒绝，所以
+/// 这里不必再兜一次：能走到这儿的声明就是能生效的声明。
+pub fn client_and_pusher(
+    config: &crate::LokiConfig,
+    http_client: Arc<dyn HttpClient>,
+    service: &str,
+) -> (Arc<LokiPushClient>, Arc<LokiBackgroundPusher>) {
+    let client = Arc::new(
+        LokiPushClient::new(&config.endpoint)
+            .with_max_retries(config.max_retries)
+            .with_timeout(config.timeout_secs)
+            .with_label(crate::LABEL_SERVICE, service)
+            .with_client(http_client),
+    );
+    let pusher = Arc::new(LokiBackgroundPusher::new(
+        client.clone(),
+        std::time::Duration::from_secs(config.flush_interval_sec),
+        config.max_batch_size,
+    ));
+    (client, pusher)
+}
+
 /// Install the subscriber for a process that never reaches the plugin
 /// assembly: a node-side daemon, a one-shot Job, or a subcommand entry point.
 ///
@@ -324,18 +352,7 @@ where
     // 三格原样生效：`max_retries = 0` 是「不重试」的合法声明（首投失败即返回），
     // 另外两格声明 0 在 `ObservabilityExportersConfig::load_from` 按字段名拒绝
     // ——0 秒的刷盘间隔会让 `tokio::time::interval` panic，0 条的批则永远凑不满。
-    let push_client = Arc::new(
-        LokiPushClient::new(&config.loki.endpoint)
-            .with_max_retries(config.loki.max_retries)
-            .with_timeout(config.loki.timeout_secs)
-            .with_label(crate::LABEL_SERVICE, service)
-            .with_client(client),
-    );
-    let pusher = Arc::new(LokiBackgroundPusher::new(
-        push_client,
-        std::time::Duration::from_secs(config.loki.flush_interval_sec),
-        config.loki.max_batch_size,
-    ));
+    let (_, pusher) = client_and_pusher(&config.loki, client, service);
     let handle = init_subscriber_with_pusher(&level, format, Some(pusher.clone()), service);
 
     // `run_loop` spawns its own task, so there is nothing to await here — but
@@ -1097,6 +1114,27 @@ mod tests {
             std::time::Duration::from_secs(60),
             10,
         ))
+    }
+
+    /// 声明就是生效值。`max_retries = 0` 是合法的「不重试」，装配点不许把它夹成
+    /// 一次——三个装配点各写一遍 `.max(1)` 时，节点侧那处读对了、插件与网关两处
+    /// 读错了，而配置面看到的仍是 0。这条测试问的是装配出来的端，不是配置结构。
+    #[test]
+    fn the_declared_loki_budget_reaches_the_assembled_pusher() {
+        let config = crate::LokiConfig {
+            enabled: true,
+            endpoint: "http://loki:3100".into(),
+            max_retries: 0,
+            timeout_secs: 7,
+            flush_interval_sec: 2,
+            max_batch_size: 64,
+        };
+        let http: Arc<dyn HttpClient> = Arc::new(FakeHttp { ok: true });
+        let (push, pusher) = client_and_pusher(&config, http, "probe");
+        assert_eq!(push.max_retries, 0, "声明的「不重试」被装配点改写了");
+        assert_eq!(push.timeout_secs, 7);
+        assert_eq!(pusher.interval, std::time::Duration::from_secs(2));
+        assert_eq!(pusher.max_batch_size, 64);
     }
 
     /// A push that failed and a push that succeeded must land in different
