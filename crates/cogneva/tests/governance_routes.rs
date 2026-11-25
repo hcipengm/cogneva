@@ -466,11 +466,22 @@ async fn the_capability_and_output_faces_answer_and_name_their_missing_layers() 
         "the capability face answers: {body}"
     );
     let sources = body["sources"].as_array().expect("sources is an array");
-    assert_eq!(sources.len(), 3, "one row per layer: {body}");
+    // 按名字判，不按条数判：少一层与多一层都要在这里现形，而条数只看得见后者。
+    // 四层是 `Source` 的四个取值——进程级注册表、插件注册表、MCP 对端，以及上一轮
+    // 交给模型的那张表。
+    let layers: Vec<&str> = sources
+        .iter()
+        .map(|row| row[0].as_str().expect("each row names its layer"))
+        .collect();
+    assert_eq!(
+        layers,
+        ["builtin", "plugin", "mcp", "conversation"],
+        "one row per layer, in the order the face publishes them: {body}"
+    );
     for row in sources {
         assert_eq!(
             row[1]["state"], "unwired",
-            "the fixture wires none of the three layers: {body}"
+            "the fixture wires none of the four layers: {body}"
         );
         assert!(
             row[1]["because"].is_string(),
