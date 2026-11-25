@@ -8,7 +8,11 @@
 #   2. 有进程把 cwd 钉在树里 ⇒ 那棵树不删（其余照删）；
 #   3. 没有 cargo 缓存标记的目录 ⇒ 从来不是候选，哪怕名字就叫 target；
 #   4. dry-run 只报计划、不删；读数写 `planned` 而不是 `released`；
-#   5. 空跑（没有候选）也必须留下一份读数，不能什么都不说。
+#   5. 空跑（没有候选）也必须留下一份读数，不能什么都不说；
+#   6. 属主的进程读不出来 ⇒ 整跑拒绝释放，读数写 `unattributable` 并报出条数。
+#
+# 「读不出来的进程」这一读数是钉住的（见 run_gc）：哪些进程同一 uid 读不了是宿主
+# 的属性，CI 的 runner 上就有，拿它判规则等于拿跑测试的机器判规则。
 #
 # 跑法：bash deploy/scripts/tests/host-scratch-gc.test.sh
 set -uo pipefail
@@ -38,8 +42,14 @@ run_gc() { # avail_kb [dry_run]
         COGNEVA_SCRATCH_GC_STATE="${work}/state.json" \
         COGNEVA_SCRATCH_GC_DRY_RUN="${2:-0}" \
         COGNEVA_SCRATCH_GC_AVAIL_KB="$1" \
+        COGNEVA_SCRATCH_GC_UNREADABLE_PIDS_FILE="${work}/unreadable" \
         bash "$gc" >"${work}/out" 2>&1
 }
+
+# 「属主的哪些进程读不出来」随宿主变：CI 的 runner 上就有这类进程，读到它会让
+# 整跑拒绝释放，于是每一条关于大小关系的判据都读成 unattributable。这里把它也
+# 钉住（默认为空＝这台机器没有读不出来的进程），第 6 条再单独喂一个给它。
+: >"${work}/unreadable"
 
 # 1) 空闲 < 临时树总和 ⇒ 删掉；空闲 ≥ 总和 ⇒ 留下。
 roots="${work}/roots"
@@ -108,6 +118,20 @@ mkdir -p "$roots"
 run_gc 1
 grep -q '"outcome":"nothing"' "${work}/state.json" \
     && ok "没有候选时也写一份读数" || bad "空跑应写 nothing" '"outcome":"nothing"' "$(cat "${work}/state.json")"
+
+# 6) 属主的进程读不出来 ⇒ 整跑不释放，读数写 unattributable（归不了因不等于不在）。
+rm -rf "$roots"
+mkdir -p "$roots"
+make_cache "$roots/blind/target"
+printf '424242\n' >"${work}/unreadable"
+run_gc 1
+[ -d "$roots/blind/target" ] \
+    && ok "进程读不出来时一棵都不删" || bad "归不了因时不该删" "树还在" "被删了"
+grep -q '"outcome":"unattributable"' "${work}/state.json" \
+    && ok "读数写 unattributable" || bad "读数应写 unattributable" '"outcome":"unattributable"' "$(cat "${work}/state.json")"
+grep -q '"unreadable":1' "${work}/state.json" \
+    && ok "读数报出读不出来的条数" || bad "读数应报 unreadable 的条数" '"unreadable":1' "$(cat "${work}/state.json")"
+: >"${work}/unreadable"
 
 printf '%s: %d passed, %d failed\n' "$(basename "${BASH_SOURCE[0]}")" "$pass" "$fail"
 [ "$fail" -eq 0 ]

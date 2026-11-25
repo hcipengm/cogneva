@@ -36,6 +36,13 @@ dry_run="${COGNEVA_SCRATCH_GC_DRY_RUN:-0}"
 # An injected free-space reading, for the tests: they cannot fill a disk to
 # check a rule that fires on a full one. Unset in every real run.
 injected_avail_kb="${COGNEVA_SCRATCH_GC_AVAIL_KB:-}"
+# An injected "processes of ours we cannot read" reading, for the tests: which
+# processes a host will not let the same uid read is a property of that host
+# (runner daemons that are not dumpable, mount namespaces), and the rule below
+# says any such process stops the run. A test that judged that against
+# whatever /proc the machine happens to have would be judging the host, not the
+# rule. Unset in every real run.
+injected_unreadable_pids="${COGNEVA_SCRATCH_GC_UNREADABLE_PIDS_FILE:-}"
 
 log() { printf 'scratch-gc: %s\n' "$*" >&2; }
 
@@ -68,6 +75,10 @@ process_paths() {
 
 # A process of ours that cannot be read: a failure to attribute, not an absence.
 unattributable_processes() {
+    if [ -n "${injected_unreadable_pids}" ]; then
+        cat "${injected_unreadable_pids}"
+        return
+    fi
     find /proc/[0-9]* -user "$(id -u)" -maxdepth 0 2>/dev/null |
         while IFS= read -r p; do
             [ -d "$p" ] || continue
