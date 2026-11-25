@@ -24,6 +24,13 @@
 //! - **律**：p95 决定请求，峰值 × 余量决定内存上限；CPU 上限取
 //!   `max(p95 × 余量, request)`。余量与卷容量回路同一条（`HEADROOM_PERCENT`），
 //!   不另立一套。
+//! - **第二种输入：被杀**。样本是「它用过多少」，被杀是「它用到的上限不够」——
+//!   后者比前者强，因为前者只在样本够（[`MIN_SAMPLES`]）时才说话，而一个反复
+//!   被杀、活不到一拍窗口的容器永远凑不齐样本。`lastState.terminated.reason ==
+//!   OOMKilled` 记进窗口：上限抬到被杀那一刻 Pod spec 上的上限 × 同一条余量；
+//!   同一次杀只抬一次（按 `finishedAt` 记账），写回成功才算消费掉。读不出上限
+//!   的容器不算证据：没有内存上限的 OOMKilled 是节点内存压力下的内核杀手，不是
+//!   这条律能改的那个界。
 //! - **写回**：patch 工作负载的容器 spec——Deployment / StatefulSet /
 //!   DaemonSet 走 `/spec/template/spec/*`，CronJob 走
 //!   `/spec/jobTemplate/spec/template/spec/*`。升与降都做：CPU 与内存都能缩。
@@ -73,6 +80,13 @@ pub const EVALUATIONS_METRIC: &str = "cogneva_workload_resources_evaluations_tot
 
 /// 窗口里这个容器有多少个样本。样本数为 0 时这一族读数只说明没在量。
 pub const SAMPLES_METRIC: &str = "cogneva_workload_resources_samples";
+
+/// 这个容器有一笔还没被写回消费掉的「被 OOM 杀掉」：1 = 有，0 = 没有。
+///
+/// 它与上限读数必须分开：上限停着不动，可能是「量到就是这样」，也可能是
+/// 「被杀了、抬的写回没落下去」。这一格是 1 就是后者——一笔证据挂在那里，
+/// 下一拍还会再试；写回成功或判定上限已够时回到 0。
+pub const OOM_KILLED_METRIC: &str = "cogneva_workload_oom_killed";
 
 /// 内存盘（`emptyDir` `medium: Memory`）的目标，字节。
 ///
@@ -419,6 +433,22 @@ fn quantize_up(value: u64, quantum: u64) -> u64 {
     value.div_ceil(quantum).saturating_mul(quantum).max(quantum)
 }
 
+/// 被 OOM 杀掉之后，上限该是多少。
+///
+/// 输入是**被杀那一刻**容器带着的那个上限，不是任何读数：一次 `OOMKilled`
+/// 就是「用到这个数的全部，还不够」的证据，比 p95 强——它不用等样本分布，
+/// 一个反复被杀、活不过一拍窗口的容器也用得上。抬法是同一条律的余量：
+/// 被杀时的上限 × [`HEADROOM_PERCENT`]，再量化到 kubelet 的分辨率。
+///
+/// 它只抬，不压：没人被杀过时这个函数不被调用，也从不给出比被杀上限更小的
+/// 值——`HEADROOM_PERCENT` 是 120，乘它只会让输入变大。
+pub fn limit_after_oom(killed_at_limit: u64) -> u64 {
+    quantize_up(
+        killed_at_limit.saturating_mul(HEADROOM_PERCENT) / 100,
+        MEMORY_QUANTUM_BYTES,
+    )
+}
+
 /// 百分位。`percent` 取 0–100；空切片没有答案。
 pub fn percentile(sorted: &[u64], percent: u64) -> Option<u64> {
     if sorted.is_empty() {
@@ -708,6 +738,28 @@ pub struct Window {
     /// 同一条窗口：两者都是「这份部署最近实际是什么样」的样本。
     #[serde(default)]
     startups: BTreeMap<String, VecDeque<StartupSample>>,
+    /// 观测到、还没被写回消费掉的 OOM 杀，按 `kind/name/container` 分桶。
+    /// 一个容器在同一时刻只有一个「最近一次」：状态里本来就只留最后一次终
+    /// 止，更早的杀已经被 Reset 覆盖掉了。
+    #[serde(default)]
+    oom: BTreeMap<String, OomKill>,
+    /// 每个容器已经消费掉的最后一次 OOM 杀的 `finishedAt`。
+    ///
+    /// 没有这一格，Pod 的 `lastState` 会把同一次杀报上每一拍：它一直挂在那
+    /// 里，直到容器被替换。按时刻记账，才让「一次杀抬一次」成立。
+    #[serde(default)]
+    answered_oom: BTreeMap<String, u64>,
+}
+
+/// 一次被 OOM 杀掉：什么时候、在多大的上限之下。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OomKill {
+    /// 这次终止的 `finishedAt`（Unix 秒）。同一个容器的下一次杀必须比它晚，
+    /// 才算新证据。
+    pub finished_at: u64,
+    /// 被杀那一刻 Pod spec 上的内存上限。Pod 的 spec 不可变，容器就是带着
+    /// 这个数被掐死的；工作负载的声明可能已经是被抬过之后的值。
+    pub limit_bytes: u64,
 }
 
 /// 一次成功启动：从 Pod 被创建到它第一次 Ready。
@@ -756,6 +808,38 @@ impl Window {
         self.startups.get(key)?.iter().map(|s| s.secs).max()
     }
 
+    /// 记一次被 OOM 杀掉。已经消费过的同一次杀不是新证据——Pod 的 `lastState`
+    /// 会一直报它，直到容器被替换。
+    pub fn observe_oom(&mut self, key: &str, kill: OomKill) {
+        if self
+            .answered_oom
+            .get(key)
+            .is_some_and(|answered| kill.finished_at <= *answered)
+        {
+            return;
+        }
+        let slot = self.oom.entry(key.to_string()).or_insert(kill);
+        if kill.finished_at >= slot.finished_at {
+            *slot = kill;
+        }
+    }
+
+    /// 这个容器有一笔还没消费掉的 OOM 杀。
+    pub fn unanswered_oom(&self, key: &str) -> Option<OomKill> {
+        self.oom.get(key).copied()
+    }
+
+    /// 这一笔证据被消费掉了：写回落到了对象上，或者判定上限本来就够。
+    pub fn answer_oom(&mut self, key: &str) {
+        if let Some(kill) = self.oom.remove(key) {
+            let answered = self
+                .answered_oom
+                .entry(key.to_string())
+                .or_insert(kill.finished_at);
+            *answered = (*answered).max(kill.finished_at);
+        }
+    }
+
     /// 这一桶的目标，样本不足 [`MIN_SAMPLES`] 时没有答案。
     pub fn targets(&self, key: &str) -> Option<Targets> {
         let bucket = self.entries.get(key)?;
@@ -782,6 +866,10 @@ impl Window {
             }
             !bucket.is_empty()
         });
+        // 一笔证据过了窗口还没被消费掉，说明它没被任何一拍用上；再留下去，
+        // 它会离「当时那个上限」越来越远，抬的就不是今天该抬的那个数了。
+        self.oom.retain(|_, kill| kill.finished_at >= oldest);
+        self.answered_oom.retain(|_, at| *at >= oldest);
     }
 
     fn to_json(&self) -> String {
@@ -1408,6 +1496,8 @@ struct Row {
     source: &'static str,
     samples: usize,
     evaluations: u64,
+    /// 有一笔还没被写回消费掉的 OOM 杀。见 [`OOM_KILLED_METRIC`]。
+    oom_killed: bool,
 }
 
 impl WorkloadResourcesReadings {
@@ -1433,6 +1523,7 @@ impl WorkloadResourcesReadings {
                 source: SOURCE_SEED,
                 samples: 0,
                 evaluations: 0,
+                oom_killed: false,
             });
         row.evaluations = row.evaluations.saturating_add(1);
     }
@@ -1456,10 +1547,29 @@ impl WorkloadResourcesReadings {
                 source,
                 samples,
                 evaluations: 0,
+                oom_killed: false,
             });
         row.targets = targets;
         row.source = source;
         row.samples = samples;
+    }
+
+    /// 这个容器此刻挂着一笔还没消费掉的 OOM 杀。每拍都写：证据被写回消费掉
+    /// 之后要回到 0，而 `or_insert_with` 的默认值不会替下一拍清掉上一拍的值。
+    pub fn observe_oom(&self, workload: &str, container: &str, killed: bool) {
+        let mut rows = self.rows.lock().unwrap();
+        if let Some(row) = rows.get_mut(&format!("{workload}/{container}")) {
+            row.oom_killed = killed;
+        }
+    }
+
+    /// 这个容器有没有挂着一笔没消费的 OOM 杀。
+    pub fn oom_killed(&self, workload: &str, container: &str) -> bool {
+        self.rows
+            .lock()
+            .unwrap()
+            .get(&format!("{workload}/{container}"))
+            .is_some_and(|row| row.oom_killed)
     }
 
     /// 这一个容器的求值次数。
@@ -1647,6 +1757,7 @@ impl Observable for WorkloadResourcesReadings {
                 (LIMIT_MEMORY_METRIC, row.targets.memory_limit_bytes),
                 (SAMPLES_METRIC, row.samples as u64),
                 (EVALUATIONS_METRIC, row.evaluations),
+                (OOM_KILLED_METRIC, u64::from(row.oom_killed)),
             ] {
                 out.push(
                     RawMetric::new(metric, value as f64)
@@ -1838,6 +1949,87 @@ pub fn pod_ready_secs(pod: &Value) -> Option<u64> {
         .ok()
 }
 
+/// Pod 里每个容器最近一次被 OOM 杀掉：容器名、终止时刻、被杀那一刻 Pod spec
+/// 上的内存上限。
+///
+/// 上限读的是 **Pod** 的 spec，不是工作负载的声明：Pod 的 spec 不可变，容器
+/// 就是带着这个数被掐死的；工作负载的声明可能已经是被这条回路抬过之后的值，
+/// 拿它当输入会低估「不够」的那一格。
+///
+/// 读不出上限的容器不算证据：没有内存上限的 `OOMKilled` 是节点内存压力下的
+/// 内核杀手，不是这一条律能改的那个界；把它当证据会凭空给一个有意不声明上限
+/// 的容器发明一份声明。没有 `finishedAt` 的终止同样不算：没有时刻就没法分辨
+/// 「这次杀」与「上次已经处理过的那次杀」。
+pub fn pod_oom_kills(pod: &Value) -> Vec<(String, OomKill)> {
+    let mut limits: HashMap<String, u64> = HashMap::new();
+    for section in ["containers", "initContainers"] {
+        for container in pod
+            .pointer(&format!("/spec/{section}"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(name) = container.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(limit) = container
+                .pointer("/resources/limits/memory")
+                .and_then(Value::as_str)
+                .and_then(parse_memory_bytes)
+            else {
+                continue;
+            };
+            limits.insert(name.to_string(), limit);
+        }
+    }
+    let mut out = Vec::new();
+    for section in ["containerStatuses", "initContainerStatuses"] {
+        for status in pod
+            .pointer(&format!("/status/{section}"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(name) = status.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(limit_bytes) = limits.get(name).copied() else {
+                continue;
+            };
+            // 一个还在重启循环里的容器把最近一次杀放在 `lastState`；一个不再
+            // 重启的（Job Pod）把它放在 `state`。两处都读，是两个不同的容器
+            // 形态，不是同一次杀的两份副本——同一个容器两个位置都有的，时刻
+            // 取更晚的那次。
+            for path in ["/state/terminated", "/lastState/terminated"] {
+                let Some(terminated) = status.pointer(path) else {
+                    continue;
+                };
+                if terminated.get("reason").and_then(Value::as_str) != Some("OOMKilled") {
+                    continue;
+                }
+                let Some(finished_at) = terminated_secs(terminated) else {
+                    continue;
+                };
+                out.push((
+                    name.to_string(),
+                    OomKill {
+                        finished_at,
+                        limit_bytes,
+                    },
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// 一次终止的 `finishedAt`（Unix 秒）。
+fn terminated_secs(terminated: &Value) -> Option<u64> {
+    let text = terminated.get("finishedAt").and_then(Value::as_str)?;
+    let at = chrono::DateTime::parse_from_rfc3339(text).ok()?;
+    at.timestamp().try_into().ok()
+}
+
 /// Pod 的这一副副本此刻能接活。
 fn pod_is_ready(pod: &Value) -> bool {
     pod.pointer("/status/conditions")
@@ -1919,6 +2111,22 @@ fn lane_queue(reading: &cog_core::BuildLaneReading) -> LaneQueue {
 pub struct RoundSummary {
     pub evaluated: usize,
     pub patched: usize,
+}
+
+/// 这一拍的 OOM 证据被消费掉了：窗口里销账，读数面上的旗子随之落下。
+///
+/// 只在写回落到对象上、或判定上限本来就够之后调用。patch 被拒时不调——那
+/// 时候抬上限这件事还没有发生，证据留在窗口里等下一拍。
+fn answer_oom_evidence(
+    window: &mut Window,
+    readings: &WorkloadResourcesReadings,
+    workload: &WorkloadSpec,
+    answers: &[(String, String)],
+) {
+    for (key, container) in answers {
+        window.answer_oom(key);
+        readings.observe_oom(&workload.name, container, false);
+    }
 }
 
 /// 跑一拍：读工作负载与用量、喂窗口、算目标、写回、发布读数。
@@ -2007,6 +2215,33 @@ pub async fn round(
                 for container in spec.containers.iter().filter(|c| c.startup_probe.is_some()) {
                     window.push_startup(&spec.key(container), secs, now);
                 }
+            }
+        }
+        // 被杀是「上限不够」的证据，与样本无关，所以放在 `usage` 那一跳之前：
+        // 一个刚被杀、还没被 metrics-server 报上量的 Pod 恰恰是最该读的一只。
+        // 只收这条回路管得到的容器——声明了资源的那几个；有意留白的容器不归
+        // 这条律，替它发明一份声明比不抬更糟。
+        if let Some(index) = by_name.get(&workload) {
+            let spec = &workloads[*index];
+            for (container, kill) in pod_oom_kills(&pod) {
+                let managed = spec
+                    .containers
+                    .iter()
+                    .any(|candidate| candidate.name == container && candidate.declared.is_some());
+                if !managed {
+                    continue;
+                }
+                let key = format!("{kind}/{workload}/{container}");
+                if window.unanswered_oom(&key) != Some(kill) {
+                    debug!(
+                        workload = %workload,
+                        container = %container,
+                        limit = kill.limit_bytes,
+                        raise_to = limit_after_oom(kill.limit_bytes),
+                        "workload resources: a container was OOM killed at its memory limit"
+                    );
+                }
+                window.observe_oom(&key, kill);
             }
         }
         let Some(containers) = usage.get(pod_name) else {
@@ -2149,6 +2384,9 @@ pub async fn round(
         let mut changes = BTreeMap::new();
         // 这一轮已经算出目标、可以喂给下游（内存盘）的容器。
         let mut resolved: BTreeMap<String, Targets> = BTreeMap::new();
+        // 这一拍用掉的 OOM 证据。写回成功（或判定上限本来就够）之后才按
+        // `answer_oom` 记账；patch 被拒时它留在窗口里，下一拍重试。
+        let mut oom_answers: Vec<(String, String)> = Vec::new();
         for container in &workload.containers {
             let Some(declared) = container.declared else {
                 continue;
@@ -2157,9 +2395,22 @@ pub async fn round(
             evaluated += 1;
             readings.note_evaluated(&workload.name, &container.name);
             let samples = window.samples(&key);
+            let oom = window.unanswered_oom(&key);
+            readings.observe_oom(&workload.name, &container.name, oom.is_some());
+            if oom.is_some() {
+                oom_answers.push((key.clone(), container.name.clone()));
+            }
             match window.targets(&key) {
                 Some(mut targets) => {
                     limits_only_rise(&mut targets, &declared);
+                    // 被杀过的上限不是「够不够」的估计，是一个反例：容器带着
+                    // 这个数被掐死过。它压过窗口读出来的那一个，也压过对象上
+                    // 已经声明的（那可能正是被压坏后的呆值）。
+                    if let Some(kill) = oom {
+                        targets.memory_limit_bytes = targets
+                            .memory_limit_bytes
+                            .max(limit_after_oom(kill.limit_bytes));
+                    }
                     resolved.insert(container.name.clone(), targets);
                     namespace_cpu_requests.push(targets.cpu_request_millicores);
                     namespace_memory_requests.push(targets.memory_request_bytes);
@@ -2191,20 +2442,53 @@ pub async fn round(
                     }
                 }
                 None => {
-                    // 样本还不够：把当前声明的值当 seed 发出去，让读者看得见
-                    // 「这一格现在没在跟测量走」，而不是看见一个空格。
-                    readings.observe(
-                        &workload.name,
-                        &container.name,
-                        Targets {
+                    // 样本还不够，但被杀过这一件事不需要样本：一个反复被杀、
+                    // 活不到 [`MIN_SAMPLES`] 个样本的容器，正是最该抬的那一个。
+                    // 只有上限有实测依据（那次杀），请求仍是对象上的声明。
+                    if let Some(kill) = oom {
+                        let mut targets = Targets {
                             cpu_request_millicores: declared.cpu_request_millicores.unwrap_or(0),
                             memory_request_bytes: declared.memory_request_bytes.unwrap_or(0),
                             cpu_limit_millicores: declared.cpu_limit_millicores.unwrap_or(0),
                             memory_limit_bytes: declared.memory_limit_bytes.unwrap_or(0),
-                        },
-                        SOURCE_SEED,
-                        samples,
-                    );
+                        };
+                        targets.memory_limit_bytes = targets
+                            .memory_limit_bytes
+                            .max(limit_after_oom(kill.limit_bytes))
+                            .max(targets.memory_request_bytes);
+                        resolved.insert(container.name.clone(), targets);
+                        readings.observe(
+                            &workload.name,
+                            &container.name,
+                            targets,
+                            SOURCE_DERIVED,
+                            samples,
+                        );
+                        if wants_write(
+                            declared.memory_limit_bytes,
+                            targets.memory_limit_bytes,
+                            MEMORY_QUANTUM_BYTES,
+                        ) {
+                            changes.insert(container.name.clone(), targets);
+                        }
+                    } else {
+                        // 样本还不够：把当前声明的值当 seed 发出去，让读者看得见
+                        // 「这一格现在没在跟测量走」，而不是看见一个空格。
+                        readings.observe(
+                            &workload.name,
+                            &container.name,
+                            Targets {
+                                cpu_request_millicores: declared
+                                    .cpu_request_millicores
+                                    .unwrap_or(0),
+                                memory_request_bytes: declared.memory_request_bytes.unwrap_or(0),
+                                cpu_limit_millicores: declared.cpu_limit_millicores.unwrap_or(0),
+                                memory_limit_bytes: declared.memory_limit_bytes.unwrap_or(0),
+                            },
+                            SOURCE_SEED,
+                            samples,
+                        );
+                    }
                 }
             }
         }
@@ -2232,6 +2516,9 @@ pub async fn round(
                 }
             }
         }
+        // 没有要写的东西也是一种结论：每个目标都已经落在对象上（包括「被杀
+        // 之后不用抬」那一格）。证据照样算消费掉，否则它会每一拍都被当成
+        // 「还没处理」，读数上永远是 1。
         let Some(body) = patch_body(
             workload,
             &changes,
@@ -2239,6 +2526,7 @@ pub async fn round(
             &startup_changes,
             replica_change,
         ) else {
+            answer_oom_evidence(window, readings, workload, &oom_answers);
             continue;
         };
         let body = body.to_string();
@@ -2263,6 +2551,7 @@ pub async fn round(
                     + shm_changes.len()
                     + startup_changes.len()
                     + usize::from(replica_change.is_some());
+                answer_oom_evidence(window, readings, workload, &oom_answers);
                 debug!(
                     kind = %workload.kind,
                     workload = %workload.name,
@@ -2273,7 +2562,8 @@ pub async fn round(
             }
             Err(e) => {
                 // 拒绝通常来自配额或 LimitRange：那是这一拍的结论，不是回路
-                // 坏了。下一拍重新量、重新试。
+                // 坏了。下一拍重新量、重新试。被杀的证据**不**消费：写回
+                // 没落地，抬上限这件事还没发生。
                 warn!(
                     kind = %workload.kind,
                     workload = %workload.name,
@@ -2697,6 +2987,209 @@ mod tests {
         let loaded = Window::load(&path);
         assert_eq!(loaded.samples("Deployment/a/c"), MIN_SAMPLES);
         assert!(loaded.targets("Deployment/a/c").is_some());
+    }
+
+    /// 一次 OOM 杀之后该抬到哪：被杀那一刻的上限 × 同一条余量，量化。
+    ///
+    /// 这条判据的第二半是「换输入 ⇒ 值跟着变」：它是从被杀上限导出的，不是
+    /// 一个钉住的数。2026-11-25 现网的 claim-store 是在 1392Mi 上被杀的那个
+    /// 样本，用它当输入。
+    #[test]
+    fn an_oom_kill_raises_the_limit_it_died_under() {
+        let mib = 1024 * 1024;
+        assert_eq!(limit_after_oom(1392 * mib), 1680 * mib);
+        // 换一个被杀上限，给出的目标跟着走——它由输入决定。
+        assert!(limit_after_oom(2048 * mib) > limit_after_oom(1392 * mib));
+        // 2048 × 1.2 = 2457.6Mi，量化到 16Mi 的整数倍 ⇒ 2464Mi。
+        assert_eq!(limit_after_oom(2048 * mib), 2464 * mib);
+        // 抬，不压：任何被杀过的上限都不会被它缩小。
+        for limit in [16 * mib, 64 * mib, 1392 * mib, 4 * 1024 * mib] {
+            assert!(limit_after_oom(limit) > limit);
+        }
+    }
+
+    /// 同一次杀只抬一次：Pod 的 `lastState` 会一直挂着那一次终止，直到容器被
+    /// 替换；不按 `finishedAt` 记账，每一拍都会再抬 20%，一条泄漏会无限涨。
+    #[test]
+    fn the_same_kill_raises_once_and_a_newer_one_raises_again() {
+        let key = "Deployment/claim-store/walker";
+        let mut window = Window::default();
+        let first = OomKill {
+            finished_at: 1_000,
+            limit_bytes: 1392 * 1024 * 1024,
+        };
+        window.observe_oom(key, first);
+        assert_eq!(window.unanswered_oom(key), Some(first));
+
+        window.answer_oom(key);
+        assert_eq!(window.unanswered_oom(key), None, "消费掉的证据不再挂着");
+        window.observe_oom(key, first);
+        assert_eq!(
+            window.unanswered_oom(key),
+            None,
+            "同一只 Pod 的同一个 lastState 不是新证据"
+        );
+
+        let second = OomKill {
+            finished_at: 2_000,
+            limit_bytes: limit_after_oom(first.limit_bytes),
+        };
+        window.observe_oom(key, second);
+        assert_eq!(
+            window.unanswered_oom(key),
+            Some(second),
+            "换了一只 Pod、在新上限上又被杀，才是下一笔证据"
+        );
+    }
+
+    /// 证据存在窗口文件里：进程重启不该抹掉一笔还没被写回消费的杀。
+    #[test]
+    fn an_unanswered_oom_survives_a_persisted_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("window.json");
+        let key = "DaemonSet/claim-store/walker";
+        let kill = OomKill {
+            finished_at: 500,
+            limit_bytes: 1392 * 1024 * 1024,
+        };
+        let mut window = Window::default();
+        window.observe_oom(key, kill);
+        window.save(&path).unwrap();
+        let loaded = Window::load(&path);
+        assert_eq!(loaded.unanswered_oom(key), Some(kill));
+        // 消费过的那一笔也活过重启，否则 Pod 的 lastState 会把它再报一遍。
+        let mut loaded = loaded;
+        loaded.answer_oom(key);
+        loaded.save(&path).unwrap();
+        let mut reloaded = Window::load(&path);
+        assert_eq!(reloaded.unanswered_oom(key), None);
+        reloaded.observe_oom(key, kill);
+        assert_eq!(
+            reloaded.unanswered_oom(key),
+            None,
+            "重启之后账本还在：已经抬过的那次杀不会被当成新的一笔"
+        );
+    }
+
+    /// 一条 Pod 的 OOM 证据：读 Pod spec 上的上限，而不是工作负载的声明。
+    #[test]
+    fn a_pod_names_the_containers_it_lost_to_oom_and_the_limit_they_died_under() {
+        let pod = json!({
+            "spec": {
+                "containers": [{
+                    "name": "walker",
+                    "resources": {"limits": {"memory": "1392Mi"}}
+                }],
+                "initContainers": [{
+                    "name": "prepare",
+                    "resources": {"requests": {"memory": "32Mi"}}
+                }]
+            },
+            "status": {
+                "containerStatuses": [{
+                    "name": "walker",
+                    "restartCount": 54,
+                    "lastState": {"terminated": {
+                        "reason": "OOMKilled",
+                        "finishedAt": "2026-11-25T08:37:33Z"
+                    }},
+                    "state": {"running": {}}
+                }],
+                "initContainerStatuses": [{
+                    "name": "prepare",
+                    "state": {"terminated": {
+                        "reason": "OOMKilled",
+                        "finishedAt": "2026-11-25T08:30:00Z"
+                    }}
+                }]
+            }
+        });
+        let kills = pod_oom_kills(&pod);
+        assert_eq!(
+            kills,
+            vec![(
+                "walker".to_string(),
+                OomKill {
+                    finished_at: 1_795_595_853,
+                    limit_bytes: 1392 * 1024 * 1024,
+                }
+            )],
+            "只收有上限、有终止时刻、确实写着 OOMKilled 的那一个容器"
+        );
+    }
+
+    /// 不算证据的三种形态：没有上限、没有终止时刻、理由不是 OOM。
+    #[test]
+    fn a_kill_without_a_limit_or_a_time_is_not_evidence() {
+        let no_limit = json!({
+            "spec": {"containers": [{"name": "c"}]},
+            "status": {"containerStatuses": [{
+                "name": "c",
+                "lastState": {"terminated": {"reason": "OOMKilled", "finishedAt": "2026-11-25T08:37:33Z"}}
+            }]}
+        });
+        assert!(
+            pod_oom_kills(&no_limit).is_empty(),
+            "没有上限的 OOM 是节点内存压力，不是这条律改的界"
+        );
+
+        let no_time = json!({
+            "spec": {"containers": [{"name": "c", "resources": {"limits": {"memory": "1Gi"}}}]},
+            "status": {"containerStatuses": [{
+                "name": "c",
+                "lastState": {"terminated": {"reason": "OOMKilled"}}
+            }]}
+        });
+        assert!(
+            pod_oom_kills(&no_time).is_empty(),
+            "没有 finishedAt 就分不清这次与上次"
+        );
+
+        let other_reason = json!({
+            "spec": {"containers": [{"name": "c", "resources": {"limits": {"memory": "1Gi"}}}]},
+            "status": {"containerStatuses": [{
+                "name": "c",
+                "lastState": {"terminated": {"reason": "Error", "finishedAt": "2026-11-25T08:37:33Z"}}
+            }]}
+        });
+        assert!(
+            pod_oom_kills(&other_reason).is_empty(),
+            "只有 OOMKilled 是「上限不够」"
+        );
+    }
+
+    /// 读数面把「被杀、还没抬」与「量到就是这样」分开：上限不动时，旗子在。
+    #[test]
+    fn the_reading_keeps_an_unpaid_kill_visible() {
+        let readings = WorkloadResourcesReadings::new();
+        let targets = targets(100, 1392 * 1024 * 1024);
+        readings.note_evaluated("claim-store", "walker");
+        readings.observe("claim-store", "walker", targets, SOURCE_DERIVED, 24);
+        readings.observe_oom("claim-store", "walker", true);
+        let metrics = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(readings.collect_metrics(""))
+            .unwrap();
+        let flag = metrics
+            .iter()
+            .find(|metric| metric.name == OOM_KILLED_METRIC)
+            .expect("这笔没付掉的杀要在读数上");
+        assert_eq!(flag.value, 1.0);
+        assert_eq!(
+            flag.labels.get(WORKLOAD_LABEL).map(String::as_str),
+            Some("claim-store")
+        );
+
+        readings.observe_oom("claim-store", "walker", false);
+        let metrics = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(readings.collect_metrics(""))
+            .unwrap();
+        let flag = metrics
+            .iter()
+            .find(|metric| metric.name == OOM_KILLED_METRIC)
+            .expect("旗子落下，序列还在：0 不是「没有这一格」");
+        assert_eq!(flag.value, 0.0);
     }
 
     // proves: gateway.replicas
