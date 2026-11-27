@@ -1,3 +1,4 @@
+# census-keep: shapes=deploy-numbers — 部署清单里的数是部署自己的声明：它写在生效的那一处，改它只改这一次部署，不是代码里看不见的默认；由部署面本身兜住
 # ClickHouse — 时序明细后端（上游状态变化 / LLM 调用结果 / 可用率曲线）。
 # 网关把每次上游状态变化与调用结果批量写这里，列存 + MergeTree 支持高吞吐写入
 # 与时间桶聚合；告警状态机（需行级 UPDATE）走 PostgreSQL，日志走 Loki，

@@ -57,6 +57,7 @@ pub const DEPLOYMENT_LABEL: &str = "deployment";
 /// 「现在有多大」的读数必须比那个窗口刷新得更勤，留出余量给一次迟到的抓取。这个数
 /// 不是谁挑的节拍，它就是那条约定除以一个整数；换算成界写在下面一行。
 // cap: fixed — Prometheus 的默认 lookback delta = 5 分钟，读数须在其内至少刷新一次；这里取 1/5
+// keep: 删掉后读数在 lookback 内不刷新，序列消失；由「lookback delta 的 1/5」兜住
 pub const LOOP_PERIOD: Duration = Duration::from_secs(60);
 
 /// 读一次日志得到的那几个数。**一个都不来自删除**。

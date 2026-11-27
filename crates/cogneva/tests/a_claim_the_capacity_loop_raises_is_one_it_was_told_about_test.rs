@@ -387,7 +387,7 @@ fn the_evolution_pods_own_data_claim_is_one_the_loop_can_raise() {
         .get("containers")
         .and_then(|c| c.as_sequence())
         .map(|cs| cs.iter().flat_map(declared_mounts).collect())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
 
     assert!(
         declared
@@ -543,7 +543,7 @@ fn workloads_that_may_raise(documents: &[serde_yaml::Value]) -> BTreeSet<String>
             .get("roleRef")
             .and_then(|r| r.get("name"))
             .and_then(|n| n.as_str())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         if !writing_roles.contains(role) {
             continue;
         }
@@ -674,7 +674,7 @@ fn the_pod_that_raises_claims_is_given_the_endpoint_the_others_publish_on() {
                     .filter_map(|n| u16::try_from(n).ok())
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         assert!(
             ports.contains(&port),
             "{name} 的地址用的是 {port}，而 Service {service_name} 只提供 {ports:?}"

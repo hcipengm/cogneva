@@ -44,7 +44,8 @@ use crate::pressure::Placement;
 /// asked for this lane for a while": the second one is still sent to the same
 /// replica, but the replica may have reclaimed the tree in the meantime, and
 /// its own first frame is what settles that.
-// cap: bound — 一条钉子多久算「还活着」：超过它，下一次只能读成「隔了一段时间才回来」
+// cap: fixed — 一条钉子多久算「还活着」：超过它，下一次只能读成「隔了一段时间才回来」
+// keep: 删掉后下一次命令分不出「一直没停」与「隔了一段时间才回来」，被回收的树会被读成还在；由「一条钉子多久算还活着」兜住
 pub const LANE_LEASE_SECS: u64 = 600;
 
 /// What happened when a lane was pinned.

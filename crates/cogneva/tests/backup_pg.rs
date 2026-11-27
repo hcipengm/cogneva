@@ -538,7 +538,7 @@ async fn pg_restore_loads_a_package_written_before_the_schema_moved_on() {
                 .ok()
                 .and_then(|text| text.lines().next().map(str::to_string))
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     if !header.split(',').any(|column| column.trim() == "is_hot") {
         // 判不了 ≠ 判不过。输入由外部给，保留窗口按**运行次数**滚，合格包滚完以后
         // 这条用例手上没有任何能考生成列重算的东西。判红会把人送去修恢复代码，
@@ -560,7 +560,7 @@ async fn pg_restore_loads_a_package_written_before_the_schema_moved_on() {
             created_at = manifest.created_at,
         );
         use std::io::Write as _;
-        let _ = std::io::stderr().write_all(format!("\n{notice}\n").as_bytes());
+        cog_core::ignore_lost!(std::io::stderr().write_all(format!("\n{notice}\n").as_bytes()));
         return;
     }
 

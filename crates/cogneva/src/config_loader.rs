@@ -2109,7 +2109,7 @@ mod tests {
                 "health_interval_secs": 5,
                 "health_checker": { "suspect_after_secs": 10 }
             },
-            "hook_engine": { "dedup_window_secs": 2, "default_rate_limit": { "burst": 50 } }
+            "hook_engine": { "dedup_window_secs": 2, "default_rate_limit": { "burst": 50, "per_second": 25 } }
         }"#;
         tmpfile.write_all(json.as_bytes()).unwrap();
 
@@ -2119,7 +2119,13 @@ mod tests {
         assert_eq!(config.supervisor.health_interval_secs, 5);
         assert_eq!(config.supervisor.health_checker.suspect_after_secs, 10);
         assert_eq!(config.hook_engine.dedup_window_secs, 2);
-        assert_eq!(config.hook_engine.default_rate_limit.burst, 50);
+        let limit = config
+            .hook_engine
+            .default_rate_limit
+            .clone()
+            .expect("declared");
+        assert_eq!(limit.burst, 50);
+        assert_eq!(limit.per_second, 25);
     }
 
     #[test]
@@ -2159,15 +2165,15 @@ mod tests {
     fn test_hook_engine_config_conversion() {
         let cfg = cog_core::HookEngineConfig {
             dedup_window_secs: 3,
-            default_rate_limit: cog_core::RateLimitConfig {
+            default_rate_limit: Some(cog_core::RateLimitConfig {
                 burst: 200,
                 per_second: 200,
-            },
+            }),
             hook_timeout_secs: 30,
         };
         let business: cog_agent::HookEngineConfig = cfg.into();
         assert_eq!(business.dedup_window, std::time::Duration::from_secs(3));
-        assert_eq!(business.default_rate_limit.burst, 200);
+        assert_eq!(business.default_rate_limit.unwrap().burst, 200);
     }
 
     #[test]

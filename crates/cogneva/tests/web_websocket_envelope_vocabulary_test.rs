@@ -381,7 +381,7 @@ ws.send(JSON.stringify(payload));
 #[test]
 fn a_sent_key_its_variant_does_not_parse_is_reported() {
     let root = std::env::temp_dir().join(format!("cogneva-sent-keys-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     std::fs::create_dir_all(root.join("crates/cog-gateway/src")).expect("temp gateway");
     std::fs::create_dir_all(root.join("web/src")).expect("temp web");
 
@@ -415,7 +415,7 @@ fn a_sent_key_its_variant_does_not_parse_is_reported() {
         .collect();
     assert_eq!(extra, vec!["gost"], "{extra:?}");
 
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }
 
 #[test]
@@ -821,7 +821,7 @@ if (message.type === 'agent_event') return;
 #[test]
 fn a_wait_nothing_sends_and_a_frame_nobody_reads_are_both_reported() {
     let root = std::env::temp_dir().join(format!("cogneva-envelope-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     std::fs::create_dir_all(root.join("crates/cog-gateway/src")).expect("temp gateway");
     std::fs::create_dir_all(root.join("crates/demo/src")).expect("temp crate");
     std::fs::create_dir_all(root.join("web/src/transport")).expect("temp web");
@@ -884,5 +884,5 @@ fn a_wait_nothing_sends_and_a_frame_nobody_reads_are_both_reported() {
         "{complaints:?}"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }

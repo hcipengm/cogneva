@@ -60,6 +60,6 @@ mod tests {
         let cfg = PromptConfig::load_from(&path).unwrap();
         assert_eq!(cfg.dir, "/etc/cogneva/prompts");
         assert!(cfg.hot_reload);
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 }

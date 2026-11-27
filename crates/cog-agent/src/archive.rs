@@ -211,6 +211,44 @@ pub async fn post_raw(
     Ok(artifact_uri(DEFAULT_MEMORY_NAMESPACE, id))
 }
 
+/// 按 `artifact://<namespace>/<id>` 取回正文——[`post_raw`] 的读回口。
+///
+/// 写侧把字节交给 memory API 并造出这个引用；此前没有任何一条代码能按引用取回
+/// 它，于是「正文在哪」只有一个字符串，工具调用与会话表这两处投影都拼不回原文。
+/// 这一条补的是那个读回口：同一个 base、同一个路径约定。
+pub async fn read_artifact(
+    client: &dyn HttpClient,
+    base: Option<&str>,
+    uri: &str,
+) -> cog_core::SFResult<String> {
+    let rest = uri.strip_prefix("artifact://").ok_or_else(|| {
+        cog_core::SFError::Config(format!("{uri:?} is not an artifact reference"))
+    })?;
+    let (namespace, id) = rest
+        .split_once('/')
+        .ok_or_else(|| cog_core::SFError::Config(format!("{uri:?} names no source")))?;
+    let base = base
+        .filter(|b| !b.trim().is_empty())
+        .ok_or_else(|| {
+            cog_core::SFError::Config(format!(
+                "{MEMORY_API_BASE_ENV} is not set: an archived body has nowhere to be read from"
+            ))
+        })?
+        .trim_end_matches('/');
+    let path = cog_core::MEMORY_RAW_CONTENT_PATH.replace("{id}", &format!("{namespace}/{id}"));
+    let url = format!("{base}{path}");
+    let resp = client
+        .execute(cog_core::HttpRequest::get(url).timeout(ARCHIVE_TIMEOUT_SECS))
+        .await?;
+    if !resp.is_success() {
+        return Err(cog_core::SFError::Config(format!(
+            "the memory API refused {uri:?}: HTTP {}",
+            resp.status
+        )));
+    }
+    Ok(String::from_utf8_lossy(&resp.body).to_string())
+}
+
 impl HttpToolOutputArchive {
     pub fn new(
         client: Arc<dyn HttpClient>,
@@ -305,7 +343,8 @@ fn tool_labels(tool: &str) -> HashMap<String, String> {
 /// rather than a background job's: long enough for a healthy API to store an
 /// oversized payload, short enough that an API that stopped answering delays the
 /// turn instead of wedging it.
-// cap: bound — 长到容得下一份过大的载荷，短到让一个不再应答的 API 拖慢这一回合而不是把它卡死
+// cap: fixed — 长到容得下一份过大的载荷，短到让一个不再应答的 API 拖慢这一回合而不是把它卡死
+// keep: 删掉后一个不再应答的归档 API 会把这一回合卡住；由「一次归档请求的往返」兜住
 // wall: 等=归档 API 收下一次写入 / 等不到=这一回合的归档失败，账上记一条失败；**没有半份载荷被当成已归档** / 续跑=能，重来是一次新的归档请求
 const ARCHIVE_TIMEOUT_SECS: u64 = 20;
 

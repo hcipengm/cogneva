@@ -208,12 +208,14 @@ pub struct RestartSettings {
 
 // 三次重启：一次 panic 可能是偶然，连着三次就是每次都被同一件活打回；再往后
 // 重启只是换个时间点重放同一个崩溃。
-// cap: bound — 三次：连着三次都被同一件活打回，第四次只会重放同一个崩溃
+// cap: fixed — 三次：连着三次都被同一件活打回，第四次只会重放同一个崩溃
+// keep: 删掉后同一个崩溃被无限重放，循环永远重启；由「第四次只会重放同一个崩溃」兜住
 const RESTART_MAX_CONSECUTIVE: u32 = 3;
 
 // 五秒地板：短到事件驱动的循环在下一次活来之前回来了，长到立刻 panic 的循环
 // 不会把日志刷满（等待从这儿翻倍，一份预算花完是几十秒，不是几毫秒）。
-// cap: bound — 五秒：立刻 panic 的循环不刷屏，事件驱动的循环在下一次活来前回来
+// cap: fixed — 五秒：立刻 panic 的循环不刷屏，事件驱动的循环在下一次活来前回来
+// keep: 删掉后立刻 panic 的循环刷屏，事件驱动的循环在下一次活来前回不来；由「五秒」兜住
 const RESTART_BACKOFF_FLOOR_SECS: u64 = 5;
 
 impl Default for RestartSettings {
@@ -248,7 +250,8 @@ pub struct RestartPolicy {
 /// budget is deliberately left out of this wait: it is time the loop spends
 /// working rather than time between attempts, and a restart that waited it out
 /// would delay the repair by the length of the thing that is not being repaired.
-// cap: bound — 量的是「在不在干活」而不是两次尝试之间的时间；等满它的重启会把修复推迟整整一段没在被修的时间
+// cap: fixed — 量的是「在不在干活」而不是两次尝试之间的时间；等满它的重启会把修复推迟整整一段没在被修的时间
+// keep: 删掉后「在不在干活」没有判据，重启在没被修的那段时间里反复发生；由「等满它的重启会把修复推迟」兜住
 const STALL_PERIODS: u32 = 6;
 
 impl RestartPolicy {

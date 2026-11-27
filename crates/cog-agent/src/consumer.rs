@@ -31,11 +31,13 @@ use futures::StreamExt;
 /// wrote just as the previous incarnation was dying: too small and it could
 /// take back a message that a still-draining process is finishing; nothing
 /// waits on this value, so it is chosen for safety rather than latency.
-// cap: bound — 为的是不把一条还在排空的进程正在结束的消息抢回来；没有任何人在等这个值，所以按安全取而不是按延迟取
+// cap: fixed — 为的是不把一条还在排空的进程正在结束的消息抢回来；没有任何人在等这个值，所以按安全取而不是按延迟取
+// keep: 删掉后会把一条还在排空的消息抢回来，同一件活做两遍；由「安全取而不是按延迟取」兜住
 const INBOX_RECLAIM_MIN_IDLE_MS: u64 = 60_000;
 
 /// How many pending messages one reclaim call asks for.
-// cap: bound — 一次回收调用要多少条待处理消息
+// cap: fixed — 一次回收调用要多少条待处理消息
+// keep: 删掉后一次回收会把所有待处理消息拉进内存，白占堆；由「一次一页」兜住
 const INBOX_RECLAIM_BATCH: usize = 64;
 
 /// How often a running consumer looks back at its own pending list.
@@ -46,7 +48,8 @@ const INBOX_RECLAIM_BATCH: usize = 64;
 /// [`INBOX_RECLAIM_MIN_IDLE_MS`], so the one pass skips it -- and nothing ever
 /// asks again, because a pending entry is not lag and no reading shows it. A
 /// backstop pass turns "never" into "one interval later".
-// cap: bound — 与回收空闲阈值同量级；更小是白问一遍，更大只让那条消息多等一会儿
+// cap: fixed — 与回收空闲阈值同量级；更小是白问一遍，更大只让那条消息多等一会儿
+// keep: 删掉后回收没有节拍，几条消息被反复问；由「与回收空闲阈值同量级」兜住
 const INBOX_RECLAIM_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Generic agent consumer backed by any [`cog_core::MessageBackend`] implementation.
@@ -190,7 +193,7 @@ impl AgentConsumer {
         // world is told. A sender whose receiver was dropped needs no error:
         // the caller stopped caring, the loop keeps reading.
         if let Some(ready) = ready {
-            let _ = ready.send(());
+            cog_core::ignore_lost!(ready.send(()));
         }
 
         // The first tick is a full period out: the starting pass above already

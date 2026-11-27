@@ -104,7 +104,7 @@ fn every_container_carries_the_clusters_timezone_including_the_database() {
                 let image = container
                     .get("image")
                     .and_then(|v| v.as_str())
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 let env = env_pairs(container);
 
                 if image.starts_with(app_repo) {

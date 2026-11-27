@@ -55,6 +55,13 @@ pub(crate) const NO_LEDGER_REASON: &str = "no_ledger";
 /// it is still happening, this says how much is gone.
 pub(crate) const WRITE_FAILED_REASON: &str = "write_failed";
 
+/// The row landed and the call fact did not.
+///
+/// 两种落点各是一次丢失：行没了，读行的那一半读少；事件没了，读流的那一半读少，
+/// 而且重建时这一笔调用不存在。它不混进 `write_failed`——那一个说的是库或 schema
+/// 的问题，这一个说的是事件写口的问题，修法不同。
+pub(crate) const EVENT_WRITE_FAILED_REASON: &str = "event_write_failed";
+
 /// Every reason a completed call's spend can fail to reach the ledger, in the
 /// order they are published at startup.
 ///
@@ -63,7 +70,11 @@ pub(crate) const WRITE_FAILED_REASON: &str = "write_failed";
 /// to `increase()`, and the one loss a fresh process suffers would be the one the
 /// rule cannot see. A reason added to a call site and not here leaves a blind
 /// cell, so the vocabulary test compares this list against what is published.
-pub(crate) const LANDING_DROP_REASONS: [&str; 2] = [NO_LEDGER_REASON, WRITE_FAILED_REASON];
+pub(crate) const LANDING_DROP_REASONS: [&str; 3] = [
+    NO_LEDGER_REASON,
+    WRITE_FAILED_REASON,
+    EVENT_WRITE_FAILED_REASON,
+];
 
 /// How many times one row is offered to the store before the loss is declared.
 ///
@@ -71,7 +82,8 @@ pub(crate) const LANDING_DROP_REASONS: [&str; 2] = [NO_LEDGER_REASON, WRITE_FAIL
 /// the request path, but a store that is down for a minute fails every attempt
 /// of every caller anyway — the retries are for the transient case, and the
 /// alert is for the other one.
-// cap: bound — 落库失败的重试次数，界的是写丢失的概率与请求耗时的折中
+// cap: fixed — 落库失败的重试次数，界的是写丢失的概率与请求耗时的折中
+// keep: 删掉后落库失败不重试，写丢失的概率直接交给一次抖动；由「写丢失的概率与请求耗时的折中」兜住
 pub(crate) const WRITE_ATTEMPTS: u32 = 3;
 
 /// Whether a row has started failing to land, so that only the edges are acted
@@ -132,7 +144,8 @@ pub(crate) fn write_failed_message(attempts: u32, last_error: &str) -> String {
 /// A fifth of a second: long enough to ride out a connection reset, short
 /// enough that a store which is really down is declared in the same second
 /// rather than holding a task open behind it.
-// cap: bound — 指数退避的基数，第 n 次重试等 base*2^n
+// cap: fixed — 指数退避的基数，第 n 次重试等 base*2^n
+// keep: 删掉后指数退避没有基数，三次重试挤在同一刻；由「第 n 次重试等 base*2^n」兜住
 const BACKOFF_BASE_MS: u64 = 200;
 
 /// How long to wait before the next attempt, by the attempt that just failed.

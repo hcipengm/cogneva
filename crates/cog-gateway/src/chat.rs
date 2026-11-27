@@ -15,7 +15,8 @@ use crate::GatewayState;
 ///
 /// 这是「装得进一次请求」的界，不是「存得下多少」的界：记录本身留在库里，按会话
 /// 自己的上界裁剪，见存储面。
-// cap: bound — 一次会话带多少轮历史进上下文，界的是请求体积
+// cap: fixed — 一次会话带多少轮历史进上下文，界的是请求体积
+// keep: 删掉后请求体积跟着会话长度走，历史把请求撑爆；由「界的是请求体积」兜住
 const SESSION_HISTORY_CAP: usize = 40;
 
 /// 一条长消息落成的文件放在哪。这个路径由**执行器**解释：写入与读回都走同一个
@@ -27,11 +28,14 @@ pub const ATTACHMENT_ROOT: &str = "/tmp/cogneva-chat-attachments";
 /// 这里把它写出来只为一件事：阈值要读它。不写出来的话「帧上限」在阈值那一段
 /// 是一个没人写过的数，两个数之间也就没有关系可言。
 // cap: fixed — 传输层的协议默认值，不是谁挑的拨盘；钉出来让阈值读得到它
+// not-a-bound: 传输层的协议默认值，不是谁挑的拨盘；钉出来让阈值读得到它
 pub const MAX_INBOUND_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 /// UTF-8 一个字最多几个字节。把字节上限折成字符时按最坏的算，读出来的字数就
 /// 不会比真到手的多。
 // cap: fixed — UTF-8 编码本身给的上界
+// keep: 删掉后按另一种编码上界估字节，一问一答的预算对不上；由「UTF-8 编码本身给的上界」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const MAX_UTF8_BYTES_PER_CHAR: usize = 4;
 
 /// 这一轮窗口里，一句用户话最多占到几分之一。
@@ -39,12 +43,14 @@ const MAX_UTF8_BYTES_PER_CHAR: usize = 4;
 /// 窗口不只装这一句话：系统前缀、工具表、前面的历史与这一轮的回答都住在里面。
 /// 一句话可以长，但不能长到把回答挤出去——超过这个份额的，原文落成文件，循环
 /// 拿到的是引用与开头。
-// cap: bound — 窗口分给一句提问的份额，剩下来的要装前缀、工具表、历史与回答
+// cap: fixed — 窗口分给一句提问的份额，剩下来的要装前缀、工具表、历史与回答
+// keep: 删掉后提问可以占满整个窗口，前缀、工具表、历史与回答没有位置；由「剩下来的要装前缀、工具表、历史与回答」兜住
 const INPUT_SHARE_OF_CONTEXT: usize = 8;
 
 /// 引用里留多长的开头：阈值的几分之一。够看出这条消息在讲什么，又不至于让
 /// 「引用」自己再吃一大口窗口。
-// cap: bound — 开头摘录占阈值的份额，与阈值同向变化
+// cap: fixed — 开头摘录占阈值的份额，与阈值同向变化
+// keep: 删掉后开头摘录的份额与阈值脱钩，摘录可能吃掉整个阈值；由「与阈值同向变化」兜住
 const HEAD_SHARE_OF_THRESHOLD: usize = 4;
 
 fn now_iso() -> String {
@@ -851,6 +857,12 @@ pub struct ConversationRequest {
     /// 由网关从会话上读出来再带进来，因为「这一段用哪只」是会话的属性，而运行时
     /// 每轮重建：把选择留在网关的内存里，进程重启或换一条连接就会读不回它。
     pub model: Option<String>,
+    /// 这一轮属主打的那一行原话（未展开）。命令展开之后交给模型的是另一段文本，
+    /// 意图行要收的是原话：`text` 不改写，展开记在 `model_text` 那一格。
+    pub original_text: Option<String>,
+    /// 这一轮的到达 id：意图的身份由「会话＋到达 id」算出，轮内其余事实用这条
+    /// 意图事件的 id 做因果。`None` 是旧调用方没有这一格（那时按原文算身份）。
+    pub arrival_id: Option<String>,
     /// 这一轮处在哪种权限模式下，取的是闭集里的名字。不认识的由装配层按更严的
     /// 那一格处理——一次拼错的模式名不该让这一轮问得更少。
     pub permission_mode: String,
@@ -874,7 +886,8 @@ pub struct ClientOrigin<'a> {
 /// 一个模型的回合可以连着吐几百个小增量，而界面那头的写是有背压的（慢客户端会
 /// 堵住 WebSocket）。管道浅了生产端就跟着堵，把一次推理拖成一次写网络；深到能装下
 /// 一整个回合的增量，生产端就不会因为读者慢而停下。
-// cap: bound — 事件管道深度，界的是「读者慢多久会堵住循环」
+// cap: fixed — 事件管道深度，界的是「读者慢多久会堵住循环」
+// keep: 删掉后事件管道无界，慢读者不堵循环而是让内存一直长；由「界的是读者慢多久会堵住循环」兜住
 const EVENT_CHANNEL_CAP: usize = 512;
 
 /// 被叫停之后，最多等多久把已经说出口的那半句读回来。
@@ -882,7 +895,8 @@ const EVENT_CHANNEL_CAP: usize = 512;
 /// 正常情况下这个等待立刻结束：那一轮被丢下时，它手里的事件发送端一起没了，读
 /// 回那一头马上看到管道关闭。这个数只兜「有人另留了一份发送端」的底——那时界面
 /// 上的停止按钮会卡在这个等待里，而这正是它最不该表现出犹豫的地方。
-// cap: bound — 停止之后等读回管道关闭的上限，界的是停止按钮的响应时间
+// cap: fixed — 停止之后等读回管道关闭的上限，界的是停止按钮的响应时间
+// keep: 删掉后停止之后没有等管道关闭的上限，停止按钮一直转；由「界的是停止按钮的响应时间」兜住
 const STOPPED_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// 这一轮从循环里读回来的东西：回复正文，它派出去的目标号，它翻开过的变更，
@@ -965,7 +979,7 @@ impl RunningTurns {
         let stopped = list.len();
         for turn in list {
             // 接收方已经走了（那一轮刚好在这之前结束）时 send 会失败，这不是错。
-            let _ = turn.stop.send(true);
+            cog_core::ignore_lost!(turn.stop.send(true));
         }
         stopped
     }
@@ -1057,7 +1071,7 @@ async fn pump_events(
     let mut told: Option<String> = None;
     while let Some(event) = events.recv().await {
         // 没有订阅者时 send 会失败，这不是错：连接先走了，帧没有人要。
-        let _ = bus.send(event.clone());
+        cog_core::ignore_lost!(bus.send(event.clone()));
         // 界面靠这一帧把执行者的工具调用归到这段对话下面：工具帧只带 `agent_id`，
         // 没有这一帧，这段对话自己的执行过程一条也接不回来，屏幕上就只剩一问一答。
         let speaker = match &event {
@@ -1494,7 +1508,7 @@ async fn emit_turn_memory(
                 })
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     emit(
         out,
         session_id,
@@ -1527,7 +1541,7 @@ async fn emit_turn_mcp(
                 .filter_map(|row| row.as_str().map(str::to_string))
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     emit(
         out,
         session_id,
@@ -1681,7 +1695,7 @@ async fn session_spend_frame(
     };
     match ledger.spend_for_session(session).await {
         Ok(spend) => {
-            let spend = spend.unwrap_or_default();
+            let spend = spend.unwrap_or(Default::default());
             serde_json::json!({
                 "readable": true,
                 "calls": spend.calls,
@@ -2144,6 +2158,67 @@ pub async fn run_chat_turn(
     permission_mode: String,
     permissions: Option<Arc<dyn PermissionBridge>>,
 ) {
+    // 这一轮的到达 id 与它的意图事件 id：轮的根是用户那一句，轮内其余事实
+    // （附件、工具调用、回答、失败）都用这个 id 做因果。两处算得出同一个值。
+    let user_mid = format!("user-{}", uuid::Uuid::new_v4());
+    let turn_causation =
+        cog_core::intent_event_id(&cog_core::chat_intent_identity(&session_id, &user_mid));
+
+    // 附件先落成事实：字节进对象存储，流上留一条带指针的消息（kind=attachment，
+    // 属于这一段会话）。会话表里那一份是投影；投影坏了，正文仍按指针取得回来。
+    if !attachments.is_empty() {
+        if let (Some(backend), Some(events)) =
+            (state.object_backend.as_ref(), state.message_events.as_ref())
+        {
+            for (i, attachment) in attachments.iter().enumerate() {
+                let bytes = match base64::Engine::decode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &attachment.data,
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "一个附件不是合法的 base64，没落成事实");
+                        continue;
+                    }
+                };
+                let key = format!(
+                    "attachments/{session_id}/{i}-{}",
+                    attachment.name.as_deref().unwrap_or("file")
+                );
+                match backend.put(&key, &bytes).await {
+                    Ok(uri) => {
+                        if let Err(e) = events
+                            .append(cog_core::message_event(
+                                &owner,
+                                &session_id,
+                                "attachment",
+                                // 指针连同人能认出的两格一起进正文：重建会话表时
+                                // 附件那一列要的就是这三样。
+                                &serde_json::json!({
+                                    "key": key,
+                                    "uri": uri,
+                                    "name": attachment.name,
+                                    "mime_type": attachment.mime_type,
+                                })
+                                .to_string(),
+                                Some(&session_id),
+                                Some(&turn_causation),
+                                None,
+                                chrono::Utc::now(),
+                            ))
+                            .await
+                        {
+                            tracing::warn!(session_id = %session_id, error = %e, "附件的指针没写进流");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(session_id = %session_id, key = %key, error = %e, "附件没存进对象存储")
+                    }
+                }
+            }
+        }
+    }
+
     // 这一段上正在跑的轮都在这一台上的名册里：连接断掉、换一条重连上来，停止
     // 按钮仍按得动——名册跟着对话走，不跟着 socket 走。
     let running = out.running().clone();
@@ -2186,7 +2261,6 @@ pub async fn run_chat_turn(
 
     // 1. Echo the user message so the UI renders it (the real transport has
     //    no local echo, unlike the mock client).
-    let user_mid = format!("user-{}", uuid::Uuid::new_v4());
     emit_message_start(
         &out,
         &session_id,
@@ -2361,6 +2435,8 @@ pub async fn run_chat_turn(
                 session_id: session_id.clone(),
                 // 记录在下面几步还要用这个身份：这一轮属于谁，写的是同一件事。
                 owner: owner.clone(),
+                original_text: Some(content.clone()),
+                arrival_id: Some(user_mid.clone()),
                 messages,
                 llm,
                 platform: origin.platform.map(str::to_string),
@@ -2380,6 +2456,7 @@ pub async fn run_chat_turn(
     // 也不能让停止按钮卡在这里。已经流到屏幕上的字不算白说：那一半记在这一轮的
     // 记录里，用户看到的就是结束在这儿。
     let journal = if matches!(&outcome, TurnOutcome::Stopped) {
+        // wall: 等=停止后读回管道排空 / 等不到=已流出的字记为这一轮结局 / 续跑=能，用户再发一轮
         match tokio::time::timeout(STOPPED_DRAIN, &mut pump).await {
             Ok(journal) => journal.unwrap_or_default(),
             Err(_) => {
@@ -2388,7 +2465,7 @@ pub async fn run_chat_turn(
             }
         }
     } else {
-        pump.await.unwrap_or_default()
+        cog_core::logged_default!(pump.await)
     };
 
     // 4a. 被停掉的那一轮：先说「停了」，再说「这一轮结束了」。
@@ -2522,6 +2599,26 @@ pub async fn run_chat_turn(
     //    派了活的那一轮把目标记在记录里：帧只活在连接里，刷新之后历史要能读出
     //    「这一轮交出去过一道目标」，否则追问「刚才那个目标怎么样了」时模型手里
     //    什么都没有。
+    // 失败也是一轮的事实：原因不在回答正文里（那时还没有回答），不写这一条，
+    // 会话表里那一行「为什么没有回答」就没有第二处可读。
+    if let (Some(err), Some(events)) = (failure.as_ref(), state.message_events.as_ref()) {
+        if let Err(e) = events
+            .append(cog_core::message_event(
+                journal.agent.as_deref().unwrap_or(""),
+                &owner,
+                "failure",
+                err,
+                Some(&session_id),
+                Some(&turn_causation),
+                None,
+                chrono::Utc::now(),
+            ))
+            .await
+        {
+            tracing::warn!(session_id = %session_id, error = %e, "失败原因没写进流");
+        }
+    }
+
     match (&failure, reply.is_empty()) {
         (Some(err), _) => {
             record_failed_turn(
@@ -2580,6 +2677,36 @@ pub async fn run_chat_turn(
                 .await
             }
         },
+    }
+
+    // 这一轮的回答也是一条事实：谁说的、说给谁、正文。用户那一句已经在意图那本账
+    // 上（到达即落），回答此前只活在会话表里——表坏了会话就拼不回来。写不进去只
+    // 说一句：回答已经交付，缺的是那一条账。
+    if failure.is_none() && !reply.is_empty() {
+        if let (Some(events), Some(agent)) =
+            (state.message_events.as_ref(), journal.agent.as_deref())
+        {
+            if let Err(e) = events
+                .append(cog_core::message_event(
+                    agent,
+                    &owner,
+                    "answer",
+                    &reply,
+                    Some(&session_id),
+                    Some(&turn_causation),
+                    None,
+                    chrono::Utc::now(),
+                ))
+                .await
+            {
+                tracing::warn!(
+                    session_id = %session_id,
+                    agent = %agent,
+                    error = %e,
+                    "the answer was delivered but its fact was not written to the stream"
+                );
+            }
+        }
     }
 
     // 6. 这一轮的现场：上下文挤掉了什么、花了多少。都排在收尾帧之前，因为界面
@@ -2822,7 +2949,7 @@ mod tests {
                 .unwrap();
         }
         drop(events_tx);
-        let _ = pump.await;
+        cog_core::ignore_lost!(pump.await);
 
         let mut identity = Vec::new();
         // 这一轮只有身份那一帧：同一个人重复开口也只报一次，所以后面不该再来。
@@ -2876,7 +3003,7 @@ mod tests {
             .await
             .unwrap();
         drop(events_tx);
-        let _ = pump.await;
+        cog_core::ignore_lost!(pump.await);
 
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), bus_rx.recv())
             .await
@@ -3090,7 +3217,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl cog_core::LlmUsageLedger for SessionLedger {
-        async fn record(&self, _: &cog_core::LlmUsageRecord) -> Result<(), String> {
+        async fn record(&self, _: &cog_core::LlmUsageRecord) -> Result<String, String> {
             unimplemented!("这一格只读不写")
         }
         async fn record_exchange(&self, _: &cog_core::LlmExchangeRecord) -> Result<(), String> {
@@ -4118,7 +4245,10 @@ mod tests {
                 .map(|(offset, turn)| {
                     let (tool_calls, agent) = match turn.role {
                         cog_core::ChatTurnRole::Assistant => {
-                            let held = calls.get(assistant_at).cloned().unwrap_or_default();
+                            let held = calls
+                                .get(assistant_at)
+                                .cloned()
+                                .unwrap_or(Default::default());
                             assistant_at += 1;
                             held
                         }

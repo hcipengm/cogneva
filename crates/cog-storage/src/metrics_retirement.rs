@@ -66,7 +66,8 @@ pub const HISTOGRAM_SUMS_TABLE: &str = "cog_metric_histogram_sums";
 /// locks, the same way the sweep's batch does. A retired name's history can be
 /// the larger part of the log, and deleting it in one statement would block
 /// every writer for as long as that takes.
-// cap: bound — 与清扫那批同源地界单句的锁：一个退役名字的历史可能是日志的大头，一句删完会让所有写者等那么久
+// cap: fixed — 与清扫那批同源地界单句的锁：一个退役名字的历史可能是日志的大头，一句删完会让所有写者等那么久
+// not-a-bound: 与清扫那批同源地界单句的锁：一个退役名字的历史可能是日志的大头，一句删完会让所有写者等那么久
 const RELEASE_BATCH: i64 = 5_000;
 
 /// 申报：一个名字**后来长出来的标签**，与长出之前那批标签集。
@@ -191,7 +192,8 @@ pub const ROSTER_FRESH_SECS: i64 =
 /// `increment_counter_total` 是 `SET value = t.value + EXCLUDED.value`，下一笔从增量
 /// 重起、Prometheus 读成 reset ⇒ 比不删更坏。取大了只是把一个没有截止期的删除推后。
 /// 中位数落在被保护的形状自己正常的节奏里，压根不是候选。
-// cap: bound — increment_counter_total 是 SET value = t.value + EXCLUDED.value，删后再写会被读成 reset，比不删更坏；取大了只是把一个没有截止期的删除推后
+// cap: fixed — increment_counter_total 是 SET value = t.value + EXCLUDED.value，删后再写会被读成 reset，比不删更坏；取大了只是把一个没有截止期的删除推后
+// keep: 删掉后回到「increment_counter_total 是 SET value = t.value + EXCLUDED.value，删后再写会被读成 reset，比不删更坏；取大了只是把一个没有截止期的删除推后」所描述的情形；由这条约定兜住
 pub const SUPERSEDED_QUIET_SECS: i64 = 6 * 3600;
 
 /// 一张表把时钟放在哪——形状守卫要按它判年龄。

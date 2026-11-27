@@ -202,7 +202,7 @@ async fn test_the_comparison_step_is_held_to_the_specification() {
         ..SelfReviewConfig::default()
     };
 
-    let _ = SelfReviewLoop::new(config).review("draft", &provider).await;
+    cog_core::ignore_lost!(SelfReviewLoop::new(config).review("draft", &provider).await);
 
     let payloads = provider.payloads();
     assert_eq!(payloads.len(), 2, "critique and compare, one call each");

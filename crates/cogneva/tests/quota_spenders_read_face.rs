@@ -155,7 +155,7 @@ impl LlmUsageLedger for FakeSpend {
         Ok(self.refused_workspaces.clone())
     }
 
-    async fn record(&self, _: &cog_core::LlmUsageRecord) -> Result<(), String> {
+    async fn record(&self, _: &cog_core::LlmUsageRecord) -> Result<String, String> {
         unimplemented!("只读替身")
     }
     async fn record_exchange(&self, _: &cog_core::LlmExchangeRecord) -> Result<(), String> {

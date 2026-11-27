@@ -33,11 +33,13 @@ const REPO_ROOT_ENV: &str = "COGNEVA_REPO_ROOT";
 
 /// 等 apiserver 答话的轮询节拍：一拍是一次 `kubectl cluster-info` 加一次
 /// `systemctl is-active`。比它更密只是重复读同一份状态。
-// cap: bound — 一拍的代价是两次本地命令；更密只是重复读同一份状态
+// cap: fixed — 一拍的代价是两次本地命令；更密只是重复读同一份状态
+// keep: 删掉后轮询没有节拍，同一份 kubeconfig 被反复读，白烧 CPU；由「一拍两次本地命令」兜住
 const KUBECONFIG_READY_INTERVAL: Duration = Duration::from_secs(2);
 
 /// 等节点 Ready 的轮询节拍：一拍是一次 `kubectl get nodes`。
-// cap: bound — 一拍的代价是一次 kubectl get；更密只是重复读同一份状态
+// cap: fixed — 一拍的代价是一次 kubectl get；更密只是重复读同一份状态
+// keep: 删掉后轮询没有节拍，同一份节点状态被反复取，白烧 API；由「一拍一次 kubectl get」兜住
 const NODES_READY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 集群内 registry 播种的一拍：一次 `ctr images push`。
@@ -45,13 +47,15 @@ const NODES_READY_INTERVAL: Duration = Duration::from_secs(5);
 /// 它不判结局（结局由推送本身与 registry 进程的状态说），只决定重试的疏密；
 /// 失败的推送通常立刻返回，10s 一拍既不会把刚起来的 registry 淹掉，也不会让
 /// 一次瞬断把整条装机拖很久。
-// cap: bound — 一拍是一次本地推送；更密只是把同一个失败再问一遍
+// cap: fixed — 一拍是一次本地推送；更密只是把同一个失败再问一遍
+// keep: 删掉后同一个失败被立刻再问一遍，白占一次推送；由「一拍一次本地推送」兜住
 const REGISTRY_SEED_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
 /// 最佳努力的新版本探测单次上限。
 ///
 /// 这一步只提示、绝不阻塞命门链路：3s 之后就当官方没有新版本，静默返回。
-// cap: bound — 这一步只提示、绝不阻塞命门链路：3s 之后就当官方没有新版本，静默返回
+// cap: fixed — 这一步只提示、绝不阻塞命门链路：3s 之后就当官方没有新版本，静默返回
+// not-a-bound: 这一步只提示、绝不阻塞命门链路：3s 之后就当官方没有新版本，静默返回
 // wall: 等=官方版本接口的答复 / 等不到=这一提示整段跳过、静默返回，**绝不阻塞命门链路**——没有版本提示不是装机失败 / 续跑=不适用：这一步只提示
 const OUTDATED_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -443,7 +447,7 @@ async fn run_k3s_install_script(env: &str) -> Result<()> {
         }
     }
     let status = child.status().await?;
-    let _ = std::fs::remove_dir_all(&dir);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     if !status.success() {
         bail!("K3s 安装脚本退出码 {:?}", status.code());
     }
@@ -1568,7 +1572,7 @@ async fn ensure_git() -> Result<()> {
             continue;
         }
         if *mgr == "apt-get" {
-            run("apt-get", &["update"]).await.ok();
+            cog_core::ignore_lost!(run("apt-get", &["update"]).await);
         }
         if run(args[0], &args[1..]).await.is_ok() && command_exists("git").await {
             info!("git 已安装");
@@ -1663,7 +1667,7 @@ async fn ensure_git_remote() -> Result<()> {
     );
     for url in [primary, fallback] {
         // 失败重试前清掉半截 clone 产物，避免下次 clone 因目录非空报错。
-        std::fs::remove_dir_all(&remote).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&remote));
         match run("git", &["clone", "--bare", url, &remote.to_string_lossy()]).await {
             Ok(()) => {
                 info!("git-remote bare 已从 {url} seed");
@@ -1711,7 +1715,7 @@ async fn ensure_firecracker() -> Result<()> {
         .await
     }
     .await;
-    let _ = std::fs::remove_dir_all(&dir);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     match outcome {
         Ok(()) => {
             info!("firecracker 安装完成");
@@ -2060,7 +2064,7 @@ async fn download_parts(url: &str, workdir: &Path, tar: &str) -> Result<()> {
                 info!("分卷 part-{suffix} 下载完成");
                 let data = std::fs::read(&part)?;
                 std::io::Write::write_all(&mut out, &data)?;
-                let _ = std::fs::remove_file(&part);
+                cog_core::ignore_lost!(std::fs::remove_file(&part));
             }
             Err(e) if i == 0 => bail!("首卷 part-aa 不存在，该 release 无分卷（{e}）"),
             Err(_) => break,
@@ -2122,7 +2126,7 @@ async fn fetch_prebuilt_tar() -> Result<(PathBuf, String)> {
     match fetch {
         Ok(tar) => Ok((workdir, tar)),
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&workdir);
+            cog_core::ignore_lost!(std::fs::remove_dir_all(&workdir));
             Err(e)
         }
     }
@@ -2164,7 +2168,7 @@ async fn try_import_prebuilt(image: &str) -> Result<()> {
         Ok(())
     }
     .await;
-    let _ = std::fs::remove_dir_all(&workdir);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&workdir));
     result
 }
 
@@ -2187,7 +2191,7 @@ async fn distribute_image_to_nodes(image: &str, namespace: &str) -> Result<()> {
         }
     };
     let result = distribute_via_daemonset(&tar, namespace).await;
-    let _ = std::fs::remove_dir_all(&workdir);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&workdir));
     result?;
     info!("镜像已分发到全部节点: {image}");
     Ok(())
@@ -2264,7 +2268,7 @@ async fn distribute_via_daemonset(tar: &str, namespace: &str) -> Result<()> {
 
     // 分发器常设保留（增量升级复用：注入新 tar + rollout restart 即可，
     // 见 deploy/scripts/distribute-image.sh）；失败时也保留现场便于排查
-    let _ = std::fs::remove_dir_all(&mdir);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&mdir));
     run_result
 }
 
@@ -2456,7 +2460,9 @@ async fn seed_cluster_registry(namespace: &str) -> Result<()> {
         // Print what was on the machine when the wait ended. Without it the log
         // says only "not ready" -- the same words whether the registry is
         // crash-looping or still pulling.
-        let _ = run("kubectl", &["-n", namespace, "get", "pods", "-o", "wide"]).await;
+        cog_core::ignore_lost!(
+            run("kubectl", &["-n", namespace, "get", "pods", "-o", "wide"]).await
+        );
         return Err(e).context("集群内 registry 未就绪（上面是判定那一刻的 Pod 现场）");
     }
     Ok(())
@@ -2610,7 +2616,7 @@ async fn kick_image_pull_pending(namespace: &str) -> Result<()> {
                 })
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     if pending.is_empty() {
         return Ok(());
     }
@@ -2679,7 +2685,7 @@ async fn ensure_source_tree() -> Result<PathBuf> {
         attempts.push(vec!["clone", "--depth", "1", url, dir.to_str().unwrap()]);
     }
     for args in &attempts {
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
         match run("git", args).await {
             Ok(()) => {
                 info!("镜像源码回退树已就绪: {}", dir.display());
@@ -2860,7 +2866,7 @@ async fn export_image_tar(image: &str) -> Result<(PathBuf, String)> {
     )
     .await;
     if let Err(e) = result {
-        let _ = std::fs::remove_dir_all(&workdir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&workdir));
         return Err(e);
     }
     Ok((workdir, tar))
@@ -2871,7 +2877,7 @@ async fn build_runtime_image_from_source(image: &str) -> Result<()> {
     build_image_locally(image).await?;
     let (workdir, tar) = export_image_tar(image).await?;
     let result = run("k3s", &["ctr", "-n", "k8s.io", "images", "import", &tar]).await;
-    let _ = std::fs::remove_dir_all(&workdir);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&workdir));
     result?;
     info!("运行时镜像已导入集群: {image}");
     Ok(())
@@ -3190,7 +3196,7 @@ async fn ensure_helm() -> bool {
             .is_ok(),
             Err(_) => false,
         };
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
         if ok {
             info!("helm 安装完成（来源 {url}）");
             return true;
@@ -3931,7 +3937,8 @@ fn chart_values() -> Result<serde_yaml::Value> {
 }
 
 /// 等一个工作负载就绪时的轮询节拍。
-// cap: bound — 一拍的代价是一次 kubectl get；比它更密只是重复读同一份状态
+// cap: fixed — 一拍的代价是一次 kubectl get；比它更密只是重复读同一份状态
+// keep: 删掉后工作负载状态被无节拍地反复取，白烧 API；由「一拍一次 kubectl get」兜住
 const WORKLOAD_POLL_SECS: u64 = 5;
 
 /// 对象不在集群里时，判词里的那一句。按它把「该组件没部署」与「还没就绪」分开：
@@ -3940,19 +3947,23 @@ const WORKLOAD_NOT_FOUND_MARKER: &str = "does not exist in this cluster";
 
 /// 镜像服务：申报的期望工期。空白机首拉 busybox（经镜像站）可能远超两分钟，而
 /// 过了点只是说一句、继续等，所以它是申报而不是预算。
-// cap: bound — 申报的期望工期（过了点只说话）；空白机首拉镜像的时长由机器与镜像站决定
+// cap: fixed — 申报的期望工期（过了点只说话）；空白机首拉镜像的时长由机器与镜像站决定
+// keep: 删掉后镜像服务那一段的「比预期慢」没有读数，慢与坏分不开；由申报工期这条约定兜住
 const IMAGE_SERVER_DECLARED: Duration = Duration::from_secs(600);
 
 /// 镜像分发 DaemonSet：逐节点导入整包镜像，时长随节点数与盘速变。
-// cap: bound — 申报的期望工期（过了点只说话）；逐节点导入的时长由节点数与盘速决定
+// cap: fixed — 申报的期望工期（过了点只说话）；逐节点导入的时长由节点数与盘速决定
+// keep: 删掉后逐节点导入那一段的「比预期慢」没有读数，慢与坏分不开；由申报工期这条约定兜住
 const IMAGE_DISTRIBUTOR_DECLARED: Duration = Duration::from_secs(900);
 
 /// 集群内 registry：播种基镜像前它自己要先起来，而它自己也可能在拉镜像。
-// cap: bound — 申报的期望工期（过了点只说话）；registry 自己的启动时长由镜像与盘速决定
+// cap: fixed — 申报的期望工期（过了点只说话）；registry 自己的启动时长由镜像与盘速决定
+// keep: 删掉后 registry 启动那一段的「比预期慢」没有读数，慢与坏分不开；由申报工期这条约定兜住
 const REGISTRY_DECLARED: Duration = Duration::from_secs(900);
 
 /// 装机完成前的就绪门禁：两个工作负载各自滚动完成。
-// cap: bound — 申报的期望工期（过了点只说话）；它只说「比预期慢」，不收尾
+// cap: fixed — 申报的期望工期（过了点只说话）；它只说「比预期慢」，不收尾
+// keep: 删掉后就绪那一段的「比预期慢」没有读数，慢与坏分不开；由申报工期这条约定兜住
 const READY_DECLARED: Duration = Duration::from_secs(180);
 
 /// 等一个 Deployment / DaemonSet 就绪，收尾只认**平台自己写的证据**。
@@ -5690,7 +5701,7 @@ mod ingress_preflight_tests {
     fn the_declared_ingress_class_is_read_from_the_object_not_the_filename() {
         let dir =
             std::env::temp_dir().join(format!("cogneva-ingress-class-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
         std::fs::create_dir_all(&dir).unwrap();
         // 名字像 ingress 但没有 Ingress 对象。
         std::fs::write(
@@ -5928,7 +5939,7 @@ mod key_value_literal_tests {
     #[test]
     fn a_key_value_literal_written_twice_is_reported() {
         let dir = std::env::temp_dir().join(format!("bootstrap-kv-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("a.rs"),
@@ -5942,7 +5953,7 @@ mod key_value_literal_tests {
         .unwrap();
         let mut found = BTreeMap::new();
         collect_key_value_literals(&dir, &mut found);
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
         assert_eq!(
             found.get("BatchMode=yes").map(|files| files.len()),
             Some(2),

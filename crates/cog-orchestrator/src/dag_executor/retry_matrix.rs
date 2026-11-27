@@ -45,6 +45,7 @@ impl BackoffStrategy {
 /// 这不是挑出来的数，是指数退避的定义本身——把它写成 `2.0` 只是把这个定义
 /// 抄进了每一处表项。
 // cap: fixed — 倍增：指数退避的定义，不是这台机器量的
+// not-a-bound: 倍增：指数退避的定义，不是这台机器量的
 pub const DOUBLING: f64 = 2.0;
 
 /// Circuit breaker configuration per task type.
@@ -61,9 +62,11 @@ pub struct CircuitBreakerConfig {
 // 未分类的任务（四个角色 Planner/Generator/Evaluator/Reviewer 与 `Custom`）
 // 没有专门的档，走这两个 `Default`。它们的失败多是上游抖动而不是活本身坏了，
 // 所以熔断比节点档宽：多两次失败才判死。
-// cap: bound — 连续五次失败才开熔断：角色失败多是上游抖动，三次判死会把它锁在 DLQ
+// cap: fixed — 连续五次失败才开熔断：角色失败多是上游抖动，三次判死会把它锁在 DLQ
+// keep: 删掉后三次判死把一个上游抖动的角色锁在 DLQ；由「连续五次才开熔断」兜住
 const UNCLASSIFIED_FAILURE_THRESHOLD: u32 = 5;
-// cap: bound — 半开放三次探测：一次分不清抖动与真坏，三次全失败才判死
+// cap: fixed — 半开放三次探测：一次分不清抖动与真坏，三次全失败才判死
+// keep: 删掉后一次探测分不清抖动与真坏；由「三次全失败才判死」兜住
 const UNCLASSIFIED_HALF_OPEN_CALLS: u32 = 3;
 // 三次重试，与节点档同一个次数；等待更长（1s 起步、30s 封顶）是因为不知道失败在哪。
 // 这个数只在一处定义：任务行上那一列的初值也是它（`cog_core::types::task::DEFAULT_MAX_RETRIES`），
@@ -124,53 +127,70 @@ impl Default for RetryMatrix {
 /// 形状换了，数还是数——名字给出来之后，每个数至少有一条判词和一个能拦住
 /// 「只能往下调」的簿记。
 // LLM 调用：一次调用里重试三次
-// cap: bound — 退避三档 1s/2s/4s；三次之后每一次都只是把同一个失败拖得更久
+// cap: fixed — 退避三档 1s/2s/4s；三次之后每一次都只是把同一个失败拖得更久
+// keep: 删掉后重试无界，同一个失败被拖得越来越久；由「三次之后每一次都只是拖」兜住
 const LLM_CALL_RETRIES: u32 = 3;
-// cap: bound — 连续五次失败才开熔断：三次重试各自失败都算在内，第五次才说明这条路真不通
+// cap: fixed — 连续五次失败才开熔断：三次重试各自失败都算在内，第五次才说明这条路真不通
+// keep: 删掉后三次重试都失败还不开熔断，这条路真不通时每轮都去撞；由「第五次才说明真不通」兜住
 const LLM_CALL_FAILURE_THRESHOLD: u32 = 5;
-// cap: bound — 半开时放三次探测：一次分不清抖动与真坏，三次仍全失败才判死
+// cap: fixed — 半开时放三次探测：一次分不清抖动与真坏，三次仍全失败才判死
+// keep: 删掉后半开只放一次，抖动与真坏分不开；由「三次仍全失败才判死」兜住
 const LLM_CALL_HALF_OPEN_CALLS: u32 = 3;
 
 // 工具调用：外部服务抖动，等一等再试
-// cap: bound — 工具失败多是抖动：两次重试足够越过一次瞬时故障
+// cap: fixed — 工具失败多是抖动：两次重试足够越过一次瞬时故障
+// keep: 删掉后一次瞬时故障就让工具失败；由「两次重试越过一次瞬时故障」兜住
 const TOOL_CALL_RETRIES: u32 = 2;
-// cap: bound — 连续三次失败开熔断：比 LLM 调用更早停，因为工具重试本身是等待而不是推理
+// cap: fixed — 连续三次失败开熔断：比 LLM 调用更早停，因为工具重试本身是等待而不是推理
+// keep: 删掉后工具的路真断时还每轮去等，把等待当成推理；由「比 LLM 更早停」兜住
 const TOOL_CALL_FAILURE_THRESHOLD: u32 = 3;
-// cap: bound — 半开放两次探测
+// cap: fixed — 半开放两次探测
+// keep: 删掉后半开只放一次，抖动与真坏分不开；由「半开放两次探测」兜住
 const TOOL_CALL_HALF_OPEN_CALLS: u32 = 2;
 
 // 文件操作：立刻重试一次
-// cap: bound — 本地文件失败再等也不会变，只给一次不留等待的重试
+// cap: fixed — 本地文件失败再等也不会变，只给一次不留等待的重试
+// keep: 删掉后本地文件失败连一次重试都没有；由「再等也不会变」兜住
 const FILE_OP_RETRIES: u32 = 1;
 
 // 数据库事务：线性退避
-// cap: bound — 连接池争用是秒级的事：三次、每次加一百毫秒，等太久只是让锁持有更久
+// cap: fixed — 连接池争用是秒级的事：三次、每次加一百毫秒，等太久只是让锁持有更久
+// keep: 删掉后锁争用被无限重试，锁持有被拖得更久；由「三次、每次加一百毫秒」兜住
 const DB_RETRIES: u32 = 3;
-// cap: bound — 十次才开熔断：事务失败要区分「这次撞上锁」与「这条 SQL 坏了」，前者会自己好
+// cap: fixed — 十次才开熔断：事务失败要区分「这次撞上锁」与「这条 SQL 坏了」，前者会自己好
+// keep: 删掉后撞锁与 SQL 坏了分不开，前者被当成后者进熔断；由「十次才开熔断」兜住
 const DB_FAILURE_THRESHOLD: u32 = 10;
-// cap: bound — 半开放三次探测
+// cap: fixed — 半开放三次探测
+// keep: 删掉后半开只放一次，抖动与真坏分不开；由「半开放三次探测」兜住
 const DB_HALF_OPEN_CALLS: u32 = 3;
 
 // 网络请求：对端过载时第一次重试就该更慢
-// cap: bound — 三次：0.5s/1s/2s，超过两秒仍被拒就不是过载而是不可达
+// cap: fixed — 三次：0.5s/1s/2s，超过两秒仍被拒就不是过载而是不可达
+// keep: 删掉后不可达被当成过载无限重试；由「超过两秒仍被拒就是不可达」兜住
 const NETWORK_RETRIES: u32 = 3;
-// cap: bound — 连续五次失败开熔断
+// cap: fixed — 连续五次失败开熔断
+// keep: 删掉后网络真不可达时无限撞；由「连续五次失败开熔断」兜住
 const NETWORK_FAILURE_THRESHOLD: u32 = 5;
-// cap: bound — 半开放三次探测
+// cap: fixed — 半开放三次探测
+// keep: 删掉后网络真坏时分不清抖动与真坏，半开探测永远放出错的请求；由「三次仍全失败才判死」兜住
 const NETWORK_HALF_OPEN_CALLS: u32 = 3;
 
 // WASM 技能：沙箱内的失败多是初始化竞态
-// cap: bound — 两次：竞态在一次重试之内就过去，第三次开始只是在等一个坏掉的初始化
+// cap: fixed — 两次：竞态在一次重试之内就过去，第三次开始只是在等一个坏掉的初始化
+// keep: 删掉后竞态过去之后还在等一个坏掉的初始化；由「竞态在一次重试之内过去」兜住
 const WASM_SKILL_RETRIES: u32 = 2;
 
 // 技能：立刻重试一次
-// cap: bound — 一次不留等待的重试：技能本身失败再等也不会变
+// cap: fixed — 一次不留等待的重试：技能本身失败再等也不会变
+// keep: 删掉后技能本身失败被无限重试；由「再等也不会变」兜住
 const SKILL_RETRIES: u32 = 1;
 
 // DAG 节点：同一节点连败到熔断阈值即进 DLQ
-// cap: bound — 连续三次失败即进 DLQ
+// cap: fixed — 连续三次失败即进 DLQ
+// keep: 删掉后节点一直坏却一直调度；由「连续三次失败即进 DLQ」兜住
 const DAG_NODE_FAILURE_THRESHOLD: u32 = 3;
-// cap: bound — 半开只放一次探测：节点一坏往往就是一直坏，多放几次只是多花几次额度
+// cap: fixed — 半开只放一次探测：节点一坏往往就是一直坏，多放几次只是多花几次额度
+// keep: 删掉后多放几次只是多花几次额度；由「节点一坏往往一直坏」兜住
 const DAG_NODE_HALF_OPEN_CALLS: u32 = 1;
 
 impl RetryMatrix {

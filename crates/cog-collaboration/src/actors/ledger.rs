@@ -123,7 +123,7 @@ pub async fn run(events: Option<std::sync::Arc<dyn cog_core::RoundEvents>>) -> i
         Some("stop-gate") => stop_gate(),
         Some("compiled") => compiled(),
         Some(other) => {
-            eprintln!("ledger: 不认识的动作 `{other}`（今天有 `status`、`next`、`open`、`close`、`gate`、`editing`、`stop-gate` 与 `compiled`）");
+            eprintln!("ledger: 不认识的动作 `{other}`（今天有 `status`、`next`、`open [--batch S19,S20]`、`close`、`gate`、`editing`、`stop-gate` 与 `compiled`）");
             2
         }
     }
@@ -173,7 +173,7 @@ pub enum GateOutcome {
 pub fn compiled() -> i32 {
     let mut root = std::env::current_dir()
         .map(|d| d.display().to_string())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let mut base = std::env::var("COGNEVA_PUSH_BASE").unwrap_or_else(|_| "origin/main".to_string());
     let mut ledger = std::path::PathBuf::from(
         std::env::var(COMPILE_LEDGER_ENV)
@@ -361,7 +361,7 @@ pub fn stop_gate() -> i32 {
     let ledger_dir = path
         .parent()
         .map(|p| p.display().to_string())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let (repo, ok) = git(&ledger_dir, &["rev-parse", "--show-toplevel"]);
     if !ok || repo.is_empty() {
         eprintln!("ledger: 台账不在一个 git 仓里（{ledger_dir}）");
@@ -421,7 +421,7 @@ fn editing_verdict() -> GateOutcome {
     let ledger_dir = path
         .parent()
         .map(|p| p.display().to_string())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let (repo, ok) = git(&ledger_dir, &["rev-parse", "--show-toplevel"]);
     if !ok || repo.is_empty() {
         return GateOutcome::Unreadable(format!("台账不在一个 git 仓里（{ledger_dir}）"));
@@ -451,7 +451,7 @@ fn editing_verdict() -> GateOutcome {
     let touches = touches_by_id(&text);
     let tree = std::env::current_dir()
         .map(|d| d.display().to_string())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let touched: Vec<String> = match git(&tree, &["diff", "--name-only", &code_rev]) {
         (out, true) => out
             .lines()
@@ -505,7 +505,7 @@ pub fn judge_editing(
         if !paths.iter().any(|p| hit(p)) {
             missing.push(format!(
                 "TODO {id}（触点 {} 一处都没动）",
-                paths.iter().take(3).cloned().collect::<Vec<_>>().join("、")
+                paths.iter().cloned().collect::<Vec<_>>().join("、")
             ));
         }
     }
@@ -525,7 +525,7 @@ fn gate_verdict() -> GateOutcome {
     let ledger_dir = path
         .parent()
         .map(|p| p.display().to_string())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let (repo, ok) = git(&ledger_dir, &["rev-parse", "--show-toplevel"]);
     if !ok || repo.is_empty() {
         return GateOutcome::Unreadable(format!("台账不在一个 git 仓里（{ledger_dir}）"));
@@ -549,7 +549,7 @@ fn gate_verdict() -> GateOutcome {
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     if batch.is_empty() {
         return GateOutcome::Refuse("这一轮的批次是空的：没有一条待办说过要做什么".into());
     }
@@ -576,7 +576,7 @@ fn gate_verdict() -> GateOutcome {
 
     let tree = std::env::current_dir()
         .map(|d| d.display().to_string())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let mut touched: Vec<String> = match git(&tree, &["diff", "--name-only", &code_rev]) {
         (out, true) => out
             .lines()
@@ -737,15 +737,13 @@ fn judge_split(
 ) -> Result<(), String> {
     match split.kind {
         '3' => {
-            let batch_irr: Vec<&String> =
-                touched.iter().filter(|p| irreversible(p)).take(3).collect();
+            let batch_irr: Vec<&String> = touched.iter().filter(|p| irreversible(p)).collect();
             let excl_irr: Vec<&String> = split
                 .declared
                 .iter()
                 .filter_map(|id| item_touches.get(id))
                 .flatten()
                 .filter(|p| irreversible(p))
-                .take(3)
                 .collect();
             if !batch_irr.is_empty() && !excl_irr.is_empty() {
                 return Err(format!(
@@ -900,6 +898,49 @@ mod tests {
         assert_eq!(cells[3], "N01,N02");
     }
 
+    /// 没有声明台账时，读的是「没有一个地址」，不是某一份共享清单。
+    ///
+    /// 平台侧的变更账在库里（`change_ledger`），这里解析的是**这一台机器**上某个人
+    /// 那一本。两者一旦互相回落，一边没写就会被另一边读成「没有待办」——那正是一次
+    /// 静默的空转：活还在，只是没人看得见。两个方向都钉：没有声明 ⇒ 报错；声明的是
+    /// 空行 ⇒ 也报错（空文件不等于零条待办）。
+    #[test]
+    fn an_undeclared_ledger_is_an_error_not_somebody_elses_list() {
+        assert!(
+            resolve_ledger_path(None, None, None).is_err(),
+            "没有声明台账却解析出了一个地址：读到的会是别人的清单"
+        );
+        let dir = std::env::temp_dir().join(format!("ledger-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let declared = dir.join("todo-ledger");
+        std::fs::write(&declared, "\n").unwrap();
+        assert!(
+            resolve_ledger_path(None, None, Some(declared.as_path())).is_err(),
+            "声明文件是空的却被读成了一个地址：这一台机器没有台账，不该读成「都做完了」"
+        );
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
+    }
+
+    /// 带内开轮与 CLI 开轮读的是同一段判读：批是全部未完成那些，差距随行走。
+    #[test]
+    fn a_round_opened_from_inside_reads_the_same_batch_the_cli_does() {
+        let text = "\
+| 序号 | 终态 | 现在 | 差距 | 状态 |
+|---|---|---|---|---|
+| A1 | 到终态 | 没到 | 缺的是：接线 | 未落 |
+| A2 | 到终态 | 到了 | — | 已落 |
+| A3 | 到终态 | 没到 | 缺的是：用例 | 未落 |
+";
+        let (batch, gaps) = batch_and_gaps(text, None).expect("这本台账读得懂");
+        assert_eq!(batch, vec!["A1".to_string(), "A3".to_string()]);
+        assert_eq!(
+            gaps.get("A1").and_then(|v| v.as_str()),
+            Some("缺的是：接线"),
+            "这一轮钉下的书要带着每条还差什么，接着做的人读轮就知道"
+        );
+        assert!(!gaps.contains_key("A2"), "到了终态的那条不进批");
+    }
+
     /// 读数只数这一批里真的到了终态的那几条：钉进去 3 条、到位 1 条的轮记 1，不记 3。
     /// 记 3 的话，下一个 `Split: 4` 的界就被抬到 3，而那一轮并没有读到 3 条。
     #[test]
@@ -989,7 +1030,7 @@ mod tests {
     #[test]
     fn re_pinning_recomputes_the_batch_but_not_the_range() {
         let dir = std::env::temp_dir().join(format!("ledger-repin-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
         std::fs::create_dir_all(&dir).unwrap();
         let d = dir.display().to_string();
         git(&d, &["init", "-q"]);
@@ -1009,7 +1050,7 @@ mod tests {
         assert_eq!(again["first_rev"], "rev-A");
         assert_eq!(again["ledger_rev"], "rev-B", "批次没有按新台账重算");
         assert_eq!(again["batch"].as_array().map(|a| a.len()), Some(2));
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// 事件流那本书：批次原样带着，`ledger_rev` 是空串（这本台账没有版本坐标）。
@@ -1302,7 +1343,7 @@ pub fn next() -> i32 {
     };
     let tree = std::env::current_dir()
         .map(|p| p.display().to_string())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let (status, ok) = git(&tree, &["status", "--porcelain"]);
     if !ok {
         eprintln!("ledger: 工作树读不到（{tree}）");
@@ -1320,11 +1361,90 @@ pub fn next() -> i32 {
 /// 书：这一轮钉在哪一版台账上。载荷是 JSON，住在台账那个仓的 `refs/cogneva/round`。
 pub const ROUND_REF: &str = "refs/cogneva/round";
 
+/// 带内的开轮：进化循环与人对平台做的事走同一段代码、同一本书。
+///
+/// 与 `cogneva ledger open` 的差别只有一处：它不打印、不读命令行，把成败交回调用方。
+/// 循环在开跑之前调它，于是「先开一条轮」不再是带外那一步——带内没有短路可走。
+/// 台账不在 git 仓里时它明确报错（那一轮钉不到任何一版上），由调用方决定是停还是留日志。
+pub fn pin_round() -> Result<Vec<String>, String> {
+    pin_round_selected(None)
+}
+
+/// 同 [`pin_round`]，但这一批可以由定批的那一侧**显式点名**：默认仍是台账上全部
+/// 未完成的，点名只筛不改顺序；点了一个台账上没有的标记是错误，不是更小的批。
+pub fn pin_round_selected(asked: Option<&[String]>) -> Result<Vec<String>, String> {
+    let path = ledger_path()?;
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("台账读不到：{}（{e}）", path.display()))?;
+    let (batch, gaps) = batch_and_gaps(&text, asked)?;
+    if batch.is_empty() {
+        return Ok(batch);
+    }
+    let ledger_dir = path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or(Default::default());
+    let (repo, ok) = git(&ledger_dir, &["rev-parse", "--show-toplevel"]);
+    if !ok || repo.is_empty() {
+        return Err(format!(
+            "台账不在一个 git 仓里（{ledger_dir}）：这一轮钉不到任何一版上"
+        ));
+    }
+    let (ledger_rev, ok) = git(&repo, &["rev-parse", "HEAD"]);
+    if !ok {
+        return Err(format!("台账仓读不到 HEAD（{repo}）"));
+    }
+    let (code_rev, _) = git(
+        &std::env::current_dir()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default(),
+        &["rev-parse", "HEAD"],
+    );
+    record_git_book(&repo, &batch, &gaps, &ledger_rev, &code_rev)?;
+    Ok(batch)
+}
+
+/// 台账文本 →（这一轮的批，每条的差距）。批是**全部未完成**那些，与 CLI 同一段判读。
+fn batch_and_gaps(
+    text: &str,
+    asked: Option<&[String]>,
+) -> Result<(Vec<String>, serde_json::Map<String, serde_json::Value>), String> {
+    let items = cog_core::contract::ledger_item::parse_md(text)?;
+    let selected = cog_core::contract::ledger_item::select_batch(&items, asked)?;
+    let batch: Vec<String> = selected.iter().map(|i| i.id.clone()).collect();
+    let gaps: serde_json::Map<String, serde_json::Value> = selected
+        .iter()
+        .map(|i| (i.id.clone(), serde_json::Value::String(i.gap.clone())))
+        .collect();
+    Ok((batch, gaps))
+}
+
 /// `cogneva ledger open`：把这一批钉进书里。
 ///
 /// 一批是什么由台账现算（未完成、且没写 `touches: unknown` 的那些），三格里的「差距」
 /// 随行走——接着做的人打开轮就读得到每条还差什么，不必把整本台账重判一遍。
 /// 重钉继承 `first_rev`：那一格是「自开工以来」的基准，不能因为重钉被清零。
+/// 这一轮要做的那些条目由谁点名：`--batch S19,S20`。没给时是台账上全部未完成的。
+fn asked_batch() -> Result<Option<Vec<String>>, String> {
+    let args: Vec<String> = std::env::args().skip(3).collect();
+    let Some(at) = args.iter().position(|arg| arg == "--batch") else {
+        return Ok(None);
+    };
+    let value = args
+        .get(at + 1)
+        .ok_or("--batch 后面没有跟标记（形如 S19,S20）")?;
+    let ids: Vec<String> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect();
+    if ids.is_empty() {
+        return Err("--batch 一条都没点：至少给一个标记，或者不要传这一项".into());
+    }
+    Ok(Some(ids))
+}
+
 pub async fn open(events: Option<&std::sync::Arc<dyn cog_core::RoundEvents>>) -> i32 {
     let path = match ledger_path() {
         Ok(p) => p,
@@ -1350,10 +1470,30 @@ pub async fn open(events: Option<&std::sync::Arc<dyn cog_core::RoundEvents>>) ->
     let ledger_dir = path
         .parent()
         .map(|p| p.display().to_string())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let (repo, ok) = git(&ledger_dir, &["rev-parse", "--show-toplevel"]);
-    let batch: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
-    let gaps: serde_json::Map<String, serde_json::Value> = items
+    // 显式批次：`--batch S19,S20`。默认仍是「全部未完成」；点错一个标记就开不出轮，
+    // 不静默丢掉它——那一轮会带着一个缺条目的批走完全部验证。
+    let asked = match asked_batch() {
+        Ok(asked) => asked,
+        Err(e) => {
+            eprintln!("ledger: {e}");
+            return 2;
+        }
+    };
+    let selected = match cog_core::contract::ledger_item::select_batch(&items, asked.as_deref()) {
+        Ok(selected) => selected,
+        Err(e) => {
+            eprintln!("ledger: {e}");
+            return 2;
+        }
+    };
+    if selected.is_empty() {
+        println!("ledger: 台账里没有未完成的待办。");
+        return 0;
+    }
+    let batch: Vec<String> = selected.iter().map(|i| i.id.clone()).collect();
+    let gaps: serde_json::Map<String, serde_json::Value> = selected
         .iter()
         .map(|i| (i.id.clone(), serde_json::Value::String(i.gap.clone())))
         .collect();
@@ -1516,7 +1656,7 @@ pub async fn close(events: Option<&std::sync::Arc<dyn cog_core::RoundEvents>>) -
     let ledger_dir = path
         .parent()
         .map(|p| p.display().to_string())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let (repo, ok) = git(&ledger_dir, &["rev-parse", "--show-toplevel"]);
     if !ok || repo.is_empty() {
         // 事件流那本书：关轮就是把当前开着的那一轮记成 closed。
@@ -1596,7 +1736,7 @@ pub async fn close(events: Option<&std::sync::Arc<dyn cog_core::RoundEvents>>) -
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let first_rev = payload
         .get("first_rev")
         .and_then(|v| v.as_str())
@@ -1628,7 +1768,7 @@ pub async fn close(events: Option<&std::sync::Arc<dyn cog_core::RoundEvents>>) -
             .unwrap_or_else(|_| format!("{}/.local/state/cogneva/rounds-closed.tsv", home())),
     );
     if let Some(dir) = ledger_path_file.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        cog_core::ignore_lost!(std::fs::create_dir_all(dir));
     }
     use std::io::Write;
     match std::fs::OpenOptions::new()
@@ -1637,7 +1777,7 @@ pub async fn close(events: Option<&std::sync::Arc<dyn cog_core::RoundEvents>>) -
         .open(&ledger_path_file)
     {
         Ok(mut f) => {
-            let _ = writeln!(f, "{line}");
+            cog_core::ignore_lost!(writeln!(f, "{line}"));
         }
         Err(e) => eprintln!(
             "ledger: 读数没写进去：{}（{e}）——这一轮关了，但那条界没有新增样本",

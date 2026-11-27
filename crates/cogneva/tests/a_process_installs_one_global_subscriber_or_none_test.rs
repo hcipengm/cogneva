@@ -228,7 +228,7 @@ fn the_detector_knows_an_install_from_a_filter() {
 
     let idempotent = r#"
         fn try_install() {
-            let _ = tracing_subscriber::registry().try_init();
+            cog_core::ignore_lost!(tracing_subscriber::registry().try_init());
         }
     "#;
     assert!(

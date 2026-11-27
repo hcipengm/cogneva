@@ -16,35 +16,13 @@ use async_trait::async_trait;
 use chrono::Utc;
 use sqlx::{PgPool, Row};
 
-use cog_core::{
-    check as check_envelope, EnvelopeFields, RoundEvents, RoundOpened, SFError, SFResult,
-};
+use cog_core::{EventPayload, EventStore, FactEvent, RoundEvents, RoundOpened, SFError, SFResult};
 
-/// 事件流的写入器，只认「一轮开工」这一种事实。
+/// 事件流的写入器，只认「一轮」这一种事实。落库走那条流唯一的写口。
 pub struct RoundEventStore {
     pool: PgPool,
-    writer: String,
+    store: std::sync::Arc<dyn EventStore>,
 }
-
-/// kind 与 subject_kind 写死在这一句里（这一族只写一种），其余列从载荷来。
-const INSERT_SQL: &str = "\
-INSERT INTO cogneva_event (\
-    event_id, kind, subject_kind, subject_id, unit_of_work, step, outcome, attempt, \
-    idempotency_key, causation_id, batch_id, actor, writer, scope, payload_version, \
-    attributes, at) \
-VALUES ($1, 'round_opened', 'round', $2, $2, 'open', 'ok', 1, $3, NULL, NULL, $4, $5, \
-        'round', 1, $6, $7) \
-ON CONFLICT (writer, idempotency_key) DO NOTHING";
-
-/// 关一轮。幂等键是「这一轮的身份＋closed」，与开工那条不是同一个键。
-const CLOSE_SQL: &str = "\
-INSERT INTO cogneva_event (\
-    event_id, kind, subject_kind, subject_id, unit_of_work, step, outcome, attempt, \
-    idempotency_key, causation_id, batch_id, actor, writer, scope, payload_version, \
-    attributes, at) \
-VALUES ($1, 'round_closed', 'round', $2, $2, 'close', 'ok', 1, $3, NULL, NULL, $4, $5, \
-        'round', 1, '{}', NOW()) \
-ON CONFLICT (writer, idempotency_key) DO NOTHING";
 
 /// 当前开着的那一轮：最后一条没有配对 `round_closed` 的开工事件。
 const CURRENT_SQL: &str = "\
@@ -58,72 +36,58 @@ SELECT subject_id, ledger_rev, code_rev, round_batch AS batch, actor \
 
 impl RoundEventStore {
     pub fn new(pool: PgPool, writer: impl Into<String>) -> Self {
-        Self {
-            pool,
-            writer: writer.into(),
-        }
+        let store: std::sync::Arc<dyn EventStore> = std::sync::Arc::new(
+            crate::postgres::event_log::EventLogStore::new(pool.clone(), writer),
+        );
+        Self { pool, store }
     }
 }
 
 #[async_trait]
 impl RoundEvents for RoundEventStore {
     fn writer(&self) -> &str {
-        &self.writer
+        self.store.writer()
     }
 
     async fn open(&self, round: &RoundOpened) -> SFResult<()> {
-        let event_id = event_id_for(&round.round);
-        let attributes = round.attributes().to_string();
-        check_envelope(&EnvelopeFields {
-            event_id: event_id.clone(),
-            kind: "round_opened".into(),
-            subject_kind: "round".into(),
-            subject_id: round.round.clone(),
-            unit_of_work: round.round.clone(),
-            step: "open".into(),
-            outcome: "ok".into(),
-            idempotency_key: round.idempotency_key(),
-            actor: round.actor.clone(),
-            writer: self.writer.clone(),
-            scope: "round".into(),
-            attributes: attributes.clone(),
-        })
-        .map_err(|defect| {
-            SFError::Database(format!(
-                "round_opened refused before it was written: {}",
-                defect.as_str()
-            ))
-        })?;
-        sqlx::query(INSERT_SQL)
-            .bind(&event_id)
-            .bind(&round.round)
-            .bind(round.idempotency_key())
-            .bind(&round.actor)
-            .bind(&self.writer)
-            .bind(attributes)
-            .bind(if round.at.timestamp() == 0 {
-                Utc::now()
-            } else {
-                round.at
-            })
-            .execute(&self.pool)
+        // 这一族的 id 由轮次身份派生：重放同一轮拿到同一个主键。
+        let mut event = FactEvent::new(EventPayload::RoundOpened(round.clone()));
+        event.event_id = Some(event_id_for(&round.round));
+        event.at = Some(if round.at.timestamp() == 0 {
+            Utc::now()
+        } else {
+            round.at
+        });
+        self.store
+            .append(event)
             .await
-            .map_err(|e| SFError::Database(format!("append round_opened: {e}")))?;
-        Ok(())
+            .map_err(|e| SFError::Database(format!("round_opened: {e}")))
     }
 
     async fn close(&self, round: &str, actor: &str) -> SFResult<()> {
-        let event_id = event_id_for(&format!("{round}-closed"));
-        sqlx::query(CLOSE_SQL)
-            .bind(&event_id)
-            .bind(round)
-            .bind(format!("{round}:closed"))
-            .bind(actor)
-            .bind(&self.writer)
-            .execute(&self.pool)
+        // 这一轮开了多久：从开工那条事件的 `at` 算。读不到就写 `None`
+        // ——「不知道开了多久」与「开了 0 毫秒」是两句话。
+        let opened_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT at FROM cogneva_event \
+              WHERE kind = 'round_opened' AND subject_id = $1 \
+              ORDER BY at ASC, event_id ASC LIMIT 1",
+        )
+        .bind(round)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(format!("read the open round's start: {e}")))?;
+        let elapsed_ms = opened_at.map(|at| (Utc::now() - at).num_milliseconds().max(0) as u64);
+        let mut event = FactEvent::new(EventPayload::RoundClosed {
+            round: round.to_string(),
+            actor: actor.to_string(),
+            status: "closed".to_string(),
+            elapsed_ms,
+        });
+        event.event_id = Some(event_id_for(&format!("{round}-closed")));
+        self.store
+            .append(event)
             .await
-            .map_err(|e| SFError::Database(format!("append round_closed: {e}")))?;
-        Ok(())
+            .map_err(|e| SFError::Database(format!("round_closed: {e}")))
     }
 
     async fn current(&self) -> SFResult<Option<RoundOpened>> {
@@ -132,30 +96,31 @@ impl RoundEvents for RoundEventStore {
             .await
             .map_err(|e| SFError::Database(format!("read the open round: {e}")))?;
         let Some(row) = row else { return Ok(None) };
-        let batch: Vec<String> = match row.try_get::<Option<serde_json::Value>, _>("batch") {
-            Ok(Some(serde_json::Value::Array(items))) => items
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect(),
-            // 2026-11-22 之前带外那一版把清单写成**一段含数组的字符串**，
-            // 这一侧读到的是 `String`。那一段字节是真实发生过的开工记录，丢掉它等于
-            // 把 33 轮判成「没有清单」——所以读得懂的旧形状就地读出来，写在注释里。
-            Ok(Some(serde_json::Value::String(text))) => {
-                match serde_json::from_str::<Vec<String>>(&text) {
-                    Ok(items) => items,
-                    Err(_) => {
+        // 这一列是 `TEXT` 的生成列（迁移 128）：载荷里的 `batch` 按文本取出来，
+        // 这里再按数组解析。老行里还可能有**双重编码**的形状（一段含数组的字符串），
+        // 再解一层就读得回来——那段字节是真实发生过的开工记录，丢掉它等于把那些轮
+        // 判成「没有清单」。
+        let batch: Vec<String> = match row.try_get::<Option<String>, _>("batch") {
+            Ok(Some(text)) => match serde_json::from_str::<Vec<String>>(&text) {
+                Ok(items) => items,
+                Err(_) => match serde_json::from_str::<String>(&text)
+                    .ok()
+                    .and_then(|inner| serde_json::from_str::<Vec<String>>(&inner).ok())
+                {
+                    Some(items) => items,
+                    None => {
                         return Err(SFError::Database(
-                            "round_opened carries a `batch` string that is not a JSON array \
+                            "round_opened carries a `batch` value that is not a JSON array \
                              of ids: a round whose batch reads as empty is indistinguishable \
                              from one that is finished"
                                 .into(),
                         ))
                     }
-                }
-            }
-            // 老行没有这一格、或者它不是数组：读成空清单会让「这一轮要做几条」答 0，
-            // 而 0 条正是「做完了」的读数。所以这里报错，不答 0。
-            Ok(_) => {
+                },
+            },
+            // 老行没有这一格：读成空清单会让「这一轮要做几条」答 0，而 0 条正是
+            // 「做完了」的读数。所以这里报错，不答 0。
+            Ok(None) => {
                 return Err(SFError::Database(
                     "round_opened is missing its `batch` array: a round whose batch reads as \
                      empty is indistinguishable from one that is finished"

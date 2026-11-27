@@ -196,12 +196,14 @@ fn refused_view(row: cog_core::PrincipleRow) -> RefusedPrinciple {
 /// taken before the truncation, so this bounds the list without making either
 /// total a page count.
 // cap: fixed — 一屏就是 A2A 的 `page_size` 默认值：本仓列表面共用同一个页长，各写一个 50 只会让「一屏」慢慢走散
+// keep: 删掉后回到「一屏就是 A2A 的 `page_size` 默认值：本仓列表面共用同一个页长，各写一个 50 只会让「一屏」慢慢走散」所描述的情形；由这条约定兜住
 const REFUSED_PAGE: usize = cog_core::config::A2A_LIST_PAGE_SIZE as usize;
 /// How many refused rows are read to compute the totals. The selection is
 /// `refusals > 0`, so this is a bound on how many principles have ever been
 /// refused by a single deployment; reading the whole set is what lets the two
 /// totals describe the set rather than the page.
-// cap: bound — 算拒绝总数最多读多少行；读到这里就按已读部分外推，不把整表读进内存
+// cap: fixed — 算拒绝总数最多读多少行；读到这里就按已读部分外推，不把整表读进内存
+// keep: 删掉后算拒绝总数把整表读进内存；由「读到这里就按已读部分外推」兜住
 const REFUSED_READ_CAP: usize = 10_000;
 
 fn principles(state: &GatewayState) -> Result<&Arc<dyn cog_core::PrincipleLedgerStore>, ApiError> {
@@ -462,7 +464,8 @@ async fn page_costs(
 /// How many outstanding rows the route returns. The account can hold thousands;
 /// this bounds the body without bounding `outstanding_total`, which is taken
 /// from the census.
-// cap: bound — 一页未结事项的条数，与拒绝页同量级，界的是单次响应体积
+// cap: fixed — 一页未结事项的条数，与拒绝页同量级，界的是单次响应体积
+// keep: 删掉后一页未结事项无界，单次响应被撑爆；由「界的是单次响应体积」兜住
 const OUTSTANDING_PAGE: usize = 100;
 
 fn changes(state: &GatewayState) -> Result<&Arc<dyn cog_core::ChangeLedgerStore>, ApiError> {
@@ -572,6 +575,8 @@ pub struct ChangeFunnelQuery {
 
 /// A fortnight: long enough to see a week's shape twice, short enough that the
 /// query stays inside the event table's hot window.
+// cap: fixed — 治理漏斗按「一个考核周期」看：默认一周，与周报同一档，不是一条按量伸缩的界
+// keep: 删掉后治理漏斗没有默认周期，读者不知道看的是哪一段；由「默认一周、与周报同一档」兜住
 fn default_funnel_days() -> u32 {
     // 两周：够看见一次完整的周节律，又还在事件表的热窗口里。
     (2 * cog_core::day::DAYS_PER_WEEK) as u32
@@ -942,8 +947,10 @@ pub async fn change_cost(
 /// steps come newest first, so the bound drops the oldest ones -- the account
 /// can be years deep and the question is "how did this get here".
 // cap: fixed — 与拒绝列表同一屏：列表面共用一个页长，见 `A2A_LIST_PAGE_SIZE`
+// keep: 删掉后回到「与拒绝列表同一屏：列表面共用一个页长，见 `A2A_LIST_PAGE_SIZE`」所描述的情形；由这条约定兜住
 const TIMELINE_PAGE: usize = cog_core::config::A2A_LIST_PAGE_SIZE as usize;
-// cap: bound — widest history a caller may ask for in one read
+// cap: fixed — widest history a caller may ask for in one read
+// keep: 删掉后一次读可以要无限久的历史，响应体积跟着调用方走；由「一次读最宽能问多少历史」兜住
 const TIMELINE_MAX: usize = 200;
 
 /// The identity a timeline request names, or the reason it names none.

@@ -396,7 +396,8 @@ const SERVED_FILE: &str = "builds.served";
 /// distinct names that exist -- the ten asker cells plus the host's gate step
 /// labels -- because the cost of a missing line is one more stand-down, and
 /// the cost of a large file is a scan on every takeover question.
-// cap: bound — 远超实际不同名字数的上界：丢一行只多让一轮，文件大了是每次仲裁都扫一遍
+// cap: fixed — 远超实际不同名字数的上界：丢一行只多让一轮，文件大了是每次仲裁都扫一遍
+// not-a-bound: 远超实际不同名字数的上界：丢一行只多让一轮，文件大了是每次仲裁都扫一遍
 const SERVED_RECORD_CAP: usize = 64;
 
 /// How many cargo jobs one build gets, from the same measurement the gate uses
@@ -504,7 +505,8 @@ impl WalkOutcome {
 
 /// How often a waiter looks again. Builds run for minutes, so this only decides
 /// how promptly a freed slot is picked up.
-// cap: bound — 构建以分钟计，它只决定一个空出来的槽多快被捡走
+// cap: fixed — 构建以分钟计，它只决定一个空出来的槽多快被捡走
+// keep: 删掉后等待槽位的循环会空转，槽位空出来也没人按时捡；由「构建以分钟计，只决定多快被捡走」兜住
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// The registry key this gate's wait budget is declared under, and the name its
@@ -530,7 +532,8 @@ fn wait_floor() -> Duration {
 /// whether builds interfere with the cluster. Two turns is enough for the waiter
 /// to come round and take what it asked for, and short enough that a waiter that
 /// cannot take it does not hold the field off builds it never runs.
-// cap: bound — 拿不走的人不能一直占着这一手，让该轮到的人来拿
+// cap: fixed — 拿不走的人不能一直占着这一手，让该轮到的人来拿
+// keep: 删掉后拿不走的一方一直占着这一手，轮到的人也拿不到；由「让该轮到的人来拿」兜住
 const WALK_YIELD_LIMIT: u32 = 2;
 
 /// How long a work's stand-down for another work's claim on the next build is
@@ -541,14 +544,16 @@ const WALK_YIELD_LIMIT: u32 = 2;
 /// scoped to one call: it is the work that keeps losing, not the call. An hour
 /// is longer than any of those rounds and shorter than a work that has stopped
 /// asking has any claim to a turn it no longer wants.
-// cap: bound — 比那些回合都长，又短于一个已经不再提问的工作还有资格要的那一手
+// cap: fixed — 比那些回合都长，又短于一个已经不再提问的工作还有资格要的那一手
+// keep: 删掉后一个已经不再提问的工作永远占着它那一手，活的那一方等不到回合；由「短于一个不再提问的工作还有资格要的那一手」兜住
 const TURN_STAND_DOWN_SECS: u64 = 3600;
 
 /// 等构建场空出来再做进程切换的上限：1 小时。
 ///
 /// 构建最长可跑一小时，所以等不到就让这一版留在暂存处——在别人的构建上切一刀
 /// 的代价是一个半完成的部署；而无限期等待会让调用它的管理端永远挂着。
-// cap: bound — 构建最长一小时；等不到就让这一版留在暂存处，在别人的构建上切一刀是一个半完成的部署
+// cap: fixed — 构建最长一小时；等不到就让这一版留在暂存处，在别人的构建上切一刀是一个半完成的部署
+// keep: 删掉后在别人的构建上进行切换，切出一次半完成的部署；由「等不到就留在暂存处」兜住
 pub(crate) const SWITCH_FIELD_WAIT: Duration = Duration::from_secs(3600);
 
 static GLOBAL: OnceLock<Arc<BuildGate>> = OnceLock::new();
@@ -1344,7 +1349,8 @@ const HOST_DISK_FREE_BYTES: &str = "cogneva_host_disk_free_bytes";
 /// A fraction of one build rather than a count of windows: what is being damped
 /// is the reading's own noise across the integer it floors to, not a trend, and
 /// the noise is measured in the same unit the answer is.
-// cap: bound — 死区宽度就是读数在它取整的那个整数上的自身噪声，不是趋势
+// cap: fixed — 死区宽度就是读数在它取整的那个整数上的自身噪声，不是趋势
+// not-a-bound: 死区宽度就是读数在它取整的那个整数上的自身噪声，不是趋势
 const CEILING_DEAD_BAND: f64 = 0.15;
 /// How many windows a dimension read at an instant is taken over before it may
 /// size a bound.
@@ -1387,7 +1393,8 @@ const CEILING_DEAD_BAND: f64 = 0.15;
 /// and finish must not be able to move the bound, and one build is the shortest
 /// span that guarantees it. It is a count of windows rather than a duration
 /// because the window is the unit the derivation already runs in.
-// cap: bound — 窗口数由「一次构建的时长」定，不是由收紧告警的阈值反推
+// cap: fixed — 窗口数由「一次构建的时长」定，不是由收紧告警的阈值反推
+// keep: 删掉后读数回看没有尽头，一次古老的构建一直留在基线里；由「窗口数由一次构建的时长定」兜住
 const READING_HORIZON_WINDOWS: usize = 30;
 /// What each dimension answers on its own, beside the ceiling that takes the
 /// smallest of them.
@@ -1416,7 +1423,9 @@ pub const BUILD_GATE_BOUND_RULE: &str = "build_gate_bound_not_converging";
 /// nine tenths, which is inside the life of one build: the cost follows a
 /// workspace that got cheaper, without following a build that got quieter for a
 /// minute.
-// cap: bound — 跟住变便宜的工作区，又不跟一个只是安静了一分钟的构建跑
+// cap: fixed — 跟住变便宜的工作区，又不跟一个只是安静了一分钟的构建跑
+// keep: 删掉后跟随没有平滑，一次只是安静了一分钟的构建就被读成变便宜；由「跟住变便宜的工作区、不跟一分钟的安静」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const IO_PER_BUILD_SMOOTHING: f64 = 0.3;
 
 /// The kernel's averaging window for the `avg60` pressure figures, in seconds.
@@ -1424,7 +1433,8 @@ const IO_PER_BUILD_SMOOTHING: f64 = 0.3;
 /// Not a dial. It is the definition of the reading the io dimension explains:
 /// the occupancy charged against that reading has to be averaged over the same
 /// period, or the two describe different minutes. See [`next_occupancy_avg`].
-// cap: bound — 记在这条读数上的占用必须按同一段窗口平均，否则两边说的是不同的分钟
+// cap: fixed — 记在这条读数上的占用必须按同一段窗口平均，否则两边说的是不同的分钟
+// keep: 删掉后两边按不同的窗口平均，同一个占用在两个读数里说的是不同的分钟；由「同一条读数的同一段窗口」兜住
 const PSI_AVG60_WINDOW_SECONDS: f64 = 60.0;
 
 /// The build occupancy an io reading's window ends on, given the average it
@@ -1640,12 +1650,14 @@ fn host_metrics(reading: Option<HostReading>, origin: Origin<'_>) -> Vec<RawMetr
 /// all of it — and the number this replaces is the divisor of a bound that
 /// decides how many builds run at once. Three is the smallest count at which
 /// "they agree" can be true of a sequence rather than of a pair.
-// cap: bound — 三是「它们彼此一致」能对一串而不只是对一对成立的最小个数
+// cap: fixed — 三是「它们彼此一致」能对一串而不只是对一对成立的最小个数
+// keep: 删掉后只有两份样本也要判「彼此一致」，一对当然一致，判据永远亮；由「三份才谈得上一串」兜住
 const MEASURED_BUILD_COST_SAMPLES: usize = 3;
 
 /// How close the measured builds must be to each other, as a fraction of their
 /// median, before they count as agreeing.
-// cap: bound — 按中位数的比例算「算一致」的容差
+// cap: fixed — 按中位数的比例算「算一致」的容差
+// keep: 删掉后容差为零，正常的编译抖动被读成不一致，实测永远用不上；由「按中位数的比例算一致」兜住
 const MEASURED_BUILD_COST_AGREEMENT: f64 = 0.10;
 
 /// How far the measured divisor must be from the declared one before it is used
@@ -1655,7 +1667,8 @@ const MEASURED_BUILD_COST_AGREEMENT: f64 = 0.10;
 /// differences smaller than the measurement's own noise, and every flip would
 /// be a bound move: the same square wave the ceiling's dead band exists to
 /// stop, one level down.
-// cap: bound — 界别跟着方波跳，与天花板那条死区同一个理由，低一层
+// cap: fixed — 界别跟着方波跳，与天花板那条死区同一个理由，低一层
+// keep: 删掉后界跟着实测的方波跳，每一次抖动都改写一次请求；由「与天花板那条死区同一个理由」兜住
 const MEASURED_BUILD_COST_DEAD_BAND: f64 = 0.20;
 
 /// The divisor the measurements have earned, if they have earned one.
@@ -1857,7 +1870,8 @@ fn tuning_readings(
 /// stall nobody measured. Capping at the sample's own horizon makes the counter
 /// a floor rather than a total, which is the safe direction for a rule that
 /// fires on it being large.
-// cap: bound — 取的是下限而不是总量，这对「它大就触发」的规则是安全方向
+// cap: fixed — 取的是下限而不是总量，这对「它大就触发」的规则是安全方向
+// keep: 删掉后一个采样窗口没有边界，构建期间的尖峰与空闲被平均成同一个数；由「取的是下限、对触发规则是安全方向」兜住
 const IO_SAMPLE_HORIZON: Duration = Duration::from_secs(60);
 
 /// What share of `since` a look at the disk may charge to [`BUILD_GATE_IO_OUTSIDE_SECONDS`].
@@ -2252,6 +2266,7 @@ const HOST_STEP_ASKER_PREFIX: &str = "gate: ";
 /// How many asks the refusal counter publishes per wall: the named works and
 /// the unnamed one.
 // cap: fixed — one cell per named asker plus the unnamed one; the +1 is that cell, not a dial
+// keep: 删掉后没有名字的那个问者没有自己的格，它的请求从读数上消失；由「每个点名的问者一格、再加无名的一格」兜住
 const ASKER_CELLS: usize = BUILD_GATE_ASKERS.len() + 1;
 
 /// The cell an ask is counted in, in the order [`BUILD_GATE_ASKERS`] lists the
@@ -2306,7 +2321,8 @@ pub fn reserve_build_field(what: &str) -> bool {
 /// dozen asks, and a bound moves at most once per measurement window. The number
 /// is not a policy about how many events matter -- anything this large means the
 /// consumer is not running, which is what the dropped count is for.
-// cap: bound — 不是关于多少事件算重要的策略：大到这个数说明消费端没在跑，那正是 dropped 计数要报的
+// cap: fixed — 不是关于多少事件算重要的策略：大到这个数说明消费端没在跑，那正是 dropped 计数要报的
+// keep: 删掉后消费端不跑时事件环无界地长，问题从 dropped 计数变成内存；由「大到这个数说明消费端没在跑」兜住
 const EVENT_RING_CAPACITY: usize = 256;
 
 /// The process that made a decision about the host, as the account records it.
@@ -4327,7 +4343,7 @@ fn record_served(dir: &Path, name: &str, now: u64) {
         .iter()
         .map(|(epoch, what)| format!("{epoch}\t{what}\n"))
         .collect();
-    let _ = write_gate_file(&dir.join(SERVED_FILE), &text);
+    cog_core::ignore_lost!(write_gate_file(&dir.join(SERVED_FILE), &text));
 }
 
 /// What a refusal can say about what is holding the slots it could not take.
@@ -4439,7 +4455,7 @@ fn lay_out_slots(dir: &Path, bound: usize) {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             continue;
         }
-        let _ = std::fs::remove_file(&path);
+        cog_core::ignore_lost!(std::fs::remove_file(&path));
     }
 }
 
@@ -4452,12 +4468,14 @@ fn lay_out_slots(_dir: &Path, _bound: usize) {}
 /// it. Nothing here is a secret -- a holder's name, a claim, a count -- so the
 /// mode is not about who may read it; it is about who may *write* it, and the
 /// answer has to be everyone who builds.
-// cap: bound — 这个模式管的不是谁能读，而是谁能写，答案必须是每个构建的人
+// cap: fixed — 这个模式管的不是谁能读，而是谁能写，答案必须是每个构建的人
+// keep: 删掉后本机别的构建写不进判词目录，一次构建变成一次权限故障；由「每个构建的人都要能写」兜住
 const GATE_DIR_MODE: u32 = 0o1777;
 /// Mode a gate file is created with. World-writable on purpose: every user that
 /// builds on this host has to be able to record a verdict, and the mode is about
 /// who may write, not about who may read.
-// cap: bound — 同上：本机每个构建都要能写判词，模式管写不管读
+// cap: fixed — 同上：本机每个构建都要能写判词，模式管写不管读
+// keep: 删掉后下一台构建读不到也写不回同一份判词文件；由「本机每个构建都要能写判词」兜住
 const GATE_FILE_MODE: u32 = 0o666;
 
 /// Opens the gate directory to every builder on this host, whichever user it
@@ -4572,7 +4590,9 @@ fn open_gate_file(path: &Path, write: bool) -> Option<std::fs::File> {
         // Best-effort: a file this process does not own refuses, and the holder
         // note it then cannot write is a reading it loses, not a lock it loses.
         use std::os::unix::fs::PermissionsExt;
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(GATE_FILE_MODE));
+        cog_core::ignore_lost!(
+            file.set_permissions(std::fs::Permissions::from_mode(GATE_FILE_MODE))
+        );
     }
     file.metadata().ok()?.is_file().then_some(file)
 }
@@ -4605,7 +4625,7 @@ fn write_gate_file(path: &Path, text: &str) -> std::io::Result<()> {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let tmp = path.with_file_name(format!(".{name}.{}", std::process::id()));
     {
         let mut file = std::fs::OpenOptions::new()
@@ -4625,7 +4645,9 @@ fn write_gate_file(path: &Path, text: &str) -> std::io::Result<()> {
         // own turn. Set before the write so the name never exists in the wrong
         // mode even for an instant.
         use std::os::unix::fs::PermissionsExt;
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(GATE_FILE_MODE));
+        cog_core::ignore_lost!(
+            file.set_permissions(std::fs::Permissions::from_mode(GATE_FILE_MODE))
+        );
         file.write_all(text.as_bytes())?;
     }
     std::fs::rename(&tmp, path)
@@ -7371,7 +7393,7 @@ unevictable 28532736
             .labels
             .get(crate::LABEL_DIMENSION)
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
 
         assert!(
             matches!(dimension.as_str(), DIM_CPU | DIM_MEMORY | DIM_IO),

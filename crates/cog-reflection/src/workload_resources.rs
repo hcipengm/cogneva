@@ -118,16 +118,19 @@ pub const ROLLOUT_JOB_CONTAINER: &str = ROLLOUT_JOB_WORKLOAD;
 
 /// 内存与 CPU 上限相对实测的余量，百分比。与卷容量回路同一条律。
 // cap: fixed — 余量是这条律与卷容量回路共用的一个协议数，不是某次测量的结果；两处各写一份才会有两条说法。
+// not-a-bound: 余量是这条律与卷容量回路共用的一个协议数，不是某次测量的结果；两处各写一份才会有两条说法。
 const HEADROOM_PERCENT: u64 = 120;
 
 /// CPU 的量化格：1/100 核。调度器与 kubelet 的 CPU 粒度本来就是毫核，
 /// 比这更细的差写回对象里也留不住。
 // cap: fixed — 毫核是调度器与 kubelet 的 CPU 粒度，0.01 核就是这一层的结构下限。
+// keep: 删掉后写回请求的步长没有结构下限，写回小于 kubelet 粒度的差只是换一个哈希；由「毫核是调度器的 CPU 粒度」兜住
 const CPU_QUANTUM_MILLICORES: u64 = 10;
 
 /// 内存的量化格。取值贴着 kubelet 自己的统计分辨率，差小于它就不值得
 /// churn 一次对象。
-// cap: bound — 该值贴着 kubelet 自己的统计分辨率：比这更小的差在读数上分不出来，写回只是让对象换一个哈希；它是「读数本身分辨不出」的下限，不是一个人挑的尺寸。
+// cap: fixed — 该值贴着 kubelet 自己的统计分辨率：比这更小的差在读数上分不出来，写回只是让对象换一个哈希；它是「读数本身分辨不出」的下限，不是一个人挑的尺寸。
+// keep: 删掉后写回小于 kubelet 统计分辨率的差，对象换了哈希而读数没变；由「贴着 kubelet 的统计分辨率」兜住
 const MEMORY_QUANTUM_BYTES: u64 = 16 * 1024 * 1024;
 
 /// 滚动窗口的长度：7 天。
@@ -136,21 +139,25 @@ const MEMORY_QUANTUM_BYTES: u64 = 16 * 1024 * 1024;
 /// （批量任务、备份、人工活动），又不至于让一次已修掉的旧尖峰永远决定今天
 /// 的请求。
 // cap: fixed — 一周是这条窗口的协议值：盖住一个完整周周期，又不让旧尖峰过冬。
+// not-a-bound: 一周是这条窗口的协议值：盖住一个完整周周期，又不让旧尖峰过冬。
 const WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// 一个容器至少要有多少个样本才允许写回。
 ///
 /// 12 个样本在默认节拍下是一小时。少于此数时一次突发就是一个结论，而
 /// 资源声明会跟着它抖。
-// cap: bound — 12 个样本在默认节拍下是一小时；低于它，p95 与峰值落在同一两个点上，量出来的不是分布。
+// cap: fixed — 12 个样本在默认节拍下是一小时；低于它，p95 与峰值落在同一两个点上，量出来的不是分布。
+// keep: 删掉后两三个样本就取 p95，量出来的不是分布；由「12 个样本是一小时」兜住
 const MIN_SAMPLES: usize = 12;
 
 /// 默认采样节拍（秒）。
 // cap: fixed — 五分钟一拍是这份部署的采样约定；再密只是重复读同一段窗口。
+// keep: 删掉后不说节拍的部署没有采样周期，回路没有读数可用；由「这份部署的五分钟采样约定」兜住
 const DEFAULT_INTERVAL_SECS: u64 = 300;
 
 /// 节拍下限（秒）。再密就只是在重复读同一段窗口里的数。
 // cap: fixed — 一分钟是这条回路允许的最密拍子，防止部署方把它配成忙等。
+// keep: 删掉后部署方可以把拍子配成忙等，回路在空转里占 CPU；由「允许的最密拍子」兜住
 const MIN_INTERVAL_SECS: u64 = 60;
 
 /// 窗口文件的落点，相对于 `COGNEVA_DATA_DIR`。
@@ -281,14 +288,17 @@ pub struct QueueReading {
 
 /// 一副副本：「这个面开着」的最小集合。
 // cap: fixed — 「至少有一副」这句话本身；零副不是一条扩容结论，是把执行面关掉（`sandboxExecutor.enabled`），那件事不该由一次队列读数决定。
+// keep: 删掉后一次队列读数就能把副数放到零，执行面被关掉而没人说要关；由「至少有一副，关执行面由 enabled 决定」兜住
 const MIN_REPLICAS: u64 = 1;
 
 /// 一拍最多收几副。
 // cap: fixed — 收缩按步走：一次把四副收回去，会让每一阵浪的尾巴都变成一次滚动换 Pod，而下一阵浪又要重新起。
+// keep: 删掉后一次把四副收回去，每一阵浪的尾巴都变成一次换 Pod；由「收缩按步走」兜住
 const SHRINK_STEP_REPLICAS: u64 = 1;
 
 /// 读一副副本的队最多等多久。
-// cap: bound — 读不到的执行器不该把一拍拖长：这条读是拍子的一个子步骤，拍子本身是分钟级。
+// cap: fixed — 读不到的执行器不该把一拍拖长：这条读是拍子的一个子步骤，拍子本身是分钟级。
+// keep: 删掉后读不到的执行器把一拍拖长，拍子跟着一个坏副本走；由「这条读是拍子的一个子步骤」兜住
 // wall: 等=执行器回一条车道读数 / 等不到=这条读数这一拍读作「读不到」，**不是 0**；拍子本身不因此变长 / 续跑=能，下一拍再读
 const LANE_READ_TIMEOUT_SECS: u64 = 2;
 
@@ -588,7 +598,7 @@ async fn quota_headroom(ns: &str) -> Option<Targets> {
     let object: Value = serde_json::from_str(&raw).ok()?;
     let hard = object.pointer("/status/hard")?;
     let used = object.pointer("/status/used").unwrap_or(&Value::Null);
-    // 配额的每一维是 Kubernetes 的数量串（`"5"`、`"19Gi"`），与本文件读 LimitRange
+    // 配额的每一维是 Kubernetes 的数量串（例如 `"5"`、`"19Gi"`，是数量串的写法，不是容量读数），与本文件读 LimitRange
     // 时同一组解析函数：两处各写一份，`0.5` 与 `500m` 迟早会有一处读成 0。
     let left = |dimension: &str, parse: fn(&str) -> Option<u64>| -> Option<u64> {
         let h = parse(hard.get(dimension)?.as_str()?)?;
@@ -697,6 +707,35 @@ fn spend_raise(declared: u64, requested: u64, budget: &mut u64) -> u64 {
     let grant = (requested - declared).min(*budget);
     *budget -= grant;
     declared + grant
+}
+
+/// 这一份工作负载里**没被改动**的容器已经占掉的请求（CPU 毫核 / 内存字节）。
+///
+/// 准入按 Pod 的**全部**容器算：回路只写回被测量的那几个，但新 Pod 仍带着其余容器
+/// （exporter、sidecar）。它们不在 `changes` 里；抬价时若只按被改的那一个去花额度
+/// 余量，算出来的 Pod 就装不进去。2026-11-27 实测：库的主容器抬到 3040m，同一 Pod
+/// 里 exporter 的 30m 让 5 核配额差 30m 不够，数据库被逐出之后再也建不回来
+/// （`FailedCreate ... exceeded quota`）。
+///
+/// 方向取保守：Pod 在跑时这些请求已经在 `used` 里，多算一次只会少抬一点，不会
+/// 抬出一个装不进的数。
+fn unchanged_requests(
+    containers: &[ContainerSpec],
+    changed: &std::collections::BTreeMap<String, Targets>,
+) -> (u64, u64) {
+    let mut cpu = 0u64;
+    let mut memory = 0u64;
+    for container in containers {
+        if changed.contains_key(&container.name) {
+            continue;
+        }
+        let Some(declared) = container.declared else {
+            continue;
+        };
+        cpu = cpu.saturating_add(declared.cpu_request_millicores.unwrap_or(0));
+        memory = memory.saturating_add(declared.memory_request_bytes.unwrap_or(0));
+    }
+    (cpu, memory)
 }
 
 /// 把默认层夹进 namespace 还剩下的准入余量：一个新 Pod 用这组值必须进得去。
@@ -808,7 +847,8 @@ pub struct RunSample {
 }
 
 /// 限流目标：被限流的周期占比超过它，就认为这次跑的 CPU 上限在咬自己。
-// cap: bound — 10% 是 CFS 限流开始影响单次运行尾部延迟的频度；低于它的限流是正常的分时公平，高于它的限流会让判定进程自己的时钟变长。
+// cap: fixed — 10% 是 CFS 限流开始影响单次运行尾部延迟的频度；低于它的限流是正常的分时公平，高于它的限流会让判定进程自己的时钟变长。
+// keep: 删掉后限流没有判据线，正常的分时公平被读成需要扩容；由「10% 是影响尾部延迟的频度」兜住
 const THROTTLE_TARGET: f64 = 0.10;
 
 /// 把一份滚动 Job 的运行史收成一个目标。
@@ -837,7 +877,8 @@ pub fn rollout_job_targets(history: &[RunSample]) -> Option<Targets> {
 }
 
 /// 限流判据看最近几次跑：一次偶发的限流不改变上限，连续几次才会。
-// cap: bound — 三次是这份部署里一个滚动结论从发生到被观察到的拍数（Job 每轮至多派一次，部署器按分钟轮询）；再多就把已经修好的旧限流也算进来。
+// cap: fixed — 三次是这份部署里一个滚动结论从发生到被观察到的拍数（Job 每轮至多派一次，部署器按分钟轮询）；再多就把已经修好的旧限流也算进来。
+// keep: 删掉后回看太久，已经修好的旧限流又被算进来；由「一个滚动结论从发生到被观察到的拍数」兜住
 const RUNS_IN_THROTTLE_LOOKBACK: usize = 3;
 
 /// 丢掉窗口外的运行史。
@@ -1396,8 +1437,10 @@ pub fn cpu_quantity(millicores: u64) -> String {
 
 pub fn memory_quantity(bytes: u64) -> String {
     // cap: fixed — 这两个是二进制单位的定义（2^30 / 2^20），不是可调的界。
+    // not-a-bound: 这两个是二进制单位的定义（2^30 / 2^20），不是可调的界。
     const GIB: u64 = 1024 * 1024 * 1024;
     // cap: fixed — 同上，2^20 字节。
+    // not-a-bound: 单位定义（2^20 字节），不是界
     const MIB: u64 = 1024 * 1024;
     if bytes % GIB == 0 {
         format!("{}Gi", bytes / GIB)
@@ -2048,7 +2091,7 @@ async fn read_lane(http: &dyn cog_core::HttpClient, address: &str) -> Option<Lan
 /// 挡住了正是「需要更多副本」的读数，不是「没事做」。旧一版执行器不报余量这
 /// 一格（`None`），那就只数编译位子，不把没报读成零。
 fn lane_queue(reading: &cog_core::BuildLaneReading) -> LaneQueue {
-    let room = reading.room.unwrap_or_default();
+    let room = reading.room.unwrap_or(Default::default());
     LaneQueue {
         lanes: reading.capacity,
         holding: reading.holding.len() + room.running,
@@ -2269,6 +2312,11 @@ pub async fn round(
     let mut hard_now_mem = quota_now.map(|(hard, _)| hard.memory_request_bytes);
     let used_now_cpu = quota_now.map(|(_, used)| used.cpu_request_millicores);
     let used_now_mem = quota_now.map(|(_, used)| used.memory_request_bytes);
+    // 一次 pass 里所有工作负载共用这一份额度余量：抬价各自记账，不是各自拿一份
+    // `hard − used`。两个工作负载各拿一份时，两次抬价合起来可以越过配额，而任何
+    // 一次单独看都「装得下」。
+    let mut remaining_cpu = used_now_cpu;
+    let mut remaining_mem = used_now_mem;
 
     // 这一拍给每个声明了资源的容器算出的请求。默认层问的是同一份测量的
     // 另一个问题（见 `default_shape`），所以在下面那段循环里顺手收起来，
@@ -2553,7 +2601,8 @@ pub async fn round(
                     ),
                 }
             }
-            for (decision, dimension) in [(cpu_move, "requests.cpu"), (mem_move, "requests.memory")] {
+            for (decision, dimension) in [(cpu_move, "requests.cpu"), (mem_move, "requests.memory")]
+            {
                 if let SyncDecision::ExceedsNode { required, cap } = decision {
                     warn!(
                         namespace = %ns,
@@ -2566,56 +2615,103 @@ pub async fn round(
             }
             // 装不下时把这一份压到「hard − used」还放得下的地方：留一条能重建的
             // 请求，而不是写一个准入必拒的数。
-            if matches!(cpu_move, SyncDecision::ExceedsNode { .. }) {
-                if let (Some(hard_cpu), Some(used_cpu)) = (hard_now_cpu, used_now_cpu) {
-                    let mut budget = hard_cpu.saturating_sub(used_cpu);
-                    for (name, targets) in changes.iter_mut() {
-                        let Some(declared) = workload
+            // 「这个 Pod 装得进配额」是**无条件**的最后一问，不是只在「所需超过节点」
+            // 时才问：配额由稳态读数导出，请求由窗口尾部导出，两者可以差在尾巴上，
+            // 而节点还有余量时旧的那条支路根本不夹——闭环照样能写出准入必拒的数
+            // （2026-11-27 实测：库的 Pod 被逐出后一直建不回来）。
+            //
+            // 预算按**最坏情形**算：这个工作负载此刻可能没有 Pod（`used` 里没有它的
+            // 请求），所以未改容器与将被改容器的声明值都先占掉；方向取保守——
+            // 多扣只会少抬一点，不会抬出一个装不进的 Pod。
+            if let (Some(hard_cpu), Some(used_cpu)) = (hard_now_cpu, remaining_cpu) {
+                let (fixed_cpu, _) = unchanged_requests(&workload.containers, &changes);
+                let planned_cpu: u64 = changes
+                    .keys()
+                    .filter_map(|name| {
+                        workload
                             .containers
                             .iter()
                             .find(|c| &c.name == name)
                             .and_then(|c| c.declared)
-                        else {
-                            continue;
-                        };
-                        let before = targets.cpu_request_millicores;
-                        targets.cpu_request_millicores = spend_raise(
-                            declared.cpu_request_millicores.unwrap_or(0),
-                            before,
-                            &mut budget,
+                            .and_then(|d| d.cpu_request_millicores)
+                    })
+                    .sum();
+                let mut budget = hard_cpu
+                    .saturating_sub(used_cpu)
+                    .saturating_sub(fixed_cpu)
+                    .saturating_sub(planned_cpu);
+                let mut spent = 0u64;
+                for (name, targets) in changes.iter_mut() {
+                    let Some(declared) = workload
+                        .containers
+                        .iter()
+                        .find(|c| &c.name == name)
+                        .and_then(|c| c.declared)
+                    else {
+                        continue;
+                    };
+                    let declared = declared.cpu_request_millicores.unwrap_or(0);
+                    let before = targets.cpu_request_millicores;
+                    targets.cpu_request_millicores = spend_raise(declared, before, &mut budget);
+                    spent = spent
+                        .saturating_add(targets.cpu_request_millicores.saturating_sub(declared));
+                    if targets.cpu_request_millicores != before {
+                        warn!(
+                            workload = %workload.name,
+                            container = %name,
+                            wanted = before,
+                            granted = targets.cpu_request_millicores,
+                            "workload resources: capped at what the ceiling can still admit"
                         );
-                        if targets.cpu_request_millicores != before {
-                            warn!(
-                                workload = %workload.name,
-                                container = %name,
-                                wanted = before,
-                                granted = targets.cpu_request_millicores,
-                                "workload resources: capped at what the ceiling can still admit"
-                            );
-                            readings.observe(&workload.name, name, *targets, SOURCE_QUOTA, 0);
-                        }
+                        readings.observe(&workload.name, name, *targets, SOURCE_QUOTA, 0);
                     }
                 }
+                remaining_cpu = Some(used_cpu.saturating_add(spent));
             }
-            if matches!(mem_move, SyncDecision::ExceedsNode { .. }) {
-                if let (Some(hard_mem), Some(used_mem)) = (hard_now_mem, used_now_mem) {
-                    let mut budget = hard_mem.saturating_sub(used_mem);
-                    for (name, targets) in changes.iter_mut() {
-                        let Some(declared) = workload
+            if let (Some(hard_mem), Some(used_mem)) = (hard_now_mem, remaining_mem) {
+                let (_, fixed_mem) = unchanged_requests(&workload.containers, &changes);
+                let planned_mem: u64 = changes
+                    .keys()
+                    .filter_map(|name| {
+                        workload
                             .containers
                             .iter()
                             .find(|c| &c.name == name)
                             .and_then(|c| c.declared)
-                        else {
-                            continue;
-                        };
-                        targets.memory_request_bytes = spend_raise(
-                            declared.memory_request_bytes.unwrap_or(0),
-                            targets.memory_request_bytes,
-                            &mut budget,
+                            .and_then(|d| d.memory_request_bytes)
+                    })
+                    .sum();
+                let mut budget = hard_mem
+                    .saturating_sub(used_mem)
+                    .saturating_sub(fixed_mem)
+                    .saturating_sub(planned_mem);
+                let mut spent = 0u64;
+                for (name, targets) in changes.iter_mut() {
+                    let Some(declared) = workload
+                        .containers
+                        .iter()
+                        .find(|c| &c.name == name)
+                        .and_then(|c| c.declared)
+                    else {
+                        continue;
+                    };
+                    let declared = declared.memory_request_bytes.unwrap_or(0);
+                    let before = targets.memory_request_bytes;
+                    targets.memory_request_bytes = spend_raise(declared, before, &mut budget);
+                    spent =
+                        spent.saturating_add(targets.memory_request_bytes.saturating_sub(declared));
+                    if targets.memory_request_bytes != before {
+                        warn!(
+                            workload = %workload.name,
+                            container = %name,
+                            wanted = before,
+                            granted = targets.memory_request_bytes,
+                            "workload resources: capped at what the ceiling can still admit"
                         );
+                        readings.observe(&workload.name, name, *targets, SOURCE_QUOTA, 0);
                     }
                 }
+                remaining_mem = Some(used_mem.saturating_add(spent));
             }
         }
         let Some(body) = patch_body(
@@ -3235,7 +3331,7 @@ mod tests {
                     .labels
                     .get(WORKLOAD_LABEL)
                     .cloned()
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 (workload, metric.value)
             })
             .collect()
@@ -3490,6 +3586,64 @@ mod tests {
         }
     }
 
+    /// 侧车的请求要占额度：只改主容器时，预算里必须先扣掉同一个 Pod 里没被改的容器。
+    /// 2026-11-27 的现场算术：库的主容器被抬到 3040m 时，同一 Pod 的 exporter 30m
+    /// 让它越过 5 核配额 30m。预算先扣未改容器与声明值后，抬出来的 Pod 正好装得进。
+    #[test]
+    fn the_library_raise_fits_the_quota_once_the_sidecar_is_reserved() {
+        let hard = 5_000u64;
+        let used = 1_960u64;
+        let sidecar = 30u64;
+        let declared = 500u64;
+        let mut budget = hard
+            .saturating_sub(used)
+            .saturating_sub(sidecar)
+            .saturating_sub(declared);
+        let granted = spend_raise(declared, 3_040, &mut budget);
+        assert_eq!(granted, 3_010, "抬价要把侧车与声明值先留出来");
+        assert!(
+            used + granted + sidecar <= hard,
+            "新 Pod 仍然装不进配额：{used}+{granted}+{sidecar} > {hard}"
+        );
+    }
+
+    #[test]
+    fn a_pods_unchanged_containers_take_room_out_of_the_budget() {
+        let sidecar = ContainerSpec {
+            name: "exporter".into(),
+            init: false,
+            declared: Some(Declared {
+                cpu_request_millicores: Some(30),
+                memory_request_bytes: Some(32 * 1024 * 1024),
+                cpu_limit_millicores: Some(30),
+                memory_limit_bytes: Some(64 * 1024 * 1024),
+            }),
+            startup_probe: None,
+        };
+        let main = ContainerSpec {
+            name: "postgres".into(),
+            init: false,
+            declared: Some(Declared {
+                cpu_request_millicores: Some(500),
+                memory_request_bytes: Some(512 * 1024 * 1024),
+                cpu_limit_millicores: Some(2000),
+                memory_limit_bytes: Some(2 * 1024 * 1024 * 1024),
+            }),
+            startup_probe: None,
+        };
+        let mut changed = BTreeMap::new();
+        changed.insert("postgres".to_string(), targets(3040, 1488 * 1024 * 1024));
+        let (cpu, memory) = unchanged_requests(&[main.clone(), sidecar.clone()], &changed);
+        assert_eq!(
+            cpu, 30,
+            "exporter 的 30m 不在 changes 里，但它就在新 Pod 里"
+        );
+        assert_eq!(memory, 32 * 1024 * 1024);
+        // 两个都改时不留预算：两份请求都由 spend_raise 逐个记账。
+        changed.insert("exporter".to_string(), targets(30, 32 * 1024 * 1024));
+        assert_eq!(unchanged_requests(&[main, sidecar], &changed), (0, 0));
+    }
+
     #[test]
     fn a_deployment_patch_lands_under_the_pod_template() {
         let mut changes = BTreeMap::new();
@@ -3730,12 +3884,24 @@ mod tests {
     fn the_ceiling_moves_with_the_measured_need_or_names_the_hardware_limit() {
         // 需要的比硬的大：抬到它；一样大：不动；需要的比硬的小：**降下来**——
         // 单个与整体的需要始终相等，不是只许涨；超过节点就告警、不动。
-        assert_eq!(sync_decision(5_000, 5_700, Some(23_860)), SyncDecision::Set(5_700));
-        assert_eq!(sync_decision(5_700, 5_700, Some(23_860)), SyncDecision::Keep);
-        assert_eq!(sync_decision(5_700, 4_100, Some(23_860)), SyncDecision::Set(4_100));
+        assert_eq!(
+            sync_decision(5_000, 5_700, Some(23_860)),
+            SyncDecision::Set(5_700)
+        );
+        assert_eq!(
+            sync_decision(5_700, 5_700, Some(23_860)),
+            SyncDecision::Keep
+        );
+        assert_eq!(
+            sync_decision(5_700, 4_100, Some(23_860)),
+            SyncDecision::Set(4_100)
+        );
         assert_eq!(
             sync_decision(5_000, 5_700, Some(5_000)),
-            SyncDecision::ExceedsNode { required: 5_700, cap: 5_000 }
+            SyncDecision::ExceedsNode {
+                required: 5_700,
+                cap: 5_000
+            }
         );
         assert_eq!(sync_decision(5_000, 5_700, None), SyncDecision::Set(5_700));
     }
@@ -3748,9 +3914,17 @@ mod tests {
         let mut budget = 2_340;
         assert_eq!(spend_raise(500, 400, &mut budget), 400, "不抬就不花预算");
         assert_eq!(budget, 2_340);
-        assert_eq!(spend_raise(500, 3_040, &mut budget), 2_840, "抬价被余量夹住");
+        assert_eq!(
+            spend_raise(500, 3_040, &mut budget),
+            2_840,
+            "抬价被余量夹住"
+        );
         assert_eq!(budget, 0);
-        assert_eq!(spend_raise(500, 3_040, &mut budget), 500, "余量用完就停在声明值");
+        assert_eq!(
+            spend_raise(500, 3_040, &mut budget),
+            500,
+            "余量用完就停在声明值"
+        );
     }
 
     /// 默认层被配额顶住时取「还装得下」的那组值；量不到时原样交回。

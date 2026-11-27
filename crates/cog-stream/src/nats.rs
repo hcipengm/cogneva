@@ -403,7 +403,7 @@ impl MessageBackend for NatsMessageBackend {
         };
         match sender {
             Some(sender) => {
-                let _ = sender.send(true);
+                cog_core::ignore_lost!(sender.send(true));
             }
             None => tracing::debug!(
                 stream = %subject,
@@ -636,7 +636,7 @@ impl MessageBackend for NatsMessageBackend {
         let this = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-            let _ = this.publish(&subject, &payload).await;
+            cog_core::ignore_lost!(this.publish(&subject, &payload).await);
         });
         Ok(())
     }

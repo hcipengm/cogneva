@@ -10,7 +10,8 @@ use std::sync::Arc;
 ///
 /// 这些调用都是单对象读/写（元数据、小文件），慢在远端而不是本机；30s 之后
 /// 重试还有意义，再等只是把调用方一起挂住。
-// cap: bound — 这些是单对象读写的远端延迟；30s 之后重试还有意义，再等只是把调用方一起挂住
+// cap: fixed — 这些是单对象读写的远端延迟；30s 之后重试还有意义，再等只是把调用方一起挂住
+// keep: 删掉后一个不响应的远端把调用方一起挂住，重试也没发生；由「30s 之后重试还有意义」兜住
 // wall: 等=对象存储对一次单对象读写的答复 / 等不到=这次读写按失败收尾，重试还有意义；再等只是把调用方一起挂住 / 续跑=能，重试是一次新的请求
 const BACKEND_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -328,6 +329,60 @@ impl S3ObjectBackend {
         self
     }
 
+    /// 让这个后端引用的桶在存储上真的存在。
+    ///
+    /// 引用（`artifact://…` / `s3://<bucket>/<key>`）能不能取回全文，取决于桶是否
+    /// 存在——对象后端自己只假设它在。2026-11-27 现场：部署里配置了 `seaweedfs`
+    /// 与桶 `cogneva`，存储上一个桶都没有；那一刻所有外置正文的引用都不可解，而
+    /// 账上没有一格说这件事。存在即返回；不存在就建（幂等）；别的失败原样报出来，
+    /// 由装配处决定要不要拦。
+    pub async fn ensure_bucket(&self) -> SFResult<()> {
+        let client = self.client()?;
+        let empty_hash = Self::sha256_hex(b"");
+        let canonical_uri = format!("/{}", self.bucket);
+        let ep = self.endpoint.trim_end_matches('/');
+        let url = format!("{}/{}", ep, self.bucket);
+
+        // 一次往返：桶在不在（HEAD 桶本身，不列内容）。
+        let mut req = HttpRequest::head(&url);
+        for (k, v) in self.sign_request("HEAD", &canonical_uri, "", &empty_hash, &[]) {
+            req = req.header(k, v);
+        }
+        let resp = self.with_timeout(client.execute(req)).await?;
+        match resp.status {
+            200..=299 => return Ok(()),
+            404 => {}
+            status => {
+                let body = resp
+                    .text()
+                    .unwrap_or_else(|_| "<unable to read body>".to_string());
+                return Err(SFError::Adapter {
+                    provider: "s3".to_string(),
+                    message: format!("bucket {}: HEAD answered {status} - {body}", self.bucket),
+                });
+            }
+        }
+
+        // 一次往返：建桶（幂等；已存在时服务端答 200/409，都算它在）。
+        let mut req = HttpRequest::put(&url);
+        for (k, v) in self.sign_request("PUT", &canonical_uri, "", &empty_hash, &[]) {
+            req = req.header(k, v);
+        }
+        let resp = self.with_timeout(client.execute(req)).await?;
+        match resp.status {
+            200..=299 | 409 => Ok(()),
+            status => {
+                let body = resp
+                    .text()
+                    .unwrap_or_else(|_| "<unable to read body>".to_string());
+                Err(SFError::Adapter {
+                    provider: "s3".to_string(),
+                    message: format!("bucket {}: PUT answered {status} - {body}", self.bucket),
+                })
+            }
+        }
+    }
+
     fn client(&self) -> SFResult<&Arc<dyn cog_core::HttpClient>> {
         self.client.as_ref().ok_or_else(|| SFError::Adapter {
             provider: "s3".to_string(),
@@ -502,6 +557,7 @@ impl S3ObjectBackend {
         &self,
         fut: impl std::future::Future<Output = SFResult<T>>,
     ) -> SFResult<T> {
+        // roundtrip: 一次对象后端调用
         match tokio::time::timeout(BACKEND_CALL_TIMEOUT, fut).await {
             Ok(v) => v,
             Err(_) => Err(SFError::Timeout),
@@ -610,6 +666,7 @@ fn parse_next_token(xml: &str) -> Option<String> {
 /// 「大块字节的写必须在内存里攒齐」这条一点没变。分块上传是唯一能把它变成「一段」的
 /// 形态，而 S3 的每一段各自签自己的载荷哈希——签名与校验因此仍然真跑过。
 // cap: fixed — 协议给定的下界：S3 不接受小于协议下限的段（最后一段除外），这里取下限的两倍，与这台机器无关
+// not-a-bound: 协议给定的下界：S3 不接受小于协议下限的段（最后一段除外），这里取下限的两倍，与这台机器无关
 const S3_PART_BYTES: usize = 10 * 1024 * 1024;
 
 struct S3Write {
@@ -671,7 +728,7 @@ impl S3Write {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
             .map(|(_, v)| v.clone())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         self.etags.push(etag);
         Ok(())
     }
@@ -738,13 +795,17 @@ impl cog_core::ObjectWrite for S3Write {
         for (k, v) in signed {
             req = req.header(k, v);
         }
-        let _ = self.backend.client()?.execute(req).await;
+        cog_core::ignore_lost!(self.backend.client()?.execute(req).await);
         Ok(())
     }
 }
 
 #[async_trait]
 impl ObjectBackend for S3ObjectBackend {
+    async fn ensure_ready(&self) -> SFResult<()> {
+        self.ensure_bucket().await
+    }
+
     async fn open_write(&self, key: &str) -> SFResult<Box<dyn cog_core::ObjectWrite>> {
         // initiate：`POST /key?uploads` 换回一个 `UploadId`。
         let canonical = self.canonical_uri(key);
@@ -763,7 +824,7 @@ impl ObjectBackend for S3ObjectBackend {
                 message: format!("initiate multipart for {key} failed: {}", resp.status),
             });
         }
-        let body = resp.text().unwrap_or_default();
+        let body = resp.text().unwrap_or(Default::default());
         let upload_id = body
             .split("<UploadId>")
             .nth(1)
@@ -918,7 +979,8 @@ impl ObjectBackend for S3ObjectBackend {
             let mut continuation: Option<String> = None;
             // A bucket listing is unbounded; cap the walk so a server that keeps
             // reporting truncation without advancing the cursor cannot spin forever.
-            // cap: bound — a page-count ceiling so a cursor that keeps truncating cannot spin forever
+            // cap: fixed — a page-count ceiling so a cursor that keeps truncating cannot spin forever
+            // keep: 删掉后一个一直截断的游标永远转下去，一次列举不结束；由「a page-count ceiling」兜住
             const MAX_PAGES: usize = 10_000;
 
             for _ in 0..MAX_PAGES {
@@ -1038,6 +1100,98 @@ mod tests {
         assert!(!dir.path().join("c.partial").exists());
     }
 
+    /// 一个只答桶级 HEAD/PUT 的存储：用来判「桶不在就先建、在就不再建、建不成要说
+    /// 得出来」。引用能不能取回全文取决于桶是否存在，所以这三件事各是一条判据。
+    #[derive(Debug)]
+    struct BucketHttp {
+        head_status: u16,
+        put_status: u16,
+        seen: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::HttpClient for BucketHttp {
+        async fn execute(&self, req: cog_core::HttpRequest) -> SFResult<cog_core::HttpResponse> {
+            let status = if req.method == "HEAD" {
+                self.head_status
+            } else {
+                self.put_status
+            };
+            self.seen
+                .lock()
+                .unwrap()
+                .push((req.method.clone(), req.url.clone()));
+            Ok(cog_core::HttpResponse {
+                status,
+                headers: Default::default(),
+                body: Vec::new(),
+            })
+        }
+    }
+
+    fn bucket_backend(http: Arc<BucketHttp>) -> S3ObjectBackend {
+        S3ObjectBackend::new("http://s3.example", "us-east-1", "cogneva", "ak", "sk")
+            .with_client(http)
+    }
+
+    /// 桶不存在：先问 HEAD，再一次 PUT 把它建出来。
+    #[tokio::test]
+    async fn an_absent_bucket_is_created_before_it_is_used() {
+        let http = Arc::new(BucketHttp {
+            head_status: 404,
+            put_status: 200,
+            seen: Mutex::new(Vec::new()),
+        });
+        bucket_backend(http.clone())
+            .ensure_bucket()
+            .await
+            .expect("404 then 200 must create the bucket");
+        let seen = http.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.iter().map(|(m, _)| m.as_str()).collect::<Vec<_>>(),
+            vec!["HEAD", "PUT"],
+            "先问在不在，再建；两条都打在桶上"
+        );
+        assert!(seen[0].1.ends_with("/cogneva"), "{}", seen[0].1);
+        assert!(seen[1].1.ends_with("/cogneva"), "{}", seen[1].1);
+    }
+
+    /// 桶已经在：只问一次，不再建。
+    #[tokio::test]
+    async fn an_existing_bucket_is_not_created_again() {
+        let http = Arc::new(BucketHttp {
+            head_status: 200,
+            put_status: 500,
+            seen: Mutex::new(Vec::new()),
+        });
+        bucket_backend(http.clone())
+            .ensure_bucket()
+            .await
+            .expect("an existing bucket needs no write");
+        let seen = http.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.iter().map(|(m, _)| m.as_str()).collect::<Vec<_>>(),
+            vec!["HEAD"]
+        );
+    }
+
+    /// 建不成：错误里点名桶与状态码，别让「引用不可解」只留在日志里的一句猜测上。
+    #[tokio::test]
+    async fn a_bucket_that_cannot_be_created_is_an_error() {
+        let http = Arc::new(BucketHttp {
+            head_status: 404,
+            put_status: 403,
+            seen: Mutex::new(Vec::new()),
+        });
+        let error = bucket_backend(http)
+            .ensure_bucket()
+            .await
+            .expect_err("a refused creation must not read as ready");
+        let message = error.to_string();
+        assert!(message.contains("cogneva"), "{message}");
+        assert!(message.contains("403"), "{message}");
+    }
+
     /// Serves a scripted sequence of ListObjectsV2 pages and records the URL of
     /// every request so a test can assert the continuation cursor was forwarded.
     #[derive(Debug)]
@@ -1078,7 +1232,7 @@ mod tests {
             .collect();
         let next = token
             .map(|t| format!("<NextContinuationToken>{}</NextContinuationToken>", t))
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         format!(
             "<ListBucketResult>{}{}<IsTruncated>{}</IsTruncated>{}</ListBucketResult>",
             contents, next, truncated, ""
@@ -1160,7 +1314,7 @@ mod tests {
             assert!(objects.delete(key).await.is_err());
             assert!(objects.presign_url(key, 60).await.is_err());
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     #[tokio::test]
@@ -1174,7 +1328,7 @@ mod tests {
         assert_eq!(listed, vec!["files/abc".to_string()]);
         objects.delete("files/abc").await.unwrap();
         assert!(objects.get("files/abc").await.unwrap().is_none());
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
     /// 会说分块上传那套协议的替身：initiate 给一个 UploadId，每段 PUT 收下正文，
     /// complete 收 XML。断言用它的记录，不用真 S3——**签名仍然是真算的**，因为门
@@ -1292,7 +1446,7 @@ mod tests {
         assert_eq!(objects.list(None).await.unwrap().len(), 3);
         objects.delete("files/deep/b").await.unwrap();
         assert_eq!(objects_on_disk(&dir).await.unwrap(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// A tree that is gone reads as zero; a tree that cannot be looked at reads
@@ -1304,7 +1458,7 @@ mod tests {
             "cogneva-object-keys-missing-{}",
             std::process::id()
         ));
-        let _ = std::fs::remove_dir_all(&missing);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&missing));
         assert_eq!(objects_on_disk(&missing).await.unwrap(), 0);
 
         // A path that is a file, not a directory: something is there that
@@ -1312,7 +1466,7 @@ mod tests {
         let (objects, dir) = file_backend("not-a-dir");
         objects.put("file", b"x").await.unwrap();
         assert!(objects_on_disk(&dir.join("file")).await.is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// A store that cannot be looked at is not an empty store. `exists` used to
@@ -1344,7 +1498,7 @@ mod tests {
         objects.put("plain", b"x").await.unwrap();
         assert!(!objects.exists("plain/under-a-file").await.unwrap());
 
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// Only a remote provider with a declared `base_path` has an orphaned tree

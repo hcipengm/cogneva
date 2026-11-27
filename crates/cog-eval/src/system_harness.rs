@@ -49,7 +49,8 @@ pub struct DeploymentTestConfig {
 
 // 三遍：一次量不出抖动，两次分不清「这台机器就是慢」与「这一次撞上了别的负载」；
 // 三遍同时给出均值与「每次都成了没有」，再多只是把同一台机器的同一个数再量几遍。
-// cap: bound — 三遍：一次量不出抖动，两次分不清慢机器与偶发负载
+// cap: fixed — 三遍：一次量不出抖动，两次分不清慢机器与偶发负载
+// keep: 删掉后一遍量不出抖动，慢机器与偶发负载分不开；由「三遍」兜住
 const DEFAULT_DEPLOY_REPETITIONS: u32 = 3;
 
 /// 手写而不是 `derive(Default)`：派生出来的 `repetitions` 是 0，而没写这一格的

@@ -657,7 +657,8 @@ pub async fn summary_search_handler(
 /// turn "list the namespace" into one read per id; the cap keeps a listing to a
 /// bounded number of reads and reports the untrimmed `total` so the caller can
 /// see it was a prefix.
-// cap: bound — 列原始记忆时没传 limit 的兜底条数；调用方能要更多，这是默认不是上限
+// cap: fixed — 列原始记忆时没传 limit 的兜底条数；调用方能要更多，这是默认不是上限
+// keep: 删掉后不传 limit 的调用方没有兜底页长，整段原始记忆搬进响应；由「这是默认不是上限」兜住
 const DEFAULT_RAW_LIST_LIMIT: usize = 100;
 
 #[derive(Debug, Deserialize)]
@@ -1014,7 +1015,8 @@ pub async fn get_raw_url_handler(
     // A short window: the URL carries the object store's signature and is meant
     // to be used at once. A long one would leave a working link to the stored
     // bytes circulating past the request that asked for it.
-    // cap: bound — lifetime of the signed URL for stored bytes: long enough for the request that asked, short enough that a working link does not circulate
+    // cap: fixed — lifetime of the signed URL for stored bytes: long enough for the request that asked, short enough that a working link does not circulate
+    // keep: 删掉后签名 URL 永不过期，一个还在流传的工作链接就能一直读这些字节；由「长到够那次请求、短到链接不再流通」兜住
     const EXPIRY_SECS: u64 = 300;
     match backend.presign_raw(&ns, &id, EXPIRY_SECS).await {
         Ok(Some(url)) => (

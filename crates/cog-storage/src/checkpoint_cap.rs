@@ -65,7 +65,8 @@ pub const DEPLOYMENT_LABEL: &str = "deployment";
 /// 54,452 — the rest was garbage. Forty thousand sits well above that live set
 /// and well below the table. It is the declaration a deployment makes when it
 /// does not say otherwise, not a policy: nothing acts on it.
-// cap: bound — 这是不说自己容量的部署的默认声明值，不是策略；它不再驱动任何删除
+// cap: fixed — 这是不说自己容量的部署的默认声明值，不是策略；它不再驱动任何删除
+// keep: 删掉后不说自己容量的部署没有默认声明，读数无法与任何界比较；由「默认声明值，不驱动删除」兜住
 pub const DEFAULT_MAX_ROWS: u64 = 40_000;
 
 /// The environment variable a deployment overrides the declaration with.
@@ -77,6 +78,7 @@ pub const MAX_ROWS_ENV: &str = "COGNEVA_CHECKPOINT_MAX_ROWS";
 /// 五分钟，超过它这一条序列就从抓取面上消失——不是变成旧值，是不存在。所以一个
 /// 「现在有多大」的读数必须比那个窗口刷新得更勤。
 // cap: fixed — Prometheus 的默认 lookback delta = 5 分钟，读数须在其内至少刷新一次；这里取 1/5
+// keep: 删掉后读数在 lookback 内不刷新，Prometheus 把这条序列丢掉；由「lookback delta 的 1/5」兜住
 pub const LOOP_PERIOD: Duration = Duration::from_secs(60);
 
 /// 读一次仓库得到的那几个数。**一个都不来自删除**。

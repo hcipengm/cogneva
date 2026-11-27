@@ -154,6 +154,19 @@ CREATE TABLE IF NOT EXISTS cog_metric_histogram_sums (
                 sum DOUBLE PRECISION NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (name, labels)
+            )
+;
+-- 标签集里被按键读的键（`endpoint`、`status`……）落成的侧表（迁移 139 的同一列
+-- 表述）。标签集是开集，一个键一列不成立；而读者按某个键筛行时不该每拍把 labels
+-- 文本解析一遍——解析的键名打错只会读成 NULL，不会报错。写者在写累加行的同一
+-- 事务里落这张表，读的人按 (name, labels, key) 联结。labels 与累加行的 labels
+-- 是同一份字节（同一条 `::jsonb::text`），所以联结是逐字相等而不是重新规整。
+CREATE TABLE IF NOT EXISTS metric_labels (
+                name TEXT NOT NULL,
+                labels TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                PRIMARY KEY (name, labels, key)
             );
 "#;
 
@@ -219,21 +232,24 @@ enum Command {
 /// 由「一次提交的固定成本摊到多少条上才不亏」定，不是从任何容量读数导出：
 /// 一次提交的 WAL 页与提交记录摊到 256 条上已低到可以忽略，再往上加行省下的
 /// 提交成本小于整批变慢的方差。
-// cap: bound — 使一次提交的固定成本摊到 256 条上可忽略，不是从任何容量读数导出
+// cap: fixed — 使一次提交的固定成本摊到 256 条上可忽略，不是从任何容量读数导出
+// keep: 删掉后一次提交的固定成本摊不薄，每条指标都付一次事务；由「摊到 256 条上可忽略」兜住
 const METRIC_BATCH_MAX: usize = 256;
 
 /// 第一条到了之后最多再等多久凑批。
 ///
 /// 指标是按拍刷的（每次抓取、每个事件循环各一轮），凑够一批通常不用等；
 /// 这个等待只对安静时段起作用，让单条观测不因为「等下一批」而迟到。
-// cap: bound — 与指标到达间隔（毫秒级）相比足够短，只用来收尾一批
+// cap: fixed — 与指标到达间隔（毫秒级）相比足够短，只用来收尾一批
+// keep: 删掉后一批永远等不到收尾，指标停在缓冲里；由「足够短，只用来收尾一批」兜住
 const METRIC_BATCH_LINGER_MS: u64 = 50;
 
 /// 队列能排多少条。满了不丢观测，改为立刻单独写一条。
 ///
 /// 按「数据库停住多久还不丢」定：实测本平台每秒数十到数百条观测，8192 条约是
 /// 十几秒到几分钟的积压。
-// cap: bound — 按观测速率（每秒数十到数百条）乘一段可等待的数据库停顿估出
+// cap: fixed — 按观测速率（每秒数十到数百条）乘一段可等待的数据库停顿估出
+// keep: 删掉后队列无界，数据库停顿期间内存跟着速率长；由「速率 × 可等待的停顿」兜住
 const METRIC_WRITE_QUEUE: usize = 8192;
 
 /// 读之前等写者确认的上限。
@@ -241,7 +257,8 @@ const METRIC_WRITE_QUEUE: usize = 8192;
 /// 确认是一次队列内的屏障，正常在一批之内（几十毫秒）就回来；超过这个界说明
 /// 写者不在了，读继续走——读到的是还没落库的观测缺席，那是对的答案，而不是
 /// 一次永远不返回的读。
-// cap: bound — 屏障正常在毫秒级返回，这个界只用来结束一个已经不存在的写者
+// cap: fixed — 屏障正常在毫秒级返回，这个界只用来结束一个已经不存在的写者
+// keep: 删掉后一个已不存在的写者把屏障永远挂着；由「屏障正常毫秒级返回」兜住
 // wall: 等=写屏障放行（正常在毫秒级）/ 等不到=这个屏障按「写者已经不在了」结束，指标不会被当成已落库 / 续跑=能，下一拍重新攒批
 const METRIC_FLUSH_ACK_TIMEOUT_SECS: u64 = 5;
 
@@ -320,6 +337,7 @@ impl PostgresMetricsBackend {
         if queue.send(Command::Flush(ack)).await.is_err() {
             return Ok(());
         }
+        // roundtrip: 一次刷盘确认
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(METRIC_FLUSH_ACK_TIMEOUT_SECS),
             landed,
@@ -525,6 +543,20 @@ const HISTOGRAM_SUM_UPSERT_SQL: &str = r#"
                   updated_at = NOW()
 "#;
 
+/// 被按键读的标签键落成行：每个序列的标签集拆成 (key, value)。
+///
+/// `labels` 用与累加行同一条 `::jsonb::text`，两条 SQL 在同一个事务里跑，所以侧表
+/// 的 `labels` 与累加行的 `labels` 逐字相等，读者按 `(name, labels, key)` 联结即可。
+/// 序列的标签集是它的身份，写进去之后不会再改，所以冲突了就跳过（这张表不 UPDATE）。
+const METRIC_LABEL_INSERT_SQL: &str = r#"
+    INSERT INTO metric_labels (name, labels, key, value)
+    SELECT t.name, t.labels, e.key, e.value
+    FROM (SELECT DISTINCT x.name, x.labels::jsonb::text AS labels
+            FROM unnest($1::text[], $2::text[]) AS x(name, labels)) t,
+         LATERAL jsonb_each_text(t.labels::jsonb) e
+    ON CONFLICT (name, labels, key) DO NOTHING
+"#;
+
 /// Write a batch of observations in one transaction.
 ///
 /// One commit for the batch rather than one per observation is the whole point:
@@ -619,6 +651,38 @@ async fn write_batch(pool: &PgPool, batch: &[PendingWrite]) -> SFResult<()> {
             .map_err(|e| SFError::Database(e.to_string()))?;
     }
 
+    // 序列行的标签键同时落成侧表的行。三种累加表共用一份键空间：同一个
+    // (name, labels) 在 counter 与 histogram 上是同一条序列的两种投影，拆两次
+    // 也只是同几行；`DISTINCT` 与 `ON CONFLICT DO NOTHING` 让重复不付代价。
+    let mut label_names: Vec<String> = Vec::new();
+    let mut label_sets: Vec<String> = Vec::new();
+    let mut seen_labels: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    let mut keep_identity = |name: &str, label_set: &str| {
+        if seen_labels.insert((name.to_string(), label_set.to_string())) {
+            label_names.push(name.to_string());
+            label_sets.push(label_set.to_string());
+        }
+    };
+    for (name, label_set, _value) in &counters.rows {
+        keep_identity(name, label_set);
+    }
+    for (name, label_set, _bucket, _count) in &buckets.rows {
+        keep_identity(name, label_set);
+    }
+    for (name, label_set, _value) in &sums.rows {
+        keep_identity(name, label_set);
+    }
+    drop(keep_identity);
+    if !label_names.is_empty() {
+        sqlx::query(METRIC_LABEL_INSERT_SQL)
+            .bind(&label_names)
+            .bind(&label_sets)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
+    }
+
     tx.commit()
         .await
         .map_err(|e| SFError::Database(e.to_string()))?;
@@ -669,7 +733,7 @@ async fn run_metric_writer(pool: PgPool, mut rx: tokio::sync::mpsc::Receiver<Com
                     write_batch_logged(&pool, &batch).await;
                     batch.clear();
                 }
-                let _ = ack.send(());
+                cog_core::ignore_lost!(ack.send(()));
                 continue;
             }
         };
@@ -693,7 +757,7 @@ async fn run_metric_writer(pool: PgPool, mut rx: tokio::sync::mpsc::Receiver<Com
         batch.clear();
 
         if let Some(ack) = barrier {
-            let _ = ack.send(());
+            cog_core::ignore_lost!(ack.send(()));
         }
     }
 }

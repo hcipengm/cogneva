@@ -1,3 +1,4 @@
+// census-keep: shapes=spaces — 界面取数的默认页大小：与服务端分页契约一致，删掉会一次拉全部行；由服务端的 LIMIT 契约兜住
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   getProjectBoard,

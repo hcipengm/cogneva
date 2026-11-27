@@ -16,6 +16,7 @@ use cog_core::{CandidateOutcome, ChangeCandidate, ChangeCandidateStore};
 
 fn candidate(id: &str) -> ChangeCandidate {
     ChangeCandidate {
+        unit_of_work: None,
         artifact_id: id.to_string(),
         kind: "code_change".to_string(),
         description: "why this change".to_string(),
@@ -46,6 +47,7 @@ async fn a_recorded_candidate_leaves_no_json_file_beside_its_diff() {
         .with_candidates(store.clone());
     pipeline
         .write_change_record(&cog_reflection::types::EvolutionResult {
+            unit_of_work: None,
             kind: cog_reflection::types::EvolutionKind::CodeChange,
             artifact_id: "chg-1".to_string(),
             description: "why this change".to_string(),

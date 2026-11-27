@@ -195,7 +195,7 @@ fn search_params_of(text: &str) -> Vec<Binding> {
                 if let Some(end) = matching_brace(text, open, Dialect::JavaScript) {
                     names = top_level_keys(&text[open + 1..end], KeyWords::Any)
                         .map(|keys| keys.into_iter().collect())
-                        .unwrap_or_default();
+                        .unwrap_or(Default::default());
                 }
             }
         }

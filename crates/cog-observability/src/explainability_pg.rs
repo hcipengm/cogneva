@@ -226,7 +226,7 @@ fn row_to_record(row: sqlx::postgres::PgRow) -> ExplainabilityRecord {
         .try_get::<String, _>("data")
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let reasoning_chain = data
         .get("reasoning_chain")
         .and_then(|v| v.as_array())
@@ -235,12 +235,12 @@ fn row_to_record(row: sqlx::postgres::PgRow) -> ExplainabilityRecord {
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let metadata = data
         .get("metadata")
         .and_then(|v| v.as_object())
         .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
 
     ExplainabilityRecord {
         record_id: row.try_get("record_id").unwrap_or_default(),

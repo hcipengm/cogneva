@@ -27,7 +27,8 @@ use cog_core::Role;
 /// 缓存里等下一次被当成真的。
 /// 续跑：能。下一次请求重新走一遍完整的往返，没有中间状态要清理；本次拿到结论的那
 /// 一侧（例如已经拉到的新 JWKS）也不会因为超时而留在缓存里。
-// cap: bound — 一次身份提供方的往返；远短于令牌有效期，所以超时总发生在令牌过期之前
+// cap: fixed — 一次身份提供方的往返；远短于令牌有效期，所以超时总发生在令牌过期之前
+// keep: 删掉后身份提供方一次不应答会挂住登录；由「一次身份提供方往返」兜住
 // wall: wait=one IdP round trip; on-timeout=error, nothing cached; resume=yes, next call starts over
 const KEYCLOAK_REQUEST_TIMEOUT_SECS: u64 = 30;
 
@@ -122,7 +123,8 @@ impl JwksCache {
 ///
 /// 签名密钥的轮换以小时计，缓存一小时意味着最坏情况下一小时的旧 key 仍被信任；
 /// 更短则每次校验都要回源，把鉴权路径压到 Keycloak 上。
-// cap: bound — key 轮换以小时计；再短就每次校验回源、把鉴权压在 Keycloak 上
+// cap: fixed — key 轮换以小时计；再短就每次校验回源、把鉴权压在 Keycloak 上
+// keep: 删掉后每次校验都回源，把鉴权压在 Keycloak 上；由「key 轮换以小时计」兜住
 const DEFAULT_JWKS_TTL: Duration = Duration::from_secs(3600);
 
 impl Default for JwksCache {
@@ -357,7 +359,7 @@ impl KeycloakClient {
 
         if !response.is_success() {
             let status = response.status;
-            let text = response.text().unwrap_or_default();
+            let text = response.text().unwrap_or(Default::default());
             return Err(crate::error::AuthError::Internal(format!(
                 "Keycloak token exchange failed: HTTP {status}: {text}"
             )));
@@ -392,7 +394,7 @@ impl KeycloakClient {
 
         if !response.is_success() {
             let status = response.status;
-            let text = response.text().unwrap_or_default();
+            let text = response.text().unwrap_or(Default::default());
             return Err(crate::error::AuthError::Internal(format!(
                 "Keycloak introspection failed: HTTP {status}: {text}"
             )));
@@ -420,7 +422,7 @@ impl KeycloakClient {
 
         if !response.is_success() {
             let status = response.status;
-            let text = response.text().unwrap_or_default();
+            let text = response.text().unwrap_or(Default::default());
             return Err(crate::error::AuthError::Internal(format!(
                 "Keycloak userinfo failed: HTTP {status}: {text}"
             )));
@@ -555,7 +557,8 @@ struct CachedJwks {
     fetched_at: Instant,
 }
 
-// cap: bound — how long a fetched key set is reused; bounds how long a rotated-away key is still accepted
+// cap: fixed — how long a fetched key set is reused; bounds how long a rotated-away key is still accepted
+// keep: 删掉后 JWKS 永不刷新，轮换掉的钥匙一直被接受；由「缓存只复用五分钟」兜住
 const JWKS_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Keycloak OIDC authentication provider.
@@ -725,7 +728,7 @@ impl KeycloakAuthProvider {
 
         if !response.is_success() {
             let status = response.status;
-            let text = response.text().unwrap_or_default();
+            let text = response.text().unwrap_or(Default::default());
             return Err(AuthError::Internal(format!(
                 "Keycloak well-known config failed: HTTP {status}: {text}"
             )));
@@ -749,7 +752,7 @@ impl KeycloakAuthProvider {
 
         if !response.is_success() {
             let status = response.status;
-            let text = response.text().unwrap_or_default();
+            let text = response.text().unwrap_or(Default::default());
             return Err(AuthError::Internal(format!(
                 "Keycloak JWKS fetch failed: HTTP {status}: {text}"
             )));

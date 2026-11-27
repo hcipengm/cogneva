@@ -1705,7 +1705,7 @@ fn a_profile_leaf_nobody_reads_is_a_knob_the_deployment_cannot_turn() {
         let name = file
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let parsed: serde_yaml::Value = serde_yaml::from_str(
             &std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("{}: {e}", file.display())),
         )

@@ -38,7 +38,9 @@ async fn udp_heartbeat_end_to_end() {
     );
 
     cancel.trigger();
-    let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), client_handle).await;
+    cog_core::ignore_lost!(
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), client_handle).await
+    );
     server_handle.abort();
 }
 

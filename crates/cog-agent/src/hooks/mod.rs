@@ -31,5 +31,5 @@ pub use lifecycle::{
 pub use loader::{apply_runtime_overrides, load_and_apply, HookConfig};
 pub use rate_limit::TokenBucket;
 pub use tiered::TieredHookPublisher;
-pub use types::{DEFAULT_DEDUP_WINDOW, DEFAULT_HOOK_TIMEOUT};
+pub use types::DEFAULT_DEDUP_WINDOW;
 pub use wal_buffer::WalHookPublisher;

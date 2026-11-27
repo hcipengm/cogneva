@@ -6,10 +6,7 @@ use tokio::sync::broadcast;
 
 /// 主后端订阅失败后隔多久再订：5s。
 ///
-/// 与就绪队列、事件流同一个节拍：后端要么回来要么不回来，更快的重试只会在
-/// 集群已经不健康时成倍放大告警。
-// cap: bound — 与就绪队列、事件流同一个节拍：后端要么回来要么不回来，更快的重试只在集群已经不健康时成倍放大告警
-const SUBSCRIBE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+use cog_core::contract::subscribe_backoff::SUBSCRIBE_RETRY_BACKOFF;
 
 /// Consumes AgentEvents from multiple message backends with automatic fallback.
 /// Primary backend (e.g. Redis Streams) is polled continuously.
@@ -90,7 +87,7 @@ impl MultiBackendEventConsumer {
                                     if let Ok(event) =
                                         serde_json::from_slice::<AgentEvent>(&payload)
                                     {
-                                        let _ = event_tx.send(event);
+                                        cog_core::ignore_lost!(event_tx.send(event));
                                     }
                                     if let Err(e) = backend.ack(&channel, &group, &[id]).await {
                                         tracing::warn!(

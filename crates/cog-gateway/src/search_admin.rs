@@ -90,9 +90,10 @@ pub(crate) fn status_json(raw: Result<Option<String>, String>, from_llm: Vec<Val
     let (upstreams, configured, read_error) = match raw {
         Ok(Some(text)) => {
             let parsed = parse_upstreams(&text);
-            let declared = serde_json::from_str::<Vec<Value>>(&text)
-                .map(|list| list.len())
-                .unwrap_or(parsed.len());
+            let declared = match cog_core::logged_ok!(serde_json::from_str::<Vec<Value>>(&text)) {
+                Some(list) => list.len(),
+                None => parsed.len(),
+            };
             let entries = parsed
                 .iter()
                 .map(|u| {
@@ -217,7 +218,10 @@ pub(crate) async fn merged_pool_json(
         Ok(kube) => read_secret(&kube).await.ok().flatten(),
         Err(_) => None,
     };
-    let existing = existing.as_deref().map(parse_upstreams).unwrap_or_default();
+    let existing = existing
+        .as_deref()
+        .map(parse_upstreams)
+        .unwrap_or(Default::default());
 
     let merged = merge_with_existing(requested, &existing).map_err(|message| {
         (

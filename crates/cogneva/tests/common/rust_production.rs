@@ -371,7 +371,7 @@ fn production_numbered_impl(text: &str, keep_comments: bool) -> Vec<(usize, &str
     let mut skipping: Option<(i32, bool)> = None;
     let mut waiting = 0usize;
     for (index, line) in lines.iter().copied().enumerate() {
-        let shape = shapes.get(index).copied().unwrap_or_default();
+        let shape = shapes.get(index).copied().unwrap_or(Default::default());
         let trimmed = line.trim_start();
         if skipping.is_none() {
             if opens_test_module(line) {
@@ -479,13 +479,13 @@ mod tests {
             .downcast_ref::<String>()
             .cloned()
             .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         assert!(
             message.contains(&MIN_PRODUCTION_FILES.to_string()),
             "拒读的理由要说出下限是多少，读到的是：{message}"
         );
 
-        std::fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     /// 一个文件在树里只有一种写法：`./` 前缀与 Windows 分隔符都折掉。
@@ -529,7 +529,7 @@ mod tests {
         let refused = std::panic::catch_unwind(|| production_sources(&root));
         assert!(refused.is_err(), "同一棵树走判真树的那条入口，下限必须拒读");
 
-        std::fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     /// 工作树的几份普查之间只差那几个减法：夹具、示例、构建脚本各留一份。
@@ -594,7 +594,7 @@ mod tests {
             "第三种人口的下限同样在真树上生效，假树照读"
         );
 
-        std::fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     /// 构建脚本算生产源码：它在编译期跑，读的是同一份环境变量。今天四个 crate 有
@@ -618,7 +618,7 @@ mod tests {
             "src/ 与 build.rs 都是这个 crate 的生产源码"
         );
 
-        std::fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     /// 文件中间的一个 `#[cfg(test)]` 项不许把后面的产出整段截掉。
@@ -665,7 +665,7 @@ mod tests {
         let yaml = "\
             value: \"1\"
         ";
-        let _ = yaml;
+        cog_core::ignore_lost!(yaml);
     }
 }
 

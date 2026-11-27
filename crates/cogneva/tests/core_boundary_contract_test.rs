@@ -253,7 +253,7 @@ fn declared_names(code: &str) -> BTreeSet<String> {
         if let Some(body) = rest.strip_prefix("use ") {
             for part in body.trim_end_matches(';').split([',', '{', '}']) {
                 let part = part.trim();
-                let part = part.rsplit("::").next().unwrap_or_default();
+                let part = part.rsplit("::").next().unwrap_or(Default::default());
                 let name = part.split(" as ").last().unwrap_or_default().trim();
                 if is_ident(name) {
                     out.insert(name.to_owned());
@@ -572,7 +572,7 @@ fn lonely_mechanisms(
     let mut shared: BTreeMap<String, BTreeSet<String>> = code
         .keys()
         .map(|name| {
-            let own = reached_by.get(name).cloned().unwrap_or_default();
+            let own = reached_by.get(name).cloned().unwrap_or(Default::default());
             (name.clone(), own)
         })
         .collect();
@@ -813,7 +813,7 @@ fn the_judgement_counts_reach_and_not_names() {
                     .iter()
                     .find(|(module, _)| module == name)
                     .map(|(_, crates)| crates.iter().map(|c| (*c).to_owned()).collect())
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 (name.clone(), crates)
             })
             .collect::<BTreeMap<String, BTreeSet<String>>>()

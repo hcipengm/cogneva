@@ -10,11 +10,13 @@ type ServerHandle = tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error
 /// 策略这一段要重试：3s 一拍、最多 10 拍（约 30s）。拍长与被重启的那一端
 /// 同步起停的时长同量级，更短只是空转，更长则属主设的 local/ask 会更久地
 /// 停在默认的 auto 上。
-// cap: bound — 策略恢复的轮询间隔，界的是「策略改动多久能被插件看见」
+// cap: fixed — 策略恢复的轮询间隔，界的是「策略改动多久能被插件看见」
+// keep: 删掉后策略改动多久被插件看见没有答案；由「界的是策略改动多久能被看见」兜住
 const POLICY_RESTORE_CADENCE: std::time::Duration = std::time::Duration::from_secs(3);
 /// 重试上限拍数。退避到最后仍读不到就报「没恢复」，不无限等——留着的默认
 /// 策略是 auto，无限等等于永远不报。
-// cap: bound — 恢复重试拍数上限；退避到此仍读不到就报没恢复，不无限等
+// cap: fixed — 恢复重试拍数上限；退避到此仍读不到就报没恢复，不无限等
+// keep: 删掉后恢复重试无限等，插件永远停在没恢复；由「退避到此仍读不到就报没恢复」兜住
 const POLICY_RESTORE_ATTEMPTS: u32 = 10;
 
 /// Gateway plugin that self-assembles [`crate::GatewayState`] and drives the HTTP server lifecycle.
@@ -104,7 +106,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         // 界面上的这一轮明确回答「还没接上」，而不是由网关自己另跑一条循环。
         let conversation: crate::chat::ConversationHandle = ctx
             .consume::<crate::chat::ConversationSlot>()
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let agent_messages: crate::AgentMessageHandle =
             ctx.consume_service::<dyn cog_core::AgentMessageStore>();
         let datasets: Option<Arc<dyn cog_core::DatasetStore>> =
@@ -232,8 +234,8 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         // The per-row token ledger, published by the same plugin as the rolled
         // read face above. Same reason it is consumed rather than built: the
         // gateway asks "what did this task spend", not "how do rows land".
-        let llm_call_events: Option<Arc<dyn cog_core::LlmCallEvents>> =
-            ctx.consume_service::<dyn cog_core::LlmCallEvents>();
+        let llm_call_events: Option<Arc<dyn cog_core::EventStore>> =
+            ctx.consume_service::<dyn cog_core::EventStore>();
         let llm_usage: Option<Arc<dyn cog_core::LlmUsageLedger>> =
             ctx.consume_service::<dyn cog_core::LlmUsageLedger>();
 
@@ -253,6 +255,8 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             .unwrap_or_else(|| tokio::sync::broadcast::channel(16).0);
 
         // ── Build GatewayState ──
+        let security_keys: Option<Arc<dyn cog_core::SecurityKeys>> =
+            ctx.consume_service::<dyn cog_core::SecurityKeys>();
         let gateway_state = crate::state_builder::build_gateway_state(
             config,
             &event_tx,
@@ -319,6 +323,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             // 这里只借读面：属主要在同一个界面里看见语料判成了什么、哪几条
             // 真的拦下过东西，而那几个数除了这条路由没有第二个出口。
             &ctx.consume_service::<dyn cog_core::PrincipleLedgerStore>(),
+            &security_keys,
             // The change account is published by the same storage plugin and
             // written by the evolution loop's resident writer. This side only
             // borrows the read face: how much the corpus asks for, how much of
@@ -327,7 +332,9 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             &ctx.consume_service::<dyn cog_core::ChangeLedgerStore>(),
             // 意图进门那一条事件的写者：与变更账同一处取，缺席时写意图那一步显式报
             // 「没有收件台」。
-            &ctx.consume_service::<dyn cog_core::IntentEvents>(),
+            &ctx.consume_service::<dyn cog_core::EventStore>(),
+            &ctx.consume_service::<dyn cog_core::EventStore>(),
+            &ctx.consume_service::<dyn cog_core::EventStore>(),
             &key_value,
             &chat_turns,
             conversation,
@@ -409,7 +416,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         let handle = tokio::spawn(async move {
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
-                    let _ = shutdown_rx.await;
+                    cog_core::ignore_lost!(shutdown_rx.await);
                     warn!("Shutdown signal received, stopping server...");
                 })
                 .await
@@ -434,7 +441,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             let internal_handle = tokio::spawn(async move {
                 axum::serve(internal_listener, internal_app)
                     .with_graceful_shutdown(async move {
-                        let _ = internal_shutdown_rx.await;
+                        cog_core::ignore_lost!(internal_shutdown_rx.await);
                         warn!("Shutdown signal received, stopping internal server...");
                     })
                     .await
@@ -459,7 +466,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
                     let forwarder_stop = ctx
                         .consume::<cog_core::ShutdownSignal>()
                         .map(|s| (*s).clone())
-                        .unwrap_or_default();
+                        .unwrap_or(Default::default());
                     crate::hook_forwarder::HookToWsForwarder::spawn(
                         hook_engine.clone(),
                         (*event_tx).clone(),
@@ -502,7 +509,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
 
     async fn shutdown(&self) -> cog_core::SFResult<()> {
         for tx in self.shutdown_tx.lock().await.drain(..) {
-            let _ = tx.send(());
+            cog_core::ignore_lost!(tx.send(()));
         }
         for handle in self.server_handle.lock().await.drain(..) {
             if let Err(e) = handle.await {

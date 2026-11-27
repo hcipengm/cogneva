@@ -68,7 +68,7 @@ fn violations(root: &Path) -> Vec<String> {
         if dialect != "postgres" {
             continue;
         }
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let text = std::fs::read_to_string(&path).unwrap_or(Default::default());
         let name = path
             .file_name()
             .and_then(|n| n.to_str())

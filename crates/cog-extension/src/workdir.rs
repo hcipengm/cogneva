@@ -61,13 +61,17 @@ pub const WORKTREE_FETCH_LOOP: &str = "extension_worktree_fetch";
 /// Loop name of the claim-footprint walk over this executor's own volumes.
 pub const VOLUME_FOOTPRINT_LOOP: &str = "extension_volume_footprint";
 
-// cap: bound — seed; applies only until two trees exist to give an arrival interval
+// cap: fixed — seed; applies only until two trees exist to give an arrival interval
+// keep: 删掉后在两棵树出现之前没有到达间隔可算，空闲树没有可用的保留期，只能立刻回收刚用完的树；由「种子只用到有实测为止」兜住
 const DEFAULT_TTL_SECS: u64 = 21600;
-// cap: bound — seed; applies only until a reclamation pass has been timed, then the interval follows the pass
+// cap: fixed — seed; applies only until a reclamation pass has been timed, then the interval follows the pass
+// keep: 删掉后第一次回收还没有耗时读数，回收循环没有可用的间隔；由「种子只用到有一次实测为止」兜住
 const DEFAULT_GC_INTERVAL_SECS: u64 = 600;
-// cap: bound — seed; applies only until the first observed move of main, then the fetch period follows that
+// cap: fixed — seed; applies only until the first observed move of main, then the fetch period follows that
+// keep: 删掉后还没有见过 main 移动时，取回循环没有可用的周期；由「种子只用到第一次实测为止」兜住
 const DEFAULT_FETCH_INTERVAL_SECS: u64 = 300;
-// cap: bound — seed when the deployment names none; the volume's own reading replaces it as soon as one tree exists
+// cap: fixed — seed when the deployment names none; the volume's own reading replaces it as soon as one tree exists
+// keep: 删掉后在还没有容量读数时没有并发树数可用，路一多就把卷写满；由「卷自己的读数一有就替换它」兜住
 const DEFAULT_MAX_WORKSPACES: usize = 8;
 
 /// Trees kept cut and ready under `workspaces/.warm`, so a new task's first
@@ -82,7 +86,8 @@ const DEFAULT_MAX_WORKSPACES: usize = 8;
 /// is only worth holding
 /// until the next arrival: arrivals measured ~1.1 a minute on this host, and
 /// the refill runs off the request path.
-// cap: bound — seed; applies until an arrival rate and a checkout cost have both been measured
+// cap: fixed — seed; applies until an arrival rate and a checkout cost have both been measured
+// keep: 删掉后在两项实测都还没有时，新会话的第一次调用没有树可接；由「种子只用到两项实测都有为止」兜住
 const DEFAULT_WARM_TREES: usize = 2;
 
 /// Where warm trees wait between arrivals. Dot-prefixed because every listing
@@ -113,7 +118,8 @@ const MAX_TASK_ID_LEN: usize = cog_core::MAX_CHECKOUT_NAME_CHARS;
 /// The shortest time between two reclamation passes, and the pace the loop
 /// wakes at whatever the derived interval turns out to be -- waking is cheap,
 /// a pass is not.
-// cap: bound — 两次回收之间的最短间隔，也是循环无条件醒来的节奏
+// cap: fixed — 两次回收之间的最短间隔，也是循环无条件醒来的节奏
+// keep: 删掉后算出的间隔可以趋近于零，回收循环在卷空时也空转；由「唤醒便宜、一次 pass 不便宜」兜住
 const MIN_GC_INTERVAL_SECS: u64 = 30;
 
 /// How many times a pass's own duration the interval must cover, so maintenance
@@ -121,7 +127,8 @@ const MIN_GC_INTERVAL_SECS: u64 = 30;
 /// period: the pass gets slower as the volume fills, and the interval has to
 /// follow it or the upkeep becomes the load. Shared by reclamation and the
 /// build-cache walk -- one control law, one number.
-// cap: bound — 间隔要覆盖一次回收自身耗时的这么多倍，维护至多占 1/20
+// cap: fixed — 间隔要覆盖一次回收自身耗时的这么多倍，维护至多占 1/20
+// keep: 删掉后间隔只覆盖一次回收自身耗时，维护会占满进程的全部时间；由「维护至多占 1/20」兜住
 const MAINTENANCE_OVERHEAD_MULTIPLE: u64 = 20;
 
 /// The published name of the interval the reclamation loop is keeping.
@@ -137,7 +144,8 @@ const GC_INTERVAL_EVALUATIONS_METRIC: &str = "sandbox_workspace_gc_interval_eval
 /// cost of the git round trip stops being paid for by anything. A floor rather
 /// than a period: the period itself follows how often `main` is observed to
 /// move.
-// cap: bound — 比这更密就是在向镜像要同一个 commit，比一次推送还快
+// cap: fixed — 比这更密就是在向镜像要同一个 commit，比一次推送还快
+// keep: 删掉后循环可以在同一个 commit 上反复问镜像，比一次推送到达还快；由「一次推送到达的节奏」兜住
 const MIN_FETCH_INTERVAL_SECS: u64 = 30;
 
 /// The published name of the wait the fetch loop is currently keeping, and the
@@ -202,17 +210,20 @@ const WARM_TREES_SOURCES: [&str; 2] = ["seed", "measured"];
 /// The window arrival samples are kept over. Longer than any working day, so a
 /// burst is not averaged away by the quiet hours around it.
 // cap: fixed — 7 天：比任何工作日都长，突发才不会被两旁的安静时段平均掉
+// keep: 删掉后到达样本无限留着，上个月的突发一直在定今天的树数；由「比任何工作日都长的一周」兜住
 const ARRIVAL_WINDOW_SECS: i64 = 7 * 24 * 3600;
 
 /// How many arrival timestamps to keep. A cap rather than a promise: the window
 /// above already bounds the queue for realistic rates, and this bounds it for
 /// a pathological one.
-// cap: bound — 1024 是给病理速率的兜底（正常速率由上面的窗口兜）：内存代价随它走
+// cap: fixed — 1024 是给病理速率的兜底（正常速率由上面的窗口兜）：内存代价随它走
+// keep: 删掉后病理速率下这份时间戳队列无界地长，内存跟着攻击性的到达走；由「正常速率由窗口兜、病理速率由它兜」兜住
 const MAX_ARRIVAL_SAMPLES: usize = 1024;
 
 /// How many checkout durations to keep for the median. Small on purpose: the
 /// cost follows the repository's size, which changes over days, not seconds.
 // cap: fixed — 32 个样本取中位数就够：成本跟着仓库大小走，那是按天变的，不是按秒
+// keep: 删掉后每次 checkout 都留一个样本，成本中位数被历史全量拖着走；由「成本按天变、32 个样本够」兜住
 const CHECKOUT_SAMPLES: usize = 32;
 
 /// How many ready trees are worth holding: Little's law over the two costs the
@@ -334,7 +345,8 @@ fn ttl_from(capacity: usize, trees: usize, span_secs: u64) -> Option<Duration> {
 
 /// The shortest an idle tree is held, whatever the arithmetic says: below this
 /// the executor rebuilds trees it has just finished with.
-// cap: bound — 空闲树最少留一小时，再短执行器就在重建刚用完的树
+// cap: fixed — 空闲树最少留一小时，再短执行器就在重建刚用完的树
+// keep: 删掉后算出来的保留期可以短到几秒，执行器在重建刚用完的树；由「空闲树至少留一小时」兜住
 const MIN_TTL_SECS: u64 = 3600;
 
 /// Which of the three inputs set the period in force.
@@ -1357,13 +1369,13 @@ impl WorkdirRouter {
             .run_git(&["bundle", "create", &path_text, &refname], Some(&tree))
             .await;
         if let Err(e) = packed {
-            let _ = tokio::fs::remove_file(&path).await;
+            cog_core::ignore_lost!(tokio::fs::remove_file(&path).await);
             return Err(CarryError::Failed(e.to_string()));
         }
         let bytes = tokio::fs::read(&path).await.map_err(|e| {
             CarryError::Failed(format!("the bundle just written cannot be read: {e}"))
         });
-        let _ = tokio::fs::remove_file(&path).await;
+        cog_core::ignore_lost!(tokio::fs::remove_file(&path).await);
         let bytes = bytes?;
         self.note_carry(started.elapsed().as_millis() as u64, bytes.len() as u64);
         info!(
@@ -1403,7 +1415,7 @@ impl WorkdirRouter {
         let fetched = self
             .run_git(&["fetch", &path_text, &spec], Some(&tree))
             .await;
-        let _ = tokio::fs::remove_file(&path).await;
+        cog_core::ignore_lost!(tokio::fs::remove_file(&path).await);
         fetched.map_err(|e| CarryError::Failed(e.to_string()))?;
         let plan = checkpoints::restore(&tree, &key)
             .await
@@ -1639,7 +1651,7 @@ impl WorkdirRouter {
             );
             return false;
         }
-        let _ = tokio::fs::remove_file(Self::ready_marker(&slot)).await;
+        cog_core::ignore_lost!(tokio::fs::remove_file(Self::ready_marker(&slot)).await);
         self.register_safe_directory(path).await;
         // The slot was cut detached and the pool is filled ahead of demand, so
         // two things have to happen at hand-out: the tree gets its owner's
@@ -1883,8 +1895,8 @@ impl WorkdirRouter {
             .map_err(|e| {
                 SFError::IO(format!("create meta dir {}: {e}", self.meta_dir.display()))
             })?;
-        tokio::fs::create_dir_all(&self.cfg.target_dir).await.ok();
-        let _ = self.git_bare(&["worktree", "prune"]).await;
+        cog_core::ignore_lost!(tokio::fs::create_dir_all(&self.cfg.target_dir).await);
+        cog_core::ignore_lost!(self.git_bare(&["worktree", "prune"]).await);
         // `prune` leaves locked registrations alone, so one whose tree is
         // already gone survives every boot: the cap counts it, the volume does
         // not hold it, and no reclaim can ever clear it. Unlock the ones the
@@ -1901,7 +1913,7 @@ impl WorkdirRouter {
             }
         }
         if dropped {
-            let _ = self.git_bare(&["worktree", "prune"]).await;
+            cog_core::ignore_lost!(self.git_bare(&["worktree", "prune"]).await);
         }
 
         let trees = self.list_task_trees().await;
@@ -2058,7 +2070,7 @@ impl WorkdirRouter {
             }
         }
         self.enforce_cap(0).await;
-        let _ = self.git_bare(&["worktree", "prune"]).await;
+        cog_core::ignore_lost!(self.git_bare(&["worktree", "prune"]).await);
         self.prune_orphan_metas(&self.list_task_trees().await).await;
         self.refresh_count_metric().await;
         Ok(reclaimed)
@@ -2631,6 +2643,7 @@ impl WorkdirRouter {
     // -- internals -------------------------------------------------------------
 
     fn meta_path(&self, task_id: &str) -> PathBuf {
+        // state-file: cache — 这一份是工作树的可重算代价（最近使用时刻与大小），丢了从树本身重扫，不是平台事实的第二份正本
         self.meta_dir.join(format!("{task_id}.json"))
     }
 
@@ -2677,7 +2690,7 @@ impl WorkdirRouter {
     }
 
     fn remove_meta(&self, task_id: &str) {
-        let _ = std::fs::remove_file(self.meta_path(task_id));
+        cog_core::ignore_lost!(std::fs::remove_file(self.meta_path(task_id)));
     }
 
     async fn touch(&self, task_id: &str) {
@@ -2703,7 +2716,7 @@ impl WorkdirRouter {
                 continue;
             };
             if !live.contains(id) {
-                let _ = tokio::fs::remove_file(entry.path()).await;
+                cog_core::ignore_lost!(tokio::fs::remove_file(entry.path()).await);
             }
         }
     }
@@ -2742,10 +2755,10 @@ impl WorkdirRouter {
             .git_bare(&["worktree", "remove", "--force", path.to_str().unwrap_or("")])
             .await;
         if tokio::fs::try_exists(path).await.unwrap_or(false) {
-            let _ = tokio::fs::remove_dir_all(path).await;
+            cog_core::ignore_lost!(tokio::fs::remove_dir_all(path).await);
         }
         self.forget_safe_directory(path).await;
-        let _ = self.git_bare(&["worktree", "prune"]).await;
+        cog_core::ignore_lost!(self.git_bare(&["worktree", "prune"]).await);
     }
 
     /// Drop the `locked` marker a killed `worktree add` left on the tree at

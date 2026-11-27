@@ -33,6 +33,23 @@ pub struct GeneratorActor {
     context_builder: Option<Arc<dyn cog_core::TaskContextBuilder>>,
 }
 
+/// 把计划交出来的定义摆到生成侧的上下文里：完成标准不只是判者的输入。
+///
+/// 计划的 `definition` 说的是「这一类是什么、怎样算做完」。判者已经按它判；生成侧
+/// 若只在 `plan` 那一格里顺带看见它，执行就仍是在照每片输入填。这里把它提成上下文
+/// 的一等格，模型的答案契约因此有一条明确的完成标准；空定义不摆（不是一条标准）。
+fn state_the_completion_standard(ctx: &mut serde_json::Value, plan: &serde_json::Value) {
+    let Some(definition) = plan
+        .get("definition")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|definition| !definition.is_empty())
+    else {
+        return;
+    };
+    ctx["completion_standard"] = serde_json::json!(definition);
+}
+
 impl GeneratorActor {
     pub fn new(agent: Arc<dyn Agent>) -> Self {
         Self {
@@ -158,7 +175,7 @@ impl GeneratorActor {
         // Inject reference implementations if knowledge backend is wired.
         if let Some(ref k) = self.knowledge {
             let task_type = format!("{:?}", task.task_type);
-            let input_summary = serde_json::to_string(&task.input).unwrap_or_default();
+            let input_summary = serde_json::to_string(&task.input).unwrap_or(Default::default());
             match k
                 .retrieve_similar_implementations(&task_type, &input_summary, 3)
                 .await
@@ -173,6 +190,8 @@ impl GeneratorActor {
             }
         }
 
+        // 定义的来源是计划，不是任务输入：同一份计划下的每一片都按同一条完成标准做。
+        state_the_completion_standard(&mut ctx, plan);
         let input = crate::actors::actor_input(task, contract, ctx);
         // 自进化的一轮要在收尾时问工作树「它改了什么」，问不到就得让这一轮
         // 重来一次；重来的请求是这一次的请求加一句，所以留一份。别的角色不留。
@@ -232,7 +251,7 @@ impl GeneratorActor {
                 )
             }
         };
-        let output_str = serde_json::to_string_pretty(&output).unwrap_or_default();
+        let output_str = serde_json::to_string_pretty(&output).unwrap_or(Default::default());
         if let Some(revised) = crate::actors::maybe_self_review(
             self.agent.as_ref(),
             &self.self_review,
@@ -560,7 +579,7 @@ fn principles_block(input: &serde_json::Value) -> Option<serde_json::Value> {
                 })
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     if rows.is_empty() {
         return None;
     }
@@ -604,6 +623,25 @@ fn change_generation_contract() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 计划的定义进生成侧的上下文，作为一条明确写成 `completion_standard` 的完成标准。
+    #[test]
+    fn the_plan_definition_becomes_the_generation_standard() {
+        let mut ctx = serde_json::json!({"goal": "g"});
+        state_the_completion_standard(
+            &mut ctx,
+            &serde_json::json!({"definition": "  做完＝每一片都说得出终态  "}),
+        );
+        assert_eq!(
+            ctx["completion_standard"],
+            serde_json::json!("做完＝每一片都说得出终态"),
+            "定义没有被摆成生成侧的完成标准"
+        );
+        // 没有定义（或者只有空白）时不摆一格：空标准会把「没写」读成「随便」。
+        let mut bare = serde_json::json!({});
+        state_the_completion_standard(&mut bare, &serde_json::json!({"definition": "   "}));
+        assert!(bare.get("completion_standard").is_none());
+    }
 
     /// The stable contract carries the plug, not the rule book.
     ///

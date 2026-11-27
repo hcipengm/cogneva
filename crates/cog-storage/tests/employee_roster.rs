@@ -82,14 +82,13 @@ async fn two_employees_hold_different_numbers() {
     assert_ne!(na, nb, "两个员工共用一个工号");
 }
 
-/// 座位行照建、号不发：工号发给一个人，不发给一把椅子。
+/// 座位不进名册：工号发给一个人，不发给一把椅子。
 ///
-/// 座位随任务生灭，每接一件活注册一次。发号的话名册行数会长到任务数，「员工」
-/// 这个读数就不再是编制。座位行必须照建——派工要往上面写人；号那一格空着，
-/// 名册上「有号的行数」才正好等于人数。
+/// 座位随任务生灭，每接一件活注册一次。进名册的话名册行数会长到任务数，「员工」
+/// 这个读数就不再是编制。谁坐在上面由任务行回答，名册不建这一行。
 #[tokio::test]
 #[ignore = "needs a throwaway Redis: set COGNEVA_TEST_REDIS_URL"]
-async fn a_seat_gets_a_row_but_no_number() {
+async fn a_seat_does_not_enter_the_roster() {
     let reg = registry().await;
     let seat = cog_core::agent_id_for(&format!("{PROBE}:seat-task"), cog_core::roles::GENERATOR);
     let row = AgentRegistration::new(
@@ -102,12 +101,7 @@ async fn a_seat_gets_a_row_but_no_number() {
     );
     reg.register(&row).await.unwrap();
 
-    let seat_row = reg
-        .employee(&seat)
-        .await
-        .unwrap()
-        .expect("座位行被省掉了：派工没有地方写人");
-    assert_eq!(seat_row.number, None, "一把椅子领了工号");
+    assert!(reg.employee(&seat).await.unwrap().is_none(), "座位进了名册");
 
     // 座位不占号：同一个人照常领号，号也不因为座位注册过而跳一格。
     let person = registration("seat-neighbour");
@@ -163,4 +157,41 @@ async fn the_roster_lists_a_retired_person() {
         .expect("退役的人不在名册上");
     assert!(!found.is_active());
     assert!(found.number.is_some());
+}
+
+/// 先发号、再拿由它推出的 id 去注册：注册只认这个号，不再发第二个。
+///
+/// 「先起一个随机 id、之后再补号」是让一个人有两个名字的来路——名册上 id 与
+/// 工号各说一个，读面迟早要按入口分叉。这条用例走真的 Lua：内存在 Rust 里
+/// 模拟的那一步证明不了脚本。
+#[tokio::test]
+#[ignore = "needs a throwaway Redis: set COGNEVA_TEST_REDIS_URL"]
+async fn a_minted_id_keeps_the_number_it_was_issued() {
+    let reg = registry().await;
+    let id = reg.mint_employee_id().await.expect("发号");
+    let number = cog_core::employee_number_of(&id).expect("id 由工号推出");
+    assert_eq!(
+        id,
+        cog_core::employee_identity(number),
+        "id 与工号是同一个字符串"
+    );
+
+    reg.register(&AgentRegistration::new(
+        id.clone(),
+        "probe-host",
+        "127.0.0.1",
+        "probe",
+        "probe",
+        ResourceInfo::default(),
+    ))
+    .await
+    .unwrap();
+
+    let row = reg
+        .employee(&id)
+        .await
+        .unwrap()
+        .expect("注册之后名册上有一行");
+    assert_eq!(row.number, Some(number), "注册又给这个人发了一次号");
+    assert_eq!(row.agent_id, id, "名册行的 id 就是发出去的那个");
 }

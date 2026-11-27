@@ -111,7 +111,7 @@ async fn every_declared_prompt_is_the_text_the_code_falls_back_to() {
                 .expect("agent:default declares no instruction");
             let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
             for path in production_sources(root) {
-                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let text = std::fs::read_to_string(&path).unwrap_or(Default::default());
                 assert!(
                     !text.contains(opening),
                     "{} carries a second copy of the agent base instruction; \

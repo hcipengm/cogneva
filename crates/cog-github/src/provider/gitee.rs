@@ -76,9 +76,9 @@ impl GiteeProvider {
         let status = resp.status;
         let text = String::from_utf8_lossy(&resp.body).into_owned();
         if !(200..300).contains(&status) {
-            let snippet: String = text.chars().take(200).collect();
+            // 错误路径默认无损：上游说了什么就带什么，整段交给调用方/操作员。
             return Err(CogGitHubError::Provider(format!(
-                "gitee api returned HTTP {status}: {snippet}"
+                "gitee api returned HTTP {status}: {text}"
             )));
         }
         // 一段空正文是「这条接口没有东西要读」（合并、评论这类写接口），读成
@@ -176,7 +176,7 @@ fn parse_issue(v: &serde_json::Value) -> PlatformIssue {
                 .filter_map(|l| l["name"].as_str().map(String::from))
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     PlatformIssue {
         number: v["id"].as_u64().unwrap_or_default(),
         title: v["title"].as_str().unwrap_or_default().to_string(),
@@ -213,6 +213,7 @@ fn parse_time(v: &serde_json::Value) -> chrono::DateTime<chrono::Utc> {
 /// Gitee v5 的列表端点都认这个上限。它不只是「一页要多大」，还是**问完了没有**
 /// 的判据本身：一页正好这么多条，就说明后面可能还有，得再问一页。
 // cap: fixed — Gitee v5 列表端点的 per_page 上限：接口一次最多回 100 条，不是我们挑的数
+// keep: 删掉后回到「Gitee v5 列表端点的 per_page 上限：接口一次最多回 100 条，不是我们挑的数」所描述的情形；由这条约定兜住
 const PER_PAGE: usize = 100;
 
 /// 列「还开着的那一批」用的三个查询参数。

@@ -601,7 +601,7 @@ impl BaselinePorter {
             return false;
         };
 
-        let patch = self.change_patch(&change.commit).await.unwrap_or_default();
+        let patch = cog_core::logged_default!(self.change_patch(&change.commit).await);
         let intent = self.change_intent(change).await;
         let task_id = format!(
             "port-absorb-{}-{}",
@@ -943,7 +943,7 @@ impl BaselinePorter {
             change_id = %change.change_id,
             "port failed after 3 rounds; rewinding and reflowing as rework"
         );
-        let _ = self.git(&["reset", "--hard", &prev_head]).await;
+        cog_core::ignore_lost!(self.git(&["reset", "--hard", &prev_head]).await);
         Ok(PortOutcome::NeedsRework {
             reason: format!("port to {new_tag} failed after 3 rounds: {feedback}"),
         })
@@ -991,7 +991,7 @@ impl BaselinePorter {
                 }
             }
         }
-        let _ = self.git(&["cherry-pick", "--abort"]).await;
+        cog_core::ignore_lost!(self.git(&["cherry-pick", "--abort"]).await);
         Ok(Err(evidence))
     }
 
@@ -1008,7 +1008,7 @@ impl BaselinePorter {
             return Ok(Err("orchestrator not configured".into()));
         };
 
-        let patch = self.change_patch(&change.commit).await.unwrap_or_default();
+        let patch = cog_core::logged_default!(self.change_patch(&change.commit).await);
         let intent = self.change_intent(change).await;
         let task_id = format!(
             "port-resolve-{}-{}-r{}",
@@ -1316,7 +1316,7 @@ impl BaselinePorter {
         let msg = self
             .git(&["log", "-1", "--format=%s%n%n%b", &change.commit])
             .await
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         format!(
             "{msg}\n[promotion] change_id={} level={} eval={}",
             change.change_id,
@@ -1531,7 +1531,8 @@ pub const BASELINE_PORT_LOOP: &str = "baseline_port";
 /// The floor under the configured poll interval: a value below this is clamped
 /// up, so a reader measuring its cadence against `poll_interval_secs` alone
 /// measures a number the loop does not keep whenever this floor binds.
-// cap: bound — 这条地板生效时循环并不按 poll_interval_secs 走，拿它量节拍会量错
+// cap: fixed — 这条地板生效时循环并不按 poll_interval_secs 走，拿它量节拍会量错
+// keep: 删掉后回到「这条地板生效时循环并不按 poll_interval_secs 走，拿它量节拍会量错」所描述的情形；由这条约定兜住
 pub const MIN_POLL_INTERVAL_SECS: u64 = 60;
 
 /// 基线移植触发循环。第一轮立即执行（启动即对齐新基线，不等一个
@@ -2695,7 +2696,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         shutdown.trigger();
-        let _ = handle.await;
+        cog_core::ignore_lost!(handle.await);
 
         assert_eq!(
             value,

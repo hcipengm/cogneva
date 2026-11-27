@@ -270,7 +270,7 @@ impl WalBackend for MemoryWalBackend {
         let records = sessions
             .get(session_id)
             .map(|v| v.iter().filter(|r| r.seq >= seq).cloned().collect())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         Ok(records)
     }
 
@@ -280,7 +280,10 @@ impl WalBackend for MemoryWalBackend {
         limit: usize,
     ) -> Result<Vec<WalRecord>, WalError> {
         let sessions = self.sessions.lock().unwrap();
-        let records = sessions.get(session_id).cloned().unwrap_or_default();
+        let records = sessions
+            .get(session_id)
+            .cloned()
+            .unwrap_or(Default::default());
         let start = records.len().saturating_sub(limit);
         Ok(records[start..].to_vec())
     }
@@ -322,7 +325,9 @@ impl WalBackend for MemoryWalBackend {
 /// oldest record still held. Raising this number keeps more history; lowering
 /// it trades history for memory. Neither choice removes the logs themselves;
 /// that is the retirement path, which is a separate change.
-// cap: bound — 界的是每个会话还留多少历史；调高留更多、调低拿内存换历史，两者都不动日志本身，那是退役路径的事
+// cap: fixed — 界的是每个会话还留多少历史；调高留更多、调低拿内存换历史，两者都不动日志本身，那是退役路径的事
+// keep: 删掉后每个会话留多少历史没有界，内存跟着会话的历史长；由「调高留更多、调低拿内存换历史」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 pub const WAL_MAX_ENTRIES_PER_SESSION: usize = 5_000;
 
 /// How long the sweep waits between passes over the store.
@@ -332,7 +337,8 @@ pub const WAL_MAX_ENTRIES_PER_SESSION: usize = 5_000;
 /// whose session ended while over the cap, and that population changes when
 /// sessions end rather than on any clock. What the period really buys is a
 /// bounded delay between a session ending and its log giving the memory back.
-// cap: bound — 清扫的对象是「已经结束却还超着界」的会话，那群人按会话结束变而不按时钟变；这个周期真正买到的是「会话结束到把内存还回去」的延迟有界
+// cap: fixed — 清扫的对象是「已经结束却还超着界」的会话，那群人按会话结束变而不按时钟变；这个周期真正买到的是「会话结束到把内存还回去」的延迟有界
+// keep: 删掉后会话结束后归还内存的延迟无界；由「周期买到的是这个延迟有界」兜住
 pub const WAL_CAP_SWEEP_PERIOD: Duration = Duration::from_secs(600);
 
 /// The name this loop registers under in the process's loop readings.
@@ -368,7 +374,8 @@ pub struct RetireOutcome {
 /// a second pass costs one sweep period and removes the race: a session that is
 /// really starting registers long before the second look, while an abandoned
 /// log has neither a registry record nor any growth in the meantime.
-// cap: bound — 第二次看只花一个清扫周期就消掉这个竞态：真要起来的会话早在第二看之前就注册了，被弃的日志既没有注册记录也没有增长
+// cap: fixed — 第二次看只花一个清扫周期就消掉这个竞态：真要起来的会话早在第二看之前就注册了，被弃的日志既没有注册记录也没有增长
+// keep: 删掉后一次清扫就把刚注册的会话日志当弃物，竞态吃掉正要起来的会话；由「第二看只花一个清扫周期」兜住
 pub const WAL_RETIRE_PASSES: usize = 2;
 
 /// Which of this pass's candidates may be removed, given the previous pass.

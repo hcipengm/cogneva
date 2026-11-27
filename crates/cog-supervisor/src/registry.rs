@@ -34,7 +34,8 @@ pub const DEFAULT_HEARTBEAT_TTL_SECONDS: u64 = cog_core::config::AGENT_REGISTRAT
 /// word, and a second spelling would leave one side unable to recognise the
 /// units the other one registered.
 pub const EXTERNAL_WORKER_ROLE: &str = cog_core::roles::EXTERNAL_WORKER;
-// cap: bound — heartbeat records kept per agent; a ring depth, not a measured history
+// cap: fixed — heartbeat records kept per agent; a ring depth, not a measured history
+// keep: 删掉后每个 agent 的心跳历史无界，ring 深度跟着运行时长走；由「a ring depth」兜住
 pub const HEARTBEAT_HISTORY_MAX: usize = 1000;
 
 /// The heartbeat vocabulary lives in `cog_core`: the supervisor fills the
@@ -77,7 +78,8 @@ pub struct CrewInfo {
 }
 
 impl CrewInfo {
-    // cap: bound — three crew-level retries before the failure is escalated; a policy cap
+    // cap: fixed — three crew-level retries before the failure is escalated; a policy cap
+    // keep: 删掉后班组失败被无限重试，升级永远不发生；由「三次之后升级」兜住
     pub const MAX_CREW_RETRIES: u32 = 3;
 
     pub fn new(crew_id: impl Into<String>) -> Self {

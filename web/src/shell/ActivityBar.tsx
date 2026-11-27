@@ -35,6 +35,7 @@ const ITEMS: { id: ActivityId; label: string; icon: IconName }[] = [
   { id: 'governance', label: '治理', icon: 'governance' },
   { id: 'observability', label: '观测', icon: 'observability' },
   { id: 'token', label: 'Token', icon: 'token' },
+  { id: 'keys', label: '密钥', icon: 'governance' },
   { id: 'resources', label: '资源', icon: 'resources' },
   { id: 'storage', label: '存储', icon: 'storage' },
   { id: 'hooks', label: '钩子', icon: 'governance' },

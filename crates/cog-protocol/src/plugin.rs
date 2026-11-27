@@ -7,7 +7,8 @@ use tracing::{info, warn};
 ///
 /// 关停时先让在飞的调用收尾；5s 之后还没停就交给进程退出——把停机拖到编排器
 /// 的宽限期用完，才是真正难看的结局。
-// cap: bound — 优雅退出上限；拖到编排器宽限期用完是更难看的结局
+// cap: fixed — 优雅退出上限；拖到编排器宽限期用完是更难看的结局
+// keep: 删掉后优雅退出可能拖到编排器宽限期用完，变成 KILL；由「编排器宽限期」兜住
 // wall: 等=gRPC server 把在飞的调用收完 / 等不到=直接交给进程退出，在那之前已经开始收尾的调用不做任何「已完成」的记录 / 续跑=不适用：这是关停，不是一条会被重来的活
 const GRPC_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -195,13 +196,14 @@ impl cog_core::SystemPlugin for ProtocolPlugin {
         if let Some(stop) = stop {
             // A closed receiver means the task already ended (binding failed,
             // say) -- nothing left to stop, which is not an error here.
-            let _ = stop.send(());
+            cog_core::ignore_lost!(stop.send(()));
             let serve = self
                 .grpc_serve
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take();
             if let Some(serve) = serve {
+                // wall: 等=gRPC 服务任务停下 / 等不到=进程照常退出，收尾交给下一次 serve / 续跑=能，下一次 serve 重建
                 match tokio::time::timeout(GRPC_SHUTDOWN_TIMEOUT, serve).await {
                     Ok(Ok(())) => info!("gRPC server stopped"),
                     Ok(Err(e)) => warn!("gRPC server task ended with error: {e}"),
@@ -236,7 +238,7 @@ pub(crate) fn spawn_grpc_server(
         let outcome = tonic::transport::Server::builder()
             .add_service(server)
             .serve_with_shutdown(socket_addr, async move {
-                let _ = stopped.await;
+                cog_core::ignore_lost!(stopped.await);
             })
             .await;
         if let Err(e) = outcome {

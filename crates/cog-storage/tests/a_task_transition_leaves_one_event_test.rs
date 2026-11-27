@@ -18,7 +18,11 @@ async fn a_task_transition_leaves_one_event() {
     let pool = schema_pool(&url, &schema).await;
     common::apply_migration_files(
         &pool,
-        &["117_event_stream.up.sql", "119_event_payload_is_json.up.sql"],
+        &[
+            "117_event_stream.up.sql",
+            "130_event_session_id.up.sql",
+            "119_event_payload_is_json.up.sql",
+        ],
     )
     .await;
 

@@ -302,7 +302,7 @@ async fn a_run_records_the_conversation_in_the_order_that_makes_resume_possible(
         .unwrap()
         .first()
         .cloned()
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     assert!(
         !first_request.iter().any(|m| matches!(
             m,

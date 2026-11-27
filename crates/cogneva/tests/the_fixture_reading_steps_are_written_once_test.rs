@@ -1169,7 +1169,7 @@ fn a_copy_on_disk_is_reported() {
         found.copies
     );
 
-    std::fs::remove_dir_all(&root).ok();
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }
 
 /// 判据自检：**自走的递归**这个形状认不认得出。
@@ -1229,7 +1229,7 @@ fn a_recursion_on_disk_is_reported() {
         "要点名到文件和行号，且报出那个自己调自己的函数名（它按定义名判不出来）"
     );
 
-    std::fs::remove_dir_all(&root).ok();
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }
 
 /// 判据自检：**同一段函数体写在两个夹具里**这个形状认不认得出。
@@ -1300,7 +1300,7 @@ fn a_body_written_twice_is_reported() {
         "两份都要点名到文件与行号，哪怕它们的函数名不一样：{at:?}"
     );
 
-    std::fs::remove_dir_all(&root).ok();
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }
 
 /// 同一段字节，两种方言的读法不同——这正是方言必须由调用方说出来的原因。

@@ -21,7 +21,8 @@ use cog_core::{ResourceLimits, SandboxBackend, SandboxPayload, SandboxRequest};
 /// 这是钉住的值（`cap: bound`）：列出来的是给人挑的入口，不是存储的上限；更早的
 /// 那些仍然在树上（对象与别的快照共用），只是不再逐个列出，列表尾上说明「更早的
 /// 没列」。
-// cap: bound — 给人挑的入口个数；不据此删快照
+// cap: fixed — 给人挑的入口个数：这是列表的选择约定，不据此删任何快照，也不是存储的上限
+// keep: 删掉后一次列出全部快照，人挑不完；由「给人挑的入口个数」兜住
 pub const MAX_LISTED_CHECKPOINTS: usize = 20;
 
 /// 检查点在存储里的那一行。

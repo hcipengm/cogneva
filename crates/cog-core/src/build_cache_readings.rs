@@ -137,7 +137,8 @@ pub use crate::build_cache::*;
 /// A cap derived from a peak the cache has not come near for this long holds
 /// space for a build pattern that no longer happens; the window lets the next
 /// walk replace it with what is actually there.
-// cap: bound — 留到下一个走查用实测值替换它；窗再短，一个不再发生的构建模式就会永远留在峰值里
+// cap: fixed — 留到下一个走查用实测值替换它；窗再短，一个不再发生的构建模式就会永远留在峰值里
+// keep: 删掉后窗口无限，一个不再发生的构建模式永远留在峰值里；由「留到下一个走查用实测替换」兜住
 const PEAK_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// Headroom over the peak, in percent.
@@ -145,7 +146,8 @@ const PEAK_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
 /// A cap at the peak itself reclaims the bytes the next build is about to
 /// write: the peak is the largest working set seen, so bounding to it turns the
 /// busiest walk into an over-cap one every time it repeats.
-// cap: bound — 峰值是见过的最大的工作集，紧贴着它设界会让最忙的那次走查每次重演都超界
+// cap: fixed — 峰值是见过的最大的工作集，紧贴着它设界会让最忙的那次走查每次重演都超界
+// keep: 删掉后界紧贴峰值，最忙的那次走查每次重演都超界；由「峰值是见过的最大的工作集」兜住
 const CAP_HEADROOM_PERCENT: u64 = 120;
 
 /// The ceiling slot before any loop has stated one.
@@ -549,6 +551,7 @@ impl BuildCacheReadings {
         // after the pass gave up on it; the deletion still runs below, inside
         // the slot, and is never what this timeout can drop halfway.
         let budget = Duration::from_secs(self.scan_interval_secs());
+        // wall: 等=一次缓存目录走查 / 等不到=这一趟不给数（走查未完成） / 续跑=能，下一拍重走
         let walked = tokio::time::timeout(
             budget,
             tokio::task::spawn_blocking(move || fs_size::dir_files(&path, CACHE_LAYER_DEPTH, &[])),

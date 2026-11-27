@@ -1,3 +1,4 @@
+# census-keep: shapes=deploy-numbers — 部署清单里的数是部署自己的声明：它写在生效的那一处，改它只改这一次部署，不是代码里看不见的默认；由部署面本身兜住
 # Loki — 日志后端。安全网关的 tracing 订阅者把同一批事件镜像到这里
 # （`COGNEVA_LOKI_ENABLED=true`），于是 `kubectl logs` 与 Loki 查到的是同一份内容。
 # 日志→Loki、时序明细→ClickHouse、告警状态机→PostgreSQL、指标→Prometheus，

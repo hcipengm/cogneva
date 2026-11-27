@@ -299,7 +299,7 @@ impl CaseJudge for HleJudge {
             .expected_output
             .as_ref()
             .and_then(|v| v.as_str())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
 
         if self.shortcut_multiple_choice && answer_type == "multipleChoice" {
             if let Some(mut verdict) = multiple_choice_verdict(&output.final_answer, correct_answer)
@@ -324,7 +324,7 @@ impl CaseJudge for HleJudge {
             .input
             .get("question")
             .and_then(|v| v.as_str())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let prompt = HLE_JUDGE_TEMPLATE
             .replace("{question}", question)
             .replace("{correct_answer}", correct_answer)
@@ -430,7 +430,7 @@ mod tests {
         // 空串的 image 是「没有图」，不是「有一条空 data URL」。
         assert_eq!(cases[1].input["image"], serde_json::Value::Null);
         assert_eq!(cases[1].metadata["has_image"], "false");
-        std::fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     #[test]
@@ -438,7 +438,7 @@ mod tests {
         let root = tempdir();
         let err = HleCaseSource.cases(&root).unwrap_err().to_string();
         assert!(err.contains("--convert"), "{err}");
-        std::fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     #[test]
@@ -743,6 +743,6 @@ mod tests {
             .judge(&cases[0], &env, &output("B"))
             .await
             .is_err());
-        std::fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 }

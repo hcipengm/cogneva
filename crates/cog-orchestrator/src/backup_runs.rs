@@ -61,7 +61,8 @@ pub const READOUT_LABEL: &str = crate::LABEL_READOUT;
 /// while leaving hours of margin. The deployed liveness alert derives its
 /// threshold from this period (`6 * period`), so changing it changes that
 /// threshold.
-// cap: bound — 存活告警的门槛由它推出（6 × 周期），所以这个数是那个门槛的分子，不是独立的一拍
+// cap: fixed — 存活告警的门槛由它推出（6 × 周期），所以这个数是那个门槛的分子，不是独立的一拍
+// keep: 删掉后存活告警的门槛没有分子，告警的墙跟着一拍一拍地漂；由「门槛是 6 × 周期」兜住
 pub const BACKUP_RUNS_PASS_INTERVAL: Duration = Duration::from_secs(300);
 
 /// The readouts one look at the account produces.
@@ -658,7 +659,7 @@ fn value_of(
                     .flatten()
                     .collect()
                 })
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             if counts.is_empty() {
                 None
             } else {

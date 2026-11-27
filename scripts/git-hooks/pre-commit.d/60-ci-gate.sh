@@ -49,7 +49,7 @@ out="$(
 rc=$?
 case "$rc" in
 0)
-    printf 'pre-commit（CI 判据）: %s\n' "$(printf '%s' "$out" | head -n 1)" >&2
+    printf 'pre-commit（CI 判据）: %s\n' "$(printf '%s' "$out")" >&2
     exit 0
     ;;
 1)

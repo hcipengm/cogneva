@@ -39,15 +39,18 @@ impl PatternEntry {
 }
 
 /// Default maximum pattern DB size before LRU/score-based eviction kicks in.
-// cap: bound — 淘汰策略的触发点，不是数据库容量：界的是「什么时候开始丢最不值的那条模式」，值随实际使用量再调
+// cap: fixed — 淘汰策略的触发点，不是数据库容量：界的是「什么时候开始丢最不值的那条模式」，值随实际使用量再调
+// keep: 删掉后模式库在淘汰之前无界增长，最不值的那条一直占着位置；由「什么时候开始丢最不值的那条模式」兜住
 pub const DEFAULT_MAX_PATTERN_DB_SIZE: usize = 256;
 /// Default maximum age (in days) for pattern DB entries before they are
 /// expired even if the size cap has not been reached.
-// cap: bound — 单条模式的最长寿命：过期的模式是没人再验证过的经验，认它等于让一个旧结论一直生效
+// cap: fixed — 单条模式的最长寿命：过期的模式是没人再验证过的经验，认它等于让一个旧结论一直生效
+// keep: 删掉后旧结论永远生效，没人再验证过的经验一直参与决策；由「过期的模式是没人再验证过的经验」兜住
 pub const DEFAULT_MAX_PATTERN_AGE_DAYS: i64 = 30;
 
 /// 同一道目标的分解答案复用多久（秒）。
-// cap: bound — 复用窗口。比实测的重投节拍（约 120 秒）宽出数倍，否则省不下来；
+// cap: fixed — 复用窗口。比实测的重投节拍（约 120 秒）宽出数倍，否则省不下来；
+// keep: 删掉后复用窗口没有长度，要么不省、要么把过时的回答一直发给别处；由「比实测重投节拍宽出数倍」兜住
 // 又不能长到「计划该重做了还拿旧答案」，所以它是一个有限窗口而不是永久缓存。
 pub const DEFAULT_ANSWER_REUSE_TTL_SECS: u64 = 600;
 
@@ -739,6 +742,9 @@ impl ActionPlanOrchestrator {
             None => TaskType::Custom("unknown".to_string()),
         };
         let mut task = Task::new(at.id.clone(), task_type, at.input.clone());
+        task.terminal = at.terminal.clone();
+        task.now = at.now.clone();
+        task.gap = at.gap.clone();
         task.blocked_by = at.blocked_by.clone();
         task.blocks = at.blocks.clone();
         // 验收标准跟着任务行走，不跟着基线行：没有估算的工作包不落基线行，写在
@@ -860,11 +866,46 @@ impl ActionPlanOrchestrator {
     fn states_its_own_work(task: &Task) -> bool {
         task.is_executable
             && !task.acceptance.is_empty()
-            && task
+            && (task
                 .input
                 .get(cog_core::INPUT_TASK_KIND)
                 .and_then(|v| v.as_str())
                 .is_some_and(|kind| !kind.trim().is_empty())
+                // 平台自己的员工活（`PLATFORM_AGENT_TASK`）把「这是什么活」
+                // 写在任务类型上，而不是再抄一个 `task_kind` 进输入：两类说法
+                // 并存时，只认输入那一格会把员工活全部送去再分解一遍。
+                || Self::is_platform_agent_row(task))
+    }
+
+    /// 这条行是不是平台自己的员工活（类型就是它的 kind）。
+    fn is_platform_agent_row(task: &Task) -> bool {
+        matches!(
+            &task.task_type,
+            TaskType::Custom(kind)
+                if kind == cog_core::contract::work_item::PLATFORM_AGENT_TASK
+        )
+    }
+
+    /// 一条行自己带着待办三格时，它的终态就是它的验收标准。
+    ///
+    /// 「按定义整段做、判据按 items 判」在入口上的落地：调用方或员工已经知道
+    /// 拆法时，每件活自带 `terminal / now / gap`。没有这一格，行读起来像「只说
+    /// 了要做什么」，会被送去再分解一遍，而分解出来的子任务拿不到这三格。
+    fn fill_acceptance_from_ledger_items(tasks: &mut [Task]) {
+        for task in tasks {
+            if !task.acceptance.is_empty() {
+                continue;
+            }
+            let Some(terminal) = task
+                .ledger_item()
+                .map(|item| item.terminal)
+                .map(|terminal| terminal.trim().to_string())
+                .filter(|terminal| !terminal.is_empty())
+            else {
+                continue;
+            };
+            task.acceptance = vec![terminal];
+        }
     }
 
     /// 那一行的状态，读失败时说明读失败。
@@ -954,6 +995,13 @@ impl ActionPlanOrchestrator {
         tasks: Vec<Task>,
         skill_registry: &SkillRegistry,
     ) -> SFResult<Vec<String>> {
+        // 行自己带着待办三格时，先把终态抄成验收标准：它说的是「这一类活是什么
+        // ＋这条怎样算完」，正是「说清了自己要做什么」的形状，只是判据写在待办
+        // 三格里。不先抄，这一行会被读成「只说了要做什么」而送去再分解一遍，
+        // 分解出来的子任务又拿不到这三格。
+        let mut tasks = tasks;
+        Self::fill_acceptance_from_ledger_items(&mut tasks);
+
         // Self-evolution tasks are human intents that should be executed
         // atomically by the collaboration pipeline without decomposition.
         // Matching the task type alone is not enough: the platform
@@ -1110,7 +1158,6 @@ impl ActionPlanOrchestrator {
         // 它身上，判退也要有行可落。少了这一行，一次提交无论成败在读面上都不存在——
         // 成功时子任务挂在空父下、没有哪一行声明答案，失败时连判词都没有落点。
         // 它是不可执行的标记行，组 hints 时按这个键被排除，分解身份也不受影响。
-        let mut tasks = tasks;
         if tasks.is_empty() {
             tasks.push(cog_core::Task::goal_row(
                 uuid::Uuid::new_v4().to_string(),
@@ -2431,6 +2478,9 @@ mod tests {
             blocked_by: vec![],
             blocks: vec![],
             input: serde_json::json!({}),
+            terminal: String::new(),
+            now: String::new(),
+            gap: String::new(),
             output_entities: vec![],
             estimated_seconds: 600,
             parent_id: None,
@@ -2924,6 +2974,9 @@ mod tests {
             blocked_by: vec![],
             blocks: vec![],
             input: serde_json::json!({}),
+            terminal: String::new(),
+            now: String::new(),
+            gap: String::new(),
             output_entities: vec![],
             estimated_seconds: 600,
             parent_id: None,
@@ -5002,6 +5055,93 @@ mod tests {
             "the row has to be runnable: an outcome can only be read off a row that ran"
         );
         assert!(stored.action_planner_meta.as_ref().unwrap().verified);
+    }
+
+    /// 带着待办三格的行自己就是计划：终态抄成验收标准，不再花一次分解。
+    ///
+    /// 这是「按定义整段做、判据按 items 判」在入口上的形状：调用方给出拆法时，
+    /// 每件活自带 `terminal / now / gap`，那三格就是它说清的「怎样算完」。这条
+    /// 测试同时钉住两件事——执行器一次都没被调用（没有第二次分解），以及入图的
+    /// 那一行带着从三格抄来的验收标准（否则派发器不认它是说清了自己的活）。
+    #[tokio::test]
+    async fn a_row_that_carries_its_ledger_cell_is_taken_as_written() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-cell-row".to_string()));
+        let executor = Arc::new(CountingExecutor::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(executor.clone())
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(1);
+        let registry = SkillRegistry::new();
+
+        let row = Task::new(
+            "goal-cell/t1",
+            TaskType::Custom(cog_core::contract::work_item::PLATFORM_AGENT_TASK.into()),
+            serde_json::json!({
+                "query": "把三处收进一处",
+                "definition": "这一类：把三处收进一处；做完＝只剩一处。",
+                cog_core::contract::ledger_item::ITEM_INPUT_KEY: {
+                    "id": "goal-cell/t1",
+                    "terminal": "只剩一处",
+                    "now": "三处",
+                    "gap": "两处",
+                    "state": "未落",
+                },
+            }),
+        );
+
+        let ids = planner
+            .process_goal_impl("把三处收进一处", vec![row], &registry)
+            .await
+            .unwrap();
+
+        assert_eq!(ids, vec!["goal-cell/t1".to_string()]);
+        assert_eq!(
+            executor.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the cell already says what done means; decomposing it again costs a model call \
+             and drops the cell into no child"
+        );
+        let stored = dag.get_task("goal-cell/t1").await.unwrap();
+        assert_eq!(
+            stored.acceptance,
+            vec!["只剩一处".to_string()],
+            "the terminal has to reach the row: a dispatcher that reads acceptance would \
+             otherwise treat this row as one that never said what done means"
+        );
+        assert!(stored.action_planner_meta.as_ref().unwrap().verified);
+    }
+
+    /// 对照：既没有待办三格、也没有 `task_kind` 的行仍落到模型。
+    ///
+    /// 这一条防的是把「员工活」这个类型读成一张免判的批文——没有判据的行照样要
+    /// 由模型补出「怎样算完」，直通只会让它在派发器前面吊着。
+    #[tokio::test]
+    async fn a_row_without_cells_or_kind_still_goes_to_the_model() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-cell-row-bare".to_string()));
+        let executor = Arc::new(CountingExecutor::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(executor.clone())
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(1);
+        let registry = SkillRegistry::new();
+
+        let bare = Task::new(
+            "goal-bare/t1",
+            TaskType::Custom(cog_core::contract::work_item::PLATFORM_AGENT_TASK.into()),
+            serde_json::json!({ "query": "把三处收进一处" }),
+        );
+
+        let _ = planner
+            .process_goal_impl("把三处收进一处", vec![bare], &registry)
+            .await;
+
+        assert_eq!(
+            executor.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a row that states no criterion still needs the planner to state one"
+        );
     }
 
     /// 判据缺一项就不放行：只声明 `task_kind`、没写「怎样算完」的行，放行之后派发器

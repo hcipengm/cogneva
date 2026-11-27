@@ -87,7 +87,9 @@ mod tests {
     fn d10_missing_measurement_is_not_a_pass() {
         let result = mk_result_for_output(serde_json::json!({}));
         let (v, p) = compute(
-            &EvalMetric::DeploymentTime { threshold_ms: 60000 },
+            &EvalMetric::DeploymentTime {
+                threshold_ms: 60000,
+            },
             &mk_case(),
             &result,
         );
@@ -95,12 +97,16 @@ mod tests {
         assert!(!p, "没有读数的一维被判成了通过");
         // 有读数时照旧按阈值判：低于阈值通过、高于阈值不通过。
         let slow = mk_result_for_output(serde_json::json!({"deployment_time_ms": 90000}));
-        assert!(!compute(
-            &EvalMetric::DeploymentTime { threshold_ms: 60000 },
-            &mk_case(),
-            &slow
-        )
-        .1);
+        assert!(
+            !compute(
+                &EvalMetric::DeploymentTime {
+                    threshold_ms: 60000
+                },
+                &mk_case(),
+                &slow
+            )
+            .1
+        );
     }
 
     #[test]

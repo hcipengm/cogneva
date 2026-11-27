@@ -40,6 +40,7 @@ async fn a_refused_slot_keeps_the_change_alive_and_the_tree_clean() {
     common::git(root.path(), &["commit", "-q", "-m", "seed"]);
 
     let change = EvolutionResult {
+        unit_of_work: None,
         kind: EvolutionKind::CodeChange,
         artifact_id: "slot-1".into(),
         description: "修正这个取值的计算".into(),

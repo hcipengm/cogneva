@@ -124,15 +124,19 @@ pub struct SignalWatcherConfig {
 
 /// 一拍最多处理几条信号：告警通道与口味通道问的是同一件事（一拍的处理时长要
 /// 短于下一拍到点），所以两处读同一个数——各写一个 5，改一处另一处不懂。
-// cap: bound — 由一拍的处理时长定：处理完这一批要早于下一拍到点
+// cap: fixed — 由一拍的处理时长定：处理完这一批要早于下一拍到点
+// keep: 删掉后一拍要处理的信号无界，处理不完就拖到下一拍之后；由「处理完这一批要早于下一拍到点」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const MAX_SIGNALS_PER_TICK: usize = 5;
 
 /// 同一类失败连着出现几次才算「重现」：一次是抖动，连着几次才是判据。
-// cap: bound — 由同类失败的到达率定：抖动会自己消失，真问题会连着来
+// cap: fixed — 由同类失败的到达率定：抖动会自己消失，真问题会连着来
+// keep: 删掉后一次抖动就被读成真问题，告警被常态噪声占满；由「抖动会自己消失、真问题连着来」兜住
 const FAILURE_RECURRENCE_THRESHOLD: usize = 3;
 
 /// 积压深到什么程度才值得报：它问的是「几拍排得完」，所以随一拍的吞吐走。
-// cap: bound — 由一拍排得动的条数定：积压超过几拍的量才报
+// cap: fixed — 由一拍排得动的条数定：积压超过几拍的量才报
+// keep: 删掉后几拍的积压就报，告警被正常的排队占满；由「积压超过几拍的量才报」兜住
 const BACKLOG_THRESHOLD: usize = 100;
 
 impl Default for SignalWatcherConfig {
@@ -223,10 +227,10 @@ async fn load_state() -> SignalGuardState {
 async fn save_state(state: &SignalGuardState) {
     let path = state_path();
     if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
+        cog_core::ignore_lost!(tokio::fs::create_dir_all(parent).await);
     }
     if let Ok(text) = serde_json::to_string_pretty(state) {
-        let _ = tokio::fs::write(&path, text).await;
+        cog_core::ignore_lost!(tokio::fs::write(&path, text).await);
     }
 }
 
@@ -660,7 +664,8 @@ const ALERT_TASK_PREFIX: &str = "self-signal-alert-";
 /// hide the standing one behind them for as long as they kept firing. It is
 /// also the page that says whether the round may conclude anything from
 /// absence, which it may only do when the page came back short.
-// cap: bound — 页的大小不是量出来的界：高到一场风暴藏不住站着的那条，低到一轮仍读得完。
+// cap: fixed — 页的大小不是量出来的界：高到一场风暴藏不住站着的那条，低到一轮仍读得完。
+// keep: 删掉后一轮读不完页，一场风暴里站着的那条藏不住；由「高到风暴藏不住、低到一轮读得完」兜住
 const ALERT_LIST_LIMIT: i64 = 1000;
 
 /// How many cleared rows one round retires.
@@ -672,7 +677,9 @@ const ALERT_LIST_LIMIT: i64 = 1000;
 /// behind would be undone in one round that blocks the loop for as long as a
 /// thousand cancellations take, and the rounds after it are what read the new
 /// alerts.
-// cap: bound — 与收行的上限同一档：一轮的活有界，够不着的下一轮还看得见同一份证据。
+// cap: fixed — 与收行的上限同一档：一轮的活有界，够不着的下一轮还看得见同一份证据。
+// keep: 删掉后一轮退休的活无界，一轮跑不完而下一轮看不到同一份证据；由「一轮的活有界」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const ALERT_RETIRE_MAX_PER_ROUND: usize = 200;
 
 /// Whether `task_id` is a row [`alert_task_id`] minted.
@@ -1184,7 +1191,8 @@ fn signal_project_root_id(project: &str) -> String {
 /// rows to reach, and this round also reads the whole graph every minute. A
 /// batch bounds the burst, not the work: the round asks again on its next tick
 /// until `remaining` is zero.
-// cap: bound — 界的是这一轮的突发量，不是工作量；下一拍会接着问直到 remaining 归零
+// cap: fixed — 界的是这一轮的突发量，不是工作量；下一拍会接着问直到 remaining 归零
+// keep: 删掉后一拍吞下整场突发，这一轮的活没有上界；由「下一拍接着问直到 remaining 归零」兜住
 const SIGNAL_SETTLE_BATCH: usize = 250;
 
 /// What one settle of the signal projects did, cell by cell.
@@ -1468,7 +1476,7 @@ async fn fill_rework_criteria(
                     .map(str::to_string)
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         if cause.is_none() && files.is_empty() {
             continue;
         }
@@ -1682,7 +1690,7 @@ async fn tick(
     alert_source: Option<&Arc<dyn cog_core::ActiveAlertSource>>,
     taste_source: Option<&Arc<dyn cog_core::TasteIntentSource>>,
     intent_reader: Option<&Arc<dyn cog_core::IntentReader>>,
-    intent_writer: Option<&Arc<dyn cog_core::IntentEvents>>,
+    intent_writer: Option<&Arc<dyn cog_core::EventStore>>,
     readings: &SignalWatcherReadings,
     held: bool,
     parents_settled: &mut bool,
@@ -1846,7 +1854,7 @@ async fn tick(
             readings.record(SignalOutcome::Cooldown);
         } else {
             dirty = true;
-            let dlq = orch.dlq_len().await.unwrap_or(0);
+            let dlq = cog_core::logged_default!(orch.dlq_len().await, 0);
             let goal = format!(
                 "Drain the queue backlog\n\nInvestigate orchestrator queue backlog: {backlog} \
                  tasks pending/scheduled (DLQ: {dlq}). Determine why tasks are not \
@@ -2101,10 +2109,20 @@ async fn tick(
                         dirty = true;
                         let identities: Vec<String> =
                             batch.iter().map(|intent| intent.identity.clone()).collect();
-                        if let Err(e) = writer
-                            .mark_triaged(&identities, &task_id, "signal-watcher")
-                            .await
-                        {
+                        let events = cog_core::intent_triaged_events(
+                            &identities,
+                            &task_id,
+                            "signal-watcher",
+                            chrono::Utc::now(),
+                        );
+                        let mut failure = None;
+                        for event in events {
+                            if let Err(e) = writer.append(event).await {
+                                failure = Some(e);
+                                break;
+                            }
+                        }
+                        if let Some(e) = failure {
                             warn!(
                                 task_id = %task_id,
                                 error = %e,
@@ -2313,7 +2331,7 @@ pub fn spawn_signal_watcher_loop(
     alert_source: Option<Arc<dyn cog_core::ActiveAlertSource>>,
     taste_source: Option<Arc<dyn cog_core::TasteIntentSource>>,
     intent_reader: Option<Arc<dyn cog_core::IntentReader>>,
-    intent_writer: Option<Arc<dyn cog_core::IntentEvents>>,
+    intent_writer: Option<Arc<dyn cog_core::EventStore>>,
     readings: Arc<SignalWatcherReadings>,
     llm_gate: Option<Arc<dyn cog_core::SchedulerGate>>,
 ) -> tokio::task::JoinHandle<()> {
@@ -4976,6 +4994,8 @@ mod tests {
             addressed_to: String::new(),
             text: text.to_string(),
             parent: None,
+            session: None,
+            model_text: None,
             at: Utc::now(),
         }
     }

@@ -189,9 +189,12 @@ async fn build_test_state() -> Option<AutonomousTestState> {
         mcp_call_counts: None,
         workspace_store: None,
         governance_store: None,
+        security_keys: None,
         principle_ledger: None,
         change_ledger: None,
         intent_events: None,
+        employee_events: None,
+        message_events: None,
         key_value: None,
         external_skill_registry: None,
         tool_registry: None,
@@ -494,8 +497,8 @@ async fn execute_ready_task(state: &AutonomousTestState, task_id: &str) {
     // Schedule then start the task so start_task succeeds
     {
         let orch = state.gateway_state.orchestrator.clone();
-        let _ = orch.schedule_task(task_id).await;
-        let _ = orch.start_task(task_id).await;
+        cog_core::ignore_lost!(orch.schedule_task(task_id).await);
+        cog_core::ignore_lost!(orch.start_task(task_id).await);
     }
 
     // Hook: OnAgentStart
@@ -549,7 +552,7 @@ async fn execute_ready_task(state: &AutonomousTestState, task_id: &str) {
             .error
             .unwrap_or_else(|| "Squad execution failed".into());
 
-        let _ = orch.fail_task(task_id, error.clone(), None).await;
+        cog_core::ignore_lost!(orch.fail_task(task_id, error.clone(), None).await);
 
         // Hook: OnTaskFail
         if let Some(ref engine) = state.gateway_state.hook_engine {

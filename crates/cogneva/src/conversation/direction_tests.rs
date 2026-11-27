@@ -785,7 +785,7 @@ async fn a_band_outside_the_closed_set_is_refused_before_anything_is_written() {
     .await;
 
     assert_eq!(answer["refused"], "unknown_band", "{answer}");
-    let note = answer["note"].as_str().unwrap_or_default();
+    let note = answer["note"].as_str().unwrap_or(Default::default());
     for band in ["p0", "p1", "p2", "p3", "unstated"] {
         assert!(
             note.contains(band),
@@ -1201,7 +1201,7 @@ async fn a_direction_the_owner_states_is_recorded_under_the_owner() {
         }
         other => panic!("种类被读成了别的东西：{other:?}"),
     }
-    let summary = answer["summary"].as_str().unwrap_or_default();
+    let summary = answer["summary"].as_str().unwrap_or(Default::default());
     assert!(
         summary.contains("把回归也当成缺陷") && summary.contains("只看目标项"),
         "回执里的人话没有把两个方向都说出来：{summary}"

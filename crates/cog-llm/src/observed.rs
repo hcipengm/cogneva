@@ -15,6 +15,7 @@ use crate::observable::{global_observable, CallFailure, LlmObservable};
 /// 所以只能自己再起一跳。容量取与路由层相同的大小——观测不该成为新的瓶颈，
 /// 下游读得慢时压力先落在路由那一跳上，与没有这层时一致。
 // cap: fixed — 路由那一跳的容量本身；两处相等是这条旁路不成为新瓶颈的全部理由
+// keep: 删掉后旁路成为新瓶颈，路由那一跳的背压不再先落在它身上；由「两处相等」兜住
 const FORWARD_CAPACITY: usize = crate::routing::ROUTING_STREAM_CAPACITY;
 
 pub struct ObservedLlmClient {
@@ -77,13 +78,7 @@ struct CallContext {
 }
 
 fn call_context(options: &ChatOptions) -> CallContext {
-    let get = |name: &str| {
-        options
-            .headers
-            .get(name)
-            .cloned()
-            .unwrap_or_default()
-    };
+    let get = |name: &str| options.headers.get(name).cloned().unwrap_or_default();
     CallContext {
         actor: get(cog_core::LLM_ACTOR_HEADER),
         origin: get(cog_core::LLM_ORIGIN_HEADER),
@@ -99,37 +94,85 @@ fn call_context(options: &ChatOptions) -> CallContext {
 /// 写在**流交回下游之前**：答复发了、事实还在队列里，进程死在两者之间就少一笔，
 /// 而少一笔是所有读数一起偏一点、偏得没有痕迹的那种错。写不进去只告警——事件流
 /// 的可用性不该把一次答复拖住。
-async fn record_call_row(obs: &LlmObservable, ctx: &CallContext, response: &ChatResponse, latency_ms: u64) {
+async fn record_call_row(
+    obs: &LlmObservable,
+    ctx: &CallContext,
+    response: &ChatResponse,
+    latency_ms: u64,
+) {
     let Some(sink) = obs.call_events() else {
         return;
     };
     let call = cog_core::LlmCall {
         call_id: format!(
             "{}:{}",
-            if ctx.actor.is_empty() { "unknown" } else { &ctx.actor },
+            if ctx.actor.is_empty() {
+                "unknown"
+            } else {
+                &ctx.actor
+            },
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ),
         upstream: "-".to_string(),
         api_style: "-".to_string(),
-        model: if ctx.model.is_empty() { "-".to_string() } else { ctx.model.clone() },
+        model: if ctx.model.is_empty() {
+            "-".to_string()
+        } else {
+            ctx.model.clone()
+        },
         result: "ok".to_string(),
         input_tokens: response.usage.input as u64,
         output_tokens: response.usage.output as u64,
         cached_tokens: 0,
         cache_created_tokens: None,
         origin: ctx.origin.clone(),
-        owner: if ctx.owner.is_empty() { None } else { Some(ctx.owner.clone()) },
+        owner: if ctx.owner.is_empty() {
+            None
+        } else {
+            Some(ctx.owner.clone())
+        },
         latency_ms: Some(latency_ms),
-        task_id: if ctx.task.is_empty() { None } else { Some(ctx.task.clone()) },
-        actor: if ctx.actor.is_empty() { "unknown".to_string() } else { ctx.actor.clone() },
+        task_id: if ctx.task.is_empty() {
+            None
+        } else {
+            Some(ctx.task.clone())
+        },
+        actor: if ctx.actor.is_empty() {
+            "unknown".to_string()
+        } else {
+            ctx.actor.clone()
+        },
         pace: None,
         cost_micros: None,
         price_book: None,
-        session: if ctx.session.is_empty() { None } else { Some(ctx.session.clone()) },
-        batch_id: if ctx.task.is_empty() { None } else { Some(ctx.task.clone()) },
+        session: if ctx.session.is_empty() {
+            None
+        } else {
+            Some(ctx.session.clone())
+        },
+        batch_id: if ctx.task.is_empty() {
+            None
+        } else {
+            Some(ctx.task.clone())
+        },
+        tokens_reasoning: None,
+        refusal_kind: None,
+        retry_after_secs: None,
+        usage_outcome: None,
+        estimated_input: None,
+        refused_scope: None,
+        finish_reason: None,
+        ttft_ms: None,
+        prompt_manifest: None,
+        prompt_dropped: None,
         at: chrono::Utc::now(),
     };
-    if let Err(e) = sink.append(&call).await {
+    if let Err(e) = sink
+        .append(cog_core::FactEvent::new(cog_core::EventPayload::LlmCall(
+            call.clone(),
+        )))
+        .await
+    {
         tracing::warn!(error = %e, "this call's row did not reach the event stream; the in-process counters still count it");
     }
 }
@@ -189,7 +232,12 @@ impl LlmClient for ObservedLlmClient {
     ) -> SFResult<AssistantMessageEventStream> {
         let start = Instant::now();
         match self.inner.chat_stream(messages, options).await {
-            Ok(stream) => Ok(observed_stream(stream, self.obs.clone(), call_context(options), start)),
+            Ok(stream) => Ok(observed_stream(
+                stream,
+                self.obs.clone(),
+                call_context(options),
+                start,
+            )),
             Err(e) => {
                 // 连流都没拿到——上游在首字节之前就拒了，agent 的流量正是
                 // 这个形态失败的。这一跳的失败面就在这条路上，不记在这里
@@ -290,13 +338,19 @@ mod tests {
     struct RecordingSink(std::sync::Mutex<Vec<cog_core::LlmCall>>);
 
     #[async_trait]
-    impl cog_core::LlmCallEvents for RecordingSink {
+    impl cog_core::EventStore for RecordingSink {
         fn writer(&self) -> &str {
             "probe"
         }
 
-        async fn append(&self, call: &cog_core::LlmCall) -> SFResult<()> {
-            self.0.lock().unwrap().push(call.clone());
+        fn next_event_id(&self) -> String {
+            format!("E{}", self.0.lock().unwrap().len())
+        }
+
+        async fn append(&self, event: cog_core::FactEvent) -> SFResult<()> {
+            if let cog_core::EventPayload::LlmCall(call) = event.payload {
+                self.0.lock().unwrap().push(call);
+            }
             Ok(())
         }
     }
@@ -319,9 +373,10 @@ mod tests {
         options
             .headers
             .insert(cog_core::LLM_TASK_HEADER.to_string(), "t-1".into());
-        options
-            .headers
-            .insert(cog_core::LLM_ACTOR_HEADER.to_string(), "agent:planner".into());
+        options.headers.insert(
+            cog_core::LLM_ACTOR_HEADER.to_string(),
+            "agent:planner".into(),
+        );
         client.chat(&[], &options).await.expect("the fake answers");
 
         let rows = sink.0.lock().unwrap();

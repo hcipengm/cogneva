@@ -20,7 +20,7 @@
 use chrono::Utc;
 use sqlx::PgPool;
 
-use cog_core::{LlmCall, LlmCallEvents};
+use cog_core::LlmCall;
 use cog_storage::LlmCallEventStore;
 
 /// A schema carrying this run's event table, dropped when the case ends.
@@ -121,6 +121,16 @@ fn call(id: &str) -> LlmCall {
         session: None,
         batch_id: None,
         pace: None,
+        tokens_reasoning: None,
+        refusal_kind: None,
+        retry_after_secs: None,
+        usage_outcome: None,
+        estimated_input: None,
+        refused_scope: None,
+        finish_reason: None,
+        ttft_ms: None,
+        prompt_manifest: None,
+        prompt_dropped: None,
         at: Utc::now(),
     }
 }

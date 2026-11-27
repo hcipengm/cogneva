@@ -1,3 +1,4 @@
+// census-keep: shapes=clocks — 界面上的提示计时（复制成功、提示消失之类）：只影响提示停留多久，不参与任何决定；删掉只是提示不自动消失或一直不消失
 import { useState } from 'react';
 import {
   getMemoryMetrics,

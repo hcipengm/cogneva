@@ -391,7 +391,7 @@ struct FakeUsage {
 
 #[async_trait::async_trait]
 impl cog_core::LlmUsageLedger for FakeUsage {
-    async fn record(&self, _: &cog_core::LlmUsageRecord) -> Result<(), String> {
+    async fn record(&self, _: &cog_core::LlmUsageRecord) -> Result<String, String> {
         unimplemented!("read-only stand-in")
     }
     async fn record_exchange(&self, _: &cog_core::LlmExchangeRecord) -> Result<(), String> {
@@ -611,9 +611,12 @@ fn state_with(
         mcp_call_counts: None,
         workspace_store: None,
         governance_store: None,
+        security_keys: None,
         principle_ledger: None,
         change_ledger: change_ledger.map(|ledger| ledger as Arc<dyn ChangeLedgerStore>),
         intent_events: None,
+        employee_events: None,
+        message_events: None,
         key_value: None,
         external_skill_registry: None,
         tool_registry: None,

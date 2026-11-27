@@ -70,7 +70,7 @@ async fn sse_handler(State(shared): State<Shared>) -> Response<Body> {
     // The endpoint event is relative on purpose: the transport has to resolve it
     // against the stream's own URL, and a server that sends an absolute one would
     // not exercise that.
-    let _ = tx.send(sse_frame("endpoint", "/messages"));
+    cog_core::ignore_lost!(tx.send(sse_frame("endpoint", "/messages")));
     drop(tx);
     let stream: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, Infallible>> + Send>> =
         Box::pin(unfold_receiver(rx));
@@ -208,7 +208,7 @@ async fn stub(behaviour: Behaviour) -> (String, Shared) {
         .expect("bind a loopback port");
     let addr = listener.local_addr().expect("read the bound port");
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        cog_core::ignore_lost!(axum::serve(listener, app).await);
     });
     (format!("http://{addr}"), shared)
 }

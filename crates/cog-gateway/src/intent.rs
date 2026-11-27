@@ -16,7 +16,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use cog_core::{IntentEvents, IntentRow};
+use cog_core::IntentRow;
 use tracing::warn;
 
 /// 三个计数。
@@ -66,7 +66,7 @@ pub fn readings() -> Vec<cog_core::observability::RawMetric> {
 /// `unwired`，不会让某一条路安静地不写。
 ///
 /// 空白的一句不是一次到达；写不进去也不中止调用方那一轮，但失败与未接线分开计数。
-pub async fn record(sink: Option<&Arc<dyn IntentEvents>>, row: IntentRow) {
+pub async fn record(sink: Option<&Arc<dyn cog_core::EventStore>>, row: IntentRow) {
     if row.text.trim().is_empty() {
         return;
     }
@@ -74,7 +74,7 @@ pub async fn record(sink: Option<&Arc<dyn IntentEvents>>, row: IntentRow) {
     c.received.fetch_add(1, Ordering::Relaxed);
     match sink {
         Some(sink) => {
-            if let Err(e) = sink.record(&row).await {
+            if let Err(e) = sink.append(cog_core::intent_received_event(&row)).await {
                 c.failures.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     error = %e,
@@ -114,23 +114,20 @@ mod tests {
     }
 
     #[async_trait]
-    impl IntentEvents for Recorder {
+    impl cog_core::EventStore for Recorder {
         fn writer(&self) -> &str {
             "test"
         }
-        async fn record(&self, row: &IntentRow) -> cog_core::SFResult<()> {
+        fn next_event_id(&self) -> String {
+            format!("T{}", self.rows.lock().unwrap().len())
+        }
+        async fn append(&self, event: cog_core::FactEvent) -> cog_core::SFResult<()> {
             if self.fail {
                 return Err(cog_core::SFError::Database("boom".into()));
             }
-            self.rows.lock().unwrap().push(row.clone());
-            Ok(())
-        }
-        async fn mark_triaged(
-            &self,
-            _identities: &[String],
-            _task_id: &str,
-            _actor: &str,
-        ) -> cog_core::SFResult<()> {
+            if let cog_core::EventPayload::IntentRecorded(row) = event.payload {
+                self.rows.lock().unwrap().push(row);
+            }
             Ok(())
         }
     }
@@ -151,7 +148,7 @@ mod tests {
     async fn a_row_reaches_the_one_sink_with_its_addressee() {
         let _gate = one_at_a_time();
         let recorder = Arc::new(Recorder::default());
-        let sink: Arc<dyn IntentEvents> = recorder.clone();
+        let sink: Arc<dyn cog_core::EventStore> = recorder.clone();
         record(
             Some(&sink),
             chat_row("s1", "owner", "luna-1", "把这批门禁的归属改回来"),
@@ -173,7 +170,7 @@ mod tests {
             rows: Mutex::default(),
             fail: true,
         });
-        let sink: Arc<dyn IntentEvents> = recorder.clone();
+        let sink: Arc<dyn cog_core::EventStore> = recorder.clone();
         let before = counters().received.load(Ordering::Relaxed);
         record(Some(&sink), chat_row("s1", "owner", "luna-1", "   ")).await;
         assert_eq!(counters().received.load(Ordering::Relaxed), before);

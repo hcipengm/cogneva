@@ -120,7 +120,8 @@ pub struct PgeSettings {
 /// feedback is unchanged between iterations, so repeating it cannot buy a
 /// different outcome — either the plan is the real defect, which is the global
 /// reset's job, or nothing in the feedback is actionable.
-// cap: bound — 再来一次得不到不同的结局：要么计划本身就是缺陷（那是全局重置的事），要么反馈里没有可执行的东西
+// cap: fixed — 再来一次得不到不同的结局：要么计划本身就是缺陷（那是全局重置的事），要么反馈里没有可执行的东西
+// keep: 删掉后同一个结局被一遍遍重来，反馈里没有可执行的东西也还在修；由「再来一次得不到不同的结局」兜住
 pub const DEFAULT_LOCAL_REPAIR_MAX: u32 = 2;
 
 /// A zero here would close the repair loop for every deployment that does not
@@ -267,7 +268,7 @@ mod tests {
         // not overrule the deployment.
         std::fs::write(&path, r#"{"pge": {"local_repair_max": 0}}"#).unwrap();
         assert_eq!(PgeSettings::load_from(&path).unwrap().local_repair_max, 0);
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// A configuration section this crate reads: the pointer a template has to
@@ -593,7 +594,8 @@ mod tests {
     fn ralph_settings_defaults_carry_the_window_and_no_budget() {
         let p = Path::new("/nonexistent/cogneva.json");
         let r = RalphSettings::load_from(p).unwrap();
-        assert_eq!(r.stagnation_window, 5);
+        // 默认窗口由实测导出（没有样本时是 0）：写死一个轮数就是人拍的界。
+        assert_eq!(r.stagnation_window, cog_core::stagnation::window_rounds());
         // 预算已经不存在：配置文件里再写 `ralph.max_iterations` 也不该有字段接它，
         // 那一条由「每个配置键都被一份交付文档点名」那一族门负责。
     }
@@ -626,7 +628,7 @@ mod tests {
             "开关必须传到循环读的那份配置上"
         );
 
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     #[test]
@@ -650,6 +652,6 @@ mod tests {
             .schema_for("planner")
             .is_some());
         assert_eq!(BoundaryConfig::load_from(&path).unwrap().rules.len(), 1);
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 }

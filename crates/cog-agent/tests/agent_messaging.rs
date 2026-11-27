@@ -187,7 +187,6 @@ impl AgentRegistry for Roster {
                 first_seen: now,
                 last_seen: now,
                 retired_at: None,
-                person_id: cog_core::person_id_for(id).map(str::to_string),
             })
             .collect())
     }
@@ -213,7 +212,7 @@ async fn call<B: MessageBackend + 'static>(
     roster: Arc<Roster>,
     args: serde_json::Value,
 ) -> SFResult<serde_json::Value> {
-    let tool = send_to_agent(backend, roster);
+    let tool = send_to_agent(backend, roster, None, None, None, None);
     match tool.implementation {
         ToolImplementation::Native(handler) => (handler)(args).await,
         _ => panic!("send_to_agent is a native tool"),
@@ -724,7 +723,7 @@ impl MessageBackend for Answering {
                 let bytes = serde_json::to_vec(answer).expect("encode answer");
                 // A subscriber that is not attached yet receives nothing:
                 // that is the property under test.
-                let _ = self.replies.send(("1-0".to_string(), bytes));
+                cog_core::ignore_lost!(self.replies.send(("1-0".to_string(), bytes)));
             }
         }
         self.inner.publish(subject, payload).await
@@ -943,7 +942,7 @@ async fn a_cancelled_ask_ends_its_stream_and_is_counted_apart_from_a_timeout() {
     let backend = Arc::new(Answering::new(None));
     let roster = Arc::new(Roster::new(&["squad:task-1-tester"]));
 
-    let tool = send_to_agent(backend.clone(), roster);
+    let tool = send_to_agent(backend.clone(), roster, None, None, None, None);
     let ToolImplementation::Native(handler) = tool.implementation else {
         panic!("send_to_agent is a native tool");
     };
@@ -972,7 +971,7 @@ async fn a_cancelled_ask_ends_its_stream_and_is_counted_apart_from_a_timeout() {
     let stream = stream.expect("the ask opened its reply stream before waiting");
 
     asking.abort();
-    let _ = asking.await;
+    cog_core::ignore_lost!(asking.await);
 
     // The guard deletes from a task it spawned on the way out, so let the
     // runtime reach it before reading what the backend saw.
@@ -1031,7 +1030,7 @@ async fn a_question_the_queue_refused_is_not_booked_as_abandoned() {
     // nothing.
     let abandoned_before = abandoned_count().await;
 
-    let tool = send_to_agent(backend.clone(), roster);
+    let tool = send_to_agent(backend.clone(), roster, None, None, None, None);
     let ToolImplementation::Native(handler) = tool.implementation else {
         panic!("send_to_agent is a native tool");
     };
@@ -1083,4 +1082,100 @@ async fn abandoned_count() -> f64 {
         })
         .map(|m| m.value)
         .unwrap_or(0.0)
+}
+
+/// 一次投递记下的那些事实，按到达顺序留着。
+#[derive(Default)]
+struct Facts(Mutex<Vec<cog_core::FactEvent>>);
+
+impl Facts {
+    fn rows(&self) -> Vec<cog_core::IntentRow> {
+        self.0
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter_map(|event| match &event.payload {
+                cog_core::EventPayload::IntentRecorded(row) => Some(row.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl cog_core::EventStore for Facts {
+    fn writer(&self) -> &str {
+        "agent-messaging-test"
+    }
+
+    fn next_event_id(&self) -> String {
+        "FACTS00000000000000000001".into()
+    }
+
+    async fn append(&self, event: cog_core::FactEvent) -> SFResult<()> {
+        self.0.lock().expect("lock").push(event);
+        Ok(())
+    }
+}
+
+/// 同事之间说的那句话同时是一条意图，而且收件人拿到的消息自己带着那个身份：
+/// 他派出去的活因此答得出「这是谁让我做的」，不必按时间或原文去猜。
+#[tokio::test]
+async fn a_colleague_message_lands_as_an_intent_and_carries_its_identity() {
+    let backend = Arc::new(Recording::default());
+    let facts = Arc::new(Facts::default());
+    let tool = send_to_agent(
+        backend.clone(),
+        Arc::new(Roster::new(&["staff-2"])),
+        None,
+        Some(facts.clone()),
+        None,
+        None,
+    );
+    let ToolImplementation::Native(handler) = tool.implementation else {
+        panic!("send_to_agent is a native tool");
+    };
+    (handler)(serde_json::json!({
+        "agent_id": "staff-2",
+        "message": "把门禁的归属改回它判的那个对象",
+    }))
+    .await
+    .expect("投递成功");
+
+    let published = backend.published();
+    assert_eq!(published.len(), 1, "一条消息只投一次");
+    let message: InboxMessage = serde_json::from_slice(&published[0].1).expect("inbox wire form");
+    let InboxMessage::Prompt { intent, .. } = message else {
+        panic!("prompt 应投成 Prompt");
+    };
+    let intent = intent.expect("收件人要拿到这条消息的意图身份");
+
+    let rows = facts.rows();
+    assert_eq!(rows.len(), 1, "投递成功之后要有一条意图");
+    let row = &rows[0];
+    assert_eq!(row.identity, intent, "消息与意图行是同一个身份");
+    assert_eq!(row.source, "agent");
+    assert_eq!(row.addressed_to, "staff-2");
+    assert_eq!(row.text, "把门禁的归属改回它判的那个对象");
+    assert!(
+        intent.starts_with("agent:>staff-2:prompt:"),
+        "发信人没留名时如实写空，不编一个名字：{intent}"
+    );
+}
+
+/// 收件人那一侧真的用了消息带来的那个身份：`handle_inbox` 把 `intent` 交给
+/// `prompt_for_intent`，不是丢掉它照旧 `prompt`。消息与意图两条各自都有用例，
+/// 中间这一格不接线时两头的用例都还是绿的。
+#[test]
+fn the_resident_employee_hears_which_intent_the_message_is() {
+    let source = include_str!("../src/agent.rs");
+    assert!(
+        source.contains("let out = self.prompt_for_intent(input, intent).await?;"),
+        "handle_inbox 没有把消息上的意图身份交给运行"
+    );
+    assert!(
+        include_str!("../src/agent_kernel/runtime.rs")
+            .contains("self.stamp_intent(&tc.name, &mut tc.arguments);"),
+        "运行没有把意图身份挂到派活的参数上"
+    );
 }

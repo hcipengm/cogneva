@@ -1,3 +1,4 @@
+// census-keep: shapes=clocks — 下载客户端的连接/请求期限：上游不答时删掉它会永久挂住安装，由那次传输的墙与「换源重试」约定兜住
 //! 全部出网动作共用的「下载停没停」判据。
 //!
 //! 过去每个下载点各写各的超时：镜像包有、helm 只有连接超时、firecracker 与
@@ -31,6 +32,7 @@ pub struct Timeouts {
 /// curl 的速率下限：只要有字节进来就算在动。
 ///
 /// 写成 1 而不是 0，因为 0 在 curl 里不是「任何速率都算在动」。
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const CURL_SPEED_LIMIT_BYTES_PER_SEC: &str = "1";
 
 impl Timeouts {
@@ -53,7 +55,8 @@ impl Timeouts {
 }
 
 /// 装不下去的东西：K3s 安装脚本、helm、预编译镜像的校验文本。
-// cap: bound — 一分钟没有新字节就是停住了：这是拍定的界，不是量出来的
+// cap: fixed — 一分钟没有新字节就是停住了：这是拍定的界，不是量出来的
+// keep: 删掉后一个不再来字节的下载会一直等下去，装机永远不结束；由「一分钟没有新字节就是停住了」兜住
 pub const MANDATORY: Timeouts = Timeouts {
     connect: 15,
     stall: 60,
@@ -61,7 +64,8 @@ pub const MANDATORY: Timeouts = Timeouts {
 };
 
 /// 大件：镜像包（数百 MB）。慢网下每段仍会有字节进来，判据看的是字节，不是总时长。
-// cap: bound — 大件在慢网上会长时间低速率，窗口放宽到两分钟；判据仍是「没字节」
+// cap: fixed — 大件在慢网上会长时间低速率，窗口放宽到两分钟；判据仍是「没字节」
+// keep: 删掉后慢网上的大件会一直占着下载位，不走重试与降级；由「大件两分钟没有新字节即停」兜住
 pub const LARGE: Timeouts = Timeouts {
     connect: 15,
     stall: 120,
@@ -69,7 +73,8 @@ pub const LARGE: Timeouts = Timeouts {
 };
 
 /// 可选组件：装不上就降级走别的形态，不该拖着装机流程（firecracker 即此类）。
-// cap: bound — 降级比等待便宜：十几秒没字节就走别的形态
+// cap: fixed — 降级比等待便宜：十几秒没字节就走别的形态
+// keep: 删掉后可选件等不到会一直等，拖住整条装机链路；由「降级比等待便宜」兜住
 pub const OPTIONAL: Timeouts = Timeouts {
     connect: 5,
     stall: 15,
@@ -78,6 +83,7 @@ pub const OPTIONAL: Timeouts = Timeouts {
 
 /// 可达性探测的时限（与 shell 侧 `probe_reachable` 的 5s 对齐）。
 // cap: fixed — 与 shell 侧 probe_reachable 的 5s 对齐：同一件事在两侧不能有两个时限
+// not-a-bound: 与 shell 侧 probe_reachable 的 5s 对齐：同一件事在两侧不能有两个时限
 pub const PROBE: Duration = Duration::from_secs(5);
 
 /// 下载到文件。任何失败返回 Err，调用方决定是回退还是降级。

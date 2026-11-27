@@ -49,7 +49,7 @@ pub async fn task_budget_post_handler(
     if let Some(refusal) = reject_two_actions(&req) {
         return refusal;
     }
-    forward(serde_json::to_value(&req).unwrap_or_default()).await
+    forward(cog_core::logged_default!(serde_json::to_value(&req))).await
 }
 
 /// 「撤」与「写」同时给出来时的拒单。抽成函数是为了能在没有 `GatewayState` 的地方

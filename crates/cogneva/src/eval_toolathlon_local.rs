@@ -26,10 +26,12 @@ use crate::eval_mcp_in_pod::sh_quote as shq;
 use crate::eval_toolathlon::{ToolathlonPod, CONTAINER_AGENT_WORKSPACE};
 
 /// 上游 `overlong_tool_manager.PAGE_SIZE`：一页约一万字符。
-// cap: bound — 取自上游 overlong_tool_manager.PAGE_SIZE：一页约一万字符
+// cap: fixed — 取自上游 overlong_tool_manager.PAGE_SIZE：一页约一万字符
+// keep: 删掉后回到「取自上游 overlong_tool_manager.PAGE_SIZE：一页约一万字符」所描述的情形；由这条约定兜住
 const PAGE_SIZE: usize = 10_000;
 /// 上游 `python_execute` 自带上界：`timeout = min(int(timeout), 120)`。
-// cap: bound — 上游 python_execute 自带的上界 timeout = min(int(timeout), 120)
+// cap: fixed — 上游 python_execute 自带的上界 timeout = min(int(timeout), 120)
+// keep: 删掉后回到「上游 python_execute 自带的上界 timeout = min(int(timeout), 120)」所描述的情形；由这条约定兜住
 // wall: 等=上游 python_execute 自己的上界，这里是它的副本，不是第二个界 / 等不到=由上游那一条收尾，这一格只保证两边写成同一个数 / 续跑=不适用：这一格不自己收任何东西
 const PYTHON_TIMEOUT_CEILING: u64 = 120;
 
@@ -232,6 +234,7 @@ impl LocalTools {
                 .unwrap_or(0.0),
         });
         self.pod
+            // state-file: artifact — 容器工作区里一次评测的产物，按运行命名，不是某条事实的第二份正本
             .write_bytes(&format!("{dir}/{id}.json"), body.to_string().as_bytes())
             .await?;
         let preview: String = content.chars().take(200).collect();
@@ -263,6 +266,7 @@ impl LocalTools {
         if !looks_like_id {
             return Ok(format!("No saved output with id '{id}'."));
         }
+        // state-file: artifact — 容器工作区里一次评测的产物，按运行命名，不是某条事实的第二份正本
         let path = format!("{CONTAINER_AGENT_WORKSPACE}/.overlong_tool_outputs/{id}.json");
         let Some(raw) = self.pod.read_text(&path).await? else {
             return Ok(format!("No saved output with id '{id}'."));

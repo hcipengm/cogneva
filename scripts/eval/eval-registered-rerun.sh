@@ -261,6 +261,7 @@ reclaim() {
       log "the leftover pods did not go away within ${RECLAIM_WAIT}s: $(printf '%s' "$left" | tr '\n' ' ')"
       return 1
     fi
+    # not-a-bound: 等待外部状态收敛/轮询的让路节拍——它决定多久看一次，不结束任何活
     sleep 5
   done
   if checkpoint_held; then
@@ -719,6 +720,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   io_at_row=$last_io
   phase=timeout
   while [ $(( $(date +%s) - started )) -lt "$POD_TIMEOUT" ]; do
+    # not-a-bound: 等待外部状态收敛/轮询的让路节拍——它决定多久看一次，不结束任何活
     sleep 20
     ph=$($KUBECTL -n "$NAMESPACE" get pod "$name" -o jsonpath='{.status.phase}' 2>/dev/null)
     case "$ph" in Succeeded|Failed) phase=$ph; break;; esac

@@ -1,3 +1,4 @@
+# census-keep: shapes=deploy-numbers — 部署清单里的数是部署自己的声明：它写在生效的那一处，改它只改这一次部署，不是代码里看不见的默认；由部署面本身兜住
 # Cogneva K8s 多节点镜像分发器（常设、可重入）。
 # 用途：多节点集群里 `ctr images import` 只覆盖单节点；DaemonSet 让每个节点的
 # containerd 都预导入 localhost/cogneva:local 作暖缓存（工作负载实际 pin

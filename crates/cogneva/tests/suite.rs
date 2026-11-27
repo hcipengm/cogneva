@@ -86,6 +86,121 @@ mod a_payload_field_becomes_a_column_not_a_query_test;
 #[path = "a_pending_count_that_could_not_be_read_is_not_zero_test.rs"]
 mod a_pending_count_that_could_not_be_read_is_not_zero_test;
 
+#[path = "a_losing_candidate_keeps_why_it_lost_test.rs"]
+mod a_losing_candidate_keeps_why_it_lost_test;
+
+#[path = "the_config_default_book_only_shrinks_test.rs"]
+mod the_config_default_book_only_shrinks_test;
+
+#[path = "the_progress_probe_is_one_text_test.rs"]
+mod the_progress_probe_is_one_text_test;
+#[path = "the_state_file_book_only_shrinks_test.rs"]
+mod the_state_file_book_only_shrinks_test;
+#[path = "the_ui_refresh_cycle_is_one_number_in_both_trees_test.rs"]
+mod the_ui_refresh_cycle_is_one_number_in_both_trees_test;
+
+#[path = "the_database_pressure_readings_reach_rules_test.rs"]
+mod the_database_pressure_readings_reach_rules_test;
+
+#[path = "the_task_graph_reads_use_indexes_that_do_not_grow_with_history_test.rs"]
+mod the_task_graph_reads_use_indexes_that_do_not_grow_with_history_test;
+
+#[path = "the_event_stream_is_split_into_domain_and_telemetry_test.rs"]
+mod the_event_stream_is_split_into_domain_and_telemetry_test;
+
+#[path = "a_change_carries_the_goal_that_asked_for_it_test.rs"]
+mod a_change_carries_the_goal_that_asked_for_it_test;
+
+#[path = "a_delete_asks_whether_the_world_keeps_another_copy_test.rs"]
+mod a_delete_asks_whether_the_world_keeps_another_copy_test;
+
+#[path = "the_build_plan_is_recorded_as_a_fact_test.rs"]
+mod the_build_plan_is_recorded_as_a_fact_test;
+
+#[path = "the_roster_projection_has_a_rebuild_command_test.rs"]
+mod the_roster_projection_has_a_rebuild_command_test;
+
+#[path = "a_message_body_can_live_outside_the_event_test.rs"]
+mod a_message_body_can_live_outside_the_event_test;
+
+#[path = "a_stalled_build_is_stopped_by_its_attribution_test.rs"]
+mod a_stalled_build_is_stopped_by_its_attribution_test;
+
+#[path = "a_prefix_break_is_named_from_the_calls_themselves_test.rs"]
+mod a_prefix_break_is_named_from_the_calls_themselves_test;
+
+#[path = "a_revised_terminal_needs_a_reason_and_changes_only_its_item_test.rs"]
+mod a_revised_terminal_needs_a_reason_and_changes_only_its_item_test;
+
+#[path = "db_pressure_reads_the_limits_the_database_enforces_test.rs"]
+mod db_pressure_reads_the_limits_the_database_enforces_test;
+
+#[path = "a_batch_can_be_named_instead_of_being_the_whole_ledger_test.rs"]
+mod a_batch_can_be_named_instead_of_being_the_whole_ledger_test;
+
+#[path = "a_change_ledger_rebuilds_from_declared_facts_test.rs"]
+mod a_change_ledger_rebuilds_from_declared_facts_test;
+
+#[path = "the_change_ledger_is_a_projection_of_its_facts_test.rs"]
+mod the_change_ledger_is_a_projection_of_its_facts_test;
+
+#[path = "the_change_ledger_carries_the_watermark_it_read_to_test.rs"]
+mod the_change_ledger_carries_the_watermark_it_read_to_test;
+
+#[path = "a_futex_wait_says_what_is_readable_about_its_holder_test.rs"]
+mod a_futex_wait_says_what_is_readable_about_its_holder_test;
+
+#[path = "a_retention_floor_follows_the_farthest_reader_test.rs"]
+mod a_retention_floor_follows_the_farthest_reader_test;
+
+#[path = "a_table_migration_resumes_from_its_target_test.rs"]
+mod a_table_migration_resumes_from_its_target_test;
+
+#[path = "a_table_swap_stops_where_the_reading_says_test.rs"]
+mod a_table_swap_stops_where_the_reading_says_test;
+
+#[path = "one_shape_per_concept_test.rs"]
+mod one_shape_per_concept_test;
+
+#[path = "a_cache_miss_says_which_layer_let_it_through_test.rs"]
+mod a_cache_miss_says_which_layer_let_it_through_test;
+
+#[path = "a_documentation_only_change_does_not_rebuild_the_binary_test.rs"]
+mod a_documentation_only_change_does_not_rebuild_the_binary_test;
+
+#[path = "a_workspace_test_run_narrows_to_the_cells_whose_inputs_changed_test.rs"]
+mod a_workspace_test_run_narrows_to_the_cells_whose_inputs_changed_test;
+
+#[path = "a_chat_projection_folds_only_what_is_new_test.rs"]
+mod a_chat_projection_folds_only_what_is_new_test;
+
+#[path = "no_clock_kills_work_test.rs"]
+mod no_clock_kills_work_test;
+
+#[path = "the_three_disciplines_name_their_gates_test.rs"]
+mod the_three_disciplines_name_their_gates_test;
+
+#[path = "the_stagnation_window_is_measured_not_declared_test.rs"]
+mod the_stagnation_window_is_measured_not_declared_test;
+
+#[path = "the_two_todo_sources_do_not_fall_back_to_each_other_test.rs"]
+mod the_two_todo_sources_do_not_fall_back_to_each_other_test;
+
+#[path = "the_landing_account_is_a_shadow_of_the_stream_test.rs"]
+mod the_landing_account_is_a_shadow_of_the_stream_test;
+
+#[path = "every_stream_table_has_the_no_scheduled_delete_rule_test.rs"]
+mod every_stream_table_has_the_no_scheduled_delete_rule_test;
+
+#[path = "the_read_surface_layer_holds_no_sql_test.rs"]
+mod the_read_surface_layer_holds_no_sql_test;
+
+#[path = "self_evolution_section_seven_names_its_code_test.rs"]
+mod self_evolution_section_seven_names_its_code_test;
+
+#[path = "every_read_surface_names_the_port_it_delegates_to_test.rs"]
+mod every_read_surface_names_the_port_it_delegates_to_test;
+
 #[path = "a_change_is_accepted_or_refused_before_it_lands_test.rs"]
 mod a_change_is_accepted_or_refused_before_it_lands_test;
 #[path = "a_claim_the_capacity_loop_raises_is_one_it_was_told_about_test.rs"]
@@ -110,6 +225,8 @@ mod a_day_is_named_by_one_clock_test;
 mod a_default_table_names_its_numbers_test;
 #[path = "a_failed_login_that_was_not_counted_says_so_test.rs"]
 mod a_failed_login_that_was_not_counted_says_so_test;
+#[path = "a_filing_is_judged_before_it_lands_test.rs"]
+mod a_filing_is_judged_before_it_lands_test;
 #[path = "a_job_inner_wait_budget_widens_the_job_deadline_test.rs"]
 mod a_job_inner_wait_budget_widens_the_job_deadline_test;
 #[path = "the_event_stream_has_one_write_path_test.rs"]
@@ -123,6 +240,17 @@ mod dynamic_insert_tables_are_declared_test;
 
 #[path = "every_envelope_column_has_a_reader_test.rs"]
 mod every_envelope_column_has_a_reader_test;
+mod every_event_class_names_its_writer_and_reader_test;
+mod every_evidence_carrier_declares_its_retention_test;
+#[path = "every_select_sleep_is_classified_test.rs"]
+mod every_select_sleep_is_classified_test;
+mod every_storage_reader_is_in_the_census_test;
+mod every_table_is_in_the_event_source_census_test;
+mod every_usage_reader_names_its_source_test;
+#[path = "every_work_clock_answers_the_first_question_test.rs"]
+mod every_work_clock_answers_the_first_question_test;
+mod no_fact_write_is_sampled_test;
+mod no_record_files_are_written_test;
 
 #[path = "a_judged_out_row_stays_owed_and_carries_its_reason_test.rs"]
 mod a_judged_out_row_stays_owed_and_carries_its_reason_test;
@@ -182,10 +310,14 @@ mod a_timeout_wall_is_a_named_value_test;
 mod a_tool_that_changes_things_asks_the_person_first_test;
 #[path = "a_transition_nobody_could_read_is_not_judged_against_a_made_up_state_test.rs"]
 mod a_transition_nobody_could_read_is_not_judged_against_a_made_up_state_test;
+#[path = "a_turn_that_is_only_talk_files_nothing_test.rs"]
+mod a_turn_that_is_only_talk_files_nothing_test;
 #[path = "a_waiting_reason_is_declared_once_test.rs"]
 mod a_waiting_reason_is_declared_once_test;
 #[path = "a_wall_answers_when_nothing_arrives_test.rs"]
 mod a_wall_answers_when_nothing_arrives_test;
+#[path = "a_wall_may_not_end_work_it_cannot_resume_test.rs"]
+mod a_wall_may_not_end_work_it_cannot_resume_test;
 #[path = "a_word_written_out_is_the_word_read_back_test.rs"]
 mod a_word_written_out_is_the_word_read_back_test;
 #[path = "a_worker_can_ask_to_change_the_system_test.rs"]
@@ -220,6 +352,8 @@ mod agent_tools_test;
 mod agent_wal_test;
 #[path = "agent_wrapper_test.rs"]
 mod agent_wrapper_test;
+#[path = "an_answer_never_waits_on_a_snapshot_that_never_lands_test.rs"]
+mod an_answer_never_waits_on_a_snapshot_that_never_lands_test;
 #[path = "an_employee_can_search_and_commit_test.rs"]
 mod an_employee_can_search_and_commit_test;
 #[path = "an_employee_works_in_its_own_checkout_test.rs"]
@@ -266,6 +400,8 @@ mod bounds_registry_test;
 mod ignored_test_corpus_contract_test;
 #[path = "shipped_config_numbers_are_registered_test.rs"]
 mod shipped_config_numbers_are_registered_test;
+#[path = "the_employee_row_starts_a_stream_or_shows_a_failure_test.rs"]
+mod the_employee_row_starts_a_stream_or_shows_a_failure_test;
 #[path = "the_exchange_writer_binds_only_columns_the_store_creates_test.rs"]
 mod the_exchange_writer_binds_only_columns_the_store_creates_test;
 
@@ -406,6 +542,7 @@ mod every_rendered_profile_is_a_tree_the_deployer_delivers_test;
 mod every_served_route_is_a_face_or_says_who_it_serves_test;
 #[path = "every_updated_table_declares_its_shape_test.rs"]
 mod every_updated_table_declares_its_shape_test;
+
 #[path = "export_package_names_test.rs"]
 mod export_package_names_test;
 #[path = "gateway_answers_a_waited_prompt.rs"]
@@ -654,6 +791,8 @@ mod the_quota_cells_are_written_by_a_projection_test;
 mod the_repo_root_is_computed_in_one_place_test;
 #[path = "the_roster_reads_people_not_roles_test.rs"]
 mod the_roster_reads_people_not_roles_test;
+#[path = "the_table_registries_agree_test.rs"]
+mod the_table_registries_agree_test;
 #[path = "the_token_counters_are_a_projection_of_the_ledger_test.rs"]
 mod the_token_counters_are_a_projection_of_the_ledger_test;
 #[path = "todo_panel_shows_one_list_test.rs"]

@@ -12,7 +12,8 @@ use async_trait::async_trait;
 ///
 /// 连不上通常是被网络策略挡住或对端没起，这两种都不靠等解决；10s 让调用方
 /// 快速失败，而不是卡在 SYN 重传里。
-// cap: bound — 连沙盒执行器的墙
+// cap: fixed — 连沙盒执行器的墙
+// keep: 删掉后连不上的执行器会让调用卡在 SYN 重传里，几分钟才失败；由「连不上的两种原因都不靠等解决」兜住
 // wall: 等=到沙盒执行器的连接建立 / 等不到=这一次调用记成「连不上执行器」，与「执行器慢」分得开 / 续跑=能，换一次连接重来
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -26,21 +27,24 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// 跑 `cargo clippy`、读文件、产出 diff：它重试十几次都落在窗口里，最后交了白卷，
 /// 一条停线单连交三轮零改动、预算耗尽记 `failed`。窗口比一条命令长，客户端就得
 /// 比窗口更长——这不是"执行器坏了"，是"执行器正在被换掉"。
-// cap: bound — 跨一次执行器换版的等待上界
+// cap: fixed — 跨一次执行器换版的等待上界
+// keep: 删掉后客户端在换版窗口内就判「执行器坏了」，一条命令都发不出去（2026-11-06 实测交白卷）；由「跨一次执行器换版的等待上界」兜住
 const REPLACEMENT_WINDOW: std::time::Duration = std::time::Duration::from_secs(200);
 
 /// 换版窗口里第一次重试之前等多久。
 ///
 /// 比它更短的等法没有意义：端口拒绝是「还没有就绪后端」，而下一次尝试要跨过的是
 /// 一次容器启动，不是一次调度；等得比这更短只是把同一条失败的连接多打几遍。
-// cap: bound — 重试退避的起点，短于一次容器启动就没有可等的东西
+// cap: fixed — 重试退避的起点，短于一次容器启动就没有可等的东西
+// keep: 删掉后重试立即重来，同一条失败的连接在容器起来之前一连打十几遍；由「下一次尝试要跨过一次容器启动」兜住
 const RETRY_FIRST_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// 退避翻倍到这个数就不再涨。
 ///
 /// 窗口有两百秒，而退避只负责「不要空转」：五秒已经很粗，再长就只是在窗口里少试
 /// 几次，把本来已经就绪的后端多等一轮。
-// cap: bound — 退避的粗粒度上界，再长就少试几次而已
+// cap: fixed — 退避的粗粒度上界，再长就少试几次而已
+// keep: 删掉后退避一直翻倍，窗口里只剩最后几次尝试，已经就绪的后端被多等一轮；由「退避只负责不空转」兜住
 const RETRY_MAX_PAUSE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 问「这副副本上有没有这条 lane 的树」最多等多久。
@@ -49,7 +53,8 @@ const RETRY_MAX_PAUSE: std::time::Duration = std::time::Duration::from_secs(5);
 /// 而树不随进程消失。问不到就当「没有」，按轮转落点——等得比这更久，等于把重启
 /// 后的第一条命令挂在一次读目录上；而问错一次的代价只是那条命令落在一棵新树上，
 /// 那副副本的第一帧会如实说出树是从哪来的。
-// cap: bound — 这一问是一次读目录，正常在毫秒级；2s 分的是「答得慢」与「答不上」，再长只是让重启后的第一条命令陪着等
+// cap: fixed — 这一问是一次读目录，正常在毫秒级；2s 分的是「答得慢」与「答不上」，再长只是让重启后的第一条命令陪着等
+// not-a-bound: 这一问是一次读目录，正常在毫秒级；2s 分的是「答得慢」与「答不上」，再长只是让重启后的第一条命令陪着等
 // wall: 等=执行器把一次目录读回来 / 等不到=这一问读作「答不上」，**不是空目录**——空目录是一个真实读数，两者不能同形 / 续跑=能，下一次问再读一遍
 const TREE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -113,7 +118,8 @@ use futures::StreamExt;
 /// holding it forever would keep sending commands to a replica that is gone.
 /// Five seconds is short against a scale-out and long against a command, and it
 /// bounds how long an address that has already vanished may still be tried.
-// cap: bound — 副本表的保鲜期：新副本最迟这么久之后会被用上
+// cap: fixed — 副本表的保鲜期：新副本最迟这么久之后会被用上
+// keep: 删掉后副本表要么每次命令都问 DNS，要么一直用着已经消失的地址；由「新增副本最迟五秒被用上」兜住
 const ENDPOINT_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Where the executor replicas' addresses come from.
@@ -590,7 +596,7 @@ impl RemoteExecutor {
             Ok(response) => {
                 // 404：那副上没有这条 lane 的树——没有东西可搬，不是故障。
                 let status = response.status();
-                let body = response.text().await.unwrap_or_default();
+                let body = cog_core::logged_default!(response.text().await);
                 tracing::info!(
                     lane,
                     from,
@@ -620,7 +626,7 @@ impl RemoteExecutor {
             .await;
         match arrived {
             Ok(response) if response.status().is_success() => {
-                let answer = response.text().await.unwrap_or_default();
+                let answer = cog_core::logged_default!(response.text().await);
                 tracing::info!(
                     lane,
                     from,
@@ -632,7 +638,7 @@ impl RemoteExecutor {
             }
             Ok(response) => {
                 let status = response.status();
-                let body = response.text().await.unwrap_or_default();
+                let body = cog_core::logged_default!(response.text().await);
                 tracing::warn!(
                     lane,
                     from,
@@ -808,7 +814,7 @@ impl SandboxBackend for RemoteExecutor {
         };
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = cog_core::logged_default!(response.text().await);
             return Err(cog_core::SFError::Agent(format!(
                 "sandbox executor returned {}: {}",
                 status, body
@@ -1046,7 +1052,7 @@ mod tests {
                     body.len(),
                     body
                 );
-                let _ = socket.write_all(response.as_bytes()).await;
+                cog_core::ignore_lost!(socket.write_all(response.as_bytes()).await);
             }
         });
         (format!("http://{}", addr), hits)
@@ -1141,7 +1147,7 @@ mod tests {
                     body.len(),
                     body
                 );
-                let _ = socket.write_all(response.as_bytes()).await;
+                cog_core::ignore_lost!(socket.write_all(response.as_bytes()).await);
             }
         });
         (format!("http://{}", addr), hits, looks)
@@ -1192,7 +1198,7 @@ mod tests {
                     body.len(),
                     body
                 );
-                let _ = socket.write_all(response.as_bytes()).await;
+                cog_core::ignore_lost!(socket.write_all(response.as_bytes()).await);
             }
         });
         format!("http://{}", addr)
@@ -1307,7 +1313,7 @@ mod tests {
                     )
                     .into_bytes()
                 };
-                let _ = socket.write_all(&response).await;
+                cog_core::ignore_lost!(socket.write_all(&response).await);
             }
         });
         (format!("http://{}", addr), log)
@@ -1338,7 +1344,7 @@ mod tests {
             }
 
             let (mut second, _) = listener.accept().await.unwrap();
-            let _ = second.read(&mut buf).await;
+            cog_core::ignore_lost!(second.read(&mut buf).await);
             let body = format!(
                 "{}\n{}\n",
                 serde_json::to_string(&CommandEvent::Workdir {
@@ -1353,7 +1359,7 @@ mod tests {
                 body.len(),
                 body
             );
-            let _ = second.write_all(response.as_bytes()).await;
+            cog_core::ignore_lost!(second.write_all(response.as_bytes()).await);
         });
         format!("http://{}", addr)
     }
@@ -2052,7 +2058,7 @@ mod tests {
             let (mut socket, _) = listener.accept().await.unwrap();
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut buf = vec![0u8; 4096];
-            let _ = socket.read(&mut buf).await;
+            cog_core::ignore_lost!(socket.read(&mut buf).await);
             let body = format!(
                 "{}\n",
                 serde_json::to_string(&CommandEvent::Exit { code: 0 }).unwrap()

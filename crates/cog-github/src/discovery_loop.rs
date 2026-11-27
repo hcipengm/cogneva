@@ -32,15 +32,18 @@ pub const DISCOVERY_ROLE: &str = "issue_discovery";
 /// What a single assess task declares it will take. Nothing ends the row at
 /// this number; it must still exceed the wait budget below, so the poller's
 /// "I stopped waiting" is the statement a round hears, not the row's.
-// cap: bound — 必须长于下面的等待预算，这样轮询放弃先于任何对行的看法
+// cap: fixed — 必须长于下面的等待预算，这样轮询放弃先于任何对行的看法
+// keep: 删掉后轮询放弃晚于对行的看法，一行被判超时时任务还在等；由「必须长于等待预算」兜住
 const ASSESS_TASK_DECLARED_SECS: u64 = 120;
 /// How long the discovery loop blocks waiting for an assess verdict before it
 /// gives up and falls back to the local heuristic this round.
-// cap: bound — 等这么久拿不到判词就落回本地启发式，这一轮不再等下去
+// cap: fixed — 等这么久拿不到判词就落回本地启发式，这一轮不再等下去
+// keep: 删掉后拿不到判词就一直等，这一轮不落回本地启发式；由「拿不到就落回本地启发式」兜住
 // wall: 等=一次评估给出判词 / 等不到=这一轮落回本地启发式，不再等下去；判词没来不等于判词是「否」 / 续跑=能，下一轮重新等
 const ASSESS_WAIT_TIMEOUT_SECS: u64 = 100;
 /// Poll interval while waiting for the assess task to complete.
-// cap: bound — 等待期间多久问一次
+// cap: fixed — 等待期间多久问一次
+// keep: 删掉后等待期间问得太密或太疏，判词到达与发现之间没有格；由「等待期间多久问一次」兜住
 const ASSESS_POLL_INTERVAL_MS: u64 = 500;
 /// Judgement-logic epoch mixed into the assess task id hash. Bump it when the
 /// judge prompt/logic changes, or after a bulk queue reset, to force one
@@ -82,18 +85,21 @@ Reply with ONE JSON object only, no prose, no code fence:\n\
 priority is 1 (highest) to 5 (lowest). When decision is not `clarify`, leave question empty. \
 Write the question in the same language the reporter used.";
 /// Maximum cross-validation tasks running concurrently for this instance.
-// cap: bound — 这个实例同时能跑几条交叉验证
+// cap: fixed — 这个实例同时能跑几条交叉验证
+// keep: 删掉后这个实例同时跑任意多条交叉验证，把上游与内存一起压住；由「这个实例同时能跑几条」兜住
 const MAX_CROSS_VALIDATION_INFLIGHT: usize = 3;
 /// What one cross-validation task declares it will take (apply + workspace
 /// tests + optional eval A/B in the sandbox).
-// cap: bound — 一条交叉验证要应用补丁、跑工作区测试、可选在沙箱里做 A/B 评测，所以声明按小时计
+// cap: fixed — 一条交叉验证要应用补丁、跑工作区测试、可选在沙箱里做 A/B 评测，所以声明按小时计
+// keep: 删掉后回到「一条交叉验证要应用补丁、跑工作区测试、可选在沙箱里做 A/B 评测，所以声明按小时计」所描述的情形；由这条约定兜住
 const CROSS_VALIDATE_TASK_DECLARED_SECS: u64 = 3600;
 /// Upper bound of the per-intent exponential backoff after terminal
 /// (deterministic) upstream failures. Quota/billing windows reset on a
 /// day scale; probing more often than this cap only adds failed attempts
 /// without speeding recovery. Six hours bounds the post-reset recovery
 /// lag while keeping probe cost at one failed call per intent per window.
-// cap: bound — 六小时界住重置之后的恢复滞后，同时让探测成本停在「每个意图每窗一次失败的调用」
+// cap: fixed — 六小时界住重置之后的恢复滞后，同时让探测成本停在「每个意图每窗一次失败的调用」
+// keep: 删掉后重置之后的恢复滞后无界，探测成本不再停在每窗一次调用；由「六小时界住恢复滞后」兜住
 const TERMINAL_BACKOFF_CAP_SECS: u64 = 6 * 60 * 60;
 /// How long a finished attempt keeps its intent answered, counted from the
 /// round that saw it finish rather than from the row that carried it.
@@ -114,7 +120,8 @@ const TERMINAL_BACKOFF_CAP_SECS: u64 = 6 * 60 * 60;
 /// broken issue is re-examined at most once per working day or so, and long
 /// enough to sit out a quota window that kept the attempt from being a real
 /// test of the fix.
-// cap: bound — 要长过一个曾让那次尝试不构成真正验证的配额窗
+// cap: fixed — 要长过一个曾让那次尝试不构成真正验证的配额窗
+// keep: 删掉后那次尝试在让它不构成真正验证的配额窗内就被读成已答；由「要长过那个配额窗」兜住
 const ANSWERED_GRACE_SECS: u64 = 48 * 60 * 60;
 
 /// Whether a failed processing attempt is deterministic: retrying the same
@@ -440,8 +447,8 @@ fn default_state_dir() -> std::path::PathBuf {
         clear_stale_state_dirs(&temp);
         let d = temp.join(format!("cogneva-test-state-{}", std::process::id()));
         // A reused pid inherits the previous run's state and fixtures with it.
-        let _ = std::fs::remove_dir_all(&d);
-        let _ = std::fs::create_dir_all(&d);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&d));
+        cog_core::ignore_lost!(std::fs::create_dir_all(&d));
         d
     })
     .clone()
@@ -474,7 +481,7 @@ fn clear_stale_state_dirs(temp: &std::path::Path) {
             .map(|age| age.as_secs() > 86_400)
             .unwrap_or(false);
         if stale {
-            let _ = std::fs::remove_dir_all(entry.path());
+            cog_core::ignore_lost!(std::fs::remove_dir_all(entry.path()));
         }
     }
 }
@@ -552,7 +559,8 @@ fn intent_verdict_prefix(task_id: &str) -> Option<String> {
 /// listing that returns exactly this many entries may be truncated, so
 /// reaping requires a count below the cap on both surfaces to treat the open
 /// set as provably complete.
-// cap: bound — 只读一页的 provider 两个面都要数到低于这个界，才能把开放集当作可证完整
+// cap: fixed — 只读一页的 provider 两个面都要数到低于这个界，才能把开放集当作可证完整
+// keep: 删掉后只读一页的 provider 数不到低于界，开放集不能当作可证完整；由「两个面都要数到低于这个界」兜住
 const PROVIDER_LIST_PAGE_SIZE: usize = 100;
 
 fn listings_complete(issue_count: usize, pr_count: usize) -> bool {
@@ -591,10 +599,10 @@ impl AssessVerdicts {
 
     async fn persist(&self) {
         if let Some(parent) = self.path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+            cog_core::ignore_lost!(tokio::fs::create_dir_all(parent).await);
         }
         if let Ok(text) = serde_json::to_string(&self.map) {
-            let _ = tokio::fs::write(&self.path, text).await;
+            cog_core::ignore_lost!(tokio::fs::write(&self.path, text).await);
         }
     }
 
@@ -1665,7 +1673,7 @@ impl GitHubDiscoveryLoop {
             .provider
             .fetch_ci_failure_logs(fix_run)
             .await
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
 
         let log_section = logs
             .iter()
@@ -1786,7 +1794,7 @@ impl GitHubDiscoveryLoop {
             IntentKind::Issue => self.provider.list_issue_comments(number).await,
             IntentKind::Pr => self.provider.list_pull_comments(number).await,
         }
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
         let key = kind.key(number);
         let bot_logins = self.config.bot_identity.own_logins();
         let conversation = IssueConversation::from_comments(
@@ -2050,13 +2058,13 @@ impl GitHubDiscoveryLoop {
             if let Some(t) = polled {
                 match t.status {
                     TaskStatus::Completed => {
-                        let verdict = t.result.unwrap_or_default();
+                        let verdict = t.result.unwrap_or(Default::default());
                         let decision = Self::verdict_to_decision(&verdict);
                         self.verdict_store(id.clone(), decision.clone()).await;
                         return Ok(decision);
                     }
                     TaskStatus::Failed => {
-                        let reason = t.error.unwrap_or_default();
+                        let reason = t.error.unwrap_or(Default::default());
                         // 失败带类型时把类型原样带出来，别压成 Provider 的散文：
                         // 上层只允许按类型判"这次失败重发是否可能成功"，读文本等于
                         // 把判定权交给上游当天的措辞。没有类型可依才退回文本。
@@ -2707,7 +2715,8 @@ pub(crate) fn assess_acceptance(task_id: &str) -> String {
 /// The first pass after this ships has a few dozen rows to reach and runs on a
 /// round that is also polling two platforms; a batch bounds the burst, not the
 /// work.
-// cap: bound — 这一轮同时在轮询两个平台；一批界的是突发不是工作量
+// cap: fixed — 这一轮同时在轮询两个平台；一批界的是突发不是工作量
+// keep: 删掉后这一轮吞下整场突发，同时轮询两个平台的拍被撑破；由「一批界的是突发不是工作量」兜住
 const CRITERIA_SETTLE_BATCH: usize = 400;
 
 /// What one back-fill pass did.
@@ -2748,7 +2757,8 @@ fn criteria_backfill_is_done(settled: &SettledCriteria) -> bool {
 /// How many rows one pass may close. A backlog of dead rows costs one GitHub
 /// read per branch and workflow, so the bound is on the burst, not on the work:
 /// the next round picks up where this one stopped.
-// cap: bound — this bounds one round's burst of upstream reads (one read per
+// cap: fixed — this bounds one round's burst of upstream reads (one read per
+// keep: 删掉后一轮的上游读突发无界；由「一轮的突发有界」兜住
 // branch and workflow), not the number of dead rows waiting; no reading moves it
 const CI_SETTLE_BATCH: usize = 40;
 
@@ -6121,7 +6131,7 @@ pub(crate) mod tests {
                 .map(|v| &v.decision),
             Some(&decision)
         );
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        cog_core::ignore_lost!(tokio::fs::remove_dir_all(&dir).await);
     }
 
     #[tokio::test]
@@ -6143,7 +6153,7 @@ pub(crate) mod tests {
         };
         store.ensure_loaded().await;
         assert!(store.map.is_empty());
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        cog_core::ignore_lost!(tokio::fs::remove_dir_all(&dir).await);
     }
 
     #[test]

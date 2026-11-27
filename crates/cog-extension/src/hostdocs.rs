@@ -100,7 +100,8 @@ const JOURNAL_FILE: &str = "journal.json";
 /// 回滚完成后把日志改名成它。存在即「这一次已经回滚过」，读取侧据此拒收。
 const JOURNAL_ROLLED_BACK_FILE: &str = "journal.rolled-back.json";
 
-// cap: bound — Default for the body of one host document. Sized for the largest document this platform writes by hand (a plan or an audit), not to the channel's bound: a document is stored whole, so the number answers to what a reader can open.
+// cap: fixed — Default for the body of one host document. Sized for the largest document this platform writes by hand (a plan or an audit), not to the channel's bound: a document is stored whole, so the number answers to what a reader can open.
+// keep: 删掉后一份文档正文没有上限，一次写入把任意大的正文读进内存；由「人能打开的最大文档」兜住
 const DEFAULT_MAX_DOC_BYTES: usize = 8 * 1024 * 1024;
 /// A full-size body. **Deliberately not tied to the audited channel's bound**: that one
 /// is another process's quantity, bounding the text one request sends out, while this
@@ -108,16 +109,19 @@ const DEFAULT_MAX_DOC_BYTES: usize = 8 * 1024 * 1024;
 /// is a coincidence, and coupling them would let either side drag the other whenever it
 /// is adjusted -- while the smaller side is observable (`over_ceiling` carries both
 /// numbers) rather than silently lost.
-// cap: bound — 一份满尺寸正文的上限；特意不绑审计通道的界，那是另一个进程的量
+// cap: fixed — 一份满尺寸正文的上限；特意不绑审计通道的界，那是另一个进程的量
+// keep: 删掉后一次读取可以把任意大的正文读进内存，Pod 跟着正文的大小走；由「一份满尺寸正文」兜住
 const DEFAULT_MAX_READ_BYTES: usize = 8 * 1024 * 1024;
 /// A listing is for a person to read and for a model to read; past a few thousand
 /// entries, both sides are only paying for it.
-// cap: bound — 过几千条之后，人和模型都只是在为这份清单付钱
+// cap: fixed — 过几千条之后，人和模型都只是在为这份清单付钱
+// keep: 删掉后一次列目录把几十万条装进内存并送进模型，两边都为它付钱；由「人和模型都读得完的清单长度」兜住
 const DEFAULT_MAX_LIST_ENTRIES: usize = 5_000;
 /// A day. This gate is a person reading one plan, and a plan left unread for more than
 /// a working day is no longer the plan about to be read -- approving it then is
 /// approving something nobody looked at.
-// cap: bound — 种子：量不到审批延迟时的退路；生效的窗口取它与窗口内最慢一次实测中较大的那个
+// cap: fixed — 种子：量不到审批延迟时的退路；生效的窗口取它与窗口内最慢一次实测中较大的那个
+// keep: 删掉后第一次审批之前没有任何延迟读数，窗口无值可依，计划要么永不过期要么立刻过期；由「生效窗口取种子与实测中较大者」兜住
 const DEFAULT_APPROVAL_TTL_SECS: u64 = 86_400;
 
 /// How long an approval-latency sample stays in the window the window is
@@ -125,6 +129,7 @@ const DEFAULT_APPROVAL_TTL_SECS: u64 = 86_400;
 /// take to read one plan", which has weekly shape (a plan staged on Friday) --
 /// a window shorter than a month would call a quiet fortnight an empty one.
 // cap: fixed — 30 天：批准延迟带周形状（周五排的计划下周才读），更短的窗口会把安静的两周读成空窗口
+// keep: 删掉后延迟样本永远留着，半年前的节奏还在定今天的窗口；由「带周形状的三十天窗口」兜住
 const APPROVAL_LATENCY_WINDOW_SECS: u64 = 30 * 86_400;
 
 /// How long a question's measured wire size stays in the window the assist plan
@@ -132,16 +137,19 @@ const APPROVAL_LATENCY_WINDOW_SECS: u64 = 30 * 86_400;
 /// folders this station meets changes with the work, and the work has a weekly
 /// shape, so a shorter window would call a quiet fortnight an empty one.
 // cap: fixed — 30 天：与批准窗口同一个周形状的理由，一道问句的尺寸随这一周碰到的工作变
+// keep: 删掉后问句尺寸的样本永远留着，上个月碰到的工作还在定今天的推理计划；由「与批准窗口同一个周形状」兜住
 const QUESTION_WINDOW_SECS: u64 = 30 * 86_400;
 
 /// Headroom over the slowest measured approval. The measurement is one sample
 /// of a person's schedule, so the window gives the next one a quarter more
 /// room than the slowest one already took.
 // cap: fixed — 1.25 是留出的余量（四分之一）：一份样本只是一个人日程的一次读数，不是分布
+// keep: 删掉后窗口正好等于最慢的一次实测，下一份稍慢的计划就在点击前过期；由「一份样本不是分布，留四分之一余量」兜住
 const APPROVAL_TTL_MARGIN: f64 = 1.25;
 /// A window shorter than this is not a window: the plan could expire between being
 /// displayed and being clicked.
-// cap: bound — 比这更短的窗口不算窗口：计划可能在显示与点击之间过期
+// cap: fixed — 比这更短的窗口不算窗口：计划可能在显示与点击之间过期
+// keep: 删掉后算出的窗口可以短到计划在显示与点击之间就过期；由「比这更短不算窗口」兜住
 const MIN_APPROVAL_TTL_SECS: u64 = 60;
 /// The same order of magnitude as a body: if a plan carries more text than one write is
 /// allowed to carry, then approving it does not mean what it says on the tin.
@@ -1410,7 +1418,7 @@ impl HostDocs {
             .skipped
             .get("no_rule")
             .map(Vec::as_slice)
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let asked = self.ask_model(scope, candidates).await;
         self.metrics.count_assist(asked.outcome);
         // The hinted pass replaces the first rather than patching it: one function decides
@@ -1940,6 +1948,7 @@ impl HostDocs {
         if let Err(e) = validate_staged_id(staged_id) {
             return Err(StagedLoad::NoRecord(e));
         }
+        // state-file: handoff — 待批准/待应用的暂存计划，apply 或拒绝时取走即删，不是某条事实的第二份正本
         let path = self.staged_dir().join(format!("{staged_id}.json"));
         let body = match tokio::fs::read(&path).await {
             Ok(body) => body,
@@ -1974,6 +1983,7 @@ impl HostDocs {
                 dir.display()
             ))
         })?;
+        // state-file: handoff — 同一暂存队列的写入口，记录只活到 apply 或拒绝
         let published = dir.join(format!("{}.json", record.staged_id));
         cog_core::atomic_write::write_json_async(
             &published,
@@ -2134,7 +2144,11 @@ impl HostDocs {
             match self.apply_one(planned, &dir, records.len()).await {
                 Ok(record) => {
                     records.push(record);
-                    let resolved = planned.resolved.last().cloned().unwrap_or_default();
+                    let resolved = planned
+                        .resolved
+                        .last()
+                        .cloned()
+                        .unwrap_or(Default::default());
                     applied.push(AppliedOp {
                         resolved,
                         effect: planned.effect,
@@ -2147,7 +2161,7 @@ impl HostDocs {
                         Ok(()) => {
                             // Nothing survives a failed apply, so the journal
                             // has no restore value: drop it with its backups.
-                            let _ = tokio::fs::remove_dir_all(&dir).await;
+                            cog_core::ignore_lost!(tokio::fs::remove_dir_all(&dir).await);
                             SFError::Validation(format!(
                                 "{e}; the {} operation(s) applied before it were rolled back, so the scope is unchanged",
                                 records.len()
@@ -2158,7 +2172,7 @@ impl HostDocs {
                             // describe, let alone finish: leave the records on
                             // disk so the leftovers are discoverable instead of
                             // becoming silent.
-                            let _ = write_journal(&dir, &records).await;
+                            cog_core::ignore_lost!(write_journal(&dir, &records).await);
                             SFError::Agent(format!(
                                 "{e}; rolling back the applied prefix failed ({re}); journal {journal_id} holds what was done ({}) and needs a manual look",
                                 dir.display()

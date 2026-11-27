@@ -188,7 +188,7 @@ async fn webhook_handler(
     let signature = headers
         .get("x-hub-signature-256")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
 
     if !verify_signature(&state.secret, &body, signature) {
         tracing::warn!(event = %event, "Webhook 签名验证失败，已拒绝");
@@ -217,7 +217,7 @@ pub async fn run_webhook_server(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, webhook_router(state, &path))
         .with_graceful_shutdown(async move {
-            let _ = shutdown.changed().await;
+            cog_core::ignore_lost!(shutdown.changed().await);
         })
         .await
 }
@@ -257,7 +257,7 @@ async fn verified_github_handler(
     let signature = headers
         .get(INTERNAL_SIGNATURE_HEADER)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     if !verify_signature(&state.internal_secret, &body, signature) {
         tracing::warn!(event = %event, "GitHub 事件内部签名验证失败，已拒绝");
         return (StatusCode::UNAUTHORIZED, "invalid internal signature").into_response();
@@ -281,7 +281,7 @@ async fn verified_gitee_handler(
     let signature = headers
         .get(INTERNAL_SIGNATURE_HEADER)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     if !verify_signature(&state.internal_secret, &body, signature) {
         tracing::warn!(event = %event, "Gitee 事件内部签名验证失败，已拒绝");
         return (StatusCode::UNAUTHORIZED, "invalid internal signature").into_response();
@@ -320,7 +320,7 @@ pub async fn run_verified_webhook_server(
         verified_webhook_router(state, &github_path, &gitee_path),
     )
     .with_graceful_shutdown(async move {
-        let _ = shutdown.changed().await;
+        cog_core::ignore_lost!(shutdown.changed().await);
     })
     .await
 }

@@ -21,15 +21,19 @@ use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 
 /// App JWT 有效期：9 分钟（GitHub 硬上限 10 分钟）。
 // cap: fixed — GitHub 的 App JWT 寿命上限是 10 分钟，这里取 9 分钟给它留余量
+// keep: 删掉后按 10 分钟上限签，网关与 GitHub 的时钟偏差就可能让 JWT 在途过期；由「10 分钟上限留余量」兜住
 const JWT_TTL_SECS: i64 = 9 * 60;
 /// 签发时间提前 60s，容忍网关与 GitHub 时钟偏差。
-// cap: bound — 签发时间往前推的量，容忍网关与 GitHub 之间的时钟偏差
+// cap: fixed — 签发时间往前推的量，容忍网关与 GitHub 之间的时钟偏差
+// keep: 删掉后时钟偏差让签出的 JWT 被判为尚未生效；由「容忍网关与 GitHub 之间的时钟偏差」兜住
 const JWT_CLOCK_SKEW_SECS: i64 = 60;
 /// installation token 在实际过期前留足刷新余量。
-// cap: bound — installation token 到期前提前刷新的余量，取两分钟
+// cap: fixed — installation token 到期前提前刷新的余量，取两分钟
+// keep: 删掉后 token 到期才刷，正在进行的请求拿着已经过期的 token；由「到期前提前刷新的余量」兜住
 const REFRESH_MARGIN_SECS: u64 = 120;
 /// 解析不到过期时间时的保守缓存时长（installation token 寿命约 1 小时）。
 // cap: fixed — installation token 寿命约 1 小时；解析不到 expires_at 时按 50 分钟保守缓存
+// keep: 删掉后回到「installation token 寿命约 1 小时；解析不到 expires_at 时按 50 分钟保守缓存」所描述的情形；由这条约定兜住
 const FALLBACK_TTL_SECS: u64 = 50 * 60;
 
 /// GitHub App 凭证（仅驻留网关内存，Debug 不打印私钥）。
@@ -178,7 +182,7 @@ pub async fn installation_token(
         .map_err(|e| format!("请求 GitHub installation token 失败: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let body = cog_core::logged_default!(resp.text().await);
         let body: String = body.chars().take(300).collect();
         return Err(format!("installation token 接口返回 {status}: {body}"));
     }

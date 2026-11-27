@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 ///
 /// 探针问的是「这个面还活着吗」，正常是毫秒级；5s 是「慢」与「死了」的分界，
 /// 更久只会让一轮巡检被一个不响的端点拖住。
-// cap: bound — 探针问的是「这个面还活着吗」，正常是毫秒级；5s 是「慢」与「死了」的分界，更久只会让一轮巡检被一个不响的端点拖住
+// cap: fixed — 探针问的是「这个面还活着吗」，正常是毫秒级；5s 是「慢」与「死了」的分界，更久只会让一轮巡检被一个不响的端点拖住
+// keep: 删掉后一轮巡检被一个不响的端点拖住；由「5s 是慢与死了的分界」兜住
 // wall: 等=被探的那个面回一句话 / 等不到=这个面这次读作「不可达」，**不读作 0 分或 0 延迟**——没答与答得慢是两件事 / 续跑=能，下一轮巡检再问一次
 const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -40,6 +41,7 @@ pub struct HttpProbe {
 
 /// HTTP 的「成功」状态码：协议定义的那一个，不是本仓挑的。
 // cap: fixed — RFC 9110：200 OK
+// keep: 删掉后探测按另一个成功码判，200 的正常应答被读成失败；由「RFC 9110：200 OK」兜住
 const HTTP_STATUS_OK: u16 = 200;
 
 impl Default for HttpProbe {
@@ -251,7 +253,7 @@ impl PushgatewayClient {
         let resp = client.execute(req).await?;
 
         if !resp.is_success() {
-            let body = resp.text().unwrap_or_default();
+            let body = resp.text().unwrap_or(Default::default());
             return Err(anyhow::anyhow!(
                 "Pushgateway returned {}: {}",
                 resp.status,

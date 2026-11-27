@@ -454,7 +454,7 @@ mod tests {
                 .or_default()
                 .push(payload.to_vec());
             // Drop result: zero subscribers is OK in unit tests.
-            let _ = sender.send(payload.to_vec());
+            cog_core::ignore_lost!(sender.send(payload.to_vec()));
             Ok(())
         }
 

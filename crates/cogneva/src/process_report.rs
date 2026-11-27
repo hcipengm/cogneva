@@ -21,14 +21,16 @@ pub const REPORT_URL_ENV: &str = "COGNEVA_PROCESS_REPORT_URL";
 pub const DEFAULT_REPORT_URL: &str = "http://cogneva:8085/api/v1/cluster/process-report";
 /// 自报间隔。这一格答「现在跑着什么」，不是一条时间序列；六十秒一拍足够让停掉的
 /// 进程在下一拍消失，又不会把总线塞满。
-// cap: bound — 这一格答「现在跑着什么」不是时间序列；六十秒够让停掉的进程在下一拍消失，又不会把总线塞满
+// cap: fixed — 这一格答「现在跑着什么」不是时间序列；六十秒够让停掉的进程在下一拍消失，又不会把总线塞满
+// keep: 删掉后停掉的进程一直留在「现在跑着什么」里；由「六十秒够它下一拍消失」兜住
 pub const REPORT_INTERVAL: Duration = Duration::from_secs(60);
 /// 与网关收口的条数一致：读多了也没人要，`/proc` 很大时按 PID 从小到大取。
 ///
 /// 收条数是一件事，把「收过」说出来是另一件：一份停在 64 条的表必须带上它本来
 /// 有几个（[`ScannedProc::processes_total`]），否则屏上读作「它就这么多」，而不是
 /// 「这一面只读这么多」。
-// cap: bound — 与网关收口的条数一致：读多了也没人要，/proc 很大时按 PID 从小到大取
+// cap: fixed — 与网关收口的条数一致：读多了也没人要，/proc 很大时按 PID 从小到大取
+// keep: 删掉后 /proc 很大时把它全部读出来，没人要的人挤掉重要的；由「与网关收口的条数一致」兜住
 pub const MAX_PROCESSES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

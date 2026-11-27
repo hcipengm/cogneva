@@ -336,12 +336,14 @@ impl PromotionEvalOutcome {
 /// 默认 3600）：同样是「把一棵工作树建起来 + 跑固定评估集」这件最贵的事。两个数
 /// 目前各自写在构造点、没有共同的配置位——值一致是因为它们量的是同一件事，不是因为
 /// 有一处领它们；真要分开调时这两处就是覆盖点。
-// cap: bound — 两处构造点值一致是因为它们量的是同一件事，没有共同配置位；真要分开调时这两处就是覆盖点
+// cap: fixed — 两处构造点值一致是因为它们量的是同一件事，没有共同配置位；真要分开调时这两处就是覆盖点
+// keep: 删掉后两处构造点各写一个数，同一件事的墙迟早分开；由「两处量的是同一件事」兜住
 // wall: 等=一次晋级评测跑完 / 等不到=这一次评测按失败收尾，不产出「通过」——没有判词不等于判词是通过 / 续跑=能，重来是一次新的评测
 pub(crate) const DEFAULT_EVAL_TIMEOUT_SECS: u64 = 3600;
 
 /// 轮询任务结果的默认间隔（秒），与基线移植侧一致（默认 5）。
-// cap: bound — 与基线移植侧的轮询间隔一致
+// cap: fixed — 与基线移植侧的轮询间隔一致
+// keep: 删掉后评估轮询与基线移植侧各拍一个数，两边看到的进度不同步；由「与基线移植侧一致」兜住
 pub(crate) const DEFAULT_EVAL_POLL_INTERVAL_SECS: u64 = 5;
 
 impl PromotionEval {
@@ -531,7 +533,8 @@ pub fn promotion_eval_task(change_id: &str, rev: &str, repo: &Path, timeout_secs
 /// 上限来算——等待方已经不再有上限了（等的人等到终态为止），所以「等了多久」这
 /// 个读数在这个进程里已经不存在；留下的问题只是「这一行是不是被丢下了」，而这
 /// 与一件活跑了多久无关。
-// cap: bound — 只收从没被认领过的行，收掉不杀任何在跑的活；这个数只回答「放这么久还没人认领就是孤儿」
+// cap: fixed — 只收从没被认领过的行，收掉不杀任何在跑的活；这个数只回答「放这么久还没人认领就是孤儿」
+// keep: 删掉后从没被认领的行永远占着队列，孤儿没有被收掉的时刻；由「放这么久没人认领就是孤儿」兜住
 pub const ABANDONED_PROMOTION_EVAL_GRACE: Duration = Duration::from_secs(7200);
 
 /// 这一行是不是这道门交上去、而再没有人会来读的行。
@@ -860,7 +863,7 @@ mod tests {
         *graph.finish_on_first_read.lock().unwrap() = Some(TaskStatus::Cancelled);
 
         let orch: Arc<dyn OrchestratorControl> = graph.clone();
-        let _ = submit_and_wait(&orch, 0, row.clone(), "goal".into()).await;
+        cog_core::ignore_lost!(submit_and_wait(&orch, 0, row.clone(), "goal".into()).await);
 
         assert_eq!(
             *graph.deleted.lock().unwrap(),

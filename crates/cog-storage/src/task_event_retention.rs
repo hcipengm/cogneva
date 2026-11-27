@@ -49,7 +49,8 @@ pub const DEPLOYMENT_LABEL: &str = "deployment";
 /// table's size, and Prometheus drops a series it has not seen for five minutes
 /// rather than holding the last value. The age it measures moves by days, so
 /// nothing here needs to be faster.
-// cap: bound — 顺带重发表大小，五分钟不发 Prometheus 就丢序列；它量的「年龄」以天计
+// cap: fixed — 顺带重发表大小，五分钟不发 Prometheus 就丢序列；它量的「年龄」以天计
+// keep: 删掉后五分钟不发读数，Prometheus 丢掉表大小序列；由「5 分钟丢序列」兜住
 pub const PERIOD: Duration = Duration::from_secs(120);
 
 /// What one pass did, so a caller can assert on it rather than infer it.

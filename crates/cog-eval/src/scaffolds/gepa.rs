@@ -43,9 +43,11 @@ pub struct GepaConfig {
 
 // 每代三个候选、跑两代：一次变异要能看出「更好了」还是「只是换了个说法」，
 // 三个候选才有一点点冗余；两代之后最好的那个已经稳定，第三代只是在同一处采样。
-// cap: bound — 三个候选两代：三个才有一点冗余，两代后最好的那个已经稳定
+// cap: fixed — 三个候选两代：三个才有一点冗余，两代后最好的那个已经稳定
+// keep: 删掉后候选没有冗余，一次采样就定胜负；由「三个才有一点冗余」兜住
 const GEPA_POPULATION: usize = 3;
-// cap: bound — 两代：第二代已看不出新的抬升，第三代只是在同一处采样
+// cap: fixed — 两代：第二代已看不出新的抬升，第三代只是在同一处采样
+// keep: 删掉后代数无界，第三代只是在同一处采样，白花 token；由「两代已看不出抬升」兜住
 const GEPA_GENERATIONS: usize = 2;
 
 impl Default for GepaConfig {

@@ -189,7 +189,7 @@ impl TaskBudgetManager {
             .map_err(store_error)?;
         // 索引摘不掉不影响判定（`tasks` 会核对限值键），所以这一步失败不算撤销
         // 失败——把它报成失败会让调用方以为预算还在。
-        let _ = store.srem(Self::INDEX, task_id).await;
+        cog_core::ignore_lost!(store.srem(Self::INDEX, task_id).await);
         Ok(())
     }
 
@@ -211,7 +211,7 @@ impl TaskBudgetManager {
             {
                 Some(_) => live.push(id),
                 None => {
-                    let _ = store.srem(Self::INDEX, &id).await;
+                    cog_core::ignore_lost!(store.srem(Self::INDEX, &id).await);
                 }
             }
         }

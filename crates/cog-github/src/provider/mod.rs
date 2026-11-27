@@ -391,6 +391,7 @@ pub struct AttachmentData {
 /// Cap on a single attachment's bytes (mirrors the gateway `/attach` limit;
 /// applied in direct mode too so a huge file cannot blow up memory).
 // cap: fixed — 与网关 /attach 那条界同值：直连模式也一样，超大文件不能把内存撑破
+// keep: 删掉后直连模式的超大附件把内存撑破，与网关那侧的规模也不一致；由「与网关 /attach 同值」兜住
 pub const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 
 /// Derive the security-gateway root (where `/attach` lives) from a platform

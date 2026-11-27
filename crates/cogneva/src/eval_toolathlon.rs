@@ -34,13 +34,15 @@ use cog_core::{SFError, SFResult, ToolDefinition, ToolExecutor};
 /// 探测一条外部命令的墙：20s。
 ///
 /// 这里探的是「这台机器上的运行时认不认某种容器能力」，命令本身是秒级。
-// cap: bound — 探的是这台机器上的运行时认不认某种容器能力，命令本身是秒级
+// cap: fixed — 探的是这台机器上的运行时认不认某种容器能力，命令本身是秒级
+// keep: 删掉后探容器能力永远等一个不响应的运行时；由「命令本身是秒级」兜住
 const PROBE_COMMAND_WAIT: Duration = Duration::from_secs(20);
 
 /// 等 PG Pod Ready 的轮询间隔：2s。
 ///
 /// 总墙是 [`PG_READY_DEADLINE_SECS`]，这个数决定那个墙里最多问几次。
-// cap: bound — 总墙是 PG_READY_DEADLINE_SECS，这个数决定那个墙里最多问几次
+// cap: fixed — 总墙是 PG_READY_DEADLINE_SECS，这个数决定那个墙里最多问几次
+// keep: 删掉后回到「总墙是 PG_READY_DEADLINE_SECS，这个数决定那个墙里最多问几次」所描述的情形；由这条约定兜住
 const POD_READY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 use cog_eval::{
     tools_bound_to, CaseEnv, EvalCase, ExecSeam, ToolFactory, ToolathlonBackend, ToolathlonCheck,
@@ -117,7 +119,8 @@ const ENV_PACK_MEMORY_LIMIT: &str = "COGNEVA_EVAL_TOOLATHLON_MEMORY_LIMIT";
 const ENV_RUNTIME: &str = "COGNEVA_EVAL_TOOLATHLON_RUNTIME";
 
 /// 等库就绪的上界（秒）。超过就报「库没起来」，不是继续跑下去把每一格都判成错。
-// cap: bound — 超过就报「库没起来」，不是继续跑下去把每一格都判成错
+// cap: fixed — 超过就报「库没起来」，不是继续跑下去把每一格都判成错
+// keep: 删掉后库没起来也继续跑，把每一格都判成错；由「超过就报库没起来」兜住
 // wall: 等=评测库起来 / 等不到=这一次评测报「库没起来」并结束，不继续跑下去把每一格都判成错——那些格子会说谎，说模型答错了 / 续跑=能，重来是一次新的评测
 const PG_READY_DEADLINE_SECS: u64 = 300;
 
@@ -425,6 +428,7 @@ async fn probe(prefix: &[String], namespace: &str) -> bool {
     let Ok(child) = cmd.kill_on_drop(true).spawn() else {
         return false;
     };
+    // roundtrip: 一次探测命令
     match tokio::time::timeout(PROBE_COMMAND_WAIT, child.wait_with_output()).await {
         // 有的版本对 `no` 也退 0，所以判输出而不只判退出码；反过来 `yes` 却退非 0
         // 只可能是包装脚本出错，那时也不能算「能建」。

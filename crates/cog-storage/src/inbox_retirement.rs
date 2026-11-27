@@ -48,6 +48,7 @@ pub const INBOX_RETIRE_SWEEP_LOOP: &str = "storage_inbox_retire_sweep";
 /// How often the pass looks. Matched to the WAL sweep: both delete, both need
 /// the same second look, and there is nothing time-critical about either.
 // cap: fixed — 与 WAL 清扫同源：两边都在删、都要第二次确认，也都不是时间敏感的事
+// keep: 删掉后两侧清扫各用一个节拍，「第二次确认」的时间关系不再成立；由「与 WAL 清扫同源」兜住
 pub const INBOX_RETIRE_SWEEP_PERIOD: Duration = Duration::from_secs(600);
 
 /// The prefix and suffix of an agent's inbox stream.

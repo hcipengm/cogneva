@@ -427,6 +427,14 @@ pub struct LlmUsageRecord {
     /// 推进滚动发布的那一天，旧进程写下的拒绝数不进任何一份，比把它们同时算进
     /// 两份数要好——后者会在发布当天把每一笔拒绝数两遍。
     pub refused_scope: Option<String>,
+    /// 模型侧为什么停了（`stop`／`length`／`tool_calls` …）；`None` 是上游没报。
+    pub finish_reason: Option<String>,
+    /// 首字时延（毫秒）；`None` 是没量到（非流式或没有内容帧）。
+    pub ttft_ms: Option<u64>,
+    /// 这一次提示由哪些段组成（每段 sha256，JSON 数组）；`None` 是这条路径没有请求体。
+    pub prompt_manifest: Option<String>,
+    /// 装配时挤掉了多少条更早的消息；`None` 是没量到或没裁。
+    pub prompt_dropped: Option<u32>,
     /// Wall time of the call; for streams this is first-byte to last-byte.
     pub latency_ms: u64,
     /// 窗口配速那一拍的读数，只在 `result = "refused_by_pace"` 的行上有。
@@ -823,6 +831,99 @@ pub struct SessionMoney {
     pub priced_calls: u64,
 }
 
+/// 一笔调用的两个落点：用量行与 `llm_call` 事实。实现必须让它们同生同灭。
+///
+/// 为什么不是一个「先写行、再写事件」的调用方约定：中间失败会留下「行领先于流」或
+/// 「事件领先于行」，两侧读者各少一半，而两种半都比整笔失败更难发现。把两处放进
+/// 同一个方法，是为了让调用方没有那个中间态可走。
+#[async_trait::async_trait]
+pub trait UsageLanding: Send + Sync {
+    /// 落一笔调用：行与事件在**同一个事务**里提交，成功之后才返回。
+    async fn land(&self, record: &LlmUsageRecord) -> Result<(), String>;
+}
+
+impl LlmUsageRecord {
+    /// 这笔调用的事件形状：身份由它落下的那一行派生（`row:{id}`）。
+    ///
+    /// 映射放在契约层：网关的 live 落账与回填写的是同一条事实，两处各拼一次
+    /// 键名时，加一格漏一处不会红。
+    pub fn as_call(&self, row_id: &str) -> crate::LlmCall {
+        crate::LlmCall {
+            call_id: crate::llm_call_id(row_id),
+            upstream: self.upstream.clone(),
+            api_style: self.api_style.clone(),
+            model: self.model.clone(),
+            result: self.result.clone(),
+            input_tokens: self.tokens_input,
+            output_tokens: self.tokens_output,
+            cached_tokens: self.tokens_cached,
+            cache_created_tokens: self.tokens_cache_created,
+            origin: self.origin.clone(),
+            owner: self.owner.clone(),
+            latency_ms: Some(self.latency_ms),
+            task_id: self.task.clone(),
+            actor: self.actor.clone(),
+            cost_micros: self.cost_micros,
+            price_book: self.price_book.clone(),
+            batch_id: self.task.clone(),
+            session: self.session.clone(),
+            pace: self
+                .pace
+                .as_ref()
+                .and_then(|p| serde_json::to_string(&p.upstreams).ok()),
+            tokens_reasoning: self.tokens_reasoning,
+            refusal_kind: self.refusal_kind.clone(),
+            retry_after_secs: self.retry_after_secs,
+            usage_outcome: self.usage_outcome.map(|o| o.as_str().to_string()),
+            estimated_input: self.estimated_input,
+            refused_scope: self.refused_scope.clone(),
+            finish_reason: self.finish_reason.clone(),
+            ttft_ms: self.ttft_ms,
+            prompt_manifest: self.prompt_manifest.clone(),
+            prompt_dropped: self.prompt_dropped,
+            at: chrono::Utc::now(),
+        }
+    }
+}
+
+/// 每一个用量读口，此刻从哪儿取数。
+///
+/// `stream`：从事件流算（实现里有 `<name>_from_stream`）；`ledger`：还读用量行；
+/// `write`：写口不是读口；`window`：配速窗口状态自己的读数。判据在
+/// `crates/cogneva/tests/every_usage_reader_names_its_source_test.rs`：trait 里的每个
+/// 方法都要有这一行，少一行就是「这个数从哪来」没人答。
+pub const USAGE_READER_SOURCES: &[(&str, &str)] = &[
+    ("land", "write"),
+    ("record", "write"),
+    ("record_exchange", "write"),
+    ("record_window", "write"),
+    ("upstream_window", "window"),
+    ("stored_window", "window"),
+    ("stored_windows", "window"),
+    ("burned_between", "stream"),
+    ("spent_since", "stream"),
+    ("spend_by_actor_since", "stream"),
+    ("spend_by_upstream_and_actor", "stream"),
+    ("task_cost_quantile", "stream"),
+    ("task_has_started", "stream"),
+    ("spend_for_session", "stream"),
+    ("spend_by_task", "stream"),
+    ("priced_spend_between", "stream"),
+    ("spend_by_person_since", "stream"),
+    ("spend_by_workspace_since", "stream"),
+    ("spend_total_since", "stream"),
+    ("refusals_by_person_since", "stream"),
+    ("refusals_by_workspace_since", "stream"),
+    ("refusals_total_since", "stream"),
+    ("spend_by_task_since", "stream"),
+    ("task_attribution", "stream"),
+    ("unattributed_between", "stream"),
+    ("outcomes_between", "stream"),
+    ("metering_between", "stream"),
+    ("skips_between", "stream"),
+    ("verdicts_between", "stream"),
+];
+
 /// The writing and window-reading face of the spend ledger.
 ///
 /// Separate from the reporting face ([`crate::LlmUsageReader`]) because the two
@@ -836,8 +937,11 @@ pub struct SessionMoney {
 /// that never see the database, and a failure here is only ever logged.
 #[async_trait::async_trait]
 pub trait LlmUsageLedger: Send + Sync {
-    /// Land one metered call.
-    async fn record(&self, record: &LlmUsageRecord) -> Result<(), String>;
+    /// Land one metered call and answer **the row id it wrote**.
+    ///
+    /// 事件流里那一笔调用的身份由这一格派生（`row:{id}`），回填也用同一个拼法：
+    /// 两条路只有一套身份，同一行既走过 live 又被回填时写不出第二条事实。
+    async fn record(&self, record: &LlmUsageRecord) -> Result<String, String>;
 
     /// Land one exchange's bodies.
     async fn record_exchange(&self, record: &LlmExchangeRecord) -> Result<(), String>;

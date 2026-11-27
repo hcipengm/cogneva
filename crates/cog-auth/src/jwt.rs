@@ -27,7 +27,8 @@ pub struct JwtConfig {
 
 // 十五分钟：一个访问令牌的泄露窗口——短到被盗的令牌很快自己失效，长到一次
 // 会话里不用反复刷新；刷新令牌另有它自己的寿命。
-// cap: bound — 十五分钟：被盗令牌很快失效，一次会话不用反复刷新
+// cap: fixed — 十五分钟：被盗令牌很快失效，一次会话不用反复刷新
+// keep: 删掉后开发令牌没有寿命，被盗令牌一直有效；由「十五分钟」兜住
 const DEV_ACCESS_TOKEN_TTL_MINUTES: i64 = 15;
 
 impl Default for JwtConfig {

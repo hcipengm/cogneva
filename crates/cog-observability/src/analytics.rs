@@ -847,7 +847,7 @@ impl ClickHouseEventBuffer {
     }
 
     pub fn send(&self, event: AnalyticsEvent) {
-        let _ = self.tx.send(event);
+        cog_core::ignore_lost!(self.tx.send(event));
     }
 }
 

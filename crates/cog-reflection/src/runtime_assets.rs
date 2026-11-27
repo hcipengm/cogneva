@@ -773,7 +773,7 @@ mod tests {
 
         let mut seen_rules = 0;
         for rule in rules {
-            let promql = rule["promql"].as_str().unwrap_or_default();
+            let promql = rule["promql"].as_str().unwrap_or(Default::default());
             if !promql.contains(RUNTIME_ASSET_STATE_METRIC) {
                 continue;
             }

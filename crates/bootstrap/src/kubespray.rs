@@ -1,3 +1,4 @@
+// census-keep: shapes=clocks — 外部命令（apt-get、kubespray）的超时与重试都是这些工具自己的选项；删掉会让引导卡在它们的等待里，由工具约定兜住
 //! kubespray 标准 Kubernetes 集群供给。
 //!
 //! 元启动新建集群时，除了默认的 K3s，还可以用 kubespray 官方容器镜像新建
@@ -29,7 +30,8 @@ use super::{cn_mirror, command_exists, docker_mirror_host, download, probe_alive
 ///
 /// kubelet 报 Ready 与 apiserver 把它算进 node 列表之间有一个传播窗口；不等
 /// 这一下，紧接着的 wait_all_nodes_ready 会先数到一个缺了节点的集群。
-// cap: bound — kubelet 报 Ready 与 apiserver 把它算进 node 列表之间有一个传播窗；不等这一下，紧接的 wait_all_nodes_ready 会先数到一个缺了节点的集群
+// cap: fixed — kubelet 报 Ready 与 apiserver 把它算进 node 列表之间有一个传播窗；不等这一下，紧接的 wait_all_nodes_ready 会先数到一个缺了节点的集群
+// keep: 删掉后会在 apiserver 还没把节点算进列表时就开始等就绪，把缺节点的集群判成坏；由「Ready 到 node list 的传播窗」兜住
 const NODE_REGISTRATION_SETTLE: Duration = Duration::from_secs(5);
 
 /// kubespray 容器镜像 tag（跟随官方稳定版，它钉住经测试的 K8s 版本矩阵）。

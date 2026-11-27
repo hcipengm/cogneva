@@ -562,7 +562,7 @@ pub async fn oauth_callback_handler(
 ) -> Response {
     let provider = provider.to_lowercase();
     if let Some(err) = q.error {
-        let detail = q.error_description.unwrap_or_default();
+        let detail = q.error_description.unwrap_or(Default::default());
         return contrib::oauth_result_page(
             "登录未完成",
             &format!("平台返回错误：{err} {detail}。请回到登录页重试。"),

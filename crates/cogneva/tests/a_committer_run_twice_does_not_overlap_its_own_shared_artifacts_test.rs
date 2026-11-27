@@ -36,6 +36,7 @@ use cog_reflection::{ChangePipeline, EvolutionKind, EvolutionResult, EvolutionSt
 /// description the run's own step put there.
 fn run(id: &str, status: EvolutionStatus) -> EvolutionResult {
     EvolutionResult {
+        unit_of_work: None,
         kind: EvolutionKind::CodeChange,
         artifact_id: id.to_string(),
         description: format!("goal-{id}"),

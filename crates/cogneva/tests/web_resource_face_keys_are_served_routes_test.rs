@@ -104,7 +104,7 @@ fn the_census_is_wide_enough_to_mean_something() {
 #[test]
 fn the_reader_sees_multiline_routes_and_ignores_strings_that_are_not_routes() {
     let root = std::env::temp_dir().join(format!("cogneva-face-reader-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     std::fs::create_dir_all(root.join("crates/cog-gateway/src")).expect("temp gateway");
     std::fs::write(
         root.join("crates/cog-gateway/src/lib.rs"),
@@ -120,7 +120,7 @@ fn the_reader_sees_multiline_routes_and_ignores_strings_that_are_not_routes() {
         BTreeSet::from(["raw_logs".to_string(), "tasks".to_string()])
     );
 
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 
     let client = "\
 useKindTickedRefresh([resourceKey('settings'), 'agents'], refresh);
@@ -132,7 +132,7 @@ useKindTickedRefresh([resourceKey('settings'), 'agents'], refresh);
 #[test]
 fn a_face_key_the_router_does_not_serve_is_reported() {
     let root = std::env::temp_dir().join(format!("cogneva-face-keys-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     std::fs::create_dir_all(root.join("crates/cog-gateway/src")).expect("temp gateway");
     std::fs::create_dir_all(root.join(WEB)).expect("temp web");
 
@@ -163,5 +163,5 @@ fn a_face_key_the_router_does_not_serve_is_reported() {
     let (complaints, _) = contradictions(&root);
     assert!(complaints.is_empty(), "{complaints:?}");
 
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }

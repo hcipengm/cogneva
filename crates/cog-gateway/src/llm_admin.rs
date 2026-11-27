@@ -34,7 +34,8 @@ const GATEWAY_DEPLOYMENT: &str = cog_core::topology::SECURITY_GATEWAY;
 /// 探测发的是一个最小 chat 请求，30s 覆盖跨区上游的建连加排队；等更久不会让
 /// 判定更准，只会让一次配置写入卡住管理端。超时在这里读作「能力未知」，与
 /// 探测失败同一个结局。
-// cap: bound — 探测上游可用性的单次预算，界的是「探测本身拖垮配置页」
+// cap: fixed — 探测上游可用性的单次预算，界的是「探测本身拖垮配置页」
+// keep: 删掉后探测本身拖垮配置页，页面一直等上游；由「界的是探测本身拖垮配置页」兜住
 // wall: 等=上游对一次连通探测的答复 / 等不到=这次探测读作「不通」，配置页按不可用显示；它不改已存的配置 / 续跑=能，下一次探测重问
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -42,7 +43,8 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 ///
 /// 比能力探测紧，因为它要串着试两种形态，墙就是两倍；8s 是健康上游往返的
 /// 量级，超时读作「这一种不通」，直接换下一种。
-// cap: bound — 风格探针的预算，比连通探针短：它只问一句，慢就是不通
+// cap: fixed — 风格探针的预算，比连通探针短：它只问一句，慢就是不通
+// keep: 删掉后风格探针按连通探针的预算等，慢就是不通却没有上限；由「它只问一句，慢就是不通」兜住
 // wall: 等=上游对一句风格探针的答复 / 等不到=这一面读作「不通」——它只问一句，慢就是不通 / 续跑=能，下一次探测重问
 const STYLE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
@@ -213,7 +215,7 @@ pub(crate) async fn forwarded_llm_status() -> Result<ForwardedPool, String> {
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     // 键不在（对面是还没滚到的旧网关）与键在但为空（池里没人报过窗口）是两件事：
     // 前者是「这次没读到这一格」，不能拿它去清掉本进程现有的起点；后者是配置面
     // 刚说完「一只都没公布」。所以只有读到数组才替换。
@@ -406,12 +408,12 @@ pub(crate) async fn merge_pool_edit_into_fields(
         .as_ref()
         .and_then(|fields| fields.get(SECRET_UPSTREAMS_KEY))
         .and_then(|raw| serde_json::from_str(raw).ok())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let arriving: Vec<serde_json::Value> = fields
         .get(SECRET_UPSTREAMS_KEY)
         .and_then(|v| v.as_str())
         .and_then(|raw| serde_json::from_str(raw).ok())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let merged = merge_pool(&current, &arriving, keep_unnamed, remove)?;
     let text =
         serde_json::to_string(&merged).map_err(|e| format!("合并后的上游池序列化失败: {e}"))?;
@@ -585,7 +587,7 @@ pub async fn llm_config_handler(
     // 写完之后再读一次池：这一读才是"改后是哪几家"。请求里只有这一家，而池里
     // 还有别人留下的成员——按请求记账会把保留下来的人记成"被摘掉了"。读不到就
     // 记 null，不拿请求里那几家顶上去。
-    let measured = forwarded_llm_status().await.ok();
+    let measured = cog_core::logged_ok!(forwarded_llm_status().await);
     let after: Option<Vec<String>> = measured.as_ref().map(|pool| pool.names.clone());
     let effective_min_healthy = measured
         .as_ref()
@@ -672,7 +674,7 @@ pub async fn remove_upstreams_handler(
             .into_response();
     }
 
-    let measured = forwarded_llm_status().await.ok();
+    let measured = cog_core::logged_ok!(forwarded_llm_status().await);
     let after: Option<Vec<String>> = measured.as_ref().map(|pool| pool.names.clone());
     // 池变小之后网关会把不可达的下限夹下来，账上要记夹完之后的那一个数——
     // 记请求里的那个数，读账的人会以为声明还是原来那条。
@@ -958,7 +960,7 @@ pub(crate) async fn detect_temperature_constraint(
         .await
         .ok()?;
     let status = resp.status().as_u16();
-    let body = resp.text().await.unwrap_or_default();
+    let body = cog_core::logged_default!(resp.text().await);
     classify_temperature_probe(status, &body)
 }
 
@@ -1033,7 +1035,7 @@ pub(crate) async fn detect_usage_in_streaming(
         .await
         .ok()?;
     let status = resp.status().as_u16();
-    let body = resp.text().await.unwrap_or_default();
+    let body = cog_core::logged_default!(resp.text().await);
     let verdict = classify_usage_probe(status, &body);
     // 问到了什么形态跟着判定一起记：`None` 的两个成因（不是流式的 200、
     // 配额/鉴权类拒服）只能从这三个数分开，而它们指向完全不同的下一步。
@@ -1462,7 +1464,7 @@ impl KubeClient {
             .await
             .map_err(|e| format!("请求 apiserver 失败: {e}"))?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text = cog_core::logged_default!(resp.text().await);
         if !status.is_success() {
             return Err(format!("apiserver 返回 {status}: {text}"));
         }
@@ -1484,7 +1486,7 @@ impl KubeClient {
             .map_err(|e| format!("请求 apiserver 失败: {e}"))?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            let text = cog_core::logged_default!(resp.text().await);
             return Err(format!("apiserver 返回 {status}: {text}"));
         }
         Ok(())
@@ -1511,8 +1513,8 @@ impl KubeClient {
             // 池那个键都读不出来（没有、或不是我们写的形状）：这一面无话可说。
             return Ok(None);
         };
-        let entries =
-            serde_json::from_str::<Vec<serde_json::Value>>(upstreams_raw).unwrap_or_default();
+        let entries = serde_json::from_str::<Vec<serde_json::Value>>(upstreams_raw)
+            .unwrap_or(Default::default());
         let upstreams = entries.len();
         let names = entries.iter().filter_map(pool_member_name).collect();
         let windows = entries.iter().filter_map(pool_member_window).collect();
@@ -1590,7 +1592,7 @@ impl KubeClient {
         let restarted_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs().to_string())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         self.patch(
             &format!(
                 "/apis/apps/v1/namespaces/{}/deployments/{}",

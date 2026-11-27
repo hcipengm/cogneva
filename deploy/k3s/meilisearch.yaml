@@ -1,3 +1,4 @@
+# census-keep: shapes=deploy-numbers — 部署清单里的数是部署自己的声明：它写在生效的那一处，改它只改这一次部署，不是代码里看不见的默认；由部署面本身兜住
 # Meilisearch 全文检索后端（wiki 的存储协议）。cogneva.json 的
 # providers.wiki 指向 meilisearch.cogneva.svc.cluster.local:7700，api_key 经
 # ${MEILI_MASTER_KEY} 插值，主密钥安装时生成（init-secrets.sh）。

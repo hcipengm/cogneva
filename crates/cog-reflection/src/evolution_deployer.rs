@@ -89,6 +89,24 @@ pub struct EvolutionDeployer {
     last_report: std::sync::Arc<std::sync::Mutex<Option<BuildReport>>>,
 }
 
+/// 这一笔只动了文档吗。
+///
+/// 判据只有一条方向：**只有能证明与二进制无关的路径才算文档**——`.md`，以及
+/// 仓库外的文档目录（那里的文件不是编译输入）。其余
+/// 一律按「要重建」处理，包括 `Cargo.toml`、`build.rs`、任何 `.rs`、以及任何没有
+/// 扩展名的路径。判错的方向必须是多编一次，不能是少编一次：少编一次意味着部署出去
+/// 的二进制里没有这一笔的代码，而它在读数上与「这一笔没有改代码」一模一样。
+fn documentation_only(paths: &[String]) -> bool {
+    !paths.is_empty()
+        && paths.iter().all(|path| {
+            let path = path.trim_start_matches("./");
+            path.ends_with(".md")
+                || path.starts_with("internal-docs/")
+                || path.starts_with("specs/")
+                || path.starts_with("memory/")
+        })
+}
+
 impl EvolutionDeployer {
     pub fn new(
         project_root: impl Into<PathBuf>,
@@ -249,6 +267,24 @@ impl EvolutionDeployer {
         self.git_add_all(workdir).await?;
         let commit_hash = self.git_commit(workdir, change_id).await?;
 
+        // 只改了文档的一笔不重建：输入没变，重建付的是同一份验证的第二遍钱，
+        // 而产出的字节与原子的那个二进制一模一样。这份判断由路径算，不由人报。
+        let paths = self.changed_paths(workdir, &commit_hash).await?;
+        if documentation_only(&paths) {
+            info!(
+                change_id = %change_id,
+                files = paths.len(),
+                "Only documentation changed; reusing the staged binary"
+            );
+            self.record_build(change_id, intent, BuildEnding::Unstarted, None);
+            let new_binary_path = self.stage_new_binary(workdir).await?;
+            return Ok(BuildArtifact {
+                change_id: change_id.to_string(),
+                commit_hash,
+                new_binary_path,
+                build_duration_secs: 0,
+            });
+        }
         info!(change_id = %change_id, "Building release binary");
         let start = Instant::now();
         let build_result = self
@@ -298,6 +334,28 @@ impl EvolutionDeployer {
             return Err(SFError::IO(format!("git add failed: {}", stderr)));
         }
         Ok(())
+    }
+
+    /// 这次提交改到的那些路径。
+    async fn changed_paths(&self, workdir: &Path, commit: &str) -> SFResult<Vec<String>> {
+        let output = tokio::process::Command::new("git")
+            .args(["show", "--name-only", "--pretty=format:", commit])
+            .current_dir(workdir)
+            .output()
+            .await
+            .map_err(|e| SFError::IO(format!("Failed to list the commit's paths: {}", e)))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SFError::IO(format!(
+                "git show --name-only failed: {stderr}"
+            )));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect())
     }
 
     async fn git_commit(&self, workdir: &Path, change_id: &str) -> SFResult<String> {
@@ -396,14 +454,25 @@ impl EvolutionDeployer {
             "evolution-build:{change_id}:{}",
             started.elapsed().as_nanos()
         );
-        let waited = cog_core::progress::run_child_watched_with_pid(cmd, &build_id, move |pid| {
-            let handle = tokio::spawn(crate::build_rss_peak::watch(
-                PathBuf::from("/proc"),
-                pid,
-                crate::build_rss_peak::SAMPLE_PERIOD,
-            ));
-            *watcher_from_spawn.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
-        })
+        // 构建没有第二个观察者：判停之后没人会再看一眼。所以这里给出回答者——
+        // 归因说它在一个会自己结束的等待里就继续等（界由正常结束的那段静默涨），
+        // 说它热的、却没有对象可等就收掉，结局记成 `Stalled` 而不是 `Failed`。
+        let decide = std::sync::Arc::new(|stall: &cog_core::progress::Stall| {
+            cog_core::progress::action_for(&stall.cause)
+        });
+        let waited = cog_core::progress::run_child_watched_with_pid_decided(
+            cmd,
+            &build_id,
+            move |pid| {
+                let handle = tokio::spawn(crate::build_rss_peak::watch(
+                    PathBuf::from("/proc"),
+                    pid,
+                    crate::build_rss_peak::SAMPLE_PERIOD,
+                ));
+                *watcher_from_spawn.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
+            },
+            decide,
+        )
         .await;
         let watcher = watcher.lock().unwrap_or_else(|p| p.into_inner()).take();
         // Read before the arms below, because two of them return: the number
@@ -414,6 +483,7 @@ impl EvolutionDeployer {
         // build.
         let peak_rss_bytes = match watcher {
             Some(handle) => {
+                // roundtrip: 一次峰值采样排空的等待
                 match tokio::time::timeout(crate::build_rss_peak::DRAIN_WAIT, handle).await {
                     Ok(Ok(peak)) => peak.map(|p| p.bytes),
                     _ => None,
@@ -428,15 +498,15 @@ impl EvolutionDeployer {
         if let Some(bytes) = peak_rss_bytes {
             crate::build_gate::observe_build_memory(bytes);
         }
-        let output = match waited {
-            Ok(cog_core::progress::ChildOutcome::Exited(output)) => {
+        let (output, stopped) = match waited {
+            Ok((cog_core::progress::ChildOutcome::Exited(output), stopped)) => {
                 if let Some(budget) = &self.budget {
                     budget.record_run(
                         crate::verification_budget::KIND_BUILD,
                         started.elapsed().as_secs(),
                     );
                 }
-                output
+                (output, stopped)
             }
             Err(e) => {
                 // cargo could not be spawned at all, so no build happened: same
@@ -447,6 +517,25 @@ impl EvolutionDeployer {
             }
         };
 
+        // 被按归因收掉的构建：它没有跑完，也没有结论。结局里带着那段静默，读的人
+        // 分得出「这一版坏了」与「它卡住了、没人再等」。
+        if let Some(stall) = stopped {
+            self.record_build(
+                change_id,
+                intent,
+                BuildEnding::Stalled {
+                    silent: stall.silent,
+                    window: stall.window,
+                },
+                peak_rss_bytes,
+            );
+            return Err(SFError::Agent(format!(
+                "cargo build was stopped: {} (silent {:?}, measured window {:?})",
+                stall.cause.describe(),
+                stall.silent,
+                stall.window
+            )));
+        }
         if !output.status.success() {
             self.record_build(
                 change_id,
@@ -548,6 +637,31 @@ fn self_evolution_commit_message(change_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 只改了文档的一笔不重建；判错的方向只能是多编一次。
+    #[test]
+    fn only_paths_that_cannot_reach_the_binary_are_documentation() {
+        let paths = |list: &[&str]| list.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        // 文档：`.md` 与三个文档目录。
+        assert!(documentation_only(&paths(&["specs/a.md"])));
+        assert!(documentation_only(&paths(&["internal-docs/2026-11-26.md"])));
+        assert!(documentation_only(&paths(&["crates/a/README.md"])));
+        assert!(documentation_only(&paths(&["specs/a.md", "memory/x.md"])));
+        // 编译输入与认不出的路径：一律重建。
+        assert!(!documentation_only(&paths(&["crates/a/src/lib.rs"])));
+        assert!(!documentation_only(&paths(&["Cargo.toml"])));
+        assert!(!documentation_only(&paths(&["crates/a/build.rs"])));
+        assert!(!documentation_only(&paths(&[
+            "deploy/helm/cogneva/values.yaml"
+        ])));
+        assert!(!documentation_only(&paths(&[
+            "specs/a.md",
+            "crates/a/src/lib.rs"
+        ])));
+        // 一笔什么都没改（空提交）不算文档单：没有证据时重建。
+        assert!(!documentation_only(&[]));
+    }
+
     use std::time::Duration;
 
     /// 一个在构建阶段就睡着的 crate：`build.rs` 睡够，`cargo build --release`

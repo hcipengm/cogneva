@@ -334,7 +334,7 @@ mod tests {
         ];
         let runs = Arc::new(Runs::default());
         let before = before_tool_call(rules(&defs), Arc::clone(&runs));
-        let _ = before("bash", &mut serde_json::json!({}));
+        cog_core::ignore_lost!(before("bash", &mut serde_json::json!({})));
 
         let reading = report(&defs, &runs);
         assert_eq!(reading["configured"].as_array().unwrap().len(), 2);

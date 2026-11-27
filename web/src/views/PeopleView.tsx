@@ -245,6 +245,7 @@ export function PeopleView() {
     agents,
     agentsError,
     agentsLoaded,
+    rosterUnits,
     selected,
     select,
     lines,
@@ -333,6 +334,17 @@ export function PeopleView() {
   // 位，那时按在岗算——名单上原本就只有心跳。
   const liveCount = agents.filter((agent) => agent.live !== false).length;
   const restCount = agents.length - liveCount;
+  // 名单上的行是地址（座位），人是身份：一行不代表一个人。单位读数分开写，
+  // 座位背后有没有人另说——把两个数并成一个「9,041 个员工」会让读的人以为
+  // 有九千个人。
+  const units = rosterUnits
+    ? `${rosterUnits.people} 位人 · ${agents.length} 个座位` +
+      (rosterUnits.seatsWithoutAPerson === null
+        ? ' · 座位背后有没有人：名册没读到'
+        : rosterUnits.seatsWithoutAPerson > 0
+          ? `（其中 ${rosterUnits.seatsWithoutAPerson} 个座位背后还没有人）`
+          : '（每个座位背后都有人）')
+    : null;
 
   const submit = async () => {
     const text = draft;
@@ -375,7 +387,7 @@ export function PeopleView() {
   return (
     <ViewFrame
       title="员工"
-      meta={`${liveCount} 个在岗${restCount > 0 ? ` · ${restCount} 个休息中` : ''} · 每人一个对话框 · 名单按 15 秒重读`}
+      meta={`${liveCount} 个在岗${restCount > 0 ? ` · ${restCount} 个休息中` : ''}${units ? ` · ${units}` : ''} · 每人一个对话框 · 名单按 15 秒重读`}
       actions={
         <>
           <Button onClick={hire} disabled={hiring} tone="accent">
@@ -504,18 +516,18 @@ export function PeopleView() {
           <section className="flex min-h-0 flex-1 flex-col">
             <div className="flex shrink-0 items-center justify-between border-b border-[var(--line)] px-3 py-1.5 text-[11px] text-[var(--muted)]">
               <span>
-                {chosen ? `与 ${chosen.display_name} 的会话` : '先选一个员工'}
+                {selected ? `与 ${selected} 的会话` : '先选一个员工'}
                 {loading && ' · 读取中…'}
               </span>
               <span className="flex items-center gap-2">
-                {chosen && (
+                {selected && (
                   <>
                     <Button
                       onClick={() =>
                         void control(
                           '重启进程',
                           restartAgent,
-                          `让 supervisor 重启 ${chosen.display_name}？它手上的活会被打断。`
+                          `让 supervisor 重启 ${selected}？它手上的活会被打断。`
                         )
                       }
                     >
@@ -526,7 +538,7 @@ export function PeopleView() {
                         void control(
                           '终止进程',
                           killAgent,
-                          `终止 ${chosen.display_name} 的进程？这不是离职——工号不回收，重启后还是同一个人。`
+                          `终止 ${selected} 的进程？这不是离职——工号不回收，重启后还是同一个人。`
                         )
                       }
                     >

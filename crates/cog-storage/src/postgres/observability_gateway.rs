@@ -31,8 +31,10 @@ use super::state_reads::{
 /// old they are, because nothing here has an opinion about age. A deployment
 /// that wants the other rule needs a sweep with a clock in it, which this is
 /// deliberately not.
-// cap: bound — from what a run report is for (a year of daily runs), not from a
+// cap: fixed — from what a run report is for (a year of daily runs), not from a
+// keep: 删掉后一次运行报告要把一年每日运行的全部日志搬出来；由「报告是给一年每日运行看的」兜住
 // measurement on any host
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 pub const LOG_LINES_PER_TASK: i64 = 200;
 
 /// This store's schema, and the one a restore replays.
@@ -158,26 +160,30 @@ pub struct PostgresObservabilityGateway {
 /// 一次提交的 WAL 页与提交记录摊到 64 条上就低到可以忽略；再往上加行，省下的
 /// 提交成本已经小于一条提交持有连接、占着 WAL 的时间，而队列满时整批变慢的
 /// 方差更大。
-// cap: bound — 使一次提交的固定成本摊到 64 条上可忽略，不是从任何容量读数导出
+// cap: fixed — 使一次提交的固定成本摊到 64 条上可忽略，不是从任何容量读数导出
+// keep: 删掉后每条事件都付一次事务；由「摊到 64 条上可忽略」兜住
 const EVENT_BATCH_MAX: usize = 64;
 
 /// 第一条到了之后最多再等多久凑批。
 ///
 /// 事件是持续来的（实测约每秒 180 条），凑够一批通常不用等；这个等待只对
 /// 安静时段起作用，让单条事件不因为「等下一批」而延迟上分钟。
-// cap: bound — 与事件到达间隔（毫秒级）相比足够短，只用来收尾一批
+// cap: fixed — 与事件到达间隔（毫秒级）相比足够短，只用来收尾一批
+// keep: 删掉后一批等不到收尾；由「足够短、只用来收尾一批」兜住
 const EVENT_BATCH_LINGER_MS: u64 = 50;
 
 /// 队列能排多少条。满了不丢事件，改为立刻单独写一条（见
 /// [`PostgresObservabilityGateway::publish_event`]）。
 ///
 /// 按「数据库停住多久还不丢」定：每秒约 180 条时，四千条约是 22 秒的积压。
-// cap: bound — 按事件速率（约 180/秒）乘一段可等待的数据库停顿估出
+// cap: fixed — 按事件速率（约 180/秒）乘一段可等待的数据库停顿估出
+// keep: 删掉后队列无界，DB 停顿时内存跟着速率长；由「速率 × 可等待的停顿」兜住
 const EVENT_WRITE_QUEUE: usize = 4096;
 
 /// 失败计数最多多久落一次库。选 5 秒是因为它要明显短于一条告警的判定窗
 /// （分钟级），又足以把「每次失败一行」压成「每 5 秒一行」。
-// cap: bound — 要明显短于一条告警的判定窗（分钟级），又够把「每次失败一行」压成「每 5 秒一行」
+// cap: fixed — 要明显短于一条告警的判定窗（分钟级），又够把「每次失败一行」压成「每 5 秒一行」
+// keep: 删掉后每次失败都记一行，日志被同一件事刷满；由「明显短于告警判定窗」兜住
 const FAILURE_FLUSH_SECS: u64 = 5;
 
 /// The historical read's only bound is the caller's `since`.
@@ -865,7 +871,7 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
     /// is one per pass, so it gets its own name rather than a label on a
     /// counter with a different unit.
     fn publish_event(&self, event: AgentEvent) {
-        let _ = self.event_tx.send(event.clone());
+        cog_core::ignore_lost!(self.event_tx.send(event.clone()));
 
         // 流式增量只发给订阅方，不落这张表。
         //

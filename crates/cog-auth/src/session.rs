@@ -6,7 +6,8 @@ use crate::error::{AuthError, AuthResult};
 use cog_core::{KeyValueStore, SessionInfo};
 
 /// Session TTL in seconds (7 days).
-// cap: bound — 会话寿命：安全与免重复登录之间的取舍
+// cap: fixed — 会话寿命：安全与免重复登录之间的取舍
+// keep: 删掉后会话永不失效，安全与免登录的取舍消失；由「会话寿命」兜住
 const SESSION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 fn session_redis_key(user_id: Uuid, session_id: Uuid) -> String {

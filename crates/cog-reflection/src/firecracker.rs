@@ -24,7 +24,8 @@ const FIRECRACKER_START_CHANNEL: &str = "firecracker-start";
 /// 等 socket 出现时的轮询间隔：50ms。
 ///
 /// 比预期出现时间（毫秒级）长一个量级，既不会漏掉，也不会把这条等待变成忙等。
-// cap: bound — 比预期出现时间（毫秒级）长一个量级，不漏也不忙等
+// cap: fixed — 比预期出现时间（毫秒级）长一个量级，不漏也不忙等
+// keep: 删掉后等 socket 出现要么忙等、要么漏掉毫秒级的出现窗口；由「比预期出现时间长一个量级」兜住
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Firecracker 实例句柄。
@@ -184,7 +185,7 @@ impl FirecrackerSandbox {
                 true
             }
             Err(e) => {
-                self.destroy(vm).await.ok();
+                cog_core::ignore_lost!(self.destroy(vm).await);
                 return Err(SFError::IO(format!("wait firecracker: {e}")));
             }
         };
@@ -303,7 +304,7 @@ impl FcApiClient {
     ) -> SFResult<(u16, String)> {
         let payload = body
             .map(|b| serde_json::to_string(&b).unwrap_or_default())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
             payload.len()
@@ -370,7 +371,7 @@ mod tests {
                     writeln!(f, "{line}").unwrap();
                     conn.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                         .await
-                        .ok();
+                       .ok();
                 }
             }
         })
@@ -432,12 +433,12 @@ mod tests {
         let server = tokio::spawn(async move {
             if let Ok((mut conn, _)) = listener.accept().await {
                 let mut buf = [0u8; 4096];
-                let _ = conn.read(&mut buf).await;
+                cog_core::ignore_lost!(conn.read(&mut buf).await);
                 conn.write_all(
                     b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\nConnection: close\r\n\r\nbad request",
                 )
                 .await
-                .ok();
+               .ok();
             }
         });
 
@@ -510,7 +511,7 @@ mod tests {
         wait_for_socket(&sock, &mut child, "test-firecracker-slow")
             .await
             .expect("the socket appeared");
-        let _ = child.kill().await;
+        cog_core::ignore_lost!(child.kill().await);
         cog_core::progress::reset_for_tests();
     }
 

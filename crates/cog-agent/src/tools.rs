@@ -16,17 +16,20 @@ use std::time::Duration;
 /// 这一侧不读子任务的进度，只雇了一个任务把它排空；所以深度只需要盖住「循环
 /// 已经写了、排空的还在被调度」那一个间隙，与子任务跑多久、说多少无关。
 // cap: fixed — 有人排空，深度只盖一个调度间隙；深浅都不改变行为，取一个够用的值
+// keep: 删掉后子智能体事件缓冲无界或为零，前者占内存、后者挡住派发；由「一个调度间隙的深度」兜住
 const SUBAGENT_EVENT_BUFFER: usize = 64;
 
 /// 命令还没开跑时，隔多久问一次执行器「我在编译队里排第几」。
 ///
 /// 队只在执行器那一侧排，编排侧不问就不知道；一次编译的等待以秒计，半秒的粒度
 /// 够人看见「它在等」，又不至于让每一条排列着的编译多出几十次一问一答。
-// cap: bound — 问的间隔；它只决定界面上那一行「在等执行槽」多快出现，不决定谁等多久
+// cap: fixed — 问的间隔；它只决定界面上那一行「在等执行槽」多快出现，不决定谁等多久
+// keep: 删掉后执行槽探问没有节拍，忙等占 CPU；由「只决定那一行多快出现」兜住
 const LANE_PROBE: Duration = Duration::from_millis(500);
 
 /// 这一问自己的上限：执行器不应答时，一句「在等」不能把调用拖住。
-// cap: bound — 一次读数的超时；比它短会让读数常常读不到，比它长会让一个不应答的执行器拖慢这一轮
+// cap: fixed — 一次读数的超时；比它短会让读数常常读不到，比它长会让一个不应答的执行器拖慢这一轮
+// keep: 删掉后一个不应答的执行器会把这一轮拖住；由「一次读数的往返」兜住
 // wall: 等=执行器对一次探活的答复 / 等不到=这一条读数这次读作「读不到」，**不是 0**——读不到与量到为 0 是两件事，读数面必须分得开 / 续跑=能，下一拍再问一次
 const LANE_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
@@ -35,6 +38,7 @@ const LANE_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 /// 这一句是给还在等的人看的一行字，不是日志：每半秒把同一句话再说一遍，工具的中途
 /// 输出就会被同一条消息刷满。名次变了立刻再说——变了才是新的事实。
 // cap: fixed — 同一名次的重复间隔；重复与否不改变排队，只改变这一行多久刷新一次
+// keep: 删掉后同一行被每拍重印，把界面刷成噪声；由「重复不改变排队，只改变刷新」兜住
 const LANE_NOTICE_EVERY: Duration = Duration::from_secs(5);
 
 /// 毫秒与秒之间的换算。
@@ -42,6 +46,8 @@ const LANE_NOTICE_EVERY: Duration = Duration::from_secs(5);
 /// 不是一个可调的界：等待窗口从工具一路传到服务端都是毫秒，只有 HTTP 客户端
 /// 按秒记超时。换算本身没有第三个答案。
 // cap: fixed — 单位换算；等待窗口一路是毫秒，只有 HTTP 客户端按秒
+// not-a-bound: 单位换算；等待窗口一路是毫秒，只有 HTTP 客户端按秒
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const MILLIS_PER_SECOND: u64 = 1_000;
 
 /// How long a filed work item declares it will take when the submitter names no
@@ -53,7 +59,8 @@ const MILLIS_PER_SECOND: u64 = 1_000;
 /// its own patience, so it is sized to the whole turn -- thinking, tool calls
 /// and possibly a peer's answer -- rather than to one dispatched round, which
 /// is what the executor's own row default covers.
-// cap: bound — 一件活声明自己会花多久：不再按它砍行，按一轮接活的形状（想、调工具、等同伴）定这个声明
+// cap: fixed — 一件活声明自己会花多久：不再按它砍行，按一轮接活的形状（想、调工具、等同伴）定这个声明
+// keep: 删掉后一件活没有申报工期，读的人分不出慢与卡；由「按接活形状定声明」兜住
 const DEFAULT_WORK_ITEM_DECLARED_SECS: u64 = 3600;
 
 /// 问执行器一句「我的编译排在第几」，问到了就说给人听。
@@ -66,6 +73,7 @@ async fn announce_lane_wait(
     told: &mut Option<(usize, std::time::Instant)>,
     sink: &ToolUpdateSink,
 ) {
+    // roundtrip: 一次执行槽读数（backend.lane()）
     let Ok(Ok(reading)) = tokio::time::timeout(LANE_PROBE_TIMEOUT, backend.lane()).await else {
         return;
     };
@@ -500,6 +508,31 @@ impl ToolRegistry {
 
     pub fn get(&self, name: &str) -> Option<Tool> {
         self.tools.read().unwrap().get(name).cloned()
+    }
+
+    /// 同一套跑工具的能力，只留**读**的那几只。
+    ///
+    /// 判据审要读这一轮的树，不该顺手派活或改树：把一只写工具留在表里，
+    /// 「另一次调用只判终态」这句话就不成立——那一次的手也能落下东西。
+    /// 名单是闭集，加一只读工具要在这里点名；没点名的工具不进这张表。
+    pub fn read_only(&self) -> Self {
+        const READ_ONLY: &[&str] = &[
+            "read_file",
+            "grep",
+            "search_code",
+            "glob",
+            "git_status",
+            "git_diff",
+            "read_task_ledger",
+            "command_output",
+        ];
+        let forked = self.fork();
+        forked
+            .tools
+            .write()
+            .unwrap()
+            .retain(|name, _| READ_ONLY.contains(&name.as_str()));
+        forked
     }
 
     /// The tool list in name order.
@@ -1200,6 +1233,8 @@ mod tests {
                 web_search_fallback_base: Some("http://gateway:8081/search-fallback".into()),
                 web_fetch_base: Some("http://render:11235".into()),
                 sandbox_backend: None,
+                message_events: None,
+                intent_events: None,
             },
         );
         let tool = registry.get("web_fetch").expect("web_fetch is a built-in");
@@ -1467,7 +1502,7 @@ mod tests {
                 .url
                 .split_once("/api/v1/memory")
                 .map(|(_, rest)| format!("/api/v1/memory{rest}"))
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             let path_only = path.split_once('?').map(|(p, _)| p).unwrap_or(&path);
             let find = |id: &str| self.raws.iter().find(|r| r.id == id);
 
@@ -1871,7 +1906,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out["content"], "hello");
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// 一次调用读多个文件。
@@ -1913,7 +1948,7 @@ mod tests {
             files[2]["error"].is_string(),
             "one unreadable path must be reported on its own entry, not sink the batch: {out}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// 整批共用一页的预算：进上下文的是一条 tool_result，之后每轮重发的也是
@@ -1969,7 +2004,7 @@ mod tests {
             "预算花完后剩下的文件必须说清没读，不能悄悄给半页: {out}"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// `path` 与 `paths` 同时给是没说清要读什么：猜一个能省一轮往返，但猜错
@@ -2010,6 +2045,8 @@ mod tests {
                 web_search_fallback_base: None,
                 web_fetch_base: None,
                 sandbox_backend: None,
+                message_events: None,
+                intent_events: None,
             },
         );
         let measured = tool_payload_bytes(&registry.list());
@@ -2050,6 +2087,43 @@ mod tests {
         assert!(long > short, "the reading ignored the description text");
         let two = tool_payload_bytes(&[tool("a", "reads a file"), tool("b", "writes a file")]);
         assert!(two > short, "the reading ignored a second tool");
+    }
+
+    /// 判据审那张表只留读的工具：写、派活、发消息都不在。留下任何一只写工具，
+    /// 「另一次调用只判终态」这句话就不成立——那一次的手也能落下东西。
+    #[test]
+    fn the_judge_registry_carries_readers_and_no_hands() {
+        fn tool(name: &str) -> Tool {
+            Tool {
+                name: name.into(),
+                description: String::new(),
+                parameters: serde_json::json!({ "type": "object" }),
+                implementation: ToolImplementation::Native(Arc::new(|_| {
+                    Box::pin(async { Ok(serde_json::json!({})) })
+                })),
+            }
+        }
+        let registry = ToolRegistry::new();
+        for name in [
+            "read_file",
+            "grep",
+            "write_file",
+            "edit_file",
+            "start_task",
+            "send_to_agent",
+            "run_command",
+        ] {
+            cog_core::ToolRegistry::register(&registry, tool(name));
+        }
+        let read = registry.read_only();
+        assert_eq!(
+            read.names(),
+            vec!["grep".to_string(), "read_file".to_string()],
+            "判据审的表里混进了不是读的工具：{:?}",
+            read.names()
+        );
+        assert!(read.get("write_file").is_none());
+        assert!(read.get("start_task").is_none());
     }
 
     /// 名字、描述、参数 schema 的字节和——就是模型看到的那份东西。
@@ -2112,7 +2186,7 @@ mod tests {
             "不带范围的老调用形状不变"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// 页大小要么背后有一条读数，要么就不是一个数——两种状态分得开。
@@ -2223,7 +2297,7 @@ mod tests {
             "续读必须从上一页的下一行开始，不重不漏"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// 一页多大只有窗口一个来源：换窗口，页跟着变。
@@ -2273,7 +2347,7 @@ mod tests {
             }
         }
 
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// 一页的界是字符，不是行数：超长行照样要分页。
@@ -2326,7 +2400,7 @@ mod tests {
         );
         assert_eq!(first["next_offset"], lines + 1);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// 被字符界截断的一页不能读成「文件到这儿就完了」。
@@ -2416,7 +2490,7 @@ mod tests {
             "把所有页接起来必须还原整份文件：少一行、重一行，或者把一页的余下部分当成不存在，都会对不上"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// The tool list a request carries must come out in name order, whatever
@@ -2639,7 +2713,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out["stdout"].as_str().unwrap().trim(), "45");
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
 
         assert!(registry
             .execute("run_command", serde_json::json!({"command": "   "}))
@@ -3550,6 +3624,13 @@ pub mod builtins {
         /// because "this process has no checkout" and "there is no search"
         /// call for different repairs.
         pub sandbox_backend: Option<Arc<dyn SandboxBackend>>,
+        /// 消息事实的写者：`send_to_agent` 发布成功之后写一条 `message_sent`。
+        /// 缺席时只少这一条账，工具照常投递——「没有落点」与「没发出去」不同。
+        pub message_events: Option<Arc<dyn cog_core::EventStore>>,
+        /// 意图落点：`send_to_agent` 投出去的那一句同时是一条意图
+        /// （来源 `agent`，说给谁就是那个收件人）。缺席时那一条不写，只留
+        /// 一条具名日志——消息已经投出去了，缺的是把它记成「有人说过」的那行。
+        pub intent_events: Option<Arc<dyn cog_core::EventStore>>,
     }
 
     /// Register every built-in tool into `registry`.
@@ -3638,9 +3719,17 @@ pub mod builtins {
             inputs.message_backend.clone(),
             inputs.agent_registry.clone(),
         ) {
-            (Some(backend), Some(registry_handle)) => {
-                cog_core::ToolRegistry::register(registry, send_to_agent(backend, registry_handle))
-            }
+            (Some(backend), Some(registry_handle)) => cog_core::ToolRegistry::register(
+                registry,
+                send_to_agent(
+                    backend,
+                    registry_handle,
+                    inputs.message_events.clone(),
+                    inputs.intent_events.clone(),
+                    inputs.http_client.clone(),
+                    inputs.memory_api_base.clone(),
+                ),
+            ),
             // Both halves are needed, so the tool is absent when either is: a
             // message with no roster check goes into a stream nobody reads, and
             // a roster with no queue has nowhere to put it. Registered but
@@ -3761,9 +3850,11 @@ pub mod builtins {
                                 Some(row) => row.label(),
                                 None => cog_core::unregistered_label(&r.agent_id),
                             };
+                            // 由工号推出的唯一身份只有一处拼法（`employee_id`），
+                            // 目录不在这里再拼一遍。
                             let number = entry
                                 .and_then(|row| row.number)
-                                .map(|n| format!("{}{n:04}", cog_core::EMPLOYEE_NUMBER_PREFIX));
+                                .map(cog_core::employee_identity);
                             serde_json::json!({
                                 "agent_id": r.agent_id,
                                 "display_name": display_name,
@@ -3818,6 +3909,10 @@ pub mod builtins {
     pub fn send_to_agent(
         backend: Arc<dyn cog_core::MessageBackend>,
         registry: Arc<dyn cog_core::AgentRegistry>,
+        message_events: Option<Arc<dyn cog_core::EventStore>>,
+        intent_events: Option<Arc<dyn cog_core::EventStore>>,
+        http_client: Option<Arc<dyn HttpClient>>,
+        memory_api_base: Option<String>,
     ) -> Tool {
         Tool {
             name: "send_to_agent".into(),
@@ -3864,6 +3959,10 @@ pub mod builtins {
             implementation: ToolImplementation::Native(Arc::new(move |args| {
                 let backend = backend.clone();
                 let registry = registry.clone();
+                let message_events = message_events.clone();
+                let intent_events = intent_events.clone();
+                let archive_client = http_client.clone();
+                let archive_base = memory_api_base.clone();
                 Box::pin(async move {
                     let agent_id = args["agent_id"]
                         .as_str()
@@ -3906,11 +4005,23 @@ pub mod builtins {
                     // 发信人随消息走：收件人只拿到这一条，他自己查不到是谁写的。
                     // 一次没公布身份的运行照样发得出去，只是那一格为空。
                     let from_agent = caller_agent_id();
+                    // 事件要写「谁发的」，而构建收件箱那一步会把它移进去；先留一份。
+                    let sender = from_agent.clone();
+                    // 这一句自己的意图身份：消息与意图行用同一份，收件人那边派出去的
+                    // 活也挂它。只在真正开一轮的 `prompt` 上随消息走——steering 与
+                    // continue 改的是已经开着的那一轮，没有「这一次运行」可挂。
+                    let identity = cog_core::contract::intent_events::colleague_intent_identity(
+                        from_agent.as_deref().unwrap_or(""),
+                        agent_id,
+                        kind,
+                        message,
+                    );
                     let inbox = match kind {
                         "prompt" => cog_core::InboxMessage::Prompt {
                             goal: serde_json::Value::String(message.to_string()),
                             reply_stream: ask.clone(),
                             from_agent,
+                            intent: Some(identity.clone()),
                         },
                         "steering" => cog_core::InboxMessage::Steering {
                             instruction: message.to_string(),
@@ -3984,6 +4095,51 @@ pub mod builtins {
                     };
 
                     backend.publish(&inbox_stream, &payload).await?;
+                    // 发布成功之后立刻写一条 `message_sent`：正文原样、两端、渠道。
+                    // 写不进去只说一句——消息已经投出去了，缺的是那一条账；把这件事
+                    // 变成发送失败会让人重发一条已经发出去的话。
+                    if let Some(events) = message_events.as_ref() {
+                        if let Err(e) = events
+                            .append(cog_core::message_event(
+                                sender.as_deref().unwrap_or(""),
+                                agent_id,
+                                kind,
+                                message,
+                                None,
+                                None,
+                                None,
+                                chrono::Utc::now(),
+                            ))
+                            .await
+                        {
+                            tracing::warn!(
+                                to = agent_id,
+                                error = %e,
+                                "the message was delivered but its fact was not written to the stream"
+                            );
+                        }
+                    }
+                    // 同一句话同时是一条意图：发信人、收件人与原话一起落进意图账，
+                    // 收件人那一侧跑起来派出的活因此找得到「这是谁让我做的」。
+                    // 写在投递成功之后——没有投出去的话不是一次到达。
+                    if let Some(events) = intent_events.as_ref() {
+                        let from = sender.as_deref().unwrap_or("");
+                        let row = cog_core::IntentRow::new(
+                            "agent",
+                            identity.clone(),
+                            from,
+                            agent_id,
+                            message,
+                            None,
+                        );
+                        if let Err(e) = events.append(cog_core::intent_received_event(&row)).await {
+                            tracing::warn!(
+                                to = agent_id,
+                                error = %e,
+                                "the colleague message was delivered but its intent row was not written"
+                            );
+                        }
+                    }
                     // One line per message, naming both ends: the queue keeps
                     // no sender anywhere — the wire form carries the command
                     // and nothing about who wrote it — so without this the only
@@ -4087,7 +4243,11 @@ pub mod builtins {
                           venue you give it, and its acceptance criteria are what the answer is \
                           judged by. The call returns as soon as the row is queued; the answer \
                           comes back in the task's result, not in this turn. Call it again with \
-                          the returned goal_id to add more items to the same goal."
+                          the returned goal_id to add more items to the same goal. \
+                          For a request from the owner that asks for work, pass terminal, now \
+                          and gap together: terminal is what the world looks like after this is \
+                          done, now is what the tree shows at this moment, and gap is exactly \
+                          what is still missing between them."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -4104,6 +4264,26 @@ pub mod builtins {
                                         without one is refused, because nothing downstream \
                                         invents a criterion and the row would sit on the board \
                                         reading like work in progress."
+                    },
+                    "terminal": {
+                        "type": "string",
+                        "description": "The world after this is done: a precise natural-language \
+                                        state, not a reading, a checklist or a sample."
+                    },
+                    "now": {
+                        "type": "string",
+                        "description": "The tree as it is now, read from the tree and written in \
+                                        the same natural language as terminal."
+                    },
+                    "gap": {
+                        "type": "string",
+                        "description": "Terminal minus now, written as what is missing. Empty only \
+                                        when the terminal already holds."
+                    },
+                    "intent_id": {
+                        "type": "string",
+                        "description": "The platform fills this from the conversation turn; leave \
+                                        it out unless you are carrying an intent explicitly."
                     },
                     "venue": {
                         "type": "string",
@@ -4137,7 +4317,17 @@ pub mod builtins {
                 Box::pin(async move {
                     let base = memory_base(api_base.as_deref())?;
                     let client = memory_client(client)?;
-                    let filed = start_task_filing(&args, caller_agent_id().as_deref())?;
+                    let intent_id = args
+                        .get("intent_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string);
+                    let filed = start_task_filing(
+                        &args,
+                        caller_agent_id().as_deref(),
+                        intent_id.as_deref(),
+                    )?;
 
                     // Asked before the write, for the same reason the send tool
                     // asks: a name nobody holds would be handed to the rotation
@@ -4619,6 +4809,7 @@ pub mod builtins {
     fn start_task_filing(
         args: &serde_json::Value,
         caller: Option<&str>,
+        intent_id: Option<&str>,
     ) -> SFResult<StartTaskFiling> {
         let goal = args
             .get("goal")
@@ -4642,7 +4833,7 @@ pub mod builtins {
                     .map(str::to_string)
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         // Refused here as well as at the door, and with the reason a submitter
         // can act on: the row is filed as already decided, so no planner ever
         // runs on it to state what done means. The door would refuse it too;
@@ -4702,34 +4893,50 @@ pub mod builtins {
             "said_by": caller.unwrap_or_default(),
             "addressed_to": assignee.clone().unwrap_or_default(),
         });
-        let mut row = serde_json::json!({
-            "id": task_id,
-            "task_type": cog_core::contract::work_item::PLATFORM_AGENT_TASK,
-            "input": input,
-            "declared_duration_seconds": declared_duration_seconds,
-        });
-        // The caller is stating the work as already decided. Without this the
-        // row goes through decomposition, which would spend a planning call to
-        // restate what the caller already said. The field is read under the
-        // planner role's own name: a second spelling here would be a field the
-        // door never looks at, and the row would be planned anyway.
-        row[cog_core::roles::PLANNER] = serde_json::json!({
-            "verified": true,
-            "source": "user_provided",
-        });
+        // 三格是这次的活的终态、现在、差距。缺一格就不写：把两格写进去，
+        // 读的人会以为第三格是「没有差距」，而它只是没人写。
+        let mut cells: Option<(String, String, String)> = None;
+        match (
+            optional_label(args, "terminal"),
+            optional_label(args, "now"),
+            optional_label(args, "gap"),
+        ) {
+            (None, None, None) => {}
+            (Some(terminal), Some(now), Some(gap)) => {
+                cells = Some((terminal, now, gap));
+            }
+            _ => {
+                return Err(SFError::Validation(
+                    "terminal, now and gap must be supplied together: two cells cannot say what \
+                     the third would have said"
+                        .into(),
+                ))
+            }
+        }
+        if let Some(intent_id) = intent_id {
+            input["intent_id"] = serde_json::json!(intent_id);
+        }
+        // 行的形状与请求体只在契约层拼一次：三个入口交出同一个形状，读的人不必
+        // 按入口分叉。
+        let cell_refs = cells
+            .as_ref()
+            .map(|(terminal, now, gap)| (terminal.as_str(), now.as_str(), gap.as_str()));
+        let mut row = cog_core::contract::task_door::task_door_row(
+            &task_id,
+            cog_core::contract::work_item::PLATFORM_AGENT_TASK,
+            input,
+            cell_refs,
+            declared_duration_seconds,
+            true,
+        );
         if let Some(assignee) = assignee.as_deref() {
             row["agent_id"] = serde_json::json!(assignee);
         }
         if let Some(venue) = venue.as_deref() {
             row["venue"] = serde_json::json!(venue);
         }
-        let body = serde_json::json!({
-            "goal_id": goal_id.clone(),
-            "goal": goal,
-            "workspace_id": workspace,
-            "intent_kind": "task",
-            "tasks": [row],
-        });
+        let body =
+            cog_core::contract::task_door::task_door_body(&goal_id, goal, &workspace, vec![row]);
         Ok(StartTaskFiling {
             body,
             goal_id,
@@ -4885,6 +5092,7 @@ pub mod builtins {
     ) -> Waited {
         let started = std::time::Instant::now();
         let timeout = Duration::from_millis(timeout_ms);
+        // wall: 等=子智能体的下一段答复 / 等不到=按超时收尾，这一问放弃 / 续跑=能，调用方再问一次
         let first = tokio::time::timeout(timeout, reader.next()).await;
         let waited = started.elapsed();
 
@@ -5020,11 +5228,13 @@ pub mod builtins {
     }
 
     /// 一张待办清单最多几行。
-    // cap: bound — 清单是给这一轮运行看的；再长就不是清单而是账，而账在别处
+    // cap: fixed — 清单是给这一轮运行看的；再长就不是清单而是账，而账在别处
+    // keep: 删掉后清单无界，一次运行把整本账塞进提示，白花 token；由「清单只给这一轮看」兜住
     const TODO_MAX_ITEMS: usize = 50;
 
     /// 进程里同时留几张清单。
-    // cap: bound — 清单的寿命是一轮运行；留着不再动的那几张只是内存，不服务任何人
+    // cap: fixed — 清单的寿命是一轮运行；留着不再动的那几张只是内存，不服务任何人
+    // keep: 删掉后不再动的清单一直占内存；由「清单寿命是一轮运行」兜住
     const TODO_MAX_LISTS: usize = 64;
 
     /// 调用方自己说的一次要几条；没说就是不设条数界。
@@ -6118,8 +6328,8 @@ pub mod builtins {
         let authority = after_scheme
             .split(['/', '?', '#'])
             .next()
-            .unwrap_or_default();
-        let host_port = authority.rsplit('@').next().unwrap_or_default();
+            .unwrap_or(Default::default());
+        let host_port = authority.rsplit('@').next().unwrap_or(Default::default());
         let host = if let Some(rest) = host_port.strip_prefix('[') {
             rest.split(']').next().unwrap_or_default().to_string()
         } else {
@@ -6137,7 +6347,46 @@ pub mod builtins {
         use super::*;
 
         fn filing(args: serde_json::Value) -> SFResult<StartTaskFiling> {
-            start_task_filing(&args, Some("agent-caller"))
+            start_task_filing(&args, Some("agent-caller"), None)
+        }
+
+        /// 属主会话交出来的活带三格，任务行也带这条意图的身份；缺一格就拒。
+        #[test]
+        fn a_filing_carries_the_three_cells_and_the_intent() {
+            let filed = start_task_filing(
+                &serde_json::json!({
+                    "goal": "把门禁的归属改回来",
+                    "acceptance": ["跑一次门"],
+                    "terminal": "门禁只认它判的那个对象",
+                    "now": "门禁仍认最后写它的那一方",
+                    "gap": "还差把归属改回判定对象",
+                }),
+                Some("agent-caller"),
+                Some("chat:s1:abc"),
+            )
+            .expect("a complete three-cell filing files");
+            let row = &filed.body["tasks"][0];
+            assert_eq!(row["input"]["intent_id"], "chat:s1:abc");
+            // 三格随行交，是任务的一等字段，不再塞进 input 的开集载荷。
+            assert_eq!(row["terminal"], "门禁只认它判的那个对象");
+            assert_eq!(row["now"], "门禁仍认最后写它的那一方");
+            assert_eq!(row["gap"], "还差把归属改回判定对象");
+            assert!(row["input"].get("ledger_item").is_none());
+            assert_eq!(row["id"].as_str(), Some(filed.task_id.as_str()));
+        }
+
+        #[test]
+        fn a_filing_with_only_some_of_the_three_cells_is_refused() {
+            let refused = start_task_filing(
+                &serde_json::json!({
+                    "goal": "把门禁的归属改回来",
+                    "acceptance": ["跑一次门"],
+                    "terminal": "门禁只认它判的那个对象",
+                }),
+                Some("agent-caller"),
+                None,
+            );
+            assert!(refused.is_err());
         }
 
         /// 归属写在行上：与 A2A 同一个键（`input.origin`），入口不同而读面不必分叉。
@@ -6216,7 +6465,7 @@ pub mod builtins {
                 serde_json::json!("timeout"),
                 "没在时限内答必须明说自己是超时：{running}"
             );
-            let hint = running["hint"].as_str().unwrap_or_default();
+            let hint = running["hint"].as_str().unwrap_or(Default::default());
             assert!(
                 hint.contains("still"),
                 "超时那一句要说明这一行可能还在跑，而不是没做完：{hint}"

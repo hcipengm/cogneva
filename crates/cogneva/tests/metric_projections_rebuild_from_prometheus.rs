@@ -170,6 +170,24 @@ async fn the_three_metric_projections_rebuild_from_the_source() {
     .expect("read back the stale row");
     assert_eq!(stale, 0, "过时的行没被清掉：整表重写没做到");
 
+    // 重建之后标签侧表也要在：按标签筛的读者（网环第 10 环）从这张表联结，
+    // 只重写累加行会让重建过的序列一条标签都没有。
+    let label_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT l.key, l.value FROM cog_metric_counter_totals t \
+           JOIN metric_labels l \
+             ON l.name = t.name AND l.labels = t.labels \
+          WHERE t.name = $1 ORDER BY l.key",
+    )
+    .bind(COUNTER)
+    .fetch_all(&pool)
+    .await
+    .expect("read the rebuilt label rows");
+    assert_eq!(
+        label_rows,
+        vec![("stream".to_string(), "local".to_string())],
+        "重建没有把标签键落成侧表的行：按标签筛的读者会读成一条都没有"
+    );
+
     let counter: f64 =
         sqlx::query_scalar("SELECT value FROM cog_metric_counter_totals WHERE name = $1")
             .bind(COUNTER)

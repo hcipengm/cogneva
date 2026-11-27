@@ -13,10 +13,11 @@
 
 use sqlx::{PgPool, Row};
 
-use cog_core::{check as check_envelope, EnvelopeFields, SFError, SFResult};
+use cog_core::{EventPayload, EventStore, FactEvent, SFError, SFResult};
 
 /// 一批回填的行数。批越小，单条语句持有的锁越短；回填是一次性作业，批数由行数决定。
 // cap: fixed —— 一次 INSERT…SELECT 的载荷，与行数规模无关；它不裁剪任何东西
+// keep: 删掉后一次回填的载荷无界，一次回填变成长事务；由「与行数规模无关的载荷」兜住
 const BATCH: i64 = 500;
 
 /// 从行里读一页（按时间正序、按 id 断开），写成事件。返回写了多少条。
@@ -51,7 +52,9 @@ pub async fn backfill_page(
         let at: chrono::DateTime<chrono::Utc> = row
             .try_get("ts")
             .map_err(|e| SFError::Database(e.to_string()))?;
-        let call_id = format!("row:{id}");
+        // 与 live 落账同一个拼法：同一行两条路写出的是同一条事实。
+        let call_id = cog_core::llm_call_id(&id.to_string());
+        // 载荷按这一族自己的形状拼：回填与实时写入写下的必须是同一种事件。
         let attributes = serde_json::json!({
             "upstream": row.try_get::<String, _>("upstream").unwrap_or_default(),
             "api_style": row.try_get::<String, _>("api_style").unwrap_or_default(),
@@ -63,49 +66,23 @@ pub async fn backfill_page(
             "cached_tokens": row.try_get::<i64, _>("tokens_cached").unwrap_or(0),
             "task_id": row.try_get::<Option<String>, _>("task_id").ok().flatten(),
             "owner": row.try_get::<Option<String>, _>("owner_id").ok().flatten(),
-            "backfilled": true,
-        })
-        .to_string();
+        });
         let actor: String = row.try_get("actor").unwrap_or_else(|_| "unknown".into());
-        check_envelope(&EnvelopeFields {
-            event_id: event_id_for(&call_id),
-            kind: "llm_call".into(),
-            subject_kind: "llm_call".into(),
-            subject_id: call_id.clone(),
-            unit_of_work: call_id.clone(),
-            step: "call".into(),
-            outcome: "ok".into(),
-            idempotency_key: call_id.clone(),
-            actor,
-            writer: writer.to_string(),
-            scope: String::new(),
-            attributes: attributes.clone(),
-        })
-        .map_err(|defect| {
-            SFError::Database(format!("backfill refused row {id}: {}", defect.as_str()))
-        })?;
-
-        sqlx::query(
-            "INSERT INTO cogneva_event (
-                 event_id, kind, subject_kind, subject_id, unit_of_work, step, outcome, attempt,
-                 idempotency_key, causation_id, batch_id, actor, writer, scope, payload_version,
-                 attributes, at)
-             VALUES ($1, 'llm_call', 'llm_call', $2, $2, 'call', 'ok', 1, $2, NULL, NULL, $3,
-                     $4, '', 1, $5, $6)
-             ON CONFLICT (writer, idempotency_key) DO NOTHING",
-        )
-        .bind(event_id_for(&call_id))
-        .bind(&call_id)
-        .bind(
-            row.try_get::<String, _>("actor")
-                .unwrap_or_else(|_| "unknown".into()),
-        )
-        .bind(writer)
-        .bind(&attributes)
-        .bind(at)
-        .execute(pool)
-        .await
-        .map_err(|e| SFError::Database(format!("backfill write: {e}")))?;
+        // 「这一条是回填的」从信封读得出来：`at` 是它发生的那一刻，`recorded_at`
+        // 是这一次写流的那一刻——一次回填的两格相距整段历史，不必在载荷里再写一遍。
+        let call = cog_core::LlmCall::from_attributes(call_id.clone(), actor, &attributes, at)
+            .ok_or_else(|| {
+                SFError::Database(format!("usage row {id} does not carry a complete call"))
+            })?;
+        // 唯一写口：回填与实时写入走同一个事件形状、同一份信封检查。
+        let mut event = FactEvent::new(EventPayload::LlmCall(call));
+        event.event_id = Some(event_id_for(&call_id));
+        event.at = Some(at);
+        let store = super::event_log::EventLogStore::new(pool.clone(), writer);
+        store
+            .append(event)
+            .await
+            .map_err(|e| SFError::Database(format!("backfill write: {e}")))?;
         written += 1;
     }
 

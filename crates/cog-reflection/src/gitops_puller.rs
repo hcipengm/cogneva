@@ -137,12 +137,7 @@ const WHOLE_WATCH_GATE: &str = "watch";
 /// as the other's.
 pub const CLUSTER_LABEL: &str = "cluster";
 
-/// 等一次滚动发布完成的轮询间隔：10s。
-///
-/// Pod 重建本身以十秒计，更密的轮询只会多打几次 kubectl 而不会让发布更早
-/// 完成；10s 也是这条循环在发布期间的全部负载。
-// cap: bound — Pod 重建以十秒计，更密的轮询只多打几次 kubectl，不会让发布更早完成
-const ROLLOUT_POLL_INTERVAL: Duration = Duration::from_secs(10);
+use crate::rollout_cadence::ROLLOUT_POLL as ROLLOUT_POLL_INTERVAL;
 
 /// 等全量滚动时「读数变了」这条证据通道的名字。
 ///
@@ -508,7 +503,7 @@ impl GitOpsPuller {
             // already_processed、这条 Pending 已经被收尾，于是没有任何一方
             // 会再回来 resume——部署就停在 pause 上，下一轮重试同样空转。
             // 走到这里 age 已越过看护窗口，pause 只可能是死掉的写者留下的。
-            if self.deployment_paused().await.unwrap_or(false) {
+            if cog_core::logged_default!(self.deployment_paused().await, false) {
                 let _ = self
                     .run(
                         &k,
@@ -536,7 +531,7 @@ impl GitOpsPuller {
             // 于是主线每一轮都被读成「没落地」再倒回去（2026-11-01 现场）。先把它
             // 放下来，再问 rollout 现状：放下来之后 `rollout status` 问的才是「Pod
             // 到底起没起来」，而不是被 pause 挡住的半句话。
-            let was_paused = self.deployment_paused().await.unwrap_or(false);
+            let was_paused = cog_core::logged_default!(self.deployment_paused().await, false);
             if was_paused {
                 let _ = self
                     .run(
@@ -604,7 +599,7 @@ impl GitOpsPuller {
                     warn!(error = %e, "orphaned canary state unreadable; leaving the row pending");
                 }
             }
-        } else if self.deployment_paused().await.unwrap_or(false) {
+        } else if cog_core::logged_default!(self.deployment_paused().await, false) {
             // 镜像不是目标且部署仍 paused：金丝雀未落地或已被 undo，
             // 是 puller 中途死亡留下的现场——resume 先于 undo（paused
             // 部署 undo 会被 kubectl 拒绝）清理。
@@ -934,7 +929,7 @@ impl GitOpsPuller {
                 let previous = self
                     .run("git", &["show", &format!("HEAD~1:{file}")], Some(&dir))
                     .await
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 restart_sections = cog_core::config_sections::sections_needing_restart_on_change(
                     &config_document(&previous),
                     &config_document(&content),
@@ -1055,7 +1050,7 @@ impl GitOpsPuller {
     async fn rebuild_prompts_configmap(&self) -> SFResult<String> {
         let dir = self.work_dir();
         let staging = dir.join(".prompts-staging");
-        let _ = tokio::fs::remove_dir_all(&staging).await;
+        cog_core::ignore_lost!(tokio::fs::remove_dir_all(&staging).await);
         tokio::fs::create_dir_all(&staging)
             .await
             .map_err(|e| SFError::IO(format!("create prompts staging: {e}")))?;
@@ -1100,7 +1095,7 @@ impl GitOpsPuller {
             )
             .await?;
         let applied = self.kubectl_apply_stdin(&create).await;
-        let _ = tokio::fs::remove_dir_all(&staging).await;
+        cog_core::ignore_lost!(tokio::fs::remove_dir_all(&staging).await);
         applied?;
         Ok(format!("prompts/ configmap rebuilt ({count} files)"))
     }
@@ -3337,6 +3332,7 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
             work.path(),
         );
         let change = crate::types::EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: "p-42".into(),
             description: "test".into(),
@@ -5077,7 +5073,8 @@ spec:
         );
 
         // 一条都没问过时日志文件根本不会出现，那是"什么都没做"而不是"跑崩了"。
-        let calls = std::fs::read_to_string(tmp.path().join("kubectl.log")).unwrap_or_default();
+        let calls =
+            std::fs::read_to_string(tmp.path().join("kubectl.log")).unwrap_or(Default::default());
         assert!(
             calls.contains("rollout resume deployment/cogneva"),
             "a deployment left paused by a dead canary has to be resumed before the retry is \
@@ -5149,7 +5146,8 @@ spec:
             "the orphaned Pending has to be finalized in this round"
         );
 
-        let calls = std::fs::read_to_string(tmp.path().join("kubectl.log")).unwrap_or_default();
+        let calls =
+            std::fs::read_to_string(tmp.path().join("kubectl.log")).unwrap_or(Default::default());
         assert!(
             calls.contains("rollout resume deployment/cogneva"),
             "recording Promoted while the deployment is still paused leaves every later \

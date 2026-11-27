@@ -95,8 +95,8 @@ pub(crate) async fn serve_status(status: u16) -> (String, tokio::task::JoinHandl
                      Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
-                let _ = socket.write_all(response.as_bytes()).await;
-                let _ = socket.shutdown().await;
+                cog_core::ignore_lost!(socket.write_all(response.as_bytes()).await);
+                cog_core::ignore_lost!(socket.shutdown().await);
             });
         }
     });

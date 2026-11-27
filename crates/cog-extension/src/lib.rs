@@ -117,7 +117,7 @@ pub fn executor_backend(
             match endpoints.len() {
                 0 => Arc::new(LocalExecutor::new()),
                 1 => {
-                    let only = endpoints.into_iter().next().unwrap_or_default();
+                    let only = endpoints.into_iter().next().unwrap_or(Default::default());
                     if only.starts_with("dns://") {
                         // A name, resolved while the client runs: replicas may
                         // come and go behind it without the config changing.

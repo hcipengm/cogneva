@@ -174,7 +174,7 @@ fn boundary_of(schema: Option<&serde_json::Value>) -> Option<Boundary> {
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     required.sort();
     Some(Boundary { required, params })
 }

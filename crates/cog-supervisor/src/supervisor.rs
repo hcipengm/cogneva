@@ -29,7 +29,8 @@ pub const SUPERVISOR_LOOP: &str = "supervisor_main";
 /// outlives it has been overtaken by its next turn, which is the point where
 /// the duration is worth somebody's attention — not the point where the work
 /// is thrown away.
-// cap: bound — 只决定「超过多久说一声」；过点之后继续等，从不丢弃仍在跑的 pass
+// cap: fixed — 只决定「超过多久说一声」；过点之后继续等，从不丢弃仍在跑的 pass
+// keep: 删掉后一拍超过预期没有说一声的时刻；由「过点之后继续等，不丢弃仍在跑的 pass」兜住
 pub const PASS_EXPECTATION: Duration = Duration::from_secs(30);
 
 /// Await one pass to completion, beating while it runs and saying so once it
@@ -88,7 +89,8 @@ pub fn supervisor_cadence(beat_period: Duration) -> cog_core::loop_health::Caden
 /// given up on. Reaping earlier would delete the evidence while the attempt to
 /// bring the crew back was still running; reaping later costs nothing but the
 /// announcement each pass makes about an agent that is already gone.
-// cap: bound — 比「把队伍拉回来」所需的时间长；再晚收只是每拍多发一条关于早就没了的 agent 的通告
+// cap: fixed — 比「把队伍拉回来」所需的时间长；再晚收只是每拍多发一条关于早就没了的 agent 的通告
+// keep: 删掉后每拍多发一条关于早就没了的 agent 的通告；由「比把队伍拉回来所需的时间长」兜住
 const REAP_AFTER_DEAD: Duration = Duration::from_secs(1800);
 
 /// The verdicts a pass may announce as an unhealthy agent.
@@ -639,7 +641,7 @@ impl Supervisor {
             .health_checker
             .dead_after;
         let grace = chrono::Duration::from_std(dead_after).unwrap_or_default()
-            + chrono::Duration::from_std(REAP_AFTER_DEAD).unwrap_or_default();
+            + chrono::Duration::from_std(REAP_AFTER_DEAD).unwrap_or(Default::default());
         let now = Utc::now();
         for (agent_id, issue) in dead {
             let last_seen = match issue {
@@ -759,7 +761,7 @@ impl Supervisor {
                 .event_window
                 .as_secs(),
         ) {
-            let _ = self.event_tx.send(event);
+            cog_core::ignore_lost!(self.event_tx.send(event));
         }
         Ok(())
     }
@@ -934,7 +936,7 @@ impl Supervisor {
             tokio::select! {
                 _ = health.tick() => {
                     cycle = cycle.saturating_add(1);
-                    let _ = this.event_tx.send(SupervisorEvent::Tick { timestamp: Utc::now(), cycle });
+                    cog_core::ignore_lost!(this.event_tx.send(SupervisorEvent::Tick { timestamp: Utc::now(), cycle }));
                     let ok = match pass_past_its_expectation(
                         "supervisor health pass",
                         || beat.beat(),

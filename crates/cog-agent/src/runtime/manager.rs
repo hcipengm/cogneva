@@ -140,7 +140,7 @@ pub struct GlobalAgentManager {
     /// context window. Shared by every worker, like the observability gateway.
     tool_output_archive: Option<Arc<dyn crate::archive::ToolOutputArchive>>,
     /// 工具调用的事实落点。与归档并存：一个是记录，一个是正文载体。
-    tool_call_events: Option<Arc<dyn cog_core::ToolCallEvents>>,
+    tool_call_events: Option<Arc<dyn cog_core::EventStore>>,
     /// How often every worker renews its registration.
     ///
     /// Read from the `agent` section at startup and handed to each spawned
@@ -388,7 +388,7 @@ impl GlobalAgentManager {
     }
 
     /// Give every spawned worker the sink a tool call is recorded in.
-    pub fn with_tool_call_events(mut self, events: Arc<dyn cog_core::ToolCallEvents>) -> Self {
+    pub fn with_tool_call_events(mut self, events: Arc<dyn cog_core::EventStore>) -> Self {
         self.tool_call_events = Some(events);
         self
     }
@@ -608,7 +608,7 @@ impl GlobalAgentManager {
     pub async fn shutdown(&self) -> SFResult<()> {
         let workers = self.workers.read().await;
         for w in workers.iter() {
-            let _ = w.agent.abort().await;
+            cog_core::ignore_lost!(w.agent.abort().await);
         }
         Ok(())
     }

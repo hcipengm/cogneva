@@ -96,16 +96,33 @@ cargo: 这一轮还有待办没改完，先别编译。
   上面每一条 TODO 都是「这一轮该改、但还没改」的地方（待办点名的触点）。默认的做法
   是把它们一次改完，再编译一次。
 
-  如果这一轮确实要拆，就在编译前声明三条理由之一（会随提交进历史，推之前还要被判一次）：
+  如果这一轮确实要拆，就在编译前声明三条理由之一，并点名被排除的那几条
+  （理由与排除清单一起进历史，推之前还要被判一次）：
 
-      COGNEVA_BATCH_SPLIT="2 — <会重叠的测试目标>"  # 失败不可归因
-      COGNEVA_BATCH_SPLIT="3 — <哪一处不可逆>"      # 要滚动/迁移/动现场
-      COGNEVA_BATCH_SPLIT="4 — <这一侧为什么读不完>" # 工作集超限
+      COGNEVA_BATCH_SPLIT="2 — <会重叠的测试目标> — 排除: S1,S2"  # 失败不可归因
+      COGNEVA_BATCH_SPLIT="3 — <哪一处不可逆> — 排除: S3"          # 要滚动/迁移/动现场
+      COGNEVA_BATCH_SPLIT="4 — <这一侧为什么读不完> — 排除: S4,S5" # 工作集超限
 
 EOF
       exit 1
     fi
   else
+    # 拆批声明要有理由码，也要点名被排除的行：只写理由的声明读完仍不知道
+    # 「哪几条没进这一批」，而下一批的人要靠这一格把自己接上。
+    case "$COGNEVA_BATCH_SPLIT" in
+      2\ —*|3\ —*|4\ —*) ;;
+      *)
+        printf 'cargo: 拆批声明要以 2/3/4 开头并写出理由（例如 "2 — 共用测试目标 — 排除: S1"）\n' >&2
+        exit 1
+        ;;
+    esac
+    case "$COGNEVA_BATCH_SPLIT" in
+      *"排除:"*) ;;
+      *)
+        printf 'cargo: 拆批要说出被排除的那几条（" — 排除: S1,S2"）；只说理由，下一批的人接不上\n' >&2
+        exit 1
+        ;;
+    esac
     printf 'cargo: 本批按声明拆分：%s\n' "$COGNEVA_BATCH_SPLIT" >&2
   fi
 fi
@@ -138,7 +155,18 @@ if [ "$builds" = "1" ] && [ "$ledger" != "/dev/null" ] && [ -f "$ledger" ]; then
     exit 1
   fi
   if [ "$seen" = "1" ]; then
-    if ! git log -1 --format='%B' 2>/dev/null | grep -q '^Recompiled:'; then
+    # 产物还在不在：账本上那一笔「编过了」说的是某一次真编出来的字节，而缓存被回收、
+    # 或人手把 target 删掉之后，那些字节已经不在盘上。这时再编一次不是重复购买，是
+    # 重建——而「编过了」与「产物不在了」在账本上同形，只有看盘才能分开。
+    target_dir="${CARGO_TARGET_DIR:-target}"
+    case "$target_dir" in
+    /*) ;;
+    *) target_dir="$PWD/$target_dir" ;;
+    esac
+    if [ ! -d "$target_dir/debug/deps" ] || [ -z "$(ls -A "$target_dir/debug/deps" 2>/dev/null | head -1)" ]; then
+      printf 'cargo: 上一次编译的产物已经不在（%s 是空的或不存在）——这一次是重建，不是重复。\n' \
+        "$target_dir/debug/deps" >&2
+    elif ! git log -1 --format='%B' 2>/dev/null | grep -q '^Recompiled:'; then
       cat >&2 <<MSG
 
 cargo: 这一批已经在这份字节上把 \`$cmd_now\` 跑过一次了（HEAD ${head_now}），不再跑第二次。
@@ -178,6 +206,48 @@ fi
 # 时刻问它。它删不掉正在编译的那一棵——它的 cwd 就是本进程。
 if [ "$builds" = "1" ] && [ -n "$toplevel" ] && [ -x "$toplevel/deploy/scripts/host-scratch-gc.sh" ]; then
   "$toplevel/deploy/scripts/host-scratch-gc.sh" >/dev/null 2>&1 || true
+fi
+
+# 只跑输入变了的格：`cargo test --workspace`（没点名包）按 cell plan 收窄。
+# 判据不在这⼀层：格清单与「哪些输入变了」由 `cogneva cell-plan` 算，这一层只把它翻成
+# `-p`。任何一步读不出来（没有 origin/main、二进制不在、输出不全）就不收窄，原样跑
+# 全量——收窄只允许少跑**本来就不需要重跑**的格，读不出来时不做这个减法。
+if [ "$sub" = "test" ] && [ -n "$ledger_bin" ] && [ -x "$ledger_bin" ] \
+   && [ "${COGNEVA_CELL_PLAN:-on}" != "off" ]; then
+  case " $* " in
+    *" --workspace "*)
+      case " $* " in
+        *" -p "*|*" --package "*) : ;;
+        *)
+          base="$(git merge-base origin/main HEAD 2>/dev/null || true)"
+          if [ -n "$base" ]; then
+            changed="$(git diff --name-only "$base" HEAD 2>/dev/null || true)"
+            plan_out="$(printf '%s\n' "$changed" | "$ledger_bin" cell-plan --changed-paths-from - 2>/dev/null || true)"
+            pkgs="$(printf '%s\n' "$plan_out" | awk -F'\t' '$1=="rerun" && $2!="" {printf " -p %s", $2}')"
+            if printf '%s\n' "$plan_out" | grep -q '^reused' && [ -n "$(printf '%s' "$pkgs" | tr -d ' ')" ]; then
+              printf 'cargo: 只跑输入变了的格：%s（其余格复用上一次的结论）\n' "$pkgs" >&2
+              narrowed=()
+              inserted=0
+              for arg in "$@"; do
+                [ "$arg" = "--workspace" ] && continue
+                if [ "$arg" = "--" ] && [ "$inserted" = "0" ]; then
+                  # shellcheck disable=SC2206
+                  narrowed+=($pkgs)
+                  inserted=1
+                fi
+                narrowed+=("$arg")
+              done
+              if [ "$inserted" = "0" ]; then
+                # shellcheck disable=SC2206
+                narrowed+=($pkgs)
+              fi
+              exec "$real_cargo" "${narrowed[@]}"
+            fi
+          fi
+          ;;
+      esac
+      ;;
+  esac
 fi
 
 exec "$real_cargo" "$@"

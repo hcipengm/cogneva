@@ -618,6 +618,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = engine(dir.path());
         let skill = crate::types::EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::SkillRefinement,
             artifact_id: "skill-1".to_string(),
             description: "refined".to_string(),

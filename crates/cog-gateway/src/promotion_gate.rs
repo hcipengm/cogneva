@@ -100,7 +100,7 @@ pub async fn set_promotion_gate_handler(Json(req): Json<PromotionGateRequest>) -
     let restarted_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs().to_string())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     if let Err(e) = client
         .patch(
             &format!(

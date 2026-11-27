@@ -586,14 +586,16 @@ struct Filing<'a> {
 /// for readers, not a deadline — which is why it can be generous without
 /// costing anything, and why a stricter value would not make a stuck row end
 /// any sooner.
-// cap: bound — a week is the outer edge of "a unit of work", and the number is
+// cap: fixed — a week is the outer edge of "a unit of work", and the number is
+// keep: 删掉后一件活的工期声明没有外缘，读的人分不出慢与卡；由「一周是单位工作的外缘」兜住
 // read by people and dashboards rather than enforced; how long real rows stay
 // open is the lease's reading, not this number's.
 const UNIT_WORK_DECLARED_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// How long one filing request may take. The door answers as soon as it has
 /// judged the submission; the decomposition it starts runs behind the answer.
-// cap: bound — the answer is a judgement over one submission, not a run: thirty
+// cap: fixed — the answer is a judgement over one submission, not a run: thirty
+// keep: 删掉后一次提交的判词没有上限，注入器不回就把一轮挂住；由「判词是一次提交的判断，不是一次运行」兜住
 // wall: 等=一次提交的答复 / 等不到=这次提交读作「不知道有没有收到」，**对端可能已经收了**：所以判词是一次判断，不是一次重发 / 续跑=能，但重来是先查后发，否则同一次提交会被记两次
 // seconds is the wait past which a door that has not answered is not slow but
 // stuck, and no decomposition timing should move it.
@@ -603,11 +605,13 @@ const SUBMIT_TIMEOUT_SECS: u64 = 30;
 /// to look. Bounded on purpose: the row is usually there within a second, and a
 /// caller that waits forever has no way to tell a slow injector from a
 /// submission that was dropped.
-// cap: bound — ten seconds is the ceiling for "the injector took it", picked so
+// cap: fixed — ten seconds is the ceiling for "the injector took it", picked so
+// keep: 删掉后轮询次数无界，注入器没接住也一直等；由「十秒是注入器接过它的上限」兜住
 // a dropped submission is reported rather than waited on forever. A slower
 // injector is a case for the caller to retry, not for the wait to grow.
 const SUBMIT_POLL_ATTEMPTS: u32 = 20;
-// cap: bound — the two read as one wait: 20 x 500 ms is the ten seconds above,
+// cap: fixed — the two read as one wait: 20 x 500 ms is the ten seconds above,
+// keep: 删掉后两次读的间隔与次数脱钩，所谓十秒不再成立；由「20 × 500ms 就是那十秒」兜住
 // and the split only decides how often the graph is asked, not how long.
 const SUBMIT_POLL_INTERVAL_MS: u64 = 500;
 
@@ -753,7 +757,7 @@ async fn submit(door: &str, body: &serde_json::Value) -> Result<serde_json::Valu
         )
     })?;
     let status = response.status();
-    let text = response.text().await.unwrap_or_default();
+    let text = cog_core::logged_default!(response.text().await);
     if !status.is_success() {
         // The door's own words, not a paraphrase: a refusal names the operand
         // that was wrong, and restating it here would be a second copy of the
@@ -1122,7 +1126,8 @@ async fn next(
 /// how long its owner had been quiet, and "quiet for ten minutes" and "never
 /// registered" would both arrive as the same missing key. Keep the record past
 /// that window and let the rule read a timestamp.
-// cap: bound — the record must outlive the idle window the rule reads; 1.5 windows is past that window with room for one renewal
+// cap: fixed — the record must outlive the idle window the rule reads; 1.5 windows is past that window with room for one renewal
+// keep: 删掉后在位记录活得比它要盖住的空闲窗短，规则读到时记录已经没了；由「1.5 个空闲窗」兜住
 const UNIT_PRESENCE_TTL_SECS: u64 = cog_core::OWNER_IDLE_AFTER_SECS as u64 * 3 / 2;
 
 /// Record that this unit is alive, under the name its faces name it by.
@@ -1163,7 +1168,8 @@ async fn presence(unit: &str, workspace: &str, redis_url: &str) -> Result<(), Bo
 /// Half of [`UNIT_PRESENCE_TTL_SECS`], so one missed renewal still leaves the
 /// record standing: a unit that is listening is alive whatever its queue looks
 /// like, and the face readings ask the registry rather than the queue.
-// cap: bound — half the record TTL, so one missed renewal still leaves the record standing
+// cap: fixed — half the record TTL, so one missed renewal still leaves the record standing
+// keep: 删掉后续期节奏与 TTL 脱钩，一次漏续就让记录消失；由「记录 TTL 的一半」兜住
 const INBOX_PRESENCE_RENEWAL: Duration = Duration::from_secs(UNIT_PRESENCE_TTL_SECS / 2);
 
 /// Read the messages other agents sent this unit, and acknowledge them.

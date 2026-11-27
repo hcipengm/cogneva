@@ -190,6 +190,7 @@ impl BenchReport {
             cog_core::SFError::IO(format!("failed to create {}: {}", dir.display(), e))
         })?;
         let stamp = self.started_at.format("%Y%m%dT%H%M%SZ");
+        // state-file: artifact — 一次基准跑出来的结果产物，按运行命名，不是某条事实的第二份正本
         let json_path = dir.join(format!("bench-{}-{}.json", self.suite, stamp));
         let md_path = dir.join(format!("bench-{}-{}.md", self.suite, stamp));
         let json = serde_json::to_string_pretty(self).map_err(cog_core::SFError::Serialization)?;

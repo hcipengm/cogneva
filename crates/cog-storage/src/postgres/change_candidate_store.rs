@@ -22,9 +22,11 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 
-use cog_core::{CandidateOutcome, ChangeCandidate, ChangeCandidateStore, SFError, SFResult};
+use cog_core::{
+    CandidateOutcome, ChangeCandidate, ChangeCandidateStore, EventStore, SFError, SFResult,
+};
 
 const CANDIDATE_KIND: &str = "change_candidate";
 const MEASURED_KIND: &str = "change_measured";
@@ -33,16 +35,14 @@ const REJECTED_KIND: &str = "change_rejected";
 const SUBJECT_KIND: &str = "change";
 
 /// 这一条变更自己的全部事件种类。投影只在它们里面找「最后一条」。
-const CHANGE_KINDS: [&str; 4] = [CANDIDATE_KIND, MEASURED_KIND, ACCEPTED_KIND, REJECTED_KIND];
-
-/// 写事件的那条 SQL。信封的每一列都写，因为默认值只覆盖「服务端时间」与「第一次尝试」
-/// 这两样，其余每一列缺了都少一个能力（见迁移 117 的逐列注释）。
-const INSERT_SQL: &str = "\
-INSERT INTO cogneva_event (\
-    event_id, kind, subject_kind, subject_id, unit_of_work, step, outcome, attempt, \
-    idempotency_key, causation_id, batch_id, actor, writer, scope, payload_version, attributes) \
-VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $9, NULL, $10, $11, $12, 1, $13) \
-ON CONFLICT (writer, idempotency_key) DO NOTHING";
+fn change_kinds() -> Vec<String> {
+    // 一族的词表只在一处：`change_*` 四个细词由族表给，新写的聚合步也在里面。
+    cog_core::kinds_of("change")
+        .unwrap_or(&[])
+        .iter()
+        .map(|kind| (*kind).to_string())
+        .collect()
+}
 
 /// 一个身份的最后一条事件，连同它那条 `change_candidate`。
 ///
@@ -65,6 +65,56 @@ SELECT latest.subject_id, latest.event_id, latest.kind, latest.attributes, lates
   FROM latest JOIN origin USING (subject_id)";
 
 type RowSnapshot = (String, String, String, String, i32, String, i32);
+
+/// 同一个目标要的变更：候选事件的 `attributes->>'unit_of_work'` 等于它。
+///
+/// 身份不是 `scope`（那是进程级的一个字符串），也不是信封的 `unit_of_work`
+/// （那一格是这条变更自己的 id）。目标写在候选自己的载荷里，所以这条读法能回答
+/// 「这个目标要过哪些变更」，再按 `artifact_id` 对落地账（`landing_states`）拼出
+/// 「落地没有」。
+const UNIT_CANDIDATES_SQL: &str = "\
+WITH latest AS (\
+    SELECT DISTINCT ON (subject_id) subject_id, event_id, kind, attributes, payload_version\
+      FROM cogneva_event\
+     WHERE kind = ANY($1)\
+     ORDER BY subject_id, event_id DESC\
+), origin AS (\
+    SELECT DISTINCT ON (subject_id) subject_id, attributes, payload_version\
+      FROM cogneva_event\
+     WHERE kind = $2 AND attributes->>'unit_of_work' = $3\
+     ORDER BY subject_id, event_id DESC\
+) \
+SELECT latest.subject_id, latest.event_id, latest.kind, latest.attributes, latest.payload_version, \
+       origin.attributes, origin.payload_version \
+  FROM latest JOIN origin USING (subject_id)";
+
+/// 一个目标要的变更，按候选身份各自最新一版读出。
+pub async fn unit_candidates(
+    pool: &PgPool,
+    kinds: &[String],
+    unit_of_work: &str,
+) -> SFResult<Vec<ChangeCandidate>> {
+    let rows: Vec<RowSnapshot> = sqlx::query_as(UNIT_CANDIDATES_SQL)
+        .bind(kinds)
+        .bind(CANDIDATE_KIND)
+        .bind(unit_of_work)
+        .fetch_all(pool)
+        .await
+        .map_err(to_sf)?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (subject_id, event_id, kind, attributes, version, origin, origin_version) in rows {
+        out.push(candidate_from_events(&RowInput {
+            subject_id: &subject_id,
+            event_id: &event_id,
+            kind: &kind,
+            decision_attributes: &attributes,
+            decision_version: version,
+            origin_attributes: &origin,
+            origin_version,
+        })?);
+    }
+    Ok(out)
+}
 
 /// 这一版代码读得懂的载荷版本，按 kind 一张表。
 ///
@@ -169,38 +219,14 @@ impl PgChangeCandidateStore {
             .next(now_ms)
     }
 
-    async fn append(
-        &self,
-        artifact_id: &str,
-        event: (&str, &str, &str),
-        idempotency_key: &str,
-        causation_id: Option<&str>,
-        attributes: &str,
-    ) -> SFResult<()> {
-        let (kind, step, outcome) = event;
-        let event_id = self.next_event_id();
-        sqlx::query(INSERT_SQL)
-            .bind(&event_id)
-            .bind(kind)
-            .bind(SUBJECT_KIND)
-            .bind(artifact_id)
-            .bind(artifact_id)
-            .bind(step)
-            .bind(outcome)
-            .bind(idempotency_key)
-            .bind(causation_id)
-            .bind(&self.actor)
-            .bind(&self.writer)
-            .bind(&self.scope)
-            .bind(attributes)
-            .execute(&self.pool)
-            .await
-            .map_err(to_sf)?;
-        Ok(())
+    async fn append(&self, payload: cog_core::EventPayload) -> SFResult<()> {
+        let mut event = cog_core::FactEvent::new(payload);
+        event.event_id = Some(self.next_event_id());
+        let store = super::event_log::EventLogStore::new(self.pool.clone(), self.writer.clone());
+        store.append(event).await
     }
 
-    async fn rows(&self, kinds: &[&str]) -> SFResult<Vec<ChangeCandidate>> {
-        let kinds: Vec<String> = kinds.iter().map(|kind| (*kind).to_string()).collect();
+    async fn rows(&self, kinds: &[String]) -> SFResult<Vec<ChangeCandidate>> {
         let rows: Vec<RowSnapshot> = sqlx::query_as(LAST_EVENT_SQL)
             .bind(&kinds)
             .bind(CANDIDATE_KIND)
@@ -230,6 +256,43 @@ impl PgChangeCandidateStore {
     }
 }
 
+/// 一个目标要的变更，连同每条变更此刻的落地状态。
+#[derive(Debug, Clone)]
+pub struct LandingChainRow {
+    pub candidate: ChangeCandidate,
+    pub landing: Option<crate::postgres::landing_states::LandingStateRow>,
+}
+
+/// 「目标 → 变更 → 落地没有」：先按目标读候选，再按变更 id 对落地账。
+///
+/// 两半各自已经有读法（`unit_candidates` 与 `landing_states`），这里只把它们按
+/// 变更 id 拼成一条链——拼在 Rust 里而不是 SQL 里，是因为落地账的读法已经把
+/// 「最后一条事实」折好了，再写一遍会多出第二份折法。
+pub async fn unit_landing_chain(
+    pool: &PgPool,
+    kinds: &[String],
+    unit_of_work: &str,
+) -> SFResult<Vec<LandingChainRow>> {
+    let candidates = unit_candidates(pool, kinds, unit_of_work).await?;
+    let landings = crate::postgres::landing_states::landing_states(pool).await?;
+    let mut by_change: std::collections::HashMap<
+        &str,
+        &crate::postgres::landing_states::LandingStateRow,
+    > = std::collections::HashMap::new();
+    for landing in &landings {
+        by_change.insert(landing.change_id.as_str(), landing);
+    }
+    Ok(candidates
+        .into_iter()
+        .map(|candidate| LandingChainRow {
+            landing: by_change
+                .get(candidate.artifact_id.as_str())
+                .map(|l| (*l).clone()),
+            candidate,
+        })
+        .collect())
+}
+
 /// 把「一个身份的两条事件」拼成一行候选。
 ///
 /// 读不懂的载荷不是错误也不是空行：它是「这一行说过什么，而这一版代码读不懂」——
@@ -249,33 +312,14 @@ struct RowInput<'a> {
 /// 一条候选写进载荷的字段。目录在 `cog_observability::event_stream::PAYLOAD_CATALOG`，
 /// 由测试对账：这里多一个键或少一个键都会红——载荷存 text，没有类型能替人记住它有什么。
 fn candidate_attributes(candidate: &ChangeCandidate) -> serde_json::Value {
-    serde_json::json!({
-        "kind": candidate.kind,
-        "status": candidate.recorded_status,
-        "description": candidate.description,
-        "content": candidate.content,
-        "created_at": candidate.created_at.to_rfc3339(),
-        "eval_summary": candidate.eval_summary,
-        "tiering": candidate
-            .tiering
-            .as_deref()
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok()),
-    })
-}
-
-/// 一条状态事件的载荷。
-fn measured_attributes(status: &str, note: &str) -> serde_json::Value {
-    serde_json::json!({ "status": status, "note": note })
-}
-
-/// 一条定案事件的载荷（接受与拒绝同形，只有原因）。
-fn decision_attributes(reason: &str) -> serde_json::Value {
-    serde_json::json!({ "reason": reason })
+    // 键名只在一处：契约层的那一份，写者与读者共用。
+    cog_core::candidate_attributes(candidate)
 }
 
 /// 读不懂的一行：状态照常从事件种类读出来，内容留空，并标明这一版读不懂。
 fn undecodable_row(subject_id: &str, event_id: &str, status: &str) -> ChangeCandidate {
     ChangeCandidate {
+        unit_of_work: None,
         artifact_id: subject_id.to_string(),
         kind: String::new(),
         description: String::new(),
@@ -353,6 +397,10 @@ fn candidate_from_events(input: &RowInput<'_>) -> SFResult<ChangeCandidate> {
             .get("tiering")
             .filter(|value| !value.is_null())
             .map(|value| value.to_string()),
+        unit_of_work: origin
+            .get("unit_of_work")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
         recorded_status: text(&decision, "status")
             .or_else(|| text(&origin, "status"))
             .unwrap_or_default(),
@@ -370,25 +418,22 @@ fn candidate_from_events(input: &RowInput<'_>) -> SFResult<ChangeCandidate> {
 #[async_trait]
 impl ChangeCandidateStore for PgChangeCandidateStore {
     async fn record(&self, candidate: &ChangeCandidate) -> SFResult<()> {
-        let attributes = candidate_attributes(candidate).to_string();
-        self.append(
-            &candidate.artifact_id,
-            (CANDIDATE_KIND, "generated", "ok"),
-            &format!("{CANDIDATE_KIND}:{}", candidate.artifact_id),
-            None,
-            &attributes,
-        )
+        self.append(cog_core::EventPayload::ChangeCandidate {
+            candidate: candidate.clone(),
+            actor: self.actor.clone(),
+            scope: self.scope.clone(),
+        })
         .await
     }
 
     async fn transition(&self, artifact_id: &str, status: &str, note: &str) -> SFResult<()> {
-        self.append(
-            artifact_id,
-            (MEASURED_KIND, "verified", "ok"),
-            &format!("{MEASURED_KIND}:{artifact_id}:{status}"),
-            None,
-            &measured_attributes(status, note).to_string(),
-        )
+        self.append(cog_core::EventPayload::ChangeMeasured {
+            artifact_id: artifact_id.to_string(),
+            status: status.to_string(),
+            note: note.to_string(),
+            actor: self.actor.clone(),
+            scope: self.scope.clone(),
+        })
         .await
     }
 
@@ -398,32 +443,36 @@ impl ChangeCandidateStore for PgChangeCandidateStore {
         outcome: CandidateOutcome,
         reason: &str,
     ) -> SFResult<()> {
-        let (step, resolution) = match outcome {
-            CandidateOutcome::Accepted => ("landed", "ok"),
-            CandidateOutcome::Rejected => ("evaluated", "failed"),
+        let payload = match outcome {
+            CandidateOutcome::Accepted => cog_core::EventPayload::ChangeAccepted {
+                artifact_id: artifact_id.to_string(),
+                reason: reason.to_string(),
+                actor: self.actor.clone(),
+                scope: self.scope.clone(),
+            },
+            CandidateOutcome::Rejected => cog_core::EventPayload::ChangeRejected {
+                artifact_id: artifact_id.to_string(),
+                reason: reason.to_string(),
+                actor: self.actor.clone(),
+                scope: self.scope.clone(),
+            },
         };
-        let kind = outcome.kind();
-        self.append(
-            artifact_id,
-            (kind, step, resolution),
-            &format!("{kind}:{artifact_id}"),
-            None,
-            &decision_attributes(reason).to_string(),
-        )
-        .await
+        self.append(payload).await
     }
 
     async fn pending(&self) -> SFResult<Vec<ChangeCandidate>> {
         // 状态事件也算「最后一条」：读待办的人要的是这一行**此刻**的状态词，
         // 不是它生成时的那一个。
-        let mut rows = self.rows(&CHANGE_KINDS).await?;
+        let kinds = change_kinds();
+        let mut rows = self.rows(&kinds).await?;
         rows.retain(ChangeCandidate::is_pending);
         rows.sort_by_key(|row| std::cmp::Reverse(row.created_at));
         Ok(rows)
     }
 
     async fn all(&self) -> SFResult<Vec<ChangeCandidate>> {
-        let mut rows = self.rows(&CHANGE_KINDS).await?;
+        let kinds = change_kinds();
+        let mut rows = self.rows(&kinds).await?;
         rows.sort_by_key(|row| std::cmp::Reverse(row.created_at));
         Ok(rows)
     }
@@ -434,6 +483,28 @@ impl ChangeCandidateStore for PgChangeCandidateStore {
             .await?
             .into_iter()
             .find(|row| row.artifact_id == artifact_id))
+    }
+}
+
+#[cfg(test)]
+mod divergence_tests {
+    use super::CandidateDivergence;
+
+    /// 两种分歧各数各的：合成一个数就分不出该把判词放宽还是收紧。
+    #[test]
+    fn the_two_directions_are_counted_apart() {
+        let reading = CandidateDivergence {
+            adopt_accepted: 2,
+            adopt_rejected: 3,
+            reject_accepted: 1,
+            reject_rejected: 4,
+            inconclusive_accepted: 0,
+            inconclusive_rejected: 5,
+            unjudged: 1,
+        };
+        assert_eq!(reading.divergent(), 4);
+        assert_eq!(reading.total(), 16);
+        assert_eq!(CandidateDivergence::default().divergent(), 0);
     }
 }
 
@@ -488,6 +559,7 @@ mod tests {
     fn the_writer_and_the_catalog_name_the_same_fields() {
         use cog_core::ChangeCandidate;
         let candidate = ChangeCandidate {
+            unit_of_work: None,
             artifact_id: "c1".into(),
             kind: "code_change".into(),
             description: "d".into(),
@@ -520,18 +592,34 @@ mod tests {
             written(&candidate_attributes(&candidate)),
             catalogue("change_candidate")
         );
-        assert_eq!(
-            written(&measured_attributes("verified", "")),
-            catalogue("change_measured")
-        );
-        assert_eq!(
-            written(&decision_attributes("why")),
-            catalogue("change_accepted")
-        );
-        assert_eq!(
-            written(&decision_attributes("why")),
-            catalogue("change_rejected")
-        );
+        let measured = cog_core::EventPayload::ChangeMeasured {
+            artifact_id: "a".into(),
+            status: "verified".into(),
+            note: String::new(),
+            actor: "actor".into(),
+            scope: "scope".into(),
+        };
+        let accepted = cog_core::EventPayload::ChangeAccepted {
+            artifact_id: "a".into(),
+            reason: "why".into(),
+            actor: "actor".into(),
+            scope: "scope".into(),
+        };
+        let rejected = cog_core::EventPayload::ChangeRejected {
+            artifact_id: "a".into(),
+            reason: "why".into(),
+            actor: "actor".into(),
+            scope: "scope".into(),
+        };
+        for payload in [measured, accepted, rejected] {
+            let fields = payload.envelope("e1", "w");
+            assert_eq!(
+                written(&serde_json::from_str::<serde_json::Value>(&fields.attributes).unwrap()),
+                catalogue(payload.kind()),
+                "{} 的载荷键与目录不一致",
+                payload.kind()
+            );
+        }
     }
 
     /// 载荷读不懂时，这一行仍然读得出来，并标明它读不懂。
@@ -667,4 +755,95 @@ mod tests {
             assert_eq!(row.status, "candidate", "状态词照样从事件种类读出来");
         }
     }
+}
+
+/// 判词与门的结局分歧：评估门说该收/该拒，而最终是拒/收。
+///
+/// 两种读数都要：**判词说收而门拒**（判得太松或门太紧）与**判词说拒而门收**
+/// （判得太紧或门太松）。合成一个数会让两种修法变成一个。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CandidateDivergence {
+    pub adopt_accepted: u64,
+    pub adopt_rejected: u64,
+    pub reject_accepted: u64,
+    pub reject_rejected: u64,
+    pub inconclusive_accepted: u64,
+    pub inconclusive_rejected: u64,
+    pub unjudged: u64,
+}
+
+impl CandidateDivergence {
+    /// 判词与结局不一致的条数。
+    pub fn divergent(&self) -> u64 {
+        self.adopt_rejected + self.reject_accepted
+    }
+
+    pub fn total(&self) -> u64 {
+        self.adopt_accepted
+            + self.adopt_rejected
+            + self.reject_accepted
+            + self.reject_rejected
+            + self.inconclusive_accepted
+            + self.inconclusive_rejected
+            + self.unjudged
+    }
+}
+
+/// 从流上数一遍：每个候选的判词与它最后的结局。
+pub async fn candidate_divergence(pool: &PgPool) -> SFResult<CandidateDivergence> {
+    let rows = sqlx::query(
+        "SELECT subject_id, kind, attributes::jsonb AS attributes FROM cogneva_event \
+          WHERE kind = ANY($1) ORDER BY seq",
+    )
+    .bind(vec![
+        CANDIDATE_KIND.to_string(),
+        ACCEPTED_KIND.to_string(),
+        REJECTED_KIND.to_string(),
+        MEASURED_KIND.to_string(),
+    ])
+    .fetch_all(pool)
+    .await
+    .map_err(|e| SFError::Database(format!("read candidate divergence: {e}")))?;
+    let mut verdicts: std::collections::HashMap<String, Option<String>> = Default::default();
+    let mut outcomes: std::collections::HashMap<String, String> = Default::default();
+    for row in rows {
+        let subject: String = row.get("subject_id");
+        let kind: String = row.get("kind");
+        let attributes: serde_json::Value = row.get("attributes");
+        match kind.as_str() {
+            CANDIDATE_KIND => {
+                let verdict = attributes
+                    .get("eval_summary")
+                    .and_then(|summary| summary.get("verdict"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                verdicts.insert(subject, verdict);
+            }
+            ACCEPTED_KIND => {
+                outcomes.insert(subject, "accepted".into());
+            }
+            REJECTED_KIND => {
+                outcomes.insert(subject, "rejected".into());
+            }
+            _ => {}
+        }
+    }
+    let mut out = CandidateDivergence::default();
+    for (subject, verdict) in verdicts {
+        let Some(outcome) = outcomes.get(&subject) else {
+            out.unjudged += 1;
+            continue;
+        };
+        let accepted = outcome == "accepted";
+        match verdict.as_deref() {
+            Some("adopt") if accepted => out.adopt_accepted += 1,
+            Some("adopt") => out.adopt_rejected += 1,
+            Some("reject") if accepted => out.reject_accepted += 1,
+            Some("reject") => out.reject_rejected += 1,
+            Some("inconclusive") if accepted => out.inconclusive_accepted += 1,
+            Some("inconclusive") => out.inconclusive_rejected += 1,
+            _ => out.unjudged += 1,
+        }
+    }
+    Ok(out)
 }

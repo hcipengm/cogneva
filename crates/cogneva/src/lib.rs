@@ -3,11 +3,19 @@
 //! All modules are declared here so tests can access them via `cogneva::`.
 
 pub mod aof_repair;
+pub mod archive_events;
 pub mod assembly;
 pub mod backup;
 pub mod backup_crypto;
+pub mod batch_edit_agent;
 pub mod bootstrap;
 pub mod build_info;
+pub mod build_plan_readings;
+pub mod cache_misses;
+pub mod cell_plan;
+pub mod change_divergence;
+pub mod change_ledger_parity;
+pub mod chat_rebuild;
 pub mod checkpoints;
 pub mod claim_store;
 pub mod cli;
@@ -15,6 +23,7 @@ pub mod config_loader;
 pub mod config_watcher;
 pub mod conversation;
 pub mod daemon;
+pub mod db_pressure;
 pub mod eval_container;
 pub mod eval_hle;
 pub mod eval_mcp_in_pod;
@@ -36,6 +45,8 @@ pub mod health_check;
 pub mod host_ledger;
 pub mod hot_reload;
 pub mod import_change_records;
+pub mod keys;
+pub mod landing_states;
 pub mod mcp_serve;
 pub mod mcp_tools;
 pub mod metric_projection_rebuild;
@@ -45,10 +56,13 @@ pub mod pidfile;
 pub mod pin_census;
 pub mod platform;
 pub mod plugin_registry;
+pub mod principle_corpus;
 pub mod principles;
 pub mod principles_cli;
 pub mod process_census;
 pub mod process_report;
+pub mod read_surfaces;
+pub mod roster_rebuild;
 #[cfg(test)]
 pub(crate) mod roster_test_support;
 pub mod schema_bundle;
@@ -57,6 +71,13 @@ pub mod self_change;
 pub mod session_model;
 pub mod shutdown_coordinator;
 pub mod startup_guard;
+pub mod storage_pressure;
+pub mod table_census;
+pub mod table_copy;
+pub mod table_digest;
+pub mod table_swap;
+pub mod usage_landing_tx;
+pub mod usage_parity;
 pub mod validate_config;
 pub mod volume_walker;
 pub mod work;
@@ -188,7 +209,7 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Create shutdown coordinator early (before plugin init)
     let shutdown =
         shutdown_coordinator::ShutdownCoordinator::new(config.core.system.shutdown_timeout_ms);
-    let _ = SHUTDOWN.set(shutdown.clone());
+    cog_core::ignore_lost!(SHUTDOWN.set(shutdown.clone()));
     let shutdown = Arc::new(shutdown);
 
     let mut plugin_runner = plugin_registry::register_all()?;
@@ -300,7 +321,7 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             let sandbox = ctx.consume_service::<dyn cog_core::SandboxBackend>();
             // 对话那一侧写意图用的同一份落点：与网关的 `GatewayState.intent_events`
             // 是同一个服务，不另装一个进程级全局槽。
-            let intent_events = ctx.consume_service::<dyn cog_core::IntentEvents>();
+            let intent_events = ctx.consume_service::<dyn cog_core::EventStore>();
             // 平台上每个智能体开头读到的那段话是部署声明的，不是编译进二进制的
             // 一句。声明在 `prompts/` 里，随 ConfigMap 挂进进程；这里把本子交给
             // 内核，任务尝试与界面上的对话都从同一处取。没装提示词插件的进程
@@ -360,7 +381,7 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         let tx = shutdown_broadcast_tx.clone();
         async move {
             sig.wait().await;
-            let _ = tx.send(());
+            cog_core::ignore_lost!(tx.send(()));
         }
     });
     ctx.publish(shutdown.clone());

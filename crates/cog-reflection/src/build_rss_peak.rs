@@ -38,7 +38,8 @@ use std::time::Duration;
 /// steps spike, codegen plateaus — so half a second is fine enough to see a
 /// spike that lasts, and coarse enough that the sampler's own reads are a
 /// rounding error against the compile it is watching.
-// cap: bound — 密到抓得住真正持续的尖峰，又粗到采样自身开销在它监视的编译面前是舍入误差
+// cap: fixed — 密到抓得住真正持续的尖峰，又粗到采样自身开销在它监视的编译面前是舍入误差
+// keep: 删掉后要么量不到峰值，要么采样自身在编译面前不再是可以舍入的开销；由「密到抓住持续尖峰、粗到自身是舍入误差」兜住
 pub const SAMPLE_PERIOD: Duration = Duration::from_millis(500);
 
 /// How long a caller waits for the sampler to report after the process it was
@@ -49,12 +50,14 @@ pub const SAMPLE_PERIOD: Duration = Duration::from_millis(500);
 /// not reap, where waiting for the reading would cost the build. Named rather
 /// than written at the call site because it is a wall with a reason, and a bare
 /// number in a `Duration` constructor is one nothing can be asked about.
-// cap: bound — 给有理由的墙时，而不是给构造函数里一个没处问的裸数
+// cap: fixed — 给有理由的墙时，而不是给构造函数里一个没处问的裸数
+// keep: 删掉后最后一次排空没有上限，构建收尾停在等读数上；由「给有理由的墙」兜住
 pub const DRAIN_WAIT: Duration = Duration::from_secs(5);
 
 /// A bound on the tree walk, so a `/proc` that is misbehaving (a name cycle, a
 /// pid reused mid-walk) costs a sample rather than the build.
-// cap: bound — 走 /proc 的上界，让名字成环或 pid 在走的过程里被复用时损失的是一拍而不是整次构建
+// cap: fixed — 走 /proc 的上界，让名字成环或 pid 在走的过程里被复用时损失的是一拍而不是整次构建
+// not-a-bound: 走 /proc 的上界，让名字成环或 pid 在走的过程里被复用时损失的是一拍而不是整次构建
 const MAX_TREE: usize = 4096;
 
 /// What one build's memory looked like while it ran.
@@ -198,7 +201,7 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

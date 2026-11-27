@@ -115,13 +115,15 @@ pub(crate) async fn clear_stale_git_lock(lock: &Path, max_age: Duration) -> bool
 ///
 /// 实际生效的界每拍按实测重算（卷还装得下多少棵树 × 新树到达间隔 / 2），并把
 /// 已归还工作树里最长的一趟当地板——量不到卷或到达率时才落回这个数。
-// cap: bound — 种子：量不到卷与到达率时的退路，生效的界每拍按实测重算并以已归还的最长一趟当地板
+// cap: fixed — 种子：量不到卷与到达率时的退路，生效的界每拍按实测重算并以已归还的最长一趟当地板
+// keep: 删掉后量不到卷与到达率时没有保留期可用，只能立刻回收刚用完的树；由「种子只用到实测为止」兜住
 pub const DEFAULT_EPHEMERAL_TTL: Duration = Duration::from_secs(21600);
 
 /// 孤儿分支存活上限的**种子**：未并入 main、且所属实例已经轮换掉的 `evol/<id>`
 /// 分支留多久。实际生效的界每拍按实测重算（裸仓库还能装下多少条分支的独有
 /// 对象 × 新实例分支到达间隔 / 2）。
-// cap: bound — 种子：量不到仓库容量或分支到达率时的退路，生效的界每拍按实测重算
+// cap: fixed — 种子：量不到仓库容量或分支到达率时的退路，生效的界每拍按实测重算
+// keep: 删掉后量不到仓库容量或分支到达率时没有孤儿分支的保留期；由「种子只用到实测为止」兜住
 pub const DEFAULT_ORPHAN_BRANCH_TTL: Duration = Duration::from_secs(2_592_000);
 
 /// 临时工作树这一条保留回路在登记表里的 key，与 `evolution.workspaces.ephemeralTtlSecs`
@@ -137,6 +139,7 @@ pub const ORPHAN_BRANCH_TTL_KNOB: &str = "evolution.workspaces.orphanBranchTtlSe
 /// 事件就能翻倍，长到与「这条卷多久会被重新填满」同一量级。窗口内的到达数除以
 /// 窗口，就是这条回路的到达率。
 // cap: fixed — 7 天：到达是稀疏事件，窗口短到一两次事件就能翻倍，长到与卷被重新填满同一量级
+// keep: 删掉后到达样本永远留着，上个月的突发一直在定今天的保留期；由「稀疏事件需要一周的窗口」兜住
 const ARRIVAL_WINDOW_SECS: u64 = 7 * 86_400;
 
 /// 一件东西在这张卷上值得留多久：装得下多少件 × 新件到达间隔 / 2。
@@ -219,7 +222,8 @@ fn unique_branch_bytes(bare: &Path, names: &[String]) -> Option<u64> {
 /// 旧 Pod 必须已经释放卷，实际重叠窗口接近零；这个值只防御将来换成 RWX 或
 /// RollingUpdate 的情形，取默认终止宽限期的若干倍即可，不能取大——取值越大，
 /// 重启越频繁时遗留树越可能永远躲过回收。
-// cap: bound — 取默认终止宽限期的若干倍；取值越大，重启越频繁时遗留树越可能躲过回收
+// cap: fixed — 取默认终止宽限期的若干倍；取值越大，重启越频繁时遗留树越可能躲过回收
+// keep: 删掉后刚起的树在终止宽限期里就被当孤儿回收，重启中的执行器丢掉自己的树；由「默认终止宽限期的若干倍」兜住
 pub const ORPHAN_MIN_AGE: Duration = Duration::from_secs(900);
 
 /// 部署器独占那棵稳定工作树的 id。
@@ -847,7 +851,7 @@ impl WorkspaceManager {
         // 一个安静的卷与一条停摆的回路在这里分开——前者目标不变、计数仍在走。
         let ttl = self.effective_ephemeral_ttl().await;
         let now = chrono::Utc::now().timestamp();
-        for entry in self.list().await.unwrap_or_default() {
+        for entry in cog_core::logged_default!(self.list().await) {
             if !entry.path.starts_with(&self.root) {
                 continue;
             }
@@ -900,7 +904,7 @@ impl WorkspaceManager {
         let now = unix_now();
         let span = self.arrival_span_secs(now);
         let arrivals = arrivals_within(&self.ephemeral_arrivals.lock().unwrap(), now, span);
-        let trees = self.list().await.unwrap_or_default();
+        let trees = cog_core::logged_default!(self.list().await);
         let tree_bytes = self.sampled_tree_bytes(&trees).await;
         // 这张卷还能装新东西的字节数（`f_bavail`）：容量按它算，卷越满、界越短。
         let capacity = crate::build_gate::disk_bytes(&self.root);
@@ -1019,7 +1023,7 @@ impl WorkspaceManager {
         ];
         let mut reclaimed = Vec::new();
         let now = chrono::Utc::now().timestamp();
-        for entry in self.list().await.unwrap_or_default() {
+        for entry in cog_core::logged_default!(self.list().await) {
             if !entry.path.starts_with(&self.root) {
                 continue;
             }
@@ -1266,7 +1270,7 @@ impl WorkspaceManager {
         let listed = self
             .run_git(&["config", "--global", "--get-all", "safe.directory"], None)
             .await
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         if !safe_directory_missing(&listed, path) {
             return;
         }
@@ -1308,13 +1312,24 @@ impl WorkspaceManager {
             .git_bare(&["worktree", "remove", "--force", path.to_str().unwrap_or("")])
             .await;
         if tokio::fs::try_exists(path).await.unwrap_or(false) {
-            let _ = tokio::fs::remove_dir_all(path).await;
+            cog_core::ignore_lost!(tokio::fs::remove_dir_all(path).await);
+        }
+        // 动作之后由现实的读数回答到没到：不是「我们发过删除」，而是「它现在不在」。
+        // 目录还在（权限、占用的句柄）时不能当成功走开——那会让下一次登记把同一棵
+        // 树当成已回收。
+        if cog_core::contract::irreversible::RealityCheck::PathAbsent.read_path(path) == Some(false)
+        {
+            tracing::warn!(
+                path = %path.display(),
+                "worktree removal was asked for and the directory is still there"
+            );
         }
         self.forget_safe_directory(path).await;
-        let _ = self.prune().await;
+        cog_core::ignore_lost!(self.prune().await);
     }
 
     fn meta_path(&self, id: &str) -> PathBuf {
+        // state-file: cache — 构建工作区 sidecar 的可重算代价，丢了从目录本身重扫，不是某条事实的第二份正本
         self.meta_dir.join(format!("{}.json", sanitize_id(id)))
     }
 
@@ -1336,7 +1351,7 @@ impl WorkspaceManager {
     }
 
     fn remove_meta(&self, id: &str) {
-        let _ = std::fs::remove_file(self.meta_path(id));
+        cog_core::ignore_lost!(std::fs::remove_file(self.meta_path(id)));
     }
 
     async fn run_git(&self, args: &[&str], workdir: Option<&Path>) -> SFResult<String> {

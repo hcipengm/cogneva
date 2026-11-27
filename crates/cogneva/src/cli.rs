@@ -23,6 +23,41 @@ pub enum Command {
     SandboxExecutor,
     /// 2.1–2.4 的入口：把 2.5 的假清单变成一次生成请求。
     BatchEdit,
+    /// 照着流重建一段会话的 `chat_turns`。
+    ChatRebuild,
+    RosterRebuild,
+    /// 把超出保留期的可观测事件搬进对象存储、核对后删热副本。
+    ArchiveEvents,
+    /// 签名钥匙的生命周期：list/issue/rotate/revoke。
+    Keys,
+    /// 表与流的分工：普查的分类计数与旧主存清单。
+    TableCensus,
+    /// 评估判词与最终结局的分歧率。
+    ChangeDivergence,
+    /// 变更账与流逐格比对（`--project` 先增量重折）：空的输出就是「表是流的一份
+    /// 投影」的证据。
+    ChangeLedgerParity,
+    /// 窗口里每一次没命中按为什么没命中分类计数（前缀断在哪一格／接得上却没命中）。
+    CacheMisses,
+    /// 这一批要跑哪些格、哪些可以复用（给宿主脚本决定怎么调 cargo）。
+    CellPlan,
+    BuildPlans,
+    /// 每条变更此刻的落地状态，从流上读（文件只是缓存）。
+    LandingStates,
+    /// 一张表的逐行内容摘要（迁移前后对照用）。
+    TableDigest,
+    /// 两张表逐行对照（迁移前后/双写两侧）。
+    TableDiff,
+    /// 把一张表搬到另一张：可中断、可从任意一点接着做（水位就是目标表的主键）。
+    TableCopy,
+    /// 换表走到第几段、能不能往下一段走（判据是这一刻的逐行对照）。
+    TableSwap,
+    /// 库自己那几格读数（体积、事务、临时文件、死锁）。
+    DbPressure,
+    /// 四条压力读数装成一次判词：存储还跟不跟得上，该不该前移写入口。
+    StoragePressure,
+    /// 用量行与事件流在同一窗口里的逐项对照（停写行之前盯它）。
+    UsageParity,
     BatchPlan,
     /// 五格台账的读法与批次规则：`cogneva ledger status`。
     Ledger,
@@ -53,7 +88,7 @@ pub enum Command {
 
 /// Subcommands, in the order they appear in [`USAGE`]. A command added here but
 /// not documented fails the usage test.
-const SUBCOMMANDS: [(&str, Command); 27] = [
+const SUBCOMMANDS: [(&str, Command); 45] = [
     ("security-gateway", Command::SecurityGateway),
     ("sandbox-executor", Command::SandboxExecutor),
     ("volume-walker", Command::VolumeWalker),
@@ -86,6 +121,24 @@ const SUBCOMMANDS: [(&str, Command); 27] = [
     // 的 match 臂从加进来那天起没有一条命令能走到）。
     ("batch-edit", Command::BatchEdit),
     ("batch-plan", Command::BatchPlan),
+    ("chat-rebuild", Command::ChatRebuild),
+    ("roster-rebuild", Command::RosterRebuild),
+    ("archive-events", Command::ArchiveEvents),
+    ("keys", Command::Keys),
+    ("table-census", Command::TableCensus),
+    ("change-divergence", Command::ChangeDivergence),
+    ("change-ledger-parity", Command::ChangeLedgerParity),
+    ("cache-misses", Command::CacheMisses),
+    ("cell-plan", Command::CellPlan),
+    ("build-plans", Command::BuildPlans),
+    ("landing-states", Command::LandingStates),
+    ("table-digest", Command::TableDigest),
+    ("table-diff", Command::TableDiff),
+    ("table-copy", Command::TableCopy),
+    ("table-swap", Command::TableSwap),
+    ("db-pressure", Command::DbPressure),
+    ("storage-pressure", Command::StoragePressure),
+    ("usage-parity", Command::UsageParity),
     ("ledger", Command::Ledger),
 ];
 

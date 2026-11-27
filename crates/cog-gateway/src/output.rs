@@ -96,6 +96,9 @@ pub struct Delivery {
     /// 结果的开头一段。整份结果可能很大，这里只放够认出来的那一段。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_excerpt: Option<String>,
+    /// 取回整份结果的地方。引用是值的一部分：没有它，摘要就是「丢了且拿不回来」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_ref: Option<String>,
 }
 
 /// 一个项目这一窗口交了多少。
@@ -122,11 +125,13 @@ pub struct Outputs {
 }
 
 /// 这一面一次带多少行明细。
-// cap: bound — 界的是单次响应的体积；窗口里有更多完成行时，汇总数照旧是全部
+// cap: fixed — 界的是单次响应的体积；窗口里有更多完成行时，汇总数照旧是全部
+// keep: 删掉后单次响应装下窗口里全部完成行，响应体积无界；由「汇总数照旧是全部」兜住
 pub const RECENT_ROWS: usize = 50;
 
 /// 结果摘录多少字符。
-// cap: bound — 界的是单行体积；结果本身不截断，只在页面上放开头一段
+// cap: fixed — 界的是单行体积；结果本身不截断，只在页面上放开头一段
+// keep: 删掉后单行结果可以任意长，页面被一行撑开；由「结果本身不截断，只在页面上放开头一段」兜住
 pub const RESULT_EXCERPT_CHARS: usize = 160;
 
 /// 拼这份产出的原料。
@@ -238,6 +243,8 @@ pub fn build(inputs: Inputs<'_>) -> Outputs {
                     worker: task.agent_id.clone(),
                     finished_at: task.updated_at,
                     carried_result: task.result.is_some(),
+                    // 摘要 + 回去的路：整份结果在任务行上，引用就是任务 id。
+                    full_ref: task.result.as_ref().map(|_| format!("task:{}", task.id)),
                     result_excerpt: task.result.as_ref().map(excerpt),
                 })
                 .collect();
@@ -355,7 +362,7 @@ pub async fn output_handler(
 pub async fn read(state: &GatewayState) -> Outputs {
     let now = Utc::now();
     let window_hours = crate::observability::spend_window_hours();
-    let tasks = crate::progress::merged_tasks(state).await.ok();
+    let tasks = cog_core::logged_ok!(crate::progress::merged_tasks(state).await);
     let builds = match state.evolution_admin.as_ref() {
         None => None,
         Some(admin) => Some(
@@ -545,7 +552,7 @@ mod tests {
             .work
             .value()
             .and_then(|work| work.note.clone())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         assert!(
             work_note.contains("存储") && work_note.contains("库"),
             "任务图那一段要说清有没有存储是两种口径：{work_note:?}"
@@ -553,7 +560,7 @@ mod tests {
 
         let builds = outputs.builds.value().expect("构建跑次读到了");
         assert_eq!(builds.built, 1);
-        let builds_note = builds.note.clone().unwrap_or_default();
+        let builds_note = builds.note.clone().unwrap_or(Default::default());
         assert!(
             builds_note.contains("本进程") && builds_note.contains("别的进程"),
             "构建那一段要说出它的窗口属于哪个进程：{builds_note:?}"

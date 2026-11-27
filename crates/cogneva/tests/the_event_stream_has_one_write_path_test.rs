@@ -32,44 +32,13 @@ use crate::common::rust_production::production_texts;
 ///
 /// 它报的不是「谁写了」，是「有几条写路径」：第二处出现就是第二条路径，无论它当时
 /// 被哪个开关挡着——开关默认关着的写路径，与没有这条路径，在树里长得不一样。
-const WRITERS: &[(&str, &str)] = &[
-    (
-        "crates/cog-storage/src/postgres/intent_events.rs",
-        "一条意图进门（`intent_received`：来源、外部身份、原文、因果父行）",
-    ),
-    (
-        "crates/cog-storage/src/postgres/llm_call_events.rs",
-        "一次上游调用（`llm_call`）",
-    ),
-    (
-        "crates/cog-storage/src/postgres/tool_call_events.rs",
-        "一次工具调用（`tool_call`）",
-    ),
-    (
-        "crates/cog-storage/src/postgres/round_events.rs",
-        "一轮开工/关轮（`round_opened` / `round_closed`）",
-    ),
-    (
-        "crates/cog-storage/src/postgres/change_candidate_store.rs",
-        "候选变更的四个阶段（`change_candidate` / `change_measured` / `change_accepted` / `change_rejected`）",
-    ),
-    (
-        "crates/cog-storage/src/postgres/task_ledger.rs",
-        "任务的每一次状态转移（`task_transition`）",
-    ),
-    (
-        "crates/cog-storage/src/postgres/redaction.rs",
-        "一段正文被销毁（`redacted`）",
-    ),
-    (
-        "crates/cog-storage/src/postgres/usage_backfill.rs",
-        "旧用量行回填成调用事实（`llm_call`）",
-    ),
-    (
-        "crates/cog-storage/src/postgres/intent_events.rs",
-        "一句到达与它的接手（`intent_received` / `intent_triaged`）",
-    ),
-];
+// 写路径只有一条：`event_log.rs`。每一种事实的**信封**在 cog-core 里拼，落库全部
+// 经过这一个文件；登记名单因此只剩一行——多出来的任何一处仍然是第二条写路径，
+// 而这正是这条门要挡的形状。
+const WRITERS: &[(&str, &str)] = &[(
+    "crates/cog-storage/src/postgres/event_log.rs",
+    "唯一写口：所有事实（意图、待办、调用、工具调用、轮次、转移、擦除、员工、消息）",
+)];
 
 #[test]
 fn every_insert_site_is_a_registered_writer() {

@@ -358,6 +358,22 @@ export interface TurnTaskRow {
   goalId: string | null;
   venue: string | null;
   assignedTo: string | null;
+  /** 这一行是哪一句意图交出来的；没有意图的入口为 `null`。 */
+  intentId: string | null;
+  /**
+   * 派活那一刻带着的三格；状态是那一瞬的 `未落`。任务图读回来的那份更新，
+   * 界面优先用它——入队时的快照不是「做到哪」的答案。
+   */
+  ledgerItem: TurnLedgerItem | null;
+}
+
+/** 一条待办的五个格子。状态词与台账同一套：未落 / 已落。 */
+export interface TurnLedgerItem {
+  id: string;
+  terminal: string;
+  now: string;
+  gap: string;
+  state: '未落' | '已落';
 }
 
 /**
@@ -518,6 +534,28 @@ function frameCount(value: unknown): number | null {
 }
 
 /**
+ * 帧里的一条待办。认不出返回 `null`——「这一行没带三格」与「三格都是空」
+ * 在读面上不能同形，所以不拿空字符串补齐。
+ *
+ * 状态词只有台账上的两个：`未落` / `已落`。别的词读成 `null`，不在界面上
+ * 替它猜一个。
+ */
+function frameLedgerItem(value: unknown): TurnLedgerItem | null {
+  if (!value || typeof value !== 'object') return null;
+  const row = value as Record<string, unknown>;
+  const state = row.state;
+  if (state !== '未落' && state !== '已落') return null;
+  const cell = (key: string) => (typeof row[key] === 'string' ? (row[key] as string) : '');
+  return {
+    id: cell('id'),
+    terminal: cell('terminal'),
+    now: cell('now'),
+    gap: cell('gap'),
+    state,
+  };
+}
+
+/**
  * 一段聊天帧 → 界面认得的形状。认不出返回 `null`。
  *
  * `sessionId` 从信封上取而不是从帧体里取：帧体里没有它，而一段没有会话身份
@@ -641,6 +679,8 @@ export function normalizeChatFrame(
                     venue: typeof row.venue === 'string' ? row.venue : null,
                     assignedTo:
                       typeof row.assigned_to === 'string' ? row.assigned_to : null,
+                    intentId: typeof row.intent_id === 'string' ? row.intent_id : null,
+                    ledgerItem: frameLedgerItem(row.ledger_item),
                   }]
                 : []
             )

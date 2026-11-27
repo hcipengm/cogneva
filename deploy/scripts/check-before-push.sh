@@ -1,3 +1,4 @@
+# census-keep: shapes=truncations — 工具输出里的列宽与短摘要：完整值就在源文件/行号里（每行已带 path:line），删掉只会让一份报告撑满终端；由源文件本身兜住
 #!/usr/bin/env bash
 # reads: .github/workflows/*.yml subject
 # 推之前跑一遍 CI 里那些**只靠 shell 就能跑**的作业。
@@ -40,6 +41,7 @@
 # 那一笔之后部署器停了九版。容量登记表那条秒级的纯文本扫描（`rust_capacity_constants_registry_test.rs`）
 # 仍然单独在这里跑，理由是它可以不编译就判。
 set -uo pipefail
+
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "${here}/../.." && pwd)"
@@ -128,7 +130,7 @@ tool_sig() { # 名字 命令…
         printf '%s=absent\n' "${name}"
         return 0
     fi
-    printf '%s=%s\n' "${name}" "$("$@" 2>/dev/null | head -n 1)"
+    printf '%s=%s\n' "${name}" "$("$@" 2>/dev/null)"
 }
 
 work_tree_oid() {
@@ -354,7 +356,7 @@ case "${1:-}" in
 --status)
     key="$(tree_key)"
     if [ -f "${stamp_dir}/${key}" ]; then
-        echo "这份字节验过：$(head -n 1 "${stamp_dir}/${key}")"
+        echo "这份字节验过：$(cat "${stamp_dir}/${key}")"
         exit 0
     fi
     echo "这份字节没验过（$(git rev-parse --short HEAD 2>/dev/null)，键 ${key:0:12}）；"
@@ -393,7 +395,7 @@ case "${1:-}" in
         # 基底上的合并结果：干净的变基与「套得上但语义变了」的变基在改动键上同形
         # （上游改了同一个函数的签名，这几笔照样干净套上、却编不过），本地分不出，只有
         # CI 整棵判得出。一句笼统的「已验证」会把这两件事说成一件。
-        echo "这批改动验过（验的是改动本身，不是它与基底 ${pbase:0:12} 的合并结果）：$(head -n 1 "${stamp_dir}/patch.${pkey}")"
+        echo "这批改动验过（验的是改动本身，不是它与基底 ${pbase:0:12} 的合并结果）：$(cat "${stamp_dir}/patch.${pkey}")"
         exit 0
     fi
     echo "这批改动（改动键 ${pkey:0:12}，基底 ${pbase:0:12}）没验过：这批改动本身改过、或从没跑过验证；"
@@ -408,7 +410,7 @@ case "${1:-}" in
         exit 2
     fi
     if [ -f "${stamp_dir}/content.${ckey}" ]; then
-        echo "这份字节验过：$(head -n 1 "${stamp_dir}/content.${ckey}")"
+        echo "这份字节验过：$(cat "${stamp_dir}/content.${ckey}")"
         exit 0
     fi
     echo "这份字节（内容键 ${ckey:0:12}）没验过：改过、或者从没跑过验证；"

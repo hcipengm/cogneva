@@ -49,7 +49,7 @@ fn notification_migration() -> PathBuf {
             let name = path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             // 只认**建表**的那一份：后续迁移会改这张表（删列、加列），
             // 它们描述的不是建表语句本身，拿它们跟内联 DDL 比是把两件事混成一件。
             name.contains("notifications")
@@ -93,7 +93,7 @@ fn dropped_notification_columns() -> std::collections::BTreeSet<String> {
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         if !name.contains("notifications") || !name.ends_with(".up.sql") {
             continue;
         }

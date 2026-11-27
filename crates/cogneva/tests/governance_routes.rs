@@ -236,6 +236,7 @@ fn state_with(
 
     Arc::new(GatewayState {
         llm_call_events: None,
+        security_keys: None,
         data_dir: "/tmp".into(),
         config: std::sync::RwLock::new(GatewayConfig {
             http_port: 0,
@@ -307,6 +308,8 @@ fn state_with(
         principle_ledger,
         change_ledger: None,
         intent_events: None,
+        employee_events: None,
+        message_events: None,
         key_value: None,
         external_skill_registry: None,
         tool_registry: None,

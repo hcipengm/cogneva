@@ -374,7 +374,8 @@ fn memory_source(layer: &str) -> String {
 /// input is a serialized object of unbounded size, and clipping it at the
 /// write side keeps the ceiling on what the namespace holds rather than on
 /// what a reader is allowed to see.
-// cap: bound — 一段自由文本进 prompt 前保留多少字：上限落在产出侧
+// cap: fixed — 一段自由文本进 prompt 前保留多少字：上限落在产出侧
+// keep: 删掉后整段摘要进 prompt，白花 token 并可能挤掉上下文；由「上限落在产出侧」兜住
 const SUMMARY_MAX_CHARS: usize = 500;
 
 /// How many rows a retrieval asks the store for before it ranks them.
@@ -502,7 +503,7 @@ fn wiki_entry(r: cog_core::WikiSearchResult) -> KnowledgeEntry {
         // whose sizes differ by whatever the wiki happens to hold. Clipped here,
         // at the read side, because the backend has to go on returning the
         // document it holds.
-        content: clip(&r.document.content, crate::WIKI_PAGE_PROMPT_CHARS),
+        content: r.document.content.clone(),
         relevance_score: r.score,
         metadata: Some(serde_json::json!({
             "path": r.document.path,
@@ -888,7 +889,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         let task_type = task.task_type.retrieval_class();
         let result_summary = serde_json::to_string(&result.output)
             .map(|output| clip(&output, SUMMARY_MAX_CHARS))
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
 
         // --- Layer 1: Schema ---
         let schema_entry = SchemaEntry::new(
@@ -961,7 +962,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         // they have to match.
         let input_summary = serde_json::to_string(&task.input)
             .map(|input| clip(&input, SUMMARY_MAX_CHARS))
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         if result.success {
             self.archive_implementation(
                 &memory,
@@ -1021,7 +1022,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
             .get("goal")
             .and_then(|goal| goal.as_str())
             .map(|goal| clip(goal, SUMMARY_MAX_CHARS))
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let id = cog_core::schema_entry_id(NS_DECOMPOSITION, SchemaKind::Learning, &key);
 
         let Some(pattern) = fold_decomposition(
@@ -1207,7 +1208,6 @@ impl UnifiedKnowledgeBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::WIKI_PAGE_PROMPT_CHARS;
     use cog_core::contract::knowledge::RETRIEVAL_OUTCOMES;
     use cog_core::{DateTime, SFError, Utc, WikiDocument, WikiSearchResult};
     use std::collections::HashMap;
@@ -1605,18 +1605,20 @@ mod tests {
                 highlights: vec![],
             };
             Ok(vec![
-                doc("page-long", "x".repeat(WIKI_PAGE_PROMPT_CHARS * 3)),
+                doc("page-long", "x".repeat(6_000)),
                 doc("page-short", "y".repeat(10)),
             ])
         }
     }
 
+    /// 一页多长就交给调用方多长：这一层不再自己截断。
+    ///
+    /// 曾经这里按 2,000 字截断，那个数的出处只有「一页的量」这句自述，没有任何
+    /// 读数支撑。删掉之后，页面有多长就带多长；如果它超过了模型的上下文窗口，
+    /// 会以一次 `context_limit` 拒绝的形式被读到（那条读数与降预算的回路在
+    /// agent 侧），而不是在这里静默丢掉尾巴。
     #[tokio::test]
-    async fn a_wiki_page_reaches_the_caller_bounded() {
-        // The wiki layer has no size bound of its own, so without this a
-        // retrieval hands the caller however much the wiki happens to hold. The
-        // backend still returns the document it holds -- the bound is applied
-        // where the text becomes prompt context, which is here.
+    async fn a_wiki_page_reaches_the_caller_whole() {
         let backend = UnifiedKnowledgeBackend::new().with_wiki(Arc::new(MockWikiWithLongPage));
         let task = Task::new(
             "t1".to_string(),
@@ -1626,10 +1628,12 @@ mod tests {
 
         let entries = backend.retrieve_relevant(&task, "query", 5).await.unwrap();
         let long = entries.iter().find(|e| e.id == "page-long").unwrap();
-        assert_eq!(long.content.chars().count(), WIKI_PAGE_PROMPT_CHARS);
+        assert_eq!(
+            long.content.chars().count(),
+            6_000,
+            "检索交给调用方的正文必须与库里那一页等长，不再截断"
+        );
 
-        // Short enough to fit is left alone: a bound that rewrote every row
-        // would be a rewrite, not a bound.
         let short = entries.iter().find(|e| e.id == "page-short").unwrap();
         assert_eq!(short.content, "y".repeat(10));
     }
@@ -2363,11 +2367,11 @@ mod tests {
             let layer = labels
                 .get(cog_core::build_cache::LAYER_LABEL)
                 .cloned()
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             let outcome = labels
                 .get(cog_core::build_cache::OUTCOME_LABEL)
                 .cloned()
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             self.cells.lock().unwrap().push((layer, outcome));
             Ok(())
         }

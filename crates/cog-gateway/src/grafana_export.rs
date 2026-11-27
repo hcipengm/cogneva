@@ -208,7 +208,7 @@ pub fn panels_from_registry() -> Vec<Board> {
         let Some(kind) = kind_of(name) else {
             continue;
         };
-        let help = metric_description(kind, name.as_str()).unwrap_or_default();
+        let help = metric_description(kind, name.as_str()).unwrap_or(Default::default());
         let uid = board_uid_for_series(name.as_str());
         let board = boards.entry(uid.clone()).or_insert_with(|| Board {
             title: format!("序列目录：{uid}"),
@@ -246,7 +246,7 @@ async fn live_series_names() -> Result<Vec<String>, String> {
                 .filter_map(|row| row.as_str().map(str::to_string))
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     Ok(names)
 }
 
@@ -422,12 +422,14 @@ pub fn dashboard_body(board: &Board) -> serde_json::Value {
 
 /// How long the first retry waits after a push fails.
 // cap: fixed — 重试的代价与等待的代价同向：推出去了就停，推不出去下一轮再来；
+// keep: 删掉后退避没有起点，推不出去时下一轮什么时候再来没有答案；由「推出去了就停，推不出去下一轮再来」兜住
 // 这个数只决定 Grafana 比网关晚起来时面板晚出现多久，没有两侧代价不对称的最优点
 const PUSH_RETRY_SECONDS: u64 = 30;
 
 /// The longest a retry waits, so a Grafana that stays away does not turn into
 /// one attempt per hour that nobody is watching for.
 // cap: fixed — 与上一个同一条理由的另一端；它只是把退避封顶，不是界
+// keep: 删掉后退避无界地翻倍，一次故障后推送永远回不来；由「只是把退避封顶」兜住
 const PUSH_RETRY_CEILING_SECONDS: u64 = 300;
 
 /// Keep pushing until the boards land once.
@@ -489,6 +491,7 @@ pub async fn keep_pushing(endpoint: GrafanaEndpoint) {
 /// The deadline for one push. A push that cannot answer in this long has
 /// already failed; the retry loop is what carries the next attempt.
 // cap: fixed — 一次推送的等待上限：超时当作失败重试，等更久只是让下一次尝试更晚，
+// keep: 删掉后一次推送的等待没有上限，下一次尝试被拖得更晚；由「超时当作失败重试」兜住
 // 面板晚一分钟出现不影响任何判词
 // wall: 等=Grafana 对一次推送的答复 / 等不到=这一次推送按失败收尾，重试循环带着下一次尝试上来；已经推过去的样本不会因此被重发一遍 / 续跑=能，下一次尝试是一次新的推送
 const PUSH_TIMEOUT_SECS: u64 = 30;

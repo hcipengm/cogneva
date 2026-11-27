@@ -280,7 +280,7 @@ mod tests {
 
         let mut matched = Vec::new();
         for rule in rules {
-            let promql = rule["promql"].as_str().unwrap_or_default();
+            let promql = rule["promql"].as_str().unwrap_or(Default::default());
             if promql.contains(READ_SILENT_SECONDS_METRIC) {
                 matched.push(rule);
             }
@@ -317,7 +317,7 @@ mod tests {
              the population it is averaged over: {promql}"
         );
         if let Some((_, clause)) = left.split_once("without (") {
-            let dropped = clause.split(')').next().unwrap_or_default();
+            let dropped = clause.split(')').next().unwrap_or(Default::default());
             for label in ["stream", "consumer_group"] {
                 assert!(
                     !dropped.split(',').any(|name| name.trim() == label),
@@ -338,7 +338,7 @@ mod tests {
             "the bound has to be a scalar, or the labelled left side finds no \
              partner to compare against and the rule is silent for good: {promql}"
         );
-        let summary = rule["summary"].as_str().unwrap_or_default();
+        let summary = rule["summary"].as_str().unwrap_or(Default::default());
         for placeholder in ["{stream}", "{consumer_group}"] {
             assert!(
                 summary.contains(placeholder),

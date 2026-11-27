@@ -132,7 +132,7 @@ impl ChatStream {
             session.messages.pop_front();
         }
         // 没有收件人时 `send` 报错，那不是错：这一段的帧已经记在快照里了。
-        let _ = session.frames.send(Frame { seq, json });
+        cog_core::ignore_lost!(session.frames.send(Frame { seq, json }));
         // 一句都不剩、也没人在看：这一段在这个进程里没有可留的东西了。
         if session.messages.is_empty() && session.frames.receiver_count() == 0 {
             sessions.remove(session_id);

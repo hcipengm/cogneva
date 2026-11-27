@@ -34,14 +34,23 @@ pub struct TaskProfile {
 ///
 /// 不是挑出来的阈值——它是这个归一化的端点，和 0.0 一样是刻度的定义。
 // cap: fixed — 归一化区间的上端点：一份预算就是一
+// keep: 删掉后归一化区间的上端点消失，一份预算不再是一；由「一份预算就是一」兜住
 pub const WHOLE_BUDGET: f64 = 1.0;
 
 impl Default for TaskProfile {
     fn default() -> Self {
         Self {
+            // cap: fixed — 0.0 是这条刻度「熟悉／低风险／清晰／无依赖」的那一端，与 1.0 同为刻度的定义
+            // not-a-bound: 0.0 是这条刻度「熟悉／低风险／清晰／无依赖」的那一端，与 1.0 同为刻度的定义
             novelty: 0.0,
+            // cap: fixed — 同上：归一化区间的下端点
+            // keep: 删掉后归一化区间没有下端点，风险分数与预算不在同一尺度上；由「归一化区间的下端点」兜住
             risk: 0.0,
+            // cap: fixed — 同上
+            // keep: 删掉后模糊度的分数与预算不在同一尺度上；由「归一化区间的下端点」兜住
             ambiguity: 0.0,
+            // cap: fixed — 同上
+            // keep: 删掉后依赖数的分数与预算不在同一尺度上；由「归一化区间的下端点」兜住
             dependency_count: 0.0,
             token_budget: WHOLE_BUDGET,
             declared_scale: DeclaredScale::Unknown,
@@ -87,16 +96,20 @@ pub enum ChangeTier {
 }
 
 /// Files a request may name and still be the shortcut's.
-// cap: bound — 一个请求可以点出这么多文件，并且仍然算轻量捷径的
+// cap: fixed — 一个请求可以点出这么多文件，并且仍然算轻量捷径的
+// keep: 删掉后一份点了很多文件的请求也被当成轻量捷径，走最轻的拓扑；由「仍然算轻量捷径的」兜住
 pub const SHORTCUT_MAX_FILES: usize = 3;
 /// Lines an attached diff may declare and still be the shortcut's.
-// cap: bound — 附带的 diff 可以自报这么多行，并且仍然算轻量捷径的
+// cap: fixed — 附带的 diff 可以自报这么多行，并且仍然算轻量捷径的
+// keep: 删掉后一段大 diff 被当成轻量捷径；由「仍然算轻量捷径的」兜住
 pub const SHORTCUT_MAX_LINES: usize = 40;
 /// Declared files at which a change is too big for the lightest topology.
-// cap: bound — 到这个声明文件数，变更就重出了最轻那套拓扑的份
+// cap: fixed — 到这个声明文件数，变更就重出了最轻那套拓扑的份
+// keep: 删掉后重出最轻拓扑份量的变更仍走捷径，深度不够；由「到这个声明文件数就重出了最轻那套拓扑的份」兜住
 pub const DEEP_MIN_FILES: usize = 4;
 /// Declared diff lines at which a change is too big for the lightest topology.
-// cap: bound — 到这个声明 diff 行数，变更就重出了最轻那套拓扑的份
+// cap: fixed — 到这个声明 diff 行数，变更就重出了最轻那套拓扑的份
+// keep: 删掉后大 diff 的变更仍走捷径，深度不够；由「到这个声明 diff 行数就重出了最轻那套拓扑的份」兜住
 pub const DEEP_MIN_LINES: usize = 120;
 
 /// One of the request's own declarations the scale is read from.
@@ -219,7 +232,7 @@ fn declarations(task: &cog_core::Task) -> Declarations {
         .input
         .get("goal")
         .and_then(|v| v.as_str())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     Declarations {
         goal_paths: cog_core::paths_named_in_goal(goal),
         affected_files: task
@@ -527,7 +540,8 @@ pub fn scale_label(scale: DeclaredScale) -> &'static str {
 }
 
 /// Threshold below which the [`PgeMode::Pipeline`] is preferred.
-// cap: bound — 分数低于它才走 Pipeline 这条最轻的拓扑
+// cap: fixed — 分数低于它才走 Pipeline 这条最轻的拓扑
+// keep: 删掉后最重的变更也走 Pipeline，最轻的拓扑被用在它装不下的活上；由「分数低于它才走 Pipeline」兜住
 pub const PIPELINE_SCORE_THRESHOLD: f64 = 0.4;
 
 /// Compute the complexity score for a profile.

@@ -52,8 +52,11 @@ CREATE TABLE IF NOT EXISTS alerts (
 -- 是那个形状就别再跑」的语句，因而第二次启动不会为它们去要锁。
 ALTER TABLE alerts ALTER COLUMN labels DROP DEFAULT;
 ALTER TABLE alerts ALTER COLUMN labels TYPE TEXT USING labels::text;
--- `source` 是 labels 里唯一被按值查的键，升成真列；其余部分只整块读，存 text。
+-- 标签集里被**按值查**的两个键升成真列：`source`（镜子的收口）与
+-- `cogneva_io_face`（归属读的两跳之一）。其余部分只整块读，存 text。
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS source TEXT
+;
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS cogneva_io_face TEXT
 ;
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ
 ;
@@ -118,7 +121,8 @@ pub fn ddl() -> String {
 /// window) and a day of history is enough to explain a disagreement someone
 /// noticed this morning. The point of the bound is that the table's size has to
 /// follow the number of alert keys rather than the number of rollouts.
-// cap: bound — 界的是这张表的大小跟告警键数走、不跟发布次数走；一天够答「早上注意到的那条还在不在」
+// cap: fixed — 界的是这张表的大小跟告警键数走、不跟发布次数走；一天够答「早上注意到的那条还在不在」
+// keep: 删掉后断言表跟着发布次数无界长，一天前的告警键还在；由「跟告警键数走、不跟发布次数走」兜住
 pub const ASSERTION_RETENTION_SECONDS: i64 = 24 * 60 * 60;
 
 /// A new alert condition to raise (or close).
@@ -134,7 +138,7 @@ pub struct NewAlert {
     pub labels: Value,
 }
 
-/// 这一条告警声明的来源标签：`source` 是标签集里唯一被按值查的键，升成了真列。
+/// 这一条告警声明的来源标签：`source` 是标签集里被按值查的键之一，升成了真列。
 ///
 /// 写入时同时落列与标签集：只落标签集，按来源读的那条查询（镜子的收口）永远读到
 /// 空——空集在它那里读作「没有一条是我该关的」，于是别人写的行会被它关掉，或者
@@ -142,6 +146,15 @@ pub struct NewAlert {
 fn source_of(labels: &Value) -> Option<String> {
     labels
         .get("source")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+/// 这一条告警声明的面：`cogneva_io_face` 也是被按值查的键（归属读要问「这一行
+/// 该谁看」），与 `source` 同一个理由升成真列。没带面不是错误：那一条会读作无主。
+fn face_of(labels: &Value) -> Option<String> {
+    labels
+        .get("cogneva_io_face")
         .and_then(|value| value.as_str())
         .map(str::to_string)
 }
@@ -499,14 +512,15 @@ impl PostgresAlertStore {
                     r#"
                     INSERT INTO alerts
                         (id, rule, dedup_key, severity, state, message, labels, source,
-                         fired_at, resolved_at, updated_at, last_seen_at, writer)
-                    VALUES ($1, $2, $3, $4, '{state:firing}', $5, $6, $9, $7, NULL, $7, $7, $8)
+                         cogneva_io_face, fired_at, resolved_at, updated_at, last_seen_at, writer)
+                    VALUES ($1, $2, $3, $4, '{state:firing}', $5, $6, $9, $10, $7, NULL, $7, $7, $8)
                     ON CONFLICT (dedup_key) DO UPDATE SET
                         severity   = EXCLUDED.severity,
                         state      = '{state:firing}',
                         message    = EXCLUDED.message,
                         labels     = EXCLUDED.labels,
                         source     = EXCLUDED.source,
+                        cogneva_io_face = EXCLUDED.cogneva_io_face,
                         fired_at   = EXCLUDED.fired_at,
                         resolved_at = NULL,
                         updated_at = EXCLUDED.updated_at,
@@ -534,6 +548,7 @@ impl PostgresAlertStore {
                 .bind(now)
                 .bind(&self.writer)
                 .bind(source_of(&alert.labels))
+                .bind(face_of(&alert.labels))
                 .execute(&self.pool)
                 .await?;
                 self.record_assertion_best_effort(&alert.dedup_key, AlertState::Firing)

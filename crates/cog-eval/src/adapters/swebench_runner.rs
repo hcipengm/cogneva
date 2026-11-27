@@ -127,7 +127,7 @@ impl SweBenchRunner {
                     serde_json::from_value(v.clone()).ok()
                 }
             })
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         if fail_to_pass.is_empty() {
             return 0.0;
         }
@@ -166,7 +166,7 @@ mod tests {
         let rust = SweBenchRunner::filter_rust_instances(&dataset);
         assert_eq!(rust.cases.len(), 1);
         assert_eq!(rust.cases[0].id, "swebench-tokio-1");
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(path.parent().unwrap()));
     }
 
     #[test]

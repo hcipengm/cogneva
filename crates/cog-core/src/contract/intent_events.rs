@@ -40,6 +40,16 @@ pub struct IntentRow {
     pub text: String,
     /// 由哪一条派生；`None` 是一线入口。
     pub parent: Option<String>,
+    /// 模型实际读到的那一段（斜杠命令展开之后的文本）；`None` 表示与 `text` 相同。
+    ///
+    /// `text` 永远是原话，不改写；展开是派生出来的另一种写法，它也要留一份——
+    /// 会话表坏掉之后，「模型当时看到的是什么」只有这一格答得出来。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_text: Option<String>,
+    /// 这一句属于哪一段会话；`None` 是「这条入口没有会话」（外部情报、A2A 的
+    /// 任务提交、系统自发现）。会话是投影，这一格是它的归属。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
     /// 到达时刻，由写入口取自己的钟填进来。
     pub at: DateTime<Utc>,
 }
@@ -64,6 +74,8 @@ impl IntentRow {
             addressed_to: addressed_to.into(),
             text: text.into(),
             parent,
+            session: None,
+            model_text: None,
             at: Utc::now(),
         }
     }
@@ -81,6 +93,8 @@ impl IntentRow {
             "addressed_to": self.addressed_to,
             "text": self.text,
             "parent": self.parent,
+            "session": self.session,
+            "model_text": self.model_text,
         })
     }
 
@@ -108,12 +122,35 @@ impl IntentRow {
                 .get("parent")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
+            session: attributes
+                .get("session")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            model_text: attributes
+                .get("model_text")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
             at,
         })
     }
 }
 
+/// 一条意图事件的 id：由身份派生，26 位。
+///
+/// 派生而不是现发：同一轮里别的事实（附件、工具调用、回答）要在意图事件**落下
+/// 之前**就把因果指过来；身份两边算得出同一个值，id 也必须算得出同一个值。
+pub fn intent_event_id(identity: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("intent:{identity}").as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02X}")).collect();
+    hex.chars().take(26).collect()
+}
+
 /// 一条意图的身份：来源加这个来源自己的外部 id。
+///
+/// 对话这一路的「外部 id」是**到达 id**（一次投递的身份），不是原文：同一段会话里
+/// 说两遍「继续」是两轮，拿原文做键会把它们并成一轮；而同一句重投（同一个到达 id）
+/// 仍是同一行。原文只进正文，不进身份。
 ///
 /// 来源决定「这句话被谁听见」，外部 id 决定「在这个来源里是哪一句」。两个入口
 /// 用同一个拼法，读面才不必按入口分叉；A2A 的 `goal_id`、对话的
@@ -131,6 +168,15 @@ pub fn chat_intent_identity(session_id: &str, text: &str) -> String {
     intent_identity("chat", &format!("{session_id}:{:016x}", fnv1a(text)))
 }
 
+/// 一位同事对另一位同事说的那句话的身份：发信人、收件人、说话的方式与原话共同决定。
+///
+/// 与对话那一路同一个取向：同一句话重投是同一行（重投是传输在重试，不是又说了一遍），
+/// 换一个收件人、换一种方式（prompt／steering／continue）就是另一行。发信人为空串时
+/// 照写——「没有身份的那条连接」在这里与别处同形，不替它编一个名字。
+pub fn colleague_intent_identity(from: &str, to: &str, kind: &str, text: &str) -> String {
+    intent_identity("agent", &format!("{from}>{to}:{kind}:{:016x}", fnv1a(text)))
+}
+
 /// FNV-1a：只要求稳定与散得开，不要求抗碰撞——它是行身份的后缀，不是凭证。
 fn fnv1a(bytes: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -141,22 +187,33 @@ fn fnv1a(bytes: &str) -> u64 {
     hash
 }
 
-/// 记一条意图。
-#[async_trait::async_trait]
-pub trait IntentEvents: Send + Sync {
-    /// 事件流里这一路写者自己的名字（幂等约束的另一半）。
-    fn writer(&self) -> &str;
+/// 一条「意图到达」的事实：id 由身份派生，时刻取行的时刻。
+pub fn intent_received_event(row: &IntentRow) -> crate::FactEvent {
+    let mut event = crate::FactEvent::new(crate::EventPayload::IntentRecorded(row.clone()));
+    event.event_id = Some(intent_event_id(&row.identity));
+    event.at = Some(row.at);
+    event
+}
 
-    /// 把一句话记下来。已经记过的那一句不写第二行，也不报错：重投不是错误，
-    /// 是同一句话又到达了一次。
-    async fn record(&self, row: &IntentRow) -> SFResult<()>;
-
-    /// 记下这一批意图已经有人接手，接手的是哪一条待办。
-    ///
-    /// 一条一条记而不是一次记一批：流上的每一行自带身份，读面按行判「接手过没有」，
-    /// 一次写多行会把「记到第几行断了」变成一个读侧要处理的中间态。
-    async fn mark_triaged(&self, identities: &[String], task_id: &str, actor: &str)
-        -> SFResult<()>;
+/// 一批「已接手」的事实：一条一条写，流上每行自带身份。
+pub fn intent_triaged_events(
+    identities: &[String],
+    task_id: &str,
+    actor: &str,
+    at: DateTime<Utc>,
+) -> Vec<crate::FactEvent> {
+    identities
+        .iter()
+        .map(|identity| {
+            let mut event = crate::FactEvent::new(crate::EventPayload::IntentTriaged {
+                identity: identity.clone(),
+                task_id: task_id.to_string(),
+                actor: actor.to_string(),
+            });
+            event.at = Some(at);
+            event
+        })
+        .collect()
 }
 
 /// 读「还没有人接手的意图」。
@@ -188,6 +245,8 @@ mod tests {
             addressed_to: String::new(),
             text: "把这批门禁的归属改回它判的那个对象".into(),
             parent: None,
+            session: None,
+            model_text: None,
             at: Utc::now(),
         }
     }
@@ -257,5 +316,32 @@ mod tests {
         assert_eq!(made.addressed_to, "");
         assert_eq!(made.text, "写回来");
         assert_eq!(made.idempotency_key(), "a2a:g1");
+    }
+
+    /// 同事之间的那句话：同一个发信人、收件人、方式与原话重投是同一行；
+    /// 换收件人或换方式就是另一行。
+    #[test]
+    fn a_colleague_message_identity_names_both_ends() {
+        let a = colleague_intent_identity("staff-1", "staff-2", "prompt", "把门禁修了");
+        assert_eq!(
+            a,
+            colleague_intent_identity("staff-1", "staff-2", "prompt", "把门禁修了")
+        );
+        assert!(a.starts_with("agent:staff-1>staff-2:prompt:"));
+        assert_ne!(
+            a,
+            colleague_intent_identity("staff-1", "staff-3", "prompt", "把门禁修了"),
+            "换一个收件人是另一条意图"
+        );
+        assert_ne!(
+            a,
+            colleague_intent_identity("staff-1", "staff-2", "steering", "把门禁修了"),
+            "换一种说话方式是另一条意图"
+        );
+        assert_ne!(
+            a,
+            colleague_intent_identity("staff-1", "staff-2", "prompt", "把门禁修好"),
+            "换一句话是另一条意图"
+        );
     }
 }

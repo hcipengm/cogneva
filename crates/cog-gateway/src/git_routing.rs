@@ -41,15 +41,18 @@ use crate::git_mirror::{ssh_command_for, ssh_url_for, GitMirrorConfig};
 
 /// 实测结论的保鲜期。取得比熔断探测节拍长（实测是秒级成本 + 一次真实握手，
 /// 熔断探测是廉价的一次连接），但短到墙拆掉后几分钟内就能反映出来。
-// cap: bound — 量到的通道读数多久算新鲜；过了这个窗口要重测，不能拿旧读数路由
+// cap: fixed — 量到的通道读数多久算新鲜；过了这个窗口要重测，不能拿旧读数路由
+// keep: 删掉后旧读数永远算新鲜，路由拿一份过时的通断去选通道；由「过了窗口要重测」兜住
 const MEASURE_FRESHNESS_SECS: u64 = 600;
 /// 单通道握手上限。**这是探测预算，不是通道预算**：超时即判该通道此刻不可用，
 /// 正常请求的等待上限仍由 `GitTransport::https_timeout` 决定。
-// cap: bound — 单通道握手的探测预算，超时即判该通道此刻不可用（判的是通不通）
+// cap: fixed — 单通道握手的探测预算，超时即判该通道此刻不可用（判的是通不通）
+// keep: 删掉后一条不通的通道把握手拖住，判不出通不通；由「超时即判该通道此刻不可用」兜住
 // wall: 等=一次单通道握手走完 / 等不到=这个通道这一轮读作「此刻不可用」；判的是通不通，不是快慢 / 续跑=能，下一轮量测重新握手
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 /// 单条信号探针的上限。与引导链的短探针同量级：判的是"通不通"，不是"多快"。
-// cap: bound — 单条信号探针的上限，与引导链的短探针同量级（判通不通，不判快慢）
+// cap: fixed — 单条信号探针的上限，与引导链的短探针同量级（判通不通，不判快慢）
+// keep: 删掉后单条信号探针没有上限，引导链被一条慢信号拖住；由「判通不通，不判快慢」兜住
 // wall: 等=一条信号探针的回话 / 等不到=这条信号这一拍读作「没答」，不把它算成「信号为假」——没答与否是两件事 / 续跑=能，下一拍再探
 const SIGNAL_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -280,6 +283,7 @@ async fn measure_ssh(config: &GitMirrorConfig, repo: &str) -> Option<TransportMe
         Ok((mut child, mut guard)) => {
             // 守卫在这里的作用是"超时丢下 future 时把整组带走"：它跟着这个
             // 作用域走，`timeout` 一到期，wait 的 future 先被丢掉，守卫随后被丢。
+            // roundtrip: 一次 SSH 握手
             let out = tokio::time::timeout(HANDSHAKE_TIMEOUT, child.wait()).await;
             if out.is_ok() {
                 // 进程已经归位，号可以被复用了：对**复用后的号**发信号就是误伤
@@ -313,13 +317,14 @@ impl NetworkProbeClient {
             .connect_timeout(SIGNAL_PROBE_TIMEOUT)
             .user_agent("cogneva-gateway/route-probe")
             .build()
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         Self { client }
     }
 
     /// 一次探针：拿到**任何**应答即算可达（状态码无关，401/403 也证明通道通）。
     pub(crate) async fn probe(&self, url: &str, within: Duration) -> bool {
         matches!(
+            // roundtrip: 一次可达性探测请求
             tokio::time::timeout(within, self.client.get(url).send()).await,
             Ok(Ok(_))
         )

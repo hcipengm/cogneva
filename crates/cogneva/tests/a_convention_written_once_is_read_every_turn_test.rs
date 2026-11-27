@@ -55,19 +55,28 @@ fn the_conventions_live_in_one_bucket_per_person_with_a_stated_ceiling() {
     ] {
         assert!(store.contains(f), "{STORE} 缺 {f}：这条链少了读写撤的一环");
     }
-    // 容量两条必须写明来源：这是一个界，读的人要能分清它是量出来的还是钉死的。
+    // 容量界必须是**导出的**：它挂在窗口这条已发布读数上，窗口变了它跟着变，
+    // 并且要说得出是哪一条读数、哪一条证明。一个人拍的数（`override`）不是来源。
     assert!(
-        store.contains("MEMORY_ENTRY_LIMIT_CHARS") && store.contains("override"),
-        "{STORE} 的容量界没有标来源：读的人分不清它是不是一条实测"
+        store.contains("MEMORY_WINDOW_SHARE_DIVISOR") && store.contains("cap: derived"),
+        "{STORE} 的容量界没有标成导出的读数：读的人分不清它是不是一条实测"
     );
     assert!(
-        store.contains("MEMORY_BUCKET_LIMIT_CHARS"),
-        "{STORE} 没有整份名单的上限：这段约定每一轮都要进系统前缀，没有界的时候越写越长"
+        store.contains("bucket_limit_chars") && store.contains("window_tokens"),
+        "{STORE} 的容量界没有挂在窗口上：窗口变了它不会跟着变"
+    );
+    assert!(
+        store.contains("the_bucket_budget_follows_the_window"),
+        "{STORE} 的导出界没有「换输入就红」的证明"
+    );
+    assert!(
+        !store.contains("override"),
+        "{STORE} 里还有 `override`：一个人拍的数不是资源的来源"
     );
     // 桶满了要拒绝，不能悄悄挤掉最早的一条。
     let remember = block(&store, "pub async fn remember(");
     assert!(
-        remember.contains("超过上限") || remember.contains("MEMORY_BUCKET_LIMIT_CHARS"),
+        remember.contains("上限") && remember.contains("bucket_limit_chars"),
         "{STORE} 的 remember 不判上限：写下去的那句会把别的挤掉而写的人不知道"
     );
 }

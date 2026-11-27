@@ -73,6 +73,8 @@ pub const EMPLOYEE_SEQ_KEY: &str = "cogneva:employees:seq";
 pub struct RedisAgentRegistry {
     connection: ConnectionManager,
     ttl_seconds: u64,
+    /// 发号与离场的事实写者。缺席时只写名册（投影仍可读，但没有重建源）。
+    events: Option<std::sync::Arc<dyn cog_core::EventStore>>,
 }
 
 impl RedisAgentRegistry {
@@ -80,11 +82,18 @@ impl RedisAgentRegistry {
         Self {
             connection,
             ttl_seconds: 30,
+            events: None,
         }
     }
 
     pub fn with_ttl_seconds(mut self, ttl_seconds: u64) -> Self {
         self.ttl_seconds = ttl_seconds;
+        self
+    }
+
+    /// 挂上员工事实的写者：名册是这些事实的投影，投影坏了从流重建。
+    pub fn with_events(mut self, events: std::sync::Arc<dyn cog_core::EventStore>) -> Self {
+        self.events = Some(events);
         self
     }
 
@@ -164,57 +173,71 @@ impl RedisAgentRegistry {
     /// 现在的用途标签、「上一次服役留下的墓碑要擦掉」，以及这一行背后站着谁。
     /// 分成三条命令的话，中间那一刻读名册的人会看到一个既退役又在心跳的人。
     ///
-    /// 「背后站着谁」只有人形 id 写得出来，而这件事由 Rust 那一侧按名字的形状
-    /// 判（[`cog_core::person_id_for`]），脚本只写它被告知的值，不在脚本里再拼
-    /// 一遍前缀——两侧各拼一次时改名只会改一侧，脚本会安静地把所有座位都写成
-    /// 一个人。座位形 id 传进来的是空串，脚本遇到空串**不写**这一格：座位背后
-    /// 的人要到派活那一刻才存在，在此之前空着是读数；而写上之后，这条路径
-    /// 也不能把它擦掉——座位重新注册时把已派的人抹了，人就从名册上消失了。
-    ///
-    /// **工号只发给一个人，不发给一把椅子**（`ARGV[4] == '1'` 才是人形 id）：
+    /// **工号只发给一个人，不发给一把椅子**（`ARGV[3] == '1'` 才是人形 id）：
     /// 座位随任务生灭，每次接活都注册一次，给它发号就是每接一件活多一个「员工」
-    /// ——名册行数会长到任务数，而工号是编制。座位行照建（派工要往上面写人），
-    /// 只是没有号：名册上「有号的行」正好是可以叫做人的那些行。
-    async fn touch_employee(&self, registration: &AgentRegistration) {
+    /// ——名册行数会长到任务数，而工号是编制。座位行照建，只是没有号。
+    ///
+    /// 由工号推出的 id 自带它的号（`ARGV[4]`）：注册只认这一个号，不再发第二个；
+    /// 计数器跟着跳到它之后，下一次发号不会撞上。
+    ///
+    /// 返回「这一次是不是新发了号」与号本身：发号是一条事实，写事件的那一侧
+    /// 要知道这一次到底发没发，而不是每条注册都写一条。
+    async fn touch_employee(&self, registration: &AgentRegistration) -> Option<(bool, u32)> {
+        // 座位不是员工：它的行是注册表里那条「此刻叫得到」，名册上不建行。
+        // 谁坐在上面是任务行上的负责人，名册不回答这个问题。
+        let person = cog_core::person_id_for(&registration.agent_id)?;
         let mut conn = self.connection.clone();
         let now = Utc::now().to_rfc3339();
-        let person = cog_core::person_id_for(&registration.agent_id);
+        let declared = cog_core::employee_number_of(&registration.agent_id);
         let script = redis::Script::new(
             "local cur = redis.call('HGET', KEYS[1], ARGV[1]) \
              local row \
+             local allocated = 0 \
              if cur then \
                  row = cjson.decode(cur) \
              else \
                  row = { first_seen = ARGV[2] } \
              end \
-             if (row.number == nil or row.number == cjson.null) and ARGV[4] == '1' then \
-                 row.number = redis.call('INCR', KEYS[2]) \
+             if (row.number == nil or row.number == cjson.null) and ARGV[3] == '1' then \
+                 local declared = tonumber(ARGV[4]) \
+                 if declared ~= nil and declared > 0 then \
+                     row.number = declared \
+                     local seq = tonumber(redis.call('GET', KEYS[2]) or '0') \
+                     if seq < declared then redis.call('SET', KEYS[2], declared) end \
+                 else \
+                     row.number = redis.call('INCR', KEYS[2]) \
+                 end \
+                 allocated = 1 \
              end \
              row.agent_id = ARGV[1] \
-             if ARGV[3] ~= '' then row.person_id = ARGV[3] end \
              row.last_seen = ARGV[2] \
              row.retired_at = nil \
              redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(row)) \
-             return 1",
+             return {allocated, row.number or 0}",
         );
         // 名册写失败不能挡住注册：注册是「这个进程现在能不能被叫到」，名册是
         // 「这个人在不在册」。前者失败是停摆，后者失败是一行读数的缺口，两件
         // 事的价钱不一样，所以这里只留一条日志。
-        if let Err(e) = script
+        match script
             .key(EMPLOYEES_KEY)
             .key(EMPLOYEE_SEQ_KEY)
             .arg(&registration.agent_id)
             .arg(&now)
-            .arg(person.unwrap_or(""))
-            .arg(if person.is_some() { "1" } else { "0" })
-            .invoke_async::<i64>(&mut conn)
+            .arg("1")
+            .arg(declared.unwrap_or(0))
+            .invoke_async::<(i64, i64)>(&mut conn)
             .await
         {
-            tracing::warn!(
-                agent_id = %registration.agent_id,
-                error = %e,
-                "the employee row could not be written; this person is registered but not on the roster"
-            );
+            Ok((allocated, number)) if number > 0 => Some((allocated == 1, number as u32)),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(
+                    agent_id = %registration.agent_id,
+                    error = %e,
+                    "the employee row could not be written; this person is registered but not on the roster"
+                );
+                None
+            }
         }
     }
 
@@ -249,60 +272,6 @@ impl RedisAgentRegistry {
         }
     }
 
-    /// 把工号写进这一把座位的名册行；行不在就不写。
-    ///
-    /// 一次脚本而不是「读、改、写」：中间那一刻读名册的人会看到一把没有人的
-    /// 座位，而「还没有人」正是这一格要说的另一件事——两者同形，读的人分不出
-    /// 是派工还没到，还是这一笔写丢了。
-    ///
-    /// 行不在返回 `Err`：对从没注册过的名字造一行等于凭空造出一个人（见
-    /// `tombstone_employee`）。座位先注册、派工再写人，顺序反了是一处缺陷，
-    /// 应当报出来而不是安静地补一行。
-    async fn write_person(&self, agent_id: &str, person_id: &str) -> SFResult<()> {
-        let mut conn = self.connection.clone();
-        let script = redis::Script::new(
-            "local cur = redis.call('HGET', KEYS[1], ARGV[1]) \
-             if not cur then return 0 end \
-             local row = cjson.decode(cur) \
-             row.person_id = ARGV[2] \
-             redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(row)) \
-             return 1",
-        );
-        let written: i64 = script
-            .key(EMPLOYEES_KEY)
-            .arg(agent_id)
-            .arg(person_id)
-            .invoke_async(&mut conn)
-            .await
-            .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
-        if written == 0 {
-            return Err(SFError::Agent(format!(
-                "{agent_id} has no roster row: a person can be bound to a seat that registered first"
-            )));
-        }
-        Ok(())
-    }
-
-    /// Take the index entry off a name whose record has already gone.
-    ///
-    /// The expiry is the writer's, so a record usually disappears without any
-    /// reader being involved: Redis deletes the key, and the name stays an
-    /// index member for good. Membership is what `list` walks, so every such
-    /// name is charged to every reader on every pass — `list` answers "who is
-    /// registered" by reading one key per member, and a name whose key is gone
-    /// can never answer again. Measured 2026-10-26: 283 members, 20 of them
-    /// with a live record.
-    ///
-    /// The check and the removal are one script because `register` writes the
-    /// record *before* it adds the member: a check made outside the script can
-    /// land between those two commands, see no record, and drop the member of
-    /// an agent that is registering at that very moment — a live agent gone
-    /// from the roster while its key is right there. Inside one script the
-    /// interleaving is either "member not yet added" (nothing to remove) or
-    /// "record already there" (left alone).
-    ///
-    /// Best effort, like `forget`: the caller is answering "is this agent
-    /// here", and a failed cleanup must not turn that answer into an error.
     async fn take_index_entry_if_record_is_gone(&self, agent_id: &str) {
         let mut conn = self.connection.clone();
         let script = redis::Script::new(
@@ -339,7 +308,46 @@ impl AgentRegistry for RedisAgentRegistry {
             .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
         // 名册行跟着注册走，不另设入口：凡是会调模型的智能体都要先注册，所以
         // 「谁在册上」与「谁会注册」在这里是同一件事，不可能只做对一半。
-        self.touch_employee(registration).await;
+        // 只有人才上名册；座位不进名册，谁坐在上面是任务行上的事实。
+        let person = cog_core::person_id_for(&registration.agent_id);
+        // 注册也是一条事实：谁、什么岗位、在哪一台。「注册过」于是不必只从
+        // Redis 那个会过期的键去猜——键过期说明进程不在了，不说明这个人从未来过。
+        if let Some(events) = self.events.as_ref() {
+            let mut event = cog_core::FactEvent::new(cog_core::EventPayload::EmployeeRegistered {
+                agent_id: registration.agent_id.clone(),
+                role: registration.role.clone(),
+                workspace_id: registration.workspace_id.clone(),
+                hostname: registration.hostname.clone(),
+            });
+            event.at = Some(Utc::now());
+            if let Err(e) = events.append(event).await {
+                tracing::warn!(
+                    agent_id = %registration.agent_id,
+                    error = %e,
+                    "the registration was accepted but its fact was not written to the stream"
+                );
+            }
+        }
+        if let Some((allocated, number)) = self.touch_employee(registration).await {
+            if allocated {
+                if let (Some(events), Some(person)) = (self.events.as_ref(), person) {
+                    let mut event =
+                        cog_core::FactEvent::new(cog_core::EventPayload::EmployeeNumberAllocated {
+                            agent_id: registration.agent_id.clone(),
+                            person: person.to_string(),
+                            number,
+                        });
+                    event.at = Some(Utc::now());
+                    if let Err(e) = events.append(event).await {
+                        tracing::warn!(
+                            agent_id = %registration.agent_id,
+                            error = %e,
+                            "the number was allocated but its fact was not written to the stream"
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -487,8 +495,204 @@ impl AgentRegistry for RedisAgentRegistry {
         })
     }
 
-    async fn assign_person(&self, agent_id: &str, person_id: &str) -> SFResult<()> {
-        self.write_person(agent_id, person_id).await
+    /// 工号计数器就是正本：先取号，再拿由它推出的 id 去建人。
+    async fn mint_employee_id(&self) -> SFResult<String> {
+        let mut conn = self.connection.clone();
+        let number: u64 = conn
+            .incr(EMPLOYEE_SEQ_KEY, 1u64)
+            .await
+            .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
+        let number = u32::try_from(number)
+            .map_err(|_| SFError::Agent(format!("employee number {number} does not fit in u32")))?;
+        Ok(cog_core::employee_identity(number))
+    }
+}
+
+impl RedisAgentRegistry {
+    /// 从流重建名册：只读员工事件，重写这张 hash 的每一行。
+    ///
+    /// 名册是投影，所以这条命令存在；它不改注册记录（那是「现在叫得到吗」，
+    /// 不是「这个人存在过吗」）。
+    pub async fn rebuild_roster(&self, pool: &sqlx::PgPool) -> SFResult<u64> {
+        // 一族的词表只在一处：旧细词与新聚合词一起查，写者换了写法不会让名册
+        // 在重建时丢掉那一段。
+        let employee_kinds: Vec<String> = cog_core::kinds_of("employee")
+            .unwrap_or(&[])
+            .iter()
+            .map(|k| (*k).to_string())
+            .collect();
+        // 快照 + 增量：名册最新的一份快照给出「到某条事件为止的每一行」，重建只折
+        // 水位之后的新事实；没有快照才从流的起点折。
+        let snapshot = super::super::postgres::projection_snapshot::newest(pool, "roster").await?;
+        let mut rows: HashMap<String, serde_json::Value> = HashMap::new();
+        let mut after_seq: i64 = 0;
+        if let Some(snapshot) = &snapshot {
+            if let Ok(serde_json::Value::Object(object)) =
+                serde_json::from_str::<serde_json::Value>(&snapshot.state)
+            {
+                for (id, row) in object {
+                    rows.insert(id, row);
+                }
+            }
+            let (seq,): (Option<i64>,) =
+                sqlx::query_as("SELECT seq FROM cogneva_event WHERE event_id = $1")
+                    .bind(&snapshot.event_id)
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|e| SFError::Database(format!("roster watermark: {e}")))?;
+            after_seq = seq.unwrap_or(0);
+        }
+        let events: Vec<(
+            chrono::DateTime<chrono::Utc>,
+            String,
+            serde_json::Value,
+            String,
+        )> = sqlx::query_as(
+            "SELECT at, kind, attributes::jsonb || jsonb_build_object('agent_id', subject_id), \
+                        event_id \
+                   FROM cogneva_event \
+                  WHERE kind = ANY($1) AND seq > $2 \
+                  ORDER BY seq",
+        )
+        .bind(&employee_kinds)
+        .bind(after_seq)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| SFError::Database(format!("read employee facts: {e}")))?;
+        let last_event = events.last().map(|(_, _, _, id)| id.clone());
+        let borrowed: Vec<(chrono::DateTime<chrono::Utc>, &str, serde_json::Value)> = events
+            .iter()
+            .map(|(at, kind, attributes, _)| (*at, kind.as_str(), attributes.clone()))
+            .collect();
+        fold_roster(&borrowed, &mut rows);
+        let mut conn = self.connection.clone();
+        let mut written = 0u64;
+        for (id, row) in &rows {
+            let text = serde_json::to_string(row).map_err(SFError::Serialization)?;
+            let _: () = redis::AsyncCommands::hset(&mut conn, EMPLOYEES_KEY, &id, text)
+                .await
+                .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
+            written += 1;
+        }
+        if let Some(event_id) = last_event {
+            let state = serde_json::Value::Object(
+                rows.iter()
+                    .map(|(id, row)| (id.clone(), row.clone()))
+                    .collect(),
+            );
+            super::super::postgres::projection_snapshot::record(
+                pool,
+                &super::super::postgres::projection_snapshot::ProjectionSnapshot {
+                    projection: "roster".into(),
+                    event_id,
+                    state: state.to_string(),
+                },
+            )
+            .await?;
+        }
+        Ok(written)
+    }
+}
+
+/// 事件按时刻先后给；`employee_number_allocated` 立行（工号、首次见到），
+/// `employee_retired` 盖墓碑。同一行后来的事件覆盖先前的：名册答的是「现在这一行
+/// 是什么样」，而每一条事件都是它的一次变化。
+pub fn roster_from_events(
+    events: &[(DateTime<Utc>, &str, serde_json::Value)],
+) -> HashMap<String, serde_json::Value> {
+    let mut rows: HashMap<String, serde_json::Value> = HashMap::new();
+    fold_roster(events, &mut rows);
+    rows
+}
+
+/// 把一串员工事实折进已有的名册：增量重建从快照那一份开始，只折水位之后的事件。
+pub fn fold_roster(
+    events: &[(DateTime<Utc>, &str, serde_json::Value)],
+    rows: &mut HashMap<String, serde_json::Value>,
+) {
+    for (at, kind, attributes) in events {
+        let id = attributes
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if id.is_empty() {
+            continue;
+        }
+        match *kind {
+            "employee_number_allocated" => {
+                let number = attributes.get("number").and_then(|v| v.as_u64());
+                let mut row = rows
+                    .remove(&id)
+                    .unwrap_or_else(|| serde_json::json!({ "first_seen": at.to_rfc3339() }));
+                if let (Some(object), Some(number)) = (row.as_object_mut(), number) {
+                    object.insert("agent_id".into(), serde_json::json!(id));
+                    object.insert("number".into(), serde_json::json!(number));
+                    object.insert("last_seen".into(), serde_json::json!(at.to_rfc3339()));
+                    object.insert("retired_at".into(), serde_json::Value::Null);
+                }
+                rows.insert(id, row);
+            }
+            // 新写法：聚合词 `employee`，`step` 说这一步。注册只说明「这个人此刻在
+            // 这一台、这个岗位」，不另立一行（工号由发号那条给）。
+            "employee" => {
+                if let Some(row) = rows.get_mut(&id) {
+                    if let Some(object) = row.as_object_mut() {
+                        object.insert("last_seen".into(), serde_json::json!(at.to_rfc3339()));
+                        for key in ["role", "hostname"] {
+                            if let Some(value) = attributes.get(key) {
+                                object.insert(key.into(), value.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            "employee_retired" => {
+                if let Some(row) = rows.get_mut(&id) {
+                    if let Some(object) = row.as_object_mut() {
+                        object.insert("retired_at".into(), serde_json::json!(at.to_rfc3339()));
+                        object.insert("last_seen".into(), serde_json::json!(at.to_rfc3339()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod roster_projection_tests {
+    use super::roster_from_events;
+    use chrono::DateTime;
+
+    /// 发号立行、离场盖墓碑；同一行后来的事件覆盖先前的。
+    #[test]
+    fn the_roster_is_the_latest_employee_fact_per_person() {
+        let t1 = DateTime::from_timestamp(100, 0).unwrap();
+        let t2 = DateTime::from_timestamp(200, 0).unwrap();
+        let allocated =
+            serde_json::json!({"number": 7, "person": "employee:7", "agent_id": "employee:7"});
+        let retired = serde_json::json!({"agent_id": "employee:7"});
+        let rows = roster_from_events(&[
+            (t1, "employee_number_allocated", allocated),
+            (t2, "employee_retired", retired),
+        ]);
+        let row = rows.get("employee:7").expect("这一行该在名册上");
+        assert_eq!(row["number"], 7);
+        assert!(
+            row.get("person_id").is_none(),
+            "人形行的人就是它自己，重建不重复存一格"
+        );
+        assert!(row["retired_at"].is_string(), "离场要盖墓碑");
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// 从没发过号的名字不因为一条离场事件被凭空造出来。
+    #[test]
+    fn a_retirement_without_a_number_creates_no_person() {
+        let t = DateTime::from_timestamp(100, 0).unwrap();
+        let retired = serde_json::json!({"agent_id": "nobody"});
+        assert!(roster_from_events(&[(t, "employee_retired", retired)]).is_empty());
     }
 }
 
@@ -548,24 +752,33 @@ impl AgentRegistry for MemoryAgentRegistry {
             (registration.clone(), self.expires_at()),
         );
         let now = Utc::now();
+        // 座位不是员工：名册上不建行，谁坐在上面由任务行回答。
+        if cog_core::person_id_for(&registration.agent_id).is_none() {
+            return Ok(());
+        }
         if let Some(row) = store.employees.get_mut(&registration.agent_id) {
             row.last_seen = now;
             // 回来上班的人不再是离职：墓碑擦掉，`first_seen` 与工号都留着
             // ——工号是发出去的编制，换一次上岗不该换号。
             row.retired_at = None;
-            // 与 Redis 那段脚本同一格语义：人形 id 写它自己，座位形不碰这一格
-            // ——空着是「还没有人」，写上的那一个不能因为重新注册就丢掉。
-            if let Some(person) = cog_core::person_id_for(&registration.agent_id) {
-                row.person_id = Some(person.to_string());
-            }
         } else {
             // 工号只发给一个人，不发给一把椅子——与 Redis 那段脚本同一判据。
             // 座位行照建（派工要往上面写人），号那一格空着。
             let person = cog_core::person_id_for(&registration.agent_id);
-            let number = person.map(|_| {
-                store.next_number += 1;
-                store.next_number
-            });
+            // 由工号推出的 id 自带它的号；其余人形地址仍按旧口径发一个号。
+            let number =
+                person.map(
+                    |_| match cog_core::employee_number_of(&registration.agent_id) {
+                        Some(declared) => {
+                            store.next_number = store.next_number.max(declared);
+                            declared
+                        }
+                        None => {
+                            store.next_number += 1;
+                            store.next_number
+                        }
+                    },
+                );
             store.employees.insert(
                 registration.agent_id.clone(),
                 EmployeeRecord {
@@ -574,11 +787,19 @@ impl AgentRegistry for MemoryAgentRegistry {
                     first_seen: now,
                     last_seen: now,
                     retired_at: None,
-                    person_id: person.map(str::to_string),
                 },
             );
         }
         Ok(())
+    }
+
+    async fn mint_employee_id(&self) -> SFResult<String> {
+        let mut store = self
+            .store
+            .write()
+            .map_err(|_| SFError::Agent("memory registry lock poisoned".into()))?;
+        store.next_number += 1;
+        Ok(cog_core::employee_identity(store.next_number))
     }
 
     async fn heartbeat(&self, agent_id: &str) -> SFResult<()> {
@@ -663,20 +884,6 @@ impl AgentRegistry for MemoryAgentRegistry {
             .read()
             .map_err(|_| SFError::Agent("memory registry lock poisoned".into()))?;
         Ok(store.employees.get(agent_id).cloned())
-    }
-
-    async fn assign_person(&self, agent_id: &str, person_id: &str) -> SFResult<()> {
-        let mut store = self
-            .store
-            .write()
-            .map_err(|_| SFError::Agent("memory registry lock poisoned".into()))?;
-        let row = store.employees.get_mut(agent_id).ok_or_else(|| {
-            SFError::Agent(format!(
-                "{agent_id} has no roster row: a person can be bound to a seat that registered first"
-            ))
-        })?;
-        row.person_id = Some(person_id.to_string());
-        Ok(())
     }
 }
 
@@ -779,13 +986,13 @@ mod tests {
         assert_ne!(a.number, b.number, "两个员工共用一个工号");
     }
 
-    /// 工号只发给一个人，不发给一把椅子。
+    /// 座位不是员工：名册上不建行。
     ///
-    /// 座位随任务生灭，每接一件活注册一次；发号的话名册行数会长到任务数，
-    /// 「员工」这个读数就不再是编制，而是跑过多少件活。座位行照建（派工要往
-    /// 上面写人），号那一格空着：名册上**有号的行数**正好是可以叫做人的行数。
+    /// 座位随任务生灭，每接一件活注册一次；进名册的话名册行数会长到任务数，
+    /// 「员工」这个读数就不再是编制，而是跑过多少件活。它此刻叫不叫得到由注册表
+    /// 回答，谁坐在上面由任务行回答；名册只收人。
     #[tokio::test]
-    async fn a_seat_gets_a_row_but_no_number() {
+    async fn a_seat_does_not_enter_the_roster() {
         let reg = MemoryAgentRegistry::new();
         reg.register(&reg_row("employee:1")).await.unwrap();
         let seat = cog_core::agent_id_for("task-1", "generator");
@@ -794,14 +1001,10 @@ mod tests {
             .await
             .unwrap();
 
-        let seat_row = reg.employee(&seat).await.unwrap().expect("座位行照建");
-        assert_eq!(seat_row.number, None, "一把椅子拿到了工号");
-        assert_eq!(seat_row.person_id, None, "座位还没派人，却写上了人");
-
+        assert!(reg.employee(&seat).await.unwrap().is_none(), "座位进了名册");
         let rows = reg.employees().await.unwrap();
-        assert_eq!(rows.len(), 3, "三个注册过的地址就是三行");
-        let numbered = rows.iter().filter(|row| row.number.is_some()).count();
-        assert_eq!(numbered, 1, "有号的行数应当等于人数，不是地址数");
+        assert_eq!(rows.len(), 1, "名册上只该有那一个人");
+        assert_eq!(rows[0].agent_id, "employee:1");
     }
 
     /// 离职留行：注销之后这个人还在名册上，工号与入职时间都不变，只多一块
@@ -823,47 +1026,61 @@ mod tests {
         assert_eq!(again.number, before.number, "回来上班换了工号");
     }
 
-    /// 名册行写下这一行背后站着谁：人形 id 是它自己，座位形是空。
+    /// 座位就是它自己的地址，谁坐在上面是任务任命上的事实，名册不再存第二个指针。
     ///
-    /// 空是读数，不是缺字段：它说的正是「这个座位背后还没有人」。座位后来派
-    /// 了人之后，重新注册（每段执行都会注册一次）不能把这个答案擦掉——擦掉
-    /// 之后，这个人在名册上就消失了。
+    /// 座位会换人：同一把椅子今天坐 A、明天坐 B。把「谁」写进名册行之后，
+    /// 换人就得第二名写者去改同一行。任务行本来就有负责人，读座位的人从那里取。
     #[tokio::test]
-    async fn a_roster_row_records_the_person_standing_behind_it() {
+    async fn a_seat_is_its_own_address_and_occupancy_lives_on_the_task() {
         let reg = MemoryAgentRegistry::new();
-        reg.register(&reg_row("employee:1")).await.unwrap();
+        reg.register(&reg_row("E0001")).await.unwrap();
         let seat = cog_core::agent_id_for("task-1", "generator");
         reg.register(&reg_row(&seat)).await.unwrap();
 
-        // 同一个人的两次注册（两件活、两次上岗）在册上仍是一行。
-        reg.register(&reg_row("employee:1")).await.unwrap();
-        assert_eq!(reg.employees().await.unwrap().len(), 2, "员工册按人增行");
-
-        let person = reg.employee("employee:1").await.unwrap().expect("名册行");
-        assert_eq!(
-            person.person_id.as_deref(),
-            Some("employee:1"),
-            "人形 id 背后的人是它自己"
+        assert!(
+            reg.employee(&seat).await.unwrap().is_none(),
+            "座位不是员工，名册上不该有它"
         );
-        let seat_row = reg.employee(&seat).await.unwrap().expect("名册行");
-        assert_eq!(seat_row.person_id, None, "座位背后还没有人");
-        assert_eq!(seat_row.person(), None);
-
-        // 派活之后座位有了人。写下来的那一格优先于形状——形状答不出人是谁。
-        {
-            let mut store = reg.store.write().unwrap();
-            store.employees.get_mut(&seat).expect("名册行").person_id = Some("employee:1".into());
-        }
-        reg.register(&reg_row(&seat)).await.unwrap();
-        let assigned = reg.employee(&seat).await.unwrap().expect("名册行");
         assert_eq!(
-            assigned.person(),
-            Some("employee:1"),
-            "座位重新注册把派给它的人擦掉了"
+            cog_core::person_id_for(&seat),
+            None,
+            "座位地址本身不是一个人"
+        );
+
+        // 谁坐在上面：任务任命答得出来，而且换人不改名册。
+        let mut task = cog_core::Task::new(
+            "task-1",
+            cog_core::TaskType::Custom("generator".into()),
+            serde_json::json!({}),
+        );
+        task.agent_id = Some("E0001".into());
+        let assignment = cog_core::assignment_of(&task);
+        assert_eq!(assignment.seat_id, seat);
+        assert_eq!(assignment.person, Some("E0001"));
+    }
+
+    /// 先发号、再由号推出 id：注册只认这一个号，不再发第二个；下一次发号从
+    /// 它之后继续。
+    #[tokio::test]
+    async fn a_minted_id_is_the_number_and_registration_adopts_it() {
+        let reg = MemoryAgentRegistry::new();
+        let id = reg.mint_employee_id().await.unwrap();
+        assert_eq!(id, "E0001");
+        assert_eq!(cog_core::employee_number_of(&id), Some(1));
+
+        reg.register(&reg_row(&id)).await.unwrap();
+        let row = reg.employee(&id).await.unwrap().expect("名册行");
+        assert_eq!(row.number, Some(1), "注册又给这个人发了一次号");
+        assert_eq!(row.agent_id, id);
+
+        assert_eq!(
+            reg.mint_employee_id().await.unwrap(),
+            "E0002",
+            "发号没有从刚才那个号之后继续"
         );
     }
 
-    /// 同一个 id 反复注册不吃新号：工号是发出去的编制，不是每次注册的计数。
+    /// 同一个 id 反复注册不吃新号    /// 同一个 id 反复注册不吃新号：工号是发出去的编制，不是每次注册的计数。
     #[tokio::test]
     async fn a_second_registration_does_not_consume_a_new_number() {
         let reg = MemoryAgentRegistry::new();

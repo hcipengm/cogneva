@@ -337,7 +337,7 @@ async fn config_reload_updates_state() {
     let mut new_config = initial_config.clone();
     new_config.behavior_history_max = 42;
     new_config.health_interval = Duration::from_secs(1800);
-    let _ = config_tx.send(new_config);
+    cog_core::ignore_lost!(config_tx.send(new_config));
 
     // Wait for the config change to be processed.
     tokio::time::sleep(Duration::from_millis(200)).await;

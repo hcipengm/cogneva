@@ -174,7 +174,7 @@ fn rule_bounds(rule: &serde_json::Value) -> Vec<f64> {
         .get("condition")
         .and_then(|c| c.as_object())
         .map(|c| c.values().filter_map(|v| v.as_f64()).collect())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     out.extend(comparison_bounds(
         rule.get("promql").and_then(|p| p.as_str()).unwrap_or(""),
     ));

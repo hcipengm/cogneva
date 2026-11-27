@@ -80,7 +80,7 @@ async fn test_agent_loop_state_transitions() {
     assert_eq!(agent_loop.state(), RuntimeState::Idle);
 
     let llm = Arc::new(MockProvider::new("done"));
-    let _ = agent_loop.run(serde_json::json!({}), llm.as_ref()).await;
+    cog_core::ignore_lost!(agent_loop.run(serde_json::json!({}), llm.as_ref()).await);
 
     assert_eq!(agent_loop.state(), RuntimeState::Complete);
 }

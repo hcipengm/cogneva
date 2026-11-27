@@ -70,21 +70,28 @@ const ROW_COLUMNS: &str = "slug, lead, carrier_path, carrier_sha256, host_gate, 
 /// The bounds are the narrower dialect's (MySQL cannot key an unbounded TEXT
 /// column), so one set governs both. Widths are counted in characters, which is
 /// what both dialects' VARCHAR lengths mean.
-// cap: bound — 取的是更窄那个方言的宽度（MySQL 不能给无界 TEXT 建键），一套管两边
+// cap: fixed — 取的是更窄那个方言的宽度（MySQL 不能给无界 TEXT 建键），一套管两边
+// not-a-bound: 取的是更窄那个方言的宽度（MySQL 不能给无界 TEXT 建键），一套管两边
 const SLUG_MAX: usize = 191;
-// cap: bound — the reading's source column width, a schema limit rather than a measurement
+// cap: fixed — the reading's source column width, a schema limit rather than a measurement
+// keep: 删掉后 source 列超出 schema 宽度被库拒；由「schema 上限」兜住
 const SOURCE_MAX: usize = 512;
-// cap: bound — the refusal row's source column width, a schema limit rather than a measurement
+// cap: fixed — the refusal row's source column width, a schema limit rather than a measurement
+// keep: 删掉后拒收行的 source 列超出 schema 宽度被库拒；由「schema 上限」兜住
 const REFUSAL_SOURCE_MAX: usize = 256;
 /// The shape name a refusal carries: the gate's own key for what matched, not
 /// the principle it counts against.
-// cap: bound — 拒收携带的形状名：是门自己给它匹配到的东西起的名，不是它算在头上的那条原则
+// cap: fixed — 拒收携带的形状名：是门自己给它匹配到的东西起的名，不是它算在头上的那条原则
+// keep: 删掉后形状名超出列宽被截，读者把截断名当成另一条原则；由「门自己起的名字」兜住
 const REFUSAL_CRITERION_MAX: usize = 64;
 /// The matched text. Wide enough to hold a phrase, narrow enough that the intake
 /// stays a record of what happened rather than a copy of the call.
-// cap: bound — 够装一个短语，又窄到入账仍是「发生过什么」的记录而不是那趟调用的拷贝
+// cap: fixed:principle_refusals.span 的列宽 VARCHAR(512)——展示列的结构约定；
+// keep: 删掉后回到「principle_refusals.span 的列宽 VARCHAR(512)——展示列的结构约定；」所描述的情形；由这条约定兜住
+// 事实列 `span_full` 不裁，原文完整落库
 const REFUSAL_SPAN_MAX: usize = 512;
-// cap: bound — the width of a SHA-256 digest in hex; a protocol figure
+// cap: fixed — the width of a SHA-256 digest in hex; a protocol figure
+// keep: 删掉后十六进制摘要装不进列，哈希被截成另一串；由「SHA-256 十六进制宽度」兜住
 const SHA256_MAX: usize = 64;
 
 /// PostgreSQL principle ledger store.
@@ -225,6 +232,12 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         let mut queued = 0usize;
         for reading in readings {
             check_reading(reading).map_err(SFError::Validation)?;
+            // 表与事件同一个事务：任一侧写不进去，这一条声明就整条失败，不会
+            // 留下「表领先于流」的中间态。
+            let mut tx =
+                self.pool.begin().await.map_err(|e| {
+                    SFError::Database(format!("begin declare {}: {e}", reading.slug))
+                })?;
             let outcome = sqlx::query(DECLARE_SQL)
                 .bind(&reading.slug)
                 .bind(&reading.source)
@@ -235,7 +248,7 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
                 .bind(&reading.where_red)
                 .bind(reading.check_kind.map(PrincipleCheckKind::as_str))
                 .bind(reading.priority.map(ChangePriority::as_str))
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| SFError::Database(format!("declare {}: {e}", reading.slug)))?;
             // A reading that says what the queued one already says matches the
@@ -244,7 +257,64 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
             // statement rather than the batch is what makes "how many were
             // queued or re-queued" answerable, and the `WHERE` is what keeps
             // that number meaning something rather than counting every re-push.
-            queued += outcome.rows_affected() as usize;
+            let changed = outcome.rows_affected() as usize;
+            if changed > 0 {
+                // 事件写的是**合并后的那一行**，不是本次读数：COALESCE 会保留
+                // 旧字段，拿读数直接当事件会让事件与投影漂。
+                let merged: (
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                ) = sqlx::query_as(
+                    "SELECT source, lead, carrier_path, carrier_sha256, host_gate, where_red, \
+                            check_kind, priority \
+                       FROM principle_ledger_declared WHERE slug = $1 AND source = $2",
+                )
+                .bind(&reading.slug)
+                .bind(&reading.source)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| SFError::Database(format!("read back {}: {e}", reading.slug)))?;
+                let (
+                    source,
+                    lead,
+                    carrier_path,
+                    carrier_sha256,
+                    host_gate,
+                    where_red,
+                    check_kind,
+                    priority,
+                ) = merged;
+                let declaration = cog_core::PrincipleReading {
+                    slug: reading.slug.clone(),
+                    source,
+                    lead,
+                    carrier_path,
+                    carrier_sha256,
+                    host_gate,
+                    where_red,
+                    check_kind: check_kind.as_deref().and_then(PrincipleCheckKind::parse),
+                    priority: priority.as_deref().and_then(|word| {
+                        ChangePriority::ALL
+                            .into_iter()
+                            .find(|band| band.as_str() == word)
+                    }),
+                };
+                let payload = cog_core::EventPayload::PrincipleDeclared(declaration);
+                // 事件 id 由整行内容派生：同一条声明重放写同一个主键。
+                let event_id = declaration_event_id(&payload);
+                let fields = payload.envelope(&event_id, "storage");
+                super::event_log::append_on(&mut tx, &fields, chrono::Utc::now()).await?;
+            }
+            tx.commit()
+                .await
+                .map_err(|e| SFError::Database(format!("commit declare {}: {e}", reading.slug)))?;
+            queued += changed;
         }
         Ok(queued)
     }
@@ -358,16 +428,35 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         if let Some(rev) = &measurement.measured_rev {
             check_fits("measured revision", rev, SHA256_MAX).map_err(SFError::Validation)?;
         }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SFError::Database(format!("begin the measurement: {e}")))?;
         sqlx::query(APPLY_MEASUREMENT_SQL)
             .bind(&measurement.slug)
             .bind(measurement.state.as_str())
             .bind(&measurement.platform_gate)
             .bind(&measurement.measured_rev)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| {
                 SFError::Database(format!("apply measurement for {}: {e}", measurement.slug))
             })?;
+        let payload = cog_core::EventPayload::PrincipleJudged {
+            slug: measurement.slug.clone(),
+            state: Some(measurement.state.as_str().to_string()),
+            platform_gate: measurement.platform_gate.clone(),
+            measured_rev: measurement.measured_rev.clone(),
+        };
+        let fields = payload.envelope(
+            &principle_judged_event_id(&measurement.slug, measurement.state.as_str()),
+            "storage",
+        );
+        super::event_log::append_on(&mut tx, &fields, chrono::Utc::now()).await?;
+        tx.commit()
+            .await
+            .map_err(|e| SFError::Database(format!("commit the measurement: {e}")))?;
         Ok(())
     }
 
@@ -381,12 +470,29 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         // and keeping that while stamping a fresh `measured_at` would report the
         // old verdict as current. A row the account has never measured had no
         // state to clear, and lands here with only the two stamps.
+        // 「只有人能判」也是一次判决：表里 state 清空，流里留一条同形的判词事件。
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SFError::Database(format!("begin the human-only look: {e}")))?;
         sqlx::query(RECORD_HUMAN_ONLY_SQL)
             .bind(slug)
             .bind(measured_rev)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| SFError::Database(format!("record human-only look for {slug}: {e}")))?;
+        let payload = cog_core::EventPayload::PrincipleJudged {
+            slug: slug.to_string(),
+            state: None,
+            platform_gate: None,
+            measured_rev: measured_rev.map(str::to_string),
+        };
+        let fields = payload.envelope(&principle_judged_event_id(slug, "human-only"), "storage");
+        super::event_log::append_on(&mut tx, &fields, chrono::Utc::now()).await?;
+        tx.commit()
+            .await
+            .map_err(|e| SFError::Database(format!("commit the human-only look: {e}")))?;
         Ok(())
     }
 
@@ -720,13 +826,15 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         let mut queued = 0usize;
         for event in events {
             check_refusal(event).map_err(SFError::Validation)?;
-            let span: String = event.span.chars().take(REFUSAL_SPAN_MAX).collect();
+            // 展示列按列宽裁；事实列拿原文，一个字符都不动。
+            let display = display_span(&event.span);
             let outcome = sqlx::query(REPORT_REFUSAL_SQL)
                 .bind(&event.slug)
                 .bind(event.refused_at)
                 .bind(&event.source)
                 .bind(&event.criterion)
-                .bind(&span)
+                .bind(&display)
+                .bind(&event.span)
                 .bind(event.count)
                 .execute(&self.pool)
                 .await
@@ -1019,6 +1127,14 @@ UPDATE principle_ledger
 SET state = NULL, platform_gate = NULL, measured_at = now(), measured_rev = $2
 WHERE slug = $1";
 
+/// 一条判词事件的 id：原则＋判词，哈希出 26 位。判词换了就是另一个 id。
+fn principle_judged_event_id(slug: &str, state: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("principle_judged:{slug}:{state}").as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02X}")).collect();
+    hex.chars().take(26).collect()
+}
+
 const APPLY_MEASUREMENT_SQL: &str = "\
 INSERT INTO principle_ledger (slug, state, platform_gate, measured_at, measured_rev)
 VALUES ($1, $2, $3, now(), $4)
@@ -1122,8 +1238,8 @@ const CHECK_KIND_CENSUS_SQL: &str = concat!(
 /// what the refusing side saw at that instant, and a re-report of the same event
 /// is not a second observation of it.
 const REPORT_REFUSAL_SQL: &str = "\
-INSERT INTO principle_refusals (slug, refused_at, source, criterion, span, session_id, count) \
-VALUES ($1, $2, $3, $4, $5, '', $6) \
+INSERT INTO principle_refusals (slug, refused_at, source, criterion, span, span_full, session_id, count) \
+VALUES ($1, $2, $3, $4, $5, $6, '', $7) \
 ON CONFLICT (slug, refused_at, source, session_id, criterion) DO UPDATE \
 SET count = GREATEST(principle_refusals.count, EXCLUDED.count) \
 WHERE principle_refusals.count < EXCLUDED.count";
@@ -1271,6 +1387,19 @@ fn check_reading(reading: &PrincipleReading) -> Result<(), String> {
 /// count is what a reader takes as how often a principle was broken, so a count
 /// of zero or less is refused rather than stored as a value that adds nothing
 /// and looks like a data point.
+/// 声明事件的 id：由载荷的幂等键哈希出 26 位。同一条声明重放写同一个主键。
+fn declaration_event_id(payload: &cog_core::EventPayload) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(payload.idempotency_key().as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02X}")).collect();
+    hex.chars().take(26).collect()
+}
+
+/// 展示列那一格：按列宽裁。事实列不经过它。
+fn display_span(span: &str) -> String {
+    span.chars().take(REFUSAL_SPAN_MAX).collect()
+}
+
 fn check_refusal(event: &PrincipleRefusal) -> Result<(), String> {
     check_fits("slug", &event.slug, SLUG_MAX)?;
     check_fits("source", &event.source, REFUSAL_SOURCE_MAX)?;
@@ -1294,4 +1423,385 @@ fn check_refusal(event: &PrincipleRefusal) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// 从流重建声明的摄入表：每个 `(slug, source)` 取最后一条 `principle_declared`。
+///
+/// 表是投影，流是正本：删掉 `principle_ledger_declared`，这一条把它拼回来。
+pub(crate) async fn rebuild_declarations(pool: &sqlx::PgPool) -> Result<u64, cog_core::SFError> {
+    use std::collections::BTreeMap;
+
+    // 快照 + 增量，与状态那一条同形：水位是 event_id，快照里是整份折叠结果。
+    let snapshot = super::projection_snapshot::newest(pool, "principle_declarations").await?;
+    type Row = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        DateTime<Utc>,
+    );
+    let mut rows: BTreeMap<(String, String), Row> = BTreeMap::new();
+    let mut after_seq: i64 = 0;
+    if let Some(snapshot) = &snapshot {
+        if let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(&snapshot.state) {
+            for entry in entries {
+                let slug = entry
+                    .get("slug")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(Default::default());
+                let source = entry
+                    .get("source")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(Default::default());
+                if slug.is_empty() || source.is_empty() {
+                    continue;
+                }
+                let text = |key: &str| entry.get(key).and_then(|v| v.as_str()).map(str::to_string);
+                let declared_at = entry
+                    .get("declared_at")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .map(|t| t.with_timezone(&Utc))
+                    .unwrap_or_else(Utc::now);
+                rows.insert(
+                    (slug.to_string(), source.to_string()),
+                    (
+                        text("lead"),
+                        text("carrier_path"),
+                        text("carrier_sha256"),
+                        text("host_gate"),
+                        text("where_red"),
+                        text("check_kind"),
+                        text("priority"),
+                        declared_at,
+                    ),
+                );
+            }
+            let (seq,): (Option<i64>,) =
+                sqlx::query_as("SELECT seq FROM cogneva_event WHERE event_id = $1")
+                    .bind(&snapshot.event_id)
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|e| {
+                        cog_core::SFError::Database(format!("declaration watermark: {e}"))
+                    })?;
+            after_seq = seq.unwrap_or(0);
+        }
+    }
+
+    let events: Vec<(String, String, DateTime<Utc>, String)> = sqlx::query_as(
+        "SELECT event_id, subject_id, at, attributes \
+           FROM cogneva_event \
+          WHERE kind = 'principle_declared' AND seq > $1 \
+          ORDER BY seq",
+    )
+    .bind(after_seq)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| cog_core::SFError::Database(format!("rebuild declarations: {e}")))?;
+    let mut last_event: Option<String> = None;
+    for (event_id, slug, at, attributes) in events {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&attributes) else {
+            continue;
+        };
+        let source = value
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if slug.is_empty() || source.is_empty() {
+            continue;
+        }
+        let text = |key: &str| value.get(key).and_then(|v| v.as_str()).map(str::to_string);
+        rows.insert(
+            (slug, source),
+            (
+                text("lead"),
+                text("carrier_path"),
+                text("carrier_sha256"),
+                text("host_gate"),
+                text("where_red"),
+                text("check_kind"),
+                text("priority"),
+                at,
+            ),
+        );
+        last_event = Some(event_id);
+    }
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| cog_core::SFError::Database(format!("begin declarations: {e}")))?;
+    for (
+        (slug, source),
+        (
+            lead,
+            carrier_path,
+            carrier_sha256,
+            host_gate,
+            where_red,
+            check_kind,
+            priority,
+            declared_at,
+        ),
+    ) in &rows
+    {
+        sqlx::query(
+            "INSERT INTO principle_ledger_declared \
+                (slug, source, lead, carrier_path, carrier_sha256, host_gate, where_red, \
+                 check_kind, priority, declared_at, folded_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL) \
+             ON CONFLICT (slug, source) DO UPDATE SET \
+                 lead = EXCLUDED.lead, \
+                 carrier_path = EXCLUDED.carrier_path, \
+                 carrier_sha256 = EXCLUDED.carrier_sha256, \
+                 host_gate = EXCLUDED.host_gate, \
+                 where_red = EXCLUDED.where_red, \
+                 check_kind = EXCLUDED.check_kind, \
+                 priority = EXCLUDED.priority, \
+                 declared_at = EXCLUDED.declared_at, \
+                 folded_at = NULL",
+        )
+        .bind(slug)
+        .bind(source)
+        .bind(lead)
+        .bind(carrier_path)
+        .bind(carrier_sha256)
+        .bind(host_gate)
+        .bind(where_red)
+        .bind(check_kind)
+        .bind(priority)
+        .bind(declared_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| cog_core::SFError::Database(format!("rebuild {slug}/{source}: {e}")))?;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| cog_core::SFError::Database(format!("commit declarations: {e}")))?;
+
+    if let Some(event_id) = last_event {
+        let state: Vec<serde_json::Value> = rows
+            .iter()
+            .map(
+                |(
+                    (slug, source),
+                    (
+                        lead,
+                        carrier_path,
+                        carrier_sha256,
+                        host_gate,
+                        where_red,
+                        check_kind,
+                        priority,
+                        declared_at,
+                    ),
+                )| {
+                    serde_json::json!({
+                        "slug": slug,
+                        "source": source,
+                        "lead": lead,
+                        "carrier_path": carrier_path,
+                        "carrier_sha256": carrier_sha256,
+                        "host_gate": host_gate,
+                        "where_red": where_red,
+                        "check_kind": check_kind,
+                        "priority": priority,
+                        "declared_at": declared_at.to_rfc3339(),
+                    })
+                },
+            )
+            .collect();
+        super::projection_snapshot::record(
+            pool,
+            &super::projection_snapshot::ProjectionSnapshot {
+                projection: "principle_declarations".into(),
+                event_id,
+                state: serde_json::Value::Array(state).to_string(),
+            },
+        )
+        .await?;
+    }
+    Ok(rows.len() as u64)
+}
+
+/// 从流重建原则账的状态几格：每条原则最后一次被判成什么。
+///
+/// 判词进流之后，`principle_ledger` 的 state / platform_gate / measured_at /
+/// measured_rev 四格就是它的投影；这一条是那个投影的重建命令（归属列与读数不在这里，
+/// 它们由声明与折叠各自写）。
+pub(crate) async fn rebuild_states(pool: &sqlx::PgPool) -> Result<u64, cog_core::SFError> {
+    use std::collections::BTreeMap;
+
+    // 快照 + 增量：先取这条投影最新的一份快照（它自己是「到某条事件为止的折叠
+    // 结果」），只重放水位之后的事件；没有快照才从头折。
+    let snapshot = super::projection_snapshot::newest(pool, "principle_ledger").await?;
+    let mut rows: BTreeMap<
+        String,
+        (
+            Option<String>,
+            Option<String>,
+            DateTime<Utc>,
+            Option<String>,
+        ),
+    > = BTreeMap::new();
+    let mut after_seq: i64 = 0;
+    if let Some(snapshot) = &snapshot {
+        let parsed: Result<Vec<serde_json::Value>, _> = serde_json::from_str(&snapshot.state);
+        if let Ok(entries) = parsed {
+            for entry in entries {
+                let slug = entry
+                    .get("slug")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if slug.is_empty() {
+                    continue;
+                }
+                let measured_at = entry
+                    .get("measured_at")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .map(|t| t.with_timezone(&Utc))
+                    .unwrap_or_else(Utc::now);
+                rows.insert(
+                    slug,
+                    (
+                        entry
+                            .get("state")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        entry
+                            .get("platform_gate")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        measured_at,
+                        entry
+                            .get("measured_rev")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                    ),
+                );
+            }
+            let (seq,): (Option<i64>,) =
+                sqlx::query_as("SELECT seq FROM cogneva_event WHERE event_id = $1")
+                    .bind(&snapshot.event_id)
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|e| cog_core::SFError::Database(format!("snapshot watermark: {e}")))?;
+            after_seq = seq.unwrap_or(0);
+        }
+    }
+
+    let events: Vec<(String, String, DateTime<Utc>, String)> = sqlx::query_as(
+        "SELECT event_id, subject_id, at, attributes \
+           FROM cogneva_event \
+          WHERE kind = 'principle_judged' AND seq > $1 \
+          ORDER BY seq",
+    )
+    .bind(after_seq)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| cog_core::SFError::Database(format!("rebuild principle states: {e}")))?;
+    let mut last_event: Option<String> = None;
+    for (event_id, slug, at, attributes) in events {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&attributes) else {
+            continue;
+        };
+        rows.insert(
+            slug,
+            (
+                value
+                    .get("state")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                value
+                    .get("platform_gate")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                at,
+                value
+                    .get("measured_rev")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            ),
+        );
+        last_event = Some(event_id);
+    }
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| cog_core::SFError::Database(format!("begin rebuild: {e}")))?;
+    for (slug, (state, gate, measured_at, rev)) in &rows {
+        sqlx::query(
+            "INSERT INTO principle_ledger (slug, state, platform_gate, measured_at, measured_rev) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (slug) DO UPDATE SET \
+                 state = EXCLUDED.state, \
+                 platform_gate = EXCLUDED.platform_gate, \
+                 measured_at = EXCLUDED.measured_at, \
+                 measured_rev = EXCLUDED.measured_rev",
+        )
+        .bind(slug)
+        .bind(state)
+        .bind(gate)
+        .bind(measured_at)
+        .bind(rev)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| cog_core::SFError::Database(format!("rebuild {slug}: {e}")))?;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| cog_core::SFError::Database(format!("commit rebuild: {e}")))?;
+
+    if let Some(event_id) = last_event {
+        let state: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(slug, (state, gate, measured_at, rev))| {
+                serde_json::json!({
+                    "slug": slug,
+                    "state": state,
+                    "platform_gate": gate,
+                    "measured_at": measured_at.to_rfc3339(),
+                    "measured_rev": rev,
+                })
+            })
+            .collect();
+        super::projection_snapshot::record(
+            pool,
+            &super::projection_snapshot::ProjectionSnapshot {
+                projection: "principle_ledger".into(),
+                event_id,
+                state: serde_json::Value::Array(state).to_string(),
+            },
+        )
+        .await?;
+    }
+    Ok(rows.len() as u64)
+}
+
+#[cfg(test)]
+mod span_tests {
+    use super::*;
+
+    /// 展示列被裁到列宽，事实原文一个字不少。
+    #[test]
+    fn the_display_span_is_cut_and_the_fact_span_is_not() {
+        let long = "字".repeat(REFUSAL_SPAN_MAX + 40);
+        assert_eq!(display_span(&long).chars().count(), REFUSAL_SPAN_MAX);
+        assert_eq!(long.chars().count(), REFUSAL_SPAN_MAX + 40);
+        assert_eq!(display_span("短"), "短");
+    }
 }

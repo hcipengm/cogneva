@@ -96,11 +96,15 @@ const BUILTIN_FMT_CONFORM: &[&str] = &["cargo", "fmt", "--all"];
 ///
 /// 这是一个**条数**，不是一个时长：每一条自己按「还在不在动」判，时长来自实测
 /// 窗口（[`progress_window_secs`]）。
-// cap: bound — 条数不是时长：每条命令各自按动静判，时长由实测窗口供给；这个数只数「要跑几条」
+// cap: fixed — 条数不是时长：每条命令各自按动静判，时长由实测窗口供给；这个数只数「要跑几条」
+// keep: 删掉后一次变更的准入预算少了这一条，滚动会在跑到一半时超预算；由「只数要跑几条」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const WEB_ADMISSION_RUNS_PER_CHANGE: u64 = 1;
 
 /// 一条变更跑几趟工具链供给（`rustup install`）。
-// cap: bound — 同上，是条数：几趟供给各占一个自己的实测窗口，不按钟收尾
+// cap: fixed — 同上，是条数：几趟供给各占一个自己的实测窗口，不按钟收尾
+// keep: 删掉后工具链那趟不计入预算，预算在最后一趟才被撞破；由「几趟供给各占一个自己的实测窗口」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const TOOLCHAIN_RUNS_PER_CHANGE: u64 = 1;
 
 /// The linter this workspace's deployments ran while the stage was hardcoded.
@@ -148,7 +152,9 @@ const BUILTIN_LINT_LINE: &str = "cargo clippy --workspace --all-targets";
 
 /// [`ChangePipeline::run_cargo_fmt`] 里最多几趟命令：探针、判、改写、复判。
 /// 判干净就提前返回，所以这是上界不是次数。
-// cap: bound — 探针、判、改写、复判四趟；判干净就提前返回，所以是上界不是次数
+// cap: fixed — 探针、判、改写、复判四趟；判干净就提前返回，所以是上界不是次数
+// keep: 删掉后格式那几趟只剩一个估数，预算低估出三趟命令的钱；由「探针、判、改写、复判四趟」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const FMT_CMDS_PER_RUN_FMT: u64 = 4;
 
 /// 判这笔改动的格式化之前，先把这一侧的工具链对到 stable 的最新一次发布。
@@ -182,7 +188,8 @@ const BUILTIN_TOOLCHAIN_CHECK: &[&str] = &["rustup", "check"];
 /// `cargo fmt --all -- --check` 在这棵树上是绿还是红——而比较的两边得是同一把
 /// rustfmt。用镜像那一把读基线、用装好的那一把改写，改写过的每一行都会出现在
 /// diff 里，于是 linter 落在这些行上的报告会被记成这条变更写的。
-// cap: bound — 基线检查一趟，定工具链的刷新一趟
+// cap: fixed — 基线检查一趟，定工具链的刷新一趟
+// keep: 删掉后基线检查与工具链刷新两趟不计入，预算在变更之外先被花掉；由「基线一趟、定工具链一趟」兜住
 const FMT_CMDS_OUTSIDE_RUN_FMT: u64 = 2;
 
 /// `run_cargo_fmt` 在一条变更里最多被调用几次：apply 之后那趟，加上测试失败后
@@ -191,7 +198,9 @@ const FMT_CMDS_OUTSIDE_RUN_FMT: u64 = 2;
 /// 四段基线各跑各的：测试红了要读一次，门禁红了要读一次，linter 报了东西也要读
 /// 一次（摘掉改动之后同一棵树要能重新编译），而这三次不一定在同一条变更上发生。
 /// 数的是上界，所以按加起来算。
-// cap: bound — apply 之后那趟，加测试、门禁、linter 三处读基线各一趟
+// cap: fixed — apply 之后那趟，加测试、门禁、linter 三处读基线各一趟
+// keep: 删掉后 apply 之后的格式趟不计入，加测试、门禁、linter 三处读基线的支出一并失踪；由「apply 后那趟加三处读基线」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const FMT_RUNS_PER_CHANGE: u64 = 4;
 
 /// 格式化这一段一条变更跑几趟命令：`run_cargo_fmt` 里那几趟，加外面那两趟
@@ -218,11 +227,15 @@ pub(crate) fn progress_window_secs() -> u64 {
 /// `run_test_command` 两条（套件一条，测试失败后读基线失败集合再一条），
 /// 加上 linter 报了东西之后要读的那趟基线（把改动摘掉、同一条命令再跑一遍）。
 /// 最后这一条只在红的路上付，租约按上界算，所以也算进来。
-// cap: bound — clippy 一条加测试命令两条，加读 linter 基线那一条
+// cap: fixed — clippy 一条加测试命令两条，加读 linter 基线那一条
+// keep: 删掉后 clippy 与测试命令的开支不进入预算，变更跑到测试那一格才知道超了；由「clippy 一条、测试两条、读 linter 基线一条」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const TEST_RUNS_PER_CHANGE: u64 = 4;
 
 /// **构建那一类**里的那一条：发布构建，它的 acquire 在 `evolution_deployer` 里。
-// cap: bound — 这一类的命令只有发布构建那一条
+// cap: fixed — 这一类的命令只有发布构建那一条
+// keep: 删掉后发布构建这一条不进入预算，最贵的一趟成了预算外支出；由「这一类的命令只有发布构建那一条」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const BUILD_RUNS_PER_CHANGE: u64 = 1;
 
 /// 一条变更的验证最多收窄到几个包；超过就退回整棵 workspace。
@@ -231,11 +244,14 @@ const BUILD_RUNS_PER_CHANGE: u64 = 1;
 /// 过不过由落地后的 CI 判（红了有 `watch_landed` 回滚）。改动到这么多个包时
 /// 「自己」已经接近整棵树，再收窄省不下什么，却要多担一层「哪些包被算进来了」
 /// 的读数——那种时候跑整棵是更简单的那个答案。
-// cap: bound — 超过这么多个包，收窄省下的编译已经小于它多担的那层读数
+// cap: fixed — 超过这么多个包，收窄省下的编译已经小于它多担的那层读数
+// keep: 删掉后可以把任意多个包一起收窄，省下的编译小于多担的那层读数；由「超过这个数收窄就不划算了」兜住
 const MAX_SCOPED_PACKAGES: usize = 6;
 
 /// 一条变更跑几段门禁：判定那一段，以及红了之后读基线的那一段。
-// cap: bound — 判定一段 + 门禁失败后读基线一段
+// cap: fixed — 判定一段 + 门禁失败后读基线一段
+// keep: 删掉后门禁的两段支出不计入预算，失败后读基线那一段变成预算外；由「判定一段＋失败后读基线一段」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const REPO_GATE_RUNS_PER_CHANGE: u64 = 2;
 
 /// CI 工作流文件，门禁清单的唯一来源。
@@ -738,7 +754,8 @@ fn last_line_of(text: &str) -> &str {
 
 /// 输出的尾巴：门禁的报告是给人读的，前面大半是它读过的清单，红的那句在末尾。
 fn tail_of(text: &str) -> String {
-    // cap: bound — 够装下几组失败各自的收尾行（每组通常一两行），又不至于把整份
+    // cap: fixed — 够装下几组失败各自的收尾行（每组通常一两行），又不至于把整份
+    // keep: 删掉后一次失败要把所有收尾行都留在结果里，结果被日志淹没；由「够装几组失败的收尾行」兜住
     // 日志倒进提示词；没有测量能定这个数，它只决定「交回去的是结尾还是全文」。
     const KEPT: usize = 40;
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -1220,6 +1237,8 @@ pub(crate) async fn record_change(
                 .tiering
                 .as_ref()
                 .and_then(|tiering| serde_json::to_string(tiering).ok()),
+            // 发起这次演化的那件活一路带到变更事实上；没有它就是 None。
+            unit_of_work: result.unit_of_work.clone(),
             recorded_status: status.clone(),
             status: "candidate".to_string(),
             decision_reason: None,
@@ -1262,6 +1281,9 @@ fn result_from_candidate(candidate: &ChangeCandidate) -> EvolutionResult {
     ))
     .unwrap_or(EvolutionStatus::Unrecorded);
     EvolutionResult {
+        // 这一格随候选往返：从候选里读出来的那一版，仍然属于同一个目标；
+        // 写成 None 会把「谁要的」在重放/重投的那一刻丢掉。
+        unit_of_work: candidate.unit_of_work.clone(),
         kind,
         artifact_id: candidate.artifact_id.clone(),
         description: candidate.description.clone(),
@@ -1505,6 +1527,7 @@ impl ChangePipeline {
             }
 
             results.push(EvolutionResult {
+                unit_of_work: None,
                 kind: EvolutionKind::CodeChange,
                 artifact_id,
                 description,
@@ -1548,6 +1571,7 @@ impl ChangePipeline {
         let status = status_word(result.status);
         candidates
             .record(&ChangeCandidate {
+                unit_of_work: None,
                 artifact_id: result.artifact_id.clone(),
                 kind: kind_word(result.kind),
                 description: result.description.clone(),
@@ -1988,7 +2012,7 @@ impl ChangePipeline {
                 reason = %reason,
                 "Change refused by the deployment admission conditions"
             );
-            let _ = self.git_reset_hard(workdir, &change.content).await;
+            cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
             return Ok(ApplyResult {
                 change_id: change.artifact_id.clone(),
                 files_changed,
@@ -2012,7 +2036,7 @@ impl ChangePipeline {
                     reason = %reason,
                     "Change refused by the WebUI admission conditions"
                 );
-                let _ = self.git_reset_hard(workdir, &change.content).await;
+                cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
@@ -2047,7 +2071,7 @@ impl ChangePipeline {
                 change_id = %change.artifact_id,
                 "Change writes only defaults every shipped document overrides"
             );
-            let _ = self.git_reset_hard(workdir, &change.content).await;
+            cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
             return Ok(ApplyResult {
                 change_id: change.artifact_id.clone(),
                 files_changed,
@@ -2070,7 +2094,7 @@ impl ChangePipeline {
                     change_id = %change.artifact_id,
                     "Change is not what this deployment's formatter produces; rolling back"
                 );
-                let _ = self.git_reset_hard(workdir, &change.content).await;
+                cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
@@ -2084,7 +2108,7 @@ impl ChangePipeline {
             }
             Err(e) => {
                 warn!(change_id = %change.artifact_id, error = %e, "the format check did not run");
-                let _ = self.git_reset_hard(workdir, &change.content).await;
+                cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
@@ -2164,7 +2188,7 @@ impl ChangePipeline {
             Ok(LintVerdict::Clean(note)) => note,
             Ok(LintVerdict::NotDeclared) => NO_LINTER_NOTE.to_string(),
             Ok(LintVerdict::Unattributable(evidence)) => {
-                let _ = self.git_reset_hard(workdir, &change.content).await;
+                cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
@@ -2185,7 +2209,7 @@ impl ChangePipeline {
                     change_id = %change.artifact_id,
                     "The built-in linter reached no verdict; this change is not judged yet"
                 );
-                let _ = self.git_reset_hard(workdir, &change.content).await;
+                cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                 return Err(SFError::IO(evidence));
             }
             Ok(LintVerdict::Attributable { line, output }) => {
@@ -2211,7 +2235,9 @@ impl ChangePipeline {
                                 error = %e,
                                 "Could not read the lines this change wrote; reaching no verdict"
                             );
-                            let _ = self.git_reset_hard(workdir, &change.content).await;
+                            cog_core::ignore_lost!(
+                                self.git_reset_hard(workdir, &change.content).await
+                            );
                             return Err(e);
                         }
                     };
@@ -2235,7 +2261,7 @@ impl ChangePipeline {
                         })
                         .collect::<Vec<_>>()
                         .join("\n  ");
-                    let _ = self.git_reset_hard(workdir, &change.content).await;
+                    cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                     return Ok(ApplyResult {
                         change_id: change.artifact_id.clone(),
                         files_changed,
@@ -2297,7 +2323,9 @@ impl ChangePipeline {
                                 count = introduced.len(),
                                 "Change leaves findings this tree did not have"
                             );
-                            let _ = self.git_reset_hard(workdir, &change.content).await;
+                            cog_core::ignore_lost!(
+                                self.git_reset_hard(workdir, &change.content).await
+                            );
                             return Ok(ApplyResult {
                                 change_id: change.artifact_id.clone(),
                                 files_changed,
@@ -2335,7 +2363,9 @@ impl ChangePipeline {
                                 error = %e,
                                 "the linter's baseline got no build slot"
                             );
-                            let _ = self.git_reset_hard(workdir, &change.content).await;
+                            cog_core::ignore_lost!(
+                                self.git_reset_hard(workdir, &change.content).await
+                            );
                             return Err(e);
                         }
                         // A baseline this run could not read convicts nobody: the
@@ -2360,7 +2390,7 @@ impl ChangePipeline {
             }
             Err(e) if e.is_build_slot_refused() => {
                 warn!(change_id = %change.artifact_id, error = %e, "the linter got no build slot");
-                let _ = self.git_reset_hard(workdir, &change.content).await;
+                cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                 return Err(e);
             }
             Err(e) => {
@@ -2390,12 +2420,12 @@ impl ChangePipeline {
             // sound change for the load the machine happened to be under.
             Err(e) if e.is_build_slot_refused() => {
                 warn!(change_id = %change.artifact_id, error = %e, command = %self.test_command_line(), "the test command got no build slot");
-                let _ = self.git_reset_hard(workdir, &change.content).await;
+                cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                 return Err(e);
             }
             Err(e) => {
                 warn!(change_id = %change.artifact_id, error = %e, command = %self.test_command_line(), "the test command failed to execute");
-                let _ = self.git_reset_hard(workdir, &change.content).await;
+                cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
@@ -2480,7 +2510,7 @@ impl ChangePipeline {
                         error = %e,
                         "Could not read the tests this revision fails on its own; reaching no verdict"
                     );
-                    let _ = self.git_reset_hard(workdir, &change.content).await;
+                    cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                     return Err(e);
                 }
             }
@@ -2507,7 +2537,7 @@ impl ChangePipeline {
                     count = pre_existing_failures,
                     "The change leaves the red it claims to fix still red; rolling back"
                 );
-                let _ = self.git_reset_hard(workdir, &change.content).await;
+                cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
@@ -2531,7 +2561,7 @@ impl ChangePipeline {
                         command = %self.test_command_line(),
                         "The red this change claims to fix is green on this tree without it"
                     );
-                    let _ = self.git_reset_hard(workdir, &change.content).await;
+                    cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                     return Ok(ApplyResult {
                         change_id: change.artifact_id.clone(),
                         files_changed,
@@ -2570,7 +2600,7 @@ impl ChangePipeline {
                         error = %e,
                         "Could not read the red this tree shows without the change; reaching no verdict"
                     );
-                    let _ = self.git_reset_hard(workdir, &change.content).await;
+                    cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                     return Err(e);
                 }
             }
@@ -2661,7 +2691,7 @@ impl ChangePipeline {
                             error = %e,
                             "could not read the gates this revision fails on its own; reaching no verdict"
                         );
-                        let _ = self.git_reset_hard(workdir, &change.content).await;
+                        cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                         return Err(e);
                     }
                 }
@@ -2680,12 +2710,12 @@ impl ChangePipeline {
                 EvolutionStatus::Active
             } else {
                 info!(change_id = %change.artifact_id, "Change tests passed; rolling back for manual review");
-                let _ = self.git_reset_hard(workdir, &change.content).await;
+                cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                 EvolutionStatus::AwaitingReview
             }
         } else {
             warn!(change_id = %change.artifact_id, "Change tests failed; rolling back");
-            let _ = self.git_reset_hard(workdir, &change.content).await;
+            cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
             EvolutionStatus::ValidationFailed
         };
 
@@ -3082,7 +3112,7 @@ impl ChangePipeline {
                     .run_git_apply_args(workdir, change_content, &["--3way"])
                     .await;
                 if applied.is_err() {
-                    let _ = self.git_reset_hard(workdir, change_content).await;
+                    cog_core::ignore_lost!(self.git_reset_hard(workdir, change_content).await);
                 }
                 applied
             }
@@ -3143,7 +3173,7 @@ impl ChangePipeline {
             .three_way_probe_with_index(workdir, change_content, &index)
             .await
             .unwrap_or(false);
-        let _ = tokio::fs::remove_file(&index).await;
+        cog_core::ignore_lost!(tokio::fs::remove_file(&index).await);
         merged
     }
 
@@ -3392,11 +3422,11 @@ impl ChangePipeline {
         let head = self
             .git_try(workdir, &["rev-parse", "HEAD"])
             .await
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let upstream = self
             .git_try(workdir, &["rev-parse", "local/main"])
             .await
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         if head.is_empty() || upstream.is_empty() {
             return Ok(());
         }
@@ -3667,11 +3697,11 @@ impl ChangePipeline {
             if self.auto_apply {
                 (EvolutionStatus::Active, ChangeVerdict::Passed)
             } else {
-                let _ = self.git_reset_hard(workdir, &change.content).await;
+                cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                 (EvolutionStatus::AwaitingReview, ChangeVerdict::Passed)
             }
         } else {
-            let _ = self.git_reset_hard(workdir, &change.content).await;
+            cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
             (
                 EvolutionStatus::ValidationFailed,
                 ChangeVerdict::Refused(cog_core::RejectionCause::TestsFailed),
@@ -3830,7 +3860,7 @@ impl ChangePipeline {
         let after = self
             .git_capture(workdir, &["diff", "HEAD"])
             .await
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let added_after = untracked_of_change(
             &self
                 .git_capture(workdir, &["ls-files", "--others", "--exclude-standard"])
@@ -4819,7 +4849,9 @@ impl ChangePipeline {
         packages: Option<&[String]>,
     ) -> SFResult<BTreeSet<String>> {
         let rev = self.workspace_rev(workdir).await?;
-        let scope: Vec<String> = packages.map(|list| list.to_vec()).unwrap_or_default();
+        let scope: Vec<String> = packages
+            .map(|list| list.to_vec())
+            .unwrap_or(Default::default());
         if let Some((cached_rev, cached_scope, tests)) =
             self.baseline_failures.lock().await.as_ref()
         {
@@ -5075,6 +5107,35 @@ fn names_same_or_nested(target: &str, anchor: &str) -> bool {
     target == anchor
         || target.starts_with(&format!("{anchor}/"))
         || anchor.starts_with(&format!("{target}/"))
+}
+
+#[cfg(test)]
+mod unit_of_work_tests {
+    use super::*;
+
+    /// 从候选读回来的那一版仍然属于同一个目标。
+    ///
+    /// 没有这次改动这条会红：`result_from_candidate` 把 `unit_of_work` 写成
+    /// `None`，重放/重投一次之后「谁要的」就丢了，链条在中间断掉。
+    #[test]
+    fn a_candidate_carries_its_unit_back_into_the_result() {
+        let candidate = ChangeCandidate {
+            artifact_id: "change-1".into(),
+            kind: "code_change".into(),
+            description: "d".into(),
+            content: "x".into(),
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+            tiering: None,
+            unit_of_work: Some("goal-9".into()),
+            recorded_status: "compile_checked".into(),
+            status: "candidate".into(),
+            decision_reason: None,
+            event_id: String::new(),
+        };
+        let result = result_from_candidate(&candidate);
+        assert_eq!(result.unit_of_work.as_deref(), Some("goal-9"));
+    }
 }
 
 #[cfg(test)]
@@ -5809,6 +5870,7 @@ impl Default for MetricsConfig {
         let pipeline =
             crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false);
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "change-GOAL".into(),
             description: "补充 README.md 的 Windows 快速开始".into(),
@@ -6429,6 +6491,7 @@ index 1111111..2222222 100644
                 .with_promotion_policy(crate::PromotionGateConfig::default());
 
         let change = crate::types::EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: "evil-1".into(),
             description: "touches Cargo.toml".into(),
@@ -6527,6 +6590,7 @@ index 1111111..2222222 100644
                 .with_verification_budget(budget.clone());
 
         let change = crate::types::EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: "collides-with-the-moved-base-1".into(),
             description: "align the base before asking for a slot".into(),
@@ -6656,6 +6720,7 @@ index 1111111..2222222 100644
         let pipeline =
             crate::change_pipeline::test_pipeline(temp.path(), temp.path().join("changes"), true);
         let change = crate::types::EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: "garbage-1".into(),
             description: "not a diff at all".into(),
@@ -6691,6 +6756,7 @@ index 1111111..2222222 100644
         let pipeline =
             crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), true);
         let change = crate::types::EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: "escaping-1".into(),
             description: "补一个模块".into(),
@@ -6731,6 +6797,7 @@ index 1111111..2222222 100644
         let pipeline =
             crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false);
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "stale-1".into(),
             description: "调整这一行的取值".into(),
@@ -6778,6 +6845,7 @@ index 1111111..2222222 100644
         let pipeline =
             crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false);
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "corrupt-1".into(),
             description: "调整这一行的取值".into(),
@@ -6839,6 +6907,7 @@ index 1111111..2222222 100644
         let pipeline =
             crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false);
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "breaking-1".into(),
             description: "修正这个取值的计算".into(),
@@ -6918,6 +6987,7 @@ index 1111111..2222222 100644
         let pipeline =
             crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false);
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "banana-1".into(),
             description: "加一个取水果名的函数".into(),
@@ -7000,6 +7070,7 @@ index 1111111..2222222 100644
         let pipeline =
             crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false);
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "unrelated-1".into(),
             description: "加一行注释".into(),
@@ -7090,6 +7161,7 @@ index 1111111..2222222 100644
         // `dead_code` — two lints from two sources on one written line, so the
         // refusal has to list what it found rather than the first thing.
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "linting-1".into(),
             description: "给取值模块补一个辅助函数".into(),
@@ -7189,6 +7261,7 @@ index 1111111..2222222 100644
             crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false)
                 .with_lint_command(Some(vec!["false".into()]));
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "opaque-lint-1".into(),
             description: "给取值模块补一个辅助函数".into(),
@@ -7266,6 +7339,7 @@ index 1111111..2222222 100644
         let pipeline =
             crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false);
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "clean-1".into(),
             description: "给取值模块补一个辅助函数".into(),
@@ -7343,6 +7417,7 @@ index 1111111..2222222 100644
         let pipeline =
             crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false);
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "orphan-1".into(),
             description: "把取值函数的间接层去掉".into(),
@@ -7439,6 +7514,7 @@ index 1111111..2222222 100644
     async fn a_change_that_shows_the_red_before_it_shows_the_green_passes() {
         let (root, pipeline) = reproducing_tree("BROKEN\n").await;
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "reproduced-1".into(),
             description: "让判据看到修好后的取值".into(),
@@ -7469,6 +7545,7 @@ index 1111111..2222222 100644
     async fn a_change_whose_red_is_green_without_it_is_refused_as_unreproduced() {
         let (root, pipeline) = reproducing_tree("FIXED\n").await;
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "unreproduced-1".into(),
             description: "调整判据读到的取值".into(),
@@ -7500,6 +7577,7 @@ index 1111111..2222222 100644
     async fn the_same_change_is_judged_on_green_alone_when_it_owes_no_reproduction() {
         let (root, pipeline) = reproducing_tree("FIXED\n").await;
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "plain-1".into(),
             description: "调整判据读到的取值".into(),
@@ -7589,6 +7667,7 @@ index 1111111..2222222 100644
         let pipeline =
             crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false);
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "clean-2".into(),
             description: "给取值模块补一个辅助函数".into(),
@@ -7655,6 +7734,7 @@ index 1111111..2222222 100644
     async fn a_change_that_is_not_formatted_is_conformed_and_then_judged() {
         let (root, pipeline) = formatted_probe_workspace(true).await;
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "unformatted-1".into(),
             description: "修正这个取值的计算".into(),
@@ -7705,6 +7785,7 @@ index 1111111..2222222 100644
     async fn a_change_the_formatter_cannot_conform_is_refused() {
         let (root, pipeline) = formatted_probe_workspace(false).await;
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "unparsable-1".into(),
             description: "修正这个取值的计算".into(),
@@ -7754,6 +7835,7 @@ index 1111111..2222222 100644
     async fn a_formatted_change_is_neither_refused_nor_rewritten() {
         let (root, pipeline) = formatted_probe_workspace(false).await;
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "formatted-1".into(),
             description: "修正这个取值的计算".into(),
@@ -7860,6 +7942,7 @@ index 1111111..2222222 100644
 
         // 变更指向真实存在的 a.txt，本身完全合法——失败只来自工作树状态。
         let change = crate::types::EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: "ok-1".into(),
             description: "valid change".into(),
@@ -7939,6 +8022,7 @@ index 1111111..2222222 100644
         created_at: chrono::DateTime<chrono::Utc>,
     ) -> EvolutionResult {
         EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: id.to_string(),
             description: format!("goal-{id}"),
@@ -9097,6 +9181,7 @@ index 1111111..2222222 100644
 
     fn a_change_moving_seeds(artifact_id: &str, content: String) -> EvolutionResult {
         EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: artifact_id.into(),
             description: "修正这个取值的计算".into(),
@@ -9420,6 +9505,7 @@ index 1111111..2222222 100644\n\
         let pipeline =
             crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false);
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "misdeclared-1".into(),
             description: "调整这一行的取值".into(),
@@ -9472,6 +9558,7 @@ index 1111111..2222222 100644\n\
         let pipeline =
             crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false);
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "self-serving-1".into(),
             description: "把项目的 kind 改成 rust".into(),
@@ -9980,6 +10067,7 @@ index 1111111..2222222 100644\n\
                 .with_test_command(vec!["false".into()]);
 
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "web-only-1".into(),
             description: "让这个取值变成 2".into(),
@@ -10049,6 +10137,7 @@ index 1111111..2222222 100644\n\
     /// 一份可以塞进队列的候选：给定正文与 id。
     fn candidate_with(id: &str, content: &str) -> ChangeCandidate {
         ChangeCandidate {
+            unit_of_work: None,
             artifact_id: id.to_string(),
             kind: "code_change".to_string(),
             description: "why".to_string(),

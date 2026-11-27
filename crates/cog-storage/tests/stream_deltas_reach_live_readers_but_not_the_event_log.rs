@@ -26,7 +26,8 @@ use cog_test_support::database_url;
 
 /// 一次等多久算「没送到」。广播是本进程内的通道，正常是微秒级；给足一秒只为
 /// 让慢机器上的调度误差不算失败。
-// cap: bound — 同进程广播的等待上限，只用来区分「没送到」与「慢一拍」
+// cap: fixed — 同进程广播的等待上限，只用来区分「没送到」与「慢一拍」
+// keep: 删掉后回到「同进程广播的等待上限，只用来区分「没送到」与「慢一拍」」所描述的情形；由这条约定兜住
 const LIVE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn turn_end(agent_id: &str) -> AgentEvent {

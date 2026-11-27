@@ -10,7 +10,8 @@ use std::sync::Arc;
 /// 被写下来。
 /// 续跑：能，而且应该——状态是当前值，不是增量：下一次上报送的是那一刻的完整状态，
 /// 丢掉一次不会留下缺口。
-// cap: bound — 一次控制平面的应答；状态是当前值，所以晚到一次不产生缺口
+// cap: fixed — 一次控制平面的应答；状态是当前值，所以晚到一次不产生缺口
+// keep: 删掉后一次控制平面的应答永远等下去，状态是当前值却晚到也不产生缺口；由「晚到一次不产生缺口」兜住
 // wall: wait=one control-plane ack; on-timeout=error, nothing recorded as reported; resume=yes, the next report carries the whole state
 const CONTROL_PLANE_REPORT_TIMEOUT_SECS: u64 = 30;
 
@@ -85,7 +86,7 @@ impl ControlPlaneClient for HttpControlPlaneClient {
             Ok(())
         } else {
             let status_code = resp.status;
-            let body = resp.text().unwrap_or_default();
+            let body = resp.text().unwrap_or(Default::default());
             warn!(
                 "Control plane returned non-success status: {} — body: {}",
                 status_code, body

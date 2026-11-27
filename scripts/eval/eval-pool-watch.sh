@@ -34,12 +34,13 @@ read_any=0
 while [ "$(date +%s)" -lt "$end" ]; do
   sudo -n kubectl -n "$NAMESPACE" port-forward svc/cogneva-security-gateway "$PORT":8081 >/dev/null 2>&1 &
   pf=$!
+  # not-a-bound: 等待外部状态收敛/轮询的让路节拍——它决定多久看一次，不结束任何活
   sleep 2
   # 按面那一格同时记下来：池级 `available` 是**整个池**的容量，池里住着两种协议面时，
   # 一面全灭、另一面健康，它照样读 1，而续跑循环这一侧的每一次调用都在熔断处回 503。
   # 2026-10-24 实测就是这样：openai 面唯一那家回了额度周期、anthropic 面健康，池级读 1，
   # 续跑按它判「窗口开了」，一轮轮起跑、一轮轮零产出。所以这一行里两面都写。
-  body=$(curl -s --max-time 4 "http://127.0.0.1:$PORT/metrics" \
+  body=$(curl -s "http://127.0.0.1:$PORT/metrics" \
     | grep -E '^llm_pool_(available|evidenced_recovery_unix|next_attempt_unix) |^llm_pool_face_serving\{' \
     | awk '{print $1"="$2}' \
     | sed -E 's/^llm_pool_face_serving\{face="([^"]+)"\}=/face_serving[\1]=/' \

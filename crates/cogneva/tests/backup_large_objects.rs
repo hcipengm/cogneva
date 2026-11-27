@@ -58,20 +58,21 @@ async fn a_body_is_carried_in_the_package_and_comes_back_under_its_own_oid() {
 
     let dir = tempfile::tempdir().unwrap();
     let pkg_pg = dir.path().join("pg");
-    let report = backup_postgres(&pool, &pkg_pg)
-        .await
-        .expect("备份失败");
+    let report = backup_postgres(&pool, &pkg_pg).await.expect("备份失败");
 
     let declared = report
         .large_objects
         .iter()
         .find(|lo| lo.oid == oid)
-        .unwrap_or_else(|| panic!("清单里没有这一段正文（oid {oid}）：{:?}", report.large_objects));
+        .unwrap_or_else(|| {
+            panic!(
+                "清单里没有这一段正文（oid {oid}）：{:?}",
+                report.large_objects
+            )
+        });
     assert_eq!(declared.bytes, sealed_len, "清单里的字节数与封口读数不等");
 
-    let file = pkg_pg
-        .join("largeobjects")
-        .join(format!("{oid}.bin"));
+    let file = pkg_pg.join("largeobjects").join(format!("{oid}.bin"));
     let on_disk = std::fs::metadata(&file)
         .unwrap_or_else(|e| panic!("包里没有这一段：{}（{e}）", file.display()))
         .len();

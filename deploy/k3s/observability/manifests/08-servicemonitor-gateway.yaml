@@ -1,3 +1,4 @@
+# census-keep: shapes=deploy-numbers — 部署清单里的数是部署自己的声明：它写在生效的那一处，改它只改这一次部署，不是代码里看不见的默认；由部署面本身兜住
 # ServiceMonitor — 让 Prometheus 抓安全网关的上游池指标。
 # 网关是上游池健康的唯一掌握者：llm_upstream_healthy / llm_pool_available /
 # llm_pool_evidenced_recovery_unix / llm_pool_next_attempt_unix 只在这里产生，

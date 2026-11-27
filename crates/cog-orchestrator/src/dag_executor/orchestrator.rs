@@ -104,7 +104,6 @@ pub struct DagExecutor {
     /// 行上那位」要它，所以它和池子挂在一起：池子建的都是座位，座位背后的人
     /// 写在名册上。没挂的时候座位形认领按旧口径判（名字要比得一模一样），
     /// 那是这个进程读不到名册，不是判据说「不行」。
-    roster: std::sync::RwLock<Option<Arc<dyn cog_core::AgentRegistry>>>,
     /// 测试用：读到这些 id 的那一问答不上来。它交出的正是存储坏掉时的形状，
     /// 让「读不到」与「没有这一行」在测试里分得开；生产构建里没有这一格。
     #[cfg(test)]
@@ -249,7 +248,8 @@ fn reclaim_cause(
 /// 六轮、每轮按上游自己给的 2488s 算，是四个多小时的耐心：一段真会过去的
 /// 限流、一次真的窗口滚动，都在这个尺度以内。再往后还回来的，量出来的形状
 /// 是「窗口根本还没回来」，那时该做的是少来几次，不是继续每分钟试探。
-// cap: bound — 这个数是耐心，不是容量：调大只会让已经徒劳的试探多跑几轮，调小会把真会过去的限流也当成没救
+// cap: fixed — 这个数是耐心，不是容量：调大只会让已经徒劳的试探多跑几轮，调小会把真会过去的限流也当成没救
+// keep: 删掉后已经徒劳的试探无限跑，或真会过去的限流被当成没救；由「这个数是耐心，不是容量」兜住
 const UNCHARGED_TURNS_BEFORE_SLOWING: u32 = 6;
 
 /// 拉长等待的上界：12 小时。
@@ -257,7 +257,8 @@ const UNCHARGED_TURNS_BEFORE_SLOWING: u32 = 6;
 /// 平台量出来的额度窗口是一周（`quota_window_secs: 604800`），12 小时是它的
 /// 一个零头——窗口回来的当天，这些活半天之内都会重新被看到，而又不会在窗口
 /// 还没回来时把额度一片一片吃掉。
-// cap: bound — 上界钉在额度窗口（配置的 quota_window_secs: 604800）的一个零头上：窗口回来的当天这些活会重新被看到，又不会在窗口回来前把额度一片片吃掉。窗口是配置值，这个界是人按窗口钉的，没有闭环让它跟着动
+// cap: fixed — 上界钉在额度窗口（配置的 quota_window_secs: 604800）的一个零头上：窗口回来的当天这些活会重新被看到，又不会在窗口回来前把额度一片片吃掉。窗口是配置值，这个界是人按窗口钉的，没有闭环让它跟着动
+// keep: 删掉后回到「上界钉在额度窗口（配置的 quota_window_secs: 604800）的一个零头上：窗口回来的当天这些活会重新被看到，又不会在窗口回来前把额度一片片吃掉。窗口是配置值，这个界是人按窗口钉的，没有闭环让它跟着动」所描述的情形；由这条约定兜住
 const UNCHARGED_REQUEUE_WAIT_CAP_SECS: u64 = 12 * 3600;
 
 /// One lane's share of what a stall sweep did.
@@ -355,7 +356,6 @@ impl DagExecutor {
             archive_poll_interval_secs: 300,
             metrics: std::sync::RwLock::new(None),
             agent_manager: std::sync::RwLock::new(None),
-            roster: std::sync::RwLock::new(None),
             #[cfg(test)]
             unreadable_tasks: Default::default(),
             board_wip_limits: std::sync::RwLock::new(cog_core::BoardWipLimits::from_env().0),
@@ -377,19 +377,14 @@ impl DagExecutor {
             .unwrap_or_else(|e| e.into_inner()) = Some(manager);
     }
 
-    /// 挂上员工名册：座位背后是谁只写在那儿。
+    /// 一个名字代表的工号：人形 id 就是他自己，座位形问同一张图上的那件活。
     ///
-    /// 与 `attach_agent_manager` 同一次装配里挂：池子建的是座位，名册行是座位
-    /// 注册时写下的那一行。没挂的时候，座位形认领与结果按旧口径判（名字要比得
-    /// 一模一样），这读作「这个进程读不到名册」，不读作「那个人不该干」。
-    pub fn attach_roster(&self, roster: Arc<dyn cog_core::AgentRegistry>) {
-        *self.roster.write().unwrap_or_else(|e| e.into_inner()) = Some(roster);
-    }
-
-    /// 一个名字代表的工号：人形 id 就是他自己，座位形问名册行。
+    /// 座位背后坐谁不是名册上的字段——座位会换人，把它写进名册行就得第二名
+    /// 写者去改同一行。座位地址由任务与职务推出（`assignment_of`），所以这里
+    /// 反查图里的任务，读那一行写着的负责人。
     ///
-    /// `None` 是读数：名册没挂、座位还没有人、或者名册读失败都落在这里。三种
-    /// 都让调用方退回旧口径，而不是把「读不到」当成「不是他」。
+    /// `None` 是读数：座位还没派给人、图里没有这把座位、或者负责人不是人形
+    /// 地址。都让调用方退回旧口径，而不是把「读不到」当成「不是他」。
     pub(crate) async fn claimant_person(&self, claimant: &str) -> Option<String> {
         // 与控制面判「谁在认领」的那一处同一个口径：认领判据比对的是去空白后的
         // 名字（[`crate::ready_queue::approve_claim_for`]）。这里不去，派工就会
@@ -399,23 +394,16 @@ impl DagExecutor {
         if let Some(person) = cog_core::person_id_for(claimant) {
             return Some(person.to_string());
         }
-        let roster = self
-            .roster
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()?;
-        match roster.employee(claimant).await {
-            Ok(Some(row)) => row.person().map(str::to_string),
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!(
-                    claimant,
-                    error = %e,
-                    "the roster could not be read for this name; judging the claim by the name alone"
-                );
-                None
-            }
-        }
+        // 座位地址 = `squad:<任务>-<职务>`。同一件活的每一把椅子都是同一个人的；
+        // 带尾横线比对，`t-1` 与 `t-10` 不会互相认领。
+        let inner = self.inner.read().await;
+        inner.tasks.values().find_map(|task| {
+            let prefix = format!("{}-", cog_core::squad_id_for(&task.id));
+            claimant
+                .starts_with(&prefix)
+                .then(|| cog_core::assignment_of(task).person.map(str::to_string))
+                .flatten()
+        })
     }
 
     /// Attach the metrics backend the DAG's own repairs report to. Called once
@@ -1220,7 +1208,7 @@ impl DagExecutor {
                     );
                 }
             }
-            let _ = tx.send(event.clone());
+            cog_core::ignore_lost!(tx.send(event.clone()));
         }
         if let Some(ref logger) = self.raw_logger {
             let record = cog_core::RawRecord {
@@ -1563,7 +1551,7 @@ impl DagExecutor {
 
     /// 两种模式统一的任务集读取。
     async fn all_tasks_unified(&self) -> Vec<Task> {
-        self.all_tasks_checked().await.unwrap_or_default()
+        cog_core::logged_default!(self.all_tasks_checked().await)
     }
 
     /// 派发这一轮真正要读的那些行。
@@ -1651,7 +1639,7 @@ impl DagExecutor {
     }
 
     async fn venue_tasks_unified(&self) -> Vec<Task> {
-        self.venue_tasks_checked().await.unwrap_or_default()
+        cog_core::logged_default!(self.venue_tasks_checked().await)
     }
 
     /// 同上，但保留读失败。
@@ -1876,7 +1864,7 @@ impl DagExecutor {
             });
         }
         if let Some(ref reg) = self.circuit_registry {
-            let _ = reg.record_success(&task.task_type);
+            cog_core::ignore_lost!(reg.record_success(&task.task_type));
         }
         let scheduled = be
             .dag_complete_task(&self.workspace_id, task_id, result.clone())
@@ -2334,7 +2322,7 @@ impl DagExecutor {
         let all = be
             .dag_get_all_tasks(&self.workspace_id)
             .await
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let to_archive: Vec<String> = all
             .iter()
             .filter(|t| {
@@ -2412,7 +2400,7 @@ impl DagExecutor {
     /// work finish in between and refuse against a column that has already
     /// drained.
     pub async fn ready_work(&self) -> ReadyWork {
-        self.ready_work_checked().await.unwrap_or_default()
+        cog_core::logged_default!(self.ready_work_checked().await)
     }
 
     /// 同上，但保留读失败。
@@ -2501,7 +2489,7 @@ impl DagExecutor {
     /// Unlike [`Self::find_ready_tasks`], this includes tasks that have already
     /// been transitioned to `Scheduled` — useful for query endpoints.
     pub async fn get_ready_tasks(&self) -> Vec<Task> {
-        self.ready_tasks_checked().await.unwrap_or_default()
+        cog_core::logged_default!(self.ready_tasks_checked().await)
     }
 
     /// 同一份队列，但保留读失败。
@@ -3284,7 +3272,7 @@ impl DagExecutor {
 
         // Record success on circuit breaker if configured
         if let Some(ref reg) = self.circuit_registry {
-            let _ = reg.record_success(&task.task_type);
+            cog_core::ignore_lost!(reg.record_success(&task.task_type));
         }
 
         // Auto-schedule dependents whose dependencies are now all completed.
@@ -3294,7 +3282,7 @@ impl DagExecutor {
             .dependents
             .get(task_id)
             .map(|deps| deps.iter().cloned().collect())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
 
         let mut scheduled = Vec::new();
         for dep_id in dependents_to_schedule {
@@ -3877,7 +3865,7 @@ impl DagExecutor {
                 let history = be
                     .dag_get_retry_history(&self.workspace_id, task_id)
                     .await
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 (task, history)
             } else {
                 self.ensure_task_present(task_id).await?;
@@ -3894,7 +3882,7 @@ impl DagExecutor {
                     .retry_history
                     .get(task_id)
                     .cloned()
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 (task, history)
             };
 
@@ -4262,7 +4250,7 @@ impl DagExecutor {
                         .map(|t| t.id.clone())
                         .collect()
                 })
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
         }
         let inner = self.inner.read().await;
         inner
@@ -4352,7 +4340,7 @@ impl DagExecutor {
     }
 
     pub async fn get_task(&self, task_id: &str) -> Option<Task> {
-        self.get_task_checked(task_id).await.unwrap_or_default()
+        cog_core::logged_default!(self.get_task_checked(task_id).await)
     }
 
     /// 同一行，但把读失败留成错误。
@@ -4402,7 +4390,7 @@ impl DagExecutor {
     }
 
     pub async fn get_dependents(&self, task_id: &str) -> Option<Vec<Task>> {
-        self.dependents_checked(task_id).await.unwrap_or_default()
+        cog_core::logged_default!(self.dependents_checked(task_id).await)
     }
 
     /// 同一份名单，但保留读失败。
@@ -4433,7 +4421,7 @@ impl DagExecutor {
     }
 
     pub async fn get_dependencies(&self, task_id: &str) -> Option<Vec<Task>> {
-        self.dependencies_checked(task_id).await.unwrap_or_default()
+        cog_core::logged_default!(self.dependencies_checked(task_id).await)
     }
 
     /// 同一份名单，但保留读失败。理由同 [`Self::dependents_checked`]：旧读把
@@ -4465,7 +4453,7 @@ impl DagExecutor {
     }
 
     pub async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>) {
-        self.graph_checked().await.unwrap_or_default()
+        cog_core::logged_default!(self.graph_checked().await)
     }
 
     /// 同一张图，但保留读失败。
@@ -4543,10 +4531,9 @@ impl DagExecutor {
     /// Get retry history for a task.
     pub async fn get_retry_history(&self, task_id: &str) -> Option<Vec<RetryAttempt>> {
         if let Some(be) = self.fg() {
-            return be
-                .dag_get_retry_history(&self.workspace_id, task_id)
-                .await
-                .ok();
+            return cog_core::logged_ok!(
+                be.dag_get_retry_history(&self.workspace_id, task_id).await
+            );
         }
         let inner = self.inner.read().await;
         inner.retry_history.get(task_id).cloned()
@@ -5061,7 +5048,8 @@ fn name_unclosable_kinds(unclosable: &std::collections::BTreeMap<String, Vec<Str
         if named.insert(kind.clone()) {
             // The first few are enough to go and look; a kind with hundreds
             // would otherwise put the same text on one line forever.
-            // cap: bound — 前几行够照着去查；行数本身在同一条日志里另印（rows=），
+            // cap: fixed — 前几行够照着去查；行数本身在同一条日志里另印（rows=），
+            // keep: 删掉后日志把整段行打出来，判词被行内容淹没；由「前几行够照着去查」兜住
             // 截断不丢事实，只丢重复
             const NAMED_ROWS: usize = 5;
             let shown: Vec<&str> = ids.iter().take(NAMED_ROWS).map(String::as_str).collect();
@@ -6134,17 +6122,16 @@ mod tests {
     /// 「名字一样」，是「人一样」。
     #[tokio::test]
     async fn the_same_person_taking_a_row_twice_keeps_their_number_on_it() {
-        let seats = Arc::new(crate::test_support::Seats::default());
         let task_id = "t-person";
         let first = cog_core::agent_id_for(task_id, cog_core::roles::PLANNER);
         let second = cog_core::agent_id_for(task_id, cog_core::roles::GENERATOR);
-        seats.assign_person(&first, "E0412").await.unwrap();
-        seats.assign_person(&second, "E0412").await.unwrap();
         assert_ne!(first, second, "这条用例的前提是两把椅子不是一个名字");
 
         let dag = DagExecutor::new("ws-person".into());
-        dag.attach_roster(seats);
-        dag.add_task(claimable(task_id)).await.unwrap();
+        let mut row = claimable(task_id);
+        // 这张图上这件活的负责人是 E0412：同一件活的每一把椅子都代表他。
+        row.agent_id = Some("E0412".into());
+        dag.add_task(row).await.unwrap();
 
         let claimed = dag.claim_task(task_id, &first).await.unwrap();
         assert_eq!(
@@ -6170,14 +6157,17 @@ mod tests {
     /// 工号不同就是另一个人：座位形认领按名册判，不按名字长得像判。
     #[tokio::test]
     async fn a_seat_of_another_person_cannot_take_an_owned_row() {
-        let seats = Arc::new(crate::test_support::Seats::default());
         let task_id = "t-owned";
-        let other = cog_core::agent_id_for(task_id, cog_core::roles::EVALUATOR);
-        seats.assign_person(&other, "E0455").await.unwrap();
+        // 另一件活上的椅子，负责人是 E0455——不是行上那位 E0412。
+        let other_task = "t-foreign";
+        let other = cog_core::agent_id_for(other_task, cog_core::roles::EVALUATOR);
 
         let dag = DagExecutor::new("ws-owned".into());
-        dag.attach_roster(seats);
+        let mut elsewhere = claimable(other_task);
+        elsewhere.agent_id = Some("E0455".into());
+        dag.add_task(elsewhere).await.unwrap();
         let mut task = claimable(task_id);
+        task.agent_id = Some("E0412".into());
         task.owner_unit = Some("E0412".to_string());
         dag.add_task(task).await.unwrap();
 
@@ -6191,12 +6181,11 @@ mod tests {
     /// 名册上还没有这一把座位时，不写负责人：读不到不是「他不是那个人」。
     #[tokio::test]
     async fn a_seat_without_a_person_leaves_the_row_unowned() {
-        let seats = Arc::new(crate::test_support::Seats::default());
         let task_id = "t-unbound";
         let seat = cog_core::agent_id_for(task_id, cog_core::roles::GENERATOR);
 
         let dag = DagExecutor::new("ws-unbound".into());
-        dag.attach_roster(seats);
+        // 这件活还没派给人。
         dag.add_task(claimable(task_id)).await.unwrap();
 
         let claimed = dag.claim_task(task_id, &seat).await.unwrap();

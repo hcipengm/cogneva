@@ -116,7 +116,7 @@ fn probe(behaviour: &str) -> Probe {
         std::process::id(),
         uuid::Uuid::new_v4()
     ));
-    let _ = std::fs::remove_file(&receipt);
+    cog_core::ignore_lost!(std::fs::remove_file(&receipt));
     let transport = StdioTransport::new(
         "sh",
         vec!["-c".to_string(), STUB.to_string()],
@@ -135,7 +135,7 @@ fn probe(behaviour: &str) -> Probe {
 
 /// Every line the stub read, in the order it read them.
 fn received(receipt: &Path) -> Vec<serde_json::Value> {
-    let text = std::fs::read_to_string(receipt).unwrap_or_default();
+    let text = std::fs::read_to_string(receipt).unwrap_or(Default::default());
     text.lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {

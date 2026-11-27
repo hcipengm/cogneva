@@ -37,6 +37,7 @@ export type ActivityId =
   | 'output'
   | 'observability'
   | 'token'
+  | 'keys'
   | 'resources'
   | 'storage'
   | 'eval'
@@ -66,6 +67,7 @@ export const VIEW_TITLES: Record<ActivityId, string> = {
   output: '产出',
   observability: '观测',
   token: 'Token',
+  keys: '密钥',
   resources: '资源',
   storage: '存储',
   search: '搜索',

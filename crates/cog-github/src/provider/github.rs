@@ -20,13 +20,16 @@ use crate::provider::{
 };
 
 /// Max failed jobs whose logs are fetched per run.
-// cap: bound — 一次运行最多抓几条失败 job 的日志
+// cap: fixed — 一次运行最多抓几条失败 job 的日志
+// keep: 删掉后一次运行抓任意多条失败 job 的日志，响应无界；由「一次运行最多抓几条」兜住
 const MAX_FAILED_JOBS: usize = 5;
 /// Max bytes of log kept per job (tail).
-// cap: bound — 每条 job 保留的日志尾巴上限
+// cap: fixed — 每条 job 保留的日志尾巴上限
+// keep: 删掉后每条 job 的日志尾巴无界，一次运行的响应被一条 job 撑破；由「每条 job 保留的日志尾巴上限」兜住
 const MAX_JOB_LOG_BYTES: usize = 16 * 1024;
 /// Max total bytes of logs returned per run.
-// cap: bound — 一次运行返回的日志总量上限
+// cap: fixed — 一次运行返回的日志总量上限
+// keep: 删掉后一次运行返回的日志总量无界；由「一次运行返回的日志总量上限」兜住
 const MAX_TOTAL_LOG_BYTES: usize = 80 * 1024;
 
 /// What one commit's check runs say: whether the platform reported any at all,
@@ -440,7 +443,7 @@ impl CodePlatformProvider for GitHubProvider {
         }
 
         // 网关模式本进程零 token：凭证由透传端点出口注入；直连模式才解析。
-        let token = self.account.resolve_token().ok();
+        let token = cog_core::logged_ok!(self.account.resolve_token());
         if token.is_none() && self.api_base.is_none() {
             tracing::warn!("no github token and no gateway api_base; CI job logs unavailable");
             return Ok(Vec::new());
@@ -947,7 +950,7 @@ mod tests {
                 }
                 response.push_str("\r\n");
                 response.push_str(&body);
-                let _ = socket.write_all(response.as_bytes()).await;
+                cog_core::ignore_lost!(socket.write_all(response.as_bytes()).await);
             }
         });
         (base, asked)
@@ -997,7 +1000,7 @@ mod tests {
     fn gateway_provider(base: &str) -> GitHubProvider {
         // 测试进程不走 main.rs，rustls 无进程级默认 CryptoProvider，
         // 构建 HTTPS client 会 panic——测试内自行安装（幂等）。
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        cog_core::ignore_lost!(rustls::crypto::ring::default_provider().install_default());
         let account = GitHubAccount::Bot(crate::config::BotAccount {
             username: "bot".into(),
             token_env: Some("COG_TEST_DEFINITELY_UNSET_TOKEN".into()),
@@ -1157,7 +1160,7 @@ mod tests {
     async fn gateway_mode_builds_without_token() {
         // 测试进程不走 main.rs，rustls 无进程级默认 CryptoProvider，
         // 构建 HTTPS client 会 panic——测试内自行安装（幂等）。
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        cog_core::ignore_lost!(rustls::crypto::ring::default_provider().install_default());
         let account = GitHubAccount::Bot(crate::config::BotAccount {
             username: "bot".into(),
             token_env: Some("COG_TEST_DEFINITELY_UNSET_TOKEN".into()),

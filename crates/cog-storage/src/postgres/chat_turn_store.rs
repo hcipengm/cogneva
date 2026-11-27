@@ -500,6 +500,7 @@ impl ChatTurnStore for PostgresChatTurnStore {
 /// character and produce text that no longer says what it said.
 fn title_of(first_line: &str) -> String {
     // cap: fixed — a list row's width, not a resource bound: the whole first line
+    // keep: 删掉后列表一行放不下第一句，读者只看到半行；由「一行是一整句开头的宽度」兜住
     // stays in the transcript and is one click away.
     const MAX_CHARS: usize = 60;
     let mut title: String = first_line

@@ -46,6 +46,7 @@ pub mod pending_changes;
 pub mod plugin;
 pub mod provider;
 pub mod redrive_budget;
+pub mod route;
 pub mod triage;
 pub mod webhook;
 

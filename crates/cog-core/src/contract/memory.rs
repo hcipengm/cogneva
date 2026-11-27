@@ -19,7 +19,8 @@ use uuid::Uuid;
 /// The `importance` field on each entry type stays a plain `f32` in
 /// `0.0..=1.0`, because that is what consumers sort on, and a bounded float
 /// needs no conversion at the point of use.
-// cap: bound — 消费者按 0.0..=1.0 排序，有界浮点在使用点不需要转换
+// cap: fixed — 消费者按 0.0..=1.0 排序，有界浮点在使用点不需要转换
+// keep: 删掉后评分域没有上界，消费者使用点每次都要转换；由「0.0..=1.0 排序」兜住
 pub const IMPORTANCE_RATING_MAX: u8 = 10;
 
 /// Place a rating on the shared importance scale, clamping it into range.
@@ -167,7 +168,8 @@ pub fn tool_call_raw_id(owner: &str, run_millis: i64, turn: u32, frame: u32) -> 
 /// With the timestamp and random segments alongside it the whole key stays far
 /// below the file system's `NAME_MAX` (255 bytes), while the prefix is still
 /// long enough for a listing to show where an entry came from.
-// cap: bound — 落在文件系统 NAME_MAX（255 字节）之下，而前缀仍长到让一次列表看得出条目来自哪里
+// cap: fixed — 落在文件系统 NAME_MAX（255 字节）之下，而前缀仍长到让一次列表看得出条目来自哪里
+// keep: 删掉后回到「落在文件系统 NAME_MAX（255 字节）之下，而前缀仍长到让一次列表看得出条目来自哪里」所描述的情形；由这条约定兜住
 pub const RAW_ID_SLUG_MAX: usize = 64;
 
 /// Fold any source name into something safe to put in an object key: ASCII

@@ -1020,7 +1020,8 @@ pub const PROSE_ONLY: usize = 256;
 // cap: bound
 pub const A_LABEL: usize = 8;
 
-// cap: bound — 一小时：值得归因的构建跑几十分钟，更短会把一次构建显示成一串小的
+// cap: fixed — 一小时：值得归因的构建跑几十分钟，更短会把一次构建显示成一串小的
+// keep: 删掉后回到「一小时：值得归因的构建跑几十分钟，更短会把一次构建显示成一串小的」所描述的情形；由这条约定兜住
 pub const EXPLAINED: usize = 3600;
 
 pub const UNMARKED: usize = 4;
@@ -1067,7 +1068,7 @@ pub const FOLLOWS_A_READING: usize = 16;
         "a marker with no reason on it went unreported, either because the prose \
          above counted as one or because the marker was never read"
     );
-    std::fs::remove_dir_all(&root).ok();
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }
 
 /// The scan's two easy failures both read as green, so both are pinned: a scan
@@ -1136,7 +1137,7 @@ const PLAIN: u64 = 30;
     assert_eq!(value_of("BARE").as_deref(), Some("7s"));
     assert_eq!(value_of("QUALIFIED").as_deref(), Some("250ms"));
     assert_eq!(value_of("PLAIN").as_deref(), Some("30"));
-    std::fs::remove_dir_all(&root).ok();
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }
 
 /// A multiplier, an offset or a unit conversion inside the initializer is a
@@ -1175,7 +1176,7 @@ const SAME: u64 = OTHER;
     );
     assert_eq!(value_of("UNITS").as_deref(), Some("NAMES.len() + 1"));
     assert_eq!(value_of("SAME"), None);
-    std::fs::remove_dir_all(&root).ok();
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }
 
 /// A constant declared after an inline test module is production, and the scan
@@ -1216,7 +1217,7 @@ const AFTER: u64 = 45;
         .map(|row| row.name)
         .collect();
     assert_eq!(names, vec!["AFTER".to_string(), "BEFORE".to_string()]);
-    std::fs::remove_dir_all(&root).ok();
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }
 
 /// 一张数字表也是常量，也必须有判词——它不能借「类型不是标量」这件事溜出登记表。
@@ -1365,6 +1366,7 @@ fn the_array_guard_names_the_table_and_not_the_word_list() {
     std::fs::create_dir_all(&src).unwrap();
     let fixture = r#"
 // cap: fixed — 夹具：这一行的判词属于它下面那张表
+// keep: 删掉后回到「夹具：这一行的判词属于它下面那张表」所描述的情形；由这条约定兜住
 const RUNGS: [u64; 3] = [
     100,
     200,
@@ -1403,7 +1405,7 @@ mod tests {
     assert_eq!(rows[0].source, "fixed");
     assert!(rows[0].note.starts_with("夹具"));
     assert_eq!(rows[1].source, "");
-    std::fs::remove_dir_all(&root).ok();
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }
 
 // ---------------------------------------------------------------------------
@@ -1989,7 +1991,7 @@ fn below_the_module() -> Duration {
         "a test or fixture file was counted as production hardcoding: {:?}",
         scanned.keys().collect::<Vec<_>>()
     );
-    std::fs::remove_dir_all(&root).ok();
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }
 
 /// 界形的常量不许标成 `fixed`。
@@ -2059,7 +2061,7 @@ fn a_bound_shaped_constant_is_never_fixed() {
     let new: Vec<&String> = flagged
         .iter()
         .filter(|line| {
-            let name = line.split_whitespace().nth(1).unwrap_or_default();
+            let name = line.split_whitespace().nth(1).unwrap_or(Default::default());
             !known.contains(name)
         })
         .collect();

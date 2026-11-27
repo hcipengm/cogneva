@@ -32,6 +32,7 @@ pub use cog_core::contract::dataset::{
     DatasetCheck, DatasetEntry, DatasetOutcome, DatasetStore, DatasetVerification, DatasetWrite,
 };
 pub mod append_pressure;
+pub mod append_pressure_watch;
 pub mod etcd;
 pub mod event_filter;
 pub mod event_stream_census;
@@ -44,6 +45,7 @@ pub mod projection_readers;
 pub mod raw;
 #[cfg(feature = "s3")]
 pub mod s3;
+pub mod swap_stage;
 pub mod table_shapes;
 pub mod tier;
 pub mod wal;
@@ -126,6 +128,7 @@ pub use migrate::{
     MigrationStatus, Migrator,
 };
 
+pub use append_pressure_watch::StoragePressureWatch;
 pub use checkpoint_cap::{CheckpointCap, CheckpointReading};
 pub use db_surface::{DatabaseSurface, DbSurfaceReading};
 pub use dlq::MemoryDeadLetterQueue;
@@ -140,6 +143,9 @@ pub use partition_maintainer::PartitionMaintainer;
 pub use task_event_retention::{TaskEventRetention, TaskEventRetentionOutcome};
 
 pub mod plugin;
+
+/// 按 `providers.storage` 造对象后端：重建命令与插件走同一个构造。
+pub use plugin::build_object_backend;
 
 /// The label naming where a reading's value came from.
 ///
@@ -187,3 +193,55 @@ pub fn log_file_stem(day: chrono::NaiveDate) -> String {
 pub const LABEL_KIND: &str = "kind";
 /// 见 [`LABEL_KIND`]。
 pub const LABEL_VERSION: &str = "version";
+/// 见 [`LABEL_KIND`]：这一格回答的是领域事实还是遥测。
+pub const LABEL_CLASS: &str = "class";
+
+/// 从流重建任务定义账：只读 `task_defined` 事件，重放每一版。
+///
+/// 不给 `task_id` 就是整本。`task_defined` 表是投影——删掉它，这一条能把行拼回来；
+/// 反过来拼不回来，这正是「流是正本」的意思。
+pub async fn rebuild_task_definitions(
+    pool: &sqlx::PgPool,
+    task_id: Option<&str>,
+) -> Result<u64, cog_core::SFError> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| cog_core::SFError::Database(format!("acquire a connection: {e}")))?;
+    postgres::task_ledger::rebuild_definitions(&mut conn, task_id).await
+}
+
+/// 从流重建原则账的状态几格：每条原则最后一次被判成什么。
+pub async fn rebuild_principle_states(pool: &sqlx::PgPool) -> Result<u64, cog_core::SFError> {
+    postgres::principle_ledger_store::rebuild_states(pool).await
+}
+
+/// 从流重建原则声明：每个 `(slug, source)` 取最后一条 `principle_declared`。
+pub async fn rebuild_principle_declarations(pool: &sqlx::PgPool) -> Result<u64, cog_core::SFError> {
+    postgres::principle_ledger_store::rebuild_declarations(pool).await
+}
+
+/// 一段会话在流上的样子：谁说的、什么时刻、正文。
+pub use postgres::dialogue::{dialogue_for_session, DialogueLine};
+
+/// 从流重建变更账：每个身份取最后一条 `change_judged`。
+pub async fn rebuild_change_ledger(pool: &sqlx::PgPool) -> Result<u64, cog_core::SFError> {
+    postgres::change_ledger_store::rebuild_from_events(pool).await
+}
+
+pub use postgres::change_candidate_store::{candidate_divergence, CandidateDivergence};
+pub use postgres::change_ledger_store::{
+    change_ledger_divergence, diff_change_accounts, fold_change_account, fold_change_account_from,
+    project_change_ledger_incremental, read_table_account, ChangeDivergence, FoldedChangeAccount,
+    FoldedCitation,
+};
+pub use postgres::item_events::item_definition;
+pub use postgres::key_events::{keys, KeyEventStore};
+pub use postgres::landing_states::{landing_states, LandingStateRow, PostgresLandingFacts};
+pub use postgres::llm_call_events::{cache_miss_breaks, CacheMissClass};
+pub use postgres::redaction_read::{redactions_for, RedactionRecord};
+pub use postgres::task_ledger::{lease_from_stream, LeaseReading};
+pub use postgres::terminal_revisions::{terminal_revisions_for, PostgresTerminalRevisions};
+
+/// 从流重建一段会话的 `chat_turns`：轮的根是意图事件，因果字段是分组。
+pub use postgres::chat_turn_rebuild::rebuild_chat_turns;

@@ -197,7 +197,8 @@ impl CheckpointAgents for LiveCheckpointAgents {
 /// 它同时是循环向存活体系申报工期界的原料（见
 /// [`cog_core::loop_health::Cadence::PeriodicWithWork`]）：申报的值由真正施加
 /// 该判断的对象推导，调它会带着告警的墙一起动。
-// cap: bound — 只决定「超过多久说一声」；过点之后继续等，从不丢弃仍在跑的步
+// cap: fixed — 只决定「超过多久说一声」；过点之后继续等，从不丢弃仍在跑的步
+// keep: 删掉后一步超过预期没有说一声的时刻，读者以为它挂了；由「过点之后继续等，不丢弃仍在跑的步」兜住
 pub const CHECKPOINT_STEP_EXPECTATION: Duration = Duration::from_secs(15);
 
 /// 等一次检查点动作到它自己结束；过了 `expectation` 就发一条告警，继续等。

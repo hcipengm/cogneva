@@ -284,6 +284,7 @@ main() {
       rc=$?
       say "the loop exited rc=$rc; report skipped-leg=$(report_leg); rechecking in 60s"
     fi
+    # not-a-bound: 等待外部状态收敛/轮询的让路节拍——它决定多久看一次，不结束任何活
     sleep 60
   done
   say "horizon reached; stopping (judged=$(( $(lines) - 1 )))"

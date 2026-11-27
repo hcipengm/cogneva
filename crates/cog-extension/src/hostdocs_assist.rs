@@ -46,11 +46,13 @@ pub const ASSIST_MAX_CANDIDATES_ENV: &str = "HOST_DOCS_ASSIST_MAX_CANDIDATES";
 /// A body is evidence of what a file is, not the whole of it: a couple of kilobytes of a
 /// text file name the subject as well as the whole file does, and the cost of the call
 /// grows with every byte of it.
-// cap: bound — 几 KB 正文足以说明这是什么文件，不必整份
+// cap: fixed — 几 KB 正文足以说明这是什么文件，不必整份
+// keep: 删掉后回到「几 KB 正文足以说明这是什么文件，不必整份」所描述的情形；由这条约定兜住
 pub const DEFAULT_ASSIST_MAX_BODY_BYTES: usize = 2048;
 /// Past a few dozen unclassified files, the folder is telling the operator something about
 /// the rule table rather than about the files.
-// cap: bound — 几十个未分类文件说明的是规则表的问题，不是这些文件的问题
+// cap: fixed — 几十个未分类文件说明的是规则表的问题，不是这些文件的问题
+// keep: 删掉后一个全是陌生文件的目录会把每个都送上模型，把规则表的问题读成文件的问题并烧掉一次调用；由「几十个未分类就是规则表的问题」兜住
 pub const DEFAULT_ASSIST_MAX_CANDIDATES: usize = 50;
 
 /// The two numbers one question runs under, and how they were reached.
@@ -203,7 +205,8 @@ pub fn truncate_to_wire(body: &str, max_wire_bytes: usize) -> (&str, bool) {
 }
 /// An answer to one question. Long enough for a slow upstream, short enough that a run
 /// cannot hang on a channel that accepted the connection and then went quiet.
-// cap: bound — 一次问答的墙：够慢上游，又不至于挂在接了连接不说话的通道上
+// cap: fixed — 一次问答的墙：够慢上游，又不至于挂在接了连接不说话的通道上
+// keep: 删掉后接了连接却不说话的通道会让一次问答永远挂着，运行跟着挂；由「够慢上游又不至于挂住」兜住
 // wall: 等=上游对一次问答的答复 / 等不到=这次问答按失败收尾，不产出半份建议；接了连接不说话的通道不会一直挂着 / 续跑=能，重来是一次新的问答
 const REQUEST_TIMEOUT_SECS: u64 = 120;
 
@@ -273,7 +276,7 @@ impl AuditedChannel {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .build()
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         Self { url, http }
     }
 

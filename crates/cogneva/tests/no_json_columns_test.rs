@@ -270,6 +270,10 @@ fn scan(file: &str, text: &str, out: &mut BTreeSet<String>) {
     }
     let mut table: Option<String> = None;
     let mut inside = false;
+    // 一条 `ALTER TABLE` 可以跨很多行：第一行只有表名，列名在后续的行上。
+    // 只读第一行时，「同一行里有没有 add column」把多行写法整段漏掉——而迁移
+    // 里多行写法正是常态（`124` 的 `round_batch JSONB` 就是这样漏进树里的）。
+    let mut alter_cont = false;
     let mut depth: i32 = 0;
     for line in text.lines() {
         let lower = line.to_ascii_lowercase();
@@ -295,6 +299,8 @@ fn scan(file: &str, text: &str, out: &mut BTreeSet<String>) {
                 .trim_matches('"');
             table = Some(name.to_string());
             inside = false;
+            // 语句没在这一行收尾，后面的续行仍属于这张表。
+            alter_cont = !line.trim_end().ends_with(';');
             let line_lower = line.to_ascii_lowercase();
             if let Some(rest) = line_lower
                 .split_once("add column if not exists ")
@@ -303,6 +309,23 @@ fn scan(file: &str, text: &str, out: &mut BTreeSet<String>) {
                 if let Some(column) = column_type(rest) {
                     out.insert(format!("{file}:{}.{column}", name.trim_matches('"')));
                 }
+            }
+            continue;
+        }
+        // `ALTER TABLE` 的续行：同样是这张表上的一列，只是换了一行写。
+        if alter_cont {
+            if let Some(name) = &table {
+                let lower = line.to_ascii_lowercase();
+                let rest = lower.trim_start();
+                let rest = rest
+                    .strip_prefix("add column if not exists ")
+                    .unwrap_or(rest);
+                if let Some(column) = column_type(rest) {
+                    out.insert(format!("{file}:{}.{column}", name.trim_matches('"')));
+                }
+            }
+            if line.trim_end().ends_with(';') {
+                alter_cont = false;
             }
             continue;
         }
@@ -348,4 +371,56 @@ fn column_type(line: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod multi_line_alter_tests {
+    use super::scan;
+    use std::collections::BTreeSet;
+
+    /// 多行 `ALTER TABLE` 的续行上新增的 jsonb 列要被读到。
+    ///
+    /// 这条普查原先只看 `ALTER TABLE` 那一行里有没有 `add column`；迁移里的
+    /// 常态写法是表名一行、列定义在随后几行，于是 `124` 的 `round_batch JSONB`
+    /// 整段漏过，门是绿的。红的必须是被读到的那一列，不是「文件里有 JSON 这个词」。
+    #[test]
+    fn a_json_column_added_on_a_continuation_line_is_counted() {
+        let sql = "\
+ALTER TABLE cogneva_event
+    ADD COLUMN IF NOT EXISTS ledger_rev TEXT,
+    ADD COLUMN IF NOT EXISTS round_batch JSONB GENERATED ALWAYS AS (attributes::jsonb -> 'batch') STORED;
+";
+        let mut out = BTreeSet::new();
+        scan("m.sql", sql, &mut out);
+        assert!(
+            out.iter().any(|row| row.contains("round_batch")),
+            "续行上的 jsonb 列没被读到：{out:?}"
+        );
+        assert!(
+            !out.iter().any(|row| row.contains("ledger_rev")),
+            "text 列被读成了 json：{out:?}"
+        );
+    }
+
+    /// 一条 `ALTER TABLE` 收尾之后，后面的语句不该被当成本表的续行。
+    #[test]
+    fn a_statement_after_the_alter_does_not_become_its_rows() {
+        let sql = "\
+ALTER TABLE t
+    ADD COLUMN IF NOT EXISTS a TEXT;
+CREATE TABLE other (b TEXT);
+ALTER TABLE other
+    ADD COLUMN IF NOT EXISTS c JSON;
+";
+        let mut out = BTreeSet::new();
+        scan("m.sql", sql, &mut out);
+        assert!(
+            out.iter().any(|row| row.contains("other.c")),
+            "第二条 ALTER 的列没读到：{out:?}"
+        );
+        assert!(
+            !out.iter().any(|row| row.contains("t.c")),
+            "第二条 ALTER 的列被记到了上一张表上：{out:?}"
+        );
+    }
 }

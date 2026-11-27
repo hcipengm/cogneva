@@ -9,7 +9,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // CryptoProvider，首次 TLS 调用会 panic——必须在任何 TLS 使用之前安装。
     // install_default 仅在本进程已装过 provider 时返回 Err；那同样是可用的
     // provider，因此忽略结果，不阻断启动。
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    cog_core::ignore_lost!(rustls::crypto::ring::default_provider().install_default());
 
     // 构建标签加 git 修订，唯一标识本进程跑的代码状态：一条只告实例的
     // 告警（如 background_loop_stalled 按 loop 名、按 pod 各自判定）要能
@@ -80,6 +80,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| format!("HTTP 客户端造不出来: {e}"))?;
             Ok(std::sync::Arc::new(client) as std::sync::Arc<dyn cog_core::HttpClient>)
         });
+    }
+
+    // 原则语料：配置了三样（包 key、原文哈希、发布公钥）就装载；装不成就空着
+    // 启动——生成侧拿不到未经验签的内容，这是失败关闭。
+    if matches!(command, Command::Run | Command::SecurityGateway) {
+        match cogneva::principle_corpus::load_and_install().await {
+            Ok(Some(count)) => tracing::info!(principles = count, "principle bundle loaded"),
+            Ok(None) => tracing::info!("no principle bundle configured"),
+            Err(error) => tracing::error!(
+                error = %error,
+                "principle bundle refused; the generator starts without one"
+            ),
+        }
     }
 
     match command {
@@ -177,7 +190,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::SandboxExecutor => cog_extension::command_server::run_from_env().await,
         // 卷占用走查：挂在只由第三方进程写入的卷上的边车，把该卷的盘上字节发布成
         // 卷族序列（deploy/k3s/cluster-registry.yaml 的 volume-walker 容器）。
-        Command::BatchEdit => cog_orchestrator::batch_edit::run_from_env().await,
+        // 生成侧在装配层：agent、工具、模型入口都由这里与主应用同一套构造函数造出来，
+        // 产品自己那条路（`cog_orchestrator::batch_edit`）只留判词、组请求与循环。
+        Command::BatchEdit => cogneva::batch_edit_agent::run_from_env().await,
+        Command::ChatRebuild => cogneva::chat_rebuild::run_from_env().await,
+        Command::RosterRebuild => cogneva::roster_rebuild::run_from_env().await,
+        Command::ArchiveEvents => cogneva::archive_events::run_from_env().await,
+        Command::Keys => cogneva::keys::run_from_env().await,
+        Command::TableCensus => cogneva::table_census::run_from_env(),
+        Command::ChangeDivergence => cogneva::change_divergence::run_from_env().await,
+        Command::ChangeLedgerParity => cogneva::change_ledger_parity::run_from_env().await,
+        Command::CacheMisses => cogneva::cache_misses::run_from_env().await,
+        Command::CellPlan => cogneva::cell_plan::run_from_env(),
+        Command::BuildPlans => cogneva::build_plan_readings::run_from_env().await,
+        Command::LandingStates => cogneva::landing_states::run_from_env().await,
+        Command::TableDigest => cogneva::table_digest::run_from_env().await,
+        Command::TableDiff => cogneva::table_digest::diff_from_env().await,
+        Command::TableCopy => cogneva::table_copy::run_from_env().await,
+        Command::TableSwap => cogneva::table_swap::run_from_env().await,
+        Command::DbPressure => cogneva::db_pressure::run_from_env().await,
+        // 判词的退出码就是结局：0 没事、2 该切、3 判了一半（「量不到」不许读成「没事」）。
+        Command::StoragePressure => {
+            let code = cogneva::storage_pressure::run_from_env().await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Command::UsageParity => cogneva::usage_parity::run_from_env().await,
         Command::BatchPlan => cog_orchestrator::batch_plan::run_from_stdin().await,
         Command::Ledger => {
             // 开轮之前先让平台的批计划器判这一批（流程第 4 步）：定批是固定程序，

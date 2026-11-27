@@ -714,7 +714,7 @@ pub async fn read(state: &GatewayState) -> Workbench {
         }
     };
 
-    let tasks = crate::progress::merged_tasks(state).await.ok();
+    let tasks = cog_core::logged_ok!(crate::progress::merged_tasks(state).await);
     let plans = crate::projects::readable_plans(&state.orchestrator).await;
 
     let changes = match state.change_ledger.as_ref() {

@@ -141,6 +141,7 @@ fn a_branch(branch_id: u32) -> PgeBranchResult {
     PgeBranchResult {
         branch_id,
         plan: PlannerOutput {
+            definition: None,
             summary: format!("plan {branch_id}"),
             plan: serde_json::json!({}),
             sub_tasks: Vec::new(),
@@ -569,7 +570,9 @@ async fn a_handed_back_change_carries_the_files_the_gate_named() {
     );
     // The list is data, so the model also has to be told what it means and that
     // it is not a hint to search for.
-    let instructions = parsed["instructions"].as_str().unwrap_or_default();
+    let instructions = parsed["instructions"]
+        .as_str()
+        .unwrap_or(Default::default());
     assert!(
         instructions.contains("must appear in your targets"),
         "the file list arrived without the rule that makes it a requirement: {contract}"
@@ -636,7 +639,9 @@ async fn a_path_refusal_hands_the_planner_paths_to_stay_out_of() {
         parsed.get("required_targets").is_none(),
         "a path the change may not touch was handed over as a required target: {contract}"
     );
-    let instructions = parsed["instructions"].as_str().unwrap_or_default();
+    let instructions = parsed["instructions"]
+        .as_str()
+        .unwrap_or(Default::default());
     assert!(
         !instructions.contains("must appear in your targets"),
         "the refused path arrived with the rule that says to touch it: {contract}"

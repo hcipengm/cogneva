@@ -84,6 +84,7 @@ impl std::fmt::Debug for LLMBackendConfig {
 /// 权重是份额，不是可以调的档位——一份就是「和其他后端一样多」，只有运维给了
 /// 不同份额时它才不是一。
 // cap: fixed — 份额的单位：一份就是均分
+// not-a-bound: 份额的单位：一份就是均分
 pub const EQUAL_WEIGHT: u32 = 1;
 
 impl Default for LLMBackendConfig {
@@ -197,6 +198,6 @@ mod tests {
         let dbg = format!("{:?}", r.backends[0]);
         assert!(!dbg.contains("sk-secret"));
         assert_eq!(TuningConfig::load_from(&path).unwrap().stream_capacity, 64);
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 }

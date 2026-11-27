@@ -1,13 +1,9 @@
 use std::time::Duration;
 
-/// Default per-hook execution timeout (30 seconds).
-// cap: bound — 单条钩子的默认执行上限：钩子是同步跑的，超时它就是在拖慢这一回合
-// wall: 等=一条钩子的子进程退出 / 等不到=这条钩子读作失败并被杀掉，它的结论不参与这一次调用；钩子自己写下的东西不在这一格里 / 续跑=能，下一次调用会再跑一次这条钩子，但从头跑
-pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// Default deduplication window (1 second).  Identical events fired inside the
 /// window are coalesced — only the first one runs the action.
-// cap: bound — 一秒内的重复事件被合并成一次；窗口再长就会把真正相隔很近的两件不同的事吞成一件
+// cap: fixed — 一秒内的重复事件被合并成一次；窗口再长就会把真正相隔很近的两件不同的事吞成一件
+// keep: 删掉后重复事件被交付两遍，同一件事做两次；由「一秒内的重复合并」兜住
 pub const DEFAULT_DEDUP_WINDOW: Duration = Duration::from_secs(1);
 
 /// The Redis stream a user's notifications are published to, before the user
@@ -69,7 +65,7 @@ mod tests {
             rate_limit: None,
             timeout_ms: None,
         };
-        assert_eq!(def.timeout(), DEFAULT_HOOK_TIMEOUT);
+        assert_eq!(def.timeout(), None);
     }
 
     #[test]
@@ -91,7 +87,7 @@ timeout_ms: 5000
         assert_eq!(def.id, "notify-completed");
         assert_eq!(def.trigger, HookTrigger::OnTaskComplete);
         assert!(matches!(def.action, HookAction::Webhook { .. }));
-        assert_eq!(def.timeout(), Duration::from_millis(5000));
+        assert_eq!(def.timeout(), Some(Duration::from_millis(5000)));
         assert_eq!(def.scope, HookScope::Global, "scope defaults to Global");
         assert!(def.crew_id_filter.is_none());
         assert!(def.squad_id_filter.is_none());

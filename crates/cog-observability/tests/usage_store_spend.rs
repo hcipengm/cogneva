@@ -35,6 +35,8 @@ async fn the_money_read_splits_by_price_book_and_keeps_unpriced_calls_countable(
     let upstream = format!("spend-test:{}", uuid::Uuid::new_v4());
 
     let record = |book: Option<&str>, micros: Option<i64>, cached: u64| LlmUsageRecord {
+        finish_reason: None,
+        ttft_ms: None,
         refused_scope: None,
         upstream: upstream.clone(),
         api_style: "openai".to_string(),
@@ -49,6 +51,8 @@ async fn the_money_read_splits_by_price_book_and_keeps_unpriced_calls_countable(
         tokens_reasoning: None,
         estimated_input: None,
         usage_outcome: None,
+        prompt_manifest: None,
+        prompt_dropped: None,
         cost_micros: micros,
         price_book: book.map(str::to_string),
         refusal_kind: None,
@@ -149,6 +153,8 @@ async fn the_session_read_folds_only_that_conversation() {
 
     let record = |session: Option<&str>, book: Option<&str>, micros: Option<i64>, cached: u64| {
         LlmUsageRecord {
+            finish_reason: None,
+            ttft_ms: None,
             refused_scope: None,
             upstream: upstream.clone(),
             api_style: "openai".to_string(),
@@ -163,6 +169,8 @@ async fn the_session_read_folds_only_that_conversation() {
             tokens_reasoning: None,
             estimated_input: None,
             usage_outcome: None,
+            prompt_manifest: None,
+            prompt_dropped: None,
             cost_micros: micros,
             price_book: book.map(str::to_string),
             refusal_kind: None,

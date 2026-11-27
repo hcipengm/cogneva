@@ -444,7 +444,7 @@ pub(crate) fn spawn_command(
                         super::cgroup::record_oom_kill(facts.limit_bytes, facts.peak_bytes);
                     }
                     let data = signal_death_note(sig, &facts, oom);
-                    let _ = tx.send(CommandEvent::Stderr { data }).await;
+                    cog_core::ignore_lost!(tx.send(CommandEvent::Stderr { data }).await);
                     128 + sig
                 }
                 (None, None) => -1,
@@ -453,7 +453,7 @@ pub(crate) fn spawn_command(
             None => {
                 // 看门狗已经按实测的静默窗口判过、并且把整个组 kill 了（见上看门狗）。
                 // 这里只负责把判词交出去：两个实数都在里面，读的人能复算这次判定。
-                let (silent, window) = verdict.unwrap_or_default();
+                let (silent, window) = verdict.unwrap_or(Default::default());
                 let _ = tx
                     .send(CommandEvent::Stderr {
                         data: format!(
@@ -472,7 +472,7 @@ pub(crate) fn spawn_command(
             cage.close();
         }
         super::cgroup::record_cage(reading);
-        let _ = tx.send(CommandEvent::Exit { code }).await;
+        cog_core::ignore_lost!(tx.send(CommandEvent::Exit { code }).await);
     });
 
     Ok(rx)
@@ -999,7 +999,7 @@ mod tests {
             .unwrap();
         assert_eq!(missing.exit_code, 1);
         assert!(!missing.stderr.is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     #[tokio::test]

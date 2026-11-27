@@ -111,8 +111,9 @@ impl PostgresAuditRecorder {
 #[async_trait]
 impl GuardAuditRecorder for PostgresAuditRecorder {
     async fn record_input_check(&self, messages: &[Message], result: &GuardResult) {
-        let messages_json =
-            serde_json::to_string(&messages.iter().map(|m| m.content()).collect::<Vec<_>>()).ok();
+        let messages_json = cog_core::logged_ok!(serde_json::to_string(
+            &messages.iter().map(|m| m.content()).collect::<Vec<_>>()
+        ));
         self.insert(
             "composite",
             CheckType::Input,
@@ -139,7 +140,7 @@ impl GuardAuditRecorder for PostgresAuditRecorder {
     }
 
     async fn record_tool_check(&self, tool: &ToolCall, result: &GuardResult) {
-        let tool_json = serde_json::to_string(tool).ok();
+        let tool_json = cog_core::logged_ok!(serde_json::to_string(tool));
         self.insert(
             "composite",
             CheckType::ToolCall,

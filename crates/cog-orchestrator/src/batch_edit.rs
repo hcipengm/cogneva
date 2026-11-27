@@ -90,7 +90,11 @@ fn compose(root: &std::path::Path, missing: &[(String, String)]) -> String {
         out.push_str(&format!("## {id}\n{why}\n\n"));
     }
     out.push_str(&format!(
-        "# 树：{}\n# 要求：整批一次出 diff；工具结果不完备之前不许出。\n",
+        "# 树：{}\n\
+         # 要求：\n\
+         1. 先一次给出你需要的**全部**工具调用（读文件、搜索、跑只读命令），不要一条一条试；\n\
+         2. 工具结果不完备之前不许出改动；工具结果装不下时会以 `artifact://` 指针交回，按指针取全文，不要凭猜测补。\n\
+         3. 整批一次出 diff：这一批的每一条都在同一份改动里，不要分批交。\n",
         root.display()
     ));
     out
@@ -153,17 +157,48 @@ impl GeneratorCall for AgentCall {
 
 pub struct BatchGenerator {
     call: Arc<dyn GeneratorCall>,
+    /// 原则语料：只在启动时装进来一份索引；批次请求里按**要改的路径**取命中的那几条。
+    corpus: Option<Arc<cog_core::PrincipleBundle>>,
+}
+
+/// 把命中的原则与它们的门附在请求后面。一条都不命中就原样返回。
+fn with_principles(request: &str, corpus: Option<&cog_core::PrincipleBundle>) -> String {
+    let Some(corpus) = corpus else {
+        return request.to_string();
+    };
+    let paths = cog_core::paths_in(request);
+    let picked = cog_core::select_for_paths(corpus, &paths);
+    if picked.is_empty() {
+        return request.to_string();
+    }
+    let mut out = String::from(request);
+    out.push_str("\n\n## 适用原则（只列这一批路径命中的；每条附检查它的门）\n");
+    for item in picked {
+        out.push_str(&format!("- {}\n", item.lead));
+        out.push_str(&format!("  {}\n", item.body.trim()));
+        if let Some(gate) = item.host_gate.as_deref().or(item.where_red.as_deref()) {
+            out.push_str(&format!("  门：{gate}\n"));
+        }
+    }
+    out
 }
 
 impl BatchGenerator {
     pub fn new(call: Arc<dyn GeneratorCall>) -> Self {
-        Self { call }
+        Self { call, corpus: None }
+    }
+
+    /// 接上原则语料：装载在入口做，这里只读。
+    pub fn with_corpus(mut self, corpus: Arc<cog_core::PrincipleBundle>) -> Self {
+        self.corpus = Some(corpus);
+        self
     }
 
     /// 生产构造：把一个 agent 包成这次生成要的那一个调用。
     pub fn from_agent(agent: Arc<dyn cog_core::Agent>) -> Self {
         Self {
             call: Arc::new(AgentCall { agent }),
+            corpus: None,
         }
     }
 
@@ -174,7 +209,8 @@ impl BatchGenerator {
         batch: &BatchId,
         request: &str,
     ) -> cog_core::SFResult<serde_json::Value> {
-        self.call.call(batch, request).await
+        let request = with_principles(request, self.corpus.as_deref());
+        self.call.call(batch, &request).await
     }
 }
 
@@ -267,6 +303,19 @@ mod tests {
             "生成这一问没有带着这一批的名字：写下的调用事件归不到批"
         );
         assert_eq!(out["diff"], "for ## S1\n## S2\n## S3\n");
+    }
+
+    /// 请求里钉住整批编辑的三条：一次要全工具、零截断（指针取全文）、一次交齐。
+    #[test]
+    fn the_request_states_the_three_batch_edit_rules() {
+        let text = compose(
+            std::path::Path::new("/w"),
+            &[("S1".to_string(), "缺 x".to_string())],
+        );
+        for needle in ["**全部**工具调用", "artifact://", "整批一次出 diff"] {
+            assert!(text.contains(needle), "请求缺 {needle:?}：{text}");
+        }
+        assert!(text.contains("## S1"), "整批的每一条都要进请求：{text}");
     }
 
     /// 批号由 id 现算，与顺序无关，重复的 id 不产生第二个名字。
@@ -377,5 +426,45 @@ mod loop_tests {
             &seen,
             &[pair("S1", "测试在树里但点名的是别的用例")]
         ));
+    }
+}
+
+#[cfg(test)]
+mod principle_brief_tests {
+    use super::*;
+    use cog_core::{BundledPrinciple, PrincipleBundle};
+
+    fn principle(slug: &str, theme: &str, lead: &str, gate: &str) -> BundledPrinciple {
+        BundledPrinciple {
+            slug: slug.into(),
+            source: "list-principles.sh".into(),
+            lead: lead.into(),
+            carrier_path: "memory/x.md".into(),
+            carrier_sha256: "0".repeat(64),
+            host_gate: Some(gate.into()),
+            where_red: None,
+            check_kind: None,
+            priority: None,
+            themes: vec![theme.into()],
+            body: format!("{lead}的正文"),
+        }
+    }
+
+    #[test]
+    fn only_the_principles_matching_the_request_paths_are_appended() {
+        let corpus = PrincipleBundle {
+            version: cog_core::BUNDLE_VERSION,
+            built_at: "2026-11-25T00:00:00Z".into(),
+            principles: vec![
+                principle("hit", "crates/cog-agent/src", "上下文规则", "gate-a"),
+                principle("miss", "crates/cog-eval/src", "评测规则", "gate-b"),
+            ],
+        };
+        let request = "改 crates/cog-agent/src/context.rs 的裁剪";
+        let out = with_principles(request, Some(&corpus));
+        assert!(out.contains("上下文规则"), "{out}");
+        assert!(out.contains("gate-a"), "门要跟着原则一起给：{out}");
+        assert!(!out.contains("评测规则"), "没命中的原则不该出现：{out}");
+        assert_eq!(with_principles(request, None), request);
     }
 }

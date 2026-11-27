@@ -21,12 +21,14 @@ use sqlx::PgPool;
 /// Two, because the two layers are read concurrently and neither holds a
 /// connection between calls: one would serialise them, three would be a share
 /// taken from the serving pools for no measured gain.
-// cap: bound — 调用之间不共享连接：一条会把它们串起来，三条是从服务的池里白拿一份没有实测收益的份额
+// cap: fixed — 调用之间不共享连接：一条会把它们串起来，三条是从服务的池里白拿一份没有实测收益的份额
+// keep: 删掉后从服务池里白拿一份没有实测收益的份额；由「调用之间不共享连接」兜住
 pub const SUMMARY_POOL_CONNECTIONS: u32 = 2;
 
 /// How long a caller waits for one of those two connections before being told
 /// the database is busy.
-// cap: bound — 调用方等这两条连接这么久还拿不到，就被告知库忙
+// cap: fixed — 调用方等这两条连接这么久还拿不到，就被告知库忙
+// keep: 删掉后调用方一直等这两条连接，库忙不被看见；由「等这么久还拿不到就告知库忙」兜住
 // wall: 等=池里那两条连接之一 / 等不到=这次调用以「库忙」失败，没有半份摘要被写下去 / 续跑=能，下一次调用重新排队
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 

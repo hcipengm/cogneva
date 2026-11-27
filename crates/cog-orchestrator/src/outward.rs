@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use cog_core::contract::intent_events::{IntentEvents, IntentRow};
+use cog_core::contract::intent_events::IntentRow;
 use cog_core::observability::{DimensionSpec, Observable, RawMetric};
 use cog_core::{
     HttpClient, HttpRequest, OrchestratorControl, OwnerLeaseBroker, SFResult, ShutdownSignal, Task,
@@ -69,22 +69,26 @@ const SEARCH_BASE_ENV: &str = cog_core::WEB_SEARCH_BASE_ENV;
 /// the world this reads changes on the scale of releases and articles, and a
 /// tighter cadence would spend the same money to find the same items and have
 /// them deduplicated.
-// cap: bound — 被读的那件事按发布与文章变化，不按秒；更密的节奏买的是同一批条目
+// cap: fixed — 被读的那件事按发布与文章变化，不按秒；更密的节奏买的是同一批条目
+// keep: 删掉后节奏按秒去读一份按发布变化的东西，买的是同一批条目；由「被读的那件事不按秒变」兜住
 const DEFAULT_CADENCE_SECS: u64 = 6 * 60 * 60;
 /// How many results one source may hand over per pass. The backend returns its
 /// whole ranked list; an unbounded handover would turn one query into a day of
 /// work and bury everything else in the graph.
-// cap: bound — 一条查询变成一天的工作，图里其余的东西就都被埋了
+// cap: fixed — 一条查询变成一天的工作，图里其余的东西就都被埋了
+// keep: 删掉后一条查询变成一天的工作，图里其余的东西都被埋了；由「一条查询变一天的工作」兜住
 const DEFAULT_MAX_ITEMS: usize = 3;
 /// The backend runs inside this cluster, so a slow answer is a broken one: a
 /// request that needs longer than this is not going to be answered usefully,
 /// and holding the tick open costs every other source its turn.
-// cap: bound — SearXNG 就在集群里，三十秒还没答就是没在答
+// cap: fixed — SearXNG 就在集群里，三十秒还没答就是没在答
+// keep: 删掉后一个没在答的 SearXNG 把一轮挂住；由「三十秒还没答就是没在答」兜住
 // wall: 等=SearXNG 的回包 / 等不到=这一源这次没有结果，而整拍不停在它身上——别的源照常轮到自己 / 续跑=能，下一拍重新问
 const FETCH_TIMEOUT_SECS: u64 = 30;
 /// How much of a result's excerpt travels in the goal text. Enough to tell the
 /// taker whether it is worth opening; the URL is what they read when it is.
-// cap: bound — 够判断值不值得打开原文；要读细节的人去读 URL 那一页
+// cap: fixed — 够判断值不值得打开原文；要读细节的人去读 URL 那一页
+// keep: 删掉后摘录装不下，读者为了判断值不值得打开原文要读全文；由「够判断值不值得打开」兜住
 const EXCERPT_CHARS: usize = 600;
 /// The longest the loop sleeps between wakes, whatever its sources ask for.
 ///
@@ -97,7 +101,8 @@ const EXCERPT_CHARS: usize = 600;
 /// the loop reads as configured and permanently unexercised, and no reading ever
 /// says the outside world went unread. Waking sooner costs one timer, not one
 /// query -- each source is still only asked when its own cadence is due.
-// cap: bound — 一觉睡满一个节奏等于滚动比节奏快的部署里一次都不问
+// cap: fixed — 一觉睡满一个节奏等于滚动比节奏快的部署里一次都不问
+// keep: 删掉后一觉睡满一个节奏，滚动比节奏快的部署里一次都不问；由「一觉睡满一个节奏」兜住
 const WAKE_CEILING_SECS: u64 = 5 * 60;
 
 /// One subject to look for, and how often.
@@ -597,6 +602,21 @@ impl Observable for OutwardCensus {
     }
 }
 
+/// 交接交出去的那一行：已经发生的事实（收件台上有一行）与还差的那一件（结局）。
+///
+/// 三格由这里一次写全——没有三格的任务进不了完成判，那一段只能拿一段编出来的
+/// 终态去判。
+fn handover_row(id: &str, goal: &str) -> Task {
+    Task::goal_row(id.to_string(), goal).with_cells(
+        format!(
+            "「{}」这条发现有一个结局：有人在任务账上把它做完、判失败或明确撤回",
+            goal.lines().next().unwrap_or(goal)
+        ),
+        "这条发现已经记在收件台上，还没有任务接走",
+        "缺接走它的人与它的结局",
+    )
+}
+
 /// What one item's handover ended in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Handover {
@@ -624,7 +644,7 @@ impl Handover {
 /// looked like it avoided. `get_task` is the cheap question; the id is what
 /// makes it answerable.
 async fn hand_over(
-    desk: Option<&Arc<dyn IntentEvents>>,
+    desk: Option<&Arc<dyn cog_core::EventStore>>,
     orchestrator: &Arc<dyn OrchestratorControl>,
     source: &OutwardSource,
     item: &OutwardItem,
@@ -640,9 +660,11 @@ async fn hand_over(
             addressed_to: String::new(),
             text: goal_for(source, item),
             parent: Some(item.url.clone()),
+            session: None,
+            model_text: None,
             at: chrono::Utc::now(),
         };
-        if let Err(e) = desk.record(&row).await {
+        if let Err(e) = desk.append(cog_core::intent_received_event(&row)).await {
             warn!(
                 source = %source.name,
                 url = %item.url,
@@ -656,7 +678,7 @@ async fn hand_over(
         return Handover::AlreadyHeld;
     }
     let goal = goal_for(source, item);
-    let row = Task::goal_row(id.clone(), &goal);
+    let row = handover_row(&id, &goal);
     match orchestrator.submit_goal_auto(&goal, vec![row]).await {
         Ok(added) if added.is_empty() => {
             // The graph took nothing: another replica handed the same item over
@@ -683,7 +705,8 @@ async fn hand_over(
 /// rest. Three is enough for a refusal that is a collision or a momentary
 /// outage to clear, and bounded so that an item the goal path will never take
 /// stops costing a submission every five minutes for the rest of the day.
-// cap: bound — 一次交接被拒多是撞车或片刻不可用，下一两个唤醒就过去了；界设在「今天剩下的每一拍都再交一次」之前
+// cap: fixed — 一次交接被拒多是撞车或片刻不可用，下一两个唤醒就过去了；界设在「今天剩下的每一拍都再交一次」之前
+// keep: 删掉后一次被拒的交接要么不再交，要么今天剩下的每一拍都再交一次；由「下一两个唤醒就过去了」兜住
 const HANDOVER_ATTEMPTS: u32 = 3;
 
 /// An item whose hand-over failed, waiting for the next wake.
@@ -706,7 +729,7 @@ struct Retry {
 /// this pass found and what became of it" into a count of tries, and the pass
 /// reading beside it already says how often the source was asked.
 async fn drain_retries(
-    desk: Option<&Arc<dyn IntentEvents>>,
+    desk: Option<&Arc<dyn cog_core::EventStore>>,
     orchestrator: &Arc<dyn OrchestratorControl>,
     sources: &[OutwardSource],
     pending: &mut Vec<Retry>,
@@ -751,7 +774,7 @@ pub fn spawn_outward_loop(
     shutdown: ShutdownSignal,
     config: OutwardConfig,
     census: Arc<OutwardCensus>,
-    intents: Option<Arc<dyn IntentEvents>>,
+    intents: Option<Arc<dyn cog_core::EventStore>>,
 ) {
     let period = config.period();
     let wake = config.wake_interval();
@@ -1163,22 +1186,17 @@ mod tests {
     struct RecordingDesk(StdMutex<Vec<IntentRow>>);
 
     #[async_trait]
-    impl cog_core::IntentEvents for RecordingDesk {
+    impl cog_core::EventStore for RecordingDesk {
         fn writer(&self) -> &str {
             "outward-probe"
         }
-
-        async fn record(&self, row: &IntentRow) -> SFResult<()> {
-            self.0.lock().unwrap().push(row.clone());
-            Ok(())
+        fn next_event_id(&self) -> String {
+            format!("R{}", self.0.lock().unwrap().len())
         }
-
-        async fn mark_triaged(
-            &self,
-            _identities: &[String],
-            _task_id: &str,
-            _actor: &str,
-        ) -> SFResult<()> {
+        async fn append(&self, event: cog_core::FactEvent) -> SFResult<()> {
+            if let cog_core::EventPayload::IntentRecorded(row) = event.payload {
+                self.0.lock().unwrap().push(row);
+            }
             Ok(())
         }
     }
@@ -1188,7 +1206,7 @@ mod tests {
     #[tokio::test]
     async fn an_item_found_outside_lands_on_the_same_intent_desk() {
         let recording = Arc::new(RecordingDesk::default());
-        let desk: Arc<dyn cog_core::IntentEvents> = recording.clone();
+        let desk: Arc<dyn cog_core::EventStore> = recording.clone();
         let orchestrator: Arc<dyn OrchestratorControl> =
             Arc::new(RememberingOrchestrator::default());
         let source = OutwardSource {
@@ -1342,6 +1360,19 @@ mod tests {
         async fn replay_dlq(&self, _task_id: &str) -> SFResult<bool> {
             Ok(false)
         }
+    }
+
+    /// 交接行带着三格：事实在「现在」，缺的结局在「差距」。
+    #[test]
+    fn a_handover_row_carries_the_fact_and_the_missing_ending() {
+        use cog_core::contract::ledger_item::LedgerState;
+        let row = handover_row("outward:https://x/1", "某条发现");
+        let item = row.ledger_item().expect("三格在任务的一等字段上");
+        assert_eq!(item.id, "outward:https://x/1");
+        assert_eq!(item.state, LedgerState::Open);
+        assert!(item.terminal.contains("结局"), "{}", item.terminal);
+        assert!(item.now.contains("收件台"), "{}", item.now);
+        assert!(item.gap.contains("接走"), "{}", item.gap);
     }
 
     #[tokio::test]

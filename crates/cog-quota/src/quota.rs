@@ -242,7 +242,7 @@ impl QuotaManager {
         let total_quota = reading
             .as_ref()
             .map(|r| r.limits.hard_limit)
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         QuotaSummary {
             target_id: user_id.to_string(),
             target_type: "user".into(),
@@ -262,7 +262,7 @@ impl QuotaManager {
         let total_quota = reading
             .as_ref()
             .map(|r| r.limits.hard_limit)
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         QuotaSummary {
             target_id: workspace_id.to_string(),
             target_type: "workspace".into(),

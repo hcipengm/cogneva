@@ -77,6 +77,8 @@ pub struct CollaborationExecutor {
     /// 上游池的暂停开关；每个任务现建的 SquadExecutor 都要拿到它，否则那条
     /// 循环在上游停供期间照样一轮一轮地开新轮。
     pause_gate: Option<Arc<dyn cog_core::SchedulerGate>>,
+    /// 判据的修订读面；没有它时计划定下之后判据不再变。
+    terminal_revisions: Option<Arc<dyn cog_core::contract::terminal_revision::TerminalRevisions>>,
     /// 原则账；生成端事前要看的那几条原则从这里按路径取。没有它时生成端
     /// 仍旧照跑——只是这一次没有任何一条项目原则被递进来，与「这个仓库没有
     /// 原则管着这些文件」不是一回事，所以缺它要留一条具名日志。
@@ -193,6 +195,7 @@ impl CollaborationExecutor {
             local_repair_max: None,
             stage_store: None,
             pause_gate: None,
+            terminal_revisions: None,
             principle_ledger: None,
             roster: None,
             live_takes: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -329,6 +332,15 @@ impl CollaborationExecutor {
     }
 
     /// 让每条 Ralph 循环认识上游池的暂停开关。
+    /// 判据的修订读面：每一轮开始前读一次，换了就对着新的那段话说。
+    pub fn with_terminal_revisions(
+        mut self,
+        revisions: Arc<dyn cog_core::contract::terminal_revision::TerminalRevisions>,
+    ) -> Self {
+        self.terminal_revisions = Some(revisions);
+        self
+    }
+
     pub fn with_pause_gate(mut self, gate: Arc<dyn cog_core::SchedulerGate>) -> Self {
         self.pause_gate = Some(gate);
         self
@@ -699,15 +711,19 @@ impl CollaborationExecutor {
         if let Some(ref gate) = self.pause_gate {
             squad_executor = squad_executor.with_pause_gate(gate.clone());
         }
+        if let Some(ref revisions) = self.terminal_revisions {
+            squad_executor = squad_executor.with_terminal_revisions(revisions.clone());
+        }
         // 这一段座位是谁的：行上写了工号就是那个人。座位建出来之后写进名册行，
         // 判「认领与交活的是不是行上那位」时才有一处问得出来。
-        squad_executor = squad_executor.with_person(self.roster.clone(), task.owner_unit.clone());
 
         let result = squad_executor
             .execute_squad(
                 task.id.clone(),
                 SquadConfig {
-                    goal,
+                    // 定义式计划的「整段做」那一件要把同一道目标带进输入，
+                    // 所以这一份留在这里，不随配置一起被移走。
+                    goal: goal.clone(),
                     context: Self::goal_context(task),
                     pge_mode: crate::profile::PgeMode::PlanOnly,
                     max_retries: task.max_retries,
@@ -728,7 +744,15 @@ impl CollaborationExecutor {
         }
 
         info!(task_id=%task.id, "Collaboration decomposition succeeded");
-        let atomic_tasks = Self::extract_atomic_tasks(&result);
+        let mut atomic_tasks =
+            Self::extract_atomic_tasks(&result, self.intent_reader.as_ref()).await;
+        // 计划只交了定义与待办（契约允许 `sub_tasks` 缺省）：把它变成一件可执行
+        // 的「整段做」任务，而不是让下游读到一张空图。
+        if atomic_tasks.is_empty() {
+            if let Some(whole) = Self::whole_task_from_plan(&result, &goal) {
+                atomic_tasks.push(whole);
+            }
+        }
         self.enforce_boundaries(task, &result, &atomic_tasks)?;
         let score = Self::extract_score(&result);
         let sub_task_types = Self::sub_task_types(&atomic_tasks);
@@ -742,10 +766,6 @@ impl CollaborationExecutor {
         if let Some(s) = score {
             metadata = metadata.with_score(s);
         }
-        // 交上来的那条待办若带着三格，就把**判完之后的它**带回去：状态跟着这一次
-        // 运行的结果走，差距原样（改没改掉由下一次读树的人说，不由这一次自报）。
-        // 入口那一侧因此拿得到「这条到了没有」，而不只是「这次跑成了没有」。
-        metadata = Self::carry_ledger_item(task, &result, metadata);
         let task_result = TaskResult {
             success: true,
             output,
@@ -754,35 +774,6 @@ impl CollaborationExecutor {
         self.archive_execution(task, &task_result);
         self.archive_decomposition(task, sub_task_types);
         Ok(task_result)
-    }
-
-    /// 把任务行上那条待办的三格带进结果的 `extensions`。
-    ///
-    /// 三格从 `input[ITEM_INPUT_KEY]` 来（意图入口写的），状态按这一次的结局写：
-    /// 成功记 `已落`、失败保持 `未落`。差距不改：这一段改没改掉，要由下一位读树的人说。
-    fn carry_ledger_item(
-        task: &Task,
-        result: &SquadResult,
-        mut metadata: TaskResultMetadata,
-    ) -> TaskResultMetadata {
-        use cog_core::contract::ledger_item::{LedgerItem, LedgerState, ITEM_INPUT_KEY};
-        let Some(raw) = task.input.get(ITEM_INPUT_KEY) else {
-            return metadata;
-        };
-        let Ok(mut item) = serde_json::from_value::<LedgerItem>(raw.clone()) else {
-            return metadata;
-        };
-        if result.success {
-            item.state = LedgerState::Reached;
-        }
-        if let Ok(value) = serde_json::to_value(&item) {
-            let mut extensions = metadata.extensions.clone().unwrap_or(serde_json::json!({}));
-            if let Some(obj) = extensions.as_object_mut() {
-                obj.insert(ITEM_INPUT_KEY.to_string(), value);
-            }
-            metadata.extensions = Some(extensions);
-        }
-        metadata
     }
 
     /// 这一次运行的产出要不要走抽取与落地那条路。
@@ -926,8 +917,10 @@ impl CollaborationExecutor {
         if let Some(ref gate) = self.pause_gate {
             squad_executor = squad_executor.with_pause_gate(gate.clone());
         }
+        if let Some(ref revisions) = self.terminal_revisions {
+            squad_executor = squad_executor.with_terminal_revisions(revisions.clone());
+        }
         // 同分解路径：行上写的工号是这一段座位的主人。
-        squad_executor = squad_executor.with_person(self.roster.clone(), task.owner_unit.clone());
 
         let mut context = Self::goal_context(task);
         if is_self_evolution {
@@ -1096,10 +1089,8 @@ impl CollaborationExecutor {
         // plan without them — the shape self-evolution runs have — passes an
         // empty list, which the archive does not record.
         self.archive_execution(task, &task_result);
-        self.archive_decomposition(
-            task,
-            Self::sub_task_types(&Self::extract_atomic_tasks(&result)),
-        );
+        let atomic_tasks = Self::extract_atomic_tasks(&result, self.intent_reader.as_ref()).await;
+        self.archive_decomposition(task, Self::sub_task_types(&atomic_tasks));
         Ok(task_result)
     }
 
@@ -1233,7 +1224,7 @@ impl CollaborationExecutor {
         result: &SquadResult,
         fallback: &str,
     ) -> SFError {
-        let reason = result.error.clone().unwrap_or_default();
+        let reason = result.error.clone().unwrap_or(Default::default());
         let mut metadata = TaskResultMetadata::new(executor_id);
         if !reason.is_empty() {
             metadata = metadata.with_feedback(&reason);
@@ -1513,6 +1504,8 @@ impl CollaborationExecutor {
 
             let change_id = Self::change_id_for(task_id, &artifact.content);
             changes.push(cog_core::GeneratedChange {
+                // 这件变更来自这一件活：任务 id 是平台内的稳定身份，落地率按它读。
+                unit_of_work: Some(format!("task:{task_id}")),
                 change_id,
                 goal: goal.into(),
                 content: artifact.content,
@@ -1602,7 +1595,10 @@ impl CollaborationExecutor {
         serde_json::Value::Null
     }
 
-    fn extract_atomic_tasks(squad_result: &crate::squad::SquadResult) -> Vec<AtomicTask> {
+    async fn extract_atomic_tasks(
+        squad_result: &crate::squad::SquadResult,
+        reader: Option<&Arc<dyn cog_core::IntentReader>>,
+    ) -> Vec<AtomicTask> {
         let mut tasks = Vec::new();
         if let Some(result_val) = Self::pge_payload(squad_result) {
             // 分解路径的产物形状：计划本身就是交付物。
@@ -1612,7 +1608,7 @@ impl CollaborationExecutor {
                 for spec in &plan_run.plan.sub_tasks {
                     tasks.push(Self::task_spec_to_atomic(spec));
                 }
-                Self::attach_items(&mut tasks, &plan_run.plan);
+                Self::attach_items(&mut tasks, &plan_run.plan, reader).await;
                 return tasks;
             }
             // Try to parse as PgePipelineResult first.
@@ -1622,7 +1618,7 @@ impl CollaborationExecutor {
                 for spec in &pipeline.final_plan.sub_tasks {
                     tasks.push(Self::task_spec_to_atomic(spec));
                 }
-                Self::attach_items(&mut tasks, &pipeline.final_plan);
+                Self::attach_items(&mut tasks, &pipeline.final_plan, reader).await;
                 return tasks;
             }
             // Try PgeRoundtableResult.
@@ -1632,10 +1628,84 @@ impl CollaborationExecutor {
                 for spec in &roundtable.final_plan.sub_tasks {
                     tasks.push(Self::task_spec_to_atomic(spec));
                 }
-                Self::attach_items(&mut tasks, &roundtable.final_plan);
+                Self::attach_items(&mut tasks, &roundtable.final_plan, reader).await;
             }
         }
         tasks
+    }
+
+    /// 只交了定义与待办的计划 → 一件「整段做」的原子任务。
+    ///
+    /// 计划的形状由 planner 的契约决定（`sub_tasks` 可缺省），判计划那一侧也
+    /// 放行这种答案。这里把它变成执行面接得住的东西：一件可执行的任务，声明整段
+    /// 做，验收标准逐条抄自待办终态。没有这一步，一次成功的定义式计划在下游读成
+    /// 「没有任务可入图」——不是失败，却和失败同形。
+    fn whole_task_from_plan(
+        squad_result: &crate::squad::SquadResult,
+        goal: &str,
+    ) -> Option<AtomicTask> {
+        let payload = Self::pge_payload(squad_result)?;
+        let plan = serde_json::from_value::<crate::squad::PlanRunResult>(payload.clone())
+            .ok()
+            .map(|run| run.plan)
+            .or_else(|| {
+                serde_json::from_value::<crate::PgePipelineResult>(payload.clone())
+                    .ok()
+                    .map(|pipeline| pipeline.final_plan)
+            })
+            .or_else(|| {
+                serde_json::from_value::<crate::PgeRoundtableResult>(payload)
+                    .ok()
+                    .map(|roundtable| roundtable.final_plan)
+            })?;
+        Self::whole_atomic_task(&plan, goal)
+    }
+
+    /// 一件「整段做」的原子任务：定义进输入，待办的终态进验收标准。
+    ///
+    /// 座位写生成者：执行面拿到这一类任务按 PGE 整段跑（planner 排、generator
+    /// 做、evaluator 判），不是把定义再拆一次。`estimated_tokens` 留 0——没估
+    /// 过就不落基线行，写成 0 会让挣值把它读成免费。
+    fn whole_atomic_task(
+        plan: &crate::squad::pge::types::PlannerOutput,
+        goal: &str,
+    ) -> Option<AtomicTask> {
+        let definition = plan.definition.as_deref()?.trim();
+        if definition.is_empty() {
+            return None;
+        }
+        let items = plan.judged_items();
+        let acceptance: Vec<String> = items
+            .iter()
+            .map(|item| item.terminal.trim().to_string())
+            .filter(|terminal| !terminal.is_empty())
+            .collect();
+        if acceptance.is_empty() {
+            return None;
+        }
+        Some(AtomicTask {
+            id: "whole".into(),
+            name: goal.to_string(),
+            skill_id: Some(cog_core::roles::GENERATOR.into()),
+            description: Some(definition.to_string()),
+            estimated_tokens: 0,
+            skill_gap: false,
+            blocked_by: Vec::new(),
+            blocks: Vec::new(),
+            input: serde_json::json!({
+                "goal": goal,
+                "definition": definition,
+                "items": items,
+            }),
+            terminal: String::new(),
+            now: String::new(),
+            gap: String::new(),
+            output_entities: Vec::new(),
+            estimated_seconds: 0,
+            parent_id: None,
+            acceptance,
+            delivers: None,
+        })
     }
 
     /// 把 planner 给每条待办写下的三格挂到它拆出来的那条原子任务上。
@@ -1644,31 +1714,75 @@ impl CollaborationExecutor {
     /// 现在什么样、还差什么」。所以它们由 `PlannerOutput.items` 给出，在这里按 id 落到
     /// 原子任务行的 `input[ITEM_INPUT_KEY]` 上——下游（判据审、判定、结果回带）读的就是
     /// 那一格，而不是再回头去猜。
-    fn attach_items(tasks: &mut [AtomicTask], plan: &crate::squad::pge::types::PlannerOutput) {
-        use cog_core::contract::ledger_item::ITEM_INPUT_KEY;
+    ///
+    /// **五格只随任务这一族进流，不再写第二条事实。** 任务定义（`task_defined`）的
+    /// 载荷带整条 `Task`，这一格就在里面：定义写下去，五格同时有了流上的落点；
+    /// 判完/读树的人更新它时写下一版定义（rev+1），最后一条折出现在与差距。
+    /// 早先这里还额外写一条 `item_defined`，等于把同一件事记了两处——两处一漂开，
+    /// 读的人分不清哪一份是正本。
+    async fn attach_items(
+        tasks: &mut [AtomicTask],
+        plan: &crate::squad::pge::types::PlannerOutput,
+        reader: Option<&Arc<dyn cog_core::IntentReader>>,
+    ) {
         for item in plan.judged_items() {
+            // 「谁提的」从意图那一行原样搬过来：同一个键、同一个拼法，读面不必按
+            // 入口分叉。取不到那一行（没有读者、或这条待办不是从意图派生的）就
+            // 不写——写一个空壳 `origin` 会让「没人说过是谁提的」与「有人说了、
+            // 但那句话里没有身份」在读数上同形。
+            let origin = match reader {
+                Some(reader) => match reader.by_identity(&item.id).await {
+                    Ok(Some(row)) => Some(Self::origin_of(&row)),
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::warn!(
+                            intent = %item.id,
+                            error = %e,
+                            "意图那一行读不到；这条待办不写 origin，而不是编一个说话的人"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            // 五格随任务定义进流（`task_defined` 的载荷带整条 `Task`），这里不再
+            // 另写一条 `item_defined`：同一件事两个落点，一漂开就没有正本。
             for task in tasks.iter_mut() {
                 if task.id != item.id {
                     continue;
                 }
-                if let Ok(value) = serde_json::to_value(&item) {
-                    match task.input.as_object_mut() {
-                        Some(obj) => {
-                            obj.insert(ITEM_INPUT_KEY.to_string(), value);
-                            // 这条任务是从哪条意图派生的：收件台靠它判「处理过没有」。
-                            // 待办的 id 就是意图的身份（planner 按 `identity` 命名）。
-                            obj.insert(
-                                cog_core::contract::intent_events::INTENT_ID_KEY.to_string(),
-                                serde_json::Value::String(item.id.clone()),
-                            );
-                        }
-                        None => {
-                            task.input = serde_json::json!({ ITEM_INPUT_KEY: value });
-                        }
+                // 三格是任务的一等字段：计划这一层就按名放，不再塞进 `input`。
+                task.terminal = item.terminal.clone();
+                task.now = item.now.clone();
+                task.gap = item.gap.clone();
+                // 意图身份与 origin 仍是输入上的旁注，不是待办的第二份。
+                if !task.input.is_object() {
+                    task.input = serde_json::json!({});
+                }
+                if let Some(obj) = task.input.as_object_mut() {
+                    // 这条任务是从哪条意图派生的：收件台靠它判「处理过没有」。
+                    // 待办的 id 就是意图的身份（planner 按 `identity` 命名）。
+                    obj.insert(
+                        cog_core::contract::intent_events::INTENT_ID_KEY.to_string(),
+                        serde_json::Value::String(item.id.clone()),
+                    );
+                    if let Some(origin) = origin.clone() {
+                        obj.insert("origin".to_string(), origin);
                     }
                 }
             }
         }
+    }
+
+    /// 意图那一行里的「谁提的」，按平台唯一的那个键写：`origin {source, said_by,
+    /// addressed_to}`。三个值原样搬，不改写、不补缺——`said_by` 是空串时就写空串，
+    /// 那是「这条连接没有身份」这件事本身。
+    fn origin_of(row: &cog_core::IntentRow) -> serde_json::Value {
+        serde_json::json!({
+            "source": row.source,
+            "said_by": row.said_by,
+            "addressed_to": row.addressed_to,
+        })
     }
 
     /// The sub-task types a decomposition produced, as the namespace records
@@ -1694,6 +1808,9 @@ impl CollaborationExecutor {
             blocked_by: spec.blocked_by.clone(),
             blocks: vec![],
             input: spec.input.clone(),
+            terminal: String::new(),
+            now: String::new(),
+            gap: String::new(),
             output_entities: vec![],
             estimated_seconds: Self::estimate_seconds(&spec.name, &spec.input),
             // 验收标准随计划一起来：计划说得出每一片怎样算做完，这里就照抄；
@@ -1716,7 +1833,8 @@ impl CollaborationExecutor {
     /// construction: the rule is declared, enabled, evaluated — and can never
     /// fire, which is indistinguishable from a plan that never exceeded it.
     /// Twice the largest threshold the shipped configurations declare.
-    // cap: bound — 取的是出货配置里声明过的最大阈值的两倍：一个实打实等于阈值的估计是看不见的失败，与一个从没超过的计划无法区分
+    // cap: fixed — 取的是出货配置里声明过的最大阈值的两倍：一个实打实等于阈值的估计是看不见的失败，与一个从没超过的计划无法区分
+    // keep: 删掉后一次估计可以超出配置阈值而无人知道，实打实等于阈值的失败与从没超过的计划分不开；由「出厂配置最大阈值的两倍」兜住
     const TOKEN_ESTIMATE_CAP: u64 = 200_000;
 
     /// Rough token estimate: ~4 chars per token plus 2 000 token overhead for
@@ -1756,7 +1874,9 @@ impl CollaborationExecutor {
 /// 一次任务点名几百个路径时（整仓改名的活会这样）匹配可以是几百条，而几百条
 /// 原则正文会把提示词里真正的任务挤到读不到的地方。撞上界说明这次要动的东西
 /// 太大，该先拆，不该靠多塞原则解决。
-// cap: bound — 选出来的一道界，不是量出来的容量
+// cap: fixed — 选出来的一道界，不是量出来的容量
+// keep: 删掉后一次任务可以带任意多条原则，前缀跟着原则账的长度走；由「选出来的一道界」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const PRINCIPLES_PER_TASK: usize = 12;
 
 /// 这一轮真正递出去的那几条，以及账里是不是还多着。
@@ -1868,7 +1988,9 @@ fn collect_strings(value: &serde_json::Value, out: &mut String) {
 mod tests {
     use super::{CollaborationExecutor, ProducerClass, PLATFORM_AGENT_TASK};
     use crate::checkout::repo_root;
-    use cog_core::{Observable, Task, TaskType};
+    use async_trait::async_trait;
+    use cog_core::{AtomicTask, Observable, SFResult, Task, TaskType};
+    use std::sync::Arc;
 
     /// Keeps the envelopes the archive is handed, so a test can read back how a
     /// run ended without a store behind it.
@@ -1889,6 +2011,52 @@ mod tests {
             }
             panic!("nothing reached the archive");
         }
+    }
+
+    /// 只交定义与待办的计划要变成一任务，而不是一张空图。
+    ///
+    /// 这条测试钉的是「按定义整段做、判据按 items 判」那一半：计划的
+    /// `sub_tasks` 可缺省，契约允许这个答案；执行面不能把它读成「没有任务」。
+    /// 没有待办终态的空答案仍不合成——那是真的没有可判的东西。
+    #[test]
+    fn a_definition_only_plan_becomes_one_whole_task() {
+        use cog_core::contract::ledger_item::{LedgerItem, LedgerState};
+
+        let item = LedgerItem {
+            id: "i1".into(),
+            terminal: "只剩一处".into(),
+            now: "三处".into(),
+            gap: "两处".into(),
+            state: LedgerState::Open,
+        };
+        let definition = "这一类：把三处收进一处；做完＝只剩一处。";
+        let plan = crate::squad::pge::types::PlannerOutput {
+            summary: "s".into(),
+            plan: serde_json::json!({}),
+            sub_tasks: Vec::new(),
+            acceptance_criteria: Vec::new(),
+            targets: Vec::new(),
+            items: vec![item.clone()],
+            definition: Some(definition.into()),
+        };
+
+        let whole = CollaborationExecutor::whole_atomic_task(&plan, "把三处收进一处")
+            .expect("a definition with one judged item must yield a whole task");
+        assert_eq!(whole.acceptance, vec!["只剩一处".to_string()]);
+        assert_eq!(whole.input["definition"], definition);
+        assert_eq!(whole.input["items"].as_array().map(Vec::len), Some(1));
+        assert_eq!(whole.skill_id.as_deref(), Some(cog_core::roles::GENERATOR));
+        assert_eq!(
+            whole.estimated_tokens, 0,
+            "no estimate means no baseline row"
+        );
+
+        let mut bare = plan.clone();
+        bare.items.clear();
+        assert!(
+            CollaborationExecutor::whole_atomic_task(&bare, "把三处收进一处").is_none(),
+            "an answer with no judged item is still an empty deliverable"
+        );
     }
 
     /// 计划说得出每一片怎样算做完，这里就照着搬到那一行上。
@@ -2019,9 +2187,82 @@ mod tests {
         }
     }
 
+    /// 收件台上的一句话派生成待办时，「谁提的」跟着过去：同一个键、同一个拼法，
+    /// 与 A2A、内部工具写下的那一条同形，读面不必按入口分叉。
+    ///
+    /// 这一格以前是空的：待办只带 `intent_id`，不带说话的人——按人读「谁提的」
+    /// 在那条路上永远读不到，而它与「没人提过」在读数上同形。
+    #[tokio::test]
+    async fn a_task_derived_from_an_intent_carries_who_said_it() {
+        use crate::squad::pge::types::PlannerOutput;
+        use cog_core::contract::ledger_item::{LedgerItem, LedgerState};
+
+        struct OneRow(cog_core::IntentRow);
+        #[async_trait]
+        impl cog_core::IntentReader for OneRow {
+            async fn undispatched(&self, _limit: i64) -> SFResult<Vec<cog_core::IntentRow>> {
+                Ok(vec![self.0.clone()])
+            }
+            async fn by_identity(&self, identity: &str) -> SFResult<Option<cog_core::IntentRow>> {
+                Ok((self.0.identity == identity).then(|| self.0.clone()))
+            }
+        }
+
+        let row = cog_core::IntentRow::new(
+            "chat",
+            "t1",
+            "owner-1",
+            "employee-3",
+            "把界改成实测的",
+            None,
+        );
+        let reader: Arc<dyn cog_core::IntentReader> = Arc::new(OneRow(row));
+        let spec = |id: &str| crate::squad::pge::types::TaskSpec {
+            id: id.into(),
+            name: id.into(),
+            task_type: "generate".into(),
+            input: serde_json::json!({}),
+            blocked_by: Vec::new(),
+            acceptance: vec!["x".into()],
+            delivers: None,
+        };
+        let plan = PlannerOutput {
+            definition: None,
+            summary: "s".into(),
+            plan: serde_json::json!({}),
+            sub_tasks: vec![spec("t1")],
+            acceptance_criteria: Vec::new(),
+            targets: Vec::new(),
+            items: vec![LedgerItem {
+                id: "t1".into(),
+                terminal: "界跟着实测走".into(),
+                now: "写死的".into(),
+                gap: "缺的是：换输入不跟着变".into(),
+                state: LedgerState::Open,
+            }],
+        };
+        let mut tasks: Vec<AtomicTask> = plan
+            .sub_tasks
+            .iter()
+            .map(CollaborationExecutor::task_spec_to_atomic)
+            .collect();
+        CollaborationExecutor::attach_items(&mut tasks, &plan, Some(&reader)).await;
+
+        let task = cog_core::Task::new("t1", cog_core::TaskType::Generator, tasks[0].input.clone());
+        assert_eq!(
+            task.said_by(),
+            Some("owner-1"),
+            "从意图派生的待办读不出是谁提的：那条路上按人读账永远是空的"
+        );
+        assert_eq!(
+            tasks[0].input["origin"]["addressed_to"],
+            serde_json::json!("employee-3")
+        );
+    }
+
     /// planner 拆完才有的三格，落在它拆出来的那条原子任务上（按 id）。
-    #[test]
-    fn the_planner_items_land_on_the_atomic_tasks_it_decomposed_into() {
+    #[tokio::test]
+    async fn the_planner_items_land_on_the_atomic_tasks_it_decomposed_into() {
         use crate::squad::pge::types::PlannerOutput;
         use cog_core::contract::ledger_item::{LedgerItem, LedgerState, ITEM_INPUT_KEY};
         let item = LedgerItem {
@@ -2041,6 +2282,7 @@ mod tests {
             delivers: None,
         };
         let plan = PlannerOutput {
+            definition: None,
             summary: "s".into(),
             plan: serde_json::json!({}),
             sub_tasks: vec![spec("t1"), spec("t2")],
@@ -2053,7 +2295,7 @@ mod tests {
             .iter()
             .map(CollaborationExecutor::task_spec_to_atomic)
             .collect();
-        CollaborationExecutor::attach_items(&mut tasks, &plan);
+        CollaborationExecutor::attach_items(&mut tasks, &plan, None).await;
 
         let carried: LedgerItem = serde_json::from_value(
             tasks[0]
@@ -2068,59 +2310,6 @@ mod tests {
             tasks[1].input.get(ITEM_INPUT_KEY).is_none(),
             "没有对应待办的那条不该被塞进别人的三格"
         );
-    }
-
-    /// 任务行上带着三格的，结果里就把判完之后的它带回去：状态跟着结局走，差距原样。
-    ///
-    /// 判的是「入口那一侧读得到『这条到了没有』」——只读「这次跑成了没有」的话，
-    /// 一次成功的运行会被读成一条到了终态的待办，而它可能只差着最后一件。
-    #[test]
-    fn a_task_carrying_an_item_hands_it_back_with_its_state() {
-        use cog_core::contract::ledger_item::{LedgerItem, LedgerState, ITEM_INPUT_KEY};
-        use cog_core::TaskResultMetadata;
-        let item = LedgerItem {
-            id: "N77".into(),
-            terminal: "窗口里每一轮都带着它需要的全部".into(),
-            now: "地板还装不下".into(),
-            gap: "缺的是：地板外置".into(),
-            state: LedgerState::Open,
-        };
-        let mut task = Task::new("t1", TaskType::DagNode, serde_json::json!({}));
-        task.input = serde_json::json!({ ITEM_INPUT_KEY: serde_json::to_value(&item).unwrap() });
-
-        let mut ok = squad_failure(None);
-        ok.success = true;
-        let meta = CollaborationExecutor::carry_ledger_item(
-            &task,
-            &ok,
-            TaskResultMetadata::new("collaboration"),
-        );
-        let back: LedgerItem = serde_json::from_value(
-            meta.extensions
-                .as_ref()
-                .and_then(|e| e.get(ITEM_INPUT_KEY))
-                .cloned()
-                .expect("结果里没有带回来的那条待办"),
-        )
-        .unwrap();
-        assert_eq!(back.state, LedgerState::Reached, "跑成了，状态跟着到终态");
-        assert_eq!(back.gap, item.gap, "差距不由这一次自报");
-
-        let failed = CollaborationExecutor::carry_ledger_item(
-            &task,
-            &squad_failure(Some("boom")),
-            TaskResultMetadata::new("collaboration"),
-        );
-        let back: LedgerItem = serde_json::from_value(
-            failed
-                .extensions
-                .as_ref()
-                .and_then(|e| e.get(ITEM_INPUT_KEY))
-                .cloned()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(back.state, LedgerState::Open, "失败保持原状");
     }
 
     /// A run that failed reaches the archive as a failure, with the reason the
@@ -2767,14 +2956,16 @@ mod tests {
             .next()
             .expect("the file has no production half");
         let after = production
-            .split("let atomic_tasks = Self::extract_atomic_tasks(&result);")
+            .split("let atomic_tasks = Self::extract_atomic_tasks(")
             .nth(1)
             .expect("the decomposition path no longer extracts its atomic tasks");
+        // 第一行是那次调用自己的尾巴（切点在参数中间），从它的下一行起找调用。
         let call = after
             .lines()
+            .skip(1)
             .map(str::trim)
             .find(|line| !line.is_empty() && !line.starts_with("//"))
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         assert_eq!(
             call, "self.enforce_boundaries(task, &result, &atomic_tasks)?;",
             "the boundary rules are read somewhere else than where the tasks are produced, \
@@ -2817,6 +3008,7 @@ mod tests {
             iterations: 1,
             consensus_reached: true,
             final_plan: PlannerOutput {
+                definition: None,
                 summary: String::new(),
                 plan: serde_json::json!({}),
                 sub_tasks: Vec::new(),

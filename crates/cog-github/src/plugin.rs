@@ -16,7 +16,8 @@ use crate::provider::CodePlatformProvider;
 ///
 /// 排空要看的是外部平台侧「合并了没有」，这个数决定「合并到看见它走完」的最长
 /// 滞后；一拍的代价是几次查询，密到分钟级没有收益。
-// cap: bound — 排空要等的是外部平台侧「合并了没有」，这个数就是「合并到看见它走完」的最长滞后；一拍的代价只是几次查询
+// cap: fixed — 排空要等的是外部平台侧「合并了没有」，这个数就是「合并到看见它走完」的最长滞后；一拍的代价只是几次查询
+// keep: 删掉后「合并到看见它走完」的滞后无界，一排空拖很久；由「这个数就是最长滞后」兜住
 const STAGED_CHANGE_DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Background loop state, held behind a mutex because [`SystemPlugin::start`]
@@ -318,6 +319,23 @@ impl cog_core::SystemPlugin for GitHubPlugin {
                     // 盯这次提交的 CI。工作目录未配置时从数据目录派生，通道默认
                     // 就是通的；真正的开关是贡献策略（auto/ask/local），不是路径
                     // 是否填了值。
+                    // 落地账的事件写口：接上之后每一次落盘同时落一条事实，文件退成缓存。
+                    // storage 插件与这一层并发 init，读不到时就只写文件（并在日志里说清）。
+                    match ctx.consume_service::<dyn cog_core::EventStore>() {
+                        Some(events) => crate::landing::attach_events(events),
+                        None => {
+                            info!("no event store in this process: landing records stay files only")
+                        }
+                    }
+                    // 读口与写口成对：只有两边都在，盘上那份文件才退成可以被丢掉的
+                    // 缓存。缺一半时落地账继续读文件（进程照常工作，只是还没切）。
+                    match ctx.consume_service::<dyn cog_core::LandingFactReader>() {
+                        Some(facts) => crate::landing::attach_facts(facts),
+                        None => info!(
+                            "no landing fact reader in this process: the landing channel keeps \
+                             reading its file cache"
+                        ),
+                    }
                     let token = config
                         .primary_account()
                         .ok()
@@ -338,7 +356,8 @@ impl cog_core::SystemPlugin for GitHubPlugin {
                                     provider.clone(),
                                     controller.clone(),
                                 )
-                                .with_mirrors(mirrors),
+                                .with_mirrors(mirrors)
+                                .with_token(token.clone()),
                             );
                             // 属主在 UI 点"提交"时经 ContributionControl::flush_pending
                             // 调用同一通道，跳过策略门禁（点击即批准）。
@@ -505,7 +524,7 @@ impl cog_core::SystemPlugin for GitHubPlugin {
             .config
             .clone()
             .or_else(|| self.gitee.as_ref().map(|(c, _)| c.clone()))
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
 
         // 非属主进程不建发现循环。落地监视（上面已起）不在此列：它盯的是本进程
         // 自己推上去的提交，两个进程各有各的工作树与落盘记录。句柄照常登记，
@@ -670,7 +689,7 @@ impl cog_core::SystemPlugin for GitHubPlugin {
         self.shutdown.trigger();
         if let Ok(mut guard) = self.loop_state.lock() {
             if let Some(state) = guard.take() {
-                let _ = state.shutdown_tx.send(true);
+                cog_core::ignore_lost!(state.shutdown_tx.send(true));
                 for handle in state.handles {
                     handle.abort();
                 }

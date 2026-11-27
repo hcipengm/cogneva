@@ -36,7 +36,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 /// 交接读回任务行的间隔。
-// cap: bound — 答案被读到的延迟就是这一格；再密一点，安静的那一方也成了负载
+// cap: fixed — 答案被读到的延迟就是这一格；再密一点，安静的那一方也成了负载
+// keep: 删掉后答案被读到的延迟没有格，安静的那一方也成了负载；由「再密一点安静的一方也成负载」兜住
 pub const WORK_ITEM_POLL: Duration = Duration::from_millis(500);
 
 /// 交接只向任务图问两个问题。
@@ -77,12 +78,15 @@ pub async fn run_work_item<G: WorkItemGraph + ?Sized>(
     graph: &G,
     goal: &str,
     task: crate::Task,
-    wait: Duration,
+    wait: Option<Duration>,
 ) -> crate::SFResult<serde_json::Value> {
     let id = task.id.clone();
     let submitted = graph.submit(goal, vec![task]).await?;
     let id = submitted.into_iter().next().unwrap_or(id);
-    let deadline = tokio::time::Instant::now() + wait;
+    // 有没有等待上限是交活那一方的选择：给 `None` 就一直等到它到终态——那条寿命
+    // 的界不在这一层，而在任务自己的租约与实测步间隔上。有上限时到点只报告
+    // 「没等到」，不杀那件活。
+    let deadline = wait.map(|bound| tokio::time::Instant::now() + bound);
     loop {
         if let Some(row) = graph.row(&id).await {
             match row.status {
@@ -104,13 +108,17 @@ pub async fn run_work_item<G: WorkItemGraph + ?Sized>(
             }
         }
         let now = tokio::time::Instant::now();
-        if now >= deadline {
-            return Err(crate::SFError::Agent(format!(
-                "the work item {id} did not reach a terminal state within {}s",
-                wait.as_secs()
-            )));
+        if let Some(deadline) = deadline {
+            if now >= deadline {
+                return Err(crate::SFError::Agent(format!(
+                    "the work item {id} did not reach a terminal state within {}s",
+                    wait.map(|w| w.as_secs()).unwrap_or_default()
+                )));
+            }
+            tokio::time::sleep(WORK_ITEM_POLL.min(deadline - now)).await;
+        } else {
+            tokio::time::sleep(WORK_ITEM_POLL).await;
         }
-        tokio::time::sleep(WORK_ITEM_POLL.min(deadline - now)).await;
     }
 }
 
@@ -218,7 +226,25 @@ mod tests {
             crate::TaskType::Custom(PLATFORM_AGENT_TASK.into()),
             serde_json::json!({}),
         );
-        let answer = run_work_item(&graph, "judge it", task, Duration::from_secs(5))
+        let answer = run_work_item(&graph, "judge it", task, Some(Duration::from_secs(5)))
+            .await
+            .expect("the row completes");
+        assert_eq!(answer["result"], "ok");
+    }
+
+    /// 不给等待上界时，答案仍在它到终态的那一刻回来——界不在这一层。
+    ///
+    /// 没有这次改动这条会红：`run_work_item` 的 `wait` 不是 `Option`，交活的一侧
+    /// 只能从「声明工期」和「等待上界」两个数里再挑一个，而两个都没有量过。
+    #[tokio::test]
+    async fn without_a_wait_bound_the_answer_still_comes_back_on_completion() {
+        let graph = ScriptedGraph::new(3, serde_json::json!({"result": "ok"}));
+        let task = crate::Task::new(
+            "item-1",
+            crate::TaskType::Custom(PLATFORM_AGENT_TASK.into()),
+            serde_json::json!({}),
+        );
+        let answer = run_work_item(&graph, "judge it", task, None)
             .await
             .expect("the row completes");
         assert_eq!(answer["result"], "ok");
@@ -233,7 +259,7 @@ mod tests {
             crate::TaskType::Custom(PLATFORM_AGENT_TASK.into()),
             serde_json::json!({}),
         );
-        let err = run_work_item(&graph, "judge it", task, Duration::from_millis(50))
+        let err = run_work_item(&graph, "judge it", task, Some(Duration::from_millis(50)))
             .await
             .expect_err("nothing settles");
         assert!(err.to_string().contains("did not reach a terminal state"));

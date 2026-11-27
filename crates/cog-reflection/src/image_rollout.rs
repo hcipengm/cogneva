@@ -19,10 +19,7 @@ use cog_core::declared_wall::Step;
 use cog_core::{ImageRolloutConfig, SFError, SFResult};
 use tracing::{info, warn};
 
-/// 读部署状态的节奏。读取周期，不是界：界是
-/// [`cog_core::declared_wall::wait_for_settled`] 按实测窗口判的那一条。
-// cap: bound — 读取周期钉在这里，不参与判停
-const ROLLOUT_POLL: Duration = Duration::from_secs(10);
+use crate::rollout_cadence::ROLLOUT_POLL;
 
 /// 「滚动读数变了」这条证据通道的名字。等待方与判停方读同一个名字。
 const ROLLOUT_CHANNEL: &str = "image-rollout";

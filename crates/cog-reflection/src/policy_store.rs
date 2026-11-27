@@ -39,7 +39,7 @@ pub struct PolicyArtifact {
 impl PolicyArtifact {
     fn compute_hash(parent_hash: &str, payload: &serde_json::Value) -> String {
         // canonical：serde_json Map 默认 BTreeMap 序，序列化稳定
-        let canonical = serde_json::to_string(payload).unwrap_or_default();
+        let canonical = serde_json::to_string(payload).unwrap_or(Default::default());
         let mut h = Sha256::new();
         h.update(parent_hash.as_bytes());
         h.update(canonical.as_bytes());
@@ -123,6 +123,7 @@ impl PolicyStore {
     }
 
     fn version_path(&self, name: &str, version: u64) -> PathBuf {
+        // state-file: store — 策略存储自己的介质（版本化的声明），不是流上事实的影子
         self.policy_dir(name).join(format!("{version:06}.json"))
     }
 

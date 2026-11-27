@@ -115,7 +115,8 @@ pub fn needs_the_hold(later: &DocumentDelivery) -> bool {
 ///
 /// A third of the sighting window, so a miss or two of the tick is not what
 /// decides whether the row reads as maintained.
-// cap: bound — 取的是目击窗的三分之一，所以少漏一两拍不决定这一行读不读作「在维护」
+// cap: fixed — 取的是目击窗的三分之一，所以少漏一两拍不决定这一行读不读作「在维护」
+// keep: 删掉后少漏一两拍就决定这一行读不读作在维护；由「目击窗的三分之一」兜住
 const REASSERT_PERIOD: Duration = Duration::from_secs(300);
 
 /// Read the document, wait out the settle window, read it again, and act.
@@ -851,7 +852,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cog-config-delivery-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let missing = dir.join("not-delivered.json");
-        let _ = std::fs::remove_file(&missing);
+        cog_core::ignore_lost!(std::fs::remove_file(&missing));
         assert_eq!(judge(&missing), DocumentDelivery::Absent);
 
         let broken = dir.join("broken.json");
@@ -862,7 +863,7 @@ mod tests {
         std::fs::write(&other, "{\"app\": {\"log_level\": \"debug\"}}").unwrap();
         assert!(matches!(judge(&other), DocumentDelivery::Differs(_)));
 
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// The document this binary carries has to be one the running code can act
@@ -922,7 +923,10 @@ mod tests {
     fn the_declared_observability_section_loads() {
         let declared: serde_json::Value =
             serde_json::from_str(crate::config::DECLARED_CONFIG_JSON).unwrap();
-        let section = declared.get("observability").cloned().unwrap_or_default();
+        let section = declared
+            .get("observability")
+            .cloned()
+            .unwrap_or(Default::default());
         serde_json::from_value::<crate::config::ObservabilityExportersConfig>(section)
             .expect("the declared observability section loads");
     }

@@ -451,4 +451,7 @@ pub struct EvolutionResult {
     /// 消费方取它作为参数，不重算。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tiering: Option<crate::criteria_face::Tiering>,
+    /// 发起这次演化的那条任务：它要的变更，落地率按它读得回来。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_of_work: Option<String>,
 }

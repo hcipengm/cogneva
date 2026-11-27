@@ -1594,7 +1594,7 @@ impl ObservabilityGateway for MemoryObservabilityGateway {
     }
 
     fn publish_event(&self, event: AgentEvent) {
-        let _ = self.event_tx.send(event);
+        cog_core::ignore_lost!(self.event_tx.send(event));
     }
 }
 

@@ -233,6 +233,26 @@ pub async fn rebuild(
         .await
         .map_err(|e| format!("write a histogram sum: {e}"))?;
     }
+    // 三张累加表被整表重写了，标签侧表也要跟着重写：只写累加行会让重建出来的序列在
+    // `metric_labels` 上一条标签都没有——按标签筛的读者（第 10 环的 endpoint/status）
+    // 会读成「这个端点一条请求都没有」。侧表是累加行的导数，重写就得一起重写。
+    sqlx::query("DELETE FROM metric_labels")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("clear metric_labels: {e}"))?;
+    sqlx::query(
+        "INSERT INTO metric_labels (name, labels, key, value) \
+         SELECT t.name, t.labels, e.key, e.value \
+           FROM (SELECT DISTINCT name, labels FROM cog_metric_counter_totals \
+                 UNION SELECT DISTINCT name, labels FROM cog_metric_histogram_buckets \
+                 UNION SELECT DISTINCT name, labels FROM cog_metric_histogram_sums) t, \
+                LATERAL jsonb_each_text(t.labels::jsonb) e \
+         ON CONFLICT (name, labels, key) DO NOTHING",
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("rebuild metric_labels: {e}"))?;
+
     let as_of: Option<chrono::DateTime<chrono::Utc>> =
         sqlx::query_scalar("SELECT max(as_of) FROM cog_metric_counter_totals")
             .fetch_one(&mut *tx)

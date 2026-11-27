@@ -170,6 +170,7 @@ CREATE TABLE IF NOT EXISTS task_defined (
                 created_at TIMESTAMPTZ NOT NULL,
                 priority INTEGER NOT NULL DEFAULT 0,
                 max_retries INTEGER NOT NULL DEFAULT 0,
+                -- db-column: task_defined.declared_duration_seconds — not-a-bound — 任务自己声明的时长（输入，不是我们设的界）
                 declared_duration_seconds BIGINT NOT NULL DEFAULT 0,
                 is_executable BOOLEAN NOT NULL DEFAULT TRUE,
                 acceptance TEXT[] NOT NULL DEFAULT '{}',
@@ -195,6 +196,11 @@ CREATE TABLE IF NOT EXISTS task_defined (
                 intent_id TEXT GENERATED ALWAYS AS (
                     (CASE WHEN input ~ '^[[:space:]]*[\[{]' THEN input::jsonb END) ->> 'intent_id'
                 ) STORED,
+                -- 三格与迁移 141 是同一列表述；放在末尾，升上来的库与全新安装的
+                -- 列序才一样（`task_ledger_ddl_matches_the_migration` 逐列比）。
+                terminal TEXT NOT NULL DEFAULT '',
+                now TEXT NOT NULL DEFAULT '',
+                gap TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (task_id, rev)
             )
 ;
@@ -220,6 +226,19 @@ CREATE INDEX IF NOT EXISTS idx_task_defined_venue
 -- proxied call, so it is an index and not a scan.
 CREATE INDEX IF NOT EXISTS idx_task_defined_submitted_by
             ON task_defined(submitted_by)
+;
+-- 定义行携带的交接身份落成的侧表（迁移 131 的同一列表述）。一次交接可以带多行
+-- 身份，所以它不是 task_defined 上的一列；两跳对账按身份键查，读的人不再把
+-- `input` 文本解析一遍。写者与 `insert_definition_row` 在同一语句里落行。
+CREATE TABLE IF NOT EXISTS task_change_identity (
+                task_id TEXT NOT NULL,
+                rev BIGINT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                literal TEXT NOT NULL,
+                PRIMARY KEY (task_id, rev, ordinal)
+            )
 ;
 CREATE TABLE IF NOT EXISTS task_transition (
                 task_id TEXT NOT NULL,
@@ -692,7 +711,7 @@ impl PostgresStateBackend {
                     }
                 }
             }
-            task_ledger::append_transition(
+            let seq = task_ledger::append_transition(
                 &mut tx,
                 &task_ledger::Transition {
                     task_id,
@@ -705,9 +724,24 @@ impl PostgresStateBackend {
                 },
             )
             .await?;
+            // 接下的那一刻是一条事实：「谁接下了这条活、租到什么时候」。续租不进流
+            // ——同一个 owner 把到期时刻往后挪是读数，不是一件新发生的事。
+            if updated.status == cog_core::TaskStatus::Running {
+                if let Some(owner) = updated.lease_owner.clone() {
+                    let payload = cog_core::EventPayload::TaskLeased {
+                        task_id: task_id.to_string(),
+                        owner,
+                        expires_at: updated.lease_expires_at.unwrap_or_else(chrono::Utc::now),
+                        actor: "store".into(),
+                    };
+                    let fields =
+                        payload.envelope(&task_ledger::lease_event_id(task_id, seq), "storage");
+                    super::event_log::append_on(&mut tx, &fields, chrono::Utc::now()).await?;
+                }
+            }
         }
 
-        task_ledger::project(&mut tx, Some(task_id)).await?;
+        task_ledger::project_incremental(&mut tx, task_id).await?;
         sqlx::query(
             "UPDATE task_current SET lease_owner = $2, lease_expires_at = $3 WHERE task_id = $1",
         )
@@ -1825,7 +1859,7 @@ SELECT t.to_state, COUNT(*)::bigint
             },
         )
         .await?;
-        task_ledger::project(&mut tx, Some(task_id)).await?;
+        task_ledger::project_incremental(&mut tx, task_id).await?;
 
         tx.commit()
             .await
@@ -1862,7 +1896,7 @@ SELECT t.to_state, COUNT(*)::bigint
                     reported = %error,
                     "a failure arrived for a finished task; keeping the outcome it already had"
                 );
-                tx.rollback().await.ok();
+                cog_core::ignore_lost!(tx.rollback().await);
                 return Ok((false, Vec::new()));
             }
         }
@@ -1946,7 +1980,7 @@ SELECT t.to_state, COUNT(*)::bigint
             },
         )
         .await?;
-        task_ledger::project(&mut tx, Some(task_id)).await?;
+        task_ledger::project_incremental(&mut tx, task_id).await?;
 
         let mut cancelled = Vec::new();
         if !should_retry {
@@ -1999,7 +2033,7 @@ SELECT t.to_state, COUNT(*)::bigint
                                 },
                             )
                             .await?;
-                            task_ledger::project(&mut tx, Some(&child)).await?;
+                            task_ledger::project_incremental(&mut tx, &child).await?;
                             cancelled.push(child.clone());
                         }
                     }
@@ -2068,7 +2102,7 @@ SELECT t.to_state, COUNT(*)::bigint
             },
         )
         .await?;
-        task_ledger::project(&mut tx, Some(task_id)).await?;
+        task_ledger::project_incremental(&mut tx, task_id).await?;
 
         let mut cancelled = Vec::new();
         let mut stack = vec![task_id.to_string()];
@@ -2118,7 +2152,7 @@ SELECT t.to_state, COUNT(*)::bigint
                             },
                         )
                         .await?;
-                        task_ledger::project(&mut tx, Some(&child)).await?;
+                        task_ledger::project_incremental(&mut tx, &child).await?;
                         cancelled.push(child.clone());
                     }
                 }

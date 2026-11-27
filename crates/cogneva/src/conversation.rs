@@ -32,6 +32,84 @@ use cog_gateway::chat::{
     MemoryEntryView, RewindReport,
 };
 
+/// 这一屏交给模型的那一句：属主要在对话里办的事，和只是说话，怎么分。
+///
+/// 不另起一次分类调用：这一轮本来就要回答，模型在回答里选择调不调
+/// `start_task` 就是分类。工具调用不是额外模型调用，只多几十个 token。
+const CONVERSATION_INTENT_INSTRUCTION: &str = "这一屏是属主在和你说话。属主这一句如果要求办一件事——改代码、修东西、做出来或去查——就在这一轮调用 start_task，把 goal、acceptance、terminal、now、gap 一起给出：terminal 是做完之后世界的样子，now 是此刻树上读到的样子，gap 是还缺什么；然后回答属主。如果只是问题、闲聊或追问，就不要调 start_task，直接回答。不要把一句普通的话派成任务。";
+
+/// `/task` 与 `/chat`：属主自己说的判词，不由模型再猜一遍。
+///
+/// 两个词只在句首生效（前面的空白不算），后面跟什么都行。它们不改原话——
+/// 意图行里存的仍是属主打的整句——只改这一轮交给模型的那一段说明。别的写法
+/// （句子中间出现 `/task`、`/tasking`）不是开关：把一句提到开关词的话读成开关，
+/// 是替属主做了他没做的决定。
+fn intent_instruction(turn: &str) -> String {
+    // 开关是句首那**一个词**，不是句首的几个字母：`/tasking` 是一个普通词，
+    // 拿前缀去匹配会把它读成 `/task`。
+    let word = turn
+        .trim_start()
+        .split(char::is_whitespace)
+        .next()
+        .unwrap_or("");
+    let directive = match word {
+        "/task" => {
+            "属主这一句打了 `/task`：这是一件要办的事，这一轮必须调用 start_task 把它交出来。"
+        }
+        "/chat" => "属主这一句打了 `/chat`：这一句只是说话，不要调用 start_task。",
+        _ => return CONVERSATION_INTENT_INSTRUCTION.to_string(),
+    };
+    format!("{CONVERSATION_INTENT_INSTRUCTION}\n\n{directive}")
+}
+
+/// 这一句里有没有「可能是一件活」的动词。**只做前置，不主判。**
+///
+/// 回答那一轮自己会判；它答了「不是活」之后，这一句默认被标成已接手，下一批
+/// 分诊不会再捡。这条预筛守的是另一半：一句带着「改 / 修 / 查 / 部署」的话被
+/// 判成了闲聊时，不标接手，留给批量分诊带着原文重判一次——那一次是兜底，不是
+/// 主判。没有动词的句子（问候、感想、纯问题）照常标掉，闲聊因此仍然零额外调用。
+///
+/// 判据故意只是「出现过这些词」：它不判断语气、不判断谁在说、不判断上下文。
+/// 一个确定的字面量至少是确定的；让这条前置去猜意图，就等于把主判搬到一个更
+/// 便宜也更瞎的调用上。
+fn may_be_work(text: &str) -> bool {
+    const WORK_VERBS: &[&str] = &[
+        "改",
+        "修",
+        "做",
+        "建",
+        "删",
+        "加",
+        "查",
+        "写",
+        "跑",
+        "部署",
+        "提交",
+        "实现",
+        "补",
+        "清理",
+        "迁移",
+        "上线",
+        "重命名",
+        "替换",
+        "fix",
+        "change",
+        "add",
+        "build",
+        "deploy",
+        "implement",
+        "remove",
+        "update",
+        "write",
+        "run",
+        "ship",
+        "migrate",
+        "refactor",
+    ];
+    let lowered = text.to_lowercase();
+    WORK_VERBS.iter().any(|verb| lowered.contains(verb))
+}
+
 /// 这一段对话在名册里属于哪个分组。
 ///
 /// 分组只参与名字的哈希材料，把界面上这些员工与 worker 池、进化池的同号槽位
@@ -50,60 +128,73 @@ const REGISTRATION_HEARTBEAT_SECS: u64 = cog_core::config::AGENT_HEARTBEAT_INTER
 ///
 /// 上下文的容量是有限的，收件箱不是：一晚上攒了五十条，全塞进这一轮会把这一轮
 /// 自己的问题挤出去。读不完的留在流里，下一轮接着读。
-// cap: bound — 一轮对话的上下文里，收件箱这一块最多占几条
+// cap: fixed — 一轮对话的上下文里，收件箱这一块最多占几条
+// keep: 删掉后收件箱这一块可以任意长，把一段对话的上下文淹掉；由「一轮上下文里最多占几条」兜住
 const INBOX_DRAIN_MAX: usize = 16;
 
 /// 读收件箱时，等一条新消息等多久算「这一轮没有更多了」。
 ///
 /// 这是人正等着的一段对话，不是后台消费者：静默窗口按人的耐心取，而不是按
 /// 总线的延迟上限取。
-// cap: bound — 收件箱排空的静默窗口，按一段对话能接受的额外等待取
+// cap: fixed — 收件箱排空的静默窗口，按一段对话能接受的额外等待取
+// keep: 删掉后排空没有静默窗口，一段对话的额外等待无界；由「按对话能接受的额外等待取」兜住
 const INBOX_QUIET_MS: u64 = 200;
 
 /// 一次开跑花在读收件箱上的总预算。
 ///
 /// 消息接连不断地来也不无限读：这条界与条数界互为兜底，谁先到谁停。
-// cap: bound — 开跑前读收件箱的总时间预算
+// cap: fixed — 开跑前读收件箱的总时间预算
+// keep: 删掉后开跑前读收件箱没有总预算，一条挂住的队列拖着整段对话；由「开跑前读收件箱的总时间预算」兜住
 const INBOX_DRAIN_BUDGET_MS: u64 = 1_500;
 
 /// 领回「上一轮读到一半就断了」的消息，等它闲置多久。
 ///
 /// 与后台消费者同一个取法：同一段会话的两轮不会同时在跑，所以这个窗口只要
 /// 大过一轮正常对话的读耗时，就不会把另一个人正在读的那条抢过来。
-// cap: bound — 回收待处理消息的最小闲置时长
+// cap: fixed — 回收待处理消息的最小闲置时长
+// keep: 删掉后把还在排空的消息抢回来，同一件活做两遍；由「最小闲置时长」兜住
 const INBOX_TAKEOVER_IDLE_MS: u64 = 5_000;
 
 /// 一次回收调用要多少条。
-// cap: bound — 一次回收调用要多少条待处理消息
+// cap: fixed — 一次回收调用要多少条待处理消息
+// keep: 删掉后一次回收把所有待处理消息拉进内存；由「一次回收要多少条」兜住
 const INBOX_TAKEOVER_BATCH: usize = 16;
 
 /// 一次 `list_tasks` 最多回多少行。
-// cap: bound — 一次读台账回多少行；整张图会把上下文和这次回答一起淹掉
+// cap: fixed — 一次读台账回多少行；整张图会把上下文和这次回答一起淹掉
+// keep: 删掉后整张图把上下文和这次回答一起淹掉；由「一次读台账回多少行」兜住
 const LIST_TASKS_LIMIT: usize = 40;
 /// 调用方没给 `limit` 时回多少行。
-// cap: bound — 默认页只有上限的一半：上限是显式要多的人能拿到的，默认值给的是「一眼扫完、还能接着问」的量
+// cap: fixed — 默认页只有上限的一半：上限是显式要多的人能拿到的，默认值给的是「一眼扫完、还能接着问」的量
+// keep: 删掉后默认页等于上限，一眼扫不完也不留追问余地；由「默认页是上限的一半」兜住
 const LIST_TASKS_DEFAULT: usize = 20;
 
 /// 一次读变更账向账本要多少行，也是调用方能要到的上限。
 ///
 /// 未了结的那本账有几千行，全取回来会把这一轮的上下文和这次回答一起淹掉。取回来
 /// 再按调用方的 `match`/`state` 筛，所以窗口要够筛而不是刚好够看。
-// cap: bound — 一次读变更账向账本要多少行
+// cap: fixed — 一次读变更账向账本要多少行
+// keep: 删掉后一次读变更账要的行数无界；由「一次读变更账要多少行」兜住
 const LIST_CHANGES_WINDOW: usize = 40;
 /// 调用方没给 `limit` 时回多少行。
-// cap: bound — 默认页是窗口的一半：够扫一眼，也留得住接着追问的余地
+// cap: fixed — 默认页是窗口的一半：够扫一眼，也留得住接着追问的余地
+// keep: 删掉后默认页等于窗口，够不着一眼扫完又留得住追问的余地；由「默认页是窗口的一半」兜住
 const LIST_CHANGES_DEFAULT: usize = 20;
 /// 一条变更的历史最多回几步。
-// cap: bound — 一次 `get_change` 回多少条状态迁移；更早的那几步读不出「现在在哪」以外的信息
+// cap: fixed — 一次 `get_change` 回多少条状态迁移；更早的那几步读不出「现在在哪」以外的信息
+// keep: 删掉后回到「一次 `get_change` 回多少条状态迁移；更早的那几步读不出「现在在哪」以外的信息」所描述的情形；由这条约定兜住
 const CHANGE_HISTORY_LIMIT: usize = 20;
 /// 一次读原则账向账本要多少行，也是调用方能要到的上限。
-// cap: bound — 一次读原则账向账本要多少行
+// cap: fixed — 一次读原则账向账本要多少行
+// keep: 删掉后一次读原则账要的行数无界；由「一次读原则账要多少行」兜住
 const LIST_PRINCIPLES_WINDOW: usize = 40;
 /// 调用方没给 `limit` 时回多少行。
-// cap: bound — 默认页是窗口的一半，理由同变更账那一对
+// cap: fixed — 默认页是窗口的一半，理由同变更账那一对
+// keep: 删掉后默认页等于窗口；由「默认页是窗口的一半」兜住
 const LIST_PRINCIPLES_DEFAULT: usize = 20;
 /// 一次读告警最多回几条。
-// cap: bound — 一次读告警回几条；亮着的告警多到看不完时，本身就是要先说出来的事
+// cap: fixed — 一次读告警回几条；亮着的告警多到看不完时，本身就是要先说出来的事
+// keep: 删掉后亮着的告警一次全回来，说不完的告警把回答淹掉；由「告警多到看不完本身就是要先说的事」兜住
 const ACTIVE_ALERTS_LIMIT: usize = 20;
 
 /// 这一段对话在名册里的身份：名字与 id。
@@ -116,6 +207,12 @@ const ACTIVE_ALERTS_LIMIT: usize = 20;
 /// 指纹缺失时退回进程自身的装配标识：名字仍然唯一，但它只稳定到下一次滚动，
 /// 于是 `stable` 如实置 false——这是"滚一次会不会换名"的那一位，不能糊。
 pub fn employee_for(session_id: &str) -> cog_agent::identity::AgentName {
+    // 员工页点出来的会话 id 自己就写着「跟谁说话」：这一条是纯函数，不依赖身份
+    // 绑定表在不在。没有这一支时，进程没装身份存储的部署会把同一段会话派给一个
+    // 由指纹算出来的陌生人——员工页点 E0412，答话的却是别人。
+    if let Some(target) = session_target(session_id) {
+        return employee_for_target(target);
+    }
     employee_named(fingerprint().as_deref(), session_id)
 }
 
@@ -357,7 +454,7 @@ pub struct PlatformConversation {
     /// 意图落点：与网关的 `GatewayState.intent_events` 是同一份。这里只借来写
     /// 属主在对话里说的那一句；缺席时 `record(None, ...)` 会计进 `unwired`，
     /// 不会让这一轮安静地不写。
-    intent_events: Option<Arc<dyn cog_core::IntentEvents>>,
+    intent_events: Option<Arc<dyn cog_core::EventStore>>,
 }
 
 impl PlatformConversation {
@@ -381,7 +478,7 @@ impl PlatformConversation {
         mcp: Option<Arc<dyn cog_core::McpClient>>,
         hooks: Option<Arc<dyn cog_core::HookEngine>>,
         sandbox: Option<Arc<dyn cog_core::SandboxBackend>>,
-        intent_events: Option<Arc<dyn cog_core::IntentEvents>>,
+        intent_events: Option<Arc<dyn cog_core::EventStore>>,
     ) -> Self {
         Self {
             orchestrator,
@@ -454,7 +551,9 @@ async fn open_checkpoints(
         }
         Err(reason) => {
             tracing::debug!(session_id, %reason, "会话开头的检查点拍不下来");
-            let _ = crate::checkpoints::mark_unavailable(&kv, &owner, &session_id, reason).await;
+            cog_core::ignore_lost!(
+                crate::checkpoints::mark_unavailable(&kv, &owner, &session_id, reason).await
+            );
         }
     }
 }
@@ -492,6 +591,57 @@ async fn close_checkpoints(
         Err(reason) => {
             tracing::debug!(session_id, turn, %reason, "这一轮的检查点拍不下来");
         }
+    }
+}
+
+/// 会话开头那张快照与这一轮的第一道命令之间的闸。
+///
+/// 拍快照那一趟在开跑时就被派出去（见 `turn` 里那一段），这一层包在工具面的
+/// 执行器外面：不碰树的调用原样透传，第一次真要动树时才等那一趟走完。
+/// 不变量因此没变——命令仍然排在那张快照之后；变的是**回答不排在它后面**。
+struct OpeningSnapshot {
+    inner: Arc<dyn cog_core::SandboxBackend>,
+    /// 那一趟走完了没有。拍不下来也算走完：它的出路是记下「这个会话没有
+    /// 开头快照」，不是把这一轮的命令永远扣住。
+    landed: tokio::sync::watch::Receiver<bool>,
+}
+
+impl OpeningSnapshot {
+    /// 等那一趟走完。已经有结论的闸不再等：第一次读到的就是 `true`。
+    async fn settled(&self) {
+        let mut landed = self.landed.clone();
+        // 发送端随那一趟一起丢掉（任务 panic 也一样）：那时闸跟着消失，命令
+        // 照过——一张拍不下来的快照不该变成一张永远不落地的门。
+        while !*landed.borrow() && landed.changed().await.is_ok() {}
+    }
+}
+
+#[async_trait::async_trait]
+impl cog_core::SandboxBackend for OpeningSnapshot {
+    async fn execute(&self, req: &cog_core::SandboxRequest) -> SFResult<cog_core::SandboxResult> {
+        self.settled().await;
+        self.inner.execute(req).await
+    }
+
+    async fn execute_stream(
+        &self,
+        req: &cog_core::SandboxRequest,
+    ) -> SFResult<cog_core::CommandEventStream> {
+        self.settled().await;
+        self.inner.execute_stream(req).await
+    }
+
+    // 下面三问不碰树：队列、边界、预编译照当时的样子答，不排在快照后面。
+    async fn boundary(&self) -> SFResult<cog_core::SandboxBoundary> {
+        self.inner.boundary().await
+    }
+
+    async fn lane(&self) -> SFResult<cog_core::BuildLaneReading> {
+        self.inner.lane().await
+    }
+
+    async fn precompile(&self, bytes: &[u8]) -> SFResult<String> {
+        self.inner.precompile(bytes).await
     }
 }
 
@@ -552,8 +702,8 @@ pub(crate) async fn note_person(
 ///
 /// 界的是这一行的体积，不是参数能有多大：真正拦住大参数的是工具自己的上限，
 /// 这里只保证一条询问不会把整份文件正文塞进对话框。
-// cap: bound — 一行摘要的长度，界的是问句在屏幕上的体积
-const PERMISSION_SUMMARY_CHARS: usize = 240;
+// cap: fixed — 一行摘要的长度，界的是问句在屏幕上的体积
+// keep: 删掉后一行摘要跟着问句长度走，屏幕上放不下；由「界的是问句在屏幕上的体积」兜住
 
 /// 把一次调用的参数压成一行：`command` / `path` 这类最要紧的那一格先说，
 /// 那样屏幕上第一眼看到的就是它要动什么。
@@ -575,12 +725,9 @@ fn permission_summary(arguments: &serde_json::Value) -> String {
         }
         other => other.to_string(),
     };
-    if text.chars().count() <= PERMISSION_SUMMARY_CHARS {
-        text
-    } else {
-        let head: String = text.chars().take(PERMISSION_SUMMARY_CHARS).collect();
-        format!("{head}…")
-    }
+    // 这一行是**批准前的摘要**：属主按它点头。截断等于让人批准自己没看到的
+    // 那部分，按「有损默认无损」整段交出去；要短的是渲染，不是它。
+    text
 }
 
 /// 把内核的「问一句」接到这条连接上。
@@ -914,17 +1061,32 @@ impl ConversationTurn for PlatformConversation {
             // 算出来的那个名字。
             let owner = Some(request.owner.as_str()).filter(|owner| !owner.trim().is_empty());
             let employee = self.employee_here(owner, &request.session_id).await;
-            if let Some(text) = last_user_text(&request.messages) {
-                cog_gateway::intent::record(
-                    self.intent_events.as_ref(),
-                    chat_intent_row(
-                        &request.session_id,
-                        request.owner.as_str(),
-                        &employee.id,
-                        &text,
-                    ),
-                )
-                .await;
+            let mut intent_identity = None;
+            if let Some(model_text) = last_user_text(&request.messages) {
+                // 原话优先取请求带进来的那一格（未展开）；没有就退回模型读到的那段
+                // ——旧调用方没有这一格，那时两者本来就是同一段。
+                let original = request
+                    .original_text
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| model_text.clone());
+                let expansion = (original != model_text).then_some(model_text.as_str());
+                let arrival = request
+                    .arrival_id
+                    .clone()
+                    .unwrap_or_else(|| model_text.clone());
+                let row = chat_intent_row(
+                    &request.session_id,
+                    request.owner.as_str(),
+                    &employee.id,
+                    &arrival,
+                    &original,
+                    expansion,
+                );
+                intent_identity = Some(row.identity.clone());
+                cog_gateway::intent::record(self.intent_events.as_ref(), row).await;
             }
             // 先把他记进「说过话的人」名册：注册表上的心跳在他闭嘴几十秒后就
             // 过期，而人要找的是「那个跟我聊过的人」。写不进去不是这一轮的
@@ -997,20 +1159,35 @@ impl ConversationTurn for PlatformConversation {
                 ..Default::default()
             };
             // 会话开头的那棵树：只在第一次进到这里时真的拍（之后读一行 KV 就
-            // 知道已经有了）。这一句要等，是因为它必须落在动手之前——放到开跑
-            // 之后，拍到的就是这一轮改了一半的树，而读数上它叫「会话开头」。
-            if let (Some(owner_name), Some(sandbox), Some(kv)) =
-                (owner, self.sandbox.as_ref(), self.people.as_ref())
-            {
-                open_checkpoints(
-                    Arc::clone(sandbox),
-                    Arc::clone(kv),
-                    owner_name.to_string(),
-                    request.session_id.clone(),
-                    employee.id.clone(),
-                )
-                .await;
-            }
+            // 知道已经有了）。
+            //
+            // 这一趟派出去跑，不在这里等。它是附加能力，拍不下来时这一趟自己
+            // 会把「这个会话没有开头快照」记进账（`mark_unavailable`）；把它放在
+            // 回答的必经之路上，等到的只是执行器换版的那整个重试窗口——2026-11-24
+            // 实测一轮因此停在 `message.start` 上 3 分 26 秒，最后落的还是一句
+            // 与快照毫无关系的上游拒绝。
+            //
+            // 但它仍要落在这一轮动手之前：放到开跑之后，拍到的就是这一轮改了
+            // 一半的树，读数上却还叫「会话开头」。所以闸装在**命令**那一侧
+            // （见 `OpeningSnapshot`）：不碰树的回答不等它，要动树的时候才等。
+            let opening = match (owner, self.sandbox.as_ref(), self.people.as_ref()) {
+                (Some(owner_name), Some(sandbox), Some(kv)) => {
+                    let (landed_tx, landed) = tokio::sync::watch::channel(false);
+                    let who = owner_name.to_string();
+                    let session = request.session_id.clone();
+                    let agent = employee.id.clone();
+                    let capturing = Arc::clone(sandbox);
+                    let kv = Arc::clone(kv);
+                    tokio::spawn(async move {
+                        open_checkpoints(capturing, kv, who, session, agent).await;
+                        // 拍到了、拍不下来、这个会话本来就有开头快照，都是这一趟
+                        // 走完了：闸放下，命令照常过。
+                        cog_core::ignore_lost!(landed_tx.send(true));
+                    });
+                    Some((landed, Arc::clone(sandbox)))
+                }
+                _ => None,
+            };
             // 工具面 = 这个进程装配好的那一份 ＋ 控制面五只。
             //
             // 复制的是**整张注册表**（`fork`），不是工具清单：哪些工具存在只是
@@ -1022,10 +1199,19 @@ impl ConversationTurn for PlatformConversation {
             //
             // 表本身仍是这一轮私有的：控制面五只只属于这一段对话，注册进共用表里
             // 会变成每个 agent 都能派活。
-            let tools = match self.tools.as_ref() {
+            let mut tools = match self.tools.as_ref() {
                 Some(shared) => shared.fork(),
                 None => cog_agent::ToolRegistry::new(),
             };
+            // 命令那一侧的闸：第一次真要动树的时候，先等会话开头那张快照。
+            // 子任务复制的是这张已经上过闸的表（`tools.fork()`），所以子任务
+            // 的第一道命令排的也是同一张快照之后。
+            if let Some((landed, sandbox)) = opening {
+                tools.set_sandbox_backend(Arc::new(OpeningSnapshot {
+                    inner: sandbox,
+                    landed,
+                }));
+            }
             // 三本只读账与控制面五只同一处装：它们读的也是这个进程里已发布的
             // 服务，缺的那本由进程如实缺席，而工具会把它说出来。
             for tool in ledger_tools(&self.ledgers) {
@@ -1099,7 +1285,7 @@ impl ConversationTurn for PlatformConversation {
             // 需要问的那一步拒绝执行（见 `permission::decide`）。
             let permission_mode =
                 cog_agent::permission::PermissionMode::parse(&request.permission_mode)
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
             // 判定者先于工具表装好：子任务要用同一个判定者，而工具得在
             // `with_tools` 之前进表。晚一步建出来，子任务就只能自己造一个
             // 「不问」的判定者——那等于用一次分解绕开了人的决定。
@@ -1154,6 +1340,10 @@ impl ConversationTurn for PlatformConversation {
                     files_seen: None,
                 },
             ));
+            // 判据审是另一次调用，但它读的是同一份工具面：fork 一份，读树
+            // 用 read_file / command，判者只回答「这段终态在树上立不立得住」。
+            // 判据审只拿读的几只：它要读树，不该派活或改树。
+            let eval_tools = tools.read_only();
             let mut runtime = cog_agent::AgentRuntime::new(config, events).with_tools(tools);
             // 属主写下的约定：只在这条连接既是某个登录身份、又接上了键值存储时
             // 才挂读面。没有身份就没有「属主」，读不到任何一个人的话——不挂，
@@ -1201,9 +1391,21 @@ impl ConversationTurn for PlatformConversation {
                 let after_engine = self.hooks.clone();
                 let after_log = Arc::clone(&colleague_messages);
                 let filed_log = Arc::clone(&filed_tasks);
+                let intent_for_hook = intent_identity.clone();
                 runtime = runtime.with_hooks(cog_agent::AgentHooks {
                     before_tool_call: Some(Arc::new(
                         move |tool: &str, arguments: &mut serde_json::Value| {
+                            // 这条活是哪一句意图交出来的：工具自己不知道，
+                            // 这一轮知道。挂在参数上，任务行与意图因此由同一个
+                            // 身份连起来，不靠事后按时间猜。
+                            if tool == "start_task" {
+                                if let (Some(intent), Some(object)) =
+                                    (intent_for_hook.as_deref(), arguments.as_object_mut())
+                                {
+                                    object
+                                        .insert("intent_id".to_string(), serde_json::json!(intent));
+                                }
+                            }
                             // 观测型钩子（log / notify / webhook）也要看见这次
                             // 调用：事件先发出去，判定再回答。两件事的顺序不
                             // 影响结果，但先发出去意味着被拒的调用也在账上。
@@ -1275,12 +1477,20 @@ impl ConversationTurn for PlatformConversation {
             // 这一段选的模型：只挂在这一轮的每一发上。没选过时是 `None`，走上游
             // 配置的那一只——不是在这里另写一个默认名。
             let mut runtime = runtime.with_model(request.model.clone());
+            if let Some(causation) = intent_identity.as_deref().map(cog_core::intent_event_id) {
+                runtime = runtime.with_call_causation(causation);
+            }
 
             // 开跑前先读收件箱：同事在它不在的时候发来的话，这一轮要看得见。
             // 读完就确认，下一轮只读新的；回信地址跟着消息一起带进来，等这一轮
             // 有了答案再投回去。
             let mut askers: Vec<String> = Vec::new();
             let mut history: Vec<cog_core::Message> = Vec::new();
+            // 同事发来的话也是意图：谁说的、说给谁、原话。它们走收件箱进来，
+            // 不经过 WebUI 那条入口，但进的是同一本意图账——否则「所有输入先
+            // 成为一条意图」只对属主成立。这一轮把它们一并接手，下一批分诊
+            // 因此不会把已经答过的话再捡一遍。
+            let mut inbox_intents: Vec<String> = Vec::new();
             if let Some(backend) = self.inbox.as_ref() {
                 for msg in drain_inbox(backend, &employee.id).await {
                     if let cog_core::InboxMessage::Prompt {
@@ -1290,11 +1500,35 @@ impl ConversationTurn for PlatformConversation {
                     {
                         askers.push(stream.clone());
                     }
+                    if let Some((said_by, text)) = inbox_intent(&msg) {
+                        let row = cog_core::IntentRow::new(
+                            "internal",
+                            cog_core::intent_identity(
+                                "internal",
+                                &format!("{said_by}:{}:{text}", employee.id),
+                            ),
+                            said_by,
+                            employee.id.clone(),
+                            text,
+                            None,
+                        );
+                        inbox_intents.push(row.identity.clone());
+                        cog_gateway::intent::record(self.intent_events.as_ref(), row).await;
+                    }
                     if let Some(text) = inbox_as_message(&msg) {
                         history.push(cog_core::Message::user(text));
                     }
                 }
             }
+            // 这一轮属主说的那句话：判据审拿它当「是不是意图要的那件事」的尺子，
+            // 也是 `/task`、`/chat` 这两个显式开关读的那一格。历史随后就被搬进
+            // 内核，这里先把这一句留下。
+            let turn_text = last_user_text(&request.messages).unwrap_or(Default::default());
+            // 这一句放在历史最前面：模型在回答这一轮时，手里同时有「这是谁」
+            // 与「什么算活、活要带哪三格」。不调一个分类器，选择调不调
+            // `start_task` 就是分类；属主写了 `/task` 或 `/chat` 时，那句话
+            // 已经替模型判过，不再让它猜。
+            history.push(cog_core::Message::system(intent_instruction(&turn_text)));
             history.extend(request.messages);
 
             // 说话的这一段时间它在名册上活着：续约间隔比名册的过期短，否则一轮
@@ -1307,6 +1541,132 @@ impl ConversationTurn for PlatformConversation {
             let mut answer = runtime
                 .run_conversation(history, request.llm.as_ref())
                 .await;
+            // 判据审：另一次调用，读这一轮的工作树，判三格立不立得住。不成立
+            // 的任务当场撤回；判词随这一轮的交付物回给属主，不把「写歪了」
+            // 留给执行者去撞。
+            let review_items: Vec<(
+                String,
+                cog_core::contract::ledger_item::LedgerItem,
+                Option<String>,
+            )> = filed_tasks
+                .lock()
+                .ok()
+                .map(|log| {
+                    log.iter()
+                        .filter_map(|row| {
+                            let task_id = row.get("task_id")?.as_str()?.to_string();
+                            let item = row.get("ledger_item")?.clone();
+                            let definition = row
+                                .get("definition")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string);
+                            serde_json::from_value(item)
+                                .ok()
+                                .map(|item| (task_id, item, definition))
+                        })
+                        .collect()
+                })
+                .unwrap_or(Default::default());
+            if !review_items.is_empty() {
+                let items: Vec<cog_core::contract::ledger_item::LedgerItem> = review_items
+                    .iter()
+                    .map(|(_, item, _)| item.clone())
+                    .collect();
+                // 这一轮定下的「这一类是什么、怎样算做完」：判据审按定义判断。
+                let defined = review_items
+                    .iter()
+                    .find_map(|(_, _, definition)| definition.clone());
+                let definition = defined.as_deref();
+                let eval_config = RuntimeConfig {
+                    agent_id: format!("criterion-review:{}", request.session_id),
+                    role: cog_core::roles::EVALUATOR.to_string(),
+                    ..Default::default()
+                };
+                let eval_agent: Arc<dyn cog_core::Agent> = Arc::new(
+                    cog_agent::Agent::new(eval_config, Arc::clone(&request.llm))
+                        .with_tools(eval_tools),
+                );
+                let evaluator = cog_collaboration::actors::EvaluatorActor::new(eval_agent);
+                let verdicts = evaluator
+                    .review_criteria(&turn_text, &items, definition)
+                    .await;
+                let mut attached = Vec::new();
+                for ((task_id, _, _), verdict) in review_items.iter().zip(verdicts.iter()) {
+                    if !verdict.ok {
+                        let _ = self
+                            .orchestrator
+                            .cancel_task_with_reason(task_id, verdict.reason.clone())
+                            .await;
+                    }
+                    attached.push(verdict.clone());
+                }
+                if let Ok(value) = answer.as_mut() {
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert(
+                            "intent_review".to_string(),
+                            serde_json::to_value(&attached).unwrap_or_default(),
+                        );
+                    }
+                }
+            }
+
+            // 这一句意图的下场：这一轮如果真把活交给了任务图，意图挂到那条
+            // 任务上；没有交，就是「这一句只是话」。两条都写一条接手事件，
+            // 否则它会被下一批分诊重新捡起来，而那一次分诊没有这一轮的对话。
+            //
+            // 空 task_id 是「没有任务」的读数，不是一条编出来的任务号：读面按
+            // 事件的存在判「有人接手过」，不按 task_id 去反查一条不存在的行。
+            if let Some(sink) = self.intent_events.as_ref() {
+                let owner_identity = intent_identity.clone();
+                let mut handled = inbox_intents;
+                if let Some(identity) = intent_identity {
+                    handled.push(identity);
+                }
+                if !handled.is_empty() {
+                    let filed = filed_tasks.lock().ok().and_then(|log| {
+                        log.first().and_then(|row| {
+                            row.get("task_id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string)
+                        })
+                    });
+                    let (task_id, actor) = match filed {
+                        Some(task_id) => (task_id, "conversation"),
+                        None => (String::new(), "conversation:no-work"),
+                    };
+                    for identity in handled {
+                        // 漏判兜底：这一轮没派活，而属主那句带着「可能是一件活」的
+                        // 动词——不标接手，留给下一批分诊带着原文重判一次。预筛只
+                        // 决定「要不要留给人再看」，不决定它是不是活。
+                        if task_id.is_empty()
+                            && owner_identity.as_deref() == Some(identity.as_str())
+                            && may_be_work(&turn_text)
+                        {
+                            continue;
+                        }
+                        let events = cog_core::intent_triaged_events(
+                            &[identity.clone()],
+                            &task_id,
+                            actor,
+                            chrono::Utc::now(),
+                        );
+                        let mut failure = None;
+                        for event in events {
+                            if let Err(e) = sink.append(event).await {
+                                failure = Some(e);
+                                break;
+                            }
+                        }
+                        if let Some(e) = failure {
+                            tracing::warn!(
+                                identity = %identity,
+                                error = %e,
+                                "this turn's intent was not marked; the next batch may read it again"
+                            );
+                        }
+                    }
+                }
+            }
             // 挂没挂外部服务、这一次连上没有、问到了几只工具：随这一轮的交付物
             // 一起回去。没有端点的部署没有这一格，界面上也就没有这一行——「没挂」
             // 与「挂了但连不上」是两句不同的话。
@@ -1483,7 +1843,15 @@ impl ConversationTurn for PlatformConversation {
                 return Vec::new();
             };
             let owner = Some(owner).filter(|owner| !owner.trim().is_empty());
-            match crate::owner_memory::remember(kv, owner, text, chrono::Utc::now()).await {
+            match crate::owner_memory::remember(
+                kv,
+                owner,
+                text,
+                chrono::Utc::now(),
+                conversation_window_tokens(),
+            )
+            .await
+            {
                 Ok(entries) => owner_memory_view(entries),
                 Err(error) => {
                     // 写不进去要把理由说给写的人：空名单读起来会像「写完就没了」，
@@ -1722,6 +2090,7 @@ async fn drain_inbox(
             break;
         }
         let window = left.min(Duration::from_millis(INBOX_QUIET_MS));
+        // wall: 等=收件箱的下一条 / 等不到=按静默窗结束这一轮读，已读的照常带走 / 续跑=能，下一轮再读
         match tokio::time::timeout(window, reader.next()).await {
             Ok(Some(Ok((id, bytes)))) => {
                 push_or_log(&mut out, &bytes, agent_id);
@@ -1759,6 +2128,35 @@ fn push_or_log(out: &mut Vec<cog_core::InboxMessage>, bytes: &[u8], agent_id: &s
 /// （见 `cog_agent::inbox`）。这里只负责「这一段对话的收件箱消息要不要进历史」。
 fn inbox_as_message(msg: &cog_core::InboxMessage) -> Option<String> {
     cog_agent::inbox::as_turn_text(msg)
+}
+
+/// 收件箱里的一条同事消息：谁说的、原话。撤停与重置是平台对正在跑的那一轮
+/// 说话，不是某个人交办的一件事，因此不落意图行。
+///
+/// 原文不借用 [`inbox_as_message`] 的转述：那一份是给模型读的回合文本，加了
+/// 「谁发来的」这类前缀；意图行存的是那个人说的原话，一个字节都不改写。
+fn inbox_intent(msg: &cog_core::InboxMessage) -> Option<(String, String)> {
+    use cog_core::InboxMessage;
+    let (said_by, text) = match msg {
+        InboxMessage::Prompt {
+            goal, from_agent, ..
+        } => (
+            from_agent.clone().unwrap_or_default(),
+            goal.as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| goal.to_string()),
+        ),
+        InboxMessage::Continue {
+            instruction,
+            from_agent,
+        }
+        | InboxMessage::Steering {
+            instruction,
+            from_agent,
+        } => (from_agent.clone().unwrap_or_default(), instruction.clone()),
+        InboxMessage::Abort | InboxMessage::Reset => return None,
+    };
+    (!text.trim().is_empty()).then_some((said_by, text))
 }
 
 /// 工具路径（`send_to_agent`）发出去的一条，写成界面上那一行要的全部事实：
@@ -1834,12 +2232,35 @@ fn task_list(
         .and_then(|goal| goal.lines().next())
         .unwrap_or("")
         .trim();
+    let ledger_item = match (
+        arguments
+            .get("terminal")
+            .and_then(serde_json::Value::as_str),
+        arguments.get("now").and_then(serde_json::Value::as_str),
+        arguments.get("gap").and_then(serde_json::Value::as_str),
+    ) {
+        (Some(terminal), Some(now), Some(gap)) => Some(serde_json::json!({
+            "id": task_id,
+            "terminal": terminal,
+            "now": now,
+            "gap": gap,
+            "state": "未落",
+        })),
+        _ => None,
+    };
     Some(serde_json::json!({
         "task_id": task_id,
         "goal": title,
         "goal_id": receipt.get("goal_id").cloned(),
         "venue": receipt.get("venue").cloned(),
         "assigned_to": receipt.get("assigned_to").cloned(),
+        // 这一行是哪一句意图交出来的。挂上它，属主在屏幕上能顺着看
+        // 「我说的那句话 → 意图 → 任务 → 终态」；没有它，任务与那句话之间的
+        // 关系只存在于这一轮的上下文里，页面一关就断了。
+        "intent_id": arguments.get("intent_id").cloned(),
+        "ledger_item": ledger_item,
+        // 这一类是什么、怎样算做完：随派活的那一次交给判据审，而不是让它只就事论事。
+        "definition": arguments.get("definition").cloned(),
     }))
 }
 
@@ -1905,6 +2326,28 @@ impl ControlPlaneOp {
                     "goal": {
                         "type": "string",
                         "description": "要做的事，一句话说清做什么与怎样算做完"
+                    },
+                    "definition": {
+                        "type": "string",
+                        "description": "这一类是什么、这一类里怎样算做完——判据审按它判断，不要写成步骤清单"
+                    },
+                    "goal_id": {
+                        "type": "string",
+                        "description": "续在已有的目标下：交同一个 id，条目就挂到那一道目标上；不给就新开一个"
+                    },
+                    "items": {
+                        "type": "array",
+                        "description": "已经知道的拆法：给出时跳过分解，按每条直接建任务。每条是终态／现在／差距三格；缺 `id` 时按序号生成",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "terminal": {"type": "string", "description": "做完之后世界的自然语言描述"},
+                                "now": {"type": "string", "description": "树上此刻的样子"},
+                                "gap": {"type": "string", "description": "终态减现在"}
+                            },
+                            "required": ["terminal", "now", "gap"]
+                        }
                     }
                 },
                 "required": ["goal"]
@@ -1945,6 +2388,7 @@ impl ControlPlaneOp {
     }
 
     /// 这一项装成内核认的工具：名字、说明、参数结构，以及那个一定存在的执行分支。
+    #[allow(clippy::too_many_arguments)]
     fn tool(
         self,
         orchestrator: Arc<dyn OrchestratorControl>,
@@ -1952,10 +2396,11 @@ impl ControlPlaneOp {
         audit: Option<Arc<dyn AuditStream>>,
         owner: String,
         actor: String,
+        door: Option<Door>,
     ) -> Tool {
         let handler = match self {
             ControlPlaneOp::DispatchGoal => {
-                dispatch_handler(orchestrator, admission, audit, owner, actor)
+                dispatch_handler(orchestrator, admission, audit, owner, actor, door)
             }
             ControlPlaneOp::ListTasks => list_handler(orchestrator),
             ControlPlaneOp::GetTask => get_handler(orchestrator),
@@ -1972,6 +2417,10 @@ impl ControlPlaneOp {
 }
 
 /// 这段对话的工具集。
+/// 交活的那个门：本进程的 HTTP 客户端与服务基址。没有它时对话侧直接调编排器
+/// （进程内装配、测试），有它时打的是与 `start_task` 同一个已服务路径。
+type Door = (Arc<dyn cog_core::HttpClient>, String);
+
 fn control_plane_tools(
     orchestrator: Arc<dyn OrchestratorControl>,
     admission: Option<Arc<dyn HierarchyManager>>,
@@ -1979,6 +2428,7 @@ fn control_plane_tools(
     owner: String,
     actor: String,
 ) -> Vec<Tool> {
+    let door = door_client();
     CONTROL_PLANE
         .iter()
         .map(|op| {
@@ -1988,9 +2438,22 @@ fn control_plane_tools(
                 audit.clone(),
                 owner.clone(),
                 actor.clone(),
+                door.clone(),
             )
         })
         .collect()
+}
+
+/// 本进程能打到的门：基址取自 Agent 循环配置里的 memory API 地址（同一个服务），
+/// 客户端取自网络配置；任何一半缺了就不走门，退回进程内调用。
+fn door_client() -> Option<Door> {
+    let base = cog_agent::AgentLoopConfig::load()
+        .ok()
+        .and_then(|config| config.memory_api_base.clone())
+        .filter(|base| !base.trim().is_empty())?;
+    let config = cog_net::HttpClientConfig::load().ok()?;
+    let client = cog_net::ReqwestHttpClient::from_config(&config).ok()?;
+    Some((Arc::new(client), base))
 }
 
 /// 三本只读账：变更、原则、告警。
@@ -2819,7 +3282,7 @@ fn rollback_change_tool(evolution: Option<Arc<dyn cog_core::EvolutionAdmin>>) ->
                     .get("why")
                     .and_then(|v| v.as_str())
                     .map(str::trim)
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 tracing::info!(why, "rollback requested from a conversation");
                 match admin.rollback().await {
                     Ok(done) => Ok(serde_json::json!({
@@ -3034,7 +3497,7 @@ fn list_principles_tool(principles: Option<Arc<dyn cog_core::PrincipleLedgerStor
                             .map(str::to_string)
                             .collect()
                     })
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
 
                 let census = store.census().await?;
                 let kinds = store.check_kind_census().await?;
@@ -3492,12 +3955,14 @@ async fn record_refusal(
         .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_handler(
     orchestrator: Arc<dyn OrchestratorControl>,
     admission: Option<Arc<dyn HierarchyManager>>,
     audit: Option<Arc<dyn AuditStream>>,
     owner: String,
     actor: String,
+    door: Option<Door>,
 ) -> ToolHandler {
     native(move |args| {
         let orchestrator = orchestrator.clone();
@@ -3505,6 +3970,7 @@ fn dispatch_handler(
         let audit = audit.clone();
         let owner = owner.clone();
         let actor = actor.clone();
+        let door = door.clone();
         async move {
             let goal = require_str(&args, "goal")?.to_string();
             if let Some(refusal) = admission_refusal(admission.as_ref(), &owner, &goal).await {
@@ -3518,7 +3984,131 @@ fn dispatch_handler(
                     "note": "这一次没有派出去，也没有目标号。把原因说给用户听，不要重试同一次提交"
                 }));
             }
-            let goal_id = uuid::Uuid::new_v4().to_string();
+            // 续在已有目标下还是新开一道：与 `start_task` 同一个语义，同一个参数名。
+            let goal_id = args
+                .get("goal_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            // 调用方已经知道拆法时直接交 items：跳过分解，按每条建一件活。
+            // 三格与定义都随任务走，判据审读得到；id 缺了就按序号生成——回执里给的是
+            // 真正入图的那几个 id。
+            let items = args
+                .get("items")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or(Default::default());
+            if !items.is_empty() {
+                let definition = args
+                    .get("definition")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                let mut tasks = Vec::new();
+                let mut ids = Vec::new();
+                for (index, item) in items.iter().enumerate() {
+                    let id = item
+                        .get("id")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("{goal_id}-{}", index + 1));
+                    let text = |key: &str| {
+                        item.get(key)
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                    };
+                    let terminal = text("terminal");
+                    let now = text("now");
+                    let gap = text("gap");
+                    let mut input = serde_json::json!({ "query": goal });
+                    if let Some(definition) = &definition {
+                        input["definition"] = serde_json::json!(definition);
+                    }
+                    // 五格的中心是 `Task`：三格直接挂在任务上，不经值对象再从 `input` 拷。
+                    let task = cog_core::Task::new(
+                        id.clone(),
+                        cog_core::TaskType::Custom(
+                            cog_core::contract::work_item::PLATFORM_AGENT_TASK.into(),
+                        ),
+                        input,
+                    )
+                    .with_cells(terminal, now, gap);
+                    tasks.push(task);
+                    ids.push(id);
+                }
+                // 有门就走门：与 `start_task` 同一条已服务路径，同一个请求体形状。
+                // 门的回执是「已排队」，与进程内那条一样，结局都在任务行上读。
+                if let Some((client, base)) = door.as_ref() {
+                    let rows: Vec<serde_json::Value> = tasks
+                        .iter()
+                        .map(|task| {
+                            let cells = task.cells();
+                            let acceptance = cells
+                                .map(|(terminal, _, _)| vec![terminal.to_string()])
+                                .unwrap_or_default();
+                            let mut input = task.input.clone();
+                            input["acceptance"] = serde_json::json!(acceptance);
+                            // 时长没由这一条给就按任务行的默认值声明：门把 0 读成
+                            // 「这活不花时间」并拒收，缺省才是「照常估」。
+                            let declared = input
+                                .get("declared_duration_seconds")
+                                .and_then(|value| value.as_u64())
+                                .filter(|value| *value > 0)
+                                .unwrap_or(cog_core::types::task::DEFAULT_DECLARED_DURATION_SECS);
+                            cog_core::contract::task_door::task_door_row(
+                                &task.id,
+                                cog_core::contract::work_item::PLATFORM_AGENT_TASK,
+                                input,
+                                cells,
+                                declared,
+                                true,
+                            )
+                        })
+                        .collect();
+                    let workspace = std::env::var(cog_core::env::WORKSPACE_ID)
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or_else(|| "default".to_string());
+                    let body = cog_core::contract::task_door::task_door_body(
+                        &goal_id, &goal, &workspace, rows,
+                    );
+                    let url = format!("{}/api/v1/tasks", base.trim_end_matches('/'));
+                    let request = cog_core::HttpRequest::post(url)
+                        .json(&body)
+                        .map_err(|e| cog_core::SFError::Validation(e.to_string()))?;
+                    let response = client.execute(request).await?;
+                    if !response.is_success() {
+                        let text = String::from_utf8_lossy(&response.body).to_string();
+                        return Err(cog_core::SFError::Validation(format!(
+                            "the task door refused this batch (HTTP {}): {}",
+                            response.status,
+                            text.trim()
+                        )));
+                    }
+                    return Ok(serde_json::json!({
+                        "goal_id": goal_id,
+                        "task_ids": ids,
+                        "status": "submitted",
+                        "note": "已按给定的拆法经任务门直接建任务，没有走分解。要查进展用 list_tasks；goal_id 与 task_ids 照抄"
+                    }));
+                }
+                let submitter = orchestrator.clone();
+                let goal_for_submit = goal.clone();
+                let goal_for_warn = goal_id.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = submitter.submit_goal_auto(&goal_for_submit, tasks).await {
+                        tracing::warn!(goal = %goal_for_warn, error = %e, "这批 items 没能交给编排器");
+                    }
+                });
+                return Ok(serde_json::json!({
+                    "goal_id": goal_id,
+                    "task_ids": ids,
+                    "status": "submitted",
+                    "note": "已按给定的拆法直接建任务，没有走分解。要查进展用 list_tasks；goal_id 与 task_ids 照抄"
+                }));
+            }
             let row = cog_core::Task::goal_row(goal_id.clone(), &goal);
             // 分解是异步的（规划要几十秒），所以这一条不在工具调用里等：把目标号交
             // 回去，分解在后台跑，进展由台账回答。判退也是 Ok——成败读目标行本身。
@@ -3630,7 +4220,13 @@ fn cancel_handler(orchestrator: Arc<dyn OrchestratorControl>) -> ToolHandler {
 /// 台账里一行压成模型读得动的一小段。长字段（`result`、`input`）只在 `get_task`
 /// 里给，否则一次列 20 行就把上下文占满了。
 fn task_summary(task: &cog_core::Task) -> serde_json::Value {
-    serde_json::json!({
+    // 待办的状态由任务行的结局现算（[`LedgerItem::at_outcome`]），不抄进任务行：
+    // 同一个结局只在 `status` 一处写，任务重试一次，读出来的状态跟着变，没有
+    // 第二份要同步。差距那一格原样带回——它写的是「世界上还缺什么」。
+    let ledger_item = task
+        .ledger_item()
+        .and_then(|item| serde_json::to_value(item).ok());
+    let mut summary = serde_json::json!({
         "id": task.id,
         "kind": task.task_type,
         "status": task.status,
@@ -3640,7 +4236,16 @@ fn task_summary(task: &cog_core::Task) -> serde_json::Value {
         "retry_count": task.retry_count,
         "updated_at": task.updated_at,
         "error": task.error,
-    })
+        // 谁在跑、租约何时过期：状态是 Running 时这两格是唯一能读出「孤儿」的
+        // 证据。结果与 input 不在这里给——一次列 20 行会把上下文占满，
+        // 要读那两格走 `get_task`。
+        "lease_owner": task.lease_owner,
+        "lease_expires_at": task.lease_expires_at,
+    });
+    if let (Some(item), Some(object)) = (ledger_item, summary.as_object_mut()) {
+        object.insert("ledger_item".to_string(), item);
+    }
+    summary
 }
 
 /// 方向盘那四只的门。单独一个文件，因为它要造的假账里有几个账契约的写入口，
@@ -3652,6 +4257,206 @@ mod direction_tests;
 mod tests {
     use super::*;
     use cog_core::RuntimePrincipleStore as _;
+
+    /// 定义从派活的那一次一路走到判据审：工具参数里有它，任务行带着它，判据审读它。
+    ///
+    /// 没有这次改动这条会红：派活只收 `goal`，判据审拿到的定义恒为 `None`，
+    /// 「按定义判断」只剩就事论事。
+    #[test]
+    fn the_definition_travels_from_the_dispatch_to_the_judge() {
+        let source = include_str!("conversation.rs");
+        assert!(
+            source.contains("判据审按它判断"),
+            "派活工具的参数里没有定义这一格"
+        );
+        assert!(
+            source.contains("\"definition\": arguments.get(\"definition\").cloned()"),
+            "任务行没有把定义带下去"
+        );
+        assert!(
+            source.contains("review_criteria(&turn_text, &items, definition)"),
+            "判据审没有读这一轮的定义"
+        );
+    }
+
+    /// 调用方知道拆法时直接交 items：跳过分解，按每条建一件活，三格与定义随任务走。
+    ///
+    /// 没有这次改动这条会红：派活只认 `goal`，一条已经拆好的活还要再被 planner 拆一次，
+    /// 三格与定义在进图那一刻就丢了。
+    #[tokio::test]
+    async fn known_items_skip_decomposition_and_become_tasks() {
+        use cog_core::OrchestratorControl as _;
+        let graph = std::sync::Arc::new(cog_test_support::TaskGraphStub::empty());
+        let tool = ControlPlaneOp::DispatchGoal.tool(
+            graph.clone(),
+            None,
+            None,
+            "owner".into(),
+            "actor".into(),
+            None,
+        );
+        let ToolImplementation::Native(handler) = tool.implementation else {
+            panic!("dispatch_goal 不是原生工具");
+        };
+        let answer = handler(serde_json::json!({
+            "goal": "把三处收进一处",
+            "goal_id": "goal-known",
+            "definition": "这一类：把三处收进一处；做完＝只剩一处。",
+            "items": [
+                {"terminal": "a 收好了", "now": "还没", "gap": "缺 a"},
+                {"id": "mine", "terminal": "b 收好了", "now": "还没", "gap": "缺 b"}
+            ]
+        }))
+        .await
+        .expect("这批 items 应当被受理");
+        assert_eq!(answer["status"], "submitted", "{answer}");
+        assert_eq!(
+            answer["goal_id"], "goal-known",
+            "给了 goal_id 就要续在那一道目标上"
+        );
+        let ids: Vec<&str> = answer["task_ids"]
+            .as_array()
+            .expect("回执里要有 task_ids")
+            .iter()
+            .filter_map(|id| id.as_str())
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"mine"), "给定的 id 要照用：{ids:?}");
+
+        let mut rows = Vec::new();
+        for _ in 0..200 {
+            rows = graph.get_all_tasks().await;
+            if rows.len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(rows.len(), 2, "两条 items 应当在图上各成一件活");
+        let mine = rows.iter().find(|t| t.id == "mine").expect("mine");
+        assert_eq!(mine.terminal, "b 收好了", "三格在任务的一等字段上");
+        // 两个入口都走同一张门行（`task_door_row`）：三格随行交，
+        // 谁也不再往 `input` 里塞一份。
+        let tools_source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("cog-agent/src/tools.rs"),
+        )
+        .expect("tools.rs");
+        assert!(
+            tools_source.contains("task_door_row("),
+            "智能体侧的 start_task 没有走门行那条路"
+        );
+        assert!(
+            !tools_source.contains("ITEM_INPUT_KEY"),
+            "智能体侧还在把三格塞进 input：系统流程必须用任务字段"
+        );
+        assert_eq!(
+            mine.input["definition"],
+            "这一类：把三处收进一处；做完＝只剩一处。"
+        );
+    }
+
+    /// 门在时，已经拆好的 items 走的是与 `start_task` 同一条已服务路径：
+    /// 一次 POST `/api/v1/tasks`，请求体里带着定义、验收与「已经想过」的标记，
+    /// 进程内那张图上一件也不多出来。
+    ///
+    /// 没有这次改动这条会红：控制面的派活只往进程内的编排器交，
+    /// 服务进程与对话进程不共享同一张图，交出去的活在对面的任务列表里读不到。
+    #[tokio::test]
+    async fn known_items_go_through_the_served_door_when_there_is_one() {
+        #[derive(Debug, Default)]
+        struct Captured(std::sync::Mutex<Vec<cog_core::HttpRequest>>);
+
+        #[async_trait::async_trait]
+        impl cog_core::HttpClient for Captured {
+            async fn execute(
+                &self,
+                request: cog_core::HttpRequest,
+            ) -> cog_core::SFResult<cog_core::HttpResponse> {
+                self.0.lock().unwrap().push(request);
+                Ok(cog_core::HttpResponse {
+                    status: 201,
+                    headers: Default::default(),
+                    body: br#"{"task_ids":["FROM-DOOR"]}"#.to_vec(),
+                })
+            }
+        }
+
+        use cog_core::OrchestratorControl as _;
+        let graph = std::sync::Arc::new(cog_test_support::TaskGraphStub::empty());
+        let capture = std::sync::Arc::new(Captured::default());
+        let tool = ControlPlaneOp::DispatchGoal.tool(
+            graph.clone(),
+            None,
+            None,
+            "owner".into(),
+            "actor".into(),
+            Some((capture.clone(), "http://door.example/".into())),
+        );
+        let ToolImplementation::Native(handler) = tool.implementation else {
+            panic!("dispatch_goal 不是原生工具");
+        };
+        let answer = handler(serde_json::json!({
+            "goal": "把三处收进一处",
+            "goal_id": "goal-known",
+            "definition": "这一类：把三处收进一处；做完＝只剩一处。",
+            "items": [
+                {"terminal": "a 收好了", "now": "还没", "gap": "缺 a"},
+                {"id": "mine", "terminal": "b 收好了", "now": "还没", "gap": "缺 b"}
+            ]
+        }))
+        .await
+        .expect("这批 items 应当被门受理");
+        assert_eq!(answer["status"], "submitted", "{answer}");
+        assert_eq!(
+            answer["task_ids"]
+                .as_array()
+                .expect("回执里要有 task_ids")
+                .iter()
+                .filter_map(|id| id.as_str())
+                .count(),
+            2
+        );
+
+        let posts = capture.0.lock().unwrap();
+        assert_eq!(posts.len(), 1, "一次派活只该发一次请求");
+        assert_eq!(
+            posts[0].url, "http://door.example/api/v1/tasks",
+            "门地址后面不能多出一个斜杠"
+        );
+        assert_eq!(posts[0].method, "POST");
+        let body: serde_json::Value =
+            serde_json::from_slice(posts[0].body.as_ref().expect("请求体")).expect("请求体是 JSON");
+        assert_eq!(body["goal_id"], "goal-known");
+        assert_eq!(body["intent_kind"], "task");
+        let tasks = body["tasks"].as_array().expect("请求体里要有任务行");
+        assert_eq!(tasks.len(), 2);
+        let mine = tasks.iter().find(|t| t["id"] == "mine").expect("mine");
+        assert_eq!(
+            mine["input"]["definition"],
+            "这一类：把三处收进一处；做完＝只剩一处。"
+        );
+        assert_eq!(mine["terminal"], "b 收好了", "三格随行交，不塞进 input");
+        assert_eq!(
+            mine["input"]["acceptance"][0], "b 收好了",
+            "验收就是这一条的终态：没有它门会以 acceptance_required 拒收"
+        );
+        assert_eq!(
+            mine[cog_core::roles::PLANNER]["verified"],
+            true,
+            "拆法来自调用方，门不该再为这一行花一次分解"
+        );
+        assert!(
+            mine["declared_duration_seconds"].as_u64().unwrap_or(0) > 0,
+            "门把 0 秒读成「这活不花时间」并拒收，没给时长就按行默认值声明"
+        );
+        drop(posts);
+        assert!(
+            graph.get_all_tasks().await.is_empty(),
+            "走了门就不该在进程内再建一遍"
+        );
+    }
 
     /// 控制面这一组是闭集，而且里面没有执行工具。
     ///
@@ -3686,6 +4491,105 @@ mod tests {
             assert!(!op.description().trim().is_empty(), "{}", op.name());
             assert_eq!(op.parameters()["type"], "object", "{}", op.name());
         }
+    }
+
+    /// 员工页读的是任务图那一行：只有「完成且差距已空」读作「已落」；完成却
+    /// 还写着差距、失败、撤回、还在跑，都是「未落」。差距那一格原样带回——
+    /// 一次运行报告成功不等于树上的那件事成立了，把差距抹掉等于让「跑完了」
+    /// 冒充「世界变了」。
+    #[test]
+    fn the_owner_sees_the_ledger_state_of_what_the_turn_filed() {
+        use cog_core::contract::ledger_item::{LedgerItem, LedgerState, ITEM_INPUT_KEY};
+        let item = LedgerItem {
+            id: "work-1".into(),
+            terminal: "树上是这个样子".into(),
+            now: "现在还不是".into(),
+            gap: "还差那一处".into(),
+            state: LedgerState::Open,
+        };
+        let base = || {
+            let now = chrono::Utc::now();
+            cog_core::Task {
+                submitted_by: None,
+                id: "work-1".into(),
+                task_type: cog_core::TaskType::Custom(
+                    cog_core::contract::work_item::PLATFORM_AGENT_TASK.into(),
+                ),
+                status: cog_core::TaskStatus::Pending,
+                input: serde_json::json!({
+                    "task": "把那一处改掉",
+                    ITEM_INPUT_KEY: serde_json::to_value(&item).expect("待办该序列化得出来"),
+                }),
+                terminal: item.terminal.clone(),
+                now: item.now.clone(),
+                gap: item.gap.clone(),
+                result: None,
+                error: None,
+                error_cause: None,
+                failure_payer: None,
+                blocked_by: vec![],
+                blocks: vec![],
+                priority: 1,
+                created_at: now,
+                updated_at: now,
+                agent_id: None,
+                workspace_id: None,
+                retry_count: 0,
+                max_retries: 1,
+                retry_not_before: None,
+                started_at: None,
+                declared_duration_seconds: 30,
+                lease_owner: None,
+                lease_expires_at: None,
+                action_planner_meta: None,
+                goal_id: Some("goal-1".into()),
+                parent_task_id: None,
+                sink_task_id: None,
+                is_executable: true,
+                face_id: None,
+                venue: None,
+                owner_unit: None,
+                bound_by_handover_id: None,
+                acceptance: vec!["那一处不再出现".into()],
+            }
+        };
+        // 差距还写着：完成也仍是未落——跑完了不等于世界变了。
+        for (status, state) in [
+            (cog_core::TaskStatus::Pending, "未落"),
+            (cog_core::TaskStatus::Running, "未落"),
+            (cog_core::TaskStatus::Completed, "未落"),
+            (cog_core::TaskStatus::Failed, "未落"),
+            (cog_core::TaskStatus::Cancelled, "未落"),
+        ] {
+            let mut task = base();
+            task.status = status;
+            let summary = task_summary(&task);
+            assert_eq!(
+                summary["ledger_item"]["state"], state,
+                "{status:?} 在员工页上读成了 {state}"
+            );
+            assert_eq!(summary["status"], serde_json::json!(status));
+            assert_eq!(
+                summary["ledger_item"]["gap"], "还差那一处",
+                "差距是世界上的缺口，不是这一次运行的结局"
+            );
+            assert_eq!(summary["ledger_item"]["terminal"], "树上是这个样子");
+        }
+        // 完成且差距被读树的人清掉：这时才读作已落。
+        let mut reached = base();
+        let mut verified = item.clone();
+        verified.gap = String::new();
+        reached.status = cog_core::TaskStatus::Completed;
+        reached.input = serde_json::json!({
+            "task": "把那一处改掉",
+            ITEM_INPUT_KEY: serde_json::to_value(&verified).expect("待办该序列化得出来"),
+        });
+        assert_eq!(task_summary(&reached)["ledger_item"]["state"], "已落");
+
+        // 没有三格的行不凭空长出一条待办：读面缺这一格，与「这一条没有差距」分得开。
+        let mut bare = base();
+        bare.input = serde_json::json!({ "task": "把那一处改掉" });
+        assert!(task_summary(&bare).get("ledger_item").is_none());
     }
 
     /// 界面上那笔账的 actor 是这位员工自己，且必须在网关声明的闭集里。
@@ -3979,6 +4883,7 @@ mod tests {
                 goal: serde_json::json!("把首页配色改一下"),
                 reply_stream: None,
                 from_agent: None,
+                intent: None,
             })
             .as_deref(),
             Some("[没留名的同事发来的消息]\n把首页配色改一下")
@@ -3988,6 +4893,7 @@ mod tests {
                 goal: serde_json::json!({"step": 2}),
                 reply_stream: None,
                 from_agent: None,
+                intent: None,
             })
             .as_deref(),
             Some("[没留名的同事发来的消息]\n{\"step\":2}")
@@ -4050,6 +4956,7 @@ mod tests {
             goal: serde_json::json!("帮我看一下昨天那次发布为什么红了"),
             reply_stream: None,
             from_agent: Some("E0412".into()),
+            intent: None,
         };
         backend
             .publish(
@@ -5205,14 +6112,15 @@ mod tests {
             "最要紧的那一格没有排在前面：{summary}"
         );
 
-        let huge = "x".repeat(PERMISSION_SUMMARY_CHARS * 3);
-        let capped = permission_summary(&serde_json::json!({ "path": huge }));
-        assert_eq!(
-            capped.chars().count(),
-            PERMISSION_SUMMARY_CHARS + 1,
-            "超长的摘要要在界上截断并留一个省略号，而不是整段塞进对话框"
+        // 批准前的摘要必须整段：属主按它点头，截掉的那部分就是「他没看到却同意」。
+        let huge = "x".repeat(2000);
+        let whole = permission_summary(&serde_json::json!({ "path": huge }));
+        assert!(
+            whole.chars().count() > 2000 && !whole.ends_with('…'),
+            "摘要被截断了：{} 字符，末尾 {}",
+            whole.chars().count(),
+            whole.chars().last().unwrap_or(' ')
         );
-        assert!(capped.ends_with('…'), "{capped}");
     }
 
     /// 人答的那一句原样变成内核的判词：允许就执行，拒绝连理由一起交回模型。
@@ -5491,16 +6399,25 @@ fn chat_intent_row(
     session_id: &str,
     owner: &str,
     employee_id: &str,
+    arrival: &str,
     text: &str,
+    model_text: Option<&str>,
 ) -> cog_core::IntentRow {
-    cog_core::IntentRow::new(
+    let mut row = cog_core::IntentRow::new(
         "chat",
-        cog_core::chat_intent_identity(session_id, text),
+        cog_core::chat_intent_identity(session_id, arrival),
         owner,
         employee_id,
         text,
         None,
-    )
+    );
+    // 这一句属于哪一段会话：会话是投影，这一格是它的归属。别的入口（外部情报、
+    // A2A）没有会话，那一格空着，不编一个。
+    row.session = Some(session_id.to_string());
+    // 命令展开之后交给模型的那一段：与原话不同才写。会话表坏掉之后，「模型当时
+    // 看到的是什么」只有这一格答得出来。
+    row.model_text = model_text.map(str::to_string);
+    row
 }
 
 #[cfg(test)]
@@ -5510,7 +6427,7 @@ mod chat_intent_row_tests {
     /// 收件人是正在和属主对话的那个智能体，不是空的，也不是客户端自报的字段。
     #[test]
     fn the_row_names_the_agent_in_the_conversation() {
-        let row = chat_intent_row("s1", "owner", "luna-1", "把这件事办了");
+        let row = chat_intent_row("s1", "owner", "luna-1", "a-1", "把这件事办了", None);
         assert_eq!(row.source, "chat");
         assert_eq!(row.said_by, "owner");
         assert_eq!(row.addressed_to, "luna-1");
@@ -5521,10 +6438,10 @@ mod chat_intent_row_tests {
     /// 同一段会话里的同一句是同一行；换会话或换原文才是另一行。
     #[test]
     fn the_same_sentence_in_the_same_session_is_one_row() {
-        let a = chat_intent_row("s1", "owner", "luna-1", "改回来");
-        let b = chat_intent_row("s1", "owner", "luna-1", "改回来");
-        let c = chat_intent_row("s2", "owner", "luna-1", "改回来");
-        let d = chat_intent_row("s1", "owner", "luna-1", "改回去");
+        let a = chat_intent_row("s1", "owner", "luna-1", "m-1", "改回来", None);
+        let b = chat_intent_row("s1", "owner", "luna-1", "m-1", "改回来", None);
+        let c = chat_intent_row("s2", "owner", "luna-1", "m-1", "改回来", None);
+        let d = chat_intent_row("s1", "owner", "luna-1", "m-2", "改回去", None);
         assert_eq!(a.identity, b.identity);
         assert_ne!(a.identity, c.identity);
         assert_ne!(a.identity, d.identity);
@@ -5549,11 +6466,118 @@ mod session_for_employee_tests {
         assert_eq!(session_target("随机会话"), None);
     }
 
+    /// 没有身份绑定表时，会话前缀仍然决定是谁：员工页点谁就是谁。
+    ///
+    /// 这一支走的是纯函数 `employee_for`（进程没装 KV 时装配层用的就是它）：
+    /// 少了它，同一段 `agent:E0412` 会落到一个由实例指纹算出来的陌生人头上，
+    /// 而员工页点的那一行与答话的人从此不是同一个。
+    #[test]
+    fn the_prefix_names_the_employee_even_without_an_identity_store() {
+        let employee = super::employee_for(&session_for_employee("E0412"));
+        assert_eq!(employee.id, "E0412");
+        assert_eq!(employee.handle, "E0412");
+    }
+
     /// 目标会话钉住的就是被点名的那个员工，不是属主的默认员工。
     #[test]
     fn a_target_employee_keeps_the_id_it_was_addressed_by() {
         let employee = employee_for_target("employee:1");
         assert_eq!(employee.id, "employee:1");
         assert_eq!(employee.handle, "employee:1");
+    }
+}
+
+#[cfg(test)]
+mod inbox_intent_tests {
+    use super::inbox_intent;
+    use cog_core::InboxMessage;
+
+    /// 同事发来的一句要办的话是意图：原话不改写，发信人随行；没留名就如实空着。
+    /// 撤停与重置不是某人交办的一件事，不落意图行。
+    #[test]
+    fn a_colleagues_message_is_an_intent_with_its_sender() {
+        let prompt = InboxMessage::Prompt {
+            goal: serde_json::json!("把那一处改掉"),
+            reply_stream: None,
+            from_agent: Some("E0412".into()),
+            intent: None,
+        };
+        assert_eq!(
+            inbox_intent(&prompt),
+            Some(("E0412".to_string(), "把那一处改掉".to_string()))
+        );
+        let unnamed = InboxMessage::Steering {
+            instruction: "先别动那一处".into(),
+            from_agent: None,
+        };
+        assert_eq!(
+            inbox_intent(&unnamed),
+            Some((String::new(), "先别动那一处".to_string())),
+            "没留名不是编一个名字，也不是把这句话丢掉"
+        );
+        assert_eq!(inbox_intent(&InboxMessage::Abort), None);
+        assert_eq!(inbox_intent(&InboxMessage::Reset), None);
+    }
+}
+
+#[cfg(test)]
+mod intent_instruction_tests {
+    use super::{intent_instruction, CONVERSATION_INTENT_INSTRUCTION};
+
+    /// 句首的 `/task`、`/chat` 是属主的显式判词：说了算，不再让模型猜。
+    #[test]
+    fn a_leading_switch_says_what_the_turn_is() {
+        let task = intent_instruction("/task 把那一处改掉");
+        assert!(task.contains("必须调用 start_task"), "{task}");
+        let chat = intent_instruction("  /chat 今天怎么样");
+        assert!(chat.contains("不要调用 start_task"), "{chat}");
+    }
+
+    /// 没打开关时逐字是原来那一句：开关不是新的默认。
+    #[test]
+    fn a_turn_without_a_switch_keeps_the_ordinary_instruction() {
+        assert_eq!(
+            intent_instruction("把那一处改掉"),
+            CONVERSATION_INTENT_INSTRUCTION
+        );
+    }
+
+    /// 句子中间提到开关词不算开关：替属主做一个他没做的决定，比让他多打一次
+    /// `/task` 更贵。
+    #[test]
+    fn a_switch_word_inside_a_sentence_is_not_a_switch() {
+        for turn in ["请解释 /task 是什么意思", "/tasking 不是这个开关"] {
+            assert_eq!(
+                intent_instruction(turn),
+                CONVERSATION_INTENT_INSTRUCTION,
+                "{turn:?} 被读成了开关"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod may_be_work_tests {
+    use super::may_be_work;
+
+    /// 带「可能是一件活」动词的一句：不标接手，留给下一批分诊重判。
+    #[test]
+    fn a_sentence_with_a_work_verb_is_left_for_the_batch_judge() {
+        for text in [
+            "把这处改掉",
+            "帮我部署一下",
+            "fix the failing test",
+            "查一下日志",
+        ] {
+            assert!(may_be_work(text), "{text:?} 被读成了纯闲聊");
+        }
+    }
+
+    /// 没有动词的问候与感想：照常标掉，闲聊仍然零额外调用。
+    #[test]
+    fn a_greeting_is_not_left_for_the_batch_judge() {
+        for text in ["今天怎么样", "你好", "谢谢你", "what is this"] {
+            assert!(!may_be_work(text), "{text:?} 被读成了可能是一件活");
+        }
     }
 }

@@ -79,7 +79,9 @@ async fn sweep_abandoned(pool: &PgPool) {
     .expect("read the test family");
 
     let cutoff = Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        - ABANDONED_AFTER.num_nanoseconds().unwrap_or_default();
+        - ABANDONED_AFTER
+            .num_nanoseconds()
+            .unwrap_or(Default::default());
     for (task_id, workspace) in rows {
         let started = marker_stamp(&task_id).or_else(|| {
             workspace
@@ -904,7 +906,7 @@ async fn a_round_that_died_before_its_cleanup_is_reclaimed_by_the_next_one() {
 
     let long_ago = (Utc::now() - chrono::Duration::hours(1))
         .timestamp_nanos_opt()
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let abandoned = format!("governance-store-test:1:{long_ago}:face");
     let current = format!(
         "governance-store-test:{}:{}:face",

@@ -93,7 +93,7 @@ fn first_balanced_json_object(text: &str) -> Option<serde_json::Value> {
                 depth -= 1;
                 if depth == 0 {
                     let span = &text[start..start + i + ch.len_utf8()];
-                    return serde_json::from_str(span).ok();
+                    return cog_core::logged_ok!(serde_json::from_str(span));
                 }
             }
             _ => {}
@@ -648,6 +648,7 @@ impl LLMProvider for OpenAIProvider {
                     "awaiting next SSE event"
                 );
 
+                // wall: 等=上游 SSE 的下一个事件 / 等不到=这一跳按失败收尾 / 续跑=能，新开一次上游调用
                 let line = match tokio::time::timeout(timeout, lines.try_next()).await {
                     Ok(Ok(Some(line))) => line,
                     Ok(Ok(None)) => {

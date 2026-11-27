@@ -16,7 +16,8 @@ use cog_core::{AgentTrace, SFError, SFResult, StorageTier, TraceMeta, TraceStore
 /// loadable; anything else becomes `prefix-<hash>`, keeping distinct long ids
 /// collision-free even when they share the retained prefix.
 fn file_stem(trace_id: &str) -> String {
-    // cap: bound — well under the filesystem's 255-byte name limit, leaving room for .trace and .meta.json
+    // cap: fixed — well under the filesystem's 255-byte name limit, leaving room for .trace and .meta.json
+    // keep: 删掉后文件名加 .trace/.meta.json 撞上 255 字节上限，trace 写不进去；由「留出后缀的余量」兜住
     const MAX_SAFE_LEN: usize = 180;
     let is_safe = !trace_id.is_empty()
         && trace_id.len() <= MAX_SAFE_LEN
@@ -76,6 +77,7 @@ impl FileTraceStore {
     /// Get the metadata file path for a given tier.
     fn meta_path(&self, tier: StorageTier, trace_id: &str) -> std::path::PathBuf {
         self.tier_dir(tier)
+            // state-file: store — 文件后端自己的介质：接上它时这里就是正本，不是第二份
             .join(format!("{}.meta.json", file_stem(trace_id)))
     }
 
@@ -418,7 +420,7 @@ mod tests {
             "the oldest warm entries are the ones aging toward cold"
         );
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        cog_core::ignore_lost!(tokio::fs::remove_dir_all(&dir).await);
     }
 
     #[test]
@@ -451,7 +453,7 @@ mod tests {
         store.save(&test_trace(&long_id)).await.unwrap();
         let loaded = store.load(&long_id).await.unwrap();
         assert_eq!(loaded.unwrap().trace_id, long_id);
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        cog_core::ignore_lost!(tokio::fs::remove_dir_all(&dir).await);
     }
 
     /// A tier move writes the destination before it removes the source, so a
@@ -487,7 +489,7 @@ mod tests {
             .expect("a failed move must not destroy the only copy");
         assert_eq!(survived.tier, StorageTier::Hot);
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        cog_core::ignore_lost!(tokio::fs::remove_dir_all(&dir).await);
     }
 
     /// The tier search answers with the first tier holding metadata. Asked
@@ -525,7 +527,7 @@ mod tests {
             "the hot copy is the one that answers"
         );
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        cog_core::ignore_lost!(tokio::fs::remove_dir_all(&dir).await);
     }
 
     /// A tier directory that exists but cannot be listed is not an empty
@@ -549,7 +551,7 @@ mod tests {
             "a tier that could not be read must not be reported as empty"
         );
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        cog_core::ignore_lost!(tokio::fs::remove_dir_all(&dir).await);
     }
 
     /// A sidecar that is there but is not a trace's metadata makes the
@@ -574,7 +576,7 @@ mod tests {
             "the error must name the file to inspect, got: {message}"
         );
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        cog_core::ignore_lost!(tokio::fs::remove_dir_all(&dir).await);
     }
 
     /// Metadata without a readable payload is a damaged entry, not an absent
@@ -598,7 +600,7 @@ mod tests {
             "the error must name the trace, got: {err}"
         );
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        cog_core::ignore_lost!(tokio::fs::remove_dir_all(&dir).await);
     }
 
     /// The one skip that stays a skip: the payload disappeared between the
@@ -619,7 +621,7 @@ mod tests {
             .expect("a delete in flight is not a listing failure");
         assert!(listed.is_empty(), "the entry is gone, not broken");
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        cog_core::ignore_lost!(tokio::fs::remove_dir_all(&dir).await);
     }
 
     /// The atomic write publishes through a rename, so its temp sibling must
@@ -642,6 +644,6 @@ mod tests {
             "a landed save leaves exactly its two files"
         );
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        cog_core::ignore_lost!(tokio::fs::remove_dir_all(&dir).await);
     }
 }

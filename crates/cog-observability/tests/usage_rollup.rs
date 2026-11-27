@@ -123,6 +123,8 @@ async fn a_window_folds_the_ledger_and_reruns_in_place_with_zeros_for_the_idle()
     };
 
     let record = |actor: &str, result: &str, input: u64, output: u64, cached: u64| LlmUsageRecord {
+        finish_reason: None,
+        ttft_ms: None,
         refused_scope: None,
         upstream: upstream.clone(),
         api_style: api_style.clone(),
@@ -136,6 +138,8 @@ async fn a_window_folds_the_ledger_and_reruns_in_place_with_zeros_for_the_idle()
         tokens_cache_created: None,
         tokens_reasoning: None,
         estimated_input: None,
+        prompt_manifest: None,
+        prompt_dropped: None,
         cost_micros: None,
         price_book: None,
         refusal_kind: None,
@@ -319,6 +323,8 @@ async fn the_rolled_reader_sums_the_fold_over_the_windows_in_range() {
     };
 
     let record = |input: u64, output: u64, latency: u64| LlmUsageRecord {
+        finish_reason: None,
+        ttft_ms: None,
         refused_scope: None,
         upstream: upstream.clone(),
         api_style: api_style.clone(),
@@ -332,6 +338,8 @@ async fn the_rolled_reader_sums_the_fold_over_the_windows_in_range() {
         tokens_cache_created: None,
         tokens_reasoning: None,
         estimated_input: None,
+        prompt_manifest: None,
+        prompt_dropped: None,
         cost_micros: None,
         price_book: None,
         refusal_kind: None,
@@ -503,6 +511,8 @@ async fn the_summed_read_leaves_out_a_combination_the_range_never_used() {
 
     store
         .record(&LlmUsageRecord {
+            finish_reason: None,
+            ttft_ms: None,
             refused_scope: None,
             upstream: upstream.clone(),
             api_style: "openai".to_string(),
@@ -516,6 +526,8 @@ async fn the_summed_read_leaves_out_a_combination_the_range_never_used() {
             tokens_cache_created: None,
             tokens_reasoning: None,
             estimated_input: None,
+            prompt_manifest: None,
+            prompt_dropped: None,
             cost_micros: None,
             price_book: None,
             refusal_kind: None,
@@ -633,6 +645,8 @@ async fn the_outcome_breakdown_keeps_the_verdict_that_explains_a_failed_range() 
         async move {
             store
                 .record(&LlmUsageRecord {
+                    finish_reason: None,
+                    ttft_ms: None,
                     refused_scope: None,
                     upstream,
                     api_style: "openai".to_string(),
@@ -646,6 +660,8 @@ async fn the_outcome_breakdown_keeps_the_verdict_that_explains_a_failed_range() 
                     tokens_cache_created: None,
                     tokens_reasoning: None,
                     estimated_input: None,
+                    prompt_manifest: None,
+                    prompt_dropped: None,
                     cost_micros: None,
                     price_book: None,
                     refusal_kind: kind,
@@ -889,6 +905,8 @@ async fn the_fold_carries_the_written_half_and_keeps_no_reading_apart_from_zero(
     };
 
     let record = |actor: &str, cached: u64, created: Option<u64>| LlmUsageRecord {
+        finish_reason: None,
+        ttft_ms: None,
         refused_scope: None,
         upstream: upstream.clone(),
         // The Anthropic face is the one that reports what it wrote; the
@@ -905,6 +923,8 @@ async fn the_fold_carries_the_written_half_and_keeps_no_reading_apart_from_zero(
         tokens_cache_created: created,
         tokens_reasoning: None,
         estimated_input: None,
+        prompt_manifest: None,
+        prompt_dropped: None,
         cost_micros: None,
         price_book: None,
         refusal_kind: None,
@@ -1043,6 +1063,8 @@ async fn one_upstream_answering_on_two_faces_spends_as_two_rows() {
     };
 
     let record = |api_style: &str, input: u64, cached: u64| LlmUsageRecord {
+        finish_reason: None,
+        ttft_ms: None,
         refused_scope: None,
         upstream: upstream.clone(),
         api_style: api_style.to_string(),
@@ -1056,6 +1078,8 @@ async fn one_upstream_answering_on_two_faces_spends_as_two_rows() {
         tokens_cache_created: None,
         tokens_reasoning: None,
         estimated_input: None,
+        prompt_manifest: None,
+        prompt_dropped: None,
         cost_micros: None,
         price_book: None,
         refusal_kind: None,

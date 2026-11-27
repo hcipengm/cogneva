@@ -24,7 +24,7 @@ impl UnixHeartbeatServer {
     ) -> SFResult<tokio::task::JoinHandle<()>> {
         let path = path.as_ref().to_owned();
         // Remove stale socket file
-        let _ = tokio::fs::remove_file(&path).await;
+        cog_core::ignore_lost!(tokio::fs::remove_file(&path).await);
         let listener = UnixListener::bind(&path)
             .map_err(|e| cog_core::SFError::IO(format!("Unix bind failed: {}", e)))?;
 
@@ -44,7 +44,7 @@ impl UnixHeartbeatServer {
                                         if let Some(agent_id) =
                                             packet.get("agent_id").and_then(|v| v.as_str())
                                         {
-                                            let _ = reg.heartbeat(agent_id).await;
+                                            cog_core::ignore_lost!(reg.heartbeat(agent_id).await);
                                             if let Some(ref tx) = tx {
                                                 let _ = tx.send(AgentEvent::Heartbeat {
                                                     agent_id: agent_id.into(),
@@ -115,7 +115,7 @@ impl UnixHeartbeatClient {
                                 });
                                 match UnixStream::connect(&path).await {
                                     Ok(mut stream) => {
-                                        let _ = stream.write_all(packet.to_string().as_bytes()).await;
+                                        cog_core::ignore_lost!(stream.write_all(packet.to_string().as_bytes()).await);
                                     }
                                     Err(e) => {
                                         tracing::warn!(agent_id=%agent_id, "Unix heartbeat connect failed: {}", e);

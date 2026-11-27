@@ -60,7 +60,8 @@ impl std::fmt::Debug for HarnessConfig {
 
 // 0.85：回归集留一成半的余量给偶发失败（网络、超时这类与改动无关的抖动）；
 // 再低就分不清「这一版退化了」与「这一次运气不好」。
-// cap: bound — 0.85：留一成半给与改动无关的抖动，再低分不清退化与运气
+// cap: fixed — 0.85：留一成半给与改动无关的抖动，再低分不清退化与运气
+// keep: 删掉后分不清退化与运气，判据变成一次抛硬币；由「留一成半给抖动」兜住
 const HARNESS_MIN_PASS_RATE: f64 = 0.85;
 
 impl Default for HarnessConfig {

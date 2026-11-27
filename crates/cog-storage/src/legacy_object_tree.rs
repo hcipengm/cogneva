@@ -56,7 +56,7 @@ static SCAN: OnceLock<LegacyObjectTree> = OnceLock::new();
 /// 同一个进程里换 provider 不是运行期会发生的事，而让后来的调用悄悄改掉
 /// 已经答过的问题，会让「这个进程启动时数到了什么」变成没人答得上来。
 pub fn record_scan(tree: LegacyObjectTree) {
-    let _ = SCAN.set(tree);
+    cog_core::ignore_lost!(SCAN.set(tree));
 }
 
 /// 本次进程记下的那次清点。

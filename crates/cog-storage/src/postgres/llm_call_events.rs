@@ -11,85 +11,196 @@
 //!   `to_string()` 与读侧的 `from_str` 一对保证，写错的方向是「看起来存进去了」。
 
 use async_trait::async_trait;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 
-use cog_core::{
-    check as check_envelope, EnvelopeFields, LlmCall, LlmCallEvents, SFError, SFResult,
-};
+use cog_core::{EventPayload, EventStore, FactEvent, LlmCall, SFError, SFResult};
 
-/// 事件流的写入器，只认这一种事实。
+/// 事件流的写入器，只认这一种事实。落库走那条流**唯一的写口**。
 pub struct LlmCallEventStore {
     pool: PgPool,
-    /// 这一条连接代表哪个写者（部署名）。与幂等键一起构成唯一约束的两半。
-    writer: String,
+    store: std::sync::Arc<dyn EventStore>,
 }
-
-/// 写一行事件的语句。
-///
-/// `event_id` 由调用方给（ULID 由事件流那一层的约定决定），这里只把它写进去；
-/// 其余枚举列照信封的取值写死在这条语句里，因为这一族只写一种 kind。
-const INSERT_SQL: &str = "\
-INSERT INTO cogneva_event (\
-    event_id, kind, subject_kind, subject_id, unit_of_work, step, outcome, attempt, \
-    idempotency_key, causation_id, batch_id, actor, writer, scope, payload_version, \
-    attributes, at) \
-VALUES ($1, 'llm_call', 'llm_call', $2, $2, 'call', 'ok', 1, $3, NULL, $9, $4, $5, $6, 1, $7, $8) \
-ON CONFLICT (writer, idempotency_key) DO NOTHING";
 
 impl LlmCallEventStore {
     pub fn new(pool: PgPool, writer: impl Into<String>) -> Self {
-        Self {
-            pool,
-            writer: writer.into(),
-        }
+        let store: std::sync::Arc<dyn EventStore> = std::sync::Arc::new(
+            crate::postgres::event_log::EventLogStore::new(pool.clone(), writer),
+        );
+        Self { pool, store }
     }
 }
 
-#[async_trait]
-impl LlmCallEvents for LlmCallEventStore {
-    fn writer(&self) -> &str {
-        &self.writer
+impl LlmCallEventStore {
+    /// 写一条调用事实：与其他族同一条流、同一个写口。
+    pub async fn append(&self, call: &LlmCall) -> SFResult<()> {
+        let mut event = FactEvent::new(EventPayload::LlmCall(call.clone()));
+        event.event_id = Some(ulid_like_id(&call.call_id));
+        event.at = Some(call.at);
+        self.store.append(event).await
     }
+}
 
-    async fn append(&self, call: &LlmCall) -> SFResult<()> {
-        let event_id = ulid_like_id(&call.call_id);
-        // 信封先过判据再写：空着的那一格与「不适用」在读数上同形，写进去就分不开了。
-        check_envelope(&EnvelopeFields {
-            event_id: event_id.clone(),
-            kind: "llm_call".into(),
-            subject_kind: "llm_call".into(),
-            subject_id: call.call_id.clone(),
-            unit_of_work: call.call_id.clone(),
-            step: "call".into(),
-            outcome: "ok".into(),
-            idempotency_key: call.idempotency_key(),
-            actor: call.actor.clone(),
-            writer: self.writer.clone(),
-            scope: call.model.clone(),
-            attributes: call.attributes().to_string(),
-        })
-        .map_err(|defect| {
-            SFError::Database(format!(
-                "llm_call event refused before it was written: {}",
-                defect.as_str()
-            ))
-        })?;
-        sqlx::query(INSERT_SQL)
-            .bind(&event_id)
-            .bind(&call.call_id)
-            .bind(call.idempotency_key())
-            .bind(&call.actor)
-            .bind(&self.writer)
-            .bind(&call.model)
-            .bind(call.attributes().to_string())
-            .bind(call.at)
-            // 第 9 个参数：sqlx 按**绑定顺序**编号（不是按语句里的 `$n`），所以批号
-            // 必须排在 `at` 之后才能对上 `$9`。
-            .bind(call.batch_id.clone())
-            .execute(&self.pool)
+/// 一次「没命中」按**为什么没命中**分类后的一格：类名与条数。
+///
+/// 命中率低是一个数，而两种低法要做的活完全不同：前缀接不上（工具定义变了、system
+/// 里注入了每轮都变的东西、历史被改写）与接得上却没有命中（上一轮的字节这次没被
+/// 复用）。合成一个数，谁也看不出该修哪一层。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheMissClass {
+    /// `model`／`system`／`tools`／`messages`／`none`（接得上却没命中）／`unmeasured`。
+    pub class: String,
+    pub misses: i64,
+}
+
+/// 窗口里每一次「没命中」按上面的分类计数。
+///
+/// 只看同会话里**前一条留下清单**的那些调用：没有清单的那一次无从判断接没接上，
+/// 记成 `unmeasured` 而不是猜一个类。缓存命中数取自那一行自己的 `cached_tokens`。
+pub async fn cache_miss_breaks(
+    pool: &PgPool,
+    since: chrono::DateTime<chrono::Utc>,
+    until: chrono::DateTime<chrono::Utc>,
+) -> SFResult<Vec<CacheMissClass>> {
+    use cog_core::contract::prompt_prefix::{classify_manifest_break, parse_manifest};
+    use std::collections::BTreeMap;
+    let rows: Vec<(String, Option<String>, Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT idempotency_key, attributes::jsonb ->> 'session', cached_tokens, \
+                attributes::jsonb ->> 'prompt_manifest' \
+           FROM cogneva_event \
+          WHERE kind = 'llm_call' AND at >= $1 AND at < $2 \
+          ORDER BY at, event_id",
+    )
+    .bind(since)
+    .bind(until)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| SFError::Database(format!("read calls for cache misses: {e}")))?;
+    let mut previous: BTreeMap<String, cog_core::contract::prompt_prefix::PrefixManifest> =
+        BTreeMap::new();
+    let mut counts: BTreeMap<String, i64> = BTreeMap::new();
+    for (_call_id, session, cached, manifest) in rows {
+        let Some(session) = session else { continue };
+        let manifest = manifest.as_deref().and_then(parse_manifest);
+        let hit = cached.unwrap_or(0) > 0;
+        if !hit {
+            let class = match (&previous.get(&session), &manifest) {
+                (Some(before), Some(now)) => classify_manifest_break(before, now).as_str(),
+                // 没有前一条或没有这一次的清单：判断不了，记成没量到。
+                _ => "unmeasured",
+            };
+            *counts.entry(class.to_string()).or_default() += 1;
+        }
+        match manifest {
+            Some(manifest) => {
+                previous.insert(session, manifest);
+            }
+            // 没有清单的那一次不在链上：前后比较不能跨过它。
+            None => {
+                previous.remove(&session);
+            }
+        }
+    }
+    Ok(counts
+        .into_iter()
+        .map(|(class, misses)| CacheMissClass { class, misses })
+        .collect())
+}
+
+/// 同会话相邻两次调用之间，前缀断在哪一格：前一条的身份、后一条的身份、断法。
+///
+/// 读的是两次调用**自己记下的清单**，不重算请求体：请求体可能已经随留底过期，
+/// 而清单是调用那一刻算的。没有清单的那一次调用不能被跳过——跨过它去比前后两条，
+/// 报出来的「接得上」是关于两条彼此没见过的请求说的。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefixObservation {
+    pub previous: String,
+    pub next: String,
+    pub break_: cog_core::contract::prompt_prefix::PrefixBreak,
+}
+
+impl LlmCallEventStore {
+    /// 一个会话里每一次前缀断裂，按发生顺序。
+    pub async fn prefix_breaks_in_session(
+        &self,
+        session: &str,
+    ) -> SFResult<Vec<PrefixObservation>> {
+        use cog_core::contract::prompt_prefix::{classify_manifest_break, parse_manifest};
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT idempotency_key, attributes::jsonb ->> 'prompt_manifest' \
+               FROM cogneva_event \
+              WHERE kind = 'llm_call' AND attributes::jsonb ->> 'session' = $1 \
+              ORDER BY at, event_id",
+        )
+        .bind(session)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(format!("read calls of session {session}: {e}")))?;
+        let mut out = Vec::new();
+        let mut previous: Option<(String, cog_core::contract::prompt_prefix::PrefixManifest)> =
+            None;
+        for (call_id, manifest) in rows {
+            let Some(manifest) = manifest.as_deref().and_then(parse_manifest) else {
+                // 没有清单：这一条不在链上，也不假装它没出现过——前后的比较不能跨过它。
+                previous = None;
+                continue;
+            };
+            if let Some((previous_id, previous_manifest)) = &previous {
+                out.push(PrefixObservation {
+                    previous: previous_id.clone(),
+                    next: call_id.clone(),
+                    break_: classify_manifest_break(previous_manifest, &manifest),
+                });
+            }
+            previous = Some((call_id, manifest));
+        }
+        Ok(out)
+    }
+}
+
+impl LlmCallEventStore {
+    /// 按批号取这一批发起过的调用，按发生时刻排。
+    ///
+    /// 批号是那次调用自己带进信封的那一列；这里只读列，不在载荷里再取一次
+    /// ——「写的人放载荷、读的人按列」正是这一族此前答「这一批没有记录」的形状。
+    ///
+    /// 读不回来的那一行**点名报错**，不跳过：少一行会让「这一批花了多少」算少，
+    /// 而算少的数看起来与真的少花了一样。
+    pub async fn calls_in_batch(&self, batch_id: &str) -> SFResult<Vec<cog_core::LlmCall>> {
+        const SQL: &str = "\
+SELECT idempotency_key, actor, attributes, at FROM cogneva_event \
+ WHERE kind = 'llm_call' AND batch_id = $1 \
+ ORDER BY at, event_id";
+        let rows = sqlx::query(SQL)
+            .bind(batch_id)
+            .fetch_all(&self.pool)
             .await
-            .map_err(|e| SFError::Database(format!("append llm_call event: {e}")))?;
-        Ok(())
+            .map_err(|e| SFError::Database(format!("read llm calls of batch {batch_id}: {e}")))?;
+        let mut calls = Vec::with_capacity(rows.len());
+        for row in rows {
+            let call_id: String = row
+                .try_get("idempotency_key")
+                .map_err(|e| SFError::Database(format!("read a call identity: {e}")))?;
+            let actor: String = row.try_get("actor").unwrap_or(Default::default());
+            let text: String = row
+                .try_get("attributes")
+                .map_err(|e| SFError::Database(format!("read a call payload: {e}")))?;
+            let at: chrono::DateTime<chrono::Utc> = row
+                .try_get("at")
+                .map_err(|e| SFError::Database(format!("read a call time: {e}")))?;
+            let attributes: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+                SFError::Database(format!(
+                    "call {call_id} carries a payload that is not JSON: {e}"
+                ))
+            })?;
+            let call = cog_core::LlmCall::from_attributes(call_id.clone(), actor, &attributes, at)
+                .ok_or_else(|| {
+                    SFError::Database(format!(
+                        "call {call_id} is missing a cell its own writer always writes"
+                    ))
+                })?;
+            calls.push(call);
+        }
+        Ok(calls)
     }
 }
 

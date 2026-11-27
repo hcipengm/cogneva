@@ -426,12 +426,14 @@ pub const NODE_IO_SYSCTL_FILE: &str = "/etc/sysctl.d/99-cogneva-node-io.conf";
 
 /// Seconds of the device's own sustained write the node lets pile up before the
 /// kernel starts writing back in the background.
-// cap: bound — 内核把脏页转到后台回写的阈值，按这台设备自己的持续写速度折算出来
+// cap: fixed — 内核把脏页转到后台回写的阈值，按这台设备自己的持续写速度折算出来
+// keep: 删掉后内核脏页回写阈值回到内核默认，与这台设备的持续写速脱钩，突发写会把磁盘堵住；由「按设备写速折算」兜住
 const DIRTY_BACKGROUND_SECONDS: u64 = 2;
 
 /// The same, for the watermark at which a writer is made to write back before it
 /// can dirty more.
-// cap: bound — 同一个折算下的另一档：写者被强制回写、不能再弄脏更多
+// cap: fixed — 同一个折算下的另一档：写者被强制回写、不能再弄脏更多
+// keep: 删掉后强制回写那一档没有界，写者可以一直弄脏更多；由同一折算兜住
 const DIRTY_FORCE_SECONDS: u64 = 5;
 
 /// Floor for the background watermark. Below the speed the flusher threads can
@@ -439,11 +441,13 @@ const DIRTY_FORCE_SECONDS: u64 = 5;
 /// it, so the queue this bound exists to shape never forms and the two points
 /// collapse into a permanent trickle. These floors are the smallest pair that
 /// still lets a burst finish.
-// cap: bound — 这两个下限是「一次突发还能写完」的最小一对；再低，回写会塌成永久细流
+// cap: fixed — 这两个下限是「一次突发还能写完」的最小一对；再低，回写会塌成永久细流
+// keep: 删掉后一次突发写不完整，回写会塌成永久细流；由「一次突发还能写完」兜住
 const DIRTY_BACKGROUND_FLOOR_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Floor for the force watermark, above the background floor by construction.
-// cap: bound — 强制档的地板，按构造高于后台档
+// cap: fixed — 强制档的地板，按构造高于后台档
+// keep: 删掉后两档地板的关系失效，强制档不再按构造高于后台档；由「强制档地板高于后台档」兜住
 const DIRTY_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The unflushed data never grows past this share of RAM: one twentieth, a
@@ -454,12 +458,14 @@ const DIRTY_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
 /// unflushed data is affordable; it decides only that a device so fast the
 /// throughput-derived number would be enormous must not be allowed to hold the
 /// whole node's memory dirty, which would turn a disk bound into an OOM.
-// cap: bound — 按吞吐推出来的数在 RAM 大的机器上会很大，但不能让它把整机内存握成脏页，那会把磁盘瓶颈变成 OOM
+// cap: fixed — 按吞吐推出来的数在 RAM 大的机器上会很大，但不能让它把整机内存握成脏页，那会把磁盘瓶颈变成 OOM
+// keep: 删掉后大 RAM 机器会把整机内存握成脏页，磁盘瓶颈变成 OOM；由「按吞吐折算且不超过内存份额」兜住
 const DIRTY_MAX_RAM_DIVISOR: u64 = 20;
 
 /// Hard ceiling on either watermark, for a node whose RAM would put the share
 /// above it.
-// cap: bound — 两条水位的硬顶，管住那些按 RAM 份额会算出更高值的机器
+// cap: fixed — 两条水位的硬顶，管住那些按 RAM 份额会算出更高值的机器
+// keep: 删掉后按 RAM 份额算出的更高值没有硬顶，可能超过设备能承受的脏页量；由「两条水位的硬顶」兜住
 const DIRTY_CEILING_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// The dirty-page watermarks this node should run with, in bytes.

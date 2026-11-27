@@ -132,6 +132,19 @@ pub struct Task {
     pub task_type: TaskType,
     pub status: TaskStatus,
     pub input: serde_json::Value,
+    /// 终态描述：讨论写下的那段话，原样。判据只读这一格。
+    ///
+    /// 与 `now`／`gap` 一起是待办的五格里的三格（另两格是 `id` 与算出来的
+    /// 状态）。它们是一等字段而不是 `input` 里的一个键：判据与界面都按名读它们，
+    /// 埋在文本载荷里就不可查询，只好像什么「按键读的键升成真列」那样再补一层。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub terminal: String,
+    /// 此刻的样子，写明来源（census／test／planner／owner）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub now: String,
+    /// 终态减现在，用话写明缺什么；空 = 到终态。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gap: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1140,7 +1153,8 @@ pub const READY_LANE_STOP_THE_LINE: &str = "stop_the_line";
 /// 判决读的是 `retry_matrix` 的「未分类」档（`effective_max_retries`），行上这一列
 /// 只被落库与读回；两处各写一个 3 的那一版，改一边不会让另一边红。这里只留一份，
 /// 两边读同一个名字。
-// cap: bound — 三次重试：与 retry_matrix 未分类档同源（角色失败多是上游抖动，三次之后每次只是把同一个失败拖得更久）
+// cap: fixed — 三次重试：与 retry_matrix 未分类档同源（角色失败多是上游抖动，三次之后每次只是把同一个失败拖得更久）
+// keep: 删掉后回到「三次重试：与 retry_matrix 未分类档同源（角色失败多是上游抖动，三次之后每次只是把同一个失败拖得更久）」所描述的情形；由这条约定兜住
 pub const DEFAULT_MAX_RETRIES: u32 = 3;
 
 /// 交活方没说「这件活预计多久」时，任务行上的声明值（秒）。
@@ -1149,32 +1163,105 @@ pub const DEFAULT_MAX_RETRIES: u32 = 3;
 /// `outcome_deadline` 用它算「多久没有结局算欠着」。与 `DISCOVERY_PROBE_CONTRACT_SECS`
 /// 是同一个数，两边读同一个名字。
 // cap: fixed — 与探针那一侧的「一轮工期」约定同值（五分钟），不是测出来的量
+// keep: 删掉后工期声明没有默认值，读的人分不出慢与卡；由「与探针那一侧的轮工期同值」兜住
 pub const DEFAULT_DECLARED_DURATION_SECS: u64 = 300;
 
 impl Task {
-    /// 把一条待办的三格挂到任务行上（`input[ITEM_INPUT_KEY]`）。
+    /// 待办的第五格：状态是算出来的，不是存的。
+    ///
+    /// 只有「完成且差距为空（空串或破折号）」才是 `已落`；失败、撤回、还在跑，
+    /// 或者完成却仍写着差距，都是 `未落`——一次运行报告成功不等于那件事在树上成立了。
+    pub fn ledger_state(&self) -> crate::contract::ledger_item::LedgerState {
+        crate::contract::ledger_item::LedgerState::from_outcome(
+            self.status == TaskStatus::Completed,
+            &self.gap,
+        )
+    }
+
+    /// 这条待办此刻的五格。字段是正本；字段全空时退回 `input[ITEM_INPUT_KEY]`
+    /// （过渡期的旧入口/旧行）。状态按任务的当前状态与差距现算。
+    pub fn ledger_item(&self) -> Option<crate::contract::ledger_item::LedgerItem> {
+        let mut item = if !self.terminal.is_empty() || !self.now.is_empty() || !self.gap.is_empty()
+        {
+            crate::contract::ledger_item::LedgerItem {
+                id: self.id.clone(),
+                terminal: self.terminal.clone(),
+                now: self.now.clone(),
+                gap: self.gap.clone(),
+                state: Default::default(),
+            }
+        } else {
+            let raw = self
+                .input
+                .get(crate::contract::ledger_item::ITEM_INPUT_KEY)?
+                .clone();
+            crate::logged_ok!(serde_json::from_value::<
+                crate::contract::ledger_item::LedgerItem,
+            >(raw))?
+        };
+        item.state = item.clone().at_outcome(self.status).state;
+        Some(item)
+    }
+
+    /// 把 `input[ITEM_INPUT_KEY]` 里的三格提到一等字段上（过渡期用）。
+    ///
+    /// 入口不止一处，今天还有几条路把三格塞在输入里；写任务事实之前在这里提一次，
+    /// 保证流上那条定义带着三格。字段已经有值时不动——字段是正本，输入是旧写法。
+    pub fn lift_item_cells(&mut self) {
+        if !self.terminal.is_empty() || !self.now.is_empty() || !self.gap.is_empty() {
+            return;
+        }
+        let Some(raw) = self
+            .input
+            .get(crate::contract::ledger_item::ITEM_INPUT_KEY)
+            .cloned()
+        else {
+            return;
+        };
+        if let Ok(item) = serde_json::from_value::<crate::contract::ledger_item::LedgerItem>(raw) {
+            self.terminal = item.terminal;
+            self.now = item.now;
+            self.gap = item.gap;
+        }
+    }
+
+    /// 写事实时把输入里的三格副本退休：字段是正本，同一件事不再留第二份。
+    ///
+    /// 只影响要写下去的那一份（`save_definition` 在克隆上调它）；入口仍在输入里
+    /// 交三格是**传输形状**，不是事实的第二份。旧事件里的副本不动，读法仍有回退。
+    pub fn retire_item_cells_copy(&mut self) {
+        if let Some(obj) = self.input.as_object_mut() {
+            obj.remove(crate::contract::ledger_item::ITEM_INPUT_KEY);
+        }
+    }
+
+    /// 把一条待办的三格挂到任务行上（一等字段）。
     ///
     /// 意图的入口不止一处——对话、GitHub 发现、A2A、信号、变更再修——它们都要把
     /// 「做完是什么样、现在什么样、还差什么」一起交进来；否则协作层拿到的只有一句
     /// 目标，判者判完之后也没有东西可以写回去。入口各拼一次键名就会漂，所以键与这一
-    /// 句都住在这里。
-    pub fn carrying(mut self, item: &crate::contract::ledger_item::LedgerItem) -> Self {
-        if let Ok(value) = serde_json::to_value(item) {
-            match self.input.as_object_mut() {
-                Some(obj) => {
-                    obj.insert(
-                        crate::contract::ledger_item::ITEM_INPUT_KEY.to_string(),
-                        value,
-                    );
-                }
-                None => {
-                    self.input = serde_json::json!({
-                        crate::contract::ledger_item::ITEM_INPUT_KEY: value
-                    });
-                }
-            }
-        }
+    /// 句都住在这里。字段是正本；输入里的副本供还没切过来的旧读者，下一段退休。
+    /// 给任务挂上三格：终态、现在、差距。五格的中心是 `Task`，不是另造一个值对象
+    /// 再把字符串拷进来；`LedgerItem` 是读出来的投影，`carrying` 只是它的桥。
+    pub fn with_cells(
+        mut self,
+        terminal: impl Into<String>,
+        now: impl Into<String>,
+        gap: impl Into<String>,
+    ) -> Self {
+        self.terminal = terminal.into();
+        self.now = now.into();
+        self.gap = gap.into();
         self
+    }
+
+    /// 这条任务带的三格；三格都空即不是待办，答 `None`。
+    pub fn cells(&self) -> Option<(&str, &str, &str)> {
+        if self.terminal.is_empty() && self.now.is_empty() && self.gap.is_empty() {
+            None
+        } else {
+            Some((&self.terminal, &self.now, &self.gap))
+        }
     }
 
     pub fn new(id: impl Into<String>, task_type: TaskType, input: serde_json::Value) -> Self {
@@ -1184,6 +1271,9 @@ impl Task {
             task_type,
             status: TaskStatus::Pending,
             input,
+            terminal: String::new(),
+            now: String::new(),
+            gap: String::new(),
             result: None,
             error: None,
             error_cause: None,
@@ -1418,10 +1508,7 @@ impl Task {
     /// 时把未派生的意图读进请求——普通目标的那一跑不该看见别人说的话。
     pub fn is_chat_intent_batch(&self) -> bool {
         matches!(&self.task_type, TaskType::Custom(s) if s == CHAT_INTENT_TASK_KIND)
-            || self
-                .input
-                .get(INPUT_TASK_KIND)
-                .and_then(|v| v.as_str())
+            || self.input.get(INPUT_TASK_KIND).and_then(|v| v.as_str())
                 == Some(CHAT_INTENT_TASK_KIND)
     }
 
@@ -1657,6 +1744,110 @@ mod tests {
     use super::*;
     use crate::checkout::repo_root;
 
+    /// 三格挂在任务的一等字段上，输入里不再有副本。
+    #[test]
+    fn with_cells_puts_the_three_cells_on_the_task() {
+        use crate::contract::ledger_item::{LedgerItem, ITEM_INPUT_KEY};
+        let item = LedgerItem {
+            id: "L1".into(),
+            terminal: "到终态".into(),
+            now: "此刻".into(),
+            gap: "缺的是：接线".into(),
+            state: Default::default(),
+        };
+        let task = Task::new("L1", TaskType::DagNode, serde_json::json!({})).with_cells(
+            item.terminal.clone(),
+            item.now.clone(),
+            item.gap.clone(),
+        );
+        assert_eq!(task.terminal, "到终态");
+        assert_eq!(task.now, "此刻");
+        assert_eq!(task.gap, "缺的是：接线");
+        assert!(
+            task.input.get(ITEM_INPUT_KEY).is_none(),
+            "系统流程用字段，不在输入里留第二份"
+        );
+    }
+
+    /// 状态是算出来的：完成且差距为空才已落；完成却还写着差距仍是未落。
+    #[test]
+    fn the_ledger_state_is_computed_from_status_and_gap() {
+        use crate::contract::ledger_item::LedgerState;
+        let mut task = Task::new("L1", TaskType::DagNode, serde_json::json!({}));
+        task.status = TaskStatus::Completed;
+        assert_eq!(
+            task.ledger_state(),
+            LedgerState::Reached,
+            "完成且差距为空才是终态"
+        );
+        task.gap = "缺的是：最后一处".into();
+        assert_eq!(
+            task.ledger_state(),
+            LedgerState::Open,
+            "完成却还写着差距，不许冒充终态"
+        );
+        task.gap = "—".into();
+        assert_eq!(
+            task.ledger_state(),
+            LedgerState::Reached,
+            "破折号是排版上的「没有差距」，与空串同义"
+        );
+        task.gap = String::new();
+        task.status = TaskStatus::Running;
+        assert_eq!(task.ledger_state(), LedgerState::Open);
+    }
+
+    /// 写事实时旧入口留在输入里的副本退休：字段留下，输入里不再有第二个落点。
+    #[test]
+    fn retiring_the_copy_removes_the_input_key_and_keeps_the_fields() {
+        use crate::contract::ledger_item::{LedgerItem, ITEM_INPUT_KEY};
+        let item = LedgerItem {
+            id: "L1".into(),
+            terminal: "到终态".into(),
+            now: "此刻".into(),
+            gap: "缺的是：接线".into(),
+            state: Default::default(),
+        };
+        let mut task = Task::new(
+            "L1",
+            TaskType::DagNode,
+            serde_json::json!({ ITEM_INPUT_KEY: serde_json::to_value(&item).unwrap() }),
+        );
+        task.terminal = item.terminal.clone();
+        task.now = item.now.clone();
+        task.gap = item.gap.clone();
+        assert!(task.input.get(ITEM_INPUT_KEY).is_some());
+        task.retire_item_cells_copy();
+        assert!(
+            task.input.get(ITEM_INPUT_KEY).is_none(),
+            "写下去的那一份不再带副本"
+        );
+        assert_eq!(task.terminal, "到终态");
+        assert_eq!(task.gap, "缺的是：接线");
+    }
+
+    /// 旧入口把三格塞在 `input` 里：写事实前 lift 一次，字段成为正本。
+    #[test]
+    fn lifting_moves_the_input_copy_onto_the_fields() {
+        use crate::contract::ledger_item::{LedgerItem, ITEM_INPUT_KEY};
+        let item = LedgerItem {
+            id: "L1".into(),
+            terminal: "到终态".into(),
+            now: "此刻".into(),
+            gap: "缺的是：接线".into(),
+            state: Default::default(),
+        };
+        let mut task = Task::new(
+            "L1",
+            TaskType::DagNode,
+            serde_json::json!({ ITEM_INPUT_KEY: serde_json::to_value(&item).unwrap() }),
+        );
+        task.lift_item_cells();
+        assert_eq!(task.terminal, "到终态");
+        assert_eq!(task.now, "此刻");
+        assert_eq!(task.gap, "缺的是：接线");
+    }
+
     /// 行上那两个数各有一个名字：重试预算与声明时长。
     ///
     /// 它们不是「这条用例挑的值」——判决（`retry_matrix`）与探针的欠结判据
@@ -1667,7 +1858,11 @@ mod tests {
     /// 「谁提的」读同一个键；缺失与空串都读作没有身份。
     #[test]
     fn who_filed_it_is_read_from_one_key() {
-        let mut task = Task::new("t", TaskType::Custom("dag_node".into()), serde_json::json!({}));
+        let mut task = Task::new(
+            "t",
+            TaskType::Custom("dag_node".into()),
+            serde_json::json!({}),
+        );
         assert_eq!(task.said_by(), None);
         task.input["origin"] = serde_json::json!({"source": "a2a", "said_by": ""});
         assert_eq!(task.said_by(), None, "空串是「没有身份」，不是一个匿名的人");
@@ -1691,11 +1886,15 @@ mod tests {
             serde_json::json!({ INPUT_TASK_KIND: CHAT_INTENT_TASK_KIND }),
         );
         assert!(by_input.is_chat_intent_batch());
-        let goal = Task::new("t3", TaskType::Custom("dag_node".into()), serde_json::json!({}));
+        let goal = Task::new(
+            "t3",
+            TaskType::Custom("dag_node".into()),
+            serde_json::json!({}),
+        );
         assert!(!goal.is_chat_intent_batch());
     }
 
-    fn a_task_can_carry_its_ledger_item() {
+    fn a_task_carries_its_cells_on_its_fields() {
         use crate::contract::ledger_item::{LedgerItem, LedgerState, ITEM_INPUT_KEY};
         let item = LedgerItem {
             id: "N1".into(),
@@ -1704,12 +1903,21 @@ mod tests {
             gap: "缺的是：地板外置".into(),
             state: LedgerState::Open,
         };
-        let task =
-            Task::new("t1", TaskType::DagNode, serde_json::json!({"goal": "g"})).carrying(&item);
-        let back: LedgerItem =
-            serde_json::from_value(task.input.get(ITEM_INPUT_KEY).cloned().expect("没挂上"))
-                .unwrap();
-        assert_eq!(back, item);
+        let task = Task::new("t1", TaskType::DagNode, serde_json::json!({"goal": "g"})).with_cells(
+            item.terminal.clone(),
+            item.now.clone(),
+            item.gap.clone(),
+        );
+        let back = task.ledger_item().expect("三格在任务字段上");
+        assert_eq!(back.id, "t1");
+        assert_eq!(back.terminal, item.terminal);
+        assert_eq!(back.now, item.now);
+        assert_eq!(back.gap, item.gap);
+        assert_eq!(back.state, LedgerState::Open);
+        assert!(
+            task.input.get(ITEM_INPUT_KEY).is_none(),
+            "三格不在输入里留副本"
+        );
         assert_eq!(
             task.input.get("goal").and_then(|v| v.as_str()),
             Some("g"),
@@ -2575,7 +2783,7 @@ mod tests {
                 problems.push(format!("{kind} is declared by a producer but unattributed"));
             }
             for file in *files {
-                let text = std::fs::read_to_string(root.join(file)).unwrap_or_default();
+                let text = std::fs::read_to_string(root.join(file)).unwrap_or(Default::default());
                 if !text.contains(kind) {
                     problems.push(format!("{kind} is no longer declared in {file}"));
                 }

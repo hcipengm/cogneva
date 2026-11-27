@@ -86,6 +86,10 @@ pub const LLM_OWNER_HEADER: &str = "x-cogneva-owner";
 /// conversation.
 pub const LLM_SESSION_HEADER: &str = "x-cogneva-session";
 
+/// 这一轮提示在装配时丢掉了多少条更早的消息。只被记录，不被判定；它让「模型
+/// 看到的是哪几段」在段清单之外还答得出「少了几段」。
+pub const LLM_PROMPT_DROPPED_HEADER: &str = "x-cogneva-prompt-dropped";
+
 /// The standard header an upstream uses to say when it can serve us again.
 pub const RETRY_AFTER_HEADER: &str = "retry-after";
 
@@ -166,6 +170,7 @@ pub const RETRY_AFTER_MARKER: &str = "[retry_after_secs=";
 /// ceiling the gateway's own circuit breaker puts on the interval it advertises,
 /// so a recovered wait cannot outlast the source that produced it.
 // cap: fixed — 网关自己的熔断器给它公布的间隔也封在同一高度，所以恢复出来的等待不会长过产生它的源头
+// not-a-bound: 网关自己的熔断器给它公布的间隔也封在同一高度，所以恢复出来的等待不会长过产生它的源头
 pub const MAX_RECOVERED_RETRY_AFTER_SECS: u64 = 6 * 60 * 60;
 
 /// Render `secs` as the token [`retry_after_hint_in`] reads back.
@@ -364,6 +369,15 @@ impl ChatOptions {
         if !session.is_empty() {
             self.headers
                 .insert(LLM_SESSION_HEADER.to_string(), session.to_string());
+        }
+        self
+    }
+
+    /// 装配时丢掉了多少条更早的消息；0 不写（没裁就不报）。
+    pub fn with_prompt_dropped(mut self, dropped: u32) -> Self {
+        if dropped > 0 {
+            self.headers
+                .insert(LLM_PROMPT_DROPPED_HEADER.to_string(), dropped.to_string());
         }
         self
     }

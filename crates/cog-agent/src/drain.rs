@@ -81,11 +81,10 @@ pub fn in_flight() -> usize {
 
 /// 等「在飞数归零」时两次读数之间的间隔。
 ///
-/// 它在飞的数量只在一头一尾各动一次，等的时长由调用方给的 `limit` 决定，这个
-/// 间隔只决定收尾快多少。
-// cap: bound — 一次收尾的等待，量的是「多久看一次」，不是「等多久」；等多久由调用方给
-const DRAIN_POLL: Duration = Duration::from_millis(50);
-
+/// 它在飞的数量只在一头一尾各动一次，等的时长由调用方给的 `limit` 决定；看多勤
+/// 用的是全树同一条读取周期（[`cog_core::progress::WATCH_TICK`]）——两处各写一个
+/// 节拍时，同一个「多久看一次」会有两个答案，而两个答案平时都读得通。
+///
 /// 等到手上的运行都结束，最多等 `limit`。返回是否等到了零。
 ///
 /// 轮询而不是条件变量：在飞的数量本来就只在一头一尾各动一次，而一个条件变量
@@ -100,7 +99,7 @@ pub async fn wait_drained(limit: Duration) -> bool {
         if now >= deadline {
             return false;
         }
-        tokio::time::sleep(DRAIN_POLL.min(deadline - now)).await;
+        tokio::time::sleep(cog_core::progress::WATCH_TICK.min(deadline - now)).await;
     }
 }
 

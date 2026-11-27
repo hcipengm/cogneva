@@ -142,7 +142,7 @@ impl PrometheusMetricsBackend {
                 &sorted_keys.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             )
             .map_err(|e| SFError::Agent(format!("prometheus counter init: {}", e)))?;
-            self.registry.register(Box::new(counter_vec.clone())).ok();
+            cog_core::ignore_lost!(self.registry.register(Box::new(counter_vec.clone())));
             store.insert(key.clone(), counter_vec);
         }
 
@@ -173,7 +173,7 @@ impl PrometheusMetricsBackend {
                 &sorted_keys.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             )
             .map_err(|e| SFError::Agent(format!("prometheus gauge init: {}", e)))?;
-            self.registry.register(Box::new(gauge_vec.clone())).ok();
+            cog_core::ignore_lost!(self.registry.register(Box::new(gauge_vec.clone())));
             store.insert(key.clone(), gauge_vec);
         }
 
@@ -216,7 +216,7 @@ impl PrometheusMetricsBackend {
                 &sorted_keys.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             )
             .map_err(|e| SFError::Agent(format!("prometheus histogram init: {}", e)))?;
-            self.registry.register(Box::new(hist_vec.clone())).ok();
+            cog_core::ignore_lost!(self.registry.register(Box::new(hist_vec.clone())));
             store.insert(key.clone(), hist_vec);
         }
 

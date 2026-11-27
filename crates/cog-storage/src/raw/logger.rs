@@ -16,6 +16,7 @@ use std::sync::Arc;
 /// The level zstd itself calls its default: cheap enough for the raw-log write
 /// path, which is on the hot path of every record.
 // cap: fixed — 取的是 zstd 自己叫默认的那个级别：对每条记录都在热路径上的原始日志写够便宜
+// keep: 删掉后原始日志按另一个档压缩，热路径上每条记录的写代价变了；由「zstd 默认级别」兜住
 const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
 fn zstd_compress(bytes: &[u8], level: i32) -> SFResult<Vec<u8>> {
@@ -265,7 +266,7 @@ impl FileRawLogger {
                             &*codec_bg,
                         )
                         .await;
-                        let _ = reply.send(overall);
+                        cog_core::ignore_lost!(reply.send(overall));
                     }
                 }
             }
@@ -559,7 +560,7 @@ async fn read_one_file(path: &Path, codec: &dyn RawRecordCodec) -> SFResult<Vec<
     let file_name = path
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
 
     // Warm-tier migration compresses a file in place and keeps the extension it
     // found (`2026-09-14.jsonl` -> `2026-09-14.jsonl.zst`), so the frame has to

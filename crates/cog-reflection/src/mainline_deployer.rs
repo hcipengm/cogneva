@@ -123,8 +123,8 @@ pub(crate) async fn ensure_cargo_home_mirror_config() {
         return;
     }
     if let Ok(body) = tokio::fs::read(img_config).await {
-        let _ = tokio::fs::create_dir_all(CARGO_HOME_PVC).await;
-        let _ = tokio::fs::write(&pvc_config, body).await;
+        cog_core::ignore_lost!(tokio::fs::create_dir_all(CARGO_HOME_PVC).await);
+        cog_core::ignore_lost!(tokio::fs::write(&pvc_config, body).await);
     }
 }
 
@@ -322,12 +322,15 @@ const PROGRESS_FILE: &str = cog_core::paths::PROGRESS_FILE;
 /// 声明自己的工期界，而一条每批 900 秒、批数随库存变的回收循环，会让那个界没法
 /// 存在——库存涨起来时，同一条循环可以从"一轮一分钟"变成"一轮几小时"而没有一次
 /// 心跳。删不完的留给下一轮，回收是幂等的。
-// cap: bound — 与 CHUNK 一起给回收那一段一轮定上界；删不完留给下一轮，回收是幂等的
+// cap: fixed — 与 CHUNK 一起给回收那一段一轮定上界；删不完留给下一轮，回收是幂等的
+// keep: 删掉后回到「与 CHUNK 一起给回收那一段一轮定上界；删不完留给下一轮，回收是幂等的」所描述的情形；由这条约定兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const BUILDAH_RMI_BATCHES_PER_ROUND: u64 = 2;
 
 /// 回收那一轮里每批删几张。与 [`BUILDAH_RMI_BATCHES_PER_ROUND`] 一起构成这一段
 /// 一轮的上界。
-// cap: bound — 每批删几张，与上面那个数一起构成一轮的上界
+// cap: fixed — 每批删几张，与上面那个数一起构成一轮的上界
+// keep: 删掉后一轮删除的镜像无界，一次回收把镜像存储清空成一次长事务；由「每批删几张、一轮的上界」兜住
 const BUILDAH_RMI_BATCH_CHUNK: usize = 32;
 
 /// 判定 Job 还在跑时，就地轮询它的间隔。
@@ -335,8 +338,11 @@ const BUILDAH_RMI_BATCH_CHUNK: usize = 32;
 /// 这个数是"看见它退出"的延迟，不是"等它跑完"的时间：判定本身要跑几分钟，而
 /// 十五秒的粒度在十分钟的轮询节拍旁边几乎不花什么——它只换掉一个本来要等满
 /// 一轮才发生的结论。
-// cap: bound — 十五秒的粒度在十分钟的轮询节拍旁几乎不花什么，只换掉一个本来要等满一轮的结论
-const JUDGEMENT_POLL_SECS: u64 = 15;
+// 删掉它，看见它退出最多晚一整轮（十分钟）；来源是这条粒度约定——判定要跑几分钟，
+// 十几秒的轮询在十分钟节拍旁几乎不花什么。
+fn judgement_poll_secs() -> cog_core::Bound<u64> {
+    cog_core::Bound::fixed(15, "看见判词退出的粒度：最多换掉一次本来要等满一轮的结论")
+}
 
 /// 部署器这一轮愿意为一次判定等多久。
 ///
@@ -374,7 +380,8 @@ fn judgement_wait_budget(soak_secs: u64, rollout_timeout_secs: u64) -> Duration 
 /// 它取到全场并没有"回答"这一方的请求），被构建挡住时又把自己的认领写上去，直接顶掉
 /// 这一方的。两种情况都让这一方每轮白认领一次，于是照旧连输。闸门现在只允许认领的持有者
 /// 清掉自己的那条，且已有人认领时不再覆写——构建对两个认领一样让步，覆写换不到任何东西。
-// cap: bound — 让连输的一方在几次让步后能前进；闸门只许持有者清自己那条
+// cap: fixed — 让连输的一方在几次让步后能前进；闸门只许持有者清自己那条
+// keep: 删掉后连输的一方永远让位，闸门被一直占着的那一方饿死；由「几次让步后让连输的一方前进」兜住
 const ADVANCE_CLAIM_AFTER_DEFERRALS: u32 = 3;
 
 /// 主线在构建闸前排队等多久，秒。
@@ -386,14 +393,21 @@ const ADVANCE_CLAIM_AFTER_DEFERRALS: u32 = 3;
 /// 一分钟是**排队**的时长，不是**构建**的时长：一轮构建要十几分钟，等满它会把一拍
 /// 轮询整个停住，而这一拍正是发布「我还在等」的那一拍。等满一分钟还没轮到的，照旧按
 /// 被拒处理（计数、起点、认领名额都不变），下一拍重新排队。
-// cap: bound — 等满一分钟还没轮到的按被拒处理，下一拍重新排队
-const ADVANCE_BUILD_WAIT: Duration = Duration::from_secs(60);
+// 删掉排队界，主线会等满一次构建（十几分钟，实测一次持有 268 秒而它自称等了 1066 秒），
+// 把这一拍轮询整个停住；来源是「排队不是构建」这条约定——等满就按被拒处理，下一拍重排。
+fn advance_build_wait() -> cog_core::Bound<Duration> {
+    cog_core::Bound::fixed(
+        Duration::from_secs(60),
+        "排队不是构建：等满一分钟按被拒处理、下一拍重排，不把一拍轮询停住",
+    )
+}
 
 /// 一次 socket 读最多收多少字节。
 ///
 /// 它不是界：判停画在两次字节之间（`READ_TIMEOUT` 内一个字节都没进来才算停），
 /// 块多大只影响系统调用的次数。
-// cap: bound — 读缓冲容量，不改变判据：判停画在两次字节之间，块大小只影响系统调用次数
+// cap: fixed — 读缓冲容量，不改变判据：判停画在两次字节之间，块大小只影响系统调用次数
+// keep: 删掉后读缓冲没有大小，一次读把整个响应拉进内存；由「读缓冲容量、判据在两次字节之间」兜住
 const HTTP_READ_CHUNK: usize = 64 * 1024;
 
 /// 稳定叠层基底的 tag：`<registry>/cogneva:seed`。
@@ -956,7 +970,8 @@ pub(crate) const FATAL_WAITING_REASONS: &[&str] = &[
 /// 不是这次失败的性质——辅助读数能让主判据换个落点，等于让病因自己决定归谁管。
 pub(crate) const SUPPORT_CAUSE_SEPARATOR: &str = "; why it has not come up: ";
 
-// cap: bound — the text comes from the cluster, so its length cannot be the cluster's to decide: it ends up in logs, termination messages and failure records
+// cap: fixed — the text comes from the cluster, so its length cannot be the cluster's to decide: it ends up in logs, termination messages and failure records
+// keep: 删掉后集群给的病因原文决定日志与终止消息的长度，一个啰嗦的 Pod 能把别的记录挤掉；由「进日志与终止消息的现场读数」兜住
 pub(crate) const SUPPORT_CAUSE_MESSAGE_CHARS: usize = 200;
 
 /// 一个 Pod 模板里「读到某个 ConfigMap」的形态，写成相对 Pod 模板根的路径。
@@ -1641,7 +1656,8 @@ const CI_HOLD_FIX_KIND: &str = "ci_hold_fix";
 ///
 /// 轮次不是时间表，是「上一行已经终结了，而扣住还站着」的计数：每一轮都要有一行
 /// 真的办完才会走到下一轮，所以这个上界只在别的地方出错时才会被撞到。
-// cap: bound — 正常一轮一条活，三十二轮只在上游判据自己出错时才会被撞到；撞到就换带时刻的新 id
+// cap: fixed — 正常一轮一条活，三十二轮只在上游判据自己出错时才会被撞到；撞到就换带时刻的新 id
+// keep: 删掉后修一轮的上限消失，上游判据自己出错时同一件活被无限轮下去；由「撞到就换带时刻的新 id」兜住
 const CI_HOLD_FIX_ROUNDS: usize = 32;
 
 /// 这一轮**谁在管**这次扣住。0/1 只答「有没有人管」，而「没人管」有两种，修法在
@@ -1770,7 +1786,7 @@ pub(crate) fn ci_hold_goal_text(
     // 接在同一行里读起来会像是这一次的失败原因之一。
     let tried = ci_hold_attempts_note(attempted, stopped)
         .map(|note| format!("\n\n{note}"))
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     // 可落地的范围与贡献门是同一句措辞（见 [`cog_core::CONTRIBUTABLE_SURFACES`]）。
     // 写在这里，是因为「修 CI」最直接的读法就是改 CI 自己的文件，而那条路走不通：
     // 2026-11-05 实测一条修法把 `fetch-depth: 0` 加进 `.github/workflows/ci.yml`，
@@ -1904,12 +1920,14 @@ pub(crate) fn ci_hold_attempts_note(attempted: &[CiHoldAttempt], stopped: usize)
 }
 
 /// 一轮的结论带进下一轮时的长度上限。这段是提示不是日志，读到卡在哪一步就够。
-// cap: bound — 结论只要留到能读出它停在哪条命令，再长就从题面里挤掉下一轮真正要看的东西
+// cap: fixed — 结论只要留到能读出它停在哪条命令，再长就从题面里挤掉下一轮真正要看的东西
+// keep: 删掉后结论把题面里下一轮要看的东西挤掉；由「结论只留到能读出停在哪条命令」兜住
 const CI_HOLD_ATTEMPT_SAID_MAX: usize = 200;
 
 /// 最多回顾最近几轮。每一条都要问一次图，而扣住可以跨几个小时，行数没有上界；
 /// 答的问题也只是「刚刚那几次为什么没成」，不是全量审计。
-// cap: bound — 只用来认出「这几轮在重复同一个做法」，看得更早只是多问几次图
+// cap: fixed — 只用来认出「这几轮在重复同一个做法」，看得更早只是多问几次图
+// keep: 删掉后每轮多问几次图，只为认出「这几轮在重复同一个做法」；由「看得更早只是多问几次」兜住
 const CI_HOLD_ATTEMPTS_SHOWN: usize = 4;
 
 /// 这次失败是不是已经见过的那一处坏。证据取不到（`None`）时不做区分：读不出
@@ -2012,7 +2030,8 @@ pub(crate) fn ci_failed_test_names(text: &str) -> Vec<String> {
 ///
 /// 交下去的是「该去跑哪几条」，不是失败全表：一百条红的时候，前几个名字足以
 /// 让人找到那一族测试，而把一百个名字塞进上下文只会挤掉真正的原因。
-// cap: bound — 前几个名字够找到那一族测试，失败全表进上下文只会挤掉真正的原因
+// cap: fixed — 前几个名字够找到那一族测试，失败全表进上下文只会挤掉真正的原因
+// not-a-bound: 前几个名字够找到那一族测试，失败全表进上下文只会挤掉真正的原因
 const CI_FAILED_TEST_NAMES_MAX: usize = 8;
 
 /// 去掉终端着色序列。
@@ -2074,7 +2093,8 @@ fn annotation_says_nothing(message: &str) -> bool {
 /// 这张表只登记**实测见过**的串。表外的一律照旧判红：把一条真失败认成机器失败，
 /// 代价是它滚上去；把一个不认识的机器失败照常判红，代价只是等一个新 rev。两侧
 /// 代价不对称，所以宁窄不宁宽。新的形状要连着实测的 run 一起加进来。
-// cap: bound — 每一串都是要维护的实测凭据，不是越长越好的黑名单
+// cap: fixed — 每一串都是要维护的实测凭据，不是越长越好的黑名单
+// keep: 删掉后基础设施故障被读成代码红，同一件活在一台坏机器上反复重试；由「每一串都是要维护的实测凭据」兜住
 const INFRASTRUCTURE_FAILURE_SIGNATURES: &[&str] =
     &["no space left on device", "was not acquired by runner"];
 
@@ -2199,7 +2219,8 @@ fn killed_reason(
 /// （`state.terminated.reason` 与 Pod 的 `status.reason`），所以那一侧的原因不丢：
 /// 落点里的 [`KilledReason`] 就是它。（这个 Job 已经没有按钟杀容器的那条路了；
 /// 存活判据是进度文件。）
-// cap: bound — 与环境类退出码同源；Pod 状态里能分出它的原因，所以切分点在这一侧
+// cap: fixed — 与环境类退出码同源；Pod 状态里能分出它的原因，所以切分点在这一侧
+// keep: 删掉后环境类失败与代码失败共用一个退出码，调用方分不出该重试还是该改代码；由「与环境类退出码同源」兜住
 pub(crate) const ROLLOUT_EXIT_ENVIRONMENT: i32 = 75;
 
 /// 滚动失败的类别。分的是**这次失败说不说得出新版本的问题**：版本类是这份
@@ -2782,7 +2803,8 @@ const CI_HOLD_ENDED_EVENT: &str = "ci_hold_ended";
 
 /// 盘上保留多少次扣住的结局。扣住是被上游 CI 挡住的那几次，不是每一轮都会发生；
 /// 一个环足够回答"最近几版都怎么被放的"，又不让状态文件随历史线性长大。
-// cap: bound — 一个环足够回答「最近几版都怎么被放的」，又不让状态文件随历史线性长大
+// cap: fixed — 一个环足够回答「最近几版都怎么被放的」，又不让状态文件随历史线性长大
+// keep: 删掉后这份环没有上界，状态文件随历史线性长大；由「足够回答最近几版怎么被放」兜住
 const CI_HOLD_END_KEEP: usize = 16;
 
 /// 头上的修订被判红时，往回数几版去找一版可以滚的。
@@ -2791,7 +2813,8 @@ const CI_HOLD_END_KEEP: usize = 16;
 /// 一次构建加一次 rollout 是十几分钟，期间落地的版数才是真正在变的东西。十二
 /// 版按 2026-11-05 实测的落地节奏（约每六分钟一版）是一小时出头，而在头上连续
 /// 被扣住的那几版里，回头的第一版往往就已经是没被判红的。
-// cap: bound — 往回的深度决定一次红头最多追问几次上游，取到「几个小时的路地量」为止
+// cap: fixed — 往回的深度决定一次红头最多追问几次上游，取到「几个小时的路地量」为止
+// keep: 删掉后一次红头要么不追问上游，要么往回到头去问；由「几个小时的路地量」兜住
 const CI_RED_HEAD_LOOKBACK: usize = 12;
 
 /// 一轮从上游往回数出来的两个答案，一次提问同时给出。
@@ -2887,7 +2910,8 @@ const ADVANCE_WAIT_ENDED_EVENT: &str = "advance_wait_ended";
 
 /// 盘上保留多少段等槽的结局。与 [`CI_HOLD_END_KEEP`] 同尺度：这里答的是"最近几段
 /// 等待怎么结束的"，不是全量审计。
-// cap: bound — 与 CI_HOLD_END_KEEP 同尺度：答的是最近几段等待怎么结束的，不是全量审计
+// cap: fixed — 与 CI_HOLD_END_KEEP 同尺度：答的是最近几段等待怎么结束的，不是全量审计
+// keep: 删掉后回到「与 CI_HOLD_END_KEEP 同尺度：答的是最近几段等待怎么结束的，不是全量审计」所描述的情形；由这条约定兜住
 const ADVANCE_WAIT_KEEP: usize = 16;
 
 /// 上一次问上游 CI 得到的判词，按 rev 落盘。
@@ -4185,9 +4209,9 @@ impl MainlineDeployer {
                 return None;
             }
             warn!(pid, age_secs = age, "mainline build lock stale; preempting");
-            let _ = std::fs::remove_file(&path);
+            cog_core::ignore_lost!(std::fs::remove_file(&path));
         }
-        let _ = std::fs::create_dir_all(&self.cfg.state_dir);
+        cog_core::ignore_lost!(std::fs::create_dir_all(&self.cfg.state_dir));
         // pid 占第一行：只认第一行的旧二进制照样能读这份锁；第二行是这一次启动的
         // 标记，给认得它的读者用来认出「同一个 pid 的另一次启动」。
         let body = format!("{}\n{}\n", std::process::id(), launch_token());
@@ -4987,6 +5011,7 @@ impl MainlineDeployer {
         let req = format!(
             "{method} {path} HTTP/1.1\r\nHost: {host}\r\n{accepted}{typed}Connection: close\r\n\r\n"
         );
+        // roundtrip: 一次 TCP 连接
         let mut stream = tokio::time::timeout(
             crate::platform_http::CONNECT_TIMEOUT,
             tokio::net::TcpStream::connect((host, port)),
@@ -5011,6 +5036,7 @@ impl MainlineDeployer {
         let mut chunk = [0u8; HTTP_READ_CHUNK];
         loop {
             let read =
+                // roundtrip: 一次 http 读
                 tokio::time::timeout(crate::platform_http::READ_TIMEOUT, stream.read(&mut chunk))
                     .await
                     .map_err(|_| {
@@ -5097,6 +5123,7 @@ impl MainlineDeployer {
             "GET {prefix}{path} HTTP/1.1\r\nHost: {host}\r\nAccept: {accept}\r\n\
              User-Agent: cogneva-mainline-deployer\r\nConnection: close\r\n\r\n"
         );
+        // roundtrip: 一次 TCP 连接
         let mut stream = tokio::time::timeout(
             crate::platform_http::CONNECT_TIMEOUT,
             tokio::net::TcpStream::connect((host.as_str(), port)),
@@ -5114,6 +5141,7 @@ impl MainlineDeployer {
         let mut chunk = [0u8; HTTP_READ_CHUNK];
         loop {
             let read =
+                // roundtrip: 一次 http 读
                 tokio::time::timeout(crate::platform_http::READ_TIMEOUT, stream.read(&mut chunk))
                     .await
                     .map_err(|_| PlatformReadFailure::Transport)?
@@ -5194,7 +5222,8 @@ impl MainlineDeployer {
     ///
     /// 阶梯要盖住整条实测窗口并留余量：那条窗口的宽度由策略面的调度决定，不是我们能
     /// 钉住的一个数，所以这里只保证一直复问到确认不是「刚起来」为止。
-    // cap: bound — 实测（2026-10-27）：连接被拒的窗口在 1~3 秒之间，这份阶梯从半秒起
+    // cap: fixed — 实测（2026-10-27）：连接被拒的窗口在 1~3 秒之间，这份阶梯从半秒起
+    // keep: 删掉后连接被拒的窗口里没有退避阶梯，重试要么立即要么错过 1~3 秒的就绪窗口；由「实测 2026-10-27 的连接被拒窗口」兜住
     // 翻倍、四档把覆盖拉到那之上；窗口变窄时要跟着下调
     const CI_ASK_RETRY_DELAYS_MS: [u64; 4] = [500, 1_000, 2_000, 4_000];
 
@@ -5572,17 +5601,20 @@ impl MainlineDeployer {
     }
 
     /// 一条失败的检查最多把几句话带进目标里。
-    // cap: bound — 注解是上游按行给的，一个失败的测试一行；三条足以点名是哪一处红，
+    // cap: fixed — 注解是上游按行给的，一个失败的测试一行；三条足以点名是哪一处红，
+    // keep: 删掉后一次红要把所有注解都塞进证据，题面被测试输出淹没；由「三条足以点名哪一处红」兜住
     // 再多就把目标写成一堵读不完的墙，而读不完的那部分等于没写。
     const CI_EVIDENCE_MAX_MESSAGES: usize = 3;
 
     /// 单句话最多带多少个字符。
-    // cap: bound — 注解正文可能带着整段 diff 或栈，这里只留够认出是哪一条的量；全文仍在
+    // cap: fixed — 注解正文可能带着整段 diff 或栈，这里只留够认出是哪一条的量；全文仍在
+    // keep: 删掉后一段 diff 或栈整段进证据，下一轮真正要看的东西被挤掉；由「只留够认出是哪一条的量，全文仍在」兜住
     // 上游页面上，任务图不是它的归宿。
     const CI_EVIDENCE_MAX_CHARS: usize = 400;
 
     /// 没有失败级注解时，从作业日志末尾往回取几行。
-    // cap: bound — 一行是判词、一行是那一步自己打的错、再多几行是它当时在做什么；
+    // cap: fixed — 一行是判词、一行是那一步自己打的错、再多几行是它当时在做什么；
+    // keep: 删掉后日志尾巴要么没有、要么整段，判词读不出它在做什么；由「判词一行＋错误一行＋当时在做什么」兜住
     // 往上多取只会把目标写成一段日志，而读不完的那部分等于没写。
     const CI_LOG_TAIL_LINES: usize = 6;
 
@@ -5687,12 +5719,13 @@ impl MainlineDeployer {
             // 在说「那一步没成功」。只在「一句有内容的话都没有」时才去读日志：已经有
             // 上游自己的话就别再读一遍日志，那是把同一件事说两遍。
             if informative == 0 {
-                let log = Self::platform_get_text(
-                    api_base,
-                    &format!("/repos/{repo}/actions/jobs/{id}/logs"),
-                )
-                .await
-                .ok();
+                let log = cog_core::logged_ok!(
+                    Self::platform_get_text(
+                        api_base,
+                        &format!("/repos/{repo}/actions/jobs/{id}/logs"),
+                    )
+                    .await
+                );
                 // 名字排在末尾那句之前：末尾说的是「最后一行怎么收的」，名字说的是
                 // 「该去跑哪几条」。读到这句的人下一步就是动手，先看见名字才找得到
                 // 位置；只看见「2 failed」则只能把整族测试再跑一遍。
@@ -5910,7 +5943,8 @@ impl MainlineDeployer {
     /// 时限的参照是**这一段扣住的起点**（`ci_hold_run_since_unix`，跨版本连续；还没进
     /// 过扣住的第一拍退回那一版的 `decided_unix`）。宿主实测一段冷构建约 8 分钟，窗口
     /// 给到 30 分钟，足够让一次重跑跑完还留出排队的余量。
-    // cap: bound — 冷构建约 8 分钟，窗口给 30 分钟，够一次重跑跑完还留排队的余量
+    // cap: fixed — 冷构建约 8 分钟，窗口给 30 分钟，够一次重跑跑完还留排队的余量
+    // keep: 删掉后取消的豁免没有窗口，一次重跑跑不完就被判成又一次取消；由「冷构建 8 分钟＋排队余量」兜住
     pub(crate) const CANCELLED_WAIVER_WINDOW_SECS: i64 = 30 * 60;
 
     /// 见 [`Self::CANCELLED_WAIVER_WINDOW_SECS`]。返回新的判词与原因列；没有可以放行的
@@ -5945,7 +5979,7 @@ impl MainlineDeployer {
         }
         let mut waived: Vec<String> = Vec::new();
         for check in cancelled_checks {
-            let platform = check.name.split(':').next().unwrap_or_default();
+            let platform = check.name.split(':').next().unwrap_or(Default::default());
             let slug = format!("{platform}:{}", CiNoVerdictReason::CancelledWaived.label());
             if !waived.contains(&slug) {
                 waived.push(slug);
@@ -6178,7 +6212,7 @@ impl MainlineDeployer {
             .ci_hold
             .as_ref()
             .map(|held| held.rows.clone())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let (owner, rows) = self
             .dispatch_ci_remediation(rev, &finding_rev, &failed_checks, finding_unix, &prior_rows)
             .await;
@@ -7081,7 +7115,7 @@ impl MainlineDeployer {
         }
         let manifest: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|e| SFError::IO(format!("registry manifest {tag} is not JSON: {e}")))?;
-        let digest = header_value(&headers, "docker-content-digest").unwrap_or_default();
+        let digest = header_value(&headers, "docker-content-digest").unwrap_or(Default::default());
         let (source, digest) = if manifest.get("manifests").is_some() {
             let Some(child) = first_manifest_digest(&manifest) else {
                 return Ok(None);
@@ -8528,7 +8562,11 @@ impl MainlineDeployer {
                 );
                 let budget = self.judgement_wait();
                 if !self
-                    .await_judgement(&job, Duration::from_secs(JUDGEMENT_POLL_SECS), budget)
+                    .await_judgement(
+                        &job,
+                        Duration::from_secs(judgement_poll_secs().get()),
+                        budget,
+                    )
                     .await?
                 {
                     return Ok(());
@@ -9175,7 +9213,9 @@ impl MainlineDeployer {
         // 构建在两轮之间插进来，它每次都正好撞上——连续几轮被拒读起来像宿主一直
         // 忙着，实际是它从没排过队（见 [`ADVANCE_BUILD_WAIT`]）。
         let build_slot =
-            match crate::build_gate::acquire_within("mainline advance", ADVANCE_BUILD_WAIT).await {
+            match crate::build_gate::acquire_within("mainline advance", advance_build_wait().get())
+                .await
+            {
                 Ok(slot) => slot,
                 Err(e) => {
                     // 被挡住的每一轮在日志里都和上一轮一模一样：同一个请求者、同一句
@@ -10145,7 +10185,7 @@ impl MainlineDeployer {
                  already holds"
             )));
         }
-        let digest = header_value(&headers, "docker-content-digest").unwrap_or_default();
+        let digest = header_value(&headers, "docker-content-digest").unwrap_or(Default::default());
         if digest.is_empty() {
             return Err(SFError::IO(format!(
                 "the registry served {tag} without a Docker-Content-Digest, so there is no \
@@ -10176,7 +10216,7 @@ impl MainlineDeployer {
         // 构建是哪条链上的，说明不了紧接着的那次滚动。
         let traceparent = cog_core::TraceContext::generate()
             .to_traceparent()
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let mut args: Vec<String> = vec![
             "mainline-rollout".into(),
             "--traceparent".into(),
@@ -10897,7 +10937,7 @@ impl MainlineDeployer {
                     })
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         // 新的在前；同一时刻按名字定序，免得两次读到的顺序不同。
         items.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
 
@@ -11077,7 +11117,10 @@ impl MainlineDeployer {
                 killed,
             };
         }
-        let reason = self.job_failed_condition(name).await.unwrap_or_default();
+        let reason = match self.job_failed_condition(name).await {
+            Some(reason) => reason,
+            None => String::new(),
+        };
         if is_cluster_unreachable(&reason)
             || is_observation_tool_failure(&reason)
             || is_authorization_denied(&reason)
@@ -11340,7 +11383,7 @@ struct BuildLock {
 
 impl Drop for BuildLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        cog_core::ignore_lost!(std::fs::remove_file(&self.path));
     }
 }
 
@@ -11660,7 +11703,9 @@ pub(crate) fn record_convergence(state_dir: &str, pin: &RevPin, now_unix: i64) -
 /// 钉没了就把落地记录一起删掉：留着它，下一份钉会继承上一次的时刻，而那个数会被
 /// 读成「这一次撤回落得很快」。
 pub(crate) fn drop_convergence(state_dir: &str) {
-    let _ = std::fs::remove_file(Path::new(state_dir).join(CONVERGED_FILE));
+    cog_core::ignore_lost!(std::fs::remove_file(
+        Path::new(state_dir).join(CONVERGED_FILE)
+    ));
 }
 
 pub(crate) fn write_pin(state_dir: &str, pin: &RevPin) -> SFResult<()> {
@@ -12009,7 +12054,7 @@ pub async fn run_mainline_loop(
         .output()
         .await
         .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     for dir in [
         deployer.cfg.bare_repo.as_str(),
         deployer.workspaces.root().to_str().unwrap_or(""),
@@ -12024,7 +12069,7 @@ pub async fn run_mainline_loop(
             .await;
     }
     // 崩溃残留的临时工作树与裸仓库里的孤儿登记在循环启动时清一次。
-    let _ = deployer.workspaces.prune().await;
+    cog_core::ignore_lost!(deployer.workspaces.prune().await);
     match deployer.workspaces.gc_stale().await {
         Ok(reclaimed) if !reclaimed.is_empty() => {
             info!(
@@ -12158,7 +12203,8 @@ fn manifests_configmap_name(rev: &str) -> String {
 ///
 /// 撤回要用的是**上一版**的那一份包；保留一个数是为了让「留几个」成为一处可读的
 /// 决定，而不是散在清理逻辑里的隐含行为。改这个数的人要同时想清楚撤回窗口有多长。
-// cap: bound — 撤回要用上一版那份包；改这个数的人要同时想清楚撤回窗口有多长
+// cap: fixed — 撤回要用上一版那份包；改这个数的人要同时想清楚撤回窗口有多长
+// keep: 删掉后撤回要用的上一版包没有保留，撤回落到无包可用的境地；由「撤回窗口要多长」兜住
 pub(crate) const MANIFEST_BUNDLES_KEPT: usize = 5;
 
 /// 集群级 kind：进化 SA 只有命名空间级 Role，apply 这些必然被拒；它们由
@@ -13317,7 +13363,7 @@ fn reject_dialect_dependent_scalars(text: &str, origin: &str) -> SFResult<()> {
             .ok()
             .filter(|_| tok.starts_with('0') && tok.len() > 1)
             .map(|v| format!(" — `{v}` is the same value and needs no quotes"))
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         return Err(SFError::Config(format!(
             "{origin}:{}: the bare value `{tok}` is typed differently by the two YAML \
              dialects this manifest passes through: it is a {here} to this process and a \
@@ -13821,7 +13867,7 @@ exit 1
             rejected.is_empty(),
             "git accepted the leading-slash form; the case this guard exists for changed: {rejected:?}"
         );
-        let _ = std::fs::remove_dir_all(&repo);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&repo));
     }
 
     /// 一个只含 `deploy/k3s/a.yaml` 的临时仓库，用完删掉。
@@ -13831,7 +13877,7 @@ exit 1
             std::process::id(),
             std::thread::current().id()
         ));
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
         std::fs::create_dir_all(dir.join("deploy/k3s")).expect("create temp repo");
         std::fs::write(dir.join("deploy/k3s/a.yaml"), "kind: ConfigMap\n").expect("write file");
         for args in [
@@ -17089,7 +17135,7 @@ exit 0
             "the owner's build produced no artifact"
         );
 
-        let log = std::fs::read_to_string(bin_dir.join("cargo.log")).unwrap_or_default();
+        let log = std::fs::read_to_string(bin_dir.join("cargo.log")).unwrap_or(Default::default());
         assert_eq!(
             log.lines().count(),
             1,
@@ -17118,7 +17164,7 @@ exit 0
         let deployer = MainlineDeployer::new(cfg, ws);
 
         // cargo/strip 靠 PATH 查找，bin_dir 前置；ENV_LOCK 保证无并行测试串改。
-        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_path = std::env::var("PATH").unwrap_or(Default::default());
         std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
 
         deployer.poll_once().await.unwrap();
@@ -17253,7 +17299,7 @@ exit 0
         }];
         let deployer = MainlineDeployer::new(cfg, ws);
 
-        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_path = std::env::var("PATH").unwrap_or(Default::default());
         std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
         let round = deployer.poll_once().await;
         std::env::set_var("PATH", old_path);
@@ -17322,7 +17368,7 @@ exit 0
         }];
         let deployer = MainlineDeployer::new(cfg, ws);
 
-        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_path = std::env::var("PATH").unwrap_or(Default::default());
         std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
         deployer.poll_once().await.unwrap();
         std::env::set_var("PATH", old_path);
@@ -17372,7 +17418,7 @@ exit 0
         let cfg = test_config(root, &bare, &buildah, &kubectl);
         let deployer = MainlineDeployer::new(cfg, ws);
 
-        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_path = std::env::var("PATH").unwrap_or(Default::default());
         std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
         let round = deployer.poll_once().await;
         std::env::set_var("PATH", old_path);
@@ -17410,7 +17456,7 @@ exit 0
         let cfg = test_config(root, &bare, &buildah, &kubectl);
         let deployer = MainlineDeployer::new(cfg, ws);
 
-        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_path = std::env::var("PATH").unwrap_or(Default::default());
         std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
         deployer.poll_once().await.unwrap();
         std::env::set_var("PATH", old_path);
@@ -17514,7 +17560,7 @@ exit 0
         let cfg = test_config(root, &bare, &buildah, &kubectl);
         let deployer = MainlineDeployer::new(cfg, ws.clone());
 
-        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_path = std::env::var("PATH").unwrap_or(Default::default());
         std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
         deployer.poll_once().await.unwrap();
         std::env::set_var("PATH", old_path);
@@ -17599,7 +17645,7 @@ exit 0
         let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let deployer = MainlineDeployer::new(cfg, ws).with_metrics(metrics.clone());
 
-        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_path = std::env::var("PATH").unwrap_or(Default::default());
         std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
         deployer.poll_once().await.unwrap();
         std::env::set_var("PATH", old_path);
@@ -17607,7 +17653,7 @@ exit 0
         // The round really did reach the build: without this the test would pass
         // green on a round that never started.
         let buildah_calls =
-            std::fs::read_to_string(bin_dir.join("buildah.log")).unwrap_or_default();
+            std::fs::read_to_string(bin_dir.join("buildah.log")).unwrap_or(Default::default());
         let push_tag = main_image("reg.local:5000", &rev_a);
         assert!(
             buildah_calls.contains(&format!("commit ctr-test-123 {push_tag}")),
@@ -17616,7 +17662,8 @@ exit 0
 
         // Being one revision behind is the accepted cost: the image the round
         // already paid for goes out, and the next round takes the newer tip.
-        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or_default();
+        let calls =
+            std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or(Default::default());
         assert!(
             calls.contains(&job_name(&rev_a)) || calls.contains(rev12(&rev_a)),
             "a revision the tip still contains has to be rolled out: {calls}"
@@ -17723,27 +17770,29 @@ exit 0
         let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let deployer = MainlineDeployer::new(cfg, ws).with_metrics(metrics.clone());
 
-        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_path = std::env::var("PATH").unwrap_or(Default::default());
         std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
         deployer.poll_once().await.unwrap();
         std::env::set_var("PATH", old_path);
 
         // 编译器 double 只在真正答复一次 release build 时写日志，所以"日志非空"
         // 就是"这一轮付了构建"——被越过之后仍然要付，这是接受落后一版的代价面。
-        let built = std::fs::read_to_string(bin_dir.join("cargo.log")).unwrap_or_default();
+        let built =
+            std::fs::read_to_string(bin_dir.join("cargo.log")).unwrap_or(Default::default());
         assert!(
             !built.is_empty(),
             "the round builds the revision it decided on: {built}"
         );
         let buildah_calls =
-            std::fs::read_to_string(bin_dir.join("buildah.log")).unwrap_or_default();
+            std::fs::read_to_string(bin_dir.join("buildah.log")).unwrap_or(Default::default());
         let push_tag = main_image("reg.local:5000", &rev_a);
         assert!(
             buildah_calls.contains(&format!("commit ctr-test-123 {push_tag}")),
             "the image for the round's revision is assembled and tagged: {buildah_calls}"
         );
 
-        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or_default();
+        let calls =
+            std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or(Default::default());
         assert!(
             calls.contains(&job_name(&rev_a)) || calls.contains(rev12(&rev_a)),
             "the built revision is dispatched even though the tip moved on: {calls}"
@@ -17823,12 +17872,13 @@ exit 0
         let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let deployer = MainlineDeployer::new(cfg, ws).with_metrics(metrics.clone());
 
-        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_path = std::env::var("PATH").unwrap_or(Default::default());
         std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
         deployer.poll_once().await.unwrap();
         std::env::set_var("PATH", old_path);
 
-        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or_default();
+        let calls =
+            std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or(Default::default());
         assert!(
             calls.contains(&job_name(&rev_a)),
             "the revision is still the tip; this round must dispatch as usual: {calls}"
@@ -17884,7 +17934,7 @@ exit 0
         let cfg = test_config(root, &bare, &buildah, &kubectl);
         let deployer = MainlineDeployer::new(cfg, ws);
 
-        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_path = std::env::var("PATH").unwrap_or(Default::default());
         std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
         deployer.poll_once().await.unwrap();
         std::env::set_var("PATH", old_path);
@@ -17944,7 +17994,7 @@ exit 0
             },
         );
 
-        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_path = std::env::var("PATH").unwrap_or(Default::default());
         std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
         deployer.poll_once().await.unwrap();
         std::env::set_var("PATH", old_path);
@@ -17985,7 +18035,7 @@ exit 0
             "no rebuild expected when already at main rev"
         );
         let kubectl_calls =
-            std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or_default();
+            std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or(Default::default());
         assert!(
             !kubectl_calls.contains("apply"),
             "no job dispatch expected: {kubectl_calls}"
@@ -18081,7 +18131,7 @@ exit 0
 
         // 这一拍的后半段要真的构建这一版，而夹具的工作树里没有可构建的包；判据只看
         // 扣住收尾那一段，所以那一半的失败不吞掉这里的结论，只当它没发生。
-        let _ = deployer.poll_once().await;
+        cog_core::ignore_lost!(deployer.poll_once().await);
 
         let cancels = planner.cancels();
         assert!(
@@ -18158,7 +18208,7 @@ exit 0
         state.ci_hold_run_since_unix = Some(now - 600);
         deployer.save_state(&state).unwrap();
 
-        let _ = deployer.poll_once().await;
+        cog_core::ignore_lost!(deployer.poll_once().await);
 
         let after = deployer.load_state();
         assert!(after.ci_hold.is_none(), "扣住已经结束");
@@ -18254,7 +18304,7 @@ exit 0
         state.ci_hold_run_since_unix = Some(now - 600);
         deployer.save_state(&state).unwrap();
 
-        let _ = deployer.poll_once().await;
+        cog_core::ignore_lost!(deployer.poll_once().await);
 
         let after = deployer.load_state();
         assert!(after.ci_hold.is_none(), "上游判绿了，扣住该结束");
@@ -18344,7 +18394,7 @@ exit 0
         state.ci_hold_run_since_unix = Some(now - 600);
         deployer.save_state(&state).unwrap();
 
-        let _ = deployer.poll_once().await;
+        cog_core::ignore_lost!(deployer.poll_once().await);
 
         let after = deployer.load_state();
         assert!(
@@ -18944,7 +18994,7 @@ exec {real} "$@"
         );
         write_fake_bin(&bin_dir, "git", &script);
 
-        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_path = std::env::var("PATH").unwrap_or(Default::default());
         std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
         deployer.record_skipped_revs(&mut state, &rev_c).await;
         std::env::set_var("PATH", old_path);
@@ -19008,7 +19058,7 @@ exec {real} "$@"
         fake_strip(&bin_dir);
         let cfg = test_config(root, &bare, &buildah, &kubectl);
         let deployer = MainlineDeployer::new(cfg, ws);
-        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_path = std::env::var("PATH").unwrap_or(Default::default());
         std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
         let mut state = deployer.load_state();
         state.registry_restart_unix = Some(chrono::Utc::now().timestamp());
@@ -19016,7 +19066,7 @@ exec {real} "$@"
 
         // 这一轮本该在这里停住。不要把返回摊平：真没停住时会一路走到构建、在别处
         // 炸出一个与判据无关的错，把真正的红点（有没有开始建、标记清没清）盖掉。
-        let _ = deployer.poll_once().await;
+        cog_core::ignore_lost!(deployer.poll_once().await);
 
         assert!(
             !buildah_built(&bin_dir),
@@ -19054,7 +19104,7 @@ exec {real} "$@"
         fake_strip(&bin_dir);
         let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let deployer = MainlineDeployer::new(cfg, ws).with_metrics(metrics.clone());
-        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_path = std::env::var("PATH").unwrap_or(Default::default());
         std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
         let mut state = deployer.load_state();
         state.registry_restart_unix = Some(chrono::Utc::now().timestamp() - 600);
@@ -19062,7 +19112,7 @@ exec {real} "$@"
 
         // 放行之后这一轮还要读 registry（补 tag 内容、前移浮动签……），那个假
         // registry 只答一次，所以后半程怎么结束与这条判据无关——只看标记。
-        let _ = deployer.poll_once().await;
+        cog_core::ignore_lost!(deployer.poll_once().await);
 
         assert!(
             deployer.load_state().registry_restart_unix.is_none(),
@@ -19106,8 +19156,8 @@ exec {real} "$@"
                 let request = String::from_utf8_lossy(&buf[..n]).to_string();
                 let line = request.lines().next().unwrap_or_default().to_string();
                 log.lock().unwrap().push(line.clone());
-                let _ = sock.write_all(decide(&line).as_bytes()).await;
-                let _ = sock.shutdown().await;
+                cog_core::ignore_lost!(sock.write_all(decide(&line).as_bytes()).await);
+                cog_core::ignore_lost!(sock.shutdown().await);
             }
         });
         (format!("127.0.0.1:{port}"), seen)
@@ -19126,8 +19176,8 @@ exec {real} "$@"
                 let mut buf = vec![0u8; 8192];
                 let n = sock.read(&mut buf).await.unwrap_or(0);
                 reqs.push(String::from_utf8_lossy(&buf[..n]).to_string());
-                let _ = sock.write_all(resp.as_bytes()).await;
-                let _ = sock.shutdown().await;
+                cog_core::ignore_lost!(sock.write_all(resp.as_bytes()).await);
+                cog_core::ignore_lost!(sock.shutdown().await);
             }
             reqs
         });
@@ -19143,7 +19193,7 @@ exec {real} "$@"
     /// 「少问了一次」这件事本身。少问没少问由断言判（它们断的都是问回来的东西），这里只
     /// 负责不把「少问」变成「卡死」。
     async fn settle(handle: tokio::task::JoinHandle<Vec<String>>) {
-        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        cog_core::ignore_lost!(tokio::time::timeout(Duration::from_secs(5), handle).await);
     }
 
     /// 假平台 API：按序应答，`None` 表示「收下连接就 RST」；返回 base 与**已接受的
@@ -19179,13 +19229,13 @@ exec {real} "$@"
                 match resp {
                     Some(r) => {
                         let mut buf = vec![0u8; 8192];
-                        let _ = sock.read(&mut buf).await;
-                        let _ = sock.write_all(r.as_bytes()).await;
-                        let _ = sock.shutdown().await;
+                        cog_core::ignore_lost!(sock.read(&mut buf).await);
+                        cog_core::ignore_lost!(sock.write_all(r.as_bytes()).await);
+                        cog_core::ignore_lost!(sock.shutdown().await);
                     }
                     None => {
                         let mut one = [0u8; 1];
-                        let _ = sock.read(&mut one).await;
+                        cog_core::ignore_lost!(sock.read(&mut one).await);
                         drop(sock);
                     }
                 }
@@ -23079,8 +23129,8 @@ exec {real} "$@"
                     .find(|(m, p, _)| *m == method && *p == target)
                     .map(|(_, _, r)| r.clone())
                     .unwrap_or_else(|| HTTP_404.to_string());
-                let _ = sock.write_all(resp.as_bytes()).await;
-                let _ = sock.shutdown().await;
+                cog_core::ignore_lost!(sock.write_all(resp.as_bytes()).await);
+                cog_core::ignore_lost!(sock.shutdown().await);
             }
         });
         (format!("127.0.0.1:{port}"), seen)
@@ -23879,7 +23929,8 @@ exit 0
             "没有证据时一个 tag 都不该删: {reqs:?}"
         );
         assert_eq!(state.registry_maintenance_unix, 0, "没做过就别记成做过");
-        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or_default();
+        let calls =
+            std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or(Default::default());
         assert!(
             !calls.contains("rollout restart"),
             "连删都没删，重启一次 registry 是无谓的动作: {calls}"
@@ -24714,7 +24765,7 @@ exit 0
         )
         .unwrap();
 
-        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_path = std::env::var("PATH").unwrap_or(Default::default());
         std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
         deployer.poll_once().await.unwrap();
         std::env::set_var("PATH", old_path);
@@ -24789,7 +24840,7 @@ exit 0
         )
         .unwrap();
 
-        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_path = std::env::var("PATH").unwrap_or(Default::default());
         std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
         deployer.poll_once().await.unwrap();
         std::env::set_var("PATH", old_path);
@@ -24897,7 +24948,7 @@ exit 0
         // 反面同样要钉住：这条路上不该再出现一次整份镜像的推送。本机实测 2.1 GB 的那条
         // push 在这台机器上跑十分钟以上，而收敛的落盘排在它后面。
         let buildah_calls =
-            std::fs::read_to_string(bin_dir.join("buildah.log")).unwrap_or_default();
+            std::fs::read_to_string(bin_dir.join("buildah.log")).unwrap_or(Default::default());
         assert!(
             !buildah_calls.contains("push --tls-verify=false reg.local:5000/cogneva:local"),
             "the floating tag must not be moved by re-pushing the whole image: {buildah_calls}"
@@ -25080,13 +25131,13 @@ exit 0
         assert!(round.await.is_err(), "在滚的那一版还没判完，这一轮不该返回");
 
         let buildah_calls =
-            std::fs::read_to_string(bin_dir.join("buildah.log")).unwrap_or_default();
+            std::fs::read_to_string(bin_dir.join("buildah.log")).unwrap_or(Default::default());
         assert!(
             !buildah_calls.contains(rev12(&rev_c)),
             "手上有活在滚，不要去编树的新头：{buildah_calls}"
         );
         let kubectl_calls =
-            std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or_default();
+            std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or(Default::default());
         assert!(
             !kubectl_calls.contains(&job_name(&rev_c)),
             "手上有活在滚，不要派一版新的 Job：{kubectl_calls}"
@@ -25243,7 +25294,7 @@ exit 0
             "apply pin to current :local must not trigger rebuild"
         );
         let kubectl_calls =
-            std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or_default();
+            std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or(Default::default());
         assert!(
             !kubectl_calls.contains("apply"),
             "apply pin to current :local must not redispatch: {kubectl_calls}"
@@ -25702,7 +25753,7 @@ exit 0
         );
 
         let deployer = MainlineDeployer::new(cfg, ws);
-        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_path = std::env::var("PATH").unwrap_or(Default::default());
         std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
         deployer.poll_once().await.unwrap();
         std::env::set_var("PATH", old_path);
@@ -29039,7 +29090,7 @@ spec:
             .await
             .expect("an immutable pod template must not fail the whole rollout");
 
-        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let calls = std::fs::read_to_string(&log).unwrap_or(Default::default());
         assert!(
             calls.contains("get job cogneva-db-role-bootstrap -o json"),
             "the live object still has to be read: {calls}"
@@ -29099,7 +29150,7 @@ esac
             .await
             .expect("a changed Job template must not stop the support bundle");
 
-        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let calls = std::fs::read_to_string(&log).unwrap_or(Default::default());
         let lines: Vec<&str> = calls.lines().collect();
         assert_eq!(lines.len(), 3, "expected apply, delete, apply: {calls}");
         assert!(lines[0].contains("apply -f"), "{calls}");
@@ -29148,7 +29199,7 @@ esac
             .await
             .is_err());
 
-        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let calls = std::fs::read_to_string(&log).unwrap_or(Default::default());
         assert!(
             !calls.contains("delete"),
             "a mutable kind is not rebuilt to get a manifest in: {calls}"
@@ -29877,7 +29928,7 @@ exit 0
         // 不回滚：回滚到一个更旧的镜像并不能让镜像源恢复。判据是"旧镜像一次都
         // 没被写回去"——正向那次 set image 本来就该发生，所以不能笼统地禁 set
         // image；回滚的两种形状（写回 prev tag、rollout undo）都要禁掉。
-        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let calls = std::fs::read_to_string(&log).unwrap_or(Default::default());
         assert!(
             !calls.contains("main-old") && !calls.contains("rollout undo"),
             "no rollback should happen: {calls}"
@@ -31901,7 +31952,7 @@ spec:
         cfg.deliver_manifests = true;
         let deployer = MainlineDeployer::new(cfg, ws);
 
-        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_path = std::env::var("PATH").unwrap_or(Default::default());
         std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
         deployer.poll_once().await.unwrap();
         std::env::set_var("PATH", old_path);
@@ -31983,7 +32034,7 @@ spec:
         cfg.deliver_manifests = true;
         let deployer = MainlineDeployer::new(cfg, ws);
 
-        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_path = std::env::var("PATH").unwrap_or(Default::default());
         std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
         let err = deployer.poll_once().await.unwrap_err();
         std::env::set_var("PATH", old_path);
@@ -32940,7 +32991,7 @@ exit 0
             .await
             .expect("the image reading runs against the fake");
 
-        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let calls = std::fs::read_to_string(&log).unwrap_or(Default::default());
         let mut read = 0;
         for entry in &WORKLOAD_KINDS {
             let get = format!("get {} -o jsonpath=", entry.resource);
@@ -35111,7 +35162,8 @@ exit 0
             .buildah_store_round("111111111111", &[], &mut state)
             .await;
 
-        let calls = std::fs::read_to_string(bin_dir.join("buildah.log")).unwrap_or_default();
+        let calls =
+            std::fs::read_to_string(bin_dir.join("buildah.log")).unwrap_or(Default::default());
         assert!(!calls.contains("rmi"), "名单读不到时一张都不许删: {calls}");
         assert_eq!(
             state.buildah_store_unix, 0,
@@ -35201,7 +35253,7 @@ exit 0
         let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let deployer = MainlineDeployer::new(cfg, ws).with_metrics(metrics.clone());
 
-        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_path = std::env::var("PATH").unwrap_or(Default::default());
         std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
         deployer.run_cycle().await;
         assert_eq!(
@@ -35299,7 +35351,7 @@ exit 0
     #[tokio::test]
     async fn the_newest_manifest_bundles_are_kept_so_a_rev_can_be_rolled_back() {
         let root = std::env::temp_dir().join(format!("cog-bundles-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
         let bin_dir = root.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let bare = root.join("bare.git");
@@ -35372,7 +35424,7 @@ exit 0
                 "撤回要用到的包被删了：{kept}"
             );
         }
-        let _ = std::fs::remove_dir_all(&root);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     /// 清单读不到时一个都不删：残留比丢掉撤回唯一要用的那一份便宜。
@@ -35380,7 +35432,7 @@ exit 0
     async fn an_unreadable_listing_deletes_nothing() {
         let root =
             std::env::temp_dir().join(format!("cog-bundles-unreadable-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
         let bin_dir = root.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let bare = root.join("bare.git");
@@ -35418,7 +35470,7 @@ exit 0
             !calls.contains("delete configmap"),
             "清单读不到时删了东西：{calls}"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     /// 已经在退场的 Pod 仍然被配额计着，所以一份「它们还在」的用量读数不是

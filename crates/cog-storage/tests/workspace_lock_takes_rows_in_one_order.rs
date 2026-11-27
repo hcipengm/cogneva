@@ -288,7 +288,7 @@ async fn only_one_session_can_hold_the_first_row_at_a_time() {
                     "取第一行时报了一个与等锁无关的错：{e}"
                 );
                 // 语句超时会把事务置为已中止，这里只能回滚，不能再往下走。
-                sqlx::query("ROLLBACK").execute(&mut *conn).await.ok();
+                cog_core::ignore_lost!(sqlx::query("ROLLBACK").execute(&mut *conn).await);
                 blocked.push(conn);
             }
         }

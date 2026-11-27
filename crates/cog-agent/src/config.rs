@@ -162,7 +162,8 @@ pub struct AgentLoopConfig {
 /// starts being a document: comfortably above what an API or a page summary
 /// returns, comfortably below the tool-return budget of the smallest window the
 /// loop is configured with.
-// cap: bound — 一头是 API/网页摘要的典型长度，另一头是最小窗口的工具返回预算
+// cap: fixed — 一头是 API/网页摘要的典型长度，另一头是最小窗口的工具返回预算
+// keep: 删掉后所有载荷都走外置归档，每读一次多一跳，或者都不走而把内存交出去；由「摘要典型长度与最小工具返回预算」兜住
 const EXTERNAL_ARCHIVE_THRESHOLD_CHARS: usize = 8192;
 
 fn default_external_archive_threshold_chars() -> usize {
@@ -240,6 +241,8 @@ pub struct AgentManagerConfig {
 impl Default for AgentManagerConfig {
     fn default() -> Self {
         Self {
+            // cap: fixed — 0 ＝ 不写这个上限，并发由资源读数算；写下的数只在比实测更紧时生效
+            // not-a-bound: 0 表示「不写这个上限，并发由资源读数算」；它是哨兵，不是资源界
             worker_count: 0,
             worker_role: cog_core::roles::PLANNER.into(),
         }
@@ -406,6 +409,6 @@ mod tests {
         );
         let rt: cog_core::RuntimeConfig = l.into();
         assert_eq!(rt.role, "evaluator");
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 }

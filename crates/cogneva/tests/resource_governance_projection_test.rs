@@ -57,7 +57,7 @@ fn generated_path(profile: &Path) -> PathBuf {
     let stem = profile
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     repo_root()
         .join(CHART)
         .join(format!("values.resource-governance.{stem}.yaml"))
@@ -115,9 +115,9 @@ fn every_profile_carries_a_generated_ceiling() {
         let name = profile
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let text = read(&path);
-        let first = text.lines().next().unwrap_or_default();
+        let first = text.lines().next().unwrap_or(Default::default());
         assert!(
             first.contains("GENERATED") && first.contains(PROJECTOR),
             "{}: first line does not name the projector, so nothing distinguishes this \
@@ -191,7 +191,7 @@ fn the_ceiling_is_not_written_twice() {
 #[test]
 fn the_static_quota_is_the_single_node_projection() {
     let static_text = read(&repo_root().join(STATIC_QUOTA));
-    let first = static_text.lines().next().unwrap_or_default();
+    let first = static_text.lines().next().unwrap_or(Default::default());
     assert!(
         first.contains("GENERATED") && first.contains(PROJECTOR),
         "{STATIC_QUOTA}: first line does not name the projector, so the applied copy \

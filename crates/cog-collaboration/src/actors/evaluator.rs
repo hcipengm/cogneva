@@ -69,20 +69,50 @@ impl EvaluatorActor {
     /// 是不是一个「做完的样子」、能不能被证据判、是不是意图要的那件事。
     ///
     /// 这是「终态写得对不对」的**他律**：写终态的与审终态的不是同一次调用。
-    /// 它不看树、不判完成，所以很便宜：两段文字进，一串判词出。答不出判词的
-    /// 条目按**不成立**读——判不了不是通过。
+    /// 它要读树：终态与现在是散文，判者自己去树里找那段话说的代码，读懂之后再答
+    /// 立不立得住、是不是最优。它不判完成——完成是 [`Self::review_completed`]
+    /// 那一问。答不出判词的条目按**不成立**读——判不了不是通过。
     // prompt: contract — enforced by crates/cog-collaboration/src/actors/evaluator.rs::the_review_asks_the_judge_to_read_the_tree
     pub async fn review_criteria(
         &self,
         goal: &str,
         items: &[cog_core::contract::ledger_item::LedgerItem],
+        definition: Option<&str>,
     ) -> Vec<crate::squad::pge::types::CriterionVerdict> {
         use crate::squad::pge::types::CriterionVerdict;
         if items.is_empty() {
             return Vec::new();
         }
+        // 定义要进判者读的那段话里，而不只是载荷里的一格：判的人拿到的是一段
+        // 指令加一份数据，指令不提定义时，它仍旧只会就事论事地判这一条。
+        let definition_line = match definition {
+            Some(definition) => format!(
+                "What counts as done for this kind of work, as the plan stated it: \
+                 {definition}. Judge each item against it; do not restate it as steps. "
+            ),
+            None => String::new(),
+        };
+        let base_instructions = "Judge against this run's working tree, not against the prose alone. \
+                The terminal and the now cell are prose and will NOT name files: search the tree \
+                (`grep`, `glob`), read the code they are about with `read_file`, and understand \
+                what it does before you answer. Judge \
+                (1) whether the terminal describes a finished state rather than an activity, \
+                (2) whether the code you actually read implements it, (3) whether it is what the \
+                goal asks for, (4) whether the now cell reads like what the tree shows - a reader \
+                following it would land on the same place, (5) whether the gap is exactly what the \
+                terminal still lacks and nothing else, and (6) whether the terminal is the shortest \
+                description that still decides the same finished state - one that names steps or \
+                repeats the goal is longer than it has to be, and a reader of either lands in the \
+                same place. \
+                Answer one JSON object: {\"verdicts\": [{\"id\": \"...\", \
+                \"ok\": true|false, \"reason\": \"...\"}]}. The reason says what you read: a file and \
+                what it showed, or that you could not read it - an item you could not check is \
+                not ok, because \"could not look\" and \"looked and it holds\" cannot read the same.";
+        let instructions = format!("{definition_line}{base_instructions}");
         let payload = serde_json::json!({
             "goal": goal,
+            // 这一类是什么、怎样算做完：判据审按定义判断，而不是照步骤填。
+            "definition": definition,
             "items": items
                 .iter()
                 .map(|i| {
@@ -96,21 +126,7 @@ impl EvaluatorActor {
                     })
                 })
                 .collect::<Vec<_>>(),
-            "instructions": "Judge against this run's working tree, not against the prose alone: \
-                read the files the terminal and the now cell name (read_file) before you answer, \
-                and judge (1) whether the terminal describes a finished state rather than an \
-                activity, (2) whether what you actually read makes it hold, (3) whether it is \
-                what the goal asks for, (4) whether the now cell reads like what the tree \
-                shows - a reader following it would land on the same place, (5) whether the \
-                gap is exactly what the terminal still lacks and nothing else, and \
-                (6) whether the terminal is the shortest description that still decides \
-                the same finished state - one that names steps or repeats the goal is \
-                longer than it has to be, and a reader of either lands in the same \
-                place. \
-                Answer one JSON object: {\"verdicts\": [{\"id\": \"...\", \
-                \"ok\": true|false, \"reason\": \"...\"}]}. The reason says what you read: a file and \
-                what it showed, or that you could not read it - an item you could not check is \
-                not ok, because \"could not look\" and \"looked and it holds\" cannot read the same.",
+            "instructions": instructions,
         });
         let task = Task::new(
             "criterion-review",
@@ -143,7 +159,7 @@ impl EvaluatorActor {
                     .filter_map(|v| serde_json::from_value::<CriterionVerdict>(v.clone()).ok())
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         items
             .iter()
             .map(|i| match given.iter().find(|v| v.id == i.id) {
@@ -155,6 +171,147 @@ impl EvaluatorActor {
                 },
             })
             .collect()
+    }
+
+    /// 编辑完成没有：对着每条的**终态那段话**再读一次这一轮的树。
+    ///
+    /// 与 [`Self::review_criteria`] 分开：那一次在定批之前判「这段描述立不立得住」，
+    /// 这一次在编辑之后判「树上现在是不是已经是它说的样子」。两问都不是写它的那次
+    /// 调用答的，谁都不替对方作证。
+    ///
+    /// 判据是那段自然语言本身，不是某个实例的通过。终态是散文，不会点名文件：
+    /// 判者自己去树里找相关代码、读懂它在做什么，再判代码实现是不是终态描述的样子。
+    /// 找不到、读不懂、模型没答出这一条，都按**没到**读——判不了不是完成。返回
+    /// `None` 表示这一份计划没有可判的待办（与「全部到了」在调用点要分开）。
+    // prompt: contract — 判词只回答「终态在这棵树上的现在成不成立」，实现见本函数
+    pub async fn review_completed(
+        &self,
+        goal: &str,
+        items: &[cog_core::contract::ledger_item::LedgerItem],
+        definition: Option<&str>,
+    ) -> Option<Vec<crate::squad::pge::types::CriterionVerdict>> {
+        use crate::squad::pge::types::CriterionVerdict;
+        if items.is_empty() {
+            return None;
+        }
+        let payload = serde_json::json!({
+            "goal": goal,
+            // 这一类是什么、怎样算做完：判据审按定义判断，而不是照步骤填。
+            "definition": definition,
+            "items": items
+                .iter()
+                .map(|i| {
+                    serde_json::json!({
+                        "id": &i.id,
+                        "terminal": &i.terminal,
+                        "now": &i.now,
+                        "gap": &i.gap,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            "instructions": "Judge whether each terminal description is true of the working tree \
+                NOW, after the edit. The terminal is prose and will NOT name files or commands: \
+                finding the code it is about is part of your task. Search the tree, read the code \
+                you find, understand what it actually does, and decide whether that implementation \
+                is the state the terminal describes. Judge the description, not whether some one \
+                example passed. Answer ok=true only when the code you read implements the \
+                terminal. A terminal you could not locate or understand is not ok. Answer one JSON \
+                object: {\"verdicts\": [{\"id\": \"...\", \"ok\": true|false, \"reason\": \"...\"}]}. \
+                The reason names what you read and what it showed, or that you could not find it.",
+        });
+        let task = Task::new(
+            "completion-review",
+            TaskType::Custom("completion_review".into()),
+            payload,
+        );
+        let answer = match self
+            .agent
+            .prompt_for_task(&task.id, task.input.clone())
+            .await
+        {
+            Ok(value) => value,
+            Err(e) => {
+                return Some(
+                    items
+                        .iter()
+                        .map(|i| CriterionVerdict {
+                            id: i.id.clone(),
+                            ok: false,
+                            reason: format!("the completion review did not reach a model: {e}"),
+                        })
+                        .collect(),
+                )
+            }
+        };
+        let given: Vec<CriterionVerdict> = answer
+            .get("verdicts")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| serde_json::from_value::<CriterionVerdict>(v.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or(Default::default());
+        Some(
+            items
+                .iter()
+                .map(|i| match given.iter().find(|v| v.id == i.id) {
+                    Some(v) => v.clone(),
+                    None => CriterionVerdict {
+                        id: i.id.clone(),
+                        ok: false,
+                        reason: "the completion review answered nothing for this item".into(),
+                    },
+                })
+                .collect(),
+        )
+    }
+
+    /// 完成判的 [`EvaluationResult`] 形态：把逐条判词折成一次尝试的结论。
+    ///
+    /// 给管线和圆桌共用一个形状：判的人都是 [`Self::review_completed`]，合成规则
+    /// （全到才 Pass、分数是到了的比例、feedback 是缺口清单）也只有这一处。
+    pub async fn completion_evaluation(
+        &self,
+        goal: &str,
+        items: &[cog_core::contract::ledger_item::LedgerItem],
+        definition: Option<&str>,
+    ) -> crate::squad::pge::types::EvaluationResult {
+        use crate::squad::pge::types::{EvaluationResult, Verdict};
+        if items.is_empty() {
+            return EvaluationResult {
+                verdict: Verdict::Fail,
+                feedback: "计划没有写出一条待办的终态/现在/差距：先让 planner 把三格写出来，再动树"
+                    .into(),
+                score: Some(0),
+                criteria: Vec::new(),
+                details: Some(serde_json::json!("plan_without_items")),
+            };
+        }
+        // 定义随请求交给判者：planner 交出来的是「这一类怎么算做完」，判的人按它判，
+        // 不是照一串步骤填。没有定义时判者只对着每条的三格判。
+        let verdicts = match self.review_completed(goal, items, definition).await {
+            Some(verdicts) => verdicts,
+            None => Vec::new(),
+        };
+        let total = items.len().max(1);
+        let gaps: Vec<String> = verdicts
+            .iter()
+            .filter(|v| !v.ok)
+            .map(|v| format!("{}: {}", v.id, v.reason))
+            .collect();
+        let ok = verdicts.iter().filter(|v| v.ok).count();
+        EvaluationResult {
+            verdict: if !verdicts.is_empty() && gaps.is_empty() {
+                Verdict::Pass
+            } else {
+                Verdict::Fail
+            },
+            feedback: gaps.join("\n"),
+            score: Some((ok * 100 / total) as u32),
+            criteria: Vec::new(),
+            details: Some(serde_json::json!(verdicts)),
+        }
     }
 
     pub async fn evaluate(
@@ -211,7 +368,7 @@ impl EvaluatorActor {
             // this path: the planner's calls are a line in the ledger either
             // way, and without this one there is nothing to weigh them against.
             crate::observable::global_observable().record_self_evolution_verdict(cause);
-            let output_str = serde_json::to_string_pretty(&output).unwrap_or_default();
+            let output_str = serde_json::to_string_pretty(&output).unwrap_or(Default::default());
             // Self-review for self-evolution is skipped for the same reason: the
             // deterministic change validation already answers the measurable
             // question, and a model asked it again would add a second, less
@@ -328,7 +485,7 @@ impl EvaluatorActor {
                 )
             }
         };
-        let output_str = serde_json::to_string_pretty(&output).unwrap_or_default();
+        let output_str = serde_json::to_string_pretty(&output).unwrap_or(Default::default());
         if let Some(revised) = crate::actors::maybe_self_review(
             self.agent.as_ref(),
             &self.self_review,
@@ -504,7 +661,7 @@ impl EvaluatorActor {
             .get("artifacts")
             .and_then(|v| v.as_array())
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
 
         let change_artifacts: Vec<&serde_json::Value> = artifacts
             .iter()
@@ -723,7 +880,6 @@ mod tests {
         }
     }
 
-
     /// 判据审现在要**去树上取证**：它读终态与「现在」点名的文件，判词说它读到了什么。
     ///
     /// 这条钉的是请求的形状，不是模型的判断：请求里必须出现「读这一轮的工作树」与
@@ -734,49 +890,95 @@ mod tests {
         struct Recorder(Arc<Mutex<Vec<String>>>);
         #[async_trait::async_trait]
         impl cog_core::Agent for Recorder {
-            async fn prompt(&self, input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .push(input.get("instructions").and_then(|v| v.as_str()).unwrap_or("").to_string());
+            async fn prompt(
+                &self,
+                input: serde_json::Value,
+            ) -> cog_core::SFResult<serde_json::Value> {
+                self.0.lock().unwrap().push(
+                    input
+                        .get("instructions")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                );
                 Ok(serde_json::json!({"verdicts": []}))
             }
             async fn start(&self) {}
-            async fn snapshot(&self, _t: String) -> cog_core::SFResult<cog_core::snapshot::AgentCheckpoint> {
+            async fn snapshot(
+                &self,
+                _t: String,
+            ) -> cog_core::SFResult<cog_core::snapshot::AgentCheckpoint> {
                 Err(cog_core::SFError::NotImplemented("snapshot".into()))
             }
-            async fn restore(&self, _s: &cog_core::snapshot::AgentCheckpoint) -> cog_core::SFResult<()> {
+            async fn restore(
+                &self,
+                _s: &cog_core::snapshot::AgentCheckpoint,
+            ) -> cog_core::SFResult<()> {
                 Ok(())
             }
-            async fn continue_(&self, input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
+            async fn continue_(
+                &self,
+                input: serde_json::Value,
+            ) -> cog_core::SFResult<serde_json::Value> {
                 Ok(input)
             }
-            async fn steer(&self, _i: String) -> cog_core::SFResult<()> { Ok(()) }
-            async fn abort(&self) -> cog_core::SFResult<()> { Ok(()) }
-            async fn reset(&self) -> cog_core::SFResult<()> { Ok(()) }
+            async fn steer(&self, _i: String) -> cog_core::SFResult<()> {
+                Ok(())
+            }
+            async fn abort(&self) -> cog_core::SFResult<()> {
+                Ok(())
+            }
+            async fn reset(&self) -> cog_core::SFResult<()> {
+                Ok(())
+            }
             async fn state(&self) -> cog_core::SFResult<cog_core::AgentState> {
                 Err(cog_core::SFError::NotImplemented("state".into()))
             }
-            async fn wait_for_idle(&self) -> cog_core::SFResult<()> { Ok(()) }
-            async fn restore_from_id(&self, _c: &str) -> cog_core::SFResult<()> { Ok(()) }
+            async fn wait_for_idle(&self) -> cog_core::SFResult<()> {
+                Ok(())
+            }
+            async fn restore_from_id(&self, _c: &str) -> cog_core::SFResult<()> {
+                Ok(())
+            }
             fn subscribe(&self) -> tokio::sync::broadcast::Receiver<cog_core::AgentEvent> {
                 let (_tx, rx) = tokio::sync::broadcast::channel(1);
                 rx
             }
-            async fn chat_stream(&self, _m: &[cog_core::Message], _o: &cog_core::ChatOptions)
-                -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            async fn chat_stream(
+                &self,
+                _m: &[cog_core::Message],
+                _o: &cog_core::ChatOptions,
+            ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
                 Err(cog_core::SFError::NotImplemented("chat_stream".into()))
             }
-            async fn complete_stream(&self, _p: &str, _o: &cog_core::CompleteOptions)
-                -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            async fn complete_stream(
+                &self,
+                _p: &str,
+                _o: &cog_core::CompleteOptions,
+            ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
                 Err(cog_core::SFError::NotImplemented("complete_stream".into()))
             }
-            async fn read_board(&self, _t: &str, _f: &str) -> cog_core::SFResult<Option<String>> { Ok(None) }
-            async fn write_board(&self, _t: &str, _f: &str, _v: &str) -> cog_core::SFResult<()> { Ok(()) }
-            async fn receive_message(&self, _m: cog_core::InboxMessage) -> cog_core::SFResult<()> { Ok(()) }
-            async fn review_and_revise(&self, output: &str, _c: &cog_core::SelfReviewConfig)
-                -> cog_core::SFResult<(String, cog_core::SelfReviewResult)> {
-                Ok((output.to_string(), cog_core::SelfReviewResult::Pass { score: 0.9, summary: "ok".into() }))
+            async fn read_board(&self, _t: &str, _f: &str) -> cog_core::SFResult<Option<String>> {
+                Ok(None)
+            }
+            async fn write_board(&self, _t: &str, _f: &str, _v: &str) -> cog_core::SFResult<()> {
+                Ok(())
+            }
+            async fn receive_message(&self, _m: cog_core::InboxMessage) -> cog_core::SFResult<()> {
+                Ok(())
+            }
+            async fn review_and_revise(
+                &self,
+                output: &str,
+                _c: &cog_core::SelfReviewConfig,
+            ) -> cog_core::SFResult<(String, cog_core::SelfReviewResult)> {
+                Ok((
+                    output.to_string(),
+                    cog_core::SelfReviewResult::Pass {
+                        score: 0.9,
+                        summary: "ok".into(),
+                    },
+                ))
             }
         }
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -789,13 +991,40 @@ mod tests {
             gap: "缺的是：地板外置".into(),
             state: LedgerState::Open,
         }];
-        let _ = evaluator.review_criteria("把上下文做对", &items).await;
+        let _ = evaluator
+            .review_criteria("把上下文做对", &items, None)
+            .await;
+        // 有定义时，判据审的请求里必须原样带着它：判者按定义判断，而不是照步骤填。
+        let definition = "这一类：窗口里的每一轮都带着它需要的全部；做完＝每一轮都不缺。";
+        let _ = evaluator
+            .review_criteria("把上下文做对", &items, Some(definition))
+            .await;
         let instructions = seen.lock().unwrap().join("\n");
-        assert!(instructions.contains("working tree"), "请求里没让它去读树：{instructions}");
-        assert!(instructions.contains("read_file"), "请求里没让它读文件：{instructions}");
+        assert!(
+            instructions.contains(definition),
+            "定义没有随请求交给判者：它只能就事论事地判这一条"
+        );
+        assert!(
+            instructions.contains("working tree"),
+            "请求里没让它去读树：{instructions}"
+        );
+        assert!(
+            instructions.contains("read_file"),
+            "请求里没让它读文件：{instructions}"
+        );
         assert!(
             instructions.contains("not ok"),
             "请求里没写「读不出来就不算通过」：{instructions}"
+        );
+        // 合成为一次尝试结论的那条路也带着定义：`completion_evaluation` 是管线与圆桌
+        // 共用的入口，定义在这里被丢掉的话，判者拿到的仍是一串没有「这一类」的条目。
+        let _ = evaluator
+            .completion_evaluation("把上下文做对", &items, Some(definition))
+            .await;
+        let through_synthesis = seen.lock().unwrap().join("\n");
+        assert!(
+            through_synthesis.contains(definition),
+            "合成入口把定义丢了：判者只能就事论事地判这一条"
         );
         // 三格各有它的那一问：「现在」要判「照着它能不能读到同一处」，「差距」要判
         // 「是不是恰好只差那一件」。少任何一问，判者就只判了终态那一格。

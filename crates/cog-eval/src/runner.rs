@@ -35,7 +35,8 @@ fn default_max_concurrency() -> usize {
 
 /// 一例重跑一次：一次失败可能是环境抖动（镜像、网络），两次都失败就把它记成
 /// 失败——第三次只是在同一个坏环境里再多花一次的 token。
-// cap: bound — 一次：一次可能是环境抖动，两次都失败就记失败，第三次只是多花一份 token
+// cap: fixed — 一次：一次可能是环境抖动，两次都失败就记失败，第三次只是多花一份 token
+// keep: 删掉后一次环境抖动就把用例判失败，浪费一次完整评测；由「两次都失败才记失败」兜住
 const DEFAULT_CASE_RETRIES: u32 = 1;
 
 impl Default for RunnerConfig {
@@ -168,7 +169,7 @@ async fn run_single_case(
         };
         match outcome {
             Ok(result) => {
-                output = serde_json::to_value(&result).unwrap_or_default();
+                output = serde_json::to_value(&result).unwrap_or(Default::default());
                 // Extract tool calls from result if present
                 if let Some(tools) = result.get("tool_calls").and_then(|v| v.as_array()) {
                     tool_calls = tools
@@ -447,7 +448,7 @@ async fn compute_metric_value(
             (score, score >= t)
         }
         EvalMetric::ToolCallAccuracy => {
-            let expected_tools = case.expected_tools.clone().unwrap_or_default();
+            let expected_tools = case.expected_tools.clone().unwrap_or(Default::default());
             let actual_tools: Vec<String> = result
                 .steps
                 .iter()
@@ -729,7 +730,7 @@ mod no_clock_wall_tests {
             _input: serde_json::Value,
             _llm: &dyn cog_core::LlmClient,
         ) -> SFResult<serde_json::Value> {
-            let _ = self.entered.send(()).await;
+            cog_core::ignore_lost!(self.entered.send(()).await);
             let _permit = self.gate.acquire().await.expect("gate never closed");
             Ok(serde_json::json!({"answer": "released"}))
         }

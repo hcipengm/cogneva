@@ -13,6 +13,7 @@
 use super::pge::types::{EvaluationResult, PlannerOutput, Verdict};
 
 /// 计划的依赖表里出现了一个不在这份计划里的 id。
+pub const PLAN_NO_DEFINITION: &str = "plan_no_definition";
 pub const PLAN_DANGLING_DEPENDENCY: &str = "plan_dangling_dependency";
 /// 两个子任务用了同一个 id。
 pub const PLAN_DUPLICATE_ID: &str = "plan_duplicate_id";
@@ -64,15 +65,44 @@ pub struct PlanDefect {
 /// 留着；但它不是这份计划的**判据所有者**。所有者在这里：判一次、判词原样回到
 /// 下一轮的提示里，计划在花掉一次完整重拆之前就有机会把自己补全。
 pub fn check_plan(plan: &PlannerOutput) -> Vec<PlanDefect> {
-    if plan.sub_tasks.is_empty() {
-        return vec![PlanDefect {
+    let mut defects = Vec::new();
+    // 计划这一种产物首先要说清「这一类是什么、怎样算做完」。没有这一段，执行的人
+    // 只剩一串步骤可照，判的人只剩几条孤立的终态可读——两头都回到照表填。
+    if plan
+        .definition
+        .as_deref()
+        .map(str::trim)
+        .filter(|definition| !definition.is_empty())
+        .is_none()
+    {
+        defects.push(PlanDefect {
             task_id: String::new(),
-            code: EMPTY_DECOMPOSITION_PREFIX,
-            detail: "the planner returned no atomic sub-tasks".to_string(),
-        }];
+            code: PLAN_NO_DEFINITION,
+            detail: "the plan states no definition: what counts as this kind of work, and \
+                     what makes it done"
+                .to_string(),
+        });
+    }
+    if plan.sub_tasks.is_empty() {
+        // 只交定义与待办的计划不是空交付物：它说的是「这一类活是什么、每条待办
+        // 怎样算完」，执行面按定义整段做、判据按 items 判。有没有拆成原子任务
+        // 是执行面的选择，不是计划这一种产物必须声明的东西（`sub_tasks` 在
+        // 契约里可缺省）。真正的空交付物是连一条能判的待办都没有。
+        let judged = plan
+            .items
+            .iter()
+            .filter(|item| !item.terminal.trim().is_empty())
+            .count();
+        if judged == 0 {
+            defects.push(PlanDefect {
+                task_id: String::new(),
+                code: EMPTY_DECOMPOSITION_PREFIX,
+                detail: "the planner returned no atomic sub-tasks and no judged items".to_string(),
+            });
+        }
+        return defects;
     }
 
-    let mut defects = Vec::new();
     let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for spec in &plan.sub_tasks {
         if !seen.insert(spec.id.as_str()) {
@@ -152,15 +182,35 @@ pub fn judge_plan(plan: &PlannerOutput) -> EvaluationResult {
     let defects = check_plan(plan);
     let count = plan.sub_tasks.len();
     if defects.is_empty() {
+        // 两种通过的形状分开说：拆成了几片的，与只交定义和待办的。后者的判据面
+        // 是 items——执行面按定义整段做，判词逐条对着终态读。
+        let judged = plan
+            .items
+            .iter()
+            .filter(|item| !item.terminal.trim().is_empty())
+            .count();
+        let (name, comment, feedback) = if count == 0 {
+            (
+                "definition_with_judged_items",
+                format!("{judged} judged items, no atomic split"),
+                format!("the plan states a definition and {judged} judged items"),
+            )
+        } else {
+            (
+                "atomic_sub_tasks_present",
+                format!("{count} atomic sub-tasks"),
+                format!("the decomposition produced {count} atomic sub-tasks"),
+            )
+        };
         return EvaluationResult {
             verdict: Verdict::Pass,
             score: Some(100),
             criteria: vec![super::pge::types::Criterion {
-                name: "atomic_sub_tasks_present".into(),
+                name: name.into(),
                 score: 100,
-                comment: format!("{count} atomic sub-tasks"),
+                comment,
             }],
-            feedback: format!("the decomposition produced {count} atomic sub-tasks"),
+            feedback,
             details: None,
         };
     }
@@ -203,6 +253,7 @@ mod tests {
 
     fn plan_with(sub_tasks: Vec<TaskSpec>) -> PlannerOutput {
         PlannerOutput {
+            definition: Some("这一类：每一片都说得出它的终态，合起来就是目标的终态".into()),
             summary: "s".into(),
             plan: serde_json::json!({}),
             sub_tasks,
@@ -210,6 +261,25 @@ mod tests {
             targets: Vec::new(),
             items: Vec::new(),
         }
+    }
+
+    /// 没有定义的计划不是计划：它只交出一串步骤，判的人无从知道「怎样算做完」。
+    #[test]
+    fn a_plan_that_states_no_definition_is_refused() {
+        let mut plan = plan_with(vec![spec("t1")]);
+        plan.definition = None;
+        let defects = check_plan(&plan);
+        assert!(
+            defects.iter().any(|d| d.code == PLAN_NO_DEFINITION),
+            "没有定义的计划被放过了：{defects:?}"
+        );
+        plan.definition = Some("   ".into());
+        assert!(
+            check_plan(&plan)
+                .iter()
+                .any(|d| d.code == PLAN_NO_DEFINITION),
+            "只有空白的一段不算定义"
+        );
     }
 
     fn spec(id: &str) -> TaskSpec {
@@ -323,6 +393,33 @@ mod tests {
     }
 
     /// 空交付物是**失败**，但绝不是终止性失败：没有观测到的证据排除下一轮
+    /// 只交定义与待办的计划是合格的计划。
+    ///
+    /// `sub_tasks` 在契约里可缺省：planner 交出来的是「这一类是什么、每条待办
+    /// 怎样算完」，执行面按定义整段做、判据按 items 判。判计划这一侧若把没有
+    /// 原子拆分的答案一律读成空交付物，这个被允许的答案就永远过不去。
+    #[test]
+    fn a_definition_only_plan_with_judged_items_passes() {
+        use cog_core::contract::ledger_item::{LedgerItem, LedgerState};
+
+        let mut plan = plan_with(Vec::new());
+        plan.items = vec![LedgerItem {
+            id: "i1".into(),
+            terminal: "只剩一处".into(),
+            now: "三处".into(),
+            gap: "两处".into(),
+            state: LedgerState::Open,
+        }];
+        let evaluation = judge_plan(&plan);
+        assert_eq!(evaluation.verdict, Verdict::Pass, "{}", evaluation.feedback);
+        assert!(
+            evaluation.feedback.contains("1 judged items"),
+            "the pass must say what it judged: {}",
+            evaluation.feedback
+        );
+        assert_eq!(evaluation.criteria[0].name, "definition_with_judged_items");
+    }
+
     /// 成功，记成环境故障会让重试预算按一个从没看见过的事实结账。
     #[test]
     fn an_empty_decomposition_fails_without_claiming_a_terminal_cause() {

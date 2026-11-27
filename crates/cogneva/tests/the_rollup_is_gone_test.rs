@@ -12,7 +12,7 @@
 //!
 //! 默认忽略，需要 `COGNEVA_TEST_DATABASE_URL`。
 
-use cog_core::{LlmCall, LlmCallEvents};
+use cog_core::LlmCall;
 use cog_observability::usage_store::{LlmUsageRecord, LlmUsageStore};
 use cog_storage::LlmCallEventStore;
 
@@ -20,6 +20,8 @@ use cog_test_support::{database_url, drop_schema, own_schema, schema_pool};
 
 fn row(actor: &str, input: u64, output: u64) -> LlmUsageRecord {
     LlmUsageRecord {
+        finish_reason: None,
+        ttft_ms: None,
         refused_scope: None,
         upstream: "gone-upstream".to_string(),
         api_style: "openai".to_string(),
@@ -33,6 +35,8 @@ fn row(actor: &str, input: u64, output: u64) -> LlmUsageRecord {
         tokens_cache_created: None,
         tokens_reasoning: None,
         estimated_input: None,
+        prompt_manifest: None,
+        prompt_dropped: None,
         cost_micros: None,
         price_book: None,
         refusal_kind: None,
@@ -69,6 +73,16 @@ fn call(id: &str, actor: &str, input: u64, output: u64) -> LlmCall {
         batch_id: None,
         session: None,
         pace: None,
+        tokens_reasoning: None,
+        refusal_kind: None,
+        retry_after_secs: None,
+        usage_outcome: None,
+        estimated_input: None,
+        refused_scope: None,
+        finish_reason: None,
+        ttft_ms: None,
+        prompt_manifest: None,
+        prompt_dropped: None,
         at: chrono::Utc::now(),
     }
 }

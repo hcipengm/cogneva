@@ -121,7 +121,8 @@ pub fn is_edit(tool: &str) -> bool {
 /// 弹窗是给人读几秒就点头的东西：更大的改动在流里那一份（E4 的行级 diff）与
 /// 文件视图里看全文，这里只放读得完的一段。截断过就说出来（`truncated`），
 /// 被截断的那一份读起来才不像整个改动。
-// cap: bound — 弹窗要在人读它的那几秒里画完；8k 字约两屏，更大的改动由流里那一份与文件视图看全文
+// cap: fixed — 弹窗要在人读它的那几秒里画完；8k 字约两屏，更大的改动由流里那一份与文件视图看全文
+// keep: 删掉后一次审批弹窗要装下整份改动（可能几 MB），人读不完；由「8k 字约两屏，全文在文件视图」兜住
 const PREVIEW_CHARS: usize = 8_000;
 
 /// 工具要做的那个改动，折成一份能画给人看的东西；不是改动类工具时是 `None`。
@@ -139,7 +140,8 @@ pub fn edit_preview(tool: &str, arguments: &serde_json::Value) -> Option<Permiss
     };
     let cut = |text: &str| -> (String, bool) {
         (
-            text.chars().take(PREVIEW_CHARS).collect(),
+            // keep: 一份整文件可能比一次审批读得完的大两个数量级，全量交给审批面只会把要点头的那一处挤没；由下面这个 diff 自带的 path（文件视图里读全文）兜住
+            text.chars().take(PREVIEW_CHARS).collect(), // full_ref: PermissionDiff.path（文件视图里读全文）
             text.chars().count() > PREVIEW_CHARS,
         )
     };

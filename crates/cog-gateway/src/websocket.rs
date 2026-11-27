@@ -804,7 +804,7 @@ pub async fn handle_socket(
     }
 
     // Graceful close: attempt to send close frame before dropping.
-    let _ = socket.close().await;
+    cog_core::ignore_lost!(socket.close().await);
 
     if let Some(ref mgr) = state.connection_manager {
         mgr.unregister(&connection_id).await;

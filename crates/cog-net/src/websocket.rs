@@ -28,7 +28,10 @@ impl WebSocketClient for TungsteniteWebSocketClient {
             .parse::<http::Uri>()
             .map_err(|e| SFError::Agent(format!("invalid websocket url '{}': {}", url, e)))?;
 
-        let host = parsed_url.host().unwrap_or("localhost").to_string();
+        let host = parsed_url
+            .host()
+            .ok_or_else(|| SFError::Agent(format!("websocket url '{url}' has no host")))?
+            .to_string();
         let mut builder = tokio_tungstenite::tungstenite::handshake::client::Request::builder()
             .uri(url)
             .header("Host", host)

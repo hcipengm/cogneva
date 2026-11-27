@@ -396,6 +396,15 @@ ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS tokens_reasoning BIGINT;
 -- identity its own per-run census uses, and the reader's job is to join the
 -- two, not to funnel both through a type.
 ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS task_id TEXT;
+-- 模型侧为什么停了，以及首字时延。两格都可空无默认：上游没报／非流式就是
+-- 「没量到」，不是空串或 0 毫秒。
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS finish_reason TEXT;
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS ttft_ms BIGINT;
+-- 提示清单：这一次发出去的每段 sha256（JSON 数组）；留底过期后靠它回到当时的提示。
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS prompt_manifest TEXT;
+-- 装配时挤掉了多少条更早的消息；null 是没量到或没裁。
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS prompt_dropped BIGINT;
+
 -- The person dimension, same shape and same reason as the job one: the ceiling
 -- a call was judged against is the person's daily allowance, and the row that
 -- records a refusal has to name the person it refused. Nullable because "no
@@ -721,7 +730,20 @@ impl LlmUsageStore {
         Ok(())
     }
 
-    pub async fn record(&self, r: &LlmUsageRecord) -> anyhow::Result<()> {
+    pub async fn record(&self, r: &LlmUsageRecord) -> anyhow::Result<String> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Self::record_on(&mut conn, r).await
+    }
+
+    /// 在**调用方的事务**里写这一行：与事件同一次提交时用它，两处要么都进、要么都不进。
+    pub async fn record_on(
+        conn: &mut sqlx::PgConnection,
+        r: &LlmUsageRecord,
+    ) -> anyhow::Result<String> {
         // **这一行仍是「这次调用花了多少」的读面**（S39 ②）。事件流是正本，但把行换成
         // 一份投影要两步同一笔：读者全切到流上，与停写这一侧。只停了写、没切完读者，
         // 配速、会话花费、按任务花费会一起读成 0——2026-11-22 复核发现 16 个读者仍在
@@ -731,6 +753,8 @@ impl LlmUsageStore {
             .pace
             .as_ref()
             .and_then(|p| serde_json::to_string(&p.upstreams).ok());
+        // 行 id 在这里生成并返回：事件的身份由它派生，与回填同一个拼法。
+        let row_id = uuid::Uuid::new_v4();
         sqlx::query(
             r#"
             INSERT INTO gateway_llm_usage
@@ -739,14 +763,14 @@ impl LlmUsageStore {
                  estimated_input, task_id, latency_ms, refusal_kind, retry_after_secs,
                  pace_measured_upstreams, pace_allowance_tokens, pace_spent_tokens,
                  pace_reserve_tokens, pace_window_start_unix, pace_upstreams,
-                 usage_outcome, owner_id, refused_scope, cost_micros, price_book,
-                 tokens_reasoning, session_id)
+                 usage_outcome, owner_id, refused_scope, finish_reason, ttft_ms, prompt_manifest,
+                 prompt_dropped, cost_micros, price_book, tokens_reasoning, session_id)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
                     $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27,
-                    $28, $29)
+                    $28, $29, $30, $31, $32, $33)
             "#,
         )
-        .bind(uuid::Uuid::new_v4())
+        .bind(row_id)
         .bind(&r.upstream)
         .bind(&r.api_style)
         .bind(&r.model)
@@ -771,13 +795,17 @@ impl LlmUsageStore {
         .bind(r.usage_outcome.map(|o| o.as_str()))
         .bind(r.owner.as_deref())
         .bind(r.refused_scope.as_deref())
+        .bind(r.finish_reason.as_deref())
+        .bind(r.ttft_ms.map(|ms| ms as i64))
+        .bind(r.prompt_manifest.as_deref())
+        .bind(r.prompt_dropped.map(|n| n as i64))
         .bind(r.cost_micros)
         .bind(r.price_book.as_deref())
         .bind(r.tokens_reasoning.map(|n| n as i64))
         .bind(r.session.as_deref())
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await?;
-        Ok(())
+        Ok(row_id.to_string())
     }
 
     /// One exchange: the index row for the bytes that went upstream and the
@@ -2224,6 +2252,419 @@ impl LlmUsageStore {
         })
     }
 
+    /// 一台上游在某个窗口里被烧掉的 token，**从事件流算**。
+    pub async fn burned_between_from_stream(
+        &self,
+        upstream: &str,
+        since_unix: i64,
+        until_unix: i64,
+    ) -> anyhow::Result<u64> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)), 0)::BIGINT \
+               FROM cogneva_event \
+              WHERE kind = 'llm_call' AND upstream_name = $1 AND call_result = 'ok' \
+                AND at > to_timestamp($2::DOUBLE PRECISION) \
+                AND at <= to_timestamp($3::DOUBLE PRECISION)",
+        )
+        .bind(upstream)
+        .bind(since_unix as f64)
+        .bind(until_unix as f64)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0.max(0) as u64)
+    }
+
+    /// 没有归属到任何一条已知任务的 token，**从事件流算**。
+    pub async fn unattributed_between_from_stream(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> anyhow::Result<u64> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)), 0)::BIGINT \
+               FROM cogneva_event e \
+              WHERE e.kind = 'llm_call' AND e.at >= $1 AND e.at < $2 \
+                AND (e.task_id_text IS NULL \
+                     OR NOT EXISTS (SELECT 1 FROM task_defined d \
+                                     WHERE d.task_id = (e.task_id_text)))",
+        )
+        .bind(since)
+        .bind(until)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0.max(0) as u64)
+    }
+
+    /// 一件活的花销记在谁头上（人、租户），**从事件流上最近一版的任务定义读**。
+    pub async fn task_attribution_from_stream(
+        &self,
+        task_id: &str,
+    ) -> anyhow::Result<Option<cog_core::TaskAttribution>> {
+        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT NULLIF(submitted_by, '') AS submitter, NULLIF(workspace_id, '') AS workspace_id \
+               FROM task_defined WHERE task_id = $1 ORDER BY rev DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(
+            row.map(|(submitter, workspace_id)| cog_core::TaskAttribution {
+                submitter,
+                workspace_id,
+            }),
+        )
+    }
+
+    /// 按工作区的额度拒绝，自某时刻、按工作区计，**从事件流算**。
+    pub async fn refusals_by_workspace_since_from_stream(
+        &self,
+        since_unix: i64,
+    ) -> anyhow::Result<Vec<(String, u64)>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT workspace, COUNT(*)::BIGINT AS refusals FROM ( \
+                 SELECT (SELECT d.workspace_id FROM task_defined d \
+                          WHERE d.task_id = (e.task_id_text) \
+                          ORDER BY d.rev DESC LIMIT 1) AS workspace \
+                   FROM cogneva_event e \
+                  WHERE e.kind = 'llm_call' \
+                    AND e.at >= to_timestamp($1::DOUBLE PRECISION) \
+                    AND e.call_result = 'refused_by_owner_budget' \
+                    AND (e.attributes::jsonb ->> 'refused_scope') = 'ws' \
+             ) s WHERE workspace IS NOT NULL AND workspace <> '' \
+             GROUP BY workspace ORDER BY workspace",
+        )
+        .bind(since_unix as f64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(workspace, refusals)| (workspace, refusals.max(0) as u64))
+            .collect())
+    }
+
+    /// 这件活开跑过没有（有过成功或失败的调用），**从事件流算**。
+    pub async fn task_has_started_from_stream(&self, task: &str) -> anyhow::Result<bool> {
+        let row: (bool,) = sqlx::query_as(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM cogneva_event \
+                  WHERE kind = 'llm_call' AND task_id_text = $1 \
+                    AND call_result IN ('ok', 'error')) AS started",
+        )
+        .bind(task)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    /// 一件活的整本成本的分位数，**从事件流算**；样本是「任务 × 成功调用的总量」。
+    pub async fn task_cost_quantile_from_stream(
+        &self,
+        days: i64,
+        quantile: f64,
+    ) -> anyhow::Result<Option<(u64, u64, i64)>> {
+        let rows: Vec<(f64, i64, i64)> = sqlx::query_as(
+            "SELECT PERCENTILE_CONT($2) WITHIN GROUP (ORDER BY total) AS cost, \
+                    COUNT(*)::BIGINT AS jobs, \
+                    COALESCE(EXTRACT(EPOCH FROM MIN(oldest))::BIGINT, 0) AS oldest_unix \
+               FROM (SELECT task_id_text AS task_id, \
+                            SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0))::BIGINT AS total, \
+                            MIN(at) AS oldest \
+                       FROM cogneva_event \
+                      WHERE kind = 'llm_call' AND call_result = 'ok' \
+                        AND task_id_text IS NOT NULL \
+                        AND at > NOW() - make_interval(days => $1) \
+                      GROUP BY task_id_text) jobs",
+        )
+        .bind(days as i32)
+        .bind(quantile)
+        .fetch_all(&self.pool)
+        .await?;
+        let Some((cost, jobs, oldest)) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        if jobs == 0 {
+            return Ok(None);
+        }
+        Ok(Some((cost.max(0.0) as u64, jobs.max(0) as u64, oldest)))
+    }
+
+    /// 按人的额度拒绝，自某时刻、按人计，**从事件流算**。
+    ///
+    /// 归人：先看调用行上的 owner，没有就取它挂的那条任务最近一版的提交人。
+    /// 只数 `refused_by_owner_budget` 且 `refused_scope = user` 的那一格——工作区
+    /// 那级是另一格，混进来会把一个没被动过的上限读成被顶穿了。
+    pub async fn refusals_by_person_since_from_stream(
+        &self,
+        since_unix: i64,
+    ) -> anyhow::Result<Vec<(String, u64)>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT person, COUNT(*)::BIGINT AS refusals FROM ( \
+                 SELECT COALESCE(NULLIF(e.owner_name, ''), \
+                                 (SELECT NULLIF(d.submitted_by, '') FROM task_defined d \
+                                   WHERE d.task_id = (e.task_id_text) \
+                                   ORDER BY d.rev DESC LIMIT 1)) AS person \
+                   FROM cogneva_event e \
+                  WHERE e.kind = 'llm_call' \
+                    AND e.at >= to_timestamp($1::DOUBLE PRECISION) \
+                    AND e.call_result = 'refused_by_owner_budget' \
+                    AND (e.attributes::jsonb ->> 'refused_scope') = 'user' \
+             ) s WHERE person IS NOT NULL GROUP BY person ORDER BY person",
+        )
+        .bind(since_unix as f64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(person, refusals)| (person, refusals.max(0) as u64))
+            .collect())
+    }
+
+    /// 某窗口里调用怎么结束的，**从事件流算**。
+    pub async fn outcomes_between_from_stream(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<cog_core::OutcomeCount>> {
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT COALESCE(call_result, '') AS result, \
+                    COALESCE(attributes::jsonb ->> 'refusal_kind', '') AS refusal_kind, \
+                    COUNT(*)::BIGINT AS calls \
+               FROM cogneva_event \
+              WHERE kind = 'llm_call' AND at >= $1 AND at < $2 \
+              GROUP BY 1, 2 ORDER BY COUNT(*) DESC, 1, 2",
+        )
+        .bind(since)
+        .bind(until)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(result, refusal_kind, calls)| cog_core::OutcomeCount {
+                result,
+                refusal_kind,
+                calls,
+            })
+            .collect())
+    }
+
+    /// 成功调用里，上游到底报没报用量，**从事件流算**。
+    pub async fn metering_between_from_stream(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<cog_core::MeteringCount>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT COALESCE(attributes::jsonb ->> 'usage_outcome', '') AS outcome, \
+                    COUNT(*)::BIGINT AS calls \
+               FROM cogneva_event \
+              WHERE kind = 'llm_call' AND at >= $1 AND at < $2 \
+                AND call_result = 'ok' \
+              GROUP BY 1 ORDER BY COUNT(*) DESC, 1",
+        )
+        .bind(since)
+        .bind(until)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(outcome, calls)| cog_core::MeteringCount { outcome, calls })
+            .collect())
+    }
+
+    /// 整本账自某时刻的成功 token，**从事件流算**。
+    pub async fn spend_total_since_from_stream(&self, since_unix: i64) -> anyhow::Result<u64> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)), 0)::BIGINT \
+               FROM cogneva_event \
+              WHERE kind = 'llm_call' AND call_result = 'ok' \
+                AND at >= to_timestamp($1::DOUBLE PRECISION)",
+        )
+        .bind(since_unix as f64)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0.max(0) as u64)
+    }
+
+    /// 自某时刻被任何一级额度拒掉的调用数，**从事件流算**。
+    pub async fn refusals_total_since_from_stream(&self, since_unix: i64) -> anyhow::Result<u64> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::BIGINT FROM cogneva_event \
+              WHERE kind = 'llm_call' AND call_result LIKE 'refused%' \
+                AND at >= to_timestamp($1::DOUBLE PRECISION)",
+        )
+        .bind(since_unix as f64)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0.max(0) as u64)
+    }
+
+    /// 一组任务各自花了多少 token，**从事件流算**（不设窗口：成本按活算，不按窗算）。
+    pub async fn spend_by_task_from_stream(
+        &self,
+        task_ids: &[String],
+    ) -> anyhow::Result<Vec<(String, u64)>> {
+        if task_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT task_id_text, \
+                    COALESCE(SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)), 0)::BIGINT \
+               FROM cogneva_event \
+              WHERE kind = 'llm_call' AND task_id_text = ANY($1) \
+              GROUP BY 1 ORDER BY 1",
+        )
+        .bind(task_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(task, tokens)| (task, tokens.max(0) as u64))
+            .collect())
+    }
+
+    /// 一台上游自 `since` 起成功调用烧掉的 token，**从事件流算**。
+    pub async fn spent_since_from_stream(
+        &self,
+        upstream: &str,
+        since_unix: i64,
+    ) -> anyhow::Result<u64> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)), 0)::BIGINT \
+               FROM cogneva_event \
+              WHERE kind = 'llm_call' AND upstream_name = $1 AND call_result = 'ok' \
+                AND at >= to_timestamp($2::DOUBLE PRECISION)",
+        )
+        .bind(upstream)
+        .bind(since_unix as f64)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0.max(0) as u64)
+    }
+
+    /// 一段会话的花销，**从事件流算**；`None` 是这段会话没有调用。
+    pub async fn spend_for_session_from_stream(
+        &self,
+        session: &str,
+    ) -> anyhow::Result<Option<cog_core::SessionSpend>> {
+        let rows: Vec<(i64, i64, i64, i64, i64)> = sqlx::query_as(
+            "SELECT COUNT(*)::BIGINT,
+                    COALESCE(SUM(COALESCE(input_tokens,0)),0)::BIGINT,
+                    COALESCE(SUM(COALESCE(cached_tokens,0)),0)::BIGINT,
+                    COALESCE(SUM(COALESCE(output_tokens,0)),0)::BIGINT,
+                    COUNT(*) FILTER (WHERE cost_micros IS NULL OR price_book IS NULL OR price_book = '')::BIGINT \
+               FROM cogneva_event WHERE kind = 'llm_call' AND session_id = $1",
+        )
+        .bind(session)
+        .fetch_all(&self.pool)
+        .await?;
+        let (calls, input, cached, output, unpriced) = rows[0];
+        if calls == 0 {
+            return Ok(None);
+        }
+        let money_rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT price_book, SUM(cost_micros)::BIGINT, COUNT(*)::BIGINT \
+               FROM cogneva_event \
+              WHERE kind = 'llm_call' AND session_id = $1 AND cost_micros IS NOT NULL \
+                AND price_book IS NOT NULL AND price_book <> '' \
+              GROUP BY price_book",
+        )
+        .bind(session)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut by_currency: std::collections::BTreeMap<String, (i64, u64)> = Default::default();
+        for (book, cost, priced) in money_rows {
+            let currency = match book.split_once('@') {
+                Some((currency, _)) if !currency.is_empty() => currency.to_string(),
+                _ => book,
+            };
+            let cell = by_currency.entry(currency).or_default();
+            cell.0 = cell.0.saturating_add(cost);
+            cell.1 = cell.1.saturating_add(priced.max(0) as u64);
+        }
+        Ok(Some(cog_core::SessionSpend {
+            calls: calls as u64,
+            tokens_input: input.max(0) as u64,
+            tokens_cached: cached.max(0) as u64,
+            tokens_output: output.max(0) as u64,
+            money: by_currency
+                .into_iter()
+                .map(
+                    |(currency, (cost_micros, priced_calls))| cog_core::SessionMoney {
+                        currency,
+                        cost_micros,
+                        priced_calls,
+                    },
+                )
+                .collect(),
+            unpriced_calls: unpriced.max(0) as u64,
+        }))
+    }
+
+    /// 与 [`Self::priced_spend_between`] 同一问，**从事件流算**：按上游×协议×人×价目分组。
+    ///
+    /// 两侧的差别只有一处、且必须留着：`cost_micros` 整组都没定价时是 NULL 而不是 0，
+    /// 而 `priced_calls` 一起给出——「这些调用没算过价」与「算出来是零」是两句话。
+    pub async fn priced_spend_between_from_stream(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> anyhow::Result<cog_core::PricedSpend> {
+        let covered: (Option<DateTime<Utc>>, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT MIN(at) AS covered_since, MAX(at) AS covered_until \
+               FROM cogneva_event WHERE kind = 'llm_call' AND at >= $1 AND at < $2",
+        )
+        .bind(since)
+        .bind(until)
+        .fetch_one(&self.pool)
+        .await?;
+        let rows = sqlx::query(
+            r#"
+            SELECT actor,
+                   COALESCE(attributes::jsonb ->> 'origin', 'unknown') AS origin,
+                   COALESCE(upstream_name, '-') AS upstream,
+                   COALESCE(api_style, '-') AS api_style,
+                   price_book,
+                   COUNT(*) AS calls,
+                   COUNT(*) FILTER (WHERE call_result IS DISTINCT FROM 'ok') AS failed_calls,
+                   COALESCE(SUM(COALESCE(input_tokens, 0)), 0)::BIGINT AS tokens_input,
+                   COALESCE(SUM(COALESCE(cached_tokens, 0)), 0)::BIGINT AS tokens_cached,
+                   COALESCE(SUM(COALESCE(output_tokens, 0)), 0)::BIGINT AS tokens_output,
+                   SUM(cost_micros)::BIGINT AS cost_micros,
+                   COUNT(cost_micros) AS priced_calls
+              FROM cogneva_event
+             WHERE kind = 'llm_call' AND at >= $1 AND at < $2
+             GROUP BY actor, origin, upstream, api_style, price_book
+             ORDER BY SUM(cost_micros) DESC NULLS LAST, calls DESC,
+                      actor, origin, upstream, api_style
+            "#,
+        )
+        .bind(since)
+        .bind(until)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(cog_core::PricedSpend {
+            covered_since: covered.0,
+            covered_until: covered.1,
+            rows: rows
+                .iter()
+                .map(|r| cog_core::PricedSpendRow {
+                    actor: r.get("actor"),
+                    origin: r.get("origin"),
+                    upstream: r.get("upstream"),
+                    api_style: r.get("api_style"),
+                    price_book: r.get("price_book"),
+                    calls: r.get("calls"),
+                    failed_calls: r.get("failed_calls"),
+                    tokens_input: r.get("tokens_input"),
+                    tokens_cached: r.get("tokens_cached"),
+                    tokens_output: r.get("tokens_output"),
+                    cost_micros: r.get("cost_micros"),
+                    priced_calls: r.get("priced_calls"),
+                })
+                .collect(),
+        })
+    }
+
     /// Every `(actor, origin, upstream, api_style)` the ledger has ever recorded.
     ///
     /// This is the set a window is completed against so that "no traffic" still
@@ -2659,7 +3100,7 @@ impl cog_core::LlmUsageReader for RolledUsageReader {
 /// as they are for the reporting side, which is assembled here and can see both.
 #[async_trait::async_trait]
 impl cog_core::LlmUsageLedger for LlmUsageStore {
-    async fn record(&self, record: &LlmUsageRecord) -> Result<(), String> {
+    async fn record(&self, record: &LlmUsageRecord) -> Result<String, String> {
         LlmUsageStore::record(self, record)
             .await
             .map_err(|e| e.to_string())
@@ -2676,13 +3117,13 @@ impl cog_core::LlmUsageLedger for LlmUsageStore {
         since: DateTime<Utc>,
         until: DateTime<Utc>,
     ) -> Result<cog_core::PricedSpend, String> {
-        LlmUsageStore::priced_spend_between(self, since, until)
+        LlmUsageStore::priced_spend_between_from_stream(self, since, until)
             .await
             .map_err(|e| e.to_string())
     }
 
     async fn spend_for_session(&self, session: &str) -> Result<Option<SessionSpend>, String> {
-        LlmUsageStore::spend_for_session(self, session)
+        LlmUsageStore::spend_for_session_from_stream(self, session)
             .await
             .map_err(|e| e.to_string())
     }
@@ -2703,7 +3144,7 @@ impl cog_core::LlmUsageLedger for LlmUsageStore {
         since_unix: i64,
         until_unix: i64,
     ) -> Result<u64, String> {
-        LlmUsageStore::burned_between(self, upstream, since_unix, until_unix)
+        LlmUsageStore::burned_between_from_stream(self, upstream, since_unix, until_unix)
             .await
             .map_err(|e| e.to_string())
     }
@@ -2731,7 +3172,7 @@ impl cog_core::LlmUsageLedger for LlmUsageStore {
     }
 
     async fn spent_since(&self, upstream: &str, since_unix: i64) -> Result<u64, String> {
-        LlmUsageStore::spent_since(self, upstream, since_unix)
+        LlmUsageStore::spent_since_from_stream(self, upstream, since_unix)
             .await
             .map_err(|e| e.to_string())
     }
@@ -2758,19 +3199,19 @@ impl cog_core::LlmUsageLedger for LlmUsageStore {
         days: i64,
         quantile: f64,
     ) -> Result<Option<(u64, u64, i64)>, String> {
-        LlmUsageStore::task_cost_quantile(self, days, quantile)
+        LlmUsageStore::task_cost_quantile_from_stream(self, days, quantile)
             .await
             .map_err(|e| e.to_string())
     }
 
     async fn task_has_started(&self, task: &str) -> Result<bool, String> {
-        LlmUsageStore::task_has_started(self, task)
+        LlmUsageStore::task_has_started_from_stream(self, task)
             .await
             .map_err(|e| e.to_string())
     }
 
     async fn spend_by_task(&self, task_ids: &[String]) -> Result<Vec<(String, u64)>, String> {
-        LlmUsageStore::spend_by_task(self, task_ids)
+        LlmUsageStore::spend_by_task_from_stream(self, task_ids)
             .await
             .map_err(|e| e.to_string())
     }
@@ -2801,13 +3242,13 @@ impl cog_core::LlmUsageLedger for LlmUsageStore {
     }
 
     async fn spend_total_since(&self, since_unix: i64) -> Result<u64, String> {
-        LlmUsageStore::spend_total_since(self, since_unix)
+        LlmUsageStore::spend_total_since_from_stream(self, since_unix)
             .await
             .map_err(|e| e.to_string())
     }
 
     async fn refusals_total_since(&self, since_unix: i64) -> Result<u64, String> {
-        LlmUsageStore::refusals_total_since(self, since_unix)
+        LlmUsageStore::refusals_total_since_from_stream(self, since_unix)
             .await
             .map_err(|e| e.to_string())
     }
@@ -2816,7 +3257,7 @@ impl cog_core::LlmUsageLedger for LlmUsageStore {
         &self,
         since_unix: i64,
     ) -> Result<Vec<(String, u64)>, String> {
-        LlmUsageStore::refusals_by_person_since(self, since_unix)
+        LlmUsageStore::refusals_by_person_since_from_stream(self, since_unix)
             .await
             .map_err(|e| e.to_string())
     }
@@ -2825,7 +3266,7 @@ impl cog_core::LlmUsageLedger for LlmUsageStore {
         &self,
         since_unix: i64,
     ) -> Result<Vec<(String, u64)>, String> {
-        LlmUsageStore::refusals_by_workspace_since(self, since_unix)
+        LlmUsageStore::refusals_by_workspace_since_from_stream(self, since_unix)
             .await
             .map_err(|e| e.to_string())
     }
@@ -2834,7 +3275,7 @@ impl cog_core::LlmUsageLedger for LlmUsageStore {
         &self,
         task_id: &str,
     ) -> Result<Option<cog_core::TaskAttribution>, String> {
-        LlmUsageStore::task_attribution(self, task_id)
+        LlmUsageStore::task_attribution_from_stream(self, task_id)
             .await
             .map_err(|e| e.to_string())
     }
@@ -2844,7 +3285,7 @@ impl cog_core::LlmUsageLedger for LlmUsageStore {
         since: chrono::DateTime<chrono::Utc>,
         until: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64, String> {
-        LlmUsageStore::unattributed_between(self, since, until)
+        LlmUsageStore::unattributed_between_from_stream(self, since, until)
             .await
             .map_err(|e| e.to_string())
     }
@@ -2854,7 +3295,7 @@ impl cog_core::LlmUsageLedger for LlmUsageStore {
         since: chrono::DateTime<chrono::Utc>,
         until: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<cog_core::OutcomeCount>, String> {
-        LlmUsageStore::outcomes_between(self, since, until)
+        LlmUsageStore::outcomes_between_from_stream(self, since, until)
             .await
             .map_err(|e| e.to_string())
     }
@@ -2864,7 +3305,7 @@ impl cog_core::LlmUsageLedger for LlmUsageStore {
         since: chrono::DateTime<chrono::Utc>,
         until: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<cog_core::MeteringCount>, String> {
-        LlmUsageStore::metering_between(self, since, until)
+        LlmUsageStore::metering_between_from_stream(self, since, until)
             .await
             .map_err(|e| e.to_string())
     }

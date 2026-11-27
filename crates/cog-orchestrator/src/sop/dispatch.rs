@@ -304,7 +304,7 @@ async fn dispatch_face(
                 .input
                 .get("role")
                 .and_then(|r| r.as_str())
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             registry.skill_for_role(role).is_none()
         })
         .count();

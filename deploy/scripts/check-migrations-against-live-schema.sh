@@ -46,11 +46,15 @@ run_sql() { # run_sql <库> <sql>
         psql -U "${pg_user}" -d "$1" -v ON_ERROR_STOP=1 -tA -c "$2"
 }
 
-applied="$(run_sql "${pg_db}" "select coalesce(max(version), 0) from schema_migrations")"
-if [ -z "${applied}" ]; then
-    echo "RED  读不到 ${pg_db}.schema_migrations 的最大版本号：这份检查没有起点" >&2
+# 记录过的版本是**一张名单**，不是一个最大值：手工应用的迁移可以是跳着的
+# （2026-11-27 现网就是 131/139/140/141 已在、120–138 未在）。按最大值挑待应用
+# 的那一版会把中间没应用的整段看漏，而漏掉的正是下一次部署要跑的那些。
+recorded="$(run_sql "${pg_db}" "select version from schema_migrations order by version")"
+if [ -z "${recorded}" ]; then
+    echo "RED  读不到 ${pg_db}.schema_migrations 的已应用版本：这份检查没有起点" >&2
     exit 1
 fi
+applied="$(printf '%s\n' "${recorded}" | wc -l | tr -d ' ')"
 
 scratch="mig_rehearsal_$$"
 pending="$(mktemp "${TMPDIR:-/tmp}/cogneva-pending-migrations.XXXXXX")"
@@ -68,14 +72,21 @@ if ! ls "${migrations}"/*.up.sql >/dev/null 2>&1; then
     exit 1
 fi
 count=0
-for path in $(ls "${migrations}"/*.up.sql | sed 's/.*\/\([0-9]*\)_.*/\1 &/' \
-    | sort -n | awk -v applied="${applied}" '$1 > applied { print $2 }'); do
+for path in $(ls "${migrations}"/*.up.sql | sort -V); do
+    version="$(basename "${path}" | sed 's/^\([0-9]*\)_.*/\1/')"
+    # 文件名有前导零（`010_…`），表里存的是整数（`10`）：不归一化就会把每一条老
+    # 迁移都看成「没记录过」，于是回放从第一份开始重跑，红在早已存在的对象上。
+    version="$(printf '%s' "${version}" | sed 's/^0*//')"
+    [ -n "${version}" ] || version=0
+    if printf '%s\n' "${recorded}" | grep -qx "${version}"; then
+        continue
+    fi
     cat "${path}" >>"${pending}"
     echo "" >>"${pending}"
     count=$((count + 1))
 done
 if [ "${count}" -eq 0 ]; then
-    echo "OK：真库已经在 ${applied}，没有待应用的迁移"
+    echo "OK：真库记录过的 ${applied} 个版本覆盖了树里的全部迁移，没有待应用的"
     exit 0
 fi
 
@@ -109,11 +120,11 @@ set -e
     rm -f /tmp/live-schema.sql /tmp/pending-migrations.sql >/dev/null 2>&1 || true
 
 if [ "${status}" -ne 0 ]; then
-    echo "RED  ${count} 份待应用的迁移（${applied} 之后）在真库的形状上跑不完：" >&2
+    echo "RED  ${count} 份未记录的迁移在真库的形状上跑不完：" >&2
     printf '%s\n' "${out}" | tail -n 20 >&2
     echo "     空库重放看不出这一类：依赖被改列的表达式索引 / 生成列 / 视图都是" >&2
     echo "     store 首启时建的，迁移链里没有它们。" >&2
     exit 1
 fi
 
-echo "OK：${count} 份待应用的迁移（${applied} 之后）在真库的形状上跑得完"
+echo "OK：${count} 份未记录的迁移在真库的形状上跑得完（已记录 ${applied} 个版本）"

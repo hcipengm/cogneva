@@ -1,3 +1,4 @@
+// census-keep: shapes=clocks — 排空到点只让位并落 DRAIN_TIMEOUT，在飞的运行下次从 journal 续跑；删掉会让 shutdown 永不返回、45s 被 SIGKILL，由 terminationGracePeriodSeconds=45 与 DRAIN_TIMEOUT 计数兜住
 //! Agent plugin — implements [`cog_core::SystemPlugin`].
 
 use std::sync::Arc;
@@ -17,13 +18,15 @@ pub const EVAL_EMPLOYEE_HEARTBEAT_LOOP: &str = "agent_eval_employee_heartbeat";
 /// Shorter than the pool's own task length on purpose: a task holds its turn
 /// for minutes, so a reading that stepped faster than that could shrink the
 /// pool and regrow it between two tasks without either reading being wrong.
-// cap: bound — 负载以分钟为单位变，比那更快的读数会在两次任务之间把池缩了又长回来，而两次读数都没错
+// cap: fixed — 负载以分钟为单位变，比那更快的读数会在两次任务之间把池缩了又长回来，而两次读数都没错
+// not-a-bound: 负载以分钟为单位变，比那更快的读数会在两次任务之间把池缩了又长回来，而两次读数都没错
 const POOL_SIZING_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How often this agent says it is alive to the control plane. Short enough
 /// that a restarted control plane re-learns its agents without a redeploy, long
 /// enough that the heartbeat is not the busiest thing on the channel.
-// cap: bound — 短到重启的控制面不用重新部署就能重新认出它的 agent，长到心跳不是这条通道上最忙的东西
+// cap: fixed — 短到重启的控制面不用重新部署就能重新认出它的 agent，长到心跳不是这条通道上最忙的东西
+// keep: 删掉后心跳要么不发（重启后认不出 agent），要么每轮都发（占满通道）；由「一个心跳周期」兜住
 const HEARTBEAT_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Keep the pool's concurrency equal to what the container can carry.
@@ -528,6 +531,8 @@ impl cog_core::SystemPlugin for AgentPlugin {
                 // 的答案取决于调用者自己那棵树，在本进程跑就等于读一份与调用者
                 // 无关的源码。后端在交给注册表时克隆了一份，这里再拿一份。
                 sandbox_backend: Some(sandbox_backend.clone()),
+                message_events: ctx.consume_service::<dyn cog_core::EventStore>(),
+                intent_events: ctx.consume_service::<dyn cog_core::EventStore>(),
             },
         );
         info!(
@@ -547,10 +552,10 @@ impl cog_core::SystemPlugin for AgentPlugin {
         // eval runtime and the whole worker pool: the reading it carries is
         // keyed by tool, and a second copy would only split the count.
         // 工具调用的事实落点：只要装配层给了就接上，与归档分开（记录 vs 载体）。
-        let tool_call_events = ctx.consume_service::<dyn cog_core::ToolCallEvents>();
+        let tool_call_events = ctx.consume_service::<dyn cog_core::EventStore>();
         if tool_call_events.is_none() {
             warn!(
-                "ToolCallEvents unavailable; a tool call leaves no row in the event \n                 stream, so replaying a run from the stream alone cannot see it"
+                "EventStore unavailable; a tool call leaves no row in the event \n                 stream, so replaying a run from the stream alone cannot see it"
             );
         }
         let tool_output_archive: Option<Arc<dyn crate::ToolOutputArchive>> = ctx
@@ -942,6 +947,9 @@ impl cog_core::SystemPlugin for AgentPlugin {
                 self.record_drain(started.elapsed().as_secs_f64() * 1000.0, DRAIN_DRAINED, 0)
                     .await;
             } else {
+                // keep: 删掉这个等待界，shutdown 永不返回，45s 处被 kubelet SIGKILL，
+                // WAL 与连接一步都排不掉；由 `terminationGracePeriodSeconds: 45` 与
+                // `DRAIN_TIMEOUT` 计数兜住（到点只是让位，在飞的运行下次从 journal 续跑）。
                 let left = crate::drain::in_flight();
                 warn!(
                     in_flight = left,
@@ -1017,9 +1025,11 @@ async fn event_upload_task(
 ) {
     use tokio::time::{interval, Duration};
 
-    // cap: bound — a batching choice; the flush deadline is what bounds the wait
+    // cap: fixed — a batching choice; the flush deadline is what bounds the wait
+    // keep: 删掉后每个事件单独写一次 WAL，条数速率变成 WAL 等待速率；由「批大小与冲线成对」兜住
     const BATCH_SIZE: usize = 16;
-    // cap: bound — flush deadline for buffered events; the batch size of 16 is the other half of the batching
+    // cap: fixed — flush deadline for buffered events; the batch size of 16 is the other half of the batching
+    // keep: 删掉后缓冲里的事件无限期等待，答复先于落盘；由「冲线与批大小成对」兜住
     // wall: 等=攒够一批事件或者到点刷一次 / 等不到=不适用：它到点就刷，不结束任何一条事件 / 续跑=不适用
     const BATCH_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -1234,6 +1244,7 @@ mod conversation_reaches_the_worker_tests {
             goal: serde_json::json!("你叫什么名字？"),
             reply_stream: Some(reply_stream.into()),
             from_agent: None,
+            intent: None,
         })
         .await
         .expect("the worker answers a sentence without failing");

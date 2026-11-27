@@ -106,7 +106,8 @@ pub struct MaintenanceConfig {
 /// 一条记忆被回读时重要度会被抬高，所以这条阈值分的是「还会被回读」与「已经
 /// 不再被回读」两堆。它由衰减之后回读面里还剩多少被清掉的条目定：清错了就把
 /// 它调低，清不干净就调高——不是一个可以拍定的档位。
-// cap: bound — 由衰减后的回读率定：被清掉的条目还出现在回读里，就是它太高
+// cap: fixed — 由衰减后的回读率定：被清掉的条目还出现在回读里，就是它太高
+// keep: 删掉后被清掉的条目还出现在回读里，衰减线没有判据；由「由衰减后的回读率定」兜住
 const DECAY_IMPORTANCE_THRESHOLD: f32 = 0.5;
 
 impl Default for MaintenanceConfig {
@@ -128,7 +129,8 @@ impl Default for MaintenanceConfig {
 /// 取今天窗口配置的值：raw 层改存完整历史之前，抽取器拿到的最长载荷就是被
 /// 裁到一个窗口的那份，默认值让这条请求的量级不变。它是这条链路上第一个显式
 /// 的界——窗口配置改了要一起看，两者比的是同一段文本。
-// cap: bound — 与窗口同源：两者量的是同一段文本，窗口配置改了要一起看
+// cap: fixed — 与窗口同源：两者量的是同一段文本，窗口配置改了要一起看
+// keep: 删掉后抽取输入与窗口各说各的，同一段文本两处预算对不上；由「与窗口同源」兜住
 pub const DEFAULT_EXTRACTION_INPUT_BUDGET_TOKENS: usize = 64_000;
 
 /// 自动摄取管线的运行参数。代码侧 [`Default`] 只是兜底，集群上调参改
@@ -222,26 +224,33 @@ pub struct IngestConfig {
 /// 它钉的是「一条消息从首投到终局要多久」与上游断供重放窗口的关系：重试跑完
 /// 的时间长过重放窗口，消息在队列里等的那段时间就白等了；短太多则一次抖动就
 /// 进 DLQ。
-// cap: bound — 由断供重放窗口定：一条消息从首投到进 DLQ 要短于这个窗
+// cap: fixed — 由断供重放窗口定：一条消息从首投到进 DLQ 要短于这个窗
+// keep: 删掉后一条消息从首投到进 DLQ 的时间超过断供重放窗，重放再也接不上；由「要短于断供重放窗口」兜住
 const INGEST_MAX_RETRIES: u32 = 3;
 
 /// 同时在途的抽取请求条数。
-// cap: bound — 由提供方的速率上限与单条抽取时长定：被 429 顶住就是它太大
+// cap: fixed — 由提供方的速率上限与单条抽取时长定：被 429 顶住就是它太大
+// keep: 删掉后并发被提供方的 429 顶住，重试代替了抽取；由「由速率上限与单条时长定」兜住
 const EXTRACTION_CONCURRENCY: usize = 4;
 
 /// 一拍搬运多少条：回看窗外的补驱动与 pending 认领问的是同一件事。
 ///
-/// 批大小由一拍的时限定：这一批要在下一个认领间隔到点前走完，所以它不是两个
-/// 各自可拍的数，而是一个「一段时长里搬得动多少」的读数。
-// cap: bound — 由一拍的时限定：一批要在下一个认领间隔到点前走完
+/// 真正的批量不是这个数：认领那一拍按「一拍时长 ÷ 单次抽取的 p95 耗时」现算
+/// （`claim_batch_for_pass`），读数来自 `memory_operation_latency_ms{operation="extract"}`。
+/// 这一格只是**量不到时的种子**（还没有一条抽取耗时样本，或者指标面没接上）——
+/// 种子是退路，不是结论。
+// cap: fixed — 量不到时的种子：真正的一拍批量由实测的抽取耗时现算，这个数只在没有样本时兜底
+// keep: 删掉后量不到时没有种子，一拍批量在冷启动时无值可依；由「只在没有样本时兜底」兜住
 const INGEST_BATCH: usize = 32;
 
 /// 连续多少次环境类抽取失败后暂停拉取。
-// cap: bound — 由上游断供的判定时长定：暂停要早于断供把事件面塞满
+// cap: fixed — 由上游断供的判定时长定：暂停要早于断供把事件面塞满
+// keep: 删掉后暂停晚于断供把事件面塞满，上游断供不被发现；由「暂停要早于断供塞满」兜住
 const PULL_PAUSE_AFTER_FAILURES: u32 = 3;
 
 /// 积压深度告警起点：达到后每翻倍打一条 WARN。
-// cap: bound — 由一拍的抽取吞吐定：它是「几拍才清得完」的积压量
+// cap: fixed — 由一拍的抽取吞吐定：它是「几拍才清得完」的积压量
+// keep: 删掉后积压到几拍才清得完之前不报警，读数只在事后可见；由「几拍才清得完的积压量」兜住
 const BACKLOG_WARN_AT: usize = 64;
 
 impl Default for IngestConfig {
@@ -326,7 +335,7 @@ mod tests {
         assert!(cfg.enabled);
         assert_eq!(cfg.backend_type, "composite");
         assert_eq!(cfg.embedding_dimension, 1024);
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// 模型加载默认关：一个 2Gi 上限的 Pod 装不下 BGE-M3 的常驻权重，而本地无缓存

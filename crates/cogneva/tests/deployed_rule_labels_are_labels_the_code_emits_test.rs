@@ -292,7 +292,7 @@ fn references_a_declaration_of(root: &Path, file: &str, label: &str) -> bool {
     if names.is_empty() {
         return false;
     }
-    let body = std::fs::read_to_string(root.join(file)).unwrap_or_default();
+    let body = std::fs::read_to_string(root.join(file)).unwrap_or(Default::default());
     names.iter().any(|name| body.contains(&format!("::{name}")))
 }
 

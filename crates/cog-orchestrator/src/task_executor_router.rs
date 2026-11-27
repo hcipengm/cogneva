@@ -20,12 +20,15 @@ use std::time::Duration;
 // cog-core so the two cannot drift into a pair that publishes a duplicate while
 // the first copy is still on its way.
 // cap: fixed — 1000 is the seconds-to-milliseconds conversion, not a dial; the window itself is DEFAULT_READY_CLAIM_IDLE_SECS
+// keep: 删掉后回到「1000 is the seconds-to-milliseconds conversion, not a dial; the window itself is DEFAULT_READY_CLAIM_IDLE_SECS」所描述的情形；由这条约定兜住
 const PENDING_IDLE_MS: u64 = cog_core::config::DEFAULT_READY_CLAIM_IDLE_SECS * 1000;
-// cap: bound — sweeper poll period; PENDING_IDLE_MS is the claim threshold, this only sets how late a stuck message is seen
+// cap: fixed — sweeper poll period; PENDING_IDLE_MS is the claim threshold, this only sets how late a stuck message is seen
+// keep: 删掉后回到「sweeper poll period; PENDING_IDLE_MS is the claim threshold, this only sets how late a stuck message is seen」所描述的情形；由这条约定兜住
 const CLAIM_INTERVAL: Duration = Duration::from_secs(60);
 /// 一次认领要多少条：够把下一次醒来之前的工作铺在 executor 前面，也小到一次认领
 /// 本身跨不过两轮之间的间隔。
-// cap: bound — 够把下一次醒来之前的工作铺在 executor 前面，又小到一次认领跨不过两轮之间的间隔
+// cap: fixed — 够把下一次醒来之前的工作铺在 executor 前面，又小到一次认领跨不过两轮之间的间隔
+// keep: 删掉后一次认领跨不过两轮之间的间隔；由「够铺、又小到跨不过两轮」兜住
 const CLAIM_BATCH: usize = 16;
 /// 给在途执行上限的那个环境变量名。
 ///
@@ -46,7 +49,8 @@ pub const CLAIM_CONCURRENCY_ENV: &str = "COGNEVA_TASK_CLAIM_CONCURRENCY";
 /// 与 [`cog_core::BoardWipLimits`] 同一个口径：**量不到就按这个数跑，量不到不等于
 /// 零**。一个凭空造出来的 0 会让所有执行停摆，而它与「没配」在读数上是同一个
 /// 空白。窗口一旦读出来，下一次重算就把它换成 `(额度-已花)/单任务价格`。
-// cap: bound — 进程级许可：本进程读的每条就绪队列共用同一份，多读一条队列不该把在途执行翻倍
+// cap: fixed — 进程级许可：本进程读的每条就绪队列共用同一份，多读一条队列不该把在途执行翻倍
+// keep: 删掉后多读一条就绪队列把在途执行翻倍；由「进程级许可」兜住
 pub const DEFAULT_CLAIM_CONCURRENCY: usize = 4;
 
 /// 认领上限的导出循环在存活登记里的名字。
@@ -61,7 +65,8 @@ pub const CLAIM_WINDOW_LOOP: &str = "task_claim_window_bound";
 /// that the cost of the exception is bounded by a single extra task in flight.
 /// One is enough because a red main is one finding: the deployer files one row
 /// per revision per day and the row names the whole failing set.
-// cap: bound — 这条例外的价钱就定在这一格：单开一份许可，同时最多多一条在跑的活；不是量出来的，是「例外不该翻倍」定的
+// cap: fixed — 这条例外的价钱就定在这一格：单开一份许可，同时最多多一条在跑的活；不是量出来的，是「例外不该翻倍」定的
+// keep: 删掉后停线这条例外把在跑的活翻倍；由「例外不该翻倍」兜住
 pub const STOP_THE_LINE_CLAIM_CONCURRENCY: usize = 1;
 
 /// 进程本地车道的在途执行上限，从环境读。
@@ -128,7 +133,8 @@ pub const LOCAL_CLAIM_CONCURRENCY_ENV: &str = "COGNEVA_LOCAL_CLAIM_CONCURRENCY";
 ///
 /// 它现在是两件事的共同起点：导出模式的起始值与下限（还没量到一条任务的价格
 /// 时用它），以及这个导出的界在任何一次读失败之后退回的那一格。
-// cap: bound — 这条例外的价钱就定在这一格：单开一份许可，同时最多多一条在跑的活
+// cap: fixed — 这条例外的价钱就定在这一格：单开一份许可，同时最多多一条在跑的活
+// keep: 删掉后本地这条路径自己开会把在跑的活翻倍；由「例外不该翻倍」兜住
 pub const DEFAULT_LOCAL_CLAIM_CONCURRENCY: usize = 1;
 
 /// 读一条在途执行上限。
@@ -387,7 +393,8 @@ fn stall_poll_interval() -> Duration {
 }
 
 /// 守护空转的下限。
-// cap: bound — 这是 CPU 代价的下限不是判据：没有窗口时每拍只醒一次判据，
+// cap: fixed — 这是 CPU 代价的下限不是判据：没有窗口时每拍只醒一次判据，
+// keep: 删掉后没有窗口时拍子可以趋零，判据循环空转；由「这是 CPU 代价的下限不是判据」兜住
 // 而判据那时恒为 `None`；再密也只是把一次 `select!` 换成两次。窗口有了之后
 // 拍子由窗口导出，这个数就不再是主力。
 const STALL_POLL_FLOOR: Duration = Duration::from_secs(1);

@@ -108,6 +108,42 @@ trap cleanup EXIT
 # 放在**这一份自己的判定之前**：下面每一道提前退出（缺 rustfmt、没有暂存的 Rust）
 # 都是「这一份没什么可判」，而别的关注点看的是别的东西——尤其删除与搬移根本不在
 # `--diff-filter=ACMR` 的射程里，放在后面就等于在正是它该管的那一笔上不跑。
+# ---- 界与有损：判这一笔暂存的新增行 ----------------------------------------
+#
+# 判据在 `scripts/{bounds,loss}-census.py` 里，这里只调用（薄入口）。界默认无界，
+# 有损默认无损；留下来的必须落成 `Bound::derived|fixed` 或 `Excerpt { shown, full_ref }`
+# 并写 `keep:` 理由。红的时候脚本自己把正确写法打出来。
+#
+# 三条判据：根从钩子自己的位置解析（不靠 cwd——principle-commit 调它时不 cd）；
+# 缺 python3 或缺某一个脚本，是「判不了」，记 UNJUDGED 放行，不是拒提交；
+# 没有暂存的改动就直接早退，不为一笔无关的提交付整树扫描的钱。
+census_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.."
+if git -C "$top" diff --cached --quiet -- . 2>/dev/null; then
+  journal ok "界与有损（没有暂存改动）"
+elif ! command -v python3 >/dev/null 2>&1; then
+  journal UNJUDGED "界与有损（这台机器没有 python3）"
+else
+  census_missing=""
+  for census in bounds-census.py loss-census.py table-shapes-census.py; do
+    [ -f "$census_root/scripts/$census" ] || census_missing="$census_missing $census"
+  done
+  if [ -n "$census_missing" ]; then
+    journal UNJUDGED "界与有损（缺${census_missing}）"
+  else
+    census_rc=0
+    python3 "$census_root/scripts/bounds-census.py" --root "$census_root" --check-staged || census_rc=1
+    if [ "$census_rc" -eq 0 ]; then
+      python3 "$census_root/scripts/loss-census.py" --root "$census_root" --check-staged || census_rc=1
+    fi
+    if [ "$census_rc" -eq 0 ]; then
+      journal ok "界与有损"
+    else
+      journal RED "界与有损"
+      exit 1
+    fi
+  fi
+fi
+
 extra_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pre-commit.d"
 if [ -d "$extra_dir" ]; then
   for extra in "$extra_dir"/*.sh; do

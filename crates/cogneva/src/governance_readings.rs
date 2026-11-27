@@ -101,7 +101,7 @@ pub fn parse_roster(text: &str) -> Result<Vec<ReadingRow>, String> {
                     .map(String::from)
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         rows.push(ReadingRow {
             producer: producer.to_string(),
             path: path.to_string(),
@@ -167,7 +167,7 @@ pub fn from_task(task: &Task) -> Option<ReadingRow> {
                 .map(String::from)
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     Some(ReadingRow {
         producer,
         path,

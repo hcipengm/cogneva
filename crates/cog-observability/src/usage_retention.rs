@@ -48,7 +48,8 @@ pub const DEPLOYMENT_LABEL: &str = "deployment";
 /// that bought it are gone. What ends at thirty days is the per-call detail —
 /// which task bought which tokens — and that is a promise about the ledger
 /// rather than a side effect of the table's size.
-// cap: bound — 「哪条任务买了多少 token」是关于这本账的承诺，不是表大小的副作用
+// cap: fixed — 「哪条任务买了多少 token」是关于这本账的承诺，不是表大小的副作用
+// keep: 删掉关于这本账的承诺，保留期变成表大小的副作用；由「哪条任务买了多少 token 是承诺」兜住
 pub const DEFAULT_KEEP_DAYS: i64 = cog_core::retention::LLM_USAGE_KEEP_DAYS_DEFAULT;
 
 /// The shortest retention this loop will accept.
@@ -56,7 +57,8 @@ pub const DEFAULT_KEEP_DAYS: i64 = cog_core::retention::LLM_USAGE_KEEP_DAYS_DEFA
 /// One day. Zero or negative days would erase the ledger every pass, which
 /// reads as a working retention while destroying the rows the current hour's
 /// fold is computed from — the value falls back rather than being honoured.
-// cap: bound — 更短读作一条在工作的保留期，却把当前小时那个折赖以计算的删掉；低于它的值回退
+// cap: fixed — 更短读作一条在工作的保留期，却把当前小时那个折赖以计算的删掉；低于它的值回退
+// keep: 删掉后配置错误把保留期配到删掉当前小时折赖以计算的行；由「低于它的值回退」兜住
 pub const MIN_KEEP_DAYS: i64 = cog_core::retention::LLM_USAGE_KEEP_DAYS_MIN;
 
 /// The environment variable that carries the retention.
@@ -70,7 +72,8 @@ pub const KNOB: &str = "llmUsageRetention.keepDays";
 /// Five minutes, for the same reason the prompt archive uses it: the readings
 /// this loop publishes are what the alert rules read, and Prometheus drops a
 /// series it has not seen for five minutes.
-// cap: bound — 这个循环发布的是告警规则读的那些系列，而 Prometheus 五分钟见不到就丢
+// cap: fixed — 这个循环发布的是告警规则读的那些系列，而 Prometheus 五分钟见不到就丢
+// keep: 删掉后告警规则读的系列五分钟见不到就丢；由「Prometheus 五分钟丢序列」兜住
 pub const PERIOD: Duration = Duration::from_secs(300);
 
 /// What one pass did, so a caller can assert on it rather than infer it.
@@ -243,6 +246,14 @@ impl UsageRetention {
             oldest_age_secs,
             bytes,
         );
+        // 读者问过的窗口是地板：留得比它短，下一次问同一段过去就会读成一个
+        // 看起来像「那段时间没有花费」的缺口。体积算出来的天数只是另一半。
+        let seed_secs = (days.max(1) as u64).saturating_mul(86_400);
+        let (read_floor, _) = cog_core::retention::read_window_secs(
+            seed_secs,
+            cog_core::retention::longest_read_span(cog_core::retention::LLM_USAGE_READ_WINDOW_KNOB),
+        );
+        let days = cog_core::retention::kept_days_against_reads(days, read_floor);
         (
             Duration::from_secs((days.max(0) as u64).saturating_mul(86_400)),
             derived,

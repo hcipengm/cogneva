@@ -100,7 +100,7 @@ fn every_preset_window_names_the_document_it_came_from() {
                 let rest = &entry[at + "model: '".len()..];
                 rest[..rest.find('\'').unwrap_or(0)].to_string()
             })
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         if model.trim().is_empty() {
             // 「自定义」：没有型号，也就没有文档可引。
             continue;

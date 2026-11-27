@@ -54,9 +54,11 @@ const RUN_LIVE_SUFFIX: &str = ".running";
 const RUN_STAGES: [&str; 3] = ["precommit", "gate", "prepush"];
 /// 文件名里没有阶段的那一种，就是整门——记录最早只有这一种。
 const LEGACY_STAGE: &str = "gate";
-// cap: bound — 每棵树每阶段各留一跑；三阶段 × 两棵在动的树，再留一点余量
+// cap: fixed — 每棵树每阶段各留一跑；三阶段 × 两棵在动的树，再留一点余量
+// keep: 删掉后一份门读数里的跑数无界，坏数据把整份读数撑爆；由「每棵树每阶段各留一跑」兜住
 const MAX_RUNS: usize = 8;
-// cap: bound — 一跑最多带几格；一道门一百多格，上千格不是读数多，是有人在灌
+// cap: fixed — 一跑最多带几格；一道门一百多格，上千格不是读数多，是有人在灌
+// keep: 删掉后一跑可以带任意多格，读数变成灌数据；由「一道门一百多格」兜住
 const MAX_RUN_STEPS: usize = 512;
 
 /// 一格读数。`state` 是闭集里的一个词，页面据此决定画读数还是画理由。
@@ -577,7 +579,12 @@ fn slot_is_held(path: &Path) -> bool {
 }
 
 fn read_reservation(path: &Path, fresh_window: u64) -> ReservationReading {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| e.to_string())
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, path = %path.display(), "读取不到这个文件，按空文本继续");
+            String::new()
+        });
     let line = text.trim().to_string();
     let (who, renewed) = match line.split_once('\t') {
         Some((who, since)) => (
@@ -689,7 +696,7 @@ mod tests {
             now_secs(),
             seq
         ));
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

@@ -187,9 +187,8 @@ impl ElasticsearchBackend {
             anyhow::bail!("Elasticsearch error ({}): {}", status, text);
         }
         serde_json::from_str(&text).map_err(|e| {
-            let head: String = text.chars().take(200).collect();
             anyhow::anyhow!(
-                "Elasticsearch answered {status} with a body that is not JSON ({e}): {head}"
+                "Elasticsearch answered {status} with a body that is not JSON ({e}): {text}"
             )
         })
     }
@@ -333,7 +332,7 @@ impl SearchBackend for ElasticsearchBackend {
                         .flat_map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)))
                         .collect()
                 })
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
 
             results.push(SearchResult {
                 doc_id: hit["_id"].as_str().unwrap_or("").to_string(),

@@ -136,7 +136,7 @@ impl MergerActor {
                 )
             }
         };
-        let output_str = serde_json::to_string_pretty(&output).unwrap_or_default();
+        let output_str = serde_json::to_string_pretty(&output).unwrap_or(Default::default());
         if let Some(revised) = crate::actors::maybe_self_review(
             self.agent.as_ref(),
             &self.self_review,
@@ -191,6 +191,7 @@ pub fn fallback_best_branch(branches: &[PgeBranchResult]) -> MergeResult {
         },
         None => MergeResult {
             plan: PlannerOutput {
+                definition: None,
                 summary: String::new(),
                 plan: serde_json::json!({}),
                 sub_tasks: Vec::new(),

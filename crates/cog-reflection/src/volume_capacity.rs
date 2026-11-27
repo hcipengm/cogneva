@@ -221,28 +221,36 @@ impl CapacityOutcome {
 /// The same factor the chart's volumes are declared by, and stated once here so
 /// the loop that repairs a declaration and the numbers in `values.yaml` cannot
 /// drift apart into two standards for "big enough".
-// cap: bound — 声明值按这条余量放大，维修循环与 values.yaml 才不会各自立一套「够大」的标尺
+///
+/// 它是 `values.yaml` 里写定的那条约定（卷声明与 cpu/memory 上限的 why 都写着
+/// 「times the 120% headroom」），不是某次测量推出来的数：改它要先改那张表。
+// cap: fixed — `deploy/helm/cogneva/values.yaml` 的卷与资源上限都按这条 120% 余量声明（why 行点名）
+// keep: 删掉后卷与资源上限不再按 120% 余量声明，声明值与代码里的判据脱钩；由「values.yaml 的 why 行点名」兜住
 pub const HEADROOM_PERCENT: u64 = 120;
 
 /// Walks whose peak is kept. Six is about an hour at the default cadence, which
 /// is longer than any one build and shorter than the day a mis-sized
 /// declaration otherwise survives.
-// cap: bound — 峰值要盖过任何一次构建，又要短于「填错一次能活一整天」
+// cap: fixed — 峰值要盖过任何一次构建，又要短于「填错一次能活一整天」
+// keep: 删掉后峰值窗口要么盖不住一次构建，要么长到填错一次能活一整天；由「盖过任何一次构建、短于一天」兜住
 pub const PEAK_ROUNDS: usize = 6;
 
 /// Cadence of the loop when the deployment states none.
-// cap: bound — 部署没给节拍时的默认轮询间隔
+// cap: fixed — 部署没给节拍时的默认声明值：真正的节拍由部署写，这里只是不说自己节拍的部署的退路
+// keep: 删掉后不说自己节拍的部署没有重决的时刻，卷在无人看的情况下变满；由「没给节拍时的退路」兜住
 pub const DEFAULT_INTERVAL_SECS: u64 = 600;
 
 /// Floor on that cadence: a walk and an API read are cheap, but a loop that
 /// re-decides faster than the volume changes is just a busier way to be wrong.
-// cap: bound — 节拍下限：比卷的变化更快地重决只是在更忙地犯错
+// cap: fixed — 节拍下限：比卷的变化更快地重决只是在更忙地犯错
+// keep: 删掉后节拍可以比卷的变化还快，重决变成更忙地犯错；由「节拍下限」兜住
 pub const MIN_INTERVAL_SECS: u64 = 300;
 
 /// How long a claim that refused the patch is left alone before it is tried
 /// again. An API refusal is usually a property of the StorageClass and will not
 /// change by asking again next round.
-// cap: bound — API 拒绝通常是 StorageClass 的属性，再问一遍不会变
+// cap: fixed — API 拒绝通常是 StorageClass 的属性，再问一遍不会变
+// keep: 删掉后 StorageClass 的固定拒绝被每拍重问，同一次拒绝占满日志；由「再问一遍不会变」兜住
 pub const REFUSAL_COOLDOWN_SECS: u64 = 3600;
 
 /// How long a claim may announce more than it has been given, with no resize
@@ -261,7 +269,8 @@ pub const REFUSAL_COOLDOWN_SECS: u64 = 3600;
 /// half an hour at the floor, so a resizer that takes forty minutes would be
 /// called missing on a loop that merely decided more often. The fact being
 /// judged is how long nothing has answered, and that is time.
-// cap: bound — 一个钟头还没有任何 resize 条件，就不是「慢」而是「没人应答」
+// cap: fixed — 一个钟头还没有任何 resize 条件，就不是「慢」而是「没人应答」
+// keep: 删掉后一个钟头没有 resize 条件的卷永远读成「慢」，没人应答的扩容不被发现；由「慢与没人应答的分界」兜住
 pub const ORPHAN_AFTER_SECS: u64 = 3600;
 
 /// Where the shortfall's start time is kept: unix seconds, on the claim itself.
@@ -1114,15 +1123,18 @@ pub const OCCUPANCY_URL_ENV: &str = "COGNEVA_CLAIM_STORE_METRICS_URL";
 /// scrape that is still delivering is worth finishing even when it outlives a
 /// round, while a connection that has produced nothing for this long is the
 /// shape a dead endpoint has.
-// cap: bound — 一拍内没有新字节＝这条连接不是慢，是不动了；判据是字节，不是总时长
+// cap: fixed — 一拍内没有新字节＝这条连接不是慢，是不动了；判据是字节，不是总时长
+// keep: 删掉后一条不再来字节的连接一直挂着，抓取永远不结束；由「一拍内没有新字节就是不动了」兜住
 // wall: 等=这条连接上的新字节 / 等不到=这一拍读作「不动了」，与「慢」分开——判据是字节，不是总时长 / 续跑=能，下一拍重新连上再读
 pub const OCCUPANCY_SCRAPE_TIMEOUT_SECS: u64 = 10;
 
 /// How long curl may spend before the connection is up.
-// cap: bound — 连不上与连上不动是两件事，这一条只管握手
+// cap: fixed — 连不上与连上不动是两件事，这一条只管握手
+// keep: 删掉后握手没有上限，连不上的抓取会一直重试；由「连不上与连上不动是两件事」兜住
 const CURL_CONNECT_TIMEOUT_SECS: &str = "15";
 
 /// 只要有字节进来就算在动。写成 1 而不是 0，因为 0 在 curl 里不是「任何速率都算在动」。
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const CURL_SPEED_LIMIT_BYTES_PER_SEC: &str = "1";
 
 /// The label the published series names its namespace with.
@@ -2821,6 +2833,6 @@ mod tests {
         );
         assert_eq!(unmeasured.cap_bytes(), None);
 
-        std::fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 }

@@ -17,7 +17,8 @@ use cog_core::SupervisorEvent;
 
 /// Threshold for pending-handoffs / active-agents ratio that triggers a
 /// scale-out recommendation in [`AutonomousCollaborator::run_decision_pass`].
-// cap: bound — 待办交接比在跑 agent 多到这个倍数就建议扩容：再低会把正常排队当不足，再高就是排到没人干
+// cap: fixed — 待办交接比在跑 agent 多到这个倍数就建议扩容：再低会把正常排队当不足，再高就是排到没人干
+// keep: 删掉后正常的排队被读成不足，或排到没人干才扩容；由「再低会把正常排队当不足」兜住
 const LOAD_RATIO_THRESHOLD: f64 = 0.8;
 
 /// Configuration for autonomous collaboration decisions.
@@ -31,12 +32,14 @@ pub struct AutonomousConfig {
 
 // 三次重试后进死信：自治编排里一次失败可能是调度冲突（会自己过去），三次都失败
 // 说明这件活需要人看一眼；再多轮只是把同一个坏任务在队列里来回搬。
-// cap: bound — 三次：调度冲突会自己过去，三次都失败就需要人看
+// cap: fixed — 三次：调度冲突会自己过去，三次都失败就需要人看
+// keep: 删掉后调度冲突被反复重试，或三次都失败也无人看；由「三次都失败就需要人看」兜住
 const AUTONOMOUS_MAX_TASK_RETRIES: u32 = 3;
 
 // 五秒一拍：编排决策读的是队列与 agent 的当前状态，一拍的下限要短于一次交接的
 // 往返，否则决策看到的是上一拍的现场。
-// cap: bound — 五秒：短于一次交接的往返，否则决策看到的是上一拍的现场
+// cap: fixed — 五秒：短于一次交接的往返，否则决策看到的是上一拍的现场
+// keep: 删掉后决策看到的是上一拍的现场；由「短于一次交接的往返」兜住
 const AUTONOMOUS_DECISION_INTERVAL_SECS: u64 = 5;
 
 impl Default for AutonomousConfig {

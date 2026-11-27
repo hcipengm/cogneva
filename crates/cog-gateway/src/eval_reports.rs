@@ -26,7 +26,8 @@ use crate::GatewayState;
 /// 列举要按修改时间排序，并且为了给出数据集名要读每一份的正文——每个返回项一次
 /// 读。不设上限时，「列一下目录」会退化成按文件数读盘，所以上限落在这里，同时把
 /// 未截断的总数报出去：调用方必须能看出自己拿到的是前缀。
-// cap: bound — 列评估报告时没传 limit 的默认条数
+// cap: fixed — 列评估报告时没传 limit 的默认条数
+// keep: 删掉后不传 limit 的列表没有默认页长，一次响应装下所有报告；由「没传 limit 的默认条数」兜住
 pub const DEFAULT_LIST_LIMIT: usize = 200;
 
 /// 报告目录：`{data_dir}/eval/reports`。
@@ -69,6 +70,7 @@ pub fn store_report(dir: &Path, id: &str, report_json: &str) -> std::io::Result<
     let mut final_id = id.to_string();
     let mut attempt = 1usize;
     let path = loop {
+        // state-file: artifact — 一次评测跑出来的报告产物，按运行命名，不是平台事实的影子
         let candidate = dir.join(format!("{final_id}.json"));
         // 「这个名字没人用」要查得出来才算数：查不出来时当空名用，会把一份
         // 已经写下的报告改名覆盖掉，而这份实现承诺的是不覆盖前一份。
@@ -176,7 +178,7 @@ pub fn list_reports(dir: &Path, limit: usize) -> std::io::Result<ReportListing> 
                     .and_then(|d| d.as_str())
                     .map(String::from)
             })
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let created_at = Utc
             .timestamp_opt(
                 modified
@@ -287,7 +289,7 @@ mod tests {
             std::fs::read_to_string(&first_path).unwrap(),
             r#"{"dataset_name":"probe","n":1}"#
         );
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     // 列举要新的在前，并在截断时报出截断前的总数——否则一页列表与一份完整的列表
@@ -308,7 +310,7 @@ mod tests {
         assert_eq!(listing.reports.len(), 2);
         assert_eq!(listing.reports[0].dataset_name, "set-2", "新的要在前");
         assert_eq!(listing.reports[1].dataset_name, "set-1");
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     // 目录不存在（还没跑过评测）与读失败是两件事：前者是一份空列举。
@@ -357,6 +359,6 @@ mod tests {
             "错误要说是查名这一步失败：{err}"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 }

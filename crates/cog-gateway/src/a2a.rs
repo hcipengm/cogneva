@@ -27,17 +27,17 @@ use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::Extension;
 use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
+use axum::Extension;
 use axum::Json;
 use futures::stream::Stream;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use cog_core::{Claims, 
-    A2aTask, A2aTaskStatus, A2aVersion, MessagePart, OrchestratorControl, Task, TaskArtifact,
-    TaskMessage, TaskStatus,
+use cog_core::{
+    A2aTask, A2aTaskStatus, A2aVersion, Claims, MessagePart, OrchestratorControl, Task,
+    TaskArtifact, TaskMessage, TaskStatus,
 };
 
 use crate::GatewayState;
@@ -828,8 +828,10 @@ fn a2a_task_with_history(task: &Task, wanted: usize) -> A2aTask {
 /// 一页默认几条、最多几条。两数出自规范对 `page_size` 的说明：不写就按 50，
 /// 值域 1..=100。
 // cap: fixed — 出自 A2A 规范对 page_size 的说明：不写按 50，值域 1..=100
+// not-a-bound: 出自 A2A 规范对 page_size 的说明：不写按 50，值域 1..=100
 const LIST_PAGE_DEFAULT: usize = cog_core::config::A2A_LIST_PAGE_SIZE as usize;
-// cap: bound — the A2A specification's page_size ceiling
+// cap: fixed — the A2A specification's page_size ceiling
+// keep: 删掉后回到「the A2A specification's page_size ceiling」所描述的情形；由这条约定兜住
 const LIST_PAGE_MAX: usize = 100;
 
 /// `ListTasks` 的过滤与分页条件（解析之后的样子）。
@@ -1117,8 +1119,10 @@ async fn message_stream_for(
     } else {
         let mut goal_row = Task::goal_row(goal_id.clone(), &request.goal);
         goal_row.workspace_id = None;
-        goal_row.input["origin"] =
-            a2a_origin(caller.as_ref().map(|Extension(claims)| claims), request.message_id.as_deref());
+        goal_row.input["origin"] = a2a_origin(
+            caller.as_ref().map(|Extension(claims)| claims),
+            request.message_id.as_deref(),
+        );
         let intent = cog_core::IntentRow::new(
             "a2a",
             cog_core::intent_identity("a2a", &goal_id),
@@ -1396,10 +1400,7 @@ fn accepted(goal_id: &str, submitted: cog_core::SFResult<Vec<String>>) -> Result
 /// 字段说明里讲清；不拿 `messageId` 冒充「说给谁」。
 pub fn a2a_origin(caller: Option<&Claims>, message_id: Option<&str>) -> serde_json::Value {
     let (said_by, said_by_name) = match caller {
-        Some(claims) => (
-            claims.sub.clone(),
-            Some(claims.preferred_username.clone()),
-        ),
+        Some(claims) => (claims.sub.clone(), Some(claims.preferred_username.clone())),
         // 没有令牌：这条连接没有身份。空串是「没有身份的那条连接」，不是「匿名用户」。
         None => (String::new(), None),
     };
@@ -1451,8 +1452,10 @@ async fn rpc_message_send(
 
     let mut goal_row = Task::goal_row(goal_id.clone(), &request.goal);
     goal_row.workspace_id = None;
-    goal_row.input["origin"] =
-        a2a_origin(caller.as_ref().map(|Extension(claims)| claims), request.message_id.as_deref());
+    goal_row.input["origin"] = a2a_origin(
+        caller.as_ref().map(|Extension(claims)| claims),
+        request.message_id.as_deref(),
+    );
     let intent = cog_core::IntentRow::new(
         "a2a",
         cog_core::intent_identity("a2a", &goal_id),
@@ -1521,7 +1524,6 @@ async fn send_result(
     )
         .into_response()
 }
-
 
 /// 这一次 `SendMessage` 要不要阻塞到任务结束。
 ///
@@ -2653,7 +2655,9 @@ mod tests {
         assert_eq!(error["jsonrpc"], json!("2.0"));
         assert_eq!(error["id"], json!("ask-1"));
         assert_eq!(error["error"]["code"], json!(-32603));
-        let message = error["error"]["message"].as_str().unwrap_or_default();
+        let message = error["error"]["message"]
+            .as_str()
+            .unwrap_or(Default::default());
         assert!(message.contains("could not be read"), "{message}");
         assert!(message.contains("store unavailable"), "{message}");
     }

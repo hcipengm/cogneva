@@ -42,9 +42,15 @@ fn enclosing_body(text: &str, delete_at: usize) -> Option<&str> {
 
 /// 一个函数体是否做完了「写副本 → 读回来 → 逐字节比」这三步。
 fn archives_and_verifies(body: &str) -> bool {
-    body.contains(".put(")
+    // 两种载体，同一条形状：写副本、读回来、逐字节比。
+    // - 对象存储：`put` 写、`get` 读回；
+    // - 表内归档：`INSERT INTO ..._archive` 写、`SELECT body FROM ..._archive` 读回。
+    let object_store = body.contains(".put(")
         && body.contains(".get(")
-        && (body.contains("!= bytes") || body.contains("!= &bytes"))
+        && (body.contains("!= bytes") || body.contains("!= &bytes"));
+    let table_archive =
+        body.contains("_archive") && body.contains("SELECT body FROM") && body.contains("!= body");
+    object_store || table_archive
 }
 
 #[test]
@@ -55,10 +61,14 @@ fn every_fact_delete_sits_beside_the_archive_that_verifies_it() {
         .expect("crates/cogneva is two levels under the workspace root")
         .to_path_buf();
     let src = crate_dir.join("crates/cog-storage/src");
+    let memory_src = crate_dir.join("crates/cog-memory/src");
 
     let mut offenders = Vec::new();
-    for file in rust_files_under(&src) {
-        let text = std::fs::read_to_string(&file).unwrap_or_default();
+    for file in rust_files_under(&src)
+        .into_iter()
+        .chain(rust_files_under(&memory_src))
+    {
+        let text = std::fs::read_to_string(&file).unwrap_or(Default::default());
         // `#[cfg(test)]` 之后的部分不算：那里的 DELETE 是夹具，删的是它自己刚写的行。
         // 产出与夹具的切法只有一份（`common::rust_production`）：在第一个
         // `#[cfg(test)]` 上切，会在文件中间带着 test-only 项时把后面的产出整段丢掉。

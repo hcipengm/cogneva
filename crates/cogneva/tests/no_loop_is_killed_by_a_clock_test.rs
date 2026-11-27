@@ -36,7 +36,7 @@ fn every_kill_is_a_destruction_and_none_of_them_judges_stalling() {
         if rel.contains("/tests/") || rel.ends_with("_test.rs") {
             continue;
         }
-        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        let text = std::fs::read_to_string(&file).unwrap_or(Default::default());
         // 产出与夹具的切法只有一份（`common::rust_production`）：在第一个
         // `#[cfg(test)]` 上切，会在文件中间带着 test-only 项时把后面的产出整段丢掉。
         let production = crate::common::rust_production::production_text(&text);

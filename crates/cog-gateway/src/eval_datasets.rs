@@ -117,7 +117,7 @@ mod tests {
         let empty = list_datasets(&scratch).expect("the directory can be looked at");
         assert!(empty.present, "目录在、只是没有文件，present 必须为真");
         assert!(empty.datasets.is_empty());
-        std::fs::remove_dir_all(&scratch).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&scratch));
     }
 
     #[test]
@@ -142,7 +142,7 @@ mod tests {
             listed.datasets[1].case_count, None,
             "yaml 不数行：这里是「没数」，不是「0 个用例」"
         );
-        std::fs::remove_dir_all(&scratch).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&scratch));
     }
 
     /// 读不出内容的 jsonl 也不许报成 0 个用例：那与一个空文件在屏上同形。
@@ -177,7 +177,7 @@ mod tests {
             "读得出来、里面没有行，这才是量到的 0"
         );
 
-        std::fs::remove_dir_all(&scratch).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&scratch));
     }
 
     /// 目录「看不到」与「不在」必须答得不一样：前者一个数据集都没列出来，
@@ -199,6 +199,6 @@ mod tests {
             "错误要点名看的是哪个路径，got: {err}"
         );
 
-        std::fs::remove_dir_all(&scratch).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&scratch));
     }
 }

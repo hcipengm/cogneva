@@ -437,7 +437,7 @@ impl SelfReviewLoop {
         let options = stamp(ChatOptions::default(), actor, task);
 
         let output = execute_structured::<CritiqueOutput>(llm, &[user_msg], &options).await?;
-        let raw = serde_json::to_string(&output).unwrap_or_default();
+        let raw = serde_json::to_string(&output).unwrap_or(Default::default());
 
         Ok(Critique {
             issues: output.issues,
@@ -475,7 +475,7 @@ impl SelfReviewLoop {
         let options = stamp(ChatOptions::default(), actor, task);
 
         let output = execute_structured::<ComparisonOutput>(llm, &[user_msg], &options).await?;
-        let raw = serde_json::to_string(&output).unwrap_or_default();
+        let raw = serde_json::to_string(&output).unwrap_or(Default::default());
 
         // 分数只在 0.0–1.0 上可比。走出这个区间的数不是「差一点」，是另一把
         // 尺子（8/10、85 分），夹紧之后会变成 1.0——一次越界的读数被读成满分

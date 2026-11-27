@@ -62,6 +62,15 @@ impl MemoryCandidateStore {
         Self::default()
     }
 
+    /// 记下来的候选，按 `created_at` 新的在前（测试读回用）。
+    pub fn recorded(&self) -> Vec<ChangeCandidate> {
+        let entries = self
+            .entries
+            .lock()
+            .expect("the candidate store was poisoned");
+        Self::sorted(entries.values().filter_map(|entry| entry.candidate.clone()))
+    }
+
     /// 一条候选被记下的时间（用于「最新的在前」）。库端按 `created_at` 排，这里同一条规则。
     fn sorted(rows: impl Iterator<Item = ChangeCandidate>) -> Vec<ChangeCandidate> {
         let mut rows: Vec<ChangeCandidate> = rows.collect();
@@ -158,6 +167,7 @@ mod tests {
 
     fn candidate(id: &str, minute: u32) -> ChangeCandidate {
         ChangeCandidate {
+            unit_of_work: None,
             artifact_id: id.to_string(),
             kind: "code_change".to_string(),
             description: format!("why {id}"),

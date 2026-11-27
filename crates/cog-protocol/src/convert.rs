@@ -15,14 +15,15 @@ use super::wal as wal_proto;
 /// The level zstd itself calls its default. Picked so compression costs little
 /// enough to sit on the write path: the codec is buying bytes cheaply, not
 /// trading the writer's time for the smallest possible frame.
-// cap: bound — zstd 自己叫默认的那个级别，定义值
+// cap: fixed — zstd 自己叫默认的那个级别，定义值：它是这个库的约定，改了就不是同一个编解码器
+// not-a-bound: zstd 自己叫默认的那个级别，定义值：它是这个库的约定，改了就不是同一个编解码器
 pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
 // ─── RawRecord ↔ raw::RawRecord conversions ───
 
 impl From<&RawRecord> for raw::RawRecord {
     fn from(rec: &RawRecord) -> Self {
-        let payload_json = serde_json::to_vec(&rec.payload).unwrap_or_default();
+        let payload_json = serde_json::to_vec(&rec.payload).unwrap_or(Default::default());
         raw::RawRecord {
             meta: Some(raw::RawMeta {
                 version: rec.meta.version.clone(),
@@ -52,7 +53,7 @@ impl TryFrom<raw::RawRecord> for RawRecord {
         let meta = p
             .meta
             .ok_or_else(|| SFError::Agent("proto RawRecord missing meta".into()))?;
-        let context = p.context.unwrap_or_default();
+        let context = p.context.unwrap_or(Default::default());
 
         let recorded_at = chrono::Utc.timestamp_nanos(meta.recorded_at_unix_nanos);
 

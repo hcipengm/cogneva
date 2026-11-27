@@ -1,3 +1,5 @@
+// census-keep: shapes=clocks — 界面上的提示计时（复制成功、提示消失之类）：只影响提示停留多久，不参与任何决定；删掉只是提示不自动消失或一直不消失
+// census-keep: shapes=spaces — 界面取数的默认页大小：与服务端分页契约一致，删掉会一次拉全部行；由服务端的 LIMIT 契约兜住
 import type { ChatRole } from '@/types/events';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '';
@@ -1562,6 +1564,20 @@ export interface TaskRow {
   acceptance?: string[];
   is_executable?: boolean;
   result?: Record<string, unknown> | null;
+  /**
+   * 这一行带着的待办三格。状态按行自己的结局现算：**完成且差距已空**才是
+   * `已落`，其余仍 `未落`，差距不动。没带三格的行没有这一格。
+   */
+  ledger_item?: LedgerItem;
+}
+
+/** 一条待办的五个格子，与台账是同一套词。 */
+export interface LedgerItem {
+  id: string;
+  terminal: string;
+  now: string;
+  gap: string;
+  state: '未落' | '已落';
 }
 
 export interface TaskGraph {
@@ -4866,4 +4882,52 @@ export async function uploadFile(file: File): Promise<UploadedFile> {
   form.append('file', file);
   const res = await api.sendForm<{ code: string; data: UploadedFile }>('/api/v1/files/upload', form);
   return res.data;
+}
+
+// ── 签名钥匙的生命周期 ──
+
+/** 一把钥匙此刻的状态，与 `SecurityKeys::list` 的每一行同形。 */
+export interface SecurityKey {
+  key_id: string;
+  purpose: string;
+  public_key_b64: string;
+  fingerprint: string;
+  /** issued / rotated / revoked */
+  state: string;
+  overlap_until?: string | null;
+  revoked_reason?: string | null;
+}
+
+export async function getSecurityKeys(): Promise<SecurityKey[]> {
+  const body = await api.get<{ keys: SecurityKey[] }>('/api/v1/admin/keys');
+  return body.keys ?? [];
+}
+
+export async function issueSecurityKey(payload: {
+  key_id: string;
+  purpose: string;
+  public_key: string;
+  fingerprint: string;
+  actor: string;
+}): Promise<void> {
+  await api.post('/api/v1/admin/keys', payload);
+}
+
+export async function rotateSecurityKey(payload: {
+  key_id: string;
+  previous_key_id: string;
+  public_key: string;
+  fingerprint: string;
+  overlap_until?: string;
+  actor: string;
+}): Promise<void> {
+  await api.post('/api/v1/admin/keys/rotate', payload);
+}
+
+export async function revokeSecurityKey(payload: {
+  key_id: string;
+  reason: string;
+  actor: string;
+}): Promise<void> {
+  await api.post('/api/v1/admin/keys/revoke', payload);
 }

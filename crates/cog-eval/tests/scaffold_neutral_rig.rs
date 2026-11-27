@@ -115,7 +115,7 @@ fn the_check_would_catch_a_rigged_rig() {
 #[test]
 fn a_table_that_cannot_grow_is_refused_not_silently_shorter() {
     let base = std::env::temp_dir().join(format!("cog-eval-scaffolds-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&base));
 
     let with_a_shell = base.join("with");
     std::fs::create_dir_all(with_a_shell.join("src/scaffolds")).unwrap();
@@ -143,5 +143,5 @@ fn a_table_that_cannot_grow_is_refused_not_silently_shorter() {
         "外壳目录读不出来时判据仍然出了一张表——它没读到任何外壳，却宣布合规"
     );
 
-    let _ = std::fs::remove_dir_all(&base);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&base));
 }

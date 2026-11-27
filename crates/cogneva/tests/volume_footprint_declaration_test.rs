@@ -241,7 +241,7 @@ fn claim_templates(value: &serde_yaml::Value) -> (Vec<String>, u32) {
                 .filter_map(|t| t.get("metadata")?.get("name")?.as_str().map(str::to_string))
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let replicas = spec
         .and_then(|s| s.get("replicas"))
         .and_then(|r| r.as_u64())
@@ -675,7 +675,11 @@ fn every_api_measured_claim_is_a_volume_that_delivery_declares_mounts_and_walks(
                  container in this delivery mounts it: the declaration outlived the volume it \
                  names"
             );
-            let walkers = facts.walked.get(claim).cloned().unwrap_or_default();
+            let walkers = facts
+                .walked
+                .get(claim)
+                .cloned()
+                .unwrap_or(Default::default());
             assert_eq!(
                 walkers.len(),
                 1,

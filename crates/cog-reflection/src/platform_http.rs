@@ -12,7 +12,8 @@ use std::time::Duration;
 ///
 /// 同机群内本该是毫秒级；30s 留给「apiserver 正在滚动重启」这种短暂不可达，
 /// 再久就说明不是等一会能好的问题。
-// cap: bound — 同机群内本该是毫秒级；30s 留给 apiserver 滚动重启这类短暂不可达
+// cap: fixed — 同机群内本该是毫秒级；30s 留给 apiserver 滚动重启这类短暂不可达
+// keep: 删掉后 apiserver 滚动重启时连接一直重试，调用卡在 SYN 里；由「同机群本该毫秒级、30s 留给短暂不可达」兜住
 // wall: 等=一次到集群内 HTTP 端口的连接建立 / 等不到=这一次读失败，调用方拿到错误，没有半份清单被当成读到了 / 续跑=能，下一次调用重新连
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -21,6 +22,7 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// 判据是字节：一个还在吐字节的响应哪怕比一整块都大也仍在动，而「连着、但一个
 /// 字节也不再进来」正是死掉的那副样子。总时长的界会把一份慢却正常的响应砍在中间，
 /// 读出来的是一份残缺的清单——那看起来像「这个仓库没有那个镜像」，而不是「没读完」。
-// cap: bound — 60 秒没有任何新字节即判停；判据是字节，不是总时长
+// cap: fixed — 60 秒没有任何新字节即判停；判据是字节，不是总时长
+// keep: 删掉后一条不再来字节的连接一直占着，判停永远不亮；由「60 秒没有新字节即判停」兜住
 // wall: 等=响应里的下一个字节 / 等不到=这一次读以错误结束，已经读到的字节不会被当成完整清单 / 续跑=能，重来是重新读一遍整份
 pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(60);

@@ -36,6 +36,9 @@ fn make_task(id: &str, task_type: TaskType, blocked_by: Vec<String>, workspace: 
         task_type,
         status: TaskStatus::Pending,
         input: serde_json::json!({}),
+        terminal: String::new(),
+        now: String::new(),
+        gap: String::new(),
         result: None,
         error: None,
         error_cause: None,
@@ -422,7 +425,7 @@ async fn test_pending_result_is_reclaimed_and_applied() {
     let consumer = rt.clone();
     let consumer_shutdown = shutdown.clone();
     let consumer_handle = tokio::spawn(async move {
-        let _ = consumer.run_consumer(consumer_shutdown).await;
+        cog_core::ignore_lost!(consumer.run_consumer(consumer_shutdown).await);
     });
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -438,7 +441,7 @@ async fn test_pending_result_is_reclaimed_and_applied() {
     }
 
     shutdown.trigger();
-    let _ = tokio::time::timeout(Duration::from_secs(5), consumer_handle).await;
+    cog_core::ignore_lost!(tokio::time::timeout(Duration::from_secs(5), consumer_handle).await);
 
     assert_eq!(
         status,

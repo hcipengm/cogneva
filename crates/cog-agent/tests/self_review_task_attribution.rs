@@ -256,7 +256,7 @@ async fn an_agent_carries_the_direction_it_was_given_into_its_review() {
     let payloads = seen.lock().unwrap().clone();
     let payload = payloads.last().expect("the agent asked something");
     let request: serde_json::Value = serde_json::from_str(payload).expect("请求是 JSON");
-    let rubric = request["rubric"].as_str().unwrap_or_default();
+    let rubric = request["rubric"].as_str().unwrap_or(Default::default());
     assert!(
         rubric.contains(DIRECTION),
         "运行时带着方向，判活时却没到请求上：这一层把它丢了\n{rubric}"

@@ -81,6 +81,7 @@ async fn a_reset_keeps_the_inbox_consumer_reading() {
         goal: serde_json::json!({"work": "before the reset"}),
         reply_stream: None,
         from_agent: None,
+        intent: None,
     })
     .expect("the inbox wire form");
 

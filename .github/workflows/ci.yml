@@ -10,6 +10,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  census:
+    # 界与有损：只判这一段提交新增的行。判据在 scripts/ 的两个脚本里，
+    # 这里只调用；钩子管本机最早反馈，这一格管「没接钩子或 --no-verify」的漏网。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: bounds and loss census on this range
+        run: |
+          base="origin/${{ github.base_ref || 'main' }}"
+          python3 scripts/bounds-census.py --root . --check-since "$base"
+          python3 scripts/loss-census.py --root . --check-since "$base"
   check:
     name: Check
     runs-on: ubuntu-latest

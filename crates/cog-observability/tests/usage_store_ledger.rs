@@ -55,6 +55,8 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
                   estimated: Option<u64>,
                   task: Option<&str>,
                   refusal_kind: Option<&str>| LlmUsageRecord {
+        finish_reason: None,
+        ttft_ms: None,
         refused_scope: None,
         upstream: "ledger-test-upstream".to_string(),
         api_style: "openai".to_string(),
@@ -68,6 +70,8 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         tokens_cache_created: None,
         tokens_reasoning: None,
         estimated_input: estimated,
+        prompt_manifest: None,
+        prompt_dropped: None,
         cost_micros: None,
         price_book: None,
         refusal_kind: refusal_kind.map(str::to_string),

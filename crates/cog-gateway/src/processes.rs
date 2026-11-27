@@ -314,7 +314,7 @@ pub async fn process_overview_handler(
                 })
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     crews.sort_by(|a, b| a.crew_id.cmp(&b.crew_id));
 
     let dlq_len = dlq_len_from_reading(state.orchestrator.dlq_len().await)?;

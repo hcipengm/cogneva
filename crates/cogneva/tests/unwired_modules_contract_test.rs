@@ -250,7 +250,7 @@ fn child_dir(file: &Path, is_crate_root: bool) -> PathBuf {
     let stem = file
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     if stem == "mod" {
         parent
     } else {

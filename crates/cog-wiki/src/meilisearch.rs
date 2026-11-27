@@ -404,7 +404,7 @@ mod tests {
                     body.len(),
                     body
                 );
-                let _ = socket.write_all(response.as_bytes()).await;
+                cog_core::ignore_lost!(socket.write_all(response.as_bytes()).await);
             }
         });
         (format!("http://{}", addr), asked)

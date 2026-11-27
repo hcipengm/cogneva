@@ -682,7 +682,7 @@ fn the_project_views_the_page_offers_are_the_ones_the_export_branch_reads() {
             if p.is_dir() {
                 stack.push(p);
             } else if p.extension().is_some_and(|e| e == "ts" || e == "tsx") {
-                let text = std::fs::read_to_string(&p).unwrap_or_default();
+                let text = std::fs::read_to_string(&p).unwrap_or(Default::default());
                 if text.contains("'wbs' | 'board' | 'gantt' | 'evm'") {
                     copies.push(p.display().to_string());
                 }

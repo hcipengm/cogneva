@@ -53,7 +53,8 @@ pub const VOTE_INPUT_KEY: &str = "vote";
 /// signed, short enough that a signature nobody applied is visible inside the
 /// same working session. A signed handover that is never applied is the shape
 /// a change of responsibility takes when the change was only on paper.
-// cap: bound — 仍是同一个工作时段：一份签了却从未执行的交接，正是「责任变了但只在纸上」的形状
+// cap: fixed — 仍是同一个工作时段：一份签了却从未执行的交接，正是「责任变了但只在纸上」的形状
+// keep: 删掉后签了却从未执行的交接永远不报，责任只在纸上被藏起来；由「同一个工作时段」兜住
 pub const SIGNED_UNAPPLIED_LIMIT_SECS: i64 = 900;
 
 /// One signature on a handover.
@@ -687,7 +688,7 @@ pub async fn append_decision_event(
     let prev_hash = events
         .last()
         .map(|event| event.spec.hash.clone())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let task = decision_event_task(decision_id, seq, kind, actor_unit, detail, &prev_hash, now);
     store.save_governance_node(&task).await?;
     Ok(task)
@@ -735,7 +736,7 @@ pub async fn close_decision_with_event(
     let prev_hash = events
         .last()
         .map(|event| event.spec.hash.clone())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let event = decision_event_task(decision_id, seq, "closed", None, detail, &prev_hash, now);
     if store
         .save_governance_node_with_event(&event, row, expected)

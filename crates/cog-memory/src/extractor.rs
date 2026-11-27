@@ -56,16 +56,20 @@ pub struct RuleBasedExtractor;
 /// `importance`. See [`RuleBasedExtractor`] for why the numbers are a prior.
 mod rating {
     /// An entity is named and nothing more is said about it.
-    // cap: bound — 是这种条目的等级编码，不是容量：实体只是被命名，关于它什么都没说
+    // cap: fixed — 是这种条目的等级编码，不是容量：实体只是被命名，关于它什么都没说
+    // keep: 删掉后实体换一个等级编码，关于它「只是被命名」的读法变了；由「等级编码不是容量」兜住
     pub const ENTITY: u8 = 6;
     /// A relation carries the two ends it connects, so it says slightly more.
-    // cap: bound — 同上：关系带着它连的两端，所以比实体多说一点
+    // cap: fixed — 同上：关系带着它连的两端，所以比实体多说一点
+    // keep: 删掉后关系与实体的等级混在一起，读者分不出谁多说了一点；由「关系带着它连的两端」兜住
     pub const RELATION: u8 = 7;
     /// An event is a thing that happened, at a point in time.
-    // cap: bound — 同上：事件是某个时刻发生过的事
+    // cap: fixed — 同上：事件是某个时刻发生过的事
+    // keep: 删掉后事件换一格，读者把某个时刻发生过的事读成另一种条目；由「事件是某个时刻发生过的事」兜住
     pub const EVENT: u8 = 8;
     /// A preview is a slice of the payload, not a claim about the payload.
-    // cap: bound — 同上：摘要是载荷的一段切片，不是关于载荷的判断
+    // cap: fixed — 同上：摘要是载荷的一段切片，不是关于载荷的判断
+    // keep: 删掉后摘要与判断混为一格，读者把载荷的切片读成关于载荷的判断；由「摘要是载荷的一段切片」兜住
     pub const SUMMARY: u8 = 5;
 }
 
@@ -349,7 +353,8 @@ impl CombinedExtraction {
 /// its own event timestamp and therefore its own raw id. A small window covers
 /// that, and the cap is on the number of answers (not on their inputs, which
 /// are not retained) simply so a long-lived process cannot accumulate them.
-// cap: bound — 实测同一条提示词重复到达最多 6 份、相邻间隔中位数 16–56 秒（最长 627 秒）；按当天 1792 个不同提示词（约 75/小时）算，128 条覆盖一个半小时，远宽于该窗口，再宽只会让早没人问的那一段也命中
+// cap: fixed — 实测同一条提示词重复到达最多 6 份、相邻间隔中位数 16–56 秒（最长 627 秒）；按当天 1792 个不同提示词（约 75/小时）算，128 条覆盖一个半小时，远宽于该窗口，再宽只会让早没人问的那一段也命中
+// keep: 删掉后这份 memo 无界，早没人问的那一段也占着内存并命中；由「128 条覆盖一个半小时」兜住
 const EXTRACTION_MEMO_CAPACITY: usize = 128;
 
 /// Answers already obtained for byte-identical prompts.
@@ -384,21 +389,9 @@ impl ExtractionMemo {
 
 /// How long one extraction declares it will take once an employee picks it up.
 ///
-/// A general employee answers through its own loop rather than one bounded
-/// completion, so the declaration sits on the task row, not on a call. Nothing
-/// ends the row at this number -- the holder's lease and the measured
-/// inter-step window decide when it stopped -- so it is sized above one model
-/// round because the loop may read a tool before it answers.
-// cap: bound — one turn of the employee's loop is a model round plus whatever tool it chooses to read; the declaration has to fit both, even though nothing ends the row at it.
-const EXTRACT_TASK_DECLARED_SECS: u64 = 180;
-
-/// How long the ingest pass waits for that answer before giving up on this
-/// transcript. It sits just under the row's declared duration, so "the pass
-/// stopped waiting" and "the row declared more than the pass will wait" are two
-/// different statements rather than the same one made twice.
-// cap: bound — ten seconds under the row's declared duration (180): the waiter has to give up first, otherwise "we stopped waiting" and "the declaration outlasted the pass" arrive together and the two readings cannot be told apart.
-// wall: 等=抽取任务交出结论 / 等不到=等待的一方先开口说出自己不再等，而任务本身不被杀掉——任务由它自己的租约回收 / 续跑=能，下一拍接着等同一个任务
-const EXTRACT_WAIT_TIMEOUT_SECS: u64 = 170;
+// 这一件活不声明工期，等待也不设上界：寿命由任务自己的租约与实测步间隔管，
+// 等的人一直等到它到终态或者看见它被回收。曾经这里有 180（声明）与 170（等待），
+// 后者是前者减十秒——两个数互为理由，谁也没有量过一次抽取要多久。
 
 /// One work item in, one answer out.
 ///
@@ -419,11 +412,64 @@ pub trait WorkItemRunner: Send + Sync {
 /// turns the repeat into a read, and no second model call is paid for it.
 pub struct OrchestratorWorkItems {
     orchestrator: Arc<dyn cog_core::OrchestratorControl>,
+    /// 抽取这一步的耗时记在哪：与记忆后端同一个直方图
+    /// `memory_operation_latency_ms{operation}`，只是标签取 `extract`。批大小与
+    /// 并发要由它的 p95 导出，所以它必须真的被写下来。
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
 }
 
 impl OrchestratorWorkItems {
     pub fn new(orchestrator: Arc<dyn cog_core::OrchestratorControl>) -> Self {
-        Self { orchestrator }
+        Self {
+            orchestrator,
+            metrics: None,
+        }
+    }
+
+    pub fn with_metrics(mut self, metrics: Arc<dyn cog_core::MetricsBackend>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+}
+
+impl OrchestratorWorkItems {
+    /// 把这一次抽取的耗时写进与记忆后端同一个直方图（`operation="extract"`）。
+    ///
+    /// 写不进去不影响抽取本身：读数缺一格与把答案改坏是两件事，前者的代价是
+    /// 批大小与并发暂时还只能用手按的数。
+    async fn record_latency(&self, started: std::time::Instant, is_err: bool) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(
+            crate::observable::HOLDER_LABEL.to_string(),
+            "extract".to_string(),
+        );
+        let _ = metrics
+            .record_counter(
+                cog_core::metric_names::MEMORY_OPERATIONS_TOTAL,
+                1.0,
+                labels.clone(),
+            )
+            .await;
+        let _ = metrics
+            .record_histogram(
+                cog_core::metric_names::MEMORY_OPERATION_LATENCY_MS,
+                latency_ms,
+                labels.clone(),
+            )
+            .await;
+        if is_err {
+            let _ = metrics
+                .record_counter(
+                    cog_core::metric_names::MEMORY_OPERATION_ERRORS_TOTAL,
+                    1.0,
+                    labels,
+                )
+                .await;
+        }
     }
 }
 
@@ -438,13 +484,16 @@ impl std::fmt::Debug for OrchestratorWorkItems {
 impl WorkItemRunner for OrchestratorWorkItems {
     async fn answer(&self, task: Task) -> SFResult<serde_json::Value> {
         let goal = format!("Judge what is worth remembering in {}", task.id);
-        cog_core::contract::work_item::run_work_item(
+        let started = std::time::Instant::now();
+        let outcome = cog_core::contract::work_item::run_work_item(
             self.orchestrator.as_ref(),
             &goal,
             task,
-            std::time::Duration::from_secs(EXTRACT_WAIT_TIMEOUT_SECS),
+            None,
         )
-        .await
+        .await;
+        self.record_latency(started, outcome.is_err()).await;
+        outcome
     }
 }
 
@@ -458,12 +507,14 @@ impl WorkItemRunner for OrchestratorWorkItems {
 /// published one" is answered once and honestly instead of as an empty graph.
 pub struct LateOrchestratorWorkItems {
     orchestrator: cog_core::LateService<dyn cog_core::OrchestratorControl>,
+    metrics: cog_core::LateService<dyn cog_core::MetricsBackend>,
 }
 
 impl LateOrchestratorWorkItems {
     pub fn new(ctx: cog_core::PluginContext) -> Self {
         Self {
-            orchestrator: cog_core::LateService::new(ctx),
+            orchestrator: cog_core::LateService::new(ctx.clone()),
+            metrics: cog_core::LateService::new(ctx),
         }
     }
 }
@@ -485,7 +536,12 @@ impl WorkItemRunner for LateOrchestratorWorkItems {
                     .into(),
             )
         })?;
-        OrchestratorWorkItems::new(orchestrator).answer(task).await
+        let metrics = self.metrics.get();
+        let runner = match metrics {
+            Some(metrics) => OrchestratorWorkItems::new(orchestrator).with_metrics(metrics),
+            None => OrchestratorWorkItems::new(orchestrator),
+        };
+        runner.answer(task).await
     }
 }
 
@@ -583,7 +639,6 @@ impl AgentMemoryExtractor {
             confidence: None,
             timestamp: Some(chrono::Utc::now()),
         });
-        task.declared_duration_seconds = EXTRACT_TASK_DECLARED_SECS;
         // 这件活落在 memory 这个场地上。场地是活上的标签，不是接活那个人的
         // 身份：同一个员工明天接 wiki 的活，仍是同一个人。
         task.venue = Some("memory".into());
@@ -1001,6 +1056,40 @@ impl MemoryExtractor for AgentMemoryExtractor {
         );
         let summary = self.summary_entry(source, summary).await?;
         Ok((entries, summary))
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+    use cog_core::MetricsBackend as _;
+    use std::sync::Arc;
+
+    /// 抽取这一步的耗时写进与记忆后端同一个直方图，标签是 `extract`。
+    ///
+    /// 批大小与并发要由这条读数的 p95 导出；没有这次改动，`record_latency` 不存在，
+    /// `operation="extract"` 的这一格永远缺席——而「缺席」在读数面上与「一次都没跑」
+    /// 同形。
+    #[tokio::test]
+    async fn an_extraction_is_timed_into_the_memory_operation_histogram() {
+        let metrics = Arc::new(cog_test_support::MemoryMetricsBackend::new());
+        let runner = OrchestratorWorkItems::new(Arc::new(cog_test_support::TaskGraphStub::empty()))
+            .with_metrics(metrics.clone());
+        let before = chrono::Utc::now() - chrono::Duration::seconds(1);
+        runner
+            .record_latency(std::time::Instant::now(), false)
+            .await;
+        let after = chrono::Utc::now() + chrono::Duration::seconds(1);
+        let samples = metrics
+            .query_histogram_range("memory_operation_latency_ms", before, after)
+            .await
+            .expect("the histogram answers");
+        assert!(
+            samples
+                .iter()
+                .any(|sample| sample.labels.get("operation").map(String::as_str) == Some("extract")),
+            "没有一条 operation=extract 的耗时样本：{samples:?}"
+        );
     }
 }
 

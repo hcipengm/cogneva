@@ -1,3 +1,4 @@
+// census-keep: shapes=clocks — 界面上的提示计时（复制成功、提示消失之类）：只影响提示停留多久，不参与任何决定；删掉只是提示不自动消失或一直不消失
 /**
  * 访问令牌的寿命算术。三个纯函数，没有 import——所以它能单文件编译、在 node
  * 里按判据跑（`deploy/scripts/check-web-token-refresh.sh` 就是这么验的）。

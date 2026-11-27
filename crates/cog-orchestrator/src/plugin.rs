@@ -9,25 +9,22 @@ use tracing::{info, warn};
 /// 一轮检查点通常在下一拍到来之前就做完了；超过这个点还没有交还控制权，就
 /// 发一条告警（不会切断——见下面的 [`checkpoint_round_budget`]）。余量的取值
 /// 是「一拍要留多久给节拍本身」：小于一个 DB 往返的抖动就会天天误报。
-// cap: bound — 只决定告警点落在哪；不取消任何一轮
+// cap: fixed — 只决定告警点落在哪；不取消任何一轮
+// keep: 删掉后告警点贴着轮次的预期落地，正常的一轮被读成超时；由「只决定告警点落在哪」兜住
 const CHECKPOINT_ROUND_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// 整轮预期工期的下限：节拍再密，也要给一轮留出这么久，否则告警每轮都响。
-///
-/// 10s 是一轮落点在健康集群里的实测耗时上限。
-// cap: bound — 10s 是一轮落点在健康集群里的实测耗时上限；没有这个下限，节拍小于余量的部署每轮都告警
-const MIN_CHECKPOINT_ROUND_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 一轮检查点的预期工期，由它自己的节拍推出。
 ///
-/// 随节拍动而不是写死：部署把间隔调大，这个预期跟着放大；调小到下限以下，
-/// 由下限兜住。过了它只发一条告警并继续等——一轮里可能已经落下若干续跑点，
-/// 切断会把它们作废，而没轮到的任务下一拍还要从头再来。
+/// 随节拍动而不是写死：部署把间隔调大，这个预期跟着放大；节拍小于余量时预算
+/// 是零——那一轮的每一拍都超过了自己的预算，告警每轮都响。那不是在误报：它说的
+/// 是「这个部署的节拍比一轮的固定成本还紧」，修法在节拍那一侧。曾经这里有一个
+/// 10 秒的下限，注释自称「实测耗时上限」——它把这条真实的读数压掉了，而那个数
+/// 没有任何一次测量在更新它。
+///
+/// 过了预算只发一条告警并继续等：一轮里可能已经落下若干续跑点，切断会把它们
+/// 作废，而没轮到的任务下一拍还要从头再来。
 fn checkpoint_round_budget(cadence: std::time::Duration) -> std::time::Duration {
-    std::cmp::max(
-        cadence.saturating_sub(CHECKPOINT_ROUND_MARGIN),
-        MIN_CHECKPOINT_ROUND_BUDGET,
-    )
+    cadence.saturating_sub(CHECKPOINT_ROUND_MARGIN)
 }
 
 pub const DAG_CHECKPOINT_LOOP: &str = "orchestrator_dag_checkpoint";
@@ -48,7 +45,8 @@ pub const TASK_CHECKPOINT_LOOP: &str = "orchestrator_task_checkpoint";
 /// a queue nobody drains stops being an excuse — past it the row is re-armed
 /// and counted apart, so the queue's refusal to move becomes a reading instead
 /// of an indefinite silence.
-// cap: bound — 三个窗口之后，没人排空的队列不再是借口：行被重新上膛并单独计数，队列不动变成一条读数而不是无限沉默
+// cap: fixed — 三个窗口之后，没人排空的队列不再是借口：行被重新上膛并单独计数，队列不动变成一条读数而不是无限沉默
+// keep: 删掉后没人排空的队列一直沉默，行不被重新上膛；由「队列不动变成一条读数」兜住
 pub const BACKLOG_WINDOWS_BEFORE_RECLAIM: u64 = 3;
 
 /// Orchestrator plugin that self-assembles the DAG executor and related services.
@@ -425,15 +423,6 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             } else {
                 warn!("no AgentManager; task-scoped agents are never retired at task end");
             }
-            // 名册：座位背后坐着谁只写在名册行上。判「这一手是不是行上那位」
-            // 要它，所以与池子在同一次装配里挂。没挂的时候座位形认领与结果按
-            // 旧口径判（名字要比得一模一样）——那是这个进程读不到名册，不是
-            // 判据说「那个人不行」。
-            if let Some(roster) = ctx.consume_service::<dyn cog_core::AgentRegistry>() {
-                orch.attach_roster(roster);
-            } else {
-                warn!("no AgentRegistry; a seat's claim is judged by its name alone");
-            }
             // Start archive background loop
             if ctx.config().dag_executor.archive_enabled {
                 orch.start_archive_loop();
@@ -568,7 +557,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                         let dag_shutdown_clone = dag_shutdown.clone();
                         let mut shutdown_rx = broadcast_tx.0.subscribe();
                         tokio::spawn(async move {
-                            let _ = shutdown_rx.recv().await;
+                            cog_core::ignore_lost!(shutdown_rx.recv().await);
                             dag_shutdown_clone.trigger();
                         });
 
@@ -990,7 +979,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                 let ledger_shutdown = ctx
                     .consume::<cog_core::ShutdownSignal>()
                     .map(|s| (*s).clone())
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 crate::change_ledger::spawn_change_ledger_loop(
                     store,
                     ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
@@ -1054,7 +1043,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                 let principle_shutdown = ctx
                     .consume::<cog_core::ShutdownSignal>()
                     .map(|s| (*s).clone())
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 crate::principle_ledger::spawn_principle_ledger_loop(
                     store,
                     ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
@@ -1088,7 +1077,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                 let resource_shutdown = ctx
                     .consume::<cog_core::ShutdownSignal>()
                     .map(|s| (*s).clone())
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 crate::resource_ledger::spawn_resource_ledger_loop(
                     store,
                     ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
@@ -1120,7 +1109,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                 let backup_shutdown = ctx
                     .consume::<cog_core::ShutdownSignal>()
                     .map(|s| (*s).clone())
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 crate::backup_runs::spawn_backup_runs_loop(
                     store,
                     ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
@@ -1147,7 +1136,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                 let face_shutdown = ctx
                     .consume::<cog_core::ShutdownSignal>()
                     .map(|s| (*s).clone())
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 crate::face_drift::spawn_face_drift_loop(
                     store.clone(),
                     agents.clone(),
@@ -1163,7 +1152,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                 let close_shutdown = ctx
                     .consume::<cog_core::ShutdownSignal>()
                     .map(|s| (*s).clone())
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 crate::governance_acts::spawn_decision_close_loop(
                     store,
                     ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
@@ -1192,7 +1181,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                         let shutdown = ctx
                             .consume::<cog_core::ShutdownSignal>()
                             .map(|s| (*s).clone())
-                            .unwrap_or_default();
+                            .unwrap_or(Default::default());
                         crate::sop::spawn_sop_dispatch_loop(
                             planner as Arc<dyn cog_core::ActionPlanner>,
                             skills,
@@ -1251,7 +1240,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                         let shutdown = ctx
                             .consume::<cog_core::ShutdownSignal>()
                             .map(|s| (*s).clone())
-                            .unwrap_or_default();
+                            .unwrap_or(Default::default());
                         crate::outward::spawn_outward_loop(
                             orchestrator,
                             http,
@@ -1262,7 +1251,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                             // 收件台与网关那一侧是同一份：外循环找到的东西也落成
                             // 一行意图，而不是在流程旁边直接下单。没有装配时交
                             // `None`——循环照常把条目交给目标路径。
-                            ctx.consume_service::<dyn cog_core::IntentEvents>(),
+                            ctx.consume_service::<dyn cog_core::EventStore>(),
                         );
                     }
                     (orchestrator, http) => warn!(
@@ -1314,16 +1303,25 @@ mod round_budget_tests {
     use super::*;
     use std::time::Duration;
 
+    /// 预算跟着节拍走，没有第二条下限：节拍短于余量时预算为零。
+    ///
+    /// 零不是「没有界」，是「这一轮的固定成本已经超过了留给它的全部时间」——
+    /// 那一拍该报，报的是节拍太紧，而不是让一个写死的 10 秒把这条读数压掉。
     #[test]
-    fn a_longer_cadence_lengthens_the_round_and_a_short_one_is_floored() {
+    fn the_round_budget_follows_the_cadence_and_has_no_floor() {
         let base = Duration::from_secs(60);
         let doubled = checkpoint_round_budget(base + base);
         assert_eq!(doubled - checkpoint_round_budget(base), base);
+        assert!(checkpoint_round_budget(base) < base);
 
         assert_eq!(
             checkpoint_round_budget(Duration::from_secs(2)),
-            MIN_CHECKPOINT_ROUND_BUDGET
+            Duration::ZERO,
+            "节拍比余量还短时预算必须是零：这个部署的固定成本装不进一拍"
         );
-        assert!(checkpoint_round_budget(base) < base);
+        assert_eq!(
+            checkpoint_round_budget(CHECKPOINT_ROUND_MARGIN),
+            Duration::ZERO
+        );
     }
 }

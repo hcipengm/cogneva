@@ -114,7 +114,7 @@ pub async fn evidence_at(
         ],
     )
     .await
-    .unwrap_or_default();
+    .unwrap_or(Default::default());
 
     let mut revs: Vec<&str> = touching
         .split_whitespace()

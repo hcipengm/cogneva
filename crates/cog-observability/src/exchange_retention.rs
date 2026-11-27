@@ -60,7 +60,8 @@ pub const DEPLOYMENT_LABEL: &str = "deployment";
 /// default for the deployment that does not say otherwise, not a policy — a
 /// deployment with stricter promises about what it holds shortens it, and the
 /// readings move with it because the number is published rather than assumed.
-// cap: bound — 对「存了些什么」许下更紧承诺的部署会缩短它，读数跟着动，因为那个数是发布出去的而不是假定的
+// cap: fixed — 对「存了些什么」许下更紧承诺的部署会缩短它，读数跟着动，因为那个数是发布出去的而不是假定的
+// keep: 删掉后部署许下的更紧承诺没有地方缩短，读数不再跟着那个发布出去的数动；由「承诺是发布出去的」兜住
 pub const DEFAULT_KEEP_DAYS: i64 = 30;
 
 /// The shortest retention this loop will accept.
@@ -69,7 +70,8 @@ pub const DEFAULT_KEEP_DAYS: i64 = 30;
 /// which reads as "the retention works" while the table it exists to bound is
 /// empty by construction — the promise to the reader is what has to survive a
 /// misconfiguration, so the value falls back rather than being honoured.
-// cap: bound — 承诺是许给读的人的，它必须扛过一次配置错误，所以低于它的值回退而不是被采纳
+// cap: fixed — 承诺是许给读的人的，它必须扛过一次配置错误，所以低于它的值回退而不是被采纳
+// keep: 删掉后一次配置错误把保留期配成零，读的人昨天还能看的东西今天就没了；由「承诺要扛过一次配置错误」兜住
 pub const MIN_KEEP_DAYS: i64 = 1;
 
 /// The environment variable that carries the retention.
@@ -81,7 +83,8 @@ pub const KEEP_DAYS_ENV: &str = "COGNEVA_LLM_EXCHANGE_KEEP_DAYS";
 /// read, and Prometheus drops a series it has not seen for five minutes. A
 /// shorter period would spend durable rows to restate a table whose age changes
 /// by days; a longer one would let the published size go stale between scrapes.
-// cap: bound — 更短就为一门年龄以天变的表反复重述花掉持久行，更长就让发布出去的大小在两次抓取之间过期
+// cap: fixed — 更短就为一门年龄以天变的表反复重述花掉持久行，更长就让发布出去的大小在两次抓取之间过期
+// keep: 删掉后要么反复花持久行，要么发布出去的大小在两次抓取之间过期；由「两个坏方向的中间」兜住
 pub const PERIOD: Duration = Duration::from_secs(300);
 
 /// 两次采样之间，这张表每天涨多少行。

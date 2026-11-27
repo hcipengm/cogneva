@@ -23,7 +23,10 @@ async fn main() -> cog_core::SFResult<()> {
     let plan = planner.plan(&task, 1, None, None, None, None).await;
     println!("plan summary: {}", plan.summary);
 
-    let stages = plan.plan["stages"].as_array().cloned().unwrap_or_default();
+    let stages = plan.plan["stages"]
+        .as_array()
+        .cloned()
+        .unwrap_or(Default::default());
     for stage in stages {
         let generator = GeneratorActor::new(MockAgent::json(serde_json::json!({
             "content": {"stage": stage, "rows_out": 1024},

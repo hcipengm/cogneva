@@ -100,6 +100,45 @@ pub fn judge(readings: &AppendReadings) -> Verdict {
     Verdict { triggered, unread }
 }
 
+/// 多久问一次判词。
+///
+/// 判词的第一条输入是「最近五分钟的追加重尾」，也就是 Prometheus `rate()` 默认窗
+/// 口那段样本——比这更勤地问，问的是同一批样本；比这更疏，一次持续的退化会晚一
+/// 个窗口才被提出。
+// cap: fixed — Prometheus 的 rate/lookback 默认窗口是 5 分钟；判词的输入就是这个窗口
+// keep: 删掉后问的节奏与判据读的窗口脱节；由「输入是最近五分钟的样本」兜住
+pub const JUDGE_PERIOD: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// 这次判词要不要落一条「提出」事实。
+///
+/// 判词每五分钟问一次，但**同一件事只提一次**：提出是要人处置的，每拍写一条会把
+/// 流灌满同一句话，而「提出过几次」也不再说得清。判据是「触发的条件集合变了」或
+/// 「量不到的条件集合变了」——两者都是判词内容的一部分：一条以前量不到的条件后来
+/// 量到了，也是新的信息。
+pub fn verdict_changed(last: Option<(&str, &str)>, verdict: &Verdict) -> bool {
+    let names = |items: &[Pressure]| {
+        let mut words: Vec<&str> = items.iter().copied().map(pressure_word).collect();
+        words.sort_unstable();
+        words.join(",")
+    };
+    let (triggered, unread) = (names(&verdict.triggered), names(&verdict.unread));
+    match last {
+        None => true,
+        Some((last_triggered, last_unread)) => last_triggered != triggered || last_unread != unread,
+    }
+}
+
+/// 条件在流上的词。与 `cogneva::storage_pressure` 用的同一组（写进事实的 `triggered`
+/// 与 `unread` 两格），所以读面按逗号切得开。
+pub fn pressure_word(pressure: Pressure) -> &'static str {
+    match pressure {
+        Pressure::AppendLatency => "append_latency",
+        Pressure::StreamLag => "stream_lag",
+        Pressure::Vacuum => "vacuum",
+        Pressure::Growth => "growth",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +202,34 @@ mod tests {
     #[test]
     fn the_size_of_the_table_is_not_one_of_the_triggers() {
         assert_eq!(AppendReadings::default().growth_headroom_days, None);
+    }
+
+    /// 同一句话只提一次；集合变了一点就要再提一次（量不到变读到也算变了）。
+    #[test]
+    fn a_verdict_is_recorded_once_per_change() {
+        let mut slow = quiet();
+        slow.append_p99_ms = Some(19.0);
+        let verdict = judge(&slow);
+        assert!(verdict_changed(None, &verdict), "第一次提出必须落一条");
+        assert!(
+            !verdict_changed(Some(("append_latency", "")), &verdict),
+            "同一句话每五分钟写一次会把流灌满，而「提出过几次」也说不清"
+        );
+        assert!(
+            verdict_changed(Some(("", "")), &verdict),
+            "从「没有触发」变成「触发了追加延迟」是一次真正的变化"
+        );
+        let mut also_blind = slow;
+        also_blind.growth_headroom_days = None;
+        assert!(
+            verdict_changed(Some(("append_latency", "")), &judge(&also_blind)),
+            "量不到的条件多了一条，也是新的信息，要再提一次"
+        );
+    }
+
+    /// 问的节奏与判据读的窗口是同一个数：输入是最近五分钟的样本。
+    #[test]
+    fn the_judge_is_asked_once_per_measurement_window() {
+        assert_eq!(JUDGE_PERIOD, std::time::Duration::from_secs(300));
     }
 }

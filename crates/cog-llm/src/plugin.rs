@@ -47,15 +47,15 @@ impl cog_core::SystemPlugin for LlmPlugin {
             &llm_routing,
             ctx.consume_service::<dyn cog_core::HttpClient>(),
         )?;
-    // 每一发调用也写成事件流上的一行（正本）；进程内计数仍是旁路的读数。
-    // 取不到那一条流不挡这一路：只留计数，装配时告警说清。
-    if let Some(sink) = ctx.consume_service::<dyn cog_core::LlmCallEvents>() {
-        crate::observable::global_observable().attach_call_events(sink);
-    } else {
-        tracing::warn!(
-            "no LlmCallEvents store in this process: calls are counted in memory but leave no event row"
-        );
-    }
+        // 每一发调用也写成事件流上的一行（正本）；进程内计数仍是旁路的读数。
+        // 取不到那一条流不挡这一路：只留计数，装配时告警说清。
+        if let Some(sink) = ctx.consume_service::<dyn cog_core::EventStore>() {
+            crate::observable::global_observable().attach_call_events(sink);
+        } else {
+            tracing::warn!(
+                "no EventStore in this process: calls are counted in memory but leave no event row"
+            );
+        }
         let hot_swap = Arc::new(crate::HotSwappableLlmClient::new(provider));
         ctx.publish(hot_swap.clone());
         info!("LlmPlugin LLM provider published");
@@ -144,29 +144,37 @@ impl ModelCard {
 // 输出, 缓存读, 缓存写] 的每百万 token 价。
 
 // cap: fixed — 提供方公布的模型卡（窗口、输出上限），随公布值更新
+// not-a-bound: 提供方公布的模型卡（窗口、输出上限），随公布值更新
 const OPENAI_LIMITS: [u32; 2] = [128_000, 4096];
 
 // cap: fixed — 提供方公布的每百万 token 价（输入/输出/缓存读/缓存写）
+// not-a-bound: 提供方公布的每百万 token 价（输入/输出/缓存读/缓存写）
 const OPENAI_PRICE: [f64; 4] = [2.5, 10.0, 1.25, 0.0];
 
 // cap: fixed — 提供方公布的模型卡（窗口、输出上限），随公布值更新
+// not-a-bound: 提供方公布的模型卡（窗口、输出上限），随公布值更新
 const ANTHROPIC_LIMITS: [u32; 2] = [200_000, cog_core::config::ANTHROPIC_OUTPUT_TOKEN_DEFAULT];
 
 // cap: fixed — 提供方公布的每百万 token 价（输入/输出/缓存读/缓存写）
+// not-a-bound: 提供方公布的每百万 token 价（输入/输出/缓存读/缓存写）
 const ANTHROPIC_PRICE: [f64; 4] = [3.0, 15.0, 0.0, 0.0];
 
 // cap: fixed — 提供方公布的模型卡（窗口、输出上限），随公布值更新
+// not-a-bound: 提供方公布的模型卡（窗口、输出上限），随公布值更新
 const GOOGLE_LIMITS: [u32; 2] = [1_000_000, 8192];
 
 // cap: fixed — 提供方公布的每百万 token 价（输入/输出/缓存读/缓存写）
+// not-a-bound: 提供方公布的每百万 token 价（输入/输出/缓存读/缓存写）
 const GOOGLE_PRICE: [f64; 4] = [1.25, 10.0, 0.0, 0.0];
 
 // 本地跑的模型不收钱：价格那几格是 0，不是「没写」。
 //
 // cap: fixed — 提供方公布的模型卡（窗口、输出上限），随公布值更新
+// not-a-bound: 提供方公布的模型卡（窗口、输出上限），随公布值更新
 const OLLAMA_LIMITS: [u32; 2] = [128_000, 4096];
 
 // cap: fixed — 提供方公布的每百万 token 价（输入/输出/缓存读/缓存写）
+// not-a-bound: 提供方公布的每百万 token 价（输入/输出/缓存读/缓存写）
 const OLLAMA_PRICE: [f64; 4] = [0.0, 0.0, 0.0, 0.0];
 
 /// 四张卡按提供方取。`default_model_for` 只从这里拿数，卡上写数，函数里不写。

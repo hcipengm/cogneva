@@ -1,3 +1,4 @@
+# census-keep: shapes=deploy-numbers — 部署清单里的数是部署自己的声明：它写在生效的那一处，改它只改这一次部署，不是代码里看不见的默认；由部署面本身兜住
 # 部署 profile：K3s 单节点（元启动在单机 K3s 上的默认形态）。
 #
 # 渲染：bash deploy/scripts/render-deploy.sh

@@ -45,6 +45,15 @@ CREATE TABLE IF NOT EXISTS summary_entries (
     last_retrieved_at TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_summary_entries_ns_raw_uri ON summary_entries(namespace, raw_uri);
+-- 删之前的那一份副本：整行 row_to_json 的文本，按 (id, namespace) 一条。
+-- 事实面只有一种删法——写副本、读回来逐字节比、然后才删；这一张表就是那个副本，
+-- 它自己不删。
+CREATE TABLE IF NOT EXISTS summary_entries_archive (
+    id          TEXT        NOT NULL,
+    namespace   TEXT        NOT NULL,
+    body        TEXT        NOT NULL,
+    archived_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 ALTER TABLE summary_entries ADD COLUMN IF NOT EXISTS retrieval_count BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE summary_entries ADD COLUMN IF NOT EXISTS last_retrieved_at TIMESTAMPTZ;
 -- 已经在库里的那两列搬过来。改成 text 不必丢数据，也不必换列名：
@@ -166,7 +175,7 @@ impl PostgresEntryStore {
             .ok()
             .flatten()
             .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let retrieval_count: i64 = row
             .try_get("retrieval_count")
             .map_err(|e| SFError::Agent(format!("decode retrieval_count: {}", e)))?;
@@ -282,7 +291,8 @@ impl SummaryEntryStore for PostgresEntryStore {
             .sparse_embedding
             .as_ref()
             .and_then(|s| serde_json::to_string(s).ok());
-        let related_json = serde_json::to_string(&entry.related_schema_ids).unwrap_or_default();
+        let related_json =
+            serde_json::to_string(&entry.related_schema_ids).unwrap_or(Default::default());
 
         sqlx::query(
             r#"
@@ -326,12 +336,54 @@ impl SummaryEntryStore for PostgresEntryStore {
     }
 
     async fn delete(&self, namespace: &str, id: &str) -> SFResult<()> {
+        // 删事实只有一种做法：先写一份读得回来的副本、读回来逐字节比，然后才删。
+        // 「删了」与「本来没有」在读数上同形，所以副本是唯一能事后说清的东西。
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SFError::Agent(format!("entry_store delete begin: {e}")))?;
+        let body: Option<String> = sqlx::query_scalar(
+            "SELECT row_to_json(t)::text FROM summary_entries t \
+              WHERE namespace = $1 AND id = $2",
+        )
+        .bind(namespace)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| SFError::Agent(format!("entry_store delete read: {e}")))?;
+        // 没有这一行：没有事实可删，也就不写副本。
+        let Some(body) = body else {
+            return Ok(());
+        };
+        sqlx::query(
+            "INSERT INTO summary_entries_archive (id, namespace, body) VALUES ($1, $2, $3)",
+        )
+        .bind(id)
+        .bind(namespace)
+        .bind(&body)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| SFError::Agent(format!("entry_store archive: {e}")))?;
+        let back: String = sqlx::query_scalar(
+            "SELECT body FROM summary_entries_archive WHERE id = $1 AND namespace = $2 \
+              ORDER BY archived_at DESC, ctid DESC LIMIT 1",
+        )
+        .bind(id)
+        .bind(namespace)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| SFError::Agent(format!("entry_store archive read-back: {e}")))?;
+        crate::deletion::deletion_is_allowed(back == body)?;
         sqlx::query("DELETE FROM summary_entries WHERE namespace = $1 AND id = $2")
             .bind(namespace)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
-            .map_err(|e| SFError::Agent(format!("entry_store delete failed: {}", e)))?;
+            .map_err(|e| SFError::Agent(format!("entry_store delete: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| SFError::Agent(format!("entry_store delete commit: {e}")))?;
         Ok(())
     }
 

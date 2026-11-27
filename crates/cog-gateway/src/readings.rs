@@ -1319,6 +1319,45 @@ pub const DB_TIMEOUT_BOUND_SECONDS: ReadingSpec = ReadingSpec {
     produced_by: "crates/cog-storage/src/db_surface.rs",
 };
 
+/// 空闲事务最老的那一条有多老。
+///
+/// 库会在 `idle_in_transaction_session_timeout` 到点时掐掉它，所以这条年龄就是
+/// 「那条界已经花掉多少」。与 `pg_stat_activity_max_tx_duration` 不同：那个是全部
+/// 在飞事务的最大值，分不清是有一条语句在跑，还是一段事务开了口不再说话——
+/// 后者会一直按住快照，让 vacuum 追不上。该状态此刻没有事务时这一格缺席，不是 0。
+pub const DB_IDLE_TRANSACTION_AGE: ReadingSpec = ReadingSpec {
+    id: "db_idle_transaction_age_seconds",
+    title: "最老的空闲事务年龄",
+    group: ReadingGroup::Infra,
+    query: r#"max(cogneva_db_xact_age_seconds{state="idle in transaction"})"#,
+    unit: "秒",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_db_xact_age_seconds",
+    produced_by: "crates/cog-storage/src/db_surface.rs",
+};
+
+/// 每张表离自己的 autovacuum 触发线有多远：死元组 ÷ 触发线，取最大的一张。
+///
+/// 比值在读到的地方算，不发布成一个数：阈值为 0 的表（触发关掉）会除出无界，
+/// 那正是「已有死行就早已越过」的读法；先除好再发布会把这一情形编成一个比值。
+/// 1.0 不是人拍的线：它就是 autovacuum 自己的触发线，越过即「本该来而没来」。
+pub const DB_VACUUM_LAG_RATIO: ReadingSpec = ReadingSpec {
+    id: "db_vacuum_lag_max_ratio",
+    title: "离 autovacuum 触发线最远的那张表（比值）",
+    group: ReadingGroup::Infra,
+    query: r#"max(cogneva_db_dead_tuples / cogneva_db_vacuum_threshold_tuples)"#,
+    unit: "倍",
+    // 1.0 是库自己的触发线，不是这里挑的：越过它的那一刻就是 vacuum 本该来过而没来。
+    // 再往上没有第二条由库给定的线，所以不给 crit——那会是一个拍出来的数。
+    warn: Some(1.0),
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_db_dead_tuples",
+    produced_by: "crates/cog-storage/src/db_surface.rs",
+};
+
 /// autovacuum 已经追不上的表有多少张。
 ///
 /// 越过触发线的那一刻，就是 vacuum 本该来过而没来的那一刻；死元组是「删了却还占着」
@@ -1395,7 +1434,7 @@ pub const LLM_EXCHANGE_RATE: ReadingSpec = ReadingSpec {
     produced_by: "crates/cog-observability/src/exchange_retention.rs",
 };
 
-pub const READINGS: [&ReadingSpec; 68] = [
+pub const READINGS: [&ReadingSpec; 70] = [
     &DISK_FREE,
     &EVENT_STREAM_VOLUME,
     &EVENT_UNDECODABLE,
@@ -1403,6 +1442,8 @@ pub const READINGS: [&ReadingSpec; 68] = [
     &PG_CONNECTIONS,
     &DB_TIMEOUT_BOUND_SECONDS,
     &DB_VACUUM_BEHIND_TABLES,
+    &DB_IDLE_TRANSACTION_AGE,
+    &DB_VACUUM_LAG_RATIO,
     &PG_OLDEST_TX,
     &QDRANT_VECTORS,
     &INGRESS_5XX,
@@ -1629,7 +1670,8 @@ fn query_client() -> Result<std::sync::Arc<dyn cog_core::HttpClient>, String> {
 
 /// The deadline for one query. A reading that cannot answer in five seconds is
 /// already the answer; a failed query is reported as "no reading", never as 0.
-// cap: bound — 一次查询的等待上限；超时报「没有读数」，绝不报 0
+// cap: fixed — 一次查询的等待上限；超时报「没有读数」，绝不报 0
+// keep: 删掉后一次慢查询把面板拖住，超时也不报「没有读数」；由「超时报没有读数，绝不报 0」兜住
 // wall: 等=一次读数查询返回 / 等不到=这条读数报「没有读数」，**绝不报 0**——0 是一次真实读数，与「没量到」必须分得开 / 续跑=能，下一拍再查
 const QUERY_TIMEOUT_SECS: u64 = 5;
 

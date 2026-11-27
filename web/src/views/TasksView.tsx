@@ -247,6 +247,20 @@ export function TasksView() {
                   {t.blocked_by?.length || '—'}
                 </span>
               ) },
+              // 待办的三格：状态词与差距先在列表里给一眼，终态/现在的全文在悬停
+              // 与详情里。没有三格的行出一道破折号——「这一行不是待办」与「这一条
+              // 没有差距」是两件事，不拿空字符串把两者画成一样。
+              { key: 'ledger', title: '待办', width: '220px', render: (t) =>
+                t.ledger_item ? (
+                  <span
+                    className="mono text-[11px] text-[var(--muted)]"
+                    title={`终态：${t.ledger_item.terminal}\n现在：${t.ledger_item.now}\n差距：${t.ledger_item.gap || '—'}`}
+                  >
+                    {t.ledger_item.state} · {t.ledger_item.gap || '—'}
+                  </span>
+                ) : (
+                  <span className="text-[11px] text-[var(--muted)]">—</span>
+                ) },
               { key: 'error', title: '结局', render: (t) =>
                 t.error ? (
                   <span className="text-[11px] text-[var(--danger)]">
@@ -448,6 +462,16 @@ function TaskDetail({
         </Field>
         <Field label="场地">{task.venue ?? '不属于任何场地'}</Field>
         <Field label="服务面">{task.face_id ?? '不服务任何面'}</Field>
+        {task.ledger_item ? (
+          <>
+            <Field label="终态">{task.ledger_item.terminal}</Field>
+            <Field label="现在">{task.ledger_item.now}</Field>
+            <Field label="差距">
+              {task.ledger_item.gap || '—'}
+              {`（${task.ledger_item.state}）`}
+            </Field>
+          </>
+        ) : null}
         <Field label="判据">
           {task.acceptance && task.acceptance.length > 0 ? (
             <ul className="list-disc pl-4">

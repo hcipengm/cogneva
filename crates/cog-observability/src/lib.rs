@@ -187,6 +187,7 @@ pub enum LogFormat {
 
 /// Prometheus 的约定端口：`/metrics` 被谁抓、抓在哪，是抓取方的约定，不是本仓量的。
 // cap: fixed — Prometheus 抓取约定端口 9090
+// keep: 删掉后抓取端连不到约定端口，指标面全空；由「Prometheus 约定端口 9090」兜住
 const PROMETHEUS_PORT: u16 = 9090;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -260,7 +261,8 @@ pub struct RawStreamConfig {
 
 // 一个热文件默认 256 MB：轮转的开销与「一个文件能被一次搬走」的粒度之间的取舍；
 // 再大，一次冷热迁移搬的字节就压过了轮转省下来的。
-// cap: bound — 默认 256 MB：一次能搬走的粒度，再大迁移的字节压过轮转省下的
+// cap: fixed — 默认 256 MB：一次能搬走的粒度，再大迁移的字节压过轮转省下的
+// keep: 删掉后回到「默认 256 MB：一次能搬走的粒度，再大迁移的字节压过轮转省下的」所描述的情形；由这条约定兜住
 const RAW_STREAM_MAX_HOT_FILE_MB: u64 = 256;
 
 impl Default for RawStreamConfig {
@@ -306,7 +308,8 @@ pub struct ExplainabilityConfig {
 
 // 一万条理由在内存里是几十 MB：足够覆盖最近一段决策，又不至于让这个进程的
 // 常驻内存跟着它涨；再多就该走独立存储，而那个面还没接（见上面的注释）。
-// cap: bound — 一万条几十 MB：覆盖最近一段决策，再多该走独立存储
+// cap: fixed — 一万条几十 MB：覆盖最近一段决策，再多该走独立存储
+// keep: 删掉后回到「一万条几十 MB：覆盖最近一段决策，再多该走独立存储」所描述的情形；由这条约定兜住
 const EXPLAINABILITY_MAX_RECORDS: usize = 10_000;
 
 impl Default for ExplainabilityConfig {

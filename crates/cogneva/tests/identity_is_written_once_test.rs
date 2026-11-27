@@ -84,10 +84,9 @@ fn the_roster_has_exactly_one_write_point() {
         "`cogneva:employees` 的字面量在别处又出现了一次：{literal:?}"
     );
 
-    // 写：整棵树里 HSET 到这张 hash 的脚本只有三段——建行、盖墓碑、把工号写进
-    // 一把**已经存在**的座位行。三段而不是四段的理由是第三段不建行也不发号：
-    // 派工那一刻要让座位记下坐着的是谁，而不是再造一个人。多出来的第四段如果
-    // 也走「读行、没有号就发一个」，重号就有了第二个来源。
+    // 写：整棵树里 HSET 到这张 hash 的脚本只有两段——建行、盖墓碑。座位不建行
+    // （它不是员工，谁坐在上面由任务行回答），所以没有第三条绑人的写命令；
+    // 多出来的第三段如果也走「读行、没有号就发一个」，重号就有了第二个来源。
     let root = repo_root();
     let writer_text =
         std::fs::read_to_string(root.join(ROSTER_WRITER)).expect("registry.rs readable");
@@ -96,8 +95,8 @@ fn the_roster_has_exactly_one_write_point() {
         .filter(|line| line.contains("HSET', KEYS[1]"))
         .count();
     assert_eq!(
-        hset_on_roster, 3,
-        "名册的写命令应当是三段脚本（建行 / 盖墓碑 / 绑人），读到 {hset_on_roster} 段"
+        hset_on_roster, 2,
+        "名册的写命令应当是两段脚本（建行 / 盖墓碑），读到 {hset_on_roster} 段"
     );
 
     // 构造点：每个建起内核循环的生产文件。
@@ -165,8 +164,8 @@ async fn every_registered_employee_has_a_number() {
     let rows = registry.employees().await.expect("roster readable");
     assert_eq!(rows.len(), 2, "登记的两个人各一行");
 
-    // 一把椅子：行照建（派工要往上面写人），工号不发。座位随任务生灭，每接
-    // 一件活注册一次，发号的话名册行数会长到任务数。
+    // 一把椅子：名册上不建行。座位随任务生灭，每接一件活注册一次，进名册的话
+    // 名册行数会长到任务数；谁坐在上面由任务行回答。
     let seat = cog_core::agent_id_for("task-1", cog_core::roles::GENERATOR);
     registry
         .register(&cog_core::AgentRegistration::new(
@@ -180,11 +179,19 @@ async fn every_registered_employee_has_a_number() {
         .await
         .expect("registration lands");
     let rows = registry.employees().await.expect("roster readable");
-    assert_eq!(rows.len(), 3, "三个注册过的地址就是三行");
+    assert_eq!(rows.len(), 2, "名册上只有那两个人；座位不是员工");
     assert_eq!(
         rows.iter().filter(|row| row.number.is_some()).count(),
         2,
-        "有号的行数应当等于人数，不是地址数：座位不该领工号"
+        "有号的行数应当等于人数：座位不该领工号，也不该进名册"
+    );
+    assert!(
+        registry
+            .employee(&seat)
+            .await
+            .expect("roster readable")
+            .is_none(),
+        "座位进了名册"
     );
 
     let mut labels = BTreeSet::new();

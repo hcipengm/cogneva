@@ -36,7 +36,8 @@ fn point_id_for(caller_id: &str) -> String {
 /// Qdrant-backed [`VectorBackend`].
 /// Talks to a Qdrant cluster over gRPC/HTTP.  Collections are created on
 /// demand via [`VectorBackend::create_collection`].
-// cap: bound — 由这个部署自己的建集合耗时导出：实测最慢 12.15 秒（另一次 2.40 秒），
+// cap: fixed — 由这个部署自己的建集合耗时导出：实测最慢 12.15 秒（另一次 2.40 秒），
+// keep: 删掉后建集合的慢请求被当成挂住，部署最慢 12.15 秒的实测不再被容纳；由「实测最慢 12.15 秒」兜住
 // 取 ×5。忙时与构建争 I/O 会到十几秒；这条界跟着那条分布走，不再贴着实测值的边缘设。
 // wall: wait=one qdrant request; on-timeout=the client gives up and the caller retries; resume=yes, collection create is idempotent
 pub const QDRANT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);

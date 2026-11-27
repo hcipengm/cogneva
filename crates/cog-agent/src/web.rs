@@ -35,7 +35,8 @@ use url::Url;
 /// Bytes one page may transfer. Below the point where a single turn is worth
 /// anything, the page cannot be read anyway; above it, an accidental video or
 /// an infinite stream costs the pod's memory before extraction ever runs.
-// cap: bound — 不到这个数页面本来就读不了，过了它就是一段误抓的视频或一条无限流，在抽取开始之前先吃掉 Pod 的内存
+// cap: fixed — 不到这个数页面本来就读不了，过了它就是一段误抓的视频或一条无限流，在抽取开始之前先吃掉 Pod 的内存
+// keep: 删掉后一段误抓的视频或无限流会在抽取之前吃掉 Pod 的内存；由「网页正文的下载上界」兜住
 const MAX_DOWNLOAD_BYTES: usize = 5 * 1024 * 1024;
 
 /// The environment variable that names the SearXNG base URL.
@@ -75,7 +76,8 @@ pub const WEB_FETCH_BASE_ENV: &str = "COGNEVA_WEB_FETCH_BASE";
 
 /// How long one rendered fetch may take. A browser has to start, load, run the
 /// page's scripts and settle; the in-process deadline would cut that short.
-// cap: bound — 浏览器要起来、加载、跑完页面脚本并稳定下来；进程内的那个截止时间会把它切短
+// cap: fixed — 浏览器要起来、加载、跑完页面脚本并稳定下来；进程内的那个截止时间会把它切短
+// keep: 删掉后一次渲染等不到稳定状态就永远挂着；由「浏览器起、加载、跑完脚本并稳定」兜住
 // wall: 等=无头浏览器把这一页渲染稳 / 等不到=这次渲染失败，**没有半份页面被当成读到了**；浏览器进程连同它的临时目录一起收掉 / 续跑=能，重来是一次新的渲染，从打开页面开始
 const RENDER_TIMEOUT_SECS: u64 = 60;
 
@@ -735,10 +737,10 @@ async fn fallback_search(
     })?;
     if !resp.is_success() {
         let body = String::from_utf8_lossy(&resp.body);
+        // 错误路径默认无损：后端的整段答复交给调用方，不在这里切。
         return Err(SFError::Agent(format!(
             "fallback search backend answered {}: {}",
-            resp.status,
-            body.chars().take(300).collect::<String>()
+            resp.status, body
         )));
     }
     let body: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| {
@@ -820,7 +822,7 @@ fn search_answer(
         .get("unresponsive_engines")
         .and_then(|v| v.as_array())
         .cloned()
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let extras: Vec<(String, serde_json::Value)> = ["answers", "suggestions", "infoboxes"]
         .into_iter()
         .filter_map(|key| {
@@ -1374,7 +1376,7 @@ mod tests {
                 .into_iter()
                 .flatten()
             {
-                let text = schema["description"].as_str().unwrap_or_default();
+                let text = schema["description"].as_str().unwrap_or(Default::default());
                 assert!(
                     standalone_numbers(text).is_empty(),
                     "{} 的 {field} 字段又开始自己声明一个数了：不设默认、不设上限: {text}",
@@ -1905,7 +1907,9 @@ mod tests {
             .expect("the second backend found what the first did not");
         assert_eq!(out["count"], 1);
         assert_eq!(out["source"], "fallback");
-        let because = out["fallback_because"].as_str().unwrap_or_default();
+        let because = out["fallback_because"]
+            .as_str()
+            .unwrap_or(Default::default());
         assert!(
             because.contains("matched nothing"),
             "为什么不问自建那层，答案里要说清楚——这里不是沉默，是没匹配上: {out}"
@@ -2033,7 +2037,7 @@ mod tests {
         )
         .await
         .expect("a public page is fetched");
-        let text = out["text"].as_str().unwrap_or_default();
+        let text = out["text"].as_str().unwrap_or(Default::default());
         assert!(text.contains("promise you keep"), "{out}");
         assert!(text.contains("Invalidation is the clock"), "{out}");
         assert!(!text.contains("track()"), "script text is not prose: {out}");

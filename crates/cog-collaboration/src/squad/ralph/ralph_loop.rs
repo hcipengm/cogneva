@@ -133,6 +133,18 @@ pub enum ResetStrategy {
     Escalated,
 }
 
+impl ResetStrategy {
+    /// 读数上的那个词。与枚举名的拼法分开写：改一个变体名做可读性时，
+    /// 已经发布出去的时间序列不该跟着改名。
+    fn as_str(self) -> &'static str {
+        match self {
+            ResetStrategy::Identical => "identical",
+            ResetStrategy::Modified => "modified",
+            ResetStrategy::Escalated => "escalated",
+        }
+    }
+}
+
 /// 失败原因分析结果。
 #[derive(Debug, Clone)]
 pub enum FailureAnalysis {
@@ -151,7 +163,6 @@ pub struct SemanticFailureAnalysis {
     pub root_cause: String,
     /// Recommended reset strategy: Identical, Modified, Escalated
     pub recommended_strategy: String,
-    /// Concrete modifications to apply (e.g. "add error handling for network timeout").
     pub suggested_modifications: String,
 }
 
@@ -167,18 +178,16 @@ pub struct RalphLoopConfig {
 
 // 停滞时最多换三档（同题重试 → 改上下文 → 换执行者）。这是**策略的档数**，
 // 不是轮数：换完这三档仍没买到进展，缺的就是属主手里的那份输入。
-// cap: bound — 三档＝重置策略闭集的词数（Identical / Modified / Escalated）：换一处只能换这三档之一，换完就是问属主
+// cap: fixed — 三档＝重置策略闭集的词数（Identical / Modified / Escalated）：换一处只能换这三档之一，换完就是问属主
+// keep: 删掉后升级次数超过闭集档数，换完无处可换却还在升；由「三档闭集」兜住
 const MAX_STALL_ESCALATIONS: u8 = 3;
-
-// 五轮不买进展即判停滞：一轮反馈要落到下一轮的产出上，两三轮还看得出是在
-// 修，五轮都平就是在换着说法重复同一个失败。
-// cap: bound — 五轮：反馈落到产出的滞后期是两三轮，五轮都平就是在重复同一失败
-const RALPH_STAGNATION_WINDOW: u32 = 5;
 
 impl Default for RalphLoopConfig {
     fn default() -> Self {
+        // 窗口由实测导出：这套部署见过的「平了 K 轮之后才买到一次进展」里最大的 K。
+        // 还没有样本时是 0——「量不到」不判停滞，否则会把还没跑够读成已经停滞。
         Self {
-            stagnation_window: RALPH_STAGNATION_WINDOW,
+            stagnation_window: cog_core::stagnation::window_rounds(),
         }
     }
 }
@@ -277,6 +286,10 @@ pub struct RalphLoop {
     /// 这一跑里已经为「停滞」换过几次档。换档是**改一处**的证据：同题重试 →
     /// 改上下文 → 换执行者，换完仍无进展就是缺属主那份输入。
     stall_escalations: u8,
+    /// 判据的修订从哪儿读。判据只在下一次计划时定下，之后每一圈都对着同一段话
+    /// 说；要换那一段话，只能发一条带理由的修订。没有读面的进程与从前一样：
+    /// 计划定下之后它的判据不会变。
+    terminal_revisions: Option<Arc<dyn cog_core::contract::terminal_revision::TerminalRevisions>>,
 }
 
 impl Default for RalphLoop {
@@ -286,10 +299,13 @@ impl Default for RalphLoop {
             llm_provider: None,
             history: Vec::new(),
             task_id: None,
+            // cap: fixed — 计数从 0 起：它是这一任跑过的升级次数，不是容量
+            // keep: 删掉后这一任跑过的升级次数没有起点，计数从别的数起；由「计数从 0 起」兜住
             stall_escalations: 0,
             state_backend: None,
             run_nonce: uuid::Uuid::new_v4().simple().to_string()[..8].to_string(),
             pause_gate: None,
+            terminal_revisions: None,
         }
     }
 }
@@ -318,6 +334,16 @@ impl RalphLoop {
     /// 不受池影响的活由全局闸那一侧管，不从这里过。
     pub fn with_pause_gate(mut self, gate: Arc<dyn cog_core::SchedulerGate>) -> Self {
         self.pause_gate = Some(gate);
+        self
+    }
+
+    /// 让这条循环在每一轮开始前读一次判据的修订：计划只做一次，但「那一段话」
+    /// 可以被一条带理由的修订换掉，之后每一圈对着新的那段说。
+    pub fn with_terminal_revisions(
+        mut self,
+        revisions: Arc<dyn cog_core::contract::terminal_revision::TerminalRevisions>,
+    ) -> Self {
+        self.terminal_revisions = Some(revisions);
         self
     }
 
@@ -515,11 +541,21 @@ impl RalphLoop {
         if tail.iter().any(|it| it.pge_passed) {
             return false;
         }
+        // 两轮算不算「同一处」看的是**缺口集合**，不是那段话的排版：逐行归一化
+        // 之后排序再比，判词换了顺序不算买到进展，同一组缺口换个说法也仍然算同一处。
         let normalize = |s: &str| {
-            s.split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .to_lowercase()
+            let mut lines: Vec<String> = s
+                .lines()
+                .map(|line| {
+                    line.split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .to_lowercase()
+                })
+                .filter(|line| !line.is_empty())
+                .collect();
+            lines.sort();
+            lines.join("\n")
         };
         let first = normalize(&tail[0].feedback);
         // 「同一句失败原样重放」要求这一窗连策略都没换过；「这一窗买到进展了吗」
@@ -586,14 +622,23 @@ impl RalphLoop {
     /// 策略，而是一个只有属主能给的输入，于是带着根因去问，条目开着不关闭。
     fn change_one_thing(&mut self) -> Option<String> {
         self.stall_escalations = self.stall_escalations.saturating_add(1);
+        // 换的档进读数：同一档被换第二次说明上一次并没有真的改掉那一处，
+        // 而这句话只有在跨进程的计数上才读得出来。
+        let tier = match self.stall_escalations {
+            1 => ResetStrategy::Identical,
+            2 => ResetStrategy::Modified,
+            _ => ResetStrategy::Escalated,
+        };
+        crate::observable::global_observable().record_ralph_escalation(tier.as_str());
         let cause = self
             .history
             .last()
             .map(|it| it.feedback.clone())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         tracing::warn!(
             window = self.config.stagnation_window,
             escalation = self.stall_escalations,
+            tier = tier.as_str(),
             %cause,
             "Ralph Loop bought no progress across the window; changing one thing and continuing"
         );
@@ -849,6 +894,8 @@ impl RalphLoop {
         generator: &GeneratorActor,
         evaluator: &EvaluatorActor,
     ) -> RalphVerdict {
+        // 开轮挪到计划之后：定批属于 planner，计划写出来才知道这一批是哪几条。
+        // 「不开轮就直接落地」的短路仍然堵着——开轮发生在动树之前。
         self.load_history().await;
 
         // 请求就是目标加上它被提出时的上下文，整个外层循环只有这一份。本轮
@@ -868,6 +915,8 @@ impl RalphLoop {
             PlanScope::Planned(planner) => Some(planner),
             PlanScope::Declared(_) => None,
         };
+        // 三格退回重写那一步还要用它；上面那次 match 会把它移走。
+        let planner_for_cells = planner_for_review;
         // 审终态是 evaluator 的角色：它与写终态的 planner、与判完成的自己都不是同一次
         // 调用，所以那两问由这个角色发起，程序在定批之后、开生成之前调它一次。
         let planned_once: Option<PlannerOutput> = match scope {
@@ -897,7 +946,9 @@ impl RalphLoop {
         // 「终态不成立：哪一问」。只有一条都审不过时，才带着判词去问属主。
         let planned_once = match (planner_for_review, planned_once) {
             (Some(planner), Some(plan)) => {
-                let mut findings = evaluator.review_criteria(goal, &plan.judged_items()).await;
+                let mut findings = evaluator
+                    .review_criteria(goal, &plan.items, plan.definition.as_deref())
+                    .await;
                 if findings.iter().any(|f| !f.ok) {
                     // 退回 planner 改一次：把不成立的那几条作为反馈问一次。
                     let feedback = findings
@@ -921,7 +972,7 @@ impl RalphLoop {
                         )
                         .await;
                     findings = evaluator
-                        .review_criteria(goal, &revised.judged_items())
+                        .review_criteria(goal, &revised.items, revised.definition.as_deref())
                         .await;
                     if findings.iter().any(|f| !f.ok) {
                         let refused: Vec<String> = findings
@@ -957,10 +1008,82 @@ impl RalphLoop {
             }
             (_, planned) => planned,
         };
-        let scope = match (&planned_once, scope) {
-            (Some(plan), PlanScope::Planned(_)) => PlanScope::Declared(plan),
-            (_, declared) => declared,
+        // 三格是必须的：没有终态就没有可对的描述，完成判无从谈起。计划没写三格
+        // 不是「换一种判法」，是计划不合格——退回 planner 重写一次；仍写不出就带
+        // 原因问属主，绝不把这一批送进生成。
+        let planned_once = match planned_once {
+            Some(plan) if plan.items.is_empty() => {
+                let demand =
+                    "每一条待办都必须写 terminal / now / gap：没有这三格，完成判没有可对的描述";
+                let Some(planner) = planner_for_cells else {
+                    return self.question_verdict(demand.to_string());
+                };
+                let repaired = planner
+                    .plan_judged_downstream(
+                        &Task::new(
+                            self.iteration_task_id("plan-cells", 2),
+                            TaskType::Custom("ralph_plan_goal".into()),
+                            serde_json::json!({ "goal": goal, "ralph_feedback": demand }),
+                        ),
+                        2,
+                        Some(demand),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                if repaired.items.is_empty() {
+                    return self.question_verdict(
+                        "两次计划都没有写出一条待办的终态/现在/差距：缺的是只有属主能给的输入"
+                            .to_string(),
+                    );
+                }
+                Some(repaired)
+            }
+            other => other,
         };
+        // 计划只做一次（`plan_owned`），但「那一段话」可以被一条带理由的修订换掉：
+        // 每一轮开始前读一次，这一轮就对着新的那段说。没有修订读面的进程，判据
+        // 定下之后不再变——与从前一样。
+        let mut plan_owned = planned_once;
+        let planned_by_actor: Option<&PlannerActor> = match &scope {
+            PlanScope::Planned(planner) => Some(*planner),
+            PlanScope::Declared(_) => None,
+        };
+
+        // 定批属于 planner：计划写出来之后才钉轮。计划里的标记若都是台账上的条目，
+        // 这一轮就钉这一批；不是（或没有计划）就钉「全部未完成」——钉不成全量也不
+        // 静默：先记一条具名日志，再说这一跑没有轮可查。
+        let planned_batch: Option<Vec<String>> = plan_owned.as_ref().and_then(|plan| {
+            (!plan.items.is_empty())
+                .then(|| plan.items.iter().map(|item| item.id.clone()).collect())
+        });
+        match crate::actors::ledger::pin_round_selected(planned_batch.as_deref()) {
+            Ok(batch) if batch.is_empty() => {
+                tracing::info!("这一跑没有未完成的待办可开轮");
+            }
+            Ok(batch) => {
+                tracing::info!(rows = batch.len(), "这一轮开在台账那本书上");
+            }
+            Err(e) if planned_batch.is_some() => {
+                tracing::warn!(
+                    error = %e,
+                    "计划里的批钉不进书里；这一轮按台账上全部未完成来钉"
+                );
+                match crate::actors::ledger::pin_round() {
+                    Ok(batch) => {
+                        tracing::info!(rows = batch.len(), "这一轮开在台账那本书上（全量）")
+                    }
+                    Err(e) => tracing::warn!(error = %e, "这一跑没开成轮"),
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "这一跑没开成轮：台账那本书不可用，这一跑没有轮可查");
+            }
+        }
+
+        // 连续多少轮没买到进展；买到一次进展时它被记成一条样本然后清零。
+        let mut flat_streak: u32 = 0;
 
         // 本轮自己的预算：归档历史提供反馈与停滞证据，不从预算里扣。
         // 起算点跟着历史走曾让预算变成目标的终身配额——攒满之后每次重驱
@@ -1000,7 +1123,41 @@ impl RalphLoop {
                 TaskType::Custom("ralph_pipeline_goal".into()),
                 input,
             );
-            let pge_result = match scope {
+            // 每一轮开始前读一次修订：判据在那一次计划时定下，换它只能靠一条带理由的
+            // 修订，而那一轮之后必须对着新的那段话判。
+            if let (Some(revisions), Some(plan)) =
+                (self.terminal_revisions.as_ref(), plan_owned.as_mut())
+            {
+                let ids: Vec<String> = plan.items.iter().map(|item| item.id.clone()).collect();
+                match revisions.latest_for(&ids).await {
+                    Ok(found) if !found.is_empty() => {
+                        let changed = cog_core::contract::terminal_revision::apply_revisions(
+                            &mut plan.items,
+                            &found,
+                        );
+                        if changed > 0 {
+                            tracing::info!(changed, "判据按修订换了；这一轮对着新的那段话");
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "判据的修订没有读到；这一轮仍对着上一段话说"
+                    ),
+                }
+            }
+            let round_scope = match &plan_owned {
+                Some(plan) => PlanScope::Declared(plan),
+                None => match planned_by_actor {
+                    Some(planner) => PlanScope::Planned(planner),
+                    // 没有计划可改时，这一跑对着调用方给的那份成稿说（`scope` 原样）。
+                    None => match &scope {
+                        PlanScope::Declared(plan) => PlanScope::Declared(plan),
+                        PlanScope::Planned(planner) => PlanScope::Planned(planner),
+                    },
+                },
+            };
+            let pge_result = match round_scope {
                 PlanScope::Planned(planner) => {
                     pipeline
                         .execute_task(&task, context.clone(), planner, generator, evaluator)
@@ -1018,7 +1175,18 @@ impl RalphLoop {
                         .await
                 }
             };
+            // 离开循环只看一件事：终态到了没有。管线的第三段已经是完成判（对着
+            // 每条终态读这一轮的树），所以 `final_evaluation` 就是那一问的答案，
+            // 这里不再另买一次调用。
             let passed = matches!(pge_result.final_evaluation.verdict, Verdict::Pass);
+            // 平局轮数喂给停滞窗口：买到一次进展时，把「平了多少轮才买到」记成一条
+            // 实测；下一次的窗口跟着它长。没有进这一支的轮数不算样本。
+            if passed {
+                cog_core::stagnation::record_flat_run_before_improvement(flat_streak);
+                flat_streak = 0;
+            } else {
+                flat_streak = flat_streak.saturating_add(1);
+            }
             let feedback = pge_result.final_evaluation.feedback.clone();
 
             let analysis = if passed {
@@ -1321,7 +1489,7 @@ impl RalphLoop {
         // `analyze_failure` counts the whole history for its "same failure
         // repeated N times" verdict, and a trimmed slice would undercount it.
         let (recent, dropped) = self.failure_prompt_history(history);
-        let history_json = serde_json::to_string_pretty(recent).unwrap_or_default();
+        let history_json = serde_json::to_string_pretty(recent).unwrap_or(Default::default());
         let dropped_bytes = serde_json::to_string_pretty(dropped)
             .map(|json| json.len())
             .unwrap_or(0);
@@ -1535,7 +1703,8 @@ fn pace_sleep_secs(reason: &str) -> Option<u64> {
 /// （`record_ralph_termination` 带的是 `classify` 出来的 `upstream_unavailable`，
 /// 不是「判死」那一类），下游 hook 也会收到一次 `OnRalphUnrecoverable`。
 /// 分开它们要一个新的 verdict 变体，那会牵动 squad 执行器的分支；今天先记在这里。
-// cap: bound — 超过它的等待交回调度面回投而不是就地睡：睡着的任务占着派工侧的在途许可，在消费者眼里与正在执行同形
+// cap: fixed — 超过它的等待交回调度面回投而不是就地睡：睡着的任务占着派工侧的在途许可，在消费者眼里与正在执行同形
+// keep: 删掉后就地睡的长等待占着派工侧的在途许可，在消费者眼里与正在执行同形；由「超过它的等待交回调度面回投」兜住
 const PACED_SLEEP_MAX_SECS: u64 = 60;
 
 /// 这一轮的等待是在这里睡过去，还是交回调度面。
@@ -1581,14 +1750,14 @@ mod tests {
     use crate::squad::pge::{PgePipeline, PgePipelineConfig, PgeRoundtable, PgeRoundtableConfig};
     use std::sync::Arc;
 
-    /// 停滞窗口只有一处声明：默认值读常量，常量上面写着它由什么钉住。
+    /// 停滞窗口由实测导出：默认值读那一份读数，字段里不写裸数字。
     ///
-    /// 运行时默认值等于常量（改常量就改默认值）；源码面 `impl Default` 的字段
-    /// 里不再有数字（下一笔写回裸字面量就红）。
+    /// 还没有样本时它是 0——「量不到」不判停滞。源码面 `impl Default` 的字段里
+    /// 不能有数字（下一笔写回裸字面量就红）。
     #[test]
     fn the_ralph_default_reads_its_window() {
         let cfg = RalphLoopConfig::default();
-        assert_eq!(cfg.stagnation_window, RALPH_STAGNATION_WINDOW);
+        assert_eq!(cfg.stagnation_window, cog_core::stagnation::window_rounds());
 
         let source = include_str!("ralph_loop.rs");
         let body = source
@@ -1759,6 +1928,37 @@ mod tests {
                 .is_some_and(|s| s.contains("Judge against this run's working tree"));
             // 夹具自己写了判词的（审不过的那几条反例），照它写的答。
             let has_own_verdicts = self.response.get("verdicts").is_some();
+            let asks_completion = input
+                .get("instructions")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains("Judge whether each terminal description is true"));
+            if asks_completion && !has_own_verdicts {
+                // 完成判：夹具按它脚本里的 verdict 答「到没到」。
+                let ok = self
+                    .response
+                    .get("verdict")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.eq_ignore_ascii_case("pass"))
+                    .unwrap_or(true);
+                let reason = self
+                    .response
+                    .get("feedback")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let verdicts: Vec<serde_json::Value> = input
+                    .get("items")
+                    .and_then(|v| v.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|i| i.get("id"))
+                            .map(|id| serde_json::json!({"id": id, "ok": ok, "reason": reason}))
+                            .collect()
+                    })
+                    .unwrap_or(Default::default());
+                return Ok(serde_json::json!({ "verdicts": verdicts }));
+            }
             if asks_about_terminals && !has_own_verdicts {
                 let verdicts: Vec<serde_json::Value> = input
                     .get("items")
@@ -1776,7 +1976,7 @@ mod tests {
                             })
                             .collect()
                     })
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 return Ok(serde_json::json!({ "verdicts": verdicts }));
             }
             Ok(self.response.clone())
@@ -2004,11 +2204,8 @@ mod tests {
             ..Default::default()
         });
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
-            timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
-            independent_review: false,
         });
         let planner = PlannerActor::new(Arc::new(pass_planner()));
         let generator = GeneratorActor::new(Arc::new(pass_generator()));
@@ -2660,7 +2857,7 @@ mod tests {
             gap: String::new(),
             state: LedgerState::Open,
         }];
-        let out = evaluator.review_criteria("把它做对", &items).await;
+        let out = evaluator.review_criteria("把它做对", &items, None).await;
         assert_eq!(out.len(), 1);
         assert!(
             !out[0].ok,
@@ -2687,9 +2884,46 @@ mod tests {
             gap: String::new(),
             state: LedgerState::Open,
         }];
-        let out = evaluator.review_criteria("统一正本", &items).await;
+        let out = evaluator.review_criteria("统一正本", &items, None).await;
         assert_eq!(out.len(), 1);
         assert!(!out[0].ok, "没答的条目按不成立读，而不是默认通过");
+    }
+
+    /// 完成判：编辑之后对着终态再读一次树。判不说「到了」时，这一轮不能离开循环。
+    #[tokio::test]
+    async fn a_completion_review_that_did_not_read_done_is_not_done() {
+        use cog_core::contract::ledger_item::{LedgerItem, LedgerState};
+        let evaluator = EvaluatorActor::new(Arc::new(MockAgent {
+            response: serde_json::json!({
+                "verdicts": [{"id": "N3", "ok": false, "reason": "read crates/a/src/lib.rs; the branch is not there"}]
+            }),
+        }));
+        let items = vec![LedgerItem {
+            id: "N3".into(),
+            terminal: "那个分支在 crates/a/src/lib.rs 里，且两处调用都走它".into(),
+            now: "分支还没有".into(),
+            gap: "缺那个分支".into(),
+            state: LedgerState::Open,
+        }];
+        let out = evaluator
+            .review_completed("把它接上", &items, None)
+            .await
+            .expect("有可判的条目就该有判词");
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].ok, "判者说没到，就不能读成到了");
+        assert!(out[0].reason.contains("lib.rs"));
+    }
+
+    /// 没有可判的条目时是 `None`，不是「全部到了」。
+    #[tokio::test]
+    async fn an_empty_plan_has_no_completion_verdict_to_read_as_done() {
+        let evaluator = EvaluatorActor::new(Arc::new(MockAgent {
+            response: serde_json::json!({ "verdicts": [] }),
+        }));
+        assert!(evaluator
+            .review_completed("随便", &[], None)
+            .await
+            .is_none());
     }
 
     /// 计划在循环**外面**做一次，循环里只剩生成与判定。
@@ -2725,7 +2959,11 @@ mod tests {
             "审不过的那几条要从批里摘掉，而不是整批退回：一条描述写坏不该让其余各条一起停"
         );
         assert!(
-            before_loop.contains("PlanScope::Declared(plan)"),
+            before_loop.contains("pin_round_selected"),
+            "开轮要等计划出来：定批属于 planner，钉在计划之前就只钉得到全量"
+        );
+        assert!(
+            pipeline[planned_at..].contains("PlanScope::Declared(plan)"),
             "循环里拿到的该是一份固定的计划（Declared），不是每轮现问的 planner"
         );
     }
@@ -2994,6 +3232,42 @@ mod tests {
         assert!(!ralph.is_stagnated());
     }
 
+    /// 缺口集合相同、行的顺序不同：仍是同一处，判停滞。
+    #[test]
+    fn stagnation_reads_the_gap_set_not_the_line_order() {
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            stagnation_window: 2,
+        });
+        ralph.history.push(failed_iteration(
+            1,
+            ResetStrategy::Identical,
+            "N1: 缺 A\nN2: 缺 B",
+        ));
+        ralph.history.push(failed_iteration(
+            2,
+            ResetStrategy::Identical,
+            "N2: 缺 B\nN1: 缺 A",
+        ));
+        assert!(ralph.is_stagnated());
+    }
+
+    /// 缺口少了一条：这一轮买到了进展，不算停滞。
+    #[test]
+    fn losing_a_gap_is_progress() {
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            stagnation_window: 2,
+        });
+        ralph.history.push(failed_iteration(
+            1,
+            ResetStrategy::Identical,
+            "N1: 缺 A\nN2: 缺 B",
+        ));
+        ralph
+            .history
+            .push(failed_iteration(2, ResetStrategy::Identical, "N2: 缺 B"));
+        assert!(!ralph.is_stagnated());
+    }
+
     #[test]
     fn no_stagnation_when_strategy_changes() {
         let mut ralph = RalphLoop::with_config(RalphLoopConfig {
@@ -3166,6 +3440,7 @@ mod tests {
             iterations: 1,
             consensus_reached: false,
             final_plan: PlannerOutput {
+                definition: None,
                 summary: String::new(),
                 plan: serde_json::json!({}),
                 sub_tasks: Vec::new(),
@@ -3199,6 +3474,7 @@ mod tests {
 
         let mut result = roundtable_result(Verdict::Fail, "");
         result.final_plan = PlannerOutput {
+            definition: None,
             summary: String::new(),
             plan: serde_json::json!({}),
             sub_tasks: Vec::new(),
@@ -3328,6 +3604,31 @@ mod tests {
                 && m.labels.get("reason").map(String::as_str) == Some("terminal_env_failure")),
             "terminal env failures must be visible as ralph_terminations_total{{reason=...}}"
         );
+    }
+
+    /// 停滞换档进读数：第一档是 identical、第二档是 modified。只看终止原因
+    /// 看不出「同一档被换过两次」这件事。
+    #[tokio::test]
+    async fn each_stalled_round_is_counted_under_the_tier_it_changed() {
+        use cog_core::Observable;
+
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            stagnation_window: 2,
+        });
+        assert!(ralph.change_one_thing().is_none());
+        assert!(ralph.change_one_thing().is_none());
+
+        let metrics = crate::observable::global_observable()
+            .collect_metrics("D8")
+            .await
+            .unwrap();
+        let tiers: Vec<&str> = metrics
+            .iter()
+            .filter(|m| m.name == "ralph_stall_escalations_total")
+            .filter_map(|m| m.labels.get("tier").map(String::as_str))
+            .collect();
+        assert!(tiers.contains(&"identical"), "第一档没有进读数：{tiers:?}");
+        assert!(tiers.contains(&"modified"), "第二档没有进读数：{tiers:?}");
     }
 
     /// 有真进展就不判停滞——哪怕措辞一轮比一轮难听。
@@ -3903,11 +4204,8 @@ mod tests {
     async fn ralph_history_persists_across_loop_instances() {
         let backend = Arc::new(BoardMockBackend::new());
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
-            timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
-            independent_review: false,
         });
         let planner = PlannerActor::new(Arc::new(pass_planner()));
         let generator = GeneratorActor::new(Arc::new(pass_generator()));
@@ -3976,8 +4274,15 @@ mod tests {
             history.len() > restart_at,
             "重启之后至少要留下一条自己的条目"
         );
-        let own: Vec<u32> = history[restart_at..].iter().map(|it| it.iteration).collect();
-        assert_eq!(own.first().copied(), Some(1), "自己的轮次从 1 起算：{own:?}");
+        let own: Vec<u32> = history[restart_at..]
+            .iter()
+            .map(|it| it.iteration)
+            .collect();
+        assert_eq!(
+            own.first().copied(),
+            Some(1),
+            "自己的轮次从 1 起算：{own:?}"
+        );
         assert!(
             own.windows(2).all(|w| w[1] == w[0] + 1),
             "自己的轮次连续编号：{own:?}"
@@ -4069,11 +4374,8 @@ mod tests {
     async fn every_iteration_is_archived_even_when_the_board_keeps_only_the_tail() {
         let backend = Arc::new(BoardMockBackend::new());
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
-            timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
-            independent_review: false,
         });
         let planner = PlannerActor::new(Arc::new(pass_planner()));
         let generator = GeneratorActor::new(Arc::new(pass_generator()));
@@ -4139,11 +4441,8 @@ mod tests {
     async fn an_archive_that_cannot_be_written_does_not_fail_the_loop() {
         let backend = Arc::new(BoardMockBackend::rejecting_appends());
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
-            timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
-            independent_review: false,
         });
         let planner = PlannerActor::new(Arc::new(pass_planner()));
         let generator = GeneratorActor::new(Arc::new(pass_generator()));
@@ -4202,11 +4501,8 @@ mod tests {
         );
 
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
-            timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
-            independent_review: false,
         });
         let planner = PlannerActor::new(Arc::new(pass_planner()));
         let generator = GeneratorActor::new(Arc::new(pass_generator()));
@@ -4259,11 +4555,8 @@ mod tests {
     #[tokio::test]
     async fn a_terminal_environment_failure_outranks_stagnation() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
-            timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 0,
-            independent_review: false,
         });
         let planner = PlannerActor::new(Arc::new(pass_planner()));
         let generator = GeneratorActor::new(Arc::new(MockAgent {
@@ -4310,11 +4603,8 @@ mod tests {
     #[tokio::test]
     async fn a_planner_that_spent_its_budget_is_not_reported_as_a_generator_defect() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
-            timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 0,
-            independent_review: false,
         });
         let planner = PlannerActor::new(Arc::new(MockAgent {
             response: serde_json::json!({
@@ -4374,7 +4664,6 @@ mod tests {
             PgeRoundtableConfig {
                 consensus_threshold: 0.8,
                 stall_threshold: 0,
-                independent_review: false,
                 ..Default::default()
             },
             PlannerActor::new(Arc::new(pass_planner())),
@@ -4417,11 +4706,8 @@ mod tests {
             ..Default::default()
         });
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
-            timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
-            independent_review: false,
         });
         let verdict = ralph
             .run_pipeline(

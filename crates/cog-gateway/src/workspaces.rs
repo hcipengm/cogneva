@@ -188,7 +188,7 @@ pub async fn list_workspace_members_handler(
                 })
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
 
     (
         StatusCode::OK,

@@ -33,6 +33,7 @@ pub struct LargeBody {
 /// 取这么大是因为 `lo_get` 一条语句返回一个 `bytea`，一次取回整段会让常驻内存跟着
 /// 正文大小走——而「无界」指的是正文无界，不是进程内存无界。
 // cap: fixed — 一次 lo_get 往返的载荷（单值 bytea），与正文大小无关
+// keep: 删掉后回到「一次 lo_get 往返的载荷（单值 bytea），与正文大小无关」所描述的情形；由这条约定兜住
 const VERIFY_CHUNK: i64 = 1_048_576;
 
 /// 开一段正文，拿到 oid。

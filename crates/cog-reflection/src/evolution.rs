@@ -264,7 +264,9 @@ impl EvolutionEngine {
             graph.as_ref(),
             &format!("Evolution judgment: {item_id}"),
             task,
-            std::time::Duration::from_secs(timeout_secs.saturating_sub(10).max(1)),
+            Some(std::time::Duration::from_secs(
+                timeout_secs.saturating_sub(10).max(1),
+            )),
         )
         .await?;
         Ok(cog_core::contract::work_item::answer_text(&answer))
@@ -386,6 +388,7 @@ impl EvolutionEngine {
                 // 时，这一步把它补成一条：结论落在一个连候选都没有的 `.diff` 上，
                 // 那份 `.diff` 就永远说不清自己是什么。
                 let stub = EvolutionResult {
+                    unit_of_work: None,
                     kind: EvolutionKind::CodeChange,
                     artifact_id: artifact_id.to_string(),
                     description: String::new(),
@@ -526,7 +529,7 @@ impl EvolutionEngine {
             }
         };
 
-        let skill_json = serde_json::to_string_pretty(&skill).unwrap_or_default();
+        let skill_json = serde_json::to_string_pretty(&skill).unwrap_or(Default::default());
         let prompt = {
             let mut vars = std::collections::HashMap::new();
             vars.insert("skill_json".to_string(), skill_json.clone());
@@ -567,6 +570,7 @@ impl EvolutionEngine {
                     reg.insert_skill_config(improved);
                     info!(skill_id, "Refined skill inserted into registry");
                     let result = EvolutionResult {
+                        unit_of_work: None,
                         kind: EvolutionKind::SkillRefinement,
                         artifact_id: skill_id.to_string(),
                         description: "LLM-refined skill config".into(),
@@ -581,6 +585,7 @@ impl EvolutionEngine {
                 } else {
                     warn!(skill_id, "Refined skill failed quality gate");
                     let result = EvolutionResult {
+                        unit_of_work: None,
                         kind: EvolutionKind::SkillRefinement,
                         artifact_id: skill_id.to_string(),
                         description: "Refined skill failed quality gate".into(),
@@ -597,6 +602,7 @@ impl EvolutionEngine {
             Err(e) => {
                 warn!(skill_id, "Failed to parse refined skill: {}", e);
                 let result = EvolutionResult {
+                    unit_of_work: None,
                     kind: EvolutionKind::SkillRefinement,
                     artifact_id: skill_id.to_string(),
                     description: format!("Failed to parse refined skill: {}", e),
@@ -679,6 +685,7 @@ impl EvolutionEngine {
         let action = hook_json.get("action");
         let (Some(id_str), Some(trigger_str), Some(_action)) = (id, trigger, action) else {
             let result = EvolutionResult {
+                unit_of_work: None,
                 kind: EvolutionKind::HookSynthesis,
                 artifact_id: format!(
                     "hook-{}",
@@ -708,6 +715,7 @@ impl EvolutionEngine {
         ];
         if !valid_triggers.contains(&trigger_str) {
             let result = EvolutionResult {
+                unit_of_work: None,
                 kind: EvolutionKind::HookSynthesis,
                 artifact_id: format!(
                     "hook-{}",
@@ -731,9 +739,10 @@ impl EvolutionEngine {
 
         // Write to hooks directory.
         let hook_dir = cog_core::config::self_evolution_hook_dir(&self.change_dir);
+        // state-file: artifact — 钩子生成物的本体（一次生成的产物），不是某条事实的第二份正本
         let filename = hook_dir.join(format!("{}.json", artifact_id));
         if let Some(parent) = filename.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+            cog_core::ignore_lost!(tokio::fs::create_dir_all(parent).await);
         }
         tokio::fs::write(
             &filename,
@@ -758,11 +767,12 @@ impl EvolutionEngine {
         // active immediately without waiting for a file-system scan.
         if let Ok(guard) = self.hook_sink.lock() {
             if let Some(ref tx) = *guard {
-                let _ = tx.send(hook_json);
+                cog_core::ignore_lost!(tx.send(hook_json));
             }
         }
 
         let result = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::HookSynthesis,
             artifact_id,
             description: format!("Synthesized hook for pattern: {}", event_pattern),
@@ -829,6 +839,7 @@ impl EvolutionEngine {
             (name, description, parameters)
         else {
             let result = EvolutionResult {
+                unit_of_work: None,
                 kind: EvolutionKind::ToolVariant,
                 artifact_id: format!("{}-v2", tool_name),
                 description: format!("Tool variant suggestion for {}", tool_name),
@@ -846,6 +857,7 @@ impl EvolutionEngine {
         {
             if params.get("type").and_then(|v| v.as_str()) != Some("object") {
                 let result = EvolutionResult {
+                    unit_of_work: None,
                     kind: EvolutionKind::ToolVariant,
                     artifact_id: format!("{}-v2", tool_name),
                     description: format!("Tool '{}' parameters must have type='object'", tool_name),
@@ -864,6 +876,7 @@ impl EvolutionEngine {
                 .unwrap_or(false)
             {
                 let result = EvolutionResult {
+                    unit_of_work: None,
                     kind: EvolutionKind::ToolVariant,
                     artifact_id: format!("{}-v2", tool_name),
                     description: format!(
@@ -885,9 +898,10 @@ impl EvolutionEngine {
 
         // Write to tools directory.
         let tool_dir = self.change_dir.join("tools");
+        // state-file: artifact — 工具生成物的本体（一次生成的产物），不是某条事实的第二份正本
         let filename = tool_dir.join(format!("{}.json", artifact_id));
         if let Some(parent) = filename.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+            cog_core::ignore_lost!(tokio::fs::create_dir_all(parent).await);
         }
         tokio::fs::write(
             &filename,
@@ -912,11 +926,12 @@ impl EvolutionEngine {
         // discoverable immediately.
         if let Ok(guard) = self.tool_sink.lock() {
             if let Some(ref tx) = *guard {
-                let _ = tx.send(tool_json);
+                cog_core::ignore_lost!(tx.send(tool_json));
             }
         }
 
         let result = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::ToolVariant,
             artifact_id,
             description: format!("Improved variant of tool {}", tool_name),
@@ -1095,6 +1110,14 @@ impl EvolutionEngine {
         );
 
         let result = EvolutionResult {
+            // 这条变更属于哪件活：外部入口带来的 issue 编号是一个稳定身份，
+            // 落地率按它读得回来。没有 issue 的入口（自演化按节拍跑）留空。
+            // 变更自己带着目标身份时用它的（`task:` 来自平台内的活，`issue:` 来自
+            // 外部入口）；没有就用 issue 编号兜底。
+            unit_of_work: change
+                .unit_of_work
+                .clone()
+                .or_else(|| change.issue_number.map(|number| format!("issue:{number}"))),
             kind: EvolutionKind::CodeChange,
             artifact_id: artifact_id.clone(),
             description: change.goal.clone(),
@@ -1307,6 +1330,7 @@ mod tests {
 
     fn make_result(id: &str, created_at: chrono::DateTime<chrono::Utc>) -> EvolutionResult {
         EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: id.to_string(),
             description: format!("desc-{id}"),
@@ -1365,6 +1389,7 @@ mod tests {
 
     fn code_change(id: &str, status: EvolutionStatus) -> EvolutionResult {
         EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: id.to_string(),
             description: format!("goal-{id}"),
@@ -1417,6 +1442,63 @@ mod tests {
             engine.get_result("chg-1").await.is_none(),
             "the state lives in the retired record from here on"
         );
+    }
+
+    /// 平台内任务产生的变更，带着 `task:<id>` 落进队列。
+    ///
+    /// 没有这次改动这条会红：`GeneratedChange` 没有这一格，任务产生的变更在落地率
+    /// 里永远无主。
+    #[tokio::test]
+    async fn a_task_generated_change_carries_its_task_as_the_unit_of_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let store = Arc::new(cog_test_support::MemoryCandidateStore::new());
+        let engine = engine_on(&change_dir).with_candidates(store.clone());
+        let change = cog_core::GeneratedChange {
+            unit_of_work: Some("task:t-9".into()),
+            change_id: "from-task".into(),
+            goal: "do the thing".into(),
+            content:
+                "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+two\n"
+                    .into(),
+            ..Default::default()
+        };
+        engine
+            .write_generated_change(&change)
+            .await
+            .expect("recorded");
+        let rows = store.recorded();
+        assert_eq!(rows[0].unit_of_work.as_deref(), Some("task:t-9"));
+    }
+
+    /// 外部入口带来的 issue 编号，随候选一起落进队列，成为这条变更的目标身份。
+    ///
+    /// 没有这次改动这条会红：候选的 `unit_of_work` 是 `None`，落地率答不出
+    /// 「这个 issue 要的变更落地没有」。
+    #[tokio::test]
+    async fn an_issue_fix_change_carries_its_issue_as_the_unit_of_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let store = Arc::new(cog_test_support::MemoryCandidateStore::new());
+        let engine = engine_on(&change_dir).with_candidates(store.clone());
+        let change = cog_core::GeneratedChange {
+            change_id: "issue-7".into(),
+            goal: "fix the issue".into(),
+            content:
+                "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+two\n"
+                    .into(),
+            issue_number: Some(7),
+            ..Default::default()
+        };
+        engine
+            .write_generated_change(&change)
+            .await
+            .expect("the change is written and recorded");
+        let rows = store.recorded();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].unit_of_work.as_deref(), Some("issue:7"));
     }
 
     /// A change the index never saw still gets its conclusion recorded: it is

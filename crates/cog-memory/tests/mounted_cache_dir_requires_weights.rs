@@ -14,7 +14,7 @@ fn empty_dir(tag: &str) -> std::path::PathBuf {
         "cog-memory-empty-weights-{tag}-{}",
         std::process::id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     std::fs::create_dir_all(&dir).expect("temp dir");
     dir
 }
@@ -29,7 +29,7 @@ fn an_empty_embedding_cache_dir_is_refused_before_any_fetch() {
         err.contains("no ONNX weights"),
         "要说出「目录里没有权重」而不是一句泛泛的加载失败：{err}"
     );
-    std::fs::remove_dir_all(&dir).ok();
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
 }
 
 #[test]
@@ -42,5 +42,5 @@ fn an_empty_reranker_cache_dir_is_refused_before_any_fetch() {
         err.contains("no ONNX weights"),
         "要说出「目录里没有权重」而不是一句泛泛的加载失败：{err}"
     );
-    std::fs::remove_dir_all(&dir).ok();
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
 }

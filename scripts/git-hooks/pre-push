@@ -72,6 +72,22 @@
 # governs what arrives. To push through a real finding: `git push --no-verify`
 # and say why in the message.
 set -u
+# 界与有损：判要推的这段提交（origin/main...HEAD）新增的行。判据在
+# `scripts/{bounds,loss}-census.py` 里，这里只是薄入口。根从钩子位置解析，不靠 cwd；
+# 缺 python3 或缺脚本是「判不了」，说出来放行，不是拒推——拒推只留给真正的未处置。
+census_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.."
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "pre-push: 界与有损没有判——这台机器没有 python3。" >&2
+else
+    for census in bounds-census.py loss-census.py; do
+        if [ -f "${census_root}/scripts/${census}" ]; then
+            python3 "${census_root}/scripts/${census}" --root "${census_root}" --check-since origin/main || exit 1
+        else
+            echo "pre-push: 界与有损没有判——缺 scripts/${census}。" >&2
+        fi
+    done
+fi
+
 
 # git hands the hook one line per ref on stdin; without it there is nothing to
 # judge, and reading the script's own stdin would hang.
@@ -251,7 +267,7 @@ else
         patch_out="$(bash "$gate" --status-patch "$head_base" 2>&1)"
         prc=$?
         if [ "$prc" -eq 0 ]; then
-            echo "pre-push: $(printf '%s' "$patch_out" | head -n 1)" >&2
+            echo "pre-push: $(printf '%s' "$patch_out")" >&2
             exit 0
         fi
         # rc 2 is "cannot tell" -- not evidence either way, so fall through. rc 1 is
@@ -278,6 +294,6 @@ else
         echo "pre-push（CI 等价门）: 门自己说判不了（退出码 ${rc}），不拦；CI 仍会整棵判这一推。" >&2
         exit 0
     fi
-    echo "pre-push: $(printf '%s' "$out" | head -n 1)" >&2
+    echo "pre-push: $(printf '%s' "$out")" >&2
 fi
 exit 0

@@ -106,15 +106,19 @@ pub struct PromotionGateConfig {
 }
 
 /// 每 24 小时自动晋级几条：超出的排队。
-// cap: bound — 由回退面（一天内出问题能回退到哪一版）与沙盒验证的吞吐定
+// cap: fixed — 由回退面（一天内出问题能回退到哪一版）与沙盒验证的吞吐定
+// keep: 删掉后一天之内可以推进任意多版，出问题能回退到哪一版变得没有答案；由「回退面与沙盒验证吞吐」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const PROMOTION_QUOTA_PER_DAY: u32 = 3;
 
 /// 连续晋级后回滚几次触发熔断（转人工）。
-// cap: bound — 由回滚的成因分布定：偶发一次是正常，连着两次同一类才是判据坏了
+// cap: fixed — 由回滚的成因分布定：偶发一次是正常，连着两次同一类才是判据坏了
+// keep: 删掉后一次偶发回滚就停掉推进，正常变更被挡在外面；由「连着两次同一类才是判据坏了」兜住
 const ROLLBACK_BREAKER_THRESHOLD: u32 = 2;
 
 /// 连续沙盒验证失败几次触发熔断。
-// cap: bound — 由沙盒环境的抖动率定：抖一次就停会把正常变更挡在外面
+// cap: fixed — 由沙盒环境的抖动率定：抖一次就停会把正常变更挡在外面
+// keep: 删掉后沙盒抖动一次就停，正常变更被挡在外面；由「抖一次是常态、连着来才是问题」兜住
 const FAILURE_BREAKER_THRESHOLD: u32 = 3;
 
 impl Default for PromotionGateConfig {
@@ -359,15 +363,18 @@ pub struct ChangeJobConfig {
 
 /// 派发方在 Job 结束之后还留给自己的收尾时间：读日志、记终止消息、清对象。
 // cap: fixed — 收尾那几步是分钟级的：十分钟够它跑完，再长只是白等
+// keep: 删掉后收尾几步没有上限，一轮执行可以停在删 Job 上；由「收尾是分钟级」兜住
 const CHANGE_JOB_TEARDOWN_SECS: u64 = 600;
 
 /// 同时派几个执行 Job：进程内那条路一次只跑一个构建，并发窗口只有派发这一侧
 /// 才有意义，而它受命名空间配额约束。
-// cap: bound — 由命名空间 limits.cpu 的余量 ÷ 一个 Job 的请求量定
+// cap: fixed — 由命名空间 limits.cpu 的余量 ÷ 一个 Job 的请求量定
+// keep: 删掉后变更 Job 可以一起起，命名空间的 cpu 余量被一次吃完；由「余量 ÷ 一个 Job 的请求量」兜住
 const CHANGE_JOB_MAX_PARALLEL: usize = 1;
 
 /// 派发后多久看一次 Job 的状态：太密只是把同一个答案取回来。
-// cap: bound — 由一次 Job 的最短执行时长定：轮询要短于它，又不能比它密一个量级
+// cap: fixed — 由一次 Job 的最短执行时长定：轮询要短于它，又不能比它密一个量级
+// keep: 删掉后轮询要么比一次 Job 还密，要么比它稀一个量级；由「一次 Job 的最短执行时长」兜住
 const CHANGE_JOB_POLL_INTERVAL_SECS: u64 = 10;
 
 impl Default for ChangeJobConfig {
@@ -604,12 +611,14 @@ impl BaselinePortConfig {
 /// 它同时是「一份暂停最久能挂多久」的那一半：滚动侧等别人留下的 `paused` 时按
 /// 这个数算残渣，两个数必须同源，否则那边的界会比这边的看护还短，一次正在进行的
 /// 看护会被当成残渣 resume 掉。
-// cap: bound — 一次金丝雀最多看十分钟：更久只是在占用一次滚动的验证时间内不给结论
+// cap: fixed — 一次金丝雀最多看十分钟：更久只是在占用一次滚动的验证时间内不给结论
+// keep: 删掉后金丝雀没有看护窗口，要么不看结论就放、要么无限看下去；由「一次滚动的验证时间」兜住
 pub const DEFAULT_CANARY_WATCH_SECS: u64 = 600;
 
 /// 看护结束到滚动收场之间留的余量：resume/undo、全量滚动都在这段里做完。
 /// 与 [`DEFAULT_CANARY_WATCH_SECS`] 相加就是一份暂停的最长持有期。
-// cap: bound — 收场余量取看护窗口的一半：resume/undo 与一次全量滚动都在这段里做完
+// cap: fixed — 收场余量取看护窗口的一半：resume/undo 与一次全量滚动都在这段里做完
+// keep: 删掉后放行时 resume/undo 与全量滚动没有做完的余量，暂停状态被下一次操作打断；由「看护窗口的一半」兜住
 pub const CANARY_PAUSE_GRACE_SECS: u64 = 300;
 
 /// GitOps 分发配置（路线 B：推送端只推中央仓库，拉取端各自自治，
@@ -658,17 +667,20 @@ pub struct GitOpsConfig {
 }
 
 /// 金丝雀看护的判定倍数：错误率超过基线的这么多倍算回归。
-// cap: bound — 由基线的抖动幅度定：倍数小于抖动，好版本会被判成回归
+// cap: fixed — 由基线的抖动幅度定：倍数小于抖动，好版本会被判成回归
+// not-a-bound: 由基线的抖动幅度定：倍数小于抖动，好版本会被判成回归
 const CANARY_ERROR_RATE_MULTIPLIER: f64 = 1.5;
 
-// cap: bound — 同上，按 P99 的抖动幅度定
+// cap: fixed — 同上，按 P99 的抖动幅度定
+// keep: 删掉后金丝雀的 P99 与基线同一个数，正常抖动被读成回归；由「按 P99 的抖动幅度定」兜住
 const CANARY_P99_MULTIPLIER: f64 = 1.3;
 
 /// 累加计数器下，两次抓取之间至少要新增多少请求才允许对错误率下结论。
 ///
 /// 这是算出来的：一版的错误率下限是 1%，要把 1% 与 0% 分开需要百量级样本，
 /// 而增量太小时一条 5xx 就能把比值抬到任意高。
-// cap: bound — 由要分辨的最小错误率（1%）与置信所需的样本量定
+// cap: fixed — 由要分辨的最小错误率（1%）与置信所需的样本量定
+// keep: 删掉后几条请求就算出一个错误率，一次偶发错误被读成 100%；由「要分辨 1% 所需的样本量」兜住
 const CANARY_MIN_REQUESTS_FOR_RATE: f64 = 100.0;
 
 impl Default for GitOpsConfig {
@@ -894,6 +906,7 @@ pub struct MainlineDeployerConfig {
 /// registry 走查读取器监听的端口：node exporter 的约定口，走查按它抓同一个
 /// 读数，换端口等于换一个抓取方。
 // cap: fixed — node exporter 约定端口 9100
+// keep: 删掉后抓取端不知道自己该连哪个口，读数在部署里对不上；由「node exporter 约定端口 9100」兜住
 const REGISTRY_WALKER_PORT: u16 = 9100;
 
 /// 构建 Job 起几个 cargo 作业：这台构建机能同时跑几个线程就几个。
@@ -907,15 +920,18 @@ fn default_cargo_build_jobs() -> u32 {
 }
 
 /// 新部署起来后被重启几次算「没起来」。
-// cap: bound — 由启动期的探针节奏定：一次重启是滚动的常态，两次就是没起来
+// cap: fixed — 由启动期的探针节奏定：一次重启是滚动的常态，两次就是没起来
+// keep: 删掉后一次正常滚动重启就被读成没起来，主线被误停；由「一次是常态、两次是没起来」兜住
 const MAINLINE_RESTART_THRESHOLD: u32 = 1;
 
 /// 注册表里留多少个 rev：这是回退面的深度，不是磁盘容量。
-// cap: bound — 由回退面要有多深定：真正的下界是 keep 集，这个数只管有多久的历史
+// cap: fixed — 由回退面要有多深定：真正的下界是 keep 集，这个数只管有多久的历史
+// keep: 删掉后历史没有深度，回退面只剩 keep 集，上一版一被替换就找不回来；由「回退面要有多深」兜住
 const REGISTRY_RETENTION: usize = 20;
 
 /// 回收在占用达到声明容量的这个比例时动手：规则在 1.0 开火，回收要走在它前面。
-// cap: bound — 由告警规则的触发线定：它是那条线的一半，中间留一倍余量
+// cap: fixed — 由告警规则的触发线定：它是那条线的一半，中间留一倍余量
+// keep: 删掉后维护的触发线与告警线重合，维护在告警之前没有余量可走；由「告警触发线的一半」兜住
 const REGISTRY_MAINTENANCE_THRESHOLD: f64 = 0.5;
 
 impl Default for MainlineDeployerConfig {
@@ -959,6 +975,8 @@ impl Default for MainlineDeployerConfig {
             // 声明量的一半：规则 data_volume_over_declared_size 在 1.0 开火，
             // 回收在它之前把占用压回叠层基底的大小，中间留出一倍余量。
             registry_maintenance_threshold: REGISTRY_MAINTENANCE_THRESHOLD,
+            // cap: fixed — 维护环两趟之间的冷却：六小时是「一天最多四趟」的编制，不是按量伸缩的界
+            // keep: 删掉后维护环一天可以跑任意多趟，把 API 与日志刷满；由「一天最多四趟」兜住
             registry_maintenance_cooldown_secs: 6 * cog_core::day::SECONDS_PER_HOUR as u64,
             targets: vec![
                 RolloutTargetConfig {
@@ -1032,7 +1050,8 @@ pub struct ObservabilityStackConfig {
 
 impl ObservabilityStackConfig {
     /// 间隔下限：低于它，一次 apply 还没落地就进下一轮，日志与 API 都被刷屏。
-    // cap: bound — 间隔下限：低于它，一次 apply 还没落地就进下一轮，日志与 API 都被刷屏
+    // cap: fixed — 间隔下限：低于它，一次 apply 还没落地就进下一轮，日志与 API 都被刷屏
+    // keep: 删掉后一轮 apply 还没落地就进下一轮，日志与 API 被刷屏；由「间隔下限」兜住
     pub const MIN_INTERVAL_SECS: u64 = 60;
 }
 
@@ -1301,7 +1320,7 @@ mod tests {
         assert!(!cfg.enabled);
         assert_eq!(cfg.poll_interval_secs, 120);
         assert_eq!(cfg.retry_cooldown_secs, 86_400);
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     #[test]
@@ -1396,7 +1415,7 @@ mod tests {
         let cfg = MainlineDeployerConfig::load_from(&path).unwrap();
         assert_eq!(cfg.upstreams.len(), 1);
         assert_eq!(cfg.upstreams[0].repo, "x/y");
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// 关掉或没配 repo 的平台不进跟踪列表：那表示这台部署不跟这一端，
@@ -1475,7 +1494,7 @@ mod tests {
         assert_eq!(cfg.gitops.poll_interval_secs, 30);
         // 段内未写的字段保持默认
         assert_eq!(cfg.gitops.branch, "evolution-release");
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     #[test]
@@ -1486,7 +1505,7 @@ mod tests {
         std::fs::write(&path, r#"{"self_evolution": {"enabled": true}}"#).unwrap();
         let cfg = PromotionGateConfig::load_from(&path).unwrap();
         assert!(!cfg.enabled);
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     #[test]
@@ -1500,7 +1519,7 @@ mod tests {
         )
         .unwrap();
         assert!(PromotionGateConfig::load_from(&path).is_err());
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     #[test]
@@ -1594,7 +1613,7 @@ mod tests {
         let cfg = ChangeJobConfig::load_from(&path).unwrap();
         assert!(!cfg.enabled);
         assert_eq!(cfg.max_parallel, 1);
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
 
         let env: HashMap<&str, &str> = [
             ("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_ENABLED", "true"),
@@ -1646,7 +1665,7 @@ mod tests {
         assert_eq!(cfg.poll_interval_secs, 42);
         assert_eq!(cfg.targets.len(), 1);
         assert_eq!(cfg.targets[0].deployment, "d1");
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
 
         let env: HashMap<&str, &str> = [
             ("COGNEVA_MAINLINE_DEPLOYER_ENABLED", "true"),
@@ -1770,7 +1789,7 @@ mod tests {
         )
         .unwrap();
         assert!(GenerationLimits::load_from(&path).is_err());
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     #[test]

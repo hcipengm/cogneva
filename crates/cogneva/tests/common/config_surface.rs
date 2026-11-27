@@ -946,7 +946,7 @@ impl TypeGraph {
         } else if let Some(rest) = bare.strip_prefix("super::") {
             (from.crate_name.clone(), last_segment(rest))
         } else if bare.contains("::") {
-            let first = bare.split("::").next().unwrap_or_default();
+            let first = bare.split("::").next().unwrap_or(Default::default());
             if self
                 .definitions
                 .keys()
@@ -1003,7 +1003,7 @@ impl TypeGraph {
         let Some(info) = info else {
             let produced = read_back
                 .map(|map| map.keys().cloned().collect())
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             out.push(SectionShape {
                 path: prefix.to_string(),
                 written,
@@ -1613,7 +1613,7 @@ fn rename_case(name: &str, rename_all: Option<&str>) -> String {
     match rename_all {
         "camelCase" => {
             let mut parts = name.split('_');
-            let head = parts.next().unwrap_or_default();
+            let head = parts.next().unwrap_or(Default::default());
             let rest: String = parts
                 .map(|part| {
                     let mut chars = part.chars();

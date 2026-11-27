@@ -23,7 +23,8 @@ const DECOMPOSITION_ALERT_PREFIX: &str = "decomposition_";
 /// 当成计划：一条三小时的任务按两个十分钟的样本排成二十分钟，会让它在计划上
 /// 「早就该完了」——一个凭空造出来的落后。样本不够就不排，读数上读作「还没
 /// 样本」，那是真话。
-// cap: bound — 样本不够就不排程；两三个样本排出来的计划会让一条任务在计划上「早就该完了」，那是凭空造出来的落后
+// cap: fixed — 样本不够就不排程；两三个样本排出来的计划会让一条任务在计划上「早就该完了」，那是凭空造出来的落后
+// keep: 删掉后两三个样本就排程，计划上的「早就该完了」是凭空造出来的；由「样本不够就不排程」兜住
 pub const MIN_ESTIMATE_SAMPLES: u64 = 5;
 
 /// 基线版本串里表示「这个数是估的、没有人批过」的那一段。
@@ -186,7 +187,9 @@ mod retry_matrix_wiring_tests {
 /// `reason="pass_ceiling"`: a healthy publisher holds nothing under that label,
 /// and one that holds a large share of every pass is a ceiling that should be
 /// re-tuned or a pool reading that never arrives.
-// cap: bound — 落进 pass_ceiling 标签的计数是它的读数：健康的发布者在那里占用为零，占了大头的说明这个数该重调
+// cap: fixed — 落进 pass_ceiling 标签的计数是它的读数：健康的发布者在那里占用为零，占了大头的说明这个数该重调
+// keep: 删掉后回到「落进 pass_ceiling 标签的计数是它的读数：健康的发布者在那里占用为零，占了大头的说明这个数该重调」所描述的情形；由这条约定兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const READY_TASKS_PER_PASS: u64 = 200;
 
 /// 门类占比量的是最近多少小时的落地。
@@ -194,7 +197,8 @@ const READY_TASKS_PER_PASS: u64 = 200;
 /// 一天：短到能跟住队列今天的形状，长到装得下这个平台一天落一百来条账行的
 /// 量（2026-11-06 实测 24 小时 100 条）。半个小时的窗口在这个速率下只有两三条
 /// 样本，而两条样本算出来的占比是噪声，会让一整类活的座位跟着一次偶然走。
-// cap: bound — 窗口要装下一天在这个速率下的落地量（2026-11-06 实测 24 小时 100 条）；速率再低时样本不够，GateShare 回答 None 而不是编一个占比。窗口是钉住的，不是跟着速率动的量
+// cap: fixed — 窗口要装下一天在这个速率下的落地量（2026-11-06 实测 24 小时 100 条）；速率再低时样本不够，GateShare 回答 None 而不是编一个占比。窗口是钉住的，不是跟着速率动的量
+// keep: 删掉后窗口跟着速率动，速率低时占比样本不够却照样编一个数；由「窗口是钉住的」兜住
 const GATE_SHARE_WINDOW_HOURS: i64 = 24;
 
 /// 门类占比的缓存：量它的时刻，与那次量到的答案。
@@ -208,7 +212,8 @@ type GateShareCache =
 ///
 /// 发布者的节拍是秒级，而落地数在十分钟里不会变出第二种答案：每拍问一次就是
 /// 拿一整类活的节拍去换一个十位数，而库已经在为别的读超时。
-// cap: bound — 只挡重复读；把账问得更勤换不到更早的答案，只会让库多一次超时
+// cap: fixed — 只挡重复读；把账问得更勤换不到更早的答案，只会让库多一次超时
+// keep: 删掉后每读一次都问账，库多一次超时换不到更早的答案；由「只挡重复读」兜住
 const GATE_SHARE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// How long the goal consumer holds before pulling the next goal when the
@@ -220,7 +225,8 @@ const GATE_SHARE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs
 /// waking, the same pool verdict is read again and a pool still down is refused
 /// without spending an LLM call. The cap is what makes the hold safe, not what
 /// makes it cheap.
-// cap: bound — 等待是池子自己说的「何时能再服务」，可以是小时级（月度配额）；扣满它会让 intake 对提前恢复失聪，而唤醒后那一问不花一次调用，没有读数应该把这个数移动
+// cap: fixed — 等待是池子自己说的「何时能再服务」，可以是小时级（月度配额）；扣满它会让 intake 对提前恢复失聪，而唤醒后那一问不花一次调用，没有读数应该把这个数移动
+// keep: 删掉后扣满池子的等待，intake 对提前恢复失聪；由「等待是池子自己说的」兜住
 const GOAL_CONSUMER_MAX_HOLD: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// What one pass may admit, together with the reading it was derived from.
@@ -2500,6 +2506,9 @@ async fn wbs_verdict_no_longer_holds(
             blocked_by: task.blocked_by.clone(),
             blocks: task.blocks.clone(),
             input: task.input.clone(),
+            terminal: String::new(),
+            now: String::new(),
+            gap: String::new(),
             output_entities: Vec::new(),
             estimated_seconds: 0,
             parent_id: task.parent_task_id.clone(),
@@ -2675,7 +2684,7 @@ mod consumer_ack_tests {
                 .lock()
                 .unwrap()
                 .remove(subject)
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             let stream =
                 futures::stream::iter(queue.into_iter().map(Ok)).chain(futures::stream::pending());
             Ok(Box::pin(stream))
@@ -2804,6 +2813,9 @@ mod consumer_ack_tests {
             task_type: cog_core::TaskType::DagNode,
             status: cog_core::TaskStatus::Pending,
             input,
+            terminal: String::new(),
+            now: String::new(),
+            gap: String::new(),
             result: None,
             error: None,
             error_cause: None,
@@ -3470,26 +3482,28 @@ mod consumer_ack_tests {
             ..DagExecutorConfig::default()
         };
         let runtime = test_runtime_with(backend.clone(), config);
+        // 负责人写在任务行上（`agent_id`）：座位背后是谁由这一格回答。
+        let mut bound = ready_task("task-seat", serde_json::json!({}));
+        bound.agent_id = Some("E0412".into());
+        bound.owner_unit = Some("E0412".into());
         runtime
             .orchestrator()
-            .submit_goal(
-                "goal-seat-result",
-                vec![ready_task("task-seat", serde_json::json!({}))],
-            )
+            .submit_goal("goal-seat-result", vec![bound])
             .await
             .unwrap();
+
+        // 座位代表谁由它所属的那件活的负责人回答：同一件活的每一把椅子
+        // 都是行上那位；另一件活上的椅子才是别人。
+        let mut foreign = ready_task("task-foreign", serde_json::json!({}));
+        foreign.agent_id = Some("E0455".into());
         runtime
             .orchestrator()
-            .assign_task("task-seat", "E0412")
+            .submit_goal("goal-seat-elsewhere", vec![foreign])
             .await
-            .expect("a pending task takes a binding");
+            .unwrap();
 
         let same_person = cog_core::agent_id_for("task-seat", cog_core::roles::GENERATOR);
-        let other_person = cog_core::agent_id_for("task-seat", cog_core::roles::EVALUATOR);
-        let seats = Arc::new(crate::test_support::Seats::default());
-        seats.assign_person(&same_person, "E0412").await.unwrap();
-        seats.assign_person(&other_person, "E0455").await.unwrap();
-        runtime.orchestrator().attach_roster(seats);
+        let other_person = cog_core::agent_id_for("task-foreign", cog_core::roles::EVALUATOR);
 
         assert!(
             !runtime
@@ -3607,7 +3621,7 @@ mod consumer_ack_tests {
         let handle = tokio::spawn(async move { runtime.run_consumer(shutdown_clone).await });
         let acks = wait_for_acks(&backend, 1).await;
         shutdown.trigger();
-        let _ = handle.await.unwrap();
+        cog_core::ignore_lost!(handle.await.unwrap());
 
         assert_eq!(acks, vec!["rid-1".to_string()]);
     }
@@ -3627,7 +3641,7 @@ mod consumer_ack_tests {
         let handle = tokio::spawn(async move { runtime.run_consumer(shutdown_clone).await });
         let acks = wait_for_acks(&backend, 1).await;
         shutdown.trigger();
-        let _ = handle.await.unwrap();
+        cog_core::ignore_lost!(handle.await.unwrap());
 
         assert_eq!(acks, vec!["rid-poison".to_string()]);
     }
@@ -3653,7 +3667,7 @@ mod consumer_ack_tests {
         let handle = tokio::spawn(async move { runtime.run_consumer(shutdown_clone).await });
         wait_for_acks(&backend, 1).await;
         shutdown.trigger();
-        let _ = handle.await.unwrap();
+        cog_core::ignore_lost!(handle.await.unwrap());
 
         let writes = backend.dlq_writes();
         assert_eq!(writes.len(), 1, "一条毒消息对应一笔死信写");
@@ -3700,6 +3714,9 @@ mod consumer_ack_tests {
             task_type: cog_core::TaskType::DagNode,
             status: cog_core::TaskStatus::Pending,
             input: serde_json::json!({}),
+            terminal: String::new(),
+            now: String::new(),
+            gap: String::new(),
             result: None,
             error: None,
             error_cause: None,
@@ -3764,7 +3781,7 @@ mod consumer_ack_tests {
         let handle = tokio::spawn(async move { runtime.run_consumer(shutdown_clone).await });
         let acks = wait_for_acks(&backend, 1).await;
         shutdown.trigger();
-        let _ = handle.await.unwrap();
+        cog_core::ignore_lost!(handle.await.unwrap());
 
         assert_eq!(acks, vec!["rid-pending".to_string()]);
         // The point is the state transition, not merely draining the entry.
@@ -3830,7 +3847,7 @@ mod consumer_ack_tests {
         let handle = tokio::spawn(async move { runtime.run_consumer(shutdown_clone).await });
         let metrics = wait_for_stream_metrics(&stream).await;
         shutdown.trigger();
-        let _ = handle.await.unwrap();
+        cog_core::ignore_lost!(handle.await.unwrap());
 
         let of = |name: &str| {
             metrics
@@ -3914,7 +3931,7 @@ mod consumer_ack_tests {
         }
         let calls = backend.pending_stats_calls();
         shutdown.trigger();
-        let _ = handle.await;
+        cog_core::ignore_lost!(handle.await);
 
         // The round really is stuck, so those readings cannot have come from it:
         // a round that had returned would have taken the message back and acked
@@ -3952,7 +3969,7 @@ mod consumer_ack_tests {
         let handle = tokio::spawn(async move { runtime.run_goal_consumer(shutdown_clone).await });
         let acks = wait_for_acks(&backend, 1).await;
         shutdown.trigger();
-        let _ = handle.await.unwrap();
+        cog_core::ignore_lost!(handle.await.unwrap());
 
         assert_eq!(acks, vec!["gid-1".to_string()]);
     }
@@ -4009,7 +4026,7 @@ mod consumer_ack_tests {
         let handle = tokio::spawn(async move { runtime.run_goal_consumer(shutdown_clone).await });
         let acks = wait_for_acks(&backend, 1).await;
         shutdown.trigger();
-        let _ = handle.await.unwrap();
+        cog_core::ignore_lost!(handle.await.unwrap());
 
         assert_eq!(acks, vec!["gid-refused".to_string()]);
     }
@@ -5081,7 +5098,7 @@ mod orphan_reconciler_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         shutdown.trigger();
-        let _ = handle.await;
+        cog_core::ignore_lost!(handle.await);
 
         assert!(
             recording
@@ -5151,7 +5168,7 @@ mod orphan_reconciler_tests {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
         shutdown.trigger();
-        let _ = handle.await;
+        cog_core::ignore_lost!(handle.await);
 
         assert!(
             resolved,
@@ -5201,7 +5218,7 @@ mod orphan_reconciler_tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         shutdown.trigger();
-        let _ = handle.await;
+        cog_core::ignore_lost!(handle.await);
 
         assert!(
             !recording

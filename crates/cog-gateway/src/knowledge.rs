@@ -30,7 +30,8 @@ use crate::GatewayState;
 /// The widest answer this route will assemble. Same ceiling the wiki search
 /// applies, because both are asking a store to return a page of its contents
 /// over HTTP rather than sizing an internal candidate window.
-// cap: bound — 检索最多回多少条，界的是单次查询的代价
+// cap: fixed — 检索最多回多少条，界的是单次查询的代价
+// keep: 删掉后一次检索可以要任意多条，单次查询的代价无界；由「界的是单次查询的代价」兜住
 const MAX_TOP_K: usize = 100;
 
 #[derive(Debug, Deserialize)]

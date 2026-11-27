@@ -15,7 +15,8 @@ use cog_core::RuntimeConfig;
 /// then the message the handler is inside has to finish. Ten seconds is where
 /// an idle consumer always makes it and a busy one is always worth a line — it
 /// is a judgement about the wait, not a percentile of task duration.
-// cap: bound — 是对这段等待的判断，不是任务时长的分位数：空闲的消费者总能赶到，忙的那个总值得记一行
+// cap: fixed — 是对这段等待的判断，不是任务时长的分位数：空闲的消费者总能赶到，忙的那个总值得记一行
+// keep: 删掉后一次退役会一直等一个忙着的消费者，退役流程挂住；由「等待只覆盖消费者赶到的窗口」兜住
 // wall: 等=忙碌的消费者把手上那条消息处理完 / 等不到=记一行「退役时还有消费者在忙」，然后照常退役——这一格不阻止退役 / 续跑=不适用：退役是一次性的，重来就是第二次退役
 const AGENT_RETIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -52,6 +53,9 @@ pub enum AgentCommand {
         /// unscoped prompt.
         task_id: Option<String>,
         input: serde_json::Value,
+        /// 这一次运行是为哪一句意图做的（同事发来的话的身份）。None = 输入
+        /// 自己没带、调用方也没说：运行照跑，只是派出去的活不带这一格。
+        intent_id: Option<String>,
         result_tx: oneshot::Sender<SFResult<serde_json::Value>>,
     },
     Continue {
@@ -135,7 +139,7 @@ pub struct Agent {
     /// Where the loop sends a tool output too large to fit the context window,
     /// so the bytes it drops stay reachable by the reference in the marker.
     tool_output_archive: Option<Arc<dyn crate::archive::ToolOutputArchive>>,
-    tool_call_events: Option<Arc<dyn cog_core::ToolCallEvents>>,
+    tool_call_events: Option<Arc<dyn cog_core::EventStore>>,
     /// Broadcast channel capacity for agent events.
     event_channel_capacity: usize,
     /// 持久事件总线投递口。装上之后 AgentEnd 只写总线（broadcast 由
@@ -354,7 +358,7 @@ impl Agent {
     ///
     /// Separate from the archive on purpose: the record of a call is not the body
     /// it carried, and a run with no archive still happened.
-    pub fn with_tool_call_events(mut self, events: Arc<dyn cog_core::ToolCallEvents>) -> Self {
+    pub fn with_tool_call_events(mut self, events: Arc<dyn cog_core::EventStore>) -> Self {
         self.tool_call_events = Some(events);
         self
     }
@@ -512,15 +516,15 @@ impl Agent {
                     "this employee could not be put on the lifecycle row; it will run without one"
                 );
             }
-            let _ = lifecycle.transition(agent_id, AgentState::Registered).await;
-            let _ = lifecycle.transition(agent_id, AgentState::Idle).await;
+            cog_core::ignore_lost!(lifecycle.transition(agent_id, AgentState::Registered).await);
+            cog_core::ignore_lost!(lifecycle.transition(agent_id, AgentState::Idle).await);
         }
 
         // Global registry integration: register this agent so supervisors
         // and orchestrators can discover it.
         if let Some(ref registry) = self.registry {
             if let Some(ref registration) = self.registration {
-                let _ = registry.register(registration).await;
+                cog_core::ignore_lost!(registry.register(registration).await);
                 // Spawn periodic heartbeat to keep the registration alive.
                 // A lost key (TTL expiry, Redis flush, another replica's
                 // shutdown) must not silence this agent forever: re-register
@@ -560,7 +564,7 @@ impl Agent {
     /// State machine: `Idle → Active → Completing → Idle` on success,
     /// `Active → Dead` on failure.
     pub async fn prompt(&self, input: serde_json::Value) -> SFResult<serde_json::Value> {
-        self.dispatch_prompt(None, input).await
+        self.dispatch_prompt(None, input, None).await
     }
 
     /// Inherent counterpart of [`cog_core::Agent::prompt_for_task`] for callers
@@ -570,7 +574,17 @@ impl Agent {
         task_id: &str,
         input: serde_json::Value,
     ) -> SFResult<serde_json::Value> {
-        self.dispatch_prompt(Some(task_id.to_string()), input).await
+        self.dispatch_prompt(Some(task_id.to_string()), input, None)
+            .await
+    }
+
+    /// 为一句已知的意图跑一轮：派出去的活会挂上那个身份。
+    pub async fn prompt_for_intent(
+        &self,
+        input: serde_json::Value,
+        intent_id: Option<String>,
+    ) -> SFResult<serde_json::Value> {
+        self.dispatch_prompt(None, input, intent_id).await
     }
 
     /// The change this task's checkout holds, as git prints it.
@@ -633,6 +647,7 @@ impl Agent {
         &self,
         task_id: Option<String>,
         input: serde_json::Value,
+        intent_id: Option<String>,
     ) -> SFResult<serde_json::Value> {
         self.start().await;
         let (result_tx, result_rx) = oneshot::channel();
@@ -648,6 +663,7 @@ impl Agent {
                 .send(AgentCommand::Prompt {
                     task_id,
                     input,
+                    intent_id,
                     result_tx,
                 })
                 .await
@@ -667,8 +683,12 @@ impl Agent {
                     inner.state = AgentState::Idle;
                     if let Some(ref lifecycle) = self.lifecycle {
                         let agent_id = &self.config.agent_id;
-                        let _ = lifecycle.transition(agent_id, AgentState::Completing).await;
-                        let _ = lifecycle.transition(agent_id, AgentState::Idle).await;
+                        cog_core::ignore_lost!(
+                            lifecycle.transition(agent_id, AgentState::Completing).await
+                        );
+                        cog_core::ignore_lost!(
+                            lifecycle.transition(agent_id, AgentState::Idle).await
+                        );
                     }
                 } else {
                     // 这一条没答上来，不等于是个死人：循环还在，下一次派发照样
@@ -679,8 +699,12 @@ impl Agent {
                     inner.state = AgentState::Idle;
                     if let Some(ref lifecycle) = self.lifecycle {
                         let agent_id = &self.config.agent_id;
-                        let _ = lifecycle.transition(agent_id, AgentState::Completing).await;
-                        let _ = lifecycle.transition(agent_id, AgentState::Idle).await;
+                        cog_core::ignore_lost!(
+                            lifecycle.transition(agent_id, AgentState::Completing).await
+                        );
+                        cog_core::ignore_lost!(
+                            lifecycle.transition(agent_id, AgentState::Idle).await
+                        );
                     }
                 }
                 result
@@ -729,8 +753,12 @@ impl Agent {
                     inner.state = AgentState::Idle;
                     if let Some(ref lifecycle) = self.lifecycle {
                         let agent_id = &self.config.agent_id;
-                        let _ = lifecycle.transition(agent_id, AgentState::Completing).await;
-                        let _ = lifecycle.transition(agent_id, AgentState::Idle).await;
+                        cog_core::ignore_lost!(
+                            lifecycle.transition(agent_id, AgentState::Completing).await
+                        );
+                        cog_core::ignore_lost!(
+                            lifecycle.transition(agent_id, AgentState::Idle).await
+                        );
                     }
                 } else {
                     // 这一条没答上来，不等于是个死人：循环还在，下一次派发照样
@@ -741,8 +769,12 @@ impl Agent {
                     inner.state = AgentState::Idle;
                     if let Some(ref lifecycle) = self.lifecycle {
                         let agent_id = &self.config.agent_id;
-                        let _ = lifecycle.transition(agent_id, AgentState::Completing).await;
-                        let _ = lifecycle.transition(agent_id, AgentState::Idle).await;
+                        cog_core::ignore_lost!(
+                            lifecycle.transition(agent_id, AgentState::Completing).await
+                        );
+                        cog_core::ignore_lost!(
+                            lifecycle.transition(agent_id, AgentState::Idle).await
+                        );
                     }
                 }
                 result
@@ -807,8 +839,8 @@ impl Agent {
     pub async fn abort(&self) -> SFResult<()> {
         if let Some(ref lifecycle) = self.lifecycle {
             let agent_id = &self.config.agent_id;
-            let _ = lifecycle.transition(agent_id, AgentState::Completing).await;
-            let _ = lifecycle.transition(agent_id, AgentState::Inactive).await;
+            cog_core::ignore_lost!(lifecycle.transition(agent_id, AgentState::Completing).await);
+            cog_core::ignore_lost!(lifecycle.transition(agent_id, AgentState::Inactive).await);
         }
 
         {
@@ -877,7 +909,7 @@ impl Agent {
 
         if let Some(ref lifecycle) = self.lifecycle {
             let agent_id = &self.config.agent_id;
-            let _ = lifecycle.transition(agent_id, AgentState::Inactive).await;
+            cog_core::ignore_lost!(lifecycle.transition(agent_id, AgentState::Inactive).await);
         }
         if let Some(ref registry) = self.registry {
             if let Err(e) = registry.deregister(&self.config.agent_id).await {
@@ -945,6 +977,7 @@ impl Agent {
         let Some(handle) = handle else {
             return true;
         };
+        // wall: 等=一个忙着的消费者走到空闲 / 等不到=这一趟退役不再等，回收照常交回 / 续跑=不适用：退役是一次性的，重来就是第二次退役
         tokio::time::timeout(AGENT_RETIRE_TIMEOUT, handle)
             .await
             .is_ok()
@@ -1361,6 +1394,7 @@ impl Agent {
                 goal,
                 reply_stream,
                 from_agent,
+                intent,
             } => {
                 // 一条 Prompt 是「开始一次新的运行」，不是「接着说」——后者是
                 // `Continue`，下面那一条。员工无状态：上一轮留在窗口里的对话
@@ -1384,7 +1418,7 @@ impl Agent {
                     from_agent.as_deref(),
                     &spoken,
                 ));
-                let out = self.prompt(input).await?;
+                let out = self.prompt_for_intent(input, intent).await?;
                 if let Some(stream) = reply_stream {
                     publish_inbox_reply(self.message_backend.as_ref(), &stream, &out).await?;
                 }
@@ -1572,7 +1606,7 @@ impl Drop for Agent {
             let agent_id = self.config.agent_id.clone();
             let lifecycle = lifecycle.clone();
             finish_off_thread(async move {
-                let _ = lifecycle.transition(&agent_id, AgentState::Inactive).await;
+                cog_core::ignore_lost!(lifecycle.transition(&agent_id, AgentState::Inactive).await);
             });
         }
 
@@ -1581,7 +1615,7 @@ impl Drop for Agent {
             let agent_id = self.config.agent_id.clone();
             let registry = registry.clone();
             finish_off_thread(async move {
-                let _ = registry.deregister(&agent_id).await;
+                cog_core::ignore_lost!(registry.deregister(&agent_id).await);
             });
         }
     }
@@ -1633,7 +1667,7 @@ fn forward_event(
             return;
         }
     }
-    let _ = broadcast_tx.send(event);
+    cog_core::ignore_lost!(broadcast_tx.send(event));
 }
 
 async fn run_agent_task(
@@ -1647,18 +1681,24 @@ async fn run_agent_task(
             AgentCommand::Prompt {
                 task_id,
                 input,
+                intent_id,
                 result_tx,
             } => {
                 let result = agent_loop
-                    .run_scoped(input, llm.as_ref(), task_id.as_deref())
+                    .run_scoped_for_intent(
+                        input,
+                        llm.as_ref(),
+                        task_id.as_deref(),
+                        intent_id.as_deref(),
+                    )
                     .await;
-                let _ = result_tx.send(result);
+                cog_core::ignore_lost!(result_tx.send(result));
             }
             AgentCommand::Continue { input, result_tx } => {
                 // AgentRuntime::run() appends the user message to existing context,
                 // so continuing is the same as prompting on the same loop instance.
                 let result = agent_loop.run(input, llm.as_ref()).await;
-                let _ = result_tx.send(result);
+                cog_core::ignore_lost!(result_tx.send(result));
             }
             AgentCommand::Steer { instruction } => {
                 let context = agent_loop.get_context();
@@ -1674,7 +1714,7 @@ async fn run_agent_task(
                 // all — so a reset loop answered with nothing to call while
                 // still running its state machine normally.
                 agent_loop.reset();
-                let _ = result_tx.send(Ok(()));
+                cog_core::ignore_lost!(result_tx.send(Ok(())));
             }
             AgentCommand::Snapshot { task_id, result_tx } => {
                 let snap = agent_loop.checkpoint(&task_id);
@@ -1695,7 +1735,7 @@ async fn run_agent_task(
                         }
                     }
                 }
-                let _ = result_tx.send(snap);
+                cog_core::ignore_lost!(result_tx.send(snap));
             }
         }
     }
@@ -1935,7 +1975,8 @@ fn workspace_change_from(result: &cog_core::SandboxResult) -> Option<String> {
 /// coming"); this wait is only to learn why, so it is short enough that a loop
 /// still inside a tool call does not hold the caller for longer than the
 /// failure it is reporting.
-// cap: bound — 等的是"为什么没答"这句话，不是答案；短到不把一个卡住的调用变成调用方的新等待
+// cap: fixed — 等的是"为什么没答"这句话，不是答案；短到不把一个卡住的调用变成调用方的新等待
+// keep: 删掉后一次卡住的调用会把等待转嫁给调用方；由「只等这句话，不等答案」兜住
 const RUN_END_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Why a run ended without answering.
@@ -1962,6 +2003,7 @@ async fn unanswered_run(handle: &mut Option<tokio::task::JoinHandle<()>>) -> SFE
         // `&mut JoinHandle` 也是一个 future：等得到结果，但把手仍归调用方。
         // 等到结果就把把手清掉（这一步已经结束了，再等它一次没有意义）；等不到
         // 就原样留着——循环还在跑，下一次失败还要靠它说出是谁没答。
+        // wall: 等=一次运行结束 / 等不到=把手留着，循环继续 / 续跑=能，下一次失败再看它
         Some(running) => tokio::time::timeout(RUN_END_GRACE, &mut *running).await,
     };
     let Ok(ended) = waited else {

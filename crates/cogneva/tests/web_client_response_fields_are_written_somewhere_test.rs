@@ -217,7 +217,7 @@ fn the_census_is_wide_enough_to_mean_something() {
 #[test]
 fn a_field_no_writer_spells_is_reported() {
     let root = std::env::temp_dir().join(format!("cogneva-field-writer-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     std::fs::create_dir_all(root.join("web/src/api")).expect("temp web tree");
     std::fs::create_dir_all(root.join("crates/demo/src")).expect("temp crate tree");
     std::fs::write(
@@ -257,5 +257,5 @@ fn a_field_no_writer_spells_is_reported() {
     )
     .is_empty());
 
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }

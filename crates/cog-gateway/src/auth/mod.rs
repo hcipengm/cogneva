@@ -336,10 +336,12 @@ impl cog_core::UserStore for InMemoryUserStore {
 
 /// Failed-login attempts allowed per identifier inside the window before
 /// the endpoint answers 429.
-// cap: bound — 同一来源在窗口内允许的登录失败次数，界的是暴力猜密码的成本
+// cap: fixed — 同一来源在窗口内允许的登录失败次数，界的是暴力猜密码的成本
+// keep: 删掉后同一来源的失败次数没有上限，暴力猜密码不受成本约束；由「界的是暴力猜密码的成本」兜住
 pub const LOGIN_MAX_ATTEMPTS: u32 = 5;
 /// Sliding window (seconds) for failed-login counting.
-// cap: bound — 失败计数的滑动窗口长度，与上限配成一对
+// cap: fixed — 失败计数的滑动窗口长度，与上限配成一对
+// keep: 删掉后失败计数没有窗口，昨天的失败今天还算在名额里；由「与上限配成一对」兜住
 pub const LOGIN_WINDOW_SECONDS: u64 = 300;
 
 /// Rate-limits failed login attempts per identifier.
@@ -1334,7 +1336,7 @@ pub async fn validate_session_handler(
                     match sm.get(user_id, session_id).await {
                         Ok(Some(session)) => {
                             // Optionally refresh the session on validation
-                            let _ = sm.refresh(user_id, session_id).await;
+                            cog_core::ignore_lost!(sm.refresh(user_id, session_id).await);
                             (
                                 StatusCode::OK,
                                 Json(json!({

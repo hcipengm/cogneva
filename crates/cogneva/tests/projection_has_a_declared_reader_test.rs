@@ -129,7 +129,7 @@ fn every_projection_table_declares_its_reader_and_why_the_source_would_not_do() 
             ));
             continue;
         }
-        let text = std::fs::read_to_string(&test_path).unwrap_or_default();
+        let text = std::fs::read_to_string(&test_path).unwrap_or(Default::default());
         if !text.contains("#[ignore") || !text.contains("async fn") {
             unexplained.push(format!(
                 "{}: {} 里没有一条需要真库的重算用例（`#[ignore]` + `async fn`）",
@@ -143,7 +143,26 @@ fn every_projection_table_declares_its_reader_and_why_the_source_would_not_do() 
         unexplained.join("\n")
     );
 
-    let stale: Vec<&String> = declared.difference(&found).collect();
+    // 没有水位的投影（整表重算：每次都从头算，不存在「读到哪」）不在 DDL 的
+    // `as_of` 人口里；它们由形状声明里的 `watermark: None` 认领。一个读者声明既不在
+    // 水位人口里、也不被任何整表重算的投影认领，才是「声明没跟上表」。
+    let full_rebuild: BTreeSet<String> = cog_storage::table_shapes::MUTABLE_TABLES
+        .iter()
+        .filter(|declaration| {
+            matches!(
+                declaration.shape,
+                cog_storage::table_shapes::TableShape::Projection {
+                    watermark: None,
+                    ..
+                }
+            )
+        })
+        .map(|declaration| declaration.table.to_string())
+        .collect();
+    let stale: Vec<&String> = declared
+        .difference(&found)
+        .filter(|table| !full_rebuild.contains(*table))
+        .collect();
     assert!(
         stale.is_empty(),
         "契约声明了这几张投影表，而树上的 DDL 里已经没有带水位的表叫这个名字：\

@@ -31,6 +31,12 @@ pub enum LedgerState {
     /// 终态到了：差距那一格空着才成立。
     #[serde(rename = "已落")]
     Reached,
+    /// 属主免除了这一条：它不在本账的收口范围内（差距那一格写明谁、哪一天、为什么）。
+    ///
+    /// 它与「已落」不是一回事：事情没做，只是不再由这本账追。所以它不进批次、
+    /// 也不算「到了终态」那一栏；写成「已落」会把一次豁免读成一次交付。
+    #[serde(rename = "已豁免")]
+    Exempt,
 }
 
 impl LedgerState {
@@ -39,6 +45,7 @@ impl LedgerState {
         match self {
             LedgerState::Open => "未落",
             LedgerState::Reached => "已落",
+            LedgerState::Exempt => "已豁免",
         }
     }
 
@@ -47,8 +54,27 @@ impl LedgerState {
         match word {
             "未落" => Some(LedgerState::Open),
             "已落" => Some(LedgerState::Reached),
+            "已豁免" => Some(LedgerState::Exempt),
             _ => None,
         }
+    }
+
+    /// 结局与差距合起来说的那一问：任务完成、且差距写的是空/破折号，才是终态。
+    ///
+    /// 规则只有这一处：`LedgerItem::at_outcome`、`Task::ledger_state` 与流上的
+    /// `state_from_transition` 都调它。三处各写一次 `if` 时，「差距离写成破折号算不算
+    /// 空」这件事迟早会有一处漏掉。
+    pub fn from_outcome(completed: bool, gap: &str) -> Self {
+        if completed && EMPTY_GAP.contains(&gap.trim()) {
+            LedgerState::Reached
+        } else {
+            LedgerState::Open
+        }
+    }
+
+    /// 反过来读：这个状态词是不是「成立」。
+    pub fn is_reached(self) -> bool {
+        self == LedgerState::Reached
     }
 }
 
@@ -75,11 +101,30 @@ pub struct LedgerItem {
     pub now: String,
     /// 差距：终态减现在，写成缺什么。空着 = 到终态了。
     pub gap: String,
-    /// 状态。
+    /// 状态。没写就是 `未落`：一条只有三格、还没人说过它到了的待办，按「还在
+    /// 做」读。缺省值在这里不是为了宽松，是因为写三格的入口（planner、对话）
+    /// 只被要求写三格——要求它们再写一次这个词，多的那一格只会与差距对不上。
+    #[serde(default)]
     pub state: LedgerState,
 }
 
 impl LedgerItem {
+    /// 把一次运行的结局折进状态这一格：任务报告**完成**、且差距那一格已经空着，
+    /// 这一条才读作 `已落`；失败、撤回、还在跑，或者完成却仍写着差距，都是
+    /// `未落`。
+    ///
+    /// 差距原样不动——它写的是世界上还缺什么，一次运行报告成功不等于那件事在
+    /// 树上成立了；改掉它得由读树的人说。所以「跑完了」这一格能读到
+    /// `status=completed`，但待办仍是未落，直到差距被读树的人清掉：一个带着
+    /// 差距的 `已落` 是这一族最坏的形状，它把「文件改了」读成「做完了」。
+    ///
+    /// 任务行上只有 `status` 一处写着结局。状态是读的时候现算的，不抄进任务行的
+    /// `input`：抄一份就等于多一处要跟着重试和结局同步的副本。
+    pub fn at_outcome(mut self, status: crate::TaskStatus) -> Self {
+        self.state = LedgerState::from_outcome(status == crate::TaskStatus::Completed, &self.gap);
+        self
+    }
+
     /// 差距是不是空着。空 = 这一条已经到终态（不再进批次）。
     pub fn gap_is_empty(&self) -> bool {
         EMPTY_GAP.contains(&self.gap.trim())
@@ -93,7 +138,12 @@ impl LedgerItem {
     /// - 写着 `已落` 却还留着差距：**按未完成读**——跳过它等于承认那个假的终态，
     ///   而那个假的终态从此不会被任何门看第二眼。
     pub fn is_in_batch(&self) -> bool {
-        self.state == LedgerState::Open || !self.gap_is_empty()
+        match self.state {
+            LedgerState::Open => true,
+            LedgerState::Reached => !self.gap_is_empty(),
+            // 豁免的一条不进批次：它的差距格写着豁免的出处，不代表还有活要做。
+            LedgerState::Exempt => false,
+        }
     }
 }
 
@@ -236,7 +286,7 @@ pub fn parse_md(text: &str) -> Result<Vec<LedgerItem>, String> {
     }
     if !bad.is_empty() {
         return Err(format!(
-            "这些行的状态词不在闭集里（只有 `未落` / `已落`）：{}",
+            "这些行的状态词不在闭集里（只有 `未落` / `已落` / `已豁免`）：{}",
             bad.join("、")
         ));
     }
@@ -248,6 +298,40 @@ pub fn parse_md(text: &str) -> Result<Vec<LedgerItem>, String> {
 /// 与 [`parse_md`] 是同一把尺子的两面：那一面只交「还进批次的」，这一面只交「已经到
 /// 了的」。两个函数读同一组格子规则，一处改了另一处也必须改——所以这里带一条用例，
 /// 拿同一本台账比对两面的答案，免得「做完了」与「还在做」各读各的。
+/// 这一轮要做的那些条目：显式点名的那一批，或（没有点名时）全部未完成的。
+///
+/// 显式批次只做两件事：**筛**（顺序仍按台账，按点名顺序会让同一批在两次执行里
+/// 换一个次序）与**查**（点了一个台账上没有的标记不是一个更小的批，是点错了——
+/// 静默丢掉它，这一轮就会带着一个缺条目的批走完全部验证）。
+pub fn select_batch<'a>(
+    items: &'a [LedgerItem],
+    asked: Option<&[String]>,
+) -> Result<Vec<&'a LedgerItem>, String> {
+    let Some(asked) = asked else {
+        return Ok(items.iter().collect());
+    };
+    if asked.is_empty() {
+        return Err("显式批次里一条都没点：至少要有一条，或者不要传这一项".into());
+    }
+    let mut unknown: Vec<&str> = asked
+        .iter()
+        .filter(|id| !items.iter().any(|item| &item.id == *id))
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        unknown.sort_unstable();
+        unknown.dedup();
+        return Err(format!(
+            "这一批里点了台账上没有的标记：{}",
+            unknown.join(", ")
+        ));
+    }
+    Ok(items
+        .iter()
+        .filter(|item| asked.iter().any(|id| id == &item.id))
+        .collect())
+}
+
 pub fn reached_ids(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -314,11 +398,15 @@ mod tests {
         assert_eq!(done, vec!["S2", "S4"]);
     }
 
-    fn item(terminal: &str, now: &str, gap: &str, state: LedgerState) -> LedgerItem {
+    /// 夹具：`(id, 终态, 差距, 状态)`；「现在」留空，这些用例判的都不是它。
+    ///
+    /// 第一格是 id：批次用例按 id 断言点名与排序，固定成 N99 时那条断言
+    /// 永远只看得到同一个标记（2026-11-27 这条用例红着，红的是夹具）。
+    fn item(id: &str, terminal: &str, gap: &str, state: LedgerState) -> LedgerItem {
         LedgerItem {
-            id: "N99".into(),
+            id: id.into(),
             terminal: terminal.into(),
-            now: now.into(),
+            now: String::new(),
             gap: gap.into(),
             state,
         }
@@ -366,6 +454,42 @@ mod tests {
     ///
     /// 这是这条类型存在的理由：判据是那段描述，不是一条测试。若这里要求一个读数，
     /// 那么所有描述性的待办都会被读成「信息不足」，而它们其实什么都写清楚了。
+    /// 默认仍是全量；点名只筛不改顺序；点错一个标记是错误，不是更小的批。
+    #[test]
+    fn an_explicit_batch_filters_without_reordering_and_refuses_unknown_marks() {
+        let items = vec![
+            item("S1", "a", "b", LedgerState::Open),
+            item("S2", "a", "b", LedgerState::Open),
+            item("S3", "a", "b", LedgerState::Open),
+        ];
+        let ids = |selected: &[&LedgerItem]| -> Vec<String> {
+            selected.iter().map(|item| item.id.clone()).collect()
+        };
+
+        let all = select_batch(&items, None).expect("no selection is the whole batch");
+        assert_eq!(ids(&all), vec!["S1", "S2", "S3"]);
+
+        // 点名顺序与台账顺序相反：结果仍按台账排。
+        let asked = vec!["S3".to_string(), "S1".to_string()];
+        let some = select_batch(&items, Some(&asked)).expect("both marks exist");
+        assert_eq!(ids(&some), vec!["S1", "S3"]);
+
+        // 重复点名不会把一条排两次。
+        let twice = vec!["S2".to_string(), "S2".to_string()];
+        assert_eq!(
+            ids(&select_batch(&items, Some(&twice)).unwrap()),
+            vec!["S2"]
+        );
+
+        // 点了一个台账上没有的标记：错误里点名它，不静默丢掉。
+        let typo = vec!["S2".to_string(), "S29".to_string()];
+        let err = select_batch(&items, Some(&typo)).expect_err("a typo is not a smaller batch");
+        assert!(err.contains("S29"), "{err}");
+
+        // 一条都没点：这也是错误——空批会让轮开着而什么也不做。
+        assert!(select_batch(&items, Some(&[])).is_err());
+    }
+
     #[test]
     fn a_prose_terminal_with_no_reading_still_has_an_open_gap() {
         let it = item(
@@ -376,6 +500,67 @@ mod tests {
         );
         assert!(it.is_in_batch(), "散文终态的一条被读成了不在批次里");
         assert!(!it.gap_is_empty());
+    }
+
+    /// 一份只写了三格的待办（planner 的答案）读得回来：缺省状态是 `未落`。
+    #[test]
+    fn an_item_without_a_state_reads_as_open() {
+        let item: LedgerItem = serde_json::from_value(serde_json::json!({
+            "id": "t1",
+            "terminal": "树上是这个样子",
+            "now": "现在还不是",
+            "gap": "还差那一处",
+        }))
+        .expect("三格齐的待办该读得回来");
+        assert_eq!(item.state, LedgerState::Open);
+        assert!(item.is_in_batch());
+    }
+
+    /// 结局折进状态：只有「完成且差距已空」读作 `已落`；其余仍 `未落`，
+    /// 差距那一格一步不动。
+    #[test]
+    fn an_outcome_moves_the_state_only_when_the_gap_is_already_empty() {
+        let open = item("到", "还没到", "还差那一处", LedgerState::Open);
+        let done = open.clone().at_outcome(crate::TaskStatus::Completed);
+        assert_eq!(
+            done.state,
+            LedgerState::Open,
+            "跑完了但差距还在：读成已落就是把「文件改了」当成「做完了」"
+        );
+        assert_eq!(done.gap, "还差那一处", "世界上的缺口不由一次运行抹掉");
+        assert!(done.is_in_batch());
+
+        for status in [
+            crate::TaskStatus::Pending,
+            crate::TaskStatus::Scheduled,
+            crate::TaskStatus::Running,
+            crate::TaskStatus::Failed,
+            crate::TaskStatus::Cancelled,
+        ] {
+            assert_eq!(
+                open.clone().at_outcome(status).state,
+                LedgerState::Open,
+                "{status:?} 不该把待办读成已落"
+            );
+        }
+
+        let verified =
+            item("到", "已经到了", "—", LedgerState::Open).at_outcome(crate::TaskStatus::Completed);
+        assert_eq!(verified.state, LedgerState::Reached);
+        assert!(!verified.is_in_batch());
+    }
+
+    /// 属主豁免的一条：不进批次，也不算「到了终态」——事情没做，只是不再由这本账追。
+    #[test]
+    fn an_exempted_row_leaves_the_batch_but_is_not_a_landing() {
+        let exempt = item(
+            "N25",
+            "长篇写作里的平台能力",
+            "属主 2026-11-26 豁免：本账不跟踪",
+            LedgerState::Exempt,
+        );
+        assert!(!exempt.is_in_batch(), "豁免的一条还挂在批次里");
+        assert_ne!(exempt.state, LedgerState::Reached, "把一次豁免读成一次交付");
     }
 
     /// `已落` 只在差距为空时成立；带着差距的 `已落` 要按未完成读。
@@ -418,6 +603,7 @@ mod tests {
     #[test]
     fn the_state_words_are_a_closed_set() {
         assert_eq!(LedgerState::parse("未落"), Some(LedgerState::Open));
+        assert_eq!(LedgerState::parse("已豁免"), Some(LedgerState::Exempt));
         assert_eq!(LedgerState::parse("已落"), Some(LedgerState::Reached));
         assert_eq!(LedgerState::parse("进行中"), None);
         assert_eq!(LedgerState::Open.as_str(), "未落");
@@ -439,5 +625,25 @@ mod tests {
         assert!(!wire.contains("Open"), "线上出现了台账不认的旁名：{wire}");
         let back: LedgerItem = serde_json::from_str(&wire).expect("读不回来");
         assert_eq!(back, item);
+    }
+}
+
+#[cfg(test)]
+mod verdict_word_tests {
+    use super::{LedgerState, EMPTY_GAP};
+
+    /// 状态词与差距合起来只有一张对照：完成且差距为空／破折号才是已落。
+    #[test]
+    fn the_outcome_and_the_gap_are_one_table() {
+        assert_eq!(LedgerState::from_outcome(true, ""), LedgerState::Reached);
+        assert_eq!(LedgerState::from_outcome(true, "—"), LedgerState::Reached);
+        assert_eq!(
+            LedgerState::from_outcome(true, "缺的是 X"),
+            LedgerState::Open
+        );
+        assert_eq!(LedgerState::from_outcome(false, ""), LedgerState::Open);
+        assert!(LedgerState::Reached.is_reached());
+        assert!(!LedgerState::Open.is_reached());
+        assert!(EMPTY_GAP.contains(&"–"));
     }
 }

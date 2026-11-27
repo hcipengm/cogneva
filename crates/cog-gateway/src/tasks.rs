@@ -140,6 +140,19 @@ pub struct TaskItem {
     /// generation and auto-deploy pipeline.
     pub task_type: String,
     pub input: serde_json::Value,
+    /// 这条活的终态描述。
+    ///
+    /// 三格随行一起来、是任务的一等字段，不放进 `input` 的开集载荷：判据、界面
+    /// 与定批都按键读它们，埋在文本里就不可查询。老调用方仍可把三格放在
+    /// `input.ledger_item` 里，写事实前会被提到字段上。
+    #[serde(default)]
+    pub terminal: Option<String>,
+    /// 此刻的样子（写明来源）。
+    #[serde(default)]
+    pub now: Option<String>,
+    /// 缺什么；空 = 到终态。
+    #[serde(default)]
+    pub gap: Option<String>,
     #[serde(default)]
     pub blocked_by: Vec<String>,
     #[serde(default)]
@@ -377,10 +390,19 @@ pub struct TaskView {
     /// 没有这一列，「做完了」只能靠读结果自己猜。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acceptance: Vec<String>,
+    /// 这一行带着的待办三格（终态／现在／差距），状态按行自己的结局现算：
+    /// **完成且差距已空**才是 `已落`，其余仍 `未落`，差距不动。没带三格的行
+    /// 不出这一格——「这一条没有差距」与「这一行不是待办」在读面上是两件事。
+    ///
+    /// 现算而不回写 `input`：行上只有 `status` 一处写结局，读的时候折进来，
+    /// 重试一次读出来的状态就跟着变，没有第二份要同步的副本。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger_item: Option<cog_core::contract::ledger_item::LedgerItem>,
 }
 
 impl From<Task> for TaskView {
     fn from(t: Task) -> Self {
+        let ledger_item = t.ledger_item();
         Self {
             id: t.id,
             task_type: task_type_str(&t.task_type),
@@ -411,6 +433,7 @@ impl From<Task> for TaskView {
             bound_by_handover_id: t.bound_by_handover_id,
             venue: t.venue,
             acceptance: t.acceptance,
+            ledger_item,
         }
     }
 }
@@ -913,6 +936,15 @@ fn submitted_tasks(
                         parse_task_type(&item.task_type),
                         item.input.clone(),
                     );
+                    if let Some(terminal) = item.terminal.as_deref() {
+                        task.terminal = terminal.to_string();
+                    }
+                    if let Some(now) = item.now.as_deref() {
+                        task.now = now.to_string();
+                    }
+                    if let Some(gap) = item.gap.as_deref() {
+                        task.gap = gap.to_string();
+                    }
                     task.blocked_by = item.blocked_by.clone();
                     task.priority = item.priority;
                     task.workspace_id = Some(req.workspace_id.clone());
@@ -985,7 +1017,7 @@ fn submitted_tasks(
                 })
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     if rows.is_empty() {
         let mut goal_row = Task::goal_row(goal_id, &req.goal);
         goal_row.workspace_id = Some(req.workspace_id.clone());
@@ -1187,7 +1219,8 @@ pub async fn create_task_handler(
 /// 超过它的等待方早就不在了（它自己那一轮有停滞超时），连接只是挂在那里。
 /// 门这一侧再钳一次，是因为这个读口不问调用方是谁：一个任意长的 `wait_ms`
 /// 就是一条能被外面拿住的连接。
-// cap: bound — 人定的（override）：与 await_task 的上限同一个决定，超过它等待方早已不在
+// cap: fixed — 人定的（override）：与 await_task 的上限同一个决定，超过它等待方早已不在
+// keep: 删掉后回到「人定的（override）：与 await_task 的上限同一个决定，超过它等待方早已不在」所描述的情形；由这条约定兜住
 pub const MAX_TASK_WAIT_MS: u64 = 600_000;
 
 /// `GET /api/v1/tasks/{id}` 的等待参数。
@@ -1309,7 +1342,9 @@ pub async fn list_tasks_handler(
 /// 那一屏最多同时看得到三百行，台账读口一页五十行。超了不截、不静默降级——
 /// 一个要一万行的调用方想要的不是一页，是整张表，而那张表今天九千多行、三十
 /// 八兆，收到之后它只会截掉再看，字节一个没少。
-// cap: bound — 一页多大由读者一屏读得完多少定，不由表的行数定；要整张表的人要的是整张表，不是更大的一页
+// cap: fixed — 一页多大由读者一屏读得完多少定，不由表的行数定；要整张表的人要的是整张表，不是更大的一页
+// keep: 删掉后一页跟着表的行数走，而不是跟着一屏读得完多少；由「要整张表的人要的是整张表」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 pub const MAX_TASKS_PER_PAGE: usize = 1000;
 
 /// 调用方要的这一页有几行。`None` 是「不翻页」，与从前逐字相同。
@@ -2355,6 +2390,66 @@ mod tests {
         }
     }
 
+    /// 任务行带着的三格随行自己的结局现算：只有「完成且差距已空」读作 `已落`；
+    /// 完成却还写着差距、失败、还在跑，都是 `未落`。没带三格的行不出这一格——
+    /// 「没有差距」与「不是一条待办」在读面上是两件事。
+    #[test]
+    fn the_task_view_reads_the_ledger_state_from_the_rows_own_outcome() {
+        use cog_core::contract::ledger_item::{LedgerItem, LedgerState, ITEM_INPUT_KEY};
+        let item = LedgerItem {
+            id: "a".into(),
+            terminal: "树上是这个样子".into(),
+            now: "现在还不是".into(),
+            gap: "还差那一处".into(),
+            state: LedgerState::Open,
+        };
+        for (status, want) in [
+            (cog_core::TaskStatus::Completed, "未落"),
+            (cog_core::TaskStatus::Failed, "未落"),
+            (cog_core::TaskStatus::Cancelled, "未落"),
+            (cog_core::TaskStatus::Running, "未落"),
+        ] {
+            let mut t = task("a", status, "t", 0);
+            t.input = serde_json::json!({
+                ITEM_INPUT_KEY: serde_json::to_value(&item).expect("待办该序列化得出来"),
+            });
+            let view: TaskView = t.into();
+            let got = view.ledger_item.expect("带三格的行该读得出待办");
+            assert_eq!(
+                got.state.as_str(),
+                want,
+                "{status:?} 在任务读面上读错了状态"
+            );
+            assert_eq!(got.gap, "还差那一处", "一次运行的结局不抹掉世界上的缺口");
+            let wire = serde_json::to_value(&got).expect("读面该序列化得出来");
+            assert!(
+                wire["state"] == "已落" || wire["state"] == "未落",
+                "读面印的不是台账上的词：{wire}"
+            );
+        }
+        // 完成且差距已空：这时才读作已落——差距是被读树的人清掉的，不是被
+        // 一次运行报告成功抹掉的。
+        let mut reached = item.clone();
+        reached.gap = String::new();
+        let mut done = task("c", cog_core::TaskStatus::Completed, "t", 0);
+        done.input = serde_json::json!({
+            ITEM_INPUT_KEY: serde_json::to_value(&reached).expect("待办该序列化得出来"),
+        });
+        let view: TaskView = done.into();
+        assert_eq!(
+            view.ledger_item
+                .expect("带三格的行该读得出待办")
+                .state
+                .as_str(),
+            "已落"
+        );
+        let bare: TaskView = task("b", cog_core::TaskStatus::Completed, "t", 0).into();
+        assert!(
+            bare.ledger_item.is_none(),
+            "没带三格的行不该凭空长出一条待办"
+        );
+    }
+
     /// 总线帧里带的是同一个词，而且网关自己的等级过滤器认得它：`failed` 帧要被
     /// 标成 error。帧里写死另一种拼法时，这一层永远标不出 error，读起来像
     /// 「没有一次失败」，而不是像一处拼错。
@@ -3001,6 +3096,9 @@ mod tests {
                 id: "case-1".into(),
                 task_type: "benchmark_case".into(),
                 input: serde_json::json!({ "x": 1 }),
+                terminal: None,
+                now: None,
+                gap: None,
                 blocked_by: vec![],
                 priority: 0,
                 planner: None,
@@ -3019,6 +3117,46 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "case-1");
         assert_eq!(tasks[0].goal_id.as_deref(), Some("goal-9"));
+    }
+
+    /// 门交上来的三格落在任务的一等字段上，不留在 `input` 的开集载荷里。
+    #[test]
+    fn a_rows_cells_land_on_the_task_not_in_input() {
+        let req = CreateTaskRequest {
+            goal_id: None,
+            goal: "g".into(),
+            tasks: Some(vec![crate::tasks::TaskItem {
+                id: "case-2".into(),
+                task_type: "benchmark_case".into(),
+                input: serde_json::json!({ "x": 1 }),
+                terminal: Some("到终态".into()),
+                now: Some("此刻".into()),
+                gap: Some("缺的是：接线".into()),
+                blocked_by: vec![],
+                priority: 0,
+                planner: None,
+                agent_id: None,
+                face_id: None,
+                unit_id: None,
+                venue: None,
+                declared_duration_seconds: None,
+                renamed_timeout_seconds: None,
+            }]),
+            workspace_id: "ws".into(),
+            priority: None,
+            intent_kind: IntentKind::Goal,
+        };
+        let tasks = submitted_tasks(&req, "goal-9", None);
+        assert_eq!(tasks[0].terminal, "到终态");
+        assert_eq!(tasks[0].now, "此刻");
+        assert_eq!(tasks[0].gap, "缺的是：接线");
+        assert!(
+            tasks[0]
+                .input
+                .get(cog_core::contract::ledger_item::ITEM_INPUT_KEY)
+                .is_none(),
+            "三格不该留在 input 里"
+        );
     }
 
     /// 提交人点名的场地要落到行上：工作台按这一列把活分开看，而这个标签没有
@@ -3083,6 +3221,9 @@ mod tests {
             id: id.into(),
             task_type: "benchmark_case".into(),
             input: serde_json::json!({ "x": 1 }),
+            terminal: None,
+            now: None,
+            gap: None,
             blocked_by: vec![],
             priority: 0,
             planner: verified.map(|v| PlannerClaim {

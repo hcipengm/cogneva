@@ -57,6 +57,7 @@ mod tests {
             goal: serde_json::Value::String(instruction.into()),
             reply_stream: None,
             from_agent: Some("squad:task-1-reviewer".into()),
+            intent: None,
         }
     }
 
@@ -85,6 +86,7 @@ mod tests {
             goal: serde_json::json!({ "step": 2 }),
             reply_stream: None,
             from_agent: None,
+            intent: None,
         };
         assert_eq!(
             as_turn_text(&msg).as_deref(),

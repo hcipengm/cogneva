@@ -79,7 +79,8 @@ pub const INFRA_WATCH_LOOP: &str = "infra_watch";
 /// first miss turns that into a close followed by a re-fire, which the receiver
 /// reads as a brand-new alert with a fresh `fired_at` -- a false "it was
 /// resolved and came back" for something that never went away.
-// cap: bound — 少于两拍就关，会让一条没消失的告警读成全新的、带着新 fired_at 的告警，一次「解决过又回来了」的假象
+// cap: fixed — 少于两拍就关，会让一条没消失的告警读成全新的、带着新 fired_at 的告警，一次「解决过又回来了」的假象
+// keep: 删掉后回到「少于两拍就关，会让一条没消失的告警读成全新的、带着新 fired_at 的告警，一次「解决过又回来了」的假象」所描述的情形；由这条约定兜住
 const MISSING_TICKS_BEFORE_CLOSE: u32 = 2;
 
 /// Outlets the watcher drives. Both are optional: with no store the watcher
@@ -1128,7 +1129,8 @@ pub async fn query_prometheus(
 fn describe_api_error(body: &[u8]) -> Option<String> {
     /// Prometheus messages embed the whole match group; enough to recognise
     /// the cause, not enough to flood the alert row.
-    // cap: bound — Prometheus 的消息会带上整个匹配组；够认出病因，又不够淹掉告警那一行
+    // cap: fixed — Prometheus 的消息会带上整个匹配组；够认出病因，又不够淹掉告警那一行
+    // keep: 删掉后整个匹配组把告警那一行淹掉；由「够认出病因」兜住
     const MAX_CHARS: usize = 300;
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let kind = v.get("errorType").and_then(|e| e.as_str())?;
@@ -1205,7 +1207,7 @@ pub fn parse_vector_response(body: &serde_json::Value) -> Result<Vec<SeriesSampl
                     .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let value = entry
             .get("value")
             .and_then(|v| v.as_array())
@@ -2748,7 +2750,7 @@ mod tests {
             .expect("rules array");
         let mut checked = 0;
         for rule in rules {
-            let promql = rule["promql"].as_str().unwrap_or_default();
+            let promql = rule["promql"].as_str().unwrap_or(Default::default());
             // Labels this rule's own PromQL names: `label="..."` matchers and
             // `by (...)` groupings both keep that label on the sample.
             let mut selected: BTreeSet<String> = BTreeSet::new();
@@ -2777,7 +2779,7 @@ mod tests {
                 }
             }
 
-            let summary = rule["summary"].as_str().unwrap_or_default();
+            let summary = rule["summary"].as_str().unwrap_or(Default::default());
             let mut rest = summary;
             while let Some(open) = rest.find('{') {
                 let after = &rest[open + 1..];

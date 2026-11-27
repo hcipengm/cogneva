@@ -51,12 +51,14 @@ pub const DEFAULT_URL: &str = crate::process_report::DEFAULT_REPORT_URL;
 pub const NODE_ENV: &str = cog_core::env::NODE_NAME;
 
 /// 一拍多久。与容器自报同一个节奏：两边报的是同一份读数，节奏不该有两套。
-// cap: bound — 与容器自报同一个节奏：两边报的是同一份读数，节奏不该有两套
+// cap: fixed — 与容器自报同一个节奏：两边报的是同一份读数，节奏不该有两套
+// keep: 删掉后两边报同一份读数却用两套节奏，读数对不上；由「与容器自报同一个节奏」兜住
 pub const INTERVAL: Duration = Duration::from_secs(60);
 
 /// cgroup 树往下最多走几层。宿主布局是 `/kubepods.slice/<qos>.slice/<pod>.slice/<scope>`，
 /// 四层；留一倍余量，再多就不是我们认识的布局，而不是「树很深」。
-// cap: bound — 宿主布局是四层（/kubepods.slice/<qos>.slice/<pod>.slice/<scope>）；留一倍余量，再多就不是我们认识的布局
+// cap: fixed — 宿主布局是四层（/kubepods.slice/<qos>.slice/<pod>.slice/<scope>）；留一倍余量，再多就不是我们认识的布局
+// keep: 删掉后走查深度没有界，坏布局把递归拉爆；由「宿主布局是四层、留一倍余量」兜住
 const MAX_DEPTH: usize = 8;
 
 /// systemd 驱动给容器起的 scope 名。cgroupfs 驱动下叶子目录名就是 id 本身，
@@ -262,7 +264,7 @@ struct Census {
 
 impl Census {
     fn from_env(root: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
-        let node = std::env::var(NODE_ENV).unwrap_or_default();
+        let node = std::env::var(NODE_ENV).unwrap_or(Default::default());
         let url = std::env::var(URL_ENV)
             .ok()
             .filter(|url| !url.trim().is_empty())
@@ -371,7 +373,7 @@ mod tests {
     fn a_container_is_read_from_the_pids_in_its_own_cgroup() {
         // 没有这次改动就会红：采集器根本不读宿主 cgroup 树，这一格拿不到任何进程。
         let root = std::env::temp_dir().join(format!("cog-census-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
         tree(&root);
         let scanned = scan(&root);
         let mine = scanned.get(A).expect("这个 cgroup 里有一个真实进程");
@@ -385,7 +387,7 @@ mod tests {
             !scanned.contains_key(B),
             "空的 cgroup 不是一个容器，报上去读作「里面没有进程」"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     /// 没有这次改动就会红：Pod 的沙箱容器（pause）不在 `containerStatuses` 里，
@@ -408,7 +410,7 @@ mod tests {
         assert_eq!(pod_uid_of_dir("system.slice"), None);
 
         let root = std::env::temp_dir().join(format!("cog-census-pod-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
         tree(&root);
         // 一个直接挂在 QoS 层下的叶子：没有 Pod 认领它（宿主上直接起的容器）。
         let loose = root.join("kubepods.slice/kubepods-burstable.slice");
@@ -428,7 +430,7 @@ mod tests {
             None,
             "不在 Pod slice 下的容器没有归属，不能被安到任何 Pod 上"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     /// 宿主上的构建容器可以跑着上百个进程，而表只收前几十条：那一格必须跟着
@@ -436,7 +438,7 @@ mod tests {
     #[test]
     fn a_cgroup_with_more_pids_than_the_table_holds_states_how_many_it_saw() {
         let root = std::env::temp_dir().join(format!("cog-census-capped-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
         let leaf = root.join(format!("cri-containerd-{A}.scope"));
         std::fs::create_dir_all(&leaf).unwrap();
         // 自己的 pid 重复填满：这一格判的是计数与截断，而重复的 pid 保证每一行都
@@ -454,7 +456,7 @@ mod tests {
             "列出来的 pid 个数要在截断之前取"
         );
         assert_eq!(row.processes.len(), cap, "条数照旧按上限收");
-        let _ = std::fs::remove_dir_all(&root);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     #[test]
@@ -466,7 +468,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cog-census-ok-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         assert!(root_is_usable(&root).is_ok());
-        let _ = std::fs::remove_dir_all(&root);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 }
 

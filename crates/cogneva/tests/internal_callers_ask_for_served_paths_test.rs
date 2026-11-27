@@ -137,8 +137,8 @@ fn the_reader_sees_literals_shapes_and_ignores_fixtures() {
     let production = "\
 async fn call(&self) -> Result<()> {
     self.call(\"POST\", \"/api/v1/tasks\", Some(body)).await?;
-    let _ = format!(\"/api/v1/tasks/{task_id}\");
-    let _ = format!(\"/api/v1/traces?limit={LIMIT}\");
+    cog_core::ignore_lost!(format!(\"/api/v1/tasks/{task_id}\"));
+    format!(\"/api/v1/traces?limit={LIMIT}\").ok();
     Ok(())
 }
 ";
@@ -153,14 +153,14 @@ async fn call(&self) -> Result<()> {
 
     let fixture = "\
 fn handle(path_only: &str) {
-    let _ = path_only.strip_prefix(\"/api/v1/ghost/\");
+    cog_core::ignore_lost!(path_only.strip_prefix(\"/api/v1/ghost/\"));
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn fixture() {
-        let _ = \"/api/v1/ghost\";
+        cog_core::ignore_lost!(\"/api/v1/ghost\");
     }
 }
 ";
@@ -174,7 +174,7 @@ mod tests {
 #[test]
 fn a_caller_path_the_gateway_does_not_serve_is_reported() {
     let root = std::env::temp_dir().join(format!("cogneva-internal-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     std::fs::create_dir_all(root.join("crates/cog-gateway/src")).expect("temp gateway");
     std::fs::create_dir_all(root.join("crates/cog-eval/src")).expect("temp caller");
 
@@ -202,5 +202,5 @@ fn a_caller_path_the_gateway_does_not_serve_is_reported() {
     let (complaints, _) = contradictions(&root, &crate_files_of(&root));
     assert!(complaints.is_empty(), "{complaints:?}");
 
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }

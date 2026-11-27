@@ -229,6 +229,10 @@ live_check redis 'Live-Redis capped agent log' cargo test -p cog-storage --test 
 live_check db 'Live-DB call events' cargo test -p cog-storage --test llm_call_events -- --ignored
 live_check db 'Live-DB transition events' cargo test -p cog-storage --test a_task_transition_leaves_one_event_test -- --ignored
 live_check db 'Live-DB usage readers agree' cargo test -p cogneva --test the_usage_readers_agree_row_by_row -- --ignored
+# 库里的界：`pg_settings` 与数值列的人口每一跑现算，账上缺一行就红。树普查扫不到这一半。
+live_check db 'Live-DB bounds census' python3 scripts/db-bounds-census.py --check
+# 库里的有损面：引用动作与分区摘除，判词写在约束所属模块；没判词一律红。
+live_check db 'Live-DB loss census' python3 scripts/db-loss-census.py --check
 live_check db 'Live-DB batch cost' cargo test -p cogneva --test a_batch_id_answers_what_the_batch_cost_test -- --ignored
 live_check db 'Live-DB rollup is gone' cargo test -p cogneva --test the_rollup_is_gone_test -- --ignored
 live_check db 'Live-DB round events' cargo test -p cog-storage --test round_events -- --ignored

@@ -68,6 +68,7 @@ pub struct SquadConfig {
 // 评审的人，不是再跑一遍同样的生成轮次。升级第二次没有第三条拓扑可升，只是
 // 同一张桌子再吵一轮。
 // cap: fixed — 升级次数由拓扑数定：Pipeline 之后只有 Roundtable 这一种拓扑
+// keep: 删掉后升级次数与拓扑数脱钩，同一件活在坏拓扑上反复升级；由「Pipeline 之后只有 Roundtable」兜住
 const SQUAD_POLICY_UPGRADES: u32 = 1;
 
 impl Default for SquadConfig {
@@ -109,7 +110,8 @@ pub struct Squad {
 }
 
 /// 连续 Pipeline 失败多少次后自动升级到 Roundtable 模式。
-// cap: bound — 连续两次 Pipeline 都失败，第三次的结局不会再变，所以升级拓扑而不是再试一遍
+// cap: fixed — 连续两次 Pipeline 都失败，第三次的结局不会再变，所以升级拓扑而不是再试一遍
+// keep: 删掉后同一件活在 Pipeline 上一遍遍失败，第三次的结局不会再变；由「连续两次都失败就升级拓扑」兜住
 pub const PIPELINE_FAILURES_BEFORE_UPGRADE: u32 = 2;
 
 /// 单个 Squad 执行结果。
@@ -163,13 +165,9 @@ pub struct SquadExecutor {
     stage_store: Option<Arc<dyn cog_core::PgeStageStore>>,
     /// 上游池的暂停开关。None = 这个进程不认识那道闸，行为与从前一样。
     pub(crate) pause_gate: Option<Arc<dyn cog_core::SchedulerGate>>,
-    /// 员工名册：座位建出来之后要把「背后坐着谁」写进名册行。
-    roster: Option<Arc<dyn cog_core::AgentRegistry>>,
-    /// 这一段座位背后的人（工号），来自任务行的 `owner_unit`。
-    ///
-    /// 与 [`Self::roster`] 成对：没有名册就没有地方写，没有工号就没有可写的。
-    /// 两者都缺时座位照建，判归属退回旧口径（名字要比得一模一样）。
-    person: Option<String>,
+    /// 判据的修订读面。None = 计划定下之后判据不再变，与从前一样。
+    pub(crate) terminal_revisions:
+        Option<Arc<dyn cog_core::contract::terminal_revision::TerminalRevisions>>,
 }
 
 /// Optional service dependencies shared by squad execution stages.
@@ -194,10 +192,9 @@ pub(crate) struct SquadDeps {
     pub stage_store: Option<Arc<dyn cog_core::PgeStageStore>>,
     /// 上游池的暂停开关，原样交给每一条 Ralph 循环。
     pub pause_gate: Option<Arc<dyn cog_core::SchedulerGate>>,
-    /// 员工名册：座位建出来之后把「背后坐着谁」写进名册行。
-    pub roster: Option<Arc<dyn cog_core::AgentRegistry>>,
-    /// 这一段座位背后的人（工号），来自任务行的 `owner_unit`。
-    pub person: Option<String>,
+    /// 判据的修订读面，原样交给每一条 Ralph 循环。
+    pub terminal_revisions:
+        Option<Arc<dyn cog_core::contract::terminal_revision::TerminalRevisions>>,
 }
 
 /// 给流水线挂上阶段产物的记录位置。
@@ -330,17 +327,12 @@ impl SquadExecutor {
         self
     }
 
-    /// 挂上员工名册与这一段座位背后的人（工号）。
-    ///
-    /// 两个一起给才有意义：座位建好之后要有人可写、有名册可写。只给一个时
-    /// 座位照建，只是名册行上不会多出这一格——判归属退回旧口径。
-    pub fn with_person(
+    /// 让这个执行器每一轮开始前读一次判据的修订。
+    pub fn with_terminal_revisions(
         mut self,
-        roster: Option<Arc<dyn cog_core::AgentRegistry>>,
-        person: Option<String>,
+        revisions: Arc<dyn cog_core::contract::terminal_revision::TerminalRevisions>,
     ) -> Self {
-        self.roster = roster;
-        self.person = person;
+        self.terminal_revisions = Some(revisions);
         self
     }
 
@@ -373,7 +365,7 @@ impl SquadExecutor {
                 &squad_id,
                 serde_json::json!({"task_id": &task_id}),
             );
-            let _ = comm.broadcast(&msg).await;
+            cog_core::ignore_lost!(comm.broadcast(&msg).await);
         }
 
         // Mode selection is done upstream by ModeSelectorAgent (LLM semantic
@@ -403,8 +395,7 @@ impl SquadExecutor {
             local_repair_max: self.local_repair_max,
             stage_store: self.stage_store.clone(),
             pause_gate: self.pause_gate.clone(),
-            roster: self.roster.clone(),
-            person: self.person.clone(),
+            terminal_revisions: self.terminal_revisions.clone(),
         };
         let result = Self::run_squad_with_retries(squad, deps).await;
         let squad_latency_ms = squad_start.elapsed().as_millis() as u64;
@@ -459,7 +450,7 @@ impl SquadExecutor {
                     "success": result.success,
                 }),
             );
-            let _ = comm.broadcast(&msg).await;
+            cog_core::ignore_lost!(comm.broadcast(&msg).await);
         }
 
         result
@@ -515,8 +506,6 @@ impl SquadExecutor {
                 manager,
                 llm,
                 deps.state_backend.as_ref(),
-                deps.roster.as_ref(),
-                deps.person.as_deref(),
                 &squad.task_id,
                 cog_core::roles::PLANNER,
                 cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Plan),
@@ -574,8 +563,6 @@ impl SquadExecutor {
                 manager,
                 llm,
                 deps.state_backend.as_ref(),
-                deps.roster.as_ref(),
-                deps.person.as_deref(),
                 &squad.task_id,
                 cog_core::roles::GENERATOR,
                 squad.config.deliverable.clone(),
@@ -597,8 +584,6 @@ impl SquadExecutor {
                 manager,
                 llm,
                 deps.state_backend.as_ref(),
-                deps.roster.as_ref(),
-                deps.person.as_deref(),
                 &squad.task_id,
                 cog_core::roles::EVALUATOR,
                 cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Judgement),
@@ -644,14 +629,11 @@ impl SquadExecutor {
                 .config
                 .profile
                 .map(|p| p.declared_scale)
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             let declared = crate::squad::pge::pipeline::declared_plan(&squad.config.goal, scale);
+            // 没有尝试上限：出口只有终态、确定性环境失败与停滞检测。自进化任务
+            // 也不再单独钉「一次尝试」——那是一个到点就停的界，不是完成判。
             let mut pipeline_config = PgePipelineConfig::default();
-            if squad.config.is_self_evolution {
-                // 与 Pipeline 同一条：自进化任务对延迟敏感，一次尝试交给外层
-                // Ralph 做全局重置就够。
-                pipeline_config.max_retries = 1;
-            }
             pipeline_config.local_repair_max = deps
                 .local_repair_max
                 .unwrap_or(crate::DEFAULT_LOCAL_REPAIR_MAX);
@@ -675,8 +657,6 @@ impl SquadExecutor {
                     manager,
                     llm,
                     state,
-                    deps.roster.as_ref(),
-                    deps.person.as_deref(),
                     &squad.task_id,
                     cog_core::roles::PLANNER,
                     cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Plan),
@@ -687,8 +667,6 @@ impl SquadExecutor {
                     manager,
                     llm,
                     state,
-                    deps.roster.as_ref(),
-                    deps.person.as_deref(),
                     &squad.task_id,
                     cog_core::roles::GENERATOR,
                     squad.config.deliverable.clone(),
@@ -699,8 +677,6 @@ impl SquadExecutor {
                     manager,
                     llm,
                     state,
-                    deps.roster.as_ref(),
-                    deps.person.as_deref(),
                     &squad.task_id,
                     cog_core::roles::EVALUATOR,
                     cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Judgement),
@@ -708,19 +684,18 @@ impl SquadExecutor {
                 )
                 .await;
                 // Moderator is optional — failure to create it is non-fatal.
-                let moderator = crate::resume::create_role_agent(
-                    manager,
-                    llm,
-                    state,
-                    deps.roster.as_ref(),
-                    deps.person.as_deref(),
-                    &squad.task_id,
-                    cog_core::roles::MODERATOR,
-                    cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Answer),
-                    squad.config.stated_directions.clone(),
-                )
-                .await
-                .ok();
+                let moderator = cog_core::logged_ok!(
+                    crate::resume::create_role_agent(
+                        manager,
+                        llm,
+                        state,
+                        &squad.task_id,
+                        cog_core::roles::MODERATOR,
+                        cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Answer),
+                        squad.config.stated_directions.clone(),
+                    )
+                    .await
+                );
 
                 match (planner, generator, evaluator) {
                     (Ok(p), Ok(g), Ok(e)) => (Some(p), Some(g), Some(e), moderator),
@@ -748,12 +723,9 @@ impl SquadExecutor {
                 history: Vec::new(),
             },
             PgeMode::Pipeline => {
+                // No attempt cap: the pipeline leaves on the terminal holding, a
+                // deterministic environment failure, or the stall detector.
                 let mut pipeline_config = PgePipelineConfig::default();
-                if squad.config.is_self_evolution {
-                    // Self-evolution tasks are latency-sensitive: one attempt per
-                    // Ralph iteration is enough; rely on Ralph for global reset.
-                    pipeline_config.max_retries = 1;
-                }
                 // The repair loop is what lets the evaluator's feedback reach the
                 // generator without paying for a new plan, so it is set for every
                 // mode rather than only the non-self-evolution ones: the run that
@@ -848,8 +820,6 @@ impl SquadExecutor {
                                 manager,
                                 llm,
                                 deps.state_backend.as_ref(),
-                                deps.roster.as_ref(),
-                                deps.person.as_deref(),
                                 &squad.task_id,
                                 cog_core::roles::MERGER,
                                 cog_core::DeliverableDeclaration::protocol(
@@ -1001,6 +971,9 @@ impl SquadExecutor {
         }
         if let Some(ref gate) = deps.pause_gate {
             ralph = ralph.with_pause_gate(gate.clone());
+        }
+        if let Some(ref revisions) = deps.terminal_revisions {
+            ralph = ralph.with_terminal_revisions(revisions.clone());
         }
 
         // 若 Squad 已携带快照，先从后端恢复
@@ -1320,7 +1293,7 @@ fn build_contributions_from_verdict(
                 "escalate to a human or reframe the goal",
             )]
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
 
     // Pipeline 快照在顶层包含 plan / generation / evaluation
     let has_pipeline_shape = snapshot.get("plan").is_some() || snapshot.get("final_plan").is_some();
@@ -1404,7 +1377,8 @@ fn extract_evaluation(
 /// 终止原因走的是上游的错误正文：实测一条 `upstream_unavailable` 原因带 84 KB
 /// 的 HTTP 响应体，同一条记忆的 details 就照抄这个长度。细节是给复发匹配和读的
 /// 人看的，超出这个长度的部分既读不动，又让每次全量读取按行数乘上去。
-// cap: bound — 细节是给人读的，超出这个长度的部分既读不动，又让每次全量读取按行数乘上去
+// cap: fixed — 细节是给人读的，超出这个长度的部分既读不动，又让每次全量读取按行数乘上去
+// keep: 删掉后每次全量读取按行数乘上去，细节既读不动又拖慢读取；由「细节是给人读的」兜住
 pub const LEARNING_DETAILS_CHARS: usize = 4096;
 
 /// 把细节截到 [`LEARNING_DETAILS_CHARS`]，并在截断处写明留了多少、原本多少。
@@ -1482,7 +1456,7 @@ fn learning_from_termination(
                 .join("\n");
             format!("\nlast iteration criteria:\n{lines}")
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let mut learning = cog_core::Learning::new(
         cog_core::LearningCategory::Correction,
         cog_core::Priority::High,

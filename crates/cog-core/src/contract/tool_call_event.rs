@@ -25,6 +25,12 @@ pub struct ToolCallEvent {
     pub unit_of_work: String,
     /// 工具名。
     pub tool: String,
+    /// 模型当时看到的工具说明。工具会改，回放要用当时那一份，不是今天的。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_description: Option<String>,
+    /// 模型当时看到的参数 schema 的 sha256。schema 正文可从注册表按这一格核对。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_sha256: Option<String>,
     /// 参数字节的哈希（sha256 hex）。正文不进事件。
     pub arguments_sha256: String,
     /// 参数字节数。
@@ -43,6 +49,18 @@ pub struct ToolCallEvent {
     /// 不给它，就得按哈希去载体取正文再解析——那是把一次读数变成一次回源，而回源
     /// 读不到时整份清单会静默变空。给一格之后，清单是事件自己回答的。
     pub path: Option<String>,
+    /// 正文的存放处（`artifact://…`）；`None` 表示这一份正文没有可取的载体。
+    ///
+    /// 事件里存的是哈希，哈希只证明「取回来的字节对不对」，不告诉人去哪取。
+    /// 这一格是那个指针：没有它，一次调用的参数与结果只能永远留在触发它的
+    /// 那个进程里。
+    pub artifact: Option<String>,
+    /// 这一次调用属于哪一段会话；`None` 是「不是从会话里发起的」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// 这一次调用的因果根：把它触发了的那条意图事件 id。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causation: Option<String>,
     /// 发起方身份。
     pub actor: String,
     /// 服务端时刻，由写入口取自己的钟。
@@ -59,6 +77,8 @@ impl ToolCallEvent {
     pub fn attributes(&self) -> serde_json::Value {
         serde_json::json!({
             "tool": self.tool,
+            "tool_description": self.tool_description,
+            "schema_sha256": self.schema_sha256,
             "arguments_sha256": self.arguments_sha256,
             "arguments_bytes": self.arguments_bytes,
             "result_sha256": self.result_sha256,
@@ -66,6 +86,9 @@ impl ToolCallEvent {
             "outcome": self.outcome,
             "latency_ms": self.latency_ms,
             "path": self.path,
+            "artifact": self.artifact,
+            "session": self.session,
+            "causation": self.causation,
         })
     }
 }
@@ -79,20 +102,36 @@ impl ToolCallEvent {
         call_id: impl Into<String>,
         unit_of_work: impl Into<String>,
         tool: impl Into<String>,
+        definition: Option<(&str, &serde_json::Value)>,
         actor: impl Into<String>,
         arguments: &[u8],
         result: Option<&[u8]>,
         outcome: impl Into<String>,
         latency_ms: Option<u64>,
         path: Option<String>,
+        artifact: Option<String>,
+        session: Option<String>,
+        causation: Option<String>,
         at: DateTime<Utc>,
     ) -> Self {
         use sha2::{Digest, Sha256};
         let hex = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+        let (tool_description, schema_sha256) = match definition {
+            Some((description, parameters)) => {
+                let schema = serde_json::to_string(parameters).unwrap_or(Default::default());
+                (
+                    Some(description.to_string()),
+                    Some(format!("{:x}", Sha256::digest(schema.as_bytes()))),
+                )
+            }
+            None => (None, None),
+        };
         Self {
             call_id: call_id.into(),
             unit_of_work: unit_of_work.into(),
             tool: tool.into(),
+            tool_description,
+            schema_sha256,
             arguments_sha256: hex(arguments),
             arguments_bytes: arguments.len() as u64,
             result_sha256: result.map(hex),
@@ -100,18 +139,13 @@ impl ToolCallEvent {
             outcome: outcome.into(),
             latency_ms,
             path,
+            artifact,
+            session,
+            causation,
             actor: actor.into(),
             at,
         }
     }
-}
-
-/// 往事件流里追加一条工具调用。实现必须幂等，写不进去要如实报错。
-#[async_trait]
-pub trait ToolCallEvents: Send + Sync {
-    fn writer(&self) -> &str;
-
-    async fn append(&self, call: &ToolCallEvent) -> SFResult<()>;
 }
 
 #[cfg(test)]
@@ -123,6 +157,8 @@ mod tests {
             call_id: "c1".into(),
             unit_of_work: "u1".into(),
             tool: "run_command".into(),
+            tool_description: None,
+            schema_sha256: None,
             arguments_sha256: "aa".into(),
             arguments_bytes: 10,
             result_sha256: Some("bb".into()),
@@ -130,6 +166,9 @@ mod tests {
             outcome: "ok".into(),
             latency_ms: Some(5),
             path: None,
+            artifact: None,
+            session: None,
+            causation: None,
             actor: "a".into(),
             at: Utc::now(),
         }
@@ -171,11 +210,15 @@ mod from_bytes_tests {
             "c1",
             "u1",
             "run_command",
+            None,
             "a",
             args,
             result,
             "ok",
             Some(3),
+            None,
+            None,
+            None,
             None,
             Utc::now(),
         )
@@ -222,6 +265,8 @@ mod path_tests {
             call_id: "c1".into(),
             unit_of_work: "u1".into(),
             tool: "read_file".into(),
+            tool_description: None,
+            schema_sha256: None,
             arguments_sha256: "aa".into(),
             arguments_bytes: 1,
             result_sha256: None,
@@ -229,11 +274,47 @@ mod path_tests {
             outcome: "ok".into(),
             latency_ms: None,
             path: Some("crates/cog-core/src/lib.rs".into()),
+            artifact: None,
+            session: None,
+            causation: None,
             actor: "a".into(),
             at: Utc::now(),
         };
         assert_eq!(c.attributes()["path"], "crates/cog-core/src/lib.rs");
         c.path = None;
         assert!(c.attributes()["path"].is_null(), "与文件无关的调用不带路径");
+    }
+    /// 写出去的键与目录一致：载荷存 text，没有类型替人记住它有什么。
+    #[test]
+    fn the_written_keys_are_the_catalogued_keys() {
+        let call = ToolCallEvent::from_bytes(
+            "c1",
+            "u1",
+            "read_file",
+            None,
+            "a",
+            b"{}",
+            Some(b"ok"),
+            "ok",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Utc::now(),
+        );
+        let written: std::collections::BTreeSet<String> = call
+            .attributes()
+            .as_object()
+            .expect("a payload is an object")
+            .keys()
+            .cloned()
+            .collect();
+        let catalogued: std::collections::BTreeSet<String> = crate::payload_fields("tool_call", 1)
+            .expect("tool_call v1 is catalogued")
+            .iter()
+            .map(|(field, _)| (*field).to_string())
+            .collect();
+        assert_eq!(written, catalogued, "写者与目录不是同一组键");
     }
 }

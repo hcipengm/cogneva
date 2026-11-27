@@ -17,7 +17,7 @@
 
 use sqlx::PgPool;
 
-use cog_core::{check as check_envelope, EnvelopeFields, SFError, SFResult};
+use cog_core::{check as check_envelope, EnvelopeFields, EventLog, SFError, SFResult};
 
 use super::large_object;
 
@@ -74,29 +74,19 @@ pub async fn redact_body(
     }
 
     let event_id = event_id_for(oid, sha256);
-    let subject = format!("body:{oid}");
-    let attributes = serde_json::json!({
-        "body_oid": oid,
-        "sha256": sha256,
-        "bytes": bytes,
-        "reason": reason,
-    })
-    .to_string();
-    check_envelope(&EnvelopeFields {
-        event_id: event_id.clone(),
-        kind: KIND.into(),
-        subject_kind: "body".into(),
-        subject_id: subject.clone(),
-        unit_of_work: subject,
-        step: "redact".into(),
-        outcome: "ok".into(),
-        idempotency_key: format!("redact:{oid}:{sha256}"),
-        actor: actor.into(),
-        writer: writer.into(),
-        scope: "body".into(),
-        attributes: attributes.clone(),
-    })
-    .map_err(|defect| {
+    // 唯一写口：这一族的 id 由正文与哈希派生，其余列由载荷的信封给。
+    let mut event = cog_core::FactEvent::new(cog_core::EventPayload::Redacted {
+        artifact: None,
+        oid: Some(oid),
+        sha256: sha256.to_string(),
+        bytes,
+        reason: reason.to_string(),
+        actor: actor.to_string(),
+    });
+    event.event_id = Some(event_id.clone());
+    event.at = Some(chrono::Utc::now());
+    let fields = event.payload.envelope(&event_id, writer);
+    check_envelope(&fields).map_err(|defect| {
         SFError::Database(format!(
             "redacted refused before it was written: {}",
             defect.as_str()
@@ -109,24 +99,10 @@ pub async fn redact_body(
     // 所以顺序换过来不损失重放安全。
     large_object::unlink(pool, oid).await?;
 
-    sqlx::query(
-        "INSERT INTO cogneva_event (\
-            event_id, kind, subject_kind, subject_id, unit_of_work, step, outcome, attempt, \
-            idempotency_key, causation_id, batch_id, actor, writer, scope, payload_version, \
-            attributes, at) \
-         VALUES ($1, 'redacted', 'body', $2, $2, 'redact', 'ok', 1, $3, NULL, NULL, $4, $5, \
-                 'body', 1, $6, NOW()) \
-         ON CONFLICT (writer, idempotency_key) DO NOTHING",
-    )
-    .bind(&event_id)
-    .bind(format!("body:{oid}"))
-    .bind(format!("redact:{oid}:{sha256}"))
-    .bind(actor)
-    .bind(writer)
-    .bind(attributes)
-    .execute(pool)
-    .await
-    .map_err(|e| SFError::Database(format!("append redacted: {e}")))?;
+    let store = super::event_log::EventLogStore::new(pool.clone(), writer);
+    cog_core::EventStore::append(&store, event)
+        .await
+        .map_err(|e| SFError::Database(format!("redacted: {e}")))?;
 
     Ok(Redaction { event_id, oid })
 }

@@ -325,7 +325,7 @@ fn collector_rule(root: &Path) -> CollectorRule {
     let namespaces = block(discovery, "namespaces")
         .and_then(|n| attribute(n, "names"))
         .map(|names| quoted(&names))
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
 
     // Every `rule { … }` inside the relabel component; the drop rule is the one
     // carrying `action = "drop"`.

@@ -65,7 +65,7 @@ async fn test_agent_subscribe_receives_events() {
 
     let mut events = agent.subscribe();
 
-    let _ = agent.prompt(serde_json::json!({"goal": "test"})).await;
+    cog_core::ignore_lost!(agent.prompt(serde_json::json!({"goal": "test"})).await);
 
     let mut received = Vec::new();
     while let Ok(event) = events.try_recv() {
@@ -112,7 +112,7 @@ async fn test_agent_state_transitions() {
 
     // The prompt runs synchronously in our test (await blocks until done),
     // so we can't easily catch the Running state. Just verify final state.
-    let _ = prompt_future.await;
+    cog_core::ignore_lost!(prompt_future.await);
     assert_eq!(agent.state().await, AgentState::Idle);
 }
 
@@ -176,7 +176,7 @@ async fn test_agent_reset_clears_state() {
         Arc::new(MockProvider::new("result")),
     );
 
-    let _ = agent.prompt(serde_json::json!({"goal": "test"})).await;
+    cog_core::ignore_lost!(agent.prompt(serde_json::json!({"goal": "test"})).await);
     assert_eq!(agent.state().await, AgentState::Idle);
 
     agent.reset().await.expect("reset failed");
@@ -247,7 +247,7 @@ async fn test_agent_wait_for_idle() {
         .expect("wait_for_idle timed out")
         .expect("wait_for_idle failed");
 
-    let _ = agent.prompt(serde_json::json!({"goal": "test"})).await;
+    cog_core::ignore_lost!(agent.prompt(serde_json::json!({"goal": "test"})).await);
 
     // After completion, should also return immediately
     timeout(Duration::from_secs(1), agent.wait_for_idle())

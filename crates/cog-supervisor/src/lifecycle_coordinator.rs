@@ -325,7 +325,7 @@ impl LifecycleCoordinator {
             issue: issue.clone(),
             timestamp: Utc::now(),
         };
-        let _ = self.event_tx.send(event);
+        cog_core::ignore_lost!(self.event_tx.send(event));
         // No second, dedicated event: `AgentUnhealthy` is already the lifecycle
         // transition, and `kind` above names which one it was. A previous
         // version also sent a `Tick { cycle: 0 }` here as a "heartbeat", which

@@ -21,13 +21,16 @@ use cog_core::{
 use tracing::{error, info, warn};
 
 /// 参与聚合的周数。
-// cap: bound — 参与聚合的周数
+// cap: fixed — 参与聚合的周数
+// keep: 删掉后聚合窗口缩成一周，趋势被一次发布读成方向；由「参与聚合的周数」兜住
 const WINDOW_WEEKS: usize = 8;
 /// 判定趋势向下的连续下降周数。
-// cap: bound — 判趋势向下的连续下降周数
+// cap: fixed — 判趋势向下的连续下降周数
+// keep: 删掉后连续两周下降就判向下，正常的周间抖动被读成趋势；由「连续下降周数」兜住
 const DECLINE_RUN: usize = 3;
 /// 单周完结对决样本下限（低于则该周不参与趋势判定，避免小样本抖动误报）。
-// cap: bound — 单周样本下限，低于它该周不参与判定，避免小样本抖动误报
+// cap: fixed — 单周样本下限，低于它该周不参与判定，避免小样本抖动误报
+// keep: 删掉后一条样本的周也参与判定，小样本抖动被读成趋势；由「单周样本下限」兜住
 const MIN_WEEK_SAMPLES: u64 = 2;
 
 /// 抓取面上这一族的两个标签。
@@ -50,7 +53,8 @@ const OUTCOME_AWAITING_REVIEW: &str = "awaiting_review";
 ///
 /// 防的是配置错误：周期被填成 0 或 1 会让这条循环对着表打热循环，而趋势读数
 /// 本身的粒度就是分钟级，更密不会让曲线更准。
-// cap: bound — 防周期被填成 0 或 1 打热循环；趋势读数本身是分钟级粒度
+// cap: fixed — 防周期被填成 0 或 1 打热循环；趋势读数本身是分钟级粒度
+// keep: 删掉后周期可以被填成 0 或 1，趋势读数打热循环；由「趋势本身是分钟级粒度」兜住
 const MIN_TREND_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 从台账记录聚合周报。纯函数，便于测试。
@@ -312,7 +316,6 @@ pub fn render_markdown(report: &PromotionTrendReport) -> String {
 /// 周期报表器。
 pub struct PromotionTrendReporter {
     ledger: Arc<dyn PromotionLedger>,
-    report_dir: std::path::PathBuf,
     interval: std::time::Duration,
     audit_stream: Option<Arc<dyn cog_core::AuditStream>>,
     alert_sink: Option<Arc<dyn cog_core::PersistentAlertSink>>,
@@ -336,7 +339,6 @@ impl PromotionTrendReporter {
     /// one the monitoring stack reads -- see the field's own comment.
     pub fn new(
         ledger: Arc<dyn PromotionLedger>,
-        report_dir: std::path::PathBuf,
         interval: std::time::Duration,
         audit_stream: Option<Arc<dyn cog_core::AuditStream>>,
         alert_sink: Option<Arc<dyn cog_core::PersistentAlertSink>>,
@@ -344,7 +346,6 @@ impl PromotionTrendReporter {
     ) -> Arc<Self> {
         Arc::new(Self {
             ledger,
-            report_dir,
             interval,
             audit_stream,
             alert_sink,
@@ -381,19 +382,9 @@ impl PromotionTrendReporter {
         let records = self.ledger.list(10_000).await?;
         let report = aggregate(&records, Utc::now());
 
-        std::fs::create_dir_all(&self.report_dir)?;
-        let json = serde_json::to_string_pretty(&report)?;
-        std::fs::write(self.report_dir.join("promotion-trend-latest.json"), &json)?;
-        std::fs::write(
-            self.report_dir.join("promotion-trend-latest.md"),
-            render_markdown(&report),
-        )?;
-        let stamp = report.generated_at.format("%Y%m%d-%H%M%S");
-        std::fs::write(
-            self.report_dir
-                .join(format!("promotion-trend-{stamp}.json")),
-            &json,
-        )?;
+        // 报告只活在两处：进程内那一份（admin 端点读）与事件/读数面。
+        // 磁盘上不再落「最新一份 + 按时刻归档」的 json/md：那是第二份记录，
+        // 既不能被查，也不会跟着读数走。
 
         if let Some(ref alert) = report.alert {
             error!(alert = %alert, "Promotion trend alert");
@@ -956,13 +947,6 @@ mod tests {
         }
     }
 
-    fn temp_report_dir(tag: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("promotion-trend-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
-    }
-
     /// 报告文件是给人看的产物，不是判据：只有条件真的进了持久化告警面，
     /// 系统才可能自己发现「六周零晋级」。恢复时同一条 dedup key 必须被解除，
     /// 否则告警会在系统恢复之后永久挂着。
@@ -971,7 +955,6 @@ mod tests {
         let sink: Arc<RecordingSink> = Arc::new(RecordingSink::default());
         let stalled = PromotionTrendReporter::new(
             Arc::new(FixedLedger(Vec::new())),
-            temp_report_dir("stalled"),
             std::time::Duration::from_secs(60),
             None,
             Some(sink.clone()),
@@ -981,7 +964,6 @@ mod tests {
 
         let recovered = PromotionTrendReporter::new(
             Arc::new(FixedLedger(vec![rec(2, PromotionStatus::Promoted)])),
-            temp_report_dir("recovered"),
             std::time::Duration::from_secs(60),
             None,
             Some(sink.clone()),
@@ -1018,7 +1000,6 @@ mod tests {
                 rec(0, PromotionStatus::Failed),
                 rec(1, PromotionStatus::RolledBack),
             ])),
-            temp_report_dir("metrics"),
             std::time::Duration::from_secs(60),
             None,
             None,

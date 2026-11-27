@@ -134,6 +134,7 @@ CREATE TABLE IF NOT EXISTS principle_producer_pushes (
                 trigger        TEXT NOT NULL DEFAULT '{trigger:timer}'
                                CHECK (trigger IN ('{trigger:timer}', '{trigger:manual}')),
                 pushed_at      TIMESTAMPTZ NOT NULL,
+                -- db-column: principle_producer_pushes.period_seconds — not-a-bound — 生产者自报的周期，记录用
                 period_seconds BIGINT NOT NULL,
                 PRIMARY KEY (source, trigger)
             );

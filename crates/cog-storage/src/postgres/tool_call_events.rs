@@ -13,79 +13,31 @@
 use async_trait::async_trait;
 use sqlx::PgPool;
 
-use cog_core::{
-    check as check_envelope, EnvelopeFields, SFError, SFResult, ToolCallEvent, ToolCallEvents,
-};
+use cog_core::{EventPayload, EventStore, FactEvent, SFError, SFResult, ToolCallEvent};
 
-/// 事件流的写入器，只认工具调用这一种事实。
+/// 事件流的写入器，只认工具调用这一种事实。落库走那条流唯一的写口。
 pub struct ToolCallEventStore {
-    pool: PgPool,
-    writer: String,
+    store: std::sync::Arc<dyn EventStore>,
 }
-
-/// 写一行工具调用事件的语句。kind 与 subject_kind 写死在这一句里（这一族只写一种），
-/// 其余列从载荷来。
-const INSERT_SQL: &str = "\
-INSERT INTO cogneva_event (\
-    event_id, kind, subject_kind, subject_id, unit_of_work, step, outcome, attempt, \
-    idempotency_key, causation_id, batch_id, actor, writer, scope, payload_version, \
-    attributes, at) \
-VALUES ($1, 'tool_call', 'tool_call', $2, $3, 'call', $4, 1, $5, NULL, NULL, $6, $7, $8, 1, $9, $10) \
-ON CONFLICT (writer, idempotency_key) DO NOTHING";
 
 impl ToolCallEventStore {
     pub fn new(pool: PgPool, writer: impl Into<String>) -> Self {
-        Self {
-            pool,
-            writer: writer.into(),
-        }
+        let store: std::sync::Arc<dyn EventStore> =
+            std::sync::Arc::new(crate::postgres::event_log::EventLogStore::new(pool, writer));
+        Self { store }
     }
 }
 
-#[async_trait]
-impl ToolCallEvents for ToolCallEventStore {
-    fn writer(&self) -> &str {
-        &self.writer
-    }
-
-    async fn append(&self, call: &ToolCallEvent) -> SFResult<()> {
-        let event_id = event_id_for(&call.call_id);
-        let attributes = call.attributes().to_string();
-        check_envelope(&EnvelopeFields {
-            event_id: event_id.clone(),
-            kind: "tool_call".into(),
-            subject_kind: "tool_call".into(),
-            subject_id: call.call_id.clone(),
-            unit_of_work: call.unit_of_work.clone(),
-            step: "call".into(),
-            outcome: call.outcome.clone(),
-            idempotency_key: call.idempotency_key(),
-            actor: call.actor.clone(),
-            writer: self.writer.clone(),
-            scope: call.tool.clone(),
-            attributes: attributes.clone(),
-        })
-        .map_err(|defect| {
-            SFError::Database(format!(
-                "tool_call event refused before it was written: {}",
-                defect.as_str()
-            ))
-        })?;
-        sqlx::query(INSERT_SQL)
-            .bind(&event_id)
-            .bind(&call.call_id)
-            .bind(&call.unit_of_work)
-            .bind(&call.outcome)
-            .bind(call.idempotency_key())
-            .bind(&call.actor)
-            .bind(&self.writer)
-            .bind(&call.tool)
-            .bind(attributes)
-            .bind(call.at)
-            .execute(&self.pool)
+impl ToolCallEventStore {
+    /// 写一条工具调用事实：与其他族同一条流、同一个写口。
+    pub async fn append(&self, call: &ToolCallEvent) -> SFResult<()> {
+        let mut event = FactEvent::new(EventPayload::ToolCall(call.clone()));
+        event.event_id = Some(event_id_for(&call.call_id));
+        event.at = Some(call.at);
+        self.store
+            .append(event)
             .await
-            .map_err(|e| SFError::Database(format!("append tool_call event: {e}")))?;
-        Ok(())
+            .map_err(|e| SFError::Database(format!("tool_call: {e}")))
     }
 }
 

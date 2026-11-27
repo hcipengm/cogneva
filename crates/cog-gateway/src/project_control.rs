@@ -27,7 +27,8 @@ pub const PROJECT_CONTROL_LOOP: &str = "gateway_project_control";
 ///
 /// 覆盖率不是在窗口上发生的事件，是一个会被冻住的读数：一轮只决定它多快跟上图的
 /// 变化。十分钟量一次，图上多了一千行也还看得见它是旧的（这一格带着量成时刻）。
-// cap: bound — 只决定读数多快跟上图的变化，不决定任何动作
+// cap: fixed — 只决定读数多快跟上图的变化，不决定任何动作
+// keep: 删掉后读数不会跟上图的变化，面板停在旧形状；由「只决定读数多快跟上图的变化」兜住
 const CADENCE: Duration = Duration::from_secs(600);
 
 /// 起这条回路。
@@ -306,7 +307,7 @@ impl cog_core::Observable for Readings {
         }
         // 覆盖也照发，包括「还没量成过」那一份全零：缺一格会让「这一版没量过」与
         // 「这一版不认识这个读数」同形。时刻那一格是它的保鲜标记。
-        let (coverage, measured_at) = self.coverage().unwrap_or_default();
+        let (coverage, measured_at) = self.coverage().unwrap_or(Default::default());
         for (kind, cells) in COVERAGE_KINDS {
             let (coverable, covered) = cells(coverage);
             readings.push(

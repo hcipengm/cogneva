@@ -23,6 +23,7 @@ FILE="${WRITER_LEASE_FILE:-${CLAUDE_HOME:-$HOME/.claude}/cogneva-writer-lease.js
 LOCK="$FILE.lock"
 cmd="${1:-show}"; shift || true
 
+# keep: 租约的默认有效期：删掉后一把没人续的租约永不过期，后来者永远拿不到这条写权；由租约协议（ttl 必须有限）兜住
 owner=""; reason=""; ttl=3600
 case "$cmd" in
   claim)

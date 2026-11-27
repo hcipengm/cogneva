@@ -17,7 +17,8 @@ use crate::tools::{ToolRegistry, ToolRunError};
 ///
 /// Below this a repeated result is a tool answering a different question with
 /// the same few words, and the pointer would not be shorter than the answer.
-// cap: bound — 指针本身是一段固定的话；结果比它长不了多少时，换成指针既省不下字节，又让模型多跳一次去读上面那份。这个界是「省下的字节」与「多一跳」相抵的位置，不是从机器上量出来的
+// cap: fixed — 指针本身是一段固定的话；结果比它长不了多少时，换成指针既省不下字节，又让模型多跳一次去读上面那份。这个界是「省下的字节」与「多一跳」相抵的位置，不是从机器上量出来的
+// keep: 删掉后连很短的重复结果也换成指针，模型多跳一次、反而更费 token；由「省下的字节与多一跳相抵」兜住
 const REPEATED_TOOL_RESULT_MIN_CHARS: usize = 2_000;
 
 /// How many calls a run may spend without changing the checkout before it is
@@ -29,11 +30,13 @@ const REPEATED_TOOL_RESULT_MIN_CHARS: usize = 2_000;
 /// anything has already outlived nine runs in ten. A lower bound would
 /// interrupt ordinary reading — a run that plans before it writes reads for a
 /// while first, and that stretch is not the one this note is for.
-// cap: bound — 四十是「九成的已交付运行此刻已经跑完」的位置；再低会把正常的先读后写当成迷路
+// cap: fixed — 四十是「九成的已交付运行此刻已经跑完」的位置；再低会把正常的先读后写当成迷路
+// keep: 删掉后一个只在原地打转的运行不会被拦下，白白烧 token；由「九成已交付运行此刻已跑完的位置」兜住
 const CALLS_WITHOUT_CHANGE: u32 = 40;
 
 /// How many times one run may be told that the checkout has not moved.
-// cap: bound — 一条提示本身也要付一次回合，且落地会作废它之后的缓存前缀；两次之后不再打断
+// cap: fixed — 一条提示本身也要付一次回合，且落地会作废它之后的缓存前缀；两次之后不再打断
+// keep: 删掉后运行不再收到「没有任何变化」的提示，原地打转不被叫停；由「两次之后不再打断」兜住
 const NOTHING_CHANGED_NOTES: u32 = 2;
 
 /// 一条还在跑的工具调用，多久把攒下的输出往外发一次。
@@ -43,7 +46,8 @@ const NOTHING_CHANGED_NOTES: u32 = 2;
 /// WebSocket 和界面上各变成几万条记录，而读的人要看的只是「它还在动、动到哪
 /// 了」。攒到一个节拍再发，滚动的观感不变，帧数按节拍被削掉。这个数是给人眼
 /// 看的：比它慢，界面看上去像卡住了；比它快，一屏之内叠着好几帧还没读完。
-// cap: bound — 界面那一格的刷新节奏是人的阅读节奏：比这快，几帧挤在一起还没读完就滚过去了
+// cap: fixed — 界面那一格的刷新节奏是人的阅读节奏：比这快，几帧挤在一起还没读完就滚过去了
+// keep: 删掉后每一帧都单独冲出去，界面来不及读就被下一帧挤掉；由「人的阅读节奏」兜住
 const TOOL_UPDATE_FLUSH: Duration = Duration::from_millis(200);
 
 /// 一帧进度最多带多少字符。
@@ -51,7 +55,8 @@ const TOOL_UPDATE_FLUSH: Duration = Duration::from_millis(200);
 /// 界面上一条工具调用留的是一格，不是一份日志：那一格只留最后 8000 字符，超过
 /// 这个量的帧到了那里也只剩下尾巴。在这里就裁，省下的是总线和 WAL 上的字节，
 /// 读的人看到的东西一点不少。
-// cap: bound — 与界面那一格的窗口同源：更长的帧到了读者那里一样只剩尾巴
+// cap: fixed — 与界面那一格的窗口同源：更长的帧到了读者那里一样只剩尾巴
+// keep: 删掉后一帧可以是任意长，读者那里只剩尾巴；由「与界面窗口同源」兜住
 const TOOL_UPDATE_CHARS: usize = 8_000;
 
 /// 把一段新输出接在进度的尾巴上，超出这一帧的容量时丢掉最旧的那一段。
@@ -411,7 +416,7 @@ pub struct AgentRuntime {
     tool_output_archive: Option<Arc<dyn crate::archive::ToolOutputArchive>>,
     /// 工具调用的事实落点。正文那份（`tool_output_archive`）是**载体**，这只是记录：
     /// 一次调用落一条 `tool_call` 事件，参数与结果存哈希，正文由载体按哈希取。
-    tool_call_events: Option<Arc<dyn cog_core::ToolCallEvents>>,
+    tool_call_events: Option<Arc<dyn cog_core::EventStore>>,
     /// 工具执行之前那一问由谁回答，以及这一轮处在哪种模式下。
     ///
     /// 没有配置回答者时不是「不问」，而是「要问的那一步拒绝」：见
@@ -489,6 +494,8 @@ pub struct AgentRuntime {
     /// 开着几段，所以「这段对话花了多少」既不能从按人的总数里读，也不能由运行时
     /// 在这里算——它只把 id 挂到每一发上，折叠那一步读账本的行。
     call_session: Option<String>,
+    /// 这一轮的因果根：这一轮的用户意图事件 id。工具调用把它写进信封。
+    call_causation: Option<String>,
     /// 这一轮用哪只模型，由人在这段对话里选的那一格给出；`None` 是没选过，
     /// 由上游自己配置的那一只（见 `ChatOptions::model` 的读法）。
     ///
@@ -504,6 +511,13 @@ pub struct AgentRuntime {
     /// Held on the runtime rather than threaded through every call site because
     /// it is a property of the run, exactly like the usage totals beside it.
     run_task_id: Option<String>,
+    /// 这一次运行是为哪一句意图做的。
+    ///
+    /// 两个来源：派生的任务把它写在自己的输入上（planner 派生待办时写下的
+    /// `intent_id`），同事发来的话把它挂在这条消息上（`colleague_intent_identity`）。
+    /// 运行期间由 [`Self::stamp_intent`] 挂到 `start_task` 的参数上——这次运行派出去
+    /// 的活与它自己那条意图因此是同一个身份，读面不必按时间猜。
+    run_intent_id: Option<String>,
     /// 上一次运行替哪件活干的（`begin_scoped_run` 收到的那一个）。
     ///
     /// 与上面那个不同：那个是「这一次运行」，运行结束就清；这个跨运行留着，
@@ -1223,6 +1237,7 @@ impl AgentRuntime {
             permission_mode: crate::permission::PermissionMode::Bypass,
             run_usage: RunUsage::default(),
             run_task_id: None,
+            run_intent_id: None,
             last_run_task: None,
             run_seen: false,
             resume_is_from_another_task: false,
@@ -1238,6 +1253,7 @@ impl AgentRuntime {
             call_owner: None,
             call_origin: None,
             call_session: None,
+            call_causation: None,
             call_model: None,
             roster: None,
             display_name: None,
@@ -1334,7 +1350,7 @@ impl AgentRuntime {
     /// the surface the loop still runs and still cuts — it just has nowhere to
     /// put the copy, and the marker says only that bytes were dropped.
     /// 接上事件流的写入点：一次工具调用落一条事实。
-    pub fn with_tool_call_events(mut self, events: Arc<dyn cog_core::ToolCallEvents>) -> Self {
+    pub fn with_tool_call_events(mut self, events: Arc<dyn cog_core::EventStore>) -> Self {
         self.tool_call_events = Some(events);
         self
     }
@@ -1396,6 +1412,12 @@ impl AgentRuntime {
     /// 捆在一起传，就会逼着调用方为没有主人的对话编一个主人。
     pub fn with_call_session(mut self, session: impl Into<String>) -> Self {
         self.call_session = Some(session.into());
+        self
+    }
+
+    /// 这一轮的因果根：与 `with_call_session` 成对，工具调用的事实带着它。
+    pub fn with_call_causation(mut self, causation: impl Into<String>) -> Self {
+        self.call_causation = Some(causation.into());
         self
     }
 
@@ -1578,7 +1600,13 @@ impl AgentRuntime {
             // not a judgement. What changed is that the words are no longer spelled
             // here: `RuntimeState::parse` answers with the same table `Display`
             // printed from, so there is no second list that can fall behind it.
-            self.state = RuntimeState::parse(state_str).unwrap_or(RuntimeState::Idle);
+            self.state = RuntimeState::parse(state_str).unwrap_or_else(|| {
+                tracing::warn!(
+                    state = %state_str,
+                    "checkpoint 里有一个本版本不认识的状态词，按 Idle 续跑"
+                );
+                RuntimeState::Idle
+            });
         }
 
         // Optionally restore role if present and different
@@ -1692,7 +1720,7 @@ impl AgentRuntime {
             // 重放事件直发 broadcast（本地状态重建），不进运行时 mpsc：
             // mpsc 下游的总线投递只认活体流量，重放再进总线会被摄取侧
             // 当成新事件重复建档。无订阅者时 send 报错属正常，不算失败。
-            let _ = sink.send(event);
+            cog_core::ignore_lost!(sink.send(event));
             count += 1;
         }
         Ok(count)
@@ -1782,6 +1810,12 @@ impl AgentRuntime {
     /// without an identity makes unlabelled calls rather than a made-up one,
     /// because a made-up id reads as a real job on the ledger.
     fn stamp_task(&self, options: cog_core::ChatOptions) -> cog_core::ChatOptions {
+        // 这一份提示被挤掉了多少条更早的消息：只被记录，用来回答「丢了哪些段」。
+        let options = options.with_prompt_dropped(
+            self.context
+                .last_compaction_dropped()
+                .min(u32::MAX as usize) as u32,
+        );
         // Charged to a person, when there is one: the same call the interface's
         // own completion path used to stamp, now stamped where the call is made.
         let options = match self.call_owner.as_deref() {
@@ -1822,13 +1856,59 @@ impl AgentRuntime {
         llm: &dyn cog_core::LlmClient,
         run_task_id: Option<&str>,
     ) -> SFResult<serde_json::Value> {
+        self.run_scoped_for_intent(input, llm, run_task_id, None)
+            .await
+    }
+
+    /// 同上，外加这一次运行是为哪一句意图做的。
+    ///
+    /// 不给就只看输入自己带的 `intent_id`；两条都有时以显式那一条为准——同事发来
+    /// 的话的身份挂在消息上，任务输入里没有它。
+    pub async fn run_scoped_for_intent(
+        &mut self,
+        input: serde_json::Value,
+        llm: &dyn cog_core::LlmClient,
+        run_task_id: Option<&str>,
+        intent_id: Option<&str>,
+    ) -> SFResult<serde_json::Value> {
         // 这一次运行在飞期间，停机的那一侧会等它走到回合边界（见
         // `crate::drain`）。守卫活着就算在飞，落盘在 `Drop` 里，panic 与
         // 提前返回都算结束——否则一次失败的运行会让关停永远等不到零。
         let _in_flight = crate::drain::enter_run();
         let started = self.begin_scoped_run(run_task_id);
+        self.run_intent_id = intent_id
+            .map(str::trim)
+            .filter(|intent| !intent.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                input
+                    .get(cog_core::contract::intent_events::INTENT_ID_KEY)
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|intent| !intent.is_empty())
+                    .map(str::to_string)
+            });
         let outcome = self.run_turns(input, llm, run_task_id).await;
         self.finish_scoped_run(run_task_id, started, outcome).await
+    }
+
+    /// 把这一次运行的意图身份挂到派活的参数上：调用方自己写了就照它的。
+    ///
+    /// 只认 `start_task`：「这一次运行属于哪一句意图」对读的人有用，是因为派出去
+    /// 的活要答得出「这是谁让我做的」；别的工具没有这一格。
+    fn stamp_intent(&self, tool: &str, arguments: &mut serde_json::Value) {
+        if tool != "start_task" {
+            return;
+        }
+        let Some(intent) = self.run_intent_id.as_deref() else {
+            return;
+        };
+        let Some(fields) = arguments.as_object_mut() else {
+            return;
+        };
+        fields
+            .entry(cog_core::contract::intent_events::INTENT_ID_KEY)
+            .or_insert_with(|| serde_json::json!(intent));
     }
 
     /// Run one turn of a conversation the caller has already assembled.
@@ -2167,6 +2247,7 @@ impl AgentRuntime {
             }
         }
         self.run_task_id = None;
+        self.run_intent_id = None;
         outcome
     }
 
@@ -2399,31 +2480,6 @@ impl AgentRuntime {
         delivered: &mut DeliveredResults,
     ) -> Message {
         let text = result.to_string();
-        // 事实先落事件流：记录与载体是两件事——没有载体时这份调用仍然发生过，
-        // 而「载体在不在」不该决定「这次调用有没有被记下来」。
-        if let Some(sink) = self.tool_call_events.as_ref() {
-            let arguments_bytes = arguments.to_string().into_bytes();
-            let result_bytes = result.to_string().into_bytes();
-            let call = cog_core::ToolCallEvent::from_bytes(
-                format!("{tool_call_id}:{turn}:{frame}"),
-                task_id.unwrap_or(self.config.agent_id.as_str()),
-                tool_name,
-                self.config.agent_id.clone(),
-                &arguments_bytes,
-                Some(&result_bytes),
-                if is_error { "error" } else { "ok" },
-                None,
-                Self::file_path_of(tool_name, arguments),
-                chrono::Utc::now(),
-            );
-            if let Err(e) = sink.append(&call).await {
-                tracing::warn!(
-                    tool = tool_name,
-                    error = %e,
-                    "工具调用的那条事实没写进事件流；这一轮的结果仍然给了模型，但账上没有它"
-                );
-            }
-        }
         let reference = self
             .archive_tool_call(
                 task_id,
@@ -2436,6 +2492,50 @@ impl AgentRuntime {
                 is_error,
             )
             .await;
+        // 事实在拿到载体指针之后落：先落事件时这一格只能是 None，而「正文在哪」
+        // 正是表的工具调用要重建时缺的那一格。归档失败仍然写事件（`artifact` 空），
+        // 因为这次调用发生过，不因载体缺失而不存在。
+        if let Some(sink) = self.tool_call_events.as_ref() {
+            // 模型当时看到的定义：注册表按名字取一份，随事实落库；回放不再用今天的 schema。
+            let definition: Option<(String, serde_json::Value)> = self
+                .tools
+                .list()
+                .into_iter()
+                .find(|t| t.name == tool_name)
+                .map(|t| (t.description.clone(), t.parameters.clone()));
+            let arguments_bytes = arguments.to_string().into_bytes();
+            let result_bytes = result.to_string().into_bytes();
+            let call = cog_core::ToolCallEvent::from_bytes(
+                format!("{tool_call_id}:{turn}:{frame}"),
+                task_id.unwrap_or(self.config.agent_id.as_str()),
+                tool_name,
+                definition
+                    .as_ref()
+                    .map(|(description, parameters)| (description.as_str(), parameters)),
+                self.config.agent_id.clone(),
+                &arguments_bytes,
+                Some(&result_bytes),
+                if is_error { "error" } else { "ok" },
+                None,
+                Self::file_path_of(tool_name, arguments),
+                reference.clone(),
+                self.call_session.clone(),
+                self.call_causation.clone(),
+                chrono::Utc::now(),
+            );
+            if let Err(e) = sink
+                .append(cog_core::FactEvent::new(cog_core::EventPayload::ToolCall(
+                    call.clone(),
+                )))
+                .await
+            {
+                tracing::warn!(
+                    tool = tool_name,
+                    error = %e,
+                    "工具调用的那条事实没写进事件流；这一轮的结果仍然给了模型，但账上没有它"
+                );
+            }
+        }
         if let Some(stub) = delivered.repeat_note(tool_name, &text, turn) {
             return Message::tool_result_text(tool_call_id, tool_name, &stub);
         }
@@ -2457,15 +2557,20 @@ impl AgentRuntime {
             // 计数沿用「被截掉多少字符」这一族：这里的含义是「整份都没给」。
             archive.record_truncation(tool_name, size).await;
         }
+        // 「归档了」这句话只在真有引用时说得出口：没有归档面时那句话是假的，
+        // 而模型会照它去「稍后再取」，那一份根本没有地方可取。两种情形分开写。
+        let where_the_whole_is = match reference.as_deref() {
+            Some(uri) => format!("The whole result is archived under {uri}."),
+            None => "This run has no archive, so the whole result is not stored anywhere a \
+                     later fetch could reach it; narrow the request and the tool will answer \
+                     again."
+                .to_string(),
+        };
         let refusal = format!(
             "not delivered: this result is {size} characters and this turn's tool-result \
              budget is {budget}. Nothing was cut and nothing was shown, so a decision must not \
              be made from this call. Narrow the request instead: read_file takes offset/limit, \
-             and run_command can use head/tail/grep/sed -n. The whole result is archived{}.",
-            reference
-                .as_deref()
-                .map(|uri| format!(" under {uri}"))
-                .unwrap_or_default()
+             and run_command can use head/tail/grep/sed -n. {where_the_whole_is}"
         );
         Message::tool_result_text(tool_call_id, tool_name, &refusal)
     }
@@ -2957,6 +3062,18 @@ impl AgentRuntime {
                 .await;
         }
 
+        // 入口处的尺寸判据：这段正文连「一个字符的开头 + 指针」的形态都装不下时，
+        // 那是**入口写错了**（有人把整本书塞进一句任务），不是这一轮做不成。在这里
+        // 停下并说清楚，而不是让每一轮都去截一次、再用同一句话失败——那样读起来
+        // 像模型不行，而那件事与模型无关。
+        if !self.context.intake_fits() {
+            return Err(cog_core::SFError::Agent(format!(
+                "this task's own body does not fit any window even when reduced to a pointer \
+                 (window {:?} tokens): the input was filed wrong at the entry, and another \
+                 attempt cannot make room for it",
+                self.context.max_tokens()
+            )));
+        }
         self.run_loop(llm, run_task_id).await
     }
 
@@ -3255,6 +3372,9 @@ impl AgentRuntime {
                 // the frame carries the arguments the tool is actually given.
                 // A rewrite that landed after the frame would leave the bus
                 // showing a call that never ran.
+                // 这一次运行派出去的活挂同一个意图身份；放在钩子之前，
+                // 属主配的改写仍能覆盖它。
+                self.stamp_intent(&tc.name, &mut tc.arguments);
                 let mut refusal: Option<SFError> = None;
                 if let Some(hook) = self.hooks.before_tool_call.clone() {
                     if let Err(e) = hook(&tc.name, &mut tc.arguments) {
@@ -3387,7 +3507,7 @@ impl AgentRuntime {
                         // through every chunk this call will produce. A send
                         // that fails means the call is already over and there
                         // is nobody left to show it to.
-                        let _ = update_tx.send(chunk.to_string());
+                        cog_core::ignore_lost!(update_tx.send(chunk.to_string()));
                     })
                 };
                 let mut partial = String::new();
@@ -3651,7 +3771,11 @@ impl AgentRuntime {
                 // 先试着让地板装得下：窗口有限、任务无界，靠的正是这一步——
                 // 任务正文压到窗口能放下的长度，运行继续（2026-11-23 属主：
                 // 「超窗应该可以继续，不是实现了有限窗口做无限任务吗」）。
-                if self.context.shrink_floor_to_fit() {
+                if self
+                    .context
+                    .shrink_floor_to_fit(self.tool_output_archive.as_ref())
+                    .await
+                {
                     tracing::warn!(
                         agent_id = %self.config.agent_id,
                         budget = self.config.context_window_size,
@@ -4045,6 +4169,7 @@ impl AgentRuntime {
         // 重连接上了，这一轮照常往下走；两次都没等到，才说得上是连接建立不起来。
         let mut attempt = 1u32;
         let mut stream = loop {
+            // wall: 等=上游一次流的建立 / 等不到=这一跳按失败收尾并重连一次 / 续跑=能，新开一次上游调用
             match tokio::time::timeout(stall_timeout, llm.chat_stream(&messages, &options)).await {
                 Ok(Ok(stream)) => break stream,
                 Ok(Err(e)) => {
@@ -4090,6 +4215,7 @@ impl AgentRuntime {
         // 第一段静默只记一笔并继续等；第二段仍然静默才说得上「这条流不再前进」。
         let mut quiet_windows = 0u32;
         loop {
+            // wall: 等=上游流里的下一个事件 / 等不到=这一跳按失败收尾并记账 / 续跑=能，新开一次上游调用（流本身不能续读）
             let event = match tokio::time::timeout(stall_timeout, stream.next()).await {
                 Ok(Some(event)) => {
                     quiet_windows = 0;
@@ -4098,12 +4224,27 @@ impl AgentRuntime {
                 Ok(None) => break,
                 Err(_) if quiet_windows == 0 => {
                     quiet_windows = 1;
+                    // 一段静默说明不了是「它还在算」还是「连接已经死了」：多等一个
+                    // 窗口只是把两种情况都往后推，而两种情况的处置相反——算着的别去
+                    // 打扰，死了的接着这一轮来。所以先问一句连接还在不在，读得出的
+                    // 时候按读数处置，读不出（客户端不答这一问）才退回多等一个窗口。
+                    let alive = llm.health_check().await;
                     tracing::warn!(
                         agent_id = %self.config.agent_id,
                         window_secs = stall_timeout.as_secs(),
-                        "the stream has been quiet for one window while still open; \
-                         waiting one more window before judging it stopped"
+                        connection_alive = alive,
+                        "the stream has been quiet for one window while still open"
                     );
+                    if !alive {
+                        let err = stall_err("streaming events (the connection is gone)");
+                        tracing::warn!(
+                            agent_id = %self.config.agent_id,
+                            error = %err,
+                            "the upstream connection is gone; this round is retried from where it \
+                             stopped instead of waiting out another window"
+                        );
+                        return Err(err);
+                    }
                     continue;
                 }
                 Err(_) => {
@@ -4139,8 +4280,10 @@ impl AgentRuntime {
         // normally resolves instantly; the stall guard only covers a producer
         // that closed the event channel without ever completing the result.
         // 同一条口径：第一次等不到只说明「还没来」，不是「不会来」。
+        // wall: 等=这条流自己的结果 / 等不到=再等一段就收尾 / 续跑=能，新开一次上游调用
         let response = match tokio::time::timeout(stall_timeout, stream.result()).await {
             Ok(response) => response,
+            // wall: 等=这条流自己的结果（第二段静默） / 等不到=这一跳按失败收尾 / 续跑=能，新开一次上游调用
             Err(_) => match tokio::time::timeout(stall_timeout, stream.result()).await {
                 Ok(response) => response,
                 Err(_) => {
@@ -4553,7 +4696,7 @@ impl AgentRuntime {
                 _ => None,
             };
             if let Some(stream) = stream {
-                let raw = serde_json::to_value(&event).unwrap_or_default();
+                let raw = serde_json::to_value(&event).unwrap_or(Default::default());
                 let record = cog_core::RawRecord {
                     meta: cog_core::RawMeta {
                         version: "1.0".into(),
@@ -4595,7 +4738,7 @@ impl AgentRuntime {
             if let Some(ref squad_id) = self.config.squad_id {
                 hook_event = hook_event.with_squad_id(squad_id.clone());
             }
-            let _ = hook_tx.send(hook_event).await;
+            cog_core::ignore_lost!(hook_tx.send(hook_event).await);
             // The engine's forward_tx relays the raw AgentEvent to event_tx.
         } else {
             self.event_tx
@@ -4890,7 +5033,6 @@ mod tests {
                 first_seen: now,
                 last_seen: now,
                 retired_at: None,
-                person_id: cog_core::person_id_for(agent_id).map(str::to_string),
             }))
         }
     }
@@ -9019,6 +9161,60 @@ mod tests {
         );
     }
 
+    /// 没有归档面时，拒绝里不许说「已归档」。
+    ///
+    /// 装不下的结果是明说没给；模型照着这句话决定「回去取全文」。没有归档面时
+    /// 根本不存在那个地址——说它存在，就是把一次不可取回当成了可取回。
+    #[tokio::test]
+    async fn a_refusal_without_an_archive_does_not_claim_the_result_was_archived() {
+        let registry = ToolRegistry::new();
+        let payload = serde_json::json!({ "blob": "z".repeat(5000) });
+        let blob = payload.clone();
+        cog_core::ToolRegistry::register(
+            &registry,
+            cog_core::Tool {
+                name: "bigdump".into(),
+                description: String::new(),
+                parameters: serde_json::json!({}),
+                implementation: cog_core::ToolImplementation::Native(Arc::new(move |_args| {
+                    let v = blob.clone();
+                    Box::pin(async move { Ok(v) })
+                })),
+            },
+        );
+        let config = RuntimeConfig {
+            agent_id: "archivist-0002".into(),
+            context_window_size: Some(400),
+            max_iterations: 4,
+            ..Default::default()
+        };
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let mut runtime = AgentRuntime::new(config, tx).with_tools(registry);
+        let llm = OneToolThenAnswerLlm {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let _ = runtime
+            .run_scoped(serde_json::json!({"goal": "dump"}), &llm, Some("taskseam2"))
+            .await;
+        let joined = runtime
+            .get_context()
+            .messages()
+            .iter()
+            .map(|m| m.content())
+            .collect::<Vec<_>>()
+            .join("\n---\n");
+        assert!(joined.contains("not delivered"), "{joined}");
+        assert!(
+            joined.contains("no archive"),
+            "没有归档面时要说清整份没有可取回的地方: {joined}"
+        );
+        assert!(
+            !joined.contains("is archived"),
+            "没有归档面时不许说「已归档」——那句话让模型以为稍后取得到: {joined}"
+        );
+    }
+
     /// 小到不需要裁的结果同样要落盘。
     ///
     /// 这是这次改动的那一格：从前只有超出窗口的结果才写进 Raw 层，装得下的
@@ -10379,6 +10575,76 @@ mod attempt_readings_tests {
             result.to_string().contains("no-write"),
             "模型读不到是哪条钩子拒的：{result}"
         );
+    }
+
+    /// 这一次运行为哪一句意图做，就从输入里读出来，并挂到它派出去的活上。
+    ///
+    /// 没有这次改动这条会红：内部员工跑的活只带 `intent_id` 在输入里，派出去的
+    /// `start_task` 不带——下游读「这串活是谁让我做的」只能靠时间猜。
+    #[tokio::test]
+    async fn an_internal_run_stamps_its_intent_on_the_work_it_files() {
+        let (registry, seen) = watched_tool("start_task");
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(100);
+        let config = RuntimeConfig {
+            agent_id: "staff-0001".into(),
+            max_iterations: 3,
+            ..Default::default()
+        };
+        let mut runtime = AgentRuntime::new(config, tx).with_tools(registry);
+        runtime
+            .run_scoped(
+                serde_json::json!({ "task": "把这批门禁修了", "intent_id": "chat:s1:9f2a" }),
+                &CallsOnce("start_task"),
+                None,
+            )
+            .await
+            .expect("这一次运行应当收敛");
+        drop(runtime);
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "这一轮只该派一次活");
+        assert_eq!(
+            seen[0]["intent_id"], "chat:s1:9f2a",
+            "派出去的活没有挂着它是在为哪一句意图做：{}",
+            seen[0]
+        );
+    }
+
+    /// 显式给的那一条优先于输入里的；调用方自己写的那一格不被覆盖；
+    /// 别的工具不长这一格。
+    #[tokio::test]
+    async fn the_runs_intent_is_stamped_once_and_never_over_someone_elses() {
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(100);
+        let config = RuntimeConfig {
+            agent_id: "staff-0002".into(),
+            max_iterations: 3,
+            ..Default::default()
+        };
+        let mut runtime = AgentRuntime::new(config, tx);
+
+        runtime
+            .run_scoped_for_intent(
+                serde_json::json!({ "task": "x", "intent_id": "chat:input" }),
+                &CallsOnce("none"),
+                None,
+                Some("agent:a>b:prompt:00ff"),
+            )
+            .await
+            .expect("这一次运行应当收敛");
+
+        // 运行结束后退回「没有」：下一次运行不继承上一次的意图。
+        let mut empty = serde_json::json!({});
+        runtime.stamp_intent("start_task", &mut empty);
+        assert_eq!(empty, serde_json::json!({}), "运行结束后意图仍在");
+
+        runtime.run_intent_id = Some("agent:a>b:prompt:00ff".into());
+        let mut given = serde_json::json!({ "intent_id": "caller:own" });
+        runtime.stamp_intent("start_task", &mut given);
+        assert_eq!(given["intent_id"], "caller:own", "调用方写的身份被盖掉了");
+
+        let mut other = serde_json::json!({});
+        runtime.stamp_intent("list_tasks", &mut other);
+        assert_eq!(other, serde_json::json!({}), "只有派活的工具有这一格");
     }
 
     /// 改写后的参数才是工具收到的、也是总线上开始帧写着的：帧里不能留一份没跑

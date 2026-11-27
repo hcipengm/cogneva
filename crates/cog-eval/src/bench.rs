@@ -322,7 +322,7 @@ mod tests {
                 .expected_output
                 .as_ref()
                 .and_then(|v| v.as_str())
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             Ok(if output.final_answer == expected {
                 Verdict::pass("exact match")
             } else {

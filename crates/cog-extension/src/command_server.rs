@@ -81,7 +81,8 @@ fn build_concurrency() -> Option<usize> {
 ///
 /// Below it are hand-offs between builds that were going to compile anyway;
 /// above it is a round that may well have spent its wall waiting.
-// cap: bound — 记一笔的阈值，不是容量：它只决定哪些等待值得读，不决定谁等多久
+// cap: fixed — 记一笔的阈值，不是容量：它只决定哪些等待值得读，不决定谁等多久
+// keep: 删掉后每一次排队交接都记一行，日志被本来就要编的交接刷满；由「只记值得读的等待」兜住
 const BUILD_QUEUE_NOTEWORTHY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long a build may queue for a lane before the
@@ -160,7 +161,8 @@ fn quantile(
 /// rather than remade per deployment: a missing or unusable variable binds
 /// the port the Service already routes to, while the environment stays
 /// authoritative when it names a usable port.
-// cap: bound — 没有 SANDBOX_EXECUTOR_PORT 时的默认监听口
+// cap: fixed — 执行器的 Service 路由到的那个口：没有可用环境变量时绑它，而不是每台部署另立一个
+// keep: 删掉后没有可用环境变量时执行器绑不到 Service 路由的那个口，健康检查连不上；由「Service 的目标端口」兜住
 const DEFAULT_EXECUTOR_PORT: u16 = 9090;
 
 /// Resolve the listen port from `SANDBOX_EXECUTOR_PORT`.
@@ -455,6 +457,7 @@ pub struct CommandMetrics {
 /// for, so a command that runs long lands in a bucket instead of leaving every
 /// long request to be counted in `+Inf` with the timeouts.
 // cap: fixed — 桶边界是测量轴的定义：命中分布量在桶里，桶本身不能由它导出（那是循环），
+// not-a-bound: 桶边界是测量轴的定义：命中分布量在桶里，桶本身不能由它导出（那是循环），
 // 切点就是读这张图的人要分开的那几类等待
 const COMMAND_LATENCY_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0, 3600.0,
@@ -843,14 +846,14 @@ fn single_shot(result: std::io::Result<String>) -> tokio::sync::mpsc::Receiver<C
     let (tx, rx) = tokio::sync::mpsc::channel(2);
     match result {
         Ok(content) => {
-            let _ = tx.try_send(CommandEvent::Stdout { data: content });
-            let _ = tx.try_send(CommandEvent::Exit { code: 0 });
+            cog_core::ignore_lost!(tx.try_send(CommandEvent::Stdout { data: content }));
+            cog_core::ignore_lost!(tx.try_send(CommandEvent::Exit { code: 0 }));
         }
         Err(e) => {
             let _ = tx.try_send(CommandEvent::Stderr {
                 data: e.to_string(),
             });
-            let _ = tx.try_send(CommandEvent::Exit { code: 1 });
+            cog_core::ignore_lost!(tx.try_send(CommandEvent::Exit { code: 1 }));
         }
     }
     rx
@@ -1242,7 +1245,7 @@ async fn metrics_handler(State(state): State<AppState>) -> Response {
         .workdir
         .as_ref()
         .map(|r| r.metrics().render())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     // The build cache this executor's commands write into. Rendered from the
     // readings rather than from the prometheus registry the counters above live
     // in, because the same family is served by the other process that owns a
@@ -1380,7 +1383,8 @@ impl LaneState {
 /// than the build: a cargo build's resident set moves over seconds, and a
 /// sample a second catches the plateau without reading allocation noise as a
 /// second build.
-// cap: bound — 采样间隔按「编译的常驻集在秒级移动」定；更密只是同一平台期的重复
+// cap: fixed — 采样间隔按「编译的常驻集在秒级移动」定；更密只是同一平台期的重复
+// keep: 删掉后要么量不到这次构建涨了多少，要么每圈读一次把分配噪声读成第二次构建；由「编译常驻集在秒级移动」兜住
 // 读数，更疏会漏掉整条编译的峰
 const LANE_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -3030,7 +3034,7 @@ mod tests {
         );
         drop(held);
         parked.abort();
-        let _ = parked.await;
+        cog_core::ignore_lost!(parked.await);
         assert_eq!(
             build_lane_fairness(&lane).room,
             Some(cog_core::RoomQueue {
@@ -3462,7 +3466,7 @@ mod tests {
             })
             .collect();
         assert_eq!(content, "via-server");
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// 读不进准入判决：命令把余量占满时，读照样立刻答，也不占一份预留。
@@ -3518,7 +3522,7 @@ mod tests {
         assert_eq!(content, "answer");
         assert_eq!(pressure.open_count(), 1, "读占了一份预留：读不该进准入判决");
         drop(held);
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// 编辑走的是和读写同一条服务：文件在哪个树上，就在哪里改。
@@ -3585,7 +3589,7 @@ mod tests {
             "x\nx\n",
             "被拒绝的编辑不能留下半次写入"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     #[tokio::test]

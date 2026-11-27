@@ -42,11 +42,13 @@
 pub const LLM_USAGE_KEEP_DAYS_ENV: &str = "COGNEVA_LLM_USAGE_KEEP_DAYS";
 
 /// 用量账的保留天数：三十天，与它旁边那本提示归档的承诺一致。
-// cap: bound — 与旁边那本提示归档同一个承诺，不是从某次读数推出来的
+// cap: fixed — 与旁边那本提示归档同一个承诺，不是从某次读数推出来的
+// keep: 删掉后用量保留没有承诺，旁边那本提示归档与它各说各的；由「同一个承诺」兜住
 pub const LLM_USAGE_KEEP_DAYS_DEFAULT: i64 = 30;
 
 /// 用量账最短的保留期：一天。更短会在每一趟里把当前小时折赖以计算的行走删掉。
-// cap: bound — 再短就会删掉当前小时那次折赖以计算的行走；没有测量能把它调小
+// cap: fixed — 再短就会删掉当前小时那次折赖以计算的行走；没有测量能把它调小
+// keep: 删掉后保留期可以被配到删掉当前小时折赖以计算的行；由「再短就删掉折赖以计算的行走」兜住
 pub const LLM_USAGE_KEEP_DAYS_MIN: i64 = 1;
 
 /// 用量账的保留天数，按 [`LLM_USAGE_KEEP_DAYS_ENV`] 读。
@@ -144,7 +146,8 @@ pub const DATABASE_STORAGE_ENV: &str = "COGNEVA_DATABASE_STORAGE_BYTES";
 /// 自清扫。每张表都按「整张卷」算预算，它们合起来就会把卷填满；份额是它们之间
 /// 的分配约定，只能由部署来定，测不出来。回路继承这个数，每拍用它乘出预算、再
 /// 除以当拍实测的每行字节／日写入量。
-// cap: bound — 多张表共用一张卷，份额是分配约定而不是测出来的尺寸；改它是一次产品决策
+// cap: fixed — 多张表共用一张卷，份额是分配约定而不是测出来的尺寸；改它是一次产品决策
+// keep: 删掉后多张表共用一张卷却没有份额约定，一张表把卷吃满；由「份额是分配约定」兜住
 pub const RETENTION_TABLE_SHARE_PERCENT: u64 = 5;
 
 /// 把部署声明的卷大小读成字节；读不出来就是 `None`。
@@ -885,8 +888,22 @@ pub const OBSERVABILITY_EVENTS_READ_WINDOW_ENV: &str =
 /// 观测事件读口在保留读数面上的旋钮名。
 pub const OBSERVABILITY_EVENTS_READ_WINDOW_KNOB: &str = "observability.eventLog.readWindowSeconds";
 
+/// 用量账读口的读数键：花销屏问过的窗口在这里累计，清扫那一侧拿它当保留期的地板。
+pub const LLM_USAGE_READ_WINDOW_KNOB: &str = "llmUsage.readWindowSeconds";
+
+/// 一张原始事实表留多久：体积算出来的天数与读者能读多远的天数，两者取大。
+///
+/// 「读者能读多远」不是部署声明的那一个数：声明只是种子，读者实际问过的窗口由
+/// [`record_read_span`] 记下来、只增不减。留得比读者问过的短，读者下一次问同一
+/// 段过去就会读到一个看起来像「那段时间没有发生任何事」的缺口。
+pub fn kept_days_against_reads(days: i64, read_window_secs: u64) -> i64 {
+    let read_days = (read_window_secs.saturating_add(86_399) / 86_400) as i64;
+    days.max(read_days)
+}
+
 /// 观测事件读口的部署声明：一天，与历史事件查询的默认窗同值。
-// cap: bound — 与历史事件查询的默认窗同值，是读者与清扫共同约定的地板，不是某次测量
+// cap: fixed — 与历史事件查询的默认窗同值，是读者与清扫共同约定的地板，不是某次测量
+// keep: 删掉后读者与清扫没有共同的地板窗，两边各按自己的默认删或读；由「读者与清扫共同约定的地板」兜住
 pub const OBSERVABILITY_EVENTS_READ_WINDOW_DEFAULT_SECS: u64 = 86_400;
 
 /// 本进程读者实际问过的最长跨度，按旋钮名分开记。

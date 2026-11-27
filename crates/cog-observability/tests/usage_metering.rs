@@ -29,6 +29,8 @@ use cog_test_support::database_url;
 
 fn row(actor: &str, result: &str, outcome: Option<MeteringOutcome>) -> LlmUsageRecord {
     LlmUsageRecord {
+        finish_reason: None,
+        ttft_ms: None,
         refused_scope: None,
         upstream: "metering-test-upstream".to_string(),
         api_style: "openai".to_string(),
@@ -43,6 +45,8 @@ fn row(actor: &str, result: &str, outcome: Option<MeteringOutcome>) -> LlmUsageR
         tokens_reasoning: None,
         usage_outcome: outcome,
         estimated_input: None,
+        prompt_manifest: None,
+        prompt_dropped: None,
         cost_micros: None,
         price_book: None,
         refusal_kind: None,

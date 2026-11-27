@@ -1,3 +1,4 @@
+# census-keep: shapes=deploy-numbers — 这是第三方 chart（kube-prometheus-stack）的取值：抓取/评估间隔、保留期与资源由该 chart 的公开约定给定，不由本仓的读数导出；改它要跟它的协议一起改
 # kube-prometheus-stack 缩配 Values —— 单节点 4C/7.5Gi、兼跑构建的本机可落地版本
 #
 # 与商用全量版（kube-prometheus-stack-values.yaml）的差异：

@@ -100,6 +100,10 @@ pub struct GeneratedChange {
     /// issue. Sinks use it to link the PR back (`Fixes #N`) so competing
     /// solutions for the same issue can be grouped.
     pub issue_number: Option<u64>,
+    /// 这件变更属于哪件活：由它产生出来的任务 id（`task:<id>`），或外部入口
+    /// 带来的 issue 编号（`issue:<n>`）。落地率按它把「目标 → 变更 → 落地」串起来。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_of_work: Option<String>,
     /// Which entry point produced this change, carried forward from the task.
     ///
     /// On the change rather than looked up from the task later: the stages that
@@ -718,7 +722,7 @@ impl DiffShape {
                 .added_lines
                 .get(path)
                 .map(|lines| identifier_tokens(&lines.join("\n")))
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             let gone: BTreeSet<String> = identifier_tokens(&removed.join("\n"))
                 .into_iter()
                 .filter(|token| !added.contains(token))
@@ -959,7 +963,7 @@ pub fn introduced_lints(
         let level = message
             .get("level")
             .and_then(|l| l.as_str())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         // Both levels: a run that promotes warnings reports a lint as an error,
         // and one that does not still reports the same lint.
         if level != "error" && level != "warning" {
@@ -1059,7 +1063,7 @@ pub fn lint_findings(transcript: &str) -> BTreeMap<LintFinding, usize> {
         let level = message
             .get("level")
             .and_then(|l| l.as_str())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         if level != "error" && level != "warning" {
             continue;
         }
@@ -1280,12 +1284,14 @@ pub fn path_protected_dir_segment<'a>(
 
 /// Longest an extension may be before a trailing `.foo` reads as a sentence
 /// fragment rather than a file type.
-// cap: bound — 再长，末尾那个 .foo 读起来像句子碎片而不是文件类型
+// cap: fixed — 再长，末尾那个 .foo 读起来像句子碎片而不是文件类型
+// keep: 删掉后路径末尾可以是任意长的串，读起来像句子碎片；由「.foo 的形状」兜住
 const GOAL_PATH_EXT_MAX: usize = 6;
 
 /// Shortest extension worth reading as a file type. One letter is the shape of
 /// an abbreviation (`e.g`, `i.e`), not of an extension anybody ships.
-// cap: bound — 一个字母是缩写（e.g、i.e）的形状，不是任何人会发布的扩展名的形状
+// cap: fixed — 一个字母是缩写（e.g、i.e）的形状，不是任何人会发布的扩展名的形状
+// keep: 删掉后一个字母的扩展名也当文件类型，e.g 与 i.e 被读成后缀；由「一个字母是缩写的形状」兜住
 const GOAL_PATH_EXT_MIN: usize = 2;
 
 /// Characters that separate one candidate token from the next. A goal is prose,
@@ -2489,7 +2495,8 @@ fn test_binary_of(line: &str) -> Option<String> {
 fn without_metadata_hash(stem: &str) -> String {
     /// How many hex digits cargo appends to a binary name's stem: sixteen, the
     /// truncated metadata hash.
-    // cap: bound — 取的是 cargo 给二进制名后面加的那段十六进制长度：截断的 metadata 哈希
+    // cap: fixed — 取的是 cargo 给二进制名后面加的那段十六进制长度：截断的 metadata 哈希
+    // keep: 删掉后按另一种长度截 metadata 哈希，二进制名对不上 cargo 给的形状；由「cargo 那段十六进制长度」兜住
     const HASH_LEN: usize = 16;
     match stem.rsplit_once('-') {
         Some((name, hash))
@@ -2621,7 +2628,8 @@ fn failure_blocks(output: &str) -> String {
 /// How many panic sites a digest names. A run can panic in every test it has;
 /// the first few name the places to look, and the rest is repetition that would
 /// spend the budget the failing-test list needs.
-// cap: bound — 前几行点出该去看哪里，剩下的重复会花掉失败测试清单要用的预算
+// cap: fixed — 前几行点出该去看哪里，剩下的重复会花掉失败测试清单要用的预算
+// keep: 删掉后 panic 的重复行花掉失败测试清单的预算，该看的地方被挤掉；由「前几行点出该去看哪里」兜住
 const PANIC_LINES: usize = 8;
 
 /// At most `budget` characters from the front.
@@ -2676,6 +2684,13 @@ pub struct ChangeCandidate {
     /// 定案那一条的结局说明（拒绝原因 / 接受附注）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_reason: Option<String>,
+    /// 哪一件活要的这条变更：发起它的那条任务的 id（信封上的 `unit_of_work`）。
+    ///
+    /// `scope` 是「这一面在哪」，不是「谁要的」——它由进程写死，同一次运行里所有
+    /// 候选都一样。没有这一格，落地率只能给分段总数，答不出「这个目标对应哪些
+    /// 变更、落地没有」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_of_work: Option<String>,
     /// 这一行由哪条事件算出：投影水位。
     pub event_id: String,
 }
@@ -2685,6 +2700,29 @@ impl ChangeCandidate {
     pub fn is_pending(&self) -> bool {
         self.status == "candidate"
     }
+}
+
+/// 一条候选写进载荷的字段。
+///
+/// 目录在 `event_payload` 的 `PAYLOAD_CATALOG`，由测试对账：这里多一个键或少一个键
+/// 都会红——载荷存 text，没有类型能替人记住它有什么。写者与读者都从这里取，不再各
+/// 拼一份键名。
+pub fn candidate_attributes(candidate: &ChangeCandidate) -> serde_json::Value {
+    serde_json::json!({
+        "kind": candidate.kind,
+        "status": candidate.recorded_status,
+        "description": candidate.description,
+        "content": candidate.content,
+        "created_at": candidate.created_at.to_rfc3339(),
+        "eval_summary": candidate.eval_summary,
+        "tiering": candidate
+            .tiering
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok()),
+        // 发起这条变更的那件活。读的人按它把「一个目标 → 哪些变更 → 落地没有」
+        // 串起来；没有它就是 null，而不是一个空串凑出来的身份。
+        "unit_of_work": candidate.unit_of_work,
+    })
 }
 
 /// 候选的定案。接受与拒绝都是**又一条事件**，不是改一个字段。

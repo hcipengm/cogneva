@@ -76,7 +76,8 @@ pub const DEPLOYMENT_LABEL: &str = "deployment";
 /// well outside the read window on a normal day and inside it during a storm —
 /// which is what the window verdict is for. It is a default for the deployment
 /// that does not say otherwise, not a policy: the deployment states its own.
-// cap: bound — 平常日子在读取窗之外、风暴期在窗之内，那正是窗口判据要回答的；这是不说自己容量的部署的默认值，不是策略
+// cap: fixed — 平常日子在读取窗之外、风暴期在窗之内，那正是窗口判据要回答的；这是不说自己容量的部署的默认值，不是策略
+// keep: 删掉后不说自己容量的部署没有默认值，窗口判据没有可越的地板；由「不说自己容量的部署的默认值」兜住
 pub const DEFAULT_MAX_ROWS: u64 = 1_000_000;
 
 /// How far back readers are promised rows, in seconds.
@@ -84,7 +85,8 @@ pub const DEFAULT_MAX_ROWS: u64 = 1_000_000;
 /// Not a retention knob — it is the floor the capacity may not cross. It
 /// matches the default window of the historical-events query, so a reader that
 /// asks for what it asks for by default never sees a gap the sweep made.
-// cap: bound — 不是保留旋钮，是容量不许越过的地板：与历史事件查询的默认窗同值，按默认问的人不会看见清扫挖出的缺口
+// cap: fixed — 不是保留旋钮，是容量不许越过的地板：与历史事件查询的默认窗同值，按默认问的人不会看见清扫挖出的缺口
+// keep: 删掉后清扫可以越过读者默认问的窗口，按默认问的人看见缺口；由「容量不许越过的地板」兜住
 pub const DEFAULT_READ_WINDOW_SECS: u64 =
     cog_core::retention::OBSERVABILITY_EVENTS_READ_WINDOW_DEFAULT_SECS;
 
@@ -103,12 +105,14 @@ pub const READ_WINDOW_ENV: &str = cog_core::retention::OBSERVABILITY_EVENTS_READ
 /// drops a series it has not seen for five minutes rather than holding the
 /// last value. A period at or beyond that would make the size reading vanish
 /// exactly when the table has gone quiet.
-// cap: bound — 到五分钟 Prometheus 会丢掉这条序列，表一安静大小读数就跟着消失
+// cap: fixed — 到五分钟 Prometheus 会丢掉这条序列，表一安静大小读数就跟着消失
+// keep: 删掉后清扫周期长到五分钟，表一安静这条序列就从 Prometheus 消失；由「5 分钟丢序列」兜住
 const MAX_SWEEP_PERIOD: Duration = Duration::from_secs(120);
 
 /// Shortest the sweeper will wait between passes. A guard against a control
 /// loop that never sleeps, not a cadence anyone is choosing.
-// cap: bound — 防的是一个从不睡眠的控制循环，不是谁在挑节拍
+// cap: fixed — 防的是一个从不睡眠的控制循环，不是谁在挑节拍
+// keep: 删掉后一个从不睡眠的清扫循环把库打满；由「防的是从不睡眠的控制循环」兜住
 const MIN_SWEEP_PERIOD: Duration = Duration::from_secs(1);
 
 /// The cadence this loop declares for itself: the longest it will wait

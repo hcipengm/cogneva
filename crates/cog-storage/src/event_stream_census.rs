@@ -28,11 +28,13 @@ pub const LOOP: &str = "storage_event_stream_census";
 
 /// 进量按哪个窗口数。
 // cap: fixed —— 读数叫「每天」，窗口就是这个名字，不是可调的界
+// not-a-bound: — 读数叫「每天」，窗口就是这个名字，不是可调的界
 pub const WINDOW_SECONDS: i64 = 86_400;
 
 /// 这个 loop 多久问一次。问得比窗口短得多：窗口是「最近一天」，而它回答的是
 /// 「刚刚这一拍还是不是 0」。
 // cap: fixed —— 一拍的长度，由「面板多久刷一次」给定（20 秒那一档），不是策略
+// keep: 删掉后一拍与面板刷新脱钩，面板每次刷新看到的不是同一段；由「面板多久刷一次」兜住
 pub const PASS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// 一拍的结果：每个 kind 在窗口里进了多少行。
@@ -73,6 +75,15 @@ pub async fn pass(pool: &PgPool, metrics: &Arc<dyn MetricsBackend>) -> SFResult<
     for (kind, rows) in &cells {
         let mut labels = std::collections::HashMap::new();
         labels.insert(crate::LABEL_KIND.to_string(), kind.clone());
+        // 这一格回答的是哪一类问题：领域事实还是遥测。分类只在一处（`class_of_kind`），
+        // 读面按标签取；闭集之外的老 kind 落进 `unknown`，不冒充领域。
+        let class = cog_core::contract::event_fact::class_of_kind(kind)
+            .map(|class| match class {
+                cog_core::contract::event_fact::EventClass::Domain => "domain",
+                cog_core::contract::event_fact::EventClass::Telemetry => "telemetry",
+            })
+            .unwrap_or("unknown");
+        labels.insert(crate::LABEL_CLASS.to_string(), class.to_string());
         metrics
             .record_gauge(metric_names::EVENT_STREAM_ROWS_PER_DAY, *rows, labels)
             .await?;

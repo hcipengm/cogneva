@@ -41,7 +41,8 @@ pub const CLAIM_LABEL: &str = "persistentvolumeclaim";
 /// The walk is metadata-only and cheap, but it holds no value being fresher than
 /// the scrape interval, and a deployment that asks for more gets this instead of
 /// a knob that reads as "how wrong the setting was".
-// cap: bound — 与抓取间隔对齐；要更密的人拿到这个值，而不是一个读起来像「你的设置错了多少」的旋钮
+// cap: fixed — 与抓取间隔对齐；要更密的人拿到这个值，而不是一个读起来像「你的设置错了多少」的旋钮
+// not-a-bound: 与抓取间隔对齐；要更密的人拿到这个值，而不是一个读起来像「你的设置错了多少」的旋钮
 pub const MIN_SCAN_INTERVAL_SECS: u64 = 30;
 
 /// Cadence a process re-walks its volumes at when nothing states one.
@@ -52,7 +53,8 @@ pub const MIN_SCAN_INTERVAL_SECS: u64 = 30;
 /// on a ten-minute one for the same workload. It sits beside the floor because
 /// the two are read together — a deployment's own cadence is clamped by the
 /// floor and falls back to this.
-// cap: bound — 与上面那条一起读：部署自己的节拍被地板夹住，读不到就落回这个默认值
+// cap: fixed — 量不到时的种子：部署自己的节拍被地板夹住、读不到时落回这个值；生效的节拍每拍按部署声明的重算
+// keep: 删掉后读不到部署节拍时没有种子，走查要么不停要么从不发生；由「量不到时的种子」兜住
 pub const DEFAULT_SCAN_INTERVAL_SECS: u64 = 300;
 
 /// Deployment variable stating the `claim=path` mounts a pod measures.

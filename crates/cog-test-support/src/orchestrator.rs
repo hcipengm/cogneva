@@ -94,6 +94,8 @@ impl OrchestratorControl for TaskGraphStub {
     }
 
     async fn submit_goal_auto(&self, _goal: &str, tasks: Vec<Task>) -> SFResult<Vec<String>> {
+        // 交进来的任务留在图上：读回口就是它，调用方（以及测试）不必另造一份记录。
+        self.tasks.lock().unwrap().extend(tasks.iter().cloned());
         Ok(tasks.into_iter().map(|task| task.id).collect())
     }
 

@@ -5,7 +5,7 @@
 //!
 //! 默认忽略，需要 `COGNEVA_TEST_DATABASE_URL`。
 
-use cog_core::{LlmCall, LlmCallEvents};
+use cog_core::LlmCall;
 use cog_observability::usage_store::LlmUsageStore;
 use cog_storage::LlmCallEventStore;
 
@@ -35,6 +35,16 @@ async fn call(events: &LlmCallEventStore, id: &str, batch: &str, input: u64, out
             session: None,
             pace: None,
             batch_id: Some(batch.to_string()),
+            tokens_reasoning: None,
+            refusal_kind: None,
+            retry_after_secs: None,
+            usage_outcome: None,
+            estimated_input: None,
+            refused_scope: None,
+            finish_reason: None,
+            ttft_ms: None,
+            prompt_manifest: None,
+            prompt_dropped: None,
             at: chrono::Utc::now(),
         })
         .await

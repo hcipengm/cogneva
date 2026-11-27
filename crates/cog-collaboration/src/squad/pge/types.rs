@@ -48,6 +48,11 @@ pub struct PlannerOutput {
     /// Machine-consumable structured plan.
     pub plan: serde_json::Value,
     /// Atom tasks decomposed from the meta-task.
+    ///
+    /// **可缺省**：planner 交出来的是这一类的定义与每条待办的三格；要不要拆成
+    /// 原子任务由执行面决定。缺这一格时按空列表读（自演化的计划本来就是空），
+    /// 而不是把一份只写了定义的计划判成解析失败。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sub_tasks: Vec<TaskSpec>,
     /// Verifiable acceptance criteria the Evaluation stage must check one by one.
     /// Empty means the plan imposes no explicit gate and the evaluator falls back
@@ -80,6 +85,12 @@ pub struct PlannerOutput {
     /// 那两格只作为兼容输入读，不再作为判据。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub items: Vec<cog_core::contract::ledger_item::LedgerItem>,
+    /// 这一类活是什么、这一类里怎样算做完——planner 交出来的**定义**，不是步骤表。
+    ///
+    /// 步骤表由执行的人自己排；定义才是判据审要对着读的那段话：它既约束「这一条
+    /// 终态像不像这一类」，也约束「做完的样子」。没有它时判据只能就事论事。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<String>,
 }
 
 impl PlannerOutput {
@@ -143,9 +154,34 @@ mod ledger_items_tests {
 
     /// 契约没点名 `items` 时，从每一片的 `acceptance` 派生：判据仍是那一句，
     /// 只是换了个更窄的载体。派生不出来（没有一片写了验收）就是空，不是「全过」。
+    /// 只交定义与三格、完全不写 `sub_tasks` 的答案要读得回来：空列表。
+    ///
+    /// 拆不拆是执行面的事；解析器把「没写这一格」读成解析失败，等于把
+    /// 「定义就是产出」的形状挡在门外。
+    #[test]
+    fn a_definition_only_answer_parses_with_no_sub_tasks() {
+        let plan: PlannerOutput = serde_json::from_value(serde_json::json!({
+            "summary": "s",
+            "plan": {"approach": "one paragraph"},
+            "definition": "这一类：每一轮都带着它需要的全部；做完＝每一轮都不缺",
+            "items": [{
+                "id": "N1",
+                "terminal": "窗口里每一轮都带着它需要的全部",
+                "now": "还没做",
+                "gap": "缺的是：窗口装配",
+                "state": "未落"
+            }]
+        }))
+        .expect("只写定义与三格的计划要能解析");
+        assert!(plan.sub_tasks.is_empty());
+        assert!(plan.definition.is_some());
+        assert_eq!(plan.items.len(), 1);
+    }
+
     #[test]
     fn items_are_derived_from_the_acceptance_when_the_contract_names_none() {
         let mut plan = PlannerOutput {
+            definition: None,
             summary: "s".into(),
             plan: serde_json::json!({}),
             sub_tasks: vec![TaskSpec {
@@ -956,6 +992,71 @@ pub fn best_scored<'a>(judged: &[&'a PgeBranchResult]) -> Option<&'a PgeBranchRe
         .max_by_key(|b| b.outcome.judgement().and_then(|e| e.score).unwrap_or(0))
 }
 
+/// 落选的那一份候选，和它为什么没成。
+///
+/// 「记得上一次试过什么、为什么没成」靠的就是这一格：选中的那一份进了产物，
+/// 落选的若只剩一个 `branch_id`，下一轮读到的只有「试过」，没有「为什么没成」，
+/// 同一个坑就会再踩一次。落选分两种，读数时分开：**判过但不如果**——带上它的
+/// 判词与分；**没被判过**——明写没到判，不能读成「判了不通过」。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RejectedCandidate {
+    pub branch_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<Verdict>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<u32>,
+    pub reason: String,
+}
+
+/// 一轮里除选中的那一份之外，每一份的去处。`chosen` 为 `None` 时（整轮没判成）
+/// 每一支都算落选，各自的理由照写。
+pub fn rejected_candidates(
+    branches: &[PgeBranchResult],
+    chosen: Option<u32>,
+) -> Vec<RejectedCandidate> {
+    branches
+        .iter()
+        .filter(|b| Some(b.branch_id) != chosen)
+        .map(|b| match &b.outcome {
+            RoundOutcome::Judged { evaluation } => RejectedCandidate {
+                branch_id: b.branch_id,
+                verdict: Some(evaluation.verdict),
+                score: evaluation.score,
+                reason: if evaluation.feedback.trim().is_empty() {
+                    format!("{:?} without a stated reason", evaluation.verdict)
+                } else {
+                    evaluation.feedback.clone()
+                },
+            },
+            RoundOutcome::Stopped { cause, product } => RejectedCandidate {
+                branch_id: b.branch_id,
+                verdict: None,
+                score: None,
+                reason: format!("no judgement: {} ({product:?})", cause.reason()),
+            },
+        })
+        .collect()
+}
+
+/// 下一轮读到的历史：每一轮的产出、判词，与**落选的理由**。
+///
+/// 不把候选全文搬进来：候选本身的体积由各自的产物格带着，这里只回答
+/// 「上一轮试过别的方式吗、为什么没过」。
+pub fn round_history_doc(history: &[PgeRoundtableIteration]) -> Vec<serde_json::Value> {
+    history
+        .iter()
+        .map(|h| {
+            serde_json::json!({
+                "iteration": h.iteration,
+                "plan": &h.plan,
+                "generation": &h.generation,
+                "outcome": &h.outcome,
+                "rejected": h.merge_summary.as_ref().map(|m| &m.rejected),
+            })
+        })
+        .collect()
+}
+
 /// Strategy for merging parallel branch results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -982,6 +1083,10 @@ pub struct MergeSummary {
     pub selected_branch_id: Option<u32>,
     pub strategy: BranchMergeStrategy,
     pub reasoning: String,
+    /// 落选的每一份与它的理由：选中的进了产物，这些留在这里，下一轮从
+    /// [`round_history_doc`] 里读到「试过什么、为什么没成」。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected: Vec<RejectedCandidate>,
 }
 
 /// A single roundtable iteration.
@@ -1017,6 +1122,7 @@ mod tests {
     #[test]
     fn planner_output_roundtrip_preserves_criteria() {
         let output = PlannerOutput {
+            definition: None,
             summary: "s".into(),
             plan: serde_json::json!({}),
             sub_tasks: Vec::new(),
@@ -1034,6 +1140,7 @@ mod tests {
     #[test]
     fn an_empty_but_real_plan_is_not_an_environment_failure() {
         let output = PlannerOutput {
+            definition: None,
             summary: "nothing to decompose".into(),
             plan: serde_json::json!({}),
             sub_tasks: Vec::new(),
@@ -1049,6 +1156,7 @@ mod tests {
     #[test]
     fn a_plan_that_never_reached_its_upstream_carries_the_real_cause() {
         let output = PlannerOutput {
+            definition: None,
             summary: "Planner prompt did not reach its upstream: HTTP 503".into(),
             plan: serde_json::Value::String(
                 "environment_error: HTTP 503 upstream unavailable".into(),
@@ -1087,6 +1195,7 @@ mod tests {
     #[test]
     fn a_refusal_the_environment_can_clear_is_declared_unavailable_not_terminal() {
         let planner = |cause: &str| PlannerOutput {
+            definition: None,
             summary: "planner prompt failed".into(),
             plan: serde_json::Value::String(format!(
                 "environment_error: LLM upstream refused ({cause}): HTTP 503 upstream unavailable"

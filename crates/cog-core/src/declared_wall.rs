@@ -498,7 +498,8 @@ pub async fn wait_until_stalled(watched: &[&str]) -> (Duration, Duration) {
 
 /// How often the waiter wakes. It only exists so the completion of the inner
 /// future can be raced against a clock; it is not a wall.
-// cap: bound — 只排期、从不取消任何东西：进度由内层 future 决定，这个数只定回来看一眼的节拍
+// cap: fixed — 只排期、从不取消任何东西：进度由内层 future 决定，这个数只定回来看一眼的节拍
+// keep: 删掉后声明墙没有回来看一眼的节拍，进度再也读不到；由「只排期、从不取消任何东西」兜住
 pub const POLL_EVERY: Duration = Duration::from_secs(15);
 
 /// 轮询间隔的测试覆盖，0 表示用 [`POLL_EVERY`]。
@@ -529,7 +530,8 @@ pub fn set_poll_every_for_tests(poll: Duration) {
 /// has been running for three hours is a different fact from one that ran over
 /// by a minute, and the first warning alone would read as stale — the same
 /// reason any measured figure needs a freshness rule.
-// cap: bound — 只决定超墙之后重复说一句的间隔，从不取消任何东西
+// cap: fixed — 只决定超墙之后重复说一句的间隔，从不取消任何东西
+// keep: 删掉后超墙之后的那句话不再重复，读的人以为它自己消失了；由「只决定重复说一句的间隔」兜住
 pub const REPEAT_EVERY: Duration = Duration::from_secs(300);
 
 /// Await `fut` to completion, warning when it outlives `declared`.

@@ -370,7 +370,7 @@ pub fn task() -> RawRecord {
 
 const FIXTURE_READER: &str = "\
 pub async fn read(logger: &dyn Logger) {
-    let _ = logger.read_proto(\"session_raw\").await;
+    cog_core::ignore_lost!(logger.read_proto(\"session_raw\").await);
 }
 ";
 

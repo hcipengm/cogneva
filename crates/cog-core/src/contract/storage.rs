@@ -395,6 +395,16 @@ pub trait ObjectBackend: Send + Sync {
     /// Generate a presigned URL for temporary access (no-op for memory/fs backends).
     async fn presign_url(&self, key: &str, expiry_secs: u64) -> SFResult<String>;
 
+    /// 让这个后端此刻真的能服务：它存放的根（桶／目录）在，写出去的引用解得开。
+    ///
+    /// 默认什么都不做：文件后端按需建目录，内存后端没有可准备的东西。S3 一类要
+    /// 先确认桶在——引用（`artifact://…`、`s3://<bucket>/<key>`）能不能取回全文
+    /// 取决于桶是否存在，而「配置里写了桶」与「存储上有这个桶」是两件事
+    /// （2026-11-27 现场：配置了 `seaweedfs` 与桶 `cogneva`，存储上一个桶都没有）。
+    async fn ensure_ready(&self) -> SFResult<()> {
+        Ok(())
+    }
+
     /// Check whether an object exists.
     async fn exists(&self, key: &str) -> SFResult<bool>;
 
@@ -622,12 +632,14 @@ pub struct RawLoggerConfig {
 
 // 一条记录的大小在几百字节量级：一千条留在内存里是几百 KB，是一次刷盘能背得动
 // 的量；再多，进程死掉时丢的那一段就不再是一瞬间的读数。
-// cap: bound — 一千条几百 KB：一次刷盘背得动，死掉时丢的只是一瞬间的读数
+// cap: fixed — 一千条几百 KB：一次刷盘背得动，死掉时丢的只是一瞬间的读数
+// keep: 删掉后回到「一千条几百 KB：一次刷盘背得动，死掉时丢的只是一瞬间的读数」所描述的情形；由这条约定兜住
 const RAW_LOG_MAX_BUFFER_RECORDS: usize = 1000;
 
 // 一秒：计时器与条数两个触发谁先到谁刷，一秒是「事件驱动的一拍」的下限——再短
 // 就退化成每条记录一次刷盘。
-// cap: bound — 一秒：再短就退化成每条一次刷盘，一拍的下限就是这个节拍
+// cap: fixed — 一秒：再短就退化成每条一次刷盘，一拍的下限就是这个节拍
+// keep: 删掉后刷盘退化成每条一次，一拍的下限跟着每条日志走；由「一拍的下限就是这个节拍」兜住
 const RAW_LOG_FLUSH_INTERVAL_SECS: u64 = 1;
 
 fn default_flush_interval_secs() -> u64 {
@@ -1227,7 +1239,8 @@ pub trait VectorBackend: Send + Sync {
         /// The damping constant of reciprocal rank fusion as the literature defines it
         /// (k = 60): it holds the weight of the lowest ranks near the weight of the
         /// highest instead of letting one list's top hit decide the fusion.
-        // cap: bound — 取的是 RRF 论文的 k = 60：它让最低那些名次的权重接近最高的，而不是让一张表的头名决定整次融合
+        // cap: fixed — 取的是 RRF 论文的 k = 60：它让最低那些名次的权重接近最高的，而不是让一张表的头名决定整次融合
+        // keep: 删掉后换一个 k，最低名次的权重被压低，一张表的头名决定整次融合；由「RRF 论文的 k=60」兜住
         const RRF_K: f32 = 60.0;
         let mut fused_scores: std::collections::HashMap<String, f32> =
             std::collections::HashMap::new();
@@ -1475,7 +1488,7 @@ pub fn tier_for_age(
     hot_duration: std::time::Duration,
     warm_duration: std::time::Duration,
 ) -> StorageTier {
-    let age = age.to_std().unwrap_or_default();
+    let age = age.to_std().unwrap_or(Default::default());
     if age < hot_duration {
         StorageTier::Hot
     } else if age < hot_duration + warm_duration {
@@ -1505,11 +1518,13 @@ pub struct TierPolicy {
 }
 
 /// 默认热层保留 7 天：最近一周的原始流是排障与评测最常回看的那一段。
-// cap: bound — 最近一周的原始流是排障与评测最常回看的那一段；这是一次回看窗口的取舍，不是测量
+// cap: fixed — 最近一周的原始流是排障与评测最常回看的那一段；这是一次回看窗口的取舍，不是测量
+// keep: 删掉后最近一周的原始流不在热层，排障与评测最常回看的那一段要跨层读；由「回看窗口的取舍」兜住
 const DEFAULT_HOT_DURATION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// 默认温层保留 90 天：超过一个季度的事件已经属于归档，但仍要能查。
-// cap: bound — 一个季度之后的事件属于归档但仍要能查；这是分层策略的取舍，不是测量
+// cap: fixed — 一个季度之后的事件属于归档但仍要能查；这是分层策略的取舍，不是测量
+// keep: 删掉后一个季度内的归档不可查，分层策略把仍要能查的那段切掉；由「一个季度之后仍要能查」兜住
 const DEFAULT_WARM_DURATION: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 
 /// zstd 的三档压缩级别：`0` 是库自己的默认档，`3` 是推荐区间里的快档，`9` 是
@@ -1518,14 +1533,18 @@ const DEFAULT_WARM_DURATION: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 /// 三个存储面说的是同一件事——原始日志、冷热分层迁移、可观测快照各写一份，改
 /// 一处忘一处，盘上就会出现「同一天的日志在两个 tier 用两种档压」。
 // cap: fixed — zstd 语义：0 = 库默认档
+// keep: 删掉后默认档由各处自己写，同一层用不同压缩档；由「zstd 库默认档」兜住
 pub const COMPRESSION_LEVEL_DEFAULT: i32 = 0;
 // cap: fixed — zstd 推荐压缩档（快档 3）
+// keep: 删掉后热层用别的压缩档，写读两侧的档位对不上；由「zstd 快档 3」兜住
 pub const COMPRESSION_LEVEL_WARM: i32 = 3;
 // cap: fixed — zstd 推荐压缩档（高压缩档 9）
+// keep: 删掉后冷层用别的压缩档，冷数据的存储代价随写入方走；由「zstd 高压缩档 9」兜住
 pub const COMPRESSION_LEVEL_COLD: i32 = 9;
 
 /// 默认每小时扫一次分层：分层是按时间的判据，密到分钟级只会重复搬同一批对象。
-// cap: bound — 分层是按时间的判据，密到分钟级只会重复搬同一批对象
+// cap: fixed — 分层是按时间的判据，密到分钟级只会重复搬同一批对象
+// keep: 删掉后分层按分钟重扫，重复搬同一批对象；由「分层是按时间的判据」兜住
 const DEFAULT_TIER_SCAN_INTERVAL: Duration = Duration::from_secs(3600);
 
 impl Default for TierPolicy {

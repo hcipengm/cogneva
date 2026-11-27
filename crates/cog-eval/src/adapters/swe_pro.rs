@@ -520,7 +520,8 @@ fn grade(
 
 /// 判词里最多点几条测试名——全列出来会把判词撑成一整份测试报告。
 fn sample(names: &[&str]) -> String {
-    // cap: bound — at most five test names in a verdict; the rest are counted, not listed
+    // cap: fixed — at most five test names in a verdict; the rest are counted, not listed
+    // keep: 删掉后一次失败很多的评测会把每个失败测试名都塞进判词，白花 token；由「判词只列五个名字、其余计数」兜住
     const MAX: usize = 5;
     if names.is_empty() {
         return "none".into();
@@ -569,9 +570,9 @@ impl CaseJudge for SweProJudge {
         verdict
             .readings
             .insert("tests_passed".into(), report.passed.len().to_string());
-        // 原始输出可能很长：只在 readings 里留一段，判词里不留。
-        let raw: String = report.raw.chars().take(2000).collect();
-        verdict.readings.insert("report".into(), raw);
+        // 原始输出整份进 readings：默认无损。它有没有长到装不下，由读到这一格的人
+        // 量（`report` 的字节数就在同一份 verdict 里），不在这里先替它切。
+        verdict.readings.insert("report".into(), report.raw.clone());
         Ok(verdict)
     }
 }
@@ -671,7 +672,7 @@ mod tests {
         assert_eq!(c.input["problem_statement"], "the bug");
         assert!(c.input.get("patch").is_none());
         assert!(c.input.get("fail_to_pass").is_none());
-        std::fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     #[test]
@@ -702,7 +703,7 @@ mod tests {
         let root = tempdir();
         let err = SweProCaseSource.cases(&root).unwrap_err().to_string();
         assert!(err.contains("--convert"), "{err}");
-        std::fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     #[test]
@@ -1001,6 +1002,6 @@ mod tests {
         assert_eq!(cases.len(), 1);
         // 没有容器后端 ⇒ 起环境就报错，不是给一个空环境让分数掉下去。
         assert!(bench.env.acquire(&cases[0]).await.is_err());
-        std::fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 }

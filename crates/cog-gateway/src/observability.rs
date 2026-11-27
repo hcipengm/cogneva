@@ -45,7 +45,8 @@ fn default_limit() -> usize {
 /// How many firing alerts to fetch when all the verdict needs is whether any
 /// exist. The question is boolean, so one row settles it and the read stays
 /// bounded no matter how much is firing.
-// cap: bound — 探测只取一条；有界，不随正在告警的数量增长
+// cap: fixed — 探测只取一条；有界，不随正在告警的数量增长
+// keep: 删掉后探测的代价跟着正在告警的数量长，风暴里探测先拖垮面板；由「只取一条、不随告警数量增长」兜住
 const FIRING_PROBE_LIMIT: i64 = 1;
 
 /// Verdict over the firing alerts an evidence source reported.
@@ -378,7 +379,8 @@ fn usage_reach_hours() -> i64 {
 /// weeks and a chart cannot draw them. The summed reads have no such limit and
 /// derive theirs from the retention ([`usage_reach_hours`]); only this one is
 /// bounded by how much can be drawn.
-// cap: bound — 逐窗口那一读的响应大小就是区间本身，界的是画得出来多少格
+// cap: fixed — 逐窗口那一读的响应大小就是区间本身，界的是画得出来多少格
+// keep: 删掉后一次读图可以要任意长的区间，响应大小就是区间本身；由「界的是画得出来多少格」兜住
 const MAX_SERIES_HOURS: i64 = 24 * 7;
 
 /// The instant a spend request asks the fold to sum from.
@@ -659,6 +661,13 @@ fn spend_range(
             "hours 与 since/until 只能二选一：两个都给时用哪个都要靠约定，而约定看不见",
         ));
     }
+    // 读者问过多宽，清扫那一侧就要把保留期的地板抬到多高：这是「谁能读多远」
+    // 的输入，不是一个被拒绝之后什么也不改变的请求。记在拒绝之前——一个被拒的
+    // 更宽请求正是「有人要读那么远」的证据。
+    cog_core::retention::record_read_span(
+        cog_core::retention::LLM_USAGE_READ_WINDOW_KNOB,
+        (until - since).num_seconds().max(0) as u64,
+    );
     if until <= since {
         return Err(ApiError::bad_request(format!(
             "until 必须晚于 since：{}, {}",

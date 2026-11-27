@@ -18,9 +18,10 @@ const GROUP: &str = "test-group";
 #[tokio::test]
 async fn test_multi_instance_publish_subscribe_consistency() {
     let backend = Arc::new(MemoryMessageBackend::new());
-    let _ = backend.create_consumer_group(STREAM, GROUP).await;
+    cog_core::ignore_lost!(backend.create_consumer_group(STREAM, GROUP).await);
 
     const N_INSTANCES: usize = 4;
+    // not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
     const MESSAGES_PER_INSTANCE: usize = 25;
 
     let start = Instant::now();
@@ -116,7 +117,7 @@ async fn test_multi_instance_publish_subscribe_consistency() {
 #[tokio::test]
 async fn test_multi_instance_batch_publish_ordering() {
     let backend = Arc::new(MemoryMessageBackend::new());
-    let _ = backend.create_consumer_group(STREAM, GROUP).await;
+    cog_core::ignore_lost!(backend.create_consumer_group(STREAM, GROUP).await);
 
     const N_INSTANCES: usize = 4;
     const BATCH_SIZE: usize = 10;
@@ -193,7 +194,7 @@ async fn test_multi_instance_batch_publish_ordering() {
 #[tokio::test]
 async fn test_late_joining_instance_replay() {
     let backend = Arc::new(MemoryMessageBackend::new());
-    let _ = backend.create_consumer_group(STREAM, GROUP).await;
+    cog_core::ignore_lost!(backend.create_consumer_group(STREAM, GROUP).await);
 
     // Publish 10 messages.
     for i in 0..10 {
@@ -237,7 +238,7 @@ async fn test_late_joining_instance_replay() {
 #[tokio::test]
 async fn test_memory_backend_latency_under_load() {
     let backend = Arc::new(MemoryMessageBackend::new());
-    let _ = backend.create_consumer_group(STREAM, GROUP).await;
+    cog_core::ignore_lost!(backend.create_consumer_group(STREAM, GROUP).await);
 
     const MSG_COUNT: usize = 100;
 

@@ -311,9 +311,11 @@ pub struct ListProjectsQuery {
     pub cursor: Option<usize>,
 }
 
-// cap: bound — 不传 `limit` 时一页返回多少个项目。与 `PROJECTS_PAGE_MAX` 成对：默认值小到一屏能读完，大请求才要显式说要。
+// cap: fixed — 不传 `limit` 时一页返回多少个项目。与 `PROJECTS_PAGE_MAX` 成对：默认值小到一屏能读完，大请求才要显式说要。
+// keep: 删掉后回到「不传 `limit` 时一页返回多少个项目。与 `PROJECTS_PAGE_MAX` 成对：默认值小到一屏能读完，大请求才要显式说要。」所描述的情形；由这条约定兜住
 const PROJECTS_PAGE_DEFAULT: usize = 200;
-// cap: bound — 一页的上限。存在的理由是拒绝比静默截断更便宜：读全量要带游标一页页走，而不是把 `limit` 调成一百万让这一次请求把整张图读进内存。
+// cap: fixed — 一页的上限。存在的理由是拒绝比静默截断更便宜：读全量要带游标一页页走，而不是把 `limit` 调成一百万让这一次请求把整张图读进内存。
+// keep: 删掉后一次请求把整张图读进内存，读全量的人本该带游标一页页走；由「拒绝比静默截断更便宜」兜住
 const PROJECTS_PAGE_MAX: usize = 1000;
 
 /// 每列最多带回多少张卡片。
@@ -321,7 +323,9 @@ const PROJECTS_PAGE_MAX: usize = 1000;
 /// 看板是给人挪的，不是给人数的：只回计数的话，界面画得出六列数字，画不出任何一张
 /// 能拖的卡，而「这一列有 37 个」在客户眼里等于「我不知道里面是什么」。上限之外
 /// 的张数由 `cards_hidden` 如实报出来——静默截断会让一列看起来正好装得下。
-// cap: bound — 一列最多画多少张卡；超出的张数由 cards_hidden 如实报出来，不静默截断
+// cap: fixed — 一列最多画多少张卡；超出的张数由 cards_hidden 如实报出来，不静默截断
+// keep: 删掉后回到「一列最多画多少张卡；超出的张数由 cards_hidden 如实报出来，不静默截断」所描述的情形；由这条约定兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const BOARD_CARDS_PER_COLUMN: usize = 100;
 
 /// 看板上的一张卡片。
@@ -650,7 +654,9 @@ pub(crate) fn task_title(task: &Task) -> String {
         if let Some(v) = task.input.get(key).and_then(|v| v.as_str()) {
             let v = v.trim();
             if !v.is_empty() {
-                return v.chars().take(120).collect();
+                // 展示面手里就是全文，按「有损默认无损」整段交出去；
+                // 版面宽度交给渲染侧（CSS/换行），不在这里切。
+                return v.to_string();
             }
         }
     }
@@ -1399,7 +1405,8 @@ pub struct WbsResponse {
 ///
 /// 真实的分解深度个位数；一个四千层的链只可能来自坏数据或有人手工造环，那时
 /// 递归会把网关的栈打穿——而栈溢出不是一个能被 `Result` 接住的错误。
-// cap: bound — 递归分解的深度上限；坏数据或手工造环会把网关的栈打穿，而栈溢出不是 Result 能接住的
+// cap: fixed — 递归分解的深度上限；坏数据或手工造环会把网关的栈打穿，而栈溢出不是 Result 能接住的
+// keep: 删掉后坏数据或手工造环把网关的栈打穿，栈溢出不是 Result 能接住的；由「递归分解的深度上限」兜住
 const WBS_DEPTH_CAP: usize = 256;
 
 /// 把一批任务折成一棵范围树。
@@ -1880,7 +1887,8 @@ pub(crate) fn build_project_task(
 
 /// 标题的上限。超了拒绝而不是截断：截断之后存下来的就不是用户写的那个名字，
 /// 而界面上没有任何地方会说它被改过。
-// cap: bound — 标题上限；超了拒绝而不是截断——截断之后存下的就不是用户写的那个名字
+// cap: fixed — 标题上限；超了拒绝而不是截断——截断之后存下的就不是用户写的那个名字
+// not-a-bound: 标题上限；超了拒绝而不是截断——截断之后存下的就不是用户写的那个名字
 pub(crate) const MAX_TITLE_CHARS: usize = 200;
 
 pub async fn create_project_task_handler(

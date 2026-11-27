@@ -25,7 +25,8 @@ use tokio::process::Command;
 /// 这是钉住的值（`cap: bound`）：预览是给人做决定用的，一条看不完的清单和没有
 /// 清单一样；退回本身不受这个数限制（少列不等于少退），所以超过时清单只列前面
 /// 这些条并在 `truncated` 上说明「还有，没列完」。
-// cap: bound — 给人看的预览长度；退回不按它砍，只砍清单
+// cap: fixed — 给人看的预览长度；退回不按它砍，只砍清单
+// keep: 删掉后一次退回要在弹窗里列出全部文件（可能上千），人读不完也点不到底；由「清单只列前面几条、其余由 truncated 说明」兜住
 const MAX_LISTED_FILES: usize = 500;
 
 /// 一次退回会改动的一行。
@@ -47,6 +48,9 @@ pub struct Plan {
     pub files: Vec<Change>,
     /// 清单被上面那个上限截断了。
     pub truncated: bool,
+    /// 退回去会丢掉的那几条**未提交**改动：它们在快照之后改过，且不在 HEAD 里。
+    /// 退回去是显式改树，丢掉是它的本意；但丢掉哪些要读得出来，不能是静默覆盖。
+    pub discarded: Vec<String>,
 }
 
 impl Plan {
@@ -55,6 +59,7 @@ impl Plan {
             "key": self.key,
             "commit": self.commit,
             "truncated": self.truncated,
+            "discarded": self.discarded,
             "files": self.files.iter().map(|c| serde_json::json!({
                 "path": c.path,
                 "change": c.change,
@@ -68,6 +73,7 @@ impl Plan {
 /// 这是**固定**的：名字只由「哪一段对话、第几轮」拼出来，长度由那两个数决定；
 /// 更长的名字不比短的有用，而 git 的 ref 名本身有长度上限。
 // cap: fixed — ref 名的一部分，不随读数变
+// keep: 删掉后点名会把任意长的名字拼进 ref，git 拒收发生在更晚也更深的地方；由「git ref 名的长度上限」兜住
 const MAX_KEY_LEN: usize = 200;
 
 /// `key` 只允许这些字符。
@@ -146,7 +152,7 @@ fn scratch_index() -> PathBuf {
 /// 他根本没打算提交的改动——拍快照这个动作不该在 `git status` 里留下痕迹。
 async fn worktree_tree(root: &Path) -> Result<String, String> {
     let index = scratch_index();
-    let _ = std::fs::remove_file(&index);
+    cog_core::ignore_lost!(std::fs::remove_file(&index));
     let result = async {
         match head(root).await? {
             Some(_) => git(root, &["read-tree", "HEAD"], Some(&index)).await?,
@@ -156,7 +162,7 @@ async fn worktree_tree(root: &Path) -> Result<String, String> {
         git(root, &["write-tree"], Some(&index)).await
     }
     .await;
-    let _ = std::fs::remove_file(&index);
+    cog_core::ignore_lost!(std::fs::remove_file(&index));
     result
 }
 
@@ -180,6 +186,7 @@ pub async fn capture(root: &Path, key: &str) -> Result<Plan, String> {
         commit,
         files: Vec::new(),
         truncated: false,
+        discarded: Vec::new(),
     })
 }
 
@@ -223,6 +230,7 @@ pub async fn plan(root: &Path, key: &str) -> Result<Plan, String> {
         commit,
         files,
         truncated,
+        discarded: Vec::new(),
     })
 }
 
@@ -254,7 +262,34 @@ async fn snapshot_entries(
 /// 只写工作区与文件系统，不碰索引、HEAD 与分支：退完之后 `git status` 会把差别
 /// 如实报出来——退回是一次显式的改树，不该同时替人把改动暂存好。
 pub async fn restore(root: &Path, key: &str) -> Result<Plan, String> {
-    let plan = plan(root, key).await?;
+    let mut plan = plan(root, key).await?;
+    // 先判一次这一步会永久失去什么：受影响路径里，当前内容既不在快照里、也不在
+    // HEAD 里的那些，退回去就再也取不回。退回去仍然是本意，但丢掉的是谁必须点名。
+    if !plan.files.is_empty() {
+        let mut args: Vec<String> = vec![
+            "status".into(),
+            "--porcelain".into(),
+            "-z".into(),
+            "--".into(),
+        ];
+        args.extend(plan.files.iter().map(|c| c.path.clone()));
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        if let Ok(status) = git(root, &refs, None).await {
+            for entry in status.split('\0') {
+                if entry.len() > 3 {
+                    let path = entry[3..].trim().to_string();
+                    if !path.is_empty() {
+                        tracing::warn!(
+                            path = %path,
+                            "restore discards uncommitted content that neither the snapshot nor HEAD holds"
+                        );
+                        plan.discarded.push(path);
+                    }
+                }
+            }
+        }
+    }
+    let plan = plan;
     let entries = snapshot_entries(root, &plan.commit).await?;
     let wanted: std::collections::HashMap<&str, (&str, &str)> = entries
         .iter()
@@ -282,7 +317,7 @@ pub async fn restore(root: &Path, key: &str) -> Result<Plan, String> {
                 // 走字节而不是字符串：快照里可能是二进制，按行收尾会把内容改坏。
                 let bytes = raw_blob(root, sha).await?;
                 if std::fs::symlink_metadata(&target).is_ok() {
-                    let _ = std::fs::remove_file(&target);
+                    cog_core::ignore_lost!(std::fs::remove_file(&target));
                 }
                 if mode == "120000" {
                     #[cfg(unix)]
@@ -303,7 +338,7 @@ pub async fn restore(root: &Path, key: &str) -> Result<Plan, String> {
                             .map_err(|e| format!("{} 读不回来：{e}", change.path))?
                             .permissions();
                         perms.set_mode(if executable { 0o755 } else { 0o644 });
-                        let _ = std::fs::set_permissions(&target, perms);
+                        cog_core::ignore_lost!(std::fs::set_permissions(&target, perms));
                     }
                 }
             }
@@ -456,6 +491,28 @@ mod tests {
         assert!(
             !plan.files.iter().any(|c| c.path.starts_with("target/")),
             "忽略目录不进快照：{plan:?}"
+        );
+    }
+    /// 退回去会丢掉的未提交改动必须点名，不能静默覆盖。
+    ///
+    /// 没有这次改动这条会红：快照之后改的那一行会被退回直接覆盖，`Plan` 里没有
+    /// 任何一格说出「刚才那份内容再也不在了」。
+    #[tokio::test]
+    async fn a_restore_names_the_uncommitted_content_it_discards() {
+        let dir = repo().await;
+        capture(dir.path(), "cp1").await.expect("capture");
+        std::fs::write(dir.path().join("a.txt"), "two\n").expect("edit");
+        let plan = restore(dir.path(), "cp1").await.expect("restore");
+        assert!(
+            plan.discarded.iter().any(|p| p == "a.txt"),
+            "退回去丢掉的未提交内容没有点名：{:?}",
+            plan.discarded
+        );
+        let clean = restore(dir.path(), "cp1").await.expect("restore again");
+        assert!(
+            clean.discarded.is_empty(),
+            "干净的树上退回不该报丢弃：{:?}",
+            clean.discarded
         );
     }
 }

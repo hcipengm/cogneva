@@ -41,16 +41,19 @@ pub const REQUEST_FILE: &str = "request.json";
 pub const OUTCOME_FILE: &str = "outcome.json";
 
 /// 执行到位并给出了判定：变更通过，产物在结果文件里。
-// cap: bound — 与 POSIX 惯例同源：0 表示执行到位且判定通过
+// cap: fixed — 与 POSIX 惯例同源：0 表示执行到位且判定通过
+// keep: 删掉后进程以运行时默认状态退出，拒绝会被读成通过；由「POSIX 约定 0 表示执行到位且通过」兜住
 pub const EXIT_PASSED: i32 = 0;
 /// 执行到位并给出了判定：变更被拒，判词与原因在结果文件里。
-// cap: bound — 与 POSIX 惯例同源：1 表示执行到位且判定拒绝
+// cap: fixed — 与 POSIX 惯例同源：1 表示执行到位且判定拒绝
+// keep: 删掉后拒绝与通过走同一个退出状态，调用方分不出该重试还是该停；由「POSIX 约定 1 表示执行到位且拒绝」兜住
 pub const EXIT_REFUSED: i32 = 1;
 /// 没能做出判定：工作树、git、cargo 或构建闸门没能让这次执行跑完。
 ///
 /// 与变更本身无关，也不含任何结论——调用方据此把变更留在队列里重试，而不是记成
 /// 一次失败。取 75（EX_TEMPFAIL），与一次性滚动入口的环境类退出码同源。
 // cap: fixed — 取 75（EX_TEMPFAIL），与滚动入口的环境类退出码同源
+// keep: 删掉后回到「取 75（EX_TEMPFAIL），与滚动入口的环境类退出码同源」所描述的情形；由这条约定兜住
 pub const EXIT_UNAVAILABLE: i32 = 75;
 
 /// 容器终止消息（kubelet 的 `terminationMessagePath` 默认值）。类别在退出码上，
@@ -712,7 +715,7 @@ async fn run_in(
 
 /// 尽力把这一轮的落点写进容器终止消息。
 fn report_termination_message(text: &str) {
-    let _ = std::fs::write(TERMINATION_LOG, text);
+    cog_core::ignore_lost!(std::fs::write(TERMINATION_LOG, text));
 }
 
 /// `cogneva execute-change` 子命令入口（一过性执行进程内执行）。
@@ -846,7 +849,8 @@ const PARENT_CONTAINER: &str = cog_core::topology::MAIN_CONTAINER;
 
 /// 派发方耐心之外多等的那一段：探针判死之后，容器退出、Job 控制器收尾、状态回写
 /// 都需要几拍，派发方等到恰好等于探针的窗口就会在最后几秒里抢跑。
-// cap: bound — 探针判死到 Job 状态回写之间的那一段
+// cap: fixed — 探针判死到 Job 状态回写之间的那一段
+// keep: 删掉后探针判死到状态回写之间没有余量，已经判死的活被读成还在跑；由「探针判死到回写的那一段」兜住
 const WAIT_MARGIN_SECS: u64 = 300;
 
 /// 容器运行时会在 `imageID` 前面挂一段 scheme（`docker-pullable://` 等）。
@@ -952,7 +956,7 @@ pub fn parent_pod_facts(pod: &serde_json::Value, container: &str) -> SFResult<Pa
         .pointer("/spec/volumes")
         .and_then(|v| v.as_array())
         .map(|v| v.iter().collect())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let source_of = |name: &str| -> Option<serde_json::Value> {
         let volume = volumes
             .iter()
@@ -972,11 +976,11 @@ pub fn parent_pod_facts(pod: &serde_json::Value, container: &str) -> SFResult<Pa
         let name = mount
             .get("name")
             .and_then(|n| n.as_str())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let mount_path = mount
             .get("mountPath")
             .and_then(|p| p.as_str())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         if name.is_empty() || mount_path.is_empty() {
             return Err(SFError::IO(
                 "the parent pod has a volume mount with no name or no path".into(),
@@ -1269,7 +1273,7 @@ pub fn in_cluster_namespace() -> SFResult<String> {
 /// 没有它就取不到自己的 `imageID`，也就没有可派发的镜像——这时停下并指名缺的是
 /// 哪一条，而不是退回去用一个 tag。
 pub fn parent_pod_name() -> SFResult<String> {
-    let name = std::env::var(cog_core::env::POD_NAME).unwrap_or_default();
+    let name = std::env::var(cog_core::env::POD_NAME).unwrap_or(Default::default());
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err(SFError::IO(
@@ -1451,7 +1455,7 @@ async fn job_exit_code(kubectl: &str, namespace: &str, job_name: &str) -> SFResu
             .pointer("/items")
             .and_then(|i| i.as_array())
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         for pod in &items {
             if let Some(code) = terminated_exit_code(pod, JOB_CONTAINER) {
                 return Ok(code);
@@ -1606,6 +1610,7 @@ mod tests {
 
     fn change(id: &str) -> EvolutionResult {
         EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: id.to_string(),
             description: "make the thing do the other thing".to_string(),

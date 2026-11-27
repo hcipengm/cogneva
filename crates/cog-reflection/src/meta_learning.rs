@@ -90,7 +90,8 @@ struct SnapshotGroup {
 impl SnapshotFile {
     /// 这份快照的落盘形状的版本。读侧遇到不认识的版本一律不猜：形状变了才动这个数，
     /// 它标的是「这份文件按哪种形状写的」，不是容量。
-    // cap: bound — 标的是「这份文件按哪种形状写的」，不是容量；形状变了才动它
+    // cap: fixed — 标的是「这份文件按哪种形状写的」，不是容量；形状变了才动它
+    // keep: 删掉后这份文件的形状没有标号，读侧分不出该按哪种形状解码；由「形状变了才动它」兜住
     const VERSION: u32 = 1;
 
     fn from_map(stats: &HashMap<(DecisionCategory, DecisionGroupKey), DecisionStatistics>) -> Self {
@@ -510,7 +511,7 @@ impl MetaLearningEngine {
         let stats = guard
             .get(&(category, group.clone()))
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         drop(guard);
 
         if stats.counts.is_empty() {

@@ -94,13 +94,47 @@ pub fn role_of_seat<'a>(task_id: &str, agent_id: &'a str) -> Option<&'a str> {
 /// 一个具体的人，那个人就是它自己。
 ///
 /// `None` 是读数，不是缺字段：它说的正是「这个座位背后还没有人」。座位什么时候
-/// 有了人，由派活那一侧写进名册行（`EmployeeRecord::person_id`），到那时形状
+/// 有了人，记在任务任命上（`assignment_of`），名册行里不另存一格，到那时形状
 /// 答不出来，只有那一格答得出来。
 pub fn person_id_for(agent_id: &str) -> Option<&str> {
     if agent_id.starts_with(SQUAD_ID_PREFIX) {
         None
     } else {
         Some(agent_id)
+    }
+}
+
+/// 一条任命：哪个员工在哪个任务节点上、以什么职务、租约到什么时候。
+///
+/// 这是**读模型**，不是第五张表：任务节点是唯一的记录，职务由节点的
+/// [`crate::TaskType`] 给定（职务属于任务，不属于人），座位地址由
+/// [`agent_id_for`] 从任务与职务推出，租约就是行上的那两列。池里的位置不在
+/// 这里——它是运行时事实（谁此刻占着这个地址），不是身份。
+pub struct Assignment<'a> {
+    /// 任务节点。
+    pub task_id: &'a str,
+    /// 职务：这个节点要人做什么。
+    pub role: String,
+    /// 座位地址，由任务与职务推出；不另存一处。
+    pub seat_id: String,
+    /// 坐在这个节点上的员工；`None` 是「这个座位背后还没有人」。
+    pub person: Option<&'a str>,
+    /// 租约持有者与到期时刻；两列都在任务行上。
+    pub lease_owner: Option<&'a str>,
+    pub lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// 从任务节点读出一条任命。
+pub fn assignment_of(task: &crate::Task) -> Assignment<'_> {
+    let role = task.task_type.kind_key();
+    let seat_id = agent_id_for(&task.id, &role);
+    Assignment {
+        task_id: &task.id,
+        role,
+        seat_id,
+        person: task.agent_id.as_deref().and_then(person_id_for),
+        lease_owner: task.lease_owner.as_deref(),
+        lease_expires_at: task.lease_expires_at,
     }
 }
 
@@ -130,11 +164,13 @@ pub const WORKTREE_TASK_PREFIX: &str = "task-";
 /// would otherwise keep a ceiling of its own: the tighter of the two silently
 /// becomes the real one, and an id past it loses its checkout rather than
 /// failing anywhere a reader could see.
-// cap: bound — Linux NAME_MAX (255 bytes per path component) less the `work/` a branch name adds; a platform ceiling, not a capacity reading of this deployment, so no reading moves it
+// cap: fixed — Linux NAME_MAX (255 bytes per path component, a platform limit rather than this deployment's capacity) less the `work/` a branch name adds; no reading can move it, the kernel defines it
+// keep: 删掉后回到「Linux NAME_MAX (255 bytes per path component, a platform limit rather than this deployment's capacity) less the `work/` a branch name adds; no reading can move it, the kernel defines it」所描述的情形；由这条约定兜住
 pub const MAX_CHECKOUT_NAME_CHARS: usize = 255 - "work/".len();
 
 /// `-` plus the eight hex digits that end a truncated lane.
-// cap: bound — 一个 `-` 和八位十六进制；它数的是指纹的写法，不是这台机器能承受多少
+// cap: fixed — 一个 `-` 和八位十六进制；它数的是指纹的写法，不是这台机器能承受多少
+// keep: 删掉后指纹的写法由调用点各拼一次，截断标识对不上；由「一个 - 和八位十六进制」兜住
 const TRUNCATION_TAIL_CHARS: usize = 9;
 
 /// A stable 32-bit fingerprint of the whole id, used only to end a truncated
@@ -314,6 +350,29 @@ pub fn employee_name(number: u32) -> String {
     name
 }
 
+/// 一个人的唯一身份：由工号推出，`E0412`。
+///
+/// 与 [`employee_label`] 同一个前缀、同一处派生——展示名是「这个 id ＋ 姓名」，
+/// 不是另拼一份。身份与登记地址分开：地址（`agent_id`）是这个人此刻被叫到的
+/// 地方，换 Pod、换槽位都不换人；工号发出去之后也不换，所以由它推出的身份
+/// 跨重装稳定。这里不出现第二个拼法：要问「这个人是谁」，读这一格。
+pub fn employee_identity(number: u32) -> String {
+    format!("{prefix}{number:04}", prefix = EMPLOYEE_NUMBER_PREFIX)
+}
+
+/// [`employee_identity`] 的反向：这个 id 是哪个工号的人。
+///
+/// 员工 id 就是工号的字符串形式，没有第二层包装。只认这一个形状；座位
+/// （`squad:` 开头）、旧随机地址、别的任务席位都答 `None`——「这不是一个
+/// 由工号推出的员工 id」与「读不出来」是同一个答案，因为两者都只能退回旧口径。
+pub fn employee_number_of(employee_id: &str) -> Option<u32> {
+    let digits = employee_id.strip_prefix(EMPLOYEE_NUMBER_PREFIX)?;
+    if digits.len() < 4 || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 /// 名册、对话、日志里给人的那一行：`E0412 林清和`。
 pub fn employee_label(number: u32) -> String {
     format!(
@@ -359,6 +418,33 @@ mod naming_tests {
         );
         // 前缀是唯一的分界线：名字里带 squad 但不在开头的是一个人，不是座位。
         assert_eq!(person_id_for("squad-member-kai"), Some("squad-member-kai"));
+    }
+
+    /// 任命由任务节点推出：职务来自节点、座位由任务＋职务推、租约照抄行上两列；
+    /// 人是人的 id，座位形地址背后是「还没有人」。
+    #[test]
+    fn an_assignment_is_derived_from_the_task_node() {
+        let mut task = crate::Task::new("t-1", crate::TaskType::Generator, serde_json::json!({}));
+        task.agent_id = Some("employee:7".into());
+        task.lease_owner = Some("pod-a".into());
+        task.lease_expires_at = Some(chrono::DateTime::from_timestamp(100, 0).unwrap());
+        let a = assignment_of(&task);
+        assert_eq!(a.task_id, "t-1");
+        // 拼写取任务 JSON 里的那一把尺子（`TaskType` 的 serde 形状是 snake_case），
+        // 不是变体名：席位地址与按种类取的样本都按它算，两处换了任一处都读不到行。
+        assert_eq!(a.role, "generator", "职务由节点的 TaskType 给定");
+        assert_eq!(
+            a.seat_id,
+            agent_id_for("t-1", "generator"),
+            "座位地址由任务与职务推出，不另存一处"
+        );
+        assert_eq!(a.person, Some("employee:7"));
+        assert_eq!(a.lease_owner, Some("pod-a"));
+        assert!(a.lease_expires_at.is_some());
+
+        // 地址本身就是座位形：这个座位背后还没有人。
+        task.agent_id = Some(agent_id_for("t-1", "Generator"));
+        assert_eq!(assignment_of(&task).person, None);
     }
 
     /// 角色能从执行地址里原样读回来：账本记「这一段是谁的哪把椅子」时只有地址。
@@ -495,6 +581,32 @@ mod naming_tests {
     fn the_same_number_is_the_same_person() {
         assert_eq!(employee_label(412), employee_label(412));
         assert_ne!(employee_label(412), employee_label(413));
+    }
+
+    /// 唯一身份由工号推出，且与展示名同一处派生：展示名的第一段就是它。
+    #[test]
+    fn the_identity_is_derived_from_the_number_and_heads_the_label() {
+        assert_eq!(employee_identity(412), "E0412");
+        assert_eq!(employee_identity(412), employee_identity(412));
+        assert_ne!(employee_identity(412), employee_identity(413));
+        let label = employee_label(412);
+        let (head, _) = label
+            .split_once(' ')
+            .expect("展示名里工号与姓名之间有一个空格");
+        assert_eq!(
+            head,
+            employee_identity(412),
+            "展示名的头与唯一身份不是同一处派生"
+        );
+        assert_eq!(employee_number_of(&employee_identity(412)), Some(412));
+        assert_eq!(employee_number_of("E0413"), Some(413));
+        assert_eq!(employee_number_of("squad:task-1-generator"), None);
+        assert_eq!(
+            employee_number_of("employee:0e2ba053"),
+            None,
+            "旧随机地址不是由工号推出的"
+        );
+        assert_eq!(employee_number_of("EA12"), None, "非数字后缀不是工号");
     }
 
     #[test]

@@ -85,7 +85,8 @@ const IMAGE_REF_ENV: &str = "COGNEVA_IMAGE_REF";
 /// 却没人收尾的记录」有一个可判的时刻：判那一行要用**它自己被开出来时**的期限，
 /// 不是今天的旋钮。实测一次运行 41 秒（含导出、快照、打包、裁剪），一小时的界
 /// 是它的一百多倍。
-// cap: bound — 账本里一条开着的记录没有别的判据；这个数只判那一行，不掐正在跑的容器
+// cap: fixed — 账本里一条开着的记录没有别的判据；这个数只判那一行，不掐正在跑的容器
+// keep: 删掉后账本里开着的记录没有别的判据，孤儿记录永远开着；由「只判那一行，不掐正在跑的容器」兜住
 const DEFAULT_RUN_DEADLINE_SECONDS: i32 = 3600;
 
 /// 内部实例密钥对象名：业务 Pod 读的那一份（数据库/缓存/内部签名/S3/邮件）。
@@ -357,6 +358,7 @@ pub struct BackupConfig {
     /// 而卷声明的默认是 10 GiB。声明本身不再是窗口的长度——窗口是卷装得下的包数，卷由
     /// 容量回路按实测占用抬高。
     pub keep_count: usize,
+    // db-column: backup_runs.run_deadline_seconds — not-a-bound — 运行开出时记下的期限（判「开着却没人收尾」用）
     /// 这一次运行开出来时的期限，随这一行落进账本的 `run_deadline_seconds`。
     ///
     /// 它**不是**判这一趟死活的判据：Job 的死活由存活探针按进展文件判，整趟跑了
@@ -1467,7 +1469,7 @@ impl QdrantHttp {
             .await?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = cog_core::logged_default!(resp.text().await);
             return Err(format!("qdrant upload {collection} -> {status}: {body}").into());
         }
         Ok(())
@@ -2026,6 +2028,50 @@ fn tighten_entries(
     Ok(())
 }
 
+/// 收掉被杀的上一趟留下的暂存目录，返回收掉几个。
+///
+/// 暂存目录与包同名，但没有 `.tar.zst` 后缀：`packages_in` 只认包，保留窗口也
+/// 只数包，于是这些目录在每一面的读数上都不存在，却在盘上一直占着整份明文。
+/// 判据是「比这一趟自己申报的期限还老」——被杀的那一趟正是过了自己的期限还没
+/// 收尾的那种；年轻于期限的可能是另一趟正在写，不动。
+fn sweep_abandoned_staging(dir: &Path, older_than_secs: u64) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now();
+    let mut swept = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(PACKAGE_PREFIX) {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let age = now.duration_since(modified).unwrap_or_default();
+        if age.as_secs() <= older_than_secs {
+            continue;
+        }
+        // keep: 收的是上一趟被杀留下的暂存目录（未改名的半成品）；包本体改名后才算数，删掉它不会丢已发布的包
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => swept += 1,
+            Err(e) => tracing::warn!(
+                dir = %path.display(),
+                error = %e,
+                "备份：上一趟被杀留下的暂存目录收不掉"
+            ),
+        }
+    }
+    swept
+}
+
 pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // 开工先记一拍：容器外的存活探针从这一刻起就有东西可读，这一跑在导出、快照这些
     // 不印日志的段里也一直「在动」。
@@ -2035,6 +2081,19 @@ pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::erro
         .await
         .adopt();
     std::fs::create_dir_all(&cfg.backup_dir)?;
+    // 被杀掉的那一趟不会自己收尾：它的暂存目录留在卷上，是打包之前的明文树，
+    // 里面还有 Secret 清单。2026-11-27 现场：11 个 abandoned 的暂存目录在备份卷上
+    // 躺了约 250 GB、把宿主盘推到 90%（这是那一台备份卷的实测，不是软件的容量界）。
+    // 判据是**这一趟自己申报的期限**：比它更老的
+    // 暂存目录，说明那一趟早已过了它自己的期限，不会再有进程在写它；比它年轻的
+    // 可能是另一趟正在跑，不动。
+    let swept = sweep_abandoned_staging(&cfg.backup_dir, cfg.run_deadline_seconds.max(0) as u64);
+    if swept > 0 {
+        tracing::warn!(
+            swept,
+            "备份：收掉了上一趟被杀后留下的暂存目录（它们不是包，保留窗口里看不见它们）"
+        );
+    }
     // 保留数是一趟一算，不是一个部署一写：卷上现存的包和卷容量都是这一趟看得到
     // 的现场。开工时算出的数同时写进账本那一行，于是「这一趟按几个包裁」在账上
     // 和盘上是同一句话。
@@ -2091,7 +2150,7 @@ pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::erro
                 Err(detail) => {
                     let reason = format!("{reason}；这一趟自己收紧之后仍然收不住：{detail}");
                     tracing::error!(run = %staging_name, reason = %reason, "备份被凭证面拦住");
-                    let _ = std::fs::remove_dir_all(&staging);
+                    cog_core::ignore_lost!(std::fs::remove_dir_all(&staging));
                     record_run(
                         run_store.as_ref(),
                         &staging_name,
@@ -2200,7 +2259,7 @@ fn copy_offsite(dir: &Path, package: &Path, keep: usize) {
     match copied {
         Ok(()) => {}
         Err(e) => {
-            let _ = std::fs::remove_file(&partial);
+            cog_core::ignore_lost!(std::fs::remove_file(&partial));
             tracing::warn!(
                 package = %package.display(),
                 dir = %dir.display(),
@@ -2300,7 +2359,7 @@ fn publish_package(dir: &Path, package: &Path) -> Result<PathBuf, Box<dyn std::e
         std::fs::remove_file(&target)?;
     }
     let partial = dir.join(format!(".{}.partial", name.to_string_lossy()));
-    let _ = std::fs::remove_file(&partial);
+    cog_core::ignore_lost!(std::fs::remove_file(&partial));
     std::fs::copy(package, &partial)?;
     restrict_to_owner(&partial, 0o600)?;
     std::fs::rename(&partial, &target)?;
@@ -2384,7 +2443,7 @@ async fn finish_backup(
         }
         Err(e) => {
             // 半成品 staging 必须清掉：留在原地会被当成可恢复包误用。
-            let _ = std::fs::remove_dir_all(staging);
+            cog_core::ignore_lost!(std::fs::remove_dir_all(staging));
             Err(e)
         }
     }
@@ -2455,7 +2514,7 @@ async fn run_backup_into(
     if evolution_bundle.is_some() {
         segments.push(segment_stamp("git-bundle"));
     }
-    let bound = max_segment_skew();
+    let bound = segment_skew_bound(cfg.run_deadline_seconds);
     if let Ok((first, last, skew)) = segment_span(&segments) {
         if skew > bound as i64 {
             // 包照打：一份偏差超界的包仍然比没有包强（PG 那一段本身是自洽的），
@@ -2533,6 +2592,7 @@ const LARGE_OBJECTS_DIR: &str = "largeobjects";
 /// 一次数据库往返的载荷（`lo_get` 返回一个 `bytea`），与正文大小无关：正文多大
 /// 由上游说了算，这个数只决定进程内存跟着走多远。
 // cap: fixed — 一次 lo_get 往返的载荷（单值 bytea），与正文大小无关
+// keep: 删掉后回到「一次 lo_get 往返的载荷（单值 bytea），与正文大小无关」所描述的情形；由这条约定兜住
 const BODY_EXPORT_CHUNK: i32 = 1_048_576;
 
 /// 数据根下装对象的那一级。
@@ -2705,18 +2765,20 @@ fn current_schema_version() -> i64 {
     }
 }
 
-/// 跨段偏差的默认界：五分钟。超过它，包里几段就已经不是同一份数据了。可由
-/// `COGNEVA_BACKUP_MAX_SEGMENT_SKEW_SECONDS` 覆盖——大对象层在小机器上本来就慢，
-/// 把界写死会让那类环境每一晚都产出一个恢复端拒收的包。
-// cap: bound — 大对象层在小机器上本来就慢，写死会让那类环境每一晚都产出一个恢复端拒收的包，所以它可覆盖
-const DEFAULT_MAX_SEGMENT_SKEW_SECONDS: u64 = 300;
-
-fn max_segment_skew() -> u64 {
-    std::env::var("COGNEVA_BACKUP_MAX_SEGMENT_SKEW_SECONDS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(DEFAULT_MAX_SEGMENT_SKEW_SECONDS)
+/// 跨段偏差的界**就是这一趟运行自己的期限**，不是另一个人挑的数。
+///
+/// 段时刻是打包过程中逐段写下的，所以同一趟里首段与末段相距不可能超过这一趟跑了多久；
+/// 而这一趟的期限（`run_deadline_seconds`，随运行行落进账本）正是它被允许跑多久的声明。
+/// 于是界与期限是同一个数：换期限它跟着换，不需要一个「大对象层慢就调大」的旋钮——
+/// 机器慢到段间隔超过期限时，该调的是期限本身，界自动跟上。
+///
+/// 超过它的含义也因此是确定的：这个包不是一趟运行能产出的东西（至少有一段来自别的
+/// 一趟），或者那一趟跑过了它自己声明的期限。两种都不该被恢复端当成一份完整包。
+///
+/// 期限没有声明（<=0）时界也是 0：恢复端把「声明了分段却没有界」读作拒收，而不是
+/// 拿一个编出来的数替它下判。
+fn segment_skew_bound(run_deadline_seconds: i32) -> u64 {
+    run_deadline_seconds.max(0) as u64
 }
 
 fn segment_stamp(name: &str) -> SegmentStamp {
@@ -2914,7 +2976,7 @@ fn bundle_evolution(
     std::fs::create_dir_all(out_dir)?;
     let bundle = out_dir.join(EVOLUTION_BUNDLE_FILE);
     let partial = out_dir.join("evolution.bundle.partial");
-    let _ = std::fs::remove_file(&partial);
+    cog_core::ignore_lost!(std::fs::remove_file(&partial));
     let partial_s = partial
         .to_str()
         .ok_or("bundle 路径不是 UTF-8，git 命令行给不出来")?;
@@ -2935,7 +2997,7 @@ fn bundle_evolution(
         .count() as u64;
     let head = git_ok(dir, &["symbolic-ref", "-q", "HEAD"])
         .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let commit = git_ok(dir, &["rev-parse", "HEAD"])?.trim().to_string();
     let bytes = std::fs::metadata(&bundle)?.len();
     tracing::info!(
@@ -3631,7 +3693,56 @@ fn restore_summary(manifest: &BackupManifest) -> String {
 ///
 /// 动手恢复之前先拿 manifest 逐段核包（`verify_package_against_manifest`）：
 /// 内容与清单对不上就退非零，绝不带着分歧走到 `TRUNCATE` 那一步。
-pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
+/// 包里会落到哪些表、这些表在这个库此刻各有多少行。
+async fn existing_rows_for_package(
+    pool: &PgPool,
+    pkg_pg_dir: &Path,
+) -> Result<Vec<(String, i64)>, Box<dyn std::error::Error>> {
+    let mut tables = Vec::new();
+    for entry in std::fs::read_dir(pkg_pg_dir)? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        if let Some(rest) = name.strip_prefix("public.") {
+            if let Some(table) = rest.strip_suffix(".csv") {
+                validate_table_name(table)?;
+                tables.push(table.to_string());
+            }
+        }
+    }
+    tables.sort_unstable();
+    let mut counts = Vec::new();
+    for table in tables {
+        let sql = format!("SELECT count(*)::bigint FROM \"{table}\"");
+        match sqlx::query_scalar::<_, i64>(&sql).fetch_one(pool).await {
+            Ok(rows) => counts.push((table, rows)),
+            // 表在这个库不存在：包里的行不会覆盖任何东西。
+            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("42P01") => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(counts)
+}
+
+/// 覆盖判据：非空且没有显式接受时，把将被覆盖的表与行数点名。
+fn overwrite_refusal(counts: &[(String, i64)], overwrite: bool) -> Option<String> {
+    if overwrite {
+        return None;
+    }
+    let filled: Vec<String> = counts
+        .iter()
+        .filter(|(_, rows)| *rows > 0)
+        .map(|(table, rows)| format!("{table} ({rows})"))
+        .collect();
+    if filled.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "restore would overwrite rows that are already in this database ({}). \
+         Nothing has been loaded. Pass --overwrite if replacing them is intended",
+        filled.join(", ")
+    ))
+}
+
+pub async fn run_restore(pkg: &Path, overwrite: bool) -> Result<(), Box<dyn std::error::Error>> {
     let database_url = std::env::var(cog_core::env::DATABASE_URL)
         .map_err(|_| "COGNEVA_DATABASE_URL is required for restore")?;
     let data_dir = PathBuf::from(cog_core::paths::data_dir());
@@ -3679,6 +3790,13 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let pg_dir = pkg_dir.join(PACKAGE_PG_DIR);
     if pg_dir.exists() {
         let pool = PgPool::connect(&database_url).await?;
+        // 动作之前先判一次会不会永久失去什么：恢复是往**这个库**里装，目标表里
+        // 已有的行会被覆盖。装了哪些、覆盖了多少，动手之前点名；没有显式接受就
+        // 停在这里——演练恢复进的是空库，因此照常通过。
+        let counts = existing_rows_for_package(&pool, &pg_dir).await?;
+        if let Some(refusal) = overwrite_refusal(&counts, overwrite) {
+            return Err(refusal.into());
+        }
         let report = restore_postgres(&pool, &pg_dir).await?;
         tracing::info!(
             tables = report.tables.len(),
@@ -3731,7 +3849,7 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
     seed_evolution_bundle(&pkg_dir, &manifest)?;
 
     if let Some((root, _)) = &extract_root {
-        let _ = std::fs::remove_dir_all(root);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(root));
     }
     tracing::info!("{}", restore_summary(&manifest));
     Ok(())
@@ -3877,7 +3995,7 @@ fn seed_evolution_bundle_into(
         &["for-each-ref", "--format=%(refname)", "refs/restore/"],
     )?;
     for refname in leftovers.lines().map(str::trim).filter(|s| !s.is_empty()) {
-        let _ = git_run(target, &["update-ref", "-d", refname]);
+        cog_core::ignore_lost!(git_run(target, &["update-ref", "-d", refname]));
     }
 
     // 空白卷上 `git init --bare` 的 HEAD 指向 master；包里是 main 时那个符号引用
@@ -4209,7 +4327,7 @@ async fn restore_artifact_root(
     let scratch = target.join(format!(".restore-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&scratch)?;
     let outcome = stage_artifact_root(&base, root, target, &scratch, readings).await;
-    let _ = std::fs::remove_dir_all(&scratch);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&scratch));
     outcome
 }
 
@@ -4341,12 +4459,12 @@ fn replace_dir(staged: &Path, live: &Path) -> std::io::Result<()> {
     }
     if let Err(e) = std::fs::rename(staged, live) {
         if had_live {
-            let _ = std::fs::rename(&parked, live);
+            cog_core::ignore_lost!(std::fs::rename(&parked, live));
         }
         return Err(e);
     }
     if had_live {
-        let _ = std::fs::remove_dir_all(&parked);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&parked));
     }
     Ok(())
 }
@@ -4359,7 +4477,8 @@ fn replace_dir(staged: &Path, live: &Path) -> std::io::Result<()> {
 pub const DRILL_DATABASE: &str = "cog_drill";
 
 /// 演练互斥锁的键。取自 `cog_dril` 的 ASCII，只要求集群内不与人撞车，不承担含义。
-// cap: bound — 取自 cog_dril 的 ASCII，只要求集群内不与人撞车，不承担含义
+// cap: fixed — 取自 cog_dril 的 ASCII，只要求集群内不与人撞车，不承担含义
+// keep: 删掉后回到「取自 cog_dril 的 ASCII，只要求集群内不与人撞车，不承担含义」所描述的情形；由这条约定兜住
 const DRILL_LOCK_KEY: i64 = 0x636f_675f_6472_696c;
 
 /// 演练配置。只要库、卷与迁移目录。
@@ -4799,7 +4918,7 @@ struct TempTree(PathBuf);
 
 impl Drop for TempTree {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&self.0));
     }
 }
 
@@ -4839,7 +4958,7 @@ fn with_database(url: &str, database: &str) -> String {
             let query = path_and_query
                 .split_once('?')
                 .map(|(_, q)| format!("?{q}"))
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             format!("{scheme}://{authority}/{database}{query}")
         }
         // 连接串里没有路径：数据库名取默认值，换名就是把路径补上。
@@ -4882,11 +5001,13 @@ impl ScratchBackend {
 /// 三分钟是按「大表自动清理不一定几秒就完」留的余量：一趟演练的预算是 3600 秒，
 /// 收尾与预清理各最多等这么久，加起来仍是一个零头，而「上一趟的库清不掉、这一趟
 /// 不开工」是整趟演练白跑。界是有的，不会无限等一个挂着不放的后台进程。
-// cap: bound — 没有一份「自动清理要走多久」的实测可依，所以取的是界不是量：36 × 5 ＝
+// cap: fixed — 没有一份「自动清理要走多久」的实测可依，所以取的是界不是量：36 × 5 ＝
+// keep: 删掉后自动清理的等待要么没有界、要么一有抖动就放弃；由「36 × 5 秒」兜住
 // 180 秒，远小于单趟预算 3600 秒，而它的代价只是一次多等几分钟，收益是一本会白跑的
 // 演练。
 const BACKGROUND_DRAIN_ATTEMPTS: u32 = 36;
-// cap: bound — 轮询间隔取 5 秒：自动清理收工的时刻不可预知，间隔只影响发现它走了的
+// cap: fixed — 轮询间隔取 5 秒：自动清理收工的时刻不可预知，间隔只影响发现它走了的
+// keep: 删掉后轮询密到白打盘，或稀到清理走了很久没发现；由「间隔只影响发现它走了的时刻」兜住
 // 延迟；再短只是多问服务端几次，再长则等待的尾巴变粗。
 const BACKGROUND_DRAIN_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -4985,7 +5106,7 @@ pub async fn drop_scratch_database(live: &PgPool, database: &str) -> Result<(), 
                 return Ok(());
             }
             Err(e) => {
-                let left = backends_on(live, database).await.unwrap_or_default();
+                let left = cog_core::logged_default!(backends_on(live, database).await);
                 if !can_still_drain(&left) || attempt >= BACKGROUND_DRAIN_ATTEMPTS {
                     return Err(format!(
                         "删不掉 {database}：{e}（{}）",
@@ -5201,7 +5322,9 @@ async fn backend_pid(tx: &mut sqlx::PgConnection) -> Option<i32> {
 
 /// 搬多少字节记一拍。它只决定读数的分辨率，不参与任何判断——判据是「多久没有一拍」，
 /// 拍子越密，「静默」越接近「真的没在搬」。
-// cap: bound — 记拍粒度钉在这里，不是界；界是那个实测静默窗口
+// cap: fixed — 记拍粒度钉在这里，不是界；界是那个实测静默窗口
+// keep: 删掉后记拍粒度跟着读缓冲走，进度条与实际静默窗口脱钩；由「记拍粒度钉在这里，不是界」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const PROGRESS_BYTES_PER_BEAT: usize = 4 * 1024 * 1024;
 
 /// 每搬过 [`PROGRESS_BYTES_PER_BEAT`] 字节记一拍。
@@ -5838,6 +5961,8 @@ async fn drill_once(
     // 「离界还有多远」。旧包没有分段表，两列留空——没有声明就没有可比的数。
     if let Ok((_, _, skew)) = segment_span(&manifest.segments) {
         drill.segment_skew_seconds = Some(skew);
+        // db-column: backup_drills.segment_skew_bound_seconds — derived — backup.rs segment_skew_bound(run_deadline_seconds)：包里声明的跨段界＝这一趟的期限
+        // db-column: backup_drills.segment_skew_seconds — not-a-bound — 那一趟实测的跨段偏差
         drill.segment_skew_bound_seconds = Some(manifest.max_segment_skew_seconds as i64);
     }
     verify_artifact_stores(&pkg_dir, &manifest, drill).await;
@@ -6411,10 +6536,11 @@ pub async fn run_drill_from_env() -> Result<(), Box<dyn std::error::Error>> {
 
 /// `cogneva restore <pkg>`：换机/重装的一次性恢复 Job 入口。
 pub async fn run_restore_from_env() -> Result<(), Box<dyn std::error::Error>> {
+    let overwrite = std::env::args().any(|arg| arg == "--overwrite");
     let pkg = std::env::args()
         .nth(2)
         .ok_or("usage: cogneva restore <package.tar.zst|dir>")?;
-    run_restore(Path::new(&pkg)).await
+    run_restore(Path::new(&pkg), overwrite).await
 }
 
 #[cfg(test)]
@@ -6438,6 +6564,20 @@ mod tests {
         );
         // 没有 scheme、没有库名：只剩地址的那一段原样交出去，不编一个库名。
         assert_eq!(endpoint_of("postgres:5432"), "postgres:5432");
+    }
+
+    /// 跨段偏差的界跟着这一趟运行自己的期限走：换期限它跟着换，没有第二个旋钮。
+    ///
+    /// 现场（2026-11-27）：一份合法的包各段相隔 2201 秒，被写死的 300 秒拒收。段间隔
+    /// 的长短是这一趟跑了多久的函数，所以界要挂在「这一趟允许跑多久」上，而不是一个人
+    /// 在小机器前面拍的数。
+    #[test]
+    fn the_segment_skew_bound_follows_the_run_deadline() {
+        assert_eq!(segment_skew_bound(3600), 3600);
+        assert_eq!(segment_skew_bound(1800), 1800);
+        // 没有声明期限：界也是 0，恢复端据此拒收，而不是拿一个编出来的数替它下判。
+        assert_eq!(segment_skew_bound(0), 0);
+        assert_eq!(segment_skew_bound(-5), 0);
     }
 
     /// 没有超级用户位时外键检查是开着的，装载顺序就是唯一能让它通过的东西。
@@ -7198,7 +7338,7 @@ mod tests {
         std::fs::write(off.join(older), vec![0u8; 10]).unwrap();
         assert!(!same_file(&vol.join(older), &off.join(name)));
 
-        std::fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     #[test]
@@ -7235,7 +7375,7 @@ mod tests {
         std::fs::write(off.join("cogneva-backup-20261016T031700Z.tar.zst"), b"x").unwrap();
         assert_eq!(count(&vol, &off), 0);
 
-        std::fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     #[test]
@@ -8444,6 +8584,37 @@ mod tests {
     }
 
     /// 只填本节用得到的段：其余段空着，恢复产物层不看它们。
+    /// 被杀的那一趟留下的暂存目录要被下一趟收掉；比申报期限年轻的可能是另一趟
+    /// 正在写，不许动；包不是暂存。
+    ///
+    /// 没有这次改动这条会红：旧的 `run_backup` 只建自己的暂存目录，从不看卷上
+    /// 还有谁的——2026-11-27 现场 11 个这样的目录占了约 250 GB。
+    #[test]
+    fn an_abandoned_staging_tree_is_swept_and_a_live_one_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join(format!("{PACKAGE_PREFIX}20261107T031730Z"));
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::File::open(&stale)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7_200))
+            .unwrap();
+        let live = dir.path().join(format!("{PACKAGE_PREFIX}20261127T031730Z"));
+        std::fs::create_dir_all(&live).unwrap();
+        let package = dir
+            .path()
+            .join(format!("{PACKAGE_PREFIX}20261126T031710Z{PACKAGE_SUFFIX}"));
+        std::fs::write(&package, b"package").unwrap();
+
+        let swept = sweep_abandoned_staging(dir.path(), 3_600);
+        assert_eq!(swept, 1, "one abandoned tree, exactly");
+        assert!(!stale.exists(), "被杀的上一趟留下的暂存树要收掉");
+        assert!(
+            live.exists(),
+            "比申报期限年轻的暂存目录可能是另一趟正在写，不能动"
+        );
+        assert!(package.exists(), "包不是暂存目录");
+    }
+
     fn manifest_with(artifacts: Vec<ArtifactRootReport>) -> BackupManifest {
         BackupManifest {
             version: "0.1.0".into(),
@@ -9643,7 +9814,7 @@ mod tests {
                         }
                     }
                     let request = String::from_utf8_lossy(&head);
-                    let line = request.lines().next().unwrap_or_default();
+                    let line = request.lines().next().unwrap_or(Default::default());
                     let body = if line.starts_with("POST ") {
                         r#"{"result":{"name":"c1.snap"}}"#
                     } else if line.starts_with("GET ") && line.contains("/snapshots/") {
@@ -9658,8 +9829,8 @@ mod tests {
                          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
-                    let _ = socket.write_all(response.as_bytes()).await;
-                    let _ = socket.shutdown().await;
+                    cog_core::ignore_lost!(socket.write_all(response.as_bytes()).await);
+                    cog_core::ignore_lost!(socket.shutdown().await);
                 });
             }
         });
@@ -9798,5 +9969,15 @@ mod tests {
         let names = qdrant.collection_names().await.unwrap();
         assert_eq!(names, vec!["beta".to_string(), "alpha".to_string()]);
         server.abort();
+    }
+    /// 空库的演练照常；非空且没有显式接受时点名将被覆盖的表与行数。
+    #[test]
+    fn a_restore_over_filled_tables_is_refused_until_accepted() {
+        let counts = vec![("alerts".to_string(), 3), ("nothing".to_string(), 0)];
+        let refusal = overwrite_refusal(&counts, false).expect("非空目标必须拒绝");
+        assert!(refusal.contains("alerts (3)"), "{refusal}");
+        assert!(!refusal.contains("nothing"), "空表不该被点名：{refusal}");
+        assert!(overwrite_refusal(&counts, true).is_none());
+        assert!(overwrite_refusal(&[("nothing".to_string(), 0)], false).is_none());
     }
 }

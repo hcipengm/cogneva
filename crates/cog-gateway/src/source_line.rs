@@ -40,7 +40,8 @@ pub const REPO_ENV: &str = cog_core::env::GITOPS_REPO_URL;
 /// 的闭环可走。实测 2026-11-09 裸仓库里有六条工作树分支与若干 `evol/<id>`，取 40 条足以
 /// 把活跃的全列上；超出时读数自己会说还有几条没列（`more_branches`），所以截断是可见的，
 /// 不会读成「就这么多」。
-// cap: bound — 给人看的列表长度，不是被谁消费的界；截断由 more_branches 自己说出来
+// cap: fixed — 给人看的列表长度，不是被谁消费的界；截断由 more_branches 自己说出来
+// keep: 删掉后回到「给人看的列表长度，不是被谁消费的界；截断由 more_branches 自己说出来」所描述的情形；由这条约定兜住
 pub const MAX_BRANCHES: usize = 40;
 
 /// 字段分隔符：`for-each-ref` 的 `%09`。提交标题里出现制表符是可能的，所以解析时按
@@ -366,7 +367,7 @@ mod tests {
             now_secs(),
             seq
         ));
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

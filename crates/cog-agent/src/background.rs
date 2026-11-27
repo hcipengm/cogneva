@@ -31,7 +31,8 @@ use tokio::sync::broadcast;
 /// unbounded book is an unbounded leak in a process that never restarts. Only
 /// finished commands are dropped, and only the oldest; a handle that has aged
 /// out is refused by name rather than answered with someone else's output.
-// cap: bound — 这本书只服务「刚发出去、还在被轮询」的那几条；几十条之外的读者要的已经不是「刚才那条」而是审计，而审计不在这本书里
+// cap: fixed — 这本书只服务「刚发出去、还在被轮询」的那几条；几十条之外的读者要的已经不是「刚才那条」而是审计，而审计不在这本书里
+// keep: 删掉后这本书没有上界，没人再读的输出一直占内存；由「只服务刚发出、还在被轮询的那几条」兜住
 const RETAINED: usize = 64;
 
 /// How much of a finished command's output the notice carries.
@@ -40,14 +41,16 @@ const RETAINED: usize = 64;
 /// full text stays readable through `command_output` for as long as the handle
 /// lives. The cut is by characters, not bytes, so a tail never splits a
 /// multi-byte character.
-// cap: bound — 通知是「一句话 + 一张卡片」，不是第二份输出；全文由 command_output 读，这里的长度只决定卡片上能看见多少
+// cap: fixed — 通知是「一句话 + 一张卡片」，不是第二份输出；全文由 command_output 读，这里的长度只决定卡片上能看见多少
+// keep: 删掉后通知卡片上要放全文，卡片变成第二份输出；由「通知是一句话＋一张卡片」兜住
 const NOTICE_TAIL_CHARS: usize = 400;
 
 /// How many finished notices are held for a subscriber that is momentarily
 /// behind. The assembly is the only subscriber and forwards each one as a chat
 /// frame, which costs nothing to await — but a subscriber that stopped reading
 /// (a panic, a blocked runtime) must not grow this queue without bound.
-// cap: bound — 这条环只吸收订阅者短暂的落后；装配层的转发不阻塞，落后意味着它已经不在了
+// cap: fixed — 这条环只吸收订阅者短暂的落后；装配层的转发不阻塞，落后意味着它已经不在了
+// keep: 删掉后通知环无界，订阅者落后时事件一直占内存；由「只吸收短暂的落后」兜住
 const NOTICE_RING: usize = 64;
 
 /// 一条跑完的后台命令：它属于哪一段对话，和它跑完的样子。
@@ -139,7 +142,7 @@ impl Command {
             }
             *slot = Some(ending);
         }
-        let _ = self.done.send(true);
+        cog_core::ignore_lost!(self.done.send(true));
         if let Some(notice) = self.completion_notice() {
             // 没有订阅者时 `send` 报错，那不是错：这个进程里没人接这条通知
             // （嵌入运行、或装配层没有起转发），命令本身仍然跑完并留在簿上。
@@ -222,6 +225,7 @@ impl Command {
             return;
         }
         let mut finished = self.done_rx.clone();
+        // wall: 等=后台命令自己结束 / 等不到=答复「还在跑」，命令仍归它自己写完 / 续跑=能，下一次轮询再看
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(secs),
             finished.wait_for(|done| *done),

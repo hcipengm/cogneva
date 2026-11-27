@@ -60,7 +60,8 @@ pub struct ContentFilterConfig {
 
 // 0.6 的余弦相似度：同义改写通常落在 0.6 以上，而主题相邻的句子（「怎么保护
 // 自己」对「怎么伤害别人」）在 0.6 以下分开。
-// cap: bound — 0.6：同义改写在它之上，主题相邻的句子在它之下分开
+// cap: fixed — 0.6：同义改写在它之上，主题相邻的句子在它之下分开
+// not-a-bound: 0.6：同义改写在它之上，主题相邻的句子在它之下分开
 const SEMANTIC_BLOCK_THRESHOLD: f64 = 0.6;
 
 impl Default for ContentFilterConfig {

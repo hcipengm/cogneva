@@ -144,7 +144,9 @@ fn render_metrics_human(m: &EvalMetrics) -> String {
             (Some(nb), Some(na)) => format!(", n={nb}/{na}"),
             _ => String::new(),
         };
-        let z = m.z.map(|z| format!(", z={z:.2}")).unwrap_or_default();
+        let z =
+            m.z.map(|z| format!(", z={z:.2}"))
+                .unwrap_or(Default::default());
         parts.push(format!(
             "success rate {:.0}% → {:.0}% ({:+.1}pp{z}{n}{sig})",
             b * 100.0,
@@ -167,7 +169,8 @@ pub const CROSS_VALIDATE_TASK_KIND: &str = "pr_cross_validate";
 
 /// Cap on a PR diff fed into the task payload; larger PRs are skipped rather
 /// than blowing the task input.
-// cap: bound — 更大的 PR 是跳过而不是硬塞：塞进去只会把任务的输入撑破
+// cap: fixed — 更大的 PR 是跳过而不是硬塞：塞进去只会把任务的输入撑破
+// keep: 删掉后更大的 PR 硬塞进任务，把输入撑破；由「更大的 PR 是跳过而不是硬塞」兜住
 pub const MAX_CV_DIFF_BYTES: usize = 512 * 1024;
 
 /// One in-flight cross-validation task for a PR.

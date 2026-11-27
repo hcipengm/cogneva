@@ -65,7 +65,8 @@ pub(crate) const IMAGE_PULL_WAITING_REASONS: &[&str] = &["ErrImagePull", "ImageP
 /// 这一侧拿它包住整段提问（超时按「没问到」扣住这一轮）；派发侧把它加进自己的
 /// 等待预算（`judgement_wait_budget`），让它愿意等到这一问有结论。Job 本身没有
 /// 期限了——容器死活由存活探针按进度文件判，所以这里只需要照顾「派发方别先走」。
-// cap: bound — 这一侧包住整段提问，派发侧把它加进自己的等待预算；Job 本身已没有期限
+// cap: fixed — 这一侧包住整段提问，派发侧把它加进自己的等待预算；Job 本身已没有期限
+// keep: 删掉后整段提问没有上界，派发侧的等待预算少了一项；由「这一侧包住整段提问」兜住
 pub(crate) const CI_ASK_BUDGET_SECS: u64 = 180;
 
 /// 上游答「还在跑」时，这一问愿意等多久（秒）再扣住这一轮。
@@ -93,12 +94,14 @@ pub(crate) const CI_ASK_BUDGET_SECS: u64 = 180;
 ///
 /// 派发侧还有一条：正在滚的那一版**不会**被新提交顶掉（`in_flight` 只在结束后才
 /// 前进），所以这段等待等到的结论一定会被用上，不是白等。
-// cap: bound — in_flight 只在前一版结束后才前进，所以这段等待等到的结论一定会被用上
+// cap: fixed — in_flight 只在前一版结束后才前进，所以这段等待等到的结论一定会被用上
+// keep: 删掉后回到「in_flight 只在前一版结束后才前进，所以这段等待等到的结论一定会被用上」所描述的情形；由这条约定兜住
 pub(crate) const CI_PENDING_WAIT_SECS: u64 = 1800;
 
 /// 等在里面的复问间隔（秒）。一次 CI 判定的粒度是分钟级，问得比这密只是把同一个
 /// 答案多读几遍。
-// cap: bound — 一次 CI 判定的粒度是分钟级，问得更密只是把同一个答案多读几遍
+// cap: fixed — 一次 CI 判定的粒度是分钟级，问得更密只是把同一个答案多读几遍
+// keep: 删掉后同一个答案被每拍重读，提问密度与判定粒度脱钩；由「CI 判定是分钟级」兜住
 pub(crate) const CI_PENDING_REASK_SECS: u64 = 60;
 
 /// 「还在跑」等到了界时，这一轮的判词。
@@ -253,14 +256,17 @@ pub(crate) fn settle_jsonpath(kind: &str) -> &'static str {
 
 /// 现场读数带病因，但长度不能由集群里的内容决定：它进日志、进终止消息、进失败
 /// 记录。Pod 数、每个 Pod 的容器数、单条消息的字符数各设一个界，超界显式写出来。
-// cap: bound — 现场读数要进日志与终止消息，长度不能由集群内容决定
+// cap: fixed — 现场读数要进日志与终止消息，长度不能由集群内容决定
+// keep: 删掉后日志长度由集群内容决定，一个 Pod 的现场读数把别的挤出去；由「长度不能由集群决定」兜住
 pub(crate) const SUPPORT_CAUSE_POD_LIMIT: usize = 3;
 
-// cap: bound — companion to the pod limit: a pod's containers are bounded so one verbose pod cannot crowd out the rest
+// cap: fixed — companion to the pod limit: a pod's containers are bounded so one verbose pod cannot crowd out the rest
+// keep: 删掉后一个啰嗦的 Pod 用它所有容器占满病因名额，其他 Pod 消失；由「Pod 的容器也有界」兜住
 const SUPPORT_CAUSE_CONTAINER_LIMIT: usize = 4;
 
 /// 滚动内部轮询间隔：探测、致命态复查、部署态查询共用同一节拍。
-// cap: bound — 探测、致命态复查、部署态查询共用同一节拍
+// cap: fixed — 探测、致命态复查、部署态查询共用同一节拍
+// keep: 删掉后探测、复查、查询各自定节拍，同一轮的三个读数说的不是同一刻；由「共用同一节拍」兜住
 pub(crate) const ROLLOUT_POLL_SECS: u64 = 5;
 
 /// 这一跑在进度面上的名字。容器里的判断读内存，容器外的存活探针读进度文件
@@ -287,12 +293,14 @@ const SUPPORT_SETTLE_CHANNEL: &str = "mainline-support-settle";
 /// 「看护 + 300s」的界。超过它仍在暂停，置这个标志的进程已经不在了（被自家滚动
 /// 杀掉、Job 被驱逐），这一轮可以清掉它。反过来，在这个界之内一律先等：那可能
 /// 是一次正在进行的看护，替它 resume 会让候选在没看完的情况下被放出去。
-// cap: bound — 与拉取端「看护窗口 + 收尾余量」同一个界，两边不能各拍一个数
+// cap: fixed — 与拉取端「看护窗口 + 收尾余量」同一个界，两边不能各拍一个数
+// keep: 删掉后拉取端与推送端各拍一个数，暂停的一侧先到期而另一侧还在等；由「看护窗口＋收尾余量同一个界」兜住
 pub(crate) const CANARY_PAUSE_MAX_HOLD_SECS: u64 =
     crate::config::DEFAULT_CANARY_WATCH_SECS + crate::config::CANARY_PAUSE_GRACE_SECS;
 
 /// 超时诊断里保留的事件条数。错误记录不是日志转储：只要够指出病因。
-// cap: bound — 错误记录不是日志转储，够指出病因就行
+// cap: fixed — 错误记录不是日志转储，够指出病因就行
+// keep: 删掉后错误记录变成日志转储，病因被细节淹没；由「够指出病因就行」兜住
 const DIAGNOSIS_EVENT_LIMIT: usize = 3;
 
 /// 就绪门禁在探针判定周期之外额外给出的余量：镜像已在节点上时，容器从起进程
@@ -301,18 +309,22 @@ const DIAGNOSIS_EVENT_LIMIT: usize = 3;
 /// 判定周期是 38 秒，差值约 4 秒——这就是起进程到监听的实际开销；这里取 15 秒
 /// 是给这一段留的宽裕上界。预算的另一半从活的探针配置推（见 [`ProbeCycle`]），
 /// 所以换一套探针只动那一半，这个数不跟着变。
-// cap: bound — 预算是给这一段留的宽裕上界；另一半从活的探针配置推，换探针时这个数不跟着变
+// cap: fixed — 预算是给这一段留的宽裕上界；另一半从活的探针配置推，换探针时这个数不跟着变
+// keep: 删掉后启动预算只从探针配置推，一段慢启动被读成没起来；由「给这一段留的宽裕上界」兜住
 const CONTAINER_STARTUP_ALLOWANCE_SECS: u64 = 15;
 
 // k8s 探针 API 的三格默认值（initialDelaySeconds 的 0 是「没写」，不是一条约定）。
 // 它们写成具名常量而不是结构体字面量里的三个字面数：容量登记表认得出一个声明，
 // 认不出一个字面量，三个字面数因此一个判词都不欠也一个都没有。
 // cap: fixed — k8s 探针 API 的默认 periodSeconds=10：不写 period 时 kubelet 用它
+// keep: 删掉后不写 period 的探针被我们按另一个数算，等待与实际 kubelet 不一致；由「k8s 探针 API 默认 periodSeconds」兜住
 const K8S_PROBE_DEFAULT_PERIOD_SECS: u64 = 10;
 // cap: fixed — k8s 探针 API 的默认 timeoutSeconds=1：不写 timeout 时 kubelet 用它
+// keep: 删掉后对没写 timeout 的探针估错一次探测的耗时；由「k8s 探针 API 默认 timeoutSeconds」兜住
 // wall: wait=kubelet exec probe; on-timeout=that probe reads as failed; resume=yes, the next period probes again
 const K8S_PROBE_DEFAULT_DEADLINE_SECS: u64 = 1;
 // cap: fixed — k8s 探针 API 的默认 failureThreshold=3：不写阈值时 kubelet 连判三次才判死
+// keep: 删掉后对没写阈值的探针估错判死时刻，等待早于或晚于 kubelet；由「k8s 默认 failureThreshold」兜住
 const K8S_PROBE_DEFAULT_FAILURES: u64 = 3;
 
 /// 就绪探针自己的四个旋钮。门禁的预算从这里推，不拍固定秒数：探针调周期，
@@ -886,7 +898,7 @@ impl ClusterConfigSources {
                     .map(str::to_string)
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         Self {
             kubeconfig_files,
             home_config: home
@@ -2773,8 +2785,10 @@ impl cog_core::declared_wall::SettleProbe for RolloutWait<'_> {
                 return Ok(Step::Failed(e.to_string()));
             }
             if self.has_init_containers.is_none() {
-                self.has_init_containers =
-                    Some(exec.init_containers_exist(t).await.unwrap_or(true));
+                self.has_init_containers = Some(cog_core::logged_default!(
+                    exec.init_containers_exist(t).await,
+                    true
+                ));
             }
             reading = out.clone();
             if self.has_init_containers == Some(true) {
@@ -3214,7 +3228,8 @@ fn file_len(path: &std::path::Path) -> u64 {
 /// 这样败的——九次、三百多秒，一次也没留下 kubectl 说的字，事后翻集群日志也判不出
 /// 是 apiserver 卡住还是 Pod 自己的网络栈坏了。所以输出落到文件而不是管道：文件在
 /// 进程死后仍然可读，判词于是能带上它自己的诊断。
-// cap: bound — 输出落到文件而不是管道，进程死后仍可读，判词才能带上自己的诊断
+// cap: fixed — 输出落到文件而不是管道，进程死后仍可读，判词才能带上自己的诊断
+// keep: 删掉后判词带不上自己的诊断，进程死后的输出没人读；由「输出落文件、判词带诊断」兜住
 const STDERR_TAIL_CHARS: usize = 600;
 
 fn stderr_tail(text: &str) -> String {
@@ -3422,8 +3437,8 @@ impl RolloutExecutor {
         let mut child = match spawned {
             Ok(child) => child,
             Err(e) => {
-                let _ = std::fs::remove_file(&out_path);
-                let _ = std::fs::remove_file(&err_path);
+                cog_core::ignore_lost!(std::fs::remove_file(&out_path));
+                cog_core::ignore_lost!(std::fs::remove_file(&err_path));
                 return Err(SFError::IO(format!(
                     "{OBSERVATION_TOOL_MARKER}: cannot run {}: {e}",
                     self.kubectl
@@ -3469,17 +3484,23 @@ impl RolloutExecutor {
                     if let Some((silent, window)) = cog_core::declared_wall::stall(&beat_id) {
                         stalled = Some((silent, window));
                         // 先杀再读：让它停手，否则读到的是一份还在长的文件。
-                        let _ = child.start_kill();
+                        cog_core::ignore_lost!(child.start_kill());
                         break child.wait().await;
                     }
                 }
             }
         };
         cog_core::progress::forget(&beat_id);
-        let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
-        let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
-        let _ = std::fs::remove_file(&out_path);
-        let _ = std::fs::remove_file(&err_path);
+        let stdout = std::fs::read_to_string(&out_path).map_err(|e| e.to_string()).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, path = %out_path.display(), "读取不到这一步的输出文件，按空文本继续");
+        String::new()
+    });
+        let stderr = std::fs::read_to_string(&err_path).map_err(|e| e.to_string()).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, path = %err_path.display(), "读取不到这一步的错误文件，按空文本继续");
+        String::new()
+    });
+        cog_core::ignore_lost!(std::fs::remove_file(&out_path));
+        cog_core::ignore_lost!(std::fs::remove_file(&err_path));
         // 判停被杀：把子进程已经写下的话带上。这正是这条路径存在的理由——
         // 一次九次尝试、三百多秒的停摆如果只留一句「超时」，事后没人说得清
         // 是 apiserver 卡住、Pod 的网络栈坏了，还是配置根本没读进来。
@@ -3678,7 +3699,7 @@ impl RolloutExecutor {
                 "json",
             ])
             .await
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let already = pod_already_admitted(&pods_text, &t.name, &t.component, &new_limits);
         let verdict =
             first_admission_shortfall(&quotas, &old_limits, &new_limits, surges, &already);
@@ -3734,9 +3755,11 @@ impl RolloutExecutor {
         /// How long one attempt waits for a full ceiling to drain, and how often it looks
         /// while waiting. Waiting on a path that already said no costs seconds; giving up
         /// early costs a whole retry round.
-        // cap: bound — 等一条已经说过「不」的路径只花几秒，早放弃要赔一整轮重试
+        // cap: fixed — 等一条已经说过「不」的路径只花几秒，早放弃要赔一整轮重试
+        // keep: 删掉后等一条已说「不」的路径没有上限，排空的等待可能拖住整轮；由「等一条已经说过不的路径只花几秒」兜住
         const BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
-        // cap: bound — how often the wait looks while draining: small enough that a drained ceiling is noticed within a few seconds.
+        // cap: fixed — how often the wait looks while draining: small enough that a drained ceiling is noticed within a few seconds.
+        // keep: 删掉后排空的等待看不见天花板已经放开，几秒的空档变成一整轮；由「几秒内注意到排空」兜住
         const POLL: std::time::Duration = std::time::Duration::from_secs(5);
         let started = std::time::Instant::now();
         let mut waited = false;
@@ -3850,7 +3873,7 @@ impl RolloutExecutor {
                     // 这份暂存件只服务这一次 apply，名字又按实例唯一（不再被下一轮覆盖），
                     // 所以用完就删：留着就是随每一次滚动在临时目录里堆一份，而没有任何
                     // 回收方认得它们。失败那一路也删——它派生自包里那份清单，包还在。
-                    let _ = tokio::fs::remove_file(&staged_path).await;
+                    cog_core::ignore_lost!(tokio::fs::remove_file(&staged_path).await);
                     outcome?;
                     let readback = self.read_back_removals(&field_removals).await;
                     if !readback.not_taken.is_empty() {
@@ -4591,7 +4614,7 @@ impl RolloutExecutor {
         let diagnosis = self.rollout_diagnosis(t, &replicasets).await;
         let suffix = scene_suffix(&diagnosis);
         let blocked = self.sample_unschedulable_pods(t).await;
-        let now_shape = self.current_placement_shape(t).await.ok();
+        let now_shape = cog_core::logged_ok!(self.current_placement_shape(t).await);
         let environment = environment_class(&blocked, wait.prev_shape, now_shape.as_deref());
         let denied = admission_rejection(&replicasets, wait.prev_shape, now_shape.as_deref());
         let pull_blocked = image_pull_blocked(&self.waiting_states(t).await).map(|r| r.to_string());
@@ -4743,7 +4766,7 @@ impl RolloutExecutor {
                      {.status.containerStatuses[0].lastState.terminated.message}{\"\\n\"}{end}",
             ])
             .await
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         pod_samples(&out)
     }
 
@@ -4819,7 +4842,7 @@ impl RolloutExecutor {
                      {.reason}|{.message}{\"\\n\"}{end}",
             ])
             .await
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let mut out = summarize_pod_states(&samples, Utc::now());
         let rs = replicasets
             .iter()
@@ -4861,7 +4884,7 @@ impl RolloutExecutor {
                      {.status.conditions[?(@.type==\"PodScheduled\")].message}{\"\\n\"}{end}",
             ])
             .await
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         unschedulable_pods(&out)
     }
 
@@ -4889,7 +4912,7 @@ impl RolloutExecutor {
                      {.status.conditions[?(@.type==\"ReplicaFailure\")].message}{\"\\n\"}{end}",
             ])
             .await
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         replicaset_failures(&out)
     }
 
@@ -5357,6 +5380,7 @@ impl RolloutExecutor {
             // 有多个、报失败的检查还要逐条问工作流身份，不封顶就会被一次慢网关把
             // Job 的期限吃光——那时失败会以"被判进程没跑完"的形状出现，谁也看不出
             // 是这一步。超时按「没问到」处置：这一轮不滚，下一轮再问。
+            // wall: 等=一次上游询问 / 等不到=按「没问到」处置，这一轮不滚 / 续跑=能，下一轮再问
             let hold = match tokio::time::timeout(
                 Duration::from_secs(CI_ASK_BUDGET_SECS),
                 self.ask_upstreams(ask),
@@ -5745,7 +5769,7 @@ impl RolloutExecutor {
                         // 这份暂存件只服务这一次 apply，名字又按实例唯一（不再被下一轮覆盖），
                         // 所以用完就删：留着就是随每一次滚动在临时目录里堆一份，而没有任何
                         // 回收方认得它们。失败那一路也删——它派生自包里那份清单，包还在。
-                        let _ = tokio::fs::remove_file(&path).await;
+                        cog_core::ignore_lost!(tokio::fs::remove_file(&path).await);
                         outcome.map_err(|e| classify_before_any_change("support", "", e))?;
                         // 支撑清单里除了 ConfigMap/Service，还有后端与集群内
                         // registry 这些工作负载，而目标部署的镜像要从这个 registry
@@ -5917,7 +5941,7 @@ impl RolloutExecutor {
                 .iter()
                 .find(|(d, _)| d == &target.deployment)
                 .map(|(_, v)| v.as_str())
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             // 换旧 Pod 之前先问一次：新 Pod 装不装得下。装不下就当场扣住，
             // 旧 Pod 留着、应用不断——这是量到了漂移却没有任何门去拦的那一处，
             // 补成门。装不下是集群此刻的事，不是这一版的结论，所以判环境类、
@@ -6269,7 +6293,7 @@ impl RolloutExecutor {
             };
             // 回退前的放置面：与新版本那一侧同一判据，好让"回退的 Pod 也排
             // 不进去"在日志里读成同一件事（节点满了），不被当成回退本身失败。
-            let live_shape = self.current_placement_shape(t).await.unwrap_or_default();
+            let live_shape = cog_core::logged_default!(self.current_placement_shape(t).await);
             // 这个目标的**整组**引用一条命令还回去：主容器（`prevs` 里那一份）
             // 加上同一份文档里被这次 apply 改写的其它引用（init 容器、边车）。
             // 只还主容器的话，失败 rev 的二进制会继续留在启动路径上——现场就是
@@ -6565,6 +6589,7 @@ pub(crate) fn parse_rollout_args(
         ns: "cogneva".to_string(),
         soak_secs: 120,
         restart_threshold: 1,
+        // keep: Job 的等待上限：删掉后卡住的 Job 不会被判失败、也不会重来，主线就永远等它；由 k8s Job 的失败判定与重试约定兜住
         timeout: 300,
         startup_timeout: 900,
         kubectl: "kubectl".to_string(),

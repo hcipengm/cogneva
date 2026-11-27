@@ -166,7 +166,7 @@ impl cog_core::BinarySwitcher for SelfExecSwitcher {
         })?;
 
         // Remove staged copy to avoid confusion.
-        let _ = tokio::fs::remove_file(&staged).await;
+        cog_core::ignore_lost!(tokio::fs::remove_file(&staged).await);
 
         info!(current = %current.display(), "Switching to new binary via exec");
         Self::exec_binary(&current)

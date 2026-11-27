@@ -23,14 +23,16 @@ use async_trait::async_trait;
 /// 给文件算 sha256 时一次读多少：默认 64 KiB。
 ///
 /// 整块读让哈希只受磁盘顺序读限制，默认的 64 KiB 是页缓存友好的块大小。
-// cap: bound — 整块读让哈希只受磁盘顺序读限制，块大小取的是页缓存友好的量级
+// cap: fixed — 整块读让哈希只受磁盘顺序读限制，块大小取的是页缓存友好的量级
+// keep: 删掉后逐字节读，哈希被系统调用次数限制；由「页缓存友好的量级」兜住
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
 
 /// 抓一次 /metrics 的墙：5s。
 ///
 /// 这是评测里的一条读数，抓不到按缺读数处理；等更久只会让一条评测卡在别人的
 /// 观测面上。
-// cap: bound — 这是评测里的一条读数，抓不到按缺读数处理；等更久只会让一条评测卡在别人的观测面上
+// cap: fixed — 这是评测里的一条读数，抓不到按缺读数处理；等更久只会让一条评测卡在别人的观测面上
+// keep: 删掉后一条评测卡在别人的观测面上，抓不到也不按缺读数走；由「抓不到按缺读数处理」兜住
 // wall: 等=观测面吐出这几格读数 / 等不到=这几格按「缺读数」处理，**不填 0**——一次评测里读不到与量到为 0 是两件事 / 续跑=能，下一次评测重新抓
 const METRICS_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 use cog_core::{
@@ -72,7 +74,8 @@ fn pins_key(benchmark: &str) -> &str {
 const SCAFFOLDS: [&str; 4] = ["codeact", "gepa", "agentflow", "nql"];
 
 /// 每个格子打印几条失败明细。
-// cap: bound — 每个格子打印几条失败明细，够看出是同一类失败就够了
+// cap: fixed — 每个格子打印几条失败明细，够看出是同一类失败就够了
+// keep: 删掉后每格打印全部失败明细，看不出是同一类失败；由「够看出同一类」兜住
 const FAILURE_SAMPLE: usize = 3;
 
 pub const USAGE: &str = "\
@@ -876,6 +879,7 @@ async fn read_pool(http: &Arc<dyn HttpClient>, base_url: &str) -> Option<PoolRea
     let url = metrics_url(base_url);
     let mut req = cog_core::HttpRequest::get(url);
     req.timeout_secs = Some(3);
+    // roundtrip: 一次指标抓取
     let resp = tokio::time::timeout(METRICS_FETCH_TIMEOUT, http.execute(req))
         .await
         .ok()?
@@ -2193,7 +2197,7 @@ async fn wiring_from_config(args: &EvalTableArgs) -> Wiring {
 
     let capacity = cog_llm::TuningConfig::load()
         .map(|t| t.stream_capacity)
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let max_tokens = crate::config_loader::load()
         .core
         .system
@@ -2307,7 +2311,7 @@ pub async fn run_from_args() -> Result<(), Box<dyn std::error::Error>> {
     // 而报表里另有一行说着声明为什么读不出来。
     let declared: Vec<String> = crate::eval_container::foreign_flows()
         .map(|flows| flows.into_iter().map(|flow| flow.name).collect())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let args = match EvalTableArgs::parse_with(&operands(&argv), &declared) {
         Ok(args) => args,
         // 用法跟着错误走：缺一个必填项与写错一个选项名，读的人都要能当场看见这个

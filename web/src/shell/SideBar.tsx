@@ -124,6 +124,7 @@ const TITLES: Record<ActivityId, string> = {
   governance: '治理',
   observability: '观测',
   token: 'Token',
+  keys: '密钥',
   resources: '资源',
   storage: '存储',
   eval: '评测',

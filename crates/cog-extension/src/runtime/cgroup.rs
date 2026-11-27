@@ -241,7 +241,7 @@ impl CommandCage {
         };
         std::fs::create_dir(&cage.dir)?;
         if let Err(e) = std::fs::write(cage.dir.join("cgroup.procs"), pid.to_string()) {
-            let _ = std::fs::remove_dir(&cage.dir);
+            cog_core::ignore_lost!(std::fs::remove_dir(&cage.dir));
             return Err(e);
         }
         Ok(cage)

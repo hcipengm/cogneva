@@ -2417,7 +2417,7 @@ fn a_difference_read_of_a_metering_family_is_one_the_producer_declared() {
 
     let mut missing_cost: Vec<String> = Vec::new();
     for (family, baseline) in RANGE_READ_BASELINES {
-        let actual: BTreeSet<String> = readers.get(*family).cloned().unwrap_or_default();
+        let actual: BTreeSet<String> = readers.get(*family).cloned().unwrap_or(Default::default());
         match baseline {
             RangeReadBaseline::SeededAtZero => {
                 if actual.is_empty() {
@@ -3031,9 +3031,9 @@ fn a_summary_names_only_labels_its_expression_keeps() {
     let mut judged = 0usize;
     let mut unjudged = 0usize;
     for rule in &rules {
-        let name = rule["name"].as_str().unwrap_or_default();
-        let expression = rule["promql"].as_str().unwrap_or_default();
-        let summary = rule["summary"].as_str().unwrap_or_default();
+        let name = rule["name"].as_str().unwrap_or(Default::default());
+        let expression = rule["promql"].as_str().unwrap_or(Default::default());
+        let summary = rule["summary"].as_str().unwrap_or(Default::default());
 
         let clauses = kept_labels_by_clause(expression);
         if clauses.is_empty() {
@@ -6644,7 +6644,7 @@ fn the_face_drift_rule_is_quiet_on_exactly_the_states_the_enum_calls_yellow() {
         .iter()
         .find(|r| r["name"] == "governance_face_not_on_target")
         .expect("面漂移规则不见了：没有任何东西会报一个面正在漂");
-    let expression = rule["promql"].as_str().unwrap_or_default();
+    let expression = rule["promql"].as_str().unwrap_or(Default::default());
 
     assert!(
         expression.contains(r#"state!="on_target""#),
@@ -6770,6 +6770,7 @@ fn a_retired_rule_is_named_where_the_watcher_can_settle_it() {
 /// `cogneva_*` rules legitimately identify a pod (`orphans_unreaped` is one row
 /// per pod that failed to reap its own orphans), so a rule like "no app metric
 /// may be selected bare" would flag sixty correct rules and be turned off.
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const PUBLISHED_PER_REPLICA: &[&str] = &[
     "cogneva_stream_read_silent_seconds",
     "cogneva_stream_read_failures_total",
@@ -6858,7 +6859,7 @@ fn reporter_aggregated_away(expr: &str, pos: usize) -> bool {
         // `max(NAME)`: every label is dropped.
         return true;
     };
-    let list = list.unwrap_or_default();
+    let list = list.unwrap_or(Default::default());
     let keeps = |label: &str| list.split(',').map(str::trim).any(|l| l == label);
     match modifier.as_str() {
         "without" => keeps("pod"),

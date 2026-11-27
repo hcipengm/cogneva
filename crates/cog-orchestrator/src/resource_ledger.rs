@@ -57,7 +57,8 @@ pub const RESOURCE_LEDGER_ROLE: &str = "resource_ledger";
 /// refusal is one line of work, not a stream. Shorter would put a query against
 /// the shared database on every few control ticks for an account that is read
 /// by people; longer starts to look like the ring's bound.
-// cap: bound — 一次拒收是一行活不是一串流；更密等于每几个控制拍往共享库打一次查询，更疏就开始像环的那条界
+// cap: fixed — 一次拒收是一行活不是一串流；更密等于每几个控制拍往共享库打一次查询，更疏就开始像环的那条界
+// keep: 删掉后每几个控制拍就往共享库打一次查询，或开始像环的那条界；由「一次拒收是一行活不是一串流」兜住
 pub const RESOURCE_LEDGER_PASS_INTERVAL: Duration = Duration::from_secs(10);
 
 /// How many queued events one pass folds.
@@ -66,7 +67,9 @@ pub const RESOURCE_LEDGER_PASS_INTERVAL: Duration = Duration::from_secs(10);
 /// but generous, because the common case is two or three events and anything
 /// that reached this bound is a producer that looped rather than a corpus being
 /// read.
-// cap: bound — 常见情形是两三条事件；到了这个数说明是生产者在打转，不是在被读的语料
+// cap: fixed — 常见情形是两三条事件；到了这个数说明是生产者在打转，不是在被读的语料
+// keep: 删掉后生产者打转时一拍把整批事件折完；由「常见情形是两三条事件」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const FOLD_PER_PASS: usize = 500;
 
 /// How many events this loop holds on to when the account cannot be written.
@@ -80,14 +83,16 @@ const FOLD_PER_PASS: usize = 500;
 /// the log rather than counted as a ring drop, because the two losses are
 /// different facts: one is a producer outrunning its consumer, the other is a
 /// consumer that cannot reach its store at all.
-// cap: bound — 满了要落进日志而不是记成环丢弃：生产者超过消费者与消费者够不到库，是两件不同的事实
+// cap: fixed — 满了要落进日志而不是记成环丢弃：生产者超过消费者与消费者够不到库，是两件不同的事实
+// keep: 删掉后携带环无界，生产者超过消费者时内存一直长且丢事件被记成环丢弃；由「满了要落进日志」兜住
 const CARRY_CAPACITY: usize = 1024;
 
 /// How many recent events one pass looks at when it says what it saw.
 ///
 /// Only for the log line, so a bound that keeps a few is enough; the table is
 /// what a reader who wants the whole thing reads.
-// cap: bound — 只给日志一行看，留几条就够；要全量的人读的是那张表
+// cap: fixed — 只给日志一行看，留几条就够；要全量的人读的是那张表
+// keep: 删掉后日志一行要打全量；由「只给日志一行看」兜住
 const RECENT_PEEK: usize = 5;
 
 /// One pass: carry this process's events out, then read and fold the account.

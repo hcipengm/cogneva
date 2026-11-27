@@ -43,6 +43,14 @@ pub struct ProjectionReader {
 /// 自报「我读到哪了」，而那是重建得出的表才需要说的话。
 pub const PROJECTION_READERS: &[ProjectionReader] = &[
     ProjectionReader {
+        table: "change_ledger",
+        reader: "crates/cog-storage/src/postgres/change_ledger_store.rs",
+        why_not_the_source: "取批次的顺序读的是这一张表的几列（档、面、最近测量），而每一格都来自流上的三类事实；直接对事实做这一问要在每次取批时把整本账折一遍，而屏上的队列与部署器都在问它。",
+        rebuilt_from: "由 `change_judged`／`change_declared`／`change_delivered` 三类事实折回来（每个身份取最后一条；声明补 title／assertion 与每条引用）",
+        rebuild: "crates/cog-storage/src/lib.rs",
+        rebuild_test: "crates/cog-storage/tests/a_change_account_rebuilds_from_the_stream.rs",
+    },
+    ProjectionReader {
         table: "cog_metric_counter_totals",
         reader: "crates/cog-storage/src/postgres/metrics_backend.rs",
         why_not_the_source: "这一行是被观测的进程自己累加的数，真源是 Prometheus 里那条序列；从真源读一次要走一趟网络、并且 Prometheus 不在时读不到，而屏上的每一次刷新都在问它。库里的这一份是投影，用 `cogneva rebuild-metric-projections` 可以按真源整表重写。",
@@ -65,6 +73,22 @@ pub const PROJECTION_READERS: &[ProjectionReader] = &[
         rebuilt_from: "Prometheus 里 `<name>_sum` 那条序列",
         rebuild: "crates/cog-observability/src/metric_projection.rs",
         rebuild_test: "crates/cogneva/tests/metric_projections_rebuild_from_prometheus.rs",
+    },
+    ProjectionReader {
+        table: "principle_ledger",
+        reader: "crates/cog-storage/src/postgres/principle_ledger_store.rs",
+        why_not_the_source: "每个原则的当前判词要按 slug 一次读出；对 `principle_judged` 事件折一遍整条流回答同一个问题太贵，而判词读者每回合都问它。整表重算，没有水位。",
+        rebuilt_from: "由 `principle_judged` 事件重建（每个 slug 取最后一条判词）",
+        rebuild: "crates/cog-storage/src/lib.rs",
+        rebuild_test: "crates/cog-storage/tests/a_principle_verdict_rebuilds_from_the_stream.rs",
+    },
+    ProjectionReader {
+        table: "principle_ledger_declared",
+        reader: "crates/cog-storage/src/postgres/principle_ledger_store.rs",
+        why_not_the_source: "声明行的当前集合按 slug 与来源一次读出；对 `principle_declared` 事件折一遍整条流回答同一问太贵。整表重算，没有水位。",
+        rebuilt_from: "由 `principle_declared` 事件重建",
+        rebuild: "crates/cog-storage/src/lib.rs",
+        rebuild_test: "crates/cog-storage/tests/a_principle_verdict_rebuilds_from_the_stream.rs",
     },
     ProjectionReader {
         table: "task_current",

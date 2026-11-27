@@ -440,6 +440,7 @@ impl LLMProvider for OpenAIResponsesProvider {
             'stream: loop {
                 let timeout = event_timeout.max(Duration::from_secs(1));
 
+                // wall: 等=上游 SSE 的下一个事件 / 等不到=这一跳按失败收尾 / 续跑=能，新开一次上游调用
                 let line = match tokio::time::timeout(timeout, lines.try_next()).await {
                     Ok(Ok(Some(line))) => line,
                     Ok(Ok(None)) => break,
@@ -572,7 +573,7 @@ impl LLMProvider for OpenAIResponsesProvider {
                         }
                     }
                     "response.output_item.added" => {
-                        let item = event.get("item").cloned().unwrap_or_default();
+                        let item = event.get("item").cloned().unwrap_or(Default::default());
                         if item.get("type").and_then(|t| t.as_str()) != Some("function_call") {
                             continue;
                         }
@@ -670,7 +671,7 @@ impl LLMProvider for OpenAIResponsesProvider {
                         }
                     }
                     "response.output_item.done" => {
-                        let item = event.get("item").cloned().unwrap_or_default();
+                        let item = event.get("item").cloned().unwrap_or(Default::default());
                         if item.get("type").and_then(|t| t.as_str()) != Some("function_call") {
                             continue;
                         }

@@ -64,6 +64,18 @@ pub fn purge() {
     // DELETE FROM commented_out WHERE id = 1;
     let head: String = text.chars().take(32).collect();
 }
+
+// 三条紧挨着的常量：判词不许借邻居。甲有真判词，乙只有 not-a-bound，
+// 丙什么都没有——按距离取窗口时乙会读到甲的 `keep:`，于是「不算界」被读成
+// 「已处置」，而丙会读到乙的 `not-a-bound`。
+// cap: fixed — 甲是一个有判词的界
+// keep: 删掉后甲会坏；由「甲的读数」兜住
+const NEIGHBOR_MAX_A: usize = 1;
+// cap: fixed — 乙不是界，只是一条定义
+// not-a-bound: 乙不是界，只是一条定义
+const NEIGHBOR_MAX_B: usize = 2;
+// cap: fixed — 丙没有写第一问
+const NEIGHBOR_MAX_C: usize = 3;
 RS
 
 cat >"$tree/deploy/helm/cogneva/files/cogneva.json" <<'JSON'
@@ -79,6 +91,21 @@ cat >"$tree/deploy/helm/cogneva/files/cogneva.json" <<'JSON'
   }
 }
 JSON
+
+# 宿主脚本里的时钟界：写死的 `timeout N` / `--max-time N` / `sleep N` 要认出来；
+# 值在变量里的（`timeout "$BOUND"`）不在这里判——它的数在赋值处；标了 not-a-bound 的
+# 轮询节拍要通过判据，不被当成未处置。
+mkdir -p "$tree/scripts/host"
+cat >"$tree/scripts/host/bound.sh" <<'SH'
+#!/bin/sh
+timeout 30 bash something.sh
+curl -s --max-time 5 http://example.invalid/x
+# not-a-bound: 轮询节拍，删掉会忙等
+sleep 2
+timeout "$BOUND" bash other.sh
+SH
+# 夹具不是生产读数：`.test.sh` 里的秒数一颗也不该被数进来。
+printf '#!/bin/sh\ntimeout 99 bash test-only.sh\n' >"$tree/scripts/host/ignored.test.sh"
 
 # 后缀不在扫描面里的毁数据语句：它不该被数进来。
 echo "DELETE FROM invented WHERE x = 1;" >"$tree/scripts/notes.txt"
@@ -163,8 +190,51 @@ printf '%s' "$out" | grep -q "change_candidate" \
 printf '%s' "$out" | grep -q "event_log" \
     && bad "名字带 event 的表被当成了欠事件的：$out" || ok "无事件事实面：事件表本身不算"
 
+# 面九 处置归属：判词只属于它自己那条常量，不许借邻居的。
+disposition() { # $1 = 常量名
+  python3 -I - "$census" "$tree" "$1" <<'PY'
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("bounds_census", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+root = pathlib.Path(sys.argv[2])
+for row in module.surface_markers(root):
+    if sys.argv[3] not in row["name"]:
+        continue
+    print(module.disposition_of(root, row, module.projection_tables(root), {}))
+PY
+}
+
+[ "$(disposition NEIGHBOR_MAX_A)" = keep ] \
+    && ok "处置归属：有自己的判词就是 keep" \
+    || bad "有判词的常量没读成 keep（$(disposition NEIGHBOR_MAX_A)）"
+[ "$(disposition NEIGHBOR_MAX_B)" = definition ] \
+    && ok "处置归属：not-a-bound 不借邻居的 keep" \
+    || bad "not-a-bound 借了邻居的判词（$(disposition NEIGHBOR_MAX_B)）"
+[ "$(disposition NEIGHBOR_MAX_C)" = reason-incomplete ] \
+    && ok "处置归属：自己没写第一问就是理由不全" \
+    || bad "没有判词的常量被邻居兜住了（$(disposition NEIGHBOR_MAX_C)）"
+
+# 面六 shell-clocks：宿主脚本里写死的时钟界。
+out=$(rows shell-clocks); rc=$?
+printf '%s' "$out" | grep -q "timeout 30" \
+    && ok "shell 面：写死的 timeout 认出来了" || bad "写死的 timeout 没认出来（rc=$rc）：$out"
+printf '%s' "$out" | grep -q -- "--max-time 5" \
+    && ok "shell 面：--max-time 认出来了" || bad "--max-time 没认出来（rc=$rc）：$out"
+printf '%s' "$out" | grep -q "timeout \"\$BOUND\"" \
+    && bad "值在变量里的调用被当成了界：$out" || ok "shell 面：变量里的值不在调用点判"
+printf '%s' "$out" | grep -q "timeout 99" \
+    && bad "夹具里的秒数被数进来了：$out" || ok "shell 面：.test.sh 不算生产界"
+
+out=$(python3 -I "$census" --root "$tree" --surface shell-clocks --check 2>&1); rc=$?
+[ "$rc" -ne 0 ] \
+    && ok "shell 面：写死的界让判据红（rc=$rc）" \
+    || bad "写死的界没有让判据红：$out"
+printf '%s' "$out" | grep -q "sleep 2" \
+    && bad "标了 not-a-bound 的节拍被当成未处置" || ok "shell 面：有判词的节拍通过"
+
 # 这四面在这份标本上都必须**非空**：空产出与「这一面没跑」在命令行上是同一个读数。
-for face in markers consts config destroys walls state-files facts-without-events; do
+for face in markers consts config destroys walls state-files facts-without-events shell-clocks; do
   count=$(rows "$face" | wc -l)
   [ "$count" -gt 0 ] \
       && ok "面 $face 在这份标本上非空（$count）" \

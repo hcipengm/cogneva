@@ -111,6 +111,10 @@ fn every_declaration_answers_where_the_truth_is() {
                         ));
                     }
                 }
+                let Some(watermark) = watermark else {
+                    // 整表重算的投影没有水位：它每次都从头算，不存在「读到哪」。
+                    continue;
+                };
                 let has_watermark = tables
                     .get(declaration.table)
                     .is_some_and(|columns| columns.contains(watermark));
@@ -209,7 +213,7 @@ fn updated_tables(root: &Path) -> BTreeSet<String> {
             if name.is_empty() {
                 continue;
             }
-            let rest_of_statement = rest.split(';').next().unwrap_or_default();
+            let rest_of_statement = rest.split(';').next().unwrap_or(Default::default());
             if rest_of_statement.contains("do update set") {
                 out.insert(name);
             }

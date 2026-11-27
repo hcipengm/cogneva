@@ -86,11 +86,14 @@ pub const CAPABILITY_DECLARED_METRIC: &str = "cogneva_capability_declared";
 /// declarations is fixed at build time.
 pub const CAPABILITY_LABEL: &str = "capability";
 
-// cap: bound — 闭集的一格，不是可调的数：换一个数就是换一种语言，读的人先前的选择器全部失配
+// cap: fixed — 闭集的一格，不是可调的数：换一个数就是换一种语言，读的人先前的选择器全部失配
+// keep: 删掉后闭集换一种语言，读者先前的选择器全部失配；由「闭集的一格不是可调的数」兜住
 pub const VERDICT_OK: u8 = 0;
-// cap: bound — 闭集的一格，不是可调的数
+// cap: fixed — 闭集的一格，不是可调的数
+// keep: 删掉后闭集少一格，读的人把红读成另一件事；由「闭集的一格」兜住
 pub const VERDICT_RED: u8 = 1;
-// cap: bound — 3 不是 2：平台里「这一轮什么都没量到」一直是 3，沿用那一格，读者不必再学一套
+// cap: fixed — 3 不是 2：平台里「这一轮什么都没量到」一直是 3，沿用那一格，读者不必再学一套
+// keep: 删掉后「什么都没量到」换一格，读者要再学一套；由「一直是 3」兜住
 pub const VERDICT_UNMEASURED: u8 = 3;
 
 /// What a capability answered this round.

@@ -102,7 +102,8 @@ pub const HOST_LEDGER_SLICES_INVISIBLE_RULE: &str = "host_ledger_slices_invisibl
 /// stay quiet -- and a bound nothing reaches says nothing about anything.
 /// What this floor is set to catch is the host being *held* under pressure,
 /// which is why the derived number comes from the minimum and not the peak.
-// cap: bound — 实测：8.59 GB 地板 / 62.7 GiB MemTotal；它要抓的是主机被压着「顶住」，所以派生量取的是最小值而不是峰值
+// cap: fixed — 实测：8.59 GB 地板 / 62.7 GiB MemTotal；它要抓的是主机被压着「顶住」，所以派生量取的是最小值而不是峰值
+// keep: 删掉后回到「实测：8.59 GB 地板 / 62.7 GiB MemTotal；它要抓的是主机被压着「顶住」，所以派生量取的是最小值而不是峰值」所描述的情形；由这条约定兜住
 pub const HOST_SLICE_ANON_FLOOR_PERCENT: u64 = 13;
 
 /// Environment variable naming the node this process is running on.
@@ -279,7 +280,7 @@ mod tests {
     fn scratch(name: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("cog-host-ledger-{}-{}", name, std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

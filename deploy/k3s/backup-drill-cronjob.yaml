@@ -1,3 +1,4 @@
+# census-keep: shapes=deploy-numbers — 部署清单里的数是部署自己的声明：它写在生效的那一处，改它只改这一次部署，不是代码里看不见的默认；由部署面本身兜住
 # 恢复演练 CronJob：把最新一个备份包装进一个跑完迁移的**空库**，逐表对数、
 # 把账行与源库逐格比，然后把库删掉，答案落进 `backup_drills`。
 #
@@ -83,7 +84,7 @@ spec:
                       f="$COGNEVA_PROGRESS_FILE"; if [ -z "$f" ] || [ ! -f "$f" ]; then
                       echo "no progress file (COGNEVA_PROGRESS_FILE='$f')"; exit 1; fi;
                       age=$(( $(date +%s) - $(date -r "$f" +%s) )); win=$(cat "$f");
-                      echo "quiet ${age}s, window ${win}s"; [ "$age" -le "$win" ]
+                      echo "quiet ${age}s, window ${win}"; if [ "$win" = "unbounded" ]; then exit 0; fi; [ "$age" -le "$win" ]
                 periodSeconds: 30
                 timeoutSeconds: 10
                 failureThreshold: 3

@@ -16,7 +16,7 @@
 //! ```
 
 use chrono::Utc;
-use cog_core::{LlmCall, LlmCallEvents};
+use cog_core::LlmCall;
 use cog_observability::usage_store::{LlmUsageRecord, LlmUsageStore};
 use cog_storage::LlmCallEventStore;
 use cog_test_support::{database_url, drop_schema, own_schema, schema_pool};
@@ -30,6 +30,7 @@ async fn apply_event_stream_migration(pool: &sqlx::PgPool) {
         "119_event_payload_is_json.up.sql",
         // 流上的读者按生成列取 token 与花费；缺这一条，列名根本不存在。
         "124_event_payload_query_columns.up.sql",
+        "130_event_session_id.up.sql",
     ] {
         let sql = std::fs::read_to_string(dir.join(file))
             .unwrap_or_else(|e| panic!("read the migration {file}: {e}"));
@@ -42,6 +43,8 @@ async fn apply_event_stream_migration(pool: &sqlx::PgPool) {
 
 fn usage_row(actor: &str, input: u64, output: u64, marker: &str) -> LlmUsageRecord {
     LlmUsageRecord {
+        finish_reason: None,
+        ttft_ms: None,
         refused_scope: None,
         upstream: "agreement-upstream".to_string(),
         api_style: "openai".to_string(),
@@ -55,6 +58,8 @@ fn usage_row(actor: &str, input: u64, output: u64, marker: &str) -> LlmUsageReco
         tokens_cache_created: None,
         tokens_reasoning: None,
         estimated_input: None,
+        prompt_manifest: None,
+        prompt_dropped: None,
         cost_micros: None,
         price_book: None,
         refusal_kind: None,
@@ -89,6 +94,16 @@ fn call(call_id: &str, actor: &str, input: u64, output: u64) -> LlmCall {
         batch_id: None,
         session: None,
         pace: None,
+        tokens_reasoning: None,
+        refusal_kind: None,
+        retry_after_secs: None,
+        usage_outcome: None,
+        estimated_input: None,
+        refused_scope: None,
+        finish_reason: None,
+        ttft_ms: None,
+        prompt_manifest: None,
+        prompt_dropped: None,
         at: Utc::now(),
     }
 }

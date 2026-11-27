@@ -1429,6 +1429,14 @@ const COUNTER_HELP: &[(&str, &str)] = &[
 /// Descriptions for the histogram series. See [`COUNTER_HELP`].
 const HISTOGRAM_HELP: &[(&str, &str)] = &[
     (
+        crate::metric_names::EVENT_APPEND_SECONDS.as_str(),
+        "One append to the event stream, in seconds, labelled by the kind of \
+         fact. The observation is taken around the single writer's INSERT, so \
+         pool queueing is included: that is time the append waited. The p99 over \
+         a window is read against half the UI refresh cycle, which is why the \
+         tail and not the mean is the reading here",
+    ),
+    (
         "memory_operation_latency_ms",
         "Memory backend operation latency in milliseconds",
     ),
@@ -1725,8 +1733,12 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          idle_in_transaction_session_timeout and lock_timeout. These are bounds \
          the database carries rather than bounds this repository writes, so no \
          scan of the tree can see them -- and a statement the database kills \
-         halfway is the same loss as one a hard-coded bound kills halfway. Zero \
-         means that setting is off, which is the state to check first: a \
+         halfway is the same loss as one a hard-coded bound kills halfway. A \
+         value of NaN means the setting is off (PostgreSQL encodes that as 0, \
+         which is not zero seconds): the series is still published so a reader \
+         can tell `no bound set` from `the surface did not run`, and every \
+         comparison against it is false rather than reading as an expired \
+         bound. Which settings are off is the state to check first: a \
          deployment that deleted every time bound in code and left one in the \
          database has moved the bound rather than removed it",
     ),
@@ -1740,6 +1752,39 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          are space that is deleted and still occupied: they make backups slower \
          and the planner read a table larger than its live data. Read the \
          per-table counts beside this one to see which tables are carrying it",
+    ),
+    (
+        "cogneva_db_xact_age_seconds",
+        "How old the longest transaction in each state already is, in seconds, \
+         labelled by `state`: `active` for one running work, `idle in \
+         transaction` for one that opened a transaction and stopped talking. \
+         The second is the one the database kills on its own \
+         `idle_in_transaction_session_timeout`, so its age is how much of that \
+         bound is spent; the two carry different settings and are published \
+         apart because one maximum cannot say which bound is near. A state \
+         with no open transaction is absent rather than 0 -- zero seconds is a \
+         transaction that has just begun",
+    ),
+    (
+        "cogneva_db_dead_tuples",
+        "Dead tuples carried by each table, labelled by `table`. Space that is \
+         deleted and still occupied: it makes backups slower and the planner \
+         read a table larger than its live data. Read together with \
+         `cogneva_db_vacuum_threshold_tuples`, which is the line autovacuum \
+         itself works against",
+    ),
+    (
+        "cogneva_db_vacuum_threshold_tuples",
+        "The dead-tuple count after which autovacuum should already have come \
+         to this table: `autovacuum_vacuum_threshold + \
+         autovacuum_vacuum_scale_factor x live tuples`, both settings read from \
+         the server and the live count from the table itself. A reading rather \
+         than a threshold somebody typed: change the server's settings and \
+         this moves with them. Together with the dead-tuple count it says how \
+         far past its own trigger a table is; a zero threshold means the \
+         trigger is off for that table and any dead tuple is already past it, \
+         which is why the ratio is divided where it is read rather than \
+         published as a number",
     ),
     (
         "metrics_samples_rows",

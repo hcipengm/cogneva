@@ -18,7 +18,8 @@ use std::sync::RwLock;
 ///
 /// 这条循环曾经阻塞等待，在同一个线程上与运行时互锁、冻住整个进程；轮询间隔
 /// 要短到看不出延迟，长到不把线程占满。
-// cap: bound — 轮询间隔：短到看不出延迟、长到不把线程占满；不是从机器测出来的数
+// cap: fixed — 轮询间隔：短到看不出延迟、长到不把线程占满；不是从机器测出来的数
+// keep: 删掉后轮询没有节拍，忙等占线程；由「短到看不出延迟、长到不占满线程」兜住
 const CHANNEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// 热重载模式。
@@ -101,7 +102,7 @@ impl PromptLoader for FileSystemLoader {
         let (tx, rx) = channel::<Result<Event, notify::Error>>();
         let mut watcher = RecommendedWatcher::new(
             move |res| {
-                let _ = tx.send(res);
+                cog_core::ignore_lost!(tx.send(res));
             },
             Config::default(),
         )?;

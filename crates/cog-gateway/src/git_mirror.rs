@@ -60,24 +60,29 @@ pub(crate) const GIT_SSH_KEY_ENV: &str = "COGNEVA_GATEWAY_GIT_SSH_KEY";
 pub(crate) const GIT_SSH_BASE_ENV: &str = "COGNEVA_GATEWAY_GIT_SSH_BASE";
 /// 镜像保鲜期：最后一次成功 fetch 在这个秒数内，才允许把它当基线发出去。
 /// 取得短是因为它同时是"兜底期基线能有多旧"的上界。
-// cap: bound — 取得短，是因为它同时是「兜底期基线能有多旧」的上界
+// cap: fixed — 取得短，是因为它同时是「兜底期基线能有多旧」的上界
+// keep: 删掉后兜底期基线能有多旧没有上界，路由拿一份无限旧的读数去判；由「它同时是兜底期基线的上界」兜住
 pub(crate) const MIRROR_FRESHNESS_SECS: u64 = 30;
 /// 熔断探测节拍：连续失败按指数退避，封顶见 [`suspect_backoff_secs`]。
-// cap: bound — 熔断探测节拍；连续失败按指数退避，封顶见 suspect_backoff_secs
+// cap: fixed — 熔断探测节拍；连续失败按指数退避，封顶见 suspect_backoff_secs
+// keep: 删掉后回到「熔断探测节拍；连续失败按指数退避，封顶见 suspect_backoff_secs」所描述的情形；由这条约定兜住
 const HTTPS_PROBE_INTERVAL_SECS: u64 = 60;
 /// HTTPS 快路径的等待上限。GET 是 `info/refs`（应答小、上游立刻回）；POST 是
 /// pack 计算 + 传输，给足时间。**这两个值判的是"是不是进了黑洞"，不是给正常
 /// 请求设预算**——透传路径原本没有任何总超时，加它就是为了让降级判据存在。
-// cap: bound — 透传路径原本没有总超时，加它是为了让降级判据存在
+// cap: fixed — 透传路径原本没有总超时，加它是为了让降级判据存在
+// keep: 删掉后透传路径没有总超时，降级判据不存在；由「加它是为了让降级判据存在」兜住
 // wall: 等=代理出去的那次 GET 回来（清单、单文件） / 等不到=这次读按失败收尾，调用方拿到错误；透传路径上原本没有总超时，这一条存在的理由就是让「降级」有一个判据 / 续跑=能，重来是一次新的请求
 const HTTPS_GET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// post 的判据与 get 同形，只是量级不同：一次 post 要把整包算完再传出去，
 /// 所以在正常仓库上它本来就以分钟计；这个界判的仍是「是不是进了黑洞」。
-// cap: bound — 推送正常就以分钟计，这个界判的仍是「是不是进了黑洞」
+// cap: fixed — 推送正常就以分钟计，这个界判的仍是「是不是进了黑洞」
+// keep: 删掉后推送挂在黑洞里永远不结束；由「这个界判的仍是是不是进了黑洞」兜住
 // wall: 等=一次推送走完 / 等不到=这次推送按失败收尾；**对端可能已经收了一部分**，所以判据是「进了黑洞」而不是「没推成」 / 续跑=能，推是幂等的（同一 ref 再推一次到同一个位置），但要在下一次读清远端之后
 const HTTPS_POST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 /// 镜像单次响应体上限，与透传路径的缓冲约定一致。
-// cap: bound — 镜像单次响应体上限，与透传路径的缓冲约定一致
+// cap: fixed — 镜像单次响应体上限，与透传路径的缓冲约定一致
+// keep: 删掉后镜像响应体可以任意大，一次透传把内存交出去；由「与透传路径的缓冲约定一致」兜住
 const MAX_MIRROR_BODY: usize = 256 * 1024 * 1024;
 /// git 可执行文件。镜像路径只经由它跑 clone/fetch/push/show-ref。
 const DEFAULT_GIT_BIN: &str = "git";
@@ -100,10 +105,12 @@ pub(crate) fn git_bin_from_env() -> PathBuf {
 /// 就等于"没有进展"。用总时长判会把"链路慢"和"链路死"压成同一个结论，而这两种
 /// 情况该做的事相反：慢要等，死要立刻换通道。这条是这里**唯一**会杀东西的判据；
 /// 总时长那一个数只负责在超点时登一行读数（见下）。
-// cap: bound — 静默判据的默认值：慢要等、死要立刻换通道；这是本模块唯一会杀进程的判据
+// cap: fixed — 静默判据的默认值：慢要等、死要立刻换通道；这是本模块唯一会杀进程的判据
+// keep: 删掉后静默判据没有默认值，慢的传输要么被误杀、要么死了也不换通道；由「慢要等、死要立刻换通道」兜住
 const DEFAULT_MIRROR_STALL_SECS: u64 = 180;
 /// 静默判死的下限。允许部署面调小，但不允许小到把正常传输误杀。
-// cap: bound — 静默判死的下限；部署面可调小，但不许小到把正常传输误杀
+// cap: fixed — 静默判死的下限；部署面可调小，但不许小到把正常传输误杀
+// keep: 删掉后部署可以把静默判据调到把正常传输误杀；由「不许小到误杀」兜住
 const MIRROR_STALL_FLOOR_SECS: u64 = 30;
 /// 单次 clone/fetch/push **预期**要跑多久（秒）。过了这个点登一行告警，然后继续等。
 ///
@@ -111,26 +118,32 @@ const MIRROR_STALL_FLOOR_SECS: u64 = 30;
 /// 结束」。可一个还在吐进度的传输就是在干活——按钟把它切断，作废的是已经传了一半
 /// 的对象，下一次从头再传一遍。真正说得出口的判据是**静默**（[`DEFAULT_MIRROR_STALL_SECS`]）：
 /// 没有新字节才是「没在动」。这个数现在只负责让「慢」在读数面上不隐形。
-// cap: bound — 只决定「超过多久说一声」；过点之后继续等，从不丢弃仍在跑的传输
+// cap: fixed — 只决定「超过多久说一声」；过点之后继续等，从不丢弃仍在跑的传输
+// keep: 删掉后一次大取回没有说一声的时刻，读者以为它挂了；由「过点之后继续等，不丢弃仍在跑的传输」兜住
 // wall: 等=一次镜像操作（clone/fetch）的进度 / 等不到=只发布一行「比预期慢」，**过点之后继续等**，从不丢弃仍在跑的传输 / 续跑=不适用：这一格不结束任何东西
 const DEFAULT_MIRROR_OP_TIMEOUT_SECS: u64 = 1800;
-// cap: bound — lowest the deployment may set the operation timeout to; below it a large legitimate fetch is cut
+// cap: fixed — lowest the deployment may set the operation timeout to; below it a large legitimate fetch is cut
+// keep: 删掉后部署可以把操作超时调到切断一次合法的大取回；由「低于它就切掉一次大取回」兜住
 // wall: 等=不适用——这是别人被等多久的下限 / 等不到=不适用 / 续跑=不适用：低于它的配置会把一次正常的大 fetch 砍断，所以它挡的是配置，不是一次等待
 const MIRROR_OP_TIMEOUT_FLOOR_SECS: u64 = 60;
 /// 看门狗巡检间隔的上限；实际间隔按静默窗的四分之一取（见
 /// [`GitTransport::watchdog_interval`]），这样测试里把窗口压到秒级仍然判得准。
-// cap: bound — 巡检间隔的上限；要跟着静默窗走，测试把窗压到秒级仍判得准
+// cap: fixed — 巡检间隔的上限；要跟着静默窗走，测试把窗压到秒级仍判得准
+// keep: 删掉后巡检间隔不跟静默窗走，测试把窗压到秒级时判不准；由「要跟着静默窗走」兜住
 const MIRROR_WATCHDOG_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 /// 巡检间隔的下限：静默窗压到毫秒级（测试）时，别让巡检变成忙等。
-// cap: bound — 巡检间隔的下限；静默窗压到毫秒级（测试）时别让巡检变成忙等
+// cap: fixed — 巡检间隔的下限；静默窗压到毫秒级（测试）时别让巡检变成忙等
+// keep: 删掉后静默窗压到毫秒级时巡检变成忙等；由「别让巡检变成忙等」兜住
 const MIRROR_WATCHDOG_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 /// 失败信息里保留的 stderr 尾巴长度：传输失败的**原因在最后几行**，而前几千行
 /// 是进度刷屏。留尾部才留得住原因，同时也别让一条日志带上几 MB。
-// cap: bound — 只留尾部才留得住原因，同时别让一条日志带上几 MB
+// cap: fixed — 只留尾部才留得住原因，同时别让一条日志带上几 MB
+// keep: 删掉后回到「只留尾部才留得住原因，同时别让一条日志带上几 MB」所描述的情形；由这条约定兜住
 const STDERR_TAIL_CHARS: usize = 600;
 /// 临时物/锁的清理门槛下限：比这新的东西可能是**活着的**传输手里的
 /// （进度秒级更新、锁活不过一次请求），只有明显陈旧才是死进程的遗物。
-// cap: bound — 残留对象多旧才算死进程的遗物；只有明显陈旧才是遗物
+// cap: fixed — 残留对象多旧才算死进程的遗物；只有明显陈旧才是遗物
+// keep: 删掉后刚起的残留对象被当成死进程遗物清掉，正在跑的传输被打断；由「只有明显陈旧才是遗物」兜住
 const RESIDUE_MIN_AGE_SECS: u64 = 60;
 
 /// 兜底路径的部署配置。全部来自环境变量，未配置私钥即视为**未启用**。
@@ -555,7 +568,7 @@ impl GitTransport {
             force,
         };
         tokio::spawn(async move {
-            let _ = tx.send(work.run().await);
+            cog_core::ignore_lost!(tx.send(work.run().await));
         });
         // 调用者走掉就是走掉：接收端被丢弃，发送失败被忽略，任务照跑。
         rx.await
@@ -683,8 +696,8 @@ impl GitTransport {
         if let Some(mut stdin) = child.stdin.take() {
             let body = body.to_vec();
             tokio::spawn(async move {
-                let _ = stdin.write_all(&body).await;
-                let _ = stdin.shutdown().await;
+                cog_core::ignore_lost!(stdin.write_all(&body).await);
+                cog_core::ignore_lost!(stdin.shutdown().await);
             });
         }
         let out = child.wait_with_output().await.map_err(|e| {
@@ -906,12 +919,16 @@ impl GitExec {
             Err(reason) => {
                 kill_group(pid);
                 group.disarm();
-                let _ = tokio::time::timeout(WATCHDOG_REAP_TIMEOUT, &mut wait_task).await;
+                // wall: 等=已判超时的传输进程收尾 / 等不到=丢下它，按超时记账 / 续跑=能，下一次取
+                cog_core::ignore_lost!(
+                    tokio::time::timeout(WATCHDOG_REAP_TIMEOUT, &mut wait_task).await
+                );
+                // wall: 等=已判超时的传输进程收尾 / 等不到=丢下它，按超时记账 / 续跑=能，下一次取
                 let tail = tokio::time::timeout(WATCHDOG_REAP_TIMEOUT, err_task)
                     .await
                     .ok()
                     .and_then(Result::ok)
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 return Err(format!(
                     "{reason}，耗时 {}s{}",
                     elapsed_secs(started),
@@ -922,15 +939,22 @@ impl GitExec {
 
         Ok(std::process::Output {
             status,
-            stdout: out_task.await.unwrap_or_default(),
-            stderr: err_task.await.unwrap_or_default(),
+            stdout: out_task.await.unwrap_or_else(|err| {
+                tracing::warn!(error = ?err, "读取标准输出的任务没有正常结束，按空输出继续");
+                Default::default()
+            }),
+            stderr: err_task.await.unwrap_or_else(|err| {
+                tracing::warn!(error = ?err, "读取标准错误的没有正常结束，按空输出继续");
+                Default::default()
+            }),
         })
     }
 }
 
 /// 超时后等被杀的进程/读取任务收尾的上限。杀的是整个进程组，正常情况下管道
 /// 立刻断开；给个上限只为不让"已判定超时"的路径自己再挂住。
-// cap: bound — 收尾等待的上限，只为不让已判超时的路径自己再挂住
+// cap: fixed — 收尾等待的上限，只为不让已判超时的路径自己再挂住
+// keep: 删掉后已判超时的路径在收尾时自己再挂住；由「只为不让已判超时的路径挂住」兜住
 // wall: 等=看门狗把已经判超时的那个进程收掉 / 等不到=这一条路径不再等它，进程交给运行时的回收；已经发出的那一行判词不变 / 续跑=不适用：收尾只做一次
 const WATCHDOG_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -1180,7 +1204,7 @@ fn residue_max_age_for(cfg: &GitMirrorConfig) -> std::time::Duration {
 
 async fn read_all(mut r: impl tokio::io::AsyncRead + Unpin) -> Vec<u8> {
     let mut out = Vec::new();
-    let _ = r.read_to_end(&mut out).await;
+    cog_core::ignore_lost!(r.read_to_end(&mut out).await);
     out
 }
 
@@ -1344,7 +1368,12 @@ fn head_is_dangling(dir: &Path) -> bool {
     if dir.join(target).is_file() {
         return false;
     }
-    let packed = std::fs::read_to_string(dir.join("packed-refs")).unwrap_or_default();
+    let packed = std::fs::read_to_string(dir.join("packed-refs"))
+        .map_err(|e| e.to_string())
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "读取不到 packed-refs，按空文本继续");
+            String::new()
+        });
     let needle = format!(" {target}");
     !packed.lines().any(|l| l.ends_with(&needle))
 }
@@ -1708,7 +1737,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            cog_core::ignore_lost!(axum::serve(listener, app).await);
         });
         let url = format!("http://127.0.0.1:{port}/local/repo.git");
 
@@ -1836,6 +1865,7 @@ mod tests {
     /// 一起带走"——按乐观值定界（原来这里是 5 秒、另一处根本没等），只会把
     /// "机器被压满时调度慢"读成"缺陷"：实测全量并行跑会红、单独跑 6/6 绿。
     // cap: fixed — 夹具等的是「另一个进程把自己写进文件」。它不是判据的界，而是一个
+    // keep: 删掉后夹具等另一个进程写文件的窗口没有上界，测试挂死；由「它不是判据的界，是夹具的等待」兜住
     // 富余量：孙进程本该活 300 秒，任何远小于它的界都照样能判出「没被一起带走」。
     // 30 秒在整门满载（24 核跑满、建进程本身要几十秒）时实测会红，所以放宽到 60：
     // 这一格宁可在真出问题时多等半分钟，也不要把机器的负载读成缺陷。
@@ -1923,7 +1953,7 @@ mod tests {
                         .collect::<Vec<_>>()
                         .join(" ")
                 })
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             out.push(format!(
                 "pid={pid} state={state} ppid={ppid} comm={comm} cmd={cmd}"
             ));
@@ -2165,7 +2195,7 @@ mod tests {
         );
 
         task.abort();
-        let _ = task.await;
+        cog_core::ignore_lost!(task.await);
 
         wait_until_group_empty(leader).await;
         assert!(
@@ -2208,7 +2238,7 @@ mod tests {
             // 让 clone 真的跑起来，再把调用者撤掉。
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             caller.abort();
-            let _ = caller.await;
+            cog_core::ignore_lost!(caller.await);
 
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while !t.is_fresh(&dir) && std::time::Instant::now() < deadline {

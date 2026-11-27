@@ -53,7 +53,8 @@ pub struct PolicyEvolutionConfig {
 
 // 四十次：一次比较要看出两个策略的差别，样本低于这个数时胜出者可能只是运气；
 // 部署上这个数经常攒不满，所以它是「能不能下结论」的门，不是「等到攒满」的期限。
-// cap: bound — 四十次：低于它胜出者可能只是运气，它决定能不能下结论
+// cap: fixed — 四十次：低于它胜出者可能只是运气，它决定能不能下结论
+// keep: 删掉后几轮试验就敢说胜出，结论可能只是运气；由「低于四十次结论下不了」兜住
 const POLICY_MIN_TRIALS: usize = 40;
 
 impl Default for PolicyEvolutionConfig {

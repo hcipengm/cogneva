@@ -26,6 +26,7 @@ use cog_core::{SFError, SFResult};
 /// store splits them off on write and puts them back on read, so a caller still
 /// sees the map it wrote.
 pub const RELATION_FROM_KEY: &str = "from";
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 pub const RELATION_TO_KEY: &str = "to";
 pub const RELATION_TYPE_KEY: &str = "relation_type";
 
@@ -68,6 +69,14 @@ CREATE TABLE IF NOT EXISTS schema_entries (
     last_seen         TIMESTAMPTZ,
     retrieval_count   BIGINT      NOT NULL DEFAULT 0,
     last_retrieved_at TIMESTAMPTZ
+);
+-- 删之前的那一份副本：整行 row_to_json 的文本，按 (id, namespace) 一条。
+-- 事实面只有一种删法——写副本、读回来逐字节比、然后才删；这张表自己不删。
+CREATE TABLE IF NOT EXISTS schema_entries_archive (
+    id          TEXT        NOT NULL,
+    namespace   TEXT        NOT NULL,
+    body        TEXT        NOT NULL,
+    archived_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 ALTER TABLE schema_entries ADD COLUMN IF NOT EXISTS observed_by TEXT[] NOT NULL DEFAULT '{}';
 ALTER TABLE schema_entries ADD COLUMN IF NOT EXISTS occurrences BIGINT NOT NULL DEFAULT 1;
@@ -254,7 +263,10 @@ impl PostgresSchemaBackend {
     fn split_relation_keys(
         properties: &serde_json::Value,
     ) -> (String, Option<String>, Option<String>, Option<String>) {
-        let mut document = properties.as_object().cloned().unwrap_or_default();
+        let mut document = properties
+            .as_object()
+            .cloned()
+            .unwrap_or(Default::default());
         let mut take = |key: &str| {
             document
                 .remove(key)
@@ -378,6 +390,51 @@ fn parse_schema_kind(s: &str) -> SFResult<SchemaKind> {
     // second time, and a word added to the enum but not here would have read as
     // "unknown kind" on rows the writer had just stored.
     SchemaKind::parse(s).ok_or_else(|| SFError::Agent(format!("unknown schema kind: {s}")))
+}
+
+/// 删之前先写一份读得回来的副本，读回来逐字节比，然后才删。两条删路径（最后一位
+/// 观察者被摘掉、显式删一条）共用这一处：两份写法分家时，其中一条会漏掉副本，
+/// 而漏掉的那条看起来与「这张表本来就没有这一行」一模一样。
+async fn archive_and_delete(
+    conn: &mut sqlx::PgConnection,
+    namespace: &str,
+    id: &str,
+) -> SFResult<()> {
+    let body: Option<String> = sqlx::query_scalar(
+        "SELECT row_to_json(t)::text FROM schema_entries t \
+          WHERE namespace = $1 AND id = $2",
+    )
+    .bind(namespace)
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| SFError::Agent(format!("archive_and_delete read: {e}")))?;
+    let Some(body) = body else {
+        return Ok(());
+    };
+    sqlx::query("INSERT INTO schema_entries_archive (id, namespace, body) VALUES ($1, $2, $3)")
+        .bind(id)
+        .bind(namespace)
+        .bind(&body)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| SFError::Agent(format!("archive_and_delete archive: {e}")))?;
+    let back: String = sqlx::query_scalar(
+        "SELECT body FROM schema_entries_archive WHERE id = $1 AND namespace = $2",
+    )
+    .bind(id)
+    .bind(namespace)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| SFError::Agent(format!("archive_and_delete read-back: {e}")))?;
+    crate::deletion::deletion_is_allowed(back == body)?;
+    sqlx::query("DELETE FROM schema_entries WHERE namespace = $1 AND id = $2")
+        .bind(namespace)
+        .bind(id)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| SFError::Agent(format!("archive_and_delete delete: {e}")))?;
+    Ok(())
 }
 
 #[async_trait]
@@ -611,14 +668,7 @@ impl SchemaBackend for PostgresSchemaBackend {
                 })?;
             }
             None => {
-                sqlx::query("DELETE FROM schema_entries WHERE namespace = $1 AND id = $2")
-                    .bind(namespace)
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| {
-                        SFError::Agent(format!("forget_schema_source delete failed: {}", e))
-                    })?;
+                archive_and_delete(&mut tx, namespace, id).await?;
             }
         }
         tx.commit()
@@ -643,12 +693,15 @@ impl SchemaBackend for PostgresSchemaBackend {
     }
 
     async fn delete_schema(&self, namespace: &str, id: &str) -> SFResult<()> {
-        sqlx::query("DELETE FROM schema_entries WHERE namespace = $1 AND id = $2")
-            .bind(namespace)
-            .bind(id)
-            .execute(&self.pool)
+        let mut tx = self
+            .pool
+            .begin()
             .await
-            .map_err(|e| SFError::Agent(format!("delete_schema failed: {}", e)))?;
+            .map_err(|e| SFError::Agent(format!("delete_schema begin: {e}")))?;
+        archive_and_delete(&mut tx, namespace, id).await?;
+        tx.commit()
+            .await
+            .map_err(|e| SFError::Agent(format!("delete_schema commit: {e}")))?;
         Ok(())
     }
 

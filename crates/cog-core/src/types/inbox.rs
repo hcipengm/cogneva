@@ -31,6 +31,13 @@ pub enum InboxMessage {
         /// 不带这个键的老消息照旧解析——线上已有的条目不能因为加一列就读不回来。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_agent: Option<String>,
+        /// 这条消息本身是哪一句意图（`colleague_intent_identity`）。
+        ///
+        /// 收件人跑起来之后派出去的活要答得出「这是谁让我做的」；身份随消息走，
+        /// 而不是让收件人按时间或原文再去猜一条。缺省、不带这个键的老消息照旧
+        /// 解析——线上已有的条目不能因为加一列就读不回来。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        intent: Option<String>,
     },
     /// Continue the current conversation with additional instruction.
     Continue {
@@ -106,6 +113,7 @@ mod tests {
             goal: serde_json::json!("run the tests"),
             reply_stream: None,
             from_agent: None,
+            intent: None,
         };
         let wire = serde_json::to_value(&nameless).expect("serializes");
         assert!(

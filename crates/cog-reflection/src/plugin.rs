@@ -22,7 +22,8 @@ pub const LEARNING_REVIEW_LOOP: &str = "reflection_learning_review";
 /// 放过它，而下一次重启也许要几天之后——中间这段时间里，那行既没人等、也没人清。
 pub const PROMOTION_EVAL_SWEEP_LOOP: &str = "reflection_promotion_eval_sweep";
 /// 这一趟多久走一次。
-// cap: bound — 等待上限是一小时，收一行迟到十分钟没有代价；跑得更勤快不了任何事
+// cap: fixed — 等待上限是一小时，收一行迟到十分钟没有代价；跑得更勤快不了任何事
+// keep: 删掉后清扫比等待上限还密，跑的更勤快不了任何事只占 CPU；由「等待上限一小时」兜住
 pub const PROMOTION_EVAL_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 /// Loop name reported through the background-loop liveness family.
 pub const SKILL_EFFECTIVENESS_LOOP: &str = "reflection_skill_effectiveness";
@@ -399,7 +400,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                         let shutdown = shutdown.clone();
                         let mut rx = broadcast_tx.0.subscribe();
                         tokio::spawn(async move {
-                            let _ = rx.recv().await;
+                            cog_core::ignore_lost!(rx.recv().await);
                             shutdown.trigger();
                         });
                     }
@@ -1100,10 +1101,6 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                         }
                         let reporter = crate::PromotionTrendReporter::new(
                             ledger.clone(),
-                            std::path::PathBuf::from(format!(
-                                "{}/reports",
-                                ctx.config().app.data_dir
-                            )),
                             std::time::Duration::from_secs(promotion.trend_report_interval_secs),
                             audit_stream.clone(),
                             alert_sink,
@@ -1133,8 +1130,8 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {
                         let mut rx = broadcast_tx.0.subscribe();
                         tokio::spawn(async move {
-                            let _ = rx.recv().await;
-                            let _ = shutdown_tx.send(true);
+                            cog_core::ignore_lost!(rx.recv().await);
+                            cog_core::ignore_lost!(shutdown_tx.send(true));
                         });
                     }
                     info!("Promotion trend reporter enabled");
@@ -1196,7 +1193,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                             let shutdown = puller_shutdown.clone();
                             let mut rx = broadcast_tx.0.subscribe();
                             tokio::spawn(async move {
-                                let _ = rx.recv().await;
+                                cog_core::ignore_lost!(rx.recv().await);
                                 shutdown.trigger();
                             });
                         }
@@ -1516,7 +1513,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 let sweep_shutdown = sweep_shutdown.clone();
                 let mut rx = broadcast_tx.0.subscribe();
                 tokio::spawn(async move {
-                    let _ = rx.recv().await;
+                    cog_core::ignore_lost!(rx.recv().await);
                     sweep_shutdown.trigger();
                 });
             }
@@ -1562,7 +1559,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 let shutdown = shutdown.clone();
                 let mut rx = broadcast_tx.0.subscribe();
                 tokio::spawn(async move {
-                    let _ = rx.recv().await;
+                    cog_core::ignore_lost!(rx.recv().await);
                     shutdown.trigger();
                 });
             }
@@ -1582,7 +1579,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             // 由持有库的插件一同发布，所以两半要么都在、要么都不在；只到一半时
             // 通道关掉而不是读了不写——读了不写会让同一批话每拍被派一次。
             let intent_reader = ctx.consume_service::<dyn cog_core::IntentReader>();
-            let intent_writer = ctx.consume_service::<dyn cog_core::IntentEvents>();
+            let intent_writer = ctx.consume_service::<dyn cog_core::EventStore>();
             if intent_reader.is_none() || intent_writer.is_none() {
                 info!("signal watcher: no chat intent store; intent channel off");
             }
@@ -1612,7 +1609,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     let shutdown = shutdown.clone();
                     let mut rx = broadcast_tx.0.subscribe();
                     tokio::spawn(async move {
-                        let _ = rx.recv().await;
+                        cog_core::ignore_lost!(rx.recv().await);
                         shutdown.trigger();
                     });
                 }
@@ -1651,7 +1648,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 let shutdown = shutdown.clone();
                 let mut rx = broadcast_tx.0.subscribe();
                 tokio::spawn(async move {
-                    let _ = rx.recv().await;
+                    cog_core::ignore_lost!(rx.recv().await);
                     shutdown.trigger();
                 });
             }
@@ -1718,7 +1715,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 let shutdown = shutdown.clone();
                 let mut rx = broadcast_tx.0.subscribe();
                 tokio::spawn(async move {
-                    let _ = rx.recv().await;
+                    cog_core::ignore_lost!(rx.recv().await);
                     shutdown.trigger();
                 });
             }
@@ -1743,7 +1740,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 let shutdown = shutdown.clone();
                 let mut rx = broadcast_tx.0.subscribe();
                 tokio::spawn(async move {
-                    let _ = rx.recv().await;
+                    cog_core::ignore_lost!(rx.recv().await);
                     shutdown.trigger();
                 });
             }
@@ -1793,7 +1790,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 let shutdown = shutdown.clone();
                 let mut rx = broadcast_tx.0.subscribe();
                 tokio::spawn(async move {
-                    let _ = rx.recv().await;
+                    cog_core::ignore_lost!(rx.recv().await);
                     shutdown.trigger();
                 });
             }
@@ -1891,7 +1888,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     let shutdown = shutdown.clone();
                     let mut rx = broadcast_tx.0.subscribe();
                     tokio::spawn(async move {
-                        let _ = rx.recv().await;
+                        cog_core::ignore_lost!(rx.recv().await);
                         shutdown.trigger();
                     });
                 }
@@ -1998,7 +1995,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 let shutdown = shutdown.clone();
                 let mut rx = broadcast_tx.0.subscribe();
                 tokio::spawn(async move {
-                    let _ = rx.recv().await;
+                    cog_core::ignore_lost!(rx.recv().await);
                     shutdown.trigger();
                 });
             }
@@ -2117,7 +2114,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             let shutdown = shutdown.clone();
             let mut rx = broadcast_tx.0.subscribe();
             tokio::spawn(async move {
-                let _ = rx.recv().await;
+                cog_core::ignore_lost!(rx.recv().await);
                 shutdown.trigger();
             });
         }
@@ -2243,7 +2240,8 @@ fn spawn_skill_effectiveness_loop(
 /// 取负数是刻意的：这个平台上有两档已经用掉了 0 与 1——变更派发器的地板是 0，
 /// `Task::new` 的默认是 1——而探针要比**这两档都低**。用一个负数表达「比所有
 /// 落地的活儿都低」，就不会在下一档工作下沉到 0 时再次与探针打平。
-// cap: bound — 比派发变更（0）与默认工作（1）都低一档：探针只在没有别的活儿时跑
+// cap: fixed — 比派发变更（0）与默认工作（1）都低一档：探针只在没有别的活儿时跑
+// keep: 删掉后探针与默认工作同档，有别的活儿时也抢着跑；由「只在没有别的活儿时跑」兜住
 pub const PROBE_PRIORITY: i32 = -1;
 
 /// 一条探针怎么变成任务图里的一行。
@@ -2498,7 +2496,8 @@ fn outcome_deadline(declared_secs: u64, period: std::time::Duration) -> std::tim
 
 /// 执行契约之外多等几轮。见 `outcome_deadline`：它是一段**没有声明**的排队时间
 /// 的覆盖位，所以是一个标了来源的数，而不是一条实测出来的界。
-// cap: bound — 是 outcome_deadline 那段没有声明的排队时间的覆盖位，所以标来源而不是实测
+// cap: fixed — 是 outcome_deadline 那段没有声明的排队时间的覆盖位，所以标来源而不是实测
+// keep: 删掉后回到「是 outcome_deadline 那段没有声明的排队时间的覆盖位，所以标来源而不是实测」所描述的情形；由这条约定兜住
 const OUTCOME_QUEUE_MARGIN_ROUNDS: u32 = 3;
 
 /// 一条探针的执行契约（秒）：`Task::new` 给每一条任务写的 `declared_duration_seconds`。
@@ -2508,6 +2507,7 @@ const OUTCOME_QUEUE_MARGIN_ROUNDS: u32 = 3;
 /// `Task::new` 里：`discovery_probe_declares_the_contract_its_round_is_sized_from`
 /// 那条测试盯着两处一致，那边改了而这里没跟，它会红。
 // cap: fixed — 直接读 `Task::new` 写进去的那个名字，两处不再是两个数
+// not-a-bound: 直接读 `Task::new` 写进去的那个名字，两处不再是两个数
 const DISCOVERY_PROBE_CONTRACT_SECS: u64 = cog_core::types::task::DEFAULT_DECLARED_DURATION_SECS;
 
 /// 一轮最多能把多久花在「开始新的交接」上。
@@ -3608,6 +3608,7 @@ async fn merge_verification_inputs(
         let already_queued = changes.iter().any(|c| c.artifact_id == change.change_id);
         if !already_queued {
             changes.push(crate::types::EvolutionResult {
+                unit_of_work: None,
                 kind: crate::types::EvolutionKind::CodeChange,
                 artifact_id: change.change_id.clone(),
                 description: change.goal.clone(),
@@ -3657,7 +3658,9 @@ async fn merge_verification_inputs(
                 // 拒绝要按判据与文件归档，而重新读一遍同一条规则正是这两者与
                 // 判词开始各说各话的方式。连路径都读不出来的 diff 保留拒绝本身，
                 // 只丢掉名字。
-                let files = landing.contribution_refusal_paths(diff).unwrap_or_default();
+                let files = landing
+                    .contribution_refusal_paths(diff)
+                    .unwrap_or(Default::default());
                 // 记录不留给这一轮的落地：这条变更不会落地。真正的收口（两份载体
                 // 一起退休）由调用方做，见 `run_evolution_cycle_in`。
                 recorded.remove(&change.artifact_id);
@@ -3707,7 +3710,7 @@ async fn fail_and_retire_change(
             change_id = %change_id,
             "A change was retired without a refusal cause; its record cannot be counted by criterion"
         );
-        let _ = engine.record_change_outcome(change_id, false, reason).await;
+        cog_core::ignore_lost!(engine.record_change_outcome(change_id, false, reason).await);
     }
     retire_change_everywhere(
         pipeline,
@@ -5131,6 +5134,7 @@ mod tests {
 
     fn generated(id: &str, goal: &str) -> cog_core::GeneratedChange {
         cog_core::GeneratedChange {
+            unit_of_work: None,
             change_id: id.into(),
             goal: goal.into(),
             content: "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n".into(),
@@ -5147,6 +5151,7 @@ mod tests {
 
     fn queued(id: &str, description: &str) -> crate::types::EvolutionResult {
         crate::types::EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: id.into(),
             description: description.into(),
@@ -5418,6 +5423,7 @@ mod tests {
         let pipeline = crate::change_pipeline::test_pipeline(temp.path(), &change_dir, true);
         pipeline
             .write_change_record(&crate::types::EvolutionResult {
+                unit_of_work: None,
                 kind: crate::types::EvolutionKind::CodeChange,
                 artifact_id: "chg-1".to_string(),
                 description: "goal".to_string(),
@@ -5521,6 +5527,7 @@ mod tests {
         let pipeline = crate::change_pipeline::test_pipeline(temp.path(), &change_dir, true);
         pipeline
             .write_change_record(&crate::types::EvolutionResult {
+                unit_of_work: None,
                 kind: crate::types::EvolutionKind::CodeChange,
                 artifact_id: "chg-1".to_string(),
                 description: "goal from the record".to_string(),

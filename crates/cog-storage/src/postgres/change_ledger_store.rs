@@ -106,24 +106,36 @@ const WRITE_WINDOW_COLUMNS_SQL: &str = "SELECT window_id, path_scope, writer, ap
 /// The bounds are the narrower dialect's (MySQL cannot key an unbounded TEXT
 /// column), so one set governs both. Widths are counted in characters, which is
 /// what both dialects' VARCHAR lengths mean.
-// cap: bound — 取的是更窄那个方言的宽度（MySQL 不能给无界 TEXT 建键），一套管两边
+// cap: fixed — 取的是更窄那个方言的宽度（MySQL 不能给无界 TEXT 建键），一套管两边
+// not-a-bound: 取的是更窄那个方言的宽度（MySQL 不能给无界 TEXT 建键），一套管两边
 const KIND_MAX: usize = 32;
-// cap: bound — the identity's scope column width, pinned by the narrower dialect's index limit
+// cap: fixed — the identity's scope column width, pinned by the narrower dialect's index limit
+// keep: 删掉后 scope 列超出较窄方言的索引上限，建索引失败；由「较窄方言的索引上限」兜住
 const SCOPE_MAX: usize = 191;
-// cap: bound — the identity's literal column width, a schema limit shared by both dialects
+// cap: fixed — the identity's literal column width, a schema limit shared by both dialects
+// keep: 删掉后 literal 列在两种方言之间一半能写一半被拒；由「两种方言共用的 schema 上限」兜住
 const LITERAL_MAX: usize = 512;
-// cap: bound — a writer-side cap on one citation's document; the citations live in change_ledger_sources
+// cap: fixed — a writer-side cap on one citation's document; the citations live in change_ledger_sources
+// keep: 删掉后回到「a writer-side cap on one citation's document; the citations live in change_ledger_sources」所描述的情形；由这条约定兜住
 const DOC_MAX: usize = 512;
 
 /// PostgreSQL change ledger store.
 #[derive(Clone)]
 pub struct PostgresChangeLedgerStore {
     pool: PgPool,
+    /// 事件流的写口；没接上时只写表（读切换之前两者并存）。
+    events: Option<std::sync::Arc<dyn cog_core::EventStore>>,
 }
 
 impl PostgresChangeLedgerStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self { pool, events: None }
+    }
+
+    /// 接上事件流：每一次测量同时落一条事实，账本行成为它的投影。
+    pub fn with_events(mut self, events: std::sync::Arc<dyn cog_core::EventStore>) -> Self {
+        self.events = Some(events);
+        self
     }
 
     /// A row as callers see it, or why it cannot be one.
@@ -951,6 +963,40 @@ async fn write_reading(
     Ok(())
 }
 
+impl PostgresChangeLedgerStore {
+    /// 把一次 reading 落成一条 `change_declared` 事实。
+    ///
+    /// 先写事实、再写行：中途断掉时留下的是「事实在、行没有」，重建读得回来；反过来
+    /// 留下的是「行在、事实没有」，那一行的 title／assertion 就只剩表里这一份。
+    /// 没接事件写口时只写行——读切换之前两者并存。
+    async fn append_declared(
+        &self,
+        reading: &ChangeReading,
+        first_seen_rev: Option<&str>,
+    ) -> SFResult<()> {
+        let Some(events) = self.events.as_ref() else {
+            return Ok(());
+        };
+        let mut event = cog_core::FactEvent::new(cog_core::EventPayload::ChangeDeclared {
+            kind: reading.identity.kind.clone(),
+            scope: reading.identity.scope.clone(),
+            literal: reading.identity.literal.clone(),
+            title: reading.title.clone(),
+            assertion: reading.assertion.clone(),
+            doc: reading.source.doc.clone(),
+            verdict: reading.source.verdict.clone(),
+            priority: reading.source.priority.as_str().to_string(),
+            block: reading.source.block.as_str().to_string(),
+            first_seen_rev: first_seen_rev.map(str::to_string),
+        });
+        event.at = None;
+        events
+            .append(event)
+            .await
+            .map_err(|e| SFError::Database(format!("declare {}: {e}", reading.identity.as_key())))
+    }
+}
+
 #[async_trait]
 impl ChangeLedgerStore for PostgresChangeLedgerStore {
     async fn record_readings(
@@ -961,6 +1007,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         let mut stored = 0usize;
         for reading in readings {
             check_reading(reading).map_err(SFError::Validation)?;
+            self.append_declared(reading, first_seen_rev).await?;
             // 台账行、它的引用、以及从引用重算出的两个排序值，要么一起进库，要么
             // 一起不进：分开提交会留下一行「引用已写、排序值还是默认」的台账，而
             // 那正是取批次的顺序所读的两格。
@@ -1038,6 +1085,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // other order would drop the change instead, and nothing would say so.
         for reading in &readings {
             check_reading(reading).map_err(SFError::Validation)?;
+            self.append_declared(reading, first_seen_rev).await?;
             write_reading(&mut tx, reading, first_seen_rev).await?;
         }
 
@@ -1194,6 +1242,23 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                     measurement.identity.as_key()
                 ))
             })?;
+        if let Some(events) = self.events.as_ref() {
+            let mut event = cog_core::FactEvent::new(cog_core::EventPayload::ChangeJudged {
+                kind: measurement.identity.kind.clone(),
+                scope: measurement.identity.scope.clone(),
+                literal: measurement.identity.literal.clone(),
+                state: measurement.state.as_str().to_string(),
+                measured_rev: measurement.measured_rev.clone(),
+                retire_reason: measurement.retire_reason.map(|r| r.as_str().to_string()),
+                unsettled_reason: measurement.unsettled_reason.clone(),
+                parent_observation: measurement.parent_observation.clone(),
+            });
+            event.at = Some(chrono::Utc::now());
+            events
+                .append(event)
+                .await
+                .map_err(|e| SFError::Database(format!("change judged fact: {e}")))?;
+        }
         Ok(())
     }
 
@@ -1743,6 +1808,19 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             .execute(&self.pool)
             .await
             .map_err(|e| SFError::Database(format!("record delivery: {e}")))?;
+        if let Some(events) = self.events.as_ref() {
+            let mut event = cog_core::FactEvent::new(cog_core::EventPayload::ChangeDelivered {
+                kind: identity.kind.clone(),
+                scope: identity.scope.clone(),
+                literal: identity.literal.clone(),
+                rev: rev.to_string(),
+            });
+            event.at = Some(chrono::Utc::now());
+            events
+                .append(event)
+                .await
+                .map_err(|e| SFError::Database(format!("change delivered fact: {e}")))?;
+        }
         Ok(())
     }
 
@@ -2626,4 +2704,502 @@ mod templates {
              that has moved on reads as work still waiting: {wait}"
         );
     }
+}
+
+/// 一行变更账从事实折出来的样子：重建写回的是它，逐行比对读的也是它。
+///
+/// 一次折叠只有一份实现：重建若自己再折一遍，「表与流相等」这件事会有两个口径，
+/// 而两个口径相等的唯一时间点是它们刚好都没改过。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FoldedChangeAccount {
+    pub state: String,
+    pub measured_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub measured_rev: Option<String>,
+    pub retire_reason: Option<String>,
+    pub unsettled_reason: Option<String>,
+    pub parent_observation: Option<String>,
+    pub delivered_rev: Option<String>,
+    pub title: Option<String>,
+    pub assertion: Option<String>,
+    pub first_seen_rev: Option<String>,
+    /// 引用：doc → 那份文档说的是什么。
+    pub sources: std::collections::BTreeMap<String, FoldedCitation>,
+    /// 折到流上的哪个位置：这一行读到的最深一条事实的 `seq`。0 是「还没有人折过它」。
+    pub as_of_seq: i64,
+}
+
+/// 一条引用：哪份文档、它当时的判决、要求的档与面。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FoldedCitation {
+    pub verdict: Option<String>,
+    pub priority: String,
+    pub block: String,
+}
+
+/// 从流折出整本变更账：判定（最后一条）、交付（最后一条）、声明（title／assertion
+/// 与每条引用各取最后一次说法）。
+pub async fn fold_change_account(
+    pool: &sqlx::PgPool,
+) -> SFResult<std::collections::BTreeMap<String, FoldedChangeAccount>> {
+    fold_change_account_from(
+        pool,
+        &std::collections::BTreeMap::new(),
+        &std::collections::BTreeMap::new(),
+    )
+    .await
+}
+
+/// 同 [`fold_change_account`]，但从一张已有的账与每一行的水位出发：只折水位之后的
+/// 事实，水位之前的那些格子由 `seed` 带进来。
+///
+/// 增量与全量共用这一份折叠：两份折法「相等」的时机只有它们刚好都没改过。
+pub async fn fold_change_account_from(
+    pool: &sqlx::PgPool,
+    since: &std::collections::BTreeMap<String, i64>,
+    seed: &std::collections::BTreeMap<String, FoldedChangeAccount>,
+) -> SFResult<std::collections::BTreeMap<String, FoldedChangeAccount>> {
+    use std::collections::BTreeMap;
+    let mut account: BTreeMap<String, FoldedChangeAccount> = seed.clone();
+    let newer = |identity: &String, seq: i64| -> bool {
+        since
+            .get(identity)
+            .map(|floor| seq > *floor)
+            .unwrap_or(true)
+    };
+
+    let judgements: Vec<(String, chrono::DateTime<chrono::Utc>, i64, String)> = sqlx::query_as(
+        "SELECT subject_id, at, seq, attributes FROM cogneva_event \
+          WHERE kind = 'change_judged' ORDER BY seq",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| SFError::Database(format!("read change judgements: {e}")))?;
+    for (identity, at, seq, attributes) in judgements {
+        if !newer(&identity, seq) {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&attributes) else {
+            continue;
+        };
+        let text = |key: &str| {
+            value
+                .get(key)
+                .and_then(|found| found.as_str())
+                .map(str::to_string)
+        };
+        let Some(state) = text("state") else { continue };
+        let entry = account.entry(identity).or_default();
+        entry.state = state;
+        entry.measured_at = Some(at);
+        entry.as_of_seq = entry.as_of_seq.max(seq);
+        entry.measured_rev = text("measured_rev");
+        entry.retire_reason = text("retire_reason");
+        entry.unsettled_reason = text("unsettled_reason");
+        entry.parent_observation = text("parent_observation");
+    }
+
+    let declarations: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT subject_id, seq, attributes FROM cogneva_event \
+          WHERE kind = 'change_declared' ORDER BY seq",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| SFError::Database(format!("read change declarations: {e}")))?;
+    for (identity, seq, attributes) in declarations {
+        if !newer(&identity, seq) {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&attributes) else {
+            continue;
+        };
+        let text = |key: &str| {
+            value
+                .get(key)
+                .and_then(|found| found.as_str())
+                .map(str::to_string)
+        };
+        let entry = account
+            .entry(identity)
+            .or_insert_with(|| FoldedChangeAccount {
+                state: cog_core::ChangeState::Pending.as_str().to_string(),
+                ..Default::default()
+            });
+        entry.as_of_seq = entry.as_of_seq.max(seq);
+        if let Some(title) = text("title") {
+            entry.title = Some(title);
+        }
+        if let Some(assertion) = text("assertion") {
+            entry.assertion = Some(assertion);
+        }
+        if entry.first_seen_rev.is_none() {
+            entry.first_seen_rev = text("first_seen_rev");
+        }
+        if let (Some(doc), Some(priority), Some(block)) =
+            (text("doc"), text("priority"), text("block"))
+        {
+            entry.sources.insert(
+                doc,
+                FoldedCitation {
+                    verdict: text("verdict"),
+                    priority,
+                    block,
+                },
+            );
+        }
+    }
+
+    let deliveries: Vec<(String, i64, Option<String>)> = sqlx::query_as(
+        "SELECT subject_id, seq, attributes::jsonb ->> 'rev' FROM cogneva_event \
+          WHERE kind = 'change_delivered' ORDER BY seq",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| SFError::Database(format!("read change deliveries: {e}")))?;
+    for (identity, seq, rev) in deliveries {
+        if !newer(&identity, seq) {
+            continue;
+        }
+        let entry = account.entry(identity).or_default();
+        entry.as_of_seq = entry.as_of_seq.max(seq);
+        if let Some(rev) = rev {
+            entry.delivered_rev = Some(rev);
+        }
+    }
+    // 只有交付事实的身份没有状态可言：它的状态就是「还没有人判过它」——表里的默认
+    // 也是这一格。留一个空串写回去，那一行会读成一个谁也不认识的状态。
+    for row in account.values_mut() {
+        if row.state.is_empty() {
+            row.state = cog_core::ChangeState::Pending.as_str().to_string();
+        }
+    }
+    Ok(account)
+}
+
+/// 从流重建变更账：每个身份取最后一条 `change_judged`／`change_declared`／
+/// `change_delivered`，写回账本行与它的引用。
+///
+/// 账本行是这些事实的投影；测量与声明写表的同时写流，删掉表这一条把它拼回来。
+pub(crate) async fn rebuild_from_events(pool: &sqlx::PgPool) -> SFResult<u64> {
+    let account = fold_change_account(pool).await?;
+    if account.is_empty() {
+        return Ok(0);
+    }
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| SFError::Database(format!("begin change rebuild: {e}")))?;
+    for (identity, row) in &account {
+        write_account(&mut tx, identity, row).await?;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| SFError::Database(format!("commit change rebuild: {e}")))?;
+    Ok(account.len() as u64)
+}
+
+/// 把折出来的一行写回账本（行＋它的引用＋两列排序值）。重折与增量重折共用这一份，
+/// 两份写法分家时，「表是流的一份投影」会有两个口径。
+async fn write_account(
+    tx: &mut sqlx::PgConnection,
+    identity: &str,
+    row: &FoldedChangeAccount,
+) -> SFResult<()> {
+    let parts: Vec<&str> = identity.split('|').collect();
+    if parts.len() != 3 {
+        return Ok(());
+    }
+    // 行本身：状态与测量那几格来自判定，title／assertion／first_seen 来自声明。
+    // 同一句 upsert 里写齐，是因为它们描述的是同一行；分开写会让重建中途停下时
+    // 留下「状态是新的、title 是旧的」这种读起来像真的一行。
+    sqlx::query(
+        "INSERT INTO change_ledger \
+            (kind, scope, literal, state, first_seen_at, measured_at, measured_rev, \
+             retire_reason, unsettled_reason, parent_observation, delivered_rev, \
+             title, assertion, first_seen_rev, as_of_seq) \
+         VALUES ($1, $2, $3, $4, COALESCE($5, now()), $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+         ON CONFLICT (kind, scope, literal) DO UPDATE SET \
+             state = EXCLUDED.state, \
+             measured_at = EXCLUDED.measured_at, \
+             measured_rev = EXCLUDED.measured_rev, \
+             retire_reason = EXCLUDED.retire_reason, \
+             unsettled_reason = EXCLUDED.unsettled_reason, \
+             parent_observation = EXCLUDED.parent_observation, \
+             delivered_rev = COALESCE(EXCLUDED.delivered_rev, change_ledger.delivered_rev), \
+             title = COALESCE(EXCLUDED.title, change_ledger.title), \
+             assertion = COALESCE(EXCLUDED.assertion, change_ledger.assertion), \
+             first_seen_rev = COALESCE(change_ledger.first_seen_rev, EXCLUDED.first_seen_rev), \
+             as_of_seq = GREATEST(change_ledger.as_of_seq, EXCLUDED.as_of_seq)",
+    )
+    .bind(parts[0])
+    .bind(parts[1])
+    .bind(parts[2])
+    .bind(&row.state)
+    .bind(row.measured_at)
+    .bind(&row.measured_rev)
+    .bind(&row.retire_reason)
+    .bind(&row.unsettled_reason)
+    .bind(&row.parent_observation)
+    .bind(&row.delivered_rev)
+    .bind(&row.title)
+    .bind(&row.assertion)
+    .bind(&row.first_seen_rev)
+    .bind(row.as_of_seq)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| SFError::Database(format!("rebuild {identity}: {e}")))?;
+    for (doc, citation) in &row.sources {
+        sqlx::query(
+            "INSERT INTO change_ledger_sources (kind, scope, literal, doc, verdict, priority, block) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (kind, scope, literal, doc) DO UPDATE SET \
+                 verdict = EXCLUDED.verdict, priority = EXCLUDED.priority, block = EXCLUDED.block",
+        )
+        .bind(parts[0])
+        .bind(parts[1])
+        .bind(parts[2])
+        .bind(doc)
+        .bind(&citation.verdict)
+        .bind(&citation.priority)
+        .bind(&citation.block)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| SFError::Database(format!("rebuild citation {identity}/{doc}: {e}")))?;
+    }
+    sqlx::query(RECOUNT_SQL)
+        .bind(parts[0])
+        .bind(parts[1])
+        .bind(parts[2])
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| SFError::Database(format!("recount rebuilt {identity}: {e}")))?;
+
+    Ok(())
+}
+
+/// 库里的账读成折叠用的同一形状：行 + 它的每一条引用。
+pub async fn read_table_account(
+    pool: &sqlx::PgPool,
+) -> SFResult<std::collections::BTreeMap<String, FoldedChangeAccount>> {
+    use std::collections::BTreeMap;
+    let rows: Vec<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT kind || '|' || scope || '|' || literal, state, title, assertion, \
+            first_seen_rev, measured_rev, retire_reason, unsettled_reason, \
+            parent_observation, delivered_rev \
+       FROM change_ledger",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| SFError::Database(format!("read the change ledger: {e}")))?;
+    let mut table: BTreeMap<String, FoldedChangeAccount> = BTreeMap::new();
+    for row in rows {
+        table.insert(
+            row.0,
+            FoldedChangeAccount {
+                state: row.1,
+                title: row.2,
+                assertion: row.3,
+                first_seen_rev: row.4,
+                measured_rev: row.5,
+                retire_reason: row.6,
+                unsettled_reason: row.7,
+                parent_observation: row.8,
+                delivered_rev: row.9,
+                ..Default::default()
+            },
+        );
+    }
+    let citations: Vec<(String, String, Option<String>, String, String)> = sqlx::query_as(
+        "SELECT kind || '|' || scope || '|' || literal, doc, verdict, priority, block \
+       FROM change_ledger_sources",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| SFError::Database(format!("read the change citations: {e}")))?;
+    for (identity, doc, verdict, priority, block) in citations {
+        table.entry(identity).or_default().sources.insert(
+            doc,
+            FoldedCitation {
+                verdict,
+                priority,
+                block,
+            },
+        );
+    }
+    Ok(table)
+}
+
+/// 增量重折：只把水位之后的事实写回账本，水位跟着前进。
+///
+/// 水位之前那些格子由表自己带进折叠（`seed`），所以一次增量不重折历史；返回改了几行。
+/// 没有新事实时一行都不写——空跑不推进水位，否则「读到哪儿了」会追上还没发生的事。
+pub async fn project_change_ledger_incremental(pool: &sqlx::PgPool) -> SFResult<u64> {
+    use std::collections::BTreeMap;
+    let table = read_table_account(pool).await?;
+    let since: BTreeMap<String, i64> = table
+        .iter()
+        .map(|(identity, row)| (identity.clone(), row.as_of_seq))
+        .collect();
+    let folded = fold_change_account_from(pool, &since, &table).await?;
+    let changed: Vec<(&String, &FoldedChangeAccount)> = folded
+        .iter()
+        .filter(|(identity, row)| {
+            table
+                .get(*identity)
+                .map(|existing| row.as_of_seq > existing.as_of_seq)
+                .unwrap_or(true)
+        })
+        .collect();
+    if changed.is_empty() {
+        return Ok(0);
+    }
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| SFError::Database(format!("begin change projection: {e}")))?;
+    for (identity, row) in &changed {
+        write_account(&mut tx, identity, row).await?;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| SFError::Database(format!("commit change projection: {e}")))?;
+    Ok(changed.len() as u64)
+}
+
+/// 一行台账的一格分歧：哪条身份、哪一格、表里是什么、流上是什么。
+///
+/// `None` 是「那一侧没有这一格」——把「没有」印成空字符串，读的人分不出
+/// 「流上没有这句话」与「流上说的是空」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeDivergence {
+    pub identity: String,
+    pub column: String,
+    pub table: Option<String>,
+    pub stream: Option<String>,
+}
+
+/// 台账与流逐格比对：空的返回值就是「表是流的一份投影」这句断言的全部证据。
+///
+/// 只比折叠得回来的那几格（状态、测量 rev、三个原因、交付、title／assertion、
+/// first_seen_rev、每条引用的三格）：时间是写库那一刻的钟，不是事实里的一格，
+/// 拿它比会把每一行都报成分歧。
+pub async fn change_ledger_divergence(pool: &sqlx::PgPool) -> SFResult<Vec<ChangeDivergence>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let stream = fold_change_account(pool).await?;
+
+    let table = read_table_account(pool).await?;
+    Ok(diff_change_accounts(&table, &stream))
+}
+
+/// 逐格比对两份折出来的账：`table` 是库里的表，`stream` 是从事实折出来的那份。
+///
+/// 单独一个函数是为了让判据能在没有库的地方反问：折两遍、比一遍，逻辑只有这一处，
+/// 读库的那一半只是把表读成同一形状。
+pub fn diff_change_accounts(
+    table: &std::collections::BTreeMap<String, FoldedChangeAccount>,
+    stream: &std::collections::BTreeMap<String, FoldedChangeAccount>,
+) -> Vec<ChangeDivergence> {
+    use std::collections::BTreeSet;
+    let mut out = Vec::new();
+    let identities: BTreeSet<&String> = stream.keys().chain(table.keys()).collect();
+    for identity in identities {
+        let Some(from_stream) = stream.get(identity) else {
+            out.push(ChangeDivergence {
+                identity: identity.clone(),
+                column: "<row>".into(),
+                table: Some("present".into()),
+                stream: None,
+            });
+            continue;
+        };
+        let Some(from_table) = table.get(identity) else {
+            out.push(ChangeDivergence {
+                identity: identity.clone(),
+                column: "<row>".into(),
+                table: None,
+                stream: Some("present".into()),
+            });
+            continue;
+        };
+        let mut cell = |column: &str, table: Option<String>, stream: Option<String>| {
+            if table != stream {
+                out.push(ChangeDivergence {
+                    identity: identity.clone(),
+                    column: column.to_string(),
+                    table,
+                    stream,
+                });
+            }
+        };
+        cell(
+            "state",
+            Some(from_table.state.clone()),
+            Some(from_stream.state.clone()),
+        );
+        cell("title", from_table.title.clone(), from_stream.title.clone());
+        cell(
+            "assertion",
+            from_table.assertion.clone(),
+            from_stream.assertion.clone(),
+        );
+        cell(
+            "first_seen_rev",
+            from_table.first_seen_rev.clone(),
+            from_stream.first_seen_rev.clone(),
+        );
+        cell(
+            "measured_rev",
+            from_table.measured_rev.clone(),
+            from_stream.measured_rev.clone(),
+        );
+        cell(
+            "retire_reason",
+            from_table.retire_reason.clone(),
+            from_stream.retire_reason.clone(),
+        );
+        cell(
+            "unsettled_reason",
+            from_table.unsettled_reason.clone(),
+            from_stream.unsettled_reason.clone(),
+        );
+        cell(
+            "parent_observation",
+            from_table.parent_observation.clone(),
+            from_stream.parent_observation.clone(),
+        );
+        cell(
+            "delivered_rev",
+            from_table.delivered_rev.clone(),
+            from_stream.delivered_rev.clone(),
+        );
+        let docs: BTreeSet<&String> = from_table
+            .sources
+            .keys()
+            .chain(from_stream.sources.keys())
+            .collect();
+        for doc in docs {
+            let t = from_table.sources.get(doc);
+            let f = from_stream.sources.get(doc);
+            if t == f {
+                continue;
+            }
+            out.push(ChangeDivergence {
+                identity: identity.clone(),
+                column: format!("source:{doc}"),
+                table: t.map(|c| format!("{:?}|{}|{}", c.verdict, c.priority, c.block)),
+                stream: f.map(|c| format!("{:?}|{}|{}", c.verdict, c.priority, c.block)),
+            });
+        }
+    }
+    out
 }

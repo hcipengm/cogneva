@@ -177,10 +177,12 @@ fn own_schema_name(label: &str, pid: u32, nanos: u128, seq: u64) -> String {
 /// 删不掉不算失败：用例的结论说的是被测代码，不是收尾时数据库还在不在。
 pub async fn drop_schema(url: &str, schema: &str) {
     if let Ok(mut admin) = sqlx::PgConnection::connect(url).await {
-        sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        if let Err(err) = sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
             .execute(&mut admin)
             .await
-            .ok();
+        {
+            eprintln!("schema {schema} was not dropped: {err}");
+        }
     }
 }
 

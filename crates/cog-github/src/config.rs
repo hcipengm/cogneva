@@ -16,7 +16,9 @@ use cog_core::{SFError, SFResult};
 /// 没扫到的留给下一拍，水位线保证不会漏。平台之间的差别（限流额度、账号数）
 /// 不改变「一拍读多少条」这件事，所以它不是两个旋钮——两个字段各写一个 50
 /// 就是同一条界的两处声明，改一处的下一次只会改一处。
-// cap: bound — 一趟往返读得完、又不把一拍的处理时长长的条数；只往下调
+// cap: fixed — 一趟往返读得完、又不把一拍的处理时长长的条数；只往下调
+// keep: 删掉后一趟扫描的往返量无界，一拍的处理时长跟着 issue 总数走；由「一趟往返读得完」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 pub const ISSUES_PER_SCAN: usize = 50;
 
 /// A registered GitHub account used by Cogneva to interact with GitHub.
@@ -177,6 +179,7 @@ fn resolve_token(
 /// GitHub webhook 监听口。转发规则把这一路径指到本服务，落在哪个口由接收方
 /// 自己说；9090 与 Prometheus 抓取口同值，是这套部署里「旁路服务口」的约定。
 // cap: fixed — 本仓部署约定的旁路服务端口 9090
+// keep: 删掉后旁路服务与部署约定的口对不上，webhook 打不进来；由「本仓部署约定的端口」兜住
 const GITHUB_WEBHOOK_PORT: u16 = 9090;
 
 /// Webhook 事件入口配置（discovery_mode=events/both 时启用）。
@@ -393,12 +396,15 @@ pub struct LandingPolicy {
 
 // 一次落地最多重试三趟：推送撞上新基线是竞态，重取、重放即可；三趟还在撞说明
 // 基线在持续前进，再撞只是把这一笔自己的分支拖长。
-// cap: bound — 三趟：撞车是竞态，重取重放；三趟还在撞说明基线在跑，不是运气不好
+// cap: fixed — 三趟：撞车是竞态，重取重放；三趟还在撞说明基线在跑，不是运气不好
+// keep: 删掉后撞车无限重放，或第二次就放弃一次只是竞态的落地；由「三趟还在撞说明基线在跑」兜住
 const LANDING_MAX_ATTEMPTS: u32 = 3;
 
 // 同一个失败原因只给一轮生成：一轮产出的修复是新的一笔，自带它自己的一轮；
 // 同一原因第二轮还在，说明生成器够不着它，剩下的该由人接手。
-// cap: bound — 一轮：一轮的修复是新的一笔、自带额度；同一原因第二轮还在就是够不着
+// cap: fixed — 一轮：一轮的修复是新的一笔、自带额度；同一原因第二轮还在就是够不着
+// keep: 删掉后同一原因反复重驱，够不着的那条被无限重开；由「第二轮还在就是够不着」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const REDRIVE_ROUNDS_PER_CAUSE: u32 = 1;
 
 impl Default for LandingPolicy {
@@ -454,7 +460,8 @@ pub struct ConversationConfig {
 
 // 问三轮还没说清就按已知信息开工：每一轮都要等人回话，第三轮之后「再问一轮」
 // 的成本已经超过「先做、做错了再纠」。
-// cap: bound — 三轮：每轮都等人回话，第三轮之后再问的成本超过先做再纠
+// cap: fixed — 三轮：每轮都等人回话，第三轮之后再问的成本超过先做再纠
+// keep: 删掉后一轮轮地问下去，问的成本超过先做再纠；由「第三轮之后再问成本超过先做再纠」兜住
 const CLARIFICATION_ROUNDS: u32 = 3;
 
 impl Default for ConversationConfig {
@@ -766,7 +773,7 @@ mod tests {
             !cfg.discovery_enabled,
             "env override must reach the discovery owner switch"
         );
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     #[test]
@@ -969,7 +976,7 @@ mod tests {
         assert!(cfg.enabled);
         assert_eq!(cfg.repo, "a/b");
         assert_eq!(cfg.poll_interval_secs, 45);
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     #[test]
@@ -987,7 +994,7 @@ mod tests {
         assert_eq!(cfg.repo, "o/r");
         assert_eq!(cfg.base_branch, "main");
         assert_eq!(cfg.api_base.as_deref(), Some("http://gw:8081/gitee"));
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
 
         let missing =
             GiteeIntegrationConfig::load_from(std::path::Path::new("/nonexistent/x.json")).unwrap();

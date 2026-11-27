@@ -1,0 +1,3 @@
+ALTER TABLE task_defined DROP COLUMN IF EXISTS gap;
+ALTER TABLE task_defined DROP COLUMN IF EXISTS now;
+ALTER TABLE task_defined DROP COLUMN IF EXISTS terminal;

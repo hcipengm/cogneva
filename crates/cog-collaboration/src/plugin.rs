@@ -155,6 +155,13 @@ impl cog_core::SystemPlugin for CollaborationPlugin {
             if let Some(roster) = ctx.consume_service::<dyn cog_core::AgentRegistry>() {
                 collab = collab.with_roster(roster);
             }
+            // 判据的修订：计划只做一次，但每一轮开始前读一次修订，换了就对着新的
+            // 那段话说。没有这个读面的进程行为与从前一样。
+            if let Some(revisions) = ctx
+                .consume_service::<dyn cog_core::contract::terminal_revision::TerminalRevisions>()
+            {
+                collab = collab.with_terminal_revisions(revisions);
+            }
             // 池停供时这条执行器手里的 Ralph 循环不再开新轮。闸由 supervisor
             // 发布，而它不是本插件的 `requires`——两者落在同一层、并发 init，
             // 现在读它读到的是运气。句柄延后到第一次被问时才解析，那时所有

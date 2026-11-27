@@ -459,7 +459,7 @@ fn the_reader_sees_keys_and_ignores_comparisons() {
 fn a_client_directory_that_cannot_be_read_is_refused() {
     let missing =
         std::env::temp_dir().join(format!("cogneva-web-storage-absent-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&missing);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&missing));
     let mut files = Vec::new();
     let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         walk(&missing, &["ts", "tsx"], &mut files)

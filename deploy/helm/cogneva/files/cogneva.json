@@ -3924,6 +3924,26 @@
           "severity": "warning",
           "summary": "A call this process made was refused by an upstream for exceeding its context window. The window belongs to the upstream deployment and no file in this tree carries it, so the loop trims to a configured bootstrap until a call measures the real one -- and a refusal is that measurement, not only a failure. `limit_named` cells are refusals whose text states the limit (\"maximum context length is 128000 tokens\", \"prompt is too long: 214401 tokens > 200000 maximum\"); the loop reads that number and lowers its budget to it in the same turn, so these should arrive in ones and twos and then stop -- a `limit_named` cell that keeps climbing means the number was read and the budget still exceeded it, which is a fault in the decision rather than a missing measurement. `limit_unnamed` cells say the prompt was too long and name no number: the budget is still wrong and nothing was learned, so the repair is to teach `context_limit_from_refusal` that vendor's wording. Either way the spend is real: a refused call was billed for the prompt it carried, and the same oversized prompt is what the loop would send again if the refusal had taught it nothing.",
           "face": "资源管理"
+        },
+        {
+          "name": "db_vacuum_lag_past_trigger",
+          "promql": "max(cogneva_db_dead_tuples / cogneva_db_vacuum_threshold_tuples)",
+          "condition": {
+            "greater_than": 1.0
+          },
+          "severity": "warning",
+          "summary": "A table's dead tuples have passed the trigger autovacuum itself works against (`autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor x live tuples`), so vacuum should already have come and has not. Neither the ratio nor its line is picked here: the threshold is read from the server's settings and the table's own live count, and 1.0 is that trigger. Dead tuples are space that is deleted and still occupied, which makes backups slower and the planner read the table larger than its live data. A table whose trigger is off divides by zero and reads as +Inf, which is the same verdict for a table that is already past by construction. The per-table `cogneva_db_dead_tuples` and `cogneva_db_vacuum_threshold_tuples` series beside this one say which table; the repair is to let vacuum catch up or to find the transaction holding a snapshot, not a code change.",
+          "face": "资源管理"
+        },
+        {
+          "name": "db_idle_transaction_past_timeout",
+          "promql": "max(cogneva_db_xact_age_seconds{state=\"idle in transaction\"} and ((time() - cogneva_db_xact_age_seconds_observed_timestamp_seconds) < 120)) > on() max(cogneva_db_setting_seconds{setting=\"idle_in_transaction_session_timeout\"} and ((time() - cogneva_db_setting_seconds_observed_timestamp_seconds) < 120)) and max(cogneva_db_setting_seconds{setting=\"idle_in_transaction_session_timeout\"} and ((time() - cogneva_db_setting_seconds_observed_timestamp_seconds) < 120)) > 0",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "An idle transaction has been open longer than the database's own `idle_in_transaction_session_timeout`, and the server has not ended it. The bound comes from the setting, not from this rule: when the setting is 0 (off) the second half is false and the rule stays silent, because there is no line to cross. An idle transaction holds a snapshot, so vacuum cannot reclaim behind it and every reader's view of the table stays old; the age series is published per state, which is why this reads one state rather than the maximum transaction age. A setting the server enforces and one it does not are different states with the same name, and this rule exists because only the settings gauge can say which one is in force.",
+          "face": "资源管理"
         }
       ],
       "_comment_poll_interval_secs": "采集周期：连续几拍取不到数才算「断档」（`eval_failure_alert_after` 按拍计），所以改它等于改所有告警的时间分辨率；读侧把 0 夹到 1 秒。",

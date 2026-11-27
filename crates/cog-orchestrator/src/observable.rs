@@ -700,12 +700,14 @@ impl Observable for ClaimSlotsObservable {
 /// 与 `cogneva_task_router_claim_slots` 同一个形状：同一个数有两种来路——按图里
 /// 已完成/已退回的批次量出来的界，和部署钉死的一个数。没有这条读数，导出的界
 /// 与钉死的界在抓取面上同形，一个停在一个数上的回路看不出它停在哪儿。
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 pub const ROWS_PER_HANDOVER_METRIC: &str = "cogneva_change_ledger_rows_per_handover";
 
 /// 批大小从图里的批次重算过几拍。
 ///
 /// 界只在某批落地或退回时动，输入安静时不动才是对的；这条计数分开「算子还
 /// 在跑、只是没有新证据」与「算子停了、界冻在最后一次的值」。
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 pub const ROWS_PER_HANDOVER_EVALUATIONS_METRIC: &str =
     "cogneva_change_ledger_rows_per_handover_evaluations_total";
 
@@ -733,10 +735,13 @@ pub struct RowsPerHandoverObservable {
 
 impl RowsPerHandoverObservable {
     // cap: fixed — 写进读数标签的编号：已经发布出去的序列按这些数字认，改它等于换一个序列
+    // not-a-bound: 写进读数标签的编号：已经发布出去的序列按这些数字认，改它等于换一个序列
     const UNRECORDED: u64 = 0;
     // cap: fixed — 写进读数标签的编号：已经发布出去的序列按这些数字认，改它等于换一个序列
+    // not-a-bound: 写进读数标签的编号：已经发布出去的序列按这些数字认，改它等于换一个序列
     const DERIVED: u64 = 1;
     // cap: fixed — 写进读数标签的编号：已经发布出去的序列按这些数字认，改它等于换一个序列
+    // not-a-bound: 写进读数标签的编号：已经发布出去的序列按这些数字认，改它等于换一个序列
     const OVERRIDE: u64 = 2;
 
     pub fn new() -> Self {
@@ -907,6 +912,7 @@ struct TaskGraphSnapshot {
 /// staleness rule reads the stamp of the last successful read against a 900 s
 /// bound, so it does not see this at all.
 // cap: fixed — half the interval the monitoring stack scrapes at, so no collector on that interval is ever handed a read older than one it would have taken itself.
+// keep: 删掉后采集器拿到的读比它自己会取的还旧，图上两格说的不是同一刻；由「抓取间隔的一半」兜住
 pub const TASK_GRAPH_MEASURE_WINDOW: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The live shape of the task graph.

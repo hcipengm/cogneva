@@ -87,11 +87,11 @@ fn hold_a_reader(
             .execute(&mut *conn)
             .await
             .expect("the reader's select");
-        let _ = taken.send(());
+        cog_core::ignore_lost!(taken.send(()));
         while !stop.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        sqlx::query("ROLLBACK").execute(&mut *conn).await.ok();
+        cog_core::ignore_lost!(sqlx::query("ROLLBACK").execute(&mut *conn).await);
     });
     (handle, took_it)
 }
@@ -107,7 +107,7 @@ async fn worst_read_latency(pool: PgPool, table: String, until: Arc<AtomicBool>)
     while !until.load(Ordering::SeqCst) {
         let started = Instant::now();
         let read = sqlx::query(&statement).execute(&pool);
-        let _ = tokio::time::timeout(Duration::from_secs(5), read).await;
+        cog_core::ignore_lost!(tokio::time::timeout(Duration::from_secs(5), read).await);
         worst = worst.max(started.elapsed());
         tokio::time::sleep(Duration::from_millis(25)).await;
     }

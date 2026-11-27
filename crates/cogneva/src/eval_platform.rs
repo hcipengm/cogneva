@@ -138,7 +138,8 @@ pub const PLATFORM_DEADLINE_ENV: &str = "COG_EVAL_PLATFORM_DEADLINE_SECS";
 /// 这一段的用途只有一个：桥对一道题的期望与它写进行的那条声明不该是同一个数——
 /// 否则「桥开始说超期」与「这一行刚好到期」同时发生，读的人分不清是哪一方说的。
 /// 两个数都不杀任何东西：判一条正在跑的活停没停，读的是租约与实测步间隔。
-// cap: bound — 两个申报值之间的余量；比 POLL_INTERVAL 大，才不会在同一拍上互相盖住
+// cap: fixed — 两个申报值之间的余量；比 POLL_INTERVAL 大，才不会在同一拍上互相盖住
+// keep: 删掉后回到「两个申报值之间的余量；比 POLL_INTERVAL 大，才不会在同一拍上互相盖住」所描述的情形；由这条约定兜住
 const PLATFORM_DECLARED_MARGIN_SECS: u64 = 30;
 
 /// 接活的人读到的做法：这道题要交回什么。
@@ -155,14 +156,17 @@ const CASE_CONTRACT: &str = "Answer one benchmark question. The question is in \
 /// 而提交方读到的只是 202。所以这一条是这道桥能跑起来的一部分，不是装饰。
 const CASE_ACCEPTANCE: &str =
     "The reply answers the question in `task`, in the form that question asks for.";
-// cap: bound — the expectation the bridge declares for one case; passing it only publishes a
+// cap: fixed — the expectation the bridge declares for one case; passing it only publishes a
+// keep: 删掉后一格评测没有声明的期限，跑不出来的那格永远不说结论；由「过点只发布一个判词」兜住
 // wall: 等=桥对单条用例声明的预期时长 / 等不到=过了只发布一行「比预期慢」，用例本身继续跑到它自己的结局 / 续跑=不适用：这一格只发布，不结束
 // line, and a case that must stop is stopped by the platform's lease-and-motion verdict
 const DEFAULT_DEADLINE_SECS: u64 = 3600;
-// cap: bound — polling period for a submitted platform case; the declared wall is DEFAULT_DEADLINE_SECS
+// cap: fixed — polling period for a submitted platform case; the declared wall is DEFAULT_DEADLINE_SECS
+// keep: 删掉后回到「polling period for a submitted platform case; the declared wall is DEFAULT_DEADLINE_SECS」所描述的情形；由这条约定兜住
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// 轨迹列表一次取多少条。按最近的排，刚跑完的那条在最前面。
-// cap: bound — 按最近的排，刚跑完的那条在最前；一页够翻，再多也没有人在看
+// cap: fixed — 按最近的排，刚跑完的那条在最前；一页够翻，再多也没有人在看
+// keep: 删掉后一页列全部 trace，刚跑完的那条混在历史里；由「一页够翻」兜住
 const TRACE_LIST_LIMIT: usize = 200;
 
 /// 桥的接入点。三样东西各有独立的判据：没有基址就是没有平台；令牌与时限有默认值。
@@ -830,7 +834,7 @@ mod tests {
                     .and_then(|v| v.as_str())
                     .map(str::to_string)
             })
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let task_id = f.trace_task_id.clone().unwrap_or(task_id);
         let items: Vec<serde_json::Value> = f
             .trace_ids
@@ -879,7 +883,7 @@ mod tests {
                 .route("/api/v1/traces/{id}", axum_get(handle_trace))
                 .with_state(fake);
             let handle = tokio::spawn(async move {
-                let _ = axum::serve(listener, app).await;
+                cog_core::ignore_lost!(axum::serve(listener, app).await);
             });
             Self {
                 base: format!("http://{addr}"),

@@ -61,7 +61,7 @@ pub struct OpsState {
     pub llm_usage: Option<Arc<dyn cog_core::LlmUsageLedger>>,
     /// 调用事实的写入口（`cogneva_event` 的 `llm_call`）。与上面的账本并存：
     /// 账本是投影，事件是正本；读切换之前两条都写。
-    pub llm_call_events: Option<Arc<dyn cog_core::LlmCallEvents>>,
+    pub llm_call_events: Option<Arc<dyn cog_core::EventStore>>,
     pub hierarchy_manager: Option<Arc<dyn cog_core::HierarchyManager>>,
     pub supervisor: Option<Arc<dyn cog_core::Supervisor>>,
     pub agent_registry: Option<Arc<dyn cog_core::AgentRegistry>>,

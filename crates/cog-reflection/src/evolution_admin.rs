@@ -362,7 +362,7 @@ impl EvolutionAdminService {
     /// 向接管台广播行变更；无订阅者或无通道时静默丢弃。
     fn emit(&self, row: EvolutionChangeInfo) {
         if let Some(ref tx) = self.stream {
-            let _ = tx.send(row);
+            cog_core::ignore_lost!(tx.send(row));
         }
     }
 
@@ -657,6 +657,7 @@ impl EvolutionAdmin for EvolutionAdminService {
         let created_at = chrono::Utc::now();
 
         self.store_policy_result(crate::types::EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::PolicyUpdate,
             artifact_id: artifact_id.clone(),
             description: description.clone(),
@@ -1093,6 +1094,7 @@ mod tests {
 
         let id = "landed-change";
         let record = crate::types::EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: id.to_string(),
             description: "goal landed".to_string(),
@@ -1353,6 +1355,7 @@ mod tests {
         // 核心路径：分级判它必须人工审批。
         let diff = "diff --git a/crates/cog-storage/src/postgres/state_backend.rs b/crates/cog-storage/src/postgres/state_backend.rs\n--- a/crates/cog-storage/src/postgres/state_backend.rs\n+++ b/crates/cog-storage/src/postgres/state_backend.rs\n@@ -1 +1 @@\n-a\n+b\n";
         let change = crate::types::EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: "awaits".into(),
             description: "test".into(),

@@ -264,7 +264,7 @@ impl PostgresGovernanceStore {
     /// a reading that looks fresh and is one revision behind.
     async fn reproject(conn: &mut sqlx::PgConnection, task_ids: &[String]) -> Result<(), SFError> {
         for task_id in task_ids {
-            task_ledger::project(conn, Some(task_id)).await?;
+            task_ledger::project_incremental(conn, task_id).await?;
         }
         Ok(())
     }
@@ -353,7 +353,7 @@ impl GovernanceStore for PostgresGovernanceStore {
         task_ledger::lock_workspace(&mut tx, GOVERNANCE_WORKSPACE).await?;
         let current = Self::face_revision(&mut tx, &task.id).await?;
         if current != expected {
-            tx.rollback().await.ok();
+            cog_core::ignore_lost!(tx.rollback().await);
             return Ok(false);
         }
         task_ledger::write_task(&mut tx, GOVERNANCE_WORKSPACE, task).await?;
@@ -410,7 +410,7 @@ impl GovernanceStore for PostgresGovernanceStore {
                 // No row answers the question the same way a row in another
                 // state does: the caller asked to write only from the states it
                 // read, and a missing row is not one of them.
-                tx.rollback().await.ok();
+                cog_core::ignore_lost!(tx.rollback().await);
                 Ok(false)
             }
         }
@@ -431,7 +431,7 @@ impl GovernanceStore for PostgresGovernanceStore {
 
         let state = task_ledger::current_state(&mut tx, &node.id).await?;
         if !matches!(state, Some(state) if expected.contains(&state)) {
-            tx.rollback().await.ok();
+            cog_core::ignore_lost!(tx.rollback().await);
             return Ok(false);
         }
 
@@ -464,14 +464,14 @@ impl GovernanceStore for PostgresGovernanceStore {
         // arrived twice must apply once.
         let state = task_ledger::current_state(&mut tx, &handover.id).await?;
         if state != Some(TaskStatus::Scheduled) {
-            tx.rollback().await.ok();
+            cog_core::ignore_lost!(tx.rollback().await);
             return Ok(None);
         }
         task_ledger::write_task(&mut tx, GOVERNANCE_WORKSPACE, handover).await?;
 
         let current = Self::face_revision(&mut tx, &face.id).await?;
         if current != expected_revision {
-            tx.rollback().await.ok();
+            cog_core::ignore_lost!(tx.rollback().await);
             return Ok(None);
         }
         task_ledger::write_task(&mut tx, GOVERNANCE_WORKSPACE, face).await?;

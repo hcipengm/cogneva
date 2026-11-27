@@ -22,12 +22,14 @@ use std::time::Duration;
 /// Probe target. Kept off the business-request metric surface as an
 /// infrastructure route — see the assertion in the tests below.
 const PROBE_PATH: &str = "/health/ready";
-// cap: bound — read/write timeout on a loopback readiness probe; waiting longer only delays the verdict
+// cap: fixed — read/write timeout on a loopback readiness probe; waiting longer only delays the verdict
+// keep: 删掉后环回探测等更久只是推迟判词；由「waiting longer only delays the verdict」兜住
 // wall: 等=本机回环上的就绪探针的答复 / 等不到=这次探活读作「未就绪」；读不到不等于「进程死了」，判词只覆盖这一次探测 / 续跑=能，下一次探活重新问
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// A status line longer than this is not a status line; stop reading rather
 /// than block until the timeout.
-// cap: bound — 比这更长的状态行不是状态行；停读，而不是一直阻塞到超时
+// cap: fixed — 比这更长的状态行不是状态行；停读，而不是一直阻塞到超时
+// keep: 删掉后一条不换行的状态流把探测一直读到超时；由「比这更长的不是状态行」兜住
 const STATUS_LINE_LIMIT: usize = 512;
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -124,8 +126,8 @@ mod tests {
         std::thread::spawn(move || {
             if let Ok((mut socket, _)) = listener.accept() {
                 let mut buf = [0u8; 1024];
-                let _ = socket.read(&mut buf);
-                let _ = socket.write_all(response.as_bytes());
+                cog_core::ignore_lost!(socket.read(&mut buf));
+                cog_core::ignore_lost!(socket.write_all(response.as_bytes()));
             }
         });
         port

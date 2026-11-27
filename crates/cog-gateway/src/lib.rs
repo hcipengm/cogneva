@@ -63,6 +63,7 @@ pub mod hook_forwarder;
 pub mod hooks;
 pub mod ide;
 pub mod intent;
+pub mod keys_api;
 pub mod knowledge;
 pub mod llm_admin;
 pub mod mcp_calls;
@@ -85,7 +86,6 @@ pub mod project_rate_limit;
 pub mod projects;
 pub mod prometheus_render;
 pub mod promotion_gate;
-pub mod prompt_prefix;
 pub mod raw_logs;
 pub mod readings;
 pub mod resource_frames;
@@ -339,7 +339,7 @@ pub struct GatewayState {
     pub llm_usage: Option<Arc<dyn cog_core::LlmUsageLedger>>,
     /// 调用事实的写入口（`cogneva_event` 的 `llm_call`）。与账本并存：账本是投影，
     /// 事件是正本；读切换之前两条都写。
-    pub llm_call_events: Option<Arc<dyn cog_core::LlmCallEvents>>,
+    pub llm_call_events: Option<Arc<dyn cog_core::EventStore>>,
     /// Observables — 各业务 crate 暴露的系统级指标（D5/D8/D9）。
     pub observables: Vec<Arc<dyn cog_core::Observable>>,
     /// 抓取维度集合的可选收窄项；空 = 不收窄，采每个 observable 自己声明的有界维度。
@@ -369,6 +369,8 @@ pub struct GatewayState {
     /// 与面名册同样按请求现读；`None` 时那条路由报「没有台账」而不是回一份
     /// 全零的账——全零会被读成「一条原则都没有」。
     pub principle_ledger: Option<Arc<dyn cog_core::PrincipleLedgerStore>>,
+    /// 签名钥匙的读写面：页面上的签发/轮换/吊销走它。
+    pub security_keys: Option<Arc<dyn cog_core::SecurityKeys>>,
     /// The change account: what the corpus asks for, what the tree has been
     /// measured to hold, and how much intake is still waiting to be folded in.
     /// Read per request, like the face roster; `None` makes the route report
@@ -377,7 +379,13 @@ pub struct GatewayState {
     pub change_ledger: Option<Arc<dyn cog_core::ChangeLedgerStore>>,
     /// 意图进门那一条事件的写者。对话收尾用它把这一轮落成一条意图行；缺席时写意图
     /// 的那一步显式报「没有收件台」，不把「没地方交」读成「没有意图」。
-    pub intent_events: Option<Arc<dyn cog_core::IntentEvents>>,
+    pub intent_events: Option<Arc<dyn cog_core::EventStore>>,
+    /// 员工编制与离场两条事实的写者。雇佣与离场 handler 各写一条；名册是这两条
+    /// 事实的投影。缺席时那一步只记日志、不写事件——「没有落点」与「没发生」因此
+    /// 在日志里分得开。
+    pub employee_events: Option<Arc<dyn cog_core::EventStore>>,
+    /// 消息事实的写者：投递成功之后写一条 `message_sent`。缺席时只少这一条账。
+    pub message_events: Option<Arc<dyn cog_core::EventStore>>,
     /// The shared key-value face this deployment's processes publish to.
     ///
     /// The gateway that holds the upstream credentials writes the LLM pool's
@@ -652,7 +660,8 @@ fn memory_raw_routes() -> Router<Arc<GatewayState>> {
 /// 记忆写入与原始流上传是这里唯一的批量入口，两条路由面（对外与集群内）共用
 /// 这一个数——各写一份时，改一处就有一个面静默地留着旧上限。这是这段代码自己
 /// 选的界，不是量出来的容量。
-// cap: bound — 选出来的一道界，不是量出来的容量
+// cap: fixed — 选出来的一道界，不是量出来的容量
+// keep: 删掉后请求体无界，一次请求把网关内存吃穿；由「选出来的一道界」兜住
 const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 pub fn create_internal_router(state: Arc<GatewayState>) -> Router {
@@ -786,7 +795,9 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
                                 if let Ok(session_id) = uuid::Uuid::parse_str(token) {
                                     match session_mgr.get(user_id, session_id).await {
                                         Ok(Some(_)) => {
-                                            let _ = session_mgr.refresh(user_id, session_id).await;
+                                            cog_core::ignore_lost!(
+                                                session_mgr.refresh(user_id, session_id).await
+                                            );
                                         }
                                         Ok(None) => {
                                             return (
@@ -960,6 +971,18 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/v1/evolution/promotion/trend",
             get(evolution::promotion_trend_handler),
+        )
+        .route(
+            "/api/v1/admin/keys",
+            get(keys_api::list_keys_handler).post(keys_api::issue_key_handler),
+        )
+        .route(
+            "/api/v1/admin/keys/rotate",
+            post(keys_api::rotate_key_handler),
+        )
+        .route(
+            "/api/v1/admin/keys/revoke",
+            post(keys_api::revoke_key_handler),
         )
         .route(
             "/api/v1/admin/llm-status",
@@ -2038,7 +2061,8 @@ pub const OBSERVABLES_REGISTERED_METRIC: &str = "cogneva_observables_registered"
 /// scrape that asks for more connections than exist does not finish sooner --
 /// it queues, and it holds connections the writers whose work it is about to
 /// read would otherwise have.
-// cap: bound — 一个抓取同时占住的连接数上限；远低于连接池上限（默认 50），留给正在写这些读数的写者
+// cap: fixed — 一个抓取同时占住的连接数上限；远低于连接池上限（默认 50），留给正在写这些读数的写者
+// keep: 删掉后一个抓取占满连接池，正在写这些读数的写者没有连接可用；由「远低于连接池上限，留给写者」兜住
 const BACKEND_READ_CONCURRENCY: usize = 8;
 
 /// A label value with the three characters the text format reserves escaped.
@@ -3041,6 +3065,7 @@ fn answer_deadline(
                 .request_timeout_secs
                 .load(std::sync::atomic::Ordering::Relaxed);
             let timeout = std::time::Duration::from_secs(timeout_secs);
+            // wall: 等=一次请求的处理 / 等不到=按超时答复调用方 / 续跑=能，调用方重发
             match tokio::time::timeout(timeout, next.run(req)).await {
                 Ok(response) => response,
                 Err(_) => {
@@ -3542,7 +3567,7 @@ pub(crate) async fn read_active_alerts(
                 })
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
 
     // The store above is process-local: it holds the supervisor's health
     // events for this process and starts empty after a restart. Durable
@@ -4068,12 +4093,18 @@ async fn guard_check_handler(
                     guardrail.check_input(&messages).await
                 }
                 "output" => {
-                    let response = req.response.unwrap_or_default();
+                    let response = req.response.unwrap_or(Default::default());
                     guardrail.check_output(&response).await
                 }
                 "tool" => {
-                    let tool_call = req.tool_call.and_then(|v| serde_json::from_value::<cog_core::ToolCall>(v).ok())
-                        .unwrap_or(cog_core::ToolCall { id: "".into(), name: "".into(), arguments: serde_json::Value::Null });
+                    let tool_call = req
+                        .tool_call
+                        .and_then(|v| serde_json::from_value::<cog_core::ToolCall>(v).ok())
+                        .unwrap_or_else(|| cog_core::ToolCall {
+                            id: "".into(),
+                            name: "".into(),
+                            arguments: serde_json::Value::Null,
+                        });
                     guardrail.check_tool_call(&tool_call).await
                 }
                 _ => return (
@@ -4266,7 +4297,7 @@ async fn eval_get_report_handler(
                         .and_then(|d| d.as_str())
                         .map(String::from)
                 })
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             let report_markdown = match state.eval_service {
                 Some(ref service) => match service.render_report(&content, "markdown").await {
                     Ok(md) => md,

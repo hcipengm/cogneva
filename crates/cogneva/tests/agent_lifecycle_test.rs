@@ -395,6 +395,7 @@ async fn two_inbox_prompts_on_one_employee_do_not_share_a_window() {
                 goal: serde_json::json!({ "task": format!("这一件活 {marker}") }),
                 reply_stream: None,
                 from_agent: None,
+                intent: None,
             })
             .await
             .expect("投递的这一条要真的跑起来");
@@ -508,6 +509,7 @@ async fn a_resident_employee_reads_who_sent_the_message() {
             goal: serde_json::json!({ "task": "查一下昨晚那次发布为什么红了" }),
             reply_stream: None,
             from_agent: Some("mira".into()),
+            intent: None,
         })
         .await
         .expect("这一条要真的跑起来");
@@ -528,6 +530,7 @@ async fn a_resident_employee_reads_who_sent_the_message() {
             goal: serde_json::json!({ "task": "再看一下另一件事" }),
             reply_stream: None,
             from_agent: None,
+            intent: None,
         })
         .await
         .expect("这一条也要真的跑起来");

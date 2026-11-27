@@ -381,5 +381,5 @@ fn a_local_copy_put_back_reddens_both_faces() {
     assert_eq!(defs.len(), 3, "src/ 里的定义要数得出来：{defs:?}");
     assert_eq!(climbs.len(), 3, "src/ 里的算法要数得出来：{climbs:?}");
 
-    std::fs::remove_dir_all(&root).ok();
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }

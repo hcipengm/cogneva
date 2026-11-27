@@ -155,6 +155,7 @@ fn default_true() -> bool {
 
 /// 邮件提交口：RFC 6409 给提交（而非中继）定的约定端口。
 // cap: fixed — RFC 6409 提交端口 587
+// keep: 删掉后提交端不知道连哪个口，告警发不出去；由「RFC 6409 提交端口」兜住
 pub const SMTP_SUBMISSION_PORT: u16 = 587;
 
 impl Default for SmtpConfig {
@@ -474,7 +475,8 @@ pub const CONFIG_DECLARATION_RULE: &str = "config_declaration_mismatch";
 pub const CONFIG_RULES_NOT_LOADED_RULE: &str = "config_rules_not_loaded";
 
 /// Longest an alert label value may be before it is truncated.
-// cap: bound — 告警标签值在被截之前最长能有多长；再长的部分读者认不出是同一件事
+// cap: fixed — 告警标签值在被截之前最长能有多长；再长的部分读者认不出是同一件事
+// keep: 删掉后标签值无上界，再长的部分读者也认不出是同一件事；由「被截之前最长能有多长」兜住
 pub const ALERT_LABEL_VALUE_MAX_CHARS: usize = 1024;
 
 /// Truncate on a character boundary and mark that it happened.
@@ -503,7 +505,7 @@ pub fn bounded_task_goal(input: Option<&serde_json::Value>, max_chars: usize) ->
     let text = input
         .and_then(|v| v.get("goal"))
         .and_then(|g| g.as_str())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     clamp_label_text(text, max_chars)
 }
 

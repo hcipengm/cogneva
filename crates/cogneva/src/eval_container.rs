@@ -29,7 +29,8 @@ use cog_core::{SFError, SFResult, ToolExecutor};
 ///
 /// 这些探测只判「这台机器能不能建」，命令本身是秒级；20s 还没结束就说明守护
 /// 进程不在，与「不能建」是同一个结论。
-// cap: bound — 这条探测只判「这台机器能不能建」，命令本身是秒级；20s 还没结束说明守护进程不在，与「不能建」是同一个结论
+// cap: fixed — 这条探测只判「这台机器能不能建」，命令本身是秒级；20s 还没结束说明守护进程不在，与「不能建」是同一个结论
+// keep: 删掉后守护进程不在时探测永远等下去，与「不能建」分不开；由「秒级的命令、20s 还没结束就是同一个结论」兜住
 const PROBE_CONTAINER_WAIT: Duration = Duration::from_secs(20);
 use crate::eval_toolathlon::next_exec_id;
 use cog_eval::{
@@ -112,7 +113,7 @@ const FOREIGN_INDEX_PATH: &str = "/tmp/foreign.index";
 /// 读不出来就是 `Err(为什么)`，**不是**一个空列表：一块写坏的声明与「这次没有外部流派」
 /// 读起来一样，而处置相反——前者要去改声明，后者什么都不用做。
 pub fn foreign_flows() -> Result<Vec<ForeignFlowSpec>, String> {
-    let raw = std::env::var(ENV_FOREIGN_FLOWS).unwrap_or_default();
+    let raw = std::env::var(ENV_FOREIGN_FLOWS).unwrap_or(Default::default());
     let lines: Vec<&str> = raw
         .lines()
         .map(str::trim)
@@ -316,14 +317,14 @@ impl BuildahRuntime {
         if let Some(cached) = slot.as_ref() {
             return cached.clone();
         }
-        let out = self
-            .exec(&[
+        let out = cog_core::logged_ok!(
+            self.exec(&[
                 "images".into(),
                 "--format".into(),
                 "{{.Name}}:{{.Tag}}".into(),
             ])
             .await
-            .ok();
+        );
         let answer = match out {
             Some(out) if out.code == Some(0) => Some(parse_image_refs(&out.stdout)),
             _ => None,
@@ -411,6 +412,7 @@ async fn probe(prefix: &[String]) -> bool {
         let Ok(child) = spawn(&["from", "--name", &name, "scratch"]) else {
             return false;
         };
+        // roundtrip: 一次探测命令
         started = match tokio::time::timeout(PROBE_CONTAINER_WAIT, child.wait_with_output()).await {
             Ok(Ok(out)) => out.status.success(),
             _ => false,
@@ -418,7 +420,10 @@ async fn probe(prefix: &[String]) -> bool {
         // 探针容器不管成没成都收掉：留下一个同名容器会让下一次 `from` 直接失败
         // （重试那一次也走这条清理，否则第二次会撞上自己）。
         if let Ok(mut cleanup) = spawn(&["rm", &name]) {
-            let _ = tokio::time::timeout(PROBE_CONTAINER_WAIT, cleanup.wait()).await;
+            // roundtrip: 一次清理命令收尾
+            cog_core::ignore_lost!(
+                tokio::time::timeout(PROBE_CONTAINER_WAIT, cleanup.wait()).await
+            );
         }
         if started {
             break;
@@ -492,7 +497,7 @@ impl Container {
     /// 按名起一台。同名先清掉：上一次跑留下的同名容器会让 `from` 直接失败，而它只是一份
     /// 半成品，不该拦住这一次。
     async fn create(runtime: Arc<BuildahRuntime>, image: &str, name: &str) -> anyhow::Result<Self> {
-        let _ = runtime.exec(&["rm".into(), name.into()]).await;
+        cog_core::ignore_lost!(runtime.exec(&["rm".into(), name.into()]).await);
         let mut out = runtime
             .exec(&["from".into(), "--name".into(), name.into(), image.into()])
             .await?;
@@ -502,7 +507,7 @@ impl Container {
             && overlay_driver_cannot_nest(&out.stderr)
             && runtime.adopt_storage_driver(FALLBACK_STORAGE_DRIVER).await
         {
-            let _ = runtime.exec(&["rm".into(), name.into()]).await;
+            cog_core::ignore_lost!(runtime.exec(&["rm".into(), name.into()]).await);
             out = runtime
                 .exec(&["from".into(), "--name".into(), name.into(), image.into()])
                 .await?;
@@ -1067,7 +1072,7 @@ impl SweProBackend for SweProContainerBackend {
         // 起完容器之后任一步失败都要回收：留着它既占盘（一份题镜像近 1 GB），又会让下一次
         // 同名起容器失败。
         if let Err(e) = prepare(&container, base, test_patch).await {
-            let _ = container.remove().await;
+            cog_core::ignore_lost!(container.remove().await);
             return Err(e);
         }
 
@@ -1149,7 +1154,7 @@ impl SweProBackend for SweProContainerBackend {
             .get("selected_test_files_to_run")
             .map(|raw| parse_test_list(raw))
             .transpose()?
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let arg = if files.is_empty() {
             String::new()
         } else {

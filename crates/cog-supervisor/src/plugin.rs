@@ -218,7 +218,7 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
         let alert_stop = ctx
             .consume::<cog_core::ShutdownSignal>()
             .map(|s| (*s).clone())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         drop(cog_core::loop_health::spawn(
             ALERT_STORE_LOOP,
             cog_core::loop_health::Cadence::EventDriven,
@@ -283,7 +283,7 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
         let handle = tokio::spawn(async move {
             supervisor
                 .run(async move {
-                    shutdown_rx.await.ok();
+                    cog_core::ignore_lost!(shutdown_rx.await);
                 })
                 .await;
             info!("Supervisor task exited");
@@ -338,7 +338,7 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
 
     async fn shutdown(&self) -> cog_core::SFResult<()> {
         if let Some(tx) = self.shutdown_tx.lock().await.take() {
-            let _ = tx.send(());
+            cog_core::ignore_lost!(tx.send(()));
         }
         if let Some(handle) = self.task_handle.lock().await.take() {
             if let Err(e) = handle.await {

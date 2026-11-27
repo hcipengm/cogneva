@@ -37,6 +37,7 @@ pub struct AblationGroup {
 ///
 /// 要重复才写 2、3——零次跑不出均值，而「跑一次」是这里唯一不用选就有意义的数。
 // cap: fixed — 次数的单位：一次＝不重复
+// not-a-bound: 次数的单位：一次＝不重复
 const ONE_RUN: u32 = 1;
 
 fn default_runs() -> u32 {

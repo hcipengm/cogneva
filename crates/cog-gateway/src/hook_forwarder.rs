@@ -103,7 +103,7 @@ impl HookToWsForwarder {
                         }
 
                         // Broadcast to WebSocket subscribers; ignore send errors (no receivers).
-                        let _ = event_tx.send(event);
+                        cog_core::ignore_lost!(event_tx.send(event));
                     }
                 }
             },

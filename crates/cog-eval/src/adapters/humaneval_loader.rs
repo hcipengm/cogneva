@@ -181,7 +181,7 @@ mod tests {
                 "{}: no assertion block, so nothing could score this problem",
                 case.id
             );
-            let entry_point = entry_point.unwrap_or_default();
+            let entry_point = entry_point.unwrap_or(Default::default());
             assert!(
                 !entry_point.is_empty(),
                 "{}: the assertions call a function by name and the name is missing",
@@ -192,7 +192,7 @@ mod tests {
             // release's file does not contain that call -- its own harness adds
             // it -- so this asserts the loader's half of the contract, not the
             // dataset's. Textual, because nothing in this crate runs Python.
-            let test = test.unwrap_or_default();
+            let test = test.unwrap_or(Default::default());
             assert!(
                 test.contains("def check("),
                 "{}: the block that defines the checker is gone",

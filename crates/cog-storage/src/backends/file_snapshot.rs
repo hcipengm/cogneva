@@ -13,6 +13,7 @@ impl FileSnapshotStore {
     }
 
     fn path(&self, snapshot_id: &str) -> std::path::PathBuf {
+        // state-file: store — 文件后端自己的介质：接上它时这里就是正本，不是第二份
         self.dir.join(format!("{}.json", snapshot_id))
     }
 }
@@ -146,7 +147,7 @@ mod tests {
             "the error must name the file to inspect, got: {err}"
         );
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        cog_core::ignore_lost!(tokio::fs::remove_dir_all(&dir).await);
     }
 
     /// A save publishes through a rename; its temp sibling must not survive a
@@ -182,6 +183,6 @@ mod tests {
             "only the published snapshot is listed"
         );
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        cog_core::ignore_lost!(tokio::fs::remove_dir_all(&dir).await);
     }
 }

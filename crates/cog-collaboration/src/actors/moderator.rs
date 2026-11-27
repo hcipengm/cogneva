@@ -199,7 +199,7 @@ impl ModeratorActor {
                 )
             }
         };
-        let output_str = serde_json::to_string_pretty(&output).unwrap_or_default();
+        let output_str = serde_json::to_string_pretty(&output).unwrap_or(Default::default());
         if let Some(revised) = crate::actors::maybe_self_review(
             self.agent.as_ref(),
             &self.self_review,
@@ -251,7 +251,7 @@ pub fn parse_moderator_output(value: &serde_json::Value) -> ModeratorOutput {
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
 
     let good_enough = value
         .get("good_enough")

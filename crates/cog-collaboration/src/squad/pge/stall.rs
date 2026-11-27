@@ -103,7 +103,8 @@ fn criteria_improved(prev: &ProgressSignals, cur: &ProgressSignals) -> bool {
 /// 两次连续没有进展才是「它不会自己好」。两处配置各写一个 2 就是同一句话的
 /// 两次声明，改一处的下一次只会改一处。0 不是这个数的一个取值，是关掉检测
 /// （见 [`StallDetector::new`]）。
-// cap: bound — 「连续两次平」的判断，两个默认值读它；只往下调会更早判停
+// cap: fixed — 「连续两次平」的判断，两个默认值读它；只往下调会更早判停
+// keep: 删掉后连续两次平不被判停，或更早判停把正常的重试当成停住；由「连续两次平」兜住
 pub const STALL_THRESHOLD: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

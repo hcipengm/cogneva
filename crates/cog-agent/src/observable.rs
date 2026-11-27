@@ -250,7 +250,7 @@ impl ContextMeasurements {
             .map(Self::key)
             .filter(|key| !key.is_empty())
             .and_then(|key| self.per_model.get(&key).copied())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         ModelMeasurements {
             accepted_max: own.accepted_max.max(self.unattributed.accepted_max),
             limit_min: match (own.limit_min, self.unattributed.limit_min) {
@@ -386,7 +386,8 @@ struct RosterEntry {
 /// A window rather than a lifetime archive on purpose: the ceiling is meant to
 /// track the workload as it is now, and a run from a month ago under a
 /// different model says nothing about how much work a run needs today.
-// cap: bound — 窗口跟的是现在的负载；一个月前另一个模型下的一轮跑，说不了今天的活要多少
+// cap: fixed — 窗口跟的是现在的负载；一个月前另一个模型下的一轮跑，说不了今天的活要多少
+// keep: 删掉后窗口无界，一个月前另一个模型的运行也来定今天的预算；由「窗口跟现在的负载」兜住
 const BUDGET_SAMPLE_WINDOW: usize = 64;
 
 /// How a role's own finished runs ended.
@@ -2671,6 +2672,7 @@ mod tests {
                 goal: serde_json::Value::Null,
                 reply_stream: None,
                 from_agent: None,
+                intent: None,
             },
             cog_core::InboxMessage::Continue {
                 instruction: String::new(),

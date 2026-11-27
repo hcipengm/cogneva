@@ -40,7 +40,8 @@ pub const SKIP_NEEDS_VISION: &str =
 /// 这是**读取周期**，不是判据：判据是实测的静默窗口（`cog_core::declared_wall::stall`），
 /// 这一拍只决定多久去看一眼，只能让判词晚到，不会让它变宽或变窄。所以它不必与
 /// 任何实测量对齐。
-// cap: bound — 读取周期钉在这里，不是界；界是 cog_core::progress 按实测步间隔算出来的窗口
+// cap: fixed — 读取周期钉在这里，不是界；界是 cog_core::progress 按实测步间隔算出来的窗口
+// keep: 删掉后停滞判据没有采样节奏，读不到步间隔；由「界由 progress 按实测步间隔算」兜住
 const STALL_POLL: Duration = Duration::from_secs(1);
 
 /// 一次实验的配置。

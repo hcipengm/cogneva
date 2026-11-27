@@ -69,7 +69,7 @@ impl HeartbeatDriver {
                                         agent_id: agent_id.clone(),
                                         timestamp: chrono::Utc::now(),
                                     };
-                                    let _ = tx.send(event);
+                                    cog_core::ignore_lost!(tx.send(event));
                                 }
                             }
                             _ = cancel.wait() => {

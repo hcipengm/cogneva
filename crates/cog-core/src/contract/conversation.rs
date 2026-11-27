@@ -16,8 +16,20 @@ use crate::SFResult;
 /// Larger than the forty messages the model is shown as context, because the
 /// two bounds answer different questions: the context window is what fits in a
 /// request, and this is how far back a reader can still see what was said.
-// cap: bound — 上下文窗管的是「一次请求装得下多少」，这个管的是「读者还能往回看多远」
+// cap: fixed — 上下文窗管的是「一次请求装得下多少」，这个管的是「读者还能往回看多远」
+// keep: 删掉后读者往回看的深度没有界，历史在列表里消失；由「读者还能往回看多远」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 pub const ROWS_KEPT_PER_SESSION: i64 = 200;
+
+/// 界面刷新一轮的周期。判「存储还跟不跟得上」时，写入延迟的 p99 与它的一半比。
+///
+/// 这个数不是后端的旋钮：它由界面自己定（`web/src/hooks/useResource.ts` 的默认
+/// 轮询间隔），后端读不到浏览器里的那个值，所以只能按协议常量收在这一处，
+/// 由一条跨树的门把它与界面源码里那个数钉在一起。浏览器把周期改了而这里没改，
+/// 判词的线就跟着错。
+// cap: fixed — 界面自己的轮询周期，由 `web/src/hooks/useResource.ts` 的默认值给定
+// keep: 删掉后写入延迟的判词没有可比的那条线；由这条协议约定兜住
+pub const UI_REFRESH_MS: u64 = 30_000;
 
 /// Who said one line of the transcript.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,7 +350,9 @@ pub trait ChatTurnStore: Send + Sync {
 /// Rows kept per receiving peer, so a chatty sender cannot grow the table
 /// without bound. Larger than what a panel shows at once, because how far back
 /// a reader can scroll and what fits on one screen answer different questions.
-// cap: bound — 比一个面板一次显示的更多，因为「能往回滚多远」与「一屏装得下多少」答的不是同一个问题
+// cap: fixed — 比一个面板一次显示的更多，因为「能往回滚多远」与「一屏装得下多少」答的不是同一个问题
+// keep: 删掉后每对端的历史深度与面板一次显示的量混为一谈；由「能往回滚多远与一屏装多少不是同一个问题」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 pub const ROWS_KEPT_PER_PEER: i64 = 500;
 
 /// The settled shape of one send.

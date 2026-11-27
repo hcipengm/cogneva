@@ -1,3 +1,4 @@
+// census-keep: shapes=clocks — 这里只按归因停（/proc 说 Spin 才杀，读 I/O、等锁、读不到一律放行），删掉会让空转进程永久占住构建槽与共享 target 锁；由 BuildSlot 生命周期与 verification_budget.record_stopped 兜住
 //! Whether a running attempt is *moving*, as a fact its supervisor can read.
 //!
 //! Before this module the only question a supervisor could ask about a running
@@ -37,7 +38,8 @@ use std::time::{Duration, Instant};
 ///
 /// It is also what the sample floor is derived from (see [`SAMPLE_FLOOR`]), so
 /// moving this one number moves both, and neither can drift from the other.
-// cap: bound — 误判预算是拍定的：窗口取在这里，随手停摆回收约千分之一次仍在干活的尝试，这就是选它的全部理由；没有一条测量能把它调到别处
+// cap: fixed — 误判预算是拍定的：窗口取在这里，随手停摆回收约千分之一次仍在干活的尝试，这就是选它的全部理由；没有一条测量能把它调到别处
+// keep: 删掉后误判预算不再是千分之一，回收会带走仍在干活的尝试；由「窗口取在这里就是选它的全部理由」兜住
 pub const SILENCE_QUANTILE: f64 = 0.999;
 
 /// How many gap samples a window needs before it is a reading at all.
@@ -47,7 +49,8 @@ pub const SILENCE_QUANTILE: f64 = 0.999;
 /// Derived from [`SILENCE_QUANTILE`] rather than picked, so the two cannot
 /// disagree — a floor that stayed at 100 while the quantile moved to 0.9999
 /// would report a window from a sample that cannot support it.
-// cap: bound — 1 / (1 - SILENCE_QUANTILE)：估 0.999 分位要至少有一个落在它之外的点
+// cap: fixed — 1 / (1 - SILENCE_QUANTILE)：估 0.999 分位要至少有一个落在它之外的点
+// keep: 删掉后回到「1 / (1 - SILENCE_QUANTILE)：估 0.999 分位要至少有一个落在它之外的点」所描述的情形；由这条约定兜住
 pub const SAMPLE_FLOOR: usize = 1000;
 
 fn beacons() -> &'static Mutex<HashMap<String, Instant>> {
@@ -338,7 +341,8 @@ pub const PROGRESS_FILE_UNBOUNDED: &str = "unbounded";
 ///
 /// 它不改判据，只改这条读数自己的开销；一秒一次足够让探针读到「它还活着」，而
 /// `mtime` 的精度也就是秒。
-// cap: bound — 写盘频率是钉住的节奏，不是界；界是文件里那个窗口
+// cap: fixed — 写盘频率是钉住的节奏，不是界；界是文件里那个窗口
+// keep: 删掉后写盘没有节奏，每次进度都落一次盘；由「写盘频率是节奏、界是文件里那个窗口」兜住
 const PROGRESS_FILE_WRITE_TICK: Duration = Duration::from_secs(1);
 
 /// kubelet 的 exec 探针在容器里跑的那一条命令。
@@ -355,17 +359,20 @@ pub const PROGRESS_PROBE_COMMAND: &str = r#"f="$COGNEVA_PROGRESS_FILE"; if [ -z 
 ///
 /// 这只是判词最晚多久出现，不是判据：判据是文件里那个窗口，探针的节奏只决定
 /// 「停住」最多晚几分钟被说出来。
-// cap: bound — 读取周期钉在这里，不是判据；判据是文件里的实测窗口
+// cap: fixed — 读取周期钉在这里，不是判据；判据是文件里的实测窗口
+// keep: 删掉后读进度没有周期，判据拿不到新的实测窗口；由「读取周期钉在这里、判据是文件里的窗口」兜住
 pub const PROBE_PERIOD_SECS: u64 = 30;
 
 /// 连续几次读数超窗才判死。窗口本身已经是「这套部署从没在干活时静默过这么久」，
 /// 再要几次连续读数，是为了不让一次读盘抖动变成一次重启。
-// cap: bound — 连续读数次数钉在这里，不是界；界是实测窗口，它只防一次抖动
+// cap: fixed — 连续读数次数钉在这里，不是界；界是实测窗口，它只防一次抖动
+// keep: 删掉后一次读失败就被读成停摆，抖动回收在干活的尝试；由「只防一次抖动」兜住
 pub const PROBE_FAILURE_THRESHOLD: u32 = 3;
 
 /// 容器起来之后先给多久再开始探。进程开工第一件事就是建这个文件
 /// （[`start_progress_file`]），这段时间只是留给拉镜像与解压的。
-// cap: bound — 开工宽限钉在这里，不是判据；它只留拉镜像与解压的时间
+// cap: fixed — 开工宽限钉在这里，不是判据；它只留拉镜像与解压的时间
+// keep: 删掉后开工宽限消失，拉镜像与解压中的 Pod 被读成停摆；由「只留拉镜像与解压的时间」兜住
 pub const PROBE_INITIAL_DELAY_SECS: u64 = 120;
 
 fn last_progress_write() -> &'static Mutex<Option<Instant>> {
@@ -436,7 +443,8 @@ pub fn liveness_probe() -> serde_json::Value {
 /// 这是**读取周期，不是判据**：判据是 [`crate::declared_wall::stall`] 那条实测窗口，
 /// 这一拍只决定判词
 /// 最晚多久出现，不会让它变宽或变窄。所以它不参与任何「多少秒算停」的决定。
-// cap: bound — 读取周期钉在这里，不是界；界是实测的步间隔窗口
+// cap: fixed — 读取周期钉在这里，不是界；界是实测的步间隔窗口
+// keep: 删掉后读步间隔没有周期，界的输入不再刷新；由「界是实测的步间隔窗口」兜住
 pub const WATCH_TICK: Duration = Duration::from_secs(1);
 
 /// 判据与生产者共同的那一段：子进程被杀的原因是**它不再动**，不是它跑够了钟点。
@@ -452,6 +460,43 @@ pub fn went_silent(cmdline: &str, silent: Duration, window: Duration) -> String 
     format!(
         "{cmdline} {WENT_SILENT} {silent:?}, longer than the {window:?} this deployment has measured"
     )
+}
+
+/// 一次判停的归因：静默了多久、界是多少、它此刻停在哪、等什么。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stall {
+    /// 已经多久没有可观测的移动。
+    pub silent: Duration,
+    /// 这一套部署实测出来的界。
+    pub window: Duration,
+    /// 它此刻的状态、等待对象、持锁者。
+    pub cause: SilenceCause,
+}
+
+/// 判停之后由谁动手：调用方拿到归因，回答「继续等」还是「收」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StallDecision {
+    /// 它在一个会自己结束的等待里（I/O、锁、读不到）：继续等，界是靠正常结束的那段
+    /// 静默涨上去的，不是靠杀掉它。
+    KeepRunning,
+    /// 它没有任何可等的对象、却也不动（空转）：等下去不会自己结束，收掉。
+    Kill,
+}
+
+/// 动作由归因决定，不由时钟决定。
+///
+/// 只有「热的、却没有对象可等」这一档收：它等的是一个永远不会来的东西，继续等只是
+/// 把它从读数里拖走。在等 I/O、在等锁、以及读不到 `/proc` 的那三档都不收——那三种
+/// 都会自己结束，而杀掉它们会把成因此外销毁，事后只剩「被判停」一条读数。
+// keep: 删掉这一档，空转的子进程会永久握住构建槽与共享 target 锁，后续构建全部排队；
+// 由 `BuildSlot` 生命周期与 `verification_budget.record_stopped` 计数兜住。
+pub fn action_for(cause: &SilenceCause) -> StallDecision {
+    match cause.action {
+        SilenceAction::Spin => StallDecision::Kill,
+        SilenceAction::Wait | SilenceAction::WaitOnLock | SilenceAction::Unknown => {
+            StallDecision::KeepRunning
+        }
+    }
 }
 
 /// 一个被看门狗看着的子进程的结局。
@@ -488,6 +533,14 @@ pub struct SilenceCause {
     /// 等锁时点名到的那几个持锁进程。空 = 没点出来（不是「没有人持锁」：
     /// 内核 futex 那一类读不出持锁者，见 [`file_lock_holders`]）。
     pub holders: Vec<u32>,
+    /// 这个进程此刻有几条线程（`/proc/<pid>/task` 的条数）。0 = 没读到。
+    ///
+    /// futex 那一类持锁者点不出名字时的第二条读数：等的是**这个进程自己**的多线程
+    /// 内部工作，还是所有线程都睡死在一把锁上，这两种要做的处置不同，而只看
+    /// 「在等锁」一格分不出来。
+    pub threads: usize,
+    /// 其中处于可运行状态（`R`）的线程数。0 = 没读到，或者全都在睡。
+    pub runnable_threads: usize,
 }
 
 /// 一份静默的处置。
@@ -510,8 +563,16 @@ impl SilenceCause {
             SilenceAction::Wait => "waiting on an object; keep running",
             SilenceAction::WaitOnLock => {
                 if self.holders.is_empty() {
-                    "waiting on a lock; keep running, and the holder is not readable from /proc \
-                     (a kernel futex does not name it)"
+                    if self.threads > 0 {
+                        // 点不出持锁者时至少把「这个进程自己是什么样」说出来：有线程在跑，
+                        // 等的是内部工作；一条都不跑，才是死在一把锁上。
+                        "waiting on a lock; keep running; the holder is not namable from /proc \
+                         (a kernel futex does not name it), and this process has its own threads \
+                         to check"
+                    } else {
+                        "waiting on a lock; keep running, and the holder is not readable from /proc \
+                         (a kernel futex does not name it)"
+                    }
                 } else {
                     "waiting on a lock; keep running and ask the holder"
                 }
@@ -520,7 +581,14 @@ impl SilenceCause {
             SilenceAction::Unknown => "unreadable; not guessed",
         };
         if self.holders.is_empty() {
-            format!("{}; in {}; {action}", self.state, self.wchan)
+            if matches!(self.action, SilenceAction::WaitOnLock) && self.threads > 0 {
+                format!(
+                    "{}; in {}; {action}; this process has {} threads, {} of them runnable",
+                    self.state, self.wchan, self.threads, self.runnable_threads
+                )
+            } else {
+                format!("{}; in {}; {action}", self.state, self.wchan)
+            }
         } else {
             let who: Vec<String> = self.holders.iter().map(|p| format!("pid {p}")).collect();
             format!(
@@ -542,7 +610,7 @@ impl SilenceCause {
 pub fn file_lock_holders(pid: u32) -> Vec<u32> {
     #[cfg(not(unix))]
     {
-        let _ = pid;
+        cog_core::ignore_lost!(pid);
         Vec::new()
     }
     #[cfg(unix)]
@@ -583,7 +651,8 @@ pub fn file_lock_holders(pid: u32) -> Vec<u32> {
                 continue;
             };
             let mut parts = fields[5].split(':');
-            let (Some(major), Some(minor), Some(inode)) = (parts.next(), parts.next(), parts.next())
+            let (Some(major), Some(minor), Some(inode)) =
+                (parts.next(), parts.next(), parts.next())
             else {
                 continue;
             };
@@ -630,12 +699,47 @@ pub fn describe_silence(pid: u32) -> SilenceCause {
     } else {
         Vec::new()
     };
+    // futex 那一类点不出持锁者，于是多读一格：这个进程自己有几条线程、几条还在跑。
+    // 读不到（进程已退出、没有 procfs）时留 0——「量不到」不是「一条线程都没有」。
+    let (threads, runnable_threads) = if action == SilenceAction::WaitOnLock && holders.is_empty() {
+        thread_census(pid)
+    } else {
+        (0, 0)
+    };
     SilenceCause {
         state,
         wchan,
         action,
         holders,
+        threads,
+        runnable_threads,
     }
+}
+
+/// 一个进程此刻的线程数，以及其中处于 `R` 的条数。读不到时是 `(0, 0)`。
+pub fn thread_census(pid: u32) -> (usize, usize) {
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return (0, 0);
+    };
+    let mut threads = 0usize;
+    let mut runnable = 0usize;
+    for entry in entries.flatten() {
+        threads += 1;
+        let stat = std::fs::read_to_string(entry.path().join("stat"))
+            .map_err(|e| e.to_string())
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "读取不到这一进程的 stat，按空文本继续");
+                String::new()
+            });
+        // stat 的第 3 个字段是状态；第 2 个是带括号的线程名，可能含空格，从最后一个
+        // `)` 之后开始切。
+        if let Some(rest) = stat.rsplit(')').next() {
+            if rest.split_whitespace().next() == Some("R") {
+                runnable += 1;
+            }
+        }
+    }
+    (threads, runnable)
 }
 
 /// 由状态与等待对象算处置。
@@ -696,7 +800,26 @@ pub async fn run_child_watched_with_pid<F>(
 where
     F: FnOnce(u32),
 {
-    run_child_watched_observed(cmd, id, on_spawn, None).await
+    run_child_watched_observed(cmd, id, on_spawn, None, None)
+        .await
+        .map(|(outcome, _)| outcome)
+}
+
+/// Same, and the caller answers what to do once the child is judged stopped.
+///
+/// 一个没有第二个观察者的单步动作（一次构建、一次部署）用它：判停之后没有人会再看
+/// 一眼，等下去就是永远等下去。回答者拿到的是一整份归因，所以「收」只在归因说它
+/// 不会自己结束时发生（见 [`action_for`]），不是一个按秒的时钟。
+pub async fn run_child_watched_with_pid_decided<F>(
+    cmd: tokio::process::Command,
+    id: &str,
+    on_spawn: F,
+    decide: std::sync::Arc<dyn Fn(&Stall) -> StallDecision + Send + Sync>,
+) -> std::io::Result<(ChildOutcome, Option<Stall>)>
+where
+    F: FnOnce(u32),
+{
+    run_child_watched_observed(cmd, id, on_spawn, None, Some(decide)).await
 }
 
 /// Same, and every beat this child produces is also handed to `also`.
@@ -717,7 +840,9 @@ where
     F: FnOnce(u32),
     G: Fn() + Send + Sync + 'static,
 {
-    run_child_watched_observed(cmd, id, on_spawn, Some(std::sync::Arc::new(also))).await
+    run_child_watched_observed(cmd, id, on_spawn, Some(std::sync::Arc::new(also)), None)
+        .await
+        .map(|(outcome, _)| outcome)
 }
 
 async fn run_child_watched_observed<F>(
@@ -725,7 +850,8 @@ async fn run_child_watched_observed<F>(
     id: &str,
     on_spawn: F,
     also: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
-) -> std::io::Result<ChildOutcome>
+    decide: Option<std::sync::Arc<dyn Fn(&Stall) -> StallDecision + Send + Sync>>,
+) -> std::io::Result<(ChildOutcome, Option<Stall>)>
 where
     F: FnOnce(u32),
 {
@@ -744,7 +870,7 @@ where
         on_spawn(pid);
     }
     beat(id);
-    watch_child(&mut child, id, also).await
+    watch_child_decided(&mut child, id, also, decide).await
 }
 
 /// 看着一个**已经起来**的子进程，判据与 [`run_child_watched`] 是同一条。
@@ -758,6 +884,24 @@ pub async fn watch_child(
     id: &str,
     also: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 ) -> std::io::Result<ChildOutcome> {
+    watch_child_decided(child, id, also, None)
+        .await
+        .map(|(outcome, _)| outcome)
+}
+
+/// 同 [`watch_child`]，另加一个「判停之后怎么办」的回答者。
+///
+/// 不给回答者（[`watch_child`]）就是「只归因、不动手」：调用方可能有第二个观察者，
+/// 而这里只有这一条子进程的读数。给了回答者，它拿到的是一整份归因（停在哪个状态、
+/// 等什么、静默多久、界多少），回答「继续等」还是「收」——动作由归因决定，不由时钟
+/// 决定。收掉之后结局是 [`ChildOutcome::Stalled`]：它没有跑完，也没有结论，读的人要
+/// 能从结局里分出这一种，而不是把它读成一次失败。
+pub async fn watch_child_decided(
+    child: &mut tokio::process::Child,
+    id: &str,
+    also: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    decide: Option<std::sync::Arc<dyn Fn(&Stall) -> StallDecision + Send + Sync>>,
+) -> std::io::Result<(ChildOutcome, Option<Stall>)> {
     // 两条管子各一个读端：只读一条时，另一条写满管道缓冲就会把子进程堵在那里，
     // 而那副样子在读数上与「它停了」一模一样——一个自己造出来的停住。
     //
@@ -791,6 +935,8 @@ pub async fn watch_child(
     // 从这一拍重起，会让一段 2.5 秒的安静只量出 1.5 秒——样本永远比实际短一拍，
     // 而界是从这些样本导出的，短一拍的界会误杀下一次正常的等待。
     let mut seen_once = false;
+    // 判停之后被按归因收掉的那一份归因：收场结局要从这里读，而它发生在循环里。
+    let mut stopped: Option<Stall> = None;
     let status = loop {
         tokio::select! {
             status = child.wait() => break status?,
@@ -823,8 +969,32 @@ pub async fn watch_child(
                             wchan: "unreadable".to_string(),
                             action: crate::progress::SilenceAction::Unknown,
                             holders: Vec::new(),
+                            threads: 0,
+                            runnable_threads: 0,
                         });
                     let where_it_stopped = cause.describe();
+                    let stall = Stall {
+                        silent,
+                        window,
+                        cause,
+                    };
+                    // 动作由归因决定：没有回答者、或回答「继续等」时只归因不动手。
+                    let decision = decide
+                        .as_ref()
+                        .map(|decide| decide(&stall))
+                        .unwrap_or(StallDecision::KeepRunning);
+                    if decision == StallDecision::Kill {
+                        tracing::warn!(
+                            silent_secs = silent.as_secs_f64(),
+                            window_secs = window.as_secs_f64(),
+                            cause = %where_it_stopped,
+                            "the child is not waiting on anything and has stopped moving; \
+                             killing it on that attribution"
+                        );
+                        let _ = child.start_kill();
+                        stopped = Some(stall);
+                        break child.wait().await?;
+                    }
                     tracing::warn!(
                         silent_secs = silent.as_secs_f64(),
                         window_secs = window.as_secs_f64(),
@@ -843,15 +1013,24 @@ pub async fn watch_child(
         let chunk = match reader.await {
             Ok(Ok(chunk)) => chunk,
             // 判停之后管子是我们自己打断的：那一侧读到错是这次收场的预期形状，
-            // 不是一段没读到的输出。
+            // 不是一段没读到的输出——收场结局与归因已经定了，不能因为管子断了就
+            // 把它换成一条 IO 错（那样调用方拿不到归因，等于没判停）。
             // 没判停却读出错：交回的这段输出是被截断的，而调用方会把它当作完整
             // 结果去解析。说不出「读到哪儿断了」的一侧，不能报成一个正常的结尾。
+            Ok(Err(e)) if stopped.is_some() => {
+                let _ = e;
+                Vec::new()
+            }
             Ok(Err(e)) => {
                 forget(id);
                 return Err(std::io::Error::new(
                     e.kind(),
                     format!("reading the child's {side} failed: {e}"),
                 ));
+            }
+            Err(join) if stopped.is_some() => {
+                let _ = join;
+                Vec::new()
             }
             Err(join) => {
                 forget(id);
@@ -870,15 +1049,24 @@ pub async fn watch_child(
 
     // 正常结束：最后那一段静默是这条命令**干活时能有多安静**的一条实测。低于一拍的
     // 那一段不记——它是采样网格本身，不是关于这段活的读数。
-    let quiet = last_movement.elapsed();
-    if quiet > WATCH_TICK {
-        record_measured_silence(quiet);
+    //
+    // 被按归因收掉的（`stopped`）这一段**不是**实测：它是判停的那一段，把它记进
+    // 样本群只会让界每次判停后自己长大一格，谁也说不清那是工作本来就安静，还是
+    // 界被自己喂胖了。
+    if stopped.is_none() {
+        let quiet = last_movement.elapsed();
+        if quiet > WATCH_TICK {
+            record_measured_silence(quiet);
+        }
     }
-    Ok(ChildOutcome::Exited(std::process::Output {
-        status,
-        stdout,
-        stderr,
-    }))
+    Ok((
+        ChildOutcome::Exited(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        stopped,
+    ))
 }
 
 /// 这个进程到现在为止烧掉了多少 CPU 时间（用户 + 内核，单位是内核的时钟滴答）。
@@ -1192,6 +1380,83 @@ mod tests {
         assert!(
             after.moved_since(before),
             "the child's CPU has to count as this command moving"
+        );
+    }
+
+    /// 动作由归因决定：只有「热的、没有对象可等」这一档收；在等 I/O、在等锁、
+    /// 以及读不到 `/proc` 的三档都继续等。
+    ///
+    /// 判据是把归类函数与动作函数**分开**的：如果哪天有人把动作改成「静默够久就
+    /// 杀」，这条用例会在三档上红——那三种都会自己结束，杀掉它们只是把成因销毁。
+    #[test]
+    fn only_a_spin_with_nothing_to_wait_for_is_stopped() {
+        let cause = |state: &str, wchan: &str| SilenceCause {
+            state: state.to_string(),
+            wchan: wchan.to_string(),
+            action: classify_silence(state, wchan),
+            holders: Vec::new(),
+            threads: 0,
+            runnable_threads: 0,
+        };
+        // 热的、却没有可等的对象：等下去不会自己结束。
+        assert_eq!(
+            action_for(&cause("State: R (running)", "0")),
+            StallDecision::Kill
+        );
+        // 在等 I/O：会自己结束。
+        assert_eq!(
+            action_for(&cause("State: S (sleeping)", "pipe_read")),
+            StallDecision::KeepRunning
+        );
+        // 在等一把锁：成因可见，收掉就没有归因了。
+        assert_eq!(
+            action_for(&cause("State: S (sleeping)", "futex_wait")),
+            StallDecision::KeepRunning
+        );
+        // 读不到：判不了，不猜——不猜的两种落法里，收是不可逆的那一种。
+        assert_eq!(
+            action_for(&cause("State: unreadable", "unreadable")),
+            StallDecision::KeepRunning
+        );
+    }
+
+    /// 失败标本：样本群只收「被判停的那一段」时，判停线会一轮比一轮紧，最后把
+    /// 正常干活的那种安静（一次远端握手、一段 git fetch）也判成停住。
+    ///
+    /// 这一格就是把那种病写成可反问的判据：同一个样本群里，正常结束的一段静默
+    /// 与被判停的一段静默**同等地**决定线；把它们分成两个样本群，或者只让被判停
+    /// 的那些进来，下面第二个断言的形状就出来了——线只跟着误杀走，一圈圈往下收。
+    #[test]
+    fn a_population_of_kills_only_tightens_the_line_round_after_round() {
+        // 正常干活时的安静：网络等待整段不动，但它最后正常结束了。
+        let mut honest = GapSamples::default();
+        for _ in 0..SAMPLE_FLOOR {
+            honest.push(Duration::from_secs(40));
+        }
+        // 一次被判停的 41 秒进来：线不因此往下走，它本来就该比 40 秒宽。
+        honest.push(Duration::from_secs(41));
+        let with_normal = honest.window.expect("样本到量了就该有线");
+        assert!(
+            with_normal >= Duration::from_secs(40),
+            "正常结束的那段安静没有进样本群：线 {with_normal:?} 比干活时真静过的 40s 还窄"
+        );
+
+        // 只收误杀：每一轮进来的都比上一轮的线短一点点（那就是「越勒越紧」的样子）。
+        let mut kills_only = GapSamples::default();
+        for _ in 0..SAMPLE_FLOOR {
+            kills_only.push(Duration::from_secs(5));
+        }
+        let first = kills_only.window.expect("样本到量了就该有线");
+        // 水库只留最近十窗：灌满一整个水库的短样本，长的那些才真的被挤出去。
+        // 只加一窗时，5 秒的样本仍占着 99.9 分位，线不动——那说明的是分位数的
+        // 算术，不是这一格要展示的「只收误杀会往下收」。
+        for _ in 0..GapSamples::capacity() {
+            kills_only.push(Duration::from_secs(2));
+        }
+        let second = kills_only.window.expect("样本还在");
+        assert!(
+            second < first,
+            "这一格要证明的是「只收误杀会往下收」：{first:?} → {second:?}"
         );
     }
 

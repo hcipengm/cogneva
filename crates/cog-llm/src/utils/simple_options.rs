@@ -47,6 +47,7 @@ pub fn clamp_reasoning(level: Option<ThinkingLevel>) -> Option<ThinkingLevel> {
 /// 不是本仓挑的数——供应商的 `budget_tokens` 从 1024 起算，其余各档都是它的
 /// 整数倍。写成 1024 的四份拷贝会让「最小一档」这个说法在四处慢慢走散。
 // cap: fixed — 供应商扩展思考 `budget_tokens` 的最小值：1024
+// keep: 删掉后回到「供应商扩展思考 `budget_tokens` 的最小值：1024」所描述的情形；由这条约定兜住
 pub const THINKING_BUDGET_UNIT: u32 = 1024;
 
 /// Token budgets for each thinking level.
@@ -76,7 +77,7 @@ pub fn adjust_max_tokens_for_thinking(
     reasoning_level: Option<ThinkingLevel>,
     custom_budgets: Option<&ThinkingBudgets>,
 ) -> (u32, u32) {
-    let budgets = custom_budgets.cloned().unwrap_or_default();
+    let budgets = custom_budgets.cloned().unwrap_or(Default::default());
     let level = clamp_reasoning(reasoning_level).unwrap_or(ThinkingLevel::High);
     let thinking_budget = match level {
         // Nothing to reserve: the request asks the model not to think, so the

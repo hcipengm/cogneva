@@ -32,7 +32,8 @@ pub const REFLECTION_NAMESPACE: &str = "reflection";
 /// 评审读的是这一小时的产出与记忆，比它更密只会把同一批证据再读一遍；更长
 /// 则让一次跑偏的产出等到下一轮才被看见。这是 `SelfEvolution` 引擎的节拍，
 /// 与「一轮评审能跑多久」无关。
-// cap: bound — 引擎节拍，决定一次跑偏的产出多晚被看见，与「一轮评审能跑多久」无关
+// cap: fixed — 引擎节拍，决定一次跑偏的产出多晚被看见，与「一轮评审能跑多久」无关
+// keep: 删掉后引擎没有节拍，一次跑偏的产出不知道多晚才被看见；由「与一轮评审能跑多久无关的引擎节拍」兜住
 pub const SELF_REVIEW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 // 整份替换一份文件的规则与网关、主线共用一份实现，见 `cog_core::atomic_write`。
@@ -101,6 +102,7 @@ pub mod recorder;
 pub(crate) mod registry_endpoint;
 pub mod registry_footprint;
 pub mod reviewer;
+pub mod rollout_cadence;
 pub mod rollout_resources;
 pub mod runtime_assets;
 pub mod sandbox;
@@ -328,7 +330,8 @@ pub fn refusal_pattern_key(
 /// attempt cannot know. The spend is what matters, not the size — see
 /// `failure_digest`, which puts the diagnosis inside it. Shared by the refusal
 /// path and the general outcome path so one number governs both.
-// cap: bound — 同一条数管住拒绝路径与普通结果路径，两处共用才不会被各自调宽
+// cap: fixed — 同一条数管住拒绝路径与普通结果路径，两处共用才不会被各自调宽
+// keep: 删掉后拒绝路径与结果路径各写一个数，一处被调宽另一处不会跟着；由「同一条数管住两条路径」兜住
 const CHANGE_EVIDENCE_BUDGET: usize = 2000;
 
 /// The files a refusal names, spelled the one way the key and the record both
@@ -398,27 +401,31 @@ fn rework_surface(l: &cog_core::Learning, named_files: &[String]) -> String {
 ///
 /// 冷却挡的是「同一个键被反复触发」，不是触发本身：一次触发要花一次 LLM 调用，
 /// 而同一件事在一小时里再看一遍，看到的还是同一件事。
-// cap: bound — 一小时：同一键重看的间隔；只往下调会更频繁地重看同一件事
+// cap: fixed — 一小时：同一键重看的间隔；只往下调会更频繁地重看同一件事
+// keep: 删掉后同一个键被反复重看，冷却消失、每拍都重问同一件事；由「同一键重看的间隔」兜住
 const EVOLUTION_COOLDOWN_SECS: u64 = 3600;
 
 /// 同一个工具错几次才建议变体。
 ///
 /// 一次是手误，两次还可能撞上同一段输入，三次重复才是这条路本身走不通。
-// cap: bound — 三次：一次手误、两次同一个输入的重复都还说明不了路走不通
+// cap: fixed — 三次：一次手误、两次同一个输入的重复都还说明不了路走不通
+// keep: 删掉后一次手误就被读成路走不通，正常探索被拦；由「三次才说明搬不动」兜住
 const TOOL_ERROR_THRESHOLD: u32 = 3;
 
 /// 同一件事重复几次才合成一个 hook。
 ///
 /// 与工具错误同一个数、同一个理由：合成的是一条会一直跑下去的路，比错误本身
 /// 更值得等一次重复。
-// cap: bound — 三次重复才合成 hook，与工具错误阈值同一条理由
+// cap: fixed — 三次重复才合成 hook，与工具错误阈值同一条理由
+// keep: 删掉后两次重复就合成 hook，手误被固化成规则；由「与工具错误阈值同一条理由」兜住
 const HOOK_RECURRENCE_THRESHOLD: u32 = 3;
 
 /// 同一件事重复几次才生成一个代码变更。
 ///
 /// 比 hook 多等两次：改动生产代码的代价比装一条 hook 高得多，而重复五次的
 /// 那件事不会在第四、第五次之间忽然消失。
-// cap: bound — 五次：代码变更比 hook 贵，多等两次重复
+// cap: fixed — 五次：代码变更比 hook 贵，多等两次重复
+// keep: 删掉后代码变更按 hook 的阈值合成，比 hook 便宜的重复被过早固化；由「代码变更更贵、多等两次」兜住
 const CHANGE_RECURRENCE_THRESHOLD: u32 = 5;
 
 /// Convenience builder that wires together all Phase-1 components.
@@ -799,7 +806,7 @@ impl ReflectionEngine {
             self.recorder.record_learning(l.clone()).await?;
 
             // Attempt promotion immediately
-            let _ = self.promoter.promote_if_ready(&l).await;
+            cog_core::ignore_lost!(self.promoter.promote_if_ready(&l).await);
 
             // Evolution triggers for mature learnings (same logic as process_context)
             self.maybe_trigger_evolution_from_learning(&l).await;
@@ -1084,7 +1091,7 @@ impl ReflectionEngine {
             let mut l = learning;
             self.matcher.update_recurrence(&mut l).await?;
             self.recorder.record_learning(l.clone()).await?;
-            let _ = self.promoter.promote_if_ready(&l).await;
+            cog_core::ignore_lost!(self.promoter.promote_if_ready(&l).await);
             self.maybe_trigger_evolution_from_learning(&l).await;
         }
         Ok(())
@@ -1170,7 +1177,7 @@ impl ReflectionEngine {
         let notes = result
             .and_then(|r| r.get(cog_core::contract::task::DISCOVERY_NOTES_FIELD))
             .and_then(|v| v.as_str())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         match self.discovery {
             Some(ref disc) => disc.evaluate_result(task, verdict, notes).await,
             // No engine means no reader for this probe's outcome, which is not

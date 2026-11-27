@@ -1,7 +1,8 @@
+// census-keep: shapes=clocks — 界面上的提示计时（复制成功、提示消失之类）：只影响提示停留多久，不参与任何决定；删掉只是提示不自动消失或一直不消失
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   getAgentConversation,
-  listAgents,
+  getAgentRoster,
   sendAgentPrompt,
   type AgentConversationLine,
   type AgentSummary,
@@ -34,6 +35,17 @@ export function useAgentConversation(enabled: boolean, waitSecs = 0) {
    * 还没开口。没有这一位，读者看着一个永远转的圈，会以为界面坏了。
    */
   const [agentsLoaded, setAgentsLoaded] = useState(false);
+  /**
+   * 名单的单位读数：多少位人、多少个座位背后没有人。
+   *
+   * 名册上的行是**地址**（座位），人是身份：一个人可以占着几个地址，一个地址
+   * 也可能背后还没有人。只数行数会把「座位多」读成「人多」；`seats_without_a_person`
+   * 为 `null` 时是「名册没读到」，不是「一个都没有」——两个答案不能画成同一个数。
+   */
+  const [rosterUnits, setRosterUnits] = useState<{
+    people: number;
+    seatsWithoutAPerson: number | null;
+  } | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [lines, setLines] = useState<AgentConversationLine[]>([]);
   const [loading, setLoading] = useState(false);
@@ -45,8 +57,13 @@ export function useAgentConversation(enabled: boolean, waitSecs = 0) {
 
   const refreshAgents = useCallback(async () => {
     try {
-      const roster = await listAgents();
+      const page = await getAgentRoster();
+      const roster = page.agents;
       setAgents(roster);
+      setRosterUnits({
+        people: page.people?.length ?? 0,
+        seatsWithoutAPerson: page.seats_without_a_person ?? null,
+      });
       setAgentsError(null);
       setAgentsLoaded(true);
       // 选中的那个下线了就把选中让给名单里的第一个：留着一个已不在岗的名字，
@@ -58,6 +75,7 @@ export function useAgentConversation(enabled: boolean, waitSecs = 0) {
     } catch (e) {
       const err = e as { status?: number; message?: string };
       setAgents([]);
+      setRosterUnits(null);
       setAgentsError(err?.message?.trim() || `读不到 agent 名单（HTTP ${err?.status ?? '?'}）`);
     }
   }, []);
@@ -122,6 +140,7 @@ export function useAgentConversation(enabled: boolean, waitSecs = 0) {
     agents,
     agentsError,
     agentsLoaded,
+    rosterUnits,
     selected,
     select: setSelected,
     lines,

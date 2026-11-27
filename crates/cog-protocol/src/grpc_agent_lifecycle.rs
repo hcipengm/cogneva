@@ -182,7 +182,7 @@ impl AgentLifecycle for AgentLifecycleGrpcHandler {
         request: Request<HeartbeatReq>,
     ) -> Result<Response<HeartbeatResp>, Status> {
         let req = request.into_inner();
-        let _ = self.agent_registry.heartbeat(&req.agent_id).await;
+        cog_core::ignore_lost!(self.agent_registry.heartbeat(&req.agent_id).await);
         // The state is the only part of a heartbeat the registry cannot take,
         // and the only part that answers "what is it doing": record it here,
         // where the RPC that asks is answered. An empty state is not a state,

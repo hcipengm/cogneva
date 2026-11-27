@@ -1,4 +1,5 @@
 use cog_core::Message;
+use std::sync::Arc;
 
 /// Agent 上下文窗口管理。
 /// 参考 pi-agent-core 的 transcript 设计，但用 Rust Vec 替代 JS 数组。
@@ -166,8 +167,7 @@ impl CompactionSummary {
 ///
 /// 按字符截而不是按字节：正文里通常有中文，按字节切会落在字的中间。
 // cap: fixed — 一行摘要的长度，不是资源界；它只决定界面上「保留边界」写多长，
-// 60 个字够认出是哪一句，再长就把这一行挤成正文
-const HEADLINE_CHARS: usize = 60;
+// not-a-bound: 一行摘要的展示长度，不参与任何判断
 
 fn headline(message: &Message) -> String {
     let text = message.content();
@@ -176,13 +176,9 @@ fn headline(message: &Message) -> String {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or("");
-    let total = first.chars().count();
-    let head: String = first.chars().take(HEADLINE_CHARS).collect();
-    if total > HEADLINE_CHARS {
-        format!("{}: {head}…", message.role())
-    } else {
-        format!("{}: {head}", message.role())
-    }
+    // 这里只用于日志与前缀里认出是哪一句。按「默认无损」的口径，截断是不合法的：
+    // 整行照原样带上——日志的读者要能读到完整的那一句。
+    format!("{}: {first}", message.role())
 }
 
 impl ContextWindow {
@@ -377,6 +373,14 @@ impl ContextWindow {
     ///
     /// 取走而不是读：这条记录说的是「这一轮从提示词里挤掉了什么」，读到下一次
     /// 运行里就是一份说错了对象的现场。没有裁剪就是 `None`——界面不发那条线。
+    /// 这一份提示里已经被挤掉多少条更早的消息；不取走（取走是运行收尾的事）。
+    pub fn last_compaction_dropped(&self) -> usize {
+        self.compaction
+            .as_ref()
+            .map(|report| report.dropped_messages)
+            .unwrap_or(0)
+    }
+
     pub fn take_compaction(&mut self) -> Option<Compaction> {
         let mut report = self.compaction.take()?;
         // 保留条数取**交出去这一刻**的投影长度：裁剪之后这一轮还可能追加了几条
@@ -455,13 +459,53 @@ impl ContextWindow {
         self.messages.len() <= 2 && self.current_tokens > self.budget()
     }
 
+    /// 入口处的尺寸判据：这条活本身放不放得进窗口。
+    ///
+    /// 与 [`Self::shrink_floor_to_fit`] 是同一个判据的**只读**形态：入口在开跑之前问
+    /// 一次，答案是「放不进」时，那是入口写错了（有人把整本书塞进一句任务），不是这一
+    /// 轮的结局——运行时每轮都去截一次再失败，读起来会像「模型不行」。最短的形态也装
+    /// 不下时就没有更短的形态了：一个字符的开头加那行指针。
+    pub fn intake_fits(&self) -> bool {
+        let Some(budget) = self.max_tokens else {
+            return true; // 没人说过窗口多大：无所谓「装不下」
+        };
+        let Some(index) = self.messages.iter().position(|m| m.role() == "user") else {
+            return true;
+        };
+        let original = self.messages[index].content();
+        let spill_at = spill_path(&self.spill_dir, &original);
+        let head: String = original.chars().take(1).collect();
+        let shortest = format!(
+            "{head}\n…（任务正文被截到窗口里能放下的长度：共 {} 个字符；整段正文：{}）",
+            original.chars().count(),
+            spill_at.display()
+        );
+        let pointer = Message::user(&shortest);
+        let total: usize = self
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                if i == index {
+                    estimate_tokens(&pointer.content())
+                } else {
+                    estimate_tokens(&m.content())
+                }
+            })
+            .sum();
+        total <= budget
+    }
+
     /// 地板装不下时把它压进预算：截断首条 user（任务输入），窗口里只留它的开头。
     ///
     /// 「窗口有限、任务无界」靠的正是这一步：任务正文本该先落到可寻址的存储里、
     /// 窗口里只放指针。这里做的是同一件事的最小形态——保留开头，截掉尾部，
     /// 并在结尾写明被截了多少。压得进去返回 `true`，压完仍装不下返回 `false`：
     /// 那时缺的是入口那一侧的尺寸判据（任务把整本书塞进一句话），不是运行时的错。
-    pub fn shrink_floor_to_fit(&mut self) -> bool {
+    pub async fn shrink_floor_to_fit(
+        &mut self,
+        archive: Option<&Arc<dyn crate::archive::ToolOutputArchive>>,
+    ) -> bool {
         let Some(budget) = self.max_tokens else {
             return true; // 没人说过窗口多大：地板无所谓「装不下」
         };
@@ -473,11 +517,24 @@ impl ContextWindow {
         // 正文外置到哪个文件先算出来：内容是寻址的，写与不写都落在同一个路径上。
         // 二分里的候选正文必须**已经**带上这个路径——截完的正文与预算判的要是
         // 同一段字，否则补上那句话又把窗口顶出去，落回「压不进」。
-        let spill_at = spill_path(&self.spill_dir, &original);
+        // 正文外置到哪：优先平台归档（Raw 层，可检索、可重建），指针与工具结果
+        // 那一路同一个形状（`artifact://…`）；没有归档时退回本机数据根下的文件。
+        // 归档失败与「没有归档」走同一个回落——本机文件是两种情况下都能取回的那条路。
+        let archived = match archive {
+            Some(archive) => archive
+                .archive("task_input", &spill_id(&original), "text/plain", &original)
+                .await
+                .ok(),
+            None => None,
+        };
+        let spill_at = match archived {
+            Some(uri) => uri,
+            None => spill_path(&self.spill_dir, &original).display().to_string(),
+        };
         let tail = format!(
             "\n…（任务正文被截到窗口里能放下的长度：共 {} 个字符；整段正文：{}）",
             chars.len(),
-            spill_at.display()
+            spill_at
         );
         // 二分出能装下的最长前缀：估算与裁剪用同一套字符计数。
         let (mut low, mut high) = (0usize, chars.len());
@@ -513,7 +570,9 @@ impl ContextWindow {
         let head: String = chars[..low].iter().collect();
         // 写不进去时不能留一个指向空处的路径：退回到「只在这条任务行上」——
         // 这句话比路径短，二分定下的前缀仍然装得下。
-        let text = if spill_floor(&spill_at, &original) {
+        let text = if spill_at.starts_with("artifact://")
+            || spill_floor(std::path::Path::new(&spill_at), &original)
+        {
             format!("{head}{tail}")
         } else {
             format!(
@@ -684,10 +743,13 @@ impl ContextWindow {
             if report.dropped_head.is_none() {
                 report.dropped_head = dropped_head;
             }
-            // 裁剪只作用在投影上，所以这条报的是「模型这一轮少看到多少」，
-            // 而不是「丢了什么」——被裁的轮次仍在 history 里，落进 raw 归档。
-            // 不另铸指标：压力读数由耐久面自己给（transcript 的估算长度对窗口
-            // 配置），铸一个只在这里 +1 的计数器，等于把同一个量记两遍。
+            // 裁剪只作用在投影上，所以这条报的是「模型这一轮少看到多少」，而不是
+            // 「丢了什么」——被裁的轮次仍在 `history` 里（这一份从不因预算被裁）。
+            //
+            // 如实说清它到哪一步为止：`history` 是**进程内**的，一次 run 结束时
+            // 随 `AgentEnd` 整份发布出去；进程死在发布之前，这一段就只剩内存里
+            // 那一份。把它说成「已落进 raw 归档」是过头话——那一天还没有来（S45/S47
+            // 是那条待办）。
             tracing::debug!(
                 "Context window dropped {} messages (~{} tokens) from the prompt; the window budget is {:?}, the low-water target is {}, the run history keeps {} messages",
                 dropped,
@@ -738,7 +800,8 @@ impl ContextWindow {
 /// 留一半给任务输入、system 与后续轮次，超出的部分不是"内容多"而是
 /// 这条结果根本挤不进这段对话。与窗口同源而不是另立一个绝对值：
 /// 窗口配大了，允许的单条结果跟着变大，两者不会各自漂移。
-// cap: bound — 与窗口同源而不是另立一个绝对值：窗口配大了，允许的单条结果跟着变大，两者不会各自漂移
+// cap: fixed:上下文窗口的一半——单条工具结果最多占半个窗口，与裁剪低水位 `TRIM_LOW_WATER_DIVISOR` 同源（结构约定）
+// keep: 删掉后一条工具结果可以占满整个窗口，上下文超窗被上游拒收；由「单条结果不超过半个窗口」兜住
 const TOOL_RESULT_WINDOW_SHARE_DIVISOR: usize = 2;
 
 /// 裁剪要把窗口压到预算的几分之一为止，即滞回的低水位。
@@ -747,7 +810,8 @@ const TOOL_RESULT_WINDOW_SHARE_DIVISOR: usize = 2;
 /// 挪一格，缓存从第一个被删的位置起全部作废，命中率永远只剩地板。压到一半
 /// 之后，同样的裁剪要隔半个窗口才再发生一次，中间每一轮都是纯追加。
 /// 见 [`ContextWindow::trim_target`]。
-// cap: bound — 同样按窗口的一半：裁剪之后要隔半个窗口才再发生一次，中间每一轮都是纯追加
+// cap: fixed:上下文窗口的一半——裁剪低水位取半窗，使下一次裁剪隔半个窗口才发生（结构约定）
+// keep: 删掉后裁剪到整窗，下一次裁剪立刻又来，上下文在每轮抖动；由「低水位取半窗」兜住
 const TRIM_LOW_WATER_DIVISOR: usize = 2;
 
 /// 一段过大的任务正文外置到哪个文件：内容寻址，同一段正文永远落在同一条路径上，
@@ -756,6 +820,13 @@ fn spill_path(dir: &std::path::Path, text: &str) -> std::path::PathBuf {
     use sha2::Digest as _;
     let digest = sha2::Sha256::digest(text.as_bytes());
     dir.join(format!("{}.txt", hex::encode(&digest[..16])))
+}
+
+/// 同一段正文在平台归档里的名字：内容寻址，同一段正文重放不产生第二份。
+fn spill_id(text: &str) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(text.as_bytes());
+    format!("task-input-{}", hex::encode(&digest[..16]))
 }
 
 /// 把正文写到 [`spill_path`] 算出的位置上。已经在了就不再写（同一段正文只写一次）。
@@ -909,9 +980,53 @@ pub fn truncate_to_chars(text: &str, budget_chars: usize, reference: Option<&str
 pub use cog_core::estimate_tokens;
 
 #[cfg(test)]
+/// 有平台归档时，地板的指针与工具结果同一个形状（`artifact://…`），本地不再落文件。
+///
+/// 「两个去处」曾经是两个指针形状：工具结果进平台归档、地板进本地数据根。模型读到
+/// 的东西因此有两种取法，而「这一份放哪了」不该由它去猜。
+#[tokio::test]
+async fn a_shrunk_floor_points_at_the_same_archive_tool_results_use() {
+    #[derive(Debug)]
+    struct Archive(std::sync::Mutex<Vec<String>>);
+    #[async_trait::async_trait]
+    impl crate::archive::ToolOutputArchive for Archive {
+        async fn archive(
+            &self,
+            _tool: &str,
+            id: &str,
+            _content_type: &str,
+            _text: &str,
+        ) -> cog_core::SFResult<String> {
+            self.0.lock().unwrap().push(id.to_string());
+            Ok(format!("artifact://default/{id}"))
+        }
+        async fn record_truncation(&self, _tool: &str, _dropped: usize) {}
+    }
+    let archive = std::sync::Arc::new(Archive(std::sync::Mutex::new(Vec::new())));
+    let mut ctx = ContextWindow::new(Some(2_000));
+    let spill_dir = std::env::temp_dir().join(format!("cog-agent-spill-ar-{}", std::process::id()));
+    ctx.spill_dir = spill_dir.clone();
+    ctx.add_message(Message::system("你是执行者。"));
+    ctx.add_message(Message::user(&"任务正文".repeat(4_000)));
+    assert!(ctx.floor_exceeds_budget(), "前提：地板装不下");
+    let as_dyn: std::sync::Arc<dyn crate::archive::ToolOutputArchive> = archive.clone();
+    assert!(ctx.shrink_floor_to_fit(Some(&as_dyn)).await);
+    let text = ctx.messages()[1].content();
+    assert!(
+        text.contains("artifact://"),
+        "有归档时指针仍是文件路径：两个去处没合成一种指针——{text}"
+    );
+    assert!(
+        !spill_dir.exists() || std::fs::read_dir(&spill_dir).unwrap().next().is_none(),
+        "有归档时还在本地落了文件：同一段正文有了两份载体"
+    );
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&spill_dir));
+}
+
+#[cfg(test)]
 /// 地板压进窗口之后，被截掉的那一段有着落：内容寻址的文件里能读回整段。
-#[test]
-fn a_shrunk_floor_names_where_the_full_text_lives() {
+#[tokio::test]
+async fn a_shrunk_floor_names_where_the_full_text_lives() {
     let big = "任务正文".repeat(4_000);
     let mut ctx = ContextWindow::new(Some(2_000));
     // 外置目录指到临时目录：这条测的是「截掉的正文去哪了」，不该往装好的数据根里写。
@@ -920,7 +1035,7 @@ fn a_shrunk_floor_names_where_the_full_text_lives() {
     ctx.add_message(Message::system("你是执行者。"));
     ctx.add_message(Message::user(&big));
     assert!(ctx.floor_exceeds_budget(), "前提：地板装不下");
-    assert!(ctx.shrink_floor_to_fit(), "压不进窗口");
+    assert!(ctx.shrink_floor_to_fit(None).await, "压不进窗口");
     let text = ctx.messages()[1].content();
     let path = text
         .split("整段正文：")
@@ -936,9 +1051,9 @@ fn a_shrunk_floor_names_where_the_full_text_lives() {
     again.spill_dir = spill_dir.clone();
     again.add_message(Message::system("你是执行者。"));
     again.add_message(Message::user(&big));
-    assert!(again.shrink_floor_to_fit());
+    assert!(again.shrink_floor_to_fit(None).await);
     assert_eq!(std::fs::read_dir(&spill_dir).unwrap().count(), before);
-    let _ = std::fs::remove_dir_all(&spill_dir);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&spill_dir));
 }
 
 #[cfg(test)]
@@ -946,6 +1061,32 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    /// 入口处的尺寸判据：窗口小到「一个字符的开头 + 指针」都装不下时，它说「放不进」。
+    ///
+    /// 这条判据的意义是把「入口写错了」与「这一轮没做成」分开：放不进窗口是那条活
+    /// 的写法有问题，运行时每轮去截一次再失败，读起来像模型不行。量不到窗口时它
+    /// 不下结论——「没人说过窗口多大」不是「装不下」。
+    #[test]
+    fn an_input_that_fits_no_window_at_all_is_caught_at_intake() {
+        let mut ctx = ContextWindow::new(Some(8));
+        ctx.add_message(Message::user(&"整本书".repeat(10_000)));
+        assert!(
+            !ctx.intake_fits(),
+            "窗口只有 8 个 token，正文再短也只有指针那一种形态，这一档应当读成「放不进」"
+        );
+
+        let mut roomy = ContextWindow::new(Some(100_000));
+        roomy.add_message(Message::user("把界改成实测的"));
+        assert!(roomy.intake_fits(), "普通的任务正文放得进大窗口");
+
+        let mut unmeasured = ContextWindow::new(None);
+        unmeasured.add_message(Message::user(&"整本书".repeat(10_000)));
+        assert!(
+            unmeasured.intake_fits(),
+            "没人说过窗口多大：量不到不等于装不下"
+        );
+    }
 
     /// 一段指示并进开头那条 system，而不是另开一条。
     ///
@@ -1120,7 +1261,7 @@ mod tests {
         ONCE.call_once(|| {
             // 装不上（别的用例先装了全局订阅者）不是这里的失败：那时兴趣位由
             // 那个订阅者决定，哨兵会立刻把「收不收得到」说清楚。
-            let _ = tracing::subscriber::set_global_default(AlwaysMaybe);
+            cog_core::ignore_lost!(tracing::subscriber::set_global_default(AlwaysMaybe));
         });
     }
 

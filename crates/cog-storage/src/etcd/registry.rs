@@ -129,7 +129,7 @@ impl AgentRegistry for EtcdAgentRegistry {
         };
         let mut client = self.client.lock().await;
         if let Some(id) = lease_id {
-            let _ = client.lease_revoke(id).await;
+            cog_core::ignore_lost!(client.lease_revoke(id).await);
         }
         let _ = client
             .delete(Self::key(agent_id), None)

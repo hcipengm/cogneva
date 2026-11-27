@@ -46,7 +46,8 @@ use crate::pressure::{Demand, Pressure};
 /// admission price answer the same shape of question -- "what was the worst of
 /// the recent few" -- and two copies of that answer drift the day one of them
 /// is widened. The stream being read is the caller's; the width is not.
-// cap: bound — 窗口宽度按事件次数定而不是按墙钟：一次编译、一条命令都是一个事件，
+// cap: fixed — 窗口宽度按事件次数定而不是按墙钟：一次编译、一条命令都是一个事件，
+// not-a-bound: 窗口宽度按事件次数定而不是按墙钟：一次编译、一条命令都是一个事件，
 // 都随任务到达；更老的样本由新样本挤出去，所以「第一次大事件」不会永久定住这个数
 pub(crate) const WINDOW: usize = 32;
 

@@ -108,7 +108,7 @@ mod tests {
         let dist = AgentBenchLoader::env_distribution(&dataset);
         assert_eq!(dist.get("os"), Some(&1));
         assert_eq!(dist.get("unknown"), Some(&1));
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     fn uuid_v4() -> String {

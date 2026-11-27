@@ -317,6 +317,19 @@ fn the_restricted_role_is_created_before_anything_uses_it() {
         "对象所有权没挪给 cog_app：分区维护要表属主，GRANT 给不出那一格"
     );
 
+    // 演练那个角色的写权不能只靠一张名单：名单盖的是 bootstrap 跑完那一刻已有的
+    // 表，迁移之后新建的表会漏授（2026-11-26 现场：`backup_drill_attempts` 晚于
+    // bootstrap 建出来，整趟演练以 `permission denied` 收尾，那一夜读起来像没跑过）。
+    // 默认权限补的正是这个盲区：此后 cog_app 建的表也归 cog_backup 写。
+    assert!(
+        script.contains("ALTER DEFAULT PRIVILEGES FOR ROLE cog_app"),
+        "引导脚本没有给此后新建的表授 cog_backup 的写权：晚建的表会让演练以 permission denied 收尾"
+    );
+    assert!(
+        script.contains("GRANT SELECT, INSERT, UPDATE ON TABLES TO cog_backup"),
+        "默认权限那条没有点名 cog_backup 的写权；名字写错等于什么都没授"
+    );
+
     // 清单侧：Job 与它挂的 ConfigMap 都要在，且两份清单（chart 与静态）都在。
     for path in [
         root.join("deploy/helm/cogneva/templates/db-role-bootstrap.yaml"),

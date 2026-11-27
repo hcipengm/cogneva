@@ -58,7 +58,7 @@ impl MessageBackend for Held {
         // Held until the test releases it: this is the last step before the
         // loop starts reading, so it is exactly the boundary under test.
         if let Some(rx) = self.hold.lock().await.take() {
-            let _ = rx.await;
+            cog_core::ignore_lost!(rx.await);
         }
         self.inner.subscribe(subject, group).await
     }
@@ -78,7 +78,7 @@ impl MessageBackend for Held {
 
     async fn create_consumer_group(&self, stream: &str, group: &str) -> SFResult<()> {
         if let Some(tx) = self.entered.lock().expect("entered").take() {
-            let _ = tx.send(());
+            cog_core::ignore_lost!(tx.send(()));
         }
         if self.fail_group {
             return Err(SFError::Agent("the store refused the group".into()));

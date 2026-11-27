@@ -227,19 +227,14 @@ pub struct HookDef {
     pub timeout_ms: Option<u64>,
 }
 
-/// 没写 `timeout_ms` 的钩子跑多久：30s。
+/// 钩子跑多久：只有它自己声明了 `timeout_ms` 才有界。
 ///
-/// 钩子是任务路径上的同步点，默认值必须短到「卡住的钩子」不会把一次任务拖成
-/// 超时；而一个正常的钩子（写一条记忆、发一次通知）远在秒级内完成。
-// cap: bound — 钩子是任务路径上的同步点，要短到卡住的钩子不把一次任务拖成超时，而正常钩子（写一条记忆、发一次通知）远在秒级内完成
-// wall: 等=钩子这个同步点返回 / 等不到=这个钩子读作失败，任务继续（钩子写下的东西不在这一格里，它自己负责）/ 续跑=能，下一次任务再跑一次这个钩子
-const DEFAULT_HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
+/// 这里曾经有一条 30 秒的缺省。那个数的理由是「正常钩子远在秒级内完成」——一句
+/// 没有人量过任何一次钩子耗时的自述。按「无界是缺省态、界要自己给出理由」的口径，
+/// 缺省不存在：声明了 `timeout_ms` 的钩子有界，没声明的就跑到完。
 impl HookDef {
-    pub fn timeout(&self) -> std::time::Duration {
-        self.timeout_ms
-            .map(std::time::Duration::from_millis)
-            .unwrap_or(DEFAULT_HOOK_TIMEOUT)
+    pub fn timeout(&self) -> Option<std::time::Duration> {
+        self.timeout_ms.map(std::time::Duration::from_millis)
     }
 }
 

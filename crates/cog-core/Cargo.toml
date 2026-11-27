@@ -24,6 +24,7 @@ blake3 = { workspace = true }
 # 层；密钥各自持有。三者都只是算法原语，与 blake3 同一类。
 hmac = { workspace = true }
 sha2 = { workspace = true }
+ed25519-dalek = { version = "2.1" }
 base64 = "0.22"
 regex = "1.11"
 libc = "0.2"

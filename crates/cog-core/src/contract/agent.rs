@@ -453,6 +453,8 @@ impl AgentRegistration {
 /// 的常态：探针与按任务起的成员从来不进任何名单。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EmployeeRecord {
+    /// 这位员工的 id：有工号的就是工号的字符串形式（`E0412`）。没有第二个身份
+    /// 字段，也不做地址到人的映射——座位（`squad:<任务>-<职务>`）不是员工，不发号。
     pub agent_id: String,
     /// 工号。人形 id 建行时从全局计数器上取一个，此后不改、不回收——退役的
     /// 人留着它，正如离职员工保留工号。
@@ -477,32 +479,12 @@ pub struct EmployeeRecord {
     /// 同一个形状。
     #[serde(default)]
     pub retired_at: Option<DateTime<Utc>>,
-    /// 这一行背后站着的那个人。空是读数：它说的正是「这个座位背后还没有人」。
-    ///
-    /// 人形 id（安装期定下的名字、`employee:<建号>`）背后的人是它自己；座位形
-    /// id（`squad:<任务>-<座位>`）背后的人只有在派活那一刻才存在，形状答不出来
-    /// ——所以这一格是写下来的，不是每次读的时候算出来的。缺省是 `None`：
-    /// 这一格是后加的，早于这列的名册行里没有它。
-    #[serde(default)]
-    pub person_id: Option<String>,
 }
 
 impl EmployeeRecord {
     /// 这个人现在还算不算在职。
     pub fn is_active(&self) -> bool {
         self.retired_at.is_none()
-    }
-
-    /// 这一行背后的人：写下来的那一个优先，没写就按 id 的形状答。
-    ///
-    /// 座位行写下来的那一格才是唯一答案——它在派活那一刻才存在，形状答不出来。
-    /// 人形行的答案只能是它自己，而这一列又比这类行年轻，所以早于它的人形行
-    /// 不必等下一次注册才读得对：形状在这里能唯一答出来。两者之差是一个
-    /// 读数，不是一个错误。
-    pub fn person(&self) -> Option<&str> {
-        self.person_id
-            .as_deref()
-            .or_else(|| crate::types::agent_state::person_id_for(&self.agent_id))
     }
 
     /// 名册、对话、日志里显示的那一行：`E0412 林清和`。
@@ -536,26 +518,23 @@ pub trait AgentRegistry: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// 发一个工号，并返回由它推出的员工 id（`E0412`）。
+    ///
+    /// 员工是先有工号、再有 id：工号是正本，id、姓名、会话键都从它推出来。
+    /// 先起一个随机 id、之后再补工号，等于给人两个名字，读面迟早要按入口分叉。
+    ///
+    /// 没有编号能力的实现返回 `NotImplemented` 而不是编一个 id：编出来的 id
+    /// 没有工号可推，名册上会多一行「没有编制的人」。
+    async fn mint_employee_id(&self) -> SFResult<String> {
+        Err(crate::SFError::NotImplemented("mint_employee_id".into()))
+    }
+
     /// 名册上一个人的那一行；不在册返回 `None`。
     ///
     /// 与 [`AgentRegistry::employees`] 分开，是因为读一个人的工号不该把整张
     /// 名册搬过来：入职接口、对话页的称呼都在调用最频繁的那条路上。
     async fn employee(&self, _agent_id: &str) -> SFResult<Option<EmployeeRecord>> {
         Ok(None)
-    }
-
-    /// 把一个人写进这一把座位的名册行：派工时定下谁做，执行时座位记下是谁。
-    ///
-    /// 人不是座位的属性，这件事只有一层写下来的地方，因为它的形状答不出来：
-    /// `squad:<task>-<role>` 里没有工号，`person_id_for` 对它只能答 `None`。
-    /// 派工那一刻写下的人，必须在这里落进名册，否则同一个工号与同一把座位之间
-    /// 唯一的联系只活在任务行上，名册读不出「坐在这儿的是谁」。
-    ///
-    /// 没有名册行的实现返回 `NotImplemented` 而不是静默成功：「记下了」与
-    /// 「这面名册根本不记事」在调用方那一侧是两句话，前者可以当作已落，后者
-    /// 只能作为一条读数的缺口报出去。
-    async fn assign_person(&self, _agent_id: &str, _person_id: &str) -> SFResult<()> {
-        Err(crate::SFError::NotImplemented("assign_person".into()))
     }
 }
 

@@ -175,7 +175,7 @@ fn no_place_the_deployment_is_written_caps_the_replica_count() {
     let mut offenders = Vec::new();
     for root in ["deploy/helm/cogneva", "deploy/k3s"] {
         for file in files_under(&repo_root().join(root)) {
-            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            let text = std::fs::read_to_string(&file).unwrap_or(Default::default());
             let lowered = text.to_ascii_lowercase();
             if lowered.contains("maxreplicas") || lowered.contains("max_replicas") {
                 offenders.push(format!("{} 写了副本上限", file.display()));

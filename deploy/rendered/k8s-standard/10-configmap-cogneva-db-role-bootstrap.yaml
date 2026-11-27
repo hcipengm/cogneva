@@ -62,6 +62,7 @@ data:
         echo "postgres never became ready; the role cannot be bootstrapped" >&2
         exit 1
       fi
+      # not-a-bound: 等待外部状态收敛/轮询的让路节拍——它决定多久看一次，不结束任何活
       sleep 2
     done
     
@@ -232,6 +233,7 @@ data:
         echo "public.backup_drills never appeared; the backup role cannot be granted on it" >&2
         exit 1
       fi
+      # not-a-bound: 等待外部状态收敛/轮询的让路节拍——它决定多久看一次，不结束任何活
       sleep 2
     done
     # 三张表都由迁移建出来，顺序与时刻各不相同：`backup_drills` 只在有结论时写得出来；
@@ -250,6 +252,16 @@ data:
       END LOOP;
     END $do$;
     SQL
+    
+    # 此后由 cog_app 建出来的表也归 cog_backup 写：上面那张名单只盖得住**建库那一刻
+    # 已经存在**的表，而迁移会继续加表（2026-11-26 现场：`backup_drill_attempts` 在
+    # bootstrap 跑完之后才建出来，整趟演练以 `permission denied` 收尾）。默认权限补的
+    # 是名单的盲区，不替掉名单——bootstrap 之前就存在的表仍要靠上面那几条 GRANT。
+    psql -v ON_ERROR_STOP=1 <<'SQL'
+    ALTER DEFAULT PRIVILEGES FOR ROLE cog_app IN SCHEMA public
+        GRANT SELECT, INSERT, UPDATE ON TABLES TO cog_backup;
+    SQL
+    echo "db role bootstrap: tables cog_app creates from now on are writable by cog_backup"
     
     # 测试专用库：需要真服务的检查（`deploy/scripts/check-live-services.sh`，变更验证
     # 会跑它）连这一个，不连业务库。分开是硬要求——清单里有几条一上来就清空整张任务表，

@@ -63,7 +63,7 @@ pub struct LlmObservable {
     /// 每一笔调用也落成事件流上的一行（正本）。没有装配时（部署里没有那条流）
     /// 就只留进程内计数——「这一路没记账」与「记了零笔」在读数上是两件事，
     /// 前者由装配时的告警说出，后者由计数说出。
-    call_events: OnceLock<Arc<dyn cog_core::LlmCallEvents>>,
+    call_events: OnceLock<Arc<dyn cog_core::EventStore>>,
     call_count: AtomicU64,
     token_in: AtomicU64,
     token_out: AtomicU64,
@@ -82,11 +82,11 @@ impl LlmObservable {
 
     /// 装配事件流那一侧的写者。全局计数器只有进程里那一份，装配一次即可；
     /// 再装一次以第一次为准（第二份写者只会把同一笔写成两行）。
-    pub fn attach_call_events(&self, sink: Arc<dyn cog_core::LlmCallEvents>) {
+    pub fn attach_call_events(&self, sink: Arc<dyn cog_core::EventStore>) {
         let _ = self.call_events.set(sink);
     }
 
-    pub fn call_events(&self) -> Option<Arc<dyn cog_core::LlmCallEvents>> {
+    pub fn call_events(&self) -> Option<Arc<dyn cog_core::EventStore>> {
         self.call_events.get().cloned()
     }
 

@@ -13,6 +13,7 @@ import { FlowView } from '@/views/FlowView';
 import { GovernanceView } from '@/views/GovernanceView';
 import { HooksView } from '@/views/HooksView';
 import { InboxView } from '@/views/InboxView';
+import { KeysView } from '@/views/KeysView';
 import { ObservabilityView } from '@/views/ObservabilityView';
 import { SearchView } from '@/views/SearchView';
 import { SnapshotsView } from '@/views/SnapshotsView';
@@ -103,6 +104,8 @@ export function ViewFor({ view }: { view: string }) {
       return <WikiView />;
     case 'observability':
       return <ObservabilityView />;
+    case 'keys':
+      return <KeysView />;
     case 'token':
       return <TokenView />;
     case 'resources':

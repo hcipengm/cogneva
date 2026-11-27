@@ -189,9 +189,11 @@ impl<T: ?Sized> DeferredSink<T> {
 /// ——撞锁的那一瞬旧 Pod 还在写，几秒之后就没了，重试太密只是把已经撞过的那把锁
 /// 再撞一遍。封顶一分钟：库真的不通时，每多试一次就多一条连接与一行日志，而一分
 /// 钟一次足够在恢复后的第一分钟里接上。
-// cap: bound — 要长过一次正常滚动的重叠期（撞锁的那一瞬旧 Pod 还在写、几秒后就走），又要短到恢复后第一分钟里接得上；没有一处读数能把它变成分位数
+// cap: fixed — 要长过一次正常滚动的重叠期（撞锁的那一瞬旧 Pod 还在写、几秒后就走），又要短到恢复后第一分钟里接得上；没有一处读数能把它变成分位数
+// keep: 删掉后滚动重叠期的撞锁被当成永久失败，恢复后第一分钟接不上；由「长过一次正常滚动的重叠期」兜住
 const SINK_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(5);
-// cap: bound — 库真的不通时每多试一次就多一条连接与一行日志；一分钟一次已经够在恢复后的第一分钟里接上，再密只是把不通的库再敲一遍
+// cap: fixed — 库真的不通时每多试一次就多一条连接与一行日志；一分钟一次已经够在恢复后的第一分钟里接上，再密只是把不通的库再敲一遍
+// keep: 删掉后库不通时无限密地重试，每多试一次多一条连接与一行日志；由「一分钟一次够接上」兜住
 const SINK_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 一直重试到接上为止，然后停下。
@@ -280,7 +282,7 @@ impl cog_core::PersistentAlertSink for DeferredSink<dyn cog_core::PersistentAler
 /// 不能读成「账本里本来就没有这一笔」。
 #[async_trait::async_trait]
 impl cog_core::LlmUsageLedger for DeferredSink<dyn cog_core::LlmUsageLedger> {
-    async fn record(&self, record: &cog_core::LlmUsageRecord) -> Result<(), String> {
+    async fn record(&self, record: &cog_core::LlmUsageRecord) -> Result<String, String> {
         self.ledger()?.record(record).await
     }
 
@@ -695,8 +697,15 @@ async fn build_pool_observability(
                 let deployment = std::env::var(cog_core::env::DEPLOYMENT_NAME_ENV)
                     .unwrap_or_else(|_| "cogneva".to_string());
                 pool_obs = pool_obs.with_call_events(Arc::new(
-                    cog_storage::LlmCallEventStore::new(pool, deployment),
+                    cog_storage::postgres::event_log::EventLogStore::new(
+                        pool.clone(),
+                        deployment.clone(),
+                    ),
                 ));
+                // 行与事件同一次提交：接上之后网关不再分两步写。
+                pool_obs = pool_obs.with_usage_landing(
+                    crate::usage_landing_tx::postgres_usage_landing(pool, deployment),
+                );
             }
             Err(e) => {
                 tracing::warn!(error = %e, "调用事实的写入口接不上；读切换之前不影响读数");
@@ -833,7 +842,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl cog_core::LlmUsageLedger for CountingLedger {
-        async fn record(&self, _: &cog_core::LlmUsageRecord) -> Result<(), String> {
+        async fn record(&self, _: &cog_core::LlmUsageRecord) -> Result<String, String> {
             unimplemented!("这一格只读不写")
         }
         async fn record_exchange(&self, _: &cog_core::LlmExchangeRecord) -> Result<(), String> {

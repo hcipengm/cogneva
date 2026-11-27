@@ -74,7 +74,8 @@ pub const FACE_HOLDER_ROLE: &str = cog_core::roles::EXTERNAL_WORKER;
 /// single window would move faces during the key's own lifetime -- turning a
 /// restart into a handover. Two windows is past the expiry with room for one
 /// missed renewal on top.
-// cap: bound — the presence key outlives the last heartbeat by 1.5 idle windows; two windows clears that expiry and one missed renewal
+// cap: fixed — the presence key outlives the last heartbeat by 1.5 idle windows; two windows clears that expiry and one missed renewal
+// keep: 删掉后在位键比心跳早过期，一次漏续就让在位者消失；由「1.5 个空闲窗」兜住
 pub const STAFFING_GRACE_SECS: i64 = OWNER_IDLE_AFTER_SECS * 2;
 
 /// Why the pass withdrew a draft it had opened.
@@ -450,7 +451,7 @@ pub async fn staff_faces(
                     continue;
                 };
                 let mut spec = row.spec.clone();
-                let from_unit = spec.from_unit.clone().unwrap_or_default();
+                let from_unit = spec.from_unit.clone().unwrap_or(Default::default());
                 spec.to_unit = to_unit.clone();
                 spec.withdraw_condition = Some(format!(
                     "{from_unit} returns to the heartbeat registry, or {to_unit} leaves before \

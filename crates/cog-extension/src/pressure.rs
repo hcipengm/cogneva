@@ -505,7 +505,7 @@ fn publish_carry_series(gauge: &GaugeVec, value: f64, source: &'static str) {
     let mut last = SHAPE_CARRY_SOURCE.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(old) = *last {
         if old != source {
-            let _ = gauge.remove_label_values(&[old]);
+            cog_core::ignore_lost!(gauge.remove_label_values(&[old]));
         }
     }
     *last = Some(source);
@@ -527,7 +527,7 @@ fn publish_shape_series(
     seen.retain(|(seen_shape, seen_source)| {
         let stale = seen_shape == shape && *seen_source != source;
         if stale {
-            let _ = gauge.remove_label_values(&[shape, seen_source]);
+            cog_core::ignore_lost!(gauge.remove_label_values(&[shape, seen_source]));
         }
         !stale
     });
@@ -1060,7 +1060,7 @@ mod tests {
     /// 读数面那几格共用的一把锁。
     ///
     /// 每个测试各写一个 `static SERIAL` 时锁的是**自己**：三个测试互相看不见对方的
-    /// 预留，而它们读的 `render()` 是同一份进程级读数——一个测试正持着 2 GiB，另一个
+    /// 预留，而它们读的 `render()` 是同一份进程级读数——一个测试正持着它自己写进去的一大块预留（测试自己的数，不是机器容量），另一个
     /// 刚把自己的那一格放下，读到的却不是 0（2026-11-23 实测：偶发红在
     /// `sandbox_command_reservation_open 0`）。所以锁只有一把，凡是预留或读那一面的
     /// 测试都拿它。

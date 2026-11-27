@@ -494,8 +494,13 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
                 eprintln!("cogneva governance: {note}");
             }
             let backend = PostgresStateBackend::new(progress_pool.clone());
+            let events: Arc<dyn cog_core::EventStore> =
+                Arc::new(cog_storage::postgres::event_log::EventLogStore::new(
+                    progress_pool.clone(),
+                    "cogneva",
+                ));
             let change: Arc<dyn cog_core::ChangeLedgerStore> =
-                Arc::new(PostgresChangeLedgerStore::new(progress_pool.clone()));
+                Arc::new(PostgresChangeLedgerStore::new(progress_pool.clone()).with_events(events));
             let principle: Arc<dyn cog_core::PrincipleLedgerStore> =
                 Arc::new(PostgresPrincipleLedgerStore::new(progress_pool));
             progress(

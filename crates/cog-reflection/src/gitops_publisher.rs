@@ -495,6 +495,7 @@ mod tests {
 
     fn change(id: &str) -> EvolutionResult {
         EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: id.into(),
             description: "test".into(),

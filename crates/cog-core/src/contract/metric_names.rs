@@ -187,8 +187,27 @@ metric_names! {
     METRICS_SAMPLES_BUDGET_ROWS => "metrics_samples_budget_rows",
     METRICS_SAMPLES_ROWS => "metrics_samples_rows",
     METRICS_SAMPLE_SWEEP_FAILED => "metrics_sample_sweep_failed",
+    // cog-storage — one append to the event stream, in seconds, by kind. Taken
+    // around the single writer's INSERT (pool queueing included): the p99 over a
+    // window is the write-rate face of "is the store still keeping up", and it is
+    // compared against half the UI refresh cycle rather than a chosen constant.
+    EVENT_APPEND_SECONDS => "cogneva_event_append_seconds",
     DB_SETTING_SECONDS => "cogneva_db_setting_seconds",
     DB_VACUUM_BEHIND_TABLES => "cogneva_db_vacuum_behind_tables",
+    // cog-storage — how old the transactions in flight already are, labelled by
+    // `state` (active / idle in transaction). The database kills the idle ones
+    // on its own `idle_in_transaction_session_timeout`; the age is how much of
+    // that bound is already spent, and it is the reading that separates a
+    // transaction waiting on work from one holding a snapshot with nothing to
+    // do. Published per state rather than as one maximum: the two are stopped
+    // by different settings, so a single number cannot say which bound is near.
+    DB_XACT_AGE_SECONDS => "cogneva_db_xact_age_seconds",
+    // cog-storage — dead tuples and the table's own autovacuum trigger, per
+    // table. Between them they state how far past its trigger a table is
+    // (`dead / threshold`); the ratio is evaluated where it is read so the
+    // zero-threshold case stays "already past", not a number somebody picked.
+    DB_DEAD_TUPLES => "cogneva_db_dead_tuples",
+    DB_VACUUM_THRESHOLD_TUPLES => "cogneva_db_vacuum_threshold_tuples",
     TIER_MIGRATION_TOTAL => "tier_migration_total",
 
     // cog-storage — the observability event log's own readings.

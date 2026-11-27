@@ -236,7 +236,7 @@ async fn git_sees_the_change_and_commits_it() {
         )
         .await
         .expect("a commit happens");
-    let commit = committed["commit"].as_str().unwrap_or_default();
+    let commit = committed["commit"].as_str().unwrap_or(Default::default());
     assert_eq!(
         commit.len(),
         40,

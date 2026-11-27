@@ -47,7 +47,8 @@ pub struct AbTestConfig {
 
 // 五十次曝光：一个变体的成功率在五十次以内只能分辨几十个百分点的差别，再少
 // 胜出者就可能只是运气；这个数是「够不够比」的门，不是统计显著性的门。
-// cap: bound — 五十次：再少分辨不出几十个百分点的差别，胜出者可能只是运气
+// cap: fixed — 五十次：再少分辨不出几十个百分点的差别，胜出者可能只是运气
+// keep: 删掉后几十个百分点的差别也可能只是运气；由「五十次才分辨得出」兜住
 const AB_WINNER_MIN_SAMPLES: u64 = 50;
 
 impl Default for AbTestConfig {

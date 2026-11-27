@@ -160,3 +160,54 @@ fn the_page_draws_the_rows_and_their_live_state() {
         "{WEB_PANE} 把这一轮的待办与任务图上的活并成了一片：两样东西的寿命不同"
     );
 }
+
+/// 属主在对话里看到的每一行待办都带着三格与状态：终态、现在、差距、未落/已落。
+///
+/// 只画状态不画三格时，「这件事要办成什么样、现在离它多远」在屏幕上没有答案，
+/// 属主要去读代码或问人——那正是台账要替掉的动作。
+#[test]
+fn a_task_in_the_turn_shows_its_three_cells_and_state() {
+    let tasks = read_repo("crates/cog-gateway/src/tasks.rs");
+    assert!(
+        tasks.contains("pub ledger_item: Option<cog_core::contract::ledger_item::LedgerItem>"),
+        "任务读面没有这一格：员工页拿不到三格与状态"
+    );
+    let events = read_repo(WEB_EVENTS);
+    assert!(
+        events.contains("ledgerItem: frameLedgerItem(row.ledger_item)"),
+        "{WEB_EVENTS} 没把帧里的三格读进界面形状"
+    );
+    let client = read_repo("web/src/api/client.ts");
+    assert!(
+        client.contains("ledger_item?: LedgerItem"),
+        "任务列表的读面形状里没有待办：读回来的三格会被丢掉"
+    );
+    let pane = read_repo(WEB_PANE);
+    for needle in ["终态：", "现在：", "差距：", "item.state"] {
+        assert!(
+            pane.contains(needle),
+            "{WEB_PANE} 缺 {needle:?}：三格与状态没有画出来"
+        );
+    }
+    // 意图到任务那一段也要在屏幕上：属主看得到自己那句话交出了哪一行。
+    assert!(
+        read_repo(ASSEMBLY).contains("\"intent_id\""),
+        "{ASSEMBLY} 没把意图身份挂到这一轮的列表行上"
+    );
+    assert!(
+        events.contains("intentId:"),
+        "{WEB_EVENTS} 没把帧里的意图身份读进界面形状"
+    );
+    assert!(
+        pane.contains("来自意图"),
+        "{WEB_PANE} 没画出这一行是哪句意图交出来的"
+    );
+    // 工作台的任务列表也读同一份三格：对话里看得到的，到了任务面不该消失。
+    let tasks_view = read_repo("web/src/views/TasksView.tsx");
+    for needle in ["ledger_item", "终态：", "现在：", "差距："] {
+        assert!(
+            tasks_view.contains(needle),
+            "web/src/views/TasksView.tsx 缺 {needle:?}：任务面没有三格"
+        );
+    }
+}

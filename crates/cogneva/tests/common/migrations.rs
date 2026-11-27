@@ -73,10 +73,41 @@ pub fn tables_in(text: &str) -> BTreeMap<String, BTreeSet<String>> {
         let trimmed = line.trim();
         let lower = trimmed.to_ascii_lowercase();
         if in_table.is_none() {
+            // 注释里提到一句 `CREATE TABLE named inline` 不是建表：注释没有形状，
+            // 但这条扫描器只认文本，所以先在这里把它排除。
+            // 注释里提到一句 `CREATE TABLE named inline` 不是建表：迁移用 `--`、
+            // 源码用 `//`，两种都排除。
+            if trimmed.starts_with("--") || trimmed.starts_with("//") {
+                continue;
+            }
             // 一个 `CREATE TABLE` 不必从行首开始：`pub const DDL: &str = "CREATE TABLE
             // IF NOT EXISTS cogneva_owner_leases (` 就是这样写的。只认行首会把这类
             // 表读成「树上没有」，而那条判据的方向是「没有声明就红」——它不红，它
             // 一句也不说。
+            // 后加的列从 `ALTER TABLE ... ADD COLUMN` 来：水位列几乎都是这样加上的，
+            // 只认 `CREATE TABLE` 会把「这张表带水位」读成「没有」，而形状普查按水位
+            // 认投影——那一条判据会对一张真有水位的表说它没有。
+            if let Some(at) = lower.find("alter table ") {
+                let rest = &lower[at + "alter table ".len()..];
+                // `ALTER TABLE IF EXISTS <name>`：不剥掉这两个词，表名会被读成 `if`，
+                // 于是普查里多出一张不存在的表、真表那一列的来路也丢了。
+                let rest = rest.strip_prefix("if exists ").unwrap_or(rest);
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if let Some(add) = lower.find(" add column ") {
+                    let tail = &lower[add + " add column ".len()..];
+                    let tail = tail.strip_prefix("if not exists ").unwrap_or(tail);
+                    let column: String = tail
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    if !name.is_empty() && !column.is_empty() {
+                        out.entry(name).or_default().insert(column);
+                    }
+                }
+            }
             for opening in ["create table if not exists ", "create table "] {
                 if let Some(at) = lower.find(opening) {
                     let rest = &lower[at + opening.len()..];

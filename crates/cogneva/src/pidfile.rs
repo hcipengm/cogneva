@@ -51,7 +51,7 @@ impl PidFile {
 
 impl Drop for PidFile {
     fn drop(&mut self) {
-        let _ = self.remove_file();
+        cog_core::ignore_lost!(self.remove_file());
     }
 }
 

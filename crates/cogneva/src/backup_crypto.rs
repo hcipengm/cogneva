@@ -31,18 +31,22 @@ pub const MAGIC: &[u8] = b"COGNEVA-BACKUP-ENC-1\n";
 /// 读不到时给出的说法。
 pub const KEY_ENV: &str = cog_core::env::BACKUP_PACKAGE_KEY;
 
-// cap: bound — sixteen random bytes per package: enough that two packages from one password cannot be compared.
+// cap: fixed — sixteen random bytes per package: enough that two packages from one password cannot be compared.
+// keep: 删掉后包按算法缺一段盐，同一口令的两个包能互相比对；由「够到同一口令的两个包不能比较」兜住
 const SALT_LEN: usize = 16;
-// cap: bound — the tag ChaCha20-Poly1305 appends: sixteen bytes, and the terminal frame is recognised by it.
+// cap: fixed — the tag ChaCha20-Poly1305 appends: sixteen bytes, and the terminal frame is recognised by it.
+// keep: 删掉后终端帧认不出来，包尾没有收尾标记；由「ChaCha20-Poly1305 追加的 tag」兜住
 const TAG_LEN: usize = 16;
 /// 密文形状里三个由算法定死的长度：ChaCha20-Poly1305 的 nonce 12 字节、认证标签
 /// 16 字节（终止帧靠它认出来），以及每个包一份的 16 字节随机盐——盐够大就够让同一
 /// 句口令打出来的两个包互不可比。它们不是可调的旋钮。
-// cap: bound — AES-GCM 的 nonce 长度由算法定死，不是可调的旋钮
+// cap: fixed — AES-GCM 的 nonce 长度由算法定死，不是可调的旋钮
+// keep: 删掉后 nonce 长度由调用点各写一个，算法两边对不上；由「算法定死」兜住
 const NONCE_LEN: usize = 12;
 /// 一帧的明文上限。它是吞吐与内存占用的折中：包体越大，整包读进内存就越让备份
 /// Pod 的峰值跟着包大小走。
-// cap: bound — 这一帧上限是吞吐与内存的折中：整包读进内存会让备份 Pod 的峰值跟着包大小走
+// cap: fixed — 这一帧上限是吞吐与内存的折中：整包读进内存会让备份 Pod 的峰值跟着包大小走
+// keep: 删掉后整包读进内存，备份 Pod 峰值跟着包大小走；由「吞吐与内存的折中」兜住
 const CHUNK: usize = 1 << 20;
 const MAX_FRAME: usize = CHUNK + TAG_LEN;
 

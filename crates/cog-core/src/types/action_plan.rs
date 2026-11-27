@@ -79,6 +79,15 @@ pub struct AtomicTask {
     pub blocks: Vec<String>,
     #[serde(default)]
     pub input: serde_json::Value,
+    /// 这条活的终态描述。三格是计划的一部分，按名读，不埋在 `input` 里。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub terminal: String,
+    /// 此刻的样子（写明来源）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub now: String,
+    /// 缺什么；空 = 到终态。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gap: String,
     #[serde(default)]
     pub output_entities: Vec<String>,
     #[serde(default)]
@@ -520,6 +529,9 @@ mod tests {
             blocked_by: blocked_by.into_iter().map(String::from).collect(),
             blocks: blocks.into_iter().map(String::from).collect(),
             input: serde_json::Value::Null,
+            terminal: String::new(),
+            now: String::new(),
+            gap: String::new(),
             output_entities: vec![],
             estimated_seconds: 0,
             parent_id: None,

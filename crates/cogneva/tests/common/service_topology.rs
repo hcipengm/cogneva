@@ -230,7 +230,7 @@ pub fn manifest_trees(root: &Path) -> Vec<PathBuf> {
                 .filter(|path| path.is_dir())
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     profiles.sort();
     trees.extend(profiles);
     trees
@@ -261,7 +261,7 @@ fn documents(root: &Path) -> Vec<(String, serde_yaml::Value)> {
 pub fn workloads(root: &Path) -> Vec<Workload> {
     let mut out = Vec::new();
     for (manifest, value) in documents(root) {
-        let kind = text_at(&value, "kind").unwrap_or_default();
+        let kind = text_at(&value, "kind").unwrap_or(Default::default());
         if !matches!(kind, "Deployment" | "StatefulSet" | "DaemonSet") {
             continue;
         }
@@ -383,7 +383,7 @@ fn value_as_u64_text(value: &serde_yaml::Value) -> Option<String> {
 pub fn monitors(root: &Path) -> Vec<Monitor> {
     let mut out = Vec::new();
     for (manifest, value) in documents(root) {
-        let kind = text_at(&value, "kind").unwrap_or_default();
+        let kind = text_at(&value, "kind").unwrap_or(Default::default());
         if !matches!(kind, "ServiceMonitor" | "PodMonitor") {
             continue;
         }
@@ -422,7 +422,7 @@ pub fn monitors(root: &Path) -> Vec<Monitor> {
                     .filter_map(|n| n.as_str().map(str::to_string))
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         out.push(Monitor {
             manifest,
             kind: kind.to_string(),
@@ -512,7 +512,7 @@ pub fn network_policies(root: &Path) -> Vec<NetworkPolicySubject> {
                     })
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let uses_expressions = value
             .get("spec")
             .and_then(|s| s.get("podSelector"))
@@ -565,7 +565,7 @@ pub fn pod_labels(root: &Path) -> Vec<(String, BTreeMap<String, String>)> {
                     })
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         out.push((scalar_at(&value, &["metadata", "namespace"]), labels));
     }
     out

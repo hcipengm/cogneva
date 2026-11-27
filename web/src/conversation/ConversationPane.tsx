@@ -28,6 +28,7 @@ import type {
   ContextCompaction,
   HookReading,
   SessionSpend,
+  TurnLedgerItem,
   TurnTaskRow,
   TurnUsage,
 } from '@/types/events';
@@ -300,7 +301,9 @@ function BackgroundCardView({ card }: { card: BackgroundCard }) {
 function TurnTasks({ rows }: { rows: TurnTaskRow[] }) {
   const liveTasks = useStreamStore((s) => s.liveTasks);
   const ids = rows.map((row) => row.taskId).join(',');
-  const [status, setStatus] = useState<Record<string, string>>({});
+  const [status, setStatus] = useState<
+    Record<string, { status: string; ledger: TurnLedgerItem | null }>
+  >({});
   const [readable, setReadable] = useState<boolean | null>(null);
   useEffect(() => {
     let alive = true;
@@ -308,8 +311,13 @@ function TurnTasks({ rows }: { rows: TurnTaskRow[] }) {
     listTasks({ ids })
       .then((read) => {
         if (!alive) return;
-        const next: Record<string, string> = {};
-        for (const task of read) next[task.id] = task.status;
+        const next: Record<string, { status: string; ledger: TurnLedgerItem | null }> = {};
+        for (const task of read) {
+          next[task.id] = {
+            status: task.status,
+            ledger: task.ledger_item ?? null,
+          };
+        }
         setStatus(next);
         setReadable(true);
       })
@@ -329,7 +337,8 @@ function TurnTasks({ rows }: { rows: TurnTaskRow[] }) {
       <p>这一轮挂到任务图上的活：</p>
       {rows.map((row) => {
         // 总线上的状态比读回来的新：它是一次真实的变迁，读口那一份是上一次拉取的。
-        const word = live.get(row.taskId) ?? status[row.taskId];
+        const read = status[row.taskId];
+        const word = live.get(row.taskId) ?? read?.status;
         const state =
           word !== undefined
             ? taskStatusWord(word)
@@ -340,10 +349,26 @@ function TurnTasks({ rows }: { rows: TurnTaskRow[] }) {
                 : '任务图上没有这一行';
         const who = row.assignedTo ? `派给 ${row.assignedTo}` : '等人接';
         const where = row.venue ? `，场地 ${row.venue}` : '';
+        // 任务图读回来的那份比入队时的快照新：状态是行自己现算的。
+        const item = read?.ledger ?? row.ledgerItem;
         return (
-          <p key={row.taskId}>
-            {row.goal || row.taskId} —— {who}{where}，{state}
-          </p>
+          <div key={row.taskId}>
+            <p>
+              {row.goal || row.taskId} —— {who}{where}，{state}
+            </p>
+            {row.intentId && (
+              <p className="pl-2">来自意图 {row.intentId}</p>
+            )}
+            {item && (
+              <div className="pl-2">
+                <p>终态：{item.terminal || '还没写'}</p>
+                <p>现在：{item.now || '还没写'}</p>
+                <p>
+                  差距：{item.gap || '—'}（{item.state}）
+                </p>
+              </div>
+            )}
+          </div>
         );
       })}
     </div>

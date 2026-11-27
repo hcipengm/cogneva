@@ -124,17 +124,21 @@ pub const RELOCATED_LEAVES: &[(&str, &str)] = &[("out", "deps"), ("fingerprint",
 ///
 /// One, and it is the newest file the layer has. See the module docs: this is
 /// what keeps a layer from reading as absent, not what keeps a build warm.
-// cap: bound — 取 1，而它就是这层最新的那个文件：这是为了让一层不读成缺席，不是为了让一次构建还热
+// cap: fixed — 取 1，而它就是这层最新的那个文件：这是为了让一层不读成缺席，不是为了让一次构建还热
+// keep: 删掉后最旧的一层读成缺席，回收把空层当成没落位；由「一层最新的那个文件」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 pub const FLOOR_FILES_PER_LAYER: usize = 1;
 
 /// The bucket of files whose loss costs only time -- the layers in
 /// [`DISCARDABLE_LEAVES`].
 // cap: fixed — 桶的编号不是可调的量：它只用来排序，两种代价谁在前由代价本身决定
+// not-a-bound: 桶的编号不是可调的量：它只用来排序，两种代价谁在前由代价本身决定
 pub const TIME_ONLY: usize = 0;
 
 /// The bucket of files a later build reads -- the layers in [`RESULT_LEAVES`],
 /// and the layout shapes that stand in for them in [`RELOCATED_LEAVES`].
 // cap: fixed — 同上：编号是排序用的枚举值，不是界；改它只会让这一种代价排到前面去
+// not-a-bound: 同上：编号是排序用的枚举值，不是界；改它只会让这一种代价排到前面去
 pub const COMPILED_RESULT: usize = 1;
 
 /// The rank of a layer neither list places, which is the last of them.
@@ -142,7 +146,8 @@ pub const COMPILED_RESULT: usize = 1;
 /// Named rather than written as a literal because the question "is this layer
 /// placed at all" is asked in more than one place, and a second `2` there would
 /// be a second answer to it.
-// cap: bound — 「根本没有落位」在不止一处被问，第二处再写一个 2 就是对同一个问题给第二个答案
+// cap: fixed — 「根本没有落位」在不止一处被问，第二处再写一个 2 就是对同一个问题给第二个答案
+// keep: 删掉后第二处再写一个 2，同一个问题有了两个答案；由「不止一处被问」兜住
 const UNPLACED: usize = 2;
 
 /// One file a plan would delete, by every name it has.
