@@ -8078,7 +8078,7 @@ mod tests {
             role: "floor-exceeds-window-test".into(),
             max_iterations: 10,
             // 窗口装得下这条正文的指针、装不下地板：判的是地板那一条，不是入口。
-            context_window_size: Some(256),
+            context_window_size: Some(128),
             ..Default::default()
         };
         // 同上：这一轮判的是「窗口 40 装不下地板」，量到过的大 prompt 不属于它。
@@ -9184,7 +9184,7 @@ mod tests {
         );
         let config = RuntimeConfig {
             agent_id: "archivist-0002".into(),
-            context_window_size: Some(400),
+            context_window_size: Some(1024),
             max_iterations: 4,
             ..Default::default()
         };
