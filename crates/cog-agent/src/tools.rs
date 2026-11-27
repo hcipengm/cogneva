@@ -2057,7 +2057,10 @@ mod tests {
         // 13716 → 13713 是搜索与 diff 的截断改由「一页」导出，说明里那句
         // 「the cap」换成了它实际是哪个界；13713 → 13647 是工具侧不再截断，
         // 搜索与 diff 说明里那两句「一页装不下就回 truncated」随之一并删掉。
-        const BUDGET: usize = 13_647;
+        // 13647 → 14463 是 start_task 的四个格子（terminal/now/gap 与「平台从
+        // 这一轮补」那一格）：它们把「一条活要做到什么、现在差什么」变成模型
+        // 必须读到的形状，没有这四句模型仍会只交一句话，五格就无从落账。
+        const BUDGET: usize = 14_463;
         assert!(
             measured <= BUDGET,
             "the model now pays {measured} bytes per turn for tool signatures; the budget \

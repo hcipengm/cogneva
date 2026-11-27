@@ -480,20 +480,13 @@ impl ContextWindow {
             original.chars().count(),
             spill_at.display()
         );
+        // 判的是**这条任务正文**压成指针之后还放不放得进窗口。system 与工具面
+        // 那半截不在这里算：那半截装不下是「地板高过窗口」的另一种结局
+        // （`floor_exceeds_budget`），而这条界判的是入口写错了——把整本书塞进
+        // 一句任务。把固定半截也算进来时，窗口一小它就替地板那一条报成「正文
+        // 装不下」，读的人会去改入口，而该改的是窗口。
         let pointer = Message::user(&shortest);
-        let total: usize = self
-            .messages
-            .iter()
-            .enumerate()
-            .map(|(i, m)| {
-                if i == index {
-                    estimate_tokens(&pointer.content())
-                } else {
-                    estimate_tokens(&m.content())
-                }
-            })
-            .sum();
-        total <= budget
+        estimate_tokens(&pointer.content()) <= budget
     }
 
     /// 地板装不下时把它压进预算：截断首条 user（任务输入），窗口里只留它的开头。
