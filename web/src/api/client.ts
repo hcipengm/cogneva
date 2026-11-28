@@ -3119,7 +3119,12 @@ export async function getWorkbench(): Promise<WorkbenchPage> {
 // ── 能力 ──
 
 /** 一项动作从哪来。同名不同源是两行。 */
-export type CapabilitySource = 'builtin' | 'plugin' | 'mcp';
+export type CapabilitySource =
+  | 'builtin'
+  | 'plugin'
+  | 'mcp'
+  /** 对话层在一轮里装上去的工具：只属于那一段对话，共用注册表里没有它们。 */
+  | 'conversation';
 
 /**
  * 这一项此刻能不能真的被调起来。
@@ -3907,9 +3912,11 @@ export async function listAuditEvents(query: AuditQuery = {}): Promise<AuditEven
 
 export interface QuotaUsage {
   user_id: string;
-  remaining: number;
+  /** `null` ＝ 没有任何人给这一格声明过上限，所以没有「还剩多少」可报。 */
+  remaining: number | null;
   used_today: number;
-  total_quota: number;
+  /** `null` ＝ 同上：没有上限，不是一个很大的上限。 */
+  total_quota: number | null;
 }
 
 /** 我这一份 token 额度今天用了多少、还剩多少。 */

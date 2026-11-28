@@ -398,7 +398,7 @@ data:
             "batch_persistence_enabled": false,
             "archive_enabled": true,
             "_comment_archive_after_secs": "终态行在内存里保留多久才归档到对象存储：172800 秒（两天），与代码里 default_archive_after_secs 一致。它必须长于一次重驱动要等的那段（重启窗口），否则被归档的行读成「没有这件任务」，重驱动永远不会发生。",
-            "_comment_ready_task_poll_interval_secs": "空闲时多久问一次「有没有就绪任务」。读侧把 0 夹到 1 秒（`.max(1)`），那等于常态忙轮询；5 秒是「就绪到被取走」的可接受延迟与空转代价之间的那一档。"
+            "_comment_ready_task_poll_interval_secs": "空闲时多久问一次「有没有就绪任务」。读侧把 0 读作「没写」，换回内置的 5 秒（`effective_ready_task_poll_interval_secs`）；写一个正数就按它来。5 秒是「就绪到被取走」的可接受延迟与空转代价之间的那一档。"
           },
           "gateway": {
             "http_port": 8080,
@@ -3956,7 +3956,7 @@ data:
                   "face": "资源管理"
                 }
               ],
-              "_comment_poll_interval_secs": "采集周期：连续几拍取不到数才算「断档」（`eval_failure_alert_after` 按拍计），所以改它等于改所有告警的时间分辨率；读侧把 0 夹到 1 秒。",
+              "_comment_poll_interval_secs": "采集周期：连续几拍取不到数才算「断档」（`eval_failure_alert_after` 按拍计），所以改它等于改所有告警的时间分辨率；读侧取它和下限 30 秒（抓取间隔决定的新鲜度上限）中较大的那个，循环周期与规则停报的判定窗读同一个生效值。",
               "_comment_greater_than": "`greater_than` 里的数是这条告警的判定线本身：同一规则里的 `summary` 把它复述给看告警的人，两处说的是同一件事。线定在哪由这条规则要抓的问题定（例如根分区用到 75% 就该有人看），这一族不共用一条实测——每条规则的线各自对应它自己的判据。 查询只取数：`promql` 不把这条线同向地再比一次，比一次的是 `condition` 这一格。",
               "_comment_less_than": "`less_than` 里的数是这条告警的判定线本身：同一规则里的 `summary` 把它复述给看告警的人，两处说的是同一件事。线定在哪由这条规则要抓的问题定（例如根分区用到 75% 就该有人看），这一族不共用一条实测——每条规则的线各自对应它自己的判据。方向相反：低于这条线就报。 查询只取数：`promql` 不把这条线同向地再比一次，比一次的是 `condition` 这一格。",
               "_comment_greater_than_or_equal": "`greater_than_or_equal` 里的数是这条告警的判定线本身：同一规则里的 `summary` 把它复述给看告警的人，两处说的是同一件事。线定在哪由这条规则要抓的问题定（例如根分区用到 75% 就该有人看），这一族不共用一条实测——每条规则的线各自对应它自己的判据。边界包含：等于这条线就报。 查询只取数：`promql` 不把这条线同向地再比一次，比一次的是 `condition` 这一格。",
@@ -3968,7 +3968,7 @@ data:
             "data_volume_watch": {
               "_comment": "应用数据目录的占用量由写它的进程自己量成 gauge cogneva_data_volume_used_bytes 并带上卷名，规则拿它除以 kube-state-metrics 报的 requests.storage。同一份 cogneva.json 挂给多个 Pod，各自挂的卷不是同一张，所以卷名由各部署用自己的 env 指名（COGNEVA_DATA_VOLUME_CLAIM），不写在这里；claim 为空即整个观测关闭。没有应用数据目录、只有挂载表的进程（独立子命令与边车）用 COGNEVA_DATA_VOLUME_MOUNTS 的 claim=路径 列表声明，卷名就在那一行里；这条序列只能由挂载着该卷的进程走查产出——问得出来的那份是另一个量（引用字节），不是盘上占用。",
               "interval_secs": 300,
-              "_comment_interval_secs": "数据量扫描周期。扫描要遍历整个数据目录，代价随数据量涨，所以取分钟级；读侧把 0 夹到 `MIN_SCAN_INTERVAL_SECS`。"
+              "_comment_interval_secs": "数据量扫描周期。扫描要遍历整个数据目录，代价随数据量涨，所以取分钟级；读侧取它和下限 `MIN_SCAN_INTERVAL_SECS`（30 秒，与抓取间隔对齐）中较大的那个。"
             }
           },
           "self_review": {
@@ -4029,12 +4029,11 @@ data:
               "--no-fail-fast"
             ],
             "deploy_admission": {
-              "_comment": "触及 deploy/** 的变更按可执行条件准入，不转人工：chart 必须能渲染且 deploy/rendered 与 chart 一致（render-deploy.sh --check），chart 与 deploy/k3s 静态清单逐字段 parity（check-deploy-parity.sh），且渲染产物描述出来的控制面必须仍然可达（check-control-plane-reachability.sh：它判哪几族、每族的判据，由脚本头部的清单说，这里不再抄一遍——抄的那一份会随族的增加过期，而过期的注释没有任何东西读得出来）。三门都在应用后的树上跑，任一退出非零即拒收并点名；第三条判不了的形状（没有产物、解析失败、缺 python3-yaml）退出码 2，不当 0 读。helm 由 Pod 内挂载的宿主二进制提供；宿主没有 helm 时这一族被点名缺条件而拒收，不退回「等人批」。服务端 dry-run 目前不声明：判定身份按 Role 只在本命名空间，dry-run 覆盖不了的集群级对象会一律报未授权，把整族误杀；扩权是属主的动作。",
+              "_comment": "触及 deploy/** 的变更按可执行条件准入，不转人工：chart 必须能渲染、仓里没有渲染产物、且每个 profile 都现场生成得出来（check-rendered-trees.sh），chart 与 deploy/k3s 静态清单逐字段 parity（check-deploy-parity.sh），且渲染产物描述出来的控制面必须仍然可达（check-control-plane-reachability.sh：它判哪几族、每族的判据，由脚本头部的清单说，这里不再抄一遍——抄的那一份会随族的增加过期，而过期的注释没有任何东西读得出来）。三门都在应用后的树上跑，任一退出非零即拒收并点名；第三条判不了的形状（没有产物、解析失败、缺 python3-yaml）退出码 2，不当 0 读。helm 由运行镜像自带（构建期按引导器的 HELM_VERSION 装），两条渲染链因此是同一个版本；镜像里没有 helm 时这一族被点名缺条件而拒收，不退回「等人批」。服务端 dry-run 目前不声明：判定身份按 Role 只在本命名空间，dry-run 覆盖不了的集群级对象会一律报未授权，把整族误杀；扩权是属主的动作。",
               "commands": [
                 [
                   "bash",
-                  "deploy/scripts/render-deploy.sh",
-                  "--check"
+                  "deploy/scripts/check-rendered-trees.sh"
                 ],
                 [
                   "bash",
@@ -4142,7 +4141,7 @@ data:
                 "secrets/",
                 "*.lock"
               ],
-              "_comment_forbidden_paths": "deploy/ is deliberately absent: deploy changes are judged by the deploy admission gate (render freshness, parity, rollback, dry-run on the applied tree), so forbidding the path here would refuse them before that gate could run. The entries that stay have no executable judge.",
+              "_comment_forbidden_paths": "deploy/ is deliberately absent: deploy changes are judged by the deploy admission gate (rendered trees generated not committed, parity, rollback, dry-run on the applied tree), so forbidding the path here would refuse them before that gate could run. The entries that stay have no executable judge.",
               "revert_on_ci_failure": true,
               "redrive_on_ci_failure": true
             },

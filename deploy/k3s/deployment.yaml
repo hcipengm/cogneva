@@ -1,4 +1,3 @@
-# census-keep: shapes=deploy-numbers — 部署清单里的数是部署自己的声明：它写在生效的那一处，改它只改这一次部署，不是代码里看不见的默认；由部署面本身兜住
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -46,7 +45,7 @@ spec:
         # 一直用旧配置，回滚只改 ConfigMap 时进程仍用新配置。指纹同时覆盖 env 那份
         # cogneva-config（通知/告警出口地址在那里），只哈希卷里那份会让「配好地址但
         # 不重启」永远挂不上出口。
-        checksum/config: e9ee23c6dc7cafee170824957287e04b7872a4bc9f76ced321735c7eb61b7d7b
+        checksum/config: fdb3c2e9d0f3b958d3c82827d9c933ccb74b7cff309fe2b8b8bf670d7aad6f5c
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: gateway
@@ -390,15 +389,22 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 10
             failureThreshold: 6
-          # 内存这一档按**量出来的**占用给：实测三份权重各建一个 session 之后
+          # 天花板按**量出来的**占用给：实测三份权重各建一个 session 之后
           # 实测进程以 4.52GiB 开始服务，跑几轮真实取数后稳定在 6.46GiB 上下，
           # 并发高峰再往上要。只按出生那一下定的档装不下后段——实测每一代都在
           # 贴住上限时被 OOMKilled。这些页是私有匿名页，容器里不可回收，所以
           # limit 要真装得下而不是靠回收兜底。
+          #
+          # request 是种子，不是稳态声明：这份清单会落到各种大小的节点上，
+          # 而 6.46GiB 是在一台机器上量出来的。实测 2026-11-24：6Gi 的种子在
+          # 一台实测 allocatable 5.55GiB 的节点上让新副本一直 Pending，而把 request
+          # 换成实测值的正是那条按 p95 回写的闭环——闭环要靠 Pod 跑起来才拿得到
+          # 样本。种子取闭环自己的量化格（默认 16Mi，`MEMORY_QUANTUM_BYTES`）：它是这条
+          # 律从种子上动起来的最小一步，也是任何节点都排得下的最小声明。
           resources:
             requests:
               cpu: 500m
-              memory: 6Gi
+              memory: 16Mi
             limits:
               cpu: 4000m
               memory: 12Gi

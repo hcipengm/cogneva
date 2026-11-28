@@ -1,7 +1,7 @@
 # 部署 profile：K3s 多节点（元启动声明 COGNEVA_CLUSTER_NODES 或探测到多节点）。
 #
 # 渲染：bash deploy/scripts/render-deploy.sh
-# 产物：deploy/rendered/k3s-multi/
+# 产物：deploy/rendered/k3s-multi/（消费点现场生成，不进仓）
 #
 # 与 k3s-single 的唯一拓扑差异：git-remote 用集群卷（PVC）而非宿主
 # hostPath——hostPath 只存在于元启动所在节点，evolution/主应用调度到

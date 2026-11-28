@@ -1,4 +1,3 @@
-# census-keep: shapes=deploy-numbers — 部署清单里的数是部署自己的声明：它写在生效的那一处，改它只改这一次部署，不是代码里看不见的默认；由部署面本身兜住
 # Standalone security gateway: it holds every sensitive credential (LLM API keys, code
 # platform tokens, webhook secrets) so that sandbox pods hold none. Four channels: 8080
 # the external proxy (outbound after redaction review), 8081 the LLM and
@@ -35,7 +34,7 @@ spec:
       annotations:
         # 本 Pod 经 envFrom 取 cogneva-config。env 只在进程启动时读一次，所以
         # 只改配置的那次升级必须换掉这个模板，否则改完地址也不会生效。
-        checksum/config: e9ee23c6dc7cafee170824957287e04b7872a4bc9f76ced321735c7eb61b7d7b
+        checksum/config: fdb3c2e9d0f3b958d3c82827d9c933ccb74b7cff309fe2b8b8bf670d7aad6f5c
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: security-gateway

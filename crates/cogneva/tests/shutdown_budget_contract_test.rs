@@ -29,7 +29,7 @@ use crate::common;
 
 use common::routes::{read, walk_all};
 
-use common::routes::repo_root;
+use common::routes::{rendered_root, repo_root};
 
 /// 进程读到的那份配置。
 const JSON: &str = "deploy/helm/cogneva/files/cogneva.json";
@@ -188,7 +188,7 @@ fn every_rendered_profile_carries_the_derived_budget() {
     let grace = leaf(&shutdown, "terminationGraceSeconds");
     let margin = leaf(&shutdown, "drainTeardownMarginMs");
     let want = grace * 1000 - margin;
-    let root = repo_root().join(RENDERED);
+    let root = rendered_root();
     let mut paths = Vec::new();
     walk_all(&root, &mut paths);
     let mut seen: Vec<String> = Vec::new();
@@ -202,16 +202,16 @@ fn every_rendered_profile_carries_the_derived_budget() {
             assert_eq!(
                 rendered_field(&text, "terminationGracePeriodSeconds"),
                 Some(grace),
-                "{} ({name}) renders a grace period other than values' {grace}: the rendered \
-                 profile is stale -- re-run deploy/scripts/render-deploy.sh",
+                "{} ({name}) renders a grace period other than values' {grace}: the template \
+                 stopped deriving it -- re-render with deploy/scripts/lib/rendered-cache.sh --ensure",
                 path.display()
             );
             assert_eq!(
                 rendered_env(&text, BUDGET_ENV),
                 Some(want.to_string()),
                 "{} ({name}) does not render {BUDGET_ENV} as {grace} s - {margin} ms = {want}: \
-                 either the template stopped deriving it or the rendered profile is stale -- \
-                 re-run deploy/scripts/render-deploy.sh",
+                 the template stopped deriving it -- re-render with \
+                 deploy/scripts/lib/rendered-cache.sh --ensure",
                 path.display()
             );
             seen.push(path.display().to_string());

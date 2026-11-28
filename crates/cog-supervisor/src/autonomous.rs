@@ -247,7 +247,7 @@ impl AutonomousCollaborator {
         };
         if had_retries {
             if let Some(ref meta) = self.meta_learning {
-                if let Some(group) = self.decision_group_for(task_id).await {
+                if let Some(group) = self.decision_group_or_skip(task_id).await {
                     let _ = meta
                         .record(
                             cog_core::DecisionCategory::RetryPolicy,
@@ -272,7 +272,7 @@ impl AutonomousCollaborator {
 
         // Build task features and query meta-learning for retry strategy.
         let ml_recommendation = if let Some(ref meta) = self.meta_learning {
-            if let Some(group) = self.decision_group_for(task_id).await {
+            if let Some(group) = self.decision_group_or_skip(task_id).await {
                 let decision = meta
                     .recommend(cog_core::DecisionCategory::RetryPolicy, &group)
                     .await;
@@ -324,7 +324,7 @@ impl AutonomousCollaborator {
 
             // Record failed outcome to meta-learning.
             if let Some(ref meta) = self.meta_learning {
-                if let Some(group) = self.decision_group_for(task_id).await {
+                if let Some(group) = self.decision_group_or_skip(task_id).await {
                     let _ = meta
                         .record(
                             cog_core::DecisionCategory::RetryPolicy,
@@ -360,7 +360,7 @@ impl AutonomousCollaborator {
 
             // Record retry decision to meta-learning.
             if let Some(ref meta) = self.meta_learning {
-                if let Some(group) = self.decision_group_for(task_id).await {
+                if let Some(group) = self.decision_group_or_skip(task_id).await {
                     let _ = meta
                         .record(
                             cog_core::DecisionCategory::RetryPolicy,
@@ -407,7 +407,15 @@ impl AutonomousCollaborator {
     /// scale-out event when the load exceeds `LOAD_RATIO_THRESHOLD`.
     pub async fn run_decision_pass(&self) {
         let pending = self.pending_count().await;
-        let ready = self.orchestrator.get_ready_tasks().await.len();
+        // 读不到**不是**「这一拍没有可派的活」：那会让扩容判断把一次库抖动读成空闲
+        // （CC27）。这一拍不给出结论，把读失败说出来。
+        let ready = match self.orchestrator.get_ready_tasks_checked().await {
+            Ok(tasks) => tasks.len(),
+            Err(e) => {
+                warn!(error = %e, "Autonomous: could not read the ready queue; this decision pass draws no conclusion");
+                return;
+            }
+        };
 
         if ready == 0 {
             debug!("Autonomous: decision pass — no ready tasks");
@@ -447,13 +455,31 @@ impl AutonomousCollaborator {
     /// task, so every group would hold a single observation, never reach the
     /// sample floor, and the retry decision would stay unlearnable no matter
     /// how many tasks run.
-    async fn decision_group_for(&self, task_id: &str) -> Option<cog_core::DecisionGroupKey> {
-        let tasks = self.orchestrator.get_all_tasks().await;
-        let task = tasks.into_iter().find(|t| t.id == task_id)?;
-        Some(cog_core::DecisionGroupKey::by_task_type(format!(
-            "{:?}",
-            task.task_type
-        )))
+    async fn decision_group_for(
+        &self,
+        task_id: &str,
+    ) -> cog_core::SFResult<Option<cog_core::DecisionGroupKey>> {
+        let tasks = self.orchestrator.get_all_tasks_checked().await?;
+        Ok(tasks
+            .into_iter()
+            .find(|t| t.id == task_id)
+            .map(|task| cog_core::DecisionGroupKey::by_task_type(format!("{:?}", task.task_type))))
+    }
+
+    /// 读不到分组时**不把观察记进那一组**，并把读失败说出来：那与「任务不在图里」
+    /// 是两件事，而后者才是一次正当的跳过（CC27）。
+    async fn decision_group_or_skip(&self, task_id: &str) -> Option<cog_core::DecisionGroupKey> {
+        match self.decision_group_for(task_id).await {
+            Ok(group) => group,
+            Err(e) => {
+                warn!(
+                    task_id = %task_id,
+                    error = %e,
+                    "Autonomous: could not read the task graph for a decision group; skipping this observation"
+                );
+                None
+            }
+        }
     }
 }
 

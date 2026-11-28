@@ -49,6 +49,15 @@ for arg in "$@"; do
     esac
 done
 
+# 渲染产物不进仓：读之前让 chart 现场生成（输入没变就是一次摘要比较）。
+# 夹具树只摆自己判的那几个文件、没有生成器，缺它时按「这里没有产物要生成」跳过。
+# 树根由参数决定，所以这一步必须在参数解析之后：测试给的是副本树。
+if [ -f "${ROOT}/deploy/scripts/lib/rendered-cache.sh" ]; then
+    # shellcheck source=lib/rendered-cache.sh
+    source "${ROOT}/deploy/scripts/lib/rendered-cache.sh"
+    ensure_rendered "${ROOT}" || exit $?
+fi
+
 record_line() { # <结局> <必需键数> <缺失数> <面数>
     [ "${record}" = 1 ] || return 0
     mkdir -p -- "$(dirname -- "${SERIES}")" 2>/dev/null \

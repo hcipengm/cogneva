@@ -26,7 +26,7 @@
 
 use crate::common;
 
-use common::routes::{read, repo_root};
+use common::routes::{read, rendered_root, repo_root};
 use common::rust_production::{production_sources, production_text};
 
 /// 名字的声明面：整个 `cog-core` 源树，不是一个文件。
@@ -119,7 +119,7 @@ fn every_delivery_reading_names_a_producer_file_that_exists() {
 
 /// The rendered rules, as the operator's pager sees them.
 fn rules() -> Vec<serde_json::Value> {
-    let text = read(&repo_root().join(RENDERED_CONFIG));
+    let text = read(&rendered_root().join("k3s-single/10-configmap-cogneva-json.yaml"));
     let at = text
         .find("cogneva.json:")
         .unwrap_or_else(|| panic!("{RENDERED_CONFIG} no longer carries cogneva.json"));

@@ -89,10 +89,15 @@ impl cog_core::contract::work_item::WorkItemGraph for LateWorkGraph {
         cog_core::contract::work_item::WorkItemGraph::submit(graph.as_ref(), goal, tasks).await
     }
 
-    async fn row(&self, id: &str) -> Option<cog_core::Task> {
+    async fn row(&self, id: &str) -> cog_core::SFResult<Option<cog_core::Task>> {
         match self.0.get() {
-            Some(graph) => graph.get_task(id).await,
-            None => None,
+            // 读不到要留成错误：把「这一拍没读到」折成 `None`，调用方会把它读成
+            // 「图里没有这一行」——那正是这一族要分开的两个答案（CC25）。
+            Some(graph) => graph.get_task_checked(id).await,
+            None => Err(cog_core::SFError::Agent(
+                "the task graph is not published in this process, so this row cannot be read"
+                    .into(),
+            )),
         }
     }
 }

@@ -1367,15 +1367,14 @@ fn dead_document_values(
 /// 共享层整份就是从文档投影出来的，在那里再写一个不同的值，同一件事就有了第二个
 /// 决定，而读文档的人以为那就是部署的取值。
 ///
-/// 今天全树只有一处，且是一笔**还没定**的部署决定：`COGNEVA_STORAGE_PROVIDER` 写
-/// `local-fs`，交接文档 `providers.storage.provider` 写 `seaweedfs`（连同一整套
-/// endpoint / bucket / 凭据，在这个部署上谁都走不到）。哪边是对的不从树里判——要看
-/// 活着的集群上 seaweedfs 的卷里有没有对象，这份读数的现场不在本仓。判据把这一处
-/// 钉住，是为了让它**不能悄悄变化**：这一对值任何一边动了，都说明部署换了存储后端，
-/// 那件事要按实测重新定，不是一次渲染改动。
+/// 今天全树一处都没有。`COGNEVA_STORAGE_PROVIDER` 曾经是唯一那处：共享层写
+/// `local-fs`、交接文档 `providers.storage.provider` 写 `seaweedfs`。2026-11-24 那
+/// 一行改成从文档投影之后两边同值，这一对随之消失——判据收紧成空集，正是它自己
+/// 写下的两条出口之一（两处声明同值）。
 ///
-/// 那条部署决定收口之后这条断言要收紧成空集：两处声明同值（于是这一对消失），或者
-/// 文档那一份删掉（路径只剩 env 一层声明）。
+/// 断言留在原地而不是删掉：下一处会以同样的形状出现，也就是共享层写一个与文档不同
+/// 的字面量。那一行读起来像是「这里本来就这样」，而真正的取值是文档那份；只有当场
+/// 红，才知道写下去的是一句死话。
 #[test]
 fn the_shared_env_layer_does_not_leave_the_document_stating_a_dead_value() {
     let doc: serde_json::Value = serde_json::from_str(&read_repo(CHART_DOC))
@@ -1406,18 +1405,12 @@ fn the_shared_env_layer_does_not_leave_the_document_stating_a_dead_value() {
     for (key, _) in &found {
         differing.insert(key.clone());
     }
-    let known: BTreeSet<(String, String, String)> = BTreeSet::from([(
-        "COGNEVA_STORAGE_PROVIDER".to_string(),
-        "seaweedfs".to_string(),
-        "local-fs".to_string(),
-    )]);
+    let known: BTreeSet<(String, String, String)> = BTreeSet::new();
     assert_eq!(
         differing, known,
-        "共享层与交接文档对同一条路径给了两个值，或已知那一处变了。已知的那一处是\n\
-         `providers.storage.provider`：文档写 seaweedfs、两张载体都写 local-fs，跑的是\n\
-         后者，文档那段 S3 配置谁都走不到——这是 D7，要在活着的集群上量过才知道哪边对，\n\
-         不能顺手改。落点：{:#?}。新出现的条目不是覆盖，是同一件事的第二个决定：要么\n\
-         删掉文档那一份（它什么都没决定），要么让两边同值。",
+        "共享层与交接文档对同一条路径给了两个值：跑的是 env 那个，文档那个没人读。\n\
+         这已经不是覆盖，是同一件事的第二个决定。落点：{:#?}。要么删掉 env 那一行\n\
+         （它什么都没决定，改成投影），要么让两边同值。",
         found
     );
 }

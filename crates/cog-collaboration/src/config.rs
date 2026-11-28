@@ -236,7 +236,7 @@ fn is_the_default_self_review_iterations(v: &u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkout::repo_root;
+    use crate::checkout::{rendered_root, repo_root};
 
     #[test]
     fn boundary_config_default_has_no_rules() {
@@ -405,7 +405,7 @@ mod tests {
         ] {
             out.push((relative.to_string(), read_config(&root.join(relative))));
         }
-        let rendered = root.join("deploy/rendered");
+        let rendered = rendered_root();
         let mut profiles: Vec<_> = std::fs::read_dir(&rendered)
             .unwrap_or_else(|e| panic!("read {}: {e}", rendered.display()))
             .map(|e| e.expect("readable dir entry").path())

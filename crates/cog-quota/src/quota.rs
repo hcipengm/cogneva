@@ -116,15 +116,18 @@ impl QuotaManager {
             .unwrap_or(0)
     }
 
-    /// The ceiling in force for one cell: the declared pair, or the
-    /// hierarchy's default when nobody declared one.
-    async fn ceiling(&self, scope: QuotaScope, target_id: &str) -> QuotaLimits {
+    /// The pair an operator declared for one cell, or `None` when nobody did.
+    ///
+    /// A cell with no declared pair has no ceiling to raise: the fallback pair
+    /// the hierarchy answers with is what the cell *reads* as, not a number
+    /// anyone chose for it. Returning it here would make every top-up start
+    /// from an invented base and write that base back as if an operator had
+    /// declared it.
+    async fn declared_ceiling(&self, scope: QuotaScope, target_id: &str) -> Option<QuotaLimits> {
         self.scope_reading(scope, target_id)
             .await
+            .filter(|reading| reading.enforced)
             .map(|reading| reading.limits)
-            // 没有读数的格子落回层级库自己的那一对，不是合同里另写的一对：
-            // 「没人配过」的答案由持有起点的实现方给出。
-            .unwrap_or_else(|| self.hierarchy.default_limits())
     }
 
     /// Ask whether a call of `estimated_tokens` fits, without spending
@@ -292,7 +295,14 @@ impl QuotaManager {
                  declare the ceiling for the period you mean with the limits route instead"
             )));
         }
-        let current = self.ceiling(scope, target_id).await;
+        let Some(current) = self.declared_ceiling(scope, target_id).await else {
+            return Err(QuotaError::InvalidArgument(format!(
+                "{} {:?} 还没有任何人声明过上限：先声明一对上限（limits 路由），再充值。\
+                 抬一个没人声明过的格子，起点只能是一个凭空写下的数",
+                scope.as_str(),
+                target_id
+            )));
+        };
         let raised = QuotaLimits::new(
             current.soft_limit.saturating_add(tokens),
             current.hard_limit.saturating_add(tokens),
@@ -388,6 +398,19 @@ impl QuotaChecker {
     }
 }
 
+/// 把配额层的拒绝折进接口层的错误类型，**保留它是哪一类**。
+///
+/// 从前两个充值入口一律折成 `Internal`，于是「抬一个没人声明过的格子」这种
+/// 调用方错误到网关时与数据库故障长得一样，网关只能答 500；即便它多写一个
+/// 400 分支也没有东西可匹配。`InvalidArgument` 说的是「这份请求本身不成立」，
+/// 对到 `Validation`（接口层译为 400）；其余的仍是服务端故障。
+fn refusal_kind(error: QuotaError) -> cog_core::SFError {
+    match error {
+        QuotaError::InvalidArgument(message) => cog_core::SFError::Validation(message),
+        other => cog_core::SFError::Internal(other.to_string()),
+    }
+}
+
 #[async_trait::async_trait]
 impl cog_core::QuotaManager for QuotaManager {
     async fn pre_check(
@@ -448,7 +471,7 @@ impl cog_core::QuotaManager for QuotaManager {
     ) -> cog_core::SFResult<()> {
         self.recharge(user_id, tokens, valid_until)
             .await
-            .map_err(|e| cog_core::SFError::Internal(e.to_string()))
+            .map_err(refusal_kind)
     }
 
     async fn recharge_workspace(
@@ -459,6 +482,6 @@ impl cog_core::QuotaManager for QuotaManager {
     ) -> cog_core::SFResult<()> {
         self.recharge_workspace(workspace_id, tokens, valid_until)
             .await
-            .map_err(|e| cog_core::SFError::Internal(e.to_string()))
+            .map_err(refusal_kind)
     }
 }

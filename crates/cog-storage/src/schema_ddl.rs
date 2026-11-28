@@ -283,7 +283,26 @@ async fn attempt_once(pool: &PgPool, schema: &str, tag: &str, wait: &str) -> Att
     match apply_once(pool, schema, tag, wait).await {
         Ok(()) => Attempt::Ok,
         Err(e) if is_lock_wait_expiry(&e) => Attempt::LockWait(e),
-        Err(e) => Attempt::Failed(e.to_string()),
+        Err(e) => {
+            // Losing a race to a peer is not a failed schema. `CREATE TABLE IF
+            // NOT EXISTS` is idempotent as a statement but not atomic as a
+            // check: two sessions that both read the catalog before either has
+            // written it both go on to insert its rows, and one of them comes
+            // back `duplicate key value violates unique constraint
+            // "pg_type_typname_nsp_index"` or `relation ... already exists`
+            // (both measured on the two replicas that start together). The
+            // text's work is done either way, so a failed attempt asks the
+            // catalog again: empty means the peer did it, and this attempt is
+            // as good as done. A statement that is not a catalog fact is kept
+            // by `outstanding` unconditionally, so a real failure -- bad SQL, a
+            // constraint, a statement whose effect is rows -- still comes back
+            // with work left and is reported.
+            if matches!(outstanding(pool, schema).await, Some(rest) if rest.trim().is_empty()) {
+                Attempt::Ok
+            } else {
+                Attempt::Failed(e.to_string())
+            }
+        }
     }
 }
 

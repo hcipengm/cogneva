@@ -24,7 +24,7 @@
 
 use crate::common;
 
-use common::routes::{read, repo_root};
+use common::routes::{read, rendered_root, repo_root};
 use common::rust_production::production_text;
 use common::rust_text::rust_function_body;
 
@@ -221,9 +221,8 @@ fn every_entrance_read_is_probed_and_granted() {
             "集群读探针没有探 {resource}：这一读 403 时它不会在任何一格读数里留下痕迹"
         );
     }
-    let role = read(
-        &repo_root().join("deploy/rendered/k3s-single/16-clusterrole-cogneva-topology-reader.yaml"),
-    );
+    let role =
+        read(&rendered_root().join("k3s-single/16-clusterrole-cogneva-topology-reader.yaml"));
     assert!(
         role.contains("resources: [\"services\", \"endpoints\"]"),
         "渲染出来的 ClusterRole 没有授权 services 与 endpoints：代码读它们，而集群\

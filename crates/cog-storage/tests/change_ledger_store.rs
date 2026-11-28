@@ -1714,8 +1714,13 @@ async fn a_history_reads_back_through_the_store_newest_first_and_on_its_own_iden
     assert_eq!(newest.len(), 1);
     assert_eq!(
         newest[0].to_state,
-        ChangeState::Landed,
+        ChangeState::Pending,
         "the bound has to drop the oldest steps, not keep them"
+    );
+    assert_eq!(
+        newest[0].measured_rev.as_deref(),
+        Some("rev-c"),
+        "the one step kept is the last one taken, not the first"
     );
 
     cleanup(&pool, &marker).await;
@@ -1750,8 +1755,11 @@ async fn the_reason_of_a_transition_is_recorded_with_it() {
     assert_eq!(
         event_reasons(&pool, &marker).await,
         vec![
+            // The account has two state words, and the event records the state
+            // the move landed in: an unsettled measurement is `pending` with
+            // the reason beside it.
             (
-                "undecided".to_string(),
+                "pending".to_string(),
                 None,
                 Some("scope_outside_tree".to_string())
             ),

@@ -11,9 +11,9 @@ profile values 表达：`deploy/helm/cogneva/profiles/k3s-single.yaml`、
 
 本目录的静态清单**不是**权威源，不能手改后不回写 chart。它保留两个消费方：
 
-1. **bootstrap 的 apply 物不直接是本目录**——bootstrap 消费的是 chart 经 CI
-   预渲染的 `deploy/rendered/<profile>/`（`bash deploy/scripts/render-deploy.sh`
-   生成，CI 新鲜度门禁防漂移），按环境探测自动选 profile。
+1. **bootstrap 的 apply 物不直接是本目录**——bootstrap 消费的是 chart 渲染出的
+   `deploy/rendered/<profile>/`（构建期按平台渲染并内嵌进二进制，部署主机不需要
+   helm；运行时按环境探测自动选 profile），产物不进仓。
 2. **集群内 GitOps 拉取端**（cog-reflection）在进化流水线里 apply 克隆仓库中的
    本目录文件（如 `cogneva-json-configmap.yaml`、`evolution-deployment.yaml`），
    换版脚本 `swap-image.sh` 也直接操作本目录清单。
@@ -30,9 +30,10 @@ bash deploy/scripts/check-deploy-parity.sh
 # 见脚本头部），差异即失败；比了多少资源、多少类由脚本自报，别在文档里钉死。
 ```
 
-**改动拓扑的正确顺序**：改 chart templates / values.yaml → 跑
-`render-deploy.sh` 重新生成 `deploy/rendered/` → 同步本目录对应静态清单 →
-`check-deploy-parity.sh` 绿。三者同提一个 commit。
+**改动拓扑的正确顺序**：改 chart templates / values.yaml → 现场生成
+`deploy/rendered/`（`bash deploy/scripts/lib/rendered-cache.sh --ensure`；写回式投影用
+`render-deploy.sh`）→ 同步本目录对应静态清单 → `check-deploy-parity.sh` 绿。chart 与
+静态清单同提一个 commit；渲染产物本身不进仓。
 
 ## 不在本目录的两类东西
 

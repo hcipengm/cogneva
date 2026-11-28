@@ -20,8 +20,8 @@
 use crate::common;
 
 use common::routes::read;
-use common::routes::repo_root;
 use common::routes::walk;
+use common::routes::{rendered_root, repo_root};
 use common::yaml;
 
 fn env_pairs(container: &serde_yaml::Mapping) -> Vec<(String, Option<String>)> {
@@ -77,7 +77,7 @@ fn every_container_carries_the_clusters_timezone_including_the_database() {
     let pg_image = field(&values, &["backends", "postgres", "image"]).expect("postgres image");
 
     let mut files = Vec::new();
-    walk(&root.join("deploy/rendered"), &["yaml"], &mut files);
+    walk(&rendered_root(), &["yaml"], &mut files);
     assert!(
         files.len() > 10,
         "读到 {} 份渲染清单：这条判据几乎在空集上通过",

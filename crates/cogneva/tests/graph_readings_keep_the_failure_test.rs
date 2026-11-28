@@ -37,6 +37,15 @@ const SIGNAL_WATCHER: &str = "crates/cog-reflection/src/signal_watcher.rs";
 const CHANGE_LEDGER: &str = "crates/cog-orchestrator/src/change_ledger.rs";
 const DISCOVERY_LOOP: &str = "crates/cog-github/src/discovery_loop.rs";
 const PROMOTION_EVAL: &str = "crates/cog-reflection/src/promotion_eval.rs";
+const MAINLINE_DEPLOYER: &str = "crates/cog-reflection/src/mainline_deployer.rs";
+const EVOLUTION: &str = "crates/cog-reflection/src/evolution.rs";
+const WORK_ITEM: &str = "crates/cog-core/src/contract/work_item.rs";
+const PLUGIN: &str = "crates/cog-reflection/src/plugin.rs";
+const AUTONOMOUS: &str = "crates/cog-supervisor/src/autonomous.rs";
+const CONVERSATION: &str = "crates/cogneva/src/conversation.rs";
+const LANDING: &str = "crates/cog-github/src/landing.rs";
+const OUTWARD: &str = "crates/cog-orchestrator/src/outward.rs";
+const TASK_ROUTER: &str = "crates/cog-orchestrator/src/task_executor_router.rs";
 
 /// 折叠过的那几条读。某一段正文里出现它们，就是那一面在替没读到的图作证。
 const FOLDED: &[&str] = &[
@@ -398,6 +407,134 @@ const SURFACES: &[(&str, &str, &str, &str)] = &[
         "get_task_checked",
         "提交前那一读读成「没有旧行挡着」，这一次提交被当重投静默跳过；等待里那一读读成「还在跑」，无上限地等下去",
     ),
+    // CC19：主线上部署器的四处扣住读数。
+    (
+        MAINLINE_DEPLOYER,
+        "async fn ci_hold_attempts",
+        "get_task_checked",
+        "列不出前几轮被读成「第一次动手」，后一轮收到的题面里没有别人替它编的经历",
+    ),
+    (
+        MAINLINE_DEPLOYER,
+        "async fn live_ci_hold_fix_id",
+        "get_task_checked",
+        "读不到被读成「这个 id 还没人开过」，或沿用一张可能还挂着活行的 id，这一轮一张单也开不出来",
+    ),
+    (
+        MAINLINE_DEPLOYER,
+        "async fn retire_ci_hold_rows",
+        "get_task_checked",
+        "读不到被读成「它从没落库」，一行带着已经不成立的判词留在队列里",
+    ),
+    (
+        MAINLINE_DEPLOYER,
+        "async fn retire_ci_holds_except",
+        "get_all_tasks_checked",
+        "一整趟收行读成「图上一行都没有」，旧停线单继续占着唯一的座位",
+    ),
+    // CC20：A2A 面。
+    (
+        A2A,
+        "impl GoalReader for Arc<dyn OrchestratorControl>",
+        "get_task_checked",
+        "「读不到」与「没有这一行」并成同一个 `None`，对端无从决定换 id 还是重试",
+    ),
+    (
+        A2A,
+        "async fn wait_until_done",
+        "get_task_checked",
+        "等终局时读不到被读成「行没了」，拿等待前的旧值当终局递回去",
+    ),
+    // CC21：任务面。
+    (
+        TASKS,
+        "async fn wait_for_task_end",
+        "get_task_checked",
+        "读不到被读成「任务已不在」，这一等静默结束而对端以为等到了终局",
+    ),
+    (
+        TASKS,
+        "pub async fn assign_task_handler",
+        "get_task_checked",
+        "派工预检把读失败答成 404，调用者分不出「读不到」与「id 不存在」",
+    ),
+    // CC22–CC24：提交前的幂等检查。
+    (
+        LANDING,
+        "async fn redrive",
+        "get_task_checked",
+        "读不到被读成「还没有人交过」，同一个 id 再交一份",
+    ),
+    (
+        OUTWARD,
+        "async fn hand_over",
+        "get_task_checked",
+        "读不到被读成「没人拿着」，同一个 id 的目标被交第二份",
+    ),
+    (
+        TASK_ROUTER,
+        "async fn drop_if_its_task_cannot_run",
+        "get_task_checked",
+        "读不到被读成「这一行不能跑」，一条活任务的消息被 ack 掉",
+    ),
+    // CC25：自进化的行读口。
+    (
+        WORK_ITEM,
+        "pub async fn run_work_item",
+        "graph.row(&id).await?",
+        "读口只答「有没有」，读不到与「图里没有」在这条路上同形",
+    ),
+    (
+        WORK_ITEM,
+        "impl<T: crate::OrchestratorControl + ?Sized> WorkItemGraph for T",
+        "get_task_checked",
+        "读口把读失败折成 `None`，调用者没有地方取那个区别",
+    ),
+    (
+        EVOLUTION,
+        "impl cog_core::contract::work_item::WorkItemGraph for LateWorkGraph",
+        "get_task_checked",
+        "读不到被读成「没有这一行」，一条自进化的任务被当成不存在",
+    ),
+    // CC26：发现环的结算。
+    (
+        PLUGIN,
+        "fn spawn_discovery_loop",
+        "get_task_checked",
+        "读不到被读成「这一条没带判词回来」，读失败那一格算进了「没有判词」",
+    ),
+    // CC27：自治监督的决策拍。
+    (
+        AUTONOMOUS,
+        "pub async fn run_decision_pass",
+        "get_ready_tasks_checked",
+        "读失败被读成 `ready == 0`，「这一拍什么都没量到」与「确实没有可派的活」同一句",
+    ),
+    (
+        AUTONOMOUS,
+        "async fn decision_group_for",
+        "get_all_tasks_checked",
+        "读失败被读成「它不在图里」，一次观察被记进一个不存在的那一组",
+    ),
+    // CC28：对话面。
+    (
+        CONVERSATION,
+        "fn dispatch_change_tool",
+        "get_all_tasks_checked",
+        "交变更前的查重读成空图，同一条变更再开一代",
+    ),
+    (
+        CONVERSATION,
+        "fn list_handler",
+        "get_all_tasks_checked",
+        "列任务读失败答成「0 条」",
+    ),
+    (
+        CONVERSATION,
+        "fn get_handler",
+        "get_task_checked",
+        "按 id 取任务读失败答成「图里没有这条任务」",
+    ),
 ];
 
 #[test]
@@ -421,6 +558,15 @@ fn every_surface_that_draws_the_graph_keeps_the_failure() {
         CHANGE_LEDGER,
         DISCOVERY_LOOP,
         PROMOTION_EVAL,
+        MAINLINE_DEPLOYER,
+        EVOLUTION,
+        WORK_ITEM,
+        PLUGIN,
+        AUTONOMOUS,
+        CONVERSATION,
+        LANDING,
+        OUTWARD,
+        TASK_ROUTER,
     ] {
         productions.insert(file, production_text(&read_repo(file)));
     }

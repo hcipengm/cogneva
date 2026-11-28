@@ -7,7 +7,8 @@
 //! 拼 URL 的站点钉在同一个 values 键上——部署侧不做 import，靠的就是这条门。
 //!
 //! `templates/postgres.yaml` 的路径属于 Postgres exporter 自己的面，不在此列；
-//! 渲染产物由 `render-deploy.sh --check` 判新鲜度，也不在这里重复。
+//! 渲染产物由读者现场生成（`deploy/scripts/lib/rendered-cache.sh`），不在仓里，
+//! 也没有「新鲜度」可比，这里不重复。
 
 use crate::common;
 

@@ -309,8 +309,23 @@ impl PromotionGateConfig {
         if let Some(v) = get("COGNEVA_GITOPS_GIT_USER_EMAIL") {
             g.git_user_email = v;
         }
+        // 声明的两条节拍原样生效。从前读侧把它们静默抬到 15 秒与 300 秒：配置面
+        // 写着 60，跑的却是 300，而没有任何一处说它被改写过。0 秒不是「越快越好」
+        // 的极端，是忙等，所以拒绝而不是替换成一个没人声明的数。
+        declared_cadence("gitops.poll_interval_secs", g.poll_interval_secs)?;
+        declared_cadence("gitops.canary_watch_secs", g.canary_watch_secs)?;
         Ok(())
     }
+}
+
+/// 一条声明的节拍只有两种归宿：原样用，或点名拒绝。
+pub(crate) fn declared_cadence(field: &str, secs: u64) -> SFResult<()> {
+    if secs == 0 {
+        return Err(SFError::Config(format!(
+            "{field} 为 0 秒：那是忙等，不是一个节拍。给它一个周期，或关掉这条循环。"
+        )));
+    }
+    Ok(())
 }
 
 /// 按变更一次的执行 Job：一次最多派几个、Job 自己的资源面与时限。
@@ -429,6 +444,21 @@ impl ChangeJobConfig {
             Err(e) => return Err(SFError::Config(format!("{}: {e}", path.display()))),
         };
         cfg.apply_env_with(|k| std::env::var(k).ok())?;
+        if cfg.enabled {
+            // 声明了要派 Job，这两个数就是这份声明的执行面：0 秒是忙等，
+            // 0 个并发窗口等于一次也派不出去。读到它们的那一层从前各换成一个数，
+            // 声明的值与生效的值于是有两个。
+            declared_cadence(
+                "self_evolution.change_job.poll_interval_secs",
+                cfg.poll_interval_secs,
+            )?;
+            if cfg.max_parallel == 0 {
+                return Err(SFError::Config(
+                    "self_evolution.change_job.max_parallel 声明为 0：一次也派不出去的并发窗口不是一个窗口。至少给 1。"
+                        .into(),
+                ));
+            }
+        }
         Ok(cfg)
     }
 
@@ -1166,6 +1196,10 @@ impl MainlineDeployerConfig {
         if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_POLL_INTERVAL_SECS", &get)? {
             self.poll_interval_secs = v;
         }
+        declared_cadence(
+            "self_evolution.mainline_deployer.poll_interval_secs",
+            self.poll_interval_secs,
+        )?;
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_BARE_REPO") {
             self.bare_repo = v;
         }
@@ -1551,6 +1585,78 @@ mod tests {
         assert!((cfg.gitops.canary_p99_multiplier - 1.9).abs() < f64::EPSILON);
     }
 
+    /// 声明的节拍只有两种归宿：原样用，或点名拒绝 0。
+    #[test]
+    fn only_zero_is_refused_as_a_cadence() {
+        assert!(declared_cadence("x", 1).is_ok());
+        let refused = declared_cadence("x", 0).expect_err("0 秒是忙等");
+        assert!(refused.to_string().contains('x'), "{refused}");
+    }
+
+    /// 声明的 10 秒 / 45 秒原样落到配置上（从前读侧换成 15 秒与 300 秒），
+    /// 0 秒被点名拒绝。
+    #[test]
+    fn a_declared_gitops_cadence_survives_and_zero_is_refused() {
+        let env: HashMap<&str, &str> = [
+            ("COGNEVA_GITOPS_POLL_INTERVAL_SECS", "10"),
+            ("COGNEVA_GITOPS_CANARY_WATCH_SECS", "45"),
+        ]
+        .into_iter()
+        .collect();
+        let mut cfg = PromotionGateConfig::default();
+        cfg.apply_env_with(|k| env.get(k).map(|s| s.to_string()))
+            .unwrap();
+        assert_eq!(cfg.gitops.poll_interval_secs, 10);
+        assert_eq!(cfg.gitops.canary_watch_secs, 45);
+
+        for (key, field) in [
+            (
+                "COGNEVA_GITOPS_POLL_INTERVAL_SECS",
+                "gitops.poll_interval_secs",
+            ),
+            (
+                "COGNEVA_GITOPS_CANARY_WATCH_SECS",
+                "gitops.canary_watch_secs",
+            ),
+        ] {
+            let env: HashMap<&str, &str> = [(key, "0")].into_iter().collect();
+            let mut cfg = PromotionGateConfig::default();
+            let refused = cfg
+                .apply_env_with(|k| env.get(k).map(|s| s.to_string()))
+                .unwrap_err();
+            assert!(
+                refused.to_string().contains(field),
+                "{key}=0 说「忙等」时必须点名 {field}：{refused}"
+            );
+        }
+    }
+
+    /// 主线上部署器的节拍同样原样生效；0 被点名拒绝。
+    #[test]
+    fn a_declared_deployer_cadence_survives_and_zero_is_refused() {
+        let env: HashMap<&str, &str> = [("COGNEVA_MAINLINE_DEPLOYER_POLL_INTERVAL_SECS", "12")]
+            .into_iter()
+            .collect();
+        let mut cfg = MainlineDeployerConfig::default();
+        cfg.apply_env_with(|k| env.get(k).map(|s| s.to_string()))
+            .unwrap();
+        assert_eq!(cfg.poll_interval_secs, 12);
+
+        let env: HashMap<&str, &str> = [("COGNEVA_MAINLINE_DEPLOYER_POLL_INTERVAL_SECS", "0")]
+            .into_iter()
+            .collect();
+        let mut cfg = MainlineDeployerConfig::default();
+        let refused = cfg
+            .apply_env_with(|k| env.get(k).map(|s| s.to_string()))
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("mainline_deployer.poll_interval_secs"),
+            "{refused}"
+        );
+    }
+
     #[test]
     fn env_empty_registry_means_none() {
         let env: HashMap<&str, &str> = [("COGNEVA_GITOPS_REGISTRY", "")].into_iter().collect();
@@ -1636,6 +1742,53 @@ mod tests {
         // 默认走 PATH 上的 kubectl：本 Pod 把 k3s 多调用二进制挂成
         // /usr/local/bin/kubectl（argv[0]=kubectl 即 kubectl），正好在 PATH 上。
         assert_eq!(ChangeJobConfig::default().kubectl_bin, "kubectl");
+    }
+
+    /// 声明要派 Job 时，节拍与并发窗口原样生效；0 秒与 0 个窗口被点名拒绝，
+    /// 而不是在读它们的那一层被换成 1。
+    #[test]
+    fn a_declared_change_job_cadence_and_window_survive_and_zero_is_refused() {
+        let dir =
+            std::env::temp_dir().join(format!("cog-reflection-cj-zero-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cogneva.json");
+
+        std::fs::write(
+            &path,
+            r#"{"self_evolution": {"change_job": {"enabled": true, "max_parallel": 2, "poll_interval_secs": 7}}}"#,
+        )
+        .unwrap();
+        let declared = ChangeJobConfig::load_from(&path).unwrap();
+        assert_eq!(declared.max_parallel, 2);
+        assert_eq!(declared.poll_interval_secs, 7);
+
+        std::fs::write(
+            &path,
+            r#"{"self_evolution": {"change_job": {"enabled": true, "poll_interval_secs": 0}}}"#,
+        )
+        .unwrap();
+        let refused = ChangeJobConfig::load_from(&path).unwrap_err().to_string();
+        assert!(
+            refused.contains("change_job.poll_interval_secs"),
+            "{refused}"
+        );
+
+        std::fs::write(
+            &path,
+            r#"{"self_evolution": {"change_job": {"enabled": true, "max_parallel": 0}}}"#,
+        )
+        .unwrap();
+        let refused = ChangeJobConfig::load_from(&path).unwrap_err().to_string();
+        assert!(refused.contains("max_parallel"), "{refused}");
+
+        // 关着的时候那两个数不执行任何东西，也就没有可拒的声明。
+        std::fs::write(
+            &path,
+            r#"{"self_evolution": {"change_job": {"enabled": false, "max_parallel": 0, "poll_interval_secs": 0}}}"#,
+        )
+        .unwrap();
+        assert!(ChangeJobConfig::load_from(&path).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
 
         let bad: HashMap<&str, &str> = [("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_MAX_PARALLEL", "nope")]
             .into_iter()

@@ -13,6 +13,12 @@
 # cluster to the topology that revision carried; it does not touch data
 # (PVCs, database contents), and it does not revert the repository.
 #
+# That directory is not committed (it is entirely produced by the chart), so it
+# is rebuilt here from the revision's own tree: revisions old enough to have
+# committed the bytes are read as they are, and the rest are rendered from that
+# revision's chart with that revision's own renderer. Rendering needs helm on
+# the machine running this -- the cluster still needs none.
+#
 # Default is a plan: it prints the command it would run and exits 0 without
 # touching the cluster. `--apply` runs it. A rollback is a write against a
 # running system, so the read-only outcome has to be the one you get by
@@ -24,11 +30,14 @@
 #   - a revision that is not an ancestor of HEAD: going *forward* or sideways
 #     is a change to the platform, and changes go through review, not through
 #     this script;
-#   - a revision with no deploy/rendered/<profile>/ — there is nothing there to
+#   - a revision with no chart profile of that name — there is nothing there to
 #     put back, and applying an empty directory would report success; this is
 #     also how an unknown profile is refused, since the profiles that exist are
-#     the directories under deploy/rendered/ in that revision, not a list kept
+#     the files under the chart's profiles/ in that revision, not a list kept
 #     here;
+#   - a revision whose chart cannot be rendered on this machine (no helm):
+#     nothing can be put back, and giving up before touching the cluster is the
+#     only safe reading of that;
 #   - a profile name outside [a-z0-9-] — it is pasted into a path;
 #   - --wait against a tree that declares no Deployment or StatefulSet: there
 #     is nothing to wait for, and reporting ready would be a claim about
@@ -110,13 +119,52 @@ if ! git -C "$repo" merge-base --is-ancestor "$full_rev" HEAD 2>/dev/null; then
 fi
 
 rendered_rel="deploy/rendered/$profile"
-if ! git -C "$repo" ls-tree -d --name-only "$full_rev" -- "$rendered_rel" 2>/dev/null | grep -qx "$rendered_rel"; then
-    printf 'rollback: %s 里没有 %s/——那一版没有可回滚的清单\n' "${full_rev:0:12}" "$rendered_rel" >&2
+profile_rel="deploy/helm/cogneva/profiles/$profile.yaml"
+# 这个 profile 在那一版里存不存在有两个证据：产物曾经被提交过（老版本），或者
+# chart 里还有它的 profile（新版本——产物由读者现场渲染）。两个都没有就是没有。
+has_rendered=0
+has_profile=0
+git -C "$repo" ls-tree -d --name-only "$full_rev" -- "$rendered_rel" 2>/dev/null \
+    | grep -qx "$rendered_rel" && has_rendered=1 || true
+git -C "$repo" ls-tree --name-only "$full_rev" -- "$profile_rel" 2>/dev/null \
+    | grep -qx "$profile_rel" && has_profile=1 || true
+if [ "$has_rendered" -eq 0 ] && [ "$has_profile" -eq 0 ]; then
+    printf 'rollback: %s 里没有 %s/（也没有 %s）——那一版没有可回滚的清单\n' \
+        "${full_rev:0:12}" "$rendered_rel" "$profile_rel" >&2
     exit 2
 fi
 
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+# 那一版提交过产物就读它（交付时就是这份字节）；没提交过就从它自己的 chart
+# 现场渲染——用的也是**那一版**的渲染器，产物随它的树走。
+if [ "$has_rendered" -eq 1 ]; then
+    if ! git -C "$repo" archive "$full_rev" "$rendered_rel" | tar -x -C "$work"; then
+        printf 'rollback: 取不出 %s 的清单（git archive 失败）\n' "${full_rev:0:12}" >&2
+        exit 2
+    fi
+    manifest_dir="$work/$rendered_rel"
+else
+    command -v helm >/dev/null 2>&1 || {
+        printf 'rollback: %s 没有提交渲染产物，要从它的 chart 现场渲染，而本机没有 helm\n' \
+            "${full_rev:0:12}" >&2
+        exit 2
+    }
+    if ! git -C "$repo" archive "$full_rev" deploy/helm deploy/scripts deploy/k3s | tar -x -C "$work"; then
+        printf 'rollback: 取不出 %s 的 chart（git archive 失败）\n' "${full_rev:0:12}" >&2
+        exit 2
+    fi
+    if ! bash "$work/deploy/scripts/render-deploy.sh" --out "$work/rendered" >&2; then
+        printf 'rollback: %s 的 chart 渲染失败——不把「渲不出来」当「没有清单」\n' \
+            "${full_rev:0:12}" >&2
+        exit 2
+    fi
+    manifest_dir="$work/rendered/$profile"
+fi
+
 # 空目录不是一版清单：apply 一个空目录会退出 0，读起来像回滚成功。
-file_count="$(git -C "$repo" ls-tree -r --name-only "$full_rev" -- "$rendered_rel" | grep -c '\.yaml$' || true)"
+file_count="$(find "$manifest_dir" -maxdepth 1 -name '*.yaml' -type f 2>/dev/null | wc -l || true)"
 if [ "${file_count:-0}" -eq 0 ]; then
     printf 'rollback: %s 的 %s/ 里一份 yaml 都没有——不把空目录当回滚\n' "${full_rev:0:12}" "$rendered_rel" >&2
     exit 2
@@ -128,19 +176,6 @@ printf 'rollback_plan from=%s\n' "$current_rev"
 printf 'rollback_plan to=%s\n' "${full_rev:0:12}"
 printf 'rollback_plan profile=%s files=%s\n' "$profile" "$file_count"
 
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
-if ! git -C "$repo" archive "$full_rev" "$rendered_rel" | tar -x -C "$work"; then
-    printf 'rollback: 取不出 %s 的清单（git archive 失败）\n' "${full_rev:0:12}" >&2
-    exit 2
-fi
-manifest_dir="$work/$rendered_rel"
-
-# 要等哪些工作负载从**这一版清单**里读，不在这里列名字。写死的那份名单在工作
-# 负载改名、多出第四个、或者换了一种（执行器是 StatefulSet）时，`--wait` 会去等
-# 一个不存在的东西（rollout status 对它报错，于是这一趟报回滚失败，而集群其实
-# 已经退回去了），或者漏掉没被数到的那个，在它还没起来时就报 ready。判在 apply
-# 之前：判不了的那一版不该先动集群再说不算数。
 workloads=()
 if [ "$wait" -eq 1 ]; then
     while read -r kind name; do

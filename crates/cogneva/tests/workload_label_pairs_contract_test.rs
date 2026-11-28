@@ -26,7 +26,7 @@ use serde::Deserialize;
 
 use crate::common;
 
-use common::routes::{repo_root, walk};
+use common::routes::{rendered_root, repo_root, walk};
 
 use common::rust_production::{production_lines, production_sources, relative_name};
 
@@ -89,7 +89,7 @@ fn missing<'a>(
 
 #[test]
 fn every_pair_the_code_selects_on_is_one_the_manifests_carry() {
-    let mut profiles: Vec<PathBuf> = std::fs::read_dir(repo_root().join("deploy/rendered"))
+    let mut profiles: Vec<PathBuf> = std::fs::read_dir(rendered_root())
         .expect("deploy/rendered 不在仓库里")
         .flatten()
         .map(|entry| entry.path())

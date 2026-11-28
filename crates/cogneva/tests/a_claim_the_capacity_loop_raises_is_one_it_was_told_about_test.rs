@@ -29,7 +29,7 @@
 
 use crate::common;
 
-use common::routes::repo_root;
+use common::routes::{rendered_root, repo_root};
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -41,7 +41,7 @@ const OCCUPANCY_URL_ENV: &str = "COGNEVA_CLAIM_STORE_METRICS_URL";
 /// Every manifest in a rendered profile, keyed by nothing — the checks below ask
 /// for kinds, so the documents are all kept and filtered at the use.
 fn rendered_documents() -> Vec<serde_yaml::Value> {
-    let dir = repo_root().join("deploy/rendered/k3s-single");
+    let dir = rendered_root().join("k3s-single");
     let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
     let mut paths: Vec<_> = entries
         .filter_map(|e| e.ok())

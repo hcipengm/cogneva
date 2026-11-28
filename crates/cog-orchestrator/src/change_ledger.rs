@@ -113,7 +113,6 @@
 //! principle: feedback_a_stronger_claim_may_not_be_checked_less_often_than_a_weaker_one
 //! principle: feedback_two_renderings_of_one_quantity_may_differ_by_a_declared_window
 
-use crate::ledger_pacing::{MEASUREMENTS_PER_PASS, OUTSTANDING_PEEK, UNMEASURABLE_RETRY};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -159,8 +158,7 @@ pub const CHANGE_LEDGER_ROLE: &str = "change_ledger";
 /// steady state out of the log. The deployed liveness alert derives its
 /// threshold from this period (`6 * period`), so changing it changes that
 /// threshold.
-// cap: fixed — 存活告警的门槛由它推出（6 × 周期）；改周期就是改告警的墙
-// keep: 删掉后存活告警的墙没有分子，改节奏变成改一个看不见的告警；由「6 × 周期」兜住
+// cap: bound — 存活告警的门槛由它推出（6 × 周期）；改周期就是改告警的墙
 pub const CHANGE_LEDGER_PASS_INTERVAL: Duration = Duration::from_secs(300);
 
 /// What a reader of a blocked row is told ends the wait.
@@ -179,9 +177,18 @@ const POOL_BLOCK_CONDITION: &str = "\
 /// A bound is needed because the read returns the rows themselves; it is set
 /// far above any real firing set so that a pass which fills it knows its own
 /// count is not a census and says so rather than comparing a truncated pile.
-// cap: fixed — 读回的就是行本身，所以要有界；设在远高于任何真实告警集的位置，填满即说明这次不是普查
-// keep: 删掉后一次普查把整个告警集读进内存，填满时也读不出「这次不是普查」；由「设在远高于任何真实告警集」兜住
+// cap: bound — 读回的就是行本身，所以要有界；设在远高于任何真实告警集的位置，填满即说明这次不是普查
 pub const ALERT_CENSUS_LIMIT: i64 = 5000;
+
+/// How many outstanding rows one round reads.
+///
+/// The round exists for one thing: to make "the ledger is readable, and this is
+/// how much is outstanding" a line in the log with a reading behind it. It is
+/// not a work list, so the bound is a fixed small number; a round that does hand
+/// work over will pick its own batch size from its own throttle rather than
+/// reusing this one.
+// cap: bound — 只给日志一行看的 peek，不是工作清单；真正的批量由做活那一轮按自己的节流取
+const OUTSTANDING_PEEK: usize = 50;
 
 /// How many queued declarations one pass folds into the account.
 ///
@@ -191,9 +198,7 @@ pub const ALERT_CENSUS_LIMIT: i64 = 5000;
 /// past the cadence it is renewed on. The queue is written by a person or a
 /// script, in batches of tens, so this bound is generous for how it is used --
 /// reaching it means the fold is behind, which the backlog reading says anyway.
-// cap: fixed — 队列由人或脚本按几十条一批写入；到这个数说明折叠落后了，而后备读数本就会说这件事
-// keep: 删掉后一拍把积压的全部申报折完，轮次被生产者的一句话拖成整棵树；由「队列按几十条一批写入」兜住
-// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+// cap: bound — 队列由人或脚本按几十条一批写入；到这个数说明折叠落后了，而后备读数本就会说这件事
 const DECLARATIONS_PER_PASS: usize = 200;
 
 /// How many queued retirements one pass folds into the account.
@@ -204,9 +209,7 @@ const DECLARATIONS_PER_PASS: usize = 200;
 /// cadence. Retirements are written by a classifier in batches of tens, so this
 /// bound is generous for how it is used -- reaching it means the fold is behind,
 /// which the backlog reading says anyway.
-// cap: fixed — 退役由分类器按几十条一批写入；到这个数说明折叠落后了，而后备读数本就会说这件事
-// keep: 删掉后一拍吞下整批退役，折叠跟着分类器的写入量走；由「按几十条一批写入」兜住
-// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+// cap: bound — 退役由分类器按几十条一批写入；到这个数说明折叠落后了，而后备读数本就会说这件事
 const RETIREMENTS_PER_PASS: usize = 200;
 
 /// How many retirements that say "another account answered this" one pass
@@ -218,10 +221,18 @@ const RETIREMENTS_PER_PASS: usize = 200;
 /// -- the rows it did not reach read as retirements nothing will ever revisit.
 /// It is still a bound, because the pass holds the owner lease and each row costs
 /// a read of the other account.
-// cap: fixed — 但仍是界：这一轮持有属主租约，每行都要读另一本账，未扫到的行读作永远没人再看的退役
-// keep: 删掉后一拍要把所有 restored 行都读另一本账，未扫到的行被读作永远没人再看的退役；由「每行都要读另一本账」兜住
-// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+// cap: bound — 但仍是界：这一轮持有属主租约，每行都要读另一本账，未扫到的行读作永远没人再看的退役
 const RESTORED_ANSWERED_PER_PASS: usize = 1024;
+
+/// How many rows one pass measures against the tree.
+///
+/// The ledger holds rows in the thousands and a pass that walked all of them
+/// would spend the whole interval asking git questions while holding the owner
+/// lease. Rows are taken stalest-first, so this bound costs latency rather than
+/// coverage: everything outstanding is still reached, in as many passes as it
+/// takes.
+// cap: bound — 行的代价是延迟而不是覆盖面：剩余最旧的行下一轮接着取，条数只是把一轮摊开
+const MEASUREMENTS_PER_PASS: usize = 200;
 
 /// How many landed rows one pass re-asks because a path their check reads moved.
 ///
@@ -231,7 +242,6 @@ const RESTORED_ANSWERED_PER_PASS: usize = 1024;
 /// way the measurement batch is. What the bound leaves behind is not lost: the
 /// window still reaches it, so a wide change costs latency on the rows that did
 /// not fit rather than their freshness.
-// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const TOUCHED_PER_PASS: usize = MEASUREMENTS_PER_PASS;
 
 /// How many existing landings one pass fills a parent reading for.
@@ -241,9 +251,7 @@ const TOUCHED_PER_PASS: usize = MEASUREMENTS_PER_PASS;
 /// git calls at a revision from the history, so it is bounded like the batches
 /// above; unlike them it does not rotate forever -- a row it writes leaves the
 /// set, so the bound is the length of a one-off sweep.
-// cap: fixed — 每行要按版本读一次 git 历史；与上面的批量同源，区别是写过的行离开集合，所以这个界就是一次扫完的长度
-// not-a-bound: 每行要按版本读一次 git 历史；与上面的批量同源，区别是写过的行离开集合，所以这个界就是一次扫完的长度
-// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+// cap: bound — 每行要按版本读一次 git 历史；与上面的批量同源，区别是写过的行离开集合，所以这个界就是一次扫完的长度
 const PARENT_BACKFILL_PER_PASS: usize = 50;
 
 /// How many retired rows one pass asks whether their surface came back.
@@ -263,9 +271,7 @@ const PARENT_BACKFILL_PER_PASS: usize = 50;
 /// reads a full batch, which is the only signal that the assumption has been
 /// outgrown. What that warning asks for is a rotation key in the read (a cursor
 /// persisted with the row), not a larger number here.
-// cap: fixed — 读满整批是「这个假设被撑破」的唯一信号，那时的答案是给读加游标，不是把这里的数调大
-// keep: 删掉后读满整批不再是「假设被撑破」的信号，游标该加的时候没人知道；由「读满整批是唯一信号」兜住
-// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+// cap: bound — 读满整批是「这个假设被撑破」的唯一信号，那时的答案是给读加游标，不是把这里的数调大
 const RETIRED_RECHECK_PER_PASS: usize = 500;
 
 /// How many queued re-measurements one pass takes.
@@ -277,9 +283,7 @@ const RETIRED_RECHECK_PER_PASS: usize = 500;
 /// the outstanding pass already is; the bound keeps one pass from becoming a
 /// full pass over the tree on a producer's word. A full batch warns rather than
 /// growing, because the answer to a queue that outgrew it is to ask why.
-// cap: fixed — 存在的活那一轮本身就是界；这个数只防「凭生产者一句话就把一轮变成整棵树」
-// keep: 删掉后生产者一句话就能把一轮变成整棵树；由「存在的活那一轮本身就是界」兜住
-// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+// cap: bound — 存在的活那一轮本身就是界；这个数只防「凭生产者一句话就把一轮变成整棵树」
 const REMEASURE_PER_PASS: usize = 64;
 
 /// How many owed rows one pass hands over.
@@ -312,9 +316,7 @@ const REMEASURE_PER_PASS: usize = 64;
 /// up to `HANDOVERS_PER_PASS * UNMEASURABLE_RETRY / CHANGE_LEDGER_PASS_INTERVAL`
 /// rows is swept inside `UNMEASURABLE_RETRY`, and the assertion below fails to
 /// compile if the three numbers drift apart.
-// cap: fixed — 与 UNMEASURABLE_RETRY、PASS_INTERVAL 一起决定一次清扫的覆盖速度，下面的断言在三个数走散时编不过
-// keep: 删掉后回到「与 UNMEASURABLE_RETRY、PASS_INTERVAL 一起决定一次清扫的覆盖速度，下面的断言在三个数走散时编不过」所描述的情形；由这条约定兜住
-// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+// cap: bound — 与 UNMEASURABLE_RETRY、PASS_INTERVAL 一起决定一次清扫的覆盖速度，下面的断言在三个数走散时编不过
 const HANDOVERS_PER_PASS: usize = 200;
 
 const _: () = assert!(
@@ -328,6 +330,18 @@ const _: () = assert!(
      more slowly than the window promises. Which way the account is allowed to be \
      late is not decided by editing one constant."
 );
+
+/// How long a check that could not be settled is left before it is asked again.
+///
+/// Held alone it would be permanent, and a permanent answer to a question about
+/// a moving tree is the wrong shape: the check could not be settled because of
+/// what the tree holds right now, and a tree that gains the path makes it
+/// answerable. An hour is long enough that re-asking costs nothing (the pass
+/// runs every few minutes and the unanswered set is a few hundred rows) and
+/// short enough that a tree that changed is noticed within the same working
+/// session.
+// cap: bound — 长到一次几小时的扫描不会把它重刷一遍，又短到改过的树在同一个工作时段内被注意到
+const UNMEASURABLE_RETRY: Duration = Duration::from_secs(3600);
 
 /// How long a row the account calls done may go before its check is asked again.
 ///
@@ -412,8 +426,7 @@ const DISPATCH_TASK_PREFIX: &str = cog_core::contract::change_ledger::CHANGE_LED
 /// deep. One below the default keeps a dispatched change from taking the slot a
 /// submitted goal could have used, without making it ineligible: it still runs
 /// whenever the graph has room this pass did not claim.
-// cap: fixed — 比默认低一档：派发的变更不去抢提交目标本可以用的槽，但仍够格在还有空位时跑
-// keep: 删掉后派发的变更与提交目标抢同一个槽，谁先谁后没有答案；由「比默认低一档」兜住
+// cap: bound — 比默认低一档：派发的变更不去抢提交目标本可以用的槽，但仍够格在还有空位时跑
 const DISPATCH_TASK_PRIORITY: i32 = 0;
 
 /// The task kind a dispatched change is submitted under.
@@ -632,8 +645,7 @@ pub fn dispatch_task_ids(identity: &ChangeIdentity) -> Vec<String> {
 /// would forget it. The landing machine writes at most a few commits a day, and
 /// this bound is what keeps a repository with years of history from turning one
 /// pass into a walk of it.
-// cap: fixed — 落地机一天写几笔提交；这个界挡的是「一个多年历史仓把一轮变成走一遍历史」
-// keep: 删掉后一个多年历史仓把一轮落地变成走一遍历史；由「落地机一天写几笔提交」兜住
+// cap: bound — 落地机一天写几笔提交；这个界挡的是「一个多年历史仓把一轮变成走一遍历史」
 const LANDING_LOG_COMMITS: usize = 2_000;
 
 /// The part of the tree whose commits are expected to answer to the account.
@@ -817,15 +829,13 @@ fn product_commits(
 /// and every candidate costs a tree-wide read -- so the longest ones are tried
 /// first and only a bounded number of them, which picks the most specific line
 /// the commit wrote rather than the first one in diff order.
-// cap: fixed — a floor chosen to put the tree's stock lines (`return true;`, `let x = 1;`) below it, not
-// keep: 删掉后树里的模板行（return true;）也被当成申报，每条提交都带一串噪声；由「把树的存量行放在它下面」兜住
+// cap: bound — a floor chosen to put the tree's stock lines (`return true;`, `let x = 1;`) below it, not
 // a measurement: below this the candidate is a shape many files share, and above it nothing is lost
 // because the longest lines are tried first.
 const DECLARATION_MIN_LINE_LENGTH: usize = 12;
 
 /// How many of the commit's lines are tried as an identity, longest first.
-// cap: fixed — every candidate costs a tree-wide read; twelve keeps one commit's declaration a fixed
-// keep: 删掉后一条提交的申报候选无界，每个候选都要一次全树读；由「twelve keeps one commit's declaration a fixed cost」兜住
+// cap: bound — every candidate costs a tree-wide read; twelve keeps one commit's declaration a fixed
 // cost rather than one that grows with the size of the diff, and the longest lines are the ones worth
 // spending those reads on.
 const DECLARATION_MAX_LINE_CANDIDATES: usize = 12;
@@ -835,8 +845,7 @@ const DECLARATION_MAX_LINE_CANDIDATES: usize = 12;
 /// A name most of the tree spells identifies none of it: a row filed under it
 /// would read as settled for as long as any unrelated file still said it, and
 /// the account would call a deleted change landed.
-// cap: fixed — three is where a literal stops naming one place and starts naming a phrase the tree
-// keep: 删掉后一个片段在整棵树里命名一句话而不是一个地方，申报落到多份文件上；由「three is where a literal stops naming one place」兜住
+// cap: bound — three is where a literal stops naming one place and starts naming a phrase the tree
 // repeats; the read it gates is a tree-wide search, so a larger number buys ambiguity, not evidence.
 const DECLARATION_MAX_MATCH_FILES: usize = 3;
 
@@ -847,24 +856,19 @@ const DECLARATION_MAX_MATCH_FILES: usize = 3;
 /// sake of history. Commits that arrive while the loop is running are the ones
 /// this closes, and those are a handful; a backlog is caught up by running the
 /// same question over more of the window, not by making every pass expensive.
-// cap: fixed — what one beat can afford, not a measurement: each declaration is a diff read plus one
-// keep: 删掉后一拍能做的申报无界，每个申报是一次 diff 读加一次全树读；由「what one beat can afford」兜住
+// cap: bound — what one beat can afford, not a measurement: each declaration is a diff read plus one
 // tree-wide read per candidate, and the queue drains over further passes rather than in one long one.
-// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const DECLARATION_MAX_PER_PASS: usize = 4;
 
 /// The widths the intake columns hold. A row wider than its column is refused
 /// here rather than truncated by the writer: a shortened identity is a
 /// different change sharing a row.
 // cap: fixed — the declared `VARCHAR` widths of the columns these values are written to, taken from the
-// keep: 删掉后申报写进 VARCHAR 列时被库截断，截出来的值没人知道被改过；由「列声明的宽度」兜住
 // store's own DDL; a value here that the column cannot hold is the truncation this refuses.
 const DECLARATION_WIDTH_SCOPE: usize = 191;
 // cap: fixed — the `literal` column's declared width, same source as the scope width above.
-// keep: 删掉后 literal 列超出声明宽度被库拒或截；由「literal 列声明的宽度」兜住
 const DECLARATION_WIDTH_LITERAL: usize = 512;
 // cap: fixed — the `doc` column's declared width, same source as the scope width above.
-// keep: 删掉后 doc 列超出声明宽度被库拒或截；由「doc 列声明的宽度」兜住
 const DECLARATION_WIDTH_DOC: usize = 512;
 
 /// What one out-of-band commit left behind that a check can settle.
@@ -1385,9 +1389,7 @@ const HANDOVER_ROUNDTABLE_HISTORY: &str = "/snapshot/roundtable/history";
 /// position 146, so a single page would have to be longer than the longest run
 /// there has ever been. Paging at a bound under that keeps the read correct for
 /// a stream longer than any of them rather than correct for the ones observed.
-// cap: fixed — 小于历史上最长的那一串；按它分页，比按「观察过的最长一串」正确，长过它的流也照样读对
-// keep: 删掉后一页大于历史上最长的一串，读一条长流要一次装下所有事件；由「按它分页比按观察过的最长一串正确」兜住
-// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+// cap: bound — 小于历史上最长的那一串；按它分页，比按「观察过的最长一串」正确，长过它的流也照样读对
 const HANDOVER_EVENTS_PER_PAGE: usize = 100;
 
 /// The deliverable one handover left.
@@ -1662,28 +1664,27 @@ fn dispatch_priority(row: &ChangeLedgerRow) -> i32 {
 
 /// The knob a deployment pins the batch with, or `0` to let the graph's
 /// batches set it.
-// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 pub const ROWS_PER_HANDOVER_ENV: &str = "COGNEVA_CHANGE_LEDGER_ROWS_PER_HANDOVER";
 
-/// How many rows one hand-over carries when nothing has measured a bigger one.
+/// The fewest rows that are a batch at all.
 ///
 /// Not the landing cap, and not the pass's slice: the slice
-/// ([`HANDOVERS_PER_PASS`]) is how many rows a pass may *start*, and this is how
-/// many of them one change can carry. The two differ because the price of a
-/// hand-over is mostly its fixed part -- a plan, a run's context, a sandbox
-/// round that validates the whole tree -- and that part is paid once per task
-/// whatever the task carries. So the rows are gathered until a batch is worth
-/// paying it for.
+/// ([`HANDOVERS_PER_PASS`]) is how many rows a pass may *start*, and this is
+/// where the bound on rows per hand-over starts. The two differ because the
+/// price of a hand-over is mostly its fixed part -- a plan, a run's context, a
+/// sandbox round that validates the whole tree -- and that part is paid once
+/// per task whatever the task carries.
 ///
-/// The starting point, not a boundary this code believes in: the dominant shape
-/// of the queue is one gate per row (a test, a header and a check), and a batch
-/// of five is what one generation has been observed to write whole. Above it the
-/// bound is what the graph measured -- see [`rows_per_handover_bound`] -- and
-/// this number only stands while no batch bigger than it has completed.
-// cap: fixed — 一批太大时生成会被截断、整批报废；这是「还没量到更大的批次」时用的起点，不是界本身
-// keep: 删掉后一批太大时生成被截断、整批报废；由「还没量到更大批次时用的起点」兜住
-// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
-const DEFAULT_ROWS_PER_HANDOVER: usize = 5;
+/// The start is the smallest batch the measurement can read, not a size someone
+/// copied into a constant: a hand-over of one row is the chat turn's "hand this
+/// row over" shape, so [`measured_batch_sizes`] cannot read it, and a bound
+/// below it would hand out one row for ever, climbing nothing. Every landing
+/// then buys one row more (see [`rows_per_handover_bound`]), which is the only
+/// rate the evidence supports; a number like the old seed of five was one
+/// generation's observation frozen into the tree, and the graph that was
+/// supposed to measure it already answers that question live.
+// cap: bound — 「一批」的最小行数，由单行交接的形状钉住：一行的那一种交接是聊天回合「把这一行交出去」，不是批次，测量读不到它
+const MIN_ROWS_PER_BATCH: usize = 2;
 
 /// How long a refused batch speaks about what one generation in front of us can
 /// write.
@@ -1695,8 +1696,7 @@ const DEFAULT_ROWS_PER_HANDOVER: usize = 5;
 /// and the next attempt at that size is a new measurement rather than a
 /// contradiction. Thirty days is longer than a deployment's model changes and
 /// shorter than "for ever".
-// cap: fixed — 退回的证据只对交出去的那个生成器有效；换模型没有事件可订阅，按这个窗口让旧证据过期
-// keep: 删掉后退回的证据永远有效，换模型后旧证据还在拦；由「换模型没有事件可订阅，按窗口让旧证据过期」兜住
+// cap: bound — 退回的证据只对交出去的那个生成器有效；换模型没有事件可订阅，按这个窗口让旧证据过期
 const BATCH_REFUSAL_WINDOW_SECS: i64 = 30 * 24 * 3600;
 
 /// The batch size the deployment pinned, or `None` to derive it.
@@ -1760,20 +1760,20 @@ pub fn parse_rows_per_handover(raw: &str) -> Result<Option<usize>, String> {
 ///
 /// A refusal below what has already landed says nothing about size -- the
 /// proven size still works -- so only refusals above the landed proof cap the
-/// bound. With no proof at all the seed stands, and with no refusal the bound
-/// climbs one size per landing, which is the only rate the measurement supports.
-pub fn rows_per_handover_bound(
-    seed: usize,
-    landed_max: Option<usize>,
-    refused_min: Option<usize>,
-) -> usize {
-    let seed = seed.max(1);
-    let grown = landed_max.map_or(seed, |landed| seed.max(landed.saturating_add(1)));
+/// bound. With no proof at all the bound stands at [`MIN_ROWS_PER_BATCH`], and
+/// with no refusal it climbs one size per landing, which is the only rate the
+/// measurement supports.
+pub fn rows_per_handover_bound(landed_max: Option<usize>, refused_min: Option<usize>) -> usize {
+    let grown = landed_max.map_or(MIN_ROWS_PER_BATCH, |landed| {
+        landed.saturating_add(1).max(MIN_ROWS_PER_BATCH)
+    });
     let proven = landed_max.unwrap_or(0);
     let capped = refused_min
         .filter(|refused| *refused > proven)
         .map(|refused| refused.saturating_sub(1));
-    capped.map_or(grown, |cap| grown.min(cap)).max(1)
+    capped
+        .map_or(grown, |cap| grown.min(cap))
+        .max(MIN_ROWS_PER_BATCH)
 }
 
 /// The batch sizes the graph answers for: the largest a hand-over carried to
@@ -1794,7 +1794,7 @@ fn measured_batch_sizes(tasks: &[Task], now_unix: i64) -> (Option<usize>, Option
             continue;
         }
         let carried = dispatched_identities(task).len();
-        if carried < 2 {
+        if carried < MIN_ROWS_PER_BATCH {
             continue;
         }
         if task.status == TaskStatus::Completed {
@@ -1827,7 +1827,7 @@ fn batch_size_for_this_pass(tasks: &[Task], now_unix: i64) -> (usize, &'static s
         Some(pinned) => (pinned, crate::observable::SOURCE_OVERRIDE),
         None => {
             let (landed_max, refused_min) = measured_batch_sizes(tasks, now_unix);
-            let bound = rows_per_handover_bound(DEFAULT_ROWS_PER_HANDOVER, landed_max, refused_min);
+            let bound = rows_per_handover_bound(landed_max, refused_min);
             crate::observable::rows_per_handover_observable().record_evaluation();
             (bound, crate::observable::SOURCE_DERIVED)
         }
@@ -1999,9 +1999,7 @@ fn dispatch_project_root_id(project: &str) -> String {
 /// pass did not reach is reached by the next one, and waiting costs nothing --
 /// it is work nothing is going to do, which is the whole reason the sweep
 /// exists.
-// cap: fixed — 关一行要把整个工作区的任务表读进一个事务，界的是突发；没轮到的下一拍接着关
-// keep: 删掉后一拍关行的突发无界，整个工作区任务表被一次读进一个事务；由「没轮到的下一拍接着关」兜住
-// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+// cap: bound — 关一行要把整个工作区的任务表读进一个事务，界的是突发；没轮到的下一拍接着关
 const CLOSE_SETTLED_PER_PASS: usize = 200;
 
 /// Written into a hand-over's reason when the loop let it go so that a batch
@@ -2053,7 +2051,7 @@ fn dispatched_identities(task: &Task) -> Vec<ChangeIdentity> {
         .get(cog_core::INPUT_CHANGE_IDENTITIES)
         .and_then(|list| list.as_array())
         .map(|list| list.iter().filter_map(read).collect())
-        .unwrap_or(Default::default());
+        .unwrap_or_default();
     if identities.is_empty() {
         if let Some(identity) = task
             .input
@@ -2522,8 +2520,7 @@ async fn close_settled_dispatch_rows(
 /// of rows to reach, and this loop shares its process with the measurement
 /// passes. A batch bounds the burst, not the work: the loop asks again on its
 /// next beat until `remaining` is zero.
-// cap: fixed — 界的是突发不是工作量：这一拍没处理完，下一拍接着问到 remaining 归零
-// keep: 删掉后这一拍吞下整场突发；由「下一拍接着问到 remaining 归零」兜住
+// cap: bound — 界的是突发不是工作量：这一拍没处理完，下一拍接着问到 remaining 归零
 const SETTLE_BATCH: usize = 400;
 
 /// What one settle of the dispatched projects did, cell by cell.
@@ -3013,7 +3010,7 @@ pub fn spawn_change_ledger_loop(
                     // the account whether or not the tree can be read -- and a row
                     // that enters then records no revision rather than a guessed
                     // one.
-                    let first_seen_rev = cog_core::logged_ok!(tree.rev().await);
+                    let first_seen_rev = tree.rev().await.ok();
                     // The paths that moved since the last pass read this tree,
                     // resolved before the passes that use them. A diff that
                     // cannot be read is not a pass without changes: it is one
@@ -3812,8 +3809,7 @@ fn principle_literal(slug: &str) -> String {
 /// within the budget reaches `git log --oneline` whole; a longer one is
 /// shortened there, and a shortened title is a view a reader has to scroll
 /// past.
-// cap: fixed — 放进预算的那句标题在 git log --oneline 里要整句读得到；更长的在那里被截，截出来的标题是读者得滚过去才看得全的东西
-// keep: 删掉后标题在 git log --oneline 里被截，读者得滚过去才看得全；由「整句读得到」兜住
+// cap: bound — 放进预算的那句标题在 git log --oneline 里要整句读得到；更长的在那里被截，截出来的标题是读者得滚过去才看得全的东西
 const GOAL_TITLE_CHARS: usize = 50;
 
 /// What a row of the principle ledger asks for, in the words the goal path is
@@ -4790,8 +4786,7 @@ async fn reopen_pass(
             // moment that surface comes back. A failed look leaves it
             // unrecorded instead of guessing: `false` would file a git error as
             // a removal.
-            let scope_present =
-                cog_core::logged_ok!(tree.scope_present(snapshot, &row.identity).await);
+            let scope_present = tree.scope_present(snapshot, &row.identity).await.ok();
             let reopen = ChangeReopen {
                 identity: row.identity.clone(),
                 was_landed_at: row.landed_at,
@@ -7374,8 +7369,7 @@ async fn record_dispatch_state(
             /// Rows one account line names before it summarises the rest as a count: a line
             /// is an annotation, and an account that came to hold thousands of rows would
             /// otherwise turn it into a dump.
-            // cap: fixed — 一行是注解不是转储：拥有上千行的账若照单一遍，注解就变成了本体
-            // keep: 删掉后注解变成转储，上千行的账照单一遍；由「一行是注解不是转储」兜住
+            // cap: bound — 一行是注解不是转储：拥有上千行的账若照单一遍，注解就变成了本体
             const NAMED: usize = 20;
             let named: Vec<String> = holders
                 .iter()
@@ -12484,7 +12478,7 @@ mod tests {
     /// would leave the row looking answered for the rest of the account's life.
     #[tokio::test]
     async fn a_one_row_handover_that_never_started_is_taken_back_for_its_batch() {
-        let rows: Vec<ChangeLedgerRow> = ["fn a", "fn b", "fn c"]
+        let rows: Vec<ChangeLedgerRow> = ["fn a", "fn b"]
             .iter()
             .map(|literal| ChangeLedgerRow {
                 identity: ChangeIdentity::new("grep", "crates/x", *literal),
@@ -12533,16 +12527,16 @@ mod tests {
         }
 
         let state = store.written().pop().expect("the pass wrote its row");
-        assert_eq!(state.submitted, 3, "三条欠账该在这一拍全部出去");
+        assert_eq!(state.submitted, 2, "两条欠账该在这一拍全部出去");
         assert_the_counts_add_up(&state);
 
         let batch = graph
             .handed()
             .into_iter()
             .find(|task| task.input.get(cog_core::INPUT_CHANGE_IDENTITIES).is_some())
-            .expect("三条欠账该由一笔交接承载");
+            .expect("两条欠账该由一笔交接承载");
         let carried = dispatched_identities(&batch);
-        assert_eq!(carried.len(), 3, "三条挂在同一个任务上：{carried:?}");
+        assert_eq!(carried.len(), 2, "两条挂在同一个任务上：{carried:?}");
         assert_eq!(
             batch.id,
             dispatch_task_id(&carried[0], 1),
@@ -13017,7 +13011,7 @@ mod tests {
                 TaskStatus::Cancelled,
                 "账上已经 landed 的行还开着，它会一直排在未结里"
             );
-            let why = held.error.unwrap_or(Default::default());
+            let why = held.error.unwrap_or_default();
             assert!(
                 why.contains(ChangeState::Landed.as_str()),
                 "关掉时的理由没有点名账上的终态：{why}"
@@ -13391,7 +13385,7 @@ mod tests {
             Some(first.identity.clone()),
             "单数那个词仍然是第一个身份：阶段归档只读它"
         );
-        let goal = task.input["goal"].as_str().unwrap_or(Default::default());
+        let goal = task.input["goal"].as_str().unwrap_or_default();
         for title in ["第一项", "第二项", "第三项"] {
             assert!(
                 goal.contains(title),
@@ -13483,27 +13477,35 @@ mod tests {
     /// The bound follows the graph's own batches: one above the largest that
     /// landed whole, and never a size a generation refused.
     ///
-    /// Four measurements, one law. Nothing measured keeps the seed. A batch of
-    /// five landing argues for six. A six that comes back refused puts the bound
-    /// back to five -- the largest proven size -- and a refusal of four, below
-    /// what has already landed, does not shrink the proof, because five has been
-    /// observed to work and four failing says something else was wrong. With no
-    /// landing at all the seed stands for six rows.
+    /// One law, and nothing in it that a person picked. With nothing measured it
+    /// stands at the smallest batch the reading can see. A batch of five landing
+    /// argues for six. A six that comes back refused puts the bound back to five
+    /// -- the largest proven size -- and a refusal of four, below what has
+    /// already landed, does not shrink the proof, because five has been observed
+    /// to work and four failing says something else was wrong. With no landing
+    /// at all a refusal can only cap down to the floor: the bound never leaves
+    /// the sizes the measurement can read.
     #[test]
     fn the_batch_bound_follows_the_graphs_batch_outcomes() {
-        assert_eq!(rows_per_handover_bound(5, None, None), 5);
-        assert_eq!(rows_per_handover_bound(5, Some(5), None), 6);
-        assert_eq!(rows_per_handover_bound(5, Some(5), Some(6)), 5);
-        assert_eq!(rows_per_handover_bound(5, Some(5), Some(4)), 6);
-        assert_eq!(rows_per_handover_bound(5, Some(9), Some(7)), 10);
-        assert_eq!(rows_per_handover_bound(5, None, Some(5)), 4);
-        assert_eq!(rows_per_handover_bound(5, None, Some(1)), 1);
+        assert_eq!(rows_per_handover_bound(None, None), MIN_ROWS_PER_BATCH);
+        assert_eq!(rows_per_handover_bound(Some(2), None), 3);
+        assert_eq!(rows_per_handover_bound(Some(3), None), 4);
+        assert_eq!(rows_per_handover_bound(Some(5), None), 6);
+        assert_eq!(rows_per_handover_bound(Some(5), Some(6)), 5);
+        assert_eq!(rows_per_handover_bound(Some(5), Some(4)), 6);
+        assert_eq!(rows_per_handover_bound(Some(9), Some(7)), 10);
+        assert_eq!(rows_per_handover_bound(None, Some(5)), MIN_ROWS_PER_BATCH);
+        assert_eq!(
+            rows_per_handover_bound(None, Some(1)),
+            MIN_ROWS_PER_BATCH,
+            "一条都被算作「批次」的拒绝不是关于批大小的证据，界不许掉到读不到的行数上"
+        );
     }
 
     /// Every pass asks for the bound, whether or not the graph moved, and the
     /// observable's evaluation count is the evidence of it.
     ///
-    /// Two passes over a graph with nothing measured keep the seed both times.
+    /// Two passes over a graph with nothing measured keep the floor both times.
     /// Without the count, that steady bound and a loop that stopped after the
     /// first pass publish the same number.
     #[test]
@@ -13516,7 +13518,7 @@ mod tests {
         let before = observable.evaluations();
         let (first, first_source) = batch_size_for_this_pass(&[], now);
         let (second, second_source) = batch_size_for_this_pass(&[], now);
-        assert_eq!(first, DEFAULT_ROWS_PER_HANDOVER);
+        assert_eq!(first, MIN_ROWS_PER_BATCH);
         assert_eq!(second, first, "nothing measured is the same answer");
         assert_eq!(first_source, crate::observable::SOURCE_DERIVED);
         assert_eq!(second_source, first_source);
@@ -13638,9 +13640,13 @@ mod tests {
     /// each, and the queue held 1,957 rows, so the same work was priced 1,957
     /// times. What the counts keep saying is the row: `submitted` is still rows
     /// handed over, so the pass's arithmetic closes on the set it read.
+    ///
+    /// This graph has landed nothing, so the bound is the smallest batch the
+    /// measurement can read; the claim is that the project's owed rows share a
+    /// hand-over instead of each getting one.
     #[tokio::test]
     async fn a_pass_files_one_task_for_a_project_however_many_rows_it_owes() {
-        let rows: Vec<ChangeLedgerRow> = ["fn a", "fn b", "fn c"]
+        let rows: Vec<ChangeLedgerRow> = ["fn a", "fn b"]
             .iter()
             .map(|literal| ChangeLedgerRow {
                 identity: ChangeIdentity::new("grep", "crates/x", *literal),
@@ -13672,8 +13678,8 @@ mod tests {
 
         let state = store.written().pop().expect("the pass wrote its row");
         assert_eq!(
-            state.submitted, 3,
-            "读数按行算：派出去的是三条账，不是一个任务"
+            state.submitted, 2,
+            "读数按行算：派出去的是两条账，不是一个任务"
         );
         assert_the_counts_add_up(&state);
         assert_eq!(
@@ -13690,8 +13696,8 @@ mod tests {
         let carried = dispatched_identities(&task);
         assert_eq!(
             carried.len(),
-            3,
-            "一个项目这一拍欠的三条都挂在同一个任务上：{carried:?}"
+            2,
+            "一个项目这一拍欠的两条都挂在同一个任务上：{carried:?}"
         );
         assert_eq!(
             task.id,

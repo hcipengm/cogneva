@@ -42,6 +42,7 @@ const SOURCE_LABEL: Record<CapabilitySource, string> = {
   builtin: '内建',
   plugin: '插件',
   mcp: 'MCP',
+  conversation: '对话层',
 };
 
 const RUNS_IN_LABEL: Record<CapabilityRunsIn, string> = {
@@ -54,6 +55,9 @@ const SOURCE_NOTE: Record<CapabilitySource, string> = {
   builtin: '编译进这个进程、由 cog-agent 发布的工具',
   plugin: '磁盘清单声明的工具',
   mcp: '远端 MCP 对端暴露的工具',
+  // 这一层按**最近一轮**记：属主身份与计划模式会改变它，所以表里这一组是那一轮
+  // 实际递出去的，不是平台能提供的全集。还没有一轮跑过时这一层自报「没跑过」。
+  conversation: '最近一轮对话交给模型的工具（属主与计划模式会改变它）',
 };
 
 export function CapabilitiesView() {

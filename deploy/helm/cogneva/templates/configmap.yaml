@@ -40,7 +40,13 @@ data:
   # 向量后端的地址直接由代码读 QDRANT_URL；没有第二个 provider 开关要同步。
   QDRANT_URL: {{ printf "http://qdrant.%s.svc.cluster.local:%d" (include "cogneva.namespace" .) (int .Values.backends.qdrant.grpcPort) | quote }}
   COGNEVA_MEDIA_PROVIDER: {{ $doc.providers.media.provider | quote }}
-  COGNEVA_STORAGE_PROVIDER: "local-fs"
+  {{- /* 存储的 provider 只有 `files/cogneva.json` 一处声明：那份文件里
+         `providers.storage.provider` 是 `seaweedfs`，而 seaweedfs 段默认 `enabled: true`
+         就是照着它开的。这里曾经写死 `"local-fs"`，于是同一个 provider 在树上有了两个
+         声明，且 env 层按 `files/cogneva.json` 的 env→配置路径映射盖住那份文件——
+         集群里跑着 SeaweedFS，进程读到的却是本地文件系统，Raw 层与冷层写去卷上而不是
+         桶里。两处相等不等于一处在说：改一处、另一处沉默地盖回去。 */}}
+  COGNEVA_STORAGE_PROVIDER: {{ $doc.providers.storage.provider | quote }}
 
   COGNEVA_WORKSPACE_ID: {{ $doc.dag_executor.workspace_id | quote }}
   # 每个用户工作区的字节上限。这里**不写默认值**：网关自己有同一条界（它的
@@ -80,8 +86,8 @@ data:
   # 生成写得完的量就会截断、整批报废。
   #
   # 0 = 按图里的批次导出：每拍读一次它自己交出去的批次，落地整批的最大条数 + 1
-  # 就是下一拍的界，被工作本身退回的批次给界封顶（证据 30 天后过期）；还没量到
-  # 更大的批次时用 5 作起点。界写回 `cogneva_change_ledger_rows_per_handover`
+  # 就是下一拍的界，被工作本身退回的批次给界封顶（证据 30 天后过期）；还没有任何
+  # 批次落地时界停在「能称为批次的最小条数」（2 条），每落地一次涨一条。界写回 `cogneva_change_ledger_rows_per_handover`
   # 并带 `source`，每拍记一次 `_evaluations_total`。正数是钉死的覆盖位。
   COGNEVA_CHANGE_LEDGER_ROWS_PER_HANDOVER: {{ .Values.changeLedger.rowsPerHandover | int | quote }}
 

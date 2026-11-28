@@ -1657,7 +1657,7 @@ pub fn shipped_configs(root: &Path) -> Vec<(String, Value)> {
     ] {
         out.push((relative.to_string(), read_config(&root.join(relative))));
     }
-    let rendered = root.join("deploy/rendered");
+    let rendered = super::root::rendered_root();
     let mut profiles: Vec<_> = std::fs::read_dir(&rendered)
         .unwrap_or_else(|e| panic!("read {}: {e}", rendered.display()))
         .map(|e| e.expect("readable dir entry").path())

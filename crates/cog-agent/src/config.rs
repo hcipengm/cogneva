@@ -113,6 +113,11 @@ pub struct AgentLoopConfig {
     pub skill_cache_ttl_secs: u64,
     /// Abort a streaming think turn only after no stream event arrives for
     /// this many consecutive seconds (stall detection, not a wall-clock cap).
+    ///
+    /// Zero is refused at load: a zero-second window is not "abort at once" as
+    /// a setting — it kills every stream at its first quiet moment, and the
+    /// value that would actually run would be some other number than the one
+    /// written here.
     pub think_stall_timeout_secs: u64,
     /// Base URL of the platform memory API where an oversized tool output is
     /// archived. Absent when the deployment names none; the loop then still
@@ -192,11 +197,28 @@ impl Default for AgentLoopConfig {
 
 impl AgentLoopConfig {
     pub fn load() -> SFResult<Self> {
-        load_section("/agent_loop", AGENT_LOOP_ENV)
+        let config: Self = load_section("/agent_loop", AGENT_LOOP_ENV)?;
+        config.refuse_a_window_that_cannot_be_a_window()?;
+        Ok(config)
     }
 
     pub fn load_from(path: &Path) -> SFResult<Self> {
-        load_section_from(path, "/agent_loop", AGENT_LOOP_ENV)
+        let config: Self = load_section_from(path, "/agent_loop", AGENT_LOOP_ENV)?;
+        config.refuse_a_window_that_cannot_be_a_window()?;
+        Ok(config)
+    }
+
+    /// 停滞窗是「多久没有收到流事件才算死」：0 秒不是一个窗口，是「每一条流在
+    /// 第一个静默瞬间就被判死」。读它的那一层从前把这个 0 悄悄换成 1 秒——声明的
+    /// 值与生效的值于是有两个，而写配置的人读不到后一个。声明在哪里拒在哪里。
+    fn refuse_a_window_that_cannot_be_a_window(&self) -> SFResult<()> {
+        if self.think_stall_timeout_secs == 0 {
+            return Err(SFError::Config(
+                "agent_loop.think_stall_timeout_secs 声明为 0 秒：停滞窗不是「立刻算死」的另一种写法。给它一个周期。"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -262,6 +284,32 @@ impl AgentManagerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 声明的停滞窗原样生效；0 秒被点名拒绝，而不是在读到它的那一层被换成 1。
+    #[test]
+    fn a_declared_stall_window_survives_and_zero_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cogneva.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({"agent_loop": {"think_stall_timeout_secs": 90}}).to_string(),
+        )
+        .unwrap();
+        let declared = AgentLoopConfig::load_from(&path).unwrap();
+        assert_eq!(declared.think_stall_timeout_secs, 90);
+
+        std::fs::write(
+            &path,
+            serde_json::json!({"agent_loop": {"think_stall_timeout_secs": 0}}).to_string(),
+        )
+        .unwrap();
+        let refused = AgentLoopConfig::load_from(&path).unwrap_err();
+        let message = refused.to_string();
+        assert!(
+            message.contains("think_stall_timeout_secs"),
+            "the refusal must name the field: {message}"
+        );
+    }
 
     #[test]
     fn defaults_match_legacy_core_values() {

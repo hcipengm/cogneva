@@ -345,6 +345,17 @@ impl InfraWatchConfig {
     // cap: fixed — 抓取间隔本就决定了新鲜度的上限；更快的轮询只烧 Prometheus 的 CPU，不会更早发现
     // keep: 删掉后更快的轮询只烧 Prometheus 的 CPU，新鲜度上限仍在抓取间隔上；由「抓取间隔决定新鲜度上限」兜住
     pub const MIN_POLL_INTERVAL_SECS: u64 = 30;
+
+    /// The cadence the watcher actually runs at.
+    ///
+    /// One accessor, because two places read this interval: the loop's own
+    /// period and the staleness window that decides a rule has gone missing.
+    /// Reading the declaration twice let them disagree — a declared 10 seconds
+    /// ran the loop at 30 but aged rules against 10, so a rule that stopped
+    /// being reported was called missing three times too early.
+    pub fn effective_poll_interval_secs(&self) -> u64 {
+        self.poll_interval_secs.max(Self::MIN_POLL_INTERVAL_SECS)
+    }
 }
 
 /// 一次推送到观测出口的 HTTP 超时。
@@ -968,8 +979,32 @@ impl ObservabilityExportersConfig {
         if let Ok(raw) = std::env::var(crate::data_volume::MOUNTS_ENV) {
             apply_mount_list(&mut section, &raw)?;
         }
-        serde_json::from_value(section)
-            .map_err(|e| SFError::Config(format!("{} observability: {e}", path.display())))
+        let config: Self = serde_json::from_value(section)
+            .map_err(|e| SFError::Config(format!("{} observability: {e}", path.display())))?;
+        config.refuse_zero_loki_cadence()?;
+        Ok(config)
+    }
+
+    /// Loki 推送的两格声明 0 时按字段名拒绝。
+    ///
+    /// 0 秒的刷盘间隔会让 `tokio::time::interval` panic，0 条的批永远凑不满
+    /// 而缓冲无界增长；两处此前都 `.max(1)` 悄悄换成 1，配置面读到的不是生效值。
+    /// `max_retries = 0` 不在这里：它是「不重试」的合法声明，推送失败首投即返回。
+    fn refuse_zero_loki_cadence(&self) -> SFResult<()> {
+        if !self.loki.enabled {
+            return Ok(());
+        }
+        if self.loki.flush_interval_sec == 0 {
+            return Err(SFError::Config(
+                "observability.loki.flush_interval_sec 声明为 0 秒：刷盘循环的节拍要一个周期，0 秒不是一个节拍（tokio 的 interval 会直接 panic）。".into(),
+            ));
+        }
+        if self.loki.max_batch_size == 0 {
+            return Err(SFError::Config(
+                "observability.loki.max_batch_size 声明为 0 条：一个永远凑不满的批等于日志只进缓冲不出门，那时缓冲无界增长。给它一个条数。".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1346,5 +1381,71 @@ mod tests {
             InfraWatchConfig::default().eval_failure_alert_after,
             EVAL_FAILURE_ALERT_AFTER
         );
+    }
+
+    /// 基础设施巡检的生效节拍只有一个读数：循环周期与缺报窗都读它。
+    ///
+    /// 没有这条测试，两处各读一次声明是看不见的：声明 10 秒时循环按 30 跑，
+    /// 而缺报窗按 10 秒老化，一条规则停报 30 秒就被判成失踪——比它真的停报早
+    /// 三倍报警。
+    #[test]
+    fn the_infra_watch_cadence_has_one_reading() {
+        let declared = |secs| InfraWatchConfig {
+            poll_interval_secs: secs,
+            ..Default::default()
+        };
+        assert_eq!(
+            declared(10).effective_poll_interval_secs(),
+            InfraWatchConfig::MIN_POLL_INTERVAL_SECS
+        );
+        assert_eq!(
+            declared(0).effective_poll_interval_secs(),
+            InfraWatchConfig::MIN_POLL_INTERVAL_SECS
+        );
+        assert_eq!(declared(60).effective_poll_interval_secs(), 60);
+        assert_eq!(
+            declared(60).effective_poll_interval_secs(),
+            declared(60).poll_interval_secs,
+            "声明的值高于下限时，生效值就是它"
+        );
+    }
+
+    /// Loki 推送：声明的节拍与批原样生效，0 在加载时按字段名拒绝；
+    /// `max_retries = 0` 是合法的「不重试」，不该被改写成一个别的数。
+    ///
+    /// 没有这条测试，`.max(1)` 回来时没人会红：刷盘间隔的 0 被换成 1 秒后，
+    /// 配置面读到的是「用户说了 1 秒」，而 panic 那条路也一起被藏住了。
+    #[test]
+    fn a_declared_loki_cadence_survives_and_zero_is_refused() {
+        let dir = std::env::temp_dir().join(format!("cog-obs-loki-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cogneva.json");
+
+        std::fs::write(
+            &path,
+            r#"{"observability": {"loki": {"enabled": true, "flush_interval_sec": 2, "max_batch_size": 64, "max_retries": 0}}}"#,
+        )
+        .unwrap();
+        let cfg = ObservabilityExportersConfig::load_from(&path).unwrap();
+        assert_eq!(cfg.loki.flush_interval_sec, 2);
+        assert_eq!(cfg.loki.max_batch_size, 64);
+        assert_eq!(
+            cfg.loki.max_retries, 0,
+            "max_retries = 0 是「不重试」的合法声明，不该被夹成 1"
+        );
+
+        for field in ["flush_interval_sec", "max_batch_size"] {
+            let zero =
+                format!(r#"{{"observability": {{"loki": {{"enabled": true, "{field}": 0}}}}}}"#);
+            std::fs::write(&path, zero).unwrap();
+            let err = ObservabilityExportersConfig::load_from(&path)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(field),
+                "{field} 声明 0 的错误要点名这个字段，实际是：{err}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

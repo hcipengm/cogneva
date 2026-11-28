@@ -76,6 +76,12 @@ async fn setup() -> (String, PgPool) {
         .execute(&pool)
         .await
         .expect("apply the startup schema");
+    // Writing a task appends a `task_transition` event, and that table is a
+    // migration, not part of the state backend's own schema. Without it the
+    // seed fails on a missing relation before any lock is taken, and the
+    // failure reads as a broken store rather than as this fixture missing half
+    // of what the path writes.
+    cog_test_support::event_stream(&pool).await;
     (schema, pool)
 }
 

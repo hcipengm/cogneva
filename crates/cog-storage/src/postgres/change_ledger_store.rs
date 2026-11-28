@@ -414,14 +414,17 @@ UPDATE change_ledger c \
 /// being reopened has no earlier reading, and takes the new one.
 ///
 /// The three columns describing a wait -- its reason, its condition and when it
-/// started -- are cleared by any measurement that does not say `pending`. They
-/// describe work still owed, and a row that has landed or retired owes nothing;
-/// left behind they keep counting in every census that groups by reason.
+/// started -- are cleared by any measurement that does not leave the row owed
+/// and waiting: a landing, and a retirement. A retirement no longer has a state
+/// of its own -- the row stays `pending` and carries `retire_reason` -- so the
+/// state alone cannot say it: the row is judged out of the account and no longer
+/// asks the tree for anything, which is exactly the shape a wait must not stay
+/// on. Left behind it keeps counting in every census that groups by reason.
 /// Measured on the live account: a row retired minutes earlier still carried the
 /// pool's reason, and the blocked reading came out one row larger than the
-/// pending set it was describing. A measurement that still says `pending` keeps
-/// the wait it found -- stamping and clearing are the passes that decide those,
-/// and re-measuring a row is not one of them.
+/// pending set it was describing. A measurement that still leaves the row owed
+/// keeps the wait it found -- stamping and clearing are the passes that decide
+/// those, and re-measuring a row is not one of them.
 const APPLY_MEASUREMENT_SQL_TEMPLATE: &str = "\
 WITH prior AS (
     SELECT state AS before FROM change_ledger
@@ -458,17 +461,21 @@ WITH prior AS (
                 THEN COALESCE(change_ledger.retired_at, now())
             ELSE NULL
         END,
-        -- A wait describes work still owed; see the note above this statement.
+        -- A wait describes work the account is still asking the tree about; a
+        -- judged-out row is not asking. See the note above this statement.
         blocked_reason = CASE
-            WHEN EXCLUDED.state = '{state:pending}' THEN change_ledger.blocked_reason
+            WHEN EXCLUDED.state = '{state:pending}' AND EXCLUDED.retire_reason IS NULL
+                THEN change_ledger.blocked_reason
             ELSE NULL
         END,
         unblock_condition = CASE
-            WHEN EXCLUDED.state = '{state:pending}' THEN change_ledger.unblock_condition
+            WHEN EXCLUDED.state = '{state:pending}' AND EXCLUDED.retire_reason IS NULL
+                THEN change_ledger.unblock_condition
             ELSE NULL
         END,
         blocked_since = CASE
-            WHEN EXCLUDED.state = '{state:pending}' THEN change_ledger.blocked_since
+            WHEN EXCLUDED.state = '{state:pending}' AND EXCLUDED.retire_reason IS NULL
+                THEN change_ledger.blocked_since
             ELSE NULL
         END
     RETURNING state, measured_rev, retire_reason, unsettled_reason

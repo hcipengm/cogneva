@@ -42,6 +42,17 @@ case "${1:-}" in
     *) echo "用法：$0 [--check]" >&2; exit 2 ;;
 esac
 
+# 判的那一路要从树里读渲染产物；写的那一路由 render-deploy.sh 刚渲染完，不重来。
+# 产物不进仓，读的那一刻现场生成（输入没变就是一次摘要比较）。
+# 夹具树没有生成器时跳过（它只摆自己判的那几个文件）。
+if [ "${mode}" = check ]; then
+    if [ -f "${REPO_ROOT}/deploy/scripts/lib/rendered-cache.sh" ]; then
+        # shellcheck source=lib/rendered-cache.sh
+        source "${REPO_ROOT}/deploy/scripts/lib/rendered-cache.sh"
+        ensure_rendered "${REPO_ROOT}" || exit $?
+    fi
+fi
+
 for f in "${CHART_JSON}" "${STATIC_CONFIG}" "${RENDERED}"; do
     [ -e "${f}" ] || { echo "FAIL: 缺 ${f}" >&2; exit 2; }
 done

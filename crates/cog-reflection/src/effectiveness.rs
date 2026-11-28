@@ -352,7 +352,7 @@ mod tests {
             Ok(tasks.into_iter().map(|task| task.id).collect())
         }
 
-        async fn row(&self, _id: &str) -> Option<cog_core::Task> {
+        async fn row(&self, _id: &str) -> cog_core::SFResult<Option<cog_core::Task>> {
             let mut row = cog_core::Task::new(
                 "counting",
                 cog_core::TaskType::Custom("counting".into()),
@@ -360,7 +360,7 @@ mod tests {
             );
             row.status = cog_core::TaskStatus::Completed;
             row.result = Some(serde_json::json!({ "result": "{}" }));
-            Some(row)
+            Ok(Some(row))
         }
     }
 

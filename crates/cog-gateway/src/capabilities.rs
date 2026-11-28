@@ -12,13 +12,17 @@
 //! - **执行手表（`SkillConfig`）**是分工表：这一块活可以交给哪一种手。分解时读它，
 //!   它空着是合法状态，不是「没配好」。
 //!
-//! **不新建任何存储。** 这张表由四个已经在跑的读取面拼出来，各有各的负责人：
+//! **不新建任何存储。** 这张表由五个已经在跑的读取面拼出来，各有各的负责人：
 //!
 //! - 内建动作：`cog_core::ToolRegistry` 的三个读法——`names()`（有什么）、
 //!   `definitions()`（要什么参数）与 `calls()`（点过几次），由 `cog-agent` 发布成服务；
 //! - 插件动作：`PluginRegistry::discover()` 读磁盘上的清单（工作台那一格读的就是本
 //!   文件，不另读一遍磁盘）；
 //! - 远端动作：`McpClient::list_tools()`，与 `/api/v1/protocol/mcp/tools` 同一个源；
+//! - 对话层动作：`ConversationTurn::offered_tools()`，也就是**最近一轮真正交给模型
+//!   的那张表**里共用表之外的那几只。这一层曾经在能力页上整层缺席：页上 25 只，
+//!   一轮对话手里 44 只，差的那 19 只只在聊过天的人那里存在。按装配代码另拼一份
+//!   会漂，所以读的是那一轮自己交出去的表；还没有一轮跑过时它自报 `unread`；
 //! - 谁能点它：共享技能表（`SkillRegistry`）里每个角色声明的 `tools`。读法与运行时
 //!   收窄一轮时一样——`skill_for_role` 决定一个角色的多行里哪一行算数——所以这一栏
 //!   不会报出运行时并不给的许可。没有声明 `tools` 的角色是「不设边界，拿整张注册
@@ -57,6 +61,12 @@ pub enum Source {
     Plugin,
     /// 远端 MCP 服务器暴露的工具。
     Mcp,
+    /// 对话层在一轮里装上去的工具：只属于这一段对话，共用注册表里没有它们。
+    ///
+    /// 单列一层而不是并进内建，是因为它们的生命周期不同：内建那批随进程存在，
+    /// 这一批随一轮存在——属主身份与计划模式都会改变它。并进内建，能力页会报出
+    /// 一只「此刻这段对话拿不到」的工具，而点击它的人只会得到一次拒绝。
+    Conversation,
 }
 
 impl Source {
@@ -65,6 +75,7 @@ impl Source {
             Source::Builtin => "builtin",
             Source::Plugin => "plugin",
             Source::Mcp => "mcp",
+            Source::Conversation => "conversation",
         }
     }
 }
@@ -98,7 +109,7 @@ impl Reach {
 /// 在这里改一次——下面有一条测试钉着当前的值。
 fn reach_of(source: Source) -> Reach {
     match source {
-        Source::Builtin | Source::Mcp => Reach::Callable,
+        Source::Builtin | Source::Mcp | Source::Conversation => Reach::Callable,
         Source::Plugin => Reach::DeclaredOnly,
     }
 }
@@ -230,7 +241,7 @@ pub struct Entry {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Inventory {
     pub generated_at: chrono::DateTime<chrono::Utc>,
-    /// 按来源排好的读数。顺序固定：内建、插件、MCP。
+    /// 按来源排好的读数。顺序固定：内建、插件、MCP、对话层。
     pub sources: Vec<(Source, SourceReading)>,
     /// 全部项，去重后按名字排。同名来自两个源的各占一行。
     pub entries: Vec<Entry>,
@@ -284,9 +295,9 @@ impl Inventory {
     /// 的零（「量过，没人点」），它照常参与求和。
     ///
     /// 里层那串来源是缺计数器的层：少算了几层要让读者看得见，否则「插件 7 项」会被
-    /// 读成「这 7 项没人点」。今天缺的是插件与 MCP——插件声明的动作本来就没人能调，
-    /// MCP 的调用走网关自己的路由，不经过这张登记表，两条理由都写在 `Entry` 的
-    /// `calls` 那一栏上。
+    /// 读成「这 7 项没人点」。今天缺的是插件、MCP 与对话层——插件声明的动作本来
+    /// 就没人能调，MCP 的调用走网关自己的路由，对话层那几只装在每一轮私有的表上，
+    /// 三条理由都写在 `Entry` 的 `calls` 那一栏上。
     ///
     /// 求和而不是按层印：工作台那一行问的是「有没有人在点这些动作」，一层一条会把
     /// 一格的明细撑成一张表，而那几层在这个问题上不是分开的答案。
@@ -294,7 +305,12 @@ impl Inventory {
         let mut total = 0u64;
         let mut counted = false;
         let mut without_counter: Vec<Source> = Vec::new();
-        for source in [Source::Builtin, Source::Plugin, Source::Mcp] {
+        for source in [
+            Source::Builtin,
+            Source::Plugin,
+            Source::Mcp,
+            Source::Conversation,
+        ] {
             let mut entries = 0usize;
             let mut with_counter = 0usize;
             for entry in self.entries.iter().filter(|e| e.source == source) {
@@ -471,6 +487,47 @@ pub async fn read(state: &GatewayState) -> Inventory {
         },
     };
     sources.push((Source::Mcp, mcp));
+
+    // ── 对话层 ──
+    // 这一层没有自己的一份清单可读：它读的是**最近一轮真正交给模型的那张表**，
+    // 由对话层自报（见 `ConversationTurn::offered_tools`）。按装配代码另拼一份会
+    // 漂：加了工具忘了改这一面，屏幕上少的那几只没有任何读数会红。
+    let conversation = match state.conversation.get() {
+        None => SourceReading::Unwired {
+            because: "这个部署没有装配对话层，能力页读不到一轮的工具表".into(),
+        },
+        Some(turn) => match turn.offered_tools() {
+            None => SourceReading::Unread {
+                because: "还没有一轮对话跑过：这一层要读到的是那一轮实际交出去的表，跑过一轮之后这里才有名字"
+                    .into(),
+            },
+            Some(tools) => {
+                for tool in &tools {
+                    entries.push(Entry {
+                        name: tool.name.clone(),
+                        source: Source::Conversation,
+                        reach: reach_of(Source::Conversation),
+                        description: Some(tool.description.clone()),
+                        boundary: boundary_of(Some(&tool.parameters)),
+                        runs_in: Some(match &tool.implementation {
+                            cog_core::ToolImplementation::Native(_) => RunsIn::Native,
+                            cog_core::ToolImplementation::Wasm { .. } => RunsIn::Wasm,
+                            cog_core::ToolImplementation::Shell(_) => RunsIn::Shell,
+                        }),
+                        // 这几只装在那一轮私有的表上，调用计数记在那张表上，
+                        // 不经过共用的那张——这里没有数可报。
+                        calls: None,
+                        allowed_roles: None,
+                    });
+                }
+                SourceReading::Measured {
+                    entries: tools.len(),
+                    callable: tools.len(),
+                }
+            }
+        },
+    };
+    sources.push((Source::Conversation, conversation));
 
     // ── 谁能点它 ──
     // 从角色分工表读：名册自报那一栏写的是工号与角色名，这一面要的是动作名，两
@@ -696,6 +753,7 @@ mod tests {
             (Source::Builtin, "builtin"),
             (Source::Plugin, "plugin"),
             (Source::Mcp, "mcp"),
+            (Source::Conversation, "conversation"),
         ] {
             assert_eq!(serde_json::to_value(source).unwrap(), expected);
         }
@@ -722,6 +780,7 @@ mod tests {
     fn the_plugin_layer_is_declared_only_until_something_registers_it() {
         assert_eq!(reach_of(Source::Builtin), Reach::Callable);
         assert_eq!(reach_of(Source::Mcp), Reach::Callable);
+        assert_eq!(reach_of(Source::Conversation), Reach::Callable);
         assert_eq!(reach_of(Source::Plugin), Reach::DeclaredOnly);
     }
 

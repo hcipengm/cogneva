@@ -14,7 +14,7 @@ use cog_gateway::security_gateway::{PoolObservability, SecurityGatewayConfig, Vo
 use cog_observability::alert_store::PostgresAlertStore;
 use cog_observability::analytics::{ClickHouseAnalyticsBackend, ClickHouseEventBuffer};
 use cog_observability::data_volume;
-use cog_observability::logs::{LokiBackgroundPusher, LokiPushClient};
+use cog_observability::logs::LokiBackgroundPusher;
 use cog_observability::metrics::PrometheusMetricsBackend;
 use cog_observability::usage_store::LlmUsageStore;
 
@@ -111,23 +111,15 @@ fn init_gateway_logging(
     // 再没人设置的名字，而读不到与「本来就没配」在调用点上同形。
     let (level, format) = cog_observability::logs::level_and_format();
     let pusher = if obs.loki.enabled {
-        let client = Arc::new(
-            LokiPushClient::new(&obs.loki.endpoint)
-                .with_max_retries(obs.loki.max_retries.max(1))
-                .with_timeout(obs.loki.timeout_secs)
-                .with_label(
-                    cog_gateway::LABEL_SERVICE,
-                    cog_core::topology::SECURITY_GATEWAY,
-                )
-                .with_client(http_client.clone()),
-        );
         // 循环由调用方在后端建好后起（见 `assemble`）：在构造点起，后端之前
-        // 每一轮的结局就无处记。
-        Some(Arc::new(LokiBackgroundPusher::new(
-            client,
-            std::time::Duration::from_secs(obs.loki.flush_interval_sec.max(1)),
-            obs.loki.max_batch_size.max(1),
-        )))
+        // 每一轮的结局就无处记。三格原样生效——这里曾是第三个把声明的
+        // `max_retries = 0` 夹成一次重试的装配点。
+        let (_, pusher) = cog_observability::logs::client_and_pusher(
+            &obs.loki,
+            http_client.clone(),
+            cog_core::topology::SECURITY_GATEWAY,
+        );
+        Some(pusher)
     } else {
         None
     };

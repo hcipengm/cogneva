@@ -813,7 +813,7 @@ impl MainChannel {
     ) -> std::result::Result<String, LandingError> {
         self.check_policy(change, owner_approved)?;
         let base = self.config.base_branch.clone();
-        let attempts = self.config.landing_policy.max_land_attempts.max(1);
+        let attempts = self.config.landing_policy.max_land_attempts;
         let _guard = self.gate.lock().await;
 
         let mut last_race = None;
@@ -2236,14 +2236,29 @@ async fn redrive(
     // produced a re-drive is dropped by the idempotent insert. Read the row
     // first: without it the submission reports success and the change is left
     // with no attempt running and no record of why.
-    if let Some(existing) = orchestrator.get_task(&task_id).await {
-        tracing::warn!(
-            change_id = %record.change.change_id,
-            task_id = %task_id,
-            status = ?existing.status,
-            "a re-drive for this change is already in the graph; nothing queued"
-        );
-        return;
+    //
+    // 读不到**不是**「还没有人交过」：那一行可能还在图里。读失败这一拍不交，
+    // 把错误留给下一拍重试——否则一次库抖动就再交一份同样的活（CC22）。
+    match orchestrator.get_task_checked(&task_id).await {
+        Ok(Some(existing)) => {
+            tracing::warn!(
+                change_id = %record.change.change_id,
+                task_id = %task_id,
+                status = ?existing.status,
+                "a re-drive for this change is already in the graph; nothing queued"
+            );
+            return;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(
+                change_id = %record.change.change_id,
+                task_id = %task_id,
+                error = %e,
+                "could not read whether a re-drive already exists; leaving this tick to the next one"
+            );
+            return;
+        }
     }
     let mut task = cog_core::Task::new(
         task_id,

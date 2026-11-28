@@ -366,6 +366,19 @@ fn hold_back_message(admitted: u64) -> &'static str {
     }
 }
 
+/// 三条声明的节拍各就各位：只有 0 被拒，其余原样用。
+///
+/// 0 秒的扫描是忙等，0 秒的停滞窗让每个刚出现的占位符立刻算孤儿——两者都不是
+/// 「越快越好」的极端，所以拒绝而不是替换成一个没人声明的数（从前它们被静默
+/// 抬到 30 与 60）。dwell 的下限是一次扫描周期，这条下限由扫描周期自己给出：
+/// 短于它的告警可能在两次扫描之间亮起又灭掉，消费者一次也轮询不到。
+fn reconciler_cadence(poll_secs: u64, stall_secs: u64, dwell_secs: u64) -> Option<(u64, u64, u64)> {
+    if poll_secs == 0 || stall_secs == 0 {
+        return None;
+    }
+    Some((poll_secs, stall_secs, dwell_secs.max(poll_secs)))
+}
+
 impl DagExecutorRuntime {
     /// 具体后端类型的入口：与 [`Self::new_with_dyn_backend`] 同一套装配。
     ///
@@ -1557,7 +1570,7 @@ impl DagExecutorRuntime {
         // 阈值必须大于最长处理时长，否则正在处理的消息会被并发重投；重投是
         // at-least-once，已终态任务会被上面的拒绝分支 ack 丢弃，不会重复迁移。
         let claim_idle_ms = self.config.result_claim_idle_secs.saturating_mul(1000);
-        let interval_secs = self.config.result_claim_interval_secs.max(1);
+        let interval_secs = self.config.result_claim_interval_secs;
         // 观测面单独成任务，不搭清扫器的节拍：这个循环会在 tick 里就地 await
         // 一条重投消息的完整处理（可能几十分钟），测量挂在同一根节拍上就等于
         // "处理得越久，指标越静止"，而抓取面上一条静止的序列和一条干净流量的
@@ -2172,11 +2185,17 @@ impl DagExecutorRuntime {
             tracing::info!("decomposition orphan reconciler disabled by config");
             return;
         }
-        let interval_secs = poll_interval_secs.max(30);
-        let stall_secs = stall_after_secs.max(60);
-        // The alert consumer polls independently; a dwell shorter than one scan
-        // interval could elude every poll. Default dwell is two intervals.
-        let dwell_secs = alert_dwell_secs.max(interval_secs);
+        let Some((interval_secs, stall_secs, dwell_secs)) =
+            reconciler_cadence(poll_interval_secs, stall_after_secs, alert_dwell_secs)
+        else {
+            tracing::error!(
+                poll_interval_secs,
+                stall_after_secs,
+                "decomposition orphan reconciler not started: a declared cadence is 0 seconds, \
+                 which is a busy loop (or every pending placeholder is an orphan the moment it appears)"
+            );
+            return;
+        };
         tracing::info!(
             interval_secs,
             stall_after_secs = stall_secs,
@@ -5433,5 +5452,34 @@ mod hold_back_tests {
                  与它互相否证，而读者按文字行事"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod reconciler_cadence_tests {
+    use super::reconciler_cadence;
+
+    /// 声明的扫描与停滞窗原样生效（从前被静默抬到 30/60）；只有 0 被拒。
+    #[test]
+    fn a_declared_cadence_survives_and_only_zero_is_refused() {
+        assert_eq!(
+            reconciler_cadence(5, 45, 10),
+            Some((5, 45, 10)),
+            "声明的节拍不许被改写"
+        );
+        assert_eq!(reconciler_cadence(0, 60, 30), None, "0 秒扫描是忙等");
+        assert_eq!(
+            reconciler_cadence(30, 0, 30),
+            None,
+            "0 秒停滞窗让每个占位符立刻算孤儿"
+        );
+    }
+
+    /// 告警停留的下限是一次扫描周期，由扫描周期自己给出：短于它的告警可能
+    /// 在两次扫描之间亮起又灭掉。
+    #[test]
+    fn the_alert_dwell_is_floored_by_the_scan_it_must_outlive() {
+        assert_eq!(reconciler_cadence(300, 1800, 10), Some((300, 1800, 300)));
+        assert_eq!(reconciler_cadence(300, 1800, 600), Some((300, 1800, 600)));
     }
 }

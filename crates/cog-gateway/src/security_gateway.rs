@@ -136,7 +136,7 @@ pub struct SecurityGatewayConfig {
     /// 与「什么都没声明」——这两件事在监控上同形，而它们对运营者的含义不同。
     pub llm_pool_min_healthy: Option<usize>,
     /// 嫌疑上游的主动探测间隔秒数（COGNEVA_LLM_HEALTH_PROBE_SECS，默认 300），
-    /// 同时是嫌疑窗指数退避的基数。
+    /// 同时是嫌疑窗指数退避的基数。声明的值原样生效，0 秒在 `run` 入口按名字拒绝。
     pub llm_health_probe_secs: u64,
     /// GitHub API 透传出口注入的 token（COGNEVA_GITHUB_TOKEN）。未配置时
     /// `/github/*` 一律 503。
@@ -216,8 +216,9 @@ pub struct SecurityGatewayConfig {
     pub webhook_internal_secret: Option<String>,
     /// 验签通过后的转发基址（COGNEVA_WEBHOOK_FORWARD_URL）。
     pub webhook_forward_url: String,
-    /// 池状态发布/判定间隔秒数（COGNEVA_LLM_POOL_CHECK_SECS，默认 30，下限 5）：
-    /// 指标刷新、共享键续期、告警状态机推进的统一节拍。
+    /// 池状态发布/判定间隔秒数（COGNEVA_LLM_POOL_CHECK_SECS，默认 30）：
+    /// 指标刷新、共享键续期、告警状态机推进的统一节拍。声明的值原样生效，
+    /// 0 秒在 `run` 入口按名字拒绝——那是忙等，不是一个节拍。
     pub pool_check_secs: u64,
     /// 贡献通道 OAuth 续期循环的拍长与续期阈值（`COGNEVA_CONTRIBUTION_OAUTH_
     /// REFRESH_{INTERVAL,THRESHOLD}_SECS`，0 = 内置默认）。名字与主应用配置面
@@ -308,7 +309,7 @@ impl SecurityGatewayConfig {
             domain_denylist: list("COGNEVA_SG_DOMAIN_DENYLIST"),
             llm_upstreams: upstreams_from_env(),
             llm_pool_min_healthy: min_healthy_from_env(),
-            llm_health_probe_secs: env_u64("COGNEVA_LLM_HEALTH_PROBE_SECS", 300),
+            llm_health_probe_secs: env_u64(LLM_HEALTH_PROBE_SECS_ENV, 300),
             github_token: token("COGNEVA_GITHUB_TOKEN"),
             gitee_token: token("COGNEVA_GITEE_TOKEN"),
             search_fallback_upstreams: crate::search_fallback::upstreams_from_env(),
@@ -337,7 +338,7 @@ impl SecurityGatewayConfig {
             webhook_internal_secret: token(cog_core::env::WEBHOOK_INTERNAL_SECRET),
             webhook_forward_url: std::env::var("COGNEVA_WEBHOOK_FORWARD_URL")
                 .unwrap_or_else(|_| "http://cogneva:9091".into()),
-            pool_check_secs: env_u64(cog_core::env::LLM_POOL_CHECK_SECS, 30).max(5),
+            pool_check_secs: env_u64(cog_core::env::LLM_POOL_CHECK_SECS, 30),
             // 同一个 env 名，读它的进程从主应用换成了这里：清单里那一行没动，
             // 而循环跟着 Secret 的读权走。
             contribution_oauth_refresh_interval_secs: env_u64(
@@ -406,6 +407,10 @@ fn upstreams_from_env() -> Vec<LlmUpstream> {
 /// 而「没配」与「配在另一个拼法的名字下」在结果上同形。
 pub(crate) const GITHUB_OAUTH_CLIENT_ID_ENV: &str = "COGNEVA_GITHUB_OAUTH_CLIENT_ID";
 pub(crate) const LLM_POOL_MIN_HEALTHY_ENV: &str = "COGNEVA_LLM_POOL_MIN_HEALTHY";
+/// 上游健康探测间隔那一格的部署名。配置装配读它取值、`run` 读它做「0 秒按名字拒绝」，
+/// 测试也拿它断言错误文本点名了哪一格——三处各写一遍时，改名只改一处不会报错，
+/// 而拒绝那一步会指着一个再也没人设置的名字。
+pub(crate) const LLM_HEALTH_PROBE_SECS_ENV: &str = "COGNEVA_LLM_HEALTH_PROBE_SECS";
 
 /// 声明的冗余下限：上面那个环境变量，与上游池同一次写入 Secret 的那个值
 /// （llm-config 单入口里的一个整数）。
@@ -6883,9 +6888,22 @@ pub const POOL_STATE_PUBLISHER_LOOP: &str = "gateway_pool_state_publisher";
 /// Loop name reported through the background-loop liveness family.
 pub const LLM_HEALTH_PROBER_LOOP: &str = "gateway_llm_health_prober";
 
+/// 部署声明的节拍原样生效；0 秒是忙等，不是一个节拍，点名拒绝。
+///
+/// 从前网关在两个读它的地方各把声明的值静默抬一次（池检查 5 秒、健康探测
+/// 30 秒），于是声明的值与生效的值有两个，而写配置的人读不到后一个。
+fn declared_cadence(env_name: &str, secs: u64) -> Result<u64, String> {
+    if secs == 0 {
+        return Err(format!(
+            "{env_name} 声明为 0 秒：那是忙等，不是一个节拍。给它一个周期。"
+        ));
+    }
+    Ok(secs)
+}
+
 /// 池状态发布循环：把进程内的池健康周期性落成指标/时序/告警/跨进程信号。
 fn spawn_pool_state_publisher(state: AppState) -> tokio::task::JoinHandle<()> {
-    let period = std::time::Duration::from_secs(state.config.pool_check_secs.max(5));
+    let period = std::time::Duration::from_secs(state.config.pool_check_secs);
     // Nothing hands this loop a stop signal: it runs for the life of the gateway
     // process, so any exit leaves the pool state unprojected.
     cog_core::loop_health::spawn_unstoppable(
@@ -8553,7 +8571,7 @@ async fn record_upstream_failure(
 /// 每退避窗口最多烧一次 max_tokens=1 的探测，配额消耗有界。
 /// 探测成功即热恢复（进程内清嫌疑，零重启），失败则指数加窗。
 fn spawn_llm_health_prober(state: AppState) -> tokio::task::JoinHandle<()> {
-    let period = std::time::Duration::from_secs(state.config.llm_health_probe_secs.max(30));
+    let period = std::time::Duration::from_secs(state.config.llm_health_probe_secs);
     // Nothing hands this loop a stop signal: it runs for the life of the gateway
     // process, and without it a suspect upstream is never retested.
     cog_core::loop_health::spawn_unstoppable(
@@ -11595,6 +11613,10 @@ pub async fn run(
     // 扫描器的内存里——那是今天的行为，不是一个新的默认。
     body_store: Option<Arc<dyn cog_core::BodyStore>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // 两个节拍都是部署声明的：声明 1 秒就跑 1 秒，0 秒是忙等不是一个节拍，
+    // 在这里按名字拒绝——不在读它的那一层悄悄抬成 5 秒或 30 秒。
+    declared_cadence(cog_core::env::LLM_POOL_CHECK_SECS, config.pool_check_secs)?;
+    declared_cadence(LLM_HEALTH_PROBE_SECS_ENV, config.llm_health_probe_secs)?;
     // 本进程的出站客户端由装配层造好交进来（本 crate 不认具体实现）。交回给
     // `contribution_admin`，那些调 github/gitee 的请求与这里其余出站就确实是
     // 同一份设置，而不是各自从配置造出来的第二份。
@@ -11770,6 +11792,21 @@ pub async fn run(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// 声明的节拍原样生效；0 秒按名字拒绝，不再被悄悄抬到一个下限。
+    #[test]
+    fn a_declared_cadence_survives_and_zero_is_refused() {
+        assert_eq!(
+            declared_cadence("COGNEVA_LLM_POOL_CHECK_SECS", 1).unwrap(),
+            1
+        );
+        assert_eq!(
+            declared_cadence("COGNEVA_LLM_POOL_CHECK_SECS", 300).unwrap(),
+            300
+        );
+        let refused = declared_cadence(LLM_HEALTH_PROBE_SECS_ENV, 0).unwrap_err();
+        assert!(refused.contains(LLM_HEALTH_PROBE_SECS_ENV), "{refused}");
+    }
 
     /// A proxied call that names its caller, which every real caller does.
     ///

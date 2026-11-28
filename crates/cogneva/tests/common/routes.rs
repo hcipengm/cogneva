@@ -27,7 +27,7 @@ use super::lex::{blank, Dialect};
 /// 把它删掉让消费者改走 `common::root::repo_root`，等于让 75 个文件各写一条路径，
 /// 而这里的一行恰恰是它们只写一条路径的原因。
 #[allow(unused_imports)]
-pub use super::root::repo_root;
+pub use super::root::{rendered_root, repo_root};
 
 /// 读文件、走目录的那两条规则本身在 [`super::fsio`]——那里不 import 兄弟模块，
 /// 所以 `src/` 的单测也能按 `#[path]` 编它。这里只是把它们原样再导一次：消费者

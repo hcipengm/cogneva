@@ -668,8 +668,14 @@ export function SettingsView() {
           >
           <div className="flex flex-wrap py-2">
             <Reading label="今天已用" value={quota.data.used_today.toLocaleString()} />
-            <Reading label="剩余额度" value={quota.data.remaining.toLocaleString()} />
-            <Reading label="额度总量" value={quota.data.total_quota.toLocaleString()} />
+            <Reading
+              label="剩余额度"
+              value={quota.data.remaining === null ? '不限（没有人声明过上限）' : quota.data.remaining.toLocaleString()}
+            />
+            <Reading
+              label="额度总量"
+              value={quota.data.total_quota === null ? '不限（没有人声明过上限）' : quota.data.total_quota.toLocaleString()}
+            />
             <Reading label="账号" value={<span className="mono text-[13px]">{quota.data.user_id}</span>} />
           </div>
           </Readings>

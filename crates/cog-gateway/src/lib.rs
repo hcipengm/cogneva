@@ -2588,11 +2588,15 @@ async fn quota_usage_handler(
         .unwrap_or_else(|| "anonymous".to_string());
 
     let summary = state.quota_manager.get_user_summary(&user_id).await;
+    // 没人声明过的格子读到「没有上限」（`QuotaLimits::unlimited`）。这一面对
+    // 它写 `null` 而不是把 `u64::MAX` 印出去：没有上限就没有「还剩多少」，而
+    // 一个十八位整数在读数面上与「额度真的这么多」同形。
+    let unlimited = summary.total_quota == u64::MAX;
     let mut body = serde_json::json!({
         "user_id": user_id,
-        "remaining": summary.remaining,
+        "remaining": if unlimited { None } else { Some(summary.remaining) },
         "used_today": summary.used_today,
-        "total_quota": summary.total_quota,
+        "total_quota": if unlimited { None } else { Some(summary.total_quota) },
     });
 
     if let Some(hier) = state.hierarchy_manager.as_ref() {
@@ -2679,6 +2683,14 @@ async fn quota_recharge_handler(
             })),
         )
             .into_response(),
+        // 抬一个没人声明过的格子是调用方的问题，不是服务端故障：配额实现把
+        // 「先声明一对上限」这一种拒绝报成 `Validation`，照 400 答，调用方才
+        // 知道该改什么；`Internal` 仍是服务端故障。
+        Err(cog_core::SFError::Validation(message)) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid_argument", "message": message})),
+        )
+            .into_response(),
         Err(e) => {
             tracing::warn!("Quota recharge failed: {}", e);
             (
@@ -2699,13 +2711,16 @@ async fn quota_workspace_handler(
         .quota_manager
         .get_workspace_summary(&workspace_id)
         .await;
+    // 与个人那一面同一条：没人声明过的格子没有上限，就报 `null`，不把
+    // `u64::MAX` 印成「额度真的这么多」。
+    let unlimited = summary.total_quota == u64::MAX;
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "workspace_id": workspace_id,
-            "remaining": summary.remaining,
+            "remaining": if unlimited { None } else { Some(summary.remaining) },
             "used_today": summary.used_today,
-            "total_quota": summary.total_quota,
+            "total_quota": if unlimited { None } else { Some(summary.total_quota) },
         })),
     )
         .into_response()

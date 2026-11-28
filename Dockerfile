@@ -175,7 +175,49 @@ RUN cargo build --release --locked --bin cogneva
 RUN strip target/release/cogneva
 
 # ------------------------------------------------------------------------------
-# Stage 1b: WebUI 构建（干净克隆也能产出 dist，不依赖本机预构建）
+# Stage 1b: 钉版本的 helm
+# ------------------------------------------------------------------------------
+# 运行镜像要自带一把 helm：部署器读 `deploy/rendered/<profile>` 时，那个 rev 下
+# 没有可读的字节，它用**目标 rev 自己的**渲染器现场生成，而渲染器要 helm。运行期
+# 下载会让「滚动一拍」取决于出站网络，所以构建期就装好。
+#
+# 版本从引导器的源码读，不由入口传：HELM_VERSION 只在
+# crates/bootstrap/src/main.rs 里声明一次（宿主上的引导器装的就是那个版本），
+# 不同 helm 版本渲染块标量的尾随空白不同，两处版本漂移会让现场渲出的字节和
+# 构建期内嵌的那份对不上。单独一层、只依赖那一个文件：改其它源码不重下 helm。
+FROM ubuntu:24.04 AS helm
+ARG APT_MIRROR_HOST
+RUN if [ -n "$APT_MIRROR_HOST" ]; then \
+    sed -i "s|archive.ubuntu.com|$APT_MIRROR_HOST|g; s|security.ubuntu.com|$APT_MIRROR_HOST|g" \
+    /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true; \
+    fi; \
+    sed -i 's/^Components: main.*/Components: main restricted universe multiverse/' \
+    /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+COPY crates/bootstrap/src/main.rs /tmp/helm-version.rs
+RUN HELM_VERSION="$(sed -n 's/^const HELM_VERSION: &str = "\([^"]*\)";$/\1/p' /tmp/helm-version.rs)"; \
+    rm -f /tmp/helm-version.rs; \
+    [ -n "$HELM_VERSION" ] || { echo "未从 crates/bootstrap/src/main.rs 读到 HELM_VERSION" >&2; exit 1; }; \
+    case "$(uname -m)" in \
+        x86_64) arch=amd64 ;; \
+        aarch64) arch=arm64 ;; \
+        *) echo "helm 自动安装不支持架构 $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    ok=0; \
+    for base in https://mirrors.huaweicloud.com/helm https://get.helm.sh; do \
+        curl -fsSL "$base/$HELM_VERSION/helm-$HELM_VERSION-linux-$arch.tar.gz" -o /tmp/helm.tgz \
+            && { ok=1; break; }; \
+    done; \
+    [ "$ok" = 1 ] || { echo "取不到 helm $HELM_VERSION" >&2; exit 1; }; \
+    tar -xzf /tmp/helm.tgz -C /tmp; \
+    install -m 0755 "/tmp/linux-$arch/helm" /usr/local/bin/helm; \
+    rm -rf /tmp/helm.tgz "/tmp/linux-$arch"
+
+# ------------------------------------------------------------------------------
+# Stage 1c: WebUI 构建（干净克隆也能产出 dist，不依赖本机预构建）
 # ------------------------------------------------------------------------------
 FROM node:22-slim AS webbuilder
 
@@ -249,6 +291,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     buildah \
     shellcheck \
     && rm -rf /var/lib/apt/lists/*
+
+# helm 在独立的构建阶段装好（版本读自引导器源码，只依赖那一个文件），这里只把
+# 二进制带进最终镜像：运行镜像自带与构建期内嵌产物同一版的 helm，宿主既不需要
+# 装 helm，也不能用宿主那份把它盖掉。
+COPY --from=helm /usr/local/bin/helm /usr/local/bin/helm
 
 # Install rustup/stable toolchain. 这一把与上面钉住的 RUST_TOOLCHAIN 无关、有意不同：
 # 它既给自进化 worker 在运行期编译系统写给自己、之后要落地的变更，也**就是部署器

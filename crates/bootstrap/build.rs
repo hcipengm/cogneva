@@ -11,11 +11,39 @@ use std::path::{Path, PathBuf};
 #[path = "../cogneva/tests/common/root.rs"]
 mod root;
 
-use root::repo_root;
+use root::{rendered_root, repo_root};
 
 fn main() {
     let repo_root = repo_root();
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+
+    // 渲染产物不进仓：构建这一刻从 chart 现场生成。引导器在**部署时**不能跑 helm
+    // （命门链路零下载），所以生成必须落在这里；打进二进制的就是刚生成的字节。
+    //
+    // 只给 Linux 目标：交付面是 Linux 集群（K3s/buildah），别的平台这一份只证明
+    // 编得过（CI 的三平台矩阵），内嵌一份自己交付不了的清单只会让二进制里多出
+    // 一份永远没人读的字节。判**目标平台**而不是「这台机器装没装 helm」——按环境
+    // 判会让同一个提交在两台机器上编出不同的二进制，而那份差异没有东西量。
+    let linux_target = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux");
+    let rendered = if linux_target {
+        // 渲染产物的输入变了要重跑这份构建脚本：目录级声明会递归盯住 chart 整棵树，
+        // 渲染链的脚本和额度基线各点一处。不声明就会拿着一份上一版的产物编译，
+        // 而「没重渲染」与「chart 没变」在产物上同形。
+        for rel in [
+            "deploy/helm/cogneva",
+            "deploy/scripts/render-deploy.sh",
+            "deploy/scripts/render-chart.sh",
+            "deploy/scripts/project-resource-governance.py",
+            "deploy/scripts/check-governance-consistency.sh",
+            "deploy/scripts/lib/rendered-cache.sh",
+            "deploy/k3s/resource-quota.yaml",
+        ] {
+            println!("cargo:rerun-if-changed={}", repo_root.join(rel).display());
+        }
+        Some(rendered_root())
+    } else {
+        None
+    };
 
     // (相对仓库根的路径, 是否递归目录)
     let asset_roots: &[(&str, bool)] = &[
@@ -28,7 +56,14 @@ fn main() {
 
     let mut entries: Vec<(String, PathBuf)> = Vec::new();
     for (rel, recursive) in asset_roots {
-        let abs = repo_root.join(rel);
+        // 预渲染那三棵从刚生成的树里取，其余从仓里取；写进产物的相对名不变，
+        // 运行时的解包路径因此一个字节都不用改。
+        let abs = match rel.strip_prefix("deploy/rendered/") {
+            // 非 Linux 目标不内嵌交付清单（理由见上）。
+            Some(_) if rendered.is_none() => continue,
+            Some(rest) => rendered.as_ref().unwrap().join(rest),
+            None => repo_root.join(rel),
+        };
         if *recursive {
             collect_files(&repo_root, &abs, &mut entries);
         } else {

@@ -61,11 +61,19 @@
 //! match.
 //!
 //! There is no third answer and no place to park one: a constant that arrives
-//! without a `cap:` line is red, and the two words are the whole closed set. A
-//! debt column would have been the easy shape and the wrong one -- "not judged
-//! yet" is exactly what a registry of every number was supposed to end. The same
-//! reasoning refuses `derived` rather than admitting it as a third word: a
-//! constant carrying it does not become a moving value, it only reads like one.
+//! without a `cap:` line is red, and the answers a constant can give are the ones
+//! [`Answer`] enumerates. A debt column would have been the easy shape and the
+//! wrong one -- "not judged yet" is exactly what a registry of every number was
+//! supposed to end. The same reasoning refuses `derived` rather than admitting it
+//! as a third answer: a constant carrying it does not become a moving value, it
+//! only reads like one.
+//!
+//! What this file does not keep is a **table of numbers**: how many `bound`
+//! constants each file carries, and which bound-shaped names are excused, are
+//! both read from the base branch on every run (`common::base_tree`). A table
+//! written down here would be a reading copied into the tree -- true on the day
+//! it was taken, drifted from then on, and edited by whoever needed it to agree
+//! with their change.
 //!
 //! The other half of the same question is on this file too: a number written at
 //! the point of *use* rather than in a declaration. The census above cannot see
@@ -83,6 +91,8 @@ use std::path::{Path, PathBuf};
 
 use crate::common;
 
+use common::base_tree::{base_rev, base_text};
+
 use common::routes::repo_root;
 
 use common::rust_production::{production_sources, sources_of_tree};
@@ -90,13 +100,36 @@ use common::rust_production::{production_sources, sources_of_tree};
 /// The word that answers for a constant, in the comment block above it.
 const CAP_MARKER: &str = "// cap:";
 
-/// The whole closed set of answers a constant may carry.
-const CAP_SOURCES: [&str; 2] = ["bound", "fixed"];
+/// 常量能给的答案。
+///
+/// 词表不是一份名单（旧写法是 `["bound", "fixed"]`），而是一组变体：每个答案都在
+/// 判词里有一个消费者——`Bound` 进那条只减不增的基线，`Fixed` 进界形那一问，
+/// `Derived` 在 [`refuses`] 里被拒。[`refuses`] 对 `parse` 的结果穷举匹配，所以
+/// **加一个变体在那里编译不过**，必须当场决定它是被接受还是被拒；它要真的出现在
+/// 判词里，还得在 `parse` 里给一个词、在另外两问里各想一遍。数组写法没有这个性质：
+/// 往数组里加一个词，既不用谁处理它，也不会有人注意到判词根本没读过它。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    /// 被某个事实钉住；理由说明是什么钉的。
+    Bound,
+    /// 不是旋钮，是一项约定；理由点名是哪一条。
+    Fixed,
+    /// 图那一侧的词，一个常量给不出：它的值在编译时就定死了。
+    Derived,
+}
 
-/// The chart's word for a value a measurement moves. A `const` is frozen at
-/// compile time, so it is not an answer a constant can give; naming it here
-/// keeps the refusal separate from "a word we have never heard of".
-const DERIVED: &str = "derived";
+impl Answer {
+    /// 标记行里的那个词。**加一个答案必须在这里加一臂**——这就是它的第一个
+    /// 消费者；解析不出这个词的标记仍按「没听说过的词」报，不是按任何一个答案报。
+    fn parse(word: &str) -> Option<Answer> {
+        match word {
+            "bound" => Some(Answer::Bound),
+            "fixed" => Some(Answer::Fixed),
+            "derived" => Some(Answer::Derived),
+            _ => None,
+        }
+    }
+}
 
 /// One written number: where it is, what it says, and what the block above it
 /// answered.
@@ -521,16 +554,21 @@ fn refuses(rows: &[Row]) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>)
             unmarked.push(format!("{}:{} = {}", row.file, row.name, row.value));
             continue;
         }
-        if row.source == DERIVED {
-            moves.push(format!("{}:{} = {}", row.file, row.name, row.value));
-            continue;
-        }
-        if !CAP_SOURCES.contains(&row.source.as_str()) {
-            unknown.push(format!(
-                "{}:{} says `cap: {}`",
-                row.file, row.name, row.source
-            ));
-            continue;
+        // 这一处 `match` 是答案的词表的第二个消费者：加一个变体而没在这里给它
+        // 一个去处，编译不过。`Derived` 单独一桶，因为拒的是形状而不是拼写。
+        match Answer::parse(&row.source) {
+            Some(Answer::Derived) => {
+                moves.push(format!("{}:{} = {}", row.file, row.name, row.value));
+                continue;
+            }
+            Some(Answer::Bound) | Some(Answer::Fixed) => {}
+            None => {
+                unknown.push(format!(
+                    "{}:{} says `cap: {}`",
+                    row.file, row.name, row.source
+                ));
+                continue;
+            }
         }
         // The reason has to be in the marker itself. A block above can describe
         // a number without saying why it is that number, and a description in
@@ -572,8 +610,8 @@ fn every_capacity_number_in_rust_says_where_it_comes_from() {
     );
     assert!(
         unknown.is_empty(),
-        "these say something the vocabulary does not accept; a constant's answers are \
-         {CAP_SOURCES:?}:\n{}",
+        "these say something the vocabulary does not accept; a constant answers either \
+         `bound` (say what pins it) or `fixed` (name the agreement it comes from):\n{}",
         unknown.join("\n")
     );
     assert!(
@@ -594,347 +632,69 @@ fn every_capacity_number_in_rust_says_where_it_comes_from() {
     );
 }
 
-/// One row per file: how many constants there answered `bound` on 2026-11-17.
+/// 基分支上的普查，用同一台扫描器读——基线就是这一份，不是这个文件里的一张表。
 ///
-/// `bound` is the one word in the vocabulary nothing can check. The reason says
-/// what pins the value, and no rule reads that reason well enough to tell a pin
-/// from a preference — so it is the shape a hand-picked number arrives in: an
-/// override wearing a justification. The two shapes that can be checked are
-/// `fixed` (it names an agreement) and a value computed at run time from the
-/// setting or the reading it follows (the read-file page is the worked example:
-/// it derives from the window the tools serve instead of a constant page size).
+/// 这里之前是 `BOUND_AT_CENSUS`，305 行「文件 → 条数」，量于 2026-11-17。那不是
+/// 判据，是一份读数抄件：只在量的那一天是真的，之后每一笔加 `bound` 的提交都要靠
+/// 人记得把那一行加一，而人记不得。抄件与树对不上时，红的不是抄件，是没人读的那
+/// 一句 `STALE`。判据真正要问的只有一句，「这一笔有没有让某个文件多出一条」，而
+/// 这句话由同一台扫描器（[`production_rows`]、同一套规则：测试模块不算、字面量按
+/// 括号切）在另一个来源上回答。基分支怎么找见 [`common::base_tree`]。
 ///
-/// Recorded per path, not as a total: with a total, fixing fifteen in one file
-/// and writing fifteen in another leaves the number unchanged and the gate
-/// silent — a green that covers a new one. A file may come in under its row;
-/// that is a repaid debt, printed as STALE so the row gets lowered. Going over
-/// a row is red, and a file that is not here has a row of zero.
-///
-/// The rows are the measured population, not a budget somebody chose.
-const BOUND_AT_CENSUS: &[(&str, u64)] = &[
-    // 任务行上的重试初值：它唯一的值由 `retry_matrix` 的未分类档读它（同一个名字），
-    // 判决与落库因此只有一个来源；这条不是「又拍了一个数」，是把既有的一条集中到一处。
-    ("crates/cog-core/src/types/task.rs", 1),
-    // 这两条是**由实测导出**的墙（不是没人管的债）：qdrant 建集合实测最慢 12.15 秒、
-    // 取 ×5；控制平面一次应答的实测上限 30 秒。它们的值跟着读数走，所以进基线的是
-    // 「这里有一条被读数量过的界」，不是「这里又加了一条拍出来的数」。
-    ("crates/cog-storage/src/qdrant/mod.rs", 1),
-    ("crates/cog-supervisor/src/control_plane.rs", 1),
-    ("crates/bootstrap/src/apt.rs", 1),
-    ("crates/bootstrap/src/kubespray.rs", 1),
-    ("crates/bootstrap/src/lib.rs", 6),
-    ("crates/bootstrap/src/main.rs", 11),
-    ("crates/cog-agent/src/agent.rs", 2),
-    ("crates/cog-agent/src/agent_kernel/replay_guard.rs", 1),
-    ("crates/cog-agent/src/agent_kernel/runtime.rs", 5),
-    ("crates/cog-agent/src/archive.rs", 1),
-    ("crates/cog-agent/src/background.rs", 3),
-    ("crates/cog-agent/src/config.rs", 1),
-    ("crates/cog-agent/src/consumer.rs", 3),
-    ("crates/cog-agent/src/context.rs", 3),
-    ("crates/cog-agent/src/drain.rs", 1),
-    ("crates/cog-agent/src/hooks/lifecycle.rs", 1),
-    ("crates/cog-agent/src/hooks/types.rs", 2),
-    ("crates/cog-agent/src/observable.rs", 1),
-    ("crates/cog-agent/src/permission.rs", 1),
-    ("crates/cog-agent/src/plugin.rs", 4),
-    ("crates/cog-agent/src/tools.rs", 8),
-    ("crates/cog-agent/src/web.rs", 2),
-    ("crates/cog-auth/src/jwt.rs", 1),
-    ("crates/cog-auth/src/keycloak.rs", 3),
-    ("crates/cog-auth/src/session.rs", 1),
-    ("crates/cog-collaboration/src/collaboration_executor.rs", 2),
-    ("crates/cog-collaboration/src/config.rs", 1),
-    ("crates/cog-collaboration/src/profile.rs", 5),
-    ("crates/cog-collaboration/src/squad/executor.rs", 3),
-    ("crates/cog-collaboration/src/squad/pge/pipeline.rs", 1),
-    ("crates/cog-collaboration/src/squad/pge/roundtable.rs", 2),
-    ("crates/cog-collaboration/src/squad/pge/stall.rs", 1),
-    ("crates/cog-collaboration/src/squad/ralph/ralph_loop.rs", 3),
-    ("crates/cog-core/src/build_cache.rs", 5),
-    ("crates/cog-core/src/build_cache_readings.rs", 2),
-    ("crates/cog-core/src/claim_footprint.rs", 2),
-    // 13 而不是 12：钩子限流的速率原先只作为 `RateLimitConfig` 的两个字段各写一遍，
-    // 两份都不在册。现在它是一条 `bound`，所以这一格多了一。
-    ("crates/cog-core/src/config.rs", 43),
-    ("crates/cog-core/src/config_sections.rs", 2),
-    ("crates/cog-core/src/contract/alerts.rs", 1),
-    ("crates/cog-core/src/contract/build_cache_reclaim.rs", 2),
-    ("crates/cog-core/src/contract/conversation.rs", 2),
-    ("crates/cog-core/src/contract/event.rs", 1),
-    ("crates/cog-core/src/contract/face_registry.rs", 1),
-    ("crates/cog-core/src/contract/governance_acts.rs", 1),
-    ("crates/cog-core/src/contract/hook.rs", 1),
-    ("crates/cog-core/src/contract/loop_health.rs", 3),
-    ("crates/cog-core/src/contract/memory.rs", 2),
-    ("crates/cog-core/src/contract/owner_lease.rs", 2),
-    ("crates/cog-core/src/contract/reflection.rs", 4),
-    ("crates/cog-core/src/contract/resilience.rs", 2),
-    ("crates/cog-core/src/contract/storage.rs", 6),
-    ("crates/cog-core/src/contract/taste.rs", 4),
-    ("crates/cog-core/src/contract/work_item.rs", 1),
-    ("crates/cog-core/src/day.rs", 1),
-    ("crates/cog-core/src/declared_wall.rs", 2),
-    ("crates/cog-core/src/pacing.rs", 2),
-    ("crates/cog-core/src/progress.rs", 7),
-    ("crates/cog-core/src/reading_cadence.rs", 1),
-    ("crates/cog-core/src/retention.rs", 4),
-    ("crates/cog-core/src/token_estimate.rs", 2),
-    ("crates/cog-core/src/types/agent_state.rs", 2),
-    ("crates/cog-core/src/types/self_review.rs", 2),
-    ("crates/cog-eval/src/adapters/swe_pro.rs", 1),
-    ("crates/cog-eval/src/admission.rs", 9),
-    ("crates/cog-eval/src/backoff.rs", 4),
-    ("crates/cog-eval/src/exec_seam.rs", 2),
-    ("crates/cog-eval/src/harness.rs", 1),
-    ("crates/cog-eval/src/long_run.rs", 3),
-    ("crates/cog-eval/src/rig.rs", 1),
-    ("crates/cog-eval/src/runner.rs", 1),
-    ("crates/cog-eval/src/scaffold.rs", 1),
-    ("crates/cog-eval/src/scaffolds/gepa.rs", 2),
-    ("crates/cog-eval/src/scaffolds/mod.rs", 1),
-    ("crates/cog-eval/src/system_harness.rs", 1),
-    ("crates/cog-eval/src/trend.rs", 3),
-    ("crates/cog-extension/src/build_cache.rs", 1),
-    ("crates/cog-extension/src/checkpoints.rs", 1),
-    ("crates/cog-extension/src/command_server.rs", 3),
-    ("crates/cog-extension/src/executor_lease.rs", 1),
-    ("crates/cog-extension/src/hostdocs.rs", 8),
-    ("crates/cog-extension/src/hostdocs_assist.rs", 3),
-    ("crates/cog-extension/src/lane_sizing.rs", 1),
-    ("crates/cog-extension/src/runtime/remote.rs", 6),
-    ("crates/cog-extension/src/workdir.rs", 10),
-    ("crates/cog-gateway/src/a2a.rs", 1),
-    ("crates/cog-gateway/src/agents.rs", 5),
-    ("crates/cog-gateway/src/auth/mod.rs", 2),
-    ("crates/cog-gateway/src/backup_admin.rs", 2),
-    ("crates/cog-gateway/src/buildgate.rs", 2),
-    ("crates/cog-gateway/src/chat.rs", 5),
-    ("crates/cog-gateway/src/cluster.rs", 2),
-    ("crates/cog-gateway/src/contribution_admin.rs", 1),
-    ("crates/cog-gateway/src/document_egress.rs", 1),
-    ("crates/cog-gateway/src/eval_reports.rs", 1),
-    ("crates/cog-gateway/src/evolution.rs", 2),
-    ("crates/cog-gateway/src/git_identity.rs", 2),
-    ("crates/cog-gateway/src/git_mirror.rs", 15),
-    ("crates/cog-gateway/src/git_routing.rs", 3),
-    ("crates/cog-gateway/src/github_app.rs", 2),
-    ("crates/cog-gateway/src/governance.rs", 3),
-    ("crates/cog-gateway/src/ide.rs", 10),
-    ("crates/cog-gateway/src/knowledge.rs", 1),
-    ("crates/cog-gateway/src/lib.rs", 2),
-    ("crates/cog-gateway/src/llm_admin.rs", 2),
-    ("crates/cog-gateway/src/memory.rs", 2),
-    ("crates/cog-gateway/src/observability.rs", 2),
-    ("crates/cog-gateway/src/output.rs", 2),
-    ("crates/cog-gateway/src/pace_reservations.rs", 2),
-    ("crates/cog-gateway/src/plugin.rs", 2),
-    ("crates/cog-gateway/src/process_reports.rs", 4),
-    ("crates/cog-gateway/src/project_control.rs", 1),
-    ("crates/cog-gateway/src/project_rate_limit.rs", 2),
-    ("crates/cog-gateway/src/projects.rs", 5),
-    ("crates/cog-gateway/src/readings.rs", 1),
-    ("crates/cog-gateway/src/scm.rs", 7),
-    ("crates/cog-gateway/src/security_gateway.rs", 18),
-    ("crates/cog-gateway/src/source_line.rs", 1),
-    ("crates/cog-gateway/src/task_ledger.rs", 2),
-    ("crates/cog-gateway/src/tasks.rs", 2),
-    ("crates/cog-gateway/src/usage_landing.rs", 2),
-    ("crates/cog-gateway/src/venues.rs", 1),
-    ("crates/cog-github/src/ci_refusals.rs", 1),
-    ("crates/cog-github/src/config.rs", 4),
-    ("crates/cog-github/src/conversation.rs", 1),
-    ("crates/cog-github/src/cross_validation.rs", 1),
-    ("crates/cog-github/src/discovery_loop.rs", 10),
-    ("crates/cog-github/src/landing.rs", 1),
-    ("crates/cog-github/src/plugin.rs", 1),
-    ("crates/cog-github/src/provider/github.rs", 3),
-    ("crates/cog-guardrail/src/content_filter.rs", 1),
-    ("crates/cog-llm/src/provider/mod.rs", 2),
-    ("crates/cog-llm/src/routing.rs", 1),
-    ("crates/cog-memory/src/bge_m3_sparse_linear.rs", 1),
-    ("crates/cog-memory/src/config.rs", 7),
-    ("crates/cog-memory/src/extractor.rs", 7),
-    ("crates/cog-memory/src/ingestor.rs", 1),
-    ("crates/cog-memory/src/maintenance.rs", 2),
-    ("crates/cog-memory/src/pg_summary_pool.rs", 2),
-    ("crates/cog-memory/src/vector_summary_backend.rs", 3),
-    ("crates/cog-net/src/config.rs", 2),
-    ("crates/cog-observability/src/alert_store.rs", 1),
-    ("crates/cog-observability/src/capability.rs", 3),
-    ("crates/cog-observability/src/claim_store.rs", 2),
-    ("crates/cog-observability/src/config.rs", 11),
-    ("crates/cog-observability/src/config_delivery.rs", 1),
-    ("crates/cog-observability/src/exchange_retention.rs", 3),
-    ("crates/cog-observability/src/host_ledger.rs", 1),
-    ("crates/cog-observability/src/image_store.rs", 2),
-    ("crates/cog-observability/src/infra_watch.rs", 2),
-    ("crates/cog-observability/src/llm_usage_rollup.rs", 5),
-    ("crates/cog-observability/src/lib.rs", 2),
-    ("crates/cog-observability/src/logs.rs", 1),
-    ("crates/cog-observability/src/plugin.rs", 3),
-    ("crates/cog-observability/src/probes.rs", 1),
-    ("crates/cog-observability/src/process_zombies.rs", 1),
-    ("crates/cog-observability/src/raw_stream.rs", 1),
-    ("crates/cog-observability/src/spend_verdict.rs", 4),
-    ("crates/cog-observability/src/usage_retention.rs", 3),
-    (
-        "crates/cog-orchestrator/src/action_planner/action_plan_orchestrator.rs",
-        3,
-    ),
-    (
-        "crates/cog-orchestrator/src/action_planner/roundtable.rs",
-        2,
-    ),
-    ("crates/cog-orchestrator/src/backup_runs.rs", 1),
-    ("crates/cog-orchestrator/src/change_ledger.rs", 28),
-    ("crates/cog-orchestrator/src/dag_executor/mod.rs", 5),
-    // 18 而不是 0：出厂策略表里的数原先写在 `fn defaults()` 的结构体字面量里，
-    // 两道门都不认这个形状（D5 只认 `fn default_*`，登记表只认 `const`）。给了
-    // 名字之后它们进册了——不是新增的界，是原先没被数上的界。
-    (
-        "crates/cog-orchestrator/src/dag_executor/retry_matrix.rs",
-        20,
-    ),
-    (
-        "crates/cog-orchestrator/src/dag_executor/orchestrator.rs",
-        3,
-    ),
-    (
-        "crates/cog-orchestrator/src/dag_executor/task_checkpoint.rs",
-        1,
-    ),
-    ("crates/cog-orchestrator/src/face_drift.rs", 1),
-    ("crates/cog-orchestrator/src/face_lifecycle.rs", 1),
-    ("crates/cog-orchestrator/src/face_staffing.rs", 1),
-    ("crates/cog-orchestrator/src/governance_acts.rs", 1),
-    ("crates/cog-orchestrator/src/lane_memory.rs", 2),
-    ("crates/cog-orchestrator/src/outward.rs", 6),
-    ("crates/cog-orchestrator/src/plugin.rs", 3),
-    ("crates/cog-orchestrator/src/principle_ledger.rs", 8),
-    ("crates/cog-orchestrator/src/ready_queue.rs", 2),
-    ("crates/cog-orchestrator/src/resource_ledger.rs", 4),
-    ("crates/cog-orchestrator/src/subscribe_backoff.rs", 1),
-    ("crates/cog-orchestrator/src/task_executor_router.rs", 6),
-    ("crates/cog-prompt/src/ab_test.rs", 1),
-    ("crates/cog-prompt/src/loader.rs", 1),
-    ("crates/cog-protocol/src/convert.rs", 1),
-    ("crates/cog-protocol/src/plugin.rs", 1),
-    ("crates/cog-quota/src/hierarchy.rs", 1),
-    ("crates/cog-reflection/src/auto_promoter.rs", 2),
-    ("crates/cog-reflection/src/baseline_port.rs", 1),
-    ("crates/cog-reflection/src/build_gate/mod.rs", 16),
-    ("crates/cog-reflection/src/build_rss_peak.rs", 3),
-    ("crates/cog-reflection/src/change_execution.rs", 3),
-    ("crates/cog-reflection/src/change_pipeline.rs", 10),
-    ("crates/cog-reflection/src/config.rs", 14),
-    ("crates/cog-reflection/src/evolution_build_readings.rs", 1),
-    ("crates/cog-reflection/src/firecracker.rs", 1),
-    ("crates/cog-reflection/src/gitops_puller.rs", 1),
-    ("crates/cog-reflection/src/image_rollout.rs", 1),
-    ("crates/cog-reflection/src/lib.rs", 6),
-    // 21 而不是 20：`CI_ASK_RETRY_DELAYS_MS` 是一张数组类型的阶梯，原先整行不进册。
-    // 表进册之后这一格才算进本文件——不是上限抬了，是漏数的一条被数上了。
-    ("crates/cog-reflection/src/mainline_deployer.rs", 22),
-    ("crates/cog-reflection/src/mainline_rollout.rs", 12),
-    ("crates/cog-reflection/src/meta_learning.rs", 1),
-    ("crates/cog-reflection/src/observability_stack.rs", 2),
-    ("crates/cog-reflection/src/platform_http.rs", 2),
-    ("crates/cog-reflection/src/plugin.rs", 3),
-    ("crates/cog-reflection/src/policy_evolution.rs", 1),
-    ("crates/cog-reflection/src/promotion_eval.rs", 3),
-    ("crates/cog-reflection/src/promotion_trend.rs", 4),
-    ("crates/cog-reflection/src/registry_footprint.rs", 2),
-    ("crates/cog-reflection/src/signal_watcher.rs", 6),
-    ("crates/cog-reflection/src/store_readouts.rs", 2),
-    ("crates/cog-reflection/src/volume_capacity.rs", 8),
-    ("crates/cog-reflection/src/workload_resources.rs", 14),
-    ("crates/cog-reflection/src/workspace.rs", 3),
-    ("crates/cog-storage/src/backends/file_trace_store.rs", 1),
-    ("crates/cog-storage/src/backends/object_backends.rs", 3),
-    ("crates/cog-storage/src/checkpoint_cap.rs", 2),
-    ("crates/cog-storage/src/metrics_retirement.rs", 2),
-    ("crates/cog-storage/src/metrics_sample_cap.rs", 2),
-    ("crates/cog-storage/src/observability_event_cap.rs", 4),
-    ("crates/cog-storage/src/partition_maintainer.rs", 2),
-    ("crates/cog-storage/src/plugin.rs", 3),
-    (
-        "crates/cog-storage/src/postgres/attempt_journal_store.rs",
-        2,
-    ),
-    ("crates/cog-storage/src/postgres/change_ledger_store.rs", 4),
-    ("crates/cog-storage/src/postgres/decision_stats_store.rs", 3),
-    ("crates/cog-storage/src/postgres/metrics_backend.rs", 4),
-    (
-        "crates/cog-storage/src/postgres/observability_gateway.rs",
-        5,
-    ),
-    (
-        "crates/cog-storage/src/postgres/principle_ledger_store.rs",
-        6,
-    ),
-    ("crates/cog-storage/src/postgres/resource_event_store.rs", 3),
-    ("crates/cog-storage/src/schema_ddl.rs", 4),
-    ("crates/cog-storage/src/task_event_retention.rs", 1),
-    ("crates/cog-storage/src/wal/mod.rs", 3),
-    ("crates/cog-stream/src/redis.rs", 2),
-    ("crates/cog-supervisor/src/alert_store.rs", 1),
-    ("crates/cog-supervisor/src/autonomous.rs", 3),
-    ("crates/cog-supervisor/src/behavior_monitor.rs", 1),
-    ("crates/cog-supervisor/src/event_aggregator.rs", 1),
-    ("crates/cog-supervisor/src/multi_backend_consumer.rs", 1),
-    ("crates/cog-supervisor/src/registry.rs", 2),
-    ("crates/cog-supervisor/src/supervisor.rs", 2),
-    ("crates/cog-supervisor/src/udp_heartbeat.rs", 2),
-    ("crates/cog-wiki/src/bounds.rs", 1),
-    ("crates/cog-wiki/src/distiller.rs", 3),
-    ("crates/cog-wiki/src/indexer.rs", 2),
-    ("crates/cog-wiki/src/unified_knowledge_backend.rs", 1),
-    ("crates/cogneva/src/aof_repair.rs", 2),
-    ("crates/cogneva/src/backup.rs", 7),
-    ("crates/cogneva/src/backup_crypto.rs", 4),
-    ("crates/cogneva/src/checkpoints.rs", 1),
-    ("crates/cogneva/src/conversation.rs", 14),
-    ("crates/cogneva/src/eval_container.rs", 1),
-    ("crates/cogneva/src/eval_mcp_in_pod.rs", 1),
-    ("crates/cogneva/src/eval_platform.rs", 4),
-    ("crates/cogneva/src/eval_table.rs", 3),
-    ("crates/cogneva/src/eval_toolathlon.rs", 3),
-    ("crates/cogneva/src/eval_toolathlon_local.rs", 2),
-    ("crates/cogneva/src/gateway_observability.rs", 2),
-    ("crates/cogneva/src/health_check.rs", 2),
-    ("crates/cogneva/src/owner_memory.rs", 2),
-    ("crates/cogneva/src/process_census.rs", 2),
-    ("crates/cogneva/src/process_report.rs", 2),
-    ("crates/cogneva/src/scraper_endpoint.rs", 1),
-    ("crates/cogneva/src/startup_guard.rs", 1),
-    ("crates/cogneva/src/work.rs", 6),
-    ("crates/cogneva/src/write_role.rs", 5),
-];
+/// 只读**今天还带着标记的那些文件**：这一笔把一个文件的最后一条标记删掉时，基线里
+/// 少掉的那一条只会让判词少印一句 STALE（欠债还清了，没有什么要红的），而少读
+/// 几百个文件省下的是每次跑这套测试都要付的那几秒。
+fn base_rows(root: &Path, current: &[Row]) -> Vec<Row> {
+    let rev = base_rev(root);
+    let files: std::collections::BTreeSet<&str> = current
+        .iter()
+        .filter(|row| !row.source.is_empty())
+        .map(|row| row.file.as_str())
+        .collect();
+    let mut rows = Vec::new();
+    for rel in files {
+        if let Some(text) = base_text(root, &rev, rel) {
+            rows.extend(production_rows(&text, rel));
+        }
+    }
+    rows.sort();
+    rows.dedup();
+    rows
+}
 
-/// Compare the tree against the rows: files over their row, and rows above what
-/// the file now carries.
+/// 每个文件答 `bound` 的条数。
+fn bound_counts(rows: &[Row]) -> BTreeMap<String, u64> {
+    let mut by_file: BTreeMap<String, u64> = BTreeMap::new();
+    for row in rows {
+        if Answer::parse(&row.source) == Some(Answer::Bound) {
+            *by_file.entry(row.file.clone()).or_default() += 1;
+        }
+    }
+    by_file
+}
+
+/// Compare the tree against the baseline: files over their count, and files below
+/// what the baseline holds.
 ///
-/// Separate from the test so the refusal can be pinned on a handful of rows: a
+/// Separate from the test so the refusal can be pinned on a handful of files: a
 /// rule that only reads the real tree cannot show that it would catch one file
 /// growing while another shrinks by the same amount, which is exactly the shape
 /// a total would call green.
 fn judge_bound_census(
     by_file: &BTreeMap<String, u64>,
-    pinned: &[(&str, u64)],
+    baseline: &BTreeMap<String, u64>,
 ) -> (Vec<String>, Vec<String>) {
-    let pinned: BTreeMap<&str, u64> = pinned.iter().copied().collect();
     let over: Vec<String> = by_file
         .iter()
         .filter_map(|(file, count)| {
-            let allowed = pinned.get(file.as_str()).copied().unwrap_or(0);
+            let allowed = baseline.get(file).copied().unwrap_or(0);
             (*count > allowed).then(|| format!("{file}: {count} > {allowed}"))
         })
         .collect();
-    let stale: Vec<String> = pinned
+    let stale: Vec<String> = baseline
         .iter()
         .filter_map(|(file, allowed)| {
-            let now = by_file.get(*file).copied().unwrap_or(0);
+            let now = by_file.get(file).copied().unwrap_or(0);
             (now < *allowed).then(|| format!("{file}: {now} < {allowed}"))
         })
         .collect();
@@ -945,25 +705,23 @@ fn judge_bound_census(
 fn the_uncheckable_bound_answer_only_comes_down() {
     let root = repo_root();
     let scanned = scan(&root, &production_sources(&root));
-    let mut by_file: BTreeMap<String, u64> = BTreeMap::new();
-    for row in scanned.iter().filter(|row| row.source == "bound") {
-        *by_file.entry(row.file.clone()).or_default() += 1;
-    }
+    let by_file = bound_counts(&scanned);
+    let baseline = bound_counts(&base_rows(&root, &scanned));
 
-    let (over, stale) = judge_bound_census(&by_file, BOUND_AT_CENSUS);
+    let (over, stale) = judge_bound_census(&by_file, &baseline);
 
     assert!(
         over.is_empty(),
-        "these files carry more `bound` constants than their row in BOUND_AT_CENSUS. \
-         `bound` is the one answer nothing checks, so the debt only comes down: name \
-         the agreement in a `fixed` line, or compute the value at run time from the \
-         setting or the reading it follows:\n{}",
+        "these files carry more `bound` constants than the base branch does. `bound` is \
+         the one answer nothing checks, so the debt only comes down: name the agreement \
+         in a `fixed` line, or compute the value at run time from the setting or the \
+         reading it follows:\n{}",
         over.join("\n")
     );
     if !stale.is_empty() {
         eprintln!(
-            "STALE: these files carry fewer `bound` constants than their row; lower the \
-             row to the number shown:\n{}",
+            "STALE: these files carry fewer `bound` constants than the base branch; that \
+             is a repaid debt, not a refusal:\n{}",
             stale.join("\n")
         );
     }
@@ -971,17 +729,20 @@ fn the_uncheckable_bound_answer_only_comes_down() {
 
 /// A file that grows while another shrinks is red, even when the two cancel out.
 ///
-/// This is the shape a total would read as green, and the reason the rows are
+/// This is the shape a total would read as green, and the reason the counts are
 /// per file. The shrinking file is also the half that must not red: a repaid
-/// debt prints STALE -- the row is a reading, not a quota.
+/// debt prints STALE -- a baseline is a reading, not a quota.
 #[test]
 fn the_bound_ratchet_counts_per_file_not_in_total() {
     let by_file = BTreeMap::from([
         ("crates/a/src/one.rs".to_string(), 1),
         ("crates/b/src/two.rs".to_string(), 1),
     ]);
-    let pinned = [("crates/a/src/one.rs", 2), ("crates/b/src/two.rs", 0)];
-    let (over, stale) = judge_bound_census(&by_file, &pinned);
+    let baseline = BTreeMap::from([
+        ("crates/a/src/one.rs".to_string(), 2),
+        ("crates/b/src/two.rs".to_string(), 0),
+    ]);
+    let (over, stale) = judge_bound_census(&by_file, &baseline);
     assert_eq!(
         over,
         vec!["crates/b/src/two.rs: 1 > 0".to_string()],
@@ -992,6 +753,63 @@ fn the_bound_ratchet_counts_per_file_not_in_total() {
         vec!["crates/a/src/one.rs: 1 < 2".to_string()],
         "a repaid debt is a stale row to lower, not a refusal"
     );
+}
+
+/// 基线跟着基分支走，不是跟着这棵树走。
+///
+/// 用一棵自己的仓钉住这件事：`refs/remotes/origin/main` 指向旧提交，工作分支再往前
+/// 走一笔，[`base_text`] 读到的仍是基分支上那一份；把基分支挪到新提交，同一个问题
+/// 就换一个答案。这是这条判据的「换输入 ⇒ 值跟着变」——一张写在本文件里的表两个
+/// 方向都做不到：它既不会因为基分支前进而变，也不会因为这一笔多写一条而变。
+#[test]
+fn the_baseline_follows_the_base_branch_not_the_tree() {
+    let root = std::env::temp_dir().join(format!("cog-base-tree-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("crates/probe/src")).unwrap();
+    let rel = "crates/probe/src/probe.rs";
+    let write = |body: &str| std::fs::write(root.join(rel), body).unwrap();
+    let git = |args: &[&str]| -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(&root)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let bounds_in = |rev: &str| -> u64 {
+        let text = base_text(&root, rev, rel).expect("the file is on the base branch");
+        *bound_counts(&production_rows(&text, rel))
+            .get(rel)
+            .unwrap_or(&0)
+    };
+
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "gate@example.invalid"]);
+    git(&["config", "user.name", "gate"]);
+    write("// cap: bound — 一条\nconst ONE: u64 = 1;\n");
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "one bound"]);
+    let first = git(&["rev-parse", "HEAD"]);
+    git(&["update-ref", "refs/remotes/origin/main", &first]);
+
+    // 工作分支往前走一笔：多一条 `bound`。基线不动。
+    write(
+        "// cap: bound — 一条\nconst ONE: u64 = 1;\n\n// cap: bound — 又一条\nconst TWO: u64 = 2;\n",
+    );
+    git(&["commit", "-q", "-am", "two bounds"]);
+    assert_eq!(base_rev(&root), first, "基分支还停在旧提交上");
+    assert_eq!(bounds_in(&base_rev(&root)), 1, "基线读的是基分支那一份");
+
+    // 基分支前进之后，同一个问题的答案跟着变。
+    let head = git(&["rev-parse", "HEAD"]);
+    git(&["update-ref", "refs/remotes/origin/main", &head]);
+    assert_eq!(bounds_in(&base_rev(&root)), 2, "基分支挪了，基线跟着挪");
+    std::fs::remove_dir_all(&root).ok();
 }
 
 /// The refusal this census exists for, pinned on a tree written for the purpose.
@@ -1020,8 +838,7 @@ pub const PROSE_ONLY: usize = 256;
 // cap: bound
 pub const A_LABEL: usize = 8;
 
-// cap: fixed — 一小时：值得归因的构建跑几十分钟，更短会把一次构建显示成一串小的
-// keep: 删掉后回到「一小时：值得归因的构建跑几十分钟，更短会把一次构建显示成一串小的」所描述的情形；由这条约定兜住
+// cap: bound — 一小时：值得归因的构建跑几十分钟，更短会把一次构建显示成一串小的
 pub const EXPLAINED: usize = 3600;
 
 pub const UNMARKED: usize = 4;
@@ -1068,7 +885,7 @@ pub const FOLLOWS_A_READING: usize = 16;
         "a marker with no reason on it went unreported, either because the prose \
          above counted as one or because the marker was never read"
     );
-    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
+    std::fs::remove_dir_all(&root).ok();
 }
 
 /// The scan's two easy failures both read as green, so both are pinned: a scan
@@ -1137,7 +954,7 @@ const PLAIN: u64 = 30;
     assert_eq!(value_of("BARE").as_deref(), Some("7s"));
     assert_eq!(value_of("QUALIFIED").as_deref(), Some("250ms"));
     assert_eq!(value_of("PLAIN").as_deref(), Some("30"));
-    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
+    std::fs::remove_dir_all(&root).ok();
 }
 
 /// A multiplier, an offset or a unit conversion inside the initializer is a
@@ -1176,7 +993,7 @@ const SAME: u64 = OTHER;
     );
     assert_eq!(value_of("UNITS").as_deref(), Some("NAMES.len() + 1"));
     assert_eq!(value_of("SAME"), None);
-    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
+    std::fs::remove_dir_all(&root).ok();
 }
 
 /// A constant declared after an inline test module is production, and the scan
@@ -1217,7 +1034,7 @@ const AFTER: u64 = 45;
         .map(|row| row.name)
         .collect();
     assert_eq!(names, vec!["AFTER".to_string(), "BEFORE".to_string()]);
-    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
+    std::fs::remove_dir_all(&root).ok();
 }
 
 /// 一张数字表也是常量，也必须有判词——它不能借「类型不是标量」这件事溜出登记表。
@@ -1366,7 +1183,6 @@ fn the_array_guard_names_the_table_and_not_the_word_list() {
     std::fs::create_dir_all(&src).unwrap();
     let fixture = r#"
 // cap: fixed — 夹具：这一行的判词属于它下面那张表
-// keep: 删掉后回到「夹具：这一行的判词属于它下面那张表」所描述的情形；由这条约定兜住
 const RUNGS: [u64; 3] = [
     100,
     200,
@@ -1402,10 +1218,10 @@ mod tests {
     let rows = production_rows(fixture, "ladder.rs");
     let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
     assert_eq!(names, vec!["RUNGS", "SLICE", "ONE"]);
-    assert_eq!(rows[0].source, "fixed");
+    assert_eq!(Answer::parse(&rows[0].source), Some(Answer::Fixed));
     assert!(rows[0].note.starts_with("夹具"));
     assert_eq!(rows[1].source, "");
-    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
+    std::fs::remove_dir_all(&root).ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -1991,34 +1807,8 @@ fn below_the_module() -> Duration {
         "a test or fixture file was counted as production hardcoding: {:?}",
         scanned.keys().collect::<Vec<_>>()
     );
-    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
+    std::fs::remove_dir_all(&root).ok();
 }
-
-/// 界形的常量不许标成 `fixed`。
-///
-/// 常量的词表只有两个词：`bound`（被某个事实钉住，理由说明是什么钉的）与
-/// `fixed`（不是旋钮，是一项约定，比如协议端口）。而一个名字就是界形的常量
-/// ——`MAX_*`、`MIN_*`、`*_LIMIT`、`*_RETRY`、`*_TIMEOUT`、`*_CAP`——既不是协议常数，
-/// 也不是"量出来的"：它是一条把未发生的事拦在外面的规则。
-///
-/// 这种数的合法归宿与图里那张表一样：**被一条读数导出，或者不存在**。名单是
-/// 2026-11-16 的读数，**只减不增**：新提出一条界形常量标 `fixed` 就是红。
-const BOUND_SHAPED_FIXED_AT_CENSUS: &[&str] = &[
-    "MAX_RECOVERED_RETRY_AFTER_SECS",
-    "DEFAULT_MAX_CONTEXT_TOKENS",
-    "MAX_KEY_LEN",
-    "MAX_INBOUND_FRAME_BYTES",
-    "MAX_UTF8_BYTES_PER_CHAR",
-    "PUSH_RETRY_CEILING_SECONDS",
-    "PUSH_RETRY_SECONDS",
-    "PUSH_TIMEOUT_SECS",
-    "SUSPECT_BACKOFF_CAP_SECS",
-    "MAX_ATTACHMENT_BYTES",
-    "MAX_LENGTH",
-    "MIN_INTERVAL_SECS",
-    "MIN_REPLICAS",
-    "MAX_CHARS",
-];
 
 /// 名字里出现这些片段，就算界形。按 `_` 分隔的**整段**比，不按裸子串：
 /// `SECONDS_PER_MINUTE` 里的 `MINUTE` 是分钟这个单位，不是「下界」；
@@ -2046,22 +1836,38 @@ fn is_bound_shaped(name: &str) -> bool {
         .any(|segment| BOUND_SHAPED_NAME_PARTS.contains(&segment))
 }
 
+/// 界形的常量不许标成 `fixed`。
+///
+/// 常量的词表只有两个词：`bound`（被某个事实钉住，理由说明是什么钉的）与
+/// `fixed`（不是旋钮，是一项约定，比如协议端口）。而一个名字就是界形的常量
+/// ——`MAX_*`、`MIN_*`、`*_LIMIT`、`*_RETRY`、`*_TIMEOUT`、`*_CAP`——既不是协议常数，
+/// 也不是"量出来的"：它是一条把未发生的事拦在外面的规则。
+///
+/// 这种数的合法归宿与图里那张表一样：**被一条读数导出，或者不存在**。豁免的名额
+/// 不在这个文件里，而在基准分支上——基线是「这一笔之前就有哪些界形常量标着
+/// `fixed`」，由 [`base_rows`] 现量；新提出一条就是红，把旧的那条还清（改成
+/// `bound` 或删掉）它就自己从基线里消失，不需要谁来删一行。
 #[test]
 fn a_bound_shaped_constant_is_never_fixed() {
     let root = repo_root();
     let scanned = scan(&root, &production_sources(&root));
     let flagged: Vec<String> = scanned
         .iter()
-        .filter(|row| row.source == "fixed")
+        .filter(|row| Answer::parse(&row.source) == Some(Answer::Fixed))
         .filter(|row| is_bound_shaped(&row.name))
         .map(|row| format!("{} {} = {}", row.file, row.name, row.value))
         .collect();
-    let known: std::collections::BTreeSet<&str> =
-        BOUND_SHAPED_FIXED_AT_CENSUS.iter().copied().collect();
+    let known: std::collections::BTreeSet<String> = base_rows(&root, &scanned)
+        .iter()
+        .filter(|row| {
+            Answer::parse(&row.source) == Some(Answer::Fixed) && is_bound_shaped(&row.name)
+        })
+        .map(|row| row.name.clone())
+        .collect();
     let new: Vec<&String> = flagged
         .iter()
         .filter(|line| {
-            let name = line.split_whitespace().nth(1).unwrap_or(Default::default());
+            let name = line.split_whitespace().nth(1).unwrap_or_default();
             !known.contains(name)
         })
         .collect();

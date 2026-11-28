@@ -146,18 +146,11 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             );
             None
         } else {
-            let client = Arc::new(
-                crate::logs::LokiPushClient::new(&observability.loki.endpoint)
-                    .with_max_retries(observability.loki.max_retries.max(1))
-                    .with_timeout(observability.loki.timeout_secs)
-                    .with_label(crate::LABEL_SERVICE, &loki_service)
-                    .with_client(http_client.clone()),
+            let (client, pusher) = crate::logs::client_and_pusher(
+                &observability.loki,
+                http_client.clone(),
+                &loki_service,
             );
-            let pusher = Arc::new(crate::logs::LokiBackgroundPusher::new(
-                client.clone(),
-                std::time::Duration::from_secs(observability.loki.flush_interval_sec.max(1)),
-                observability.loki.max_batch_size.max(1),
-            ));
             // Same sink the ClickHouse buffer below takes: this plugin's init
             // runs after the storage plugin has published the backend, so the
             // handle is here and the pusher can report a batch it could not

@@ -306,8 +306,41 @@ impl MemoryConfig {
             Err(e) => return Err(SFError::Config(format!("{}: {e}", path.display()))),
         };
         cog_core::config::apply_env_paths(&mut section, MEMORY_ENV);
-        serde_json::from_value(section)
-            .map_err(|e| SFError::Config(format!("{} memory: {e}", path.display())))
+        let config: Self = serde_json::from_value(section)
+            .map_err(|e| SFError::Config(format!("{} memory: {e}", path.display())))?;
+        config.ingest.refuse_zero_pull_gate()?;
+        Ok(config)
+    }
+}
+
+impl IngestConfig {
+    /// 拉取闸门的四个输入都是「一个有长度的窗口 / 一段有内容的间隔」：
+    /// 0 次失败之后的暂停、0 秒长的暂停、0 秒的封顶、0 秒的检查间隔，都不是
+    /// 同一件事的极端写法，而是没有意义的值。此前 `PullGate::new` 把四个都
+    /// `.max(1)`，声明的 0 被悄悄换成一个别的数，配置面读到的却不是生效值。
+    /// 改成在这一层（声明进入的地方）按字段名拒绝。
+    fn refuse_zero_pull_gate(&self) -> SFResult<()> {
+        let zero = [
+            (
+                "memory.ingest.pull_pause_after_failures",
+                self.pull_pause_after_failures == 0,
+            ),
+            (
+                "memory.ingest.pull_pause_initial_secs",
+                self.pull_pause_initial_secs == 0,
+            ),
+            (
+                "memory.ingest.pull_pause_max_secs",
+                self.pull_pause_max_secs == 0,
+            ),
+            ("memory.ingest.pool_check_secs", self.pool_check_secs == 0),
+        ];
+        if let Some((name, _)) = zero.iter().find(|(_, is_zero)| *is_zero) {
+            return Err(SFError::Config(format!(
+                "{name} 声明为 0：拉取闸门要一个长度才能判「暂停多久」或「隔多久看一眼」，0 不是这个长度的极端值。要关掉暂停请改配置语义，不要写 0。"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -375,6 +408,45 @@ mod tests {
             bare.is_empty(),
             "这两个字段不该各自写一个数，要读 INGEST_BATCH：{bare:?}"
         );
+    }
+
+    /// 拉取闸门的四格：声明的值原样生效，0 在加载时按字段名拒绝。
+    ///
+    /// 没有这条测试，`.max(1)` 回来时没人会红：声明的 0 会被悄悄换成 1，而
+    /// 配置面读到的仍然像生效值。
+    #[test]
+    fn a_declared_pull_gate_survives_and_zero_is_refused() {
+        let dir = std::env::temp_dir().join(format!("cog-mem-pull-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cogneva.json");
+
+        std::fs::write(
+            &path,
+            r#"{"memory": {"enabled": true, "ingest": {"pull_pause_initial_secs": 90, "pool_check_secs": 5}}}"#,
+        )
+        .unwrap();
+        let cfg = MemoryConfig::load_from(&path).unwrap();
+        assert_eq!(cfg.ingest.pull_pause_initial_secs, 90);
+        assert_eq!(cfg.ingest.pool_check_secs, 5);
+
+        for field in [
+            "pull_pause_after_failures",
+            "pull_pause_initial_secs",
+            "pull_pause_max_secs",
+            "pool_check_secs",
+        ] {
+            std::fs::write(
+                &path,
+                format!(r#"{{"memory": {{"ingest": {{"{field}": 0}}}}}}"#),
+            )
+            .unwrap();
+            let err = MemoryConfig::load_from(&path).unwrap_err().to_string();
+            assert!(
+                err.contains(field),
+                "{field} 声明 0 的错误要点名这个字段，实际是：{err}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// `Default` 里其余几条具名常量也要真的被读到：常量与默认值相等，改常量就

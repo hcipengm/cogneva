@@ -1573,7 +1573,7 @@ async fn wait_for_job(
     job_name: &str,
     config: &ChangeJobConfig,
 ) -> SFResult<()> {
-    let interval = Duration::from_secs(config.poll_interval_secs.max(1));
+    let interval = Duration::from_secs(config.poll_interval_secs);
     let deadline =
         tokio::time::Instant::now() + Duration::from_secs(config.deadline_secs + WAIT_MARGIN_SECS);
     loop {

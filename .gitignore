@@ -25,6 +25,14 @@ cogneva.json
 # Exception: the Helm chart ships its default cogneva.json via .Files.Get
 !deploy/helm/cogneva/files/cogneva.json
 
+# Rendered deploy trees are derived, not source: chart + profiles + the renderer
+# fully decide them, and every reader generates them at read time through
+# deploy/scripts/lib/rendered-cache.sh. Nothing to keep in sync with the chart.
+deploy/rendered/
+deploy/.rendered.lock
+deploy/.rendered.tmp.*
+deploy/.rendered.old.*
+
 # Bootstrap runtime artifacts (machine-specific, never commit)
 intent_config.yaml
 management_plan.yaml
@@ -41,3 +49,7 @@ evolution-patches/
 deploy/.rendered.lock
 
 __pycache__/
+
+# Per-checkout Claude Code settings: a hook that only this working copy wants
+# is not part of what the repository ships.
+.claude/

@@ -37,8 +37,8 @@ storage:
 # 还有两项曾经写在这里、现在都不写了：
 #   - 节点数：DaemonSet 逐节点铺开后有几分 Pod 必须计入额度，而这不是任何一份清单
 #     能说出来的。投影器在**渲染宿主**上从 live cluster 读节点数，并把它记进生成
-#     文件的首部（`# topology-nodes: N`）；`render-deploy.sh --check` 在 CI 上没有
-#     集群，就按生成文件记录的拓扑重算，所以漂移判据仍在，而数不再是手写的。
+#     文件的首部（`# topology-nodes: N`）；离线渲染（`render-deploy.sh --out`，CI 与
+#     构建期用的就是它）没有集群，就按生成文件记录的拓扑重算，所以数不再是手写的。
 #   - 运行期自建 Pod 的形状：产品创建的评测 Pod 与宿主创建的注册评测补跑 Pod，都在
 #     创建前按自己那份清单把额度抬到装得下、结束后放回去。形状的唯一来源是建它
 #     的那份代码，这里再写一遍就是第二处声明，而 2026-10-26 的实测显示它漂起来时
@@ -531,9 +531,14 @@ gateway:
   # 若下一代仍贴住这一档，说明增长没有界，那时候要查的是权重共享（dense 与
   # sparse 两个 session 各装一份同一份权重文件）或泄漏，而不是再抬一次天花板。
   #
-  # requests 6Gi：request 声明的是调度器为这个 Pod 预留多少，而实测暖机后的稳态
-  # 实测就在 6.46GiB 上下——低于它等于把本 Pod 排到节点压力的第一个驱逐位。这次抬完命名
-  # 空间 requests 合计约等于稳态之和，仍在节点可分配量与配额之内（见投影产物）。
+  # requests 是种子，不是稳态声明。这张表不描述任何一台机器（同一份 values 会被排到
+  # 单节点、多节点、别人的集群上），所以写进 request 的数只能是与机器无关的量；而
+  # 6.46GiB 这份稳态恰恰是在一台机器上量出来的。实测 2026-11-24：6Gi 的种子在一台
+  # allocatable 5.55GiB 的节点上让新副本一直 Pending，而把 request 写回实测值的正是
+  # 那条按 p95 回写的闭环——闭环要靠 Pod 跑起来才拿得到样本。种子写大了，纠正它的
+  # 那条环永远启动不了。所以种子取闭环自己的量化格（`MEMORY_QUANTUM_BYTES`，默认 16Mi）：
+  # 它是这条律能从种子上动起来的最小一步，也是任何节点都排得下的最小声明。稳态由闭环
+  # 按 p95 写回，天花板由 limits 兜住（见上）。
   resources:
     requests:
       # tunable:
@@ -553,9 +558,12 @@ gateway:
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
+      # why: The declared seed is the loop's own quantum (`MEMORY_QUANTUM_BYTES`), not a footprint: this
+      # why: chart sees no node, and a seed above a node's allocatable leaves the pod Pending -- the loop that
+      # why: would replace the seed with the measured p95 then never gets its first sample (live: 2026-11-24).
       # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_MEMORY_METRIC label=source cadence=periodic
       # proof: file=crates/cog-reflection/src/workload_resources.rs test=a_request_follows_the_measured_draw beat=the_evaluation_counter_keeps_time_when_the_target_does_not_move evidence=evaluations
-      memory: 6Gi
+      memory: 16Mi
     limits:
       # tunable:
       # why: The CPU bound rises with the measured draw and never falls below this declared value: the loop
@@ -3029,9 +3037,12 @@ gitops:
   kubectlBin:
     enabled: false
     hostPath: /usr/local/bin/k3s
-  # 部署准入条件里的 chart 渲染 / parity 在进化 Pod 内跑，需要 helm。与 kubectl
-  # 同一条思路：挂宿主已有的二进制，版本由宿主管、镜像不背一个下载器；宿主没装
-  # 时置 false，这一族就没有可执行的渲染检查（变更会被点名缺条件，不会转人工）。
+  # 部署准入条件里的 chart 渲染 / parity 在进化 Pod 内跑，需要 helm；主线落地端也
+  # 在这里按 rev 现场渲染发布集（渲染产物不进仓），没有 helm 就落不了新 rev。运行
+  # 镜像自带一把钉住版本的 helm（版本读自引导器的 HELM_VERSION），默认就不挂宿主
+  # 二进制——宿主那把由 bootstrap 按需装、装上后不再升级，让它遮住镜像里那把会把
+  # 「现场渲出来的字节」交给一个没人钉的版本。只有在宿主必须提供 helm（镜像不是本仓
+  # 构建的）时才把这一项打开并给 hostPath。
   helmBin:
     enabled: false
     hostPath: /usr/local/bin/helm
@@ -3334,7 +3345,8 @@ changeLedger:
   # 验证的尝试，落地了就成为新证据）；**因工作本身被退回的最小条数 - 1** 给界封
   # 顶，退回的证据 30 天后过期（换模型/抬输出预算没有事件可订阅，旧证据不该永久
   # 钉住界）。低于已落地条数的退回不封顶——那说明问题不在批大小。还没有任何批次
-  # 落地时用 5 作起点。界写回 `cogneva_change_ledger_rows_per_handover` 并带
+  # 落地时界停在「能称为批次的最小条数」（2 条），每落地一次涨一条。界写回
+  # `cogneva_change_ledger_rows_per_handover` 并带
   # `source` 标签，每一拍记一次
   # `cogneva_change_ledger_rows_per_handover_evaluations_total`：界不动时，
   # 只有这条计数能说明回路还在算。正数仍是覆盖位（钉死它，读数面就报这个数）。
@@ -3351,8 +3363,9 @@ changeLedger:
   # why: batch a generation refused for the work's own reason caps the bound one below its size, so a refused
   # why: shape is not repeated while the evidence is younger than 30 days; a refusal below what has already
   # why: landed caps nothing, because the proven size still works. A refusal paid to the environment is the
-  # why: pool's answer and moves nothing. While no batch bigger than the seed has completed, the seed (5)
-  # why: stands. The pass writes the bound and its `source` to `cogneva_change_ledger_rows_per_handover` and
+  # why: pool's answer and moves nothing. While no batch has landed the bound stands at the smallest batch the
+  # why: reading can see (2), and each landing argues for one row more. The pass writes the bound and its
+  # why: `source` to `cogneva_change_ledger_rows_per_handover` and
   # why: counts every recomputation on `cogneva_change_ledger_rows_per_handover_evaluations_total`, because a
   # why: bound that only moves with its inputs cannot show that the loop behind it is still running. The
   # why: deployment's 0 means derive; a positive number pins the batch and is reported as `override`.

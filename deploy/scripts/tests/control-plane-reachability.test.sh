@@ -44,6 +44,10 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${here}/../../.." && pwd)"
+# 基线是真树的渲染产物，而产物不进仓：读之前现场生成。生成不出来是「跑不了」
+# （exit 2），不是这一条规则红了。
+bash "${here}/../lib/rendered-cache.sh" --ensure "${repo}" \
+    || { echo "真树的渲染产物生成失败：deploy/rendered" >&2; exit 2; }
 gate="${repo}/deploy/scripts/check-control-plane-reachability.sh"
 fail() { echo "FAIL: $*"; exit 1; }
 

@@ -73,28 +73,36 @@ impl SupervisorPlugin {
     /// gate and a Redis URL (the gateway publishes the pool snapshot there);
     /// without Redis this is a single-process deployment, so the loop is not
     /// started and the gate stays under operator control only.
-    fn spawn_llm_pool_guard(&self, ctx: &cog_core::PluginContext) {
+    fn spawn_llm_pool_guard(&self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
         let (Some(gate), Some(source)) = (self.scheduler_gate.clone(), self.pool_source.clone())
         else {
-            return;
+            return Ok(());
         };
         let Some(event_tx) =
             ctx.consume::<tokio::sync::broadcast::Sender<cog_core::SupervisorEvent>>()
         else {
             warn!("LLM pool guard disabled: no SupervisorEvent sender published");
-            return;
+            return Ok(());
         };
         let interval_secs = std::env::var(cog_core::env::LLM_POOL_CHECK_SECS)
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(30)
-            .max(5);
+            .unwrap_or(30);
+        // 声明的节拍原样生效：0 秒是忙等不是节拍，按名字拒绝；与网关读同一个
+        // env 名的那个循环同一条口径——两处不再各抬一次（从前是 5 秒）。
+        if interval_secs == 0 {
+            return Err(cog_core::SFError::Config(format!(
+                "{} 声明为 0 秒：那是忙等，不是一个节拍。给它一个周期。",
+                cog_core::env::LLM_POOL_CHECK_SECS
+            )));
+        }
         let guard = Arc::new(crate::llm_pool_guard::LlmPoolGuard::new(source, gate));
         guard.spawn(
             (*event_tx).clone(),
             std::time::Duration::from_secs(interval_secs),
         );
         info!(interval_secs, "LLM pool guard started");
+        Ok(())
     }
 }
 
@@ -295,7 +303,7 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
         // ── LLM upstream pool awareness ──
         // Pool health is owned by the security gateway; this loop reads its
         // cross-process snapshot and pauses only the LLM-dependent class.
-        self.spawn_llm_pool_guard(ctx);
+        self.spawn_llm_pool_guard(ctx)?;
 
         // ── Multi-backend consumer ──
         let mbc = ctx.config().multi_backend_consumer.clone();

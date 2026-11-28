@@ -922,12 +922,23 @@ impl TaskExecutorRouter {
         let Ok(task) = serde_json::from_slice::<Task>(bytes) else {
             return false;
         };
-        let cannot_run = match orch.get_task(&task.id).await {
-            None => true,
-            Some(row) => matches!(
+        let cannot_run = match orch.get_task_checked(&task.id).await {
+            Ok(None) => true,
+            Ok(Some(row)) => matches!(
                 row.status,
                 TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
             ),
+            // 读不到不是「不能跑」：ack 掉就再也重投不回来了。这一条留给下一轮，
+            // 让一次读失败不至于把一条活任务丢掉（CC24）。
+            Err(e) => {
+                tracing::warn!(
+                    task_id = %task.id,
+                    msg_id = %msg_id,
+                    error = %e,
+                    "could not read what became of this ready message's task; leaving it to be redelivered"
+                );
+                return false;
+            }
         };
         if !cannot_run {
             return false;

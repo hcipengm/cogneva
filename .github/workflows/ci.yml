@@ -32,6 +32,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # 编译这棵树就要渲染它：bootstrap 的构建脚本把部署清单从 chart 现场生成后
+      # 打进二进制（产物不进仓），`cargo check` 也会跑那个构建脚本。版本从引导器
+      # 的 HELM_VERSION 读——渲染字节随 helm 版本漂，两边各挑一个版本就会在不相关
+      # 的地方红。
+      - name: Resolve pinned Helm version
+        id: helmver
+        run: |
+          v=$(grep -oP 'const HELM_VERSION: &str = "\K[^"]+' crates/bootstrap/src/main.rs)
+          [ -n "$v" ] || { echo "未从 crates/bootstrap/src/main.rs 读到 HELM_VERSION"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ steps.helmver.outputs.version }}
+      - name: Install pyyaml
+        run: sudo apt-get update && sudo apt-get install -y python3-yaml
       # --all-targets: this job's verdict is the one a person or a script can read
       # without a token, so it has to be able to go red for the failures the
       # token-only jobs would otherwise be alone in reporting. A library-only
@@ -85,6 +100,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # 这棵树的两处构建期事实都要 helm：bootstrap 的构建脚本从 chart 现场生成
+      # 部署清单（产物不进仓），而读渲染产物的契约测试在读的那一刻生成同一棵树。
+      # 版本从引导器的 HELM_VERSION 读，不在 CI 里另抄一份。
+      - name: Resolve pinned Helm version
+        id: helmver
+        run: |
+          v=$(grep -oP 'const HELM_VERSION: &str = "\K[^"]+' crates/bootstrap/src/main.rs)
+          [ -n "$v" ] || { echo "未从 crates/bootstrap/src/main.rs 读到 HELM_VERSION"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ steps.helmver.outputs.version }}
+      - name: Install pyyaml
+        run: sudo apt-get update && sudo apt-get install -y python3-yaml
       # A red run has to name the test that broke. The job log is behind a
       # token, so without one all that is readable -- by a person or by anything
       # that reads CI status programmatically -- is "the suite failed", which is
@@ -216,6 +245,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # 与 check 同一个理由：clippy 也跑 bootstrap 的构建脚本，而那一步要 helm。
+      - name: Resolve pinned Helm version
+        id: helmver
+        run: |
+          v=$(grep -oP 'const HELM_VERSION: &str = "\K[^"]+' crates/bootstrap/src/main.rs)
+          [ -n "$v" ] || { echo "未从 crates/bootstrap/src/main.rs 读到 HELM_VERSION"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ steps.helmver.outputs.version }}
+      - name: Install pyyaml
+        run: sudo apt-get update && sudo apt-get install -y python3-yaml
       # `--keep-going` is what makes one red run list every offending crate. Without
       # it the build halts at the first crate that fails, so a toolchain bump that
       # adds a lint to two unrelated crates costs one push per crate, and the tree
@@ -259,6 +300,16 @@ jobs:
         run: python3 deploy/scripts/check-manifest-duplicate-keys.py
       - name: Check the duplicate-key gate rejects what it should
         run: bash deploy/scripts/tests/manifest-duplicate-keys.test.sh
+      # 767KB 的 `cogneva-json` ConfigMap 走 client-side apply 会被 256KiB 的
+      # last-applied 注解上限拒掉，换版停在「应用主部署结构」这一步（实测 2026-11-24）。
+      # 判据：换版脚本 apply 这一份时必须带 --server-side，且这一步不许整个消失。
+      - name: Check the big ConfigMap is applied server-side
+        run: bash deploy/scripts/tests/big-configmap-applies-server-side.test.sh
+      # StatefulSet 的 `spec.volumeClaimTemplates` 不可变：整份 apply 一份由 chart 建出来
+      # 的对象会被 apiserver 以 `field is immutable` 拒收，换版停在这一步（实测 2026-11-25）。
+      # 判据：换版脚本对这一份先判存在性，在则只 patch Pod 模板。
+      - name: Check the executor StatefulSet is patched, not re-applied
+        run: bash deploy/scripts/tests/executor-statefulset-is-patched-not-reapplied.test.sh
       # 批次纪律那四道门各自的判据，在 CI 与本机跑同一份夹具：本机绿而 CI 红过一次
       # （或者反过来），说明判据在两边不是同一条。
       - name: Check the compile-discipline gate judges what it claims
@@ -688,11 +739,11 @@ jobs:
       #
       # `if:` for the same reason as the script-test step below, measured on the
       # other side of it: when an earlier step fails these get skipped, helm is
-      # then whatever the runner image happens to carry, and the freshness gate
-      # reports the committed manifests as stale -- telling the author to
-      # re-render, which would rewrite the whole tree in that foreign helm's
-      # shape. A skipped setup does not read as "no helm"; it reads as a render
-      # disagreement.
+      # then whatever the runner image happens to carry, and the gates render
+      # the chart with that foreign helm -- parity then reports the static
+      # manifests as drifted by block-scalar whitespace, somewhere unrelated to
+      # the change. A skipped setup does not read as "no helm"; it reads as a
+      # render disagreement.
       - name: Resolve pinned Helm version
         id: helmver
         if: ${{ !cancelled() }}
@@ -781,6 +832,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # 与 test 同一个理由：这一格跑的是同一套用例，构建期渲染与读渲染产物的
+      # 测试都要 helm。
+      - name: Resolve pinned Helm version
+        id: helmver
+        run: |
+          v=$(grep -oP 'const HELM_VERSION: &str = "\K[^"]+' crates/bootstrap/src/main.rs)
+          [ -n "$v" ] || { echo "未从 crates/bootstrap/src/main.rs 读到 HELM_VERSION"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ steps.helmver.outputs.version }}
+      - name: Install pyyaml
+        run: sudo apt-get update && sudo apt-get install -y python3-yaml
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       # 审计 1.4：--fail-under-lines 基线阈值防退化，只升不降。
@@ -845,11 +909,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # 新鲜度门禁是**字节级**比对（重渲染后 diff 已提交产物），而 helm 各版本
-      # 渲染块标量的尾随空白不同：放任 setup-helm 取 latest，一次取不到就静默
-      # 回落它内置的默认版本（实测 3.18.4 与 4.x 在这份 chart 上产出不同字节），
-      # 门禁会在与代码无关的地方红。版本从引导器的 HELM_VERSION 读——安装期就是
-      # 用它下载 helm 的，不在这里再抄一份。
+      # 这条 job 下的门吃的都是**渲染字节**（parity、静态清单回写、各处按目录读
+      # profile 的判据），而 helm 各版本渲染块标量的尾随空白不同：放任 setup-helm
+      # 取 latest，一次取不到就静默回落它内置的默认版本（实测 3.18.4 与 4.x 在这份
+      # chart 上产出不同字节），门禁会在与代码无关的地方红。版本从引导器的
+      # HELM_VERSION 读——安装期就是用它下载 helm 的，不在这里再抄一份。
       - name: Resolve pinned Helm version
         id: helmver
         run: |
@@ -875,8 +939,10 @@ jobs:
           promtool --version
       - name: Check helm/kustomize parity
         run: bash deploy/scripts/check-deploy-parity.sh
-      - name: Check rendered profiles are fresh
-        run: bash deploy/scripts/render-deploy.sh --check
+      # 渲染产物不进仓：这条门判两件事——仓里没有它们，而每个 profile 此刻都
+      # 从 chart 渲染得出来。没有「已提交的产物」可以比，所以没有新鲜度这一说。
+      - name: Check rendered trees are generated, not committed
+        run: bash deploy/scripts/check-rendered-trees.sh
       # 副本数是部署里的一个数：加一副副本要真的多一块卷、多一条可钉的地址。
       # 两条都由 chart 投影出来，而投影断掉的那一侧不会报错——一个地址照样能跑，
       # 只是所有 lane 挤在同一副副本、同一个目录上。判据是换输入值跟着变（1→3）。
@@ -885,9 +951,9 @@ jobs:
       # 示例配置不再提交：它就是 chart 配置文档的投影，读它的人够得着源。
       # 需要一份独立文件的人在消费点跑 `deploy/scripts/gen-example-config.py`，
       # 生成到 stdout，结果不进树。没有副本，就没有「副本是否等于源」的新鲜度门。
-      # 静态清单里有两块是渲染出来的（配置正文、Pod 模板的配置指纹）。新鲜度门只管
-      # deploy/rendered/，parity 只管字段级对齐，两块都不问「抄过来的那两份还等于
-      # 源吗」——于是改一次配置、忘了手抄，静态清单会一直落后而三道门全绿。
+      # 静态清单里有两块是渲染出来的（配置正文、Pod 模板的配置指纹）。渲染产物本身
+      # 不进仓（上一条门判它不在），parity 只管字段级对齐，两者都不问「抄过来的那两份
+      # 还等于源吗」——于是改一次配置、忘了同步，静态清单会一直落后而三道门全绿。
       - name: Check static manifests carry the rendered config and fingerprints
         run: bash deploy/scripts/sync-static-manifests.sh --check
       - name: Check the Postgres connection share covers every pooled process
@@ -1032,6 +1098,22 @@ jobs:
       - name: Install protoc (Windows)
         if: runner.os == 'Windows'
         run: choco install protoc -y
+      # Linux 目标要渲染部署清单（bootstrap 的构建脚本把它们打进二进制）；
+      # 别的目标不嵌那一份——交付面就是 Linux 集群，理由在 build.rs。
+      - name: Resolve pinned Helm version
+        if: runner.os == 'Linux'
+        id: helmver
+        run: |
+          v=$(grep -oP 'const HELM_VERSION: &str = "\K[^"]+' crates/bootstrap/src/main.rs)
+          [ -n "$v" ] || { echo "未从 crates/bootstrap/src/main.rs 读到 HELM_VERSION"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: azure/setup-helm@v4
+        if: runner.os == 'Linux'
+        with:
+          version: ${{ steps.helmver.outputs.version }}
+      - name: Install pyyaml
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-yaml
       # 只编译不跑测试：引导器运行时逻辑是 Linux 专属（K3s/buildah），
       # 本矩阵证明它在三平台都能通过编译（cfg 门控无遗漏）
       - run: cargo check -p cogneva-bootstrap

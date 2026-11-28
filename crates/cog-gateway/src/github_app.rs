@@ -21,20 +21,21 @@ use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 
 /// App JWT 有效期：9 分钟（GitHub 硬上限 10 分钟）。
 // cap: fixed — GitHub 的 App JWT 寿命上限是 10 分钟，这里取 9 分钟给它留余量
-// keep: 删掉后按 10 分钟上限签，网关与 GitHub 的时钟偏差就可能让 JWT 在途过期；由「10 分钟上限留余量」兜住
 const JWT_TTL_SECS: i64 = 9 * 60;
 /// 签发时间提前 60s，容忍网关与 GitHub 时钟偏差。
-// cap: fixed — 签发时间往前推的量，容忍网关与 GitHub 之间的时钟偏差
-// keep: 删掉后时钟偏差让签出的 JWT 被判为尚未生效；由「容忍网关与 GitHub 之间的时钟偏差」兜住
+// cap: bound — 签发时间往前推的量，容忍网关与 GitHub 之间的时钟偏差
 const JWT_CLOCK_SKEW_SECS: i64 = 60;
 /// installation token 在实际过期前留足刷新余量。
-// cap: fixed — installation token 到期前提前刷新的余量，取两分钟
-// keep: 删掉后 token 到期才刷，正在进行的请求拿着已经过期的 token；由「到期前提前刷新的余量」兜住
+// cap: bound — installation token 到期前提前刷新的余量，取两分钟
 const REFRESH_MARGIN_SECS: u64 = 120;
-/// 解析不到过期时间时的保守缓存时长（installation token 寿命约 1 小时）。
-// cap: fixed — installation token 寿命约 1 小时；解析不到 expires_at 时按 50 分钟保守缓存
-// keep: 删掉后回到「installation token 寿命约 1 小时；解析不到 expires_at 时按 50 分钟保守缓存」所描述的情形；由这条约定兜住
-const FALLBACK_TTL_SECS: u64 = 50 * 60;
+/// GitHub 文档给的 installation access token 寿命：1 小时。这不是一个旋钮，
+/// 是协议这一侧的声明值。
+// cap: fixed — GitHub 文档：installation access token 1 小时后过期
+const INSTALLATION_TOKEN_LIFETIME_SECS: u64 = 60 * 60;
+
+/// 解析不到 `expires_at` 时的缓存时长：文档寿命减同一段刷新余量，不另立一个数。
+// cap: fixed — 由 INSTALLATION_TOKEN_LIFETIME_SECS 减 REFRESH_MARGIN_SECS 得到，没有第三个输入
+const FALLBACK_TTL_SECS: u64 = INSTALLATION_TOKEN_LIFETIME_SECS - REFRESH_MARGIN_SECS;
 
 /// GitHub App 凭证（仅驻留网关内存，Debug 不打印私钥）。
 #[derive(Clone)]
@@ -182,7 +183,7 @@ pub async fn installation_token(
         .map_err(|e| format!("请求 GitHub installation token 失败: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
-        let body = cog_core::logged_default!(resp.text().await);
+        let body = resp.text().await.unwrap_or_default();
         let body: String = body.chars().take(300).collect();
         return Err(format!("installation token 接口返回 {status}: {body}"));
     }
@@ -201,8 +202,13 @@ pub async fn installation_token(
     Ok(token)
 }
 
-/// 从 GitHub 返回的 `expires_at`（RFC3339）推算缓存时长，扣除刷新余量并
-/// 收敛到安全区间；解析失败回退保守时长。
+/// 从 GitHub 返回的 `expires_at`（RFC3339）推算缓存时长：声明的那段寿命减去
+/// 刷新余量；解析失败回退文档寿命的同一算法。
+///
+/// 声明说它已经到期（或余量吃掉全部寿命）就缓存零秒，下一次调用重新换一枚。
+/// 从前这里夹在 [30, 3300]：下界把一枚将死的 token 缓存成「还能再用 30 秒」，
+/// 上界替 GitHub 砍掉它自己宣布的寿命——两个数都是拍出来的，且与回退值
+/// （50 分钟）互相矛盾：同一段寿命，解析成功反而比解析失败缓存得短。
 fn parse_token_ttl(expires_at: Option<&str>) -> Duration {
     let fallback = Duration::from_secs(FALLBACK_TTL_SECS);
     let Some(raw) = expires_at else {
@@ -212,8 +218,8 @@ fn parse_token_ttl(expires_at: Option<&str>) -> Duration {
         return fallback;
     };
     let secs = (exp.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds();
-    let secs = (secs - REFRESH_MARGIN_SECS as i64).clamp(30, 3300);
-    Duration::from_secs(secs.max(30) as u64)
+    let secs = secs - REFRESH_MARGIN_SECS as i64;
+    Duration::from_secs(secs.max(0) as u64)
 }
 
 /// 解析代码平台透传要用的 GitHub 出口凭证：配置了 App 则用 installation
@@ -318,8 +324,14 @@ mod tests {
         assert_eq!(cache.fresh().as_deref(), Some("good"));
     }
 
+    /// 回退值就是同一段寿命的保守读法：没有第二个数。
     #[test]
-    fn parse_token_ttl_falls_back_and_clamps() {
+    fn the_fallback_is_the_documented_life_minus_the_refresh_margin() {
+        assert_eq!(
+            FALLBACK_TTL_SECS,
+            INSTALLATION_TOKEN_LIFETIME_SECS - REFRESH_MARGIN_SECS,
+            "回退缓存时长不许另立一个数：它只能是文档寿命减同一段刷新余量"
+        );
         assert_eq!(
             parse_token_ttl(None),
             Duration::from_secs(FALLBACK_TTL_SECS)
@@ -328,11 +340,25 @@ mod tests {
             parse_token_ttl(Some("not-a-date")),
             Duration::from_secs(FALLBACK_TTL_SECS)
         );
-        // 远未来：clamp 到 3300 秒上限。
-        assert_eq!(
-            parse_token_ttl(Some("2999-01-01T00:00:00Z")),
-            Duration::from_secs(3300)
+    }
+
+    /// 声明的那段寿命原样生效，两端都不许再夹一个数。
+    #[test]
+    fn the_declared_expiry_is_what_is_cached() {
+        let declared = chrono::Utc::now() + chrono::Duration::days(1);
+        let got = parse_token_ttl(Some(&declared.to_rfc3339()));
+        let expected = (declared - chrono::Utc::now()).num_seconds() as u64 - REFRESH_MARGIN_SECS;
+        // 两次取 `now()` 之间会走掉几毫秒，允许一秒的差。
+        assert!(
+            got.as_secs().abs_diff(expected) <= 1,
+            "缓存时长要跟着声明走：声明 {expected} 秒，实际 {:?}",
+            got
         );
+
+        // 声明已经过期：缓存零秒，下一次调用重新换，而不是把一枚死 token
+        // 缓存成「还能再用一会儿」。
+        let past = chrono::Utc::now() - chrono::Duration::minutes(5);
+        assert_eq!(parse_token_ttl(Some(&past.to_rfc3339())), Duration::ZERO);
     }
 
     #[test]

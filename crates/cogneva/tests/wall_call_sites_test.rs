@@ -18,7 +18,7 @@
 
 use crate::common;
 
-use common::root::repo_root;
+use common::root::{rendered_root, repo_root};
 use common::routes::walk;
 use common::rust_production::production_sources;
 use std::path::Path;
@@ -109,6 +109,9 @@ fn no_production_call_site_kills_work_on_a_clock() {
 #[test]
 fn no_manifest_kills_work_on_a_clock() {
     let root = repo_root();
+    // 渲染产物不进仓：先让它从 chart 现场生成，否则这条普查会从 deploy/ 少读
+    // 三棵 profile，而「没扫到」与「扫过且干净」在这条判据上同形。
+    let _ = rendered_root();
     let files = deploy_manifests(&root);
     assert!(
         files.len() > 10,

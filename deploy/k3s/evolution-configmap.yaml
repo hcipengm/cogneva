@@ -117,9 +117,9 @@ data:
   COGNEVA_MAINLINE_DEPLOYER_REGISTRY_MAINTENANCE_THRESHOLD: "0.5"
   COGNEVA_MAINLINE_DEPLOYER_REGISTRY_MAINTENANCE_COOLDOWN_SECS: "21600"
   # 从裸仓库的哪个目录读清单。默认与代码默认值同源（deploy/k3s），暴露它是为了
-  # 让"清单目录"成为可配置的部署面，而不是散在代码里的常量。换成
-  # deploy/rendered/<profile>/ 现在不成立：那里没有 kustomization.yaml，清单
-  # 文件名也不同，得先有消费渲染产物的路径。
+  # 让"清单目录"成为可配置的部署面，而不是散在代码里的常量。指向
+  # deploy/rendered/<profile>/ 也受支持：那是平铺清单（没有 kustomization.yaml），
+  # 落地端按该 rev 自己的 chart 现场渲染；产物不进仓，老 rev 读它当时提交的字节。
   COGNEVA_MAINLINE_DEPLOYER_MANIFEST_DIR: "deploy/k3s"
   # 启动阶段（Pod 的 init 容器未结束）的上界，与就绪预算分开计。
   COGNEVA_MAINLINE_DEPLOYER_STARTUP_TIMEOUT_SECS: "900"

@@ -40,7 +40,6 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 GIT_REVISION="$(git rev-parse --short HEAD)"
 VERSION_ID="$(bash "$REPO_ROOT/deploy/scripts/version-id.sh")"
-
 echo "==> 版本一致性门禁（VERSION=$VERSION, rev=$GIT_REVISION, 标签=$VERSION_ID）"
 fail() { echo "版本漂移: $1" >&2; exit 1; }
 # The declared version inside the derived label has to be the version in
@@ -57,10 +56,11 @@ esac
 # deploy/k3s 下每个本平台工作负载的 Pod 模板、configmap），这里不抄第二份名单。
 bash deploy/scripts/check-release-version-consistency.sh "$REPO_ROOT" || exit 1
 
-# 预渲染产物（元启动 apply 主路径，覆盖 k3s 单/多节点与 k8s 标准三 profile）
-# 必须与 chart 同源新鲜，否则发出去的 release 带的是旧拓扑/旧版本
-echo "==> 预渲染产物新鲜度门禁"
-bash deploy/scripts/render-deploy.sh --check
+# 渲染产物（元启动 apply 主路径，覆盖 k3s 单/多节点与 k8s 标准三 profile）不进仓：
+# 这条门判「仓里没有它们，而 chart 此刻渲染得出来」。渲不出来的 release 发出去，
+# 引导器构建那一刻就会拿到空树。
+echo "==> 渲染产物门禁"
+bash deploy/scripts/check-rendered-trees.sh "$REPO_ROOT"
 
 BUILD_ARGS=(build -t "$IMAGE" -t "$VERSIONED_IMAGE" -f "$REPO_ROOT/Dockerfile")
 BUILD_ARGS+=(--build-arg "VERSION=${VERSION}" --build-arg "GIT_REVISION=${GIT_REVISION}")

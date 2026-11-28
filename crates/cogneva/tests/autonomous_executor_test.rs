@@ -614,7 +614,7 @@ async fn test_squad_retry_mechanism() {
     };
     let task_id = submit_goal(&state, "task that will trigger retry").await;
 
-    // Execute squad with max_retries=0 so failures are terminal.
+    // Execute squad with policy_upgrades=0 so failures are terminal.
     // Since stub agents always pass, we verify the retry infrastructure is wired.
     let config = SquadConfig {
         stated_directions: Vec::new(),
