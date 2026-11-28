@@ -1,3 +1,4 @@
+// reads: deploy/k3s/observability/helm/*.yaml subject
 //! principle: feedback_a_closed_state_set_must_route_an_unrecognized_verdict_to_a_non_pass_state
 //! principle: feedback_a_row_is_an_event_so_the_agreeing_state_needs_its_own_series
 //! principle: feedback_a_rule_and_the_name_it_reads_are_locked_by_two_censuses_that_guard_opposite_directions
@@ -19,13 +20,14 @@
 //!
 //! A rule whose expression names a series nothing produces never fires. It does
 //! not error, it does not log, it does not show up anywhere except as an alert
-//! that stays quiet through exactly the incident it was written for — the same
-//! failure mode the dashboard contract covers, on the side that is supposed to
-//! wake someone up. The two sides drift for the same reason: nothing about
-//! editing one makes the other notice.
+//! that stays quiet through exactly the incident it was written for. A rule is
+//! the hand-written side of a reading: the gateway computes a panel for every
+//! renderable series (`eeed08952`), so a series that exists is drawn and one
+//! that stops existing loses its panel with nobody editing anything. A rule is
+//! named by hand, so it can name a series nothing produces and keep its silence.
 //!
-//! The dashboard contract test covers panels. This one covers
-//! `observability.infra_watch.rules` in the chart, which nothing checked before.
+//! This test covers `observability.infra_watch.rules` in the chart, which
+//! nothing checked before.
 //!
 //! The tables below are the contract. A series a rule reads must be either one
 //! this workspace publishes (recorded with the file that publishes it, so a
@@ -46,7 +48,6 @@ use cog_gateway::security_gateway::{RangeReadBaseline, RANGE_READ_BASELINES};
 
 use crate::cells_written;
 use crate::closed_set;
-use crate::dashboard;
 use crate::derivation;
 use crate::producer;
 use crate::promql;
@@ -230,15 +231,16 @@ const PRODUCED: &[(&str, &str)] = &[
     // is judged by -- how long the cache has been over it against how long
     // between walks, so the threshold moves with a configured interval instead
     // of a constant that goes stale when the interval changes.
-    // `last_reclaim_seconds` is deliberately not here. It is still published and
-    // still has a panel, but no rule reads it: the age of the last pass is not
-    // how long the cap has gone unmet -- a cache that spent that time under its
-    // cap earns the same age by being fine -- and a rule that read one for the
-    // other woke someone about a cache whose excess was one walk old.
+    // `last_reclaim_seconds` is deliberately not here. It is still published
+    // (and so drawn by the catalogue), but no rule reads it: the age of the
+    // last pass is not how long the cap has gone unmet -- a cache that spent
+    // that time under its cap earns the same age by being fine -- and a rule
+    // that read one for the other woke someone about a cache whose excess was
+    // one walk old.
     // The names are named in the contract file rather than in either publisher:
     // two processes measure a cache of this shape on two volumes that are not
     // each other's, so a second spelling of any of them would leave a rule
-    // reading one process's cache and a panel the other's.
+    // reading one process's cache and the catalogue drawing the other's.
     (
         "cogneva_build_target_unmet_bytes",
         "crates/cog-core/src/build_cache.rs",
@@ -302,20 +304,6 @@ const PRODUCED: &[(&str, &str)] = &[
     (
         "cogneva_evolution_change_queue_files",
         "crates/cog-reflection/src/evolution_queue_readings.rs",
-    ),
-    // The apply/test flight. Neither of these is published by a task: the age is
-    // derived from a stamp the flight leaves behind when the scrape arrives, and
-    // the wall is a property of the process. The pair is what tells a
-    // healthy-but-slow verification from a cycle that has stopped at the flight,
-    // which nothing else could -- every other reading about that work is written
-    // after it ends.
-    (
-        "cogneva_evolution_change_flight_seconds",
-        "crates/cog-reflection/src/evolution_flight_readings.rs",
-    ),
-    (
-        "cogneva_evolution_change_flight_budget_seconds",
-        "crates/cog-reflection/src/evolution_flight_readings.rs",
     ),
     (
         "cogneva_evolution_build_outcomes_total",
@@ -398,8 +386,18 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_task_router_claim_hold_bound_seconds",
         "crates/cog-orchestrator/src/observable.rs",
     ),
-    // The two task-graph readings a rule on "the graph stopped moving" is
-    // built from, and they are a pair for the reason a stall is hard to read:
+    // The ordinary lane's bound is derived from the pool's window, and a window
+    // that does not move leaves the bound where it is: the target unchanged is
+    // the correct answer, so only an evaluation count can say the loop is still
+    // recomputing rather than stopped. That count is a beat, not a rule input --
+    // a quiet lane may owe it no evaluation, so a rule on the count would fire
+    // on a healthy host -- and nothing reads it: it is published so that the
+    // recomputation has a series at all, and the scrape census covers it by the
+    // file it is published from rather than by a reader. That is why it has no
+    // row here, while the bound and the slots it is about do.
+    // These are the two task-graph readings a rule on "the graph stopped
+    // moving" is built from, and they are a pair for the reason a stall is hard
+    // to read:
     // the oldest-untouched age grows while everything else holds still, and
     // the last-success stamp is what separates a graph that looks the same
     // because nothing changed from one that looks the same because the reader
@@ -431,8 +429,9 @@ const PRODUCED: &[(&str, &str)] = &[
     // cadence, which is what the age is compared against here rather than a
     // constant written into the rule. The census series
     // (`cogneva_loop_registered`, and the loop-name label domain it makes
-    // countable) is not read by any rule and is registered with the dashboard
-    // contract instead.
+    // countable) is not read by any rule, and it has no row below: it is a
+    // renderable series rather than a store one, so the scrape census covers it
+    // by the file that publishes it instead of by a producer row here.
     (
         "cogneva_loop_period_seconds",
         "crates/cog-core/src/contract/loop_health.rs",
@@ -835,7 +834,7 @@ const PRODUCED: &[(&str, &str)] = &[
         "crates/cog-extension/src/runtime/cgroup.rs",
     ),
     (
-        "cogneva_verification_timeouts_total",
+        "cogneva_verification_stopped_total",
         "crates/cog-reflection/src/verification_budget.rs",
     ),
     // The claim-capacity loop: what became of each volume in each round, and the
@@ -1224,6 +1223,18 @@ const PRODUCED: &[(&str, &str)] = &[
         "agent_inbox_ask_total",
         "crates/cog-agent/src/observable.rs",
     ),
+    // 关停排空留下的、与续跑捡起来的。两族是一句话的两面：排空让被通知的
+    // 终止零损失，日志让硬杀至多丢一步，而在此之前两个结局各只写一行日志，
+    // 于是「这次滚动丢了几步」在读数面上不存在。放弃计数由关停那一格写，
+    // 未决调用计数由续跑那一格写。
+    (
+        "cogneva_shutdown_drain_abandoned_total",
+        "crates/cog-agent/src/plugin.rs",
+    ),
+    (
+        "cogneva_attempt_unresolved_calls_total",
+        "crates/cog-agent/src/agent_kernel/runtime.rs",
+    ),
     // 退役清扫只删「无主且空」的 inbox。另一半——属主已经不在注册表、条目却
     // 还在——永远不会被投递、也不会被删，而清扫的输出只报它删掉了多少：没人
     // 计过它留下的。两族都出声：只数流分不出「一条搁浅的命令」与「一万条」。
@@ -1271,6 +1282,18 @@ const PRODUCED: &[(&str, &str)] = &[
     (
         "cogneva_gitee_token_refresh_threshold_seconds",
         "crates/cog-gateway/src/contribution_admin.rs",
+    ),
+    // 换对象后端是一次数据搬迁：远端后端看不见旧后端写在盘上的那批对象，
+    // 而这条路上没有报错，只有空库。启动时清点一次，两个答案分两条序列：
+    // 数到多少是一条，读不出来是另一条上的 1——并成一条，卷没挂上就会被
+    // 读成「已经搬完了」。
+    (
+        "cogneva_object_store_legacy_objects",
+        "crates/cog-storage/src/legacy_object_tree.rs",
+    ),
+    (
+        "cogneva_object_store_legacy_scan_unreadable",
+        "crates/cog-storage/src/legacy_object_tree.rs",
     ),
 ];
 
@@ -1850,14 +1873,6 @@ const FOREIGN: &[(&str, &str)] = &[
         "宿主读数 `scripts/principles/must-green-flake-reading.sh`（不在本仓，登记行 `must_green_flake`）：0/1 判词，1 表示**同一个**驱动套件在窗口（默认 7 天）里留下的假红记录达到界（默认 3 次）。假红＝第一次红、同一份字节再跑转绿——真正复现的红落在 `red/`、不进这一堆，两群混起来数会把回归算成噪声。降到套件粒度是因为修法就在那一层（去查那一层里哪一份不稳），而代价落在所有排队提交者身上：每一条记录都让当时排队的人各付一整轮门。界与窗口只写在生产者里，这条规则读判词、不另立一套数；读不到目录时生产者一条序列都不印，那是 `CognevaHostReadingProducerUnreadable{producer=\"must_green_flake\"}` 的事，不是「这一周没有假红」",
     ),
     (
-        "roster_import_age_seconds",
-        "宿主读数 `scripts/principles/governance-roster-freshness.sh`（不在本仓，登记行 `roster`）：名册最近一次导进任务图的 stamp 距今多少秒。名册与图各住一边——名册在私有仓的 `scripts/data/faces.tsv`，图在平台数据库里——两条腿隔着一条进程边界，所以「导入那一方向还有没有人跑」只能由跨这条边界的读数回答，本仓印不出它。规则 `CognevaGovernanceRosterImportStale` 等十分钟再响：那十分钟是给一次滚动（Pod 换了、探针打不通那几拍）留的，不是给写者的节奏留的",
-    ),
-    (
-        "roster_rows_not_in_graph",
-        "同一生产者：名册声明的面主与图里记的 `owner_unit` 对不上有几行。它是**状态**不是计数——两种收口方向（改名册或开交接）都能把它降回 0，所以规则 `CognevaGovernanceRosterDrift` 拿它直接判而不取窗口：一个停住的写者留下的最后一行在图上读起来与此刻的对不上一样，而这一条读的本来就是「没人打算收口」这件事本身。写者读不到名册或图时它不印这一格，那是 `CognevaHostReadingProducerUnreadable` 的判词",
-    ),
-    (
         "cogneva_declared_identifiers_missing",
         "宿主读数 `scripts/host/cogneva-declared-identifiers-reading.sh`（不在本仓，登记行 `declared_identifiers`）：自足声明表里能被机器检查的名字（规则名、`systemctl show … -p <属性>` 的属性名）这一拍有没有一个在它自己的正本里解析不到。它必须外来：被查的那份表与它点名的正本都住在本仓看不见的那棵树里。分母是同族的 `cogneva_declared_identifiers_checked`；表或正本读不到时一条序列都不印（退 3），与「查过、一个名字都没点空」不同形",
     ),
@@ -2269,8 +2284,8 @@ fn the_delivery_reader_check_separates_the_cell_a_notification_cannot_move() {
 /// A rule may read a name this build records, a name it *derives* from one, or
 /// a foreign series listed with its owner — nothing else, because a rule on any
 /// other name fires never. The derived half is decided by
-/// [`closed_set::a_series_this_build_publishes`], which owns it for both
-/// readers: the store renders `_observed_timestamp_seconds` beside every series
+/// [`closed_set::a_series_this_build_publishes`], which owns it: the store
+/// renders `_observed_timestamp_seconds` beside every series
 /// it serves and a histogram's `_bucket`/`_sum`/`_count` come from the name its
 /// producer records, so a rule naming either reads something that exists.
 /// Spelling the judgement here instead is what made the two readers disagree.
@@ -2402,7 +2417,7 @@ fn a_difference_read_of_a_metering_family_is_one_the_producer_declared() {
 
     let mut missing_cost: Vec<String> = Vec::new();
     for (family, baseline) in RANGE_READ_BASELINES {
-        let actual: BTreeSet<String> = readers.get(*family).cloned().unwrap_or_default();
+        let actual: BTreeSet<String> = readers.get(*family).cloned().unwrap_or(Default::default());
         match baseline {
             RangeReadBaseline::SeededAtZero => {
                 if actual.is_empty() {
@@ -2642,8 +2657,8 @@ fn the_node_subject_gate_reports_the_rule_without_the_conjunct_and_allows_the_on
 }
 
 /// A rule whose expression does not parse never fires, and the check above
-/// passes it for the same reason a blank panel passes: every series it names is
-/// really produced.
+/// passes it for the same reason an unparseable reading query passes: every
+/// series it names is really produced.
 ///
 /// This is not a parser, and the name says so rather than claiming more: it
 /// recognises a finite set of shapes, each of them verified against a live
@@ -2656,8 +2671,8 @@ fn the_node_subject_gate_reports_the_rule_without_the_conjunct_and_allows_the_on
 /// A shape outside that set gets past this gate. The backstop for whatever
 /// ships anyway is the watcher's own eval-failure self-alert, which fires on a
 /// query that keeps failing -- slower, and heard only if someone reads the
-/// alerts. A rule and a panel fail the same way here, which is why both sides
-/// of this contract ask the same question about their text.
+/// alerts. A reading has no such backstop: its query failing comes back as an
+/// unavailable cell carrying Prometheus' reason, and no rule fires on it.
 #[test]
 fn no_rule_expression_has_a_known_unparseable_shape() {
     let mut complaints: Vec<String> = Vec::new();
@@ -3016,9 +3031,9 @@ fn a_summary_names_only_labels_its_expression_keeps() {
     let mut judged = 0usize;
     let mut unjudged = 0usize;
     for rule in &rules {
-        let name = rule["name"].as_str().unwrap_or_default();
-        let expression = rule["promql"].as_str().unwrap_or_default();
-        let summary = rule["summary"].as_str().unwrap_or_default();
+        let name = rule["name"].as_str().unwrap_or(Default::default());
+        let expression = rule["promql"].as_str().unwrap_or(Default::default());
+        let summary = rule["summary"].as_str().unwrap_or(Default::default());
 
         let clauses = kept_labels_by_clause(expression);
         if clauses.is_empty() {
@@ -4361,7 +4376,7 @@ fn every_cell_a_rule_selects_is_a_name_this_tree_writes() {
         labels.len()
     );
 
-    let written = cells_written::literals_the_tree_writes(
+    let written = cells_written::strings_the_tree_writes(
         &repo_root(),
         PRODUCED.iter().map(|(_, source)| repo_root().join(source)),
     );
@@ -4431,10 +4446,9 @@ fn a_cell_no_producer_writes_is_reported_and_one_that_exists_is_not() {
 /// keeps accepting any rule that reads it, and if the producer is deleted later
 /// nothing goes red.
 ///
-/// The reading lives in `common/closed_set.rs` rather than here: the dashboard
-/// contract sorts its series into the same two tables and has the same hole, so
-/// the criterion is one function with two call sites instead of two copies that
-/// drift apart.
+/// The reading lives in `common/closed_set.rs` rather than here: the criterion
+/// was shared with the dashboard contract while it existed, and it stays in the
+/// common helpers as the one place the derivation rule is decided.
 #[test]
 fn no_foreign_name_is_one_the_closed_set_publishes() {
     closed_set::assert_no_foreign_name_is_ours(FOREIGN);
@@ -4733,6 +4747,12 @@ fn the_pending_band_is_counted() {
 /// that says a bound is missing is worth re-reading against the rules before it
 /// is believed.
 ///
+/// Where an entry below says the reader it owes is "a panel", read that as a
+/// reading on the decision surface: the catalogue draws a reading's query as a
+/// panel, and the query is what reads the series. Panels stopped being a face
+/// of their own with `eeed08952` (2026-11-15), which is why the reasons here
+/// name a reading's content rather than a panel's title.
+///
 /// `Elsewhere` is a decision: the same fact is already stated by a surface that
 /// is read, named here. `Gap` is a debt: nothing states the fact, and the reason
 /// it could not be closed is what the entry carries -- a missing declared bound,
@@ -4753,6 +4773,19 @@ const UNREAD: &[(&str, Unread)] = &[
             reason: "the starvation this counted is now read in seconds, and the rule reads that series; this row is still written only because the control law compares the same number inside the process, so nothing on the reading faces consumes it",
         },
     ),
+    // 工具调用记录「落地了」是预期结局，不是故障：一条规则若读它，只会在没活干
+    // 的时候响（零条落地既可能是闲，也可能是归档面根本没装上，而它一个数分不开
+    // 这两种）。要决定的那一格是它失败的那一半，规则的判据在那儿，这一条是那条
+    // 规则的余数——归零与失败并存才说明问题。它另有自己的读数
+    // （`tool_call_records_archived`，画在交付面上），所以它并非没人看，只是没有
+    // 一条该读它的规则。
+    (
+        "cogneva_tool_call_archived_total",
+        Unread::Elsewhere {
+            readers: &["cogneva_tool_output_archive_failed_total"],
+            reason: "a record landing is the expected outcome, so a rule on it would fire on idleness; the decision is taken on the failure series, where one increment is already a loss, and this counter is the denominator that rule names plus a reading of its own on the delivery board",
+        },
+    ),
     // An eval A/B gate ends in "did not measure" more often than not right now:
     // the repository ships no fixed eval task set, so the sandbox agent reports
     // `applicable=false` on every run. What would make a run of those skips a
@@ -4764,6 +4797,17 @@ const UNREAD: &[(&str, Unread)] = &[
     // the binary never published it. That turns "the gate is idling" and "the
     // reading was never wired" into different pictures, which is what makes the
     // rule authorable the moment the suite lands.
+    // 这条曾经只有一条读者：`task_event_archive_behind` 拿它和数据发布进程说的保留期
+    // 比。那个保留期连同「到点删」一起被拆掉了（读者从偏移零重放一条流，退掉整条流
+    // 会让读回一个形如「这次运行刚开始」的缺口），所以现在没有任何规则作用在它上面。
+    // 它仍然发布、也仍然被画出来：档案有多深是运维要看的读数。要给它一条规则，先说清
+    // 「多深算坏」——在档案不再被退役之后，这个问句没有答案，所以它留在这里当一笔债。
+    (
+        "cogneva_task_events_oldest_age_seconds",
+        Unread::Gap(
+            "the archive is never retired, so there is no retention to compare its depth against; a rule would have to declare what depth is a fault, and with no deletion there is nothing that makes depth wrong. It stays published and drawn for an operator",
+        ),
+    ),
     (
         "cogneva_eval_gate_outcomes_total",
         Unread::Gap(
@@ -4905,7 +4949,7 @@ const UNREAD: &[(&str, Unread)] = &[
     (
         "cogneva_rollout_job_reading_unix",
         Unread::Gap(
-            "ties the two readings above to the run that produced them; a reader needs the run cadence, which is per-rollout and published by no series -- every published name in this family was enumerated, and none counts judgement runs. The nearest is cogneva_mainline_rollout_attempts_total, whose help calls it the only published cadence of a promotion attempt, and it is not the run count: it is written where the round reaches the decision whether to roll, so a revision the upstream has already left reaches that decision and stops there, and reading it as the run cadence would pair a climbing counter with a timestamp that has no run to advance it on every superseded revision. The one reading that would not need the cadence is this timestamp's own age, and the store does render a companion that carries it -- cogneva_rollout_job_reading_unix_observed_timestamp_seconds, frozen while the writer is gone. That family is now inside the gate's view, so a rule may name it (see the derived half of every_series_an_alert_rule_reads_is_one_something_produces); what still keeps the reader unopened is the same missing bound, since an age is only a fault against a cadence, and the run happens per change rather than on a declared period. The bound the judgement itself runs under is declared -- the job's activeDeadlineSeconds is computed from the startup, rollout and soak budgets -- but it is a value in the job spec rather than a published series, so no rule can name it",
+            "ties the two readings above to the run that produced them; a reader needs the run cadence, which is per-rollout and published by no series -- every published name in this family was enumerated, and none counts judgement runs. The nearest is cogneva_mainline_rollout_attempts_total, whose help calls it the only published cadence of a promotion attempt, and it is not the run count: it is written where the round reaches the decision whether to roll, so a revision the upstream has already left reaches that decision and stops there, and reading it as the run cadence would pair a climbing counter with a timestamp that has no run to advance it on every superseded revision. The one reading that would not need the cadence is this timestamp's own age, and the store does render a companion that carries it -- cogneva_rollout_job_reading_unix_observed_timestamp_seconds, frozen while the writer is gone. That family is now inside the gate's view, so a rule may name it (see the derived half of every_series_an_alert_rule_reads_is_one_something_produces); what still keeps the reader unopened is the same missing bound, since an age is only a fault against a cadence, and the run happens per change rather than on a declared period. The bound the judgement itself runs under is declared -- the job no longer carries a deadline, its liveness is judged by a probe against the progress file the run writes as it advances -- but the window that probe compares against lives inside that file in the container rather than in a published series, so no rule can name it",
         ),
     ),
     (
@@ -4917,7 +4961,7 @@ const UNREAD: &[(&str, Unread)] = &[
     (
         "llm_request_param_clamped_total",
         Unread::Gap(
-            "fields the gateway rewrote before sending, by field and upstream. This entry used to be an Elsewhere citing llm_usage_verdict_measured, and that citation is what kills it: the producer's own comment on the usage verdict states that the verdict has two readings and that neither of them is this series, so the sentence offered as the reason is the sentence that excludes it. The two facts are different -- the gauge answers whether one input to one of the adaptations was settled from evidence, the counter answers what happened to a request that was already sent. No rule and no panel on either face names it, and it is not a store series either: the durable face carries only the declared gauge list and this is a counter, so it lives and dies with the gateway process. A rewrite is not a fault by construction -- the temperature clamp fires only where the pool entry or the compat profile says the upstream demands 1, and the max_tokens, store, reasoning_effort, strict and stream_options adaptations follow that same profile -- so a rule would have to declare which rewrites are fault-worthy. What that declaration turns on is evidence, and that picture has moved twice since this entry was written. It used to read that of the three verdicts the admission probe settles (tool calls, temperature, usage) only usage publishes a reading at all, so a clamp decided from a probe result and one decided from a profile guess were the same shape on every series. All three publish now, and the role rewrite is recorded here too -- that was the one rewrite that happened nowhere, since a response never echoes the messages it was sent, so nothing on any series could have shown it. That moves the question rather than answering it: pairing this counter with llm_temperature_verdict_measured does say which of the two inputs decided a temperature clamp, but the counter alone does not, and the other four profile decisions (the max_tokens spelling, store, reasoning_effort, strict) have no probe behind them at all and so can never be decided from measurement. Until somebody states the condition, a rule would report the gateway's own adaptation habits back at us",
+            "fields the gateway rewrote before sending, by field and upstream. This entry used to be an Elsewhere citing llm_usage_verdict_measured, and that citation is what kills it: the producer's own comment on the usage verdict states that the verdict has two readings and that neither of them is this series, so the sentence offered as the reason is the sentence that excludes it. The two facts are different -- the gauge answers whether one input to one of the adaptations was settled from evidence, the counter answers what happened to a request that was already sent. No rule and no reading on either face names it, and it is not a store series either: the durable face carries only the declared gauge list and this is a counter, so it lives and dies with the gateway process. A rewrite is not a fault by construction -- the temperature clamp fires only where the pool entry or the compat profile says the upstream demands 1, and the max_tokens, store, reasoning_effort, strict and stream_options adaptations follow that same profile -- so a rule would have to declare which rewrites are fault-worthy. What that declaration turns on is evidence, and that picture has moved twice since this entry was written. It used to read that of the three verdicts the admission probe settles (tool calls, temperature, usage) only usage publishes a reading at all, so a clamp decided from a probe result and one decided from a profile guess were the same shape on every series. All three publish now, and the role rewrite is recorded here too -- that was the one rewrite that happened nowhere, since a response never echoes the messages it was sent, so nothing on any series could have shown it. That moves the question rather than answering it: pairing this counter with llm_temperature_verdict_measured does say which of the two inputs decided a temperature clamp, but the counter alone does not, and the other four profile decisions (the max_tokens spelling, store, reasoning_effort, strict) have no probe behind them at all and so can never be decided from measurement. Until somebody states the condition, a rule would report the gateway's own adaptation habits back at us",
         ),
     ),
     (
@@ -4943,13 +4987,14 @@ const UNREAD: &[(&str, Unread)] = &[
     // expected traffic rather than a fault -- a tool a task asks to dump a large
     // file will cross the window share on purpose -- so what a rule would need
     // is a bound on how much truncation is normal, and the right amount follows
-    // what the tasks read. The panel reads the three of them together instead,
+    // what the tasks read. The panel read the three of them together then,
     // which is the reading the pair actually supports: this counter is the
     // denominator of the landed-in-Raw share, and the character total is how
     // much was withheld. The fault in that family is the archive-failure
-    // counter, which keeps its rule. So the entry is gone rather than moved --
-    // the fact is read by a face, and leaving it here would be an exemption for
-    // a series that has a reader.
+    // counter, which keeps its rule. The panel is gone with `eeed08952`; the
+    // decision surface names all three counters in its readings, and the
+    // entries below still stand because what they owe is a bound this census
+    // would take as a rule.
     (
         "cogneva_tool_output_fetch_budget_exhausted_total",
         Unread::Gap(
@@ -5020,13 +5065,14 @@ const UNREAD: &[(&str, Unread)] = &[
     ),
     // The pair minted when the publisher started holding ready tasks back --
     // one on what the window can pay for, one on the board column that is full
-    // -- is not counted here any more: the dashboard's "Publisher Holds: The
-    // Window and the Board" panel draws both, which is the reader the window
-    // half was filed as owing. A rule still cannot take either: every nonzero
-    // is the gate working as designed, and what would make a hold a fault is
-    // one that outlasts what justified it. The window entry left with the
-    // panel; the board entry never had to be filed, because it arrived with its
-    // reader in the same pass -- which is why the count moves by one.
+    // -- is not counted here any more: each has a reading on the decision
+    // surface (`ready_admission_held`, `board_column_held`), which is the
+    // reader the window half was filed as owing. A rule still cannot take
+    // either: every nonzero is the gate working as designed, and what would
+    // make a hold a fault is one that outlasts what justified it. The window
+    // entry left with the panel that was its reader then; the board entry never
+    // had to be filed, because it arrived in the pass that wrote that panel --
+    // which is why the count moves by one.
     //
     // The write-window record, published for the first time in this pass because
     // the face that owes the reading had nowhere to get it from. Four cells, and
@@ -5246,13 +5292,14 @@ const UNREAD: &[(&str, Unread)] = &[
 /// It came down to 17 in the pass that gave the tool-output fidelity pair a
 /// panel. The truncation count had been filed as a debt whose reader was a bound
 /// nobody could declare -- how much truncation is normal follows what the tasks
-/// read -- and that reason was true and still is. What changed is that a reader
-/// arrived which does not need the bound: the panel draws the share of cuts whose
-/// tail landed, and that share is the count minus the failure counter, so the
-/// count is no longer read for its own level but as one operand of an identity.
+/// read -- and that reason was true and still is. What changed then was that a
+/// reader arrived which did not need the bound: the panel drew the share of cuts
+/// whose tail landed, computed from the count and the failure counter, so the
+/// count was read as one operand of an identity rather than for its own level.
 /// The character total went in beside it in the same pass and needed no entry of
 /// its own, which is the ordinary case for a new name added with its reader
-/// rather than before one.
+/// rather than before one. That share left with the panel in `eeed08952`; the
+/// readings on the decision surface name all three counters without it.
 /// It went to 18 in the pass that published `cogneva_project_kind_total`, the
 /// dispatch reading that says whether a change landed under the recipe its
 /// project declared or under the built-in. Its reader is a bound rather than a
@@ -5293,7 +5340,7 @@ const UNREAD: &[(&str, Unread)] = &[
 /// visible: what a drain took, what it handed on, and how many writes failed.
 /// Neither has a reader, and neither can have one of the kind this census
 /// counts -- their deciding operand is a row count in Postgres, which no rule or
-/// panel can query -- so both are filed as gaps whose reason names the
+/// reading can query -- so both are filed as gaps whose reason names the
 /// comparison a reading script has to make instead. They arrive together
 /// deliberately: one without the other still cannot say whether the fault is in
 /// the consumer or in the write.
@@ -5447,7 +5494,39 @@ const UNREAD: &[(&str, Unread)] = &[
 /// owners' call. That sentence is why the census has a reader and no rule, and
 /// it is written here rather than in the entry because the entry's whole value
 /// was the reader it named.
-const GAPS_AT_CENSUS: usize = 33;
+const GAPS_AT_CENSUS: usize = 34;
+
+/// How many closed-set series are drawn with nothing acting on them.
+///
+/// Measured 2026-11-13 after the generated catalogue replaced the hand-written
+/// dashboard: that file was the only surface for these, so removing it turned
+/// them into names no rule and no reading consumes. The ceiling only falls; a
+/// change that raises it has to say, in the same commit, why the new series
+/// can only be drawn.
+///
+/// Raised by two on 2026-11-20 for the database surface, and the reason is the
+/// same for both: a bound the database carries is a *property of the workload*,
+/// not of this tree. `cogneva_db_setting_seconds` publishes what the three time
+/// bounds are set to; whether any of them is too short depends on what the
+/// deployment runs and how long its queries take, so a rule would be a threshold
+/// somebody picked. `cogneva_db_vacuum_behind_tables` counts tables past
+/// autovacuum's own trigger: the count is defined by the server, but whether one
+/// such table at this hour is a page is the same kind of judgement, and the
+/// series is drawn beside the per-table numbers a face owner reads. Both have a
+/// reading on the panel; neither has a decided bound.
+///
+/// Raised to 32 on 2026-11-22 by the event-stream work, for three series that are
+/// readings of the stream and the memory index rather than of a workload:
+/// `cogneva_event_stream_rows_per_day` is the volume the retention target is set
+/// against — a bound on it would be a picked number, and what it is for is
+/// plotted beside the age of the oldest row; `cogneva_event_undecodable_total`
+/// counts payloads a later version wrote that this reader cannot decode, which a
+/// gate keeps at zero by refusing unknown versions at the writer, so a rule
+/// would restate the gate; `cogneva_memory_dropped_entries_total` counts entries
+/// the vector index refused, and whether a drop is a fault depends on which
+/// backend refused it — the per-backend series beside it is what a person reads.
+/// All three are drawn with no decided bound, and none of them has a rule today.
+const DRAWN_ONLY_AT_CENSUS: usize = 32;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {
@@ -5455,7 +5534,6 @@ fn every_series_the_closed_set_publishes_has_a_decided_reader() {
         .iter()
         .flat_map(|(_, promql)| metric_names_in(promql))
         .collect();
-    let panel_read = dashboard::series();
 
     // A histogram is published under its base name and read under one of the
     // recording suffixes, and the closed set holds the base name -- so a reader
@@ -5480,15 +5558,33 @@ fn every_series_the_closed_set_publishes_has_a_decided_reader() {
         .chain(FOREIGN_PENDING.iter().map(|(n, _)| *n))
         .collect();
 
-    let unclassified: Vec<&str> = cog_core::metric_names::ALL
+    // Two questions, two answers. "Does a rule consume this series" is the one
+    // this census has always asked, and it is the narrower of the two the tree
+    // could ask: a reading's query names the series as well, and the scrape
+    // census counts readings beside rules on both of its populations. Here the
+    // debt is a name no rule reads and no `UNREAD` row owes. "Is it visible at
+    // all" is now answered by construction: the catalogue the gateway computes
+    // from the closed set draws every name in it, so a series cannot be
+    // invisible.
+    // That makes the second question worthless as a check and the first one the
+    // only one left standing -- so such a name is not "unclassified", it is
+    // drawn with nothing acting on it, and that is a debt with a number rather
+    // than a missing verdict.
+    //
+    // The number only comes down: every name under it is one whose owner has
+    // not decided yet what its value would change. Raising it to make a change
+    // green is the one move this constant exists to refuse.
+    let drawn_only: Vec<&str> = cog_core::metric_names::ALL
         .iter()
         .map(|n| n.as_str())
-        .filter(|n| !read(&rule_read, n) && !read(&panel_read, n) && !listed.contains(n))
+        .filter(|n| !read(&rule_read, n) && !listed.contains(n))
         .collect();
-    assert!(
-        unclassified.is_empty(),
-        "闭集里的这些序列没有任何告警规则或面板在读，也没在 UNREAD 里给出判词——补读者，或写清那份事实在哪个面上已经可见，或登记成欠账:\n{}",
-        unclassified.join("\n")
+    assert_eq!(
+        drawn_only.len(),
+        DRAWN_ONLY_AT_CENSUS,
+        "闭集里没有决定消费的序列数变了（现在 {} 条，常数 {DRAWN_ONLY_AT_CENSUS}）。\n多一条：新序列要么被一条规则消费（或登记进 UNREAD），要么这个数跟着涨——涨要在同一笔里说清为什么它只能被画出来、不能被决定；\n少一条：补上了决定，这个数要跟着降。\n{}",
+        drawn_only.len(),
+        drawn_only.join("\n")
     );
 
     let published: BTreeSet<&str> = cog_core::metric_names::ALL
@@ -5509,7 +5605,7 @@ fn every_series_the_closed_set_publishes_has_a_decided_reader() {
     let read_but_listed: Vec<&str> = UNREAD
         .iter()
         .map(|(n, _)| *n)
-        .filter(|n| read(&rule_read, n) || read(&panel_read, n))
+        .filter(|n| read(&rule_read, n))
         .collect();
     assert!(
         read_but_listed.is_empty(),
@@ -5542,7 +5638,7 @@ fn every_series_the_closed_set_publishes_has_a_decided_reader() {
     // whose reason named a rule that reads neither series they exempted. A
     // series name is either one a face reads or it is not, so the same claim
     // written this way cannot be made without being true.
-    let any_read: BTreeSet<String> = rule_read.union(&panel_read).cloned().collect();
+    let any_read: BTreeSet<String> = rule_read.clone();
     let unresolved: Vec<String> = UNREAD
         .iter()
         .flat_map(|(name, verdict)| match verdict {
@@ -5583,7 +5679,6 @@ fn an_elsewhere_entry_that_names_a_reader_no_rule_has_is_reported() {
     let any_read: BTreeSet<String> = shipped_rules()
         .iter()
         .flat_map(|(_, promql)| metric_names_in(promql))
-        .chain(dashboard::series())
         .collect();
 
     // A published name nothing reads: the claim the false entries made, in the
@@ -6549,7 +6644,7 @@ fn the_face_drift_rule_is_quiet_on_exactly_the_states_the_enum_calls_yellow() {
         .iter()
         .find(|r| r["name"] == "governance_face_not_on_target")
         .expect("面漂移规则不见了：没有任何东西会报一个面正在漂");
-    let expression = rule["promql"].as_str().unwrap_or_default();
+    let expression = rule["promql"].as_str().unwrap_or(Default::default());
 
     assert!(
         expression.contains(r#"state!="on_target""#),
@@ -6675,6 +6770,7 @@ fn a_retired_rule_is_named_where_the_watcher_can_settle_it() {
 /// `cogneva_*` rules legitimately identify a pod (`orphans_unreaped` is one row
 /// per pod that failed to reap its own orphans), so a rule like "no app metric
 /// may be selected bare" would flag sixty correct rules and be turned off.
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const PUBLISHED_PER_REPLICA: &[&str] = &[
     "cogneva_stream_read_silent_seconds",
     "cogneva_stream_read_failures_total",
@@ -6763,7 +6859,7 @@ fn reporter_aggregated_away(expr: &str, pos: usize) -> bool {
         // `max(NAME)`: every label is dropped.
         return true;
     };
-    let list = list.unwrap_or_default();
+    let list = list.unwrap_or(Default::default());
     let keeps = |label: &str| list.split(',').map(str::trim).any(|l| l == label);
     match modifier.as_str() {
         "without" => keeps("pod"),

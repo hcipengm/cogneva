@@ -84,6 +84,13 @@ impl<S: tracing::Subscriber> Layer<S> for DropCapture {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
         let mut pick = PickFields::default();
         event.record(&mut pick);
+        // 只有**点名了一条条目**的事件才是丢弃记录。把这一层当成「所有日志行」，
+        // 会让任何一条与丢弃无关的 info 也读成 Drop——2026-11-22 实测：qdrant
+        // 建集合那条耗时读数被读成「一个条目离开了」，而这个夹具就是为「读到的
+        // 每一条都属于该发生的事」建的。
+        if pick.entry_id.is_none() && pick.namespace.is_none() {
+            return;
+        }
         self.events.lock().unwrap().push(Dropped {
             message: pick.message.unwrap_or_default(),
             namespace: pick.namespace,

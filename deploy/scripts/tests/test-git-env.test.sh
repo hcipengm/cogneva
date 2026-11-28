@@ -38,7 +38,26 @@ trap 'rm -rf "${work}"' EXIT
 
 # 仓是这一族文件的标志：建仓的才会拿 `-C` 去写自己的夹具。
 creates_repo() { grep -qE '(^|[[:space:]])git([[:space:]]+[^[:space:]]+)*[[:space:]]init([[:space:]]|$)' "$1"; }
-guarded() { grep -qE '^unset .*GIT_DIR.*GIT_WORK_TREE.*GIT_INDEX_FILE' "$1"; }
+# 三个变量要在**某一** unset 行里出现，顺序不论：判据问的是「这条路径清没清干净」，
+# 而 `unset A B C` 与 `unset C A B` 是同一件事。原先按固定顺序匹配，把一份写法不同、
+# 清得同样的夹具判成了没清。
+guarded() {
+    local line
+    line="$(grep -E '^unset ' "$1" | tr '\n' ' ')"
+    case "${line}" in
+        *GIT_DIR*) ;;
+        *) return 1 ;;
+    esac
+    case "${line}" in
+        *GIT_WORK_TREE*) ;;
+        *) return 1 ;;
+    esac
+    case "${line}" in
+        *GIT_INDEX_FILE*) ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
 
 unguarded() { # $1 = 目录：印出「建仓但没有文件级 unset」的文件，一个一行
     local f

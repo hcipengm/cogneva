@@ -22,7 +22,7 @@ const CHEAP: &str = ".always_recorded(";
 
 /// The gate that grew expensive: it submits a sandbox A/B rebuild and waits for
 /// its terminal state.
-const EXPENSIVE: &str = ".eval_gate_blocks(";
+const EXPENSIVE: &str = ".eval_gate_action(";
 
 /// 本 crate 的出厂源码：共享普查按 crate 裁出来的那一份，与同目录另一扇门共用。
 #[path = "common/mod.rs"]
@@ -115,11 +115,11 @@ fn the_scan_sees_both_calls_in_the_tree() {
 fn the_reader_reports_the_order_and_not_the_occurrence() {
     let cheap_first = "let seen = self.always_recorded(&change_id).await?;\n\
                        if !seen {\n\
-                           self.eval_gate_blocks(&change_id, source).await;\n\
+                           self.eval_gate_action(&change_id, source).await;\n\
                        }\n";
     assert!(expensive_without_cheap_ahead(cheap_first).is_empty());
 
-    let expensive_first = "self.eval_gate_blocks(&change_id, source).await;\n\
+    let expensive_first = "self.eval_gate_action(&change_id, source).await;\n\
                            self.always_recorded(&change_id).await?;\n";
     assert_eq!(expensive_without_cheap_ahead(expensive_first), vec![1]);
 
@@ -127,13 +127,13 @@ fn the_reader_reports_the_order_and_not_the_occurrence() {
     let separated = "self.always_recorded(&change_id).await?;\n\
                      \n\
                      // the gate below costs a rebuild\n\
-                     self.eval_gate_blocks(&change_id, source).await;\n";
+                     self.eval_gate_action(&change_id, source).await;\n";
     assert!(expensive_without_cheap_ahead(separated).is_empty());
 
     // The prose that explains the invariant names both calls; it must not be
     // read as one of them.
-    let explained = "// `always_recorded` has to stay ahead of `eval_gate_blocks`.\n\
-                     // `.eval_gate_blocks(` is the expensive one.\n\
+    let explained = "// `always_recorded` has to stay ahead of `eval_gate_action`.\n\
+                     // `.eval_gate_action(` is the expensive one.\n\
                      fn f() {}\n";
     assert!(expensive_without_cheap_ahead(explained).is_empty());
 }

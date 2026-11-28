@@ -4,10 +4,13 @@
 //! three answers and the same lookup.
 //!
 //! The reader-face census walks `cog_core::metric_names::ALL` -- the closed set
-//! the recording macros generate -- and asks whether a shipped rule or a panel
-//! reads each name. The scrape census walks the names a build can *render*:
-//! the ones producers hand to an exposition through an `Observable`, which the
-//! store never holds and which therefore appear in the closed set not at all.
+//! the recording macros generate -- and asks whether a shipped rule reads each
+//! name. The scrape census walks the names a build can *render*: the ones
+//! producers hand to an exposition through an `Observable`, which the store
+//! never holds and which therefore appear in the closed set not at all. There
+//! it counts readings beside the rules, because a name with no store row cannot
+//! be read back inside a process and a reading's query is the only other
+//! expression that can name it.
 //! Different populations, and the same question about each member: something
 //! carries it, or the reason it is carried by nothing is written down.
 //!

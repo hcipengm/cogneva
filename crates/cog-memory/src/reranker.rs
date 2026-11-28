@@ -14,8 +14,12 @@ pub struct FastEmbedRerankerProvider {
 impl FastEmbedRerankerProvider {
     /// Create a new reranker using BGE-Reranker-V2-M3, loading its weights from
     /// wherever fastembed's own cache setting points.
+    ///
+    /// `FASTEMBED_CACHE_DIR` is read here so the directory can be checked before
+    /// fastembed sees it; an empty directory is refused instead of fetching the
+    /// weights (see [`crate::embedding_provider::cache_dir_has_weights`]).
     pub fn try_new() -> Result<Self, String> {
-        Self::try_new_with_cache_dir(None)
+        Self::try_new_with_cache_dir(crate::embedding_provider::cache_dir_from_env())
     }
 
     /// The same, but with the cache directory taken from `FASTEMBED_CACHE_DIR`
@@ -27,9 +31,7 @@ impl FastEmbedRerankerProvider {
     /// itself. Reading it here, at the construction site, keeps the policy "the
     /// cache dir is an environment decision" out of every caller.
     pub fn try_new_from_env() -> Result<Self, String> {
-        Self::try_new_with_cache_dir(
-            std::env::var_os("FASTEMBED_CACHE_DIR").map(std::path::PathBuf::from),
-        )
+        Self::try_new_with_cache_dir(crate::embedding_provider::cache_dir_from_env())
     }
 
     /// The same, with the cache directory named here instead of read from the
@@ -43,6 +45,16 @@ impl FastEmbedRerankerProvider {
     /// another, which shows up as a model that downloads in a test and hangs in a
     /// deployment.
     pub fn try_new_with_cache_dir(cache_dir: Option<std::path::PathBuf>) -> Result<Self, String> {
+        if let Some(dir) = cache_dir.as_deref() {
+            if !crate::embedding_provider::cache_dir_has_weights(dir) {
+                return Err(format!(
+                    "no ONNX weights under the mounted cache directory {}: refusing to fetch \
+                     them from the model hub (that request has no timeout, so an unreachable \
+                     hub hangs this process instead of reporting a missing weight)",
+                    dir.display()
+                ));
+            }
+        }
         let mut options =
             fastembed::RerankInitOptions::new(fastembed::RerankerModel::BGERerankerV2M3)
                 .with_show_download_progress(true);

@@ -231,5 +231,5 @@ fn a_hand_rolled_cut_on_disk_is_reported() {
         found.sites
     );
 
-    std::fs::remove_dir_all(&root).ok();
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }

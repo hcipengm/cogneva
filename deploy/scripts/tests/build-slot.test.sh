@@ -60,6 +60,17 @@ printf '%s\n' "${out}" | grep -q '持有者记录' ||
 printf '%s\n' "${out}" | grep -q 'held slot-' ||
     fail "退出时要报出拿了哪个槽、等了多久、跑了多久：${out}"
 
+# 2b. 被服务过就留一行：门的另一半只从这一行知道 `gate: …` 这一问已经被服务过。
+#     没有它就只剩「从没被服务」，于是对这份声明永远让——2026-11-10 主线推进
+#     就这样被饿了三个小时。同一个名字再跑一次只换时间，不叠一行。
+run_in "${work}/own/lock" "${gate_dir}" "持有者记录" true >/dev/null 2>&1 ||
+    fail "第二次拿槽应当照样跑完"
+lines="$(grep -c $'\tgate: 持有者记录$' "${gate_dir}/builds.served" 2>/dev/null || true)"
+[ "${lines}" = "1" ] ||
+    fail "每个名字在 builds.served 里只留一行，实际 ${lines} 行：$(cat "${gate_dir}/builds.served" 2>&1)"
+grep -Eq $'^[0-9]+\tgate: 持有者记录$' "${gate_dir}/builds.served" 2>/dev/null ||
+    fail "被服务过的工作应当在 builds.served 里留一行时间：$(cat "${gate_dir}/builds.served" 2>&1)"
+
 # 3. 被别人占着（bound=1）：等，而不是并排跑。判据是时间顺序，不是字数。
 printf '1\n' >"${gate_dir}/buildgate.bound"
 : >"${gate_dir}/slot-0.lock"
@@ -123,4 +134,68 @@ rc=$?
 set -e
 [ "${rc}" -eq 7 ] || fail "命令自己的退出码应当原样传出去，实际退 ${rc}"
 
-echo "ok - 没有槽时退到本机的锁并说明；有槽时写持有者记录、被占时等待、等不到退 75、命令的退出码原样传出"
+# 7. 等槽与干活分两个数报出来：问的人要的是「这一格自己花了多久」，而终端上那行
+#    给人读的文字（`held … for Ns after waiting Ms`）不能拿去减。设了文件名就要有
+#    一行 `<waited>\t<held>\t<name>`，没设就一个字都不多写——别的调用方不必跟着改。
+printf '1\n' >"${gate_dir}/buildgate.bound"
+: >"${gate_dir}/slot-0.lock"
+rm -f "${gate_dir}/builds.reserve"
+report="${work}/waits.tsv"
+(
+    exec 5<"${gate_dir}/slot-0.lock"
+    flock -x 5
+    sleep 2
+) &
+holder=$!
+sleep 0.5
+report_in() { # <报告文件> <说明> <命令…>
+    local file="$1" what="$2"; shift 2
+    (
+        COGNEVA_BUILD_SLOT_REPORT="${file}" \
+            COGNEVA_BUILD_GATE_LOCK_DIR="${gate_dir}" \
+            COGNEVA_BUILD_LOCK_FILE="${work}/own/lock" \
+            COGNEVA_BUILD_SLOT_WAIT_SECS=20 \
+            COGNEVA_BUILD_SLOT_POLL_SECS=1 \
+            bash -c '. "$1"; shift; build_slot_run "$@"' _ "${lib}" "${what}" "$@"
+    )
+}
+export COGNEVA_BUILD_SLOT_REPORT="${report}"
+lines_before="$(build_slot_reported_lines)"
+report_in "${report}" "报等槽" true >/dev/null 2>&1 || fail "带报告文件时应当照样跑完"
+wait "${holder}" 2>/dev/null || true
+[ -s "${report}" ] || fail "设了 COGNEVA_BUILD_SLOT_REPORT 却没有留下任何一行"
+line="$(tail -n 1 "${report}")"
+case "${line}" in
+*$'\t'gate:\ 报等槽) ;;
+*) fail "报告行应当是 <等槽秒>\\t<干活秒>\\t<名字>，实际：${line}" ;;
+esac
+waited="$(printf '%s' "${line}" | cut -f1)"
+held="$(printf '%s' "${line}" | cut -f2)"
+[ "${waited}" -ge 1 ] || fail "被占着的时候等槽秒数应当大于 0，实际 ${waited}：${line}"
+case "${held}" in '' | *[!0-9]*) fail "干活秒数应当是数字，实际 ${held}：${line}" ;; esac
+[ "$(build_slot_reported_waits_since "${lines_before}")" = "${waited}" ] ||
+    fail "从某个位置往后求和应当只数这一行：得 $(build_slot_reported_waits_since "${lines_before}")，行里是 ${waited}"
+[ "$(build_slot_reported_waits_since 0)" -ge "${waited}" ] || fail "从头求和应当不少于这一行"
+
+# 没设文件名：一个字都不多写，终端那行照旧。别的调用方（集群里的构建）不该因为门
+# 要这个读数而多出一份文件，也不该因为它不设就少一行给人读的话。
+unset COGNEVA_BUILD_SLOT_REPORT
+[ "$(build_slot_reported_lines)" = "0" ] || fail "没设报告文件时行数应当是 0"
+[ "$(build_slot_reported_waits_since 0)" = "0" ] || fail "没设报告文件时等槽秒数应当是 0"
+out="$(
+    COGNEVA_BUILD_GATE_LOCK_DIR="${gate_dir}" \
+        COGNEVA_BUILD_LOCK_FILE="${work}/own/lock" \
+        COGNEVA_BUILD_SLOT_WAIT_SECS=20 \
+        bash -c '. "$1"; shift; build_slot_run "$@"' _ "${lib}" "不报" true 2>&1
+)" || fail "没设报告文件时应当照样跑完：${out}"
+printf '%s\n' "${out}" | grep -q 'held slot-' || fail "没设报告文件时终端那行照旧要有：${out}"
+
+# 名字前缀是库加的：`build_slot_run` 把它写成 `gate: <名字>`。调用点自己再写一次，
+# 槽文件与成本表里就是 `gate: gate: 容量登记表` —— 成本表按名字分行，同一格于是
+# 读成一个前缀不同的第二行，而「这一格等了多少」从此要按两个名字去加。
+# 静态扫一眼调用点，因为这一族错的形状只在这里出现：书的前缀对上调用点的前缀。
+if grep -n 'build_slot_run "gate:' "${repo}/deploy/scripts/check-before-push.sh" >/dev/null 2>&1; then
+    fail "调用点不要自己加 gate: 前缀，build_slot_run 已经加了：$(grep -n 'build_slot_run "gate:' "${repo}/deploy/scripts/check-before-push.sh" | tr '\n' ' ')"
+fi
+
+echo "ok - 没有槽时退到本机的锁并说明；有槽时写持有者记录、被占时等待、等不到退 75、命令的退出码原样传出；等槽与干活分两个数落一份记录；名字前缀只在库里加一次"

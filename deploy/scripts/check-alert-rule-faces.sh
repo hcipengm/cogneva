@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# reads: deploy/k3s/observability/manifests/*.yaml subject
+# reads: deploy/helm/cogneva/files/cogneva.json subject
 # principle: feedback_the_missing_hop_of_ownership_belongs_on_the_rule_not_in_a_join_table
 # 告警的「归谁」那一跳：一条会被投递出去（带 `cogneva_io_managed`）的规则，必须同时申报
 # 它判的是哪个面（`cogneva_io_face`）。

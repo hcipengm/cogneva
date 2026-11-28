@@ -44,6 +44,12 @@ pub const BACKUP_RUNS_LOOP: &str = "backup_runs";
 /// is not changing the other.
 pub const BACKUP_RUNS_ROLE: &str = "backup_runs";
 
+/// 读数上点名这一格的标签名，与 [`crate::LABEL_READOUT`] 同一个词。
+///
+/// 本文件同时发布指标名与这格的名字；登记表要在**一个**文件里读到两者，而把
+/// 标签抄成一个字符串字面量会让它与其他账本的 `readout` 各自漂移。
+pub const READOUT_LABEL: &str = crate::LABEL_READOUT;
+
 /// How long one round waits for the next.
 ///
 /// The account changes at most a few times a day -- a run opens, and it closes
@@ -55,7 +61,8 @@ pub const BACKUP_RUNS_ROLE: &str = "backup_runs";
 /// while leaving hours of margin. The deployed liveness alert derives its
 /// threshold from this period (`6 * period`), so changing it changes that
 /// threshold.
-// cap: bound — 存活告警的门槛由它推出（6 × 周期），所以这个数是那个门槛的分子，不是独立的一拍
+// cap: fixed — 存活告警的门槛由它推出（6 × 周期），所以这个数是那个门槛的分子，不是独立的一拍
+// keep: 删掉后存活告警的门槛没有分子，告警的墙跟着一拍一拍地漂；由「门槛是 6 × 周期」兜住
 pub const BACKUP_RUNS_PASS_INTERVAL: Duration = Duration::from_secs(300);
 
 /// The readouts one look at the account produces.
@@ -131,6 +138,14 @@ enum BackupReadout {
     /// behind them, counted by the store across the window rather than read off
     /// the newest drill's row.
     DrillWindowUnprovenPackages,
+    /// Drill attempts that opened and whose end nobody ever saw.
+    ///
+    /// Not `drill_latest_age_seconds` with a different label: a killed pass
+    /// leaves no row in the drill ledger at all, so the newest-row reading ages
+    /// exactly as it would if nobody had scheduled one. This counts the nights
+    /// that started and never finished, which is the only shape in which "it
+    /// was killed from outside" and "it stopped on its own criterion" differ.
+    DrillAttemptsNeverSeen,
     /// Permission violations on the credential-bearing material the drill could
     /// see: the backup volume, the offsite copy and the host state directory.
     /// The total is published for the face, and the three counts beside it say
@@ -173,6 +188,7 @@ impl BackupReadout {
         BackupReadout::SegmentSkewSeconds,
         BackupReadout::SegmentSkewBoundSeconds,
         BackupReadout::DrillWindowUnprovenPackages,
+        BackupReadout::DrillAttemptsNeverSeen,
         BackupReadout::CredentialSurfaceLive,
         BackupReadout::CredentialSurfaceViolationsBackupPvc,
         BackupReadout::CredentialSurfaceViolationsOffsite,
@@ -206,6 +222,7 @@ impl BackupReadout {
             BackupReadout::SegmentSkewSeconds => "segment_skew_seconds",
             BackupReadout::SegmentSkewBoundSeconds => "segment_skew_bound_seconds",
             BackupReadout::DrillWindowUnprovenPackages => "drill_window_unproven_packages",
+            BackupReadout::DrillAttemptsNeverSeen => "drill_attempts_never_seen",
             BackupReadout::CredentialSurfaceLive => "credential_surface_live",
             BackupReadout::CredentialSurfaceViolationsBackupPvc => {
                 "credential_surface_violations_backup_pvc"
@@ -429,6 +446,16 @@ const READOUT_READERS: [(BackupReadout, ReadoutReader); BackupReadout::ALL.len()
         BackupReadout::DrillWindowUnprovenPackages,
         ReadoutReader::Rule("backup_restore_drill_window_has_unproven_packages"),
     ),
+    // The one backup reading whose rule reads a *change* rather than a level:
+    // an attempt that dies leaves exactly one row, and after a first kill this
+    // counter stays above zero for good, so a rule on the value would fire once
+    // and never clear. What deserves an alert is the night that opened and did
+    // not finish, so the rule takes `increase` over the drill's own schedule --
+    // the same shape `backup_run_abandoned` already uses for the run counter.
+    (
+        BackupReadout::DrillAttemptsNeverSeen,
+        ReadoutReader::Rule("backup_restore_drill_attempt_never_finished"),
+    ),
     // The credential surface. One rule reads the total, because one open bit on
     // any of the three surfaces is the same fact: material that holds the whole
     // database is readable by an account that was never given the key. The three
@@ -473,6 +500,20 @@ fn age_seconds(now: DateTime<Utc>, instant: DateTime<Utc>) -> f64 {
     (now - instant).num_seconds().max(0) as f64
 }
 
+/// How long ago the newest run concluded, as the loop publishes it.
+///
+/// Public because it is the last-beat reading of the run that derives the keep
+/// count: the run writes a fresh `finished_at` every time, even when the count
+/// it computed did not move, and this age is what a reader sees advance. A
+/// steady `keep_target` beside an advancing age is a loop that is running; the
+/// target alone cannot tell that from a loop that stopped.
+pub fn latest_finish_age_seconds(
+    account: &BackupAccountReading,
+    now: DateTime<Utc>,
+) -> Option<f64> {
+    account.latest_finish_at.map(|at| age_seconds(now, at))
+}
+
 /// The value of one readout, or `None` when the account has nothing to say for
 /// it.
 ///
@@ -492,9 +533,7 @@ fn value_of(
         BackupReadout::RunsOk => Some(account.ok as f64),
         BackupReadout::RunsFailed => Some(account.failed as f64),
         BackupReadout::RunsAbandoned => Some(account.abandoned as f64),
-        BackupReadout::LatestFinishAgeSeconds => {
-            account.latest_finish_at.map(|at| age_seconds(now, at))
-        }
+        BackupReadout::LatestFinishAgeSeconds => latest_finish_age_seconds(account, now),
         BackupReadout::LatestSuccessAgeSeconds => account
             .newest_package
             .as_ref()
@@ -592,6 +631,9 @@ fn value_of(
         // open. A green newest row and a window nobody has opened are both
         // ordinary, and only one of them is what a restore needs.
         BackupReadout::DrillWindowUnprovenPackages => Some(account.drill_unproven_packages as f64),
+        // A count of attempts whose end nobody saw. Absent is not zero here -- the
+        // field is a plain count, and a deployment that never lost a drill reads 0.
+        BackupReadout::DrillAttemptsNeverSeen => Some(account.drill_attempts_never_seen as f64),
         // The three counts are read off one drill row and each is absent on its
         // own: a directory the drill was not given is not a clean one.
         BackupReadout::CredentialSurfaceViolationsBackupPvc => drill
@@ -617,7 +659,7 @@ fn value_of(
                     .flatten()
                     .collect()
                 })
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             if counts.is_empty() {
                 None
             } else {
@@ -690,10 +732,7 @@ async fn publish_account_once(
                 continue;
             };
             let mut labels = HashMap::new();
-            labels.insert(
-                crate::LABEL_READOUT.to_string(),
-                readout.as_str().to_string(),
-            );
+            labels.insert(READOUT_LABEL.to_string(), readout.as_str().to_string());
             if let Err(e) = metrics
                 .record_gauge(metric_names::BACKUP_RUN_READINGS, value, labels)
                 .await

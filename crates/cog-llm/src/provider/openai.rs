@@ -93,7 +93,7 @@ fn first_balanced_json_object(text: &str) -> Option<serde_json::Value> {
                 depth -= 1;
                 if depth == 0 {
                     let span = &text[start..start + i + ch.len_utf8()];
-                    return serde_json::from_str(span).ok();
+                    return cog_core::logged_ok!(serde_json::from_str(span));
                 }
             }
             _ => {}
@@ -541,8 +541,7 @@ impl LLMProvider for OpenAIProvider {
                 .header("Content-Type", cog_core::CONTENT_TYPE_JSON)
                 .json(&body)
                 .map_err(|e| SFError::Agent(format!("JSON serialization failed: {}", e)))
-                .unwrap()
-                .timeout(600);
+                .unwrap();
 
             for (key, value) in &headers {
                 req = req.header(key, value);
@@ -629,39 +628,18 @@ impl LLMProvider for OpenAIProvider {
             let mut active_tool_index: Option<u64> = None;
 
             // Some providers (e.g. kimi-k2.6 under high load) open the SSE stream
-            // but then stall without sending data. A per-event timeout lets us fail
-            // fast and gives the RoutingProvider a chance to failover, while a hard
-            // total duration cap (matching the HTTP request timeout) prevents a
-            // single slow reasoning stream from blocking the whole squad execution
-            // indefinitely. The per-event timeout resets after the first event so
-            // that long initial reasoning windows are tolerated without masking
-            // mid-stream stalls.
-            let total_timeout = crate::provider::STREAM_TOTAL_TIMEOUT;
-            // Before the first event, tolerate long reasoning windows up to the
-            // total cap; tightened to 60s once bytes start flowing.
-            let mut event_timeout = total_timeout;
-            let stream_start = std::time::Instant::now();
+            // but then stall without sending data. What is measured here is the
+            // **gap between events**, not the length of the stream: a stream that
+            // keeps emitting is working however long it has been going, and the
+            // old total cap threw such a stream away at the ten-minute mark along
+            // with everything it had already produced. The gap before the first
+            // event is the wider one, because a long reasoning window is an
+            // upstream thinking rather than an upstream stuck.
+            let mut event_timeout = crate::provider::STREAM_FIRST_EVENT_GAP;
             let mut first_event_logged = false;
 
             'stream: loop {
-                let elapsed = stream_start.elapsed();
-                if elapsed >= total_timeout {
-                    tracing::warn!(
-                        provider = "openai",
-                        model = %model.id,
-                        total_secs = total_timeout.as_secs(),
-                        "SSE stream exceeded total duration limit"
-                    );
-                    response.stop_reason = StopReason::Error;
-                    response.error_message = Some(format!(
-                        "SSE stream exceeded total duration limit of {}s",
-                        total_timeout.as_secs()
-                    ));
-                    break;
-                }
-
-                let remaining = total_timeout - elapsed;
-                let timeout = event_timeout.min(remaining).max(Duration::from_secs(1));
+                let timeout = event_timeout.max(Duration::from_secs(1));
 
                 tracing::debug!(
                     provider = "openai",
@@ -670,6 +648,7 @@ impl LLMProvider for OpenAIProvider {
                     "awaiting next SSE event"
                 );
 
+                // wall: 等=上游 SSE 的下一个事件 / 等不到=这一跳按失败收尾 / 续跑=能，新开一次上游调用
                 let line = match tokio::time::timeout(timeout, lines.try_next()).await {
                     Ok(Ok(Some(line))) => line,
                     Ok(Ok(None)) => {
@@ -1168,29 +1147,18 @@ impl LLMProvider for OpenAIProvider {
         // To make chat() reliable we therefore reconstruct the final response
         // from the Done event, which always carries the full assistant message.
         //
-        // A hard timeout protects the caller from providers (e.g. kimi-k2.6)
-        // that open the SSE stream and then stall without closing it.
-        let chat_timeout = crate::provider::CHAT_CONSUME_TIMEOUT;
-        let consume_result = tokio::time::timeout(chat_timeout, async {
-            let mut final_message: Option<Message> = None;
-            while let Some(event) = stream.next().await {
-                if let AssistantMessageEvent::Done { message, .. } = event {
-                    final_message = Some(message);
-                }
+        // No clock here: the stream ends by its own rules — the provider closes
+        // it, it errors, or it goes quiet past the event gap declared in
+        // `provider::STREAM_EVENT_TIMEOUT`, which ends the producer and drops
+        // this channel. A clock at this level would be a second, coarser wall
+        // over the same work, and the one that fired first threw away a
+        // response the stream layer was still producing.
+        let mut final_message: Option<Message> = None;
+        while let Some(event) = stream.next().await {
+            if let AssistantMessageEvent::Done { message, .. } = event {
+                final_message = Some(message);
             }
-            final_message
-        })
-        .await;
-
-        let final_message = match consume_result {
-            Ok(msg) => msg,
-            Err(_) => {
-                return Err(SFError::LLM(format!(
-                    "OpenAIProvider chat() timed out after {}s waiting for stream",
-                    chat_timeout.as_secs()
-                )));
-            }
-        };
+        }
 
         let mut response = stream.result().await;
         if let Some(Message::Assistant { content, .. }) = final_message {
@@ -1199,6 +1167,7 @@ impl LLMProvider for OpenAIProvider {
         Ok(response)
     }
 
+    // prompt: not-an-instruction — 探活请求，模型看不到它
     async fn health_check(&self) -> bool {
         match self
             .chat(

@@ -377,7 +377,7 @@ mod tests {
         assert_eq!(cold.mode, PgeMode::Pipeline);
     }
 
-    /// Every stage the routing surface publishes is one this router can return.
+    /// Every stage the routing surface publishes is one a production path can record.
     ///
     /// The surface publishes a cell per entry of [`RouteStage::ALL`], so an
     /// entry no call can produce reads as "that stage decided nothing" forever.
@@ -386,12 +386,35 @@ mod tests {
     /// every profile, so neither could be entered, and the account's zeroes were
     /// a property of the argument shape rather than of the routing.
     ///
+    /// Four stages belong to this router; `Claimant` is written by the executor
+    /// when the employee who took the row declares its topology, so it is
+    /// driven through `team_of` here — the point of the check is that no listed
+    /// entry is unreachable, not that this one struct produces all of them.
+    ///
     /// This drives every stage with the inputs it needs and fails on the first
     /// listed entry no decision ever carried, so a stage added to the list
     /// without a way to reach it is caught where it is written.
     #[tokio::test]
-    async fn every_published_stage_is_one_this_router_can_return() {
+    async fn every_published_stage_is_one_a_production_path_can_record() {
         let score_goal = "polish the wording in `docs/quickstart.md`";
+
+        // 第五个不来自选择器：它由接了活的人写进行里，执行侧读到后记账。
+        let mut declared = cog_core::Task::new(
+            "declared",
+            cog_core::TaskType::Custom("test".into()),
+            serde_json::json!({ "goal": "summarize the changelog" }),
+        );
+        declared.input[crate::collaboration_executor::INPUT_TEAM] = serde_json::json!("pipeline");
+        let declared_stage = crate::CollaborationExecutor::new()
+            .team_of(
+                &declared,
+                "summarize the changelog",
+                &profile(DeclaredScale::Unknown),
+            )
+            .await
+            .expect("pipeline 是一个可选的拓扑")
+            .stage;
+
         let produced = vec![
             ModeSelectorActor::new()
                 .select_mode(
@@ -417,6 +440,7 @@ mod tests {
                 .select_mode(score_goal, &profile(DeclaredScale::Unknown))
                 .await
                 .stage,
+            declared_stage,
         ];
         for stage in &produced {
             assert!(

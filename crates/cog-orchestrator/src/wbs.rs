@@ -173,10 +173,14 @@ pub fn check_work_package(id: &str, acceptance: &[String]) -> Vec<WbsDefect> {
         blocked_by: Vec::new(),
         blocks: Vec::new(),
         input: serde_json::Value::Null,
+        terminal: String::new(),
+        now: String::new(),
+        gap: String::new(),
         output_entities: Vec::new(),
         estimated_seconds: 0,
         parent_id: None,
         acceptance: acceptance.to_vec(),
+        delivers: None,
     };
     check(&[package])
 }
@@ -216,10 +220,14 @@ mod tests {
             blocked_by: vec![],
             blocks: vec![],
             input: serde_json::Value::Null,
+            terminal: String::new(),
+            now: String::new(),
+            gap: String::new(),
             output_entities: vec![],
             estimated_seconds: 60,
             parent_id: parent.map(String::from),
             acceptance: acceptance.iter().map(|s| s.to_string()).collect(),
+            delivers: None,
         }
     }
 

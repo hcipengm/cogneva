@@ -31,8 +31,10 @@ use super::state_reads::{
 /// old they are, because nothing here has an opinion about age. A deployment
 /// that wants the other rule needs a sweep with a clock in it, which this is
 /// deliberately not.
-// cap: bound — from what a run report is for (a year of daily runs), not from a
+// cap: fixed — from what a run report is for (a year of daily runs), not from a
+// keep: 删掉后一次运行报告要把一年每日运行的全部日志搬出来；由「报告是给一年每日运行看的」兜住
 // measurement on any host
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 pub const LOG_LINES_PER_TASK: i64 = 200;
 
 /// This store's schema, and the one a restore replays.
@@ -44,7 +46,7 @@ CREATE TABLE IF NOT EXISTS cog_observability_events (
     task_id     TEXT,
     crew_id     TEXT,
     squad_id    TEXT,
-    payload     JSONB       NOT NULL,
+    payload     TEXT        NOT NULL,
     timestamp   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_cog_obs_events_agent_id  ON cog_observability_events(agent_id);
@@ -61,7 +63,7 @@ CREATE TABLE IF NOT EXISTS cog_observability_logs (
     level       TEXT        NOT NULL,
     source      TEXT        NOT NULL,
     message     TEXT        NOT NULL,
-    metadata    JSONB       NOT NULL DEFAULT '{}'
+    metadata    TEXT        NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_cog_obs_logs_task_id     ON cog_observability_logs(task_id);
 CREATE INDEX IF NOT EXISTS idx_cog_obs_logs_timestamp   ON cog_observability_logs(timestamp);
@@ -98,7 +100,7 @@ CREATE TABLE IF NOT EXISTS cog_observability_squads (
     squad_id        TEXT PRIMARY KEY,
     task_id         TEXT        NOT NULL,
     status          TEXT        NOT NULL,
-    agents          JSONB       NOT NULL,
+    agents          TEXT        NOT NULL,
     completion_pct  REAL        NOT NULL,
     retry_count     INTEGER     NOT NULL,
     snapshot_id     TEXT,
@@ -158,27 +160,101 @@ pub struct PostgresObservabilityGateway {
 /// 一次提交的 WAL 页与提交记录摊到 64 条上就低到可以忽略；再往上加行，省下的
 /// 提交成本已经小于一条提交持有连接、占着 WAL 的时间，而队列满时整批变慢的
 /// 方差更大。
-// cap: bound — 使一次提交的固定成本摊到 64 条上可忽略，不是从任何容量读数导出
+// cap: fixed — 使一次提交的固定成本摊到 64 条上可忽略，不是从任何容量读数导出
+// keep: 删掉后每条事件都付一次事务；由「摊到 64 条上可忽略」兜住
 const EVENT_BATCH_MAX: usize = 64;
 
 /// 第一条到了之后最多再等多久凑批。
 ///
 /// 事件是持续来的（实测约每秒 180 条），凑够一批通常不用等；这个等待只对
 /// 安静时段起作用，让单条事件不因为「等下一批」而延迟上分钟。
-// cap: bound — 与事件到达间隔（毫秒级）相比足够短，只用来收尾一批
+// cap: fixed — 与事件到达间隔（毫秒级）相比足够短，只用来收尾一批
+// keep: 删掉后一批等不到收尾；由「足够短、只用来收尾一批」兜住
 const EVENT_BATCH_LINGER_MS: u64 = 50;
 
 /// 队列能排多少条。满了不丢事件，改为立刻单独写一条（见
 /// [`PostgresObservabilityGateway::publish_event`]）。
 ///
 /// 按「数据库停住多久还不丢」定：每秒约 180 条时，四千条约是 22 秒的积压。
-// cap: bound — 按事件速率（约 180/秒）乘一段可等待的数据库停顿估出
+// cap: fixed — 按事件速率（约 180/秒）乘一段可等待的数据库停顿估出
+// keep: 删掉后队列无界，DB 停顿时内存跟着速率长；由「速率 × 可等待的停顿」兜住
 const EVENT_WRITE_QUEUE: usize = 4096;
 
 /// 失败计数最多多久落一次库。选 5 秒是因为它要明显短于一条告警的判定窗
 /// （分钟级），又足以把「每次失败一行」压成「每 5 秒一行」。
-// cap: bound — 要明显短于一条告警的判定窗（分钟级），又够把「每次失败一行」压成「每 5 秒一行」
+// cap: fixed — 要明显短于一条告警的判定窗（分钟级），又够把「每次失败一行」压成「每 5 秒一行」
+// keep: 删掉后每次失败都记一行，日志被同一件事刷满；由「明显短于告警判定窗」兜住
 const FAILURE_FLUSH_SECS: u64 = 5;
+
+/// The historical read's only bound is the caller's `since`.
+///
+/// That instant is not arbitrary: the gateway derives it from the retention
+/// registry — the deployment's declared window, widened by the longest question
+/// already asked — and the sweep keeps rows inside it for exactly this read.
+/// A second bound written here (`LIMIT 10000` was one) answered a well-formed
+/// query with the oldest ten thousand rows of a wider window, ending at the
+/// seam where the live stream takes over, and nothing in the answer said a row
+/// was missing. Refusing to answer and answering short are not the same thing.
+const HISTORICAL_EVENTS_SQL: &str = "SELECT payload, timestamp FROM cog_observability_events WHERE timestamp >= $1 ORDER BY timestamp ASC";
+
+/// One stored row back as the event it was written from.
+///
+/// A payload that does not parse used to be logged and skipped, so the
+/// subscriber received a gap it could not tell from events that never
+/// happened. The row is on the table's books either way, so it is an error —
+/// and the timestamp is what names it, the payload being the column that could
+/// not be read.
+fn decode_stored_event(payload: &str, timestamp: DateTime<Utc>) -> SFResult<AgentEvent> {
+    serde_json::from_str(payload).map_err(|e| {
+        SFError::Validation(format!(
+            "event stored at {timestamp} does not parse as an AgentEvent: {e}"
+        ))
+    })
+}
+
+/// The stored rows the subscriber asked for, or an error naming the row that
+/// would otherwise have been left out of them.
+fn filter_stored_events(
+    rows: Vec<(String, DateTime<Utc>)>,
+    filter: &EventFilter,
+) -> SFResult<Vec<AgentEvent>> {
+    let mut events = Vec::with_capacity(rows.len());
+    for (payload, timestamp) in rows {
+        let ev = decode_stored_event(&payload, timestamp)?;
+        if crate::event_filter::event_matches(filter, &ev) {
+            events.push(ev);
+        }
+    }
+    Ok(events)
+}
+
+/// One stored log line back as the entry it was written from.
+///
+/// `record_log` writes `metadata.to_string()`, so every row this gateway wrote
+/// parses. A row that does not parse was written by something else, and folding
+/// it to `Null` handed back a log line whose metadata read as "none given" —
+/// indistinguishable from an entry recorded without any.
+fn log_entry_from_row(
+    task_id: &str,
+    timestamp: DateTime<Utc>,
+    level: String,
+    source: String,
+    message: String,
+    metadata: String,
+) -> SFResult<LogEntry> {
+    let metadata: serde_json::Value = serde_json::from_str(&metadata).map_err(|e| {
+        SFError::Validation(format!(
+            "log line for task {task_id} at {timestamp}: stored metadata is not JSON, so the entry cannot be read ({e})"
+        ))
+    })?;
+    Ok(LogEntry {
+        timestamp,
+        level,
+        source,
+        message,
+        metadata,
+    })
+}
 
 impl PostgresObservabilityGateway {
     /// 接上指标面。缺席是正常的（嵌入式运行没有后端），不是错误。
@@ -255,28 +331,24 @@ impl PostgresObservabilityGateway {
 
     /// Record a structured log entry for the given task.
     ///
-    /// The insert is followed by a trim that keeps the task's newest
-    /// [`LOG_LINES_PER_TASK`] rows. Without it this table is append-only and
-    /// its size is the platform's uptime times its run rate — the shape the
-    /// event log already had to be bounded for, on a table a thousand times
-    /// larger.
+    /// The row is written and **nothing is deleted**. A log line is something the
+    /// platform said while running a task; the row is the only copy of it. The
+    /// earlier shape trimmed each task to its newest [`LOG_LINES_PER_TASK`] rows
+    /// on every write -- an age bound on a fact, and one that shrinks the table
+    /// exactly as fast whether or not an archive exists, so nobody notices the
+    /// moment the rows stop being recoverable.
+    ///
+    /// Readers still see a window: they ask for one task id and a count, and the
+    /// bound keeps a busy task from pushing a quiet one's only line out of that
+    /// read. What changed is that the window is where reading stops, not where
+    /// deleting starts. [`Self::lines_beyond_window`] counts what a reader will
+    /// never be shown again -- the part an archive owes.
     ///
     /// Per task rather than per table because the reader asks in tasks: it
     /// names one task id and a count. A table-wide capacity would let one busy
     /// task push a quiet task's only line out, and that task's reader would
-    /// then get an empty list — the exact false answer this table exists to
+    /// then get an empty list -- the exact false answer this table exists to
     /// stop giving.
-    ///
-    /// The trim is a separate statement from the insert because one statement
-    /// cannot see its own CTE's rows: a `DELETE` beside the `INSERT` in the
-    /// same statement counts the table as it was before the row landed and
-    /// would therefore take one line too many. Two statements can leave the
-    /// task one row over its bound between them, which is a row a reader can
-    /// see and the next write removes; losing the newest line is not.
-    ///
-    /// A failed trim does not fail the write. The line is in; the bound is the
-    /// part that did not hold, and saying so is more useful to the caller than
-    /// telling it the write it can already read back did not happen.
     pub async fn record_log(&self, task_id: &str, entry: LogEntry) -> SFResult<()> {
         sqlx::query(
             r#"
@@ -289,14 +361,23 @@ impl PostgresObservabilityGateway {
         .bind(&entry.level)
         .bind(&entry.source)
         .bind(&entry.message)
-        .bind(&entry.metadata)
+        .bind(entry.metadata.to_string())
         .execute(&self.pool)
         .await
         .map_err(|e| SFError::Database(format!("record_log failed: {}", e)))?;
 
-        if let Err(e) = sqlx::query(
+        Ok(())
+    }
+
+    /// Log lines of `task_id` that fall outside its newest `keep` -- the part a
+    /// reader will never be shown again, and therefore the part an archive owes.
+    ///
+    /// Nothing is deleted: the count says "there is something to move", not
+    /// "there is something to drop".
+    pub async fn lines_beyond_window(&self, task_id: &str, keep: i64) -> SFResult<i64> {
+        sqlx::query_scalar(
             r#"
-            DELETE FROM cog_observability_logs
+            SELECT count(*) FROM cog_observability_logs
             WHERE task_id = $1
               AND id NOT IN (
                   SELECT id FROM cog_observability_logs
@@ -307,18 +388,10 @@ impl PostgresObservabilityGateway {
             "#,
         )
         .bind(task_id)
-        .bind(LOG_LINES_PER_TASK)
-        .execute(&self.pool)
+        .bind(keep)
+        .fetch_one(&self.pool)
         .await
-        {
-            tracing::warn!(
-                task_id,
-                error = %e,
-                kept = LOG_LINES_PER_TASK,
-                "this task's log lines were written but not trimmed to the bound"
-            );
-        }
-        Ok(())
+        .map_err(|e| SFError::Database(format!("count a task's log overflow: {}", e)))
     }
 
     /// Add one run's metrics to its task's row.
@@ -418,7 +491,7 @@ impl PostgresObservabilityGateway {
         .bind(squad_id)
         .bind(&state.task_id)
         .bind(squad_status_str(state.status))
-        .bind(serde_json::to_value(&state.agents).map_err(SFError::Serialization)?)
+        .bind(serde_json::to_string(&state.agents).map_err(SFError::Serialization)?)
         .bind(state.completion_pct)
         .bind(state.retry_count as i32)
         .bind(&state.snapshot_id)
@@ -452,7 +525,7 @@ impl PostgresObservabilityGateway {
         for event in events {
             let (event_type, agent_id, task_id, crew_id, squad_id, timestamp) =
                 extract_event_meta(event);
-            let payload = serde_json::to_value(event).map_err(SFError::Serialization)?;
+            let payload = serde_json::to_string(event).map_err(SFError::Serialization)?;
             rows.push((
                 event_type, agent_id, task_id, crew_id, squad_id, payload, timestamp,
             ));
@@ -496,28 +569,13 @@ impl PostgresObservabilityGateway {
                 - Duration::seconds(crate::observability_event_cap::DEFAULT_READ_WINDOW_SECS as i64)
         });
 
-        let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
-            "SELECT payload FROM cog_observability_events WHERE timestamp >= $1 ORDER BY timestamp ASC LIMIT 10000",
-        )
-        .bind(since)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(format!("query historical events failed: {}", e)))?;
+        let rows: Vec<(String, chrono::DateTime<Utc>)> = sqlx::query_as(HISTORICAL_EVENTS_SQL)
+            .bind(since)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("query historical events failed: {}", e)))?;
 
-        let mut events = Vec::with_capacity(rows.len());
-        for (payload,) in rows {
-            match serde_json::from_value::<AgentEvent>(payload) {
-                Ok(ev) => {
-                    if crate::event_filter::event_matches(filter, &ev) {
-                        events.push(ev);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to deserialize historical event: {}", e);
-                }
-            }
-        }
-        Ok(events)
+        filter_stored_events(rows, filter)
     }
 }
 
@@ -617,7 +675,7 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
     }
 
     async fn get_task_logs(&self, task_id: &str, limit: usize) -> SFResult<Vec<LogEntry>> {
-        let rows: Vec<(DateTime<Utc>, String, String, String, serde_json::Value)> = sqlx::query_as(
+        let rows: Vec<(DateTime<Utc>, String, String, String, String)> = sqlx::query_as(
             r#"
             SELECT timestamp, level, source, message, metadata
             FROM cog_observability_logs
@@ -634,13 +692,9 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
 
         let mut logs = Vec::with_capacity(rows.len());
         for (timestamp, level, source, message, metadata) in rows {
-            logs.push(LogEntry {
-                timestamp,
-                level,
-                source,
-                message,
-                metadata,
-            });
+            logs.push(log_entry_from_row(
+                task_id, timestamp, level, source, message, metadata,
+            )?);
         }
         logs.reverse();
         Ok(logs)
@@ -752,7 +806,7 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
     }
 
     async fn get_squad_state(&self, squad_id: &str) -> SFResult<SquadState> {
-        let row: Option<(String, String, serde_json::Value, f32, i32, Option<String>, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
+        let row: Option<(String, String, String, f32, i32, Option<String>, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
             "SELECT task_id, status, agents, completion_pct, retry_count, snapshot_id, created_at, updated_at
              FROM cog_observability_squads WHERE squad_id = $1",
         )
@@ -773,7 +827,7 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
                 updated_at,
             )) => {
                 let agents: Vec<cog_core::AgentSummary> =
-                    serde_json::from_value(agents_json).map_err(SFError::Serialization)?;
+                    serde_json::from_str(&agents_json).map_err(SFError::Serialization)?;
                 Ok(SquadState {
                     squad_id: squad_id.into(),
                     task_id,
@@ -817,7 +871,7 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
     /// is one per pass, so it gets its own name rather than a label on a
     /// counter with a different unit.
     fn publish_event(&self, event: AgentEvent) {
-        let _ = self.event_tx.send(event.clone());
+        cog_core::ignore_lost!(self.event_tx.send(event.clone()));
 
         // 流式增量只发给订阅方，不落这张表。
         //
@@ -832,8 +886,9 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
         // 增量，而它们一条也翻不完。它同时把容量上限变成天花板上的滑动门——表按行数
         // 封顶，增量占八成，别的读窗口就被挤到最小值。
         //
-        // 工具进度增量（`ToolExecutionUpdate`）形状相同，但今天没有量：先按量到的
-        // 那一条改，不替没量过的通路拍板。
+        // 工具进度增量（`ToolExecutionUpdate`）形状相同，但还没有量过它的量：运行时
+        // 自 2026-11-11 起在命令运行中按节拍发出这种帧，一天里到底多少条要读集群的
+        // 数才知道。先按量到的那一条改，不替没量过的通路拍板。
         if matches!(event, AgentEvent::MessageUpdate { .. }) {
             return;
         }
@@ -1268,5 +1323,89 @@ mod tests {
     #[tokio::test]
     async fn a_writer_without_a_backend_seeds_nothing_and_survives() {
         gateway_with(None).seed_persist_failure_series().await;
+    }
+
+    /// The read's bound is the instant the caller names, derived from the
+    /// retention registry. A cap written into the query would answer a wider
+    /// window with its oldest rows and no sign that the rest existed.
+    #[test]
+    fn the_historical_read_has_no_second_bound() {
+        let sql = HISTORICAL_EVENTS_SQL.to_ascii_uppercase();
+        assert!(
+            !sql.contains("LIMIT"),
+            "the caller's `since` is the bound; a written-in cap answers short: {HISTORICAL_EVENTS_SQL}"
+        );
+        assert!(
+            sql.contains("TIMESTAMP"),
+            "the error that names an unreadable row needs its timestamp selected"
+        );
+    }
+
+    /// A row that is there but does not parse used to be logged and skipped:
+    /// the subscriber saw a gap indistinguishable from nothing having happened.
+    #[test]
+    fn a_row_that_does_not_parse_fails_the_read_instead_of_leaving_a_gap() {
+        let at = Utc::now();
+        let rows = vec![
+            (r#"{"type":"agent_start","agent_id":"a-1"}"#.to_string(), at),
+            ("not an event".to_string(), at),
+        ];
+        let err = filter_stored_events(rows, &EventFilter::default())
+            .expect_err("an unreadable row must not be skipped");
+        assert!(
+            err.to_string().contains(&at.to_string()),
+            "the error must name the row, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_stored_event_decodes_back() {
+        let ev = decode_stored_event(r#"{"type":"agent_start","agent_id":"a-1"}"#, Utc::now())
+            .expect("a row this gateway wrote must decode");
+        assert!(matches!(ev, AgentEvent::AgentStart { ref agent_id, .. } if agent_id == "a-1"));
+    }
+
+    /// `record_log` writes the metadata it was handed, so a line this gateway
+    /// wrote comes back the same.
+    #[test]
+    fn a_stored_log_line_decodes_back_with_its_metadata() {
+        let at = Utc::now();
+        let entry = log_entry_from_row(
+            "task-1",
+            at,
+            "INFO".into(),
+            "kernel".into(),
+            "started".into(),
+            r#"{"iteration":3}"#.into(),
+        )
+        .expect("a row this gateway wrote must decode");
+        assert_eq!(entry.timestamp, at);
+        assert_eq!(entry.metadata, serde_json::json!({"iteration": 3}));
+    }
+
+    /// The metadata column used to be folded to `Null` when it would not
+    /// parse, so the caller read a log line that looked like it was recorded
+    /// without metadata. The read must refuse instead, naming the line.
+    #[test]
+    fn log_metadata_that_does_not_parse_is_not_folded_to_null() {
+        let at = Utc::now();
+        let err = log_entry_from_row(
+            "task-1",
+            at,
+            "INFO".into(),
+            "kernel".into(),
+            "started".into(),
+            "{ half".into(),
+        )
+        .expect_err("unreadable metadata must not become Null");
+        let text = err.to_string();
+        assert!(
+            text.contains("task-1"),
+            "the error must name the task: {text}"
+        );
+        assert!(
+            text.contains(&at.to_string()),
+            "the error must name the line: {text}"
+        );
     }
 }

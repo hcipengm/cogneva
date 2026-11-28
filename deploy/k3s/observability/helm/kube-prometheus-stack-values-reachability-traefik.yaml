@@ -1,3 +1,4 @@
+# census-keep: shapes=deploy-numbers — 部署清单里的数是部署自己的声明：它写在生效的那一处，改它只改这一次部署，不是代码里看不见的默认；由部署面本身兜住
 # 可达性探针的目标 — 入口是 traefik 的集群（k3s 自带形态）。
 #
 # 与 `kube-prometheus-stack-values-reachability-nginx.yaml` 是二选一的两份：目标

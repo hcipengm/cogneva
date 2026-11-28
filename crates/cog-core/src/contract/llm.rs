@@ -67,6 +67,29 @@ pub const LLM_TASK_HEADER: &str = "x-cogneva-task";
 /// whole platform.
 pub const LLM_OWNER_HEADER: &str = "x-cogneva-owner";
 
+/// Inbound header carrying the conversation a call is spent for.
+///
+/// The four axes already on this request answer which component, which
+/// environment, which job and whose budget; none of them answers "which
+/// conversation", and a person's spend is not a conversation's: one person
+/// runs several at once, and each of them is a thing a reader asks the cost of
+/// -- "这段对话花了多少" has no answer from a per-person total.
+///
+/// Not judged, only recorded. Unlike [`LLM_OWNER_HEADER`] there is no ceiling
+/// on a conversation, so a wrong value costs a wrong reading rather than
+/// somebody else's budget.
+///
+/// Absent is a supported state and means "not attributed to a conversation" --
+/// most callers are components finishing a job, not turns in a chat. Like the
+/// other optional axes it must not be defaulted to a placeholder: every
+/// unattributed call would gather under it and read as one very expensive
+/// conversation.
+pub const LLM_SESSION_HEADER: &str = "x-cogneva-session";
+
+/// 这一轮提示在装配时丢掉了多少条更早的消息。只被记录，不被判定；它让「模型
+/// 看到的是哪几段」在段清单之外还答得出「少了几段」。
+pub const LLM_PROMPT_DROPPED_HEADER: &str = "x-cogneva-prompt-dropped";
+
 /// The standard header an upstream uses to say when it can serve us again.
 pub const RETRY_AFTER_HEADER: &str = "retry-after";
 
@@ -146,7 +169,8 @@ pub const RETRY_AFTER_MARKER: &str = "[retry_after_secs=";
 /// The longest wait a reader will accept out of rendered text. Matches the
 /// ceiling the gateway's own circuit breaker puts on the interval it advertises,
 /// so a recovered wait cannot outlast the source that produced it.
-// cap: derived — 网关自己的熔断器给它公布的间隔也封在同一高度，所以恢复出来的等待不会长过产生它的源头
+// cap: fixed — 网关自己的熔断器给它公布的间隔也封在同一高度，所以恢复出来的等待不会长过产生它的源头
+// not-a-bound: 网关自己的熔断器给它公布的间隔也封在同一高度，所以恢复出来的等待不会长过产生它的源头
 pub const MAX_RECOVERED_RETRY_AFTER_SECS: u64 = 6 * 60 * 60;
 
 /// Render `secs` as the token [`retry_after_hint_in`] reads back.
@@ -331,6 +355,29 @@ impl ChatOptions {
         if !owner.is_empty() {
             self.headers
                 .insert(LLM_OWNER_HEADER.to_string(), owner.to_string());
+        }
+        self
+    }
+
+    /// Declare the conversation this call is spent for.
+    ///
+    /// Blank-tolerant like the three before it, and for the same reason: the
+    /// reader folds spend by this value, so an empty string would be a
+    /// conversation of its own that nobody can open.
+    pub fn with_session(mut self, session: &str) -> Self {
+        let session = session.trim();
+        if !session.is_empty() {
+            self.headers
+                .insert(LLM_SESSION_HEADER.to_string(), session.to_string());
+        }
+        self
+    }
+
+    /// 装配时丢掉了多少条更早的消息；0 不写（没裁就不报）。
+    pub fn with_prompt_dropped(mut self, dropped: u32) -> Self {
+        if dropped > 0 {
+            self.headers
+                .insert(LLM_PROMPT_DROPPED_HEADER.to_string(), dropped.to_string());
         }
         self
     }
@@ -718,6 +765,253 @@ impl std::str::FromStr for RefusalKind {
     }
 }
 
+/// The token limit an upstream named when it refused a prompt for being too
+/// long.
+///
+/// This is the one measurement of the window that exists inside this system.
+/// A model's context window is a property of the upstream deployment, not of
+/// this tree: it is in no file here, it is not in the caller's configuration,
+/// and the gateway forwards a vendor's refusal body verbatim. When that body
+/// says *why* — "maximum context length is 128000 tokens", "prompt is too long:
+/// 214401 tokens > 200000 maximum" — it also says *how much*, and that number
+/// is a measurement rather than a guess. A budget derived from it moves when
+/// the upstream moves; a constant does not.
+///
+/// `None` means the body named no limit — an empty body, a quota refusal, a
+/// bare `context_length_exceeded` with no number. That is "not measured", and
+/// it is a different fact from "measured, and the limit is N": a reader that
+/// turns the second into the first keeps a stale constant alive, and one that
+/// turns the first into the second asserts a number nobody observed.
+///
+/// The anchor list is the vendors' own wording, one entry per shape that has
+/// been seen in the wild; a body is matched against all of them and the first
+/// hit wins. Numbers are read as the first integer after the anchor, which is
+/// why every anchor ends where the limit starts: `... allowed (1048576)` takes
+/// the number inside the bracket, and `... tokens > 200000 maximum` is matched
+/// by its own pattern because the number precedes the word `maximum` there.
+pub fn context_limit_from_refusal(body: &str) -> Option<u64> {
+    let lowered = body.to_ascii_lowercase();
+    // "prompt is too long: 214401 tokens > 200000 maximum" — the limit is the
+    // number right before the word, so this shape is read backwards.
+    if let Some(at) = lowered.find(" maximum") {
+        let before = &lowered[..at];
+        if let Some(n) = trailing_integer(before) {
+            return Some(n);
+        }
+    }
+    for anchor in [
+        "maximum context length is",
+        "maximum context window is",
+        "context length is",
+        "context window is",
+        "maximum number of tokens allowed",
+        "maximum number of tokens is",
+        "model token limit:",
+        "model token limit is",
+        "token limit:",
+        "token limit is",
+        "limited to",
+    ] {
+        if let Some(at) = lowered.find(anchor) {
+            if let Some(n) = first_integer_after(&lowered[at + anchor.len()..]) {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+/// Whether a refusal says the prompt was too long at all.
+///
+/// Separate from [`context_limit_from_refusal`] because the two answers are
+/// different facts and both are worth counting: a refusal that says *too long*
+/// and names the limit teaches the number, and one that says *too long* without
+/// naming it teaches only that some prompt was over — which is still a
+/// measurement of the caller's budget being wrong, and is the case a counter
+/// that only counted named limits would silently drop.
+///
+/// The needles are the vendors' own words for this refusal and nothing else:
+/// a quota refusal that happens to mention "tokens" is not this, and counting it
+/// here would point the repair at the context budget.
+pub fn is_context_limit_refusal(body: &str) -> bool {
+    let lowered = body.to_ascii_lowercase();
+    [
+        "prompt is too long",
+        "context_length_exceeded",
+        "maximum context length",
+        "maximum context window",
+        "context length exceeded",
+        "context window exceeded",
+        "exceeds the maximum number of tokens",
+        "exceeded model token limit",
+        "reduce the length of the messages",
+        "input is too long",
+        "too many tokens",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+/// The first integer in `text`, with commas and underscores allowed inside the
+/// number (`128,000` and `1_048_576` are how vendors print large limits).
+///
+/// Capped at the first non-digit run: an anchor followed by a stray digit in a
+/// request id must not become a limit. A run longer than ten digits is not a
+/// token count any deployment has, and reading it as one would put a number in
+/// the budget that no upstream ever stated.
+fn first_integer_after(text: &str) -> Option<u64> {
+    let mut digits = String::new();
+    let mut started = false;
+    for ch in text.chars() {
+        match ch {
+            c if c.is_ascii_digit() => {
+                started = true;
+                digits.push(c);
+            }
+            ',' | '_' if started && !digits.is_empty() => {}
+            _ if started && !digits.is_empty() => break,
+            _ => started = false,
+        }
+        if digits.len() > 10 {
+            return None;
+        }
+    }
+    digits.parse().ok().filter(|n| *n > 0)
+}
+
+/// The integer ending `text`, read the same way [`first_integer_after`] reads
+/// one forwards.
+fn trailing_integer(text: &str) -> Option<u64> {
+    let trimmed = text.trim_end();
+    let end = trimmed.len();
+    let mut start = end;
+    for (offset, ch) in trimmed.char_indices().rev() {
+        match ch {
+            c if c.is_ascii_digit() => start = offset,
+            ',' | '_' => {}
+            _ => break,
+        }
+    }
+    if start == end {
+        return None;
+    }
+    trimmed[start..end]
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
+        .filter(|n: &u64| *n > 0)
+}
+
+#[cfg(test)]
+mod context_limit_tests {
+    use super::*;
+
+    /// The bodies below are the shapes upstreams actually return, kept as they
+    /// arrive (a JSON envelope around the message) rather than trimmed to the
+    /// sentence: the parser reads whatever the transport hands over, and a
+    /// fixture that is already clean proves less than the real thing.
+    #[test]
+    fn every_vendor_shape_in_the_wild_names_its_limit() {
+        // OpenAI and every OpenAI-compatible server (vLLM, DeepSeek, ...).
+        assert_eq!(
+            context_limit_from_refusal(
+                r#"{"error":{"message":"This model's maximum context length is 128000 tokens. However, your messages resulted in 150000 tokens.","type":"invalid_request_error","code":"context_length_exceeded"}}"#
+            ),
+            Some(128_000)
+        );
+        // Anthropic puts the limit after the arrow and the prompt size before it.
+        assert_eq!(
+            context_limit_from_refusal(
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 214401 tokens > 200000 maximum"}}"#
+            ),
+            Some(200_000)
+        );
+        // Google states the input size first and the limit inside brackets.
+        assert_eq!(
+            context_limit_from_refusal(
+                r#"{"error":{"code":400,"message":"The input token count (1200000) exceeds the maximum number of tokens allowed (1048576)."}}"#
+            ),
+            Some(1_048_576)
+        );
+        // Moonshot says it as a limit on the model.
+        assert_eq!(
+            context_limit_from_refusal(
+                r#"{"error":{"message":"Invalid request: Your request exceeded model token limit: 131072","type":"invalid_request_error"}}"#
+            ),
+            Some(131_072)
+        );
+        // A limit printed with separators is still one number.
+        assert_eq!(
+            context_limit_from_refusal("maximum context length is 1,000,000 tokens"),
+            Some(1_000_000)
+        );
+    }
+
+    /// The two absences have to stay apart: a refusal that names no number is
+    /// not a measurement, and reading it as zero (or as the prompt size it
+    /// happens to quote) would hand the budget a number nobody stated.
+    #[test]
+    fn a_refusal_without_a_number_measures_nothing() {
+        assert_eq!(
+            context_limit_from_refusal(
+                r#"{"error":{"type":"invalid_request_error","code":"context_length_exceeded"}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            context_limit_from_refusal(
+                r#"{"error":{"message":"Rate limit exceeded, retry after 30 seconds"}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            context_limit_from_refusal(r#"{"error":{"message":"Your subscription has expired"}}"#),
+            None
+        );
+        assert_eq!(context_limit_from_refusal(""), None);
+    }
+
+    /// "Too long" and "too long, and here is the number" are two facts, and the
+    /// predicate has to hold for both — the first is what tells the reader a
+    /// budget is wrong even when nothing was measured.
+    #[test]
+    fn a_refusal_is_recognised_as_over_the_window_whether_or_not_it_names_one() {
+        assert!(is_context_limit_refusal(
+            "prompt is too long: 214401 tokens > 200000 maximum"
+        ));
+        assert!(is_context_limit_refusal(
+            r#"{"error":{"code":"context_length_exceeded"}}"#
+        ));
+        assert!(is_context_limit_refusal(
+            "The input token count (1200000) exceeds the maximum number of tokens allowed (1048576)."
+        ));
+        // The repairs point in different directions, so these must not match:
+        // a rate limit and an expired subscription are not context budgets.
+        assert!(!is_context_limit_refusal(
+            "Rate limit exceeded, retry after 30 seconds"
+        ));
+        assert!(!is_context_limit_refusal("Your subscription has expired"));
+        assert!(!is_context_limit_refusal(""));
+    }
+
+    /// The prompt's own size is never read as the limit: both numbers appear in
+    /// the same sentence, and taking the first would shrink the budget below
+    /// what the upstream had just accepted.
+    #[test]
+    fn the_prompt_size_quoted_beside_the_limit_is_not_mistaken_for_it() {
+        assert_eq!(
+            context_limit_from_refusal("prompt is too long: 214401 tokens > 200000 maximum"),
+            Some(200_000)
+        );
+        assert_eq!(
+            context_limit_from_refusal("Your messages resulted in 150000 tokens"),
+            None
+        );
+    }
+}
+
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     async fn chat_stream(
@@ -760,6 +1054,29 @@ pub trait LlmClient: Send + Sync {
 /// # Ok(())
 /// # }
 /// ```
+/// 答案的 JSON，允许整段被一条围栏包着。
+///
+/// 拆在这里而不是在提示词里要求「不要写围栏」：那条要求没有检查，模型照写时
+/// 这里报的是「第 0 行语法错误」——读起来像模型答坏了，其实是它能读懂的一份
+/// 答案被格式判词挡下。只拆整段是一条围栏的那种，正文里本来有的围栏不动。
+fn parse_answer(text: &str) -> SFResult<serde_json::Value> {
+    if let Ok(value) = serde_json::from_str(text) {
+        return Ok(value);
+    }
+    let trimmed = text.trim();
+    if let Some(rest) = trimmed.strip_prefix("```") {
+        if let Some(body) = rest.strip_suffix("```") {
+            let body = body
+                .split_once('\n')
+                .map(|(_, inner)| inner)
+                .unwrap_or(body);
+            return serde_json::from_str(body).map_err(SFError::Serialization);
+        }
+    }
+    serde_json::from_str(text).map_err(SFError::Serialization)
+}
+
+// prompt: fixed — 结构化回答的线格式：schema 由调用方类型生成，这里只说「按它回」
 pub async fn execute_structured<T>(
     provider: &dyn LlmClient,
     messages: &[Message],
@@ -772,8 +1089,7 @@ where
     let schema_json = serde_json::to_string_pretty(&root_schema).map_err(SFError::Serialization)?;
 
     let system_msg = Message::system(format!(
-        "Respond with valid JSON conforming to this JSON Schema. \
-         Do not output markdown fences or explanatory text.\n\n{schema_json}"
+        "Respond with valid JSON conforming to this JSON Schema.\n\n{schema_json}"
     ));
 
     let mut msgs = vec![system_msg];
@@ -813,7 +1129,7 @@ where
         )));
     }
 
-    let value: serde_json::Value = serde_json::from_str(&text).map_err(SFError::Serialization)?;
+    let value: serde_json::Value = parse_answer(&text)?;
 
     let schema_value = serde_json::to_value(&root_schema).map_err(SFError::Serialization)?;
     let validator = jsonschema::validator_for(&schema_value)
@@ -1351,6 +1667,58 @@ mod task_header_tests {
 }
 
 #[cfg(test)]
+mod session_header_tests {
+    use super::*;
+
+    /// The conversation id goes onto the wire exactly as the chat names it, so
+    /// the ledger's column joins back to the transcript it belongs to.
+    #[test]
+    fn the_declared_session_travels_verbatim() {
+        let options = ChatOptions::default().with_session("s-42");
+        assert_eq!(
+            options.headers.get(LLM_SESSION_HEADER).map(String::as_str),
+            Some("s-42")
+        );
+    }
+
+    /// Blank is "not attributed to a conversation", not a conversation named
+    /// "": every unattributed call would gather under the empty string and read
+    /// as one very expensive conversation.
+    #[test]
+    fn a_blank_session_declares_nothing() {
+        for blank in ["", "   "] {
+            let options = ChatOptions::default().with_session(blank);
+            assert!(!options.headers.contains_key(LLM_SESSION_HEADER));
+        }
+    }
+
+    /// Four axes, four independent headers: declaring one must not overwrite
+    /// another, or a call would lose the identity it already carried.
+    #[test]
+    fn session_sits_beside_actor_origin_task_and_owner() {
+        let options = ChatOptions::default()
+            .with_actor("agent:planner")
+            .with_origin("gateway_pool")
+            .with_task("task-1")
+            .with_owner("u-1")
+            .with_session("s-42");
+        for (header, expected) in [
+            (LLM_ACTOR_HEADER, "agent:planner"),
+            (LLM_ORIGIN_HEADER, "gateway_pool"),
+            (LLM_TASK_HEADER, "task-1"),
+            (LLM_OWNER_HEADER, "u-1"),
+            (LLM_SESSION_HEADER, "s-42"),
+        ] {
+            assert_eq!(
+                options.headers.get(header).map(String::as_str),
+                Some(expected),
+                "{header} did not survive the other declarations"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod owner_header_tests {
     use super::*;
 
@@ -1416,5 +1784,27 @@ mod owner_header_tests {
             REFUSED_BY_OWNER_BUDGET, REFUSED_BY_BUDGET,
             "两种拒绝的响应成因同值的话，调用侧只能得出一个处置，而它们要问的不是同一个人"
         );
+    }
+
+    /// 整段被一条围栏包着的答案，是能读懂的答案，不是答坏了。
+    #[test]
+    fn an_answer_in_one_fence_is_still_the_answer() {
+        assert_eq!(
+            parse_answer("{\"a\": 1}").unwrap(),
+            serde_json::json!({"a": 1})
+        );
+        assert_eq!(
+            parse_answer("```json\n{\"a\": 1}\n```").unwrap(),
+            serde_json::json!({"a": 1})
+        );
+        assert_eq!(
+            parse_answer("```\n{\"a\": 1}\n```").unwrap(),
+            serde_json::json!({"a": 1})
+        );
+        assert!(
+            parse_answer("```\nnot json\n```").is_err(),
+            "拆了围栏也得还是 JSON：这条兜底不能把坏答案读成好答案"
+        );
+        assert!(parse_answer("plain text").is_err());
     }
 }

@@ -10,7 +10,8 @@ use tokio::sync::{mpsc, oneshot};
 
 /// Default capacity for bounded event streams.
 /// Backpressure kicks in when the producer outpaces the consumer.
-// cap: bound — 有界事件流的默认容量：生产快过消费时在这一条上施加背压
+// cap: fixed — 有界事件流的默认容量：生产快过消费时在这一条上施加背压
+// keep: 删掉后有界流没有容量，生产快过消费时没有地方施加背压；由「有界事件流的默认容量」兜住
 pub const DEFAULT_STREAM_CAPACITY: usize = 256;
 
 /// A push-based async event stream with true backpressure.

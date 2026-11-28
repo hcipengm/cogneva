@@ -12,8 +12,8 @@
 //!    之后没有一条断言会红——退役这一次照样成功，收尾这一句照样执行，名册只是短了
 //!    一格。两条退役入口（`retire_agent`、`retire_task_agents`）都必须走这一个收尾，
 //!    否则同一条规则在两条路径上有两个答案。
-//! 2. 交还按**活没活**判。`get_agent`、`list_workers`、`create_agent` 三处都先问
-//!    `is_retired()`。唯一按名字摘的那一句在 `create_agent` 里，它摘的是上一次生命
+//! 2. 交还按**活没活**判。`get_agent`、`list_workers`、`create_agent_declaring` 三处都先问
+//!    `is_retired()`。唯一按名字摘的那一句在 `create_agent_declaring` 里，它摘的是上一次生命
 //!    留下的空壳，所以只能排在「退役了没有」之后——排到前面，摘掉的就是并发创建
 //!    刚挂上的活对象，而「同一个名字只对应一个活的对象」这条幂等也就反了过来。
 //!
@@ -98,10 +98,16 @@ fn no_roster_read_hands_a_retired_entry_back() {
         );
     }
 
-    let create = body("create_agent");
+    // 创建的本体在 `create_agent_declaring` 里（`create_agent` 只是补一句「没有
+    // 声明」就转过去），所以「退役了没有」这一问也长在那里。
+    let create = body("create_agent_declaring");
+    assert!(
+        body("create_agent").contains("create_agent_declaring("),
+        "`create_agent` 不再转到创建本体上：下面读的那一份已经不是这条路了"
+    );
     assert!(
         create.contains("is_retired()"),
-        "`create_agent` 不看名下那一个退役了没有：「同名就是同一个对象」于是把空壳当成\
+        "`create_agent_declaring` 不看名下那一个退役了没有：「同名就是同一个对象」于是把空壳当成\
          活着的那一个交回去，重跑接上的是一个再也不会回话的消费者"
     );
     let liveness = create

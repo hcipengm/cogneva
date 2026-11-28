@@ -33,11 +33,14 @@ use cog_core::{
 /// The widths the keyed columns were created with, taken from the narrower
 /// dialect's DDL. Checked here so a producer finds out at the write rather than
 /// a database refusing a row halfway through a batch.
-// cap: bound — 建键列当初的宽度，取自更窄那个方言的 DDL；在这里查是为了让生产者在写时就知道，而不是库在批量写到一半时拒一行
+// cap: fixed — 建键列当初的宽度，取自更窄那个方言的 DDL；在这里查是为了让生产者在写时就知道，而不是库在批量写到一半时拒一行
+// not-a-bound: 建键列当初的宽度，取自更窄那个方言的 DDL；在这里查是为了让生产者在写时就知道，而不是库在批量写到一半时拒一行
 const SUBJECT_MAX: usize = 191;
-// cap: bound — the actor column width, a schema limit rather than a measurement
+// cap: fixed — the actor column width, a schema limit rather than a measurement
+// keep: 删掉后 actor 列超出索引上限；由「schema 上限」兜住
 const ACTOR_MAX: usize = 191;
-// cap: bound — the reading-name column width, a schema limit rather than a measurement
+// cap: fixed — the reading-name column width, a schema limit rather than a measurement
+// keep: 删掉后读数名列超出索引上限；由「schema 上限」兜住
 const READING_MAX: usize = 191;
 
 const ROW_COLUMNS: &str = "kind, occurred_at, subject, actor, reading, reading_value, \
@@ -151,7 +154,12 @@ fn event_from_row(row: &sqlx::postgres::PgRow) -> Result<ResourceEvent, SFError>
         from_value: row.try_get("from_value").map_err(|e| db(e, "from_value"))?,
         to_value: row.try_get("to_value").map_err(|e| db(e, "to_value"))?,
         outcome,
-        detail: row.try_get("detail").map_err(|e| db(e, "detail"))?,
+        // `detail` 是自由字段：整块写、整块读，筛选靠它旁边的 subject / reading /
+        // outcome。存 text，坏行读成空文档——一条事件的其他列仍然是真的。
+        detail: {
+            let text: String = row.try_get("detail").map_err(|e| db(e, "detail"))?;
+            serde_json::from_str(&text).unwrap_or_default()
+        },
         count: row.try_get("count").map_err(|e| db(e, "count"))?,
     })
 }
@@ -200,7 +208,7 @@ impl ResourceEventStore for PostgresResourceEventStore {
                 .bind(event.from_value)
                 .bind(event.to_value)
                 .bind(event.outcome.as_str())
-                .bind(&event.detail)
+                .bind(event.detail.to_string())
                 .bind(event.count)
                 .fetch_one(&self.pool)
                 .await

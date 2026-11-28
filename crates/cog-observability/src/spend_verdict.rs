@@ -77,11 +77,13 @@ pub const VERDICT_TABLE: &str = "cog_llm_spend_verdict";
 /// Window length. The same closed hour the usage rollup folds, so a verdict
 /// cell and the spend it judges are keyed identically and can be read together
 /// without a mapping.
-// cap: bound — 与它判的那一格用同一个键读，两边的窗口必须同值才能直接对上而不经映射
+// cap: fixed — 与它判的那一格用同一个键读，两边的窗口必须同值才能直接对上而不经映射
+// keep: 删掉后判词与它判的那一格用不同窗口读同一个键，两边对不上；由「必须同值」兜住
 pub const WINDOW_SECS: i64 = 3600;
 
 /// How often the loop looks for windows that have closed.
-// cap: bound — 找已关闭窗口的节拍
+// cap: fixed — 找已关闭窗口的节拍
+// keep: 删掉后已关闭窗口没有找的节拍，判词在窗口关闭后不知道什么时候出；由「找已关闭窗口的节拍」兜住
 pub const PERIOD: Duration = Duration::from_secs(600);
 
 /// How far back a first run reaches: nowhere.
@@ -96,7 +98,8 @@ pub const PERIOD: Duration = Duration::from_secs(600);
 /// judges the newest closed window and follows the watermark from there; a run
 /// that *has* a watermark still fills every window after it, so a gap while
 /// this loop was down is caught up rather than skipped.
-// cap: bound — 取 0：有水位的流仍会把之后的每个窗填满，所以这个循环停过的那段是被补齐而不是被跳过
+// cap: fixed — 取 0：有水位的流仍会把之后的每个窗填满，所以这个循环停过的那段是被补齐而不是被跳过
+// keep: 删掉后这段循环停过的窗口被跳过而不是被补齐；由「有水位的流仍会把之后的每个窗填满」兜住
 pub const LOOKBACK_SECS: i64 = 0;
 
 /// This store's schema, and the one a restore replays.
@@ -433,7 +436,7 @@ pub fn cells_for_window(
             .skip_stage
             .and_then(|stage| saves.get(stage))
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let facts = SiteWindowFacts {
             skip_stage: site.skip_stage,
             tokens,
@@ -495,6 +498,8 @@ pub struct SpendVerdictStore {
     /// rather than assumed, because "the face is missing" and "the face says
     /// nothing was saved" must not read alike — the first is `unsettled`.
     skips: Option<LlmSkipStore>,
+    /// 事件流的写口；没接上时只写表（读切换之前两者并存）。
+    events: Option<std::sync::Arc<dyn cog_core::EventStore>>,
 }
 
 impl SpendVerdictStore {
@@ -508,7 +513,14 @@ impl SpendVerdictStore {
             pool,
             ledger,
             skips,
+            events: None,
         })
+    }
+
+    /// 接上事件流：每一条窗口判词同时落一条事实。
+    pub fn with_events(mut self, events: std::sync::Arc<dyn cog_core::EventStore>) -> Self {
+        self.events = Some(events);
+        self
     }
 
     pub async fn init_schema(&self, schema: &dyn cog_core::SchemaRunner) -> anyhow::Result<()> {
@@ -596,6 +608,25 @@ impl SpendVerdictStore {
                 .bind(cell.tokens_output)
                 .execute(&self.pool)
                 .await?;
+                if let Some(events) = self.events.as_ref() {
+                    let mut event =
+                        cog_core::FactEvent::new(cog_core::EventPayload::SpendVerdict {
+                            window_start: w.start.to_rfc3339(),
+                            window_end: w.end.to_rfc3339(),
+                            actor: cell.actor.clone(),
+                            verdict: cell.verdict.as_str().to_string(),
+                            skip_reason: cell.skip_reason.clone(),
+                            skips: cell.skips,
+                            calls: cell.calls,
+                            tokens_input: cell.tokens_input,
+                            tokens_output: cell.tokens_output,
+                        });
+                    event.at = Some(w.end);
+                    events
+                        .append(event)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
                 written += 1;
             }
         }
@@ -609,8 +640,58 @@ impl SpendVerdictStore {
         since: DateTime<Utc>,
         until: DateTime<Utc>,
     ) -> anyhow::Result<Vec<VerdictLine>> {
-        verdict_lines(&self.pool, since, until).await
+        // 读切换：判词已在流上（写者与表同落），这里从流上折同一问。
+        verdicts_between_from_stream(&self.pool, since, until).await
     }
+}
+
+/// 同一问，**从事件流算**（窗口的终点落在区间内的判词）。
+pub async fn verdicts_between_from_stream(
+    pool: &PgPool,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+) -> anyhow::Result<Vec<VerdictLine>> {
+    verdict_lines_from_stream(pool, since, until).await
+}
+
+/// 同一问，**从事件流算**：窗口**结束**在区间内的那些判词，按 `(actor, verdict, reason)` 合并。
+pub async fn verdict_lines_from_stream(
+    pool: &PgPool,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+) -> anyhow::Result<Vec<VerdictLine>> {
+    let rows: Vec<(String, String, String, i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT COALESCE(attributes::jsonb ->> 'actor','') AS actor, \
+                COALESCE(attributes::jsonb ->> 'verdict','') AS verdict, \
+                COALESCE(attributes::jsonb ->> 'skip_reason','') AS skip_reason, \
+                COUNT(*)::BIGINT AS cells, \
+                COALESCE(SUM((attributes::jsonb ->> 'skips')::BIGINT), 0)::BIGINT AS skips, \
+                COALESCE(SUM((attributes::jsonb ->> 'tokens_input')::BIGINT), 0)::BIGINT AS tokens_input, \
+                COALESCE(SUM((attributes::jsonb ->> 'tokens_output')::BIGINT), 0)::BIGINT AS tokens_output \
+           FROM cogneva_event \
+          WHERE kind = 'spend_verdict' AND at >= $1 AND at < $2 \
+          GROUP BY 1, 2, 3 ORDER BY 1, 2, 3",
+    )
+    .bind(since)
+    .bind(until)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(actor, verdict, skip_reason, cells, skips, tokens_input, tokens_output)| {
+                VerdictLine {
+                    actor,
+                    verdict,
+                    skip_reason,
+                    cells,
+                    skips,
+                    tokens_input,
+                    tokens_output,
+                }
+            },
+        )
+        .collect())
 }
 
 /// The cells whose windows lie wholly inside `[since, until)`.
@@ -766,7 +847,8 @@ pub const FRESHNESS_CAPABILITY_ID: &str = "spend_verdict_current";
 /// state the newest judged window ended one window ago. A bound of one window
 /// would be red half the time on a healthy system, and a bound nobody can be
 /// inside is the same as no bound.
-// cap: bound — 稳态滞后就是一个窗口，留一个窗口的余量；两倍窗口是「漏了一整趟」的界
+// cap: fixed — 稳态滞后就是一个窗口，留一个窗口的余量；两倍窗口是「漏了一整趟」的界
+// keep: 删掉后「漏了一整趟」没有判据；由「两倍窗口是漏了一整趟的界」兜住
 pub const FRESHNESS_MAX_LAG: Duration = Duration::from_secs(2 * WINDOW_SECS as u64);
 
 /// Where the projection's watermark comes from.

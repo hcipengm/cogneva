@@ -9,7 +9,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // CryptoProvider，首次 TLS 调用会 panic——必须在任何 TLS 使用之前安装。
     // install_default 仅在本进程已装过 provider 时返回 Err；那同样是可用的
     // provider，因此忽略结果，不阻断启动。
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    cog_core::ignore_lost!(rustls::crypto::ring::default_provider().install_default());
 
     // 构建标签加 git 修订，唯一标识本进程跑的代码状态：一条只告实例的
     // 告警（如 background_loop_stalled 按 loop 名、按 pod 各自判定）要能
@@ -50,6 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         command,
         Command::Run
             | Command::SecurityGateway
+            | Command::BatchEdit
             | Command::VolumeWalker
             | Command::HostLedger
             | Command::ClaimStore
@@ -79,6 +80,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| format!("HTTP 客户端造不出来: {e}"))?;
             Ok(std::sync::Arc::new(client) as std::sync::Arc<dyn cog_core::HttpClient>)
         });
+    }
+
+    // 原则语料：配置了三样（包 key、原文哈希、发布公钥）就装载；装不成就空着
+    // 启动——生成侧拿不到未经验签的内容，这是失败关闭。
+    if matches!(command, Command::Run | Command::SecurityGateway) {
+        match cogneva::principle_corpus::load_and_install().await {
+            Ok(Some(count)) => tracing::info!(principles = count, "principle bundle loaded"),
+            Ok(None) => tracing::info!("no principle bundle configured"),
+            Err(error) => tracing::error!(
+                error = %error,
+                "principle bundle refused; the generator starts without one"
+            ),
+        }
     }
 
     match command {
@@ -167,13 +181,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(provider_compat),
                 observability.pool,
                 observability.volume_footprint,
+                // 流式正文的落点：装配层连的库与账本、告警、池读数是同一个。
+                observability.body_store,
             )
             .await
         }
-        // 独立沙箱执行器模式（deploy/k3s/sandbox-executor-deployment.yaml 的启动命令）。
+        // 独立沙箱执行器模式（deploy/k3s/sandbox-executor-statefulset.yaml 的启动命令）。
         Command::SandboxExecutor => cog_extension::command_server::run_from_env().await,
         // 卷占用走查：挂在只由第三方进程写入的卷上的边车，把该卷的盘上字节发布成
         // 卷族序列（deploy/k3s/cluster-registry.yaml 的 volume-walker 容器）。
+        // 生成侧在装配层：agent、工具、模型入口都由这里与主应用同一套构造函数造出来，
+        // 产品自己那条路（`cog_orchestrator::batch_edit`）只留判词、组请求与循环。
+        Command::BatchEdit => cogneva::batch_edit_agent::run_from_env().await,
+        Command::ChatRebuild => cogneva::chat_rebuild::run_from_env().await,
+        Command::RosterRebuild => cogneva::roster_rebuild::run_from_env().await,
+        Command::ArchiveEvents => cogneva::archive_events::run_from_env().await,
+        Command::Keys => cogneva::keys::run_from_env().await,
+        Command::TableCensus => cogneva::table_census::run_from_env(),
+        Command::ChangeDivergence => cogneva::change_divergence::run_from_env().await,
+        Command::ChangeLedgerParity => cogneva::change_ledger_parity::run_from_env().await,
+        Command::CacheMisses => cogneva::cache_misses::run_from_env().await,
+        Command::CellPlan => cogneva::cell_plan::run_from_env(),
+        Command::BuildPlans => cogneva::build_plan_readings::run_from_env().await,
+        Command::LandingStates => cogneva::landing_states::run_from_env().await,
+        Command::TableDigest => cogneva::table_digest::run_from_env().await,
+        Command::TableDiff => cogneva::table_digest::diff_from_env().await,
+        Command::TableCopy => cogneva::table_copy::run_from_env().await,
+        Command::TableSwap => cogneva::table_swap::run_from_env().await,
+        Command::DbPressure => cogneva::db_pressure::run_from_env().await,
+        // 判词的退出码就是结局：0 没事、2 该切、3 判了一半（「量不到」不许读成「没事」）。
+        Command::StoragePressure => {
+            let code = cogneva::storage_pressure::run_from_env().await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Command::UsageParity => cogneva::usage_parity::run_from_env().await,
+        Command::BatchPlan => cog_orchestrator::batch_plan::run_from_stdin().await,
+        Command::Ledger => {
+            // 开轮之前先让平台的批计划器判这一批（流程第 4 步）：定批是固定程序，
+            // 计划站不住就不该开出一条轮——一套验证付在这一批上，而这一批不成立。
+            if std::env::args().nth(2).as_deref() == Some("open") {
+                match ledger_batch_holds().await {
+                    Ok(0) => println!("ledger: 台账里没有未完成的待办。"),
+                    Ok(n) => println!("ledger: 这一批的计划成立（{n} 条，两种验收形状）。"),
+                    Err(defect) => {
+                        eprintln!("ledger: 这一批不成立，开不出轮：{defect}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            // 事件流那本书：台账不在 git 里时（平台自己的变更账）由这条流来钉。
+            // 连接不上只是这本书不可用，git 那本书照常；「读不到」由调用它的那个动作说。
+            let events = ledger_round_events().await;
+            std::process::exit(cog_collaboration::actors::ledger::run(events).await)
+        }
         Command::VolumeWalker => cogneva::volume_walker::run_from_env().await,
         // 宿主账本的拆解面：每节点一个只读进程，把宿主 cgroup v2 的三个 slice 各按
         // anon / file 拆开（deploy/k3s/host-ledger-daemonset.yaml 的启动命令）。
@@ -203,6 +266,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 逐格比，然后删库。跑在独立的 CronJob 里，所以源库哪怕连不上也不影响
         // 主应用——但它必须连得上才谈得上演练。
         Command::BackupDrill => cogneva::backup::run_drill_from_env().await,
+        // 指标三张累加表的重建：它们是投影，真源是 Prometheus。样本日志不是来源——
+        // 保留窗口会把旧样本清掉，实测 500 条累加里 469 条已经对不上日志。
+        Command::RebuildMetricProjections => {
+            cogneva::metric_projection_rebuild::run_from_env().await
+        }
+        // 历史记录文件的导入：这一步之后盘上那份 `<id>.json` 就没有读者了，
+        // 队列的正本是事件流。
+        Command::ImportChangeRecords => cogneva::import_change_records::run_from_env().await,
+        // 一条变更的 diff 从队列导出：盘上那份只是工件，导出要带得出水位。
+        Command::ExportChangeDiff => {
+            let argv: Vec<String> = std::env::args().collect();
+            cogneva::export_change_diff::run_from_args(&argv).await
+        }
         // Torn AOF tail repair: runs in the redis Pod's init container, which is
         // what moves "a host that died uncleanly means truncating the AOF by
         // hand" onto the startup path.
@@ -225,6 +301,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 带外 worker 的任务面：读自己名下的任务、按租约开工、把结果发回同一条
         // results 流，完成与依赖调度仍由编排器那一份实现执行。
         Command::Work => cogneva::work::run_from_args().await,
+        // 运行时原则账的一次性读写面：与 governance 同样直接开共享库，因为调用方
+        // 可能是没有平台令牌的宿主进程，而账只有一本。
+        Command::Principles => cogneva::principles_cli::run_from_args().await,
         Command::WindowsService => {
             #[cfg(windows)]
             {
@@ -276,3 +355,49 @@ const STANDALONE_LOG_SERVICES: &[(Command, &str)] = &[
     (Command::Restore, "cogneva-restore"),
     (Command::BackupDrill, "cogneva-backup-drill"),
 ];
+
+/// `cogneva ledger` 的事件流书。没有配置库就是没有这本书（`None`），不是错误：
+/// 台账在 git 里时根本用不到它。
+async fn ledger_round_events() -> Option<std::sync::Arc<dyn cog_core::RoundEvents>> {
+    let url = std::env::var(cog_core::env::DATABASE_URL).ok()?;
+    let writer = std::env::var("COGNEVA_WRITER").unwrap_or_else(|_| "worker".to_string());
+    match sqlx::PgPool::connect(&url).await {
+        Ok(pool) => {
+            let store: std::sync::Arc<dyn cog_core::RoundEvents> =
+                std::sync::Arc::new(cog_storage::RoundEventStore::new(pool, writer));
+            Some(store)
+        }
+        Err(e) => {
+            eprintln!("ledger: 事件流连不上（{e}）；这一侧没有那本书");
+            None
+        }
+    }
+}
+
+/// 这一批交给 `LedgerBatchPlanner`，再按固定程序校一遍。返回的是计划站不住的那一句。
+async fn ledger_batch_holds() -> Result<usize, String> {
+    use cog_core::BatchPlanner;
+    let path = cog_collaboration::actors::ledger::ledger_path()?;
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("台账读不到：{}（{e}）", path.display()))?;
+    let items = cog_core::contract::ledger_item::parse_md(&text)?;
+    let touches = cog_collaboration::actors::ledger::touches_by_id(&text);
+    let batch: Vec<cog_core::BatchItem> = items
+        .iter()
+        .map(|i| cog_core::BatchItem {
+            id: i.id.clone(),
+            title: i.terminal.clone(),
+            touches: touches.get(&i.id).cloned().unwrap_or_default(),
+            item: i.clone(),
+        })
+        .collect();
+    if batch.is_empty() {
+        return Ok(0);
+    }
+    let plan = cog_orchestrator::action_planner::LedgerBatchPlanner::new()
+        .plan_batch(&batch)
+        .await
+        .map_err(|e| e.to_string())?;
+    plan.validate().map_err(|defect| format!("{defect:?}"))?;
+    Ok(batch.len())
+}

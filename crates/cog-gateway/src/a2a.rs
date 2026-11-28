@@ -29,14 +29,15 @@ use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
+use axum::Extension;
 use axum::Json;
 use futures::stream::Stream;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use cog_core::{
-    A2aTask, A2aTaskStatus, A2aVersion, MessagePart, OrchestratorControl, Task, TaskArtifact,
-    TaskMessage, TaskStatus,
+    A2aTask, A2aTaskStatus, A2aVersion, Claims, MessagePart, OrchestratorControl, Task,
+    TaskArtifact, TaskMessage, TaskStatus,
 };
 
 use crate::GatewayState;
@@ -236,7 +237,7 @@ fn card_v03(base: &str) -> Value {
     json!({
         "protocolVersion": "0.3",
         "name": "cogneva",
-        "description": "Cogneva autonomous multi-agent collaboration platform",
+        "description": "Cogneva autonomous multi-agent collaboration platform. Every message becomes a goal that is decomposed into work; a goal may be a question, and it is still filed as work — this endpoint has no separate conversation channel.",
         "url": format!("{base}{A2A_RPC}"),
         "version": env!("CARGO_PKG_VERSION"),
         "capabilities": capabilities_wire(),
@@ -257,7 +258,7 @@ fn card_v10(base: &str) -> Value {
     let endpoint = format!("{base}{A2A_RPC}");
     json!({
         "name": "cogneva",
-        "description": "Cogneva autonomous multi-agent collaboration platform",
+        "description": "Cogneva autonomous multi-agent collaboration platform. Every message becomes a goal that is decomposed into work; a goal may be a question, and it is still filed as work — this endpoint has no separate conversation channel.",
         "supportedInterfaces": [
             {"url": endpoint, "protocolBinding": "JSONRPC", "protocolVersion": "1.0"},
             {"url": endpoint, "protocolBinding": "JSONRPC", "protocolVersion": "0.3"},
@@ -428,13 +429,15 @@ fn max_stream() -> Duration {
 /// 「读得到这一行」，接口就只该说这件事。
 #[async_trait::async_trait]
 pub trait GoalReader: Send + Sync {
-    async fn goal(&self, goal_id: &str) -> Option<Task>;
+    /// `Ok(None)` 是「图里没有这一行」，`Err` 是「读不到」——对端据这个区别决定
+    /// 换 id 还是重试，所以这一层不能把两者并成一个 `None`（CC20）。
+    async fn goal(&self, goal_id: &str) -> cog_core::SFResult<Option<Task>>;
 }
 
 #[async_trait::async_trait]
 impl GoalReader for Arc<dyn OrchestratorControl> {
-    async fn goal(&self, goal_id: &str) -> Option<Task> {
-        self.get_task(goal_id).await
+    async fn goal(&self, goal_id: &str) -> cog_core::SFResult<Option<Task>> {
+        self.get_task_checked(goal_id).await
     }
 }
 
@@ -465,9 +468,15 @@ async fn accept_goal(sink: &dyn GoalSink, goal: &str, row: Task) -> Result<Task,
     let goal_id = row.id.clone();
     let submitted = sink.submit(goal, row).await;
     accepted(&goal_id, submitted)?;
-    sink.goal(&goal_id)
-        .await
-        .ok_or_else(|| format!("the goal '{goal_id}' was submitted but cannot be read back"))
+    match sink.goal(&goal_id).await {
+        Ok(Some(task)) => Ok(task),
+        Ok(None) => Err(format!(
+            "the goal '{goal_id}' was submitted but cannot be read back"
+        )),
+        Err(e) => Err(format!(
+            "the goal '{goal_id}' was submitted but the graph could not answer: {e}"
+        )),
+    }
 }
 
 // ─── 状态映射 ─────────────────────────────────────────────────────────────
@@ -826,9 +835,11 @@ fn a2a_task_with_history(task: &Task, wanted: usize) -> A2aTask {
 
 /// 一页默认几条、最多几条。两数出自规范对 `page_size` 的说明：不写就按 50，
 /// 值域 1..=100。
-// cap: derived — 出自 A2A 规范对 page_size 的说明：不写按 50，值域 1..=100
-const LIST_PAGE_DEFAULT: usize = 50;
-// cap: bound — the A2A specification's page_size ceiling
+// cap: fixed — 出自 A2A 规范对 page_size 的说明：不写按 50，值域 1..=100
+// not-a-bound: 出自 A2A 规范对 page_size 的说明：不写按 50，值域 1..=100
+const LIST_PAGE_DEFAULT: usize = cog_core::config::A2A_LIST_PAGE_SIZE as usize;
+// cap: fixed — the A2A specification's page_size ceiling
+// keep: 删掉后回到「the A2A specification's page_size ceiling」所描述的情形；由这条约定兜住
 const LIST_PAGE_MAX: usize = 100;
 
 /// `ListTasks` 的过滤与分页条件（解析之后的样子）。
@@ -1021,7 +1032,28 @@ fn goal_stream(state: StreamState) -> impl Stream<Item = Result<Bytes, std::io::
             }
 
             let reader = s.reader.clone();
-            let row = reader.goal(&s.goal_id).await;
+            // 读不到不能在这里静默重试到截止：到点时它会答「这一行从没出现过」，
+            // 而那是一句关于任务的断言——库读不出来时它完全可能一直在那里（CC20）。
+            // 当场报一帧、收流，与上面那条「到点零帧」同一条理由。
+            let row = match reader.goal(&s.goal_id).await {
+                Ok(row) => row,
+                Err(e) => {
+                    s.done = true;
+                    tracing::warn!(goal_id = %s.goal_id, error = %e,
+                        "the goal row could not be read; the stream answers the read failure");
+                    let frame = sse_frame(&json!({
+                        "jsonrpc": "2.0",
+                        "id": s.rpc_id,
+                        "error": {
+                            "code": -32603,
+                            "message": format!(
+                                "the goal '{}' could not be read: {e}", s.goal_id
+                            ),
+                        },
+                    }));
+                    return Some((Ok(frame), s));
+                }
+            };
             if let Some(task) = row {
                 s.seen_row = true;
                 let state = a2a_state(task.status);
@@ -1060,6 +1092,7 @@ pub async fn message_stream_handler(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
     uri: Uri,
+    caller: Option<Extension<Claims>>,
     Json(body): Json<Value>,
 ) -> Response {
     let version = match requested_version(&headers, &uri) {
@@ -1072,7 +1105,7 @@ pub async fn message_stream_handler(
             return (StatusCode::OK, Json(rpc_error(&rpc_id, -32009, message))).into_response();
         }
     };
-    message_stream_for(state, body, version).await
+    message_stream_for(state, body, version, caller).await
 }
 
 /// 版本已经定下来之后的流式受理。
@@ -1084,6 +1117,7 @@ async fn message_stream_for(
     state: Arc<GatewayState>,
     body: Value,
     version: A2aVersion,
+    caller: Option<Extension<Claims>>,
 ) -> Response {
     let request = match parse_message_stream(&body) {
         Ok(request) => request,
@@ -1105,7 +1139,32 @@ async fn message_stream_for(
     // 存在的缺陷。重发的判据也与 `message/send` 同一个：这一行已经在，就订阅
     // 它，不再分解一次。
     let already = if request.message_id.is_some() {
-        GoalReader::goal(&state.orchestrator, &goal_id).await
+        // 这条消息是不是已经受理过，只能由图来答；图读不出来时既不当作「没受理过」
+        // 再去提交一份，也不当作「受理过」去订阅——两句话都是关于那一行的断言（CC20）。
+        match GoalReader::goal(&state.orchestrator, &goal_id).await {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::error!(goal_id = %goal_id, error = %e,
+                    "a2a message/stream cannot tell whether this message was already accepted");
+                let frame = sse_frame(&json!({
+                    "jsonrpc": "2.0",
+                    "id": request.rpc_id,
+                    "error": {
+                        "code": -32603,
+                        "message": format!("the graph could not be read: {e}"),
+                    },
+                }));
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .header("x-accel-buffering", "no")
+                    .body(Body::from(frame))
+                    .unwrap_or_else(|_| {
+                        (StatusCode::OK, "the graph could not be read").into_response()
+                    });
+            }
+        }
     } else {
         None
     };
@@ -1114,16 +1173,35 @@ async fn message_stream_for(
     } else {
         let mut goal_row = Task::goal_row(goal_id.clone(), &request.goal);
         goal_row.workspace_id = None;
+        goal_row.input["origin"] = a2a_origin(
+            caller.as_ref().map(|Extension(claims)| claims),
+            request.message_id.as_deref(),
+        );
+        let intent = cog_core::IntentRow::new(
+            "a2a",
+            cog_core::intent_identity("a2a", &goal_id),
+            caller
+                .as_ref()
+                .map(|Extension(claims)| claims.sub.clone())
+                .unwrap_or_default(),
+            "",
+            &request.goal,
+            None,
+        );
+        crate::intent::record(state.intent_events.as_ref(), intent).await;
         // 提交在开流之前等它落地，理由与 `message/send` 是同一个：这一行要读不回来，
         // 流能给出的只有「这一行从没出现过」——而那与「提交被拒」是两件事，对端要等
         // 满一个截止时间才能听到前者。拒了就当场报一帧，理由照实说。
         if let Err(reason) = accept_goal(&state.orchestrator, &request.goal, goal_row).await {
             // 同一个 `messageId` 的两份请求可以同时到：先到的插了行，后到的在批量
             // 注入里被跳过。库里有这一行就照样订阅，不把一次已受理读成拒收。
+            // 读失败在这里按「没看到那一行」算：这一支本来要答的就是「没受理」，
+            // 读不出来只是让这个答案少了那一半的旁证，不会据此多提交一份。
             let raced = request.message_id.is_some()
-                && GoalReader::goal(&state.orchestrator, &goal_id)
-                    .await
-                    .is_some();
+                && matches!(
+                    GoalReader::goal(&state.orchestrator, &goal_id).await,
+                    Ok(Some(_))
+                );
             if !raced {
                 tracing::error!(goal_id = %goal_id, reason = %reason, "a2a message/stream was not accepted");
                 let frame = sse_frame(&json!({
@@ -1255,6 +1333,7 @@ pub async fn rpc_handler(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
     uri: Uri,
+    caller: Option<Extension<Claims>>,
     Json(body): Json<Value>,
 ) -> Response {
     let rpc_id = body.get("id").cloned().unwrap_or(Value::Null);
@@ -1266,10 +1345,10 @@ pub async fn rpc_handler(
     };
     match body.get("method").and_then(Value::as_str) {
         Some("message/send") | Some("SendMessage") => {
-            rpc_message_send(&state, &body, &rpc_id, version).await
+            rpc_message_send(&state, &body, &rpc_id, version, caller).await
         }
         Some("message/stream") | Some("SendStreamingMessage") => {
-            message_stream_for(state, body, version).await
+            message_stream_for(state, body, version, caller).await
         }
         Some("tasks/get") | Some("GetTask") => rpc_tasks_get(&state, &body, &rpc_id, version).await,
         Some("tasks/cancel") | Some("CancelTask") => {
@@ -1370,6 +1449,32 @@ fn accepted(goal_id: &str, submitted: cog_core::SFResult<Vec<String>>) -> Result
 ///
 /// **1.0 的 `SendMessage` 还有一层**：那一版规定不带 `configuration.returnImmediately`
 /// 时默认**阻塞**到任务进入终态或被打断（`INPUT_REQUIRED`/`AUTH_REQUIRED`）。这不是
+/// 这一条 A2A 请求的归属：谁提的、说给谁、哪一条消息。
+///
+/// 认证主体取的是中间件已经验过的那一份（`Claims`），不在这里再读一次
+/// `Authorization`——两处各验一次，第二次的结果没人保证与第一次相同。
+/// `addressed_to` 今天在 A2A 请求里没有显式目标（名片就是平台），写空串并在
+/// 字段说明里讲清；不拿 `messageId` 冒充「说给谁」。
+pub fn a2a_origin(caller: Option<&Claims>, message_id: Option<&str>) -> serde_json::Value {
+    let (said_by, said_by_name) = match caller {
+        Some(claims) => (claims.sub.clone(), Some(claims.preferred_username.clone())),
+        // 没有令牌：这条连接没有身份。空串是「没有身份的那条连接」，不是「匿名用户」。
+        None => (String::new(), None),
+    };
+    let mut origin = json!({
+        "source": "a2a",
+        "said_by": said_by,
+        "addressed_to": "",
+    });
+    if let Some(name) = said_by_name {
+        origin["said_by_name"] = Value::String(name);
+    }
+    if let Some(id) = message_id {
+        origin["message_id"] = Value::String(id.to_string());
+    }
+    origin
+}
+
 /// 可选的风格差异，是同一份请求在两版里承诺不同的东西：0.3 的 `message/send` 回的是
 /// 「受理了」，1.0 回的是「跑完了」。按 0.3 的样子回给 1.0 的对端，它会拿一个
 /// `submitted` 当最终答复收工——比报错更糟，因为它不报错。
@@ -1378,6 +1483,7 @@ async fn rpc_message_send(
     body: &Value,
     rpc_id: &Value,
     version: A2aVersion,
+    caller: Option<Extension<Claims>>,
 ) -> Response {
     let request = match parse_message_stream(body) {
         Ok(request) => request,
@@ -1395,14 +1501,48 @@ async fn rpc_message_send(
     // 重发先读、后提交：提交会经过分解，那是一次要花配额的上游调用——先读一行
     // 比再分解一次便宜得多，而这一行在，就说明这条消息已经被受理过。
     if request.message_id.is_some() {
-        if let Some(existing) = GoalReader::goal(&orchestrator, &goal_id).await {
-            tracing::info!(goal_id = %goal_id, "a2a message/send repeated a message already accepted");
-            return send_result(rpc_id, version, &orchestrator, &goal_id, existing, body).await;
+        match GoalReader::goal(&orchestrator, &goal_id).await {
+            Ok(Some(existing)) => {
+                tracing::info!(goal_id = %goal_id, "a2a message/send repeated a message already accepted");
+                return send_result(rpc_id, version, &orchestrator, &goal_id, existing, body).await;
+            }
+            Ok(None) => {}
+            // 读不到就既不能答「重发」也不能再提交一份：那一行可能就在图里，
+            // 再交一次就是同一条消息的两份分解（CC20）。
+            Err(e) => {
+                tracing::error!(goal_id = %goal_id, error = %e,
+                    "a2a message/send cannot tell whether this message was already accepted");
+                return (
+                    StatusCode::OK,
+                    Json(rpc_error(
+                        rpc_id,
+                        -32603,
+                        format!("the graph could not be read: {e}"),
+                    )),
+                )
+                    .into_response();
+            }
         }
     }
 
     let mut goal_row = Task::goal_row(goal_id.clone(), &request.goal);
     goal_row.workspace_id = None;
+    goal_row.input["origin"] = a2a_origin(
+        caller.as_ref().map(|Extension(claims)| claims),
+        request.message_id.as_deref(),
+    );
+    let intent = cog_core::IntentRow::new(
+        "a2a",
+        cog_core::intent_identity("a2a", &goal_id),
+        caller
+            .as_ref()
+            .map(|Extension(claims)| claims.sub.clone())
+            .unwrap_or_default(),
+        "",
+        &request.goal,
+        None,
+    );
+    crate::intent::record(state.intent_events.as_ref(), intent).await;
     // 回执读的是库里的那一行，不是本地构造的这一份：受理之后状态可能已经被派工
     // 改过，对端要的是它现在是什么样。
     let row = match accept_goal(&orchestrator, &request.goal, goal_row).await {
@@ -1411,16 +1551,31 @@ async fn rpc_message_send(
         // 把行插进去，后到的那份在批量注入里按 id 被跳过、回执里没有这个 id。
         // 这不等于「没受理」——库里有这一行就是受理了，回它。
         Err(reason) => match GoalReader::goal(&orchestrator, &goal_id).await {
-            Some(existing) if request.message_id.is_some() => {
+            Ok(Some(existing)) if request.message_id.is_some() => {
                 tracing::info!(
                     goal_id = %goal_id,
                     "a2a message/send lost the race to the same message and answers the row it found"
                 );
                 return send_result(rpc_id, version, &orchestrator, &goal_id, existing, body).await;
             }
-            _ => {
+            Ok(_) => {
                 tracing::error!(goal_id = %goal_id, reason = %reason, "a2a message/send was not accepted");
                 return (StatusCode::OK, Json(rpc_error(rpc_id, -32603, reason))).into_response();
+            }
+            // 提交被拒、图又读不出来：两句一起说，否则对端会以为「只是没受理」，
+            // 而真正的原因可能是那一行其实已经在了（CC20）。
+            Err(e) => {
+                tracing::error!(goal_id = %goal_id, reason = %reason, error = %e,
+                    "a2a message/send was not accepted and the graph could not be read");
+                return (
+                    StatusCode::OK,
+                    Json(rpc_error(
+                        rpc_id,
+                        -32603,
+                        format!("{reason}; the graph could not be read either: {e}"),
+                    )),
+                )
+                    .into_response();
             }
         },
     };
@@ -1442,7 +1597,14 @@ async fn send_result(
     body: &Value,
 ) -> Response {
     let row = if blocks_until_done(body, version) {
-        wait_until_done(orchestrator, goal_id, &row).await
+        match wait_until_done(orchestrator, goal_id, &row).await {
+            Ok(row) => row,
+            // 等的过程里读不出来：答「读不到」，不拿等待前那一刻的旧行当终局递回去
+            // ——那会让对端把一次读故障读成「任务还在这一步」（CC20）。
+            Err(e) => {
+                return (StatusCode::OK, Json(rpc_error(rpc_id, -32603, e))).into_response();
+            }
+        }
     } else {
         row
     };
@@ -1487,7 +1649,7 @@ async fn wait_until_done(
     orchestrator: &Arc<dyn OrchestratorControl>,
     goal_id: &str,
     first: &Task,
-) -> Task {
+) -> Result<Task, String> {
     let deadline = tokio::time::Instant::now() + max_stream();
     let mut current = first.clone();
     // 停止点是「终态，或被打断」：规范把 `INPUT_REQUIRED`/`AUTH_REQUIRED` 也算作
@@ -1506,15 +1668,22 @@ async fn wait_until_done(
                 goal_id,
                 "a blocking SendMessage hit its wait ceiling; answering with the row as it stands"
             );
-            return current;
+            return Ok(current);
         }
         tokio::time::sleep(poll_interval()).await;
-        match orchestrator.get_task(goal_id).await {
-            Some(row) => current = row,
-            None => return current,
+        match orchestrator.get_task_checked(goal_id).await {
+            Ok(Some(row)) => current = row,
+            // 读到了「没有这一行」：等不到终局了，回手里的那一行。
+            Ok(None) => return Ok(current),
+            // 读不到不是「它没了」，也不是「它还在动」：交给上面的读口作答。
+            Err(e) => {
+                return Err(format!(
+                    "the task '{goal_id}' could not be read while waiting for it to end: {e}"
+                ));
+            }
         }
     }
-    current
+    Ok(current)
 }
 
 /// `tasks/get`：按 id 读一行，带上它已有的结果与失败原因。
@@ -1535,8 +1704,10 @@ async fn rpc_tasks_get(
             .into_response();
     };
 
-    match state.orchestrator.get_task(task_id).await {
-        Some(task) => (
+    // 「没有这条任务」是读到的答案；读失败是另一件事，不能答成同一个 -32001：
+    // 对端据这个码决定是换 id 还是重试，而库读不出来时 id 完全可能还在。
+    match state.orchestrator.get_task_checked(task_id).await {
+        Ok(Some(task)) => (
             StatusCode::OK,
             Json(jsonrpc_result(
                 rpc_id,
@@ -1544,12 +1715,39 @@ async fn rpc_tasks_get(
             )),
         )
             .into_response(),
-        None => (
+        Ok(None) => (
             StatusCode::OK,
             Json(rpc_error(rpc_id, -32001, format!("no task '{task_id}'"))),
         )
             .into_response(),
+        Err(e) => (
+            StatusCode::OK,
+            Json(rpc_error(
+                rpc_id,
+                -32603,
+                format!("the task could not be read: {e}"),
+            )),
+        )
+            .into_response(),
     }
+}
+
+/// 读任务表；读不到就回一帧 JSON-RPC 内部错误。
+///
+/// 分页是对「已经读到的那一页」做的。先把读失败折成空表，`ListTasks` 就会在库
+/// 读不出来的时候答「你有 0 条任务」——对端唯一的视野，被一句它无法分辨的
+/// 谎话填满：与一个真的还没建过活的部署逐字同形。
+fn task_rows_or_error(
+    reading: cog_core::SFResult<Vec<Task>>,
+    rpc_id: &Value,
+) -> Result<Vec<Task>, Value> {
+    reading.map_err(|e| {
+        rpc_error(
+            rpc_id,
+            -32603,
+            format!("the task list could not be read: {e}"),
+        )
+    })
 }
 
 /// `ListTasks`（1.0）：翻一页对端能看见的任务。
@@ -1574,7 +1772,11 @@ async fn rpc_list_tasks(
         }
     };
 
-    let (page, next, total) = list_page(state.orchestrator.get_all_tasks().await, &query);
+    let tasks = match task_rows_or_error(state.orchestrator.get_all_tasks_checked().await, rpc_id) {
+        Ok(tasks) => tasks,
+        Err(error) => return (StatusCode::OK, Json(error)).into_response(),
+    };
+    let (page, next, total) = list_page(tasks, &query);
     let tasks: Vec<Value> = page
         .iter()
         .map(|task| {
@@ -1637,10 +1839,21 @@ async fn rpc_tasks_resubscribe(
     };
 
     match GoalReader::goal(&state.orchestrator, task_id).await {
-        Some(_) => goal_stream_response(state, task_id.to_string(), rpc_id.clone(), version),
-        None => (
+        Ok(Some(_)) => goal_stream_response(state, task_id.to_string(), rpc_id.clone(), version),
+        Ok(None) => (
             StatusCode::OK,
             Json(rpc_error(rpc_id, -32001, format!("no task '{task_id}'"))),
+        )
+            .into_response(),
+        // 「读不到」不能答成「没有这条任务」：对端据那个码决定换 id，而库里
+        // 可能正压着它（CC20）。
+        Err(e) => (
+            StatusCode::OK,
+            Json(rpc_error(
+                rpc_id,
+                -32603,
+                format!("the task could not be read: {e}"),
+            )),
         )
             .into_response(),
     }
@@ -1669,19 +1882,35 @@ async fn rpc_tasks_cancel(
             .into_response();
     };
 
-    if state.orchestrator.get_task(task_id).await.is_none() {
-        return (
-            StatusCode::OK,
-            Json(rpc_error(rpc_id, -32001, format!("no task '{task_id}'"))),
-        )
-            .into_response();
+    match state.orchestrator.get_task_checked(task_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::OK,
+                Json(rpc_error(rpc_id, -32001, format!("no task '{task_id}'"))),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            // 读失败不是「这个 id 不存在」：对端会拿 -32001 去换一个 id，
+            // 而那一行可能还在，只是这一侧读不动它。
+            return (
+                StatusCode::OK,
+                Json(rpc_error(
+                    rpc_id,
+                    -32603,
+                    format!("task '{task_id}' could not be read: {e}"),
+                )),
+            )
+                .into_response();
+        }
     }
 
     match state.orchestrator.cancel_task(task_id).await {
         Ok(cascaded) => {
             tracing::info!(task_id, cascaded = cascaded.len(), "a2a tasks/cancel");
-            match state.orchestrator.get_task(task_id).await {
-                Some(task) => (
+            match state.orchestrator.get_task_checked(task_id).await {
+                Ok(Some(task)) => (
                     StatusCode::OK,
                     Json(jsonrpc_result(
                         rpc_id,
@@ -1689,12 +1918,21 @@ async fn rpc_tasks_cancel(
                     )),
                 )
                     .into_response(),
-                None => (
+                Ok(None) => (
                     StatusCode::OK,
                     Json(rpc_error(
                         rpc_id,
                         -32603,
                         format!("task '{task_id}' was cancelled but can no longer be read"),
+                    )),
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::OK,
+                    Json(rpc_error(
+                        rpc_id,
+                        -32603,
+                        format!("task '{task_id}' was cancelled but could not be read: {e}"),
                     )),
                 )
                     .into_response(),
@@ -1714,6 +1952,74 @@ async fn rpc_tasks_cancel(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn claims(sub: &str, name: &str) -> Claims {
+        Claims {
+            sub: sub.into(),
+            iss: "https://issuer".into(),
+            aud: "cogneva".into(),
+            exp: 0,
+            iat: 0,
+            jti: "j".into(),
+            token_use: Default::default(),
+            preferred_username: name.into(),
+            user_type: cog_core::UserType::Standard,
+            workspace_ids: Vec::new(),
+            permissions: Vec::new(),
+            roles: Vec::new(),
+        }
+    }
+
+    /// A2A 的身份形状与统一写入口同形：同一条消息重投是同一行，原文不改写。
+    #[test]
+    fn an_a2a_message_lands_as_one_intent_row() {
+        let identity = cog_core::intent_identity("a2a", "goal-9");
+        assert_eq!(identity, "a2a:goal-9");
+        let row = cog_core::IntentRow::new(
+            "a2a",
+            identity.clone(),
+            "u-1",
+            "",
+            "刷新接口未区分访问令牌",
+            None,
+        );
+        assert_eq!(row.idempotency_key(), identity);
+        assert_eq!(row.text, "刷新接口未区分访问令牌");
+        assert!(row.addressed_to.is_empty());
+        let replay = cog_core::IntentRow::new("a2a", identity.clone(), "u-1", "", "同一条", None);
+        assert_eq!(replay.idempotency_key(), row.idempotency_key());
+    }
+
+    /// 契约写在对端读得到的那张名片上：每一条 message 都落成一条 goal（问题也是
+    /// 一条要回答的活），这里没有单独的对话通道。对端据此决定要不要在这里「聊」。
+    #[test]
+    fn the_card_says_what_an_a2a_message_becomes() {
+        for card in [card_v03("http://x"), card_v10("http://x")] {
+            let text = card["description"].as_str().expect("a description");
+            assert!(text.contains("no separate conversation channel"), "{text}");
+            assert!(text.contains("decomposed into work"), "{text}");
+        }
+    }
+
+    /// 归属写在 goal 行的 input 里：谁提的、说给谁、哪一条消息。空串是「这条连接
+    /// 没有身份」，不是编一个匿名用户；`addressed_to` 没有显式目标时就是空串，
+    /// 不拿 messageId 冒充。
+    #[test]
+    fn an_a2a_goal_carries_who_asked() {
+        let named = a2a_origin(Some(&claims("u-1", "owner")), Some("msg-7"));
+        assert_eq!(named["source"], "a2a");
+        assert_eq!(named["said_by"], "u-1");
+        assert_eq!(named["said_by_name"], "owner");
+        assert_eq!(named["addressed_to"], "");
+        assert_eq!(named["message_id"], "msg-7");
+
+        let anonymous = a2a_origin(None, None);
+        assert_eq!(anonymous["said_by"], "");
+        assert!(anonymous.get("message_id").is_none());
+        assert!(anonymous.get("said_by_name").is_none());
+    }
+
     use super::*;
     use axum::http::HeaderValue;
     use futures::StreamExt;
@@ -1753,21 +2059,19 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GoalReader for ScriptedReader {
-        async fn goal(&self, goal_id: &str) -> Option<Task> {
+        async fn goal(&self, goal_id: &str) -> cog_core::SFResult<Option<Task>> {
             let mut asks = self.asks.lock().unwrap();
             let nth = *asks;
             *asks += 1;
             let script = self.script.lock().unwrap();
-            let step = script
-                .get(nth)
-                .or_else(|| script.last())
-                .cloned()
-                .flatten()?;
+            let Some(step) = script.get(nth).or_else(|| script.last()).cloned().flatten() else {
+                return Ok(None);
+            };
             let mut row = Task::goal_row(goal_id.to_string(), "a goal");
             row.status = step;
             row.result = self.result.clone();
             row.error = self.error.clone();
-            Some(row)
+            Ok(Some(row))
         }
     }
 
@@ -2132,8 +2436,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GoalReader for ScriptedSink {
-        async fn goal(&self, _goal_id: &str) -> Option<Task> {
-            self.row.clone()
+        async fn goal(&self, _goal_id: &str) -> cog_core::SFResult<Option<Task>> {
+            Ok(self.row.clone())
         }
     }
 
@@ -2448,6 +2752,39 @@ mod tests {
         assert_eq!(page[0].id, "g-old");
         assert_eq!(next, "", "the last page says there is no next one");
         assert_eq!(total, 3, "the total counts the whole filter, not the page");
+    }
+
+    /// 读不出来的一张表不能答成「你有 0 条任务」。
+    ///
+    /// 判据：把 `task_rows_or_error` 换回 `unwrap_or_default()`，这条会红——而那
+    /// 正是对端唯一的视野被一句它无法分辨的谎话填满的样子。
+    #[test]
+    fn a_task_list_that_cannot_be_read_is_not_zero_tasks() {
+        let error = task_rows_or_error(
+            Err(cog_core::SFError::Database("store unavailable".into())),
+            &json!("ask-1"),
+        )
+        .expect_err("读失败不许折成一张空表");
+        assert_eq!(error["jsonrpc"], json!("2.0"));
+        assert_eq!(error["id"], json!("ask-1"));
+        assert_eq!(error["error"]["code"], json!(-32603));
+        let message = error["error"]["message"]
+            .as_str()
+            .unwrap_or(Default::default());
+        assert!(message.contains("could not be read"), "{message}");
+        assert!(message.contains("store unavailable"), "{message}");
+    }
+
+    /// 真读到的一页原样过去，条数不改写。
+    #[test]
+    fn a_task_list_that_was_read_passes_through() {
+        let rows = task_rows_or_error(
+            Ok(vec![Task::goal_row("g-1".to_string(), "a goal")]),
+            &json!(7),
+        )
+        .expect("读到的一页");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "g-1");
     }
 
     /// 过滤是过滤，写错的东西要报错，不能静默变成「没有过滤」。

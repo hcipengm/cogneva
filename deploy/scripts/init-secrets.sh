@@ -441,7 +441,8 @@ ensure_blank_oob notification-feishu-secret
 
 cat <<'EOF'
 ==> 完成。元启动（bootstrap）会在 apply 清单前自动调用本脚本，无需手动运行。
-    手动部署时，密钥就绪后部署对应 profile 的预渲染清单：
+    手动部署时，密钥就绪后先生成对应 profile 的清单（渲染产物不进仓），再 apply：
+    bash deploy/scripts/lib/rendered-cache.sh --ensure
     kubectl apply -f deploy/rendered/k3s-single/   # 或 k3s-multi / k8s-standard
     平台 token / LLM 上游：经 WebUI 配置向导写入，或
     kubectl -n cogneva edit secret cogneva-secrets-oob 后滚动对应 Deployment。

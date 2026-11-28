@@ -15,10 +15,7 @@ use crate::isolation::{BenchmarkIsolation, BenchmarkRefusal};
 use crate::IngestConfig;
 
 /// 订阅失败后的重试间隔：5s。
-///
-/// 与其它消费者同一个节拍：总线要么回来要么不回来。
-// cap: bound — 与其它消费者同一个节拍：总线要么回来要么不回来
-const SUBSCRIBE_RETRY_BACKOFF: Duration = Duration::from_secs(5);
+use cog_core::contract::subscribe_backoff::SUBSCRIBE_RETRY_BACKOFF;
 /// Loop name reported through the background-loop liveness family.
 pub const MEMORY_RECONCILE_LOOP: &str = "memory_ingest_reconcile";
 /// Loop name reported through the background-loop liveness family.
@@ -347,31 +344,19 @@ pub struct MemoryIngestorConfig {
 
 impl Default for MemoryIngestorConfig {
     fn default() -> Self {
-        Self {
-            max_retries: 3,
-            retry_base_delay_ms: 1000,
-            enable_dlq: true,
-            dlq_namespace: "dlq".into(),
-            extraction_concurrency: 4,
-            startup_reconcile: true,
-            reconcile_lookback_hours: 24,
-            aged_out_redrive_batch: 32,
-            reconcile_interval_secs: 600,
-            pull_pause_after_failures: 3,
-            pull_pause_initial_secs: 60,
-            pull_pause_max_secs: 1800,
-            pool_check_secs: 30,
-            pull_resume_observation_secs: 300,
-            backlog_warn_at: 64,
-            // 兜底构造不设闸：它只出现在单测里（测的是抽取本身），
-            // 装配路径一律走 `From<&IngestConfig>` 并把读侧声明带上。
-            read_namespaces: Vec::new(),
-            bus_group: "memory-ingestor".into(),
-            bus_claim_interval_secs: 30,
-            bus_claim_min_idle_ms: 900_000,
-            bus_claim_batch: 32,
-            benchmark_isolation: BenchmarkIsolation::default(),
-        }
+        // 每个数都取自 `IngestConfig` 的那一份声明——这里再写一遍就是同一件
+        // 事的第二个说法，改一处忘一处的那天，两处会各自以为是对方在管。
+        // 唯一例外是读侧命名空间：兜底构造不设闸（它只出现在单测里，测的是
+        // 抽取本身），装配路径一律走 `From<&IngestConfig>` 并把读侧声明带上。
+        //
+        // 写成「先取一份再清掉那一格」而不是结构体更新语法：`IngestConfig` 的
+        // 默认值大多不是零（重试次数、DLQ 开关、各种间隔），`#[derive(Default)]`
+        // 给出的是全零，两者不是同一个东西；更新语法又把那个非零的基准藏在
+        // `..` 后面，`clippy::derivable_impls` 读不到它，会把这个 impl 当成
+        // 可以派生的。清掉那一格写成一行，基准是什么在字面上就看得见。
+        let mut config = Self::from(&IngestConfig::default());
+        config.read_namespaces = Vec::new();
+        config
     }
 }
 
@@ -555,10 +540,12 @@ impl PullGate {
     ) -> Self {
         Self {
             pool,
-            after_failures: config.pull_pause_after_failures.max(1),
-            initial_secs: config.pull_pause_initial_secs.max(1),
-            max_secs: config.pull_pause_max_secs.max(1),
-            check_secs: config.pool_check_secs.max(1),
+            // 值原样生效：这四格在 `MemoryConfig::load_from` 按字段名拒绝 0，
+            // 到这里还夹一次就是同一件事的第二个说法，而它会把声明的值悄悄换掉。
+            after_failures: config.pull_pause_after_failures,
+            initial_secs: config.pull_pause_initial_secs,
+            max_secs: config.pull_pause_max_secs,
+            check_secs: config.pool_check_secs,
             resume_observation_secs: config.pull_resume_observation_secs,
             metrics,
             state: std::sync::Mutex::new(PullGateState::default()),
@@ -831,6 +818,26 @@ pub struct MemoryIngestor {
     in_flight: InFlight,
 }
 
+/// 一条直方图读数上的 p95，单位毫秒；没有样本或全部落在上界之外时答 `None`。
+///
+/// 用累计桶：找到累计条数先到 95% 的那个桶，取它的上界；落进 `+Inf` 的那些说明
+/// 最慢的一截比最高的有限界还慢，这时不编一个数——量不到就是量不到，调用方退回
+/// 种子值。
+fn p95_ms(row: &cog_core::HistogramTotals) -> Option<f64> {
+    if row.count == 0 {
+        return None;
+    }
+    let target = row.count as f64 * 0.95;
+    let mut cumulative = 0u64;
+    for (bound, count) in row.buckets.iter() {
+        cumulative += count;
+        if cumulative as f64 >= target {
+            return Some(*bound);
+        }
+    }
+    None
+}
+
 impl MemoryIngestor {
     pub fn new(backend: Arc<dyn MemoryBackend>, extractor: Arc<dyn MemoryExtractor>) -> Self {
         let config = MemoryIngestorConfig::default();
@@ -843,6 +850,40 @@ impl MemoryIngestor {
             metrics: None,
             in_flight: InFlight::default(),
         }
+    }
+
+    /// 这一拍认领多少条：由「一拍时长」÷「单次抽取的 p95 耗时」导出。
+    ///
+    /// 声明值只在**量不到**的时候用（还没有一条 `operation="extract"` 的样本，
+    /// 或者指标面没接上）：那时它是一条种子，不是结论。一旦读得到 p95，这一拍的
+    /// 批量就是「一拍搬得动多少」，而不是一个谁也没量过的数。
+    async fn claim_batch_for_pass(&self) -> usize {
+        let declared = self.config.bus_claim_batch;
+        let Some(metrics) = self.metrics.as_ref() else {
+            return declared;
+        };
+        let Ok(totals) = metrics
+            .query_histogram_totals(cog_core::metric_names::MEMORY_OPERATION_LATENCY_MS.as_str())
+            .await
+        else {
+            return declared;
+        };
+        let Some(measured) = totals.iter().find(|row| {
+            row.labels
+                .get(crate::observable::HOLDER_LABEL)
+                .map(String::as_str)
+                == Some("extract")
+        }) else {
+            return declared;
+        };
+        let Some(p95_ms) = p95_ms(measured) else {
+            return declared;
+        };
+        if p95_ms <= 0.0 {
+            return declared;
+        }
+        let fit = (self.config.bus_claim_interval_secs as f64 * 1000.0 / p95_ms).floor();
+        (fit as usize).max(1)
     }
 
     /// 接上指标面，用来发布对账扫到的积压量与闸门掌权者。
@@ -1089,7 +1130,6 @@ impl MemoryIngestor {
             let claim_stop = loop_stop.clone();
             let claim_interval = Duration::from_secs(inner.config.bus_claim_interval_secs);
             let claim_min_idle_ms = inner.config.bus_claim_min_idle_ms;
-            let claim_batch = inner.config.bus_claim_batch;
             // The loop supervises itself (a panic is run again in place) and
             // nobody holds its handle: its stop is the signal passed in, and it
             // goes away with the process.
@@ -1123,7 +1163,12 @@ impl MemoryIngestor {
                                 continue;
                             }
                             match bus
-                                .claim_pending(&channel, &group, claim_min_idle_ms, claim_batch)
+                                .claim_pending(
+                                    &channel,
+                                    &group,
+                                    claim_min_idle_ms,
+                                    inner.claim_batch_for_pass().await,
+                                )
                                 .await
                             {
                                 // This backend has no reclaim path, which is not
@@ -2111,6 +2156,47 @@ fn enqueue(
 }
 
 #[cfg(test)]
+mod claim_batch_tests {
+    use super::*;
+
+    fn totals(buckets: Vec<(f64, u64)>, count: u64) -> cog_core::HistogramTotals {
+        cog_core::HistogramTotals {
+            labels: std::collections::HashMap::new(),
+            buckets,
+            overflow: 0,
+            count,
+            sum: 0.0,
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// p95 取「累计到 95%」的那个桶的上界；空读数答「量不到」。
+    #[test]
+    fn the_p95_comes_from_the_bucket_that_reaches_ninety_five_percent() {
+        let row = totals(vec![(100.0, 90), (500.0, 9), (1000.0, 1)], 100);
+        assert_eq!(p95_ms(&row), Some(100.0));
+        let slower = totals(vec![(100.0, 50), (500.0, 50)], 100);
+        assert_eq!(p95_ms(&slower), Some(500.0));
+        assert_eq!(p95_ms(&totals(vec![], 0)), None);
+        assert_eq!(p95_ms(&totals(vec![(100.0, 10)], 10)), Some(100.0));
+    }
+
+    /// 认领批量由这条读数导出，而不是读那个声明值——声明值只在量不到时当种子。
+    #[test]
+    fn the_claim_batch_is_derived_and_the_declared_value_is_only_a_seed() {
+        let source = include_str!("ingestor.rs");
+        assert!(
+            source.contains("inner.claim_batch_for_pass().await"),
+            "认领那一拍没有问导出值"
+        );
+        assert!(
+            !source.contains("let claim_batch = inner.config.bus_claim_batch;"),
+            "认领批量仍在拍之前读声明值：导出没有接管"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{MemoryMemoryBackend, RuleBasedExtractor};
@@ -3091,7 +3177,10 @@ mod tests {
             value: f64,
             labels: HashMap<String, String>,
         ) -> cog_core::SFResult<()> {
-            let operation = labels.get("operation").cloned().unwrap_or_default();
+            let operation = labels
+                .get("operation")
+                .cloned()
+                .unwrap_or(Default::default());
             self.counters
                 .lock()
                 .unwrap()

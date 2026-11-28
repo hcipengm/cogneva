@@ -5,11 +5,13 @@ use std::time::{Duration, Instant};
 
 /// Default high watermark: when the buffer reaches this level, the producer pauses.
 /// Zero in core — real defaults live in the assembly-layer config loader.
-// cap: bound — core 里取 0：真正的默认值在装配层的配置加载器里
+// cap: fixed — core 里取 0 是「没写」的哨兵：真正的默认值在装配层的配置加载器里
+// not-a-bound: core 里取 0 是「没写」的哨兵：真正的默认值在装配层的配置加载器里
 pub const DEFAULT_HIGH_WATERMARK: usize = 0;
 /// Default low watermark: when the buffer drops below this level, the producer resumes.
 /// Zero in core — real defaults live in the assembly-layer config loader.
-// cap: bound — 同上：core 里取 0，真正的默认值在装配层的配置加载器里
+// cap: fixed — 同上：0 ＝ 没写，真正的默认值在装配层的配置加载器里
+// keep: 删掉后 0 ＝ 没写的语义消失，配置加载器把它读成低水位为零；由「真正的默认值在装配层」兜住
 pub const DEFAULT_LOW_WATERMARK: usize = 0;
 
 /// Configuration for backpressure watermarks.

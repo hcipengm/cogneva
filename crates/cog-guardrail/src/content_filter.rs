@@ -58,6 +58,12 @@ pub struct ContentFilterConfig {
     pub custom_blocked_patterns: Vec<String>,
 }
 
+// 0.6 的余弦相似度：同义改写通常落在 0.6 以上，而主题相邻的句子（「怎么保护
+// 自己」对「怎么伤害别人」）在 0.6 以下分开。
+// cap: fixed — 0.6：同义改写在它之上，主题相邻的句子在它之下分开
+// not-a-bound: 0.6：同义改写在它之上，主题相邻的句子在它之下分开
+const SEMANTIC_BLOCK_THRESHOLD: f64 = 0.6;
+
 impl Default for ContentFilterConfig {
     fn default() -> Self {
         Self {
@@ -66,7 +72,7 @@ impl Default for ContentFilterConfig {
             block_hate_speech: true,
             block_self_harm: true,
             block_illegal_acts: true,
-            semantic_threshold: 0.6,
+            semantic_threshold: SEMANTIC_BLOCK_THRESHOLD,
             custom_blocked_patterns: vec![],
         }
     }
@@ -197,8 +203,26 @@ impl ContentFilter {
             r"(?i)\b(how to make|recipe for|instructions for).{0,20}(bomb|meth|explosive)\b".into(),
             r"(?i)\b(steal|hack|break into|bypass security|social engineer)\b".into(),
         ];
+        let builtin = patterns.len();
         patterns.extend(config.custom_blocked_patterns.iter().cloned());
-        let regex_set = RegexSet::new(&patterns).unwrap_or_else(|_| RegexSet::empty());
+        // 整组编不过就换成空集，等于一次配置笔误把这门过滤器整个关掉：判词从
+        // 「拦」变成「过」，入口处没有一句话说它已经不在拦。所以只丢出错的
+        // 那一半——自定义模式来自配置，写错是外力；内置模式是本文件的常量。
+        let regex_set = match RegexSet::new(&patterns) {
+            Ok(set) => set,
+            Err(error) => {
+                let custom = patterns.len() - builtin;
+                tracing::warn!(
+                    custom,
+                    builtin,
+                    error = %error,
+                    "自定义违禁内容模式编不过，整组自定义模式被丢掉；内置的 {builtin} 条照常生效。这一段里写的规则现在不拦任何东西"
+                );
+                patterns.truncate(builtin);
+                RegexSet::new(&patterns)
+                    .expect("内置模式是本文件的常量；compile_patterns 的单测让它们一编不过就红")
+            }
+        };
         (patterns, regex_set)
     }
 
@@ -466,5 +490,72 @@ impl cog_core::Guardrail for ContentFilter {
 
     async fn check_tool_call(&self, _tool: &cog_core::ToolCall) -> GuardResult {
         GuardResult::Pass
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一条写错的自定义违禁模式只丢自定义那一组：内置的照常拦。
+    #[test]
+    fn a_broken_custom_pattern_does_not_disable_the_builtin_patterns() {
+        let (builtin_patterns, builtin) =
+            ContentFilter::build_regex_set(&ContentFilterConfig::default());
+        assert!(
+            !builtin.is_empty(),
+            "内置违禁模式一条都没编进来，这门过滤器对谁都是放行"
+        );
+
+        let config = ContentFilterConfig {
+            custom_blocked_patterns: vec!["(?i)unclosed(".into()],
+            ..ContentFilterConfig::default()
+        };
+        let (kept, broken) = ContentFilter::build_regex_set(&config);
+
+        assert_eq!(
+            broken.len(),
+            builtin.len(),
+            "自定义模式编不过时整组模式变了：要么连自定义的残片也编进去了，要么把内置的一起丢了"
+        );
+        assert_eq!(
+            kept, builtin_patterns,
+            "编不过时留下的模式名与内置的那组不一致"
+        );
+        assert!(
+            broken.is_match("how to make a bomb at home"),
+            "一句编不过的自定义模式就把内置的违禁规则全关了"
+        );
+    }
+
+    /// 语义判定的阈值只有一处声明：默认值读常量，常量上面写着它由什么钉住。
+    #[test]
+    fn the_content_filter_default_reads_its_threshold() {
+        assert_eq!(
+            ContentFilterConfig::default().semantic_threshold,
+            SEMANTIC_BLOCK_THRESHOLD
+        );
+
+        let body = include_str!("content_filter.rs")
+            .split("impl Default for ContentFilterConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    let value = value.trim().trim_end_matches(',');
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.starts_with(|c: char| c.is_ascii_digit())
+                        && value != "0"
+                })
+            })
+            .map(str::trim)
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
     }
 }

@@ -564,7 +564,10 @@ pub fn classify(
     // 「没想到的路径」不再等于「要人批」。等人批的那条路没有下一个动作：一条
     // 永远没有人来批的待办既不会落地也不会消失，它只会在审批台上把真正的待办
     // 淹掉。这里拒收并点名缺条件的那一族——下一个动作是改配置，不是等人。
-    let unclassified = files.first().map(String::as_str).unwrap_or_default();
+    let unclassified = files
+        .first()
+        .map(String::as_str)
+        .unwrap_or(Default::default());
     GateVerdict::Reject {
         kind: PromotionGateKind::RejectUnclassified,
         reason: format!(

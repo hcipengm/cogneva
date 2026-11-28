@@ -43,7 +43,7 @@
 
 use crate::common;
 
-use common::routes::{read_repo, repo_root};
+use common::routes::{read_repo, rendered_root, repo_root};
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -172,6 +172,84 @@ fn pod_specs<'a>(value: &'a serde_yaml::Value, out: &mut Vec<&'a serde_yaml::Map
     }
 }
 
+/// Where a mounted volume comes from.
+///
+/// Two shapes, because the delivery has two: a claim object the manifest names,
+/// and a per-replica claim a StatefulSet creates from a template. In the second
+/// the real claim is `<template>-<workload>-<ordinal>` and nothing in the
+/// manifest spells that out — the container writes its own pod name beside the
+/// template name, and the claim exists only because that ordinal does. Folding
+/// the second into the first by writing ordinal 0 would check one replica and
+/// claim to have checked the family; folding it by ignoring the ordinal would
+/// let a declaration name a template that does not exist.
+#[derive(Debug, Clone)]
+enum ClaimSource {
+    /// A claim the delivery declares or the pod references by name.
+    Named(String),
+    /// A claim the StatefulSet creates from `volumeClaimTemplates`.
+    Template {
+        template: String,
+        workload: String,
+        replicas: u32,
+    },
+}
+
+impl ClaimSource {
+    /// Every claim name this source can stand for, as a manifest would spell it.
+    fn names(&self) -> Vec<String> {
+        match self {
+            ClaimSource::Named(name) => vec![name.clone()],
+            ClaimSource::Template {
+                template,
+                workload,
+                replicas,
+            } => (0..*replicas)
+                .map(|ordinal| format!("{template}-{workload}-{ordinal}"))
+                .collect(),
+        }
+    }
+
+    /// Does `declared` denote this source?
+    ///
+    /// A per-replica claim is spelled at runtime with the pod's own name, so an
+    /// environment declaration writes `$(POD_NAME)` for the ordinal part: the
+    /// substitution is what the kubelet does, not a wildcard this test grants.
+    fn names_declared(&self, declared: &str) -> bool {
+        match self {
+            ClaimSource::Named(name) => name == declared,
+            ClaimSource::Template {
+                template,
+                workload,
+                replicas,
+            } => (0..*replicas).any(|ordinal| {
+                let pod = format!("{workload}-{ordinal}");
+                declared.replace("$(POD_NAME)", &pod) == format!("{template}-{pod}")
+            }),
+        }
+    }
+}
+
+/// The per-replica claims a workload creates from templates, and how many
+/// replicas it makes. Empty for everything that is not a StatefulSet.
+fn claim_templates(value: &serde_yaml::Value) -> (Vec<String>, u32) {
+    let spec = value.get("spec");
+    let templates = spec
+        .and_then(|s| s.get("volumeClaimTemplates"))
+        .and_then(|v| v.as_sequence())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|t| t.get("metadata")?.get("name")?.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or(Default::default());
+    let replicas = spec
+        .and_then(|s| s.get("replicas"))
+        .and_then(|r| r.as_u64())
+        .unwrap_or(1)
+        .max(1) as u32;
+    (templates, replicas)
+}
+
 /// The claim behind every mount path a container has, keyed by the path.
 ///
 /// A path can be mounted from something other than a claim (configMap, secret,
@@ -180,7 +258,10 @@ fn pod_specs<'a>(value: &'a serde_yaml::Value, out: &mut Vec<&'a serde_yaml::Map
 fn mounted_claims(
     pod: &serde_yaml::Mapping,
     container: &serde_yaml::Mapping,
-) -> BTreeMap<String, String> {
+    workload: &str,
+    claim_templates: &[String],
+    replicas: u32,
+) -> BTreeMap<String, ClaimSource> {
     let mut claims_by_volume = BTreeMap::new();
     if let Some(volumes) = pod.get("volumes").and_then(|v| v.as_sequence()) {
         for volume in volumes {
@@ -194,9 +275,21 @@ fn mounted_claims(
                 .and_then(|p| p.get("claimName"))
                 .and_then(|c| c.as_str());
             if let (Some(name), Some(claim)) = (name, claim) {
-                claims_by_volume.insert(name.to_string(), claim.to_string());
+                claims_by_volume.insert(name.to_string(), ClaimSource::Named(claim.to_string()));
             }
         }
+    }
+    // A volume named by a claim template has no pod-level entry at all: the
+    // StatefulSet injects it.
+    for template in claim_templates {
+        claims_by_volume.insert(
+            template.clone(),
+            ClaimSource::Template {
+                template: template.clone(),
+                workload: workload.to_string(),
+                replicas,
+            },
+        );
     }
 
     let mut claims = BTreeMap::new();
@@ -233,7 +326,9 @@ fn env_value(container: &serde_yaml::Mapping, name: &str) -> Option<String> {
 
 /// Every declaration the delivered manifests carry, beside the claim behind each
 /// mount of the container that made it.
-fn declarations() -> Vec<(Declaration, BTreeMap<String, String>)> {
+fn declarations() -> Vec<(Declaration, BTreeMap<String, ClaimSource>)> {
+    // 渲染产物不进仓：读之前现场生成。
+    rendered_root();
     let mut found = Vec::new();
     for dir in DELIVERED {
         let manifest_dir = repo_root().join(dir);
@@ -260,6 +355,7 @@ fn declarations() -> Vec<(Declaration, BTreeMap<String, String>)> {
                 else {
                     continue;
                 };
+                let (templates, replicas) = claim_templates(&value);
                 let mut pods = Vec::new();
                 pod_specs(&value, &mut pods);
                 for pod in pods {
@@ -307,7 +403,7 @@ fn declarations() -> Vec<(Declaration, BTreeMap<String, String>)> {
                                     mounts,
                                     claim,
                                 },
-                                mounted_claims(pod, container),
+                                mounted_claims(pod, container, workload, &templates, replicas),
                             ));
                         }
                     }
@@ -378,11 +474,13 @@ fn every_declaration_names_a_volume_that_container_actually_mounts() {
     for (declaration, mounted) in declarations() {
         for (claim, path) in &declaration.mounts {
             match mounted.get(path) {
-                Some(mounted_claim) => assert_eq!(
-                    mounted_claim, claim,
-                    "{}/{} (container {}): {path} is mounted from {mounted_claim} and declared as \
+                Some(source) => assert!(
+                    source.names_declared(claim),
+                    "{}/{} (container {}): {path} is mounted from {source:?} and declared as \
                      {claim}",
-                    declaration.dir, declaration.workload, declaration.container
+                    declaration.dir,
+                    declaration.workload,
+                    declaration.container
                 ),
                 None => panic!(
                     "{}/{} (container {}): declares {claim}={path}, and that container mounts \
@@ -393,7 +491,7 @@ fn every_declaration_names_a_volume_that_container_actually_mounts() {
         }
         if let Some(claim) = &declaration.claim {
             assert!(
-                mounted.values().any(|mounted_claim| mounted_claim == claim),
+                mounted.values().any(|source| source.names_declared(claim)),
                 "{}/{} (container {}): {CLAIM_ENV} names {claim}, which that container does not \
                  mount",
                 declaration.dir,
@@ -408,6 +506,8 @@ fn every_declaration_names_a_volume_that_container_actually_mounts() {
 /// and at least one manifest in it declares a volume.
 #[test]
 fn the_scan_covers_every_delivered_directory() {
+    // 渲染产物不进仓：读之前现场生成。
+    rendered_root();
     let declared = declarations();
     for dir in DELIVERED {
         let path = repo_root().join(dir);
@@ -435,6 +535,8 @@ struct DeliveryFacts {
 }
 
 fn delivery_facts() -> BTreeMap<&'static str, DeliveryFacts> {
+    // 渲染产物不进仓：读之前现场生成。
+    rendered_root();
     let mut facts = BTreeMap::new();
     for dir in DELIVERED {
         let mut entry = DeliveryFacts::default();
@@ -471,6 +573,7 @@ fn delivery_facts() -> BTreeMap<&'static str, DeliveryFacts> {
                 else {
                     continue;
                 };
+                let (templates, replicas) = claim_templates(&value);
                 let mut pods = Vec::new();
                 pod_specs(&value, &mut pods);
                 for pod in pods {
@@ -482,9 +585,12 @@ fn delivery_facts() -> BTreeMap<&'static str, DeliveryFacts> {
                             let Some(container) = container.as_mapping() else {
                                 continue;
                             };
-                            entry
-                                .mounted
-                                .extend(mounted_claims(pod, container).into_values());
+                            for source in
+                                mounted_claims(pod, container, workload, &templates, replicas)
+                                    .into_values()
+                            {
+                                entry.mounted.extend(source.names());
+                            }
                             let walker = format!(
                                 "{}/{}",
                                 workload,
@@ -575,7 +681,11 @@ fn every_api_measured_claim_is_a_volume_that_delivery_declares_mounts_and_walks(
                  container in this delivery mounts it: the declaration outlived the volume it \
                  names"
             );
-            let walkers = facts.walked.get(claim).cloned().unwrap_or_default();
+            let walkers = facts
+                .walked
+                .get(claim)
+                .cloned()
+                .unwrap_or(Default::default());
             assert_eq!(
                 walkers.len(),
                 1,

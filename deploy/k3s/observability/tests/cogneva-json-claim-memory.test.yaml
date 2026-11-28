@@ -278,7 +278,7 @@ tests:
       - series: 'cogneva_memory_schema_repair_total{outcome="unrepairable"}'
         values: '0x60'
       - series: 'memory_operations_total{operation="bus_claim_failed"}'
-        values: '0x55 1x5'
+        values: '0x56 1x4'
     alert_rule_test:
       - eval_time: 60m
         alertname: memory_decay_passes_all_failed

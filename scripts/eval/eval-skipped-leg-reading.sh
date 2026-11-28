@@ -15,9 +15,10 @@
 #   给了 --subset 就要求跳过的题号 ⊆ 子集里**带图**的那些（子集不含图字段时只查「在子集里」）。
 # 退出码：0 读数成立；1 读数不成立；3 报表读不出来（不许当 0 读）。
 #
-# 复跑产物（零模型调用，与池子开不开无关）：用 `scripts/data/eval-skipped-leg-subset.tsv`
-# 起一个 eval-table Pod，参数与登记跑法相同，只把 `--subset` 换成它、`--scaffolds
-# gepa,agentflow --seeds 0,1,2 --vision none`，报表写到另一个 `--out`；跑完再拿本脚本读它。
+# 复跑产物（零模型调用，与池子开不开无关）：把这一跑里带图的那几道题写成一份两列
+# `benchmark<TAB>case` 子集起一个 eval-table Pod，参数与登记跑法相同，只把 `--subset`
+# 换成它、`--scaffolds gepa,agentflow --seeds 0,1,2 --vision none`，报表写到另一个
+# `--out`；跑完再拿本脚本读它。
 # 2026-10-19 实测产物：7 行 skipped、scaffolds=2、seeds=3、6 个格子、42 行、verdict=holds。
 set -uo pipefail
 

@@ -38,7 +38,7 @@ impl TraceSerializer {
 
     /// Compute blake3 checksum of serialized `AgentTrace` events.
     pub fn compute_checksum(trace: &cog_core::AgentTrace) -> String {
-        let jsonl = Self::to_jsonl(trace).unwrap_or_default();
+        let jsonl = Self::to_jsonl(trace).unwrap_or(Default::default());
         blake3::hash(jsonl.as_bytes()).to_string()
     }
 
@@ -1016,7 +1016,7 @@ mod tests {
         // Let the collector drain the channel before shutdown.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         shutdown.trigger();
-        let _ = handle.await;
+        cog_core::ignore_lost!(handle.await);
 
         let saved = store.saved.lock().unwrap();
         assert!(
@@ -1053,7 +1053,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         shutdown.trigger();
-        let _ = handle.await;
+        cog_core::ignore_lost!(handle.await);
 
         let saved = store.saved.lock().unwrap();
         assert_eq!(saved.len(), 1);

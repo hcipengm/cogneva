@@ -603,8 +603,8 @@ fn page_of(entry: &Value) -> FetchAnswer {
             .trim()
             .to_string()
     };
-    let content =
-        first_non_empty(&[text("raw_content"), text("text"), text("content")]).unwrap_or_default();
+    let content = first_non_empty(&[text("raw_content"), text("text"), text("content")])
+        .unwrap_or(Default::default());
     if content.is_empty() {
         return FetchAnswer::Empty;
     }
@@ -743,8 +743,8 @@ fn first_non_empty(values: &[String]) -> Option<String> {
 /// 需要它。长度上限按字符截，不按字节切——按字节切会把一个多字节字符
 /// 切成两半，而那段字节会进日志。
 fn head_of(raw: &Value) -> String {
-    let text = raw.to_string();
-    text.chars().take(200).collect()
+    // 错误路径默认无损：诊断要能读到整段答复，不在这里切。
+    raw.to_string()
 }
 
 #[cfg(test)]

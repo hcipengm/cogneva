@@ -7,7 +7,7 @@ use cog_core::SFResult;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 use super::rate_limit::{is_expired, TokenBucket};
-use super::types::{notify_channel, DEFAULT_DEDUP_WINDOW, DEFAULT_HOOK_TIMEOUT};
+use super::types::{notify_channel, DEFAULT_DEDUP_WINDOW};
 use cog_core::{
     HookAction, HookDef, HookEvent, HookExecution, HookOutcome, HookScope, HookTrigger, LogLevel,
     RateLimitConfig,
@@ -124,17 +124,22 @@ pub struct HookEngineConfig {
     /// Window inside which identical events are coalesced.  Defaults to 1s.
     pub dedup_window: Duration,
     /// Default rate-limit applied to hooks without an explicit `rate_limit`.
-    pub default_rate_limit: RateLimitConfig,
-    /// Default per-hook execution timeout.  Defaults to 30s.
-    pub hook_timeout: Duration,
+    ///
+    /// `None` means there is no default: a hook that declares no limit is not
+    /// limited. The engine used to carry `100/s` here, a number nobody had
+    /// measured against any hook's trigger density.
+    pub default_rate_limit: Option<RateLimitConfig>,
+    /// Default per-hook execution timeout. `None` means hooks that declare no
+    /// `timeout_ms` run to completion: unbounded is the default state.
+    pub hook_timeout: Option<Duration>,
 }
 
 impl Default for HookEngineConfig {
     fn default() -> Self {
         Self {
             dedup_window: DEFAULT_DEDUP_WINDOW,
-            default_rate_limit: RateLimitConfig::default(),
-            hook_timeout: DEFAULT_HOOK_TIMEOUT,
+            default_rate_limit: None,
+            hook_timeout: None,
         }
     }
 }
@@ -144,7 +149,8 @@ impl From<cog_core::HookEngineConfig> for HookEngineConfig {
         Self {
             dedup_window: Duration::from_secs(c.dedup_window_secs),
             default_rate_limit: c.default_rate_limit,
-            hook_timeout: Duration::from_secs(c.hook_timeout_secs),
+            hook_timeout: (c.hook_timeout_secs > 0)
+                .then(|| Duration::from_secs(c.hook_timeout_secs)),
         }
     }
 }
@@ -258,10 +264,14 @@ impl HookEngine {
     }
 
     async fn rate_limit_check(&self, def: &HookDef) -> bool {
-        let cfg = def
+        // 没有声明（钩子自己没写、引擎也没缺省）＝ 不限流。无界是缺省态。
+        let Some(cfg) = def
             .rate_limit
             .clone()
-            .unwrap_or_else(|| self.inner.config.default_rate_limit.clone());
+            .or_else(|| self.inner.config.default_rate_limit.clone())
+        else {
+            return true;
+        };
         let mut limiters = self.inner.rate_limiters.lock().await;
         let bucket = limiters
             .entry(def.id.clone())
@@ -296,6 +306,9 @@ pub fn trigger_scope(trigger: HookTrigger) -> HookScope {
         HookTrigger::OnRalphPass
         | HookTrigger::OnRalphUnrecoverable
         | HookTrigger::OnSquadRetry => HookScope::Squad,
+        // 工具前后是这一轮自己的事：它没有 Crew / Squad 可广播给，判定也只在
+        // 这一次调用上生效。
+        HookTrigger::OnToolBefore | HookTrigger::OnToolAfter => HookScope::Global,
     }
 }
 
@@ -325,7 +338,7 @@ impl HookEngine {
     /// outcomes can use [`HookEngine::emit_detached`].
     pub async fn emit(&self, event: HookEvent) -> Vec<HookExecution> {
         // Broadcast to subscribers first (best-effort).
-        let _ = self.inner.event_tx.send(event.clone());
+        cog_core::ignore_lost!(self.inner.event_tx.send(event.clone()));
 
         if !self.dedup_check(&event).await {
             return vec![HookExecution {
@@ -342,6 +355,11 @@ impl HookEngine {
                 .iter()
                 .filter(|h| h.trigger == event.trigger)
                 .filter(|h| hook_matches_scope(h, &event))
+                // A deciding action is answered at the call site, before the
+                // tool runs. Publishing it from here would report a decision
+                // that was never taken, and would take it twice when a tool
+                // guard is also attached.
+                .filter(|h| !h.action.is_guard())
                 .cloned()
                 .collect()
         };
@@ -400,19 +418,47 @@ impl HookEngine {
         }
 
         let payload = build_payload(&event);
+        // 声明了就有界，没声明就跑到完（无界是缺省态）。
         let timeout = def
             .timeout_ms
             .map(Duration::from_millis)
-            .unwrap_or(self.inner.config.hook_timeout);
+            .or(self.inner.config.hook_timeout);
         let publisher = Arc::clone(&self.inner.publisher);
         let action = def.action.clone();
 
         let exec = async move { execute_action(&publisher, &action, &payload).await };
 
-        let outcome = match tokio::time::timeout(timeout, exec).await {
-            Err(_) => HookOutcome::TimedOut,
-            Ok(Ok(())) => HookOutcome::Success,
-            Ok(Err(e)) => HookOutcome::Failed(e.to_string()),
+        // 申报的墙：过了点只说一句，**不取消**动作。
+        //
+        // 这里原来是 `timeout(bound, exec)`：到点把动作丢掉、记 `TimedOut`。丢掉的
+        // 那一半可能是「事件已经读到一半」或「通知已经发出去一半」，而账上只剩一个
+        // 结果词——没有人能从它接着做。墙的第一问问的是「能不能删」：删掉它，动作
+        // 跑完最坏只多花一段；留着它，留下的是一段没法续的半成品。
+        //
+        // 于是三问只剩一问有答案——在等什么；「等不到」不发生（它总会结束，或被
+        // 整个进程一起带走），续跑也就不必谈。
+        let finish = |result: SFResult<()>| match result {
+            Ok(()) => HookOutcome::Success,
+            Err(e) => HookOutcome::Failed(e.to_string()),
+        };
+        let outcome = match timeout {
+            Some(bound) => {
+                let started = std::time::Instant::now();
+                let mut exec = std::pin::pin!(exec);
+                tokio::select! {
+                    done = &mut exec => finish(done),
+                    _ = tokio::time::sleep(bound) => {
+                        tracing::warn!(
+                            hook = %hook_id,
+                            waited_ms = started.elapsed().as_millis() as u64,
+                            "hook action is past the bound it declared; waiting for it to finish \
+                             instead of leaving a half-done action nobody can resume"
+                        );
+                        finish((&mut exec).await)
+                    }
+                }
+            }
+            None => finish(exec.await),
         };
 
         HookExecution {
@@ -480,6 +526,13 @@ async fn execute_action(
             Ok(())
         }
         HookAction::Notify { user_id } => publisher.notify_user(user_id, payload).await,
+        // Unreachable through `emit`, which filters deciding actions out: they
+        // are answered where the tool runs. Reaching this arm means something
+        // dispatched a decision as if it were a notification, and reporting
+        // success would hide that.
+        HookAction::Block { .. } | HookAction::Rewrite { .. } => Err(cog_core::SFError::Config(
+            "a block/rewrite hook decides the call and cannot be published".into(),
+        )),
     }
 }
 
@@ -589,6 +642,7 @@ mod tests {
             scope: HookScope::Global,
             crew_id_filter: None,
             squad_id_filter: None,
+            tool: None,
             action,
             rate_limit: None,
             timeout_ms: None,
@@ -664,8 +718,13 @@ mod tests {
         assert_eq!(limited, 3);
     }
 
+    /// 过了申报的界只记一句，**不取消**：一次慢动作照样做完。
+    ///
+    /// 取消一个可能已经做了一半的动作，留下的是「没人知道做到哪」；而账上只有
+    /// 一个 `TimedOut` 结果词，没有人能从它接着做。没有这次改动这条会红：旧的
+    /// `timeout` 到点丢掉动作，结果词是 `TimedOut`。
     #[tokio::test]
-    async fn timeout_protection_kills_long_action() {
+    async fn a_slow_hook_past_its_declared_bound_is_waited_out_not_killed() {
         let publisher = Arc::new(TestPublisher::slow(Duration::from_millis(500)));
         let engine = Arc::new(HookEngine::new(publisher.clone()));
         let mut def = make_def(
@@ -681,7 +740,11 @@ mod tests {
 
         let recs = engine.emit(HookEvent::new(HookTrigger::OnAgentEnd)).await;
         assert_eq!(recs.len(), 1);
-        assert_eq!(recs[0].outcome, HookOutcome::TimedOut);
+        assert_eq!(
+            recs[0].outcome,
+            HookOutcome::Success,
+            "过了界要等它做完，不是把做了一半的动作丢掉"
+        );
     }
 
     #[tokio::test]
@@ -1030,6 +1093,41 @@ mod tests {
             .await;
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].hook_id, "crew-all");
+    }
+
+    /// 没有声明限流的钩子不被限流。
+    ///
+    /// 这条门判的是「缺省不存在的界」：引擎曾经带一个没人量过的 `100/秒`，理由
+    /// 是「触发密度还没量过」——那正是人拍一个数的样子。删掉之后，不声明就是不限。
+    /// 没有这次改动这条会红：第 500 次触发会被那个默认桶拒掉。
+    #[tokio::test]
+    async fn a_hook_without_a_declared_limit_is_not_limited() {
+        let publisher = Arc::new(TestPublisher::new());
+        let engine = Arc::new(HookEngine::new(publisher.clone()));
+        engine
+            .register(make_def(
+                "unlimited",
+                HookTrigger::OnAgentStart,
+                HookAction::Log {
+                    level: LogLevel::Info,
+                },
+            ))
+            .await;
+        let def = engine
+            .list_hooks()
+            .await
+            .pop()
+            .expect("the hook was registered");
+        assert!(
+            engine.inner.config.default_rate_limit.is_none(),
+            "引擎又给自己配了一个没人量过的缺省限流"
+        );
+        for attempt in 1..=500 {
+            assert!(
+                engine.rate_limit_check(&def).await,
+                "第 {attempt} 次触发被一个没声明过的限流挡住了"
+            );
+        }
     }
 
     #[tokio::test]

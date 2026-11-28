@@ -206,11 +206,23 @@ pub struct RestartSettings {
     pub backoff_floor_secs: u64,
 }
 
+// 三次重启：一次 panic 可能是偶然，连着三次就是每次都被同一件活打回；再往后
+// 重启只是换个时间点重放同一个崩溃。
+// cap: fixed — 三次：连着三次都被同一件活打回，第四次只会重放同一个崩溃
+// keep: 删掉后同一个崩溃被无限重放，循环永远重启；由「第四次只会重放同一个崩溃」兜住
+const RESTART_MAX_CONSECUTIVE: u32 = 3;
+
+// 五秒地板：短到事件驱动的循环在下一次活来之前回来了，长到立刻 panic 的循环
+// 不会把日志刷满（等待从这儿翻倍，一份预算花完是几十秒，不是几毫秒）。
+// cap: fixed — 五秒：立刻 panic 的循环不刷屏，事件驱动的循环在下一次活来前回来
+// keep: 删掉后立刻 panic 的循环刷屏，事件驱动的循环在下一次活来前回不来；由「五秒」兜住
+const RESTART_BACKOFF_FLOOR_SECS: u64 = 5;
+
 impl Default for RestartSettings {
     fn default() -> Self {
         Self {
-            max_consecutive: 3,
-            backoff_floor_secs: 5,
+            max_consecutive: RESTART_MAX_CONSECUTIVE,
+            backoff_floor_secs: RESTART_BACKOFF_FLOOR_SECS,
         }
     }
 }
@@ -238,7 +250,8 @@ pub struct RestartPolicy {
 /// budget is deliberately left out of this wait: it is time the loop spends
 /// working rather than time between attempts, and a restart that waited it out
 /// would delay the repair by the length of the thing that is not being repaired.
-// cap: derived — 量的是「在不在干活」而不是两次尝试之间的时间；等满它的重启会把修复推迟整整一段没在被修的时间
+// cap: fixed — 量的是「在不在干活」而不是两次尝试之间的时间；等满它的重启会把修复推迟整整一段没在被修的时间
+// keep: 删掉后「在不在干活」没有判据，重启在没被修的那段时间里反复发生；由「等满它的重启会把修复推迟」兜住
 const STALL_PERIODS: u32 = 6;
 
 impl RestartPolicy {
@@ -262,5 +275,41 @@ impl RestartPolicy {
         self.backoff
             .saturating_mul(1u32 << (run - 1).min(16))
             .min(self.backoff_max)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 重启预算的两个数只有一处声明：默认值读常量，常量上面写着它由什么钉住。
+    ///
+    /// 两面一起钉：运行时默认值等于常量（改常量就改默认值），源码面
+    /// `impl Default` 的字段里不再有数字（下一笔写回裸字面量就红）。
+    #[test]
+    fn the_restart_settings_read_their_names() {
+        let cfg = RestartSettings::default();
+        assert_eq!(cfg.max_consecutive, RESTART_MAX_CONSECUTIVE);
+        assert_eq!(cfg.backoff_floor_secs, RESTART_BACKOFF_FLOOR_SECS);
+
+        let body = include_str!("loop_health.rs")
+            .split("impl Default for RestartSettings")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body.lines().filter_map(bare_field_value).collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
+    }
+
+    /// 一行 `字段: <数字>` 就是一处裸默认。
+    fn bare_field_value(line: &str) -> Option<&str> {
+        let (field, value) = line.trim().split_once(':')?;
+        let named_field =
+            !field.is_empty() && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        let value = value.trim().trim_end_matches(',');
+        (named_field && value.starts_with(|c: char| c.is_ascii_digit()) && value != "0")
+            .then_some(line.trim())
     }
 }

@@ -285,7 +285,7 @@ fn body_of(code: &str, signature: &str) -> String {
     let mut depth = 0i32;
     let mut opened = false;
     for (index, line) in lines.iter().enumerate().skip(start) {
-        let shape = shapes.get(index).copied().unwrap_or_default();
+        let shape = shapes.get(index).copied().unwrap_or(Default::default());
         depth += shape.delta;
         if shape.opens {
             opened = true;

@@ -37,6 +37,16 @@
 //! doing anything. `the_marker_scan_separates_a_call_from_a_mention` pins that
 //! distinction on both polarities.
 //!
+//! Third, a reading with one consumer has a home: the consumer's crate. The
+//! base was carrying the config-reachability parser -- the one that decides
+//! whether a written default is reachable from any deployment document -- while
+//! the only crate calling it was the reflection pipeline. A pure function is
+//! not a shape, and one caller is not sharing. What stays is the half more than
+//! one crate reaches: the diff readers are called by landing and collaboration
+//! too, and moving them would leave those crates with no way to name the base.
+//! The test below reads both sides, so a move in either direction -- into the
+//! base or out of it -- fails here.
+//!
 //! Where this gate lives, and why not in the crate it measures: its subject is
 //! the workspace's layering, and the base is the crate that is supposed to stop
 //! changing. A test directory inside it would make every future boundary
@@ -243,7 +253,7 @@ fn declared_names(code: &str) -> BTreeSet<String> {
         if let Some(body) = rest.strip_prefix("use ") {
             for part in body.trim_end_matches(';').split([',', '{', '}']) {
                 let part = part.trim();
-                let part = part.rsplit("::").next().unwrap_or_default();
+                let part = part.rsplit("::").next().unwrap_or(Default::default());
                 let name = part.split(" as ").last().unwrap_or_default().trim();
                 if is_ident(name) {
                     out.insert(name.to_owned());
@@ -562,7 +572,7 @@ fn lonely_mechanisms(
     let mut shared: BTreeMap<String, BTreeSet<String>> = code
         .keys()
         .map(|name| {
-            let own = reached_by.get(name).cloned().unwrap_or_default();
+            let own = reached_by.get(name).cloned().unwrap_or(Default::default());
             (name.clone(), own)
         })
         .collect();
@@ -599,11 +609,18 @@ fn lonely_mechanisms(
     (lonely, acts.len())
 }
 
-/// A mechanism in the base has to be reached by more than one crate.
-#[test]
-fn a_module_that_touches_the_machine_is_reached_by_more_than_one_crate() {
-    let root = common::root::repo_root();
-    let modules = modules(&root);
+/// The base read once: each module's code, who outside the base reaches it, and
+/// which module declares each item name.
+struct BaseCensus {
+    code: BTreeMap<String, String>,
+    reached_by: BTreeMap<String, BTreeSet<String>>,
+    owners: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// Read the base and its consumers off the tree. Two rules below are read from
+/// this one census, so a module is never counted two different ways.
+fn base_census(root: &Path) -> BaseCensus {
+    let modules = modules(root);
     let code: BTreeMap<String, String> = modules
         .iter()
         .map(|(name, files)| (name.clone(), code_of(files)))
@@ -624,15 +641,30 @@ fn a_module_that_touches_the_machine_is_reached_by_more_than_one_crate() {
         .keys()
         .map(|name| (name.clone(), BTreeSet::new()))
         .collect();
-    for (crate_dir, text) in consumer_code(&root) {
+    for (crate_dir, text) in consumer_code(root) {
         for module in referenced_modules(&text, &module_names, &owners) {
             if let Some(set) = reached_by.get_mut(&module) {
                 set.insert(crate_dir.clone());
             }
         }
     }
+    BaseCensus {
+        code,
+        reached_by,
+        owners,
+    }
+}
 
-    let (lonely, acting) = lonely_mechanisms(&code, &reached_by);
+/// A mechanism in the base has to be reached by more than one crate.
+#[test]
+fn a_module_that_touches_the_machine_is_reached_by_more_than_one_crate() {
+    let root = common::root::repo_root();
+    let census = base_census(&root);
+    let code = &census.code;
+    let reached_by = &census.reached_by;
+    let modules = &census.code;
+
+    let (lonely, acting) = lonely_mechanisms(code, reached_by);
     assert!(
         lonely.is_empty(),
         "modules in the base that do work nothing outside it shares:\n  {}\n\
@@ -650,6 +682,107 @@ fn a_module_that_touches_the_machine_is_reached_by_more_than_one_crate() {
     println!(
         "{acting} of {} modules in the base do work; the rest are shapes and names",
         modules.len()
+    );
+}
+
+/// Every module the base declares is reached by something: a crate outside the
+/// base, or another module inside it.
+///
+/// The rule above only reads modules that do work, and a shape nobody calls
+/// compiles just as quietly -- `pub` items are never "unused" to the compiler.
+/// So a definition can sit in the base with no consumer at all: it changes
+/// nothing, ships to every crate that links the base, and looks exactly like a
+/// contract that is about to be wired. That module is either waiting on work
+/// nobody has done (then the caller comes first, in the crate that will call it)
+/// or it is gone already and nobody noticed.
+///
+/// Reach is read the same way the rule above reads it, plus the base's own
+/// callers, because a module this crate's other modules call is at least being
+/// used. A module named only by its own file fails here.
+#[test]
+fn every_module_the_base_declares_is_reached_somewhere() {
+    let root = common::root::repo_root();
+    let census = base_census(&root);
+
+    let mut dead: Vec<String> = Vec::new();
+    for module in census.code.keys() {
+        if census
+            .reached_by
+            .get(module)
+            .is_some_and(|readers| !readers.is_empty())
+        {
+            continue;
+        }
+        let called_inside = census.code.iter().any(|(other, text)| {
+            if other == module {
+                return false;
+            }
+            if names_path(text, &format!("crate::{module}")) {
+                return true;
+            }
+            census.owners.iter().any(|(item, owners)| {
+                owners.contains(module) && names_path(text, &format!("crate::{item}"))
+            })
+        });
+        if !called_inside {
+            dead.push(module.clone());
+        }
+    }
+
+    assert!(
+        dead.is_empty(),
+        "modules the base declares that nothing reaches:\n  {}\n\
+         A module no crate outside the base names and no other module inside it \
+         calls is code that does not run: it costs every crate that links the \
+         base and it is indistinguishable from a contract somebody is about to \
+         use. Either move it to the crate that will call it -- and land it \
+         together with that caller -- or delete it; the history keeps it.",
+        dead.join("\n  ")
+    );
+    println!(
+        "{} modules in the base, all reached from outside or from another module",
+        census.code.len()
+    );
+}
+
+/// A reading one crate calls lives in that crate; a reading more than one crate
+/// calls stays in the base.
+///
+/// The two sides are read from the tree rather than kept as a table: if the
+/// parser drifts back into the base, the first half fails; if the shared diff
+/// reader is moved out with it, the second half fails. Neither failure can be
+/// answered by editing this file alone, which is the point -- the reading is
+/// about which crate can name the symbol.
+#[test]
+fn a_reading_with_one_consumer_lives_in_that_consumer() {
+    let base = common::routes::read_repo(&format!("{BASE_SRC}/contract/reflection.rs"));
+    let consumer = common::routes::read_repo("crates/cog-reflection/src/config_reachability.rs");
+
+    for name in [
+        "unreachable_defaults",
+        "default_impl_blocks",
+        "literal_field_assignment",
+    ] {
+        let declared = format!("fn {name}(");
+        assert!(
+            !base.contains(&declared),
+            "`{name}` is back in the base: its only caller is the reflection \
+             pipeline, and a reader one crate calls belongs in that crate"
+        );
+        assert!(
+            consumer.contains(&declared),
+            "`{name}` is in neither the base nor `cog-reflection::config_reachability`: \
+             the reading the change pipeline needs has no home"
+        );
+    }
+
+    // The diff reader three crates name must not be swept out with the parser.
+    let shared = "pub fn parse_diff_affected_files(";
+    assert!(
+        base.contains(shared),
+        "`parse_diff_affected_files` left the base, but landing and \
+         collaboration call it too: a crate other than the assembly can reach \
+         the base and nothing else, so the shared half has no other home"
     );
 }
 
@@ -680,7 +813,7 @@ fn the_judgement_counts_reach_and_not_names() {
                     .iter()
                     .find(|(module, _)| module == name)
                     .map(|(_, crates)| crates.iter().map(|c| (*c).to_owned()).collect())
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 (name.clone(), crates)
             })
             .collect::<BTreeMap<String, BTreeSet<String>>>()

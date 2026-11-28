@@ -10,7 +10,7 @@ pub fn apply_gateway_config_update(
     current: &std::sync::RwLock<cog_core::GatewayConfig>,
     new_gateway: &cog_core::GatewayConfig,
     request_timeout_secs: &std::sync::atomic::AtomicU64,
-    sandbox_task_timeout_secs: &std::sync::atomic::AtomicU64,
+    shutdown_timeout_ms: u64,
 ) -> (Vec<String>, Vec<String>) {
     let mut applied = Vec::new();
     let mut need_restart = Vec::new();
@@ -48,19 +48,14 @@ pub fn apply_gateway_config_update(
         let mut cfg = current.write().unwrap_or_else(|e| e.into_inner());
         cfg.websocket_timeout_secs = new_gateway.websocket_timeout_secs;
         cfg.websocket_inactivity_timeout_secs = new_gateway.websocket_inactivity_timeout_secs;
-        cfg.websocket_tick_secs = new_gateway.websocket_tick_secs;
         cfg.request_timeout_secs = new_gateway.request_timeout_secs;
-        cfg.sandbox_task_timeout_secs = new_gateway.sandbox_task_timeout_secs;
         cfg.notification_limit = new_gateway.notification_limit;
         // NOTE: http_port / ws_port / metrics_port / internal_port are intentionally
         // preserved so the already-bound sockets remain valid.
     }
+    // 与启动时同一口径：原子里存生效值，没写时取这次停机的排空时长。
     request_timeout_secs.store(
-        new_gateway.request_timeout_secs,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    sandbox_task_timeout_secs.store(
-        new_gateway.sandbox_task_timeout_secs,
+        new_gateway.effective_request_timeout_secs(shutdown_timeout_ms),
         std::sync::atomic::Ordering::Relaxed,
     );
     applied.push("gateway_timeouts_updated".to_string());
@@ -82,9 +77,7 @@ mod tests {
             cors_origins: vec![],
             websocket_timeout_secs: 30,
             websocket_inactivity_timeout_secs: 90,
-            websocket_tick_secs: 5,
             notification_limit: 50,
-            sandbox_task_timeout_secs: 30,
             request_timeout_secs: 30,
             notification_webhook_url: None,
             ..Default::default()
@@ -96,18 +89,15 @@ mod tests {
             metrics_port: 9092,
             websocket_timeout_secs: 60,
             websocket_inactivity_timeout_secs: 120,
-            websocket_tick_secs: 10,
             notification_limit: 100,
-            sandbox_task_timeout_secs: 45,
             request_timeout_secs: 45,
             notification_webhook_url: None,
             ..Default::default()
         };
 
         let request_timeout = std::sync::atomic::AtomicU64::new(30);
-        let sandbox_timeout = std::sync::atomic::AtomicU64::new(30);
         let (applied, need_restart) =
-            apply_gateway_config_update(&current, &new_config, &request_timeout, &sandbox_timeout);
+            apply_gateway_config_update(&current, &new_config, &request_timeout, 30_000);
 
         assert!(
             need_restart.iter().any(|s| s.contains("ports_changed")),
@@ -127,16 +117,10 @@ mod tests {
         // Non-port fields must be updated.
         assert_eq!(cfg.websocket_timeout_secs, 60);
         assert_eq!(cfg.websocket_inactivity_timeout_secs, 120);
-        assert_eq!(cfg.websocket_tick_secs, 10);
         assert_eq!(cfg.notification_limit, 100);
-        assert_eq!(cfg.sandbox_task_timeout_secs, 45);
         assert_eq!(cfg.request_timeout_secs, 45);
         assert_eq!(
             request_timeout.load(std::sync::atomic::Ordering::Relaxed),
-            45
-        );
-        assert_eq!(
-            sandbox_timeout.load(std::sync::atomic::Ordering::Relaxed),
             45
         );
     }
@@ -150,9 +134,7 @@ mod tests {
             cors_origins: vec![],
             websocket_timeout_secs: 30,
             websocket_inactivity_timeout_secs: 90,
-            websocket_tick_secs: 5,
             notification_limit: 50,
-            sandbox_task_timeout_secs: 30,
             request_timeout_secs: 30,
             notification_webhook_url: None,
             ..Default::default()
@@ -164,18 +146,15 @@ mod tests {
             metrics_port: 8082,
             websocket_timeout_secs: 60,
             websocket_inactivity_timeout_secs: 90,
-            websocket_tick_secs: 5,
             notification_limit: 50,
-            sandbox_task_timeout_secs: 30,
             request_timeout_secs: 30,
             notification_webhook_url: None,
             ..Default::default()
         };
 
         let request_timeout = std::sync::atomic::AtomicU64::new(30);
-        let sandbox_timeout = std::sync::atomic::AtomicU64::new(30);
         let (applied, need_restart) =
-            apply_gateway_config_update(&current, &new_config, &request_timeout, &sandbox_timeout);
+            apply_gateway_config_update(&current, &new_config, &request_timeout, 30_000);
 
         assert!(
             need_restart.is_empty(),
@@ -191,10 +170,6 @@ mod tests {
         assert_eq!(cfg.http_port, 8080);
         assert_eq!(
             request_timeout.load(std::sync::atomic::Ordering::Relaxed),
-            30
-        );
-        assert_eq!(
-            sandbox_timeout.load(std::sync::atomic::Ordering::Relaxed),
             30
         );
     }

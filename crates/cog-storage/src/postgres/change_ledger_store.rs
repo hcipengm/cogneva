@@ -67,7 +67,27 @@ fn read_sql(rest: &str) -> String {
 
 /// Every read returns these, in one place so no two readers can come back with
 /// differently ordered columns.
-const ROW_COLUMNS: &str = "kind, scope, literal, state, title, assertion, sources, \
+/// The citations as the row's readers receive them: one array, ordered by the
+/// document that made it.
+///
+/// `sources` was a jsonb array on the row. An array of objects with keys is a
+/// second table written into a cell: the four keys were read by name
+/// (`->>'block'` counted, `->>'doc'` filtered), nothing could be indexed, and
+/// two writers citing the same change rewrote the whole array. As a table each
+/// citation is a row, the doc is part of its key, and the queries above are
+/// `WHERE`s rather than key lookups into a document.
+///
+/// The array is built here, per read, so there is no second stored copy to
+/// drift: the state a reader sees is computed from `change_ledger_sources` at
+/// the moment it is asked for. `l` is the row source at every call site.
+const ROW_COLUMNS: &str = "kind, scope, literal, state, title, assertion, \
+                           COALESCE((SELECT jsonb_agg(jsonb_build_object( \
+                                            'doc', s.doc, 'verdict', s.verdict, \
+                                            'priority', s.priority, 'block', s.block) \
+                                        ORDER BY s.doc) \
+                                       FROM change_ledger_sources s \
+                                      WHERE s.kind = l.kind AND s.scope = l.scope \
+                                        AND s.literal = l.literal), '[]'::jsonb) AS sources, \
                            first_seen_at, measured_at, measured_rev, delivered_rev, landed_at, \
                            unsettled_reason, retire_reason, retired_at";
 
@@ -86,24 +106,36 @@ const WRITE_WINDOW_COLUMNS_SQL: &str = "SELECT window_id, path_scope, writer, ap
 /// The bounds are the narrower dialect's (MySQL cannot key an unbounded TEXT
 /// column), so one set governs both. Widths are counted in characters, which is
 /// what both dialects' VARCHAR lengths mean.
-// cap: bound — 取的是更窄那个方言的宽度（MySQL 不能给无界 TEXT 建键），一套管两边
+// cap: fixed — 取的是更窄那个方言的宽度（MySQL 不能给无界 TEXT 建键），一套管两边
+// not-a-bound: 取的是更窄那个方言的宽度（MySQL 不能给无界 TEXT 建键），一套管两边
 const KIND_MAX: usize = 32;
-// cap: bound — the identity's scope column width, pinned by the narrower dialect's index limit
+// cap: fixed — the identity's scope column width, pinned by the narrower dialect's index limit
+// keep: 删掉后 scope 列超出较窄方言的索引上限，建索引失败；由「较窄方言的索引上限」兜住
 const SCOPE_MAX: usize = 191;
-// cap: bound — the identity's literal column width, a schema limit shared by both dialects
+// cap: fixed — the identity's literal column width, a schema limit shared by both dialects
+// keep: 删掉后 literal 列在两种方言之间一半能写一半被拒；由「两种方言共用的 schema 上限」兜住
 const LITERAL_MAX: usize = 512;
-// cap: bound — a writer-side cap on the source document; the row itself keeps the sources in JSONB
+// cap: fixed — a writer-side cap on one citation's document; the citations live in change_ledger_sources
+// keep: 删掉后回到「a writer-side cap on one citation's document; the citations live in change_ledger_sources」所描述的情形；由这条约定兜住
 const DOC_MAX: usize = 512;
 
 /// PostgreSQL change ledger store.
 #[derive(Clone)]
 pub struct PostgresChangeLedgerStore {
     pool: PgPool,
+    /// 事件流的写口；没接上时只写表（读切换之前两者并存）。
+    events: Option<std::sync::Arc<dyn cog_core::EventStore>>,
 }
 
 impl PostgresChangeLedgerStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self { pool, events: None }
+    }
+
+    /// 接上事件流：每一次测量同时落一条事实，账本行成为它的投影。
+    pub fn with_events(mut self, events: std::sync::Arc<dyn cog_core::EventStore>) -> Self {
+        self.events = Some(events);
+        self
     }
 
     /// A row as callers see it, or why it cannot be one.
@@ -291,34 +323,39 @@ impl PostgresChangeLedgerStore {
 /// live database reading the row back could tell. The parameter list is written
 /// here, next to the statement, because the numbering is not the column order.
 const RECORD_READING_SQL_TEMPLATE: &str = "\
-INSERT INTO change_ledger (kind, scope, literal, state, title, assertion, sources, first_seen_rev)
-VALUES ($1, $2, $3, '{state:pending}', $4, $5, jsonb_build_array(jsonb_build_object('doc', $6, 'verdict', $7, 'priority', $8, 'block', $9)), $10)
-ON CONFLICT (kind, scope, literal) DO UPDATE SET
-    title = COALESCE(EXCLUDED.title, change_ledger.title),
-    assertion = COALESCE(EXCLUDED.assertion, change_ledger.assertion),
-    sources = CASE
-        WHEN NOT EXISTS (
-            SELECT 1 FROM jsonb_array_elements(change_ledger.sources) AS cited(entry)
-            WHERE cited.entry->>'doc' = $6
-        ) THEN change_ledger.sources || EXCLUDED.sources
-        WHEN EXISTS (
-            SELECT 1 FROM jsonb_array_elements(change_ledger.sources) AS cited(entry)
-            WHERE cited.entry->>'doc' = $6
-              AND (cited.entry->>'verdict' IS DISTINCT FROM $7
-                   OR cited.entry->>'priority' IS DISTINCT FROM $8
-                   OR COALESCE(cited.entry->>'block', 'none') IS DISTINCT FROM $9)
-        ) THEN (
-            SELECT jsonb_agg(
-                CASE
-                    WHEN cited.entry->>'doc' = $6
-                    THEN jsonb_build_object('doc', $6, 'verdict', $7, 'priority', $8, 'block', $9)
-                    ELSE cited.entry
-                END
-            )
-            FROM jsonb_array_elements(change_ledger.sources) AS cited(entry)
-        )
-        ELSE change_ledger.sources
-    END";
+WITH ledger_row AS (\
+    INSERT INTO change_ledger (kind, scope, literal, state, title, assertion, first_seen_rev)
+    VALUES ($1, $2, $3, '{state:pending}', $4, $5, $10)
+    ON CONFLICT (kind, scope, literal) DO UPDATE SET
+        title = COALESCE(EXCLUDED.title, change_ledger.title),
+        assertion = COALESCE(EXCLUDED.assertion, change_ledger.assertion)
+    RETURNING kind, scope, literal\
+)
+INSERT INTO change_ledger_sources (kind, scope, literal, doc, verdict, priority, block)
+SELECT ledger_row.kind, ledger_row.scope, ledger_row.literal, $6, $7, $8, $9 FROM ledger_row
+ON CONFLICT (kind, scope, literal, doc) DO UPDATE SET
+    verdict = EXCLUDED.verdict,
+    priority = EXCLUDED.priority,
+    block = EXCLUDED.block
+ WHERE (change_ledger_sources.verdict, change_ledger_sources.priority, change_ledger_sources.block)
+       IS DISTINCT FROM (EXCLUDED.verdict, EXCLUDED.priority, EXCLUDED.block)";
+
+/// 重算一行台账的两个排序值，从它的引用表读。
+///
+/// 069 的 `priority_rank` 与 087 的 `block` 原本是**生成列**，表达式读 `sources`。
+/// 生成列不能引用别的表，所以引用搬走之后它们变成普通列，由这一条语句在写引用的
+/// 同一条事务里重算。计算本身没有第二份：两个 `change_ledger_*(jsonb)` 函数原样
+/// 复用，这里只是把引用表的行拼回它们认得的数组。
+const RECOUNT_SQL: &str = "\
+UPDATE change_ledger c \
+   SET priority_rank = change_ledger_priority_rank(sub.citations), \
+       block = change_ledger_block(sub.citations) \
+  FROM (SELECT COALESCE(jsonb_agg(jsonb_build_object('priority', s.priority, \
+                                                   'block', s.block)), '[]'::jsonb) \
+               AS citations \
+          FROM change_ledger_sources s \
+         WHERE s.kind = $1 AND s.scope = $2 AND s.literal = $3) sub \
+ WHERE c.kind = $1 AND c.scope = $2 AND c.literal = $3";
 
 /// Write one measurement, with every time taken from the database clock.
 ///
@@ -377,14 +414,17 @@ ON CONFLICT (kind, scope, literal) DO UPDATE SET
 /// being reopened has no earlier reading, and takes the new one.
 ///
 /// The three columns describing a wait -- its reason, its condition and when it
-/// started -- are cleared by any measurement that does not say `pending`. They
-/// describe work still owed, and a row that has landed or retired owes nothing;
-/// left behind they keep counting in every census that groups by reason.
+/// started -- are cleared by any measurement that does not leave the row owed
+/// and waiting: a landing, and a retirement. A retirement no longer has a state
+/// of its own -- the row stays `pending` and carries `retire_reason` -- so the
+/// state alone cannot say it: the row is judged out of the account and no longer
+/// asks the tree for anything, which is exactly the shape a wait must not stay
+/// on. Left behind it keeps counting in every census that groups by reason.
 /// Measured on the live account: a row retired minutes earlier still carried the
 /// pool's reason, and the blocked reading came out one row larger than the
-/// pending set it was describing. A measurement that still says `pending` keeps
-/// the wait it found -- stamping and clearing are the passes that decide those,
-/// and re-measuring a row is not one of them.
+/// pending set it was describing. A measurement that still leaves the row owed
+/// keeps the wait it found -- stamping and clearing are the passes that decide
+/// those, and re-measuring a row is not one of them.
 const APPLY_MEASUREMENT_SQL_TEMPLATE: &str = "\
 WITH prior AS (
     SELECT state AS before FROM change_ledger
@@ -402,7 +442,7 @@ WITH prior AS (
         $5,
         now(),
         CASE WHEN $4 = '{state:landed}' THEN now() ELSE NULL END,
-        CASE WHEN $4 = '{state:retired}' THEN now() ELSE NULL END
+        CASE WHEN $6 IS NOT NULL THEN now() ELSE NULL END
     )
     ON CONFLICT (kind, scope, literal) DO UPDATE SET
         state = EXCLUDED.state,
@@ -417,20 +457,25 @@ WITH prior AS (
             ELSE NULL
         END,
         retired_at = CASE
-            WHEN EXCLUDED.state = '{state:retired}' THEN COALESCE(change_ledger.retired_at, now())
+            WHEN EXCLUDED.retire_reason IS NOT NULL
+                THEN COALESCE(change_ledger.retired_at, now())
             ELSE NULL
         END,
-        -- A wait describes work still owed; see the note above this statement.
+        -- A wait describes work the account is still asking the tree about; a
+        -- judged-out row is not asking. See the note above this statement.
         blocked_reason = CASE
-            WHEN EXCLUDED.state = '{state:pending}' THEN change_ledger.blocked_reason
+            WHEN EXCLUDED.state = '{state:pending}' AND EXCLUDED.retire_reason IS NULL
+                THEN change_ledger.blocked_reason
             ELSE NULL
         END,
         unblock_condition = CASE
-            WHEN EXCLUDED.state = '{state:pending}' THEN change_ledger.unblock_condition
+            WHEN EXCLUDED.state = '{state:pending}' AND EXCLUDED.retire_reason IS NULL
+                THEN change_ledger.unblock_condition
             ELSE NULL
         END,
         blocked_since = CASE
-            WHEN EXCLUDED.state = '{state:pending}' THEN change_ledger.blocked_since
+            WHEN EXCLUDED.state = '{state:pending}' AND EXCLUDED.retire_reason IS NULL
+                THEN change_ledger.blocked_since
             ELSE NULL
         END
     RETURNING state, measured_rev, retire_reason, unsettled_reason
@@ -483,7 +528,7 @@ SELECT count(*) FILTER (WHERE l.state = '{state:landed}') AS satisfied, \
 const BLOCKING_SURFACE_SQL_TEMPLATE: &str = "\
 WITH holder AS ( \
     SELECT kind, scope, literal, delivered_rev FROM change_ledger \
-     WHERE delivered_rev IS NOT NULL AND state NOT IN ('{state:landed}', '{state:retired}') \
+     WHERE delivered_rev IS NOT NULL AND state = '{state:pending}' \
 ), held AS ( \
     SELECT DISTINCT l.kind, l.scope, l.literal \
       FROM change_ledger l JOIN holder h ON l.measured_rev = h.delivered_rev \
@@ -492,11 +537,11 @@ WITH holder AS ( \
 SELECT (SELECT count(*) FROM holder) AS holders, \
        (SELECT count(*) FROM held) AS held_landings, \
        (SELECT count(*) FROM change_ledger l \
-         WHERE l.state NOT IN ('{state:landed}', '{state:retired}') \
-           AND (SELECT count(DISTINCT entry->>'block') \
-                  FROM jsonb_array_elements(l.sources) AS entry \
-                 WHERE entry->>'block' IS NOT NULL \
-                   AND entry->>'block' <> 'none') > 1) \
+         WHERE l.state = '{state:pending}' \
+           AND (SELECT count(DISTINCT s.block) \
+                  FROM change_ledger_sources s \
+                 WHERE s.kind = l.kind AND s.scope = l.scope AND s.literal = l.literal \
+                   AND s.block <> 'none') > 1) \
            AS block_conflicts";
 
 /// The owed set and the landed set, grouped by the face the documents named.
@@ -518,7 +563,7 @@ SELECT h.kind, h.scope, h.literal, \
            AND (l.kind, l.scope, l.literal) IS DISTINCT FROM (h.kind, h.scope, h.literal)) \
          AS held \
   FROM change_ledger h \
- WHERE h.delivered_rev IS NOT NULL AND h.state NOT IN ('{state:landed}', '{state:retired}') \
+ WHERE h.delivered_rev IS NOT NULL AND h.state = '{state:pending}' \
  ORDER BY held DESC, h.kind, h.scope, h.literal";
 
 /// `undecided` gets its own arm rather than being folded into `owed`.
@@ -540,13 +585,10 @@ SELECT h.kind, h.scope, h.literal, \
 /// unreachable for the ones it can.
 const BLOCK_CENSUS_SQL_TEMPLATE: &str = "\
 SELECT block, \
-       CASE state WHEN '{state:landed}' THEN '{state:landed}' \
-                  WHEN '{state:retired}' THEN '{state:retired}' \
-                  WHEN '{state:undecided}' THEN '{state:undecided}' \
-                  WHEN '{state:conflict}' THEN 'owed' \
-                  WHEN '{state:pending}' THEN 'owed' \
-                  WHEN '{state:partial}' THEN 'owed' \
-                  ELSE 'owed' END AS state, \
+       CASE WHEN state = '{state:landed}' THEN '{state:landed}' \
+            WHEN retire_reason IS NOT NULL THEN 'retired' \
+            WHEN unsettled_reason IS NOT NULL THEN 'undecided' \
+            ELSE 'owed' END AS state, \
        count(*) AS n, \
        max(EXTRACT(EPOCH FROM (now() - COALESCE(measured_at, first_seen_at))))::float8 \
          AS oldest_unmeasured_secs, \
@@ -664,47 +706,47 @@ fn check_reading(reading: &ChangeReading) -> Result<(), String> {
     check_fits("source document", &reading.source.doc, DOC_MAX)
 }
 
-/// Refuse a measurement whose state and reason do not agree.
+/// Refuse a measurement whose state and reasons do not agree.
 ///
-/// Two invariants: a row is retired if and only if it carries a `retire_reason`,
-/// and a row is undecided if and only if it carries an `unsettled_reason`.
-/// [`ChangeMeasurement::retired`] and [`ChangeMeasurement::undecided`] make a
-/// reason-less retirement and a reason-less undecided row unbuildable, so the half
-/// this catches is the other direction -- a reason left on a measurement of some
-/// other state, which would write a row that is not in that state while holding a
-/// reason it is not. Checked here as well as constrained in the schema because the
-/// dialects disagree: Postgres can hold the coupling in a CHECK, MySQL 5.7 cannot,
-/// and a rule that only one dialect enforces is a rule the store cannot rely on.
+/// There are two reasons a measurement can carry, and both are about *why the
+/// row is still owed*: `retire_reason` says the census judges the identity one
+/// the account should not hold, `unsettled_reason` says the pass could not read
+/// the row. Neither is a statement that the change is in the tree, so neither may
+/// ride on a `landed` row -- a landed row carrying "could not measure" would make
+/// the two readings indistinguishable at every column. A row carrying both is
+/// refused for the same reason: they are two different claims about the same row,
+/// and the account cannot be making both at once.
+///
+/// [`ChangeMeasurement::retired`] and [`ChangeMeasurement::undecided`] cannot be
+/// built without their reason; the half this catches is the other direction -- a
+/// reason left on a measurement of another state, which the enum no longer has a
+/// state to describe. Checked here as well as constrained in the schema because
+/// the coupling is a rule the store relies on, and a rule that lives only in a
+/// dialect's CHECK is one the other dialect runs without.
 fn check_measurement(m: &ChangeMeasurement) -> Result<(), String> {
-    match (m.state, m.retire_reason) {
-        (ChangeState::Retired, None) => {
-            return Err(
-                "a retired measurement carries no reason, which would be a deletion \
-                 wearing a state's clothes"
-                    .to_string(),
-            );
-        }
-        (state, Some(reason)) if state != ChangeState::Retired => {
+    if m.state == ChangeState::Landed {
+        if let Some(reason) = m.retire_reason {
             return Err(format!(
-                "a {} measurement carries the retire reason {}, which belongs only to a \
-                 retired row",
-                state.as_str(),
+                "a landed measurement carries the retire reason {}, which says the row is \
+                 still the account's to decide -- not that the change is in the tree",
                 reason.as_str()
             ));
         }
-        _ => {}
+        if let Some(reason) = m.unsettled_reason.as_deref() {
+            return Err(format!(
+                "a landed measurement carries the unsettled reason {reason}, which says the \
+                 row could not be read -- a reading that could not be taken cannot land it"
+            ));
+        }
     }
-    match (m.state, m.unsettled_reason.as_deref()) {
-        (ChangeState::Undecided, None) => Err(
-            "an undecided measurement carries no reason, which would read as answered".to_string(),
-        ),
-        (state, Some(reason)) if state != ChangeState::Undecided => Err(format!(
-            "a {} measurement carries the unsettled reason {reason}, which belongs only to \
-             an undecided row",
-            state.as_str()
-        )),
-        _ => Ok(()),
+    if m.retire_reason.is_some() && m.unsettled_reason.is_some() {
+        return Err(
+            "a measurement carries both a retire reason and an unsettled reason: one row \
+             cannot be both judged out of the account and unread in the same pass"
+                .to_string(),
+        );
     }
+    Ok(())
 }
 
 /// Queue a declaration, or leave the one already queued for this change and
@@ -784,9 +826,9 @@ WITH known AS (
       FROM change_ledger
      WHERE delivered_rev IS NOT NULL AND delivered_rev <> ''
     UNION
-    SELECT left(substr(src->>'doc', 5), 12) AS rev
-      FROM change_ledger, jsonb_array_elements(sources) AS src
-     WHERE src->>'doc' LIKE 'git:%'
+    SELECT left(substr(s.doc, 5), 12) AS rev
+      FROM change_ledger_sources s
+     WHERE s.doc LIKE 'git:%'
 )
 SELECT DISTINCT rev FROM known WHERE rev = ANY($1::text[])";
 
@@ -886,14 +928,11 @@ WHERE folded_at IS NULL";
 /// transaction that claimed the declaration: a version bound to the pool could
 /// only be called outside it, and the claim is worth nothing if the write it
 /// guards has already been committed or has yet to start.
-async fn write_reading<'e, E>(
-    exec: E,
+async fn write_reading(
+    conn: &mut sqlx::PgConnection,
     reading: &ChangeReading,
     first_seen_rev: Option<&str>,
-) -> SFResult<()>
-where
-    E: sqlx::PgExecutor<'e>,
-{
+) -> SFResult<()> {
     sqlx::query(&fill_vocabulary(RECORD_READING_SQL_TEMPLATE))
         .bind(&reading.identity.kind)
         .bind(&reading.identity.scope)
@@ -905,7 +944,7 @@ where
         .bind(reading.source.priority.as_str())
         .bind(reading.source.block.as_str())
         .bind(first_seen_rev)
-        .execute(exec)
+        .execute(&mut *conn)
         .await
         .map_err(|e| {
             SFError::Database(format!(
@@ -913,7 +952,56 @@ where
                 reading.identity.as_key()
             ))
         })?;
+    // 两列排序值在同一条事务里重算：它们是 069／087 的生成列，表达式读的是
+    // `sources`，而那一列已经搬进引用表——生成列不能引用别的表，所以这一次
+    // 重算必须有人写。写引用的路径只有这一条，所以「有人」只有这一个地方。
+    sqlx::query(RECOUNT_SQL)
+        .bind(&reading.identity.kind)
+        .bind(&reading.identity.scope)
+        .bind(&reading.identity.literal)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| {
+            SFError::Database(format!(
+                "recount the citations of {}: {e}",
+                reading.identity.as_key()
+            ))
+        })?;
     Ok(())
+}
+
+impl PostgresChangeLedgerStore {
+    /// 把一次 reading 落成一条 `change_declared` 事实。
+    ///
+    /// 先写事实、再写行：中途断掉时留下的是「事实在、行没有」，重建读得回来；反过来
+    /// 留下的是「行在、事实没有」，那一行的 title／assertion 就只剩表里这一份。
+    /// 没接事件写口时只写行——读切换之前两者并存。
+    async fn append_declared(
+        &self,
+        reading: &ChangeReading,
+        first_seen_rev: Option<&str>,
+    ) -> SFResult<()> {
+        let Some(events) = self.events.as_ref() else {
+            return Ok(());
+        };
+        let mut event = cog_core::FactEvent::new(cog_core::EventPayload::ChangeDeclared {
+            kind: reading.identity.kind.clone(),
+            scope: reading.identity.scope.clone(),
+            literal: reading.identity.literal.clone(),
+            title: reading.title.clone(),
+            assertion: reading.assertion.clone(),
+            doc: reading.source.doc.clone(),
+            verdict: reading.source.verdict.clone(),
+            priority: reading.source.priority.as_str().to_string(),
+            block: reading.source.block.as_str().to_string(),
+            first_seen_rev: first_seen_rev.map(str::to_string),
+        });
+        event.at = None;
+        events
+            .append(event)
+            .await
+            .map_err(|e| SFError::Database(format!("declare {}: {e}", reading.identity.as_key())))
+    }
 }
 
 #[async_trait]
@@ -926,7 +1014,19 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         let mut stored = 0usize;
         for reading in readings {
             check_reading(reading).map_err(SFError::Validation)?;
-            write_reading(&self.pool, reading, first_seen_rev).await?;
+            self.append_declared(reading, first_seen_rev).await?;
+            // 台账行、它的引用、以及从引用重算出的两个排序值，要么一起进库，要么
+            // 一起不进：分开提交会留下一行「引用已写、排序值还是默认」的台账，而
+            // 那正是取批次的顺序所读的两格。
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| SFError::Database(format!("begin a reading: {e}")))?;
+            write_reading(&mut tx, reading, first_seen_rev).await?;
+            tx.commit()
+                .await
+                .map_err(|e| SFError::Database(format!("commit a reading: {e}")))?;
             stored += 1;
         }
         Ok(stored)
@@ -992,7 +1092,8 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // other order would drop the change instead, and nothing would say so.
         for reading in &readings {
             check_reading(reading).map_err(SFError::Validation)?;
-            write_reading(&mut *tx, reading, first_seen_rev).await?;
+            self.append_declared(reading, first_seen_rev).await?;
+            write_reading(&mut tx, reading, first_seen_rev).await?;
         }
 
         let mut folded = 0usize;
@@ -1148,6 +1249,23 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                     measurement.identity.as_key()
                 ))
             })?;
+        if let Some(events) = self.events.as_ref() {
+            let mut event = cog_core::FactEvent::new(cog_core::EventPayload::ChangeJudged {
+                kind: measurement.identity.kind.clone(),
+                scope: measurement.identity.scope.clone(),
+                literal: measurement.identity.literal.clone(),
+                state: measurement.state.as_str().to_string(),
+                measured_rev: measurement.measured_rev.clone(),
+                retire_reason: measurement.retire_reason.map(|r| r.as_str().to_string()),
+                unsettled_reason: measurement.unsettled_reason.clone(),
+                parent_observation: measurement.parent_observation.clone(),
+            });
+            event.at = Some(chrono::Utc::now());
+            events
+                .append(event)
+                .await
+                .map_err(|e| SFError::Database(format!("change judged fact: {e}")))?;
+        }
         Ok(())
     }
 
@@ -1201,11 +1319,26 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // band order, because that order decides which of the owed rows this pass
         // pays for.
         //
-        // Both terminal states are excluded together, so the set this answers is
-        // the same one `landed` was excluded to make: the work. A retired row is
-        // not work -- its question is answered -- and leaving it in would hand a
-        // fixture identity back to the tree, whose check would only overwrite the
-        // retirement with the unsettled answer it was retired to stop repeating.
+        // Two exclusions, and they are not the same rule. `landed` rows are out
+        // because the account says their question is answered. Rows the census
+        // judged out of the account are still `pending` -- the work is still
+        // owed, and every census counts them -- but asking the tree again cannot
+        // change anything: the identity is a fixture, or has been superseded, or
+        // names a surface no look can reach. Handing one back to the tree would
+        // overwrite the reason with the same absent reading every pass, which is
+        // the judgement dissolving into noise. The two reads that can falsify a
+        // judgement (`retired_surface_moved` and `retired_answered_elsewhere`)
+        // ask their question directly, and the re-measurement queue is the third
+        // way back, so this exclusion has a door.
+        // `landed` is terminal, and this exclusion is where the account says so:
+        // a row it stops answering is a row no later pass is handed to measure,
+        // so a criterion corrected afterwards never reaches the rows that landed
+        // under the old one. A criterion revision is a property of the
+        // (identity, revision) pair: re-pointing it declares a fresh change rather
+        // than re-reading the old row, and the rows landed under the old criterion
+        // stay landed. Read the other way round they look like a backlog this
+        // queue forgot, and a pass that reopened them would be moving state on a
+        // reading rather than on a measurement -- which the state column is not
         //
         // Both orderings end on the identity, and that is not decoration. Every
         // row a fold writes in one transaction shares one `now()`, so a batch of
@@ -1238,12 +1371,13 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                                                  l.first_seen_at ASC, \
                                                  l.kind ASC, l.scope ASC, l.literal ASC) AS by_band \
                                FROM change_ledger l \
-                              WHERE l.state NOT IN ('{state:landed}', '{state:retired}')\
+                              WHERE l.state = '{state:pending}'\
+                                AND l.retire_reason IS NULL\
                        ) ranked \
-                 ) t \
-                 WHERE t.by_age <= $2::bigint \
-                    OR t.of_rest <= $1::bigint - $2::bigint \
-                 ORDER BY t.by_band",
+                 ) l \
+                 WHERE l.by_age <= $2::bigint \
+                    OR l.of_rest <= $1::bigint - $2::bigint \
+                 ORDER BY l.by_band",
             ))
             .bind(limit as i64)
             .bind((limit / 2) as i64)
@@ -1328,7 +1462,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // the owed set, and that sum is a reader's only check on the split.
         let owed_by_band_sql = fill_vocabulary(
             "SELECT priority_rank, count(*) FROM change_ledger \
-             WHERE state NOT IN ('{state:landed}', '{state:retired}') \
+             WHERE state = '{state:pending}' \
              GROUP BY priority_rank",
         );
         let counted: Vec<(i16, i64)> = sqlx::query_as(&owed_by_band_sql)
@@ -1365,8 +1499,8 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // day-old landed row at the head of this one.
         Self::entries(
             sqlx::query(&read_sql(
-                "FROM change_ledger \
-                 WHERE state = '{state:landed}' \
+                "FROM change_ledger l \
+                 WHERE l.state = '{state:landed}' \
                  ORDER BY measured_at ASC NULLS FIRST, first_seen_at ASC \
                  LIMIT $1",
             ))
@@ -1445,17 +1579,17 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // statement's parameter count depend on the tree.
         Self::entries(
             sqlx::query(&read_sql(
-                "FROM change_ledger c \
+                "FROM change_ledger l \
                  CROSS JOIN LATERAL ( \
-                     SELECT rtrim(regexp_replace(c.scope, '^\\./', ''), '/') AS s \
+                     SELECT rtrim(regexp_replace(l.scope, '^\\./', ''), '/') AS s \
                  ) n \
-                 WHERE c.state = '{state:landed}' AND ( \
+                 WHERE l.state = '{state:landed}' AND ( \
                      n.s = '' OR n.s = '.' OR EXISTS ( \
                          SELECT 1 FROM unnest($1::text[]) AS p(path) \
                          WHERE p.path = n.s OR p.path LIKE n.s || '/%' \
                      ) \
                  ) \
-                 ORDER BY c.measured_at ASC NULLS FIRST, c.first_seen_at ASC \
+                 ORDER BY l.measured_at ASC NULLS FIRST, l.first_seen_at ASC \
                  LIMIT $2",
             ))
             .bind(paths.to_vec())
@@ -1554,8 +1688,8 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // re-reading the same head of the set.
         Self::entries(
             sqlx::query(&read_sql(
-                "FROM change_ledger \
-                 WHERE state = '{state:retired}' AND retire_reason = '{reason:surface_moved}' \
+                "FROM change_ledger l \
+                 WHERE l.retire_reason = '{reason:surface_moved}' \
                  ORDER BY retired_at ASC NULLS FIRST, first_seen_at ASC \
                  LIMIT $1",
             ))
@@ -1576,8 +1710,8 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // measurement to advance, so nothing else in this order moves.
         Self::entries(
             sqlx::query(&read_sql(
-                "FROM change_ledger \
-                 WHERE state = '{state:retired}' AND retire_reason = '{reason:answered_elsewhere}' \
+                "FROM change_ledger l \
+                 WHERE l.retire_reason = '{reason:answered_elsewhere}' \
                  ORDER BY retired_at ASC NULLS FIRST, first_seen_at ASC \
                  LIMIT $1",
             ))
@@ -1681,6 +1815,19 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             .execute(&self.pool)
             .await
             .map_err(|e| SFError::Database(format!("record delivery: {e}")))?;
+        if let Some(events) = self.events.as_ref() {
+            let mut event = cog_core::FactEvent::new(cog_core::EventPayload::ChangeDelivered {
+                kind: identity.kind.clone(),
+                scope: identity.scope.clone(),
+                literal: identity.literal.clone(),
+                rev: rev.to_string(),
+            });
+            event.at = Some(chrono::Utc::now());
+            events
+                .append(event)
+                .await
+                .map_err(|e| SFError::Database(format!("change delivered fact: {e}")))?;
+        }
         Ok(())
     }
 
@@ -1721,8 +1868,8 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
 
     async fn get(&self, identity: &ChangeIdentity) -> SFResult<Option<ChangeLedgerRow>> {
         let row = sqlx::query(&format!(
-            "SELECT {ROW_COLUMNS} FROM change_ledger \
-             WHERE kind = $1 AND scope = $2 AND literal = $3"
+            "SELECT {ROW_COLUMNS} FROM change_ledger l \
+             WHERE l.kind = $1 AND l.scope = $2 AND l.literal = $3"
         ))
         .bind(&identity.kind)
         .bind(&identity.scope)
@@ -1821,18 +1968,19 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // there would claim a day of zero spend, which is a measurement, not an
         // absence.
         let usage: Option<Vec<sqlx::postgres::PgRow>> = match sqlx::query(
-            "SELECT to_char((ts AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS day, \
+            // 读事件流，不读汇总表：它是正本，且汇总表的写入已经停了（S39 ②）。
+            "SELECT to_char((at AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS day, \
                     count(*) AS calls, \
-                    sum(tokens_input + tokens_output)::bigint AS tokens, \
+                    sum(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))::bigint AS tokens, \
                     count(cost_micros) AS priced_calls, \
                     coalesce(sum(cost_micros), 0)::bigint AS cost_micros, \
                     count(DISTINCT split_part(price_book, '@', 1)) \
                         FILTER (WHERE cost_micros IS NOT NULL) AS currencies, \
                     min(split_part(price_book, '@', 1)) \
                         FILTER (WHERE cost_micros IS NOT NULL) AS currency \
-               FROM gateway_llm_usage \
-              WHERE ts >= $1 \
-                AND result = $2 \
+               FROM cogneva_event \
+              WHERE kind = 'llm_call' AND at >= $1 \
+                AND call_result = $2 \
               GROUP BY 1",
         )
         .bind(since)
@@ -2084,9 +2232,13 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // 这三处比的是查询返回的桶名，而桶名就是 `as_str` 写进去的那个词：比作
         // 字面量的话，改一位枚举的名字，写进去的词变了、这里没变，每一行都会被
         // 读成「还没落地」。
+        // 这三个桶名由查询的 CASE 写死，不是状态词：`retired` 与 `undecided` 现在是
+        // `pending` 行上的两条理由（`retire_reason` / `unsettled_reason`），普查把它们
+        // 单独数出来是因为「判过不该持有」与「这一趟没读到」在待办面上都不该和
+        // 「排着队」混成一片。状态本身只有 `landed` 从枚举来。
         let landed_word = ChangeState::Landed.as_str();
-        let retired_word = ChangeState::Retired.as_str();
-        let undecided_word = ChangeState::Undecided.as_str();
+        let retired_word = "retired";
+        let undecided_word = "undecided";
         let mut census = Vec::with_capacity(names.len());
         for name in names {
             let landed = counted
@@ -2352,52 +2504,70 @@ mod templates {
         }
     }
 
-    /// The census reader finds its buckets by name, so a bucket the statement
-    /// never emits reads exactly like an empty one.
+    /// The reader counts three buckets, and the statement has to name each one
+    /// by the word the reader looks up -- otherwise the bucket reads as zero and
+    /// nobody can tell that apart from a face with nothing in it.
     ///
-    /// The reader selects `landed`, `retired` and `undecided` by the words the
-    /// state writes, and takes whatever else comes back as owed. The statement
-    /// folded `undecided` in with the rest: a face whose looks had all come back
-    /// unsettled and a face with nothing unsettled in it both read zero, and the
-    /// one row that could tell them apart -- the one somebody has to go and ask
-    /// about -- was the row not counted. Only a live database caught that, in a
-    /// step that runs after every other test has passed.
+    /// The two reason buckets are decided by the reason columns now, not by a
+    /// state word: `retired` and `undecided` stopped being states, so a statement
+    /// that still branched on `state = 'undecided'` would match nothing at all
+    /// and answer exactly like a face with no unsettled rows.
     #[test]
     fn the_census_emits_every_bucket_the_reader_counts_by_name() {
         let sql = fill_vocabulary(BLOCK_CENSUS_SQL_TEMPLATE);
-        for state in [
-            ChangeState::Landed,
-            ChangeState::Retired,
-            ChangeState::Undecided,
+        let landed = ChangeState::Landed.as_str();
+        assert!(
+            sql.contains(&format!("WHEN state = '{landed}' THEN '{landed}'")),
+            "the landed bucket is read by name but the statement never emits it: {sql}"
+        );
+        for (reason, bucket) in [
+            ("retire_reason IS NOT NULL", "retired"),
+            ("unsettled_reason IS NOT NULL", "undecided"),
         ] {
             assert!(
-                sql.contains(&format!("THEN '{}'", state.as_str())),
-                "the census reads `{}` by name but the statement never emits that word, so the \
-                 bucket always reads as zero: {sql}",
-                state.as_str()
+                sql.contains(&format!("{reason} THEN '{bucket}'")),
+                "the `{bucket}` bucket is read by name but nothing in the statement emits it: \
+                 {sql}"
             );
         }
+        assert!(
+            sql.contains("ELSE 'owed'"),
+            "the remaining pending rows have to land somewhere the reader calls owed: {sql}"
+        );
     }
 
-    /// The `ELSE` arm answers for rows this cannot enumerate, not for states the
-    /// vocabulary knows.
+    /// The statement branches on the two states the vocabulary holds and on
+    /// nothing else.
     ///
-    /// A state with no arm of its own lands in the `ELSE`, which is how
-    /// `undecided` was reported as owed work for as long as it was: the total
-    /// stayed right and only the reader that asks for that bucket by name saw
-    /// the difference. Adding the missing arm fixes that one state; naming every
-    /// state the vocabulary holds is what makes the next one visible the moment
-    /// it is added, rather than one live reading later. The vocabulary is the
-    /// list, so this needs no database and changes when `ChangeState::ALL` does.
+    /// A state word copied into SQL does not fail when the enum changes -- it
+    /// matches no row and reads as an empty bucket. This pins the statement to
+    /// the vocabulary: the landed arm must name the word the enum writes, and no
+    /// arm may test a state this crate no longer has.
     #[test]
-    fn the_census_answers_for_every_state_out_of_its_own_arm() {
+    fn the_census_branches_on_the_states_the_vocabulary_holds() {
         let sql = fill_vocabulary(BLOCK_CENSUS_SQL_TEMPLATE);
+        assert!(
+            !sql.contains("{state:"),
+            "a vocabulary slot was left unfilled, which reads as a literal `{{` in the query: \
+             {sql}"
+        );
         for state in ChangeState::ALL {
+            let word = state.as_str();
+            let tested = format!("state = '{word}'");
+            if state == ChangeState::Landed {
+                assert!(sql.contains(&tested), "the landed arm is missing: {sql}");
+            } else {
+                assert!(
+                    !sql.contains(&tested),
+                    "`{word}` has no bucket of its own: its rows belong in `owed`, and an arm \
+                     for it would count them twice: {sql}"
+                );
+            }
+        }
+        for old in ["conflict", "partial", "undecided", "retired"] {
             assert!(
-                sql.contains(&format!("WHEN '{}' THEN", state.as_str())),
-                "`{}` has no arm of its own, so its rows reach the `ELSE` and are reported as \
-                 whatever that arm says rather than as something somebody decided: {sql}",
-                state.as_str()
+                !sql.contains(&format!("state = '{old}'")),
+                "the statement still tests `{old}`, a state the account no longer has: {sql}"
             );
         }
     }
@@ -2511,4 +2681,532 @@ mod templates {
             );
         }
     }
+
+    /// The wait reading counts the rows the stamp marked, and only those.
+    ///
+    /// The stamp is deliberately narrow -- a block somebody set for a reason of
+    /// their own is not this pass's to relabel -- so the reading that says how
+    /// long the queue has been stuck has to be narrow the same way. A count that
+    /// took every blocked row would report a row waiting on an owner as waiting
+    /// on the pool, and the age that comes with it would be that row's: the
+    /// figure a person acts on would be wrong in the one direction that sends
+    /// them looking at a pool that is fine.
+    ///
+    /// The state half is the same argument from the other side: a block left on
+    /// a row that has since landed is the clear's business, and counting it here
+    /// would report work waiting that nobody is owed.
+    #[test]
+    fn the_pool_wait_counts_only_the_rows_the_stamp_marked() {
+        let pool = BlockedReason::PoolUnavailable.as_str();
+        let pending = ChangeState::Pending.as_str();
+        let wait = fill_vocabulary(POOL_WAIT_SQL_TEMPLATE);
+        assert!(
+            wait.contains(&format!("blocked_reason = '{pool}'")),
+            "the wait reading stopped selecting on the reason the stamp writes, so a row blocked \
+             for a reason of its own is counted as waiting on the pool: {wait}"
+        );
+        assert!(
+            wait.contains(&format!("state = '{pending}'")),
+            "the wait reading stopped holding itself to the queued rows, so a block left on a row \
+             that has moved on reads as work still waiting: {wait}"
+        );
+    }
+}
+
+/// 一行变更账从事实折出来的样子：重建写回的是它，逐行比对读的也是它。
+///
+/// 一次折叠只有一份实现：重建若自己再折一遍，「表与流相等」这件事会有两个口径，
+/// 而两个口径相等的唯一时间点是它们刚好都没改过。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FoldedChangeAccount {
+    pub state: String,
+    pub measured_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub measured_rev: Option<String>,
+    pub retire_reason: Option<String>,
+    pub unsettled_reason: Option<String>,
+    pub parent_observation: Option<String>,
+    pub delivered_rev: Option<String>,
+    pub title: Option<String>,
+    pub assertion: Option<String>,
+    pub first_seen_rev: Option<String>,
+    /// 引用：doc → 那份文档说的是什么。
+    pub sources: std::collections::BTreeMap<String, FoldedCitation>,
+    /// 折到流上的哪个位置：这一行读到的最深一条事实的 `seq`。0 是「还没有人折过它」。
+    pub as_of_seq: i64,
+}
+
+/// 一条引用：哪份文档、它当时的判决、要求的档与面。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FoldedCitation {
+    pub verdict: Option<String>,
+    pub priority: String,
+    pub block: String,
+}
+
+/// 从流折出整本变更账：判定（最后一条）、交付（最后一条）、声明（title／assertion
+/// 与每条引用各取最后一次说法）。
+pub async fn fold_change_account(
+    pool: &sqlx::PgPool,
+) -> SFResult<std::collections::BTreeMap<String, FoldedChangeAccount>> {
+    fold_change_account_from(
+        pool,
+        &std::collections::BTreeMap::new(),
+        &std::collections::BTreeMap::new(),
+    )
+    .await
+}
+
+/// 同 [`fold_change_account`]，但从一张已有的账与每一行的水位出发：只折水位之后的
+/// 事实，水位之前的那些格子由 `seed` 带进来。
+///
+/// 增量与全量共用这一份折叠：两份折法「相等」的时机只有它们刚好都没改过。
+pub async fn fold_change_account_from(
+    pool: &sqlx::PgPool,
+    since: &std::collections::BTreeMap<String, i64>,
+    seed: &std::collections::BTreeMap<String, FoldedChangeAccount>,
+) -> SFResult<std::collections::BTreeMap<String, FoldedChangeAccount>> {
+    use std::collections::BTreeMap;
+    let mut account: BTreeMap<String, FoldedChangeAccount> = seed.clone();
+    let newer = |identity: &String, seq: i64| -> bool {
+        since
+            .get(identity)
+            .map(|floor| seq > *floor)
+            .unwrap_or(true)
+    };
+
+    let judgements: Vec<(String, chrono::DateTime<chrono::Utc>, i64, String)> = sqlx::query_as(
+        "SELECT subject_id, at, seq, attributes FROM cogneva_event \
+          WHERE kind = 'change_judged' ORDER BY seq",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| SFError::Database(format!("read change judgements: {e}")))?;
+    for (identity, at, seq, attributes) in judgements {
+        if !newer(&identity, seq) {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&attributes) else {
+            continue;
+        };
+        let text = |key: &str| {
+            value
+                .get(key)
+                .and_then(|found| found.as_str())
+                .map(str::to_string)
+        };
+        let Some(state) = text("state") else { continue };
+        let entry = account.entry(identity).or_default();
+        entry.state = state;
+        entry.measured_at = Some(at);
+        entry.as_of_seq = entry.as_of_seq.max(seq);
+        entry.measured_rev = text("measured_rev");
+        entry.retire_reason = text("retire_reason");
+        entry.unsettled_reason = text("unsettled_reason");
+        entry.parent_observation = text("parent_observation");
+    }
+
+    let declarations: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT subject_id, seq, attributes FROM cogneva_event \
+          WHERE kind = 'change_declared' ORDER BY seq",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| SFError::Database(format!("read change declarations: {e}")))?;
+    for (identity, seq, attributes) in declarations {
+        if !newer(&identity, seq) {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&attributes) else {
+            continue;
+        };
+        let text = |key: &str| {
+            value
+                .get(key)
+                .and_then(|found| found.as_str())
+                .map(str::to_string)
+        };
+        let entry = account
+            .entry(identity)
+            .or_insert_with(|| FoldedChangeAccount {
+                state: cog_core::ChangeState::Pending.as_str().to_string(),
+                ..Default::default()
+            });
+        entry.as_of_seq = entry.as_of_seq.max(seq);
+        if let Some(title) = text("title") {
+            entry.title = Some(title);
+        }
+        if let Some(assertion) = text("assertion") {
+            entry.assertion = Some(assertion);
+        }
+        if entry.first_seen_rev.is_none() {
+            entry.first_seen_rev = text("first_seen_rev");
+        }
+        if let (Some(doc), Some(priority), Some(block)) =
+            (text("doc"), text("priority"), text("block"))
+        {
+            entry.sources.insert(
+                doc,
+                FoldedCitation {
+                    verdict: text("verdict"),
+                    priority,
+                    block,
+                },
+            );
+        }
+    }
+
+    let deliveries: Vec<(String, i64, Option<String>)> = sqlx::query_as(
+        "SELECT subject_id, seq, attributes::jsonb ->> 'rev' FROM cogneva_event \
+          WHERE kind = 'change_delivered' ORDER BY seq",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| SFError::Database(format!("read change deliveries: {e}")))?;
+    for (identity, seq, rev) in deliveries {
+        if !newer(&identity, seq) {
+            continue;
+        }
+        let entry = account.entry(identity).or_default();
+        entry.as_of_seq = entry.as_of_seq.max(seq);
+        if let Some(rev) = rev {
+            entry.delivered_rev = Some(rev);
+        }
+    }
+    // 只有交付事实的身份没有状态可言：它的状态就是「还没有人判过它」——表里的默认
+    // 也是这一格。留一个空串写回去，那一行会读成一个谁也不认识的状态。
+    for row in account.values_mut() {
+        if row.state.is_empty() {
+            row.state = cog_core::ChangeState::Pending.as_str().to_string();
+        }
+    }
+    Ok(account)
+}
+
+/// 从流重建变更账：每个身份取最后一条 `change_judged`／`change_declared`／
+/// `change_delivered`，写回账本行与它的引用。
+///
+/// 账本行是这些事实的投影；测量与声明写表的同时写流，删掉表这一条把它拼回来。
+pub(crate) async fn rebuild_from_events(pool: &sqlx::PgPool) -> SFResult<u64> {
+    let account = fold_change_account(pool).await?;
+    if account.is_empty() {
+        return Ok(0);
+    }
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| SFError::Database(format!("begin change rebuild: {e}")))?;
+    for (identity, row) in &account {
+        write_account(&mut tx, identity, row).await?;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| SFError::Database(format!("commit change rebuild: {e}")))?;
+    Ok(account.len() as u64)
+}
+
+/// 把折出来的一行写回账本（行＋它的引用＋两列排序值）。重折与增量重折共用这一份，
+/// 两份写法分家时，「表是流的一份投影」会有两个口径。
+async fn write_account(
+    tx: &mut sqlx::PgConnection,
+    identity: &str,
+    row: &FoldedChangeAccount,
+) -> SFResult<()> {
+    let parts: Vec<&str> = identity.split('|').collect();
+    if parts.len() != 3 {
+        return Ok(());
+    }
+    // 行本身：状态与测量那几格来自判定，title／assertion／first_seen 来自声明。
+    // 同一句 upsert 里写齐，是因为它们描述的是同一行；分开写会让重建中途停下时
+    // 留下「状态是新的、title 是旧的」这种读起来像真的一行。
+    sqlx::query(
+        "INSERT INTO change_ledger \
+            (kind, scope, literal, state, first_seen_at, measured_at, measured_rev, \
+             retire_reason, unsettled_reason, parent_observation, delivered_rev, \
+             title, assertion, first_seen_rev, as_of_seq) \
+         VALUES ($1, $2, $3, $4, COALESCE($5, now()), $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+         ON CONFLICT (kind, scope, literal) DO UPDATE SET \
+             state = EXCLUDED.state, \
+             measured_at = EXCLUDED.measured_at, \
+             measured_rev = EXCLUDED.measured_rev, \
+             retire_reason = EXCLUDED.retire_reason, \
+             unsettled_reason = EXCLUDED.unsettled_reason, \
+             parent_observation = EXCLUDED.parent_observation, \
+             delivered_rev = COALESCE(EXCLUDED.delivered_rev, change_ledger.delivered_rev), \
+             title = COALESCE(EXCLUDED.title, change_ledger.title), \
+             assertion = COALESCE(EXCLUDED.assertion, change_ledger.assertion), \
+             first_seen_rev = COALESCE(change_ledger.first_seen_rev, EXCLUDED.first_seen_rev), \
+             as_of_seq = GREATEST(change_ledger.as_of_seq, EXCLUDED.as_of_seq)",
+    )
+    .bind(parts[0])
+    .bind(parts[1])
+    .bind(parts[2])
+    .bind(&row.state)
+    .bind(row.measured_at)
+    .bind(&row.measured_rev)
+    .bind(&row.retire_reason)
+    .bind(&row.unsettled_reason)
+    .bind(&row.parent_observation)
+    .bind(&row.delivered_rev)
+    .bind(&row.title)
+    .bind(&row.assertion)
+    .bind(&row.first_seen_rev)
+    .bind(row.as_of_seq)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| SFError::Database(format!("rebuild {identity}: {e}")))?;
+    for (doc, citation) in &row.sources {
+        sqlx::query(
+            "INSERT INTO change_ledger_sources (kind, scope, literal, doc, verdict, priority, block) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (kind, scope, literal, doc) DO UPDATE SET \
+                 verdict = EXCLUDED.verdict, priority = EXCLUDED.priority, block = EXCLUDED.block",
+        )
+        .bind(parts[0])
+        .bind(parts[1])
+        .bind(parts[2])
+        .bind(doc)
+        .bind(&citation.verdict)
+        .bind(&citation.priority)
+        .bind(&citation.block)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| SFError::Database(format!("rebuild citation {identity}/{doc}: {e}")))?;
+    }
+    sqlx::query(RECOUNT_SQL)
+        .bind(parts[0])
+        .bind(parts[1])
+        .bind(parts[2])
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| SFError::Database(format!("recount rebuilt {identity}: {e}")))?;
+
+    Ok(())
+}
+
+/// 库里的账读成折叠用的同一形状：行 + 它的每一条引用。
+pub async fn read_table_account(
+    pool: &sqlx::PgPool,
+) -> SFResult<std::collections::BTreeMap<String, FoldedChangeAccount>> {
+    use std::collections::BTreeMap;
+    let rows: Vec<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT kind || '|' || scope || '|' || literal, state, title, assertion, \
+            first_seen_rev, measured_rev, retire_reason, unsettled_reason, \
+            parent_observation, delivered_rev \
+       FROM change_ledger",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| SFError::Database(format!("read the change ledger: {e}")))?;
+    let mut table: BTreeMap<String, FoldedChangeAccount> = BTreeMap::new();
+    for row in rows {
+        table.insert(
+            row.0,
+            FoldedChangeAccount {
+                state: row.1,
+                title: row.2,
+                assertion: row.3,
+                first_seen_rev: row.4,
+                measured_rev: row.5,
+                retire_reason: row.6,
+                unsettled_reason: row.7,
+                parent_observation: row.8,
+                delivered_rev: row.9,
+                ..Default::default()
+            },
+        );
+    }
+    let citations: Vec<(String, String, Option<String>, String, String)> = sqlx::query_as(
+        "SELECT kind || '|' || scope || '|' || literal, doc, verdict, priority, block \
+       FROM change_ledger_sources",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| SFError::Database(format!("read the change citations: {e}")))?;
+    for (identity, doc, verdict, priority, block) in citations {
+        table.entry(identity).or_default().sources.insert(
+            doc,
+            FoldedCitation {
+                verdict,
+                priority,
+                block,
+            },
+        );
+    }
+    Ok(table)
+}
+
+/// 增量重折：只把水位之后的事实写回账本，水位跟着前进。
+///
+/// 水位之前那些格子由表自己带进折叠（`seed`），所以一次增量不重折历史；返回改了几行。
+/// 没有新事实时一行都不写——空跑不推进水位，否则「读到哪儿了」会追上还没发生的事。
+pub async fn project_change_ledger_incremental(pool: &sqlx::PgPool) -> SFResult<u64> {
+    use std::collections::BTreeMap;
+    let table = read_table_account(pool).await?;
+    let since: BTreeMap<String, i64> = table
+        .iter()
+        .map(|(identity, row)| (identity.clone(), row.as_of_seq))
+        .collect();
+    let folded = fold_change_account_from(pool, &since, &table).await?;
+    let changed: Vec<(&String, &FoldedChangeAccount)> = folded
+        .iter()
+        .filter(|(identity, row)| {
+            table
+                .get(*identity)
+                .map(|existing| row.as_of_seq > existing.as_of_seq)
+                .unwrap_or(true)
+        })
+        .collect();
+    if changed.is_empty() {
+        return Ok(0);
+    }
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| SFError::Database(format!("begin change projection: {e}")))?;
+    for (identity, row) in &changed {
+        write_account(&mut tx, identity, row).await?;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| SFError::Database(format!("commit change projection: {e}")))?;
+    Ok(changed.len() as u64)
+}
+
+/// 一行台账的一格分歧：哪条身份、哪一格、表里是什么、流上是什么。
+///
+/// `None` 是「那一侧没有这一格」——把「没有」印成空字符串，读的人分不出
+/// 「流上没有这句话」与「流上说的是空」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeDivergence {
+    pub identity: String,
+    pub column: String,
+    pub table: Option<String>,
+    pub stream: Option<String>,
+}
+
+/// 台账与流逐格比对：空的返回值就是「表是流的一份投影」这句断言的全部证据。
+///
+/// 只比折叠得回来的那几格（状态、测量 rev、三个原因、交付、title／assertion、
+/// first_seen_rev、每条引用的三格）：时间是写库那一刻的钟，不是事实里的一格，
+/// 拿它比会把每一行都报成分歧。
+pub async fn change_ledger_divergence(pool: &sqlx::PgPool) -> SFResult<Vec<ChangeDivergence>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let stream = fold_change_account(pool).await?;
+
+    let table = read_table_account(pool).await?;
+    Ok(diff_change_accounts(&table, &stream))
+}
+
+/// 逐格比对两份折出来的账：`table` 是库里的表，`stream` 是从事实折出来的那份。
+///
+/// 单独一个函数是为了让判据能在没有库的地方反问：折两遍、比一遍，逻辑只有这一处，
+/// 读库的那一半只是把表读成同一形状。
+pub fn diff_change_accounts(
+    table: &std::collections::BTreeMap<String, FoldedChangeAccount>,
+    stream: &std::collections::BTreeMap<String, FoldedChangeAccount>,
+) -> Vec<ChangeDivergence> {
+    use std::collections::BTreeSet;
+    let mut out = Vec::new();
+    let identities: BTreeSet<&String> = stream.keys().chain(table.keys()).collect();
+    for identity in identities {
+        let Some(from_stream) = stream.get(identity) else {
+            out.push(ChangeDivergence {
+                identity: identity.clone(),
+                column: "<row>".into(),
+                table: Some("present".into()),
+                stream: None,
+            });
+            continue;
+        };
+        let Some(from_table) = table.get(identity) else {
+            out.push(ChangeDivergence {
+                identity: identity.clone(),
+                column: "<row>".into(),
+                table: None,
+                stream: Some("present".into()),
+            });
+            continue;
+        };
+        let mut cell = |column: &str, table: Option<String>, stream: Option<String>| {
+            if table != stream {
+                out.push(ChangeDivergence {
+                    identity: identity.clone(),
+                    column: column.to_string(),
+                    table,
+                    stream,
+                });
+            }
+        };
+        cell(
+            "state",
+            Some(from_table.state.clone()),
+            Some(from_stream.state.clone()),
+        );
+        cell("title", from_table.title.clone(), from_stream.title.clone());
+        cell(
+            "assertion",
+            from_table.assertion.clone(),
+            from_stream.assertion.clone(),
+        );
+        cell(
+            "first_seen_rev",
+            from_table.first_seen_rev.clone(),
+            from_stream.first_seen_rev.clone(),
+        );
+        cell(
+            "measured_rev",
+            from_table.measured_rev.clone(),
+            from_stream.measured_rev.clone(),
+        );
+        cell(
+            "retire_reason",
+            from_table.retire_reason.clone(),
+            from_stream.retire_reason.clone(),
+        );
+        cell(
+            "unsettled_reason",
+            from_table.unsettled_reason.clone(),
+            from_stream.unsettled_reason.clone(),
+        );
+        cell(
+            "parent_observation",
+            from_table.parent_observation.clone(),
+            from_stream.parent_observation.clone(),
+        );
+        cell(
+            "delivered_rev",
+            from_table.delivered_rev.clone(),
+            from_stream.delivered_rev.clone(),
+        );
+        let docs: BTreeSet<&String> = from_table
+            .sources
+            .keys()
+            .chain(from_stream.sources.keys())
+            .collect();
+        for doc in docs {
+            let t = from_table.sources.get(doc);
+            let f = from_stream.sources.get(doc);
+            if t == f {
+                continue;
+            }
+            out.push(ChangeDivergence {
+                identity: identity.clone(),
+                column: format!("source:{doc}"),
+                table: t.map(|c| format!("{:?}|{}|{}", c.verdict, c.priority, c.block)),
+                stream: f.map(|c| format!("{:?}|{}|{}", c.verdict, c.priority, c.block)),
+            });
+        }
+    }
+    out
 }

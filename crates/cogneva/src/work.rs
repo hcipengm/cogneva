@@ -85,9 +85,10 @@ OPTIONS:
     --acceptance <text>    What done means (file); repeat for several criteria.
     --priority <n>         Higher runs first (file; default 1).
     --blocked-by <id>      A task that must finish first (file); repeatable.
-    --timeout-secs <n>     How long the row may stay open before the graph fails
-                           it (file; default a week -- the lease, renewed by
-                           heartbeat, is what says the holder is still there).
+    --declared-secs <n>    How long the row declares it will take (file; default
+                           a week). Nothing ends the row at this number: the lease
+                           says the holder is still there, and the measured
+                           inter-step window says it is still moving.
     --result <json|@file>  The result payload for complete; @file reads a file.
     --error <text>         The failure text for fail.
     --door-url <url>       The zero-credential submission face to file through
@@ -108,7 +109,7 @@ pub enum Action {
         acceptance: Vec<String>,
         priority: i32,
         blocked_by: Vec<String>,
-        timeout_secs: u64,
+        declared_secs: u64,
     },
     Queue {
         json: bool,
@@ -118,6 +119,8 @@ pub enum Action {
     },
     Claim {
         task: String,
+        /// 接活的人为这件活选的拓扑；`None` 是「没表态」，执行时按量到的路走。
+        team: Option<String>,
     },
     Start {
         task: String,
@@ -161,12 +164,13 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
     let mut task: Option<String> = None;
     let mut result: Option<serde_json::Value> = None;
     let mut error: Option<String> = None;
+    let mut team: Option<String> = None;
     let mut goal: Option<String> = None;
     let mut face: Option<String> = None;
     let mut acceptance: Vec<String> = Vec::new();
     let mut priority: Option<i32> = None;
     let mut blocked_by: Vec<String> = Vec::new();
-    let mut timeout_secs: Option<u64> = None;
+    let mut declared_secs: Option<u64> = None;
     let mut json = false;
     let mut workspace = None;
     let mut database_url = None;
@@ -198,6 +202,7 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
                 );
             }
             "--error" => error = Some(value("--error")?),
+            "--team" => team = Some(value("--team")?),
             "--goal" => goal = Some(value("--goal")?),
             "--face" => face = Some(value("--face")?),
             "--acceptance" => acceptance.push(value("--acceptance")?),
@@ -209,11 +214,11 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
                         .map_err(|_| format!("--priority is not a number: {raw}"))?,
                 );
             }
-            "--timeout-secs" => {
-                let raw = value("--timeout-secs")?;
-                timeout_secs = Some(
+            "--declared-secs" => {
+                let raw = value("--declared-secs")?;
+                declared_secs = Some(
                     raw.parse()
-                        .map_err(|_| format!("--timeout-secs is not a number: {raw}"))?,
+                        .map_err(|_| format!("--declared-secs is not a number: {raw}"))?,
                 );
             }
             "--workspace" => workspace = Some(value("--workspace")?),
@@ -250,12 +255,15 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
                 acceptance,
                 priority: priority.unwrap_or(1),
                 blocked_by,
-                timeout_secs: timeout_secs.unwrap_or(UNIT_WORK_BUDGET_SECS),
+                declared_secs: declared_secs.unwrap_or(UNIT_WORK_DECLARED_SECS),
             }
         }
         Some("queue") => Action::Queue { json },
         Some("next") => Action::Next { json },
-        Some("claim") => Action::Claim { task: task()? },
+        Some("claim") => Action::Claim {
+            task: task()?,
+            team,
+        },
         Some("start") => Action::Start { task: task()? },
         Some("heartbeat") => Action::Heartbeat,
         Some("complete") => Action::Complete {
@@ -375,7 +383,7 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
             acceptance,
             priority,
             blocked_by,
-            timeout_secs,
+            declared_secs,
         } => {
             let filing = Filing {
                 id: &task,
@@ -384,7 +392,7 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
                 acceptance: &acceptance,
                 priority,
                 blocked_by: &blocked_by,
-                timeout_secs,
+                declared_secs,
             };
             let body = filing_body(&filing, unit, workspace)?;
             preflight(&*backend, workspace, &task, &blocked_by).await?;
@@ -417,26 +425,41 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
         }
         Action::Queue { json } => queue(&*backend, workspace, unit, json).await?,
         Action::Next { json } => next(&*backend, workspace, unit, json).await?,
-        Action::Claim { task } => {
-            let task = owned_task(&*backend, workspace, &task, unit).await?;
+        Action::Claim { task, team } => {
+            // 接活判定在 `ready_queue::approve_claim`，与派工侧同一个函数：谁能
+            // 接哪件活只有一份答案，两边各判一次，最先漂的总是「已经有人接了」。
+            //
+            // 这里不再要求「这条行属于你」：任务板上待接的活谁都能接，接了的人
+            // 就是责任人——那是这一列的全部意义。只有被人指定给别人的行（面值班
+            // 那种）会拒绝。
+            let mut row = backend
+                .dag_get_task(workspace, &task)
+                .await?
+                .ok_or_else(|| format!("task {task} does not exist"))?;
+            // 拓扑由接活的人定，所以它写在**认领这一次写**里：接走的那一刻
+            // 行上就带着这个决定，此后任何一次运行读到的都是同一条。
+            declare_team(&mut row, team)?;
             let deps = dependency_state(&*backend, workspace).await?;
-            if !task.is_ready(&deps) {
+            if !row.is_ready(&deps) {
                 return Err(format!(
                     "task {} is waiting on dependencies that are not completed",
-                    task.id
+                    row.id
                 )
                 .into());
             }
-            transition(
-                &*backend,
-                workspace,
-                &task.id,
-                &[TaskStatus::Pending],
-                unit,
-                |t| t.status = TaskStatus::Scheduled,
-            )
-            .await?;
-            println!("{} scheduled", task.id);
+            let lease = chrono::Duration::seconds(endpoints.lease_secs as i64);
+            let claimed =
+                cog_orchestrator::ready_queue::approve_claim(&row, unit, lease, Utc::now())
+                    .map_err(|refusal| claim_refused_reason(&row.id, unit, refusal))?;
+            backend
+                .dag_claim_task(
+                    workspace,
+                    &row.id,
+                    &[TaskStatus::Pending, TaskStatus::Scheduled],
+                    &claimed,
+                )
+                .await?;
+            println!("{} claimed by {unit}", row.id);
         }
         Action::Start { task } => {
             let task = owned_task(&*backend, workspace, &task, unit).await?;
@@ -550,7 +573,7 @@ struct Filing<'a> {
     acceptance: &'a [String],
     priority: i32,
     blocked_by: &'a [String],
-    timeout_secs: u64,
+    declared_secs: u64,
 }
 
 /// What a filed row declares it will take, unless the caller says otherwise.
@@ -563,14 +586,17 @@ struct Filing<'a> {
 /// for readers, not a deadline — which is why it can be generous without
 /// costing anything, and why a stricter value would not make a stuck row end
 /// any sooner.
-// cap: bound — a week is the outer edge of "a unit of work", and the number is
+// cap: fixed — a week is the outer edge of "a unit of work", and the number is
+// keep: 删掉后一件活的工期声明没有外缘，读的人分不出慢与卡；由「一周是单位工作的外缘」兜住
 // read by people and dashboards rather than enforced; how long real rows stay
 // open is the lease's reading, not this number's.
-const UNIT_WORK_BUDGET_SECS: u64 = 7 * 24 * 60 * 60;
+const UNIT_WORK_DECLARED_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// How long one filing request may take. The door answers as soon as it has
 /// judged the submission; the decomposition it starts runs behind the answer.
-// cap: bound — the answer is a judgement over one submission, not a run: thirty
+// cap: fixed — the answer is a judgement over one submission, not a run: thirty
+// keep: 删掉后一次提交的判词没有上限，注入器不回就把一轮挂住；由「判词是一次提交的判断，不是一次运行」兜住
+// wall: 等=一次提交的答复 / 等不到=这次提交读作「不知道有没有收到」，**对端可能已经收了**：所以判词是一次判断，不是一次重发 / 续跑=能，但重来是先查后发，否则同一次提交会被记两次
 // seconds is the wait past which a door that has not answered is not slow but
 // stuck, and no decomposition timing should move it.
 const SUBMIT_TIMEOUT_SECS: u64 = 30;
@@ -579,11 +605,13 @@ const SUBMIT_TIMEOUT_SECS: u64 = 30;
 /// to look. Bounded on purpose: the row is usually there within a second, and a
 /// caller that waits forever has no way to tell a slow injector from a
 /// submission that was dropped.
-// cap: bound — ten seconds is the ceiling for "the injector took it", picked so
+// cap: fixed — ten seconds is the ceiling for "the injector took it", picked so
+// keep: 删掉后轮询次数无界，注入器没接住也一直等；由「十秒是注入器接过它的上限」兜住
 // a dropped submission is reported rather than waited on forever. A slower
 // injector is a case for the caller to retry, not for the wait to grow.
 const SUBMIT_POLL_ATTEMPTS: u32 = 20;
-// cap: bound — the two read as one wait: 20 x 500 ms is the ten seconds above,
+// cap: fixed — the two read as one wait: 20 x 500 ms is the ten seconds above,
+// keep: 删掉后两次读的间隔与次数脱钩，所谓十秒不再成立；由「20 × 500ms 就是那十秒」兜住
 // and the split only decides how often the graph is asked, not how long.
 const SUBMIT_POLL_INTERVAL_MS: u64 = 500;
 
@@ -610,7 +638,7 @@ fn filing_body(filing: &Filing, unit: &str, workspace: &str) -> Result<serde_jso
         acceptance,
         priority,
         blocked_by,
-        timeout_secs,
+        declared_secs,
     } = *filing;
     if id.trim().is_empty() {
         return Err("--task is empty".into());
@@ -648,7 +676,7 @@ fn filing_body(filing: &Filing, unit: &str, workspace: &str) -> Result<serde_jso
         "blocked_by": blocked_by,
         "priority": priority,
         "unit_id": unit,
-        "timeout_seconds": timeout_secs,
+        "declared_duration_seconds": declared_secs,
     });
     // The role name is read from its one declaration: a second spelling here keeps
     // working after a rename while every reader that picks a schema or a checkpoint
@@ -729,7 +757,7 @@ async fn submit(door: &str, body: &serde_json::Value) -> Result<serde_json::Valu
         )
     })?;
     let status = response.status();
-    let text = response.text().await.unwrap_or_default();
+    let text = cog_core::logged_default!(response.text().await);
     if !status.is_success() {
         // The door's own words, not a paraphrase: a refusal names the operand
         // that was wrong, and restating it here would be a second copy of the
@@ -811,16 +839,71 @@ async fn owned_task(
         .dag_get_task(workspace, task_id)
         .await?
         .ok_or_else(|| format!("task {task_id} does not exist"))?;
-    match task.owner_unit.as_deref() {
-        Some(owner) if owner == unit && !task.is_executable => {
-            Err(format!("task {task_id} is a graph node, not work; it has no body to run").into())
+    // 两种说法都算「这件活是这个人的」：提交方把它指定给了这个 unit，或者这个
+    // unit 在任务板上把它接走了。只认第一种，等于接活接不成的活；只认第二种，
+    // 等于指定的活没法开工——两句话都在同一个行上说，读它的人得能读到两处。
+    let designated = task.owner_unit.as_deref() == Some(unit);
+    let taken = task.claimed_by() == Some(unit);
+    if let Some(owner) = task.owner_unit.as_deref() {
+        if !designated && !taken {
+            return Err(format!("task {task_id} is owned by {owner}, not {unit}").into());
         }
-        Some(owner) if owner == unit => Ok(task),
-        Some(owner) => Err(format!("task {task_id} is owned by {owner}, not {unit}").into()),
-        None => Err(format!(
-            "task {task_id} names no owner; it runs on the shared queue, not from this command"
-        )
-        .into()),
+    }
+    if designated || taken {
+        if !task.is_executable {
+            return Err(
+                format!("task {task_id} is a graph node, not work; it has no body to run").into(),
+            );
+        }
+        return Ok(task);
+    }
+    Err(format!(
+        "task {task_id} names no owner and nobody has taken it; claim it first with `claim`"
+    )
+    .into())
+}
+
+/// 接活的人把选好的拓扑写进这一行；没选就什么都不写。
+///
+/// 写的是执行时读的同一格（`cog_collaboration::INPUT_TEAM`），名字在写之前
+/// 验：一个认不出的拓扑名在这里就该被拒，而不是留在行上等某次运行退回默认。
+fn declare_team(row: &mut Task, team: Option<String>) -> Result<(), String> {
+    let Some(name) = team else {
+        return Ok(());
+    };
+    cog_collaboration::declared_team(&name).map_err(|e| e.to_string())?;
+    row.input[cog_collaboration::INPUT_TEAM] = serde_json::Value::String(name.trim().to_string());
+    Ok(())
+}
+
+/// 一次被拒的认领，翻成带派命令行读得懂的一句话。
+fn claim_refused_reason(
+    task_id: &str,
+    unit: &str,
+    refusal: cog_orchestrator::ready_queue::ClaimRefusal,
+) -> String {
+    use cog_orchestrator::ready_queue::ClaimRefusal as Refused;
+    match refusal {
+        Refused::Anonymous => format!("task {task_id} was claimed with no unit name"),
+        Refused::MovedOn(status) => format!(
+            "task {task_id} is {status:?}, so {unit} cannot take it: work that is running or \
+             settled is not taken again"
+        ),
+        // 也叫「你自己」：同一条活的有效认领不接第二次，否则同一条就绪消息
+        // 会被同一双手跑两遍。
+        Refused::HeldByAnother(held) => format!(
+            "task {task_id} is already claimed by {held}, and that claim's lease has not lapsed; \
+             {unit} cannot take it again"
+        ),
+        Refused::NamesAnotherOwner(owner) => format!(
+            "task {task_id} is designated to {owner}; {unit} can only take work nobody is \
+             designated for"
+        ),
+        Refused::NoBodyToRun => format!("task {task_id} has no body to run"),
+        Refused::NoCriterion => format!(
+            "task {task_id} states no acceptance criterion; taking it would start work nobody \
+             can close"
+        ),
     }
 }
 
@@ -849,12 +932,18 @@ async fn dependency_state(
     })
 }
 
-/// Apply one transition under the owner guard.
+/// Apply one transition under the guard that says the row is this unit's.
 ///
 /// The row is re-read here rather than carried from the caller's earlier read:
 /// between that read and this write another session may have moved the row,
 /// and the guard can only refuse the stale state if it is checked against the
 /// row as it stands now.
+///
+/// Which guard applies is read off the row, not chosen here: a designated row is
+/// guarded by its `owner_unit` (a handover that rebinds it between the two reads
+/// must win), and a row this unit took off the board is guarded by its status
+/// transition — the claim already decided whose it is, and the store refuses a
+/// move on a row that has left the expected state.
 async fn transition<F>(
     backend: &dyn StateBackend,
     workspace: &str,
@@ -870,11 +959,23 @@ where
         .dag_get_task(workspace, task_id)
         .await?
         .ok_or_else(|| format!("task {task_id} does not exist"))?;
+    if updated.owner_unit.as_deref() != Some(unit) && updated.claimed_by() != Some(unit) {
+        return Err(format!(
+            "task {task_id} is neither designated to {unit} nor taken by it; refusing to move it"
+        )
+        .into());
+    }
     mutate(&mut updated);
     updated.updated_at = Utc::now();
-    backend
-        .dag_transition_owned_task(workspace, &updated.id, expected, &updated, unit)
-        .await?;
+    if updated.owner_unit.as_deref() == Some(unit) {
+        backend
+            .dag_transition_owned_task(workspace, &updated.id, expected, &updated, unit)
+            .await?;
+    } else {
+        backend
+            .dag_transition_task(workspace, &updated.id, expected, &updated)
+            .await?;
+    }
     Ok(())
 }
 
@@ -893,7 +994,9 @@ async fn heartbeat(
     let lease = chrono::Duration::seconds(lease_secs as i64);
     let mut renewed = 0usize;
     for task in tasks {
-        if task.owner_unit.as_deref() != Some(unit) || task.status != TaskStatus::Running {
+        // 两种说法都算这个人的：提交方指定给他，或者他在任务板上接走的。
+        let designated = task.owner_unit.as_deref() == Some(unit);
+        if (!designated && task.claimed_by() != Some(unit)) || task.status != TaskStatus::Running {
             continue;
         }
         if task.lease_owner.as_deref() != Some(unit) {
@@ -906,15 +1009,21 @@ async fn heartbeat(
         let mut updated = task;
         updated.lease_expires_at = Some(now + lease);
         updated.updated_at = now;
-        backend
-            .dag_transition_owned_task(
-                workspace,
-                &updated.id,
-                &[TaskStatus::Running],
-                &updated,
-                unit,
-            )
-            .await?;
+        if designated {
+            backend
+                .dag_transition_owned_task(
+                    workspace,
+                    &updated.id,
+                    &[TaskStatus::Running],
+                    &updated,
+                    unit,
+                )
+                .await?;
+        } else {
+            backend
+                .dag_transition_task(workspace, &updated.id, &[TaskStatus::Running], &updated)
+                .await?;
+        }
         renewed += 1;
     }
     Ok(renewed)
@@ -929,7 +1038,9 @@ async fn queue(
     let tasks = backend.dag_get_all_tasks(workspace).await?;
     let mut mine: Vec<Task> = tasks
         .into_iter()
-        .filter(|t| t.owner_unit.as_deref() == Some(unit))
+        // 两种说法都算「这件活是我的」：提交方指定给我，或者我在任务板上接走了。
+        // 只读第一种，接来的活就从这个人的队列里消失——他接了却看不到它。
+        .filter(|t| t.owner_unit.as_deref() == Some(unit) || t.claimed_by() == Some(unit))
         // Face nodes name their owner on the same field and are not work: the
         // roster is read with `cogneva governance`, not from the queue.
         .filter(|t| t.is_executable)
@@ -1015,6 +1126,8 @@ async fn next(
 /// how long its owner had been quiet, and "quiet for ten minutes" and "never
 /// registered" would both arrive as the same missing key. Keep the record past
 /// that window and let the rule read a timestamp.
+// cap: fixed — the record must outlive the idle window the rule reads; 1.5 windows is past that window with room for one renewal
+// keep: 删掉后在位记录活得比它要盖住的空闲窗短，规则读到时记录已经没了；由「1.5 个空闲窗」兜住
 const UNIT_PRESENCE_TTL_SECS: u64 = cog_core::OWNER_IDLE_AFTER_SECS as u64 * 3 / 2;
 
 /// Record that this unit is alive, under the name its faces name it by.
@@ -1043,7 +1156,6 @@ async fn presence(unit: &str, workspace: &str, redis_url: &str) -> Result<(), Bo
         "",
         cog_supervisor::registry::EXTERNAL_WORKER_ROLE,
         workspace,
-        Vec::new(),
         cog_core::ResourceInfo::default(),
     );
     use cog_core::AgentRegistry as _;
@@ -1056,6 +1168,8 @@ async fn presence(unit: &str, workspace: &str, redis_url: &str) -> Result<(), Bo
 /// Half of [`UNIT_PRESENCE_TTL_SECS`], so one missed renewal still leaves the
 /// record standing: a unit that is listening is alive whatever its queue looks
 /// like, and the face readings ask the registry rather than the queue.
+// cap: fixed — half the record TTL, so one missed renewal still leaves the record standing
+// keep: 删掉后续期节奏与 TTL 脱钩，一次漏续就让记录消失；由「记录 TTL 的一半」兜住
 const INBOX_PRESENCE_RENEWAL: Duration = Duration::from_secs(UNIT_PRESENCE_TTL_SECS / 2);
 
 /// Read the messages other agents sent this unit, and acknowledge them.
@@ -1114,7 +1228,10 @@ fn ready_owned(tasks: Vec<Task>, deps: &TaskDAG, unit: &str) -> (Vec<Task>, usiz
     let mut owned = 0usize;
     let mut ready: Vec<Task> = Vec::new();
     for task in tasks {
-        if task.owner_unit.as_deref() != Some(unit) || !task.is_executable {
+        let designated = task.owner_unit.as_deref() == Some(unit);
+        // 「还欠我几件活」这个读数必须把接来的也算进去：只数指定的，一个人从
+        // 任务板上接得越多，他看上去越闲。
+        if (!designated && task.claimed_by() != Some(unit)) || !task.is_executable {
             continue;
         }
         owned += 1;
@@ -1193,7 +1310,32 @@ mod tests {
         assert_eq!(request.action, Action::Next { json: false });
 
         let request = parse_args(&args(&["claim", "--unit", "8b", "--task", "t-1"])).unwrap();
-        assert_eq!(request.action, Action::Claim { task: "t-1".into() });
+        assert_eq!(
+            request.action,
+            Action::Claim {
+                task: "t-1".into(),
+                team: None
+            }
+        );
+
+        // 接活的人可以顺手把组队方式钉在行上；名字原样交给执行时读的同一格。
+        let request = parse_args(&args(&[
+            "claim",
+            "--unit",
+            "8b",
+            "--task",
+            "t-1",
+            "--team",
+            "roundtable",
+        ]))
+        .unwrap();
+        assert_eq!(
+            request.action,
+            Action::Claim {
+                task: "t-1".into(),
+                team: Some("roundtable".into())
+            }
+        );
 
         let request = parse_args(&args(&["heartbeat", "--unit", "8b"])).unwrap();
         assert_eq!(request.action, Action::Heartbeat);
@@ -1289,6 +1431,60 @@ mod tests {
         );
     }
 
+    /// 接活时选定的拓扑落在执行时读的那一格上，认不出的名字一个字节也不落。
+    ///
+    /// 写侧与读侧是两段代码：`--team` 只被解析、没人写进行里的话，运行起来
+    /// 照样退回测量，而命令行看起来已经接受了这个决定。
+    #[test]
+    fn the_team_the_claimant_chose_lands_on_the_row_it_claims() {
+        let mut row = Task::new("t-1", cog_core::TaskType::DagNode, serde_json::json!({}));
+
+        declare_team(&mut row, None).expect("没选拓扑不是错误");
+        assert!(
+            row.input.get(cog_collaboration::INPUT_TEAM).is_none(),
+            "没表态就不该在行上留下一个值"
+        );
+
+        declare_team(&mut row, Some("roundtable".into())).expect("roundtable 是一个拓扑");
+        assert_eq!(
+            row.input
+                .get(cog_collaboration::INPUT_TEAM)
+                .and_then(|v| v.as_str()),
+            Some("roundtable"),
+            "负责人选的拓扑必须落在执行时读的同一格上"
+        );
+
+        let mut untouched = Task::new("t-2", cog_core::TaskType::DagNode, serde_json::json!({}));
+        let err = declare_team(&mut untouched, Some("debate".into()))
+            .expect_err("debate 不是本 build 认得的拓扑");
+        assert!(err.contains("debate"), "{err}");
+        assert!(
+            untouched.input.get(cog_collaboration::INPUT_TEAM).is_none(),
+            "被拒的名字不留在行上，等一次运行去猜"
+        );
+
+        let err = declare_team(&mut untouched, Some("plan_only".into()))
+            .expect_err("plan_only 是分解路径的模式，不是原子运行能选的拓扑");
+        assert!(err.contains("plan_only"), "{err}");
+    }
+
+    /// 从任务板上接来的活，也算这个 unit 手上欠着的。
+    #[test]
+    fn a_row_taken_off_the_board_counts_as_owned_too() {
+        let dag = TaskDAG::default();
+        let mut taken = Task::new("taken", cog_core::TaskType::DagNode, serde_json::json!({}));
+        taken.take_claim("8b", chrono::Duration::seconds(300), chrono::Utc::now());
+        let (picked, owned_count) = ready_owned(vec![taken], &dag, "8b");
+        assert!(
+            picked.is_empty(),
+            "已经接走的行在等 start，不在等下一次挑选"
+        );
+        assert_eq!(
+            owned_count, 1,
+            "接了却没被数进手上的活，这个人会越干越显得闲"
+        );
+    }
+
     /// The idle rule answers "how long has this owner been quiet" from a
     /// timestamp. If the record expires sooner than the rule's window, that
     /// question loses its answer before it can be asked and every quiet owner
@@ -1362,7 +1558,7 @@ mod tests {
                 acceptance: vec!["CI is green on main".into()],
                 priority: 1,
                 blocked_by: Vec::new(),
-                timeout_secs: UNIT_WORK_BUDGET_SECS,
+                declared_secs: UNIT_WORK_DECLARED_SECS,
             }
         );
         // Each of these would otherwise reach a row that says less than a row
@@ -1401,7 +1597,7 @@ mod tests {
             acceptance,
             priority,
             blocked_by,
-            timeout_secs,
+            declared_secs,
         } = request.action
         else {
             panic!("file must parse as file");
@@ -1413,7 +1609,7 @@ mod tests {
             acceptance: &acceptance,
             priority,
             blocked_by: &blocked_by,
-            timeout_secs,
+            declared_secs,
         };
         let body = filing_body(&filing, &request.unit, "cogneva").unwrap();
 
@@ -1430,7 +1626,7 @@ mod tests {
         assert_eq!(row["face_id"], "CI/构建/部署");
         assert_eq!(row["unit_id"], "8b");
         assert_eq!(row["priority"], 1);
-        assert_eq!(row["timeout_seconds"], UNIT_WORK_BUDGET_SECS);
+        assert_eq!(row["declared_duration_seconds"], UNIT_WORK_DECLARED_SECS);
         assert_eq!(
             row["planner"]["verified"], true,
             "without the verified claim the orchestrator plans the row again"
@@ -1462,7 +1658,7 @@ mod tests {
             acceptance,
             priority,
             blocked_by,
-            timeout_secs,
+            declared_secs,
         } = request.action
         else {
             panic!("file must parse as file");
@@ -1474,7 +1670,7 @@ mod tests {
             acceptance: &acceptance,
             priority,
             blocked_by: &blocked_by,
-            timeout_secs,
+            declared_secs,
         };
         let body = filing_body(&filing, &request.unit, "cogneva").unwrap();
         let read: CreateTaskRequest =
@@ -1487,7 +1683,10 @@ mod tests {
         assert_eq!(rows[0].id, "close-the-ci-gap");
         assert_eq!(rows[0].face_id.as_deref(), Some("CI/构建/部署"));
         assert_eq!(rows[0].unit_id.as_deref(), Some("8b"));
-        assert_eq!(rows[0].timeout_seconds, Some(UNIT_WORK_BUDGET_SECS));
+        assert_eq!(
+            rows[0].declared_duration_seconds,
+            Some(UNIT_WORK_DECLARED_SECS)
+        );
         assert!(
             rows[0].planner.as_ref().is_some_and(|claim| claim.verified),
             "the row is injected without decomposition only if this claim arrives"
@@ -1542,7 +1741,7 @@ mod tests {
             acceptance,
             priority: 1,
             blocked_by: &[],
-            timeout_secs: UNIT_WORK_BUDGET_SECS,
+            declared_secs: UNIT_WORK_DECLARED_SECS,
         }
     }
 
@@ -1560,22 +1759,23 @@ mod tests {
         assert!(filing_body(&filing("t", " ", &stated), "8b", "ws").is_err());
     }
 
-    /// The executor's own default is five minutes, and the over-budget rule
-    /// reads the age of the row rather than whether its holder is still there.
-    /// A filed row left on that default would fail under a unit that was
-    /// heartbeating at the time -- the row's own unit, on work it just started.
+    /// The executor's own row default is five minutes, sized for one dispatched
+    /// round. Nothing ends the row at the declared number -- a held row is
+    /// judged by whether its holder keeps stepping -- so this field is what a
+    /// reader sizes its patience from, and a filed row that said five minutes
+    /// would tell every reader a unit's work is one round long.
     #[test]
-    fn a_filed_row_outlives_a_five_minute_executor_run() {
+    fn a_filed_row_declares_a_units_length_not_one_executor_round() {
         let stated = vec!["CI is green on main".to_string()];
         let body = filing_body(&filing("t", "g", &stated), "8b", "ws").unwrap();
-        let stated_budget = body["tasks"][0]["timeout_seconds"]
+        let stated_duration = body["tasks"][0]["declared_duration_seconds"]
             .as_u64()
             .expect("the budget travels with the submission");
         assert!(
-            stated_budget > 300,
-            "a filed row left on the executor's budget fails while its owner is alive"
+            stated_duration > 300,
+            "a filed row reading as one dispatched round misstates the unit's work"
         );
-        assert_eq!(stated_budget, UNIT_WORK_BUDGET_SECS);
+        assert_eq!(stated_duration, UNIT_WORK_DECLARED_SECS);
     }
 
     /// The door is addressed the way every other caller of that face addresses

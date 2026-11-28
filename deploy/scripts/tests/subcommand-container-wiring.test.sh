@@ -95,7 +95,7 @@ PYEOF
 
 check_file "${repo}/deploy/k3s/cluster-registry.yaml"
 check_file "${repo}/deploy/k3s/gateway-deployment.yaml"
-check_file "${repo}/deploy/k3s/sandbox-executor-deployment.yaml"
+check_file "${repo}/deploy/k3s/sandbox-executor-statefulset.yaml"
 check_file "${repo}/deploy/k3s/host-ledger-daemonset.yaml"
 check_file "${work}/chart.yaml"
 # 形态的集合从树里读：新增的 profile 不在名单里就没有任何一个容器被这一趟看过，
@@ -105,7 +105,7 @@ for profile_dir in "${repo}"/deploy/rendered/*/; do
   profile="$(basename "${profile_dir}")"
   check_file "${repo}/deploy/rendered/${profile}/41-deployment-cogneva-registry.yaml"
   check_file "${repo}/deploy/rendered/${profile}/41-deployment-cogneva-security-gateway.yaml"
-  check_file "${repo}/deploy/rendered/${profile}/41-deployment-cogneva-sandbox-executor.yaml"
+  check_file "${repo}/deploy/rendered/${profile}/42-statefulset-cogneva-sandbox-executor.yaml"
   check_file "${repo}/deploy/rendered/${profile}/40-daemonset-cogneva-host-ledger.yaml"
 done
 

@@ -189,6 +189,23 @@ const COUNTER_HELP: &[(&str, &str)] = &[
         "Total LLM upstream calls rejected as malformed requests",
     ),
     (
+        crate::metric_names::AGENT_CONTEXT_LIMIT_REFUSALS_TOTAL.as_str(),
+        "Calls this process made that an upstream refused for exceeding its \
+         context window, by `outcome`. The window belongs to the upstream \
+         deployment and no file in this tree carries it, so the loop's budget \
+         is a bootstrap until a call measures it -- and a refusal is the \
+         measurement. `limit_named` cells are refusals whose text states the \
+         limit (\"maximum context length is 128000 tokens\", \"prompt is too \
+         long: 214401 tokens > 200000 maximum\"); the loop reads that number, \
+         lowers its budget to it in the same turn and reports it, so these \
+         cells should arrive in ones and twos and then stop. `limit_unnamed` \
+         cells are refusals that say the prompt was too long and name no \
+         number: the budget is still wrong, but nothing was learned, and the \
+         repair is to teach `context_limit_from_refusal` that vendor's wording. \
+         A cell that keeps climbing after its named sibling moved means the \
+         number was learned and the budget still exceeds it",
+    ),
+    (
         "llm_upstream_failures_total",
         "Total LLM upstream failures this process recorded against an upstream, \
          split by which side observed them. `source=\"caller\"` is a call this \
@@ -1075,13 +1092,27 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          per boot, on both layers. On the wiki cell an increase can only be the \
          boot case, since a live backend never writes `absent` for wiki, and \
          that is the cell that tells the two apart. Because one cell counts \
-         boots where the rest count calls, no rule or panel may sum across \
+         boots where the rest count calls, no rule and no reading may sum across \
          `outcome` and report the total as a number of retrievals. So a reader \
          concludes \"no knowledge backend\" from the wiki cell and never from \
          the memory cell: the memory cell carries ordinary traffic (a live \
          backend writes `absent` there whenever it answers for wiki and holds \
          no memory) and the two meanings are only separable while the wiki cell \
          is read with it.",
+    ),
+    (
+        crate::metric_names::TOOL_CALL_ARCHIVED_TOTAL.as_str(),
+        "Tool call records written to the permanent Raw layer, labelled by \
+         `tool`, one increment per call whose record landed. The record holds \
+         what the call was given and what it returned, written before the result \
+         is handed to the model, so it is the copy that survives the event log's \
+         row cap and the context window both. Read it as the numerator of the \
+         record landed share against `cogneva_tool_output_archive_failed_total`: \
+         the two are the fates of the same call and every call the process can \
+         key reaches exactly one of them. It is also the volume reading for that \
+         layer -- how many records this deployment is writing and for which \
+         tools -- which the failure counter cannot give, since a deployment \
+         whose writes all fail increments only the failure side.",
     ),
     (
         crate::metric_names::TOOL_OUTPUT_TRUNCATED_TOTAL.as_str(),
@@ -1091,14 +1122,15 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          the same fact outside the conversation, so a run that spends its budget \
          on oversized tool results is countable rather than silent. Read per \
          `tool`: a series climbing for one tool names that tool's output shape, \
-         not the context budget as a whole. It is the denominator of the landed \
-         share: every cut ends either with its tail stored or with an increment \
-         on `cogneva_tool_output_archive_failed_total`, so the share of cuts \
-         whose tail stayed reachable is this counter minus that one over this \
-         one, and the residue is what the reading cannot account for. Read it \
-         with `cogneva_tool_output_truncated_chars_total` for the size of what \
-         was withheld: this counter says how many results were cut and that one \
-         says how much of them the model never saw.",
+         not the context budget as a whole. It is not a loss reading: the call's \
+         whole result was written to the Raw layer before this cut was made, so \
+         what the model did not see is still reachable by the reference the marker \
+         carries. Whether that write landed is `cogneva_tool_call_archived_total` \
+         against `cogneva_tool_output_archive_failed_total`, which are counted \
+         over calls rather than cuts. Read it with \
+         `cogneva_tool_output_truncated_chars_total` for the size of what was \
+         withheld: this counter says how many results were cut and that one says \
+         how much of them the model never saw.",
     ),
     (
         crate::metric_names::TOOL_OUTPUT_TRUNCATED_CHARS_TOTAL.as_str(),
@@ -1117,21 +1149,22 @@ const COUNTER_HELP: &[(&str, &str)] = &[
     ),
     (
         crate::metric_names::TOOL_OUTPUT_ARCHIVE_FAILED_TOTAL.as_str(),
-        "Archives of a truncated tool output's full text that did not land, \
-         labelled by `tool` and by `cause`, one increment per cut whose tail was \
-         not stored. A truncation marker carries an `artifact://` reference only \
-         when the full text was stored, so this counts the times a caller \
-         following such a reference would find nothing. The causes are a closed \
-         set and every cut ends in one of them: `unconfigured` (no base URL was \
-         handed to this deployment, so nothing was attempted), `unreachable` \
-         (the API did not answer), `refused` (it answered and rejected the \
-         write), and `unkeyed` (the run carried no task id, so there was no \
-         source to file the tail under and no attempt was made). That closure is \
-         the point of the series: `cogneva_tool_output_truncated_total` minus \
-         this one is the number of cuts whose tail landed, and the subtraction \
-         only names a share while every unlanded cut is counted here. Read it \
-         beside the truncation counter, where a share of the two moving together \
-         names the archive endpoint rather than ordinary truncation.",
+        "Tool call records that did not land in the permanent Raw layer, \
+         labelled by `tool` and by `cause`, one increment per call whose record \
+         was not stored. A record that does not land is the call's only permanent \
+         copy missing: the event log is a bounded ring that sweeps by row count, \
+         and the copy the model was shown lives in a context that is trimmed. A \
+         truncation marker carries an `artifact://` reference only when the \
+         record was stored, so this also counts the times a caller following such \
+         a reference would find nothing. The causes are a closed set and every \
+         attempt ends in one of them: `unconfigured` (no base URL was handed to \
+         this deployment, so nothing was attempted), `unreachable` (the API did \
+         not answer), and `refused` (it answered and rejected the write). That \
+         closure is the point of the series: `cogneva_tool_call_archived_total` \
+         against this one is the share of calls whose record landed, and the \
+         share only names something while every unlanded call is counted here. \
+         Read it against the archived counter, where the two moving apart names \
+         the archive endpoint rather than ordinary traffic.",
     ),
     (
         crate::metric_names::EVENT_BUS_DROPPED_TOTAL.as_str(),
@@ -1292,6 +1325,49 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          that tool's payload shape, not the budget as a whole.",
     ),
     (
+        crate::metric_names::SHUTDOWN_DRAIN_ABANDONED_TOTAL.as_str(),
+        "Runs still in flight when a shutdown's drain budget ran out, one \
+         increment per abandoned run. The histogram beside it says how long the \
+         wait lasted; this says what the wait bought. A drain that times out \
+         with nothing left lost nothing, and one that times out with three runs \
+         going handed three attempts to their journals -- the two write the \
+         same log line, so without this series a rollout that quietly skips the \
+         drain entirely is indistinguishable from one that finishes it.",
+    ),
+    (
+        crate::metric_names::SHUTDOWN_DRAIN_UNDECLARED_TOTAL.as_str(),
+        "Shutdowns that found no declared drain budget and therefore did not \
+         wait for in-flight runs at all, one increment per shutdown. It is a \
+         counter separate from the drain histogram because a zero-second \
+         observation there would mean the opposite: that a drain ran and \
+         finished at once. A process that never declares a budget is one whose \
+         rollout is paid for out of the attempt journals every time, and the \
+         only other trace it leaves is a log line nobody reads at the moment \
+         it matters.",
+    ),
+    (
+        crate::metric_names::ATTEMPT_RESUME_TOTAL.as_str(),
+        "Attempts that opened by reading the attempt journal, labelled by \
+         `outcome`, one increment per attempt. `resumed` continued an unfinished \
+         conversation from its journal; `fresh` found nothing to continue (no \
+         entries, or the last one closed) and paid for its first turn. The pair \
+         is one reading because either count alone is ambiguous: five resumes \
+         is a healthy rolling deploy out of five attempts and a restart loop out \
+         of five thousand, and the share is what says which.",
+    ),
+    (
+        crate::metric_names::ATTEMPT_UNRESOLVED_CALLS_TOTAL.as_str(),
+        "Tool calls a resumed attempt found without a result, labelled by \
+         `effect` (`read`, `write` or `external`), one increment per call. It is \
+         the measurable form of \"at most one step lost\": zero means the kill \
+         landed on a turn boundary, and each increment names an action whose \
+         outcome the resume could not know. Counted by class because the classes \
+         are what the resume does differently with them -- replay a read, replay \
+         a write that refuses a stale anchor, hand an external effect back to \
+         the model -- so a rollout that cost nothing and one that cost an \
+         external action are the same total with different labels.",
+    ),
+    (
         crate::metric_names::SOP_DISPATCH_TOTAL.as_str(),
         "What the SOP dispatch loop did with one configured face on one tick, \
          labelled by `face` and `result`, one increment per face per tick that \
@@ -1353,6 +1429,14 @@ const COUNTER_HELP: &[(&str, &str)] = &[
 /// Descriptions for the histogram series. See [`COUNTER_HELP`].
 const HISTOGRAM_HELP: &[(&str, &str)] = &[
     (
+        crate::metric_names::EVENT_APPEND_SECONDS.as_str(),
+        "One append to the event stream, in seconds, labelled by the kind of \
+         fact. The observation is taken around the single writer's INSERT, so \
+         pool queueing is included: that is time the append waited. The p99 over \
+         a window is read against half the UI refresh cycle, which is why the \
+         tail and not the mean is the reading here",
+    ),
+    (
         "memory_operation_latency_ms",
         "Memory backend operation latency in milliseconds",
     ),
@@ -1369,6 +1453,26 @@ const HISTOGRAM_HELP: &[(&str, &str)] = &[
          both carried because a pool fails over between endpoints serving the \
          same model, so 'which model is slow' and 'which endpoint is slow' are \
          different questions",
+    ),
+    (
+        crate::metric_names::SHUTDOWN_DRAIN_MILLISECONDS.as_str(),
+        "How long one shutdown waited for in-flight runs to reach a turn \
+         boundary, in milliseconds, observed once per shutdown and labelled by \
+         `outcome`. `drained` is a wait that reached zero; `timeout` is one that \
+         ran out of its budget with runs still going. A histogram rather than a \
+         mean because the number the grace period must cover is the slow tail -- \
+         one rollout that took thirty seconds is the observation that matters, \
+         and an average over a day is the one that hides it. Milliseconds \
+         because the bucket ladder doubles from the unit its name declares: the \
+         seconds ladder stops at 16.384 s, which is inside the range a drain is \
+         allowed to take, so the slow observations -- the only ones that say the \
+         grace is too small -- would all share one overflow count. The two \
+         outcomes are not interchangeable when read as a distribution: a \
+         `drained` duration is the real wait, while a `timeout` one is censored \
+         at the cap it was given and only says `at least this long`. So a \
+         quantile belongs on the `drained` rows, and the `timeout` rows are read \
+         as a count -- any of them is evidence that the cap was reached, which \
+         is the one fact a quantile of the censored rows would hide.",
     ),
 ];
 
@@ -1623,37 +1727,103 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          memory_unextracted_scan_failed, which is written on every attempt",
     ),
     (
+        "cogneva_db_setting_seconds",
+        "One PostgreSQL time bound that ends work in flight, in seconds, \
+         labelled by the setting it is about: statement_timeout, \
+         idle_in_transaction_session_timeout and lock_timeout. These are bounds \
+         the database carries rather than bounds this repository writes, so no \
+         scan of the tree can see them -- and a statement the database kills \
+         halfway is the same loss as one a hard-coded bound kills halfway. A \
+         value of NaN means the setting is off (PostgreSQL encodes that as 0, \
+         which is not zero seconds): the series is still published so a reader \
+         can tell `no bound set` from `the surface did not run`, and every \
+         comparison against it is false rather than reading as an expired \
+         bound. Which settings are off is the state to check first: a \
+         deployment that deleted every time bound in code and left one in the \
+         database has moved the bound rather than removed it",
+    ),
+    (
+        "cogneva_db_vacuum_behind_tables",
+        "Tables whose dead tuples have passed autovacuum's own trigger -- \
+         `autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor x live \
+         tuples`, both read from pg_settings. Past that line is the moment \
+         autovacuum should already have come and has not, which is a reading the \
+         database itself defines rather than a top-N somebody picked. Dead tuples \
+         are space that is deleted and still occupied: they make backups slower \
+         and the planner read a table larger than its live data. Read the \
+         per-table counts beside this one to see which tables are carrying it",
+    ),
+    (
+        "cogneva_db_xact_age_seconds",
+        "How old the longest transaction in each state already is, in seconds, \
+         labelled by `state`: `active` for one running work, `idle in \
+         transaction` for one that opened a transaction and stopped talking. \
+         The second is the one the database kills on its own \
+         `idle_in_transaction_session_timeout`, so its age is how much of that \
+         bound is spent; the two carry different settings and are published \
+         apart because one maximum cannot say which bound is near. A state \
+         with no open transaction is absent rather than 0 -- zero seconds is a \
+         transaction that has just begun",
+    ),
+    (
+        "cogneva_db_dead_tuples",
+        "Dead tuples carried by each table, labelled by `table`. Space that is \
+         deleted and still occupied: it makes backups slower and the planner \
+         read a table larger than its live data. Read together with \
+         `cogneva_db_vacuum_threshold_tuples`, which is the line autovacuum \
+         itself works against",
+    ),
+    (
+        "cogneva_db_vacuum_threshold_tuples",
+        "The dead-tuple count after which autovacuum should already have come \
+         to this table: `autovacuum_vacuum_threshold + \
+         autovacuum_vacuum_scale_factor x live tuples`, both settings read from \
+         the server and the live count from the table itself. A reading rather \
+         than a threshold somebody typed: change the server's settings and \
+         this moves with them. Together with the dead-tuple count it says how \
+         far past its own trigger a table is; a zero threshold means the \
+         trigger is off for that table and any dead tuple is already past it, \
+         which is why the ratio is divided where it is read rather than \
+         published as a number",
+    ),
+    (
         "metrics_samples_rows",
         "Rows currently held in the metrics sample log",
     ),
     (
         "metrics_sample_sweep_failed",
-        "Whether the last sample-log pass could not be completed, 1 or 0 \
-         (a pass is the sweep when the log is over budget, otherwise the \
-         measure). The row count, the budget, the floor verdict and the bytes \
-         are all stamped only once a pass returns, so a pass that fails leaves \
-         every one of them at its last value, and the two capacity rules then \
-         trust a frozen log until their age bound closes them -- a sweep that \
-         cannot run and a log that is not growing look the same. This reading \
-         says the pass itself did not answer; it is written on every pass, so a \
-         pass that completes keeps it at 0",
+        "Whether the last sample-log pass could not be completed, 1 or 0. The \
+         row count, the declared capacity, the over-capacity verdict and the \
+         bytes are all stamped only once a pass returns, so a pass that fails \
+         leaves every one of them at its last value, and the capacity rules \
+         then trust a frozen log until their age bound closes them -- a loop \
+         that cannot run and a log that is not growing look the same. This \
+         reading says the pass itself did not answer; it is written on every \
+         pass, so a pass that completes keeps it at 0",
     ),
     (
         "metrics_samples_budget_rows",
-        "Rows the metrics sample log is allowed to hold; the sweep deletes \
-         oldest-first past this, stopping at each gauge series' newest row. \
-         Every reading here names the deployment that published it, because \
-         this is one deployment's own declaration and the log they land in is \
-         shared, so without the name a deployment that declares no cap at all \
-         is served the one the deployment beside it declared",
+        "Rows the metrics sample log is **declared** allowed to hold. Nothing \
+         deletes past this: the loop measures the log and publishes the \
+         declaration beside the count, and a log above it stays above it until \
+         somebody decides what to do -- raise the declaration, change how the \
+         series that grew it is recorded, or stop declaring one. Every reading \
+         here names the deployment that published it, because this is one \
+         deployment's own declaration and the log they land in is shared, so \
+         without the name a deployment that declares no capacity at all is \
+         served the one the deployment beside it declared. Absent rather than \
+         0 for a deployment that declares none",
     ),
     (
         "metrics_samples_over_capacity",
-        "1 when the sample log is over its row budget and cannot be pruned \
-         further without deleting a gauge series' current value, 0 otherwise. \
-         Carries the same deployment label as the budget it is read beside, \
-         and is absent rather than 0 for a deployment that ran no pass to \
-         report on",
+        "1 when the sample log holds more rows than the capacity its \
+         deployment declares, 0 otherwise. It is a comparison of the two \
+         readings beside it, published so a reader cannot get the inequality \
+         backwards without anything noticing -- and it is not a fault report: \
+         nothing deletes the log, so a 1 stays a 1 until a person decides what \
+         the capacity ought to be. Carries the same deployment label as the \
+         capacity it is read beside, and is absent rather than 0 for a \
+         deployment that declares no capacity",
     ),
     (
         "metrics_samples_bytes",
@@ -1752,6 +1922,23 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          and retirement removes whole streams rather than rows",
     ),
     (
+        "cogneva_event_stream_rows_per_day",
+        "Rows that entered the event stream in the last day, one series per \
+         kind. The stream is the account's source of truth, and \"nothing \
+         arrived\" and \"the writer is stuck\" read the same on every other \
+         surface; every kind in the closed set is published, zero included, so a \
+         series cannot disappear and look like nobody configured it",
+    ),
+    (
+        "cogneva_event_undecodable_total",
+        "Payloads this build could not decode, by kind and version. A row it \
+         cannot decode is kept and marked `undecodable` rather than dropped: \
+         dropping it would put a rejected change back into the queue. The count \
+         is the only signal that the deployment is holding rows a later build \
+         wrote -- a state a reader can otherwise find only by reading every \
+         undecodable row one at a time",
+    ),
+    (
         "cogneva_task_events_tasks",
         "Task event streams currently held, one per task whose events have not \
          been retired. A stream is kept or removed whole, because both readers \
@@ -1764,15 +1951,6 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          for an empty archive. This is the retention seen from the reader's \
          side: whatever the deployment says it keeps, this is how far back the \
          archive actually reaches",
-    ),
-    (
-        "cogneva_task_events_keep_seconds",
-        "The retention the publishing process enforces on the per-task event \
-         archive, in seconds. Published beside the oldest row's age so the rule \
-         compares two readings rather than a constant written into the rules \
-         file. Absent from a deployment that retires nothing: every deployment \
-         sharing the database writes this gauge, and a zero would make the \
-         comparison a verdict about a policy that deployment does not have",
     ),
     (
         "cogneva_task_events_sweep_failed",
@@ -1790,6 +1968,13 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          rather than by how many calls there were: read it beside \
          gateway_llm_exchange_keep_seconds to see the retention this deployment \
          is actually holding",
+    ),
+    (
+        "gateway_llm_exchange_rows_per_day",
+        "Rows the exchange archive gained per day between the last two passes. \
+         Absent until a second pass has something to compare with: a rate nobody \
+         measured is not a rate of zero, and a zero there would read as a table \
+         that stopped growing",
     ),
     (
         "gateway_llm_exchange_oldest_age_seconds",
@@ -2294,15 +2479,15 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          make the band order visible: the pass hands out the highest band it \
          holds, so a band whose count does not fall while the others move is \
          urgent work that is not getting through, which no per-row reading can \
-         say. state_conflict, state_pending, state_partial and state_undecided \
-         are the same owed set split again, by the state the account holds each \
-         row in, from its census. The two splits have to add up to the same \
-         total, and state_pending has to equal change_ledger_pending: the \
-         pass's own split and the account's census count the same rows, and the \
-         four states are what makes the rest of the owed set readable at all -- \
-         a row held as undecided, conflict or partial is owed work that appears \
-         in none of the pass's columns, so without these cells an account whose \
-         checks had all become unsettleable would read as owing nothing. A pass \
+         say. state_pending and state_landed are the account's own census, by \
+         the state it holds each row in. state_pending has to equal \
+         change_ledger_pending: the pass's own split and the account's census \
+         count the same rows, and the equality is the reading -- a pass that \
+         counted its slice right but the account wrong would otherwise look \
+         sound. The account has two states, so there is no third cell to make \
+         the rest of a six-word vocabulary readable; a row whose check could not \
+         be settled is pending and appears in unmeasurable, with the reason it is \
+         stuck on the face census. A pass \
          that could not count the account writes no band cell and no state cell \
          rather than writing zeros: a zero says the urgent work is done, which \
          is the one wrong answer, and the stamp on the last write is what tells \
@@ -2312,8 +2497,9 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          as landed, and how many are still owed. They are the only cells here \
          that answer whether the work was actually done, as opposed to how much \
          is outstanding; state_pending falling while demand_satisfied does not \
-         move is a ledger emptying itself by retiring rows rather than by \
-         completing them. Both are written or neither, from the intake joined to \
+         move is a ledger whose rows stopped being measured rather than one \
+         whose changes were made, which is why the face census splits the owed \
+         rows by the reason they are stuck. Both are written or neither, from the intake joined to \
          the account, and a store that cannot answer writes no demand cell. \
          blocking_rows and held_landings are what the account is holding in \
          front of itself: a change a commit delivered while the account still \

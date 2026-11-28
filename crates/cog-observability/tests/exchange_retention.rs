@@ -1,21 +1,19 @@
-//! The prompt-and-response archive's retention, against a live PostgreSQL.
+//! The prompt-and-response archive is measured, never trimmed, against a live
+//! PostgreSQL.
 //!
-//! Three claims, and all three are the server's answer rather than the caller's:
+//! What used to answer the archive's growth was a retention: past N days, delete
+//! the rows whose bodies read back from the archive. That condition was right
+//! about the risk and wrong about the mechanism -- it made a minute loop ask
+//! "would deleting this lose the only copy", a question about a deletion that
+//! should not be happening at all. The claims worth a live server now:
 //!
-//! - the cutoff is the clock, so a pass retires every row older than the
-//!   retention and leaves the rest alone -- the count it deletes is decided by
-//!   `ts < cutoff`, not by anything the loop passes down;
-//! - a second pass over the same archive finds nothing, because correctness
-//!   comes from the deletion being a set defined by the clock rather than from a
-//!   single writer -- two replicas sweeping the same cutoff take the same rows;
+//! - the reading is the table's own row count and the age of its oldest row,
+//!   however far past the declared window that age is;
+//! - a row past the window is still there after a pass, with or without a copy
+//!   in the archive -- nothing deletes;
 //! - an archive with nothing in it answers zero for its oldest age rather than
 //!   an error. A series that disappeared would make the age rule go silent
 //!   exactly while the archive is clean, so the empty case is a reading.
-//!
-//! The pass reports progress before each batch, so a first run against an
-//! archive that grew while nothing retired it does not leave the loop looking
-//! stopped for as long as the backlog lasts. The counts below are what says the
-//! callback fires per batch rather than once per pass.
 //!
 //! Ignored by default; needs `COGNEVA_TEST_DATABASE_URL` pointing at a throwaway
 //! database. The test owns a schema of its own and drops it, so the live
@@ -26,7 +24,6 @@
 //!   cargo test -p cog-observability --test exchange_retention -- --ignored
 //! ```
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,9 +45,27 @@ impl Scratch {
         )
         .await;
         sqlx::query(&format!(
+            // 与真表同形状：写入口的 INSERT 点的是这些列，少一列就不是同一个问题。
             "CREATE TABLE \"{schema}\".gateway_llm_exchange (
-                 id BIGSERIAL PRIMARY KEY,
-                 ts TIMESTAMPTZ NOT NULL
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 upstream TEXT NOT NULL DEFAULT 'test-upstream',
+                 api_style TEXT NOT NULL DEFAULT 'openai',
+                 model TEXT NOT NULL DEFAULT 'm',
+                 actor TEXT NOT NULL DEFAULT 'a',
+                 origin TEXT NOT NULL DEFAULT 'gateway_pool',
+                 task_id TEXT,
+                 result TEXT NOT NULL DEFAULT 'ok',
+                 latency_ms BIGINT NOT NULL DEFAULT 0,
+                 request_sha256 TEXT NOT NULL DEFAULT '',
+                 response_sha256 TEXT,
+                 request_bytes BIGINT NOT NULL DEFAULT 0,
+                 response_seen_bytes BIGINT NOT NULL DEFAULT 0,
+                 response_bytes BIGINT,
+                 request_raw  TEXT,
+                 response_raw TEXT,
+                 request_body TEXT,
+                 response_body TEXT
              )"
         ))
         .execute(&pool)
@@ -74,81 +89,78 @@ impl Scratch {
 
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
-async fn a_pass_retires_every_row_past_the_retention_and_only_those() {
+async fn rows_past_the_window_are_measured_and_kept() {
     let url = cog_test_support::database_url();
     let pool = PgPool::connect(&url)
         .await
         .expect("database must be reachable");
     let scratch = Scratch::new(pool.clone()).await;
-    let table = format!("\"{}\".gateway_llm_exchange", scratch.schema);
-
-    // 3,001 rows past a one-day retention and 2,001 inside it. The extra row on
-    // each side is what makes the batch arithmetic below say "one more than the
-    // batch size" rather than a round number that a single statement would
-    // satisfy either way.
+    let table = scratch.table();
     sqlx::query(&format!(
-        "INSERT INTO {table} (ts)
-         SELECT NOW() - interval '30 days' - (g || ' seconds')::interval
-         FROM generate_series(1, 3001) AS g"
+        "INSERT INTO {table} (ts) VALUES
+             (NOW() - interval '30 days'), (NOW() - interval '1 day')"
     ))
     .execute(&pool)
     .await
-    .expect("fill the expired half");
-    sqlx::query(&format!(
-        "INSERT INTO {table} (ts)
-         SELECT NOW() - (g || ' seconds')::interval
-         FROM generate_series(1, 2001) AS g"
-    ))
-    .execute(&pool)
-    .await
-    .expect("fill the live half");
+    .expect("fill two rows, one past the window");
 
-    let beats = Arc::new(AtomicUsize::new(0));
-    let counter = Arc::clone(&beats);
-    let outcome = scratch
+    let reading = scratch
         .cap(Duration::from_secs(86_400))
-        .retire_once(move || {
-            counter.fetch_add(1, Ordering::Relaxed);
-        })
+        .measure_once()
         .await
-        .expect("sweep");
+        .expect("measure");
 
-    assert_eq!(
-        outcome.removed, 3_001,
-        "every expired row goes, and no other"
-    );
-    assert_eq!(outcome.held, 2_001, "the rows inside the retention stay");
-    assert_eq!(
-        outcome.keep_secs, 86_400,
-        "the pass reports what it enforced"
-    );
+    assert_eq!(reading.held, 2, "the reading is the row count: {reading:?}");
     assert!(
-        outcome.oldest_age_secs < 3_600,
-        "the oldest surviving row has to be one of the ones inside the \
-         retention, not the month-old half: {}",
-        outcome.oldest_age_secs
+        reading.oldest_age_secs >= 30 * 86_400 - 60,
+        "the reading says how far back the archive reaches: {reading:?}"
     );
-    assert_eq!(
-        beats.load(Ordering::Relaxed),
-        3,
-        "two full batches and the empty one that ends the pass: the callback \
-         fires per batch, not once per pass"
-    );
-
-    let again = scratch
-        .cap(Duration::from_secs(86_400))
-        .retire_once(|| {})
+    let left: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+        .fetch_one(&pool)
         .await
-        .expect("second sweep");
+        .expect("count the rows");
     assert_eq!(
-        again.removed, 0,
-        "a second pass over the same cutoff finds nothing"
+        left, 2,
+        "a row past the window was removed; nothing here deletes"
     );
-    assert_eq!(again.held, 2_001);
-
     scratch.done().await;
 }
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn a_copy_in_the_archive_does_not_change_what_is_kept() {
+    use cog_core::ObjectBackend;
+    let url = cog_test_support::database_url();
+    let pool = PgPool::connect(&url)
+        .await
+        .expect("database must be reachable");
+    let scratch = Scratch::new(pool.clone()).await;
+    let table = scratch.table();
+    let archive: Arc<dyn ObjectBackend> = Arc::new(cog_test_support::MemoryObjectBackend::new());
+    archive.put("bodies/req", b"{}").await.expect("seed");
+    sqlx::query(&format!(
+        "INSERT INTO {table} (ts, request_raw) VALUES (NOW() - interval '30 days', 'bodies/req')"
+    ))
+    .execute(&pool)
+    .await
+    .expect("fill one expired row");
 
+    let reading = scratch
+        .cap(Duration::from_secs(86_400))
+        .with_archive(archive)
+        .measure_once()
+        .await
+        .expect("measure");
+    assert_eq!(reading.held, 1);
+    let left: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+        .fetch_one(&pool)
+        .await
+        .expect("count the rows");
+    assert_eq!(
+        left, 1,
+        "an archived copy used to be the licence to delete; it is now only a fact"
+    );
+    scratch.done().await;
+}
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn an_empty_archive_answers_zero_rather_than_nothing() {
@@ -156,21 +168,16 @@ async fn an_empty_archive_answers_zero_rather_than_nothing() {
     let pool = PgPool::connect(&url)
         .await
         .expect("database must be reachable");
-    let scratch = Scratch::new(pool).await;
-
-    let outcome = scratch
+    let scratch = Scratch::new(pool.clone()).await;
+    let reading = scratch
         .cap(Duration::from_secs(86_400))
-        .retire_once(|| {})
+        .measure_once()
         .await
-        .expect("sweep");
-
-    assert_eq!(outcome.held, 0);
-    assert_eq!(outcome.removed, 0);
+        .expect("measure");
+    assert_eq!(reading.held, 0);
     assert_eq!(
-        outcome.oldest_age_secs, 0,
-        "an empty archive is a clean one: the age rule compares this to the \
-         retention and zero is what has to arrive"
+        reading.oldest_age_secs, 0,
+        "an empty archive is a reading, not an error"
     );
-
     scratch.done().await;
 }

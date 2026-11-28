@@ -1,3 +1,4 @@
+# census-keep: shapes=deploy-numbers — 部署清单里的数是部署自己的声明：它写在生效的那一处，改它只改这一次部署，不是代码里看不见的默认；由部署面本身兜住
 # 向量库的读数：qdrant 自己暴露 /metrics。
 #
 # 通用清单里这一项叫 LanceDB exporter，本平台不适用：向量库是 qdrant。为读一个

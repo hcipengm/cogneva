@@ -1,3 +1,4 @@
+//! principle: feedback_an_unmeasured_bound_must_not_take_the_zero_cell_on_the_reading
 use crate::common;
 
 use cog_agent::GlobalAgentManager;
@@ -19,6 +20,9 @@ fn make_test_task(id: &str) -> Task {
         task_type: cog_core::TaskType::DagNode,
         status: TaskStatus::Pending,
         input: serde_json::json!({"goal": "test"}),
+        terminal: String::new(),
+        now: String::new(),
+        gap: String::new(),
         result: None,
         error: None,
         error_cause: None,
@@ -34,7 +38,7 @@ fn make_test_task(id: &str) -> Task {
         max_retries: 3,
         retry_not_before: None,
         started_at: None,
-        timeout_seconds: 300,
+        declared_duration_seconds: 300,
         lease_owner: None,
         lease_expires_at: None,
         action_planner_meta: None,

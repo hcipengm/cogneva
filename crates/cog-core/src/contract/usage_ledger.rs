@@ -172,6 +172,11 @@ pub struct PaceEvidence {
     pub allowance_tokens: u64,
     pub spent_tokens: u64,
     pub reserve_tokens: u64,
+    /// `reserve_tokens` 是样本均值，没有 N 就复算不出这一拍：同样一个 300k，
+    /// 取自九件活与取自一件是同一个数、两种读数。旧行缺这一格，按 0 读作
+    /// "没有样本量"，不是"样本量为零"。
+    #[serde(default)]
+    pub reserve_population: u64,
     /// 这一窗的起点。不能省：`allowance_tokens = 0` 本身分不清"窗口还没开张"
     /// 与"已经烧到零"，边界时刻必须自带。
     pub window_start_unix: i64,
@@ -395,6 +400,16 @@ pub struct LlmUsageRecord {
     /// empty rather than gathering unattributed calls into one placeholder
     /// person.
     pub owner: Option<String>,
+    /// The conversation this call is part of, as the caller declared it.
+    ///
+    /// 与 `task` 和 `owner` 并列，回答第三件事：哪一件工作、谁付钱、哪一段对话。
+    /// 一个人的花销不是一段对话的花销——同一个人同时开好几段，而「这段对话花了
+    /// 多少」从按人的总数里读不出来。只有对话那一侧知道这个 id，所以它由调用方
+    /// 声明；没有对话的调用（后台任务、评测、进化）留空。
+    ///
+    /// 可空，`NULL` 是「没有归属到任何一段对话」，不是一段名叫 `unknown` 的对话：
+    /// 把所有没归属的调用并进一个占位，那一格就会读成全平台最贵的一段对话。
+    pub session: Option<String>,
     /// 拒掉这一发的是哪一级的上限，`QuotaScope::as_str()` 的取值
     /// （`user` / `ws`）；只在 `result = "refused_by_owner_budget"` 的行上有。
     ///
@@ -412,6 +427,14 @@ pub struct LlmUsageRecord {
     /// 推进滚动发布的那一天，旧进程写下的拒绝数不进任何一份，比把它们同时算进
     /// 两份数要好——后者会在发布当天把每一笔拒绝数两遍。
     pub refused_scope: Option<String>,
+    /// 模型侧为什么停了（`stop`／`length`／`tool_calls` …）；`None` 是上游没报。
+    pub finish_reason: Option<String>,
+    /// 首字时延（毫秒）；`None` 是没量到（非流式或没有内容帧）。
+    pub ttft_ms: Option<u64>,
+    /// 这一次提示由哪些段组成（每段 sha256，JSON 数组）；`None` 是这条路径没有请求体。
+    pub prompt_manifest: Option<String>,
+    /// 装配时挤掉了多少条更早的消息；`None` 是没量到或没裁。
+    pub prompt_dropped: Option<u32>,
     /// Wall time of the call; for streams this is first-byte to last-byte.
     pub latency_ms: u64,
     /// 窗口配速那一拍的读数，只在 `result = "refused_by_pace"` 的行上有。
@@ -422,7 +445,29 @@ pub struct LlmUsageRecord {
     pub pace: Option<PaceEvidence>,
 }
 
-/// One LLM exchange, bodies included.
+/// 封口读数：把整段读回来算出的哈希与长度。
+///
+/// 哈希与上游字节的哈希相等，才叫「无损」——不相等的那一行不比没有更强。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodySeal {
+    pub sha256: String,
+    pub bytes: u64,
+}
+
+/// 一段大对象上的正文：指针，加上封口读数（读过一次才有）。
+///
+/// `seal` 为 `None` 不是「没有正文」：指针指向的字节就在库里，只是封口那次回读失败了，
+/// 没人验证过它完整。这与「进程崩在中途、行还没写」是同一族读数（孤儿扫描会把它找出来），
+/// 而不是能靠「这一列空着」糊过去的东西——把一份存在却没验证过的正文写成「没有正文」，
+/// 正是这一族最忌的形状。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodyObject {
+    pub oid: u32,
+    pub seal: Option<BodySeal>,
+}
+
+/// One LLM exchange: what was asked, what came back, and where the permanent
+/// copy of each sits.
 ///
 /// The usage record beside it answers "how much"; this answers "what was
 /// asked and what came back". They are separate rows in separate tables
@@ -430,6 +475,14 @@ pub struct LlmUsageRecord {
 /// consumers: pacing and billing read the usage row on every window boundary
 /// and must not pay for text they never look at, while a person asking why a
 /// run burned 850k tokens reads one exchange and nothing else.
+///
+/// The bytes themselves do not live in this row. The row is swept at the
+/// deployment's retention and the table is read by the nightly backup, so a
+/// body here lasts as long as both allow; the copies are written to the memory
+/// Raw layer, which outlives every sweep, and this row is the index that names
+/// them. That split is also what makes the two sides comparable: the sizes and
+/// hashes stay here, so a reader can tell a short body from one this process
+/// could not hold without fetching either.
 #[derive(Debug, Clone)]
 pub struct LlmExchangeRecord {
     pub upstream: String,
@@ -442,22 +495,49 @@ pub struct LlmExchangeRecord {
     /// `error` (the upstream answered with a non-2xx body).
     pub result: String,
     pub latency_ms: u64,
-    /// SHA-256 of the exact bytes sent upstream, before redaction.
+    /// SHA-256 of the exact bytes sent upstream.
     pub request_sha256: String,
     /// SHA-256 of the response bytes; `None` when no response body existed.
     pub response_sha256: Option<String>,
+    /// How many bytes went upstream.
     pub request_bytes: u64,
-    pub response_bytes: u64,
-    /// Redacted text, capped by the caller and marked in `truncated` when it
-    /// was cut. `None` is the shape a caller uses when there were no bytes at
-    /// all -- a request path that builds no body of its own, for instance --
-    /// and is therefore distinct from `Some("")`, which is a body that was
-    /// empty. Both the size and the hash are taken before the cut, so a reader
-    /// can tell a short body from a long one that was clipped.
-    pub request_body: Option<String>,
-    pub response_body: Option<String>,
-    /// Which side was dropped for size: `""`, `request`, `response`, `both`.
-    pub truncated: String,
+    /// How many response bytes this process **saw**. Separate from
+    /// [`Self::response_bytes`] because the two answer different questions:
+    /// the captured count says how much the copy holds, and this one says how
+    /// much came back. A stream the gateway stops holding after a prefix leaves
+    /// the two unequal, and that inequality is the only trace of the bytes no
+    /// copy has.
+    pub response_seen_bytes: u64,
+    /// How many response bytes the permanent copy holds. Equal to
+    /// [`Self::response_seen_bytes`] unless the capture was cut, and `0` when
+    /// there was no body at all.
+    ///
+    /// `None` 是**另一件事**：正文写进了大对象却没有封口（回读失败），这时副本长度
+    /// 量不到。写成 `0` 会让「副本一个字节也没有」与「没量到」在读数上同形，而前者是
+    /// 一次真实读数。
+    pub response_bytes: Option<u64>,
+    /// 响应正文的大对象落点。**只有响应侧有指针**：请求正文在发出之前整段都在手上，
+    /// 直接写行内那一列；响应是流进来的，逐块写进大对象，行里只留指针。两侧不对称
+    /// 是因为两条路本来就不一样——给请求侧也开一段大对象，只是多三次数据库往返。
+    pub response_body_object: Option<BodyObject>,
+    /// The permanent copy of the bytes sent upstream, as the reference a reader
+    /// fetches it back by. `None` means no copy was made -- nothing is stored
+    /// under a name nobody can name.
+    ///
+    /// The id is the hash of the bytes, so one prompt sent a thousand times is
+    /// one object; the row still records each call, because which call sent it
+    /// is what the row is for.
+    pub request_raw: Option<String>,
+    /// The permanent copy of the response bytes `response_bytes` counts.
+    pub response_raw: Option<String>,
+    /// 没有归档副本时，正文**原样**写在这一格。
+    ///
+    /// 这一格存在只为一件事：正文不能因为「归档没配 / 归档拒绝 / 归档不可达」就
+    /// 消失。有副本时它是 `None`（正文在归档里，行只存键）；没有副本时它是那份字节
+    /// 本身——宁可这一行大，也不要这一行说了「有一次调用」却拿不出它说了什么。
+    pub request_inline: Option<String>,
+    /// 同上，响应那一侧。
+    pub response_inline: Option<String>,
 }
 
 /// One upstream's quota window as the ledger tells it.
@@ -713,6 +793,137 @@ pub struct PricedSpend {
     pub rows: Vec<PricedSpendRow>,
 }
 
+/// What one conversation cost, folded from the call rows that named it.
+///
+/// A conversation is not a smaller person: one person runs several at once, and
+/// each is a thing a reader asks the cost of. The rows already say which one
+/// (`LlmUsageRecord::session`), so this is a fold and not a second book.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionSpend {
+    /// Calls that reached an upstream and were metered, successful or failed.
+    ///
+    /// Rows a ceiling turned away are not here: they never reached an upstream,
+    /// so they carry no usage frame and no conversation either. A refused call
+    /// costs nothing, so leaving it out changes no total — what it would answer
+    /// is "how often was this conversation turned away", and that is a fact the
+    /// refusal itself tells the screen, at the moment it happens.
+    pub calls: u64,
+    /// The uncached half of the prompt, the same convention as every other
+    /// token figure on this ledger.
+    pub tokens_input: u64,
+    pub tokens_cached: u64,
+    pub tokens_output: u64,
+    /// 钱按币种分开：两种币种是两个数，不是一次汇率。
+    pub money: Vec<SessionMoney>,
+    /// Calls that ran but carried no price at all. Read beside
+    /// [`Self::money`]: a total whose unpriced count is not zero is a floor,
+    /// not a measurement.
+    pub unpriced_calls: u64,
+}
+
+/// One currency's worth of a conversation's spend.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionMoney {
+    /// `USD` / `CNY`, read off the price books these calls were priced from.
+    pub currency: String,
+    /// In the currency's millionths, over [`Self::priced_calls`] calls.
+    pub cost_micros: i64,
+    pub priced_calls: u64,
+}
+
+/// 一笔调用的两个落点：用量行与 `llm_call` 事实。实现必须让它们同生同灭。
+///
+/// 为什么不是一个「先写行、再写事件」的调用方约定：中间失败会留下「行领先于流」或
+/// 「事件领先于行」，两侧读者各少一半，而两种半都比整笔失败更难发现。把两处放进
+/// 同一个方法，是为了让调用方没有那个中间态可走。
+#[async_trait::async_trait]
+pub trait UsageLanding: Send + Sync {
+    /// 落一笔调用：行与事件在**同一个事务**里提交，成功之后才返回。
+    async fn land(&self, record: &LlmUsageRecord) -> Result<(), String>;
+}
+
+impl LlmUsageRecord {
+    /// 这笔调用的事件形状：身份由它落下的那一行派生（`row:{id}`）。
+    ///
+    /// 映射放在契约层：网关的 live 落账与回填写的是同一条事实，两处各拼一次
+    /// 键名时，加一格漏一处不会红。
+    pub fn as_call(&self, row_id: &str) -> crate::LlmCall {
+        crate::LlmCall {
+            call_id: crate::llm_call_id(row_id),
+            upstream: self.upstream.clone(),
+            api_style: self.api_style.clone(),
+            model: self.model.clone(),
+            result: self.result.clone(),
+            input_tokens: self.tokens_input,
+            output_tokens: self.tokens_output,
+            cached_tokens: self.tokens_cached,
+            cache_created_tokens: self.tokens_cache_created,
+            origin: self.origin.clone(),
+            owner: self.owner.clone(),
+            latency_ms: Some(self.latency_ms),
+            task_id: self.task.clone(),
+            actor: self.actor.clone(),
+            cost_micros: self.cost_micros,
+            price_book: self.price_book.clone(),
+            batch_id: self.task.clone(),
+            session: self.session.clone(),
+            pace: self
+                .pace
+                .as_ref()
+                .and_then(|p| serde_json::to_string(&p.upstreams).ok()),
+            tokens_reasoning: self.tokens_reasoning,
+            refusal_kind: self.refusal_kind.clone(),
+            retry_after_secs: self.retry_after_secs,
+            usage_outcome: self.usage_outcome.map(|o| o.as_str().to_string()),
+            estimated_input: self.estimated_input,
+            refused_scope: self.refused_scope.clone(),
+            finish_reason: self.finish_reason.clone(),
+            ttft_ms: self.ttft_ms,
+            prompt_manifest: self.prompt_manifest.clone(),
+            prompt_dropped: self.prompt_dropped,
+            at: chrono::Utc::now(),
+        }
+    }
+}
+
+/// 每一个用量读口，此刻从哪儿取数。
+///
+/// `stream`：从事件流算（实现里有 `<name>_from_stream`）；`ledger`：还读用量行；
+/// `write`：写口不是读口；`window`：配速窗口状态自己的读数。判据在
+/// `crates/cogneva/tests/every_usage_reader_names_its_source_test.rs`：trait 里的每个
+/// 方法都要有这一行，少一行就是「这个数从哪来」没人答。
+pub const USAGE_READER_SOURCES: &[(&str, &str)] = &[
+    ("land", "write"),
+    ("record", "write"),
+    ("record_exchange", "write"),
+    ("record_window", "write"),
+    ("upstream_window", "window"),
+    ("stored_window", "window"),
+    ("stored_windows", "window"),
+    ("burned_between", "stream"),
+    ("spent_since", "stream"),
+    ("spend_by_actor_since", "stream"),
+    ("spend_by_upstream_and_actor", "stream"),
+    ("task_cost_quantile", "stream"),
+    ("task_has_started", "stream"),
+    ("spend_for_session", "stream"),
+    ("spend_by_task", "stream"),
+    ("priced_spend_between", "stream"),
+    ("spend_by_person_since", "stream"),
+    ("spend_by_workspace_since", "stream"),
+    ("spend_total_since", "stream"),
+    ("refusals_by_person_since", "stream"),
+    ("refusals_by_workspace_since", "stream"),
+    ("refusals_total_since", "stream"),
+    ("spend_by_task_since", "stream"),
+    ("task_attribution", "stream"),
+    ("unattributed_between", "stream"),
+    ("outcomes_between", "stream"),
+    ("metering_between", "stream"),
+    ("skips_between", "stream"),
+    ("verdicts_between", "stream"),
+];
+
 /// The writing and window-reading face of the spend ledger.
 ///
 /// Separate from the reporting face ([`crate::LlmUsageReader`]) because the two
@@ -726,8 +937,11 @@ pub struct PricedSpend {
 /// that never see the database, and a failure here is only ever logged.
 #[async_trait::async_trait]
 pub trait LlmUsageLedger: Send + Sync {
-    /// Land one metered call.
-    async fn record(&self, record: &LlmUsageRecord) -> Result<(), String>;
+    /// Land one metered call and answer **the row id it wrote**.
+    ///
+    /// 事件流里那一笔调用的身份由这一格派生（`row:{id}`），回填也用同一个拼法：
+    /// 两条路只有一套身份，同一行既走过 live 又被回填时写不出第二条事实。
+    async fn record(&self, record: &LlmUsageRecord) -> Result<String, String>;
 
     /// Land one exchange's bodies.
     async fn record_exchange(&self, record: &LlmExchangeRecord) -> Result<(), String>;
@@ -819,6 +1033,19 @@ pub trait LlmUsageLedger: Send + Sync {
     /// Whether the named task has ever landed a call on this ledger.
     async fn task_has_started(&self, task: &str) -> Result<bool, String>;
 
+    /// What the calls that named `session` cost, or `None` when no row does.
+    ///
+    /// Across the whole record, not a day: a conversation's cost is its own
+    /// history, it ends when the conversation does, and asking it for "today"
+    /// would reset a session that spans midnight to a number that contradicts
+    /// every turn the reader watched go by.
+    ///
+    /// `None` is "this ledger holds no call that named this conversation",
+    /// which is what a deployment whose calls do not carry the header answers
+    /// for every session — never a zero, because a zero reads as "it cost
+    /// nothing" and that would be a measurement nobody took.
+    async fn spend_for_session(&self, session: &str) -> Result<Option<SessionSpend>, String>;
+
     /// Tokens spent by each of the named tasks, `(task_id, tokens)`.
     ///
     /// Tasks that never spent are absent rather than zero: a job that has not
@@ -850,14 +1077,23 @@ pub trait LlmUsageLedger: Send + Sync {
 
     /// Tokens spent since `since_unix`, per person, `(person, tokens)`.
     ///
-    /// Two rows resolve to the same person by different evidence, and both are
-    /// written down at the moment the call is made rather than reconstructed
-    /// here: a call that stated an owner carries it on the row; a call made for
-    /// a task carries the task, and the person is whoever submitted that task.
-    /// The second half is a join rather than a second accumulator because the
-    /// task row is where a submitter is written once for a whole piece of work
-    /// — asking every call site to restate it would be the same fact kept in
-    /// two places, and the two disagree the first time one is forgotten.
+    /// Three layers of evidence resolve a call to a person, from the most
+    /// specific down, and every one of them is written down at the moment the
+    /// call or the attempt is made rather than reconstructed here:
+    ///
+    /// 1. a call that stated an owner carries it on the row — that is the
+    ///    payer the caller itself named (an identified conversation);
+    /// 2. failing that, the attempt the call falls inside carries the person:
+    ///    `task_attempt.person` is the employee number the dispatch wrote when
+    ///    the row was claimed. The seat is not a person — `squad:<task>-<seat>`
+    ///    is born and dies with the task, so keying spend on it turns one
+    ///    employee into as many people as the tasks they touched;
+    /// 3. failing that, the task's submitter.
+    ///
+    /// The latter two are joins rather than second accumulators because each
+    /// fact is written once, on its own row — asking every call site to restate
+    /// a person would be the same fact kept in two places, and the two disagree
+    /// the first time one is forgotten.
     ///
     /// People who spent nothing are absent, not zero: this feeds a projection
     /// that rewrites cells a ceiling is judged against, and writing a zero for

@@ -23,11 +23,14 @@ use sqlx::{PgPool, Row};
 use cog_core::{DecisionStatCell, DecisionStatsStore, SFError, SFResult};
 
 /// The widths the keyed columns were created with.
-// cap: bound — 建键列当初用的那个宽度
+// cap: fixed — 建键列当初用的那个宽度
+// not-a-bound: 建键列当初用的那个宽度
 const CATEGORY_MAX: usize = 32;
-// cap: bound — the group-key column width, a schema limit rather than a measurement
+// cap: fixed — the group-key column width, a schema limit rather than a measurement
+// keep: 删掉后 group-key 列超出索引上限，统计表建不出索引；由「schema 上限」兜住
 const GROUP_MAX: usize = 191;
-// cap: bound — the decision column width, a schema limit rather than a measurement
+// cap: fixed — the decision column width, a schema limit rather than a measurement
+// keep: 删掉后 decision 列超出索引上限，统计表建不出索引；由「schema 上限」兜住
 const DECISION_MAX: usize = 191;
 
 /// Add one cell's worth of evidence. The conflict clause adds rather than

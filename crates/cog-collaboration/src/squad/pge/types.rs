@@ -31,6 +31,13 @@ pub struct TaskSpec {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub acceptance: Vec<String>,
+    /// 这一片交什么，由分解读这件活得出，闭集与任务行的 `delivers` 相同。
+    ///
+    /// 计划是平台自己的生产者：它比任何外部提交者都更清楚这一片要交出哪种产物，
+    /// 让它在分解时说出来，任务行才能带着来源而不是「没人说」进入派发。说不出时
+    /// 留空，入口落成 `Unstated`，不拿 `task_type`（座位）反推一个形状。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivers: Option<String>,
 }
 
 /// Output produced by a Planner agent.
@@ -41,6 +48,11 @@ pub struct PlannerOutput {
     /// Machine-consumable structured plan.
     pub plan: serde_json::Value,
     /// Atom tasks decomposed from the meta-task.
+    ///
+    /// **可缺省**：planner 交出来的是这一类的定义与每条待办的三格；要不要拆成
+    /// 原子任务由执行面决定。缺这一格时按空列表读（自演化的计划本来就是空），
+    /// 而不是把一份只写了定义的计划判成解析失败。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sub_tasks: Vec<TaskSpec>,
     /// Verifiable acceptance criteria the Evaluation stage must check one by one.
     /// Empty means the plan imposes no explicit gate and the evaluator falls back
@@ -65,6 +77,137 @@ pub struct PlannerOutput {
     /// emit targets yet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub targets: Vec<String>,
+    /// 这一份计划要人做的那几条**待办**，每条只带三样：终态、现在、差距。
+    ///
+    /// 判词只读 `terminal`——它是讨论里说定的那段描述，允许散文；`acceptance_criteria`
+    /// 与 `targets` 是同一件事的另外两份写法（一个说判什么、一个说要改哪），
+    /// 三份并存就会漂：判的地方与改的地方对不上，而谁也不会红。这一格存在之后，
+    /// 那两格只作为兼容输入读，不再作为判据。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<cog_core::contract::ledger_item::LedgerItem>,
+    /// 这一类活是什么、这一类里怎样算做完——planner 交出来的**定义**，不是步骤表。
+    ///
+    /// 步骤表由执行的人自己排；定义才是判据审要对着读的那段话：它既约束「这一条
+    /// 终态像不像这一类」，也约束「做完的样子」。没有它时判据只能就事论事。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<String>,
+}
+
+impl PlannerOutput {
+    /// 这一份计划要判的那几条待办。
+    ///
+    /// 计划没写 `items` 时**不是空批**：那是「这一版 planner 的契约还没点名这一格」
+    /// （部署侧的 prompt skill 决定答案形状，平台改不了它）。这时从每一片的
+    /// `acceptance` 派生出待办——那本来就是这一片「怎样算做完」的那句话，判据仍是
+    /// 它，只是换了个更窄的载体。派生出来的是**借用**：`items` 为空时，调用方用
+    /// [`Self::derived_items`] 拿到那份借来的清单。
+    pub fn ledger_items(&self) -> &[cog_core::contract::ledger_item::LedgerItem] {
+        &self.items
+    }
+
+    /// 契约没点名 `items` 时，从每一片的 `acceptance` 派生出的待办。
+    ///
+    /// 返回空表示这一份计划既没有 `items`、也没有任何一片写了验收：那是真的没有
+    /// 可判的东西，不是「全部通过」。
+    pub fn derived_items(&self) -> Vec<cog_core::contract::ledger_item::LedgerItem> {
+        self.sub_tasks
+            .iter()
+            .filter(|t| !t.acceptance.is_empty())
+            .map(|t| cog_core::contract::ledger_item::LedgerItem {
+                id: t.id.clone(),
+                terminal: t.acceptance.join("；"),
+                now: String::new(),
+                gap: String::new(),
+                state: cog_core::contract::ledger_item::LedgerState::Open,
+            })
+            .collect()
+    }
+
+    /// 这一份计划要判的待办：契约写的优先，没写就从各片的验收派生。
+    pub fn judged_items(&self) -> Vec<cog_core::contract::ledger_item::LedgerItem> {
+        if self.items.is_empty() {
+            self.derived_items()
+        } else {
+            self.items.clone()
+        }
+    }
+}
+
+/// 判据审的判词：这一条终态是不是「做完的样子」、能不能被证据判、是不是意图要的那件事。
+///
+/// 与完成判分开：完成判答「终态到了没有」，判据审答「这段描述本身立不立得住」。
+/// 两问由两次不同的调用回答，谁都不替对方作证。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CriterionVerdict {
+    /// 这一条待办。
+    pub id: String,
+    /// 立不立得住。
+    pub ok: bool,
+    /// 不成立时，缺的是什么（点名到「不是做完的样子 / 判不了 / 不是意图要的」哪一问）。
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[cfg(test)]
+mod ledger_items_tests {
+    use super::*;
+
+    /// 契约没点名 `items` 时，从每一片的 `acceptance` 派生：判据仍是那一句，
+    /// 只是换了个更窄的载体。派生不出来（没有一片写了验收）就是空，不是「全过」。
+    /// 只交定义与三格、完全不写 `sub_tasks` 的答案要读得回来：空列表。
+    ///
+    /// 拆不拆是执行面的事；解析器把「没写这一格」读成解析失败，等于把
+    /// 「定义就是产出」的形状挡在门外。
+    #[test]
+    fn a_definition_only_answer_parses_with_no_sub_tasks() {
+        let plan: PlannerOutput = serde_json::from_value(serde_json::json!({
+            "summary": "s",
+            "plan": {"approach": "one paragraph"},
+            "definition": "这一类：每一轮都带着它需要的全部；做完＝每一轮都不缺",
+            "items": [{
+                "id": "N1",
+                "terminal": "窗口里每一轮都带着它需要的全部",
+                "now": "还没做",
+                "gap": "缺的是：窗口装配",
+                "state": "未落"
+            }]
+        }))
+        .expect("只写定义与三格的计划要能解析");
+        assert!(plan.sub_tasks.is_empty());
+        assert!(plan.definition.is_some());
+        assert_eq!(plan.items.len(), 1);
+    }
+
+    #[test]
+    fn items_are_derived_from_the_acceptance_when_the_contract_names_none() {
+        let mut plan = PlannerOutput {
+            definition: None,
+            summary: "s".into(),
+            plan: serde_json::json!({}),
+            sub_tasks: vec![TaskSpec {
+                id: "t1".into(),
+                name: "n".into(),
+                task_type: "generate".into(),
+                input: serde_json::json!({}),
+                blocked_by: Vec::new(),
+                acceptance: vec!["the answer names the exact version".into()],
+                delivers: None,
+            }],
+            acceptance_criteria: Vec::new(),
+            targets: Vec::new(),
+            items: Vec::new(),
+        };
+        let derived = plan.judged_items();
+        assert_eq!(derived.len(), 1);
+        assert_eq!(derived[0].id, "t1");
+        assert_eq!(derived[0].terminal, "the answer names the exact version");
+
+        plan.sub_tasks[0].acceptance.clear();
+        assert!(
+            plan.judged_items().is_empty(),
+            "没有验收可派生的计划不该被读成「全部通过」"
+        );
+    }
 }
 
 /// Whether an in-band cause says this role produced nothing: the transport never
@@ -612,17 +755,34 @@ pub struct EvaluationResult {
 }
 
 impl EvaluationResult {
-    /// Whether the evaluator never judged anything because its own ReAct loop
-    /// spent its whole iteration budget. The raw payload is read structurally
-    /// rather than by scanning the feedback: that feedback is prose about
-    /// somebody else's work, so a deterministic-sounding failure named inside
-    /// it is a judgement the evaluator made, not a cause the evaluator suffered.
+    /// Whether the evaluator never judged anything because the environment took
+    /// the call away from it: its own ReAct loop spent its whole iteration
+    /// budget, or its prompt never reached the upstream.
     ///
-    /// Without this the exhausted run comes back as a bare `Fail` with empty
-    /// feedback — indistinguishable from an evaluator that read the attempt and
-    /// found it wanting — and buys a full round of local repairs plus every
-    /// configured retry, none of which can judge anything either.
+    /// The raw payload is read structurally rather than by scanning the
+    /// feedback: that feedback is prose about somebody else's work, so a
+    /// deterministic-sounding failure named inside it is a judgement the
+    /// evaluator made, not a cause the evaluator suffered. The cause a role
+    /// carries for its own failed call lives in a *string* `details` value, the
+    /// same shape [`PlannerOutput::is_terminal_env_failure`] gives its `plan`
+    /// slot; the iteration budget arrives as the object the runtime wrote.
+    ///
+    /// Without this an unanswered call comes back as a bare `Fail` —
+    /// indistinguishable from an evaluator that read the attempt and found it
+    /// wanting — and buys a full round of local repairs plus every configured
+    /// retry, none of which can judge anything either. It is also filed in the
+    /// ledger and counted in the roundtable's consensus as a verdict on the
+    /// work, which nobody ever judged.
     pub fn terminal_env_failure_reason(&self) -> Option<String> {
+        if let Some(detail) = self.details.as_ref().and_then(serde_json::Value::as_str) {
+            if names_a_deterministic_cause(detail) {
+                return Some(format!(
+                    "{}: evaluator {}",
+                    declaration_for_cause(detail),
+                    detail.trim()
+                ));
+            }
+        }
         let cause = iteration_budget_exhausted_reason(self.details.as_ref()?)?;
         Some(format!("{TERMINAL_ENV_FAILURE_PREFIX}: evaluator {cause}"))
     }
@@ -832,6 +992,71 @@ pub fn best_scored<'a>(judged: &[&'a PgeBranchResult]) -> Option<&'a PgeBranchRe
         .max_by_key(|b| b.outcome.judgement().and_then(|e| e.score).unwrap_or(0))
 }
 
+/// 落选的那一份候选，和它为什么没成。
+///
+/// 「记得上一次试过什么、为什么没成」靠的就是这一格：选中的那一份进了产物，
+/// 落选的若只剩一个 `branch_id`，下一轮读到的只有「试过」，没有「为什么没成」，
+/// 同一个坑就会再踩一次。落选分两种，读数时分开：**判过但不如果**——带上它的
+/// 判词与分；**没被判过**——明写没到判，不能读成「判了不通过」。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RejectedCandidate {
+    pub branch_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<Verdict>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<u32>,
+    pub reason: String,
+}
+
+/// 一轮里除选中的那一份之外，每一份的去处。`chosen` 为 `None` 时（整轮没判成）
+/// 每一支都算落选，各自的理由照写。
+pub fn rejected_candidates(
+    branches: &[PgeBranchResult],
+    chosen: Option<u32>,
+) -> Vec<RejectedCandidate> {
+    branches
+        .iter()
+        .filter(|b| Some(b.branch_id) != chosen)
+        .map(|b| match &b.outcome {
+            RoundOutcome::Judged { evaluation } => RejectedCandidate {
+                branch_id: b.branch_id,
+                verdict: Some(evaluation.verdict),
+                score: evaluation.score,
+                reason: if evaluation.feedback.trim().is_empty() {
+                    format!("{:?} without a stated reason", evaluation.verdict)
+                } else {
+                    evaluation.feedback.clone()
+                },
+            },
+            RoundOutcome::Stopped { cause, product } => RejectedCandidate {
+                branch_id: b.branch_id,
+                verdict: None,
+                score: None,
+                reason: format!("no judgement: {} ({product:?})", cause.reason()),
+            },
+        })
+        .collect()
+}
+
+/// 下一轮读到的历史：每一轮的产出、判词，与**落选的理由**。
+///
+/// 不把候选全文搬进来：候选本身的体积由各自的产物格带着，这里只回答
+/// 「上一轮试过别的方式吗、为什么没过」。
+pub fn round_history_doc(history: &[PgeRoundtableIteration]) -> Vec<serde_json::Value> {
+    history
+        .iter()
+        .map(|h| {
+            serde_json::json!({
+                "iteration": h.iteration,
+                "plan": &h.plan,
+                "generation": &h.generation,
+                "outcome": &h.outcome,
+                "rejected": h.merge_summary.as_ref().map(|m| &m.rejected),
+            })
+        })
+        .collect()
+}
+
 /// Strategy for merging parallel branch results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -858,6 +1083,10 @@ pub struct MergeSummary {
     pub selected_branch_id: Option<u32>,
     pub strategy: BranchMergeStrategy,
     pub reasoning: String,
+    /// 落选的每一份与它的理由：选中的进了产物，这些留在这里，下一轮从
+    /// [`round_history_doc`] 里读到「试过什么、为什么没成」。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected: Vec<RejectedCandidate>,
 }
 
 /// A single roundtable iteration.
@@ -893,11 +1122,13 @@ mod tests {
     #[test]
     fn planner_output_roundtrip_preserves_criteria() {
         let output = PlannerOutput {
+            definition: None,
             summary: "s".into(),
             plan: serde_json::json!({}),
             sub_tasks: Vec::new(),
             acceptance_criteria: vec!["answer states the exact version".into()],
             targets: Vec::new(),
+            items: Vec::new(),
         };
         let value = serde_json::to_value(&output).unwrap();
         let back: PlannerOutput = serde_json::from_value(value).unwrap();
@@ -909,11 +1140,13 @@ mod tests {
     #[test]
     fn an_empty_but_real_plan_is_not_an_environment_failure() {
         let output = PlannerOutput {
+            definition: None,
             summary: "nothing to decompose".into(),
             plan: serde_json::json!({}),
             sub_tasks: Vec::new(),
             acceptance_criteria: Vec::new(),
             targets: Vec::new(),
+            items: Vec::new(),
         };
         assert!(!output.is_terminal_env_failure());
         assert!(output.terminal_env_failure_reason().is_none());
@@ -923,6 +1156,7 @@ mod tests {
     #[test]
     fn a_plan_that_never_reached_its_upstream_carries_the_real_cause() {
         let output = PlannerOutput {
+            definition: None,
             summary: "Planner prompt did not reach its upstream: HTTP 503".into(),
             plan: serde_json::Value::String(
                 "environment_error: HTTP 503 upstream unavailable".into(),
@@ -930,6 +1164,7 @@ mod tests {
             sub_tasks: Vec::new(),
             acceptance_criteria: Vec::new(),
             targets: Vec::new(),
+            items: Vec::new(),
         };
         assert!(output.is_terminal_env_failure());
         let reason = output.terminal_env_failure_reason().unwrap();
@@ -960,6 +1195,7 @@ mod tests {
     #[test]
     fn a_refusal_the_environment_can_clear_is_declared_unavailable_not_terminal() {
         let planner = |cause: &str| PlannerOutput {
+            definition: None,
             summary: "planner prompt failed".into(),
             plan: serde_json::Value::String(format!(
                 "environment_error: LLM upstream refused ({cause}): HTTP 503 upstream unavailable"
@@ -967,6 +1203,7 @@ mod tests {
             sub_tasks: Vec::new(),
             acceptance_criteria: Vec::new(),
             targets: Vec::new(),
+            items: Vec::new(),
         };
 
         // 环境自己会清掉的三档：占位关系不变（下游照样不能当交付物），但声明
@@ -1112,6 +1349,43 @@ mod tests {
             reason.contains("evaluator") && reason.contains("iteration budget"),
             "the reason must say which role spent what, got: {reason}"
         );
+    }
+
+    /// 评委调用本身失败时，角色把真因按同一条线格带进 `details` 的字符串里
+    /// ——与 planner 的 `plan`、generator 的 `content` 是同一个形状。它必须被
+    /// 认成「没判定」；只有字符串确实点名了确定性病因时才算，模特写进
+    /// `details` 的散文（对象）不参与这条判据。
+    #[test]
+    fn a_carried_upstream_error_on_the_evaluator_is_not_a_verdict() {
+        let mut result = EvaluationResult {
+            verdict: Verdict::Fail,
+            feedback: "Evaluator prompt did not reach its upstream".into(),
+            score: None,
+            criteria: Vec::new(),
+            details: Some(serde_json::Value::String(
+                cog_core::contract::outcome::environment_error_content(
+                    "HTTP 503 upstream unavailable",
+                ),
+            )),
+        };
+        let reason = result
+            .terminal_env_failure_reason()
+            .expect("a call that never reached its upstream judged nothing");
+        assert!(
+            reason.contains("HTTP 503 upstream unavailable"),
+            "the real cause must survive into the reason, got: {reason}"
+        );
+        assert!(
+            reason.contains("evaluator"),
+            "the reason must name which role did not answer, got: {reason}"
+        );
+
+        // A string that names no cause is not a declaration, and an object
+        // payload is the evaluator's own review rather than its own failure.
+        result.details = Some(serde_json::Value::String("looks fine to me".into()));
+        assert_eq!(result.terminal_env_failure_reason(), None);
+        result.details = Some(serde_json::json!({"environment_error": "mentioned in a review"}));
+        assert_eq!(result.terminal_env_failure_reason(), None);
     }
 
     /// What came of asking the model straight out for an answer is part of the

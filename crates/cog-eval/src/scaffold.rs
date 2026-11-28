@@ -22,7 +22,8 @@ use crate::metric::StepRecord;
 ///
 /// 逐类比照公开模型值，不额外放宽；上下文是评测里最容易被「给多一点」吃掉
 /// 可变性的地方——同一道题给不同流派不同的窗口，读数就不可比了。
-// cap: derived — 逐类比照公开模型值，没有额外放宽
+// cap: fixed — 逐类比照公开模型值，没有额外放宽
+// keep: 删掉后脚手架不再声明窗口，超窗请求由上游拒收并判成模型失败；由「公开模型卡」兜住
 const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 512 * 1024;
 
 /// 外壳跑完一题交回来的东西。
@@ -50,12 +51,13 @@ pub enum FinishReason {
     StepBudget,
     /// 撞到上下文上限。
     ContextBudget,
-    /// 撞到组合根给这一行设的上限（时间 / CPU / 内存）。
+    /// 撞到组合根给这一行设的上限（CPU / 内存）。
     ///
     /// 只在**循环不在我们手里**的外壳上出现：外部流派的循环是别人写的，步数管不到它，
-    /// 能管的只有时间与这台机器分给它的资源。它与 [`Failed`] 必须分开——`Failed` 是它
-    /// 自己说做不下去，这一条是**我们设的界**把它收走了：前者要换方法，后者要问一句
-    /// 上限是不是给少了。
+    /// 能管的只有这台机器分给它的资源。时间不在其中——它不区分「慢」与「停住」，
+    /// 一道难题跑得久不是它错了（见 `cog_core::progress`）。它与 [`Failed`] 必须分开——
+    /// `Failed` 是它自己说做不下去，这一条是**我们设的界**把它收走了：前者要换方法，
+    /// 后者要问一句上限是不是给少了。
     ///
     /// [`Failed`]: FinishReason::Failed
     ResourceLimit,
@@ -72,13 +74,25 @@ pub struct Budget {
     pub temperature: f32,
 }
 
+// 五百步：四个外壳、三个基准共用这一份；公开榜单的求解步数落在几百的量级，
+// 再高就不是「同一份预算下比外壳」了。
+// cap: fixed — 五百步：公开榜单的求解步数在几百的量级，再高就不是同一份预算
+// keep: 删掉后解题步数无界，预算与公开榜单不可比；由「公开榜单的几百步量级」兜住
+const DEFAULT_MAX_STEPS: usize = 500;
+
+// 采样温度 1.0 是提供方的默认值，不是这台机器调的：评测要比的是外壳，不是
+// 采样策略，所以用发布方给出的那一个。
+// cap: fixed — 提供方的采样默认值（温度 1.0），评测不比采样策略
+// keep: 删掉后采样温度交由各上游默认，评测与公开榜单不再同一采样策略；由「提供方采样默认」兜住
+const DEFAULT_TEMPERATURE: f32 = 1.0;
+
 impl Default for Budget {
     fn default() -> Self {
         // 逐类比照公开值，不额外加工具、不放松上限。
         Self {
-            max_steps: 500,
+            max_steps: DEFAULT_MAX_STEPS,
             max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
-            temperature: 1.0,
+            temperature: DEFAULT_TEMPERATURE,
         }
     }
 }
@@ -305,6 +319,39 @@ pub trait AgentScaffold: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 求解预算的步数上限与采样温度只有一处声明：默认值读常量，常量上面写着它由什么钉住。
+    ///
+    /// 两面一起钉：运行时默认值等于常量（改常量就改默认值），源码面
+    /// `impl Default` 的字段里不再有数字（下一笔写回裸字面量就红）。
+    #[test]
+    fn the_budget_default_reads_its_names() {
+        let budget = Budget::default();
+        assert_eq!(budget.max_steps, DEFAULT_MAX_STEPS);
+        assert_eq!(budget.temperature, DEFAULT_TEMPERATURE);
+        let body = include_str!("scaffold.rs")
+            .split("impl Default for Budget")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    let value = value.trim().trim_end_matches(',');
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.starts_with(|c: char| c.is_ascii_digit())
+                        // 哨兵 0 与空串不是旋钮，是「没写」。
+                        && value != "0"
+                })
+            })
+            .map(str::trim)
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
+    }
 
     fn native_tool(name: &str) -> Tool {
         Tool {

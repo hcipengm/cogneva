@@ -14,8 +14,9 @@ use crate::error::{SupervisorError, SupervisorResult};
 /// [`AgentRegistry::check_expired`]. Aligns with the default TTL used by
 /// Redis and etcd agent registries (30 seconds) so the Supervisor's view
 /// of liveness matches the Agent's self-registered TTL.
-// cap: bound — 与 Agent 自注册的 TTL 同值，否则 Supervisor 眼里的存活与 Agent 自己声明的对不上
-pub const DEFAULT_HEARTBEAT_TTL_SECONDS: u64 = 30;
+/// 与 agent 自己注册时用的是同一个数（`cog_core::config::AGENT_REGISTRATION_TTL_SECS`）：
+/// 两处各写一个 30，监督者眼里的存活迟早与 agent 自己声明的对不上。
+pub const DEFAULT_HEARTBEAT_TTL_SECONDS: u64 = cog_core::config::AGENT_REGISTRATION_TTL_SECS;
 
 /// The role a unit takes when it writes its presence from outside the platform.
 ///
@@ -33,7 +34,8 @@ pub const DEFAULT_HEARTBEAT_TTL_SECONDS: u64 = 30;
 /// word, and a second spelling would leave one side unable to recognise the
 /// units the other one registered.
 pub const EXTERNAL_WORKER_ROLE: &str = cog_core::roles::EXTERNAL_WORKER;
-// cap: bound — heartbeat records kept per agent; a ring depth, not a measured history
+// cap: fixed — heartbeat records kept per agent; a ring depth, not a measured history
+// keep: 删掉后每个 agent 的心跳历史无界，ring 深度跟着运行时长走；由「a ring depth」兜住
 pub const HEARTBEAT_HISTORY_MAX: usize = 1000;
 
 /// The heartbeat vocabulary lives in `cog_core`: the supervisor fills the
@@ -76,7 +78,8 @@ pub struct CrewInfo {
 }
 
 impl CrewInfo {
-    // cap: bound — three crew-level retries before the failure is escalated; a policy cap
+    // cap: fixed — three crew-level retries before the failure is escalated; a policy cap
+    // keep: 删掉后班组失败被无限重试，升级永远不发生；由「三次之后升级」兜住
     pub const MAX_CREW_RETRIES: u32 = 3;
 
     pub fn new(crew_id: impl Into<String>) -> Self {
@@ -595,19 +598,6 @@ impl AgentRegistry {
         match self.agent_registry.as_ref() {
             Some(reg) => reg.list_by_role(role).await.map_err(|e| {
                 SupervisorError::Registry(format!("global registry list_by_role failed: {e}"))
-            }),
-            None => Ok(Vec::new()),
-        }
-    }
-
-    /// List agents by capability from the global registry, if attached.
-    pub async fn list_registered_agents_by_capability(
-        &self,
-        capability: &str,
-    ) -> SupervisorResult<Vec<cog_core::AgentRegistration>> {
-        match self.agent_registry.as_ref() {
-            Some(reg) => reg.list_by_capability(capability).await.map_err(|e| {
-                SupervisorError::Registry(format!("global registry list_by_capability failed: {e}"))
             }),
             None => Ok(Vec::new()),
         }

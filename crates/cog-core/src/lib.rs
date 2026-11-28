@@ -1,7 +1,78 @@
+/// 一个 Result 出错时用缺省值继续，并把这个错误记下来。
+///
+/// `unwrap_or(默认值)` 在接收者不是 Result 时过不了编译——那正是这条宏与编译器的
+/// 分工：能改成它的，是「有一个错误被换成了默认值」，于是必须记下来；改不成的，
+/// 那个缺省值只是在补一个缺席的值，不是吞一个错误。
+#[macro_export]
+macro_rules! or_lost {
+    ($e:expr, $d:expr) => {{
+        match $e {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::debug!(error = ?err, "an error was replaced by a default here");
+                $d
+            }
+        }
+    }};
+}
+
+/// 丢掉一个结果时把错误记下来：`let _ = expr;` 的替代。
+///
+/// 「丢掉」在账面上与「没有出错」同形；这条宏把它变成一条带位置的 debug 记录，
+/// 于是「这一步失败过」读得出来，而不是只剩静默。
+/// 读取失败时按缺省值继续，但把错误**记下来**：`unwrap_or` / `unwrap_or_default`
+/// 在错误上静默换成空值的替代。`source` 是那一格自己的表达式，日志里看得见是哪一次读。
+#[macro_export]
+macro_rules! logged_default {
+    ($e:expr) => {{
+        match $e {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(error = ?err, source = stringify!($e), "读取失败，按缺省值继续");
+                Default::default()
+            }
+        }
+    }};
+    ($e:expr, $default:expr) => {{
+        match $e {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(error = ?err, source = stringify!($e), "读取失败，按声明的缺省值继续");
+                $default
+            }
+        }
+    }};
+}
+
+/// 读取失败时按「没有」传递，并把错误记下来：`Result::ok()` 在错误上静默变成
+/// `None` 的替代。调用点按 `None` 分支走，日志里留有这一次读为什么是空的。
+#[macro_export]
+macro_rules! logged_ok {
+    ($e:expr) => {{
+        match $e {
+            Ok(value) => Some(value),
+            Err(err) => {
+                tracing::debug!(error = ?err, source = stringify!($e), "读取失败，按「没有」传递");
+                None
+            }
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! ignore_lost {
+    ($e:expr) => {{
+        if let Err(err) = $e {
+            tracing::debug!(error = ?err, "a result was dropped here; see this location");
+        }
+    }};
+}
+
 pub mod admission;
 pub mod atomic_write;
 pub mod attempt_journal;
 pub mod audit;
+pub mod bound;
 pub mod build_cache;
 pub mod build_cache_readings;
 pub mod build_cache_reclaim;
@@ -11,32 +82,37 @@ pub mod config_sections;
 pub mod contract;
 pub mod day;
 pub mod day_key;
+pub mod declared_wall;
 pub mod env;
 pub mod error;
+pub mod excerpt;
 pub mod fs_size;
 pub mod git_budget;
 pub mod host;
 pub mod loop_health;
 pub mod observability_text;
+pub mod pacing;
 pub mod paths;
 pub mod progress;
 pub mod reading_cadence;
 pub mod retention;
 pub mod roles;
 pub mod secrets;
-pub mod self_scheduled_wake;
 pub mod sql;
+pub mod stagnation;
 pub mod token_estimate;
 pub mod topology;
 pub mod types;
 pub mod vocabulary;
 
 pub use audit::{verify_chain, AuditEvent, AuditKind, AuditStream, ChainVerification};
+pub use bound::{Bound, BoundSource};
 pub use config::*;
 pub use contract::agent::*;
 pub use contract::alerts::*;
 pub use contract::auth::*;
 pub use contract::backup_run::*;
+pub use contract::body_store::*;
 pub use contract::change_ledger::*;
 pub use contract::codec::*;
 pub use contract::context_builder::*;
@@ -45,8 +121,16 @@ pub use contract::dataset::*;
 pub use contract::decision_stats::*;
 pub use contract::dlq::*;
 pub use contract::embedding::*;
+pub use contract::employee_events;
+pub use contract::employee_events::*;
 pub use contract::eval::*;
 pub use contract::event::*;
+pub use contract::event_envelope::*;
+pub use contract::event_fact::*;
+pub use contract::event_id::*;
+pub use contract::event_kinds::*;
+pub use contract::event_log::*;
+pub use contract::event_payload::*;
 pub use contract::evolution_admin::*;
 pub use contract::face_registry::*;
 pub use contract::fault::*;
@@ -54,17 +138,22 @@ pub use contract::governance_acts::*;
 pub use contract::guardrail::*;
 pub use contract::hook::*;
 pub use contract::host_documents;
+pub use contract::intent_events::*;
 pub use contract::knowledge::*;
 pub use contract::kv::*;
 pub use contract::live_revision::*;
 /// Retry judgement for LLM refusals: the typed `UpstreamFailure` here, the
 /// in-band deterministic-failure predicates under `contract::outcome`.
 pub use contract::llm::*;
+pub use contract::llm_call_event::*;
 pub use contract::media::*;
 pub use contract::memory::*;
+pub use contract::message_events;
+pub use contract::message_events::*;
 pub use contract::metric_help::{documented_metric_names, metric_description, metric_help_text};
 pub use contract::metric_names;
 pub use contract::metric_names::{is_registered_metric, metric_name_of_ident, MetricName};
+pub use contract::model_windows;
 pub use contract::net::*;
 pub use contract::notification::*;
 pub use contract::observability::*;
@@ -73,6 +162,8 @@ pub use contract::owner_lease;
 pub use contract::owner_lease::{OwnerLease, OwnerLeaseBroker, Ownership, RoleClaim, RoleHold};
 pub use contract::pge_stage::*;
 pub use contract::plugin::*;
+pub use contract::principle_bundle::*;
+pub use contract::principle_bundle_sealed::*;
 pub use contract::principle_ledger::*;
 pub use contract::project_audit::*;
 pub use contract::project_kind::*;
@@ -83,7 +174,11 @@ pub use contract::reflection::*;
 pub use contract::reranker::*;
 pub use contract::resilience::*;
 pub use contract::resource_ledger::*;
+pub use contract::resume_point::*;
+pub use contract::round_batch::*;
+pub use contract::runtime_principle::*;
 pub use contract::sandbox::*;
+pub use contract::security_keys::*;
 pub use contract::shutdown::*;
 pub use contract::skill::*;
 pub use contract::snapshot::*;
@@ -94,15 +189,16 @@ pub use contract::system_plugin::*;
 pub use contract::task::*;
 pub use contract::taste::*;
 pub use contract::tool::*;
+pub use contract::tool_call_event::*;
 pub use contract::usage_ledger::*;
 pub use contract::wiki::*;
 pub use day_key::{day_key, DAY_KEY_FORMAT};
 pub use error::{SFError, SFResult};
+pub use excerpt::Excerpt;
 pub use secrets::{
     redact_json_secrets, redact_secrets, ChainedSecretProvider, EnvSecretProvider,
     FileSecretProvider, SecretProvider,
 };
-pub use self_scheduled_wake::{announce, is_self_scheduled, SELF_SCHEDULED_WAKE_MARKER};
 pub use token_estimate::estimate_tokens;
 pub use types::*;
 pub use vocabulary::fill_slots;
@@ -273,3 +369,4 @@ pub use uuid::Uuid;
 #[cfg(test)]
 #[path = "../../cogneva/tests/common/root.rs"]
 pub(crate) mod checkout;
+pub use contract::rebuild_ports::*;

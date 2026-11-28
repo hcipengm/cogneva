@@ -1,9 +1,13 @@
+// census-keep: shapes=clocks — 界面上的提示计时（复制成功、提示消失之类）：只影响提示停留多久，不参与任何决定；删掉只是提示不自动消失或一直不消失
 import type { AgentEvent, ChatFrame } from '@/types/events';
+import type { ChatSandboxBoundaryWire } from '@/transport/websocket';
 
 export interface MockStreamOptions {
   onEvent: (event: AgentEvent) => void;
   /** 聊天帧走自己那一路，与真后端一致：它们不是 agent 事件的变体。 */
   onChatFrame?: (frame: ChatFrame) => void;
+  /** 边界读数同理：它是部署的读数，不是这一轮说出来的话。 */
+  onChatSandboxBoundary?: (boundary: ChatSandboxBoundaryWire) => void;
   onStatusChange?: (status: 'connecting' | 'open' | 'closed' | 'error') => void;
 }
 
@@ -39,8 +43,54 @@ export class MockEventStreamClient {
     this.options.onStatusChange?.('closed');
   }
 
-  send(_message: unknown): void {
-    // Mock transport does not send to a real server.
+  /**
+   * 演示流不往服务端送东西，除了一个停止：那一帧在这里要真的应验，否则演示里
+   * 的停止按钮就是一个按下去什么都不发生的按钮——而它与真后端上的那个长得一样。
+   */
+  send(message: unknown): void {
+    const type = (message as { type?: string | null } | null)?.type;
+    if (type === 'chat_cancel') this.cancelStream();
+    if (type === 'chat_sandbox_boundary') this.reportBoundary();
+  }
+
+  /**
+   * 演示流里的边界：这里一条命令都不跑，所以四行全是「不设界」。这不是占位，
+   * 是演示的真实处境——把它答成一份「已隔离」的读数，演示就会替真部署说话。
+   */
+  private reportBoundary(): void {
+    this.options.onChatSandboxBoundary?.({
+      session_id: this.sessionId,
+      boundary: {
+        kind: 'demo',
+        isolated: false,
+        workdir: null,
+        lines: [
+          { dimension: '可写路径', state: 'none', detail: '演示流不跑命令：没有执行器，也没有文件' },
+          { dimension: '网络', state: 'none', detail: '演示流不跑命令：没有出口' },
+          { dimension: '资源', state: 'none', detail: '演示流不跑命令：没有可量的容器' },
+          { dimension: '超时', state: 'none', detail: '演示流不跑命令：没有要停的东西' },
+        ],
+      },
+      reason: null,
+    });
+  }
+
+  /** 正在流的那一条。停止要停的是它，不是随便哪一条。 */
+  private streamingMid: string | null = null;
+
+  private cancelStream(): void {
+    if (!this.streamingMid) return;
+    const mid = this.streamingMid;
+    this.streamingMid = null;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    // 与服务端同序：先说「停了」，再说「这一轮结束了」。
+    this.chat('cancelled', mid);
+    this.chat('end', mid);
+    this.emit('state_change', { from: 'thinking', to: 'idle' });
+    this.emit('agent_end', { messages: [] });
   }
 
   simulateUserMessage(text: string): void {
@@ -57,7 +107,7 @@ export class MockEventStreamClient {
 
   /** 一帧聊天。名字带点，与 `crates/cog-gateway/src/chat.rs` 发的一致。 */
   private chat(
-    kind: 'start' | 'text_delta' | 'end' | 'identity',
+    kind: 'start' | 'text_delta' | 'end' | 'cancelled' | 'identity',
     messageId: string,
     fields: Record<string, unknown> = {}
   ): void {
@@ -70,9 +120,28 @@ export class MockEventStreamClient {
       role: (fields.role as 'user' | 'assistant' | null) ?? null,
       delta: (fields.delta as string | null) ?? null,
       goalId: (fields.goalId as string | null) ?? null,
+      // 假流也不翻账：变更身份只从真服务的工具返回里来，这里没有就是没有。
+      changeId: (fields.changeId as string | null) ?? null,
       // 假流不扮身份：没有人脸要报，就没有这一格。字段必填是为了让真流里
       // 「这一轮是谁在说」不会静默缺一帧；空值在这里就是「假流不报」。
       agentId: (fields.agentId as string | null) ?? null,
+      // 假流不记账：token 与轮次只有真的跑过一轮才量得到，这里不编一个数。
+      usage: null,
+      // 假流不压缩：演示的对话永远装得下，没有裁剪这回事。
+      compaction: null,
+      // 假流不读约定：演示里没有谁写过一句要跨轮生效的话。
+      memory: null,
+      // 假流不挂外部服务：演示里的工具表就是这个进程里那一张。
+      mcp: null,
+      // 假流不配钩子：演示里没有属主写在配置文件里的判定与通知。
+      hooks: null,
+      // 假流不落文件：演示里的每一句都远在窗口之内，没有附件这回事。
+      attachment: null,
+      // 假流不跟同事说话：演示里没有第二个账号，也没有共享任务图。
+      colleague: null,
+      tasks: null,
+      // 假流不进后台：演示里的命令都是当场跑完的，没有要回来报的那一条。
+      background: null,
       timestamp: new Date().toISOString(),
     });
   }
@@ -107,9 +176,11 @@ export class MockEventStreamClient {
     this.chat('start', replyMid, { role: 'assistant' });
 
     let index = 0;
+    this.streamingMid = replyMid;
     const stream = () => {
       if (!this.connected) return;
       if (index >= replyText.length) {
+        this.streamingMid = null;
         this.chat('end', replyMid);
         // 回话之后调一次工具：活动面板要能看见「读了哪个文件」，而不是只有
         // 一段文字流过去。

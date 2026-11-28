@@ -169,6 +169,50 @@ pub fn sources_of_src_and_tests(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// `crates/` 下带 `src` 段的每一份 `.rs` 连同正文，`tests/` 目录整棵跳过。
+///
+/// 要正文而不是只要路径的那一族用它（「树里还有没有第二个写入口」这类）。人口与
+/// [`production_sources`] 差在 `build.rs`：那一份收构建脚本，这一份只收 `src` 段下的，
+/// 因为问的是「产物里会不会跑这段代码」，而构建脚本不进产物。
+pub fn production_texts(root: &Path) -> Vec<(PathBuf, String)> {
+    let mut paths = Vec::new();
+    let mut stack = vec![root.join("crates")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().and_then(|n| n.to_str()) != Some("tests") {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) == Some("rs")
+                && path.components().any(|c| c.as_os_str() == "src")
+            {
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                paths.push((path, text));
+            }
+        }
+    }
+    paths.sort();
+    paths
+}
+
+/// 某个目录下每一个 `.rs`，递归、排序；人口就是调用点给的那个目录。
+///
+/// 与 [`crate_files_of`] 的差在起点：那一份从仓库根出发去找 `crates/`，这一份给的是
+/// 「只看这一棵子树」的判据用（例如「这张表的 DELETE 只写在一个 crate 里」）。
+pub fn rust_files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    walk_files(dir, &["rs"], &["target", ".git"], &mut out);
+    out.sort();
+    out
+}
+
 /// 一个文件在树里的名字：repo 相对、`/` 分隔。
 ///
 /// 口径只有这一份。两套写法（`./a/b.rs` 与 `a/b.rs`）在读者眼里是同一个文件，在
@@ -280,6 +324,15 @@ pub fn production_lines_keeping_comments(text: &str) -> Vec<&str> {
         .collect()
 }
 
+/// The production half with its comments left in, still numbered.
+///
+/// A gate that reports `file:line` **and** reads a marker out of a comment needs
+/// both halves of the same boundary: dropping the comments loses the marker,
+/// renumbering after a filter points at the wrong statement.
+pub fn production_numbered_lines_keeping_comments(text: &str) -> Vec<(usize, &str)> {
+    production_numbered_impl(text, true)
+}
+
 /// One flag per line: true when that line is production.
 ///
 /// The projection for a caller that blanks the test half in place instead of
@@ -311,10 +364,14 @@ fn production_numbered_impl(text: &str, keep_comments: bool) -> Vec<(usize, &str
     let shapes = brace_shapes(text);
     let mut out = Vec::new();
     let mut gated = false;
+    // 这一行是不是被门装饰的那一项的第一行。字段与枚举支是**一行**、以逗号收尾，
+    // 续行里的逗号（`fn f(` 之后的一个参数）后面还有这一项的身子，所以只有第一行
+    // 上的逗号能算收尾。
+    let mut head = false;
     let mut skipping: Option<(i32, bool)> = None;
     let mut waiting = 0usize;
     for (index, line) in lines.iter().copied().enumerate() {
-        let shape = shapes.get(index).copied().unwrap_or_default();
+        let shape = shapes.get(index).copied().unwrap_or(Default::default());
         let trimmed = line.trim_start();
         if skipping.is_none() {
             if opens_test_module(line) {
@@ -335,6 +392,7 @@ fn production_numbered_impl(text: &str, keep_comments: bool) -> Vec<(usize, &str
                 }
                 gated = false;
                 skipping = Some((0, false));
+                head = true;
                 waiting = 0;
             } else {
                 if trimmed.starts_with("//") && !keep_comments {
@@ -348,7 +406,15 @@ fn production_numbered_impl(text: &str, keep_comments: bool) -> Vec<(usize, &str
         let (depth, opened) = skipping.take().unwrap_or((0, false));
         let next = depth + shape.delta;
         let opened = opened || shape.opens;
-        let ended = (opened && next <= 0) || (!opened && trimmed.ends_with(';'));
+        // 字段、枚举支、结构体字面量里的一格：门装饰的那一项就是这一行，它以逗号
+        // 收尾、不带身子。不认识这种形状时这一项要等五十行才被放弃，而放弃之后
+        // 真实的收尾括号（`}`）已经落在被跳过的一段里——从这里往下读到的正文括号
+        // 净差三格，`impl` 的配平于是永远收不拢（实测：orchestrator.rs 里带
+        // `#[cfg(test)]` 的那个字段）。
+        let field_form = head && !shape.opens && trimmed.trim_end().ends_with(',');
+        head = false;
+        let ended =
+            (opened && next <= 0) || (!opened && (trimmed.trim_end().ends_with(';') || field_form));
         if ended {
             waiting = 0;
         } else if !opened {
@@ -384,6 +450,16 @@ pub fn production_text_keeping_comments(text: &str) -> String {
     production_lines_keeping_comments(text).join("\n")
 }
 
+/// 这段字里有没有测试标记（`#[test]`、`#[cfg(test)]`、`#[tokio::test]`）。
+///
+/// 与「产出面在哪里」不是同一个问题：那个问的是「切在哪里」，这个问的是「有没有测试
+/// 那一半」。两者都关于测试，但只有一个需要一份切法；把「有没有」也放进这份共享模块，
+/// 是为了让调用点不再各写一遍标记表——写过三份，下一类测试框架只会在其中一份里被加上。
+pub fn mentions_tests(text: &str) -> bool {
+    const MARKERS: [&str; 3] = ["#[test]", "#[cfg(test)]", "#[tokio::test]"];
+    MARKERS.iter().any(|marker| text.contains(marker))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,13 +479,13 @@ mod tests {
             .downcast_ref::<String>()
             .cloned()
             .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         assert!(
             message.contains(&MIN_PRODUCTION_FILES.to_string()),
             "拒读的理由要说出下限是多少，读到的是：{message}"
         );
 
-        std::fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     /// 一个文件在树里只有一种写法：`./` 前缀与 Windows 分隔符都折掉。
@@ -453,7 +529,7 @@ mod tests {
         let refused = std::panic::catch_unwind(|| production_sources(&root));
         assert!(refused.is_err(), "同一棵树走判真树的那条入口，下限必须拒读");
 
-        std::fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     /// 工作树的几份普查之间只差那几个减法：夹具、示例、构建脚本各留一份。
@@ -518,7 +594,7 @@ mod tests {
             "第三种人口的下限同样在真树上生效，假树照读"
         );
 
-        std::fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     /// 构建脚本算生产源码：它在编译期跑，读的是同一份环境变量。今天四个 crate 有
@@ -542,7 +618,7 @@ mod tests {
             "src/ 与 build.rs 都是这个 crate 的生产源码"
         );
 
-        std::fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     /// 文件中间的一个 `#[cfg(test)]` 项不许把后面的产出整段截掉。
@@ -589,7 +665,7 @@ mod tests {
         let yaml = "\
             value: \"1\"
         ";
-        let _ = yaml;
+        cog_core::ignore_lost!(yaml);
     }
 }
 

@@ -1,5 +1,5 @@
 import { useMemo } from 'react';
-import { listAgents, type AgentSummary } from '@/api/client';
+import { getAgentRoster, type AgentSummary } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
@@ -9,8 +9,9 @@ import {
   type LiveAgentRow,
 } from '@/store/liveAgents';
 import { useLiveAgentStore } from '@/store/liveAgentStore';
+import { EmployeeAvatar } from '@/components/EmployeeAvatar';
 import { Button, Empty, Loading, Moment, ReadError, Reading, Readings, Table } from '@/ui/primitives';
-import { BarList, Strip, type Tone } from '@/ui/plots';
+import { Strip, type Tone } from '@/ui/plots';
 
 import { Note } from '@/ui/Note';
 /**
@@ -102,27 +103,61 @@ function LiveState({ live }: { live: LiveAgentRow | null }) {
   );
 }
 
+/** 名册表上的一行：一个人，或者「还没派给人的座位」那一组。 */
+type RosterGroup = {
+  personId: string | null;
+  displayName: string;
+  /** 这个人此刻占着的地址（座位）。一个地址是他在对话页能被点到的唯一入口。 */
+  agentIds: string[];
+  live: boolean;
+  retired: boolean;
+  /** 画状态、心跳、主机用的代表行：占着几个地址时取第一个；没派人的那组取第一个座位。 */
+  lead: AgentSummary | null;
+  leadLive: LiveAgentRow | null;
+};
+
 export function EmployeeRoster({ onPick }: { onPick?: (agentId: string) => void }) {
-  const resources = useResource('在岗名单', listAgents, 15_000);
+  // 名册按人收好后再交给界面：座位是地址，人是身份。同一个人占着两个地址时，
+  // 按座位展开的表会出现两次同一个人，读的人以为撞了名；而任务一多，座位能长
+  // 到几百行，人却没变。收在服务端做一次（`people` / `seats_without_a_person`），
+  // 这里不再自己数一遍——两处各数一次，两个数迟早会对不上。
+  const resources = useResource('在岗名单', getAgentRoster, 15_000);
   // 名单是每 15 秒一拍读回来的快照；谁起来了、谁换态了、谁走了，都在总线上。
   // 没有这一行，把间隔一调长，这张表就停在上一次读回来的那一刻——而平台早就
   // 换了一拨人。
   useKindTickedRefresh(['agents', resourceKey('agents')], resources.refresh);
   const { data, error, loading, refresh } = resources;
-  const agents = data ?? [];
+  const agents = data?.agents ?? [];
+  const people = data?.people ?? [];
+  const seatsWithoutAPerson = data?.seats_without_a_person ?? null;
   const liveRows = useLiveAgentStore((s) => s.rows);
   const { rows, unseen } = useMemo(
     () => rosterWithFrames(agents, liveRows),
     [agents, liveRows]
   );
+  // 手上有活的人此刻在岗没有，由注册表（`agents[].live`）回答；`people` 那一行
+  // 已经替我们收好了，这里只按 agent id 找回代表行去画状态与心跳。
+  const byId = useMemo(() => new Map(agents.map((a) => [a.agent_id, a])), [agents]);
+  const groups = useMemo<RosterGroup[]>(
+    () =>
+      people.map((p) => {
+        const lead = p.agent_ids.map((id) => byId.get(id)).find((a) => a !== undefined) ?? null;
+        return {
+          personId: p.person_id,
+          displayName: p.display_name,
+          agentIds: p.agent_ids,
+          live: p.live,
+          retired: p.retired,
+          lead,
+          leadLive: lead ? liveRows[lead.agent_id] ?? null : null,
+        };
+      }),
+    [people, byId, liveRows]
+  );
   // 名单现在装两种人：心跳上活着的，和说过话、名字在名册上但此刻不在线的。
   // 合成一个「在岗」数，读者分不出「没人干活」和「人都下线了」。
-  const liveCount = agents.filter((agent) => agent.live !== false).length;
-  const restCount = agents.length - liveCount;
-  const roles = new Map<string, number>();
-  for (const agent of agents) {
-    roles.set(agent.role, (roles.get(agent.role) ?? 0) + 1);
-  }
+  const liveCount = groups.filter((group) => group.live).length;
+  const restCount = groups.length - liveCount;
   const fromFrame = rows.filter(({ row, live }) =>
     seenAfterSnapshot(row.last_heartbeat, live)
   ).length + unseen.length;
@@ -147,7 +182,7 @@ export function EmployeeRoster({ onPick }: { onPick?: (agentId: string) => void 
     <div className="flex h-full min-h-0 flex-col overflow-auto">
       <div className="flex flex-wrap items-baseline gap-2 border-b border-[var(--line)] px-4 py-1.5 text-[11px] text-[var(--muted)]">
         <span>
-          {`${liveCount} 个在岗${restCount > 0 ? ` · ${restCount} 个休息中` : ''} · ${roles.size} 种角色 · ${fromFrame} 条有比这次轮询更新的帧 · 快照按 15 秒重读`}
+          {`${liveCount} 人在岗${restCount > 0 ? ` · ${restCount} 人休息中` : ''} · ${fromFrame} 条有比这次轮询更新的帧 · 快照按 15 秒重读`}
         </span>
         <span className="ml-auto">
           <Button onClick={refresh}>重读</Button>
@@ -157,32 +192,42 @@ export function EmployeeRoster({ onPick }: { onPick?: (agentId: string) => void 
         <ReadError what="在岗名单" error={error} onRetry={refresh} />
       ) : !data && loading ? (
         <Loading what="在岗名单" />
-      ) : agents.length === 0 ? (
-        <Empty>当前没有在岗的智能体，也没有说过话的人。可对话的员工在说完话几十秒后会离开心跳，但仍留在名册上。</Empty>
+      ) : groups.length === 0 ? (
+        <Empty>
+          {agents.length > 0
+            ? '这一版网关还没返回按人收好的名册（people）；名册接口与员工页要用同一版。'
+            : '当前没有在岗的智能体，也没有说过话的人。可对话的员工在说完话几十秒后会离开心跳，但仍留在名册上。'}
+        </Empty>
       ) : (
         <>
-          <Readings from={resources} source="GET /api/v1/agents 按角色数这一页" caveat="数的是这次读回来的名单：在岗的是心跳，休息中的是说过话、名字在名册上但此刻不在线的人。状态一列不是这份快照给的，是总线上的帧折出来的。">
+          <Readings from={resources} source="GET /api/v1/agents 按人收好的名册" caveat="按人这一列由服务端收好：同一个人占着几个地址也只占一行；座位背后的人只记在名册（cogneva:employees）那一份上，名册读不到时「没派人的座位」这一格是空的，不是 0。">
           <div className="flex flex-wrap border-b border-[var(--line)] py-2">
-            <Reading label="在岗" value={agents.length} />
-            <Reading label="角色" value={roles.size} />
+            <Reading label="人" value={groups.length} />
+            <Reading
+              label="地址"
+              value={agents.length}
+              note="可寻址的地址数：一个人可以同时占着几个"
+            />
             <Reading
               label="比快照新"
               value={fromFrame}
               note="帧里见过、这次快照还没轮到"
             />
+            <Reading
+              label="没派人的座位"
+              value={seatsWithoutAPerson === null ? '—' : seatsWithoutAPerson}
+              note={
+                seatsWithoutAPerson === null
+                  ? '名册没读到：这个数与「量到 0」不是一回事'
+                  : '座位背后还没有人；阶段收口时这个数要归零'
+              }
+            />
           </div>
           </Readings>
-          {/* 名单这一屏要回答的第二问是「这一拨人是怎么构成的」：哪个角色人多、有几个人
-              在跑。角色在表里是一列名字，读不出谁多谁少；状态分散在几十行里，读不出
-              整体的分布——所以这两问画出来，确切的名字仍去表里查。 */}
+          {/* 名单这一屏要回答的第二问是「这一拨人怎么构成」：有几个人在跑。角色不在
+              这里分：角色是这一段活里的职务分工，记在任职与账行上，不是人的属性；
+              按它把人分堆只会把「同一个人今天当 planner、明天当 generator」读成两种人。 */}
           <div className="border-b border-[var(--line)]">
-            <BarList
-              label="每个角色在岗几人"
-              note="按 GET /api/v1/agents 这次读回来的名单数，同一行一个人"
-              rows={[...roles.entries()]
-                .sort((a, b) => b[1] - a[1])
-                .map(([role, count]) => ({ label: role, value: count }))}
-            />
             <Strip
               label="这一拨人现在处在哪个状态"
               note="状态由总线上的帧折出来；「没有状态帧」是这一轮没听到过它，不是它空闲"
@@ -205,43 +250,64 @@ export function EmployeeRoster({ onPick }: { onPick?: (agentId: string) => void 
               ))}
             </div>
           )}
-          <Table<{ row: AgentSummary; live: LiveAgentRow | null }>
+          <Table<RosterGroup>
             columns={[
               // 第一列是这个人叫什么，不是它内部的 id：名册给每个上过册的人发过
               // 「工号 姓名」，读的人要认的是那个；id 放进悬停里，排障时才需要。
-              // 还没入册的 id 由服务端写成「待编 名字」，也不在这里退回十六进制。
+              // 没派人的那一行不是一个人，名字由服务端直接写成「座位，尚未分配给人」。
               {
                 key: 'person',
                 title: '员工',
-                render: ({ row: a }) => (
-                  <span className="inline-flex items-baseline gap-1.5">
-                    <Note className="text-[12px]" text={a.agent_id}>
-                      {a.display_name || a.agent_id}
-                    </Note>
-                    {a.retired && (
-                      <span className="text-[10px] text-[var(--muted)]">离职</span>
-                    )}
+                render: (g) => (
+                  <span className="inline-flex items-center gap-2">
+                    <EmployeeAvatar
+                      employeeId={g.personId ?? g.displayName}
+                      name={g.displayName}
+                      size={24}
+                    />
+                    <span className="inline-flex items-baseline gap-1.5">
+                      <Note
+                        className="text-[12px]"
+                        text={g.personId ?? `${g.agentIds.length} 个座位，都还没有人`}
+                      >
+                        {g.displayName}
+                      </Note>
+                      {g.retired && (
+                        <span className="text-[10px] text-[var(--muted)]">离职</span>
+                      )}
+                    </span>
                   </span>
                 ),
               },
-              { key: 'state', title: '状态', width: '120px', render: ({ live }) => <LiveState live={live} /> },
-              { key: 'role', title: '角色', width: '110px', render: ({ row: a }) => a.role },
-              { key: 'cap', title: '能力', render: ({ row: a }) => (
-                <span className="text-[11px] text-[var(--paper-dim)]">
-                  {a.capabilities.length ? a.capabilities.join(' · ') : '—'}
+              { key: 'state', title: '状态', width: '120px', render: (g) => (
+                g.live ? <LiveState live={g.leadLive} /> : (
+                  <span className="text-[11px] text-[var(--muted)]">休息中</span>
+                )
+              ) },
+              // 主机、Pod IP 是「进程」那一层的，一个人的几个座位可以落在不同进程里；
+              // 这个人只占一个地址时它就是那个人的地址，占着多个时这一格不属于
+              // 某一个人。判据是这个人自己的地址数，不是一个另外数出来的数——两处
+              // 各数一次，迟早会对不上。
+              // 能力不列：它是这个类（数字员工）的属性，人人同一份，写在一行里
+              // 不区分谁——要读它去看那个类，不看名册。
+              { key: 'host', title: '主机', width: '160px', render: (g) => (
+                <span className="mono text-[11px] text-[var(--muted)]">
+                  {g.agentIds.length === 1 ? g.lead?.hostname ?? '' : '—'}
                 </span>
               ) },
-              { key: 'host', title: '主机', width: '160px', render: ({ row: a }) => (
-                <span className="mono text-[11px] text-[var(--muted)]">{a.hostname}</span>
+              { key: 'ip', title: 'Pod IP', width: '130px', render: (g) => (
+                <span className="mono text-[11px] text-[var(--muted)]">
+                  {g.agentIds.length === 1 ? g.lead?.pod_ip ?? '' : '—'}
+                </span>
               ) },
-              { key: 'ip', title: 'Pod IP', width: '130px', render: ({ row: a }) => (
-                <span className="mono text-[11px] text-[var(--muted)]">{a.pod_ip}</span>
-              ) },
-              { key: 'beat', title: '最后一次心跳', width: '130px', render: ({ row: a, live }) => {
-                const fromBeat = seenAfterSnapshot(a.last_heartbeat, live);
+              { key: 'beat', title: '最后一次心跳', width: '130px', render: (g) => {
+                if (!g.lead) {
+                  return <span className="text-[11px] text-[var(--muted)]">—</span>;
+                }
+                const fromBeat = seenAfterSnapshot(g.lead.last_heartbeat, g.leadLive);
                 return (
                   <span className="inline-flex items-baseline gap-1.5">
-                    <Moment iso={fromBeat && live ? live.seenAt : a.last_heartbeat} />
+                    <Moment iso={fromBeat && g.leadLive ? g.leadLive.seenAt : g.lead.last_heartbeat} />
                     {fromBeat && (
                       <Note className="mono text-[10px] text-[var(--brass)]" text="这条心跳比这次轮询读到的快照更晚">
                         帧
@@ -251,22 +317,24 @@ export function EmployeeRoster({ onPick }: { onPick?: (agentId: string) => void 
                 );
               } },
               // 名册与对话在同一个页面里，点一行就切到那个人的对话框：两页之间
-              // 跳转曾要重新找人，而两边读的是同一份名单。
+              // 跳转曾要重新找人，而两边读的是同一份名单。占着不止一个地址时，
+              // 这一行不指向某一个地址，按钮不出现——点哪一个都由读的人自己说。
               ...(onPick
                 ? [
                     {
                       key: 'talk',
                       title: '',
                       width: '64px',
-                      render: ({ row: a }: { row: AgentSummary; live: LiveAgentRow | null }) => (
-                        <Button onClick={() => onPick(a.agent_id)}>对话</Button>
-                      ),
+                      render: (g: RosterGroup) =>
+                        g.agentIds.length === 1 ? (
+                          <Button onClick={() => onPick(g.agentIds[0])}>对话</Button>
+                        ) : null,
                     },
                   ]
                 : []),
             ]}
-            rows={rows}
-            rowKey={({ row }) => row.agent_id}
+            rows={groups}
+            rowKey={(g) => g.personId ?? '__unassigned__'}
           />
         </>
       )}

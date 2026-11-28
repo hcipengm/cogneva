@@ -71,6 +71,13 @@ impl<'de> Deserialize<'de> for QuotaScope {
 }
 
 /// Soft / hard limit pair for a single scope.
+///
+/// 没有 `Default`：一对上限是某一格的声明，不存在「通用的那一对」。未配置的格
+/// 子读到的是 [`QuotaLimits::unlimited`]——**没有上限**，不是某个平台默认值：
+/// 一个谁都没声明过的天花板不是「宽松的默认」，它是一条没有出处的界，读的人
+/// 分不出「这格花完了」与「这格从来没人配过」（现场：默认 50k 对着一天
+/// 47_746_019 的花销，默认工作区被一律 429）。合同里原先还写过一对 80k/100k、
+/// `from_store` 那一处是 40k/50k，两个数没有任何人量过其中哪一个。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuotaLimits {
     pub soft_limit: u64,
@@ -91,13 +98,16 @@ impl QuotaLimits {
             hard_limit,
         }
     }
-}
 
-impl Default for QuotaLimits {
-    fn default() -> Self {
+    /// 没有上限：未声明的格子读到的那一对。
+    ///
+    /// 它不是一把「很大的尺」而是一种缺席——`u64::MAX` 花不完，所以任何按
+    /// 「花销 / 上限」算出的比例都是零，判定不会在这里拦人；`ScopeStatus::enforced`
+    /// 另有一格说清这一格有没有人声明过。两者合起来，读者不必从数值大小去猜。
+    pub const fn unlimited() -> Self {
         Self {
-            soft_limit: 80_000,
-            hard_limit: 100_000,
+            soft_limit: u64::MAX,
+            hard_limit: u64::MAX,
         }
     }
 }
@@ -254,6 +264,14 @@ pub trait HierarchyManager: Send + Sync {
     /// clearing an override only changes anything in the second case's absence.
     async fn limits(&self, scope: QuotaScope, target_id: &str) -> SFResult<Option<QuotaLimits>>;
 
+    /// 一个没人配过的格子读到的那一对上下限。
+    ///
+    /// 与 [`limits`](Self::limits) 的 `None` 成对：那里说「没人配过」，这里说
+    /// 「于是它读到什么」。这一对只有实现方持有，读的人不该自己再猜一对——两份
+    /// 答案没有任何人量过谁对，却会在读数面上分叉。真实现答的是
+    /// [`QuotaLimits::unlimited`]：没有人声明过，就没有上限可读。
+    fn default_limits(&self) -> QuotaLimits;
+
     /// Configure the daily soft/hard ceilings for one `(scope, target)` cell.
     /// Set these to give one person, one workspace, or one team its own
     /// ceiling; the cascade still checks every level above it.
@@ -283,8 +301,8 @@ pub trait WorkspaceQuotaSource: Send + Sync {
 /// 租户却不与任何一级构成上下级关系。把任务塞进 `scope` 那个闭集里，`cascade_order`
 /// 就变成一个混着两种关系的列表，按它逐级走的检查会把两件事读成一件。
 ///
-/// 声明的是**今天**的上限：计数到下一个 UTC 午夜归零，被拒的那一发拿到的等待也是
-/// 到那个午夜。
+/// 声明的是**今天**的上限：计数到下一个日界（这台进程时钟的零点，见 [`crate::day`]）归零，
+/// 被拒的那一发拿到的等待也是到那个日界。
 ///
 /// 写成契约而不是让网关直接依赖实现，是因为写它的（配额实现）与问它的（LLM 代理
 /// 路径）在不同的 crate 里，而业务 crate 之间不直接互相依赖：两边各自认这一个 trait，
@@ -344,6 +362,20 @@ pub struct TaskBudgetVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 一对上限没有「通用的那一对」：合同里不再有 `Default`，起点只有
+    /// `from_hard` 那一条，且它是真算出来的（换输入 ⇒ 值跟着变）。
+    #[test]
+    fn a_limit_pair_has_no_generic_default() {
+        // 针不在这一行里原样出现：否则这条判据读到的就是它自己。
+        let needle = concat!("impl Default for ", "QuotaLimits");
+        assert!(
+            !include_str!("quota.rs").contains(needle),
+            "上限是某一格的声明，合同里不许再给出一对「通用」的"
+        );
+        assert_eq!(QuotaLimits::from_hard(10_000, 0.8).soft_limit, 8_000);
+        assert_eq!(QuotaLimits::from_hard(20_000, 0.8).soft_limit, 16_000);
+    }
 
     /// 一级一个名字：键上写的、序列化写出去的、读回来的都是 `as_str`。
     ///

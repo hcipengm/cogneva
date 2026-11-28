@@ -11,7 +11,8 @@
 //! - `cog_metric_histogram_buckets` and `cog_metric_histogram_sums`, the
 //!   accumulation of a histogram.
 //!
-//! The sweep in [`crate::SampleLogCap`] cannot reach the last three: they have
+//! The measuring loop in [`crate::MetricsSampleLog`] never deletes and cannot
+//! reach the last three: they have
 //! no rows to rank and no overshoot to trim, because they hold current state
 //! rather than history. An unreachable store is a series that is not merely held
 //! but never deleted at all — a retired counter keeps being listed and served at
@@ -65,7 +66,8 @@ pub const HISTOGRAM_SUMS_TABLE: &str = "cog_metric_histogram_sums";
 /// locks, the same way the sweep's batch does. A retired name's history can be
 /// the larger part of the log, and deleting it in one statement would block
 /// every writer for as long as that takes.
-// cap: bound — 与清扫那批同源地界单句的锁：一个退役名字的历史可能是日志的大头，一句删完会让所有写者等那么久
+// cap: fixed — 与清扫那批同源地界单句的锁：一个退役名字的历史可能是日志的大头，一句删完会让所有写者等那么久
+// not-a-bound: 与清扫那批同源地界单句的锁：一个退役名字的历史可能是日志的大头，一句删完会让所有写者等那么久
 const RELEASE_BATCH: i64 = 5_000;
 
 /// 申报：一个名字**后来长出来的标签**，与长出之前那批标签集。
@@ -148,7 +150,7 @@ pub const ROSTERED_LABEL_SERIES: &[&str] = &[
 /// 一遍就是第二个写者——改名只落到一处时，读旧拼写的那一侧照旧去找一个再也不会
 /// 出现的东西，而「没找到」与「本来就没有」在读数上同形。
 pub use cog_core::metric_names::LLM_UPSTREAM_POSITION as ROSTER_SERIES;
-pub const ROSTER_LABEL: &str = "upstream";
+pub const ROSTER_LABEL: &str = cog_core::observability_text::UPSTREAM_LABEL;
 
 /// 名册的一行要有多新，才算「写者这一拍确实在说话」。
 ///
@@ -190,7 +192,8 @@ pub const ROSTER_FRESH_SECS: i64 =
 /// `increment_counter_total` 是 `SET value = t.value + EXCLUDED.value`，下一笔从增量
 /// 重起、Prometheus 读成 reset ⇒ 比不删更坏。取大了只是把一个没有截止期的删除推后。
 /// 中位数落在被保护的形状自己正常的节奏里，压根不是候选。
-// cap: bound — increment_counter_total 是 SET value = t.value + EXCLUDED.value，删后再写会被读成 reset，比不删更坏；取大了只是把一个没有截止期的删除推后
+// cap: fixed — increment_counter_total 是 SET value = t.value + EXCLUDED.value，删后再写会被读成 reset，比不删更坏；取大了只是把一个没有截止期的删除推后
+// keep: 删掉后回到「increment_counter_total 是 SET value = t.value + EXCLUDED.value，删后再写会被读成 reset，比不删更坏；取大了只是把一个没有截止期的删除推后」所描述的情形；由这条约定兜住
 pub const SUPERSEDED_QUIET_SECS: i64 = 6 * 3600;
 
 /// 一张表把时钟放在哪——形状守卫要按它判年龄。
@@ -446,12 +449,12 @@ impl MetricsRetirement {
         let sibling = self.clock_expr("s", clock);
         let legs = format!(
             "t.name = d.name
-               AND NOT (t.labels ? d.label)
+               AND NOT (t.labels::jsonb ? d.label)
                AND {mine} < NOW() - ($3::double precision * INTERVAL '1 second')
                AND EXISTS (
                      SELECT 1 FROM {table} s
                       WHERE s.name = t.name
-                        AND s.labels ? d.label
+                        AND s.labels::jsonb ? d.label
                         AND {sibling} > {mine}
                    )"
         );
@@ -504,7 +507,8 @@ impl MetricsRetirement {
     /// 名册那一步：把 [`ROSTERED_LABEL_SERIES`] 里不在当前名册上的取值，从一张表里
     /// 删掉。
     ///
-    /// 三条腿：这行带 [`ROSTER_LABEL`]、它的取值不在**新鲜**的名册上、它自己安静够久。
+    /// 三条腿：这行的 [`ROSTER_LABEL`] 列有值、那个值不在**新鲜**的名册上、它自己
+    /// 安静够久。这个键在样本表上是一列（`upstream`），不是标签集里的一个键。
     /// 第四条腿在语句外面：名册一条新鲜行都没有时整条语句不执行——名册缺席不是「池空
     /// 了」，而是写者停了或进程刚起，那时按缺席删会把还活着的一族整族删掉。
     ///
@@ -530,7 +534,6 @@ impl MetricsRetirement {
         match batch_by {
             None => Ok(sqlx::query(&sql)
                 .bind(&names)
-                .bind(ROSTER_LABEL)
                 .bind(ROSTER_SERIES.as_str())
                 .bind(fresh)
                 .bind(quiet)
@@ -543,7 +546,6 @@ impl MetricsRetirement {
                 loop {
                     let deleted = sqlx::query(&sql)
                         .bind(&names)
-                        .bind(ROSTER_LABEL)
                         .bind(ROSTER_SERIES.as_str())
                         .bind(fresh)
                         .bind(quiet)
@@ -580,22 +582,26 @@ impl MetricsRetirement {
         // `NOT IN` 的两边都先剔掉 NULL：子查询里一条不带该标签的名册行会让整个 `NOT
         // IN` 变成 NULL，那会把**每一条**候选都判成「不能删」——一个形状守卫最坏的
         // 失效方向是静默不删，比删错好，但它会让这一整条通道看起来在工作其实没有。
+        // 名册那个键是一个真列。这一句问的是「这一行的上游在不在新鲜的名单上」，
+        // 要的是那个键的**值**——所以它的形状是列的比较，不再是按标签名索引进去。
+        // 标签集本身已经只是指纹（`text`），按名索引的那一下在新形状里没有对应物，
+        // 留着它只会在类型改完之后报「operator does not exist」。
         let legs = format!(
             "t.name = ANY($1)
-               AND t.labels ? $2
-               AND t.labels ->> $2 NOT IN (
-                     SELECT r.labels ->> $2 FROM {roster} r
-                      WHERE r.name = $3
-                        AND r.labels ? $2
-                        AND r.timestamp > NOW() - ($4::double precision * INTERVAL '1 second')
+               AND t.upstream IS NOT NULL
+               AND t.upstream NOT IN (
+                     SELECT r.upstream FROM {roster} r
+                      WHERE r.name = $2
+                        AND r.upstream IS NOT NULL
+                        AND r.timestamp > NOW() - ($3::double precision * INTERVAL '1 second')
                    )
-               AND {mine} < NOW() - ($5::double precision * INTERVAL '1 second')"
+               AND {mine} < NOW() - ($4::double precision * INTERVAL '1 second')"
         );
         let fresh_roster = format!(
             "EXISTS (
                    SELECT 1 FROM {roster} r2
-                    WHERE r2.name = $3
-                      AND r2.timestamp > NOW() - ($4::double precision * INTERVAL '1 second')
+                    WHERE r2.name = $2
+                      AND r2.timestamp > NOW() - ($3::double precision * INTERVAL '1 second')
                  )"
         );
         match batch_by {
@@ -604,7 +610,7 @@ impl MetricsRetirement {
                 "DELETE FROM {table} WHERE {id} IN (
                      SELECT t.{id} FROM {table} t
                       WHERE {legs} AND {fresh_roster}
-                      LIMIT $6
+                      LIMIT $5
                  )"
             ),
         }

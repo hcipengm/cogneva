@@ -9,7 +9,7 @@ import {
 } from '@/api/client';
 import { useResource, type Resource } from '@/hooks/useResource';
 import { BreathingTopology } from '@/topology/BreathingTopology';
-import { clusterName, formatBytes, formatCpu } from '@/topology/format';
+import { clusterName, formatBytes, formatCpu, formatUsedBytes } from '@/topology/format';
 import { ContainerRow, Dot, EventRow, VolumeRow } from '@/topology/rows';
 import { Empty, Loading, ReadError } from '@/ui/primitives';
 
@@ -371,6 +371,11 @@ function NodeCard({ node }: { node: TopologyNode }) {
           )}
         </div>
       )}
+      {node.pods_without_usage != null && node.pods_without_usage > 0 && (
+        <p className="px-3 pb-1 text-[10px] text-[var(--muted)]">
+          用量条里少 <span className="mono">{node.pods_without_usage}</span> 个 Pod 的样：条上那一段是量到的那些加起来，是个下界。
+        </p>
+      )}
       {pressures.length > 0 && (
         <p className="px-3 pb-1 text-[10px]" style={{ color: 'var(--danger)' }}>
           {pressures.join(' · ')}：这个节点在驱逐 Pod，光看申报量看不出来。
@@ -391,12 +396,17 @@ function NodeCard({ node }: { node: TopologyNode }) {
             个容器，其中 <span className="mono">{node.unclaimed_containers}</span>{' '}
             个没有任何 Pod 认领（构建容器、宿主上直接起的进程）：它们有进程读数，但没有
             Pod 这一格。下面按进程数从多到少列出是谁——cgroup 只给容器 id，进程名是这一面
-            唯一读得到的身份。
+            唯一读得到的身份。进程数按条数收：写成 <span className="mono">64/137</span>{' '}
+            时，斜杠前是这一面列出的条数，后面是它实际跑着几个。
           </p>
           <ul className="mt-1 space-y-0.5">
             {node.unclaimed.map((row) => (
               <li key={row.id} className="mono text-[10px] text-[var(--muted)]">
-                {row.id} · {row.processes} 个进程
+                {row.id} · {row.processes}
+                {row.processes_total != null && row.processes_total > row.processes
+                  ? `/${row.processes_total}`
+                  : ''}{' '}
+                个进程
                 {row.commands.length > 0 && <> · {row.commands.join(' / ')}</>}
               </li>
             ))}
@@ -439,7 +449,7 @@ function PodRow({ pod }: { pod: TopologyPod }) {
           {pod.cpu_used_millicores != null && (
             <span style={{ color: 'var(--paper-dim)' }}>
               {' '}
-              （实 {formatCpu(pod.cpu_used_millicores)} · {formatBytes(pod.memory_used_bytes ?? 0)}）
+              （实 {formatCpu(pod.cpu_used_millicores)} · {formatUsedBytes(pod.memory_used_bytes)}）
             </span>
           )}
         </span>

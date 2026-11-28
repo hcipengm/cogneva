@@ -27,13 +27,15 @@ use axum::{
     Router,
 };
 use chrono::{DateTime, Datelike, Utc};
+use cog_core::contract::observability::{METRICS_JSON_PATH, METRICS_PATH};
 use cog_core::contract::platform_sign::{
     platform_signature, PlatformOutlet, SignRefusal, SignRequest, SIGN_PATH,
 };
 use cog_core::contract::transport::{Credential, Operation, Transport};
 use cog_core::usage_ledger::{
-    AnalyticsEvent, AnalyticsSink, LlmExchangeRecord, LlmOrigin, LlmUsageLedger, LlmUsageRecord,
-    MeteringOutcome as UsageOutcome, PaceEvidence, PaceUpstreamEvidence,
+    AnalyticsEvent, AnalyticsSink, BodyObject, BodySeal, LlmExchangeRecord, LlmOrigin,
+    LlmUsageLedger, LlmUsageRecord, MeteringOutcome as UsageOutcome, PaceEvidence,
+    PaceUpstreamEvidence,
 };
 use cog_core::{
     AlertTransition, MetricsBackend, PersistentAlertSink, RefusalKind, ScrapableMetrics,
@@ -81,6 +83,17 @@ pub struct LlmUpstream {
     /// 落在哪一档算出一个数写进同一行；没声明的写 `NULL`——「没算」与「算出来
     /// 是零」在账单上是两句话，见 [`crate::pricing::PriceBook::cost`]。
     pub pricing: Option<crate::pricing::PriceBook>,
+    /// 这只模型**对外公布**的上下文窗口（token），随条目落盘。
+    ///
+    /// 与 `pricing` 同一条理由跟着条目走：窗口是型号的属性，而池里可以同时有几
+    /// 只不同型号——按厂商名挂一张表，迟早把 A 型号的窗口算到 B 型号头上。值来自
+    /// 设置页那一项预设（`web/src/overlay/LlmSetupOverlay.tsx` 的 `PRESETS`，出处
+    /// 写在同一项的注释里），不是网关拍的。
+    ///
+    /// `None` = 这台没有公开规格，不是 0 个 token 的窗口：运行时按实测走（收下过
+    /// 多大的 prompt、拒收时自述多大的界）。这一格要报给主应用——循环裁剪的起点
+    /// 就在那里（`cog_core::model_windows`）——所以它随状态读数出去，但从不带 key。
+    pub context_window: Option<u64>,
 }
 
 impl std::fmt::Debug for LlmUpstream {
@@ -123,7 +136,7 @@ pub struct SecurityGatewayConfig {
     /// 与「什么都没声明」——这两件事在监控上同形，而它们对运营者的含义不同。
     pub llm_pool_min_healthy: Option<usize>,
     /// 嫌疑上游的主动探测间隔秒数（COGNEVA_LLM_HEALTH_PROBE_SECS，默认 300），
-    /// 同时是嫌疑窗指数退避的基数。
+    /// 同时是嫌疑窗指数退避的基数。声明的值原样生效，0 秒在 `run` 入口按名字拒绝。
     pub llm_health_probe_secs: u64,
     /// GitHub API 透传出口注入的 token（COGNEVA_GITHUB_TOKEN）。未配置时
     /// `/github/*` 一律 503。
@@ -152,6 +165,12 @@ pub struct SecurityGatewayConfig {
     /// 即 fail-closed，授权码通道不可用——设备流不需要应用凭证，不受影响。
     pub github_oauth_client_id: Option<String>,
     pub github_oauth_client_secret: Option<String>,
+    /// 内存 Raw 层的写入面：留底正文整份存在那里，留底表只留索引。
+    ///
+    /// 与业务 Pod 用的是同一个环境变量、同一个地址（主应用的内部端口，零凭证）：
+    /// 正文的存放处只有一个，两边各配一个地址就会出现「写入落在 A、读取去 B」。
+    /// `None` = 这个部署没给地址，正文没有永久副本，读数里带 `unconfigured`。
+    pub memory_api_base: Option<String>,
     /// Webhook 入口通道监听端口（第三通道，面向集群外平台回调）。
     pub webhook_port: u16,
     /// 观测通道监听端口（第四通道，只挂 /health/* 与 /metrics）。
@@ -197,8 +216,9 @@ pub struct SecurityGatewayConfig {
     pub webhook_internal_secret: Option<String>,
     /// 验签通过后的转发基址（COGNEVA_WEBHOOK_FORWARD_URL）。
     pub webhook_forward_url: String,
-    /// 池状态发布/判定间隔秒数（COGNEVA_LLM_POOL_CHECK_SECS，默认 30，下限 5）：
-    /// 指标刷新、共享键续期、告警状态机推进的统一节拍。
+    /// 池状态发布/判定间隔秒数（COGNEVA_LLM_POOL_CHECK_SECS，默认 30）：
+    /// 指标刷新、共享键续期、告警状态机推进的统一节拍。声明的值原样生效，
+    /// 0 秒在 `run` 入口按名字拒绝——那是忙等，不是一个节拍。
     pub pool_check_secs: u64,
     /// 贡献通道 OAuth 续期循环的拍长与续期阈值（`COGNEVA_CONTRIBUTION_OAUTH_
     /// REFRESH_{INTERVAL,THRESHOLD}_SECS`，0 = 内置默认）。名字与主应用配置面
@@ -289,13 +309,14 @@ impl SecurityGatewayConfig {
             domain_denylist: list("COGNEVA_SG_DOMAIN_DENYLIST"),
             llm_upstreams: upstreams_from_env(),
             llm_pool_min_healthy: min_healthy_from_env(),
-            llm_health_probe_secs: env_u64("COGNEVA_LLM_HEALTH_PROBE_SECS", 300),
+            llm_health_probe_secs: env_u64(LLM_HEALTH_PROBE_SECS_ENV, 300),
             github_token: token("COGNEVA_GITHUB_TOKEN"),
             gitee_token: token("COGNEVA_GITEE_TOKEN"),
             search_fallback_upstreams: crate::search_fallback::upstreams_from_env(),
             gitee_oauth_client_id: token("COGNEVA_GITEE_OAUTH_CLIENT_ID"),
             gitee_oauth_client_secret: token("COGNEVA_GITEE_OAUTH_CLIENT_SECRET"),
             github_oauth_client_id: token(GITHUB_OAUTH_CLIENT_ID_ENV),
+            memory_api_base: token(cog_core::MEMORY_API_BASE_ENV),
             github_oauth_client_secret: token("COGNEVA_GITHUB_OAUTH_CLIENT_SECRET"),
             webhook_port: env_u16("COGNEVA_SG_WEBHOOK_PORT", 8082),
             metrics_port: env_u16("COGNEVA_SG_METRICS_PORT", 9090),
@@ -317,7 +338,7 @@ impl SecurityGatewayConfig {
             webhook_internal_secret: token(cog_core::env::WEBHOOK_INTERNAL_SECRET),
             webhook_forward_url: std::env::var("COGNEVA_WEBHOOK_FORWARD_URL")
                 .unwrap_or_else(|_| "http://cogneva:9091".into()),
-            pool_check_secs: env_u64(cog_core::env::LLM_POOL_CHECK_SECS, 30).max(5),
+            pool_check_secs: env_u64(cog_core::env::LLM_POOL_CHECK_SECS, 30),
             // 同一个 env 名，读它的进程从主应用换成了这里：清单里那一行没动，
             // 而循环跟着 Secret 的读权走。
             contribution_oauth_refresh_interval_secs: env_u64(
@@ -386,6 +407,10 @@ fn upstreams_from_env() -> Vec<LlmUpstream> {
 /// 而「没配」与「配在另一个拼法的名字下」在结果上同形。
 pub(crate) const GITHUB_OAUTH_CLIENT_ID_ENV: &str = "COGNEVA_GITHUB_OAUTH_CLIENT_ID";
 pub(crate) const LLM_POOL_MIN_HEALTHY_ENV: &str = "COGNEVA_LLM_POOL_MIN_HEALTHY";
+/// 上游健康探测间隔那一格的部署名。配置装配读它取值、`run` 读它做「0 秒按名字拒绝」，
+/// 测试也拿它断言错误文本点名了哪一格——三处各写一遍时，改名只改一处不会报错，
+/// 而拒绝那一步会指着一个再也没人设置的名字。
+pub(crate) const LLM_HEALTH_PROBE_SECS_ENV: &str = "COGNEVA_LLM_HEALTH_PROBE_SECS";
 
 /// 声明的冗余下限：上面那个环境变量，与上游池同一次写入 Secret 的那个值
 /// （llm-config 单入口里的一个整数）。
@@ -454,6 +479,14 @@ fn parse_upstreams(raw: &str) -> Vec<LlmUpstream> {
                 supports_usage_in_streaming: v
                     .get("supports_usage_in_streaming")
                     .and_then(|x| x.as_bool()),
+                // 公布窗口与价目同一处置：解析不出来时**整条目照收、窗口置空**，
+                // 而不是把条目丢掉——丢掉一条上游是拿「少一个起点」去换「少一家
+                // 可故障转移的候选」，代价不对等。代价是这台要等第一次超窗才说得出
+                // 自己的界，所以 0 与负数按「没说过」读，不当作一个界。
+                context_window: v
+                    .get("context_window")
+                    .and_then(|x| x.as_u64())
+                    .filter(|w| *w > 0),
                 // 价目是这一条的可选声明。解析不出来时**整条目照收、价目置空**，
                 // 而不是把条目丢掉：丢掉一条上游会从池里少一家可供故障转移的
                 // 候选，那是拿「记不了钱」去换「跑不了活」，两件事的代价不对等。
@@ -526,25 +559,21 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// 日志/合成错误串里的上游错误体摘录：截头防大错误页刷爆日志。
-/// 截断长度保证常见厂商错误 JSON 的 type 字段（如 access_terminated_error）
-/// 不被切掉——调用方的终止性失败分类依赖这些标记。
+/// 上游错误体：整段交给调用方与日志。
+///
+/// 这里曾经截到 512 字，理由是「防大错误页刷爆日志」。按「有损默认无损」，
+/// 日志体积属于容量问题，解法不是丢掉读者需要的分类标记，而是把容量放到读数上；
+/// 在拿到那条读数之前，这一步不切。
 fn error_excerpt(text: &str) -> String {
-    // cap: bound — upstream error excerpt: the truncation point is chosen so the vendor's own error-type marker (access_terminated_error) survives, because termination classification reads it
-    const MAX_CHARS: usize = 512;
-    let t = text.trim();
-    if t.chars().count() <= MAX_CHARS {
-        t.to_string()
-    } else {
-        t.chars().take(MAX_CHARS).collect::<String>() + "…"
-    }
+    text.trim().to_string()
 }
 
 // ─── LLM 上游池健康表（进程内热切换依据）─────────────────────
 
 /// 嫌疑窗指数退避封顶：与调用侧终止退避同形，配额类终止的上游
 /// 每窗口最多烧一次最小探测调用，恢复延迟最多一个窗口。
-// cap: derived — 与调用侧终止退避同形；配额类终止每窗口最多烧一次最小探测调用，恢复延迟最多一个窗口
+// cap: fixed — 与调用侧终止退避同形；配额类终止每窗口最多烧一次最小探测调用，恢复延迟最多一个窗口
+// keep: 删掉后配额类终止的退避无界，恢复延迟超过一个窗口；由「与调用侧终止退避同形」兜住
 const SUSPECT_BACKOFF_CAP_SECS: u64 = 6 * 60 * 60;
 
 /// 限流类拒绝（配额周期类、上游没报复位时刻）的嫌疑窗起步基线。
@@ -556,7 +585,8 @@ const SUSPECT_BACKOFF_CAP_SECS: u64 = 6 * 60 * 60;
 ///
 /// 曲线不改，只改起步：首窗 30 秒，之后照旧 ×2，几次就并回探测间隔那条。反复
 /// 限流仍然会退到分钟级，配额真的耗尽时不会变成 30 秒一次的锤门。
-// cap: derived — 起步窗取自上面那组现场读数，不是容量；曲线不动，只把第一窗从探测间隔缩到这个数
+// cap: fixed — 起步窗取自上面那组现场读数，不是容量；曲线不动，只把第一窗从探测间隔缩到这个数
+// keep: 删掉后限流退避从探测间隔起步，第一窗就烧掉一次最小探测调用；由「曲线不动，只缩第一窗」兜住
 const RATE_LIMIT_BACKOFF_BASE_SECS: u64 = 30;
 
 /// 嫌疑窗时长：探测间隔 × 2^(n-1)，封顶 6h。n 为连续失败次数。
@@ -731,7 +761,8 @@ fn parse_quota_window_secs(body: &str) -> Option<u64> {
 
 /// 窗口长度的上界：上游写什么我们都不当"永远不可用"播报，超过一年的数只可能是
 /// 解析错了或上游文案变了，按一年截断并保留"这只是个窗口"的语义。
-// cap: bound — 上游写什么都不当「永远不可用」播报；超过一年只可能是解析错或文案变了，按一年截断
+// cap: fixed — 上游写什么都不当「永远不可用」播报；超过一年只可能是解析错或文案变了，按一年截断
+// keep: 删掉后上游一句解析错被播成「永远不可用」，调用方等到天荒地老；由「超过一年只可能是解析错」兜住
 const MAX_QUOTA_WINDOW_SECS: u64 = 366 * 86_400;
 
 /// 把一条拒绝的正文读成 [`RefusalKind`]。
@@ -1064,7 +1095,8 @@ struct FaceAnswerReading {
 /// 一次面探测就是一次 `max_tokens=1` 的 ping，配额成本可以忽略；而"某个面没了"
 /// 是件**慢**事（厂商下掉端点、运维写错地址），要的是迟早会看见，不是三十秒内
 /// 看见。这个间隔同时是候选资格的有效期：一条十天前的答复不该替今天放行流量。
-// cap: bound — 候选资格的有效期；过期探测是慢事，要的是迟早看得见，不是三十秒内看见
+// cap: fixed — 候选资格的有效期；过期探测是慢事，要的是迟早看得见，不是三十秒内看见
+// keep: 删掉后候选资格永不过期，一份过时的探测回答一直在路由里生效；由「过期探测是慢事」兜住
 const FACE_ANSWER_TTL_SECS: u64 = 1800;
 
 /// 准入探测问的三个问题。
@@ -1708,9 +1740,14 @@ pub struct PoolObservability {
     pub alerts: Option<Arc<dyn PersistentAlertSink>>,
     /// 逐调用 token 计量明细（PG）。未配置数据库时 None，计量退化为指标+时序。
     pub usage: Option<Arc<dyn LlmUsageLedger>>,
-    /// 这本账最近是不是写不进去。落账是前台不等、后台 spawn 的写，所以它
-    /// 失败时请求路径上没有任何东西会红——只有这一格记着「连续失败到第几笔」，
-    /// 让告警只在进入/离开故障的那一刻各动一次。
+    /// 调用事实的写入口（`cogneva_event` 的 `llm_call`）。与 `usage` 并存到读切换
+    /// 为止：行是投影，事件是正本。
+    pub llm_call_events: Option<Arc<dyn cog_core::EventStore>>,
+    /// 行与事件的同事务落点。接上之后 `land_usage_record` 不再分两步写。
+    pub usage_landing: Option<Arc<dyn cog_core::UsageLanding>>,
+    /// 这本账最近是不是写不进去。落账在请求路径上写完才返回，失败在返回值里
+    /// 也看得见；但连续失败与恢复对读者是一件事（不是每一次），所以这一格记着
+    /// 「连续失败到第几笔」，让告警只在进入/离开故障的那一刻各动一次。
     pub usage_write_health: Arc<crate::usage_landing::WriteHealth>,
     /// 池读数的耐久面（共享 metrics store）。未配置数据库时为 None。
     durable: Option<Arc<DurableGauges>>,
@@ -1742,9 +1779,24 @@ impl PoolObservability {
             analytics,
             alerts,
             usage,
+            llm_call_events: None,
+            usage_landing: None,
             usage_write_health: Arc::new(crate::usage_landing::WriteHealth::default()),
             durable: durable.map(|backend| Arc::new(DurableGauges::new(backend))),
         }
+    }
+
+    /// 接上调用事实的写入口。装配层有池时用它；没有就保持 `None`，
+    /// 读切换之前这不会让任何读数变错——它只是让正本多一行。
+    pub fn with_call_events(mut self, sink: Arc<dyn cog_core::EventStore>) -> Self {
+        self.llm_call_events = Some(sink);
+        self
+    }
+
+    /// 接上同事务落点：行与事件要么都进，要么都不进。
+    pub fn with_usage_landing(mut self, landing: Arc<dyn cog_core::UsageLanding>) -> Self {
+        self.usage_landing = Some(landing);
+        self
     }
 }
 
@@ -1834,8 +1886,17 @@ pub const DURABLE_POOL_GAUGES: &[cog_core::MetricName] = &[
 
 /// 一次共享写的上界。这条路径在池状态发布循环里（不是请求路径），但循环一停
 /// 池判定就不再续期，所以等一个不响应的 PG 必须有上限。
-// cap: bound — 池状态发布循环里等一次共享写的上限；循环一停池判定就不续期，等不响应的 PG 必须有界
-const DURABLE_GAUGE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+// cap: fixed — 池状态发布循环里等一次共享写的上限；循环一停池判定就不续期，等不响应的 PG 必须有界
+// keep: 删掉后循环等一次不响应的 PG，一停池判定就不续期；由「必须有界」兜住
+// wall: 等=一次池状态写进耐久面 / 等不到=这一拍不写，循环继续下一拍；池判定靠下一拍续期，不由这一次写决定 / 续跑=能，下一拍重写一次当前值（它是当前值，不是增量）
+// 删掉它，一次卡住的 gauge 写会占住请求路径那么久——指标写入是尽力而为的旁路，
+// 任何一次它自己出问题都不该拖住被它观测的那条请求。来源是这条旁路约定。
+fn durable_gauge_write_timeout() -> cog_core::Bound<std::time::Duration> {
+    cog_core::Bound::fixed(
+        std::time::Duration::from_secs(2),
+        "指标写入是旁路：它自己的问题不拖住被观测的请求",
+    )
+}
 
 /// 池读数的耐久面：把同一个 gauge 再往共享 metrics store 写一份，让读数活得比
 /// 产出它的进程久。
@@ -1924,8 +1985,9 @@ impl DurableGauges {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
+        // roundtrip: 一次共享 gauge 写
         match tokio::time::timeout(
-            DURABLE_GAUGE_WRITE_TIMEOUT,
+            durable_gauge_write_timeout().get(),
             self.metrics.record_gauge(name, value, map),
         )
         .await
@@ -2036,6 +2098,8 @@ struct WindowPaceReading {
 #[derive(Clone)]
 struct AppState {
     config: SecurityGatewayConfig,
+    /// 流式正文的落点。`None` 时正文照旧留在扫描器的内存里（今天的行为）。
+    body_store: Option<Arc<dyn cog_core::BodyStore>>,
     client: reqwest::Client,
     /// No total timeout — SSE streams from reasoning models can run for
     /// minutes; only connection establishment is bounded.
@@ -2502,7 +2566,7 @@ async fn record_llm_call(
         owner,
         refusal_kind,
     ) {
-        land_usage_record(state, record);
+        cog_core::ignore_lost!(land_usage_record(state, record).await);
     }
 }
 
@@ -2536,6 +2600,8 @@ fn failed_attempt_usage(
         return None;
     }
     Some(LlmUsageRecord {
+        finish_reason: None,
+        ttft_ms: None,
         refused_scope: None,
         upstream: LlmHealthTable::key(upstream),
         api_style: upstream.api_style.clone(),
@@ -2555,6 +2621,8 @@ fn failed_attempt_usage(
         estimated_input: None,
         // 失败与拒绝的行没有 token 可折算——「没算」不是「算出来是零」，写 0 会让
         // 拒绝行看起来像免费的成功调用。
+        prompt_manifest: None,
+        prompt_dropped: None,
         cost_micros: None,
         price_book: None,
         // The classification travels with the row. Without it the ledger can
@@ -2571,6 +2639,9 @@ fn failed_attempt_usage(
         // 试过但没成的一发也记在声明的那个人名下。
         task: task.map(str::to_string),
         owner: owner.map(str::to_string),
+        // 拒绝行不属于任何一段对话：它没到过上游、没用量帧，会话花销按
+        // 「真的花出去的钱」折叠，漏掉这些行不改变任何合计。
+        session: None,
         latency_ms,
         // 这一行不是配速拒的：这一拍的额度读数与它无关，写上去会读成"缺口为零"。
         pace: None,
@@ -2605,6 +2676,8 @@ fn pooled_refusal_usage(
     retry_after_secs: u64,
 ) -> LlmUsageRecord {
     LlmUsageRecord {
+        finish_reason: None,
+        ttft_ms: None,
         refused_scope: None,
         upstream: POOLED_REFUSAL_UNNAMED.to_string(),
         api_style: style.to_string(),
@@ -2622,6 +2695,8 @@ fn pooled_refusal_usage(
         estimated_input: None,
         // 失败与拒绝的行没有 token 可折算——「没算」不是「算出来是零」，写 0 会让
         // 拒绝行看起来像免费的成功调用。
+        prompt_manifest: None,
+        prompt_dropped: None,
         cost_micros: None,
         price_book: None,
         // 池级拒绝时没有任何一家上游的正文可读，成因无从分类。把一个候选上游的
@@ -2637,6 +2712,7 @@ fn pooled_refusal_usage(
         // 被熔断拒掉的那一发，也仍然是某人名下的。
         task: task.map(str::to_string),
         owner: owner.map(str::to_string),
+        session: None,
         latency_ms: 0,
         // 熔断拒的依据是健康表，不是额度；这一格留空，缺口只在配速行上算。
         pace: None,
@@ -2661,6 +2737,8 @@ fn paced_refusal_usage(
     pace: PaceEvidence,
 ) -> LlmUsageRecord {
     LlmUsageRecord {
+        finish_reason: None,
+        ttft_ms: None,
         refused_scope: None,
         upstream: POOLED_REFUSAL_UNNAMED.to_string(),
         api_style: style.to_string(),
@@ -2676,6 +2754,8 @@ fn paced_refusal_usage(
         estimated_input: None,
         // 失败与拒绝的行没有 token 可折算——「没算」不是「算出来是零」，写 0 会让
         // 拒绝行看起来像免费的成功调用。
+        prompt_manifest: None,
+        prompt_dropped: None,
         cost_micros: None,
         price_book: None,
         // 拒绝发生在向上游发请求之前，没有正文可分类；把它记成某个上游的成因
@@ -2687,6 +2767,7 @@ fn paced_refusal_usage(
         retry_after_secs: None,
         task: task.map(str::to_string),
         owner: owner.map(str::to_string),
+        session: None,
         latency_ms: 0,
         // 这一行存在的全部理由就是这一拍的数：没有它，拒绝只剩一句"被拒了"，
         // 缺口要等到下一拍再猜。
@@ -2715,6 +2796,8 @@ fn unidentified_refusal_usage(
     owner: Option<&str>,
 ) -> LlmUsageRecord {
     LlmUsageRecord {
+        finish_reason: None,
+        ttft_ms: None,
         refused_scope: None,
         upstream: POOLED_REFUSAL_UNNAMED.to_string(),
         api_style: style.to_string(),
@@ -2731,12 +2814,15 @@ fn unidentified_refusal_usage(
         estimated_input: None,
         // 失败与拒绝的行没有 token 可折算——「没算」不是「算出来是零」，写 0 会让
         // 拒绝行看起来像免费的成功调用。
+        prompt_manifest: None,
+        prompt_dropped: None,
         cost_micros: None,
         price_book: None,
         refusal_kind: None,
         retry_after_secs: None,
         task: task.map(str::to_string),
         owner: owner.map(str::to_string),
+        session: None,
         latency_ms: 0,
         pace: None,
         usage_outcome: None,
@@ -2824,6 +2910,7 @@ fn pace_verdict(
         allowance_tokens: pool.allowance_tokens,
         spent_tokens: pool.spent_tokens,
         reserve_tokens: pool.reserve_tokens,
+        reserve_population: pool.reserve_population,
         window_start_unix: pool.window_start_unix,
         upstreams: blocked,
     })
@@ -2948,10 +3035,11 @@ async fn refuse_on_pace(
         .iter()
         .map(|u| u.upstream.clone())
         .collect();
-    land_usage_record(
+    let _ = land_usage_record(
         state,
         paced_refusal_usage(style, actor, origin, task, owner, evidence),
-    );
+    )
+    .await;
     Some(PaceRefusal {
         wait_secs,
         blocked_upstreams,
@@ -2978,7 +3066,8 @@ struct TaskBudgetRefusal {
     task: String,
     spent_today: u64,
     hard_limit: u64,
-    /// 到下一个 UTC 午夜的秒数——预算按 UTC 日归零，这个数就是「什么时候再来」。
+    /// 到下一个日界（这台进程时钟的零点，见 `cog_core::day`）的秒数——预算按日归零，
+    /// 这个数就是「什么时候再来」。
     wait_secs: u64,
 }
 
@@ -3028,7 +3117,7 @@ async fn task_budget_refusal(
                 hard_limit: v.hard_limit,
                 wait_secs: v.wait_secs.unwrap_or(60),
             };
-            land_usage_record(
+            let _ = land_usage_record(
                 state,
                 task_budget_refusal_usage(
                     style,
@@ -3038,7 +3127,8 @@ async fn task_budget_refusal(
                     owner,
                     refusal.wait_secs,
                 ),
-            );
+            )
+            .await;
             Some(refusal)
         }
         Err(e) => {
@@ -3073,6 +3163,8 @@ fn task_budget_refusal_usage(
     retry_after_secs: u64,
 ) -> LlmUsageRecord {
     LlmUsageRecord {
+        finish_reason: None,
+        ttft_ms: None,
         refused_scope: None,
         upstream: POOLED_REFUSAL_UNNAMED.to_string(),
         api_style: style.to_string(),
@@ -3088,17 +3180,20 @@ fn task_budget_refusal_usage(
         estimated_input: None,
         // 失败与拒绝的行没有 token 可折算——「没算」不是「算出来是零」，写 0 会让
         // 拒绝行看起来像免费的成功调用。
+        prompt_manifest: None,
+        prompt_dropped: None,
         cost_micros: None,
         price_book: None,
         // 拒绝发生在向上游发请求之前，没有正文可分类。
         refusal_kind: None,
-        // 这一格是「什么时候可以再来」：到下一个 UTC 午夜，那时预算归零。
+        // 这一格是「什么时候可以再来」：到下一个日界（本机时钟的零点），那时预算归零。
         // 与配速那行不同，这个数不是上游的窗口，是我们自己那份预算的重置点。
         retry_after_secs: Some(retry_after_secs),
         task: Some(task.to_string()),
         // 这被拒的一发也是记在这个人名下的：一件工作被自己的预算截断，
         // 不等于它不花这个人的额度。
         owner: owner.map(str::to_string),
+        session: None,
         latency_ms: 0,
         pace: None,
         usage_outcome: None,
@@ -3122,7 +3217,8 @@ struct OwnerBudgetRefusal {
     owner: Option<String>,
     spent_today: u64,
     hard_limit: u64,
-    /// 到下一个 UTC 午夜的秒数。额度按 UTC 日归零，这个数就是「什么时候再来」。
+    /// 到下一个日界（这台进程时钟的零点，见 `cog_core::day`）的秒数。额度按日归零，
+    /// 这个数就是「什么时候再来」。
     wait_secs: u64,
 }
 
@@ -3298,10 +3394,11 @@ async fn owner_budget_refusal(
         wait_secs: cog_core::day::seconds_to_next_day(Utc::now().timestamp()),
     };
     note_owner_budget_refusal(state, &refusal).await;
-    land_usage_record(
+    let _ = land_usage_record(
         state,
         owner_budget_refusal_usage(style, actor, origin, task, &refusal),
-    );
+    )
+    .await;
     Some(refusal)
 }
 
@@ -3392,6 +3489,8 @@ fn owner_budget_refusal_usage(
     LlmUsageRecord {
         // 拒掉它的是哪一级：事后读这笔拒绝的人要能分开「该给这个人加额度」与
         // 「该给这个租户加额度」，而结果词本身只有一种。
+        finish_reason: None,
+        ttft_ms: None,
         refused_scope: Some(refusal.scope.as_str().to_string()),
         upstream: POOLED_REFUSAL_UNNAMED.to_string(),
         api_style: style.to_string(),
@@ -3407,6 +3506,8 @@ fn owner_budget_refusal_usage(
         estimated_input: None,
         // 失败与拒绝的行没有 token 可折算——「没算」不是「算出来是零」，写 0 会让
         // 拒绝行看起来像免费的成功调用。
+        prompt_manifest: None,
+        prompt_dropped: None,
         cost_micros: None,
         price_book: None,
         refusal_kind: None,
@@ -3416,6 +3517,7 @@ fn owner_budget_refusal_usage(
         // 计数追不出这个人——只有这一格记得住。拒绝的主体是租户时这一格可能为空
         // （任务没有提交人），那时的身份要从 `task` 连回任务图。
         owner: refusal.owner.clone(),
+        session: None,
         latency_ms: 0,
         pace: None,
         usage_outcome: None,
@@ -3431,7 +3533,7 @@ fn owner_budget_refusal_usage(
 ///
 /// 调用点仍可以是新的，但**不许再直接调 `pool_circuit_break`**：那样绕开的是这一行，
 /// 而池全灭的窗口就会退回与"没有流量"同形。
-fn pooled_refusal(
+async fn pooled_refusal(
     state: &AppState,
     candidates: &[&LlmUpstream],
     style: &str,
@@ -3442,71 +3544,136 @@ fn pooled_refusal(
 ) -> Option<(u64, u64)> {
     let verdict = state.pool_circuit_break(candidates);
     if let Some((retry_after, _)) = verdict {
-        land_usage_record(
+        let _ = land_usage_record(
             state,
             pooled_refusal_usage(style, actor, origin, task, owner, retry_after),
-        );
+        )
+        .await;
     }
     verdict
 }
 
-/// 台账写入异步化：流结束的调用方不该等一次 PG insert。
+/// 台账在请求路径上写完再返回：这一笔账是折叠面的正本，丢一行就是一段永远
+/// 读不出来的花销，而且它读起来与「那一段没人调用」完全同形。
 ///
-/// 异步的代价是这一笔的成败不在请求路径上——可这本账是折叠面的正本，丢一行
-/// 就是一段永远读不出来的花销，而且它读起来与「那一段没人调用」完全同形。
-/// 所以写在这里的不只是一次 insert：几笔之内重试（PG 重启与连接重置都在一秒
-/// 内自愈），失败连续到要放弃时经耐久告警面喊一次、恢复时关掉——见
-/// [`crate::usage_landing`]。
-fn land_usage_record(state: &AppState, record: LlmUsageRecord) {
+/// 写在这里的不只是一次 insert：几笔之内重试（PG 重启与连接重置都在一秒内
+/// 自愈），失败连续到要放弃时经耐久告警面喊一次、恢复时关掉——见
+/// [`crate::usage_landing`]。每一次失败都在读数上留痕（`write_failed` /
+/// `no_ledger`），所以「答复已经发出而账没进库」不会只剩下一句日志。
+/// 一次代理调用的事实行。拆出来是因为它是这一族里唯一有形状的地方：哪几格来自
+/// 用量记录、哪一格是这次调用自己的身份、以及**批号**。
+///
+/// 批号今天取这条记录上的任务 id：一次运行花的每一笔调用都挂回触发它的那条任务，
+/// 「这一批花了几次调用」于是按批号查得到（读面 `a_batch_id_answers_what_the_batch_cost`）。
+/// 换「批」的定义时只改这里一处。
+fn llm_call_from(record: &cog_core::LlmUsageRecord, row_id: &str) -> cog_core::LlmCall {
+    record.as_call(row_id)
+}
+
+async fn land_usage_record(state: &AppState, record: LlmUsageRecord) -> Result<(), String> {
+    // 接上同事务落点就用它：行与事件一次提交，没有中间态。
+    if let Some(landing) = state.pool_obs.usage_landing.clone() {
+        match landing.land(&record).await {
+            Ok(()) => {
+                if state.pool_obs.usage_write_health.note_landed() {
+                    resolve_ledger_write_alert(state.pool_obs.alerts.clone()).await;
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                record_counter(
+                    state,
+                    cog_core::metric_names::LLM_USAGE_LANDING_DROPPED_TOTAL,
+                    &[("reason", crate::usage_landing::WRITE_FAILED_REASON)],
+                )
+                .await;
+                if state.pool_obs.usage_write_health.note_lost() {
+                    fire_ledger_write_alert(state.pool_obs.alerts.clone(), 1, &error).await;
+                }
+                return Err(error);
+            }
+        }
+    }
     let Some(store) = state.pool_obs.usage.clone() else {
         // 这一格只在部署里根本没配账本时走到（`database_url` 为空）：配了但连不上
         // 的部署拿到的是一个会自己接上的槽，那期间的失败走下面的 write_failed。
         // 这一种没有可等的下一次尝试——配置在启动时读，只有换一个 Pod 才会变——
         // 所以它自己成一条原因，而不是混进「写失败」里。
-        let state = state.clone();
-        tokio::spawn(async move {
-            record_counter(
-                &state,
-                cog_core::metric_names::LLM_USAGE_LANDING_DROPPED_TOTAL,
-                &[("reason", crate::usage_landing::NO_LEDGER_REASON)],
-            )
-            .await;
-        });
-        return;
+        record_counter(
+            state,
+            cog_core::metric_names::LLM_USAGE_LANDING_DROPPED_TOTAL,
+            &[("reason", crate::usage_landing::NO_LEDGER_REASON)],
+        )
+        .await;
+        return Err(format!(
+            "no usage ledger is configured ({})",
+            crate::usage_landing::NO_LEDGER_REASON
+        ));
     };
     let health = state.pool_obs.usage_write_health.clone();
     let alerts = state.pool_obs.alerts.clone();
-    let state = state.clone();
-    tokio::spawn(async move {
-        let outcome =
-            crate::usage_landing::persist_with_retry(crate::usage_landing::WRITE_ATTEMPTS, || {
-                store.record(&record)
-            })
-            .await;
-        match outcome {
-            Ok(_) => {
-                if health.note_landed() {
-                    resolve_ledger_write_alert(alerts).await;
+    // **在请求路径上写完再返回**，不 spawn。
+    //
+    // 这一行是「这次调用花了多少」的唯一凭据；spawn 出去等于「答复发了，账在队列里
+    // 等写」。进程在两者之间死掉（滚动、OOM、节点回收），这笔花销就永远不进任何窗口
+    // ——而窗口正是限额、配速与告警的依据，缺一笔就是所有读数一起偏一点，偏得没有
+    // 痕迹。重试仍在这里：写不进去就把「丢了」记成读数与告警，而不是把「可能丢」
+    // 藏在成功路径里。
+    let outcome =
+        crate::usage_landing::persist_with_retry(crate::usage_landing::WRITE_ATTEMPTS, || {
+            store.record(&record)
+        })
+        .await;
+    match outcome {
+        Ok((row_id, _attempt)) => {
+            if health.note_landed() {
+                resolve_ledger_write_alert(alerts).await;
+            }
+            // 同一笔调用的事实也落进事件流：行是投影，事件是正本。写在行之后、
+            // 在答复离开之前——两处的顺序与 S38 的理由一样：宁可多一次同步写，
+            // 也不要「答复发了、事实还在队列里」。
+            if let Some(sink) = state.pool_obs.llm_call_events.clone() {
+                let call = llm_call_from(&record, &row_id);
+                if let Err(e) = sink
+                    .append(cog_core::FactEvent::new(cog_core::EventPayload::LlmCall(
+                        call.clone(),
+                    )))
+                    .await
+                {
+                    // 行在、事实不在：读流的那一半会少这一笔，重建时它也不存在。
+                    // 这件事必须在读数面上有一格，不能只有一行日志。
+                    tracing::warn!(
+                        error = %e,
+                        "这条调用的事实没写进事件流；用量行仍在，读切换之前两者并存"
+                    );
+                    record_counter(
+                        state,
+                        cog_core::metric_names::LLM_USAGE_LANDING_DROPPED_TOTAL,
+                        &[("reason", crate::usage_landing::EVENT_WRITE_FAILED_REASON)],
+                    )
+                    .await;
                 }
             }
-            Err((error, attempts)) => {
-                tracing::error!(
-                    error = %error,
-                    attempts,
-                    "LLM 计量明细落库失败：这一笔的花销不会进任何窗口"
-                );
-                record_counter(
-                    &state,
-                    cog_core::metric_names::LLM_USAGE_LANDING_DROPPED_TOTAL,
-                    &[("reason", crate::usage_landing::WRITE_FAILED_REASON)],
-                )
-                .await;
-                if health.note_lost() {
-                    fire_ledger_write_alert(alerts, attempts, &error.to_string()).await;
-                }
-            }
+            Ok(())
         }
-    });
+        Err((error, attempts)) => {
+            tracing::error!(
+                error = %error,
+                attempts,
+                "LLM 计量明细落库失败：这一笔的花销不会进任何窗口"
+            );
+            record_counter(
+                state,
+                cog_core::metric_names::LLM_USAGE_LANDING_DROPPED_TOTAL,
+                &[("reason", crate::usage_landing::WRITE_FAILED_REASON)],
+            )
+            .await;
+            if health.note_lost() {
+                fire_ledger_write_alert(alerts, attempts, &error.to_string()).await;
+            }
+            Err(format!("usage row: {error}"))
+        }
+    }
 }
 
 /// 计量写不进去时，在耐久告警面上开一行。
@@ -3560,6 +3727,10 @@ struct UsageReading {
     /// 一次性的手艺，不是读数——每天六千次调用里哪一处最贵，没人答得上来。
     /// `None` 是「上游这次没说」，与「说了零」不同形：不思考的上游根本不带这个键。
     reasoning: Option<u64>,
+    /// 模型侧为什么停了；`None` 是这一通没有哪一帧报过。
+    finish_reason: Option<String>,
+    /// 首字时延；`None` 是没量到（非流式或没有内容帧）。
+    ttft_ms: Option<u64>,
     outcome: UsageOutcome,
 }
 
@@ -3585,6 +3756,12 @@ impl UsageReading {
     /// A call that never asked cannot have been ignored, so its silence is
     /// `NotAsked`; only a call that did ask leaves the silence on the upstream's
     /// side, which is `Absent`.
+    /// 非流式读法带上的停止词；流式那一侧由 scanner 自己记。
+    fn with_finish_reason(mut self, finish_reason: Option<String>) -> Self {
+        self.finish_reason = finish_reason;
+        self
+    }
+
     fn from_usage(
         (input, output, cached, cache_created, reasoning): ReportedUsage,
         asked: bool,
@@ -3595,6 +3772,8 @@ impl UsageReading {
             cached: cached.unwrap_or(0),
             cache_created,
             reasoning,
+            finish_reason: None,
+            ttft_ms: None,
             outcome: if input.is_some()
                 || output.is_some()
                 || cached.is_some()
@@ -3895,10 +4074,18 @@ struct RequestSide {
     /// 的当日额度拿它去拒——所以它必须来自一个已经通过鉴权的身份，不能是调用方
     /// 随便起的名字。`None` 是"没有声明"，不是"声明为某个人"。
     owner: Option<String>,
+    /// 这次调用属于哪一段对话，由调用方在请求头上声明。
+    ///
+    /// 与 `task` 和 `owner` 回答三件不同的事：哪一件工作、谁付钱、哪一段对话。
+    /// 它不被判定——一段对话没有上限——所以写错一个值只是读错一个数，不会花掉
+    /// 别人的额度。`None` 是"没有声明"，不是"声明为某一段"。
+    session: Option<String>,
     /// [`price_request`] 的读数。`None` 是"这条路径没量过"，不是"量出来是 0"：台账
     /// 那一列可空正是因为两者修法相反——一个说明装配面还没接上，一个是空提示词——
     /// 所以量不出来的路径一律传 `None`，绝不填 0 冒充量过。
     estimated_input: Option<u64>,
+    /// 这一份提示被挤掉了多少条更早的消息；`None` 是没量到或没裁。
+    prompt_dropped: Option<u32>,
     /// 发出去的那份字节，逐字节留底。`None` 是"这条路径手上没有 body"（探测类调用
     /// 自己拼 JSON），不是"body 为空"——空 body 是另一种形状，存成 `Some(vec![])`。
     ///
@@ -3912,32 +4099,54 @@ struct RequestSide {
 /// code-platform payloads, and the gateway has to have the whole thing before
 /// it can decide whether to send it; it is still a bound, so a caller streaming
 /// without end fails here instead of in memory.
-// cap: bound — 代理转发的请求体上限；调用方仍能判断要不要送，但无界流会在这里失败而不是在内存里
+// cap: fixed — 代理转发的请求体上限；调用方仍能判断要不要送，但无界流会在这里失败而不是在内存里
+// keep: 删掉后无界流失败在内存里而不是在这里；由「调用方仍能判断要不要送」兜住
 const MAX_PROXIED_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 /// How much of a git pack transfer this will buffer. The copy is held so that
 /// the forwarded request carries a complete Content-Length — git servers
 /// disagree about chunked encoding — and cogneva's own repositories sit far
 /// below this, so the memory is spent on the header rather than the payload.
-// cap: bound — git pack 的上限；cogneva 自己的仓库远低于它，多出来的内存花在头上而不是载荷上
+// cap: fixed — git pack 的上限；cogneva 自己的仓库远低于它，多出来的内存花在头上而不是载荷上
+// keep: 删掉后一次 git pack 无界，多出来的内存花在载荷上；由「cogneva 自己的仓库远低于它」兜住
 const MAX_GIT_PACK_BYTES: usize = 256 * 1024 * 1024;
 
 /// Wall for one outbound call to an upstream. Sized for a non-streaming
 /// completion, which is the slowest non-stream thing this process asks for.
-// cap: bound — 对上游一次调用的墙钟；按最慢的非流式补全定，那是这个进程最慢的非流请求
-const UPSTREAM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+// wall: 等=上游对这次请求的答复 / 等不到=这一次尝试按失败收尾并换池内下一个上游；**没有半份答复被当成读到了** / 续跑=能，换一家重问是一次新的调用
+//
+// 删掉它，一个不答的上游会把这一次调用永远挂住（任务无法完成）；因此保留，
+// 来源是「最慢的非流式补全」这条约定——本进程最慢的一次非流请求就是它的量级。
+fn upstream_request_timeout() -> cog_core::Bound<std::time::Duration> {
+    cog_core::Bound::fixed(
+        std::time::Duration::from_secs(60),
+        "上游一次非流式补全的最慢量级：不设墙则一个不答的上游挂住整次调用",
+    )
+}
 
 /// Wall for the connection alone. Kept well under the request wall so an
 /// unreachable upstream is reported as "cannot connect" quickly instead of
 /// being indistinguishable from a slow one.
-// cap: bound — 连不上的上游要快报「连不上」，不能跟「上游慢」混成同一个现象
-const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+// wall: 等=到上游的连接建立 / 等不到=这一次尝试记成「连不上」，与「上游慢」分开——两者在池判定里不是同一种失败 / 续跑=能，换一家重连
+//
+// 删掉它，连不上的上游要等到请求墙才报，而「连不上」与「上游慢」在池判定里
+// 是两种失败；来源是这条区分本身的约定，不是拍出来的秒数。
+fn upstream_connect_timeout() -> cog_core::Bound<std::time::Duration> {
+    cog_core::Bound::fixed(
+        std::time::Duration::from_secs(10),
+        "连接建立与请求答复是两种失败：连不上要快报，不能等到请求墙",
+    )
+}
 
-/// 留底表的单边上限。流式响应的原文扫描本来就只留 1 MiB（见 [`UsageScanner::feed`]），
-/// 请求侧对齐同一个界：两边都是"一次调用的规模"，而把它调大只会让一张诊断表变成
-/// 库里最大的一张。
-// cap: derived — 与请求侧对齐同一个界：两边都是「一次调用的规模」；调大只会让诊断表变成库里最大的一张
-const EXCHANGE_BODY_CAP: usize = 1024 * 1024;
+/// 留底正文的存放面：内存 Raw 层的写入端点（见 [`archive_exchange_body`]）。
+///
+/// 正文不落在留底表里。那张表按部署的保留期清扫、又被每晚的备份整表拷走，正文放在
+/// 那里能活多久取决于这两件事；Raw 层没有清扫，正文在那里才是永久的，表只做索引。
+#[cfg(test)]
+#[cfg(test)]
+fn exchange_raw_id(side: &str, sha256: &str) -> String {
+    format!("llm-{side}-{sha256}")
+}
 
 /// 留底开关。默认开，`COGNEVA_GATEWAY_EXCHANGE_STORE=0` 关——关掉之后台账照写，
 /// 只是正文不落库；这是给"这台部署不该把提示词写进数据库"的准备，而不是故障开关。
@@ -3948,46 +4157,6 @@ fn exchange_store_enabled() -> bool {
         Ok(v) => !matches!(v.trim(), "0" | "false" | "off" | "no"),
         Err(_) => true,
     })
-}
-
-/// 留底正文里不该出现的凭证形状。上游的 key 在请求头里，正常不会进 body；但调用方
-/// 可能把自家的 token 写进提示词（贴代码、贴配置），而这张表的读者比请求路径多得多。
-///
-/// 只抹看起来像密钥的那一段，不整段丢弃：丢掉整条正文等于把这一次调用从留底里删掉，
-/// 而"这里有一处密钥"本身是值得知道的事。
-fn redact_exchange(text: &str) -> String {
-    use std::sync::OnceLock;
-    static PATTERNS: OnceLock<Vec<regex::Regex>> = OnceLock::new();
-    let patterns = PATTERNS.get_or_init(|| {
-        [
-            r"(?i)(bearer\s+)[A-Za-z0-9._\-]{16,}",
-            r"\bsk-[A-Za-z0-9_\-]{16,}",
-            r#"(?i)("(?:api_key|apikey|authorization|access_token|refresh_token|secret)"\s*:\s*")[^"]{8,}(")"#,
-            r"(?i)(\b(?:api[_-]?key|access[_-]?token|secret)\s*[=:]\s*)[A-Za-z0-9._\-]{16,}",
-        ]
-        .iter()
-        .filter_map(|p| regex::Regex::new(p).ok())
-        .collect()
-    });
-    let mut out = text.to_string();
-    for re in patterns.iter() {
-        out = re.replace_all(&out, "${1}[redacted]${2}").into_owned();
-    }
-    out
-}
-
-/// 把一段字节切成"能存的那一份 + 有没有被切"。按字符边界切，否则 PostgreSQL 的
-/// `TEXT` 会拒掉半截 UTF-8，而一次 1 MiB 的截断正好会切在中文中间。
-fn capped_body(raw: &[u8], cap: usize) -> (String, bool) {
-    let text = String::from_utf8_lossy(raw);
-    if text.len() <= cap {
-        return (text.into_owned(), false);
-    }
-    let mut cut = cap;
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    (text[..cut].to_string(), true)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -4011,7 +4180,7 @@ async fn record_llm_tokens(
     reading: UsageReading,
     latency_ms: u64,
     request: &RequestSide,
-) {
+) -> Result<(), String> {
     let actor = request.actor.as_str();
     let origin = request.origin.as_str();
     let estimated_input = request.estimated_input;
@@ -4092,6 +4261,13 @@ async fn record_llm_tokens(
     land_usage_record(
         state,
         LlmUsageRecord {
+            finish_reason: reading.finish_reason.clone(),
+            ttft_ms: reading.ttft_ms,
+            prompt_manifest: request
+                .request_body
+                .as_deref()
+                .and_then(|body| cog_core::prompt_manifest(body)),
+            prompt_dropped: request.prompt_dropped,
             refused_scope: None,
             upstream: key,
             api_style: upstream.api_style.clone(),
@@ -4122,11 +4298,17 @@ async fn record_llm_tokens(
             // （见 `project_quota_usage`），所以人只能写在这里、只写一次：
             // 两处各记一遍，「这个人今天花了多少」就会有两个答案。
             owner: request.owner.clone(),
+            // 这一发是为哪一段对话花的。与 owner 各管一件事：owner 回答"记在谁
+            // 头上"，session 回答"算进哪段会话的合计"——界面上的会话花销是账本
+            // 按这一列折叠出来的投影，不写这一格，那段会话的合计就会比它下面每
+            // 一轮加起来少。
+            session: request.session.clone(),
             latency_ms,
             // 真实调用的一行：配速没参与这一次的判定。
             pace: None,
         },
-    );
+    )
+    .await
 }
 
 /// 把这次调用的两边字节落进留底表。
@@ -4135,15 +4317,103 @@ async fn record_llm_tokens(
 /// 才去读的宽行。写失败只 WARN——留底是观测，不是请求路径的一部分，和记账同一条
 /// 降级约定。
 ///
+/// 两件事在这里发生，顺序就是重点：两边各自的字节先整份写进内存 Raw 层，再把索引
+/// 行写进留底表。写在前面的是永久的那份，写在后面的是会被清扫的那份——反过来的话，
+/// 一行索引有而正文没有的记录，读起来正是「查得到、取不到」。
+///
 /// `response` 是**上游回来的原始字节**（流式就是整段 SSE 转录），不是重新拼的
 /// 正文：重拼要经过一层协议解释，而解释会随上游习惯变；留底的价值正在于它不经解释。
+/// 它可能只是前缀（见 [`UsageScanner`] 的采集上限），所以 `response_seen_bytes` 单独
+/// 记上游到底发了多少：两者不等就说明有一截谁也没有副本，而不是这条正文本身就短。
+/// 把一整段字节写进大对象并封口。
+///
+/// 只给**手上已经有整段**的那两条路用（请求侧，以及响应的非流式/错误路径）。流式响应
+/// 不走这里：它的每一块在到达的那一拍就写进去了，末尾只取封口读数（见
+/// [`seal_stream_body`]）。
+///
+/// 写不进去就返回 `None`，调用方退回行内那一列——**这也是一条落点**，不是「没落成」：
+/// 退回之后正文仍在库里，只是换了一种形状。所以这里不删已经开出来的对象（只有封口
+/// 失败、正文确实已经完整写进去时才保留指针），也绝不把 `None` 读成「没有正文」。
+async fn put_body_object(state: &AppState, bytes: &[u8]) -> Option<BodyObject> {
+    let store = state.body_store.as_ref()?;
+    let writer = match store.open().await {
+        Ok(writer) => writer,
+        Err(e) => {
+            tracing::warn!(error = %e, "正文大对象开户失败，退回行内正文");
+            return None;
+        }
+    };
+    if let Err(e) = writer.write(bytes).await {
+        tracing::warn!(error = %e, "正文大对象写入失败，退回行内正文");
+        // 这一份不完整，而字节在调用方手上还有一份：丢掉，别让它冒充「崩在中途」。
+        cog_core::ignore_lost!(writer.discard().await);
+        return None;
+    }
+    match writer.seal().await {
+        Ok((sha256, bytes_len)) => Some(BodyObject {
+            oid: writer.oid(),
+            seal: Some(BodySeal {
+                sha256,
+                bytes: bytes_len,
+            }),
+        }),
+        Err(e) => {
+            // 正文写进去了，只是没验证过：**保留指针**。删掉就是把库里唯一的一份正文
+            // 删了，而读者要的是「有正文、未验证」，不是「没有正文」。
+            tracing::warn!(error = %e, "正文大对象封口失败，行内留指针而不写封口读数");
+            Some(BodyObject {
+                oid: writer.oid(),
+                seal: None,
+            })
+        }
+    }
+}
+
+/// 流式响应的封口读数。
+///
+/// 只有「每一块都写进去了」时才用大对象那份。任何一块写失败都会把 `keep_raw` 翻回
+/// `true`——那时内存里攒下的那一份才是完整的，库里那段是半截：把半截写成指针，
+/// 读者会拿到一份比上游短、却没有任何一列说它短的正文。
+async fn seal_stream_body(
+    scanner: &Arc<Mutex<UsageScanner>>,
+    body: &Arc<tokio::sync::OnceCell<Option<Arc<dyn cog_core::BodyWriter>>>>,
+) -> Option<BodyObject> {
+    let handle = body.get().cloned().flatten()?;
+    let keep_raw = scanner.lock().map(|s| s.keep_raw).unwrap_or(true);
+    if keep_raw {
+        // 写失败之后退回攒的那条路：这份半截的不完整，而完整的那份在内存里。
+        cog_core::ignore_lost!(handle.discard().await);
+        return None;
+    }
+    match handle.seal().await {
+        Ok((sha256, bytes_len)) => Some(BodyObject {
+            oid: handle.oid(),
+            seal: Some(BodySeal {
+                sha256,
+                bytes: bytes_len,
+            }),
+        }),
+        Err(e) => {
+            tracing::warn!(error = %e, "流式正文封口失败，行内只留指针");
+            Some(BodyObject {
+                oid: handle.oid(),
+                seal: None,
+            })
+        }
+    }
+}
+
+// 参数与交换表那一行的列一一对应：拆成结构体只是把同一组名字再写一遍一次。
+#[allow(clippy::too_many_arguments)]
 async fn record_exchange(
     state: &AppState,
     upstream: &LlmUpstream,
     request: &RequestSide,
     result: &str,
     response: Option<&[u8]>,
+    response_seen_bytes: u64,
     latency_ms: u64,
+    response_object: Option<BodyObject>,
 ) {
     if !exchange_store_enabled() {
         return;
@@ -4157,19 +4427,27 @@ async fn record_exchange(
         return;
     };
     let request_sha256 = sha256_hex(body);
-    let (request_body, request_cut) = capped_body(body, EXCHANGE_BODY_CAP);
-    let (response_body, response_cut) = match response {
-        Some(bytes) => {
-            let (text, cut) = capped_body(bytes, EXCHANGE_BODY_CAP);
-            (Some(text), cut)
-        }
-        None => (None, false),
+    // 响应侧的两个「副本有多长 / 副本的哈希」跟着落点走：正文进了大对象时，手上那一份
+    // 是空的（流式路径在字节到达的那一拍就写走了），拿它去算会把「副本有 N 字节」写成 0
+    // ——而 0 是一次真实读数（「没有正文」），不是「量不到」。有指针时这两个数只能是封口
+    // 读数；封口没成（哈希列为 `NULL`）就是没量到，不是 0。
+    let response_sha256 = if response_object.is_some() {
+        response_object
+            .as_ref()
+            .and_then(|o| o.seal.as_ref())
+            .map(|s| s.sha256.clone())
+    } else {
+        response.map(sha256_hex)
     };
-    let truncated = match (request_cut, response_cut) {
-        (true, true) => "both",
-        (true, false) => "request",
-        (false, true) => "response",
-        (false, false) => "",
+    // 封口没成时是 `None`（没量到），不是 0（量到就是没有）——见 `response_bytes`
+    // 那一格的说明：`0` 与「不知道」写成同一个数，正是这一族最忌的形状。
+    let response_bytes = if response_object.is_some() {
+        response_object
+            .as_ref()
+            .and_then(|o| o.seal.as_ref())
+            .map(|s| s.bytes)
+    } else {
+        Some(response.map(|b| b.len() as u64).unwrap_or(0))
     };
     // 模型名从请求体里读：上游条目的 `model` 是被改写之后的真相，但调用方声明的
     // 那个名字在改写中丢了；两个都留着才回答得了"哪一边的模型在花钱"。
@@ -4177,6 +4455,32 @@ async fn record_exchange(
         .ok()
         .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
         .unwrap_or_else(|| upstream.model.clone());
+    // 正文**直接落这一行**，对象存储不再当默认落点（属主 2026-11-19）。
+    //
+    // 一个落点同时买到三件事：同一次写（账与正文在一个事务里，不存在「行在、正文不在」）、
+    // 同一次读（取证按调用身份一次查询）、少一处会对不上的地方。PG 会把大值 TOAST 到
+    // 侧表，主表因此不会随正文变大。
+    // 实测 2026-11-19 本部署：请求正文平均 2.7 KB、最大 78 KB，响应正文平均 36 KB、最大 1.05 MB——那一天的读数，不是本软件的规格。
+    let request_raw = None;
+    let response_raw = None;
+    // 请求侧永远走行内：它在发出去之前整段都在手上，另开一段大对象只是多三次往返。
+    // 响应侧有落点就走大对象，没有（或写失败）才退回行内。**一侧一份**：两边都写
+    // 就是两份可能对不上的正本，而这正是这张表存在的理由所反对的形状。
+    let response_object = if response_object.is_some() {
+        // 流式路径已经把每一块写进去了，这里只接它的封口读数。
+        response_object
+    } else {
+        match response {
+            Some(bytes) => put_body_object(state, bytes).await,
+            None => None,
+        }
+    };
+    let request_inline = Some(String::from_utf8_lossy(body).into_owned());
+    let response_inline = if response_object.is_some() {
+        None
+    } else {
+        response.map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+    };
     let record = LlmExchangeRecord {
         upstream: LlmHealthTable::key(upstream),
         api_style: upstream.api_style.clone(),
@@ -4187,20 +4491,29 @@ async fn record_exchange(
         result: result.to_string(),
         latency_ms,
         request_sha256,
-        response_sha256: response.map(sha256_hex),
+        response_sha256,
         request_bytes: body.len() as u64,
-        response_bytes: response.map(|b| b.len() as u64).unwrap_or(0),
-        request_body: Some(redact_exchange(&request_body)),
-        response_body: response_body.map(|t| redact_exchange(&t)),
-        truncated: truncated.to_string(),
+        response_seen_bytes,
+        response_bytes,
+        request_raw,
+        response_raw,
+        request_inline,
+        response_inline,
+        response_body_object: response_object,
     };
-    // 与用量行同一条写法：spawn 出去。留底挂在响应流的尾巴上，而调用方的流要到
-    // 这里返回才真正结束——为一次诊断写入多等一个往返，等于让每个用户替观测买单。
-    tokio::spawn(async move {
-        if let Err(e) = store.record_exchange(&record).await {
-            tracing::warn!(error = %e, "LLM 调用留底写入失败（用量台账不受影响）");
-        }
-    });
+    // **在请求路径上写完再返回**，不 spawn。
+    //
+    // spawn 出去的意思是：调用方已经拿到答复，而那一行还在队列里等写。进程在这之间
+    // 死掉（滚动、OOM、节点回收），这一次调用的账与它指向的正文引用就一起消失——
+    // 正文在归档里还有一份，但「谁在什么时候花了多少」再也对不上。留下这一行是这
+    // 条路径存在的全部理由，它不能是「大概率会写成」。
+    //
+    // 代价是一行 INSERT 的往返（本机库、毫秒级），而它换的是「答复发出 ⇒ 账已落地」。
+    // 真到了这一毫秒也付不起的时候，正确的改法是本地只追加暂存 + 搬运器（读一次
+    // 不丢），不是继续 spawn——那是把「可能丢」藏在成功路径里。
+    if let Err(e) = store.record_exchange(&record).await {
+        tracing::warn!(error = %e, "LLM 调用留底写入失败（用量台账不受影响）");
+    }
 }
 
 /// 从一条 SSE `data:` 负载或非流式 JSON body 里提取 token usage。
@@ -4241,6 +4554,15 @@ async fn record_exchange(
 /// Anthropic 面不把思考单列，所以那两条臂返回 `None`；OpenAI 形状的上游在不思考时
 /// 干脆不带这个键，于是 `None` 同时是「这次没想」与「这家不报」——在会报的那家身上
 /// 两者同义，在不会报的那家身上也读不出错数。
+/// 非流式响应里模型侧的停止词：两种协议面各写一处。
+fn finish_reason_of(json: &serde_json::Value) -> Option<String> {
+    json.pointer("/choices/0/finish_reason")
+        .or_else(|| json.get("stop_reason"))
+        .and_then(|v| v.as_str())
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+}
+
 fn extract_usage(json: &serde_json::Value) -> ReportedUsage {
     let as_u64 = |v: &serde_json::Value| v.as_u64();
     // 两个协议面对这门读数的写法不同，取法归一，账上就只有一列。
@@ -4344,13 +4666,18 @@ fn extract_usage(json: &serde_json::Value) -> ReportedUsage {
                 // 的人，把 88% 的命中读成 1.1%，把「读回多少」读成「整个 prompt」。
                 // 减掉之后再记，两种口径就合成一句：`input` 是没被缓存服务的那部分，
                 // `input + cached` 是整个 prompt，命中率一律 `cached/(input+cached)`。
+                // `prompt_tokens` 含缓存命中，要减掉；`input_tokens` 本来就不含，
+                // 不减。两种写法在「没有 type 的尾帧」上都会出现，只认一种会让另一半
+                // 调用整条记成零。
                 usage
                     .and_then(|u| u.get("prompt_tokens"))
                     .and_then(as_u64)
-                    .map(|prompt| prompt.saturating_sub(cached.unwrap_or(0))),
+                    .map(|prompt| prompt.saturating_sub(cached.unwrap_or(0)))
+                    .or_else(|| usage.and_then(|u| u.get("input_tokens")).and_then(as_u64)),
                 usage
                     .and_then(|u| u.get("completion_tokens"))
-                    .and_then(as_u64),
+                    .and_then(as_u64)
+                    .or_else(|| usage.and_then(|u| u.get("output_tokens")).and_then(as_u64)),
                 cached,
                 None,
                 usage.and_then(reasoning_of),
@@ -4362,10 +4689,22 @@ fn extract_usage(json: &serde_json::Value) -> ReportedUsage {
 /// 透传响应流的旁路扫描器：逐字节转发不变，只从 SSE `data:` 行里抠 usage。
 /// 非 SSE 响应（application/json 整体 body）在行解析失败后由 `finish`
 /// 兜底解析。扫描永不报错——认不出 usage 就是零，不是故障。
-#[derive(Default)]
 struct UsageScanner {
     line_buf: Vec<u8>,
+    /// 整段响应。**只在没有别处承接正文时攒**（`keep_raw`）：接上大对象写者之后，
+    /// 字节在到达的那一拍就写进库，这里再留一份既是第二份正本，也是「无界」的反面
+    /// ——正文多大，进程内存就多大。
     raw: Vec<u8>,
+    /// 是否把正文留在内存里。默认 `true`（测试与没有写者的部署走这条），
+    /// 接上写者时置 `false`。
+    keep_raw: bool,
+    /// 这一跳一共看到多少字节，无论有没有留下来。
+    ///
+    /// 与 `raw.len()` 是两个问题：后者是副本有多长，前者是上游发了多少。两者现在相等
+    /// ——副本不再有截断（见 `feed`）。这一格仍旧单独记着：它是「上游到底发了多少」的
+    /// 唯一读数，将来若那条路真的出了岔子（写不进去、读不回来），差就出在这里，而不是
+    /// 让读者从「正文短」去猜。
+    seen: u64,
     tokens_input: u64,
     tokens_output: u64,
     /// 上游自报的缓存命中量。与另两个计数同样只在真拿到正数时改写：中间帧常带一个
@@ -4397,13 +4736,74 @@ struct UsageScanner {
     /// 只有没见到结束标记就被放开的流才真的是中途断了。这两件事在没有这个
     /// 字段时同形，读数只能把它们一起记成"断了"。
     saw_done: bool,
+    /// 模型侧为什么停了（`stop` / `length` / `tool_calls` / `content_filter` …）。
+    /// 平台的结果词说的是调用成没成，这一格说的是模型自己停在哪——两者不同。
+    finish_reason: Option<String>,
+    /// 第一帧到达的时刻与第一段内容到达的时刻。两者之差是首字时延；
+    /// 只在这条流真的逐帧过的时候才有值（非流式一次给完整 body）。
+    first_byte_at: Option<std::time::Instant>,
+    first_token_at: Option<std::time::Instant>,
+}
+
+impl Default for UsageScanner {
+    fn default() -> Self {
+        // 派生出来的 `keep_raw` 会是 `false`，而那恰好是本字段存在之前的行为的反面：
+        // 不显式写这一格，「没有写者」的部署就会静默丢掉正文。
+        Self {
+            line_buf: Vec::new(),
+            raw: Vec::new(),
+            keep_raw: true,
+            seen: 0,
+            tokens_input: 0,
+            tokens_output: 0,
+            tokens_cached: 0,
+            tokens_cache_created: 0,
+            tokens_reasoning: 0,
+            saw_reasoning: false,
+            saw_cache_created: false,
+            saw_error: false,
+            saw_usage: false,
+            asked: false,
+            saw_done: false,
+            finish_reason: None,
+            first_byte_at: None,
+            first_token_at: None,
+        }
+    }
 }
 
 impl UsageScanner {
+    /// 模型侧停在哪个词上；`None` 是这一通没有哪一帧报过。
+    fn finish_reason(&self) -> Option<&str> {
+        self.finish_reason.as_deref()
+    }
+
+    /// 首字时延：第一段内容到达的时刻减第一帧到达的时刻。两格缺一就是 `None`
+    /// ——「没量到」不是「0 毫秒」。
+    fn ttft_ms(&self) -> Option<u64> {
+        match (self.first_byte_at, self.first_token_at) {
+            (Some(start), Some(token)) => {
+                Some(token.saturating_duration_since(start).as_millis() as u64)
+            }
+            _ => None,
+        }
+    }
+
     fn feed(&mut self, chunk: &[u8]) {
+        self.first_byte_at
+            .get_or_insert_with(std::time::Instant::now);
         self.line_buf.extend_from_slice(chunk);
-        // 非 SSE body 的兜底解析需要原文；上限 1MiB 防内存被异常响应顶爆。
-        if self.raw.len() < 1024 * 1024 {
+        self.seen += chunk.len() as u64;
+
+        // 整条响应原样留下：没有窗口、没有阈值、没有截断。
+        //
+        // 从前这里有一道写死的字节数做上限（`if raw.len() < 1024 * 1024`），越过的部分没有副本，而落库那一行
+        // 看起来是完整的——只有把 `seen` 与副本长度摆在一起才看得出少了一截。正文
+        // 是这次调用唯一的现场，现场不许被安静地切掉；大小由上游自己决定（受它自己的
+        // 输出上限约束），不由我们拍一个数。
+        if self.keep_raw {
+            // 正文另有落点时这里不存：字节在到达那一拍就写进库了，这里再留一份是
+            // 第二份正本，也是「无界」的反面。解析照旧进行——用量帧在下面那段。
             self.raw.extend_from_slice(chunk);
         }
         while let Some(pos) = self.line_buf.iter().position(|b| *b == b'\n') {
@@ -4425,6 +4825,33 @@ impl UsageScanner {
                 // 各有一个"到此为止"的标记，漏认一个就让那一半的完整流看起来像断线。
                 if json.get("type").and_then(|t| t.as_str()) == Some("message_stop") {
                     self.saw_done = true;
+                }
+                // 两种协议面的停法：OpenAI 在 `choices[0].finish_reason`，Anthropic
+                // 在顶层 `stop_reason`。只记住非空的，占位的空串不算读数。
+                // 第一段内容：OpenAI 的 `choices[0].delta.content` 或 Anthropic 的
+                // `delta.text` / `content_block_delta`。空串不算「到了」。
+                if self.first_token_at.is_none()
+                    && json
+                        .pointer("/choices/0/delta/content")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|text| !text.is_empty())
+                    || self.first_token_at.is_none()
+                        && json
+                            .pointer("/delta/text")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|text| !text.is_empty())
+                {
+                    self.first_token_at = Some(std::time::Instant::now());
+                }
+                if let Some(reason) = json
+                    .pointer("/choices/0/finish_reason")
+                    .or_else(|| json.get("stop_reason"))
+                    .or_else(|| json.pointer("/delta/stop_reason"))
+                    .and_then(|v| v.as_str())
+                {
+                    if !reason.is_empty() {
+                        self.finish_reason = Some(reason.to_string());
+                    }
                 }
                 let (input, output, cached, cache_created, reasoning) = extract_usage(&json);
                 self.absorb(input, output, cached, cache_created, reasoning);
@@ -4578,8 +5005,21 @@ impl UsageScanner {
 /// incremented from the same place, no existing reading showed the loss. Tying
 /// the write to a value the stream owns makes both paths the same write:
 /// normally from the tail, and on the way out from [`Drop`].
+/// 上游回来的那一段原文，以及这一跳总共看到多少字节。
+///
+/// 两者绑在一起走，因为它们回答的是同一笔调用的两个问题，而分开取会让「副本短」
+/// 与「正文短」在读者那里又变成同一个形状：`bytes` 是留下来、要写进 Raw 层的那
+/// 一份，`seen` 是上游实际发了多少。
+struct CapturedBody {
+    bytes: Vec<u8>,
+    seen: u64,
+}
+
 struct UsageRecorder {
     scanner: Arc<Mutex<UsageScanner>>,
+    /// 这一段正文的句柄格。**存格子不存句柄**：构造记录器时第一块可能还没到，
+    /// 句柄那时还不存在；封口发生在流结束，那时格子里才有值。
+    body: Arc<tokio::sync::OnceCell<Option<Arc<dyn cog_core::BodyWriter>>>>,
     state: AppState,
     upstream: LlmUpstream,
     /// 请求侧的三件事实（谁、哪个环境、这份字节值多少），在请求还在手上的那一刻就
@@ -4604,13 +5044,17 @@ impl UsageRecorder {
     /// Claiming here rather than after the write is deliberate: a stream
     /// dropped mid-write has still had its reading taken, and writing it twice
     /// would be worse than writing it once.
-    fn reading(&mut self, abandoned: bool) -> (UsageReading, Vec<u8>) {
+    fn reading(&mut self, abandoned: bool) -> (UsageReading, CapturedBody) {
         self.claimed = true;
         let mut s = self.scanner.lock().unwrap();
         s.finish();
-        // 响应原文在这里一并取走：扫描器本来就留着（上限 1 MiB，见 `feed`），
-        // 留底要的就是它，不必再从流里抄第二份。
-        let raw = s.raw.clone();
+        // 响应原文在这里一并取走：扫描器本来就留着整条（见 `feed`），
+        // 留底要的就是它，不必再从流里抄第二份。`seen` 跟它一起走：副本有多长与
+        // 上游一共发了多少必须同一次读出，分开读会让两个数说不上同一笔。
+        let captured = CapturedBody {
+            bytes: s.raw.clone(),
+            seen: s.seen,
+        };
         (
             UsageReading {
                 input: s.tokens_input,
@@ -4618,13 +5062,15 @@ impl UsageRecorder {
                 cached: s.tokens_cached,
                 cache_created: s.saw_cache_created.then_some(s.tokens_cache_created),
                 reasoning: s.saw_reasoning.then_some(s.tokens_reasoning),
+                finish_reason: s.finish_reason.clone(),
+                ttft_ms: s.ttft_ms(),
                 outcome: if abandoned {
                     s.outcome_abandoned()
                 } else {
                     s.outcome()
                 },
             },
-            raw,
+            captured,
         )
     }
 }
@@ -4635,13 +5081,17 @@ impl Drop for UsageRecorder {
             return;
         }
         let completed = self.scanner.lock().is_ok_and(|s| s.dropped_completed());
-        let (reading, raw) = self.reading(true);
+        let (reading, captured) = self.reading(true);
         let state = self.state.clone();
         let upstream = self.upstream.clone();
         // Cloned, not taken: an empty request side is a shape this type exists to
         // keep out of the ledger, so `Drop` leaves a whole one behind rather
         // than a hollow that reads like one.
         let request = self.request.clone();
+        // 封口要在能 await 的地方做，而 `Drop` 不能——于是把两样东西交给那个自己的
+        // 任务：句柄格与扫描器（它留着「每一块都写进去了吗」这个读数）。
+        let scanner = self.scanner.clone();
+        let body = self.body.clone();
         let latency_ms = self.start.elapsed().as_millis() as u64;
         // [`Drop`] cannot await and the caller is already on its way out, so
         // the write rides a task of its own. Only a runtime that is itself
@@ -4649,7 +5099,7 @@ impl Drop for UsageRecorder {
         // than a request.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                record_llm_tokens(
+                let _ = record_llm_tokens(
                     &state,
                     &upstream,
                     UsageResult::Ok,
@@ -4660,13 +5110,16 @@ impl Drop for UsageRecorder {
                 .await;
                 // 这里也要留底：用量行只留下三个计数，正文才是这次调用真正的现场。
                 // 标签按"流有没有走完"给，而不是"尾巴跑没跑"——后者对每一笔都成立。
+                let response_object = seal_stream_body(&scanner, &body).await;
                 record_exchange(
                     &state,
                     &upstream,
                     &request,
                     if completed { "ok" } else { "abandoned" },
-                    Some(&raw),
+                    Some(&captured.bytes),
+                    captured.seen,
                     latency_ms,
+                    response_object,
                 )
                 .await;
             });
@@ -4692,52 +5145,120 @@ fn wrap_usage_scan(
         asked,
         ..UsageScanner::default()
     }));
+    // 开了正文落点就把扫描器设成「不攒」，每一块在到达的这一拍照写出去；
+    // 写不进去时退回攒——宁可多一份内存，也不要静默丢一块正文。
+    let body_store = state.body_store.clone();
+    if body_store.is_some() {
+        scanner.lock().unwrap().keep_raw = false;
+    }
+    // 第一块到达时才开户：`wrap_usage_scan` 是同步函数，开户要 await。`OnceCell`
+    // 让「只开一次」成为类型上的事实，不是靠一个 `bool` 记着。
+    let writer: Arc<tokio::sync::OnceCell<Option<Arc<dyn cog_core::BodyWriter>>>> =
+        Arc::new(tokio::sync::OnceCell::new());
     let scan = scanner.clone();
-    let scanned = stream.map(move |item| {
-        match &item {
-            Ok(bytes) => {
-                let mut s = scan.lock().unwrap();
-                s.feed(bytes);
+    let store_for_chunks = body_store.clone();
+    let writer_for_chunks = writer.clone();
+    let scanned = stream.then(move |item| {
+        let scan = scan.clone();
+        let body_store = store_for_chunks.clone();
+        let writer = writer_for_chunks.clone();
+        async move {
+            match &item {
+                Ok(bytes) => {
+                    // 先在锁里取块、放锁，再等待写：guard 不许跨 await。
+                    let chunk = {
+                        let mut s = scan.lock().unwrap();
+                        s.feed(bytes);
+                        bytes.to_vec()
+                    };
+                    if let Some(store) = body_store.as_ref() {
+                        let handle = writer
+                            .get_or_init(|| async { store.open().await.ok().map(Arc::from) })
+                            .await;
+                        if let Some(handle) = handle.as_ref() {
+                            // 写不进去就退回攒：宁可多一份内存，也不要静默丢一块正文。
+                            if handle.write(&chunk).await.is_err() {
+                                scan.lock().unwrap().keep_raw = true;
+                            }
+                        } else {
+                            scan.lock().unwrap().keep_raw = true;
+                        }
+                    }
+                }
+                Err(_) => {
+                    let mut s = scan.lock().unwrap();
+                    s.saw_error = true;
+                }
             }
-            Err(_) => {
-                let mut s = scan.lock().unwrap();
-                s.saw_error = true;
-            }
+            item
         }
-        item
     });
     let mut recorder = UsageRecorder {
         scanner,
+        // 句柄可能还没开（第一块没到）——那时没有正文可封，与「没接落点」同形：
+        // 两者的正文都在扫描器的内存里，落库时走行内列。
+        body: writer.clone(),
         state,
         upstream,
         request,
         start,
         claimed: false,
     };
-    let finalize = futures::stream::once(async move {
-        let (reading, raw) = recorder.reading(false);
-        let latency_ms = recorder.start.elapsed().as_millis() as u64;
-        record_llm_tokens(
-            &recorder.state,
-            &recorder.upstream,
-            UsageResult::Ok,
-            reading,
-            latency_ms,
-            &recorder.request,
-        )
-        .await;
-        record_exchange(
-            &recorder.state,
-            &recorder.upstream,
-            &recorder.request,
-            "ok",
-            Some(&raw),
-            latency_ms,
-        )
-        .await;
-        Ok(axum::body::Bytes::new())
-    });
-    scanned.chain(finalize)
+    // 最后一帧压到落账之后：落成了才转发结束帧，落不成就不转发——客户端读到的是
+    // 一条没有结束帧的流（我们的扫描器把这种流读作 abandoned，而不是成功）。
+    let held = futures::stream::unfold(
+        (
+            Box::pin(scanned),
+            None::<Result<axum::body::Bytes, reqwest::Error>>,
+            Some(recorder),
+        ),
+        |(mut inner, mut pending, mut recorder)| async move {
+            use futures::StreamExt;
+            loop {
+                match inner.next().await {
+                    Some(item) => {
+                        if let Some(previous) = pending.replace(item) {
+                            return Some((previous, (inner, pending, recorder)));
+                        }
+                    }
+                    None => {
+                        let Some(mut rec) = recorder.take() else {
+                            return None;
+                        };
+                        let (reading, captured) = rec.reading(false);
+                        let latency_ms = rec.start.elapsed().as_millis() as u64;
+                        let landed = record_llm_tokens(
+                            &rec.state,
+                            &rec.upstream,
+                            UsageResult::Ok,
+                            reading,
+                            latency_ms,
+                            &rec.request,
+                        )
+                        .await
+                        .is_ok();
+                        let response_object = seal_stream_body(&rec.scanner, &rec.body).await;
+                        record_exchange(
+                            &rec.state,
+                            &rec.upstream,
+                            &rec.request,
+                            if landed { "ok" } else { "not_landed" },
+                            Some(&captured.bytes),
+                            captured.seen,
+                            latency_ms,
+                            response_object,
+                        )
+                        .await;
+                        if !landed {
+                            return None;
+                        }
+                        return pending.take().map(|last| (last, (inner, None, None)));
+                    }
+                }
+            }
+        },
+    );
+    held
 }
 
 /// 上游健康状态变化的落点：时序明细（状态、连续失败数、配额恢复时刻、拒绝成因），
@@ -5134,7 +5655,8 @@ async fn sync_pool_alert(state: &AppState, down: bool) {
 
 /// 配速预留用多少天的历史任务来量一件任务的成本。取近一个月：短了会被一次
 /// 异常便宜的批任务拉低，长了会把配置/提示词变更之前的形状带进来。
-// cap: bound — 用近一个月的历史任务量成本；短了会被一次异常便宜的批任务拉低，长了会把提示词变更前的形状带进来
+// cap: fixed — 用近一个月的历史任务量成本；短了会被一次异常便宜的批任务拉低，长了会把提示词变更前的形状带进来
+// keep: 删掉后预留被一次异常便宜的批任务拉低，或把提示词变更前的形状带进来；由「用近一个月的历史任务量成本」兜住
 const WINDOW_PACE_RESERVE_DAYS: i64 = 30;
 /// 预留取的分位数。这一格要答的是"这一窗还装不装得下**一件整活**"，不是"装不
 /// 装得下一件典型的活"——低于分布顶端的任何一个分位，答的都是后一个问题，而两
@@ -5149,7 +5671,8 @@ const WINDOW_PACE_RESERVE_DAYS: i64 = 30;
 /// 1,099,270），一窗之内有界。这一格抬高之后，配速可以一直拒到这一窗真能付得起
 /// 一件整活为止——而"这条尺子根本装不下一件活"要另判，否则抬高的预留会把窄窗变
 /// 成永久拒绝，见 [`crate::window_pace::governing_ruler`]。
-// cap: bound — 预留取 99 分位：低于它的分位答的是"典型的活装得下"，不是"整件装得下"
+// cap: fixed — 预留取 99 分位：低于它的分位答的是"典型的活装得下"，不是"整件装得下"
+// keep: 删掉后预留按典型活答，整件活装不下却没人发现；由「低于它的分位答的是典型的活」兜住
 const WINDOW_PACE_RESERVE_QUANTILE: f64 = 0.99;
 
 /// 一拍窗口配速：量出每个上游的容量、算出这一窗的允许量、把用量对上去。
@@ -5318,8 +5841,17 @@ async fn publish_window_pace_gauges(state: &AppState, reading: &WindowPaceReadin
 
 /// 一次账本求和的等待上界。这条路径在池状态发布循环里（不是请求路径），但循环一停
 /// 池状态就不再续期，所以等一个不响应的 PG 必须有上限。
-// cap: bound — 池状态发布循环里等一次账本求和的上限；循环一停池状态就不续期，必须有界
-const SPEND_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+// cap: fixed — 池状态发布循环里等一次账本求和的上限；循环一停池状态就不续期，必须有界
+// keep: 删掉后循环等一次账本求和，一停池状态就不续期；由「必须有界」兜住
+// wall: 等=账本给出这一窗口的求和 / 等不到=这一拍读作「账本读不到」，**不是花掉 0**——配速不能拿一个没读到的 0 当依据 / 续跑=能，下一拍再求和
+// 删掉它，一次卡住的额度读会挂住准入判定（任务无法开始）；额度读是准入的前置，
+// 它答不上来时应当按「这一次不批准」收尾，而不是无限等。来源是准入路径的这条约定。
+fn spend_read_timeout() -> cog_core::Bound<std::time::Duration> {
+    cog_core::Bound::fixed(
+        std::time::Duration::from_secs(5),
+        "额度读是准入前置：答不上来按这一次不批准收尾，不无限等",
+    )
+}
 
 /// 重算"今天为止花了多少"，以及这一拍到底量到没有。
 ///
@@ -5337,7 +5869,8 @@ async fn refresh_spend_reading(
     };
     let day_start = crate::spend_reading::day_start_unix(now_unix);
     let read =
-        tokio::time::timeout(SPEND_READ_TIMEOUT, store.spend_by_actor_since(day_start)).await;
+        // roundtrip: 一次账本求和
+        tokio::time::timeout(spend_read_timeout().get(), store.spend_by_actor_since(day_start)).await;
     match read {
         Ok(Ok((total_tokens, actor_tokens))) => crate::spend_reading::Reading {
             snapshot: Some(crate::spend_reading::SpendSnapshot {
@@ -5408,7 +5941,12 @@ async fn publish_token_totals_from_ledger(state: &AppState) {
     let Some(store) = state.pool_obs.usage.clone() else {
         return;
     };
-    let read = tokio::time::timeout(SPEND_READ_TIMEOUT, store.spend_by_upstream_and_actor()).await;
+    // roundtrip: 一次账本求和
+    let read = tokio::time::timeout(
+        spend_read_timeout().get(),
+        store.spend_by_upstream_and_actor(),
+    )
+    .await;
     let rows = match read {
         Ok(Ok(rows)) => rows,
         Ok(Err(e)) => {
@@ -6350,9 +6888,22 @@ pub const POOL_STATE_PUBLISHER_LOOP: &str = "gateway_pool_state_publisher";
 /// Loop name reported through the background-loop liveness family.
 pub const LLM_HEALTH_PROBER_LOOP: &str = "gateway_llm_health_prober";
 
+/// 部署声明的节拍原样生效；0 秒是忙等，不是一个节拍，点名拒绝。
+///
+/// 从前网关在两个读它的地方各把声明的值静默抬一次（池检查 5 秒、健康探测
+/// 30 秒），于是声明的值与生效的值有两个，而写配置的人读不到后一个。
+fn declared_cadence(env_name: &str, secs: u64) -> Result<u64, String> {
+    if secs == 0 {
+        return Err(format!(
+            "{env_name} 声明为 0 秒：那是忙等，不是一个节拍。给它一个周期。"
+        ));
+    }
+    Ok(secs)
+}
+
 /// 池状态发布循环：把进程内的池健康周期性落成指标/时序/告警/跨进程信号。
 fn spawn_pool_state_publisher(state: AppState) -> tokio::task::JoinHandle<()> {
-    let period = std::time::Duration::from_secs(state.config.pool_check_secs.max(5));
+    let period = std::time::Duration::from_secs(state.config.pool_check_secs);
     // Nothing hands this loop a stop signal: it runs for the life of the gateway
     // process, so any exit leaves the pool state unprojected.
     cog_core::loop_health::spawn_unstoppable(
@@ -6381,7 +6932,8 @@ pub const QUOTA_PROJECTION_LOOP: &str = "gateway_quota_projection";
 /// 这是**投影的滞后上界**，不是一条策略：格子里的数与账本最多差这么多秒的花销。
 /// 不能为 0（那样每一发都要连一次库），也不该更大——一天的额度是粗控，半分钟
 /// 的滞后远小于一次普通运行的花销。
-// cap: bound — 是投影滞后的上界不是旋钮；更短就要每发连库，更长就放跑了超额
+// cap: fixed — 是投影滞后的上界不是旋钮；更短就要每发连库，更长就放跑了超额
+// keep: 删掉后投影滞后无界，超额被放跑；由「是投影滞后的上界不是旋钮」兜住
 //
 // 公开是为了让读这条循环结局的告警规则按它自己的节拍取窗口：窗口写死一个数、
 // 而节拍改了，规则会在每一轮里只覆盖其中的一小段（或者跨了好几轮）。
@@ -7171,6 +7723,20 @@ async fn stream_forward(
             .get(cog_core::LLM_OWNER_HEADER)
             .and_then(|v| v.to_str().ok()),
     );
+    // 会话那一轴，读取与归一规则同上，且同样缺省为空。它不被判定，只被记录：一段
+    // 对话没有上限，所以它读错一个值时坏掉的是一个读数，不是谁的额度。
+    let session = normalize_task(
+        req.headers()
+            .get(cog_core::LLM_SESSION_HEADER)
+            .and_then(|v| v.to_str().ok()),
+    );
+    // 装配时挤掉了多少条更早的消息：0 与「没有这一格」都不写。
+    let prompt_dropped = req
+        .headers()
+        .get(cog_core::LLM_PROMPT_DROPPED_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|count| *count > 0);
     // 身份是**前置条件**，不是事后补的一格。以前这里把缺名字的调用归一成
     // `unknown` 再照常转发，于是平台为一整段无人认领的调用付了钱：2026-10-04 至
     // 10-19 的 987 次调用、2,802 万输入 token 全落在那一格，事后只能靠请求体里的
@@ -7199,7 +7765,7 @@ async fn stream_forward(
             // 「有多少次调用因为没报身份被挡在门外」，counter 让
             // `llm_call_without_declared_actor` 这条规则继续有信号可读——它读的
             // 就是这个格子，早退之后只剩这一处会写它。
-            land_usage_record(
+            let _ = land_usage_record(
                 &state,
                 unidentified_refusal_usage(
                     style,
@@ -7208,7 +7774,8 @@ async fn stream_forward(
                     task.as_deref(),
                     owner.as_deref(),
                 ),
-            );
+            )
+            .await;
             record_counter(
                 &state,
                 cog_core::metric_names::LLM_CALLS_TOTAL,
@@ -7226,7 +7793,7 @@ async fn stream_forward(
     let body = axum::body::to_bytes(req.into_body(), MAX_PROXIED_BODY_BYTES)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let parsed = cog_core::logged_ok!(serde_json::from_slice::<serde_json::Value>(&body));
 
     // 携带 tools 的请求只路由到实证支持原生 tool_calls 的上游：
     // 实证说 Some(false) 的上游对工具类负载只会空转烧钱
@@ -7312,7 +7879,9 @@ async fn stream_forward(
         &origin,
         task.as_deref(),
         owner.as_deref(),
-    ) {
+    )
+    .await
+    {
         tracing::warn!(
             // 拒绝面必须自称：503 是熔断期"一个上游都没试"的结果，与"试遍了
             // 都不行"在状态码、在响应体上都同形（两者都可能是 503），唯一分得开
@@ -7723,7 +8292,7 @@ async fn stream_forward(
                 .get(reqwest::header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
-            let text = resp.text().await.unwrap_or_default();
+            let text = cog_core::logged_default!(resp.text().await);
             // 上游拒了这一份请求：问题与答复都留底。这是"为什么被拒"唯一不经解释的
             // 现场——拒绝分类是从这段文本里解析出来的，解析错的争议要靠它来判。
             record_exchange(
@@ -7734,12 +8303,16 @@ async fn stream_forward(
                     origin: origin.clone(),
                     task: task.clone(),
                     owner: owner.clone(),
+                    session: session.clone(),
+                    prompt_dropped: None,
                     estimated_input: Some(estimated_input),
                     request_body: Some(request_body.clone()),
                 },
                 "error",
                 Some(text.as_bytes()),
+                text.len() as u64,
                 start.elapsed().as_millis() as u64,
+                None,
             )
             .await;
             let quota_reset = parse_quota_reset(&text, retry_after.as_deref());
@@ -7838,6 +8411,8 @@ async fn stream_forward(
                 origin: origin.clone(),
                 task: task.clone(),
                 owner: owner.clone(),
+                session: session.clone(),
+                prompt_dropped,
                 estimated_input: Some(estimated_input),
                 request_body: Some(request_body.clone()),
             },
@@ -7996,7 +8571,7 @@ async fn record_upstream_failure(
 /// 每退避窗口最多烧一次 max_tokens=1 的探测，配额消耗有界。
 /// 探测成功即热恢复（进程内清嫌疑，零重启），失败则指数加窗。
 fn spawn_llm_health_prober(state: AppState) -> tokio::task::JoinHandle<()> {
-    let period = std::time::Duration::from_secs(state.config.llm_health_probe_secs.max(30));
+    let period = std::time::Duration::from_secs(state.config.llm_health_probe_secs);
     // Nothing hands this loop a stop signal: it runs for the life of the gateway
     // process, and without it a suspect upstream is never retested.
     cog_core::loop_health::spawn_unstoppable(
@@ -8029,11 +8604,14 @@ pub const PRICE_WATCH_LOOP: &str = "gateway_llm_price_watch";
 /// 一天一次。价格是年尺度的东西，抓勤了只是给上游站点加负载；而它判的是「配置
 /// 里那份抄本还是不是今天挂出来的那份」，晚一天知道与早知道一天，差的是那一天
 /// 的账按旧价算——真调价时那笔钱本来也只在下一笔账里才看得见。
-// cap: bound — 这是对账滞后的上界，不是吞吐旋钮
+// cap: fixed — 这是对账滞后的上界，不是吞吐旋钮
+// keep: 删掉后对账滞后无界，价格变了却不被看见；由「这是对账滞后的上界」兜住
 const PRICE_WATCH_PERIOD: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 /// 抓一次价目页的墙。页面很小，10 秒足够；超时读作「读不到」，与解析失败分开报。
-// cap: bound — 一页很小的正文，10 秒是「读不到」与「慢」的分界，不是吞吐旋钮
+// cap: fixed — 一页很小的正文，10 秒是「读不到」与「慢」的分界，不是吞吐旋钮
+// keep: 删掉后一页很小的正文读不到与慢分不开；由「10 秒是读不到与慢的分界」兜住
+// wall: 等=价格页那一小段正文回来 / 等不到=这一格读作「价格读不到」，不是「免费」 / 续跑=能，下一次重新取整页
 const PRICE_PAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 配置价目与官方页对不上时开的那一行。
@@ -8428,7 +9006,7 @@ async fn probe_face(
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-        let text = resp.text().await.unwrap_or_default();
+        let text = cog_core::logged_default!(resp.text().await);
         Err(UpstreamRefusal::from_body(
             status.as_u16(),
             format!("HTTP {status}: {}", error_excerpt(&text)),
@@ -8521,7 +9099,9 @@ async fn call_llm(
         None,
         // 网关自己的意图判定不发在任何人名下：它没有请求方声明的人。
         None,
-    ) {
+    )
+    .await
+    {
         tracing::warn!(
             // 拒绝面必须自称：503 是熔断期"一个上游都没试"的结果，与"试遍了
             // 都不行"在状态码、在响应体上都同形（两者都可能是 503），唯一分得开
@@ -8637,6 +9217,8 @@ async fn call_one_upstream(
             origin: origin.to_string(),
             task: None,
             owner: None,
+            session: None,
+            prompt_dropped: None,
             estimated_input: Some(estimated_input),
             // 这条路自己拼 JSON，不经过可留底的那份字节。
             request_body: None,
@@ -8657,7 +9239,7 @@ async fn call_one_upstream(
                 .get(reqwest::header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
-            let text = resp.text().await.unwrap_or_default();
+            let text = cog_core::logged_default!(resp.text().await);
             return Err(UpstreamRefusal::from_body(
                 status.as_u16(),
                 format!("上游 {base} 返回 HTTP {status}: {}", error_excerpt(&text)),
@@ -8671,7 +9253,8 @@ async fn call_one_upstream(
             .map_err(|e| UpstreamRefusal::transport(format!("上游 {base} 响应解析失败: {e}")))?;
         // 这条是非流式调用：响应的 usage 在 body 里本来就该有，不需要我们开口要，
         // 所以它缺席是上游的账（absent），不是我们没问。
-        let reading = UsageReading::from_usage(extract_usage(&v), true);
+        let reading = UsageReading::from_usage(extract_usage(&v), true)
+            .with_finish_reason(finish_reason_of(&v));
         record_llm_tokens(
             state,
             upstream,
@@ -8680,7 +9263,8 @@ async fn call_one_upstream(
             start.elapsed().as_millis() as u64,
             &request_side,
         )
-        .await;
+        .await
+        .map_err(|e| UpstreamRefusal::transport(e))?;
         let content = v["content"][0]["text"]
             .as_str()
             .unwrap_or_default()
@@ -8701,6 +9285,8 @@ async fn call_one_upstream(
         origin: origin.to_string(),
         task: None,
         owner: None,
+        session: None,
+        prompt_dropped: None,
         estimated_input: Some(estimated_input),
         // 这条路自己拼 JSON，不经过可留底的那份字节。
         request_body: None,
@@ -8720,7 +9306,7 @@ async fn call_one_upstream(
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-        let text = resp.text().await.unwrap_or_default();
+        let text = cog_core::logged_default!(resp.text().await);
         return Err(UpstreamRefusal::from_body(
             status.as_u16(),
             format!("上游 {base} 返回 HTTP {status}: {}", error_excerpt(&text)),
@@ -8734,7 +9320,8 @@ async fn call_one_upstream(
         .map_err(|e| UpstreamRefusal::transport(format!("上游 {base} 响应解析失败: {e}")))?;
     // 这条是非流式调用：响应的 usage 在 body 里本来就该有，不需要我们开口要，
     // 所以它缺席是上游的账（absent），不是我们没问。
-    let reading = UsageReading::from_usage(extract_usage(&v), true);
+    let reading =
+        UsageReading::from_usage(extract_usage(&v), true).with_finish_reason(finish_reason_of(&v));
     record_llm_tokens(
         state,
         upstream,
@@ -8743,7 +9330,8 @@ async fn call_one_upstream(
         start.elapsed().as_millis() as u64,
         &request_side,
     )
-    .await;
+    .await
+    .map_err(|e| UpstreamRefusal::transport(e))?;
     let content = v["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or_default()
@@ -9109,7 +9697,9 @@ async fn code_platform_forward(
 /// 它必须小于调用方自己的检索墙（`cog-agent` 的 `SEARCH_TIMEOUT_SECS` 是 20s）：
 /// 池是按顺序问的，一次超过这里就会让「还有第二、第三家可问」在调用方眼里变成
 /// 一次超时——那时换上游这件事根本没有发生，而读起来像「后备全挂了」。
-// cap: bound — 一次尝试的上限；池是按顺序问的，超了会让「还有第二三家可问」在调用方眼里变成一次超时
+// cap: fixed — 一次尝试的上限；池是按顺序问的，超了会让「还有第二三家可问」在调用方眼里变成一次超时
+// keep: 删掉后一家慢池把「还有第二三家可问」变成调用方眼里的一次超时；由「池是按顺序问的」兜住
+// wall: 等=池里这一家搜索源的答复 / 等不到=换下一家；**整次检索不停在它身上**，超时只花掉这一家那一份预算 / 续跑=能，下一次检索从头问
 const SEARCH_FALLBACK_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// 后备出口的两个动作。路由决定问哪一个，不由请求体决定——请求体是调用方给的，
@@ -9286,7 +9876,7 @@ async fn search_fallback_outlet(
             }
         };
         let status = resp.status();
-        let raw = resp.text().await.unwrap_or_default();
+        let raw = cog_core::logged_default!(resp.text().await);
         if !status.is_success() {
             let excerpt: String = raw.chars().take(200).collect();
             // 把**问的是哪个地址**写进判词：同一个主机的 `/v1/...` 与 `/coding/v1/...`
@@ -9455,7 +10045,8 @@ async fn attach_proxy(
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     /// 附件的上限，与 GitHub 附件面那条界同值：一个平台接受的附件，在网关这一侧和
     /// 在代码平台那一侧必须是同一个规摸。
-    // cap: bound — 附件的上限，与 GitHub 附件面那条界同值：平台接受的附件在网关这侧和代码平台那侧必须是同一个规模
+    // cap: fixed — 附件的上限，与 GitHub 附件面那条界同值：平台接受的附件在网关这侧和代码平台那侧必须是同一个规模
+    // keep: 删掉后网关接受的附件规模与 GitHub 那侧不一致，附件在另一端被拒；由「两侧必须是同一个规模」兜住
     const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 
     let raw = params
@@ -9824,6 +10415,7 @@ async fn git_https_forward(
     // 给正常请求设预算，而是让"进了黑洞"这件事**可判定**——没有它，一个挂死的
     // 请求会一直占着，兜底永远不会被触发。
     let timeout = crate::git_mirror::GitTransport::https_timeout(is_get);
+    // roundtrip: 一次 git 转发的应答
     let resp = tokio::time::timeout(timeout, builder.send())
         .await
         .map_err(|_| {
@@ -9938,7 +10530,7 @@ async fn webhook_forward(
             )
         })?;
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let text = resp.text().await.unwrap_or_default();
+    let text = cog_core::logged_default!(resp.text().await);
     Ok(axum::response::Response::builder()
         .status(status)
         .header("content-type", "text/plain")
@@ -9964,7 +10556,7 @@ async fn github_webhook_handler(
     let signature = headers
         .get("x-hub-signature-256")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     if !verify_github_signature(secret, &body, signature) {
         tracing::warn!("GitHub webhook 签名验证失败，已拒绝");
         return Err((StatusCode::UNAUTHORIZED, "invalid signature".into()));
@@ -10075,6 +10667,15 @@ async fn metrics_handler(State(state): State<AppState>) -> axum::response::Respo
     {
         Ok(readings) => body.push_str(&crate::prometheus_render::render_raw_metrics(&readings)),
         Err(e) => tracing::warn!(error = %e, "project control readings unavailable this scrape"),
+    }
+    // 传输时限的两条界会跟着实测自己走：静默判死窗和预期工期都不是钉住的数。
+    // 只在这里渲染它们，运维才分得出「界变宽了」和「这条回路停了」——后者的
+    // 形状恰好是求值计数不再增长。
+    match cog_core::Observable::collect_metrics(state.git_transport.pacing().as_ref(), "").await {
+        Ok(readings) => body.push_str(&crate::prometheus_render::render_raw_metrics(&readings)),
+        Err(e) => {
+            tracing::warn!(error = %e, "git transport pacing readings unavailable this scrape")
+        }
     }
     // The volumes this pod writes are readable from nowhere else — the kubelet's
     // per-volume number for a directory-backed volume is the node's filesystem —
@@ -10682,8 +11283,8 @@ async fn internal_llm_status_handler(
         Ok(kube) => kube.secret_pool_policy().await.ok().flatten(),
         Err(_) => None,
     };
-    let (upstreams, declared, names) = match from_file {
-        Some(pool) => (pool.upstreams, pool.min_healthy, pool.names),
+    let (upstreams, declared, names, windows) = match from_file {
+        Some(pool) => (pool.upstreams, pool.min_healthy, pool.names, pool.windows),
         // 读不到文件就报本进程正在用的那份：那不是「没配」，那是「正在用的」。
         None => (
             state.config.llm_upstreams.len(),
@@ -10693,6 +11294,12 @@ async fn internal_llm_status_handler(
                 .llm_upstreams
                 .iter()
                 .map(|u| format!("{}|{}", u.base_url, u.model))
+                .collect(),
+            state
+                .config
+                .llm_upstreams
+                .iter()
+                .filter_map(|u| Some((u.model.clone(), u.context_window?)))
                 .collect(),
         ),
     };
@@ -10705,6 +11312,15 @@ async fn internal_llm_status_handler(
             // 名字不带 key：主应用要用它把「改前是哪几家」写进审计，而凭证只留在
             // 这个进程里。指标的 `upstream` 标签本来就是同一串。
             "names": names,
+            // 各条目自报的公布窗口，主应用拿它定循环裁剪的起点。没有公布规格的
+            // 条目不出现在这里——「没说过」不是「0 个 token」。
+            "windows": windows
+                .into_iter()
+                .map(|(model, context_window)| serde_json::json!({
+                    "model": model,
+                    "context_window": context_window,
+                }))
+                .collect::<Vec<_>>(),
         })),
     )
         .into_response()
@@ -10805,8 +11421,8 @@ fn router(state: AppState, llm_channel: bool) -> Router {
     let r = Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
-        .route("/metrics", get(metrics_handler))
-        .route("/metrics/json", get(metrics_json_handler));
+        .route(METRICS_PATH, get(metrics_handler))
+        .route(METRICS_JSON_PATH, get(metrics_json_handler));
     let r = if llm_channel {
         r.merge(llm_channel_router()).merge(code_channel_router())
     } else {
@@ -10851,8 +11467,8 @@ fn metrics_router(state: AppState) -> Router {
     Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
-        .route("/metrics", get(metrics_handler))
-        .route("/metrics/json", get(metrics_json_handler))
+        .route(METRICS_PATH, get(metrics_handler))
+        .route(METRICS_JSON_PATH, get(metrics_json_handler))
         .with_state(state)
 }
 
@@ -10992,7 +11608,15 @@ pub async fn run(
     provider_compat: Option<Arc<dyn cog_core::ProviderCompatTable>>,
     pool_obs: Arc<PoolObservability>,
     volume_footprint: Vec<VolumeFootprint>,
+    // 流式正文的落点。交进来的理由与其余几样相同：本 crate 不认具体实现，而
+    // 「正文写在大对象里」这件事只有装配层知道该连哪个库。`None` 时正文留在
+    // 扫描器的内存里——那是今天的行为，不是一个新的默认。
+    body_store: Option<Arc<dyn cog_core::BodyStore>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // 两个节拍都是部署声明的：声明 1 秒就跑 1 秒，0 秒是忙等不是一个节拍，
+    // 在这里按名字拒绝——不在读它的那一层悄悄抬成 5 秒或 30 秒。
+    declared_cadence(cog_core::env::LLM_POOL_CHECK_SECS, config.pool_check_secs)?;
+    declared_cadence(LLM_HEALTH_PROBE_SECS_ENV, config.llm_health_probe_secs)?;
     // 本进程的出站客户端由装配层造好交进来（本 crate 不认具体实现）。交回给
     // `contribution_admin`，那些调 github/gitee 的请求与这里其余出站就确实是
     // 同一份设置，而不是各自从配置造出来的第二份。
@@ -11004,11 +11628,11 @@ pub async fn run(
     tracing::info!(identity = %identity, "安全网关出站请求自我标识");
     let state = AppState {
         client: reqwest::Client::builder()
-            .timeout(UPSTREAM_REQUEST_TIMEOUT)
+            .timeout(upstream_request_timeout().get())
             .default_headers(identity_headers.clone())
             .build()?,
         stream_client: reqwest::Client::builder()
-            .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+            .connect_timeout(upstream_connect_timeout().get())
             .default_headers(identity_headers.clone())
             .build()?,
         outbound_identity: identity,
@@ -11039,6 +11663,7 @@ pub async fn run(
             crate::spend_reading::Reading::default(),
         )),
         volume_footprint,
+        body_store,
         provider_compat,
         config: config.clone(),
     };
@@ -11167,6 +11792,21 @@ pub async fn run(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// 声明的节拍原样生效；0 秒按名字拒绝，不再被悄悄抬到一个下限。
+    #[test]
+    fn a_declared_cadence_survives_and_zero_is_refused() {
+        assert_eq!(
+            declared_cadence("COGNEVA_LLM_POOL_CHECK_SECS", 1).unwrap(),
+            1
+        );
+        assert_eq!(
+            declared_cadence("COGNEVA_LLM_POOL_CHECK_SECS", 300).unwrap(),
+            300
+        );
+        let refused = declared_cadence(LLM_HEALTH_PROBE_SECS_ENV, 0).unwrap_err();
+        assert!(refused.contains(LLM_HEALTH_PROBE_SECS_ENV), "{refused}");
+    }
 
     /// A proxied call that names its caller, which every real caller does.
     ///
@@ -11405,6 +12045,7 @@ mod tests {
             requires_temperature_one: None,
             supports_usage_in_streaming: None,
             pricing: None,
+            context_window: None,
         }
     }
 
@@ -11442,6 +12083,36 @@ mod tests {
         assert_eq!(cost.book, "CNY@2026-11-05");
     }
 
+    /// 上游条目自报的公布窗口随池一起解析出来，0 与缺失都读成「没说过」。
+    ///
+    /// 这一格是循环裁剪的起点（主应用把它报进 `cog_core::model_windows`）。少了
+    /// 它，运行时就说不出「这只型号的窗口有多大」，只能等第一次超窗被上游拒——
+    /// 而那次拒绝是真金白银的一发。把 0 读成一个窗口更糟：那是零个 token 的
+    /// 窗口，第一次调用就会把历史裁到只剩一句。
+    #[test]
+    fn an_upstream_entry_carries_the_window_it_was_saved_with() {
+        let raw = r#"[{
+            "base_url": "https://api.example.com",
+            "model": "claude-opus-5-5",
+            "api_key": "k",
+            "context_window": 1000000
+        },{
+            "base_url": "https://api.example.com",
+            "model": "unstated",
+            "api_key": "k"
+        },{
+            "base_url": "https://api.example.com",
+            "model": "zero",
+            "api_key": "k",
+            "context_window": 0
+        }]"#;
+        let pool = super::parse_upstreams(raw);
+        assert_eq!(pool.len(), 3, "窗口那一格读不出来不该丢掉整条目");
+        assert_eq!(pool[0].context_window, Some(1_000_000));
+        assert_eq!(pool[1].context_window, None, "缺失 = 没说过");
+        assert_eq!(pool[2].context_window, None, "0 = 没说过，不是零个 token");
+    }
+
     /// 一次被定价的调用，落进账本的那一行要带着钱和它依据的那本价目。
     ///
     /// 单测只证 `PriceBook::cost` 自己算得对；这条证的是**落账那条路真的用了
@@ -11470,7 +12141,7 @@ mod tests {
         );
         let state = with_usage_ledger(test_state(vec![upstream.clone()]), ledger.clone());
 
-        record_llm_tokens(
+        let _ = record_llm_tokens(
             &state,
             &upstream,
             UsageResult::Ok,
@@ -11485,6 +12156,8 @@ mod tests {
                 origin: "gateway_pool".to_string(),
                 task: None,
                 owner: None,
+                session: None,
+                prompt_dropped: None,
                 estimated_input: None,
                 request_body: None,
             },
@@ -11525,7 +12198,7 @@ mod tests {
         let upstream = stub_upstream("https://api.example.com", "deepseek-flash");
         let state = with_usage_ledger(test_state(vec![upstream.clone()]), ledger.clone());
 
-        record_llm_tokens(
+        let _ = record_llm_tokens(
             &state,
             &upstream,
             UsageResult::Ok,
@@ -11536,6 +12209,8 @@ mod tests {
                 origin: "gateway_pool".to_string(),
                 task: None,
                 owner: None,
+                session: None,
+                prompt_dropped: None,
                 estimated_input: None,
                 request_body: None,
             },
@@ -11696,37 +12371,29 @@ mod tests {
         );
     }
 
-    /// 留底正文里抹掉的是密钥那一段，不是整条正文：整条丢掉等于把这次调用从留底里
-    /// 删掉，而"这里有一处密钥"本身是值得知道的事。
+    /// 副本的名字只由「内容 + 哪一侧」决定，所以同一份提示词重发一千次还是一个
+    /// 对象，而两侧即使字节完全相同也不会互相覆盖。
+    ///
+    /// 三条各挡一种写法：去掉内容哈希，重发就多一个对象；去掉侧别，一次请求与
+    /// 它的响应在字节恰好相同时共用一个名字；名字里再掺别的东西（时间、uuid），
+    /// 内容寻址就不成立了。
     #[test]
-    fn an_exchange_body_drops_the_credential_and_keeps_the_prompt() {
-        let raw = r#"{"api_key":"sk-abcdefghijklmnopqrstuvwx","text":"keep me"}"#;
-        let redacted = redact_exchange(raw);
-        assert!(redacted.contains("keep me"), "{redacted}");
-        assert!(!redacted.contains("abcdefghijklmnopqrstuvwx"), "{redacted}");
-        assert!(redacted.contains("[redacted]"), "{redacted}");
-        // 反方向：一句没有密钥的正文原样留下。少了这格，抹掉一切也能让上面全绿。
-        let plain = r#"{"messages":[{"role":"user","content":"hello"}]}"#;
-        assert_eq!(redact_exchange(plain), plain);
-    }
-
-    /// 上限要到**字符边界**上切：PostgreSQL 的 TEXT 拒半截 UTF-8，而 1 MiB 的截断
-    /// 正好会切在中文中间。
-    #[test]
-    fn a_capped_body_is_cut_on_a_character_boundary_and_flagged() {
-        let raw = "中".repeat(10).into_bytes();
-        let (text, cut) = capped_body(&raw, 4);
-        assert!(cut, "超过上限必须标出来");
-        assert_eq!(text, "中");
-        // 恰好等于上限：不截断、也不标记。少了这格，`>` 写成 `>=` 也全绿。
-        let exact = "abcd".as_bytes().to_vec();
-        let (text, cut) = capped_body(&exact, 4);
-        assert!(!cut);
-        assert_eq!(text, "abcd");
-        // 空 body 与"没有 body"是两回事：前者留一行空正文，后者才是不写。
-        let (text, cut) = capped_body(b"", 4);
-        assert!(!cut);
-        assert_eq!(text, "");
+    fn an_exchange_body_is_named_by_its_content_and_its_side() {
+        let sha = "a".repeat(64);
+        assert_eq!(
+            exchange_raw_id("request", &sha),
+            exchange_raw_id("request", &sha)
+        );
+        assert_ne!(
+            exchange_raw_id("request", &sha),
+            exchange_raw_id("response", &sha)
+        );
+        assert_ne!(
+            exchange_raw_id("request", &sha),
+            exchange_raw_id("request", &"b".repeat(64))
+        );
+        // 名字里不许出现路径分隔符：那会变成对象存储里的目录，下一次列表就数不到它。
+        assert!(!exchange_raw_id("request", &sha).contains('/'));
     }
 
     /// 上游自述过何时恢复时，任何"已成定论"的状态码都降级成一次等待；没自述过
@@ -11936,6 +12603,33 @@ mod tests {
             "usage": {"output_tokens": 210}
         });
         assert_eq!(extract_usage(&delta), (None, Some(210), None, None, None));
+    }
+
+    /// 默认必须把正文留在内存里：`bool` 的派生默认是 `false`，显式写这一格是
+    /// 为了让「没有写者的部署」不静默丢正文——这条用例就是那一格的守卫。
+    #[test]
+    fn a_scanner_with_no_writer_keeps_the_body() {
+        let mut s = UsageScanner::default();
+        s.feed(b"data: {\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n\n");
+        assert_eq!(s.seen, 54, "看见的字节数照旧计");
+        assert!(
+            !s.raw.is_empty(),
+            "没有写者时正文必须留在内存里，否则这一行的正文就是空的"
+        );
+    }
+
+    /// 接上写者时不攒，但**解析照旧**：用量帧不能因为正文另存而消失。
+    #[test]
+    fn a_scanner_with_a_writer_still_reads_the_usage_frames() {
+        let mut s = UsageScanner {
+            keep_raw: false,
+            ..UsageScanner::default()
+        };
+        s.feed(b"data: {\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}\n\n");
+        assert!(s.raw.is_empty(), "有写者时不再留第二份正文");
+        assert_eq!(s.tokens_input, 7);
+        assert_eq!(s.tokens_output, 9);
+        assert!(s.saw_usage);
     }
 
     /// 尾帧报的用量才能改之前读到的读数：一条流上 `message_start` 报的是
@@ -12195,6 +12889,35 @@ mod tests {
         );
     }
 
+    /// 正文没有截断：越过原来那道写死的上限的响应仍然整条留下。
+    ///
+    /// 从前 `feed` 在那个写死的字节数处停手（那一版代码里的裸字面量，没有出处），越过的字节没有副本，而落库那一行看起来是完整的
+    /// ——只有把 `seen` 与副本长度摆在一起才看得出少了一截。这条用例逐块喂过那道旧上限，
+    /// 判「留下的字节与喂进去的逐字节相等」。
+    #[test]
+    fn a_body_past_a_megabyte_is_kept_whole() {
+        let mut s = UsageScanner {
+            asked: true,
+            ..UsageScanner::default()
+        };
+        let chunk = vec![b'x'; 64 * 1024];
+        let chunks = 17; // 16 块整只是旧上限，第 17 块才跨过它
+        for _ in 0..chunks {
+            s.feed(&chunk);
+        }
+        s.finish();
+        assert_eq!(
+            s.raw.len(),
+            chunk.len() * chunks,
+            "正文被截断了：留下的字节比上游发的少"
+        );
+        assert_eq!(
+            s.seen as usize,
+            s.raw.len(),
+            "副本长度与上游发出的字节数不再相等，说明中间还有一处截断"
+        );
+    }
+
     /// 读到结束标记就放开的流是完整的：它不该被记成断线，沉默该按"问没问过"
     /// 分给上游或我们自己。
     #[test]
@@ -12436,10 +13159,12 @@ mod tests {
                 origin: "gateway_pool".to_string(),
                 task: None,
                 owner: None,
+                session: None,
                 // 这条夹具没有请求体可定价，取一个非零数只为了让这条路径落的是
                 // "量过"而不是"没量过"——被丢掉的流要带的就是请求侧钉下的那一份。
                 // 它到不到台账，在这个进程里看不见（测试的 `durable`/`usage` 都是
                 // None），所以这里断言的是计数器那一面。
+                prompt_dropped: None,
                 estimated_input: Some(4),
                 // 夹具没有请求字节；留底那一支不在这格断言里。
                 request_body: None,
@@ -12734,6 +13459,7 @@ mod tests {
             requires_temperature_one: None,
             supports_usage_in_streaming: None,
             pricing: None,
+            context_window: None,
         };
         config.llm_upstreams = vec![
             llm("https://api.deepseek.com/v1", "sk-live"),
@@ -12988,6 +13714,7 @@ mod tests {
             gitee_oauth_client_secret: None,
             github_oauth_client_id: None,
             github_oauth_client_secret: None,
+            memory_api_base: None,
             webhook_port: 8082,
             metrics_port: 9090,
             github_webhook_secret: None,
@@ -13349,6 +14076,7 @@ mod tests {
             requires_temperature_one: None,
             supports_usage_in_streaming: None,
             pricing: None,
+            context_window: None,
         };
         assert!(!table.is_suspect(&u));
         // 首次失败开新窗：返回计数供调用方打 WARN。
@@ -13426,6 +14154,7 @@ mod tests {
             requires_temperature_one: None,
             supports_usage_in_streaming: None,
             pricing: None,
+            context_window: None,
         };
         assert_eq!(table.last_success_unix(), 0, "还没送出过活");
         assert_eq!(
@@ -13540,6 +14269,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             requires_temperature_one: None,
             supports_usage_in_streaming: None,
             pricing: None,
+            context_window: None,
         };
         let pool = vec![u.clone()];
         assert_eq!(
@@ -13958,6 +14688,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             requires_temperature_one: None,
             supports_usage_in_streaming: None,
             pricing: None,
+            context_window: None,
         };
         let a = mk("https://a");
         let b = mk("https://b");
@@ -14222,7 +14953,8 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             "interactive",
             None,
             None,
-        );
+        )
+        .await;
         let (wait, _) = verdict.expect("全灭时判定仍为真：落账不许改判定");
         assert!(wait >= 60, "重试窗下界照旧，落账没有把它挪走");
     }
@@ -14288,7 +15020,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let face = labels
             .get(cog_core::alerts::ALERT_FACE_LABEL)
             .and_then(|v| v.as_str())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         assert_eq!(
             face, POOL_ALERT_FACE,
             "池不可用这一行没写面，无主读数会把它算成没人接：{labels}"
@@ -14520,6 +15252,8 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         alerts: Arc<dyn cog_core::PersistentAlertSink>,
     ) -> AppState {
         state.pool_obs = Arc::new(PoolObservability {
+            llm_call_events: None,
+            usage_landing: None,
             metrics: state.pool_obs.metrics.clone(),
             analytics: None,
             alerts: Some(alerts),
@@ -14536,6 +15270,8 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         ledger: Arc<dyn cog_core::LlmUsageLedger>,
     ) -> AppState {
         state.pool_obs = Arc::new(PoolObservability {
+            llm_call_events: None,
+            usage_landing: None,
             metrics: state.pool_obs.metrics.clone(),
             analytics: None,
             alerts: None,
@@ -14696,7 +15432,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let face = labels
             .get(cog_core::alerts::ALERT_FACE_LABEL)
             .and_then(|v| v.as_str())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         assert_eq!(
             face, POOL_ALERT_FACE,
             "价目告警没写面，读数会把它算成没人接：{labels}"
@@ -15692,6 +16428,10 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             evidence.allowance_tokens, 5_000,
             "the scalars are the pool report, the same numbers the 429 body carries"
         );
+        assert_eq!(
+            evidence.reserve_population, 9,
+            "the reserve is a sample mean: the row carries the N it rests on"
+        );
         assert_eq!(evidence.upstreams.len(), 2);
         let fast = evidence
             .upstreams
@@ -15783,6 +16523,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 allowance_tokens: 1_500_000,
                 spent_tokens: 0,
                 reserve_tokens: 1_000_000,
+                reserve_population: 9,
                 window_start_unix: now - 10,
                 upstreams: vec![PaceUpstreamEvidence {
                     upstream: key.clone(),
@@ -16139,6 +16880,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             requires_temperature_one: None,
             supports_usage_in_streaming: None,
             pricing: None,
+            context_window: None,
         };
         let a = mk("https://a");
         let b = mk("https://b");
@@ -16262,7 +17004,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let _ = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await;
+        cog_core::ignore_lost!(axum::body::to_bytes(resp.into_body(), 1024 * 1024).await);
         assert_eq!(
             seen.lock().unwrap().as_slice(),
             ["/responses".to_string()],
@@ -16311,7 +17053,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let _ = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await;
+        cog_core::ignore_lost!(axum::body::to_bytes(resp.into_body(), 1024 * 1024).await);
         assert_eq!(
             seen.lock().unwrap().as_slice(),
             ["/chat/completions".to_string()],
@@ -17738,6 +18480,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             requires_temperature_one: None,
             supports_usage_in_streaming: None,
             pricing: None,
+            context_window: None,
         }
     }
 
@@ -17774,6 +18517,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let identity = "cogneva/test";
         let headers = identity_default_headers(identity);
         AppState {
+            body_store: None,
             provider_compat: Some(std::sync::Arc::new(StubCompatImages)),
             client: reqwest::Client::builder()
                 .default_headers(headers.clone())
@@ -17800,6 +18544,8 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 ),
             )),
             pool_obs: std::sync::Arc::new(PoolObservability {
+                llm_call_events: None,
+                usage_landing: None,
                 metrics: test_metrics(),
                 analytics: None,
                 alerts: None,
@@ -19206,6 +19952,103 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         );
     }
 
+    /// 行与事件的同名映射按契约里的那张表取值：逐格相等的判据不再自己写键名。
+    #[test]
+    fn the_usage_cell_map_is_what_the_parity_test_reads() {
+        let mut record = unidentified_refusal_usage(
+            "openai",
+            "test",
+            crate::actor_labels::Unidentified::Missing,
+            Some("t-map"),
+            None,
+        );
+        record.tokens_input = 11;
+        record.tokens_output = 22;
+        record.tokens_cached = 33;
+        record.tokens_cache_created = Some(44);
+        let call = llm_call_from(&record, "row-map");
+        let attributes = call.attributes();
+        for (row_field, event_key) in cog_core::USAGE_CELL_MAP {
+            let row_value: serde_json::Value = match *row_field {
+                "tokens_input" => serde_json::json!(record.tokens_input),
+                "tokens_output" => serde_json::json!(record.tokens_output),
+                "tokens_cached" => serde_json::json!(record.tokens_cached),
+                "tokens_cache_created" => serde_json::json!(record.tokens_cache_created),
+                "task" => serde_json::json!(record.task),
+                other => panic!("映射里出现了没有取值的行字段：{other}"),
+            };
+            assert_eq!(
+                attributes.get(*event_key),
+                Some(&row_value),
+                "{row_field} ↔ {event_key} 在行与事件里不是同一个值"
+            );
+        }
+    }
+
+    /// 用量行上有的七格，事件载荷里也必须有：停写行之后，读事件的人不该少一格。
+    #[test]
+    fn the_row_and_the_call_fact_carry_the_same_cells() {
+        let mut record = unidentified_refusal_usage(
+            "openai",
+            "test",
+            crate::actor_labels::Unidentified::Missing,
+            Some("t-1"),
+            None,
+        );
+        record.tokens_reasoning = Some(9);
+        record.latency_ms = 42;
+        record.refusal_kind = Some("quota".into());
+        record.retry_after_secs = Some(30);
+        record.usage_outcome = Some(cog_core::MeteringOutcome::Read);
+        record.estimated_input = Some(7);
+        record.refused_scope = Some("person".into());
+        record.finish_reason = Some("length".into());
+        record.ttft_ms = Some(120);
+        record.prompt_manifest = Some("{\"segments\":[\"aa\"]}".into());
+        record.prompt_dropped = Some(3);
+        let call = llm_call_from(&record, "row-9");
+        assert_eq!(call.call_id, cog_core::llm_call_id("row-9"));
+        assert_eq!(call.tokens_reasoning, record.tokens_reasoning);
+        assert_eq!(call.latency_ms, Some(record.latency_ms));
+        assert_eq!(call.refusal_kind, record.refusal_kind);
+        assert_eq!(call.retry_after_secs, record.retry_after_secs);
+        assert_eq!(
+            call.usage_outcome.as_deref(),
+            record.usage_outcome.map(|o| o.as_str())
+        );
+        assert_eq!(call.estimated_input, record.estimated_input);
+        assert_eq!(call.refused_scope, record.refused_scope);
+        assert_eq!(call.finish_reason, record.finish_reason);
+        assert_eq!(call.ttft_ms, record.ttft_ms);
+        assert_eq!(call.prompt_manifest, record.prompt_manifest);
+        assert_eq!(call.prompt_dropped, record.prompt_dropped);
+    }
+
+    /// 代理写下的每一笔调用都挂回触发它的那条任务：批号就是任务 id。
+    /// 空着的任务照空写——「没说是为哪件事花的」不是「挂到某一件事上」。
+    #[test]
+    fn a_proxied_call_is_attributed_to_the_task_that_caused_it() {
+        let with_task = unidentified_refusal_usage(
+            "openai",
+            "test",
+            crate::actor_labels::Unidentified::Missing,
+            Some("t-1"),
+            None,
+        );
+        let call = llm_call_from(&with_task, "row-1");
+        assert_eq!(call.task_id.as_deref(), Some("t-1"));
+        assert_eq!(call.batch_id.as_deref(), Some("t-1"));
+
+        let without = unidentified_refusal_usage(
+            "openai",
+            "test",
+            crate::actor_labels::Unidentified::Missing,
+            None,
+            None,
+        );
+        assert!(llm_call_from(&without, "row-2").batch_id.is_none());
+    }
+
     /// 耐久面的序列清单必须与真正走耐久面的调用点一致。
     ///
     /// 告警规则的窗口判据按 [`DURABLE_POOL_GAUGES`] 取心跳，所以这份清单少一条
@@ -19682,8 +20525,8 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         /// 任务图上这件活的归属。`None` 是「图里没有这件活」。
         attribution: Option<cog_core::TaskAttribution>,
         failing: bool,
-        /// 落进来的用量行，按到达顺序。`record` 在别的任务上跑，所以这格必须
-        /// 是可共享的；读它的人在测试里轮询到第一行为止。
+        /// 落进来的用量行，按到达顺序。`record` 在请求路径上跑（不 spawn），所以
+        /// 读它的人返回后立刻就能读到；读不到就是「答复早于账」。
         records: std::sync::Mutex<Vec<cog_core::LlmUsageRecord>>,
     }
 
@@ -19746,9 +20589,9 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
     #[async_trait::async_trait]
     impl cog_core::LlmUsageLedger for StubLedger {
-        async fn record(&self, row: &cog_core::LlmUsageRecord) -> Result<(), String> {
+        async fn record(&self, row: &cog_core::LlmUsageRecord) -> Result<String, String> {
             self.records.lock().unwrap().push(row.clone());
-            Ok(())
+            Ok("stub-row".into())
         }
         async fn record_exchange(&self, _: &cog_core::LlmExchangeRecord) -> Result<(), String> {
             unimplemented!("projection stand-in")
@@ -19801,6 +20644,12 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             unimplemented!("projection stand-in")
         }
         async fn spend_by_task(&self, _: &[String]) -> Result<Vec<(String, u64)>, String> {
+            unimplemented!("projection stand-in")
+        }
+        async fn spend_for_session(
+            &self,
+            _: &str,
+        ) -> Result<Option<cog_core::contract::usage_ledger::SessionSpend>, String> {
             unimplemented!("projection stand-in")
         }
         async fn priced_spend_between(
@@ -19902,6 +20751,8 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
         let write_health = state.pool_obs.usage_write_health.clone();
         state.pool_obs = Arc::new(PoolObservability {
+            llm_call_events: None,
+            usage_landing: None,
             metrics: metrics.clone(),
             analytics: None,
             alerts: None,
@@ -20032,6 +20883,8 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         );
         let write_health = state.pool_obs.usage_write_health.clone();
         state.pool_obs = Arc::new(PoolObservability {
+            llm_call_events: None,
+            usage_landing: None,
             metrics: metrics.clone(),
             analytics: None,
             alerts: None,
@@ -20040,21 +20893,15 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             durable: None,
         });
 
-        land_usage_record(
+        let _ = land_usage_record(
             &state,
             pooled_refusal_usage("openai", "a", "cli", None, None, 5),
-        );
+        )
+        .await;
 
-        // 计数写在派生的任务里（落库那条路本来就不在请求路径上等），等它落地。
-        let mut samples = Vec::new();
-        for _ in 0..100 {
-            samples =
-                metrics.matching(cog_core::metric_names::LLM_USAGE_LANDING_DROPPED_TOTAL.as_str());
-            if !samples.is_empty() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        // 一次 yield 都不让：这条读数与落账在同一条路径上，返回时就该在。
+        let samples =
+            metrics.matching(cog_core::metric_names::LLM_USAGE_LANDING_DROPPED_TOTAL.as_str());
         assert_eq!(
             samples.len(),
             1,
@@ -20065,6 +20912,42 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             samples[0].labels.get("reason").map(String::as_str),
             Some("no_ledger"),
             "原因要分开：没有账本与写不进去，修法相反"
+        );
+    }
+
+    /// 答复发出时，这一笔账已经在库里。
+    ///
+    /// 账本这条写在请求路径上，不 spawn：spawn 出去等于「答复发了，账在队列里等写」，
+    /// 进程在两者之间死掉（滚动、OOM、节点回收），这笔花销就永远不进任何窗口——而
+    /// 窗口正是限额、配速与告警的依据。这条用例判的是**次序**，不是「最终会写成」：
+    /// 读完立刻读账本，读到零行说明答复早于账。
+    #[tokio::test]
+    async fn the_usage_row_is_landed_before_the_answer_leaves() {
+        let ledger = Arc::new(StubLedger::with(&[], &[]));
+        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        let metrics = state.pool_obs.metrics.clone();
+        let write_health = state.pool_obs.usage_write_health.clone();
+        state.pool_obs = Arc::new(PoolObservability {
+            metrics,
+            analytics: None,
+            alerts: None,
+            usage: Some(ledger.clone() as Arc<dyn cog_core::LlmUsageLedger>),
+            llm_call_events: None,
+            usage_landing: None,
+            usage_write_health: write_health,
+            durable: None,
+        });
+
+        let _ = land_usage_record(
+            &state,
+            pooled_refusal_usage("openai", "a", "cli", None, None, 5),
+        )
+        .await;
+
+        assert_eq!(
+            ledger.records().len(),
+            1,
+            "答复返回时这一笔账应当已经在库里；零行说明它被派到别的任务上去了"
         );
     }
 
@@ -20169,6 +21052,10 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
     #[async_trait::async_trait]
     impl cog_core::HierarchyManager for StubHierarchy {
+        fn default_limits(&self) -> cog_core::QuotaLimits {
+            unimplemented!("替身不问落回哪一对")
+        }
+
         async fn check(
             &self,
             ctx: &cog_core::QuotaContext,
@@ -20385,6 +21272,8 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         ));
         let write_health = state.pool_obs.usage_write_health.clone();
         state.pool_obs = Arc::new(PoolObservability {
+            llm_call_events: None,
+            usage_landing: None,
             metrics: state.pool_obs.metrics.clone(),
             analytics: None,
             alerts: None,
@@ -20444,6 +21333,8 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         ));
         let write_health = state.pool_obs.usage_write_health.clone();
         state.pool_obs = Arc::new(PoolObservability {
+            llm_call_events: None,
+            usage_landing: None,
             metrics: state.pool_obs.metrics.clone(),
             analytics: None,
             alerts: None,
@@ -20473,6 +21364,8 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         state.owner_budget = Some(Arc::new(StubHierarchy::new(&[])));
         let write_health = state.pool_obs.usage_write_health.clone();
         state.pool_obs = Arc::new(PoolObservability {
+            llm_call_events: None,
+            usage_landing: None,
             metrics: state.pool_obs.metrics.clone(),
             analytics: None,
             alerts: None,
@@ -21044,5 +21937,37 @@ mod token_kind_readings_tests {
     fn a_measured_zero_is_still_written() {
         let kinds = token_kind_readings(&row(Some(0)));
         assert_eq!(kinds[3], ("cache_created", Some(0)));
+    }
+
+    /// 模型侧为什么停了，是调用事实的一格：两种协议面各写一处。
+    #[test]
+    fn the_scanner_keeps_why_the_model_stopped() {
+        let mut openai = UsageScanner::default();
+        openai.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n");
+        assert_eq!(openai.finish_reason(), Some("tool_calls"));
+
+        let mut anthropic = UsageScanner::default();
+        anthropic
+            .feed(b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n");
+        assert_eq!(anthropic.finish_reason(), Some("end_turn"));
+
+        let mut silent = UsageScanner::default();
+        silent.feed(b"data: {\"choices\":[{\"delta\":{}}]}\n");
+        assert_eq!(silent.finish_reason(), None);
+    }
+
+    /// 首字时延只在这一通真有内容帧时才是一个读数；没有内容就是「没量到」。
+    #[test]
+    fn the_scanner_measures_the_first_token_only_when_one_arrives() {
+        let mut streamed = UsageScanner::default();
+        streamed.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n");
+        assert!(
+            streamed.ttft_ms().is_some(),
+            "内容帧到了，首字时延要量得出来"
+        );
+
+        let mut empty = UsageScanner::default();
+        empty.feed(b"data: {\"choices\":[{\"delta\":{}}]}\n");
+        assert_eq!(empty.ttft_ms(), None, "没有内容帧不是 0 毫秒");
     }
 }

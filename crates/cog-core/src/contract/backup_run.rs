@@ -293,6 +293,21 @@ pub struct BackupAccountReading {
     /// history is matched to it by package name. Zero means every package the
     /// writer says it kept has been opened successfully at least once.
     pub drill_unproven_packages: i64,
+    /// Drill attempts that opened and whose end nobody ever saw.
+    ///
+    /// A drill writes its row when it finishes, so a process killed from
+    /// outside leaves nothing in `backup_drills` -- and "no row" is the same
+    /// reading as "nobody scheduled one". These attempts do leave a row: one is
+    /// written when the pass starts, and it is only closed by the pass itself
+    /// or, when that never happens, by the next pass noticing it. An attempt
+    /// closed by the account that way is counted here and marked
+    /// `never_seen`, so a night the drill was killed reads differently from a
+    /// night it stopped on its own criterion.
+    ///
+    /// A running total, not a recent one: this is a count of ways a drill has
+    /// gone missing, and a counter that only went down would need somebody to
+    /// say which of its rows no longer count.
+    pub drill_attempts_never_seen: i64,
 }
 
 /// One restore drill's answer: what a package was opened up and found to hold.
@@ -341,6 +356,22 @@ pub struct BackupDrillRecord {
     /// backfilled: nobody recorded it, and inventing a value would put a
     /// location in the ledger that no drill ever visited.
     pub restore_target: Option<String>,
+    /// The silence line this pass was judged against, in the same words the
+    /// progress file carries (`<seconds>` or `unbounded`).
+    ///
+    /// The line itself lives in `progress_bounds`, which holds only the current
+    /// value for a job class -- the next pass overwrites it. Without this column
+    /// the only run whose line can be recovered afterwards is one that stopped
+    /// on it, and only by reading the number out of its error text; a pass that
+    /// succeeded, one killed from outside, and one that never ran are all
+    /// indistinguishable on this question.
+    ///
+    /// `unbounded` is a value, not an absence: it says nobody has measured this
+    /// job class yet, so this pass had no line to judge against and waited for
+    /// the work to end on its own. `None` is a row written before this column
+    /// existed. Folding those two together would put "never measured" and "old
+    /// row" in the same reading.
+    pub silence_bound: Option<String>,
     /// How far apart the package's own segment stamps were, and the bound the
     /// package declared for that distance. Both `None` for a package with no
     /// segment table, and both `None` when no package was opened.
@@ -599,6 +630,7 @@ mod tests {
             package_bytes: Some(1024),
             restore_source: Some("postgres:5432/cogneva".into()),
             restore_target: Some("postgres:5432/cogneva_drill".into()),
+            silence_bound: None,
             segment_skew_seconds: Some(38),
             segment_skew_bound_seconds: Some(300),
             packages_on_volume: 7,

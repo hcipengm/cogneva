@@ -22,11 +22,21 @@ stage_gate() { # stage_gate <repo root> <fixture root>
     # fact about the gate, and a fixture that had to list it would be asserting on
     # its own copy of that fact.
     cp "${repo}/deploy/scripts/lib/"*.sh "${dest}/deploy/scripts/lib/"
-    # The gate also runs two of its siblings by path rather than sourcing them.
+    # The gate also runs some of its siblings by path rather than sourcing them.
     # A fixture that staged only the gate answered their absence as RED steps
     # ("python3: can't open file ..."), which is a staging accident wearing a
     # failing verdict -- and it was the new case that found it, not the tree.
-    # A sibling the gate starts calling is added here the same day.
+    # A shell sibling the gate starts calling is added here the same day; the
+    # Python ones go by glob, so a new one is staged without anyone remembering
+    # this file.
     cp "${repo}/deploy/scripts/check-format.sh" "${dest}/deploy/scripts/check-format.sh"
-    cp "${repo}/deploy/scripts/check-commit-references.py" "${dest}/deploy/scripts/check-commit-references.py"
+    # 2026-11-20：门的 CI 回放跑 `check-commit-attribution-ci.sh`（推的范围的提交信息
+    # 不带 AI 署名），它再按路径调 `check-commit-attribution.sh`。夹具里缺任一份，那一格
+    # 都红成 `No such file or directory`——又一次「staging 事故穿着判词的衣服」。
+    cp "${repo}/deploy/scripts/check-commit-attribution-ci.sh" "${dest}/deploy/scripts/check-commit-attribution-ci.sh"
+    cp "${repo}/deploy/scripts/check-commit-attribution.sh" "${dest}/deploy/scripts/check-commit-attribution.sh"
+    # 2026-11-20：私有标识那一面（判私有仓的名字不许出现在这棵树里）也是按路径调的同级
+    # 脚本；夹具里缺它，那一格红成 `No such file or directory`。
+    cp "${repo}/deploy/scripts/check-private-names.sh" "${dest}/deploy/scripts/check-private-names.sh"
+    cp "${repo}/deploy/scripts/"*.py "${dest}/deploy/scripts/" 2>/dev/null || true
 }

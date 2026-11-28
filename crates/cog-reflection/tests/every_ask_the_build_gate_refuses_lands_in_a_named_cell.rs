@@ -343,7 +343,7 @@ fn an_ask_spelled_by_a_constant_reads_as_the_word_that_constant_means() {
     let text = r#"
 pub const SWEEP_ASKER: &str = "build-cache-reclaim";
 fn take(&self) {
-    let _ = self.0.try_acquire_exclusive(SWEEP_ASKER).await;
+    cog_core::ignore_lost!(self.0.try_acquire_exclusive(SWEEP_ASKER).await);
 }
 "#;
     let mut spellings = std::collections::BTreeMap::new();
@@ -364,8 +364,8 @@ fn take(&self) {
 fn an_ask_through_a_name_with_no_single_word_reads_as_no_word() {
     let text = r#"
 fn take(&self) {
-    let _ = self.0.try_acquire_exclusive(UNDECLARED_ASKER).await;
-    let _ = self.0.try_acquire("a literal still reads").await;
+    cog_core::ignore_lost!(self.0.try_acquire_exclusive(UNDECLARED_ASKER).await);
+    cog_core::ignore_lost!(self.0.try_acquire("a literal still reads").await);
 }
 "#;
     let spellings = std::collections::BTreeMap::new();

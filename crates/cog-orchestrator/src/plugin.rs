@@ -4,30 +4,27 @@
 use std::sync::Arc;
 use tracing::{info, warn};
 
-/// 整轮预算里留给下一拍启动的余量。
+/// 整轮预期工期里留给节拍本身的余量。
 ///
-/// 检查点整轮（枚举全部在跑任务并逐个落点）必须在下一拍到来之前交还控制权，
-/// 否则 beat 停一次、告警就把这条循环记成卡住。余量是「一拍要留多久给节拍本身」
-/// 的取值：小于一个 DB 往返的抖动就会误判，大过一拍就没有轮次可跑。
-// cap: bound — 小于一个 DB 往返的抖动会误判，大过一拍就没有轮次可跑
+/// 一轮检查点通常在下一拍到来之前就做完了；超过这个点还没有交还控制权，就
+/// 发一条告警（不会切断——见下面的 [`checkpoint_round_budget`]）。余量的取值
+/// 是「一拍要留多久给节拍本身」：小于一个 DB 往返的抖动就会天天误报。
+// cap: fixed — 只决定告警点落在哪；不取消任何一轮
+// keep: 删掉后告警点贴着轮次的预期落地，正常的一轮被读成超时；由「只决定告警点落在哪」兜住
 const CHECKPOINT_ROUND_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// 整轮预算的下限：节拍再密，也要给一轮留出这么久。
+/// 一轮检查点的预期工期，由它自己的节拍推出。
 ///
-/// 没有这个下限时，节拍小于余量的部署会得到「零预算」——每轮都被判超时，
-/// 循环看上去永远在超支。10s 是一轮落点在健康集群里的实测耗时上限。
-// cap: bound — 10s 是一轮落点在健康集群里的实测耗时上限；没有这个下限，节拍小于余量的部署每轮都被判超支
-const MIN_CHECKPOINT_ROUND_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// 一轮检查点允许占用的时间，由它自己的节拍推出。
+/// 随节拍动而不是写死：部署把间隔调大，这个预期跟着放大；节拍小于余量时预算
+/// 是零——那一轮的每一拍都超过了自己的预算，告警每轮都响。那不是在误报：它说的
+/// 是「这个部署的节拍比一轮的固定成本还紧」，修法在节拍那一侧。曾经这里有一个
+/// 10 秒的下限，注释自称「实测耗时上限」——它把这条真实的读数压掉了，而那个数
+/// 没有任何一次测量在更新它。
 ///
-/// 随节拍动而不是写死：部署把间隔调大，这条界跟着放大；调小到下限以下，
-/// 由下限兜住。返回值恒小于 `cadence`，所以 beat 之间总有空隙。
+/// 过了预算只发一条告警并继续等：一轮里可能已经落下若干续跑点，切断会把它们
+/// 作废，而没轮到的任务下一拍还要从头再来。
 fn checkpoint_round_budget(cadence: std::time::Duration) -> std::time::Duration {
-    std::cmp::max(
-        cadence.saturating_sub(CHECKPOINT_ROUND_MARGIN),
-        MIN_CHECKPOINT_ROUND_BUDGET,
-    )
+    cadence.saturating_sub(CHECKPOINT_ROUND_MARGIN)
 }
 
 pub const DAG_CHECKPOINT_LOOP: &str = "orchestrator_dag_checkpoint";
@@ -48,7 +45,8 @@ pub const TASK_CHECKPOINT_LOOP: &str = "orchestrator_task_checkpoint";
 /// a queue nobody drains stops being an excuse — past it the row is re-armed
 /// and counted apart, so the queue's refusal to move becomes a reading instead
 /// of an indefinite silence.
-// cap: bound — 三个窗口之后，没人排空的队列不再是借口：行被重新上膛并单独计数，队列不动变成一条读数而不是无限沉默
+// cap: fixed — 三个窗口之后，没人排空的队列不再是借口：行被重新上膛并单独计数，队列不动变成一条读数而不是无限沉默
+// keep: 删掉后没人排空的队列一直沉默，行不被重新上膛；由「队列不动变成一条读数」兜住
 pub const BACKLOG_WINDOWS_BEFORE_RECLAIM: u64 = 3;
 
 /// Orchestrator plugin that self-assembles the DAG executor and related services.
@@ -289,7 +287,10 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             result_claim_idle_secs: ctx.config().dag_executor.result_claim_idle_secs,
             result_claim_interval_secs: ctx.config().dag_executor.result_claim_interval_secs,
             result_claim_batch: ctx.config().dag_executor.result_claim_batch,
-            ready_task_poll_interval_secs: ctx.config().dag_executor.ready_task_poll_interval_secs,
+            ready_task_poll_interval_secs: ctx
+                .config()
+                .dag_executor
+                .effective_ready_task_poll_interval_secs(),
         };
         let skill_registry: Option<Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>> =
             ctx.consume::<tokio::sync::RwLock<cog_core::SkillRegistry>>();
@@ -305,12 +306,21 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
         let skill_registry: Option<Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>> =
             ctx.consume::<tokio::sync::RwLock<cog_core::SkillRegistry>>();
 
+        // 三格快照的唯一一份：变更账那一趟写它（现网 revision 只有那边读得到），
+        // 变更账读面取它。同一个 `Arc` 两头接，两份快照会长成两个答案。
+        let change_cells_slot: Arc<tokio::sync::RwLock<Option<cog_core::ChangeCellsSnapshot>>> =
+            Arc::new(tokio::sync::RwLock::new(None));
+        // 同一个 `Arc` 也放开成服务：`start` 里那个循环不在 `init` 的作用域内，而
+        // 两份快照会长成两个答案。
+        ctx.publish(change_cells_slot.clone());
+
         // Build OrchestratorControlImpl with action_planner + skill_registry for auto-decomposition.
         let control_impl = Arc::new(
             crate::OrchestratorControlImpl::new(shared_orchestrator.clone())
                 .with_action_planner(planner.clone())
                 .with_skill_registry(skill_registry.clone())
-                .with_plan_store(state_backend.clone(), plan_workspace_id.clone()),
+                .with_plan_store(state_backend.clone(), plan_workspace_id.clone())
+                .with_change_cells(change_cells_slot.clone()),
         );
         let control: Arc<dyn cog_core::OrchestratorControl> = control_impl.clone();
         ctx.publish_service(control);
@@ -329,6 +339,13 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
         // the bus stopped answering or because this process had no permit to
         // take another message, and only these series can tell a reader which.
         ctx.publish_observable(crate::observable::claim_slots_observable());
+        // The change ledger's batch size, written by the pass and read here.
+        // Published even before the first pass writes it: the observable then
+        // renders only the evaluation counter, which is the honest reading of a
+        // loop that has not decided anything yet -- the alternative is a zero
+        // on the gauge, and a batch of zero rows is not what "not yet
+        // evaluated" means.
+        ctx.publish_observable(crate::observable::rows_per_handover_observable());
         // The current shape of the task graph, read from the executor that owns
         // it. Separate from the D1 counters above: those meter this process's
         // outcomes, this one reports the graph itself, which outlives the
@@ -511,8 +528,10 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                         let runtime = (*runtime_holder).clone();
                         let exec_loop = exec_loop.clone();
                         let workspace_id = ctx.config().dag_executor.workspace_id.clone();
-                        let ready_task_poll_interval_secs =
-                            ctx.config().dag_executor.ready_task_poll_interval_secs;
+                        let ready_task_poll_interval_secs = ctx
+                            .config()
+                            .dag_executor
+                            .effective_ready_task_poll_interval_secs();
                         // 变更生成的产物写进本进程的 change_dir，而扫它的循环只在
                         // 执行器部署里跑：谁执行生成，谁就得是扫得动那份产物的进程。
                         // 这个开关和执行器循环、基线移植、自我发现用的是同一个。
@@ -538,7 +557,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                         let dag_shutdown_clone = dag_shutdown.clone();
                         let mut shutdown_rx = broadcast_tx.0.subscribe();
                         tokio::spawn(async move {
-                            let _ = shutdown_rx.recv().await;
+                            cog_core::ignore_lost!(shutdown_rx.recv().await);
                             dag_shutdown_clone.trigger();
                         });
 
@@ -847,31 +866,26 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                                                 beat.beat();
                                                 tokio::select! {
                                                     _ = interval.tick() => {
-                                                        match tokio::time::timeout(
-                                                            round_budget,
-                                                            checkpoint_orchestrator
-                                                                .checkpoint_owned_tasks(
-                                                                    agents.as_ref(),
-                                                                ),
-                                                        )
-                                                        .await
-                                                        {
-                                                            Ok(saved) => {
-                                                                if saved > 0 {
-                                                                    tracing::debug!(
-                                                                        saved,
-                                                                        "task checkpoint producer wrote resume points"
-                                                                    );
-                                                                }
-                                                            }
-                                                            Err(_) => {
-                                                                tracing::warn!(
-                                                                    budget_secs =
-                                                                        round_budget
-                                                                            .as_secs(),
-                                                                    "task checkpoint round exceeded its budget and was cut short; some tasks were not checkpointed this cycle"
-                                                                );
-                                                            }
+                                                        // 一轮超过预期就发一条告警继续等：切断会让
+                                                        // 这一轮已经落下的点作废、没轮到的那几个任务
+                                                        // 下一拍从头再来。等的时候 beat 照走，所以
+                                                        // 存活读数不会把「慢」读成「停」。
+                                                        let saved =
+                                                            cog_core::declared_wall::wait_past_wall_beating(
+                                                                round_budget,
+                                                                "task checkpoint round",
+                                                                || beat.beat(),
+                                                                checkpoint_orchestrator
+                                                                    .checkpoint_owned_tasks(
+                                                                        agents.as_ref(),
+                                                                    ),
+                                                            )
+                                                            .await;
+                                                        if saved > 0 {
+                                                            tracing::debug!(
+                                                                saved,
+                                                                "task checkpoint producer wrote resume points"
+                                                            );
                                                         }
                                                     }
                                                     _ = checkpoint_shutdown.wait() => break,
@@ -917,10 +931,20 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                             .shared_orchestrator
                             .clone()
                             .expect("shared orchestrator");
-                        let exec_loop = exec_loop.as_ref().clone().with_orchestrator(Arc::new(
-                            crate::OrchestratorControlImpl::new(orchestrator),
-                        )
-                            as Arc<dyn cog_core::OrchestratorControl>);
+                        let exec_loop = exec_loop
+                            .as_ref()
+                            .clone()
+                            .with_orchestrator(Arc::new(crate::OrchestratorControlImpl::new(
+                                orchestrator,
+                            ))
+                                as Arc<dyn cog_core::OrchestratorControl>)
+                            // The pool's window is what the ordinary lane's claim
+                            // bound is derived from. Attached here because `start`
+                            // runs after every plugin's `init`, and the supervisor
+                            // publishes it during its own.
+                            .with_pool_status_source(
+                                ctx.consume_service::<dyn cog_core::LlmPoolStatusSource>(),
+                            );
                         tokio::spawn(async move {
                             if let Err(e) = exec_loop
                                 .run_consumer(
@@ -955,7 +979,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                 let ledger_shutdown = ctx
                     .consume::<cog_core::ShutdownSignal>()
                     .map(|s| (*s).clone())
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 crate::change_ledger::spawn_change_ledger_loop(
                     store,
                     ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
@@ -995,6 +1019,12 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                     // nobody was handed, and the same comparison that nominates
                     // a face for unowned rows nominates one for these.
                     ctx.consume_service::<dyn cog_core::ActiveAlertSource>(),
+                    // 定批：这一轮做哪几条，在开工那一刻钉进事件流，之后这一拍就只发
+                    // 那几条。没有它时每拍临场挑一遍——挑哪些、挑几条都没有读数说得清。
+                    // 可选，理由与其余协作者相同：没有事件流的部署没有可钉住的地方。
+                    ctx.consume_service::<dyn cog_core::RoundEvents>(),
+                    // 三格快照的写端：接上之后变更账读面能回答「哪一行填了哪几格」。
+                    ctx.consume::<tokio::sync::RwLock<Option<cog_core::ChangeCellsSnapshot>>>(),
                 );
             }
             None => info!("change ledger loop not started: no ChangeLedgerStore published"),
@@ -1013,7 +1043,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                 let principle_shutdown = ctx
                     .consume::<cog_core::ShutdownSignal>()
                     .map(|s| (*s).clone())
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 crate::principle_ledger::spawn_principle_ledger_loop(
                     store,
                     ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
@@ -1047,7 +1077,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                 let resource_shutdown = ctx
                     .consume::<cog_core::ShutdownSignal>()
                     .map(|s| (*s).clone())
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 crate::resource_ledger::spawn_resource_ledger_loop(
                     store,
                     ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
@@ -1079,7 +1109,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                 let backup_shutdown = ctx
                     .consume::<cog_core::ShutdownSignal>()
                     .map(|s| (*s).clone())
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 crate::backup_runs::spawn_backup_runs_loop(
                     store,
                     ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
@@ -1106,7 +1136,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                 let face_shutdown = ctx
                     .consume::<cog_core::ShutdownSignal>()
                     .map(|s| (*s).clone())
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 crate::face_drift::spawn_face_drift_loop(
                     store.clone(),
                     agents.clone(),
@@ -1122,7 +1152,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                 let close_shutdown = ctx
                     .consume::<cog_core::ShutdownSignal>()
                     .map(|s| (*s).clone())
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 crate::governance_acts::spawn_decision_close_loop(
                     store,
                     ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
@@ -1151,7 +1181,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                         let shutdown = ctx
                             .consume::<cog_core::ShutdownSignal>()
                             .map(|s| (*s).clone())
-                            .unwrap_or_default();
+                            .unwrap_or(Default::default());
                         crate::sop::spawn_sop_dispatch_loop(
                             planner as Arc<dyn cog_core::ActionPlanner>,
                             skills,
@@ -1210,7 +1240,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                         let shutdown = ctx
                             .consume::<cog_core::ShutdownSignal>()
                             .map(|s| (*s).clone())
-                            .unwrap_or_default();
+                            .unwrap_or(Default::default());
                         crate::outward::spawn_outward_loop(
                             orchestrator,
                             http,
@@ -1218,6 +1248,10 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                             shutdown,
                             config,
                             outward_census,
+                            // 收件台与网关那一侧是同一份：外循环找到的东西也落成
+                            // 一行意图，而不是在流程旁边直接下单。没有装配时交
+                            // `None`——循环照常把条目交给目标路径。
+                            ctx.consume_service::<dyn cog_core::EventStore>(),
                         );
                     }
                     (orchestrator, http) => warn!(
@@ -1269,16 +1303,25 @@ mod round_budget_tests {
     use super::*;
     use std::time::Duration;
 
+    /// 预算跟着节拍走，没有第二条下限：节拍短于余量时预算为零。
+    ///
+    /// 零不是「没有界」，是「这一轮的固定成本已经超过了留给它的全部时间」——
+    /// 那一拍该报，报的是节拍太紧，而不是让一个写死的 10 秒把这条读数压掉。
     #[test]
-    fn a_longer_cadence_lengthens_the_round_and_a_short_one_is_floored() {
+    fn the_round_budget_follows_the_cadence_and_has_no_floor() {
         let base = Duration::from_secs(60);
         let doubled = checkpoint_round_budget(base + base);
         assert_eq!(doubled - checkpoint_round_budget(base), base);
+        assert!(checkpoint_round_budget(base) < base);
 
         assert_eq!(
             checkpoint_round_budget(Duration::from_secs(2)),
-            MIN_CHECKPOINT_ROUND_BUDGET
+            Duration::ZERO,
+            "节拍比余量还短时预算必须是零：这个部署的固定成本装不进一拍"
         );
-        assert!(checkpoint_round_budget(base) < base);
+        assert_eq!(
+            checkpoint_round_budget(CHECKPOINT_ROUND_MARGIN),
+            Duration::ZERO
+        );
     }
 }

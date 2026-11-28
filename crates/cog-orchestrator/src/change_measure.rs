@@ -29,18 +29,8 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use cog_core::{ChangeIdentity, ChangeState};
-
-/// How long one question to git may take before it is given up on.
-///
-/// The questions are asked of a local repository and take tens of milliseconds.
-/// The bound exists so that a repository on a stalled mount fails as a reading
-/// instead of holding the pass: the pass runs under an owner lease that is
-/// renewed on a cadence, and a pass that hangs is a pass that loses the seat.
-// cap: bound — 让卡死的挂载点表现为一条读数而不是挂住整轮：这一轮持有属主租约，挂住就是丢座位
-const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Where the platform's own deployment mounts the repository it builds from.
 ///
@@ -186,6 +176,116 @@ pub fn kind_direction(kind: &str) -> Option<KindDirection> {
     }
 }
 
+/// Why a declaration names something no look at the tree can settle.
+///
+/// Each arm is a way a row would be filed and then sit at `undecided` for good.
+/// The judge already answers most of these shapes by saying it could not
+/// measure; refusing them at the write point is what keeps that answer from
+/// being written down as a debt in the first place -- where the author is still
+/// there to be told which line refused it, and where the row would otherwise
+/// read to every later reader as outstanding work nobody can do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeclarationRefusal {
+    /// A kind outside the vocabulary: no predicate and no retirement either.
+    UnknownKind(String),
+    /// A name the judge retires: it meant two opposite demands at once, so no
+    /// look at the tree can tell them apart. `gone` is the demand it was split
+    /// into.
+    RetiredKind(String),
+    /// An absolute path, a path with whitespace in it, or one carrying `..`:
+    /// this tree cannot hold it, so the check would name a place nothing
+    /// measures.
+    ScopeNotInTree(String),
+    /// A `grep` with nothing to look for.
+    LiteralBlank,
+    /// A literal carrying the separator a finding is split on: it is a finding
+    /// written out, not a fragment of this tree.
+    LiteralIsARendering(String),
+}
+
+impl DeclarationRefusal {
+    /// The machine-readable name, for the answer the author gets back.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::UnknownKind(_) => "unknown_kind",
+            Self::RetiredKind(_) => "retired_kind",
+            Self::ScopeNotInTree(_) => "scope_outside_tree",
+            Self::LiteralBlank => "literal_blank",
+            Self::LiteralIsARendering(_) => "literal_is_a_rendering",
+        }
+    }
+
+    /// What to tell the author, naming the line that refused it.
+    ///
+    /// A refusal that only says "no" is one the author retries around; each arm
+    /// here says which line it is and what to write instead, because the person
+    /// reading it is the one who can still fix the declaration.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::UnknownKind(kind) => format!(
+                "账上没有 {kind:?} 这一种判据：能判的是 {}。换一个，或者先让它成为一种判据——\
+                 一种判不了的判据进账，只会是一条永远量不出来的欠债。",
+                JUDGEABLE_KINDS.join("、")
+            ),
+            Self::RetiredKind(kind) => format!(
+                "{kind:?} 不再是一种判据：它同时写着「让它消失」和「我搜了，没有」，\
+                 看树分不出是哪一句。要它消失用 {GONE_KIND:?}。"
+            ),
+            Self::ScopeNotInTree(scope) => format!(
+                "{scope:?} 不是这棵树能有的路径：绝对路径、带空白的路径、带 `..` 的路径\
+                 都在树外，而账查的是树，树外的东西没人量得到。写相对树根的路径。"
+            ),
+            Self::LiteralBlank => format!(
+                "{GREP_KIND:?} 没有说要找什么。一条不指向任何文字的检查，\
+                 谁也判不了它落没落地。"
+            ),
+            Self::LiteralIsARendering(literal) => format!(
+                "{literal:?} 是一句判词，不是树上的片段：它带着判词的分隔符。\
+                 把要在文件里找到的那段原文写进 literal。"
+            ),
+        }
+    }
+}
+
+/// The identity a declaration earns, once the judge can answer it.
+///
+/// Pure, so every write point can call it before anything is stored: the
+/// conversation tools, a self-change proposal, and any later intake share this
+/// one rule instead of each keeping a copy that would drift from the vocabulary
+/// above it. It checks what can be answered without a revision -- the kind, the
+/// shape of the scope, the literal -- and leaves whether a path exists at a
+/// given revision to the judge, which is the only side that reads the tree.
+pub fn measurable_identity(
+    kind: &str,
+    scope: &str,
+    literal: &str,
+) -> Result<ChangeIdentity, DeclarationRefusal> {
+    match kind_direction(kind) {
+        None => return Err(DeclarationRefusal::UnknownKind(kind.to_string())),
+        Some(KindDirection::Ambiguous) => {
+            return Err(DeclarationRefusal::RetiredKind(kind.to_string()))
+        }
+        Some(_) => {}
+    }
+    // The same shapes [`Snapshot::could_hold`] refuses, minus the top-level
+    // segment: whether a revision has that directory is a question only the tree
+    // can answer, and it stays with the judge.
+    let path = scope.strip_prefix("./").unwrap_or(scope);
+    if path.starts_with('/')
+        || path.contains(char::is_whitespace)
+        || path.split('/').any(|part| part == "..")
+    {
+        return Err(DeclarationRefusal::ScopeNotInTree(scope.to_string()));
+    }
+    if kind == GREP_KIND && literal.is_empty() {
+        return Err(DeclarationRefusal::LiteralBlank);
+    }
+    if predicate_is_a_rendering(literal) {
+        return Err(DeclarationRefusal::LiteralIsARendering(literal.to_string()));
+    }
+    Ok(ChangeIdentity::new(kind, scope, literal))
+}
+
 /// The tree this deployment measures against.
 ///
 /// Read from the environment rather than from the configuration document because
@@ -326,24 +426,33 @@ impl CheckOutcome {
     /// One unsettled reason is not about the look, and it does move the row. A
     /// predicate that is a finding written out is a property of the row itself:
     /// no revision will ever make it measurable, so the state the row carries
-    /// cannot have come from measuring it -- an earlier evaluator ran a search
-    /// for the whole rendering, found nothing, and answered `pending`. Leaving
-    /// that answer in place is not caution about the document's word, it is
-    /// freezing an answer from a look that could not have been measuring the
-    /// row: the row goes on reading as work still owed to anything that selects
-    /// by state, while no artifact can ever close it. `Undecided` is what this
-    /// shape is -- "what it found does not settle the question" -- and writing
-    /// it is a retraction of that earlier answer rather than a claim about the
-    /// tree.
+    /// cannot have come from measuring it. The row is still **pending** -- no
+    /// artifact has closed it and the ask is still owed -- and what changes is the
+    /// reason beside it: the caller writes an [`ChangeState::Pending`] measurement
+    /// carrying [`UnsettledReason::as_str`], so "nobody can measure this row" is
+    /// readable as a named defect instead of being mistaken for a pass that has
+    /// not run yet. [`Self::is_unmeasurable`] is the predicate the caller branches
+    /// on; it is not a state, because "could not measure" is not an answer about
+    /// the tree.
     pub fn state(&self) -> Option<ChangeState> {
         match self {
             CheckOutcome::Landed => Some(ChangeState::Landed),
             CheckOutcome::Absent => Some(ChangeState::Pending),
             CheckOutcome::Unsettled { reason, .. } if reason.is_about_the_row() => {
-                Some(ChangeState::Undecided)
+                Some(ChangeState::Pending)
             }
             CheckOutcome::Unsettled { .. } => None,
         }
+    }
+
+    /// Whether this outcome is a look that could not speak to the row at all,
+    /// for a reason that is a property of the row rather than of this revision.
+    ///
+    /// True is the case that writes a reason instead of an observation: the row
+    /// stays owed, and the reason is what the account reads to find out that the
+    /// check itself needs rewriting rather than re-running.
+    pub fn is_unmeasurable(&self) -> bool {
+        matches!(self, CheckOutcome::Unsettled { reason, .. } if reason.is_about_the_row())
     }
 
     /// Why the look could not settle the row, for the one outcome that has one.
@@ -1205,15 +1314,17 @@ impl CheckTree {
             // tree and not to wherever this process happens to have been started.
             .current_dir(&self.repo)
             .kill_on_drop(true);
-        let out = match tokio::time::timeout(GIT_TIMEOUT, cmd.output()).await {
-            Ok(Ok(out)) => out,
-            Ok(Err(e)) => {
+        // 判据是它还在不在动，不是它跑了多久：一次要走几百个提交的 `git log`
+        // 与一次卡死的 git 在钟面上同形，而前者不该被砍在中间。
+        let cmdline = format!("git {}", args.join(" "));
+        let out = match cog_core::progress::run_child_watched(cmd, &cmdline).await {
+            Ok(cog_core::progress::ChildOutcome::Exited(out)) => out,
+            Err(e) => {
                 return Err(format!(
                     "git could not be run against {}: {e}",
                     self.repo.display()
                 ))
             }
-            Err(_) => return Err(format!("git did not answer within {GIT_TIMEOUT:?}")),
         };
         if out.status.success() {
             return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
@@ -1509,7 +1620,11 @@ mod tests {
             )
             .await;
         assert_eq!(outcome.reason(), Some(UnsettledReason::ScopeOutsideTree));
-        assert_eq!(outcome.state(), Some(ChangeState::Undecided));
+        assert_eq!(outcome.state(), Some(ChangeState::Pending));
+        assert!(
+            outcome.is_unmeasurable(),
+            "the state alone cannot say this row needs its check rewritten: {outcome:?}"
+        );
     }
 
     /// The two absence kinds never settle to a verdict, and say so in their own
@@ -1526,7 +1641,7 @@ mod tests {
                 .await;
             assert_eq!(
                 outcome.state(),
-                Some(ChangeState::Undecided),
+                Some(ChangeState::Pending),
                 "{kind} is unmeasurable and must read as a criterion to rewrite"
             );
             assert_eq!(
@@ -1582,7 +1697,11 @@ mod tests {
         let outcome = tree
             .judge(&snapshot(), &identity("resembles", "crates/x", "y"))
             .await;
-        assert_eq!(outcome.state(), Some(ChangeState::Undecided));
+        assert_eq!(outcome.state(), Some(ChangeState::Pending));
+        assert!(
+            outcome.is_unmeasurable(),
+            "the state alone cannot say this row needs its check rewritten: {outcome:?}"
+        );
         assert_eq!(
             outcome.reason(),
             Some(UnsettledReason::KindWithoutPredicate)
@@ -1602,7 +1721,11 @@ mod tests {
         let outcome = tree
             .judge(&snapshot(), &identity("grep", "crates/x", ""))
             .await;
-        assert_eq!(outcome.state(), Some(ChangeState::Undecided));
+        assert_eq!(outcome.state(), Some(ChangeState::Pending));
+        assert!(
+            outcome.is_unmeasurable(),
+            "the state alone cannot say this row needs its check rewritten: {outcome:?}"
+        );
         assert_eq!(
             outcome.reason(),
             Some(UnsettledReason::KindWithoutPredicate)
@@ -1630,7 +1753,7 @@ mod tests {
                 .await;
             assert_eq!(
                 outcome.state(),
-                Some(ChangeState::Undecided),
+                Some(ChangeState::Pending),
                 "{kind} must not answer for another tree"
             );
             assert_eq!(outcome.reason(), Some(UnsettledReason::ScopeOutsideTree));
@@ -1673,10 +1796,12 @@ mod tests {
                 ),
             )
             .await;
-        // `undecided`, not `pending`: the row cannot be owed, because nothing
-        // can ever measure it. The state an earlier evaluator wrote is retracted
-        // rather than kept -- see `CheckOutcome::state`.
-        assert_eq!(outcome.state(), Some(ChangeState::Undecided), "{outcome:?}");
+        // `pending` with a reason, not a state of its own: the row is still owed
+        // -- nothing can measure it, which is the defect the reason names. The
+        // state an earlier evaluator wrote is retracted rather than kept -- see
+        // `CheckOutcome::state`.
+        assert_eq!(outcome.state(), Some(ChangeState::Pending), "{outcome:?}");
+        assert!(outcome.is_unmeasurable(), "{outcome:?}");
         assert_eq!(
             outcome.reason(),
             Some(UnsettledReason::PredicateIsARendering)
@@ -2252,7 +2377,8 @@ mod tests {
             "{outside:?}"
         );
         assert!(outside.reason().is_some_and(|r| r.is_about_the_row()));
-        assert_eq!(outside.state(), Some(ChangeState::Undecided), "{outside:?}");
+        assert_eq!(outside.state(), Some(ChangeState::Pending), "{outside:?}");
+        assert!(outside.is_unmeasurable(), "{outside:?}");
         // `crates` exists but `crates/gone` does not: a later revision can add it,
         // so this is about the look and the row is not touched.
         let absent = tree
@@ -2311,5 +2437,67 @@ mod tests {
         );
         let registry = Declarations::parse(&lines);
         assert_eq!(registry.gate_for("feedback_x"), Some("crates/x/tests/a.rs"));
+    }
+
+    /// A declaration the judge could never settle is refused where it is
+    /// written, and each refusal names the line it is.
+    ///
+    /// The shapes below all used to reach the account: the tool's own schema
+    /// suggested `absent`, which is retired; a scope with an absolute path or a
+    /// space in it named a place this tree does not have; a literal that was a
+    /// whole finding carried the separator findings are split on. Every one of
+    /// them answers `unsettled` on every pass, so the row reads as work still
+    /// owed and nothing can ever pay it off. Read from the vocabulary rather
+    /// than from this test's own list, so a kind retired later is refused here
+    /// the day it retires.
+    #[test]
+    fn a_declaration_no_look_could_settle_is_refused_at_the_write_point() {
+        let cases = [
+            ("absent", "crates/", "fn a()", "retired_kind"),
+            ("missing", "crates/", "fn a()", "retired_kind"),
+            ("contains", "crates/", "fn a()", "unknown_kind"),
+            ("", "crates/", "fn a()", "unknown_kind"),
+            ("grep", "/root/cogneva", "fn a()", "scope_outside_tree"),
+            ("grep", "crates/ deploy/", "fn a()", "scope_outside_tree"),
+            ("grep", "../cogneva", "fn a()", "scope_outside_tree"),
+            ("grep", "crates/", "", "literal_blank"),
+            (
+                "grep",
+                "crates/",
+                "grep crates/ :: fn a()",
+                "literal_is_a_rendering",
+            ),
+        ];
+        for (kind, scope, literal, expected) in cases {
+            let refused = measurable_identity(kind, scope, literal).expect_err(&format!(
+                "{kind:?}/{scope:?}/{literal:?} 被判据面答得了，而它答不了"
+            ));
+            assert_eq!(
+                refused.code(),
+                expected,
+                "{kind:?}/{scope:?}/{literal:?} 拒错了理由：{refused:?}"
+            );
+            assert!(
+                !refused.reason().is_empty(),
+                "拒了却没说清是哪一条线：{refused:?}"
+            );
+        }
+
+        // 阳性对照：判据面答得了的形状原样通过，身份逐字节保留（多看一格空白
+        // 或大小写就是把这一条改成了另一条变更）。
+        let accepted = [
+            ("grep", "crates/", "fn a()"),
+            ("grep", ".", "fn a()"),
+            ("exists", "docs/x.md", ""),
+            ("gone", "deploy/old.yaml", ""),
+            ("dependency_edge", "crates/cog-core", "tokio"),
+        ];
+        for (kind, scope, literal) in accepted {
+            let identity = measurable_identity(kind, scope, literal)
+                .unwrap_or_else(|refused| panic!("{kind:?}/{scope:?} 被误拒：{refused:?}"));
+            assert_eq!(identity.kind, kind);
+            assert_eq!(identity.scope, scope);
+            assert_eq!(identity.literal, literal);
+        }
     }
 }

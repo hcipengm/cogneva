@@ -22,7 +22,7 @@ use std::time::Duration;
 use chrono::{Duration as ChronoDuration, Utc};
 use redis::AsyncCommands;
 
-use cog_core::{generate_agent_id, AgentRegistration, AgentRegistry, ResourceInfo};
+use cog_core::{agent_id_for_identity, AgentRegistration, AgentRegistry, ResourceInfo};
 use cog_storage::RedisAgentRegistry;
 use cog_test_support::redis_url;
 
@@ -46,7 +46,6 @@ fn registration(name: &str, beaten_at: chrono::DateTime<Utc>) -> AgentRegistrati
         agent_id: format!("{PROBE}:{name}"),
         role: "probe".into(),
         workspace_id: "probe".into(),
-        capabilities: vec![],
         resources: ResourceInfo::default(),
         hostname: "probe".into(),
         pod_ip: "127.0.0.1".into(),
@@ -254,10 +253,7 @@ async fn a_heartbeat_keeps_an_agent_live_past_its_first_expiry() {
     let _serial = SERIAL.lock().await;
     let registry = registry().await;
     let mut reg = registration("beating", Utc::now());
-    reg.agent_id = format!(
-        "{PROBE}:{}",
-        generate_agent_id("probe", "127.0.0.1", "probe", "beating")
-    );
+    reg.agent_id = format!("{PROBE}:{}", agent_id_for_identity("beating"));
     registry.register(&reg).await.expect("register");
 
     tokio::time::sleep(Duration::from_millis(1200)).await;

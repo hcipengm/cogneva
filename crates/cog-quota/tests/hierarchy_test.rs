@@ -1,3 +1,4 @@
+//! principle: feedback_a_default_meant_to_describe_a_cell_must_not_decide_about_it
 //! Integration tests for the 5-level quota hierarchy.
 //!
 //! The manager speaks the core key-value contract, so these tests run against
@@ -215,12 +216,12 @@ async fn test_check_blocks_at_hard_limit() {
     assert_eq!(decision.blocked_by[0].scope, QuotaScope::User);
 }
 
-/// 没人声明的格子不拦任何人：默认值只决定它「读作多少」。
+/// 没人声明的格子不拦任何人：它读到的是「没有上限」。
 ///
-/// 现场读数：workspace `default` 一天花掉 47_746_019 token，而平台默认日上限
-/// 是 50_000。判定照默认值算，于是工作台往默认工作区派活一律 429——一条谁都
-/// 没为这个格子声明过的上限，把整个产品面挡死。默认值与真实一天的差距不是
-/// 调参能追上的量级，它本来就不该是判定的输入。
+/// 现场读数：workspace `default` 一天花掉 47_746_019 token，而当时平台默认日
+/// 上限是 50_000。判定照默认值算，于是工作台往默认工作区派活一律 429——一条谁
+/// 都没为这个格子声明过的上限，把整个产品面挡死。那个 50_000 已经删掉：没被声明
+/// 的格子读到 [`QuotaLimits::unlimited`]，凭空写下的数不再是任何判定的输入。
 #[tokio::test]
 async fn an_undeclared_ceiling_refuses_nothing() {
     let mgr = fresh_manager();
@@ -626,9 +627,9 @@ async fn the_person_axis_answers_only_what_an_operator_declared_and_counts_what_
     assert_eq!(decision.blocked_by[0].limits.hard_limit, 1000);
 }
 
-/// 平台给未配置格子用的默认上限只有一个定义，两个进程读到的是同一个数。
+/// 未配置的格子读到**没有上限**：两个进程读到的是同一个答案，而不是同一个数。
 #[tokio::test]
-async fn the_platform_default_ceiling_is_one_definition() {
+async fn an_undeclared_cell_reads_as_no_ceiling() {
     let mgr = HierarchyManager::from_store(Arc::new(FakeStore::default()));
     let ctx = QuotaContext {
         user_id: Some("ti10:user".into()),
@@ -636,8 +637,9 @@ async fn the_platform_default_ceiling_is_one_definition() {
     };
     let decision = mgr.check(&ctx, 0).await;
     assert_eq!(decision.scopes.len(), 1);
-    assert_eq!(
-        decision.scopes[0].limits,
-        QuotaLimits::from_hard(cog_quota::hierarchy::PLATFORM_DAILY_TOKENS, 0.8)
+    assert_eq!(decision.scopes[0].limits, QuotaLimits::unlimited());
+    assert!(
+        !decision.scopes[0].enforced,
+        "读到「没有上限」与「属主声明了这一对」是两件事，状态里那一格要说清"
     );
 }

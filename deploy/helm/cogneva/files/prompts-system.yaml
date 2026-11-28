@@ -25,10 +25,7 @@ prompts:
       Generate an improved version as valid JSON with the same schema:
       - skill_id (keep identical: '{{ skill_id }}')
       - name (improved if needed)
-      - tools (add/remove based on learnings)
-      - max_iterations (tune if needed)
       - role_type (keep or refine)
-      - system_prompt (the actual prompt text that guides the agent)
     version: "1.0.0"
     description: "EvolutionEngine skill refinement prompt"
     tags: ["reflection", "evolution"]
@@ -57,7 +54,6 @@ prompts:
       - parameters: valid JSON Schema object describing input parameters
       - implementation_hint: string describing implementation approach (e.g., "native", "wasm", "rhai")
 
-      Respond with ONLY the JSON object.
     version: "1.0.0"
     description: "EvolutionEngine tool variant prompt"
     tags: ["reflection", "evolution"]

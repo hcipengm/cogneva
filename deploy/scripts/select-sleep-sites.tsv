@@ -1,0 +1,101 @@
+# 生产代码里每一个 `select!` 里带 sleep/tick 分支的等待点：它的判词只回答一件事——
+# 那一支到点取消的是**等待本身**（读、tick，重来即可），还是一段做了一半的活（墙）。
+# 键 = 路径 + 分支行（去空白）+ 同文件同行的第几个。新增一处不分类，门会红；账不许比树大。
+path	branch	occurrence	kind	reason
+crates/cog-agent/src/consumer.rs	_ = backstop.tick() => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-agent/src/hooks/engine.rs	_ = tokio::time::sleep(bound) => {	1	wall	等=一次 hook 动作做完 / 等不到=过点只记一句、继续等 / 续跑=不适用：没有人取消它
+crates/cog-agent/src/tools.rs	_ = tokio::time::sleep(LANE_PROBE), if updates.is_some() => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-core/src/build_cache_readings.rs	_ = tokio::time::sleep(wait) => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-core/src/contract/owner_lease.rs	_ = ask.tick() => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-core/src/declared_wall.rs	_ = tokio::time::sleep(poll) => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-core/src/loop_health.rs	_ = tokio::time::sleep(wait) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-core/src/progress.rs	_ = tokio::time::sleep(WATCH_TICK) => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-eval/src/rig.rs	_ = tokio::time::sleep(STALL_POLL) => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-extension/src/pressure.rs	_ = tokio::time::sleep(left) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-gateway/src/agents.rs	_ = tick.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-gateway/src/cluster.rs	_ = interval.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-gateway/src/contribution_admin.rs	_ = interval.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-gateway/src/executor.rs	_ = interval.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-gateway/src/git_identity.rs	_ = tokio::time::sleep(std::time::Duration::from_secs(config.retry_secs)) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-gateway/src/git_identity.rs	_ = tokio::time::sleep(std::time::Duration::from_secs(config.retry_secs)) => {}	2	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-gateway/src/git_mirror.rs	_ = tokio::time::sleep(self.watchdog_interval()) => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-gateway/src/project_control.rs	_ = interval.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-github/src/discovery_loop.rs	_ = tokio::time::sleep(interval) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-github/src/plugin.rs	_ = tokio::time::sleep(interval) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-github/src/plugin.rs	_ = interval.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-github/src/plugin.rs	_ = ticker.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-memory/src/ingestor.rs	_ = tokio::time::sleep(SUBSCRIBE_RETRY_BACKOFF) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-memory/src/maintenance.rs	_ = ticker.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-memory/src/refusal_sweep.rs	_ = ticker.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-observability/src/capability.rs	_ = tokio::time::sleep(period) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-observability/src/claim_store.rs	_ = tokio::time::sleep(wait) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-observability/src/config_delivery.rs	_ = ticker.tick() => match store.refresh_firing(&dedup_key).await {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-observability/src/data_volume.rs	_ = ticker.tick() => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-observability/src/exchange_retention.rs	_ = interval.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-observability/src/image_store.rs	_ = tokio::time::sleep(wait) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-observability/src/infra_watch.rs	_ = ticker.tick() => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-observability/src/llm_usage_rollup.rs	_ = interval.tick() => match run_once(&store).await {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-observability/src/plugin.rs	_ = interval.tick() => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-observability/src/plugin.rs	_ = ticker.tick() => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-observability/src/plugin.rs	_ = sweep.tick() => BridgeWake::Sweep,	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-observability/src/spend_verdict.rs	_ = interval.tick() => match run_once(&store).await {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-observability/src/usage_retention.rs	_ = interval.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/backup_runs.rs	_ = ticker.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/change_ledger.rs	_ = ticker.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/dag_executor/mod.rs	_ = ticker.tick() => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/dag_executor/mod.rs	_ = tokio::time::sleep(crate::subscribe_backoff::SUBSCRIBE_RETRY_BACKOFF) => continue 'subscribe,	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/dag_executor/mod.rs	_ = tokio::time::sleep(crate::subscribe_backoff::SUBSCRIBE_RETRY_BACKOFF) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/dag_executor/mod.rs	_ = tokio::time::sleep(crate::subscribe_backoff::SUBSCRIBE_RETRY_BACKOFF) => continue 'subscribe,	2	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/dag_executor/mod.rs	_ = tokio::time::sleep(hold) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/dag_executor/mod.rs	_ = tokio::time::sleep(crate::subscribe_backoff::SUBSCRIBE_RETRY_BACKOFF) => {}	2	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/dag_executor/mod.rs	_ = ticker.tick() => {	2	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/face_drift.rs	_ = ticker.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/governance_acts.rs	_ = ticker.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/lane_memory.rs	_ = ticker.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/observable.rs	_ = ticker.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/outward.rs	_ = ticker.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/plugin.rs	_ = interval.tick() => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/plugin.rs	_ = interval.tick() => {	2	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/plugin.rs	_ = interval.tick() => {	3	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/plugin.rs	_ = interval.tick() => {	4	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/principle_ledger.rs	_ = ticker.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/resource_ledger.rs	_ = ticker.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/sop/dispatch.rs	_ = ticker.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/task_executor_router.rs	_ = ticker.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/task_executor_router.rs	_ = tokio::time::sleep(stall_poll_interval()) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/task_executor_router.rs	_ = ticker.tick() => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/task_executor_router.rs	_ = tokio::time::sleep(crate::subscribe_backoff::SUBSCRIBE_RETRY_BACKOFF) => continue 'subscribe,	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-orchestrator/src/task_executor_router.rs	_ = tokio::time::sleep(crate::subscribe_backoff::SUBSCRIBE_RETRY_BACKOFF) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-reflection/src/baseline_port.rs	_ = ticker.tick() => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-reflection/src/gitops_puller.rs	_ = ticker.tick() => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-reflection/src/mainline_deployer.rs	_ = tokio::time::sleep(wait) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-reflection/src/mainline_rollout.rs	_ = tokio::time::sleep(cog_core::progress::WATCH_TICK) => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-reflection/src/observability_stack.rs	_ = tokio::time::sleep(wait) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-reflection/src/plugin.rs	_ = ticker.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-reflection/src/plugin.rs	_ = ticker.tick() => {}	2	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-reflection/src/plugin.rs	_ = tokio::time::sleep(wait) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-reflection/src/policy_evolution.rs	_ = ticker.tick() => match driver.run_once().await {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-reflection/src/promotion_trend.rs	_ = tokio::time::sleep(interval) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-reflection/src/recorder.rs	_ = ticker.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-reflection/src/registry_footprint.rs	_ = ticker.tick() => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-reflection/src/signal_watcher.rs	_ = ticker.tick() => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-reflection/src/store_readouts.rs	_ = ticker.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-reflection/src/volume_capacity.rs	_ = ticker.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-reflection/src/workload_resources.rs	_ = ticker.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-storage/src/checkpoint_cap.rs	_ = tokio::time::sleep(LOOP_PERIOD) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-storage/src/db_surface.rs	_ = tokio::time::sleep(PERIOD) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-storage/src/inbox_retirement.rs	_ = tokio::time::sleep(INBOX_RETIRE_SWEEP_PERIOD) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-storage/src/metrics_sample_cap.rs	_ = tokio::time::sleep(LOOP_PERIOD) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-storage/src/observability_event_cap.rs	_ = tokio::time::sleep(period) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-storage/src/partition_maintainer.rs	_ = interval.tick() => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-storage/src/postgres/attempt_journal_store.rs	_ = tokio::time::sleep(SWEEP_PERIOD) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-storage/src/raw/logger.rs	_ = t.tick() => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-storage/src/task_event_retention.rs	_ = interval.tick() => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-storage/src/tier/migrator.rs	_ = interval.tick() => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-storage/src/wal/mod.rs	_ = tokio::time::sleep(WAL_CAP_SWEEP_PERIOD) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-storage/src/wal/mod.rs	_ = tokio::time::sleep(WAL_CAP_SWEEP_PERIOD) => {}	2	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-supervisor/src/heartbeat_driver.rs	_ = ticker.tick() => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-supervisor/src/supervisor.rs	_ = health.tick() => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-supervisor/src/udp_heartbeat.rs	_ = ticker.tick() => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-supervisor/src/unix_heartbeat.rs	_ = ticker.tick() => {	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活
+crates/cog-storage/src/append_pressure_watch.rs	_ = tokio::time::sleep(JUDGE_PERIOD) => {}	1	pace	一拍一次：那一支取消的是等待本身（读或 tick，重来即可），不是一段做了一半的活

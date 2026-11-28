@@ -169,6 +169,6 @@ mod tests {
             Some(serde_json::Value::String("4".into()))
         );
         assert!(dataset.cases[0].tags.contains(&"level-1".to_string()));
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 }

@@ -1,6 +1,7 @@
 pub mod context_builder;
 pub mod evaluator;
 pub mod generator;
+pub mod ledger;
 pub mod merger;
 pub mod mode_selector;
 pub mod moderator;

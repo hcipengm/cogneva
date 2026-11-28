@@ -26,56 +26,37 @@ pub struct Skill {
 
 /// One row of the executor table, loaded dynamically from JSON.
 ///
-/// A row answers three questions: which kind of hand this is (`role_type`), what
-/// that hand may call (`tools`), and how many iterations it gets — when the
-/// operator has stated one (`max_iterations`). Agents are configured from a row by role
-/// (`skill_for_role`), and goal decomposition is handed the rows so it can name
-/// the kind of hand for each sub-task.
+/// A row answers one question: which kind of hand this is (`role_type`). Agents
+/// are bound to a row by role (`skill_for_role`) so that a run's outcome can be
+/// attributed to the hand that produced it, and goal decomposition is handed the
+/// rows so it can name the kind of hand for each sub-task.
 ///
-/// The table is not a capability catalogue: it lists the hands that exist, and an
-/// empty table is legal — a run then declares no per-role tool boundary and the
-/// planner names a generic executor kind instead of a registered one.
-/// **Note:** `system_prompt` is deprecated. LLM calls must use structured
-/// JSON input via `cog_llm::execute_structured` instead of natural-language
-/// prompts. The field is retained only for backward-compatible deserialisation.
+/// 这一行不回答「这一位能用哪些工具」。工具只有一套：手上有什么由**身体所在的
+/// 进程**决定（有没有沙盒、有没有消息队列、有没有出门的客户端），不是由「它是
+/// 哪种手」决定。按角色收窄时，同一个进程里两个人对同一张注册表看到两套工具，
+/// 而谁被收窄取决于注册表上一个自由标签——换个标签，同一件活就做不成了。
+///
+/// 这一行也不带人格（`system_prompt`）。它是一个执行体的系统前缀：写明它是谁
+/// 在这里是多余的，写错则是把一种流水线的口吻安在另一个人身上。那一轮做什么，
+/// 由它拿到的那件活说。
+///
+/// 这一行更不写轮次上限。它曾经有一个 `max_iterations`：行按角色名取，于是同一
+/// 件活换个标签接手就换一个天花板，而「这一轮还要不要接着干」是标签最不该决定
+/// 的事。上限现在只有两个来源——操作者在配置面上钉的数（覆盖），和这个进程自己
+/// 交卷运行跑出来的轮数（实测，见 `AgentObservable::iteration_budget_for`）。
+/// 字段删掉而不是留着不读：一个按标签分发、却没人读的数，比没有它更难发现。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct SkillConfig {
     pub skill_id: String,
     pub name: String,
-    #[serde(default)]
-    pub system_prompt: String,
-    /// The registry tools this role may call, by the name the registry knows
-    /// them by. A role's skill is where its boundary is declared, next to the
-    /// iteration budget it already carries, so the two halves of "how much may
-    /// this role do" are read from one place.
-    ///
-    /// An empty list means the boundary is not declared, and a run under this
-    /// skill gets the whole registry. An entry that matches no registered tool
-    /// is dropped, so a typo here narrows a role silently — which is why the
-    /// shipped lists are gated against the registry rather than trusted.
-    pub tools: Vec<String>,
-    /// The turn ceiling this role starts from — absent means there is none.
-    ///
-    /// A written number is the operator's own decision for this deployment, and
-    /// it is read as the starting point of the per-role calibration rather than
-    /// as a wall the calibration may never move. Absent means the run has no
-    /// turn ceiling: the loop ends when the model stops asking for tools, and
-    /// what bounds it is the stall timeout, the context window and the cost
-    /// ledger — not a number written down before the work was seen.
-    ///
-    /// The default used to be ten, for every role, in this row's absence. Ten
-    /// turns is shorter than one round of "read the failing test, change the
-    /// code, run it again": a repair run stopped at ten with one tool call
-    /// still pending, every round, and the round after it started over.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_iterations: Option<u32>,
     /// The kind of hand this row registers — the dispatch key.
     ///
     /// Read in two places: [`crate::SkillRegistry::skill_for_role`] binds an
     /// agent's role to its row, and goal decomposition hands it to the planner as
     /// the row's `description`, which is how a sub-task ends up naming a kind of
     /// hand. It is a kind name (`planner`, `generator`, …), not a capability
-    /// claim: the row's boundary is `tools`, next to it.
+    /// claim and not a permission: every row sees the same tool registry, the
+    /// one its process installed.
     pub role_type: String,
 }
 
@@ -98,6 +79,15 @@ pub struct AtomicTask {
     pub blocks: Vec<String>,
     #[serde(default)]
     pub input: serde_json::Value,
+    /// 这条活的终态描述。三格是计划的一部分，按名读，不埋在 `input` 里。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub terminal: String,
+    /// 此刻的样子（写明来源）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub now: String,
+    /// 缺什么；空 = 到终态。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gap: String,
     #[serde(default)]
     pub output_entities: Vec<String>,
     #[serde(default)]
@@ -115,6 +105,13 @@ pub struct AtomicTask {
     /// 非叶子（有人挂在它下面）不要求填：它的完成是由子节点汇上来的。
     #[serde(default)]
     pub acceptance: Vec<String>,
+    /// 这一片交什么：闭集里的一个词，由分解时读这件活得出。
+    ///
+    /// 不从 `skill_id` 反推。那个字段说的是「派给哪个座位」，是同一次分解的另一个
+    /// 回答；两者一旦互为代理，同一件活换个座位接手就在读数里换了交付物。分解说不出
+    /// 来时留空——入口落定的是一份「没人说」，不是一个默认形状。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivers: Option<String>,
 }
 
 /// The complete action plan produced by Stage 1 decomposition.
@@ -155,7 +152,6 @@ pub struct BoundaryRule {
     pub rule_type: RuleType,
     #[serde(default)]
     pub threshold: Option<u64>,
-    pub description: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -388,9 +384,139 @@ pub fn validate_dag(
     })
 }
 
+/// 一份计划对「这一类」说了什么。
+///
+/// planner 的产出不是步骤，而是三样东西：这次处理的东西是什么（`input_type`）、
+/// 对它这一类**任意实例**都成立的话（`invariants`）、以及这些性质怎么被量出来
+/// （`acceptance`）。执行者只允许在它们里面实现；把性质缩窄成这次遇到的样例，
+/// 就是「没有计划的实现」。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, schemars::JsonSchema)]
+pub struct Plan {
+    pub input_type: String,
+    pub invariants: Vec<String>,
+    pub acceptance: Vec<PlanAcceptance>,
+    /// 什么情况下这条性质应当被拒。没有反例的判据，实现里会退化成恒真。
+    pub counterexamples: Vec<String>,
+    /// 确实只有一种形状时的说明（例如「删掉一个已废弃的函数」）。
+    ///
+    /// 它是**说明**，不是省略的默认值：写了它才允许只有一种形状，而且它要能回答
+    /// 「为什么第二种来源形状不存在」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub one_shape_because: Option<String>,
+}
+
+/// 一条验收：说的是哪种来源形状、怎么量。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
+pub struct PlanAcceptance {
+    /// 这条验收是在哪种输入来源上量的（换一本台账、换一个 worker、换一种格式）。
+    ///
+    /// 两个几乎一样的样例不算两种形状——形状的区分是**来源类型**的区分。
+    pub shape: String,
+    pub statement: String,
+    /// 从代码树或现网读得出的量法（命令或路径）。人工确认不算。
+    pub check: String,
+}
+
+/// 计划不成立的原因。每一条都点名是哪一处分不合规。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanDefect {
+    /// 一条不变量都没有：这份计划没有说「这一类」是什么。
+    NoInvariants,
+    /// 一条验收都没有：没有任何东西能在事后说它做对了。
+    NoAcceptance,
+    /// 只有一种来源形状，又没有说明为什么第二种不存在。
+    OneShape(String),
+    /// 同一来源形状上的两条验收：那是同一把尺子量两次。
+    RepeatedShape(String),
+    /// 验收的量法不是可执行的（空串）。
+    Unmeasurable(String),
+}
+
+impl Plan {
+    /// 这份计划能不能进 generator。
+    ///
+    /// 判据就是设计里那三条：性质非空、验收至少两种**不同来源形状**（或写明为什么
+    /// 只有一种）、每条验收都带一条可执行的量法。
+    pub fn validate(&self) -> Result<(), PlanDefect> {
+        if self.invariants.is_empty() {
+            return Err(PlanDefect::NoInvariants);
+        }
+        if self.acceptance.is_empty() {
+            return Err(PlanDefect::NoAcceptance);
+        }
+        for a in &self.acceptance {
+            if a.check.trim().is_empty() {
+                return Err(PlanDefect::Unmeasurable(a.shape.clone()));
+            }
+        }
+        let mut shapes: Vec<&str> = self.acceptance.iter().map(|a| a.shape.as_str()).collect();
+        shapes.sort_unstable();
+        shapes.dedup();
+        if shapes.len() == 1 && self.one_shape_because.is_none() {
+            return Err(PlanDefect::OneShape(shapes[0].to_string()));
+        }
+        if shapes.len() != self.acceptance.len() {
+            let mut seen = std::collections::BTreeSet::new();
+            for a in &self.acceptance {
+                if !seen.insert(a.shape.as_str()) {
+                    return Err(PlanDefect::RepeatedShape(a.shape.clone()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 这份计划点到了每一个给定的身份吗。
+    ///
+    /// 一条**批次**计划与一条单点计划的区别就在这里：批次的意义是「它们一起成立」，
+    /// 所以漏掉一条就不是「计划写得粗」，而是**这一批少了那一件**——而少了的那件
+    /// 在读数上与「做完了」同形。判据因此是逐条的，不是「点到了几条就算过」。
+    ///
+    /// 空清单返回真：没有要覆盖的活时，「每一条都点到了」是真的。
+    pub fn names_every(&self, ids: &[String]) -> bool {
+        ids.iter().all(|id| {
+            self.invariants
+                .iter()
+                .any(|line| line.contains(id.as_str()))
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 批次计划漏一条就答否：漏掉的那件在读数上与「做完了」同形。
+    #[test]
+    fn a_batch_plan_that_misses_an_item_does_not_cover_it() {
+        let plan = Plan {
+            input_type: "ledger-batch".into(),
+            invariants: vec!["S50：流式写入口".into(), "S67：批量入口".into()],
+            acceptance: vec![
+                PlanAcceptance {
+                    shape: "a".into(),
+                    statement: "x".into(),
+                    check: "cmd".into(),
+                },
+                PlanAcceptance {
+                    shape: "b".into(),
+                    statement: "y".into(),
+                    check: "cmd".into(),
+                },
+            ],
+            counterexamples: vec![],
+            one_shape_because: None,
+        };
+        assert!(plan.names_every(&["S50".to_string(), "S67".to_string()]));
+        assert!(
+            !plan.names_every(&["S50".to_string(), "S67".to_string(), "S65".to_string()]),
+            "漏掉 S65 却答「覆盖了」——那一条会读作做完了"
+        );
+        assert!(
+            plan.names_every(&[]),
+            "没有要覆盖的活时，每一条都点到了是真的"
+        );
+    }
 
     fn make_task(id: &str, blocked_by: Vec<&str>, blocks: Vec<&str>) -> AtomicTask {
         AtomicTask {
@@ -403,10 +529,14 @@ mod tests {
             blocked_by: blocked_by.into_iter().map(String::from).collect(),
             blocks: blocks.into_iter().map(String::from).collect(),
             input: serde_json::Value::Null,
+            terminal: String::new(),
+            now: String::new(),
+            gap: String::new(),
             output_entities: vec![],
             estimated_seconds: 0,
             parent_id: None,
             acceptance: vec![],
+            delivers: None,
         }
     }
 
@@ -494,7 +624,6 @@ mod tests {
             name: "OutputQuality".into(),
             rule_type: RuleType::Soft,
             threshold: None,
-            description: "代码输出必须包含单元测试".into(),
             enabled: true,
         };
         assert_eq!(rule.name, "OutputQuality");
@@ -508,5 +637,133 @@ mod tests {
         assert!(report.violations.is_empty());
         assert!(report.suggestions.is_empty());
         assert!(report.passed);
+    }
+
+    /// 两种不同来源形状各自有一条可量的验收：计划成立。
+    #[test]
+    fn two_source_shapes_make_a_plan() {
+        let plan = Plan {
+            input_type: "台账".into(),
+            invariants: vec!["批次＝台账上所有未完成条目".into()],
+            acceptance: vec![
+                PlanAcceptance {
+                    shape: "worker 的 markdown 台账".into(),
+                    statement: "缺口被列出".into(),
+                    check: "cogneva ledger editing".into(),
+                },
+                PlanAcceptance {
+                    shape: "平台的变更账本".into(),
+                    statement: "pending 条目被逐条点名".into(),
+                    check: "cogneva ledger gate".into(),
+                },
+            ],
+            counterexamples: vec!["子集被当成默认批次".into()],
+            one_shape_because: None,
+        };
+        assert_eq!(plan.validate(), Ok(()));
+    }
+
+    /// 只有一种形状又没有说明：那是「验了我自己举的例子」，计划不成立。
+    #[test]
+    fn one_shape_without_a_reason_is_refused() {
+        let plan = Plan {
+            input_type: "台账".into(),
+            invariants: vec!["批次＝全部未完成".into()],
+            acceptance: vec![PlanAcceptance {
+                shape: "我的 markdown".into(),
+                statement: "缺口被列出".into(),
+                check: "cogneva ledger editing".into(),
+            }],
+            counterexamples: vec![],
+            one_shape_because: None,
+        };
+        assert_eq!(
+            plan.validate(),
+            Err(PlanDefect::OneShape("我的 markdown".into()))
+        );
+    }
+
+    /// 写了说明就允许只有一种形状——但那是说明，不是默认。
+    #[test]
+    fn one_shape_is_allowed_when_the_absence_is_explained() {
+        let plan = Plan {
+            input_type: "已废弃函数".into(),
+            invariants: vec!["没有调用点".into()],
+            acceptance: vec![PlanAcceptance {
+                shape: "代码树".into(),
+                statement: "零命中".into(),
+                check: "grep -r fn_name crates/".into(),
+            }],
+            counterexamples: vec![],
+            one_shape_because: Some("这一类的输入只有代码树一种来源".into()),
+        };
+        assert_eq!(plan.validate(), Ok(()));
+    }
+
+    /// 同一形状上量两次不是两种形状。
+    #[test]
+    fn two_checks_on_one_shape_are_not_two_shapes() {
+        let plan = Plan {
+            input_type: "台账".into(),
+            invariants: vec!["批次＝全部未完成".into()],
+            acceptance: vec![
+                PlanAcceptance {
+                    shape: "我的 markdown".into(),
+                    statement: "a".into(),
+                    check: "x".into(),
+                },
+                PlanAcceptance {
+                    shape: "我的 markdown".into(),
+                    statement: "b".into(),
+                    check: "y".into(),
+                },
+            ],
+            counterexamples: vec![],
+            one_shape_because: None,
+        };
+        assert_eq!(
+            plan.validate(),
+            Err(PlanDefect::OneShape("我的 markdown".into())),
+            "同一来源上的两条验收仍是同一把尺子"
+        );
+    }
+
+    /// 没有量法的验收不算验收。
+    #[test]
+    fn an_acceptance_without_a_check_is_refused() {
+        let plan = Plan {
+            input_type: "台账".into(),
+            invariants: vec!["批次＝全部未完成".into()],
+            acceptance: vec![PlanAcceptance {
+                shape: "我的 markdown".into(),
+                statement: "人工确认".into(),
+                check: "   ".into(),
+            }],
+            counterexamples: vec![],
+            one_shape_because: Some("x".into()),
+        };
+        assert_eq!(
+            plan.validate(),
+            Err(PlanDefect::Unmeasurable("我的 markdown".into()))
+        );
+    }
+
+    /// 一批的每一条都必须在计划里被点到名：漏一条，这份计划说的就不是「这一批」，
+    /// 而份量不足的计划与一份完整的计划在别处长得一样。
+    #[test]
+    fn a_plan_must_name_every_item_of_its_batch() {
+        let plan = Plan {
+            input_type: "ledger-batch".into(),
+            invariants: vec!["S1：把 A 做完".into(), "S2：再把 B 做完".into()],
+            acceptance: Vec::new(),
+            counterexamples: Vec::new(),
+            one_shape_because: None,
+        };
+        assert!(plan.names_every(&["S1".into(), "S2".into()]));
+        assert!(
+            !plan.names_every(&["S1".into(), "S3".into()]),
+            "计划没提到 S3 却被判成点齐了"
+        );
+        assert!(plan.names_every(&[]), "空批次是点齐了，不是漏了");
     }
 }

@@ -11,6 +11,7 @@
 #   - 新工作负载的标签是上一版       → 红（它从来不进名单）
 #   - 第三方工作负载的标签是自己的版本 → 不判（拿发布版本去比是错的）
 #   - values 的 tag 与声明版本不同    → 红
+#   - values 的 tag 留空              → 绿（chart 里 default 到 appVersion）
 #   - 一个本平台工作负载都没有        → 判不了（退出码 2），不是全过
 # 最后在真树上跑一遍。
 set -euo pipefail
@@ -204,6 +205,13 @@ fixture
 sed -i 's/tag: "9.9.9"/tag: "9.9.8"/' "${work}/deploy/helm/cogneva/values.yaml"
 if out="$(run)"; then fail "values 的 tag 漂移应当红却绿了：${out}"; fi
 grep -q "image.tag" <<<"${out}" || fail "报错没有点名 image.tag：${out}"
+pass=$((pass + 1))
+
+# 6b. values 的 image.tag 留空：合法——chart 的镜像助手 default 到 appVersion，
+# 而 appVersion 上面已经判过。留空正是「版本号只写一处」的形态，不能红。
+fixture
+sed -i 's/tag: "9.9.9"/tag: ""/' "${work}/deploy/helm/cogneva/values.yaml"
+if ! out="$(run)"; then fail "留空的 image.tag 被当成漂移：${out}"; fi
 pass=$((pass + 1))
 
 # 7. 树上一个本平台工作负载都没有：判不了，退出码 2，不是全过。

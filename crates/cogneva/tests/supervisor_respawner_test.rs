@@ -47,15 +47,25 @@ async fn dead_agent_with_retryable_tasks_triggers_retry() {
     orch.submit_goal("g", vec![t1, t2]).await.unwrap();
 
     for id in ["t-1", "t-2"] {
-        for _ in 0..3 {
+        // 每一次重试都要有「新东西」：同一句话原样再来一次不买重试（重试按变化判，
+        // 不按次数判）。所以这里每轮的失败原因都不同——模拟死掉的员工每次带回的
+        // 新证据。
+        for attempt in 0..3 {
             orch.schedule_task(id).await.unwrap();
             orch.start_task(id).await.unwrap();
-            let (retried, _, _) = orch.fail_task(id, "boom".into(), None).await.unwrap();
+            let (retried, _, _) = orch
+                .fail_task(id, format!("boom attempt {attempt}"), None)
+                .await
+                .unwrap();
             assert!(retried, "expected retry within budget");
         }
         orch.schedule_task(id).await.unwrap();
         orch.start_task(id).await.unwrap();
-        let (retried, _, _) = orch.fail_task(id, "boom".into(), None).await.unwrap();
+        // 永久失败由「同一句原样再来一次」给出：变了就再跑，不变就不买。
+        let (retried, _, _) = orch
+            .fail_task(id, "boom attempt 2".into(), None)
+            .await
+            .unwrap();
         assert!(
             !retried,
             "expected permanent failure after exhausting retries"
@@ -98,11 +108,22 @@ async fn retryable_failed_tasks_trigger_crew_retry() {
 
     let task = Task::new("t-1", TaskType::Planner, serde_json::json!({}));
     orch.submit_goal("g", vec![task]).await.unwrap();
-    for _ in 0..4 {
-        orch.schedule_task("t-1").await.unwrap();
-        orch.start_task("t-1").await.unwrap();
-        let _ = orch.fail_task("t-1", "boom".into(), None).await.unwrap();
-    }
+    // 换了内容的失败买得到下一次；同一句原样再来一次就买不到（重试按变化判）。
+    orch.schedule_task("t-1").await.unwrap();
+    orch.start_task("t-1").await.unwrap();
+    let (retried, _, _) = orch
+        .fail_task("t-1", "boom attempt 0".into(), None)
+        .await
+        .unwrap();
+    assert!(retried, "换了内容的失败该买得到下一次");
+
+    orch.schedule_task("t-1").await.unwrap();
+    orch.start_task("t-1").await.unwrap();
+    let (retried, _, _) = orch
+        .fail_task("t-1", "boom attempt 0".into(), None)
+        .await
+        .unwrap();
+    assert!(!retried, "同一句原样再来一次不该买重试");
     assert_eq!(
         orch.get_task("t-1").await.unwrap().status,
         cog_core::TaskStatus::Failed

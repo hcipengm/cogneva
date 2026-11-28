@@ -1,0 +1,2 @@
+ALTER TABLE cog_events    MODIFY payload LONGTEXT NOT NULL;
+ALTER TABLE cog_dag_state MODIFY state   LONGTEXT NOT NULL;

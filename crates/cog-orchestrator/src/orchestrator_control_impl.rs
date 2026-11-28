@@ -19,6 +19,9 @@ pub struct OrchestratorControlImpl {
     /// 而不是一个空集合冒充「都没排期」。
     state_backend: Option<Arc<dyn cog_core::StateBackend>>,
     workspace_id: String,
+    /// 最近一次算出来的三格快照。由变更账的 `live_revision_pass` 每次覆盖写，
+    /// 读面只取最新这一份——三格是读数，不是账本里的一列。
+    change_cells: Option<Arc<tokio::sync::RwLock<Option<cog_core::ChangeCellsSnapshot>>>>,
 }
 
 impl OrchestratorControlImpl {
@@ -29,7 +32,18 @@ impl OrchestratorControlImpl {
             skill_registry: None,
             state_backend: None,
             workspace_id: "default".into(),
+            change_cells: None,
         }
+    }
+
+    /// 接上三格快照的唯一一份。谁产、谁读都拿同一个 `Arc`：两份快照会长成
+    /// 两个答案，而它们本来就该是同一件事。
+    pub fn with_change_cells(
+        mut self,
+        cells: Arc<tokio::sync::RwLock<Option<cog_core::ChangeCellsSnapshot>>>,
+    ) -> Self {
+        self.change_cells = Some(cells);
+        self
     }
 
     pub fn with_plan_store(
@@ -119,16 +133,35 @@ impl OrchestratorControl for OrchestratorControlImpl {
         Some(crate::change_ledger::dispatch_task_ids(identity))
     }
 
+    fn change_cells(&self) -> Option<cog_core::ChangeCellsSnapshot> {
+        // 没有接上快照（或一次都还没算过）就是 `None`：读面因此印「量不到」，
+        // 而不是印一份所有格都空着的快照——后者读作「全都没做」。
+        let slot = self.change_cells.as_ref()?;
+        slot.try_read().ok().and_then(|guard| guard.clone())
+    }
+
     async fn get_ready_tasks(&self) -> Vec<Task> {
         self.dag_executor.get_ready_tasks().await
+    }
+
+    async fn get_ready_tasks_checked(&self) -> SFResult<Vec<Task>> {
+        self.dag_executor.get_ready_tasks_checked().await
     }
 
     async fn get_all_tasks(&self) -> Vec<Task> {
         self.dag_executor.get_all_tasks().await
     }
 
+    async fn get_all_tasks_checked(&self) -> SFResult<Vec<Task>> {
+        self.dag_executor.all_tasks_checked().await
+    }
+
     async fn get_venue_tasks(&self) -> Vec<Task> {
         self.dag_executor.get_venue_tasks().await
+    }
+
+    async fn get_venue_tasks_checked(&self) -> SFResult<Vec<Task>> {
+        self.dag_executor.get_venue_tasks_checked().await
     }
 
     async fn task_plans(&self) -> SFResult<Vec<cog_core::TaskPlan>> {
@@ -205,8 +238,16 @@ impl OrchestratorControl for OrchestratorControlImpl {
         self.dag_executor.get_task(task_id).await
     }
 
+    async fn get_task_checked(&self, task_id: &str) -> SFResult<Option<Task>> {
+        self.dag_executor.get_task_checked(task_id).await
+    }
+
     async fn schedule_task(&self, task_id: &str) -> SFResult<()> {
         self.dag_executor.schedule_task(task_id).await
+    }
+
+    async fn claim_task(&self, task_id: &str, claimant: &str) -> SFResult<Task> {
+        self.dag_executor.claim_task(task_id, claimant).await
     }
 
     async fn check_timeouts(&self) -> Vec<(String, bool, Vec<String>, bool)> {
@@ -217,12 +258,24 @@ impl OrchestratorControl for OrchestratorControlImpl {
         self.dag_executor.get_dependents(task_id).await
     }
 
+    async fn get_dependents_checked(&self, task_id: &str) -> SFResult<Option<Vec<Task>>> {
+        self.dag_executor.get_dependents_checked(task_id).await
+    }
+
     async fn get_dependencies(&self, task_id: &str) -> Option<Vec<Task>> {
         self.dag_executor.get_dependencies(task_id).await
     }
 
+    async fn get_dependencies_checked(&self, task_id: &str) -> SFResult<Option<Vec<Task>>> {
+        self.dag_executor.get_dependencies_checked(task_id).await
+    }
+
     async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>) {
         self.dag_executor.get_graph().await
+    }
+
+    async fn get_graph_checked(&self) -> SFResult<(Vec<Task>, Vec<(String, String)>)> {
+        self.dag_executor.get_graph_checked().await
     }
 
     async fn delete_task(&self, task_id: &str) -> SFResult<()> {

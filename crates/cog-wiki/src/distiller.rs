@@ -17,18 +17,16 @@ use serde::{Deserialize, Serialize};
 
 use cog_core::{DistilledPage, SFError, SFResult, Task, WikiBackend, WikiDistiller};
 
-/// 一次蒸馏最多把多少字的来源发出去。
+/// 来源整份交给员工。
 ///
-/// 来源没有大小界（谁都可以投一份几百 KB 的文档），而任务预算是有界的：不截的话
-/// 一件活会因为塞不进上下文而失败，读起来像「员工答不出来」。截掉的尾巴在这里
-/// 写明，读的人能看出这份来源比发出去的长。
-// cap: bound — 一份来源交给员工的上限；超出部分记在提示里而不是静默丢掉
-pub const DISTILL_SOURCE_CHARS: usize = 8_000;
-
-// cap: bound — 一件活的执行预算；超时由平台判，这里是任务行上的界
-const DISTILL_TASK_TIMEOUT_SECS: u64 = 180;
-// cap: bound — 这里等答案的上界，比任务预算短，让平台先说出自己的终态与原因
-const DISTILL_WAIT_TIMEOUT_SECS: u64 = 170;
+/// 这里曾经有一条 8,000 字的截断。那个数的理由是「任务预算有界」——没错，但预算
+/// 该由一次真实的上下文拒绝（`context_limit`）来告，而不是在这里先砍掉。截断会把
+/// 「模型没读到」写成「模型读了但答不好」，而前者是读数能看见的、后者不是。要一份
+/// 有界的来源，声明它的预算，或者让上游的拒绝把预算调小。
+// 这一件活不声明自己多久跑完，也不给等待设上界：它的寿命由任务自己的租约与实测
+// 步间隔管（那是树里已有的读数），等的人一直等到它到终态，或者看见它被回收。
+// 曾经这里有 180（声明）与 170（等待）两个数，理由都是「比另一个短」，谁也没有
+// 量过任何一次蒸馏要多久。
 
 /// 把一件活交给名册、把答复拿回来的那一格。
 ///
@@ -71,13 +69,7 @@ impl WorkItemHandoff for OrchestratorHandoff {
             .unwrap_or("(unnamed source)")
             .to_string();
         let goal = format!("Read the wiki source {source} and write one page from it");
-        cog_core::contract::work_item::run_work_item(
-            orchestrator.as_ref(),
-            &goal,
-            task,
-            std::time::Duration::from_secs(DISTILL_WAIT_TIMEOUT_SECS),
-        )
-        .await
+        cog_core::contract::work_item::run_work_item(orchestrator.as_ref(), &goal, task, None).await
     }
 }
 
@@ -97,21 +89,11 @@ struct DistilledAnswer {
 pub struct WorkItemDistiller {
     backend: Arc<dyn WikiBackend>,
     handoff: Arc<dyn WorkItemHandoff>,
-    source_chars: usize,
 }
 
 impl WorkItemDistiller {
     pub fn new(backend: Arc<dyn WikiBackend>, handoff: Arc<dyn WorkItemHandoff>) -> Self {
-        Self {
-            backend,
-            handoff,
-            source_chars: DISTILL_SOURCE_CHARS,
-        }
-    }
-
-    pub fn with_source_chars(mut self, chars: usize) -> Self {
-        self.source_chars = chars;
-        self
+        Self { backend, handoff }
     }
 
     /// 交给员工的那句话。做法只写一次，材料与形状各在它们该在的字段里。
@@ -120,16 +102,10 @@ impl WorkItemDistiller {
          Answer with one JSON object conforming to this JSON Schema and nothing else -- no \
          markdown fences and no commentary.";
 
+    /// 来源整份交出去：这一步是无损的。曾经有一个只为测试存在的截断开关，
+    /// 按「有损默认无损」的判据删掉——需要小输入的是测试，让测试自己造小输入。
     fn bounded_source(&self, content: &str) -> String {
-        let mut taken: String = content.chars().take(self.source_chars).collect();
-        if taken.len() < content.len() {
-            taken.push_str(&format!(
-                "\n\n<source truncated: {} characters were sent of {}>",
-                taken.chars().count(),
-                content.chars().count()
-            ));
-        }
-        taken
+        content.to_string()
     }
 }
 
@@ -169,7 +145,6 @@ impl WikiDistiller for WorkItemDistiller {
             confidence: None,
             timestamp: Some(chrono::Utc::now()),
         });
-        task.timeout_seconds = DISTILL_TASK_TIMEOUT_SECS;
         // 场地标签跟着活走，不跟着接活的人走：读「wiki 这一栏今天收了多少」
         // 的人读的是这一列，而不是谁在这个场地上。
         task.venue = Some("wiki".into());
@@ -400,7 +375,10 @@ mod tests {
             task.action_planner_meta.as_ref().map(|m| m.verified),
             Some(true)
         );
-        assert!(task.timeout_seconds > 0);
+        assert_eq!(
+            task.declared_duration_seconds, 0,
+            "蒸馏不声明工期：没有东西按那个数结束行"
+        );
         assert_eq!(
             task.venue.as_deref(),
             Some("wiki"),
@@ -516,6 +494,35 @@ mod tests {
         assert_ne!(tasks[0].id, tasks[1].id);
     }
 
+    /// 没有显式要截断时，来源整份交给员工。
+    ///
+    /// 这里曾经有一条 8,000 字的缺省截断：一份长来源的尾巴被丢掉，而平台上读到的
+    /// 却是「员工答得不好」。删掉之后整份交出去；装不下会以一次上下文拒绝出现，
+    /// 那条读数会去把预算调小。没有这次改动这条会红：尾巴的标记不会出现在任务里。
+    #[tokio::test]
+    async fn the_whole_source_is_handed_over_unless_truncation_is_asked_for() {
+        let handoff = Arc::new(ScriptedHandoff {
+            answer: page_json(),
+            tasks: Mutex::new(Vec::new()),
+        });
+        let wiki = Arc::new(MemoryWiki::default());
+        let distiller = WorkItemDistiller::new(wiki, handoff.clone());
+        let body = format!("{}END-OF-SOURCE", "x".repeat(20_000));
+        distiller
+            .distill_source("notes/long.md", &body)
+            .await
+            .unwrap();
+        let tasks = handoff.tasks.lock().unwrap();
+        let sent = tasks[0].input["task"]["content"].as_str().unwrap();
+        assert!(
+            sent.ends_with("END-OF-SOURCE"),
+            "来源的尾巴被缺省截断丢掉了（发出去 {} 字，原文 {} 字）",
+            sent.chars().count(),
+            body.chars().count()
+        );
+        assert!(!sent.contains("source truncated"));
+    }
+
     /// 超出界的来源被截断时要写明：读的人看得出这份来源比发出去的长。
     #[tokio::test]
     async fn a_source_past_the_bound_says_so() {
@@ -524,7 +531,7 @@ mod tests {
             tasks: Mutex::new(Vec::new()),
         });
         let wiki = Arc::new(MemoryWiki::default());
-        let distiller = WorkItemDistiller::new(wiki, handoff.clone()).with_source_chars(10);
+        let distiller = WorkItemDistiller::new(wiki, handoff.clone());
         distiller
             .distill_source("notes/long.md", "0123456789abcdef")
             .await

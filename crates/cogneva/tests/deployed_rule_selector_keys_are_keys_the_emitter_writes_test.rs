@@ -43,6 +43,7 @@ use std::path::Path;
 
 use crate::common;
 
+use common::declared_once::literals_in;
 use common::lex::Dialect;
 use common::routes::{matching_brace, repo_root};
 use common::rules::{promql_expressions, rule_document};
@@ -212,36 +213,6 @@ fn idents_in(line: &str) -> Vec<(&str, usize)> {
     out
 }
 
-/// 每个 `"…"` 字面量的内容与它在行内的位置。
-fn string_literals(line: &str) -> Vec<(&str, usize)> {
-    let bytes = line.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'"' {
-            i += 1;
-            continue;
-        }
-        let start = i + 1;
-        let mut j = start;
-        while j < bytes.len() {
-            if bytes[j] == b'\\' {
-                j += 2;
-                continue;
-            }
-            if bytes[j] == b'"' {
-                break;
-            }
-            j += 1;
-        }
-        if j <= bytes.len() {
-            out.push((&line[start..j.min(line.len())], start));
-        }
-        i = j.max(i + 1);
-    }
-    out
-}
-
 /// `const <name>: &str = "<value>";` 与宏表里的 `<NAME> => "<value>",`，全树一张表。
 ///
 /// 一个名字可以对应**多个**值，因为它们来自不同的 crate、彼此没有关系：
@@ -251,6 +222,10 @@ fn string_literals(line: &str) -> Vec<(&str, usize)> {
 /// 迟早会撞上这种重名，所以这里按名字收全部值。
 fn str_consts(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
     let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // `const A: &str = crate::B;`：别名常量。值不在这一行，得顺着引用走到声明它的
+    // 那一行。只认字面量的版本会让 `READOUT_LABEL` 以标识符原样留在键集合里，于是
+    // 规则里 `readout=` 的每一个选择子都对不上一个「从没人写下」的键。
+    let mut aliases: Vec<(String, String)> = Vec::new();
     for path in production_sources(root) {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
@@ -273,6 +248,12 @@ fn str_consts(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
             };
             let after_eq = rest[eq + 1..].trim_start();
             let Some(after_eq) = after_eq.strip_prefix('"') else {
+                let end = after_eq.find(';').unwrap_or(after_eq.len());
+                let target = after_eq[..end].trim();
+                let target = target.rsplit("::").next().unwrap_or("").trim();
+                if target.starts_with(is_ident_start) && target.chars().all(is_ident_char) {
+                    aliases.push((target.to_string(), name.to_string()));
+                }
                 continue;
             };
             let Some(end) = after_eq.find('"') else {
@@ -305,6 +286,21 @@ fn str_consts(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
             out.entry(name.to_string())
                 .or_default()
                 .insert(value.to_string());
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (target, alias) in &aliases {
+            let Some(values) = out.get(target).cloned() else {
+                continue;
+            };
+            let slot = out.entry(alias.clone()).or_default();
+            for value in values {
+                if slot.insert(value) {
+                    changed = true;
+                }
+            }
         }
     }
     out
@@ -417,9 +413,9 @@ fn emitter_keys(
                     named.extend(values.iter().cloned());
                 }
             }
-            for (literal, _) in string_literals(line) {
-                if literal.starts_with("cogneva_") {
-                    named.insert(literal.to_string());
+            for literal in literals_in(line) {
+                if literal.value.starts_with("cogneva_") {
+                    named.insert(literal.value.to_string());
                 }
             }
             if named.is_empty() {

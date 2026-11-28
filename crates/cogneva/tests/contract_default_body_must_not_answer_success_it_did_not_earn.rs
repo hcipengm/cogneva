@@ -269,7 +269,7 @@ fn every_defaulted_body_calls_the_trait_it_defaults_for() {
     }
 
     for method in &defaulted {
-        let body = method.body.as_deref().unwrap_or_default();
+        let body = method.body.as_deref().unwrap_or(Default::default());
         assert!(
             default_body_is_honest(body),
             "`{}` has a default body that neither calls the trait nor refuses: {}. \

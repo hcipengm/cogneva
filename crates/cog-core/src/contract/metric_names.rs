@@ -27,6 +27,18 @@
 //! that implementation does with it (the in-process registry backend included).
 //! Where a name is *produced* stays in the crate that produces it, and is
 //! re-exported from here so the call site reads as before.
+//!
+//! A name added here with nothing that reads it is half a change, and the
+//! census test says so: it walks [`ALL`] against the alert rules and fails for
+//! any name that no rule reads and that is not registered in that test's census
+//! with its own written verdict. So the entry arrives together with the reader —
+//! the rule that consumes the series, or the census entry and whatever count the
+//! test holds against it.
+//! A series whose only reader is a count that can sit above zero for hours
+//! without naming which subject owes it is not read in that sense: it reports
+//! a state nobody can act on, which is the failure a `pending` counter left
+//! standing by a killed pass is the local example of. Give the subject a label
+//! in the same change, or the reading is a number with no owner.
 
 use std::fmt;
 
@@ -175,6 +187,27 @@ metric_names! {
     METRICS_SAMPLES_BUDGET_ROWS => "metrics_samples_budget_rows",
     METRICS_SAMPLES_ROWS => "metrics_samples_rows",
     METRICS_SAMPLE_SWEEP_FAILED => "metrics_sample_sweep_failed",
+    // cog-storage — one append to the event stream, in seconds, by kind. Taken
+    // around the single writer's INSERT (pool queueing included): the p99 over a
+    // window is the write-rate face of "is the store still keeping up", and it is
+    // compared against half the UI refresh cycle rather than a chosen constant.
+    EVENT_APPEND_SECONDS => "cogneva_event_append_seconds",
+    DB_SETTING_SECONDS => "cogneva_db_setting_seconds",
+    DB_VACUUM_BEHIND_TABLES => "cogneva_db_vacuum_behind_tables",
+    // cog-storage — how old the transactions in flight already are, labelled by
+    // `state` (active / idle in transaction). The database kills the idle ones
+    // on its own `idle_in_transaction_session_timeout`; the age is how much of
+    // that bound is already spent, and it is the reading that separates a
+    // transaction waiting on work from one holding a snapshot with nothing to
+    // do. Published per state rather than as one maximum: the two are stopped
+    // by different settings, so a single number cannot say which bound is near.
+    DB_XACT_AGE_SECONDS => "cogneva_db_xact_age_seconds",
+    // cog-storage — dead tuples and the table's own autovacuum trigger, per
+    // table. Between them they state how far past its trigger a table is
+    // (`dead / threshold`); the ratio is evaluated where it is read so the
+    // zero-threshold case stays "already past", not a number somebody picked.
+    DB_DEAD_TUPLES => "cogneva_db_dead_tuples",
+    DB_VACUUM_THRESHOLD_TUPLES => "cogneva_db_vacuum_threshold_tuples",
     TIER_MIGRATION_TOTAL => "tier_migration_total",
 
     // cog-storage — the observability event log's own readings.
@@ -225,8 +258,20 @@ metric_names! {
     TASK_EVENTS_ROWS => "cogneva_task_events_rows",
     TASK_EVENTS_TASKS => "cogneva_task_events_tasks",
     TASK_EVENTS_OLDEST_AGE_SECONDS => "cogneva_task_events_oldest_age_seconds",
-    TASK_EVENTS_KEEP_SECONDS => "cogneva_task_events_keep_seconds",
     TASK_EVENTS_SWEEP_FAILED => "cogneva_task_events_sweep_failed",
+
+    // cog-storage — 事件流里这一版读不懂的行。
+    //
+    // 一条读不懂的载荷不是错误：行照样读出来、标 `undecodable`，原文留在库里。
+    // 但如果只有那一个状态词，没有任何计数，「读不懂的越来越多了」这件事要一条一条
+    // 翻才有读数——而它正是「该补解码器了」的唯一信号。标签是 `kind` 与 `version`：
+    // 哪一个种类、哪一版，决定补什么。
+    EVENT_UNDECODABLE_TOTAL => "cogneva_event_undecodable_total",
+
+    // 事件流每天的进量，按 kind 分。流停了与流空了在别的读数上同形，而它们要做的活
+    // 相反；这一格是「这一天真的没有东西进流」与「流坏了」之间唯一的区别。
+    // 闭集里的每一条都印（没有行印 0），闭集之外出现过的也印。
+    EVENT_STREAM_ROWS_PER_DAY => "cogneva_event_stream_rows_per_day",
 
     // cog-observability — the prompt-and-response archive's retention.
     //
@@ -245,10 +290,20 @@ metric_names! {
     // The bytes are what the nightly backup pays for; they are not a bound,
     // because PostgreSQL returns a DELETE's space only when it vacuums.
     LLM_EXCHANGE_ROWS => "gateway_llm_exchange_rows",
+    LLM_EXCHANGE_ROWS_PER_DAY => "gateway_llm_exchange_rows_per_day",
     LLM_EXCHANGE_OLDEST_AGE_SECONDS => "gateway_llm_exchange_oldest_age_seconds",
     LLM_EXCHANGE_KEEP_SECONDS => "gateway_llm_exchange_keep_seconds",
     LLM_EXCHANGE_BYTES => "gateway_llm_exchange_bytes",
     LLM_EXCHANGE_SWEEP_FAILED => "gateway_llm_exchange_sweep_failed",
+
+    // The other half of that archive: the bodies themselves.
+    //
+    // `gateway_llm_exchange` is an index -- hash, byte counts and a reference --
+    // and the bytes it names live in the memory Raw layer, which no sweep
+    // touches. A write that fails leaves the row pointing at nothing, and the
+    // row alone cannot say so to anybody who was not already looking at it: the
+    // column is NULL for a call that had no body at all, exactly as it is for
+    // one whose body could not be stored. This counter is the difference, and
 
     // cog-observability — the token ledger's retention, and what it may not
     // retire.
@@ -447,7 +502,7 @@ metric_names! {
     // readings.
     //
     // Not filed with the build-outcome cells: those are compile semantics
-    // (`built`/`failed`/`timed_out`/`unstarted`) and a recipe that does not
+    // (`built`/`failed`/`stalled`/`unstarted`) and a recipe that does not
     // compile anything has no way to land in one of them without lying about
     // what happened.
     PROJECT_KIND_TOTAL => "cogneva_project_kind_total",
@@ -2087,11 +2142,10 @@ metric_names! {
     // not fit and its tail was dropped from the model's view; without it the
     // drop is visible only inside the text the model receives, so nothing
     // outside the conversation can count how much was withheld. `archive_failed`
-    // says the tail was meant to stay reachable by reference and does not, so a
-    // reference in a truncation marker points at a source that never landed and
-    // a caller following it finds nothing. Kept as separate series by `tool`
-    // because the first is expected traffic and the second is a defect: folding
-    // them would let a failing archive read as ordinary truncation.
+    // says the call's record was meant to land in the permanent Raw layer and
+    // did not. Kept as separate series by `tool` because the first is expected
+    // traffic and the second is a defect: folding them would let a failing
+    // archive read as ordinary truncation.
     //
     // The count of cuts says nothing about how much was withheld, and one cut
     // that dropped ten characters and one that dropped a hundred thousand are
@@ -2101,7 +2155,7 @@ metric_names! {
     // two are written from one place and one computation, so the count is
     // always the number of increments and the characters the sum of them.
     //
-    // The third is the read side's own fate: a read found the source but its
+    // The fourth is the read side's own fate: a read found the source but its
     // payload outgrew the byte budget the caller set, so no bytes came back.
     // Without it, "the source is bigger than you asked for" is indistinguishable
     // from "the read failed" and, worse, from an empty answer -- a bounded read
@@ -2109,16 +2163,94 @@ metric_names! {
     // same reason the pair is: one tool's reads blowing past the budget names
     // that tool's payload shape rather than reads as a whole.
     //
-    // Every cut ends in exactly one of two fates -- the tail was stored, or it
-    // was not and `archive_failed` says why -- so a cut that reaches neither is
-    // one the reading cannot see. The two fates have to add up to the count for
-    // the landed share to be a share rather than a ceiling, which is why the
-    // causes are a closed set and why a run that had no key to archive under
-    // gets a cause of its own instead of being skipped.
+    // `archived` and `archive_failed` are the two fates of one call record, and
+    // they are about calls rather than cuts: the record holds the arguments and
+    // the whole result of every call, written before the result is handed over,
+    // so a call that lands has its full text stored whether or not the copy
+    // shown to the model was cut. That is why the landed share is this pair and
+    // not a subtraction from the truncation count -- a call whose output fit the
+    // window has no cut to subtract from, and it is still a call whose only
+    // permanent copy is this record. Every call the process can key reaches
+    // exactly one of the two, which is why the causes are a closed set.
+    TOOL_CALL_ARCHIVED_TOTAL => "cogneva_tool_call_archived_total",
     TOOL_OUTPUT_TRUNCATED_TOTAL => "cogneva_tool_output_truncated_total",
     TOOL_OUTPUT_TRUNCATED_CHARS_TOTAL => "cogneva_tool_output_truncated_chars_total",
     TOOL_OUTPUT_ARCHIVE_FAILED_TOTAL => "cogneva_tool_output_archive_failed_total",
     TOOL_OUTPUT_FETCH_BUDGET_EXHAUSTED_TOTAL => "cogneva_tool_output_fetch_budget_exhausted_total",
+
+    // cog-agent — what a shutdown lost, and what a resume picked back up.
+    //
+    // The drain and the attempt journal are one promise read from two sides:
+    // a notified stop (SIGTERM, a rollout) costs nothing because the run stops
+    // at a turn boundary with its tool results already written, and a hard kill
+    // (SIGKILL, OOM) costs at most the one call that had no result. Until these
+    // series existed that promise could not be falsified: the drain only wrote
+    // a log line and the resume only a log line, so after a rollout nobody
+    // could say how long the drain took, how many runs it left behind, or
+    // whether the next attempt actually continued from the journal rather than
+    // re-buying the conversation.
+    //
+    // A histogram, not a counter, because the question the grace is set from is
+    // "how long does a real drain take", and that is a distribution: a single
+    // slow rollout is the observation that raises the grace, and a mean over a
+    // day hides it. The `outcome` label keeps the two endings apart -- a drain
+    // that reached zero and one that ran out of budget are both events here,
+    // and summing the label away would let a process that never drains on time
+    // look like one that always does.
+    //
+    // Milliseconds rather than seconds because the bucket ladder follows the
+    // name's suffix: the `_seconds` ladder doubles from 1 ms and tops out at
+    // 16.384 s, so every drain that mattered -- the ones approaching the grace
+    // it has to fit under -- would land in one indistinguishable `+Inf` count,
+    // and a reading that cannot tell 17 s from 30 s cannot say whether the
+    // grace is too small. The `_ms` ladder reaches 65.5 s, which covers the
+    // whole range a drain is allowed to take.
+    SHUTDOWN_DRAIN_MILLISECONDS => "cogneva_shutdown_drain_milliseconds",
+    // Runs still in flight when the drain budget ran out. The histogram above
+    // says how long the wait was; this says what it bought. A drain that times
+    // out with nothing left has lost nothing, while one that times out with
+    // three runs still going has handed three attempts to the journal — and
+    // the log line those two produce is the same sentence.
+    SHUTDOWN_DRAIN_ABANDONED_TOTAL => "cogneva_shutdown_drain_abandoned_total",
+    // Shutdowns that found no declared drain budget and therefore did not wait
+    // at all. Kept apart from the histogram rather than observed there as a
+    // zero: "the process did not drain" and "the process drained instantly"
+    // are opposite facts about the same second, and a reader that saw only a
+    // zero would have no way to tell which one it was looking at.
+    SHUTDOWN_DRAIN_UNDECLARED_TOTAL => "cogneva_shutdown_drain_undeclared_total",
+    // Attempts that started by reading the journal, labelled by `outcome`.
+    //
+    // `resumed` means a previous attempt left an unfinished conversation and
+    // this one continued it; `fresh` means the journal had nothing to continue
+    // (no entries, or a closed one) and the run paid for its first turn. The
+    // pair is one reading because the count of resumes alone cannot be read:
+    // five resumes in a day is a healthy rolling deploy if there were five
+    // attempts and a runaway restart loop if there were five thousand, and
+    // which one it is decides whether anyone should be woken.
+    ATTEMPT_RESUME_TOTAL => "cogneva_attempt_resume_total",
+    // Tool calls a resumed attempt found without a result, labelled by the
+    // side-effect class the journal decides them by.
+    //
+    // This is the "at most one step lost" claim in its measurable form. A
+    // resume plan with no doubt lost nothing; a plan with doubts names exactly
+    // the calls that were interrupted, and their class decides what the resume
+    // does with them -- replay a read, replay a write that refuses a stale
+    // anchor, or hand an external effect back to the model. Counting them by
+    // class is what tells a rollout that cost nothing from one that cost an
+    // external action.
+    ATTEMPT_UNRESOLVED_CALLS_TOTAL => "cogneva_attempt_unresolved_calls_total",
+    // Calls an upstream refused for exceeding its context window, by whether
+    // the refusal named the limit.
+    //
+    // The window is a property of the upstream deployment: no file in this
+    // tree carries it, so the only number the loop can have is one it measured.
+    // A refusal is the measurement — `limit_named` cells teach the number
+    // exactly, because the vendor's own message states it, and `limit_unnamed`
+    // cells still say the budget was wrong even though nothing was learned.
+    // The two are kept apart because the repairs differ: a named limit is
+    // applied by the loop that read it, while an unnamed one needs the vendor's
+    // wording taught to `context_limit_from_refusal`.
+    AGENT_CONTEXT_LIMIT_REFUSALS_TOTAL => "cogneva_agent_context_limit_refusals_total",
 
     // cog-orchestrator -- what the backup account holds, folded into one series
     // by `readout`.

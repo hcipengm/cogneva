@@ -175,5 +175,52 @@ ck_rc "判不了的头 ⇒ 3，不是 0 也不是 1" 3 "$rc"
 ck_has "判不了单独记一档" "$out" "UNKNOWN - ghost9@"
 ck_has "汇总把判不了与不合格分开数" "$out" "unknown=1"
 
+# ---- case 10: --single 下只有 trunk ⇒ 0（零条在这一档是答案，不是判不了）----
+r="$work/single-clean"; newrepo "$r"
+out="$(bash "$gate" "$r" --single 2>&1)"; rc=$?
+ck_rc "--single：只有 trunk ⇒ 0" 0 "$rc"
+ck_has "--single 说清判的是头数" "$out" "single=main heads=0"
+ck_lacks "合格时不带 judged nothing" "$out" "judged nothing"
+
+# ---- case 11: --single 下一条内容早已在 trunk 上的分支 ⇒ 1 ----
+# 这一格是这一档存在的理由：默认那一问会把它判成合格（内容在 trunk 上），而这条规矩
+# 要拦的正是「它已经在了」——存在本身就要有人回答「能不能删」。
+r="$work/single-contained"; newrepo "$r"
+git -C "$r" branch old
+out="$(bash "$gate" "$r" --single 2>&1)"; rc=$?
+ck_rc "--single：已收敛的分支也不许在 ⇒ 1" 1 "$rc"
+ck_has "判词点名那条分支" "$out" "RED   - old：非 main 分支不许存在（--single）"
+ck_has "修法仍是先证内容再删" "$out" "git branch -d old"
+
+# ---- case 12: --single 下远端多一个头 ⇒ 1 ----
+git init -q --bare -b main "$work/origin12.git"
+r="$work/single-remote"; newrepo "$r"
+git -C "$r" remote add origin "$work/origin12.git"
+git -C "$r" push -q origin main
+git -C "$r" checkout -q -b stray
+add_commit "$r" stray.txt 'stray' stray
+git -C "$r" push -q origin stray
+git -C "$r" checkout -q main
+git -C "$r" branch -D stray >/dev/null 2>&1
+out="$(bash "$gate" "$r" --single --remote origin 2>&1)"; rc=$?
+ck_rc "--single：远端多一个头 ⇒ 1" 1 "$rc"
+ck_has "判词点名远端那一头" "$out" "RED   - stray@"
+ck_has "汇总把它数进 uncontained" "$out" "uncontained=1"
+
+# ---- case 13: --single --remote 只判远端；本机分支是各会话的工作状态 ----
+# 这一格是 --single 在宿主上可用与否的分界：工作树总要站在某条分支上，把本机头算进
+# 「远端只许一个」里，这条判据在每台机器上都是红的，红到没人再看它。
+git init -q --bare -b main "$work/origin13.git"
+r="$work/single-remote-clean"; newrepo "$r"
+git -C "$r" remote add origin "$work/origin13.git"
+git -C "$r" push -q origin main
+git -C "$r" branch local-work
+add_commit "$r" local.txt 'local' 'a session branch that was never pushed'
+git -C "$r" checkout -q main 2>/dev/null || true
+out="$(bash "$gate" "$r" --single --remote origin 2>&1)"; rc=$?
+ck_rc "--single --remote：本机有分支、远端干净 ⇒ 0" 0 "$rc"
+ck_has "汇总只数远端那一个头" "$out" "single=main heads=0"
+ck_lacks "本机那条分支不点名" "$out" "local-work"
+
 printf '\nbranch-convergence.test: %d passed / %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

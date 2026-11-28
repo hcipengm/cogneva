@@ -110,7 +110,7 @@ impl MessageBackend for Recording {
 }
 
 /// One live entry in the hand-written roster.
-type Entry = (&'static str, &'static str, &'static [&'static str]);
+type Entry = (&'static str, &'static str);
 
 /// A roster holding the names it was built with.
 ///
@@ -121,10 +121,10 @@ struct Roster {
 }
 
 impl Roster {
-    /// Entries that only need to exist: role `probe`, no capabilities.
+    /// Entries that only need to exist: role `probe`.
     fn new(live: &[&'static str]) -> Self {
         Self {
-            live: live.iter().map(|id| (*id, "probe", &[][..])).collect(),
+            live: live.iter().map(|id| (*id, "probe")).collect(),
         }
     }
 
@@ -153,15 +153,15 @@ impl AgentRegistry for Roster {
         Ok(self
             .live
             .iter()
-            .find(|(id, _, _)| *id == agent_id)
-            .map(|(id, role, caps)| registration(id, role, caps)))
+            .find(|(id, _)| *id == agent_id)
+            .map(|(id, role)| registration(id, role)))
     }
 
     async fn list(&self) -> SFResult<Vec<AgentRegistration>> {
         Ok(self
             .live
             .iter()
-            .map(|(id, role, caps)| registration(id, role, caps))
+            .map(|(id, role)| registration(id, role))
             .collect())
     }
 
@@ -169,17 +169,8 @@ impl AgentRegistry for Roster {
         Ok(self
             .live
             .iter()
-            .filter(|(_, r, _)| *r == role)
-            .map(|(id, role, caps)| registration(id, role, caps))
-            .collect())
-    }
-
-    async fn list_by_capability(&self, capability: &str) -> SFResult<Vec<AgentRegistration>> {
-        Ok(self
-            .live
-            .iter()
-            .filter(|(_, _, caps)| caps.contains(&capability))
-            .map(|(id, role, caps)| registration(id, role, caps))
+            .filter(|(_, r)| *r == role)
+            .map(|(id, role)| registration(id, role))
             .collect())
     }
 
@@ -190,10 +181,9 @@ impl AgentRegistry for Roster {
             .live
             .iter()
             .enumerate()
-            .map(|(slot, (id, role, _))| EmployeeRecord {
+            .map(|(slot, (id, _role))| EmployeeRecord {
                 agent_id: (*id).to_string(),
                 number: Some(slot as u32 + 1),
-                role: (*role).to_string(),
                 first_seen: now,
                 last_seen: now,
                 retired_at: None,
@@ -202,13 +192,12 @@ impl AgentRegistry for Roster {
     }
 }
 
-fn registration(agent_id: &str, role: &str, capabilities: &[&str]) -> AgentRegistration {
+fn registration(agent_id: &str, role: &str) -> AgentRegistration {
     let now = chrono::Utc::now();
     AgentRegistration {
         agent_id: agent_id.to_string(),
         role: role.into(),
         workspace_id: "probe".into(),
-        capabilities: capabilities.iter().map(|c| (*c).to_string()).collect(),
         resources: ResourceInfo::default(),
         hostname: "probe".into(),
         pod_ip: "127.0.0.1".into(),
@@ -223,7 +212,7 @@ async fn call<B: MessageBackend + 'static>(
     roster: Arc<Roster>,
     args: serde_json::Value,
 ) -> SFResult<serde_json::Value> {
-    let tool = send_to_agent(backend, roster);
+    let tool = send_to_agent(backend, roster, None, None, None, None);
     match tool.implementation {
         ToolImplementation::Native(handler) => (handler)(args).await,
         _ => panic!("send_to_agent is a native tool"),
@@ -248,8 +237,8 @@ async fn call_list(roster: Arc<Roster>, args: serde_json::Value) -> SFResult<ser
 #[tokio::test]
 async fn an_id_the_directory_lists_is_an_id_the_send_tool_delivers_to() {
     let roster = Arc::new(Roster::with_roles(&[
-        ("squad:task-1-reviewer", "reviewer", &[]),
-        ("squad:task-1-coder", "coder", &[]),
+        ("squad:task-1-reviewer", "reviewer"),
+        ("squad:task-1-coder", "coder"),
     ]));
     let listed = call_list(roster.clone(), serde_json::json!({}))
         .await
@@ -288,8 +277,8 @@ async fn an_id_the_directory_lists_is_an_id_the_send_tool_delivers_to() {
 #[tokio::test]
 async fn every_row_in_the_directory_carries_the_name_the_board_shows() {
     let roster = Arc::new(Roster::with_roles(&[
-        ("squad:task-1-reviewer", "reviewer", &[]),
-        ("employee:0e2ba053", "employee", &[]),
+        ("squad:task-1-reviewer", "reviewer"),
+        ("employee:0e2ba053", "employee"),
     ]));
     let listed = call_list(roster, serde_json::json!({}))
         .await
@@ -314,12 +303,16 @@ async fn every_row_in_the_directory_carries_the_name_the_board_shows() {
 }
 
 /// Narrowing the search is a filter over the same list, not a second source.
+///
+/// Role is the only filter. "Capability" is gone with the per-person column: every
+/// digital employee has the same capabilities, so a capability filter could only
+/// ever name a role by another word.
 #[tokio::test]
-async fn the_directory_can_be_narrowed_by_role_and_capability() {
+async fn the_directory_can_be_narrowed_by_role() {
     let roster = Arc::new(Roster::with_roles(&[
-        ("squad:task-1-reviewer", "reviewer", &["code-review"]),
-        ("squad:task-1-coder", "coder", &["code-review", "shell"]),
-        ("squad:task-1-tester", "tester", &["shell"]),
+        ("squad:task-1-reviewer", "reviewer"),
+        ("squad:task-1-coder", "coder"),
+        ("squad:task-1-tester", "tester"),
     ]));
 
     let reviewers = call_list(roster.clone(), serde_json::json!({ "role": "reviewer" }))
@@ -330,33 +323,25 @@ async fn the_directory_can_be_narrowed_by_role_and_capability() {
         reviewers["agents"][0]["agent_id"],
         serde_json::json!("squad:task-1-reviewer")
     );
+}
 
-    let shells = call_list(roster.clone(), serde_json::json!({ "capability": "shell" }))
-        .await
-        .expect("listed");
-    let mut shell_ids: Vec<&str> = shells["agents"]
-        .as_array()
-        .expect("agents is a list")
-        .iter()
-        .map(|a| a["agent_id"].as_str().expect("agent_id"))
-        .collect();
-    shell_ids.sort();
-    assert_eq!(shell_ids, vec!["squad:task-1-coder", "squad:task-1-tester"]);
-
-    let both = call_list(
-        roster,
-        serde_json::json!({ "role": "coder", "capability": "shell" }),
-    )
-    .await
-    .expect("listed");
-    assert_eq!(
-        both["count"],
-        serde_json::json!(1),
-        "both filters apply: {both}"
+/// The directory no longer advertises a capability filter.
+///
+/// The parameter was a role name under another spelling; keeping it on the
+/// tool's schema would let a caller believe two employees can differ that way.
+/// This goes red the day the parameter comes back, before a caller is misled.
+#[tokio::test]
+async fn the_directory_advertises_no_capability_filter() {
+    let tool = list_agents(Arc::new(Roster::new(&["worker-a"])));
+    let properties = tool.parameters["properties"]
+        .as_object()
+        .expect("the schema has properties");
+    assert!(
+        !properties.contains_key("capability"),
+        "a capability filter is a role filter under another name: {properties:?}"
     );
 }
 
-/// The wire form the inbox consumer reads, on the stream it reads it from.
 #[tokio::test]
 async fn a_prompt_reaches_the_inbox_the_consumer_group_reads() {
     let backend = Arc::new(Recording::default());
@@ -378,7 +363,9 @@ async fn a_prompt_reaches_the_inbox_the_consumer_group_reads() {
     );
     let decoded: InboxMessage = serde_json::from_slice(payload).expect("the consumer decodes this");
     match decoded {
-        InboxMessage::Prompt { goal, reply_stream } => {
+        InboxMessage::Prompt {
+            goal, reply_stream, ..
+        } => {
             assert_eq!(goal, serde_json::json!("review the patch"));
             assert_eq!(
                 reply_stream, None,
@@ -400,12 +387,14 @@ async fn steering_and_continue_keep_the_instruction_verbatim() {
             "steering",
             InboxMessage::Steering {
                 instruction: "stop refactoring".into(),
+                from_agent: None,
             },
         ),
         (
             "continue",
             InboxMessage::Continue {
                 instruction: "now run the tests".into(),
+                from_agent: None,
             },
         ),
     ] {
@@ -520,8 +509,8 @@ async fn an_empty_message_is_refused() {
 #[tokio::test]
 async fn the_run_identity_reaches_the_receipt_and_the_directory_alike() {
     let roster = Arc::new(Roster::with_roles(&[
-        ("squad:task-1-coder", "coder", &[]),
-        ("squad:task-1-reviewer", "reviewer", &[]),
+        ("squad:task-1-coder", "coder"),
+        ("squad:task-1-reviewer", "reviewer"),
     ]));
     let backend = Arc::new(Recording::default());
 
@@ -557,6 +546,54 @@ async fn the_run_identity_reaches_the_receipt_and_the_directory_alike() {
     );
 }
 
+/// 一个 Squad 的成员发给另一个 Squad 的成员，不经中继。
+///
+/// 员工之间平等：名册上有收信人就发得出去，两个人在不在同一队不影响这条路由。
+/// 如果跨队要经过某个中继，那个中继就得知道两边是谁、并且替发信人把话再说一遍
+/// ——它于是成了名册上没有的第三个人，而收件人手里的话就不再带着真正说过它的
+/// 那个人的身份。
+///
+/// 断言拆成两半：落在**收件人自己的收件箱**而不是某个共享的跨队 topic 上；
+/// 线上那条消息自己写着发信人，收件人不必回头问第二处「这是谁说的」。
+#[tokio::test]
+async fn a_member_of_one_squad_reaches_a_member_of_another_without_a_relay() {
+    let roster = Arc::new(Roster::with_roles(&[
+        ("squad:task-1-reviewer", "reviewer"),
+        ("squad:task-2-coder", "coder"),
+    ]));
+    let backend = Arc::new(Recording::default());
+
+    cog_agent::tools::CALLER_AGENT_ID
+        .scope("squad:task-1-reviewer".to_string(), async {
+            call(
+                backend.clone(),
+                roster.clone(),
+                serde_json::json!({
+                    "agent_id": "squad:task-2-coder",
+                    "message": "the patch you sent is green, carry on",
+                    "kind": "steering"
+                }),
+            )
+            .await
+            .expect("another squad's member is addressed like any other employee")
+        })
+        .await;
+
+    let published = backend.published();
+    assert_eq!(published.len(), 1, "one message, and no relay copy of it");
+    assert_eq!(
+        published[0].0,
+        cog_core::agent_inbox_stream("squad:task-2-coder"),
+        "it lands in the recipient's own inbox, not on a shared cross-squad topic"
+    );
+    let decoded: InboxMessage = serde_json::from_slice(&published[0].1).expect("decode");
+    assert_eq!(
+        decoded.from_agent(),
+        Some("squad:task-1-reviewer"),
+        "the receiver reads who said it off the message itself: {decoded:?}"
+    );
+}
+
 /// A run that announced no identity says so, rather than being given a name.
 ///
 /// Both tools are reachable from callers that were never told who they are —
@@ -567,8 +604,8 @@ async fn the_run_identity_reaches_the_receipt_and_the_directory_alike() {
 #[tokio::test]
 async fn a_run_with_no_identity_reports_null_and_marks_nobody() {
     let roster = Arc::new(Roster::with_roles(&[
-        ("squad:task-1-coder", "coder", &[]),
-        ("squad:task-1-reviewer", "reviewer", &[]),
+        ("squad:task-1-coder", "coder"),
+        ("squad:task-1-reviewer", "reviewer"),
     ]));
     let backend = Arc::new(Recording::default());
 
@@ -686,7 +723,7 @@ impl MessageBackend for Answering {
                 let bytes = serde_json::to_vec(answer).expect("encode answer");
                 // A subscriber that is not attached yet receives nothing:
                 // that is the property under test.
-                let _ = self.replies.send(("1-0".to_string(), bytes));
+                cog_core::ignore_lost!(self.replies.send(("1-0".to_string(), bytes)));
             }
         }
         self.inner.publish(subject, payload).await
@@ -905,7 +942,7 @@ async fn a_cancelled_ask_ends_its_stream_and_is_counted_apart_from_a_timeout() {
     let backend = Arc::new(Answering::new(None));
     let roster = Arc::new(Roster::new(&["squad:task-1-tester"]));
 
-    let tool = send_to_agent(backend.clone(), roster);
+    let tool = send_to_agent(backend.clone(), roster, None, None, None, None);
     let ToolImplementation::Native(handler) = tool.implementation else {
         panic!("send_to_agent is a native tool");
     };
@@ -934,7 +971,7 @@ async fn a_cancelled_ask_ends_its_stream_and_is_counted_apart_from_a_timeout() {
     let stream = stream.expect("the ask opened its reply stream before waiting");
 
     asking.abort();
-    let _ = asking.await;
+    cog_core::ignore_lost!(asking.await);
 
     // The guard deletes from a task it spawned on the way out, so let the
     // runtime reach it before reading what the backend saw.
@@ -993,7 +1030,7 @@ async fn a_question_the_queue_refused_is_not_booked_as_abandoned() {
     // nothing.
     let abandoned_before = abandoned_count().await;
 
-    let tool = send_to_agent(backend.clone(), roster);
+    let tool = send_to_agent(backend.clone(), roster, None, None, None, None);
     let ToolImplementation::Native(handler) = tool.implementation else {
         panic!("send_to_agent is a native tool");
     };
@@ -1045,4 +1082,100 @@ async fn abandoned_count() -> f64 {
         })
         .map(|m| m.value)
         .unwrap_or(0.0)
+}
+
+/// 一次投递记下的那些事实，按到达顺序留着。
+#[derive(Default)]
+struct Facts(Mutex<Vec<cog_core::FactEvent>>);
+
+impl Facts {
+    fn rows(&self) -> Vec<cog_core::IntentRow> {
+        self.0
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter_map(|event| match &event.payload {
+                cog_core::EventPayload::IntentRecorded(row) => Some(row.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl cog_core::EventStore for Facts {
+    fn writer(&self) -> &str {
+        "agent-messaging-test"
+    }
+
+    fn next_event_id(&self) -> String {
+        "FACTS00000000000000000001".into()
+    }
+
+    async fn append(&self, event: cog_core::FactEvent) -> SFResult<()> {
+        self.0.lock().expect("lock").push(event);
+        Ok(())
+    }
+}
+
+/// 同事之间说的那句话同时是一条意图，而且收件人拿到的消息自己带着那个身份：
+/// 他派出去的活因此答得出「这是谁让我做的」，不必按时间或原文去猜。
+#[tokio::test]
+async fn a_colleague_message_lands_as_an_intent_and_carries_its_identity() {
+    let backend = Arc::new(Recording::default());
+    let facts = Arc::new(Facts::default());
+    let tool = send_to_agent(
+        backend.clone(),
+        Arc::new(Roster::new(&["staff-2"])),
+        None,
+        Some(facts.clone()),
+        None,
+        None,
+    );
+    let ToolImplementation::Native(handler) = tool.implementation else {
+        panic!("send_to_agent is a native tool");
+    };
+    (handler)(serde_json::json!({
+        "agent_id": "staff-2",
+        "message": "把门禁的归属改回它判的那个对象",
+    }))
+    .await
+    .expect("投递成功");
+
+    let published = backend.published();
+    assert_eq!(published.len(), 1, "一条消息只投一次");
+    let message: InboxMessage = serde_json::from_slice(&published[0].1).expect("inbox wire form");
+    let InboxMessage::Prompt { intent, .. } = message else {
+        panic!("prompt 应投成 Prompt");
+    };
+    let intent = intent.expect("收件人要拿到这条消息的意图身份");
+
+    let rows = facts.rows();
+    assert_eq!(rows.len(), 1, "投递成功之后要有一条意图");
+    let row = &rows[0];
+    assert_eq!(row.identity, intent, "消息与意图行是同一个身份");
+    assert_eq!(row.source, "agent");
+    assert_eq!(row.addressed_to, "staff-2");
+    assert_eq!(row.text, "把门禁的归属改回它判的那个对象");
+    assert!(
+        intent.starts_with("agent:>staff-2:prompt:"),
+        "发信人没留名时如实写空，不编一个名字：{intent}"
+    );
+}
+
+/// 收件人那一侧真的用了消息带来的那个身份：`handle_inbox` 把 `intent` 交给
+/// `prompt_for_intent`，不是丢掉它照旧 `prompt`。消息与意图两条各自都有用例，
+/// 中间这一格不接线时两头的用例都还是绿的。
+#[test]
+fn the_resident_employee_hears_which_intent_the_message_is() {
+    let source = include_str!("../src/agent.rs");
+    assert!(
+        source.contains("let out = self.prompt_for_intent(input, intent).await?;"),
+        "handle_inbox 没有把消息上的意图身份交给运行"
+    );
+    assert!(
+        include_str!("../src/agent_kernel/runtime.rs")
+            .contains("self.stamp_intent(&tc.name, &mut tc.arguments);"),
+        "运行没有把意图身份挂到派活的参数上"
+    );
 }

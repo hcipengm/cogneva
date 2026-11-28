@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use crate::mainline_deployer::FATAL_WAITING_REASONS;
 use crate::GitOpsConfig;
+use cog_core::declared_wall::Step;
 use cog_core::{
     PromotionLedger, PromotionRecord, PromotionStatus, SFError, SFResult,
     COUNTER_SEMANTICS_CUMULATIVE, COUNTER_SEMANTICS_MARKER,
@@ -136,12 +137,14 @@ const WHOLE_WATCH_GATE: &str = "watch";
 /// as the other's.
 pub const CLUSTER_LABEL: &str = "cluster";
 
-/// 等一次滚动发布完成的轮询间隔：10s。
+use crate::rollout_cadence::ROLLOUT_POLL as ROLLOUT_POLL_INTERVAL;
+
+/// 等全量滚动时「读数变了」这条证据通道的名字。
 ///
-/// Pod 重建本身以十秒计，更密的轮询只会多打几次 kubectl 而不会让发布更早
-/// 完成；10s 也是这条循环在发布期间的全部负载。
-// cap: bound — Pod 重建以十秒计，更密的轮询只多打几次 kubectl，不会让发布更早完成
-const ROLLOUT_POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// 一个名字，两处读者：等待方在读数变化时记一拍，判停方（
+/// [`cog_core::declared_wall::wait_for_settled`]）按同一个名字问「多久没动」。
+/// 名字分叉＝两边各说各的，判据永远不响。
+const ROLLOUT_PROGRESS_CHANNEL: &str = "gitops-rollout";
 
 /// 一次待处理的晋级（从 release 分支 HEAD + promote tag 解析出来）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,24 +303,19 @@ impl GitOpsPuller {
         self
     }
 
-    async fn run(
-        &self,
-        program: &str,
-        args: &[&str],
-        dir: Option<&Path>,
-        timeout_secs: u64,
-    ) -> SFResult<String> {
+    /// 判的是它还在不在产出，不是它跑了多久。`git clone` 冷拉一个仓库可以安静地忙
+    /// 很久，而一份卡死的拉取与它在那条按秒的界眼里是同一个读数。
+    async fn run(&self, program: &str, args: &[&str], dir: Option<&Path>) -> SFResult<String> {
         let cmdline = format!("{} {}", program, args.join(" "));
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(args).kill_on_drop(true);
         if let Some(d) = dir {
             cmd.current_dir(d);
         }
-        let fut = cmd.output();
-        let output = tokio::time::timeout(Duration::from_secs(timeout_secs), fut)
-            .await
-            .map_err(|_| SFError::IO(crate::cmd_timeout::timed_out(&cmdline, timeout_secs)))?
-            .map_err(|e| SFError::IO(format!("failed to run {program}: {e}")))?;
+        let output = match cog_core::progress::run_child_watched(cmd, &cmdline).await {
+            Ok(cog_core::progress::ChildOutcome::Exited(output)) => output,
+            Err(e) => return Err(SFError::IO(format!("failed to run {program}: {e}"))),
+        };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(SFError::IO(format!("{cmdline} failed: {stderr}")));
@@ -345,7 +343,6 @@ impl GitOpsPuller {
                         &self.config.branch,
                     ],
                     None,
-                    60,
                 )
                 .await?;
             if probe.is_empty() {
@@ -365,40 +362,30 @@ impl GitOpsPuller {
                     ".",
                 ],
                 Some(&dir),
-                300,
             )
             .await?;
         } else {
-            self.run(
-                "git",
-                &["fetch", "origin", &self.config.branch],
-                Some(&dir),
-                120,
-            )
-            .await?;
+            self.run("git", &["fetch", "origin", &self.config.branch], Some(&dir))
+                .await?;
             self.run(
                 "git",
                 &["reset", "--hard", &format!("origin/{}", self.config.branch)],
                 Some(&dir),
-                60,
             )
             .await?;
         }
         // tag 也要拉（promote tag 带 level 元数据）。
-        self.run("git", &["fetch", "--tags", "--force"], Some(&dir), 120)
+        self.run("git", &["fetch", "--tags", "--force"], Some(&dir))
             .await?;
-        self.run("git", &["rev-parse", "HEAD"], Some(&dir), 30)
-            .await
+        self.run("git", &["rev-parse", "HEAD"], Some(&dir)).await
     }
 
     /// 从 HEAD 上的 promote tag 解析晋级候选；无 tag 返回 None。
     pub async fn candidate_at_head(&self) -> SFResult<Option<PromotionCandidate>> {
         let dir = self.work_dir();
-        let head = self
-            .run("git", &["rev-parse", "HEAD"], Some(&dir), 30)
-            .await?;
+        let head = self.run("git", &["rev-parse", "HEAD"], Some(&dir)).await?;
         let tags = self
-            .run("git", &["tag", "--points-at", &head], Some(&dir), 30)
+            .run("git", &["tag", "--points-at", &head], Some(&dir))
             .await?;
         let Some(tag) = tags
             .lines()
@@ -411,7 +398,6 @@ impl GitOpsPuller {
                 "git",
                 &["tag", "-l", "--format=%(contents)", tag],
                 Some(&dir),
-                30,
             )
             .await?;
         let (change_id, level, eval_summary) = parse_tag_message(&message);
@@ -517,13 +503,12 @@ impl GitOpsPuller {
             // already_processed、这条 Pending 已经被收尾，于是没有任何一方
             // 会再回来 resume——部署就停在 pause 上，下一轮重试同样空转。
             // 走到这里 age 已越过看护窗口，pause 只可能是死掉的写者留下的。
-            if self.deployment_paused().await.unwrap_or(false) {
+            if cog_core::logged_default!(self.deployment_paused().await, false) {
                 let _ = self
                     .run(
                         &k,
                         &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
                         None,
-                        60,
                     )
                     .await;
             }
@@ -546,35 +531,23 @@ impl GitOpsPuller {
             // 于是主线每一轮都被读成「没落地」再倒回去（2026-11-01 现场）。先把它
             // 放下来，再问 rollout 现状：放下来之后 `rollout status` 问的才是「Pod
             // 到底起没起来」，而不是被 pause 挡住的半句话。
-            let was_paused = self.deployment_paused().await.unwrap_or(false);
+            let was_paused = cog_core::logged_default!(self.deployment_paused().await, false);
             if was_paused {
                 let _ = self
                     .run(
                         &k,
                         &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
                         None,
-                        60,
                     )
                     .await;
             }
-            let status = self
-                .run(
-                    &k,
-                    &[
-                        "-n",
-                        &n,
-                        "rollout",
-                        "status",
-                        &format!("deployment/{d}"),
-                        "--timeout",
-                        "20s",
-                    ],
-                    None,
-                    40,
-                )
-                .await;
-            match status {
-                Ok(_) => {
+            // 问一次状态，不按钟问。`rollout status --timeout 20s` 把「等了二十秒」
+            // 当成了判词：puller 重启后的那一进程里，二十秒可能只是慢镜拉取，滚动
+            // 还在往前走，而失败就被读成 undo。现在只有两种读法能结束这一行：
+            // 完成，或者平台自己声明失败（`ProgressDeadlineExceeded`、坏镜像/坏挂载）。
+            // 还在滚就原样留 Pending，下一轮 poll 回来看——不写台账，于是没有重试风暴。
+            match self.rollout_step().await {
+                Ok(Step::Done(_)) => {
                     // 台账这一行要让人看出「这条是补收尾的」，不是一次完整的金丝雀：
                     // 暂停是死掉的写者留下的，本轮把它解开了。
                     let reason = if was_paused {
@@ -587,16 +560,15 @@ impl GitOpsPuller {
                         .update_status(&rec.id, PromotionStatus::Promoted, reason)
                         .await?;
                 }
-                Err(e) => {
-                    // 镜像已换但滚动卡死（拉不到镜像/副本不起）：回滚。
+                Ok(Step::Failed(why)) => {
+                    // 平台给出了失败的直接证据：回滚。
                     // resume 先于 undo（paused 部署 undo 会被 kubectl 拒绝）。
-                    warn!(error = %e, "orphaned canary stuck; rolling back");
+                    warn!(why = %why, "orphaned canary failed on direct evidence; rolling back");
                     let _ = self
                         .run(
                             &k,
                             &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
                             None,
-                            60,
                         )
                         .await;
                     let _ = self
@@ -604,19 +576,30 @@ impl GitOpsPuller {
                             &k,
                             &["-n", &n, "rollout", "undo", &format!("deployment/{d}")],
                             None,
-                            120,
                         )
                         .await;
                     self.ledger
                         .update_status(
                             &rec.id,
                             PromotionStatus::RolledBack,
-                            &format!("orphaned canary rolled back after puller restart: {e}"),
+                            &format!("orphaned canary rolled back after puller restart: {why}"),
                         )
                         .await?;
                 }
+                Ok(Step::Moving(state)) => {
+                    // 还在滚：这不是失败的证据，只是「还没完」。留 Pending 下一轮再看，
+                    // 此刻 undo 会杀掉一个可能马上完成的滚动。
+                    info!(
+                        state = %state,
+                        "orphaned canary is still rolling; leaving the row pending for the next poll"
+                    );
+                }
+                Err(e) => {
+                    // 读不出来不是「滚动失败」：这一眼没看清，下一轮再读。
+                    warn!(error = %e, "orphaned canary state unreadable; leaving the row pending");
+                }
             }
-        } else if self.deployment_paused().await.unwrap_or(false) {
+        } else if cog_core::logged_default!(self.deployment_paused().await, false) {
             // 镜像不是目标且部署仍 paused：金丝雀未落地或已被 undo，
             // 是 puller 中途死亡留下的现场——resume 先于 undo（paused
             // 部署 undo 会被 kubectl 拒绝）清理。
@@ -625,7 +608,6 @@ impl GitOpsPuller {
                     &k,
                     &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
                     None,
-                    60,
                 )
                 .await;
             let _ = self
@@ -633,7 +615,6 @@ impl GitOpsPuller {
                     &k,
                     &["-n", &n, "rollout", "undo", &format!("deployment/{d}")],
                     None,
-                    120,
                 )
                 .await;
             self.ledger
@@ -673,16 +654,19 @@ impl GitOpsPuller {
                     "jsonpath={.spec.paused}",
                 ],
                 None,
-                30,
             )
             .await?;
         Ok(out.trim() == "true")
     }
 
-    /// 全量滚动是否完成：observedGeneration 追上 generation 且更新后
-    /// 副本数与就绪副本数都达到期望。短查询（相对 rollout status 长等）
-    /// 不怕 puller 所在旧副本被杀——每次调用都是独立命令。
-    async fn rollout_complete(&self) -> SFResult<bool> {
+    /// 全量滚动的现状，一次短查询：完成 / 平台声明失败 / 还在走。
+    ///
+    /// 短查询（相对 `rollout status` 长等）不怕 puller 所在旧副本被杀——每次调用
+    /// 都是独立命令。失败那一支读的是 `Progressing` 条件里的 `ProgressDeadlineExceeded`：
+    /// 那是**部署自己**申报的期望工期被越过、且状态不再推进，是平台给出的判词，
+    /// 不是我们替它挑的一个数。还在走的那一支把原始读数带回给等待方，读数变了
+    /// 才算动过。
+    async fn rollout_step(&self) -> SFResult<Step<String>> {
         let out = self
             .run(
                 &self.config.kubectl_bin.clone(),
@@ -693,22 +677,42 @@ impl GitOpsPuller {
                     "deployment",
                     &self.config.deployment,
                     "-o",
-                    "jsonpath={.metadata.generation} {.status.observedGeneration} {.spec.replicas} {.status.updatedReplicas} {.status.readyReplicas}",
+                    "jsonpath={.metadata.generation} {.status.observedGeneration} {.spec.replicas} {.status.updatedReplicas} {.status.readyReplicas} {.status.conditions[?(@.type==\"Progressing\")].reason}",
                 ],
                 None,
-                30,
             )
             .await?;
         let parts: Vec<&str> = out.split_whitespace().collect();
         if parts.len() < 5 {
-            return Ok(false);
+            return Ok(Step::Moving(out.trim().to_string()));
         }
         let gen: u64 = parts[0].parse().unwrap_or(0);
         let obs: u64 = parts[1].parse().unwrap_or(0);
         let spec: u32 = parts[2].parse().unwrap_or(0);
         let updated: u32 = parts[3].parse().unwrap_or(0);
         let ready: u32 = parts[4].parse().unwrap_or(0);
-        Ok(obs >= gen && gen > 0 && updated == spec && ready == spec)
+        if cog_core::declared_wall::generation_reaches(gen, obs) && updated == spec && ready == spec
+        {
+            return Ok(Step::Done(out.trim().to_string()));
+        }
+        // 判词只对控制器处理过的那一代作数：`apply` 之后的第一眼可能还带着上一代
+        // 留下的 `ProgressDeadlineExceeded`。词表取自控制律那一侧，这一格按空格分列。
+        if cog_core::declared_wall::generation_reaches(gen, obs)
+            && parts.get(5) == Some(&cog_core::declared_wall::PROGRESS_DEADLINE_EXCEEDED)
+        {
+            return Ok(Step::Failed(format!(
+                "deployment {} reports Progressing=False (ProgressDeadlineExceeded): {}",
+                self.config.deployment,
+                out.trim()
+            )));
+        }
+        Ok(Step::Moving(out.trim().to_string()))
+    }
+
+    /// 全量滚动是否完成：observedGeneration 追上 generation 且更新后
+    /// 副本数与就绪副本数都达到期望。
+    async fn rollout_complete(&self) -> SFResult<bool> {
+        Ok(matches!(self.rollout_step().await?, Step::Done(_)))
     }
 
     /// 当前部署在跑的容器镜像。
@@ -727,7 +731,6 @@ impl GitOpsPuller {
                     &query,
                 ],
                 None,
-                30,
             )
             .await?;
         crate::deployment_image::container_image(
@@ -759,7 +762,6 @@ impl GitOpsPuller {
                     "json",
                 ],
                 None,
-                60,
             )
             .await?;
         Ok(rs_history_holds_image(
@@ -904,7 +906,6 @@ impl GitOpsPuller {
                 "git",
                 &["diff", "--name-only", "HEAD~1", "HEAD"],
                 Some(&dir),
-                30,
             )
             .await?;
 
@@ -918,7 +919,7 @@ impl GitOpsPuller {
         for file in changed.lines() {
             if file == config_manifest {
                 let content = self
-                    .run("git", &["show", &format!("HEAD:{file}")], Some(&dir), 30)
+                    .run("git", &["show", &format!("HEAD:{file}")], Some(&dir))
                     .await?;
                 // The document on the left of the comparison is only there to say
                 // which sections moved. A file that the parent commit does not
@@ -926,9 +927,9 @@ impl GitOpsPuller {
                 // changed: the direction is a rollout too many, never a change
                 // that stays inert.
                 let previous = self
-                    .run("git", &["show", &format!("HEAD~1:{file}")], Some(&dir), 30)
+                    .run("git", &["show", &format!("HEAD~1:{file}")], Some(&dir))
                     .await
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 restart_sections = cog_core::config_sections::sections_needing_restart_on_change(
                     &config_document(&previous),
                     &config_document(&content),
@@ -986,7 +987,6 @@ impl GitOpsPuller {
                 "git",
                 &["ls-tree", "-r", "--name-only", "HEAD", "deploy/k3s"],
                 Some(&dir),
-                30,
             )
             .await?;
 
@@ -996,7 +996,7 @@ impl GitOpsPuller {
                 continue;
             }
             let Ok(text) = self
-                .run("git", &["show", &format!("HEAD:{path}")], Some(&dir), 30)
+                .run("git", &["show", &format!("HEAD:{path}")], Some(&dir))
                 .await
             else {
                 // One unreadable manifest must not stop the roll: the workload it
@@ -1029,7 +1029,6 @@ impl GitOpsPuller {
                         &body,
                     ],
                     None,
-                    60,
                 )
                 .await?;
                 rolled.push(name);
@@ -1051,7 +1050,7 @@ impl GitOpsPuller {
     async fn rebuild_prompts_configmap(&self) -> SFResult<String> {
         let dir = self.work_dir();
         let staging = dir.join(".prompts-staging");
-        let _ = tokio::fs::remove_dir_all(&staging).await;
+        cog_core::ignore_lost!(tokio::fs::remove_dir_all(&staging).await);
         tokio::fs::create_dir_all(&staging)
             .await
             .map_err(|e| SFError::IO(format!("create prompts staging: {e}")))?;
@@ -1060,13 +1059,12 @@ impl GitOpsPuller {
                 "git",
                 &["ls-tree", "-r", "--name-only", "HEAD", "prompts/"],
                 Some(&dir),
-                30,
             )
             .await?;
         let mut count = 0usize;
         for rel in listed.lines() {
             let content = self
-                .run("git", &["show", &format!("HEAD:{rel}")], Some(&dir), 30)
+                .run("git", &["show", &format!("HEAD:{rel}")], Some(&dir))
                 .await?;
             let dest = staging.join(rel.trim_start_matches("prompts/"));
             if let Some(parent) = dest.parent() {
@@ -1094,11 +1092,10 @@ impl GitOpsPuller {
                     "yaml",
                 ],
                 None,
-                60,
             )
             .await?;
         let applied = self.kubectl_apply_stdin(&create).await;
-        let _ = tokio::fs::remove_dir_all(&staging).await;
+        cog_core::ignore_lost!(tokio::fs::remove_dir_all(&staging).await);
         applied?;
         Ok(format!("prompts/ configmap rebuilt ({count} files)"))
     }
@@ -1166,7 +1163,7 @@ impl GitOpsPuller {
         let k = self.config.kubectl_bin.clone();
 
         // 金丝雀节奏：maxSurge=1,maxUnavailable=0 → 新副本先起、旧副本不动。
-        self.run(&k, &canary_strategy_patch_args(&n, d), None, 60)
+        self.run(&k, &canary_strategy_patch_args(&n, d), None)
             .await?;
         // 换镜像之前记下本部署已在跑的副本。此后新出现的副本才是候选，
         // 看护要观测的是它。拿不到这份名单就整轮关掉指标闸门（readiness 与
@@ -1189,7 +1186,6 @@ impl GitOpsPuller {
                 &format!("{c}={image}"),
             ],
             None,
-            60,
         )
         .await?;
         // 起第一个新副本后立即暂停，进入看护。"already paused" 容忍：
@@ -1201,7 +1197,6 @@ impl GitOpsPuller {
                 &k,
                 &["-n", &n, "rollout", "pause", &format!("deployment/{d}")],
                 None,
-                60,
             )
             .await
         {
@@ -1219,7 +1214,6 @@ impl GitOpsPuller {
                         &k,
                         &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
                         None,
-                        60,
                     )
                     .await
                 {
@@ -1229,33 +1223,36 @@ impl GitOpsPuller {
                 }
                 // 等全量滚动完成。不用 `rollout status --timeout`：puller
                 // 跑在被滚动的部署里，长连接命令会随旧副本被杀而失败，
-                // 把成功的滚动误判成失败进而 undo 掉好版本。改为短查询
-                // 轮询完成条件；puller 中途被杀则台账留 Pending，由
-                // reconcile_pending 收尾。
-                let rollout_deadline = std::time::Instant::now()
-                    + Duration::from_secs(self.config.canary_watch_secs.max(300));
-                let mut rolled_out = false;
-                while std::time::Instant::now() < rollout_deadline {
-                    if self.rollout_complete().await.unwrap_or(false) {
-                        rolled_out = true;
-                        break;
-                    }
-                    tokio::time::sleep(ROLLOUT_POLL_INTERVAL).await;
-                }
-                if !rolled_out {
-                    // 看护通过但全量滚动失败（新副本后续拉不到镜像/不起）：
+                // 把成功的滚动误判成失败进而 undo 掉好版本。也不按钟收尾——
+                // 只有「完成」与「平台声明失败」两种读法能结束这一段：
+                // 读回来的读数变了就是还在动，过了申报的墙只留一行字。
+                // puller 中途被杀则台账留 Pending，由 reconcile_pending 收尾。
+                // 声明的看护时长就是这里的墙：从前它被抬到 300 秒，而配置面
+                // 与另一处（`canary_watch_secs + CANARY_PAUSE_GRACE_SECS`）读的是
+                // 声明值——同一个字段两处两个数。
+                let declared = Duration::from_secs(self.config.canary_watch_secs);
+                let rolled_out = cog_core::declared_wall::wait_for_settled(
+                    declared,
+                    "the full rollout after the canary",
+                    ROLLOUT_PROGRESS_CHANNEL,
+                    ROLLOUT_POLL_INTERVAL,
+                    || async { self.rollout_step().await.map_err(|e| e.to_string()) },
+                )
+                .await;
+                if let Err(why) = rolled_out {
+                    // 看护通过但全量滚动失败（新副本后续拉不到镜像/不起、平台
+                    // 宣布 ProgressDeadlineExceeded，或静默越过了实测界）：
                     // 与看护失败同等处理——回滚 + RolledBack。否则候选记
                     // Failed 下轮 poll 会反复金丝雀（重试风暴），部署也
                     // 停在坏镜像上（2026-08-07 cluster-2 实测）。
                     // resume 先于 undo（paused 部署 undo 会被 kubectl 拒绝）。
-                    let e = SFError::Agent("rollout did not complete in time".into());
+                    let e = SFError::Agent(why);
                     warn!(error = %e, "rollout after canary failed; rolling back");
                     let _ = self
                         .run(
                             &k,
                             &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
                             None,
-                            60,
                         )
                         .await;
                     let _ = self
@@ -1263,7 +1260,6 @@ impl GitOpsPuller {
                             &k,
                             &["-n", &n, "rollout", "undo", &format!("deployment/{d}")],
                             None,
-                            120,
                         )
                         .await;
                     self.mark_rolled_back(candidate, &format!("rollout after canary: {e}"))
@@ -1293,7 +1289,6 @@ impl GitOpsPuller {
                         &k,
                         &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
                         None,
-                        60,
                     )
                     .await;
                 let _ = self
@@ -1301,7 +1296,6 @@ impl GitOpsPuller {
                         &k,
                         &["-n", &n, "rollout", "undo", &format!("deployment/{d}")],
                         None,
-                        120,
                     )
                     .await;
                 self.mark_rolled_back(candidate, &format!("canary regression: {e}"))
@@ -1333,7 +1327,6 @@ impl GitOpsPuller {
                 "git",
                 &["diff", "--name-only", "HEAD~1", "HEAD"],
                 Some(&self.work_dir()),
-                30,
             )
             .await?;
         Ok(changed.lines().any(|f| f.starts_with(prefix)))
@@ -1546,7 +1539,6 @@ impl GitOpsPuller {
                     "jsonpath={range .items[*]}{.status.containerStatuses[0].restartCount}{' '}{.status.containerStatuses[0].ready}{' '}{.status.containerStatuses[0].state.waiting.reason}{\"\\n\"}{end}",
                 ],
                 None,
-                30,
             )
             .await?;
         if out.trim().is_empty() {
@@ -1570,7 +1562,11 @@ impl GitOpsPuller {
         url: &str,
     ) -> SFResult<Option<(CanarySignals, CounterSemantics, HistogramSnapshot)>> {
         let body = self
-            .run("curl", &["-sf", "--max-time", "10", url], None, 15)
+            .run(
+                "curl",
+                &["-sf", "--speed-limit", "1", "--speed-time", "10", url],
+                None,
+            )
             .await?;
         Ok(Some(parse_prometheus_signals(&body)))
     }
@@ -1638,7 +1634,6 @@ impl GitOpsPuller {
                     "jsonpath={range .items[*]}{.metadata.name}{\" \"}{.status.podIP}{\"\\n\"}{end}",
                 ],
                 None,
-                30,
             )
             .await?;
         Ok(out
@@ -1797,7 +1792,7 @@ pub async fn run_puller_loop(puller: Arc<GitOpsPuller>, shutdown: cog_core::Shut
             .output()
             .await;
     }
-    let interval = Duration::from_secs(puller.config.poll_interval_secs.max(15));
+    let interval = Duration::from_secs(puller.config.poll_interval_secs);
     info!(
         repo = %puller.config.repo_url,
         branch = %puller.config.branch,
@@ -3340,6 +3335,7 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
             work.path(),
         );
         let change = crate::types::EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: "p-42".into(),
             description: "test".into(),
@@ -4807,7 +4803,7 @@ spec:
             dir.path(),
             "kubectl",
             &format!(
-                "#!/bin/sh\necho \"$@\" >> '{log}'\ncat >> '{log}'\necho ok\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\ncat >> '{log}'\necho ok\n",
                 log = log.display()
             ),
         );
@@ -4861,7 +4857,7 @@ spec:
             dir.path(),
             "kubectl",
             &format!(
-                "#!/bin/sh\necho \"$@\" >> '{log}'\necho patched\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\necho patched\n",
                 log = calls.display()
             ),
         );
@@ -4979,7 +4975,7 @@ spec:
         // 新模板还没被控制器处理（observedGeneration < generation），且新版本一个
         // 副本都没起来：这就是主线正在滚的那个现场。
         let script = format!(
-            "#!/bin/sh\necho \"$@\" >> '{}'\necho \"2 1 1 0 0\"\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\necho \"2 1 1 0 0\"\n",
             tmp.path().join("kubectl.log").display()
         );
         let kubectl = crate::test_support::write_executable(tmp.path(), "fake-kubectl", &script);
@@ -5037,7 +5033,7 @@ spec:
         // 部署停在 pause 上：收尾时要问一次 .spec.paused，问出来是 true
         // 才有那一次 resume。
         let script = format!(
-            "#!/bin/sh\necho \"$@\" >> '{}'\ncase \"$*\" in *spec.paused*) echo true;; esac\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in *spec.paused*) echo true;; esac\n",
             tmp.path().join("kubectl.log").display()
         );
         let kubectl = crate::test_support::write_executable(tmp.path(), "fake-kubectl", &script);
@@ -5080,7 +5076,8 @@ spec:
         );
 
         // 一条都没问过时日志文件根本不会出现，那是"什么都没做"而不是"跑崩了"。
-        let calls = std::fs::read_to_string(tmp.path().join("kubectl.log")).unwrap_or_default();
+        let calls =
+            std::fs::read_to_string(tmp.path().join("kubectl.log")).unwrap_or(Default::default());
         assert!(
             calls.contains("rollout resume deployment/cogneva"),
             "a deployment left paused by a dead canary has to be resumed before the retry is \
@@ -5108,8 +5105,9 @@ spec:
         let (repo_url, branch) = promotion_repo_with_a_candidate(tmp.path());
         // 现场是三句话：部署停在 pause、模板已经是候选镜像、Pod 其实起齐了。
         let script = format!(
-            "#!/bin/sh\necho \"$@\" >> '{}'\ncase \"$*\" in\n\
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n\
              *spec.paused*) echo true ;;\n\
+             *observedGeneration*) echo \"3 3 2 2 2\" ;;\n\
              *containers*) echo localhost:30500/cogneva:promote-candidate-1 ;;\n\
              esac\nexit 0\n",
             tmp.path().join("kubectl.log").display()
@@ -5151,14 +5149,15 @@ spec:
             "the orphaned Pending has to be finalized in this round"
         );
 
-        let calls = std::fs::read_to_string(tmp.path().join("kubectl.log")).unwrap_or_default();
+        let calls =
+            std::fs::read_to_string(tmp.path().join("kubectl.log")).unwrap_or(Default::default());
         assert!(
             calls.contains("rollout resume deployment/cogneva"),
             "recording Promoted while the deployment is still paused leaves every later \
              revision unable to roll out: {calls}"
         );
         assert!(
-            calls.contains("rollout status deployment/cogneva"),
+            calls.contains(".status.observedGeneration"),
             "the pause is not the same question as the pods; the rollout still has to be \
              read after resuming: {calls}"
         );
@@ -5179,6 +5178,45 @@ spec:
             "the row has to say the pause was cleared by this round, not that a canary \
              completed cleanly: {}",
             row.outcome
+        );
+    }
+
+    /// 一次读状态只有三种答案：完成、平台自己声明的失败、还在走。
+    ///
+    /// 第三种必须与第二种分开：把「还没读完」读成失败，就是 2026-10-11 那次
+    /// 二十秒判词在同一张脸上的另一副样子——好的版本被 undo 掉。
+    #[tokio::test]
+    async fn the_rollout_read_tells_completion_failure_and_movement_apart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let script = format!("#!/bin/sh\ncat '{}'\n", state.display());
+        let kubectl = crate::test_support::write_executable(tmp.path(), "fake-kubectl", &script);
+        let cfg = GitOpsConfig {
+            kubectl_bin: kubectl.to_string_lossy().to_string(),
+            namespace: "cogneva".into(),
+            deployment: "cogneva".into(),
+            container: "cogneva".into(),
+            ..Default::default()
+        };
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
+        let puller = GitOpsPuller::new(cfg, ledger, "cluster-a".into());
+
+        std::fs::write(&state, "3 3 2 2 2\n").unwrap();
+        assert!(
+            matches!(puller.rollout_step().await.unwrap(), Step::Done(_)),
+            "every replica ready and observed is done"
+        );
+
+        std::fs::write(&state, "3 3 2 1 1 ProgressDeadlineExceeded\n").unwrap();
+        match puller.rollout_step().await.unwrap() {
+            Step::Failed(why) => assert!(why.contains("ProgressDeadlineExceeded"), "{why}"),
+            _ => panic!("the platform's own failure verdict was not read as one"),
+        }
+
+        std::fs::write(&state, "3 3 2 1 1\n").unwrap();
+        assert!(
+            matches!(puller.rollout_step().await.unwrap(), Step::Moving(_)),
+            "a rollout that is still going is movement, not failure"
         );
     }
 }

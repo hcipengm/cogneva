@@ -17,3 +17,8 @@ serde_yaml = "0.9"
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# 单测里的字面量读法只有 `cog-test-support` 那一份；产物不链接它
+# （`crate_dependency_contract_test` 判「正常依赖指向它」为 linked into the artifact）。
+cog-test-support = { path = "../cog-test-support" }

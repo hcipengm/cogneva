@@ -30,8 +30,6 @@ pub struct SquadConfig {
     /// Squad 被 Ralph Loop 判定不可修复后的最大策略升级次数。
     /// 0 = 只做一次尝试（不升级），1 = 允许一次 Pipeline → Roundtable 升级。
     pub max_retries: u32,
-    /// 可选的上下文窗口大小，用于策略升级时动态扩容。
-    pub context_window_size: Option<usize>,
     /// 可选的任务 profile，用于在没有 MetaLearningEngine 时通过静态规则选择 PGE 模式。
     pub profile: Option<crate::profile::TaskProfile>,
     /// Optional BoundaryConfig, carried into the squad run with the task.
@@ -44,6 +42,20 @@ pub struct SquadConfig {
     pub boundary_config: Option<crate::BoundaryConfig>,
     /// true = 这是一个 self_evolution 任务；使用更激进的短路径以控制延迟。
     pub is_self_evolution: bool,
+    /// 这件活自己交什么、这句话从哪儿来（`Task::deliverable_declaration`）。
+    ///
+    /// 只有接下「产出这份物」那一份活的座位拿到它：同一件任务上做评审的人
+    /// 不该因为工作树没动被收住，而做变更的人该。所以它不是「这件任务整体是
+    /// 不是变更」，是这一份活交给谁、判成什么。
+    ///
+    /// 带着来源走：小队建的是运行时，而运行时要在读数里指出这一轮待遇由哪一样
+    /// 决定。只传结论的话，来源在小队这一层就丢了，运行只能落回「没人说」。
+    pub deliverable: cog_core::DeliverableDeclaration,
+    /// 有人就这件活说过的方向，原文照录（`Task::stated_directions`）。
+    ///
+    /// 与 `deliverable` 成对：前者说交什么，这一格说往哪儿算好。每个座位都带着它
+    /// 建 agent——判据是每个座位判自己产出的那把尺子，不只产出改动的那一个。
+    pub stated_directions: Vec<String>,
     /// 通过 Skill ID 指定 Planner 角色的 prompt/schema 来源（None = 内置默认）。
     pub planner_skill_id: Option<String>,
     /// 通过 Skill ID 指定 Generator 角色的 prompt/schema 来源。
@@ -52,17 +64,25 @@ pub struct SquadConfig {
     pub evaluator_skill_id: Option<String>,
 }
 
+// 一次策略升级：Pipeline 跑不通之后，唯一还能换的是拓扑——Roundtable 换的是
+// 评审的人，不是再跑一遍同样的生成轮次。升级第二次没有第三条拓扑可升，只是
+// 同一张桌子再吵一轮。
+// cap: fixed — 升级次数由拓扑数定：Pipeline 之后只有 Roundtable 这一种拓扑
+// keep: 删掉后升级次数与拓扑数脱钩，同一件活在坏拓扑上反复升级；由「Pipeline 之后只有 Roundtable」兜住
+const SQUAD_POLICY_UPGRADES: u32 = 1;
+
 impl Default for SquadConfig {
     fn default() -> Self {
         Self {
             goal: String::new(),
             context: serde_json::json!({}),
             pge_mode: PgeMode::Pipeline,
-            max_retries: 1,
-            context_window_size: None,
+            max_retries: SQUAD_POLICY_UPGRADES,
             profile: None,
             boundary_config: None,
             is_self_evolution: false,
+            deliverable: cog_core::DeliverableDeclaration::Unstated,
+            stated_directions: Vec::new(),
             planner_skill_id: None,
             generator_skill_id: None,
             evaluator_skill_id: None,
@@ -90,7 +110,8 @@ pub struct Squad {
 }
 
 /// 连续 Pipeline 失败多少次后自动升级到 Roundtable 模式。
-// cap: bound — 连续两次 Pipeline 都失败，第三次的结局不会再变，所以升级拓扑而不是再试一遍
+// cap: fixed — 连续两次 Pipeline 都失败，第三次的结局不会再变，所以升级拓扑而不是再试一遍
+// keep: 删掉后同一件活在 Pipeline 上一遍遍失败，第三次的结局不会再变；由「连续两次都失败就升级拓扑」兜住
 pub const PIPELINE_FAILURES_BEFORE_UPGRADE: u32 = 2;
 
 /// 单个 Squad 执行结果。
@@ -133,6 +154,8 @@ pub struct SquadExecutor {
     skill_registry: Option<Arc<dyn cog_core::ExternalSkillRegistry>>,
     /// State backend — 持久化 RalphLoop 迭代历史（ContextBoard 载体），重启后可续跑。
     state_backend: Option<Arc<dyn cog_core::StateBackend>>,
+    /// 未派生意图的读面：planner 的那一次调用把它们一起读进来判。
+    intent_reader: Option<Arc<dyn cog_core::IntentReader>>,
     /// Ralph Loop 预算与停滞窗口（来自配置面 `ralph` 段，默认见 RalphLoopConfig）。
     ralph: RalphLoopConfig,
     /// 局部修复预算（来自配置面 `pge` 段）。None = 由
@@ -142,6 +165,9 @@ pub struct SquadExecutor {
     stage_store: Option<Arc<dyn cog_core::PgeStageStore>>,
     /// 上游池的暂停开关。None = 这个进程不认识那道闸，行为与从前一样。
     pub(crate) pause_gate: Option<Arc<dyn cog_core::SchedulerGate>>,
+    /// 判据的修订读面。None = 计划定下之后判据不再变，与从前一样。
+    pub(crate) terminal_revisions:
+        Option<Arc<dyn cog_core::contract::terminal_revision::TerminalRevisions>>,
 }
 
 /// Optional service dependencies shared by squad execution stages.
@@ -157,6 +183,8 @@ pub(crate) struct SquadDeps {
     pub pge_schemas: Option<std::collections::HashMap<String, serde_json::Value>>,
     pub skill_registry: Option<Arc<dyn cog_core::ExternalSkillRegistry>>,
     pub state_backend: Option<Arc<dyn cog_core::StateBackend>>,
+    /// 未派生意图的读面（planner 的一次调用读它）。
+    pub intent_reader: Option<Arc<dyn cog_core::IntentReader>>,
     pub ralph: RalphLoopConfig,
     /// 局部修复预算（配置面 `pge` 段）。None = [`crate::DEFAULT_LOCAL_REPAIR_MAX`]。
     pub local_repair_max: Option<u32>,
@@ -164,6 +192,9 @@ pub(crate) struct SquadDeps {
     pub stage_store: Option<Arc<dyn cog_core::PgeStageStore>>,
     /// 上游池的暂停开关，原样交给每一条 Ralph 循环。
     pub pause_gate: Option<Arc<dyn cog_core::SchedulerGate>>,
+    /// 判据的修订读面，原样交给每一条 Ralph 循环。
+    pub terminal_revisions:
+        Option<Arc<dyn cog_core::contract::terminal_revision::TerminalRevisions>>,
 }
 
 /// 给流水线挂上阶段产物的记录位置。
@@ -258,6 +289,12 @@ impl SquadExecutor {
 
     /// Inject a state backend so RalphLoop can persist iteration history
     /// across restarts (stored on the task's ContextBoard).
+    /// 装上未派生意图的读面：planner 的那一次调用用它读「还没派生的意图」。
+    pub fn with_intent_reader(mut self, reader: Arc<dyn cog_core::IntentReader>) -> Self {
+        self.intent_reader = Some(reader);
+        self
+    }
+
     pub fn with_state_backend(mut self, backend: Arc<dyn cog_core::StateBackend>) -> Self {
         self.state_backend = Some(backend);
         self
@@ -290,6 +327,15 @@ impl SquadExecutor {
         self
     }
 
+    /// 让这个执行器每一轮开始前读一次判据的修订。
+    pub fn with_terminal_revisions(
+        mut self,
+        revisions: Arc<dyn cog_core::contract::terminal_revision::TerminalRevisions>,
+    ) -> Self {
+        self.terminal_revisions = Some(revisions);
+        self
+    }
+
     /// 直接执行一个 Squad，返回执行结果。
     pub async fn execute_squad(&self, task_id: String, config: SquadConfig) -> SquadResult {
         let squad_id = cog_core::squad_id_for(&task_id);
@@ -319,7 +365,7 @@ impl SquadExecutor {
                 &squad_id,
                 serde_json::json!({"task_id": &task_id}),
             );
-            let _ = comm.broadcast(&msg).await;
+            cog_core::ignore_lost!(comm.broadcast(&msg).await);
         }
 
         // Mode selection is done upstream by ModeSelectorAgent (LLM semantic
@@ -344,10 +390,12 @@ impl SquadExecutor {
             pge_schemas: self.pge_schemas.clone(),
             skill_registry: self.skill_registry.clone(),
             state_backend: self.state_backend.clone(),
+            intent_reader: self.intent_reader.clone(),
             ralph: self.ralph,
             local_repair_max: self.local_repair_max,
             stage_store: self.stage_store.clone(),
             pause_gate: self.pause_gate.clone(),
+            terminal_revisions: self.terminal_revisions.clone(),
         };
         let result = Self::run_squad_with_retries(squad, deps).await;
         let squad_latency_ms = squad_start.elapsed().as_millis() as u64;
@@ -402,7 +450,7 @@ impl SquadExecutor {
                     "success": result.success,
                 }),
             );
-            let _ = comm.broadcast(&msg).await;
+            cog_core::ignore_lost!(comm.broadcast(&msg).await);
         }
 
         result
@@ -420,9 +468,11 @@ impl SquadExecutor {
         let self_review = &deps.self_review;
         let pge_schemas = &deps.pge_schemas;
         let skill_registry = &deps.skill_registry;
-        let schema_for = |actor: &str| -> Option<serde_json::Value> {
-            pge_schemas.as_ref()?.get(actor).cloned()
-        };
+        // 键是**席位**不是人名：调用点传的全是 `roles::*` 常量，同一个座位换个人坐
+        // 拿到同一份 schema。参数叫 `actor` 时它与「接手的人叫什么」同形，读代码的
+        // 人分不出这里是在寻址还是在按名字分待遇。
+        let schema_for =
+            |seat: &str| -> Option<serde_json::Value> { pge_schemas.as_ref()?.get(seat).cloned() };
         // 解析 SquadConfig 指定的 prompt skills（解析失败回退内置 prompt）。
         let planner_skill = crate::actors::resolve_prompt_skill(
             skill_registry.as_ref(),
@@ -458,6 +508,8 @@ impl SquadExecutor {
                 deps.state_backend.as_ref(),
                 &squad.task_id,
                 cog_core::roles::PLANNER,
+                cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Plan),
+                squad.config.stated_directions.clone(),
             )
             .await
             {
@@ -472,6 +524,9 @@ impl SquadExecutor {
                 }
             };
             let mut planner_actor = PlannerActor::new(planner);
+            if let Some(reader) = deps.intent_reader.as_ref() {
+                planner_actor = planner_actor.with_intent_reader(Arc::clone(reader));
+            }
             if let Some(ref kb) = knowledge_backend {
                 planner_actor = planner_actor.with_knowledge(kb.clone());
             }
@@ -510,6 +565,8 @@ impl SquadExecutor {
                 deps.state_backend.as_ref(),
                 &squad.task_id,
                 cog_core::roles::GENERATOR,
+                squad.config.deliverable.clone(),
+                squad.config.stated_directions.clone(),
             )
             .await
             {
@@ -529,6 +586,8 @@ impl SquadExecutor {
                 deps.state_backend.as_ref(),
                 &squad.task_id,
                 cog_core::roles::EVALUATOR,
+                cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Judgement),
+                squad.config.stated_directions.clone(),
             )
             .await
             {
@@ -570,14 +629,11 @@ impl SquadExecutor {
                 .config
                 .profile
                 .map(|p| p.declared_scale)
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             let declared = crate::squad::pge::pipeline::declared_plan(&squad.config.goal, scale);
+            // 没有尝试上限：出口只有终态、确定性环境失败与停滞检测。自进化任务
+            // 也不再单独钉「一次尝试」——那是一个到点就停的界，不是完成判。
             let mut pipeline_config = PgePipelineConfig::default();
-            if squad.config.is_self_evolution {
-                // 与 Pipeline 同一条：自进化任务对延迟敏感，一次尝试交给外层
-                // Ralph 做全局重置就够。
-                pipeline_config.max_retries = 1;
-            }
             pipeline_config.local_repair_max = deps
                 .local_repair_max
                 .unwrap_or(crate::DEFAULT_LOCAL_REPAIR_MAX);
@@ -603,6 +659,8 @@ impl SquadExecutor {
                     state,
                     &squad.task_id,
                     cog_core::roles::PLANNER,
+                    cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Plan),
+                    squad.config.stated_directions.clone(),
                 )
                 .await;
                 let generator = crate::resume::create_role_agent(
@@ -611,6 +669,8 @@ impl SquadExecutor {
                     state,
                     &squad.task_id,
                     cog_core::roles::GENERATOR,
+                    squad.config.deliverable.clone(),
+                    squad.config.stated_directions.clone(),
                 )
                 .await;
                 let evaluator = crate::resume::create_role_agent(
@@ -619,18 +679,23 @@ impl SquadExecutor {
                     state,
                     &squad.task_id,
                     cog_core::roles::EVALUATOR,
+                    cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Judgement),
+                    squad.config.stated_directions.clone(),
                 )
                 .await;
                 // Moderator is optional — failure to create it is non-fatal.
-                let moderator = crate::resume::create_role_agent(
-                    manager,
-                    llm,
-                    state,
-                    &squad.task_id,
-                    cog_core::roles::MODERATOR,
-                )
-                .await
-                .ok();
+                let moderator = cog_core::logged_ok!(
+                    crate::resume::create_role_agent(
+                        manager,
+                        llm,
+                        state,
+                        &squad.task_id,
+                        cog_core::roles::MODERATOR,
+                        cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Answer),
+                        squad.config.stated_directions.clone(),
+                    )
+                    .await
+                );
 
                 match (planner, generator, evaluator) {
                     (Ok(p), Ok(g), Ok(e)) => (Some(p), Some(g), Some(e), moderator),
@@ -658,12 +723,9 @@ impl SquadExecutor {
                 history: Vec::new(),
             },
             PgeMode::Pipeline => {
+                // No attempt cap: the pipeline leaves on the terminal holding, a
+                // deterministic environment failure, or the stall detector.
                 let mut pipeline_config = PgePipelineConfig::default();
-                if squad.config.is_self_evolution {
-                    // Self-evolution tasks are latency-sensitive: one attempt per
-                    // Ralph iteration is enough; rely on Ralph for global reset.
-                    pipeline_config.max_retries = 1;
-                }
                 // The repair loop is what lets the evaluator's feedback reach the
                 // generator without paying for a new plan, so it is set for every
                 // mode rather than only the non-self-evolution ones: the run that
@@ -676,6 +738,9 @@ impl SquadExecutor {
                 match (planner.as_ref(), generator.as_ref(), evaluator.as_ref()) {
                     (Some(p), Some(g), Some(e)) => {
                         let mut planner_actor = PlannerActor::new(Arc::clone(p));
+                        if let Some(reader) = deps.intent_reader.as_ref() {
+                            planner_actor = planner_actor.with_intent_reader(Arc::clone(reader));
+                        }
                         let mut generator_actor = GeneratorActor::new(Arc::clone(g));
                         let mut evaluator_actor = EvaluatorActor::new(Arc::clone(e));
                         if let Some(ref kb) = knowledge_backend {
@@ -757,6 +822,10 @@ impl SquadExecutor {
                                 deps.state_backend.as_ref(),
                                 &squad.task_id,
                                 cog_core::roles::MERGER,
+                                cog_core::DeliverableDeclaration::protocol(
+                                    cog_core::Deliverable::Answer,
+                                ),
+                                squad.config.stated_directions.clone(),
                             )
                             .await
                             {
@@ -777,6 +846,9 @@ impl SquadExecutor {
                         }
                     }
                     let mut planner_actor = PlannerActor::new(p);
+                    if let Some(reader) = deps.intent_reader.as_ref() {
+                        planner_actor = planner_actor.with_intent_reader(Arc::clone(reader));
+                    }
                     let mut generator_actor = GeneratorActor::new(g);
                     let mut evaluator_actor = EvaluatorActor::new(e);
                     if let Some(ref kb) = knowledge_backend {
@@ -830,6 +902,56 @@ impl SquadExecutor {
         }
     }
 
+    /// 从后端取回这一队点名的那份快照，取不回来就答 `None`。
+    ///
+    /// 三种失败都要留痕，因为它们与「这次本来就没有续跑点」在日志之外同形：
+    /// 指针指着一条不存在的路标、快照取不出来、取到了但反序列化不出来。
+    /// [`crate::resume::resume_if_checkpointed`] 的同族路径把同一件事写进
+    /// `collab_task_resume_total{outcome="failed"}`，这一队不能例外——尤其是
+    /// 反序列化那一支：滚动升级之后旧快照读不出来，重跑整队而 `snapshot_id`
+    /// 还会原样进 OnSquadRetry 的 hook payload，读的人会以为这一趟是从那份
+    /// 快照续上的。
+    async fn restore_snapshot(
+        backend: &Arc<dyn cog_core::ObjectBackend>,
+        snapshot_id: &str,
+    ) -> Option<cog_core::AgentCheckpoint> {
+        let bytes = match backend.get(snapshot_id).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                tracing::warn!(
+                    snapshot = snapshot_id,
+                    "the squad snapshot is named but not in the backend; this run starts from the beginning"
+                );
+                crate::observable::global_observable().record_resume("failed");
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    snapshot = snapshot_id,
+                    error = %e,
+                    "the squad snapshot could not be read; this run starts from the beginning"
+                );
+                crate::observable::global_observable().record_resume("failed");
+                return None;
+            }
+        };
+        match serde_json::from_slice::<cog_core::AgentCheckpoint>(&bytes) {
+            Ok(snapshot) => {
+                crate::observable::global_observable().record_resume("restored");
+                Some(snapshot)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    snapshot = snapshot_id,
+                    error = %e,
+                    "the squad snapshot could not be decoded; this run starts from the beginning"
+                );
+                crate::observable::global_observable().record_resume("failed");
+                None
+            }
+        }
+    }
+
     /// 运行单个 Squad。
     /// Ralph Loop 由配置面的迭代预算与停滞窗口止损（默认 50 轮/5 轮停滞窗），
     /// Squad 层不再做无意义重试。
@@ -839,11 +961,6 @@ impl SquadExecutor {
         let object_backend = &deps.object_backend;
         let squad_reflection = &deps.squad_reflection;
         let mut ralph = RalphLoop::with_config(RalphLoopConfig {
-            max_iterations: if squad.config.is_self_evolution {
-                2
-            } else {
-                deps.ralph.max_iterations
-            },
             stagnation_window: deps.ralph.stagnation_window,
         });
         if let Some(ref llm) = deps.llm_provider {
@@ -855,23 +972,14 @@ impl SquadExecutor {
         if let Some(ref gate) = deps.pause_gate {
             ralph = ralph.with_pause_gate(gate.clone());
         }
+        if let Some(ref revisions) = deps.terminal_revisions {
+            ralph = ralph.with_terminal_revisions(revisions.clone());
+        }
 
         // 若 Squad 已携带快照，先从后端恢复
         if let (Some(ref backend), Some(ref snap_id)) = (&object_backend, &squad.snapshot_id) {
-            match backend.get(snap_id).await {
-                Ok(Some(bytes)) => {
-                    if let Ok(snapshot) =
-                        serde_json::from_slice::<cog_core::AgentCheckpoint>(&bytes)
-                    {
-                        squad.snapshot = Some(snapshot);
-                    }
-                }
-                Ok(None) => {
-                    tracing::warn!("Snapshot {} not found in backend", snap_id);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to load snapshot {}: {}", snap_id, e);
-                }
+            if let Some(snapshot) = Self::restore_snapshot(backend, snap_id).await {
+                squad.snapshot = Some(snapshot);
             }
         }
 
@@ -994,9 +1102,6 @@ impl SquadExecutor {
 
         // === 升级策略 ===
         squad.config.pge_mode = PgeMode::Roundtable;
-        if let Some(ref mut size) = squad.config.context_window_size {
-            *size = size.saturating_add(1024);
-        }
         squad.retry_count = 1;
         squad.status = SquadStatus::Retrying;
 
@@ -1188,7 +1293,7 @@ fn build_contributions_from_verdict(
                 "escalate to a human or reframe the goal",
             )]
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
 
     // Pipeline 快照在顶层包含 plan / generation / evaluation
     let has_pipeline_shape = snapshot.get("plan").is_some() || snapshot.get("final_plan").is_some();
@@ -1272,7 +1377,8 @@ fn extract_evaluation(
 /// 终止原因走的是上游的错误正文：实测一条 `upstream_unavailable` 原因带 84 KB
 /// 的 HTTP 响应体，同一条记忆的 details 就照抄这个长度。细节是给复发匹配和读的
 /// 人看的，超出这个长度的部分既读不动，又让每次全量读取按行数乘上去。
-// cap: bound — 细节是给人读的，超出这个长度的部分既读不动，又让每次全量读取按行数乘上去
+// cap: fixed — 细节是给人读的，超出这个长度的部分既读不动，又让每次全量读取按行数乘上去
+// keep: 删掉后每次全量读取按行数乘上去，细节既读不动又拖慢读取；由「细节是给人读的」兜住
 pub const LEARNING_DETAILS_CHARS: usize = 4096;
 
 /// 把细节截到 [`LEARNING_DETAILS_CHARS`]，并在截断处写明留了多少、原本多少。
@@ -1350,7 +1456,7 @@ fn learning_from_termination(
                 .join("\n");
             format!("\nlast iteration criteria:\n{lines}")
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let mut learning = cog_core::Learning::new(
         cog_core::LearningCategory::Correction,
         cog_core::Priority::High,
@@ -1442,6 +1548,36 @@ mod tests {
     use super::*;
     use crate::squad::pge::types::{Criterion, EvaluationResult};
     use crate::squad::ralph::ralph_loop::{RalphIteration, ResetStrategy};
+
+    /// 策略升级次数只有一处声明：默认值读常量，常量上面写着它由什么钉住。
+    ///
+    /// 两面一起钉：运行时默认值等于常量（改常量就改默认值），源码面
+    /// `impl Default` 的字段里不再有数字（下一笔写回裸字面量就红）。
+    #[test]
+    fn the_squad_default_reads_its_policy_upgrade_count() {
+        assert_eq!(SquadConfig::default().max_retries, SQUAD_POLICY_UPGRADES);
+
+        let source = include_str!("executor.rs");
+        let body = source
+            .split("impl Default for SquadConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.trim().starts_with(|c: char| c.is_ascii_digit())
+                })
+            })
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
+    }
 
     fn evaluation_json(verdict: &str, feedback: &str) -> serde_json::Value {
         serde_json::to_value(EvaluationResult {
@@ -1778,5 +1914,110 @@ mod tests {
         assert_eq!(generator.learnings[0].summary, "broken");
         assert_eq!(generator.learnings[0].details, "broken");
         assert_eq!(generator.errors.len(), 1);
+    }
+
+    /// 一个只存一份字节的后端：够 `restore_snapshot` 走三条路。
+    struct OneObject(Option<Vec<u8>>);
+
+    #[async_trait::async_trait]
+    impl cog_core::ObjectBackend for OneObject {
+        async fn put(&self, key: &str, _data: &[u8]) -> cog_core::SFResult<String> {
+            Ok(key.to_string())
+        }
+        async fn get(&self, _key: &str) -> cog_core::SFResult<Option<Vec<u8>>> {
+            Ok(self.0.clone())
+        }
+        async fn delete(&self, _key: &str) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        async fn presign_url(&self, key: &str, _expiry_secs: u64) -> cog_core::SFResult<String> {
+            Ok(key.to_string())
+        }
+        async fn exists(&self, _key: &str) -> cog_core::SFResult<bool> {
+            Ok(self.0.is_some())
+        }
+        async fn list(&self, _prefix: Option<&str>) -> cog_core::SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// 这一格当前的值；断言用增量，进程里别的测试同时记数也不会让判定漂。
+    async fn resume_failed_cell() -> f64 {
+        use cog_core::observability::Observable;
+        crate::observable::global_observable()
+            .collect_metrics("D8")
+            .await
+            .unwrap()
+            .iter()
+            .filter(|m| {
+                m.name == "collab_task_resume_total"
+                    && m.labels.get(crate::LABEL_OUTCOME).map(String::as_str) == Some("failed")
+            })
+            .map(|m| m.value)
+            .sum()
+    }
+
+    /// 有指针、快照也取到了，但读不出来：这一队从零重跑，而这件事要留痕。
+    ///
+    /// 判据：把反序列化那一支改回 `if let Ok(...)` 静默丢弃，
+    /// `collab_task_resume_total{outcome="failed"}` 不会涨，这条红。
+    #[tokio::test]
+    async fn an_undecodable_snapshot_is_not_a_resume_that_never_happened() {
+        let backend: Arc<dyn cog_core::ObjectBackend> =
+            Arc::new(OneObject(Some(b"{\"checkpoint_id\": \"snap-1\"}".to_vec())));
+        let before = resume_failed_cell().await;
+        let restored = SquadExecutor::restore_snapshot(&backend, "squad-snap-1").await;
+        let after = resume_failed_cell().await;
+        assert!(
+            restored.is_none(),
+            "读不出来的快照没有可续的状态，这一队只能从零重跑"
+        );
+        assert!(
+            after > before,
+            "有指针却恢复失败要在 failed 格里留痕：{before} -> {after}"
+        );
+    }
+
+    /// 正向那一格：能读出来的快照要真的接上，并在 restored 格里留痕。
+    #[tokio::test]
+    async fn a_readable_snapshot_is_handed_back_and_counted_as_restored() {
+        use cog_core::observability::Observable;
+        let checkpoint = cog_core::AgentCheckpoint {
+            checkpoint_id: "snap-1".into(),
+            task_id: "task-1".into(),
+            agent_state: serde_json::json!({}),
+            context_window: Vec::new(),
+            event_offset: 0,
+            timestamp: chrono::Utc::now(),
+        };
+        let backend: Arc<dyn cog_core::ObjectBackend> = Arc::new(OneObject(Some(
+            serde_json::to_vec(&checkpoint).expect("checkpoint serialises"),
+        )));
+        let restored_cell = |metrics: Vec<cog_core::RawMetric>| {
+            metrics
+                .iter()
+                .filter(|m| {
+                    m.name == "collab_task_resume_total"
+                        && m.labels.get(crate::LABEL_OUTCOME).map(String::as_str)
+                            == Some("restored")
+                })
+                .map(|m| m.value)
+                .sum::<f64>()
+        };
+        let before = restored_cell(
+            crate::observable::global_observable()
+                .collect_metrics("D8")
+                .await
+                .unwrap(),
+        );
+        let restored = SquadExecutor::restore_snapshot(&backend, "squad-snap-1").await;
+        let after = restored_cell(
+            crate::observable::global_observable()
+                .collect_metrics("D8")
+                .await
+                .unwrap(),
+        );
+        assert_eq!(restored.map(|c| c.checkpoint_id), Some("snap-1".into()));
+        assert!(after > before, "接上的续跑要在 restored 格里留痕");
     }
 }

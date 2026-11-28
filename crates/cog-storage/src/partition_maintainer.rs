@@ -157,11 +157,13 @@ pub fn time_series_tables() -> Vec<PartitionedTable> {
 }
 
 /// How far ahead of the current month partitions are kept open.
-// cap: bound — 提前开着几个月的分区
+// cap: fixed — 提前开着几个月的分区
+// keep: 删掉后下个月的分区不存在，写入在月初撞上没有分区；由「提前开着几个月」兜住
 const MONTHS_AHEAD: i32 = 2;
 
 /// How far back maintenance reaches, so a recently dropped partition heals.
-// cap: bound — 维护往回看多远，为的是刚被删掉的月还能自愈
+// cap: fixed — 维护往回看多远，为的是刚被删掉的月还能自愈
+// keep: 删掉后刚被删掉的月不能自愈，缺口直到人工介入；由「维护往回看多远」兜住
 const MONTHS_BEHIND: i32 = 1;
 
 /// Loop name reported through the background-loop liveness family.

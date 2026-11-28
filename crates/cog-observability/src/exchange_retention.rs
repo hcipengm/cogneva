@@ -33,10 +33,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::{PgPool, Row};
-use tracing::{info, warn};
+use tracing::warn;
 
 use cog_core::metric_names;
+use cog_core::retention::{keep_days_against_volume, RetentionReadings, UNIT_DAYS};
 use cog_core::{MetricsBackend, SFError, SFResult, ShutdownSignal};
+
+/// The registry key this loop's target answers to.
+pub const KNOB: &str = "llmExchangeRetention.keepDays";
 
 /// The table this loop retires rows from.
 pub const TABLE: &str = "gateway_llm_exchange";
@@ -56,7 +60,8 @@ pub const DEPLOYMENT_LABEL: &str = "deployment";
 /// default for the deployment that does not say otherwise, not a policy — a
 /// deployment with stricter promises about what it holds shortens it, and the
 /// readings move with it because the number is published rather than assumed.
-// cap: bound — 对「存了些什么」许下更紧承诺的部署会缩短它，读数跟着动，因为那个数是发布出去的而不是假定的
+// cap: fixed — 对「存了些什么」许下更紧承诺的部署会缩短它，读数跟着动，因为那个数是发布出去的而不是假定的
+// keep: 删掉后部署许下的更紧承诺没有地方缩短，读数不再跟着那个发布出去的数动；由「承诺是发布出去的」兜住
 pub const DEFAULT_KEEP_DAYS: i64 = 30;
 
 /// The shortest retention this loop will accept.
@@ -65,7 +70,8 @@ pub const DEFAULT_KEEP_DAYS: i64 = 30;
 /// which reads as "the retention works" while the table it exists to bound is
 /// empty by construction — the promise to the reader is what has to survive a
 /// misconfiguration, so the value falls back rather than being honoured.
-// cap: bound — 承诺是许给读的人的，它必须扛过一次配置错误，所以低于它的值回退而不是被采纳
+// cap: fixed — 承诺是许给读的人的，它必须扛过一次配置错误，所以低于它的值回退而不是被采纳
+// keep: 删掉后一次配置错误把保留期配成零，读的人昨天还能看的东西今天就没了；由「承诺要扛过一次配置错误」兜住
 pub const MIN_KEEP_DAYS: i64 = 1;
 
 /// The environment variable that carries the retention.
@@ -77,30 +83,51 @@ pub const KEEP_DAYS_ENV: &str = "COGNEVA_LLM_EXCHANGE_KEEP_DAYS";
 /// read, and Prometheus drops a series it has not seen for five minutes. A
 /// shorter period would spend durable rows to restate a table whose age changes
 /// by days; a longer one would let the published size go stale between scrapes.
-// cap: bound — 更短就为一门年龄以天变的表反复重述花掉持久行，更长就让发布出去的大小在两次抓取之间过期
+// cap: fixed — 更短就为一门年龄以天变的表反复重述花掉持久行，更长就让发布出去的大小在两次抓取之间过期
+// keep: 删掉后要么反复花持久行，要么发布出去的大小在两次抓取之间过期；由「两个坏方向的中间」兜住
 pub const PERIOD: Duration = Duration::from_secs(300);
 
-/// How many rows one statement may delete.
+/// 两次采样之间，这张表每天涨多少行。
 ///
-/// Two thousand rows of bodies is tens of megabytes, which bounds both the
-/// statement's work and the locks it holds. The pas repeats until it finds
-/// nothing past the cutoff, so the count of batches follows the backlog rather
-/// than the batch size.
-// cap: bound — 循环重复到切点之外没有行为止，所以批数跟的是积压而不是批量
-const BATCH_ROWS: i64 = 2_000;
+/// 纯函数：速率是这一族里唯一能被穷举测试的部分，把它从 `pass` 里拿出来，判据就不必
+/// 连一个真库才问得出来。
+///
+/// 三条口径：
+/// - **没有上一次采样 ⇒ `None`**：那是一次「量不到」，不是零。
+/// - **两次采样同一时刻 ⇒ `None`**：除数不是正的，速率没有定义。
+/// - **可以是负数**：表变小了（真空或搬走一部分）也要如实报，那是读数不是错误。
+fn rows_per_day(
+    previous: Option<(i64, std::time::Instant)>,
+    now_held: i64,
+    now: std::time::Instant,
+) -> Option<f64> {
+    let (rows_before, at_before) = previous?;
+    let days = now.saturating_duration_since(at_before).as_secs_f64() / 86_400.0;
+    (days > 0.0).then(|| (now_held - rows_before) as f64 / days)
+}
 
 /// What one pass did, so a caller can assert on it rather than infer it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// 不含 `Eq`：速率是浮点数，而 `Eq` 要求全序。判等用 `PartialEq`。
+#[derive(Debug, Clone, PartialEq)]
 pub struct RetentionOutcome {
     /// Rows the archive held after the pass.
     pub held: i64,
-    /// Rows this pass retired.
-    pub removed: u64,
+    /// Rows the archive gained per day, from the previous pass to this one.
+    ///
+    /// `None` on the first pass and whenever the previous one is too old or too
+    /// close to divide by: a rate nobody measured is not a rate of zero, and a
+    /// zero here would say the table is not growing while nothing had compared
+    /// two readings yet.
+    pub rows_per_day: Option<f64>,
     /// The age of the oldest surviving row, in seconds; zero for an empty
     /// archive.
     pub oldest_age_secs: i64,
     /// The retention this pass enforced, in seconds.
     pub keep_secs: i64,
+    /// Whether `keep_secs` came from this beat's measurements rather than from
+    /// the deployment's seed.
+    pub keep_derived: bool,
 }
 
 /// The retention sweep: the archive's table, the pool it lives on, and the age
@@ -108,10 +135,24 @@ pub struct RetentionOutcome {
 #[derive(Clone)]
 pub struct ExchangeRetention {
     pool: PgPool,
+    /// The retention this deployment declared. It is what a process with no
+    /// measured write volume keeps.
     keep: Duration,
+    /// The declared size of the database volume; with it and the measured cost
+    /// of a day's writes, every pass recomputes the retention.
+    volume_bytes: Option<u64>,
     table: String,
+    /// 上一次采样：(行数, 时刻)。速率要两次读数才成立，所以它跟着这个对象走。
+    ///
+    /// 用 `Mutex` 是因为 `pass` 拿的是 `&self`：读数是这一趟自己的事，不改变
+    /// 「这个对象是什么」，而速率需要跨趟记忆。
+    last_sample: Arc<std::sync::Mutex<Option<(i64, std::time::Instant)>>>,
     metrics: Option<Arc<dyn MetricsBackend>>,
+    readings: Option<Arc<RetentionReadings>>,
     deployment: String,
+    /// 正文的归档层。没有它就没有「已归档」这回事，于是这一遍**一行也不删**：
+    /// 删一份只有本表持有、别处没有副本的正文，就是把那次调用从留底里抹掉。
+    archive: Option<Arc<dyn cog_core::ObjectBackend>>,
 }
 
 impl ExchangeRetention {
@@ -119,10 +160,32 @@ impl ExchangeRetention {
         Self {
             pool,
             keep,
+            volume_bytes: None,
             table: TABLE.to_string(),
+            last_sample: Arc::new(std::sync::Mutex::new(None)),
             metrics: None,
+            readings: None,
             deployment: String::new(),
+            archive: None,
         }
+    }
+
+    /// The declared size of the volume this archive lives on.
+    pub fn with_database_volume(mut self, bytes: Option<u64>) -> Self {
+        self.volume_bytes = bytes;
+        self
+    }
+
+    /// Attach the reading face that carries this loop's target and beat count.
+    pub fn with_readings(mut self, readings: Arc<RetentionReadings>) -> Self {
+        self.readings = Some(readings);
+        self
+    }
+
+    /// 正文归档层：这一遍只删「副本已在归档里、且能读到」的行。
+    pub fn with_archive(mut self, archive: Arc<dyn cog_core::ObjectBackend>) -> Self {
+        self.archive = Some(archive);
+        self
     }
 
     /// Point the sweep at another table. Only a test does this, and it is what
@@ -171,17 +234,9 @@ impl ExchangeRetention {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             beat.beat();
-            let pass = self.retire_once(|| beat.beat()).await;
+            let pass = self.measure_once().await;
             match pass {
                 Ok(outcome) => {
-                    if outcome.removed > 0 {
-                        info!(
-                            table = self.table,
-                            rows = outcome.removed,
-                            held = outcome.held,
-                            "Retired LLM exchanges past the retention"
-                        );
-                    }
                     self.report(&outcome).await;
                     self.report_pass_failed(false).await;
                 }
@@ -202,46 +257,57 @@ impl ExchangeRetention {
         }
     }
 
-    /// Retire every row older than the retention, calling `progress` before
-    /// each batch.
+    /// 读一次留底表：多少行、最老一行多老、占多少字节、这一拍声明的查询窗口。
     ///
-    /// The loop hands `beat.beat` in here: the work between two beats would
-    /// otherwise be the whole pass, and a first run against an archive that
-    /// grew while nothing retired it deletes for as long as the backlog lasts.
-    /// That is exactly the shape that made a working sweep read as a stopped
-    /// loop on the event log, so the bound published here is one batch.
-    pub async fn retire_once(&self, progress: impl Fn()) -> SFResult<RetentionOutcome> {
-        let cutoff = chrono::Utc::now()
-            - chrono::Duration::from_std(self.keep).unwrap_or_else(|_| chrono::Duration::days(30));
-        let mut removed = 0u64;
-        loop {
-            progress();
-            let batch = sqlx::query(&format!(
-                "DELETE FROM {table} WHERE id IN (
-                     SELECT id FROM {table} WHERE ts < $2 ORDER BY ts LIMIT $1
-                 )",
-                table = cog_core::sql::quote_relation(&self.table),
-            ))
-            .bind(BATCH_ROWS)
-            .bind(cutoff)
-            .execute(&self.pool)
+    /// 一行都不删。从前这一遍要做的事情是「删掉过了保留期、而且正文在归档里读得回来
+    /// 的那些行」——那条两段条件回答的是「删掉会不会丢掉唯一一份正文」。删界之后这个
+    /// 问题不存在了：没有任何东西会删，于是「哪些行的正文没有可读副本」也不再是这个
+    /// 循环要回答的问题（它是审计与备份演练的事，那边本来就逐表走一遍）。
+    pub async fn measure_once(&self) -> SFResult<RetentionOutcome> {
+        let oldest_before = self.oldest_age_secs().await?;
+        let bytes = self
+            .table_bytes()
             .await
-            .map_err(|e| SFError::Database(e.to_string()))?
-            .rows_affected();
-            removed += batch;
-            if batch == 0 {
-                break;
-            }
-        }
-
+            .ok()
+            .map(|bytes| bytes.max(0) as u64);
+        let (keep, keep_derived) = self.keep_for(oldest_before, bytes);
         let held = self.row_count().await?;
+        // 速率：与上一次采样比。第一次没有上一次，所以是「量不到」，不是 0。
+        let now = std::time::Instant::now();
+        let rows_per_day = {
+            let mut slot = self.last_sample.lock().map_err(|_| {
+                SFError::Database("exchange retention: sample lock poisoned".into())
+            })?;
+            // 同一段算法只有一份：这里问 `rows_per_day`，不在调用点再写一遍。
+            let rate = rows_per_day(*slot, held, now);
+            *slot = Some((held, now));
+            rate
+        };
         let oldest_age_secs = self.oldest_age_secs().await?;
         Ok(RetentionOutcome {
             held,
-            removed,
+            rows_per_day,
             oldest_age_secs,
-            keep_secs: self.keep.as_secs() as i64,
+            keep_secs: keep.as_secs() as i64,
+            keep_derived,
         })
+    }
+
+    /// The archive's own size and the age of its oldest row give the daily
+    /// write volume directly: what survived the last pass over the span it
+    /// covers is what a day costs. The volume's declared share then buys a
+    /// number of days; when any input is missing the deployment's seed stands.
+    fn keep_for(&self, oldest_age_secs: i64, bytes: Option<u64>) -> (Duration, bool) {
+        let (days, derived) = keep_days_against_volume(
+            self.keep.as_secs() as i64 / 86_400,
+            self.volume_bytes,
+            oldest_age_secs,
+            bytes,
+        );
+        (
+            Duration::from_secs((days.max(0) as u64).saturating_mul(86_400)),
+            derived,
+        )
     }
 
     /// Rows in the archive, read with the same statement as the capacity sweeps'
@@ -295,6 +361,14 @@ impl ExchangeRetention {
     /// Publish what the archive holds, how far back it reaches, and what that
     /// costs on disk.
     async fn report(&self, outcome: &RetentionOutcome) {
+        if let Some(ref readings) = self.readings {
+            readings.evaluate(
+                KNOB,
+                outcome.keep_secs as f64 / 86_400.0,
+                UNIT_DAYS,
+                outcome.keep_derived,
+            );
+        }
         let Some(ref mb) = self.metrics else { return };
         let labels = self.labels();
         let mut pairs = vec![
@@ -308,6 +382,11 @@ impl ExchangeRetention {
                 outcome.keep_secs as f64,
             ),
         ];
+        // 速率只在量得到的时候发布：量不到就不发，而不是发一个 0——一个 0 会被读成
+        // 「表不再增长」，而那时还没有任何两次读数比过。
+        if let Some(rate) = outcome.rows_per_day {
+            pairs.push((metric_names::LLM_EXCHANGE_ROWS_PER_DAY, rate));
+        }
         if let Ok(bytes) = self.table_bytes().await {
             pairs.push((metric_names::LLM_EXCHANGE_BYTES, bytes as f64));
         }
@@ -397,6 +476,59 @@ mod tests {
         );
     }
 
+    // proves: llmExchangeRetention.keepDays
+    /// 保留天数是当拍实测的函数；量不到时 seed 顶着。
+    #[tokio::test]
+    async fn the_retention_follows_the_measured_daily_write() {
+        let sweep = ExchangeRetention::new(
+            PgPool::connect_lazy("postgres://example").expect("a lazy pool"),
+            Duration::from_secs(30 * 86_400),
+        )
+        .with_database_volume(Some(10 * 1024u64.pow(3)));
+        assert_eq!(
+            sweep.keep_for(10 * 86_400, Some(512 * 1024 * 1024)),
+            (Duration::from_secs(10 * 86_400), true)
+        );
+        assert_eq!(
+            sweep.keep_for(10 * 86_400, Some(1024 * 1024 * 1024)),
+            (Duration::from_secs(5 * 86_400), true)
+        );
+        assert_eq!(
+            sweep.keep_for(0, Some(1024)),
+            (Duration::from_secs(30 * 86_400), false)
+        );
+        assert_eq!(
+            sweep.keep_for(10 * 86_400, None),
+            (Duration::from_secs(30 * 86_400), false)
+        );
+    }
+
+    /// 目标不变的一拍仍然是一拍：求值计数往上走，目标以天为单位登记。
+    #[tokio::test]
+    async fn a_beat_whose_target_does_not_move_still_counts() {
+        let readings = Arc::new(RetentionReadings::new());
+        let sweep = ExchangeRetention::new(
+            PgPool::connect_lazy("postgres://example").expect("a lazy pool"),
+            Duration::from_secs(30 * 86_400),
+        )
+        .with_readings(Arc::clone(&readings));
+        let outcome = RetentionOutcome {
+            rows_per_day: None,
+            held: 100,
+            oldest_age_secs: 86_400,
+            keep_secs: 7 * 86_400,
+            keep_derived: true,
+        };
+        for expected in 1..=2 {
+            sweep.report(&outcome).await;
+            let (target, beats, derived) = readings.reading(KNOB).expect("a beat");
+            assert_eq!(target, 7.0);
+            assert_eq!(beats, expected, "a steady target is still a beat");
+            assert_eq!(readings.evaluations(KNOB), expected);
+            assert!(derived);
+        }
+    }
+
     #[tokio::test]
     async fn the_sweep_names_the_size_and_the_retention_it_enforces() {
         let sweep = ExchangeRetention::new(
@@ -405,5 +537,48 @@ mod tests {
         );
         assert_eq!(sweep.keep(), Duration::from_secs(7 * 86_400));
         assert_eq!(sweep.table, TABLE);
+    }
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::rows_per_day;
+    use std::time::{Duration, Instant};
+
+    /// 一天的差：涨了多少行，速率就是多少。
+    #[test]
+    fn a_day_of_growth_is_the_rate() {
+        let t0 = Instant::now();
+        let rate = rows_per_day(Some((100, t0)), 300, t0 + Duration::from_secs(86_400));
+        assert_eq!(rate, Some(200.0));
+    }
+
+    /// 半天涨 100 行：每天 200 行。**换输入值，答案跟着变**——这是「derived」那条判据。
+    #[test]
+    fn halving_the_interval_doubles_the_rate() {
+        let t0 = Instant::now();
+        let rate = rows_per_day(Some((100, t0)), 200, t0 + Duration::from_secs(43_200));
+        assert_eq!(rate, Some(200.0));
+    }
+
+    /// 没有上一次采样：量不到，不是零。
+    #[test]
+    fn a_first_pass_has_no_rate() {
+        assert_eq!(rows_per_day(None, 500, Instant::now()), None);
+    }
+
+    /// 同一时刻两次采样：除数不是正的。
+    #[test]
+    fn two_samples_at_one_instant_have_no_rate() {
+        let t0 = Instant::now();
+        assert_eq!(rows_per_day(Some((10, t0)), 20, t0), None);
+    }
+
+    /// 表变小了也如实报：负数是读数，不是错误。
+    #[test]
+    fn a_shrinking_table_reports_a_negative_rate() {
+        let t0 = Instant::now();
+        let rate = rows_per_day(Some((300, t0)), 100, t0 + Duration::from_secs(86_400));
+        assert_eq!(rate, Some(-200.0));
     }
 }

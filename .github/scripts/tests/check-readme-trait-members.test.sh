@@ -92,15 +92,18 @@ run_gate 1 '名字或路径已经漂了'
 # 两份 README 都缺时那个 for 循环一次也不进；README 在而一处 Trait 成员表都没有时
 # 那个 while 循环一次也不进。两种情况下 fail 都还是 0，门会印出与「每一块都对得上」
 # 完全相同的那句绿。
+#
+# 两种缺法要分开：两份都不在（干净的检出，这两份文件不跟踪）是「没有可判的东西」，
+# 说一句未判并退出 0；文件在而认不出表，才是有人把标签写坏了，仍退 3。
 no_readme="${work}/no-readme"
 mkdir -p "${no_readme}/crates/x/src"
 cp "${fixture}/crates/x/src/lib.rs" "${no_readme}/crates/x/src/lib.rs"
 rc=0
 out="$(bash "${gate}" "${no_readme}" 2>&1)" || rc=$?
-[ "${rc}" -eq 3 ] || fail "没有 README 时 rc=${rc}，应为 3 —— ${out}"
+[ "${rc}" -eq 0 ] || fail "两份 README 都不在时 rc=${rc}，应为 0 —— ${out}"
 case "${out}" in
-    *'一份都没读到'*) ;;
-    *) fail "没有 README 时没说清是没读到 —— ${out}" ;;
+    *'未判'*) ;;
+    *) fail "两份 README 都不在时没说未判 —— ${out}" ;;
 esac
 
 no_blocks="${work}/no-blocks"
@@ -117,11 +120,22 @@ esac
 
 # --- 真文件：这棵仓库今天必须绿
 # 夹具全绿而真树红，说明这条门在测自己；两边都绿，才说明它今天在守东西。
-out="$(bash "${gate}" "${repo}" 2>&1)" || fail "真树红了 —— 判为 Trait 定义的成员表与源不一致：
+# 干净的检出里这两份 README 不跟踪，真树那一格就是「没有可判的东西」：退出 0、
+# 输出一句未判。仍要跑，因为「文件不在」也必须是这个门的答案，而不是它崩掉。
+if [ -f "${repo}/README.md" ] || [ -f "${repo}/README.zh-CN.md" ]; then
+    out="$(bash "${gate}" "${repo}" 2>&1)" || fail "真树红了 —— 判为 Trait 定义的成员表与源不一致：
 ${out}"
-case "${out}" in
-    *'与源一致'*) ;;
-    *) fail "真树没有给出通过判词：${out}" ;;
-esac
+    case "${out}" in
+        *'与源一致'*) ;;
+        *) fail "真树没有给出通过判词：${out}" ;;
+    esac
+else
+    out="$(bash "${gate}" "${repo}" 2>&1)" || fail "真树没有这两份 README 时应退出 0：
+${out}"
+    case "${out}" in
+        *'未判'*) ;;
+        *) fail "真树没有这两份 README 时没说未判：${out}" ;;
+    esac
+fi
 
 echo "check-readme-trait-members.test: all checks passed"

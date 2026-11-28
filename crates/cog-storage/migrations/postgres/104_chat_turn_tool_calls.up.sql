@@ -1,0 +1,24 @@
+-- Migration: 104_chat_turn_tool_calls
+-- What the answer ran, and who ran it, kept with the answer.
+--
+-- A reopened conversation used to keep only the words: the tool frames lived on
+-- the socket, and the panel built from them (the todo list a conversation
+-- maintains) was gone as soon as the page closed. Reopening showed the questions
+-- and the answers and nothing that happened between them -- the part a person
+-- scrolls back to look for.
+--
+-- JSON text rather than a table of tool calls: the calls belong to exactly one
+-- answer, are read exactly when that row is read, and are never queried on their
+-- own. Same reasoning as 101 for attachments, and the column holds the same
+-- shape the live frames carry (`ChatToolCall`) so the page can compare the two
+-- without a translation step in between.
+--
+-- `agent_id` is the employee that wrote the answer. The page learns it from an
+-- `agent.identity` frame while the socket is open; the id carries a process
+-- fingerprint, so a reopened page cannot compute it -- the record is the only
+-- place that still knows who spoke.
+--
+-- Null for the question's half and for rows written before this column existed:
+-- "no calls" and "calls recorded as an empty list" read the same to the reader.
+ALTER TABLE chat_turns ADD COLUMN IF NOT EXISTS tool_calls TEXT;
+ALTER TABLE chat_turns ADD COLUMN IF NOT EXISTS agent_id TEXT;

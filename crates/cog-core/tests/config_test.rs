@@ -8,7 +8,6 @@ fn test_config_default() {
     assert_eq!(config.app.version, "");
     assert_eq!(config.app.log_level, "");
     assert_eq!(config.app.data_dir, "");
-    assert_eq!(config.app.config_dir, "");
     assert_eq!(config.app.app_dir, "");
     assert_eq!(config.gateway.http_port, 0);
     assert!(!config.raw_logger.enabled);

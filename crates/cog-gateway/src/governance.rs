@@ -195,13 +195,15 @@ fn refused_view(row: cog_core::PrincipleRow) -> RefusedPrinciple {
 /// How many refused principles the route returns in the list. The totals are
 /// taken before the truncation, so this bounds the list without making either
 /// total a page count.
-// cap: bound — 一页拒绝记录的条数，界的是单次响应的体积
-const REFUSED_PAGE: usize = 50;
+// cap: fixed — 一屏就是 A2A 的 `page_size` 默认值：本仓列表面共用同一个页长，各写一个 50 只会让「一屏」慢慢走散
+// keep: 删掉后回到「一屏就是 A2A 的 `page_size` 默认值：本仓列表面共用同一个页长，各写一个 50 只会让「一屏」慢慢走散」所描述的情形；由这条约定兜住
+const REFUSED_PAGE: usize = cog_core::config::A2A_LIST_PAGE_SIZE as usize;
 /// How many refused rows are read to compute the totals. The selection is
 /// `refusals > 0`, so this is a bound on how many principles have ever been
 /// refused by a single deployment; reading the whole set is what lets the two
 /// totals describe the set rather than the page.
-// cap: bound — 算拒绝总数最多读多少行；读到这里就按已读部分外推，不把整表读进内存
+// cap: fixed — 算拒绝总数最多读多少行；读到这里就按已读部分外推，不把整表读进内存
+// keep: 删掉后算拒绝总数把整表读进内存；由「读到这里就按已读部分外推」兜住
 const REFUSED_READ_CAP: usize = 10_000;
 
 fn principles(state: &GatewayState) -> Result<&Arc<dyn cog_core::PrincipleLedgerStore>, ApiError> {
@@ -286,6 +288,17 @@ pub struct ChangesResponse {
     /// below it. `outstanding.len()` is a page length and answering this
     /// question with it would make the backlog look as small as the page.
     pub outstanding_total: u64,
+    /// 现网是哪一版（或为什么读不出来）。三格里的「上线」靠它算。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_revision: Option<cog_core::LiveRevision>,
+    /// 三格按格数出来的行数，数的是**这一页**的 `outstanding`。
+    ///
+    /// 数这一页而不是数一份全账快照，是因为「代码填了、验证空着」这一格只可能出现在
+    /// 还没闭的行上：快照里有的是已落的行，那些行的验证格按定义就是填的，于是从快照
+    /// 数出来永远是 0——一条永远为 0 的判据比没有这条判据更坏。页是个节选，所以名字
+    /// 与注释都说清楚它数的是这一页。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cells_census: Option<cog_core::ChangeCellsCensus>,
     /// The rows the ledger hands out next, most urgent band first.
     pub outstanding: Vec<ChangeLedgerRowView>,
 }
@@ -353,6 +366,12 @@ pub struct ChangeLedgerRowView {
     /// The face this change is filed under, or `none` when the documents that
     /// ask for it name none or name different ones.
     pub block: String,
+    /// 三格：代码 / 上线 / 验证，各填了没有。
+    ///
+    /// `None` 表示这一页算不出三格（平台读不到现网 revision）：那要让读的人看到
+    /// 「量不到」，不是看到三格全空——后者读作「全都没做」，是另一个结论。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cells: Option<cog_core::ChangeCells>,
     /// What this one change cost, over every handover its identity fixes.
     ///
     /// `None` when the column could not be measured for this page at all; the
@@ -367,7 +386,12 @@ pub struct ChangeLedgerRowView {
 /// Split from the handler so the mapping has a reader that needs no database:
 /// which facts a row view keeps is about the row, not about whether the store
 /// answered.
-fn change_row_view(row: cog_core::ChangeLedgerRow, cost: Option<u64>) -> ChangeLedgerRowView {
+fn change_row_view(
+    row: cog_core::ChangeLedgerRow,
+    cost: Option<u64>,
+    live: Option<&cog_core::LiveRevision>,
+) -> ChangeLedgerRowView {
+    let cells = live.map(|live| row.cells(live));
     let priority = row.priority().as_str().to_string();
     let block = row.block().as_str().to_string();
     let holds_the_line = row.holds_the_line();
@@ -392,6 +416,7 @@ fn change_row_view(row: cog_core::ChangeLedgerRow, cost: Option<u64>) -> ChangeL
         unsettled_reason: row.unsettled_reason,
         priority,
         block,
+        cells,
         cost,
     }
 }
@@ -439,7 +464,8 @@ async fn page_costs(
 /// How many outstanding rows the route returns. The account can hold thousands;
 /// this bounds the body without bounding `outstanding_total`, which is taken
 /// from the census.
-// cap: bound — 一页未结事项的条数，与拒绝页同量级，界的是单次响应体积
+// cap: fixed — 一页未结事项的条数，与拒绝页同量级，界的是单次响应体积
+// keep: 删掉后一页未结事项无界，单次响应被撑爆；由「界的是单次响应体积」兜住
 const OUTSTANDING_PAGE: usize = 100;
 
 fn changes(state: &GatewayState) -> Result<&Arc<dyn cog_core::ChangeLedgerStore>, ApiError> {
@@ -493,6 +519,21 @@ pub async fn changes_handler(
             (None, Some(reason))
         }
     };
+    // 三格是读数：由读得到现网 revision 的那一侧算出来，这里只取最新的一份。
+    // 取不到就给 `None`，页面因此印「量不到」。
+    let cells_snapshot = state.orchestrator.change_cells();
+    let live_revision = cells_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.live.clone());
+    // 数的是**这一页**的行，不是快照里的已落行：「代码填了、验证空着」只可能出现在
+    // 还没闭的行上，而已落行的验证格按定义是填的——从快照数，这一格永远是 0。
+    let cells_census = live_revision.as_ref().map(|live| {
+        let mut census = cog_core::ChangeCellsCensus::default();
+        for row in &rows {
+            census.add(&row.cells(live));
+        }
+        census
+    });
     let outstanding = rows
         .into_iter()
         .map(|row| {
@@ -502,7 +543,7 @@ pub async fn changes_handler(
                     .copied()
                     .unwrap_or(0)
             });
-            change_row_view(row, cost)
+            change_row_view(row, cost, live_revision.as_ref())
         })
         .collect();
 
@@ -515,6 +556,8 @@ pub async fn changes_handler(
         pending_retirements,
         cost_unreadable,
         outstanding_total,
+        live_revision,
+        cells_census,
         outstanding,
     }))
 }
@@ -532,8 +575,11 @@ pub struct ChangeFunnelQuery {
 
 /// A fortnight: long enough to see a week's shape twice, short enough that the
 /// query stays inside the event table's hot window.
+// cap: fixed — 治理漏斗按「一个考核周期」看：默认一周，与周报同一档，不是一条按量伸缩的界
+// keep: 删掉后治理漏斗没有默认周期，读者不知道看的是哪一段；由「默认一周、与周报同一档」兜住
 fn default_funnel_days() -> u32 {
-    14
+    // 两周：够看见一次完整的周节律，又还在事件表的热窗口里。
+    (2 * cog_core::day::DAYS_PER_WEEK) as u32
 }
 
 /// The attempt-to-landing ladder, one row per UTC day.
@@ -545,6 +591,206 @@ fn default_funnel_days() -> u32 {
 #[derive(Debug, Serialize)]
 pub struct ChangeFunnelResponse {
     pub days: Vec<FunnelDayView>,
+    /// What [`Self::days`] adds up to. Computed here, not in the page: the unit
+    /// cost is a ratio over a denominator, and a page that picks the
+    /// denominator for itself can pick one that makes the number say something
+    /// the days never said.
+    pub summary: FunnelSummary,
+}
+
+/// The returned days, summed -- the figures the page shows once above the table.
+///
+/// **Two unit costs, not one.** The numerator is the whole deployment's spend:
+/// every caller's calls, not only the ones that moved a change. There are two
+/// defensible denominators for it and they answer different questions:
+///
+/// - over *every* closure the ledger closed: what one closed item costs. Most
+///   of those closures were asks the corpus already satisfied -- they shipped
+///   nothing and cost almost nothing -- so this figure is the cheapest reading
+///   of the same spend.
+/// - over the closures that carried a delivered revision: what one shipped
+///   change costs. This is the figure the account's own target is stated in.
+///
+/// The gap between them is exactly [`Self::rev_coverage`], and printing only
+/// one of them without it is what makes the panel misread: a reader who takes
+/// the per-closure figure for the per-shipped-change figure is off by that
+/// ratio, and a reader who takes the other one without seeing the coverage
+/// cannot tell whether it is large because changes are expensive or because
+/// almost nothing shipped. So both are carried, and the coverage that relates
+/// them is carried with them.
+/// Why a window's money could not be stated.
+///
+/// Three causes, three sentences: a page that collapses them into one prints
+/// "no price recorded" over a day whose usage rows were never read, which reads
+/// as a measurement rather than as a gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostUnstated {
+    /// At least one day's usage rows could not be read. Nothing about the
+    /// window's spend is known, including whether any was.
+    UsageUnread,
+    /// Every day was read, but at least one day's priced calls span more than
+    /// one currency. A sum over two currencies is not a sum, and this service
+    /// holds no exchange rate.
+    MixedCurrency,
+    /// Every day was read and none is mixed, but no call in the window carried
+    /// a price. The total is zero and there is no unit to state it in.
+    NothingPriced,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FunnelSummary {
+    pub attempted: u64,
+    pub rounds: u64,
+    pub passed: u64,
+    /// Every row the ledger closed in the window. Not output: see
+    /// [`cog_core::ChangeFunnelDay::landed`].
+    pub landed: u64,
+    /// Closures that carried a delivered revision -- the ones that shipped.
+    pub landed_with_rev: u64,
+    /// `landed_with_rev / landed`. `null` when nothing landed: a ratio whose
+    /// denominator is zero does not exist, and printing it as zero would read
+    /// as "nothing shipped" on a window where nothing closed at all.
+    pub rev_coverage: Option<f64>,
+    /// `null` when any returned day could not read the usage table, or when
+    /// there are no days. A sum that quietly skips a day reads as "that day
+    /// cost nothing", which is the one thing an unmeasured day must not say.
+    pub llm_calls: Option<u64>,
+    /// What the window's priced calls cost, in [`Self::cost_currency`]'s
+    /// millionths. `null` when some day could not be read or some day's priced
+    /// calls span two currencies; [`Self::cost_unstated`] says which.
+    ///
+    /// A day with no calls, or with calls that were all served unpriced, is
+    /// **not** a hole here: it adds zero to the priced total, and the floor it
+    /// hides is [`Self::unpriced_calls`]'s to state.
+    pub cost_micros: Option<i64>,
+    /// The single currency [`Self::cost_micros`] is in, as the price book
+    /// names it. Never picked by the page.
+    pub cost_currency: Option<String>,
+    /// Why [`Self::cost_micros`] is `null`, when it is. `null` itself is the
+    /// only field a page cannot restate: "no money figure" has three causes and
+    /// they call for three different sentences, so the cause travels with the
+    /// absence instead of being re-derived from the days by every reader.
+    pub cost_unstated: Option<CostUnstated>,
+    /// Calls served with no price recorded, over the same days. Any of them
+    /// makes every money figure here a floor rather than a total.
+    pub unpriced_calls: Option<u64>,
+    /// `llm_calls / landed`: what one closed item costs to buy. Left as a
+    /// fraction rather than rounded here -- a fraction of a call per closure is
+    /// the useful form on a window with many landings, and a page that wants a
+    /// whole number can round it where it prints.
+    pub calls_per_landing: Option<f64>,
+    /// `llm_calls / landed_with_rev`: what one shipped change costs to buy.
+    pub calls_per_shipped_change: Option<f64>,
+    /// `cost_micros / landed`, in the currency's millionths.
+    pub cost_per_landing_micros: Option<i64>,
+    /// `cost_micros / landed_with_rev`, in the currency's millionths. This is
+    /// the denominator the account's own target is stated over.
+    pub cost_per_shipped_change_micros: Option<i64>,
+}
+
+impl FunnelSummary {
+    /// Sums exactly the days the route returns -- so the summary and the table
+    /// under it can never be about different windows.
+    pub fn of(days: &[FunnelDayView]) -> Self {
+        let sum_u64 = |f: fn(&FunnelDayView) -> u64| days.iter().map(f).sum::<u64>();
+        let attempted = sum_u64(|d| d.attempted);
+        let rounds = sum_u64(|d| d.rounds);
+        let passed = sum_u64(|d| d.passed);
+        let landed = sum_u64(|d| d.landed);
+        let landed_with_rev = sum_u64(|d| d.landed_with_rev);
+
+        // Every column that comes from the usage table is all-or-nothing over
+        // the window: one unread day and the sum is not the window's total.
+        // An empty window is a measured zero, not an unread one: every day it
+        // has -- none -- was read. `all` on an empty slice is exactly that.
+        let calls_read = days.iter().all(|d| d.llm_calls.is_some());
+        let llm_calls = calls_read.then(|| days.iter().filter_map(|d| d.llm_calls).sum::<u64>());
+
+        let unpriced_read = days.iter().all(|d| d.unpriced_calls.is_some());
+        let unpriced_calls =
+            unpriced_read.then(|| days.iter().filter_map(|d| d.unpriced_calls).sum::<u64>());
+
+        // A day whose money cannot be stated makes the window's money a
+        // non-number, not a smaller number. Which shapes count is the whole
+        // question, and getting it wrong turns a quiet day into a hole:
+        //
+        // - a day whose usage rows could not be read is unstated, always;
+        // - a day whose priced calls span two currencies is unstated: there is
+        //   no exchange rate here, so there is no sum;
+        // - a day with **no calls at all** is not unstated. Its priced spend is
+        //   zero, and zero sums. Reading it as a hole is what makes one quiet
+        //   day hide the window's whole cost;
+        // - a day whose calls were all served unpriced is not unstated either:
+        //   it adds zero to the priced total, and `unpriced_calls` already says
+        //   the total is a floor rather than a total.
+        //
+        // The day shapes that reach here with priced calls and no figure are
+        // exactly the mixed-currency ones, because the store states a day only
+        // when one currency priced at least one call.
+        let unstated_day = days.iter().any(|d| {
+            d.llm_calls.is_none()
+                || (d.cost_micros.is_none()
+                    && d.unpriced_calls == Some(0)
+                    && d.llm_calls.unwrap_or(0) > 0)
+        });
+        let mut currencies: Vec<String> = days
+            .iter()
+            .filter_map(|d| d.cost_currency.clone())
+            .collect();
+        currencies.sort();
+        currencies.dedup();
+        let cost_currency = (currencies.len() == 1).then(|| currencies[0].clone());
+        let cost_unstated = if !calls_read || !unpriced_read {
+            Some(CostUnstated::UsageUnread)
+        } else if unstated_day || currencies.len() > 1 {
+            // One day priced in two currencies, or two days priced in
+            // different ones: both are sums this service cannot take, and a
+            // window that mixes them is the same non-sum as a day that does.
+            Some(CostUnstated::MixedCurrency)
+        } else if cost_currency.is_none() {
+            // Every day was read and none is mixed, yet no currency named the
+            // window: no call in it was ever priced. The total is zero and
+            // there is no unit to state it in.
+            Some(CostUnstated::NothingPriced)
+        } else {
+            None
+        };
+        let cost_micros = match (&cost_unstated, &cost_currency) {
+            (None, Some(_)) => Some(days.iter().map(|d| d.cost_micros.unwrap_or(0)).sum::<i64>()),
+            _ => None,
+        };
+
+        // A denominator of zero does not make the ratio zero -- it makes it not
+        // exist, and every caller here has to render that as "no such figure",
+        // not as a cheap one.
+        let per = |total: Option<f64>, denominator: u64| -> Option<f64> {
+            if denominator == 0 {
+                return None;
+            }
+            Some(total? / denominator as f64)
+        };
+
+        Self {
+            attempted,
+            rounds,
+            passed,
+            landed,
+            landed_with_rev,
+            rev_coverage: (landed > 0).then(|| landed_with_rev as f64 / landed as f64),
+            llm_calls,
+            cost_micros,
+            cost_currency,
+            cost_unstated,
+            unpriced_calls,
+            calls_per_landing: per(llm_calls.map(|c| c as f64), landed),
+            calls_per_shipped_change: per(llm_calls.map(|c| c as f64), landed_with_rev),
+            cost_per_landing_micros: per(cost_micros.map(|m| m as f64), landed)
+                .map(|v| v.round() as i64),
+            cost_per_shipped_change_micros: per(cost_micros.map(|m| m as f64), landed_with_rev)
+                .map(|v| v.round() as i64),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -582,24 +828,24 @@ pub async fn changes_funnel_handler(
     // the claim that no day had any activity.
     let ledger = changes(&state)?;
     let days = ledger.funnel(q.days).await?;
-    Ok(Json(ChangeFunnelResponse {
-        days: days
-            .into_iter()
-            .map(|d| FunnelDayView {
-                day: d.day,
-                attempted: d.attempted,
-                rounds: d.rounds,
-                passed: d.passed,
-                landed: d.landed,
-                landed_with_rev: d.landed_with_rev,
-                llm_calls: d.llm_calls,
-                tokens: d.tokens,
-                cost_micros: d.cost_micros,
-                cost_currency: d.cost_currency,
-                unpriced_calls: d.unpriced_calls,
-            })
-            .collect(),
-    }))
+    let days: Vec<FunnelDayView> = days
+        .into_iter()
+        .map(|d| FunnelDayView {
+            day: d.day,
+            attempted: d.attempted,
+            rounds: d.rounds,
+            passed: d.passed,
+            landed: d.landed,
+            landed_with_rev: d.landed_with_rev,
+            llm_calls: d.llm_calls,
+            tokens: d.tokens,
+            cost_micros: d.cost_micros,
+            cost_currency: d.cost_currency,
+            unpriced_calls: d.unpriced_calls,
+        })
+        .collect();
+    let summary = FunnelSummary::of(&days);
+    Ok(Json(ChangeFunnelResponse { days, summary }))
 }
 
 /// What `GET /api/v1/governance/changes/events` takes.
@@ -700,9 +946,11 @@ pub async fn change_cost(
 /// How many moves one history returns unless the caller asks for fewer. The
 /// steps come newest first, so the bound drops the oldest ones -- the account
 /// can be years deep and the question is "how did this get here".
-// cap: bound — 一页时间线的条数，界的是单次响应体积
-const TIMELINE_PAGE: usize = 50;
-// cap: bound — widest history a caller may ask for in one read
+// cap: fixed — 与拒绝列表同一屏：列表面共用一个页长，见 `A2A_LIST_PAGE_SIZE`
+// keep: 删掉后回到「与拒绝列表同一屏：列表面共用一个页长，见 `A2A_LIST_PAGE_SIZE`」所描述的情形；由这条约定兜住
+const TIMELINE_PAGE: usize = cog_core::config::A2A_LIST_PAGE_SIZE as usize;
+// cap: fixed — widest history a caller may ask for in one read
+// keep: 删掉后一次读可以要无限久的历史，响应体积跟着调用方走；由「一次读最宽能问多少历史」兜住
 const TIMELINE_MAX: usize = 200;
 
 /// The identity a timeline request names, or the reason it names none.
@@ -832,7 +1080,7 @@ mod tests {
     /// 都丢在台账行里。看见这两格才知道该去修树还是该去修判据。
     #[test]
     fn a_row_that_was_delivered_and_is_still_owed_says_so() {
-        let view = change_row_view(ledger_row(), None);
+        let view = change_row_view(ledger_row(), None, None);
         assert_eq!(view.delivered_rev.as_deref(), Some("def456"));
         assert!(view.holds_the_line);
         assert_eq!(
@@ -845,13 +1093,35 @@ mod tests {
         assert_eq!(view.measured_rev.as_deref(), Some("abc123"));
     }
 
+    /// 三格随行一起交出去：读面看不到「上线」那一格时，`landed` 会被读成「线上有」。
+    #[test]
+    fn the_row_view_carries_the_three_cells_when_a_live_revision_is_known() {
+        let live = cog_core::LiveRevision::Known("abc123".into());
+        let view = change_row_view(ledger_row(), None, Some(&live));
+        let cells = view.cells.expect("三格随行交出去");
+        assert!(cells.code, "已落的那一行，代码格应当是填的");
+        assert!(cells.live, "量就是在现网那一版上做的：上线格应当填");
+        assert!(!cells.verified, "这一行还没被量过：验证格空着");
+        assert!(cells.unverified(), "代码填了、验证空着：这是红的那个形状");
+
+        // 现网 revision 读不出来时，这一格不能填——「不知道」被读成「有」是最贵的错。
+        let gap =
+            cog_core::LiveRevision::Unmeasurable(cog_core::LiveRevisionGap::ClusterUnreadable);
+        let view = change_row_view(ledger_row(), None, Some(&gap));
+        assert!(!view.cells.expect("仍然交出三格").live);
+
+        // 没有快照：不交三格，页面印「量不到」而不是一份全空的。
+        let view = change_row_view(ledger_row(), None, None);
+        assert!(view.cells.is_none());
+    }
+
     /// 没有交付过的那一行，`holds_the_line` 必须是假的：扣着线的行会按 P0 领序并挡住
     /// 同一 rev 上的其它行，多判一条就会把主线停在一笔从没送上去的变更后面。
     #[test]
     fn a_row_nothing_delivered_does_not_hold_the_line() {
         let mut row = ledger_row();
         row.delivered_rev = None;
-        let view = change_row_view(row, None);
+        let view = change_row_view(row, None, None);
         assert_eq!(view.delivered_rev, None);
         assert!(!view.holds_the_line);
     }
@@ -900,5 +1170,152 @@ mod tests {
         assert_eq!(timeline_limit(None), TIMELINE_PAGE);
         assert_eq!(timeline_limit(Some(0)), 1);
         assert_eq!(timeline_limit(Some(10_000)), TIMELINE_MAX);
+    }
+
+    fn funnel_day(landed: u64, landed_with_rev: u64, micros: Option<i64>) -> FunnelDayView {
+        FunnelDayView {
+            day: "2026-11-09".into(),
+            attempted: 10,
+            rounds: 20,
+            passed: 8,
+            landed,
+            landed_with_rev,
+            llm_calls: Some(100),
+            tokens: Some(1000),
+            cost_micros: micros,
+            cost_currency: Some("CNY".into()),
+            unpriced_calls: Some(0),
+        }
+    }
+
+    /// 两个分母都要印，而且都要用手算得出的数。
+    ///
+    /// 2026-11-10 的页面上只有一个「每笔交付成本」，分母只取带 rev 的那几条：分母是
+    /// 全部关掉条数的十六分之一，同一个花销看起来贵了十六倍。反过来只取全部关掉条数
+    /// 也一样坏——那会把大量「本来就成立、什么都没送出」的条算进分母，读起来像便宜。
+    /// 这一格要的是：两个数都按各自的定义算出来，谁都别冒充另一个。
+    #[test]
+    fn both_unit_costs_are_stated_over_their_own_denominator() {
+        let days = vec![funnel_day(160, 10, Some(1_600_000))];
+        let s = FunnelSummary::of(&days);
+        assert_eq!(s.landed, 160);
+        assert_eq!(s.landed_with_rev, 10);
+        assert_eq!(s.rev_coverage, Some(0.0625));
+        assert_eq!(
+            s.cost_per_landing_micros,
+            Some(10_000),
+            "每笔落地成本 = 花销 / 全部落地：1600000 / 160"
+        );
+        assert_eq!(
+            s.cost_per_shipped_change_micros,
+            Some(160_000),
+            "每笔送出变更成本 = 花销 / 带 rev 的落地：1600000 / 10"
+        );
+        assert_eq!(s.calls_per_landing, Some(0.625));
+        assert_eq!(s.calls_per_shipped_change, Some(10.0));
+    }
+
+    /// 分母为零时比值不存在。印 `0` 会把「一条都没送出」读成「送出得非常便宜」，
+    /// 而这一面最需要说清的恰恰是「一条都没送出」。
+    #[test]
+    fn a_zero_denominator_yields_no_ratio_rather_than_zero() {
+        let days = vec![funnel_day(0, 0, Some(500_000))];
+        let s = FunnelSummary::of(&days);
+        assert_eq!(s.rev_coverage, None);
+        assert_eq!(s.cost_per_landing_micros, None);
+        assert_eq!(s.cost_per_shipped_change_micros, None);
+        assert_eq!(s.calls_per_shipped_change, None);
+        assert_eq!(
+            s.cost_micros,
+            Some(500_000),
+            "钱照旧是说得出的那一个数：缺的是分母，不是花销"
+        );
+    }
+
+    /// 结算面上的一条硬规矩：窗口里有一天没读到用量表，整窗的钱就不是一个数。
+    /// 少加一天会读成「那天没花钱」，而这一列的用途正是判断「今天是不是没产出」。
+    #[test]
+    fn one_unread_day_makes_the_window_money_unknown() {
+        let mut unread = funnel_day(5, 2, None);
+        unread.llm_calls = None;
+        unread.unpriced_calls = None;
+        unread.cost_currency = None;
+        let days = vec![funnel_day(5, 2, Some(400_000)), unread];
+        let s = FunnelSummary::of(&days);
+        assert_eq!(s.llm_calls, None);
+        assert_eq!(s.unpriced_calls, None);
+        assert_eq!(s.cost_micros, None);
+        assert_eq!(s.cost_unstated, Some(CostUnstated::UsageUnread));
+        assert_eq!(s.cost_per_landing_micros, None);
+        assert_eq!(
+            s.landed, 10,
+            "数得出来的那一半照常相加：没读懂的是钱，不是落地数"
+        );
+    }
+
+    /// 窗口里有一天完全没调用（夜里没跑、网关没起），整窗的钱照样说得出来。
+    ///
+    /// 那一天的花销是零，零能相加。把它当成「没读到」是这一格要挡的错：一个安静的
+    /// 日子会让整窗的成本变成「未记价」，于是面板上「今天没花钱」与「今天读不到」
+    /// 分不开，而这一列的用途正是判断今天是不是没产出。
+    #[test]
+    fn a_quiet_day_adds_zero_and_does_not_hide_the_rest_of_the_window() {
+        let mut quiet = funnel_day(0, 0, None);
+        quiet.llm_calls = Some(0);
+        quiet.tokens = Some(0);
+        quiet.cost_currency = None;
+        let days = vec![funnel_day(5, 2, Some(400_000)), quiet];
+        let s = FunnelSummary::of(&days);
+        assert_eq!(s.llm_calls, Some(100), "安静的零调用日子照样是量到的");
+        assert_eq!(s.unpriced_calls, Some(0));
+        assert_eq!(s.cost_micros, Some(400_000));
+        assert_eq!(s.cost_currency.as_deref(), Some("CNY"));
+        assert_eq!(s.cost_unstated, None);
+        assert_eq!(
+            s.cost_per_shipped_change_micros,
+            Some(200_000),
+            "分母只数带 rev 的：400000 / 2"
+        );
+    }
+
+    /// 全窗一次有价调用都没有：钱是零，但没有任何币种能把它说出来。这种「说不出来」
+    /// 与「没读到」是两件事，印成同一句会让一次成功的读取看起来像一次失败。
+    #[test]
+    fn a_window_with_nothing_priced_says_so_rather_than_claiming_it_was_unread() {
+        let mut unpriced = funnel_day(5, 2, None);
+        unpriced.cost_currency = None;
+        unpriced.unpriced_calls = Some(100);
+        let s = FunnelSummary::of(&[unpriced]);
+        assert_eq!(s.llm_calls, Some(100));
+        assert_eq!(s.unpriced_calls, Some(100));
+        assert_eq!(s.cost_micros, None);
+        assert_eq!(s.cost_unstated, Some(CostUnstated::NothingPriced));
+    }
+
+    /// 跨币种的和不是和。两天各自说得出钱，加起来说不出来——这一格要的是那句
+    /// 「未记价」，不是「两天加起来的数」。
+    #[test]
+    fn two_currencies_do_not_add_up() {
+        let mut other = funnel_day(5, 2, Some(300_000));
+        other.cost_currency = Some("USD".into());
+        let days = vec![funnel_day(5, 2, Some(400_000)), other];
+        let s = FunnelSummary::of(&days);
+        assert_eq!(s.cost_micros, None);
+        assert_eq!(s.cost_currency, None);
+        assert_eq!(s.cost_unstated, Some(CostUnstated::MixedCurrency));
+        assert_eq!(s.cost_per_landing_micros, None);
+    }
+
+    /// 一天之内跨币种与两天之间跨币种是同一种「说不出来」：两条都要落进
+    /// `MixedCurrency`，不能因为币种集合只数到一种就把跨币种那天读成「未记价」。
+    #[test]
+    fn a_day_priced_in_two_currencies_is_mixed_even_when_its_neighbours_are_not() {
+        let mut mixed = funnel_day(5, 2, None);
+        mixed.cost_currency = None;
+        mixed.unpriced_calls = Some(0);
+        let days = vec![funnel_day(5, 2, Some(400_000)), mixed];
+        let s = FunnelSummary::of(&days);
+        assert_eq!(s.cost_micros, None);
+        assert_eq!(s.cost_unstated, Some(CostUnstated::MixedCurrency));
     }
 }

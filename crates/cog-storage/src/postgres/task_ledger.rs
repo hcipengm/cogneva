@@ -9,7 +9,7 @@
 //!   * A lost update is one interleaving away. Two writers that read the same
 //!     document and each change a different field overwrite each other, and no
 //!     constraint can say which of the two the second one meant to keep.
-//!   * A value read once is frozen forever. `timeout_seconds` was computed from
+//!   * A value read once is frozen forever. `declared_duration_seconds` was computed from
 //!     measured samples at planning time and copied into the document; nothing
 //!     recomputed it, so tasks planned on 2026-11-08 still carried 3600 when
 //!     the export of that hour said 3463.
@@ -128,10 +128,13 @@ pub(crate) struct LedgerRow {
     pub task_id: String,
     pub kind: String,
     pub input: String,
+    pub terminal: String,
+    pub now: String,
+    pub gap: String,
     pub created_at: DateTime<Utc>,
     pub priority: i32,
     pub max_retries: i32,
-    pub timeout_seconds: i64,
+    pub declared_duration_seconds: i64,
     pub is_executable: bool,
     pub acceptance: Vec<String>,
     pub blocked_by: Vec<String>,
@@ -201,6 +204,9 @@ impl LedgerRow {
             task_type: task_type_from_kind(&self.kind),
             status,
             input,
+            terminal: self.terminal,
+            now: self.now,
+            gap: self.gap,
             result,
             error: self.error_text,
             // The cause is read from its code, never guessed from the text:
@@ -219,7 +225,7 @@ impl LedgerRow {
             max_retries: self.max_retries.max(0) as u32,
             retry_not_before: self.not_before,
             started_at: self.started_at,
-            timeout_seconds: self.timeout_seconds.max(0) as u64,
+            declared_duration_seconds: self.declared_duration_seconds.max(0) as u64,
             lease_owner: self.lease_owner,
             lease_expires_at: self.lease_expires_at,
             action_planner_meta,
@@ -262,14 +268,32 @@ pub(crate) fn ledger_sql(inner: &str, outer: &str) -> String {
     };
     format!(
         r#"
+WITH latest_def AS (
+    SELECT DISTINCT ON (task_id) * FROM task_defined WHERE {inner}
+     ORDER BY task_id, rev DESC
+), blocking AS (
+    -- 「谁被谁挡」对整批算一次。从前它是逐行一个 LATERAL 子查询，每一行都去扫
+    -- 一遍全部定义（`blocked_by @> ARRAY[这一行]`），是任务数的平方：现网一千多个
+    -- 任务时这条读要十秒，而读它的是调度器的主循环——一轮十秒，它就再也挤不出余量
+    -- 干活。一次 unnest + 分组是同一句话，代价是线性的。
+    SELECT unnest(x.blocked_by) AS blocked_task,
+           array_agg(x.task_id ORDER BY x.task_id) AS blocks
+      FROM (SELECT DISTINCT ON (task_id) task_id, blocked_by
+              FROM task_defined
+             ORDER BY task_id, rev DESC) x
+     GROUP BY 1
+)
 SELECT d.workspace_id       AS workspace_id,
        d.task_id            AS task_id,
        d.kind               AS kind,
        d.input              AS input,
+       d.terminal           AS terminal,
+       d.now                AS now,
+       d.gap                AS gap,
        d.created_at         AS created_at,
        d.priority           AS priority,
        d.max_retries        AS max_retries,
-       d.timeout_seconds    AS timeout_seconds,
+       d.declared_duration_seconds    AS declared_duration_seconds,
        d.is_executable      AS is_executable,
        d.acceptance         AS acceptance,
        d.blocked_by         AS blocked_by,
@@ -300,8 +324,7 @@ SELECT d.workspace_id       AS workspace_id,
        a.agent_id                             AS attempt_agent,
        a.result                               AS attempt_result,
        COALESCE(b.blocks, '{{}}'::text[])     AS blocks
-  FROM (SELECT DISTINCT ON (task_id) * FROM task_defined WHERE {inner}
-         ORDER BY task_id, rev DESC) d
+  FROM latest_def d
   JOIN LATERAL (
         SELECT to_state, at, seq, not_before FROM task_transition
          WHERE task_id = d.task_id ORDER BY seq DESC LIMIT 1
@@ -314,14 +337,7 @@ SELECT d.workspace_id       AS workspace_id,
           FROM task_attempt WHERE task_id = d.task_id
          ORDER BY attempt_no DESC LIMIT 1
        ) a ON TRUE
-  LEFT JOIN LATERAL (
-        SELECT array_agg(x.task_id ORDER BY x.task_id) AS blocks
-          FROM (SELECT DISTINCT ON (task_id) task_id, blocked_by
-                  FROM task_defined
-                 WHERE blocked_by @> ARRAY[d.task_id]
-                 ORDER BY task_id, rev DESC) x
-         WHERE d.task_id = ANY(x.blocked_by)
-       ) b ON TRUE{outer}
+  LEFT JOIN blocking b ON b.blocked_task = d.task_id{outer}
 "#
     )
 }
@@ -355,6 +371,7 @@ WITH latest AS (
     SELECT DISTINCT ON (task_id) task_id, to_state, seq, at, not_before
       FROM task_transition
      WHERE ($1::text IS NULL OR task_id = $1)
+       AND seq > $2
      ORDER BY task_id, seq DESC
 ), attempt AS (
     SELECT DISTINCT ON (task_id) task_id, attempt_no, started_at, owner,
@@ -467,6 +484,14 @@ pub(crate) async fn save_definition(
     workspace_id: &str,
     task: &Task,
 ) -> Result<i64, SFError> {
+    // 过渡期：还有入口把三格塞在 `input[ITEM_INPUT_KEY]` 里。写事实之前提一次，
+    // 流上那条定义就带着三格；字段已经是正本，输入里的副本由下一段退休。
+    let mut lifted = task.clone();
+    lifted.lift_item_cells();
+    // 字段是正本：写下去的这一份不再留输入里的副本。旧事件里的副本不动，
+    // 重建与读法仍有回退（`insert_definition_row` 不退休，写什么就落什么）。
+    lifted.retire_item_cells_copy();
+    let task = &lifted;
     let kind = kind_of(&task.task_type);
     let input = serde_json::to_string(&task.input)?;
     let (rev, same): (i64, bool) = sqlx::query_as(
@@ -475,7 +500,7 @@ pub(crate) async fn save_definition(
                COALESCE(bool_or(
                    kind = $3 AND input = $4 AND created_at = $5
                    AND priority = $6 AND max_retries = $7
-                   AND timeout_seconds = $8 AND is_executable = $9
+                   AND declared_duration_seconds = $8 AND is_executable = $9
                    AND acceptance = $10 AND blocked_by = $11
                    AND agent_id IS NOT DISTINCT FROM $12
                    AND goal_id IS NOT DISTINCT FROM $13
@@ -488,6 +513,7 @@ pub(crate) async fn save_definition(
                    AND submitted_by IS NOT DISTINCT FROM $20
                    AND planner_verified IS NOT DISTINCT FROM $21
                    AND planner_source IS NOT DISTINCT FROM $22
+                   AND terminal = $29 AND now = $30 AND gap = $31
                ), FALSE)
           FROM task_defined
          WHERE task_id = $1 AND rev = (SELECT MAX(rev) FROM task_defined WHERE task_id = $1)
@@ -501,7 +527,7 @@ pub(crate) async fn save_definition(
     .bind(task.created_at)
     .bind(task.priority)
     .bind(task.max_retries as i32)
-    .bind(task.timeout_seconds as i64)
+    .bind(task.declared_duration_seconds as i64)
     .bind(task.is_executable)
     .bind(&task.acceptance)
     .bind(&task.blocked_by)
@@ -521,6 +547,9 @@ pub(crate) async fn save_definition(
             .and_then(|m| m.source.as_ref())
             .map(|s| format!("{s:?}")),
     )
+    .bind(&task.terminal)
+    .bind(&task.now)
+    .bind(&task.gap)
     .fetch_one(&mut *conn)
     .await
     .map_err(|e| SFError::Database(e.to_string()))?;
@@ -529,30 +558,65 @@ pub(crate) async fn save_definition(
         return Ok(rev);
     }
 
+    let at = chrono::Utc::now();
+    insert_definition_row(conn, task, workspace_id, rev + 1, at).await?;
+    // 定义也是流上的一条事实：`task_defined` 表是它的投影。同一事务里写，
+    // 「这一版定义」与描述它的那条事件不会分家。
+    let next_rev = rev + 1;
+    // 载荷带**整条定义**，不是摘要：删掉 `task_defined` 表之后，只有这一条能把
+    // 那一行逐字节拼回来。带上 `rev` 与 `workspace_id` 是因为表里这两列不在
+    // `Task` 上。
+    let payload = cog_core::EventPayload::TaskDefined {
+        task: Box::new(task.clone()),
+        rev: next_rev,
+        workspace_id: workspace_id.to_string(),
+    };
+    let fields = payload.envelope(&definition_event_id(&task.id, next_rev), "storage");
+    super::event_log::append_on(conn, &fields, at).await?;
+    Ok(next_rev)
+}
+
+/// 把一版定义写进 `task_defined`。写入口与重建都走它——两处各写一份绑定顺序，
+/// 重建出来的行就会与写进去的那一行差一格，而差的那一格不会自己红。
+pub(crate) async fn insert_definition_row(
+    conn: &mut PgConnection,
+    task: &Task,
+    workspace_id: &str,
+    rev: i64,
+    at: DateTime<Utc>,
+) -> Result<(), SFError> {
+    // 重建拿到的是一条流上的旧定义：三格可能只在 `input.ledger_item` 里。
+    // 落列之前提一次，写入口与重建长出来的行因此逐列相同。
+    let mut lifted = task.clone();
+    lifted.lift_item_cells();
+    let task = &lifted;
+    let kind = kind_of(&task.task_type);
+    let input = serde_json::to_string(&task.input)?;
     let meta = task.action_planner_meta.as_ref();
     sqlx::query(
         r#"
         INSERT INTO task_defined (
             task_id, rev, at, workspace_id, kind, input, created_at, priority,
-            max_retries, timeout_seconds, is_executable, acceptance, blocked_by,
+            max_retries, declared_duration_seconds, is_executable, acceptance, blocked_by,
             agent_id, goal_id, parent_task_id, sink_task_id, face_id, venue,
             owner_unit, bound_by_handover_id, submitted_by, planner_verified,
             planner_version, planner_note, planner_source, planner_confidence,
-            planner_at)
-        VALUES ($1, $2, NOW(), $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
-                $25, $26, $27)
+            planner_at, terminal, now, gap)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
+                $25, $26, $27, $28, $29, $30, $31)
         "#,
     )
     .bind(&task.id)
-    .bind(rev + 1)
+    .bind(rev)
+    .bind(at)
     .bind(workspace_id)
     .bind(&kind)
     .bind(&input)
     .bind(task.created_at)
     .bind(task.priority)
     .bind(task.max_retries as i32)
-    .bind(task.timeout_seconds as i64)
+    .bind(task.declared_duration_seconds as i64)
     .bind(task.is_executable)
     .bind(&task.acceptance)
     .bind(&task.blocked_by)
@@ -571,10 +635,106 @@ pub(crate) async fn save_definition(
     .bind(meta.and_then(|m| m.source.as_ref().map(|s| format!("{s:?}"))))
     .bind(meta.and_then(|m| m.confidence))
     .bind(meta.and_then(|m| m.timestamp))
+    .bind(&task.terminal)
+    .bind(&task.now)
+    .bind(&task.gap)
     .execute(&mut *conn)
     .await
     .map_err(|e| SFError::Database(e.to_string()))?;
-    Ok(rev + 1)
+    // 派发出去的身份在**写的那一刻**从输入文本里取出来落成行：两跳对账要按身份查，
+    // 而一个任务可以一次带多条身份，所以是一张侧表。查询侧因此不再解析输入文本。
+    // keep: 只重写这一版定义的侧表行（投影）；事实在事件里，删掉的行下一次写同一版由事件重建
+    sqlx::query("DELETE FROM task_change_identity WHERE task_id = $1 AND rev = $2")
+        .bind(&task.id)
+        .bind(rev)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+    for (ordinal, (kind, scope, literal)) in
+        handover_identities(&task.input).into_iter().enumerate()
+    {
+        sqlx::query(
+            "INSERT INTO task_change_identity (task_id, rev, ordinal, kind, scope, literal) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(&task.id)
+        .bind(rev)
+        .bind(ordinal as i32)
+        .bind(kind)
+        .bind(scope)
+        .bind(literal)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// 一条定义行的输入里带着的交接身份，按侧表的行序给出。
+///
+/// 复数 `change_identities` 是一次交接携带的**全部**身份；单数 `change_identity`
+/// 是更老的写者留下的形状，两边并列时它是数组的第一行。所以先看数组，没有数组
+/// 再看单数——只看复数会把老形状读成「没有交接」（现网 15 个存量），而账本那一
+/// 侧一直认得出它们。
+fn handover_identities(input: &serde_json::Value) -> Vec<(String, String, String)> {
+    let fields = |identity: &serde_json::Value| {
+        let field = |key: &str| {
+            identity
+                .get(key)
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        (field("kind"), field("scope"), field("literal"))
+    };
+    if let Some(identities) = input
+        .get(cog_core::INPUT_CHANGE_IDENTITIES)
+        .and_then(|value| value.as_array())
+    {
+        return identities.iter().map(fields).collect();
+    }
+    match input.get(cog_core::INPUT_CHANGE_IDENTITY) {
+        Some(single) if single.is_object() => vec![fields(single)],
+        _ => Vec::new(),
+    }
+}
+
+/// 从流重建 `task_defined`：只读 `task_defined` 事件，重放每一版。
+///
+/// 这是那一族「删掉表也能重建」的写侧。它只认事件里的 `rev`、`workspace_id` 与
+/// 整条 `task`；这三样是 `save_definition` 写进去的全部。
+pub(crate) async fn rebuild_definitions(
+    conn: &mut PgConnection,
+    task_id: Option<&str>,
+) -> Result<u64, SFError> {
+    let rows: Vec<(String, serde_json::Value, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT subject_id, attributes::jsonb, at FROM cogneva_event \
+          WHERE kind = 'task_defined' AND ($1::text IS NULL OR subject_id = $1) \
+          ORDER BY subject_id, at, event_id",
+    )
+    .bind(task_id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| SFError::Database(e.to_string()))?;
+    let mut written = 0u64;
+    for (id, attributes, at) in rows {
+        let rev = attributes.get("rev").and_then(|v| v.as_i64()).unwrap_or(0);
+        let workspace = attributes
+            .get("workspace_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let Some(task_value) = attributes.get("task") else {
+            continue;
+        };
+        let mut task: Task = serde_json::from_value(task_value.clone())?;
+        if task.id.is_empty() {
+            task.id = id;
+        }
+        insert_definition_row(conn, &task, &workspace, rev, at).await?;
+        written += 1;
+    }
+    Ok(written)
 }
 
 /// One state transition the writer has in hand.
@@ -621,7 +781,109 @@ pub(crate) async fn append_transition(
     .fetch_one(&mut *conn)
     .await
     .map_err(|e| SFError::Database(e.to_string()))?;
+
+    // 同一条连接、同一个事务里再落一条事件：转移是事实，表是它的第一份读法，
+    // 流是正本。主键与幂等键都取「任务 + 序号」——重放写不出第二条。
+    //
+    // 只拿序号做主键是不够的：**每个任务的第一次转移序号都是 1**，第二条任务
+    // 落下时主键就撞了（2026-11-23 CI 实测：三条真库用例都死在
+    // 主键冲突（`duplicate key value violates unique constraint`，撞的是流的主键））。
+    let event_id = transition_event_id(move_.task_id, seq);
+    let payload = cog_core::EventPayload::TaskTransition {
+        task_id: move_.task_id.to_string(),
+        from: move_.from.map(|s| s.as_str().to_string()),
+        to: move_.to.as_str().to_string(),
+        actor: move_.actor.to_string(),
+        cause: move_.cause.to_string(),
+        seq,
+    };
+    // 唯一写口在事务路径上的形态：同一条 SQL、同一份信封检查，只是不另开连接。
+    let fields = payload.envelope(&event_id, "storage");
+    super::event_log::append_on(conn, &fields, chrono::Utc::now()).await?;
+
     Ok(seq)
+}
+
+/// 一条定义事件的 id：由「任务身份＋第几版」哈希出 26 位。
+///
+/// 与转移同一条派生法：同一个任务的第 N 版定义重放得到同一个主键；不同版不会
+/// 撞——任务 id 很长时直接截断会把版本号截掉，所以用哈希。
+fn definition_event_id(task_id: &str, rev: i64) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("task_defined:{task_id}:{rev}").as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02X}")).collect();
+    hex.chars().take(26).collect()
+}
+
+/// 一条转移事件的 id：由「任务身份 + 序号」哈希出 26 位，不足补 `0`。
+///
+/// 与别的写入器同一条派生法：由身份算出，重放同一个转移得到同一个主键。
+/// **要用哈希而不是直接截断**：任务 id 很长时，直接截断会把序号截掉，同一个任务的
+/// 第二次转移就会与第一次撞主键。
+fn transition_event_id(task_id: &str, seq: i64) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("task_transition:{task_id}:{seq}").as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02X}")).collect();
+    hex.chars().take(26).collect()
+}
+
+/// 一条任务最近一次被谁租下、租到什么时候——从流上读。
+///
+/// 当前行 `task_current` 也记着这两格，但那是投影；删掉它，这个读法仍答得出来。
+/// 回收不另立事件，所以这里答的是「最后一次有人接下它」，不是「租约还有效」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseReading {
+    pub event_id: String,
+    pub owner: String,
+    pub expires_at: DateTime<Utc>,
+    pub at: DateTime<Utc>,
+}
+
+pub async fn lease_from_stream(
+    pool: &sqlx::PgPool,
+    task_id: &str,
+) -> Result<Option<LeaseReading>, cog_core::SFError> {
+    let row: Option<(String, String, DateTime<Utc>, String)> = sqlx::query_as(
+        "SELECT event_id, subject_id, at, attributes FROM cogneva_event \
+          WHERE kind = 'task' AND step = 'leased' AND subject_id = $1 \
+          ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| cog_core::SFError::Database(format!("read lease of {task_id}: {e}")))?;
+    let Some((event_id, _subject, at, attributes)) = row else {
+        return Ok(None);
+    };
+    let value: serde_json::Value = serde_json::from_str(&attributes)
+        .map_err(|e| cog_core::SFError::Database(format!("task leased payload: {e}")))?;
+    let owner = value
+        .get("owner")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let expires_at = value
+        .get("expires_at")
+        .and_then(|v| v.as_str())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&Utc))
+        .unwrap_or(at);
+    Ok(Some(LeaseReading {
+        event_id,
+        owner,
+        expires_at,
+        at,
+    }))
+}
+
+/// 一条租约事件的 id：由「任务身份 + 那次转移的序号」哈希出 26 位。
+///
+/// 不直接用转移的 id：两个 kind 各要一个主键，同一个 id 落两次是主键冲突。
+pub(crate) fn lease_event_id(task_id: &str, seq: i64) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("task:leased:{task_id}:{seq}").as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02X}")).collect();
+    hex.chars().take(26).collect()
 }
 
 /// The state the last transition left the task in, if the task has one.
@@ -640,22 +902,34 @@ pub(crate) async fn current_state(
 }
 
 /// Open the attempt a move into `running` starts.
+///
+/// 这一段的职务从执行地址里读：进 `running` 那一刻手里只有租约持有者，而角色
+/// 只写在座位上（`squad:<任务>-<座位>`）。带外员工报的是人形地址，它是人不是
+/// 座位，这一格因此为空——那是「这一段没有座位角色」，不是「角色没读到」。
+///
+/// 做这一段的人由调用方给出：派工那一刻已经把工号写进任务行的 owner 格，执行
+/// 开始时抄到这一行上。座位地址自己答不出人（`squad:<任务>-<座位>` 里没有工号），
+/// 所以这里不猜，只记调用方知道的那一个——`None` 是「没记人」，不是「人未知」。
 pub(crate) async fn open_attempt(
     conn: &mut PgConnection,
     task_id: &str,
     owner: Option<&str>,
+    person: Option<&str>,
 ) -> Result<i32, SFError> {
+    let role = owner.and_then(|owner| cog_core::role_of_seat(task_id, owner));
     let (no,): (i32,) = sqlx::query_as(
         r#"
-        INSERT INTO task_attempt (task_id, attempt_no, started_at, owner)
+        INSERT INTO task_attempt (task_id, attempt_no, started_at, owner, role, person)
         SELECT $1,
                COALESCE((SELECT MAX(attempt_no) FROM task_attempt WHERE task_id = $1), 0) + 1,
-               NOW(), $2
+               NOW(), $2, $3, $4
         RETURNING attempt_no
         "#,
     )
     .bind(task_id)
     .bind(owner)
+    .bind(role)
+    .bind(person)
     .fetch_one(&mut *conn)
     .await
     .map_err(|e| SFError::Database(e.to_string()))?;
@@ -764,8 +1038,34 @@ pub(crate) async fn record_failed_attempt(
 
 /// Rewrite one task's projection row from the ledger.
 pub(crate) async fn project(conn: &mut PgConnection, task_id: Option<&str>) -> Result<(), SFError> {
+    // 全量：从账本的第一条转移折起。重建走这一条。
+    project_from(conn, task_id, 0).await
+}
+
+/// 增量：只折水位之后的转移。写路径走这一条——投影已经跟到哪，就只问那之后
+/// 有没有新的；没有就一行也不动。
+pub(crate) async fn project_incremental(
+    conn: &mut PgConnection,
+    task_id: &str,
+) -> Result<(), SFError> {
+    let after: i64 =
+        sqlx::query_scalar("SELECT as_of_seq FROM task_current WHERE task_id = $1 LIMIT 1")
+            .bind(task_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?
+            .unwrap_or(0);
+    project_from(conn, Some(task_id), after).await
+}
+
+async fn project_from(
+    conn: &mut PgConnection,
+    task_id: Option<&str>,
+    after_seq: i64,
+) -> Result<(), SFError> {
     sqlx::query(&project_sql())
         .bind(task_id)
+        .bind(after_seq)
         .execute(&mut *conn)
         .await
         .map_err(|e| SFError::Database(e.to_string()))?;
@@ -797,7 +1097,13 @@ pub(crate) async fn write_task(
     if current != Some(task.status) {
         match (current, task.status) {
             (_, TaskStatus::Running) => {
-                open_attempt(tx, &task.id, task.lease_owner.as_deref()).await?;
+                open_attempt(
+                    tx,
+                    &task.id,
+                    task.lease_owner.as_deref(),
+                    task.owner_unit.as_deref(),
+                )
+                .await?;
             }
             (Some(TaskStatus::Running), landed) => {
                 close_attempt(
@@ -870,4 +1176,52 @@ pub(crate) async fn rebuild(pool: &sqlx::PgPool, task_id: Option<&str>) -> Resul
         .await
         .map_err(|e: sqlx::Error| SFError::Database(e.to_string()))?;
     Ok(done as u64)
+}
+
+#[cfg(test)]
+mod watermark_tests {
+    use super::*;
+
+    /// 写路径的增量投影只折水位之后的转移：模板里必须带这个界，去掉它这一条就退回全量，
+    /// 而全量在长账本上会把每次写都变成一次整本重放。
+    #[test]
+    fn the_incremental_projection_folds_only_after_its_watermark() {
+        let sql = project_sql();
+        assert!(
+            sql.contains("seq > $2"),
+            "增量投影的 SQL 里没有水位界：{sql}"
+        );
+        let source = include_str!("task_ledger.rs");
+        assert!(source.contains("SELECT as_of_seq FROM task_current"));
+    }
+
+    /// 侧表的行来自输入的哪一种形状：数组全量、老单数一行、两边都没有就是零行。
+    /// 只看复数会把现网那 15 个只带单数的定义行读成「没有交接」——账本那一侧的
+    /// pending 就一条也对不上，而读的人看到的是「挂空」。
+    #[test]
+    fn the_side_table_rows_come_from_the_plural_list_or_the_old_single_one() {
+        let one = serde_json::json!({"kind": "criterion", "scope": "a.rs", "literal": "L1"});
+        let two = serde_json::json!({"kind": "capability", "scope": "b.rs", "literal": "L2"});
+
+        let plural = serde_json::json!({(cog_core::INPUT_CHANGE_IDENTITIES): [one, two]});
+        assert_eq!(
+            handover_identities(&plural),
+            vec![
+                ("criterion".into(), "a.rs".into(), "L1".into()),
+                ("capability".into(), "b.rs".into(), "L2".into()),
+            ],
+            "复数数组的每一行都要按顺序落成侧表的一行"
+        );
+
+        let single = serde_json::json!({(cog_core::INPUT_CHANGE_IDENTITY): {
+            "kind": "criterion", "scope": "a.rs", "literal": "L1"
+        }});
+        assert_eq!(
+            handover_identities(&single),
+            vec![("criterion".into(), "a.rs".into(), "L1".into())],
+            "只有老单数形状时也要落一行，不能读成没有交接"
+        );
+
+        assert!(handover_identities(&serde_json::json!({"goal": "x"})).is_empty());
+    }
 }

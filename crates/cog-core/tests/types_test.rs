@@ -74,3 +74,36 @@ fn test_task_creation() {
     assert_eq!(task.status, TaskStatus::Pending);
     assert_eq!(task.task_type, TaskType::Planner);
 }
+
+/// 执行器与调用方是分开升级的：新版执行器报得出树从哪来，旧版报不出。
+/// 这个字段缺席时事件仍要读得懂，读成「不知道」——调用方宁可少说一句，
+/// 也不能替执行器断言一棵刚切的树。
+#[test]
+fn a_workdir_event_from_an_executor_that_does_not_say_where_the_tree_came_from_still_reads() {
+    let old = serde_json::json!({"type": "workdir", "path": "/srv/workspaces/a"});
+    let event: cog_core::CommandEvent = serde_json::from_value(old).unwrap();
+    match event {
+        cog_core::CommandEvent::Workdir { path, origin } => {
+            assert_eq!(path, "/srv/workspaces/a");
+            assert_eq!(origin, cog_core::WorktreeOrigin::Unknown);
+        }
+        other => panic!("旧版执行器的首帧读不成工作目录：{other:?}"),
+    }
+}
+
+#[test]
+fn a_workdir_event_says_where_the_tree_came_from() {
+    let event = cog_core::CommandEvent::Workdir {
+        path: "/srv/workspaces/a".into(),
+        origin: cog_core::WorktreeOrigin::Warm,
+    };
+    let line = serde_json::to_string(&event).unwrap();
+    let back: cog_core::CommandEvent = serde_json::from_str(&line).unwrap();
+    match back {
+        cog_core::CommandEvent::Workdir { origin, .. } => {
+            assert_eq!(origin, cog_core::WorktreeOrigin::Warm)
+        }
+        other => panic!("读回来的不是工作目录事件：{other:?}"),
+    }
+    assert!(line.contains("\"warm\""), "线上写法是 lowercase：{line}");
+}

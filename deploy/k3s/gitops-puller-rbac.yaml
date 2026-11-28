@@ -38,7 +38,14 @@ rules:
   # tag —— 拿不到授权与"集群里确实还是浮动 tag"就再也分不出来了。
   - apiGroups: ["apps"]
     resources: ["deployments"]
-    resourceNames: ["cogneva", "cogneva-security-gateway", "cogneva-sandbox-executor", "cogneva-evolution"]
+    resourceNames: ["cogneva", "cogneva-security-gateway", "cogneva-evolution"]
+    verbs: ["get"]
+  # 执行器是 StatefulSet（每副副本一块自己的卷），所以它在那份名单里，但落在
+  # 另一个资源词上。授给 `deployments` 的那一条读不到它：同一组名词分属两个
+  # 资源集合，而读不到只会静默退回浮动 tag。
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    resourceNames: ["cogneva-sandbox-executor"]
     verbs: ["get"]
   # 金丝雀看护：readiness 与 restart count。
   - apiGroups: [""]
@@ -79,23 +86,17 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list"]
-  # 节点实际用量同样来自 metrics-server；没装时这条规则不会被用到。
-  - apiGroups: ["metrics.k8s.io"]
-    resources: ["nodes"]
-    verbs: ["get", "list"]
-  # Pod 与它们的实际用量，与上面同一条理由。
+  # Pod 与它们的实际用量。
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list"]
+  # 实际用量只来自 metrics-server；没装时这条规则不会被用到。不授 `nodes/proxy`：
+  # 曾经的后备经 apiserver 代理读 kubelet summary，那条路径要的正是它（不是
+  # `nodes/stats`，2026-11-19 实测只授 `nodes/stats` 时每读 403），而它连 exec
+  # 一起授权——所以删掉的是那条后备，不是放宽授权。
   - apiGroups: ["metrics.k8s.io"]
     resources: ["pods"]
     verbs: ["get", "list"]
-  # 没有 metrics-server 时的用量来源：kubelet 的 summary 接口经 apiserver 代理读，
-  # apiserver 把 `/stats/*` 映射到 `nodes/stats` 子资源。只读；不给 `nodes/proxy`，
-  # 那一项连 exec 一起授权。
-  - apiGroups: [""]
-    resources: ["nodes/stats"]
-    verbs: ["get"]
   # 资源面：命名空间配额与默认限额，只读。
   - apiGroups: [""]
     resources: ["resourcequotas", "limitranges"]

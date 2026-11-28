@@ -102,6 +102,20 @@ case "${out}" in
   *) fail "collapsed: 判词没说是人口塌了 —— ${out}" ;;
 esac
 
+# 两份 README 都不在（干净的检出，这两份文件不跟踪）⇒ 未判、退出 0：没有可判的
+# 东西，红会说「文档里的路径错了」，而文档根本不在。与上一条的「人口塌了」要分开：
+# 那条是文件在、认不出路径，这条是文件不在。
+absent="${work}/absent"
+mkdir -p "${absent}/deploy/scripts"
+cp "${checker}" "${absent}/deploy/scripts/check-readme-paths.sh"
+got=0
+out="$(cd "${absent}" && bash "${absent}/deploy/scripts/check-readme-paths.sh" 2>&1)" || got=$?
+[ "${got}" -eq 0 ] || fail "absent: exit ${got}, wanted 0 —— ${out}"
+case "${out}" in
+  *"未判"*) ;;
+  *) fail "absent: 判词没说是未判 —— ${out}" ;;
+esac
+
 # 调用方点名一份没有路径的文档 ⇒ 仍绿：那份文档里没有路径就是它今天的实情，
 # 门不该为了自己的下限去逼文档写路径。
 printf '# 简介\n\n没有反引号。\n' >"${work}/plain.md"
@@ -110,14 +124,27 @@ out="$(bash "${checker}" "${work}/plain.md" 2>&1)" || got=$?
 [ "${got}" -eq 0 ] || fail "plain_doc: exit ${got}, wanted 0 —— ${out}"
 
 # 真文件：仓库根的两份 README 今天必须绿——给文件与不给文件两条路都走一遍，
-# 后者走的就是带下限的那条。
-for f in "${repo}/README.md" "${repo}/README.zh-CN.md"; do
-  got=0
-  out="$(bash "${checker}" "${f}" 2>&1)" || got=$?
-  [ "${got}" -eq 0 ] || fail "$(basename "${f}") 里有死指针：${out}"
-done
+# 后者走的就是带下限的那条。干净的检出里这两份不跟踪，那就只剩「文件不在」这条路：
+# 真树要答未判、退出 0，与上面那个小树夹具同一个答案。
+if [ -f "${repo}/README.md" ] && [ -f "${repo}/README.zh-CN.md" ]; then
+  for f in "${repo}/README.md" "${repo}/README.zh-CN.md"; do
+    got=0
+    out="$(bash "${checker}" "${f}" 2>&1)" || got=$?
+    [ "${got}" -eq 0 ] || fail "$(basename "${f}") 里有死指针：${out}"
+  done
+fi
 got=0
 out="$(bash "${checker}" 2>&1)" || got=$?
 [ "${got}" -eq 0 ] || fail "no-arg run on the real tree: exit ${got} —— ${out}"
+if [ -f "${repo}/README.md" ] || [ -f "${repo}/README.zh-CN.md" ]; then
+  case "${out}" in
+    *"未判"*) fail "真树有 README 却答未判：${out}" ;;
+  esac
+else
+  case "${out}" in
+    *"未判"*) ;;
+    *) fail "真树没有 README 时没说未判：${out}" ;;
+  esac
+fi
 
 echo "readme-paths.test: all checks passed"

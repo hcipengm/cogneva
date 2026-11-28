@@ -129,6 +129,133 @@ impl QuotaManager for OpenQuota {
     }
 }
 
+/// 一个从不被问到的账本。
+///
+/// 有的读面要一对「账本 + 额度层级」，却只判其中一面（例如对话里的配额格子只
+/// 读层级）。把另一面交给这个替身，它每一条都 `unreachable!()`：一条落到账本上
+/// 的读会当场说出是哪一条，而不是悄悄答一个空值让人以为「那就是读数」。
+pub struct UnaskedLedger;
+
+#[async_trait::async_trait]
+impl cog_core::LlmUsageLedger for UnaskedLedger {
+    async fn record(&self, _: &cog_core::LlmUsageRecord) -> Result<String, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn record_exchange(&self, _: &cog_core::LlmExchangeRecord) -> Result<(), String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn upstream_window(
+        &self,
+        _: &str,
+        _: u64,
+    ) -> Result<cog_core::UpstreamWindowReading, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn burned_between(&self, _: &str, _: i64, _: i64) -> Result<u64, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn record_window(&self, _: &cog_core::StoredWindow) -> Result<(), String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn stored_window(
+        &self,
+        _: &str,
+        _: u64,
+    ) -> Result<Option<cog_core::StoredWindow>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn stored_windows(&self, _: &str) -> Result<Vec<cog_core::StoredWindow>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn spent_since(&self, _: &str, _: i64) -> Result<u64, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn spend_by_actor_since(
+        &self,
+        _: i64,
+    ) -> Result<(u64, std::collections::BTreeMap<String, u64>), String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn spend_by_upstream_and_actor(
+        &self,
+    ) -> Result<Vec<cog_core::UpstreamActorSpend>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn task_cost_quantile(&self, _: i64, _: f64) -> Result<Option<(u64, u64, i64)>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn task_has_started(&self, _: &str) -> Result<bool, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn spend_for_session(
+        &self,
+        _: &str,
+    ) -> Result<Option<cog_core::contract::usage_ledger::SessionSpend>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn spend_by_task(&self, _: &[String]) -> Result<Vec<(String, u64)>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn priced_spend_between(
+        &self,
+        _: chrono::DateTime<chrono::Utc>,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> Result<cog_core::PricedSpend, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn spend_by_person_since(&self, _: i64) -> Result<Vec<(String, u64)>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn spend_by_workspace_since(&self, _: i64) -> Result<Vec<(String, u64)>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn spend_by_task_since(
+        &self,
+        _: &[String],
+        _: i64,
+    ) -> Result<Vec<(String, u64)>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn task_attribution(&self, _: &str) -> Result<Option<cog_core::TaskAttribution>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn unattributed_between(
+        &self,
+        _: chrono::DateTime<chrono::Utc>,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn outcomes_between(
+        &self,
+        _: chrono::DateTime<chrono::Utc>,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<cog_core::contract::usage_ledger::OutcomeCount>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn metering_between(
+        &self,
+        _: chrono::DateTime<chrono::Utc>,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<cog_core::contract::usage_ledger::MeteringCount>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn skips_between(
+        &self,
+        _: chrono::DateTime<chrono::Utc>,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<cog_core::contract::usage_ledger::SkippedWorkLine>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn verdicts_between(
+        &self,
+        _: chrono::DateTime<chrono::Utc>,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<cog_core::contract::usage_ledger::SpendVerdictLine>, String> {
+        unreachable!("这一格不该被问到")
+    }
+}
+
 /// The gateway state the router is built over: every component either absent or
 /// a stand-in, and none of them touched by a request that only has to be routed.
 pub fn stateless() -> Arc<GatewayState> {
@@ -222,6 +349,122 @@ pub fn with_quota_stores(
     Arc::new(state)
 }
 
+/// The same state, with a transcript behind it.
+///
+/// The suites that judge who may read a conversation need `owner_of` to answer
+/// something other than "this deployment keeps no transcript": with no handle
+/// the read face answers an empty list, which is a truthful answer to a
+/// different question.
+pub fn with_chat_turns(turns: cog_gateway::ChatTurnHandle) -> Arc<GatewayState> {
+    // `GatewayState` is not `Debug`, so `expect` cannot report the handle it
+    // failed to take apart; the message is the whole diagnosis anyway.
+    let mut state = match Arc::try_unwrap(stateless()) {
+        Ok(state) => state,
+        Err(_) => panic!("the fixture just built it, so this is the only handle"),
+    };
+    state.chat_turns = turns;
+    Arc::new(state)
+}
+
+/// The same state with the two components the plugin upload route asks for.
+///
+/// Both are supplied because the route's answer depends on each in turn: the
+/// registry is where the bytes come from and the backend is what compiles them.
+/// A suite that wants to judge the refusal behind them has to give the route
+/// everything a deployed build gives it, or it would be judging the missing
+/// component instead.
+pub fn with_plugin_pipeline(
+    registry: Arc<dyn cog_core::PluginRegistry>,
+    backend: Arc<dyn cog_core::SandboxBackend>,
+) -> Arc<GatewayState> {
+    let mut state = match Arc::try_unwrap(stateless()) {
+        Ok(state) => state,
+        Err(_) => panic!("the fixture just built it, so this is the only handle"),
+    };
+    state.plugin_registry = Some(registry);
+    state.sandbox_backend = Some(backend);
+    Arc::new(state)
+}
+
+/// The same state with the session store the logout route acts on.
+///
+/// Supplied because the route's answer now depends on what that store said:
+/// without it the route answers through its "no store configured" branch, and
+/// a suite that wants to judge the destroy failure would be judging the missing
+/// component instead.
+pub fn with_session_manager(sm: Arc<dyn cog_core::SessionManager>) -> Arc<GatewayState> {
+    let mut state = match Arc::try_unwrap(stateless()) {
+        Ok(state) => state,
+        Err(_) => panic!("the fixture just built it, so this is the only handle"),
+    };
+    state.session_manager = Some(sm);
+    Arc::new(state)
+}
+
+/// The same state with the two components a learn-ingest route asks for: where
+/// the raw bytes and the derived entries are stored, and what extraction makes
+/// of a payload.
+///
+/// Both are supplied because the route's answer now depends on each in turn --
+/// the store decides what landed, the extractor decides what was asked to land.
+/// A suite that supplies only one would be judging the missing component.
+pub fn with_memory_pipeline(
+    backend: Arc<dyn cog_core::MemoryBackend>,
+    ingestor: Arc<dyn cog_core::MemoryIngestor>,
+) -> Arc<GatewayState> {
+    let mut state = match Arc::try_unwrap(stateless()) {
+        Ok(state) => state,
+        Err(_) => panic!("the fixture just built it, so this is the only handle"),
+    };
+    state.memory_backend = Some(backend);
+    state.memory_ingestor = Some(ingestor);
+    Arc::new(state)
+}
+
+/// The same state with the contribution control wired in.
+///
+/// Without one, every control-backed reading has no source at all; a suite that
+/// asks what the status screen says when the queue cannot be read has to give
+/// it a queue first.
+pub fn with_contribution_control(
+    control: Arc<dyn cog_core::ContributionControl>,
+) -> Arc<GatewayState> {
+    let mut state = match Arc::try_unwrap(stateless()) {
+        Ok(state) => state,
+        Err(_) => panic!("the fixture just built it, so this is the only handle"),
+    };
+    state.contribution_control = Some(control);
+    Arc::new(state)
+}
+
+/// The same state with the platform's own audit chain switched on.
+///
+/// Without one the routes append nothing and there is nothing to judge: a
+/// suite that asks what a route does when the chain refuses has to hand it a
+/// chain first.
+pub fn with_audit_stream(stream: Arc<dyn cog_core::AuditStream>) -> Arc<GatewayState> {
+    let mut state = match Arc::try_unwrap(stateless()) {
+        Ok(state) => state,
+        Err(_) => panic!("the fixture just built it, so this is the only handle"),
+    };
+    state.audit_stream = Some(stream);
+    Arc::new(state)
+}
+
+/// The same state, with action plans kept in `store` instead of a per-process
+/// map. The routes' answers are that store's answers, so this is what a suite
+/// supplies to judge them.
+pub fn with_action_plan_store(
+    store: cog_gateway::action_plan::ActionPlanStore,
+) -> Arc<GatewayState> {
+    let mut state = match Arc::try_unwrap(stateless()) {
+        Ok(state) => state,
+        Err(_) => panic!("the fixture just built it, so this is the only handle"),
+    };
+    state.action_plan_store = store;
+    Arc::new(state)
+}
+
 fn build(
     datasets: Option<Arc<dyn cog_storage::DatasetStore>>,
     message_backend: Option<Arc<dyn cog_core::MessageBackend>>,
@@ -236,6 +479,7 @@ fn build(
     let orchestrator = orchestrator::control("test-workspace");
 
     Arc::new(GatewayState {
+        llm_call_events: None,
         data_dir,
         config: std::sync::RwLock::new(GatewayConfig {
             http_port: 0,
@@ -244,15 +488,12 @@ fn build(
             cors_origins: vec!["*".into()],
             websocket_timeout_secs: 30,
             websocket_inactivity_timeout_secs: 90,
-            websocket_tick_secs: 5,
             notification_limit: 50,
-            sandbox_task_timeout_secs: 30,
             request_timeout_secs: 30,
             notification_webhook_url: None,
             ..Default::default()
         }),
         request_timeout_secs: std::sync::atomic::AtomicU64::new(30),
-        sandbox_task_timeout_secs: std::sync::atomic::AtomicU64::new(30),
         event_tx: broadcast::channel(16).0,
         evolution_stream: None,
         task_event_tx: broadcast::channel(16).0,
@@ -304,10 +545,15 @@ fn build(
         observables: Vec::new(),
         metrics_dimensions: Vec::new(),
         mcp_client: None,
+        mcp_call_counts: None,
         workspace_store: None,
         governance_store: None,
+        security_keys: None,
         principle_ledger: None,
         change_ledger: None,
+        intent_events: None,
+        employee_events: None,
+        message_events: None,
         key_value: None,
         external_skill_registry: None,
         tool_registry: None,
@@ -327,6 +573,7 @@ fn build(
         llm_client: std::sync::Arc::new(std::sync::RwLock::new(None)),
         chat_turns: None,
         conversation: Default::default(),
+        chat_stream: Default::default(),
         agent_messages,
         datasets,
     })

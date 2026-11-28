@@ -49,8 +49,14 @@ fn notification_migration() -> PathBuf {
             let name = path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            name.contains("notifications") && name.ends_with(".up.sql")
+                .unwrap_or(Default::default());
+            // 只认**建表**的那一份：后续迁移会改这张表（删列、加列），
+            // 它们描述的不是建表语句本身，拿它们跟内联 DDL 比是把两件事混成一件。
+            name.contains("notifications")
+                && name.ends_with(".up.sql")
+                && std::fs::read_to_string(path)
+                    .map(|text| text.to_ascii_lowercase().contains("create table"))
+                    .unwrap_or(false)
         })
         .collect();
     found.sort();
@@ -67,7 +73,46 @@ fn columns() -> Vec<(String, bool, bool)> {
     let path = notification_migration();
     let sql = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("{} is unreadable: {e}", path.display()));
-    column_definitions(&sql, &path.display().to_string())
+    let mut columns = column_definitions(&sql, &path.display().to_string());
+    // 建表之后还可能删列：迁移是一条时间线，跑完之后的形状才是库里的形状。
+    // 只读建表语句，会把「后来删掉的列」读成还该在。
+    let dropped = dropped_notification_columns();
+    columns.retain(|(name, _, _)| !dropped.contains(name));
+    columns
+}
+
+/// 所有 notifications 迁移里被 `DROP COLUMN` 掉的列。
+fn dropped_notification_columns() -> std::collections::BTreeSet<String> {
+    let dir = repo_root().join("crates/cog-storage/migrations/postgres");
+    let mut out = std::collections::BTreeSet::new();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(Default::default());
+        if !name.contains("notifications") || !name.ends_with(".up.sql") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for piece in text.to_ascii_lowercase().split("drop column ") {
+            let trimmed = piece.trim_start();
+            let after = trimmed.strip_prefix("if exists ").unwrap_or(trimmed);
+            let column = after
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .next()
+                .unwrap_or("");
+            if !column.is_empty() {
+                out.insert(column.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// Read the column list out of a `CREATE TABLE notifications` statement.

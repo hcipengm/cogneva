@@ -15,10 +15,9 @@
 #   2. 每个帧类型都要在 `crates/` 的生产代码里找到一次构造（`AgentEvent::变体 {`
 #      或 `(…`，同一行带 `=>` 的是 match 臂不算），位置按文件:行印出来给读的人核。
 #
-# 局限写在这里，读的人不必猜：测试区按「文件里第一处 `#[cfg(test)]` 到文件尾」认，
-# 这是这棵树里的写法；一条构造若藏在更早的 `#[cfg(feature = "…")]` 后面，这里仍算
-# 它是生产代码。判的是「有没有一端构造它」，不判它构造得对不对——后者归那个面
-# 自己的门禁。
+# 局限写在这里，读的人不必猜：测试区按**条目**认（`#[cfg(test)]` 抹掉紧跟它的那一个
+# 条目）；一条构造若藏在 `#[cfg(feature = "…")]` 后面，这里仍算它是生产代码。判的是
+# 「有没有一端构造它」，不判它构造得对不对——后者归那个面自己的门禁。
 #
 # 用法：bash deploy/scripts/check-live-frames-have-producers.sh [仓库根目录]
 set -euo pipefail
@@ -101,6 +100,44 @@ def brace_body(source, open_at):
 
 ARM_AFTER = re.compile(r"\s*=>")
 
+CFG_TEST = "#[cfg(test)]"
+
+def blank_at(source, start, end):
+    """把 [start, end) 抹成空白，换行留下——行号还是这个文件的行号。"""
+    out = list(source)
+    for i in range(start, end):
+        if out[i] != "\n":
+            out[i] = " "
+    return "".join(out)
+
+
+def production_of(source):
+    """文件里不属于 `#[cfg(test)]` 条目的那部分。
+
+    这一格曾经读成「第一处 `#[cfg(test)]` 到文件尾」，那条判据在**测试总在文件末尾**
+    的写法下成立，在别的写法下会让门悄悄失明：2026-11-11 一笔把测试专用的构造器放在
+    `new()` 旁边，于是 runtime.rs 里每一个事件的构造都落进了「测试区」，四个面被判成
+    「没有一个生产者」——生产代码一行没动，红的是判据。属性管的是**紧跟它的那一个条目**，
+    所以这里按条目抹，抹到它的右花括号（无花括号的条目抹到分号）为止。
+    """
+    out = source
+    pos = 0
+    while True:
+        at = out.find(CFG_TEST, pos)
+        if at < 0:
+            return out
+        item_at = at + len(CFG_TEST)
+        open_at = out.find("{", item_at)
+        semi_at = out.find(";", item_at)
+        if open_at < 0 or (0 <= semi_at < open_at):
+            end = semi_at + 1 if semi_at >= 0 else len(out)
+        else:
+            _, close = brace_body(out, open_at)
+            end = close + 1 if close > open_at else len(out)
+        out = blank_at(out, at, end)
+        pos = end
+
+
 constructor_cache = {}
 def producers(variant):
     if variant in constructor_cache:
@@ -118,9 +155,10 @@ def producers(variant):
             if rel.split(os.sep)[1:2] and rel.split(os.sep)[2] in ("tests", "benches", "examples"):
                 continue
             source = open(path, encoding="utf-8", errors="ignore").read()
-            # 测试区：这棵树里测试总在文件末尾，`#[cfg(test)]` 之后的一切不算生产代码。
-            test_at = source.find("#[cfg(test)]")
-            production = source if test_at < 0 else source[:test_at]
+            # 测试区按**条目**认：`#[cfg(test)]` 管的是紧跟它的那一个条目，不是文件余下
+            # 全部。按「到文件尾」认时，一个测试专用的小构造器放在文件前部就足以让这门
+            # 对下面所有事件的构造失明（`production_of` 的 doc 里写着那一次）。
+            production = production_of(source)
             for m in pattern.finditer(production):
                 body, close = brace_body(production, m.end() - 1)
                 if body is None:

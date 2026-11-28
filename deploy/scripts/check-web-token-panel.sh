@@ -519,13 +519,45 @@ def strip_comments(src):
     return re.sub(r"(?m)//.*$", "", re.sub(r"/\*.*?\*/", "", src, flags=re.S))
 
 
+def escaped(src, at):
+    """`src[at]` 前面有奇数个反斜杠时，它是被转义的引号。"""
+    n, i = 0, at - 1
+    while i >= 0 and src[i] == "\\":
+        n, i = n + 1, i - 1
+    return n % 2 == 1
+
+
 def tag_at(src, at):
-    """`title=` 所在的那个标签名；回退不到 `<`（或中间隔着别的标签）就当不是属性。"""
-    lt = src.rfind("<", 0, at)
-    if lt < 0 or ">" in src[lt:at]:
-        return None
-    m = re.match(r"<\s*([A-Za-z][\w.-]*)", src[lt:])
-    return m.group(1) if m else None
+    """`title=` 所在的那个标签名；回退不到 `<`（或中间隔着别的标签）就当不是属性。
+
+    标签内部可以带表达式和带引号的属性值：`onClick={() => …}` 里的 `>` 是箭头，
+    `className="a>b"` 里的 `>` 在引号里——两者都不是标签的结束。只认「`<` 与
+    `title=` 之间没有 `>`」的话，任何前置的箭头函数都会把这一处 `title=` 判成
+    「不是属性」而放过它，于是原生提示框可以借着 `onClick` 回到 DOM 元素上。
+    所以按结构回退：花括号配平、引号内一律跳过，只有最外层遇到的 `>` 才算跨过了
+    另一个标签。
+    """
+    depth, quote, i = 0, None, at - 1
+    while i >= 0:
+        c = src[i]
+        if quote is not None:
+            if c == quote and not escaped(src, i):
+                quote = None
+        elif c in "\"'`":
+            quote = c
+        elif c == "}":
+            depth += 1
+        elif c == "{":
+            if depth == 0:
+                return None
+            depth -= 1
+        elif depth == 0 and c == ">":
+            return None
+        elif depth == 0 and c == "<":
+            m = re.match(r"<\s*([A-Za-z][\w.-]*)", src[i:])
+            return m.group(1) if m else None
+        i -= 1
+    return None
 
 
 stray = []

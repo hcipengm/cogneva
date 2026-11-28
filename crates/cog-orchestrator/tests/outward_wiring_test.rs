@@ -100,6 +100,11 @@ fn the_plugin_registers_the_loop_and_publishes_its_readings() {
         "nothing starts the outward loop, so the module is a library no process calls"
     );
     assert!(
+        plugin.contains("consume_service::<dyn cog_core::EventStore>()"),
+        "the loop is started without the intent desk: what it finds reaches the goal \
+         path but not the one entry the rest of the platform reads"
+    );
+    assert!(
         plugin.contains("OutwardCensus::new()"),
         "the readings are never published: the configuration cell is what tells \
          'not configured' apart from 'configured and found nothing'"

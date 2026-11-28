@@ -129,7 +129,7 @@ impl AgentRegistry for EtcdAgentRegistry {
         };
         let mut client = self.client.lock().await;
         if let Some(id) = lease_id {
-            let _ = client.lease_revoke(id).await;
+            cog_core::ignore_lost!(client.lease_revoke(id).await);
         }
         let _ = client
             .delete(Self::key(agent_id), None)
@@ -181,13 +181,5 @@ impl AgentRegistry for EtcdAgentRegistry {
     async fn list_by_role(&self, role: &str) -> SFResult<Vec<AgentRegistration>> {
         let all = self.list().await?;
         Ok(all.into_iter().filter(|r| r.role == role).collect())
-    }
-
-    async fn list_by_capability(&self, capability: &str) -> SFResult<Vec<AgentRegistration>> {
-        let all = self.list().await?;
-        Ok(all
-            .into_iter()
-            .filter(|r| r.capabilities.contains(&capability.to_string()))
-            .collect())
     }
 }

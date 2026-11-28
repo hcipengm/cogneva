@@ -11,10 +11,16 @@
 # 两边是同一批字节：改一处，两边同时改。
 #
 # 三段的判据各自不同，所以各自报，最后合成一个退出码：
-#   0  三段都跑了且都绿
+#   0  三段都跑了且都绿（脚本测试里退 4 的格子除外，见下）
 #   1  有东西红了（先报红，因为红是可以动手的那一种）
 #   2  有东西没跑成（缺工具／缺库），红绿都还不知道——这是全树的约定：跑不了
 #      不是跳过，也不是通过
+#
+# 脚本测试的一条自己退 4，是它在说「这一格只在平台宿主上判」（现网配额那一格要
+# 真的集群）。这与退 1「判了，红了」、退 2「这里该判却没跑成」都不是一回事：它
+# 换台机器就有答案，拦在这里只会让每一次推送都红在一条与改动无关的读数上。退 4
+# 的格子点名记进「没在这台机器上判」的面，不拦；没点名就等于说它绿了。
+# `check-before-push.sh` 对同一批格子是同一处置，两处靠这个退出码对齐。
 #
 # 依赖：shellcheck、git、bash；脚本测试还要 psql、helm、kubectl、python3+PyYAML、
 # promtool；PowerShell 那一步还要 pwsh。缺哪一个就点名哪一个，不静默少跑。
@@ -33,6 +39,9 @@ ran=()
 # 注释「看不了 ≠ 一致」）。跑下去报出来的会是一条与这次改动无关的红，而这条读数比
 # 「没跑」更糟——它会把一次真实的缺陷藏在一片假红后面。
 tests_unavailable=()
+# 退 4 的格子：判词是「这一格只在平台宿主上判」。记下来点名，别让「三段都通过」
+# 读成「每一格都判过」。
+not_judged_here=()
 
 need() {
     command -v "$1" >/dev/null 2>&1 || unavailable+=("$1")
@@ -98,7 +107,19 @@ elif command -v bash >/dev/null 2>&1; then
         # 的人拿得到，注解是任何人都能通过 API 取的。不带正文时，外面看到的只是一句
         # exit 1，判不了这条红是「规则写错了」还是「这台机器没有 promtool」。
         log="$(mktemp)"
-        if ! bash "${t}" >"${log}" 2>&1; then
+        status=0
+        bash "${t}" >"${log}" 2>&1 || status=$?
+        if [ "${status}" -eq 4 ]; then
+            # 格子自己说的「这一格只在平台宿主上判」：把它的判词原样带上来，点名记进
+            # 没在这台机器上判的面，跑下一条。它不是红，也不是这条测试在缺工具时
+            # 故意红的那一形（那一形退 1，仍由下面报红）。
+            cat "${log}"
+            printf 'SKIP  %s：这一格只在平台宿主上判（判词见上一行）\n' "${t}"
+            not_judged_here+=("${t}")
+            rm -f "${log}"
+            continue
+        fi
+        if [ "${status}" -ne 0 ]; then
             cat "${log}"
             echo "--> ${t}:1:1: failed"
             while IFS= read -r line; do
@@ -125,6 +146,10 @@ if command -v pwsh >/dev/null 2>&1; then
     ran+=("bootstrap.ps1 parse")
 fi
 
+if [ "${#not_judged_here[@]}" -gt 0 ]; then
+    printf '\ncheck-entry-scripts: 没在这台机器上判（退 4，去平台宿主上判）：%s\n' "${not_judged_here[*]}" >&2
+fi
+
 if [ "${#unavailable[@]}" -gt 0 ]; then
     if [ "${#ran[@]}" -gt 0 ]; then
         printf '\ncheck-entry-scripts: 跑了且绿：%s\n' "${ran[*]}" >&2
@@ -135,4 +160,8 @@ if [ "${#unavailable[@]}" -gt 0 ]; then
     exit 2
 fi
 
-printf '\ncheck-entry-scripts: shellcheck、脚本测试、bootstrap.ps1 三段都通过\n'
+if [ "${#not_judged_here[@]}" -gt 0 ]; then
+    printf '\ncheck-entry-scripts: shellcheck、脚本测试、bootstrap.ps1 三段都通过；上面点名的格子没在这台机器上判\n'
+else
+    printf '\ncheck-entry-scripts: shellcheck、脚本测试、bootstrap.ps1 三段都通过\n'
+fi

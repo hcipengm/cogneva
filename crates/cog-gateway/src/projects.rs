@@ -148,7 +148,7 @@ pub async fn export_csv_handler(
     axum::extract::Query(q): axum::extract::Query<ExportQuery>,
 ) -> Result<axum::response::Response, ApiError> {
     let claims = claims.as_ref().map(|Extension(c)| c);
-    let tasks = visible_tasks(&state, claims).await;
+    let tasks = visible_tasks(&state, claims).await?;
     let rows = tasks_of_project(&tasks, &id);
     if rows.is_empty() && id != UNGROUPED {
         return Err(ApiError::not_found(format!("project {id}")));
@@ -311,9 +311,11 @@ pub struct ListProjectsQuery {
     pub cursor: Option<usize>,
 }
 
-// cap: bound — 不传 `limit` 时一页返回多少个项目。与 `PROJECTS_PAGE_MAX` 成对：默认值小到一屏能读完，大请求才要显式说要。
+// cap: fixed — 不传 `limit` 时一页返回多少个项目。与 `PROJECTS_PAGE_MAX` 成对：默认值小到一屏能读完，大请求才要显式说要。
+// keep: 删掉后回到「不传 `limit` 时一页返回多少个项目。与 `PROJECTS_PAGE_MAX` 成对：默认值小到一屏能读完，大请求才要显式说要。」所描述的情形；由这条约定兜住
 const PROJECTS_PAGE_DEFAULT: usize = 200;
-// cap: bound — 一页的上限。存在的理由是拒绝比静默截断更便宜：读全量要带游标一页页走，而不是把 `limit` 调成一百万让这一次请求把整张图读进内存。
+// cap: fixed — 一页的上限。存在的理由是拒绝比静默截断更便宜：读全量要带游标一页页走，而不是把 `limit` 调成一百万让这一次请求把整张图读进内存。
+// keep: 删掉后一次请求把整张图读进内存，读全量的人本该带游标一页页走；由「拒绝比静默截断更便宜」兜住
 const PROJECTS_PAGE_MAX: usize = 1000;
 
 /// 每列最多带回多少张卡片。
@@ -321,7 +323,9 @@ const PROJECTS_PAGE_MAX: usize = 1000;
 /// 看板是给人挪的，不是给人数的：只回计数的话，界面画得出六列数字，画不出任何一张
 /// 能拖的卡，而「这一列有 37 个」在客户眼里等于「我不知道里面是什么」。上限之外
 /// 的张数由 `cards_hidden` 如实报出来——静默截断会让一列看起来正好装得下。
-// cap: bound — 一列最多画多少张卡；超出的张数由 cards_hidden 如实报出来，不静默截断
+// cap: fixed — 一列最多画多少张卡；超出的张数由 cards_hidden 如实报出来，不静默截断
+// keep: 删掉后回到「一列最多画多少张卡；超出的张数由 cards_hidden 如实报出来，不静默截断」所描述的情形；由这条约定兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const BOARD_CARDS_PER_COLUMN: usize = 100;
 
 /// 看板上的一张卡片。
@@ -603,14 +607,22 @@ fn now_source(reader: &'static str) -> Source {
 
 /// 取读者能看到的全部任务。可见性判定与任务面同一个函数——项目面不该有自己
 /// 一套隔离规则，两套规则迟早会不一致，而不一致的那一天，一边会漏读。
-async fn visible_tasks(state: &Arc<GatewayState>, claims: Option<&cog_core::Claims>) -> Vec<Task> {
-    state
-        .orchestrator
-        .get_all_tasks()
-        .await
+///
+/// 读不出来的那一页留成 503，不折成空表：这一面下面每一条读（列表、看板、甘特、
+/// 挣值、WBS、审计、CSV）都按「有几条」作答，折出来的空表会让整个部署的项目面
+/// 报成「一个项目都没有」，而导出还会把它写成一份看起来完整、实则空白的表。
+async fn visible_tasks(
+    state: &Arc<GatewayState>,
+    claims: Option<&cog_core::Claims>,
+) -> Result<Vec<Task>, ApiError> {
+    let rows = crate::tasks::task_rows_from_reading(
+        state.orchestrator.get_all_tasks_checked().await,
+        "project task list",
+    )?;
+    Ok(rows
         .into_iter()
         .filter(|t| visible_to_claims(claims, t))
-        .collect()
+        .collect())
 }
 
 /// 读这个部署里的全部计划基线，读不到时返回 `None` 而不是空表。
@@ -642,7 +654,9 @@ pub(crate) fn task_title(task: &Task) -> String {
         if let Some(v) = task.input.get(key).and_then(|v| v.as_str()) {
             let v = v.trim();
             if !v.is_empty() {
-                return v.chars().take(120).collect();
+                // 展示面手里就是全文，按「有损默认无损」整段交出去；
+                // 版面宽度交给渲染侧（CSS/换行），不在这里切。
+                return v.to_string();
             }
         }
     }
@@ -741,7 +755,7 @@ pub async fn list_projects_handler(
     axum::extract::Query(page): axum::extract::Query<ListProjectsQuery>,
 ) -> Result<Json<ProjectsResponse>, ApiError> {
     let claims = claims.as_ref().map(|Extension(c)| c);
-    let tasks = visible_tasks(&state, claims).await;
+    let tasks = visible_tasks(&state, claims).await?;
     let total_tasks = tasks.len();
     let plans = readable_plans(&state.orchestrator).await;
 
@@ -871,7 +885,7 @@ pub async fn project_board_handler(
     Path(id): Path<String>,
 ) -> Result<Json<BoardResponse>, ApiError> {
     let claims = claims.as_ref().map(|Extension(c)| c);
-    let tasks = visible_tasks(&state, claims).await;
+    let tasks = visible_tasks(&state, claims).await?;
     let rows = tasks_of_project(&tasks, &id);
 
     // 项目不存在与项目为空是两件事：前者是路径写错了，后者是这个 goal 还没
@@ -911,7 +925,7 @@ pub async fn project_gantt_handler(
     Path(id): Path<String>,
 ) -> Result<Json<GanttResponse>, ApiError> {
     let claims = claims.as_ref().map(|Extension(c)| c);
-    let tasks = visible_tasks(&state, claims).await;
+    let tasks = visible_tasks(&state, claims).await?;
     let rows = tasks_of_project(&tasks, &id);
 
     if rows.is_empty() && id != UNGROUPED {
@@ -929,7 +943,7 @@ pub async fn project_evm_handler(
     Path(id): Path<String>,
 ) -> Result<Json<EvmResponse>, ApiError> {
     let claims = claims.as_ref().map(|Extension(c)| c);
-    let tasks = visible_tasks(&state, claims).await;
+    let tasks = visible_tasks(&state, claims).await?;
     let rows = tasks_of_project(&tasks, &id);
 
     if rows.is_empty() && id != UNGROUPED {
@@ -1391,7 +1405,8 @@ pub struct WbsResponse {
 ///
 /// 真实的分解深度个位数；一个四千层的链只可能来自坏数据或有人手工造环，那时
 /// 递归会把网关的栈打穿——而栈溢出不是一个能被 `Result` 接住的错误。
-// cap: bound — 递归分解的深度上限；坏数据或手工造环会把网关的栈打穿，而栈溢出不是 Result 能接住的
+// cap: fixed — 递归分解的深度上限；坏数据或手工造环会把网关的栈打穿，而栈溢出不是 Result 能接住的
+// keep: 删掉后坏数据或手工造环把网关的栈打穿，栈溢出不是 Result 能接住的；由「递归分解的深度上限」兜住
 const WBS_DEPTH_CAP: usize = 256;
 
 /// 把一批任务折成一棵范围树。
@@ -1490,7 +1505,7 @@ pub async fn project_wbs_handler(
     Path(id): Path<String>,
 ) -> Result<Json<WbsResponse>, ApiError> {
     let claims = claims.as_ref().map(|Extension(c)| c);
-    let tasks = visible_tasks(&state, claims).await;
+    let tasks = visible_tasks(&state, claims).await?;
     let rows = tasks_of_project(&tasks, &id);
     if rows.is_empty() && id != UNGROUPED {
         return Err(ApiError::not_found(format!("project {id}")));
@@ -1519,7 +1534,7 @@ pub async fn project_audit_handler(
     let claims = claims.as_ref().map(|Extension(c)| c);
     // 看不到的项目不给时间线：告诉一个租户「这个项目存在但你没权限」，
     // 与告诉它「不存在」是不同的信息泄漏。
-    let tasks = visible_tasks(&state, claims).await;
+    let tasks = visible_tasks(&state, claims).await?;
     if tasks_of_project(&tasks, &id).is_empty() && id != UNGROUPED {
         return Err(ApiError::not_found(format!("project {id}")));
     }
@@ -1621,15 +1636,15 @@ pub async fn create_project_handler(
     if let Some(c) = claims {
         if !c.workspace_ids.is_empty() && !c.workspace_ids.contains(&workspace) {
             if let Some(ref stream) = state.audit_stream {
-                let _ = stream
-                    .append(
-                        cog_core::AuditKind::Authz,
-                        &c.sub,
-                        &workspace,
-                        "authz.workspace_denied",
-                        serde_json::json!({ "intent": "project.create" }),
-                    )
-                    .await;
+                crate::audit::append_or_warn(
+                    stream,
+                    cog_core::AuditKind::Authz,
+                    &c.sub,
+                    &workspace,
+                    "authz.workspace_denied",
+                    serde_json::json!({ "intent": "project.create" }),
+                )
+                .await;
             }
             return Err(ApiError::forbidden(format!(
                 "workspace '{workspace}' is outside your workspace scope"
@@ -1643,15 +1658,15 @@ pub async fn create_project_handler(
     state.orchestrator.add_task(root).await?;
 
     if let Some(ref stream) = state.audit_stream {
-        let _ = stream
-            .append(
-                cog_core::AuditKind::Custom("project".into()),
-                claims.map(|c| c.sub.as_str()).unwrap_or("system"),
-                &project_id,
-                "project.created",
-                serde_json::json!({ "name": name, "workspace_id": workspace }),
-            )
-            .await;
+        crate::audit::append_or_warn(
+            stream,
+            cog_core::AuditKind::Custom("project".into()),
+            claims.map(|c| c.sub.as_str()).unwrap_or("system"),
+            &project_id,
+            "project.created",
+            serde_json::json!({ "name": name, "workspace_id": workspace }),
+        )
+        .await;
     }
     crate::project_audit::record(cog_core::AuditEntry {
         actor: claims
@@ -1872,7 +1887,8 @@ pub(crate) fn build_project_task(
 
 /// 标题的上限。超了拒绝而不是截断：截断之后存下来的就不是用户写的那个名字，
 /// 而界面上没有任何地方会说它被改过。
-// cap: bound — 标题上限；超了拒绝而不是截断——截断之后存下的就不是用户写的那个名字
+// cap: fixed — 标题上限；超了拒绝而不是截断——截断之后存下的就不是用户写的那个名字
+// not-a-bound: 标题上限；超了拒绝而不是截断——截断之后存下的就不是用户写的那个名字
 pub(crate) const MAX_TITLE_CHARS: usize = 200;
 
 pub async fn create_project_task_handler(
@@ -1895,7 +1911,7 @@ pub async fn create_project_task_handler(
         )));
     }
 
-    let tasks = visible_tasks(&state, claims).await;
+    let tasks = visible_tasks(&state, claims).await?;
     let rows = tasks_of_project(&tasks, &id);
     if rows.is_empty() && id != UNGROUPED {
         return Err(ApiError::not_found(format!("project {id}")));
@@ -1910,15 +1926,15 @@ pub async fn create_project_task_handler(
     if let Some(c) = claims {
         if !c.workspace_ids.is_empty() && !c.workspace_ids.contains(&workspace) {
             if let Some(ref stream) = state.audit_stream {
-                let _ = stream
-                    .append(
-                        cog_core::AuditKind::Authz,
-                        &c.sub,
-                        &workspace,
-                        "authz.workspace_denied",
-                        serde_json::json!({ "project_id": id }),
-                    )
-                    .await;
+                crate::audit::append_or_warn(
+                    stream,
+                    cog_core::AuditKind::Authz,
+                    &c.sub,
+                    &workspace,
+                    "authz.workspace_denied",
+                    serde_json::json!({ "project_id": id }),
+                )
+                .await;
             }
             return Err(ApiError::forbidden(format!(
                 "workspace '{workspace}' is outside your workspace scope"
@@ -1934,20 +1950,20 @@ pub async fn create_project_task_handler(
     // 写下来就要查得到「谁在什么时候把这片活放进了哪棵树」。审计流是这一面
     // 唯一不会被后续写覆盖的地方。
     if let Some(ref stream) = state.audit_stream {
-        let _ = stream
-            .append(
-                cog_core::AuditKind::Custom("project_task".into()),
-                claims.map(|c| c.sub.as_str()).unwrap_or("system"),
-                &task_id,
-                "project.task_created",
-                serde_json::json!({
-                    "project_id": id,
-                    "parent_task_id": parent,
-                    "workspace_id": workspace,
-                    "title": title,
-                }),
-            )
-            .await;
+        crate::audit::append_or_warn(
+            stream,
+            cog_core::AuditKind::Custom("project_task".into()),
+            claims.map(|c| c.sub.as_str()).unwrap_or("system"),
+            &task_id,
+            "project.task_created",
+            serde_json::json!({
+                "project_id": id,
+                "parent_task_id": parent,
+                "workspace_id": workspace,
+                "title": title,
+            }),
+        )
+        .await;
     }
     crate::project_audit::record(cog_core::AuditEntry {
         actor: claims

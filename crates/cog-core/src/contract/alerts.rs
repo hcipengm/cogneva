@@ -153,11 +153,16 @@ fn default_true() -> bool {
     true
 }
 
+/// 邮件提交口：RFC 6409 给提交（而非中继）定的约定端口。
+// cap: fixed — RFC 6409 提交端口 587
+// keep: 删掉后提交端不知道连哪个口，告警发不出去；由「RFC 6409 提交端口」兜住
+pub const SMTP_SUBMISSION_PORT: u16 = 587;
+
 impl Default for SmtpConfig {
     fn default() -> Self {
         Self {
             host: "localhost".into(),
-            port: 587,
+            port: SMTP_SUBMISSION_PORT,
             username: None,
             password: None,
             from_address: "alerts@cogneva.local".into(),
@@ -443,8 +448,35 @@ pub struct PersistentAlertDraft {
 /// happened again.
 pub const ALERT_FACE_LABEL: &str = "cogneva_io_face";
 
+/// Rule names of the self-alerts whose subject is the observing side itself.
+///
+/// Both kinds report through the same alert table as any other fault, which is
+/// what makes them reachable at all: the reader that turns firing rows into
+/// work has one door. But they are not faults of the system being watched —
+/// they say a reading could not be taken, or that the configuration in force is
+/// not the one deployed — and a fixer told "investigate the root cause of this
+/// alert" goes to look at the system, which is exactly the thing nobody could
+/// see while the row was firing.
+///
+/// So the consumer names them, and the naming has to agree with the writers on
+/// the first character: the row carries only this string, and a reader that
+/// spells it slightly differently files the work as an ordinary fault without
+/// anything going red. Same reason, same home as [`ALERT_FACE_LABEL`]: the
+/// writer is in `cog-observability`, the reader in `cog-reflection`, and they
+/// do not share a crate.
+pub const EVAL_FAILURE_RULE: &str = "infra_watch_eval_failure";
+
+/// The document this process runs is not the one its revision declares; see
+/// [`EVAL_FAILURE_RULE`].
+pub const CONFIG_DECLARATION_RULE: &str = "config_declaration_mismatch";
+
+/// The rule set this process holds is not the one on disk; see
+/// [`EVAL_FAILURE_RULE`].
+pub const CONFIG_RULES_NOT_LOADED_RULE: &str = "config_rules_not_loaded";
+
 /// Longest an alert label value may be before it is truncated.
-// cap: bound — 告警标签值在被截之前最长能有多长；再长的部分读者认不出是同一件事
+// cap: fixed — 告警标签值在被截之前最长能有多长；再长的部分读者认不出是同一件事
+// keep: 删掉后标签值无上界，再长的部分读者也认不出是同一件事；由「被截之前最长能有多长」兜住
 pub const ALERT_LABEL_VALUE_MAX_CHARS: usize = 1024;
 
 /// Truncate on a character boundary and mark that it happened.
@@ -473,7 +505,7 @@ pub fn bounded_task_goal(input: Option<&serde_json::Value>, max_chars: usize) ->
     let text = input
         .and_then(|v| v.get("goal"))
         .and_then(|g| g.as_str())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     clamp_label_text(text, max_chars)
 }
 

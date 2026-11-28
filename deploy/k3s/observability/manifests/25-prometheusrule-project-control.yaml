@@ -1,13 +1,16 @@
+# census-keep: shapes=deploy-numbers — 部署清单里的数是部署自己的声明：它写在生效的那一处，改它只改这一次部署，不是代码里看不见的默认；由部署面本身兜住
 # 覆盖率量不出来时的判据。
 #
 # 为什么需要：`cogneva_project_control_unmeasured_total` 早在 `/metrics` 上，但它此前
 # 一条规则也没有——读数存在、消费者不存在，于是「这一轮量不了」与「一切正常」在告警面上
 # 同形。面板不是消费者：没有人会因为一块面板变色去修东西。
 #
-# 只剩一格 `no_baseline`：计划基线表整张读不出来，这一轮五格覆盖率里有三格的分母都算
-# 不了。修的是 `task_plan` 那条读路。这条回路原来的另外两格（`no_ledger`、
-# `cost_unreadable`）随成本指数一起去掉了——token 账读不到只影响成本绩效，而成本绩效
-# 不再有任何读者。
+# 两格原因各一条规则：`no_baseline` 是计划基线表整张读不出来，这一轮五格覆盖率里有三
+# 格的分母都算不了，修的是 `task_plan` 那条读路；`no_tasks` 是任务图读不出来，五格的
+# 分母全部落在这一读上，修的是图那条读路。两条不压成一条：修法不同，而把两件事收进
+# 一个名字之后，读数面上的 `reading` 标签就白留了。这条回路原来的另外两格
+# （`no_ledger`、`cost_unreadable`）随成本指数一起去掉了——token 账读不到只影响成本
+# 绩效，而成本绩效不再有任何读者。
 #
 # 界取 6 小时窗的 `increase`，不是「计数器非零」：这条回路的间隔是 600 秒，一次失败在
 # 6 小时窗里留一条，窗口滚过去自己灭掉；一直失败就一直亮——那正是要的。反过来按
@@ -45,3 +48,14 @@ spec:
           annotations:
             summary: "覆盖率这一轮没能量：6 小时里有 {{ $value }} 轮计划基线读不出来"
             description: "`cogneva_project_control_unmeasured_total{reading=\"no_baseline\"}` 在动，意思是计划基线表整张读不出来，这一轮五格覆盖率里有三格的分母一个都算不了。它不是「覆盖率是零」——那一轮根本没有读数。修的是 `task_plan` 那条读路。判据是这一格不再增长，不是这条红消失。"
+        - alert: CognevaProjectCoverageTaskGraphUnreadable
+          expr: |
+            sum(increase(cogneva_project_control_unmeasured_total{reading="no_tasks"}[6h])) > 0
+          for: 10m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "任务管理"
+            severity: warning
+          annotations:
+            summary: "覆盖率这一轮没能量：6 小时里有 {{ $value }} 轮任务图读不出来"
+            description: "`cogneva_project_control_unmeasured_total{reading=\"no_tasks\"}` 在动，意思是任务图整张读不出来，而五格覆盖率的分母全部来自这一读，所以那一轮一行也没量。它不是「覆盖率是零」——那一轮根本没有读数。修的是任务图那条读路，不是 `task_plan`（那是 `no_baseline` 那条）。判据是这一格不再增长，不是这条红消失。"

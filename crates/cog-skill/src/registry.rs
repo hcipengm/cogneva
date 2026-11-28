@@ -46,7 +46,7 @@ impl Default for SkillConfig {
     fn default() -> Self {
         Self {
             directories: skill_directories(),
-            hot_reload_interval_secs: 30,
+            hot_reload_interval_secs: cog_core::config::SKILL_HOT_RELOAD_INTERVAL_SECS,
         }
     }
 }
@@ -484,7 +484,7 @@ impl ExternalSkillRegistry for SkillRegistryImpl {
             return Err(cog_core::SFError::Agent(format!(
                 "HTTP download failed: {} {}",
                 response.status(),
-                response.text().await.unwrap_or_default()
+                cog_core::logged_default!(response.text().await)
             )));
         }
 
@@ -525,7 +525,7 @@ impl ExternalSkillRegistry for SkillRegistryImpl {
                         stderr
                     )));
                 }
-                let _ = tokio::fs::remove_file(&zip_path).await;
+                cog_core::ignore_lost!(tokio::fs::remove_file(&zip_path).await);
             }
             "gz" | "tgz" => {
                 let tar_path = dest_dir.join(format!("{}.tar.gz", basename));
@@ -549,7 +549,7 @@ impl ExternalSkillRegistry for SkillRegistryImpl {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     return Err(cog_core::SFError::Agent(format!("tar failed: {}", stderr)));
                 }
-                let _ = tokio::fs::remove_file(&tar_path).await;
+                cog_core::ignore_lost!(tokio::fs::remove_file(&tar_path).await);
             }
             _ => {
                 // Treat as raw SKILL.md

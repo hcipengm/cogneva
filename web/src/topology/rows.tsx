@@ -1,6 +1,6 @@
 import type { TopologyContainer, TopologyEvent, TopologyVolume } from '@/api/client';
 import { Note } from '@/ui/Note';
-import { formatBytes, formatCpu, percentOf } from '@/topology/format';
+import { formatBytes, formatCpu, formatUsedBytes, percentOf } from '@/topology/format';
 
 /**
  * 拓扑最底下那三行：容器、卷、事件。
@@ -84,11 +84,11 @@ export function ContainerRow({
             <>
               <dt className="text-[var(--muted)]">实际用量</dt>
               <dd className="mono text-[var(--paper-dim)]">
-                {formatCpu(container.cpu_used_millicores)} · {formatBytes(container.memory_used_bytes ?? 0)}
-                {container.memory_limit_bytes != null && (
+                {formatCpu(container.cpu_used_millicores)} · {formatUsedBytes(container.memory_used_bytes)}
+                {container.memory_used_bytes != null && container.memory_limit_bytes != null && (
                   <span className="text-[var(--muted)]">
                     {' '}
-                    （占上限 {percentOf(container.memory_used_bytes ?? 0, container.memory_limit_bytes)}）
+                    （占上限 {percentOf(container.memory_used_bytes, container.memory_limit_bytes)}）
                   </span>
                 )}
               </dd>

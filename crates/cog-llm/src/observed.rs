@@ -14,7 +14,8 @@ use crate::observable::{global_observable, CallFailure, LlmObservable};
 /// 这层是旁路：它要把事件原样交给下游，又只有把流读到底才知道这一跳的结果，
 /// 所以只能自己再起一跳。容量取与路由层相同的大小——观测不该成为新的瓶颈，
 /// 下游读得慢时压力先落在路由那一跳上，与没有这层时一致。
-// cap: derived — 路由那一跳的容量本身；两处相等是这条旁路不成为新瓶颈的全部理由
+// cap: fixed — 路由那一跳的容量本身；两处相等是这条旁路不成为新瓶颈的全部理由
+// keep: 删掉后旁路成为新瓶颈，路由那一跳的背压不再先落在它身上；由「两处相等」兜住
 const FORWARD_CAPACITY: usize = crate::routing::ROUTING_STREAM_CAPACITY;
 
 pub struct ObservedLlmClient {
@@ -64,6 +65,118 @@ fn is_content_delta(event: &AssistantMessageEvent) -> bool {
 ///
 /// 非流式收尾和转发流读到底后的收尾是同一笔账，挂在同一个入口上，
 /// 两条路径才不会各写各的、把同一次调用数出两个结果。
+/// 这一发调用是谁花的：任务、人、入口、会话、模型。全部来自请求头——调用点
+/// 把它们盖在头上，送别处（代理）与记在这里读的是同一组值。
+#[derive(Debug, Default, Clone)]
+struct CallContext {
+    actor: String,
+    origin: String,
+    owner: String,
+    session: String,
+    task: String,
+    model: String,
+}
+
+fn call_context(options: &ChatOptions) -> CallContext {
+    let get = |name: &str| options.headers.get(name).cloned().unwrap_or_default();
+    CallContext {
+        actor: get(cog_core::LLM_ACTOR_HEADER),
+        origin: get(cog_core::LLM_ORIGIN_HEADER),
+        owner: get(cog_core::LLM_OWNER_HEADER),
+        session: get(cog_core::LLM_SESSION_HEADER),
+        task: get(cog_core::LLM_TASK_HEADER),
+        model: options.model.clone().unwrap_or_default(),
+    }
+}
+
+/// 把这一发的事实写成事件流上的一行（成功才写；失败那一面由 `record_error` 记）。
+///
+/// 写在**流交回下游之前**：答复发了、事实还在队列里，进程死在两者之间就少一笔，
+/// 而少一笔是所有读数一起偏一点、偏得没有痕迹的那种错。写不进去只告警——事件流
+/// 的可用性不该把一次答复拖住。
+async fn record_call_row(
+    obs: &LlmObservable,
+    ctx: &CallContext,
+    response: &ChatResponse,
+    latency_ms: u64,
+) {
+    let Some(sink) = obs.call_events() else {
+        return;
+    };
+    let call = cog_core::LlmCall {
+        call_id: format!(
+            "{}:{}",
+            if ctx.actor.is_empty() {
+                "unknown"
+            } else {
+                &ctx.actor
+            },
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ),
+        upstream: "-".to_string(),
+        api_style: "-".to_string(),
+        model: if ctx.model.is_empty() {
+            "-".to_string()
+        } else {
+            ctx.model.clone()
+        },
+        result: "ok".to_string(),
+        input_tokens: response.usage.input as u64,
+        output_tokens: response.usage.output as u64,
+        cached_tokens: 0,
+        cache_created_tokens: None,
+        origin: ctx.origin.clone(),
+        owner: if ctx.owner.is_empty() {
+            None
+        } else {
+            Some(ctx.owner.clone())
+        },
+        latency_ms: Some(latency_ms),
+        task_id: if ctx.task.is_empty() {
+            None
+        } else {
+            Some(ctx.task.clone())
+        },
+        actor: if ctx.actor.is_empty() {
+            "unknown".to_string()
+        } else {
+            ctx.actor.clone()
+        },
+        pace: None,
+        cost_micros: None,
+        price_book: None,
+        session: if ctx.session.is_empty() {
+            None
+        } else {
+            Some(ctx.session.clone())
+        },
+        batch_id: if ctx.task.is_empty() {
+            None
+        } else {
+            Some(ctx.task.clone())
+        },
+        tokens_reasoning: None,
+        refusal_kind: None,
+        retry_after_secs: None,
+        usage_outcome: None,
+        estimated_input: None,
+        refused_scope: None,
+        finish_reason: None,
+        ttft_ms: None,
+        prompt_manifest: None,
+        prompt_dropped: None,
+        at: chrono::Utc::now(),
+    };
+    if let Err(e) = sink
+        .append(cog_core::FactEvent::new(cog_core::EventPayload::LlmCall(
+            call.clone(),
+        )))
+        .await
+    {
+        tracing::warn!(error = %e, "this call's row did not reach the event stream; the in-process counters still count it");
+    }
+}
+
 fn record_terminal(obs: &LlmObservable, response: &ChatResponse, latency_ms: u64) {
     if response.error_message.is_some() {
         obs.record_error(CallFailure::InResponse);
@@ -85,6 +198,7 @@ fn record_terminal(obs: &LlmObservable, response: &ChatResponse, latency_ms: u64
 fn observed_stream(
     stream: AssistantMessageEventStream,
     obs: Arc<LlmObservable>,
+    ctx: CallContext,
     start: Instant,
 ) -> AssistantMessageEventStream {
     let (out, mut producer) = AssistantMessageEventStream::with_capacity(FORWARD_CAPACITY);
@@ -103,6 +217,7 @@ fn observed_stream(
         let response = stream.result().await;
         let latency_ms = start.elapsed().as_millis() as u64;
         record_terminal(&obs, &response, latency_ms);
+        record_call_row(&obs, &ctx, &response, latency_ms).await;
         producer.end(response);
     });
     out
@@ -117,7 +232,12 @@ impl LlmClient for ObservedLlmClient {
     ) -> SFResult<AssistantMessageEventStream> {
         let start = Instant::now();
         match self.inner.chat_stream(messages, options).await {
-            Ok(stream) => Ok(observed_stream(stream, self.obs.clone(), start)),
+            Ok(stream) => Ok(observed_stream(
+                stream,
+                self.obs.clone(),
+                call_context(options),
+                start,
+            )),
             Err(e) => {
                 // 连流都没拿到——上游在首字节之前就拒了，agent 的流量正是
                 // 这个形态失败的。这一跳的失败面就在这条路上，不记在这里
@@ -135,7 +255,17 @@ impl LlmClient for ObservedLlmClient {
     ) -> SFResult<AssistantMessageEventStream> {
         let start = Instant::now();
         match self.inner.complete_stream(prompt, options).await {
-            Ok(stream) => Ok(observed_stream(stream, self.obs.clone(), start)),
+            // `CompleteOptions` 不带身份：这一路写下的行只有模型，`actor` 记
+            // `unknown`、没有批号——那是这条入口的事实，不替它编一个。
+            Ok(stream) => Ok(observed_stream(
+                stream,
+                self.obs.clone(),
+                CallContext {
+                    model: options.model.clone().unwrap_or_default(),
+                    ..Default::default()
+                },
+                start,
+            )),
             Err(e) => {
                 self.obs.record_error(CallFailure::NoStream);
                 Err(e)
@@ -147,7 +277,9 @@ impl LlmClient for ObservedLlmClient {
         let start = Instant::now();
         match self.inner.chat(messages, options).await {
             Ok(response) => {
-                self.record_response(&response, start.elapsed().as_millis() as u64);
+                let latency_ms = start.elapsed().as_millis() as u64;
+                self.record_response(&response, latency_ms);
+                record_call_row(&self.obs, &call_context(options), &response, latency_ms).await;
                 Ok(response)
             }
             Err(e) => {
@@ -199,6 +331,61 @@ mod tests {
             error_message: Some("API error (HTTP 403)".into()),
             ..ChatResponse::default()
         }
+    }
+
+    /// 事件流那一侧的替身：只把交给它的行记下来。
+    #[derive(Default)]
+    struct RecordingSink(std::sync::Mutex<Vec<cog_core::LlmCall>>);
+
+    #[async_trait]
+    impl cog_core::EventStore for RecordingSink {
+        fn writer(&self) -> &str {
+            "probe"
+        }
+
+        fn next_event_id(&self) -> String {
+            format!("E{}", self.0.lock().unwrap().len())
+        }
+
+        async fn append(&self, event: cog_core::FactEvent) -> SFResult<()> {
+            if let cog_core::EventPayload::LlmCall(call) = event.payload {
+                self.0.lock().unwrap().push(call);
+            }
+            Ok(())
+        }
+    }
+
+    /// 一发调用落一行，带触发它的任务、成本主体与用量；批号就是任务 id。
+    /// 没有装配事件流时只留计数，不写行，也不报错。
+    #[tokio::test]
+    async fn a_client_call_leaves_a_row_with_its_task_and_actor() {
+        let obs = Arc::new(LlmObservable::new());
+        let sink = Arc::new(RecordingSink::default());
+        obs.attach_call_events(sink.clone());
+        let client = ObservedLlmClient::with_observable(
+            Arc::new(FakeClient {
+                outcome: Outcome::Success,
+            }),
+            obs,
+        );
+        let mut options = ChatOptions::default();
+        options.model = Some("a-model".into());
+        options
+            .headers
+            .insert(cog_core::LLM_TASK_HEADER.to_string(), "t-1".into());
+        options.headers.insert(
+            cog_core::LLM_ACTOR_HEADER.to_string(),
+            "agent:planner".into(),
+        );
+        client.chat(&[], &options).await.expect("the fake answers");
+
+        let rows = sink.0.lock().unwrap();
+        assert_eq!(rows.len(), 1, "一发调用应当恰好留下一行");
+        assert_eq!(rows[0].task_id.as_deref(), Some("t-1"));
+        assert_eq!(rows[0].batch_id.as_deref(), Some("t-1"));
+        assert_eq!(rows[0].actor, "agent:planner");
+        assert_eq!(rows[0].model, "a-model");
+        assert_eq!(rows[0].input_tokens, 5);
     }
 
     #[async_trait]

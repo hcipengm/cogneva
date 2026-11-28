@@ -34,11 +34,8 @@ async fn main() -> cog_core::SFResult<()> {
     })));
 
     let pipeline = PgePipeline::new(PgePipelineConfig {
-        max_retries: 2,
-        timeout_ms: 10_000,
         local_repair_max: 1,
         stall_threshold: 2,
-        independent_review: false,
     });
     let result = pipeline
         .execute_task(

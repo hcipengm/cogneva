@@ -1,6 +1,29 @@
+# 每副副本一个 DNS 名：`<sts>-<序号>.<本服务>.<ns>.svc`。客户端把它拼成
+# sandbox_executor_url 的逗号表（见 cogneva-json 的 system.sandbox_executor_url），
+# 一条 lane 钉一个名字。没有这一条，ClusterIP 服务的负载均衡会把同一个 agent 的
+# 两条命令送到两副副本、两棵树——lane 钉定的意义就被抹掉了。
+apiVersion: v1
+kind: Service
+metadata:
+  name: cogneva-sandbox-executor-pods
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: sandbox-executor
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: sandbox-executor
+  ports:
+    - name: executor
+      port: 9090
+      targetPort: executor
+      protocol: TCP
+---
 # 沙箱执行器的集群内 Service：主应用经 system.sandbox_executor_url 路由
 # run_command/read_file/write_file 到执行器 Pod。
-# 与 Deployment 分文件：主线部署器的目标清单按单文档解析改写 image，
+# 与 StatefulSet 分文件：主线部署器的目标清单按单文档解析改写 image，
 # Service 走支撑包通道下发（与 gateway-deployment/gateway-service 同构）。
 apiVersion: v1
 kind: Service

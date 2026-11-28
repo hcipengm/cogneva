@@ -135,11 +135,23 @@ ${KUBECTL} -n "${NS}" get configmap cogneva-evolution-config -o json \
     >"${work}/evolution-config.json" 2>"${work}/evolution-config.err" || true
 
 # 判据 4 的左边：树内声明。定时载体从工作树跑这条脚本，仓库根由脚本自身位置算；
-# 读的是**已提交的渲染产物**而不是 values.yaml——values 可能正被别的会话改着，而
-# 集群上那份是上一次渲染 apply 上去的。读不到照样不在整条退出：缺席在那一条上点名。
+# 读的是**渲染产物**而不是 values.yaml——values 可能正被别的会话改着，而产物是
+# 这一版交付的那份字节（它不进仓，读的那一刻从 chart 生成）。读不到照样不在整条
+# 退出：缺席在那一条上点名。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 DECLARED_DIR="${COGNEVA_RECONCILE_DECLARED:-${REPO_ROOT}/deploy/rendered/${COGNEVA_RECONCILE_PROFILE:-k3s-single}}"
+# 渲染产物不进仓：树内声明是「这一版应该长什么样」，读它在读的那一刻从 chart 生成。
+# 显式给了别处的声明目录（测试的副本）就不动它——那份是它自己的题目。
+case "${DECLARED_DIR}" in
+    "${REPO_ROOT}"/deploy/rendered/*)
+        if [ -f "${REPO_ROOT}/deploy/scripts/lib/rendered-cache.sh" ]; then
+            # shellcheck source=lib/rendered-cache.sh
+            source "${REPO_ROOT}/deploy/scripts/lib/rendered-cache.sh"
+            ensure_rendered "${REPO_ROOT}" || exit $?
+        fi
+        ;;
+esac
 # 准入面上另一只治理对象。读不到时判据 4 点名，不在这里整条退出。
 ${KUBECTL} -n "${NS}" get limitrange -o json \
     >"${work}/limitranges.json" 2>"${work}/limitranges.err" || true

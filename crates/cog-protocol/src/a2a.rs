@@ -254,8 +254,7 @@ impl A2aClient {
         let req = self.prepared(
             cog_core::HttpRequest::post(agent_url)
                 .json(&body)
-                .map_err(|e| anyhow::anyhow!("JSON serialization failed: {}", e))?
-                .timeout(30),
+                .map_err(|e| anyhow::anyhow!("JSON serialization failed: {}", e))?,
             version,
         );
         let resp = self

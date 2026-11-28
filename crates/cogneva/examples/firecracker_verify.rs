@@ -65,7 +65,6 @@ async fn main() {
             &cog_core::paths::app_path_str("microvm/evolution-pv.ext4"),
         ),
         instance_root: arg_value(&args, "--instance-root", "/tmp/cogneva-microvm"),
-        exec_timeout_secs: arg_value(&args, "--timeout", "300").parse().unwrap_or(300),
         ..Default::default()
     };
 

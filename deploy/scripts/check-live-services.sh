@@ -91,9 +91,10 @@ if [ "${#missing[@]}" -gt 0 ]; then
     exit 2
 fi
 
-# 指向的必须是测试库，不是业务库。清单里有几条一上来就 `DELETE FROM cog_dag_tasks`，
-# 指错了就是把线上数据当 playground——而这一步做错的时候，什么都不会红：那些用例
-# 清完表照样通过。所以判据放在最前面：库名里要有 `test`，没有就拒绝跑。
+# 指向的必须是测试库，不是业务库。清单里有几条一上来就清空整张任务账本
+# （`clear_task_ledger`：定义、状态迁移、投影、尝试四张表），指错了就是把线上数据
+# 当 playground——而这一步做错的时候，什么都不会红：那些用例清完表照样通过。
+# 所以判据放在最前面：库名里要有 `test`，没有就拒绝跑。
 #
 # 这条判据在 CI 与沙箱两侧指的是同一件事，因为两边的库同名（`cogneva_test`）：
 # CI 的 postgres 服务容器按 `POSTGRES_DB` 建它，沙箱的由 `db-role-bootstrap` 建。
@@ -220,6 +221,30 @@ live_check none 'The generated SSH keypair is readable by ssh-keygen' cargo test
 # compile makes every live step below fail too: a page of the same error,
 # rather than a silence that looks like agreement.
 live_check redis 'Live-Redis capped agent log' cargo test -p cog-storage --test wal_redis_trim -- --ignored
+# 事件流与用量的真库用例：写侧（一次调用一条事件、一次转移一条事件）、读侧（两条
+# 读数逐行相等、按批号查成本）、切换之后（汇总表不再被写）。它们都带 `#[ignore]`
+# 而各自的库在 CI 里才有，「被忽略且没人点名」与「没有这条用例」从这里看不出差别。
+# 一条步骤只点一个目标：契约按目标名判「谁被点名」，合并的 `--test A --test B`
+# 它读不出来，于是那两条等于没点名。
+live_check db 'Live-DB call events' cargo test -p cog-storage --test llm_call_events -- --ignored
+live_check db 'Live-DB transition events' cargo test -p cog-storage --test a_task_transition_leaves_one_event_test -- --ignored
+live_check db 'Live-DB usage readers agree' cargo test -p cogneva --test the_usage_readers_agree_row_by_row -- --ignored
+# 库里的界：`pg_settings` 与数值列的人口每一跑现算，账上缺一行就红。树普查扫不到这一半。
+live_check db 'Live-DB bounds census' python3 scripts/db-bounds-census.py --check
+# 库里的有损面：引用动作与分区摘除，判词写在约束所属模块；没判词一律红。
+live_check db 'Live-DB loss census' python3 scripts/db-loss-census.py --check
+live_check db 'Live-DB batch cost' cargo test -p cogneva --test a_batch_id_answers_what_the_batch_cost_test -- --ignored
+live_check db 'Live-DB rollup is gone' cargo test -p cogneva --test the_rollup_is_gone_test -- --ignored
+live_check db 'Live-DB round events' cargo test -p cog-storage --test round_events -- --ignored
+# 收件台与 planner 的读者问的是同一条身份：意图写进去、读得回来、重投不写第二条，
+# 派生的任务行带上 `input.intent_id` 之后它不再出现在「未派生」里。这三件都只能
+# 对着真库问——夹具里那张表可以长得一样，而两条 SQL 的 `->>` 与生成列是库的事。
+live_check db 'Live-DB intent receipt desk' cargo test -p cog-storage --test intent_receipt_desk -- --ignored
+live_check db 'Live-DB bodies in the backup package' cargo test -p cogneva --test backup_large_objects -- --ignored
+live_check db 'Live-DB body as a large object' cargo test -p cog-storage --test body_as_large_object -- --ignored
+live_check db 'Live-DB erasure' cargo test -p cog-storage --test erasure_keeps_the_event_and_drops_the_body -- --ignored
+live_check db 'Live-DB metric projections rebuild' cargo test -p cogneva --test metric_projections_rebuild_from_prometheus -- --ignored
+live_check db 'Live-DB principle rows all decided' cargo test -p cog-storage --test no_principle_row_is_left_undecided_test -- --ignored
 # The two retirement passes are judged on the one thing a fixture cannot
 # hold: they work by asking the server what a key is now, and then acting
 # on the answer. An inbox's emptiness is a stream length the pass never
@@ -303,6 +328,13 @@ live_check db 'Live-DB metering readings' cargo test -p cog-observability --test
 # of the evidence makes a ceiling that never moves on the path that spends
 # the most -- in production, where no fixture can see it.
 live_check db 'Live-DB person and task spend' cargo test -p cog-observability --test person_and_task_spend -- --ignored
+# An attempt row is where "who did this stretch of work, in what role" is
+# written, and the write goes through one statement whose columns a fixture
+# cannot check: the role is reverse-derived from the seat address and the
+# person from the row's owner cell. A migration that adds the column, a
+# startup schema that adds it, and a statement that never fills it all pass
+# every reading that runs without a server.
+live_check db 'Live-DB attempts record the person and role' cargo test -p cog-storage --test task_attempt_records_the_seat -- --ignored
 # The quota path asks the task graph who submitted a task once per request,
 # and that read is served by an index whose first column has to be the one
 # the lookup filters on. Neither half can be answered without a server: an
@@ -453,6 +485,13 @@ live_check db 'Live-DB principle refusal shapes' cargo test -p cog-storage --tes
 # the same task see one arrangement rather than two. A database-free
 # double would restate the caller's own assumption about both.
 live_check db 'Live-DB principle gating paths' cargo test -p cog-storage --test principle_gating_paths -- --ignored
+# The runtime account's three claims are all `WHERE` clauses: a proposal is
+# not in force until a decision moves it, a rule already in force refuses a
+# second proposal of the same slug, and a decision repeated twice does not
+# move the date the rule became in force. A memory store answers each of
+# them by whatever its author wrote down, so without a server the suite
+# proves only that the fake agrees with itself.
+live_check db 'Live-DB runtime principle account' cargo test -p cog-storage --test runtime_principle_store -- --ignored
 # The sample-log sweep is expressed almost entirely as one DELETE, so its
 # correctness cannot be checked without a server; the DB-free tests beside
 # it only cover the sweep period. Leaving these out of the gate is how a
@@ -547,11 +586,6 @@ live_check db 'Live-DB task ownership guard' cargo test -p cog-storage --test ta
 # first: run together they create the same types at once and the catalog
 # refuses the second.
 live_check db 'Live-DB governance store reads' cargo test -p cog-storage --test governance_store -- --ignored --test-threads=1
-# What a single pruning statement costs, and which rows it takes. The
-# rank question is a plan question: ranking every row of the log first
-# answers it for the whole table, which is a cost no reading of the
-# statement's text shows.
-live_check db 'Live-DB metrics surplus-delete statement' cargo test -p cog-storage --test metrics_surplus_delete -- --ignored
 # The gauge read and the retirement pass were written as live tests and
 # then never named by any gate, which is the same as not having them: a
 # scrape pays for the newest-sample read continuously, and the retirement
@@ -734,9 +768,11 @@ live_check db 'Live-DB taste intent claims' cargo test -p cog-storage --test tas
 live_check db 'Live-DB task work samples' cargo test -p cog-storage --test task_kind_samples -- --ignored --test-threads=1
 # The status census is one GROUP BY plus a branch that decides what a
 # status string this build cannot name does to the total; neither is
-# visible without a server. It runs last because it empties the task
-# table on entry and exit.
-live_check db 'Live-DB task status census' cargo test -p cog-storage --test task_status_counts -- --ignored
+# visible without a server. One test at a time: the census counts every
+# workspace and expects exactly the rows it seeded, so a neighbour in the
+# same binary seeding four more while it counts turns a correct answer
+# into a wrong one.
+live_check db 'Live-DB task status census' cargo test -p cog-storage --test task_status_counts -- --ignored --test-threads=1
 # Whether a ledger row that names something counts as attributed is a
 # `NOT EXISTS` against the task graph, so only a server can answer it. It
 # writes its rows into 2001 and deletes them, so it neither reads nor

@@ -10,26 +10,47 @@ pub mod agent_message_store;
 pub mod attempt_journal_store;
 pub mod audit_recorder;
 pub mod backup_run_store;
+pub mod body_store;
+pub mod change_candidate_store;
 pub mod change_ledger_store;
+pub mod chat_turn_rebuild;
 pub mod chat_turn_store;
 pub mod database_health;
 pub mod dataset_catalog;
 pub mod decision_stats_store;
+pub mod dialogue;
+pub mod employee_events;
+pub mod event_log;
 pub mod governance_store;
 pub mod hook_archive;
+pub mod intent_events;
+pub mod item_events;
+pub mod key_events;
+pub mod landing_states;
+pub mod large_object;
+pub mod llm_call_events;
+pub mod message_events;
 pub mod metrics_backend;
 pub mod notification_store;
 pub mod observability_gateway;
 pub mod pge_stage_store;
 pub mod principle_ledger_store;
 pub mod project_audit_log;
+pub mod projection_snapshot;
 pub mod raw_log_index_store;
+pub mod redaction;
+pub mod redaction_read;
 pub mod resource_event_store;
+pub mod round_events;
+pub mod runtime_principle_store;
 pub mod snapshot_store;
 pub mod state_backend;
 pub(crate) mod state_reads;
 pub(crate) mod task_ledger;
 pub mod taste_intent_store;
+pub mod terminal_revisions;
+pub mod tool_call_events;
+pub mod usage_backfill;
 pub mod user_store;
 
 pub use agent_message_store::{
@@ -41,8 +62,8 @@ pub use audit_recorder::PostgresAuditRecorder;
 pub use backup_run_store::PostgresBackupRunStore;
 pub use change_ledger_store::PostgresChangeLedgerStore;
 pub use chat_turn_store::{
-    ChatTurn, ChatTurnRecord, ChatTurnRole, ChatTurnStore, PostgresChatTurnStore,
-    ROWS_KEPT_PER_SESSION,
+    ChatAttachment, ChatAttachmentInfo, ChatToolCall, ChatToolCallStatus, ChatTurn, ChatTurnRecord,
+    ChatTurnRole, ChatTurnStore, PostgresChatTurnStore, ROWS_KEPT_PER_SESSION,
 };
 pub use database_health::PgDatabaseHealth;
 pub use dataset_catalog::{
@@ -59,9 +80,20 @@ pub use principle_ledger_store::PostgresPrincipleLedgerStore;
 pub use project_audit_log::{AuditEntry, AuditRow, PgProjectAuditLog, ProjectAuditLog};
 pub use raw_log_index_store::PostgresRawLogIndexStore;
 pub use resource_event_store::PostgresResourceEventStore;
+pub use runtime_principle_store::PostgresRuntimePrincipleStore;
 pub use snapshot_store::PostgresSnapshotStore;
 pub use state_backend::{
     venue_tasks_sql, PostgresStateBackend, DAG_LOCK_WORKSPACE_SQL, EVENTS_PAGE_SQL,
 };
 pub use taste_intent_store::PostgresTasteIntentStore;
 pub use user_store::PostgresUserStore;
+
+/// 信封里事件 id 那一列是定长的（26 个字母数字）：短的会被拒，或者被补齐到别人的
+/// 形状。三个写入口（调用、工具调用、轮次）各写一遍这段断言时，改一处不会有任何
+/// 报错——所以它只写这一份，用例调用它。
+#[cfg(test)]
+pub(crate) fn assert_envelope_width(make: impl Fn(&str) -> String) {
+    for id in ["", "x", &"y".repeat(40)] {
+        assert_eq!(make(id).len(), 26, "{id:?}");
+    }
+}

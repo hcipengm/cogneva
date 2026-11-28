@@ -49,7 +49,8 @@ pub const PROCESS_ZOMBIES_METRIC_RULE: &str = "orphans_unreaped";
 /// Cadence of the sweep. Long enough that an owner collecting through a blocking
 /// `wait()` always wins the race, short enough that a wedged sweep is visible
 /// within a scrape interval.
-// cap: bound — 短于一次抓取间隔，卡住的一轮才能在下一次抓取之前被看见
+// cap: fixed — 短于一次抓取间隔，卡住的一轮才能在下一次抓取之前被看见
+// keep: 删掉后卡住的一轮到下一次抓取之后才被看见；由「短于一次抓取间隔」兜住
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 
 static ORPHANS_REAPED: AtomicU64 = AtomicU64::new(0);

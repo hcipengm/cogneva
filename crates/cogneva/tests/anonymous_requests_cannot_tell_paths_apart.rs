@@ -74,7 +74,7 @@ async fn status_of(app: &axum::Router, path: &str, token: Option<&str>) -> Statu
     // Read the body rather than drop the response: a handler that starts
     // streaming and is dropped mid-body is a different failure, and this check
     // is not about bodies.
-    let _ = to_bytes(response.into_body(), usize::MAX).await;
+    cog_core::ignore_lost!(to_bytes(response.into_body(), usize::MAX).await);
     status
 }
 

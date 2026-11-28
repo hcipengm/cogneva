@@ -295,13 +295,21 @@ impl EvolutionAdminService {
         // two sources above win where they overlap: they carry the richer
         // record (the scan reads the diff text the listing summarizes, the
         // engine knows the live status), and this one states metadata only.
-        let records = self.pipeline.known_change_records().await;
-        let known: std::collections::HashSet<String> =
-            results.iter().map(|r| r.artifact_id.clone()).collect();
-        for record in records {
-            if !known.contains(&record.artifact_id) {
-                results.push(record);
+        match self.pipeline.known_change_records().await {
+            Ok(records) => {
+                let known: std::collections::HashSet<String> =
+                    results.iter().map(|r| r.artifact_id.clone()).collect();
+                for record in records {
+                    if !known.contains(&record.artifact_id) {
+                        results.push(record);
+                    }
+                }
             }
+            Err(e) => warn!(
+                error = %e,
+                "could not read the durable change records for the listing; \
+                 showing only the queue and the in-memory results"
+            ),
         }
 
         results
@@ -354,7 +362,7 @@ impl EvolutionAdminService {
     /// 向接管台广播行变更；无订阅者或无通道时静默丢弃。
     fn emit(&self, row: EvolutionChangeInfo) {
         if let Some(ref tx) = self.stream {
-            let _ = tx.send(row);
+            cog_core::ignore_lost!(tx.send(row));
         }
     }
 
@@ -649,6 +657,7 @@ impl EvolutionAdmin for EvolutionAdminService {
         let created_at = chrono::Utc::now();
 
         self.store_policy_result(crate::types::EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::PolicyUpdate,
             artifact_id: artifact_id.clone(),
             description: description.clone(),
@@ -956,9 +965,8 @@ mod tests {
         let backup_dir =
             std::env::temp_dir().join(format!("cogneva-test-backup-{}", uuid::Uuid::new_v4()));
 
-        let pipeline = crate::ChangePipeline::new(&project_root, &change_dir, false)
-            .with_auto_apply(true)
-            .with_test_timeout(30);
+        let pipeline = crate::change_pipeline::test_pipeline(&project_root, &change_dir, false)
+            .with_auto_apply(true);
         let deployer = crate::EvolutionDeployer::new(&project_root, &binary_dir, &backup_dir);
 
         let admin =
@@ -1000,7 +1008,7 @@ mod tests {
             std::env::temp_dir().join(format!("cogneva-test-bin-{}", uuid::Uuid::new_v4()));
         let backup_dir =
             std::env::temp_dir().join(format!("cogneva-test-backup-{}", uuid::Uuid::new_v4()));
-        let pipeline = crate::ChangePipeline::new(&project_root, &change_dir, false);
+        let pipeline = crate::change_pipeline::test_pipeline(&project_root, &change_dir, false);
         let deployer = crate::EvolutionDeployer::new(&project_root, &binary_dir, &backup_dir);
         let admin =
             crate::EvolutionAdminService::new(Arc::new(engine), pipeline, deployer, None, None);
@@ -1036,7 +1044,7 @@ mod tests {
 
         let bare = crate::EvolutionAdminService::new(
             Arc::new(engine()),
-            crate::ChangePipeline::new(&project_root, &change_dir, false),
+            crate::change_pipeline::test_pipeline(&project_root, &change_dir, false),
             crate::EvolutionDeployer::new(&project_root, &binary_dir, &backup_dir),
             None,
             None,
@@ -1054,7 +1062,7 @@ mod tests {
         );
         let wired = crate::EvolutionAdminService::new(
             Arc::new(engine()),
-            crate::ChangePipeline::new(&project_root, &change_dir, false),
+            crate::change_pipeline::test_pipeline(&project_root, &change_dir, false),
             crate::EvolutionDeployer::new(&project_root, &binary_dir, &backup_dir)
                 .with_build_readings(readings),
             None,
@@ -1086,6 +1094,7 @@ mod tests {
 
         let id = "landed-change";
         let record = crate::types::EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: id.to_string(),
             description: "goal landed".to_string(),
@@ -1101,11 +1110,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let pipeline = crate::ChangePipeline::new(&project_root, &change_dir, false);
+        let pipeline = crate::change_pipeline::test_pipeline(&project_root, &change_dir, false);
         pipeline.write_change_record(&record).await.unwrap();
         evo.register_result(record).await;
 
-        pipeline.retire_change(id, "landed").await.unwrap();
+        pipeline
+            .retire_change(id, cog_core::CandidateOutcome::Accepted, "landed")
+            .await
+            .unwrap();
         assert!(
             evo.retire_result(&pipeline, id).await,
             "the change has to be retired and recorded before the index may drop it"
@@ -1159,7 +1171,7 @@ mod tests {
         let backup_dir =
             std::env::temp_dir().join(format!("cogneva-test-backup-{}", uuid::Uuid::new_v4()));
 
-        let pipeline = crate::ChangePipeline::new(&project_root, &change_dir, false);
+        let pipeline = crate::change_pipeline::test_pipeline(&project_root, &change_dir, false);
         let deployer = crate::EvolutionDeployer::new(&project_root, &binary_dir, &backup_dir);
         let queue = Arc::new(
             crate::evolution_queue_readings::EvolutionQueueReadings::new(
@@ -1236,7 +1248,7 @@ mod tests {
         let binary_dir = std::env::temp_dir().join(format!("cogneva-test-bin-{}", unique));
         let backup_dir = std::env::temp_dir().join(format!("cogneva-test-backup-{}", unique));
 
-        let pipeline = crate::ChangePipeline::new(&project_root, &change_dir, false);
+        let pipeline = crate::change_pipeline::test_pipeline(&project_root, &change_dir, false);
         let deployer = crate::EvolutionDeployer::new(&project_root, &binary_dir, &backup_dir);
 
         crate::EvolutionAdminService::new(Arc::new(engine), pipeline, deployer, switcher, None)
@@ -1288,7 +1300,7 @@ mod tests {
         .await
         .unwrap();
 
-        let pipeline = crate::ChangePipeline::new(&project_root, &change_dir, false);
+        let pipeline = crate::change_pipeline::test_pipeline(&project_root, &change_dir, false);
         let deployer = crate::EvolutionDeployer::new(
             &project_root,
             std::env::temp_dir().join(format!("cogneva-test-bin-{}", unique)),
@@ -1343,6 +1355,7 @@ mod tests {
         // 核心路径：分级判它必须人工审批。
         let diff = "diff --git a/crates/cog-storage/src/postgres/state_backend.rs b/crates/cog-storage/src/postgres/state_backend.rs\n--- a/crates/cog-storage/src/postgres/state_backend.rs\n+++ b/crates/cog-storage/src/postgres/state_backend.rs\n@@ -1 +1 @@\n-a\n+b\n";
         let change = crate::types::EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: "awaits".into(),
             description: "test".into(),
@@ -1385,7 +1398,7 @@ mod tests {
         // 工作树指向临时目录：接线若断了，这条测试会走到本地构建那条路上，
         // 那也必须落在临时目录里而不是真的仓库里。
         let scratch = tempfile::tempdir().unwrap();
-        let pipeline = crate::ChangePipeline::new(scratch.path(), &change_dir, false);
+        let pipeline = crate::change_pipeline::test_pipeline(scratch.path(), &change_dir, false);
         let deployer = crate::EvolutionDeployer::new(
             scratch.path(),
             scratch.path().join("bin"),

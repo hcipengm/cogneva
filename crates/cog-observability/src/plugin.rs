@@ -16,7 +16,8 @@ use crate::usage_store::LlmUsageStore;
 ///
 /// 判据被配得极短时，这条界保证巡检不会变成对着表打的热循环；正常配置下巡检
 /// 周期是判据的一半，远大于这个下限。
-// cap: bound — 判据被配得极短时，这条界保证巡检不变成对着表打的热循环；正常配置下巡检周期是判据的一半，远大于它
+// cap: fixed — 判据被配得极短时，这条界保证巡检不变成对着表打的热循环；正常配置下巡检周期是判据的一半，远大于它
+// keep: 删掉后判据被配得极短时巡检变成对着表打的热循环；由「巡检周期是判据的一半」兜住
 const MIN_SWEEP_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Loop name reported through the background-loop liveness family.
@@ -57,6 +58,12 @@ pub struct ObservabilityPlugin {
     /// and the directory it belongs to, so a scan cannot be pointed at a
     /// directory other than the one its series is attributed to.
     data_volume: Vec<Arc<crate::data_volume::DataVolumeObservable>>,
+    /// The retention loops' shared reading face: the target each beat computed,
+    /// the unit it is in, whether its input was measured, and how many beats it
+    /// has run. Created and published in `init` because the scrape snapshot is
+    /// taken there -- a handle published from `start` is held by a live loop and
+    /// read by nobody. The two sweeps attach to it in `start`.
+    retention_readings: Option<Arc<cog_core::retention::RetentionReadings>>,
 }
 
 impl ObservabilityPlugin {
@@ -73,6 +80,7 @@ impl ObservabilityPlugin {
             capabilities: None,
             trace_buffer_max_bytes: crate::config::TraceCollectorConfig::default().buffer_max_bytes,
             data_volume: Vec::new(),
+            retention_readings: None,
         }
     }
 }
@@ -138,18 +146,11 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             );
             None
         } else {
-            let client = Arc::new(
-                crate::logs::LokiPushClient::new(&observability.loki.endpoint)
-                    .with_max_retries(observability.loki.max_retries.max(1))
-                    .with_timeout(observability.loki.timeout_secs)
-                    .with_label(crate::LABEL_SERVICE, &loki_service)
-                    .with_client(http_client.clone()),
+            let (client, pusher) = crate::logs::client_and_pusher(
+                &observability.loki,
+                http_client.clone(),
+                &loki_service,
             );
-            let pusher = Arc::new(crate::logs::LokiBackgroundPusher::new(
-                client.clone(),
-                std::time::Duration::from_secs(observability.loki.flush_interval_sec.max(1)),
-                observability.loki.max_batch_size.max(1),
-            ));
             // Same sink the ClickHouse buffer below takes: this plugin's init
             // runs after the storage plugin has published the backend, so the
             // handle is here and the pusher can report a batch it could not
@@ -530,16 +531,22 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         self.skip_store = match std::env::var(cog_core::env::DATABASE_URL) {
             Ok(url) if !url.trim().is_empty() => {
                 match crate::skip_store::LlmSkipStore::connect(&url).await {
-                    Ok(store) => match store.init_schema(schema_runner.as_ref()).await {
-                        Ok(()) => {
-                            info!("saved-call ledger reachable");
-                            Some(Arc::new(store))
+                    Ok(store) => {
+                        let store = match ctx.consume_service::<dyn cog_core::EventStore>() {
+                            Some(events) => store.with_events(events),
+                            None => store,
+                        };
+                        match store.init_schema(schema_runner.as_ref()).await {
+                            Ok(()) => {
+                                info!("saved-call ledger reachable");
+                                Some(Arc::new(store))
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "saved-call schema init failed; savings stay in-process");
+                                None
+                            }
                         }
-                        Err(e) => {
-                            warn!(error = %e, "saved-call schema init failed; savings stay in-process");
-                            None
-                        }
-                    },
+                    }
                     Err(e) => {
                         warn!(error = %e, "saved-call store connect failed; savings stay in-process");
                         None
@@ -573,15 +580,21 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                     )
                     .await
                     {
-                        Ok(store) => match store.init_schema(schema_runner.as_ref()).await {
-                            Ok(()) => {
-                                info!("spend verdict projection armed");
-                                self.verdict_store = Some(Arc::new(store));
+                        Ok(store) => {
+                            let store = match ctx.consume_service::<dyn cog_core::EventStore>() {
+                                Some(events) => store.with_events(events),
+                                None => store,
+                            };
+                            match store.init_schema(schema_runner.as_ref()).await {
+                                Ok(()) => {
+                                    info!("spend verdict projection armed");
+                                    self.verdict_store = Some(Arc::new(store));
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "spend verdict schema init failed; the account keeps no verdicts")
+                                }
                             }
-                            Err(e) => {
-                                warn!(error = %e, "spend verdict schema init failed; the account keeps no verdicts")
-                            }
-                        },
+                        }
                         Err(e) => warn!(error = %e, "spend verdict store connect failed"),
                     }
                 }
@@ -624,6 +637,16 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         info!(declared = capabilities.len(), "capability ledger published");
         self.capabilities = Some(capabilities);
 
+        // The retention loops' reading face, published here rather than beside
+        // the loops in `start`: the scrape snapshot is taken during `init`, so a
+        // handle published after it is carried by a live sweep and read by
+        // nobody. Both the exchange archive sweep and the token ledger sweep
+        // report through this one face -- they share it so the two knobs appear
+        // side by side with a beat count rather than as two unrelated gauges.
+        let retention_readings = Arc::new(cog_core::retention::RetentionReadings::new());
+        ctx.publish_observable(retention_readings.clone());
+        self.retention_readings = Some(retention_readings);
+
         self.initialized = true;
         Ok(())
     }
@@ -651,7 +674,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             let shutdown = ctx
                 .consume::<cog_core::ShutdownSignal>()
                 .map(|s| (*s).clone())
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             // The loop supervises itself (a panic is run again in place) and
             // nobody holds its handle: shutdown closes it through the signal,
             // and the task goes away with the process either way.
@@ -691,7 +714,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             let shutdown = ctx
                 .consume::<cog_core::ShutdownSignal>()
                 .map(|s| (*s).clone())
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             drop(crate::llm_usage_rollup::spawn(store, shutdown));
         }
 
@@ -702,19 +725,43 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         // frequent than the retention is wide. Runs beside the rollup on the
         // same store, and publishes what it retired so the promise is
         // checkable rather than merely declared.
+        // Both retention loops recompute their target from the measured cost of
+        // a day's writes against the declared database volume. They share the
+        // reading face `init` published, so the two knobs appear side by side
+        // with a beat count rather than as two unrelated gauges. The fallback is
+        // a face nobody reads rather than a second publish: `start` runs after
+        // every reader has taken its snapshot, so publishing here reaches no
+        // scrape at all.
+        let retention_readings = self
+            .retention_readings
+            .clone()
+            .unwrap_or(Default::default());
+        let database_volume = cog_core::retention::database_volume_from_env();
         if let Some(store) = self.usage_store.clone() {
             let shutdown = ctx
                 .consume::<cog_core::ShutdownSignal>()
                 .map(|s| (*s).clone())
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             let keep = std::time::Duration::from_secs(
                 crate::exchange_retention::keep_days_from_env() as u64 * 86_400,
             );
             let mut sweep =
                 crate::exchange_retention::ExchangeRetention::new(store.pool().clone(), keep)
-                    .with_deployment(crate::exchange_retention::deployment_name());
+                    .with_deployment(crate::exchange_retention::deployment_name())
+                    .with_database_volume(database_volume)
+                    .with_readings(retention_readings.clone());
             if let Some(mb) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
                 sweep = sweep.with_metrics(mb);
+            }
+            // 归档层：只有它能证明「这一行的正文在别处还有一份」。挂不上时这一遍
+            // 一行也不删（`kept_unarchived` 会把它记出来），而不是把唯一的副本删掉。
+            if let Some(archive) = ctx.consume_service::<dyn cog_core::ObjectBackend>() {
+                sweep = sweep.with_archive(archive);
+            } else {
+                tracing::warn!(
+                    "no object archive published; the exchange retention will keep every row \
+                     rather than delete the only copy of a body"
+                );
             }
             drop(Arc::new(sweep).spawn(shutdown));
         }
@@ -730,12 +777,14 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             let shutdown = ctx
                 .consume::<cog_core::ShutdownSignal>()
                 .map(|s| (*s).clone())
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             let keep = std::time::Duration::from_secs(
                 crate::usage_retention::keep_days_from_env() as u64 * 86_400,
             );
             let mut sweep = crate::usage_retention::UsageRetention::new(store.pool().clone(), keep)
-                .with_deployment(crate::usage_retention::deployment_name());
+                .with_deployment(crate::usage_retention::deployment_name())
+                .with_database_volume(database_volume)
+                .with_readings(retention_readings.clone());
             if let Some(mb) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
                 sweep = sweep.with_metrics(mb);
             }
@@ -752,7 +801,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             let shutdown = ctx
                 .consume::<cog_core::ShutdownSignal>()
                 .map(|s| (*s).clone())
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             drop(crate::spend_verdict::spawn(store, shutdown));
         }
 
@@ -766,7 +815,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                 let shutdown = ctx
                     .consume::<cog_core::ShutdownSignal>()
                     .map(|s| (*s).clone())
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 capabilities.start_all(shutdown);
                 info!(
                     judgments = capabilities.len(),
@@ -781,7 +830,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             let shutdown = ctx
                 .consume::<cog_core::ShutdownSignal>()
                 .map(|s| (*s).clone())
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             tokio::spawn(crate::data_volume::run_data_volume_watch(
                 volume.clone(),
                 obs_cfg.data_volume_watch.interval_secs,
@@ -856,7 +905,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             let shutdown = ctx
                 .consume::<cog_core::ShutdownSignal>()
                 .map(|s| (*s).clone())
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             let metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
             // 同一张 alerts 表前可能站着不止一个进程：主应用与进化进程都装了
             // 这个插件，两者都在写告警。通知是 INSERT，不像 `set_alert` 那样按
@@ -934,7 +983,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                     let bridge_stop = ctx
                         .consume::<cog_core::ShutdownSignal>()
                         .map(|s| (*s).clone())
-                        .unwrap_or_default();
+                        .unwrap_or(Default::default());
                     let bridged = spawn_alert_bridge(
                         alert_channels.clone(),
                         alert_resolutions.clone(),
@@ -986,7 +1035,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         let declaration_stop = ctx
             .consume::<cog_core::ShutdownSignal>()
             .map(|s| (*s).clone())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         tokio::spawn(crate::config_delivery::run_config_declaration_check(
             std::time::Duration::from_secs(
                 obs_cfg
@@ -1040,7 +1089,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                     let shutdown = ctx
                         .consume::<cog_core::ShutdownSignal>()
                         .map(|s| (*s).clone())
-                        .unwrap_or_default();
+                        .unwrap_or(Default::default());
                     let outlets = crate::infra_watch::InfraWatchOutlets {
                         store: self.alert_store.clone(),
                         notifier,
@@ -1549,11 +1598,13 @@ pub const ALERT_BELL_ROLE: &str = "alert_bell";
 ///
 /// 与前端 `useNotifications` 的轮询（60 秒）同一量级：更慢会让铃铛比轮询晚
 /// 一整拍才亮，更快只是空转——浏览器不会比这更早看到。
-// cap: bound — 与前端 useNotifications 的 60 秒轮询同一量级：更慢铃铛比轮询晚一整拍才亮，更快只是空转
+// cap: fixed — 与前端 useNotifications 的 60 秒轮询同一量级：更慢铃铛比轮询晚一整拍才亮，更快只是空转
+// keep: 删掉后铃铛比轮询晚一整拍才亮，或空转；由「与前端 60 秒轮询同一量级」兜住
 const ALERT_BELL_INTERVAL_SECS: u64 = 60;
 
 /// 一轮最多发多少条。存量补发时不要一次写几千行把这一轮的墙钟撑破。
-// cap: bound — 存量补发时不要一次写几千行把这一轮的墙钟撑破
+// cap: fixed — 存量补发时不要一次写几千行把这一轮的墙钟撑破
+// keep: 删掉后存量补发一次写几千行，把这一轮的墙钟撑破；由「不要一次写几千行」兜住
 const ALERT_BELL_BATCH: i64 = 200;
 
 // 参数多是因为这一环的每个入参都来自不同的插件服务，把它们捆成一个结构体只是把
@@ -2575,7 +2626,7 @@ mod bridge_sweep {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let sweeps = store.sweeps.lock().unwrap().clone();
         stop.trigger();
-        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        cog_core::ignore_lost!(tokio::time::timeout(Duration::from_secs(2), task).await);
 
         assert!(
             sweeps.len() >= 3,

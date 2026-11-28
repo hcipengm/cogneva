@@ -116,11 +116,11 @@ fn hold_a_writer(
         .execute(&mut *conn)
         .await
         .expect("the writer's insert");
-        let _ = taken.send(());
+        cog_core::ignore_lost!(taken.send(()));
         while !stop.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        sqlx::query("ROLLBACK").execute(&mut *conn).await.ok();
+        cog_core::ignore_lost!(sqlx::query("ROLLBACK").execute(&mut *conn).await);
     });
     (handle, took_it)
 }

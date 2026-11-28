@@ -32,55 +32,12 @@ use cog_core::{HttpClient, HttpRequest, SFError, SFResult, Tool, ToolImplementat
 use futures::StreamExt;
 use url::Url;
 
-/// Hits returned when the caller does not say how many it wants. Ten is one
-/// screen of titles and excerpts: enough to choose a page to read, small enough
-/// that a turn is not spent on links it will not follow.
-// cap: bound — 一屏标题与摘录：够挑出要读的那页，又小到这一回合不会花在不会跟的链接上
-const DEFAULT_SEARCH_RESULTS: u64 = 10;
-
-/// The most hits one call may ask for. Every hit is context the run pays for on
-/// every later turn, so a caller that wants more pages should read the ones it
-/// has rather than page through a result list it cannot use.
-// cap: bound — 结果会进入之后每一回合，所以想要更多的调用方该去读已有的那些
-const MAX_SEARCH_RESULTS: u64 = 50;
-
-/// Characters of extracted text returned when the caller does not ask for a
-/// size. Roughly one long article; the caller can raise it for a document it
-/// means to read whole.
-// cap: bound — 大约一篇长文；对打算整篇读完的文档，调用方可以自己抬高
-const DEFAULT_FETCH_CHARS: u64 = 20_000;
-
-/// The most text one fetch may return. Above this the answer stops being a turn
-/// and becomes a document, and a document belongs in the archive rather than in
-/// the conversation.
-// cap: bound — 过了这个数它就不是一段摘录而是整份文档，那份文档该进归档而不是进对话
-const MAX_FETCH_CHARS: u64 = 200_000;
-
 /// Bytes one page may transfer. Below the point where a single turn is worth
 /// anything, the page cannot be read anyway; above it, an accidental video or
 /// an infinite stream costs the pod's memory before extraction ever runs.
-// cap: bound — 不到这个数页面本来就读不了，过了它就是一段误抓的视频或一条无限流，在抽取开始之前先吃掉 Pod 的内存
+// cap: fixed — 不到这个数页面本来就读不了，过了它就是一段误抓的视频或一条无限流，在抽取开始之前先吃掉 Pod 的内存
+// keep: 删掉后一段误抓的视频或无限流会在抽取之前吃掉 Pod 的内存；由「网页正文的下载上界」兜住
 const MAX_DOWNLOAD_BYTES: usize = 5 * 1024 * 1024;
-
-/// How long one fetch may take, headers included. A page that has not started
-/// answering in this window is not going to make the turn useful.
-// cap: bound — 含头部在内的抓取上限：在这个窗里还没开始应答的页面，不会让这一回合变得有用
-const FETCH_TIMEOUT_SECS: u64 = 30;
-
-/// How long one search may take. The metasearch fan-out answers from several
-/// engines at once and waits for the slowest; this is the point past which the
-/// slowest is not worth the turn.
-// cap: bound — 同时问几个引擎、等最慢的那个；过了这一点最慢的那个就不值这一回合了
-const SEARCH_TIMEOUT_SECS: u64 = 20;
-
-/// How many times a search whose engines all stayed silent is asked again.
-///
-/// Only that one outcome is repeated: an engine that timed out once often
-/// answers the next request, while a non-200 or a body that is not JSON is a
-/// verdict about the request itself and asking again returns the same verdict
-/// for the same wait.
-// cap: bound — 再问一次是对请求本身的判断，重复一次换来同样的判断和同样的等待
-const SEARCH_ATTEMPTS: u32 = 2;
 
 /// The environment variable that names the SearXNG base URL.
 ///
@@ -119,7 +76,9 @@ pub const WEB_FETCH_BASE_ENV: &str = "COGNEVA_WEB_FETCH_BASE";
 
 /// How long one rendered fetch may take. A browser has to start, load, run the
 /// page's scripts and settle; the in-process deadline would cut that short.
-// cap: bound — 浏览器要起来、加载、跑完页面脚本并稳定下来；进程内的那个截止时间会把它切短
+// cap: fixed — 浏览器要起来、加载、跑完页面脚本并稳定下来；进程内的那个截止时间会把它切短
+// keep: 删掉后一次渲染等不到稳定状态就永远挂着；由「浏览器起、加载、跑完脚本并稳定」兜住
+// wall: 等=无头浏览器把这一页渲染稳 / 等不到=这次渲染失败，**没有半份页面被当成读到了**；浏览器进程连同它的临时目录一起收掉 / 续跑=能，重来是一次新的渲染，从打开页面开始
 const RENDER_TIMEOUT_SECS: u64 = 60;
 
 /// How long one rendered page stays servable out of the backend's own cache.
@@ -135,16 +94,6 @@ const RENDER_TIMEOUT_SECS: u64 = 60;
 /// one), so a shorter window could never be hit by the next render and a longer
 /// one would keep an answer alive past the budget that produced it.
 const RENDER_CACHE_SECS: u64 = RENDER_TIMEOUT_SECS;
-
-/// How many times a page the backend failed on is asked for again.
-///
-/// A renderer answers 5xx when its own page budget ran out mid-render, which is
-/// what a cold browser on a heavy page looks like; the second attempt starts
-/// from a warm one and usually returns the page. Only a 5xx is repeated: a 4xx
-/// is a verdict about this URL and repeating it costs the caller the same wait
-/// for the same answer.
-// cap: bound — 同样是对这个 URL 的判断，重复它只让调用方为同一个答案再等一遍
-const RENDER_ATTEMPTS: u32 = 2;
 
 fn encode_component(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
@@ -263,7 +212,6 @@ struct Body {
 
 async fn fetch_capped(client: &Arc<dyn HttpClient>, url: &Url, cap: usize) -> SFResult<Body> {
     let mut req = HttpRequest::new("GET", url.as_str());
-    req.timeout_secs = Some(FETCH_TIMEOUT_SECS);
     req.headers.insert(
         "Accept".into(),
         "text/html,application/xhtml+xml,text/plain;q=0.9,application/json;q=0.8,*/*;q=0.5".into(),
@@ -518,8 +466,8 @@ fn decode_entities(text: &str) -> String {
     out
 }
 
-fn truncate_chars(text: &str, max_chars: usize) -> (String, bool) {
-    match text.char_indices().nth(max_chars) {
+fn truncate_chars(text: &str, max_chars: Option<usize>) -> (String, bool) {
+    match max_chars.and_then(|max| text.char_indices().nth(max)) {
         Some((cut, _)) => (text[..cut].to_string(), true),
         None => (text.to_string(), false),
     }
@@ -552,10 +500,7 @@ pub fn web_search_with_fallback(
     Tool {
         name: "web_search".into(),
         description: "Search the open web and return ranked results with title, URL and \
-                      excerpt. Runs against this deployment's self-hosted metasearch \
-                      backend, so it costs no per-request vendor fee. Use it before \
-                      guessing at a current fact or an unfamiliar API; follow it with \
-                      web_fetch to read a result that matters."
+                      excerpt."
             .into(),
         parameters: serde_json::json!({
             "type": "object",
@@ -566,7 +511,7 @@ pub fn web_search_with_fallback(
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "How many results to return (default 10, max 50)"
+                    "description": "Result count; the backend's default if omitted"
                 },
                 "language": {
                     "type": "string",
@@ -590,16 +535,19 @@ pub fn web_search_with_fallback(
                     .filter(|q| !q.is_empty())
                     .ok_or_else(|| SFError::Validation("query required".into()))?
                     .to_string();
-                let limit = args["limit"]
-                    .as_u64()
-                    .unwrap_or(DEFAULT_SEARCH_RESULTS)
-                    .clamp(1, MAX_SEARCH_RESULTS);
+                // 调用方说多少就是多少：没有上限，也不替它挑一个默认值。不说就
+                // 不在请求里带 `limit`，由后端自己的默认回答——那是后端的协议，
+                // 不是这里替它拍的一个数。
+                let limit = args["limit"].as_u64().filter(|n| *n > 0);
                 let base = search_base(base.as_deref())?;
                 let client = http_client(client)?;
                 let mut url = format!(
-                    "{base}/search?q={}&format=json&limit={limit}&safesearch=1",
+                    "{base}/search?q={}&format=json&safesearch=1",
                     encode_component(&query)
                 );
+                if let Some(limit) = limit {
+                    url.push_str(&format!("&limit={limit}"));
+                }
                 if let Some(language) = args["language"].as_str().filter(|l| !l.trim().is_empty()) {
                     url.push_str(&format!("&language={}", encode_component(language.trim())));
                 }
@@ -609,33 +557,18 @@ pub fn web_search_with_fallback(
                     .unwrap_or("general");
                 url.push_str(&format!("&categories={}", encode_component(categories)));
 
-                // A search that came back empty because the engines were
-                // silent is asked again, because that is the one failure here
-                // with a good chance of not repeating: measured on this
-                // deployment, one query returned zero hits with the engine
-                // timing out and the very next query answered normally. One
-                // extra request buys the caller an answer instead of a "the web
-                // has nothing on this" that is wrong. Everything else -- a
-                // non-200, a body that is not JSON -- is a verdict about the
-                // request and is not repeated.
-                let mut attempt = 0;
-                let answer = loop {
-                    attempt += 1;
-                    let mut req = HttpRequest::new("GET", url.clone());
-                    req.timeout_secs = Some(SEARCH_TIMEOUT_SECS);
-                    req.headers
-                        .insert("Accept".into(), cog_core::CONTENT_TYPE_JSON.into());
-                    let resp = client.execute(req).await.map_err(|e| {
-                        SFError::Agent(format!("web search backend at {base} is unreachable: {e}"))
-                    })?;
-                    let answer = search_answer(&resp, &base, limit)?;
-                    if !answer.results.is_empty()
-                        || answer.broken.is_empty()
-                        || attempt >= SEARCH_ATTEMPTS
-                    {
-                        break answer;
-                    }
-                };
+                // 一次请求一次判断。引擎哑掉时这里不再自己重问：零命中的两种
+                // 含义已经分得开（引擎答了没匹配 vs 引擎没答），后者返回的错误
+                // 里点了哪些引擎哑了并请调用方原样再问——重问是调用方的决定，
+                // 不是这个工具替它连着问两次。请求时限走客户端的配置，这里不
+                // 另写一个秒数。
+                let mut req = HttpRequest::new("GET", url.clone());
+                req.headers
+                    .insert("Accept".into(), cog_core::CONTENT_TYPE_JSON.into());
+                let resp = client.execute(req).await.map_err(|e| {
+                    SFError::Agent(format!("web search backend at {base} is unreachable: {e}"))
+                })?;
+                let answer = search_answer(&resp, &base, limit)?;
                 // Zero hits means two different things depending on who is
                 // reporting it. From an engine that answered, it says the query
                 // was asked and nothing matched -- paraphrasing is the right
@@ -689,14 +622,11 @@ pub fn web_search_with_fallback(
                 // what the engines know -- so that case stays local too.
                 if answer.results.is_empty() && answer.extras.is_empty() {
                     let because = if names.is_empty() {
-                        format!(
-                            "the self-hosted engines answered and matched nothing in \
-                             {attempt} attempt(s)"
-                        )
+                        "the self-hosted engines answered and matched nothing".to_string()
                     } else {
                         format!(
-                            "the self-hosted backend answered nothing in {attempt} \
-                             attempt(s); engines that stayed silent: {}",
+                            "the self-hosted backend answered nothing; engines that stayed \
+                             silent: {}",
                             names.join(", ")
                         )
                     };
@@ -710,12 +640,6 @@ pub fn web_search_with_fallback(
                                     "count": hits.len(),
                                     "results": hits,
                                     "source": "fallback",
-                                    // The attempt count is read off the loop
-                                    // rather than written as "twice": the two
-                                    // have to agree after someone changes
-                                    // SEARCH_ATTEMPTS, and a spelled-out number
-                                    // is the copy that goes stale without
-                                    // failing anything.
                                     "fallback_because": because,
                                 }));
                             }
@@ -749,11 +673,10 @@ pub fn web_search_with_fallback(
                     }
                     if !names.is_empty() {
                         return Err(SFError::Agent(format!(
-                            "web search came back empty after {attempt} attempt(s) because \
-                             no engine answered, which is not the same answer as 'nothing \
-                             matched': the query was never put to anything. Engines that \
-                             stayed silent: {}. Retry the same query rather than rephrasing \
-                             it",
+                            "web search came back empty because no engine answered, which is \
+                             not the same answer as 'nothing matched': the query was never put \
+                             to anything. Engines that stayed silent: {}. Retry the same query \
+                             rather than rephrasing it",
                             names.join(", ")
                         )));
                     }
@@ -791,24 +714,22 @@ async fn fallback_search(
     client: &dyn HttpClient,
     base: &str,
     query: &str,
-    limit: u64,
+    limit: Option<u64>,
 ) -> SFResult<Vec<serde_json::Value>> {
     let url = format!("{}/search", base.trim_end_matches('/'));
     let mut req = HttpRequest::new("POST", url.clone());
-    req.timeout_secs = Some(SEARCH_TIMEOUT_SECS);
     req.headers
         .insert("Content-Type".into(), cog_core::CONTENT_TYPE_JSON.into());
     req.headers
         .insert("Accept".into(), cog_core::CONTENT_TYPE_JSON.into());
-    req.body = Some(
-        serde_json::json!({
-            "query": query,
-            "max_results": limit,
-            "search_depth": "basic",
-        })
-        .to_string()
-        .into_bytes(),
-    );
+    let mut payload = serde_json::json!({
+        "query": query,
+        "search_depth": "basic",
+    });
+    if let Some(limit) = limit {
+        payload["max_results"] = serde_json::json!(limit);
+    }
+    req.body = Some(payload.to_string().into_bytes());
     let resp = client.execute(req).await.map_err(|e| {
         SFError::Agent(format!(
             "fallback search backend at {base} is unreachable: {e}"
@@ -816,10 +737,10 @@ async fn fallback_search(
     })?;
     if !resp.is_success() {
         let body = String::from_utf8_lossy(&resp.body);
+        // 错误路径默认无损：后端的整段答复交给调用方，不在这里切。
         return Err(SFError::Agent(format!(
             "fallback search backend answered {}: {}",
-            resp.status,
-            body.chars().take(300).collect::<String>()
+            resp.status, body
         )));
     }
     let body: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| {
@@ -832,7 +753,7 @@ async fn fallback_search(
         .map(Vec::as_slice)
         .unwrap_or_default()
         .iter()
-        .take(limit as usize)
+        .take(limit.map_or(usize::MAX, |n| n as usize))
         .map(|hit| {
             serde_json::json!({
                 "title": hit["title"],
@@ -857,7 +778,11 @@ struct SearchAnswer {
     extras: Vec<(String, serde_json::Value)>,
 }
 
-fn search_answer(resp: &cog_core::HttpResponse, base: &str, limit: u64) -> SFResult<SearchAnswer> {
+fn search_answer(
+    resp: &cog_core::HttpResponse,
+    base: &str,
+    limit: Option<u64>,
+) -> SFResult<SearchAnswer> {
     if !resp.is_success() {
         let body = String::from_utf8_lossy(&resp.body);
         let hint = if resp.status == 403 || body.contains("format") {
@@ -882,7 +807,7 @@ fn search_answer(resp: &cog_core::HttpResponse, base: &str, limit: u64) -> SFRes
         .map(Vec::as_slice)
         .unwrap_or_default()
         .iter()
-        .take(limit as usize)
+        .take(limit.map_or(usize::MAX, |n| n as usize))
         .map(|hit| {
             serde_json::json!({
                 "title": hit["title"],
@@ -897,7 +822,7 @@ fn search_answer(resp: &cog_core::HttpResponse, base: &str, limit: u64) -> SFRes
         .get("unresponsive_engines")
         .and_then(|v| v.as_array())
         .cloned()
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let extras: Vec<(String, serde_json::Value)> = ["answers", "suggestions", "infoboxes"]
         .into_iter()
         .filter_map(|key| {
@@ -993,7 +918,7 @@ async fn fetch_rendered(
     client: &Arc<dyn HttpClient>,
     base: &str,
     url: &Url,
-    max_chars: usize,
+    max_chars: Option<usize>,
 ) -> SFResult<serde_json::Value> {
     let endpoint = format!("{base}/md");
     let body = serde_json::to_vec(&serde_json::json!({
@@ -1002,36 +927,28 @@ async fn fetch_rendered(
         "c": render_cache_revision(SystemTime::now()),
     }))
     .map_err(SFError::Serialization)?;
-    let mut attempt = 0;
-    let resp = loop {
-        attempt += 1;
-        let mut req = HttpRequest::new("POST", endpoint.clone());
-        req.headers
-            .insert("Content-Type".into(), cog_core::CONTENT_TYPE_JSON.into());
-        req.timeout_secs = Some(RENDER_TIMEOUT_SECS);
-        req.body = Some(body.clone());
-        let resp = client.execute(req).await.map_err(|e| {
-            SFError::Agent(format!(
-                "the rendering backend at {base} did not answer ({e}); the page was not read \
-                 in process instead, because this deployment asked for rendering"
-            ))
-        })?;
-        if (200..300).contains(&resp.status) {
-            break resp;
-        }
-        let detail = truncate_chars(&String::from_utf8_lossy(&resp.body), 300).0;
-        if !(500..600).contains(&resp.status) || attempt >= RENDER_ATTEMPTS {
-            let tries = if attempt == 1 {
-                String::new()
-            } else {
-                format!(" on {attempt} attempts")
-            };
-            return Err(SFError::Agent(format!(
-                "the rendering backend at {base} refused {url} with HTTP {}{tries}: {detail}",
-                resp.status
-            )));
-        }
-    };
+    // 一次请求，不在工具里重问。上一版对 5xx 再问一次（浏览器冷启动、页面重时
+    // 常见），但那个「再问一次」是平台替调用方拍的一个数：调用方看到的是
+    // 「后端在 {base} 上以 HTTP 500 拒绝了这个 URL: …」，分清得出是渲染器自己
+    // 没跑完还是这一页读不到；要再试，是它再要一次，不是工具替它决定。
+    let mut req = HttpRequest::new("POST", endpoint.clone());
+    req.headers
+        .insert("Content-Type".into(), cog_core::CONTENT_TYPE_JSON.into());
+    req.timeout_secs = Some(RENDER_TIMEOUT_SECS);
+    req.body = Some(body);
+    let resp = client.execute(req).await.map_err(|e| {
+        SFError::Agent(format!(
+            "the rendering backend at {base} did not answer ({e}); the page was not read \
+             in process instead, because this deployment asked for rendering"
+        ))
+    })?;
+    if !(200..300).contains(&resp.status) {
+        let detail = truncate_chars(&String::from_utf8_lossy(&resp.body), Some(300)).0;
+        return Err(SFError::Agent(format!(
+            "the rendering backend at {base} refused {url} with HTTP {}: {detail}",
+            resp.status
+        )));
+    }
     let mut parsed: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| {
         SFError::Agent(format!(
             "the rendering backend at {base} answered non-JSON: {e}"
@@ -1105,7 +1022,7 @@ async fn fetch_locally(
     client: &Arc<dyn HttpClient>,
     base: Option<&str>,
     url: &Url,
-    max_chars: usize,
+    max_chars: Option<usize>,
 ) -> SFResult<serde_json::Value> {
     // Rendering is a property of the deployment, not of the call: a run that
     // could ask for it would ask for it every time, and the deployment that has
@@ -1198,7 +1115,7 @@ async fn fallback_fetch(
     client: &Arc<dyn HttpClient>,
     base: &str,
     url: &Url,
-    max_chars: usize,
+    max_chars: Option<usize>,
 ) -> SFResult<serde_json::Value> {
     let endpoint = format!("{base}/fetch");
     let body = serde_json::to_vec(&serde_json::json!({ "url": url.as_str() }))
@@ -1206,13 +1123,12 @@ async fn fallback_fetch(
     let mut req = HttpRequest::new("POST", endpoint.clone());
     req.headers
         .insert("Content-Type".into(), cog_core::CONTENT_TYPE_JSON.into());
-    req.timeout_secs = Some(FETCH_TIMEOUT_SECS);
     req.body = Some(body);
     let resp = client.execute(req).await.map_err(|e| {
         SFError::Agent(format!("the fallback outlet at {base} is unreachable: {e}"))
     })?;
     if !(200..300).contains(&resp.status) {
-        let detail = truncate_chars(&String::from_utf8_lossy(&resp.body), 300).0;
+        let detail = truncate_chars(&String::from_utf8_lossy(&resp.body), Some(300)).0;
         return Err(SFError::Agent(format!(
             "the fallback outlet at {base} answered HTTP {}: {detail}",
             resp.status
@@ -1281,12 +1197,10 @@ pub fn web_fetch_with_fallback(
         description: "Fetch one public web page and return its readable text, with the \
                       page title. When this deployment runs a rendering backend the page \
                       is rendered in a real browser first and returned as filtered \
-                      Markdown, so client-side-rendered pages come back with the text \
-                      their scripts produced; otherwise HTML is reduced to its article \
-                      content in process. Plain text and JSON come back as they are. \
-                      Binary files, including PDFs, are reported rather than returned: \
-                      the backend renders pages, it does not extract documents. Private, \
-                      loopback and cluster-internal addresses are refused."
+                      Markdown; otherwise HTML is reduced to its article content in \
+                      process. Plain text and JSON come back as they are. Binary files, \
+                      including PDFs, are reported rather than returned. Private, loopback \
+                      and cluster-internal addresses are refused."
             .into(),
         parameters: serde_json::json!({
             "type": "object",
@@ -1297,7 +1211,7 @@ pub fn web_fetch_with_fallback(
                 },
                 "max_chars": {
                     "type": "integer",
-                    "description": "Cap on returned characters (default 20000, max 200000)"
+                    "description": "Character cap; the whole page if omitted"
                 }
             },
             "required": ["url"]
@@ -1317,10 +1231,9 @@ pub fn web_fetch_with_fallback(
                     }
                 };
                 let client = http_client(client)?;
-                let max_chars = args["max_chars"]
-                    .as_u64()
-                    .unwrap_or(DEFAULT_FETCH_CHARS)
-                    .clamp(1, MAX_FETCH_CHARS) as usize;
+                // 调用方说要多少就多少：不说就整页给，说了也不夹到一个更小的数上。
+                // 传输量的界在抓取那一层，与这里要显示多少字无关。
+                let max_chars = args["max_chars"].as_u64().map(|n| n as usize);
                 // The address guard runs before either layer, so no layer can be
                 // pointed at loopback or at a cluster-internal service: the
                 // fallback outlet is handed only addresses this process already
@@ -1354,6 +1267,7 @@ pub fn web_fetch_with_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cog_test_support::standalone_numbers;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -1441,6 +1355,37 @@ mod tests {
         Some(scripted.clone() as Arc<dyn HttpClient>)
     }
 
+    /// 搜索与抓取都没有本地的默认值和上限：不说就交给后端 / 整页给，说了就
+    /// 照说的给。删掉这两个常量之后它们最容易以别的方式长回来——在描述里写
+    /// 「default 10」「max 200000」——所以这里按独立数字判两个工具的每一个
+    /// 字段描述，`UTF-8` 里的 8 不算。
+    #[test]
+    fn neither_the_tool_nor_its_fields_invent_a_bound() {
+        for tool in [
+            web_search(None, Some("http://searx".into())),
+            web_fetch(None, Some("http://render".into())),
+        ] {
+            assert!(
+                standalone_numbers(&tool.description).is_empty(),
+                "{} 的描述里出现了一个数：上限与默认值属于执行它的代码，不属于描述: {}",
+                tool.name,
+                tool.description
+            );
+            for (field, schema) in tool.parameters["properties"]
+                .as_object()
+                .into_iter()
+                .flatten()
+            {
+                let text = schema["description"].as_str().unwrap_or(Default::default());
+                assert!(
+                    standalone_numbers(text).is_empty(),
+                    "{} 的 {field} 字段又开始自己声明一个数了：不设默认、不设上限: {text}",
+                    tool.name
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn search_asks_the_backend_for_json_and_names_the_hits() {
         let scripted = Scripted::answering(
@@ -1487,6 +1432,45 @@ mod tests {
         );
     }
 
+    /// 不设默认、不设上限：调用方不说，请求里就没有 `limit`，由后端自己的
+    /// 默认回答；说了，就照它说的要，不再夹到一个人挑的数上。
+    #[tokio::test]
+    async fn a_search_carries_only_the_limit_the_caller_asked_for() {
+        let body = r#"{"results":[
+             {"title":"Rust","url":"https://example.com/rust","content":"notes"}],
+           "answers":[]}"#;
+
+        let scripted = Scripted::answering(200, cog_core::CONTENT_TYPE_JSON, body);
+        let tool = web_search(client_of(&scripted), Some("http://searx".into()));
+        let out = call(&tool, serde_json::json!({"query": "rust 2024"}))
+            .await
+            .expect("a healthy backend answers");
+        let asked = scripted.asked();
+        assert!(
+            !asked[0].url.contains("limit="),
+            "no default is invented when the caller stays silent: {}",
+            asked[0].url
+        );
+        assert!(
+            out["limit"].is_null(),
+            "the answer says no limit was asked for rather than naming one: {out}"
+        );
+
+        let scripted = Scripted::answering(200, cog_core::CONTENT_TYPE_JSON, body);
+        let tool = web_search(client_of(&scripted), Some("http://searx".into()));
+        call(
+            &tool,
+            serde_json::json!({"query": "rust 2024", "limit": 100}),
+        )
+        .await
+        .expect("a healthy backend answers");
+        assert!(
+            scripted.asked()[0].url.contains("limit=100"),
+            "the caller's number is asked for as given, not clamped: {}",
+            scripted.asked()[0].url
+        );
+    }
+
     /// A fan-out where nothing answered is a failed lookup, not an empty web.
     ///
     /// The backend reports both the same way -- HTTP 200 and a `results` array
@@ -1501,10 +1485,7 @@ mod tests {
         let silent = r#"{"query":"rust lang","results":[],"answers":[],"suggestions":[],
                "unresponsive_engines":[["bing","timeout"]]}"#
             .to_string();
-        let scripted = Scripted::answering_in_order(vec![
-            (200, cog_core::CONTENT_TYPE_JSON, silent.clone()),
-            (200, cog_core::CONTENT_TYPE_JSON, silent),
-        ]);
+        let scripted = Scripted::answering(200, cog_core::CONTENT_TYPE_JSON, silent);
         let tool = web_search(client_of(&scripted), Some("http://searxng:8080".into()));
         let err = call(&tool, serde_json::json!({"query":"rust lang"}))
             .await
@@ -1522,21 +1503,21 @@ mod tests {
         );
         assert_eq!(
             scripted.asked().len(),
-            SEARCH_ATTEMPTS as usize,
-            "the silence has to be re-asked before it is reported: one timed-out engine \
-             often answers the next request, and this deployment has only one engine"
+            1,
+            "one call asks once: whether to ask again is the caller's decision, and the \
+             error tells it which one comes next"
         );
     }
 
-    /// Silence that clears on the second ask is an answer, not an error.
+    /// The retry the error asks for works: a second call to the same query,
+    /// after the engine's silence has cleared, returns the hits.
     ///
-    /// This is the case the retry exists for and the one measured on the
-    /// deployment: the first query came back empty with the engine timing out,
-    /// and the request right after it returned the hits. Reporting the first
-    /// one would hand the caller an outage it would then have to retry itself,
-    /// through a model turn, at the cost of a whole turn.
+    /// This is the case measured on the deployment: one query came back empty
+    /// with the engine timing out, and the request right after it answered
+    /// normally. The tool asks once and says which engine stayed silent; the
+    /// caller's next call is the retry, and it is answerable.
     #[tokio::test]
-    async fn search_asks_again_when_the_first_ask_found_nothing_and_nobody_answered() {
+    async fn a_retry_from_the_caller_answers_once_the_silence_clears() {
         let scripted = Scripted::answering_in_order(vec![
             (
                 200,
@@ -1552,15 +1533,17 @@ mod tests {
             ),
         ]);
         let tool = web_search(client_of(&scripted), Some("http://searxng:8080".into()));
+        let first = call(&tool, serde_json::json!({"query":"rust"})).await;
+        assert!(first.is_err(), "silence is reported, not retried in place");
         let out = call(&tool, serde_json::json!({"query":"rust"}))
             .await
-            .expect("the second ask answered, so this is a hit and not an outage");
+            .expect("the caller's own retry answered, so this is a hit and not an outage");
         assert_eq!(out["count"], 1);
         assert_eq!(out["results"][0]["url"], "https://rust-lang.org/");
         assert_eq!(
             scripted.asked().len(),
             2,
-            "exactly one extra ask: the retry is not a loop that keeps the caller waiting"
+            "one request per call: the tool does not ask twice behind one call"
         );
     }
 
@@ -1767,10 +1750,12 @@ mod tests {
     /// （和事后读日志的人）要能从答案本身分辨这一点。
     #[tokio::test]
     async fn the_fallback_answers_a_query_the_self_hosted_backend_never_asked() {
-        let silent = r#"{"results":[],"unresponsive_engines":[["bing","timeout"]]}"#.to_string();
         let scripted = Scripted::answering_in_order(vec![
-            (200, cog_core::CONTENT_TYPE_JSON, silent.clone()),
-            (200, cog_core::CONTENT_TYPE_JSON, silent),
+            (
+                200,
+                cog_core::CONTENT_TYPE_JSON,
+                r#"{"results":[],"unresponsive_engines":[["bing","timeout"]]}"#.to_string(),
+            ),
             (
                 200,
                 cog_core::CONTENT_TYPE_JSON,
@@ -1805,12 +1790,12 @@ mod tests {
         let asked = scripted.asked();
         assert_eq!(
             asked.len(),
-            3,
-            "two asks of the self-hosted layer, then one of the fallback"
+            2,
+            "one ask of the self-hosted layer, then one of the fallback"
         );
-        assert_eq!(asked[2].method, "POST");
-        assert_eq!(asked[2].url, "http://gateway:8081/search-fallback/search");
-        let sent = String::from_utf8(asked[2].body.clone().unwrap_or_default()).unwrap();
+        assert_eq!(asked[1].method, "POST");
+        assert_eq!(asked[1].url, "http://gateway:8081/search-fallback/search");
+        let sent = String::from_utf8(asked[1].body.clone().unwrap_or_default()).unwrap();
         assert!(
             sent.contains("rust lang"),
             "the query travels in the body, not in a URL the caller can point elsewhere: {sent}"
@@ -1823,10 +1808,12 @@ mod tests {
     /// 那层的沉默藏起来，而沉默才是下一次该先修的东西。
     #[tokio::test]
     async fn two_failed_backends_are_both_named_in_the_error() {
-        let silent = r#"{"results":[],"unresponsive_engines":[["bing","timeout"]]}"#.to_string();
         let scripted = Scripted::answering_in_order(vec![
-            (200, cog_core::CONTENT_TYPE_JSON, silent.clone()),
-            (200, cog_core::CONTENT_TYPE_JSON, silent),
+            (
+                200,
+                cog_core::CONTENT_TYPE_JSON,
+                r#"{"results":[],"unresponsive_engines":[["bing","timeout"]]}"#.to_string(),
+            ),
             (
                 503,
                 cog_core::CONTENT_TYPE_JSON,
@@ -1854,10 +1841,12 @@ mod tests {
     /// `count: 0`——正是这次要防的那个混淆，绕一圈又回来了。
     #[tokio::test]
     async fn an_empty_fallback_answer_does_not_become_an_empty_web() {
-        let silent = r#"{"results":[],"unresponsive_engines":[["bing","timeout"]]}"#.to_string();
         let scripted = Scripted::answering_in_order(vec![
-            (200, cog_core::CONTENT_TYPE_JSON, silent.clone()),
-            (200, cog_core::CONTENT_TYPE_JSON, silent),
+            (
+                200,
+                cog_core::CONTENT_TYPE_JSON,
+                r#"{"results":[],"unresponsive_engines":[["bing","timeout"]]}"#.to_string(),
+            ),
             (
                 200,
                 cog_core::CONTENT_TYPE_JSON,
@@ -1918,7 +1907,9 @@ mod tests {
             .expect("the second backend found what the first did not");
         assert_eq!(out["count"], 1);
         assert_eq!(out["source"], "fallback");
-        let because = out["fallback_because"].as_str().unwrap_or_default();
+        let because = out["fallback_because"]
+            .as_str()
+            .unwrap_or(Default::default());
         assert!(
             because.contains("matched nothing"),
             "为什么不问自建那层，答案里要说清楚——这里不是沉默，是没匹配上: {out}"
@@ -2046,7 +2037,7 @@ mod tests {
         )
         .await
         .expect("a public page is fetched");
-        let text = out["text"].as_str().unwrap_or_default();
+        let text = out["text"].as_str().unwrap_or(Default::default());
         assert!(text.contains("promise you keep"), "{out}");
         assert!(text.contains("Invalidation is the clock"), "{out}");
         assert!(!text.contains("track()"), "script text is not prose: {out}");
@@ -2301,13 +2292,13 @@ mod tests {
         );
     }
 
-    /// A 5xx is the renderer failing on its own budget, and one more ask gets the
-    /// page. Without the retry the caller sees the failure the backend had
-    /// while its browser was cold and reads it as a page that cannot be fetched.
+    /// 渲染器答 5xx 就是它自己那一趟没跑完；工具问一次，把后端的话原样交给
+    /// 调用方，由它决定要不要再要一次。工具里存一个重试次数，就是替调用方拍
+    /// 了一个「几次算够」的数。
     #[tokio::test]
-    async fn a_render_the_backend_failed_on_is_asked_for_again() {
+    async fn a_render_the_backend_refused_is_reported_without_a_second_ask() {
         let scripted = Scripted::answering_in_order(vec![
-            (500, "text/plain", "render budget exhausted".into()),
+            (500u16, "text/plain", "render budget exhausted".to_string()),
             (
                 200,
                 cog_core::CONTENT_TYPE_JSON,
@@ -2323,44 +2314,20 @@ mod tests {
             client_of(&scripted),
             Some("http://render.invalid:11235".into()),
         );
-        let out = call(
-            &tool,
-            serde_json::json!({"url":"https://example.com/heavy"}),
-        )
-        .await
-        .expect("a page the backend failed on once is asked for again");
-        assert_eq!(
-            scripted.asked().len(),
-            2,
-            "the failure is repeated once, then the page comes back"
-        );
-        assert!(out["text"]
-            .as_str()
-            .unwrap()
-            .contains("rendered the second time"));
-    }
-
-    /// A page the backend keeps failing on carries how many times it was asked,
-    /// so a reader can tell a flaky renderer from a page that never renders.
-    #[tokio::test]
-    async fn a_render_that_keeps_failing_says_how_many_attempts_it_took() {
-        let failing = || (500u16, "text/plain", "render budget exhausted".to_string());
-        let scripted = Scripted::answering_in_order(vec![failing(), failing()]);
-        let tool = web_fetch(
-            client_of(&scripted),
-            Some("http://render.invalid:11235".into()),
-        );
         let err = call(
             &tool,
             serde_json::json!({"url":"https://example.com/heavy"}),
         )
         .await
-        .expect_err("two failures are still a failure");
+        .expect_err("a refused render comes back as a refusal");
+        assert_eq!(scripted.asked().len(), 1, "the tool asks once");
         let msg = err.to_string();
-        assert_eq!(scripted.asked().len(), 2, "the retry is bounded at two");
         assert!(
-            msg.contains("on 2 attempts") && msg.contains("render budget exhausted"),
-            "the error names the attempt count and the backend's own words: {msg}"
+            msg.contains("http://render.invalid:11235")
+                && msg.contains("HTTP 500")
+                && msg.contains("render budget exhausted"),
+            "the error names the backend, the status and the backend's own words, so a \
+             caller can tell a flaky renderer from a page that cannot be fetched: {msg}"
         );
     }
 

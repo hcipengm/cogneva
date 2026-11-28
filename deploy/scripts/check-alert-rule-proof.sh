@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# reads: deploy/k3s/observability/tests/*.yaml subject
 # 托管告警规则（`deploy/k3s/observability/manifests/*prometheusrule*.yaml`）里，每一条
 # 都得有一份 promtool 证明：一格它**会响**，一格它**不响**。
 #

@@ -1,3 +1,4 @@
+//! principle: feedback_a_trait_read_method_with_no_spec_has_as_many_semantics_as_implementations
 //! What `get_events` hands back for `Event::payload`, against a live PostgreSQL.
 //!
 //! The column `cog_events.payload` holds the *serialized event*, not its

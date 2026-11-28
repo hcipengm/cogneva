@@ -1,3 +1,4 @@
+# census-keep: shapes=deploy-numbers — 部署清单里的数是部署自己的声明：它写在生效的那一处，改它只改这一次部署，不是代码里看不见的默认；由部署面本身兜住
 name: Release
 
 on:
@@ -15,7 +16,13 @@ jobs:
   build-release:
     name: Build Release Binary
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # The platform's own ceiling, not a budget of ours. A release build that is
+    # still compiling is still working, so the number that ends this job must be
+    # the runner's hard limit rather than a guess at how long a build "should"
+    # take; a guess here throws away every artifact the build had already
+    # produced. GitHub cannot ask whether our step is alive, which is why this
+    # leg keeps a backstop at all while every wait on the host no longer does.
+    timeout-minutes: 360
     permissions:
       contents: write
     steps:
@@ -47,6 +54,23 @@ jobs:
       - name: Install protoc
         # prost-build (etcd-client) shells out to protoc during the build.
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # The release binaries embed the rendered deployment trees, and those are
+      # not committed: bootstrap's build script generates them from the chart at
+      # build time (the deployed host must not need helm). The version comes from
+      # the same HELM_VERSION the bootstrapper downloads, so the release's bytes
+      # are the ones that version produces.
+      - name: Resolve pinned Helm version
+        id: helmver
+        run: |
+          v=$(grep -oP 'const HELM_VERSION: &str = "\K[^"]+' crates/bootstrap/src/main.rs)
+          [ -n "$v" ] || { echo "Could not read HELM_VERSION from crates/bootstrap/src/main.rs"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ steps.helmver.outputs.version }}
+      - name: Install pyyaml
+        run: sudo apt-get update && sudo apt-get install -y python3-yaml
 
       - name: Build release binary
         # --locked: resolve from the committed Cargo.lock; fresh resolution
@@ -183,7 +207,11 @@ jobs:
     # 避免 PATCH 把已有 release notes 覆盖成兜底文本。
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # An upload that is still transferring is still working: the parts are 95 MB
+    # each to a host on another continent, and a piece that really failed says
+    # so in its own HTTP answer. Same ceiling as the other legs -- the runner's,
+    # not a guess at how long the mirror takes.
+    timeout-minutes: 360
     steps:
       - name: Create or update Gitee release
         env:

@@ -74,6 +74,8 @@ pub const GITEE_TOKEN_REFRESHER_LOOP: &str = "gateway_gitee_token_refresher";
 
 /// Gitee OAuth states are single-use and expire quickly: the user is mid-flow
 /// in another tab, anything older than this is abandoned.
+// cap: fixed — the user is mid-flow in another tab; anything older than this is an abandoned flow
+// keep: 删掉后放弃的 OAuth 流永远有效，另一个标签页里的旧流程能被接上；由「超过它是被放弃的流」兜住
 const OAUTH_STATE_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// A generated Ed25519 keypair in OpenSSH formats.
@@ -980,9 +982,22 @@ pub(crate) async fn connect_contribution(
 pub async fn contribution_status_handler(
     State(state): State<Arc<crate::GatewayState>>,
 ) -> Response {
-    let pending_count = match &state.contribution_control {
-        Some(control) => control.pending().await.map(|v| v.len()).unwrap_or(0),
-        None => 0,
+    // 三态，与下面 `gitee_oauth_available` 同一个理由：`null` 是「这一刻问不到
+    // 待回流队列」，不是「一条都没有」。折成 0，这一屏就在控制面读失败的那一拍
+    // 告诉所有者「没有要你点头的变更」——而恰恰是那一拍，待批的变更最不该被当成
+    // 不存在。没有接控制面（集成未启用）也是同一句话：这一格没有读数。
+    let pending_count: Option<usize> = match &state.contribution_control {
+        Some(control) => match control.pending().await {
+            Ok(changes) => Some(changes.len()),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "待回流队列读不出来；这一格报「读不到」而不是 0——读失败与空队列不是同一件事"
+                );
+                None
+            }
+        },
+        None => None,
     };
     // 这一屏的每一个布尔位都来自那两片 Secret，而 Secret 只该由网关读。主应用
     // 保留的是它自己才知道的那几格（待回流条数、本进程的授权码能力），其余由
@@ -1322,8 +1337,8 @@ pub async fn github_app_manifest_handler(
     };
     let status = resp.status;
     if !resp.is_success() {
-        let body = resp.text().unwrap_or_default();
-        let body: String = body.chars().take(300).collect();
+        // 错误路径默认无损：上游整段答复交给调用方，不在这里切。
+        let body = resp.text().unwrap_or(Default::default());
         return (
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": "manifest_exchange_failed", "message": format!("GitHub 返回 {status}: {body}")})),
@@ -1484,8 +1499,8 @@ pub(crate) async fn discover_github_app() -> (StatusCode, serde_json::Value) {
     };
     let status = resp.status;
     if !resp.is_success() {
-        let body = resp.text().unwrap_or_default();
-        let body: String = body.chars().take(300).collect();
+        // 错误路径默认无损：上游整段答复交给调用方，不在这里切。
+        let body = resp.text().unwrap_or(Default::default());
         return (
             StatusCode::BAD_GATEWAY,
             json!({"error": "installations_lookup_failed", "message": format!("GitHub 返回 {status}: {body}")}),
@@ -1902,6 +1917,7 @@ pub(crate) fn oauth_result_page(title: &str, detail: &str, ok: bool) -> Html<Str
          .card{{max-width:420px;padding:28px;border:1px solid #30363d;border-radius:12px;background:#161b22}}\
          h1{{font-size:18px;margin:0 0 10px;color:{color}}}p{{font-size:13px;color:#8b949e;line-height:1.7;margin:0}}</style></head>\
          <body><div class=\"card\"><h1>{title}</h1><p>{detail}</p></div>\
+         <!-- keep: 一次性授权页的自动关窗计时：只影响这一页何时自己关，不参与决定；删掉只是它不自动关。由回跳页兜住 -->\
          <script>if (window.opener) {{ setTimeout(() => window.close(), 1500); }}</script></body></html>"
     ))
 }
@@ -1912,7 +1928,7 @@ pub(crate) fn oauth_result_page(title: &str, detail: &str, ok: bool) -> Html<Str
 /// token, and the single-use state parameter is the CSRF proof.
 pub async fn gitee_oauth_callback_handler(Query(q): Query<GiteeOAuthCallbackQuery>) -> Response {
     if let Some(err) = q.error {
-        let detail = q.error_description.unwrap_or_default();
+        let detail = q.error_description.unwrap_or(Default::default());
         return oauth_result_page(
             "授权未完成",
             &format!("Gitee 返回错误：{err} {detail}。请回到接管台重试。"),
@@ -2411,7 +2427,7 @@ async fn gitee_refresh_tick(
         let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
         String::from_utf8(bytes).ok()
     };
-    let config_raw = decode(SECRET_CONTRIB_CONFIG).unwrap_or_default();
+    let config_raw = decode(SECRET_CONTRIB_CONFIG).unwrap_or(Default::default());
     let config: serde_json::Value = serde_json::from_str(&config_raw).unwrap_or_else(|_| json!({}));
     // 读数在判之前就写：这一拍刷不刷新、刷没刷成，都先留下「此刻还剩多少」。
     // 只在刷新成功时写的话，失败路径上的读数是上一次成功时的旧值——而

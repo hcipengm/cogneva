@@ -1,0 +1,487 @@
+#!/usr/bin/env bash
+# Refuse a commit whose staged Rust files rustfmt would rewrite.
+#
+# Why at the commit: the same slip -- a hand-written line break rustfmt folds
+# back -- has reached CI's Format job eight times, and each time the remedy had
+# already been written down before the commit was made. The cost is not the red
+# check itself: a single failing job holds the whole rollout (the deployer holds
+# the rev while any signal in the verdict is a failure), so one folded line puts
+# a finished round outside the cluster until somebody notices. CI's Format job
+# runs on the tree that was already pushed; this is the earliest point the same
+# question can be asked, and it is asked of the same bytes.
+#
+# Reject only -- never rewrite, never stage. rustfmt rewrites the whole file on
+# disk, and in a tree two sessions share the `git add` that followed it would
+# stage the other session's unstaged hunks into this commit: the accident a
+# narrow add exists to prevent, one layer further in. Rewriting is safe only
+# where the writer owns the file, which a hook cannot know.
+#
+# Judged as the commit will hold it. The bytes come out of the index, not off
+# the working tree, so an edit a peer has not staged yet is not judged and does
+# not refuse a commit it is no part of. A file that is only edited on disk is
+# not judged at all -- CI reads the pushed commit, and so does this.
+#
+# The deciding inputs come from the tree, not from this script: the paths are
+# the staged ones, the edition is the nearest `Cargo.toml`'s (walking up through
+# `edition.workspace = true` to the workspace root), and any `rustfmt.toml` in
+# the index is mirrored along with them. A number written here instead would be
+# a second answer to "how is this tree formatted", free to drift from the one
+# CI reads.
+#
+# It lives in the private tree rather than in the tree it guards because a clone
+# cannot carry a gate that fires for it: `.git/hooks/` is not cloned, the public
+# repository cannot wire one for its committers, and every commit on this host
+# is made from one clone. That clone is wired to this file by hand --
+#
+#   git -C <cogneva clone> config core.hooksPath <this directory>
+#
+# -- and `scripts/cogneva-rs-fmt-hook.test.sh` asserts that wiring on the host
+# where a clone exists.
+#
+# Escape hatch: `git commit --no-verify`, and say why in the message.
+#
+# Exit 0 means the commit may proceed, including when this check could not run
+# (no rustfmt on this host, unreadable index, no edition to read): "this machine
+# cannot answer" is not a finding about the commit, and blocking the commit on it
+# would make the machine the thing being gated. CI's Format job still governs the
+# pushed tree. Exit 1 means a staged byte is one rustfmt would rewrite or cannot
+# parse.
+set -u
+
+export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+fmt="${RUSTFMT:-rustfmt}"
+
+# 记录的两个函数先立起来：下面每一道提前退出都会经过 `not_judged`，而它要往记录里
+# 落一行。`$(…)` 里那次「不在 git 工作树里」发生在开跑之前，这时 `record_file` 还是
+# 空的，`journal` 自己会什么都不写。
+record_file=""
+journal_start=$SECONDS
+journal() { # <结局> <这一格的名字>
+  [ -n "${record_file:-}" ] || return 0
+  gate_run_append "${record_file}" "$((SECONDS - journal_start))" "$1" "$2"
+  journal_start=$SECONDS
+}
+
+# Every reason this check did not run leaves by here: one named line, exit 0.
+not_judged() {
+  printf 'pre-commit（格式）: 这次没有判定 —— %s\n' "$1" >&2
+  journal UNJUDGED "格式（$1）"
+  exit 0
+}
+
+top="$(git rev-parse --show-toplevel 2>/dev/null)" || not_judged "不在 git 工作树里"
+[ -n "${top:-}" ] || not_judged "不在 git 工作树里"
+
+# ---- 这一步自己的读数：花了多少、结局是什么 --------------------------------
+#
+# 交付链在 WebUI 上有七格，其中「提交」这一格问的正是这里：这一笔被哪一格挡下、
+# 放行花了多少秒。原先这些只印在终端上，滚过去就没了。记录写进构建槽目录——那个
+# 目录已经只读挂进网关 Pod，页面从它已有的那一面读出来，所以这里不新开通道、
+# 不新开格式：与整门同一份三列（秒、结局、说明）。
+#
+# 记录写不进去只少一面读数，绝不改变这里的判定：`set -u` 下每处都先问文件在不在。
+record_lib="$top/deploy/scripts/lib/gate-run-record.sh"
+if [ -f "$record_lib" ]; then
+  # shellcheck source=/dev/null
+  . "$record_lib"
+  record_file="$(gate_run_begin "${COGNEVA_BUILD_GATE_LOCK_DIR:-/var/lib/cogneva-build-gate}" \
+    "$top" precommit "$(date +%s)" "$$")"
+fi
+
+# 退出只有一处：镜像目录（后面才建）与这条记录都在这里收拾。装两个 `trap … EXIT`
+# 是后者把前者顶掉，不是两条都跑——下半段那条清理会静默消失，/tmp 里留下没删的镜像。
+tmp=""
+cleanup() {
+  [ -n "${tmp:-}" ] && rm -rf "${tmp}"
+  [ -n "${record_file:-}" ] && gate_run_finish "${record_file}"
+  return 0
+}
+trap cleanup EXIT
+
+# ---- 别的关注点：`pre-commit.d/*.sh` 各一份 --------------------------------
+#
+# 这一份只管格式。往同一个钩子里再堆一段判据会让「哪一段拒的」靠读代码才知道，所以
+# 每多一个关注点就在 `pre-commit.d/` 里多一个剧本：名字带序号（跑的顺序是明的）、
+# 自己写判词、自己决定「判不了」要不要拦（今天一律不拦——CI 仍会判推上去的树）。
+# 目录不在就等于没有别的关注点，不是错误：换一台还没有这个目录的机器不该因此提交不了。
+#
+# 放在**这一份自己的判定之前**：下面每一道提前退出（缺 rustfmt、没有暂存的 Rust）
+# 都是「这一份没什么可判」，而别的关注点看的是别的东西——尤其删除与搬移根本不在
+# `--diff-filter=ACMR` 的射程里，放在后面就等于在正是它该管的那一笔上不跑。
+# ---- 界与有损：判这一笔暂存的新增行 ----------------------------------------
+#
+# 判据在 `scripts/{bounds,loss}-census.py` 里，这里只调用（薄入口）。界默认无界，
+# 有损默认无损；留下来的必须落成 `Bound::derived|fixed` 或 `Excerpt { shown, full_ref }`
+# 并写 `keep:` 理由。红的时候脚本自己把正确写法打出来。
+#
+# 三条判据：根从钩子自己的位置解析（不靠 cwd——principle-commit 调它时不 cd）；
+# 缺 python3 或缺某一个脚本，是「判不了」，记 UNJUDGED 放行，不是拒提交；
+# 没有暂存的改动就直接早退，不为一笔无关的提交付整树扫描的钱。
+census_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.."
+if git -C "$top" diff --cached --quiet -- . 2>/dev/null; then
+  journal ok "界与有损（没有暂存改动）"
+elif ! command -v python3 >/dev/null 2>&1; then
+  journal UNJUDGED "界与有损（这台机器没有 python3）"
+else
+  census_missing=""
+  for census in bounds-census.py loss-census.py table-shapes-census.py; do
+    [ -f "$census_root/scripts/$census" ] || census_missing="$census_missing $census"
+  done
+  if [ -n "$census_missing" ]; then
+    journal UNJUDGED "界与有损（缺${census_missing}）"
+  else
+    census_rc=0
+    python3 "$census_root/scripts/bounds-census.py" --root "$census_root" --check-staged || census_rc=1
+    if [ "$census_rc" -eq 0 ]; then
+      python3 "$census_root/scripts/loss-census.py" --root "$census_root" --check-staged || census_rc=1
+    fi
+    if [ "$census_rc" -eq 0 ]; then
+      journal ok "界与有损"
+    else
+      journal RED "界与有损"
+      exit 1
+    fi
+  fi
+fi
+
+extra_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pre-commit.d"
+if [ -d "$extra_dir" ]; then
+  for extra in "$extra_dir"/*.sh; do
+    [ -f "$extra" ] || continue
+    # 每一份各占记录里的一行：一份钩子跑得慢或偶尔拒一次，要在读数上认得出是它，
+    # 而不是把责任摊给「提交」这一整格。
+    if bash "$extra"; then
+      journal ok "$(basename "$extra" .sh)"
+    else
+      journal RED "$(basename "$extra" .sh)"
+      exit 1
+    fi
+  done
+fi
+
+command -v "$fmt" >/dev/null 2>&1 ||
+  not_judged "PATH 里没有 $fmt（CI 的 Format 作业仍会在推后判这棵树）"
+
+# ---- 动了 `crates/cog-core` 时提示 —— 只提示，不拦 ----------------------------
+#
+# 属主 2026-10-12：core 非必要不碰，能在一个 crate 完成的就在一个 crate 完成。
+# 这条原则此前只在每会话自动加载的索引里以一行标题出现；索引里那份手抄清单撤掉之后，
+# 它不该就此从执行者的眼前消失，也不该靠重建一份清单回来——按重要性挑选条目就是重建
+# 层级。可检验的那一半是形状：这一笔碰没碰 core、净增还是净减、是不是只动了那两张
+# 只增登记表。判不了的那一半（理由够不够）不伪装成判决，所以这里**只提示**。
+#
+# 放在 rustfmt 判定之前：那个判定在缺工具时会提前 exit 0，而这条提示不依赖它。
+here="$(cd "$(dirname "$0")" && pwd)"
+# 门在哪里：公开仓自己的 `gates/` 优先；没有就退到本机配置的私有仓（还没搬过来的那几道）。
+# 早先这四道全在私有仓，钩子用 `../../gates/` 指过去——钩子搬进公开仓之后，那条相对
+# 路径指向不存在的地方，于是每道门都走「判不了」。两个来源都试一遍，谁在就用谁。
+gate_dir="$here/gates"
+if [ ! -d "$gate_dir" ]; then
+  gate_dir="$(git config --get cogneva.gatesDir 2>/dev/null || true)"
+fi
+[ -n "${gate_dir:-}" ] || gate_dir="$here/gates"
+core_check="$gate_dir/check-core-touch.sh"
+if [ -f "$core_check" ]; then
+  bash "$core_check" || true
+  journal ok "cog-core 提示"
+fi
+
+# ---- 写者租约：带内接手写 diff 时，带外的写入在**写入口**被挡下 --------------
+#
+# 属主 2026-10-16 的交接设计：池恢复后 cogneva 自己写变更，宿主上带外 claude code
+# 的进程要停手。通知不是判据，「写的时候被挡下」才是。租约状态住在宿主
+# （writer-lease.sh），这里只读它；没有租约或已过期时放行，所以平时没有任何成本。
+# 放在 rustfmt 之前：那条路在缺工具时会 exit 0，而这条拒词与 rustfmt 无关。
+lease_check="$gate_dir/check-writer-lease.sh"
+if [ -f "$lease_check" ]; then
+  bash "$lease_check"
+  lease_rc=$?
+  if [ "$lease_rc" -ne 0 ]; then
+    journal RED "写者租约"
+    exit "$lease_rc"
+  fi
+  journal ok "写者租约"
+fi
+
+# ---- 私有仓的名字：不许进公开树，在离开本机之前判 ----------------------------
+#
+# 公开仓 CI 里有 `.github/scripts/check-private-identifiers.sh`，但它只锚所有者句柄，裸标识
+# 那一遍要一份从 secret 注入的名单——**secret 缺席时它明说没跑**。于是「说明里顺手写下
+# 私有仓的名字」这件事，在推之前没有任何东西问过：2026-10-22 实测公开树里有 24 处，全是
+# 「这条读数不在本仓、它在哪」这类指路，一次都没被拦下。
+#
+# 判的是这一笔**索引里新增的字节**：存量不归提交者管，拿它判红的门第一天就会被
+# `--no-verify` 学会。判据住在私有仓（名单从它自己的名字推导，写进公开树就等于把它要防的
+# 东西放进被它守的那棵树里）。
+#
+# 判不了（推不出标识、不在 git 树里）时**明说没判定并放行**：机器答不上来不是关于这一笔
+# 的结论。拒的只有一种情形——新增的字节里真的出现了那个名字。
+pvt="$gate_dir/check-private-references.sh"
+if [ ! -f "$pvt" ]; then
+  printf 'pre-commit（私有标识）：这份检查不在这台机器上（%s 不存在）——这一次没有被判定。\n' "$pvt" >&2
+  journal UNJUDGED "私有标识（检查不在这台机器上）"
+else
+  pvt_rc=0
+  bash "$pvt" --index "$top" || pvt_rc=$?
+  case "$pvt_rc" in
+    0) journal ok "私有标识" ;;
+    1)
+      journal RED "私有标识"
+      exit 1
+      ;;
+    *)
+      printf 'pre-commit（私有标识）：这一跑什么都没判（退出码 %s）——不是你的提交有问题，也不是判定通过。\n' "$pvt_rc" >&2
+      printf '    要照常提交：`git commit --no-verify`，并把上面那段输出交给维护它的人。\n' >&2
+      journal UNJUDGED "私有标识（退出码 $pvt_rc）"
+      ;;
+  esac
+fi
+
+# ---- 动过部署拓扑的任何一面，就在离开本机之前判一次 parity --------------------
+#
+# 拓扑的权威源是 chart（`deploy/helm/cogneva/`）；`deploy/rendered/` 是它的预渲染投影，
+# `deploy/k3s/` 是 bootstrap 与集群内 GitOps 消费的静态清单。改一处拓扑的正常形状是
+# 三份同提一笔，而 CI 的 deploy-parity 作业要等推送之后才判：漏同步的那一份会先把整轮
+# 滚动扣住——mainline_deployer 见到判词里有一个失败就不部署——再让人回头找差在哪。
+# 在这里判，差的那一份还没离开本机。
+#
+# 只判**这一笔暂存的路径**，不判整棵树：共享树里别人在飞的编辑不归提交者管，判整棵树
+# 会让一个从没碰过 `deploy/` 的提交因旁人的未暂存改动变红。判据本身渲的是目录，所以
+# 镜像的是**索引里的 `deploy/`**（`checkout-index` 出来的那一份），不是盘上那一份：
+# 盘上随时可能躺着另一会话没暂存的 chart/清单改动，那几份字节不归这次提交。
+#
+# 缺 helm/kubectl/python3 时**跳过并说出来**，不拒：工具不在 PATH 与清单不一致是两件
+# 事，只有后者是关于这次提交的结论。判不了的事不冒充判过，CI 的作业仍然在推后判。
+#
+# 删掉一份清单也在判据里：`--diff-filter` 不设，删除同样是拓扑的一次改动。
+staged_deploy="$(git diff --cached --name-only -- \
+  deploy/helm deploy/rendered deploy/k3s)" || staged_deploy=""
+if [ -n "$staged_deploy" ]; then
+  parity="$top/deploy/scripts/check-deploy-parity.sh"
+
+  # 结局必须落盘，不能只在终端上闪一下：「这次没有判定」与「判过、绿了」在终端上都是
+  # 一行一闪而过，事后读日志时分不开，而**没有判定恰好是最该被数出来的那一档**。
+  # 同时记毫秒：这条判据跑在闸的队列里，偶发变慢会被算进「这一笔提交慢」，归因不到它头上。
+  # 目录取持槽时 export 的那份（COGNEVA_COMMIT_GATE_HELD=<目录>|<槽号>），没有就按缺省推定；
+  # 两种情形都写，普通 `git commit`（没过闸）也是「这一笔发生了什么」的一部分。
+  # `set -u` 下不能直接对未定义变量做 `${x%%pat}`：普通 `git commit`（没过闸）就没有这个变量。
+  parity_gate_dir="${COGNEVA_COMMIT_GATE_HELD:-}"
+  parity_gate_dir="${parity_gate_dir%%|*}"
+  [ -n "$parity_gate_dir" ] ||
+    parity_gate_dir="${COGNEVA_COMMIT_GATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/cogneva/commit-gate}"
+  now_ms() {
+    local n
+    n="$(date +%s%N 2>/dev/null)"
+    case "$n" in '' | *[!0-9]*) printf '%s000' "$(date +%s)" ;; *) printf '%s' "$((n / 1000000))" ;; esac
+  }
+  record_parity() { # $1 = 结局（ok|refused|not-judged） $2 = 毫秒 $3 = 理由（- 为无）
+    local paths
+    paths="$(printf '%s\n' "$staged_deploy" | grep -v '^$' | tr '\n' ',' | sed 's/,$//')"
+    mkdir -p "$parity_gate_dir" 2>/dev/null || return 0
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$$" "$1" "$2" "${3:--}" \
+      "${paths:--}" >>"$parity_gate_dir/deploy-parity.tsv" 2>/dev/null || true
+    # 同一次结局也进交付链的记录：terminal 上那行只活到终端关掉。
+    case "$1" in
+      ok) journal ok "部署 parity" ;;
+      refused) journal RED "部署 parity" ;;
+      *) journal UNJUDGED "部署 parity（${3:--}）" ;;
+    esac
+  }
+  parity_skip() { # $1 = 为什么没有判定
+    printf 'pre-commit（部署 parity）: 这次没有判定 —— %s\n' "$1" >&2
+    record_parity not-judged 0 "$1"
+  }
+
+  missing=""
+  for bin in helm kubectl python3; do
+    command -v "$bin" >/dev/null 2>&1 || missing="$missing $bin"
+  done
+  mirror=""
+  if [ ! -f "$parity" ]; then
+    parity_skip "$parity 不在"
+  elif [ -n "$missing" ]; then
+    parity_skip "PATH 里缺$missing（CI 的 deploy-parity 作业仍会在推后判）"
+  elif ! mirror="$(mktemp -d -p /dev/shm 2>/dev/null || mktemp -d)"; then
+    parity_skip "建不出镜像目录"
+  elif ! (cd "$top" && git ls-files -z deploy |
+    git checkout-index -z --stdin --prefix="$mirror/") >/dev/null 2>&1; then
+    rm -rf "$mirror"
+    mirror=""
+    parity_skip "索引里的 deploy/ 读不出来"
+  fi
+  parity_rc=0
+  if [ -n "$mirror" ]; then
+    # 判据**自己那几行**也取索引里的那一份：判的是这一笔提交，那么判据的字节也该是
+    # 这一笔提交里的字节。盘上的 `deploy/scripts/check-deploy-parity.sh` 可能是另一个
+    # 会话还没暂存的编辑——用它，等于让这一笔被一份它没有含的判据判，判绿了也不成立。
+    # 镜像里一定有它（tracked 文件 `checkout-index` 全量出），缺了才退回盘上那份。
+    # `set -e` 下不能写成 `[ -f x ] && parity=…`：条件为假时整条命令返回 1，钩子会当场退出。
+    if [ -f "$mirror/deploy/scripts/check-deploy-parity.sh" ]; then
+      parity="$mirror/deploy/scripts/check-deploy-parity.sh"
+    fi
+    # 判据卡住比拒了更糟：它占着槽，全队的等待都挂在它身上。给它一个上限，超了记
+    # 「没有判定」——与缺工具同一种结局，不与「对不上」混为一谈。
+    started="$(now_ms)"
+    if command -v timeout >/dev/null 2>&1; then
+      out="$(timeout 180 bash "$parity" "$mirror" 2>&1)"
+      parity_rc=$?
+    else
+      out="$(bash "$parity" "$mirror" 2>&1)"
+      parity_rc=$?
+    fi
+    took_ms=$(( $(now_ms) - started ))
+    rm -rf "$mirror"
+    # 2 = 判据自己说依赖不全；124 = 上面那条上限到点了。两者都是「没判定」。
+    case "$parity_rc" in
+      2 | 124)
+        parity_skip "$([ "$parity_rc" = 124 ] && echo '判据 180 秒没跑完' || echo '判据说依赖不全')（rc=$parity_rc）"
+        parity_rc=0
+        ;;
+      0) record_parity ok "$took_ms" - ;;
+      *) record_parity refused "$took_ms" "chart 与渲染对不上" ;;
+    esac
+  fi
+  if [ "${parity_rc:-0}" -ne 0 ]; then
+    printf 'pre-commit（部署 parity）: 这一笔动过部署拓扑，但与 chart 渲染对不上：\n' >&2
+    printf '%s\n' "$out" | sed -n '1,60p' >&2
+    cat >&2 <<'EOF'
+
+拓扑的权威源是 chart；`deploy/rendered/` 与 `deploy/k3s/` 都是它的投影。改拓扑的顺序：
+chart templates/values → `deploy/scripts/render-deploy.sh` 重新生成 → 同步 `deploy/k3s`，
+三者同提一笔。判据见 `deploy/scripts/check-deploy-parity.sh` 的头部说明。
+
+要照常提交（例如这条判据本身在修）：`git commit --no-verify`，并在信息里写清为什么。
+EOF
+    exit 1
+  fi
+fi
+
+# ---- 告警规则里「已登记、暂无读者」的那一档，判一次出口标记 --------------------
+#
+# 契约测试的 FOREIGN_PENDING 让「先登记、后加读者」能分两笔落地，代价是每条自报出口：
+# Witness（名字在宿主读数登记表里）、Unregistered（不在表里、本仓闭集在发）、
+# NoReading（两边都没有，条目自己写清在等什么）。形状（两表互斥、被规则读到即升档、
+# 自报与闭集相反、条数等于常数）由契约测试在公开仓 CI 里判；**标记与登记表是否一致
+# 只能在私有仓判**——表在那边，公开仓的 CI 看不见它，复制一份过去就是第二份正本。
+#
+# 判的是**这一笔索引**里的那几个字节（`--index`），不是工作树：共享树里别人的草稿
+# 不归这次提交，也不该替它做决定。只在这一笔动了那份文件时才判——不动它时结论不动，
+# 每笔都判只会让一扇常亮的灯被绕过。
+if git diff --cached --name-only -- \
+  crates/cogneva/tests/observability_alert_rule_contract_test.rs | grep -q .; then
+  pxe="$gate_dir/check-pending-exits.py"
+  if [ ! -f "$pxe" ]; then
+    echo "pre-commit（pending 出口）：这份检查不在这台机器上（$pxe 不存在）——这一次没有被判定，不是判定通过。" >&2
+    journal UNJUDGED "pending 出口（检查不在这台机器上）"
+  else
+    prc=0
+    python3 -I "$pxe" --index || prc=$?
+    case "$prc" in
+      0) journal ok "pending 出口" ;;
+      1)
+        echo "pre-commit（pending 出口）：FOREIGN_PENDING 的标记与宿主读数的名册（各生产者脚本头里的自声明）对不上，上面已点名是哪个脚本、标记写了什么。" >&2
+        echo "    改法是二选一：把标记改成与声明一致，或先改声明（声明是正本）。" >&2
+        journal RED "pending 出口"
+        exit 1
+        ;;
+      4)
+        echo "pre-commit（pending 出口）：这一笔里的 FOREIGN_PENDING 自己不合形状——条目认不出、变体名写错、条数与 FOREIGN_PENDING_AT_CENSUS 不相等，或登记表里的名字不合拼法。" >&2
+        echo "    条数那一格不是改门：多加一笔就是多欠一个读者，改这个数就是承认它。" >&2
+        journal RED "pending 出口"
+        exit 1
+        ;;
+      *)
+        echo "pre-commit（pending 出口）：这一跑什么都没判（退出码 ${prc}）——不是你的提交有问题，也不是判定通过。" >&2
+        echo "    它也可能是在说「读不到 cogneva 检出」「这一版里还没有这一档」「表不在或为空」。" >&2
+        echo "    要照常提交：\`git commit --no-verify\`，并把上面那段输出交给维护它的人。" >&2
+        journal UNJUDGED "pending 出口（退出码 $prc）"
+        exit 3
+        ;;
+    esac
+  fi
+fi
+
+# A repository holding `.rs` files but no workspace is not a Rust tree, and the
+# answer to "how is it formatted" is not this script's to give.
+if [ ! -f "$top/Cargo.toml" ]; then
+  journal UNJUDGED "格式（这棵树没有 Cargo.toml）"
+  exit 0
+fi
+
+staged="$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs')" ||
+  not_judged "读不出这次的暂存区"
+if [ -z "$staged" ]; then
+  journal ok "格式（这一笔没有暂存的 Rust）"
+  exit 0
+fi
+
+tmp="$(mktemp -d)" || not_judged "建不出临时目录"
+
+# The index's own bytes, at their own paths, so the diff lines name the paths the
+# committer knows. Everything else tracked comes along for a reason of its own:
+# a test target declares its helpers with `#[path = "common/…"] mod …`, and
+# rustfmt resolves those before it formats anything -- mirror only the staged
+# files and it reports "couldn't read …/common/closed_set.rs" for a file that is
+# perfectly formatted, refusing the commit for the mirror's shape rather than the
+# commit's. Manifests and rustfmt configs decide the answer; the rest is context
+# rustfmt needs to read the file it is judging.
+git ls-files -- '*.rs' '*Cargo.toml' '*rustfmt.toml' |
+  git checkout-index --stdin --prefix="$tmp/" || not_judged "索引里的字节读不出来"
+
+# The edition of the crate a file belongs to, read from the mirrored manifests:
+# a crate's own `edition` if it names one, otherwise the workspace's (its
+# manifest says `edition.workspace = true` and carries no number).
+edition_of() {
+  local d e
+  d="$(dirname "$1")"
+  while :; do
+    if [ -f "$tmp/$d/Cargo.toml" ]; then
+      e="$(grep -oE '^edition *= *"[0-9]{4}"' "$tmp/$d/Cargo.toml" |
+        grep -oE '[0-9]{4}' | head -n1)"
+      if [ -n "$e" ]; then
+        printf '%s' "$e"
+        return 0
+      fi
+    fi
+    [ "$d" = "." ] && return 1
+    d="$(dirname "$d")"
+  done
+}
+
+bad=0
+while IFS= read -r f; do
+  [ -f "$tmp/$f" ] || continue
+  if ! ed="$(edition_of "$f")"; then
+    not_judged "读不出 ${f} 的 edition（最近那份 Cargo.toml 没有数字）"
+  fi
+  out="$(cd "$tmp" && "$fmt" --edition "$ed" --color never --check "$f" 2>&1)"
+  rc=$?
+  [ "$rc" -eq 0 ] && continue
+  if [ "$bad" -eq 0 ]; then
+    printf 'pre-commit（格式）: 这次提交里的 Rust 文件过不了 rustfmt：\n' >&2
+  fi
+  bad=$((bad + 1))
+  # 判的是镜像里的那份，但要说的是提交者认得的那条路径：临时目录的前缀去掉，
+  # edition 也印出来，因为修法要照着它跑。
+  printf '\n【%d】%s（edition %s）\n' "$bad" "$f" "$ed" >&2
+  printf '%s\n' "$out" | sed "s|${tmp}/||g" | sed -n '1,40p' >&2
+done <<<"$staged"
+
+if [ "$bad" -ne 0 ]; then
+  cat >&2 <<'EOF'
+这一条同时是 CI 的 Format 作业（`cargo fmt --all -- --check`，在推之后跑），而作业里
+只要有一条红，整个滚动就被扣住，所以这次提交本来也到不了集群。
+
+修法：对上面每个文件跑 `rustfmt --edition <它括号里那个数> <那条路径>`，再 `git add` 它们。
+**别在共享树里跑 `cargo fmt --all`**：它改写的是盘上整个文件，会把另一会话还没暂存的
+改动一起卷进来，紧接着的 `git add` 就把别人的在飞编辑提交了。若那棵树确实只有你一个写者，
+`cargo fmt --all` 才是安全的（也正是 CI 跑的那条）。
+
+要照常提交（例如这条判据本身在修）：`git commit --no-verify`，并在信息里写清为什么。
+EOF
+  journal RED "格式（$bad 个文件）"
+  exit 1
+fi
+
+journal ok "格式"
+exit 0

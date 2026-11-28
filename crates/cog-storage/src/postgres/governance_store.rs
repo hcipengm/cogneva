@@ -93,7 +93,7 @@ targets AS (\
        AND c.state IN ('{pending}', '{scheduled}')) \
 INSERT INTO task_defined (\
     task_id, rev, workspace_id, kind, input, created_at, priority, max_retries, \
-    timeout_seconds, is_executable, acceptance, blocked_by, agent_id, goal_id, \
+    declared_duration_seconds, is_executable, acceptance, blocked_by, agent_id, goal_id, \
     parent_task_id, sink_task_id, face_id, venue, owner_unit, \
     bound_by_handover_id, submitted_by, planner_verified, planner_version, \
     planner_note, planner_source, planner_confidence, planner_at) \
@@ -101,7 +101,7 @@ SELECT task_id, rev + 1, workspace_id, kind, \
        CASE WHEN jsonb_typeof(input::jsonb) = 'object' \
             THEN jsonb_set(input::jsonb, '{owner_unit}', to_jsonb($3::text), true)::text \
             ELSE input END, \
-       created_at, priority, max_retries, timeout_seconds, is_executable, \
+       created_at, priority, max_retries, declared_duration_seconds, is_executable, \
        acceptance, blocked_by, NULL, goal_id, parent_task_id, sink_task_id, \
        face_id, venue, $3, $4, submitted_by, planner_verified, \
        planner_version, planner_note, planner_source, planner_confidence, planner_at \
@@ -132,7 +132,7 @@ targets AS (\
        AND c.state IN ('{pending}', '{scheduled}')) \
 INSERT INTO task_defined (\
     task_id, rev, workspace_id, kind, input, created_at, priority, max_retries, \
-    timeout_seconds, is_executable, acceptance, blocked_by, agent_id, goal_id, \
+    declared_duration_seconds, is_executable, acceptance, blocked_by, agent_id, goal_id, \
     parent_task_id, sink_task_id, face_id, venue, owner_unit, \
     bound_by_handover_id, submitted_by, planner_verified, planner_version, \
     planner_note, planner_source, planner_confidence, planner_at) \
@@ -140,7 +140,7 @@ SELECT task_id, rev + 1, workspace_id, kind, \
        CASE WHEN jsonb_typeof(input::jsonb) = 'object' \
             THEN jsonb_set(input::jsonb, '{owner_unit}', to_jsonb($3::text), true)::text \
             ELSE input END, \
-       created_at, priority, max_retries, timeout_seconds, is_executable, \
+       created_at, priority, max_retries, declared_duration_seconds, is_executable, \
        acceptance, blocked_by, NULL, goal_id, parent_task_id, sink_task_id, \
        face_id, venue, $3, bound_by_handover_id, submitted_by, planner_verified, \
        planner_version, planner_note, planner_source, planner_confidence, planner_at \
@@ -167,7 +167,7 @@ targets AS (\
        AND c.state IN ('{pending}', '{scheduled}')) \
 INSERT INTO task_defined (\
     task_id, rev, workspace_id, kind, input, created_at, priority, max_retries, \
-    timeout_seconds, is_executable, acceptance, blocked_by, agent_id, goal_id, \
+    declared_duration_seconds, is_executable, acceptance, blocked_by, agent_id, goal_id, \
     parent_task_id, sink_task_id, face_id, venue, owner_unit, \
     bound_by_handover_id, submitted_by, planner_verified, planner_version, \
     planner_note, planner_source, planner_confidence, planner_at) \
@@ -175,7 +175,7 @@ SELECT task_id, rev + 1, workspace_id, kind, \
        CASE WHEN jsonb_typeof(input::jsonb) = 'object' \
             THEN ((input::jsonb) - 'owner_unit')::text \
             ELSE input END, \
-       created_at, priority, max_retries, timeout_seconds, is_executable, \
+       created_at, priority, max_retries, declared_duration_seconds, is_executable, \
        acceptance, blocked_by, NULL, goal_id, parent_task_id, sink_task_id, \
        face_id, venue, NULL, bound_by_handover_id, submitted_by, planner_verified, \
        planner_version, planner_note, planner_source, planner_confidence, planner_at \
@@ -264,7 +264,7 @@ impl PostgresGovernanceStore {
     /// a reading that looks fresh and is one revision behind.
     async fn reproject(conn: &mut sqlx::PgConnection, task_ids: &[String]) -> Result<(), SFError> {
         for task_id in task_ids {
-            task_ledger::project(conn, Some(task_id)).await?;
+            task_ledger::project_incremental(conn, task_id).await?;
         }
         Ok(())
     }
@@ -281,11 +281,33 @@ impl PostgresGovernanceStore {
         .fetch_optional(conn)
         .await
         .map_err(|e| SFError::Database(e.to_string()))?;
-        let revision = input
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-            .and_then(|value| value.pointer("/face/revision").and_then(|v| v.as_i64()));
-        Ok(revision.unwrap_or(1))
+        face_revision_of(task_id, input.as_deref())
     }
+}
+
+/// The revision a face's latest definition states, or `1` when it states none.
+///
+/// A face with no definition row yet is at its first revision, and a row whose
+/// payload carries no `/face/revision` is one written before the field existed;
+/// both answer `1` by convention. Payload text that is not JSON at all is a
+/// different thing: the revision is unknown, and returning `1` let a handover
+/// carrying `expected_revision = 1` win a compare-and-swap against a revision
+/// nobody could read. Refusing to answer is the only outcome that cannot be
+/// mistaken for a matching revision.
+fn face_revision_of(task_id: &str, input: Option<&str>) -> Result<i64, SFError> {
+    let Some(text) = input else {
+        return Ok(1);
+    };
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|e| {
+        SFError::Validation(format!(
+            "face {task_id}: the latest definition's input is not JSON, so its revision \
+             cannot be read ({e}); refusing to guess"
+        ))
+    })?;
+    Ok(value
+        .pointer("/face/revision")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(1))
 }
 
 #[async_trait]
@@ -331,7 +353,7 @@ impl GovernanceStore for PostgresGovernanceStore {
         task_ledger::lock_workspace(&mut tx, GOVERNANCE_WORKSPACE).await?;
         let current = Self::face_revision(&mut tx, &task.id).await?;
         if current != expected {
-            tx.rollback().await.ok();
+            cog_core::ignore_lost!(tx.rollback().await);
             return Ok(false);
         }
         task_ledger::write_task(&mut tx, GOVERNANCE_WORKSPACE, task).await?;
@@ -388,7 +410,7 @@ impl GovernanceStore for PostgresGovernanceStore {
                 // No row answers the question the same way a row in another
                 // state does: the caller asked to write only from the states it
                 // read, and a missing row is not one of them.
-                tx.rollback().await.ok();
+                cog_core::ignore_lost!(tx.rollback().await);
                 Ok(false)
             }
         }
@@ -409,7 +431,7 @@ impl GovernanceStore for PostgresGovernanceStore {
 
         let state = task_ledger::current_state(&mut tx, &node.id).await?;
         if !matches!(state, Some(state) if expected.contains(&state)) {
-            tx.rollback().await.ok();
+            cog_core::ignore_lost!(tx.rollback().await);
             return Ok(false);
         }
 
@@ -442,14 +464,14 @@ impl GovernanceStore for PostgresGovernanceStore {
         // arrived twice must apply once.
         let state = task_ledger::current_state(&mut tx, &handover.id).await?;
         if state != Some(TaskStatus::Scheduled) {
-            tx.rollback().await.ok();
+            cog_core::ignore_lost!(tx.rollback().await);
             return Ok(None);
         }
         task_ledger::write_task(&mut tx, GOVERNANCE_WORKSPACE, handover).await?;
 
         let current = Self::face_revision(&mut tx, &face.id).await?;
         if current != expected_revision {
-            tx.rollback().await.ok();
+            cog_core::ignore_lost!(tx.rollback().await);
             return Ok(None);
         }
         task_ledger::write_task(&mut tx, GOVERNANCE_WORKSPACE, face).await?;
@@ -630,5 +652,45 @@ mod status_templates {
         }
         // 没登记的槽不会被悄悄当成空串填掉。
         assert!(fill_statuses("status = '{nope}'").contains("{nope}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_first_definition_is_revision_one() {
+        assert_eq!(face_revision_of("face-1", None).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_payload_that_states_a_revision_answers_with_it() {
+        let input = r#"{"face":{"revision":7,"id":"face-1"}}"#;
+        assert_eq!(face_revision_of("face-1", Some(input)).unwrap(), 7);
+    }
+
+    /// Rows written before the field existed carry no `/face/revision`; they
+    /// are the convention's other half, not an unreadable row.
+    #[test]
+    fn a_payload_without_the_field_is_revision_one() {
+        assert_eq!(
+            face_revision_of("face-1", Some(r#"{"face":{"id":"x"}}"#)).unwrap(),
+            1
+        );
+    }
+
+    /// The compare-and-swap compares this number with what the caller read.
+    /// Reading an unreadable payload as `1` let a handover carrying
+    /// `expected_revision = 1` win against a revision nobody could see.
+    #[test]
+    fn an_unreadable_payload_is_not_revision_one() {
+        let err = face_revision_of("face-1", Some("{ not json"))
+            .expect_err("an unreadable revision must not be guessed");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("face-1"),
+            "the error must name the face, got: {rendered}"
+        );
     }
 }

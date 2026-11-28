@@ -14,10 +14,11 @@
 //! series that no longer exists.
 //!
 //! The sibling gate `deployed_rule_labels_are_labels_the_code_emits_test.rs`
-//! holds the label *names*; this one holds the *values*. Both the alert rules
-//! and the Grafana dashboard are read: a panel that selects
-//! `outcome="failed"` goes blank for the same reason a rule goes quiet, and the
-//! operator reading the panel cannot tell a blank from a quiet system either.
+//! holds the label *names*; this one holds the *values*. The alert rules are
+//! what it reads: the board no longer spells a query of its own — it is
+//! computed from the closed set of series and the reading registry, so its
+//! panels draw series that exist by construction rather than by a label value
+//! somebody typed into a manifest.
 //! What it judges:
 //!
 //! * every exact value a query selects on one of our own series is a string that
@@ -48,27 +49,15 @@ use common::routes::repo_root;
 
 use common::rust_production::{production_lines, production_sources, sources_of_tree};
 
-/// The two documents an operator reads our series through, and the JSON key
-/// each holds a query under.
-const DOCUMENTS: &[(&str, &str)] = &[
-    ("deploy/helm/cogneva/files/cogneva.json", "promql"),
-    (
-        "deploy/k3s/observability/manifests/06-grafana-dashboard-configmap.yaml",
-        "expr",
-    ),
-];
-
-/// Series published by a producer outside this repository, with the reason its
-/// values are not this tree's to hold.
+/// The document an operator reads our series through, and the JSON key it holds
+/// a query under.
 ///
-/// The name and the values are written by a host-side script in a different
-/// repository, so a value the dashboard selects on it can disappear from this
-/// tree without anything here having changed. Every other `cogneva_` series is
-/// written by this tree and is held to it.
-const NOT_WRITTEN_HERE: &[(&str, &str)] = &[(
-    "cogneva_clippy_last_green_timestamp_seconds",
-    "宿主读数生产者（宿主脚本经统一宿主出口发布），本树不发这条序列",
-)];
+/// The hand-written dashboard used to be the second document. It is gone: the
+/// board is computed from the closed set of series and the reading registry, so
+/// its panels draw series that exist by construction and hold no label value of
+/// their own for this gate to compare. What decides on a label value now is a
+/// rule, and the rule file is what is left to read.
+const DOCUMENTS: &[(&str, &str)] = &[("deploy/helm/cogneva/files/cogneva.json", "promql")];
 
 /// Metric prefixes that belong to another exporter. A selector on `kube_pod_*`
 /// names a vocabulary this tree does not write, and holding it to this tree
@@ -99,10 +88,9 @@ struct Selection {
 
 /// Every query string held under `key` in the document's text.
 ///
-/// Read as text rather than as a parsed document because the dashboard carries
-/// its panels as JSON embedded in a YAML string, and both documents spell an
-/// inner quote the same way (`\"`). One scanner for both keeps a second parser
-/// out of this gate.
+/// Read as text rather than as a parsed document: the queries are JSON strings
+/// with escaped inner quotes (`\"`), and scanning for the key keeps the whole
+/// rule file's shape out of this gate.
 fn expressions_under(text: &str, key: &str) -> Vec<String> {
     let needle = format!("\"{key}\"");
     let bytes = text.as_bytes();
@@ -243,9 +231,6 @@ fn ours(selection: &Selection) -> bool {
         && !FOREIGN_METRIC_PREFIXES
             .iter()
             .any(|prefix| selection.metric.starts_with(prefix))
-        && !NOT_WRITTEN_HERE
-            .iter()
-            .any(|(metric, _)| *metric == selection.metric)
 }
 
 /// The values the rules select on, and the ones no file under `crates/*/src`
@@ -289,20 +274,6 @@ fn wanted_and_missing(root: &Path, files: &[PathBuf]) -> (BTreeSet<Selection>, V
     (wanted, missing)
 }
 
-/// Every series name either document selects by label at all, whether or not
-/// its values are held.
-fn metrics_selected(root: &Path) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    for (file, key) in DOCUMENTS {
-        let text = std::fs::read_to_string(root.join(file))
-            .unwrap_or_else(|e| panic!("{}: {e}", root.join(file).display()));
-        for expression in expressions_under(&text, key) {
-            out.extend(selections(&expression).into_iter().map(|s| s.metric));
-        }
-    }
-    out
-}
-
 #[test]
 fn every_value_a_rule_selects_on_is_a_value_the_tree_writes() {
     let root = repo_root();
@@ -330,16 +301,6 @@ fn every_value_a_rule_selects_on_is_a_value_the_tree_writes() {
         assert!(
             wanted.contains(&selection),
             "规则里读不到 {known:?}：选择器解析坏了"
-        );
-    }
-
-    // 豁免也要保鲜：一条「本树不发」的登记如果已经没有文档再按标签选它，它
-    // 就从「说明」变成了「留下来的洞」。
-    let seen = metrics_selected(&root);
-    for (metric, reason) in NOT_WRITTEN_HERE {
-        assert!(
-            seen.contains(*metric),
-            "`{metric}`（{reason}）已经没有任何文档按标签选它了，这条登记是过期的"
         );
     }
 
@@ -377,13 +338,6 @@ fn a_value_no_source_spells_is_reported_missing() {
         .to_string(),
     )
     .expect("rules");
-    let dashboard = root.join("deploy/k3s/observability/manifests");
-    std::fs::create_dir_all(&dashboard).expect("dashboard dir");
-    std::fs::write(
-        dashboard.join("06-grafana-dashboard-configmap.yaml"),
-        "data:\n  1.json: '{\"expr\": \"max(example_thing{outcome=\\\"written\\\"})\"}'\n",
-    )
-    .expect("dashboard");
     let src = root.join("crates/cog-example/src");
     std::fs::create_dir_all(&src).expect("src dir");
     // `renamed` appears only inside a test module: the emitter was renamed, the
@@ -401,7 +355,7 @@ fn a_value_no_source_spells_is_reported_missing() {
     .expect("source");
 
     let (wanted, missing) = wanted_and_missing(root, &sources_of_tree(root));
-    // 两份文档、三个选择器：值相同的那两个合成一条。
+    // 两个选择器、两个取值，`written` 只出现一次。
     assert_eq!(wanted.len(), 2, "{wanted:?}");
     assert_eq!(
         missing,
@@ -441,21 +395,22 @@ fn the_selector_parser_reads_exact_values_and_skips_patterns() {
         label: "namespace".into(),
         value: "cogneva".into(),
     }));
+    // 带外前缀的序列不是本仓库的词汇：判据按前缀认，不看它有没有在树里出现过。
     assert!(!ours(&Selection {
-        metric: "cogneva_clippy_last_green_timestamp_seconds".into(),
+        metric: "kube_pod_container_status_restarts_total".into(),
         label: "scope".into(),
         value: "selected".into(),
     }));
 
-    // 两份文档的取法：规则文档是纯 JSON，面板文档是 JSON 嵌在 YAML 里。
+    // 扫描器读的是 `"key": "value"`，值里的引号是转义过的 `\"`。
     let plain = expressions_under(
         r#"{"promql": "max by (dir) (cogneva_build_gate_slots)", "other": "x"}"#,
         "promql",
     );
     assert_eq!(plain, vec!["max by (dir) (cogneva_build_gate_slots)"]);
     let embedded = expressions_under(
-        "data:\n  1.json: '{\"expr\": \"sum(rate(cogneva_x_total{outcome=\\\"ok\\\"}[5m]))\"}'\n",
-        "expr",
+        "{\"promql\": \"sum(rate(cogneva_x_total{outcome=\\\"ok\\\"}[5m]))\"}\n",
+        "promql",
     );
     assert_eq!(
         embedded,

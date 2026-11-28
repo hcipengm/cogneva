@@ -146,11 +146,21 @@ export type ChatFrameKind =
   | 'start'
   | 'text_delta'
   | 'end'
+  | 'cancelled'
   | 'thinking_start'
   | 'thinking_delta'
   | 'thinking_end'
   | 'goal'
-  | 'identity';
+  | 'change'
+  | 'identity'
+  | 'usage'
+  | 'compaction'
+  | 'memory'
+  | 'mcp'
+  | 'hooks'
+  | 'tasks'
+  | 'background'
+  | 'colleague';
 
 /** 帧名 → 这一帧在做什么。不在这张表里的名字不是聊天帧。 */
 const CHAT_FRAME_KINDS: Record<string, ChatFrameKind> = {
@@ -162,11 +172,55 @@ const CHAT_FRAME_KINDS: Record<string, ChatFrameKind> = {
   'message.thinking_end': 'thinking_end',
   // 这一轮被受理成了一道目标：后面由任务与监督接管，不再是「一句话的问答」。
   'message.goal': 'goal',
+  // 这一轮翻开了账上的某一条变更。点进去要落到变更账上的这一行，所以它不是
+  // 正文里的几个字，而是一帧带着身份的证据。
+  'message.change': 'change',
+  // 用户按了停止，这一轮没有跑完。它排在 `message.end` 之前：收尾帧负责把光标
+  // 收掉，而「是被停的」这件事只有这一帧说得出来。
+  'message.cancelled': 'cancelled',
   // 说这句话的是谁：这一轮在总线上的名字。名字由服务端按会话折出（带进程指纹），
   // 前端算不出同一个，所以它跟着帧来。没有它，这位员工自己调的工具就归不到这段
   // 对话下面——帧上只有 `agent_id`，而这里不知道它等于谁。
   'agent.identity': 'identity',
+  // 这一轮花了多少：token、轮次、时长、上下文占用、哪一路模型答的、算了多少钱。
+  // 数字是循环量出来的那一份，网关原样搬来。它排在 `message.end` 之前——收尾帧
+  // 一到，这一条就定稿了，还没读到的花销再也没有落点。
+  'message.usage': 'usage',
+  // 这一轮把一段早期上下文挤出了提示词：模型下一轮看不见它了。没有裁剪时
+  // 服务端根本不发这一帧，所以它的出现本身就是「这一段对话开始装不下了」。
+  'message.compaction': 'compaction',
+  // 这一轮读进了哪几句属主约定。与花销同一处落点：它说的是「这条回答是在什么
+  // 前提下说出来的」，不是一句新的话。没有读面的部署根本不发这一帧，所以它的
+  // 出现本身就说明这个平台在读约定。
+  'message.memory': 'memory',
+  // 这一轮的外部 MCP 服务：挂了没有、连上没有、问到几只工具。没有端点的部署
+  // 不发这一帧；它的出现说明这个平台挂了外部服务。
+  'message.mcp': 'mcp',
+  // 这一轮属主配了哪些钩子、哪几条真的跑过。没有钩子表的部署不发这一帧；
+  // 它出现说明这个平台在按配置判定与通知，而不只是把配置存着。
+  'message.hooks': 'hooks',
+  // 这一轮里模型往某个同事的收件箱发了一条话。一条消息一帧，各自带收件人与
+  // 结局：合计数回答不了「发给他那条到底回没回」。只有真发过才有这一帧。
+  'message.colleague': 'colleague',
+  // 这一轮挂上共享任务图的活。一帧带整份列表——它是一份列表，行与行之间没有
+  // 各自的结局。帧里只有派活那一刻就能确定的事；状态由页面拿 id 去任务图那张
+  // 同一张表里读回，所以列表上的「谁在做、做到哪」跟着任务图走。
+  'message.tasks': 'tasks',
+  // 一条后台命令：交出句柄时是「在跑」，跑完时是结局。它不是这条命令的输出
+  // （输出在 command_output 里按页读），是「你放到后台的那件事现在怎么样了」。
+  'message.background': 'background',
 };
+
+/**
+ * 平台自己说的一句话的消息号前缀：后台命令跑完时那条通知。
+ *
+ * 它同样是一段 assistant 正文，但它不属于任何一轮：写入方是网关的
+ * `publish_background_finished`，那里同样按这个前缀起号。对话账靠它认出
+ * 「这一条不是某一轮正在流的那一份回答」，于是不会把正在流的那一轮的光标
+ * 交给它、再在它收尾时把别人的光标清掉——后台命令跑完的那一刻，往往正是
+ * 人刚问了下一句、回答正在流的时候。
+ */
+export const NOTICE_MESSAGE_ID_PREFIX = 'background-';
 
 /**
  * 一句话是谁说的。
@@ -196,9 +250,309 @@ export interface ChatFrame {
   delta: string | null;
   /** 只有 `goal` 帧带着：这句话被受理成的那道目标。 */
   goalId: string | null;
+  /** 只有 `change` 帧带着：这一轮翻开的是变更账上的哪一条（`kind:scope:literal`）。 */
+  changeId: string | null;
   /** 只有 `identity` 帧带着：这一轮在总线上叫什么（`employee:<指纹>` 形式）。 */
   agentId: string | null;
+  /** 只有 `usage` 帧带着：这一轮的花销。 */
+  usage: TurnUsage | null;
+  /** 只有 `compaction` 帧带着：这一轮从提示词里挤掉了什么。 */
+  compaction: ContextCompaction | null;
+  /** 只有 `memory` 帧带着：这一轮读进了哪几句属主约定。 */
+  memory: LoadedMemory[] | null;
+  /** 只有 `mcp` 帧带着：这一轮的外部 MCP 服务与它提供了几只工具。 */
+  mcp: McpListing | null;
+  /** 只有 `hooks` 帧带着：这一轮配了哪些钩子、哪几条跑过。 */
+  hooks: HookReading | null;
+  /** 只有 `colleague` 帧带着：这一轮发给某位同事的一条话。 */
+  colleague: ColleagueMessage | null;
+  /** 只有 `tasks` 帧带着：这一轮挂上共享任务图的活。 */
+  tasks: TurnTaskRow[] | null;
+  /** 只有 `background` 帧带着：一条后台命令的句柄与状态。 */
+  background: BackgroundCard | null;
+  /**
+   * 只有超过窗口的 `start` 带着：这一句的原文落成了哪个文件、有多长。
+   *
+   * 服务端对长消息只回一段开头，原文在执行器那边成了一份文件；界面据此把这一条
+   * 画成附件（带全文长度），而不是把开头当成这句话的全部。
+   */
+  attachment: ChatAttachment | null;
   timestamp: string;
+}
+
+/** 这一轮真的进了提示词的一句约定。`id` 是撤销用的号，`text` 是原文。 */
+export interface LoadedMemory {
+  id: string;
+  text: string;
+}
+
+/** 这一轮的外部 MCP 服务：连上没有、问到哪些工具、连不上时为什么。 */
+export interface McpListing {
+  reachable: boolean;
+  tools: string[];
+  error: string | null;
+}
+
+/** 钩子表里的一条：它看着哪个触发点、管哪些工具、做什么。 */
+export interface ConfiguredHook {
+  id: string;
+  trigger: string;
+  tool: string | null;
+  /** `block` / `rewrite` / `log` / `notify` / `webhook` / `redis_stream`。 */
+  action: string;
+}
+
+/** 这一轮里被一条钩子处理过的一次调用。 */
+export interface HookRun {
+  hookId: string;
+  tool: string;
+  /** `block` 或 `rewrite`：这次调用被拒了，或被换了参数。 */
+  decision: string;
+  reason: string | null;
+}
+
+/**
+ * 配了什么与跑过什么。
+ *
+ * 两半必须一起画：只画配置，一条从没命中的钩子与一条已生效的钩子看起来一样；
+ * 只画运行记录，一条把工具模式写错的钩子看起来像根本没配。
+ */
+export interface HookReading {
+  configured: ConfiguredHook[];
+  ran: HookRun[];
+}
+
+/**
+ * 这一轮发给某位同事的一条话，以及它的结局。
+ *
+ * `delivered` 是「已经发布进收件人的收件箱」，`replied` 是「等到了回信」——
+ * 两件事分开：发出去了不保证回了。`reason` 是没等到回信时的那一句，
+ * `timeout` 只说「没在时限内答」，不是「对方没做完」；`hint` 是服务端对这一句
+ * 的解释，界面照搬，不另编。`error` 有值时这条根本没发出去（收件人不在名册上、
+ * 名册读不出来），它的动作是去查那个名字，不是再发一遍。
+ */
+export interface ColleagueMessage {
+  to: string;
+  /** `prompt` / `steering` / `continue`。 */
+  sentAs: string;
+  content: string;
+  delivered: boolean;
+  /** `null` 是「没等回信」，不是「等了没回」。 */
+  replied: boolean | null;
+  reply: string | null;
+  reason: string | null;
+  hint: string | null;
+  error: string | null;
+}
+
+/**
+ * 这一轮挂上任务图的一行，只写派活那一刻就已确定的事实。
+ *
+ * 状态不在这里：任务图随时间的读数要拿 `taskId` 去 `/api/v1/tasks/list?ids=` 读，
+ * 而列表跟着那一份走。派活那一刻的「已入队」抄进这一帧，就成了永远停在入队的副本。
+ */
+export interface TurnTaskRow {
+  taskId: string;
+  /** 派活时那句 goal 的第一行，读作活名。 */
+  goal: string;
+  goalId: string | null;
+  venue: string | null;
+  assignedTo: string | null;
+  /** 这一行是哪一句意图交出来的；没有意图的入口为 `null`。 */
+  intentId: string | null;
+  /**
+   * 派活那一刻带着的三格；状态是那一瞬的 `未落`。任务图读回来的那份更新，
+   * 界面优先用它——入队时的快照不是「做到哪」的答案。
+   */
+  ledgerItem: TurnLedgerItem | null;
+}
+
+/** 一条待办的五个格子。状态词与台账同一套：未落 / 已落。 */
+export interface TurnLedgerItem {
+  id: string;
+  terminal: string;
+  now: string;
+  gap: string;
+  state: '未落' | '已落';
+}
+
+/**
+ * 一条后台命令的卡片。
+ *
+ * 交出句柄那一刻只有 `handle` 与 `state: 'running'`；跑完时同一张卡片带上结局、
+ * 用时与输出末尾。`tail` 是末尾一截，不是全文——全文仍由 `command_output` 分页读，
+ * 把全文塞进帧等于把一份内容发两遍，而屏幕上那张卡片也不需要它。
+ */
+export interface BackgroundCard {
+  handle: string;
+  state: string;
+  exitCode: number | null;
+  error: string | null;
+  elapsedMs: number | null;
+  stdoutBytes: number | null;
+  tail: string;
+  tailTruncated: boolean;
+  summary: string | null;
+}
+
+/**
+ * 一次执行前询问里，那次改动长什么样（形状与 `cog_core::contract::permission`
+ * 同一份）。
+ *
+ * `kind` 决定画法：`edit` 是 `before` 换成 `after` 的一处替换；`overwrite` 是整份
+ * 被写进去的文件——它的 `before` 是空串，因为这一次请求里没有去读树，界面上就该
+ * 明说「看不清原来是什么」；`patch` 的 `after` 是补丁原文。`truncated` 是「有一边
+ * 被截断了」：被截断的一份不加这句话，读起来就像整个改动。
+ */
+export interface PermissionDiff {
+  path: string;
+  kind: 'edit' | 'overwrite' | 'patch';
+  label: string;
+  before: string;
+  after: string;
+  truncated: boolean;
+}
+
+/** 一条长消息落成的文件。`path` 是执行器上的路径，界面只拿来显示与回溯。 */
+export interface ChatAttachment {
+  path: string;
+  /** 原文的字符数——界面上写的是这个数，不是开头那一段的长度。读不到就是 `null`。 */
+  chars: number | null;
+}
+
+/** 帧里的附件格。没有路径就不认它：一个打不开的附件只能让人以为全文在那里。 */
+export function chatAttachment(value: unknown): ChatAttachment | null {
+  if (!value || typeof value !== 'object') return null;
+  const raw = value as { path?: unknown; chars?: unknown };
+  if (typeof raw.path !== 'string' || !raw.path.trim()) return null;
+  return { path: raw.path, chars: frameCount(raw.chars) };
+}
+
+/**
+ * 一轮对话花掉的量，读的是服务端量出来的那一份。
+ *
+ * 除了模型名与费用，其余都是计数，缺了就发 `null`——这一层不替服务端补零：
+ * 屏幕上写「输入 0 tokens」与写「输入没读到」是两句不同的话。
+ */
+export interface TurnUsage {
+  inputTokens: number | null;
+  outputTokens: number | null;
+  totalTokens: number | null;
+  /** 这一轮里模型开口了几次（一次工具调用之后接着说，算下一次）。 */
+  rounds: number | null;
+  /** 这一轮结束时上下文背了多少：最后一次调用带进去的提示词长度。 */
+  contextTokens: number | null;
+  durationMs: number | null;
+  /** 答话的那一路模型。上游没报名字时 `null`，不是「未知模型」这个名字。 */
+  model: string | null;
+  /** 按声明价目算出来的美元数。上游没声明价目时 `null`：没算，不是免费。 */
+  costUsd: number | null;
+  /**
+   * 这一段会话到目前为止的合计，账本按会话那一列折叠出来的。
+   *
+   * `readable: false` 时其余几格都没有——「没读到」不许画成「花了零」。
+   */
+  session: SessionSpend | null;
+}
+
+/** 一段会话到目前为止花了多少，钱按币种分列（价目本换过，不折汇率）。 */
+export interface SessionSpend {
+  readable: boolean;
+  /** 读不到的原因（`readable: false` 时有）。 */
+  reason: string | null;
+  calls: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cachedTokens: number | null;
+  money: { currency: string; costMicros: number; pricedCalls: number }[];
+  /** 到过上游但没定价的调用次数：它们的钱不在 `money` 里。 */
+  unpricedCalls: number | null;
+}
+
+/**
+ * 这一轮从提示词里挤掉了什么。
+ *
+ * 计数是循环量出来的那一份；两段开头是**原文的开头**，不是模型写的摘要——
+ * 读者据此认出被挤掉的是哪一轮、留下的尾巴从哪一句开始，而不必相信一段转述。
+ */
+export interface ContextCompaction {
+  /** 被挤出提示词的消息条数。 */
+  droppedMessages: number | null;
+  /** 这些消息按估算占了多少 token。 */
+  freedTokens: number | null;
+  /** 裁剪之后提示词里还剩多少条。 */
+  keptMessages: number | null;
+  /** 还在的那一段从哪一条开始（`role: 开头…`）。 */
+  keptFrom: string | null;
+  /** 被挤掉的第一条的开头（`role: 开头…`）。 */
+  droppedHead: string | null;
+  /** 这一次裁剪的界：窗口预算与低水位。 */
+  budgetTokens: number | null;
+  targetTokens: number | null;
+}
+
+/**
+ * 帧里「这一段会话花了多少」那一格。
+ *
+ * 形状不对（旧服务端没有这一格、或者字段缺了）返回 `null`：没有这一格与
+ * 「这一段花了零」是两句话，后者要由服务端明说 `calls: 0`。
+ */
+function sessionSpend(value: unknown): SessionSpend | null {
+  if (!value || typeof value !== 'object') return null;
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.readable !== 'boolean') return null;
+  const money = Array.isArray(raw.money)
+    ? raw.money
+        .map((line) => {
+          if (!line || typeof line !== 'object') return null;
+          const cell = line as Record<string, unknown>;
+          const currency = typeof cell.currency === 'string' ? cell.currency : null;
+          const costMicros = frameCount(cell.cost_micros);
+          const pricedCalls = frameCount(cell.priced_calls);
+          if (currency === null || costMicros === null || pricedCalls === null) return null;
+          return { currency, costMicros, pricedCalls };
+        })
+        .filter((line): line is { currency: string; costMicros: number; pricedCalls: number } =>
+          line !== null
+        )
+    : [];
+  return {
+    readable: raw.readable,
+    reason: typeof raw.reason === 'string' ? raw.reason : null,
+    calls: frameCount(raw.calls),
+    inputTokens: frameCount(raw.input_tokens),
+    outputTokens: frameCount(raw.output_tokens),
+    cachedTokens: frameCount(raw.cached_tokens),
+    money,
+    unpricedCalls: frameCount(raw.unpriced_calls),
+  };
+}
+
+/** 帧里的数字转成界面认得的数：不是有限数就是 `null`，不猜 0。 */
+function frameCount(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * 帧里的一条待办。认不出返回 `null`——「这一行没带三格」与「三格都是空」
+ * 在读面上不能同形，所以不拿空字符串补齐。
+ *
+ * 状态词只有台账上的两个：`未落` / `已落`。别的词读成 `null`，不在界面上
+ * 替它猜一个。
+ */
+function frameLedgerItem(value: unknown): TurnLedgerItem | null {
+  if (!value || typeof value !== 'object') return null;
+  const row = value as Record<string, unknown>;
+  const state = row.state;
+  if (state !== '未落' && state !== '已落') return null;
+  const cell = (key: string) => (typeof row[key] === 'string' ? (row[key] as string) : '');
+  return {
+    id: cell('id'),
+    terminal: cell('terminal'),
+    now: cell('now'),
+    gap: cell('gap'),
+    state,
+  };
 }
 
 /**
@@ -231,7 +585,133 @@ export function normalizeChatFrame(
     role: role === 'user' || role === 'assistant' ? role : null,
     delta: typeof inner.delta === 'string' ? inner.delta : null,
     goalId: typeof inner.goal_id === 'string' ? inner.goal_id : null,
+    changeId: typeof inner.change_id === 'string' ? inner.change_id : null,
     agentId: typeof inner.agent_id === 'string' ? inner.agent_id : null,
+    attachment: chatAttachment(inner.attachment),
+    usage:
+      kind === 'usage'
+        ? {
+            inputTokens: frameCount(inner.input_tokens),
+            outputTokens: frameCount(inner.output_tokens),
+            totalTokens: frameCount(inner.total_tokens),
+            rounds: frameCount(inner.rounds),
+            contextTokens: frameCount(inner.context_tokens),
+            durationMs: frameCount(inner.duration_ms),
+            model: typeof inner.model === 'string' ? inner.model : null,
+            costUsd: frameCount(inner.cost_usd),
+            session: sessionSpend(inner.session),
+          }
+        : null,
+    memory:
+      kind === 'memory'
+        ? Array.isArray(inner.loaded)
+          ? (inner.loaded as Array<Record<string, unknown>>).flatMap((row) =>
+              typeof row?.id === 'string' && typeof row?.text === 'string'
+                ? [{ id: row.id, text: row.text }]
+                : []
+            )
+          : []
+        : null,
+    mcp:
+      kind === 'mcp'
+        ? {
+            reachable: inner.reachable === true,
+            tools: Array.isArray(inner.tools)
+              ? (inner.tools as unknown[]).flatMap((name) =>
+                  typeof name === 'string' ? [name] : []
+                )
+              : [],
+            error: typeof inner.error === 'string' ? inner.error : null,
+          }
+        : null,
+    hooks:
+      kind === 'hooks'
+        ? {
+            configured: Array.isArray(inner.configured)
+              ? (inner.configured as Array<Record<string, unknown>>).flatMap((row) =>
+                  typeof row?.id === 'string'
+                    ? [{
+                        id: row.id,
+                        trigger: typeof row.trigger === 'string' ? row.trigger : '',
+                        tool: typeof row.tool === 'string' ? row.tool : null,
+                        action: typeof row.action === 'string' ? row.action : '',
+                      }]
+                    : []
+                )
+              : [],
+            ran: Array.isArray(inner.ran)
+              ? (inner.ran as Array<Record<string, unknown>>).flatMap((row) =>
+                  typeof row?.hook_id === 'string' && typeof row?.tool === 'string'
+                    ? [{
+                        hookId: row.hook_id,
+                        tool: row.tool,
+                        decision: typeof row.decision === 'string' ? row.decision : '',
+                        reason: typeof row.reason === 'string' ? row.reason : null,
+                      }]
+                    : []
+                )
+              : [],
+          }
+        : null,
+    background:
+      kind === 'background' && typeof inner.handle === 'string' && inner.handle
+        ? {
+            handle: inner.handle,
+            state: typeof inner.state === 'string' ? inner.state : 'unknown',
+            exitCode: frameCount(inner.exit_code) ?? null,
+            error: typeof inner.error === 'string' ? inner.error : null,
+            elapsedMs: frameCount(inner.elapsed_ms) ?? null,
+            stdoutBytes: frameCount(inner.stdout_bytes) ?? null,
+            tail: typeof inner.tail === 'string' ? inner.tail : '',
+            tailTruncated: inner.tail_truncated === true,
+            summary: typeof inner.summary === 'string' ? inner.summary : null,
+          }
+        : null,
+    tasks:
+      kind === 'tasks'
+        ? Array.isArray(inner.tasks)
+          ? (inner.tasks as Array<Record<string, unknown>>).flatMap((row) =>
+              typeof row?.task_id === 'string' && row.task_id
+                ? [{
+                    taskId: row.task_id,
+                    goal: typeof row.goal === 'string' ? row.goal : '',
+                    goalId: typeof row.goal_id === 'string' ? row.goal_id : null,
+                    venue: typeof row.venue === 'string' ? row.venue : null,
+                    assignedTo:
+                      typeof row.assigned_to === 'string' ? row.assigned_to : null,
+                    intentId: typeof row.intent_id === 'string' ? row.intent_id : null,
+                    ledgerItem: frameLedgerItem(row.ledger_item),
+                  }]
+                : []
+            )
+          : []
+        : null,
+    colleague:
+      kind === 'colleague'
+        ? {
+            to: typeof inner.to === 'string' ? inner.to : '',
+            sentAs: typeof inner.sent_as === 'string' ? inner.sent_as : '',
+            content: typeof inner.content === 'string' ? inner.content : '',
+            delivered: inner.delivered === true,
+            replied: typeof inner.replied === 'boolean' ? inner.replied : null,
+            reply: typeof inner.reply === 'string' ? inner.reply : null,
+            reason: typeof inner.reason === 'string' ? inner.reason : null,
+            hint: typeof inner.hint === 'string' ? inner.hint : null,
+            error: typeof inner.error === 'string' ? inner.error : null,
+          }
+        : null,
+    compaction:
+      kind === 'compaction'
+        ? {
+            droppedMessages: frameCount(inner.dropped_messages),
+            freedTokens: frameCount(inner.freed_tokens),
+            keptMessages: frameCount(inner.kept_messages),
+            keptFrom: typeof inner.kept_from === 'string' ? inner.kept_from : null,
+            droppedHead: typeof inner.dropped_head === 'string' ? inner.dropped_head : null,
+            budgetTokens: frameCount(inner.budget_tokens),
+            targetTokens: frameCount(inner.target_tokens),
+          }
+        : null,
     timestamp:
       (payload.timestamp as string | undefined) ?? new Date().toISOString(),
   };

@@ -100,8 +100,19 @@ elif [ -n "$rustup_bin" ]; then
     behind="$(printf '%s\n' "$check_out" | grep -E '^stable[^ ]*( |$).*update available' || true)"
     current="$(printf '%s\n' "$check_out" | grep -E '^stable[^ ]*( |$).*(up to date|unchanged)' || true)"
     if [ -n "$behind" ]; then
+        # 箭头两边同版时 rustup 只是把同一次发布又列了一遍；本机 stable 就是它。
+        # 2026-11-19 实测：`1.100.0 (0ef1bc386 2026-11-09) -> 1.100.0 (0ef1bc386
+        # 2026-11-09)`，而本机 `rustc --version` 正是 1.100.0。照字面判成「落后」
+        # 会让人去 `rustup update stable`，装回来的还是同一把编译器。
+        # 读不出两边的版本（形状没见过）仍按落后算：那时「不知道」不能当「一致」。
+        from_version="$(printf '%s\n' "$behind" | sed -n 's/.*update available: \([0-9][0-9.]*\).*/\1/p')"
+        to_version="$(printf '%s\n' "$behind" | sed -n 's/.*-> *\([0-9][0-9.]*\).*/\1/p')"
         checked=1
-        problems+=("本机 stable 落后于已发布的 stable：$behind——先跑 rustup update stable，否则 CI 会用一台你看不见的编译器判这笔改动")
+        if [ -n "$from_version" ] && [ "$from_version" = "$to_version" ]; then
+            :
+        else
+            problems+=("本机 stable 落后于已发布的 stable：$behind——先跑 rustup update stable，否则 CI 会用一台你看不见的编译器判这笔改动")
+        fi
     elif [ -n "$current" ]; then
         checked=1
     else

@@ -9,11 +9,193 @@
 //!
 //! 它比的是**这一组语句**，不是整份文本：启动 schema 里还有 `task_plan` 之类的
 //! 表，迁移本来就不负责它们。
+//!
+//! 账本建出来之后，后面的迁移还可能改它的列名（099 把 `timeout_seconds` 改成
+//! `declared_duration_seconds`，启动 schema 用的是改名后的名字）。所以「迁移建出来的
+//! 账本」不是 095 一份文本说的，是 095 按顺序走完后面那些改名之后的样子——改名从
+//! 迁移目录里读，不在这里抄一份。
 
 use cog_storage::postgres::state_backend::ddl;
 use cog_storage::schema_ddl::split_statements;
 
 const MIGRATION: &str = include_str!("../migrations/postgres/095_task_ledger.up.sql");
+
+/// 095 之后落在账本上的改名：`(旧列名, 新列名)`，按版本顺序。
+///
+/// 读目录而不是抄一份：抄的那一份会在下一次改名时静默停在旧名字上，而这条门要判的
+/// 正是「两种装法长出同一个账本」。
+fn renames_after_the_ledger() -> Vec<(String, String)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/postgres");
+    let mut files: Vec<(u32, std::path::PathBuf)> = std::fs::read_dir(&dir)
+        .expect("the migrations directory is part of this crate")
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let name = path.file_name()?.to_str()?.to_string();
+            let (version, rest) = name.split_once('_')?;
+            if !rest.ends_with(".up.sql") {
+                return None;
+            }
+            let version: u32 = version.parse().ok()?;
+            (version > 95).then_some((version, path))
+        })
+        .collect();
+    files.sort();
+    let mut out = Vec::new();
+    for (_, path) in files {
+        let text = std::fs::read_to_string(&path).expect("a migration file is readable");
+        for statement in split_statements(&text).unwrap_or_default() {
+            let text = normalize(&statement);
+            let text = text.trim_end_matches(';').trim();
+            let Some(rest) = text.strip_prefix("alter table ") else {
+                continue;
+            };
+            let mut words = rest.split_whitespace();
+            let Some(table) = words.next() else { continue };
+            if !LEDGER_TABLES.contains(&table) {
+                continue;
+            }
+            let (Some("rename"), Some("column"), Some(old), Some("to"), Some(new)) = (
+                words.next(),
+                words.next(),
+                words.next(),
+                words.next(),
+                words.next(),
+            ) else {
+                continue;
+            };
+            out.push((old.to_string(), new.to_string()));
+        }
+    }
+    out
+}
+
+/// 095 之后落在账本上的**新列**：`(表, 列, 定义)`，按版本顺序。
+///
+/// 与改名同一份理由：读目录而不是抄一份。一条 `ALTER TABLE … ADD COLUMN` 不在
+/// 095 的文本里，不把它算进来，「升级上来的账本」与「刚装出来的账本」就差这一
+/// 列，而这个门判的正是两者逐条相同。
+fn columns_added_after_the_ledger() -> Vec<(String, String, String)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/postgres");
+    let mut files: Vec<(u32, std::path::PathBuf)> = std::fs::read_dir(&dir)
+        .expect("the migrations directory is part of this crate")
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let name = path.file_name()?.to_str()?.to_string();
+            let (version, rest) = name.split_once('_')?;
+            if !rest.ends_with(".up.sql") {
+                return None;
+            }
+            let version: u32 = version.parse().ok()?;
+            (version > 95).then_some((version, path))
+        })
+        .collect();
+    files.sort();
+    let mut out = Vec::new();
+    for (_, path) in files {
+        let text = std::fs::read_to_string(&path).expect("a migration file is readable");
+        for statement in split_statements(&text).unwrap_or_default() {
+            let text = normalize(&statement);
+            let text = text.trim_end_matches(';').trim();
+            let Some(rest) = text.strip_prefix("alter table ") else {
+                continue;
+            };
+            let mut words = rest.split_whitespace();
+            let Some(table) = words.next() else { continue };
+            if !LEDGER_TABLES.contains(&table) {
+                continue;
+            }
+            let (Some("add"), Some("column")) = (words.next(), words.next()) else {
+                continue;
+            };
+            let mut rest: Vec<&str> = words.collect();
+            if rest.starts_with(&["if", "not", "exists"]) {
+                rest.drain(0..3);
+            }
+            let Some(column) = rest.first() else { continue };
+            let definition = rest[1..].join(" ");
+            if definition.is_empty() {
+                continue;
+            }
+            out.push((table.to_string(), column.to_string(), definition));
+        }
+    }
+    out
+}
+
+/// 把一列追进 095 文本里那张建表语句：落在主键约束之前，也就是
+/// `ALTER TABLE … ADD COLUMN` 在库里实际追加到的位置（最后一列）。
+fn add_column(text: &str, table: &str, column: &str, definition: &str) -> String {
+    let head = format!("create table if not exists {table} (");
+    let lower = text.to_ascii_lowercase();
+    let Some(start) = lower.find(&head) else {
+        return text.to_string();
+    };
+    let Some(pk) = lower[start..].find("primary key") else {
+        return text.to_string();
+    };
+    let at = start + pk;
+    let line_start = text[..at].rfind('\n').map(|i| i + 1).unwrap_or(at);
+    format!(
+        "{}{column} {definition},\n    {}",
+        &text[..line_start],
+        &text[line_start..]
+    )
+}
+
+/// 095 之后给账本表加的索引，按版本顺序。
+///
+/// 与「加列」分开收：列要折进建表语句再比，索引本来就是独立语句，原样追加即可。
+/// 不收这一族的后果是 2026-11-24 实测的那一类：127 给 `task_defined` 加的索引
+/// 只在升级路径上有，全新安装靠启动 schema 建——而这条门只看 095，于是两边都
+/// 「一样」（它根本没看见新索引）。
+fn indexes_added_after_the_ledger() -> Vec<String> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/postgres");
+    let mut files: Vec<(u32, std::path::PathBuf)> = std::fs::read_dir(&dir)
+        .expect("the migrations directory is part of this crate")
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let name = path.file_name()?.to_str()?.to_string();
+            let (version, rest) = name.split_once('_')?;
+            if !rest.ends_with(".up.sql") {
+                return None;
+            }
+            let version: u32 = version.parse().ok()?;
+            (version > 95).then_some((version, path))
+        })
+        .collect();
+    files.sort();
+    let mut out = Vec::new();
+    for (_, path) in files {
+        let text = std::fs::read_to_string(&path).expect("a migration file is readable");
+        for statement in split_statements(&text).unwrap_or_default() {
+            let shape = normalize(&statement);
+            let shape = shape.trim_end_matches(';').trim();
+            if LEDGER_TABLES
+                .iter()
+                .any(|table| shape.starts_with(&format!("create index if not exists idx_{table}_")))
+            {
+                out.push(statement);
+            }
+        }
+    }
+    out
+}
+
+/// 095 的文本，按顺序走完后面那些改列（新列、新索引与改名）。
+fn migration_ledger_text() -> String {
+    let mut text = MIGRATION.to_string();
+    for (table, column, definition) in columns_added_after_the_ledger() {
+        text = add_column(&text, &table, &column, &definition);
+    }
+    for (old, new) in renames_after_the_ledger() {
+        text = text.replace(&old, &new);
+    }
+    for index in indexes_added_after_the_ledger() {
+        text.push_str("\n;\n");
+        text.push_str(&index);
+    }
+    text
+}
 
 /// 账本的四张表。`task_plan` 不在其中：它是启动 schema 自己的，迁移不建它。
 const LEDGER_TABLES: [&str; 4] = [
@@ -84,7 +266,7 @@ fn ledger_shapes(text: &str) -> Vec<String> {
 
 #[test]
 fn the_migration_and_the_startup_schema_build_the_same_ledger() {
-    let from_migration = ledger_shapes(MIGRATION);
+    let from_migration = ledger_shapes(&migration_ledger_text());
     let from_startup = ledger_shapes(&ddl());
 
     // 先确认两边都不是空的：一个挑不出任何语句的比较，在「句式变了、过滤条件

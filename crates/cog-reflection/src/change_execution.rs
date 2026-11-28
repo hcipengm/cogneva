@@ -41,16 +41,19 @@ pub const REQUEST_FILE: &str = "request.json";
 pub const OUTCOME_FILE: &str = "outcome.json";
 
 /// 执行到位并给出了判定：变更通过，产物在结果文件里。
-// cap: bound — 与 POSIX 惯例同源：0 表示执行到位且判定通过
+// cap: fixed — 与 POSIX 惯例同源：0 表示执行到位且判定通过
+// keep: 删掉后进程以运行时默认状态退出，拒绝会被读成通过；由「POSIX 约定 0 表示执行到位且通过」兜住
 pub const EXIT_PASSED: i32 = 0;
 /// 执行到位并给出了判定：变更被拒，判词与原因在结果文件里。
-// cap: bound — 与 POSIX 惯例同源：1 表示执行到位且判定拒绝
+// cap: fixed — 与 POSIX 惯例同源：1 表示执行到位且判定拒绝
+// keep: 删掉后拒绝与通过走同一个退出状态，调用方分不出该重试还是该停；由「POSIX 约定 1 表示执行到位且拒绝」兜住
 pub const EXIT_REFUSED: i32 = 1;
 /// 没能做出判定：工作树、git、cargo 或构建闸门没能让这次执行跑完。
 ///
 /// 与变更本身无关，也不含任何结论——调用方据此把变更留在队列里重试，而不是记成
 /// 一次失败。取 75（EX_TEMPFAIL），与一次性滚动入口的环境类退出码同源。
-// cap: derived — 取 75（EX_TEMPFAIL），与滚动入口的环境类退出码同源
+// cap: fixed — 取 75（EX_TEMPFAIL），与滚动入口的环境类退出码同源
+// keep: 删掉后回到「取 75（EX_TEMPFAIL），与滚动入口的环境类退出码同源」所描述的情形；由这条约定兜住
 pub const EXIT_UNAVAILABLE: i32 = 75;
 
 /// 容器终止消息（kubelet 的 `terminationMessagePath` 默认值）。类别在退出码上，
@@ -98,14 +101,14 @@ pub struct RunReading {
     #[serde(default)]
     pub last_secs: Option<u64>,
     #[serde(default)]
-    pub timeouts: u64,
+    pub stopped: u64,
 }
 
 impl RunReading {
     pub fn of(budget: &VerificationBudget, kind: &str) -> Self {
         Self {
             last_secs: budget.last_run_secs(kind),
-            timeouts: budget.timeouts(kind),
+            stopped: budget.stopped(kind),
         }
     }
 }
@@ -129,7 +132,6 @@ pub struct ChangeExecutionWorld {
     pub target_dir: PathBuf,
     pub binary_dir: PathBuf,
     pub backup_dir: PathBuf,
-    pub test_timeout_secs: u64,
     /// The command that judges a change. Travels in the world rather than being
     /// read from the config again on the executing side: a request is built and
     /// run by two processes, and a second read of the config is a second value
@@ -158,7 +160,6 @@ pub struct ChangeExecutionWorld {
     /// change for a declaration it never received.
     #[serde(default)]
     pub web_admission: Option<cog_core::WebAdmissionConfig>,
-    pub build_timeout_secs: u64,
     pub auto_apply: bool,
     pub manual_approve: bool,
     pub promotion: PromotionGateConfig,
@@ -609,10 +610,7 @@ async fn run_in(
     mut outcome: ChangeExecutionOutcome,
 ) -> (i32, ChangeExecutionOutcome) {
     let world = &request.world;
-    let budget = Arc::new(VerificationBudget::new(
-        world.test_timeout_secs,
-        world.build_timeout_secs,
-    ));
+    let budget = Arc::new(VerificationBudget::new());
     let pipeline = ChangePipeline::new(
         world.project_root.as_path(),
         world.change_dir.as_path(),
@@ -717,7 +715,7 @@ async fn run_in(
 
 /// 尽力把这一轮的落点写进容器终止消息。
 fn report_termination_message(text: &str) {
-    let _ = std::fs::write(TERMINATION_LOG, text);
+    cog_core::ignore_lost!(std::fs::write(TERMINATION_LOG, text));
 }
 
 /// `cogneva execute-change` 子命令入口（一过性执行进程内执行）。
@@ -725,6 +723,9 @@ fn report_termination_message(text: &str) {
 /// 参数只有两个文件路径：请求从哪读、结果往哪写。世界本身在请求里，命令行不重复
 /// 声明它——两处声明同一件事，就一定有一处会先过期。
 pub async fn run_execute_change_cli() -> Result<(), Box<dyn std::error::Error>> {
+    // 开工先建进度文件：容器外的存活探针从这一刻起就有东西可读。放在最前面，是因为
+    // 这个进程接下来要做的每一件事都可能很长，而探针要能一直看见它在动。
+    cog_core::progress::start_progress_file();
     // 订阅者由装配层在派发前装（`cogneva` 的 main.rs）：本 crate 只许依赖
     // cog-core，够不到 cog-observability，而这一行日志要活过 Job 本身，
     // 靠的正是那边装上的 Loki 镜像。
@@ -837,26 +838,19 @@ pub async fn run_execute_change_cli() -> Result<(), Box<dyn std::error::Error>> 
 
 /// 执行 Job 里那个容器的名字。回程的退出码挂在它的 `state.terminated` 上。
 const JOB_CONTAINER: &str = "change-execution";
+/// 进度文件那一卷挂在哪、文件叫什么。执行进程写、存活探针读；两者读的名字是同一个，
+/// 所以这里只写一次，容器 env 与探针命令各自引它。
+const PROGRESS_VOLUME: &str = "progress";
+const PROGRESS_DIR: &str = cog_core::paths::PROGRESS_DIR;
+const PROGRESS_FILE: &str = cog_core::paths::PROGRESS_FILE;
 /// 父进程容器的名字：镜像摘要与挂载面都从**这个容器**的现场读。写错名字的后果
 /// 是一条指名道姓的拒绝，而不是一个别处的镜像。
 const PARENT_CONTAINER: &str = cog_core::topology::MAIN_CONTAINER;
 
-/// 每次 kubectl 调用的墙钟上界。它是控制面的读，不是构建：超过这个数说明
-/// API 侧已经不正常，再等也只是把常驻进程挂在这里。
-// cap: bound — 控制面的读不是构建；超过它说明 API 侧已不正常，再等只是把常驻进程挂住
-pub(crate) const KUBECTL_TIMEOUT_SECS: u64 = 60;
-
-/// 一次**只读** kubectl 调用的墙钟上界：30 秒。
-///
-/// 只读没有落库与 admission 链，正常是百毫秒级；30 秒是「apiserver 正忙但仍然活着」与
-/// 「叫不动了」之间的分界，过了它再等只是把一个常驻进程挂在一个不会来的应答上。写动作
-/// 走 [`KUBECTL_TIMEOUT_SECS`]：超时后的重试会在 apiserver 上留下半完成的资源，值得多等。
-// cap: bound — 分界「apiserver 正忙但活着」与「叫不动了」；只读没有落库与 admission 链
-pub(crate) const KUBECTL_READ_TIMEOUT_SECS: u64 = 30;
-
-/// 等待预算比 Job 自己的 `activeDeadlineSeconds` 多出来的那一段：Job 到点后
-/// 还要被控制器判死、状态要回写，派发方等到恰好等于它就会在最后几秒里抢跑。
-// cap: bound — 比 Job 的 activeDeadlineSeconds 多出的那一段：到点后还要被控制器判死、状态回写
+/// 派发方耐心之外多等的那一段：探针判死之后，容器退出、Job 控制器收尾、状态回写
+/// 都需要几拍，派发方等到恰好等于探针的窗口就会在最后几秒里抢跑。
+// cap: fixed — 探针判死到 Job 状态回写之间的那一段
+// keep: 删掉后探针判死到状态回写之间没有余量，已经判死的活被读成还在跑；由「探针判死到回写的那一段」兜住
 const WAIT_MARGIN_SECS: u64 = 300;
 
 /// 容器运行时会在 `imageID` 前面挂一段 scheme（`docker-pullable://` 等）。
@@ -962,7 +956,7 @@ pub fn parent_pod_facts(pod: &serde_json::Value, container: &str) -> SFResult<Pa
         .pointer("/spec/volumes")
         .and_then(|v| v.as_array())
         .map(|v| v.iter().collect())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let source_of = |name: &str| -> Option<serde_json::Value> {
         let volume = volumes
             .iter()
@@ -982,11 +976,11 @@ pub fn parent_pod_facts(pod: &serde_json::Value, container: &str) -> SFResult<Pa
         let name = mount
             .get("name")
             .and_then(|n| n.as_str())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let mount_path = mount
             .get("mountPath")
             .and_then(|p| p.as_str())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         if name.is_empty() || mount_path.is_empty() {
             return Err(SFError::IO(
                 "the parent pod has a volume mount with no name or no path".into(),
@@ -1161,6 +1155,15 @@ pub fn plan_change_job(
         volume_mounts.push(serde_json::Value::Object(entry));
     }
 
+    // 进度文件：执行进程每推进一步就写一次，容器外的存活探针读它。放在一块
+    // emptyDir 上而不是容器的根文件系统上——根文件系统是不是可写取决于权限面
+    // 照抄来的那一份，探针不该因为那个决定而读不到文件。
+    volumes.push(serde_json::json!({ "name": PROGRESS_VOLUME, "emptyDir": {} }));
+    volume_mounts.push(serde_json::json!({
+        "name": PROGRESS_VOLUME,
+        "mountPath": PROGRESS_DIR,
+    }));
+
     let mut container = serde_json::json!({
         "name": JOB_CONTAINER,
         "image": facts.image,
@@ -1173,6 +1176,12 @@ pub fn plan_change_job(
             "--outcome",
             outcome_path.display().to_string(),
         ],
+        "env": [{ "name": cog_core::progress::PROGRESS_FILE_ENV, "value": PROGRESS_FILE }],
+        // 判停的不是一个声明的钟，而是**它还在不在推进**：执行进程每一步都写这个
+        // 文件，探针读 `now - mtime` 与文件里那个窗口。一次跑三小时的构建只要一直在
+        // 推进就永远不会被判停；一步卡死会在窗口之后被判死，容器按 `restartPolicy:
+        // Never` 进 Failed，Job 随之结束——派发方等待的那个结束因此有界。
+        "livenessProbe": cog_core::progress::liveness_probe(),
         "volumeMounts": volume_mounts,
         // 必须显式声明：命名空间的 LimitRange 会把未声明的容器按 defaultCpu
         // （500m）补齐，而那对一次 release 构建是实测过的坏值——限流削掉的正是
@@ -1226,7 +1235,9 @@ pub fn plan_change_job(
             // 0：重试的代价是一次重复的构建与一次重复的提交，而「这条变更要不要再试」
             // 是常驻进程按队列与账本决定的，不是 Job 控制器按次数决定的。
             "backoffLimit": 0,
-            "activeDeadlineSeconds": config.deadline_secs,
+            // 这里曾经是 `activeDeadlineSeconds`：一个到点直接杀掉容器的钟，它不知道
+            // 容器里那个跑了很久的构建是不是还在干活。判停改由容器自己的存活探针做
+            // （读进度文件），Job 控制器只负责在探针判死之后收尾。
             "ttlSecondsAfterFinished": config.ttl_secs_after_finished,
             "template": { "metadata": { "labels": labels }, "spec": spec },
         },
@@ -1262,7 +1273,7 @@ pub fn in_cluster_namespace() -> SFResult<String> {
 /// 没有它就取不到自己的 `imageID`，也就没有可派发的镜像——这时停下并指名缺的是
 /// 哪一条，而不是退回去用一个 tag。
 pub fn parent_pod_name() -> SFResult<String> {
-    let name = std::env::var(cog_core::env::POD_NAME).unwrap_or_default();
+    let name = std::env::var(cog_core::env::POD_NAME).unwrap_or(Default::default());
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err(SFError::IO(
@@ -1324,6 +1335,7 @@ async fn kubectl_apply_stdin(
 
     let mut child = tokio::process::Command::new(kubectl)
         .args(["-n", namespace, "apply", "-f", "-"])
+        .process_group(0)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1337,13 +1349,11 @@ async fn kubectl_apply_stdin(
             .map_err(|e| SFError::IO(format!("write {what} to kubectl: {e}")))?;
         drop(stdin);
     }
-    let output = tokio::time::timeout(
-        Duration::from_secs(KUBECTL_TIMEOUT_SECS),
-        child.wait_with_output(),
-    )
-    .await
-    .map_err(|_| SFError::IO(format!("kubectl apply {what} timed out")))?
-    .map_err(|e| SFError::IO(format!("kubectl apply {what}: {e}")))?;
+    let cmdline = format!("kubectl apply -f - ({what})");
+    let output = match cog_core::progress::watch_child(&mut child, &cmdline, None).await {
+        Ok(cog_core::progress::ChildOutcome::Exited(output)) => output,
+        Err(e) => return Err(SFError::IO(format!("kubectl apply {what}: {e}"))),
+    };
     if !output.status.success() {
         return Err(SFError::IO(format!(
             "kubectl apply {what} exited {:?}: {}",
@@ -1362,20 +1372,19 @@ async fn run_kubectl(
 ) -> SFResult<std::process::Output> {
     let mut full: Vec<&str> = vec!["-n", namespace];
     full.extend_from_slice(args);
-    let child = tokio::process::Command::new(kubectl)
+    let mut child = tokio::process::Command::new(kubectl)
         .args(&full)
+        .process_group(0)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| SFError::IO(format!("spawn kubectl {}: {e}", args.join(" "))))?;
-    let output = tokio::time::timeout(
-        Duration::from_secs(KUBECTL_TIMEOUT_SECS),
-        child.wait_with_output(),
-    )
-    .await
-    .map_err(|_| SFError::IO(format!("kubectl {} timed out", args.join(" "))))?
-    .map_err(|e| SFError::IO(format!("kubectl {}: {e}", args.join(" "))))?;
+    let cmdline = format!("kubectl {}", args.join(" "));
+    let output = match cog_core::progress::watch_child(&mut child, &cmdline, None).await {
+        Ok(cog_core::progress::ChildOutcome::Exited(output)) => output,
+        Err(e) => return Err(SFError::IO(format!("kubectl {}: {e}", args.join(" ")))),
+    };
     if !output.status.success() {
         return Err(SFError::IO(format!(
             "kubectl {} exited {:?}: {}",
@@ -1446,7 +1455,7 @@ async fn job_exit_code(kubectl: &str, namespace: &str, job_name: &str) -> SFResu
             .pointer("/items")
             .and_then(|i| i.as_array())
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         for pod in &items {
             if let Some(code) = terminated_exit_code(pod, JOB_CONTAINER) {
                 return Ok(code);
@@ -1554,16 +1563,17 @@ async fn dispatch_fresh_job(
 
 /// 等 Job 结束：轮询它的状态，等到自己的等待预算用尽。
 ///
-/// 预算是 Job 的 `activeDeadlineSeconds` 加上一段余量：Job 到点之后还要被控制器判死
-/// 并回写状态，派发方等到恰好等于它就可能在最后几秒里抢跑。预算用尽时报错而不是
-/// 换一个类别——那说明 Job 还在跑，这一条没有判定，下一轮接管它。
+/// 预算不是判据，是**派发方的耐心**：用尽只是「这一轮不带走判定」，Job 照跑，下一轮
+/// 按同一个名字再来看它——它不再杀任何东西。容器的死活由它自己的存活探针按进度文件
+/// 判，所以这个等待总是有界的：卡住的那一跑会在窗口之后被判死、Job 随之结束。
+/// 预算要比那个窗口宽，否则一次健康的长时间构建会让派发方一轮一轮地白等。
 async fn wait_for_job(
     kubectl: &str,
     namespace: &str,
     job_name: &str,
     config: &ChangeJobConfig,
 ) -> SFResult<()> {
-    let interval = Duration::from_secs(config.poll_interval_secs.max(1));
+    let interval = Duration::from_secs(config.poll_interval_secs);
     let deadline =
         tokio::time::Instant::now() + Duration::from_secs(config.deadline_secs + WAIT_MARGIN_SECS);
     loop {
@@ -1600,6 +1610,7 @@ mod tests {
 
     fn change(id: &str) -> EvolutionResult {
         EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: id.to_string(),
             description: "make the thing do the other thing".to_string(),
@@ -1620,13 +1631,11 @@ mod tests {
             target_dir: PathBuf::from("/opt/cogneva/sandbox/src/target"),
             binary_dir: PathBuf::from("/opt/cogneva/bin"),
             backup_dir: PathBuf::from("/opt/cogneva/bin/backups"),
-            test_timeout_secs: 3600,
             test_command: cog_core::SelfEvolutionConfig::default_test_command(),
             fmt_check_command: None,
             lint_command: None,
             deploy_admission: None,
             web_admission: None,
-            build_timeout_secs: 3600,
             auto_apply: true,
             manual_approve: false,
             promotion: PromotionGateConfig::default(),
@@ -1665,7 +1674,10 @@ mod tests {
             sent.world.build_gate.lock_dir
         );
         assert_eq!(read.intent, sent.intent);
-        assert_eq!(read.world.test_timeout_secs, sent.world.test_timeout_secs);
+        assert_eq!(
+            read.world.test_command, sent.world.test_command,
+            "the world crosses the process boundary intact"
+        );
     }
 
     #[test]
@@ -1697,14 +1709,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(OUTCOME_FILE);
         let mut outcome = passed("change-1");
-        // 预算杀的：时长就是那段预算，不是对工作的测量。跨进程之后这个区别必须还在，
-        // 否则常驻进程会把一格预算记成一次实测。
-        outcome.build_ending = Some(BuildEnding::TimedOut(Duration::from_secs(42)));
+        // 判停杀的：携带的那段静默不是对工作的测量。跨进程之后这个区别必须还在，
+        // 否则常驻进程会把一段静默记成一次实测。
+        outcome.build_ending = Some(BuildEnding::Stalled {
+            silent: Duration::from_secs(42),
+            window: Duration::from_secs(30),
+        });
         write_json_atomic(&path, &outcome).unwrap();
         let read: ChangeExecutionOutcome = read_json(&path).unwrap();
         assert_eq!(
             read.build_ending,
-            Some(BuildEnding::TimedOut(Duration::from_secs(42)))
+            Some(BuildEnding::Stalled {
+                silent: Duration::from_secs(42),
+                window: Duration::from_secs(30),
+            })
         );
 
         // 没走到构建那一步的执行没有结局可报：读回来是 None，不拿某个默认结局顶上。
@@ -1883,7 +1901,7 @@ mod tests {
         });
         outcome.build = RunReading {
             last_secs: None,
-            timeouts: 0,
+            stopped: 0,
         };
         write_json_atomic(&path, &outcome).unwrap();
         let read = interpret(EXIT_UNAVAILABLE, &path).unwrap();
@@ -1905,17 +1923,17 @@ mod tests {
         let mut outcome = passed("change-1");
         outcome.test = RunReading {
             last_secs: Some(37),
-            timeouts: 0,
+            stopped: 0,
         };
         outcome.build = RunReading {
             last_secs: None,
-            timeouts: 2,
+            stopped: 2,
         };
         write_json_atomic(&path, &outcome).unwrap();
 
         let read = interpret(EXIT_PASSED, &path).unwrap().outcome.unwrap();
         assert_eq!(read.test.last_secs, Some(37));
-        assert_eq!(read.build.timeouts, 2);
+        assert_eq!(read.build.stopped, 2);
         // 「没跑过」过边界后仍是没跑过，不会变成 0 秒。
         assert_eq!(read.build.last_secs, None);
     }
@@ -1970,18 +1988,18 @@ mod tests {
 
     #[test]
     fn adopting_a_reading_does_not_overwrite_a_real_one_with_an_absent_one() {
-        let budget = VerificationBudget::new(60, 120);
+        let budget = VerificationBudget::new();
         assert_eq!(budget.last_run_secs(KIND_TEST), None);
 
         budget.adopt_run(KIND_TEST, Some(9), 1);
         assert_eq!(budget.last_run_secs(KIND_TEST), Some(9));
-        assert_eq!(budget.timeouts(KIND_TEST), 1);
+        assert_eq!(budget.stopped(KIND_TEST), 1);
 
         // 另一次运行没有耗时读数（被预算杀掉的运行故意不带），不得把上一次的真实
         // 读数抹成"没跑过"。
         budget.adopt_run(KIND_TEST, None, 1);
         assert_eq!(budget.last_run_secs(KIND_TEST), Some(9));
-        assert_eq!(budget.timeouts(KIND_TEST), 2);
+        assert_eq!(budget.stopped(KIND_TEST), 2);
     }
 
     // ===== 派发侧 =====
@@ -2126,6 +2144,10 @@ mod tests {
         // 请求里的路径分布在三个卷上：sandbox（change/workspace/bin/backup/投递）、
         // source（项目根与共享 target）、git-remote（裸仓）。多挂的（app-data、
         // /etc/cogneva、kubectl）不进清单。
+        //
+        // 第四个是进度卷：它不是请求里的路径，而是这个 Job 自己的心跳。执行进程每一步
+        // 写一次，容器外的存活探针读它——探针读不到就等于判停，所以它必须挂在一块
+        // 自己的 emptyDir 上，而不是容器的可写层。
         let mut mounted: Vec<String> = container["volumeMounts"]
             .as_array()
             .unwrap()
@@ -2139,21 +2161,25 @@ mod tests {
                 "/host-git".to_string(),
                 "/opt/cogneva/sandbox".to_string(),
                 "/opt/cogneva/sandbox/src".to_string(),
+                cog_core::paths::PROGRESS_DIR.to_string(),
             ]
         );
-        // 卷按**名字**取，不按下标：这份清单里三项的顺序不承载任何含义（kubelet
+        // 卷按**名字**取，不按下标：这份清单里各项的顺序不承载任何含义（kubelet
         // 按名字认领），钉住它只会让一次无关的重排变红。
         let volumes = manifest["spec"]["template"]["spec"]["volumes"]
             .as_array()
             .unwrap()
             .clone();
-        assert_eq!(volumes.len(), 3);
+        assert_eq!(volumes.len(), 4);
         let mut names: Vec<&str> = volumes
             .iter()
             .map(|v| v["name"].as_str().unwrap())
             .collect();
         names.sort();
-        assert_eq!(names, vec!["git-remote", "sandbox-data", "source"]);
+        assert_eq!(
+            names,
+            vec!["git-remote", PROGRESS_VOLUME, "sandbox-data", "source"]
+        );
         let with_name = |name: &str| -> serde_json::Value {
             volumes
                 .iter()
@@ -2192,9 +2218,20 @@ mod tests {
         let names = keys(&manifest);
 
         // 执行侧的环境面由镜像与代码定（校验用的那份环境本身就是一个白名单，
-        // 里面没有部署变量），所以清单里不该有 env——加一份透传就是给"子进程的
-        // 世界"造第二个声明处。
-        for forbidden in ["env", "envFrom", "envFromValue", "secret", "secretKeyRef"] {
+        // 里面没有部署变量），所以清单里不该有透传的 env——加一份透传就是给"子进程的
+        // 世界"造第二个声明处。唯一允许的一条是进度文件的落点：它不是部署变量，而是
+        // **挂载面**的一半（卷挂在哪，写者与探针就得按同一个路径拼），所以声明它的人和
+        // 挂载它的人是同一处。`env` 因此不在禁令里，改为逐字断言那一条的形状。
+        let container = &manifest["spec"]["template"]["spec"]["containers"][0];
+        assert_eq!(
+            container["env"],
+            serde_json::json!([{
+                "name": cog_core::progress::PROGRESS_FILE_ENV,
+                "value": PROGRESS_FILE,
+            }]),
+            "the only environment a change job may carry is where it writes its beat"
+        );
+        for forbidden in ["envFrom", "secret", "secretKeyRef"] {
             assert!(
                 !names.iter().any(|k| k == forbidden),
                 "the job manifest carries {forbidden}"
@@ -2241,8 +2278,12 @@ mod tests {
         assert!(err.to_string().contains("absolute"), "{err}");
     }
 
+    /// Job 不再带一个到点杀容器的钟，判停由容器自己的存活探针按进度文件做。
+    ///
+    /// 这条测试盯住的正是那个替换：一个 `activeDeadlineSeconds` 回来了、或者探针
+    /// 不见了，都是「按钟杀掉还在干活的容器」这个形状重新长回来。
     #[test]
-    fn the_deadline_ttl_and_pull_policy_are_the_configured_ones() {
+    fn the_job_is_stopped_by_its_own_progress_not_by_a_deadline() {
         let facts = parent_pod_facts(&parent_pod(DIGEST), PARENT_CONTAINER).unwrap();
         let config = ChangeJobConfig {
             deadline_secs: 1234,
@@ -2254,7 +2295,34 @@ mod tests {
             plan_change_job(&deployed_request("change-1"), &config, "cogneva", &facts).unwrap();
 
         let spec = &plan.manifest["spec"];
-        assert_eq!(spec["activeDeadlineSeconds"], 1234);
+        assert!(
+            spec["activeDeadlineSeconds"].is_null(),
+            "Job 的期限回来了：它到点杀容器，不问那容器还在不在动"
+        );
+        let container = &spec["template"]["spec"]["containers"][0];
+        assert_eq!(
+            container["env"][0]["name"],
+            cog_core::progress::PROGRESS_FILE_ENV
+        );
+        assert_eq!(container["env"][0]["value"], PROGRESS_FILE);
+        assert_eq!(
+            container["livenessProbe"]["exec"]["command"][1], "-c",
+            "探针得是一条命令，不是一次裸 exec：它要读文件、算差、比窗口"
+        );
+        assert_eq!(
+            container["livenessProbe"]["exec"]["command"][2],
+            cog_core::progress::PROGRESS_PROBE_COMMAND
+        );
+        // 探针读的那个文件必须落在挂进来的那块卷上，否则它读的是容器的可写层，
+        // 而那一层在 `readOnlyRootFilesystem` 下根本写不进去。
+        let mounts = container["volumeMounts"]
+            .as_array()
+            .expect("mounts")
+            .clone();
+        assert!(
+            mounts.iter().any(|m| m["mountPath"] == PROGRESS_DIR),
+            "进度文件那一卷没挂上：{mounts:?}"
+        );
         assert_eq!(spec["ttlSecondsAfterFinished"], 77);
         // 0：重试是常驻进程按队列与账本决定的，不是 Job 控制器按次数决定的。
         assert_eq!(spec["backoffLimit"], 0);

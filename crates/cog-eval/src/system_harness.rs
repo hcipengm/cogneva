@@ -38,7 +38,7 @@ pub enum SecurityScenario {
     GatewayBypass,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentTestConfig {
     pub machine_specs: Vec<MachineSpec>,
     #[serde(default = "default_repetitions")]
@@ -47,8 +47,26 @@ pub struct DeploymentTestConfig {
     pub fault_scenarios: Vec<FaultType>,
 }
 
+// 三遍：一次量不出抖动，两次分不清「这台机器就是慢」与「这一次撞上了别的负载」；
+// 三遍同时给出均值与「每次都成了没有」，再多只是把同一台机器的同一个数再量几遍。
+// cap: fixed — 三遍：一次量不出抖动，两次分不清慢机器与偶发负载
+// keep: 删掉后一遍量不出抖动，慢机器与偶发负载分不开；由「三遍」兜住
+const DEFAULT_DEPLOY_REPETITIONS: u32 = 3;
+
+/// 手写而不是 `derive(Default)`：派生出来的 `repetitions` 是 0，而没写这一格的
+/// 反序列化配置拿到的是三次——同一件「没配」的事，走到这里量一次、走到那里量三次。
+impl Default for DeploymentTestConfig {
+    fn default() -> Self {
+        Self {
+            machine_specs: Vec::new(),
+            repetitions: DEFAULT_DEPLOY_REPETITIONS,
+            fault_scenarios: Vec::new(),
+        }
+    }
+}
+
 fn default_repetitions() -> u32 {
-    3
+    DEFAULT_DEPLOY_REPETITIONS
 }
 
 /// 单次部署观测。
@@ -289,6 +307,19 @@ impl SystemEvalHarness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 重跑遍数只有一处声明：两条「没配」的入口读到的是同一个数——构造默认值的
+    /// 那一条与反序列化的那一条。`derive(Default)` 只给出 0，两条入口就分叉了。
+    #[test]
+    fn the_deploy_repetitions_read_their_name_on_both_entry_paths() {
+        assert_eq!(
+            DeploymentTestConfig::default().repetitions,
+            DEFAULT_DEPLOY_REPETITIONS
+        );
+        let parsed: DeploymentTestConfig =
+            serde_json::from_str(r#"{"machine_specs": [], "fault_scenarios": []}"#).unwrap();
+        assert_eq!(parsed.repetitions, DEFAULT_DEPLOY_REPETITIONS);
+    }
 
     struct FakeRunner {
         deploy_ms: u64,

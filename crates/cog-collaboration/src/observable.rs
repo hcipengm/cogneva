@@ -116,15 +116,19 @@ pub const INDEPENDENT_REVIEW_REJECTED: &str = "rejected";
 pub const INDEPENDENT_REVIEW_NOT_ANSWERED: &str = "not_answered";
 pub const INDEPENDENT_REVIEW_NOT_ASKED_NO_PRIOR_VERDICT: &str = "not_asked_no_prior_verdict";
 pub const INDEPENDENT_REVIEW_NOT_ASKED_DISABLED: &str = "not_asked_disabled";
+/// 复核这一问已经被完成判取代：管线的第三段本身就是“对着终态读树”的另一次
+/// 调用，再买一次同题复核对同一份字节再答一遍，答的还是同一件事。
+pub const INDEPENDENT_REVIEW_NOT_ASKED_SUPERSEDED: &str = "not_asked_superseded";
 
 /// Every cell of the independent-review outcome, published at zero as well. See
 /// [`INDEPENDENT_REVIEW_AGREED`].
-pub const INDEPENDENT_REVIEW_OUTCOMES: [&str; 5] = [
+pub const INDEPENDENT_REVIEW_OUTCOMES: [&str; 6] = [
     INDEPENDENT_REVIEW_AGREED,
     INDEPENDENT_REVIEW_REJECTED,
     INDEPENDENT_REVIEW_NOT_ANSWERED,
     INDEPENDENT_REVIEW_NOT_ASKED_NO_PRIOR_VERDICT,
     INDEPENDENT_REVIEW_NOT_ASKED_DISABLED,
+    INDEPENDENT_REVIEW_NOT_ASKED_SUPERSEDED,
 ];
 
 /// What the roundtable's moderator was asked, and what it decided.
@@ -132,11 +136,20 @@ pub const INDEPENDENT_REVIEW_OUTCOMES: [&str; 5] = [
 /// The moderator is consulted at the end of every round that did not reach
 /// consensus, and it is the one role handed the whole debate: one full
 /// iteration per round, so the document it reads grows with the run. Four of
-/// these cells are its decisions. The fifth counts the rounds where no
-/// moderator was configured at all, and it is the one that makes the other four
-/// readable — a deployment without a moderator writes no decision cell, which
-/// is indistinguishable from a moderator that was consulted and had nothing to
-/// say, unless the skip has a cell of its own.
+/// these cells are its decisions. `not_asked_disabled` counts the rounds where
+/// no moderator was configured at all, and `unreadable` counts the rounds where
+/// one was asked and no decision came back — the call failed, or it answered
+/// in words the parser does not recognise as one of the four. Both are the
+/// reason the decision cells are readable: a deployment without a moderator and
+/// a moderator that answered nothing write no decision cell, which is
+/// indistinguishable from a round the moderator chose to continue unless the
+/// two skips have cells of their own.
+///
+/// `unreadable` is not `continue`. A round that carried on because nobody could
+/// read the answer is not a round the moderator approved; filing it under
+/// `continue` would report a decision nobody made, and would hide a moderator
+/// that is failing or ignoring its contract behind the cell that means "keep
+/// going".
 ///
 /// Summed over a debate, the cells also count rounds: every round the moderator
 /// was consulted for lands in exactly one of them. A round that stopped before
@@ -149,15 +162,17 @@ pub const MODERATOR_CHANGE_STRATEGY: &str = "change_strategy";
 pub const MODERATOR_ACCEPT_PARTIAL: &str = "accept_partial";
 pub const MODERATOR_ESCALATE: &str = "escalate";
 pub const MODERATOR_NOT_ASKED_DISABLED: &str = "not_asked_disabled";
+pub const MODERATOR_UNREADABLE: &str = "unreadable";
 
 /// Every cell of the moderator consultation, published at zero as well. See
 /// [`MODERATOR_CONTINUE`].
-pub const MODERATOR_OUTCOMES: [&str; 5] = [
+pub const MODERATOR_OUTCOMES: [&str; 6] = [
     MODERATOR_CONTINUE,
     MODERATOR_CHANGE_STRATEGY,
     MODERATOR_ACCEPT_PARTIAL,
     MODERATOR_ESCALATE,
     MODERATOR_NOT_ASKED_DISABLED,
+    MODERATOR_UNREADABLE,
 ];
 
 /// What one round's judgement contributed to consensus: the configured
@@ -504,6 +519,12 @@ pub struct CollaborationObservable {
     /// 同步锁而非 `try_lock`：这是分类可达性自查的记录端，一次丢失会被
     /// 读成「这个分类从没被记录过」而报出并不存在的分叉。
     ralph_terminations: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// 停滞时换的那一处，按档计数（`Identical` / `Modified` / `Escalated`）。
+    ///
+    /// 没有它时，`change_one_thing` 那句 warn 随 Pod 一起消失：下一次只看得到
+    /// 「又停了」，看不出是不是又换在同一档上——而「同一处换两次」与「三档轮着
+    /// 换」是两种完全不同的病（前者说明那一档没被真正改掉）。
+    ralph_escalations: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     /// The durability sink for the two families below, installed once at
     /// plugin init.
     ///
@@ -763,6 +784,18 @@ impl CollaborationObservable {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *map.entry(reason.to_string()).or_insert(0) += 1;
+    }
+
+    /// 一轮停滞之后换的是哪一档：`Identical` / `Modified` / `Escalated`。
+    ///
+    /// 按档计数而不是只打一行日志：日志随 Pod 消失，而「同一档被换过两次」
+    /// ——那一档其实没改掉——只有跨进程的计数看得出来。
+    pub fn record_ralph_escalation(&self, tier: &str) {
+        let mut map = self
+            .ralph_escalations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry(tier.to_string()).or_insert(0) += 1;
     }
 
     /// 一位员工接走了一件 `platform_agent_task`。
@@ -1161,6 +1194,19 @@ impl Observable for CollaborationObservable {
                 metrics.push(
                     RawMetric::new("ralph_terminations_total", *count as f64)
                         .with_label(crate::LABEL_REASON, reason),
+                );
+            }
+            // 停滞换档的次数，按档。这个读数回答的是「同一档是不是被换了两次」：
+            // 只看终止原因看不出这一层。
+            let escalations = self
+                .ralph_escalations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for (tier, count) in escalations.iter() {
+                metrics.push(
+                    RawMetric::new("ralph_stall_escalations_total", *count as f64)
+                        .with_label(crate::LABEL_TIER, tier),
                 );
             }
             // Which door each failure analysis left by, zeros included. The two
@@ -2214,7 +2260,7 @@ mod tests {
             .find(|r| r["name"].as_str() == Some(RULE))
             .unwrap_or_else(|| panic!("the chart is missing rule {RULE}"));
 
-        let promql = rule["promql"].as_str().unwrap_or_default();
+        let promql = rule["promql"].as_str().unwrap_or(Default::default());
         assert!(
             promql.contains(METRIC),
             "the rule must read the series this crate publishes: {promql}"

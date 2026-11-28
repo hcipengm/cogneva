@@ -15,7 +15,13 @@
 //!    surface) — runtime reflection cannot see static code properties.
 //! 4. **Persisted alerts**: firing rows in the alert state machine (infra
 //!    watcher, supervisor bridge) are faults something already judged
-//!    alert-worthy; each becomes an intent keyed by its dedup key.
+//!    alert-worthy; each becomes an intent keyed by its dedup key. Two of those
+//!    writers report the observing side instead of the observed one — a rule
+//!    that cannot be evaluated, a configuration that is not the one deployed —
+//!    and their rows arrive through this same door. They are named as their own
+//!    sources (`rule_evaluation`, `config_defect`) rather than filed as ordinary
+//!    faults: an observer told to find "the root cause of this alert" looks at
+//!    the system, which is the one thing that was not being read.
 //! 5. **Taste intents**: judgements submitted from outside the pipeline
 //!    (whether a claimed result holds up, which direction is worth more, what
 //!    the standard of good should be). This is the one channel here whose
@@ -64,7 +70,8 @@ use crate::signal_readings::{SignalOutcome, SignalWatcherReadings};
 pub struct SignalWatcherConfig {
     /// Master switch.
     pub enabled: bool,
-    /// Poll interval (seconds); floor 60.
+    /// Poll interval (seconds). 声明的值原样生效；0 秒在加载时点名拒绝
+    /// （那是忙等，不是一个节拍）。
     pub poll_interval_secs: u64,
     /// Same-signature failures within the window that trigger an intent.
     pub failure_recurrence_threshold: usize,
@@ -104,23 +111,52 @@ pub struct SignalWatcherConfig {
     pub taste_channel_enabled: bool,
     /// Max taste submissions acted on per tick (flood guard).
     pub taste_channel_max_per_tick: usize,
+    /// Channel 6: 属主在对话里说的话。它是这条流水线上唯一一种「有人指名要什么」
+    /// 的输入：别的通道都只能在系统自己身上发现哪里疼，只有这一条带来了外面的人
+    /// 想要的东西。
+    ///
+    /// 它按批接手而不是按句：一段对话里大多数句子是回答或追问，不是活；把每一句
+    /// 都派成一条待办，等于让使用者每说一句就花掉一个 squad。判「哪几句是活」的
+    /// 那一次判断由接手的那条待办的 planner 一起做——它本来就要读这段原文。
+    pub intent_channel_enabled: bool,
+    /// Max chat intents quoted into one triage task per tick (flood guard).
+    pub intent_channel_max_per_tick: usize,
 }
+
+/// 一拍最多处理几条信号：告警通道与口味通道问的是同一件事（一拍的处理时长要
+/// 短于下一拍到点），所以两处读同一个数——各写一个 5，改一处另一处不懂。
+// cap: fixed — 由一拍的处理时长定：处理完这一批要早于下一拍到点
+// keep: 删掉后一拍要处理的信号无界，处理不完就拖到下一拍之后；由「处理完这一批要早于下一拍到点」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+const MAX_SIGNALS_PER_TICK: usize = 5;
+
+/// 同一类失败连着出现几次才算「重现」：一次是抖动，连着几次才是判据。
+// cap: fixed — 由同类失败的到达率定：抖动会自己消失，真问题会连着来
+// keep: 删掉后一次抖动就被读成真问题，告警被常态噪声占满；由「抖动会自己消失、真问题连着来」兜住
+const FAILURE_RECURRENCE_THRESHOLD: usize = 3;
+
+/// 积压深到什么程度才值得报：它问的是「几拍排得完」，所以随一拍的吞吐走。
+// cap: fixed — 由一拍排得动的条数定：积压超过几拍的量才报
+// keep: 删掉后几拍的积压就报，告警被正常的排队占满；由「积压超过几拍的量才报」兜住
+const BACKLOG_THRESHOLD: usize = 100;
 
 impl Default for SignalWatcherConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            poll_interval_secs: 300,
-            failure_recurrence_threshold: 3,
-            failure_window_secs: 3600,
-            backlog_threshold: 100,
-            report_cooldown_secs: 86_400,
-            self_audit_interval_secs: 7 * 86_400,
+            poll_interval_secs: (5 * cog_core::day::SECONDS_PER_MINUTE) as u64,
+            failure_recurrence_threshold: FAILURE_RECURRENCE_THRESHOLD,
+            failure_window_secs: cog_core::day::SECONDS_PER_HOUR,
+            backlog_threshold: BACKLOG_THRESHOLD,
+            report_cooldown_secs: cog_core::day::SECONDS_PER_DAY,
+            self_audit_interval_secs: cog_core::day::SECONDS_PER_WEEK,
             alert_channel_enabled: true,
-            alert_channel_max_per_tick: 5,
+            alert_channel_max_per_tick: MAX_SIGNALS_PER_TICK,
             alert_label_max_chars: cog_core::ALERT_LABEL_VALUE_MAX_CHARS,
             taste_channel_enabled: true,
-            taste_channel_max_per_tick: 5,
+            taste_channel_max_per_tick: MAX_SIGNALS_PER_TICK,
+            intent_channel_enabled: true,
+            intent_channel_max_per_tick: MAX_SIGNALS_PER_TICK,
         }
     }
 }
@@ -160,6 +196,10 @@ impl SignalWatcherConfig {
                 cog_core::SFError::Config(format!("COGNEVA_SELF_AUDIT_INTERVAL_SECS: {v}"))
             })?;
         }
+        crate::config::declared_cadence(
+            "self_evolution.signal_watcher.poll_interval_secs",
+            cfg.poll_interval_secs,
+        )?;
         Ok(cfg)
     }
 }
@@ -192,10 +232,10 @@ async fn load_state() -> SignalGuardState {
 async fn save_state(state: &SignalGuardState) {
     let path = state_path();
     if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
+        cog_core::ignore_lost!(tokio::fs::create_dir_all(parent).await);
     }
     if let Ok(text) = serde_json::to_string_pretty(state) {
-        let _ = tokio::fs::write(&path, text).await;
+        cog_core::ignore_lost!(tokio::fs::write(&path, text).await);
     }
 }
 
@@ -437,6 +477,33 @@ struct SelectedAlerts<'a> {
     in_cooldown: usize,
 }
 
+/// 第四条通道里那两类「读数没读到」的自报，各自的名字。
+///
+/// 普通告警说的都是系统里的一件真事：资源紧了、进程不在了、队列堵了。这两类
+/// 说的不是那件事，而是**观察本身**缺了一格——规则求值失败是这条规则/它选的
+/// 那个指标坏了，配置缺陷是这份进程跑的文档不是部署声明的那个。把两者交给同一句
+/// 「去查这个告警的根因」，接活的人会去查系统，而系统此刻恰恰没有被看见过；
+/// 查到的任何结论都是猜的。名字分开，判据、目标、项目分组才分得开。
+const RULE_EVALUATION_KIND: &str = "rule_evaluation";
+const CONFIG_DEFECT_KIND: &str = "config_defect";
+
+/// 一条 firing 行如果不是普通告警，它属于哪一类自报。
+///
+/// 按规则名认，因为那是行走过存储后唯一还带着的出身信息：`dedup_key` 里也有
+/// 它，但那是拼接出来的身份，读者要的是「这是哪一类」。名字本身声明在共享契约里
+/// ——写行的在 `cog-observability`，读行的在这里，两边不共用一个 crate。
+fn self_alert_kind(rule: &str) -> Option<&'static str> {
+    if rule == cog_core::alerts::EVAL_FAILURE_RULE {
+        return Some(RULE_EVALUATION_KIND);
+    }
+    if rule == cog_core::alerts::CONFIG_DECLARATION_RULE
+        || rule == cog_core::alerts::CONFIG_RULES_NOT_LOADED_RULE
+    {
+        return Some(CONFIG_DEFECT_KIND);
+    }
+    None
+}
+
 /// Turn one firing alert into the intent that will try to fix it.
 ///
 /// The labels are clamped on the way in because this intent's task input is
@@ -451,24 +518,61 @@ fn alert_intent(
     max_label_chars: usize,
 ) -> (String, serde_json::Value) {
     let labels = cog_core::bound_alert_labels(&alert.labels, max_label_chars);
+    let self_kind = self_alert_kind(&alert.rule);
     // The first line is the landing header: the rule name is the part that
     // tells two alert-driven changes apart, so it comes first, where a
-    // shortened header still shows it.
-    let goal = format!(
-        "Fix alert \"{}\"\n\nInvestigate and fix the root cause of firing alert \"{}\" \
-         (severity: {}): {}. Alert labels: {}. The alert fired at {} \
-         and is still active. Identify the underlying defect or \
-         resource condition, implement a durable fix, and explain \
-         how recurrence is prevented.",
-        alert.rule,
-        alert.rule,
-        alert.severity,
-        alert.message,
-        labels,
-        alert.fired_at.to_rfc3339(),
-    );
+    // shortened header still shows it. For a self-alert the header leads with
+    // what kind of gap it is, because "fix alert X" sends the reader looking for
+    // a fault in the system while the row says the system was not looked at.
+    let goal = if self_kind == Some(RULE_EVALUATION_KIND) {
+        format!(
+            "Fix rule evaluation failure \"{}\"\n\nAlert rule \"{}\" cannot be evaluated \
+             (severity: {}): {}. While a rule cannot be evaluated, nothing can say whether \
+             the condition it names is true — a quiet board and a blind reader read the same. \
+             Find why this reading is not produced (the rule's query, the metric it selects, \
+             the scrape path behind it), fix that, and say how a rule that breaks again would \
+             be noticed as broken. Alert labels: {}. The alert fired at {} and is still \
+             active.",
+            alert.rule,
+            alert.rule,
+            alert.severity,
+            alert.message,
+            labels,
+            alert.fired_at.to_rfc3339(),
+        )
+    } else if self_kind == Some(CONFIG_DEFECT_KIND) {
+        format!(
+            "Fix configuration defect \"{}\"\n\nAlert rule \"{}\" reports that the configuration \
+             in force is not the one the deployment declares (severity: {}): {}. Nothing here \
+             says the system is misbehaving — it says every setting read from that document is \
+             a value nobody chose. Find which side is stale (the document that was applied, the \
+             process that did not roll, the revision the deployment points at), fix that, and \
+             say how the two readings would notice drifting apart again. Alert labels: {}. The \
+             alert fired at {} and is still active.",
+            alert.rule,
+            alert.rule,
+            alert.severity,
+            alert.message,
+            labels,
+            alert.fired_at.to_rfc3339(),
+        )
+    } else {
+        format!(
+            "Fix alert \"{}\"\n\nInvestigate and fix the root cause of firing alert \"{}\" \
+             (severity: {}): {}. Alert labels: {}. The alert fired at {} \
+             and is still active. Identify the underlying defect or \
+             resource condition, implement a durable fix, and explain \
+             how recurrence is prevented.",
+            alert.rule,
+            alert.rule,
+            alert.severity,
+            alert.message,
+            labels,
+            alert.fired_at.to_rfc3339(),
+        )
+    };
     let detail = serde_json::json!({
-        "kind": "persisted_alert",
+        "kind": self_kind.unwrap_or("persisted_alert"),
         "rule": alert.rule,
         "dedup_key": alert.dedup_key,
         "severity": alert.severity,
@@ -565,7 +669,8 @@ const ALERT_TASK_PREFIX: &str = "self-signal-alert-";
 /// hide the standing one behind them for as long as they kept firing. It is
 /// also the page that says whether the round may conclude anything from
 /// absence, which it may only do when the page came back short.
-// cap: bound — 页的大小不是量出来的界：高到一场风暴藏不住站着的那条，低到一轮仍读得完。
+// cap: fixed — 页的大小不是量出来的界：高到一场风暴藏不住站着的那条，低到一轮仍读得完。
+// keep: 删掉后一轮读不完页，一场风暴里站着的那条藏不住；由「高到风暴藏不住、低到一轮读得完」兜住
 const ALERT_LIST_LIMIT: i64 = 1000;
 
 /// How many cleared rows one round retires.
@@ -577,7 +682,9 @@ const ALERT_LIST_LIMIT: i64 = 1000;
 /// behind would be undone in one round that blocks the loop for as long as a
 /// thousand cancellations take, and the rounds after it are what read the new
 /// alerts.
-// cap: bound — 与收行的上限同一档：一轮的活有界，够不着的下一轮还看得见同一份证据。
+// cap: fixed — 与收行的上限同一档：一轮的活有界，够不着的下一轮还看得见同一份证据。
+// keep: 删掉后一轮退休的活无界，一轮跑不完而下一轮看不到同一份证据；由「一轮的活有界」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const ALERT_RETIRE_MAX_PER_ROUND: usize = 200;
 
 /// Whether `task_id` is a row [`alert_task_id`] minted.
@@ -642,14 +749,107 @@ fn taste_intent(intent: &cog_core::TasteIntent) -> (String, serde_json::Value) {
         intent.submitted_by,
         intent.submitted_at.to_rfc3339(),
     );
+    // The kind word is a constant because the task reads it back: a copy spelled
+    // by hand here would drift from the reader and the direction would silently
+    // stop reaching the work it was stated about.
     let detail = serde_json::json!({
-        "kind": "taste_intent",
+        "kind": cog_core::TASTE_SIGNAL_KIND,
         "taste_kind": intent.payload.kind(),
         "subject": intent.subject,
         "submitted_by": intent.submitted_by,
         "submitted_at": intent.submitted_at.to_rfc3339(),
         "intent_id": intent.id,
         "payload": intent.payload,
+    });
+    (goal, detail)
+}
+
+/// 有没有一批对话意图正被接手。
+///
+/// 有就不派下一批：接手是一个 squad 任务，属主在一段对话里连着说十句就派十个 squad
+/// 是把「说一句话」的价钱绑到「跑一件活」上。正在办的那一批读的是快照——它读到的那几
+/// 句都已被标成接手过——所以没读到的留在流上，等这一批办完再一起读。
+fn chat_triage_in_hand(tasks: &[Task]) -> bool {
+    tasks.iter().any(|task| {
+        matches!(
+            task.status,
+            TaskStatus::Pending | TaskStatus::Scheduled | TaskStatus::Running
+        ) && task
+            .input
+            .get(cog_core::INPUT_TASK_KIND)
+            .and_then(|value| value.as_str())
+            == Some(cog_core::CHAT_INTENT_TASK_KIND)
+    })
+}
+
+/// The report key a batch of chat intents is filed under, for the counters.
+fn intent_triage_key(batch: &[cog_core::IntentRow]) -> String {
+    match batch.first() {
+        Some(first) => format!("chat-intent:{}", first.identity),
+        None => "chat-intent:empty".to_string(),
+    }
+}
+
+/// The task a batch of chat intents is triaged under.
+///
+/// Derived from the first intent in the batch rather than minted. Rows are read
+/// by "not yet triaged", so a round that died between filing the task and
+/// marking the rows reads the same rows again on the next tick; deriving the id
+/// from them makes that retry land on the task already in hand instead of a
+/// second one. Two live batches never share a first row: a batch can only be
+/// read while its rows are unmarked.
+fn intent_triage_task_id(batch: &[cog_core::IntentRow]) -> String {
+    match batch.first() {
+        Some(first) => format!("self-signal-chat-intent-{}", short_hash(&first.identity)),
+        None => "self-signal-chat-intent-empty".to_string(),
+    }
+}
+
+/// Turn a batch of the owner's messages into the intent that will act on them.
+///
+/// Every message is quoted verbatim, with who said it and when. The work is
+/// asked to decide per message whether it asks for work or is a remark — that
+/// judgement is the whole point of routing chat through the task layer, because
+/// the conversation that answers a question cannot also file the change it was
+/// asked for. Rewriting the text would replace the requirement with our reading
+/// of it, so the quoted block is the requirement.
+fn intent_triage(batch: &[cog_core::IntentRow]) -> (String, serde_json::Value) {
+    let mut quoted = String::new();
+    for intent in batch {
+        quoted.push_str(&format!(
+            "\n- {} at {} said: {}",
+            intent.said_by,
+            intent.at.to_rfc3339(),
+            intent.text
+        ));
+    }
+    let goal = format!(
+        "Take up {} message(s) said in the WebUI conversation\n\nThe owner typed \
+         the messages quoted below in the conversation. For each one, decide \
+         whether it asks for work — a change, a fix, something to be made or \
+         checked — or is a question or remark the conversation already answered: \
+         file every message that asks for work as work and see it through, and \
+         say in the change description why each of the others asked for none. \
+         Do not drop a message for being short, and do not restate one as a \
+         different task: the quoted text is the requirement exactly as it was \
+         stated.{}",
+        batch.len(),
+        quoted
+    );
+    let detail = serde_json::json!({
+        "kind": cog_core::CHAT_INTENT_TASK_KIND,
+        "intent_id": batch.first().map(|first| first.identity.clone()),
+        "intents": batch
+            .iter()
+            .map(|intent| serde_json::json!({
+                "identity": intent.identity,
+                "source": intent.source,
+                "said_by": intent.said_by,
+                "addressed_to": intent.addressed_to,
+                "text": intent.text,
+                "at": intent.at.to_rfc3339(),
+            }))
+            .collect::<Vec<_>>(),
     });
     (goal, detail)
 }
@@ -860,6 +1060,24 @@ fn signal_acceptance(detail: &serde_json::Value, project: Option<&str>) -> Strin
             .and_then(|value| value.as_u64())
             .unwrap_or(0)
     };
+    // 两类自报的止损条件和普通告警同一形状——行离开 firing 集合——但说出来的话不同。
+    // 普通告警是「那件事过去了」，这两类是「这一格读数回来了」。读到这句话的人拿它
+    // 判断还要不要等，两种含义压成一句，就是把「系统好了」与「又能看见系统了」写成
+    // 同一件事，而这正是它们要分开的理由。
+    if kind == RULE_EVALUATION_KIND {
+        return format!(
+            "告警「{}」不再处于 firing：这条自报说的是求值这一格恢复了——同一规则重新被\
+             求值之后，存储里这一行由写它的那一侧关掉",
+            text("rule")
+        );
+    }
+    if kind == CONFIG_DEFECT_KIND {
+        return format!(
+            "告警「{}」不再处于 firing：进程跑的配置回到了部署声明的那个修订，行由做这项\
+             检查的那一侧自己关掉",
+            text("rule")
+        );
+    }
     match kind {
         "persisted_alert" => format!(
             "告警「{}」不再处于 firing：下一轮读告警存储时它不在 firing 集合里",
@@ -882,6 +1100,16 @@ fn signal_acceptance(detail: &serde_json::Value, project: Option<&str>) -> Strin
             "{} 这一期自审点名的缺陷在账上有一条落地的变更：账读得到这次自审的成果，\
              而不是任务跑完就算",
             text("period")
+        ),
+        // 「这一批都处理完了」不是它做完的意思：接手那一侧一批一批地读，下一批永远
+        // 已在路上，按它判等于这条活第一次交卷就永远闭得上。做完是每一句都有去向。
+        cog_core::CHAT_INTENT_TASK_KIND => format!(
+            "这批 {} 句每一句都各有去向：要办的派成了待办，不办的写出了为什么——\
+             不是这一批行被接手就算",
+            detail
+                .get("intents")
+                .and_then(|value| value.as_array())
+                .map_or(0, |rows| rows.len())
         ),
         _ => format!(
             "条件「{}」不再成立：下一轮不再为它建行",
@@ -968,7 +1196,8 @@ fn signal_project_root_id(project: &str) -> String {
 /// rows to reach, and this round also reads the whole graph every minute. A
 /// batch bounds the burst, not the work: the round asks again on its next tick
 /// until `remaining` is zero.
-// cap: bound — 界的是这一轮的突发量，不是工作量；下一拍会接着问直到 remaining 归零
+// cap: fixed — 界的是这一轮的突发量，不是工作量；下一拍会接着问直到 remaining 归零
+// keep: 删掉后一拍吞下整场突发，这一轮的活没有上界；由「下一拍接着问直到 remaining 归零」兜住
 const SIGNAL_SETTLE_BATCH: usize = 250;
 
 /// What one settle of the signal projects did, cell by cell.
@@ -1143,8 +1372,23 @@ async fn fill_signal_criteria(
         // running this moment is left to the next tick rather than written over.
         // `replace_task` writes the whole row, so there is no narrower write to
         // fall back on.
-        let Some(mut filled) = orch.get_task(&row.id).await else {
-            continue;
+        let mut filled = match orch.get_task_checked(&row.id).await {
+            Ok(Some(filled)) => filled,
+            // The row is gone: there is nothing left to fill.
+            Ok(None) => continue,
+            Err(e) => {
+                // Not "gone": a read that failed cannot say that. The row stays
+                // a candidate for the next tick, and `remaining` stays up so a
+                // pass that could not read it does not claim it filled
+                // everything.
+                settled.remaining += 1;
+                warn!(
+                    task = %row.id,
+                    error = %e,
+                    "signal watcher: a signal row could not be read; it is left for the next tick"
+                );
+                continue;
+            }
         };
         if !filled.acceptance.is_empty() {
             continue;
@@ -1199,8 +1443,20 @@ async fn fill_rework_criteria(
     for row in candidates.into_iter().take(SIGNAL_SETTLE_BATCH) {
         // Read again before writing, for the same reason as the signal rows: the
         // snapshot is a minute old and `replace_task` writes the whole row.
-        let Some(mut filled) = orch.get_task(&row.id).await else {
-            continue;
+        let mut filled = match orch.get_task_checked(&row.id).await {
+            Ok(Some(filled)) => filled,
+            Ok(None) => continue,
+            Err(e) => {
+                // Same as the signal rows: a failed read is not "this row is
+                // gone", and the row has to stay a candidate.
+                settled.remaining += 1;
+                warn!(
+                    task = %row.id,
+                    error = %e,
+                    "signal watcher: a rework row could not be read; it is left for the next tick"
+                );
+                continue;
+            }
         };
         if !filled.acceptance.is_empty() {
             continue;
@@ -1225,7 +1481,7 @@ async fn fill_rework_criteria(
                     .map(str::to_string)
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         if cause.is_none() && files.is_empty() {
             continue;
         }
@@ -1300,7 +1556,14 @@ async fn submit_intent(
     detail: serde_json::Value,
     may_redrive: bool,
 ) -> IntentOutcome {
-    let existing = orch.get_task(&task_id).await;
+    // Submitting without this read is what the idempotence exists to prevent:
+    // if the store still holds the row, the submission raises on the duplicate
+    // id every tick after this one. So a read that failed is reported as a
+    // failed attempt, retried next tick -- never as "no row".
+    let existing = match orch.get_task_checked(&task_id).await {
+        Ok(existing) => existing,
+        Err(e) => return IntentOutcome::Failed(format!("read {task_id}: {e}")),
+    };
     let action = intent_action(existing.as_ref(), may_redrive);
     let resubmitting = action == IntentAction::Resubmit;
     match action {
@@ -1343,7 +1606,7 @@ async fn submit_intent(
                     "goal": goal,
                     (cog_core::INPUT_EVOLUTION_MODE): cog_core::EVOLUTION_MODE_GENERATE_CHANGE,
                     (cog_core::INPUT_TASK_KIND): task_kind,
-                    "signal": detail,
+                    (cog_core::INPUT_SIGNAL): detail,
                 }),
             );
             // The same defect the change ledger's handover had: the goal path
@@ -1426,11 +1689,18 @@ fn report_outcome(
 }
 
 /// One watcher tick: scan task state, emit intents for active signals.
+// Each argument is an independent source the tick reads or a coordinate of the
+// one round (which orchestrator, which config, which set of sources is wired,
+// and the two pieces of state carried between rounds); bundling them into a
+// carrier would move the same count behind a name.
+#[allow(clippy::too_many_arguments)]
 async fn tick(
     orch: &Arc<dyn OrchestratorControl>,
     config: &SignalWatcherConfig,
     alert_source: Option<&Arc<dyn cog_core::ActiveAlertSource>>,
     taste_source: Option<&Arc<dyn cog_core::TasteIntentSource>>,
+    intent_reader: Option<&Arc<dyn cog_core::IntentReader>>,
+    intent_writer: Option<&Arc<dyn cog_core::EventStore>>,
     readings: &SignalWatcherReadings,
     held: bool,
     parents_settled: &mut bool,
@@ -1441,7 +1711,22 @@ async fn tick(
     // a broken watcher look like a quiet system.
     readings.tick();
     let now = Utc::now();
-    let tasks = orch.get_all_tasks().await;
+    // The graph is read once and every signal below is derived from this one
+    // read, so a read that failed would be judged as a graph with no failures,
+    // no backlog and nothing to settle -- which is what a quiet system looks
+    // like. The round has happened (the tick above is counted); it is counted
+    // apart, and it judges nothing.
+    let tasks = match orch.get_all_tasks_checked().await {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            readings.unread_round();
+            warn!(
+                error = %e,
+                "signal watcher: the task graph could not be read; this round judges nothing"
+            );
+            return;
+        }
+    };
     // Until it stops finding anything to fill, on the graph this round already
     // read: see `settle_filings`. Before the held-round return, because shaping
     // the tree spends no LLM call and a pool outage is no reason to leave a
@@ -1579,7 +1864,7 @@ async fn tick(
             readings.record(SignalOutcome::Cooldown);
         } else {
             dirty = true;
-            let dlq = orch.dlq_len().await.unwrap_or(0);
+            let dlq = cog_core::logged_default!(orch.dlq_len().await, 0);
             let goal = format!(
                 "Drain the queue backlog\n\nInvestigate orchestrator queue backlog: {backlog} \
                  tasks pending/scheduled (DLQ: {dlq}). Determine why tasks are not \
@@ -1788,6 +2073,85 @@ async fn tick(
         }
     }
 
+    // 6. Chat turns taken up for triage. Every turn the owner types in the WebUI
+    // is already a row in the event stream (`intent_received`); what was
+    // missing is the reader that turns a row into work. Rows are read by "not
+    // yet triaged", so a marked batch is never read again, and a round that
+    // died between filing and marking rereads the same rows and lands on the
+    // same task id instead of filing twice (see `intent_triage_task_id`).
+    //
+    // One task per batch rather than one per sentence: any turn may be work,
+    // and the call that tells which is the same call that then does the work.
+    // The batch is capped like the other channels and quoted verbatim, because
+    // a paraphrase of the owner's words is not the requirement. And no new
+    // batch while one is being taken up (`chat_triage_in_hand`): a burst of
+    // sentences is one conversation, not one squad run per sentence.
+    if config.intent_channel_enabled && !chat_triage_in_hand(&tasks) {
+        if let (Some(reader), Some(writer)) = (intent_reader, intent_writer) {
+            // A read that failed says nothing about the rows ("nothing was
+            // said" and "the store did not answer" are different facts, and
+            // only the second one has rows waiting), so it marks nothing and
+            // the next round is the one that acts on them.
+            match reader
+                .undispatched(config.intent_channel_max_per_tick as i64)
+                .await
+            {
+                Ok(batch) if !batch.is_empty() => {
+                    let key = intent_triage_key(&batch);
+                    let task_id = intent_triage_task_id(&batch);
+                    let (goal, detail) = intent_triage(&batch);
+                    let outcome = submit_intent(
+                        orch,
+                        task_id.clone(),
+                        cog_core::CHAT_INTENT_TASK_KIND,
+                        goal,
+                        detail,
+                        true,
+                    )
+                    .await;
+                    // Marked on every outcome that reached the task layer,
+                    // including "already in hand": those rows are being triaged
+                    // by the task that is running, and rereading them would ask
+                    // for a second task for the same work. Only a submission
+                    // that never got there leaves the rows unmarked, so the
+                    // retry is the next round's.
+                    if report_outcome(&mut state, &key, outcome, now, readings) {
+                        dirty = true;
+                        let identities: Vec<String> =
+                            batch.iter().map(|intent| intent.identity.clone()).collect();
+                        let events = cog_core::intent_triaged_events(
+                            &identities,
+                            &task_id,
+                            "signal-watcher",
+                            chrono::Utc::now(),
+                        );
+                        let mut failure = None;
+                        for event in events {
+                            if let Err(e) = writer.append(event).await {
+                                failure = Some(e);
+                                break;
+                            }
+                        }
+                        if let Some(e) = failure {
+                            warn!(
+                                task_id = %task_id,
+                                error = %e,
+                                "chat intents filed but not marked; the next round reads them again"
+                            );
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "chat intent store unreadable; no chat work this round"
+                    );
+                }
+            }
+        }
+    }
+
     // The store's own size is published every round, whatever this round did:
     // it is the only reading that says whether keys are accumulating, and a
     // store that only ever grows is how it went unnoticed for weeks. It is a
@@ -1970,16 +2334,21 @@ fn round_ticker(interval: Duration) -> tokio::time::Interval {
 
 /// Background loop; follows the same shutdown pattern as the baseline port
 /// trigger loop.
+// Same shape as `tick`: the sources are wired independently and the caller is
+// the composition root, so a carrier struct here would only rename the wiring.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_signal_watcher_loop(
     orchestrator: Arc<dyn OrchestratorControl>,
     config: SignalWatcherConfig,
     shutdown: cog_core::ShutdownSignal,
     alert_source: Option<Arc<dyn cog_core::ActiveAlertSource>>,
     taste_source: Option<Arc<dyn cog_core::TasteIntentSource>>,
+    intent_reader: Option<Arc<dyn cog_core::IntentReader>>,
+    intent_writer: Option<Arc<dyn cog_core::EventStore>>,
     readings: Arc<SignalWatcherReadings>,
     llm_gate: Option<Arc<dyn cog_core::SchedulerGate>>,
 ) -> tokio::task::JoinHandle<()> {
-    let interval = Duration::from_secs(config.poll_interval_secs.max(60));
+    let interval = Duration::from_secs(config.poll_interval_secs);
     info!(
         interval_secs = interval.as_secs(),
         failure_recurrence_threshold = config.failure_recurrence_threshold,
@@ -1987,6 +2356,8 @@ pub fn spawn_signal_watcher_loop(
         self_audit_interval_secs = config.self_audit_interval_secs,
         alert_channel = alert_source.is_some() && config.alert_channel_enabled,
         taste_channel = taste_source.is_some() && config.taste_channel_enabled,
+        intent_channel =
+            intent_reader.is_some() && intent_writer.is_some() && config.intent_channel_enabled,
         "self-discovery signal watcher started"
     );
     // Self-discovery: if this loop stops, the system stops noticing its own
@@ -2003,6 +2374,8 @@ pub fn spawn_signal_watcher_loop(
             let shutdown = shutdown.clone();
             let alert_source = alert_source.clone();
             let taste_source = taste_source.clone();
+            let intent_reader = intent_reader.clone();
+            let intent_writer = intent_writer.clone();
             let readings = readings.clone();
             let llm_gate = llm_gate.clone();
             async move {
@@ -2042,6 +2415,8 @@ pub fn spawn_signal_watcher_loop(
                                 &config,
                                 alert_source.as_ref(),
                                 taste_source.as_ref(),
+                                intent_reader.as_ref(),
+                                intent_writer.as_ref(),
                                 &readings,
                                 standing_down,
                                 &mut parents_settled,
@@ -2425,13 +2800,30 @@ mod tests {
     /// to rather than off the return value of any one call.
     struct FilingOrchestrator {
         tasks: std::sync::Mutex<Vec<Task>>,
+        /// 测试用：整份行表读不成（模拟一个读不出来的 store）。
+        graph_unreadable: std::sync::atomic::AtomicBool,
+        /// 测试用：读到这些 id 的那一问答不上来。
+        unreadable: std::sync::Mutex<std::collections::HashSet<String>>,
     }
 
     impl FilingOrchestrator {
         fn holding(tasks: Vec<Task>) -> Self {
             Self {
                 tasks: std::sync::Mutex::new(tasks),
+                graph_unreadable: std::sync::atomic::AtomicBool::new(false),
+                unreadable: std::sync::Mutex::new(std::collections::HashSet::new()),
             }
+        }
+
+        /// 整份行表这一问问不上来。
+        fn forget_the_graph(&self) {
+            self.graph_unreadable
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        /// 读这一行的那一问答不上来。
+        fn fail_read_of(&self, id: &str) {
+            self.unreadable.lock().unwrap().insert(id.to_string());
         }
 
         fn filed(&self) -> Vec<Task> {
@@ -2463,6 +2855,28 @@ mod tests {
 
         async fn get_all_tasks(&self) -> Vec<Task> {
             self.filed()
+        }
+
+        /// 如实报错的那两条读：只有 store 读不出来时才走 `Err`，其余照内存答。
+        async fn get_all_tasks_checked(&self) -> cog_core::SFResult<Vec<Task>> {
+            if self
+                .graph_unreadable
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(cog_core::SFError::Database(
+                    "store unavailable: cannot read the task graph".into(),
+                ));
+            }
+            Ok(self.filed())
+        }
+
+        async fn get_task_checked(&self, task_id: &str) -> cog_core::SFResult<Option<Task>> {
+            if self.unreadable.lock().unwrap().contains(task_id) {
+                return Err(cog_core::SFError::Database(format!(
+                    "store unavailable: cannot read task {task_id}"
+                )));
+            }
+            Ok(self.get_task(task_id).await)
         }
 
         async fn get_task(&self, task_id: &str) -> Option<Task> {
@@ -3263,6 +3677,187 @@ mod tests {
         }
     }
 
+    /// 一轮读不到整份行表，就不是「安静的一轮」。
+    ///
+    /// 这一轮里每一个信号都从这一次读里派生，读不到就等于图上一个失败、一段积压、
+    /// 一条待补的行都没有——与一个真的没事的系统逐字同形。所以它不判任何信号，
+    /// 并且要在读数面单独记一笔（`unread`）：`ticks` 照涨、信号照零的那种瘦身版
+    /// 读数，正是这一族要拆掉的那一层。
+    ///
+    /// 断言落在读数上：审计与告警通道都关掉之后，这一轮本来什么也不会写，折叠读那
+    /// 一版照常往下走、`unread` 停在 0，这条测试就红。
+    #[tokio::test]
+    async fn a_round_that_cannot_read_the_graph_judges_nothing_and_says_so() {
+        let orch = Arc::new(FilingOrchestrator::holding(vec![intent_row(
+            TaskStatus::Failed,
+            true,
+        )]));
+        orch.forget_the_graph();
+        let orch: Arc<dyn OrchestratorControl> = orch;
+        let config = SignalWatcherConfig {
+            self_audit_interval_secs: 0,
+            alert_channel_enabled: false,
+            ..Default::default()
+        };
+        let readings = SignalWatcherReadings::new();
+        readings.mark_running();
+        let mut parents_settled = false;
+
+        tick(
+            &orch,
+            &config,
+            None,
+            None,
+            None,
+            None,
+            &readings,
+            false,
+            &mut parents_settled,
+        )
+        .await;
+
+        assert_eq!(
+            orch.get_all_tasks().await.len(),
+            1,
+            "读不到图的一轮不该写出任何东西"
+        );
+        assert!(
+            !parents_settled,
+            "没读到图就没法说「这一趟已经补完」，下一拍要接着问"
+        );
+
+        use cog_core::Observable;
+        let metrics = readings.collect_metrics("").await.unwrap();
+        let value = |name: &str| {
+            metrics
+                .iter()
+                .find(|m| m.name == name)
+                .map(|m| m.value)
+                .unwrap_or(-1.0)
+        };
+        assert_eq!(
+            value(crate::signal_readings::SIGNAL_TICKS_METRIC),
+            1.0,
+            "这一轮发生过，节拍要数上"
+        );
+        assert_eq!(
+            value(crate::signal_readings::SIGNAL_UNREAD_METRIC),
+            1.0,
+            "读不到图的那一轮要单独记一笔，否则它与安静的一轮读数一样"
+        );
+        for outcome in crate::signal_readings::SIGNAL_OUTCOMES {
+            let counted = metrics
+                .iter()
+                .filter(|m| m.name == crate::signal_readings::SIGNAL_OUTCOMES_METRIC)
+                .filter(|m| {
+                    m.labels
+                        .get(crate::signal_readings::OUTCOME_LABEL)
+                        .map(String::as_str)
+                        == Some(*outcome)
+                })
+                .map(|m| m.value)
+                .next()
+                .unwrap_or(-1.0);
+            assert_eq!(counted, 0.0, "{outcome} 在没读到图的一轮里不该动");
+        }
+    }
+
+    /// 补写判据的那一趟，行本身读不出来时不是「这行不在了」。
+    ///
+    /// 读不出来就把这一行留到下一拍，`remaining` 照实加一：一读失败就当作行没了，
+    /// 等于让这一趟宣布自己已经补完，而下一拍也永远不会再来问它。
+    #[tokio::test]
+    async fn a_signal_row_whose_read_fails_is_left_for_the_next_tick() {
+        let mut row = Task::new(
+            "self-signal-unreadable".to_string(),
+            TaskType::Custom(SIGNAL_TASK_TYPE.into()),
+            serde_json::json!({
+                "goal": "g",
+                "signal": {"kind": "persisted_alert", "rule": "PoolDown"},
+            }),
+        );
+        row.status = TaskStatus::Pending;
+        let orch = Arc::new(FilingOrchestrator::holding(vec![row.clone()]));
+        orch.fail_read_of(&row.id);
+        let orch: Arc<dyn OrchestratorControl> = orch;
+        let mut settled = SettledSignals::default();
+
+        fill_signal_criteria(&orch, std::slice::from_ref(&row), &mut settled).await;
+
+        assert_eq!(settled.criteria, 0, "{settled:?}");
+        assert_eq!(settled.failed, 0, "读不到不是「写失败」：{settled:?}");
+        assert_eq!(settled.remaining, 1, "读不到的行要留到下一拍：{settled:?}");
+        let after = orch.get_all_tasks().await;
+        assert!(
+            after[0].acceptance.is_empty(),
+            "读不到的一行什么都没写，不该凭空长出一条判据"
+        );
+    }
+
+    /// 回流行同理：读不出来不是「这行不在了」，留到下一拍。
+    #[tokio::test]
+    async fn a_rework_row_whose_read_fails_is_left_for_the_next_tick() {
+        let mut row = Task::new(
+            "rework-unreadable".to_string(),
+            TaskType::Custom(crate::change_rework::REWORK_TASK_KIND.into()),
+            serde_json::json!({
+                "rejection_cause": "tests_failed",
+                "named_files": ["crates/x/src/lib.rs"],
+            }),
+        );
+        row.status = TaskStatus::Pending;
+        let orch = Arc::new(FilingOrchestrator::holding(vec![row.clone()]));
+        orch.fail_read_of(&row.id);
+        let orch: Arc<dyn OrchestratorControl> = orch;
+        let mut settled = SettledSignals::default();
+
+        fill_rework_criteria(&orch, std::slice::from_ref(&row), &mut settled).await;
+
+        assert_eq!(settled.rework_criteria, 0, "{settled:?}");
+        assert_eq!(settled.remaining, 1, "读不到的行要留到下一拍：{settled:?}");
+        let after = orch.get_all_tasks().await;
+        assert!(after[0].acceptance.is_empty(), "读不到的一行什么都没写");
+    }
+
+    /// 「先读后判」那一问答不上来时，不能当作「库里没有这一行」。
+    ///
+    /// 读的结果决定这一投是 Tracked 还是 Submit；读失败被读成 None，就会照着同一
+    /// 个固定 id 再投一次，而真实 store 对重复 id 是直接报错的——此后每拍都投、
+    /// 每拍都报错。所以它按一次失败的上报处理（下一拍重试），不重投。
+    #[tokio::test]
+    async fn an_intent_whose_row_cannot_be_read_is_reported_failed_not_resubmitted() {
+        let id = "self-signal-backlog".to_string();
+        let mut row = Task::new(
+            id.clone(),
+            TaskType::Custom(SIGNAL_TASK_TYPE.into()),
+            serde_json::json!({}),
+        );
+        row.status = TaskStatus::Running;
+        let orch = Arc::new(FilingOrchestrator::holding(vec![row]));
+        orch.fail_read_of(&id);
+        let orch: Arc<dyn OrchestratorControl> = orch;
+
+        let outcome = submit_intent(
+            &orch,
+            id.clone(),
+            SIGNAL_TASK_TYPE,
+            "goal".to_string(),
+            serde_json::json!({"kind": "queue_backlog"}),
+            true,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, IntentOutcome::Failed(_)),
+            "读不到在手的行时这一投要报失败、下一拍重试：{outcome:?}"
+        );
+        assert_eq!(
+            orch.get_all_tasks().await.len(),
+            1,
+            "读不到在手的行时不该再投一次（真实 store 会按重复 id 报错）"
+        );
+    }
+
     /// 周期性自审不是「不再成立」那一族：它每一期都会再提交一次，所以
     /// 「下一轮不再为它建行」永远为真，等于给这一行写了一句恒真的判据——那和
     /// 空判据一样关不掉。关掉它的是它本该产出的那条变更。
@@ -3554,6 +4149,129 @@ mod tests {
         assert_eq!(signal_project_key(&serde_json::json!({"kind": "  "})), None);
     }
 
+    /// 一条「规则求值失败」的自报是一条自报，不是一条故障：它说的是这一格读数
+    /// 没读到，不是系统里出了事。落成同一个 `persisted_alert`，接活的人会按那句
+    /// 「去查这个告警的根因」去看系统，而系统此刻恰恰没有被读过——他能得到的任何
+    /// 结论都是猜的。
+    #[test]
+    fn a_rule_that_cannot_be_evaluated_is_filed_under_its_own_source() {
+        let mut alert = firing("eval");
+        alert.rule = cog_core::alerts::EVAL_FAILURE_RULE.to_string();
+        alert.message = "rule CognevaPoolDown: query failed".into();
+
+        let (goal, detail) = alert_intent(&alert, 256);
+
+        assert_eq!(
+            detail["kind"].as_str(),
+            Some(RULE_EVALUATION_KIND),
+            "求值失败被当成了普通告警：判据与目标都会按「系统出事了」来写"
+        );
+        assert_eq!(
+            signal_project_key(&detail),
+            Some(format!(
+                "{SIGNAL_PROJECT_PREFIX}{RULE_EVALUATION_KIND}/{}",
+                cog_core::alerts::EVAL_FAILURE_RULE
+            )),
+            "项目按来源分组，才不会和普通告警挤在同一个项目里"
+        );
+        assert!(
+            goal.starts_with(&format!("Fix rule evaluation failure \"{}\"", alert.rule)),
+            "结案头要说出缺的是哪一格读数，而不是笼统的「修这个告警」：{}",
+            goal.lines().next().unwrap_or_default()
+        );
+        let acceptance = signal_acceptance(&detail, signal_project_key(&detail).as_deref());
+        assert!(
+            acceptance.contains("求值"),
+            "验收标准要说出关掉它的是求值恢复，而不是那件条件消失：{acceptance}"
+        );
+    }
+
+    /// 配置级缺陷同理，而且两种都算：文档不是部署声明的那个，以及这份进程手里的
+    /// 规则集不是盘上的那个。两者都说「现在生效的不是有人选过的那一份」。
+    #[test]
+    fn a_configuration_defect_is_filed_under_its_own_source() {
+        for rule in [
+            cog_core::alerts::CONFIG_DECLARATION_RULE,
+            cog_core::alerts::CONFIG_RULES_NOT_LOADED_RULE,
+        ] {
+            let mut alert = firing("cfg");
+            alert.rule = rule.to_string();
+
+            let (goal, detail) = alert_intent(&alert, 256);
+
+            assert_eq!(
+                detail["kind"].as_str(),
+                Some(CONFIG_DEFECT_KIND),
+                "{rule} 被当成了普通告警"
+            );
+            assert_eq!(
+                signal_project_key(&detail),
+                Some(format!(
+                    "{SIGNAL_PROJECT_PREFIX}{CONFIG_DEFECT_KIND}/{rule}"
+                )),
+                "每种配置缺陷自己一个项目：修法不同，不该合成一条流水"
+            );
+            assert!(
+                goal.starts_with(&format!("Fix configuration defect \"{rule}\"")),
+                "结案头先说是配置不是系统：{}",
+                goal.lines().next().unwrap_or_default()
+            );
+            let acceptance = signal_acceptance(&detail, signal_project_key(&detail).as_deref());
+            assert!(
+                acceptance.contains("配置"),
+                "验收标准要说出关掉它的是配置回到声明的修订：{acceptance}"
+            );
+        }
+    }
+
+    /// 分出来的那两类之外，别的告警一个字都不变：它们的 kind、项目、目标句与本
+    /// 次改动之前逐字相同。这条不是怀旧，它是这次改动的边界——只把「读数没读到」
+    /// 那一类挑出来，别把普通故障顺手也改了判据。
+    #[test]
+    fn an_ordinary_fault_keeps_the_plain_kind_and_the_plain_words() {
+        let mut alert = firing("plain");
+        alert.rule = "agent_unhealthy".into();
+
+        let (goal, detail) = alert_intent(&alert, 256);
+
+        assert_eq!(detail["kind"].as_str(), Some("persisted_alert"));
+        assert_eq!(
+            signal_project_key(&detail),
+            Some(format!(
+                "{SIGNAL_PROJECT_PREFIX}persisted_alert/agent_unhealthy"
+            ))
+        );
+        assert!(
+            goal.starts_with("Fix alert \"agent_unhealthy\""),
+            "{}",
+            goal.lines().next().unwrap_or_default()
+        );
+        assert!(
+            goal.contains("Investigate and fix the root cause"),
+            "普通告警仍然叫接活的人去查系统：那是它该做的事"
+        );
+        assert!(
+            signal_acceptance(&detail, None).contains("不再处于 firing"),
+            "普通告警的止损条件没有变"
+        );
+    }
+
+    /// 来源是规则名上的判定，不是 `dedup_key` 上的：同一条规则下的两个主体仍然
+    /// 是一个项目，否则一次求值失败会按每个主体的条数各开一个项目。
+    #[test]
+    fn one_self_alert_rule_is_still_one_project() {
+        let intent = |subject: &str| {
+            let mut alert = firing(subject);
+            alert.rule = cog_core::alerts::EVAL_FAILURE_RULE.to_string();
+            alert_intent(&alert, 256).1
+        };
+        assert_eq!(
+            signal_project_key(&intent("rule_a")),
+            signal_project_key(&intent("rule_b")),
+            "同一条求值失败规则按主体拆项目，会把一次故障读成很多次"
+        );
+    }
+
     /// The defect this whole disposition exists for: the attempt failed while
     /// the alert is still firing, and a clock armed at the announcement is not
     /// a reason to leave it failed. Six attempts failed at 06:00Z on 2026-10-04
@@ -3750,12 +4468,21 @@ mod tests {
     /// section is there, the code default when it is not — the resolution
     /// `SignalWatcherConfig::load` performs, reproduced rather than trusted.
     fn retention_and_wait(document: &serde_json::Value) -> (bool, u64, i64) {
-        let enabled = document["dag_executor"]["archive_enabled"]
-            .as_bool()
-            .expect("dag_executor.archive_enabled");
-        let retention = document["dag_executor"]["archive_after_secs"]
-            .as_u64()
-            .expect("dag_executor.archive_after_secs");
+        // 缺席就是默认：这两个叶子在 `DagExecutorConfig` 上带着 `#[serde(default)]`，
+        // 文档里不写时部署读到的就是代码默认值。把缺席当成错（`expect`）会在这份文档
+        // 不再抄默认值之后把门自己弄红——判据量的是「部署读到的那一对」，不是「文档里
+        // 写了几个数」。
+        let defaults = cog_core::Config::default().dag_executor;
+        let enabled = document
+            .pointer("/dag_executor/archive_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(defaults.archive_enabled);
+        // 没有写这个叶子就是「按内置值」，和 cooldown 一样：文档不再抄一遍
+        // 代码里已经有的数，读的人不能把「没写」当成缺字段。
+        let retention = document
+            .pointer("/dag_executor/archive_after_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(defaults.archive_after_secs);
         let wait = document
             .pointer("/self_evolution/signal_watcher/report_cooldown_secs")
             .and_then(|v| v.as_i64())
@@ -3777,10 +4504,7 @@ mod tests {
     /// missed to a restart still finds its record.
     #[test]
     fn the_store_outlives_the_re_drive_window_it_gates() {
-        let shipped = [
-            ("chart", "deploy/helm/cogneva/files/cogneva.json"),
-            ("example", "cogneva.example.json"),
-        ];
+        let shipped = [("chart", "deploy/helm/cogneva/files/cogneva.json")];
         let mut cases: Vec<(String, bool, u64, i64)> = shipped
             .iter()
             .map(|(name, path)| {
@@ -4235,5 +4959,125 @@ mod tests {
             picked.superseded.is_empty(),
             "超上限的那一条不是重复，下一轮还要读它"
         );
+    }
+
+    /// 两条通道的每拍上限是一件事：改常量两处一起动，源码里不再各写一个数。
+    #[test]
+    fn both_channels_share_one_per_tick_cap() {
+        let cfg = SignalWatcherConfig::default();
+        assert_eq!(cfg.alert_channel_max_per_tick, MAX_SIGNALS_PER_TICK);
+        assert_eq!(cfg.taste_channel_max_per_tick, MAX_SIGNALS_PER_TICK);
+        assert_eq!(cfg.intent_channel_max_per_tick, MAX_SIGNALS_PER_TICK);
+
+        let source = include_str!("signal_watcher.rs");
+        let bare: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                (line.starts_with("alert_channel_max_per_tick:")
+                    || line.starts_with("taste_channel_max_per_tick:")
+                    || line.starts_with("intent_channel_max_per_tick:"))
+                    && line
+                        .split_once(':')
+                        .map(|(_, value)| {
+                            value.trim_start().starts_with(|c: char| c.is_ascii_digit())
+                        })
+                        .unwrap_or(false)
+            })
+            .collect();
+        assert!(bare.is_empty(), "每拍上限不该各写一个数：{bare:?}");
+    }
+
+    /// 其余具名常量也要真的被读到。
+    #[test]
+    fn the_watcher_reads_its_named_defaults() {
+        let cfg = SignalWatcherConfig::default();
+        assert_eq!(
+            cfg.failure_recurrence_threshold,
+            FAILURE_RECURRENCE_THRESHOLD
+        );
+        assert_eq!(cfg.backlog_threshold, BACKLOG_THRESHOLD);
+    }
+
+    fn chat_row(identity: &str, text: &str) -> cog_core::IntentRow {
+        cog_core::IntentRow {
+            identity: identity.to_string(),
+            source: "chat".into(),
+            said_by: "owner".into(),
+            addressed_to: String::new(),
+            text: text.to_string(),
+            parent: None,
+            session: None,
+            model_text: None,
+            at: Utc::now(),
+        }
+    }
+
+    /// 交给 triage 任务的是属主原话：不缩写、不改写，一句一行；任务身份跟着
+    /// 这批的第一句走，重读同一批落回同一个任务而不是第二个。
+    #[test]
+    fn the_triage_task_quotes_the_owner_verbatim_and_keeps_one_identity() {
+        let batch = vec![
+            chat_row("chat:s1:aa", "员工和角色要解绑"),
+            chat_row("chat:s1:bb", "今天几号"),
+        ];
+        let (goal, detail) = intent_triage(&batch);
+        assert!(goal.contains("员工和角色要解绑"));
+        assert!(goal.contains("今天几号"));
+        assert_eq!(
+            detail.get("kind").and_then(|v| v.as_str()),
+            Some(cog_core::CHAT_INTENT_TASK_KIND)
+        );
+        assert_eq!(
+            detail
+                .get("intents")
+                .and_then(|v| v.as_array())
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            detail.get("intent_id").and_then(|v| v.as_str()),
+            Some("chat:s1:aa")
+        );
+        // 「不再有新行」这一类默认验收在这条活上是空话——接手侧每拍都在读，新的一批
+        // 随时会来；这条活的止损条件必须是每句都有去向。
+        let acceptance = signal_acceptance(&detail, None);
+        assert!(
+            acceptance.contains("每一句都各有去向"),
+            "chat 批次的验收不该退回默认那句：{acceptance}"
+        );
+
+        let again = vec![
+            chat_row("chat:s1:aa", "员工和角色要解绑"),
+            chat_row("chat:s1:cc", "第三句"),
+        ];
+        assert_eq!(intent_triage_task_id(&batch), intent_triage_task_id(&again));
+        assert_ne!(
+            intent_triage_task_id(&batch),
+            intent_triage_task_id(&[chat_row("chat:s2:aa", "别的会话里的一句话")])
+        );
+    }
+
+    /// 一批正在办时按住下一批；办完了才读——否则连着说十句就派十个 squad。
+    #[test]
+    fn a_batch_in_hand_holds_the_next_one() {
+        let mut batch_task = Task::new(
+            "self-signal-chat-intent-x",
+            TaskType::Custom(cog_core::CHAT_INTENT_TASK_KIND.to_string()),
+            serde_json::json!({ cog_core::INPUT_TASK_KIND: cog_core::CHAT_INTENT_TASK_KIND }),
+        );
+        batch_task.status = TaskStatus::Running;
+        assert!(chat_triage_in_hand(&[batch_task.clone()]));
+        batch_task.status = TaskStatus::Completed;
+        assert!(!chat_triage_in_hand(&[batch_task.clone()]));
+
+        // 别的活不算：按住下一批的只有对话批次这一类。
+        let mut alert = Task::new(
+            "self-signal-alert-x",
+            TaskType::Custom(SIGNAL_TASK_TYPE.to_string()),
+            serde_json::json!({ cog_core::INPUT_TASK_KIND: SIGNAL_TASK_TYPE }),
+        );
+        alert.status = TaskStatus::Running;
+        assert!(!chat_triage_in_hand(&[alert]));
     }
 }

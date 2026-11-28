@@ -250,24 +250,30 @@ mod tests {
     }
 
     /// The usage ledger's batch is the other text with statements a start
-    /// cannot be talked out of: its two key swaps, both `DO` blocks, because
-    /// no catalog read answers "is this constraint's definition the one I
-    /// want".
+    /// cannot be talked out of: the key swaps and column additions that have
+    /// to be conditional, because no catalog read answers "is this
+    /// constraint's definition the one I want" and the column additions have
+    /// no `IF NOT EXISTS`. Each is a `DO` block.
     ///
     /// Being opaque, they are re-sent on every start, which is why the count
-    /// is pinned here: the two blocks cost a catalog read each once the key is
-    /// right, but a *third* opaque statement would be a DDL shape nobody
-    /// taught the guard -- and that one takes ACCESS EXCLUSIVE on every start,
-    /// on a ledger that takes a write a second.
+    /// is pinned here: once the schema is right each block is catalog lookups
+    /// and runs no DDL, so it takes no table lock. A further opaque statement
+    /// would be a DDL shape nobody taught the guard -- and if that shape is a
+    /// DDL rather than a lookup, it takes ACCESS EXCLUSIVE on every start, on
+    /// a ledger that takes a write a second.
     #[test]
     fn the_usage_ledgers_startup_batch_is_opaque_only_where_it_must_be() {
         let opaque = cog_storage::schema_ddl::statements_the_guard_cannot_read(
             &cog_observability::usage_store::ddl(),
         )
         .expect("the runner splits this text with the same splitter");
+        // 四条：窗口主键、rollup 的 origin 列、「花了 token 就得挂任务」那条不变式，
+        // 以及正文的搬迁（老行把正文留在原列里，直到搬完为止——删列会毁掉尚未搬走的
+        // 那一份）。前三类都必须写成 `DO` 块而不是平语句：这一批每条都会重跑，而
+        // 建第二遍约束、重复加列都是错误；建不起来的代价落在「建表」这一步。
         assert_eq!(
             opaque.len(),
-            2,
+            4,
             "a start re-sends every statement the guard cannot read: {opaque:#?}"
         );
         for statement in &opaque {

@@ -17,6 +17,7 @@
 #   <gate dir>/buildgate.bound      the number of slots
 #   <gate dir>/slot-<n>.lock        one file per admitted build, locked with flock
 #   <gate dir>/builds.reserve       who asked for the next build and when
+#   <gate dir>/builds.served        when each work was last served, by name
 #
 # A slot is taken only by opening a file that is already there: the side that
 # publishes the bound also makes the room, so a file this client had to invent
@@ -34,15 +35,30 @@
 #   COGNEVA_BUILD_SLOT_POLL_SECS       how often to look again while waiting.
 #   COGNEVA_BUILD_RESERVE_FRESH_SECS   how long another work's claim on the next
 #                                      build counts as still being asked for.
+#   COGNEVA_BUILD_SERVED_LINES         how many works the served record keeps.
+#   COGNEVA_BUILD_SLOT_REPORT          a file to append `<waited>\t<held>\t<name>`
+#                                      to after each run; unset prints the line only.
 
 build_slot_gate_dir="${COGNEVA_BUILD_GATE_LOCK_DIR:-/var/lib/cogneva-build-gate}"
 build_slot_own_lock="${COGNEVA_BUILD_LOCK_FILE:-${HOME}/.local/state/cogneva/build.lock}"
 build_slot_wait="${COGNEVA_BUILD_SLOT_WAIT_SECS:-7200}"
 build_slot_poll="${COGNEVA_BUILD_SLOT_POLL_SECS:-5}"
 build_slot_reserve_fresh="${COGNEVA_BUILD_RESERVE_FRESH_SECS:-900}"
+# cap: bound — 与门里 SERVED_RECORD_CAP 同值的界，远高于实际不同名字数
+build_slot_served_lines="${COGNEVA_BUILD_SERVED_LINES:-64}"
 
 # A non-numeric or empty value falls back to the default rather than reaching an
 # arithmetic expansion, where it would turn a knob into a crash.
+# The directory the gate keeps its own readings in, as a value for callers.
+#
+# Callers read it through this function instead of "${build_slot_gate_dir}"
+# because shellcheck does not follow sourced files without `-x`, and a gate that
+# reads a sourced variable directly is reported as "referenced but not assigned"
+# on every run -- the same shape of false reading the variable itself is here to
+# avoid. A function is not reported, the default still lives in one place, and a
+# caller that names this function can be checked for it existing.
+build_slot_dir_path() { printf '%s' "${build_slot_gate_dir}"; }
+
 build_slot_num() { # build_slot_num <value> <default>
     case "${1:-}" in
     '' | *[!0-9]*) printf '%s' "$2" ;;
@@ -52,8 +68,45 @@ build_slot_num() { # build_slot_num <value> <default>
 build_slot_wait="$(build_slot_num "${build_slot_wait}" 7200)"
 build_slot_poll="$(build_slot_num "${build_slot_poll}" 5)"
 build_slot_reserve_fresh="$(build_slot_num "${build_slot_reserve_fresh}" 900)"
+build_slot_served_lines="$(build_slot_num "${build_slot_served_lines}" 64)"
 
 build_slot_warn() { printf 'build slot: %s\n' "$*" >&2; }
+
+# Where the wait is reported, when the caller wants the two numbers apart.
+#
+# The line printed on the way out is for a reader; a caller that adds up its own
+# time cannot subtract prose. `COGNEVA_BUILD_SLOT_REPORT` names a file, and each
+# `build_slot_run` appends `<waited>\t<held>\t<name>` to it. Unset means the line
+# only -- which is what every caller but the gate gets, so joining the slots puts
+# no new obligation on the cluster's builder.
+build_slot_report() { # <waited> <held> <what>
+    [ -n "${COGNEVA_BUILD_SLOT_REPORT:-}" ] || return 0
+    printf '%s\t%s\t%s\n' "$1" "$2" "$3" >>"${COGNEVA_BUILD_SLOT_REPORT}" 2>/dev/null || true
+}
+
+# Where the report stands now, as a line count. A cell can only tell its own
+# waiting apart from the rest of the run by bracketing itself with this and
+# asking for the sum since.
+build_slot_reported_lines() {
+    [ -n "${COGNEVA_BUILD_SLOT_REPORT:-}" ] && [ -r "${COGNEVA_BUILD_SLOT_REPORT}" ] || {
+        printf '0'
+        return 0
+    }
+    wc -l <"${COGNEVA_BUILD_SLOT_REPORT}" 2>/dev/null | tr -d ' ' || printf '0'
+}
+
+# Seconds waited, summed over the lines added after `<from>`. Unreadable counts as
+# no wait: a caller that cannot read the record must not subtract a number it did
+# not measure -- the cell is then reported whole, which is the honest reading.
+build_slot_reported_waits_since() { # <lines the cell started at>
+    [ -n "${COGNEVA_BUILD_SLOT_REPORT:-}" ] && [ -r "${COGNEVA_BUILD_SLOT_REPORT}" ] || {
+        printf '0'
+        return 0
+    }
+    awk -F'\t' -v from="${1:-0}" \
+        'NR > from && NF >= 3 && $1 ~ /^[0-9]+$/ { sum += $1 } END { printf "%d", sum + 0 }' \
+        "${COGNEVA_BUILD_SLOT_REPORT}" 2>/dev/null || printf '0'
+}
 
 # How many builds the gate admits. Readable but absent is not the same as
 # readable and one: an unreadable bound is reported as such so the wait line
@@ -122,6 +175,37 @@ build_slot_withdraw() { # build_slot_withdraw <who>
 # older gate, not for a newer one.
 build_slot_record_holder() { # build_slot_record_holder <file> <what>
     printf '%s\t%s\t%s\n' "$$" "$(date +%s)" "$2" >"$1" 2>/dev/null || true
+}
+
+# The line a served build leaves: when it was served, and the name it asks under.
+#
+# The gate only lets a work take the next build from another work's claim once
+# that other work has been *served* since the taking work began standing down.
+# A claim is kept fresh by being rewritten, so freshness cannot tell a work
+# waiting its turn from one taking every turn; service can. And this half of
+# the gate is the only one that knows a `gate: …` build was served at all: it
+# takes the slot by flocking it, and the gate process never hears of it.
+# Without this line the gate reads such a claim as never answered and stands
+# down on every round -- on 2026-11-10 the mainline advance yielded thirteen
+# times over three hours while this client held the slot, and nothing rolled.
+build_slot_record_served() { # build_slot_record_served <name>
+    local file="${build_slot_gate_dir}/builds.served" now tmp
+    [ -d "${build_slot_gate_dir}" ] && [ -w "${build_slot_gate_dir}" ] || return 0
+    now=$(date +%s)
+    tmp="${file}.$$"
+    # One line per name and the newest `${build_slot_served_lines}` works: a
+    # work that serves again is not served twice, it is served later. Two
+    # writers at once -- this client and the gate process -- lose each other's
+    # line rather than interleave halves, and a lost line costs the waiting
+    # work one more stand-down, never a turn taken from it.
+    {
+        [ -r "${file}" ] &&
+            awk -F'\t' -v me="$1" \
+                'NF == 2 && $1 ~ /^[0-9]+$/ && $2 != "" && $2 != me' "${file}"
+        printf '%s\t%s\n' "${now}" "$1"
+    } | sort -t $'\t' -k1,1n | tail -n "${build_slot_served_lines}" >"${tmp}" 2>/dev/null &&
+        mv -f -- "${tmp}" "${file}" 2>/dev/null || rm -f -- "${tmp}" 2>/dev/null
+    return 0
 }
 
 # Runs the command while holding a slot of the cluster's gate.
@@ -224,6 +308,7 @@ build_slot_run() { # build_slot_run <what> <command…>
                 [ -r "${build_slot_gate_dir}/builds.claim" ] &&
                     build_slot_record_holder "${build_slot_gate_dir}/builds.claim" "${name}" 2>/dev/null
                 build_slot_withdraw "${name}"
+                build_slot_record_served "${name}"
                 held_from=$(date +%s)
                 "$@"
                 rc=$?
@@ -231,7 +316,9 @@ build_slot_run() { # build_slot_run <what> <command…>
                 # still held would have a reader see a holder that has finished.
                 exec 7<&-
                 exec 9<&-
-                build_slot_warn "\"${name}\" held slot-${got} for $(( $(date +%s) - held_from ))s after waiting $(( held_from - waited_from ))s"
+                local held=$(( $(date +%s) - held_from )) waited=$(( held_from - waited_from ))
+                build_slot_report "${waited}" "${held}" "${name}"
+                build_slot_warn "\"${name}\" held slot-${got} for ${held}s after waiting ${waited}s"
                 return "${rc}"
             fi
             if [ "$(date +%s)" -ge "${deadline}" ]; then
@@ -264,11 +351,14 @@ build_slot_run() { # build_slot_run <what> <command…>
         build_slot_warn "no build lock after ${build_slot_wait}s; refusing to run \"${what}\""
         return 75
     fi
-    local held_from
+    local held_from held waited
     held_from=$(date +%s)
     "$@"
     rc=$?
     exec 8>&-
-    build_slot_warn "\"${what}\" ran under this host's own lock for $(( $(date +%s) - held_from ))s after waiting $(( held_from - waited_from ))s"
+    held=$(( $(date +%s) - held_from ))
+    waited=$(( held_from - waited_from ))
+    build_slot_report "${waited}" "${held}" "${what}"
+    build_slot_warn "\"${what}\" ran under this host's own lock for ${held}s after waiting ${waited}s"
     return "${rc}"
 }

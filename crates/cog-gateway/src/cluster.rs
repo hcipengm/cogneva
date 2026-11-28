@@ -210,8 +210,17 @@ pub struct NodeView {
     pub cpu_requested_millicores: u64,
     pub memory_requested_bytes: u64,
     /// 节点上所有 Pod 的实际用量之和（来自 metrics-server）。
+    ///
+    /// 和里只装量到的那些 Pod：`None` 是没有用量来源或一个都没量到，不是零。
     pub cpu_used_millicores: Option<u64>,
     pub memory_used_bytes: Option<u64>,
+    /// 上面那个和里**没有**装进去几个 Pod——这一拍它们还没有样（刚起来的容器
+    /// 要等下一轮采集）。
+    ///
+    /// `None` ＝ 这一面根本没有用量来源（没装 metrics-server），这时上面两格本来
+    /// 也是空的；`Some(0)` ＝ 每个 Pod 都量到了，和就是整台机器的用量。两个读法
+    /// 分开写，是因为「没量」和「量了、这台机器就这么闲」要做的处置相反。
+    pub pods_without_usage: Option<usize>,
     /// Ready / MemoryPressure / DiskPressure / PIDPressure。压力条件为真时是坏事，
     /// 与 Pod 的条件语义相反，界面按名字分开解读。
     pub conditions: Vec<ConditionView>,
@@ -250,13 +259,10 @@ pub struct PodView {
     pub node: Option<String>,
     pub cpu_requested_millicores: u64,
     pub memory_requested_bytes: u64,
+    /// 实际用量，各容器之和。`None` ＝ 没有数据源，或这个 Pod 有一个容器这一拍
+    /// 还没量到——后者下和只是个下界，不写成读数。与「用了 0」不是一回事。
     pub cpu_used_millicores: Option<u64>,
     pub memory_used_bytes: Option<u64>,
-    /// 这个 Pod 里跑着几个进程，来自 kubelet 的 summary（`process_stats.process_count`）。
-    /// 只有数，没有名字：Kubernetes 的读接口不报进程名单，要看名字只能 exec 进容器
-    /// 跑 `ps`，那是对运行中的业务容器执行命令，不给读面这个权限。metrics-server
-    /// 那条腿不报这个数，所以 `None` 说的是「这个来源量不到」，不是「没有进程」。
-    pub processes: Option<u64>,
     /// 这个 Pod 所在节点上的进程采集器最后一次报到的时刻。
     ///
     /// 从节点那一层抄到每一个 Pod 上，是因为读它的是「这一格为什么没有进程表」这句话，
@@ -409,16 +415,15 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
     }
 
     match client.get_json("/api/v1/nodes").await {
-        Ok(nodes) => {
-            view.nodes = nodes
-                .get("items")
-                .and_then(Value::as_array)
-                .map(|items| items.iter().map(node_view).collect())
-                .unwrap_or_default();
-            if view.nodes.is_empty() {
-                view.error = Some("apiserver 回了空节点列表".to_string());
+        Ok(nodes) => match collection_items(&nodes, "节点") {
+            Ok(items) => {
+                view.nodes = items.iter().map(node_view).collect();
+                if view.nodes.is_empty() {
+                    view.error = Some("apiserver 回了空节点列表".to_string());
+                }
             }
-        }
+            Err(e) => view.error = Some(e),
+        },
         Err(e) => {
             view.reachable = false;
             view.error = Some(format!(
@@ -427,22 +432,22 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
         }
     }
 
-    // 实际用量的来源按「谁在集群里就有」排，不把任何一个当必需品：
-    // 1. metrics-server —— 装了就有，但它是一个可选组件；
-    // 2. kubelet 自己的 summary 接口，经 apiserver 代理读 —— 每台机器的 kubelet
-    //    都在跑，不需要任何额外组件，只要 SA 对 `nodes/stats` 有 get；
-    // 3. 两个都没有：只显示申报量，并在界面上说明白，不画一条零线。
-    // 读不到不是错误：这一面照样能画申报量，把它当成读失败会让一个没装 metrics-server
-    // 的集群整天亮着一张红条。
+    // 实际用量的唯一来源是 metrics-server。它没装时只显示申报量，并在界面上
+    // 说明白，不画一条零线——读不到不是错误，把它当成读失败会让一个没装
+    // metrics-server 的集群整天亮着一张红条。
+    //
+    // 这里曾经还有一条 kubelet summary 的后备（经 apiserver 代理读
+    // `/api/v1/nodes/<节点>/proxy/stats/summary`），它的授权前提写错了：apiserver
+    // 按子资源授权，`/proxy/*` 要的是 `nodes/proxy`，不是 `nodes/stats`。2026-11-19
+    // 在一台只授了 `nodes/stats` 的 k3s 上实测，这一读每次 403——那条后备在 chart
+    // 自己的授权下永远不可达。`nodes/proxy` 能代理到 kubelet 的每一个端点，chart
+    // 刻意不授，所以删的是读，不是放宽授权。
     // 用量与 Pod 都按整个集群读，与节点那一层同范围：采集器量的是整台宿主上的
     // 每一个容器，这一面若只画自己命名空间里的，差出来的那些容器就只有进程读数、
     // 没有格子（2026-10-27 实测 71 个容器里 22 个在本命名空间）。
     let (usage, usage_source) = match client.get_json("/apis/metrics.k8s.io/v1beta1/pods").await {
         Ok(list) => (usage_by_pod(&list), Some(USAGE_FROM_METRICS.to_string())),
-        Err(_) => match usage_from_kubelets(&client, &view.nodes).await {
-            Some(usage) => (usage, Some(USAGE_FROM_KUBELET.to_string())),
-            None => (std::collections::HashMap::new(), None),
-        },
+        Err(_) => (std::collections::HashMap::new(), None),
     };
     view.usage_source = usage_source;
 
@@ -461,39 +466,45 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
 
     let pods_path = "/api/v1/pods".to_string();
     match client.get_json(&pods_path).await {
-        Ok(pods) => {
-            // 卷的实际占用来自平台自己的走查端：每台节点上都有一个 claim-store，
-            // 它量的是节点磁盘上每个卷的真实字节数。这条不经过 metrics-server，
-            // 也不经过 kubelet——它读的是这个平台自己记的账。
-            let measured = measured_claim_bytes(client.http(), pods.get("items"), &claims).await;
-            let sources = Sources {
-                events,
-                usage,
-                claims,
-                measured,
-            };
-            let parsed: Vec<PodView> = pods
-                .get("items")
-                .and_then(Value::as_array)
-                .map(|items| items.iter().map(|pod| pod_view(pod, &sources)).collect())
-                .unwrap_or_default();
-            place_pods(&mut view, parsed);
-            // 采集器读的是整台宿主上的每一个容器，这一面画的是每个有 Pod 的容器。
-            // 两者差出来的那些（宿主上的构建容器、不经 k8s 起的进程）有进程读数却没有
-            // 格子。差读在 Pod 读成功之后——读不到 Pod 时不知道谁被认领了，那时的差
-            // 不是差，是不知道。
-            let claims = claims_of_pods(pods.get("items"));
-            for node in &mut view.nodes {
-                if let Some(gap) = crate::process_reports::census_gap(&node.name, &claims) {
-                    node.census_containers = Some(gap.seen);
-                    // 计数从这一列里数出来，不另算一遍：两处各算一次，差一格的时候
-                    // 屏上会出现「3 个没有认领」而下面只列着 2 条的场面，而读者没有
-                    // 办法知道该信哪一个。
-                    node.unclaimed_containers = Some(gap.unclaimed.len());
-                    node.unclaimed = gap.unclaimed;
+        Ok(pods) => match collection_items(&pods, "Pod") {
+            Ok(items) => {
+                // 卷的实际占用来自平台自己的走查端：每台节点上都有一个 claim-store，
+                // 它量的是节点磁盘上每个卷的真实字节数。这条不经过 metrics-server，
+                // 也不经过 kubelet——它读的是这个平台自己记的账。
+                let measured =
+                    measured_claim_bytes(client.http(), pods.get("items"), &claims).await;
+                let sources = Sources {
+                    events,
+                    usage,
+                    claims,
+                    measured,
+                };
+                let parsed: Vec<PodView> =
+                    items.iter().map(|pod| pod_view(pod, &sources)).collect();
+                place_pods(&mut view, parsed);
+                // 采集器读的是整台宿主上的每一个容器，这一面画的是每个有 Pod 的容器。
+                // 两者差出来的那些（宿主上的构建容器、不经 k8s 起的进程）有进程读数却没有
+                // 格子。差读在 Pod 读成功之后——读不到 Pod 时不知道谁被认领了，那时的差
+                // 不是差，是不知道。
+                let claims = claims_of_pods(pods.get("items"));
+                for node in &mut view.nodes {
+                    if let Some(gap) = crate::process_reports::census_gap(&node.name, &claims) {
+                        node.census_containers = Some(gap.seen);
+                        // 计数从这一列里数出来，不另算一遍：两处各算一次，差一格的时候
+                        // 屏上会出现「3 个没有认领」而下面只列着 2 条的场面，而读者没有
+                        // 办法知道该信哪一个。
+                        node.unclaimed_containers = Some(gap.unclaimed.len());
+                        node.unclaimed = gap.unclaimed;
+                    }
                 }
             }
-        }
+            Err(e) => {
+                view.error = Some(match view.error {
+                    Some(previous) => format!("{previous}；{e}"),
+                    None => e,
+                });
+            }
+        },
         Err(e) => {
             view.error = Some(match view.error {
                 Some(previous) => format!("{previous}；读不到 Pod：{e}"),
@@ -503,24 +514,23 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
     }
 
     if view.usage_source.is_some() {
-        for node in &mut view.nodes {
-            let used: Vec<(u64, u64)> = node
-                .pods
-                .iter()
-                .filter_map(|pod| pod.cpu_used_millicores.zip(pod.memory_used_bytes))
-                .collect();
-            if !used.is_empty() {
-                node.cpu_used_millicores = Some(used.iter().map(|(cpu, _)| cpu).sum());
-                node.memory_used_bytes = Some(used.iter().map(|(_, memory)| memory).sum());
-            }
-        }
+        roll_up_node_usage(&mut view.nodes);
     }
 
     // 入口层：Service 与它解析到的 Endpoint 各读一次集合，按 (命名空间, 名字) 对齐。
     // 两条读互相独立：没有 Endpoint 那条腿时 Service 照样列出来，只是地址数那一格
     // 写「没读到」——那时说 0 就是替一次没发生的读下一个结论。
     let endpoints = match client.get_json("/api/v1/endpoints").await {
-        Ok(list) => Some(endpoints_by_service(&list)),
+        Ok(list) => match collection_items(&list, "Endpoints") {
+            Ok(items) => Some(endpoints_by_service(items)),
+            Err(e) => {
+                view.error = Some(match view.error {
+                    Some(previous) => format!("{previous}；{e}"),
+                    None => e,
+                });
+                None
+            }
+        },
         Err(e) => {
             view.error = Some(match view.error {
                 Some(previous) => format!("{previous}；读不到 Endpoints：{e}"),
@@ -530,18 +540,20 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
         }
     };
     match client.get_json("/api/v1/services").await {
-        Ok(list) => {
-            view.services = list
-                .get("items")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| service_view(item, endpoints.as_ref()))
-                        .collect()
-                })
-                .unwrap_or_default();
-        }
+        Ok(list) => match collection_items(&list, "Service") {
+            Ok(items) => {
+                view.services = items
+                    .iter()
+                    .filter_map(|item| service_view(item, endpoints.as_ref()))
+                    .collect()
+            }
+            Err(e) => {
+                view.error = Some(match view.error {
+                    Some(previous) => format!("{previous}；{e}"),
+                    None => e,
+                });
+            }
+        },
         Err(e) => {
             view.error = Some(match view.error {
                 Some(previous) => format!("{previous}；读不到 Service：{e}"),
@@ -556,6 +568,19 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
     })
 }
 
+/// 集合回包里的 `items` 数组。
+///
+/// 回包里没有 `items` 不是「一个空集合」：apiserver 的字段会随版本改名、精简，
+/// 而把形状的变化折成 `[]`，这一面就会向看的人宣布「集群里没有节点 / 没有
+/// Pod / 没有 Service」——一句他照着去查集群、却查不出所以然的话。读不出列表
+/// 就该说读不出列表。
+fn collection_items<'a>(body: &'a Value, what: &str) -> Result<&'a [Value], String> {
+    body.get("items")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .ok_or_else(|| format!("{what} 的回包里没有 items 数组，这次读没读成列表"))
+}
+
 /// 每个 Service 此刻解析出的 (可服务地址数, 未就绪地址数)，按 (命名空间, 名字) 索引。
 ///
 /// 地址按 IP 去重：一个 Service 声明两个端口时 apiserver 会给出两个 subset，同一个
@@ -563,12 +588,9 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
 /// 一个读得通、画得出、对不上的数。
 type ServiceEndpoints = std::collections::HashMap<(String, String), (usize, usize)>;
 
-fn endpoints_by_service(list: &Value) -> ServiceEndpoints {
+fn endpoints_by_service(items: &[Value]) -> ServiceEndpoints {
     use std::collections::BTreeSet;
     let mut out: ServiceEndpoints = ServiceEndpoints::new();
-    let Some(items) = list.get("items").and_then(Value::as_array) else {
-        return out;
-    };
     for item in items {
         let key = (namespace_of(item), name_of(item));
         let mut ready: BTreeSet<&str> = BTreeSet::new();
@@ -624,7 +646,7 @@ fn service_view(service: &Value, endpoints: Option<&ServiceEndpoints>) -> Option
                 .map(|(key, value)| format!("{key}={value}"))
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let ports = service
         .pointer("/spec/ports")
         .and_then(Value::as_array)
@@ -653,7 +675,7 @@ fn service_view(service: &Value, endpoints: Option<&ServiceEndpoints>) -> Option
                 })
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let addresses = endpoints.and_then(|map| map.get(&(namespace.clone(), name.to_string())));
     Some(ServiceView {
         namespace,
@@ -676,118 +698,45 @@ fn service_view(service: &Value, endpoints: Option<&ServiceEndpoints>) -> Option
 }
 
 pub const USAGE_FROM_METRICS: &str = "metrics-server";
-pub const USAGE_FROM_KUBELET: &str = "kubelet-summary";
 
-/// 用量来源的第二条腿：每台节点的 kubelet 都在服务 summary 接口，经 apiserver 代理
-/// 就能读，不需要集群里装任何额外组件。
+/// 把每个节点上量到的 Pod 用量加成节点用量，并记下这个和里少了几个 Pod。
 ///
-/// 这条腿要的是 `nodes/stats` 的读权限，不是 `nodes/proxy`：apiserver 按路径把代理
-/// 过来的请求映射到子资源，`/stats/*` 落到 `nodes/stats`。两者差着一整个 kubelet
-/// API——`nodes/proxy` 还能 exec 进任何 Pod，那是给这一面读用量用不着的权力。
-///
-/// 一台读不到不影响其它台：只要有一台回了，这一面就有用量；全读不到才退回到「只
-/// 有申报量」。
-async fn usage_from_kubelets(
-    client: &KubeClient,
-    nodes: &[NodeView],
-) -> Option<std::collections::HashMap<String, PodUsage>> {
-    let mut merged = std::collections::HashMap::new();
-    let mut read_any = false;
+/// 少的那几个要说出来：一个刚起来的 Pod 这一拍还没有样，它的用量进不了和。
+/// 不说这句话，节点上那个数读起来就是「这台机器用了这么多」，而它其实是
+/// 「量到的那些加起来是这么多」——两个读法指着相反的动作（放宽 vs 扩容）。
+/// 一个都没量到时和留空，`Some(0)` 才是「这台机器就是这么闲」。
+fn roll_up_node_usage(nodes: &mut [NodeView]) {
     for node in nodes {
-        let path = format!("/api/v1/nodes/{}/proxy/stats/summary", node.name);
-        let Ok(summary) = client.get_json(&path).await else {
-            continue;
-        };
-        read_any = true;
-        for (name, usage) in usage_from_summary(&summary, client.namespace()) {
-            merged.insert(name, usage);
+        let mut without_usage = 0usize;
+        let used: Vec<(u64, u64)> = node
+            .pods
+            .iter()
+            .filter_map(|pod| {
+                let pair = pod.cpu_used_millicores.zip(pod.memory_used_bytes);
+                if pair.is_none() {
+                    without_usage += 1;
+                }
+                pair
+            })
+            .collect();
+        if !used.is_empty() {
+            node.cpu_used_millicores = Some(used.iter().map(|(cpu, _)| cpu).sum());
+            node.memory_used_bytes = Some(used.iter().map(|(_, memory)| memory).sum());
         }
-    }
-    read_any.then_some(merged)
-}
-
-/// kubelet summary 的形状与 metrics-server 不同，语义也不同：这里只收本命名空间的
-/// Pod（summary 是整台机器的，别的命名空间的 Pod 不该出现在这一面），并且用
-/// `workingSetBytes` 而不是 `rssBytes`——工作集正是内存压力与 OOM 判定看的那一个数。
-fn usage_from_summary(summary: &Value, namespace: &str) -> Vec<(String, PodUsage)> {
-    let mut out = Vec::new();
-    let Some(pods) = summary.get("pods").and_then(Value::as_array) else {
-        return out;
-    };
-    for pod in pods {
-        if pod.pointer("/podRef/namespace").and_then(Value::as_str) != Some(namespace) {
-            continue;
-        }
-        let Some(name) = pod.pointer("/podRef/name").and_then(Value::as_str) else {
-            continue;
-        };
-        let mut usage = PodUsage {
-            cpu: nanocores_millicores(pod.pointer("/cpu/usageNanoCores")),
-            memory: bytes_at(pod.pointer("/memory/workingSetBytes")),
-            // 进程数只在 Pod 这一级有：summary 不给每个容器分进程，给了也没有名字
-            // 可拼成一个说得通的行。读不到就是 `None`，不写 0——0 是一句「没有进程」。
-            processes: pod
-                .pointer("/process_stats/process_count")
-                .and_then(Value::as_u64),
-            containers: std::collections::HashMap::new(),
-        };
-        for container in pod
-            .get("containers")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-        {
-            let Some(container_name) = container.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            usage.containers.insert(
-                container_name.to_string(),
-                (
-                    nanocores_millicores(container.pointer("/cpu/usageNanoCores")),
-                    bytes_at(container.pointer("/memory/workingSetBytes")),
-                ),
-            );
-        }
-        out.push((name.to_string(), usage));
-    }
-    out
-}
-
-/// summary 的数分两种写法：nanoCores 是十进制小数串或整数，字节量在 summary 里
-/// 是十进制数字串。读不出来按 0 算——这里已经在「读到了」这条腿里，缺一个容器的
-/// 数不等于整个 Pod 没有用量；缺的那一个会在容器那一层显示为 0，而 Pod 的总数
-/// 仍由加总得到。没有来源的情况（两个接口都读不到）在调用点分成 `None` 处理。
-fn nanocores_millicores(value: Option<&Value>) -> u64 {
-    let Some(value) = value else { return 0 };
-    let nanocores = value
-        .as_f64()
-        .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()));
-    match nanocores {
-        Some(nanocores) if nanocores.is_finite() && nanocores > 0.0 => {
-            (nanocores / 1_000_000.0).round() as u64
-        }
-        _ => 0,
+        node.pods_without_usage = Some(without_usage);
     }
 }
 
-fn bytes_at(value: Option<&Value>) -> u64 {
-    let Some(value) = value else { return 0 };
-    value
-        .as_u64()
-        .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
-        .unwrap_or(0)
-}
-
-/// metrics-server 回的每个 Pod：各容器用量，加总成 Pod 的用量。
+/// metrics-server 回的每个 Pod：量到的那些容器的用量。
 ///
 /// 只收容器粒度再自己加，是因为 Pod 那一级只有总数时，读者点进某个容器会看到
 /// 一个和 Pod 对不上的数——两个数并排出现在同一屏，就会有一个被当成错的。
+///
+/// 只装**量到了**的容器：一个容器的 cpu 或 memory 有一格读不出来，它就不在这张
+/// 表里。把读不出来的那格记成 0 会让「这一拍没采到样」变成「只用了 0」，而这两件
+/// 事在格子上同形——读者按后者放心的那个数，正好是他最不该放心的那个。
 #[derive(Debug, Default)]
 struct PodUsage {
-    cpu: u64,
-    memory: u64,
-    /// kubelet summary 独有：这个 Pod 的进程数。metrics-server 不报，`None` 即读不到。
-    processes: Option<u64>,
     containers: std::collections::HashMap<String, (u64, u64)>,
 }
 
@@ -824,20 +773,23 @@ fn usage_by_pod(list: &Value) -> std::collections::HashMap<String, PodUsage> {
             let Some(container_name) = container.get("name").and_then(Value::as_str) else {
                 continue;
             };
-            let cpu = container
-                .pointer("/usage/cpu")
-                .and_then(Value::as_str)
-                .and_then(millicores)
-                .unwrap_or(0);
-            let memory = container
-                .pointer("/usage/memory")
-                .and_then(Value::as_str)
-                .and_then(quantity_bytes)
-                .unwrap_or(0.0) as u64;
-            pod.cpu += cpu;
-            pod.memory += memory;
+            let (Some(cpu), Some(memory)) = (
+                container
+                    .pointer("/usage/cpu")
+                    .and_then(Value::as_str)
+                    .and_then(millicores),
+                container
+                    .pointer("/usage/memory")
+                    .and_then(Value::as_str)
+                    .and_then(quantity_bytes),
+            ) else {
+                continue;
+            };
             pod.containers
-                .insert(container_name.to_string(), (cpu, memory));
+                .insert(container_name.to_string(), (cpu, memory as u64));
+        }
+        if pod.containers.is_empty() {
+            continue;
         }
         usage.insert(namespaced_key(namespace, name), pod);
     }
@@ -873,7 +825,8 @@ pub const READ_PROBE_LOOP: &str = "cluster_read_probe";
 /// 不是「此刻集群里有什么」。授权被收窄这种事以小时计，一分钟足够在有人第一次
 /// 打开页面之前就把它变成一条告警；再快只是在 apiserver 上多花请求，而这一面
 /// 每次只读一行（`limit=1`）。
-// cap: bound — 只读探针的间隔，每次只读一行（limit=1），界的是面板读取对 apiserver 的压力
+// cap: fixed — 只读探针的间隔，每次只读一行（limit=1），界的是面板读取对 apiserver 的压力
+// keep: 删掉后面板每读一次都打一次 apiserver，读取变成压力；由「界的是面板读取对 apiserver 的压力」兜住
 pub const READ_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 探针要读的每一条集合：(资源名, 路径)。
@@ -1168,7 +1121,9 @@ struct Sources {
 ///
 /// 这一面是轮询的，一个不响的走查端不能把整次读取拖住；共用客户端的默认期限
 /// 是给 apiserver 往返的，套在这里会把一次前端刷新拖到那个数。
-// cap: bound — 走查里轮询一次的上限；apiserver 往返本来就快，套大了会把一次前端刷新拖到那个数
+// cap: fixed — 走查里轮询一次的上限；apiserver 往返本来就快，套大了会把一次前端刷新拖到那个数
+// keep: 删掉后一次前端刷新被 apiserver 的慢往返拖住；由「apiserver 往返本来就快」兜住
+// wall: 等=走查里对 apiserver 的一次轮询返回 / 等不到=这一拍读作「这一项没读到」，不是「这一项不存在」 / 续跑=能，下一拍再轮询
 const WALKTHROUGH_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// 每个节点上都有一个 claim-store，它走查节点存储根，把每个卷的真实字节数发布在
@@ -1299,7 +1254,7 @@ fn node_view(node: &Value) -> NodeView {
                 .map(str::to_string)
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     if roles.is_empty() {
         roles.push("worker".to_string());
     }
@@ -1346,6 +1301,7 @@ fn node_view(node: &Value) -> NodeView {
         memory_requested_bytes: 0,
         cpu_used_millicores: None,
         memory_used_bytes: None,
+        pods_without_usage: None,
         census_containers: None,
         unclaimed_containers: None,
         unclaimed: Vec::new(),
@@ -1420,18 +1376,17 @@ fn pod_view(pod: &Value, sources: &Sources) -> PodView {
         .pointer("/status/containerStatuses")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
 
     let specs = pod
         .pointer("/spec/containers")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
 
-    let pod_usage = usage.get(&namespaced_key(&namespace, &name));
-    let container_usage = pod_usage
-        .map(|pod| pod.containers.clone())
-        .unwrap_or_default();
+    let container_usage = usage
+        .get(&namespaced_key(&namespace, &name))
+        .map(|pod| &pod.containers);
 
     let containers: Vec<ContainerView> = specs
         .iter()
@@ -1484,9 +1439,11 @@ fn pod_view(pod: &Value, sources: &Sources) -> PodView {
                     .filter(|probe| spec.get(*probe).is_some())
                     .map(|probe| probe.trim_end_matches("Probe").to_string())
                     .collect(),
-                cpu_used_millicores: container_usage.get(container_name).map(|(cpu, _)| *cpu),
+                cpu_used_millicores: container_usage
+                    .and_then(|usage| usage.get(container_name))
+                    .map(|(cpu, _)| *cpu),
                 memory_used_bytes: container_usage
-                    .get(container_name)
+                    .and_then(|usage| usage.get(container_name))
                     .map(|(_, memory)| *memory),
                 processes: status
                     .and_then(|status| status.get("containerID"))
@@ -1510,9 +1467,28 @@ fn pod_view(pod: &Value, sources: &Sources) -> PodView {
     let pod_events = events
         .get(&namespaced_key(&namespace, &name))
         .cloned()
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let conditions = conditions_of(pod);
     let process_census_at = node.as_deref().and_then(crate::process_reports::census_at);
+
+    // Pod 的用量是它每个容器之和——一个容器这一拍没量到，和就不是这个 Pod 的
+    // 用量，而是一个下界。这时整格留空：一个偏低的数写成读数，读者没法把它和
+    // 「这个 Pod 真的用这么少」区分开，而两者该做的事相反。
+    let measured: Option<Vec<(u64, u64)>> = containers
+        .iter()
+        .map(|container| {
+            container
+                .cpu_used_millicores
+                .zip(container.memory_used_bytes)
+        })
+        .collect();
+    let (cpu_used, memory_used) = match measured {
+        Some(rows) if !rows.is_empty() => (
+            Some(rows.iter().map(|(cpu, _)| *cpu).sum()),
+            Some(rows.iter().map(|(_, memory)| *memory).sum()),
+        ),
+        _ => (None, None),
+    };
 
     PodView {
         namespace,
@@ -1525,9 +1501,8 @@ fn pod_view(pod: &Value, sources: &Sources) -> PodView {
         memory_requested_bytes: memory,
         containers,
         conditions,
-        cpu_used_millicores: pod_usage.map(|pod| pod.cpu),
-        memory_used_bytes: pod_usage.map(|pod| pod.memory),
-        processes: pod_usage.and_then(|pod| pod.processes),
+        cpu_used_millicores: cpu_used,
+        memory_used_bytes: memory_used,
         process_census_at,
         volumes,
         events: pod_events,
@@ -2586,7 +2561,7 @@ mod topology_tests {
                 {"addresses": [{"ip": "10.0.0.1"}, {"ip": "10.0.0.2"}]}
             ]
         }]});
-        let map = endpoints_by_service(&list);
+        let map = endpoints_by_service(collection_items(&list, "Endpoints").unwrap());
         assert_eq!(
             map.get(&("cogneva".to_string(), "api".to_string())),
             Some(&(2, 0))
@@ -2605,10 +2580,11 @@ mod topology_tests {
                 "ports": [{"port": 80, "targetPort": 8080}]
             }
         });
-        let read = endpoints_by_service(&json!({"items": [{
+        let endpoints = json!({"items": [{
             "metadata": {"name": "api", "namespace": "cogneva"},
             "subsets": []
-        }]}));
+        }]});
+        let read = endpoints_by_service(collection_items(&endpoints, "Endpoints").unwrap());
         let view = service_view(&service, Some(&read)).expect("the service");
         assert_eq!(view.ready_addresses, Some(0));
         assert_eq!(view.not_ready_addresses, Some(0));
@@ -2632,10 +2608,26 @@ mod topology_tests {
                 {"notReadyAddresses": [{"ip": "10.0.0.1"}, {"ip": "10.0.0.9"}]}
             ]
         }]});
-        let map = endpoints_by_service(&list);
+        let map = endpoints_by_service(collection_items(&list, "Endpoints").unwrap());
         assert_eq!(
             map.get(&("cogneva".to_string(), "api".to_string())),
             Some(&(1, 1))
+        );
+    }
+
+    /// 回包里没有 `items` 不是空集合。这条读面把两者折成同一个 `[]` 时，屏幕上
+    /// 写的是「集群里没有节点」，读者照着去查集群，而真正出问题的是这一读没读懂
+    /// 回包的形状——一句话把人打发去查一个没毛病的地方。
+    #[test]
+    fn a_collection_without_its_items_array_is_not_an_empty_collection() {
+        let err = collection_items(&json!({"kind": "NodeList"}), "节点")
+            .expect_err("形状不对的回包不许折成空列表");
+        assert!(err.contains("节点"), "错误要点名问的是哪一族：{err}");
+        assert!(
+            collection_items(&json!({"items": []}), "节点")
+                .expect("真正空着的集合读得通")
+                .is_empty(),
+            "空集合本身是读到的结果，不是读失败"
         );
     }
 
@@ -2683,6 +2675,7 @@ mod topology_tests {
                 command: command.to_string(),
                 rss_bytes: 1024,
             }],
+            processes_total: None,
         };
         crate::process_reports::record("aaaa", report("cogneva-app"));
         crate::process_reports::record("bbbb", report("cogneva-sidecar"));
@@ -2726,6 +2719,7 @@ mod topology_tests {
                     command: "x".to_string(),
                     rss_bytes: 0,
                 }],
+                processes_total: None,
             },
         );
         let pod = json!({
@@ -3042,6 +3036,112 @@ mod topology_tests {
         );
     }
 
+    /// 一个容器这一拍没有样（刚起来的容器要等下一轮采集），它就不是「只用了 0」：
+    /// 那一格留空，Pod 的和也不再是它的用量而是下界，一并留空。
+    #[test]
+    fn a_container_without_a_sample_leaves_its_cell_and_the_pod_total_unmeasured() {
+        let pod = json!({
+            "metadata": { "name": "api-1", "namespace": "cogneva" },
+            "spec": { "nodeName": "cogneva-01", "containers": [
+                { "name": "api" },
+                { "name": "sidecar" }
+            ]},
+            "status": { "phase": "Running", "containerStatuses": [] }
+        });
+
+        // metrics-server 只给了 api 的样：sidecar 还没报到。
+        let metrics = json!({ "items": [{
+            "metadata": { "name": "api-1", "namespace": "cogneva" },
+            "containers": [{ "name": "api", "usage": { "cpu": "120m", "memory": "300Mi" } }]
+        }]});
+        let view = pod_view(
+            &pod,
+            &Sources {
+                usage: usage_by_pod(&metrics),
+                ..Sources::default()
+            },
+        );
+
+        let by_name = |name: &str| {
+            view.containers
+                .iter()
+                .find(|container| container.name == name)
+                .expect("a container row")
+        };
+        assert_eq!(by_name("api").cpu_used_millicores, Some(120));
+        assert_eq!(
+            by_name("sidecar").cpu_used_millicores,
+            None,
+            "没有样不是 0 毫核"
+        );
+        assert_eq!(by_name("sidecar").memory_used_bytes, None);
+        assert_eq!(
+            view.cpu_used_millicores, None,
+            "少一个容器的和不写成这个 Pod 的用量"
+        );
+        assert_eq!(view.memory_used_bytes, None);
+
+        // 一格读不出来（这里 memory 缺失）也不许把 cpu 那一格当量到的记下来：
+        // 一个容器的两格是一起量的。
+        let half = json!({ "items": [{
+            "metadata": { "name": "api-1", "namespace": "cogneva" },
+            "containers": [{ "name": "api", "usage": { "cpu": "120m" } }]
+        }]});
+        let half = pod_view(
+            &pod,
+            &Sources {
+                usage: usage_by_pod(&half),
+                ..Sources::default()
+            },
+        );
+        assert_eq!(half.containers[0].cpu_used_millicores, None);
+        assert_eq!(half.containers[0].memory_used_bytes, None);
+    }
+
+    /// 节点那个和要说自己少装了谁：没说的时候，「用了这么多」与「量到的加起来
+    /// 这么多」在屏上同形，而两者该做的事相反。
+    #[test]
+    fn a_node_total_says_how_many_pods_it_could_not_measure() {
+        let pod_json = |name: &str| {
+            json!({
+                "metadata": { "name": name, "namespace": "cogneva" },
+                "spec": { "nodeName": "cogneva-01", "containers": [{ "name": "api" }] },
+                "status": { "phase": "Running", "containerStatuses": [] }
+            })
+        };
+        let metrics = json!({ "items": [{
+            "metadata": { "name": "api-1", "namespace": "cogneva" },
+            "containers": [{ "name": "api", "usage": { "cpu": "120m", "memory": "300Mi" } }]
+        }]});
+        let sources = Sources {
+            usage: usage_by_pod(&metrics),
+            ..Sources::default()
+        };
+
+        let mut node = node_view(&json!({ "metadata": { "name": "cogneva-01" } }));
+        node.pods = vec![
+            pod_view(&pod_json("api-1"), &sources),
+            pod_view(&pod_json("api-2"), &sources),
+        ];
+        roll_up_node_usage(std::slice::from_mut(&mut node));
+
+        assert_eq!(node.cpu_used_millicores, Some(120));
+        assert_eq!(node.memory_used_bytes, Some(300 * 1024 * 1024));
+        assert_eq!(
+            node.pods_without_usage,
+            Some(1),
+            "api-2 这一拍还没有样，和里没有它"
+        );
+
+        // 一个都没量到：和留空，但「少装了几个」照样说出来——这两格说的是两件事。
+        let mut blind = node_view(&json!({ "metadata": { "name": "cogneva-02" } }));
+        blind.pods = vec![pod_view(&pod_json("api-3"), &Sources::default())];
+        roll_up_node_usage(std::slice::from_mut(&mut blind));
+        assert_eq!(blind.cpu_used_millicores, None);
+        assert_eq!(blind.memory_used_bytes, None);
+        assert_eq!(blind.pods_without_usage, Some(1));
+    }
+
     #[test]
     fn a_restart_says_how_the_last_attempt_ended_not_just_that_it_restarted() {
         let pod = json!({
@@ -3160,68 +3260,6 @@ mod topology_tests {
             !conditions[0].ok,
             "缺 status 字段按没成立算：读成成立会把卡住的 Pod 画成正常"
         );
-    }
-
-    #[test]
-    fn the_kubelet_summary_is_a_usage_source_of_its_own_without_metrics_server() {
-        // 这是真实的 `stats/summary` 形状（kubelet 自己服务，装在每台机器上）。
-        let summary = json!({
-            "node": { "nodeName": "cogneva-01" },
-            "pods": [
-                {
-                    "podRef": { "name": "api-1", "namespace": "cogneva" },
-                    "process_stats": { "process_count": 3u64 },
-                    "cpu": { "usageNanoCores": 250_000_000u64 },
-                    "memory": { "workingSetBytes": 734_003_200u64, "rssBytes": 700_000_000u64 },
-                    "containers": [
-                        { "name": "api", "cpu": { "usageNanoCores": 200_000_000u64 },
-                          "memory": { "workingSetBytes": 600_000_000u64 } },
-                        { "name": "sidecar", "cpu": { "usageNanoCores": 50_000_000u64 },
-                          "memory": { "workingSetBytes": 134_003_200u64 } }
-                    ]
-                },
-                {
-                    "podRef": { "name": "postgres-0", "namespace": "other" },
-                    "cpu": { "usageNanoCores": 900_000_000u64 },
-                    "memory": { "workingSetBytes": 2_000_000_000u64 },
-                    "containers": []
-                }
-            ]
-        });
-
-        let usage = usage_from_summary(&summary, "cogneva");
-        assert_eq!(usage.len(), 1, "别的命名空间的 Pod 不属于这一面");
-        let (name, pod) = &usage[0];
-        assert_eq!(name, "api-1");
-        assert_eq!(pod.cpu, 250, "nanoCores 换算成毫核");
-        assert_eq!(pod.memory, 734_003_200, "取工作集，不取 RSS");
-        assert_eq!(pod.containers["api"], (200, 600_000_000));
-        assert_eq!(pod.containers["sidecar"], (50, 134_003_200));
-        assert_eq!(
-            pod.processes,
-            Some(3),
-            "进程数在 Pod 这一级，summary 报多少就是多少"
-        );
-    }
-
-    #[test]
-    fn a_summary_that_names_no_namespace_matches_nothing_rather_than_everything() {
-        // 缺 namespace 的条目如果被当成「匹配」，整台机器的 Pod 都会记到这一面。
-        let summary =
-            json!({ "pods": [{ "podRef": { "name": "api-1" }, "cpu": {}, "memory": {} }] });
-        assert!(usage_from_summary(&summary, "cogneva").is_empty());
-    }
-
-    #[test]
-    fn nanocores_and_byte_fields_survive_both_number_and_string_forms() {
-        // 1.5 毫核按最近整数进：用量是读数，不必保留小数位。
-        assert_eq!(nanocores_millicores(Some(&json!(1_500_000u64))), 2);
-        assert_eq!(nanocores_millicores(Some(&json!("2000000"))), 2);
-        assert_eq!(nanocores_millicores(Some(&json!(0))), 0);
-        assert_eq!(nanocores_millicores(None), 0, "缺字段是 0，不是猜测");
-        assert_eq!(bytes_at(Some(&json!(4096))), 4096);
-        assert_eq!(bytes_at(Some(&json!("8192"))), 8192);
-        assert_eq!(bytes_at(None), 0);
     }
 
     #[test]

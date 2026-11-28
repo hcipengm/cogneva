@@ -220,7 +220,7 @@ tests:
   - interval: 1m
     input_series:
       - series: 'cogneva_observability_drift_lines{manifest="m1"}'
-        values: '_x90 2x30'
+        values: '_x91 2x29'
     alert_rule_test:
       - eval_time: 120m
         alertname: observability_stack_drift_not_repaired
@@ -230,7 +230,7 @@ tests:
   - interval: 1m
     input_series:
       - series: 'cogneva_process_zombies'
-        values: '_x90 3x30'
+        values: '_x91 3x29'
     alert_rule_test:
       - eval_time: 120m
         alertname: orphans_unreaped

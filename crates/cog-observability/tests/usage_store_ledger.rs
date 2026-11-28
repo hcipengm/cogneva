@@ -55,6 +55,8 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
                   estimated: Option<u64>,
                   task: Option<&str>,
                   refusal_kind: Option<&str>| LlmUsageRecord {
+        finish_reason: None,
+        ttft_ms: None,
         refused_scope: None,
         upstream: "ledger-test-upstream".to_string(),
         api_style: "openai".to_string(),
@@ -68,12 +70,15 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         tokens_cache_created: None,
         tokens_reasoning: None,
         estimated_input: estimated,
+        prompt_manifest: None,
+        prompt_dropped: None,
         cost_micros: None,
         price_book: None,
         refusal_kind: refusal_kind.map(str::to_string),
         retry_after_secs: None,
         task: task.map(str::to_string),
         owner: None,
+        session: None,
         latency_ms: 12,
         pace: None,
         usage_outcome: None,
@@ -103,7 +108,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     // two different rows after the write -- a NULL that lands as 0 turns "this
     // face does not report it" into "nothing was written", which is a finding
     // the pair exists to make rather than to invent.
-    let mut wrote_call = record(format!("{before}:wrote"), 0, None, None, None);
+    let mut wrote_call = record(format!("{before}:wrote"), 0, None, Some(&task), None);
     wrote_call.tokens_cache_created = Some(1200);
     // The thought split rides on this row too: it is the column that answers
     // "what did that output buy", and a value that parses but never lands is
@@ -113,7 +118,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         .record(&wrote_call)
         .await
         .expect("record a call that wrote to the cache");
-    let silent_call = record(format!("{before}:silent"), 0, None, None, None);
+    let silent_call = record(format!("{before}:silent"), 0, None, Some(&task), None);
     store
         .record(&silent_call)
         .await
@@ -344,9 +349,20 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         .await
         .expect("record after the migration");
     store
-        .record(&record(unpriced.clone(), 0, None, None, None))
+        .record(&record(unpriced.clone(), 0, None, Some(&task), None))
         .await
         .expect("record a call whose path prices nothing");
+    // 一条花了 token 却不挂任务的账写不进去：库内不变式（`usage_that_spent_names_its_task`）
+    // 要的正是这件事。它存在的原因是「没有任务身份」曾经是一个静默的、看不见的缺口，
+    // 而不是一种正当状态；历史行按历史读（约束是 NOT VALID）。
+    let orphan = format!("{after}:orphan");
+    assert!(
+        store
+            .record(&record(orphan.clone(), 0, None, None, None))
+            .await
+            .is_err(),
+        "a call that spends tokens and names no task has to be refused, not recorded"
+    );
     let row = sqlx::query(
         "SELECT tokens_cached, estimated_input, task_id, retry_after_secs \
          FROM gateway_llm_usage WHERE actor = $1",
@@ -376,9 +392,8 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     );
     assert_eq!(
         row.get::<Option<String>, _>("task_id"),
-        None,
-        "a call from a path with no job identity stays unattributed; it must not borrow \
-         a neighbour's task or invent one"
+        Some(task.clone()),
+        "the call carries the task its path named"
     );
 
     // The refusal cause is a column of its own because the two values that reach
@@ -386,7 +401,13 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     // model never does. Folding them into `result = error` leaves the ledger able
     // to say an attempt failed but unable to say which of the two it was.
     store
-        .record(&record(refusal.clone(), 0, None, None, Some("quota_cycle")))
+        .record(&record(
+            refusal.clone(),
+            0,
+            None,
+            Some(&task),
+            Some("quota_cycle"),
+        ))
         .await
         .expect("record a refused attempt");
     let row = sqlx::query("SELECT refusal_kind FROM gateway_llm_usage WHERE actor = $1")
@@ -426,13 +447,14 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     // "which single upstream is this row about". The gap a reader recomputes
     // (`spent + reserve - allowance`) is only true of these columns.
     let paced_evidence = format!("ledger-test-pace-evidence:{}", uuid::Uuid::new_v4());
-    let mut paced_row = record(paced_evidence.clone(), 0, None, None, None);
+    let mut paced_row = record(paced_evidence.clone(), 0, None, Some(&task), None);
     paced_row.result = "refused_by_pace".to_string();
     paced_row.pace = Some(PaceEvidence {
         measured_upstreams: 2,
         allowance_tokens: 1_000,
         spent_tokens: 1_200,
         reserve_tokens: 300,
+        reserve_population: 9,
         window_start_unix: 1_700_000_000,
         upstreams: vec![PaceUpstreamEvidence {
             upstream: "https://a.example.com|m1".to_string(),
@@ -473,9 +495,12 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         "the boundary has to land with the other three numbers: allowance alone cannot \
          tell a window that has not opened yet from one burned down to nothing"
     );
-    let upstreams = row
-        .get::<Option<serde_json::Value>, _>("pace_upstreams")
-        .expect("a paced refusal names the candidates it was refused on");
+    // 这一列存的是 JSON 文本：整块写、整块读，没有哪条 SQL 按里面的键筛行。
+    let upstreams: serde_json::Value = serde_json::from_str(
+        &row.get::<Option<String>, _>("pace_upstreams")
+            .expect("a paced refusal names the candidates it was refused on"),
+    )
+    .expect("the candidates are stored as JSON text");
     let first = &upstreams[0];
     assert_eq!(first["upstream"], "https://a.example.com|m1");
     assert_eq!(first["wait_secs"], 120);
@@ -502,10 +527,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     assert_eq!(row.get::<Option<i64>, _>("pace_spent_tokens"), None);
     assert_eq!(row.get::<Option<i64>, _>("pace_reserve_tokens"), None);
     assert_eq!(row.get::<Option<i64>, _>("pace_window_start_unix"), None);
-    assert_eq!(
-        row.get::<Option<serde_json::Value>, _>("pace_upstreams"),
-        None
-    );
+    assert_eq!(row.get::<Option<String>, _>("pace_upstreams"), None);
     let pace_shape = sqlx::query(
         "SELECT is_nullable, column_default FROM information_schema.columns \
          WHERE table_name = 'gateway_llm_usage' AND column_name = 'pace_allowance_tokens'",
@@ -557,7 +579,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         "unrelated-actor".to_string(),
         0,
         None,
-        None,
+        Some(&task),
         Some("quota_cycle"),
     );
     wall.upstream = upstream.clone();
@@ -587,7 +609,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     // out, so there is no capacity to report. Answering with a sum around it
     // would hand the pacer a number nobody measured.
     let unwalled = format!("ledger-test-unwalled:{}", uuid::Uuid::new_v4());
-    let mut unwalled_call = record("unrelated-actor".to_string(), 0, None, None, None);
+    let mut unwalled_call = record("unrelated-actor".to_string(), 0, None, Some(&task), None);
     unwalled_call.upstream = unwalled.clone();
     store
         .record(&unwalled_call)
@@ -670,7 +692,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         format!("bounded-new:{}", uuid::Uuid::new_v4()),
     ];
     for (actor, age_days) in bounded_actors.iter().zip([10_i64, 2, 0]) {
-        let mut call = record(actor.clone(), 0, None, None, None);
+        let mut call = record(actor.clone(), 0, None, Some(&task), None);
         call.upstream = bounded.clone();
         store.record(&call).await.expect("record a bounded call");
         sqlx::query(&format!(
@@ -802,3 +824,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
             .expect("clean up the probe rows");
     }
 }
+
+// 两条读数相等的判据搬到了 `crates/cog-storage/tests/the_usage_readers_agree_row_by_row.rs`：
+// 事件这一侧由 `LlmCallEventStore` 写，而它住在这个 crate 的依赖之外。在这里写事件只能
+// 手搓 SQL——那证明的是读者认得手搓的形状，不是它认得写入口写下的形状。

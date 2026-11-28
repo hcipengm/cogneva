@@ -76,6 +76,13 @@ use common::rust_production::{
 /// 要么合并，要么在这里说明理由。
 const SAME_VALUE_DIFFERENT_THING: &[(&str, &str, &str)] = &[
     (
+        "cog-reflection",
+        "seed",
+        "`SEED_TAG` 是镜像被登记进仓库时打的标签，`SOURCE_SEED` 是读数上\
+         「目标还没成立、现在生效的是种子」这一格的取值：一个是仓库里的名字，\
+         一个是读数里的来源，谁也不读对方的",
+    ),
+    (
         "cog-agent",
         "role",
         "指标上的 `role` 标签与检查点 JSON 里的 `role` 键是两个通道：前者是别人\

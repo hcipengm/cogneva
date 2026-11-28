@@ -7,57 +7,96 @@ use cog_core::{
 use cog_core::{Tool, ToolImplementation};
 use futures::StreamExt;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// How long one memory-read call may take before it is abandoned. The call sits
-/// on an agent turn, so its budget is a share of a turn rather than a background
-/// job's: long enough for a healthy API to return a bounded payload, short
-/// enough that an API which stopped answering delays the turn instead of
-/// wedging it.
-// cap: bound — 短到让一个不再应答的 API 拖慢这一回合而不是把它卡死
-const MEMORY_READ_TIMEOUT_SECS: u64 = 30;
-
-/// The payload size a read moves without being told otherwise. A quarter
-/// megabyte is what a tool result that already fit an agent's context roughly
-/// holds; a caller that wants a larger source names its own budget.
-// cap: bound — 一兆是「本来就装得进 agent 上下文的一条工具结果」的量级；要更大来源的调用方自己报名额
-const DEFAULT_RAW_FETCH_BUDGET_BYTES: u64 = 262_144;
-
-/// How long an ask waits for its answer when the caller does not say, and the
-/// longest a caller may ask for.
+/// 子任务的事件管道有多深。
 ///
-/// The wait happens inside the caller's turn, holding it: long enough for a
-/// peer's run to finish, short enough that an unanswering peer costs one turn
-/// rather than the run. The cap exists because the bound is the only thing
-/// standing between "ask a peer" and "wait for it forever".
-// cap: bound — 这个界是「问一个同伴」与「永远等下去」之间唯一拦着的东西
-const ASK_DEFAULT_TIMEOUT_MS: u64 = 120_000;
-// cap: bound — the cap that keeps a peer's silence from becoming an unbounded wait
-const ASK_MAX_TIMEOUT_MS: u64 = 600_000;
+/// 这一侧不读子任务的进度，只雇了一个任务把它排空；所以深度只需要盖住「循环
+/// 已经写了、排空的还在被调度」那一个间隙，与子任务跑多久、说多少无关。
+// cap: fixed — 有人排空，深度只盖一个调度间隙；深浅都不改变行为，取一个够用的值
+// keep: 删掉后子智能体事件缓冲无界或为零，前者占内存、后者挡住派发；由「一个调度间隙的深度」兜住
+const SUBAGENT_EVENT_BUFFER: usize = 64;
 
-/// How long a filed work item may stay open when its submitter names no budget.
+/// 命令还没开跑时，隔多久问一次执行器「我在编译队里排第几」。
 ///
-/// The row default is sized for one dispatched round; a work item is carried by
-/// an employee whose turn includes thinking, tool calls and possibly a peer's
-/// answer, and the over-budget sweep fails the row by age rather than by
-/// liveness. A caller that knows better states its own number.
-// cap: bound — 一件活能挂多久；不设的话接活的人活得比行久，行会先被判死
-const DEFAULT_WORK_ITEM_TIMEOUT_SECS: u64 = 3600;
+/// 队只在执行器那一侧排，编排侧不问就不知道；一次编译的等待以秒计，半秒的粒度
+/// 够人看见「它在等」，又不至于让每一条排列着的编译多出几十次一问一答。
+// cap: fixed — 问的间隔；它只决定界面上那一行「在等执行槽」多快出现，不决定谁等多久
+// keep: 删掉后执行槽探问没有节拍，忙等占 CPU；由「只决定那一行多快出现」兜住
+const LANE_PROBE: Duration = Duration::from_millis(500);
 
-/// Default wall for one WASM tool call. The guest is somebody else's code: a
-/// module that never returns has to come back to the caller as a failure, so
-/// the bound is short — a compute-shaped tool that legitimately needs longer
-/// asks for it instead of raising this.
-// cap: bound — 计算型工具确实需要更久的话该自己报，而不是把这里调大
-const DEFAULT_WASM_TIMEOUT_SECS: u64 = 30;
+/// 这一问自己的上限：执行器不应答时，一句「在等」不能把调用拖住。
+// cap: fixed — 一次读数的超时；比它短会让读数常常读不到，比它长会让一个不应答的执行器拖慢这一轮
+// keep: 删掉后一个不应答的执行器会把这一轮拖住；由「一次读数的往返」兜住
+// wall: 等=执行器对一次探活的答复 / 等不到=这一条读数这次读作「读不到」，**不是 0**——读不到与量到为 0 是两件事，读数面必须分得开 / 续跑=能，下一拍再问一次
+const LANE_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
-/// Default wall for one shell tool call. An order of magnitude above the WASM
-/// bound because the thing being timed is a build or a test run, which is
-/// expected to take minutes; what this catches is a command that wedged, not a
-/// command that works.
-// cap: derived — 与构建侧的墙同源：这些命令本来就以分钟计，这里要抓的是卡住的命令而不是能跑的命令
-const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 600;
+/// 同一个名次最多多久重复说一次。
+///
+/// 这一句是给还在等的人看的一行字，不是日志：每半秒把同一句话再说一遍，工具的中途
+/// 输出就会被同一条消息刷满。名次变了立刻再说——变了才是新的事实。
+// cap: fixed — 同一名次的重复间隔；重复与否不改变排队，只改变这一行多久刷新一次
+// keep: 删掉后同一行被每拍重印，把界面刷成噪声；由「重复不改变排队，只改变刷新」兜住
+const LANE_NOTICE_EVERY: Duration = Duration::from_secs(5);
+
+/// 毫秒与秒之间的换算。
+///
+/// 不是一个可调的界：等待窗口从工具一路传到服务端都是毫秒，只有 HTTP 客户端
+/// 按秒记超时。换算本身没有第三个答案。
+// cap: fixed — 单位换算；等待窗口一路是毫秒，只有 HTTP 客户端按秒
+// not-a-bound: 单位换算；等待窗口一路是毫秒，只有 HTTP 客户端按秒
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+const MILLIS_PER_SECOND: u64 = 1_000;
+
+/// How long a filed work item declares it will take when the submitter names no
+/// budget.
+///
+/// Nothing ends the row at this number: a held row is judged by whether its
+/// holder is still stepping (the measured inter-step window), and an abandoned
+/// one by its lease. The number is what a reader takes off the row when sizing
+/// its own patience, so it is sized to the whole turn -- thinking, tool calls
+/// and possibly a peer's answer -- rather than to one dispatched round, which
+/// is what the executor's own row default covers.
+// cap: fixed — 一件活声明自己会花多久：不再按它砍行，按一轮接活的形状（想、调工具、等同伴）定这个声明
+// keep: 删掉后一件活没有申报工期，读的人分不出慢与卡；由「按接活形状定声明」兜住
+const DEFAULT_WORK_ITEM_DECLARED_SECS: u64 = 3600;
+
+/// 问执行器一句「我的编译排在第几」，问到了就说给人听。
+///
+/// 这一句只来自执行器：队在那儿排，编排侧自己没有这条队可读。问不到就不说——
+/// 屏幕上少一行「在等」比多一行猜出来的位次好。
+async fn announce_lane_wait(
+    backend: &dyn cog_core::SandboxBackend,
+    agent_id: &str,
+    told: &mut Option<(usize, std::time::Instant)>,
+    sink: &ToolUpdateSink,
+) {
+    // roundtrip: 一次执行槽读数（backend.lane()）
+    let Ok(Ok(reading)) = tokio::time::timeout(LANE_PROBE_TIMEOUT, backend.lane()).await else {
+        return;
+    };
+    let Some(waiting) = reading
+        .waiting
+        .iter()
+        .find(|waiter| waiter.agent == agent_id)
+    else {
+        return;
+    };
+    let said_recently = told
+        .as_ref()
+        .is_some_and(|(place, at)| *place == waiting.place && at.elapsed() < LANE_NOTICE_EVERY);
+    if said_recently {
+        return;
+    }
+    *told = Some((waiting.place, std::time::Instant::now()));
+    sink(&format!(
+        "在等执行槽：排第 {} 位，已等 {}s\n",
+        waiting.place,
+        waiting.waited_ms / MILLIS_PER_SECOND
+    ));
+}
 
 /// Real execution identity of one agent run. Carried explicitly from the
 /// actor (which knows the DAG task) through the runtime into sandbox requests,
@@ -67,6 +106,13 @@ pub struct ToolScope {
     pub task_id: String,
     pub agent_id: String,
 }
+
+/// 一次还在跑的工具调用往哪儿说话。
+///
+/// 同步的回调而不是一路 channel：调用点在执行器的读循环里，它要的只是「把这
+/// 一段交出去，别等我」。回调本身必须不阻塞——攒帧与节流是派发器的事，工具
+/// 只负责把执行器说的原样说出来。
+pub type ToolUpdateSink = Arc<dyn Fn(&str) + Send + Sync>;
 
 tokio::task_local! {
     /// The agent whose run is making the tool call on this task.
@@ -91,82 +137,58 @@ pub fn caller_agent_id() -> Option<String> {
     CALLER_AGENT_ID.try_with(|id| id.clone()).ok()
 }
 
-/// The sandbox task id for a tool call: the scoped task when there is one, and
-/// otherwise one workspace per caller.
+tokio::task_local! {
+    /// 这一轮属于哪一段对话。
+    ///
+    /// 与 [`CALLER_AGENT_ID`] 同一个理由、同一个宣告者（运行循环）。工具要它是因为
+    /// 有些事在这一次调用结束之后才有结论：后台命令跑完时，那条通知得找得到当初
+    /// 把它放到后台的那一段对话，而那时工具调用早就不在了。
+    ///
+    /// 空的时候是「没人说这是哪一段」——嵌进别的进程里的运行、或没有会话号的那
+    /// 一轮。不编一个会话号：编出来的那一段对话不存在，通知会落进一个空处。
+    pub static CALLER_SESSION: String;
+}
+
+/// 这一轮所属的对话号，运行时宣告过才有。
+pub fn caller_session() -> Option<String> {
+    CALLER_SESSION
+        .try_with(|id| id.clone())
+        .ok()
+        .filter(|id| !id.trim().is_empty())
+}
+
+/// The task id a tool call carries: the scoped task when there is one, and
+/// otherwise the caller's own lane.
 ///
 /// A call with no task scope used to get a fresh random id every time, and the
-/// executor routes a task id to a worktree — so every call in a conversation
-/// was handed a different checkout. Measured on the deployed chat path
-/// (2026-11-06): `pwd` answered
-/// `/opt/cogneva/sandbox/workspaces/unscoped-shell-f294ca21-…`, and the next
-/// call in the same conversation would have named a different directory. That
-/// makes a conversation unable to finish any job that takes two calls —
+/// executor routes by it — so every call in a conversation was handed a
+/// different checkout. Measured on the deployed chat path (2026-11-06): `pwd`
+/// answered `/opt/cogneva/sandbox/workspaces/unscoped-shell-f294ca21-…`, and the
+/// next call in the same conversation would have named a different directory.
+/// That makes a conversation unable to finish any job that takes two calls —
 /// `write_file` then `run_command` tests nothing, because the file was written
 /// into a tree the next call never sees — which is exactly the "one call at a
 /// time" ceiling the tools were meant to lift.
 ///
-/// The run loop already announces who is calling, and that identity is stable
-/// for a conversation, so it is the workspace's name. A caller nobody announced
-/// still gets the random id: two unknown callers sharing one directory would be
-/// worse than the churn.
+/// The id is routing now: [`cog_core::checkout_lane`] gives a call that names a
+/// task that task's tree, and only a call that names none its caller's own. So
+/// the placeholder below only has to be *stable within a conversation* for the
+/// callers that have no task and no announcement; two unknown callers sharing
+/// one directory would be worse than the churn.
 fn sandbox_task_id(scope: Option<&ToolScope>) -> String {
     if let Some(scope) = scope {
         return scope.task_id.clone();
     }
+    // A call with a caller and no task carries no task id: naming the caller's
+    // own lane here would be a task id that reads "employee-...", and the
+    // routing would pin the whole conversation into a tree called
+    // `task-employee-...` that nobody asked for. The agent id alone is the
+    // lane in this case.
     match caller_agent_id() {
-        // The executor accepts `[A-Za-z0-9_.-]` and nothing else in a task id
-        // (see `validate_task_id`); agent ids carry other bytes -- squads are
-        // spelled `squad:<task>` -- so the name is folded before it is used.
-        Some(caller) => format!("unscoped-shell-{}", workspace_name(&caller)),
+        Some(_) => String::new(),
         None => format!("unscoped-shell-{}", uuid::Uuid::new_v4()),
     }
 }
-
-/// Fold an agent id into something the worktree router accepts as a directory
-/// name, keeping it recognizable.
-fn workspace_name(agent_id: &str) -> String {
-    let folded: String = agent_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    // A leading dot is refused by the router (it would name a hidden directory),
-    // and an over-long id is refused too; both are the router's rules, so both
-    // are applied here rather than discovered as a failed call.
-    let folded = folded.trim_start_matches('.').to_string();
-    folded.chars().take(96).collect()
-}
-
-/// `read_file` 在调用方没说要看多少行时给出的一页。
-///
-/// 一页按行数计，不按字节：行数读起来能对上编辑器，也能直接当 `offset`
-/// 用。取值让常见源码文件一次读完，而整文件倾倒型的读（几千行、几十万
-/// 字符）自动变成可分页的几段。
-// cap: bound — 让常见源码文件一次读完，而整文件倾倒型（几千行、几十万字符）自动变成可分页的几段
-const READ_FILE_DEFAULT_WINDOW_LINES: usize = 600;
-
-/// 一页最多带多少个字符，行数没到也停下来。
-///
-/// 行数不是字节：一份压缩过的 JSON、一张宽表、一行几十万字符的日志，600 行
-/// 可以轻松超过一次对话里任何一段的体量。这一页之后每一轮都要重发，所以
-/// 两道界取更紧的那道；被这道界停下来的页面照样带 `has_more` 与
-/// `next_offset`，翻页不会漏行。
-// cap: bound — 两道界取更紧的那道；被它停下的页面照样带 has_more 与 next_offset，翻页不漏行
-const READ_FILE_PAGE_MAX_CHARS: usize = 32 * 1024;
-
-/// `read_file` 一次批量读最多带几个文件。
-///
-/// 批量读省的是往返次数，不是正文：读进来的字节与逐个读一样多。但一次带回
-/// 几十个文件就是把这几十页一起钉进上下文，之后每一轮都要重发，省下的往返
-/// 又按轮数赔回去。八份是一屏常见的「这一次改动要碰的文件」，再多的调用方
-/// 应当先缩小范围再读。
-// cap: bound — 一次带回几十份会把它们一起钉进上下文，之后每轮重发，省下的往返按轮数赔回去
-const READ_FILE_MAX_BATCH: usize = 8;
 
 /// `read_file` 调用方给的是哪几个文件。
 ///
@@ -189,13 +211,6 @@ fn batch_paths(arguments: &serde_json::Value) -> Result<Option<Vec<String>>, cog
     if list.is_empty() {
         return Err(cog_core::SFError::Validation("paths is empty".into()));
     }
-    if list.len() > READ_FILE_MAX_BATCH {
-        return Err(cog_core::SFError::Validation(format!(
-            "paths has {} entries; at most {} files per call, read the rest in another call",
-            list.len(),
-            READ_FILE_MAX_BATCH
-        )));
-    }
     list.iter()
         .map(|p| {
             p.as_str().map(str::to_string).ok_or_else(|| {
@@ -213,7 +228,18 @@ fn batch_paths(arguments: &serde_json::Value) -> Result<Option<Vec<String>>, cog
 /// 只想要一段（某个函数、报错所在的那几行）。`offset` 与 `limit` 都不给时
 /// 原样返回整份，老调用方与老断言不受影响；给了就带上文件的总行数与「后面
 /// 还有没有」，只回切片不回总行数，读的人会以为文件到那里就结束了。
-fn read_window(text: &str, offset: Option<u64>, limit: Option<u64>) -> serde_json::Value {
+///
+/// `page_chars` 是一页的字符预算。它不在这里取值：一页多大由读的人所在的
+/// 上下文窗口导出（[`ToolRegistry::page_chars`]），与窗口进入同一条
+/// [`cog_core` 的裁剪路径](crate::context::tool_result_budget_chars) 的是
+/// 同一个数。工具这边另有一个「一页多少行」的常量时，同一件事就有两份来源，
+/// 改窗口不会让页跟着变。
+fn read_window(
+    text: &str,
+    offset: Option<u64>,
+    limit: Option<u64>,
+    page_chars: usize,
+) -> serde_json::Value {
     let lines: Vec<&str> = text.lines().collect();
     let total = lines.len();
     // 调用方没说要看多少行，而这份文件又比一页长：给一页。
@@ -221,12 +247,8 @@ fn read_window(text: &str, offset: Option<u64>, limit: Option<u64>) -> serde_jso
     // 缓存命中率的分母就是每一轮新追加的字节，一次整文件读能把接下来
     // 整段对话的命中去掉一大块。`has_more` 与 `next_offset` 让读的人
     // 知道后面还有、从哪继续，而不是把「到这儿就结束了」当成结论。
-    let limit = limit.or_else(|| {
-        let too_long = total > READ_FILE_DEFAULT_WINDOW_LINES
-            || text.chars().count() > READ_FILE_PAGE_MAX_CHARS;
-        too_long.then_some(READ_FILE_DEFAULT_WINDOW_LINES as u64)
-    });
-    if offset.is_none() && limit.is_none() {
+    let too_long = text.chars().count() > page_chars;
+    if offset.is_none() && limit.is_none() && !too_long {
         return serde_json::json!({ "content": text });
     }
     let start = offset.unwrap_or(1).max(1) as usize;
@@ -237,13 +259,13 @@ fn read_window(text: &str, offset: Option<u64>, limit: Option<u64>) -> serde_jso
             .min(total),
         None => total,
     };
-    // 行数与字符两道界取更紧的那道。至少给一行：一行就超预算时如果不给，
+    // 只有一道界：字符预算。至少给一行——一行就超预算时如果不给，
     // `next_offset` 永远停在同一个位置，翻页就成了死循环。
     let mut end = start.saturating_sub(1).min(total);
     let mut chars = 0usize;
     while end < wanted {
-        let line = lines[end].len();
-        if end > start.saturating_sub(1) && chars + line + 1 > READ_FILE_PAGE_MAX_CHARS {
+        let line = lines[end].chars().count();
+        if end > start.saturating_sub(1) && chars + line + 1 > page_chars {
             break;
         }
         chars += line + 1;
@@ -312,22 +334,51 @@ pub struct ToolRegistry {
     sandbox_backend: Option<Arc<dyn SandboxBackend>>,
     guardrail: Option<Arc<dyn cog_core::Guardrail>>,
     plugin_registry: Option<Arc<dyn cog_core::PluginRegistry>>,
-    wasm_timeout: Duration,
-    /// Budget for shell commands. Kept apart from `wasm_timeout`: a snippet is
-    /// bounded work, a command may be a compiler run.
-    shell_timeout: Duration,
     /// When true, shell-class tools reject calls that carry no identity at all
     /// -- neither a [`ToolScope`] nor an announced caller. Evolution pods turn
     /// this on so no command can reach the executor under a synthetic identity;
     /// default off keeps embedded/main-app behavior.
     require_identity: bool,
+    /// 这张表服务的对话窗口有多大，`read_file` 一页的字符预算从这里导出。
+    ///
+    /// 页大小不是工具自己拍的数：它走
+    /// [`crate::context::tool_result_budget_chars`]，与运行时把一条工具结果
+    /// 裁进上下文用的是同一个函数。工具这边另存一个页大小，窗口调大时页不跟
+    /// 着变，同一件事就在树里有了两份答案。这里放的是**这一段对话真正在用的
+    /// 那只型号**的窗口：运行时每收到一条响应，就按回报的型号查出规格、叠上实测，
+    /// 把那个决定交下来。`None` = 还没有任何一条读数（型号没回报过，或它没公布），
+    /// 此时一页不设界——不拿池子里别的型号的窗口来顶（见 [`Self::page_chars`]）。
+    context_window_size: Option<usize>,
+    /// 上一次量出来的页大小是不是「不设界」。
+    ///
+    /// 读数面要把「量不到」与「量到就是这个值」分开：两边都没说窗口时一页是
+    /// `usize::MAX`，那条读数不写出来，读的人看见整份文件回来只会以为窗口很大。
+    /// 按状态翻转报一次，不是每读一页都报——同一条读数重复印不增加信息，而翻转
+    /// 本身是事件。
+    paging_unbounded: Arc<AtomicBool>,
     /// 每个工具在本进程里被点过几次。
     ///
-    /// `fork()` 与 `restricted_to()` 共用同一个 `Arc`，不各拿一份：这个数答的是
+    /// `fork()` 共用同一个 `Arc`，不各拿一份：这个数答的是
     /// 「这个平台在用这个工具吗」，那是关于进程的事实，不是关于某一轮工具表的事
     /// 实。每一轮各记一份的话，读的人只会看到最后一轮点过什么，而一个只在启动时
     /// 派过活的工具会读成「没人用」。
     calls: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+}
+
+/// 一页多大，以及这个数背后有没有一条读数。
+///
+/// 第二项是判据面的东西：没人说过窗口时页大小是「不设界」，但「量不到」与
+/// 「量到一个很大的值」必须是两件事——前者没有读数，后者有。把它并进返回值，
+/// 调用点就不必各自再猜一次，报告也才有东西可报。
+///
+/// 窗口只认这张表服务的那个窗口（运行时按**这一段对话真正在用的型号**把决定
+/// 交下来），不认池子里别的型号：池里最小的一只说了算，是在替一次可能根本不会
+/// 落到它身上的调用设界，与「没人说过就瞎设」是同一个错。
+fn page_budget(window: Option<usize>) -> (usize, bool) {
+    (
+        crate::context::tool_result_budget_chars(window),
+        window.is_some(),
+    )
 }
 
 impl ToolRegistry {
@@ -337,11 +388,59 @@ impl ToolRegistry {
             sandbox_backend: None,
             guardrail: None,
             plugin_registry: None,
-            wasm_timeout: Duration::from_secs(DEFAULT_WASM_TIMEOUT_SECS),
-            shell_timeout: Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS),
             require_identity: false,
+            // 构造时没有任何读数：窗口由运行时收到响应后按答话的型号交下来。
+            context_window_size: None,
+            paging_unbounded: Arc::new(AtomicBool::new(false)),
             calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// 说明这张表服务的对话窗口，一页工具结果的预算由它导出。
+    ///
+    /// 不设时取 `agent_loop` 配置节的缺省窗口：嵌入运行与测试没有一份进程级
+    /// 配置可读，缺省窗口正是它们实际在用的那个。
+    pub fn with_context_window_size(mut self, tokens: Option<usize>) -> Self {
+        self.context_window_size = tokens;
+        self
+    }
+
+    /// 循环学到本轮的窗口之后交给这张表：一页的大小跟着同一个数走。
+    ///
+    /// 构造时这一格是空的（生产里没有任何配置写过它）；第一份响应回来之后，
+    /// 窗口是答话那只型号公布的规格或实测的界，页大小按那个走。
+    pub fn set_context_window_size(&mut self, tokens: Option<usize>) {
+        self.context_window_size = tokens;
+    }
+
+    /// 这张表眼下按多大的窗口导出一页（`None` = 没人说过）。
+    pub fn context_window_size(&self) -> Option<usize> {
+        self.context_window_size
+    }
+
+    /// 一条工具结果能占多少字符，与运行时裁剪用的是同一个函数。
+    ///
+    /// 只有 `read_file` 用它：分页是给调用方的把手（`offset` / `limit` /
+    /// `has_more`），不是一次截断。搜索、glob、diff 不在工具里截，整份答案
+    /// 交给运行时——那里会把超出的一页归档成引用再裁。
+    ///
+    /// 没有窗口（`None`）= 这一段对话用的那只型号还没被任何一条读数说出来：
+    /// 返回「不设界」。不拿池子里**别的**型号的规格来顶——一次可能落到哪一家是
+    /// 猜测，用它设界就是替一次没发生过的调用拍数。不设界的那条读数由
+    /// [`Self::page_chars`] 报出来，结果进上下文时仍由运行时的裁剪与归档兜住。
+    fn page_chars(&self) -> usize {
+        let (chars, measured) = page_budget(self.context_window_size);
+        let was_unbounded = self.paging_unbounded.swap(!measured, Ordering::Relaxed);
+        match (was_unbounded, measured) {
+            (false, false) => tracing::warn!(
+                "no context window is known — the model in use has neither published a spec nor \
+                 had one measured — so a read_file page is unbounded; the runtime's trimming \
+                 still bounds what reaches the context"
+            ),
+            (true, true) => tracing::info!(chars, "read_file pages are bounded again"),
+            _ => {}
+        }
+        chars
     }
 
     pub fn with_require_identity(mut self, require: bool) -> Self {
@@ -351,16 +450,6 @@ impl ToolRegistry {
 
     pub fn set_require_identity(&mut self, require: bool) {
         self.require_identity = require;
-    }
-
-    pub fn with_wasm_timeout(mut self, secs: u64) -> Self {
-        self.wasm_timeout = Duration::from_secs(secs);
-        self
-    }
-
-    pub fn with_shell_timeout(mut self, secs: u64) -> Self {
-        self.shell_timeout = Duration::from_secs(secs);
-        self
     }
 
     pub fn with_sandbox_backend(mut self, backend: Arc<dyn SandboxBackend>) -> Self {
@@ -409,15 +498,41 @@ impl ToolRegistry {
             sandbox_backend: self.sandbox_backend.clone(),
             guardrail: self.guardrail.clone(),
             plugin_registry: self.plugin_registry.clone(),
-            wasm_timeout: self.wasm_timeout,
-            shell_timeout: self.shell_timeout,
             require_identity: self.require_identity,
+            context_window_size: self.context_window_size,
+            // 同一件事只报一次：复制出来这张表说的是一行同样的读数。
+            paging_unbounded: self.paging_unbounded.clone(),
             calls: self.calls.clone(),
         }
     }
 
     pub fn get(&self, name: &str) -> Option<Tool> {
         self.tools.read().unwrap().get(name).cloned()
+    }
+
+    /// 同一套跑工具的能力，只留**读**的那几只。
+    ///
+    /// 判据审要读这一轮的树，不该顺手派活或改树：把一只写工具留在表里，
+    /// 「另一次调用只判终态」这句话就不成立——那一次的手也能落下东西。
+    /// 名单是闭集，加一只读工具要在这里点名；没点名的工具不进这张表。
+    pub fn read_only(&self) -> Self {
+        const READ_ONLY: &[&str] = &[
+            "read_file",
+            "grep",
+            "search_code",
+            "glob",
+            "git_status",
+            "git_diff",
+            "read_task_ledger",
+            "command_output",
+        ];
+        let forked = self.fork();
+        forked
+            .tools
+            .write()
+            .unwrap()
+            .retain(|name, _| READ_ONLY.contains(&name.as_str()));
+        forked
     }
 
     /// The tool list in name order.
@@ -497,6 +612,31 @@ impl ToolRegistry {
         name: &str,
         arguments: serde_json::Value,
         scope: Option<&ToolScope>,
+    ) -> Result<serde_json::Value, ToolRunError> {
+        self.execute_scoped_streaming(name, arguments, scope, None)
+            .await
+    }
+
+    /// The same execution, with somewhere for a still-running tool to say how
+    /// it is going.
+    ///
+    /// A command can run for minutes. Until it ends it has no result, and the
+    /// caller that is watching it has nothing to watch — which is how a run that
+    /// is working and a run that is stuck look the same. The sink is called with
+    /// whatever the executor hands over, as it hands it over: the decision to
+    /// coalesce, throttle or drop belongs to whoever dispatched the call, not to
+    /// the tool, because only the dispatcher knows how expensive a frame is on
+    /// its way to the reader.
+    ///
+    /// Only the shell path streams. A native tool's handler is a single future
+    /// with no output until it resolves, and inventing progress for one would
+    /// mean a tool reporting what it has not produced.
+    pub async fn execute_scoped_streaming(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        scope: Option<&ToolScope>,
+        updates: Option<&ToolUpdateSink>,
     ) -> Result<serde_json::Value, ToolRunError> {
         let tool = self
             .tools
@@ -582,7 +722,6 @@ impl ToolRegistry {
                         entry: export_name.clone(),
                     },
                     input: arguments,
-                    timeout: self.wasm_timeout,
                     limits: Default::default(),
                 };
                 let result = backend.execute(&req).await?;
@@ -624,14 +763,32 @@ impl ToolRegistry {
                             .map(|s| s.agent_id.clone())
                             .or_else(caller_agent_id)
                             .unwrap_or_else(|| format!("unscoped-tool-{}", name));
+                        // 整批共用一页的预算，不是每份文件各一页。进上下文的是
+                        // 一条 tool_result，之后每一轮重发的也只有这一条：每份
+                        // 文件各给一整页，十几份就把这一条推到几十万字符，运行时
+                        // 只好按预算截断它，而截断的是 JSON 字符串的中间。预算
+                        // 花完之后还没读的文件不猜、也不硬塞，在它自己那一项里
+                        // 说清没读，调用方单独再要一次。
+                        let page_chars = self.page_chars();
+                        let mut spent = 0usize;
                         let mut files = Vec::with_capacity(paths.len());
                         for path in &paths {
+                            // 预算已经花完：不再读这一份。读回来也装不下，只会
+                            // 让执行器白跑一趟。
+                            if spent >= page_chars {
+                                files.push(serde_json::json!({
+                                    "path": path,
+                                    "error": "not read: this batch already used the turn's \
+                                              tool-result budget; ask for this file in its \
+                                              own call",
+                                }));
+                                continue;
+                            }
                             let req = SandboxRequest {
                                 task_id: task_id.clone(),
                                 agent_id: agent_id.clone(),
                                 payload: SandboxPayload::ReadFile { path: path.clone() },
                                 input: serde_json::json!({ "path": path }),
-                                timeout: self.shell_timeout,
                                 limits: Default::default(),
                             };
                             let mut stream = match backend.execute_stream(&req).await {
@@ -652,10 +809,32 @@ impl ToolRegistry {
                                     CommandEvent::Stdout { data } => stdout.push_str(&data),
                                     CommandEvent::Stderr { data } => stderr.push_str(&data),
                                     CommandEvent::Exit { code: c } => code = c,
+                                    // 这一批的每一份文件都在同一棵树上；条目里不带
+                                    // 路径，模型已经用相对路径问的
+                                    CommandEvent::Workdir { .. } => {}
                                 }
                             }
                             if code == 0 {
-                                let window = read_window(&stdout, offset, limit);
+                                let remaining = page_chars.saturating_sub(spent);
+                                let whole = read_window(&stdout, offset, limit, usize::MAX);
+                                let wanted = whole["content"]
+                                    .as_str()
+                                    .map(|content| content.chars().count())
+                                    .unwrap_or(0);
+                                // 半页不给：一份文件的正文若装不进剩下的预算，就在它自己
+                                // 那一项里说清没读，让调用方单独再要一次。给半页读起来像
+                                // 「这文件就这么长」，而调用方没有任何读性能分辨这两件事。
+                                if wanted > remaining {
+                                    files.push(serde_json::json!({
+                                        "path": path,
+                                        "error": "not read: this batch already used the turn's \
+                                                  tool-result budget; ask for this file in its \
+                                                  own call",
+                                    }));
+                                    continue;
+                                }
+                                let window = whole;
+                                spent += wanted;
                                 let mut entry = serde_json::Map::new();
                                 entry.insert("path".into(), serde_json::json!(path));
                                 if let Some(fields) = window.as_object() {
@@ -746,33 +925,6 @@ impl ToolRegistry {
                 // 而读回结果时还要用它切出调用方要的那一段。
                 let read_offset = arguments.get("offset").and_then(|v| v.as_u64());
                 let read_limit = arguments.get("limit").and_then(|v| v.as_u64());
-                // 单条命令可以自己定一堵墙；不写就用配置那一格。要的比配置大时当场
-                // 拒绝并说出上限：静默改小，调用方会以为它拿到的是自己定的那个数，
-                // 而它拿到的是一次在它没料到的时刻发生的超时。
-                let timeout = match arguments.get("timeout_seconds") {
-                    None => self.shell_timeout,
-                    Some(value) => {
-                        let secs = value.as_u64().filter(|n| *n > 0).ok_or_else(|| {
-                            cog_core::SFError::Validation(
-                                "`timeout_seconds` has to be a positive whole number of seconds"
-                                    .into(),
-                            )
-                        })?;
-                        let asked = std::time::Duration::from_secs(secs);
-                        if asked > self.shell_timeout {
-                            return Err(ToolRunError::Failed(cog_core::SFError::Validation(
-                                format!(
-                                    "timeout_seconds {secs} is longer than the {}s wall this \
-                                     process allows (system.shell_timeout_secs); raise that \
-                                     setting for a longer run -- the value is not shortened \
-                                     silently",
-                                    self.shell_timeout.as_secs()
-                                ),
-                            )));
-                        }
-                        asked
-                    }
-                };
                 let req = SandboxRequest {
                     task_id: sandbox_task_id(scope),
                     // 没有任务作用域时，执行者就是派发器公布的那一个：沙箱里的
@@ -785,7 +937,6 @@ impl ToolRegistry {
                         .unwrap_or_else(|| format!("unscoped-tool-{}", name)),
                     payload,
                     input: arguments,
-                    timeout,
                     limits: Default::default(),
                 };
                 // 背景命令：把句柄先交出去，再把流接进那本账里。这一刻起读得到
@@ -824,26 +975,77 @@ impl ToolRegistry {
                         "state": "running",
                     }));
                 }
-                let mut stream = backend.execute_stream(&req).await?;
+                // 一条命令在跑的时候，它的话已经在往外走了：执行器每读到一段就
+                // 交一段出来。这一段同时去两个地方——攒进最终结果，和交给派发器
+                // 让还在等的人先看见。只有 `Command` 往外说：`read_file` 的正文
+                // 本来就是结果本身，提前发一遍等于把同一份内容在总线上放两份。
+                let updates = updates.filter(|_| matches!(op, cog_core::ShellOp::Command));
+                // 流开出来之前这段空档是「排队」：编译类命令先在执行器的队里等位子，
+                // 那一刻还没有孩子进程、也没有输出。不在这段空档里问一句，一次排队
+                // 与一次正在跑的调用在界面上同形——都只是一行「进行中」。
+                let mut told: Option<(usize, std::time::Instant)> = None;
+                let mut opening = Box::pin(backend.execute_stream(&req));
+                let mut stream = loop {
+                    tokio::select! {
+                        opened = &mut opening => break opened?,
+                        _ = tokio::time::sleep(LANE_PROBE), if updates.is_some() => {
+                            if let Some(sink) = updates {
+                                announce_lane_wait(
+                                    backend.as_ref(),
+                                    &req.agent_id,
+                                    &mut told,
+                                    sink,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                };
                 let mut stdout = String::new();
                 let mut stderr = String::new();
                 let mut code = 0;
+                // 执行器最先说的那句话是「这条命令落在哪个目录」的绝对路径。
+                // 它不在提示词里，因为只有执行器那台机器知道车道名对应哪条路径；
+                // 不回给模型，模型就得再跑一条 `pwd` 才知道自己在哪。
+                let mut workdir = None;
                 while let Some(event) = stream.next().await {
                     match event {
-                        CommandEvent::Stdout { data } => stdout.push_str(&data),
-                        CommandEvent::Stderr { data } => stderr.push_str(&data),
+                        CommandEvent::Workdir { path, .. } => workdir = Some(path),
+                        CommandEvent::Stdout { data } => {
+                            stdout.push_str(&data);
+                            if let Some(sink) = updates {
+                                sink(&data);
+                            }
+                        }
+                        CommandEvent::Stderr { data } => {
+                            stderr.push_str(&data);
+                            if let Some(sink) = updates {
+                                sink(&data);
+                            }
+                        }
                         CommandEvent::Exit { code: c } => code = c,
                     }
                 }
                 match op {
-                    cog_core::ShellOp::Command => Ok(serde_json::json!({
-                        "stdout": stdout,
-                        "stderr": stderr,
-                        "code": code,
-                    })),
+                    cog_core::ShellOp::Command => {
+                        let mut reply = serde_json::json!({
+                            "stdout": stdout,
+                            "stderr": stderr,
+                            "code": code,
+                        });
+                        if let Some(workdir) = workdir {
+                            reply["workdir"] = serde_json::Value::String(workdir);
+                        }
+                        Ok(reply)
+                    }
                     cog_core::ShellOp::ReadFile => {
                         if code == 0 {
-                            Ok(read_window(&stdout, read_offset, read_limit))
+                            Ok(read_window(
+                                &stdout,
+                                read_offset,
+                                read_limit,
+                                self.page_chars(),
+                            ))
                         } else {
                             Err(cog_core::SFError::IO(stderr).into())
                         }
@@ -882,62 +1084,6 @@ impl ToolRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.tools.read().unwrap().is_empty()
-    }
-
-    /// The names in `allowed` this registry has no tool behind, in the order
-    /// they were given, each once.
-    ///
-    /// Narrowing drops these without a word; naming them is what turns "this
-    /// role has fewer tools than its skill says" from an absence into a reading.
-    pub fn missing_tools(&self, allowed: &[String]) -> Vec<String> {
-        let source = self.tools.read().unwrap();
-        let mut missing: Vec<String> = Vec::new();
-        for name in allowed {
-            if !source.contains_key(name) && !missing.contains(name) {
-                missing.push(name.clone());
-            }
-        }
-        missing
-    }
-
-    /// A registry holding only the named tools, over the same execution
-    /// machinery — sandbox backend, guardrail, plugin registry, timeouts — so
-    /// a narrowed registry runs a tool exactly as the full one would.
-    ///
-    /// This is how a role's tool boundary is enforced, and it is enforced in
-    /// both directions: the model is offered only these definitions, and a call
-    /// it invents for anything else has nothing behind it to reach. A boundary
-    /// that only hid the definitions would be a suggestion.
-    ///
-    /// A name with no tool behind it is dropped rather than refused. The list
-    /// states what the role is allowed to do; a name that matches nothing is a
-    /// stale entry in that statement, and failing to build the registry over it
-    /// would turn a tidying omission into an outage. What keeps the statement
-    /// honest is a gate over the shipped lists, not a runtime panic.
-    ///
-    /// Which is exactly why the drops have to be reportable: a gate over the
-    /// lists in the repository says nothing about which lists a running
-    /// deployment loaded. [`Self::missing_tools`] is that report.
-    pub fn restricted_to(&self, allowed: &[String]) -> Self {
-        let mut kept = HashMap::new();
-        {
-            let source = self.tools.read().unwrap();
-            for name in allowed {
-                if let Some(tool) = source.get(name) {
-                    kept.insert(name.clone(), tool.clone());
-                }
-            }
-        }
-        Self {
-            tools: Arc::new(std::sync::RwLock::new(kept)),
-            sandbox_backend: self.sandbox_backend.clone(),
-            guardrail: self.guardrail.clone(),
-            plugin_registry: self.plugin_registry.clone(),
-            wasm_timeout: self.wasm_timeout,
-            shell_timeout: self.shell_timeout,
-            require_identity: self.require_identity,
-            calls: self.calls.clone(),
-        }
     }
 
     /// 每个工具在本进程里被点过几次，按名字排。
@@ -986,6 +1132,15 @@ impl Default for ToolRegistry {
 mod tests {
     use super::*;
     use base64::Engine as _;
+
+    /// 分页用例自己声明的窗口。
+    ///
+    /// 页大小由一个窗口导出，而「没人说过窗口」时它是**不设界**（`usize::MAX`，
+    /// 见 [`crate::context::tool_result_budget_chars`]）：拿它当份量去造正文，就是
+    /// 按无穷大分配——2026-11-19 00:53 实测正是这一条把 3.3 GB 吃满、
+    /// 内核 OOM 杀掉了整个测试二进制。用例量的是分页行为，窗口就该由用例自己说，
+    /// 而不是继承进程里别的用例留下的那张全局表。
+    const TEST_WINDOW_TOKENS: usize = 8_000;
 
     #[derive(Debug)]
     struct StubHttp;
@@ -1077,6 +1232,9 @@ mod tests {
                 web_search_base: None,
                 web_search_fallback_base: Some("http://gateway:8081/search-fallback".into()),
                 web_fetch_base: Some("http://render:11235".into()),
+                sandbox_backend: None,
+                message_events: None,
+                intent_events: None,
             },
         );
         let tool = registry.get("web_fetch").expect("web_fetch is a built-in");
@@ -1322,9 +1480,13 @@ mod tests {
     /// metadata read, and the content read, answered off the path the tool
     /// asked for. The content read encodes the payload the same way the API
     /// does, so the tool's pass-through is exercised end to end.
-    #[derive(Debug)]
+    #[derive(Debug, Default)]
     struct MemoryApiStub {
         raws: Vec<cog_core::RawSource>,
+        /// 用例挑的坏回话：清单里省掉 `items`。
+        omit_listing_items: bool,
+        /// 用例挑的坏回话：元数据里省掉 `payload_length`。
+        omit_payload_length: bool,
     }
 
     #[async_trait::async_trait]
@@ -1340,11 +1502,20 @@ mod tests {
                 .url
                 .split_once("/api/v1/memory")
                 .map(|(_, rest)| format!("/api/v1/memory{rest}"))
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             let path_only = path.split_once('?').map(|(p, _)| p).unwrap_or(&path);
             let find = |id: &str| self.raws.iter().find(|r| r.id == id);
 
             let body = if path_only == "/api/v1/memory/raw" {
+                if self.omit_listing_items {
+                    return Ok(cog_core::HttpResponse {
+                        status: 200,
+                        headers: Default::default(),
+                        body: serde_json::json!({ "total": self.raws.len() })
+                            .to_string()
+                            .into_bytes(),
+                    });
+                }
                 let items: Vec<serde_json::Value> = self
                     .raws
                     .iter()
@@ -1385,12 +1556,18 @@ mod tests {
                 let Some(r) = find(id) else {
                     return Ok(not_found());
                 };
-                serde_json::json!({
+                let mut meta = serde_json::json!({
                     "id": r.id,
                     "content_type": r.content_type,
                     "payload_length": r.payload.len(),
                     "created_at": r.created_at,
-                })
+                });
+                if self.omit_payload_length {
+                    meta.as_object_mut()
+                        .expect("an object")
+                        .remove("payload_length");
+                }
+                meta
             } else {
                 return Ok(not_found());
             };
@@ -1484,7 +1661,23 @@ mod tests {
         raws: Vec<cog_core::RawSource>,
         metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
     ) -> ToolRegistry {
-        let client: Arc<dyn cog_core::HttpClient> = Arc::new(MemoryApiStub { raws });
+        memory_registry_for(
+            base,
+            MemoryApiStub {
+                raws,
+                ..Default::default()
+            },
+            metrics,
+        )
+    }
+
+    /// 同一份注册表，但由一个用例挑好的桩来答（省掉哪一格、回什么状态码）。
+    fn memory_registry_for(
+        base: Option<&str>,
+        stub: MemoryApiStub,
+        metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
+    ) -> ToolRegistry {
+        let client: Arc<dyn cog_core::HttpClient> = Arc::new(stub);
         let registry = ToolRegistry::new();
         cog_core::ToolRegistry::register(
             &registry,
@@ -1569,6 +1762,58 @@ mod tests {
                 "the error must name the unset base, got: {text}"
             );
         }
+    }
+
+    /// 清单缺了 `items`：这不是「这个命名空间里什么都没有」，是这份清单没读成。
+    /// 旧代码折成空表，调用方会照着一个空命名空间行事。
+    #[tokio::test]
+    async fn a_listing_without_items_is_not_an_empty_namespace() {
+        let registry = memory_registry_for(
+            Some("http://mem"),
+            MemoryApiStub {
+                raws: vec![raw_source("notes", "default", "text/plain", b"hello raw")],
+                omit_listing_items: true,
+                ..Default::default()
+            },
+            None,
+        );
+        let error = registry
+            .execute("raw_list", serde_json::json!({}))
+            .await
+            .expect_err("没有 items 不是空命名空间");
+        assert!(error.to_string().contains("items"), "{error}");
+    }
+
+    /// 反例：真的没有归档时，空数组是一份读到的答案。
+    #[tokio::test]
+    async fn a_listing_of_nothing_is_still_an_empty_listing() {
+        let registry = memory_registry(Some("http://mem"), Vec::new(), None);
+        let listed = registry
+            .execute("raw_list", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(listed["count"], 0);
+        assert_eq!(listed["items"], serde_json::json!([]));
+    }
+
+    /// 元数据没有 `payload_length`：名额无从判起。折成 0 会让预算整段失效——结果
+    /// 里写着「没超预算」，拿回来的是没有上限的一整段。
+    #[tokio::test]
+    async fn metadata_without_a_payload_length_does_not_disable_the_budget() {
+        let registry = memory_registry_for(
+            Some("http://mem"),
+            MemoryApiStub {
+                raws: vec![raw_source("notes", "default", "text/plain", b"hello raw")],
+                omit_payload_length: true,
+                ..Default::default()
+            },
+            None,
+        );
+        let error = registry
+            .execute("raw_fetch", serde_json::json!({"id": "notes", "budget": 3}))
+            .await
+            .expect_err("没有长度就判不了名额，不许当 0 长度读下去");
+        assert!(error.to_string().contains("payload_length"), "{error}");
     }
 
     /// The id is checked before it reaches the URL: an id carrying a separator
@@ -1661,7 +1906,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out["content"], "hello");
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// 一次调用读多个文件。
@@ -1703,14 +1948,70 @@ mod tests {
             files[2]["error"].is_string(),
             "one unreadable path must be reported on its own entry, not sink the batch: {out}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
-    /// 批量的两道界都报错而不是猜：`path` 与 `paths` 同时给是没说清要读什么，
-    /// 超过八份则是一次把太多页钉进上下文，之后每轮都要重发。猜一个都能省
-    /// 一轮往返，但猜错了那一轮要付整份上下文的重发钱。
+    /// 整批共用一页的预算：进上下文的是一条 tool_result，之后每轮重发的也是
+    /// 这一条。每份文件各给一整页，十几份就是几十万字符挤在一条结果里，运行
+    /// 时只好按预算把它截断——截的是 JSON 字符串的中间。预算花完后还没读的
+    /// 文件不硬塞，在自己那一项里说清没读，调用方单独再要一次。
     #[tokio::test]
-    async fn read_file_refuses_an_ambiguous_or_oversized_batch() {
+    async fn a_batch_spends_only_one_page_of_the_budget() {
+        let dir = std::env::temp_dir().join(format!("cog-tools-batch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let registry = ToolRegistry::new()
+            .with_context_window_size(Some(TEST_WINDOW_TOKENS))
+            .with_sandbox_backend(Arc::new(LocalShellBackend));
+        cog_core::ToolRegistry::register(&registry, builtins::read_file());
+        cog_core::ToolRegistry::register(&registry, builtins::write_file());
+        let page_chars = registry.page_chars();
+        // 每份按「一页的三分之二」造：两份就把预算吃光，第三份进不来。份量从
+        // 预算算，不写死一个字符数——预算随窗口走，写死的那个数迟早不再是「远
+        // 超一页」，于是这条用例会在某次窗口调整后变成一条什么也没测的绿。
+        let per_file = page_chars;
+        let line = 200;
+        let body: String = (0..(per_file / line).max(1))
+            .map(|i| format!("{} {i}\n", "y".repeat(line - 8)))
+            .collect();
+        let paths: Vec<String> = (0..3)
+            .map(|i| {
+                let path = dir.join(format!("f{i}.txt"));
+                std::fs::write(&path, &body).unwrap();
+                path.to_str().unwrap().to_string()
+            })
+            .collect();
+
+        let out = registry
+            .execute("read_file", serde_json::json!({ "paths": paths }))
+            .await
+            .unwrap();
+        let files = out["files"].as_array().expect("files array");
+        assert_eq!(files.len(), 3, "每一份都要有一项: {out}");
+        assert!(files[0]["content"].is_string(), "第一份必须读出来: {out}");
+        let used: usize = files
+            .iter()
+            .filter_map(|file| file["content"].as_str())
+            .map(|content| content.chars().count())
+            .sum();
+        assert!(
+            used <= page_chars + 256,
+            "整批正文 {used} 字符超过了一页 {page_chars}：多出来的部分会被运行时截在 JSON 中间"
+        );
+        assert!(
+            files[2]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("not read")),
+            "预算花完后剩下的文件必须说清没读，不能悄悄给半页: {out}"
+        );
+
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
+    }
+
+    /// `path` 与 `paths` 同时给是没说清要读什么：猜一个能省一轮往返，但猜错
+    /// 那一轮要付整份上下文的重发钱。这里没有条数上限——条数不花上下文，花
+    /// 上下文的是正文，而正文由整批共用的那一页预算管。
+    #[tokio::test]
+    async fn read_file_refuses_an_ambiguous_batch() {
         let registry = ToolRegistry::new().with_sandbox_backend(Arc::new(LocalShellBackend));
         cog_core::ToolRegistry::register(&registry, builtins::read_file());
 
@@ -1723,19 +2024,119 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(both.contains("not both"), "unexpected message: {both}");
+    }
 
-        let too_many: Vec<String> = (0..READ_FILE_MAX_BATCH + 1)
-            .map(|i| format!("f{i}.txt"))
-            .collect();
-        let over = registry
-            .execute("read_file", serde_json::json!({ "paths": too_many }))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            over.contains(&READ_FILE_MAX_BATCH.to_string()) && over.contains("at most"),
-            "unexpected message: {over}"
+    /// 工具面发给模型的字节数。这是模型每一回合都要付的固定成本，所以它只降不升：
+    /// 删掉一段散文，这个数跟着降，把它写进预算；要往上抬，得先说清新增的这段
+    /// 凭什么非有不可——而那句话在这里比在评审里更难糊弄过去。
+    #[test]
+    fn the_tool_payload_only_grows_when_someone_says_why() {
+        let registry = ToolRegistry::new();
+        builtins::register_builtins(
+            &registry,
+            builtins::BuiltinInputs {
+                http_client: None,
+                metrics: None,
+                memory_api_base: None,
+                external_archive_threshold_chars: 4096,
+                message_backend: None,
+                agent_registry: None,
+                web_search_base: None,
+                web_search_fallback_base: None,
+                web_fetch_base: None,
+                sandbox_backend: None,
+                message_events: None,
+                intent_events: None,
+            },
         );
+        let measured = tool_payload_bytes(&registry.list());
+        // cap: derived — 由树上的工具面现算（2026-11-17 实测 13647）；删除时跟着降，
+        // 往上抬要在提交信息里说明新增的是哪一段、凭什么非有不可。13767 → 13729
+        // 是删掉了搜索、抓取、raw_fetch、await_task 在本地的默认值和上限（四句话里
+        // 各有一个数）；13729 → 13716 是批量读的条数上限随 `maxItems` 一起消失；
+        // 13716 → 13713 是搜索与 diff 的截断改由「一页」导出，说明里那句
+        // 「the cap」换成了它实际是哪个界；13713 → 13647 是工具侧不再截断，
+        // 搜索与 diff 说明里那两句「一页装不下就回 truncated」随之一并删掉。
+        // 13647 → 14463 是 start_task 的四个格子（terminal/now/gap 与「平台从
+        // 这一轮补」那一格）：它们把「一条活要做到什么、现在差什么」变成模型
+        // 必须读到的形状，没有这四句模型仍会只交一句话，五格就无从落账。
+        const BUDGET: usize = 14_463;
+        assert!(
+            measured <= BUDGET,
+            "the model now pays {measured} bytes per turn for tool signatures; the budget \
+             was {BUDGET}. Either delete what grew or raise BUDGET with the reason"
+        );
+        eprintln!(
+            "tool payload: {measured} bytes in {} tools",
+            registry.list().len()
+        );
+    }
+
+    /// 这个数确实来自树，不是写死的：换一份工具，读数跟着变。
+    #[test]
+    fn the_payload_reading_follows_what_the_tools_actually_carry() {
+        fn tool(name: &str, description: &str) -> Tool {
+            Tool {
+                name: name.into(),
+                description: description.into(),
+                parameters: serde_json::json!({ "type": "object" }),
+                implementation: ToolImplementation::Native(Arc::new(|_| {
+                    Box::pin(async { Ok(serde_json::json!({})) })
+                })),
+            }
+        }
+        let short = tool_payload_bytes(&[tool("a", "reads a file")]);
+        let long = tool_payload_bytes(&[tool("a", "reads a file, and says what it left out")]);
+        assert!(long > short, "the reading ignored the description text");
+        let two = tool_payload_bytes(&[tool("a", "reads a file"), tool("b", "writes a file")]);
+        assert!(two > short, "the reading ignored a second tool");
+    }
+
+    /// 判据审那张表只留读的工具：写、派活、发消息都不在。留下任何一只写工具，
+    /// 「另一次调用只判终态」这句话就不成立——那一次的手也能落下东西。
+    #[test]
+    fn the_judge_registry_carries_readers_and_no_hands() {
+        fn tool(name: &str) -> Tool {
+            Tool {
+                name: name.into(),
+                description: String::new(),
+                parameters: serde_json::json!({ "type": "object" }),
+                implementation: ToolImplementation::Native(Arc::new(|_| {
+                    Box::pin(async { Ok(serde_json::json!({})) })
+                })),
+            }
+        }
+        let registry = ToolRegistry::new();
+        for name in [
+            "read_file",
+            "grep",
+            "write_file",
+            "edit_file",
+            "start_task",
+            "send_to_agent",
+            "run_command",
+        ] {
+            cog_core::ToolRegistry::register(&registry, tool(name));
+        }
+        let read = registry.read_only();
+        assert_eq!(
+            read.names(),
+            vec!["grep".to_string(), "read_file".to_string()],
+            "判据审的表里混进了不是读的工具：{:?}",
+            read.names()
+        );
+        assert!(read.get("write_file").is_none());
+        assert!(read.get("start_task").is_none());
+    }
+
+    /// 名字、描述、参数 schema 的字节和——就是模型看到的那份东西。
+    fn tool_payload_bytes(tools: &[Tool]) -> usize {
+        tools
+            .iter()
+            .map(|tool| {
+                tool.name.len() + tool.description.len() + tool.parameters.to_string().len()
+            })
+            .sum()
     }
 
     /// 带行范围读时只回那一段，但必须同时说清文件有多长、后面还有没有：
@@ -1788,7 +2189,46 @@ mod tests {
             "不带范围的老调用形状不变"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
+    }
+
+    /// 页大小要么背后有一条读数，要么就不是一个数——两种状态分得开。
+    ///
+    /// 不设界的页与「窗口很大」的页在结果上长得一样（整份文件都回来了），
+    /// 所以「这个数是量不出来」必须在决定的地方就是单独一个事实，不能等读的人
+    /// 从 `usize::MAX` 里倒推。
+    #[test]
+    fn a_page_nobody_measured_is_not_a_page_of_max_chars() {
+        assert_eq!(
+            page_budget(None),
+            (usize::MAX, false),
+            "这一段对话用的型号没有任何一条读数：不设界，并且这个数没有读数"
+        );
+        let (chars, measured) = page_budget(Some(32_000));
+        assert!(
+            measured && chars < usize::MAX,
+            "运行时交下来一个窗口：页大小由它导出，这是量出来的"
+        );
+    }
+
+    /// 池子里别的型号报了窗口，这一段对话的页大小不跟着变。
+    ///
+    /// 以前这里是「取池里最小的一只」：一次调用可能落到任何一家，于是拿最小的
+    /// 那个当界。可是页大小是给**这一段对话**用的，它的型号由运行时按回报的
+    /// 型号查出来交下来；用别的型号的窗口顶，就是给没量过的那只拍一个数。
+    #[test]
+    fn another_models_window_does_not_size_this_page() {
+        // 表是进程级的：写进去的那一行要在断言之后还回去，别的用例不该继承。
+        let before = cog_core::model_windows::all();
+        cog_core::model_windows::replace([("some-other-model".to_string(), 8_000)]);
+        let registry = ToolRegistry::new().with_context_window_size(None);
+        let page = registry.page_chars();
+        cog_core::model_windows::replace(before);
+        assert_eq!(
+            page,
+            usize::MAX,
+            "池里别的型号说了 8k，不等于这一段的型号说了 8k"
+        );
     }
 
     /// 不带范围地读一份长文件，拿到的是一页，不是整份。
@@ -1803,9 +2243,17 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("long.txt");
         let path = path.to_str().unwrap();
-        let body: String = (1..=2000).map(|i| format!("line {i}\n")).collect();
-
-        let registry = ToolRegistry::new().with_sandbox_backend(Arc::new(LocalShellBackend));
+        let registry = ToolRegistry::new()
+            .with_context_window_size(Some(TEST_WINDOW_TOKENS))
+            .with_sandbox_backend(Arc::new(LocalShellBackend));
+        // 一页多大由这张表服务的窗口导出，测试不另抄一个数。
+        let page_chars = registry.page_chars();
+        let body: String = (1..=8000).map(|i| format!("line {i}\n")).collect();
+        assert!(
+            body.chars().count() > page_chars,
+            "这份文件必须比一页长，否则读不出分页：{} 字符对一页 {page_chars}",
+            body.chars().count()
+        );
         cog_core::ToolRegistry::register(&registry, builtins::read_file());
         cog_core::ToolRegistry::register(&registry, builtins::write_file());
         registry
@@ -1820,12 +2268,12 @@ mod tests {
             .execute("read_file", serde_json::json!({"path": path}))
             .await
             .unwrap();
-        assert_eq!(first["total_lines"], 2000);
+        assert_eq!(first["total_lines"], 8000);
         assert_eq!(first["start_line"], 1);
         assert_eq!(first["has_more"], true);
-        assert_eq!(
-            first["content"].as_str().unwrap().lines().count(),
-            READ_FILE_DEFAULT_WINDOW_LINES
+        assert!(
+            first["content"].as_str().unwrap().chars().count() <= page_chars,
+            "一页超过了窗口导出的预算 {page_chars}: {first}"
         );
         assert!(
             first["content"]
@@ -1852,26 +2300,77 @@ mod tests {
             "续读必须从上一页的下一行开始，不重不漏"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
-    /// 行数没到也不是无限给：超长行照样要分页。
+    /// 一页多大只有窗口一个来源：换窗口，页跟着变。
     ///
-    /// 一页是给上下文的一笔预算，行数只是它的一半口径。压缩过的 JSON、一行
-    /// 几十万字符的日志，600 行能有几兆——那样一页和整份读没有区别，翻页
-    /// 也就白加了。
+    /// 同一份文件，宽窗口一次读完，窄窗口要分页。页大小若还是工具里写死的
+    /// 一个数，这条会在窄窗口那一半红——而树里那两份答案正是这么来的。
+    #[tokio::test]
+    async fn the_page_size_follows_the_window_the_registry_serves() {
+        let dir = std::env::temp_dir().join(format!("cog-tools-derive-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("medium.txt");
+        let path = path.to_str().unwrap();
+        let body: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+
+        for (window, paged) in [(32_000usize, false), (50, true)] {
+            let registry = ToolRegistry::new()
+                .with_context_window_size(Some(window))
+                .with_sandbox_backend(Arc::new(LocalShellBackend));
+            cog_core::ToolRegistry::register(&registry, builtins::read_file());
+            cog_core::ToolRegistry::register(&registry, builtins::write_file());
+            registry
+                .execute(
+                    "write_file",
+                    serde_json::json!({ "path": path, "content": body }),
+                )
+                .await
+                .unwrap();
+
+            let got = registry
+                .execute("read_file", serde_json::json!({ "path": path }))
+                .await
+                .unwrap();
+            if paged {
+                assert_eq!(
+                    got["has_more"],
+                    true,
+                    "窗口 {window} token 只要 {} 字符一页，这份文件必须分页: {got}",
+                    registry.page_chars()
+                );
+                assert!(
+                    got["content"].as_str().unwrap().chars().count() <= registry.page_chars(),
+                    "一页超过了窗口 {window} 导出的预算: {got}"
+                );
+            } else {
+                assert_eq!(got["content"], body.as_str(), "宽窗口里这份文件一页装得下");
+                assert!(got.get("total_lines").is_none(), "装得下就不该切: {got}");
+            }
+        }
+
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
+    }
+
+    /// 一页的界是字符，不是行数：超长行照样要分页。
+    ///
+    /// 一页是给上下文的一笔预算，只按字符算。压缩过的 JSON、一行几十万字符
+    /// 的日志，行数再少也能有几兆——那样一页和整份读没有区别，翻页也就白加了。
     #[tokio::test]
     async fn a_page_stops_on_characters_even_when_the_line_count_is_small() {
         let dir = std::env::temp_dir().join(format!("cog-tools-chars-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("wide.txt");
         let path = path.to_str().unwrap();
-        // 8 行、每行 10000 字符：行数远没到 600，字节数是 80000。
+        // 8 行、每行 10000 字符：行数很少，字符数是 80000。
         let body: String = (1..=8)
             .map(|i| format!("{}{i}\n", "x".repeat(9999)))
             .collect();
 
-        let registry = ToolRegistry::new().with_sandbox_backend(Arc::new(LocalShellBackend));
+        let registry = ToolRegistry::new()
+            .with_context_window_size(Some(TEST_WINDOW_TOKENS))
+            .with_sandbox_backend(Arc::new(LocalShellBackend));
         cog_core::ToolRegistry::register(&registry, builtins::read_file());
         cog_core::ToolRegistry::register(&registry, builtins::write_file());
         registry
@@ -1888,14 +2387,23 @@ mod tests {
             .unwrap();
         assert_eq!(first["total_lines"], 8);
         assert_eq!(first["has_more"], true);
-        assert_eq!(
-            first["content"].as_str().unwrap().lines().count(),
-            3,
-            "三万字符一页：三行就够，第四行会把它推到 40000"
+        // 一页能装几行由预算算出来，不写死：预算随窗口走，而这条用例问的是
+        // 「按字符停」这件事本身，不是某个特定窗口下的页大小。
+        let page_chars = registry.page_chars();
+        let page = first["content"].as_str().unwrap();
+        let lines = page.lines().count();
+        assert!(
+            page.chars().count() <= page_chars,
+            "一页 {} 字符超过了预算 {page_chars}",
+            page.chars().count()
         );
-        assert_eq!(first["next_offset"], 4);
+        assert!(
+            lines * 10_000 > page_chars - 10_000,
+            "这一页应当装到「再加一行就超」为止：{lines} 行、预算 {page_chars}"
+        );
+        assert_eq!(first["next_offset"], lines + 1);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// 被字符界截断的一页不能读成「文件到这儿就完了」。
@@ -1915,21 +2423,19 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("wide.txt");
         let path = path.to_str().unwrap();
+        let registry = ToolRegistry::new()
+            .with_context_window_size(Some(TEST_WINDOW_TOKENS))
+            .with_sandbox_backend(Arc::new(LocalShellBackend));
+        let page_chars = registry.page_chars();
         // 六行，每行都比一页的字符预算还长：一页装不下一行，翻页只能靠「至少给
         // 一行」这条兜底往前走——走不动是死循环，走快了是漏行。
         const LINES: usize = 6;
         let body: String = (1..=LINES)
-            .map(|i| {
-                format!(
-                    "line {i} {} {i}\n",
-                    "x".repeat(READ_FILE_PAGE_MAX_CHARS + 1024)
-                )
-            })
+            .map(|i| format!("line {i} {} {i}\n", "x".repeat(page_chars + 1024)))
             .collect();
         let expected: Vec<String> = body.lines().map(str::to_string).collect();
         assert_eq!(expected.len(), LINES);
 
-        let registry = ToolRegistry::new().with_sandbox_backend(Arc::new(LocalShellBackend));
         cog_core::ToolRegistry::register(&registry, builtins::read_file());
         cog_core::ToolRegistry::register(&registry, builtins::write_file());
         registry
@@ -1987,7 +2493,7 @@ mod tests {
             "把所有页接起来必须还原整份文件：少一行、重一行，或者把一页的余下部分当成不存在，都会对不上"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// The tool list a request carries must come out in name order, whatever
@@ -2047,6 +2553,7 @@ mod tests {
                         output: None,
                         duration_ms: 0,
                         resource_usage: Default::default(),
+                        workdir: None,
                     }
                 }
                 SandboxPayload::ReadFile { path } => match tokio::fs::read_to_string(path).await {
@@ -2085,6 +2592,15 @@ mod tests {
                 SandboxPayload::Wasm { .. } => {
                     return Err(cog_core::SFError::Agent("unsupported payload".into()));
                 }
+                // 检查点是「那棵工作树」的属性：它由持有文件的那一侧（执行器）
+                // 拍下来，这个进程内的双人替身没有树可拍，说出来而不是答成功。
+                SandboxPayload::CaptureCheckpoint { .. }
+                | SandboxPayload::PlanCheckpoint { .. }
+                | SandboxPayload::RestoreCheckpoint { .. } => {
+                    return Err(cog_core::SFError::Agent(
+                        "LocalShellBackend has no worktree to check point".into(),
+                    ));
+                }
             };
             Ok(result)
         }
@@ -2122,6 +2638,58 @@ mod tests {
         );
     }
 
+    /// 执行器报的目录要落到模型的回复里，而不是只落在事件流里。
+    ///
+    /// 车道名是调用方拼的，目录只有执行器知道：它按名字把树解出来，语言里
+    /// 没有第二条路能让模型拿到那个绝对路径。所以回复里带一格 `workdir`；
+    /// 落在任何树之外的调用（本机执行、无名无任务）反过来不许凭空报出一条
+    /// 路径——那会让模型以为自己在某棵树里。
+    #[tokio::test]
+    async fn a_command_reply_names_the_checkout_it_ran_in() {
+        let (backend, tx) = OpenStream::pair();
+        let registry = ToolRegistry::new().with_sandbox_backend(backend as Arc<dyn SandboxBackend>);
+        cog_core::ToolRegistry::register(&registry, builtins::run_command());
+
+        tx.send(CommandEvent::Workdir {
+            path: "/srv/workspaces/employee-kai-a9ab11fc".into(),
+            origin: cog_core::WorktreeOrigin::Created,
+        })
+        .unwrap();
+        tx.send(CommandEvent::Stdout {
+            data: "/srv/workspaces/employee-kai-a9ab11fc\n".into(),
+        })
+        .unwrap();
+        tx.send(CommandEvent::Exit { code: 0 }).unwrap();
+        drop(tx);
+
+        let out = registry
+            .execute("run_command", serde_json::json!({"command": "pwd"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out["workdir"], "/srv/workspaces/employee-kai-a9ab11fc",
+            "执行器报出的目录没有回给模型：它只能再跑一条 pwd 去问一个回复里本就有的答案"
+        );
+
+        let (backend, tx) = OpenStream::pair();
+        let bare = ToolRegistry::new().with_sandbox_backend(backend as Arc<dyn SandboxBackend>);
+        cog_core::ToolRegistry::register(&bare, builtins::run_command());
+        tx.send(CommandEvent::Stdout {
+            data: "hi\n".into(),
+        })
+        .unwrap();
+        tx.send(CommandEvent::Exit { code: 0 }).unwrap();
+        drop(tx);
+        let out = bare
+            .execute("run_command", serde_json::json!({"command": "echo hi"}))
+            .await
+            .unwrap();
+        assert!(
+            out.get("workdir").is_none(),
+            "没有车道的调用凭空报了一个工作目录：{out}"
+        );
+    }
+
     #[tokio::test]
     async fn run_command_supports_full_shell_syntax() {
         let registry = ToolRegistry::new().with_sandbox_backend(Arc::new(LocalShellBackend));
@@ -2148,7 +2716,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out["stdout"].as_str().unwrap().trim(), "45");
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
 
         assert!(registry
             .execute("run_command", serde_json::json!({"command": "   "}))
@@ -2171,7 +2739,7 @@ mod tests {
     /// assert what the sandbox plane actually sees.
     #[derive(Default)]
     struct RecordingBackend {
-        seen: tokio::sync::Mutex<Vec<(String, String, Duration)>>,
+        seen: tokio::sync::Mutex<Vec<(String, String)>>,
     }
 
     #[async_trait::async_trait]
@@ -2180,7 +2748,7 @@ mod tests {
             self.seen
                 .lock()
                 .await
-                .push((req.task_id.clone(), req.agent_id.clone(), req.timeout));
+                .push((req.task_id.clone(), req.agent_id.clone()));
             Ok(cog_core::SandboxResult {
                 exit_code: 0,
                 ..Default::default()
@@ -2201,16 +2769,6 @@ mod tests {
         }
         async fn fetch(&self, _manifest: &cog_core::PluginManifest) -> SFResult<Vec<u8>> {
             Ok(vec![])
-        }
-        async fn load(
-            &self,
-            _bytes: &[u8],
-            _manifest: &cog_core::PluginManifest,
-        ) -> SFResult<cog_core::PluginHandle> {
-            Err(cog_core::SFError::Agent("not loadable".into()))
-        }
-        async fn unload(&self, _handle: &cog_core::PluginHandle) -> SFResult<()> {
-            Ok(())
         }
         async fn fetch_by_id(&self, _plugin_id: &str) -> SFResult<Vec<u8>> {
             Ok(vec![])
@@ -2241,24 +2799,26 @@ mod tests {
             .unwrap();
 
         let seen = backend.seen.lock().await.clone();
-        assert_eq!(
-            seen,
-            vec![(
-                "dag-task-7".into(),
-                "worker-3".into(),
-                Duration::from_secs(600)
-            )]
-        );
+        assert_eq!(seen, vec![("dag-task-7".into(), "worker-3".into())]);
     }
 
-    /// 一条命令可以自己把墙立短一点：调用方写多少，沙箱就收到多少。
+    /// 一件活没有「调用方声明它能跑多久」这一格了：判据是它还在不在动。
+    ///
+    /// 这条盯的是**入口**——工具表里那个 `timeout_seconds` 参数已删，模型照着
+    /// 旧习惯写进来时，沙箱收到的仍然只是命令本身，不会有第二个人按秒数决定
+    /// 它什么时候作废。
     #[tokio::test]
-    async fn a_command_can_name_its_own_shorter_wall() {
+    async fn a_command_carries_no_declared_wall() {
         let backend = Arc::new(RecordingBackend::default());
-        let registry = ToolRegistry::new()
-            .with_shell_timeout(600)
-            .with_sandbox_backend(backend.clone() as Arc<dyn SandboxBackend>);
+        let registry =
+            ToolRegistry::new().with_sandbox_backend(backend.clone() as Arc<dyn SandboxBackend>);
         cog_core::ToolRegistry::register(&registry, builtins::run_command());
+
+        let schema = serde_json::to_string(&builtins::run_command().parameters).unwrap();
+        assert!(
+            !schema.contains("timeout_seconds"),
+            "工具表里不该再有一格按秒数的墙：{schema}"
+        );
 
         registry
             .execute(
@@ -2267,36 +2827,11 @@ mod tests {
             )
             .await
             .unwrap();
-
         let seen = backend.seen.lock().await;
-        assert_eq!(seen[0].2, Duration::from_secs(45), "沙箱收到的是 45 秒");
-    }
-
-    /// 比配置那一格更大时当场拒绝，并把它自己报出来。
-    ///
-    /// 静默截成配置值，调用方会以为它按自己的数在跑，然后在它没料到的时刻看到
-    /// 超时——两个数里真正生效的那个必须出现在它读得到的地方。
-    #[tokio::test]
-    async fn a_command_that_asks_for_longer_than_the_ceiling_is_refused_by_name() {
-        let backend = Arc::new(RecordingBackend::default());
-        let registry = ToolRegistry::new()
-            .with_shell_timeout(300)
-            .with_sandbox_backend(backend.clone() as Arc<dyn SandboxBackend>);
-        cog_core::ToolRegistry::register(&registry, builtins::run_command());
-
-        let err = registry
-            .execute(
-                "run_command",
-                serde_json::json!({"command": "cargo build", "timeout_seconds": 900}),
-            )
-            .await
-            .expect_err("900 秒超过 300 秒的上限，应当拒绝");
-        let text = err.to_string();
-        assert!(text.contains("900"), "要说出调用方要的那个数：{text}");
-        assert!(text.contains("300"), "要说出真正生效的上限：{text}");
-        assert!(
-            backend.seen.lock().await.is_empty(),
-            "拒绝的命令不该已经交给沙箱"
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].1, "unscoped-tool-run_command",
+            "这次调用仍然是一次普通的命令请求：多写进来的秒数没有变成第二个判它死活的人"
         );
     }
 
@@ -2533,6 +3068,11 @@ mod tests {
         assert_eq!(out["state"], "running");
 
         // 命令还在跑，已经写出来的那一截读得到。
+        tx.send(CommandEvent::Workdir {
+            path: "/srv/worktrees/employee-kai-a9ab11fc".into(),
+            origin: cog_core::WorktreeOrigin::Created,
+        })
+        .unwrap();
         tx.send(CommandEvent::Stdout {
             data: "compiling crate A\n".into(),
         })
@@ -2581,6 +3121,10 @@ mod tests {
         assert_eq!(done["state"], "exited");
         assert_eq!(done["exit_code"], 3);
         assert_eq!(done["stderr"], "warning: unused import\n");
+        assert_eq!(
+            done["workdir"], "/srv/worktrees/employee-kai-a9ab11fc",
+            "执行器报出的工作目录要跟着输出一起回给模型：否则长命令跑完，读者仍不知道自己刚才在哪编译"
+        );
 
         let cursor = done["next_offset"].as_u64().unwrap();
         let again = registry
@@ -2607,26 +3151,6 @@ mod tests {
             .await
             .expect_err("没有这条命令，读它应当是失败而不是空输出");
         assert!(err.to_string().contains("cmd-doesnotexist"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn shell_commands_get_their_own_budget_not_the_wasm_one() {
-        let backend = Arc::new(RecordingBackend::default());
-        let registry = ToolRegistry::new()
-            .with_wasm_timeout(30)
-            .with_shell_timeout(600)
-            .with_sandbox_backend(backend.clone() as Arc<dyn SandboxBackend>);
-        cog_core::ToolRegistry::register(&registry, builtins::run_command());
-
-        registry
-            .execute("run_command", serde_json::json!({"command": "cargo check"}))
-            .await
-            .unwrap();
-
-        let seen = backend.seen.lock().await.clone();
-        assert_eq!(seen.len(), 1);
-        // A command may be a compiler run; the WASM snippet budget cannot serve it.
-        assert_eq!(seen[0].2, Duration::from_secs(600));
     }
 
     #[tokio::test]
@@ -2692,35 +3216,21 @@ mod tests {
 
         let seen = backend.seen.lock().await.clone();
         assert_eq!(seen.len(), 3, "{seen:?}");
+        // The call names no task and its caller is announced, so routing falls
+        // back to the agent id: the lane is the caller's own checkout. The tool
+        // does not spell that lane itself — naming it here would be a task id
+        // reading `employee-...`, and the call would be pinned into a tree
+        // called `task-employee-...` that nobody asked for.
         assert_eq!(
-            seen[0].0, "unscoped-shell-ralph-3be244e0",
-            "an unscoped call is named after the agent making it: {seen:?}"
+            cog_core::checkout_lane(Some(seen[0].0.as_str()), Some(seen[0].1.as_str())),
+            Some(cog_core::worktree_lane("ralph-3be244e0")),
+            "an unscoped call lands in the calling agent's own checkout: {seen:?}"
         );
         assert!(
             seen.iter().all(|call| call.0 == seen[0].0),
             "every call one agent makes has to land in one workspace, or a write \
              is invisible to the read after it: {seen:?}"
         );
-    }
-
-    /// An agent id the executor would refuse is folded into one it accepts.
-    ///
-    /// The worktree router takes `[A-Za-z0-9_.-]` and refuses everything else,
-    /// while agent ids carry other bytes — a squad is spelled
-    /// `squad:<task id>`. Unfolded, every call from such an agent would fail
-    /// with "invalid task id for workspace routing" instead of running.
-    #[test]
-    fn an_agent_id_is_folded_into_a_workspace_name() {
-        assert_eq!(
-            workspace_name("squad:DSC-1A2B-generator"),
-            "squad-DSC-1A2B-generator"
-        );
-        assert_eq!(
-            workspace_name(".hidden"),
-            "hidden",
-            "a leading dot would name a hidden directory, which the router refuses"
-        );
-        assert_eq!(workspace_name(&"x".repeat(200)).len(), 96);
     }
 
     #[tokio::test]
@@ -2747,14 +3257,7 @@ mod tests {
             .await
             .unwrap();
         let seen = backend.seen.lock().await.clone();
-        assert_eq!(
-            seen,
-            vec![(
-                "dag-task-9".into(),
-                "worker-1".into(),
-                Duration::from_secs(600)
-            )]
-        );
+        assert_eq!(seen, vec![("dag-task-9".into(), "worker-1".into())]);
     }
 
     /// An announced caller is an identity, and it is the only one a task-less
@@ -2793,7 +3296,11 @@ mod tests {
             2,
             "an announced caller is not refused: {seen:?}"
         );
-        assert_eq!(seen[0].0, "unscoped-shell-squad-DSC-1A2B-generator");
+        assert_eq!(
+            cog_core::checkout_lane(Some(seen[0].0.as_str()), Some(seen[0].1.as_str())),
+            Some(cog_core::worktree_lane("squad:DSC-1A2B-generator")),
+            "an announced caller with no task keeps one checkout: {seen:?}"
+        );
         assert_eq!(
             seen[1].0, seen[0].0,
             "the second call landed in another workspace: {seen:?}"
@@ -2826,8 +3333,8 @@ mod tests {
         assert_eq!(
             seen,
             vec![
-                ("dag-a".into(), "w-1".into(), Duration::from_secs(600)),
-                ("dag-b".into(), "w-2".into(), Duration::from_secs(600))
+                ("dag-a".into(), "w-1".into()),
+                ("dag-b".into(), "w-2".into())
             ]
         );
     }
@@ -2858,14 +3365,9 @@ mod tests {
             .unwrap();
 
         let seen = backend.seen.lock().await.clone();
-        // A WASM snippet keeps the tight snippet budget.
         assert_eq!(
             seen,
-            vec![(
-                "unscoped-tool-wasm_echo".into(),
-                "plugin-42".into(),
-                Duration::from_secs(30)
-            )]
+            vec![("unscoped-tool-wasm_echo".into(), "plugin-42".into())]
         );
     }
 }
@@ -2911,12 +3413,10 @@ pub mod builtins {
             name: "read_file".into(),
             description: "Read the contents of a file. Relative paths resolve against \
                           the task's working directory, which is the repository root \
-                          when a checkout is provisioned. Pass offset and/or limit \
-                          to read one line range of a long file instead of the whole \
-                          thing; the result then also reports the file's total line \
-                          count and whether more remains. To read several files, \
-                          pass paths instead of path: one call returns them all, \
-                          which costs far less than one call per file."
+                          when a checkout is provisioned. Pass offset and/or limit to \
+                          read one line range; the result then also reports the file's \
+                          total line count and whether more remains. To read several \
+                          files, pass paths instead of path."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -2925,8 +3425,7 @@ pub mod builtins {
                     "paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "maxItems": READ_FILE_MAX_BATCH,
-                        "description": "Several file paths to read in this one call; the result is an array of entries in the same order, each with path and either content or error. Give either path or paths, not both. At most 8 files per call"
+                        "description": "Several file paths to read in this one call; the result is an array of entries in the same order, each with path and either content or error"
                     },
                     "offset": {
                         "type": "integer",
@@ -2936,7 +3435,7 @@ pub mod builtins {
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "How many lines to return; omit to read one page (600 lines) or the rest of the file if shorter. The reply carries total_lines, has_more and next_offset, so a long file is read page by page instead of in one piece"
+                        "description": "How many lines to return; omit to read one page or the rest of the file if shorter. The reply carries total_lines, has_more and next_offset"
                     }
                 },
                 "anyOf": [{ "required": ["path"] }, { "required": ["paths"] }]
@@ -2949,9 +3448,7 @@ pub mod builtins {
         Tool {
             name: "write_file".into(),
             description: "Write content to a file, replacing whatever it held. Relative paths \
-                          resolve against the task's working directory. To change part of an \
-                          existing file, use edit_file: rewriting the whole thing to change a \
-                          line carries every other line again."
+                          resolve against the task's working directory."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -2970,13 +3467,8 @@ pub mod builtins {
             name: "edit_file".into(),
             description: "Replace an exact string in a file with new text, without rewriting \
                           the whole file. `old_string` is the text to find, copied exactly \
-                          from the file including indentation; `new_string` replaces it. When \
-                          the text appears more than once the call is refused and the \
-                          occurrences' line numbers are named, so include enough surrounding \
-                          text to pick one site -- or set `replace_all` to change all of \
-                          them. The reply says how many replacements were made and at which \
-                          lines. Read the file first: an anchor that does not match the bytes \
-                          on disk is refused, never guessed at."
+                          from the file including indentation; `new_string` replaces it. The \
+                          reply says how many replacements were made and at which lines."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -3007,25 +3499,12 @@ pub mod builtins {
             description: "Run a shell command with full shell syntax: pipes, redirects, \
                           variable expansion, and scripts written via write_file are all \
                           supported. The command runs in the task's working directory; when \
-                          a repository checkout is provisioned it is already rooted there, \
-                          so work on the repo in place instead of cloning it again. For a \
-                          build or a test suite that takes minutes, use \
-                          run_command_background instead: it answers with a handle at once \
-                          and the turn goes on while the command runs."
+                          a repository checkout is provisioned it is already rooted there."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "Command to run" },
-                    "timeout_seconds": {
-                        "type": "integer",
-                        "description": "How long this one command may run, in seconds. \
-                                        Leave it out for the configured wall \
-                                        (`system.shell_timeout_secs`). A value above that \
-                                        wall is refused with the limit named, never \
-                                        silently shortened, so build and test runs that \
-                                        need longer say so in the call"
-                    }
+                    "command": { "type": "string", "description": "Command to run" }
                 },
                 "required": ["command"]
             }),
@@ -3036,22 +3515,14 @@ pub mod builtins {
     pub fn run_command_background() -> Tool {
         Tool {
             name: "run_command_background".into(),
-            description: "Start a shell command and answer at once with a handle, instead of \
-                          waiting for it to finish. Use it for builds and test suites that take \
-                          minutes: a foreground run holds the whole turn until it ends, while \
-                          this one keeps running in the task's working directory and the turn \
-                          goes on. Read its output and exit status with command_output."
+            description: "Start a shell command in the task's working directory and answer at \
+                          once with a handle, instead of waiting for it to finish. Read its \
+                          output and exit status with command_output."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "Command to run" },
-                    "timeout_seconds": {
-                        "type": "integer",
-                        "description": "How long this command may run in total, in seconds. \
-                                        Leave it out for the configured wall; a value above \
-                                        the wall is refused with the limit named"
-                    }
+                    "command": { "type": "string", "description": "Command to run" }
                 },
                 "required": ["command"]
             }),
@@ -3150,6 +3621,19 @@ pub mod builtins {
         /// browser, and a backend that does not answer is reported as such
         /// rather than quietly replaced by the path that cannot run scripts.
         pub web_fetch_base: Option<String>,
+        /// The executor whose checkouts the tree-reading tools (search, glob,
+        /// git, patch) run in. `None` is a process that holds no executor:
+        /// those tools still register and name the missing layer when called,
+        /// because "this process has no checkout" and "there is no search"
+        /// call for different repairs.
+        pub sandbox_backend: Option<Arc<dyn SandboxBackend>>,
+        /// 消息事实的写者：`send_to_agent` 发布成功之后写一条 `message_sent`。
+        /// 缺席时只少这一条账，工具照常投递——「没有落点」与「没发出去」不同。
+        pub message_events: Option<Arc<dyn cog_core::EventStore>>,
+        /// 意图落点：`send_to_agent` 投出去的那一句同时是一条意图
+        /// （来源 `agent`，说给谁就是那个收件人）。缺席时那一条不写，只留
+        /// 一条具名日志——消息已经投出去了，缺的是把它记成「有人说过」的那行。
+        pub intent_events: Option<Arc<dyn cog_core::EventStore>>,
     }
 
     /// Register every built-in tool into `registry`.
@@ -3169,6 +3653,21 @@ pub mod builtins {
         cog_core::ToolRegistry::register(registry, run_command());
         cog_core::ToolRegistry::register(registry, run_command_background());
         cog_core::ToolRegistry::register(registry, command_output());
+        // 读树与改树的工具：它们与 `run_command` 共用同一个执行器与同一份身份
+        // （agent id 选树），所以答案来自调用者自己那棵树，而不是本进程脚下的
+        // 一份源码。后端缺席时照常注册、调用时报出缺的那一层。
+        let sandbox = SandboxTools::new(inputs.sandbox_backend.clone());
+        cog_core::ToolRegistry::register(registry, search_code(sandbox.clone()));
+        cog_core::ToolRegistry::register(registry, grep(sandbox.clone()));
+        cog_core::ToolRegistry::register(registry, glob(sandbox.clone()));
+        cog_core::ToolRegistry::register(registry, git_status(sandbox.clone()));
+        cog_core::ToolRegistry::register(registry, git_diff(sandbox.clone()));
+        cog_core::ToolRegistry::register(
+            registry,
+            git_commit(sandbox.clone(), inputs.agent_registry.clone()),
+        );
+        cog_core::ToolRegistry::register(registry, apply_patch(sandbox.clone()));
+        cog_core::ToolRegistry::register(registry, todo());
         match inputs.http_client.clone() {
             Some(client) => cog_core::ToolRegistry::register(
                 registry,
@@ -3223,9 +3722,17 @@ pub mod builtins {
             inputs.message_backend.clone(),
             inputs.agent_registry.clone(),
         ) {
-            (Some(backend), Some(registry_handle)) => {
-                cog_core::ToolRegistry::register(registry, send_to_agent(backend, registry_handle))
-            }
+            (Some(backend), Some(registry_handle)) => cog_core::ToolRegistry::register(
+                registry,
+                send_to_agent(
+                    backend,
+                    registry_handle,
+                    inputs.message_events.clone(),
+                    inputs.intent_events.clone(),
+                    inputs.http_client.clone(),
+                    inputs.memory_api_base.clone(),
+                ),
+            ),
             // Both halves are needed, so the tool is absent when either is: a
             // message with no roster check goes into a stream nobody reads, and
             // a roster with no queue has nowhere to put it. Registered but
@@ -3266,6 +3773,13 @@ pub mod builtins {
             registry,
             read_task_ledger(inputs.http_client.clone(), inputs.memory_api_base.clone()),
         );
+        // 派活之后要答案：`start_task` 的回执只有「已排队」，没有结局。没有这
+        // 一只，调用方要么再派一件、要么自己反复读账——两件都是在拿「没等到」
+        // 当答案。它读的是服务端那一刻的终局，不是客户端里的轮询。
+        cog_core::ToolRegistry::register(
+            registry,
+            await_task(inputs.http_client.clone(), inputs.memory_api_base.clone()),
+        );
     }
 
     /// Names the live agents, so a caller has something to address.
@@ -3282,14 +3796,12 @@ pub mod builtins {
         Tool {
             name: "list_agents".into(),
             description: "List the live agents this platform has registered, optionally \
-                          filtered by role or capability. Use it to find the exact \
-                          agent_id to pass to send_to_agent. Only live agents appear: a \
-                          registration that has expired is not listed. Every entry \
-                          carries the agent's `display_name` -- the name the workbench \
-                          shows, derived from the id -- so a colleague is addressed by \
-                          the same name a person sees. When the run established an \
-                          identity, your own entry carries `is_me: true` and the result \
-                          repeats your id as `caller`."
+                          filtered by role. Only live agents appear: a registration \
+                          that has expired is not listed. Every entry carries the \
+                          agent's `display_name` -- the name the workbench shows, \
+                          derived from the id. When the run established an identity, \
+                          your own entry carries `is_me: true` and the result repeats \
+                          your id as `caller`."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -3297,10 +3809,6 @@ pub mod builtins {
                     "role": {
                         "type": "string",
                         "description": "Only agents playing this role"
-                    },
-                    "capability": {
-                        "type": "string",
-                        "description": "Only agents declaring this capability"
                     }
                 }
             }),
@@ -3308,7 +3816,6 @@ pub mod builtins {
                 let registry = registry.clone();
                 Box::pin(async move {
                     let role = args["role"].as_str();
-                    let capability = args["capability"].as_str();
                     // The caller's own row is marked, because an id derived
                     // from a task and a role is not something an agent can
                     // reconstruct from its prompt: without the mark the only
@@ -3337,9 +3844,6 @@ pub mod builtins {
                     let agents: Vec<serde_json::Value> = live
                         .into_iter()
                         .filter(|r| role.is_none_or(|role| r.role == role))
-                        .filter(|r| {
-                            capability.is_none_or(|cap| r.capabilities.iter().any(|c| c == cap))
-                        })
                         .map(|r| {
                             let is_me = me.as_deref() == Some(r.agent_id.as_str());
                             // 与员工页同一个来源：名册行。目录和名单读到的是
@@ -3349,16 +3853,17 @@ pub mod builtins {
                                 Some(row) => row.label(),
                                 None => cog_core::unregistered_label(&r.agent_id),
                             };
+                            // 由工号推出的唯一身份只有一处拼法（`employee_id`），
+                            // 目录不在这里再拼一遍。
                             let number = entry
                                 .and_then(|row| row.number)
-                                .map(|n| format!("{}{n:04}", cog_core::EMPLOYEE_NUMBER_PREFIX));
+                                .map(cog_core::employee_identity);
                             serde_json::json!({
                                 "agent_id": r.agent_id,
                                 "display_name": display_name,
                                 "number": number,
                                 "role": r.role,
                                 "workspace_id": r.workspace_id,
-                                "capabilities": r.capabilities,
                                 "last_heartbeat": r.last_heartbeat.to_rfc3339(),
                                 "is_me": is_me,
                             })
@@ -3407,21 +3912,23 @@ pub mod builtins {
     pub fn send_to_agent(
         backend: Arc<dyn cog_core::MessageBackend>,
         registry: Arc<dyn cog_core::AgentRegistry>,
+        message_events: Option<Arc<dyn cog_core::EventStore>>,
+        intent_events: Option<Arc<dyn cog_core::EventStore>>,
+        http_client: Option<Arc<dyn HttpClient>>,
+        memory_api_base: Option<String>,
     ) -> Tool {
         Tool {
             name: "send_to_agent".into(),
             description: "Send an instruction to another live agent's inbox. Delivery is \
                           at-least-once and the target acks only after it has run the \
-                          command, so write instructions that survive being applied twice. \
-                          With expect_reply the call waits for the target's answer and \
-                          returns it under `reply`; without it the call returns as soon as \
-                          the instruction is queued and nothing comes back. The result \
-                          repeats your own agent id as `from` when the run established \
-                          one, and `null` when it did not. kind=prompt starts a run on the \
+                          command. With expect_reply the call waits for the target's answer \
+                          and returns it under `reply`; without it the call returns as soon \
+                          as the instruction is queued and nothing comes back. The result \
+                          repeats your own agent id as `from` when the run established one, \
+                          and `null` when it did not. kind=prompt starts a run on the \
                           target, kind=steering injects into a run already in progress, \
                           kind=continue appends to the target's conversation; only \
-                          kind=prompt can carry expect_reply, because only a run produces \
-                          an answer."
+                          kind=prompt can carry expect_reply."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -3447,8 +3954,7 @@ pub mod builtins {
                     },
                     "timeout_ms": {
                         "type": "integer",
-                        "description": "How long to wait when expect_reply is set (default \
-                                        120000, capped at 600000)"
+                        "description": "Wait limit when expect_reply is set; required with it"
                     }
                 },
                 "required": ["agent_id", "message"]
@@ -3456,6 +3962,10 @@ pub mod builtins {
             implementation: ToolImplementation::Native(Arc::new(move |args| {
                 let backend = backend.clone();
                 let registry = registry.clone();
+                let message_events = message_events.clone();
+                let intent_events = intent_events.clone();
+                let archive_client = http_client.clone();
+                let archive_base = memory_api_base.clone();
                 Box::pin(async move {
                     let agent_id = args["agent_id"]
                         .as_str()
@@ -3468,6 +3978,7 @@ pub mod builtins {
                         .ok_or_else(|| SFError::Validation("message required".into()))?;
                     let kind = args["kind"].as_str().unwrap_or("prompt");
                     let expect_reply = args["expect_reply"].as_bool().unwrap_or(false);
+                    let timeout_ms = args["timeout_ms"].as_u64().filter(|ms| *ms > 0);
                     // Refused before anything is written: the other two commands
                     // do not start a run, so there is no answer to wait for and
                     // a wait would spend the whole timeout learning that.
@@ -3477,6 +3988,15 @@ pub mod builtins {
                              so no answer can come back"
                         )));
                     }
+                    // 等多久是调用方自己的决定：不说等多久就不等，没有替它挑的
+                    // 默认值，也没有替它封的顶。
+                    if expect_reply && timeout_ms.is_none() {
+                        return Err(SFError::Validation(
+                            "expect_reply needs timeout_ms: how long this turn will hold \
+                             for the answer"
+                                .into(),
+                        ));
+                    }
                     // The stream this call will read, named before the request
                     // exists so the target can be told where to answer.
                     let ask = if expect_reply {
@@ -3485,16 +4005,34 @@ pub mod builtins {
                         None
                     };
 
+                    // 发信人随消息走：收件人只拿到这一条，他自己查不到是谁写的。
+                    // 一次没公布身份的运行照样发得出去，只是那一格为空。
+                    let from_agent = caller_agent_id();
+                    // 事件要写「谁发的」，而构建收件箱那一步会把它移进去；先留一份。
+                    let sender = from_agent.clone();
+                    // 这一句自己的意图身份：消息与意图行用同一份，收件人那边派出去的
+                    // 活也挂它。只在真正开一轮的 `prompt` 上随消息走——steering 与
+                    // continue 改的是已经开着的那一轮，没有「这一次运行」可挂。
+                    let identity = cog_core::contract::intent_events::colleague_intent_identity(
+                        from_agent.as_deref().unwrap_or(""),
+                        agent_id,
+                        kind,
+                        message,
+                    );
                     let inbox = match kind {
                         "prompt" => cog_core::InboxMessage::Prompt {
                             goal: serde_json::Value::String(message.to_string()),
                             reply_stream: ask.clone(),
+                            from_agent,
+                            intent: Some(identity.clone()),
                         },
                         "steering" => cog_core::InboxMessage::Steering {
                             instruction: message.to_string(),
+                            from_agent,
                         },
                         "continue" => cog_core::InboxMessage::Continue {
                             instruction: message.to_string(),
+                            from_agent,
                         },
                         other => {
                             return Err(SFError::Validation(format!(
@@ -3560,6 +4098,51 @@ pub mod builtins {
                     };
 
                     backend.publish(&inbox_stream, &payload).await?;
+                    // 发布成功之后立刻写一条 `message_sent`：正文原样、两端、渠道。
+                    // 写不进去只说一句——消息已经投出去了，缺的是那一条账；把这件事
+                    // 变成发送失败会让人重发一条已经发出去的话。
+                    if let Some(events) = message_events.as_ref() {
+                        if let Err(e) = events
+                            .append(cog_core::message_event(
+                                sender.as_deref().unwrap_or(""),
+                                agent_id,
+                                kind,
+                                message,
+                                None,
+                                None,
+                                None,
+                                chrono::Utc::now(),
+                            ))
+                            .await
+                        {
+                            tracing::warn!(
+                                to = agent_id,
+                                error = %e,
+                                "the message was delivered but its fact was not written to the stream"
+                            );
+                        }
+                    }
+                    // 同一句话同时是一条意图：发信人、收件人与原话一起落进意图账，
+                    // 收件人那一侧跑起来派出的活因此找得到「这是谁让我做的」。
+                    // 写在投递成功之后——没有投出去的话不是一次到达。
+                    if let Some(events) = intent_events.as_ref() {
+                        let from = sender.as_deref().unwrap_or("");
+                        let row = cog_core::IntentRow::new(
+                            "agent",
+                            identity.clone(),
+                            from,
+                            agent_id,
+                            message,
+                            None,
+                        );
+                        if let Err(e) = events.append(cog_core::intent_received_event(&row)).await {
+                            tracing::warn!(
+                                to = agent_id,
+                                error = %e,
+                                "the colleague message was delivered but its intent row was not written"
+                            );
+                        }
+                    }
                     // One line per message, naming both ends: the queue keeps
                     // no sender anywhere — the wire form carries the command
                     // and nothing about who wrote it — so without this the only
@@ -3589,7 +4172,13 @@ pub mod builtins {
                         if let Some(guard) = reply_guard.as_mut() {
                             guard.begin_wait();
                         }
-                        let waited = wait_for_reply(backend.as_ref(), stream, reader, &args).await;
+                        let waited = wait_for_reply(
+                            backend.as_ref(),
+                            stream,
+                            reader,
+                            timeout_ms.unwrap_or_default(),
+                        )
+                        .await;
                         // The wait deletes the stream on every path it reaches,
                         // so from here on the guard has nothing left to clean.
                         if let Some(guard) = reply_guard.as_mut() {
@@ -3655,12 +4244,13 @@ pub mod builtins {
             description: "File a piece of work on the shared task graph, optionally naming the \
                           person who should carry it. The row appears on the workbench under the \
                           venue you give it, and its acceptance criteria are what the answer is \
-                          judged by. Use it when the work outlives this turn, needs someone \
-                          else, or should be on the board where the owner can see it. The call \
-                          returns as soon as the row is queued; the answer comes back in the \
-                          task's result, not in this turn. Call it again with the returned \
-                          goal_id to add more items to the same goal — that is how a squad is \
-                          formed around one goal."
+                          judged by. The call returns as soon as the row is queued; the answer \
+                          comes back in the task's result, not in this turn. Call it again with \
+                          the returned goal_id to add more items to the same goal. \
+                          For a request from the owner that asks for work, pass terminal, now \
+                          and gap together: terminal is what the world looks like after this is \
+                          done, now is what the tree shows at this moment, and gap is exactly \
+                          what is still missing between them."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -3678,6 +4268,26 @@ pub mod builtins {
                                         invents a criterion and the row would sit on the board \
                                         reading like work in progress."
                     },
+                    "terminal": {
+                        "type": "string",
+                        "description": "The world after this is done: a precise natural-language \
+                                        state, not a reading, a checklist or a sample."
+                    },
+                    "now": {
+                        "type": "string",
+                        "description": "The tree as it is now, read from the tree and written in \
+                                        the same natural language as terminal."
+                    },
+                    "gap": {
+                        "type": "string",
+                        "description": "Terminal minus now, written as what is missing. Empty only \
+                                        when the terminal already holds."
+                    },
+                    "intent_id": {
+                        "type": "string",
+                        "description": "The platform fills this from the conversation turn; leave \
+                                        it out unless you are carrying an intent explicitly."
+                    },
                     "venue": {
                         "type": "string",
                         "description": "Which column of the board this work belongs in — memory, \
@@ -3694,10 +4304,11 @@ pub mod builtins {
                         "description": "Returned by an earlier call: add this item to that goal \
                                         instead of starting a new one."
                     },
-                    "timeout_seconds": {
+                    "declared_duration_seconds": {
                         "type": "integer",
-                        "description": "How long the row may stay open before the graph fails it \
-                                        (default 3600)."
+                        "description": "How long the work declares it will take (default 3600). \
+                                        Nothing ends the row at this number: the holder's lease \
+                                        and the measured inter-step window decide when it stops."
                     }
                 },
                 "required": ["goal", "acceptance"]
@@ -3709,7 +4320,17 @@ pub mod builtins {
                 Box::pin(async move {
                     let base = memory_base(api_base.as_deref())?;
                     let client = memory_client(client)?;
-                    let filed = start_task_filing(&args, caller_agent_id().as_deref())?;
+                    let intent_id = args
+                        .get("intent_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string);
+                    let filed = start_task_filing(
+                        &args,
+                        caller_agent_id().as_deref(),
+                        intent_id.as_deref(),
+                    )?;
 
                     // Asked before the write, for the same reason the send tool
                     // asks: a name nobody holds would be handed to the rotation
@@ -3736,7 +4357,6 @@ pub mod builtins {
 
                     let url = format!("{base}/api/v1/tasks");
                     let mut request = cog_core::HttpRequest::new("POST", &url);
-                    request.timeout_secs = Some(MEMORY_READ_TIMEOUT_SECS);
                     request.headers.insert(
                         "content-type".into(),
                         cog_core::contract::net::CONTENT_TYPE_JSON.into(),
@@ -3798,14 +4418,12 @@ pub mod builtins {
         Tool {
             name: "read_task_ledger".into(),
             description: "Read the shared task ledger: how much work is on the board, in what \
-                          states, in which venues, and on whose hands. Use it before starting \
-                          something new, to find out whether it is already queued or already \
-                          done, and after filing work, to find out whether anyone picked it up. \
-                          The reading is folded: counts plus the oldest open rows, never the \
-                          whole table. Narrow it with any of the filters; leave them out to read \
-                          the whole board. `open` rows that were never taken are queue depth, \
-                          rows with a `started_at` are work in flight, and `truncated` says the \
-                          row list was cut to `limit` rather than being complete."
+                          states, in which venues, and on whose hands. The reading is folded: \
+                          counts plus the oldest open rows, never the whole table. Narrow it \
+                          with any of the filters; leave them out to read the whole board. \
+                          `open` rows that were never taken are queue depth, rows with a \
+                          `started_at` are work in flight, and `truncated` says the row list \
+                          was cut to `limit` rather than being complete."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -3832,8 +4450,7 @@ pub mod builtins {
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "How many of the oldest open rows to bring back (default \
-                                        20, capped at 50 regardless of what is asked for)."
+                        "description": "How many of the oldest open rows to bring back"
                     }
                 }
             }),
@@ -3860,6 +4477,301 @@ pub mod builtins {
                         url.push_str(&query.join("&"));
                     }
                     get_json(&client, &url).await
+                })
+            })),
+        }
+    }
+
+    /// 等一件已经派出去的活走到终局。
+    ///
+    /// 与 `start_task` 成对：派活的回执里只有「已排队」，没有答案。要答案就得
+    /// 等，而「等」不该是调用方自己反复读——那是调用方把一份服务端已经在维护的
+    /// 状态再轮询一遍，每一次轮询之间它什么也没做成。这里发一次请求，服务端订
+    /// 阅同一份任务事件流（`TaskEvent`），走到终态（完成 / 失败 / 取消）才回答；
+    /// 到点也回答，但说的是「没在时限内等到」。
+    ///
+    /// 到点不等于对方没做完：那一行可能还在跑，也可能排在一长串活后面。所以超时
+    /// 的回执里 `task_completed` 是假、`reason` 是 `timeout`，还带着此刻读到的
+    /// 状态；把「没等到」读成「没做完」，等的人就会去重派一件已经在做的事。
+    ///
+    /// 回执不替调用方判断成败：`status` 原样交回（完成的拼法由服务端那一列定），
+    /// `task_completed` 只在真走完时才真——一条失败的行不是「完成了」。
+    pub fn await_task(client: Option<Arc<dyn HttpClient>>, api_base: Option<String>) -> Tool {
+        Tool {
+            name: "await_task".into(),
+            description: "Wait for a task you filed to reach its end, and return what it \
+                          ended with. The call blocks this turn for up to timeout_ms; the \
+                          server subscribes to the task's lifecycle rather than being polled. \
+                          On timeout `task_completed` is false and `reason` is `timeout`: no \
+                          end arrived within the limit, not that the work failed."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "The `task_id` from start_task's receipt"
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "description": "Wait limit while the task runs; without it reads \
+                                        the status now"
+                    }
+                },
+                "required": ["task_id"]
+            }),
+            implementation: ToolImplementation::Native(Arc::new(move |args| {
+                let client = client.clone();
+                let api_base = api_base.clone();
+                Box::pin(async move {
+                    let base = memory_base(api_base.as_deref())?;
+                    let client = memory_client(client)?;
+                    let task_id = args["task_id"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                        .ok_or_else(|| {
+                            SFError::Validation(
+                                "await_task needs the `task_id` from start_task's receipt; \
+                                 without it there is no row to wait on"
+                                    .into(),
+                            )
+                        })?;
+                    // 不说等多久就不等：请求里没有 `wait_ms`，服务端据它自己的
+                    // 约定立刻回当前状态。客户端不替调用方挑默认值，也不封顶——
+                    // 服务端那侧本来就有自己的上限。
+                    let wait_ms = args
+                        .get("timeout_ms")
+                        .and_then(serde_json::Value::as_u64)
+                        .filter(|ms| *ms > 0);
+                    let mut url = format!("{base}/api/v1/tasks/{}", encode_url_component(task_id));
+                    if let Some(wait_ms) = wait_ms {
+                        url.push_str(&format!("?wait_ms={wait_ms}"));
+                    }
+                    let mut request = cog_core::HttpRequest::new("GET", &url);
+                    // 客户端自己的超时跟调用方给的等待窗口一样长：到点时先由服务端
+                    // 回答「没等到」，客户端这边跟着断开只会把同一句话读成一次网络
+                    // 失败。没说等多久时，请求按普通读的时限走。
+                    request.timeout_secs =
+                        wait_ms.map(|wait_ms| wait_ms.div_ceil(MILLIS_PER_SECOND));
+                    let response = client.execute(request).await?;
+                    let text = String::from_utf8_lossy(&response.body).to_string();
+                    if !response.is_success() {
+                        return Err(SFError::Validation(format!(
+                            "the task read refused this wait (HTTP {}): {}",
+                            response.status,
+                            text.trim()
+                        )));
+                    }
+                    let view: serde_json::Value =
+                        serde_json::from_str(&text).map_err(SFError::Serialization)?;
+                    let status_word = view.get("status").and_then(serde_json::Value::as_str);
+                    let status = status_word.and_then(cog_core::TaskStatus::parse);
+                    let completed = task_completed(status);
+                    let ended = completed || task_reached_an_end(status);
+                    let mut receipt = serde_json::json!({
+                        "task_id": task_id,
+                        "status": status_word,
+                        "task_completed": completed,
+                        "result": view.get("result").cloned().unwrap_or(serde_json::Value::Null),
+                        "error": view.get("error").cloned().unwrap_or(serde_json::Value::Null),
+                        "agent_id": view.get("agent_id").cloned().unwrap_or(serde_json::Value::Null),
+                        "waited_ms": wait_ms,
+                    });
+                    if !ended {
+                        receipt["reason"] = serde_json::json!("timeout");
+                        receipt["hint"] = serde_json::json!(
+                            "no end arrived within the limit; the row may still be running \
+                             or still queued. Ask again, or read the ledger, rather than \
+                             filing the same work a second time"
+                        );
+                    }
+                    Ok(receipt)
+                })
+            })),
+        }
+    }
+
+    /// 这一行走完了吗。失败与取消也是终局，但它们不是「完成」——两句话分开，
+    /// 因为等的人拿到之后要做的事不同：完成是去用结果，失败是去看原因。
+    fn task_completed(status: Option<cog_core::TaskStatus>) -> bool {
+        status == Some(cog_core::TaskStatus::Completed)
+    }
+
+    /// 这一行还有没有可能再变：完成、失败、取消都不会再变。
+    fn task_reached_an_end(status: Option<cog_core::TaskStatus>) -> bool {
+        matches!(
+            status,
+            Some(cog_core::TaskStatus::Completed)
+                | Some(cog_core::TaskStatus::Failed)
+                | Some(cog_core::TaskStatus::Cancelled)
+        )
+    }
+
+    /// 子任务要用的那一组东西：模型、配置、工具表、权限、名册、身份与账。
+    ///
+    /// 打成一条结构而不是七个参数：这七样是同一个决定——「这条分解在谁名下、
+    /// 按什么规矩跑」。分行传的话，某一个构造点漏掉其中一样也不会报错，它只是
+    /// 让子任务的花销记不进这段会话、或者让它在一个名册上没有的 id 下动手。
+    pub struct SubagentWiring {
+        /// 子任务答话用的模型。`None` 是「这个部署没有可交给子任务的客户端」。
+        pub llm: Option<Arc<dyn cog_core::LlmClient>>,
+        /// 父这一轮的配置（窗口、轮次天花板）：一对父子在同一个窗口上想事。
+        pub template: cog_core::RuntimeConfig,
+        /// 父表在这只工具装进来**之前**的那一份副本。
+        pub tools: Option<Arc<ToolRegistry>>,
+        /// 父这一轮的权限判定者。
+        pub decider: Option<Arc<dyn crate::permission::PermissionDecider>>,
+        /// 父这一轮的权限模式。
+        pub mode: crate::permission::PermissionMode,
+        /// 父这一轮的名册：子任务读到的是父那一行，不是新的人。
+        pub roster: Option<Arc<dyn cog_core::AgentRegistry>>,
+        /// 这一轮记在谁头上；空串是「这条连接没有身份」。
+        pub owner: String,
+        /// 这一段会话的号：子任务的花销按它折叠进会话合计。
+        pub session: String,
+        /// 按 `unit_of_work` 取「看过哪些文件」的读口。`None` 时不报清单——
+        /// 不报与报空在读数上要分得开，所以交回值里那一格是 `null` 而不是 `[]`。
+        pub files_seen: Option<Arc<dyn crate::subagent_files::FilesSeen>>,
+    }
+
+    /// 一个独立上下文的子任务：把一句话交给一条新的循环，拿回它的最终产出。
+    ///
+    /// 与另外两条路分开：
+    ///
+    /// - `send_to_agent` 是给**平级同事**发消息：对方是另一个人，有自己的收件箱与
+    ///   生命周期，回不回、什么时候回都不由这一次调用决定；
+    /// - `start_task` 是往**共享任务图**上挂活：那一行从此属于所有人，结果落在图
+    ///   上，要等就得等那条边；
+    /// - `spawn_subagent` 是**这一次调用的内部分解**：子任务只看见你交给它那一句
+    ///   话（父会话的历史一条也不进去），它的产出以这一次工具调用的结果直接回来。
+    ///   父与子的上下文因此是隔离的：子任务读了几十万 token 的中间过程不会挤占
+    ///   父会话的窗口，父会话只收到最后那一份。
+    ///
+    /// 子任务的工具表是**父表在这一刻的副本**（`fork`：沙箱后端、护栏、插件源都
+    /// 跟着走），而且是在装上这只工具**之前**复制的——子任务手上没有
+    /// `spawn_subagent`，所以父子深度就是一。这是刻意的界：没有它，一层写错的
+    /// 递归就能把一个进程的所有并发与预算都吃进去，而失败的那一侧只会看见「很慢」。
+    ///
+    /// 配置（窗口、轮次天花板）取自父这一轮的配置，不在这里另写一组数：一对父子
+    /// 在同一个窗口上想事，读的人不需要再问「子任务为什么只看到一半」。
+    pub fn spawn_subagent(wiring: SubagentWiring) -> Tool {
+        Tool {
+            name: "spawn_subagent".into(),
+            description: "Hand one self-contained piece of work to a fresh context and get its \
+                          answer back as this call's result. The child sees only the task text \
+                          you pass here -- none of this conversation's history, none of what \
+                          you have read so far. The child answers once, and that answer is what \
+                          comes back. It cannot spawn children of its own."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "Everything the child needs to know, stated in full: it \
+                                        cannot see what you have seen. End it with what to \
+                                        return -- the answer, the finding, the file and lines."
+                    }
+                },
+                "required": ["task"]
+            }),
+            implementation: ToolImplementation::Native(Arc::new(move |args| {
+                let llm = wiring.llm.clone();
+                let template = wiring.template.clone();
+                let tools = wiring.tools.clone();
+                let decider = wiring.decider.clone();
+                let roster = wiring.roster.clone();
+                let owner = wiring.owner.clone();
+                let session = wiring.session.clone();
+                let files_seen = wiring.files_seen.clone();
+                let mode = wiring.mode;
+                Box::pin(async move {
+                    let task = args
+                        .get("task")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if task.is_empty() {
+                        return Err(SFError::Validation(
+                            "a subagent needs the task stated in full; it sees nothing else".into(),
+                        ));
+                    }
+                    let Some(llm) = llm else {
+                        return Err(SFError::Agent(
+                            "this deployment has no model client for a child run".into(),
+                        ));
+                    };
+                    let Some(tools) = tools else {
+                        return Err(SFError::Agent(
+                            "this run has no tool table to hand a child".into(),
+                        ));
+                    };
+                    // 子任务的事件这一侧不读：它说的是子任务内部的进度，父会话要的
+                    // 是最后那一份。管道仍要有人排空——循环往一条没人读的管道里写，
+                    // 写满之后就会停在那里，而屏幕上只会显示「很慢」。
+                    let (events, mut received) = tokio::sync::mpsc::channel(SUBAGENT_EVENT_BUFFER);
+                    let drain =
+                        tokio::spawn(async move { while received.recv().await.is_some() {} });
+                    // 权限跟父这一轮同一个判定者、同一个模式：子任务动手之前问的
+                    // 是同一个人、同一段对话的规则。父子不共享的是上下文，不是
+                    // 谁有权点头——那两份分开，等于用一次分解绕开了人的决定。
+                    // 子任务有自己的一趟工作身份：文件清单按它取。多个子任务共用一个
+                    // 身份会把彼此的清单混在一起，而那是「谁看过什么」最不该含糊的一格。
+                    // 身份在建循环之前定：工具调用写事件时用的就是这个 agent_id。
+                    let unit = format!(
+                        "{}-sub-{}",
+                        template.agent_id,
+                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                    );
+                    let mut child_template = template.clone();
+                    child_template.agent_id = unit.clone();
+                    let mut child = crate::AgentRuntime::new(child_template, events)
+                        .with_tools(tools.fork())
+                        .with_permissions(decider, mode)
+                        // 这一发的钱记在同一段会话名下：会话合计是按这一列折叠出来
+                        // 的，子任务不挂这一格，那几发只数得进按人 / 按环境的总数，
+                        // 屏幕上「这段会话花了多少」就会比它下面每一轮加起来少。
+                        .with_call_session(session)
+                        // 没有身份的连接不声明人：编一个名字会读成真有人花过这笔钱。
+                        .with_call_identity(owner, cog_core::LlmOrigin::Interactive.as_str());
+                    // 名册交给子任务：它要读到自己那一行（工号与名字）才答得出
+                    // 「我是谁」，而这一行属于父这一轮持有的租约，不是新的人。
+                    if let Some(roster) = roster {
+                        child = child.with_roster(roster);
+                    }
+                    let outcome = child
+                        .run_conversation(vec![cog_core::Message::user(task)], llm.as_ref())
+                        .await;
+                    drain.abort();
+                    let value = outcome?;
+                    // 子任务的交付物与父的一轮同形：`reply` 是它说出口的那一句。
+                    // 拿不到 `reply` 时整份交回去——一个有结构的答案比丢掉它好。
+                    let answer = value.get("reply").cloned().unwrap_or_else(|| value.clone());
+                    // 「看过哪些文件」从子任务自己的 tool_call 事实里取；没接读口时是
+                    // `null` 而不是 `[]`——「这个部署没接读口」与「这一趟没看过文件」
+                    // 是两件事，用 `[]` 写前者会让后者永远读成零。
+                    let files = match files_seen.as_ref() {
+                        Some(port) => match port.files_for(&unit).await {
+                            Ok(list) => serde_json::json!(list),
+                            Err(e) => {
+                                tracing::warn!(
+                                    unit = %unit,
+                                    error = %e,
+                                    "子任务看过哪些文件读不出来；交回值里这一格留空"
+                                );
+                                serde_json::Value::Null
+                            }
+                        },
+                        None => serde_json::Value::Null,
+                    };
+                    Ok(serde_json::json!({
+                        "subagent": true,
+                        "result": answer,
+                        "files": files,
+                        "usage": value.get("usage").cloned().unwrap_or(serde_json::Value::Null),
+                    }))
                 })
             })),
         }
@@ -3900,6 +4812,7 @@ pub mod builtins {
     fn start_task_filing(
         args: &serde_json::Value,
         caller: Option<&str>,
+        intent_id: Option<&str>,
     ) -> SFResult<StartTaskFiling> {
         let goal = args
             .get("goal")
@@ -3923,7 +4836,7 @@ pub mod builtins {
                     .map(str::to_string)
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         // Refused here as well as at the door, and with the reason a submitter
         // can act on: the row is filed as already decided, so no planner ever
         // runs on it to state what done means. The door would refuse it too;
@@ -3944,16 +4857,18 @@ pub mod builtins {
         // around work, not around a role.
         let goal_id = optional_label(args, "goal_id")
             .unwrap_or_else(|| format!("agent-goal-{}", uuid::Uuid::new_v4()));
-        // Zero is refused rather than read as "no limit": the over-budget sweep
-        // compares the row's age against this number, so a zero would fail the
-        // row before it ever ran while the caller read a success.
-        let timeout_seconds = match args.get("timeout_seconds") {
+        // Zero is refused rather than read as "no limit": the number is the
+        // declaration a reader sizes its own patience from, so a zero would
+        // hand every reader the smallest budget there is while the caller read
+        // a success.
+        let declared_duration_seconds = match args.get("declared_duration_seconds") {
             Some(value) => value.as_u64().filter(|secs| *secs > 0).ok_or_else(|| {
                 SFError::Validation(
-                    "`timeout_seconds` has to be a positive whole number of seconds".into(),
+                    "`declared_duration_seconds` has to be a positive whole number of seconds"
+                        .into(),
                 )
             })?,
-            None => DEFAULT_WORK_ITEM_TIMEOUT_SECS,
+            None => DEFAULT_WORK_ITEM_DECLARED_SECS,
         };
         // The row has to land in the workspace the platform reads, and the
         // loops run in a process that is not told it by any config section it
@@ -3974,34 +4889,57 @@ pub mod builtins {
         if let Some(assignee) = assignee.as_deref() {
             input["agent_id"] = serde_json::json!(assignee);
         }
-        let mut row = serde_json::json!({
-            "id": task_id,
-            "task_type": cog_core::contract::work_item::PLATFORM_AGENT_TASK,
-            "input": input,
-            "timeout_seconds": timeout_seconds,
+        // 谁提的：与 A2A 同一种写法（`origin`），读面不必按入口分叉。空串是
+        // 「这条连接没有身份」，不是编一个匿名的人。
+        input["origin"] = serde_json::json!({
+            "source": "internal_tool",
+            "said_by": caller.unwrap_or_default(),
+            "addressed_to": assignee.clone().unwrap_or_default(),
         });
-        // The caller is stating the work as already decided. Without this the
-        // row goes through decomposition, which would spend a planning call to
-        // restate what the caller already said. The field is read under the
-        // planner role's own name: a second spelling here would be a field the
-        // door never looks at, and the row would be planned anyway.
-        row[cog_core::roles::PLANNER] = serde_json::json!({
-            "verified": true,
-            "source": "user_provided",
-        });
+        // 三格是这次的活的终态、现在、差距。缺一格就不写：把两格写进去，
+        // 读的人会以为第三格是「没有差距」，而它只是没人写。
+        let mut cells: Option<(String, String, String)> = None;
+        match (
+            optional_label(args, "terminal"),
+            optional_label(args, "now"),
+            optional_label(args, "gap"),
+        ) {
+            (None, None, None) => {}
+            (Some(terminal), Some(now), Some(gap)) => {
+                cells = Some((terminal, now, gap));
+            }
+            _ => {
+                return Err(SFError::Validation(
+                    "terminal, now and gap must be supplied together: two cells cannot say what \
+                     the third would have said"
+                        .into(),
+                ))
+            }
+        }
+        if let Some(intent_id) = intent_id {
+            input["intent_id"] = serde_json::json!(intent_id);
+        }
+        // 行的形状与请求体只在契约层拼一次：三个入口交出同一个形状，读的人不必
+        // 按入口分叉。
+        let cell_refs = cells
+            .as_ref()
+            .map(|(terminal, now, gap)| (terminal.as_str(), now.as_str(), gap.as_str()));
+        let mut row = cog_core::contract::task_door::task_door_row(
+            &task_id,
+            cog_core::contract::work_item::PLATFORM_AGENT_TASK,
+            input,
+            cell_refs,
+            declared_duration_seconds,
+            true,
+        );
         if let Some(assignee) = assignee.as_deref() {
             row["agent_id"] = serde_json::json!(assignee);
         }
         if let Some(venue) = venue.as_deref() {
             row["venue"] = serde_json::json!(venue);
         }
-        let body = serde_json::json!({
-            "goal_id": goal_id.clone(),
-            "goal": goal,
-            "workspace_id": workspace,
-            "intent_kind": "task",
-            "tasks": [row],
-        });
+        let body =
+            cog_core::contract::task_door::task_door_body(&goal_id, goal, &workspace, vec![row]);
         Ok(StartTaskFiling {
             body,
             goal_id,
@@ -4153,15 +5091,11 @@ pub mod builtins {
         backend: &dyn cog_core::MessageBackend,
         stream: &str,
         reader: &mut cog_core::MessageStream,
-        args: &serde_json::Value,
+        timeout_ms: u64,
     ) -> Waited {
         let started = std::time::Instant::now();
-        let timeout = Duration::from_millis(
-            args["timeout_ms"]
-                .as_u64()
-                .unwrap_or(ASK_DEFAULT_TIMEOUT_MS)
-                .clamp(1, ASK_MAX_TIMEOUT_MS),
-        );
+        let timeout = Duration::from_millis(timeout_ms);
+        // wall: 等=子智能体的下一段答复 / 等不到=按超时收尾，这一问放弃 / 续跑=能，调用方再问一次
         let first = tokio::time::timeout(timeout, reader.next()).await;
         let waited = started.elapsed();
 
@@ -4220,24 +5154,809 @@ pub mod builtins {
         }
     }
 
-    pub fn search_code() -> Tool {
+    /// 这些工具的答案取决于「我脚下的那棵树现在长什么样」，所以它们在员工自己
+    /// 的工作树里执行，不在主进程的树上。
+    ///
+    /// 搜索、`git status/diff`、打补丁若在本进程跑，读到的是一份与调用者无关的
+    /// 源码，而结果看起来完全正常——这是最坏的一种错：它对得上问题，只是对不上
+    /// 那棵树。所以它们与 `run_command` 走同一个后端、同一份身份：这一轮接的活
+    /// 选树，没有活时才是 agent id 自己那棵（见 [`cog_core::checkout_lane`]）。
+    ///
+    /// 后端缺席时工具照常注册、调用时报出缺的那一层。把工具从表里拿掉，「这个
+    /// 进程没有执行器」就会读成「没有搜索」——两者该做的补救完全不同。
+    #[derive(Clone)]
+    pub struct SandboxTools {
+        backend: Option<Arc<dyn SandboxBackend>>,
+    }
+
+    impl SandboxTools {
+        pub fn new(backend: Option<Arc<dyn SandboxBackend>>) -> Self {
+            Self { backend }
+        }
+    }
+
+    /// 一条命令在员工树下跑完的完整结果。
+    struct ShellReply {
+        stdout: String,
+        stderr: String,
+        code: i32,
+        workdir: Option<String>,
+    }
+
+    /// 在员工自己的工作树里跑一条命令。
+    ///
+    /// 与 `run_command` 的差别只在命令由工具自己拼：身份那一侧两者一样，否则
+    /// 同一次运行里 `grep` 搜的树和 `run_command` 写进去的树会是两棵。
+    async fn run_in_checkout(
+        tools: &SandboxTools,
+        tool: &str,
+        command: String,
+    ) -> SFResult<ShellReply> {
+        let backend = tools.backend.clone().ok_or_else(|| {
+            SFError::Agent(format!(
+                "SandboxBackend not configured for {tool}: this process holds no executor, so \
+                 there is no checkout to run it in"
+            ))
+        })?;
+        let caller = caller_agent_id();
+        // 归属与选树各取一处已有的派生：任务号用 `sandbox_task_id`（与 shell
+        // 工具同一个口径：有调用者就是它的车道，没有就是一次性的无主名字），
+        // agent id 决定落在哪棵树。两边各拼一遍会让同一次运行里搜索与命令报出
+        // 两个不同的归属。
+        let task_id = sandbox_task_id(None);
+        let agent_id = caller.unwrap_or_else(|| format!("unscoped-tool-{tool}"));
+        let req = SandboxRequest {
+            task_id,
+            agent_id,
+            payload: SandboxPayload::Command { command },
+            input: serde_json::Value::Null,
+            limits: Default::default(),
+        };
+        let result = backend.execute(&req).await?;
+        Ok(ShellReply {
+            stdout: result.stdout,
+            stderr: result.stderr,
+            code: result.exit_code,
+            workdir: result.workdir,
+        })
+    }
+
+    /// 把一段文本安全地放进 `sh -c` 的命令行：单引号里什么都不展开，文本里
+    /// 的单引号自己闭合再打开。
+    ///
+    /// 不用双引号：`$`、反引号、反斜杠在双引号里仍然有含义，而调用方给的
+    /// 是搜索词的原文，不是 shell 程序。
+    fn sh_quote(text: &str) -> String {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
+
+    /// 一张待办清单最多几行。
+    // cap: fixed — 清单是给这一轮运行看的；再长就不是清单而是账，而账在别处
+    // keep: 删掉后清单无界，一次运行把整本账塞进提示，白花 token；由「清单只给这一轮看」兜住
+    const TODO_MAX_ITEMS: usize = 50;
+
+    /// 进程里同时留几张清单。
+    // cap: fixed — 清单的寿命是一轮运行；留着不再动的那几张只是内存，不服务任何人
+    // keep: 删掉后不再动的清单一直占内存；由「清单寿命是一轮运行」兜住
+    const TODO_MAX_LISTS: usize = 64;
+
+    /// 调用方自己说的一次要几条；没说就是不设条数界。
+    ///
+    /// 平台不替它拍一个条数上限：能回多少由运行时把整条结果裁进窗口那一步
+    /// 决定（并归档全文、给出引用）。调用方说「只要这么多」时照办——那是一个
+    /// 具体的请求，不是平台替它做的决定。
+    fn asked_entries(args: &serde_json::Value) -> Option<usize> {
+        args.get("max_results")
+            .and_then(|v| v.as_u64())
+            .map(|n| (n as usize).max(1))
+    }
+
+    /// 拼一条 `grep -rnI` 命令。
+    ///
+    /// 命令里不接 `head`：截断只有一个地方做——运行时把结果裁进上下文那一
+    /// 步，它同时把全文归档成一条引用。工具这边先截一刀，被截掉的尾部就
+    /// 再也没人见过，归档到的也只是截过的那份。
+    fn grep_command(
+        pattern: &str,
+        path: &str,
+        include: Option<&str>,
+        fixed: bool,
+        ignore_case: bool,
+    ) -> String {
+        // `.git` 是仓库自己的账本，不是这棵树的内容：搜进去只会把配置、日志
+        // 与最近一次提交说明混进结果里。
+        let mut command = String::from("grep -rnI --exclude-dir=.git");
+        if fixed {
+            command.push_str(" -F");
+        }
+        if ignore_case {
+            command.push_str(" -i");
+        }
+        if let Some(include) = include {
+            command.push_str(&format!(" --include={}", sh_quote(include)));
+        }
+        command.push_str(&format!(" -e {} -- {}", sh_quote(pattern), sh_quote(path)));
+        command
+    }
+
+    /// 把 `path:line:text` 拆成三段。路径里可能带冒号，所以找的是「冒号后面
+    /// 全是数字再接一个冒号」的那个位置，而不是第一个冒号。
+    ///
+    /// `grep -r ... .` 回的是以 `./` 开头的路径；去掉它，因为模型拿到的路径
+    /// 是相对检出根的，而 `./src/a.rs` 与 `src/a.rs` 在它眼里是两个字符串。
+    fn split_grep_line(line: &str) -> Option<(String, u64, String)> {
+        for (index, ch) in line.char_indices() {
+            if ch != ':' {
+                continue;
+            }
+            let rest = &line[index + 1..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if digits.is_empty() {
+                continue;
+            }
+            if let Some(text) = rest[digits.len()..].strip_prefix(':') {
+                let number = digits.parse().ok()?;
+                let path = &line[..index];
+                let path = path.strip_prefix("./").unwrap_or(path);
+                return Some((path.to_string(), number, text.to_string()));
+            }
+        }
+        None
+    }
+
+    pub fn grep(tools: SandboxTools) -> Tool {
         Tool {
-            name: "search_code".into(),
-            description: "Search for code patterns in the codebase".into(),
+            name: "grep".into(),
+            description: "Search the files under the checkout for a regular expression and get \
+                          the matching lines back as `path:line:text`, the shape `grep -rn` \
+                          prints. Binary files and `.git` are skipped. `max_results` caps the \
+                          lines; without it the whole result comes back."
+                .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Search query" }
+                    "pattern": {
+                        "type": "string",
+                        "description": "Extended regular expression, as grep reads it; set fixed to search for the literal text instead"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory or file to search, relative to the checkout root; defaults to the whole checkout"
+                    },
+                    "include": {
+                        "type": "string",
+                        "description": "Only search files whose name matches this glob, e.g. \"*.rs\""
+                    },
+                    "fixed": {
+                        "type": "boolean",
+                        "description": "Treat the pattern as literal text rather than a regular expression"
+                    },
+                    "ignore_case": {
+                        "type": "boolean",
+                        "description": "Match case-insensitively"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "How many matching lines to return at most"
+                    }
+                },
+                "required": ["pattern"]
+            }),
+            implementation: ToolImplementation::Native(Arc::new(move |args| {
+                let tools = tools.clone();
+                Box::pin(async move {
+                    let pattern = args["pattern"]
+                        .as_str()
+                        .ok_or_else(|| SFError::Validation("pattern required".into()))?;
+                    let path = args["path"].as_str().unwrap_or(".");
+                    let include = args["include"].as_str();
+                    let fixed = args["fixed"].as_bool().unwrap_or(false);
+                    let ignore_case = args["ignore_case"].as_bool().unwrap_or(false);
+                    let command = grep_command(pattern, path, include, fixed, ignore_case);
+                    let reply = run_in_checkout(&tools, "grep", command).await?;
+                    let mut lines: Vec<&str> = reply.stdout.lines().collect();
+                    // 工具不截：整份答案原样交出去。超出一页的部分由运行时
+                    // 裁进上下文，先把全文归档、再在标记里给出引用——在工具这
+                    // 里先截一刀，被截掉的尾部就再也没人见过。
+                    let mut truncated = false;
+                    if let Some(asked) = asked_entries(&args) {
+                        if lines.len() > asked {
+                            lines.truncate(asked);
+                            truncated = true;
+                        }
+                    }
+                    let mut out = serde_json::json!({
+                        "matches": lines,
+                        "truncated": truncated,
+                    });
+                    if !reply.stderr.trim().is_empty() {
+                        out["stderr"] = serde_json::json!(reply.stderr);
+                    }
+                    if let Some(workdir) = reply.workdir {
+                        out["workdir"] = serde_json::json!(workdir);
+                    }
+                    Ok(out)
+                })
+            })),
+        }
+    }
+
+    pub fn search_code(tools: SandboxTools) -> Tool {
+        Tool {
+            name: "search_code".into(),
+            description: "Search the checkout for a regular expression and get the matches as \
+                          structured entries: one per match, each with the file, the line number \
+                          and the line's text. Files are searched from the checkout root; binary \
+                          files and `.git` are skipped."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Extended regular expression to search for"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory or file to search, relative to the checkout root; defaults to the whole checkout"
+                    },
+                    "include": {
+                        "type": "string",
+                        "description": "Only search files whose name matches this glob, e.g. \"*.rs\""
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "How many matches to return at most"
+                    }
                 },
                 "required": ["query"]
             }),
-            implementation: ToolImplementation::Native(Arc::new(|args| {
+            implementation: ToolImplementation::Native(Arc::new(move |args| {
+                let tools = tools.clone();
                 Box::pin(async move {
                     let query = args["query"]
                         .as_str()
-                        .ok_or_else(|| cog_core::SFError::Validation("query required".into()))?;
-                    // Placeholder - actual implementation would use ripgrep or similar
-                    Ok(serde_json::json!({ "results": [], "query": query }))
+                        .ok_or_else(|| SFError::Validation("query required".into()))?;
+                    let path = args["path"].as_str().unwrap_or(".");
+                    let include = args["include"].as_str();
+                    let command = grep_command(query, path, include, false, false);
+                    let reply = run_in_checkout(&tools, "search_code", command).await?;
+                    let lines: Vec<&str> = reply.stdout.lines().collect();
+                    // 同上：整份答案原样交出去，截断只由运行时那一步做。
+                    let mut truncated = false;
+                    let mut matches: Vec<serde_json::Value> = lines
+                        .iter()
+                        .filter_map(|line| {
+                            let (path, line_number, text) = split_grep_line(line)?;
+                            Some(serde_json::json!({
+                                "path": path,
+                                "line": line_number,
+                                "text": text,
+                            }))
+                        })
+                        .collect();
+                    if let Some(asked) = asked_entries(&args) {
+                        if matches.len() > asked {
+                            matches.truncate(asked);
+                            truncated = true;
+                        }
+                    }
+                    let mut out = serde_json::json!({
+                        "matches": matches,
+                        "truncated": truncated,
+                    });
+                    if !reply.stderr.trim().is_empty() {
+                        out["stderr"] = serde_json::json!(reply.stderr);
+                    }
+                    if let Some(workdir) = reply.workdir {
+                        out["workdir"] = serde_json::json!(workdir);
+                    }
+                    Ok(out)
+                })
+            })),
+        }
+    }
+
+    /// 一个路径是不是匹配这条 glob。
+    ///
+    /// 只有三种通配：`?` 一个非 `/` 字符、`*` 一段非 `/` 字符、`**` 任意字符
+    /// （含 `/`），`**/` 还可以匹配零个目录——所以 `**/*.rs` 既匹配 `a.rs` 也
+    /// 匹配 `src/a.rs`。模式对的是从检出根算起的整条路径，`*.rs` 只匹配根下的
+    /// 文件；这是 glob 的通行语义，也是「为什么它没找到 src 里的文件」最常见的
+    /// 那个误解，所以工具描述里写明。
+    fn glob_matches(pattern: &str, path: &str) -> bool {
+        let pattern: Vec<char> = pattern.chars().collect();
+        let path: Vec<char> = path.chars().collect();
+        let mut memo: HashMap<(usize, usize), bool> = HashMap::new();
+        fn walk(
+            pattern: &[char],
+            path: &[char],
+            i: usize,
+            j: usize,
+            memo: &mut HashMap<(usize, usize), bool>,
+        ) -> bool {
+            if let Some(hit) = memo.get(&(i, j)) {
+                return *hit;
+            }
+            let answer = if i == pattern.len() {
+                j == path.len()
+            } else if pattern[i] == '*' && pattern.get(i + 1) == Some(&'*') {
+                if pattern.get(i + 2) == Some(&'/') {
+                    // `**/`：零个目录，或者吃掉任意一段直到某个 `/`（含它）。
+                    walk(pattern, path, i + 3, j, memo)
+                        || (j..path.len())
+                            .any(|k| path[k] == '/' && walk(pattern, path, i + 3, k + 1, memo))
+                } else {
+                    walk(pattern, path, i + 2, j, memo)
+                        || (j < path.len() && walk(pattern, path, i, j + 1, memo))
+                }
+            } else if pattern[i] == '*' {
+                walk(pattern, path, i + 1, j, memo)
+                    || (j < path.len() && path[j] != '/' && walk(pattern, path, i, j + 1, memo))
+            } else if pattern[i] == '?' {
+                j < path.len() && path[j] != '/' && walk(pattern, path, i + 1, j + 1, memo)
+            } else {
+                j < path.len() && path[j] == pattern[i] && walk(pattern, path, i + 1, j + 1, memo)
+            };
+            memo.insert((i, j), answer);
+            answer
+        }
+        walk(&pattern, &path, 0, 0, &mut memo)
+    }
+
+    pub fn glob(tools: SandboxTools) -> Tool {
+        Tool {
+            name: "glob".into(),
+            description: "List the files in the checkout whose path matches a glob: `?` is one \
+                          character, `*` is any run of characters within one path segment, and \
+                          `**` crosses directories (`**/*.rs` matches `a.rs` and `src/a.rs`). \
+                          Patterns are matched against the whole path from the checkout root, so \
+                          `*.rs` names only files at the top. Tracked files and untracked files \
+                          that git does not ignore are both listed; ignored ones are not."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob to match against paths relative to the checkout root, e.g. \"crates/**/tests/*.rs\""
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "How many paths to return at most"
+                    }
+                },
+                "required": ["pattern"]
+            }),
+            implementation: ToolImplementation::Native(Arc::new(move |args| {
+                let tools = tools.clone();
+                Box::pin(async move {
+                    let pattern = args["pattern"]
+                        .as_str()
+                        .ok_or_else(|| SFError::Validation("pattern required".into()))?;
+                    let reply = run_in_checkout(
+                        &tools,
+                        "glob",
+                        "git ls-files --cached --others --exclude-standard".to_string(),
+                    )
+                    .await?;
+                    if reply.code != 0 {
+                        return Err(SFError::Agent(format!(
+                            "listing the checkout failed: {}",
+                            reply.stderr.trim()
+                        )));
+                    }
+                    let mut paths: Vec<&str> = reply
+                        .stdout
+                        .lines()
+                        .filter(|path| glob_matches(pattern, path))
+                        .collect();
+                    paths.sort_unstable();
+                    let mut truncated = false;
+                    if let Some(asked) = asked_entries(&args) {
+                        if paths.len() > asked {
+                            paths.truncate(asked);
+                            truncated = true;
+                        }
+                    }
+                    let mut out = serde_json::json!({
+                        "paths": paths,
+                        "truncated": truncated,
+                    });
+                    if let Some(workdir) = reply.workdir {
+                        out["workdir"] = serde_json::json!(workdir);
+                    }
+                    Ok(out)
+                })
+            })),
+        }
+    }
+
+    pub fn git_status(tools: SandboxTools) -> Tool {
+        Tool {
+            name: "git_status".into(),
+            description: "Show the checkout's branch and what has changed in it, in the short \
+                          form: one line per changed path, `??` for files git is not tracking, \
+                          and the first line names the branch."
+                .into(),
+            parameters: serde_json::json!({ "type": "object", "properties": {} }),
+            implementation: ToolImplementation::Native(Arc::new(move |_args| {
+                let tools = tools.clone();
+                Box::pin(async move {
+                    let reply = run_in_checkout(
+                        &tools,
+                        "git_status",
+                        "git status --short --branch".to_string(),
+                    )
+                    .await?;
+                    if reply.code != 0 {
+                        return Err(SFError::Agent(format!(
+                            "git status failed: {}",
+                            reply.stderr.trim()
+                        )));
+                    }
+                    let mut out = serde_json::json!({ "status": reply.stdout });
+                    if let Some(workdir) = reply.workdir {
+                        out["workdir"] = serde_json::json!(workdir);
+                    }
+                    Ok(out)
+                })
+            })),
+        }
+    }
+
+    pub fn git_diff(tools: SandboxTools) -> Tool {
+        Tool {
+            name: "git_diff".into(),
+            description: "Show what changed in the checkout as a unified diff. By default it \
+                          compares the working tree to the last commit; set staged to show \
+                          what a commit would record instead, and stat for the one-line-per-file \
+                          summary."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "staged": {
+                        "type": "boolean",
+                        "description": "Show the changes staged for the next commit rather than the working tree"
+                    },
+                    "stat": {
+                        "type": "boolean",
+                        "description": "Show only the summary of files changed, with line counts"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Limit the diff to this file or directory, relative to the checkout root"
+                    }
+                }
+            }),
+            implementation: ToolImplementation::Native(Arc::new(move |args| {
+                let tools = tools.clone();
+                Box::pin(async move {
+                    let mut command = String::from("git diff");
+                    if args["staged"].as_bool().unwrap_or(false) {
+                        command.push_str(" --staged");
+                    }
+                    if args["stat"].as_bool().unwrap_or(false) {
+                        command.push_str(" --stat");
+                    }
+                    if let Some(path) = args["path"].as_str() {
+                        command.push_str(&format!(" -- {}", sh_quote(path)));
+                    }
+                    let reply = run_in_checkout(&tools, "git_diff", command).await?;
+                    if reply.code != 0 {
+                        return Err(SFError::Agent(format!(
+                            "git diff failed: {}",
+                            reply.stderr.trim()
+                        )));
+                    }
+                    // 整份 diff 原样交出去，不在工具里截：运行时会把超出一页
+                    // 的部分先归档成一条引用，再裁进上下文。工具先截一刀，被
+                    // 截掉的尾部就没有第二个人见过。
+                    let mut out = serde_json::json!({ "diff": reply.stdout });
+                    if let Some(workdir) = reply.workdir {
+                        out["workdir"] = serde_json::json!(workdir);
+                    }
+                    Ok(out)
+                })
+            })),
+        }
+    }
+
+    pub fn git_commit(
+        tools: SandboxTools,
+        roster: Option<Arc<dyn cog_core::AgentRegistry>>,
+    ) -> Tool {
+        Tool {
+            name: "git_commit".into(),
+            description: "Commit the checkout's changes on the branch it is on. Pass paths to \
+                          stage them first; without paths, what is already staged is committed. \
+                          The commit is signed by you -- your employee name and id are the \
+                          author -- so the history says who made the change. It answers with the \
+                          new commit's id."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "The commit message; state what changed and why it had to"
+                    },
+                    "paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Paths to stage before committing, relative to the checkout root; omit to commit what is already staged"
+                    }
+                },
+                "required": ["message"]
+            }),
+            implementation: ToolImplementation::Native(Arc::new(move |args| {
+                let tools = tools.clone();
+                let roster = roster.clone();
+                Box::pin(async move {
+                    let message = args["message"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|m| !m.is_empty())
+                        .ok_or_else(|| SFError::Validation("message required".into()))?;
+                    let caller = caller_agent_id();
+                    let id = caller.clone().unwrap_or_else(|| "unattributed".to_string());
+                    // 署名取自主名册的那一行（`E0412 林清和`）：提交历史里该出现
+                    // 的是这个人，而不是一串节点名。名册读不到时退回 id——写上
+                    // id 仍然指得出是谁，编一个名字则指到一个不存在的人。
+                    let name = match (caller.as_deref(), roster.as_ref()) {
+                        (Some(caller), Some(roster)) => roster
+                            .employee(caller)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|record| record.label())
+                            .filter(|label| !label.trim().is_empty())
+                            .unwrap_or_else(|| caller.to_string()),
+                        (Some(caller), None) => caller.to_string(),
+                        (None, _) => id.clone(),
+                    };
+                    let mut command = String::new();
+                    if let Some(paths) = args["paths"].as_array() {
+                        let quoted: Vec<String> = paths
+                            .iter()
+                            .filter_map(|p| p.as_str().map(sh_quote))
+                            .collect();
+                        if !quoted.is_empty() {
+                            command.push_str(&format!("git add -- {} && ", quoted.join(" ")));
+                        }
+                    }
+                    command.push_str(&format!(
+                        "git -c user.name={} -c user.email={} commit -m {} && git rev-parse HEAD",
+                        sh_quote(&name),
+                        sh_quote(&format!("{id}@cogneva.invalid")),
+                        sh_quote(message)
+                    ));
+                    let reply = run_in_checkout(&tools, "git_commit", command).await?;
+                    if reply.code != 0 {
+                        return Err(SFError::Agent(format!(
+                            "the commit did not happen: {}",
+                            reply.stderr.trim()
+                        )));
+                    }
+                    let commit = reply.stdout.lines().last().unwrap_or("").trim().to_string();
+                    Ok(serde_json::json!({
+                        "commit": commit,
+                        "author": name,
+                        "output": reply.stdout,
+                    }))
+                })
+            })),
+        }
+    }
+
+    pub fn apply_patch(tools: SandboxTools) -> Tool {
+        Tool {
+            name: "apply_patch".into(),
+            description: "Apply a unified diff to the checkout, the way `git apply` does: the \
+                          patch has to name the files it changes with `---`/`+++` headers and \
+                          apply cleanly to what is on disk. A patch that does not apply is \
+                          refused whole -- nothing is half-applied."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "patch": {
+                        "type": "string",
+                        "description": "The unified diff to apply, exactly as git format-patch or git diff prints it"
+                    }
+                },
+                "required": ["patch"]
+            }),
+            implementation: ToolImplementation::Native(Arc::new(move |args| {
+                let tools = tools.clone();
+                Box::pin(async move {
+                    let patch = args["patch"]
+                        .as_str()
+                        .filter(|p| !p.trim().is_empty())
+                        .ok_or_else(|| SFError::Validation("patch required".into()))?;
+                    // 补丁走标准输入，不落盘：写进来再删会让它在 `git status` 里
+                    // 出现一瞬间，而那一刻正好可能被另一次调用读到。分隔符带随机
+                    // 串，补丁正文里不可能有一行与它相同。
+                    let delimiter = format!("COGNEVA_PATCH_{}", uuid::Uuid::new_v4().simple());
+                    let body = if patch.ends_with('\n') {
+                        patch.to_string()
+                    } else {
+                        format!("{patch}\n")
+                    };
+                    let command =
+                        format!("git apply --whitespace=nowarn <<'{delimiter}'\n{body}{delimiter}");
+                    let reply = run_in_checkout(&tools, "apply_patch", command).await?;
+                    if reply.code != 0 {
+                        return Err(SFError::Agent(format!(
+                            "the patch did not apply: {}",
+                            reply.stderr.trim()
+                        )));
+                    }
+                    Ok(serde_json::json!({ "applied": true }))
+                })
+            })),
+        }
+    }
+
+    /// 一位调用者的一行待办。
+    #[derive(Clone)]
+    struct TodoItem {
+        content: String,
+        status: String,
+    }
+
+    /// 一本账：每位调用者一张清单，各带最后一次写入的时刻——满了要丢的时候，
+    /// 丢的是最久没人动的那张，而不是随便一张。
+    type TodoBook = HashMap<String, (std::time::Instant, Vec<TodoItem>)>;
+
+    fn todo_book() -> &'static std::sync::Mutex<TodoBook> {
+        static BOOK: std::sync::OnceLock<std::sync::Mutex<TodoBook>> = std::sync::OnceLock::new();
+        BOOK.get_or_init(Default::default)
+    }
+
+    /// 把一份计划递给人批准。只在 plan 模式下注册：别的模式里它没有可批准的东西，
+    /// 挂在工具表上只会让模型多试一次拿不到结果的调用。
+    ///
+    /// 工具本身不做事——它被调用就说明人已经点了头（问人那一步在循环里），这里只是
+    /// 把「批准了」这句话交回模型，并告诉它这一轮已经从只读换成了动手。
+    pub fn exit_plan_mode() -> Tool {
+        Tool {
+            name: crate::permission::EXIT_PLAN_TOOL.into(),
+            description: "Hand the plan to the person for approval and, once they approve, \
+                          carry it out. It does nothing by itself -- while the plan is \
+                          unapproved every tool that writes or runs anything is refused."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "plan": {
+                        "type": "string",
+                        "description": "The plan, in the person's language, as the steps you \
+                                        will take and the check that will show they worked."
+                    }
+                },
+                "required": ["plan"]
+            }),
+            implementation: ToolImplementation::Native(Arc::new(|args| {
+                Box::pin(async move {
+                    let plan = args["plan"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|plan| !plan.is_empty())
+                        .ok_or_else(|| {
+                            SFError::Validation(
+                                "plan required: the person is asked to approve what you write here"
+                                    .into(),
+                            )
+                        })?;
+                    Ok(serde_json::json!({
+                        "approved": true,
+                        "mode": "default",
+                        "note": "The person approved this plan. This turn may now change \
+                                 things; tools that do so still ask unless they are already \
+                                 covered by a rule.",
+                        "plan": plan,
+                    }))
+                })
+            })),
+        }
+    }
+
+    pub fn todo() -> Tool {
+        Tool {
+            name: "todo".into(),
+            description: "Record the plan for this piece of work as a list of items with a \
+                          status each (`pending`, `in_progress`, `done`), replacing the list \
+                          wholesale. The answer repeats the list with the counts, so the state \
+                          is read back rather than remembered. It lives with this process, not \
+                          in the checkout -- a restart forgets it, and nothing is committed."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "maxItems": TODO_MAX_ITEMS,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": { "type": "string" },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "done"]
+                                }
+                            },
+                            "required": ["content", "status"]
+                        }
+                    }
+                },
+                "required": ["items"]
+            }),
+            implementation: ToolImplementation::Native(Arc::new(|args| {
+                Box::pin(async move {
+                    let items = args["items"].as_array().ok_or_else(|| {
+                        SFError::Validation("items required: an array of {content, status}".into())
+                    })?;
+                    if items.len() > TODO_MAX_ITEMS {
+                        return Err(SFError::Validation(format!(
+                            "the list has {} items and this process keeps at most {TODO_MAX_ITEMS}: \
+                             a list longer than that is a ledger, and the ledger is elsewhere",
+                            items.len()
+                        )));
+                    }
+                    let mut parsed = Vec::with_capacity(items.len());
+                    for item in items {
+                        let content = item["content"]
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|c| !c.is_empty())
+                            .ok_or_else(|| {
+                                SFError::Validation("every item needs content".into())
+                            })?;
+                        let status = item["status"].as_str().unwrap_or("pending");
+                        if !matches!(status, "pending" | "in_progress" | "done") {
+                            return Err(SFError::Validation(format!(
+                                "unknown status {status:?}: use pending, in_progress or done"
+                            )));
+                        }
+                        parsed.push(TodoItem {
+                            content: content.to_string(),
+                            status: status.to_string(),
+                        });
+                    }
+                    let key = caller_agent_id().unwrap_or_else(|| "unattributed".to_string());
+                    let book = todo_book();
+                    let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
+                    if book.len() >= TODO_MAX_LISTS && !book.contains_key(&key) {
+                        // 满了就丢掉最久没人写的那张：清单的寿命是这一轮运行，留着
+                        // 一张已经没人写的，也只是内存。
+                        if let Some(oldest) = book
+                            .iter()
+                            .min_by_key(|(_, (written, _))| *written)
+                            .map(|(owner, _)| owner.clone())
+                        {
+                            book.remove(&oldest);
+                        }
+                    }
+                    book.insert(key, (std::time::Instant::now(), parsed.clone()));
+                    let counts =
+                        |status: &str| parsed.iter().filter(|i| i.status == status).count();
+                    Ok(serde_json::json!({
+                        "items": parsed
+                            .iter()
+                            .map(|item| serde_json::json!({
+                                "content": item.content,
+                                "status": item.status,
+                            }))
+                            .collect::<Vec<_>>(),
+                        "pending": counts("pending"),
+                        "in_progress": counts("in_progress"),
+                        "done": counts("done"),
+                    }))
                 })
             })),
         }
@@ -4295,8 +6014,7 @@ pub mod builtins {
     /// carrying the status and the API's own body, so a caller sees the refusal
     /// rather than an empty object.
     async fn get_json(client: &Arc<dyn HttpClient>, url: &str) -> SFResult<serde_json::Value> {
-        let mut req = HttpRequest::new("GET", url);
-        req.timeout_secs = Some(MEMORY_READ_TIMEOUT_SECS);
+        let req = HttpRequest::new("GET", url);
         let resp = client.execute(req).await?;
         if !resp.is_success() {
             return Err(SFError::Agent(format!(
@@ -4323,9 +6041,8 @@ pub mod builtins {
             name: "raw_list".into(),
             description: "List archived raw sources in the shared memory namespace, \
                           optionally filtered by content-type prefix. Each item carries its \
-                          content type, payload length and creation time so a caller can \
-                          choose what to read within its budget; call raw_fetch for the \
-                          bytes. Fails with an error when no memory API base is configured."
+                          content type, payload length and creation time. Fails with an error \
+                          when no memory API base is configured."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -4359,7 +6076,12 @@ pub mod builtins {
                         url.push_str(&query.join("&"));
                     }
                     let body = get_json(&client, &url).await?;
-                    let items = body["items"].as_array().cloned().unwrap_or_default();
+                    // `items` 就是这份清单本身。缺了它是这一份回话没读成，不是「这个
+                    // 命名空间里什么都没有」——折成空表，调用方会照着一个空命名空间
+                    // 行事，而真相是这份清单没读成。
+                    let items = body["items"].as_array().cloned().ok_or_else(|| {
+                        SFError::Agent(format!("memory API listing has no items array: {body}"))
+                    })?;
                     let mut out = serde_json::json!({
                         "namespace": DEFAULT_MEMORY_NAMESPACE,
                         "count": items.len(),
@@ -4412,7 +6134,7 @@ pub mod builtins {
                     "id": { "type": "string", "description": "Raw source id" },
                     "budget": {
                         "type": "integer",
-                        "description": "Maximum payload bytes to move (default 262144)"
+                        "description": "Max payload bytes; whole segment if omitted"
                     }
                 },
                 "required": ["id"]
@@ -4434,15 +6156,19 @@ pub mod builtins {
                     let base = memory_base(base.as_deref())?;
                     let client = memory_client(client)?;
                     let segment = encode_url_component(id);
-                    let budget = args["budget"]
-                        .as_u64()
-                        .unwrap_or(DEFAULT_RAW_FETCH_BUDGET_BYTES);
+                    // 不设默认：调用方没报名额就整段搬。传送量本身由存储那边的
+                    // 分段决定，这里不再替它挑一个数。
+                    let budget = args["budget"].as_u64();
 
                     let item_url =
                         format!("{base}{}", MEMORY_RAW_ITEM_PATH.replace("{id}", &segment));
                     let meta = get_json(&client, &item_url).await?;
-                    let payload_length = meta["payload_length"].as_u64().unwrap_or(0);
-                    if payload_length > budget {
+                    // 没有 `payload_length`，名额就无从判起。折成 0 等于把调用方的预算
+                    // 整段关掉：结果里写着「没超预算」，而拿回来的是没有上限的一整段。
+                    let payload_length = meta["payload_length"].as_u64().ok_or_else(|| {
+                        SFError::Agent(format!("memory API metadata has no payload_length: {meta}"))
+                    })?;
+                    if let Some(budget) = budget.filter(|budget| payload_length > *budget) {
                         // The budget did its job: hand back an outcome a caller
                         // cannot mistake for the bytes, and count it so the
                         // bounded read is visible outside the tool result.
@@ -4531,8 +6257,8 @@ pub mod builtins {
                         .as_str()
                         .unwrap_or("GET")
                         .to_ascii_uppercase();
+                    // 时限走客户端配置：这里不另写一个秒数，那个数属于部署。
                     let mut req = cog_core::HttpRequest::new(method, url);
-                    req.timeout_secs = Some(30);
                     if let Some(headers) = args["headers"].as_object() {
                         for (k, v) in headers {
                             if let Some(v) = v.as_str() {
@@ -4605,8 +6331,8 @@ pub mod builtins {
         let authority = after_scheme
             .split(['/', '?', '#'])
             .next()
-            .unwrap_or_default();
-        let host_port = authority.rsplit('@').next().unwrap_or_default();
+            .unwrap_or(Default::default());
+        let host_port = authority.rsplit('@').next().unwrap_or(Default::default());
         let host = if let Some(rest) = host_port.strip_prefix('[') {
             rest.split(']').next().unwrap_or_default().to_string()
         } else {
@@ -4624,7 +6350,297 @@ pub mod builtins {
         use super::*;
 
         fn filing(args: serde_json::Value) -> SFResult<StartTaskFiling> {
-            start_task_filing(&args, Some("agent-caller"))
+            start_task_filing(&args, Some("agent-caller"), None)
+        }
+
+        /// 属主会话交出来的活带三格，任务行也带这条意图的身份；缺一格就拒。
+        #[test]
+        fn a_filing_carries_the_three_cells_and_the_intent() {
+            let filed = start_task_filing(
+                &serde_json::json!({
+                    "goal": "把门禁的归属改回来",
+                    "acceptance": ["跑一次门"],
+                    "terminal": "门禁只认它判的那个对象",
+                    "now": "门禁仍认最后写它的那一方",
+                    "gap": "还差把归属改回判定对象",
+                }),
+                Some("agent-caller"),
+                Some("chat:s1:abc"),
+            )
+            .expect("a complete three-cell filing files");
+            let row = &filed.body["tasks"][0];
+            assert_eq!(row["input"]["intent_id"], "chat:s1:abc");
+            // 三格随行交，是任务的一等字段，不再塞进 input 的开集载荷。
+            assert_eq!(row["terminal"], "门禁只认它判的那个对象");
+            assert_eq!(row["now"], "门禁仍认最后写它的那一方");
+            assert_eq!(row["gap"], "还差把归属改回判定对象");
+            assert!(row["input"].get("ledger_item").is_none());
+            assert_eq!(row["id"].as_str(), Some(filed.task_id.as_str()));
+        }
+
+        #[test]
+        fn a_filing_with_only_some_of_the_three_cells_is_refused() {
+            let refused = start_task_filing(
+                &serde_json::json!({
+                    "goal": "把门禁的归属改回来",
+                    "acceptance": ["跑一次门"],
+                    "terminal": "门禁只认它判的那个对象",
+                }),
+                Some("agent-caller"),
+                None,
+            );
+            assert!(refused.is_err());
+        }
+
+        /// 归属写在行上：与 A2A 同一个键（`input.origin`），入口不同而读面不必分叉。
+        #[test]
+        fn a_filed_task_carries_who_filed_it() {
+            let filed = filing(serde_json::json!({
+                "goal": "把这批门禁的归属改回它判的那个对象",
+                "acceptance": ["跑一次门"],
+            }))
+            .expect("a well-formed call files");
+            let origin = &filed.body["tasks"][0]["input"]["origin"];
+            assert_eq!(origin["source"], "internal_tool");
+            assert_eq!(origin["said_by"], "agent-caller");
+            assert_eq!(origin["addressed_to"], "");
+        }
+
+        /// 任务读口的替身：每一条等待都回同一个状态词。
+        ///
+        /// 与顶层的 `StubHttp` 分开写：那一只回答的是「请求到了没有」，这一只
+        /// 回答的是「那一行走到了哪」——两种替身回答的是不同的问题，共用一个
+        /// 只会让两边的判据都变松。
+        #[derive(Debug)]
+        struct TaskReading(&'static str);
+
+        #[async_trait::async_trait]
+        impl cog_core::HttpClient for TaskReading {
+            async fn execute(
+                &self,
+                _req: cog_core::HttpRequest,
+            ) -> SFResult<cog_core::HttpResponse> {
+                let body = serde_json::json!({
+                    "id": "task-1",
+                    "status": self.0,
+                    "result": { "said": "the work is done" },
+                    "agent_id": "agent-b",
+                });
+                Ok(cog_core::HttpResponse {
+                    status: 200,
+                    headers: Default::default(),
+                    body: serde_json::to_vec(&body).map_err(SFError::Serialization)?,
+                })
+            }
+        }
+
+        async fn wait_on(status: &'static str) -> serde_json::Value {
+            let tool = await_task(
+                Some(Arc::new(TaskReading(status))),
+                Some("http://gateway:8081".into()),
+            );
+            let ToolImplementation::Native(run) = &tool.implementation else {
+                panic!("await_task is native");
+            };
+            run(serde_json::json!({ "task_id": "task-1", "timeout_ms": 1_000 }))
+                .await
+                .expect("the read door answered")
+        }
+
+        /// 等到了头、没等到头、到了头但是失败——三种答案三句话。
+        ///
+        /// 「没在时限内答」与「对方没做完」是两件事：把前者说成后者，等的人会
+        /// 把活再派一遍；把后者说成前者，等的人会一直等一条已经不会再动的行。
+        #[tokio::test]
+        async fn an_ended_wait_and_a_timed_out_wait_are_different_answers() {
+            let done = wait_on("completed").await;
+            assert_eq!(done["task_completed"], serde_json::json!(true));
+            assert_eq!(done["status"], serde_json::json!("completed"));
+            assert!(
+                done.get("reason").is_none(),
+                "走到了头的等待没有「没等到」这一说：{done}"
+            );
+
+            let running = wait_on("running").await;
+            assert_eq!(running["task_completed"], serde_json::json!(false));
+            assert_eq!(
+                running["reason"],
+                serde_json::json!("timeout"),
+                "没在时限内答必须明说自己是超时：{running}"
+            );
+            let hint = running["hint"].as_str().unwrap_or(Default::default());
+            assert!(
+                hint.contains("still"),
+                "超时那一句要说明这一行可能还在跑，而不是没做完：{hint}"
+            );
+            assert_eq!(running["status"], serde_json::json!("running"));
+
+            let failed = wait_on("failed").await;
+            assert_eq!(failed["task_completed"], serde_json::json!(false));
+            assert!(
+                failed.get("reason").is_none(),
+                "失败是走到了头，不是没等到：{failed}"
+            );
+        }
+
+        /// 一个只会说一句话的模型：记住它看见的提示词，回一句固定的答案。
+        #[derive(Debug, Default)]
+        struct Says {
+            seen: std::sync::Mutex<Vec<Vec<cog_core::Message>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl cog_core::LlmClient for Says {
+            async fn chat_stream(
+                &self,
+                messages: &[cog_core::Message],
+                _options: &cog_core::ChatOptions,
+            ) -> SFResult<cog_core::AssistantMessageEventStream> {
+                self.seen.lock().unwrap().push(messages.to_vec());
+                let (stream, producer) = cog_core::EventStream::with_capacity(4);
+                tokio::spawn(async move {
+                    let mut producer = producer;
+                    // 对话里模型的正文就是答案本身，不是一道协议信封：子任务
+                    // 交回来的那一份也只该是这句话。
+                    let said = "child answer";
+                    let _ = producer
+                        .push(cog_core::AssistantMessageEvent::TextDelta {
+                            content_index: 0,
+                            delta: said.into(),
+                            timestamp: chrono::Utc::now(),
+                        })
+                        .await;
+                    producer.end(cog_core::ChatResponse {
+                        content: vec![cog_core::ContentBlock::Text {
+                            text: said.into(),
+                            text_signature: None,
+                        }],
+                        api: "mock".into(),
+                        provider: "mock".into(),
+                        model: "mock".into(),
+                        response_id: None,
+                        usage: cog_core::Usage::default(),
+                        stop_reason: cog_core::StopReason::Stop,
+                        error_message: None,
+                        upstream_failure: None,
+                        retry_after_secs: None,
+                        timestamp: chrono::Utc::now(),
+                    });
+                });
+                Ok(stream)
+            }
+
+            async fn complete_stream(
+                &self,
+                _prompt: &str,
+                _options: &cog_core::CompleteOptions,
+            ) -> SFResult<cog_core::AssistantMessageEventStream> {
+                unimplemented!()
+            }
+
+            async fn chat(
+                &self,
+                _messages: &[cog_core::Message],
+                _options: &cog_core::ChatOptions,
+            ) -> SFResult<cog_core::ChatResponse> {
+                unimplemented!()
+            }
+
+            async fn health_check(&self) -> bool {
+                true
+            }
+        }
+
+        /// 子任务只看见交给它的那一句、只答一次、结果以这一次调用回来；而它手上
+        /// 的那张工具表是父表**在装上它自己之前**的副本——父子深度就是一。
+        #[tokio::test]
+        async fn a_subagent_sees_only_its_task_and_answers_once() {
+            let says = Arc::new(Says::default());
+            let llm: Arc<dyn cog_core::LlmClient> =
+                Arc::clone(&says) as Arc<dyn cog_core::LlmClient>;
+            let parent = ToolRegistry::new();
+            cog_core::ToolRegistry::register(&parent, read_file());
+            // 复制发生在装 `spawn_subagent` 之前：子任务拿不到它自己。
+            let exported = Arc::new(parent.fork());
+            cog_core::ToolRegistry::register(
+                &parent,
+                spawn_subagent(SubagentWiring {
+                    llm: Some(Arc::clone(&llm)),
+                    template: cog_core::RuntimeConfig {
+                        agent_id: "agent-parent".into(),
+                        ..Default::default()
+                    },
+                    tools: Some(Arc::clone(&exported)),
+                    decider: None,
+                    mode: crate::permission::PermissionMode::Default,
+                    roster: None,
+                    owner: "alice".into(),
+                    session: "session-42".into(),
+                    files_seen: None,
+                }),
+            );
+            assert!(
+                exported.get("read_file").is_some(),
+                "副本要带着父表的工具走"
+            );
+            assert!(
+                exported.get("spawn_subagent").is_none(),
+                "子任务手上不该有它自己：一层写错的递归能吃掉整台机器的预算"
+            );
+
+            let tool = parent.get("spawn_subagent").expect("装进了父表");
+            let ToolImplementation::Native(run) = &tool.implementation else {
+                panic!("spawn_subagent is native");
+            };
+            let out = run(serde_json::json!({
+                "task": "count the files under /data and say how many"
+            }))
+            .await
+            .expect("the child answered");
+            assert_eq!(out["subagent"], serde_json::json!(true));
+            assert_eq!(
+                out["result"],
+                serde_json::json!("child answer"),
+                "子任务的最终产出就是这一次调用的结果：{out}"
+            );
+
+            let seen = says.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "子任务答一次就结束，不该有多轮");
+            let prompt: String = seen[0]
+                .iter()
+                .map(|message| format!("{message:?}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                prompt.contains("count the files under /data"),
+                "交给子任务的那一句没有进它的提示词：{prompt}"
+            );
+        }
+
+        /// 没给任务、没有模型客户端的部署：两种都当场说出来，而不是起一个空循环。
+        #[tokio::test]
+        async fn a_subagent_without_a_task_is_refused_before_anything_starts() {
+            let tool = spawn_subagent(SubagentWiring {
+                llm: None,
+                template: cog_core::RuntimeConfig {
+                    agent_id: "agent-parent".into(),
+                    ..Default::default()
+                },
+                tools: None,
+                decider: None,
+                mode: crate::permission::PermissionMode::Default,
+                roster: None,
+                owner: String::new(),
+                session: "session-42".into(),
+                files_seen: None,
+            });
+            let ToolImplementation::Native(run) = &tool.implementation else {
+                panic!("spawn_subagent is native");
+            };
+            let empty = run(serde_json::json!({ "task": "   " })).await;
+            assert!(matches!(empty, Err(SFError::Validation(_))), "{empty:?}");
+            let no_model = run(serde_json::json!({ "task": "do one thing" })).await;
+            assert!(matches!(no_model, Err(SFError::Agent(_))), "{no_model:?}");
         }
 
         /// The shape the door reads: one row, filed as already decided, with the
@@ -4666,7 +6682,10 @@ pub mod builtins {
             assert_eq!(row["agent_id"], "agent-abc");
             assert_eq!(row["input"]["agent_id"], "agent-abc");
             assert_eq!(row["planner"]["verified"], true);
-            assert_eq!(row["timeout_seconds"], DEFAULT_WORK_ITEM_TIMEOUT_SECS);
+            assert_eq!(
+                row["declared_duration_seconds"],
+                DEFAULT_WORK_ITEM_DECLARED_SECS
+            );
             assert_eq!(body["goal_id"], filed.goal_id.as_str());
             assert!(
                 body["workspace_id"].as_str().is_some_and(|w| !w.is_empty()),
@@ -4707,18 +6726,409 @@ pub mod builtins {
             assert_eq!(filed.body["goal_id"], "7c1f0d");
         }
 
-        /// Zero would fail the row before it ran, so it is refused where the
-        /// caller can still fix it rather than queued as a success.
+        /// Zero would hand every reader that sizes its patience from the row
+        /// the smallest duration there is, so it is refused where the caller can
+        /// still fix it rather than queued as a success.
         #[test]
-        fn a_zero_budget_is_refused_rather_than_read_as_no_limit() {
+        fn a_zero_duration_is_refused_rather_than_read_as_no_limit() {
             let err = filing(serde_json::json!({
                 "goal": "do the thing",
                 "acceptance": ["the thing is done"],
-                "timeout_seconds": 0,
+                "declared_duration_seconds": 0,
             }))
             .err()
-            .expect("a zero budget is refused");
+            .expect("a zero duration is refused");
             assert!(matches!(err, SFError::Validation(_)));
+        }
+    }
+
+    /// 树读与改树的工具：命令对不对，以及它落在谁的树里。
+    ///
+    /// 这两条是这些工具唯一会说谎的地方。命令拼错了，`grep` 什么都不回，看起来
+    /// 像「没有匹配」；树选错了，它回得整整齐齐，只是回的是另一份源码。两种错
+    /// 都不报，所以都在这一层钉住——用一个记账的执行器，把请求原样留下来。
+    #[cfg(test)]
+    mod tree_tool_tests {
+        use super::*;
+        use std::sync::atomic::{AtomicI32, Ordering};
+
+        /// 只回话不执行的执行器：记下身份与命令，stdout 由测试摆好。
+        #[derive(Default)]
+        struct Scripted {
+            seen: std::sync::Mutex<Vec<(String, String, String)>>,
+            stdout: std::sync::Mutex<String>,
+            code: AtomicI32,
+        }
+
+        impl Scripted {
+            fn answering(text: &str) -> Self {
+                let backend = Self::default();
+                *backend.stdout.lock().unwrap() = text.to_string();
+                backend
+            }
+
+            fn failing() -> Self {
+                let backend = Self::default();
+                backend.code.store(1, Ordering::SeqCst);
+                backend
+            }
+
+            fn requests(&self) -> Vec<(String, String, String)> {
+                self.seen.lock().unwrap().clone()
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl SandboxBackend for Scripted {
+            async fn execute(&self, req: &SandboxRequest) -> SFResult<cog_core::SandboxResult> {
+                let command = match &req.payload {
+                    SandboxPayload::Command { command } => command.clone(),
+                    _ => panic!("the tree tools run commands, not another payload"),
+                };
+                self.seen.lock().unwrap().push((
+                    req.agent_id.clone(),
+                    req.task_id.clone(),
+                    command,
+                ));
+                Ok(cog_core::SandboxResult {
+                    stdout: self.stdout.lock().unwrap().clone(),
+                    exit_code: self.code.load(Ordering::SeqCst),
+                    workdir: Some("/ws/employee-kai-a9ab11fc".into()),
+                    ..Default::default()
+                })
+            }
+
+            async fn precompile(&self, _bytes: &[u8]) -> SFResult<String> {
+                Err(SFError::Agent("not a wasm backend".into()))
+            }
+        }
+
+        fn tools(backend: Arc<Scripted>) -> SandboxTools {
+            SandboxTools::new(Some(backend as Arc<dyn SandboxBackend>))
+        }
+
+        /// 工具不替运行时截：整份答案原样交出去。
+        ///
+        /// 截断只有一个地方做——运行时把结果裁进上下文那一步，它先把全文归档
+        /// 成一条引用，再在标记里给出它。工具这边先截一刀，被截掉的尾部就再
+        /// 也没有人见过，归档到的也只是截过的那份。所以这条测试要的是「一条
+        /// 都不少」，以及命令拼出来的时候没有接 `head`。
+        #[tokio::test]
+        async fn the_tree_tools_hand_the_whole_answer_to_the_runtime() {
+            let script: String = (0..500)
+                .map(|i| format!("a.rs:{i}:{}\n", "x".repeat(200)))
+                .collect();
+            let backend = Arc::new(Scripted::answering(&script));
+            let registry = ToolRegistry::new();
+            cog_core::ToolRegistry::register(&registry, grep(tools(backend.clone())));
+            let reply = registry
+                .execute("grep", serde_json::json!({"pattern": "x"}))
+                .await
+                .expect("a scripted search answers");
+            let matches = reply["matches"].as_array().expect("a list");
+            assert_eq!(matches.len(), 500, "工具把尾部截掉了");
+            assert_eq!(reply["truncated"], serde_json::json!(false));
+            let seen = backend.requests();
+            let (_, _, command) = &seen[0];
+            assert!(!command.contains("head"), "命令里不许接 head：{command}");
+        }
+
+        /// 调用方自己说要几条时才截：那是它提的请求，不是平台替它拍的界。
+        #[tokio::test]
+        async fn only_the_caller_stated_count_cuts_the_answer() {
+            let script: String = (0..10).map(|i| format!("a.rs:{i}:x\n")).collect();
+            let backend = Arc::new(Scripted::answering(&script));
+            let registry = ToolRegistry::new();
+            cog_core::ToolRegistry::register(&registry, grep(tools(backend)));
+            let reply = registry
+                .execute(
+                    "grep",
+                    serde_json::json!({"pattern": "x", "max_results": 3}),
+                )
+                .await
+                .expect("a scripted search answers");
+            assert_eq!(reply["matches"].as_array().expect("a list").len(), 3);
+            assert_eq!(reply["truncated"], serde_json::json!(true));
+        }
+
+        /// 一份 diff 也整份回来：工具不切字符串，答案始终是能被解析的 JSON。
+        #[tokio::test]
+        async fn a_diff_comes_back_whole() {
+            let diff: String = (0..800)
+                .map(|i| format!("+line {i} {}\n", "y".repeat(50)))
+                .collect();
+            let backend = Arc::new(Scripted::answering(&diff));
+            let registry = ToolRegistry::new();
+            cog_core::ToolRegistry::register(&registry, git_diff(tools(backend)));
+            let reply = registry
+                .execute("git_diff", serde_json::json!({}))
+                .await
+                .expect("a scripted diff answers");
+            assert_eq!(reply["diff"].as_str().expect("diff is a string"), diff);
+        }
+
+        /// 一条匹配回成一个条目：文件、行号、那一行。三样都在，读的人才不必
+        /// 再读一遍整个文件去找第几行。
+        #[tokio::test]
+        async fn search_code_answers_with_where_each_match_lives() {
+            let backend = Arc::new(Scripted::answering(
+                "crates/cog-agent/src/a.rs:12:fn search_code() {}\nweird:dir/b.rs:3:let x = 1;\n",
+            ));
+            let registry = ToolRegistry::new();
+            cog_core::ToolRegistry::register(&registry, search_code(tools(backend.clone())));
+            let reply = CALLER_AGENT_ID
+                .scope("kai-a9ab11fc".to_string(), async {
+                    registry
+                        .execute(
+                            "search_code",
+                            serde_json::json!({"query": "fn search_code", "include": "*.rs"}),
+                        )
+                        .await
+                })
+                .await
+                .expect("a scripted search answers");
+
+            let matches = reply["matches"].as_array().expect("matches is a list");
+            assert_eq!(matches.len(), 2, "{reply}");
+            assert_eq!(matches[0]["path"], "crates/cog-agent/src/a.rs");
+            assert_eq!(matches[0]["line"], 12);
+            assert_eq!(matches[0]["text"], "fn search_code() {}");
+            // 路径里的冒号不能把行号读错：拆分点在「冒号后面是数字再接冒号」。
+            assert_eq!(matches[1]["path"], "weird:dir/b.rs");
+            assert_eq!(matches[1]["line"], 3);
+            assert_eq!(reply["truncated"], serde_json::json!(false));
+            assert_eq!(reply["workdir"], "/ws/employee-kai-a9ab11fc");
+
+            let seen = backend.requests();
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            let (agent, _task, command) = &seen[0];
+            assert_eq!(agent, "kai-a9ab11fc");
+            assert!(command.contains("--include='*.rs'"), "{command}");
+            assert!(command.contains("'fn search_code'"), "{command}");
+            // 命令这一侧也不截：截断只由运行时那一步做，它同时归档全文。
+            assert!(!command.contains("head"), "{command}");
+        }
+
+        /// 树由执行者决定，任务号只做归属。
+        ///
+        /// 反过来（按任务号选树）会让同一件活里的两位挤在一棵树里，而这正是
+        /// 员工要有自己那棵树的原因。
+        #[tokio::test]
+        async fn a_tree_tool_runs_in_the_callers_checkout() {
+            let backend = Arc::new(Scripted::answering(
+                "## work/employee-squad-DSC-1-generator\n",
+            ));
+            let registry = ToolRegistry::new();
+            cog_core::ToolRegistry::register(&registry, git_status(tools(backend.clone())));
+            let reply = CALLER_AGENT_ID
+                .scope("squad:DSC-1-generator".to_string(), async {
+                    registry.execute("git_status", serde_json::json!({})).await
+                })
+                .await
+                .expect("a scripted status answers");
+            assert_eq!(reply["status"], "## work/employee-squad-DSC-1-generator\n");
+
+            let seen = backend.requests();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].0, "squad:DSC-1-generator", "选树的是 agent id");
+            assert_eq!(
+                cog_core::checkout_lane(Some(seen[0].1.as_str()), Some(seen[0].0.as_str())),
+                Some(cog_core::worktree_lane("squad:DSC-1-generator")),
+                "归属写的是这条车道，不是别处"
+            );
+            assert_eq!(seen[0].2, "git status --short --branch");
+        }
+
+        /// 没公布过调用者时，身份写成「无主」，不编一个名字。
+        #[tokio::test]
+        async fn a_call_without_an_announced_caller_is_marked_unattributed() {
+            let backend = Arc::new(Scripted::answering(""));
+            let registry = ToolRegistry::new();
+            cog_core::ToolRegistry::register(&registry, glob(tools(backend.clone())));
+            registry
+                .execute("glob", serde_json::json!({"pattern": "*.rs"}))
+                .await
+                .expect("a scripted listing answers");
+
+            let seen = backend.requests();
+            assert!(seen[0].0.starts_with("unscoped-tool-"), "{seen:?}");
+            assert!(
+                seen[0].1.starts_with("unscoped-shell-"),
+                "无主的请求不该挂到别人的任务号上：{seen:?}"
+            );
+        }
+
+        /// 没有执行器时，报错说的是缺执行器，不是缺工具、也不是没有匹配。
+        #[tokio::test]
+        async fn without_an_executor_the_tool_names_the_missing_layer() {
+            let registry = ToolRegistry::new();
+            cog_core::ToolRegistry::register(&registry, grep(SandboxTools::new(None)));
+            let err = registry
+                .execute("grep", serde_json::json!({"pattern": "x"}))
+                .await
+                .expect_err("no executor, no answer");
+            assert!(
+                err.to_string().contains("SandboxBackend not configured"),
+                "缺执行器被说成了别的东西：{err}"
+            );
+        }
+
+        /// 同一次调用里 `grep` 搜的树与 `run_command` 写进去的树是同一棵：
+        /// 两条命令的身份必须落在同一条车道上。
+        #[test]
+        fn the_lane_is_derived_once_for_every_tool() {
+            let caller = "squad:DSC-9-reviewer";
+            let lane = cog_core::worktree_lane(caller);
+            assert_eq!(lane, cog_core::worktree_lane(caller));
+            assert!(lane.starts_with(cog_core::WORKTREE_LANE_PREFIX), "{lane}");
+        }
+
+        /// glob 的三种通配各走各的：`*` 不过 `/`，`**` 过，`**/` 还能匹配零层。
+        #[test]
+        fn a_glob_crosses_directories_only_where_the_pattern_says_so() {
+            assert!(glob_matches("*.rs", "main.rs"));
+            assert!(
+                !glob_matches("*.rs", "src/main.rs"),
+                "`*.rs` 只点名根下的文件；这是最容易读错的一格，工具描述里写明了"
+            );
+            assert!(glob_matches("src/*.rs", "src/main.rs"));
+            assert!(!glob_matches("src/*.rs", "src/deep/main.rs"));
+            assert!(glob_matches("src/**/*.rs", "src/deep/main.rs"));
+            assert!(glob_matches("**/*.rs", "main.rs"), "`**/` 要能匹配零个目录");
+            assert!(glob_matches("**/*.rs", "a/b/c.rs"));
+            assert!(glob_matches("src/?.rs", "src/a.rs"));
+            assert!(!glob_matches("src/?.rs", "src/ab.rs"));
+            assert!(!glob_matches("src/*.rs", "src/a.rs.bak"));
+            assert!(glob_matches("a/b", "a/b"), "没有通配时是逐字相等");
+        }
+
+        /// `path:line:text` 的拆分点在「数字后面那个冒号」，不是第一个冒号。
+        #[test]
+        fn a_match_line_splits_at_its_line_number() {
+            assert_eq!(
+                split_grep_line("src/a.rs:42:let x = 1;"),
+                Some(("src/a.rs".into(), 42, "let x = 1;".into()))
+            );
+            assert_eq!(
+                split_grep_line("C:/src/a.rs:7:data"),
+                Some(("C:/src/a.rs".into(), 7, "data".into()))
+            );
+            assert_eq!(
+                split_grep_line("src/a.rs:8:"),
+                Some(("src/a.rs".into(), 8, String::new()))
+            );
+            // `grep -r ... .` 回的是 `./src/a.rs`；两条写法在模型眼里是两个
+            // 字符串，`read_file` 会照着一个不存在的路径去开。
+            assert_eq!(
+                split_grep_line("./src/a.rs:9:text"),
+                Some(("src/a.rs".into(), 9, "text".into()))
+            );
+            assert_eq!(split_grep_line("no line number here"), None);
+            assert_eq!(split_grep_line("src/a.rs:not-a-number:x"), None);
+        }
+
+        /// 搜索词原样到 shell：引号、`$`、反引号都不许被展开。
+        #[test]
+        fn a_search_word_reaches_the_shell_verbatim() {
+            assert_eq!(sh_quote("plain"), "'plain'");
+            assert_eq!(sh_quote("it's $HOME `x`"), r#"'it'\''s $HOME `x`'"#);
+        }
+
+        /// 补丁从标准输入进去，正文一个字节都不动。
+        #[tokio::test]
+        async fn a_patch_travels_on_stdin_unchanged() {
+            let patch = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n";
+            let backend = Arc::new(Scripted::answering(""));
+            let registry = ToolRegistry::new();
+            cog_core::ToolRegistry::register(&registry, apply_patch(tools(backend.clone())));
+            registry
+                .execute("apply_patch", serde_json::json!({ "patch": patch }))
+                .await
+                .expect("a scripted apply answers");
+
+            let seen = backend.requests();
+            let command = &seen[0].2;
+            assert!(
+                command.starts_with("git apply --whitespace=nowarn <<'"),
+                "{command}"
+            );
+            assert!(command.contains(patch), "补丁正文被改过了：{command}");
+        }
+
+        /// 补丁没打上去时报错，而不是回一个「成功」。
+        #[tokio::test]
+        async fn a_patch_that_does_not_apply_is_reported() {
+            let backend = Arc::new(Scripted::failing());
+            let registry = ToolRegistry::new();
+            cog_core::ToolRegistry::register(&registry, apply_patch(tools(backend.clone())));
+            let err = registry
+                .execute(
+                    "apply_patch",
+                    serde_json::json!({ "patch": "--- a\n+++ b\n" }),
+                )
+                .await
+                .expect_err("a failing apply is not a success");
+            assert!(err.to_string().contains("did not apply"), "{err}");
+        }
+
+        /// 清单按人分开：一个人的清单不是另一个人的。
+        #[tokio::test]
+        async fn each_employee_keeps_its_own_list() {
+            let registry = ToolRegistry::new();
+            cog_core::ToolRegistry::register(&registry, todo());
+            let two = serde_json::json!({"items": [
+                {"content": "read the failing test", "status": "done"},
+                {"content": "fix it", "status": "in_progress"},
+            ]});
+            let one = serde_json::json!({"items": [
+                {"content": "something else entirely", "status": "pending"},
+            ]});
+            let mine = CALLER_AGENT_ID
+                .scope("todo-owner-one".to_string(), async {
+                    registry.execute("todo", two).await
+                })
+                .await
+                .expect("a list is accepted");
+            assert_eq!(mine["pending"], 0);
+            assert_eq!(mine["in_progress"], 1);
+            assert_eq!(mine["done"], 1);
+            CALLER_AGENT_ID
+                .scope("todo-owner-two".to_string(), async {
+                    registry.execute("todo", one).await
+                })
+                .await
+                .expect("another caller's list is its own");
+            let again = CALLER_AGENT_ID
+                .scope("todo-owner-one".to_string(), async {
+                    registry
+                        .execute(
+                            "todo",
+                            serde_json::json!({"items": [
+                                {"content": "read the failing test", "status": "done"},
+                                {"content": "fix it", "status": "done"},
+                            ]}),
+                        )
+                        .await
+                })
+                .await
+                .expect("the first caller still owns its list");
+            assert_eq!(again["done"], 2);
+            assert_eq!(again["in_progress"], 0);
+        }
+
+        /// 未知状态是调用方的错，说清楚，而不是当成 pending 收下。
+        #[tokio::test]
+        async fn an_unknown_status_is_refused() {
+            let registry = ToolRegistry::new();
+            cog_core::ToolRegistry::register(&registry, todo());
+            let err = registry
+                .execute(
+                    "todo",
+                    serde_json::json!({"items": [{"content": "x", "status": "blocked"}]}),
+                )
+                .await
+                .expect_err("blocked is not a status this list has");
+            assert!(err.to_string().contains("unknown status"), "{err}");
         }
     }
 }

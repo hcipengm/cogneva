@@ -104,6 +104,7 @@ impl AnthropicProvider {
         self
     }
 
+    // prompt: fixed — Anthropic Messages API 线格式（role/content/tool schema）
     fn build_request_body(&self, messages: &[Message], options: &ChatOptions) -> serde_json::Value {
         // Every system message goes into the one `system` field, in order.
         //
@@ -392,8 +393,7 @@ impl LLMProvider for AnthropicProvider {
                 .header("Content-Type", cog_core::CONTENT_TYPE_JSON)
                 .json(&body)
                 .map_err(|e| SFError::Agent(format!("JSON serialization failed: {}", e)))
-                .unwrap()
-                .timeout(120);
+                .unwrap();
 
             for (key, value) in &headers {
                 req = req.header(key, value);
@@ -873,6 +873,7 @@ impl LLMProvider for AnthropicProvider {
         Ok(stream.result().await)
     }
 
+    // prompt: not-an-instruction — 探活请求，模型看不到它
     async fn health_check(&self) -> bool {
         match self
             .chat(

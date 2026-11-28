@@ -1,0 +1,9 @@
+ALTER TABLE cog_guard_audit_log ALTER COLUMN messages      TYPE JSONB USING messages::jsonb;
+ALTER TABLE cog_guard_audit_log ALTER COLUMN tool_call     TYPE JSONB USING tool_call::jsonb;
+ALTER TABLE cog_hook_events      ALTER COLUMN payload      TYPE JSONB USING payload::jsonb;
+ALTER TABLE cog_snapshots        ALTER COLUMN agent_state  TYPE JSONB USING agent_state::jsonb;
+ALTER TABLE cog_snapshots        ALTER COLUMN context_window TYPE JSONB USING context_window::jsonb;
+ALTER TABLE pge_stage_product    ALTER COLUMN change_identity TYPE JSONB USING change_identity::jsonb;
+ALTER TABLE pge_stage_product    ALTER COLUMN product      TYPE JSONB USING product::jsonb;
+ALTER TABLE cog_taste_intents    ALTER COLUMN payload      TYPE JSONB USING payload::jsonb;
+ALTER TABLE cog_taste_intents    ALTER COLUMN evidence_refs TYPE JSONB USING evidence_refs::jsonb;

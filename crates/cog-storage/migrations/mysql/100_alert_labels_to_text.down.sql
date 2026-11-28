@@ -1,0 +1,2 @@
+ALTER TABLE alerts MODIFY labels JSON NOT NULL;
+ALTER TABLE alerts DROP COLUMN source;

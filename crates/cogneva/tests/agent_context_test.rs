@@ -15,7 +15,7 @@ prompts:
         .await
         .unwrap();
 
-    let mut ctx = ContextWindow::new(1000);
+    let mut ctx = ContextWindow::new(Some(1000));
     let default_prompt = mgr
         .get("agent:default")
         .expect("prompt 'agent:default' must be loaded by PromptManager");

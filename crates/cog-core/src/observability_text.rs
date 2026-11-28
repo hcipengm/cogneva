@@ -31,6 +31,14 @@ use std::collections::HashMap;
 
 use crate::RawMetric;
 
+/// 名册读的那个标签键。
+///
+/// 「这一行的上游是谁」在三个 crate 里各写一遍过：指标存储的回收、网关的读数面、
+/// 以及从 Prometheus 重建投影的那一步。三处拼同一个词，改一处不会有任何报错——
+/// 另外两处照旧读一个再也没人写的键，读数面读到的是一族空向量。词写在这里，
+/// 因为它不是某一张表的私事。
+pub const UPSTREAM_LABEL: &str = "upstream";
+
 /// The suffix a store appends to every series it renders, to carry the time of
 /// the newest observation behind that series.
 ///
@@ -132,12 +140,13 @@ fn escape_label_value(v: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::observability::METRICS_PATH;
 
     #[test]
     fn labels_render_in_canonical_name_order() {
         let labels: HashMap<String, String> = [
             ("status", "200"),
-            ("endpoint", "/metrics"),
+            ("endpoint", METRICS_PATH),
             ("method", "GET"),
         ]
         .iter()
@@ -145,7 +154,7 @@ mod tests {
         .collect();
         assert_eq!(
             format_labels(&labels),
-            "endpoint=\"/metrics\",method=\"GET\",status=\"200\""
+            format!("endpoint=\"{METRICS_PATH}\",method=\"GET\",status=\"200\"")
         );
     }
 

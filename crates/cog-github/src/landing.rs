@@ -266,6 +266,7 @@ fn landing_worktree() -> PathBuf {
 }
 
 fn record_path(change_id: &str) -> PathBuf {
+    // state-file: cache — 只在写口或读口没接上时兜底；两边都接上之后事实是正本，这份文件既不写也不读，不是第二份正本
     landing_dir().join(format!("{}.json", crate::pending_changes::slug(change_id)))
 }
 
@@ -316,6 +317,11 @@ pub struct LandingRecord {
     /// reading counts landings, not passes over one.
     #[serde(default)]
     pub inherited_ci_reported: bool,
+    /// Whether it has already been said that this landing's CI is taking longer
+    /// than the declared window. A latch, not a level: the record keeps being
+    /// watched, so an unlatched report would repeat on every pass.
+    #[serde(default)]
+    pub ci_aged_reported: bool,
     /// Why verification settled this change as one that must not land. Set
     /// together with `Retired`, and the only record of a verdict that leaves
     /// no commit behind.
@@ -327,8 +333,69 @@ pub struct LandingRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+/// 落地账的事件写口。接上之后每一次落盘同时落一条 `change_landed` 事实——文件是缓存，
+/// 流是正本。没接上时只写文件（读切换之前两者并存）。
+static LANDING_EVENTS: std::sync::OnceLock<std::sync::Arc<dyn cog_core::EventStore>> =
+    std::sync::OnceLock::new();
+
+/// 接上事件写口。装配处调用一次。
+pub fn attach_events(events: std::sync::Arc<dyn cog_core::EventStore>) {
+    let _ = LANDING_EVENTS.set(events);
+}
+
+/// 落地事实的读口。与写口一起由装配处接上；接上之后通道的热读走事实，
+/// 盘上那份文件不再是通道的记忆（没接上时退回文件，进程照常工作）。
+static LANDING_FACTS: std::sync::OnceLock<std::sync::Arc<dyn cog_core::LandingFactReader>> =
+    std::sync::OnceLock::new();
+
+/// 接上事实读口。装配处调用一次。
+pub fn attach_facts(facts: std::sync::Arc<dyn cog_core::LandingFactReader>) {
+    let _ = LANDING_FACTS.set(facts);
+}
+
+/// 事实是不是这一面的正本：读口与写口都接上了才算——只接一半时既不能写事实也不能
+/// 读回来，退回文件是唯一不丢记录的选择。
+fn facts_are_the_source() -> bool {
+    LANDING_EVENTS.get().is_some() && LANDING_FACTS.get().is_some()
+}
+
+impl LandingState {
+    /// 写进事实那一格的词。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LandingState::Unverified => "unverified",
+            LandingState::Landed => "landed",
+            LandingState::Retired => "retired",
+        }
+    }
+}
+
 /// Save a record (idempotent per change id).
 pub async fn save_record(record: &LandingRecord) -> SFResult<()> {
+    // 事实先落：中途断掉时留下的是「流上有、文件没有」，下一次重放写得回来；
+    // 反过来留下的是「文件有、流上没有」，那一份状态就只剩磁盘这一份。
+    if let Some(events) = LANDING_EVENTS.get() {
+        let body = serde_json::to_string(record)
+            .map_err(|e| SFError::Internal(format!("serialize landing record: {e}")))?;
+        let mut event = cog_core::FactEvent::new(cog_core::EventPayload::ChangeLanded {
+            change_id: record.change.change_id.clone(),
+            base: record.base.clone(),
+            landed_rev: record.landed_rev.clone(),
+            state: record.state.as_str().to_string(),
+            retired_reason: record.retired_reason.clone(),
+            record: Some(body),
+            closed: false,
+        });
+        event.at = Some(record.updated_at);
+        events
+            .append(event)
+            .await
+            .map_err(|e| SFError::Database(format!("append landing fact: {e}")))?;
+    }
+    // 读口接上时，事实就是这一面的正本：不再落盘上那一份第二副本。
+    if facts_are_the_source() {
+        return Ok(());
+    }
     let dir = landing_dir();
     tokio::fs::create_dir_all(&dir)
         .await
@@ -342,6 +409,65 @@ pub async fn save_record(record: &LandingRecord) -> SFResult<()> {
 
 /// Every landing record, oldest first. Unreadable entries are skipped.
 pub async fn load_records() -> Vec<LandingRecord> {
+    if facts_are_the_source() {
+        let facts = LANDING_FACTS
+            .get()
+            .expect("facts_are_the_source checked the reader is attached");
+        match facts.latest_landing_attributes().await {
+            Ok(attributes) => return records_from_landing_attributes(&attributes),
+            // 读不到流时退回盘上缓存：这是「量不到」不是「没有记录」，两句话在
+            // 日志里分开。退回文件不会把一条在飞的记录读成不存在。
+            Err(e) => warn!(
+                error = %e,
+                "落地事实读不到，这一轮退回盘上缓存；记录不会因此消失"
+            ),
+        }
+    }
+    load_records_from_files().await
+}
+
+/// 从事实的属性里折出在飞记录：每条变更最后一条胜出，`closed` 的离开通道。
+///
+/// 属性按 seq 升序给进来。老行没有 `record`（那时还没把整条记录写进事实），
+/// 跳过它——它不是这一版能重建的记录，且下一次保存会带上完整的一份。
+fn records_from_landing_attributes(attributes: &[String]) -> Vec<LandingRecord> {
+    let mut latest: HashMap<String, (DateTime<Utc>, Option<LandingRecord>, bool)> = HashMap::new();
+    for text in attributes {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+            warn!("一条落地事实的属性不是 JSON，跳过它");
+            continue;
+        };
+        let change_id = value
+            .get("change_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let closed = value
+            .get("closed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let record = value
+            .get("record")
+            .and_then(|v| v.as_str())
+            .and_then(|body| serde_json::from_str::<LandingRecord>(body).ok());
+        let at = record
+            .as_ref()
+            .map(|record| record.updated_at)
+            .unwrap_or_else(Utc::now);
+        // 同一 seq 序里后到的覆盖先到的：这就是「最后一条事实」。
+        latest.insert(change_id, (at, record, closed));
+    }
+    let mut records: Vec<(DateTime<Utc>, LandingRecord)> = latest
+        .into_values()
+        .filter(|(_, _, closed)| !closed)
+        .filter_map(|(at, record, _)| record.map(|record| (at, record)))
+        .collect();
+    records.sort_by_key(|(at, _)| *at);
+    records.into_iter().map(|(_, record)| record).collect()
+}
+
+/// 盘上缓存里的一份：只给「读口没接上」或「流读不到」时用。
+async fn load_records_from_files() -> Vec<LandingRecord> {
     let mut entries: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
     let Ok(mut it) = tokio::fs::read_dir(landing_dir()).await else {
         return Vec::new();
@@ -374,15 +500,39 @@ pub async fn load_records() -> Vec<LandingRecord> {
 
 /// Drop a record once its landing is settled (green, reverted, or abandoned).
 pub async fn remove_record(change_id: &str) {
-    let _ = tokio::fs::remove_file(record_path(change_id)).await;
+    if facts_are_the_source() {
+        let Some(record) = load_record(change_id).await else {
+            // 已经没有在飞的这一条：没有任何东西要关闭。
+            return;
+        };
+        if let Some(events) = LANDING_EVENTS.get() {
+            let mut event = cog_core::FactEvent::new(cog_core::EventPayload::ChangeLanded {
+                change_id: change_id.to_string(),
+                base: record.base.clone(),
+                landed_rev: record.landed_rev.clone(),
+                state: record.state.as_str().to_string(),
+                retired_reason: record.retired_reason.clone(),
+                record: None,
+                closed: true,
+            });
+            event.at = Some(record.updated_at);
+            if let Err(e) = events.append(event).await {
+                // 关不上时记录会再被判一次：判定自己是幂等的（台账已有记录就跳过），
+                // 但这条错误要说出来——否则「没关上」与「已关上」同形。
+                warn!(change_id, error = %e, "落地记录没有关闭；它会在下一轮再被判一次");
+            }
+        }
+        return;
+    }
+    cog_core::ignore_lost!(tokio::fs::remove_file(record_path(change_id)).await);
 }
 
 /// Load the record for one change, if any.
 pub async fn load_record(change_id: &str) -> Option<LandingRecord> {
-    let text = tokio::fs::read_to_string(record_path(change_id))
+    load_records()
         .await
-        .ok()?;
-    serde_json::from_str(&text).ok()
+        .into_iter()
+        .find(|record| record.change.change_id == change_id)
 }
 
 /// One upstream the channel lands onto.
@@ -471,6 +621,9 @@ pub struct MainChannel {
     /// loses the race for the base branch must not be on a mirror either, or
     /// the two hosts hold different histories instead of the same one.
     mirrors: Vec<PushTarget>,
+    /// 推的时候按读数选路要用到的凭证。`ensure_workdir` 那一侧由插件直接传，
+    /// 这一侧要留一份：一次 push 走哪条路是当场决定的，不能等到下次启动才改。
+    token: Option<String>,
     provider: Arc<dyn CodePlatformProvider>,
     controller: Arc<ContributionController>,
     /// Serializes landings: each one rebuilds a scratch worktree, so two
@@ -538,6 +691,7 @@ impl MainChannel {
             workdir: workdir.into(),
             config,
             mirrors: Vec::new(),
+            token: None,
             provider,
             controller,
             gate: tokio::sync::Mutex::new(()),
@@ -553,6 +707,12 @@ impl MainChannel {
     /// silently dropped.
     pub fn with_mirrors(mut self, mirrors: impl IntoIterator<Item = PushTarget>) -> Self {
         self.mirrors = mirrors.into_iter().collect();
+        self
+    }
+
+    /// 推的时候可以走的凭证：有它，token 那条路才是一条候选。
+    pub fn with_token(mut self, token: Option<String>) -> Self {
+        self.token = token;
         self
     }
 
@@ -653,7 +813,7 @@ impl MainChannel {
     ) -> std::result::Result<String, LandingError> {
         self.check_policy(change, owner_approved)?;
         let base = self.config.base_branch.clone();
-        let attempts = self.config.landing_policy.max_land_attempts.max(1);
+        let attempts = self.config.landing_policy.max_land_attempts;
         let _guard = self.gate.lock().await;
 
         let mut last_race = None;
@@ -831,6 +991,7 @@ impl MainChannel {
             redriven: false,
             unlanded_reported: false,
             inherited_ci_reported: false,
+            ci_aged_reported: false,
             retired_reason: None,
             created_at: created,
             updated_at: now,
@@ -890,6 +1051,17 @@ impl MainChannel {
             }
         }
         Ok(())
+    }
+
+    /// `ls-remote` 的一行输出里，这个分支报的是不是 `rev`。
+    ///
+    /// 一行的形状是 `<sha>\trefs/heads/<branch>`；比对逐字，不做前缀或短 sha 匹配——
+    /// 「像」与「是」在这里是两件事。
+    fn remote_reports_rev(ls_remote: &str, rev: &str) -> bool {
+        ls_remote.lines().any(|line| {
+            let mut fields = line.split_whitespace();
+            matches!((fields.next(), fields.next()), (Some(sha), Some(_)) if sha == rev)
+        })
     }
 
     /// One landing attempt against the current remote tip.
@@ -1029,9 +1201,11 @@ impl MainChannel {
     async fn fresh_worktree(&self, base: &str) -> Result<PathBuf> {
         let wt = landing_worktree();
         let wt_arg = wt.to_string_lossy().to_string();
-        let _ = run_git(&self.workdir, &["worktree", "remove", "--force", &wt_arg]).await;
-        let _ = tokio::fs::remove_dir_all(&wt).await;
-        let _ = run_git(&self.workdir, &["worktree", "prune"]).await;
+        cog_core::ignore_lost!(
+            run_git(&self.workdir, &["worktree", "remove", "--force", &wt_arg]).await
+        );
+        cog_core::ignore_lost!(tokio::fs::remove_dir_all(&wt).await);
+        cog_core::ignore_lost!(run_git(&self.workdir, &["worktree", "prune"]).await);
         run_git(&self.workdir, &["fetch", "origin", base]).await?;
         run_git(
             &self.workdir,
@@ -1106,41 +1280,126 @@ impl MainChannel {
     /// Push `rev` to one target's base branch. A lost race against a newer tip
     /// on that branch is separated from a real rejection: only the former is
     /// worth re-applying onto the fresh tip.
+    ///
+    /// 走哪条路由这条路上一次的实测决定，一次 push 就是一次实测：这条路没走通
+    /// 就记下来、换下一条；走通了就停下并记下耗时。remote 上存的 URL 只在这一次
+    /// push 期间被改写，结束时改回原样——路由读数在进程里，凭证不留在工作副本里。
     async fn push_to(
         &self,
         dir: &Path,
         target: &PushTarget,
         rev: &str,
     ) -> std::result::Result<(), PushFailure> {
-        let (ok, _stdout, stderr) = match run_git_status(
-            dir,
-            &[
-                "push",
-                &target.remote,
-                &format!("{rev}:refs/heads/{}", target.base),
-            ],
-        )
-        .await
-        {
-            Ok(out) => out,
-            Err(e) => return Err(PushFailure::Rejected(e.to_string())),
-        };
-        if ok {
-            return Ok(());
-        }
-        if is_push_race(&stderr) {
-            return Err(PushFailure::Raced(format!(
-                "push to {} on {} lost the race: {}",
+        let routes = routes_for(target, self.token.as_deref());
+        let book = crate::route::snapshot();
+        let routes: Vec<crate::route::Candidate> = crate::route::ordered(&routes, &book)
+            .into_iter()
+            .cloned()
+            .collect();
+        if routes.is_empty() {
+            return Err(PushFailure::Rejected(format!(
+                "push to {} on {}: no route is configured for that host",
                 target.base,
-                target.label(),
-                stderr.trim()
+                target.label()
             )));
         }
+        let original = match run_git_status(dir, &["remote", "get-url", &target.remote]).await {
+            Ok((true, stdout, _)) => Some(stdout.trim().to_string()),
+            _ => None,
+        };
+        let restore = || async {
+            if let Some(url) = &original {
+                cog_core::ignore_lost!(set_remote(dir, &target.remote, url).await);
+            }
+        };
+        let mut failures: Vec<String> = Vec::new();
+        let mut raced: Option<String> = None;
+        for candidate in &routes {
+            if let Err(e) = set_remote(dir, &target.remote, &candidate.url).await {
+                crate::route::note_fail(&candidate.key, 0, &e.to_string());
+                failures.push(format!("{}: {e}", candidate.route()));
+                continue;
+            }
+            let started = std::time::Instant::now();
+            let (ok, stderr) = match run_git_status(
+                dir,
+                &[
+                    "push",
+                    &target.remote,
+                    &format!("{rev}:refs/heads/{}", target.base),
+                ],
+            )
+            .await
+            {
+                Ok((ok, _stdout, stderr)) => (ok, stderr),
+                Err(e) => {
+                    crate::route::note_fail(
+                        &candidate.key,
+                        started.elapsed().as_millis(),
+                        &e.to_string(),
+                    );
+                    failures.push(format!("{}: {e}", candidate.route()));
+                    continue;
+                }
+            };
+            let ms = started.elapsed().as_millis();
+            if ok {
+                // 动作之后由现实的读数回答到没到：不是「push 返回 0」，而是
+                // 「远端这个分支现在就是这一版」。读回来的那一行是唯一能作证的
+                // 东西；读不到或读回来的不是它，就当这一步没到。
+                let reported = run_git_status(
+                    dir,
+                    &[
+                        "ls-remote",
+                        &target.remote,
+                        &format!("refs/heads/{}", target.base),
+                    ],
+                )
+                .await
+                .ok()
+                .filter(|(ok, _, _)| *ok)
+                .map(|(_, stdout, _)| stdout);
+                if reported
+                    .as_deref()
+                    .map(|stdout| remote_reports_rev(stdout, rev))
+                    .unwrap_or(false)
+                {
+                    crate::route::note_ok(&candidate.key, ms);
+                    tracing::info!(route = candidate.route(), ms = %ms, target = target.label(), "push route measured and read back");
+                    restore().await;
+                    return Ok(());
+                }
+                failures.push(format!(
+                    "{}: push reported success but the remote does not report {rev} on {}",
+                    candidate.route(),
+                    target.base
+                ));
+                continue;
+            }
+            // 输给一次争抢说明这条路是通的，只是目标分支动了：它不是一次路由
+            // 失败，记进来会把一条好路压到后面。
+            if is_push_race(&stderr) {
+                raced = Some(format!(
+                    "push to {} on {} lost the race: {}",
+                    target.base,
+                    target.label(),
+                    stderr.trim()
+                ));
+                break;
+            }
+            crate::route::note_fail(&candidate.key, ms, stderr.trim());
+            tracing::warn!(route = candidate.route(), ms = %ms, target = target.label(), "push route failed");
+            failures.push(format!("{}: {}", candidate.route(), stderr.trim()));
+        }
+        restore().await;
+        if let Some(raced) = raced {
+            return Err(PushFailure::Raced(raced));
+        }
         Err(PushFailure::Rejected(format!(
-            "push to {} on {} rejected: {}",
+            "push to {} on {} rejected on every route: {}",
             target.base,
             target.label(),
-            stderr.trim()
+            failures.join("; ")
         )))
     }
 
@@ -1561,6 +1820,7 @@ impl cog_core::ChangeLanding for MainChannel {
             redriven: false,
             unlanded_reported: false,
             inherited_ci_reported: false,
+            ci_aged_reported: false,
             retired_reason: None,
             created_at: created,
             updated_at: now,
@@ -1609,9 +1869,13 @@ impl cog_core::ChangeLanding for MainChannel {
 /// is re-driven once from the failure log — a change that breaks CI twice is
 /// out of the generator's reach and is left to a human.
 ///
-/// A revision whose CI never reports within `ci_watch_timeout_secs` stops
-/// being watched: `None` means no evidence, and waiting forever on a verdict
-/// that is not coming would grow the record set without bound.
+/// A revision whose CI has not reported within `ci_watch_timeout_secs` is not
+/// dropped: the window says how long a verdict is *expected* to take, and past
+/// it the pass logs once and keeps watching. A CI run that has not reported yet
+/// is still running — ending the watch would throw away the verdict it is about
+/// to produce, along with the revert that a red one would trigger. The record
+/// set is bounded by the landings awaiting a verdict, and every one of those is
+/// closed by the CI finishing.
 pub async fn watch_landed(
     channel: &MainChannel,
     reflection: Option<&dyn cog_core::ReflectionEngine>,
@@ -1654,15 +1918,25 @@ pub async fn watch_landed(
             continue;
         }
         let age = (now - record.updated_at).num_seconds().max(0) as u64;
-        if age > policy.ci_watch_timeout_secs {
+        // 过了声明的窗口不再「停止观察」：一条还在跑的 CI 还没有判词，按钟点把
+        // 记录删掉，等于把它的绿色（以及红色的自动回滚）一起扔掉——而它下一轮
+        // 很可能就报出来了。只登一条读数，继续看。记录的增长由「等着判词的落地
+        // 数」界住，那是一个会被 CI 收尾的集合，不是无界的。
+        if age > policy.ci_watch_timeout_secs && !record.ci_aged_reported {
             tracing::warn!(
                 change_id = %record.change.change_id,
                 rev = %record.landed_rev,
                 age_secs = age,
-                "no CI verdict for a landed commit within the watch window; no longer watching"
+                "no CI verdict for a landed commit past the declared window; still watching, \
+                 because a run that has not reported is not a run that will not report"
             );
-            remove_record(&record.change.change_id).await;
-            continue;
+            record.ci_aged_reported = true;
+            // `updated_at` 保持不动：它是量这个年龄的钟，碰它就把要暴露的陈旧
+            // 一起抹掉了。
+            if let Err(e) = save_record(&record).await {
+                tracing::warn!(change_id = %record.change.change_id, error = %e,
+                    "could not latch the aged-CI report; it will repeat next pass");
+            }
         }
 
         let verdict = match channel
@@ -1962,14 +2236,29 @@ async fn redrive(
     // produced a re-drive is dropped by the idempotent insert. Read the row
     // first: without it the submission reports success and the change is left
     // with no attempt running and no record of why.
-    if let Some(existing) = orchestrator.get_task(&task_id).await {
-        tracing::warn!(
-            change_id = %record.change.change_id,
-            task_id = %task_id,
-            status = ?existing.status,
-            "a re-drive for this change is already in the graph; nothing queued"
-        );
-        return;
+    //
+    // 读不到**不是**「还没有人交过」：那一行可能还在图里。读失败这一拍不交，
+    // 把错误留给下一拍重试——否则一次库抖动就再交一份同样的活（CC22）。
+    match orchestrator.get_task_checked(&task_id).await {
+        Ok(Some(existing)) => {
+            tracing::warn!(
+                change_id = %record.change.change_id,
+                task_id = %task_id,
+                status = ?existing.status,
+                "a re-drive for this change is already in the graph; nothing queued"
+            );
+            return;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(
+                change_id = %record.change.change_id,
+                task_id = %task_id,
+                error = %e,
+                "could not read whether a re-drive already exists; leaving this tick to the next one"
+            );
+            return;
+        }
     }
     let mut task = cog_core::Task::new(
         task_id,
@@ -2021,7 +2310,8 @@ async fn redrive(
 /// 25 characters, plus the 50 a goal's first line may occupy. A shorter cap
 /// would clip titles that followed the convention, which reads as the
 /// convention not being honoured.
-// cap: bound — 照约定写的标题要整句留在主题里；再收就会裁掉守约定的那些，读起来像约定没被执行
+// cap: fixed — 照约定写的标题要整句留在主题里；再收就会裁掉守约定的那些，读起来像约定没被执行
+// keep: 删掉后照约定写的标题在主题里被裁，读起来像约定没被执行；由「整句留在主题里」兜住
 const SUBJECT_LIMIT: usize = 76;
 
 /// Commit message for a landed change: what it does, why, and the trailer the
@@ -2416,7 +2706,7 @@ fn workspace_members() -> &'static BTreeSet<String> {
 /// A leading `*` matches a filename suffix (`.lock` files), a trailing `/`
 /// matches a directory prefix, and anything else matches the path exactly or
 /// as a prefix. Deliberately small: these are path guards, not a glob engine.
-fn path_forbidden(path: &str, pattern: &str) -> bool {
+pub(crate) fn path_forbidden(path: &str, pattern: &str) -> bool {
     let p = path.strip_prefix("./").unwrap_or(path);
     if let Some(suffix) = pattern.strip_prefix('*') {
         return p.ends_with(suffix);
@@ -2481,30 +2771,72 @@ pub async fn ensure_workdir(
     mirrors: &[PushTarget],
 ) -> Result<PathBuf> {
     let workdir = config.git_workdir_path();
-    let url = remote_url(config, token);
+    let routes = primary_routes(config, token);
+    let routes = crate::route::ordered(&routes, &crate::route::snapshot())
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
     let existing = is_git_workdir(&workdir).await;
     if !existing {
         if let Some(parent) = workdir.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let output = tokio::process::Command::new("git")
-            .arg("clone")
-            .arg(&url)
-            .arg(&workdir)
-            .output()
-            .await?;
-        if !output.status.success() {
-            // Never leak the token into logs.
-            let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-            if let Some(t) = token.filter(|t| !t.is_empty()) {
-                stderr = stderr.replace(t, "***");
+        // 克隆本身就是一次实测：第一条走通了就停，走不通就记下来、换下一条。
+        // 「先走哪条」由读数排，不由哪个环境变量设了排。
+        let mut failures: Vec<String> = Vec::new();
+        let mut cloned = false;
+        for candidate in &routes {
+            let started = std::time::Instant::now();
+            let output = tokio::process::Command::new("git")
+                .arg("clone")
+                .arg(&candidate.url)
+                .arg(&workdir)
+                .output()
+                .await;
+            match output {
+                Ok(output) if output.status.success() => {
+                    let ms = started.elapsed().as_millis();
+                    crate::route::note_ok(&candidate.key, ms);
+                    tracing::info!(route = candidate.route(), ms = %ms, "clone route measured");
+                    cloned = true;
+                    break;
+                }
+                Ok(output) => {
+                    // Never leak the token into logs.
+                    let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                    if let Some(t) = token.filter(|t| !t.is_empty()) {
+                        stderr = stderr.replace(t, "***");
+                    }
+                    crate::route::note_fail(
+                        &candidate.key,
+                        started.elapsed().as_millis(),
+                        stderr.trim(),
+                    );
+                    failures.push(format!("{}: {}", candidate.route(), stderr.trim()));
+                }
+                Err(e) => {
+                    crate::route::note_fail(
+                        &candidate.key,
+                        started.elapsed().as_millis(),
+                        &e.to_string(),
+                    );
+                    failures.push(format!("{}: {e}", candidate.route()));
+                }
             }
+        }
+        if !cloned {
             return Err(CogGitHubError::Provider(format!(
-                "git clone failed: {stderr}"
+                "git clone failed on every route: {}",
+                failures.join("; ")
             )));
         }
-    } else if git_proxy_base().is_some() {
-        set_remote(&workdir, "origin", &url).await?;
+    } else if let Some(candidate) = routes.first() {
+        // 已有工作副本只在「选中的是网关」时改写 origin：网关那条路是迁移用的，
+        // token 那条不改写，免得把凭证留进别人机器上的 .git/config。push 时
+        // 走哪条路由读数当场决定，并把它改回原样。
+        if candidate.route() == crate::route::ROUTE_PROXY {
+            set_remote(&workdir, "origin", &candidate.url).await?;
+        }
     }
     for target in mirrors {
         // A mirror is a second host for the same repository, so it is set up
@@ -2542,25 +2874,15 @@ async fn set_remote(dir: &Path, name: &str, url: &str) -> Result<()> {
 /// anonymous URL builds a remote that cannot be pushed to, and a fan-out that
 /// counts a host it can never reach is the state this replaced.
 fn mirror_url(target: &PushTarget, token: Option<&str>) -> Option<String> {
-    if target.slug == crate::GITHUB_PLATFORM {
-        return None;
-    }
-    if let Some(base) = git_proxy_base() {
-        return Some(proxy_route(&base, &target.slug, &target.repo));
-    }
-    token
-        .filter(|t| !t.is_empty())
-        .map(|t| format!("https://oauth2:{t}@gitee.com/{}.git", target.repo))
-}
-
-/// The gateway's route to one host: the proxy base, the platform's own path
-/// segment, then the repository.
-///
-/// Both remotes are built through here, so the route the channel pushes to and
-/// the route it reads a mirror's tip from cannot disagree about their shape —
-/// a disagreement that would read as a mirror that is not level.
-fn proxy_route(base: &str, slug: &str, repo: &str) -> String {
-    format!("{}/{slug}/{repo}.git", base.trim_end_matches('/'))
+    // A mirror is a second host rather than a second route to the first, so it
+    // carries its own reading (`gitee:proxy` is not `github:proxy`), and it has
+    // no anonymous fallback: an anonymous URL builds a remote that cannot be
+    // pushed to.
+    let routes = routes_for(target, token);
+    let book = crate::route::snapshot();
+    crate::route::ordered(&routes, &book)
+        .first()
+        .map(|candidate| candidate.url.clone())
 }
 
 fn git_proxy_base() -> Option<String> {
@@ -2569,35 +2891,28 @@ fn git_proxy_base() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn remote_url(config: &GitHubIntegrationConfig, token: Option<&str>) -> String {
-    let repo = config.repo.clone();
-    select_remote_url_for(
-        config,
-        token,
+/// Every route this process could take to `target`, in declaration order.
+///
+/// Declaration order is not priority: which candidate goes first is decided by
+/// [`crate::route::ordered`] from each route's own measurement, so a configured
+/// gateway participates rather than preempts.
+fn routes_for(target: &PushTarget, token: Option<&str>) -> Vec<crate::route::Candidate> {
+    crate::route::candidates(
+        &target.slug,
+        &target.repo,
         git_proxy_base().as_deref(),
         std::env::var_os("COGNEVA_GITHUB_USE_SSH").is_some(),
-        &repo,
+        token,
+        target.slug == crate::GITHUB_PLATFORM,
     )
 }
 
-/// Build the git remote URL for `target_repo` (`owner/repo`).
-fn select_remote_url_for(
-    _config: &GitHubIntegrationConfig,
+/// The primary repository's routes, in declaration order.
+fn primary_routes(
+    config: &GitHubIntegrationConfig,
     token: Option<&str>,
-    proxy_base: Option<&str>,
-    use_ssh: bool,
-    target_repo: &str,
-) -> String {
-    if let Some(base) = proxy_base {
-        return proxy_route(base, crate::GITHUB_PLATFORM, target_repo);
-    }
-    if use_ssh {
-        return format!("ssh://git@github.com:22/{target_repo}.git");
-    }
-    match token {
-        Some(t) => format!("https://x-access-token:{t}@github.com/{target_repo}.git"),
-        None => format!("https://github.com/{target_repo}.git"),
-    }
+) -> Vec<crate::route::Candidate> {
+    routes_for(&PushTarget::github(config), token)
 }
 
 pub(crate) async fn run_git(dir: &Path, args: &[&str]) -> Result<String> {
@@ -2625,6 +2940,17 @@ async fn run_git_status(dir: &Path, args: &[&str]) -> Result<(bool, String, Stri
     ))
 }
 
+/// `ls-remote` 的一行输出里，这个分支报的是不是 `rev`。
+///
+/// 一行的形状是 `<sha>\trefs/heads/<branch>`；比对逐字，不做前缀或短 sha 匹配——
+/// 「像」与「是」在这里是两件事。
+fn remote_reports_rev(ls_remote: &str, rev: &str) -> bool {
+    ls_remote.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        matches!((fields.next(), fields.next()), (Some(sha), Some(_)) if sha == rev)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2640,6 +2966,7 @@ mod tests {
 
     fn change(id: &str, diff: &str) -> GeneratedChange {
         GeneratedChange {
+            unit_of_work: None,
             change_id: id.into(),
             goal: "fix the thing".into(),
             content: diff.into(),
@@ -2729,6 +3056,37 @@ mod tests {
         }
         async fn ci_failure_log_for_sha(&self, _sha: &str) -> Result<String> {
             self.log.clone().map_err(CogGitHubError::Provider)
+        }
+    }
+
+    /// CI 还没有判词：仍在跑，或者还没有检查报到。
+    struct PendingCiProvider;
+
+    #[async_trait::async_trait]
+    impl CodePlatformProvider for PendingCiProvider {
+        async fn list_open_issues(&self) -> Result<Vec<crate::provider::PlatformIssue>> {
+            Ok(Vec::new())
+        }
+        async fn create_pull_request(
+            &self,
+            _req: crate::provider::CreatePullRequest,
+        ) -> Result<crate::provider::PlatformPullRequest> {
+            Err(CogGitHubError::Provider("unused".into()))
+        }
+        async fn comment_on_issue(&self, _n: u64, _body: String) -> Result<()> {
+            Ok(())
+        }
+        async fn merge_pull_request(&self, _n: u64, _sha: String) -> Result<()> {
+            Ok(())
+        }
+        async fn get_pull_request(&self, _n: u64) -> Result<crate::provider::PullRequestDetail> {
+            Err(CogGitHubError::Provider("unused".into()))
+        }
+        async fn ci_verdict_for_sha(&self, _sha: &str) -> Result<Option<bool>> {
+            Ok(None)
+        }
+        async fn ci_failure_log_for_sha(&self, _sha: &str) -> Result<String> {
+            Ok(String::new())
         }
     }
 
@@ -3059,7 +3417,11 @@ mod tests {
             "an unreadable diff has to stay retryable: {early:?}"
         );
 
-        let denied = change("c2", &diff_touching(&["deploy/cogneva/pg.yaml"]));
+        // A path the whitelist does not carry. `deploy/**` used to be the
+        // example here, but deploy changes now reach their admission gate
+        // instead of being refused by path, so this fixture is a path no gate
+        // has since claimed: the whitelist alone decides it.
+        let denied = change("c2", &diff_touching(&["docs/notes.md"]));
         assert_eq!(
             chan.check_policy(&denied, false).unwrap_err().category,
             LandingCategory::Path
@@ -3536,7 +3898,11 @@ mod tests {
     #[tokio::test]
     async fn a_whitelist_violation_is_counted_under_path() {
         let (chan, metrics) = measured_channel(Default::default());
-        let ch = change("c1", &diff_touching(&["deploy/helm/cogneva/values.yaml"]));
+        // Not whitelisted, so the whitelist is the guard that refuses it.
+        // `deploy/**` stopped being a whitelist violation the moment the
+        // landing policy stopped forbidding it; the family is judged by its
+        // admission conditions now.
+        let ch = change("c1", &diff_touching(&["docs/notes.md"]));
 
         chan.land(&ch, None).await.unwrap_err();
 
@@ -3890,14 +4256,15 @@ mod tests {
     /// 而不一致读出来正好是「镜像没跟上」——一个查不出病因的读数。
     #[test]
     fn a_proxy_route_differs_only_by_the_platform_segment() {
-        assert_eq!(
-            proxy_route("http://gw:8081/git/", "github", "o/r"),
-            "http://gw:8081/git/github/o/r.git"
-        );
-        assert_eq!(
-            proxy_route("http://gw:8081/git", "gitee", "o/r"),
-            "http://gw:8081/git/gitee/o/r.git"
-        );
+        let proxy = |slug: &str| {
+            crate::route::candidates(slug, "o/r", Some("http://gw:8081/git/"), false, None, true)
+                .into_iter()
+                .find(|candidate| candidate.route() == crate::route::ROUTE_PROXY)
+                .expect("proxy route")
+                .url
+        };
+        assert_eq!(proxy("github"), "http://gw:8081/git/github/o/r.git");
+        assert_eq!(proxy("gitee"), "http://gw:8081/git/gitee/o/r.git");
     }
 
     /// 只有 Gitee 集成开着、并且指向**同一个**仓库时才有第二个宿主。指向另一个
@@ -4164,6 +4531,74 @@ mod tests {
         std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
+    /// 事实读面的折叠：同一变更最后一条胜出、`closed` 的离开通道、老行与坏行跳过。
+    ///
+    /// 这三句话就是「盘上那份文件不再是通道的记忆」的全部内容：少一句，要么一条
+    /// 已关闭的落地会永远被重新判一次，要么一条老记录会凭空消失。
+    #[test]
+    fn the_fact_read_keeps_the_last_record_and_drops_closed_ones() {
+        let now = Utc::now();
+        let mk = |id: &str, state: LandingState, rev: &str, updated: DateTime<Utc>| LandingRecord {
+            change: change(id, &diff_touching(&["crates/cog-github/src/lib.rs"])),
+            base: "main".into(),
+            landed_rev: rev.into(),
+            state,
+            failure_recorded: false,
+            redriven: false,
+            unlanded_reported: false,
+            inherited_ci_reported: false,
+            ci_aged_reported: false,
+            retired_reason: None,
+            created_at: now,
+            updated_at: updated,
+        };
+        let attrs = |record: &LandingRecord, closed: bool| {
+            serde_json::json!({
+                "change_id": record.change.change_id,
+                "base": record.base,
+                "landed_rev": record.landed_rev,
+                "state": record.state.as_str(),
+                "retired_reason": record.retired_reason,
+                "record": serde_json::to_string(record).unwrap(),
+                "closed": closed,
+            })
+            .to_string()
+        };
+        let older = mk("chg-a", LandingState::Unverified, "", now);
+        let newer = mk(
+            "chg-a",
+            LandingState::Landed,
+            "abc1234",
+            now + chrono::Duration::seconds(1),
+        );
+        let gone = mk("chg-b", LandingState::Landed, "def", now);
+        let legacy = serde_json::json!({
+            "change_id": "chg-c",
+            "base": "main",
+            "landed_rev": "",
+            "state": "unverified",
+            "retired_reason": null,
+        })
+        .to_string();
+
+        let records = records_from_landing_attributes(&[
+            attrs(&older, false),
+            legacy,
+            attrs(&gone, false),
+            attrs(&newer, false),
+            attrs(&gone, true),
+            "not json".to_string(),
+        ]);
+        assert_eq!(records.len(), 1, "只剩在飞的那一条：{records:?}");
+        assert_eq!(records[0].change.change_id, "chg-a");
+        assert_eq!(
+            records[0].state,
+            LandingState::Landed,
+            "同一变更后到的那条应当胜出"
+        );
+        assert_eq!(records[0].landed_rev, "abc1234");
+    }
+
     /// 落地会按上限拒掉的那一份，不许先进记录。
     ///
     /// 记录一写下，验证循环就把它整棵验一遍、提交、release 构建，到落地才按
@@ -4304,6 +4739,7 @@ mod tests {
             redriven: false,
             unlanded_reported: false,
             inherited_ci_reported: false,
+            ci_aged_reported: false,
             retired_reason: None,
             created_at: now,
             updated_at: now,
@@ -4365,6 +4801,7 @@ mod tests {
             redriven: false,
             unlanded_reported: false,
             inherited_ci_reported: false,
+            ci_aged_reported: false,
             retired_reason: Some("patch does not apply".into()),
             created_at: now - chrono::Duration::seconds(7200),
             updated_at: now - chrono::Duration::seconds(7200),
@@ -4408,6 +4845,7 @@ mod tests {
                 redriven: false,
                 unlanded_reported: false,
                 inherited_ci_reported: false,
+                ci_aged_reported: false,
                 retired_reason: None,
                 created_at: now - chrono::Duration::seconds(age_secs),
                 updated_at: now - chrono::Duration::seconds(age_secs),
@@ -4457,6 +4895,74 @@ mod tests {
         std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
+    /// 过了窗口而 CI 仍在跑：记录留下、继续看，只登一条读数。
+    ///
+    /// 旧行为是按钟点把记录删掉——那条 CI 下一轮报出来的绿（或红的自动回滚）
+    /// 就再也读不到了。这里用一条「还没有判词」的记录跑两轮：第一轮登读数并上
+    /// 闩，第二轮既不重复说、也不删记录。
+    #[tokio::test]
+    async fn a_landing_whose_ci_is_still_running_is_not_dropped_at_the_window() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", dir.path());
+
+        let policy = crate::config::LandingPolicy {
+            ci_watch_timeout_secs: 1800,
+            ..Default::default()
+        };
+        let chan = MainChannel::new(
+            "/tmp/nonexistent",
+            GitHubIntegrationConfig {
+                repo: "o/r".into(),
+                landing_policy: policy,
+                ..Default::default()
+            },
+            Arc::new(PendingCiProvider),
+            ContributionController::new_shared(),
+        );
+        let now = Utc::now();
+        save_record(&LandingRecord {
+            change: change(
+                "chg-still-running",
+                &diff_touching(&["crates/cog-github/src/lib.rs"]),
+            ),
+            base: "main".into(),
+            landed_rev: "abc1234".into(),
+            state: LandingState::Landed,
+            failure_recorded: false,
+            redriven: false,
+            unlanded_reported: false,
+            inherited_ci_reported: false,
+            ci_aged_reported: false,
+            retired_reason: None,
+            created_at: now - chrono::Duration::seconds(7200),
+            updated_at: now - chrono::Duration::seconds(7200),
+        })
+        .await
+        .unwrap();
+
+        watch_landed(&chan, None, None).await;
+
+        let rec = load_record("chg-still-running")
+            .await
+            .expect("一条还在跑的 CI 的记录不能被窗口删掉：它的判词下一轮才到");
+        assert!(rec.ci_aged_reported, "过了窗口要登一条读数");
+        assert_eq!(
+            rec.updated_at,
+            now - chrono::Duration::seconds(7200),
+            "量年龄的钟不能被这次登记推动，否则这条读数会在下一轮自己消失"
+        );
+
+        watch_landed(&chan, None, None).await;
+        assert!(
+            load_record("chg-still-running").await.is_some(),
+            "第二轮仍然要留着它"
+        );
+
+        remove_record("chg-still-running").await;
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
     /// A channel whose CI provider answers with a fixed result, so the watch
     /// loop's red-verdict path runs without a network.
     fn watch_channel(policy: crate::config::LandingPolicy, provider: RedCiProvider) -> MainChannel {
@@ -4484,6 +4990,7 @@ mod tests {
             redriven: false,
             unlanded_reported: false,
             inherited_ci_reported: false,
+            ci_aged_reported: false,
             retired_reason: None,
             created_at: now,
             updated_at: now,
@@ -4704,6 +5211,7 @@ mod tests {
             redriven: false,
             unlanded_reported: false,
             inherited_ci_reported: false,
+            ci_aged_reported: false,
             retired_reason: None,
             created_at: now,
             updated_at: now,
@@ -4996,6 +5504,7 @@ mod tests {
             redriven: false,
             unlanded_reported: false,
             inherited_ci_reported: false,
+            ci_aged_reported: false,
             retired_reason: None,
             created_at: now,
             updated_at: now,
@@ -5051,6 +5560,7 @@ mod tests {
             redriven: false,
             unlanded_reported: false,
             inherited_ci_reported: false,
+            ci_aged_reported: false,
             retired_reason: None,
             created_at: now,
             updated_at: now,
@@ -5072,5 +5582,28 @@ mod tests {
             1.0,
             "收下的那一次也被算成失败，这一格就没有分辨力了"
         );
+    }
+    /// 推完读回远端：只有逐字相等才算到了。
+    #[test]
+    fn the_remote_must_report_the_exact_revision() {
+        let rev = "0123456789abcdef0123456789abcdef01234567";
+        assert!(remote_reports_rev(
+            &format!("{rev}\trefs/heads/main\n"),
+            rev
+        ));
+        assert!(!remote_reports_rev(
+            "fedcba9876543210fedcba9876543210fedcba98\trefs/heads/main\n",
+            rev
+        ));
+        assert!(!remote_reports_rev("", rev));
+        // 短 sha 与多一个字符的都不是它。
+        assert!(!remote_reports_rev(
+            &format!("{}\trefs/heads/main\n", &rev[..12]),
+            rev
+        ));
+        assert!(!remote_reports_rev(
+            &format!("{rev}0\trefs/heads/main\n"),
+            rev
+        ));
     }
 }

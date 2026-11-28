@@ -305,7 +305,7 @@ async fn the_spawned_loop_passes_without_waiting_a_full_interval() {
     assert!(pass > 0.0, "the loop produced no pass within its interval");
 
     shutdown.trigger();
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    cog_core::ignore_lost!(tokio::time::timeout(Duration::from_secs(5), handle).await);
 
     let totals = metrics
         .query_counter_totals("tier_migration_total")
@@ -415,7 +415,7 @@ async fn the_loop_migrates_only_while_it_holds_the_role() {
         "the loop must publish that it does not hold the role"
     );
     shutdown.trigger();
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    cog_core::ignore_lost!(tokio::time::timeout(Duration::from_secs(5), handle).await);
     assert!(
         path.exists(),
         "a process that does not hold the role must not migrate the log"
@@ -452,5 +452,5 @@ async fn the_loop_migrates_only_while_it_holds_the_role() {
         "the loop that migrated must be the one that holds the role"
     );
     shutdown.trigger();
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    cog_core::ignore_lost!(tokio::time::timeout(Duration::from_secs(5), handle).await);
 }

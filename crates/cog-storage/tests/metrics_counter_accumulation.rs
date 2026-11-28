@@ -59,7 +59,8 @@ async fn total(backend: &PostgresMetricsBackend, pool: &PgPool, series: &str) ->
     // way.
     backend.flush_pending().await.unwrap();
     sqlx::query_scalar(
-        "SELECT value FROM cog_metric_counter_totals WHERE name = $1 AND labels = $2",
+        "SELECT value FROM cog_metric_counter_totals \
+          WHERE name = $1 AND labels = ($2::jsonb::text)",
     )
     .bind(METRIC)
     .bind(serde_json::json!({ "series": series }))

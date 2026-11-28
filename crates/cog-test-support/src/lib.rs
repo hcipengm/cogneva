@@ -7,21 +7,29 @@
 //! 只是绿的来源不同。
 //!
 //! 判据在 `crates/cogneva/tests/the_fixture_reading_steps_are_written_once_test.rs`：
-//! 这份文件里定义过的函数体，不许在任何一份夹具里再出现一遍。
+//! 这个 crate 里定义过的函数体，不许在任何一份夹具里再出现一遍。
 
 use std::path::{Path, PathBuf};
 
 use sqlx::Connection as _;
 
 mod backends;
+mod change_candidates;
+mod event_stream;
+mod literals;
 mod message;
 mod metrics;
+mod orchestrator;
 mod state;
 mod task_ledger;
 
 pub use backends::{MemoryObjectBackend, MemoryVectorBackend};
+pub use change_candidates::MemoryCandidateStore;
+pub use event_stream::event_stream;
+pub use literals::{literal_values, literals_in, standalone_numbers, Literal};
 pub use message::MemoryMessageBackend;
 pub use metrics::MemoryMetricsBackend;
+pub use orchestrator::TaskGraphStub;
 pub use state::MemoryStateBackend;
 pub use task_ledger::{clear_task_ledger, clear_task_ledger_for, purge_task};
 
@@ -169,10 +177,12 @@ fn own_schema_name(label: &str, pid: u32, nanos: u128, seq: u64) -> String {
 /// 删不掉不算失败：用例的结论说的是被测代码，不是收尾时数据库还在不在。
 pub async fn drop_schema(url: &str, schema: &str) {
     if let Ok(mut admin) = sqlx::PgConnection::connect(url).await {
-        sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        if let Err(err) = sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
             .execute(&mut admin)
             .await
-            .ok();
+        {
+            eprintln!("schema {schema} was not dropped: {err}");
+        }
     }
 }
 

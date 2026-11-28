@@ -108,58 +108,129 @@ esac
 out=$(bash "$SCRIPT" --dry-run "$TMP/nope" 2>&1); rc=$?
 [ "$rc" -eq 2 ] && ok "样本文件不在是 rc=2" || bad "样本文件不在：期望 rc=2，实得 $rc（$out）"
 
-# 6. 这台 Pod 的形状必须与 chart 的 `resourceGovernance.runtimeWorkloads` 逐项相同。
-#    额度把这一份形状算进了命名空间天花板（`deploy/helm/cogneva/values.yaml`），两边
-#    不一致时准入按另一份数算——**这台 Pod 就会从滚动的重叠额度里借地方**。2026-10-26
-#    实测过一次：这台 3Gi 的 Pod 在跑时，`cogneva` 的滚动 surge（12Gi）恰好差 1Gi 装不
-#    进去，部署器按设计扣住不动，连续两轮 mainline 一个 rev 都没上去。所以只改一边必须红。
-REPO="${COGNEVA_REPO:-$(cd "$HERE/../.." && pwd)}"
-VALUES="$REPO/deploy/helm/cogneva/values.yaml"
-pod_rendered=1
-bash "$SCRIPT" --print-pod >"$TMP/pod.yaml" 2>"$TMP/pod.err"; rc=$?
-if [ "$rc" -ne 0 ]; then
-  # 清单没渲染出来时 pod.yaml 里是那句错误本身，而第 8 格如果只判「文件在」就会拿这段
-  # 文本去喂 YAML——报出来的是 Python 的 TypeError，与真正的原因（清单没生成）无关。
-  pod_rendered=0
-  bad "--print-pod 退 $rc，拿不到清单（$(head -1 "$TMP/pod.err")）"
-elif [ ! -f "$VALUES" ]; then
-  bad "找不到 chart values：$VALUES（用 COGNEVA_REPO 指路）"
-else
-  verdict=$(python3 - "$TMP/pod.yaml" "$VALUES" <<'PY' 2>&1
-import sys, yaml
-
-def q(text):
-    text = str(text).strip()
-    if text.endswith("m"):
-        return ("cpu", float(text[:-1]))
-    suffix = {"Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "K": 10**3, "M": 10**6, "G": 10**9}
-    for k, f in suffix.items():
-        if text.endswith(k):
-            return ("mem", float(text[: -len(k)]) * f)
-    return ("count", float(text))
-
-pod = yaml.safe_load(open(sys.argv[1]))
-declared = yaml.safe_load(open(sys.argv[2]))["resourceGovernance"]["runtimeWorkloads"]
-if len(declared) != 1:
-    print(f"CHART 的 runtimeWorkloads 是 {len(declared)} 条，脚本只建一类 Pod：两边说的不是同一件事")
-    sys.exit(0)
-want = declared[0]
-res = pod["spec"]["containers"][0].get("resources") or {}
-pairs = [
-    ("limits.cpu", want.get("cpuLimit"), (res.get("limits") or {}).get("cpu")),
-    ("limits.memory", want.get("memoryLimit"), (res.get("limits") or {}).get("memory")),
-    ("requests.cpu", want.get("cpuRequest"), (res.get("requests") or {}).get("cpu")),
-    ("requests.memory", want.get("memoryRequest"), (res.get("requests") or {}).get("memory")),
-]
-bad_pairs = [f"{k}: chart={c!r} pod={p!r}" for k, c, p in pairs if c is None or p is None or q(c) != q(p)]
-print("OK" if not bad_pairs else "；".join(bad_pairs))
-PY
-)
-  case "$verdict" in
-    OK) ok "Pod 的形状与 chart 的 runtimeWorkloads 逐项相同" ;;
-    *) bad "Pod 形状与 chart 声明不一致：${verdict}" ;;
+# 6. 这台 Pod 的形状不是脚本里的一个常数：它跟线上 deployment 的容器声明走。
+#
+#    这台 Pod 跑的是线上那份二进制、读同一套数据、连同一个网关，所以它在准入里占的
+#    就是线上工作负载的一份。形状写死过一次，代价 2026-10-26 实测：那台 3Gi 的 Pod
+#    在跑时，滚动 surge（12Gi）恰好差 1Gi 装不进去，部署器按设计扣住不动，两轮
+#    mainline 一个 rev 都没上去。所以这一格判三件事：形状来自 deployment（不是常数）、
+#    deployment 变了形状跟着变、没有集群时打印用的是明说的种子而不是悄悄编一个。
+fake="$TMP/fake-kubectl"
+cat >"$fake" <<'SH'
+#!/usr/bin/env bash
+# 假 kubectl：状态在 $FAKE_STATE（`<名字> <pid> <checkpoint>` 每行一条），delete 记进
+# $FAKE_DELETES；deployment 的容器形状在 $FAKE_SHAPE（四格，缺省是脚本里的种子），
+# 配额硬顶在 $FAKE_QUOTA（五格；文件不在＝这份部署没有配额），patch 载荷逐行记进
+# $FAKE_PATCHES，最后 apply 进来的清单存到 $FAKE_APPLIED。
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--namespace) shift 2 ;;
+    get)
+      case "${2:-}" in
+        pods)
+          # `<名字> <pid> <checkpoint 标签>`，与线上 jsonpath 的三格同形。
+          while read -r n p c; do [ -n "$n" ] && printf '%s %s %s\n' "$n" "${p:--}" "${c:--}"; done <"${FAKE_STATE:-/dev/null}"
+          ;;
+        deployment)
+          case "$*" in
+            *resources.requests.cpu*)
+              if [ -n "${FAKE_SHAPE:-}" ] && [ -f "$FAKE_SHAPE" ]; then cat "$FAKE_SHAPE"
+              else printf '500m 1Gi 2 3Gi\n'; fi ;;
+            *) printf 'localhost:30500/cogneva:test\n' ;;
+          esac ;;
+        resourcequota)
+          [ -n "${FAKE_QUOTA:-}" ] && [ -f "$FAKE_QUOTA" ] && cat "$FAKE_QUOTA" ;;
+        *) : ;;
+      esac
+      exit 0 ;;
+    delete)
+      shift
+      [ "${1:-}" = pod ] && shift
+      if [ -n "${1:-}" ]; then
+        if [ -n "${FAKE_STATE:-}" ] && [ -f "$FAKE_STATE" ]; then
+          grep -v "^$1 " "$FAKE_STATE" >"$FAKE_STATE.new" || :
+          mv "$FAKE_STATE.new" "$FAKE_STATE"
+        fi
+        printf '%s\n' "$1" >>"${FAKE_DELETES:-/dev/null}"
+      fi
+      exit 0 ;;
+    apply)
+      applied=$(mktemp)
+      cat >"$applied"
+      [ -n "${FAKE_APPLIED:-}" ] && cp "$applied" "$FAKE_APPLIED"
+      if [ -n "${FAKE_STATE:-}" ]; then
+        name=$(sed -n 's/^  name: \(.*\)$/\1/p' "$applied" | head -1)
+        [ -n "$name" ] && printf '%s 0\n' "$name" >>"$FAKE_STATE"
+      fi
+      rm -f "$applied"
+      exit 0 ;;
+    patch)
+      shift
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          -p) printf '%s\n' "$2" >>"${FAKE_PATCHES:-/dev/null}"; shift 2 ;;
+          *) shift ;;
+        esac
+      done
+      exit 0 ;;
+    wait) exit 0 ;;
+    exec|auth|logs) exit 0 ;;
+    *) shift ;;
   esac
+done
+exit 0
+SH
+chmod +x "$fake"
+
+# 把一份形状喂给假 deployment，印出清单里那台 Pod 的 `<来源>|<四个数>`。
+shape_of() { # shape_of <"cpuReq memReq cpuLim memLim">
+  printf '%s\n' "$1" >"$TMP/shape"
+  KUBECTL="$fake" FAKE_SHAPE="$TMP/shape" FAKE_STATE="$TMP/shape-state" \
+    bash "$SCRIPT" --print-pod 2>"$TMP/shape.err" \
+    | python3 -c 'import sys, yaml
+pod = yaml.safe_load(sys.stdin)
+c = pod["spec"]["containers"][0]
+r = c["resources"]
+print(pod["metadata"]["annotations"]["cogneva.dev/resources-source"],
+      r["requests"]["cpu"], r["requests"]["memory"],
+      r["limits"]["cpu"], r["limits"]["memory"], sep="|")'
+}
+
+got=$(shape_of "250m 2Gi 4 8Gi")
+if [ "$got" = "deployment/cogneva|250m|2Gi|4|8Gi" ]; then
+  ok "Pod 的形状照抄线上 deployment 的容器声明（来源也写在注解里）"
+else
+  bad "Pod 的形状没跟 deployment 走：期望 deployment/cogneva|250m|2Gi|4|8Gi，实得「$got」"
 fi
+
+got=$(shape_of "500m 3Gi 1 6Gi")
+if [ "$got" = "deployment/cogneva|500m|3Gi|1|6Gi" ]; then
+  ok "deployment 的声明变了，这台 Pod 的形状跟着变（不是脚本里的常数）"
+else
+  bad "改 deployment 的形状没有传到 Pod 上：实得「$got」"
+fi
+
+# 没有集群时：打印仍然可用，但形状必须**明说是种子**，不许读成「线上就是这个」。
+printf '#!/usr/bin/env bash\nexit 1\n' >"$TMP/kubectl-no-cluster"
+chmod +x "$TMP/kubectl-no-cluster"
+got=$(KUBECTL="$TMP/kubectl-no-cluster" FAKE_STATE="$TMP/shape-state" \
+  bash "$SCRIPT" --print-pod 2>"$TMP/shape.err" \
+  | python3 -c 'import sys, yaml
+pod = yaml.safe_load(sys.stdin)
+c = pod["spec"]["containers"][0]
+r = c["resources"]
+print(pod["metadata"]["annotations"]["cogneva.dev/resources-source"],
+      r["requests"]["cpu"], r["requests"]["memory"],
+      r["limits"]["cpu"], r["limits"]["memory"], sep="|")')
+if [ "$got" = "seed|500m|1Gi|2|3Gi" ]; then
+  ok "没有集群时打印用的是明说的种子形状（来源注解 seed）"
+else
+  bad "离线打印没有标成种子：实得「$got」"
+fi
+
+pod_rendered=1
+KUBECTL="$fake" FAKE_SHAPE="$TMP/shape" FAKE_STATE="$TMP/shape-state" \
+  bash "$SCRIPT" --print-pod >"$TMP/pod.yaml" 2>"$TMP/pod.err" || pod_rendered=0
 
 # 7. 镜像**跟线上走**，不钉一个 rev。
 #
@@ -213,49 +284,6 @@ fi
 #    而判词写的是「另一个驱动」——真正的持有者是上一轮自己的 Pod（它一直在判例，89 → 169，
 #    只是没有任何一行日志属于它）。所以判据是三面：留下的 Pod 要删；另一个**还活着**的驱动
 #    要让它、不许删它的 Pod；删完之后检查点还锁着，就说明持有者不是这一族，这一轮不许起。
-fake="$TMP/fake-kubectl"
-cat >"$fake" <<'SH'
-#!/usr/bin/env bash
-# 假 kubectl：只为 --reclaim 与「停这一跑」这两段判据。状态是 $FAKE_STATE 里的
-# `<名字> <起它的 pid>` 每行一条；每次 delete 记进 $FAKE_DELETES。
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -n|--namespace) shift 2 ;;
-    get)
-      case "${2:-}" in
-        pods)
-          # `<名字> <pid> <checkpoint 标签>`，与线上 jsonpath 的三格同形。
-          while read -r n p c; do [ -n "$n" ] && printf '%s %s %s\n' "$n" "${p:--}" "${c:--}"; done <"${FAKE_STATE:-/dev/null}"
-          ;;
-        deployment) printf 'localhost:30500/cogneva:test\n' ;;
-      esac
-      exit 0 ;;
-    delete)
-      shift
-      [ "${1:-}" = pod ] && shift
-      if [ -n "${1:-}" ]; then
-        if [ -n "${FAKE_STATE:-}" ] && [ -f "$FAKE_STATE" ]; then
-          grep -v "^$1 " "$FAKE_STATE" >"$FAKE_STATE.new" || :
-          mv "$FAKE_STATE.new" "$FAKE_STATE"
-        fi
-        printf '%s\n' "$1" >>"${FAKE_DELETES:-/dev/null}"
-      fi
-      exit 0 ;;
-    apply)
-      # 清单从 stdin 来：把这一轮起的 Pod 名字记进状态，好让 delete 找得到它。
-      if [ -n "${FAKE_STATE:-}" ]; then
-        name=$(sed -n 's/^  name: \(.*\)$/\1/p' | head -1)
-        [ -n "$name" ] && printf '%s 0\n' "$name" >>"$FAKE_STATE"
-      fi
-      exit 0 ;;
-    exec|auth|logs) exit 0 ;;
-    *) shift ;;
-  esac
-done
-exit 0
-SH
-chmod +x "$fake"
-
 reclaim_case() { # reclaim_case <dir> -> 印出判词；日志与状态都在 <dir> 里
   CKPT="$1/judge.md.cases.jsonl" LOG="$1/rerun.log" \
     FAKE_STATE="$1/state" FAKE_DELETES="$1/deletes" KUBECTL="$fake" \
@@ -349,12 +377,18 @@ case "$verdict" in
   *) bad "kubectl 读不到：期望判词 reclaim=unreadable，实得「$verdict」" ;;
 esac
 
-# 13. 停这一跑时（TERM），它那一轮的 Pod 跟着走——宿主进程死掉不会通知 Pod。
+# 13. 停这一跑时（TERM），它那一轮的 Pod 与它撑开的那份额度都跟着走——宿主进程死掉
+#     不会通知集群，而留下的 Pod 握着检查点、抬着的额度记在别人头上。
 #
 #    这里真把脚本跑起来（假 kubectl 让一轮建得成），在它等第一拍采样时把整个进程组 TERM
-#    掉，判两件事：退出码是 143，且 Pod 被删了。用 setsid 让脚本自成一组，否则 TERM 只
-#    够得着外层 shell，`sleep` 还在睡，trap 要等它睡完才跑。
+#    掉，判四件事：退出码是 143、Pod 被删了、它建时用的形状就是 deployment 的那份、
+#    配额先加一份形状又原样放回。用 setsid 让脚本自成一组，否则 TERM 只够得着外层 shell，
+#    `sleep` 还在睡，trap 要等它睡完才跑。
 fe="$TMP/reclaim-e"; mkdir -p "$fe"; : >"$fe/state"; : >"$fe/deletes"
+: >"$fe/patches"
+printf '250m 2Gi 4 8Gi\n' >"$fe/shape"
+# 配额的五维故意都不是整数核/整 GiB 之外的形状可以预料的数：加完要能一眼认出来。
+printf '17 52Gi 20 60Gi 240\n' >"$fe/quota"
 cat >"$fe/wrapper.sh" <<WRAP
 #!/usr/bin/env bash
 echo \$\$ >"$fe/runner.pid"
@@ -363,11 +397,13 @@ WRAP
 chmod +x "$fe/wrapper.sh"
 setsid env CKPT="$fe/judge.md.cases.jsonl" LOG="$fe/rerun.log" \
   FAKE_STATE="$fe/state" FAKE_DELETES="$fe/deletes" KUBECTL="$fake" \
+  FAKE_SHAPE="$fe/shape" FAKE_QUOTA="$fe/quota" FAKE_PATCHES="$fe/patches" \
+  FAKE_APPLIED="$fe/applied" \
   bash "$fe/wrapper.sh" >"$fe/out" 2>&1 &
 for _ in $(seq 1 100); do [ -s "$fe/state" ] && break; sleep 0.1; done
 if [ -s "$fe/state" ]; then
   ok "夹具把一轮跑起来了（Pod 已建）"
-  # 判「删的是这一轮的 Pod」，不是「有东西被删过」：旧的脚本在起 Pod 之前也会对**将要**
+  # 判「删的是这一轮的 Pod」，不是「有东西被删过」：脚本在起 Pod 之前也会对**将要**
   # 起的名字发一次 delete（那时它还不存在），拿「delete 记录非空」当判据会被那一次骗过。
   running=$(awk 'NR==1{print $1}' "$fe/state")
   kill -TERM -"$(cat "$fe/runner.pid")" 2>/dev/null
@@ -381,6 +417,50 @@ if [ -s "$fe/state" ]; then
     ok "删除这件事在日志里有一行，读者不用猜 Pod 是为什么没的"
   else
     bad "日志里没有删除那一行"
+  fi
+
+  # 建出来的 Pod 用的必须是 deployment 的那份形状，不是种子。
+  got=$(python3 - "$fe/applied" <<'PY' 2>&1
+import sys, yaml
+pod = yaml.safe_load(open(sys.argv[1]))
+c = pod["spec"]["containers"][0]
+r = c["resources"]
+print(r["requests"]["cpu"], r["requests"]["memory"], r["limits"]["cpu"], r["limits"]["memory"])
+PY
+)
+  if [ "$got" = "250m 2Gi 4 8Gi" ]; then
+    ok "建出来的 Pod 用的是 deployment 的容器形状（不是种子那份）"
+  else
+    bad "建出来的 Pod 形状不对：期望「250m 2Gi 4 8Gi」，实得「$got」"
+  fi
+
+  # 配额：第一笔 patch 是「原值 + 一份形状 + 1 个 pod」，最后一笔是「原值」。
+  # 两笔都必须有：只加不减，额度就永远多出一台 Pod 的份额。
+  patches=$(python3 - "$fe/patches" <<'PY' 2>&1
+import json, sys
+lines = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+def hard(p):
+    return p["spec"]["hard"]
+if len(lines) < 2:
+    print(f"patches={len(lines)}（要一笔加、一笔放回）")
+    sys.exit()
+print(json.dumps(hard(lines[0]), sort_keys=True))
+print(json.dumps(hard(lines[-1]), sort_keys=True))
+PY
+)
+  want_add='{"limits.cpu": "24", "limits.memory": "68Gi", "pods": "241", "requests.cpu": "17250m", "requests.memory": "54Gi"}'
+  want_back='{"limits.cpu": "20", "limits.memory": "60Gi", "pods": "240", "requests.cpu": "17", "requests.memory": "52Gi"}'
+  add=$(printf '%s\n' "$patches" | sed -n 1p)
+  back=$(printf '%s\n' "$patches" | sed -n 2p)
+  if [ "$add" = "$want_add" ]; then
+    ok "创建前按这台 Pod 的形状把配额的四维与 pods 加了一份"
+  else
+    bad "加额度那一笔不对：期望 $want_add，实得「$add」（全部：$patches）"
+  fi
+  if [ "$back" = "$want_back" ]; then
+    ok "Pod 消失后配额原样放回（加性是加自己那一份，减回同一个值）"
+  else
+    bad "放回额度那一笔不对：期望 $want_back，实得「$back」（全部：$patches）"
   fi
 else
   bad "夹具没能把一轮跑起来：$(tail -3 "$fe/out" | tr '\n' ' ')"

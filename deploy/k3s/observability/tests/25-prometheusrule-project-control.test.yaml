@@ -93,3 +93,57 @@ tests:
       - eval_time: 400m
         alertname: CognevaProjectCoverageUnmeasurable
         exp_alerts: []
+
+  # 五、任务图读不到：与基线那一格同形的判定（`for: 10m`、6 小时 `increase`）。
+  # 前半格是反向证据：刚长上去就响等于把一次抖动报成事故。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_project_control_unmeasured_total{reading="no_tasks"}'
+        values: '0x30 1x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaProjectCoverageTaskGraphUnreadable
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: CognevaProjectCoverageTaskGraphUnreadable
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: CognevaProjectCoverageTaskGraphUnreadable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "任务管理"
+
+  # 六、窗口滚过去之后自己安静。没有这一格，`[6h]` 写成无穷也照样绿。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_project_control_unmeasured_total{reading="no_tasks"}'
+        values: '0x30 1x400'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: CognevaProjectCoverageTaskGraphUnreadable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "任务管理"
+      - eval_time: 400m
+        alertname: CognevaProjectCoverageTaskGraphUnreadable
+        exp_alerts: []
+
+  # 七、兄弟那一格在动、这一格停在 0：必须安静。这条守的是 `reading=` 选择器——
+  # 抽掉它，两件修法不同的事会共用一条规则。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_project_control_unmeasured_total{reading="no_tasks"}'
+        values: '0x420'
+      - series: 'cogneva_project_control_unmeasured_total{reading="no_baseline"}'
+        values: '0x30 1x390'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: CognevaProjectCoverageTaskGraphUnreadable
+        exp_alerts: []
+      - eval_time: 400m
+        alertname: CognevaProjectCoverageTaskGraphUnreadable
+        exp_alerts: []

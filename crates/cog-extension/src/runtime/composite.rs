@@ -24,7 +24,10 @@ impl CompositeSandbox {
             SandboxPayload::Command { .. }
             | SandboxPayload::ReadFile { .. }
             | SandboxPayload::WriteFile { .. }
-            | SandboxPayload::EditFile { .. } => &self.executor,
+            | SandboxPayload::EditFile { .. }
+            | SandboxPayload::CaptureCheckpoint { .. }
+            | SandboxPayload::PlanCheckpoint { .. }
+            | SandboxPayload::RestoreCheckpoint { .. } => &self.executor,
         }
     }
 }
@@ -74,6 +77,7 @@ mod tests {
                 output: None,
                 duration_ms: 0,
                 resource_usage: Default::default(),
+                workdir: None,
             })
         }
 
@@ -88,7 +92,6 @@ mod tests {
             agent_id: "a".into(),
             payload,
             input: serde_json::json!({}),
-            timeout: std::time::Duration::from_secs(5),
             limits: Default::default(),
         }
     }

@@ -3,17 +3,27 @@
 //! All modules are declared here so tests can access them via `cogneva::`.
 
 pub mod aof_repair;
+pub mod archive_events;
 pub mod assembly;
 pub mod backup;
 pub mod backup_crypto;
+pub mod batch_edit_agent;
 pub mod bootstrap;
 pub mod build_info;
+pub mod build_plan_readings;
+pub mod cache_misses;
+pub mod cell_plan;
+pub mod change_divergence;
+pub mod change_ledger_parity;
+pub mod chat_rebuild;
+pub mod checkpoints;
 pub mod claim_store;
 pub mod cli;
 pub mod config_loader;
 pub mod config_watcher;
 pub mod conversation;
 pub mod daemon;
+pub mod db_pressure;
 pub mod eval_container;
 pub mod eval_hle;
 pub mod eval_mcp_in_pod;
@@ -22,25 +32,52 @@ pub mod eval_subset;
 pub mod eval_table;
 pub mod eval_toolathlon;
 pub mod eval_toolathlon_local;
+pub mod export_change_diff;
 pub mod gateway_observability;
 pub mod governance;
 pub mod governance_acts;
+pub mod governance_declarations;
+pub mod governance_drivers;
+pub mod governance_exemptions;
+pub mod governance_fronts;
 pub mod governance_readings;
 pub mod health_check;
 pub mod host_ledger;
 pub mod hot_reload;
+pub mod import_change_records;
+pub mod keys;
+pub mod landing_states;
 pub mod mcp_serve;
+pub mod mcp_tools;
+pub mod metric_projection_rebuild;
+pub mod owner_memory;
+pub mod permission_rules;
 pub mod pidfile;
 pub mod pin_census;
 pub mod platform;
 pub mod plugin_registry;
+pub mod principle_corpus;
+pub mod principles;
+pub mod principles_cli;
 pub mod process_census;
 pub mod process_report;
+pub mod read_surfaces;
+pub mod roster_rebuild;
+#[cfg(test)]
+pub(crate) mod roster_test_support;
 pub mod schema_bundle;
 pub mod scraper_endpoint;
 pub mod self_change;
+pub mod session_model;
 pub mod shutdown_coordinator;
 pub mod startup_guard;
+pub mod storage_pressure;
+pub mod table_census;
+pub mod table_copy;
+pub mod table_digest;
+pub mod table_swap;
+pub mod usage_landing_tx;
+pub mod usage_parity;
 pub mod validate_config;
 pub mod volume_walker;
 pub mod work;
@@ -172,7 +209,7 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Create shutdown coordinator early (before plugin init)
     let shutdown =
         shutdown_coordinator::ShutdownCoordinator::new(config.core.system.shutdown_timeout_ms);
-    let _ = SHUTDOWN.set(shutdown.clone());
+    cog_core::ignore_lost!(SHUTDOWN.set(shutdown.clone()));
     let shutdown = Arc::new(shutdown);
 
     let mut plugin_runner = plugin_registry::register_all()?;
@@ -204,6 +241,15 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     plugin_runner.init_all(&ctx).await?;
     cog_observability::boot_footprint::mark("plugins-initialized");
+
+    // 账上此刻生效的规则交给内核：每轮开头随基础指令一起交给员工。与提示词
+    // 本子同一类东西——部署的账，不是编译进二进制的一句；也没有「谁是属主」的
+    // 分支，跑任务的进程与坐在界面里的进程读的是同一本。
+    if let Some(principles) = ctx.consume_service::<dyn cog_core::RuntimePrincipleStore>() {
+        cog_agent::install_principle_source(Arc::new(crate::principles::AccountPrinciples::new(
+            principles,
+        )));
+    }
 
     // 申请改自己：装在**共用**的那张工具表上，不是某一段对话私有的那张。
     //
@@ -251,6 +297,31 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 principles: ctx.consume_service::<dyn cog_core::PrincipleLedgerStore>(),
                 alerts: ctx.consume_service::<dyn cog_core::AlertStore>(),
             };
+            // 运行时原则账：与上面三本不同，它是这段对话里的人能往里写的一本——
+            // 员工提案、属主拍板。上面装给内核的那一份是同一本（`consume_service`
+            // 不拿走服务），所以批了之后下一轮开头读到的就是它。
+            let runtime_principles = ctx.consume_service::<dyn cog_core::RuntimePrincipleStore>();
+            // 进化控制面：属主在对话里放行一条等审批的变更、把正在跑的那一版退回去。
+            // 由反射插件发布；没装的进程照实缺席，工具会把它说出来。
+            let evolution_admin = ctx.consume_service::<dyn cog_core::EvolutionAdmin>();
+            // 外部价值判定的落盘面：属主在对话里说一句「什么算好」，与网关那个提交面
+            // 落到同一本账、署同一个人。没发布的进程照实缺席，工具会说「记不下来」。
+            let taste_sink = ctx.consume_service::<dyn cog_core::TasteIntentSink>();
+            // 外部 MCP 服务：协议插件按端点配好就发布它，没配就是 `None`。对话这一
+            // 侧拿它每轮问一次工具表——没接上的时候界面上是「没挂外部服务」，不是
+            // 「挂了但一只工具都没有」。
+            let mcp = ctx.consume_service::<dyn cog_core::McpClient>();
+            // 属主配的钩子：智能体插件把引擎发布出来，配置从变更目录与进程的
+            // 钩子文件两处载入。对话这一侧拿到的是同一份注册表——属主在哪一
+            // 处写的钩子，这一轮读到的就是哪一处，不存在第二份要同步的表。
+            let hooks = ctx.consume_service::<dyn cog_core::HookEngine>();
+            // 执行器那一侧：检查点拍的是它手上那棵树。扩展插件发布的就是它；
+            // 没装的部署照实缺席，界面读到的是「做不了检查点」。远程执行器
+            // 配了的时候这里拿到的是转发那一层，落盘仍在执行器上。
+            let sandbox = ctx.consume_service::<dyn cog_core::SandboxBackend>();
+            // 对话那一侧写意图用的同一份落点：与网关的 `GatewayState.intent_events`
+            // 是同一个服务，不另装一个进程级全局槽。
+            let intent_events = ctx.consume_service::<dyn cog_core::EventStore>();
             // 平台上每个智能体开头读到的那段话是部署声明的，不是编译进二进制的
             // 一句。声明在 `prompts/` 里，随 ConfigMap 挂进进程；这里把本子交给
             // 内核，任务尝试与界面上的对话都从同一处取。没装提示词插件的进程
@@ -268,6 +339,13 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     inbox,
                     people,
                     ledgers,
+                    runtime_principles,
+                    evolution_admin,
+                    taste_sink,
+                    mcp,
+                    hooks,
+                    sandbox,
+                    intent_events,
                 )))
                 .is_err()
             {
@@ -303,7 +381,7 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         let tx = shutdown_broadcast_tx.clone();
         async move {
             sig.wait().await;
-            let _ = tx.send(());
+            cog_core::ignore_lost!(tx.send(()));
         }
     });
     ctx.publish(shutdown.clone());
@@ -329,6 +407,43 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             .llm_client
             .write()
             .unwrap_or_else(|e| e.into_inner()) = llm;
+    }
+
+    // 后台命令跑完时要回到它那一段对话。句柄簿在 cog-agent 里（工具自己那一侧），
+    // 帧的投递在网关里（哪一条连接在看哪一段）；装配层是唯一同时握着两样的地方，
+    // 所以这条转发只写在这里——写进任何一侧都要让那一侧去够另一侧的东西。
+    if let Some(gateway_state) = ctx.consume::<cog_gateway::GatewayState>() {
+        let mut finished = cog_agent::background::subscribe();
+        let stream = gateway_state.chat_stream.clone();
+        tokio::spawn(async move {
+            loop {
+                match finished.recv().await {
+                    Ok(done) => {
+                        // 不知道属于哪一段的命令（嵌进别的进程里的运行）不投给
+                        // 任何一段：猜一段等于把一条通知发给不相关的人。
+                        let Some(session) = done.session.as_deref() else {
+                            continue;
+                        };
+                        cog_gateway::chat::publish_background_finished(
+                            &stream,
+                            session,
+                            &done.notice,
+                        )
+                        .await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        // 慢到被环挤掉：那几条命令的通知不再补发。它们的输出仍
+                        // 在句柄簿里，用 command_output 读得到；这里说出来，是
+                        // 因为「少了一条消息」与「那条命令没跑完」在屏幕上同形。
+                        tracing::warn!(
+                            skipped,
+                            "background completion notices fell behind; those commands' notices are not re-sent"
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
     }
 
     daemon.ready();
@@ -394,7 +509,7 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         &gateway_state.config,
                         &new_config.gateway,
                         &gateway_state.request_timeout_secs,
-                        &gateway_state.sandbox_task_timeout_secs,
+                        new_config.system.shutdown_timeout_ms,
                     );
                 applied.extend(gateway_applied);
                 need_restart.extend(gateway_restart.clone());
@@ -406,8 +521,10 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // 3. supervisor intervals
-                let new_supervisor_cfg: cog_supervisor::SupervisorConfig =
-                    new_config.supervisor.clone().into();
+                let new_supervisor_cfg = cog_supervisor::SupervisorConfig::from_core(
+                    new_config.supervisor.clone(),
+                    new_config.agent.heartbeat_interval_secs,
+                );
                 if let Err(e) = supervisor_config_tx.send(new_supervisor_cfg) {
                     tracing::warn!("Failed to send supervisor config reload: {}", e);
                 } else {
@@ -424,7 +541,7 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 if active_llm_routing != new_llm_routing {
                     let new_stream_capacity = match cog_llm::TuningConfig::load() {
-                        Ok(t) => t.stream_capacity,
+                        Ok(t) => t.stream_capacity_or_default(),
                         Err(e) => {
                             tracing::warn!("tuning reload skipped: {}", e);
                             continue;

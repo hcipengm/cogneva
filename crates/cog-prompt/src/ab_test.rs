@@ -40,15 +40,21 @@ pub struct VariantMetrics {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AbTestConfig {
     pub min_samples: u64,
-    pub confidence_threshold: f64,
+    /// 没有 `confidence_threshold`：`pick_winner` 比的是成功率，从来没有算过
+    /// 置信区间，一个没人算的显著性阈值只会让配置面声称一件代码没做的事。
     pub auto_promote: bool,
 }
+
+// 五十次曝光：一个变体的成功率在五十次以内只能分辨几十个百分点的差别，再少
+// 胜出者就可能只是运气；这个数是「够不够比」的门，不是统计显著性的门。
+// cap: fixed — 五十次：再少分辨不出几十个百分点的差别，胜出者可能只是运气
+// keep: 删掉后几十个百分点的差别也可能只是运气；由「五十次才分辨得出」兜住
+const AB_WINNER_MIN_SAMPLES: u64 = 50;
 
 impl Default for AbTestConfig {
     fn default() -> Self {
         Self {
-            min_samples: 50,
-            confidence_threshold: 0.95,
+            min_samples: AB_WINNER_MIN_SAMPLES,
             auto_promote: false,
         }
     }
@@ -92,6 +98,41 @@ pub fn pick_winner(variants: &[PromptVariant], config: &AbTestConfig) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 胜出门槛只有一处声明：默认值读常量，源码面 `impl Default` 的字段里不再有
+    /// 数字。`confidence_threshold` 已删除——`pick_winner` 从来没有算过它。
+    #[test]
+    fn the_ab_winner_threshold_reads_its_name() {
+        assert_eq!(AbTestConfig::default().min_samples, AB_WINNER_MIN_SAMPLES);
+        // 针不在这一行里原样出现：否则这条判据读到的就是它自己。
+        let needle = concat!("confidence_", "threshold: f64");
+        assert!(
+            !include_str!("ab_test.rs").contains(needle),
+            "没人算的显著性阈值不许留在配置面上"
+        );
+        let body = include_str!("ab_test.rs")
+            .split("impl Default for AbTestConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    let value = value.trim().trim_end_matches(',');
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.starts_with(|c: char| c.is_ascii_digit())
+                        // 哨兵 0 与空串不是旋钮，是「没写」。
+                        && value != "0"
+                })
+            })
+            .map(str::trim)
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
+    }
 
     #[test]
     fn test_select_variant_deterministic() {

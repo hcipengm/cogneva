@@ -52,6 +52,14 @@
 #     <cwd>/target; any process of ours with a working directory or an open file
 #     descriptor inside a tree counts as well. A process of ours whose files
 #     cannot be read is not evidence of absence: it fails the whole run closed.
+#     And "writing" is not only "a writer is there right now": a gate run that
+#     has started but has not reached its first `rustc` yet holds the tree its
+#     next step will read, with no cargo process to show for it -- so the slot
+#     gate's own `.running` records (live pid) are a fourth leg. Without it, the
+#     gap between "nothing is writing" and "the build about to read it" is
+#     exactly where a deletion lands: on 2026-11-23 a reclaim in that gap removed
+#     `build/ring-*/out`, and the same gate's `rustc` eight seconds later failed
+#     while cargo's fingerprints still called the artifacts fresh.
 #   - deletes nothing unless the file about to run is exactly the committed
 #     version of it. The unit points straight at the checkout, which is what
 #     keeps the script from ever going stale -- and the same property means an
@@ -84,6 +92,11 @@ generations_keep="${COGNEVA_TARGET_GC_GENERATIONS_KEEP:-1}"
 stale_days="${COGNEVA_TARGET_GC_STALE_DAYS:-3}"
 dry_run="${COGNEVA_TARGET_GC_DRY_RUN:-0}"
 writer_processes="${COGNEVA_TARGET_GC_WRITER_PROCESSES:-cargo rustc rustdoc cc gcc g++ clang clang++ ld lld mold as make ninja cmake}"
+# 门的构建槽目录：与 `deploy/scripts/lib/build-slot.sh` 同一个键、同一个默认值。
+# 两处各写一个默认值，改过路径的机器上就会一半写进一个目录、一半读另一个目录——
+# 那正好是本脚本要防的那种「读的人看不见」的偏差。目录本身是约定（gate 的接口），
+# 不是旋钮：它由门的实现定，所以这里只照抄它的名字。
+gate_dir="${COGNEVA_BUILD_GATE_LOCK_DIR:-/var/lib/cogneva-build-gate}"
 # The reading the whole decision hangs on, and therefore the one thing a test
 # has to be able to hand over: a command that prints "<used_kb> <percent>" for
 # the path it is given. Left unset it is df. When it is set the run says so,
@@ -140,6 +153,14 @@ script_identity() {
 
 [ -n "${work_root}" ] || die "COGNEVA_HOST_WORK_ROOT is unset: this script never guesses which filesystem to judge"
 [ -d "${work_root}" ] || die "COGNEVA_HOST_WORK_ROOT=${work_root} is not a directory"
+
+# 临时工作树的整棵树先放掉：它不承载任何东西（没有进程持有时才动），比这份缓存里的
+# 任何一层都便宜，而且它的判据不是水位线（见 host-scratch-gc.sh：空闲 < 它们自己占
+# 的空间才动手）。放在这里，半小时那一拍也会同一趟把临时树收掉。
+scratch_gc="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/host-scratch-gc.sh"
+if [ -x "${scratch_gc}" ]; then
+    "${scratch_gc}" || true
+fi
 # Resolve once so that paths read out of /proc compare against it textually.
 work_root="$(cd "${work_root}" && pwd -P)"
 
@@ -307,6 +328,42 @@ collect_process_views() {
                 split($1, part, "/")
                 printf "%s\t%s\tholds it open\n", path, part[3]
             }' >>"${busy}"
+
+    # 第三腿：**已经开跑、还没轮到 `rustc`** 的那一跑。
+    #
+    # 上面两腿问的都是「此刻有没有写者」，而一次门从开跑到第一个 `rustc` 之间有一段
+    # 空档：它已经占住了接下来要读的树，可那一刻没有任何 cargo/rustc 进程。按写者判，
+    # 这段空档里的树是可删的——2026-11-23 23:44 就是这么删掉了 `target/debug/build/ring-*/out`
+    # （实测 2026-11-23 本机整批 9.2 GiB），八秒后同一道推前门的 `rustc` 报 `could not find native static
+    # library ring-core`，而 cargo 的指纹仍把那批产物记成新的，连重构都要先
+    # `cargo clean -p`（CC63）。
+    #
+    # 这一段不是猜的：门的每一次开跑在动手之前就写下 `.running` 记录（见
+    # `lib/gate-run-record.sh`），收尾时改名成 `.segments`。记录还在 `.running` 上、
+    # 且它指名的那个 pid 还活着，就是「这一跑的下一次 `rustc` 会读这棵树」。pid 已经
+    # 没了的那份记录是一条证据（那一跑被杀了），不是一次待办的构建，照旧不挡。
+    collect_pending_builds "${busy}"
+}
+
+# 开跑了、还没开始编译的那几跑会读的树，按 pid 写进 busy。
+#
+# pid 是不是「同一跑」的判断只有活着这一条：宿主上 pid 会被复用，复用后读到的是
+# 另一个进程的 cwd。最坏的结果是替一棵没人用的树多留一拍——回收器只是推迟，判据
+# 不会因此放松，所以这里不为一串十六进制的启动时间再造一份身份。
+collect_pending_builds() {
+    local busy="$1" rec name pid cwd dir
+    [ -d "${gate_dir}/runs" ] || return 0
+    for rec in "${gate_dir}"/runs/*.running; do
+        [ -f "${rec}" ] || continue
+        name="$(basename -- "${rec}")"
+        pid="${name%.running}"
+        pid="${pid##*-}"
+        case "${pid}" in '' | *[!0-9]*) continue ;; esac
+        [ -d "/proc/${pid}" ] || continue
+        cwd="$(readlink "/proc/${pid}/cwd" 2>/dev/null)" || continue
+        dir="$(build_dir_of "${pid}" "${cwd}")"
+        printf '%s\t%s\tbuilds (pending gate run %s)\n' "${dir}" "${pid}" "${name}" >>"${busy}"
+    done
 }
 
 # A reason if anything is using the tree or writing into it, empty otherwise.

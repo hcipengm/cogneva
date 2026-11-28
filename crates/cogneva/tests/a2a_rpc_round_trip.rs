@@ -384,7 +384,7 @@ async fn the_card_answers_in_the_version_the_caller_asked_for() {
         status, 400,
         "an unserved version is refused, not rounded down"
     );
-    let said = refusal["message"].as_str().unwrap_or_default();
+    let said = refusal["message"].as_str().unwrap_or(Default::default());
     assert!(
         said.contains("0.3") && said.contains("1.0"),
         "the refusal names the versions that are served: {said}"
@@ -498,7 +498,7 @@ async fn the_card_is_discoverable_where_the_specification_puts_it() {
     // 不服务的版本仍是同一个拒绝，不是 404、也不是悄悄回一份缺省名片。
     let (status, _, _, refusal) = fetch(Some("1.2"), None, None).await;
     assert_eq!(status, 400);
-    let said = refusal["message"].as_str().unwrap_or_default();
+    let said = refusal["message"].as_str().unwrap_or(Default::default());
     assert!(
         said.contains("0.3") && said.contains("1.0"),
         "the refusal names what is served: {said}"
@@ -810,7 +810,7 @@ async fn the_card_address_serves_the_stream_method_too() {
         .headers()
         .get("content-type")
         .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     assert!(
         content_type.starts_with("text/event-stream"),
         "the stream method has to answer with a stream here, not with a refusal: {content_type}"
@@ -1331,9 +1331,9 @@ async fn finish_the_goal_after(
         {
             let since = *seen.get_or_insert_with(std::time::Instant::now);
             if since.elapsed() >= delay {
-                let _ = orchestrator.schedule_task(&task.id).await;
-                let _ = orchestrator.start_task(&task.id).await;
-                let _ = orchestrator.complete_task(&task.id, result.clone()).await;
+                cog_core::ignore_lost!(orchestrator.schedule_task(&task.id).await);
+                cog_core::ignore_lost!(orchestrator.start_task(&task.id).await);
+                cog_core::ignore_lost!(orchestrator.complete_task(&task.id, result.clone()).await);
                 return;
             }
         }

@@ -116,11 +116,12 @@ if [ "${fail}" -ne 0 ]; then
     exit 1
 fi
 
-# 零与「都对得上」在输出上同形：一份 README 都没找到（换了文件名、检出没落地），
-# 或者两份里一处 Trait 成员表都没有（标签写法变了），本门都会印下面那句绿。
+# 零与「都对得上」在输出上同形：两份 README 都不在（干净的检出里它们本来就不
+# 跟踪），或者两份里一处 Trait 成员表都没有（标签写法变了），本门都会印下面那句绿。
+# 两种要分开说：前者是「没有可判的东西」，后者是「有文件但认不出表」，后者仍是红。
 if [ "${docs_read}" -eq 0 ]; then
-    echo "readme-trait-members: ${ROOT} 下 README.md 与 README.zh-CN.md 一份都没读到——没读到就判不了成员表" >&2
-    exit 3
+    echo "readme-trait-members: 未判：${ROOT} 下 README.md 与 README.zh-CN.md 都不在本仓"
+    exit 0
 fi
 if [ "${blocks}" -eq 0 ]; then
     echo "readme-trait-members: ${docs_read} 份 README 里一处 Trait 成员表都没有认出——零处与「每一处都对得上」在输出上同形" >&2

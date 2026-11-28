@@ -68,7 +68,7 @@ impl CuttableProxy {
     /// Drop every connection currently open through the proxy.
     fn cut(&self) {
         for cut in self.cuts.lock().expect("cuts lock").drain(..) {
-            let _ = cut.send(());
+            cog_core::ignore_lost!(cut.send(()));
         }
     }
 }

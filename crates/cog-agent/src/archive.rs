@@ -1,10 +1,21 @@
-//! Writing a truncated tool output into the platform's memory Raw layer, and
-//! the two readings that say what happened to it.
+//! Writing every tool call into the platform's memory Raw layer, and the
+//! readings that say what became of it.
 //!
-//! The tool result is cut to fit the context window, and the cut bytes are the
-//! only copy of what the model did not see. They are written back where the
-//! read side can reach them by reference — the truncation marker carries an
-//! `artifact://` URI — so the loss is addressable rather than silent.
+//! A tool call's arguments and its whole result are the most expensive
+//! information in a run and the least reproducible: replaying the conversation
+//! re-buys the model calls but never re-runs the tools. They therefore get a
+//! permanent copy the moment the call returns, before the result is handed to
+//! the model — the statement, the arguments and the result, one object per
+//! call. This is the same bargain the event stream makes, with the difference
+//! that the event log is a bounded ring (it sweeps by row count) and the Raw
+//! layer is not: once the ring passes a call, this object is the only copy left.
+//!
+//! The same write also covers the case the cut needs. When the result does not
+//! fit the context window the model is shown a prefix and a marker, and the
+//! marker carries the `artifact://` reference of the object just written — so
+//! what the model did not see is one fetch away instead of gone. Archiving only
+//! the oversized ones would leave every shorter result with no permanent copy
+//! at all, which is the loss this module exists to remove.
 //!
 //! The write cannot go through an in-process [`cog_core::MemoryBackend`]: the
 //! process that runs the loops holds no memory dataset on purpose (it is
@@ -19,22 +30,21 @@
 //! namespace by construction.
 //!
 //! The readings live on this handle rather than beside it because they are the
-//! fates of one event: a tool output that did not fit. `truncated` counts the
-//! event and carries its size in characters; `archive_failure` counts the ones
-//! whose tail could not be stored, under the cause. The two have to add up --
-//! every cut either stored its tail or is counted as a failure under some cause
-//! -- or the share of cuts that landed reads as a ceiling rather than a share.
-//! An unconfigured base URL is one of those causes, not an exemption: with
-//! nowhere to write, a truncated output is lost, and that is what the reading
-//! must say. A run with no task id to key a source by is another: no attempt can
-//! be made, the tail is just as gone, and it gets its own cause rather than
-//! being left out of both halves.
+//! fates of one write: `archived` counts the records that landed and
+//! `archive_failure` the ones that did not, under the cause. The two have to
+//! add up — every call either landed or is counted as a failure under some
+//! cause — or the share of calls whose record landed reads as a ceiling rather
+//! than a share. An unconfigured base URL is one of those causes, not an
+//! exemption: with nowhere to write, the call has no permanent copy and that is
+//! what the reading must say. `truncated` and `truncated_chars` are about the
+//! conversation rather than the record — how often a result had to be cut and
+//! how much of it the model did not see.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use cog_core::metric_names::{
-    TOOL_OUTPUT_ARCHIVE_FAILED_TOTAL, TOOL_OUTPUT_TRUNCATED_CHARS_TOTAL,
+    TOOL_CALL_ARCHIVED_TOTAL, TOOL_OUTPUT_ARCHIVE_FAILED_TOTAL, TOOL_OUTPUT_TRUNCATED_CHARS_TOTAL,
     TOOL_OUTPUT_TRUNCATED_TOTAL,
 };
 use cog_core::{
@@ -42,13 +52,12 @@ use cog_core::{
     DEFAULT_MEMORY_NAMESPACE, MEMORY_API_BASE_ENV, MEMORY_INGEST_PATH,
 };
 
-/// Why an archive attempt did not produce a reference. A closed set: the label
-/// value names the cause, and a reader choosing between "set the base URL",
-/// "fix the route to the memory API", "read the API's refusal", and "give this
-/// run a task id" is choosing between these four. It is closed on purpose —
-/// every cut of a tool output lands in exactly one of these or stored its tail,
-/// so the truncation counter minus the failure counter is the number of cuts
-/// whose tail landed.
+/// Why an archive attempt did not land. A closed set: the label value names the
+/// cause, and a reader choosing between "set the base URL", "fix the route to
+/// the memory API", and "read the API's refusal" is choosing between these
+/// three. It is closed on purpose — every call's record either lands or is
+/// counted under exactly one of these, so the archived counter against the
+/// failure counter is the share of calls whose record landed.
 pub mod cause {
     /// No base URL is configured, so nothing was attempted.
     pub const UNCONFIGURED: &str = "unconfigured";
@@ -56,26 +65,22 @@ pub mod cause {
     pub const UNREACHABLE: &str = "unreachable";
     /// The memory API answered, and refused the write.
     pub const REFUSED: &str = "refused";
-    /// The run carried no task id, so there was no source name to file the tail
-    /// under and no attempt was made. The repair is not configuration and not on
-    /// the API: it is that the cut happened on a run nothing can key a source
-    /// by, which is what makes the tail unfetchable even though the archive
-    /// endpoint is healthy.
-    pub const UNKEYED: &str = "unkeyed";
 }
 
-/// The surface a run uses to archive an oversized tool output and to record the
-/// two readings that say what became of it.
+/// The surface a run uses to give one tool call a permanent copy, and to record
+/// the readings that say what became of it.
 #[async_trait::async_trait]
 pub trait ToolOutputArchive: Send + Sync + std::fmt::Debug {
-    /// Archive `tool`'s `text` as the raw source `id` and return its
-    /// `artifact://` reference.
+    /// Store one tool call's record — its arguments and its whole result — as
+    /// the raw source `id`, and return its `artifact://` reference.
     ///
-    /// The attempt publishes its own failure reading — the cause is known only
-    /// here, and a caller left to classify the error would either guess or fold
-    /// "misconfigured" and "the API refused" into one cell. The `Err` is still
-    /// returned so the caller can say in its own log why the marker carries no
-    /// reference.
+    /// Called for every call, not only for results too large for the window: a
+    /// result that fits still exists nowhere else once the event log's ring
+    /// passes it. The attempt publishes its own outcome readings — the cause is
+    /// known only here, and a caller left to classify the error would either
+    /// guess or fold "misconfigured" and "the API refused" into one cell. The
+    /// `Err` is still returned so the caller can say in its own log why the
+    /// truncation marker carries no reference.
     async fn archive(
         &self,
         tool: &str,
@@ -92,19 +97,6 @@ pub trait ToolOutputArchive: Send + Sync + std::fmt::Debug {
     /// result cut by ten characters from one cut by a hundred thousand, and the
     /// character count is only available where the cut is decided.
     async fn record_truncation(&self, tool: &str, dropped_chars: usize);
-
-    /// Record that `tool`'s output was cut and no archive was attempted because
-    /// the run had no task id to name a source by.
-    ///
-    /// This is a fate of a truncation rather than a precondition of one: the
-    /// output was cut, nothing can fetch the tail back, and the loss is the same
-    /// as one whose write was refused. It is on the handle rather than left to
-    /// the caller because the failure family's causes are a closed set decided
-    /// here, and a caller reporting this as a count of lost cuts would publish
-    /// the cause under a label of its own invention. Leaving it out entirely is
-    /// the reading that hurts: the truncation is in the denominator of the
-    /// landed share and this loss would be in no numerator.
-    async fn record_unkeyed(&self, tool: &str);
 }
 
 /// Archive tool outputs by POSTing them to the platform memory API.
@@ -165,10 +157,11 @@ impl WriteFailure {
 /// One delivery shape for every caller that stores raw bytes from a pod: this
 /// is the same request the tool-output archive makes, so when the API's ingest
 /// contract moves there is one place to change rather than one per producer.
-/// It records nothing. The fates of a tool output are the readings of the
-/// handle below, and they are a closed pair over *cuts* -- a producer whose
-/// payload was never a cut has no cell there to land in, and adding its writes
-/// to those counters would make the share of cuts that landed unreadable.
+/// It records nothing. The fates of a tool call's record are the readings of
+/// the handle below, and they are a closed pair over *calls* -- a producer
+/// writing something that is not a tool call has no cell there to land in, and
+/// adding its writes to those counters would make the share of calls that
+/// landed unreadable.
 pub async fn post_raw(
     client: &dyn HttpClient,
     base: Option<&str>,
@@ -218,6 +211,44 @@ pub async fn post_raw(
     Ok(artifact_uri(DEFAULT_MEMORY_NAMESPACE, id))
 }
 
+/// 按 `artifact://<namespace>/<id>` 取回正文——[`post_raw`] 的读回口。
+///
+/// 写侧把字节交给 memory API 并造出这个引用；此前没有任何一条代码能按引用取回
+/// 它，于是「正文在哪」只有一个字符串，工具调用与会话表这两处投影都拼不回原文。
+/// 这一条补的是那个读回口：同一个 base、同一个路径约定。
+pub async fn read_artifact(
+    client: &dyn HttpClient,
+    base: Option<&str>,
+    uri: &str,
+) -> cog_core::SFResult<String> {
+    let rest = uri.strip_prefix("artifact://").ok_or_else(|| {
+        cog_core::SFError::Config(format!("{uri:?} is not an artifact reference"))
+    })?;
+    let (namespace, id) = rest
+        .split_once('/')
+        .ok_or_else(|| cog_core::SFError::Config(format!("{uri:?} names no source")))?;
+    let base = base
+        .filter(|b| !b.trim().is_empty())
+        .ok_or_else(|| {
+            cog_core::SFError::Config(format!(
+                "{MEMORY_API_BASE_ENV} is not set: an archived body has nowhere to be read from"
+            ))
+        })?
+        .trim_end_matches('/');
+    let path = cog_core::MEMORY_RAW_CONTENT_PATH.replace("{id}", &format!("{namespace}/{id}"));
+    let url = format!("{base}{path}");
+    let resp = client
+        .execute(cog_core::HttpRequest::get(url).timeout(ARCHIVE_TIMEOUT_SECS))
+        .await?;
+    if !resp.is_success() {
+        return Err(cog_core::SFError::Config(format!(
+            "the memory API refused {uri:?}: HTTP {}",
+            resp.status
+        )));
+    }
+    Ok(String::from_utf8_lossy(&resp.body).to_string())
+}
+
 impl HttpToolOutputArchive {
     pub fn new(
         client: Arc<dyn HttpClient>,
@@ -255,7 +286,11 @@ impl ToolOutputArchive for HttpToolOutputArchive {
     ) -> SFResult<String> {
         let base = self.base.as_deref();
         let resp = match post_raw(self.client.as_ref(), base, id, content_type, text).await {
-            Ok(uri) => return Ok(uri),
+            Ok(uri) => {
+                self.count(TOOL_CALL_ARCHIVED_TOTAL, 1.0, tool_labels(tool))
+                    .await;
+                return Ok(uri);
+            }
             Err(f) => f,
         };
         let (cause, err) = match resp {
@@ -283,10 +318,6 @@ impl ToolOutputArchive for HttpToolOutputArchive {
         )
         .await;
     }
-
-    async fn record_unkeyed(&self, tool: &str) {
-        self.record_failure(tool, cause::UNKEYED).await;
-    }
 }
 
 impl HttpToolOutputArchive {
@@ -312,7 +343,9 @@ fn tool_labels(tool: &str) -> HashMap<String, String> {
 /// rather than a background job's: long enough for a healthy API to store an
 /// oversized payload, short enough that an API that stopped answering delays the
 /// turn instead of wedging it.
-// cap: bound — 长到容得下一份过大的载荷，短到让一个不再应答的 API 拖慢这一回合而不是把它卡死
+// cap: fixed — 长到容得下一份过大的载荷，短到让一个不再应答的 API 拖慢这一回合而不是把它卡死
+// keep: 删掉后一个不再应答的归档 API 会把这一回合卡住；由「一次归档请求的往返」兜住
+// wall: 等=归档 API 收下一次写入 / 等不到=这一回合的归档失败，账上记一条失败；**没有半份载荷被当成已归档** / 续跑=能，重来是一次新的归档请求
 const ARCHIVE_TIMEOUT_SECS: u64 = 20;
 
 #[cfg(test)]
@@ -513,7 +546,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_successful_archive_records_no_failure() {
+    async fn a_successful_archive_records_the_archived_call_and_no_failure() {
         let c = client(200, false);
         let counters = Arc::new(Counters::default());
         let archiver = HttpToolOutputArchive::new(
@@ -525,7 +558,18 @@ mod tests {
             .archive("read_file", "x", "text/plain", "y")
             .await
             .is_ok());
-        assert!(counters.0.lock().unwrap().is_empty());
+        let recorded = counters.0.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "落地这一次只写成功那一格");
+        assert_eq!(recorded[0].0, TOOL_CALL_ARCHIVED_TOTAL);
+        assert_eq!(recorded[0].1, 1.0);
+        assert_eq!(
+            recorded[0].2.get(crate::LABEL_TOOL).map(String::as_str),
+            Some("read_file")
+        );
+        assert!(
+            !recorded[0].2.contains_key(crate::LABEL_CAUSE),
+            "成功没有 cause：带着一个空的 cause 标签，读的人会以为那也是失败族里的一格"
+        );
     }
 
     #[tokio::test]
@@ -548,29 +592,8 @@ mod tests {
             assert_eq!(
                 labels.get(crate::LABEL_TOOL).map(String::as_str),
                 Some("run_command"),
-                "两格必须按同一个 tool 标签写，否则减不出落 Raw 比例"
+                "两格必须按同一个 tool 标签写，否则「几个结果被剪」与「剪掉多少字」对不上同一批调用"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn an_unkeyed_cut_is_counted_under_a_cause_of_its_own() {
-        // 没有 task id 时归档根本没被发起。这一份丢失与被拒同样是丢了尾巴，
-        // 得落在同一族里，否则 truncated 减 archive_failed 会把这一份算成落了地。
-        let c = client(200, false);
-        let counters = Arc::new(Counters::default());
-        let archiver = HttpToolOutputArchive::new(
-            c,
-            Some("http://cogneva:8080".into()),
-            Some(counters.clone()),
-        );
-        archiver.record_unkeyed("run_command").await;
-        let recorded = counters.0.lock().unwrap();
-        assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0].0, TOOL_OUTPUT_ARCHIVE_FAILED_TOTAL);
-        assert_eq!(
-            recorded[0].2.get(crate::LABEL_CAUSE).map(String::as_str),
-            Some(cause::UNKEYED)
-        );
     }
 }

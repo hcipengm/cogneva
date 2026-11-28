@@ -1,17 +1,20 @@
-//! What the token ledger's retention deletes, and the one thing it may never do.
+//! The token ledger is measured, never trimmed, against a live PostgreSQL.
 //!
 //! The ledger is the source the hourly fold is a derivation of, so the claims
-//! worth a live server are the ones a row count cannot check:
+//! worth a live server are the ones a row count alone cannot check:
 //!
-//! - a row past the retention whose window the fold already summed goes;
-//! - a row below the fold's floor does not, however old it is -- deleting it
-//!   would destroy the only copy of spend that no window ever counted, and the
-//!   fold would report the hour as quiet forever;
-//! - with no fold at all nothing is deletable, and every row is reported as
-//!   uncovered, because a sweep that answered "nothing to do" there would be
-//!   indistinguishable from a clean ledger;
-//! - the sweep follows the fold down: once the backfill lands the window a row
-//!   sits in, the same pass retires it without anything else being told.
+//! - the reading is the ledger's own row count and the age of its oldest row,
+//!   however far past the declared window that age is;
+//! - a row past the window is still there after a pass -- nothing deletes, and
+//!   that is the point: the only safe cutoff was "past the retention **and**
+//!   inside what the fold already summed", which is a judgement about another
+//!   table rather than a retention;
+//! - rows below the fold's floor are reported as uncovered, with the age of the
+//!   oldest: that pair says which spans a spend question can only be answered
+//!   from the detail rows;
+//! - with no fold at all every row is uncovered and the reading says so, because
+//!   a pass that answered "nothing to report" there would be indistinguishable
+//!   from a clean ledger.
 //!
 //! Each case builds its own schema and drops it. The tables keep their real
 //! names and are reached through the connection's search path, so the sweep runs
@@ -25,7 +28,6 @@
 //!   cargo test -p cog-observability --test usage_retention -- --ignored
 //! ```
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
@@ -131,165 +133,88 @@ const KEEP: Duration = Duration::from_secs(30 * 86_400);
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
-async fn a_row_past_the_retention_inside_the_fold_is_retired() {
-    let (scratch, pool) = scratch("frees").await;
+async fn a_row_past_the_window_is_measured_and_kept() {
+    let (scratch, pool) = scratch("keeps").await;
     scratch.row(&pool, ChronoDuration::days(40)).await;
     scratch.row(&pool, ChronoDuration::days(1)).await;
-    // The fold reaches back past both rows.
     scratch.folded_window(&pool, ChronoDuration::days(45)).await;
-    scratch.folded_window(&pool, ChronoDuration::days(1)).await;
 
-    let outcome = scratch
+    let reading = scratch
         .sweep(&pool, KEEP)
-        .retire_once(|| {})
+        .measure_once()
         .await
-        .expect("sweep");
+        .expect("measure");
 
-    assert_eq!(outcome.removed, 1, "the row past the retention goes");
-    assert_eq!(outcome.held, 1);
-    assert_eq!(
-        outcome.uncovered, 0,
-        "both rows were inside what the fold answered for"
-    );
-    assert_eq!(outcome.keep_secs, 30 * 86_400);
-    scratch.done().await;
-}
-
-#[tokio::test]
-#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
-async fn a_row_below_the_fold_floor_is_never_retired() {
-    let (scratch, pool) = scratch("floor").await;
-    scratch.row(&pool, ChronoDuration::days(40)).await;
-    // The fold only starts ten days back, so the row above is the only copy of
-    // the spend it carries.
-    scratch.folded_window(&pool, ChronoDuration::days(10)).await;
-
-    let outcome = scratch
-        .sweep(&pool, KEEP)
-        .retire_once(|| {})
-        .await
-        .expect("sweep");
-
-    assert_eq!(
-        outcome.removed, 0,
-        "a row no window summed is not the sweep's to delete, however old"
-    );
-    assert_eq!(scratch.rows(&pool).await, 1);
-    assert_eq!(
-        outcome.uncovered, 1,
-        "and the pass has to say so: a deletion that reported nothing to do \
-         would read the same as a clean ledger"
-    );
+    assert_eq!(reading.held, 2, "the reading is the row count: {reading:?}");
     assert!(
-        outcome.uncovered_oldest_age_secs >= 40 * 86_400,
-        "the age of what cannot be retired is what tells a fold catching up by \
-         an hour from a retention that has stopped: {}",
-        outcome.uncovered_oldest_age_secs
+        reading.oldest_age_secs >= 40 * 86_400 - 60,
+        "the reading says how far back the ledger reaches: {reading:?}"
+    );
+    assert_eq!(
+        scratch.rows(&pool).await,
+        2,
+        "a row past the window was removed; nothing here deletes"
     );
     scratch.done().await;
 }
-
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
-async fn with_no_fold_at_all_nothing_is_deletable() {
-    let (scratch, pool) = scratch("nofold").await;
+async fn rows_below_the_folds_floor_are_reported_as_uncovered() {
+    let (scratch, pool) = scratch("uncovered").await;
     scratch.row(&pool, ChronoDuration::days(40)).await;
+    scratch.row(&pool, ChronoDuration::days(2)).await;
+    // The fold only reaches back two days, so both rows sit below its floor.
+    scratch.folded_window(&pool, ChronoDuration::days(2)).await;
 
-    let outcome = scratch
+    let reading = scratch
         .sweep(&pool, KEEP)
-        .retire_once(|| {})
+        .measure_once()
         .await
-        .expect("sweep");
-
-    assert_eq!(outcome.removed, 0);
-    assert_eq!(outcome.uncovered, 1);
-    assert_eq!(scratch.rows(&pool).await, 1);
+        .expect("measure");
+    assert_eq!(reading.uncovered, 2, "{reading:?}");
+    assert!(
+        reading.uncovered_oldest_age_secs >= 40 * 86_400 - 60,
+        "the uncovered pair has to carry the oldest one's age: {reading:?}"
+    );
+    assert_eq!(scratch.rows(&pool).await, 2);
     scratch.done().await;
 }
-
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
-async fn the_sweep_follows_the_fold_down_without_being_told() {
-    let (scratch, pool) = scratch("follow").await;
-    scratch.row(&pool, ChronoDuration::days(40)).await;
+async fn with_no_fold_every_row_is_uncovered_and_none_is_removed() {
+    let (scratch, pool) = scratch("no_fold").await;
+    scratch.rows_many(&pool, 5, ChronoDuration::days(10)).await;
+
+    let reading = scratch
+        .sweep(&pool, KEEP)
+        .measure_once()
+        .await
+        .expect("measure");
+    assert_eq!(
+        reading.uncovered, 5,
+        "no folded window, so every row is: {reading:?}"
+    );
+    assert_eq!(scratch.rows(&pool).await, 5);
+    scratch.done().await;
+}
+/// The declared window is recomputed from the measured daily write, and the
+/// reading keeps saying which input decided it.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn the_declared_window_follows_the_measured_write_volume() {
+    let (scratch, pool) = scratch("volume").await;
+    scratch.rows_many(&pool, 20, ChronoDuration::days(10)).await;
     scratch.folded_window(&pool, ChronoDuration::days(10)).await;
 
-    let first = scratch
+    let sized = scratch
         .sweep(&pool, KEEP)
-        .retire_once(|| {})
-        .await
-        .expect("first");
-    assert_eq!((first.removed, first.uncovered), (0, 1));
-
-    // The backfill lands the window the row sits in. Nothing tells the sweep;
-    // it reads the fold's own floor every pass, which is what makes the two
-    // halves one loop rather than two things that have to be kept in step.
-    scratch.folded_window(&pool, ChronoDuration::days(41)).await;
-
-    let second = scratch
-        .sweep(&pool, KEEP)
-        .retire_once(|| {})
-        .await
-        .expect("second");
-    assert_eq!(second.removed, 1);
-    assert_eq!(second.uncovered, 0);
-    assert_eq!(scratch.rows(&pool).await, 0);
-    scratch.done().await;
-}
-
-#[tokio::test]
-#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
-async fn a_second_pass_finds_nothing_and_an_empty_ledger_answers_zero() {
-    let (scratch, pool) = scratch("second").await;
-    scratch.row(&pool, ChronoDuration::days(40)).await;
-    scratch.folded_window(&pool, ChronoDuration::days(45)).await;
-
-    let first = scratch
-        .sweep(&pool, KEEP)
-        .retire_once(|| {})
-        .await
-        .expect("first");
-    assert_eq!(first.removed, 1);
-    let second = scratch
-        .sweep(&pool, KEEP)
-        .retire_once(|| {})
-        .await
-        .expect("second");
-    assert_eq!(second.removed, 0);
-    assert_eq!(
-        (second.held, second.oldest_age_secs, second.uncovered),
-        (0, 0, 0),
-        "an empty ledger answers zero rather than leaving the series absent: a \
-         gap in the reading and a clean ledger would look the same"
+        .with_database_volume(Some(10 * 1024u64.pow(3)));
+    let reading = sized.measure_once().await.expect("measure");
+    assert!(reading.keep_secs > 0, "{reading:?}");
+    assert!(
+        reading.keep_derived,
+        "a declared volume and a measured write rate is a derived window: {reading:?}"
     );
-    scratch.done().await;
-}
-
-#[tokio::test]
-#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
-async fn the_pass_beats_between_batches() {
-    let (scratch, pool) = scratch("batches").await;
-    scratch.folded_window(&pool, ChronoDuration::days(45)).await;
-    // More than one batch's worth past the retention, so the pass needs a
-    // second statement to finish and a third to find nothing.
-    scratch
-        .rows_many(&pool, 2500, ChronoDuration::days(40))
-        .await;
-    let calls = AtomicUsize::new(0);
-    let outcome = scratch
-        .sweep(&pool, KEEP)
-        .retire_once(|| {
-            calls.fetch_add(1, Ordering::Relaxed);
-        })
-        .await
-        .expect("sweep");
-
-    assert_eq!(outcome.removed, 2500);
-    assert_eq!(
-        calls.load(Ordering::Relaxed),
-        3,
-        "progress fires before every batch, so a first pass over a grown backlog \
-         reads as work on the event log rather than as a stopped loop"
-    );
+    assert_eq!(scratch.rows(&pool).await, 20);
     scratch.done().await;
 }

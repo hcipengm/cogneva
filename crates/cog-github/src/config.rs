@@ -10,6 +10,17 @@ use serde::{Deserialize, Serialize};
 
 use cog_core::{SFError, SFResult};
 
+/// 一拍扫描读多少条 issue。GitHub 与 Gitee 两个集成的同一条事实。
+///
+/// 一次扫描是一趟 API 往返加上下游的逐条处理：这个数给那一趟的处理时长上界，
+/// 没扫到的留给下一拍，水位线保证不会漏。平台之间的差别（限流额度、账号数）
+/// 不改变「一拍读多少条」这件事，所以它不是两个旋钮——两个字段各写一个 50
+/// 就是同一条界的两处声明，改一处的下一次只会改一处。
+// cap: fixed — 一趟往返读得完、又不把一拍的处理时长长的条数；只往下调
+// keep: 删掉后一趟扫描的往返量无界，一拍的处理时长跟着 issue 总数走；由「一趟往返读得完」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+pub const ISSUES_PER_SCAN: usize = 50;
+
 /// A registered GitHub account used by Cogneva to interact with GitHub.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -165,6 +176,12 @@ fn resolve_token(
     )))
 }
 
+/// GitHub webhook 监听口。转发规则把这一路径指到本服务，落在哪个口由接收方
+/// 自己说；9090 与 Prometheus 抓取口同值，是这套部署里「旁路服务口」的约定。
+// cap: fixed — 本仓部署约定的旁路服务端口 9090
+// keep: 删掉后旁路服务与部署约定的口对不上，webhook 打不进来；由「本仓部署约定的端口」兜住
+const GITHUB_WEBHOOK_PORT: u16 = 9090;
+
 /// Webhook 事件入口配置（discovery_mode=events/both 时启用）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -184,7 +201,7 @@ pub struct WebhookConfig {
 impl Default for WebhookConfig {
     fn default() -> Self {
         Self {
-            port: 9090,
+            port: GITHUB_WEBHOOK_PORT,
             secret_env: cog_core::env::GITHUB_WEBHOOK_SECRET.into(),
             path: "/webhooks/github".into(),
             gateway_verified: false,
@@ -214,8 +231,10 @@ pub struct GitHubIntegrationConfig {
     /// used as the primary actor.
     pub accounts: Vec<GitHubAccount>,
     /// Polling interval in seconds when discovery mode includes polling.
+    #[serde(skip_serializing_if = "is_the_shipped_poll_interval")]
     pub poll_interval_secs: u64,
     /// Maximum number of issues to scan per polling round.
+    #[serde(skip_serializing_if = "is_the_shipped_scan_cap")]
     pub max_issues_per_scan: usize,
     /// Whether an actionable issue is turned into a fix task automatically.
     /// Off means the intent is only recorded, never acted on.
@@ -259,8 +278,8 @@ impl Default for GitHubIntegrationConfig {
                 GitHubAccount::Bot(BotAccount::default()),
                 GitHubAccount::Human(HumanAccount::default()),
             ],
-            poll_interval_secs: 300,
-            max_issues_per_scan: 50,
+            poll_interval_secs: (5 * cog_core::day::SECONDS_PER_MINUTE) as u64,
+            max_issues_per_scan: ISSUES_PER_SCAN,
             auto_submit_fixes: true,
             landing_policy: LandingPolicy::default(),
             human_required_labels: vec!["security".into(), "breaking-change".into()],
@@ -347,14 +366,18 @@ pub struct LandingPolicy {
     /// attempt only: a change that breaks CI twice is out of the generator's
     /// reach and is left to a human.
     pub redrive_on_ci_failure: bool,
-    /// How long to watch a landed commit's CI before giving up on that
-    /// revision (seconds).
+    /// How long a landed commit's CI verdict is expected to take (seconds).
+    /// Past it the watch loop logs once and keeps watching — a CI run that has
+    /// not reported yet is not a CI run that will never report.
+    #[serde(skip_serializing_if = "is_the_shipped_ci_watch_timeout")]
     pub ci_watch_timeout_secs: u64,
     /// How often the landing loop re-reads the base branch's CI state (seconds).
+    #[serde(skip_serializing_if = "is_the_shipped_ci_poll_interval")]
     pub ci_poll_interval_secs: u64,
     /// How many times a landing is retried when the push loses a race against
     /// a newer base tip. Each retry re-fetches and re-applies the change onto
     /// the new tip.
+    #[serde(skip_serializing_if = "is_the_shipped_land_attempts")]
     pub max_land_attempts: u32,
     /// How many generation rounds one CI failure cause may be given inside
     /// `redrive_cause_window_secs` before the channel stops generating against
@@ -364,36 +387,59 @@ pub struct LandingPolicy {
     /// tests, errors, or compiler codes it named — not the change: the fix a
     /// round produces is a new change with its own re-drive allowance, so a
     /// per-change flag cannot bound the chain.
+    #[serde(skip_serializing_if = "is_the_shipped_redrive_rounds")]
     pub redrive_max_rounds_per_cause: u32,
     /// The window those rounds are counted over (seconds).
+    #[serde(skip_serializing_if = "is_the_shipped_redrive_window")]
     pub redrive_cause_window_secs: u64,
 }
+
+// 一次落地最多重试三趟：推送撞上新基线是竞态，重取、重放即可；三趟还在撞说明
+// 基线在持续前进，再撞只是把这一笔自己的分支拖长。
+// cap: fixed — 三趟：撞车是竞态，重取重放；三趟还在撞说明基线在跑，不是运气不好
+// keep: 删掉后撞车无限重放，或第二次就放弃一次只是竞态的落地；由「三趟还在撞说明基线在跑」兜住
+const LANDING_MAX_ATTEMPTS: u32 = 3;
+
+// 同一个失败原因只给一轮生成：一轮产出的修复是新的一笔，自带它自己的一轮；
+// 同一原因第二轮还在，说明生成器够不着它，剩下的该由人接手。
+// cap: fixed — 一轮：一轮的修复是新的一笔、自带额度；同一原因第二轮还在就是够不着
+// keep: 删掉后同一原因反复重驱，够不着的那条被无限重开；由「第二轮还在就是够不着」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+const REDRIVE_ROUNDS_PER_CAUSE: u32 = 1;
 
 impl Default for LandingPolicy {
     fn default() -> Self {
         Self {
             max_changed_lines: None,
+            // `deploy/` is not on this list on purpose. It used to be, and the
+            // two guards together meant a deploy change could never land: the
+            // whitelist let the path in, this list then refused it, and the
+            // deploy admission gate -- which runs the render, parity and
+            // dry-run checks on the applied tree -- was never reached. The
+            // family is now judged by that gate instead of by its path. The
+            // entries that remain have no executable judge: workflows define
+            // who may run what, `secrets/` is credentials, and lock files are
+            // a supply-chain decision.
             forbidden_paths: vec![
                 ".github/workflows".into(),
-                "deploy/".into(),
                 "secrets/".into(),
                 "*.lock".into(),
             ],
             revert_on_ci_failure: true,
             redrive_on_ci_failure: true,
-            ci_watch_timeout_secs: 1800,
-            ci_poll_interval_secs: 60,
-            max_land_attempts: 3,
+            ci_watch_timeout_secs: (30 * cog_core::day::SECONDS_PER_MINUTE) as u64,
+            ci_poll_interval_secs: cog_core::day::SECONDS_PER_MINUTE as u64,
+            max_land_attempts: LANDING_MAX_ATTEMPTS,
             // One round per cause. That is the policy the re-drive path always
             // claimed — a change that breaks CI twice is out of the
             // generator's reach — stated over the cause instead of over the
             // change, which is what makes it hold along the chain.
-            redrive_max_rounds_per_cause: 1,
+            redrive_max_rounds_per_cause: REDRIVE_ROUNDS_PER_CAUSE,
             // A day. The unit is the one the landing rules already measure
             // churn over: within a day a cause that keeps failing is the same
             // situation, and a day later the branch has moved enough that it
             // is a new one.
-            redrive_cause_window_secs: 86400,
+            redrive_cause_window_secs: cog_core::day::SECONDS_PER_DAY as u64,
         }
     }
 }
@@ -412,11 +458,17 @@ pub struct ConversationConfig {
     pub bot_signature: String,
 }
 
+// 问三轮还没说清就按已知信息开工：每一轮都要等人回话，第三轮之后「再问一轮」
+// 的成本已经超过「先做、做错了再纠」。
+// cap: fixed — 三轮：每轮都等人回话，第三轮之后再问的成本超过先做再纠
+// keep: 删掉后一轮轮地问下去，问的成本超过先做再纠；由「第三轮之后再问成本超过先做再纠」兜住
+const CLARIFICATION_ROUNDS: u32 = 3;
+
 impl Default for ConversationConfig {
     fn default() -> Self {
         Self {
-            max_clarification_rounds: 3,
-            awaiting_reply_timeout_hours: 72,
+            max_clarification_rounds: CLARIFICATION_ROUNDS,
+            awaiting_reply_timeout_hours: (3 * cog_core::day::HOURS_PER_DAY) as u64,
             auto_reply: true,
             bot_signature: "— Cogneva Bot".into(),
         }
@@ -584,8 +636,8 @@ impl Default for GiteeIntegrationConfig {
             repo: String::new(),
             base_branch: "main".into(),
             api_base: None,
-            poll_interval_secs: 300,
-            max_issues_per_scan: 50,
+            poll_interval_secs: (5 * cog_core::day::SECONDS_PER_MINUTE) as u64,
+            max_issues_per_scan: ISSUES_PER_SCAN,
             token_env: None,
         }
     }
@@ -624,10 +676,69 @@ impl GiteeIntegrationConfig {
     }
 }
 
+// 下面这几个谓词让「等于代码默认值」的旋钮不出现在序列化里：模板因此不必把它
+// 抄一遍（抄件不为部署决定任何事），而部署真要改它时，写进去的那一格仍然生效。
+// 判据是「类型还产不产生这一格」——`defaults()` 走的就是这条序列化路径。
+fn is_the_shipped_poll_interval(v: &u64) -> bool {
+    *v == GitHubIntegrationConfig::default().poll_interval_secs
+}
+
+fn is_the_shipped_scan_cap(v: &usize) -> bool {
+    *v == GitHubIntegrationConfig::default().max_issues_per_scan
+}
+
+fn is_the_shipped_ci_watch_timeout(v: &u64) -> bool {
+    *v == LandingPolicy::default().ci_watch_timeout_secs
+}
+
+fn is_the_shipped_ci_poll_interval(v: &u64) -> bool {
+    *v == LandingPolicy::default().ci_poll_interval_secs
+}
+
+fn is_the_shipped_land_attempts(v: &u32) -> bool {
+    *v == LandingPolicy::default().max_land_attempts
+}
+
+fn is_the_shipped_redrive_rounds(v: &u32) -> bool {
+    *v == LandingPolicy::default().redrive_max_rounds_per_cause
+}
+
+fn is_the_shipped_redrive_window(v: &u64) -> bool {
+    *v == LandingPolicy::default().redrive_cause_window_secs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::checkout::repo_root;
+
+    /// 两个平台的一拍扫描条数是同一条界：谁把其中一个改回字面量，这条就红。
+    ///
+    /// 只断言「两个默认值相等」等于没判——今天它们都等于 50，写死一个 50
+    /// 也照样相等。这里判的是赋值那一侧：`max_issues_per_scan:` 后面跟着的
+    /// 必须是一个名字，不是一个数。
+    #[test]
+    fn both_forges_scan_one_page_of_the_same_size() {
+        let source = include_str!("config.rs");
+        let inlined: Vec<&str> = source
+            .lines()
+            .filter_map(|line| line.split_once("max_issues_per_scan:"))
+            .map(|(_, value)| value.trim().trim_end_matches(',').trim())
+            .filter(|value| value.starts_with(|c: char| c.is_ascii_digit()))
+            .collect();
+        assert!(
+            inlined.is_empty(),
+            "一拍扫描条数只留一个声明（`ISSUES_PER_SCAN`），这些地方又写死了数：{inlined:?}"
+        );
+        assert_eq!(
+            GitHubIntegrationConfig::default().max_issues_per_scan,
+            ISSUES_PER_SCAN
+        );
+        assert_eq!(
+            GiteeIntegrationConfig::default().max_issues_per_scan,
+            ISSUES_PER_SCAN
+        );
+    }
 
     /// 发现循环属主开关：默认必须是开的。默认若跟成关，单部署安装升级后会静默
     /// 失去发现能力——这正是新增开关最容易造成的退化。置位的是部署（进化 Pod
@@ -662,7 +773,7 @@ mod tests {
             !cfg.discovery_enabled,
             "env override must reach the discovery owner switch"
         );
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     #[test]
@@ -717,6 +828,30 @@ mod tests {
         assert!(!cfg.enabled);
     }
 
+    /// 模板里写下的每一个键都得是类型里真有的字段。
+    ///
+    /// 反方向（每个字段都得写进模板）已经不成立了，也不再要求：交付模板不再
+    /// 抄一遍代码里已经有的默认值（D1，`620a6905d`／`bde17b142`），没写的那个
+    /// 字段由 serde 默认值回答，读起来与写了同一个数。仍然会红的是另一件事：
+    /// 模板里出现一个类型不认识的键——改字段名时两边只改了一头，serde 静默
+    /// 忽略它，那个开关就悄悄失效了。
+    fn assert_surface_is_known(
+        fields: &[String],
+        template: &[String],
+        file: &std::path::Path,
+        section: &str,
+    ) {
+        let known: std::collections::BTreeSet<&String> = fields.iter().collect();
+        let unknown: Vec<&String> = template.iter().filter(|k| !known.contains(*k)).collect();
+        assert!(
+            unknown.is_empty(),
+            "{} {} 里写着类型不认识的键（改字段名时只改了一头）：{:?}",
+            file.display(),
+            section,
+            unknown
+        );
+    }
+
     /// 随仓库发布的配置模板操作员会照抄。代码里改了字段名、模板没跟上（或反
     /// 过来）在运行时完全无声：serde 忽略未知键、缺的键取默认值，集成照常启
     /// 动，只是那几个开关悄悄失效。只有逐键比对能发现，所以在这里比一次。
@@ -745,12 +880,7 @@ mod tests {
             .collect();
         expected.sort();
         actual.sort();
-        assert_eq!(
-            expected,
-            actual,
-            "{} github_integration drifted from GitHubIntegrationConfig",
-            file.display()
-        );
+        assert_surface_is_known(&expected, &actual, file, "github_integration");
 
         let policy = section
             .get("landing_policy")
@@ -771,19 +901,65 @@ mod tests {
             .collect();
         expected.sort();
         actual.sort();
-        assert_eq!(
-            expected,
-            actual,
-            "{} landing_policy drifted from LandingPolicy",
-            file.display()
-        );
+        assert_surface_is_known(&expected, &actual, file, "landing_policy");
     }
 
     #[test]
     fn shipped_config_templates_track_the_field_surface() {
         let root = repo_root();
-        assert_surface_matches(&root.join("cogneva.example.json"));
+        // The chart's file is the only shipped document. A sample copy at the
+        // repository root used to be checked here too; it was generated from
+        // this file, so it could not say anything this check does not.
         assert_surface_matches(&root.join("deploy/helm/cogneva/files/cogneva.json"));
+    }
+
+    /// 部署族由准入条件判，不由路径判：默认策略与交付模板都不能再禁止
+    /// `deploy/`。两个写点必须一起动——只改代码默认，部署里那份配置照旧把
+    /// 每一笔部署变更挡在落地之外，部署准入门（渲染、parity、回滚、dry-run）
+    /// 根本没有机会跑，读者看到的是「部署变更永远落不了地」而没有一句原因。
+    #[test]
+    fn deploy_is_judged_by_admission_not_by_the_landing_path_policy() {
+        let probe = "deploy/helm/cogneva/values.yaml";
+        let default = LandingPolicy::default();
+        assert!(
+            !default
+                .forbidden_paths
+                .iter()
+                .any(|p| crate::landing::path_forbidden(probe, p)),
+            "默认落地策略仍然禁止 `deploy/`：部署变更会在准入门之前被拒收"
+        );
+        // 其余几条仍在：这次只放部署族过去，别把别的守卫一起撤了。
+        for guarded in [".github/workflows/ci.yml", "secrets/x.yaml", "Cargo.lock"] {
+            assert!(
+                default
+                    .forbidden_paths
+                    .iter()
+                    .any(|p| crate::landing::path_forbidden(guarded, p)),
+                "`{guarded}` 不再被默认策略拦：撤部署那条时把手边的守卫一起撤掉了"
+            );
+        }
+
+        let template = "deploy/helm/cogneva/files/cogneva.json";
+        let raw = std::fs::read_to_string(repo_root().join(template))
+            .unwrap_or_else(|e| panic!("读不到 {template}：{e}"));
+        let doc: serde_json::Value =
+            serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{template} 不是合法 JSON：{e}"));
+        let patterns: Vec<&str> = doc
+            .pointer("/github_integration/landing_policy/forbidden_paths")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| {
+                panic!("{template} 没有 github_integration.landing_policy.forbidden_paths")
+            })
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            !patterns
+                .iter()
+                .any(|p| crate::landing::path_forbidden(probe, p)),
+            "{template} 的 forbidden_paths 仍然禁止 `deploy/`：与部署准入条件重复且相斥，\
+             部署变更到不了准入门"
+        );
     }
 
     #[test]
@@ -800,7 +976,7 @@ mod tests {
         assert!(cfg.enabled);
         assert_eq!(cfg.repo, "a/b");
         assert_eq!(cfg.poll_interval_secs, 45);
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     #[test]
@@ -818,10 +994,54 @@ mod tests {
         assert_eq!(cfg.repo, "o/r");
         assert_eq!(cfg.base_branch, "main");
         assert_eq!(cfg.api_base.as_deref(), Some("http://gw:8081/gitee"));
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
 
         let missing =
             GiteeIntegrationConfig::load_from(std::path::Path::new("/nonexistent/x.json")).unwrap();
         assert!(!missing.enabled);
+    }
+
+    /// 落地重试、按原因重推、追问轮次这三个数各只有一处声明：默认值读常量，
+    /// 常量上面写着它由什么钉住。
+    ///
+    /// 两面一起钉：运行时默认值等于常量（改常量就改默认值），源码面两个
+    /// `impl Default` 的字段里不再有数字（下一笔把数写回裸字面量就红）。
+    #[test]
+    fn the_landing_and_conversation_defaults_read_their_names() {
+        let policy = LandingPolicy::default();
+        assert_eq!(policy.max_land_attempts, LANDING_MAX_ATTEMPTS);
+        assert_eq!(
+            policy.redrive_max_rounds_per_cause,
+            REDRIVE_ROUNDS_PER_CAUSE
+        );
+        assert_eq!(
+            ConversationConfig::default().max_clarification_rounds,
+            CLARIFICATION_ROUNDS
+        );
+
+        let source = include_str!("config.rs");
+        let mut bare: Vec<&str> = Vec::new();
+        for head in [
+            "impl Default for LandingPolicy",
+            "impl Default for ConversationConfig",
+        ] {
+            let body = source
+                .split(head)
+                .nth(1)
+                .expect("the impl is in this file")
+                .split("\n}\n")
+                .next()
+                .unwrap();
+            bare.extend(body.lines().filter(|line| {
+                let line = line.trim();
+                let Some((field, value)) = line.split_once(':') else {
+                    return false;
+                };
+                let named_field = !field.is_empty()
+                    && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                named_field && value.trim().starts_with(|c: char| c.is_ascii_digit())
+            }));
+        }
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
     }
 }

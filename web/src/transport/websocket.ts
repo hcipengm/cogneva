@@ -1,12 +1,138 @@
+// census-keep: shapes=clocks — 界面上的提示计时（复制成功、提示消失之类）：只影响提示停留多久，不参与任何决定；删掉只是提示不自动消失或一直不消失
 import {
   isEventType,
   normalizeChatFrame,
   type AgentEvent,
   type ChatFrame,
+  type PermissionDiff,
 } from '@/types/events';
 import type { NotificationItem } from '@/api/client';
 
 export type ConnectionStatus = 'connecting' | 'open' | 'closed' | 'error';
+
+/**
+ * 服务端那一帧「要不要动手」按线路上的样子。
+ *
+ * 只声明会读的那几格：服务端还带着 `mode`，这一页用它显示「这一问是在哪一格下
+ * 发生的」；其余字段不声明，免得在这里长出一份与 Rust 侧悄悄分家的字段表。
+ */
+/** 服务端递回来的一条规则，五格都照原样读，见 `permissionStore`。 */
+export interface PermissionRuleWire {
+  id?: string;
+  tool?: string;
+  subject?: string;
+  allow?: boolean;
+  scope?: string;
+}
+
+export interface PermissionRulesWire {
+  session_id?: string;
+  rules?: PermissionRuleWire[];
+}
+
+/** 服务端递回来的一句约定：号与原文，见 `memoryStore`。 */
+export interface OwnerMemoryEntryWire {
+  id?: string;
+  text?: string;
+}
+
+export interface OwnerMemoryWire {
+  entries?: OwnerMemoryEntryWire[];
+}
+
+/**
+ * 一段对话现在说到哪儿了：服务端在重连时发来的快照。
+ *
+ * 语义是替换：按 `message_id` 把这一条消息的正文与思考整段换成这里的样子，之后
+ * 到的增量接着往上写。所以重连几次都不会把同一句话叠两遍。
+ */
+export interface ResumedMessageWire {
+  message_id?: string;
+  role?: string;
+  text?: string;
+  thinking?: string;
+  attachment?: unknown;
+  ended?: boolean;
+}
+
+export interface ChatResumeWire {
+  session_id?: string;
+  messages?: ResumedMessageWire[];
+}
+
+/**
+ * 服务端答回来的「这一段用哪只模型、还能选哪些」。
+ *
+ * `model` 缺省是「没选过」（走上游配置的那一只），不是一只默认型号；`models` 为空
+ * 时 `reason` 说明为什么——界面要画的是那句话，不是一个空下拉框。
+ */
+export interface ChatModelWire {
+  session_id?: string;
+  model?: string | null;
+  models?: string[];
+  configured?: boolean;
+  reason?: string | null;
+}
+
+/**
+ * 这一段对话的检查点：一份清单，或者一次退回的结局。
+ *
+ * `rows` 与 `rewind` 不会同时有东西；`reason` 有值时前两格都空——那是「做不了」
+ * 的那一句话，不是「没有」。把它画成一张空列表，人分不清该再跑一轮还是去换部署。
+ */
+export interface ChatCheckpointWire {
+  session_id?: string;
+  rows?: CheckpointRowWire[];
+  hidden?: number;
+  rewind?: RewindReportWire | null;
+  reason?: string | null;
+}
+
+export interface CheckpointRowWire {
+  key?: string;
+  turn?: number;
+  at?: string;
+}
+
+export interface RewindReportWire {
+  turn?: number;
+  target?: number;
+  applied?: boolean;
+  files?: { path?: string; change?: string }[];
+  truncated?: boolean;
+}
+
+/**
+ * 命令跑在什么样的环境里：一条边界一行。
+ *
+ * `state` 是三个词：`enforced` 这一层真的会拒、`declared` 部署声明了边界而这一层
+ * 读不到它执行与否、`none` 这一层不设边界、`unknown` 这一层答不出来。界面按这四个
+ * 词分别说话——把 `declared` 画成 `enforced`，人就会以为越界已经有人拦了。
+ */
+export interface ChatSandboxBoundaryWire {
+  session_id?: string;
+  boundary?: SandboxBoundaryWire | null;
+  reason?: string | null;
+}
+
+export interface SandboxBoundaryWire {
+  kind?: string;
+  isolated?: boolean;
+  workdir?: string | null;
+  lines?: { dimension?: string; state?: string; detail?: string }[];
+}
+
+export interface PermissionAskWire {
+  request_id?: string;
+  session_id?: string;
+  tool?: string;
+  summary?: string;
+  mode?: string;
+  /** 待批准的计划正文，只有 plan 模式那一问带它。 */
+  plan?: string;
+  /** 这一次要做的那个改动；改动类工具才带它（见 `PermissionDiff`）。 */
+  diff?: PermissionDiff | null;
+}
 
 export interface WebSocketOptions {
   url: string;
@@ -25,6 +151,49 @@ export interface WebSocketOptions {
    * 分派里只会被当成不认识的事件丢掉。
    */
   onChatFrame?: (frame: ChatFrame) => void;
+  /**
+   * 一次「要不要动手」的询问。它不经过 `onEvent`：这不是循环吐出来的事件，而是
+   * 一个正卡在那里等人回答的调用——丢进事件流里，屏幕上就只剩下一行日志，而
+   * 那一轮会一直等到连接断掉才被拒绝。
+   */
+  onPermissionRequest?: (ask: PermissionAskWire) => void;
+  /**
+   * 留下来的规则名单。它不走 `onChatFrame`：规则不是这一轮吐出来的东西，而是
+   * 一个人设过一次之后留在平台上的设置——混进聊天流会被当成一句助手说的话。
+   */
+  onPermissionRules?: (rules: PermissionRuleWire[]) => void;
+  /**
+   * 这个人写下的约定。与规则同一个理由：它是设置，不是这一轮的产出，混进聊天流
+   * 会被当成一句助手说的话。
+   */
+  onOwnerMemory?: (entries: OwnerMemoryEntryWire[]) => void;
+  /**
+   * 一段对话的续流快照。它不走 `onChatFrame`：那一族是这一轮吐出来的每一帧，
+   * 而这是「刚才没看着的那一段现在是什么样」——按消息整段替换，不是增量。
+   */
+  onChatResume?: (resume: ChatResumeWire) => void;
+  /**
+   * 这一段对话的模型选择与可选项。它是设置，不是这一轮的产出：混进聊天流会被
+   * 当成一句助手说的话。
+   */
+  onChatModel?: (catalogue: ChatModelWire) => void;
+  /**
+   * 这一段对话的检查点：清单，或者一次退回的结局。与模型选择同一个理由——它是
+   * 这一段的状态，不是这一轮吐出来的产出，混进聊天流会被当成一句助手说的话。
+   */
+  onChatCheckpoint?: (checkpoint: ChatCheckpointWire) => void;
+  /**
+   * 这一段对话里的命令跑在什么样的环境里。与检查点同一个理由——它是部署的读数，
+   * 不是这一轮说的话。
+   */
+  onChatSandboxBoundary?: (boundary: ChatSandboxBoundaryWire) => void;
+  /**
+   * 每一次连上（含重连）之后叫一声。
+   *
+   * 重连之后，这一页需要第一件事就是把「我正在看的那一段」重新接上——不然那一轮
+   * 还在说，而屏幕上再也不会有下文。
+   */
+  onOpen?: () => void;
   onStatusChange?: (status: ConnectionStatus) => void;
   onError?: (error: Error) => void;
 }
@@ -84,6 +253,7 @@ export class EventStreamClient {
       this.setStatus('open');
       this.subscribe();
       this.startHeartbeat();
+      this.options.onOpen?.();
     };
 
     this.ws.onmessage = (event) => {
@@ -193,6 +363,66 @@ export class EventStreamClient {
       if (event) {
         this.options.onEvent(event);
       }
+    } else if (message.type === 'permission_request') {
+      // 认不出请求号的帧不能落地：答案是按它回去的，没有它就等于一条永远等在
+      // 那里的问题。
+      const wire = message as unknown as PermissionAskWire;
+      const requestId = wire.request_id;
+      if (!requestId) return;
+      this.options.onPermissionRequest?.(wire);
+      return;
+    } else if (message.type === 'permission_rules') {
+      // 名单为空是真的「一条也没有」：服务端只在读到的时候发这一帧，所以收到它
+      // 就等于读到了。认不出形状的那一份按空名单处理，不拿上次的名单冒充这次。
+      const wire = message as unknown as PermissionRulesWire;
+      this.options.onPermissionRules?.(Array.isArray(wire.rules) ? wire.rules : []);
+      return;
+    } else if (message.type === 'owner_memory') {
+      // 名单为空是真的「一句也没写」：服务端只在读到的时候发这一帧。认不出形状
+      // 的那一份按空名单处理，不拿上次的名单冒充这一次。
+      const wire = message as unknown as OwnerMemoryWire;
+      this.options.onOwnerMemory?.(Array.isArray(wire.entries) ? wire.entries : []);
+      return;
+    } else if (message.type === 'chat_resume') {
+      // 认不出形状的那一份按「这一段没有话在流」处理，不拿上次的内容冒充这次。
+      const wire = message as unknown as ChatResumeWire;
+      this.options.onChatResume?.(
+        Array.isArray(wire.messages) ? wire : { session_id: wire.session_id, messages: [] }
+      );
+      return;
+    } else if (message.type === 'chat_model') {
+      // 认不出形状的那一份按「一只都选不了」处理，不拿上次的清单冒充这次。
+      const wire = message as unknown as ChatModelWire;
+      this.options.onChatModel?.({
+        session_id: wire.session_id,
+        model: typeof wire.model === 'string' ? wire.model : null,
+        models: Array.isArray(wire.models) ? wire.models : [],
+        configured: wire.configured === true,
+        reason: typeof wire.reason === 'string' ? wire.reason : null,
+      });
+      return;
+    } else if (message.type === 'chat_checkpoint') {
+      // 认不出形状的那一份按「读不到」处理，不拿上次的清单冒充这次：检查点不是
+      // 这一轮说的话，画错一行不比少画一行安全。
+      const wire = message as unknown as ChatCheckpointWire;
+      this.options.onChatCheckpoint?.({
+        session_id: wire.session_id,
+        rows: Array.isArray(wire.rows) ? wire.rows : [],
+        hidden: typeof wire.hidden === 'number' ? wire.hidden : 0,
+        rewind: wire.rewind ?? null,
+        reason: typeof wire.reason === 'string' ? wire.reason : null,
+      });
+      return;
+    } else if (message.type === 'chat_sandbox_boundary') {
+      // 认不出形状的那一份按「读不到」处理，不拿上一次的边界冒充这一次：边界是一份
+      // 部署读数，画成旧的那一刻的读数比空着更糟。
+      const wire = message as unknown as ChatSandboxBoundaryWire;
+      this.options.onChatSandboxBoundary?.({
+        session_id: wire.session_id,
+        boundary: wire.boundary ?? null,
+        reason: typeof wire.reason === 'string' ? wire.reason : null,
+      });
+      return;
     } else if (message.type === 'notification' && message.payload) {
       const notification = normalizeNotification(
         message.payload,

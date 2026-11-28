@@ -38,6 +38,7 @@ fn load_section_from<T: serde::de::DeserializeOwned + Default>(
 #[serde(default)]
 pub struct SelfReviewSettings {
     pub enabled: bool,
+    #[serde(skip_serializing_if = "is_the_default_self_review_iterations")]
     pub max_iterations: u32,
     pub quality_threshold: f32,
     /// Whether a verdict below the threshold buys a rewrite of the output.
@@ -52,10 +53,13 @@ pub struct SelfReviewSettings {
 
 impl Default for SelfReviewSettings {
     fn default() -> Self {
+        // 这两条判据在 `cog_core::types::self_review::SelfReviewConfig` 里有唯一
+        // 一份声明（生产装配从交付配置读的就是那一份）。
+        let core = cog_core::types::self_review::SelfReviewConfig::default();
         Self {
             enabled: false,
-            max_iterations: 2,
-            quality_threshold: 0.8,
+            max_iterations: core.max_iterations,
+            quality_threshold: core.quality_threshold,
             revise: true,
             spec: None,
             best_practices: Vec::new(),
@@ -106,6 +110,7 @@ pub struct PgeSettings {
     /// escalate to a global reset, which re-runs the planner. Zero turns the
     /// path off, and then every failure pays for a fresh plan even when the
     /// failure lies in a generation the plan already described.
+    #[serde(skip_serializing_if = "is_the_default_local_repair_max")]
     pub local_repair_max: u32,
 }
 
@@ -115,7 +120,8 @@ pub struct PgeSettings {
 /// feedback is unchanged between iterations, so repeating it cannot buy a
 /// different outcome — either the plan is the real defect, which is the global
 /// reset's job, or nothing in the feedback is actionable.
-// cap: bound — 再来一次得不到不同的结局：要么计划本身就是缺陷（那是全局重置的事），要么反馈里没有可执行的东西
+// cap: fixed — 再来一次得不到不同的结局：要么计划本身就是缺陷（那是全局重置的事），要么反馈里没有可执行的东西
+// keep: 删掉后同一个结局被一遍遍重来，反馈里没有可执行的东西也还在修；由「再来一次得不到不同的结局」兜住
 pub const DEFAULT_LOCAL_REPAIR_MAX: u32 = 2;
 
 /// A zero here would close the repair loop for every deployment that does not
@@ -142,31 +148,36 @@ impl PgeSettings {
         load_section_from(path, "/pge")
     }
 
-    /// Return the configured schema for `actor`, if any.
-    pub fn schema_for(&self, actor: &str) -> Option<serde_json::Value> {
-        self.schemas.get(actor).cloned()
+    /// 这个席位交什么形状的产物。
+    ///
+    /// 键是**席位**——协议里按名字寻址的那一格，不是坐上去的人的标签：同一个席位
+    /// 换个人坐，拿到的是同一份 schema。调用方传的是 `cog_core::roles` 里的席位常量，
+    /// 不是某个 agent 的名字；这里把参数就叫 `seat`，免得下一个读代码的人以为它可以
+    /// 收一个人的标签。
+    pub fn schema_for(&self, seat: &str) -> Option<serde_json::Value> {
+        self.schemas.get(seat).cloned()
     }
 }
 
-/// Ralph Loop 预算与停滞窗口配置。不收敛的链必须在预算内终止——
-/// 无人值守场景没有操作者盯流调 prompt，"视为无限"等于无限烧 token。
+/// Ralph Loop 的停滞窗口配置。**没有迭代预算**：轮数不是「停」的理由，
+/// 停的理由只有一个——终态到了；停滞是诊断的触发，不是结束。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RalphSettings {
-    /// 单次执行的迭代预算硬上限。预算按次计，不跨执行累计：同一个目标被
-    /// 重新调度时重新起步，已归档的历史只提供反馈与停滞证据。
-    pub max_iterations: u32,
     /// 停滞窗口：最近这么多轮不买进展即终止——归一化反馈逐字相同（同一失败
     /// 原样重放），或分数未升且产物未增长的改写重放（读数不足两个不下结论）。
     /// 这个值同时决定归档历史保留的尾部长度。0 = 关闭停滞检测。
+    #[serde(skip_serializing_if = "is_the_default_ralph_window")]
     pub stagnation_window: u32,
 }
 
 impl Default for RalphSettings {
     fn default() -> Self {
+        // 停滞窗由循环自己声明（`RalphLoopConfig`）：两处各写一份，改一处忘一处
+        // 的那天，配置说五轮、循环说别的。
+        let loop_defaults = crate::squad::ralph::ralph_loop::RalphLoopConfig::default();
         Self {
-            max_iterations: 50,
-            stagnation_window: 5,
+            stagnation_window: loop_defaults.stagnation_window,
         }
     }
 }
@@ -183,7 +194,6 @@ impl RalphSettings {
     /// Convert to the loop-level config struct.
     pub fn to_loop_config(&self) -> crate::squad::ralph::RalphLoopConfig {
         crate::squad::ralph::RalphLoopConfig {
-            max_iterations: self.max_iterations,
             stagnation_window: self.stagnation_window,
         }
     }
@@ -208,10 +218,25 @@ impl BoundaryConfig {
     }
 }
 
+// 等于代码默认值的旋钮不出现在序列化里：模板不必抄一遍，部署真要改它时写进去
+// 仍然生效。`defaults()` 读的就是这条路径，所以「类型还产不产生这一格」和
+// 「模板该不该写它」是同一个答案。
+fn is_the_default_local_repair_max(v: &u32) -> bool {
+    *v == DEFAULT_LOCAL_REPAIR_MAX
+}
+
+fn is_the_default_ralph_window(v: &u32) -> bool {
+    *v == RalphSettings::default().stagnation_window
+}
+
+fn is_the_default_self_review_iterations(v: &u32) -> bool {
+    *v == SelfReviewSettings::default().max_iterations
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkout::repo_root;
+    use crate::checkout::{rendered_root, repo_root};
 
     #[test]
     fn boundary_config_default_has_no_rules() {
@@ -243,7 +268,7 @@ mod tests {
         // not overrule the deployment.
         std::fs::write(&path, r#"{"pge": {"local_repair_max": 0}}"#).unwrap();
         assert_eq!(PgeSettings::load_from(&path).unwrap().local_repair_max, 0);
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// A configuration section this crate reads: the pointer a template has to
@@ -255,9 +280,6 @@ mod tests {
         /// written here, so a field added to the type joins the check without
         /// anyone remembering to write it down twice.
         read_back: fn(&serde_json::Value) -> serde_json::Value,
-        /// What the type produces when nothing sets anything. Every key here is
-        /// one a deployment has to be able to see and change.
-        defaults: fn() -> serde_json::Value,
     }
 
     impl Section {
@@ -272,7 +294,6 @@ mod tests {
                         .unwrap_or_else(|e| panic!("a section does not fit its type: {e}"));
                     serde_json::to_value(typed).expect("a section read back serializes")
                 },
-                defaults: || serde_json::to_value(T::default()).expect("a default serializes"),
             }
         }
 
@@ -369,11 +390,11 @@ mod tests {
     /// Three places embed it: the chart's file, the static manifest the cluster
     /// pulls, and the rendered profiles. They have to agree, so the comparison
     /// is over all of them rather than over the one that happens to be edited.
+    /// A sample copy at the repository root was a fourth entry here; it was a
+    /// projection of the chart's file, so agreement with it proved nothing
+    /// about what a deployment reads.
     fn shipped_configs(root: &Path) -> Vec<(String, serde_json::Value)> {
-        let mut out = vec![(
-            "cogneva.example.json".to_string(),
-            read_config(&root.join("cogneva.example.json")),
-        )];
+        let mut out = Vec::new();
         let k3s_configmap = format!(
             "deploy/k3s/{}-configmap.yaml",
             cog_core::topology::CONFIG_CONFIGMAP
@@ -384,7 +405,7 @@ mod tests {
         ] {
             out.push((relative.to_string(), read_config(&root.join(relative))));
         }
-        let rendered = root.join("deploy/rendered");
+        let rendered = rendered_root();
         let mut profiles: Vec<_> = std::fs::read_dir(&rendered)
             .unwrap_or_else(|e| panic!("read {}: {e}", rendered.display()))
             .map(|e| e.expect("readable dir entry").path())
@@ -398,8 +419,8 @@ mod tests {
         out
     }
 
-    /// Read the config wherever it is shipped: the chart and the example keep it
-    /// as a file of its own, a ConfigMap manifest keeps it as a block scalar.
+    /// Read the config wherever it is shipped: the chart keeps it as a file of
+    /// its own, a ConfigMap manifest keeps it as a block scalar.
     fn read_config(path: &Path) -> serde_json::Value {
         match path.extension().and_then(|e| e.to_str()) {
             Some("json") => read_json(path),
@@ -481,16 +502,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("{file} `{name}` is not an object"));
             let written: Vec<&String> = object.keys().filter(|k| !k.starts_with('_')).collect();
 
-            // Every key the type produces on its own has to be visible in the
-            // template, or the deployment has a value no one can read or set.
-            let defaults = (section.defaults)();
-            for key in defaults.as_object().expect("defaults are an object").keys() {
-                assert!(
-                    written.contains(&key),
-                    "{file} `{name}` does not write `{key}`, which the type always \
-                     produces: the deployment cannot set what the code reads"
-                );
-            }
+            // 反方向（类型产出的每个键都要写进模板）已经不成立，也不再要求：
+            // 交付模板不再抄一遍代码里已有的默认值（D1），没写的那个键由 serde
+            // 默认值回答，操作员照样可以在部署里写它——只是模板不再替他写出来。
+            // 仍然会红的是另一个方向：模板写下的键必须有人读（下面那段）。
 
             // Every key the template writes has to be one the type knows. The
             // round trip answers it for anything with a value in it; a key
@@ -531,24 +546,58 @@ mod tests {
     #[test]
     fn the_embedders_ship_one_and_the_same_config() {
         let root = repo_root();
-        let mut configs = shipped_configs(&root)
-            .into_iter()
-            .filter(|(file, _)| !file.ends_with("cogneva.example.json"));
+        let mut configs = shipped_configs(&root).into_iter();
         let (reference_file, reference) = configs.next().expect("a chart source config");
+        let reference = without_projected_leaves(reference);
         for (file, doc) in configs {
             assert_eq!(
-                doc, reference,
+                without_projected_leaves(doc),
+                reference,
                 "{file} ships a different config than {reference_file}"
             );
         }
     }
 
+    /// 把**按部署形态投影**的那几个叶子抹平，再比其余部分。
+    ///
+    /// chart 的源文件里 `system.sandbox_executor_url` 是一条服务地址，渲染之后是每副
+    /// 副本一条的地址表——这是同一个键在两个阶段的两个形状，不是两份不一致的配置。
+    /// 投影本身由渲染链与 parity 门判（`sync-static-manifests.sh --check` 逐字节比对
+    /// 静态清单与渲染产物），这条测试判的是**别的键**有没有在某个载体里被漏掉或改掉。
+    /// 不认这条差，每次改投影都会把这条测试判红，而红的原因与它要防的事无关。
+    fn without_projected_leaves(mut doc: serde_json::Value) -> serde_json::Value {
+        const PROJECTED: [&str; 1] = ["sandbox_executor_url"];
+        fn walk(value: &mut serde_json::Value, projected: &[&str]) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, child) in map.iter_mut() {
+                        if projected.contains(&key.as_str()) {
+                            *child = serde_json::Value::String("<projected>".to_string());
+                        } else {
+                            walk(child, projected);
+                        }
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items.iter_mut() {
+                        walk(item, projected);
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk(&mut doc, &PROJECTED);
+        doc
+    }
+
     #[test]
-    fn ralph_settings_defaults_bound_the_loop() {
+    fn ralph_settings_defaults_carry_the_window_and_no_budget() {
         let p = Path::new("/nonexistent/cogneva.json");
         let r = RalphSettings::load_from(p).unwrap();
-        assert_eq!(r.max_iterations, 50);
-        assert_eq!(r.stagnation_window, 5);
+        // 默认窗口由实测导出（没有样本时是 0）：写死一个轮数就是人拍的界。
+        assert_eq!(r.stagnation_window, cog_core::stagnation::window_rounds());
+        // 预算已经不存在：配置文件里再写 `ralph.max_iterations` 也不该有字段接它，
+        // 那一条由「每个配置键都被一份交付文档点名」那一族门负责。
     }
 
     /// 只判不写是配置里的一个开关，而且缺省仍是原来的完整循环。
@@ -579,7 +628,7 @@ mod tests {
             "开关必须传到循环读的那份配置上"
         );
 
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     #[test]
@@ -603,6 +652,6 @@ mod tests {
             .schema_for("planner")
             .is_some());
         assert_eq!(BoundaryConfig::load_from(&path).unwrap().rules.len(), 1);
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 }

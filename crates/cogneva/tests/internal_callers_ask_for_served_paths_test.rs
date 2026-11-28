@@ -50,6 +50,17 @@ fn asked_paths(text: &str) -> BTreeSet<String> {
     paths
 }
 
+/// 一条路径是不是走 `kubectl get --raw` 打到 apiserver 的。
+///
+/// `/api/v1/nodes/<节点>/proxy/stats/summary` 与网关的 REST 前缀长得一模一样，
+/// 但目标端是集群 API：那是 kubelet 的只读口，经 apiserver 代理读。判定要两样
+/// 一起成立——前缀是集群对象，且这个文件里确实有一条 `--raw` 调用。只按前缀跳
+/// 会替一条未来真的注册在网关上的同名路由背书，只按 `--raw` 跳会漏掉同一文件里
+/// 真的发给网关的请求。
+fn is_cluster_api_call(text: &str, path: &str) -> bool {
+    text.contains("\"--raw\"") && path.starts_with("/api/v1/nodes/")
+}
+
 fn callers(root: &Path, files: &[PathBuf]) -> (BTreeMap<String, BTreeSet<String>>, usize) {
     let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut scanned = 0;
@@ -59,7 +70,11 @@ fn callers(root: &Path, files: &[PathBuf]) -> (BTreeMap<String, BTreeSet<String>
             continue;
         }
         scanned += 1;
-        let paths = asked_paths(&production_text(&read(path)));
+        let text = production_text(&read(path));
+        let paths: BTreeSet<String> = asked_paths(&text)
+            .into_iter()
+            .filter(|asked| !is_cluster_api_call(&text, asked))
+            .collect();
         if !paths.is_empty() {
             found.insert(label, paths);
         }
@@ -122,8 +137,8 @@ fn the_reader_sees_literals_shapes_and_ignores_fixtures() {
     let production = "\
 async fn call(&self) -> Result<()> {
     self.call(\"POST\", \"/api/v1/tasks\", Some(body)).await?;
-    let _ = format!(\"/api/v1/tasks/{task_id}\");
-    let _ = format!(\"/api/v1/traces?limit={LIMIT}\");
+    cog_core::ignore_lost!(format!(\"/api/v1/tasks/{task_id}\"));
+    format!(\"/api/v1/traces?limit={LIMIT}\").ok();
     Ok(())
 }
 ";
@@ -138,14 +153,14 @@ async fn call(&self) -> Result<()> {
 
     let fixture = "\
 fn handle(path_only: &str) {
-    let _ = path_only.strip_prefix(\"/api/v1/ghost/\");
+    cog_core::ignore_lost!(path_only.strip_prefix(\"/api/v1/ghost/\"));
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn fixture() {
-        let _ = \"/api/v1/ghost\";
+        cog_core::ignore_lost!(\"/api/v1/ghost\");
     }
 }
 ";
@@ -159,7 +174,7 @@ mod tests {
 #[test]
 fn a_caller_path_the_gateway_does_not_serve_is_reported() {
     let root = std::env::temp_dir().join(format!("cogneva-internal-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     std::fs::create_dir_all(root.join("crates/cog-gateway/src")).expect("temp gateway");
     std::fs::create_dir_all(root.join("crates/cog-eval/src")).expect("temp caller");
 
@@ -187,5 +202,5 @@ fn a_caller_path_the_gateway_does_not_serve_is_reported() {
     let (complaints, _) = contradictions(&root, &crate_files_of(&root));
     assert!(complaints.is_empty(), "{complaints:?}");
 
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }

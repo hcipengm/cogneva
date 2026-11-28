@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::process_report::{read_process, ReportedProcess, MAX_PROCESSES};
+use crate::process_report::ReportedProcess;
 
 /// 这条循环在 `loop_health` 里的名字。
 pub const LOOP_NAME: &str = "process-census";
@@ -51,12 +51,14 @@ pub const DEFAULT_URL: &str = crate::process_report::DEFAULT_REPORT_URL;
 pub const NODE_ENV: &str = cog_core::env::NODE_NAME;
 
 /// 一拍多久。与容器自报同一个节奏：两边报的是同一份读数，节奏不该有两套。
-// cap: bound — 与容器自报同一个节奏：两边报的是同一份读数，节奏不该有两套
+// cap: fixed — 与容器自报同一个节奏：两边报的是同一份读数，节奏不该有两套
+// keep: 删掉后两边报同一份读数却用两套节奏，读数对不上；由「与容器自报同一个节奏」兜住
 pub const INTERVAL: Duration = Duration::from_secs(60);
 
 /// cgroup 树往下最多走几层。宿主布局是 `/kubepods.slice/<qos>.slice/<pod>.slice/<scope>`，
 /// 四层；留一倍余量，再多就不是我们认识的布局，而不是「树很深」。
-// cap: bound — 宿主布局是四层（/kubepods.slice/<qos>.slice/<pod>.slice/<scope>）；留一倍余量，再多就不是我们认识的布局
+// cap: fixed — 宿主布局是四层（/kubepods.slice/<qos>.slice/<pod>.slice/<scope>）；留一倍余量，再多就不是我们认识的布局
+// keep: 删掉后走查深度没有界，坏布局把递归拉爆；由「宿主布局是四层、留一倍余量」兜住
 const MAX_DEPTH: usize = 8;
 
 /// systemd 驱动给容器起的 scope 名。cgroupfs 驱动下叶子目录名就是 id 本身，
@@ -82,6 +84,10 @@ struct ContainerReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pod_uid: Option<String>,
     processes: Vec<ReportedProcess>,
+    /// 这个容器此刻 cgroup 里列着几个 pid；`processes` 是其中读成行、且没被条数
+    /// 上限截掉的那些。宿主上的构建容器可以跑着上百个进程，而这一面只收前几十个
+    /// ——不说出这个数，屏上就把「只读了这么多」读成「就跑了这么多」。
+    processes_total: usize,
 }
 
 /// 一个 cgroup 目录名是不是某个容器实例的叶子；是就给出那串 id。
@@ -113,6 +119,8 @@ pub struct ScannedContainer {
     /// 它所在 Pod 的 uid（连字符形式，与 `metadata.uid` 一致）；不在 Pod 下的没有。
     pub pod_uid: Option<String>,
     pub processes: Vec<ReportedProcess>,
+    /// `cgroup.procs` 里列出来的 pid 个数，在按条数收表**之前**取。
+    pub processes_total: usize,
 }
 
 /// 一个目录名是不是某个 Pod 的 slice；是就给出那个 Pod 的 uid。
@@ -160,13 +168,14 @@ fn walk(
         };
         match container_id_of_dir(name) {
             Some(id) => {
-                let processes = cgroup_processes(&child);
+                let (processes, processes_total) = cgroup_processes(&child);
                 if !processes.is_empty() {
                     out.insert(
                         id,
                         ScannedContainer {
                             pod_uid: pod_uid.map(str::to_string),
                             processes,
+                            processes_total,
                         },
                     );
                 }
@@ -181,17 +190,19 @@ fn walk(
 }
 
 /// 一个容器 cgroup 里的进程。`cgroup.procs` 给出进程 id（不是线程 id），逐个读 `/proc`。
-fn cgroup_processes(dir: &Path) -> Vec<ReportedProcess> {
+///
+/// 返回「读成行的表」与「这一列本来有几个」：收条数的上限在
+/// [`crate::process_report::assemble_table`] 里，两个数一起出来，所以截断在这条
+/// 路上同样说得出口。
+fn cgroup_processes(dir: &Path) -> (Vec<ReportedProcess>, usize) {
     let Ok(text) = std::fs::read_to_string(dir.join("cgroup.procs")) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
-    let mut pids: Vec<u32> = text
+    let pids: Vec<u32> = text
         .lines()
         .filter_map(|line| line.trim().parse::<u32>().ok())
         .collect();
-    pids.sort_unstable();
-    pids.truncate(MAX_PROCESSES);
-    pids.into_iter().filter_map(read_process).collect()
+    crate::process_report::assemble_table(pids)
 }
 
 /// 宿主 cgroup 根挂进来了没有。空表不能同时表示「挂错」与「没有容器」。
@@ -253,7 +264,7 @@ struct Census {
 
 impl Census {
     fn from_env(root: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
-        let node = std::env::var(NODE_ENV).unwrap_or_default();
+        let node = std::env::var(NODE_ENV).unwrap_or(Default::default());
         let url = std::env::var(URL_ENV)
             .ok()
             .filter(|url| !url.trim().is_empty())
@@ -292,6 +303,7 @@ impl Census {
                 container_id,
                 pod_uid: scanned.pod_uid,
                 processes: scanned.processes,
+                processes_total: scanned.processes_total,
             })
             .collect();
         // 一个容器都没有也照发：这一拍同时是「这台节点我在」的活体，而「采集器在跑、
@@ -300,8 +312,9 @@ impl Census {
             node: self.node.trim(),
             reports,
         };
-        // 报不上去不是这个进程的事：下一拍再说。
-        let _ = self.client.post(&self.url).json(&body).send().await;
+        // 报不上去不是这个进程的事：下一拍再说，但这一拍要说出来——章在发送之前
+        // 就盖了，一次持续失败的推送在活体面上与「这台节点上一直就这些容器」同形。
+        crate::process_report::push_report(&self.client, &self.url, &body).await;
     }
 }
 
@@ -360,7 +373,7 @@ mod tests {
     fn a_container_is_read_from_the_pids_in_its_own_cgroup() {
         // 没有这次改动就会红：采集器根本不读宿主 cgroup 树，这一格拿不到任何进程。
         let root = std::env::temp_dir().join(format!("cog-census-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
         tree(&root);
         let scanned = scan(&root);
         let mine = scanned.get(A).expect("这个 cgroup 里有一个真实进程");
@@ -374,7 +387,7 @@ mod tests {
             !scanned.contains_key(B),
             "空的 cgroup 不是一个容器，报上去读作「里面没有进程」"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     /// 没有这次改动就会红：Pod 的沙箱容器（pause）不在 `containerStatuses` 里，
@@ -397,7 +410,7 @@ mod tests {
         assert_eq!(pod_uid_of_dir("system.slice"), None);
 
         let root = std::env::temp_dir().join(format!("cog-census-pod-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
         tree(&root);
         // 一个直接挂在 QoS 层下的叶子：没有 Pod 认领它（宿主上直接起的容器）。
         let loose = root.join("kubepods.slice/kubepods-burstable.slice");
@@ -417,7 +430,33 @@ mod tests {
             None,
             "不在 Pod slice 下的容器没有归属，不能被安到任何 Pod 上"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
+    }
+
+    /// 宿主上的构建容器可以跑着上百个进程，而表只收前几十条：那一格必须跟着
+    /// 「本来几个」一起报出去，否则屏上把「只读了这么多」读成「就跑了这么多」。
+    #[test]
+    fn a_cgroup_with_more_pids_than_the_table_holds_states_how_many_it_saw() {
+        let root = std::env::temp_dir().join(format!("cog-census-capped-{}", std::process::id()));
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
+        let leaf = root.join(format!("cri-containerd-{A}.scope"));
+        std::fs::create_dir_all(&leaf).unwrap();
+        // 自己的 pid 重复填满：这一格判的是计数与截断，而重复的 pid 保证每一行都
+        // 读得成——真去凑 69 个存在的进程会在 CI 上按机器抖动。
+        let me = std::process::id();
+        let cap = crate::process_report::MAX_PROCESSES;
+        let text = format!("{me}\n").repeat(cap + 5);
+        std::fs::write(leaf.join("cgroup.procs"), &text).unwrap();
+
+        let scanned = scan(&root);
+        let row = scanned.get(A).expect("这个叶子被认成一个容器");
+        assert_eq!(
+            row.processes_total,
+            cap + 5,
+            "列出来的 pid 个数要在截断之前取"
+        );
+        assert_eq!(row.processes.len(), cap, "条数照旧按上限收");
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     #[test]
@@ -429,6 +468,55 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cog-census-ok-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         assert!(root_is_usable(&root).is_ok());
-        let _ = std::fs::remove_dir_all(&root);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
+    }
+}
+
+#[cfg(test)]
+mod push_tests {
+    use super::*;
+    use crate::test_support::{serve_status, WarnText};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    fn census(url: String) -> (Census, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let census = Census {
+            root: dir.path().to_path_buf(),
+            node: "node-a".into(),
+            url,
+            client: reqwest::Client::new(),
+        };
+        (census, dir)
+    }
+
+    /// 对端收下了：什么都不说。
+    #[tokio::test]
+    async fn an_accepted_census_push_says_nothing() {
+        let (base, server) = serve_status(200).await;
+        let warns = WarnText::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(warns.clone()));
+        let (census, _dir) = census(base);
+        census.report_once().await;
+        assert!(warns.said().is_empty(), "{:?}", warns.said());
+        server.abort();
+    }
+
+    /// 对端拒收：这一拍没上去，而章已经盖过——网关那一格的 `process_census_at` 会
+    /// 冻在上一拍上，看着与「这台节点上一直就这些容器」一模一样。必须有这一句话。
+    #[tokio::test]
+    async fn a_refused_census_push_says_the_window_did_not_land() {
+        let (base, server) = serve_status(503).await;
+        let warns = WarnText::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(warns.clone()));
+        let (census, _dir) = census(base);
+        census.report_once().await;
+        let said = warns.said();
+        assert!(
+            said.iter().any(|m| m.contains("没上去")),
+            "被拒收的一拍没有在日志里留下痕迹：{said:?}"
+        );
+        server.abort();
     }
 }

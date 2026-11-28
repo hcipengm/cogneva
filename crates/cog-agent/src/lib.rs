@@ -8,14 +8,18 @@ pub mod context;
 pub mod event_bus_sink;
 pub mod hooks;
 pub mod identity;
+pub mod inbox;
 pub mod lifecycle;
+pub mod memory;
 pub mod observable;
+pub mod permission;
 pub mod pool_sizing;
+pub mod principles;
 pub mod runtime;
+pub mod subagent_files;
 pub mod tools;
 pub mod wal;
 pub mod web;
-pub mod worktree;
 
 /// The label naming how a reading ended.
 ///
@@ -47,6 +51,40 @@ pub const LABEL_CAUSE: &str = "cause";
 /// 读数按「哪个工具」归属时用的标签键。
 pub const LABEL_TOOL: &str = "tool";
 
+/// 读数按「这件活的声明来自哪一类」归属时用的标签键。
+///
+/// 与 [`LABEL_ROLE`] 是两个问题：角色是名册上的一行，声明是活自己的话。同一个
+/// 人接不同活时，前者不变、后者该变——这正是「待遇跟活走，不跟名字走」在读面上
+/// 的样子。
+pub const LABEL_DECLARATION: &str = "declaration";
+
+/// 读数按「这个动作有没有外部效果」归属时用的标签键。
+///
+/// 与 [`LABEL_CAUSE`] 是两个问题：成因说这次为什么发生，这一格说这次重放要付
+/// 什么代价。续跑对三类处置不同，所以计数必须按它分开。
+pub const LABEL_EFFECT: &str = "effect";
+
+/// 只读：重放它除了再花一次调用，不改变任何东西。
+pub const LABEL_EFFECT_READ: &str = "read";
+
+/// 写文件：重放是幂等的，前提是先判「它是不是已经落过了」。
+pub const LABEL_EFFECT_WRITE: &str = "write";
+
+/// 有外部效果：绝不盲目重放，交给模型去核对。
+pub const LABEL_EFFECT_EXTERNAL: &str = "external";
+
+/// 一次尝试读到了可续的日志：它从被中断的那一段接着跑。
+pub const ATTEMPT_RESUMED: &str = "resumed";
+
+/// 一次尝试在日志里没有可续的一段：它从第一轮开始。
+pub const ATTEMPT_FRESH: &str = "fresh";
+
+/// 读数按「这个数是谁给的」归属时用的标签键。
+///
+/// 目前只有轮次上限用它：钉死的数、实测给出、与两边都没有（无上限）是三种
+/// 读数上必须分得开的情形。
+pub const LABEL_CEILING_SOURCE: &str = "source";
+
 pub use archive::{HttpToolOutputArchive, ToolOutputArchive};
 pub use config::{AgentLoopConfig, AgentManagerConfig};
 
@@ -59,6 +97,9 @@ pub use agent_kernel::{AgentHooks, AgentRuntime, ReActLoop, ReActStep, RuntimeSt
 
 /// 把进程的提示词本子交给运行时：每次运行开头那段通用指示从它这里取。
 pub use agent_kernel::base_instruction::install as install_prompt_provider;
+
+/// 把进程的规则账交给运行时：每一轮开头生效的那几条规则从它这里取。
+pub use principles::install as install_principle_source;
 
 /// Open agent-role identifier (not an enum) so new roles can be added
 /// without recompiling `cog-core`.
@@ -105,7 +146,7 @@ pub use hooks::{
     HookEngineConfig, HookHandler, HookPublisher, HookType, LifecycleHookEngine,
     LifecycleHookEvent, TieredHookPublisher, DEFAULT_LIFECYCLE_CHANNEL_BUFFER,
 };
-pub use lifecycle::{HeartbeatConfig, LifecycleManager, StateTransitionHook};
+pub use lifecycle::{LifecycleManager, StateTransitionHook};
 pub use observable::AgentObservable;
 pub use runtime::{GlobalAgentManager, WorkerHandle};
 pub use tools::builtins;
@@ -125,3 +166,124 @@ pub use self_review::SelfReviewLoop;
 #[cfg(test)]
 #[path = "../../cogneva/tests/common/root.rs"]
 pub(crate) mod checkout;
+
+/// 测试用的记账后端：把每一次写入按「序列名、标签、数值」记下来。
+///
+/// 放在这里而不是各测试模块各写一份：本 crate 有三处要判「写的是哪条序列、
+/// 带什么标签」，三份拷贝会让一个改了标签的写入在另外两处仍然绿着。
+#[cfg(test)]
+pub mod recording_metrics {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// 一次写入。
+    pub type Recorded = (String, HashMap<String, String>, f64);
+
+    /// 记下每一次写入的后端。
+    #[derive(Default)]
+    pub struct RecordingMetrics(pub Mutex<Vec<Recorded>>);
+
+    impl RecordingMetrics {
+        /// 写给某条序列的全部行。
+        pub fn rows_for(&self, name: cog_core::MetricName) -> Vec<Recorded> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(n, _, _)| n == name.as_str())
+                .cloned()
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::MetricsBackend for RecordingMetrics {
+        async fn record_gauge(
+            &self,
+            name: cog_core::MetricName,
+            value: f64,
+            labels: HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((name.to_string(), labels, value));
+            Ok(())
+        }
+        async fn record_counter(
+            &self,
+            name: cog_core::MetricName,
+            value: f64,
+            labels: HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((name.to_string(), labels, value));
+            Ok(())
+        }
+        async fn record_histogram(
+            &self,
+            name: cog_core::MetricName,
+            value: f64,
+            labels: HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((name.to_string(), labels, value));
+            Ok(())
+        }
+        async fn query_gauge_range(
+            &self,
+            _name: &str,
+            _start: chrono::DateTime<chrono::Utc>,
+            _end: chrono::DateTime<chrono::Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+        async fn query_gauge_latest(
+            &self,
+            _name: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+        async fn query_counter_range(
+            &self,
+            _name: &str,
+            _start: chrono::DateTime<chrono::Utc>,
+            _end: chrono::DateTime<chrono::Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+        async fn query_counter_totals(
+            &self,
+            _name: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+        async fn query_histogram_totals(
+            &self,
+            _name: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::HistogramTotals>> {
+            Ok(Vec::new())
+        }
+        async fn query_histogram_range(
+            &self,
+            _name: &str,
+            _start: chrono::DateTime<chrono::Utc>,
+            _end: chrono::DateTime<chrono::Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+        async fn list_metric_names(
+            &self,
+            _metric_type: cog_core::MetricType,
+        ) -> cog_core::SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn health_check(&self) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+    }
+}

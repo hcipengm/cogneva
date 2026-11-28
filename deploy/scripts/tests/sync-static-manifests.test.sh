@@ -7,7 +7,9 @@
 #
 #   1. 原样的树上是绿的（空跑也要有读数，否则「一直绿」与「从没跑过」同形）；
 #   2. chart 改了、静态清单没跟上时，它红，并且点名是哪一份；
-#   3. 写回之后变绿，而且写回去的正是 chart 那一份（解析后逐字段相等）。
+#   3. 写回之后变绿，而且写回去的正是渲染投影那一份（解析后逐字段相等）；
+#   4. chart 改了而渲染产物没重算时，它红在「投影落后」上——静态基线抄的是投影，
+#      不是源文件，源文件动了而投影没跟上这件事必须有人喊。
 #
 # 渲染产物侧同理：指纹改了而静态清单还是旧的，定向红在那一份 Deployment 上。
 #
@@ -37,6 +39,11 @@ case_dir() { # case_dir <名字> -> 打印一份可以随便改的树根
     local d="${work}/$1"
     mkdir -p "${d}"
     cp -a "${repo}/deploy" "${d}/deploy"
+    # 渲染产物不进仓，CI 里真树没有它：先让副本自带一棵，后面的用例才有对象可以
+    # 摆成「静态清单落后于渲染产物」。摘要按树内相对路径算，副本与真树同值，
+    # 生成一次之后 --check 不会再重渲（重渲会把夹具覆盖掉）。
+    bash "${d}/deploy/scripts/lib/rendered-cache.sh" --ensure "${d}" >/dev/null 2>&1 \
+        || { echo "case_dir: 副本的渲染产物生成失败：${d}" >&2; exit 1; }
     printf '%s' "${d}"
 }
 
@@ -63,33 +70,64 @@ root="$(case_dir base)"
 out="$(run "${root}" --check)" || fail "正常树上 --check 应当退出 0：${out}"
 expect_ok "原样" "${out}"
 
-# ---- 2. 配置改了一个值：红，点名配置清单 ----
+# ---- 2. 配置改了一个值（渲染产物已跟上）：红，点名配置清单 ----
 root="$(case_dir config-drift)"
 python3 - "${root}" <<'PY'
 import sys, pathlib
-p = pathlib.Path(sys.argv[1]) / "deploy/helm/cogneva/files/cogneva.json"
-s = p.read_text()
-assert '"event_channel_capacity": 1024' in s, "夹具依赖的值不在 chart 配置里了"
-p.write_text(s.replace('"event_channel_capacity": 1024', '"event_channel_capacity": 2048', 1))
+root = pathlib.Path(sys.argv[1])
+old, new = '"pg_max_connections": 16', '"pg_max_connections": 20'
+# 真树上是 render-deploy.sh 先重渲染、配置正文两侧一起变；夹具只改这两个文件。
+for rel in ("deploy/helm/cogneva/files/cogneva.json",
+            "deploy/rendered/k3s-single/10-configmap-cogneva-json.yaml"):
+    p = root / rel
+    s = p.read_text()
+    assert old in s, f"{rel} 里没有夹具依赖的值"
+    p.write_text(s.replace(old, new, 1))
 PY
 out="$(run "${root}" --check)" && fail "配置漂移时 --check 应当非零：${out}"
 expect_red_naming "配置漂移" "${out}" "deploy/k3s/cogneva-json-configmap.yaml"
 
-# ---- 3. 写回：绿，且正文就是 chart 那一份 ----
+# ---- 3. 写回：绿，且正文就是渲染投影那一份 ----
 out="$(run "${root}")" || fail "写回失败：${out}"
 out="$(run "${root}" --check)" || fail "写回之后仍然红：${out}"
 expect_ok "写回后" "${out}"
 python3 - "${root}" <<'PY' || exit 1
 import sys, json, pathlib, yaml
 root = pathlib.Path(sys.argv[1])
-chart = json.loads((root / "deploy/helm/cogneva/files/cogneva.json").read_text())
+projection = None
+for yml in sorted((root / "deploy/rendered/k3s-single").glob("*.yaml")):
+    for d in yaml.safe_load_all(yml.read_text()):
+        if isinstance(d, dict) and d.get("kind") == "ConfigMap" \
+                and d["metadata"]["name"] == "cogneva-json":
+            projection = json.loads(d["data"]["cogneva.json"])
+assert projection is not None, "渲染产物里没有 ConfigMap/cogneva-json"
 doc = yaml.safe_load((root / "deploy/k3s/cogneva-json-configmap.yaml").read_text())
 body = json.loads(list(doc["data"].values())[0])
-assert body == chart, "写回去的正文与 chart 的解析结果不一致"
-assert body["system"]["event_channel_capacity"] == 2048, "写回去的是旧值"
+assert body == projection, "写回去的正文与渲染投影的解析结果不一致"
+assert body["system"]["pg_max_connections"] == 20, "写回去的是旧值"
 PY
 
-# ---- 4. 指纹改了：红，点名那一份 Deployment ----
+# ---- 4. 投影落后于源文件：红在「投影落后」，不拿旧投影当对齐 ----
+# 静态基线抄投影，两侧不一致时写回只会把其中一侧再抄一遍，而另一侧的话没有人说。
+# 这条必须是红的：否则一处没跟上的投影会一路绿到集群里。
+#
+# 摆的是**投影**那一侧，不是源文件：改了 chart 之后，`--check` 自己会先重渲一遍
+# （生成器按输入摘要决定要不要重来），于是「源文件动了、投影没跟上」在带生成器的
+# 树上根本摆不出来——那正是它存在的理由。留下来的形态是两侧不一致本身（换了
+# helm、手改过产物、某次摘要读错）：判词对它就够了——不一致 ⇒ 红，并点名哪个键。
+root="$(case_dir config-unrendered)"
+python3 - "${root}" <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]) / "deploy/rendered/k3s-single/10-configmap-cogneva-json.yaml"
+s = p.read_text()
+assert '"pg_max_connections": 16' in s, "夹具依赖的值不在渲染投影里了"
+p.write_text(s.replace('"pg_max_connections": 16', '"pg_max_connections": 15', 1))
+PY
+out="$(run "${root}" --check)" && fail "投影落后时 --check 应当非零：${out}"
+expect_red_naming "投影落后" "${out}" "deploy/k3s/cogneva-json-configmap.yaml"
+[[ "${out}" == *"pg_max_connections"* ]] || fail "应当点名落后的那个键：${out}"
+
+# ---- 5. 指纹改了：红，点名那一份 Deployment ----
 root="$(case_dir fingerprint-drift)"
 target="$(python3 - "${root}" <<'PY'
 import sys, pathlib, yaml
@@ -114,7 +152,38 @@ out="$(run "${root}")" || fail "指纹写回失败：${out}"
 out="$(run "${root}" --check)" || fail "指纹写回之后仍然红：${out}"
 expect_ok "指纹写回后" "${out}"
 
-# ---- 5. 自称渲染产物的整份清单落后于出处：红，写回后与出处逐字节相等 ----
+# ---- 6. 指纹挂在 StatefulSet 上也一样：同一条路，不按工作负载种类分工 ----
+# 沙箱执行器一副副本一块卷，所以它是 StatefulSet；指纹回答的是「换了配置就得换一版
+# Pod」，与副本怎么编排无关。只同步 Deployment 的话，这张指纹会停在上一版配置上，
+# 而配置变了 Pod 不换——进程读的还是启动时那份环境。
+root="$(case_dir statefulset-fingerprint-drift)"
+ss_file="deploy/k3s/sandbox-executor-statefulset.yaml"
+python3 - "${root}" "${ss_file}" <<'PY'
+import sys, pathlib, yaml
+root = pathlib.Path(sys.argv[1])
+old = yaml.safe_load((root / sys.argv[2]).read_text())["spec"]["template"]["metadata"]["annotations"]["checksum/config"]
+hit = False
+for yml in sorted((root / "deploy/rendered/k3s-single").glob("*.yaml")):
+    for doc in yaml.safe_load_all(yml.read_text()):
+        if isinstance(doc, dict) and doc.get("kind") == "StatefulSet":
+            text = yml.read_text()
+            assert old in text, "静态清单的指纹在渲染产物里找不到，夹具失去意义"
+            yml.write_text(text.replace(old, "b" * 64, 1))
+            hit = True
+            break
+    if hit:
+        break
+assert hit, "渲染产物里没有 StatefulSet，这条用例失去意义"
+PY
+out="$(run "${root}" --check)" && fail "StatefulSet 指纹漂移时 --check 应当非零：${out}"
+expect_red_naming "StatefulSet 指纹漂移" "${out}" "${ss_file}"
+out="$(run "${root}")" || fail "StatefulSet 指纹写回失败：${out}"
+out="$(run "${root}" --check)" || fail "StatefulSet 指纹写回之后仍然红：${out}"
+expect_ok "StatefulSet 指纹写回后" "${out}"
+grep -q "checksum/config: b\{64\}" "${root}/${ss_file}" \
+    || fail "写回后没有取渲染产物里的指纹"
+
+# ---- 7. 自称渲染产物的整份清单落后于出处：红，写回后与出处逐字节相等 ----
 root="$(case_dir whole-file-drift)"
 censused="deploy/k3s/process-census-daemonset.yaml"
 python3 - "${root}" "${censused}" <<'PY'
@@ -133,7 +202,7 @@ cmp -s "${root}/${censused}" "${root}/deploy/rendered/k3s-single/40-daemonset-co
 out="$(run "${root}" --check)" || fail "整份清单写回之后仍然红：${out}"
 expect_ok "整份清单写回后" "${out}"
 
-# ---- 6. 版本标签落后：红，写回后与渲染产物一致 ----
+# ---- 8. 版本标签落后：红，写回后与渲染产物一致 ----
 root="$(case_dir version-drift)"
 python3 - "${root}" <<'PY'
 import sys, pathlib, re
@@ -164,7 +233,7 @@ PY
 out="$(run "${root}" --check)" || fail "版本写回之后仍然红：${out}"
 expect_ok "版本写回后" "${out}"
 
-# ---- 7. 版本标签整行缺失：从渲染产物补回来，而不是留一个空格 ----
+# ---- 9. 版本标签整行缺失：从渲染产物补回来，而不是留一个空格 ----
 root="$(case_dir version-missing)"
 python3 - "${root}" <<'PY'
 import sys, pathlib, re
@@ -188,7 +257,7 @@ PY
 out="$(run "${root}" --check)" || fail "版本补回之后仍然红：${out}"
 expect_ok "版本补回后" "${out}"
 
-# ---- 8. 静态清单里根本没有这个键：不猜，直接说 ----
+# ---- 10. 静态清单里根本没有这个键：不猜，直接说 ----
 root="$(case_dir no-block)"
 python3 - "${root}" <<'PY'
 import sys, pathlib
@@ -198,4 +267,4 @@ PY
 out="$(run "${root}" --check)" && fail "少了块标量时应当红：${out}"
 [[ "${out}" == *"cogneva.json"* ]] || fail "应当点名那个键：${out}"
 
-echo "SYNC STATIC TEST OK：8/8"
+echo "SYNC STATIC TEST OK：10/10"

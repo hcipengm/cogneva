@@ -461,7 +461,7 @@ mod tests {
     #[tokio::test]
     async fn a_ledger_that_was_never_written_is_empty_and_not_a_loss() {
         let path = ledger_file("missing");
-        let _ = tokio::fs::remove_file(&path).await;
+        cog_core::ignore_lost!(tokio::fs::remove_file(&path).await);
         let ledger = load_ledger_at(&path)
             .await
             .expect("an absent ledger is not an error");
@@ -476,7 +476,7 @@ mod tests {
         let path = ledger_file("corrupt");
         tokio::fs::write(&path, "{\"causes\": ").await.unwrap();
         assert!(load_ledger_at(&path).await.is_err());
-        let _ = tokio::fs::remove_file(&path).await;
+        cog_core::ignore_lost!(tokio::fs::remove_file(&path).await);
     }
 
     /// The charge has to be in the file the next process reads, which is the
@@ -494,6 +494,6 @@ mod tests {
             decide(LOG_A, &back, 1, window(), at(5)),
             RedriveDecision::Refuse(RedriveRefusal::CauseExhausted)
         );
-        let _ = tokio::fs::remove_file(&path).await;
+        cog_core::ignore_lost!(tokio::fs::remove_file(&path).await);
     }
 }

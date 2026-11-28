@@ -41,7 +41,8 @@ use tokio::task::JoinHandle;
 use cog_core::BroadcastScope;
 
 /// Default capacity of the engine's input channel.
-// cap: bound — 引擎输入通道的默认容量：够吸收一拍里成批进来的事件，又不让一个卡住的消费者无限占内存
+// cap: fixed — 引擎输入通道的默认容量：够吸收一拍里成批进来的事件，又不让一个卡住的消费者无限占内存
+// keep: 删掉后通道无界，卡住的消费者让内存一直长；由「吸收一拍成批事件又不无限占内存」兜住
 pub const DEFAULT_LIFECYCLE_CHANNEL_BUFFER: usize = 256;
 
 /// The first seven variants are the canonical "key Hooks" called out in the
@@ -287,7 +288,7 @@ impl LifecycleHookEngine {
             while let Some(event) = rx.recv().await {
                 engine.dispatch(&event).await;
                 if let Some(ref forward) = engine.forward_tx {
-                    let _ = forward.send(event.event).await;
+                    cog_core::ignore_lost!(forward.send(event.event).await);
                 }
             }
         });
@@ -300,7 +301,7 @@ impl LifecycleHookEngine {
     pub async fn emit(&self, event: LifecycleHookEvent) {
         self.dispatch(&event).await;
         if let Some(ref forward) = self.forward_tx {
-            let _ = forward.send(event.event).await;
+            cog_core::ignore_lost!(forward.send(event.event).await);
         }
     }
 

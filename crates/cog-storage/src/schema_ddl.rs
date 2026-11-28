@@ -148,7 +148,8 @@ const FINAL_WAIT: &str = "5s";
 /// The attempts have to span more than one cycle of a periodic reader: the
 /// observed collision was a reader on a ten second poll, and a set of attempts
 /// that all landed inside the same poll would all hit the same lock.
-// cap: bound — 尝试的总时长要跨过一个周期读者的循环：实测撞车的是一个十秒轮询的读者，全落在同一拍里的尝试会全撞同一把锁
+// cap: fixed — 尝试的总时长要跨过一个周期读者的循环：实测撞车的是一个十秒轮询的读者，全落在同一拍里的尝试会全撞同一把锁
+// keep: 删掉后总尝试时长跨不过一个十秒轮询的读者，全落在同一拍里撞同一把锁；由「实测撞车的是十秒轮询的读者」兜住
 const ATTEMPTS: u32 = 16;
 
 /// How long the first replay waits before trying the schema again.
@@ -157,7 +158,8 @@ const ATTEMPTS: u32 = 16;
 /// taken for milliseconds, so the first pause is already long enough to matter
 /// to it; starting shorter would spend attempts inside the same reader's
 /// window.
-// cap: bound — 锁是被毫秒级持住的，所以第一次停顿就已经够它看见；更短的起步只会把尝试耗在同一个读者的窗口里
+// cap: fixed — 锁是被毫秒级持住的，所以第一次停顿就已经够它看见；更短的起步只会把尝试耗在同一个读者的窗口里
+// keep: 删掉后第一次停顿短于毫秒级的持锁时间，尝试耗在同一个读者的窗口里；由「锁被毫秒级持住」兜住
 const FIRST_PAUSE_MS: u64 = 200;
 
 /// How much longer each replay waits than the one before it.
@@ -165,7 +167,8 @@ const FIRST_PAUSE_MS: u64 = 200;
 /// The attempts have to spread across a reader's cycle rather than march in
 /// step: with a fixed pause, sixteen attempts fit inside one ten second poll
 /// and every one of them lands on the same lock.
-// cap: bound — 尝试要铺开在一个读者的周期上而不是齐步走：固定停顿下十六次尝试挤进一个十秒轮询，每次都落在那把锁上
+// cap: fixed — 尝试要铺开在一个读者的周期上而不是齐步走：固定停顿下十六次尝试挤进一个十秒轮询，每次都落在那把锁上
+// keep: 删掉后固定停顿下十六次尝试齐步走，每次都落在同一把锁上；由「尝试要铺开在读者的周期上」兜住
 const PAUSE_GROWTH_MS: u64 = 50;
 
 /// The pause before attempt `n`, which grows so the attempts spread out
@@ -182,7 +185,8 @@ fn pause_before(attempt: u32) -> Duration {
 /// milliseconds puts two hundred and fifty readings inside `FINAL_WAIT` and
 /// about a dozen inside a plain `LOCK_WAIT`; finer would spend more of the
 /// wait reading the catalog than waiting.
-// cap: bound — 按这个间隔在 FINAL_WAIT 里有两百多次读数、在普通 LOCK_WAIT 里有十几次；更细就是用等待的时间去读目录
+// cap: fixed — 按这个间隔在 FINAL_WAIT 里有两百多次读数、在普通 LOCK_WAIT 里有十几次；更细就是用等待的时间去读目录
+// not-a-bound: 按这个间隔在 FINAL_WAIT 里有两百多次读数、在普通 LOCK_WAIT 里有十几次；更细就是用等待的时间去读目录
 const LOCK_SAMPLE_MS: u64 = 20;
 
 /// SQLSTATE `lock_not_available`, which is what a `lock_timeout` expiry raises.
@@ -279,7 +283,26 @@ async fn attempt_once(pool: &PgPool, schema: &str, tag: &str, wait: &str) -> Att
     match apply_once(pool, schema, tag, wait).await {
         Ok(()) => Attempt::Ok,
         Err(e) if is_lock_wait_expiry(&e) => Attempt::LockWait(e),
-        Err(e) => Attempt::Failed(e.to_string()),
+        Err(e) => {
+            // Losing a race to a peer is not a failed schema. `CREATE TABLE IF
+            // NOT EXISTS` is idempotent as a statement but not atomic as a
+            // check: two sessions that both read the catalog before either has
+            // written it both go on to insert its rows, and one of them comes
+            // back `duplicate key value violates unique constraint
+            // "pg_type_typname_nsp_index"` or `relation ... already exists`
+            // (both measured on the two replicas that start together). The
+            // text's work is done either way, so a failed attempt asks the
+            // catalog again: empty means the peer did it, and this attempt is
+            // as good as done. A statement that is not a catalog fact is kept
+            // by `outstanding` unconditionally, so a real failure -- bad SQL, a
+            // constraint, a statement whose effect is rows -- still comes back
+            // with work left and is reported.
+            if matches!(outstanding(pool, schema).await, Some(rest) if rest.trim().is_empty()) {
+                Attempt::Ok
+            } else {
+                Attempt::Failed(e.to_string())
+            }
+        }
     }
 }
 
@@ -525,6 +548,25 @@ enum Check {
         table: String,
         column: String,
     },
+    /// `ALTER TABLE … ADD CONSTRAINT <name> …`: done when a constraint of that
+    /// name is on the table. Added for the one check the usage ledger carries —
+    /// "a row that spent tokens names its task" — because a store that states it
+    /// in its startup batch would otherwise have an opaque statement in a batch
+    /// that is otherwise catalog-only.
+    ConstraintExists {
+        table: String,
+        constraint: String,
+    },
+    /// `ALTER TABLE … ALTER COLUMN … TYPE <type>`: the statement is done when
+    /// the column already holds that type. A store reaching this shape is one
+    /// moving a column off `jsonb` onto `text` -- the conversion the storage
+    /// end state asks for -- and on the second start the `USING` clause has
+    /// nothing left to convert.
+    ColumnHasType {
+        table: String,
+        column: String,
+        ty: String,
+    },
 }
 
 /// The checks a schema text reduces to, or `None` when it holds anything this
@@ -604,6 +646,12 @@ fn classify(statement: &str) -> Option<Check> {
                     column: name(8)?,
                 });
             }
+            if word(3) == Some("add") && word(4) == Some("constraint") {
+                return Some(Check::ConstraintExists {
+                    table,
+                    constraint: name(5)?,
+                });
+            }
             if word(3) == Some("alter") && word(4) == Some("column") {
                 let column = name(5)?;
                 if word(6) == Some("set") && word(7) == Some("not") && word(8) == Some("null") {
@@ -614,6 +662,15 @@ fn classify(statement: &str) -> Option<Check> {
                 }
                 if word(6) == Some("drop") && word(7) == Some("default") {
                     return Some(Check::ColumnHasNoDefault { table, column });
+                }
+                if word(6) == Some("type") {
+                    // Only a bare type word: `varchar(64)` or an array is a
+                    // name this cannot hand the catalog, and those stay run.
+                    return Some(Check::ColumnHasType {
+                        table,
+                        column,
+                        ty: name(7)?,
+                    });
                 }
             }
             None
@@ -772,10 +829,40 @@ async fn checks_hold(pool: &PgPool, checks: &[Check]) -> SFResult<bool> {
         }
     }
 
+    let constraints: Vec<(String, String)> = checks
+        .iter()
+        .filter_map(|check| match check {
+            Check::ConstraintExists { table, constraint } => {
+                Some((table.clone(), constraint.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    if !constraints.is_empty() {
+        let tables: Vec<String> = constraints.iter().map(|(table, _)| table.clone()).collect();
+        let names: Vec<String> = constraints.iter().map(|(_, name)| name.clone()).collect();
+        let present: Vec<String> = sqlx::query_scalar(
+            "SELECT con.conname
+               FROM unnest($1::text[], $2::text[]) AS want(tbl, name)
+               JOIN pg_class c ON c.relname = want.tbl
+               JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = current_schema()
+               JOIN pg_constraint con ON con.conrelid = c.oid AND con.conname = want.name",
+        )
+        .bind(&tables)
+        .bind(&names)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| SFError::Database(format!("read the catalog's constraints: {e}")))?;
+        if present.len() != constraints.len() {
+            return Ok(false);
+        }
+    }
+
     let mut wanted: Vec<(String, String)> = Vec::new();
     let mut must_be_not_null: Vec<(String, String)> = Vec::new();
     let mut must_be_nullable: Vec<(String, String)> = Vec::new();
     let mut must_have_no_default: Vec<(String, String)> = Vec::new();
+    let mut must_have_type: Vec<(String, String, String)> = Vec::new();
     for check in checks {
         match check {
             Check::ColumnExists { table, column } => wanted.push((table.clone(), column.clone())),
@@ -791,6 +878,10 @@ async fn checks_hold(pool: &PgPool, checks: &[Check]) -> SFResult<bool> {
                 wanted.push((table.clone(), column.clone()));
                 must_have_no_default.push((table.clone(), column.clone()));
             }
+            Check::ColumnHasType { table, column, ty } => {
+                wanted.push((table.clone(), column.clone()));
+                must_have_type.push((table.clone(), column.clone(), ty.clone()));
+            }
             _ => {}
         }
     }
@@ -800,8 +891,13 @@ async fn checks_hold(pool: &PgPool, checks: &[Check]) -> SFResult<bool> {
         // row rather than reads that could disagree.
         let tables: Vec<String> = wanted.iter().map(|(table, _)| table.clone()).collect();
         let columns: Vec<String> = wanted.iter().map(|(_, column)| column.clone()).collect();
-        let rows: Vec<(String, String, bool, bool)> = sqlx::query_as(
-            "SELECT c.relname, a.attname, a.attnotnull, a.atthasdef
+        // `format_type` is asked for in the same row as the other three
+        // answers: a type read from a second query could disagree with the
+        // nullability read here, and this guard's whole job is to be right
+        // about "already done".
+        let rows: Vec<(String, String, bool, bool, String)> = sqlx::query_as(
+            "SELECT c.relname, a.attname, a.attnotnull, a.atthasdef,
+                    format_type(a.atttypid, a.atttypmod)
                FROM unnest($1::text[], $2::text[]) AS want(tbl, col)
                JOIN pg_class c ON c.relname = want.tbl
                JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = current_schema()
@@ -818,11 +914,22 @@ async fn checks_hold(pool: &PgPool, checks: &[Check]) -> SFResult<bool> {
         }
         let field = |table: &String, column: &String| {
             rows.iter()
-                .find(|(found_table, found_column, _, _)| {
+                .find(|(found_table, found_column, _, _, _)| {
                     found_table == table && found_column == column
                 })
-                .map(|(_, _, not_null, has_default)| (*not_null, *has_default))
+                .map(|(_, _, not_null, has_default, _)| (*not_null, *has_default))
         };
+        for (table, column, ty) in &must_have_type {
+            let found = rows
+                .iter()
+                .find(|(found_table, found_column, _, _, _)| {
+                    found_table == table && found_column == column
+                })
+                .map(|(_, _, _, _, found_type)| found_type.to_ascii_lowercase());
+            if found.as_deref() != Some(ty.as_str()) {
+                return Ok(false);
+            }
+        }
         for (table, column) in &must_be_not_null {
             if field(table, column).is_none_or(|(not_null, _)| !not_null) {
                 return Ok(false);
@@ -1007,6 +1114,23 @@ mod tests {
                 column: "seen".into()
             })
         );
+        assert_eq!(
+            read("ALTER TABLE entries ADD CONSTRAINT entries_has_owner CHECK (owner IS NOT NULL) NOT VALID"),
+            Some(Check::ConstraintExists {
+                table: "entries".into(),
+                constraint: "entries_has_owner".into()
+            })
+        );
+        // 把一列从 jsonb 搬到 text 是存储终态要求的那一步，而它的第二句在第二次
+        // 启动时已经没有东西可搬：列已经是 text。
+        assert_eq!(
+            read("ALTER TABLE entries ALTER COLUMN seen TYPE TEXT USING seen::text"),
+            Some(Check::ColumnHasType {
+                table: "entries".into(),
+                column: "seen".into(),
+                ty: "text".into()
+            })
+        );
     }
 
     /// Everything else makes the whole text run. The cases here are the ones
@@ -1028,6 +1152,8 @@ mod tests {
             // Not a shape this knows at all.
             "DROP TABLE IF EXISTS entries",
             "ALTER TABLE entries DROP COLUMN IF EXISTS seen",
+            // A type name the catalog would not answer with verbatim.
+            "ALTER TABLE entries ALTER COLUMN seen TYPE varchar(64)",
         ] {
             assert_eq!(
                 classify(statement),

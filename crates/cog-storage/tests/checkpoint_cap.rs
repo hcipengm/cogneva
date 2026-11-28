@@ -1,19 +1,18 @@
-//! What the checkpoint sweep deletes, and the two things it may never delete.
+//! The checkpoint store is measured, never trimmed, against a live PostgreSQL.
 //!
 //! `cog_snapshots` grows because nothing removes the final checkpoint of a
-//! finished task and nothing retires the board that pointed at it. The sweep
-//! answers that, and the claims worth a live server are the ones a reading of
-//! the count cannot check:
+//! finished task and nothing retires the board that pointed at it. What used to
+//! answer that was a sweep: past a row capacity, delete the oldest rows no board
+//! names. What answers it now is a reading, and the claims worth a live server
+//! are the ones a counting query alone cannot check:
 //!
-//! - past the capacity, the oldest unreferenced rows go first;
-//! - a row a board field names stays, however old and however far over the
-//!   capacity it is — it is the resume point, and deleting it leaves the board
-//!   pointing at an id that no longer exists;
-//! - a row younger than the read window stays, because the snapshots view
-//!   promises that window and "no snapshots" reads exactly like "there never
-//!   were any";
-//! - when the pointers and the window together hold more than the capacity
-//!   allows, the pass says so rather than reporting the capacity met.
+//! - the row count published is the table's own, boards and all;
+//! - past the declared capacity the reading says so and **removes nothing** --
+//!   not the oldest unreferenced row either;
+//! - a row a board field names is still there afterwards, and now for a stronger
+//!   reason than the old floor: nothing in this loop deletes at all;
+//! - a deployment that declares neither a capacity nor a volume has a target of
+//!   none rather than a target of zero.
 //!
 //! All of it needs a server, so all of it is ignored by default:
 //!
@@ -23,13 +22,9 @@
 //! ```
 //!
 //! Each case builds its own schema and drops it at the end. The tables keep
-//! their real names and are reached through the connection's search path, so
-//! the sweep is never pointed at a renamed table and the shared database's own
+//! their real names and are reached through the connection's search path, so the
+//! loop is never pointed at a renamed table and the shared database's own
 //! `cog_snapshots` is never in reach.
-
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
 use cog_storage::CheckpointCap;
@@ -37,7 +32,7 @@ use sqlx::{PgPool, Row};
 
 use cog_test_support::{database_url, drop_schema, own_schema, schema_pool_with};
 
-/// One case's own schema, holding the two tables the sweep reads.
+/// One case's own schema, holding the two tables the loop reads.
 struct Scratch {
     schema: String,
 }
@@ -91,8 +86,8 @@ impl Scratch {
             .collect()
     }
 
-    fn cap(&self, pool: &PgPool, budget: u64, window_secs: u64) -> CheckpointCap {
-        CheckpointCap::new(pool.clone(), budget).with_read_window(Duration::from_secs(window_secs))
+    fn cap(&self, pool: &PgPool, budget: u64) -> CheckpointCap {
+        CheckpointCap::new(pool.clone(), budget)
     }
 
     async fn done(&self) {
@@ -130,283 +125,135 @@ async fn scratch(case: &str) -> (Scratch, PgPool) {
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
-async fn unreferenced_rows_past_the_window_go_oldest_first() {
-    let (scratch, pool) = scratch("oldest_first").await;
+async fn the_reading_is_the_row_count_the_table_has_now() {
+    let (scratch, pool) = scratch("reads_rows").await;
     for n in 0..5 {
         scratch
-            .snapshot(&pool, &format!("old-{n}"), ChronoDuration::hours(3 + n))
+            .snapshot(&pool, &format!("snap-{n}"), ChronoDuration::hours(3 + n))
             .await;
     }
-    scratch
-        .snapshot(&pool, "recent", ChronoDuration::minutes(30))
-        .await;
 
-    let outcome = scratch
-        .cap(&pool, 2, 3_600)
-        .sweep_once()
+    let reading = scratch
+        .cap(&pool, 40_000)
+        .measure_once()
         .await
-        .expect("sweep");
-
-    assert_eq!(outcome.removed, 4, "four rows have to go to reach two");
-    assert_eq!(outcome.held, 2);
-    assert!(!outcome.held_above, "the capacity was reachable");
-    // Four of the five old rows go, oldest first: what survives is the
-    // youngest of them, plus the row inside the window that was never a
-    // candidate.
-    assert_eq!(
-        scratch.ids(&pool).await,
-        vec!["old-0".to_string(), "recent".to_string()],
-        "the oldest go first, and the row inside the window is not a candidate at all"
-    );
-
-    scratch.done().await;
-}
-
-#[tokio::test]
-#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
-async fn a_snapshot_a_board_names_survives_at_any_age() {
-    let (scratch, pool) = scratch("board_pointer").await;
-    // The oldest row of all is a board pointer: age does not protect it, and
-    // age does not condemn it.
-    scratch
-        .snapshot(&pool, "resume", ChronoDuration::days(90))
-        .await;
-    for n in 0..4 {
-        scratch
-            .snapshot(&pool, &format!("garbage-{n}"), ChronoDuration::days(10 + n))
-            .await;
-    }
-    scratch.point_at(&pool, "task-resume", "resume").await;
-
-    let outcome = scratch
-        .cap(&pool, 1, 3_600)
-        .sweep_once()
-        .await
-        .expect("sweep");
-
-    assert_eq!(
-        outcome.removed, 4,
-        "only the unreferenced rows are deletable"
-    );
-    assert_eq!(outcome.held, 1);
+        .expect("measure");
+    assert_eq!(reading.held, 5, "the reading is the row count: {reading:?}");
+    assert_eq!(reading.target, Some(40_000));
+    assert!(!reading.over_capacity);
     assert!(
-        !outcome.held_above,
-        "one row at the capacity is not a table held over it"
-    );
-    assert_eq!(
-        scratch.ids(&pool).await,
-        vec!["resume".to_string()],
-        "the resume point must survive the oldest-first order"
+        reading.bytes.is_some_and(|bytes| bytes > 0),
+        "the size on disk is a reading and this table has rows: {reading:?}"
     );
 
     scratch.done().await;
 }
 
-#[tokio::test]
-#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
-async fn a_snapshot_inside_the_window_survives_even_unreferenced() {
-    let (scratch, pool) = scratch("window").await;
-    scratch
-        .snapshot(&pool, "just-outside", ChronoDuration::seconds(3_700))
-        .await;
-    scratch
-        .snapshot(&pool, "just-inside", ChronoDuration::seconds(3_500))
-        .await;
-
-    let outcome = scratch
-        .cap(&pool, 1, 3_600)
-        .sweep_once()
-        .await
-        .expect("sweep");
-
-    assert_eq!(outcome.removed, 1, "only the row outside the window goes");
-    assert_eq!(
-        scratch.ids(&pool).await,
-        vec!["just-inside".to_string()],
-        "the window is the floor: not one row inside it may go"
-    );
-
-    scratch.done().await;
-}
-
-#[tokio::test]
-#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
-async fn a_store_the_pointers_and_the_window_hold_over_capacity_says_so() {
-    let (scratch, pool) = scratch("held_above").await;
-    // Five unreferenced rows inside the window, all of them over a capacity of
-    // one. Reaching the capacity would mean deleting rows a reader may still
-    // ask for, so the pass has to stop and say so.
-    for n in 0..5 {
-        scratch
-            .snapshot(
-                &pool,
-                &format!("recent-{n}"),
-                ChronoDuration::minutes(10 + n),
-            )
-            .await;
-    }
-
-    let outcome = scratch
-        .cap(&pool, 1, 3_600)
-        .sweep_once()
-        .await
-        .expect("sweep");
-
-    assert_eq!(outcome.removed, 0, "nothing inside the window is deletable");
-    assert_eq!(outcome.held, 5);
-    assert!(
-        outcome.held_above,
-        "a table the floor holds over budget must say so, not report the capacity met"
-    );
-    assert_eq!(scratch.ids(&pool).await.len(), 5);
-
-    scratch.done().await;
-}
-
-/// A pass that needs more than one batch reports progress between them.
+/// Past the declared capacity the reading says so — and nothing is removed.
 ///
-/// The loop stamps its own beat from that callback, so a pass that is working
-/// keeps its published age at one batch while a batch wedged on a lock still
-/// shows. Without a beat between batches the age of a pass over a store far
-/// over its capacity is the length of the whole pass, and that length is
-/// whatever the surplus is — the number of batches grows with it, so the loop
-/// can never declare a wall that covers it.
+/// The oldest rows here are exactly the ones the old sweep would have taken
+/// first: unreferenced, well past the capacity, old enough that no read window
+/// would have protected them either.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
-async fn a_pass_that_needs_more_than_one_batch_reports_progress_between_them() {
-    let (scratch, pool) = scratch("progress").await;
-    // 12,001 rows against a capacity of one, all of them outside the read
-    // window: 12,000 deletions in batches of 5,000 is three batches.
-    sqlx::query(
-        "INSERT INTO cog_snapshots (snapshot_id, task_id, timestamp) \
-         SELECT 'row-' || g, 'task-' || g, NOW() - (g || ' minutes')::interval \
-         FROM generate_series(1, 12001) AS g",
-    )
-    .execute(&pool)
-    .await
-    .expect("fill the scratch store");
-
-    let beats = Arc::new(AtomicUsize::new(0));
-    let counter = Arc::clone(&beats);
-    let outcome = scratch
-        .cap(&pool, 1, 1)
-        .sweep_once_beating(move || {
-            counter.fetch_add(1, Ordering::Relaxed);
-        })
-        .await
-        .expect("sweep");
-
-    assert_eq!(outcome.removed, 12_000, "the whole surplus goes");
-    assert_eq!(
-        beats.load(Ordering::Relaxed),
-        3,
-        "12,000 rows in batches of 5,000 is three batches, and every one of them \
-         has to report progress: the loop beats its heartbeat from this callback"
-    );
-
-    scratch.done().await;
-}
-
-#[tokio::test]
-#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
-async fn a_pass_with_pruning_off_deletes_nothing() {
-    let (scratch, pool) = scratch("pruning_off").await;
-    for n in 0..3 {
+async fn a_store_past_its_capacity_reads_over_and_keeps_every_row() {
+    let (scratch, pool) = scratch("over_capacity").await;
+    for n in 0..6 {
         scratch
             .snapshot(&pool, &format!("old-{n}"), ChronoDuration::days(30 + n))
             .await;
     }
 
-    let outcome = scratch
-        .cap(&pool, 0, 3_600)
-        .sweep_once()
-        .await
-        .expect("sweep");
-
-    assert_eq!(
-        outcome.removed, 0,
-        "a zero capacity is how a deployment opts out"
+    let reading = scratch.cap(&pool, 2).measure_once().await.expect("measure");
+    assert_eq!(reading.held, 6);
+    assert_eq!(reading.target, Some(2));
+    assert!(
+        reading.over_capacity,
+        "6 rows against a declared 2: {reading:?}"
     );
     assert_eq!(
-        outcome.budget, None,
-        "and the reading must not claim a budget it was never given"
+        scratch.ids(&pool).await.len(),
+        6,
+        "the pass removed rows it was only supposed to count"
     );
-    assert!(!outcome.held_above);
-    assert_eq!(scratch.ids(&pool).await.len(), 3);
 
     scratch.done().await;
 }
 
-/// The startup schema has to survive the rows the boards already hold.
+/// A row a board points at survives, and now nothing could remove it.
 ///
-/// A field value is an opaque string, and real boards carry long ones; a btree
-/// index keeps the value itself in every entry and refuses anything past a
-/// third of a page. When that refusal lands in `init_schema` the whole gateway
-/// refuses to start, and the rollout of that revision fails and rolls back --
-/// measured 2026-10-27 on a live table whose longest board value was 11,456
-/// bytes against a 2,704-byte ceiling.
-///
-/// The sweep only ever asks `field_value = <snapshot id>`, so the index that
-/// question needs is a hash index: it stores the hash rather than the value and
-/// has no length ceiling.
+/// The old sweep kept such a row with a floor: a `NOT EXISTS` clause in the
+/// delete. The invariant is stronger now in the only way that matters — there is
+/// no delete to carry a clause.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
-async fn the_startup_schema_holds_board_values_past_a_btree_entry() {
-    let scratch = Scratch::new("long_board_value").await;
-    let pool = scratch.pool().await;
-    for ddl in [
-        "CREATE TABLE cog_snapshots (
-             snapshot_id TEXT PRIMARY KEY,
-             task_id     TEXT NOT NULL,
-             timestamp   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-         )",
-        "CREATE TABLE cog_context_boards (
-             task_id     TEXT NOT NULL,
-             field_name  TEXT NOT NULL,
-             field_value TEXT NOT NULL,
-             updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-             PRIMARY KEY (task_id, field_name)
-         )",
-    ] {
-        sqlx::query(ddl)
-            .execute(&pool)
-            .await
-            .expect("scratch table");
+async fn a_snapshot_a_board_names_survives_at_any_age() {
+    let (scratch, pool) = scratch("board_pointer").await;
+    scratch
+        .snapshot(&pool, "resume", ChronoDuration::days(90))
+        .await;
+    scratch.point_at(&pool, "task-resume", "resume").await;
+    for n in 0..3 {
+        scratch
+            .snapshot(&pool, &format!("loose-{n}"), ChronoDuration::hours(n + 1))
+            .await;
     }
-    // A value longer than a btree entry may be, already in the table before the
-    // startup schema runs -- which is the state a rollout finds itself in.
-    let long = "v".repeat(11_456);
-    sqlx::query(
-        "INSERT INTO cog_context_boards (task_id, field_name, field_value) \
-         VALUES ($1, $2, $3)",
-    )
-    .bind("task-long")
-    .bind("blob")
-    .bind(&long)
-    .execute(&pool)
-    .await
-    .expect("insert a long board value");
 
-    sqlx::raw_sql(&cog_storage::postgres::state_backend::ddl())
-        .execute(&pool)
-        .await
-        .expect("the startup schema must apply over rows a board already holds");
-
-    // And the index has to be one the equality question can use.
-    let method: String = sqlx::query(
-        "SELECT am.amname FROM pg_index i \
-         JOIN pg_class c ON c.oid = i.indexrelid \
-         JOIN pg_am am ON am.oid = c.relam \
-         WHERE c.relname = 'idx_cog_context_boards_field_value'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("the sweep's index exists after the schema runs")
-    .get("amname");
+    let reading = scratch.cap(&pool, 1).measure_once().await.expect("measure");
+    assert!(reading.over_capacity, "four rows against a declared one");
     assert_eq!(
-        method, "hash",
-        "the sweep asks field_value = <id>; a btree here refuses the long values"
+        scratch.ids(&pool).await,
+        vec![
+            "loose-0".to_string(),
+            "loose-1".to_string(),
+            "loose-2".to_string(),
+            "resume".to_string()
+        ],
+        "the resume point is still there, and so is everything else"
     );
+
+    scratch.done().await;
+}
+
+/// A deployment that declares neither a capacity nor a volume has no target.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn no_declaration_is_no_target_rather_than_a_target_of_zero() {
+    let (scratch, pool) = scratch("no_declaration").await;
+    scratch
+        .snapshot(&pool, "only", ChronoDuration::minutes(5))
+        .await;
+
+    let reading = scratch.cap(&pool, 0).measure_once().await.expect("measure");
+    assert_eq!(reading.target, None, "{reading:?}");
+    assert!(!reading.over_capacity);
+
+    scratch.done().await;
+}
+
+/// A declared volume turns the target into a derived one, and says so.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_declared_volume_makes_the_target_a_derived_reading() {
+    let (scratch, pool) = scratch("volume").await;
+    for n in 0..4 {
+        scratch
+            .snapshot(&pool, &format!("snap-{n}"), ChronoDuration::hours(n + 1))
+            .await;
+    }
+
+    let reading = scratch
+        .cap(&pool, 40_000)
+        .with_database_volume(Some(8 * 1024 * 1024 * 1024))
+        .measure_once()
+        .await
+        .expect("measure");
+    assert_eq!(
+        reading.target_source,
+        cog_core::retention::SOURCE_DERIVED,
+        "a volume and a measured cost per row is a derived target: {reading:?}"
+    );
+    assert!(reading.target.is_some());
 
     scratch.done().await;
 }

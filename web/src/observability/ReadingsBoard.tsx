@@ -143,7 +143,7 @@ export function ReadingsBoard() {
                 title: '深挖',
                 width: '150px',
                 render: (r) => {
-                  const link = deepLink(r.dashboard_uid);
+                  const link = deepLink(r.panel);
                   if (link.href) {
                     return (
                       <a
@@ -153,7 +153,7 @@ export function ReadingsBoard() {
                         className="text-[11px] underline decoration-dotted"
                         style={{ color: 'var(--brass)' }}
                       >
-                        在 Grafana 打开 {r.dashboard_uid}
+                        在 Grafana 打开
                       </a>
                     );
                   }

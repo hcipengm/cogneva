@@ -111,7 +111,8 @@ pub const MAX_BODY_BYTES_ENV: &str = "COGNEVA_SG_AUDITED_MAX_BODY_BYTES";
 /// same quantity, and tying them together would quietly drag one side along
 /// whenever the other is adjusted. The smaller side is observable: requests it
 /// stops are counted under `refused_over_bound`, not dropped in silence.
-// cap: bound — 审计正文的默认上限；超出记在 refused_over_bound，不静默丢弃
+// cap: fixed — 审计正文的默认上限；超出记在 refused_over_bound，不静默丢弃
+// keep: 删掉后回到「审计正文的默认上限；超出记在 refused_over_bound，不静默丢弃」所描述的情形；由这条约定兜住
 pub const DEFAULT_MAX_AUDITED_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 /// When the audit cannot pass a body, which kind of "cannot" it was.

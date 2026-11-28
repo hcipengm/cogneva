@@ -140,6 +140,19 @@ pub struct TaskItem {
     /// generation and auto-deploy pipeline.
     pub task_type: String,
     pub input: serde_json::Value,
+    /// 这条活的终态描述。
+    ///
+    /// 三格随行一起来、是任务的一等字段，不放进 `input` 的开集载荷：判据、界面
+    /// 与定批都按键读它们，埋在文本里就不可查询。老调用方仍可把三格放在
+    /// `input.ledger_item` 里，写事实前会被提到字段上。
+    #[serde(default)]
+    pub terminal: Option<String>,
+    /// 此刻的样子（写明来源）。
+    #[serde(default)]
+    pub now: Option<String>,
+    /// 缺什么；空 = 到终态。
+    #[serde(default)]
+    pub gap: Option<String>,
     #[serde(default)]
     pub blocked_by: Vec<String>,
     #[serde(default)]
@@ -175,16 +188,33 @@ pub struct TaskItem {
     /// row filed without one is visible only in the unfiltered task list.
     #[serde(default)]
     pub venue: Option<String>,
-    /// How long this row may stay open before the graph fails it.
+    /// How long the submitter declares this work will take, in seconds.
     ///
-    /// The default on a task is sized for one dispatched round. A row a worker
-    /// holds across many heartbeats is a different shape, and the over-budget
-    /// rule reads the age of the row rather than the liveness of its holder --
-    /// so without a stated budget such a row is failed while its owner is
-    /// demonstrably alive. That is the submitter's call to make, not something
-    /// to infer from the row's type.
+    /// A declaration, not a deadline: nothing in the platform ends a running row
+    /// by comparing its age to this number. Reclaim reads two things instead --
+    /// whether the holder's lease expired, and whether the attempt stopped
+    /// moving (`cog_core::declared_wall::stall`) -- because a row whose owner is
+    /// demonstrably alive and whose work is demonstrably progressing must not be
+    /// failed for having taken a while. What this field does is size the
+    /// expectations around the row: producers read it back as "how long this
+    /// kind of work should take", and the ledger counts rows that outlived their
+    /// own declaration (`past_its_declaration`), which is a reading and not a
+    /// verdict.
+    ///
+    /// Zero is not "no limit": it declares a duration of nothing, so every
+    /// reader that sizes its patience from the row reads the smallest duration
+    /// there is before the work has started. A submitter that means "no limit"
+    /// has to say a length.
     #[serde(default)]
-    pub timeout_seconds: Option<u64>,
+    pub declared_duration_seconds: Option<u64>,
+    /// The field's old name, kept only so the door can refuse it by name.
+    ///
+    /// A rename that lets the old spelling fall through would be read as an
+    /// unknown field and silently replaced by the default -- a submitter who
+    /// asked for an hour would get the row's five minutes and a 202. Naming it
+    /// here turns that into a 400 that says what to send instead.
+    #[serde(default, rename = "timeout_seconds")]
+    pub renamed_timeout_seconds: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -345,7 +375,7 @@ pub struct TaskView {
     pub retry_not_before: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
-    pub timeout_seconds: u64,
+    pub declared_duration_seconds: u64,
     /// 服务哪个面（面节点的这一列指向自己）。`None` 是不服务任何面，不是默认面。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub face_id: Option<String>,
@@ -360,10 +390,19 @@ pub struct TaskView {
     /// 没有这一列，「做完了」只能靠读结果自己猜。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acceptance: Vec<String>,
+    /// 这一行带着的待办三格（终态／现在／差距），状态按行自己的结局现算：
+    /// **完成且差距已空**才是 `已落`，其余仍 `未落`，差距不动。没带三格的行
+    /// 不出这一格——「这一条没有差距」与「这一行不是待办」在读面上是两件事。
+    ///
+    /// 现算而不回写 `input`：行上只有 `status` 一处写结局，读的时候折进来，
+    /// 重试一次读出来的状态就跟着变，没有第二份要同步的副本。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger_item: Option<cog_core::contract::ledger_item::LedgerItem>,
 }
 
 impl From<Task> for TaskView {
     fn from(t: Task) -> Self {
+        let ledger_item = t.ledger_item();
         Self {
             id: t.id,
             task_type: task_type_str(&t.task_type),
@@ -389,11 +428,12 @@ impl From<Task> for TaskView {
             lease_expires_at: t.lease_expires_at.map(|at| at.to_rfc3339()),
             retry_not_before: t.retry_not_before.map(|at| at.to_rfc3339()),
             started_at: t.started_at.map(|at| at.to_rfc3339()),
-            timeout_seconds: t.timeout_seconds,
+            declared_duration_seconds: t.declared_duration_seconds,
             face_id: t.face_id,
             bound_by_handover_id: t.bound_by_handover_id,
             venue: t.venue,
             acceptance: t.acceptance,
+            ledger_item,
         }
     }
 }
@@ -406,6 +446,11 @@ pub struct TaskQuery {
     pub goal_id: Option<String>,
     /// 只看这个执行者手上的（或声明给它的）任务。
     pub agent_id: Option<String>,
+    /// 只看这几行，逗号分隔的 id。对话里那份任务列表带的就是这一轮挂上去的几个 id：
+    /// 它要的是自己派的那几行，不是整张表——整张表今天九千多行，读过之后只会截掉。
+    /// 不认的 id 静默略过：列表上的行可能已经被清理，一个已经不存在的 id 不该让整次
+    /// 读取被拒。
+    pub ids: Option<String>,
     /// 只看这一类任务：一个状态词，或就绪队列（`ready`，队列本身，不是某行携带的状态）。
     /// 大小写不敏感，取值就是 [`TaskFilter::ALL`] 印出来的那些词。
     pub status: Option<String>,
@@ -442,6 +487,17 @@ fn matches_query(query: &TaskQuery, task: &Task) -> bool {
             .agent_id
             .as_deref()
             .is_none_or(|want| task.agent_id.as_deref() == Some(want))
+        && in_ids(query, task)
+}
+
+/// 一条任务是否在被点名的这一组里。不给 id 就一律留下。
+///
+/// 一次调用读了几个 id，就只读这几个 id 的行——列表要的是它自己派的那几行。
+fn in_ids(query: &TaskQuery, task: &Task) -> bool {
+    match query.ids.as_deref() {
+        None => true,
+        Some(want) => want.split(',').map(str::trim).any(|id| id == task.id),
+    }
 }
 
 /// The state half of the filter, read out of [`TaskFilter`] rather than out of
@@ -494,19 +550,117 @@ fn matches_status(
 async fn ready_ids(
     state: &Arc<GatewayState>,
     filter: Option<TaskFilter>,
-) -> Option<HashSet<String>> {
+) -> Result<Option<HashSet<String>>, ApiError> {
     match filter {
-        Some(TaskFilter::Ready) => Some(
-            state
-                .orchestrator
-                .get_ready_tasks()
-                .await
-                .into_iter()
-                .map(|task| task.id)
-                .collect(),
-        ),
-        _ => None,
+        Some(TaskFilter::Ready) => {
+            let ids = ready_ids_from(state.orchestrator.get_ready_tasks_checked().await)?;
+            Ok(Some(ids))
+        }
+        _ => Ok(None),
     }
+}
+
+/// The ids a ready read carries, with a failed read refusing instead of
+/// answering an empty queue.
+///
+/// The `ready` filter asks for the queue itself, not for a state word, so the
+/// answer is a bare set of ids and the reader has no rows to compare it
+/// against: an empty set is exactly what a quiet deployment looks like. Folding
+/// a store error into it makes a gateway that cannot read the graph report
+/// "nothing waiting" to the tab and the count above it. Absence of the answer
+/// is a 503, the same way every other unreadable read on this surface answers.
+fn ready_ids_from(reading: cog_core::SFResult<Vec<Task>>) -> Result<HashSet<String>, ApiError> {
+    Ok(task_rows_from_reading(reading, "ready queue")?
+        .into_iter()
+        .map(|task| task.id)
+        .collect())
+}
+
+/// The rows a task read carries, with a failed read refusing instead of
+/// answering an empty list.
+///
+/// The task list, the summary above it, the purge preview and the process
+/// overview all count rows; folding a store failure into an empty set makes
+/// each of them report the cleanest possible number about a graph nobody read
+/// -- "0 tasks", "0 ready", "nothing to purge", an empty flow. Absence of the
+/// answer is a 503; an empty row set that was actually read stays a 200 with
+/// zeros.
+/// 一行任务的读：读失败留成 503，读到了才轮到「有没有这一行」。
+pub(crate) fn task_from_reading(
+    reading: cog_core::SFResult<Option<Task>>,
+) -> Result<Option<Task>, ApiError> {
+    reading.map_err(|e| ApiError::service_unavailable(format!("the task could not be read: {e}")))
+}
+
+pub(crate) fn task_rows_from_reading(
+    reading: cog_core::SFResult<Vec<Task>>,
+    what: &str,
+) -> Result<Vec<Task>, ApiError> {
+    reading.map_err(|e| ApiError::service_unavailable(format!("the {what} could not be read: {e}")))
+}
+
+/// The task a write handler is about to change, read under the caller's scope.
+///
+/// The edit handlers used to find their row in the folded graph, so a store
+/// that could not be read made an existing task answer 404 "does not exist" --
+/// a statement about the task that is really a statement about the read, on
+/// paths that then wrote nothing and reported a missing resource. A failed read
+/// is a 503; 404 stays for a row that was looked for among the rows this caller
+/// may see and was not there.
+fn task_to_change_from_reading(
+    reading: cog_core::SFResult<Vec<Task>>,
+    claims: Option<&cog_core::Claims>,
+    id: &str,
+) -> Result<Task, ApiError> {
+    let rows: Vec<Task> = task_rows_from_reading(reading, "task list")?
+        .into_iter()
+        .filter(|t| visible_to_claims(claims, t))
+        .collect();
+    Ok(task_to_change(&rows, id)?.clone())
+}
+
+/// The same lookup once the rows are in hand: a row that is not among rows
+/// this caller may see is a 404, and only a completed read reaches here.
+fn task_to_change<'a>(rows: &'a [Task], id: &str) -> Result<&'a Task, ApiError> {
+    rows.iter()
+        .find(|t| t.id == id)
+        .ok_or_else(|| ApiError::not_found(format!("task '{id}' does not exist")))
+}
+
+/// The graph a read carries, with a failed read refusing instead of answering
+/// an empty graph.
+///
+/// No nodes and no edges draws exactly like a deployment that has not made a
+/// task yet: the view is blank either way, so a store failure folded here is a
+/// graph view that says "nothing exists" about a graph it never read. Absence
+/// of the answer is a 503, the same way every other unreadable read on this
+/// surface answers.
+/// The tasks and the edges between them, as the store hands both over.
+type TaskGraphRows = (Vec<Task>, Vec<(String, String)>);
+
+fn graph_from_reading(
+    reading: cog_core::SFResult<TaskGraphRows>,
+) -> Result<TaskGraphRows, ApiError> {
+    reading.map_err(|e| {
+        ApiError::service_unavailable(format!("the task graph could not be read: {e}"))
+    })
+}
+
+/// The rows a dependents or dependencies read carries, with a failed read
+/// refusing instead of answering an empty list.
+///
+/// On the task detail page a failed read and a task with no related rows draw
+/// the same empty list, so folding the failure in says "this task depends on
+/// nothing" about a graph nobody managed to read. `None` still answers an empty
+/// list: that is a read answer (no such relation), not a failure.
+fn related_tasks_from_reading(
+    reading: cog_core::SFResult<Option<Vec<Task>>>,
+    what: &str,
+) -> Result<Vec<Task>, ApiError> {
+    let rows = reading.map_err(|e| {
+        ApiError::service_unavailable(format!("the task's {what} could not be read: {e}"))
+    })?;
+    Ok(rows.unwrap_or_default())
 }
 
 /// Whether a reader holding `claims` may see `task`.
@@ -734,18 +888,34 @@ fn injected_row_without_acceptance(req: &CreateTaskRequest) -> Option<&str> {
     })
 }
 
-/// The first row in this submission that states a budget of zero seconds.
+/// The first row in this submission that states a duration of zero seconds.
 ///
-/// Zero is not "no limit" -- the over-budget rule compares the age of the row
-/// against this number, so zero reads as "over budget before it started": the
-/// row is accepted, queued, and failed on the first sweep. A submitter that
-/// meant "no limit" has to say a length, and this check is what tells them
-/// their row was read the other way.
-fn row_with_zero_budget(req: &CreateTaskRequest) -> Option<&str> {
+/// Zero is not "no limit". A duration of zero declares that this work is
+/// expected to take no time at all, and every reader of the field -- the
+/// ledger's `past_its_declaration`, the producers sizing a wait against it --
+/// reads it as the smallest duration there is. A submitter that meant "no
+/// limit" has to say a length, and this check is what tells them their row was
+/// read the other way.
+fn row_with_zero_duration(req: &CreateTaskRequest) -> Option<&str> {
     req.tasks
         .as_ref()?
         .iter()
-        .find(|item| item.timeout_seconds == Some(0))
+        .find(|item| item.declared_duration_seconds == Some(0))
+        .map(|item| item.id.as_str())
+}
+
+/// The first row that still spells the declared duration `timeout_seconds`.
+///
+/// The name moved when the meaning did: the row's number is a declaration, and
+/// `timeout` in this tree means the point at which something is killed. A body
+/// that still says `timeout_seconds` parses into nothing, so without this check
+/// the row would be filed on its default while its submitter read a 202 -- the
+/// quiet half of a rename.
+fn row_with_the_old_duration_name(req: &CreateTaskRequest) -> Option<&str> {
+    req.tasks
+        .as_ref()?
+        .iter()
+        .find(|item| item.renamed_timeout_seconds.is_some())
         .map(|item| item.id.as_str())
 }
 
@@ -766,6 +936,15 @@ fn submitted_tasks(
                         parse_task_type(&item.task_type),
                         item.input.clone(),
                     );
+                    if let Some(terminal) = item.terminal.as_deref() {
+                        task.terminal = terminal.to_string();
+                    }
+                    if let Some(now) = item.now.as_deref() {
+                        task.now = now.to_string();
+                    }
+                    if let Some(gap) = item.gap.as_deref() {
+                        task.gap = gap.to_string();
+                    }
                     task.blocked_by = item.blocked_by.clone();
                     task.priority = item.priority;
                     task.workspace_id = Some(req.workspace_id.clone());
@@ -790,8 +969,8 @@ fn submitted_tasks(
                     // being layered under it: a submitter that says "this stays
                     // open for a week" is answering the same question the
                     // default answers.
-                    if let Some(secs) = item.timeout_seconds {
-                        task.timeout_seconds = secs;
+                    if let Some(secs) = item.declared_duration_seconds {
+                        task.declared_duration_seconds = secs;
                     }
                     // Only a submission that says it is a task can carry the
                     // "no planning needed" claim. A goal is decomposed by
@@ -822,11 +1001,23 @@ fn submitted_tasks(
                             task.acceptance = stated_acceptance(&item.input);
                         }
                     }
+                    // 这一行是提交面唯一把一件活写进账的地方：在这里把它交什么
+                    // 落成一份带来源的记录，后面的派发、判尺、输出形状都读那一格。
+                    // 提交人此时已经知道（令牌），再晚就没有这一格了。
+                    //
+                    // 请求体里自带的记录先丢掉：那一格是服务端写的，里面有「谁说的」。
+                    // 收下一个调用方自己填的 `by`，等于让任何人把一句声明记到别人头上。
+                    // 丢掉之后仍按提交内容重新落定，声明本身不受影响。
+                    if let Some(fields) = task.input.as_object_mut() {
+                        fields.remove(cog_core::types::task::INPUT_DELIVERABLE_RECORD);
+                        fields.remove(cog_core::types::task::INPUT_DELIVERABLE_SUPERSEDED);
+                    }
+                    task.settle_deliverable();
                     task
                 })
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     if rows.is_empty() {
         let mut goal_row = Task::goal_row(goal_id, &req.goal);
         goal_row.workspace_id = Some(req.workspace_id.clone());
@@ -852,15 +1043,15 @@ pub async fn create_task_handler(
             && !c.workspace_ids.contains(&req.workspace_id)
         {
             if let Some(ref stream) = state.audit_stream {
-                let _ = stream
-                    .append(
-                        cog_core::AuditKind::Authz,
-                        &c.sub,
-                        &req.workspace_id,
-                        "authz.workspace_denied",
-                        serde_json::json!({ "goal_id": goal_id }),
-                    )
-                    .await;
+                crate::audit::append_or_warn(
+                    stream,
+                    cog_core::AuditKind::Authz,
+                    &c.sub,
+                    &req.workspace_id,
+                    "authz.workspace_denied",
+                    serde_json::json!({ "goal_id": goal_id }),
+                )
+                .await;
             }
             return Err(ApiError::forbidden(format!(
                 "workspace '{}' is outside your workspace scope",
@@ -908,15 +1099,28 @@ pub async fn create_task_handler(
         .with_code("acceptance_required"));
     }
 
-    // A budget of zero is refused here rather than read as "no limit": it is
-    // the number the over-budget sweep compares against, so the row would be
-    // failed before it ever ran -- while the submitter read a 202.
-    if let Some(id) = row_with_zero_budget(&req) {
+    // The field was called `timeout_seconds`, and a submitter who still sends
+    // that spelling must be told so: an unknown key would be dropped and the
+    // row would fall back to its default while the submitter read a 202.
+    if let Some(id) = row_with_the_old_duration_name(&req) {
         return Err(ApiError::bad_request(format!(
-            "task {id} states a budget of 0 seconds, which is over budget before it starts; \
-             say how long the row may stay open"
+            "task {id} carries `timeout_seconds`, which is now `declared_duration_seconds`: \
+             the row's number is the length its submitter declares, not a point at which \
+             anything is killed. Send the same number under the new name."
         ))
-        .with_code("timeout_required"));
+        .with_code("renamed_field"));
+    }
+
+    // A duration of zero is refused here rather than read as "no limit": the
+    // number is what a reader sizes its own patience from, so a zero hands
+    // every reader the smallest duration there is before the work starts --
+    // while the submitter read a 202.
+    if let Some(id) = row_with_zero_duration(&req) {
+        return Err(ApiError::bad_request(format!(
+            "task {id} states a declared duration of 0 seconds, which declares the work takes \
+             no time at all; say how long the row declares it will take"
+        ))
+        .with_code("duration_required"));
     }
 
     // A row that names a face or a unit is checked against the roster here,
@@ -948,18 +1152,18 @@ pub async fn create_task_handler(
         let decision = hierarchy.check(&quota_ctx, estimated).await;
         if !decision.allowed {
             if let Some(ref stream) = state.audit_stream {
-                let _ = stream
-                    .append(
-                        cog_core::AuditKind::QuotaEnforcement,
-                        quota_ctx.user_id.as_deref().unwrap_or("anonymous"),
-                        &goal_id,
-                        "quota.task_rejected",
-                        serde_json::json!({
-                            "estimated_tokens": estimated,
-                            "blocked_by": decision.blocked_by.len(),
-                        }),
-                    )
-                    .await;
+                crate::audit::append_or_warn(
+                    stream,
+                    cog_core::AuditKind::QuotaEnforcement,
+                    quota_ctx.user_id.as_deref().unwrap_or("anonymous"),
+                    &goal_id,
+                    "quota.task_rejected",
+                    serde_json::json!({
+                        "estimated_tokens": estimated,
+                        "blocked_by": decision.blocked_by.len(),
+                    }),
+                )
+                .await;
             }
             return Err(ApiError::too_many_requests(format!(
                 "quota exceeded: estimated {} tokens blocked by {} scope(s)",
@@ -1009,13 +1213,103 @@ pub async fn create_task_handler(
     ))
 }
 
+/// 一次阻塞读最多等多久。
+///
+/// `override`：人定的窗口，与智能体那一侧 `await_task` 的上限取同一个决定——
+/// 超过它的等待方早就不在了（它自己那一轮有停滞超时），连接只是挂在那里。
+/// 门这一侧再钳一次，是因为这个读口不问调用方是谁：一个任意长的 `wait_ms`
+/// 就是一条能被外面拿住的连接。
+// cap: fixed — 人定的（override）：与 await_task 的上限同一个决定，超过它等待方早已不在
+// keep: 删掉后回到「人定的（override）：与 await_task 的上限同一个决定，超过它等待方早已不在」所描述的情形；由这条约定兜住
+pub const MAX_TASK_WAIT_MS: u64 = 600_000;
+
+/// `GET /api/v1/tasks/{id}` 的等待参数。
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct TaskWaitQuery {
+    /// 最多等这条任务走到终局多少毫秒；缺省是「读当下这一眼」。
+    pub wait_ms: Option<u64>,
+}
+
+/// 一条任务是不是走到了终局。
+fn task_reached_an_end(status: Option<cog_core::TaskStatus>) -> bool {
+    matches!(
+        status,
+        Some(cog_core::TaskStatus::Completed)
+            | Some(cog_core::TaskStatus::Failed)
+            | Some(cog_core::TaskStatus::Cancelled)
+    )
+}
+
+/// 等这条任务走到终局，或者到点。
+///
+/// 订阅编排器广播的那一份任务事件，不在读口里反复读库：一次等 = 一次订阅。
+/// 掉队（`Lagged`）时立刻返回让调用方重读一行，而不是在这里一直等到点——
+/// 掉队说明的是读者跟不上，这一行的终局可能就在掉队的那几条里；重读一次状态
+/// 比「等一个已经发生过的终局」便宜。
+async fn wait_for_task_end(state: &GatewayState, id: &str, wait_ms: u64) {
+    // 读失败不是「它到终局了」，也不是「没有这条任务」：这一等就此结束，让下面
+    // 那次带错误的读去回答 503（CC21）；把读不出来当成已到点，调用方会按
+    // 「已经等到」行事，而它其实什么也没等到。
+    let task = match state.orchestrator.get_task_checked(id).await {
+        Ok(Some(task)) => task,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(
+                task_id = id,
+                error = %e,
+                "the task could not be read; the wait ends here and the read answers"
+            );
+            return;
+        }
+    };
+    if task_reached_an_end(Some(task.status)) {
+        return;
+    }
+    let mut events = state.subscribe_task_events();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+    let waited = tokio::time::timeout_at(deadline, async {
+        loop {
+            match events.recv().await {
+                Ok(event) => {
+                    let arrived = match &event {
+                        cog_core::TaskEvent::TaskCompleted { task_id, .. }
+                        | cog_core::TaskEvent::TaskFailed { task_id, .. }
+                        | cog_core::TaskEvent::TaskCancelled { task_id, .. } => task_id,
+                        _ => continue,
+                    };
+                    if arrived == id {
+                        return;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => return,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    })
+    .await;
+    if waited.is_err() {
+        tracing::debug!(
+            task_id = id,
+            wait_ms,
+            "no end arrived for this task within the wait; the caller reads the row as it stands"
+        );
+    }
+}
+
 pub async fn get_task_handler(
     State(state): State<Arc<GatewayState>>,
     claims: Option<axum::Extension<cog_core::Claims>>,
     Path(id): Path<String>,
+    Query(wait): Query<TaskWaitQuery>,
 ) -> Result<Json<TaskView>, ApiError> {
+    if let Some(wait_ms) = wait.wait_ms.filter(|ms| *ms > 0) {
+        wait_for_task_end(&state, &id, wait_ms.min(MAX_TASK_WAIT_MS)).await;
+    }
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
-    match state.orchestrator.get_task(&id).await {
+    // 读失败不能被这一页答成「没有这条任务」：404 是一个对客户端有后果的答案
+    // （它据此判断那一行已经被删），而一次读不出来的库完全可能还压着这一行。
+    let task = task_from_reading(state.orchestrator.get_task_checked(&id).await)?;
+    match task {
         Some(task) if !visible_to_claims(claims, &task) => {
             Err(ApiError::not_found(format!("task '{id}' not found")))
         }
@@ -1035,8 +1329,11 @@ pub async fn list_tasks_handler(
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
     let filter = status_filter(&query)?;
     let page = page_limit(&query)?;
-    let ready = ready_ids(&state, filter).await;
-    let tasks = state.orchestrator.get_all_tasks().await;
+    let ready = ready_ids(&state, filter).await?;
+    let tasks = task_rows_from_reading(
+        state.orchestrator.get_all_tasks_checked().await,
+        "task list",
+    )?;
     let mut rows: Vec<Task> = tasks
         .into_iter()
         .filter(|t| {
@@ -1057,7 +1354,9 @@ pub async fn list_tasks_handler(
 /// 那一屏最多同时看得到三百行，台账读口一页五十行。超了不截、不静默降级——
 /// 一个要一万行的调用方想要的不是一页，是整张表，而那张表今天九千多行、三十
 /// 八兆，收到之后它只会截掉再看，字节一个没少。
-// cap: bound — 一页多大由读者一屏读得完多少定，不由表的行数定；要整张表的人要的是整张表，不是更大的一页
+// cap: fixed — 一页多大由读者一屏读得完多少定，不由表的行数定；要整张表的人要的是整张表，不是更大的一页
+// keep: 删掉后一页跟着表的行数走，而不是跟着一屏读得完多少；由「要整张表的人要的是整张表」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 pub const MAX_TASKS_PER_PAGE: usize = 1000;
 
 /// 调用方要的这一页有几行。`None` 是「不翻页」，与从前逐字相同。
@@ -1095,7 +1394,10 @@ pub async fn get_ready_tasks_handler(
     claims: Option<axum::Extension<cog_core::Claims>>,
 ) -> Result<Json<Vec<TaskView>>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
-    let tasks = state.orchestrator.get_ready_tasks().await;
+    let tasks = task_rows_from_reading(
+        state.orchestrator.get_ready_tasks_checked().await,
+        "ready queue",
+    )?;
     let views: Vec<TaskView> = tasks
         .into_iter()
         .filter(|t| visible_to_claims(claims, t))
@@ -1195,11 +1497,14 @@ pub async fn assign_task_handler(
     Path(id): Path<String>,
     Json(req): Json<AssignTaskRequest>,
 ) -> Result<StatusCode, ApiError> {
-    // Checked before the write: an unreadable task is one the caller may not
-    // assign either, and answering "not found" for both keeps the route from
-    // confirming which ids exist elsewhere.
+    // Checked before the write: a task outside the caller's scope is answered
+    // "not found" so the route does not confirm which ids exist elsewhere.
+    // A store that failed to answer is a different sentence -- it is a 503,
+    // not a claim that this id is absent.
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
-    match state.orchestrator.get_task(&id).await {
+    // 读失败不是「没有这条任务」：404 会让调用方以为这个 id 不存在，而一次读
+    // 不出来的库完全可能压着它（CC21）。读到了才轮到「有没有这一行」。
+    match task_from_reading(state.orchestrator.get_task_checked(&id).await)? {
         Some(task) if visible_to_claims(claims, &task) => {}
         _ => return Err(ApiError::not_found(format!("task '{id}' not found"))),
     }
@@ -1307,16 +1612,16 @@ pub async fn purge_tasks_handler(
         .older_than_secs
         .map(|s| chrono::Utc::now() - chrono::Duration::seconds(s));
 
-    let matched: Vec<Task> = state
-        .orchestrator
-        .get_all_tasks()
-        .await
-        .into_iter()
-        .filter(|t| {
-            visible_to_claims(claims, t)
-                && purge_matches(t, &statuses, req.task_type_prefix.as_deref(), cutoff)
-        })
-        .collect();
+    let matched: Vec<Task> = task_rows_from_reading(
+        state.orchestrator.get_all_tasks_checked().await,
+        "task list",
+    )?
+    .into_iter()
+    .filter(|t| {
+        visible_to_claims(claims, t)
+            && purge_matches(t, &statuses, req.task_type_prefix.as_deref(), cutoff)
+    })
+    .collect();
 
     let mut cancelled: Vec<String> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
@@ -1355,20 +1660,20 @@ pub async fn task_summary_handler(
     claims: Option<axum::Extension<cog_core::Claims>>,
 ) -> Result<Json<TaskSummary>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
-    let all: Vec<Task> = state
-        .orchestrator
-        .get_all_tasks()
-        .await
-        .into_iter()
-        .filter(|t| visible_to_claims(claims, t))
-        .collect();
-    let ready: Vec<Task> = state
-        .orchestrator
-        .get_ready_tasks()
-        .await
-        .into_iter()
-        .filter(|t| visible_to_claims(claims, t))
-        .collect();
+    let all: Vec<Task> = task_rows_from_reading(
+        state.orchestrator.get_all_tasks_checked().await,
+        "task list",
+    )?
+    .into_iter()
+    .filter(|t| visible_to_claims(claims, t))
+    .collect();
+    let ready: Vec<Task> = task_rows_from_reading(
+        state.orchestrator.get_ready_tasks_checked().await,
+        "ready queue",
+    )?
+    .into_iter()
+    .filter(|t| visible_to_claims(claims, t))
+    .collect();
     // Counted over what this reader can see, not the whole graph: a summary
     // whose totals and body disagree sends the reader looking for tasks it is
     // never shown.
@@ -1398,11 +1703,10 @@ pub async fn get_task_dependents_handler(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<TaskView>>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
-    let tasks = state
-        .orchestrator
-        .get_dependents(&id)
-        .await
-        .unwrap_or_default();
+    let tasks = related_tasks_from_reading(
+        state.orchestrator.get_dependents_checked(&id).await,
+        "dependents",
+    )?;
     let views: Vec<TaskView> = tasks
         .into_iter()
         .filter(|t| visible_to_claims(claims, t))
@@ -1417,11 +1721,10 @@ pub async fn get_task_dependencies_handler(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<TaskView>>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
-    let tasks = state
-        .orchestrator
-        .get_dependencies(&id)
-        .await
-        .unwrap_or_default();
+    let tasks = related_tasks_from_reading(
+        state.orchestrator.get_dependencies_checked(&id).await,
+        "dependencies",
+    )?;
     let views: Vec<TaskView> = tasks
         .into_iter()
         .filter(|t| visible_to_claims(claims, t))
@@ -1437,8 +1740,8 @@ pub async fn get_task_graph_handler(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
     let filter = status_filter(&query)?;
-    let ready = ready_ids(&state, filter).await;
-    let (tasks, edges) = state.orchestrator.get_graph().await;
+    let ready = ready_ids(&state, filter).await?;
+    let (tasks, edges) = graph_from_reading(state.orchestrator.get_graph_checked().await)?;
     let kept: Vec<Task> = tasks
         .into_iter()
         .filter(|t| {
@@ -1551,16 +1854,14 @@ pub async fn update_task_handler(
     Json(req): Json<UpdateTaskRequest>,
 ) -> Result<Json<UpdateTaskResponse>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
-    let all = state.orchestrator.get_all_tasks().await;
-    let visible: Vec<Task> = all
-        .into_iter()
-        .filter(|t| visible_to_claims(claims, t))
-        .collect();
-    let mut task = visible
-        .iter()
-        .find(|t| t.id == id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found(format!("task '{id}' does not exist")))?;
+    let visible: Vec<Task> = task_rows_from_reading(
+        state.orchestrator.get_all_tasks_checked().await,
+        "task list",
+    )?
+    .into_iter()
+    .filter(|t| visible_to_claims(claims, t))
+    .collect();
+    let mut task = task_to_change(&visible, &id)?.clone();
     // 改前的样子先留一份：审计问的是「改成了什么」，只有改后的值答不了。
     let before = serde_json::json!({
         "parent_task_id": task.parent_task_id,
@@ -1650,19 +1951,19 @@ pub async fn update_task_handler(
     state.orchestrator.replace_task(task.clone()).await?;
 
     if let Some(ref stream) = state.audit_stream {
-        let _ = stream
-            .append(
-                cog_core::AuditKind::Custom("project_task".into()),
-                claims.map(|c| c.sub.as_str()).unwrap_or("system"),
-                &task.id,
-                "project.task_updated",
-                serde_json::json!({
-                    "parent_task_id": task.parent_task_id,
-                    "title": crate::projects::task_title(&task),
-                    "acceptance": task.acceptance,
-                }),
-            )
-            .await;
+        crate::audit::append_or_warn(
+            stream,
+            cog_core::AuditKind::Custom("project_task".into()),
+            claims.map(|c| c.sub.as_str()).unwrap_or("system"),
+            &task.id,
+            "project.task_updated",
+            serde_json::json!({
+                "parent_task_id": task.parent_task_id,
+                "title": crate::projects::task_title(&task),
+                "acceptance": task.acceptance,
+            }),
+        )
+        .await;
     }
     // 哈希链记顺序与完整性，这张表记「这一张任务改过什么」——两份的读者不同。
     crate::project_audit::record(cog_core::AuditEntry {
@@ -1716,17 +2017,11 @@ pub async fn save_task_plan_handler(
     Json(req): Json<SaveTaskPlanRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
-    let tasks: Vec<Task> = state
-        .orchestrator
-        .get_all_tasks()
-        .await
-        .into_iter()
-        .filter(|t| visible_to_claims(claims, t))
-        .collect();
-    let task = tasks
-        .iter()
-        .find(|t| t.id == id)
-        .ok_or_else(|| ApiError::not_found(format!("task '{id}' does not exist")))?;
+    let task = task_to_change_from_reading(
+        state.orchestrator.get_all_tasks_checked().await,
+        claims,
+        &id,
+    )?;
 
     // 没有验收标准的工作包没有「做完」的判据：给它排一条期，等于给一件谁也
     // 说不清完成没有的活定一个计划价值。
@@ -1803,20 +2098,20 @@ pub async fn save_task_plan_handler(
     state.orchestrator.save_task_plan(&plan).await?;
 
     if let Some(ref stream) = state.audit_stream {
-        let _ = stream
-            .append(
-                cog_core::AuditKind::Custom("project_task".into()),
-                claims.map(|c| c.sub.as_str()).unwrap_or("system"),
-                &id,
-                "project.plan_saved",
-                serde_json::json!({
-                    "planned_start": plan.planned_start,
-                    "planned_end": plan.planned_end,
-                    "budget_tokens": plan.budget_tokens,
-                    "baseline_rev": plan.baseline_rev,
-                }),
-            )
-            .await;
+        crate::audit::append_or_warn(
+            stream,
+            cog_core::AuditKind::Custom("project_task".into()),
+            claims.map(|c| c.sub.as_str()).unwrap_or("system"),
+            &id,
+            "project.plan_saved",
+            serde_json::json!({
+                "planned_start": plan.planned_start,
+                "planned_end": plan.planned_end,
+                "budget_tokens": plan.budget_tokens,
+                "baseline_rev": plan.baseline_rev,
+            }),
+        )
+        .await;
     }
     crate::project_audit::record(cog_core::AuditEntry {
         actor: claims
@@ -1944,17 +2239,14 @@ pub async fn move_task_handler(
         .with_code("unknown_column")
     })?;
 
-    let tasks: Vec<Task> = state
-        .orchestrator
-        .get_all_tasks()
-        .await
-        .into_iter()
-        .filter(|t| visible_to_claims(claims, t))
-        .collect();
-    let task = tasks
-        .iter()
-        .find(|t| t.id == id)
-        .ok_or_else(|| ApiError::not_found(format!("task '{id}' does not exist")))?;
+    let tasks: Vec<Task> = task_rows_from_reading(
+        state.orchestrator.get_all_tasks_checked().await,
+        "task list",
+    )?
+    .into_iter()
+    .filter(|t| visible_to_claims(claims, t))
+    .collect();
+    let task = task_to_change(&tasks, &id)?;
 
     let step = move_step(task.status.as_str(), target.as_str())
         .map_err(|refusal| ApiError::bad_request(refusal.message()).with_code(refusal.code()))?;
@@ -2004,15 +2296,15 @@ pub async fn move_task_handler(
     broadcast_task_status(&state, &id, target, task.agent_id.clone());
 
     if let Some(ref stream) = state.audit_stream {
-        let _ = stream
-            .append(
-                cog_core::AuditKind::Custom("project_task".into()),
-                actor,
-                &id,
-                "project.card_moved",
-                serde_json::json!({ "from": task.status.as_str(), "to": target.as_str() }),
-            )
-            .await;
+        crate::audit::append_or_warn(
+            stream,
+            cog_core::AuditKind::Custom("project_task".into()),
+            actor,
+            &id,
+            "project.card_moved",
+            serde_json::json!({ "from": task.status.as_str(), "to": target.as_str() }),
+        )
+        .await;
     }
     // 「这片卡是哪一天被谁挪走的」——事故复盘问的第一个问题，按资源一秒查出来。
     crate::project_audit::record(cog_core::AuditEntry {
@@ -2086,6 +2378,7 @@ pub async fn batch_complete_handler(
 mod tests {
     use super::*;
     use crate::test_support::claims;
+    use axum::response::IntoResponse;
 
     fn task(id: &str, status: cog_core::TaskStatus, task_type: &str, age_secs: i64) -> Task {
         let mut t = Task::new(
@@ -2110,6 +2403,66 @@ mod tests {
                 "the read surface must print the word the row stores, not a formatting of it"
             );
         }
+    }
+
+    /// 任务行带着的三格随行自己的结局现算：只有「完成且差距已空」读作 `已落`；
+    /// 完成却还写着差距、失败、还在跑，都是 `未落`。没带三格的行不出这一格——
+    /// 「没有差距」与「不是一条待办」在读面上是两件事。
+    #[test]
+    fn the_task_view_reads_the_ledger_state_from_the_rows_own_outcome() {
+        use cog_core::contract::ledger_item::{LedgerItem, LedgerState, ITEM_INPUT_KEY};
+        let item = LedgerItem {
+            id: "a".into(),
+            terminal: "树上是这个样子".into(),
+            now: "现在还不是".into(),
+            gap: "还差那一处".into(),
+            state: LedgerState::Open,
+        };
+        for (status, want) in [
+            (cog_core::TaskStatus::Completed, "未落"),
+            (cog_core::TaskStatus::Failed, "未落"),
+            (cog_core::TaskStatus::Cancelled, "未落"),
+            (cog_core::TaskStatus::Running, "未落"),
+        ] {
+            let mut t = task("a", status, "t", 0);
+            t.input = serde_json::json!({
+                ITEM_INPUT_KEY: serde_json::to_value(&item).expect("待办该序列化得出来"),
+            });
+            let view: TaskView = t.into();
+            let got = view.ledger_item.expect("带三格的行该读得出待办");
+            assert_eq!(
+                got.state.as_str(),
+                want,
+                "{status:?} 在任务读面上读错了状态"
+            );
+            assert_eq!(got.gap, "还差那一处", "一次运行的结局不抹掉世界上的缺口");
+            let wire = serde_json::to_value(&got).expect("读面该序列化得出来");
+            assert!(
+                wire["state"] == "已落" || wire["state"] == "未落",
+                "读面印的不是台账上的词：{wire}"
+            );
+        }
+        // 完成且差距已空：这时才读作已落——差距是被读树的人清掉的，不是被
+        // 一次运行报告成功抹掉的。
+        let mut reached = item.clone();
+        reached.gap = String::new();
+        let mut done = task("c", cog_core::TaskStatus::Completed, "t", 0);
+        done.input = serde_json::json!({
+            ITEM_INPUT_KEY: serde_json::to_value(&reached).expect("待办该序列化得出来"),
+        });
+        let view: TaskView = done.into();
+        assert_eq!(
+            view.ledger_item
+                .expect("带三格的行该读得出待办")
+                .state
+                .as_str(),
+            "已落"
+        );
+        let bare: TaskView = task("b", cog_core::TaskStatus::Completed, "t", 0).into();
+        assert!(
+            bare.ledger_item.is_none(),
+            "没带三格的行不该凭空长出一条待办"
+        );
     }
 
     /// 总线帧里带的是同一个词，而且网关自己的等级过滤器认得它：`failed` 帧要被
@@ -2153,6 +2506,241 @@ mod tests {
                 "the parameter always was case-insensitive"
             );
         }
+    }
+
+    /// 就绪队列读不出来，不是「队列是空的」。
+    ///
+    /// `ready` 是唯一一个没有行可以对照的筛法：它问的就是队列本身，所以空集
+    /// 合正是安静时的答案。读失败被折进去时，一个读不动图的网关会把「没有活
+    /// 等着」印在标签页和它上方的计数上——那是本节最不能给的数。读不出来要
+    /// 拒绝，理由带着原始错误，读得出来时要交回那些 id。
+    /// 一行任务读不出来时，这一编要答 503，而不是「没有这条任务」。
+    ///
+    /// 判据：把 `task_from_reading` 换回 `unwrap_or(None)`，第一条断言会红。
+    #[test]
+    fn a_single_task_that_cannot_be_read_is_not_a_task_that_does_not_exist() {
+        let error = task_from_reading(Err(cog_core::SFError::Database("store unavailable".into())))
+            .expect_err("读失败不许折成「没有这一行」");
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(task_from_reading(Ok(None))
+            .expect("读到了「没有这一行」")
+            .is_none());
+    }
+
+    #[test]
+    fn an_unreadable_ready_queue_is_not_an_empty_queue() {
+        let unreadable: cog_core::SFResult<Vec<Task>> = Err(cog_core::SFError::Database(
+            "connection reset while reading the graph".into(),
+        ));
+        let refusal = ready_ids_from(unreadable).expect_err("读不出来时要交回拒绝，不能交回空集合");
+        assert!(
+            refusal.message.contains("connection reset"),
+            "拒绝的理由要带原始错误，让人看得出是读失败: {}",
+            refusal.message
+        );
+        assert_eq!(
+            refusal.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "图读不出来是「这个部署现在回答不了」，不是一场 200"
+        );
+
+        let quiet = ready_ids_from(Ok(Vec::new())).expect("一条都没有是一份读得出来的答案");
+        assert!(quiet.is_empty(), "空队列原样交回，不编造任何 id");
+
+        let ids = ready_ids_from(Ok(vec![task(
+            "t-ready",
+            cog_core::TaskStatus::Pending,
+            "t",
+            0,
+        )]))
+        .expect("读得出来时要交回队列里的那些 id");
+        assert_eq!(
+            ids,
+            HashSet::from(["t-ready".to_string()]),
+            "交回的必须是队列里的 id 本身"
+        );
+    }
+
+    /// 图画不出来，不是「图上什么都没有」。
+    ///
+    /// 图读接口交回的是一对集合，零节点零边在视图上正是一张干净的空图——
+    /// 与一个刚建好的部署同形。读失败被折进去时，任务图会把「读不动」画成
+    /// 「还没有任务」。读不出来要拒绝，读得出来时节点与边原样交回。
+    #[test]
+    fn an_unreadable_graph_read_is_not_an_empty_task_graph() {
+        let unreadable: cog_core::SFResult<TaskGraphRows> = Err(cog_core::SFError::Database(
+            "connection reset while reading the graph".into(),
+        ));
+        let refusal =
+            graph_from_reading(unreadable).expect_err("读不出来时要交回拒绝，不能画成一张空图");
+        assert!(
+            refusal.message.contains("connection reset"),
+            "拒绝的理由要带原始错误，让人看得出是读失败: {}",
+            refusal.message
+        );
+        assert_eq!(
+            refusal.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "图读不出来是「这个部署现在回答不了」，不是一场 200"
+        );
+
+        let (nodes, edges) =
+            graph_from_reading(Ok((Vec::new(), Vec::new()))).expect("空图是一份读得出来的答案");
+        assert!(
+            nodes.is_empty() && edges.is_empty(),
+            "空图原样交回，不编造任何节点或边"
+        );
+
+        let row = task("t-node", cog_core::TaskStatus::Scheduled, "t", 0);
+        let edge = ("t-upstream".to_string(), "t-node".to_string());
+        let (nodes, edges) =
+            graph_from_reading(Ok((vec![row], vec![edge.clone()]))).expect("读得出来时原样交回");
+        assert_eq!(nodes.len(), 1, "节点是读回来的那一行");
+        assert_eq!(edges, vec![edge], "边是读回来的那一条");
+    }
+
+    /// 关联名单读不出来，不是「这条任务没有关联」。
+    ///
+    /// 详情页把「读不出来」与「没有下游 / 没有依赖」画成同一张空列表。读失败
+    /// 被折进去时，页面会替一条读都没读到的图作证「它谁也不依赖」。读不出来要
+    /// 拒绝，`None` 仍是一份读得到的答案（空列表），`Some` 原样交回。
+    #[test]
+    fn an_unreadable_relation_list_is_not_a_task_with_no_relations() {
+        for what in ["dependents", "dependencies"] {
+            let unreadable: cog_core::SFResult<Option<Vec<Task>>> = Err(
+                cog_core::SFError::Database("connection reset while reading the rows".into()),
+            );
+            let refusal = related_tasks_from_reading(unreadable, what)
+                .expect_err("读不出来时要交回拒绝，不能交回一张空列表");
+            assert!(
+                refusal.message.contains("connection reset"),
+                "拒绝的理由要带原始错误，让人看得出是读失败: {}",
+                refusal.message
+            );
+            assert!(
+                refusal.message.contains(what),
+                "拒绝的理由要点名是哪一份名单读不出来: {}",
+                refusal.message
+            );
+            assert_eq!(
+                refusal.into_response().status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "名单读不出来是「这个部署现在回答不了」，不是一场 200"
+            );
+        }
+
+        let none = related_tasks_from_reading(Ok(None), "dependents")
+            .expect("没有关联是一份读得出来的答案");
+        assert!(none.is_empty(), "空名单原样交回，不编造任何行");
+
+        let rows = related_tasks_from_reading(
+            Ok(Some(vec![task(
+                "t-up",
+                cog_core::TaskStatus::Completed,
+                "t",
+                0,
+            )])),
+            "dependencies",
+        )
+        .expect("读得出来时原样交回");
+        assert_eq!(rows.len(), 1, "交回的是读回来的那一行");
+    }
+
+    /// 任务表读不出来，不是「一条任务都没有」。
+    ///
+    /// 任务列表、它上方那张汇总、以及清理接口的预览都在这同一读上数行：
+    /// 把这些数折成零，一个读不动库的部署会报告「0 条任务」「0 条就绪」「没
+    /// 有什么可清理」——本节里最干净、也最不可质疑的那几个数。读不出来要
+    /// 拒绝，读得出来的空行集仍是 200 的零。
+    #[test]
+    fn an_unreadable_task_list_is_not_an_empty_task_list() {
+        for what in ["task list", "ready queue"] {
+            let unreadable: cog_core::SFResult<Vec<Task>> = Err(cog_core::SFError::Database(
+                "connection reset while reading the tasks".into(),
+            ));
+            let refusal = task_rows_from_reading(unreadable, what)
+                .expect_err("读不出来时要交回拒绝，不能交回一张空表");
+            assert!(
+                refusal.message.contains("connection reset"),
+                "拒绝的理由要带原始错误，让人看得出是读失败: {}",
+                refusal.message
+            );
+            assert!(
+                refusal.message.contains(what),
+                "拒绝的理由要点名是哪一份读数读不出来: {}",
+                refusal.message
+            );
+            assert_eq!(
+                refusal.into_response().status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "任务表读不出来是「这个部署现在回答不了」，不是一场 200"
+            );
+        }
+
+        let rows = task_rows_from_reading(
+            Ok(vec![task("t-one", cog_core::TaskStatus::Pending, "t", 0)]),
+            "task list",
+        )
+        .expect("读得出来时照常交回");
+        assert_eq!(rows.len(), 1, "交回的是读回来的那一行");
+
+        let empty = task_rows_from_reading(Ok(Vec::new()), "task list")
+            .expect("一条都没有是一份读得出来的答案");
+        assert!(empty.is_empty(), "空表原样交回，不编造任何行");
+    }
+
+    /// 读不出来的任务不是「不存在的任务」。
+    ///
+    /// 改任务、存计划、挪列这三条写路径都在同一读上找自己要改的那一行。旧读
+    /// 把库故障折成空表，于是一条真实存在的任务被告知「does not exist」——那是
+    /// 一句关于这条任务的话，而实际发生的是另一件事。读不出来要 503；404 留给
+    /// 「真读到了、而且在可见范围内确实没有这一行」。
+    #[test]
+    fn a_task_that_cannot_be_read_is_not_a_task_that_does_not_exist() {
+        let unreadable: cog_core::SFResult<Vec<Task>> = Err(cog_core::SFError::Database(
+            "connection refused while reading the tasks".into(),
+        ));
+        let refusal = task_to_change_from_reading(unreadable, None, "t-1")
+            .expect_err("读不出来时不能判这条任务不存在");
+        assert!(
+            refusal.message.contains("connection refused"),
+            "拒绝的理由要带原始错误，让人看得出是读失败: {}",
+            refusal.message
+        );
+        let response = refusal.into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "读不出来是「这个部署现在回答不了」，不是 404"
+        );
+
+        // 真读到、但没有这一行：仍是 404——那是读到的答案。
+        let missing = task_to_change_from_reading(Ok(Vec::new()), None, "t-1")
+            .expect_err("读过之后确实没有这一行");
+        assert_eq!(
+            missing.into_response().status(),
+            StatusCode::NOT_FOUND,
+            "见过这一份行、里面没有它，才是 404"
+        );
+
+        // 别人的任务读得到、但不是这个调用方可见的：照旧 404，不泄露存在性。
+        let scoped = claims(&["ws-a"]);
+        let hidden = task_to_change_from_reading(
+            Ok(vec![task("t-1", cog_core::TaskStatus::Pending, "t", 0)]),
+            Some(&scoped),
+            "t-1",
+        )
+        .expect_err("可见范围之外的行与不存在是同一种回答");
+        assert_eq!(hidden.into_response().status(), StatusCode::NOT_FOUND);
+
+        let found = task_to_change_from_reading(
+            Ok(vec![task("t-1", cog_core::TaskStatus::Pending, "t", 0)]),
+            None,
+            "t-1",
+        )
+        .expect("读得出来、读得到、也看得见，就该交回那一行");
+        assert_eq!(found.id, "t-1");
     }
 
     /// 状态词必须与读面印出来的那个词逐字一致：`TaskFilter` 用 `as_str` 印行，
@@ -2356,6 +2944,33 @@ mod tests {
         );
     }
 
+    /// 点名一组 id 就只读这几行，其余一律不出现；不给就与从前逐字相同。
+    ///
+    /// 对话里那份任务列表拿的是这一轮自己派的几个 id——整张表读过来只会再截掉，
+    /// 而网络上一个字节都省不下。
+    #[test]
+    fn an_id_filter_keeps_exactly_the_rows_it_names() {
+        let wanted = task("wanted-1", cog_core::TaskStatus::Running, "t", 0);
+        let also = task("wanted-2", cog_core::TaskStatus::Pending, "t", 0);
+        let other = task("someone-else", cog_core::TaskStatus::Pending, "t", 0);
+
+        let named = TaskQuery {
+            ids: Some("wanted-1, wanted-2".into()),
+            ..Default::default()
+        };
+        assert!(in_ids(&named, &wanted) && in_ids(&named, &also));
+        assert!(
+            !in_ids(&named, &other),
+            "an id that was not named must not appear in the list"
+        );
+        assert!(
+            in_ids(&TaskQuery::default(), &other),
+            "no id filter keeps every task, exactly as before"
+        );
+        // 一个已经不存在的 id 静默略过：列表上的一行可能已经被清理，那不是读取失败。
+        assert!(!in_ids(&named, &other));
+    }
+
     #[test]
     fn a_goal_filter_keeps_only_that_goals_tasks() {
         let mut in_g1 = task("a", cog_core::TaskStatus::Pending, "t", 0);
@@ -2496,6 +3111,9 @@ mod tests {
                 id: "case-1".into(),
                 task_type: "benchmark_case".into(),
                 input: serde_json::json!({ "x": 1 }),
+                terminal: None,
+                now: None,
+                gap: None,
                 blocked_by: vec![],
                 priority: 0,
                 planner: None,
@@ -2503,7 +3121,8 @@ mod tests {
                 face_id: None,
                 unit_id: None,
                 venue: None,
-                timeout_seconds: None,
+                declared_duration_seconds: None,
+                renamed_timeout_seconds: None,
             }]),
             workspace_id: "ws".into(),
             priority: None,
@@ -2513,6 +3132,46 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "case-1");
         assert_eq!(tasks[0].goal_id.as_deref(), Some("goal-9"));
+    }
+
+    /// 门交上来的三格落在任务的一等字段上，不留在 `input` 的开集载荷里。
+    #[test]
+    fn a_rows_cells_land_on_the_task_not_in_input() {
+        let req = CreateTaskRequest {
+            goal_id: None,
+            goal: "g".into(),
+            tasks: Some(vec![crate::tasks::TaskItem {
+                id: "case-2".into(),
+                task_type: "benchmark_case".into(),
+                input: serde_json::json!({ "x": 1 }),
+                terminal: Some("到终态".into()),
+                now: Some("此刻".into()),
+                gap: Some("缺的是：接线".into()),
+                blocked_by: vec![],
+                priority: 0,
+                planner: None,
+                agent_id: None,
+                face_id: None,
+                unit_id: None,
+                venue: None,
+                declared_duration_seconds: None,
+                renamed_timeout_seconds: None,
+            }]),
+            workspace_id: "ws".into(),
+            priority: None,
+            intent_kind: IntentKind::Goal,
+        };
+        let tasks = submitted_tasks(&req, "goal-9", None);
+        assert_eq!(tasks[0].terminal, "到终态");
+        assert_eq!(tasks[0].now, "此刻");
+        assert_eq!(tasks[0].gap, "缺的是：接线");
+        assert!(
+            tasks[0]
+                .input
+                .get(cog_core::contract::ledger_item::ITEM_INPUT_KEY)
+                .is_none(),
+            "三格不该留在 input 里"
+        );
     }
 
     /// 提交人点名的场地要落到行上：工作台按这一列把活分开看，而这个标签没有
@@ -2577,6 +3236,9 @@ mod tests {
             id: id.into(),
             task_type: "benchmark_case".into(),
             input: serde_json::json!({ "x": 1 }),
+            terminal: None,
+            now: None,
+            gap: None,
             blocked_by: vec![],
             priority: 0,
             planner: verified.map(|v| PlannerClaim {
@@ -2587,7 +3249,8 @@ mod tests {
             face_id: None,
             unit_id: None,
             venue: None,
-            timeout_seconds: None,
+            declared_duration_seconds: None,
+            renamed_timeout_seconds: None,
         }
     }
 
@@ -2765,13 +3428,13 @@ mod tests {
         );
     }
 
-    /// 提交者声明的预算要真的落到行上。超预算判据读的是**行的年龄**、不看心跳，
-    /// 所以一条跨很多次心跳的行如果在这里丢掉预算，就会在它主人还活着的时候被判
-    /// 超时——而门口回的是 202。
+    /// 提交者声明的时长要真的落到行上。行上是**声明**，不是刀：回收读的是租约
+    /// 和实测的步间窗口，这个数只喂给台账里「过了自己声明的时长」那条读数。丢掉
+    /// 它不会砍行，但会让那条读数对着一个别人编的值说话。
     #[test]
-    fn a_stated_budget_lands_on_the_row() {
+    fn a_stated_duration_lands_on_the_row() {
         let mut item = task_item("t1", Some(true));
-        item.timeout_seconds = Some(7 * 24 * 60 * 60);
+        item.declared_duration_seconds = Some(7 * 24 * 60 * 60);
         let req = CreateTaskRequest {
             goal_id: None,
             goal: "hold this for a while".into(),
@@ -2782,15 +3445,15 @@ mod tests {
         };
         let tasks = submitted_tasks(&req, "g", None);
         assert_eq!(
-            tasks[0].timeout_seconds,
+            tasks[0].declared_duration_seconds,
             7 * 24 * 60 * 60,
-            "the submitter's budget is the one the sweep will read"
+            "the submitter's declaration is the one the ledger reading will compare"
         );
     }
 
-    /// 没声明预算的行保持原来的默认值：这条口子不许把「没说话」读成「无限期」。
+    /// 没声明时长的行保持原来的默认值：这条口子不许把「没说话」读成「零」。
     #[test]
-    fn a_row_that_states_no_budget_keeps_the_executor_default() {
+    fn a_row_that_states_no_duration_keeps_the_executor_default() {
         let req = CreateTaskRequest {
             goal_id: None,
             goal: "one round".into(),
@@ -2800,15 +3463,15 @@ mod tests {
             intent_kind: IntentKind::Task,
         };
         let tasks = submitted_tasks(&req, "g", None);
-        assert_eq!(tasks[0].timeout_seconds, 300);
+        assert_eq!(tasks[0].declared_duration_seconds, 300);
     }
 
-    /// 0 秒不是「不限时」：判据拿它比行的年龄，所以 0 读作「还没开始就超预算」。
-    /// 这一条要在门口点名，而不是收下以后在第一次扫描里判死。
+    /// 0 秒不是「不限时」：它声明这件活不花时间，台账里那条读数就会在行刚开时
+    /// 说它已经过了自己的声明。这一条要在门口点名，而不是收下以后让读数去说。
     #[test]
-    fn a_zero_budget_is_named_at_the_door() {
+    fn a_zero_duration_is_named_at_the_door() {
         let mut item = task_item("t1", Some(true));
-        item.timeout_seconds = Some(0);
+        item.declared_duration_seconds = Some(0);
         let req = CreateTaskRequest {
             goal_id: None,
             goal: "no limit".into(),
@@ -2817,7 +3480,49 @@ mod tests {
             priority: None,
             intent_kind: IntentKind::Task,
         };
-        assert_eq!(row_with_zero_budget(&req), Some("t1"));
+        assert_eq!(row_with_zero_duration(&req), Some("t1"));
+    }
+
+    /// 旧名必须被门口认出来、回 400 点名新名。serde 默认会把未知键静静丢掉，
+    /// 于是提交者写 `timeout_seconds` 的行会落回默认值，而他读到的是一个 202。
+    #[test]
+    fn the_old_budget_name_is_named_at_the_door_not_dropped() {
+        let body = serde_json::json!({
+            "goal": "do the thing",
+            "workspace_id": "ws",
+            "intent_kind": "task",
+            "tasks": [{
+                "id": "t1",
+                "task_type": "benchmark_case",
+                "input": { "x": 1 },
+                "timeout_seconds": 3600,
+            }],
+        });
+        let req: CreateTaskRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(row_with_the_old_duration_name(&req), Some("t1"));
+        assert!(
+            row_with_zero_duration(&req).is_none(),
+            "旧名不是零值错误：两条拒绝各有各的码"
+        );
+
+        let body = serde_json::json!({
+            "goal": "do the thing",
+            "workspace_id": "ws",
+            "intent_kind": "task",
+            "tasks": [{
+                "id": "t1",
+                "task_type": "benchmark_case",
+                "input": { "x": 1 },
+                "declared_duration_seconds": 3600,
+            }],
+        });
+        let req: CreateTaskRequest = serde_json::from_value(body).unwrap();
+        assert!(row_with_the_old_duration_name(&req).is_none());
+        let tasks = submitted_tasks(&req, "g", None);
+        assert_eq!(
+            tasks[0].declared_duration_seconds, 3600,
+            "新名是收的，而且落下的是提交者说的那个数"
+        );
     }
 
     /// 一条什么都不说的直注行在门口就被点名，而不是被收下以后静静躺在板上。
@@ -2865,6 +3570,54 @@ mod tests {
         assert_eq!(named[0].submitted_by.as_deref(), Some("u-1"));
         let anonymous = submitted_tasks(&req, "goal-1", None);
         assert_eq!(anonymous[0].submitted_by, None);
+    }
+
+    /// 提交面把「这件活交什么」在门口落成一份带来源的记录。
+    ///
+    /// 提交人从令牌来，只有门口这个时刻同时知道声明与提交人；过了这一格再想补，
+    /// 就只能编一个名字或者留空。说了的行记成 `stated`，没说的行记成 `unstated`
+    /// ——「没人说」不在这里被推成一个默认的交付物。
+    #[test]
+    fn a_submitted_row_settles_what_it_delivers_with_its_source() {
+        let mut stated = task_item("stated", None);
+        stated.input = serde_json::json!({
+            cog_core::types::task::INPUT_DELIVERS: "judgement",
+            // 调用方自带一份「谁说的」：门口必须丢掉它，按令牌重新落定。
+            cog_core::types::task::INPUT_DELIVERABLE_RECORD: {
+                "state": "stated",
+                "conclusion": "answer",
+                "by": "someone-else",
+                "via": "delivers",
+            },
+        });
+        let req = CreateTaskRequest {
+            goal_id: None,
+            goal: "judge the change".into(),
+            tasks: Some(vec![stated, task_item("silent", None)]),
+            workspace_id: "ws".into(),
+            priority: None,
+            intent_kind: IntentKind::Task,
+        };
+        let rows = submitted_tasks(&req, "goal-1", Some("u-1"));
+
+        assert_eq!(
+            rows[0].deliverable_declaration(),
+            cog_core::DeliverableDeclaration::Stated {
+                conclusion: cog_core::Deliverable::Judgement,
+                by: Some("u-1".into()),
+                via: cog_core::StatementVia::Delivers,
+            }
+        );
+        assert_eq!(rows[0].deliverable(), cog_core::Deliverable::Judgement);
+
+        assert_eq!(
+            rows[1].deliverable_declaration(),
+            cog_core::DeliverableDeclaration::Unstated
+        );
+        assert!(rows[1]
+            .input
+            .get(cog_core::types::task::INPUT_DELIVERABLE_RECORD)
+            .is_some());
     }
 
     /// 目标提交不受这条约束：它交给分解，验收标准由规划给出，提交时不要求写。
@@ -2954,7 +3707,7 @@ mod tests {
         t.lease_expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(30));
         t.retry_not_before = Some(chrono::Utc::now() + chrono::Duration::seconds(60));
         t.started_at = Some(chrono::Utc::now());
-        t.timeout_seconds = 900;
+        t.declared_duration_seconds = 900;
         t.face_id = Some("face-resources".into());
         t.bound_by_handover_id = Some("handover-7".into());
 
@@ -2968,7 +3721,7 @@ mod tests {
         assert!(view.lease_expires_at.is_some());
         assert!(view.retry_not_before.is_some());
         assert!(view.started_at.is_some());
-        assert_eq!(view.timeout_seconds, 900);
+        assert_eq!(view.declared_duration_seconds, 900);
         assert_eq!(view.face_id.as_deref(), Some("face-resources"));
         assert_eq!(view.bound_by_handover_id.as_deref(), Some("handover-7"));
     }

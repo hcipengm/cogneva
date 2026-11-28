@@ -1,12 +1,12 @@
 //! The one reading that can answer "is this series really not ours".
 //!
-//! Two contracts in this crate — the alert rules and the dashboard — sort every
-//! series they read into a table this workspace produces (each entry naming the
-//! file that publishes it, which is what makes a deleted producer fail) and a
-//! table of foreign series (each entry naming the owner). The two tables are
-//! meant to be exclusive, and only the first one is cross-checked against
-//! anything: the second is an allow-list whose readers accept a name on it
-//! without asking whether a producer exists.
+//! The alert-rule contract sorts every series it reads into a table this
+//! workspace produces (each entry naming the file that publishes it, which is
+//! what makes a deleted producer fail) and a table of foreign series (each entry
+//! naming the owner). The two tables are meant to be exclusive, and only the
+//! first one is cross-checked against anything: the second is an allow-list
+//! whose readers accept a name on it without asking whether a producer
+//! exists.
 //!
 //! So a produced name filed as foreign retires the producer-existence check for
 //! it in silence — the name stops being looked for in its source file, the
@@ -26,12 +26,12 @@
 //! The registry is the recorded names, but the exposition also publishes names
 //! *derived* from them, and those carry no producer of their own to be searched
 //! for. [`a_series_this_build_publishes`] is where that second half is decided,
-//! once, so the two readers cannot answer it differently — which is what they
-//! did: the dashboard derived a histogram's `_bucket`/`_sum`/`_count` from its
-//! base and the rule reader did not, so the same `_bucket` was accepted in a
-//! panel and rejected in a rule. The companion family was in neither, which
-//! leaves a rule naming one — a reading the store really does render — reported
-//! as having no producer.
+//! once. The reason it was centralized is a past disagreement: the dashboard
+//! derived a histogram's `_bucket`/`_sum`/`_count` from its base and the rule
+//! reader did not, so the same `_bucket` was accepted in a panel and rejected
+//! in a rule. The companion family was in neither, which leaves a rule naming
+//! one — a reading the store really does render — reported as having no
+//! producer.
 
 /// Whether a series name is one this build publishes.
 ///
@@ -40,10 +40,10 @@
 /// and the store's `_observed_timestamp_seconds` companion. A derived name is
 /// published only when the base is — the suffix proves nothing on its own, and
 /// accepting one over any base would let a rule name a series no surface
-/// renders, which is the failure both readers exist to catch.
+/// renders, which is the failure the rule check exists to catch.
 ///
 /// This over-accepts a `_sum` or `_count` whose base is a counter rather than a
-/// histogram, since the registry is not typed here. No rule or panel does that.
+/// histogram, since the registry is not typed here. No rule does that.
 /// The same ceiling applies to the base: the answer is "this build can write
 /// it", not "this deployment's store holds it". A registry name no deployment
 /// ever records has a companion no scrape renders, and this reading cannot tell
@@ -58,7 +58,8 @@
 /// pinned to the file that renders it, and never reaches a store — the sandbox
 /// executor's own histogram is the reading that put this question on the table.
 /// Asking the registry about it would be asking the wrong set, and filing the
-/// name in the registry to make a panel pass would claim rows that never exist.
+/// name in the registry to make a scrape-side check pass would claim rows that
+/// never exist.
 ///
 /// The derivation rule is the one above, applied to the other base: a `_bucket`
 /// is licensed exactly when the name it derives from is, and the table has
@@ -153,7 +154,7 @@ mod tests {
         assert!(a_series_this_build_publishes(
             "cogneva_change_funnel_observed_timestamp_seconds"
         ));
-        // The histogram triple, decided here as well as in the panel reader.
+        // The histogram triple, decided here rather than in each caller.
         let recorded = cog_core::metric_names::ALL
             .first()
             .expect("the registry is not empty")

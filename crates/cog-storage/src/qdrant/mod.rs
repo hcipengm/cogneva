@@ -36,6 +36,12 @@ fn point_id_for(caller_id: &str) -> String {
 /// Qdrant-backed [`VectorBackend`].
 /// Talks to a Qdrant cluster over gRPC/HTTP.  Collections are created on
 /// demand via [`VectorBackend::create_collection`].
+// cap: fixed — 由这个部署自己的建集合耗时导出：实测最慢 12.15 秒（另一次 2.40 秒），
+// keep: 删掉后建集合的慢请求被当成挂住，部署最慢 12.15 秒的实测不再被容纳；由「实测最慢 12.15 秒」兜住
+// 取 ×5。忙时与构建争 I/O 会到十几秒；这条界跟着那条分布走，不再贴着实测值的边缘设。
+// wall: wait=one qdrant request; on-timeout=the client gives up and the caller retries; resume=yes, collection create is idempotent
+pub const QDRANT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub struct QdrantVectorBackend {
     client: qdrant_client::Qdrant,
 }
@@ -45,7 +51,13 @@ impl QdrantVectorBackend {
     /// `qdrant_url` is typically `http://localhost:6334`.
     pub async fn try_new(qdrant_url: &str) -> SFResult<Self> {
         let client = qdrant_client::Qdrant::new(
-            qdrant_client::config::QdrantConfig::from_url(qdrant_url).skip_compatibility_check(),
+            qdrant_client::config::QdrantConfig::from_url(qdrant_url)
+                .skip_compatibility_check()
+                // 库的默认请求超时是 5 秒，而**建一个集合在这个部署上实测要 12.15 秒**
+                // （2026-11-21，同一请求两次采样 12.15s / 2.40s，差五倍）。于是每一次
+                // 创建都被客户端自己掐断，重试再掐断，现场看起来像「qdrant 卡死」。
+                // 取实测最大值 × 5：忙时（与构建争 I/O）留得下，闲时不受影响。
+                .timeout(QDRANT_REQUEST_TIMEOUT),
         )
         .map_err(|e| SFError::Validation(format!("qdrant connect failed: {e}")))?;
         Ok(Self { client })

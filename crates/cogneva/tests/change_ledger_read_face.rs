@@ -380,8 +380,6 @@ impl QuotaManager for OpenQuota {
     }
 }
 
-/// The gateway state the router is built over. Everything is absent except the
-/// account under test.
 /// A token ledger that answers one question: what the named task ids spent.
 ///
 /// Every other method panics on purpose. A read route that lands a row or reads
@@ -393,7 +391,7 @@ struct FakeUsage {
 
 #[async_trait::async_trait]
 impl cog_core::LlmUsageLedger for FakeUsage {
-    async fn record(&self, _: &cog_core::LlmUsageRecord) -> Result<(), String> {
+    async fn record(&self, _: &cog_core::LlmUsageRecord) -> Result<String, String> {
         unimplemented!("read-only stand-in")
     }
     async fn record_exchange(&self, _: &cog_core::LlmExchangeRecord) -> Result<(), String> {
@@ -453,6 +451,12 @@ impl cog_core::LlmUsageLedger for FakeUsage {
             .filter(|(id, _)| task_ids.contains(id))
             .cloned()
             .collect())
+    }
+    async fn spend_for_session(
+        &self,
+        _: &str,
+    ) -> Result<Option<cog_core::contract::usage_ledger::SessionSpend>, String> {
+        unimplemented!("read-only stand-in")
     }
     async fn priced_spend_between(
         &self,
@@ -514,6 +518,8 @@ impl cog_core::LlmUsageLedger for FakeUsage {
     }
 }
 
+/// The gateway state the router is built over. Everything is absent except the
+/// account under test.
 fn state(change_ledger: Option<Arc<FakeLedger>>) -> Arc<GatewayState> {
     state_with(change_ledger, None)
 }
@@ -534,6 +540,7 @@ fn state_with(
         Arc::new(cog_storage::MemoryStateBackend::new());
 
     Arc::new(GatewayState {
+        llm_call_events: None,
         data_dir: "/tmp".into(),
         config: std::sync::RwLock::new(GatewayConfig {
             http_port: 0,
@@ -542,15 +549,12 @@ fn state_with(
             cors_origins: vec!["*".into()],
             websocket_timeout_secs: 30,
             websocket_inactivity_timeout_secs: 90,
-            websocket_tick_secs: 5,
             notification_limit: 50,
-            sandbox_task_timeout_secs: 30,
             request_timeout_secs: 30,
             notification_webhook_url: None,
             ..Default::default()
         }),
         request_timeout_secs: std::sync::atomic::AtomicU64::new(30),
-        sandbox_task_timeout_secs: std::sync::atomic::AtomicU64::new(30),
         event_tx: broadcast::channel(16).0,
         evolution_stream: None,
         task_event_tx: broadcast::channel(16).0,
@@ -604,10 +608,15 @@ fn state_with(
         observables: Vec::new(),
         metrics_dimensions: Vec::new(),
         mcp_client: None,
+        mcp_call_counts: None,
         workspace_store: None,
         governance_store: None,
+        security_keys: None,
         principle_ledger: None,
         change_ledger: change_ledger.map(|ledger| ledger as Arc<dyn ChangeLedgerStore>),
+        intent_events: None,
+        employee_events: None,
+        message_events: None,
         key_value: None,
         external_skill_registry: None,
         tool_registry: None,
@@ -627,6 +636,7 @@ fn state_with(
         llm_client: std::sync::Arc::new(std::sync::RwLock::new(None)),
         chat_turns: None,
         conversation: Default::default(),
+        chat_stream: Default::default(),
         agent_messages: None,
         datasets: None,
     })
@@ -715,7 +725,7 @@ async fn the_account_is_readable_with_a_token() {
 async fn a_delivered_row_says_which_revision_said_so_and_that_it_holds_the_line() {
     let mut delivered = row(ChangeState::Pending, "doc-c.md", "crates/cog-gateway/src");
     delivered.delivered_rev = Some("def456".into());
-    let mut undecided = row(ChangeState::Undecided, "doc-d.md", "crates/cog-storage/src");
+    let mut undecided = row(ChangeState::Pending, "doc-d.md", "crates/cog-storage/src");
     undecided.unsettled_reason = Some("scope_absent_in_revision".into());
     let ledger = Arc::new(FakeLedger::new(
         vec![
@@ -751,7 +761,12 @@ async fn a_delivered_row_says_which_revision_said_so_and_that_it_holds_the_line(
     assert_eq!(never["delivered_rev"], serde_json::Value::Null, "{body}");
     assert_eq!(never["holds_the_line"], false, "{body}");
 
-    let stuck = by_state("undecided", false);
+    // A row nothing could measure is still `pending`; the reason is what tells
+    // it apart from one that was measured and found absent.
+    let stuck = rows
+        .iter()
+        .find(|r| r["unsettled_reason"] == "scope_absent_in_revision")
+        .unwrap_or_else(|| panic!("no unmeasurable row: {body}"));
     assert_eq!(
         stuck["unsettled_reason"], "scope_absent_in_revision",
         "{body}"
@@ -1008,7 +1023,7 @@ async fn an_empty_state_is_still_a_cell() {
 
     assert_eq!(status, StatusCode::OK, "{body}");
     let census = body["census"].as_array().expect("census is a list");
-    assert_eq!(census.len(), 6, "every state is a cell: {body}");
+    assert_eq!(census.len(), 2, "every state is a cell: {body}");
     let pending = census
         .iter()
         .find(|cell| cell["state"] == "pending")
@@ -1194,6 +1209,33 @@ async fn the_attempt_to_landing_ladder_is_readable_on_its_own_route() {
     assert!(
         days[1]["cost_currency"].is_null() && days[1]["unpriced_calls"].is_null(),
         "a day the usage table could not be read has no coverage count either: {body}"
+    );
+    // 合计在路由上，不在页面上。页面自己加的那一版把花销除以「带 rev 的落地」，
+    // 分母只有全部落地的零头，同一个花销被放大成十几倍；而两组数各自成立，缺的是
+    // 把它们联系起来的覆盖率。所以路由要同时交出两个分母下的单价，外加覆盖率。
+    let summary = &body["summary"];
+    assert_eq!(
+        summary["landed"], 8,
+        "the summary sums exactly the days the route returned: {body}"
+    );
+    assert_eq!(summary["landed_with_rev"], 5, "{body}");
+    assert_eq!(
+        summary["rev_coverage"], 0.625,
+        "the coverage is what tells the two unit costs apart: {body}"
+    );
+    assert!(
+        summary["cost_micros"].is_null() && summary["llm_calls"].is_null(),
+        "one unread day makes the window's money unknown, not smaller: {body}"
+    );
+    assert_eq!(
+        summary["cost_unstated"], "usage_unread",
+        "the absence carries its cause, so the page does not have to guess which of the \
+         three it is: {body}"
+    );
+    assert!(
+        summary["cost_per_landing_micros"].is_null()
+            && summary["cost_per_shipped_change_micros"].is_null(),
+        "a unit cost over an unknown spend is unknown too: {body}"
     );
 }
 

@@ -8,7 +8,6 @@
 //! compared against today -- never from the static fact that the old
 //! document is still on disk.
 
-pub mod bounds;
 pub mod distiller;
 pub mod indexer;
 pub mod manager;
@@ -18,7 +17,6 @@ pub mod search;
 pub mod unified_knowledge_backend;
 pub mod vector_index;
 
-pub use bounds::WIKI_PAGE_PROMPT_CHARS;
 pub use distiller::{OrchestratorHandoff, WorkItemDistiller, WorkItemHandoff};
 pub use indexer::{WikiIndexEntry, WikiIndexer};
 pub use manager::WikiManager;

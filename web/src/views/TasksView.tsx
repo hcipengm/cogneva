@@ -1,10 +1,20 @@
 import { useMemo, useState } from 'react';
 import {
+  cancelTask,
+  deleteTask,
+  failTask,
   getTaskGraph,
   getTaskSummary,
   listTasks,
+  retryTask,
+  retryFromDlq,
+  startTask,
+  purgeTasks,
+  type PurgeRequest,
+  type PurgeResult,
   type TaskRow,
 } from '@/api/client';
+import { useShell } from '@/shell/store';
 import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
@@ -14,7 +24,8 @@ import {
   useStreamStore,
   type LiveTaskStatus,
 } from '@/store/streamStore';
-import { Empty, Loading, Moment, ReadError, Reading, Readings, Status, Table, ViewFrame } from '@/ui/primitives';
+import { EmployeeAvatar } from '@/components/EmployeeAvatar';
+import { Button, Empty, Loading, Moment, ReadError, Reading, Readings, Status, Table, ViewFrame } from '@/ui/primitives';
 import { Strip } from '@/ui/plots';
 
 import { Note } from '@/ui/Note';
@@ -48,6 +59,7 @@ export function TasksView() {
   const [filter, setFilter] = useState<(typeof FILTERS)[number]>('全部');
   const [mode, setMode] = useState<Mode>('list');
   const [selected, setSelected] = useState<string | null>(null);
+  const [purging, setPurging] = useState(false);
 
   // 过滤词进 `what`：这个 hook 按 `what` 重开读取，而过滤词写在闭包里时它看不见
   // 变化——点了「失败」，屏上还是上一次那批行，标题却已经是新的过滤词，最久要等
@@ -116,6 +128,9 @@ export function TasksView() {
               </button>
             ))}
           </div>
+          <Button onClick={() => setPurging((v) => !v)} tone={purging ? 'accent' : 'plain'}>
+            {purging ? '收起清理' : '清理积压'}
+          </Button>
           <div className="flex gap-1">
             {FILTERS.map((f) => (
               <button
@@ -134,6 +149,15 @@ export function TasksView() {
         </div>
       }
     >
+      {purging && (
+        <PurgePanel
+          onDone={() => {
+            summary.refresh();
+            list.refresh();
+            graph.refresh();
+          }}
+        />
+      )}
       {counts && (
         <Readings
           from={summary}
@@ -200,9 +224,19 @@ export function TasksView() {
               ) },
               { key: 'type', title: '类型', width: '130px', render: (t) => t.task_type },
               { key: 'status', title: '状态', width: '130px', render: (t) => <LiveStatus row={t} live={live} /> },
-              { key: 'owner', title: '谁在做', width: '150px', render: (t) => (
-                <span className="mono text-[11px] text-[var(--muted)]">{t.owner_unit ?? t.agent_id ?? '—'}</span>
-              ) },
+              { key: 'owner', title: '谁在做', width: '170px', render: (t) => {
+                const who = t.owner_unit ?? t.agent_id;
+                if (!who) {
+                  return <span className="text-[11px] text-[var(--muted)]">—</span>;
+                }
+                // 头像是那个人的脸：同一个工号到哪一页都是同一张。
+                return (
+                  <span className="inline-flex items-center gap-1.5">
+                    <EmployeeAvatar employeeId={who} size={18} />
+                    <span className="mono text-[11px] text-[var(--muted)]">{who}</span>
+                  </span>
+                );
+              } },
               // 场地与「谁在做」是两列：同一个员工今天在 memory、明天在 wiki，
               // 场地跟着活走。合成一列就会读成「哪些人在做哪些活」是一回事。
               { key: 'venue', title: '场地', width: '100px', render: (t) => (
@@ -213,6 +247,20 @@ export function TasksView() {
                   {t.blocked_by?.length || '—'}
                 </span>
               ) },
+              // 待办的三格：状态词与差距先在列表里给一眼，终态/现在的全文在悬停
+              // 与详情里。没有三格的行出一道破折号——「这一行不是待办」与「这一条
+              // 没有差距」是两件事，不拿空字符串把两者画成一样。
+              { key: 'ledger', title: '待办', width: '220px', render: (t) =>
+                t.ledger_item ? (
+                  <span
+                    className="mono text-[11px] text-[var(--muted)]"
+                    title={`终态：${t.ledger_item.terminal}\n现在：${t.ledger_item.now}\n差距：${t.ledger_item.gap || '—'}`}
+                  >
+                    {t.ledger_item.state} · {t.ledger_item.gap || '—'}
+                  </span>
+                ) : (
+                  <span className="text-[11px] text-[var(--muted)]">—</span>
+                ) },
               { key: 'error', title: '结局', render: (t) =>
                 t.error ? (
                   <span className="text-[11px] text-[var(--danger)]">
@@ -249,6 +297,11 @@ export function TasksView() {
           live={live}
           onSelect={setSelected}
           onClose={() => setSelected(null)}
+          onChanged={() => {
+            summary.refresh();
+            list.refresh();
+            graph.refresh();
+          }}
         />
       )}
     </ViewFrame>
@@ -378,11 +431,14 @@ function TaskDetail({
   live,
   onSelect,
   onClose,
+  onChanged,
 }: {
   task: TaskRow;
   live: Record<string, LiveTaskStatus>;
   onSelect: (id: string) => void;
   onClose: () => void;
+  /** 一次状态迁移发出之后，让外面那三份读数（表头、列表、图）一起重读。 */
+  onChanged: () => void;
 }) {
   const leaseExpired =
     task.lease_expires_at != null && new Date(task.lease_expires_at).getTime() < Date.now();
@@ -396,6 +452,7 @@ function TaskDetail({
           收起
         </button>
       </div>
+      <TaskActions task={task} onChanged={onChanged} />
       <dl className="grid grid-cols-[110px_1fr] gap-x-3 gap-y-1 px-4 pb-3 text-[11px]">
         <Field label="类型">{task.task_type}</Field>
         <Field label="归属">
@@ -405,6 +462,16 @@ function TaskDetail({
         </Field>
         <Field label="场地">{task.venue ?? '不属于任何场地'}</Field>
         <Field label="服务面">{task.face_id ?? '不服务任何面'}</Field>
+        {task.ledger_item ? (
+          <>
+            <Field label="终态">{task.ledger_item.terminal}</Field>
+            <Field label="现在">{task.ledger_item.now}</Field>
+            <Field label="差距">
+              {task.ledger_item.gap || '—'}
+              {`（${task.ledger_item.state}）`}
+            </Field>
+          </>
+        ) : null}
         <Field label="判据">
           {task.acceptance && task.acceptance.length > 0 ? (
             <ul className="list-disc pl-4">
@@ -454,7 +521,7 @@ function TaskDetail({
           )}
         </Field>
         <Field label="时间">
-          开始 {task.started_at ? fmt(task.started_at) : '未开始'} · 超时 {task.timeout_seconds ?? '—'} 秒
+          开始 {task.started_at ? fmt(task.started_at) : '未开始'} · 预计 {task.declared_duration_seconds ?? '—'} 秒
         </Field>
         <Field label="创建 / 更新">
           <Moment iso={task.created_at} /> · <Moment iso={task.updated_at} />
@@ -469,6 +536,268 @@ function TaskDetail({
         )}
       </dl>
     </section>
+  );
+}
+
+/**
+ * 清理积压：先把「会清掉哪些」念出来，再让人决定。
+ *
+ * 积压是悄悄长出来的——流水线卡住一段时间，队里会攒下成千上万条没人要的意图。
+ * 这个端点的默认就是**只看不动**：预览与执行是两条请求，按两次，中间那一次把
+ * 匹配到的条数与（前一百个）id 摆出来。不预览直接执行，等于让人对一个自己没看
+ * 过的集合点「确定」。
+ *
+ * 它只动积压状态：终态会被服务端拒绝——清理是扫帚，不是改历史的笔。
+ */
+function PurgePanel({ onDone }: { onDone: () => void }) {
+  const appendOutput = useShell((s) => s.appendOutput);
+  const [statuses, setStatuses] = useState('pending,scheduled');
+  const [prefix, setPrefix] = useState('');
+  const [olderThan, setOlderThan] = useState('');
+  const [preview, setPreview] = useState<PurgeResult | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const request = (dryRun: boolean): PurgeRequest => {
+    const req: PurgeRequest = {
+      statuses: statuses
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+      dry_run: dryRun,
+    };
+    if (prefix.trim()) req.task_type_prefix = prefix.trim();
+    if (olderThan.trim()) {
+      const seconds = Number(olderThan);
+      if (Number.isFinite(seconds) && seconds > 0) req.older_than_secs = seconds;
+    }
+    return req;
+  };
+
+  const run = async (dryRun: boolean) => {
+    setBusy(true);
+    try {
+      const result = await purgeTasks(request(dryRun));
+      if (dryRun) {
+        setPreview(result);
+        appendOutput(`清理预览：匹配 ${result.matched} 条（终态不会被选中）`);
+      } else {
+        appendOutput(
+          `清理已执行：取消 ${result.cancelled} 条${
+            result.resisted.length > 0 ? `，${result.resisted.length} 条没被取消` : ''
+          }`
+        );
+        setPreview(null);
+        onDone();
+      }
+    } catch (e) {
+      const err = e as { status?: number; message?: string };
+      appendOutput(`清理${dryRun ? '预览' : '执行'}失败（HTTP ${err.status ?? '?'}）：${err.message ?? '未知原因'}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const field = 'border border-[var(--line)] bg-[var(--ink-900)] px-2 py-1 text-[11px] outline-none focus:border-[var(--brass)]';
+
+  return (
+    <section className="border-b border-[var(--line)] px-4 py-2">
+      <div className="flex flex-wrap items-end gap-3">
+        <label className="flex flex-col gap-1">
+          <span className="text-[10px] text-[var(--muted)]">状态（逗号分隔，只能是积压状态）</span>
+          <input
+            className={`${field} mono`}
+            style={{ color: 'var(--paper)', width: '200px' }}
+            value={statuses}
+            onChange={(e) => {
+              setStatuses(e.target.value);
+              setPreview(null);
+            }}
+          />
+        </label>
+        <label className="flex flex-col gap-1">
+          <span className="text-[10px] text-[var(--muted)]">类型 / id 前缀（可选）</span>
+          <input
+            className={`${field} mono`}
+            style={{ color: 'var(--paper)', width: '200px' }}
+            placeholder="platform_issue_fix"
+            value={prefix}
+            onChange={(e) => {
+              setPrefix(e.target.value);
+              setPreview(null);
+            }}
+          />
+        </label>
+        <label className="flex flex-col gap-1">
+          <span className="text-[10px] text-[var(--muted)]">只清更新早于（秒，可选）</span>
+          <input
+            className={`${field} mono`}
+            style={{ color: 'var(--paper)', width: '140px' }}
+            placeholder="86400"
+            value={olderThan}
+            onChange={(e) => {
+              setOlderThan(e.target.value);
+              setPreview(null);
+            }}
+          />
+        </label>
+        <Button onClick={() => void run(true)} disabled={busy}>
+          {busy ? '读中…' : '预览会清掉哪些'}
+        </Button>
+        <Button
+          tone="accent"
+          disabled={busy || !preview || preview.matched === 0}
+          onClick={() => {
+            if (!preview) return;
+            if (!window.confirm(`真的取消这 ${preview.matched} 条积压任务？被取消的下游会一起取消。`)) return;
+            void run(false);
+          }}
+        >
+          确认清理
+        </Button>
+      </div>
+      {preview && (
+        <div className="mt-2 text-[11px] text-[var(--paper-dim)]">
+          匹配 <span className="mono">{preview.matched}</span> 条
+          {preview.matched_ids.length > 0 && (
+            <>
+              ，前 {preview.matched_ids.length} 个：
+              <span className="mono ml-1 text-[10px] text-[var(--muted)]">
+                {preview.matched_ids.join('    ')}
+              </span>
+            </>
+          )}
+          {preview.matched > preview.matched_ids.length && (
+            <span className="text-[var(--muted)]">（列表截到一百个）</span>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+/**
+ * 一条任务的状态迁移：五个走得通的动作用按钮摆出来，走不通的不画。
+ *
+ * 「走不通」按行上的状态判：开始只在未开始的那些状态上、重试只在失败的上面、
+ * 取消在落定之前的都行。判断写在这里而不是交给服务端，是因为服务端答应的是
+ * 「迁移非法」这句话，而读者在这一刻要的是「我现在能做什么」。
+ *
+ * 这几个端点在管理员权限组里。界面拿不到角色，所以按钮不按权限藏——藏起来
+ * 会让「为什么没有这个按钮」变成一个猜；按下去被 403 挡下时，原文落在输出格。
+ * 接口答 202/204 只表示**迁移已发出**，任务最终落到哪由编排器读回的行决定，
+ * 所以每一次之后外面三份读数一起重读。
+ */
+function TaskActions({ task, onChanged }: { task: TaskRow; onChanged: () => void }) {
+  const appendOutput = useShell((s) => s.appendOutput);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const run = async (
+    label: string,
+    action: () => Promise<unknown>,
+    confirmText?: string,
+    done?: (result: unknown) => string
+  ) => {
+    if (confirmText && !window.confirm(confirmText)) return;
+    setBusy(label);
+    try {
+      const result = await action();
+      appendOutput(done ? done(result) : `${label}：已发出（${task.id}）`);
+      onChanged();
+    } catch (e) {
+      const err = e as { status?: number; message?: string };
+      appendOutput(`${label}失败（${task.id}，HTTP ${err.status ?? '?'}）：${err.message ?? '未知原因'}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const pendingish = task.status === 'pending' || task.status === 'scheduled';
+  const runningish = task.status === 'running';
+  const failed = task.status === 'failed';
+
+  return (
+    <div className="flex flex-wrap items-center gap-2 px-4 pb-2">
+      {pendingish && (
+        <Button
+          tone="accent"
+          disabled={busy !== null}
+          onClick={() => void run('开始任务', () => startTask(task.id))}
+        >
+          开始
+        </Button>
+      )}
+      {(pendingish || runningish) && (
+        <Button
+          disabled={busy !== null}
+          onClick={() =>
+            void run(
+              '取消任务',
+              () => cancelTask(task.id),
+              `取消 ${task.id}？等它的下游任务会被一起取消。`,
+              (result) => {
+                const list = Array.isArray(result) ? result : [];
+                return `已取消 ${list.length} 条（含 ${task.id}）`;
+              }
+            )
+          }
+        >
+          取消
+        </Button>
+      )}
+      {failed && (
+        <>
+          <Button
+            disabled={busy !== null}
+            onClick={() => void run('重试任务', () => retryTask(task.id))}
+          >
+            重试
+          </Button>
+          {/* 普通重试不碰死信队列：一条重试用尽、被判进死信的任务，光重试不会把
+              它从队列里取出来，队列长度一直不减。这一条才是「从死信放回去」。 */}
+          <Button
+            disabled={busy !== null}
+            onClick={() =>
+              void run(
+                '从死信重试',
+                () => retryFromDlq(task.id),
+                `从死信队列取出 ${task.id} 并重试？它不在死信里时，这一下只等于一次普通重试。`,
+                (result) => {
+                  const r = result as { replayed_from_dlq?: boolean };
+                  return r.replayed_from_dlq
+                    ? `已从死信取出并重试 ${task.id}`
+                    : `${task.id} 不在死信队列里，已按普通重试发出`;
+                }
+              )
+            }
+          >
+            从死信重试
+          </Button>
+        </>
+      )}
+      {(pendingish || runningish) && (
+        <Button
+          disabled={busy !== null}
+          onClick={() => {
+            const reason = window.prompt('判失败的理由（记在行上，给下一个人看）', '由控制台判为失败');
+            if (reason === null) return;
+            void run('判为失败', () => failTask(task.id, reason));
+          }}
+        >
+          判为失败
+        </Button>
+      )}
+      <Button
+        disabled={busy !== null}
+        onClick={() =>
+          void run('删除任务', () => deleteTask(task.id), `删除 ${task.id}？这一条不能悔。`, () =>
+            `已删除 ${task.id}`
+          )
+        }
+      >
+        删除
+      </Button>
+      {busy && <span className="text-[10px] text-[var(--muted)]">{busy}中…</span>}
+    </div>
   );
 }
 

@@ -91,9 +91,14 @@ async fn a_task_keeps_only_its_newest_lines_and_a_second_task_keeps_its_own() {
         .expect("count the task's lines")
         .get(0);
     assert_eq!(
-        kept, LOG_LINES_PER_TASK,
-        "a task holds its bound, not one under it and not one over"
+        kept, written,
+        "每一行都还在：窗口决定读到哪儿，不决定删到哪儿"
     );
+    let beyond = gateway
+        .lines_beyond_window(&busy, LOG_LINES_PER_TASK)
+        .await
+        .expect("count the task's lines outside its window");
+    assert_eq!(beyond, 5, "窗口之外的 5 行被数出来了（该搬），不是被删掉了");
 
     let kept_lines = gateway
         .get_task_logs(&busy, LOG_LINES_PER_TASK as usize)
@@ -107,11 +112,11 @@ async fn a_task_keeps_only_its_newest_lines_and_a_second_task_keeps_its_own() {
     assert_eq!(
         kept_lines.last().map(|row| row.message.as_str()),
         Some(newest.as_str()),
-        "the trim took the oldest lines and left the newest one standing"
+        "读窗口停在最新的那一行"
     );
     assert!(
         !kept_lines.iter().any(|row| row.message == "line 0"),
-        "the oldest lines are the ones the trim took"
+        "窗口之外的老行不再被读出来，但它们仍在库里"
     );
 
     let quiet_lines = gateway

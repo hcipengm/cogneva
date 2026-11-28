@@ -107,7 +107,7 @@ fn services() -> Vec<Service> {
                         })
                         .collect::<Vec<_>>()
                 })
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             out.push(Service {
                 namespace: field("namespace"),
                 name: field("name"),

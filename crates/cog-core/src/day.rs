@@ -33,8 +33,79 @@
 //! gateway owns the request path.
 
 /// Seconds in a day.
-// cap: bound — 一日的秒数，定义值，不是这台机器量的
+// cap: fixed — 一日的秒数：日历的定义值，不是这台机器量的
+// not-a-bound: 一日的秒数：日历的定义值，不是这台机器量的
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 pub const SECONDS_PER_DAY: i64 = 86_400;
+
+/// Seconds in a minute.
+///
+/// 一分钟是一分钟的秒数。名字里的「MIN」是 minute，不是 minimum——界形的
+/// 判据按 `_` 分隔的整段比，正是为了不把这个单位当成下界。
+// cap: fixed — 一分钟的秒数：定义值
+// not-a-bound: 一分钟的秒数：定义值
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+pub const SECONDS_PER_MINUTE: i64 = 60;
+
+/// Seconds in an hour.
+///
+/// 一小时是一小时的秒数，不是谁挑的档位：凡是「几小时」的量都乘它，别在调用点
+/// 各写一个 3600。
+// cap: fixed — 一小时的秒数：定义值
+// not-a-bound: 一小时的秒数：定义值
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+pub const SECONDS_PER_HOUR: i64 = 3_600;
+
+/// Seconds in a week.
+///
+/// 同上：七天是一周的秒数。
+// cap: fixed — 一周的秒数：定义值
+// not-a-bound: 一周的秒数：定义值
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+pub const SECONDS_PER_WEEK: i64 = SECONDS_PER_DAY * 7;
+
+/// Hours in a day.
+///
+/// 「回看一天」这类量按小时写（`HOURS_PER_DAY`），免得调用点为了说「一天」
+/// 把小时数再算一遍。
+// cap: fixed — 一日的小时数：定义值
+// not-a-bound: 一日的小时数：定义值
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+pub const HOURS_PER_DAY: i64 = 24;
+
+/// Milliseconds in a second.
+///
+/// 毫秒配置项（认领门槛、退避基数）乘它换算成秒，别在调用点各写一个 1000。
+// cap: fixed — 一秒的毫秒数：定义值
+// not-a-bound: 一秒的毫秒数：定义值
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+pub const MILLIS_PER_SECOND: i64 = 1_000;
+
+/// Days in a week.
+///
+/// 保留期按天写时用它，别在调用点写一个 7。
+// cap: fixed — 一周的天数：定义值
+// not-a-bound: 一周的天数：定义值
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+pub const DAYS_PER_WEEK: i64 = 7;
+
+/// Days in a month as the retention policies count it.
+///
+/// 一个月没有定长（28～31 天）：保留期要的是量级，按 30 天取，别让调用点
+/// 各自挑一个 30 或 31。
+// cap: fixed — 保留期口径的一个月：30 天
+// not-a-bound: 保留期口径的一个月：30 天
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+pub const DAYS_PER_MONTH: i64 = 30;
+
+/// Days in a quarter.
+///
+/// 季度是历法档位而不是精确长度（90 或 91 天）：按 90 天取，保留期只需要它的
+/// 量级，不需要它在哪一年都对得上。
+// cap: fixed — 一个季度的天数：历法档位，按 90 天
+// keep: 删掉后季度档位散在各处，一处按 91 一处按 90；由「历法档位」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+pub const DAYS_PER_QUARTER: i64 = 90;
 
 /// How far east of UTC this process's clock is at `now_unix`, in seconds.
 ///

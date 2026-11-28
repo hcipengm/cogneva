@@ -470,7 +470,7 @@ impl cog_core::SystemPlugin for MemoryPlugin {
                 let shutdown = ctx
                     .consume::<cog_core::ShutdownSignal>()
                     .map(|s| (*s).clone())
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 crate::maintenance::spawn_decay_loop(
                     backend.clone(),
                     metrics.clone(),
@@ -634,7 +634,7 @@ impl cog_core::SystemPlugin for MemoryPlugin {
         if let Some(handle) = stop_handle {
             // Signal the ingestor task to exit; dropping the handle would
             // also stop it, but an explicit signal keeps the intent clear.
-            let _ = handle.send(()).await;
+            cog_core::ignore_lost!(handle.send(()).await);
         }
         info!("MemoryPlugin shutdown");
         Ok(())

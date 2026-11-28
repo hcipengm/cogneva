@@ -72,11 +72,23 @@ impl SelfReviewConfig {
     }
 }
 
+// 两轮：第一轮是写，第二轮是照着第一轮的评审改；第二轮仍不过，说明问题不在
+// 「改一遍」够不够，再改只是在同一处打转。
+// cap: fixed — 两轮：写一轮、按评审改一轮；第三轮还是在同一处打转
+// keep: 删掉后评审轮次没有上限，第三轮仍在同一处打转；由「写一轮、改一轮」兜住
+const SELF_REVIEW_MAX_ITERATIONS: u32 = 2;
+
+// 0.8：评审给分的量纲是「缺了什么」——八成分的产出还留着两成明确的缺口，
+// 而要求满分会让任何一处主观项把循环永远钉在原地。
+// cap: fixed — 0.8：留两成缺口可接受，满分则被主观项钉死
+// keep: 删掉后满分才通过，主观项把每一次评审钉死；由「留两成缺口可接受」兜住
+const SELF_REVIEW_QUALITY_THRESHOLD: f32 = 0.8;
+
 impl Default for SelfReviewConfig {
     fn default() -> Self {
         Self {
-            max_iterations: 2,
-            quality_threshold: 0.8,
+            max_iterations: SELF_REVIEW_MAX_ITERATIONS,
+            quality_threshold: SELF_REVIEW_QUALITY_THRESHOLD,
             revise: true,
             spec: None,
             best_practices: Vec::new(),
@@ -127,7 +139,38 @@ pub struct SelfReviewRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::SelfReviewConfig;
+    use super::{SelfReviewConfig, SELF_REVIEW_MAX_ITERATIONS, SELF_REVIEW_QUALITY_THRESHOLD};
+
+    /// 自审的两个数只有一处声明：默认值读常量，源码面 `impl Default` 的字段里
+    /// 不再有数字（下一笔写回裸字面量就红）。
+    #[test]
+    fn the_self_review_default_reads_its_names() {
+        let cfg = SelfReviewConfig::default();
+        assert_eq!(cfg.max_iterations, SELF_REVIEW_MAX_ITERATIONS);
+        assert_eq!(cfg.quality_threshold, SELF_REVIEW_QUALITY_THRESHOLD);
+
+        let body = include_str!("self_review.rs")
+            .split("impl Default for SelfReviewConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    let value = value.trim().trim_end_matches(',');
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.starts_with(|c: char| c.is_ascii_digit())
+                        && value != "0"
+                })
+            })
+            .map(str::trim)
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
+    }
 
     #[test]
     fn a_declared_specification_fills_a_configuration_that_has_none() {

@@ -16,6 +16,13 @@ pub enum HookTrigger {
     OnRalphPass,
     OnRalphUnrecoverable,
     OnSquadRetry,
+    /// A tool is about to run. This is the one trigger that can decide: a hook
+    /// on it may refuse the call ([`HookAction::Block`]) or replace its
+    /// arguments ([`HookAction::Rewrite`]).
+    OnToolBefore,
+    /// A tool finished. Observational only — the call has already happened, so
+    /// nothing here can change it.
+    OnToolAfter,
 }
 
 /// Runtime hook event — what is dispatched when a trigger fires.
@@ -167,6 +174,33 @@ pub enum HookAction {
     Notify {
         user_id: String,
     },
+    /// Refuse the tool call this hook governs. Enforced before the tool runs,
+    /// so it is only meaningful on [`HookTrigger::OnToolBefore`]; the model
+    /// receives the reason as the tool's result and can route around it.
+    Block {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// Replace the arguments the tool will run with before it runs. Same
+    /// trigger restriction as [`HookAction::Block`]: both decide, and a
+    /// decision can only be taken before the call.
+    Rewrite {
+        /// The arguments that run instead of the model's.
+        arguments: Value,
+    },
+}
+
+impl HookAction {
+    /// Whether this action decides the call rather than reporting it.
+    ///
+    /// A deciding action is not something a publisher can carry out: it has to
+    /// be consulted at the call site and answer before the tool runs. The
+    /// publisher engine therefore skips these, and the tool guard is the only
+    /// thing that runs them — one executor per action, no path where a hook
+    /// silently reports success without having decided anything.
+    pub fn is_guard(&self) -> bool {
+        matches!(self, HookAction::Block { .. } | HookAction::Rewrite { .. })
+    }
 }
 
 /// Static hook definition.
@@ -180,6 +214,12 @@ pub struct HookDef {
     pub crew_id_filter: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub squad_id_filter: Option<String>,
+    /// Which tools this hook governs, as a name or a `*`-wildcard pattern
+    /// (`bash`, `mcp__*`, `*_write`). Absent means every tool — right for an
+    /// observational hook, too broad for one that decides, so a deciding hook
+    /// without a pattern is not consulted for anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
     pub action: HookAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<crate::RateLimitConfig>,
@@ -187,18 +227,14 @@ pub struct HookDef {
     pub timeout_ms: Option<u64>,
 }
 
-/// 没写 `timeout_ms` 的钩子跑多久：30s。
+/// 钩子跑多久：只有它自己声明了 `timeout_ms` 才有界。
 ///
-/// 钩子是任务路径上的同步点，默认值必须短到「卡住的钩子」不会把一次任务拖成
-/// 超时；而一个正常的钩子（写一条记忆、发一次通知）远在秒级内完成。
-// cap: bound — 钩子是任务路径上的同步点，要短到卡住的钩子不把一次任务拖成超时，而正常钩子（写一条记忆、发一次通知）远在秒级内完成
-const DEFAULT_HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
+/// 这里曾经有一条 30 秒的缺省。那个数的理由是「正常钩子远在秒级内完成」——一句
+/// 没有人量过任何一次钩子耗时的自述。按「无界是缺省态、界要自己给出理由」的口径，
+/// 缺省不存在：声明了 `timeout_ms` 的钩子有界，没声明的就跑到完。
 impl HookDef {
-    pub fn timeout(&self) -> std::time::Duration {
-        self.timeout_ms
-            .map(std::time::Duration::from_millis)
-            .unwrap_or(DEFAULT_HOOK_TIMEOUT)
+    pub fn timeout(&self) -> Option<std::time::Duration> {
+        self.timeout_ms.map(std::time::Duration::from_millis)
     }
 }
 

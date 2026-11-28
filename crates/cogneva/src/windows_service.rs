@@ -51,7 +51,7 @@ fn run_service() -> windows_service::Result<()> {
                     }
                     if let Ok(lock) = shutdown_tx_clone.lock() {
                         if let Some(tx) = lock.as_ref() {
-                            let _ = tx.send(());
+                            cog_core::ignore_lost!(tx.send(()));
                         }
                     }
                     ServiceControlHandlerResult::NoError
@@ -76,7 +76,7 @@ fn run_service() -> windows_service::Result<()> {
             wait_hint: std::time::Duration::default(),
             process_id: None,
         };
-        let _ = status_handle.set_service_status(status);
+        cog_core::ignore_lost!(status_handle.set_service_status(status));
     };
 
     set_status(ServiceState::Running);
@@ -94,7 +94,7 @@ fn run_service() -> windows_service::Result<()> {
         *lock = Some(tx);
     }
 
-    let _ = rx.recv();
+    cog_core::ignore_lost!(rx.recv());
 
     set_status(ServiceState::Stopped);
     info!("Windows Service '{}' stopped", SERVICE_NAME);

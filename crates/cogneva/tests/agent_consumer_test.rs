@@ -11,6 +11,8 @@ async fn test_send_message_and_consume() {
     let msg = InboxMessage::Prompt {
         goal: serde_json::json!({"task": "hello"}),
         reply_stream: None,
+        from_agent: None,
+        intent: None,
     };
     AgentConsumer::send_message("agent-1", msg.clone(), backend.as_ref())
         .await
@@ -28,7 +30,7 @@ async fn test_send_message_and_consume() {
 
     let run_fut = consumer.run(handler);
     let timeout = tokio::time::timeout(std::time::Duration::from_millis(100), run_fut);
-    let _ = timeout.await;
+    cog_core::ignore_lost!(timeout.await);
 
     let received = received.lock().unwrap();
     assert_eq!(received.len(), 1);

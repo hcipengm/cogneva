@@ -58,6 +58,7 @@ async fn build_test_state() -> Option<AutonomousTestState> {
             scope: HookScope::Global,
             crew_id_filter: None,
             squad_id_filter: None,
+            tool: None,
             action: HookAction::Log {
                 level: cog_agent::hooks::LogLevel::Info,
             },
@@ -70,6 +71,7 @@ async fn build_test_state() -> Option<AutonomousTestState> {
             scope: HookScope::Global,
             crew_id_filter: None,
             squad_id_filter: None,
+            tool: None,
             action: HookAction::Log {
                 level: cog_agent::hooks::LogLevel::Info,
             },
@@ -82,6 +84,7 @@ async fn build_test_state() -> Option<AutonomousTestState> {
             scope: HookScope::Global,
             crew_id_filter: None,
             squad_id_filter: None,
+            tool: None,
             action: HookAction::Log {
                 level: cog_agent::hooks::LogLevel::Info,
             },
@@ -117,6 +120,7 @@ async fn build_test_state() -> Option<AutonomousTestState> {
     let memory_backend: Arc<dyn cog_core::MemoryBackend> = Arc::new(MemoryMemoryBackend::new());
 
     let gateway_state = Arc::new(GatewayState {
+        llm_call_events: None,
         data_dir: "/tmp".into(),
         config: std::sync::RwLock::new(cog_core::GatewayConfig {
             http_port: 0,
@@ -125,15 +129,12 @@ async fn build_test_state() -> Option<AutonomousTestState> {
             cors_origins: vec!["*".into()],
             websocket_timeout_secs: 30,
             websocket_inactivity_timeout_secs: 90,
-            websocket_tick_secs: 5,
             notification_limit: 50,
-            sandbox_task_timeout_secs: 30,
             request_timeout_secs: 30,
             notification_webhook_url: None,
             ..Default::default()
         }),
         request_timeout_secs: std::sync::atomic::AtomicU64::new(30),
-        sandbox_task_timeout_secs: std::sync::atomic::AtomicU64::new(30),
         event_tx: event_tx.clone(),
         evolution_stream: None,
         task_event_tx: task_event_tx.clone(),
@@ -185,10 +186,15 @@ async fn build_test_state() -> Option<AutonomousTestState> {
         observables: Vec::new(),
         metrics_dimensions: Vec::new(),
         mcp_client: None,
+        mcp_call_counts: None,
         workspace_store: None,
         governance_store: None,
+        security_keys: None,
         principle_ledger: None,
         change_ledger: None,
+        intent_events: None,
+        employee_events: None,
+        message_events: None,
         key_value: None,
         external_skill_registry: None,
         tool_registry: None,
@@ -208,6 +214,7 @@ async fn build_test_state() -> Option<AutonomousTestState> {
         llm_client: std::sync::Arc::new(std::sync::RwLock::new(None)),
         chat_turns: None,
         conversation: Default::default(),
+        chat_stream: Default::default(),
         agent_messages: None,
         datasets: None,
     });
@@ -490,8 +497,8 @@ async fn execute_ready_task(state: &AutonomousTestState, task_id: &str) {
     // Schedule then start the task so start_task succeeds
     {
         let orch = state.gateway_state.orchestrator.clone();
-        let _ = orch.schedule_task(task_id).await;
-        let _ = orch.start_task(task_id).await;
+        cog_core::ignore_lost!(orch.schedule_task(task_id).await);
+        cog_core::ignore_lost!(orch.start_task(task_id).await);
     }
 
     // Hook: OnAgentStart
@@ -505,14 +512,15 @@ async fn execute_ready_task(state: &AutonomousTestState, task_id: &str) {
 
     // Execute Squad directly
     let config = SquadConfig {
+        stated_directions: Vec::new(),
         goal: format!("Execute task: {}", task_id),
         context: task.input.clone(),
         pge_mode: cog_collaboration::select_mode(&derive_task_profile(&task)).mode,
         max_retries: 3,
         profile: None,
-        context_window_size: None,
         boundary_config: None,
         is_self_evolution: false,
+        deliverable: cog_core::DeliverableDeclaration::Unstated,
         planner_skill_id: None,
         generator_skill_id: None,
         evaluator_skill_id: None,
@@ -544,7 +552,7 @@ async fn execute_ready_task(state: &AutonomousTestState, task_id: &str) {
             .error
             .unwrap_or_else(|| "Squad execution failed".into());
 
-        let _ = orch.fail_task(task_id, error.clone(), None).await;
+        cog_core::ignore_lost!(orch.fail_task(task_id, error.clone(), None).await);
 
         // Hook: OnTaskFail
         if let Some(ref engine) = state.gateway_state.hook_engine {
@@ -606,17 +614,18 @@ async fn test_squad_retry_mechanism() {
     };
     let task_id = submit_goal(&state, "task that will trigger retry").await;
 
-    // Execute squad with max_retries=0 so failures are terminal.
+    // Execute squad with policy_upgrades=0 so failures are terminal.
     // Since stub agents always pass, we verify the retry infrastructure is wired.
     let config = SquadConfig {
+        stated_directions: Vec::new(),
         goal: format!("Execute task: {}", task_id),
         context: serde_json::json!({"goal": "task that will trigger retry"}),
         pge_mode: PgeMode::Pipeline,
         max_retries: 0,
         profile: None,
-        context_window_size: None,
         boundary_config: None,
         is_self_evolution: false,
+        deliverable: cog_core::DeliverableDeclaration::Unstated,
         planner_skill_id: None,
         generator_skill_id: None,
         evaluator_skill_id: None,

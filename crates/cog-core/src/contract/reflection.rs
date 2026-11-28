@@ -100,6 +100,10 @@ pub struct GeneratedChange {
     /// issue. Sinks use it to link the PR back (`Fixes #N`) so competing
     /// solutions for the same issue can be grouped.
     pub issue_number: Option<u64>,
+    /// 这件变更属于哪件活：由它产生出来的任务 id（`task:<id>`），或外部入口
+    /// 带来的 issue 编号（`issue:<n>`）。落地率按它把「目标 → 变更 → 落地」串起来。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_of_work: Option<String>,
     /// Which entry point produced this change, carried forward from the task.
     ///
     /// On the change rather than looked up from the task later: the stages that
@@ -718,7 +722,7 @@ impl DiffShape {
                 .added_lines
                 .get(path)
                 .map(|lines| identifier_tokens(&lines.join("\n")))
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             let gone: BTreeSet<String> = identifier_tokens(&removed.join("\n"))
                 .into_iter()
                 .filter(|token| !added.contains(token))
@@ -895,192 +899,6 @@ pub fn diff_added_lines(content: &str) -> BTreeMap<String, BTreeSet<u64>> {
     added
 }
 
-/// A line this change writes whose only effect is a default no deployment
-/// reads.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnreachableDefault {
-    pub file: String,
-    pub line: u64,
-    /// The field the line assigns, as the document would spell it.
-    pub key: String,
-}
-
-/// The written lines whose value nothing can reach, empty when the change has
-/// an effect anywhere.
-///
-/// The criterion is deliberately all-or-nothing, and every input it cannot
-/// read answers "no". A change that also writes a line outside a
-/// `Default`-impl block is not a no-op, and neither is one whose written line
-/// is not a literal — a call, a constructor, a path. The documents are what
-/// make the default unreachable: the loader deserializes a document into the
-/// type and only falls back to the type's `Default` for a key the document
-/// leaves out, so the criterion needs the key written by **every** document
-/// and not merely by one. A section a document does not carry at all is a
-/// document that does not write the key, so the refusal is not reached.
-///
-/// `written` is the line numbers the change adds, in the applied file;
-/// `sources` is those files as the applied tree holds them, keyed the same way.
-/// A file `sources` has nothing for, and an empty document list, both answer
-/// "no" rather than convicting on a partial reading.
-pub fn unreachable_defaults(
-    written: &BTreeMap<String, BTreeSet<u64>>,
-    sources: &BTreeMap<String, String>,
-    documents: &[serde_json::Value],
-) -> Vec<UnreachableDefault> {
-    if written.is_empty() || documents.is_empty() {
-        return Vec::new();
-    }
-    let mut found = Vec::new();
-    for (file, lines) in written {
-        let Some(source) = sources.get(file) else {
-            return Vec::new();
-        };
-        let blocks = default_impl_blocks(source);
-        let text: Vec<&str> = source.lines().collect();
-        for &line in lines {
-            let Some(block) = blocks.iter().find(|b| b.start <= line && line <= b.end) else {
-                return Vec::new();
-            };
-            let Some(key) = text
-                .get(line as usize - 1)
-                .and_then(|text| literal_field_assignment(text))
-            else {
-                return Vec::new();
-            };
-            if !documents
-                .iter()
-                .all(|doc| section_writes(doc, &block.section, &key))
-            {
-                return Vec::new();
-            }
-            found.push(UnreachableDefault {
-                file: file.clone(),
-                line,
-                key,
-            });
-        }
-    }
-    found
-}
-
-/// One `impl Default for <Name>Config` block: the lines it spans, and the
-/// top-level section the document spells that struct as.
-struct DefaultImpl {
-    start: u64,
-    end: u64,
-    section: String,
-}
-
-/// The `Default`-impl blocks a file carries, by line range.
-///
-/// Braces are counted without regard for string literals or comments: a brace
-/// inside either would move an end. That can only cut a block short, and a line
-/// falling outside every block answers "no" above — the reading that costs a
-/// round is the one that fires on a change it cannot place, not the one that
-/// stays quiet.
-fn default_impl_blocks(source: &str) -> Vec<DefaultImpl> {
-    let mut blocks = Vec::new();
-    let lines: Vec<&str> = source.lines().collect();
-    for (index, line) in lines.iter().enumerate() {
-        let Some(rest) = line.trim_start().strip_prefix("impl Default for ") else {
-            continue;
-        };
-        let name: String = rest
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
-        let Some(section) = name.strip_suffix("Config").map(snake_case) else {
-            continue;
-        };
-        if section.is_empty() {
-            continue;
-        }
-        let mut depth: i64 = 0;
-        let mut opened = false;
-        let mut end = None;
-        for (offset, body) in lines[index..].iter().enumerate() {
-            for c in body.chars() {
-                match c {
-                    '{' => {
-                        depth += 1;
-                        opened = true;
-                    }
-                    '}' => depth -= 1,
-                    _ => {}
-                }
-            }
-            if opened && depth <= 0 {
-                end = Some(index as u64 + offset as u64 + 1);
-                break;
-            }
-        }
-        if let Some(end) = end {
-            blocks.push(DefaultImpl {
-                start: index as u64 + 1,
-                end,
-                section,
-            });
-        }
-    }
-    blocks
-}
-
-/// The field a line assigns, when the line assigns a literal and nothing else.
-fn literal_field_assignment(line: &str) -> Option<String> {
-    let line = line.trim();
-    if line.is_empty() || line.starts_with("//") {
-        return None;
-    }
-    let (key, value) = line.split_once(':')?;
-    let key = key.trim();
-    if key.is_empty() || !key.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        return None;
-    }
-    let value = value.trim().trim_end_matches(',').trim();
-    // `500_000` is a Rust literal and not a number `f64::from_str` takes, so the
-    // separators come out before the value is asked whether it is one.
-    let literal = value.replace('_', "").parse::<f64>().is_ok()
-        || matches!(value, "true" | "false" | "None")
-        || (value.len() >= 2 && value.starts_with('"') && value.ends_with('"'));
-    literal.then(|| key.to_string())
-}
-
-/// Whether this document writes the key anywhere inside the section.
-///
-/// Inside rather than at the top of it: a section's reader may take a value out
-/// by pointer, and the key's own path is what the reader reads either way.
-fn section_writes(document: &serde_json::Value, section: &str, key: &str) -> bool {
-    document
-        .get(section)
-        .is_some_and(|section| subtree_has_key(section, key))
-}
-
-fn subtree_has_key(value: &serde_json::Value, key: &str) -> bool {
-    match value {
-        serde_json::Value::Object(map) => map
-            .iter()
-            .any(|(name, child)| name == key || subtree_has_key(child, key)),
-        _ => false,
-    }
-}
-
-/// `SelfEvolution` → `self_evolution`: the rule the document's section names
-/// follow the struct names by.
-fn snake_case(name: &str) -> String {
-    let mut out = String::new();
-    for (index, c) in name.chars().enumerate() {
-        if c.is_uppercase() {
-            if index > 0 {
-                out.push('_');
-            }
-            out.extend(c.to_lowercase());
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
 /// A diagnostic the change itself is answerable for: its span sits on a line
 /// this diff writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1145,7 +963,7 @@ pub fn introduced_lints(
         let level = message
             .get("level")
             .and_then(|l| l.as_str())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         // Both levels: a run that promotes warnings reports a lint as an error,
         // and one that does not still reports the same lint.
         if level != "error" && level != "warning" {
@@ -1245,7 +1063,7 @@ pub fn lint_findings(transcript: &str) -> BTreeMap<LintFinding, usize> {
         let level = message
             .get("level")
             .and_then(|l| l.as_str())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         if level != "error" && level != "warning" {
             continue;
         }
@@ -1466,12 +1284,14 @@ pub fn path_protected_dir_segment<'a>(
 
 /// Longest an extension may be before a trailing `.foo` reads as a sentence
 /// fragment rather than a file type.
-// cap: bound — 再长，末尾那个 .foo 读起来像句子碎片而不是文件类型
+// cap: fixed — 再长，末尾那个 .foo 读起来像句子碎片而不是文件类型
+// keep: 删掉后路径末尾可以是任意长的串，读起来像句子碎片；由「.foo 的形状」兜住
 const GOAL_PATH_EXT_MAX: usize = 6;
 
 /// Shortest extension worth reading as a file type. One letter is the shape of
 /// an abbreviation (`e.g`, `i.e`), not of an extension anybody ships.
-// cap: bound — 一个字母是缩写（e.g、i.e）的形状，不是任何人会发布的扩展名的形状
+// cap: fixed — 一个字母是缩写（e.g、i.e）的形状，不是任何人会发布的扩展名的形状
+// keep: 删掉后一个字母的扩展名也当文件类型，e.g 与 i.e 被读成后缀；由「一个字母是缩写的形状」兜住
 const GOAL_PATH_EXT_MIN: usize = 2;
 
 /// Characters that separate one candidate token from the next. A goal is prose,
@@ -2675,7 +2495,8 @@ fn test_binary_of(line: &str) -> Option<String> {
 fn without_metadata_hash(stem: &str) -> String {
     /// How many hex digits cargo appends to a binary name's stem: sixteen, the
     /// truncated metadata hash.
-    // cap: bound — 取的是 cargo 给二进制名后面加的那段十六进制长度：截断的 metadata 哈希
+    // cap: fixed — 取的是 cargo 给二进制名后面加的那段十六进制长度：截断的 metadata 哈希
+    // keep: 删掉后按另一种长度截 metadata 哈希，二进制名对不上 cargo 给的形状；由「cargo 那段十六进制长度」兜住
     const HASH_LEN: usize = 16;
     match stem.rsplit_once('-') {
         Some((name, hash))
@@ -2807,7 +2628,8 @@ fn failure_blocks(output: &str) -> String {
 /// How many panic sites a digest names. A run can panic in every test it has;
 /// the first few name the places to look, and the rest is repetition that would
 /// spend the budget the failing-test list needs.
-// cap: bound — 前几行点出该去看哪里，剩下的重复会花掉失败测试清单要用的预算
+// cap: fixed — 前几行点出该去看哪里，剩下的重复会花掉失败测试清单要用的预算
+// keep: 删掉后 panic 的重复行花掉失败测试清单的预算，该看的地方被挤掉；由「前几行点出该去看哪里」兜住
 const PANIC_LINES: usize = 8;
 
 /// At most `budget` characters from the front.
@@ -2819,6 +2641,147 @@ fn take_head(text: &str, budget: usize) -> String {
 fn take_tail(text: &str, budget: usize) -> String {
     let total = text.chars().count();
     text.chars().skip(total.saturating_sub(budget)).collect()
+}
+
+/// 待落地队列里的一条候选变更。
+///
+/// 这一行是**投影**：正本是事件流里的 `change_candidate` 与随后的
+/// `change_accepted` / `change_rejected`。为什么不是一份自己写的记录文件：文件在不在
+/// 被当成了「变更在不在」，于是一次重启把「已经判过的」和「刚生成的」读成同一种东西，
+/// 一条永远不可能应用的变更每轮都被重试，而记录只有那一个写者、没有重放、也没人核过它
+/// 与真相是否一致。事件流给它三样文件给不了的东西：身份（同一候选只能被接受一次）、
+/// 因果（谁触发了它）、重放（投影坏了可以从头算）。
+///
+/// `content` 是 diff 正文。它进事件还是进内容寻址存储由读数决定；这一层只约定
+/// 「读回来的是同一串字节」。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeCandidate {
+    /// 候选身份：投影按它去重，接受/拒绝事件按它指向候选。
+    pub artifact_id: String,
+    /// 产物种类（`code_change` / `skill_refinement` …）。词表由产生它的那面定，
+    /// 这一层只存词。
+    pub kind: String,
+    pub description: String,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+    /// 产生这一面的那一侧自己的状态词（`compile_checked` / `awaiting_review` …）。
+    ///
+    /// 与 [`Self::status`] 是两个轴：那个是队列里的位置（候选 / 接受 / 拒绝），
+    /// 这个是变更自己走到了哪一步。词表由产生它的那面定，这一层只存词。
+    #[serde(default)]
+    pub recorded_status: String,
+    /// 评估门结论。散文只给人看，判定读 `verdict`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval_summary: Option<crate::EvalReport>,
+    /// 路由档位，JSON：档位类型住在产生它的 crate，这一层不解释它。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiering: Option<String>,
+    /// 这一行此刻的状态：`candidate` / `accepted` / `rejected`。
+    ///
+    /// 它**不是**一个可写字段：写入路径永远只追加事件，状态是「哪条事件最后发生」
+    /// 读出来的结果。改它等于改历史。
+    pub status: String,
+    /// 定案那一条的结局说明（拒绝原因 / 接受附注）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_reason: Option<String>,
+    /// 哪一件活要的这条变更：发起它的那条任务的 id（信封上的 `unit_of_work`）。
+    ///
+    /// `scope` 是「这一面在哪」，不是「谁要的」——它由进程写死，同一次运行里所有
+    /// 候选都一样。没有这一格，落地率只能给分段总数，答不出「这个目标对应哪些
+    /// 变更、落地没有」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_of_work: Option<String>,
+    /// 这一行由哪条事件算出：投影水位。
+    pub event_id: String,
+}
+
+impl ChangeCandidate {
+    /// 还在队列里（没有接受也没有拒绝）。
+    pub fn is_pending(&self) -> bool {
+        self.status == "candidate"
+    }
+}
+
+/// 一条候选写进载荷的字段。
+///
+/// 目录在 `event_payload` 的 `PAYLOAD_CATALOG`，由测试对账：这里多一个键或少一个键
+/// 都会红——载荷存 text，没有类型能替人记住它有什么。写者与读者都从这里取，不再各
+/// 拼一份键名。
+pub fn candidate_attributes(candidate: &ChangeCandidate) -> serde_json::Value {
+    serde_json::json!({
+        "kind": candidate.kind,
+        "status": candidate.recorded_status,
+        "description": candidate.description,
+        "content": candidate.content,
+        "created_at": candidate.created_at.to_rfc3339(),
+        "eval_summary": candidate.eval_summary,
+        "tiering": candidate
+            .tiering
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok()),
+        // 发起这条变更的那件活。读的人按它把「一个目标 → 哪些变更 → 落地没有」
+        // 串起来；没有它就是 null，而不是一个空串凑出来的身份。
+        "unit_of_work": candidate.unit_of_work,
+    })
+}
+
+/// 候选的定案。接受与拒绝都是**又一条事件**，不是改一个字段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateOutcome {
+    Accepted,
+    Rejected,
+}
+
+impl CandidateOutcome {
+    /// 落库时用的 `kind` 词。
+    pub fn kind(self) -> &'static str {
+        match self {
+            CandidateOutcome::Accepted => "change_accepted",
+            CandidateOutcome::Rejected => "change_rejected",
+        }
+    }
+}
+
+/// 待落地队列的读写口。
+///
+/// 三个问题，三种回答：**这条候选记下来了吗**（`record`）、**它此刻在队列里吗**
+/// （`pending` / `read`）、**它被定案了吗**（`decide`）。没有任何一个方法是「改状态」：
+/// 定案是追加一条事件，投影因此可以随时从流里重算。
+///
+/// 实现住在一个带库的 crate 里（`cog-storage`）；`cog-reflection` 只认这个 trait，
+/// 因而产生变更的代码不知道它落在 PG 还是别处。
+#[async_trait::async_trait]
+pub trait ChangeCandidateStore: Send + Sync + std::fmt::Debug {
+    /// 记下一条候选。同一个 `artifact_id` 记两次只留一条（写者给幂等键）。
+    async fn record(&self, candidate: &ChangeCandidate) -> crate::SFResult<()>;
+
+    /// 记下候选自己走到了哪一步（验证通过、等待复核……）。
+    ///
+    /// 它不是「改一个字段」：写者追加一条带状态的 `change_measured` 事件，投影取
+    /// 最新那条的读法。同一个 `(候选, 状态词)` 记两次只留一条——重试不会让状态
+    /// 在时间线上来回摆动。
+    async fn transition(&self, artifact_id: &str, status: &str, note: &str) -> crate::SFResult<()>;
+
+    /// 给候选定案：追加 `change_accepted` / `change_rejected`，带原因。
+    ///
+    /// 同一条候选被定案两次是调用方的错，不是写者的错——写者用候选身份当幂等键，
+    /// 第二次写成同一条事件的重复，投影仍只有一行。
+    async fn decide(
+        &self,
+        artifact_id: &str,
+        outcome: CandidateOutcome,
+        reason: &str,
+    ) -> crate::SFResult<()>;
+
+    /// 还在队列里的候选，最新的在前。
+    async fn pending(&self) -> crate::SFResult<Vec<ChangeCandidate>>;
+
+    /// 队列里与已定案的全部候选，最新的在前。
+    async fn all(&self) -> crate::SFResult<Vec<ChangeCandidate>>;
+
+    /// 按身份读一条；读不到与读出错分开。
+    async fn read(&self, artifact_id: &str) -> crate::SFResult<Option<ChangeCandidate>>;
 }
 
 #[cfg(test)]
@@ -2865,99 +2828,6 @@ mod tests {
         for (index, cause) in RejectionCause::ALL.iter().enumerate() {
             assert_eq!(cause.slot(), index, "{cause:?} does not sit at {index}");
         }
-    }
-
-    /// The refusal only fires on a change that can have no effect anywhere, and
-    /// each half of that sentence is a thing the reading has to establish.
-    #[test]
-    fn only_a_default_no_document_leaves_open_is_unreachable() {
-        let source = "\
-impl MetricsConfig {
-    fn budget(&self) -> u64 { self.sample_max_rows }
-}
-
-impl Default for MetricsConfig {
-    fn default() -> Self {
-        Self {
-            sample_max_rows: 500_000,
-            log_at_floor: false,
-        }
-    }
-}
-";
-        let sources =
-            BTreeMap::from([("crates/cog-core/src/config.rs".to_string(), source.into())]);
-        let written = BTreeMap::from([(
-            "crates/cog-core/src/config.rs".to_string(),
-            BTreeSet::from([8]),
-        )]);
-        let both = vec![
-            serde_json::json!({ "metrics": { "sample_max_rows": 200000 } }),
-            serde_json::json!({ "metrics": { "sample_max_rows": 200000, "log_at_floor": false } }),
-        ];
-
-        let found = unreachable_defaults(&written, &sources, &both);
-        assert_eq!(found.len(), 1, "这一笔的全部效果就是这个读不到的默认值");
-        assert_eq!(found[0].key, "sample_max_rows");
-        assert_eq!(found[0].line, 8);
-
-        // 少一份文档写这个键 ⇒ 那份部署的进程读的就是这个默认值，它有读者。
-        let one_writes_it = vec![
-            serde_json::json!({ "metrics": { "sample_max_rows": 200000 } }),
-            serde_json::json!({ "metrics": { "log_at_floor": false } }),
-        ];
-        assert!(
-            unreachable_defaults(&written, &sources, &one_writes_it).is_empty(),
-            "只有全部文档都写着这个键，默认值才不可达"
-        );
-
-        // 键在别的段里不算：读它的是那一段的类型，不是这个默认值。
-        let elsewhere = vec![
-            serde_json::json!({ "metrics": { "log_at_floor": false }, "memory": { "sample_max_rows": 1 } }),
-            serde_json::json!({ "metrics": { "log_at_floor": false }, "memory": { "sample_max_rows": 1 } }),
-        ];
-        assert!(unreachable_defaults(&written, &sources, &elsewhere).is_empty());
-
-        // 文档一份都读不到时不是「查过，没有」。
-        assert!(unreachable_defaults(&written, &sources, &[]).is_empty());
-
-        // 改到 impl 之外的行（第 2 行是那行函数体）⇒ 这笔变更有别的效果。
-        let outside = BTreeMap::from([(
-            "crates/cog-core/src/config.rs".to_string(),
-            BTreeSet::from([2]),
-        )]);
-        assert!(unreachable_defaults(&outside, &sources, &both).is_empty());
-
-        // 写的不是字面量（调用、构造、路径）就不是这一类。
-        let call = "\
-impl Default for MetricsConfig {
-    fn default() -> Self {
-        Self {
-            budget: default_budget(),
-        }
-    }
-}
-";
-        let call_sources =
-            BTreeMap::from([("crates/cog-core/src/config.rs".to_string(), call.into())]);
-        let call_written = BTreeMap::from([(
-            "crates/cog-core/src/config.rs".to_string(),
-            BTreeSet::from([4]),
-        )]);
-        let call_docs = vec![serde_json::json!({ "metrics": { "budget": 1 } })];
-        assert!(unreachable_defaults(&call_written, &call_sources, &call_docs).is_empty());
-
-        // 读不到被写的那份文件 ⇒ 判不了，不出口。
-        let unreadable = BTreeMap::from([("nope.rs".to_string(), BTreeSet::from([1]))]);
-        assert!(unreachable_defaults(&unreadable, &sources, &both).is_empty());
-    }
-
-    /// 那笔实测的 no-op 就是这一形：结构名到段名的对应要按文档的写法来。
-    #[test]
-    fn a_section_name_is_the_struct_name_without_its_config_suffix() {
-        assert_eq!(snake_case("SelfEvolution"), "self_evolution");
-        assert_eq!(snake_case("Metrics"), "metrics");
-        assert_eq!(snake_case("DagExecutor"), "dag_executor");
     }
 
     #[test]
@@ -4205,7 +4075,7 @@ test a::b ... FAILED\n\
         // The reference document is configuration the deployment ships, so it
         // has to read as configuration. A rule that went by how a file looks —
         // "an example, so documentation" — would put it in the prose row.
-        assert!(is_config_path("cogneva.example.json"));
+        assert!(is_config_path("cogneva.json"));
     }
 
     #[test]

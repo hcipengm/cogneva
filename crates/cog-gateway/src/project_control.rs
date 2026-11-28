@@ -27,7 +27,8 @@ pub const PROJECT_CONTROL_LOOP: &str = "gateway_project_control";
 ///
 /// 覆盖率不是在窗口上发生的事件，是一个会被冻住的读数：一轮只决定它多快跟上图的
 /// 变化。十分钟量一次，图上多了一千行也还看得见它是旧的（这一格带着量成时刻）。
-// cap: bound — 只决定读数多快跟上图的变化，不决定任何动作
+// cap: fixed — 只决定读数多快跟上图的变化，不决定任何动作
+// keep: 删掉后读数不会跟上图的变化，面板停在旧形状；由「只决定读数多快跟上图的变化」兜住
 const CADENCE: Duration = Duration::from_secs(600);
 
 /// 起这条回路。
@@ -84,34 +85,64 @@ pub async fn run_once(state: &Arc<GatewayState>) {
 /// 基线读不到时一行也数不了：五格覆盖率里有三格的分母靠它，「没有基线」与
 /// 「没有行」在读数面上同形。空着回去，而不是盖一份全零。
 async fn coverage_this_pass(state: &Arc<GatewayState>) -> (Vec<Blind>, Option<Coverage>) {
-    let Some(plans) = readable_plans(&state.orchestrator).await else {
-        return (vec![Blind::NoBaseline], None);
+    let plans = readable_plans(&state.orchestrator).await;
+    let tasks = match state.orchestrator.get_all_tasks_checked().await {
+        Ok(tasks) => Some(tasks),
+        Err(e) => {
+            tracing::warn!(error = %e, "the task graph is not readable this pass");
+            None
+        }
     };
-    let tasks = state.orchestrator.get_all_tasks().await;
-    let coverage = coverage_of(&tasks, &plans, Utc::now());
-    (Vec::new(), Some(coverage))
+    coverage_after_reading(plans, tasks, Utc::now())
+}
+
+/// 两份读的结局折成「这一轮盖不盖读数」。
+///
+/// 任意一份读不到，这一轮就一行也不盖。任务读不到时若当成空表盖出去，五格覆盖率
+/// 共用那个分母，得到的是一份「图上 0 行、覆盖 0 行」——与「图上真的一行都没有」
+/// 逐字同形，而后者是一个要动手的事实。两份都读到才算量成；读不到的每一份各自
+/// 落一格原因，两件都读不到时两格都落。
+fn coverage_after_reading(
+    plans: Option<BTreeMap<String, cog_core::TaskPlan>>,
+    tasks: Option<Vec<Task>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Vec<Blind>, Option<Coverage>) {
+    let mut blind = Vec::new();
+    if plans.is_none() {
+        blind.push(Blind::NoBaseline);
+    }
+    if tasks.is_none() {
+        blind.push(Blind::NoTasks);
+    }
+    match (plans, tasks) {
+        (Some(plans), Some(tasks)) => (Vec::new(), Some(coverage_of(&tasks, &plans, now))),
+        _ => (blind, None),
+    }
 }
 
 // ─── 这条回路自己的读数 ────────────────────────────────────────────────────
 
 /// 这一轮里没能量出来的那几件。
 ///
-/// 只剩一格：基线整张表读不出来。它曾经还有两格说的是 token 账（没接上、这一下
-/// 读不到），那两格随成本指数一起去掉了——账读不到只影响成本绩效，而成本绩效
-/// 不再有任何读者。
+/// 两格：基线整张表读不出来、任务表读不出来。它曾经还有两格说的是 token 账
+/// （没接上、这一下读不到），那两格随成本指数一起去掉了——账读不到只影响成本
+/// 绩效，而成本绩效不再有任何读者。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(usize)]
 pub enum Blind {
     /// 计划基线读不出来：五格覆盖率里三格的分母一个都算不了。
     NoBaseline = 0,
+    /// 任务表读不出来：五格覆盖率共用同一个分母，一行也数不了。
+    NoTasks = 1,
 }
 
 impl Blind {
-    pub const ALL: [Self; 1] = [Self::NoBaseline];
+    pub const ALL: [Self; 2] = [Self::NoBaseline, Self::NoTasks];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::NoBaseline => "no_baseline",
+            Self::NoTasks => "no_tasks",
         }
     }
 }
@@ -276,7 +307,7 @@ impl cog_core::Observable for Readings {
         }
         // 覆盖也照发，包括「还没量成过」那一份全零：缺一格会让「这一版没量过」与
         // 「这一版不认识这个读数」同形。时刻那一格是它的保鲜标记。
-        let (coverage, measured_at) = self.coverage().unwrap_or_default();
+        let (coverage, measured_at) = self.coverage().unwrap_or(Default::default());
         for (kind, cells) in COVERAGE_KINDS {
             let (coverable, covered) = cells(coverage);
             readings.push(
@@ -392,6 +423,50 @@ mod tests {
             budget_tokens: tokens,
             baseline_rev: "rev-1".into(),
             updated_at: now,
+        }
+    }
+
+    /// 任务表读不到的那一轮不盖读数，并记下这一格。
+    ///
+    /// 判据：把 `coverage_after_reading` 里 `tasks` 的 `None` 当成空表，这条会红
+    /// ——那种修法会在图上盖一份「0 行、覆盖 0 行」，与真的空图同形。
+    #[test]
+    fn a_task_graph_that_cannot_be_read_does_not_publish_a_zero_coverage() {
+        let (blind, coverage) = coverage_after_reading(Some(BTreeMap::new()), None, Utc::now());
+        assert_eq!(blind, vec![Blind::NoTasks]);
+        assert!(coverage.is_none(), "读不到的那一轮不许盖一份零覆盖");
+    }
+
+    /// 两份都读不到时两格原因都落：下一轮看读数的人要知道缺的是哪两份。
+    #[test]
+    fn both_readings_that_cannot_be_read_are_named() {
+        let (blind, coverage) = coverage_after_reading(None, None, Utc::now());
+        assert_eq!(blind, vec![Blind::NoBaseline, Blind::NoTasks]);
+        assert!(coverage.is_none());
+    }
+
+    /// 两份都读到才算量成，量成的就是图上那几行。
+    #[test]
+    fn a_round_that_read_both_publishes_the_coverage() {
+        let now = Utc::now();
+        let tasks = vec![task("t", "p", TaskStatus::Running)];
+        let mut plans = BTreeMap::new();
+        plans.insert("t".to_string(), plan("t", 10, -5, 5, now));
+        let (blind, coverage) = coverage_after_reading(Some(plans), Some(tasks), now);
+        assert!(blind.is_empty());
+        let coverage = coverage.expect("两份都读到就该盖读数");
+        assert_eq!(coverage.tasks, 1);
+        assert_eq!(coverage.tasks_baselined, 1);
+    }
+
+    /// 每格原因各走各的计数器：两格并一格之后，读数面就只说得出「有东西没量成」。
+    #[test]
+    fn each_unmeasured_reason_lands_in_its_own_slot() {
+        let readings = Readings::default();
+        readings.record_blind(Blind::NoTasks);
+        for (blind, count) in readings.blind_counts() {
+            let expected = u64::from(blind == Blind::NoTasks);
+            assert_eq!(count, expected, "{} 落在错的格子里", blind.label());
         }
     }
 

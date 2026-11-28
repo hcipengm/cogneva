@@ -104,7 +104,7 @@ impl cog_core::Agent for FlakyMock {
         let task = input
             .get("task")
             .and_then(|t| t.as_str())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         if task == self.fail_task {
             return Ok(serde_json::json!({ "answer": "wrong" }));
         }

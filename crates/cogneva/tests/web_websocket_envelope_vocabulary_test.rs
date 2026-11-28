@@ -256,7 +256,7 @@ fn chat_frames(text: &str) -> BTreeSet<String> {
 ///
 /// `needle` 要一直写到 `.includes(…)` 的被判对象：页面上另有一张三字母时区的
 /// 名单也用 `.includes(` 判定，只认 `].includes(` 就会读错那一张。
-fn literal_list(text: &str, needle: &str) -> BTreeSet<String> {
+fn quoted_list(text: &str, needle: &str) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     let Some(at) = text.find(needle) else {
         return names;
@@ -381,7 +381,7 @@ ws.send(JSON.stringify(payload));
 #[test]
 fn a_sent_key_its_variant_does_not_parse_is_reported() {
     let root = std::env::temp_dir().join(format!("cogneva-sent-keys-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     std::fs::create_dir_all(root.join("crates/cog-gateway/src")).expect("temp gateway");
     std::fs::create_dir_all(root.join("web/src")).expect("temp web");
 
@@ -415,7 +415,7 @@ fn a_sent_key_its_variant_does_not_parse_is_reported() {
         .collect();
     assert_eq!(extra, vec!["gost"], "{extra:?}");
 
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }
 
 #[test]
@@ -687,10 +687,15 @@ fn the_takeover_page_speaks_only_names_the_gateway_writes() {
     let frames = chat_frames(&production(&root.join(CHAT)));
     let events = agent_wire_names(&read(&root.join(EVENT_WIRE)));
 
+    // 十七帧：start / text_delta / end / cancelled / thinking_start / thinking_delta /
+    // thinking_end / goal / change / usage / compaction / memory / mcp / hooks /
+    // tasks / colleague / background。数少了
+    // 说明读取器与 chat.rs 的写法对不上——这条数不是「帧的种类应当这么多」，是「读取器
+    // 还看得见写者」的读数，所以加一帧就跟着加一。
     assert_eq!(
         frames.len(),
-        7,
-        "只读出 {} 个聊天帧名字（{frames:?}）：写者是 chat.rs 的 envelope 调用，读不出七个\
+        17,
+        "只读出 {} 个聊天帧名字（{frames:?}）：写者是 chat.rs 的 envelope 调用，读不出十七帧\
          说明读取器与那边的写法已经对不上",
         frames.len()
     );
@@ -701,7 +706,7 @@ fn the_takeover_page_speaks_only_names_the_gateway_writes() {
     );
 
     let mut complaints = Vec::new();
-    let envelope_list = literal_list(&page, "].includes(msg.type)");
+    let envelope_list = quoted_list(&page, "].includes(msg.type)");
     assert!(
         envelope_list.len() >= 2,
         "只从 {TAKEOVER} 里读出 {} 个信封名字（{envelope_list:?}）：页面换了判法，\
@@ -816,7 +821,7 @@ if (message.type === 'agent_event') return;
 #[test]
 fn a_wait_nothing_sends_and_a_frame_nobody_reads_are_both_reported() {
     let root = std::env::temp_dir().join(format!("cogneva-envelope-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     std::fs::create_dir_all(root.join("crates/cog-gateway/src")).expect("temp gateway");
     std::fs::create_dir_all(root.join("crates/demo/src")).expect("temp crate");
     std::fs::create_dir_all(root.join("web/src/transport")).expect("temp web");
@@ -879,5 +884,5 @@ fn a_wait_nothing_sends_and_a_frame_nobody_reads_are_both_reported() {
         "{complaints:?}"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }

@@ -66,23 +66,8 @@ run "${work}/c2.json"
 [ "$rc" -eq 0 ] && ok "选择器钉住写者：绿（合法写法不被误判）" \
     || bad "选择器钉住写者应为绿" "0" "$rc；$(tail -3 "${work}/out" | tr '\n' ' ')"
 
-# 3) 面板 target 改成按 phase 折叠：必须红。复制整份 manifest 目录后只改那一行。
-#    注意不是「去掉 {job=...}」就算红——裸选择器画出来的是两条按 job 分开的曲线，没有东西
-#    被折回去（与 CONTROLS 里 `{job=~".*"}` 那条对照同理）；面板这一侧的危险形状是它也开始折叠。
-cp -r "$manifests" "${work}/manifests"
-python3 - "${work}/manifests/06-grafana-dashboard-configmap.yaml" <<'PY'
-import sys
-p = sys.argv[1]
-t = open(p, encoding="utf-8").read()
-old = '"expr": "cogneva_boot_phase_cpu_seconds{job=\\"cogneva\\"}"'
-new = '"expr": "max by (phase) (cogneva_boot_phase_cpu_seconds)"'
-assert old in t, "面板里没找到那一行"
-open(p, "w", encoding="utf-8").write(t.replace(old, new, 1))
-PY
-need $? "面板变异（按 phase 折叠）"
-run "$config" "${work}/manifests"
-[ "$rc" -eq 1 ] && ok "面板按 phase 折叠：红（面板也在射程里）" \
-    || bad "面板按 phase 折叠应红" "1" "$rc；$(tail -3 "${work}/out" | tr '\n' ' ')"
+# 3)（原「面板按 phase 折叠」一段随手写面板一起退场：面板现在由注册表投影生成，
+#    不带任何折叠或判据；这条判据的规则侧仍在上面两段里，面板侧的题面已不存在。）
 
 # 4) manifest 目录不存在：退 3，不许「没看」读成「合规」。
 run "$config" "${work}/no-such-dir"

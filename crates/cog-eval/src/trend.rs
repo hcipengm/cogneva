@@ -104,11 +104,14 @@ pub fn analyze_convergence(
 
 /// 画布尺寸与留白。这是呈现面的几何：选的是一条曲线与它前后的读数能一眼看清，
 /// 不是从数据里量出来的量，也没有别的代码依赖这几个数。
-// cap: bound — 呈现面的几何：一条曲线与它的前后读数能一眼看清，没有代码依赖它
+// cap: fixed — 呈现面的几何：一条曲线与它的前后读数能一眼看清，没有代码依赖它
+// keep: 删掉后趋势图没有画布宽度，曲线与读数挤在一起；由「呈现面几何」兜住
 const SVG_WIDTH: u32 = 800;
-// cap: bound — presentation geometry: the canvas height at which a curve and its readings are legible at a glance.
+// cap: fixed — presentation geometry: the canvas height at which a curve and its readings are legible at a glance.
+// keep: 删掉后趋势图没有画布高度，曲线与读数不可读；由「呈现面几何」兜住
 const SVG_HEIGHT: u32 = 400;
-// cap: bound — presentation geometry: the whitespace that keeps axis labels from meeting the curve.
+// cap: fixed — presentation geometry: the whitespace that keeps axis labels from meeting the curve.
+// keep: 删掉后坐标标签与曲线贴在一起；由「呈现面几何」兜住
 const MARGIN: u32 = 50;
 
 const PALETTE: [&str; 8] = [

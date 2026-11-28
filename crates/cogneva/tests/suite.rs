@@ -25,15 +25,39 @@
 //! Both are read from the file, not listed: `the_suite_and_the_directory_agree`
 //! fails when a file on disk is neither here nor justified by one of the two
 //! properties above, and when a line here names a file that is gone.
+//!
+//! What admits this family, and why it is a condition rather than a row: a
+//! whitelist entry admits whatever file happens to sit at the path, so it goes
+//! on admitting a `suite.rs` that has stopped being the entry point. The
+//! condition is read off the tree on every run, by
+//! `the_suite_entry_point_earns_its_family`:
+//!
+//! 1. one file under `tests/` answers to the stem `suite`, so the entry point is
+//!    named by what it is rather than by a row someone once matched on a path;
+//! 2. every `#[path]` line above names a file that is there and that
+//!    `cannot_share_a_process` clears -- the same predicate the census below
+//!    applies to a file it does not list, called here rather than restated;
+//! 3. the census below skips this file by that stem, so being the entry point is
+//!    what exempts it, and it is never a member of its own list.
+//!
+//! A test that goes red naming the file and the property it broke is an
+//! admission condition. A name in a list is only a promise that the path was
+//! right once.
+
+#[path = "planner_schema_matches_the_ledger_item.rs"]
+mod planner_schema_matches_the_ledger_item;
 
 #[path = "common/cells_written.rs"]
 pub mod cells_written;
 #[path = "common/closed_set.rs"]
 pub mod closed_set;
 #[path = "common/mod.rs"]
+// 这几个目标各自 `mod common;` 一次，`common/` 下的每一份因此被编进好几个二进制——
+// clippy 报 `duplicate_mod`。它建议的改法（留一个 `mod`，其余 `use`）在这里不成立：
+// 测试二进制之间没有共享的模块树，`use` 够不着别的目标里那一份。编两次是安全的，
+// 这些文件只放自由函数与夹具，不定义需要在副本之间保持同一身份的类型。
+#[allow(clippy::duplicate_mod)]
 pub mod common;
-#[path = "common/dashboard.rs"]
-pub mod dashboard;
 #[path = "common/derivation.rs"]
 pub mod derivation;
 #[path = "feedback_a_rollout_replaces_the_log_that_would_have_recorded_it.rs"]
@@ -53,24 +77,203 @@ pub mod unread;
 mod a2a_advertised_paths_are_served;
 #[path = "a2a_rpc_round_trip.rs"]
 mod a2a_rpc_round_trip;
+#[path = "a_background_command_reports_back_test.rs"]
+mod a_background_command_reports_back_test;
 #[path = "a_cache_share_is_a_share_not_a_difference_test.rs"]
 mod a_cache_share_is_a_share_not_a_difference_test;
+#[path = "a_payload_field_becomes_a_column_not_a_query_test.rs"]
+mod a_payload_field_becomes_a_column_not_a_query_test;
+#[path = "a_pending_count_that_could_not_be_read_is_not_zero_test.rs"]
+mod a_pending_count_that_could_not_be_read_is_not_zero_test;
+
+#[path = "a_losing_candidate_keeps_why_it_lost_test.rs"]
+mod a_losing_candidate_keeps_why_it_lost_test;
+
+#[path = "the_config_default_book_only_shrinks_test.rs"]
+mod the_config_default_book_only_shrinks_test;
+
+#[path = "the_progress_probe_is_one_text_test.rs"]
+mod the_progress_probe_is_one_text_test;
+#[path = "the_state_file_book_only_shrinks_test.rs"]
+mod the_state_file_book_only_shrinks_test;
+#[path = "the_ui_refresh_cycle_is_one_number_in_both_trees_test.rs"]
+mod the_ui_refresh_cycle_is_one_number_in_both_trees_test;
+
+#[path = "the_database_pressure_readings_reach_rules_test.rs"]
+mod the_database_pressure_readings_reach_rules_test;
+
+#[path = "the_task_graph_reads_use_indexes_that_do_not_grow_with_history_test.rs"]
+mod the_task_graph_reads_use_indexes_that_do_not_grow_with_history_test;
+
+#[path = "the_event_stream_is_split_into_domain_and_telemetry_test.rs"]
+mod the_event_stream_is_split_into_domain_and_telemetry_test;
+
+#[path = "a_change_carries_the_goal_that_asked_for_it_test.rs"]
+mod a_change_carries_the_goal_that_asked_for_it_test;
+
+#[path = "a_delete_asks_whether_the_world_keeps_another_copy_test.rs"]
+mod a_delete_asks_whether_the_world_keeps_another_copy_test;
+
+#[path = "the_build_plan_is_recorded_as_a_fact_test.rs"]
+mod the_build_plan_is_recorded_as_a_fact_test;
+
+#[path = "the_roster_projection_has_a_rebuild_command_test.rs"]
+mod the_roster_projection_has_a_rebuild_command_test;
+
+#[path = "a_message_body_can_live_outside_the_event_test.rs"]
+mod a_message_body_can_live_outside_the_event_test;
+
+#[path = "a_stalled_build_is_stopped_by_its_attribution_test.rs"]
+mod a_stalled_build_is_stopped_by_its_attribution_test;
+
+#[path = "a_prefix_break_is_named_from_the_calls_themselves_test.rs"]
+mod a_prefix_break_is_named_from_the_calls_themselves_test;
+
+#[path = "a_revised_terminal_needs_a_reason_and_changes_only_its_item_test.rs"]
+mod a_revised_terminal_needs_a_reason_and_changes_only_its_item_test;
+
+#[path = "db_pressure_reads_the_limits_the_database_enforces_test.rs"]
+mod db_pressure_reads_the_limits_the_database_enforces_test;
+
+#[path = "a_batch_can_be_named_instead_of_being_the_whole_ledger_test.rs"]
+mod a_batch_can_be_named_instead_of_being_the_whole_ledger_test;
+
+#[path = "a_change_ledger_rebuilds_from_declared_facts_test.rs"]
+mod a_change_ledger_rebuilds_from_declared_facts_test;
+
+#[path = "the_change_ledger_is_a_projection_of_its_facts_test.rs"]
+mod the_change_ledger_is_a_projection_of_its_facts_test;
+
+#[path = "the_change_ledger_carries_the_watermark_it_read_to_test.rs"]
+mod the_change_ledger_carries_the_watermark_it_read_to_test;
+
+#[path = "a_futex_wait_says_what_is_readable_about_its_holder_test.rs"]
+mod a_futex_wait_says_what_is_readable_about_its_holder_test;
+
+#[path = "a_retention_floor_follows_the_farthest_reader_test.rs"]
+mod a_retention_floor_follows_the_farthest_reader_test;
+
+#[path = "a_table_migration_resumes_from_its_target_test.rs"]
+mod a_table_migration_resumes_from_its_target_test;
+
+#[path = "a_table_swap_stops_where_the_reading_says_test.rs"]
+mod a_table_swap_stops_where_the_reading_says_test;
+
+#[path = "one_shape_per_concept_test.rs"]
+mod one_shape_per_concept_test;
+
+#[path = "a_cache_miss_says_which_layer_let_it_through_test.rs"]
+mod a_cache_miss_says_which_layer_let_it_through_test;
+
+#[path = "a_documentation_only_change_does_not_rebuild_the_binary_test.rs"]
+mod a_documentation_only_change_does_not_rebuild_the_binary_test;
+
+#[path = "a_workspace_test_run_narrows_to_the_cells_whose_inputs_changed_test.rs"]
+mod a_workspace_test_run_narrows_to_the_cells_whose_inputs_changed_test;
+
+#[path = "a_chat_projection_folds_only_what_is_new_test.rs"]
+mod a_chat_projection_folds_only_what_is_new_test;
+
+#[path = "no_clock_kills_work_test.rs"]
+mod no_clock_kills_work_test;
+
+#[path = "the_three_disciplines_name_their_gates_test.rs"]
+mod the_three_disciplines_name_their_gates_test;
+
+#[path = "the_stagnation_window_is_measured_not_declared_test.rs"]
+mod the_stagnation_window_is_measured_not_declared_test;
+
+#[path = "the_two_todo_sources_do_not_fall_back_to_each_other_test.rs"]
+mod the_two_todo_sources_do_not_fall_back_to_each_other_test;
+
+#[path = "the_landing_account_is_a_shadow_of_the_stream_test.rs"]
+mod the_landing_account_is_a_shadow_of_the_stream_test;
+
+#[path = "every_stream_table_has_the_no_scheduled_delete_rule_test.rs"]
+mod every_stream_table_has_the_no_scheduled_delete_rule_test;
+
+#[path = "the_read_surface_layer_holds_no_sql_test.rs"]
+mod the_read_surface_layer_holds_no_sql_test;
+
+#[path = "self_evolution_section_seven_names_its_code_test.rs"]
+mod self_evolution_section_seven_names_its_code_test;
+
+#[path = "every_read_surface_names_the_port_it_delegates_to_test.rs"]
+mod every_read_surface_names_the_port_it_delegates_to_test;
+
+#[path = "a_change_is_accepted_or_refused_before_it_lands_test.rs"]
+mod a_change_is_accepted_or_refused_before_it_lands_test;
 #[path = "a_claim_the_capacity_loop_raises_is_one_it_was_told_about_test.rs"]
 mod a_claim_the_capacity_loop_raises_is_one_it_was_told_about_test;
+#[path = "a_committer_run_twice_does_not_overlap_its_own_shared_artifacts_test.rs"]
+mod a_committer_run_twice_does_not_overlap_its_own_shared_artifacts_test;
+#[path = "a_configured_hook_that_blocks_a_tool_does_block_it_test.rs"]
+mod a_configured_hook_that_blocks_a_tool_does_block_it_test;
+#[path = "a_convention_written_once_is_read_every_turn_test.rs"]
+mod a_convention_written_once_is_read_every_turn_test;
+#[path = "a_conversation_belongs_to_whoever_opened_it_test.rs"]
+mod a_conversation_belongs_to_whoever_opened_it_test;
+#[path = "a_conversation_can_go_back_to_before_a_turn_test.rs"]
+mod a_conversation_can_go_back_to_before_a_turn_test;
+#[path = "a_conversation_says_where_its_sandbox_bounds_it_test.rs"]
+mod a_conversation_says_where_its_sandbox_bounds_it_test;
 #[path = "a_crate_is_a_component_not_a_bridge_test.rs"]
 mod a_crate_is_a_component_not_a_bridge_test;
 #[path = "a_day_is_named_by_one_clock_test.rs"]
 mod a_day_is_named_by_one_clock_test;
+#[path = "a_default_table_names_its_numbers_test.rs"]
+mod a_default_table_names_its_numbers_test;
+#[path = "a_failed_login_that_was_not_counted_says_so_test.rs"]
+mod a_failed_login_that_was_not_counted_says_so_test;
+#[path = "a_filing_is_judged_before_it_lands_test.rs"]
+mod a_filing_is_judged_before_it_lands_test;
 #[path = "a_job_inner_wait_budget_widens_the_job_deadline_test.rs"]
 mod a_job_inner_wait_budget_widens_the_job_deadline_test;
+#[path = "the_event_stream_has_one_write_path_test.rs"]
+mod the_event_stream_has_one_write_path_test;
+
+#[path = "event_kind_writers_use_the_closed_set_test.rs"]
+mod event_kind_writers_use_the_closed_set_test;
+
+#[path = "dynamic_insert_tables_are_declared_test.rs"]
+mod dynamic_insert_tables_are_declared_test;
+
+#[path = "every_envelope_column_has_a_reader_test.rs"]
+mod every_envelope_column_has_a_reader_test;
+mod every_event_class_names_its_writer_and_reader_test;
+mod every_evidence_carrier_declares_its_retention_test;
+#[path = "every_select_sleep_is_classified_test.rs"]
+mod every_select_sleep_is_classified_test;
+mod every_storage_reader_is_in_the_census_test;
+mod every_table_is_in_the_event_source_census_test;
+mod every_usage_reader_names_its_source_test;
+#[path = "every_work_clock_answers_the_first_question_test.rs"]
+mod every_work_clock_answers_the_first_question_test;
+mod no_fact_write_is_sampled_test;
+mod no_record_files_are_written_test;
+
+#[path = "a_judged_out_row_stays_owed_and_carries_its_reason_test.rs"]
+mod a_judged_out_row_stays_owed_and_carries_its_reason_test;
 #[path = "a_label_name_is_the_same_wherever_it_is_declared_test.rs"]
 mod a_label_name_is_the_same_wherever_it_is_declared_test;
+#[path = "a_logout_that_could_not_end_the_session_does_not_report_one_test.rs"]
+mod a_logout_that_could_not_end_the_session_does_not_report_one_test;
+#[path = "a_memory_ingest_that_could_not_store_its_entries_does_not_report_them_test.rs"]
+mod a_memory_ingest_that_could_not_store_its_entries_does_not_report_them_test;
+#[path = "a_message_reaches_any_roster_row_whatever_its_role_test.rs"]
+mod a_message_reaches_any_roster_row_whatever_its_role_test;
 #[path = "a_missing_field_is_refused_or_fallen_back_by_what_the_field_reads_test.rs"]
 mod a_missing_field_is_refused_or_fallen_back_by_what_the_field_reads_test;
 #[path = "a_node_capacity_probe_is_written_once_test.rs"]
 mod a_node_capacity_probe_is_written_once_test;
+#[path = "a_person_keeps_one_id_whatever_their_post_test.rs"]
+mod a_person_keeps_one_id_whatever_their_post_test;
 #[path = "a_pg_integration_test_owns_its_schema_test.rs"]
 mod a_pg_integration_test_owns_its_schema_test;
+#[path = "a_plan_the_store_refused_is_not_reported_as_created_test.rs"]
+mod a_plan_the_store_refused_is_not_reported_as_created_test;
+#[path = "a_plugin_upload_says_the_module_will_not_run_test.rs"]
+mod a_plugin_upload_says_the_module_will_not_run_test;
 #[path = "a_pod_that_ships_its_own_logs_is_the_one_the_collector_skips_test.rs"]
 mod a_pod_that_ships_its_own_logs_is_the_one_the_collector_skips_test;
 #[path = "a_process_has_one_outbound_client_test.rs"]
@@ -79,28 +282,50 @@ mod a_process_has_one_outbound_client_test;
 mod a_process_installs_one_global_subscriber_or_none_test;
 #[path = "a_ready_message_starts_the_row_it_names.rs"]
 mod a_ready_message_starts_the_row_it_names;
+#[path = "a_reconnect_picks_up_where_the_answer_was_test.rs"]
+mod a_reconnect_picks_up_where_the_answer_was_test;
+#[path = "a_record_the_chain_refused_is_not_dropped_in_silence_test.rs"]
+mod a_record_the_chain_refused_is_not_dropped_in_silence_test;
 #[path = "a_relation_reading_is_one_query_test.rs"]
 mod a_relation_reading_is_one_query_test;
+#[path = "a_reopened_conversation_keeps_the_tools_it_ran_test.rs"]
+mod a_reopened_conversation_keeps_the_tools_it_ran_test;
 #[path = "a_retention_knob_says_what_zero_means_test.rs"]
 mod a_retention_knob_says_what_zero_means_test;
-#[path = "a_retired_row_carries_the_measurement_that_falsified_it_test.rs"]
-mod a_retired_row_carries_the_measurement_that_falsified_it_test;
 #[path = "a_retry_loop_that_pipes_its_command_judges_the_last_stage_test.rs"]
 mod a_retry_loop_that_pipes_its_command_judges_the_last_stage_test;
 #[path = "a_roster_entry_is_removed_by_identity_and_a_dead_one_is_never_handed_back_test.rs"]
 mod a_roster_entry_is_removed_by_identity_and_a_dead_one_is_never_handed_back_test;
+#[path = "a_session_chooses_its_own_model_test.rs"]
+mod a_session_chooses_its_own_model_test;
+#[path = "a_shared_index_makes_every_writer_carry_every_memory_test.rs"]
+mod a_shared_index_makes_every_writer_carry_every_memory_test;
 #[path = "a_shared_query_is_spelt_once_test.rs"]
 mod a_shared_query_is_spelt_once_test;
 #[path = "a_successful_write_rings_the_bell.rs"]
 mod a_successful_write_rings_the_bell;
+#[path = "a_timeout_wall_is_a_named_value_test.rs"]
+mod a_timeout_wall_is_a_named_value_test;
+#[path = "a_tool_that_changes_things_asks_the_person_first_test.rs"]
+mod a_tool_that_changes_things_asks_the_person_first_test;
+#[path = "a_transition_nobody_could_read_is_not_judged_against_a_made_up_state_test.rs"]
+mod a_transition_nobody_could_read_is_not_judged_against_a_made_up_state_test;
+#[path = "a_turn_that_is_only_talk_files_nothing_test.rs"]
+mod a_turn_that_is_only_talk_files_nothing_test;
 #[path = "a_waiting_reason_is_declared_once_test.rs"]
 mod a_waiting_reason_is_declared_once_test;
+#[path = "a_wall_answers_when_nothing_arrives_test.rs"]
+mod a_wall_answers_when_nothing_arrives_test;
+#[path = "a_wall_may_not_end_work_it_cannot_resume_test.rs"]
+mod a_wall_may_not_end_work_it_cannot_resume_test;
 #[path = "a_word_written_out_is_the_word_read_back_test.rs"]
 mod a_word_written_out_is_the_word_read_back_test;
 #[path = "a_worker_can_ask_to_change_the_system_test.rs"]
 mod a_worker_can_ask_to_change_the_system_test;
 #[path = "a_workload_that_runs_a_standalone_command_can_reach_the_log_backend_test.rs"]
 mod a_workload_that_runs_a_standalone_command_can_reach_the_log_backend_test;
+#[path = "a_written_default_is_named_or_derived_test.rs"]
+mod a_written_default_is_named_or_derived_test;
 #[path = "agent_consumer_test.rs"]
 mod agent_consumer_test;
 #[path = "agent_context_test.rs"]
@@ -127,6 +352,16 @@ mod agent_tools_test;
 mod agent_wal_test;
 #[path = "agent_wrapper_test.rs"]
 mod agent_wrapper_test;
+#[path = "an_answer_never_waits_on_a_snapshot_that_never_lands_test.rs"]
+mod an_answer_never_waits_on_a_snapshot_that_never_lands_test;
+#[path = "an_employee_can_search_and_commit_test.rs"]
+mod an_employee_can_search_and_commit_test;
+#[path = "an_employee_works_in_its_own_checkout_test.rs"]
+mod an_employee_works_in_its_own_checkout_test;
+#[path = "an_executor_says_who_is_waiting_for_a_slot_test.rs"]
+mod an_executor_says_who_is_waiting_for_a_slot_test;
+#[path = "an_external_mcp_server_s_tools_reach_the_turn_test.rs"]
+mod an_external_mcp_server_s_tools_reach_the_turn_test;
 #[path = "an_identifier_is_quoted_in_one_place_test.rs"]
 mod an_identifier_is_quoted_in_one_place_test;
 #[path = "an_occupied_id_is_not_work_in_hand_test.rs"]
@@ -141,6 +376,8 @@ mod app_config_substitutions_contract_test;
 mod assistant_event_tags_compared_are_tags_the_enum_writes_test;
 #[path = "atomic_replace_is_written_once_test.rs"]
 mod atomic_replace_is_written_once_test;
+#[path = "attachments_reach_the_model_test.rs"]
+mod attachments_reach_the_model_test;
 #[path = "attempt_resume_test.rs"]
 mod attempt_resume_test;
 #[path = "auth_error_codes_are_one_vocabulary_test.rs"]
@@ -157,6 +394,17 @@ mod backup_retention_is_counted_not_dated;
 mod board_wip_limit_wiring_test;
 #[path = "boot_phase_marks_contract_test.rs"]
 mod boot_phase_marks_contract_test;
+#[path = "bounds_registry_test.rs"]
+mod bounds_registry_test;
+#[path = "ignored_test_corpus_contract_test.rs"]
+mod ignored_test_corpus_contract_test;
+#[path = "shipped_config_numbers_are_registered_test.rs"]
+mod shipped_config_numbers_are_registered_test;
+#[path = "the_employee_row_starts_a_stream_or_shows_a_failure_test.rs"]
+mod the_employee_row_starts_a_stream_or_shows_a_failure_test;
+#[path = "the_exchange_writer_binds_only_columns_the_store_creates_test.rs"]
+mod the_exchange_writer_binds_only_columns_the_store_creates_test;
+
 #[path = "builtin_tools_have_one_list.rs"]
 mod builtin_tools_have_one_list;
 #[path = "capability_declarations_are_enumerated.rs"]
@@ -171,8 +419,12 @@ mod change_ledger_read_face;
 mod chart_declared_ports_reach_the_process_test;
 #[path = "chart_template_literals_contract_test.rs"]
 mod chart_template_literals_contract_test;
+#[path = "chat_quota_read_face.rs"]
+mod chat_quota_read_face;
 #[path = "chat_reply_points_at_a_badge_the_client_draws_test.rs"]
 mod chat_reply_points_at_a_badge_the_client_draws_test;
+#[path = "chat_spend_and_quota_on_the_header_test.rs"]
+mod chat_spend_and_quota_on_the_header_test;
 #[path = "chat_turn_is_an_agent_with_control_plane_tools_test.rs"]
 mod chat_turn_is_an_agent_with_control_plane_tools_test;
 #[path = "chat_turn_is_recorded_before_the_end_frame_test.rs"]
@@ -197,12 +449,18 @@ mod collaboration_roundtable_integration_test;
 mod collaboration_roundtable_test;
 #[path = "collaboration_self_review_test.rs"]
 mod collaboration_self_review_test;
+#[path = "colleague_messages_are_visible_in_the_turn_test.rs"]
+mod colleague_messages_are_visible_in_the_turn_test;
 #[path = "complete_options_are_mapped_once_test.rs"]
 mod complete_options_are_mapped_once_test;
+#[path = "composer_takes_more_than_one_line_test.rs"]
+mod composer_takes_more_than_one_line_test;
 #[path = "config_declaration_delivery_test.rs"]
 mod config_declaration_delivery_test;
 #[path = "config_section_reader_contract_test.rs"]
 mod config_section_reader_contract_test;
+#[path = "context_compaction_is_visible_test.rs"]
+mod context_compaction_is_visible_test;
 #[path = "contract_default_body_must_not_answer_success_it_did_not_earn.rs"]
 mod contract_default_body_must_not_answer_success_it_did_not_earn;
 #[path = "core_boundary_contract_test.rs"]
@@ -249,6 +507,11 @@ mod e2e_integration;
 mod enumerations_name_every_variant_the_enum_declares_test;
 #[path = "env_names_are_declared_once_test.rs"]
 mod env_names_are_declared_once_test;
+#[path = "no_ceiling_that_kills_work_without_a_registered_bound_test.rs"]
+mod no_ceiling_that_kills_work_without_a_registered_bound_test;
+
+#[path = "a2a_goals_carry_their_origin_test.rs"]
+mod a2a_goals_carry_their_origin_test;
 #[path = "eval_report_is_readable_after_a_run.rs"]
 mod eval_report_is_readable_after_a_run;
 #[path = "eval_table_determinism.rs"]
@@ -259,14 +522,27 @@ mod event_bus_metric_seed_test;
 mod every_agent_unhealthy_writer_consults_the_judgement;
 #[path = "every_alert_condition_has_a_promql_shape_test.rs"]
 mod every_alert_condition_has_a_promql_shape_test;
+#[path = "every_config_field_is_read_by_production_code_test.rs"]
+mod every_config_field_is_read_by_production_code_test;
+#[path = "every_config_knob_is_named_by_a_delivered_document_test.rs"]
+mod every_config_knob_is_named_by_a_delivered_document_test;
+#[path = "every_declared_once_gate_shares_the_one_reader_test.rs"]
+mod every_declared_once_gate_shares_the_one_reader_test;
 #[path = "every_file_in_the_static_tree_is_delivered_or_declared_test.rs"]
 mod every_file_in_the_static_tree_is_delivered_or_declared_test;
 #[path = "every_first_party_container_prints_time_in_the_clusters_timezone_test.rs"]
 mod every_first_party_container_prints_time_in_the_clusters_timezone_test;
+#[path = "every_preset_model_has_its_published_window_test.rs"]
+mod every_preset_model_has_its_published_window_test;
 #[path = "every_reflection_row_states_what_closes_it_test.rs"]
 mod every_reflection_row_states_what_closes_it_test;
 #[path = "every_rendered_profile_is_a_tree_the_deployer_delivers_test.rs"]
 mod every_rendered_profile_is_a_tree_the_deployer_delivers_test;
+#[path = "every_served_route_is_a_face_or_says_who_it_serves_test.rs"]
+mod every_served_route_is_a_face_or_says_who_it_serves_test;
+#[path = "every_updated_table_declares_its_shape_test.rs"]
+mod every_updated_table_declares_its_shape_test;
+
 #[path = "export_package_names_test.rs"]
 mod export_package_names_test;
 #[path = "gateway_answers_a_waited_prompt.rs"]
@@ -275,8 +551,12 @@ mod gateway_answers_a_waited_prompt;
 mod gateway_refuses_a_caller_named_reply_stream;
 #[path = "governance_routes.rs"]
 mod governance_routes;
+#[path = "graph_readings_keep_the_failure_test.rs"]
+mod graph_readings_keep_the_failure_test;
 #[path = "host_paths_are_not_baked_in_test.rs"]
 mod host_paths_are_not_baked_in_test;
+#[path = "identity_is_written_once_test.rs"]
+mod identity_is_written_once_test;
 #[path = "image_layout_literals_contract_test.rs"]
 mod image_layout_literals_contract_test;
 #[path = "in_cluster_address_literals_contract_test.rs"]
@@ -291,12 +571,12 @@ mod knowledge_namespace_write_contract_test;
 mod knowledge_retrieval_round_trip_test;
 #[path = "knowledge_retrieval_series_test.rs"]
 mod knowledge_retrieval_series_test;
+#[path = "label_differential_test.rs"]
+mod label_differential_test;
 #[path = "llm_actor_label_contract_test.rs"]
 mod llm_actor_label_contract_test;
 #[path = "llm_spend_verdict_contract_test.rs"]
 mod llm_spend_verdict_contract_test;
-#[path = "log_stream_selectors_are_labels_the_code_writes_test.rs"]
-mod log_stream_selectors_are_labels_the_code_writes_test;
 #[path = "mainline_rollout_dispatch_contract_test.rs"]
 mod mainline_rollout_dispatch_contract_test;
 #[path = "mcp_server_stdio.rs"]
@@ -325,14 +605,30 @@ mod memory_observability_gateway_test;
 mod memory_search_all_test;
 #[path = "memory_vector_backend_test.rs"]
 mod memory_vector_backend_test;
+#[path = "mentions_complete_paths_test.rs"]
+mod mentions_complete_paths_test;
 #[path = "message_backend_multi_instance_test.rs"]
 mod message_backend_multi_instance_test;
 #[path = "metric_help_reports_the_wait_the_code_does_test.rs"]
 mod metric_help_reports_the_wait_the_code_does_test;
+#[path = "metrics_path_is_declared_once_test.rs"]
+mod metrics_path_is_declared_once_test;
+#[path = "metrics_path_matches_deploy_test.rs"]
+mod metrics_path_matches_deploy_test;
+#[path = "migrations_replay_on_an_empty_database_test.rs"]
+mod migrations_replay_on_an_empty_database_test;
+#[path = "model_facing_instructions_declare_their_source_test.rs"]
+mod model_facing_instructions_declare_their_source_test;
+#[path = "multi_backend_consumer_reads_its_group_from_config_test.rs"]
+mod multi_backend_consumer_reads_its_group_from_config_test;
 #[path = "network_policy_subjects_name_a_component_the_code_writes_test.rs"]
 mod network_policy_subjects_name_a_component_the_code_writes_test;
+#[path = "no_fact_table_is_deleted_on_a_schedule_test.rs"]
+mod no_fact_table_is_deleted_on_a_schedule_test;
 #[path = "no_json_columns_test.rs"]
 mod no_json_columns_test;
+#[path = "no_loop_is_killed_by_a_clock_test.rs"]
+mod no_loop_is_killed_by_a_clock_test;
 #[path = "notification_contract_matches_its_schema.rs"]
 mod notification_contract_matches_its_schema;
 #[path = "notification_delivery_over_a_socket_test.rs"]
@@ -345,12 +641,8 @@ mod oauth_popup_keeps_its_opener_test;
 mod observability_alert_face_literals_contract_test;
 #[path = "observability_alert_rule_contract_test.rs"]
 mod observability_alert_rule_contract_test;
-#[path = "observability_dashboard_contract_test.rs"]
-mod observability_dashboard_contract_test;
 #[path = "observability_endpoint_ports_contract_test.rs"]
 mod observability_endpoint_ports_contract_test;
-#[path = "observability_pool_freshness_contract_test.rs"]
-mod observability_pool_freshness_contract_test;
 #[path = "observability_reachability_probe_wiring_test.rs"]
 mod observability_reachability_probe_wiring_test;
 #[path = "observability_scrape_census_contract_test.rs"]
@@ -363,12 +655,18 @@ mod observable_dimension_contract_test;
 mod observable_reachability_contract_test;
 #[path = "one_value_has_one_name_inside_its_crate_test.rs"]
 mod one_value_has_one_name_inside_its_crate_test;
+#[path = "oversized_input_lands_in_a_file_test.rs"]
+mod oversized_input_lands_in_a_file_test;
 #[path = "page_compared_words_are_owned_by_a_writer_test.rs"]
 mod page_compared_words_are_owned_by_a_writer_test;
 #[path = "page_component_nodes_are_components_the_gateway_reports_test.rs"]
 mod page_component_nodes_are_components_the_gateway_reports_test;
 #[path = "page_status_words_are_words_the_status_writes_test.rs"]
 mod page_status_words_are_words_the_status_writes_test;
+#[path = "permission_rules_are_remembered_test.rs"]
+mod permission_rules_are_remembered_test;
+#[path = "plan_is_approved_before_anything_changes_test.rs"]
+mod plan_is_approved_before_anything_changes_test;
 #[path = "plugin_init_dependencies.rs"]
 mod plugin_init_dependencies;
 #[path = "popup_handshake_words_are_the_words_the_other_page_sends_test.rs"]
@@ -379,6 +677,8 @@ mod probe_paths_are_routes_the_container_serves_test;
 mod process_report_path_contract_test;
 #[path = "project_contract.rs"]
 mod project_contract;
+#[path = "projection_has_a_declared_reader_test.rs"]
+mod projection_has_a_declared_reader_test;
 #[path = "promotion_eval_row_is_dispatchable_contract_test.rs"]
 mod promotion_eval_row_is_dispatchable_contract_test;
 #[path = "publish_paths_share_one_wiring_ledger.rs"]
@@ -397,6 +697,8 @@ mod redis_connection_contract_test;
 mod redis_streams_cluster_test;
 #[path = "repeated_path_components_are_named_once_test.rs"]
 mod repeated_path_components_are_named_once_test;
+#[path = "replies_render_markdown_test.rs"]
+mod replies_render_markdown_test;
 #[path = "resource_faces_read_the_whole_cluster_test.rs"]
 mod resource_faces_read_the_whole_cluster_test;
 #[path = "resource_governance_projection_test.rs"]
@@ -413,16 +715,28 @@ mod runtime_database_role_is_not_the_instance_superuser_test;
 mod runtime_roots_literals_contract_test;
 #[path = "rust_capacity_constants_registry_test.rs"]
 mod rust_capacity_constants_registry_test;
+#[path = "scale_is_a_reading_not_a_constant_test.rs"]
+mod scale_is_a_reading_not_a_constant_test;
 #[path = "scenes_hand_work_to_the_roster_test.rs"]
 mod scenes_hand_work_to_the_roster_test;
 #[path = "scrape_targets_name_a_port_the_workload_provides_test.rs"]
 mod scrape_targets_name_a_port_the_workload_provides_test;
+#[path = "self_alert_rule_names_are_declared_once_test.rs"]
+mod self_alert_rule_names_are_declared_once_test;
 #[path = "service_account_mount_literals_contract_test.rs"]
 mod service_account_mount_literals_contract_test;
+#[path = "sessions_are_listed_and_searchable_test.rs"]
+mod sessions_are_listed_and_searchable_test;
+#[path = "shared_task_list_in_the_conversation_test.rs"]
+mod shared_task_list_in_the_conversation_test;
 #[path = "shutdown_budget_contract_test.rs"]
 mod shutdown_budget_contract_test;
 #[path = "skill_directories_contract_test.rs"]
 mod skill_directories_contract_test;
+#[path = "skills_carry_no_persona_and_no_boundary_test.rs"]
+mod skills_carry_no_persona_and_no_boundary_test;
+#[path = "slash_commands_reach_the_conversation_test.rs"]
+mod slash_commands_reach_the_conversation_test;
 #[path = "sparse_weights_are_loaded_once_contract_test.rs"]
 mod sparse_weights_are_loaded_once_contract_test;
 #[path = "store_counter_window_contract_test.rs"]
@@ -431,6 +745,8 @@ mod store_counter_window_contract_test;
 mod store_tables_are_in_the_restore_bundle_test;
 #[path = "stress_message_backend_test.rs"]
 mod stress_message_backend_test;
+#[path = "subagent_runs_in_a_fresh_context_test.rs"]
+mod subagent_runs_in_a_fresh_context_test;
 #[path = "supervisor_alert_words_are_words_the_face_map_knows_test.rs"]
 mod supervisor_alert_words_are_words_the_face_map_knows_test;
 #[path = "supervisor_control_plane_test.rs"]
@@ -443,6 +759,8 @@ mod supervisor_health_checker_test;
 mod supervisor_judges_the_live_agents;
 #[path = "supervisor_lifecycle_coordinator_test.rs"]
 mod supervisor_lifecycle_coordinator_test;
+#[path = "supervisor_rebalancer_reads_report_failures_test.rs"]
+mod supervisor_rebalancer_reads_report_failures_test;
 #[path = "supervisor_registry_test.rs"]
 mod supervisor_registry_test;
 #[path = "supervisor_respawner_test.rs"]
@@ -455,30 +773,50 @@ mod supervisor_task_rebalancer_test;
 mod supervisor_udp_heartbeat_test;
 #[path = "task_claim_concurrency_wiring_test.rs"]
 mod task_claim_concurrency_wiring_test;
+#[path = "task_completion_events_and_timeout_semantics_test.rs"]
+mod task_completion_events_and_timeout_semantics_test;
 #[path = "task_resume_wiring_contract_test.rs"]
 mod task_resume_wiring_contract_test;
+#[path = "the_ceiling_follows_the_work_not_the_label_test.rs"]
+mod the_ceiling_follows_the_work_not_the_label_test;
 #[path = "the_fixture_reading_steps_are_written_once_test.rs"]
 mod the_fixture_reading_steps_are_written_once_test;
+#[path = "the_generator_keeps_a_file_so_a_reader_must_watch_it_test.rs"]
+mod the_generator_keeps_a_file_so_a_reader_must_watch_it_test;
 #[path = "the_production_cut_is_defined_once_test.rs"]
 mod the_production_cut_is_defined_once_test;
 #[path = "the_quota_cells_are_written_by_a_projection_test.rs"]
 mod the_quota_cells_are_written_by_a_projection_test;
 #[path = "the_repo_root_is_computed_in_one_place_test.rs"]
 mod the_repo_root_is_computed_in_one_place_test;
+#[path = "the_roster_reads_people_not_roles_test.rs"]
+mod the_roster_reads_people_not_roles_test;
+#[path = "the_table_registries_agree_test.rs"]
+mod the_table_registries_agree_test;
 #[path = "the_token_counters_are_a_projection_of_the_ledger_test.rs"]
 mod the_token_counters_are_a_projection_of_the_ledger_test;
+#[path = "todo_panel_shows_one_list_test.rs"]
+mod todo_panel_shows_one_list_test;
 #[path = "trace_header_names_contract_test.rs"]
 mod trace_header_names_contract_test;
+#[path = "treatment_is_decided_without_the_label_test.rs"]
+mod treatment_is_decided_without_the_label_test;
 #[path = "tunable_registry_contract_test.rs"]
 mod tunable_registry_contract_test;
 #[path = "unwired_modules_contract_test.rs"]
 mod unwired_modules_contract_test;
+#[path = "values_leaves_have_one_source_test.rs"]
+mod values_leaves_have_one_source_test;
 #[path = "volume_footprint_declaration_test.rs"]
 mod volume_footprint_declaration_test;
 #[path = "wal_event_round_trip_test.rs"]
 mod wal_event_round_trip_test;
+#[path = "wall_call_sites_test.rs"]
+mod wall_call_sites_test;
 #[path = "web_chat_frames_read_fields_the_socket_writes_test.rs"]
 mod web_chat_frames_read_fields_the_socket_writes_test;
+#[path = "web_chat_works_like_a_workspace_test.rs"]
+mod web_chat_works_like_a_workspace_test;
 #[path = "web_client_api_functions_are_called_test.rs"]
 mod web_client_api_functions_are_called_test;
 #[path = "web_client_branch_words_are_words_the_server_writes_test.rs"]
@@ -491,6 +829,10 @@ mod web_client_response_fields_are_written_somewhere_test;
 mod web_client_routes_are_served_test;
 #[path = "web_client_word_lists_are_declared_test.rs"]
 mod web_client_word_lists_are_declared_test;
+#[path = "web_delivery_chain_cells_answer_where_the_change_is_stuck_test.rs"]
+mod web_delivery_chain_cells_answer_where_the_change_is_stuck_test;
+#[path = "web_delivery_chain_shows_where_the_gate_spent_its_time_test.rs"]
+mod web_delivery_chain_shows_where_the_gate_spent_its_time_test;
 #[path = "web_event_payloads_are_the_fields_the_server_writes_test.rs"]
 mod web_event_payloads_are_the_fields_the_server_writes_test;
 #[path = "web_event_vocabulary_contract_test.rs"]
@@ -509,6 +851,8 @@ mod web_websocket_channels_are_published_test;
 mod web_websocket_envelope_vocabulary_test;
 #[path = "web_workbench_shows_people_venues_tasks_test.rs"]
 mod web_workbench_shows_people_venues_tasks_test;
+#[path = "whole_batch_generation_carries_its_batch_test.rs"]
+mod whole_batch_generation_carries_its_batch_test;
 #[path = "wiki_indexer_test.rs"]
 mod wiki_indexer_test;
 #[path = "wiki_integration_test.rs"]
@@ -523,6 +867,8 @@ mod wiki_vector_index_test;
 mod wire_words_are_not_derived_from_debug_test;
 #[path = "word_constants_with_the_same_name_say_the_same_word_test.rs"]
 mod word_constants_with_the_same_name_say_the_same_word_test;
+#[path = "work_on_the_tree_is_declared_by_the_task_test.rs"]
+mod work_on_the_tree_is_declared_by_the_task_test;
 #[path = "workload_label_pairs_contract_test.rs"]
 mod workload_label_pairs_contract_test;
 /// Whether a file can share this process with the others.
@@ -534,13 +880,39 @@ mod workload_label_pairs_contract_test;
 /// beside it, so a file that starts doing either stops being eligible in the
 /// same change that makes it do so.
 fn cannot_share_a_process(text: &str) -> Option<&'static str> {
-    if text.contains("set_var(") {
+    if text.lines().any(|line| {
+        let t = line.trim_start();
+        !t.starts_with("//") && t.contains("set_var(")
+    }) {
         return Some("writes a process-global environment variable");
     }
-    if text.contains("#[ignore") {
+    // 判**属性位**，不判裸子串：一条注释里写着 `#[ignore]`（解释这条规则本身）或一段
+    // 字符串里含着它，都不是一条被忽略的用例。裸子串会把「提到」读成「就是」，
+    // 而前者恰恰出现在解释这条规则的文件里。
+    if text
+        .lines()
+        .any(|line| line.trim_start().starts_with("#[ignore"))
+    {
         return Some("carries an #[ignore]d case that CI runs on its own");
     }
     None
+}
+
+/// The files the module list above pulls in, each by its path without the `.rs`.
+///
+/// Read out of this file's own text wherever a test has to reason about what
+/// the list covers, so the list has one reader and not one per test: a line
+/// added above is seen by all of them, and a line that stops being a line is
+/// seen by none.
+fn listed_modules(list: &str) -> Vec<&str> {
+    list.lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("#[path = \"")
+                .and_then(|rest| rest.strip_suffix("\"]"))
+                .map(|file| file.trim_end_matches(".rs"))
+        })
+        .collect()
 }
 
 /// The suite and the directory say the same thing.
@@ -556,15 +928,7 @@ fn the_suite_and_the_directory_agree() {
     const FLOOR: usize = 150;
     let tests = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     let list = include_str!("suite.rs");
-    let listed: Vec<&str> = list
-        .lines()
-        .filter_map(|line| {
-            line.trim()
-                .strip_prefix("#[path = \"")
-                .and_then(|rest| rest.strip_suffix("\"]"))
-                .map(|file| file.trim_end_matches(".rs"))
-        })
-        .collect();
+    let listed = listed_modules(list);
     assert!(
         listed.len() >= FLOOR,
         "the list names {} files, fewer than the {FLOOR} this suite is known to hold; \
@@ -612,4 +976,78 @@ fn the_suite_and_the_directory_agree() {
         "the census read {on_disk} files on disk, fewer than the {FLOOR} this suite is known to \
          hold; the directory scan has gone wrong"
     );
+}
+
+/// The entry point of the merged suite earns its own path family.
+///
+/// `crates/cogneva/tests/suite.rs` is a family of one file, and the difference
+/// between a family with an admission condition and an exception someone wrote
+/// down once is that the condition is read off the tree every time this runs:
+/// one file answers to the stem, every line of the list resolves to a file that
+/// is there and clears the exemption predicate, and the entry point stays out of
+/// the census by that stem instead of by being listed as itself. A rename, a
+/// dangling line or a second file with the same stem fails here, naming the file
+/// and the property, rather than waiting for the next round of CI.
+#[test]
+fn the_suite_entry_point_earns_its_family() {
+    let tests = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let list = include_str!("suite.rs");
+    let listed = listed_modules(list);
+    let own_stem = std::path::Path::new(file!())
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    // (1) Exactly one file answers to the stem this family is named by.
+    let mut same_stem: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&tests).expect("tests directory is readable") {
+        let path = entry.expect("directory entry").path();
+        if path.extension().is_none_or(|ext| ext != "rs") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        if stem == own_stem {
+            same_stem.push(path.display().to_string());
+        }
+    }
+    let answering = same_stem.len();
+    assert!(
+        answering == 1,
+        "the merged suite is admitted as the one file with the stem `{own_stem}`, and the \
+         directory holds {answering} that answer to it: {same_stem:?}"
+    );
+
+    // (2) Every line of the list resolves, and to a file that can share this
+    // process -- the same predicate a file outside the list has to satisfy.
+    for name in &listed {
+        let path = tests.join(format!("{name}.rs"));
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{name}.rs: named by the entry point but unreadable: {e}"));
+        if let Some(why) = cannot_share_a_process(&text) {
+            panic!(
+                "{name}.rs: the entry point may only pull in files that can share this process, \
+                 and this one {why}"
+            );
+        }
+    }
+
+    // (3) The entry point is not a member of its own list, and the census keeps
+    // it out by the stem (1) shows is unique rather than by its full path.
+    for name in &listed {
+        let stem = std::path::Path::new(name)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            stem != own_stem,
+            "{name}.rs: the entry point lists a module carrying its own stem `{own_stem}`; the \
+             census skips that stem, so the file would never be counted either way"
+        );
+    }
 }

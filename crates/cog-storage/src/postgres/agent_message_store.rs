@@ -32,6 +32,20 @@ impl PostgresAgentMessageStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    /// Messages to `to_unit` older than its newest `keep` -- the part no reader
+    /// is shown again, and therefore the part an archive owes.
+    ///
+    /// Nothing is deleted here: the count says "there is something to move", not
+    /// "there is something to drop".
+    pub async fn overflow_beyond_window(&self, to_unit: &str, keep: i64) -> SFResult<i64> {
+        sqlx::query_scalar(COUNT_OVERFLOW_SQL)
+            .bind(to_unit)
+            .bind(keep)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("count the agent conversation overflow: {e}")))
+    }
 }
 
 const INSERT_SQL: &str = "\
@@ -62,10 +76,15 @@ UPDATE agent_messages \
 SET outcome = $2, outcome_detail = $3 \
 WHERE id = $1 AND outcome = 'queued'";
 
-/// Drop what fell out of this peer's window. Bounded per receiver rather than
-/// globally: one chatty sender must not push another conversation out.
-const TRIM_SQL: &str = "\
-DELETE FROM agent_messages \
+/// How many messages to this peer sit outside its window -- **counted, not
+/// deleted**. Bounded per receiver rather than globally: one chatty sender must
+/// not push another conversation out.
+///
+/// A message is something one agent told another; the row is the only copy.
+/// The count is the reading that says an archive is owed, and the rows stay
+/// until a readable copy exists and reads back byte for byte.
+const COUNT_OVERFLOW_SQL: &str = "\
+SELECT count(*) FROM agent_messages \
 WHERE to_unit = $1 \
   AND id NOT IN ( \
       SELECT id FROM agent_messages WHERE to_unit = $1 ORDER BY id DESC LIMIT $2 \
@@ -138,15 +157,6 @@ impl AgentMessageStore for PostgresAgentMessageStore {
             .map_err(|e| SFError::Database(format!("record an agent message: {e}")))?
             .try_get("id")
             .map_err(|e| SFError::Database(format!("read back a recorded agent message: {e}")))?;
-        // Same transaction as the insert: a trim on its own could delete a row
-        // another writer had just appended, and a crash between the two would
-        // leave the bound unenforced.
-        sqlx::query(TRIM_SQL)
-            .bind(to_unit)
-            .bind(ROWS_KEPT_PER_PEER)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| SFError::Database(format!("trim the agent conversation: {e}")))?;
         tx.commit()
             .await
             .map_err(|e| SFError::Database(format!("commit the agent message: {e}")))?;

@@ -12,160 +12,63 @@
 //! So a squad that has been renamed runs to completion with the wrong prompt
 //! structure and no checkpoint resume, and both look like ordinary behaviour.
 //!
-//! The names live in [`cog_core::roles`]. This counts production lines, so a
-//! second spelling is caught the day it is written rather than the day someone
-//! renames something.
-
-use std::collections::BTreeMap;
-use std::path::Path;
+//! The names live in [`cog_core::roles`]. The reading, the subtraction of
+//! registered same-word-different-thing sites and the staleness check are the
+//! one implementation in `common::declared_once`; this file only says what is
+//! declared and who owns it.
 
 use crate::common;
 
+use common::declared_once::{Declared, Exemption, Report, Wall};
 use common::routes::repo_root;
 
-use common::rust_production::{production_lines, production_sources, relative_name};
+use common::rust_production::production_lines;
 
 /// Where the names are declared, relative to the repository root.
 const HOME: &str = "crates/cog-core/src/roles.rs";
 
-/// Every complete string literal on the line, with the text before it.
-///
-/// Whole literals only: `"the planner decides"` is prose and
-/// `"planner_v2"` is a different role, and neither is a second spelling of
-/// `"planner"`.
-fn literals(line: &str) -> Vec<(&str, &str)> {
-    let mut out = Vec::new();
-    let mut rest = line;
-    while let Some(at) = rest.find('"') {
-        let before = &rest[..at];
-        let after = &rest[at + 1..];
-        let Some(end) = after.find('"') else {
-            break;
-        };
-        out.push((&after[..end], before));
-        rest = &after[end + 1..];
-    }
-    out
-}
+const SUBJECT: &str = "角色名";
 
-/// Whether the literal is the label of a `Debug` struct field rather than data.
-///
-/// `debug_struct("..").field("moderator", &self.moderator.is_some())` prints
-/// the word `moderator`; it never reaches the configuration, never names an
-/// actor and never becomes an id. Reading it as a second spelling of the role
-/// would be a true statement about the wrong thing, so the reader skips it.
-fn is_debug_label(before: &str) -> bool {
-    before.trim_end().ends_with(".field(")
-}
-
-/// Everything in [`cog_core::roles`] that is a name, read from its declaration.
-///
-/// `ALL` is what consumers use, so it is what this gate follows: a role added
-/// there is counted here without anyone remembering to edit this file.
-fn declared() -> Vec<&'static str> {
-    cog_core::roles::ALL.to_vec()
-}
+/// What a red means: the two sides of a rename do not meet anywhere that would
+/// notice, so both halves report success.
+const WHY: &str = "改名时改一处不会报错：按旧名字取 schema 的那一侧拿到 `None`，\
+                   按旧名字找 checkpoint 的那一侧什么也找不到，两者都不算失败。";
 
 /// A site that spells a role name for a reason of its own.
 ///
 /// The same word can name two unrelated things. Registering one of those as an
 /// exemption is a claim someone had to look at; without it the gate would
 /// report a true statement about the wrong thing.
-const SAME_WORD_DIFFERENT_THING: &[(&str, &str, &str)] = &[(
+const SAME_WORD_DIFFERENT_THING: &[Exemption] = &[Exemption::new(
     "crates/cogneva/src/work.rs",
     "external-worker",
     "`HOSTNAME` 读不到时的单元显示名，不是注册用的角色字段——那条构造里角色读的是常量",
 )];
 
-fn registered_elsewhere(file: &str, value: &str) -> bool {
-    SAME_WORD_DIFFERENT_THING
-        .iter()
-        .any(|(exempt_file, exempt_value, _)| *exempt_file == file && *exempt_value == value)
-}
-
-fn sites(root: &Path, names: &[&str]) -> BTreeMap<String, Vec<String>> {
-    let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    {
-        for path in production_sources(root) {
-            let file = relative_name(root, &path);
-            if file == HOME {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-            for line in production_lines(&text) {
-                for (quote, before) in literals(line) {
-                    if is_debug_label(before) {
-                        continue;
-                    }
-                    if names.contains(&quote) && !registered_elsewhere(&file, quote) {
-                        found
-                            .entry(quote.to_string())
-                            .or_default()
-                            .push(format!("{file}: {}", line.trim()));
-                    }
-                }
-            }
-        }
-    }
-    found
+/// The wall: every name `ALL` carries, spelled nowhere but its declaration.
+///
+/// `ALL` is what consumers use, so it is what this gate follows: a role added
+/// there is counted here without anyone remembering to edit this file.
+/// `Debug`'s field labels are not data and are skipped by the shared reader.
+fn wall() -> Wall<'static> {
+    Wall::new(SUBJECT, WHY)
+        .declared(
+            cog_core::roles::ALL
+                .iter()
+                .map(|name| Declared::new(*name, *name).owned_by(HOME))
+                .collect(),
+        )
+        .skip_debug_labels()
+        .floor(5)
+        .ceiling(200)
 }
 
 #[test]
 fn every_role_name_is_spelled_in_the_place_it_is_declared() {
-    let names = declared();
-    assert!(
-        names.len() >= 5,
-        "只从 cog_core::roles::ALL 读到 {} 个名字，这条判据没有题目",
-        names.len()
-    );
-
-    let mut rendered = Vec::new();
-    let mut total = 0;
-    for (name, hits) in sites(&repo_root(), &names) {
-        total += hits.len();
-        let mut block = format!("  {name}（{} 处）", hits.len());
-        for hit in hits.iter() {
-            block.push_str("\n      ");
-            block.push_str(hit);
-        }
-        rendered.push(block);
-    }
-
-    assert!(
-        total < 200,
-        "数出 {total} 处角色名，比这棵树里可能有的多得多，说明读错了段落"
-    );
-    assert!(
-        rendered.is_empty(),
-        "这些行把角色名又写了一遍。改名时改一处不会报错：按旧名字取 schema 的\
-         那一侧拿到 `None`，按旧名字找 checkpoint 的那一侧什么也找不到，两者\
-         都不算失败。改成读 `cog_core::roles` 里的声明：\n{}",
-        rendered.join("\n")
-    );
-}
-
-/// 豁免留着而现场没了，就是一张通行证留在没人走的路口：同一个词下次真的
-/// 被写成第二处拼写时，没有人拦。
-#[test]
-fn an_exemption_that_no_longer_matches_a_site_is_stale() {
-    let root = repo_root();
-    let mut absent = Vec::new();
-    for (file, value, why) in SAME_WORD_DIFFERENT_THING {
-        let text =
-            std::fs::read_to_string(root.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
-        let still_there = production_lines(&text)
-            .into_iter()
-            .any(|line| literals(line).into_iter().any(|(quote, _)| quote == *value));
-        if !still_there {
-            absent.push(format!("  {file}: {value}（{why}）"));
-        }
-    }
-    assert!(
-        absent.is_empty(),
-        "这些豁免已经不指向任何一处拼写了：\n{}",
-        absent.join("\n")
-    );
+    let sites = wall().sites(&repo_root());
+    // A listed site that stops existing is reported here too: an exemption
+    // outliving its site is a licence nobody reviewed.
+    Report::new(SUBJECT, WHY, &sites, SAME_WORD_DIFFERENT_THING).assert_clean();
 }
 
 #[test]
@@ -177,39 +80,10 @@ fn the_declaration_list_covers_every_name_declared_in_the_module() {
         .filter(|line| line.trim_start().starts_with("pub const "))
         .filter(|line| line.contains(": &str = "))
         .count();
+    let declared = cog_core::roles::ALL.len();
     assert_eq!(
-        consts,
-        declared().len(),
-        "roles 模块声明了 {consts} 个角色名，ALL 里只有 {} 个：漏掉的那个没有\
+        consts, declared,
+        "roles 模块声明了 {consts} 个角色名，ALL 里只有 {declared} 个：漏掉的那个没有\
          任何消费者读得到，也没人拦得住别人重新拼一遍",
-        declared().len()
     );
-}
-
-#[test]
-fn the_reader_ignores_prose_and_longer_names() {
-    let values = |line: &str| -> Vec<String> {
-        literals(line)
-            .into_iter()
-            .map(|(value, _)| value.to_string())
-            .collect()
-    };
-    assert_eq!(values(r#"let a = "planner";"#), vec!["planner"]);
-    // 整条字面量才算：句子和更长的名字都不是同一处拼写。
-    assert!(!values(r#"let a = "the planner decides";"#).contains(&"planner".to_string()));
-    assert!(!values(r#"let a = "planner_v2";"#).contains(&"planner".to_string()));
-    // `Debug` 的字段标签不是角色名的第二处拼写。
-    let label = r#".field("moderator", &self.moderator.is_some())"#;
-    let (quote, before) = literals(label)[0];
-    assert_eq!(quote, "moderator");
-    assert!(is_debug_label(before));
-    // 注释行不参与统计。
-    let text = "// let role = \"planner\";\nfn f() { let role = \"planner\"; }\n";
-    let counted: Vec<&str> = production_lines(text)
-        .into_iter()
-        .flat_map(literals)
-        .filter(|(value, before)| *value == "planner" && !is_debug_label(before))
-        .map(|(value, _)| value)
-        .collect();
-    assert_eq!(counted, vec!["planner"]);
 }

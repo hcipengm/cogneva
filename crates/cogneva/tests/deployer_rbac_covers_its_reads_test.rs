@@ -60,6 +60,16 @@ use cog_reflection::{workload_kind_of_resource, WORKLOAD_KINDS};
 /// of them.
 const RBAC: &str = "deploy/k3s/evolution-rbac.yaml";
 
+/// The manifest that carries the same identity's **cluster-scoped** rights.
+///
+/// A namespace `Role` cannot grant a cluster-scoped object: a request for
+/// `nodes` is judged against ClusterRoleBindings only, and a rule spelled in
+/// the namespace Role would be a grant that never applies. Reading the cluster
+/// half from the one manifest that writes it makes the judgement equal to the
+/// union the API server applies, instead of reporting a working read as
+/// missing a grant.
+const CLUSTER_RBAC: &str = "deploy/k3s/gitops-puller-rbac.yaml";
+
 const CRATE_SRC: &str = "crates/cog-reflection/src";
 
 /// The ServiceAccount both Job specs and the deployer pod run under.
@@ -79,6 +89,9 @@ const SCANNED: &[&str] = &[
     // deployer: it reads a claim's sizes and patches its request, and the two
     // admission bounds that cap that request.
     "crates/cog-reflection/src/volume_capacity.rs",
+    // Spawned from the same plugin, in the same process and under the same
+    // ServiceAccount: it reads the workload shapes and patches their request.
+    "crates/cog-reflection/src/workload_resources.rs",
 ];
 
 /// Crate sources that do talk to the cluster under a **different** principal.
@@ -317,6 +330,32 @@ fn role() -> Role {
     held[0].clone()
 }
 
+/// The ClusterRoles bound to the same identity, from [`CLUSTER_RBAC`].
+fn cluster_roles() -> Vec<Role> {
+    let file = roles_in(CLUSTER_RBAC);
+    let mut held = Vec::new();
+    for binding in &file.bindings {
+        if binding.kind != "ClusterRoleBinding"
+            || !binding.subjects.iter().any(|s| s == SERVICE_ACCOUNT)
+        {
+            continue;
+        }
+        for role in file.roles.iter().filter(|r| r.name == binding.role_name) {
+            assert_eq!(
+                role.kind, "ClusterRole",
+                "{CLUSTER_RBAC} 的 ClusterRoleBinding 指向 {} {}：集群绑定只能引用 ClusterRole",
+                role.kind, role.name
+            );
+            held.push(role.clone());
+        }
+    }
+    assert!(
+        !held.is_empty(),
+        "{CLUSTER_RBAC} 里没有绑给 {SERVICE_ACCOUNT} 的 ClusterRole：集群作用域的读没人授权"
+    );
+    held
+}
+
 impl Role {
     /// A right is held when *some* rule for that object holds it, because the
     /// API server answers from the union of every rule matching the request.
@@ -381,6 +420,45 @@ struct Command {
     verb: String,
     sub: Option<String>,
     slot: Option<String>,
+    /// `kubectl get --raw <path>`: the element after `--raw`, which holds the
+    /// request path. Such a command names no resource word -- the path *is* the
+    /// request -- so it is resolved against [`RAW_PATHS`] instead.
+    raw: Option<String>,
+}
+
+/// A request written as `kubectl get --raw <path>`.
+///
+/// The command carries no resource word: the API server resolves the right from
+/// the URL, and it resolves it to a **subresource**. The one path this loop
+/// reads is metrics-server's pod list, which lands on `metrics.k8s.io/pods`.
+///
+/// The path that used to be here, `/api/v1/nodes/<node>/proxy/stats/summary`,
+/// was recorded against `nodes/stats` and that record was wrong: `/proxy/*`
+/// resolves to `nodes/proxy`, so a role holding only `nodes/stats` got 403 on
+/// every read (2026-11-19, one k3s). `nodes/proxy` also proxies to every other
+/// kubelet endpoint, so the chart does not grant it -- the fallback was removed
+/// from the loop instead of widening the grant. Each row names the literal the
+/// path is built from and the grant the request needs, so a path that moves to
+/// another subresource without its row moving stops matching.
+struct RawPath {
+    literal: &'static str,
+    group: &'static str,
+    resource: &'static str,
+    verbs: &'static [&'static str],
+}
+
+const RAW_PATHS: &[RawPath] = &[RawPath {
+    literal: "/apis/metrics.k8s.io/v1beta1/pods",
+    group: "metrics.k8s.io",
+    resource: "pods",
+    verbs: &["get"],
+}];
+
+/// Whether `body` really issues this request, in either spelling the loop uses:
+/// a formatted path, or the path as an argv literal right after `--raw`.
+fn raw_literal_in(body: &str, literal: &str) -> bool {
+    body.contains(&format!("format!(\"{literal}\")"))
+        || body.contains(&format!("\"--raw\", \"{literal}\""))
 }
 
 /// A quoted string that is the whole element, else `None` (an expression).
@@ -519,12 +597,17 @@ fn commands_in(file: &str, src: &str) -> Vec<Command> {
                 ),
                 _ => (None, els.get(k + 1).cloned()),
             };
+            let raw = (word == "get"
+                && slot.as_deref().and_then(literal).as_deref() == Some("--raw"))
+            .then(|| els.get(k + 2).cloned())
+            .flatten();
             out.push(Command {
                 file: file.to_string(),
                 line,
                 verb: word,
                 sub,
                 slot,
+                raw,
             });
         }
     }
@@ -543,6 +626,7 @@ const SHORTCUTS: &[(&str, &str, &str)] = &[
     ("service", "", "services"),
     ("serviceaccount", "", "serviceaccounts"),
     ("pod", "", "pods"),
+    ("node", "", "nodes"),
     ("pvc", "", "persistentvolumeclaims"),
     ("resourcequota", "", "resourcequotas"),
     ("limitrange", "", "limitranges"),
@@ -654,6 +738,15 @@ const COMPUTED: &[Computed] = &[
         words: Words::Literal(&["deployment", "statefulset", "daemonset", "job"]),
         guard: Guard::Text("kind_arg"),
     },
+    // The resource loop's own word for the object it patches. It is the table's
+    // word, not a second `match`: the guard is the delegation line, so a local
+    // mapping that comes back (with its silent `deployment` fallback) stops the
+    // words from being the table's and this row says so.
+    Computed {
+        expr: "kind_arg(&workload.kind)",
+        words: Words::WorkloadRows,
+        guard: Guard::Text("crate::mainline_rollout::workload_resource(kind)"),
+    },
     // Reading back a field this revision removed: `kubectl get <kind>` on an
     // object the previous bundle itself applied. The reachable words are the
     // delivery face, not this crate's argv, and that face already owes
@@ -664,6 +757,37 @@ const COMPUTED: &[Computed] = &[
     // second copy of a filter that drops Roles and Secrets; two copies can
     // disagree while both stay green, which is the shape this file exists to
     // refuse.
+    // The rollout target's own word, on every call that touches the target:
+    // the sandbox executor is a StatefulSet, so the word travels with the
+    // target instead of each call site assuming `deployment`. The reachable
+    // population is this crate's workload table -- a target whose word is not
+    // in it is refused while the bundle is assembled and again when the
+    // manifest is claimed ("is not a workload kind this crate can address"),
+    // so no word outside the table can reach kubectl through a target. The
+    // guard is that this file still resolves words through that table; both
+    // files that address a target do.
+    Computed {
+        expr: "&t.resource",
+        words: Words::WorkloadRows,
+        guard: Guard::Text("workload_kind_of_resource("),
+    },
+    // The same word in `TYPE/NAME` form, which is what `rollout` takes. It is
+    // `format!("{}/{}", self.resource, self.deployment)` and nothing else, so
+    // the population is the row above, read once more.
+    Computed {
+        expr: "&t.object()",
+        words: Words::WorkloadRows,
+        guard: Guard::Text("workload_kind_of_resource("),
+    },
+    // A rollback writes back the template it snapshotted, and the snapshot
+    // carries the target's word rather than the caller's assumption: restoring
+    // a StatefulSet through `deployment/...` would replace nothing and still
+    // report a successful restart.
+    Computed {
+        expr: "&snap.resource",
+        words: Words::WorkloadRows,
+        guard: Guard::Text("workload_kind_of_resource("),
+    },
     Computed {
         expr: "&r.resource",
         words: Words::Delegated {
@@ -791,7 +915,16 @@ fn slot_words(
     used: &mut BTreeSet<&'static str>,
 ) -> Result<Vec<(&'static str, &'static str)>, String> {
     if let Some(word) = literal(slot) {
-        return Ok(vec![resolve_word(&word)?]);
+        // `kubectl get a,b,c` is one call that needs a grant for each word: the
+        // list is a shorthand for the objects, not a fourth kind. Splitting it
+        // here keeps the population the same as writing three calls, which is
+        // what the RBAC role has to carry either way.
+        return word
+            .split(',')
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+            .map(resolve_word)
+            .collect();
     }
     if let Some(word) = type_name_in(slot) {
         return Ok(vec![resolve_word(&word)?]);
@@ -900,7 +1033,11 @@ fn obligations(
     }
 }
 
-fn needed_for(file: &'static str, used: &mut BTreeSet<&'static str>) -> Vec<Obligation> {
+fn needed_for(
+    file: &'static str,
+    used: &mut BTreeSet<&'static str>,
+    raw_used: &mut BTreeSet<&'static str>,
+) -> Vec<Obligation> {
     let src = read_repo(file);
     let body = production_source(&src);
     let mut needed = Vec::new();
@@ -913,6 +1050,27 @@ fn needed_for(file: &'static str, used: &mut BTreeSet<&'static str>) -> Vec<Obli
                 cmd.file,
                 cmd.line
             );
+            continue;
+        }
+        if let Some(path) = cmd.raw.as_deref() {
+            // 路径是拼出来的表达式（`&path`），读不出资源词；它落在哪个子资源由
+            // apiserver 从 URL 解析。路径的字面量在文件里找得到的那一行才是它。
+            let matched: Vec<&RawPath> = RAW_PATHS
+                .iter()
+                .filter(|row| raw_literal_in(&body, row.literal))
+                .collect();
+            assert_eq!(
+                matched.len(),
+                1,
+                "{}:{} 的 get --raw {path} 对上了 {} 行登记：一条原始请求读的是哪个子资源，\
+                 登记表里必须正好回答一次",
+                cmd.file,
+                cmd.line,
+                matched.len()
+            );
+            let row = matched[0];
+            raw_used.insert(row.literal);
+            needed.push((row.group, row.resource, row.verbs.to_vec()));
             continue;
         }
         let Some(slot) = cmd.slot.as_deref() else {
@@ -950,11 +1108,13 @@ fn needed_for(file: &'static str, used: &mut BTreeSet<&'static str>) -> Vec<Obli
 #[test]
 fn the_role_grants_every_resource_the_loop_addresses() {
     let role = role();
+    let cluster = cluster_roles();
     let mut used = BTreeSet::new();
+    let mut raw_used = BTreeSet::new();
     let mut needed: BTreeMap<(&'static str, &'static str), BTreeSet<&'static str>> =
         BTreeMap::new();
     for file in SCANNED {
-        for (group, resource, verbs) in needed_for(file, &mut used) {
+        for (group, resource, verbs) in needed_for(file, &mut used, &mut raw_used) {
             needed
                 .entry((group, resource))
                 .or_default()
@@ -971,14 +1131,21 @@ fn the_role_grants_every_resource_the_loop_addresses() {
     let mut missing = Vec::new();
     for ((group, resource), verbs) in &needed {
         let verbs: Vec<&str> = verbs.iter().copied().collect();
-        if !role.grants(group, resource, &verbs) {
+        // 权利是两个作用域的并集：命名空间内的 Role 加上绑给同一个身份的
+        // ClusterRole。API server 按并集判权，只读一半会把真能跑通的读报成缺授。
+        if !role.grants(group, resource, &verbs)
+            && !cluster
+                .iter()
+                .any(|held| held.grants(group, resource, &verbs))
+        {
             missing.push(format!("{group}/{resource} 需要 {verbs:?}"));
         }
     }
     assert!(
         missing.is_empty(),
-        "{} 没有覆盖部署器会走的路径，少了就是在真需要的那一刻报权限被拒: {missing:?}",
-        role.name
+        "{} 与 {:?} 都没有覆盖部署器会走的路径，少了就是在真需要的那一刻报权限被拒: {missing:?}",
+        role.name,
+        cluster.iter().map(|r| r.name.as_str()).collect::<Vec<_>>()
     );
 
     // 表里每一行都得真的被用上：没人用的那一行是过期的判断，会替下一处
@@ -990,6 +1157,13 @@ fn the_role_grants_every_resource_the_loop_addresses() {
             row.expr
         );
     }
+    for row in RAW_PATHS {
+        assert!(
+            raw_used.contains(row.literal),
+            "原始请求登记表里的 {:?} 没有出现在任何一条命令里：这一行该删了",
+            row.literal
+        );
+    }
 }
 
 /// The scan has to be able to see the commands it is judging.
@@ -998,13 +1172,14 @@ fn the_scan_sees_the_commands_it_is_supposed_to() {
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     let mut resolved: BTreeSet<(&'static str, &'static str)> = BTreeSet::new();
     let mut used = BTreeSet::new();
+    let mut raw_used = BTreeSet::new();
     for file in SCANNED {
         let src = read_repo(file);
         let body = production_source(&src);
         for cmd in commands_in(file, &body) {
             *seen.entry(cmd.verb.clone()).or_default() += 1;
         }
-        for (group, resource, _) in needed_for(file, &mut used) {
+        for (group, resource, _) in needed_for(file, &mut used, &mut raw_used) {
             resolved.insert((group, resource));
         }
     }
@@ -1018,11 +1193,14 @@ fn the_scan_sees_the_commands_it_is_supposed_to() {
 
     // 两个真出过事的资源词必须在解析结果里：一个真的少授过（resourcequotas
     // 报 Forbidden），一个是经 kubectl 自己那一跳读出去的（replicasets）。
+    // `metrics.k8s.io/pods` 只有一种来路——`get --raw` 的路径——所以它在这里
+    // 就是在说那条形态被真的读到了，而不是登记表自己跟自己说话。
     for word in [
         ("", "resourcequotas"),
         ("", "persistentvolumeclaims"),
         ("batch", "jobs"),
         ("apps", "replicasets"),
+        ("metrics.k8s.io", "pods"),
     ] {
         assert!(
             resolved.contains(&word),
@@ -1188,26 +1366,6 @@ fn const_str_value(src: &str, name: &str) -> Option<String> {
     declared_name(&src[start..end])
 }
 
-/// `const NAME: [&str; N] = ["a", "b", …];` 里的那些字符串，引用声明的按名字解析。
-fn const_string_list(src: &str, name: &str) -> Vec<String> {
-    let needle = format!("const {name}: ");
-    let Some(start) = src.find(&needle) else {
-        return Vec::new();
-    };
-    let rest = &src[start + needle.len()..];
-    let Some(open) = rest.find("= [") else {
-        return Vec::new();
-    };
-    let body = &rest[open + 3..];
-    let Some(close) = body.find(']') else {
-        return Vec::new();
-    };
-    body[..close]
-        .split(',')
-        .filter_map(|element| literal(element).or_else(|| declared_name(element)))
-        .collect()
-}
-
 /// `- name: KEY` 之后、下一个 env 条目之前那段里的 `value: "…"`。
 fn env_value(src: &str, key: &str) -> Option<String> {
     let needle = format!("- name: {key}\n");
@@ -1237,14 +1395,17 @@ fn quoted(src: &str, needle: &str) -> Option<String> {
 #[test]
 fn every_identity_that_can_publish_can_read_the_canary_base_names() {
     let revision = read_repo("crates/cog-reflection/src/live_revision.rs");
-    let names = const_string_list(&revision, "BASE_DEPLOYMENTS");
+    // 名单是一串 `(资源词, 名字)`：执行器是 StatefulSet，其余是 Deployment。
+    // 从这里读而不是从源码里抠字面量，是因为名字是拓扑常量而不是字符串——抠字面量
+    // 只会抠到资源词，四个名字一个都读不到。
+    let base = cog_reflection::live_revision::BASE_DEPLOYMENTS;
     assert_eq!(
-        names.len(),
+        base.len(),
         4,
-        "现役 rev 的四个主负载名单读出来是 {names:?}：这条判据靠它才算有内容"
+        "现役 rev 的四个主负载名单读出来是 {base:?}：这条判据靠它才算有内容"
     );
     assert!(
-        revision.contains("\"deployment/{name}\""),
+        revision.contains("\"{resource}/{name}\""),
         "这份读法不再按名读：resourceNames 授权下集合级 list 必被拒，而读不到只静默退回浮动 tag"
     );
 
@@ -1303,12 +1464,13 @@ fn every_identity_that_can_publish_can_read_the_canary_base_names() {
             .flat_map(|r| r.rules)
             .collect();
         assert!(!rules.is_empty(), "{who} 一条规则都没读到");
-        for name in &names {
+        for (resource, name) in base {
+            let plural = format!("{resource}s");
             assert!(
                 rules
                     .iter()
-                    .any(|r| r.grants_named("apps", "deployments", "get", name)),
-                "{who} 读不到 deployment/{name}：推送端会把它当成浮动 tag 的基底"
+                    .any(|r| r.grants_named("apps", &plural, "get", name)),
+                "{who} 读不到 {resource}/{name}：推送端会把它当成浮动 tag 的基底"
             );
         }
     }

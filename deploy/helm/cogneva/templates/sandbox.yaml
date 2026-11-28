@@ -1,50 +1,39 @@
 {{- if .Values.sandboxExecutor.enabled }}
-# 沙箱执行器专属卷：执行器自有的裸仓库、每任务工作树与共享编译缓存都在这里，
-# 与进化侧卷物理分离，两边不共享工作树。
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: cogneva-sandbox-pvc
-  namespace: {{ include "cogneva.namespace" . }}
-  labels:
-    {{- include "cogneva.labels" . | nindent 4 }}
-    app.kubernetes.io/component: sandbox-executor
-  annotations:
-    # 卸载不销毁：工作树与裸仓库跨重装继续可用。
-    helm.sh/resource-policy: keep
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: {{ .Values.sandboxExecutor.storage }}
-  {{- with .Values.sandboxExecutor.storageClass }}
-  storageClassName: {{ . }}
-  {{- end }}
----
 # 沙箱执行器：主应用与进化 Pod 共用的零凭证工具执行面（run_command/read_file/
-# write_file）统一路由到本 Pod，命令与文件 IO 不发生在持有凭证的业务 Pod 内。
+# write_file）统一路由到执行器 Pod，命令与文件 IO 不发生在持有凭证的业务 Pod 内。
 # 不挂载任何 Secret、不自动挂载 ServiceAccount token——Pod 边界即隔离边界。
+#
+# **一副副本一块卷。** 工作树只长在某一副副本的卷上，所以「谁持有这棵树」以前靠
+# 「只有一个副本」保证，副本数因此写死 1。现在客户端按 agent 把一条 lane 钉在一副
+# 副本上（`cog-extension` 的 `executor_lease`），归属跟着 lane 走，副本数于是回到
+# 它本来该是的东西：部署里的一个数。每加一副，就多一块卷、一份内存界、一条编译队
+# ——扩的是容量，拓扑不变；每副副本自己从公开仓库 seed 裸仓，副本之间不共享状态，
+# 所以任何一副都能被删掉重来。
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: cogneva-sandbox-executor
   namespace: {{ include "cogneva.namespace" . }}
   labels:
     {{- include "cogneva.labels" . | nindent 4 }}
     app.kubernetes.io/component: sandbox-executor
+  annotations:
+    # 副本数跟**队**走，不跟节点数走：每副副本自己答 `GET /lane`（几位子、谁占着、
+    # 谁在等），workload-resources 回路按「在跑 + 在等」除以单副位子数改
+    # `spec.replicas`。下面那个数是安装时的种子，第一拍之后由队回答——执行器扩的是
+    # 容量，不是失败域，所以拓扑那条律不适用。
+    cogneva.io/replica-policy: queue
 spec:
   replicas: {{ .Values.sandboxExecutor.replicas }}
-  # No surge: every profile runs a single replica on a single node, so a surging
-  # pod has nowhere to be scheduled and the rollout times out. Terminating the
-  # old pod first frees its request, at the cost of a brief restart window.
-  strategy:
+  # 序号是身份：同一个序号的 Pod 重建后拿到同一块卷，那块卷上「哪棵树属于哪个
+  # 任务」因此跨重启仍然成立。DNS 由下面的无头 Service 给出，客户端按序号拼地址。
+  serviceName: cogneva-sandbox-executor-pods
+  # 并行起停：副本之间不共享任何状态，让 0 号就绪才起 1 号只会把扩容变成一条链。
+  podManagementPolicy: Parallel
+  # 一次换一副，旧 Pod 先走：StatefulSet 不会让同号的两份 Pod 并存，所以
+  # 「一块卷不会被两份 Pod 同时写」由对象本身保证，不靠策略参数凑。
+  updateStrategy:
     type: RollingUpdate
-    rollingUpdate:
-      {{- /* lit: 0 fixed — maxSurge 0: a sandbox pod holds a workspace and must not be doubled during a rollout */}}
-      maxSurge: 0
-      {{- /* lit: 1 fixed — maxUnavailable 1 with maxSurge 0: the rollout shape that keeps a sandbox pod from ever being doubled */}}
-      maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: cogneva
@@ -76,7 +65,6 @@ spec:
           command:
             - sh
             - -c
-            {{- /* lit: 124 fixed — coreutils timeout's exit status; a shell contract, not a dial */}}
             - |
               set -e
               root=/opt/cogneva/sandbox
@@ -93,33 +81,27 @@ spec:
               if [ ! -f "$root/repo.git/HEAD" ]; then
                 # 种子失败不阻塞启动：主进程见裸仓缺失即回落无工作树模式，
                 # 下次重启 init 再试，离线集群不会因此永久卡在 Init 阶段。
-                # http.connectTimeout/lowSpeed 给网络操作兜底，否则离线时
-                # git 会长时间挂在连接上拖慢 Init 与整 Pod 就绪。
-                # 但连接超时与低速阈值管不住"带宽很低但在动"的传输：实测一次
-                # fetch 跑了 14 分钟没完，把整段启动预算吃光、Pod 被判启动超时
-                # （一次网络慢被记成版本缺陷）。所以每个走公网的 git 调用再加
-                # 一层挂钟上界：单次尝试最多 `workspaceFetch.timeoutSecs` 秒（实测正常读数秒级到几十秒，
-                # 取数倍余量）。超了就当这个镜像不可用、走下面已有的失败分支，
-                # 语义不变。代价：真的很大的传输可能一次传不完而被放弃，下一轮
-                # 从零再来（被杀掉的 fetch 不落 refs），极端网络下裸仓会停在旧
-                # main——启动可用性优先于基线新鲜度，与"种子失败不阻塞启动"同向。
+                # 这里的界全是「网络还在不在动」：`http.connectTimeout` 管镜像
+                # 根本不答，`http.lowSpeedLimit/lowSpeedTime` 管传输速率掉到
+                # `workspaceFetch.lowSpeedLimitBytesPerSec` 以下、并一直持续到
+                # `workspaceFetch.lowSpeedSecs`。没有一道按「跑了多久」收尾的钟——
+                # 实测一次 fetch 在很慢但仍在推进的链路上一度跑到十四分钟，按挂钟
+                # 砍掉它只是把已经传过的字节作废、下一轮从零再来。真死的传输由 git
+                # 自己那两条界判。
                 for m in $(echo "$mirrors" | tr ',' ' '); do
                   echo "sandbox volume empty; seeding bare repo from $m ..."
+                  {{- /* lit: 0 fixed — the shell's own success status: `rc=0` and `[ "$rc" = 0 ]` are how this seed script asks whether git exited cleanly, which no deployment configures */}}
                   rc=0
-                  /usr/bin/timeout {{ .Values.workspaceFetch.timeoutSecs }} git -c http.connectTimeout={{ .Values.workspaceFetch.connectTimeoutSecs }} -c http.lowSpeedLimit={{ .Values.workspaceFetch.lowSpeedLimitBytesPerSec }} -c http.lowSpeedTime={{ .Values.workspaceFetch.lowSpeedSecs }} clone --bare "$m" /tmp/seed.git || rc=$?
+                  git -c http.connectTimeout={{ .Values.workspaceFetch.connectTimeoutSecs }} -c http.lowSpeedLimit={{ .Values.workspaceFetch.lowSpeedLimitBytesPerSec }} -c http.lowSpeedTime={{ .Values.workspaceFetch.lowSpeedSecs }} clone --bare "$m" /tmp/seed.git || rc=$?
                   if [ "$rc" = 0 ]; then
                     cp -a /tmp/seed.git/. "$root/repo.git/"
                     rm -rf /tmp/seed.git
                     break
                   fi
-                  if [ "$rc" = 124 ]; then
-                    echo "WARN: sandbox bare repo seed from $m gave up after the {{ .Values.workspaceFetch.timeoutSecs }}s bound (transfer slower than the bound, or the mirror never answered)"
-                  else
-                    echo "WARN: sandbox bare repo seed from $m failed (rc=$rc)"
-                  fi
+                  echo "WARN: sandbox bare repo seed from $m failed (rc=$rc)"
                   rm -rf /tmp/seed.git
                 done
-                [ -f "$root/repo.git/HEAD" ] || echo "WARN: sandbox bare repo seed failed on every mirror (no mirror answered within the bound); executor starts without per-task worktrees"
+                [ -f "$root/repo.git/HEAD" ] || echo "WARN: sandbox bare repo seed failed on every mirror (no mirror answered); executor starts without per-task worktrees"
               fi
               if [ -f "$root/repo.git/HEAD" ]; then
                 for m in $(echo "$mirrors" | tr ',' ' '); do
@@ -128,15 +110,11 @@ spec:
                   # +main:main advances the local main that task worktrees are cut
                   # from; a plain fetch would only update remote-tracking refs.
                   rc=0
-                  /usr/bin/timeout {{ .Values.workspaceFetch.timeoutSecs }} git --git-dir="$root/repo.git" -c http.connectTimeout={{ .Values.workspaceFetch.connectTimeoutSecs }} -c http.lowSpeedLimit={{ .Values.workspaceFetch.lowSpeedLimitBytesPerSec }} -c http.lowSpeedTime={{ .Values.workspaceFetch.lowSpeedSecs }} fetch upstream --tags --force '+main:main' || rc=$?
+                  git --git-dir="$root/repo.git" -c http.connectTimeout={{ .Values.workspaceFetch.connectTimeoutSecs }} -c http.lowSpeedLimit={{ .Values.workspaceFetch.lowSpeedLimitBytesPerSec }} -c http.lowSpeedTime={{ .Values.workspaceFetch.lowSpeedSecs }} fetch upstream --tags --force '+main:main' || rc=$?
                   if [ "$rc" = 0 ]; then
                     break
                   fi
-                  if [ "$rc" = 124 ]; then
-                    echo "WARN: sandbox seed fetch from $m gave up after the {{ .Values.workspaceFetch.timeoutSecs }}s bound (transfer slower than the bound, or the mirror never answered); trying the next mirror"
-                  else
-                    echo "WARN: sandbox seed fetch from $m failed (rc=$rc); trying the next mirror"
-                  fi
+                  echo "WARN: sandbox seed fetch from $m failed (rc=$rc); trying the next mirror"
                 done
                 git --git-dir="$root/repo.git" worktree prune || true
               fi
@@ -167,13 +145,26 @@ spec:
               value: sandbox
             - name: SANDBOX_EXECUTOR_PORT
               value: {{ .Values.sandboxExecutor.metricsPort | int | quote }}
+            # 卷名是 `<模板名>-<StatefulSet 名>-<序号>`，序号只在本 Pod 里知道；
+            # 下面的 claim 变量靠 `$(POD_NAME)` 展开拼出自己那块。K8s 只展开
+            # **本列表里排在前面**的变量，所以这一条必须留在使用它的两条之前。
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # 哪条网络策略管着这个 Pod 的出口。本轮进程读不到策略本体（那是 API
+            # 服务器那边的事），能报的是**部署声明的是哪一条**：把名字说出来，
+            # 对话里的边界面板就能把「部署声明」与「这一层管住」分成两句话，而审计
+            # 的人有据可查。名字与 templates/network-policy.yaml 里那条同名。
+            - name: SANDBOX_EGRESS_POLICY
+              value: cogneva-sandbox-executor-egress
             # 每任务工作树路由：真实 task id 锚定命令 cwd 与相对文件路径。
             - name: SANDBOX_WORKSPACES_ROOT
-              value: /opt/cogneva/sandbox/workspaces
+              value: {{ .Values.evolution.workspaces.root }}
             - name: SANDBOX_BARE_REPO
               value: /opt/cogneva/sandbox/repo.git
             - name: CARGO_TARGET_DIR
-              value: /opt/cogneva/sandbox/src/target
+              value: {{ .Values.evolution.workspaces.targetDir }}
             # 镜像里的 /usr/local/cargo 归 root，本 Pod 以非 root 跑，cargo 连
             # registry 缓存目录都建不出来——每条 cargo 命令第一步就失败，工具
             # 调用只剩反复试错。指向自有卷上的目录：可写，且已拉取的 registry
@@ -200,7 +191,7 @@ spec:
             # 界只在给路径的那一侧成立。声明量本身是部署的输入，所以由这里传下去，
             # 不是让 Pod 去猜（目录型卷的 `statvfs` 报的是宿主盘，不是这张 claim）。
             - name: SANDBOX_VOLUME_CLAIM
-              value: "cogneva-sandbox-pvc={{ .Values.sandboxExecutor.storage }}"
+              value: "sandbox-data-$(POD_NAME)={{ .Values.sandboxExecutor.storage }}"
             {{- if hasKey .Values.sandboxExecutor "buildCacheMaxBytes" }}
             # 钉死时要显式给（`0` = 只量不封顶）。`hasKey` 而不是 `with`：模板里
             # `0` 是零值，`with` 会把「只量不封顶」这个选择读成「没配」。
@@ -215,7 +206,7 @@ spec:
             # 挂载表排除，不在这里重复声明。
             - name: COGNEVA_DATA_VOLUME_MOUNTS
               value: |
-                cogneva-sandbox-pvc=/opt/cogneva/sandbox
+                sandbox-data-$(POD_NAME)=/opt/cogneva/sandbox
             {{- if .Values.hostDocuments.scopes }}
             {{- $mount := required "hostDocuments.mountPath is required when hostDocuments.scopes is set" .Values.hostDocuments.mountPath }}
             {{- $pairs := list }}
@@ -273,6 +264,11 @@ spec:
               value: {{ .Values.hostDocuments.assistBodyBytes | int64 | quote }}
             - name: HOST_DOCS_ASSIST_MAX_CANDIDATES
               value: {{ .Values.hostDocuments.assistMaxCandidates | int64 | quote }}
+            # 受审通道自己那条正文上限。执行器用它给探针封顶：超过它的问题注定被
+            # 通道拒，而那道拒绝在读数面上与"上游撑不下"同形。两个值同源一次下发，
+            # 各写一个数时执行器会一直探到通道拒绝为止。
+            - name: HOST_DOCS_ASSIST_AUDIT_BUDGET_BYTES
+              value: {{ .Values.securityGateway.auditedLlmMaxBodyBytes | int64 | quote }}
             {{- end }}
           startupProbe:
             httpGet:
@@ -301,11 +297,8 @@ spec:
               mountPath: {{ $mount }}/{{ $name }}
             {{- end }}
             {{- end }}
+      {{- if .Values.hostDocuments.scopes }}
       volumes:
-        - name: sandbox-data
-          persistentVolumeClaim:
-            claimName: cogneva-sandbox-pvc
-        {{- if .Values.hostDocuments.scopes }}
         {{- range $name, $path := .Values.hostDocuments.scopes }}
         # type: Directory（非 DirectoryOrCreate）：宿主上路径不对就让 Pod 起不来，
         # 而不是替运维在宿主上建一个空目录——那会把"配置写错了"变成"整理出了
@@ -316,6 +309,47 @@ spec:
             type: Directory
         {{- end }}
         {{- end }}
+  # 每副副本自己的卷：卷名是 `<模板名>-<StatefulSet 名>-<序号>`，容器按 POD_NAME
+  # 拼出自己那块（见 SANDBOX_VOLUME_CLAIM）。裸仓库、每任务工作树与编译缓存在
+  # 同一块卷上——它们一起构成「这副副本能干什么」，分开反而要两张卷去对齐归属。
+  volumeClaimTemplates:
+    - metadata:
+        name: sandbox-data
+        labels:
+          {{- include "cogneva.labels" . | nindent 10 }}
+          app.kubernetes.io/component: sandbox-executor
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: {{ .Values.sandboxExecutor.storage }}
+        {{- with .Values.sandboxExecutor.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+---
+# 每副副本一个 DNS 名：`<sts>-<序号>.<本服务>.<ns>.svc`，客户端把本服务名解析成
+# **此刻存在的那些地址**再按 agent 把一条 lane 钉一个（见 app-config）。没有这一条，
+# 普通 Service 的负载均衡会把同一个 agent 的两条命令送到两副副本、两棵树。副本数
+# 变化只用重新解析，配置里写的是名字，不是一个数。
+apiVersion: v1
+kind: Service
+metadata:
+  name: cogneva-sandbox-executor-pods
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sandbox-executor
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: sandbox-executor
+  ports:
+    - name: executor
+      port: {{ .Values.sandboxExecutor.metricsPort }}
+      targetPort: executor
+      protocol: TCP
 ---
 apiVersion: v1
 kind: Service

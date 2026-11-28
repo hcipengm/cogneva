@@ -81,11 +81,10 @@ pub fn in_flight() -> usize {
 
 /// 等「在飞数归零」时两次读数之间的间隔。
 ///
-/// 它在飞的数量只在一头一尾各动一次，等的时长由调用方给的 `limit` 决定，这个
-/// 间隔只决定收尾快多少。
-// cap: bound — 一次收尾的等待，量的是「多久看一次」，不是「等多久」；等多久由调用方给
-const DRAIN_POLL: Duration = Duration::from_millis(50);
-
+/// 它在飞的数量只在一头一尾各动一次，等的时长由调用方给的 `limit` 决定；看多勤
+/// 用的是全树同一条读取周期（[`cog_core::progress::WATCH_TICK`]）——两处各写一个
+/// 节拍时，同一个「多久看一次」会有两个答案，而两个答案平时都读得通。
+///
 /// 等到手上的运行都结束，最多等 `limit`。返回是否等到了零。
 ///
 /// 轮询而不是条件变量：在飞的数量本来就只在一头一尾各动一次，而一个条件变量
@@ -100,7 +99,7 @@ pub async fn wait_drained(limit: Duration) -> bool {
         if now >= deadline {
             return false;
         }
-        tokio::time::sleep(DRAIN_POLL.min(deadline - now)).await;
+        tokio::time::sleep(cog_core::progress::WATCH_TICK.min(deadline - now)).await;
     }
 }
 
@@ -119,53 +118,6 @@ pub fn clear_signal_for_tests() {
     *slot().lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::OnceLock as TestOnceLock;
-    use tokio::sync::Mutex as AsyncMutex;
-
-    /// 两个测试共用同一个进程级计数器，串行跑才不会互相把对方的读数改成
-    /// 「别人也在飞」——同一个进程里其他测试调 `enter_run` 时，本模块的断言
-    /// 只比对**自己这一进一出**的差，不假设全局是零。
-    fn serial() -> &'static AsyncMutex<()> {
-        static SERIAL: TestOnceLock<AsyncMutex<()>> = TestOnceLock::new();
-        SERIAL.get_or_init(|| AsyncMutex::new(()))
-    }
-
-    #[tokio::test]
-    async fn a_run_in_flight_keeps_the_drain_waiting_until_it_ends() {
-        let _serial = serial().lock().await;
-        let before = in_flight();
-        let guard = enter_run();
-        assert_eq!(in_flight(), before + 1, "守卫活着就是在飞的那一个");
-        assert!(
-            !wait_drained(Duration::from_millis(120)).await,
-            "有运行没结束时，排空不能读成已完成"
-        );
-        drop(guard);
-        assert_eq!(in_flight(), before, "守卫落下，计数回到进闸之前");
-        if before == 0 {
-            assert!(
-                wait_drained(Duration::from_millis(120)).await,
-                "守卫落下之后排空完成"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn no_signal_installed_means_never_asked_to_stop() {
-        let _serial = serial().lock().await;
-        clear_signal_for_tests();
-        assert!(
-            !requested(),
-            "an ordinary embedded run is never told to stop"
-        );
-        let signal = ShutdownSignal::new();
-        install(signal.clone());
-        assert!(!requested());
-        signal.trigger();
-        assert!(requested(), "the installed signal is what the gate reads");
-        clear_signal_for_tests();
-    }
-}
+// 这两条读数判据（一进一出、装没装信号）在 `tests/drain_window.rs`：它们读的是
+// 进程级的在飞计数，而本 crate 的单元测试里别的用例也会进闸，同一个进程里断言
+// 只会读到别人的一进一出。那边各是一个进程。

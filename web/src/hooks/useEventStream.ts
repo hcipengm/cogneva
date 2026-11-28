@@ -1,13 +1,19 @@
 import { useEffect, useRef } from 'react';
-import { EventStreamClient } from '@/transport/websocket';
+import {
+  EventStreamClient,
+  type ChatCheckpointWire,
+  type ChatModelWire,
+  type ChatSandboxBoundaryWire,
+  type ResumedMessageWire,
+} from '@/transport/websocket';
 import { MockEventStreamClient } from '@/transport/mockStream';
 import {
   describeEvent,
   useStreamStore,
   type FrameSink,
 } from '@/store/streamStore';
-import type { ChatRole } from '@/types/events';
-import { useChatStore } from '@/store/chatStore';
+import { chatAttachment, type ChatRole } from '@/types/events';
+import { FIRST_SESSION, useChatStore } from '@/store/chatStore';
 import { agentFrame } from '@/store/liveAgents';
 import { alertFrame } from '@/store/liveAlerts';
 import { commsFrame } from '@/store/liveComms';
@@ -21,6 +27,8 @@ import { useFrameTickStore } from '@/store/frameTickStore';
 import { resourceKey } from '@/store/frameTick';
 import type { AgentEvent } from '@/types/events';
 import type { NotificationItem } from '@/api/client';
+import { usePermissionStore } from '@/store/permissionStore';
+import { useMemoryStore } from '@/store/memoryStore';
 
 /**
  * 一条消息里的纯文本。
@@ -89,6 +97,10 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
   const noteFrame = useStreamStore((state) => state.noteFrame);
   const noteUnrecorded = useStreamStore((state) => state.noteUnrecorded);
   const ingestChatFrame = useChatStore((state) => state.ingestFrame);
+  const applyChatResume = useChatStore((state) => state.applyResume);
+  const applyModel = useChatStore((state) => state.applyModel);
+  const applyCheckpoints = useChatStore((state) => state.applyCheckpoints);
+  const applyBoundary = useChatStore((state) => state.applyBoundary);
   const noteAgentFrame = useLiveAgentStore((state) => state.noteFrame);
   const noteAlertFrame = useLiveAlertStore((state) => state.noteFrame);
   const noteCommsFrame = useLiveCommsStore((state) => state.noteFrame);
@@ -323,12 +335,115 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
       for (const kind of touched) noteFaceTick(kind);
     };
 
+    /**
+     * 每一次连上（含重连）第一件事：把「我正在看的那一段」重新接上。
+     *
+     * 不接的话，断线时那一轮还在说，而这一页再也收不到它的下文——人看到的
+     * 是「网一抖，回答停在那儿了」。接上之后服务端先回一份快照，那一句接着写。
+     */
+    const resumeOpenSession = () => {
+      const active = useChatStore.getState().active;
+      if (active) clientRef.current?.send({ type: 'chat_resume', session_id: active });
+    };
+
+    const ingestChatResume = (sessionId: string | undefined, messages: ResumedMessageWire[]) => {
+      const session = sessionId || FIRST_SESSION;
+      applyChatResume(
+        session,
+        messages.flatMap((line) =>
+          line.message_id && typeof line.text === 'string'
+            ? [
+                {
+                  messageId: line.message_id,
+                  role: (line.role === 'user' ? 'user' : 'assistant') as ChatRole,
+                  text: line.text,
+                  thinking: typeof line.thinking === 'string' ? line.thinking : '',
+                  attachment: chatAttachment(line.attachment),
+                  ended: line.ended === true,
+                },
+              ]
+            : []
+        )
+      );
+    };
+
+    /**
+     * 这一段用哪只模型、还能选哪些。一次往返办两件事，所以两件事一起落：换完之后
+     * 手上立刻要有「现在用的是哪只」与「还能选哪些」。
+     */
+    const ingestChatModel = (wire: ChatModelWire) => {
+      const session = wire.session_id || FIRST_SESSION;
+      applyModel(session, wire.model ?? null, {
+        models: wire.models ?? [],
+        configured: wire.configured === true,
+        reason: wire.reason ?? null,
+      });
+    };
+
+    /**
+     * 这一段对话的检查点：清单，或者一次退回的结局。按会话落，与模型选择同一个
+     * 理由——它是这一段的状态，不是这一轮说出来的话。
+     */
+    const ingestChatCheckpoint = (wire: ChatCheckpointWire) => {
+      const session = wire.session_id || FIRST_SESSION;
+      applyCheckpoints(session, {
+        rows: (wire.rows ?? []).flatMap((row) =>
+          typeof row.turn === 'number'
+            ? [{ key: row.key ?? '', turn: row.turn, at: row.at ?? '' }]
+            : []
+        ),
+        hidden: wire.hidden ?? 0,
+        rewind: wire.rewind
+          ? {
+              turn: wire.rewind.turn ?? 0,
+              target: wire.rewind.target ?? 0,
+              applied: wire.rewind.applied === true,
+              files: (wire.rewind.files ?? []).flatMap((file) =>
+                file.path ? [{ path: file.path, change: file.change ?? 'modified' }] : []
+              ),
+              truncated: wire.rewind.truncated === true,
+            }
+          : null,
+        reason: wire.reason ?? null,
+      });
+    };
+
+    /**
+     * 命令跑在什么样的环境里。按会话落，与检查点同一个理由——它是部署的读数，
+     * 不是这一轮说出来的话。认不出形状的那一份按「读不到」落：把一行边界读丢了
+     * 比整份不画更糟，因为读丢的恰好可能是那个「不设边界」的词。
+     */
+    const ingestChatSandboxBoundary = (wire: ChatSandboxBoundaryWire) => {
+      const session = wire.session_id || FIRST_SESSION;
+      const boundary = wire.boundary;
+      applyBoundary(session, {
+        boundary: boundary
+          ? {
+              kind: boundary.kind ?? '',
+              isolated: boundary.isolated === true,
+              workdir: boundary.workdir ?? null,
+              lines: (boundary.lines ?? []).flatMap((line) =>
+                line.dimension && line.state
+                  ? [{ dimension: line.dimension, state: line.state, detail: line.detail ?? '' }]
+                  : []
+              ),
+            }
+          : null,
+        reason: wire.reason ?? null,
+      });
+    };
+
     const channels = channelKey ? channelKey.split(',') : [];
     const client = options.mock
       ? new MockEventStreamClient({
           onEvent: handleEvent,
           onChatFrame: ingestChatFrame,
-          onStatusChange: (status) => setConnectionStatus(status),
+          onChatSandboxBoundary: ingestChatSandboxBoundary,
+          onStatusChange: (status) => {
+            setConnectionStatus(status);
+            // 演示流也会断：接上时同样要把这一段续上。
+            if (status === 'open') resumeOpenSession();
+          },
         })
       : new EventStreamClient({
           url: options.url ?? '',
@@ -337,7 +452,66 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
           onChatFrame: ingestChatFrame,
           onNotification: (notification) =>
             notificationHandler.current?.(notification),
-          onStatusChange: (status) => setConnectionStatus(status),
+          // 问句直接进那一页的账：它不是一轮里的某一帧，而是一个正等在那里的
+          // 调用，丢进事件流只会被当成不认识的事件计数一次。
+          onPermissionRequest: (wire) => {
+            const id = wire.request_id;
+            if (!id) return;
+            usePermissionStore.getState().ask({
+              id,
+              sessionId: wire.session_id ?? 'default',
+              tool: wire.tool ?? '',
+              summary: wire.summary ?? '',
+              mode: wire.mode ?? 'default',
+              plan: wire.plan,
+              diff: wire.diff ?? null,
+            });
+          },
+          // 规则名单是设置，不进聊天流。少一格（没有号或没有工具名）的那一条不落：
+          // 没有号就撤不掉，画出来只是一个撤不掉的按钮。
+          onPermissionRules: (rules) => {
+            const known = rules.flatMap((rule) =>
+              rule.id && rule.tool
+                ? [
+                    {
+                      id: rule.id,
+                      tool: rule.tool,
+                      subject: rule.subject,
+                      allow: rule.allow === true,
+                      scope: rule.scope ?? 'session',
+                    },
+                  ]
+                : []
+            );
+            usePermissionStore.getState().setRules(known);
+          },
+          // 约定名单同理：少一格（没有号或没有原文）的那一条不落——没有号就撤
+          // 不掉，没有原文就画不出一句人写的话。
+          onChatResume: (resume) => ingestChatResume(resume.session_id, resume.messages ?? []),
+          onChatModel: ingestChatModel,
+          onChatCheckpoint: ingestChatCheckpoint,
+          onChatSandboxBoundary: ingestChatSandboxBoundary,
+          onOpen: resumeOpenSession,
+          onOwnerMemory: (entries) => {
+            const known = entries.flatMap((entry) =>
+              entry.id && entry.text ? [{ id: entry.id, text: entry.text }] : []
+            );
+            useMemoryStore.getState().setEntries(known);
+          },
+          onStatusChange: (status) => {
+            setConnectionStatus(status);
+            // 断了就把名单清回「还没读到」：上一条连接读到的规则不该留在屏幕上
+            // 冒充现状，而重连之后那一次请求会把真的名单拿回来。
+            if (status !== 'open') {
+              usePermissionStore.getState().forgetRules();
+              useMemoryStore.getState().clearEntries();
+              // 检查点同理：上一条连接读到的那几份不该留在屏幕上冒充现状。
+              useChatStore.getState().forgetCheckpoints();
+              // 边界同理，而且更甚：它是「命令跑在哪里」的读数，断开之后没人能
+              // 保证执行器还是那一副。
+              useChatStore.getState().forgetBoundaries();
+            }
+          },
           onError: (error) => {
             console.error('WebSocket error:', error);
           },
@@ -346,7 +520,19 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
     clientRef.current = client;
     client.connect();
 
+    // 换到另一段对话时，把这一段的现场接上。连上的那一刻接的是当时正在看的那一段；
+    // 之后人再切走、切回来，那一段可能还在说——不接的话，切回来看到的是切换前的
+    // 旧字，而回答已经往后写了。切走时不必退订：广播一直留着这一段的帧，再一次
+    // `chat_resume` 就是一份新快照，重复接同一条不会多出字。
+    let watching = useChatStore.getState().active;
+    const stopWatching = useChatStore.subscribe((state) => {
+      if (state.active === watching) return;
+      watching = state.active;
+      resumeOpenSession();
+    });
+
     return () => {
+      stopWatching();
       client.disconnect();
       clientRef.current = null;
     };
@@ -364,6 +550,8 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
     noteFrame,
     noteUnrecorded,
     ingestChatFrame,
+    applyChatResume,
+    applyModel,
     noteAgentFrame,
     noteAlertFrame,
     noteCommsFrame,

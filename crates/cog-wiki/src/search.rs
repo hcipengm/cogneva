@@ -189,7 +189,7 @@ impl<'a> ThreeTierSearch<'a> {
                 // result type has nowhere else to put it, and clipped to the
                 // same bound the retrieval read side applies so that the two
                 // do not hand one caller rows of two different sizes.
-                excerpt: clip(&hit.document.content, crate::WIKI_PAGE_PROMPT_CHARS),
+                excerpt: hit.document.content.clone(),
             })
             .collect())
     }

@@ -29,16 +29,21 @@ use crate::triage::{IssueTriage, TriageDecision};
 /// 段代码的两个实例，它们防的是同一件事——两个副本各自顺着同一批 issue 追问同一句话。
 pub const DISCOVERY_ROLE: &str = "issue_discovery";
 
-/// DAG-side timeout for a single assess task (must exceed the wait budget
-/// below so the poller gives up around the same time the task would be killed).
-// cap: bound — 必须长于下面的等待预算，这样轮询放弃与任务被杀几乎同时发生
-const ASSESS_TASK_TIMEOUT_SECS: u64 = 120;
+/// What a single assess task declares it will take. Nothing ends the row at
+/// this number; it must still exceed the wait budget below, so the poller's
+/// "I stopped waiting" is the statement a round hears, not the row's.
+// cap: fixed — 必须长于下面的等待预算，这样轮询放弃先于任何对行的看法
+// keep: 删掉后轮询放弃晚于对行的看法，一行被判超时时任务还在等；由「必须长于等待预算」兜住
+const ASSESS_TASK_DECLARED_SECS: u64 = 120;
 /// How long the discovery loop blocks waiting for an assess verdict before it
 /// gives up and falls back to the local heuristic this round.
-// cap: bound — 等这么久拿不到判词就落回本地启发式，这一轮不再等下去
+// cap: fixed — 等这么久拿不到判词就落回本地启发式，这一轮不再等下去
+// keep: 删掉后拿不到判词就一直等，这一轮不落回本地启发式；由「拿不到就落回本地启发式」兜住
+// wall: 等=一次评估给出判词 / 等不到=这一轮落回本地启发式，不再等下去；判词没来不等于判词是「否」 / 续跑=能，下一轮重新等
 const ASSESS_WAIT_TIMEOUT_SECS: u64 = 100;
 /// Poll interval while waiting for the assess task to complete.
-// cap: bound — 等待期间多久问一次
+// cap: fixed — 等待期间多久问一次
+// keep: 删掉后等待期间问得太密或太疏，判词到达与发现之间没有格；由「等待期间多久问一次」兜住
 const ASSESS_POLL_INTERVAL_MS: u64 = 500;
 /// Judgement-logic epoch mixed into the assess task id hash. Bump it when the
 /// judge prompt/logic changes, or after a bulk queue reset, to force one
@@ -80,18 +85,21 @@ Reply with ONE JSON object only, no prose, no code fence:\n\
 priority is 1 (highest) to 5 (lowest). When decision is not `clarify`, leave question empty. \
 Write the question in the same language the reporter used.";
 /// Maximum cross-validation tasks running concurrently for this instance.
-// cap: bound — 这个实例同时能跑几条交叉验证
+// cap: fixed — 这个实例同时能跑几条交叉验证
+// keep: 删掉后这个实例同时跑任意多条交叉验证，把上游与内存一起压住；由「这个实例同时能跑几条」兜住
 const MAX_CROSS_VALIDATION_INFLIGHT: usize = 3;
-/// DAG-side timeout for one cross-validation task (apply + workspace tests +
-/// optional eval A/B in the sandbox).
-// cap: bound — 一条交叉验证要应用补丁、跑工作区测试、可选在沙箱里做 A/B 评测，所以按小时计
-const CROSS_VALIDATE_TASK_TIMEOUT_SECS: u64 = 3600;
+/// What one cross-validation task declares it will take (apply + workspace
+/// tests + optional eval A/B in the sandbox).
+// cap: fixed — 一条交叉验证要应用补丁、跑工作区测试、可选在沙箱里做 A/B 评测，所以声明按小时计
+// keep: 删掉后回到「一条交叉验证要应用补丁、跑工作区测试、可选在沙箱里做 A/B 评测，所以声明按小时计」所描述的情形；由这条约定兜住
+const CROSS_VALIDATE_TASK_DECLARED_SECS: u64 = 3600;
 /// Upper bound of the per-intent exponential backoff after terminal
 /// (deterministic) upstream failures. Quota/billing windows reset on a
 /// day scale; probing more often than this cap only adds failed attempts
 /// without speeding recovery. Six hours bounds the post-reset recovery
 /// lag while keeping probe cost at one failed call per intent per window.
-// cap: bound — 六小时界住重置之后的恢复滞后，同时让探测成本停在「每个意图每窗一次失败的调用」
+// cap: fixed — 六小时界住重置之后的恢复滞后，同时让探测成本停在「每个意图每窗一次失败的调用」
+// keep: 删掉后重置之后的恢复滞后无界，探测成本不再停在每窗一次调用；由「六小时界住恢复滞后」兜住
 const TERMINAL_BACKOFF_CAP_SECS: u64 = 6 * 60 * 60;
 /// How long a finished attempt keeps its intent answered, counted from the
 /// round that saw it finish rather than from the row that carried it.
@@ -112,7 +120,8 @@ const TERMINAL_BACKOFF_CAP_SECS: u64 = 6 * 60 * 60;
 /// broken issue is re-examined at most once per working day or so, and long
 /// enough to sit out a quota window that kept the attempt from being a real
 /// test of the fix.
-// cap: bound — 要长过一个曾让那次尝试不构成真正验证的配额窗
+// cap: fixed — 要长过一个曾让那次尝试不构成真正验证的配额窗
+// keep: 删掉后那次尝试在让它不构成真正验证的配额窗内就被读成已答；由「要长过那个配额窗」兜住
 const ANSWERED_GRACE_SECS: u64 = 48 * 60 * 60;
 
 /// Whether a failed processing attempt is deterministic: retrying the same
@@ -169,6 +178,12 @@ enum IntentTaskAction {
     Blocked(String),
     /// The attempt is live: pending, scheduled or running.
     InHand,
+    /// The row could not be read. Not "no row carries the id": filing again
+    /// under the same id would buy a second attempt for an intent that may
+    /// already be running, and the idempotent insert cannot tell the two apart
+    /// from the intake side. The intent is left for the next round, when the
+    /// graph may answer again.
+    Unreadable,
     /// The attempt finished successfully. The intent is answered.
     ///
     /// The row is what says so while it exists, but the answer outlives it:
@@ -202,7 +217,10 @@ fn intent_task_action(existing: Option<&Task>) -> IntentTaskAction {
 /// the configured poll interval and the observed failure streak, not from a
 /// flat per-intent quota.
 fn terminal_backoff_delay(consecutive: u32, base_secs: u64) -> std::time::Duration {
-    let base = base_secs.max(30);
+    // `base_secs` 就是部署声明的轮询周期，原样用：从前这里把它抬到至少 30 秒，
+    // 于是声明 5 秒的部署拿到的是另一条节拍，而这条函数自己的说明还写着
+    // 「由配置的轮询周期导出」。
+    let base = base_secs;
     let exp = consecutive.saturating_sub(1).min(20);
     let secs = base
         .saturating_mul(1u64 << exp)
@@ -432,8 +450,8 @@ fn default_state_dir() -> std::path::PathBuf {
         clear_stale_state_dirs(&temp);
         let d = temp.join(format!("cogneva-test-state-{}", std::process::id()));
         // A reused pid inherits the previous run's state and fixtures with it.
-        let _ = std::fs::remove_dir_all(&d);
-        let _ = std::fs::create_dir_all(&d);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&d));
+        cog_core::ignore_lost!(std::fs::create_dir_all(&d));
         d
     })
     .clone()
@@ -466,7 +484,7 @@ fn clear_stale_state_dirs(temp: &std::path::Path) {
             .map(|age| age.as_secs() > 86_400)
             .unwrap_or(false);
         if stale {
-            let _ = std::fs::remove_dir_all(entry.path());
+            cog_core::ignore_lost!(std::fs::remove_dir_all(entry.path()));
         }
     }
 }
@@ -540,15 +558,31 @@ fn intent_verdict_prefix(task_id: &str) -> Option<String> {
     }
 }
 
-/// Page size the platform providers request when listing open intents. A
+/// Page size a single-page provider requests when listing open intents. A
 /// listing that returns exactly this many entries may be truncated, so
 /// reaping requires a count below the cap on both surfaces to treat the open
 /// set as provably complete.
-// cap: bound — 两个面都要数到低于这个界，才能把开放集当作可证完整
+// cap: fixed — 只读一页的 provider 两个面都要数到低于这个界，才能把开放集当作可证完整
+// keep: 删掉后只读一页的 provider 数不到低于界，开放集不能当作可证完整；由「两个面都要数到低于这个界」兜住
 const PROVIDER_LIST_PAGE_SIZE: usize = 100;
 
 fn listings_complete(issue_count: usize, pr_count: usize) -> bool {
     issue_count < PROVIDER_LIST_PAGE_SIZE && pr_count < PROVIDER_LIST_PAGE_SIZE
+}
+
+/// 这两份列取能不能当「全部还开着的」用。
+///
+/// 翻页翻到不满一页的 provider 自己保证完整（[`lists_every_page`]）；只读一页
+/// 的实现只能按条数猜：撞上页长上限的名单可能是截断的，拿它去 reap 会删掉还
+/// 开着的意图的判词，而账看上去更干净了——干净是假的。
+///
+/// [`lists_every_page`]: crate::provider::CodePlatformProvider::lists_every_page
+fn listing_is_complete(
+    provider: &dyn crate::provider::CodePlatformProvider,
+    issue_count: usize,
+    pr_count: usize,
+) -> bool {
+    provider.lists_every_page() || listings_complete(issue_count, pr_count)
 }
 
 impl AssessVerdicts {
@@ -568,10 +602,10 @@ impl AssessVerdicts {
 
     async fn persist(&self) {
         if let Some(parent) = self.path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+            cog_core::ignore_lost!(tokio::fs::create_dir_all(parent).await);
         }
         if let Ok(text) = serde_json::to_string(&self.map) {
-            let _ = tokio::fs::write(&self.path, text).await;
+            cog_core::ignore_lost!(tokio::fs::write(&self.path, text).await);
         }
     }
 
@@ -875,10 +909,21 @@ impl GitHubDiscoveryLoop {
         let Some(ref orchestrator) = self.orchestrator else {
             return IntentTaskAction::Submit;
         };
-        let existing = orchestrator
-            .get_task(&self.intent_task_id(kind, number))
-            .await;
-        intent_task_action(existing.as_ref())
+        let task_id = self.intent_task_id(kind, number);
+        match orchestrator.get_task_checked(&task_id).await {
+            Ok(existing) => intent_task_action(existing.as_ref()),
+            Err(e) => {
+                // 读不到不是「没有这一行」：那一行可能在跑，也可能已经答完了。
+                // 照「没有」处理就是同一个 id 再交一次，而那条路分不出重交。
+                tracing::warn!(
+                    task_id = %task_id,
+                    error = %e,
+                    "intent attempt could not be read; leaving the intent for the next round \
+                     rather than filing it again"
+                );
+                IntentTaskAction::Unreadable
+            }
+        }
     }
 
     /// Report an intent whose attempt cannot clear by re-running, once per
@@ -983,6 +1028,9 @@ impl GitHubDiscoveryLoop {
                 false
             }
             IntentTaskAction::InHand => false,
+            // 问不上来的那一行既不是空的也不是在手的：这一轮不提交、不记答完，
+            // 下一轮再问。`intent_decision` 已经把原因写进日志了。
+            IntentTaskAction::Unreadable => false,
             IntentTaskAction::Redrive => {
                 if self.in_redrive_backoff(key) {
                     return false;
@@ -1159,7 +1207,7 @@ impl GitHubDiscoveryLoop {
                         "settled the criteria on rows filed before their kind wrote one"
                     );
                 }
-                self.criteria_settled = settled.remaining == 0;
+                self.criteria_settled = criteria_backfill_is_done(&settled);
             }
         }
         // 先取这一轮的池实证纪元，再判任何退避窗：它决定的是"窗的前提还在不在"，
@@ -1278,7 +1326,11 @@ impl GitHubDiscoveryLoop {
             self.provider.list_open_pull_requests().await,
         ) {
             (Ok(open_issues), Ok(open_prs))
-                if listings_complete(open_issues.len(), open_prs.len()) =>
+                if listing_is_complete(
+                    self.provider.as_ref(),
+                    open_issues.len(),
+                    open_prs.len(),
+                ) =>
             {
                 let platform = self.provider.platform_kind();
                 let open: std::collections::HashSet<String> = open_issues
@@ -1412,7 +1464,7 @@ impl GitHubDiscoveryLoop {
 
     /// Run forever with the configured poll interval.
     pub async fn run(&mut self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-        let interval = std::time::Duration::from_secs(self.config.poll_interval_secs.max(30));
+        let interval = std::time::Duration::from_secs(self.config.poll_interval_secs);
         loop {
             tokio::select! {
                 _ = shutdown.changed() => {
@@ -1572,7 +1624,23 @@ impl GitHubDiscoveryLoop {
 
         // 一次只修一条：这个分支的这条工作流上已经有一张修复单在做时，再开一张
         // 只是把同一份日志交给第二个执行者，两张单还要互相踩同一批文件。
-        let repairs_in_flight = orchestrator.get_all_tasks().await.into_iter().any(|row| {
+        //
+        // 读不出来时不开新单：折叠的那条读答「图是空的」，于是同一份日志会被
+        // 交给第二个执行者。这一条是「不知道」而不是「没有」，事件不记入
+        // `ci_submitted`，下一次驱动还能再问一次。
+        let rows = match orchestrator.get_all_tasks_checked().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    run_id = event.run_id,
+                    error = %e,
+                    "cannot read the task graph to tell whether a repair is in flight; \
+                     skipping this failure event"
+                );
+                return Ok(false);
+            }
+        };
+        let repairs_in_flight = rows.into_iter().any(|row| {
             matches!(
                 row.status,
                 TaskStatus::Pending | TaskStatus::Scheduled | TaskStatus::Running
@@ -1608,7 +1676,7 @@ impl GitHubDiscoveryLoop {
             .provider
             .fetch_ci_failure_logs(fix_run)
             .await
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
 
         let log_section = logs
             .iter()
@@ -1729,7 +1797,7 @@ impl GitHubDiscoveryLoop {
             IntentKind::Issue => self.provider.list_issue_comments(number).await,
             IntentKind::Pr => self.provider.list_pull_comments(number).await,
         }
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
         let key = kind.key(number);
         let bot_logins = self.config.bot_identity.own_logins();
         let conversation = IssueConversation::from_comments(
@@ -1968,7 +2036,7 @@ impl GitHubDiscoveryLoop {
             confidence: None,
             timestamp: Some(chrono::Utc::now()),
         });
-        task.timeout_seconds = ASSESS_TASK_TIMEOUT_SECS;
+        task.declared_duration_seconds = ASSESS_TASK_DECLARED_SECS;
         task.venue = Some("github".into());
         task.acceptance.push(assess_acceptance(&task_id));
 
@@ -1977,16 +2045,29 @@ impl GitHubDiscoveryLoop {
 
         let deadline = Instant::now() + Duration::from_secs(ASSESS_WAIT_TIMEOUT_SECS);
         loop {
-            if let Some(t) = orchestrator.get_task(&id).await {
+            // A failed read is not "the row is not there yet": waiting it out
+            // ends as a timeout, and a timeout says the judgement never came
+            // back -- when the truth is that nobody could read whether it had.
+            // Answering now keeps the reason; the caller treats it as the
+            // transient failure it is and re-judges next round.
+            let polled = match orchestrator.get_task_checked(&id).await {
+                Ok(task) => task,
+                Err(e) => {
+                    return Err(crate::error::CogGitHubError::Provider(format!(
+                        "assess task {id} could not be read: {e}"
+                    )));
+                }
+            };
+            if let Some(t) = polled {
                 match t.status {
                     TaskStatus::Completed => {
-                        let verdict = t.result.unwrap_or_default();
+                        let verdict = t.result.unwrap_or(Default::default());
                         let decision = Self::verdict_to_decision(&verdict);
                         self.verdict_store(id.clone(), decision.clone()).await;
                         return Ok(decision);
                     }
                     TaskStatus::Failed => {
-                        let reason = t.error.unwrap_or_default();
+                        let reason = t.error.unwrap_or(Default::default());
                         // 失败带类型时把类型原样带出来，别压成 Provider 的散文：
                         // 上层只允许按类型判"这次失败重发是否可能成功"，读文本等于
                         // 把判定权交给上游当天的措辞。没有类型可依才退回文本。
@@ -2380,8 +2461,20 @@ impl GitHubDiscoveryLoop {
             .map(|(pr, v)| (*pr, v.task_id.clone(), v.head_sha.clone()))
             .collect();
         for (pr, task_id, head_sha) in inflight {
-            let Some(task) = orchestrator.get_task(&task_id).await else {
-                continue;
+            // 读不到不是「这一行不在了」：留在在途表里、下一轮再收，别让一次
+            // 读失败静默地把这张 PR 的判词吞掉。
+            let task = match orchestrator.get_task_checked(&task_id).await {
+                Ok(Some(task)) => task,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        pr,
+                        task = %task_id,
+                        error = %e,
+                        "cross-validation task could not be read; leaving it in flight for the next round"
+                    );
+                    continue;
+                }
             };
             match task.status {
                 TaskStatus::Completed => {
@@ -2560,7 +2653,7 @@ impl GitHubDiscoveryLoop {
                 confidence: None,
                 timestamp: Some(chrono::Utc::now()),
             });
-            task.timeout_seconds = CROSS_VALIDATE_TASK_TIMEOUT_SECS;
+            task.declared_duration_seconds = CROSS_VALIDATE_TASK_DECLARED_SECS;
 
             match orchestrator.submit_goal_auto(&goal, vec![task]).await {
                 Ok(ids) => {
@@ -2625,7 +2718,8 @@ pub(crate) fn assess_acceptance(task_id: &str) -> String {
 /// The first pass after this ships has a few dozen rows to reach and runs on a
 /// round that is also polling two platforms; a batch bounds the burst, not the
 /// work.
-// cap: bound — 这一轮同时在轮询两个平台；一批界的是突发不是工作量
+// cap: fixed — 这一轮同时在轮询两个平台；一批界的是突发不是工作量
+// keep: 删掉后这一轮吞下整场突发，同时轮询两个平台的拍被撑破；由「一批界的是突发不是工作量」兜住
 const CRITERIA_SETTLE_BATCH: usize = 400;
 
 /// What one back-fill pass did.
@@ -2634,7 +2728,13 @@ pub(crate) struct SettledCriteria {
     pub(crate) filled: usize,
     pub(crate) failed: usize,
     /// Rows still without a criterion after this pass.
+    ///
+    /// Only meaningful when the graph was read: an unreadable graph answers
+    /// zero here, and `remaining == 0` would otherwise read as "nothing left
+    /// to back-fill" and stop the pass for the life of the process.
     pub(crate) remaining: usize,
+    /// The graph could not be read, so no count in this pass is an answer.
+    pub(crate) unread: bool,
 }
 
 /// One pass of closing CI fixes whose failure the branch has left behind.
@@ -2644,12 +2744,24 @@ pub(crate) struct SettledCiFixes {
     pub(crate) failed: usize,
     /// CI repair rows still open after this pass.
     pub(crate) remaining: usize,
+    /// The graph could not be read; no row was examined.
+    pub(crate) unread: bool,
+}
+
+/// Whether the criteria back-fill has nothing left to do.
+///
+/// An unreadable graph answers `remaining == 0` without having read a row, so
+/// the count alone would retire the pass for the life of the process; the pass
+/// has to run again once the graph can be read.
+fn criteria_backfill_is_done(settled: &SettledCriteria) -> bool {
+    !settled.unread && settled.remaining == 0
 }
 
 /// How many rows one pass may close. A backlog of dead rows costs one GitHub
 /// read per branch and workflow, so the bound is on the burst, not on the work:
 /// the next round picks up where this one stopped.
-// cap: bound — this bounds one round's burst of upstream reads (one read per
+// cap: fixed — this bounds one round's burst of upstream reads (one read per
+// keep: 删掉后一轮的上游读突发无界；由「一轮的突发有界」兜住
 // branch and workflow), not the number of dead rows waiting; no reading moves it
 const CI_SETTLE_BATCH: usize = 40;
 
@@ -2739,9 +2851,18 @@ impl GitHubDiscoveryLoop {
     ) -> SettledCriteria {
         let mut settled = SettledCriteria::default();
         let platform = self.provider.platform_kind();
-        let candidates: Vec<Task> = orch
-            .get_all_tasks()
-            .await
+        let rows = match orch.get_all_tasks_checked().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                settled.unread = true;
+                tracing::warn!(
+                    error = %e,
+                    "cannot read the task graph; the criteria back-fill stays pending"
+                );
+                return settled;
+            }
+        };
+        let candidates: Vec<Task> = rows
             .into_iter()
             .filter(|row| row.acceptance.is_empty())
             .filter(|row| criterion_for_row(platform, row).is_some())
@@ -2752,8 +2873,21 @@ impl GitHubDiscoveryLoop {
             // worker can move a row in between. `replace_task` writes the whole
             // row, so writing the snapshot back would undo a status the
             // executor had just set.
-            let Some(mut filled) = orch.get_task(&row.id).await else {
-                continue;
+            // 读不到那一行不是「它不在了」：它仍然是一条要补的行，这一趟补不上，
+            // 但 `remaining` 要照实加一——不然这一趟会以「补完了」退场，而库里
+            // 那条空着判据的行谁也没问过。
+            let mut filled = match orch.get_task_checked(&row.id).await {
+                Ok(Some(filled)) => filled,
+                Ok(None) => continue,
+                Err(e) => {
+                    settled.remaining += 1;
+                    tracing::warn!(
+                        task = %row.id,
+                        error = %e,
+                        "a platform row could not be read; the criteria back-fill keeps it asking"
+                    );
+                    continue;
+                }
             };
             if !filled.acceptance.is_empty() {
                 continue;
@@ -2803,9 +2937,18 @@ impl GitHubDiscoveryLoop {
         orch: &Arc<dyn OrchestratorControl>,
     ) -> SettledCiFixes {
         let mut settled = SettledCiFixes::default();
-        let candidates: Vec<Task> = orch
-            .get_all_tasks()
-            .await
+        let rows = match orch.get_all_tasks_checked().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                settled.unread = true;
+                tracing::warn!(
+                    error = %e,
+                    "cannot read the task graph; the CI fixes that may be superseded stay open"
+                );
+                return settled;
+            }
+        };
+        let candidates: Vec<Task> = rows
             .into_iter()
             .filter(
                 |row| matches!(&row.task_type, TaskType::Custom(kind) if kind == CI_FIX_TASK_TYPE),
@@ -3207,6 +3350,50 @@ pub(crate) mod tests {
         std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
+    /// 读不到那一行时不再交一次：同一个 id 的重交在编排器那一侧分不出「同一条
+    /// 意图再跑一次」与「一条已经在跑的意图被再交一次」，而这一问正是分辨它的地方。
+    #[tokio::test]
+    async fn an_attempt_that_cannot_be_read_is_not_filed_again_under_the_same_id() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
+        let orchestrator = Arc::new(MockOrchestrator::new());
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            Arc::new(MockProvider {
+                issues: vec![],
+                comments: Mutex::new(vec![]),
+                ci_logs: vec![],
+                ci_runs: Mutex::new(vec![]),
+                ci_green_runs: Mutex::new(Vec::new()),
+                prs: vec![],
+                pr_details: HashMap::new(),
+            }),
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+        let id = loop_.intent_task_id(IntentKind::Issue, 77);
+        orchestrator.with_unreadable_id(&id);
+
+        assert_eq!(
+            loop_.intent_decision(IntentKind::Issue, 77).await,
+            IntentTaskAction::Unreadable,
+            "那一问答不上来，不能答成「没有这一行」"
+        );
+        assert!(
+            !loop_
+                .apply_fix_decision("issue:77", IntentKind::Issue, 77)
+                .await,
+            "读不到不是没交过：这一轮不交、也不记成答完了"
+        );
+        assert!(
+            orchestrator.goals.lock().unwrap().is_empty(),
+            "同一个 id 不能照着「没有」再交一次"
+        );
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
     /// A finished attempt is a verdict about the intent, and the verdict has
     /// to outlive the row it was read from: the archive pass drops terminal
     /// rows on a retention that exists to bound how long a row stays readable,
@@ -3419,6 +3606,55 @@ pub(crate) mod tests {
         assert!(matches!(err, CogGitHubError::Provider(_)), "{err}");
     }
 
+    /// 那一行读不到时当场作答，不等到超时：等下去最后的判词是「判定没回来」，
+    /// 而真相是没人读得到它回来没有——两句话的错处不同，查到的东西也不同。
+    #[tokio::test]
+    async fn an_assess_task_that_cannot_be_read_answers_now_instead_of_timing_out() {
+        let provider: Arc<dyn CodePlatformProvider> = Arc::new(MockProvider {
+            issues: vec![],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
+            prs: vec![],
+            pr_details: HashMap::new(),
+        });
+        let orchestrator = Arc::new(MockOrchestrator::new().with_unreadable_graph());
+        let loop_ = GitHubDiscoveryLoop::new(
+            provider,
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+        let title = "the issue list is slow".to_string();
+        let body = "curl /health takes 500ms".to_string();
+        let labels: Vec<String> = vec![];
+        let intent = IntentContext {
+            kind: IntentKind::Issue,
+            number: 43,
+            title: &title,
+            body: &body,
+            labels: &labels,
+            author: "alice",
+        };
+        let control: Arc<dyn OrchestratorControl> = orchestrator;
+        let started = Instant::now();
+        let err = loop_
+            .run_assess_task(&control, &intent, "thread", &[])
+            .await
+            .expect_err("读不到那一行时没有判词");
+        assert!(
+            started.elapsed() < Duration::from_secs(ASSESS_WAIT_TIMEOUT_SECS),
+            "这一问读不到就该当场退，别把一整个等待窗口睡完"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("could not be read"),
+            "判词要说的是「读不到」，不是「超时」：{text}"
+        );
+    }
+
     #[test]
     fn terminal_backoff_grows_exponentially_and_caps() {
         let d = |n: u32| terminal_backoff_delay(n, 300).as_secs();
@@ -3427,8 +3663,9 @@ pub(crate) mod tests {
         assert_eq!(d(3), 1200);
         assert_eq!(d(10), TERMINAL_BACKOFF_CAP_SECS);
         assert_eq!(d(u32::MAX), TERMINAL_BACKOFF_CAP_SECS);
-        // Tiny poll intervals still back off at least 30s per step.
-        assert_eq!(terminal_backoff_delay(1, 5).as_secs(), 30);
+        // 声明多短的周期，退避就从多短起步：节拍由部署声明，不由这里另立一个数。
+        assert_eq!(terminal_backoff_delay(1, 5).as_secs(), 5);
+        assert_eq!(terminal_backoff_delay(2, 5).as_secs(), 10);
     }
 
     #[test]
@@ -3598,6 +3835,11 @@ pub(crate) mod tests {
         /// 提交一律失败，模拟编排器这一侧根本不收——上游全 503 那天就是这样，
         /// 每个派发点在日志里各写一行、读数面上什么也看不见。
         refuse_submissions: std::sync::atomic::AtomicBool,
+        /// 带报错的那条读一律失败，模拟一个读不动任务图的编排器：折叠的那条
+        /// 这时答「图是空的」，而真相是没人读到过它。
+        unreadable_graph: std::sync::atomic::AtomicBool,
+        /// 整份行表照常读得出，只有这些 id 的那一问答不上来。
+        unreadable_ids: Mutex<std::collections::HashSet<String>>,
     }
 
     impl MockOrchestrator {
@@ -3623,6 +3865,8 @@ pub(crate) mod tests {
                 assess_failure_cause: Mutex::new(None),
                 intent_rows: Mutex::new(HashMap::new()),
                 refuse_submissions: std::sync::atomic::AtomicBool::new(false),
+                unreadable_graph: std::sync::atomic::AtomicBool::new(false),
+                unreadable_ids: Mutex::new(std::collections::HashSet::new()),
             }
         }
 
@@ -3631,6 +3875,18 @@ pub(crate) mod tests {
             self.refuse_submissions
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             self
+        }
+
+        /// 让带报错的那条读失败：任务图此刻读不动。
+        pub(crate) fn with_unreadable_graph(self) -> Self {
+            self.unreadable_graph
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self
+        }
+
+        /// 让这一个 id 的那一问答不上来，其余行照常读得出。
+        pub(crate) fn with_unreadable_id(&self, id: &str) {
+            self.unreadable_ids.lock().unwrap().insert(id.to_string());
         }
 
         /// What the archive pass does to a terminal row once its retention
@@ -3730,6 +3986,29 @@ pub(crate) mod tests {
         }
         async fn get_all_tasks(&self) -> Vec<Task> {
             self.rows.lock().unwrap().clone()
+        }
+        async fn get_task_checked(&self, id: &str) -> cog_core::SFResult<Option<Task>> {
+            if self
+                .unreadable_graph
+                .load(std::sync::atomic::Ordering::Relaxed)
+                || self.unreadable_ids.lock().unwrap().contains(id)
+            {
+                return Err(cog_core::SFError::Database(format!(
+                    "mock graph cannot answer for {id}"
+                )));
+            }
+            Ok(self.get_task(id).await)
+        }
+        async fn get_all_tasks_checked(&self) -> cog_core::SFResult<Vec<Task>> {
+            if self
+                .unreadable_graph
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(cog_core::SFError::Database(
+                    "mock graph is unreadable".to_string(),
+                ));
+            }
+            Ok(self.rows.lock().unwrap().clone())
         }
         async fn replace_task(&self, task: Task) -> cog_core::SFResult<()> {
             let mut rows = self.rows.lock().unwrap();
@@ -4437,6 +4716,44 @@ pub(crate) mod tests {
         assert!(goals[0].contains("clippy::question_mark"));
     }
 
+    /// 图读不动的时候，不再开一张修复单——折叠的那条读答「图是空的」，于是
+    /// 同一份日志会被交给第二个执行者，两张单还要互相踩同一批文件。
+    #[tokio::test]
+    async fn a_graph_that_cannot_be_read_files_no_repair_it_cannot_rule_out() {
+        let provider = Arc::new(MockProvider {
+            issues: vec![],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![CiJobLog {
+                job_id: 42,
+                job_name: "Clippy".into(),
+                log_tail: "error: clippy::question_mark".into(),
+            }],
+            ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
+            prs: vec![],
+            pr_details: HashMap::new(),
+        });
+        let orchestrator = Arc::new(MockOrchestrator::new().with_unreadable_graph());
+
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider,
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+
+        assert!(!loop_.process_ci_failure(ci_event(1002)).await.unwrap());
+        assert!(
+            orchestrator.goals.lock().unwrap().is_empty(),
+            "读不出在途的那张单，不等于没有在途的单：这里不该再开一张"
+        );
+        assert!(
+            !loop_.ci_submitted.contains(&1002),
+            "这一条没被读成「没有在途的单」，它只是没问出来：图能读之后还要能再问一次"
+        );
+    }
+
     /// 一个能用来读「分支上还有什么在跑」的 provider：CI 那份还是红的，只是
     /// 提交的时间比事件里那一版新。
     fn moving_branch_provider(finished: Vec<(&str, CiRunSummary)>) -> Arc<MockProvider> {
@@ -5066,6 +5383,138 @@ pub(crate) mod tests {
         assert_eq!(again.remaining, 1, "{again:?}");
     }
 
+    /// 一行问不上来时，这一趟不把它当作补完：`remaining` 照实加一，
+    /// 否则这一趟会以「补完了」退场，而库里那条空着判据的行谁也没问过。
+    #[tokio::test]
+    async fn a_row_that_cannot_be_read_keeps_the_criteria_backfill_asking() {
+        let orch = Arc::new(MockOrchestrator::holding(vec![Task::new(
+            "github-issue-7".to_string(),
+            TaskType::Custom("platform_issue_fix".into()),
+            serde_json::json!({"issue_number": 7}),
+        )]));
+        let loop_ = GitHubDiscoveryLoop::new(
+            Arc::new(MockProvider {
+                issues: vec![],
+                comments: Mutex::new(vec![]),
+                ci_logs: vec![],
+                ci_runs: Mutex::new(vec![]),
+                ci_green_runs: Mutex::new(Vec::new()),
+                prs: vec![],
+                pr_details: HashMap::new(),
+            }),
+            IssueTriage::rules_only(),
+            config(),
+            Some(orch.clone()),
+            None,
+        );
+        let as_control: Arc<dyn OrchestratorControl> = orch.clone();
+        // 整份行表读得出（那条候选还在名单里），只有逐行那一问答不上来。
+        orch.with_unreadable_id("github-issue-7");
+
+        let settled = loop_.settle_filed_criteria(&as_control).await;
+        assert!(!settled.unread, "整份名单是读到了的：{settled:?}");
+        assert_eq!(settled.filled, 0, "{settled:?}");
+        assert_eq!(
+            settled.remaining, 1,
+            "这一条还欠着：这一趟没补上不能读成补完了：{settled:?}"
+        );
+        assert!(
+            !criteria_backfill_is_done(&settled),
+            "还有一条问不上来，回填不能退场"
+        );
+        let after = orch.get_all_tasks().await;
+        assert!(
+            after
+                .iter()
+                .find(|r| r.id == "github-issue-7")
+                .unwrap()
+                .acceptance
+                .is_empty(),
+            "读不到就没写：判据还是空的"
+        );
+    }
+
+    /// 读不动任务图的那一趟，不能把自己读成「没有要补的行」。
+    ///
+    /// 折叠的那条读答一份空名单，`remaining == 0`，于是这趟回填以「做完了」
+    /// 退场——进程活多久就退多久，而库里那些空着判据的行一条也没被问过。
+    #[tokio::test]
+    async fn a_criteria_backfill_that_cannot_read_the_graph_does_not_retire_itself() {
+        let orch = Arc::new(MockOrchestrator::new().with_unreadable_graph());
+        let loop_ = GitHubDiscoveryLoop::new(
+            Arc::new(MockProvider {
+                issues: vec![],
+                comments: Mutex::new(vec![]),
+                ci_logs: vec![],
+                ci_runs: Mutex::new(vec![]),
+                ci_green_runs: Mutex::new(Vec::new()),
+                prs: vec![],
+                pr_details: HashMap::new(),
+            }),
+            IssueTriage::rules_only(),
+            config(),
+            Some(orch.clone()),
+            None,
+        );
+        let as_control: Arc<dyn OrchestratorControl> = orch.clone();
+
+        let settled = loop_.settle_filed_criteria(&as_control).await;
+        assert!(settled.unread, "{settled:?}");
+        assert_eq!(settled.filled, 0, "{settled:?}");
+        assert!(
+            !criteria_backfill_is_done(&settled),
+            "图没读到不等于没有要补的行：这一趟要留到下一轮再问"
+        );
+
+        // 另一个方向也钉住：真的读完了才退场，账面上还有行就还接着问。
+        assert!(criteria_backfill_is_done(&SettledCriteria {
+            unread: false,
+            remaining: 0,
+            ..Default::default()
+        }));
+        assert!(!criteria_backfill_is_done(&SettledCriteria {
+            unread: false,
+            remaining: 1,
+            ..Default::default()
+        }));
+    }
+
+    /// 读不动任务图的那一趟结案，也要说出来：它一张单都没看过，不能读成
+    /// 「没有前提已经消失的修复单」。
+    #[tokio::test]
+    async fn a_ci_settle_pass_that_cannot_read_the_graph_says_so() {
+        let orch = Arc::new(
+            MockOrchestrator::holding(vec![ci_fix_row(
+                "github-ci-run-1001",
+                "main",
+                "CI",
+                1001,
+                None,
+            )])
+            .with_unreadable_graph(),
+        );
+        let loop_ = GitHubDiscoveryLoop::new(
+            Arc::new(MockProvider {
+                issues: vec![],
+                comments: Mutex::new(vec![]),
+                ci_logs: vec![],
+                ci_runs: Mutex::new(vec![]),
+                ci_green_runs: Mutex::new(Vec::new()),
+                prs: vec![],
+                pr_details: HashMap::new(),
+            }),
+            IssueTriage::rules_only(),
+            config(),
+            Some(orch.clone()),
+            None,
+        );
+        let as_control: Arc<dyn OrchestratorControl> = orch.clone();
+
+        let settled = loop_.settle_superseded_ci_fixes(&as_control).await;
+        assert!(settled.unread, "{settled:?}");
+        assert_eq!(settled.closed, 0, "{settled:?}");
+    }
+
     /// 一条 issue 在路上会交两行：先判定、再修复。两行各自都要说清怎样算做完，
     /// 因为它们是两种不同的完成——一个是判决落库，一个是 issue 关掉。
     #[tokio::test]
@@ -5438,6 +5887,63 @@ pub(crate) mod tests {
         std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
+    /// 收在途任务的那一读问不上来时，这张 PR 留在在途表里：`continue` 是同一个
+    /// 动作，但判词不一样——不读的话，一次读失败与「这一行不在了」在日志里同形，
+    /// 而后者会让这张 PR 永远没人再收。
+    #[tokio::test]
+    async fn a_cross_validation_task_that_cannot_be_read_stays_in_flight() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
+        let (_workdir_tmp, workdir) = git_workdir_with_pr_branch();
+        let cfg = cv_config(&workdir);
+        let head_sha = "deadbeefcafebabe000000000000000000000032";
+        let provider = Arc::new(MockProvider {
+            issues: vec![],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
+            prs: vec![cv_pr(32, "cogneva-bot", "Bob#b81c0e9f")],
+            pr_details: HashMap::from([(32u64, cv_detail(32, head_sha))]),
+        });
+        let orchestrator = Arc::new(MockOrchestrator::new());
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider.clone(),
+            IssueTriage::rules_only(),
+            cfg,
+            Some(orchestrator.clone()),
+            None,
+        );
+
+        // 第一轮把它交出去，在途表里有它了。
+        loop_.run_once().await.unwrap();
+        let task_id = loop_
+            .cv_inflight
+            .get(&32)
+            .expect("第一轮该把它交出去")
+            .task_id
+            .clone();
+
+        // 第二轮收不回来：那一行读不到。
+        orchestrator.with_unreadable_id(&task_id);
+        loop_.run_once().await.unwrap();
+        assert!(
+            loop_.cv_inflight.contains_key(&32),
+            "读不到不是「不在了」：它还得留在在途表里，等下一轮再收"
+        );
+        assert!(
+            !provider
+                .comments
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(n, _)| *n == 32),
+            "没读到判词就不该有判词评论"
+        );
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
     #[tokio::test]
     async fn cross_validation_skips_self_pr_and_unlabeled_pr() {
         let _guard = crate::identity::ENV_LOCK.lock().await;
@@ -5629,7 +6135,7 @@ pub(crate) mod tests {
                 .map(|v| &v.decision),
             Some(&decision)
         );
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        cog_core::ignore_lost!(tokio::fs::remove_dir_all(&dir).await);
     }
 
     #[tokio::test]
@@ -5651,7 +6157,7 @@ pub(crate) mod tests {
         };
         store.ensure_loaded().await;
         assert!(store.map.is_empty());
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        cog_core::ignore_lost!(tokio::fs::remove_dir_all(&dir).await);
     }
 
     #[test]
@@ -5685,6 +6191,49 @@ pub(crate) mod tests {
         ));
         assert!(listings_complete(PROVIDER_LIST_PAGE_SIZE - 1, 3));
         assert!(listings_complete(0, 0));
+    }
+
+    /// 一份自报「翻完了每一页」与一份只读一页的 provider：前者几百条意图也是
+    /// 完整名单，后者撞上单页上限就只能按截断算。这个区分是 reap 闸的全部意义
+    /// 所在——翻页之后还按条数猜，仓库一过 100 个开放意图就永远 reap 不了。
+    struct ListingScope {
+        every_page: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl CodePlatformProvider for ListingScope {
+        fn lists_every_page(&self) -> bool {
+            self.every_page
+        }
+        async fn list_open_issues(&self) -> Result<Vec<PlatformIssue>> {
+            Ok(Vec::new())
+        }
+        async fn create_pull_request(
+            &self,
+            _req: CreatePullRequest,
+        ) -> Result<PlatformPullRequest> {
+            unimplemented!()
+        }
+        async fn comment_on_issue(&self, _issue_number: u64, _body: String) -> Result<()> {
+            unimplemented!()
+        }
+        async fn merge_pull_request(&self, _pr_number: u64, _sha: String) -> Result<()> {
+            unimplemented!()
+        }
+        async fn get_pull_request(&self, _pr_number: u64) -> Result<PullRequestDetail> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn a_provider_that_reads_every_page_is_complete_at_any_count() {
+        let paged = ListingScope { every_page: true };
+        assert!(listing_is_complete(&paged, 500, 300));
+        assert!(listing_is_complete(&paged, PROVIDER_LIST_PAGE_SIZE, 0));
+
+        let one_page = ListingScope { every_page: false };
+        assert!(listing_is_complete(&one_page, 3, 0));
+        assert!(!listing_is_complete(&one_page, PROVIDER_LIST_PAGE_SIZE, 0));
     }
 
     #[test]

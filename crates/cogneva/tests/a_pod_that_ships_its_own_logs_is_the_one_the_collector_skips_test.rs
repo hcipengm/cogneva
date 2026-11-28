@@ -34,6 +34,7 @@
 use crate::common;
 
 use common::routes::read;
+use common::routes::rendered_root;
 use common::routes::repo_root;
 use common::routes::walk;
 use common::rust_text;
@@ -325,7 +326,7 @@ fn collector_rule(root: &Path) -> CollectorRule {
     let namespaces = block(discovery, "namespaces")
         .and_then(|n| attribute(n, "names"))
         .map(|names| quoted(&names))
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
 
     // Every `rule { … }` inside the relabel component; the drop rule is the one
     // carrying `action = "drop"`.
@@ -416,7 +417,8 @@ fn a_pod_that_ships_its_own_logs_is_the_one_the_collector_skips() {
     // 这条判据一直只扫到 `deploy/k3s`：少读一块与那一块都合规在判词上同形。
     let mut files = Vec::new();
     walk(&root.join("deploy/k3s"), &["yaml"], &mut files);
-    walk(&root.join("deploy/rendered"), &["yaml"], &mut files);
+    // 预渲染目录不提交：读之前现场生成（`rendered_root`），路径与身份不变。
+    walk(&rendered_root(), &["yaml"], &mut files);
     let mut pods = Vec::new();
     for file in &files {
         let text = read(file);

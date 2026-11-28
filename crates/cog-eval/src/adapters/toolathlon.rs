@@ -43,11 +43,12 @@ struct TaskConfig {
 }
 
 impl ToolathlonCaseSource {
+    // prompt: not-an-instruction — 只组装用例元数据与路径；系统提示词来自该用例目录里的 docs/agent_system_prompt.md
     fn dir_to_case(dir: &Path) -> anyhow::Result<EvalCase> {
         let name = dir
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
 
         let cfg_path = dir.join(TASK_CONFIG_FILE);
         let cfg: TaskConfig = serde_json::from_str(
@@ -358,9 +359,7 @@ impl CaseJudge for ToolathlonJudge {
                 .count()
                 .to_string(),
         );
-        verdict
-            .readings
-            .insert("report".into(), report.raw.chars().take(2000).collect());
+        verdict.readings.insert("report".into(), report.raw.clone());
         Ok(verdict)
     }
 }
@@ -446,16 +445,16 @@ mod tests {
         assert!(cases[0].tags.contains(&"server:excel".to_string()));
         // 判分脚本与要哪些 server 不进外壳的输入。
         assert!(cases[0].input.get("needed_mcp_servers").is_none());
-        std::fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     #[test]
     fn a_missing_tree_names_what_to_run() {
         let root = tempdir();
-        std::fs::remove_dir_all(root.join(TOOLATHLON_TASKS_DIR)).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(root.join(TOOLATHLON_TASKS_DIR)));
         let err = ToolathlonCaseSource.cases(&root).unwrap_err().to_string();
         assert!(err.contains("tarball"), "{err}");
-        std::fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     fn case(id: &str, servers: &[&str]) -> EvalCase {
@@ -657,6 +656,6 @@ mod tests {
         assert_eq!(cases.len(), 1);
         // 没有 compose 后端 ⇒ 起环境就报错。
         assert!(bench.env.acquire(&cases[0]).await.is_err());
-        std::fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 }

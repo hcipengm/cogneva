@@ -36,6 +36,7 @@
 //! looked and could not tell" apart -- and a third answer that vanishes when it
 //! is zero is a third answer nobody can see going away.
 
+use crate::ledger_pacing::{MEASUREMENTS_PER_PASS, OUTSTANDING_PEEK, UNMEASURABLE_RETRY};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -74,7 +75,8 @@ pub const PRINCIPLE_LEDGER_ROLE: &str = "principle_ledger";
 /// being maintained". Minutes rather than seconds keeps the steady state out of
 /// the log. The deployed liveness alert derives its threshold from this period
 /// (`6 * period`), so changing it changes that threshold.
-// cap: bound — 存活告警的门槛由它推出（6 × 周期）；分钟级是为了让稳态不进日志
+// cap: fixed — 存活告警的门槛由它推出（6 × 周期）；分钟级是为了让稳态不进日志
+// keep: 删掉后存活告警的墙没有分子，稳态也会被写进日志；由「6 × 周期」兜住
 pub const PRINCIPLE_LEDGER_PASS_INTERVAL: Duration = Duration::from_secs(300);
 
 /// What the tier census calls a row whose carrier never declared one.
@@ -86,13 +88,6 @@ pub const PRINCIPLE_LEDGER_PASS_INTERVAL: Duration = Duration::from_secs(300);
 /// a panel was written against.
 const CHECK_KIND_UNDECLARED: &str = "undeclared";
 
-/// How many outstanding rows one round reads for its own census line.
-///
-/// The round exists for one thing: to make "the account is readable, and this is
-/// how much is outstanding" a line in the log with a reading behind it.
-// cap: bound — 这一轮只为让「账读得到、还有多少没做」成为一行带读数的日志，peek 取够看就行
-const OUTSTANDING_PEEK: usize = 50;
-
 /// How many refused rows one pass publishes.
 ///
 /// The selector already bounds the population to the rows the account holds
@@ -101,7 +96,9 @@ const OUTSTANDING_PEEK: usize = 50;
 /// truncate the reading by the ordering instead of by what the gates refused,
 /// and the total a reader adds up would then disagree with the account for a
 /// reason nothing on the surface states.
-// cap: bound — 截断要按「被门拒了」而不是按排序；否则读者加起来的合计会与账对不上，而面上没有一个字说原因
+// cap: fixed — 截断要按「被门拒了」而不是按排序；否则读者加起来的合计会与账对不上，而面上没有一个字说原因
+// keep: 删掉后一拍读回的拒收行无界，读者加起来的合计与账对不上；由「截断按被门拒了而不是按排序」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const REFUSAL_ROWS_PER_PASS: usize = 1000;
 
 /// How many queued readings one pass folds into the account.
@@ -112,22 +109,16 @@ const REFUSAL_ROWS_PER_PASS: usize = 1000;
 /// read in between would be of a half-folded corpus -- which is exactly the kind
 /// of reading this account must not publish. A pass is still bounded: a queue
 /// that grew past this is not a corpus being read, it is a writer looping.
-// cap: bound — 仍要有界：涨过这个数就不是在被读的语料，是写入方在打转；半折叠的语料正是这本账不许发布的读数
+// cap: fixed — 仍要有界：涨过这个数就不是在被读的语料，是写入方在打转；半折叠的语料正是这本账不许发布的读数
+// keep: 删掉后写入方打转时一拍把半折叠的语料发布出去；由「涨过这个数就是写入方在打转」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const DECLARATIONS_PER_PASS: usize = 1000;
 
 /// How many queued refusal events one pass counts.
-// cap: bound — 比申报那批小一半：拒收是例外路径，正常语料里它远小于申报
+// cap: fixed — 比申报那批小一半：拒收是例外路径，正常语料里它远小于申报
+// keep: 删掉后拒收这条例外路径占掉与申报同大的预算；由「拒收远小于申报」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const REFUSALS_PER_PASS: usize = 500;
-
-/// How many rows one pass looks at against the registries.
-///
-/// The account holds rows in the hundreds and a pass that walked all of them
-/// would spend the whole interval asking git questions while holding the owner
-/// lease. Rows are taken stalest-first, so this bound costs latency rather than
-/// coverage: everything outstanding is still reached, in as many passes as it
-/// takes.
-// cap: bound — 行的代价是延迟不是覆盖面：最旧的行下一轮接着取，剩下的照样被扫到
-const MEASUREMENTS_PER_PASS: usize = 200;
 
 /// How many human-held rows one pass may look at for the first time.
 ///
@@ -137,20 +128,10 @@ const MEASUREMENTS_PER_PASS: usize = 200;
 /// of them and no look had ever reached one. The bound is small enough that the
 /// debt still gets most of a pass, and large enough that the first sweep clears
 /// in hours rather than weeks.
-// cap: bound — 小到这笔旧账仍占一轮的大半，大到第一次清扫以小时而不是以周计
+// cap: fixed — 小到这笔旧账仍占一轮的大半，大到第一次清扫以小时而不是以周计
+// keep: 删掉后第一次清扫以周计，或旧账占满整轮；由「小到仍占一轮大半、大到以小时计」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const HUMAN_ONLY_SWEEP_PER_PASS: usize = 50;
-
-/// How long a look that could not be settled is left before it is asked again.
-///
-/// Held alone it would be permanent, and a permanent answer to a question about
-/// two moving registries is the wrong shape: the look could not be settled
-/// because of what the tree holds right now, and a tree that gains a contract
-/// test makes it answerable. An hour is long enough that re-asking costs nothing
-/// (the pass runs every few minutes and the unanswered set is a few hundred rows)
-/// and short enough that a tree that changed is noticed within the same working
-/// session.
-// cap: bound — 长到一次几小时的扫描不会把它重刷一遍，又短到改过的树在同一个工作时段内被注意到
-const UNMEASURABLE_RETRY: Duration = Duration::from_secs(3600);
 
 /// A principle this process could not settle, and when it last tried.
 ///

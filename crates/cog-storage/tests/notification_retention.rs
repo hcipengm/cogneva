@@ -1,13 +1,21 @@
 //! principle: feedback_unread_records_must_not_expire_by_age
-//! Notification retention, against a live PostgreSQL.
+//! Notification retention, against a live PostgreSQL: the pass **counts, it
+//! does not delete**.
 //!
-//! The rule is which rows survive, and that is the database's decision: read
-//! rows older than the window go, unread rows stay however old they are, and a
-//! read row inside the window stays. A file-backed store cannot be asked any of
-//! it, and the statement that deletes is exactly the line where the exception
-//! for unread rows can be dropped without any other code noticing -- the table
-//! then shrinks the same way whether the exception is there or not, until the
-//! first notification nobody has opened is deleted before its reader sees it.
+//! A notification is the platform having said something to a person, and the
+//! row is the only copy of it. An age bound over a fact is the shape this
+//! family refuses: past the window the correct next step is "archive a
+//! readable copy, check it, then delete", and until that path exists the pass
+//! may only report how many rows are due. The earlier shape deleted them, so
+//! the deletion could regrow without any other code noticing — an empty table
+//! and a table whose rows were swept on time look the same from every reader.
+//!
+//! What this file pins:
+//!
+//! - the count names exactly the read rows outside the window (the unread row
+//!   is the one a person still has to open, and the recent read row is inside);
+//! - after the pass, **every** row is still there — the row the count named is
+//!   the row an archive owes, not the row to drop.
 //!
 //! Ignored by default and needs `COGNEVA_TEST_DATABASE_URL` pointing at a
 //! throwaway database:
@@ -48,7 +56,7 @@ fn notification_for(user: &str, age_days: i64, read: bool) -> Notification {
 
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
-async fn read_rows_expire_and_unread_rows_do_not() {
+async fn the_pass_counts_the_due_rows_and_deletes_nothing() {
     let url = database_url();
     let schema = own_schema(&url, "notification_retention").await;
 
@@ -83,30 +91,29 @@ async fn read_rows_expire_and_unread_rows_do_not() {
             .expect("the probe notification is written");
     }
 
-    let removed = store
-        .prune_read(KEEP_DAYS)
+    let due = store
+        .count_read_past_retention(KEEP_DAYS)
         .await
-        .expect("the retention pass runs");
+        .expect("the retention reading runs");
     assert_eq!(
-        removed, 1,
+        due, 1,
         "only the read row outside the window is due: the unread row is the one \
          a person still has to open, and the recent read row is inside the window"
     );
 
-    for (notification, expected) in [
-        (&long_read, false),
-        (&long_unread, true),
-        (&recent_read, true),
-    ] {
+    // The count is a reading, not an action: every row survives it, including
+    // the one it named. A deletion that came back would have to answer for the
+    // archive first, and there is no archive here.
+    for notification in [&long_read, &long_unread, &recent_read] {
         let present: bool =
             sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM notifications WHERE id = $1)")
                 .bind(uuid::Uuid::parse_str(&notification.id).expect("a uuid"))
                 .fetch_one(&pool)
                 .await
                 .expect("the probe row is read back");
-        assert_eq!(
-            present, expected,
-            "row {:?} survived={present}, expected {expected}",
+        assert!(
+            present,
+            "row {:?} was deleted by a counting pass",
             notification.title
         );
     }

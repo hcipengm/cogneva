@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use cog_core::{EvolutionIntent, SFError, SFResult};
 use tracing::{info, warn};
@@ -69,7 +69,6 @@ pub struct EvolutionDeployer {
     binary_dir: PathBuf,
     backup_dir: PathBuf,
     binary_name: String,
-    build_timeout_secs: u64,
     git_name: String,
     git_email: String,
     /// 共享 CARGO_TARGET_DIR：产物不进临时工作树，工作树用完即弃不丢缓存。
@@ -90,6 +89,24 @@ pub struct EvolutionDeployer {
     last_report: std::sync::Arc<std::sync::Mutex<Option<BuildReport>>>,
 }
 
+/// 这一笔只动了文档吗。
+///
+/// 判据只有一条方向：**只有能证明与二进制无关的路径才算文档**——`.md`，以及
+/// 仓库外的文档目录（那里的文件不是编译输入）。其余
+/// 一律按「要重建」处理，包括 `Cargo.toml`、`build.rs`、任何 `.rs`、以及任何没有
+/// 扩展名的路径。判错的方向必须是多编一次，不能是少编一次：少编一次意味着部署出去
+/// 的二进制里没有这一笔的代码，而它在读数上与「这一笔没有改代码」一模一样。
+fn documentation_only(paths: &[String]) -> bool {
+    !paths.is_empty()
+        && paths.iter().all(|path| {
+            let path = path.trim_start_matches("./");
+            path.ends_with(".md")
+                || path.starts_with("internal-docs/")
+                || path.starts_with("specs/")
+                || path.starts_with("memory/")
+        })
+}
+
 impl EvolutionDeployer {
     pub fn new(
         project_root: impl Into<PathBuf>,
@@ -101,7 +118,6 @@ impl EvolutionDeployer {
             binary_dir: binary_dir.into(),
             backup_dir: backup_dir.into(),
             binary_name: cog_core::paths::APP_BINARY_NAME.to_string(),
-            build_timeout_secs: 3600,
             git_name: "Cogneva Self-Evolution".to_string(),
             git_email: "self-evolution@cogneva.ai".to_string(),
             target_dir: None,
@@ -111,29 +127,18 @@ impl EvolutionDeployer {
         }
     }
 
-    /// Attach the observation sink and take the budget from it, for the same
-    /// reason the pipeline does: one number enforced and reported, not two.
+    /// Attach the observation sink the cost of each build is reported to.
     ///
-    /// The field this sets is the fallback for a deployer with no sink. With one
-    /// attached the budget is read at every build (see
-    /// [`Self::build_budget_secs`]): the sink's number moves as runs are
-    /// measured, and a copy taken here would keep killing at a wall the reading
-    /// no longer reports.
+    /// It no longer carries a wall, because this deployer no longer has one:
+    /// a build is judged by whether it is still moving, not by how long it has
+    /// been running. The sink still gets the measured duration of every build
+    /// that ran, which is what the pipeline's divisor is made of.
     pub fn with_verification_budget(
         mut self,
         budget: Arc<crate::verification_budget::VerificationBudget>,
     ) -> Self {
-        self.build_timeout_secs = budget.timeout_secs(crate::verification_budget::KIND_BUILD);
         self.budget = Some(budget);
         self
-    }
-
-    /// The build budget this run is held to, as of now.
-    fn build_budget_secs(&self) -> u64 {
-        match &self.budget {
-            Some(budget) => budget.timeout_secs(crate::verification_budget::KIND_BUILD),
-            None => self.build_timeout_secs,
-        }
     }
 
     /// Attach the sink the builds report their cost to. One instance is shared
@@ -207,11 +212,6 @@ impl EvolutionDeployer {
         self
     }
 
-    pub fn with_build_timeout(mut self, secs: u64) -> Self {
-        self.build_timeout_secs = secs;
-        self
-    }
-
     pub fn with_git_identity(mut self, name: impl Into<String>, email: impl Into<String>) -> Self {
         self.git_name = name.into();
         self.git_email = email.into();
@@ -267,6 +267,24 @@ impl EvolutionDeployer {
         self.git_add_all(workdir).await?;
         let commit_hash = self.git_commit(workdir, change_id).await?;
 
+        // 只改了文档的一笔不重建：输入没变，重建付的是同一份验证的第二遍钱，
+        // 而产出的字节与原子的那个二进制一模一样。这份判断由路径算，不由人报。
+        let paths = self.changed_paths(workdir, &commit_hash).await?;
+        if documentation_only(&paths) {
+            info!(
+                change_id = %change_id,
+                files = paths.len(),
+                "Only documentation changed; reusing the staged binary"
+            );
+            self.record_build(change_id, intent, BuildEnding::Unstarted, None);
+            let new_binary_path = self.stage_new_binary(workdir).await?;
+            return Ok(BuildArtifact {
+                change_id: change_id.to_string(),
+                commit_hash,
+                new_binary_path,
+                build_duration_secs: 0,
+            });
+        }
         info!(change_id = %change_id, "Building release binary");
         let start = Instant::now();
         let build_result = self
@@ -316,6 +334,28 @@ impl EvolutionDeployer {
             return Err(SFError::IO(format!("git add failed: {}", stderr)));
         }
         Ok(())
+    }
+
+    /// 这次提交改到的那些路径。
+    async fn changed_paths(&self, workdir: &Path, commit: &str) -> SFResult<Vec<String>> {
+        let output = tokio::process::Command::new("git")
+            .args(["show", "--name-only", "--pretty=format:", commit])
+            .current_dir(workdir)
+            .output()
+            .await
+            .map_err(|e| SFError::IO(format!("Failed to list the commit's paths: {}", e)))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SFError::IO(format!(
+                "git show --name-only failed: {stderr}"
+            )));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect())
     }
 
     async fn git_commit(&self, workdir: &Path, change_id: &str) -> SFResult<String> {
@@ -390,34 +430,51 @@ impl EvolutionDeployer {
         for (name, value) in release_build_env(self.target_dir.as_deref()) {
             cmd.env(name, value);
         }
+        // 每道构建的并行宽度取构建闸这一拍量出来的份额（宿主核数 ÷ 一个构建的
+        // 需求），与主线构建同一份测量。闸没装或还没量到宿主时保留进程环境里的
+        // 声明值——那是这台部署给出的种子，不是第二处默认。
+        if let Some(jobs) = crate::build_gate::cargo_jobs() {
+            cmd.env("CARGO_BUILD_JOBS", jobs.to_string());
+        }
         let started = Instant::now();
-        let budget_secs = self.build_budget_secs();
-        // Spawned rather than handed to `output()`: the pid is what the memory
-        // sampler watches, and there is no way to learn it from a call that
-        // waits for the process to end. The pipes are attached here so the
-        // failure text below is the build's own, and `kill_on_drop` keeps the
-        // budget arm's kill: dropping the wait future drops the child.
-        cmd.stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(e) => {
-                // cargo could not be spawned at all, so no build happened: same
-                // class as a build the gate refused, and no duration is
-                // reported for it.
-                self.record_build(change_id, intent, BuildEnding::Unstarted, None);
-                return Err(SFError::IO(format!("Failed to run cargo build: {}", e)));
-            }
-        };
-        let watcher = child.id().map(|pid| {
-            tokio::spawn(crate::build_rss_peak::watch(
-                PathBuf::from("/proc"),
-                pid,
-                crate::build_rss_peak::SAMPLE_PERIOD,
-            ))
+        // 这段构建不再有一个按秒的预算。判据是它还在不在动：每写出一段输出是一拍，
+        // CPU 时间在涨也是一拍——后者是「沉默的编译」唯一的「还在动」证据，而没有
+        // 它，最忙的那一分钟最像停住。判据与编排侧的回收、执行器的看门狗是同一条
+        // （`cog_core::progress`），三处不会漂移。
+        //
+        // pid 要交出去：内存采样器看的是这个进程，而一个等到进程结束才返回的调用
+        // 里拿不到它。
+        let watcher: std::sync::Arc<
+            std::sync::Mutex<
+                Option<tokio::task::JoinHandle<Option<crate::build_rss_peak::RssPeak>>>,
+            >,
+        > = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let watcher_from_spawn = watcher.clone();
+        let build_id = format!(
+            "evolution-build:{change_id}:{}",
+            started.elapsed().as_nanos()
+        );
+        // 构建没有第二个观察者：判停之后没人会再看一眼。所以这里给出回答者——
+        // 归因说它在一个会自己结束的等待里就继续等（界由正常结束的那段静默涨），
+        // 说它热的、却没有对象可等就收掉，结局记成 `Stalled` 而不是 `Failed`。
+        let decide = std::sync::Arc::new(|stall: &cog_core::progress::Stall| {
+            cog_core::progress::action_for(&stall.cause)
         });
-        let waited =
-            tokio::time::timeout(Duration::from_secs(budget_secs), child.wait_with_output()).await;
+        let waited = cog_core::progress::run_child_watched_with_pid_decided(
+            cmd,
+            &build_id,
+            move |pid| {
+                let handle = tokio::spawn(crate::build_rss_peak::watch(
+                    PathBuf::from("/proc"),
+                    pid,
+                    crate::build_rss_peak::SAMPLE_PERIOD,
+                ));
+                *watcher_from_spawn.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
+            },
+            decide,
+        )
+        .await;
+        let watcher = watcher.lock().unwrap_or_else(|p| p.into_inner()).take();
         // Read before the arms below, because two of them return: the number
         // belongs to this build and there is no later point at which it could
         // be attributed to this one rather than to whatever runs next. The wait
@@ -426,6 +483,7 @@ impl EvolutionDeployer {
         // build.
         let peak_rss_bytes = match watcher {
             Some(handle) => {
+                // roundtrip: 一次峰值采样排空的等待
                 match tokio::time::timeout(crate::build_rss_peak::DRAIN_WAIT, handle).await {
                     Ok(Ok(peak)) => peak.map(|p| p.bytes),
                     _ => None,
@@ -433,54 +491,51 @@ impl EvolutionDeployer {
             }
             None => None,
         };
-        // Handed to the gate before the arms below, because a build the budget
-        // killed still measured what it took: the divisor is about what a build
-        // costs, and a build that ran out of time cost that much regardless of
-        // how it ended.
+        // Handed to the gate before the arms below, because a build that was
+        // judged stopped still measured what it took: the divisor is about what
+        // a build costs, and a build that stopped moving cost that much
+        // regardless of how it ended.
         if let Some(bytes) = peak_rss_bytes {
             crate::build_gate::observe_build_memory(bytes);
         }
-        let output = match waited {
-            Ok(result) => {
-                let output = match result {
-                    Ok(output) => output,
-                    Err(e) => {
-                        self.record_build(change_id, intent, BuildEnding::Unstarted, None);
-                        return Err(SFError::IO(format!("Failed to run cargo build: {}", e)));
-                    }
-                };
+        let (output, stopped) = match waited {
+            Ok((cog_core::progress::ChildOutcome::Exited(output), stopped)) => {
                 if let Some(budget) = &self.budget {
                     budget.record_run(
                         crate::verification_budget::KIND_BUILD,
                         started.elapsed().as_secs(),
                     );
                 }
-                output
+                (output, stopped)
             }
-            Err(_) => {
-                // An unbounded release build outlives the pod's own resources
-                // long before it is useful; give up and let the caller roll the
-                // commit back.
-                if let Some(budget) = &self.budget {
-                    budget.record_timeout(crate::verification_budget::KIND_BUILD);
-                }
-                // The host time this build spent is the budget it was cut off
-                // at, and it is reported as such rather than as a measurement
-                // of the work. What it took in memory before it was cut off is
-                // still a real measurement, so it is reported.
-                self.record_build(
-                    change_id,
-                    intent,
-                    BuildEnding::TimedOut(Duration::from_secs(budget_secs)),
-                    peak_rss_bytes,
-                );
-                return Err(SFError::IO(format!(
-                    "cargo build --release exceeded the {}s deployment budget and was killed",
-                    budget_secs
-                )));
+            Err(e) => {
+                // cargo could not be spawned at all, so no build happened: same
+                // class as a build the gate refused, and no duration is
+                // reported for it.
+                self.record_build(change_id, intent, BuildEnding::Unstarted, None);
+                return Err(SFError::IO(format!("Failed to run cargo build: {}", e)));
             }
         };
 
+        // 被按归因收掉的构建：它没有跑完，也没有结论。结局里带着那段静默，读的人
+        // 分得出「这一版坏了」与「它卡住了、没人再等」。
+        if let Some(stall) = stopped {
+            self.record_build(
+                change_id,
+                intent,
+                BuildEnding::Stalled {
+                    silent: stall.silent,
+                    window: stall.window,
+                },
+                peak_rss_bytes,
+            );
+            return Err(SFError::Agent(format!(
+                "cargo build was stopped: {} (silent {:?}, measured window {:?})",
+                stall.cause.describe(),
+                stall.silent,
+                stall.window
+            )));
+        }
         if !output.status.success() {
             self.record_build(
                 change_id,
@@ -583,6 +638,32 @@ fn self_evolution_commit_message(change_id: &str) -> String {
 mod tests {
     use super::*;
 
+    /// 只改了文档的一笔不重建；判错的方向只能是多编一次。
+    #[test]
+    fn only_paths_that_cannot_reach_the_binary_are_documentation() {
+        let paths = |list: &[&str]| list.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        // 文档：`.md` 与三个文档目录。
+        assert!(documentation_only(&paths(&["specs/a.md"])));
+        assert!(documentation_only(&paths(&["internal-docs/2026-11-26.md"])));
+        assert!(documentation_only(&paths(&["crates/a/README.md"])));
+        assert!(documentation_only(&paths(&["specs/a.md", "memory/x.md"])));
+        // 编译输入与认不出的路径：一律重建。
+        assert!(!documentation_only(&paths(&["crates/a/src/lib.rs"])));
+        assert!(!documentation_only(&paths(&["Cargo.toml"])));
+        assert!(!documentation_only(&paths(&["crates/a/build.rs"])));
+        assert!(!documentation_only(&paths(&[
+            "deploy/helm/cogneva/values.yaml"
+        ])));
+        assert!(!documentation_only(&paths(&[
+            "specs/a.md",
+            "crates/a/src/lib.rs"
+        ])));
+        // 一笔什么都没改（空提交）不算文档单：没有证据时重建。
+        assert!(!documentation_only(&[]));
+    }
+
+    use std::time::Duration;
+
     /// 一个在构建阶段就睡着的 crate：`build.rs` 睡够，`cargo build --release`
     /// 必定超过一秒的预算，而慢的原因握在测试手里，与机器快慢无关。
     fn write_slow_build_crate(root: &std::path::Path) {
@@ -601,42 +682,42 @@ mod tests {
         .unwrap();
     }
 
-    /// 部署侧那条界与测试侧是两条：`build_timeout_secs` 与 `test_timeout_secs`。
-    /// 「超预算被杀、且错误里点名是哪条预算杀的」原先只在测试侧有实测（真跑一次
-    /// `cargo test`），部署侧的界只剩「代码里写着」这一个证据——调这个旋钮时，
-    /// 需要的正是「这个界真的在拦」的读数。
+    /// 一条停在半路、既不输出也烧不动 CPU 的构建：静默是一条**归因**，不是一次判决。
     ///
-    /// 真跑一次 `cargo build --release`。杀掉的这个动作要留两处痕：错误里点名预算
-    /// （否则事后读这条变更的人分不出「没判过」与「判失败」），结局记成 `TimedOut`
-    /// 而不是「构建失败」（两者占用的宿主时间含义相反，合成一个数就没有哪个数可
-    /// 用来定界）。
+    /// 静默不杀之后（属主 2026-11-23），执行器不会因为它安静而收掉它——它跑完就是
+    /// 跑完，结局是 `Built` 而不是 `Stalled`。归因那一侧（卡在什么状态、等在哪、该
+    /// 做什么）由 `cog-core` 的 `a_child_that_goes_quiet_is_described_not_stopped`
+    /// 钉住；这条用例钉的是执行器这一侧不再拿时钟把它砍掉。
     ///
-    /// 槽位传 `None`：这个测试量的是界本身，不是闸门；在测试里拿一个真槽位会把本
-    /// 进程其它同样真跑构建的测试挤进排队。
+    /// 真跑一次 `cargo build --release`：夹具的 `build.rs` 睡 30 秒，期间一个字节都不
+    /// 输出、CPU 时间一 tick 都不涨。种子只种在这个测试里，并持着进程级的那把锁。
+    ///
+    /// 槽位传 `None`：这个测试量的是判据本身，不是闸门。
     #[tokio::test]
-    async fn a_release_build_that_outlives_its_budget_is_killed_with_the_budget_named() {
+    async fn a_build_that_goes_quiet_is_waited_on_instead_of_killed() {
+        let _guard = cog_core::progress::async_test_lock().await;
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::seed_gaps_for_tests(
+            Duration::from_millis(50),
+            cog_core::progress::SAMPLE_FLOOR,
+        );
+
         let root = tempfile::tempdir().unwrap();
         write_slow_build_crate(root.path());
 
         let deployer = EvolutionDeployer::new(root.path(), root.path(), root.path())
-            .with_binary_name("budget-probe")
-            .with_build_timeout(1);
+            .with_binary_name("budget-probe");
 
-        let err = deployer
-            .run_cargo_build(root.path(), None, "change-budget-probe", None)
+        deployer
+            .run_cargo_build(root.path(), None, "change-quiet-probe", None)
             .await
-            .expect_err("a build that cannot finish in a second must not be waited on");
-
+            .expect("安静不是判停的理由：构建跑完就是跑完");
         assert!(
-            err.to_string()
-                .contains("cargo build --release exceeded the 1s deployment budget"),
-            "the rejection has to name the budget that caused it: {err}"
+            matches!(deployer.last_build_ending(), Some(BuildEnding::Built(_))),
+            "安静地跑完的构建，结局是 Built，不是被砍掉：{:?}",
+            deployer.last_build_ending()
         );
-        assert_eq!(
-            deployer.last_build_ending(),
-            Some(BuildEnding::TimedOut(Duration::from_secs(1))),
-            "a build cut off at the budget is a timeout, not a failure of the change"
-        );
+        cog_core::progress::reset_for_tests();
     }
 
     /// The self-generated commit is the one this repository would otherwise

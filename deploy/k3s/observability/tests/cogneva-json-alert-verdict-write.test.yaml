@@ -27,7 +27,7 @@ tests:
   - interval: 1m
     input_series:
       - series: 'cogneva_alert_assertion_write_total{outcome="failed"}'
-        values: '0x5 1x15'
+        values: '0x6 1x14'
       - series: 'cogneva_alert_assertion_write_total{outcome="written"}'
         values: '5x20'
     alert_rule_test:

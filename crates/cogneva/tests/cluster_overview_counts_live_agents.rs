@@ -136,6 +136,7 @@ fn state_with(
     let state_backend: Arc<dyn StateBackend> = Arc::new(MemoryStateBackend::new());
 
     Arc::new(GatewayState {
+        llm_call_events: None,
         data_dir: "/tmp".into(),
         config: std::sync::RwLock::new(GatewayConfig {
             http_port: 0,
@@ -144,15 +145,12 @@ fn state_with(
             cors_origins: vec!["*".into()],
             websocket_timeout_secs: 30,
             websocket_inactivity_timeout_secs: 90,
-            websocket_tick_secs: 5,
             notification_limit: 50,
-            sandbox_task_timeout_secs: 30,
             request_timeout_secs: 30,
             notification_webhook_url: None,
             ..Default::default()
         }),
         request_timeout_secs: std::sync::atomic::AtomicU64::new(30),
-        sandbox_task_timeout_secs: std::sync::atomic::AtomicU64::new(30),
         event_tx: broadcast::channel(16).0,
         evolution_stream: None,
         task_event_tx: broadcast::channel(16).0,
@@ -204,10 +202,15 @@ fn state_with(
         observables: Vec::new(),
         metrics_dimensions: Vec::new(),
         mcp_client: None,
+        mcp_call_counts: None,
         workspace_store: None,
         governance_store: None,
+        security_keys: None,
         principle_ledger: None,
         change_ledger: None,
+        intent_events: None,
+        employee_events: None,
+        message_events: None,
         key_value: key_value.map(|kv| kv as Arc<dyn cog_core::KeyValueStore>),
         external_skill_registry: None,
         tool_registry: None,
@@ -227,6 +230,7 @@ fn state_with(
         llm_client: std::sync::Arc::new(std::sync::RwLock::new(None)),
         chat_turns: None,
         conversation: Default::default(),
+        chat_stream: Default::default(),
         agent_messages: None,
         datasets: None,
     })
@@ -288,7 +292,6 @@ async fn the_executor_count_is_the_live_registry() {
                 "10.42.0.10",
                 "worker",
                 "cogneva",
-                Vec::new(),
                 ResourceInfo {
                     cpu_cores: 1,
                     memory_gb: 1,

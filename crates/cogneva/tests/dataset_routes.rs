@@ -59,7 +59,7 @@ impl ObjectBackend for MapObjects {
         Ok(self.objects.lock().unwrap().contains_key(key))
     }
     async fn list(&self, prefix: Option<&str>) -> SFResult<Vec<String>> {
-        let prefix = prefix.unwrap_or_default();
+        let prefix = prefix.unwrap_or(Default::default());
         Ok(self
             .objects
             .lock()

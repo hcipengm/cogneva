@@ -17,7 +17,7 @@
 
 use crate::common;
 
-use common::routes::repo_root;
+use common::routes::{rendered_root, repo_root};
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -43,10 +43,10 @@ fn entries(dir: &Path, want_dir: bool) -> BTreeSet<String> {
 #[test]
 fn the_delivered_set_is_the_set_the_renderer_emitted() {
     let root = repo_root();
-    let rendered = entries(&root.join("deploy/rendered"), true);
+    let rendered = entries(&rendered_root(), true);
     assert!(
         !rendered.is_empty(),
-        "deploy/rendered 下没有任何渲染目录：先跑 deploy/scripts/render-deploy.sh"
+        "deploy/rendered 下没有任何渲染目录：它由 chart 现场生成，先修好渲染链"
     );
 
     let mut on_disk: BTreeSet<String> = rendered
@@ -82,7 +82,7 @@ fn the_delivered_set_is_the_set_the_renderer_emitted() {
 fn every_helm_profile_has_the_tree_it_renders_to() {
     let root = repo_root();
     let profiles = entries(&root.join("deploy/helm/cogneva/profiles"), false);
-    let rendered = entries(&root.join("deploy/rendered"), true);
+    let rendered = entries(&rendered_root(), true);
     assert_eq!(
         profiles, rendered,
         "chart 的 profile 与预渲染目录不是一一对应：缺哪一边，那套拓扑就走上了\

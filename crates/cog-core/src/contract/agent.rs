@@ -32,6 +32,10 @@ pub trait AgentRuntime: Send + Sync {
 /// Agent loop configuration.
 #[derive(Clone)]
 pub struct RuntimeConfig {
+    /// 谁在跑这一轮。没有缺省值：空着就是「还没说自己是谁」，构造没问题，
+    /// 开跑时会被拒绝（见运行时入口的检查）。这里曾经默认成 `"agent"`——
+    /// 一个没人雇过、名册上不存在的员工，却会在账上、日志里、名册外一路留下
+    /// 痕迹，读到的人都以为平台上真有这么一个人。
     pub agent_id: String,
     /// Agent role as an open string (e.g. "planner", "generator").
     /// Constants are defined in `cog-agent::AgentRole` so new roles can be
@@ -45,7 +49,17 @@ pub struct RuntimeConfig {
     /// decision for this deployment, and it reaches here through the config
     /// surface or the role's skill, never as a default nobody measured.
     pub max_iterations: u32,
-    pub context_window_size: usize,
+    /// 这一段对话**当前在用**的上下文窗口（token）；`None` = 还没有任何一条读数。
+    ///
+    /// 这不是一个可以配置的格：部署文档（`agent_loop`）里没有这个键，也没有对应
+    /// 的环境变量。它的来路只有两条读数——上游回报的型号在 LLM 配置里公布的那个数
+    /// （[`crate::model_windows`]：设置页的预设带着厂商规格，随池状态报进来），以及
+    /// 这棵树实测到的界（收下过多大的 prompt、拒收时自述过多大的界），后者按型号
+    /// 分桶、双向校正前者。运行时收到响应后把决定写在这里，读的人从这里看。
+    ///
+    /// `None` 不是零个 token 的窗口：它是「没有读数」，此时不裁，由第一次拒收把界
+    /// 说出来——宁可不设界，也不拿一个没人量过的数去裁掉本来装得下的历史。
+    pub context_window_size: Option<usize>,
     /// TTL for the available_skills cache in seconds.
     pub skill_cache_ttl_secs: u64,
     /// Stall timeout for a single streaming think turn, in seconds.
@@ -56,16 +70,6 @@ pub struct RuntimeConfig {
     /// stream event arrives for this many consecutive seconds, which indicates
     /// a hung connection rather than a slow one.
     pub think_stall_timeout_secs: u64,
-    /// Wall-clock cap for the forced final-draft ask, in seconds.
-    ///
-    /// The stall timeout above bounds silence, not the call: a stream that
-    /// keeps trickling events stays inside it indefinitely. This bounds the
-    /// call itself, and it applies to the one ask that runs *after* the run's
-    /// budget is already spent — the one that must not be open-ended. It is
-    /// larger than the stall timeout on purpose: recoveries that produced a
-    /// deliverable have run into the hundreds of seconds, and the cap exists
-    /// only so a wedged upstream cannot hold a spent run for ten minutes.
-    pub final_draft_timeout_secs: u64,
     /// Optional dynamic skill configuration that overrides role defaults.
     pub skill_config: Option<crate::SkillConfig>,
     /// Optional Crew identifier — attached to lifecycle events so the hook
@@ -84,34 +88,76 @@ pub struct RuntimeConfig {
     /// `None` 表示这个 agent 不属于任何任务（常驻角色、临时评测），它的调用
     /// 就按运行 id 记——不编一个任务名，编出来的会读成一件真花过钱的任务。
     pub owner_task_id: Option<String>,
+    /// 这份活交什么（见 [`crate::Task::deliverable`]）。
+    ///
+    /// 运行时手里只有这份 config，没有任务对象，而「这次运行该不该动手、该按什么
+    /// 判」是任务说的。所以拿到任务的那一层（认领、派单、小队建角色）把它抄进来；
+    /// 抄的人只有一处入口，判的人只有这一位——按角色名判时，同一个人换个任务就被
+    /// 判错。
+    ///
+    /// 缺省是 `Unstated`：没有声明就是「没说」，那就不拿「树没动」当它没进展的
+    /// 证据。这不等于它不会写——它照样能写，只是不会因为没写被收住。用具名状态而
+    /// 不是默认的 `WorkProduct`，是为了让「没人说」与「有人说是工作产物」在读数里
+    /// 分得开。
+    pub deliverable: crate::Deliverable,
+    /// 上面那一格的来源属于哪一类（见 [`crate::DeclarationState`]）。
+    ///
+    /// 与 `deliverable` 是同一份声明的两半：这一格说「这个结论从哪儿来」，那一格
+    /// 说「结论是什么」。两格一起写，写的人只有拿到任务的那一层；分开放是因为
+    /// 运行期的读数要按来源计数，而结论本身回答不了「是没人说、还是说了读不出来」。
+    ///
+    /// 缺省 `Unstated`：没人说。它不等于「说了是工作产物」——那会把一个拼错的词
+    /// 算进「生产者说过了」里。
+    pub deliverable_state: crate::DeclarationState,
+    /// 有人就这件活说过的方向，原文照录（见 [`crate::Task::stated_directions`]）。
+    ///
+    /// 与 `deliverable` 同一个理由、同一条路：运行时没有任务对象，「这一轮什么算好」
+    /// 里那些来自人的话只有拿到任务的那一层抄得进来。判别的时候贴在判据后面，判据
+    /// 本身不动——方向改的是「往哪儿算好」，不是「什么算完整」。
+    ///
+    /// 空表示没人就这件活说过方向。空不是「没有偏好」：它只说明这一条通道上没人
+    /// 开口，而不是说人没有意见。
+    pub stated_directions: Vec<String>,
+}
+
+impl RuntimeConfig {
+    /// 这一轮是否被预期会改工作树。读声明，不另存一份布尔。
+    pub fn declares_change(&self) -> bool {
+        self.deliverable.declares_change()
+    }
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            agent_id: "agent".into(),
+            agent_id: String::new(),
             role: crate::roles::PLANNER.into(),
             // No ceiling by default. Ten turns was the old default and it is
             // shorter than one round of read-change-run-test: every repair run
             // was cut off with a tool call still pending, and the round after
             // it started the same work over from the top.
             max_iterations: u32::MAX,
-            // 32k fallback: 4k windows amputate tool-call history so badly that
-            // CJK task prompts alone trigger trimming, leaving the model with
-            // only the task text each iteration (amnesia → repeated work).
-            context_window_size: 32000,
-            skill_cache_ttl_secs: 30,
-            think_stall_timeout_secs: 240,
+            // `None` = 没人说过。写一个数（32k、64k、1M）都是替上游拍一个它没公
+            // 布过的窗口：写小了裁掉装得下的历史，写大了第一次调用就被拒。起点由
+            // 型号 × 厂商公布规格给出，实测再把它校正到准确值；两个都没有时
+            // 不裁，第一次拒收自述的界就是那个准确的数。
+            context_window_size: None,
+            // 缓存有效期与热加载节拍同源：热加载一扫描就会让缓存失效，缓存
+            // 立在两个节拍之间只是兜住「那一拍没扫到」的窗口。
+            skill_cache_ttl_secs: crate::config::SKILL_HOT_RELOAD_INTERVAL_SECS,
+            think_stall_timeout_secs: (4 * crate::day::SECONDS_PER_MINUTE) as u64,
             // Measured against the recoveries that kept a run alive: the
             // longest one that produced a deliverable spent 326s, and the one
             // that hung outright ran 600s. 420s clears every recovery that has
             // ever worked here with margin for the tail, and still cuts the
             // hang well below the ten minutes it used to hold a spent run.
-            final_draft_timeout_secs: 420,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: crate::Deliverable::Unstated,
+            deliverable_state: crate::DeclarationState::Unstated,
+            stated_directions: Vec::new(),
         }
     }
 }
@@ -362,7 +408,6 @@ pub struct AgentRegistration {
     pub agent_id: String,
     pub role: String,
     pub workspace_id: String,
-    pub capabilities: Vec<String>,
     pub resources: ResourceInfo,
     pub hostname: String,
     pub pod_ip: String,
@@ -380,7 +425,6 @@ impl AgentRegistration {
         pod_ip: impl Into<String>,
         role: impl Into<String>,
         workspace_id: impl Into<String>,
-        capabilities: Vec<String>,
         resources: ResourceInfo,
     ) -> Self {
         let now = Utc::now();
@@ -388,7 +432,6 @@ impl AgentRegistration {
             agent_id: agent_id.into(),
             role: role.into(),
             workspace_id: workspace_id.into(),
-            capabilities,
             resources,
             hostname: hostname.into(),
             pod_ip: pod_ip.into(),
@@ -410,15 +453,22 @@ impl AgentRegistration {
 /// 的常态：探针与按任务起的成员从来不进任何名单。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EmployeeRecord {
+    /// 这位员工的 id：有工号的就是工号的字符串形式（`E0412`）。没有第二个身份
+    /// 字段，也不做地址到人的映射——座位（`squad:<任务>-<职务>`）不是员工，不发号。
     pub agent_id: String,
-    /// 工号。建行时从全局计数器上取一个，此后不改、不回收——退役的人留着它，
-    /// 正如离职员工保留工号。缺省是 `None`：这一格是后加的，早于它的名册行
-    /// 里没有工号，读到 `None` 的人要说「还没编号」，不能拿 0 冒充。
+    /// 工号。人形 id 建行时从全局计数器上取一个，此后不改、不回收——退役的
+    /// 人留着它，正如离职员工保留工号。
+    ///
+    /// **只发给一个人，不发给一把椅子**：座位行（`squad:<任务>-<座位>`）照建
+    /// ——派工要往上面写人——但没有号。座位随任务生灭，每接一件活注册一次，
+    /// 给它发号的话名册行数会长到任务数，「员工」这个读数就不再是编制。所以
+    /// 读到 `None` 有两种实情：这一行是座位（本来就不该有号），或者这一行是
+    /// 早于本列的旧人形行（还没编号）。两者都不许拿 0 冒充。
     #[serde(default)]
     pub number: Option<u32>,
-    /// 建行时注册表上写的用途标签。它随注册更新，因为它描述的是「此刻这个人
-    /// 在做什么」，不是一段写死的性格。
-    pub role: String,
+    // 这里没有 `role`：职务属于这一次任命，不属于这个人。名册行只回答「是谁」；
+    // 此刻在做什么由注册表那一行（`AgentRegistration.role`）或座位地址回答。
+    // 旧行里多余的那一格由 serde 忽略，不需要迁移。
     /// 第一次出现的时间。只在建行时写一次，退役后重建这个人也保留原来那一格
     /// ——否则「在职多久」会跟着每一次重启重新计时。
     pub first_seen: DateTime<Utc>,
@@ -459,8 +509,6 @@ pub trait AgentRegistry: Send + Sync {
     async fn list(&self) -> SFResult<Vec<AgentRegistration>>;
     /// List agents filtered by role.
     async fn list_by_role(&self, role: &str) -> SFResult<Vec<AgentRegistration>>;
-    /// List agents that have all the given capabilities.
-    async fn list_by_capability(&self, capability: &str) -> SFResult<Vec<AgentRegistration>>;
     /// 名册上的全部行，在岗的与退役的都在里面。
     ///
     /// 默认实现返回空：没有名册的实现（测试替身、嵌入式装配）不该被迫编一份
@@ -468,6 +516,17 @@ pub trait AgentRegistry: Send + Sync {
     /// 这个默认值把前者留给它自己去说。
     async fn employees(&self) -> SFResult<Vec<EmployeeRecord>> {
         Ok(Vec::new())
+    }
+
+    /// 发一个工号，并返回由它推出的员工 id（`E0412`）。
+    ///
+    /// 员工是先有工号、再有 id：工号是正本，id、姓名、会话键都从它推出来。
+    /// 先起一个随机 id、之后再补工号，等于给人两个名字，读面迟早要按入口分叉。
+    ///
+    /// 没有编号能力的实现返回 `NotImplemented` 而不是编一个 id：编出来的 id
+    /// 没有工号可推，名册上会多一行「没有编制的人」。
+    async fn mint_employee_id(&self) -> SFResult<String> {
+        Err(crate::SFError::NotImplemented("mint_employee_id".into()))
     }
 
     /// 名册上一个人的那一行；不在册返回 `None`。
@@ -488,7 +547,6 @@ pub trait AgentRegistry: Send + Sync {
 pub struct WorkerInfo {
     pub agent_id: String,
     pub role: String,
-    pub capabilities: Vec<String>,
     /// The task this worker was created for, when it has one.
     ///
     /// `None` is the worker that lives as long as the process — an employee of
@@ -519,6 +577,34 @@ pub trait AgentManager: Send + Sync {
         llm: std::sync::Arc<dyn crate::llm::LlmClient>,
         task_id: Option<&str>,
     ) -> crate::SFResult<std::sync::Arc<dyn crate::Agent>>;
+
+    /// [`Self::create_agent`], plus what the task says about the run's shape.
+    ///
+    /// 「这件活交什么」只有拿着任务的那一层答得出来（[`crate::Task::deliverable`]），
+    /// 而判它的是运行时。缺省实现忽略这一位、退化成 [`Self::create_agent`]：一个
+    /// 还不知道怎么用它的管理器不会因此编造答案，只是那位 agent 拿着 `Unstated`
+    /// 跑——而这正是没有声明时的行为。真正把它传进运行时的管理器要覆盖它。
+    ///
+    /// `stated_directions` 是同一份声明的另一半：有人就这件活说过的方向（见
+    /// [`crate::Task::stated_directions`]）。它和 `deliverable` 一起传，是因为两者
+    /// 回答的是同一次运行的两个问题——「交什么」与「往哪儿算好」——只传前一个
+    /// 的话，判活的标准仍是没人说话的那一份。
+    ///
+    /// `deliverable` 传的是整份声明而不是结论：[`crate::DeliverableDeclaration`]
+    /// 带着来源，运行时靠它把「生产者说的」「平台推的」「没人说」「说了读不出来」
+    /// 分成四个可计数的来源。只传结论的话，这四个到了运行时就只剩一个。
+    async fn create_agent_declaring(
+        &self,
+        agent_id: &str,
+        role: &str,
+        llm: std::sync::Arc<dyn crate::llm::LlmClient>,
+        task_id: Option<&str>,
+        deliverable: crate::DeliverableDeclaration,
+        stated_directions: Vec<String>,
+    ) -> crate::SFResult<std::sync::Arc<dyn crate::Agent>> {
+        let _ = (deliverable, stated_directions);
+        self.create_agent(agent_id, role, llm, task_id).await
+    }
 
     /// Retire every agent this manager created for `task_id`, returning how many
     /// it let go.
@@ -568,16 +654,22 @@ pub trait AgentManager: Send + Sync {
     }
 }
 
-/// Generate a deterministic agent_id from the four input dimensions.
-pub fn generate_agent_id(hostname: &str, pod_ip: &str, role: &str, uuid: &str) -> String {
+/// 一个员工的 id：只由「这个人是谁」算出来。
+///
+/// 身份的输入只有一格：调用方自报的稳定编号（uuid），或安装期指纹——两者都是
+/// 跨重装、跨滚动不变的那一格。姓名、主机名、Pod IP、此刻担的职务都不进来：
+/// 它们会变，而 id 是别的账页上记着的那个人的主键。把职务掺进来的旧写法
+/// （`hostname|pod_ip|role|uuid`）让同一个人换个岗位就变成一个新员工——名下
+/// 的活、账、提交记录全留在旧 id 上，读起来是「老人离岗、新人到岗」。
+///
+/// 这里也是全树唯一一份派生：原来 `cog-storage` 另有一份同函数拷贝，改一处
+/// 另一处不跟着动，两个"同一个人"就分家了。门：
+/// `crates/cogneva/tests/a_person_keeps_one_id_whatever_their_post_test.rs`。
+pub fn agent_id_for_identity(identity: &str) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(hostname.as_bytes());
-    hasher.update(b"|");
-    hasher.update(pod_ip.as_bytes());
-    hasher.update(b"|");
-    hasher.update(role.as_bytes());
-    hasher.update(b"|");
-    hasher.update(uuid.as_bytes());
+    // 域分隔：同一份 blake3 还被别的键用着，前缀把两个命名空间分开。
+    hasher.update(b"cogneva/agent-id/v1\n");
+    hasher.update(identity.as_bytes());
     let hash = hasher.finalize();
     hash.to_hex().to_string()
 }
@@ -686,7 +778,6 @@ mod tests {
             "10.0.0.1",
             "planner",
             "ws-1",
-            vec!["llm".into()],
             ResourceInfo::default(),
         );
         assert_eq!(reg.agent_id, "id-1");

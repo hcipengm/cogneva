@@ -52,7 +52,8 @@ pub const FACE_DRIFT_LOOP: &str = "governance_face_drift";
 pub const FACE_DRIFT_ROLE: &str = "governance_face_drift";
 
 /// How often a pass runs.
-// cap: bound — 一拍跑一趟全量比对；比它更密只是把同一份未变的输入重比一遍
+// cap: fixed — 一拍跑一趟全量比对；比它更密只是把同一份未变的输入重比一遍
+// keep: 删掉后一拍重比未变的输入，读数没更新却多花一轮；由「更密只是重比同一份输入」兜住
 pub const FACE_DRIFT_PASS_INTERVAL: Duration = Duration::from_secs(120);
 
 /// The scrape-only metric carrying each face's current verdict.

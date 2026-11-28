@@ -246,7 +246,7 @@ fn fixture_directories_are_not_the_root_of_any_machine() {
         std::process::id(),
         line!()
     ));
-    let _ = std::fs::remove_dir_all(&scratch);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&scratch));
     let fixture_dir = scratch.join("deploy/scripts/tests");
     std::fs::create_dir_all(&fixture_dir).expect("建夹具目录");
     let clean = scratch.join("deploy/k3s");
@@ -282,7 +282,7 @@ fn fixture_directories_are_not_the_root_of_any_machine() {
     let panicked = std::panic::catch_unwind(|| scan(&empty, 1)).is_err();
     assert!(panicked, "扫不到文件时必须报错，不能静默通过");
 
-    let _ = std::fs::remove_dir_all(&scratch);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&scratch));
 }
 
 /// 普查面里有一块读不出来时必须炸。
@@ -293,7 +293,7 @@ fn fixture_directories_are_not_the_root_of_any_machine() {
 fn a_directory_that_cannot_be_read_is_refused() {
     let missing =
         std::env::temp_dir().join(format!("cogneva-host-paths-absent-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&missing);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&missing));
     let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| text_files(&missing)));
     assert!(
         got.is_err(),

@@ -34,13 +34,15 @@ use cog_core::{SFError, SFResult, ToolDefinition, ToolExecutor};
 /// 探测一条外部命令的墙：20s。
 ///
 /// 这里探的是「这台机器上的运行时认不认某种容器能力」，命令本身是秒级。
-// cap: bound — 探的是这台机器上的运行时认不认某种容器能力，命令本身是秒级
+// cap: fixed — 探的是这台机器上的运行时认不认某种容器能力，命令本身是秒级
+// keep: 删掉后探容器能力永远等一个不响应的运行时；由「命令本身是秒级」兜住
 const PROBE_COMMAND_WAIT: Duration = Duration::from_secs(20);
 
 /// 等 PG Pod Ready 的轮询间隔：2s。
 ///
 /// 总墙是 [`PG_READY_DEADLINE_SECS`]，这个数决定那个墙里最多问几次。
-// cap: bound — 总墙是 PG_READY_DEADLINE_SECS，这个数决定那个墙里最多问几次
+// cap: fixed — 总墙是 PG_READY_DEADLINE_SECS，这个数决定那个墙里最多问几次
+// keep: 删掉后回到「总墙是 PG_READY_DEADLINE_SECS，这个数决定那个墙里最多问几次」所描述的情形；由这条约定兜住
 const POD_READY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 use cog_eval::{
     tools_bound_to, CaseEnv, EvalCase, ExecSeam, ToolFactory, ToolathlonBackend, ToolathlonCheck,
@@ -109,7 +111,6 @@ const ENV_KUBECTL: &str = "COGNEVA_EVAL_KUBECTL";
 const ENV_NAMESPACE: &str = "COGNEVA_EVAL_TOOLATHLON_NAMESPACE";
 const ENV_PACK_IMAGE: &str = "COGNEVA_EVAL_TOOLATHLON_IMAGE";
 const ENV_PG_IMAGE: &str = "COGNEVA_EVAL_TOOLATHLON_PG_IMAGE";
-const ENV_TIMEOUT_SECS: &str = "COGNEVA_EVAL_TOOLATHLON_TIMEOUT_SECS";
 /// pack 容器的 limits 覆盖位。两个必须一起给：它们是一对，单独改一个只会在额度
 /// 或内存的另一侧撞墙（额度按 limits 求和，内存不够则是 OOM）。
 const ENV_PACK_CPU_LIMIT: &str = "COGNEVA_EVAL_TOOLATHLON_CPU_LIMIT";
@@ -117,14 +118,10 @@ const ENV_PACK_MEMORY_LIMIT: &str = "COGNEVA_EVAL_TOOLATHLON_MEMORY_LIMIT";
 /// 运行时的开关：设成 `off` 就是这一次不接。
 const ENV_RUNTIME: &str = "COGNEVA_EVAL_TOOLATHLON_RUNTIME";
 
-/// 单次 Pod 命令的时间上界（秒）。默认比 swe-bench-pro 那一侧宽：一道题要起库、导入
-/// `init.sql.gz`、跑前处理、再跑判分，其中导入那一步本身就按分钟计。这是一个**安全上界**
-/// 不是量出来的界，所以它可覆盖；它的意义是让一条卡住的命令变成一次带原因的失败。
-// cap: bound — 是安全上界而不是量出来的界，所以它可覆盖；它的意义是让一条卡住的命令变成一次带原因的失败
-const DEFAULT_TIMEOUT_SECS: u64 = 1800;
-
 /// 等库就绪的上界（秒）。超过就报「库没起来」，不是继续跑下去把每一格都判成错。
-// cap: bound — 超过就报「库没起来」，不是继续跑下去把每一格都判成错
+// cap: fixed — 超过就报「库没起来」，不是继续跑下去把每一格都判成错
+// keep: 删掉后库没起来也继续跑，把每一格都判成错；由「超过就报库没起来」兜住
+// wall: 等=评测库起来 / 等不到=这一次评测报「库没起来」并结束，不继续跑下去把每一格都判成错——那些格子会说谎，说模型答错了 / 续跑=能，重来是一次新的评测
 const PG_READY_DEADLINE_SECS: u64 = 300;
 
 /// pack 容器（跑题的那一个）的 limits。**这两个数是被额度逼出来的，不是拍的**：
@@ -153,11 +150,17 @@ pub(crate) struct RunOutcome {
     pub(crate) code: Option<i32>,
 }
 
+/// 一次 `exec` 调用的身份。看门狗按 id 记「上一次产出是什么时候」，两条并发的命令
+/// 共用一个 id 时，一边的输出会把另一边的静默盖掉。
+pub(crate) fn next_exec_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 这台宿主上的一台 Pod。`kubectl` 前缀在构造时**探**出来，不写死。
 pub struct PodRuntime {
     prefix: Vec<String>,
     namespace: String,
-    timeout: Duration,
 }
 
 impl PodRuntime {
@@ -170,11 +173,6 @@ impl PodRuntime {
         {
             return Ok(None);
         }
-        let timeout = std::env::var(ENV_TIMEOUT_SECS)
-            .ok()
-            .and_then(|raw| raw.trim().parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or_else(|| Duration::from_secs(DEFAULT_TIMEOUT_SECS));
         let namespace = std::env::var(ENV_NAMESPACE)
             .ok()
             .map(|v| v.trim().to_string())
@@ -199,11 +197,7 @@ impl PodRuntime {
                 continue;
             }
             if probe(&prefix, &namespace).await {
-                return Ok(Some(Self {
-                    prefix,
-                    namespace,
-                    timeout,
-                }));
+                return Ok(Some(Self { prefix, namespace }));
             }
         }
         Ok(None)
@@ -229,27 +223,28 @@ impl PodRuntime {
         Self {
             prefix,
             namespace: namespace.to_string(),
-            timeout: Duration::from_secs(60),
         }
     }
 
-    /// 跑一条 `kubectl` 命令。超时是**失败**不是空结果：吞掉它，这一格的分就读成
+    /// 跑一条 `kubectl` 命令。停住是**失败**不是空结果：吞掉它，这一格的分就读成
     /// 「模型没做对」，而真相是「这台机器没跑完」。
+    ///
+    /// 判「停住」读的是这条命令**还在不在产出**，不是它跑了多久（2026-11-10 拆掉
+    /// 按钟的 `self.timeout`）：进程每写出一段输出就是一拍，判据在
+    /// `cog_core::progress` 里与编排侧回收、执行路由守护共用同一条。所以一道起库、
+    /// 导入、跑前处理、再判分的题——每一步都在印东西——不会被判，而一条一声不响
+    /// 卡住的命令会，判词里带着两个实数（静默多久、实测窗口多少），读的人能复算它。
     pub(crate) async fn exec(&self, args: &[String]) -> anyhow::Result<RunOutcome> {
         let mut cmd = self.command();
-        cmd.args(args);
-        let child = cmd
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("cannot run `{}`: {e}", self.prefix.join(" ")))?;
-        let out = match tokio::time::timeout(self.timeout, child.wait_with_output()).await {
-            Ok(res) => res?,
-            Err(_) => anyhow::bail!(
-                "`{} {}` did not finish within {:?}",
-                self.prefix.join(" "),
-                args.first().map(String::as_str).unwrap_or(""),
-                self.timeout
-            ),
+        cmd.args(args).kill_on_drop(true);
+        // 一次调用一个身份：并发跑的两条命令共用 id 时，一条的输出会被读成另一条
+        // 「还在动」，于是两条都永远不会被判停住。
+        let id = format!("eval-toolathlon:{}", next_exec_id());
+        let out = match cog_core::progress::run_child_watched(cmd, &id).await {
+            Ok(cog_core::progress::ChildOutcome::Exited(out)) => out,
+            Err(e) => {
+                anyhow::bail!("cannot run `{}`: {e}", self.prefix.join(" "))
+            }
         };
         Ok(RunOutcome {
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -300,6 +295,9 @@ impl PodRuntime {
     ///
     /// `Ok(None)` ＝ 命名空间里没有这只配额（治理关掉了，或者这不是那套安装）：
     /// 那时没有额度要抬，Pod 建不建得上由准入自己回答，这里不去替它编一个额度。
+    /// 但那是 apiserver 明确答 `NotFound` 才成立的读法：一次 403、一次连不上、一条
+    /// 被信号打断的命令都没读成，把没读成写成「没有这只配额」，这台机器就会在不知道
+    /// 额度的情况下继续往下走。
     async fn quota(&self) -> anyhow::Result<Option<(Quota, Quota)>> {
         let out = self
             .exec(&[
@@ -311,21 +309,42 @@ impl PodRuntime {
             ])
             .await?;
         if out.code != Some(0) {
-            return Ok(None);
+            if quota_is_absent(&out) {
+                return Ok(None);
+            }
+            anyhow::bail!(
+                "读不到 {QUOTA_NAME} 这只配额（kubectl 退出码 {:?}）：{}。\
+                 没读成不等于「没有这只配额」——后者是治理关掉的说法",
+                out.code,
+                out.stderr.trim()
+            );
         }
         let doc: serde_json::Value = serde_json::from_str(&out.stdout)
             .map_err(|e| anyhow::anyhow!("resourcequota {QUOTA_NAME}: {e}"))?;
-        let side = |pointer: &str| {
-            let map = &doc[pointer];
-            Quota {
-                cpu: map["limits.cpu"].as_str().and_then(cpu_millis).unwrap_or(0),
-                memory: map["limits.memory"]
-                    .as_str()
-                    .and_then(mem_bytes)
-                    .unwrap_or(0),
-            }
+        // 两维都要求是一个读得出来的量：缺了记 0，抬额度那一步就会从一个「用量是 0」
+        // 的假读数出发。
+        let side = |pointer: &str| -> anyhow::Result<Quota> {
+            // `doc[pointer]` 只按**整串**键名查，`"/status/used"` 于是永远查不到，
+            // 两维每次都读成 0——上面那两个 `unwrap_or(0)` 恰好把这件事盖住了。
+            let map = doc.pointer(pointer).ok_or_else(|| {
+                anyhow::anyhow!("resourcequota {QUOTA_NAME} has no {pointer}: {doc}")
+            })?;
+            let dimension = |field: &str, parse: fn(&str) -> Option<u64>| -> anyhow::Result<u64> {
+                let text = map[field].as_str().ok_or_else(|| {
+                    anyhow::anyhow!("resourcequota {QUOTA_NAME} has no {pointer}.{field}: {doc}")
+                })?;
+                parse(text).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "resourcequota {QUOTA_NAME} {pointer}.{field} is not a quantity: {text:?}"
+                    )
+                })
+            };
+            Ok(Quota {
+                cpu: dimension("limits.cpu", cpu_millis)?,
+                memory: dimension("limits.memory", mem_bytes)?,
+            })
         };
-        Ok(Some((side("/status/used"), side("/spec/hard"))))
+        Ok(Some((side("/status/used")?, side("/spec/hard")?)))
     }
 
     /// 把配额的 limits 两维抬到给的那组数（只抬、不降：降是下一次交付的事，
@@ -409,6 +428,7 @@ async fn probe(prefix: &[String], namespace: &str) -> bool {
     let Ok(child) = cmd.kill_on_drop(true).spawn() else {
         return false;
     };
+    // roundtrip: 一次探测命令
     match tokio::time::timeout(PROBE_COMMAND_WAIT, child.wait_with_output()).await {
         // 有的版本对 `no` 也退 0，所以判输出而不只判退出码；反过来 `yes` 却退非 0
         // 只可能是包装脚本出错，那时也不能算「能建」。
@@ -597,6 +617,15 @@ fn cpu_millis(text: &str) -> Option<u64> {
 
 fn cpu_text(millis: u64) -> String {
     format!("{millis}m")
+}
+
+/// `get resourcequota` 没拿到 0 时：这一格是「没这只配额」，还是「没问出来」。
+///
+/// 只有 apiserver 明确答 `NotFound`（带退出码 1）才是前者。403（没有读配额的权限）、
+/// 连不上、被信号打断（没有退出码）都是后者——把它们读成「没有这只配额」，这台机器
+/// 就会在不知道额度的情况下继续往下走。
+fn quota_is_absent(out: &RunOutcome) -> bool {
+    out.code == Some(1) && (out.stderr.contains("NotFound") || out.stderr.contains("not found"))
 }
 
 fn mem_bytes(text: &str) -> Option<u64> {
@@ -1290,6 +1319,83 @@ mod tests {
         let a = pod_name(&format!("toolathlon-{}a", "z".repeat(60)));
         let b = pod_name(&format!("toolathlon-{}b", "z".repeat(60)));
         assert_ne!(a, b);
+    }
+
+    /// 一条 `kubectl` 的回话：只看退出码与 stderr。
+    fn kubectl_said(code: Option<i32>, stderr: &str) -> RunOutcome {
+        RunOutcome {
+            stdout: String::new(),
+            stderr: stderr.into(),
+            code,
+        }
+    }
+
+    /// 没这只配额与没问出来是两件事：前者是治理关掉的说法，后者说明这一格没有读数。
+    #[test]
+    fn a_missing_quota_is_told_apart_from_a_lookup_that_failed() {
+        assert!(quota_is_absent(&kubectl_said(
+            Some(1),
+            "Error from server (NotFound): resourcequotas \"x\" not found"
+        )));
+        assert!(!quota_is_absent(&kubectl_said(
+            Some(1),
+            "Error from server (Forbidden): resourcequotas \"x\" is forbidden"
+        )));
+        assert!(!quota_is_absent(&kubectl_said(
+            Some(1),
+            "Unable to connect to the server: dial tcp 10.0.0.1:6443: i/o timeout"
+        )));
+        // 被信号打断：没有退出码，它连「apiserver 说了什么」都算不上。
+        assert!(!quota_is_absent(&kubectl_said(None, "not found")));
+    }
+
+    /// 一只只答一句话的 `kubectl`：脚本由用例给，`-n <namespace>` 落成 `$0`。
+    fn kubectl_script(script: &str) -> PodRuntime {
+        PodRuntime::for_test(vec!["/bin/sh".into(), "-c".into(), script.into()], "ns")
+    }
+
+    /// 403 不是「没有这只配额」：旧代码把它读成 `Ok(None)`，于是这台机器以为没有
+    /// 额度要抬，Pod 建不上时也没人知道额度从来没读到过。
+    #[tokio::test]
+    async fn a_forbidden_quota_lookup_is_an_error_not_an_absent_quota() {
+        let runner = kubectl_script(
+            "echo 'Error from server (Forbidden): resourcequotas \"x\" is forbidden: User cannot get' >&2; exit 1",
+        );
+        let error = runner.quota().await.expect_err("403 不是「没有这只配额」");
+        assert!(format!("{error:#}").contains("Forbidden"), "{error:#}");
+    }
+
+    /// 反例：apiserver 明确答 NotFound 时，`Ok(None)` 是诚实的读法。
+    #[tokio::test]
+    async fn a_namespace_without_the_quota_is_not_a_failure() {
+        let runner = kubectl_script(
+            "echo 'Error from server (NotFound): resourcequotas \"x\" not found' >&2; exit 1",
+        );
+        assert!(runner.quota().await.expect("没这只配额不是错").is_none());
+    }
+
+    /// 两维缺一格就是没读成，不许记 0——抬额度那一步会从一个「用量是 0」的假读数
+    /// 出发。
+    #[tokio::test]
+    async fn a_quota_answer_without_both_dimensions_is_not_read_as_zero() {
+        let runner = kubectl_script(
+            r#"printf '%s' '{"status":{"used":{"limits.cpu":"2"}},"spec":{"hard":{"limits.cpu":"4","limits.memory":"8Gi"}}}'"#,
+        );
+        let error = runner.quota().await.expect_err("缺一维不是「用量为 0」");
+        assert!(format!("{error:#}").contains("limits.memory"), "{error:#}");
+    }
+
+    /// 反例：两维都在的配额照常读出来。
+    #[tokio::test]
+    async fn a_quota_answer_is_read_from_its_limits() {
+        let runner = kubectl_script(
+            r#"printf '%s' '{"status":{"used":{"limits.cpu":"2","limits.memory":"4Gi"}},"spec":{"hard":{"limits.cpu":"4","limits.memory":"8Gi"}}}'"#,
+        );
+        let (used, hard) = runner.quota().await.unwrap().expect("有一份读数");
+        assert_eq!(used.cpu, 2000);
+        assert_eq!(used.memory, 4 * (1u64 << 30));
+        assert_eq!(hard.cpu, 4000);
+        assert_eq!(hard.memory, 8 * (1u64 << 30));
     }
 
     #[test]

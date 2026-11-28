@@ -39,6 +39,11 @@
 #       的是一堆数，而不知道这些数说的是谁。两处必须是同一个组件、同一份读数——
 #       各画一份的那天，同一台节点的 CPU 会在两页上给出两个数。
 #
+#   13. 没量到的用量不许印成 0。服务端没有样本时发的是 `null`（cluster.rs 里那句
+#       「没有样不是 0 毫核」），读面写成 `formatBytes(memory_used_bytes ?? 0)`
+#       就把「这一拍没量到」印成「用了 0」——一个要去查采集器的容器，与一个真
+#       闲着没吃内存的容器在屏上同形，而两件事该做的动作相反。
+#
 # 用法：bash deploy/scripts/check-web-topology-panel.sh [仓库根目录]
 set -euo pipefail
 
@@ -320,6 +325,27 @@ else:
             "ResourcesView: 挂了拓扑树但没把读数递进去——它会自己再读一条，"
             "同一屏上同一个接口问两次，两处的数各按各的间隔跳"
         )
+
+# ── 13. 没量到的用量不许印成 0 ──
+# 用量这一列只有两种写法：量到的数，或者「无读数」。服务端没样本时发 `null`，
+# 折成 0（`?? 0`）的屏上没有人看得出那是一次没做成的测量。
+FOLDED_USAGE = re.compile(
+    r"\b(?:cpu_used_millicores|memory_used_bytes)\s*\?\?\s*0(?![\d.])"
+)
+folded = []
+for root, _dirs, names in os.walk(WEB):
+    for name in names:
+        if not name.endswith((".ts", ".tsx")):
+            continue
+        path = os.path.join(root, name)
+        for lineno, line in enumerate(open(path, encoding="utf-8"), 1):
+            if FOLDED_USAGE.search(line):
+                folded.append(f"{os.path.relpath(path, WEB)}:{lineno}")
+if folded:
+    problems.append(
+        f"{', '.join(folded)}: 把没量到的用量折成了 0（`?? 0`）——服务端没读到那一格时"
+        "发的是 null，「这一拍没量到」与「用了 0」不该在屏上同形"
+    )
 
 if problems:
     sys.exit("拓扑读面的消费者不合格：\n  " + "\n  ".join(problems))

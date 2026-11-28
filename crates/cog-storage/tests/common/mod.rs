@@ -134,3 +134,22 @@ pub async fn cleanup_ledger(pool: &PgPool, marker: &str) {
             .unwrap_or_else(|e| panic!("clean up {table}: {e}"));
     }
 }
+
+/// 按名字应用这一 crate 的迁移文件，走调用方自己的池。
+///
+/// 与 [`migrate_once`] 的分工：那一条把整本迁移跑到**库**上；这一条按文件跑，落点
+/// 是池子 search_path 指向的那个 schema——每个用例自己建一个 schema 时用它，否则
+/// 两个用例的表会撞在 `public` 上。
+///
+/// 两个套件原本各抄了一份逐字相同的函数体，共享步骤门按体判出了它们（2026-11-24）。
+pub async fn apply_migration_files(pool: &PgPool, files: &[&str]) {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/postgres");
+    for file in files {
+        let sql =
+            std::fs::read_to_string(dir.join(file)).unwrap_or_else(|e| panic!("read {file}: {e}"));
+        sqlx::raw_sql(&sql)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("apply {file}: {e}"));
+    }
+}

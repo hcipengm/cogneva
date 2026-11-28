@@ -905,7 +905,7 @@ window.opener.postMessage({ type: 'demo-word', code: code, state: state }, '*');
 
 const FIXTURE_LOGIN_PAGE: &str = "\
 fn page() {
-    let _ = \"<script>postMessage({{ type: 'login-word', data: d }}, origin)</script>\";
+    cog_core::ignore_lost!(\"<script>postMessage({{ type: 'login-word', data: d }}, origin)</script>\");
 }
 ";
 

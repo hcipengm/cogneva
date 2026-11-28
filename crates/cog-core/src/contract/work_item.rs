@@ -16,9 +16,10 @@
 //!   内容块，不是 base64 文本）。
 //! - **验收判据**：`acceptance`。可证伪的一句一句写，答案对不对由它判，不由
 //!   接活的人的角色判。
-//! - **预算**：`timeout_seconds`。平台不拿它砍任何一条正在跑的活，所以它只是
-//!   交活那一侧自己愿意等多久的声明；另造一个没人读的预算字段只会让两处数字
-//!   各说各话。
+//! - **声明的时长**：`declared_duration_seconds`。平台不拿它砍任何一条正在跑的
+//!   活，所以它只是交活那一侧声明这件活预计多久；另造一个没人读的预算字段只会
+//!   让两处数字各说各话。名字不叫 timeout：这个仓里 `timeout` 的意思就是到点杀，
+//!   而任务行上的这个数从来不是刀。
 //! - **写回**：`TaskResult`，答案原样交给交活的那一方；`metadata` 记 `agent:<id>`，
 //!   所以事后能说清是谁干的，而不是「平台干的」。
 //!
@@ -35,7 +36,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 /// 交接读回任务行的间隔。
-// cap: bound — 答案被读到的延迟就是这一格；再密一点，安静的那一方也成了负载
+// cap: fixed — 答案被读到的延迟就是这一格；再密一点，安静的那一方也成了负载
+// keep: 删掉后答案被读到的延迟没有格，安静的那一方也成了负载；由「再密一点安静的一方也成负载」兜住
 pub const WORK_ITEM_POLL: Duration = Duration::from_millis(500);
 
 /// 交接只向任务图问两个问题。
@@ -47,8 +49,11 @@ pub const WORK_ITEM_POLL: Duration = Duration::from_millis(500);
 pub trait WorkItemGraph: Send + Sync {
     /// 把活投进图里，返回真正落下的行 id（已存在时可能只有返回、没有插入）。
     async fn submit(&self, goal: &str, tasks: Vec<crate::Task>) -> crate::SFResult<Vec<String>>;
-    /// 按 id 读回一行；图里没有这一行时是 `None`，不是错误。
-    async fn row(&self, id: &str) -> Option<crate::Task>;
+    /// 按 id 读回一行；图里没有这一行时是 `Ok(None)`，读不到是 `Err`。
+    ///
+    /// 两个答案分开，是这一口存在的理由：把「读不到」折成 `None`，交接的一方
+    /// 读不出「那一行不在」与「这一拍没能读到」的差别（见 CC25）。
+    async fn row(&self, id: &str) -> crate::SFResult<Option<crate::Task>>;
 }
 
 /// 编排器就是这样一个任务图：窄口的两问都已经是它公开的两问。
@@ -58,14 +63,14 @@ impl<T: crate::OrchestratorControl + ?Sized> WorkItemGraph for T {
         self.submit_goal_auto(goal, tasks).await
     }
 
-    async fn row(&self, id: &str) -> Option<crate::Task> {
-        self.get_task(id).await
+    async fn row(&self, id: &str) -> crate::SFResult<Option<crate::Task>> {
+        self.get_task_checked(id).await
     }
 }
 
 /// 投一件活进去，等它到终态，把答案交回来。
 ///
-/// `wait` 是**这一侧**的耐心，与任务行上的 `timeout_seconds` 不是一回事：平台
+/// `wait` 是**这一侧**的耐心，与任务行上声明的时长不是一回事：平台
 /// 不按已用时长收任何正在跑的活，所以「我们不等了」与「这件活失败了」本来就是
 /// 两句不同的话——前者返回时任务还在跑，它的结果仍然会落到行上。两处取同一个
 /// 数只会让这两种结局在时间上撞在一起，让读的人以为它们有因果。
@@ -76,14 +81,17 @@ pub async fn run_work_item<G: WorkItemGraph + ?Sized>(
     graph: &G,
     goal: &str,
     task: crate::Task,
-    wait: Duration,
+    wait: Option<Duration>,
 ) -> crate::SFResult<serde_json::Value> {
     let id = task.id.clone();
     let submitted = graph.submit(goal, vec![task]).await?;
     let id = submitted.into_iter().next().unwrap_or(id);
-    let deadline = tokio::time::Instant::now() + wait;
+    // 有没有等待上限是交活那一方的选择：给 `None` 就一直等到它到终态——那条寿命
+    // 的界不在这一层，而在任务自己的租约与实测步间隔上。有上限时到点只报告
+    // 「没等到」，不杀那件活。
+    let deadline = wait.map(|bound| tokio::time::Instant::now() + bound);
     loop {
-        if let Some(row) = graph.row(&id).await {
+        if let Some(row) = graph.row(&id).await? {
             match row.status {
                 crate::TaskStatus::Completed => {
                     return row.result.ok_or_else(|| {
@@ -103,13 +111,17 @@ pub async fn run_work_item<G: WorkItemGraph + ?Sized>(
             }
         }
         let now = tokio::time::Instant::now();
-        if now >= deadline {
-            return Err(crate::SFError::Agent(format!(
-                "the work item {id} did not reach a terminal state within {}s",
-                wait.as_secs()
-            )));
+        if let Some(deadline) = deadline {
+            if now >= deadline {
+                return Err(crate::SFError::Agent(format!(
+                    "the work item {id} did not reach a terminal state within {}s",
+                    wait.map(|w| w.as_secs()).unwrap_or_default()
+                )));
+            }
+            tokio::time::sleep(WORK_ITEM_POLL.min(deadline - now)).await;
+        } else {
+            tokio::time::sleep(WORK_ITEM_POLL).await;
         }
-        tokio::time::sleep(WORK_ITEM_POLL.min(deadline - now)).await;
     }
 }
 
@@ -195,7 +207,7 @@ mod tests {
             Ok(vec!["item-1".into()])
         }
 
-        async fn row(&self, id: &str) -> Option<crate::Task> {
+        async fn row(&self, id: &str) -> crate::SFResult<Option<crate::Task>> {
             let mut polls = self.polls.lock().unwrap();
             *polls += 1;
             let poll = *polls;
@@ -204,7 +216,7 @@ mod tests {
                 row.status = crate::TaskStatus::Completed;
                 row.result = Some(self.answer.clone());
             }
-            (row.id == id).then_some(row)
+            Ok((row.id == id).then_some(row))
         }
     }
 
@@ -217,7 +229,25 @@ mod tests {
             crate::TaskType::Custom(PLATFORM_AGENT_TASK.into()),
             serde_json::json!({}),
         );
-        let answer = run_work_item(&graph, "judge it", task, Duration::from_secs(5))
+        let answer = run_work_item(&graph, "judge it", task, Some(Duration::from_secs(5)))
+            .await
+            .expect("the row completes");
+        assert_eq!(answer["result"], "ok");
+    }
+
+    /// 不给等待上界时，答案仍在它到终态的那一刻回来——界不在这一层。
+    ///
+    /// 没有这次改动这条会红：`run_work_item` 的 `wait` 不是 `Option`，交活的一侧
+    /// 只能从「声明工期」和「等待上界」两个数里再挑一个，而两个都没有量过。
+    #[tokio::test]
+    async fn without_a_wait_bound_the_answer_still_comes_back_on_completion() {
+        let graph = ScriptedGraph::new(3, serde_json::json!({"result": "ok"}));
+        let task = crate::Task::new(
+            "item-1",
+            crate::TaskType::Custom(PLATFORM_AGENT_TASK.into()),
+            serde_json::json!({}),
+        );
+        let answer = run_work_item(&graph, "judge it", task, None)
             .await
             .expect("the row completes");
         assert_eq!(answer["result"], "ok");
@@ -232,7 +262,7 @@ mod tests {
             crate::TaskType::Custom(PLATFORM_AGENT_TASK.into()),
             serde_json::json!({}),
         );
-        let err = run_work_item(&graph, "judge it", task, Duration::from_millis(50))
+        let err = run_work_item(&graph, "judge it", task, Some(Duration::from_millis(50)))
             .await
             .expect_err("nothing settles");
         assert!(err.to_string().contains("did not reach a terminal state"));

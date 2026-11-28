@@ -1,4 +1,3 @@
-//! principle: feedback_a_gate_must_name_the_defect_it_stops
 //!
 //! 业务 Pod 连库用的角色不是实例的超级用户。
 //!
@@ -34,6 +33,35 @@ use common::routes::{read, repo_root};
 
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// 一段 Rust 源码里「写哪张表」的那些点名：`INSERT INTO <表>` 与 `UPDATE <表>`。
+///
+/// 只认这两种字面形状。参数化出来的 `INSERT INTO public."{table}"` 是一次按备份包
+/// 搬运，搬的是包里自己的内容，不是演练要记的账——它不是这里要判的那一族。
+fn written_tables(source: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for needle in ["INSERT INTO ", "UPDATE "] {
+        let mut rest = source;
+        while let Some(at) = rest.find(needle) {
+            rest = &rest[at + needle.len()..];
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            // `public.foo` 这种限定形式只取表名那一段。
+            let name = name.trim_start_matches("public").trim_start_matches('_');
+            // `ON CONFLICT … DO UPDATE SET` 里的 `SET` 不是一张表：它是同一条语句
+            // 的后半截，读到它会让这条判据要求去授一个不存在的名字。
+            let sql_word = matches!(name, "SET" | "ON" | "WHERE" | "RETURNING" | "SELECT");
+            if !name.is_empty() && !sql_word && !name.starts_with(|c: char| c.is_ascii_digit()) {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
 
 /// 业务连库必须落在的那个角色。
 const APP_ROLE: &str = "cog_app";
@@ -289,6 +317,19 @@ fn the_restricted_role_is_created_before_anything_uses_it() {
         "对象所有权没挪给 cog_app：分区维护要表属主，GRANT 给不出那一格"
     );
 
+    // 演练那个角色的写权不能只靠一张名单：名单盖的是 bootstrap 跑完那一刻已有的
+    // 表，迁移之后新建的表会漏授（2026-11-26 现场：`backup_drill_attempts` 晚于
+    // bootstrap 建出来，整趟演练以 `permission denied` 收尾，那一夜读起来像没跑过）。
+    // 默认权限补的正是这个盲区：此后 cog_app 建的表也归 cog_backup 写。
+    assert!(
+        script.contains("ALTER DEFAULT PRIVILEGES FOR ROLE cog_app"),
+        "引导脚本没有给此后新建的表授 cog_backup 的写权：晚建的表会让演练以 permission denied 收尾"
+    );
+    assert!(
+        script.contains("GRANT SELECT, INSERT, UPDATE ON TABLES TO cog_backup"),
+        "默认权限那条没有点名 cog_backup 的写权；名字写错等于什么都没授"
+    );
+
     // 清单侧：Job 与它挂的 ConfigMap 都要在，且两份清单（chart 与静态）都在。
     for path in [
         root.join("deploy/helm/cogneva/templates/db-role-bootstrap.yaml"),
@@ -353,11 +394,28 @@ fn the_drill_role_carries_only_what_the_drill_needs() {
         script.contains("GRANT pg_read_all_data TO cog_backup"),
         "演练那个角色没有读全部表：逐表 GRANT 是一份快照，而比对要读每一张表"
     );
+    // 演练写的那几张表必须逐张点到名。`pg_read_all_data` 只给读，写是一张一授权的，
+    // 而漏一张的表现不是一句明话：那一趟跑到最后一行才 `permission denied`，账本上
+    // 它读起来像根本没跑过。2026-11-01 是 `backup_drills`，2026-11-19 是
+    // `backup_drill_attempts`——同一个形状犯过两次，所以这里不钉某一句 SQL，钉的是
+    // 「演练代码里写到的每张表，引导脚本都授到了」。
     assert!(
-        script.contains("GRANT INSERT ON public.backup_drills TO cog_backup"),
-        "演练那个角色写不进 backup_drills：它给出的结论就写在那儿，写不进去这一趟等于没跑\
-         （2026-11-01 实测：恢复与比对全部通过，最后一行 `permission denied for table backup_drills`）"
+        script.contains("GRANT SELECT, INSERT, UPDATE ON public.%I TO cog_backup"),
+        "引导脚本里没有那条逐表授权：演练写不进它自己那几行，这一趟等于没跑"
     );
+    let drill = read(&root.join("crates/cogneva/src/backup.rs"));
+    let written = written_tables(&drill);
+    assert!(
+        written.len() >= 2,
+        "从 backup.rs 里一张写表都没读出来，这条判据就什么也没判：{written:?}"
+    );
+    for table in &written {
+        assert!(
+            script.contains(&format!("'{table}'")),
+            "演练会写 `{table}`，而引导脚本没有把它授给 cog_backup：那一趟会在收尾时\
+             `permission denied`，账本上它与「根本没跑」同形（读到的写表：{written:?}）"
+        );
+    }
     assert!(
         !script.contains("GRANT cog_app TO cog_backup"),
         "把演练那个角色授成 cog_app 的成员等于没分家：它可以 SET ROLE 过去"

@@ -1,3 +1,4 @@
+// census-keep: shapes=clocks — 这里调用的是外部安装器（apt）：期限与重试是 apt 自己的选项（Acquire::http::Timeout／Retries），删掉会让安装挂死在网络等待上，由 apt 的公开约定兜住
 //! CN 模式换 apt 源。
 //!
 //! 不换源的后果是安装卡死而不是报错：`apt-get update` 直连 archive.ubuntu.com /
@@ -17,7 +18,9 @@ use tracing::{info, warn};
 ///
 /// 这一步只决定用不用得上镜像；等不到就当它不可用、换下一个候选，拖久了会让
 /// 整条装机链路在探测上多花掉几分钟。
-// cap: bound — 这一步只决定用不用得上镜像；等不到就当它不可用换下一个候选，拖久了会让整条装机链路在探测上多花几分钟
+// cap: fixed — 这一步只决定用不用得上镜像；等不到就当它不可用换下一个候选，拖久了会让整条装机链路在探测上多花几分钟
+// keep: 删掉后一次对不应答镜像的探测会一直挂着，整条装机链路卡在探测上；由「一次探测是一次 HTTP 往返」兜住
+// wall: 等=镜像站对一次探测的答复 / 等不到=这个候选读作「用不上」，换下一个；不改变已经选定的源 / 续跑=能，下一个候选接着试
 const MIRROR_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 国内 apt 镜像候选。与 bootstrap.sh 的候选表同源（同样由测试盯着）。
@@ -60,7 +63,12 @@ pub fn rewrite_apt_sources(text: &str, base: &str) -> String {
 
 /// 按 /etc/os-release 读出（发行版 id, 版本代号）。代号用于探活目标路径。
 fn distro_id_and_codename() -> (String, String) {
-    let text = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+    let text = std::fs::read_to_string("/etc/os-release")
+        .map_err(|e| e.to_string())
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "读取不到 /etc/os-release，按空文本处理发行版识别");
+            String::new()
+        });
     let field = |key: &str| -> Option<String> {
         text.lines()
             .find_map(|l| l.strip_prefix(&format!("{key}=")))

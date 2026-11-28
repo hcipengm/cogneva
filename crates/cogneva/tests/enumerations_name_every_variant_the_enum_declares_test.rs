@@ -42,7 +42,6 @@ use common::rust_production::{
 
 /// 一段源码里所有 `enum <Name> { … }` 的变体。
 fn enums_in(file: &str, source: &str) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
-    let bytes = source.as_bytes();
     let mut enums = BTreeMap::new();
     let mut cursor = 0;
     while let Some(offset) = source[cursor..].find("enum ") {
@@ -63,7 +62,7 @@ fn enums_in(file: &str, source: &str) -> Result<BTreeMap<String, BTreeSet<String
             .find('{')
             .map(|i| cursor + i)
             .ok_or_else(|| format!("  `{file}` 的 `enum {name}` 没有函数体"))?;
-        let close = body_end(bytes, open)
+        let close = body_end(source, open)
             .ok_or_else(|| format!("  `{file}` 的 `enum {name}` 括号不闭合：读不出来按红处理"))?;
         let variants = variants_of(&source[open + 1..close]);
         if !variants.is_empty() {
@@ -94,60 +93,17 @@ fn variants_of(body: &str) -> BTreeSet<String> {
     variants
 }
 
-/// 从 `open`（一个 `{`）开始找到配对的那个。字符串、字符字面量与生命周期都不算
-/// 括号——枚举与 `impl` 体里三者都会出现。
-fn body_end(bytes: &[u8], open: usize) -> Option<usize> {
-    let mut depth = 0i32;
-    let mut i = open;
-    while i < bytes.len() {
-        if let Some(end) = raw_string_end(bytes, i) {
-            i = end;
-            continue;
-        }
-        match bytes[i] {
-            b'"' => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'"' {
-                    if bytes[i] == b'\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-                if i >= bytes.len() {
-                    return None;
-                }
-            }
-            b'\'' => {
-                if i + 2 < bytes.len() && bytes[i + 2] == b'\'' {
-                    i += 2;
-                } else if i + 3 < bytes.len() && bytes[i + 1] == b'\\' && bytes[i + 3] == b'\'' {
-                    i += 3;
-                } else {
-                    i += 1;
-                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-                    {
-                        i += 1;
-                    }
-                    continue;
-                }
-            }
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
+/// 从 `open`（一个 `{`）开始找到配对的那个。
+///
+/// 配平问的是「哪里是代码」，那是 [`common::lex`] 那台状态机的题目：这里原来自己走
+/// 字节，认字符串与字面量、不认注释，`impl` 体里注释中的花括号就能把配平挪进半句
+/// 话中间，判词于是收口成「括号不闭合」。方言表只留一份，从这里调它。
+fn body_end(text: &str, open: usize) -> Option<usize> {
+    common::routes::matching_brace(text, open, Dialect::Rust)
 }
 
 /// 一段源码里每一处 `impl <Name> { … const ALL … }` 引用的变体名。
 fn all_lists_in(file: &str, source: &str) -> Result<Vec<(String, BTreeSet<String>)>, String> {
-    let bytes = source.as_bytes();
     let mut lists = Vec::new();
     let mut cursor = 0;
     while let Some(offset) = source[cursor..].find("impl") {
@@ -178,7 +134,7 @@ fn all_lists_in(file: &str, source: &str) -> Result<Vec<(String, BTreeSet<String
             continue;
         }
         let open = source.len() - after_name.len();
-        let close = body_end(bytes, open)
+        let close = body_end(source, open)
             .ok_or_else(|| format!("  `{file}` 的 `impl {name}` 括号不闭合：读不出来按红处理"))?;
         cursor = close;
         let body = &source[open + 1..close];

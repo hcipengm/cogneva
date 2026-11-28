@@ -55,6 +55,69 @@ grep -qF "account.refresh, overview.refresh]" "${work}/web/src/views/TokenView.t
   && fail "改动没落到 TokenView.tsx：overview.refresh 还挂在订阅上"
 expect_red "额度窗不跟帧" "没把池子的那份读数跟花销几读一起交给"
 
+# 2. 带时限的读等于「帧到了也不动」的那一块：一个只由 30 秒定时器驱动的面，
+#    不许因为「没有订阅钩子」而混进「只由人触发」那一类。
+fixture
+cat > "${work}/web/src/views/ProbeView.tsx" <<'TSX'
+import { listHooks } from '@/api/client';
+import { useResource } from '@/hooks/useResource';
+
+export function ProbeView() {
+  const page = useResource('探针', listHooks, 30_000);
+  return <pre>{JSON.stringify(page.data)}</pre>;
+}
+TSX
+expect_red "带时限的读却没人订帧" "没订任何帧：ProbeView.tsx"
+
+# 3. 「只由人触发」是判出来的，不是一张名字表：同一份读，时限写 0 时它只由人触发、
+#    不该进「没订任何帧」那一类；把时限改成 30 秒，它立刻变成「帧到了也不动」的面，
+#    必须红。搜索面改成手工触发之后树里不再有「时限为 0 的读」，所以这一条用夹具
+#    自己的面来判——判的仍是那份读的时限，不是某个文件名。
+fixture
+cat > "${work}/web/src/views/LazyView.tsx" <<'TSX'
+import { listHooks } from '@/api/client';
+import { useResource } from '@/hooks/useResource';
+
+export function LazyView() {
+  const page = useResource('按需读的钩子', listHooks, 0);
+  return <pre>{JSON.stringify(page.data)}</pre>;
+}
+TSX
+# 夹具只有 web/src，没有那几份 crates 文本，检查器读完面之后会停在那里；这一条要问
+# 的只是「这一面进没进『没订任何帧』那张名单」，不是整条门绿不绿。
+out="$(bash "${checker}" "${work}" 2>&1)" || true
+case "${out}" in
+  *"没订任何帧：LazyView.tsx"*)
+    fail "时限为 0 的读被当成了「帧到了也不动」：它只由人触发，不该进那张名单" ;;
+esac
+echo "ok(green): 只由人触发"
+python3 - "${work}/web/src/views/LazyView.tsx" <<'PY'
+import sys
+
+path = sys.argv[1]
+src = open(path, encoding="utf-8").read()
+before = "listHooks, 0);"
+after = "listHooks, 30_000);"
+if before not in src:
+    sys.exit("fixture: LazyView.tsx 里找不到那份时限为 0 的读")
+open(path, "w", encoding="utf-8").write(src.replace(before, after))
+PY
+expect_red "只由人触发的面被加上了定时器" "没订任何帧：LazyView.tsx"
+
+# 4. 接好的三面里少一行订阅，那一条就得红：面名由路径算出来的那几处也一样。
+fixture
+python3 - "${work}/web/src/views/WikiView.tsx" <<'PY'
+import sys
+
+path = sys.argv[1]
+src = open(path, encoding="utf-8").read()
+before = "  useKindTickedRefresh([resourceKey('wiki')], [page.refresh, info.refresh]);\n"
+if before not in src:
+    sys.exit("fixture: WikiView.tsx 里找不到订阅知识那一族的那一行")
+open(path, "w", encoding="utf-8").write(src.replace(before, ""))
+PY
+expect_red "知识面又退回定时器" "没订任何帧：WikiView.tsx"
+
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 #
 # 这道门要 `web/node_modules/.bin/tsc`（它把 `frameTick` 编译出来在 node 里实跑），

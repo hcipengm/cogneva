@@ -796,7 +796,8 @@ pub const DECISION_CLOSE_ROLE: &str = "governance_decision_close";
 /// Thirty seconds: a ballot's deadline is a statement about when the question
 /// is answered, and a reader arriving a minute later should not have to know
 /// that a pass was due. A pass with nothing due writes nothing.
-// cap: bound — 选票的截止时刻是对「问题什么时候有答案」的陈述；晚一分钟来的读者不该知道这一拍本来什么时候到
+// cap: fixed — 选票的截止时刻是对「问题什么时候有答案」的陈述；晚一分钟来的读者不该知道这一拍本来什么时候到
+// keep: 删掉后截止时刻跟着读者到达而变，「问题什么时候有答案」没有陈述；由「晚一分钟来的读者不该知道」兜住
 pub const DECISION_CLOSE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Start the resident pass that writes the verdicts the rules already reached.
@@ -892,6 +893,9 @@ fn governance_task(
         task_type: TaskType::Custom(task_type.to_string()),
         status,
         input: serde_json::json!({ input_key: payload }),
+        terminal: String::new(),
+        now: String::new(),
+        gap: String::new(),
         result: None,
         error: None,
         error_cause: None,
@@ -907,7 +911,7 @@ fn governance_task(
         max_retries: 0,
         retry_not_before: None,
         started_at: None,
-        timeout_seconds: 0,
+        declared_duration_seconds: 0,
         lease_owner: None,
         lease_expires_at: None,
         action_planner_meta: None,

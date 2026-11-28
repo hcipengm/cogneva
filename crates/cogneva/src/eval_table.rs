@@ -23,14 +23,17 @@ use async_trait::async_trait;
 /// 给文件算 sha256 时一次读多少：默认 64 KiB。
 ///
 /// 整块读让哈希只受磁盘顺序读限制，默认的 64 KiB 是页缓存友好的块大小。
-// cap: bound — 整块读让哈希只受磁盘顺序读限制，块大小取的是页缓存友好的量级
+// cap: fixed — 整块读让哈希只受磁盘顺序读限制，块大小取的是页缓存友好的量级
+// keep: 删掉后逐字节读，哈希被系统调用次数限制；由「页缓存友好的量级」兜住
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
 
 /// 抓一次 /metrics 的墙：5s。
 ///
 /// 这是评测里的一条读数，抓不到按缺读数处理；等更久只会让一条评测卡在别人的
 /// 观测面上。
-// cap: bound — 这是评测里的一条读数，抓不到按缺读数处理；等更久只会让一条评测卡在别人的观测面上
+// cap: fixed — 这是评测里的一条读数，抓不到按缺读数处理；等更久只会让一条评测卡在别人的观测面上
+// keep: 删掉后一条评测卡在别人的观测面上，抓不到也不按缺读数走；由「抓不到按缺读数处理」兜住
+// wall: 等=观测面吐出这几格读数 / 等不到=这几格按「缺读数」处理，**不填 0**——一次评测里读不到与量到为 0 是两件事 / 续跑=能，下一次评测重新抓
 const METRICS_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 use cog_core::{
     AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions, HttpClient, LlmClient,
@@ -71,7 +74,8 @@ fn pins_key(benchmark: &str) -> &str {
 const SCAFFOLDS: [&str; 4] = ["codeact", "gepa", "agentflow", "nql"];
 
 /// 每个格子打印几条失败明细。
-// cap: bound — 每个格子打印几条失败明细，够看出是同一类失败就够了
+// cap: fixed — 每个格子打印几条失败明细，够看出是同一类失败就够了
+// keep: 删掉后每格打印全部失败明细，看不出是同一类失败；由「够看出同一类」兜住
 const FAILURE_SAMPLE: usize = 3;
 
 pub const USAGE: &str = "\
@@ -84,7 +88,6 @@ usage: cogneva eval-table --pins <file> --backbone <model>@<version> --judge <mo
                           [--admission-floor-unmeasured <n>]
                           [--admission-ceiling-unmeasured <n>]
                           [--refusal-wait-cap <secs>]
-                          [--case-timeout-secs <n>]
 
   --pins       the pins file: what the data is pinned by, as printed by
                deploy/scripts/fetch-benchmark-data.sh --print-pins
@@ -143,15 +146,6 @@ usage: cogneva eval-table --pins <file> --backbone <model>@<version> --judge <mo
                upstream stated is never truncated by it: a call that would have to wait longer is
                refused with the stated seconds attached, and the bound in force is printed in the
                `refusal-backoff` line of the report.
-  --case-timeout-secs
-               how long one case may run, from entering its env to its verdict coming back.
-               Defaults to 1800s. `0` is rejected: there is no `no bound` setting, because a run
-               with no per-case bound prints the same flat line whether a case is slowly computing
-               or stuck on a call that will never return -- the checkpoint stops growing and the
-               process io keeps ticking in both. With the bound, a case that runs past it is
-               recorded as an error naming the seconds, so the two outcomes are different rows
-               rather than one ambiguous silence. The number in force is printed in the report's
-               `## pins` section.
   --admission-floor-unmeasured
   --admission-ceiling-unmeasured
                the gate's lower and upper bounds. NEITHER HAS BEEN MEASURED on this host: both are
@@ -294,9 +288,6 @@ pub struct EvalTableArgs {
     pub admission_ceiling_unmeasured: Option<usize>,
     /// 一跑肯为**一次**拒绝坐等多久；`None` ＝上游说多久就等多久（`--refusal-wait-cap 0`）。
     pub refusal_wait_cap: Option<std::time::Duration>,
-    /// 一例最多允许跑多久（`--case-timeout-secs`）。没有「不设界」这一档：一次逐例推进的
-    /// 跑若没有单例上界，「很久没有新结果」就分不出正在算一道慢题与挂在一次不返回的等待上。
-    pub case_timeout: std::time::Duration,
     pub pins: PathBuf,
     pub tools: ToolArm,
     /// 骨干能不能看图；`None` 是今天唯一能跑的那一臂。
@@ -406,8 +397,6 @@ impl EvalTableArgs {
         // 外面那层 `Some` 是「命令行上说没说」，里面那层是「有没有界」：两者混成一个
         // `Option` 的话，不给这个参数与给 0（不设界）就分不开了。
         let mut refusal_wait_cap: Option<Option<std::time::Duration>> = None;
-        // 只有一层 `Option`：这里没有「不设界」这一档，说了多少就是多少，不说取默认宽界。
-        let mut case_timeout_secs: Option<u64> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -492,24 +481,6 @@ impl EvalTableArgs {
                     });
                     i += 2;
                 }
-                "--case-timeout-secs" => {
-                    let raw = next_arg(args, i, flag)?;
-                    let secs: u64 = raw.parse().map_err(|e| {
-                        format!("--case-timeout-secs: `{raw}` is not a count of seconds: {e}")
-                    })?;
-                    // 0 不是「不设界」的写法：没有上界正是这个参数要消灭的那个状态，
-                    // 让它成为一条合法输入等于把洞开在命令行上。
-                    if secs == 0 {
-                        return Err(
-                            "--case-timeout-secs: 0 is not a bound; a run with no per-case \
-                             bound cannot tell a slow case from a hung one. Name the seconds \
-                             you are willing to let one case run for."
-                                .to_string(),
-                        );
-                    }
-                    case_timeout_secs = Some(secs);
-                    i += 2;
-                }
                 other => return Err(format!("unknown argument: {other}")),
             }
         }
@@ -586,9 +557,6 @@ impl EvalTableArgs {
             admission_ceiling_unmeasured: admission_ceiling,
             refusal_wait_cap: refusal_wait_cap
                 .unwrap_or(Some(cog_eval::backoff::DEFAULT_REFUSAL_WAIT_CAP)),
-            case_timeout: std::time::Duration::from_secs(
-                case_timeout_secs.unwrap_or(cog_eval::rig::DEFAULT_CASE_TIMEOUT.as_secs()),
-            ),
             out,
         })
     }
@@ -911,6 +879,7 @@ async fn read_pool(http: &Arc<dyn HttpClient>, base_url: &str) -> Option<PoolRea
     let url = metrics_url(base_url);
     let mut req = cog_core::HttpRequest::get(url);
     req.timeout_secs = Some(3);
+    // roundtrip: 一次指标抓取
     let resp = tokio::time::timeout(METRICS_FETCH_TIMEOUT, http.execute(req))
         .await
         .ok()?
@@ -1430,9 +1399,6 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
             checkpoint: Some(checkpoint.clone()),
             admission: admission.clone(),
             vision: args.vision.can_see(),
-            // 一例的上界从命令行一路带到真正跑那一例的地方：报表里那句
-            // 「这一跑有多少例记成出错」只有在这个数同时印在表头上时才是可读的。
-            case_timeout: args.case_timeout,
         },
     )
     // 这次跑肯为一次拒绝坐等多久，从命令行一路带到真正打上游的那一层。
@@ -1690,14 +1656,6 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
             .join(",")
     ));
     out.push_str(&format!("data-root\t{}\n", data_root.display()));
-    // 一例的上界与这一跑的时间读数是一件事的两半：`## per seed` 里那一列 `errored` 只要
-    // 有一行是「超过 N 秒还没跑完」，N 就必须在表头读得到，否则读的人无法判断那道题是被
-    // 界挡下的还是自己失败的。
-    out.push_str(&format!(
-        "case-timeout\t{}s\tone case, from entering its env to its verdict; a case that runs \
-         past it is recorded as an error naming the bound rather than left running\n",
-        args.case_timeout.as_secs()
-    ));
     // 续跑的口径跟着表走：读的人看到 `## per seed` 里那一列 `resumed` 时，得同时知道
     // **记下来的是哪些例**。判据只有一条——判分器给出过判词。跑不动 / 上游拒了不进记录，
     // 续跑时**重跑**它们，而不是把它们当成「跑过且没过」记住；反过来说，记录里没有的例
@@ -2152,9 +2110,6 @@ async fn wiring_from_config(args: &EvalTableArgs) -> Wiring {
                             web_fetch_base: web.web_fetch_base.clone(),
                             web_fetch_fallback_base: None,
                             sandbox,
-                            python_timeout: std::time::Duration::from_secs(
-                                system.tool_timeout_secs,
-                            ),
                         }) {
                             Ok(factory) => wiring.hle = Some(factory),
                             Err(why) => wiring.hle_reason = Some(format!("{why:#}")),
@@ -2242,7 +2197,7 @@ async fn wiring_from_config(args: &EvalTableArgs) -> Wiring {
 
     let capacity = cog_llm::TuningConfig::load()
         .map(|t| t.stream_capacity)
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let max_tokens = crate::config_loader::load()
         .core
         .system
@@ -2356,7 +2311,7 @@ pub async fn run_from_args() -> Result<(), Box<dyn std::error::Error>> {
     // 而报表里另有一行说着声明为什么读不出来。
     let declared: Vec<String> = crate::eval_container::foreign_flows()
         .map(|flows| flows.into_iter().map(|flow| flow.name).collect())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let args = match EvalTableArgs::parse_with(&operands(&argv), &declared) {
         Ok(args) => args,
         // 用法跟着错误走：缺一个必填项与写错一个选项名，读的人都要能当场看见这个
@@ -2469,7 +2424,6 @@ mod tests {
             columns: vec!["swe-bench-pro".to_string()],
             entrypoint: "sweagent solve".to_string(),
             limits: cog_eval::ExecLimits {
-                wall_clock: std::time::Duration::from_secs(900),
                 cpus: 2.0,
                 memory_bytes: 4 * 1024 * 1024 * 1024,
             },
@@ -2524,46 +2478,27 @@ mod tests {
         assert!(err.contains("--refusal-wait-cap"), "{err}");
     }
 
-    /// 一例的上界：**没有「不设界」这一档**，而它必须印在表头上。
+    /// 一例没有声明的界（2026-11-10 连同 `--case-timeout-secs` 一起拆掉）。
     ///
-    /// 三件事一起判。不给参数时有宽界（少一个界会让「一例卡住」与「一例在算」同形）；
-    /// 给了正数就是那个数；`0` 被拒——把它读成「不设界」正是这个参数要消灭的状态。
-    /// 最后一格是报表：`## per seed` 里只要有一行是「超过 N 秒还没跑完」，N 就得在表头
-    /// 读得到，否则那道题是被界挡下的还是自己失败的，读的人分不出来。
+    /// 两件事一起判：命令行不再能造出一个钟（给了这个参数直接按未知参数拒），
+    /// 报表也不再印一个「超过 N 秒」的界。判一例停住读的是实测的静默窗口，
+    /// 判词落在那一例自己身上——它带着「多久没动、实测窗口是多少」两个读数，
+    /// 而不是让整表去信一个常数。
     #[test]
-    fn the_case_timeout_is_a_bound_the_command_line_states_and_the_report_shows() {
+    fn a_case_has_no_declared_bound_and_the_command_line_refuses_to_make_one() {
         let parsed = EvalTableArgs::parse(&minimal()).unwrap();
-        assert_eq!(
-            parsed.case_timeout,
-            cog_eval::rig::DEFAULT_CASE_TIMEOUT,
-            "a run that says nothing still gets a bound"
-        );
 
         let mut raw = minimal();
         raw.extend(["--case-timeout-secs", "120"].iter().map(|s| s.to_string()));
-        let stated = EvalTableArgs::parse(&raw).unwrap();
-        assert_eq!(stated.case_timeout, std::time::Duration::from_secs(120));
-
-        let mut raw = minimal();
-        raw.extend(["--case-timeout-secs", "0"].iter().map(|s| s.to_string()));
         let err = EvalTableArgs::parse(&raw).unwrap_err();
         assert!(
-            err.contains("--case-timeout-secs"),
-            "`0` must be refused, not read as «no bound»: {err}"
+            err.contains("unknown argument") || err.contains("--case-timeout-secs"),
+            "a declared per-case bound must not be constructible from the command line: {err}"
         );
-
-        let mut raw = minimal();
-        raw.extend(
-            ["--case-timeout-secs", "soon"]
-                .iter()
-                .map(|s| s.to_string()),
-        );
-        let err = EvalTableArgs::parse(&raw).unwrap_err();
-        assert!(err.contains("--case-timeout-secs"), "{err}");
 
         let verified = BTreeMap::new();
         let text = render(
-            &stated,
+            &parsed,
             WiringReport {
                 missing: &[],
                 platform_base: None,
@@ -2579,8 +2514,8 @@ mod tests {
             },
         );
         assert!(
-            text.contains("case-timeout\t120s"),
-            "the bound in force must be readable next to the errored column it explains: {text}"
+            !text.contains("case-timeout"),
+            "the report still states a declared per-case bound: {text}"
         );
     }
 

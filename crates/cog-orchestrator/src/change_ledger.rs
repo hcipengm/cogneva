@@ -126,15 +126,15 @@ use cog_core::{
     ChangeSource, ChangeState, DemandClosure, DispatchDecision, DispatchState, LiveRevision,
     LiveRevisionSource, LlmPoolStatus, LlmWindowPace, MetricsBackend, OrchestratorControl,
     OwnerLeaseBroker, PoolReading, PoolWait, PrincipleCheckKind, PrincipleLedgerStore,
-    PrincipleRow, RemeasureBacklog, RetireReason, SFResult, ShutdownSignal, StateBackend, Task,
-    TaskStatus, TaskType, WriteWindow,
+    PrincipleRow, RemeasureBacklog, RetireReason, RoundEvents, RoundOpened, SFResult,
+    ShutdownSignal, StateBackend, Task, TaskStatus, TaskType, WriteWindow,
 };
 
 use cog_core::contract::llm::UpstreamFailure;
 use cog_core::contract::outcome::FailureCause;
 use cog_core::contract::outcome::{declares, TERMINAL_ENV_FAILURE_PREFIX};
 
-use crate::change_measure::{CheckOutcome, CheckTree, Snapshot, UnsettledReason, GREP_KIND};
+use crate::change_measure::{CheckOutcome, CheckTree, Reach, Snapshot, UnsettledReason, GREP_KIND};
 use crate::principle_measure::HOST_REGISTRY_READ_NO_GATE;
 
 /// This loop's name in the process liveness registry, and the value of
@@ -503,7 +503,8 @@ fn dispatch_project_root_prefix() -> String {
 /// `apply_measurement`, against a revision of the tree the change does not get
 /// to choose -- so the reader that closes this task is the same account that
 /// filed it, and the two cannot drift into different opinions of "done".
-const DISPATCH_ACCEPTANCE: &str = "这条变更在变更账上不再是 outstanding：同一身份的账行落到 landed 或 retired，判据取账上那一行的状态";
+const DISPATCH_ACCEPTANCE: &str =
+    "这条变更在变更账上不再是 outstanding：同一身份的账行落到 landed，判据取账上那一行的状态";
 
 /// The name a pass writes into `sources_unread` when the principle ledger could
 /// not be read.
@@ -862,12 +863,12 @@ const DECLARATION_MAX_PER_PASS: usize = 4;
 /// The widths the intake columns hold. A row wider than its column is refused
 /// here rather than truncated by the writer: a shortened identity is a
 /// different change sharing a row.
-// cap: derived — the declared `VARCHAR` widths of the columns these values are written to, read from the
+// cap: fixed — the declared `VARCHAR` widths of the columns these values are written to, taken from the
 // store's own DDL; a value here that the column cannot hold is the truncation this refuses.
 const DECLARATION_WIDTH_SCOPE: usize = 191;
-// cap: derived — the `literal` column's declared width, same source as the scope width above.
+// cap: fixed — the `literal` column's declared width, same source as the scope width above.
 const DECLARATION_WIDTH_LITERAL: usize = 512;
-// cap: derived — the `doc` column's declared width, same source as the scope width above.
+// cap: fixed — the `doc` column's declared width, same source as the scope width above.
 const DECLARATION_WIDTH_DOC: usize = 512;
 
 /// What one out-of-band commit left behind that a check can settle.
@@ -1260,21 +1261,39 @@ fn delivered_revision<'a>(
     deliveries: &'a HashMap<String, String>,
     carried: &HashMap<ChangeIdentity, Vec<String>>,
 ) -> Option<&'a str> {
+    delivered_under_its_own_id(identity, deliveries)
+        .into_iter()
+        .chain(delivered_under_a_batch(identity, deliveries, carried))
+        .max_by(|a, b| a.0.cmp(b.0))
+        .map(|(_, rev)| rev)
+}
+
+/// The delivery a commit names under this change's own id, if one does.
+fn delivered_under_its_own_id<'a>(
+    identity: &ChangeIdentity,
+    deliveries: &'a HashMap<String, String>,
+) -> Option<(&'a str, &'a str)> {
     let prefix = handover_task_prefix(identity);
-    let by_own_id = deliveries
+    deliveries
         .iter()
         .filter(|(id, _)| id.starts_with(&prefix))
-        .map(|(id, rev)| (id.as_str(), rev.as_str()));
-    let by_the_batch = carried
+        .map(|(id, rev)| (id.as_str(), rev.as_str()))
+        .max_by(|a, b| a.0.cmp(b.0))
+}
+
+/// The delivery a commit names under an id a batch carried this change in.
+fn delivered_under_a_batch<'a>(
+    identity: &ChangeIdentity,
+    deliveries: &'a HashMap<String, String>,
+    carried: &HashMap<ChangeIdentity, Vec<String>>,
+) -> Option<(&'a str, &'a str)> {
+    carried
         .get(identity)
         .into_iter()
         .flatten()
         .filter_map(|id| deliveries.get_key_value(id))
-        .map(|(id, rev)| (id.as_str(), rev.as_str()));
-    by_own_id
-        .chain(by_the_batch)
+        .map(|(id, rev)| (id.as_str(), rev.as_str()))
         .max_by(|a, b| a.0.cmp(b.0))
-        .map(|(_, rev)| rev)
 }
 
 /// Which hand-over carried each change, for the changes carried by a batch.
@@ -1301,6 +1320,41 @@ fn carried_handovers(tasks: &[Task]) -> HashMap<ChangeIdentity, Vec<String>> {
         }
     }
     carried
+}
+
+/// The batch map the delivery stamp needs, with "could not read it" kept
+/// apart from "there is nothing to carry".
+///
+/// The stamp asks two different questions of this map: whether a change was
+/// delivered under its own id, and whether a batch delivered it. The second
+/// question is only answerable when the graph was read. Folded, a failed read
+/// answers "no batch carried it", which is the same answer a change nothing
+/// dispatched would get -- so every row a batch carried keeps reading as never
+/// delivered, stays owed, and is handed over a second time. `None` is that
+/// unread graph; the stamp then answers the question it can and says how many
+/// rows it could not answer for.
+///
+/// A deployment with no goal path is `Some` of the empty map and not `None`:
+/// with nothing to hand anything over, no batch exists, and that is a reading
+/// rather than a failure to read.
+async fn carried_batches(
+    orchestrator: Option<&Arc<dyn OrchestratorControl>>,
+) -> Option<HashMap<ChangeIdentity, Vec<String>>> {
+    let Some(orchestrator) = orchestrator else {
+        return Some(HashMap::new());
+    };
+    match orchestrator.get_all_tasks_checked().await {
+        Ok(tasks) => Some(carried_handovers(&tasks)),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the task graph could not be read, so which batch carried a \
+                 change is unmeasured this pass; deliveries under a change's own id are still \
+                 stamped"
+            );
+            None
+        }
+    }
 }
 
 /// The name a run's deliverable carries.
@@ -1608,54 +1662,66 @@ fn dispatch_priority(row: &ChangeLedgerRow) -> i32 {
     DISPATCH_TASK_PRIORITY.saturating_add(i32::from(row.priority().rank().max(blocking)))
 }
 
-/// The knob a deployment raises the batch with.
+/// The knob a deployment pins the batch with, or `0` to let the graph's
+/// batches set it.
 pub const ROWS_PER_HANDOVER_ENV: &str = "COGNEVA_CHANGE_LEDGER_ROWS_PER_HANDOVER";
 
-/// How many rows one hand-over carries when the deployment states no number.
+/// The fewest rows that are a batch at all.
 ///
 /// Not the landing cap, and not the pass's slice: the slice
-/// ([`HANDOVERS_PER_PASS`]) is how many rows a pass may *start*, and this is how
-/// many of them one change can carry. The two differ because the price of a
-/// hand-over is mostly its fixed part -- a plan, a run's context, a sandbox
-/// round that validates the whole tree -- and that part is paid once per task
-/// whatever the task carries. So the rows are gathered until a batch is worth
-/// paying it for.
+/// ([`HANDOVERS_PER_PASS`]) is how many rows a pass may *start*, and this is
+/// where the bound on rows per hand-over starts. The two differ because the
+/// price of a hand-over is mostly its fixed part -- a plan, a run's context, a
+/// sandbox round that validates the whole tree -- and that part is paid once
+/// per task whatever the task carries.
 ///
-/// Why there is a number at all rather than "as many as the project owes": the
-/// limit is the generator's, not this loop's. A batch is written as one change,
-/// so a batch past what one generation can write comes back truncated, fails
-/// the suite and costs the whole batch -- the opposite of the saving. Five is
-/// the starting point, not a boundary this code believes in: the dominant shape
-/// of the queue is one gate per row (a test, a header and a check), a few of
-/// those fit one generation with room for the reasoning that writes them, and
-/// a deployment whose model writes more raises the knob. The reading that says
-/// whether to raise it is the pass line's own `submitted` against
-/// `tasks_submitted`: batches that land whole argue for a bigger one, and a
-/// batch that keeps coming back refused argues for a smaller one.
-// cap: bound — 一批太大时生成会被截断、整批报废；这个数按一次生成装得下几条修复定，部署可抬
-const DEFAULT_ROWS_PER_HANDOVER: usize = 5;
+/// The start is the smallest batch the measurement can read, not a size someone
+/// copied into a constant: a hand-over of one row is the chat turn's "hand this
+/// row over" shape, so [`measured_batch_sizes`] cannot read it, and a bound
+/// below it would hand out one row for ever, climbing nothing. Every landing
+/// then buys one row more (see [`rows_per_handover_bound`]), which is the only
+/// rate the evidence supports; a number like the old seed of five was one
+/// generation's observation frozen into the tree, and the graph that was
+/// supposed to measure it already answers that question live.
+// cap: bound — 「一批」的最小行数，由单行交接的形状钉住：一行的那一种交接是聊天回合「把这一行交出去」，不是批次，测量读不到它
+const MIN_ROWS_PER_BATCH: usize = 2;
 
-/// How many rows a batch carries this pass, from the deployment.
+/// How long a refused batch speaks about what one generation in front of us can
+/// write.
 ///
-/// `0` is refused rather than read as "no limit": a batch of zero rows is a pass
-/// that gathers forever and hands nothing over, and "unlimited" is the one value
-/// that would put the whole pending set into a single generation. A value that
-/// cannot be read falls back to the default and says so, by name -- an operator
-/// whose number was silently replaced would read the same pass line either way
-/// and conclude the knob does nothing.
-fn rows_per_handover() -> usize {
+/// A refusal is evidence about the generator that was handed the batch, and a
+/// generator is replaced (a new model, a raised output budget) without any
+/// event this loop can subscribe to. Without a window the first refusal would
+/// pin the bound below its failing size for ever; with one, a refusal ages out
+/// and the next attempt at that size is a new measurement rather than a
+/// contradiction. Thirty days is longer than a deployment's model changes and
+/// shorter than "for ever".
+// cap: bound — 退回的证据只对交出去的那个生成器有效；换模型没有事件可订阅，按这个窗口让旧证据过期
+const BATCH_REFUSAL_WINDOW_SECS: i64 = 30 * 24 * 3600;
+
+/// The batch size the deployment pinned, or `None` to derive it.
+///
+/// `0`, an empty string and an unset variable all mean "derive": the pass has a
+/// reading of its own (the graph's completed and refused batches), and a
+/// deployment that says nothing is asking it to use that reading. A positive
+/// number is a floor the deployment insists on, reported as `override` so the
+/// reading face says which of the two is in force. A value that cannot be read
+/// falls back to deriving and says so, by name -- an operator whose number was
+/// silently replaced would read the same pass line either way and conclude the
+/// knob does nothing.
+fn pinned_rows_per_handover() -> Option<usize> {
     match std::env::var(ROWS_PER_HANDOVER_ENV) {
-        Err(_) => DEFAULT_ROWS_PER_HANDOVER,
+        Err(_) => None,
         Ok(raw) => match parse_rows_per_handover(&raw) {
-            Ok(n) => n,
+            Ok(pinned) => pinned,
             Err(problem) => {
                 warn!(
                     variable = ROWS_PER_HANDOVER_ENV,
                     problem = %problem,
-                    using = DEFAULT_ROWS_PER_HANDOVER,
-                    "change ledger: the batch size could not be read; using the default"
+                    "change ledger: the pinned batch size could not be read; deriving it from \
+                     the graph's batches instead"
                 );
-                DEFAULT_ROWS_PER_HANDOVER
+                None
             }
         },
     }
@@ -1663,17 +1729,138 @@ fn rows_per_handover() -> usize {
 
 /// The batch size a value names, or what is wrong with it.
 ///
-/// Pure so the refusal of zero and of an unreadable number can be stated without
-/// the process environment: both are answers an operator needs, and a test that
-/// had to write the variable would race every other test in the binary.
-pub fn parse_rows_per_handover(raw: &str) -> Result<usize, String> {
-    match raw.trim().parse::<usize>() {
-        Ok(0) => Err(
-            "0 would gather forever and hand nothing over; leave it unset for the default".into(),
-        ),
-        Ok(n) => Ok(n),
-        Err(_) => Err(format!("`{}` is not a count of rows", raw.trim())),
+/// `Ok(None)` is the derive spelling (`0`, or empty), not a refusal: zero used
+/// to be refused because it would have meant "gather for ever", and it now
+/// means "let the measurement decide", which is the same freedom to gather and
+/// hand nothing over only if the measurement says so. Pure so the decision can
+/// be stated without the process environment: a test that had to write the
+/// variable would race every other test in the binary.
+pub fn parse_rows_per_handover(raw: &str) -> Result<Option<usize>, String> {
+    match raw.trim() {
+        "" => Ok(None),
+        other => match other.parse::<usize>() {
+            Ok(0) => Ok(None),
+            Ok(n) => Ok(Some(n)),
+            Err(_) => Err(format!("`{other}` is not a count of rows")),
+        },
     }
+}
+
+/// How many rows a batch may carry, from what the graph's own batches measured.
+///
+/// One law, read from two numbers the graph already holds:
+///
+/// - the largest batch a hand-over carried to completion is the largest size
+///   one generation has proven it can write whole; the bound is one above it, so
+///   a bigger one is tried and, if it lands, becomes the new proof;
+/// - the smallest batch a generation refused (for the work's own reason, inside
+///   [`BATCH_REFUSAL_WINDOW_SECS`]) caps the bound one below that size, so a
+///   size that came back truncated is not handed the same shape again until the
+///   evidence ages out.
+///
+/// A refusal below what has already landed says nothing about size -- the
+/// proven size still works -- so only refusals above the landed proof cap the
+/// bound. With no proof at all the bound stands at [`MIN_ROWS_PER_BATCH`], and
+/// with no refusal it climbs one size per landing, which is the only rate the
+/// measurement supports.
+pub fn rows_per_handover_bound(landed_max: Option<usize>, refused_min: Option<usize>) -> usize {
+    let grown = landed_max.map_or(MIN_ROWS_PER_BATCH, |landed| {
+        landed.saturating_add(1).max(MIN_ROWS_PER_BATCH)
+    });
+    let proven = landed_max.unwrap_or(0);
+    let capped = refused_min
+        .filter(|refused| *refused > proven)
+        .map(|refused| refused.saturating_sub(1));
+    capped
+        .map_or(grown, |cap| grown.min(cap))
+        .max(MIN_ROWS_PER_BATCH)
+}
+
+/// The batch sizes the graph answers for: the largest a hand-over carried to
+/// completion, and the smallest one a generation refused.
+///
+/// Read off the task table the pass already holds. A hand-over of one row is
+/// not a batch and says nothing about size, so it is left out; a cancelled
+/// task is a fold or a shutdown rather than a refusal, so it is left out too.
+/// A refusal that paid to the environment is the pool's answer, not the
+/// change's -- the same split `classify_handover` makes for every other reader
+/// of this table, reused here so the bound does not shrink because an upstream
+/// was down.
+fn measured_batch_sizes(tasks: &[Task], now_unix: i64) -> (Option<usize>, Option<usize>) {
+    let mut landed_max: Option<usize> = None;
+    let mut refused_min: Option<usize> = None;
+    for task in tasks {
+        if !matches!(&task.task_type, TaskType::Custom(kind) if kind == DISPATCH_TASK_KIND) {
+            continue;
+        }
+        let carried = dispatched_identities(task).len();
+        if carried < MIN_ROWS_PER_BATCH {
+            continue;
+        }
+        if task.status == TaskStatus::Completed {
+            landed_max = Some(landed_max.map_or(carried, |seen| seen.max(carried)));
+            continue;
+        }
+        if task.status != TaskStatus::Failed || classify_handover(task) != Handover::DeadWork {
+            continue;
+        }
+        let age_secs = now_unix.saturating_sub(task.updated_at.timestamp());
+        if age_secs > BATCH_REFUSAL_WINDOW_SECS {
+            continue;
+        }
+        refused_min = Some(refused_min.map_or(carried, |seen| seen.min(carried)));
+    }
+    (landed_max, refused_min)
+}
+
+/// The batch this pass carries, and which input set chose it.
+///
+/// A pinned number short-circuits the measurement: the deployment asked for
+/// that size and the graph's batches are not consulted, which is also why the
+/// evaluation counter does not move in that mode -- there is no law being
+/// evaluated. Derived mode recomputes every pass, publishes the answer even
+/// when it equals the last one, and counts the evaluation, because a bound that
+/// only publishes when it changes cannot be told apart from one whose loop
+/// stopped.
+fn batch_size_for_this_pass(tasks: &[Task], now_unix: i64) -> (usize, &'static str) {
+    match pinned_rows_per_handover() {
+        Some(pinned) => (pinned, crate::observable::SOURCE_OVERRIDE),
+        None => {
+            let (landed_max, refused_min) = measured_batch_sizes(tasks, now_unix);
+            let bound = rows_per_handover_bound(landed_max, refused_min);
+            crate::observable::rows_per_handover_observable().record_evaluation();
+            (bound, crate::observable::SOURCE_DERIVED)
+        }
+    }
+}
+
+/// The graph rows one change is handed over as, for a caller outside the loop.
+///
+/// The chat turn's "hand this row over" and the pass here submit the same shape:
+/// the id derived from the identity, the project anchor the row hangs under, and
+/// the acceptance that names the account. A second builder in the caller would
+/// be a copy of three decisions that only look independent -- and the first one
+/// to change would leave a row that reads as handed over in one path and not the
+/// other, which is the one difference no reader can afford.
+///
+/// The generation is the caller's because a hand-over filed under an id the
+/// graph already holds is an idempotent no-op, and the caller would report
+/// "submitted" for work nothing took. Only the graph knows which of the closed
+/// set in [`dispatch_task_ids`] it already holds, and only the dispatch loop
+/// knows when a failed attempt was the environment's fault rather than the
+/// change's -- a caller that has not read either asks for generation 0, the id
+/// every hand-over carried before generations existed.
+///
+/// One row, not a batch: batching is the pass's economy, and a request names one
+/// change.
+pub fn handover_on_request(
+    row: &ChangeLedgerRow,
+    generation: u32,
+) -> (String, Vec<cog_core::Task>) {
+    let goal = dispatch_goal_for(std::slice::from_ref(row));
+    let task = dispatch_task(std::slice::from_ref(row), generation);
+    let root = dispatch_project_root_for(&dispatch_project_key(row));
+    (goal, vec![root, task])
 }
 
 /// The task this loop hands owed changes over as.
@@ -1969,10 +2156,23 @@ async fn fold_handover(
     task_id: &str,
     identity: &ChangeIdentity,
 ) -> bool {
-    match orchestrator.get_task(task_id).await {
-        Some(task) if task.status == TaskStatus::Pending && task.started_at.is_none() => {}
-        Some(_) => return false,
-        None => return false,
+    match orchestrator.get_task_checked(task_id).await {
+        Ok(Some(task)) if task.status == TaskStatus::Pending && task.started_at.is_none() => {}
+        Ok(_) => return false,
+        Err(e) => {
+            // Not "gone": a read that failed cannot say the row is untouched,
+            // and taking the row back from a task that may have started is the
+            // one thing this check exists to prevent. The row is left alone
+            // this pass and the next pass asks again.
+            warn!(
+                change = %identity,
+                task = task_id,
+                error = %e,
+                "change ledger: a hand-over could not be read, so it is left holding its row \
+                 this pass"
+            );
+            return false;
+        }
     }
     let reason = format!(
         "{FOLDED_HANDOVER_PREFIX}: 这条交接从没开始过、只占着 {identity} 一行，\
@@ -2065,7 +2265,6 @@ fn unanswered_under_handover_project(task: &Task) -> bool {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct SettledClosures {
     landed: usize,
-    retired: usize,
     /// Rows hanging under a closed one, which the graph cancelled with it.
     cascaded: usize,
     /// Rows hanging under a closed one that the sweep cancelled itself.
@@ -2096,19 +2295,14 @@ struct SettledClosures {
 
 impl SettledClosures {
     fn moved_anything(&self) -> bool {
-        self.landed > 0
-            || self.retired > 0
-            || self.cascaded > 0
-            || self.descendants > 0
-            || self.failed > 0
+        self.landed > 0 || self.cascaded > 0 || self.descendants > 0 || self.failed > 0
     }
 
     fn line(&self) -> String {
         format!(
-            "closed hand-over rows the account had settled: landed={} retired={} cascaded={} \
+            "closed hand-over rows the account had settled: landed={} cascaded={} \
              descendants={} unaccounted={} failed={} remaining={} unanswered={}",
             self.landed,
-            self.retired,
             self.cascaded,
             self.descendants,
             self.unaccounted,
@@ -2281,11 +2475,11 @@ async fn close_settled_dispatch_rows(
                     .await
                 {
                     Ok(cascaded) => {
-                        match row.state {
-                            ChangeState::Landed => closed.landed += 1,
-                            ChangeState::Retired => closed.retired += 1,
-                            // `is_outstanding` let only these two through.
-                            _ => {}
+                        // `is_outstanding` let only `landed` through: a row the
+                        // census judged out of the account is still pending, so
+                        // it still owes its task.
+                        if row.state == ChangeState::Landed {
+                            closed.landed += 1;
                         }
                         closed.cascaded += cascaded.len();
                         closed.descendants +=
@@ -2375,12 +2569,28 @@ impl SettledProjects {
 /// read on every beat would be a cost paid forever for a defect that can no
 /// longer recur. The stop is the settle's own `remaining` count rather than a
 /// fixed number of passes, because how many beats the back-fill takes depends on
-/// how many rows the graph holds. A graph read that comes back empty is
-/// indistinguishable from a graph with nothing in it, and both mean there is
-/// nothing to settle.
-async fn settle_dispatch_parents(orchestrator: &Arc<dyn OrchestratorControl>) -> SettledProjects {
+/// how many rows the graph holds.
+///
+/// `None` is a beat that could not read the graph: it settled nothing, and it
+/// is not a beat that found nothing to settle. The caller leaves its
+/// `parents_settled` flag down on it, because a folded read here would come
+/// back with an empty graph, report `remaining == 0`, and stop the back-fill
+/// for the life of the process on the strength of a read that never happened.
+async fn settle_dispatch_parents(
+    orchestrator: &Arc<dyn OrchestratorControl>,
+) -> Option<SettledProjects> {
     let mut settled = SettledProjects::default();
-    let tasks = orchestrator.get_all_tasks().await;
+    let tasks = match orchestrator.get_all_tasks_checked().await {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the graph could not be read, so this beat settles nothing and \
+                 asks again on the next one"
+            );
+            return None;
+        }
+    };
     let mut projects: HashMap<&str, Vec<&Task>> = HashMap::new();
     for task in &tasks {
         if let Some(project) = task
@@ -2439,7 +2649,7 @@ async fn settle_dispatch_parents(orchestrator: &Arc<dyn OrchestratorControl>) ->
         }
     }
     fill_dispatch_criteria(orchestrator, &tasks, &mut settled).await;
-    settled
+    Some(settled)
 }
 
 /// Give every dispatched change row the criterion the hand-over now writes.
@@ -2475,8 +2685,23 @@ async fn fill_dispatch_criteria(
         // running this moment is left to the next pass rather than written
         // over. `replace_task` writes the whole row, so there is no narrower
         // write to fall back on.
-        let Some(mut filled) = orchestrator.get_task(&row.id).await else {
-            continue;
+        let mut filled = match orchestrator.get_task_checked(&row.id).await {
+            Ok(Some(filled)) => filled,
+            // The row is gone: there is nothing left to fill.
+            Ok(None) => continue,
+            Err(e) => {
+                // Not "gone": a read that failed cannot say that, and dropping
+                // the row here would leave it out of shape for good -- while
+                // `remaining` would report the back-fill finished.
+                settled.remaining += 1;
+                warn!(
+                    task = %row.id,
+                    error = %e,
+                    "change ledger: a dispatched change could not be read, so it keeps its \
+                     empty criterion this beat"
+                );
+                continue;
+            }
         };
         if !filled.acceptance.is_empty() {
             continue;
@@ -2614,6 +2839,13 @@ pub fn spawn_change_ledger_loop(
     // none to read, and a loop that refused to keep the account over that would
     // trade a missing intake for a missing ledger.
     alert_source: Option<Arc<dyn cog_core::ActiveAlertSource>>,
+    // 定批的写入器：这一轮的批次钉进事件流，下一拍按它下发。可选，与其余协作者同一
+    // 个道理——没有事件流的部署没有可钉住的东西，而「没报出来」在启动那一行里说得清。
+    rounds: Option<Arc<dyn RoundEvents>>,
+    // 三格快照的那一格：这一趟读得到现网 revision，而那条读数只有这里有。接上之后
+    // 变更账读面就有一份「哪一行填了哪几格」的最新读数；不接就是 `None`，读面印
+    // 「量不到」，而不是一份全空的快照。
+    cells: Option<Arc<tokio::sync::RwLock<Option<cog_core::ChangeCellsSnapshot>>>>,
 ) {
     info!(
         interval_secs = CHANGE_LEDGER_PASS_INTERVAL.as_secs(),
@@ -2685,6 +2917,8 @@ pub fn spawn_change_ledger_loop(
             let live_revision = live_revision.clone();
             let events = events.clone();
             let alert_source = alert_source.clone();
+            let rounds = rounds.clone();
+            let cells = cells.clone();
             async move {
                 // The role is renewed on the lease contract's own cadence rather
                 // than once per pass: a pass can be long, and a term that ran out
@@ -2907,13 +3141,13 @@ pub fn spawn_change_ledger_loop(
                         // batches' rows after the measurement, which is exactly
                         // the ordering the comment above says records the rows
                         // that did not land and misses the ones that did.
-                        // No graph is no hand-over, so no batch: the empty map
-                        // is the right answer here rather than a degraded one.
-                        let carried_by_batch = match orchestrator.as_ref() {
-                            Some(o) => carried_handovers(&o.get_all_tasks().await),
-                            None => HashMap::new(),
-                        };
-                        stamp_deliveries(&*store, deliveries, &carried_by_batch).await;
+                        // `None` from here is a graph that could not be read,
+                        // which the stamp must not hear as "no batch carried
+                        // anything": that reading keeps every batched row owed
+                        // and hands it over again. A deployment with no goal path
+                        // is the empty map -- there, no batch exists.
+                        let carried_by_batch = carried_batches(orchestrator.as_ref()).await;
+                        stamp_deliveries(&*store, deliveries, carried_by_batch.as_ref()).await;
                     }
                     measure_pass(&*store, &tree, &mut unsettled, &changed, metrics.as_ref()).await;
                     // The second face of "is it done", read after the
@@ -2927,8 +3161,14 @@ pub fn spawn_change_ledger_loop(
                     // below carries no ordering: what it reads is the landed
                     // set, and the hand-over reads the pending one.
                     if let Some(ref live) = live_revision {
-                        let reading =
-                            live_revision_pass(&*store, &tree, &**live, &mut out_of_effect).await;
+                        let reading = live_revision_pass_with_cells(
+                            &*store,
+                            &tree,
+                            &**live,
+                            &mut out_of_effect,
+                            cells.clone().as_ref(),
+                        )
+                        .await;
                         publish_in_effect_reading(metrics.as_ref(), reading).await;
                     }
                     // Handing over comes last, and that order is the point: the
@@ -2938,14 +3178,18 @@ pub fn spawn_change_ledger_loop(
                     // the same pass that found it, rather than one period later.
                     if let Some(ref orchestrator) = orchestrator {
                         if !parents_settled {
-                            let settled = settle_dispatch_parents(orchestrator).await;
-                            if settled.moved_anything() {
-                                info!("change ledger: {}", settled.line());
+                            // A beat that could not read the graph settles
+                            // nothing, and `None` must not read as "nothing
+                            // left to settle": the flag stays down so the next
+                            // beat asks again. A settle that left rows to fill
+                            // asks again too; one that reached everything is
+                            // done for the life of the process.
+                            if let Some(settled) = settle_dispatch_parents(orchestrator).await {
+                                if settled.moved_anything() {
+                                    info!("change ledger: {}", settled.line());
+                                }
+                                parents_settled = settled.remaining == 0;
                             }
-                            // A settle that left rows to fill asks again on the
-                            // next beat; one that reached everything is done for
-                            // the life of the process.
-                            parents_settled = settled.remaining == 0;
                         }
                         let pool = pool.as_deref();
                         // Work with nobody's name on it shows up in the rows
@@ -2990,6 +3234,7 @@ pub fn spawn_change_ledger_loop(
                             deliveries.as_ref(),
                             commits_read,
                             firing.as_deref(),
+                            rounds.as_deref(),
                         )
                         .await
                         {
@@ -3351,7 +3596,7 @@ async fn principle_readings(
 /// nothing is relocated on a pass whose reading failed.
 ///
 /// The root is the directory the declaring file sits in, and the directory is the
-/// identity: a row whose gate is `deploy/scripts/tests/x.test.sh` is asked of
+/// identity: a row whose gate is `deploy/scripts/tests/alert-rule-faces.test.sh` is asked of
 /// `deploy/scripts/tests`. A rule declared under the sources keeps the identity
 /// it has always had -- the reading that the same rule is now declared in two
 /// places must not rewrite the identity of a row that has been closing there for
@@ -3954,27 +4199,19 @@ async fn measure_pass(
         // over and its reason is dropped: a stale reason left in the map would
         // report a fault the tree no longer has.
         unsettled.remove(&row.identity);
-        match state {
-            ChangeState::Landed => landed += 1,
-            ChangeState::Pending => absent += 1,
-            // A row whose reason is a property of the row rather than of the
-            // look -- no evaluator for its kind, a predicate that is a finding
-            // written out, a path this tree structurally cannot hold -- is
-            // retracted to `undecided` by the evaluator: it carried a state no
-            // later pass could ever reach. Counted separately from the unsettled
-            // kinds below, because this one *did* write its state -- it is the
-            // count of rows that left the outstanding set by being unmeasurable
-            // rather than by being done.
-            ChangeState::Undecided => undecided += 1,
-            // A settled look otherwise answers with one of exactly two states,
-            // both named above. A fourth reaching here would be one the
-            // evaluator grew without this count being told, and counting it as
-            // "not landed" would hide that.
-            other => warn!(
-                change = %row.identity,
-                state = other.as_str(),
-                "change ledger: a settled look named a state this pass does not count"
-            ),
+        // A row whose reason is a property of the row rather than of the look --
+        // no evaluator for its kind, a predicate that is a finding written out, a
+        // path this tree structurally cannot hold -- is counted apart from a row
+        // the tree simply does not have yet. Both are `pending`; the difference is
+        // the reason written beside them, and it is the whole answer to "why will
+        // this never settle by retrying".
+        if outcome.is_unmeasurable() {
+            undecided += 1;
+        } else {
+            match state {
+                ChangeState::Landed => landed += 1,
+                ChangeState::Pending => absent += 1,
+            }
         }
         // No observation travels with the write. What this look saw is the check
         // and the revision, and the revision rides in its own column rather than
@@ -3986,23 +4223,26 @@ async fn measure_pass(
         // *which* rows are stuck for *which* reason instead of only how many are
         // stuck: the reason travels as its name, because the vocabulary is this
         // judge's and the storage contract does not depend on this module.
-        let measurement = match state {
-            ChangeState::Undecided => ChangeMeasurement::undecided(
+        let measurement = if outcome.is_unmeasurable() {
+            ChangeMeasurement::undecided(
                 row.identity.clone(),
                 outcome
                     .reason()
-                    .expect("an undecided state is reached only through a reason")
+                    .expect("an unmeasurable outcome is reached only through a reason")
                     .as_str(),
             )
-            .at_revision(snapshot.rev()),
-            _ if state == ChangeState::Landed => {
-                ChangeMeasurement::new(row.identity.clone(), state)
+            .at_revision(snapshot.rev())
+        } else {
+            match state {
+                ChangeState::Landed => ChangeMeasurement::new(row.identity.clone(), state)
                     .at_revision(snapshot.rev())
                     .with_parent_observation(
                         tree.parent_observation(&snapshot, &row.identity).await,
-                    )
+                    ),
+                ChangeState::Pending => {
+                    ChangeMeasurement::new(row.identity.clone(), state).at_revision(snapshot.rev())
+                }
             }
-            _ => ChangeMeasurement::new(row.identity.clone(), state).at_revision(snapshot.rev()),
         };
         if let Err(e) = store.apply_measurement(&measurement).await {
             // Counted as measured because it was, not because it was stored: the
@@ -4573,27 +4813,27 @@ async fn reopen_pass(
         // formality: `measured_at` is what this read orders by, so a pass that
         // re-asked and wrote nothing would re-ask the same head of the set
         // forever and never reach the rest of it.
-        let measurement = match state {
-            ChangeState::Undecided => ChangeMeasurement::undecided(
+        let measurement = if outcome.is_unmeasurable() {
+            ChangeMeasurement::undecided(
                 row.identity.clone(),
                 outcome
                     .reason()
-                    .expect("an undecided state is reached only through a reason")
+                    .expect("an unmeasurable outcome is reached only through a reason")
                     .as_str(),
             )
-            .at_revision(snapshot.rev()),
+            .at_revision(snapshot.rev())
+        } else if state == ChangeState::Landed && row.state != ChangeState::Landed {
             // Only on the way in, never on a re-check: this pass also re-asks rows
             // that are already landed, and the parent of *this* revision says
             // nothing about the landing that first satisfied them -- it would
             // answer "already there" for every old row, which is the one reading
             // the column exists to tell apart from a real arrival. A row that was
             // already landed keeps whatever reading it first got.
-            _ if state == ChangeState::Landed && row.state != ChangeState::Landed => {
-                ChangeMeasurement::new(row.identity.clone(), state)
-                    .at_revision(snapshot.rev())
-                    .with_parent_observation(tree.parent_observation(snapshot, &row.identity).await)
-            }
-            _ => ChangeMeasurement::new(row.identity.clone(), state).at_revision(snapshot.rev()),
+            ChangeMeasurement::new(row.identity.clone(), state)
+                .at_revision(snapshot.rev())
+                .with_parent_observation(tree.parent_observation(snapshot, &row.identity).await)
+        } else {
+            ChangeMeasurement::new(row.identity.clone(), state).at_revision(snapshot.rev())
         };
         if let Err(e) = store.apply_measurement(&measurement).await {
             warn!(
@@ -4674,21 +4914,21 @@ async fn restore_retired(
             );
             continue;
         };
-        let measurement = match state {
-            ChangeState::Undecided => ChangeMeasurement::undecided(
+        let measurement = if outcome.is_unmeasurable() {
+            ChangeMeasurement::undecided(
                 row.identity.clone(),
                 outcome
                     .reason()
-                    .expect("an undecided state is reached only through a reason")
+                    .expect("an unmeasurable outcome is reached only through a reason")
                     .as_str(),
             )
-            .at_revision(snapshot.rev()),
-            _ if state == ChangeState::Landed => {
-                ChangeMeasurement::new(row.identity.clone(), state)
-                    .at_revision(snapshot.rev())
-                    .with_parent_observation(tree.parent_observation(snapshot, &row.identity).await)
-            }
-            _ => ChangeMeasurement::new(row.identity.clone(), state).at_revision(snapshot.rev()),
+            .at_revision(snapshot.rev())
+        } else if state == ChangeState::Landed {
+            ChangeMeasurement::new(row.identity.clone(), state)
+                .at_revision(snapshot.rev())
+                .with_parent_observation(tree.parent_observation(snapshot, &row.identity).await)
+        } else {
+            ChangeMeasurement::new(row.identity.clone(), state).at_revision(snapshot.rev())
         };
         match store.apply_measurement(&measurement).await {
             Ok(()) => {
@@ -4767,19 +5007,21 @@ async fn remeasure_queued(
             );
             continue;
         };
-        let measurement = match state {
-            ChangeState::Undecided => ChangeMeasurement::undecided(
+        let measurement = if outcome.is_unmeasurable() {
+            ChangeMeasurement::undecided(
                 identity.clone(),
                 outcome
                     .reason()
-                    .expect("an undecided state is reached only through a reason")
+                    .expect("an unmeasurable outcome is reached only through a reason")
                     .as_str(),
             )
-            .at_revision(snapshot.rev()),
-            _ if state == ChangeState::Landed => ChangeMeasurement::new(identity.clone(), state)
+            .at_revision(snapshot.rev())
+        } else if state == ChangeState::Landed {
+            ChangeMeasurement::new(identity.clone(), state)
                 .at_revision(snapshot.rev())
-                .with_parent_observation(tree.parent_observation(snapshot, &identity).await),
-            _ => ChangeMeasurement::new(identity.clone(), state).at_revision(snapshot.rev()),
+                .with_parent_observation(tree.parent_observation(snapshot, &identity).await)
+        } else {
+            ChangeMeasurement::new(identity.clone(), state).at_revision(snapshot.rev())
         };
         match store.apply_measurement(&measurement).await {
             Ok(()) => {
@@ -4843,6 +5085,48 @@ impl InEffectReading {
     }
 }
 
+/// Which side of the running revision's line one landing revision falls on.
+///
+/// The split the pass publishes and the per-row answer a reader asks "which of
+/// them" are the same question, so they are asked once, here, rather than once
+/// as a count and once as a set. Two answers and not three: a row the account
+/// holds no landing revision for has nothing to place, and that is a property of
+/// the row -- decided before this is asked -- while both of these are properties
+/// of a revision the row does carry.
+///
+/// The side is read off the ancestor set, not off the order the revisions were
+/// written in: a landing revision is on the line exactly when the running
+/// revision descends from it, and a revision on another branch, in a history that
+/// was rewritten, or in a repository this one was never given is off it -- which
+/// is one answer here because it is one fact to the image that either carries the
+/// commit or does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LandedSide {
+    /// The running revision descends from the commit the change landed at.
+    InLine,
+    /// The running revision does not carry the commit the change landed at.
+    OffLine,
+}
+
+impl LandedSide {
+    /// The label this side is named by when a row's placement is written down.
+    fn as_str(self) -> &'static str {
+        match self {
+            LandedSide::InLine => "in-line",
+            LandedSide::OffLine => "off-line",
+        }
+    }
+}
+
+/// Which side of `reach`'s line `landed_rev` falls on.
+fn landed_side(reach: &Reach, landed_rev: &str) -> LandedSide {
+    if reach.contains(landed_rev) {
+        LandedSide::InLine
+    } else {
+        LandedSide::OffLine
+    }
+}
+
 /// Check the account's landed rows against the revision the workloads are
 /// running.
 ///
@@ -4901,11 +5185,30 @@ impl InEffectReading {
 /// event log records had landed at a commit the running image carried. The
 /// reading was a count of re-checks, and it would have rung the alert that this
 /// pass exists to feed.
+/// 只要读数、不要三格快照的那一侧：生产路径走的是
+/// [`live_revision_pass_with_cells`]，这一个只给用例（同一个函数体写两遍会在两边
+/// 分开长，所以它只是那个带格版本不带格的结果）。
+#[cfg(test)]
 async fn live_revision_pass(
     store: &dyn ChangeLedgerStore,
     tree: &CheckTree,
     source: &dyn LiveRevisionSource,
     out_of_effect: &mut HashMap<ChangeIdentity, String>,
+) -> InEffectReading {
+    live_revision_pass_with_cells(store, tree, source, out_of_effect, None).await
+}
+
+/// 同一条读数，顺手把「三格」快照写给读面。
+///
+/// 三格里的 `live` 只有这一趟读得到（现网 revision 在 `source` 里）；`code` 与
+/// `verified` 是这一趟读到的那些行自己的事实。写出去的是**一份读数**：谁再算一遍
+/// 都会得到同一份，而它不会被任何写者改。
+async fn live_revision_pass_with_cells(
+    store: &dyn ChangeLedgerStore,
+    tree: &CheckTree,
+    source: &dyn LiveRevisionSource,
+    out_of_effect: &mut HashMap<ChangeIdentity, String>,
+    cells_out: Option<&std::sync::Arc<tokio::sync::RwLock<Option<cog_core::ChangeCellsSnapshot>>>>,
 ) -> InEffectReading {
     let live = match source.live_revision().await {
         LiveRevision::Known(rev) => rev,
@@ -4979,6 +5282,10 @@ async fn live_revision_pass(
     let mut entered = 0usize;
     let mut recovered = 0usize;
     let mut no_revision = 0usize;
+    // 三格的账：这一趟读到的每一行填了哪几格。`code` 与 `verified` 都为真——
+    // 这一趟读的就是「已落」的那些行，而 `landed` 这个状态本来就是一次量判出来的。
+    let mut cells_by_row: std::collections::BTreeMap<String, cog_core::ChangeCells> =
+        std::collections::BTreeMap::new();
     for (identity, landed_rev) in rows {
         // The revision compared is the one the row *landed* at, not the one a
         // re-check last asked at. A landed row is re-checked on a timer, and
@@ -4997,13 +5304,27 @@ async fn live_revision_pass(
         };
         still_landed.insert(identity.clone());
         checked += 1;
-        if reach.contains(landed_rev) {
+        // Asked through the classifier rather than with `reach.contains` here,
+        // so that the per-row answer this pass acts on and the one it names are
+        // one question: two spellings of "is this on the line" is how a count
+        // and the names it publishes come to disagree.
+        let side = landed_side(&reach, landed_rev);
+        cells_by_row.insert(
+            identity.as_key(),
+            cog_core::ChangeCells {
+                code: true,
+                live: side == LandedSide::InLine,
+                verified: true,
+            },
+        );
+        if side == LandedSide::InLine {
             in_effect += 1;
             if out_of_effect.remove(&identity).is_some() {
                 recovered += 1;
                 info!(
                     change = %identity,
                     landed_rev = %landed_rev,
+                    side = side.as_str(),
                     live_rev = reach.head(),
                     "change ledger: this change is in the revision the workloads are running now"
                 );
@@ -5025,6 +5346,7 @@ async fn live_revision_pass(
             debug!(
                 change = %identity,
                 landed_rev = %landed_rev,
+                side = side.as_str(),
                 live_rev = reach.head(),
                 "change ledger: the commit that landed this change is not in the live rev -- the \
                  project's own line carries it and the workloads are not running it"
@@ -5076,6 +5398,16 @@ async fn live_revision_pass(
         "change ledger: checked the account's landed rows against the revision the workloads are \
          running"
     );
+    if let Some(slot) = cells_out {
+        let snapshot = cog_core::ChangeCellsSnapshot {
+            taken_at: chrono::Utc::now(),
+            live: LiveRevision::Known(reach.head().to_string()),
+            cells: cells_by_row,
+        };
+        if let Ok(mut guard) = slot.try_write() {
+            *guard = Some(snapshot);
+        }
+    }
     match oldest_seconds {
         Some(seconds) => InEffectReading::Waiting(seconds),
         None => InEffectReading::Shipped,
@@ -5105,6 +5437,101 @@ fn oldest_landing_age(now_unix: i64, landing_times: impl IntoIterator<Item = i64
 /// sets. A row may be both -- a bad check keeps its `pending` state -- and
 /// splitting them here is what keeps the handover from becoming a claim about
 /// the tree.
+/// 定批：这一拍要下发的，就是**当前那一轮钉住的那几条**。
+///
+/// 没有这一层时，每一拍读一次「欠着哪些」再挑一遍——挑哪些、挑几条，都由这一拍临场
+/// 决定，而事后没有任何一条读数说得清当时的批次是什么。带外那一侧的病是同一个：清单
+/// 不钉住，「做完了没有」就没有固定的主语。
+///
+/// 三条口径：
+///
+/// - **开着一轮时，只发那一轮的**。清单里还欠着、却这一拍不可下发的（正在测量、
+///   被上游暂停），就是这一拍少发的那几条——不是「没有欠着的」。
+/// - **清单里一条都不欠了就关轮**，再按这一刻欠着的开新的一轮。关轮与钉批是同一件
+///   事的两半：只钉不关，第一轮会永远开着，循环被钉死在同一批上。
+/// - **读不到就这一拍不下发**，而不是退回「没有钉住」——退回等于把这道判据静默关掉，
+///   而它关掉的正是「这一轮做了个我挑的子集」这件事唯一的约束。
+async fn pinned_batch(
+    rounds: &dyn RoundEvents,
+    outstanding: &[ChangeLedgerRow],
+    pending: Vec<ChangeLedgerRow>,
+) -> Result<Vec<ChangeLedgerRow>, String> {
+    // 清单上的身份用 `batch_id` 而不是 `Display`：后者把三段用冒号粘起来，字面量里
+    // 带冒号的两条变更会粘成同一行，清单就会认错那一条——而这份清单是判「做完了没有」
+    // 的主语。
+    let owed_now: HashSet<String> = outstanding
+        .iter()
+        .map(|r| handover_task_prefix(&r.identity))
+        .collect();
+    let Some(open) = rounds.current().await.map_err(|e| e.to_string())? else {
+        return open_next_round(rounds, pending).await;
+    };
+    let still_owed = open
+        .batch
+        .iter()
+        .filter(|id| owed_now.contains(*id))
+        .count();
+    if still_owed == 0 {
+        rounds
+            .close(&open.round, "change-ledger")
+            .await
+            .map_err(|e| e.to_string())?;
+        info!(
+            round = %open.round,
+            batch = open.batch.len(),
+            "change ledger: 这一轮钉住的批次一条都不欠了，关轮"
+        );
+        return open_next_round(rounds, pending).await;
+    }
+    let allowed: HashSet<String> = open.batch.iter().cloned().collect();
+    let before = pending.len();
+    let pinned: Vec<ChangeLedgerRow> = pending
+        .into_iter()
+        .filter(|row| allowed.contains(&handover_task_prefix(&row.identity)))
+        .collect();
+    info!(
+        round = %open.round,
+        batch = open.batch.len(),
+        owed = still_owed,
+        dispatched = pinned.len(),
+        dispatchable = before,
+        "change ledger: 按这一轮钉住的批次下发"
+    );
+    Ok(pinned)
+}
+
+/// 开一轮，批次＝这一刻可下发的那些。没有可下发的就不开：空批次的一轮下一拍立刻
+/// 「一条都不欠了」，会变成每拍开一轮关一轮的空转。
+async fn open_next_round(
+    rounds: &dyn RoundEvents,
+    pending: Vec<ChangeLedgerRow>,
+) -> Result<Vec<ChangeLedgerRow>, String> {
+    if pending.is_empty() {
+        return Ok(pending);
+    }
+    let round = RoundOpened {
+        round: format!("round-{}", Utc::now().timestamp_millis()),
+        // 平台的账在库里，没有 git rev：空串是「这本台账没有版本坐标」，不是「没有台账」。
+        ledger_rev: String::new(),
+        code_rev: String::new(),
+        // 批次里存的是**任务 id 前缀**，不是身份的三段编码：流水线手上拿到的 `artifact_id`
+        // 正是这个 id，于是「这一笔属不属于这一批」在那里是一次字符串比较。
+        batch: pending
+            .iter()
+            .map(|r| handover_task_prefix(&r.identity))
+            .collect(),
+        actor: "change-ledger".into(),
+        at: Utc::now(),
+    };
+    rounds.open(&round).await.map_err(|e| e.to_string())?;
+    info!(
+        round = %round.round,
+        batch = round.batch.len(),
+        "change ledger: 开了一轮，批次已钉进事件流"
+    );
+    Ok(pending)
+}
+
 fn dispatchable(
     rows: &[ChangeLedgerRow],
     unsettled: &HashMap<ChangeIdentity, UnsettledCheck>,
@@ -5173,8 +5600,11 @@ fn dispatchable(
 async fn stamp_deliveries(
     store: &dyn ChangeLedgerStore,
     deliveries: &HashMap<String, String>,
-    carried_by_batch: &HashMap<ChangeIdentity, Vec<String>>,
-) -> usize {
+    // `None` when the task graph could not be read. A row with no delivery under
+    // its own id may then have been delivered by a batch this pass cannot name,
+    // so it is counted as unmeasured rather than left reading as never delivered.
+    carried_by_batch: Option<&HashMap<ChangeIdentity, Vec<String>>>,
+) -> Stamped {
     let outstanding_total = match store.census().await {
         Ok(census) => census
             .iter()
@@ -5186,7 +5616,7 @@ async fn stamp_deliveries(
                 error = %e,
                 "change ledger: the census could not be read, so no delivery was stamped this pass"
             );
-            return 0;
+            return Stamped::default();
         }
     };
     let rows = match store.outstanding(outstanding_total as usize).await {
@@ -5196,19 +5626,33 @@ async fn stamp_deliveries(
                 error = %e,
                 "change ledger: the owed set could not be read, so no delivery was stamped this pass"
             );
-            return 0;
+            return Stamped::default();
         }
     };
-    let mut recorded = 0usize;
+    let mut stamped = Stamped::default();
     for row in &rows {
         if row.delivered_rev.is_some() {
             continue;
         }
-        let Some(rev) = delivered_revision(&row.identity, deliveries, carried_by_batch) else {
+        let rev = match carried_by_batch {
+            Some(carried) => delivered_revision(&row.identity, deliveries, carried),
+            None => {
+                // Neither edge can be asked here but one: the batch map is the
+                // edge the graph would have named. A row with no delivery under
+                // its own id is then a row nothing can say anything about, and
+                // counting it keeps it out of the "not delivered" tally.
+                let own = delivered_under_its_own_id(&row.identity, deliveries);
+                if own.is_none() {
+                    stamped.unmeasured += 1;
+                }
+                own.map(|(_, rev)| rev)
+            }
+        };
+        let Some(rev) = rev else {
             continue;
         };
         match store.record_delivery(&row.identity, rev).await {
-            Ok(()) => recorded += 1,
+            Ok(()) => stamped.recorded += 1,
             Err(e) => warn!(
                 change = %row.identity,
                 error = %e,
@@ -5217,13 +5661,31 @@ async fn stamp_deliveries(
             ),
         }
     }
-    if recorded > 0 {
+    if stamped.recorded > 0 {
         info!(
-            recorded,
+            recorded = stamped.recorded,
             "change ledger: owed changes a commit on the line names as landed"
         );
     }
-    recorded
+    if stamped.unmeasured > 0 {
+        warn!(
+            unmeasured = stamped.unmeasured,
+            "change ledger: the task graph could not be read, so whether a batch delivered these \
+             owed changes went unmeasured this pass; a later pass that reads the batch list \
+             stamps them from the same sliding window"
+        );
+    }
+    stamped
+}
+
+/// What one pass of the delivery stamp managed to say.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct Stamped {
+    /// Deliveries a commit on the line names, written to the account.
+    recorded: usize,
+    /// Owed rows with no delivery under their own id, in a pass that could not
+    /// read the batch list: the graph may hold the hand-over that carried them.
+    unmeasured: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5248,6 +5710,11 @@ async fn dispatch_pass(
     // which is a different finding from "nothing is ringing", and the face
     // lifecycle reads it as a second intake of work nobody has a name on.
     alerts: Option<&[cog_core::PersistedAlert]>,
+    // The round this process pinned its batch in. `None` is a deployment that
+    // publishes no event stream: it hands over whatever is dispatchable, which
+    // is the behaviour from before the pin existed. Which one it is is said at
+    // start-up, not inferred from a pass that dispatched fewer rows.
+    rounds: Option<&dyn RoundEvents>,
 ) -> Option<PoolVerdict> {
     // The read is bounded by the ledger's own census rather than by a number
     // chosen here, and it has to be that wide because of where pending rows sit
@@ -5290,7 +5757,23 @@ async fn dispatch_pass(
     // Read before the delivery stamp below rather than beside the sweep: the
     // stamp is the first reader that needs it, and the graph it comes from is
     // the same one the hand-over later takes.
-    let graph_tasks = orchestrator.get_all_tasks().await;
+    //
+    // A read that failed hands nothing over. Folded, it would be an empty graph:
+    // the hand-over index would hold no generation for any change, so every owed
+    // row would be filed again under generation 0 -- an id the store may still
+    // hold, which the goal path treats as a fault -- and the sweep would find
+    // nothing to close. The same answer the census and the outstanding set
+    // already give above, for the same reason.
+    let graph_tasks = match orchestrator.get_all_tasks_checked().await {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the graph could not be read, so this pass handed nothing over"
+            );
+            return None;
+        }
+    };
     // Taken off that one reading, for the same reason the index is: what a
     // batch carries is on the tasks this pass already holds.
     let carried_by_batch = carried_handovers(&graph_tasks);
@@ -5330,7 +5813,20 @@ async fn dispatch_pass(
         }
     }
 
-    let pending = dispatchable(&rows, unsettled);
+    // 定批在这里生效：这一拍下发的，就是开着一轮时钉住的那几条。
+    let pending = match rounds {
+        Some(rounds) => match pinned_batch(rounds, &rows, dispatchable(&rows, unsettled)).await {
+            Ok(pinned) => pinned,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "change ledger: 这一拍的批次读不出来，这一拍不下发——读不到不是「没有欠着的」"
+                );
+                return None;
+            }
+        },
+        None => dispatchable(&rows, unsettled),
+    };
 
     // Counted apart from the states because these rows are `pending`: the state
     // line cannot show them, and a pass that quietly stopped handing rows over
@@ -5544,7 +6040,13 @@ async fn dispatch_pass(
     // One task per project, holding the rows this pass would otherwise have
     // filed one at a time. Filled by the loop below, submitted after it.
     let mut batches: Vec<HandoverBatch> = Vec::new();
-    let rows_per_batch = rows_per_handover();
+    // The batch size is recomputed every pass from the graph this pass already
+    // holds -- the completed batches and the ones a generation refused -- and
+    // the answer is published whether or not it moved. A number that only
+    // reached the reading face when it changed would leave a stopped loop and a
+    // quiet graph as the same flat line.
+    let (rows_per_batch, rows_per_batch_source) = batch_size_for_this_pass(&graph_tasks, now);
+    crate::observable::rows_per_handover_observable().record(rows_per_batch, rows_per_batch_source);
     // Hand-overs this pass may take back so their rows can be batched, and how
     // many rows each project could still put in a batch -- both read off the
     // snapshot the pass already took, so neither costs a lookup.
@@ -5614,8 +6116,26 @@ async fn dispatch_pass(
             other => other,
         };
         let owed = match held {
-            Some(handover) => Owed::Held(handover),
+            Some(handover) => Ok(Owed::Held(handover)),
             None => owed_row(orchestrator, row, rearm_limit).await,
+        };
+        // Owed, no task known to hold it, and this pass does not hand it over:
+        // that is the row fact `held_back` states, and the warn is what says
+        // this pass's reason was a read rather than a decision. Handing it over
+        // blind is the move the generation walk exists to prevent -- under an
+        // id the store may still hold, the goal path raises every pass.
+        let owed = match owed {
+            Ok(owed) => owed,
+            Err(e) => {
+                counts.held_back += 1;
+                warn!(
+                    change = %row.identity,
+                    error = %e,
+                    "change ledger: the graph could not be read for this row, so it is left \
+                     owed rather than handed over under an id something may still hold"
+                );
+                continue;
+            }
         };
         match owed {
             Owed::Held(Handover::DeadEnvironment) => counts.dead_environment += 1,
@@ -5733,6 +6253,11 @@ async fn dispatch_pass(
             handovers_with_product = readback.products,
             handovers_unreadable = readback.unreadable,
             pool = verdict.reading.as_str(),
+            // The batch size this pass gathered at and which input set chose
+            // it, so a reader of this line can tell a pinned number from one
+            // the graph's own batches just measured.
+            rows_per_handover = rows_per_batch,
+            rows_per_handover_source = rows_per_batch_source,
             not_handed_over = %held_back_summary(&rows),
             "change ledger: handed this pass's slice of the pending set to the goal path"
         );
@@ -5917,11 +6442,19 @@ async fn owed_row(
     orchestrator: &Arc<dyn OrchestratorControl>,
     row: &ChangeLedgerRow,
     rearm_limit: u32,
-) -> Owed {
+) -> SFResult<Owed> {
     let mut generation = 0u32;
     while generation <= rearm_limit {
         let id = dispatch_task_id(&row.identity, generation);
-        let Some(task) = orchestrator.get_task(&id).await else {
+        // A read that failed is not "no row holds this generation": the walk
+        // would stop here and the row would be handed over under an id the
+        // store may still hold, which the goal path treats as a fault. The
+        // caller counts the row as owed-and-not-handed-over and says why.
+        let task = match orchestrator.get_task_checked(&id).await {
+            Ok(task) => task,
+            Err(e) => return Err(e),
+        };
+        let Some(task) = task else {
             break;
         };
         match classify_handover(&task) {
@@ -5949,10 +6482,10 @@ async fn owed_row(
             {
                 generation += 1
             }
-            verdict => return Owed::Held(verdict),
+            verdict => return Ok(Owed::Held(verdict)),
         }
     }
-    Owed::NoTask { generation }
+    Ok(Owed::NoTask { generation })
 }
 
 /// One pass's own counts, as the account records them and the reading face
@@ -6073,26 +6606,21 @@ enum DispatchReadout {
     OwedP2,
     OwedP3,
     OwedUnstated,
-    /// How many owed rows the account holds in each non-terminal state, from
-    /// its own census rather than from this pass's slice.
+    /// How many rows the account holds in each state, from its own census
+    /// rather than from this pass's slice.
     ///
-    /// The four states are here because the pass's own counts cannot answer for
-    /// them. `pending` and `unmeasurable` together are the pending-state rows
-    /// this pass read; a row the account holds as `undecided`, `conflict` or
-    /// `partial` is still owed work, and it appears in none of the pass's
-    /// columns. Without these cells a pass whose owed set had moved entirely
-    /// into `undecided` -- every check unsettleable, which is what a tree that
-    /// lost a directory looks like -- would publish `change_ledger_pending` at
-    /// zero while two thousand rows still asked for something: the one answer a
-    /// reader acts on, and it would be wrong.
-    ///
-    /// The two terminal states are left out because they are the definition of
-    /// not owed; a reader asking for those reads the account, where they are the
-    /// complement of these four.
-    StateConflict,
+    /// Two cells, because the account has two states. `state_pending` is the
+    /// whole owed set as the account holds it -- it has to equal
+    /// `change_ledger_pending`, and that equality is the reading: the pass's own
+    /// split and the account's census counting the same rows. `state_landed` is
+    /// the complement. When the account still had six states these cells were the
+    /// only place a row held as `undecided` showed up at all; that hole is closed
+    /// by there being no such state -- such a row is pending, and it is in the
+    /// pass's columns with the reason it is stuck. What the census still splits
+    /// out -- rows judged out of the account, rows nothing could measure -- rides
+    /// on the face census by reason, not on this cell.
     StatePending,
-    StatePartial,
-    StateUndecided,
+    StateLanded,
     /// The demand side of the same loop: how many of the declarations the
     /// intake holds have been answered by a landing, and how many are still
     /// owed.
@@ -6170,10 +6698,8 @@ impl DispatchReadout {
         DispatchReadout::OwedP2,
         DispatchReadout::OwedP3,
         DispatchReadout::OwedUnstated,
-        DispatchReadout::StateConflict,
         DispatchReadout::StatePending,
-        DispatchReadout::StatePartial,
-        DispatchReadout::StateUndecided,
+        DispatchReadout::StateLanded,
         DispatchReadout::DemandSatisfied,
         DispatchReadout::DemandOwed,
         DispatchReadout::CommitsInWindow,
@@ -6199,18 +6725,16 @@ impl DispatchReadout {
         }
     }
 
-    /// The state a census cell is about, for the four that are about one.
+    /// The state a census cell is about, for the ones that are about one.
     ///
     /// Separate from [`Self::band`] because the two axes cross: the bands
-    /// partition the owed set and the states partition it again, and the point
-    /// of publishing both is that a reader can see the two partitions are of the
-    /// same set.
+    /// partition the owed set and the states partition the whole account, and
+    /// the point of publishing both is that a reader can see the two partitions
+    /// are of the same set.
     fn state(self) -> Option<ChangeState> {
         match self {
-            DispatchReadout::StateConflict => Some(ChangeState::Conflict),
             DispatchReadout::StatePending => Some(ChangeState::Pending),
-            DispatchReadout::StatePartial => Some(ChangeState::Partial),
-            DispatchReadout::StateUndecided => Some(ChangeState::Undecided),
+            DispatchReadout::StateLanded => Some(ChangeState::Landed),
             _ => None,
         }
     }
@@ -6231,10 +6755,8 @@ impl DispatchReadout {
             Self::OwedP2 => "owed_p2",
             Self::OwedP3 => "owed_p3",
             Self::OwedUnstated => "owed_unstated",
-            Self::StateConflict => "state_conflict",
             Self::StatePending => "state_pending",
-            Self::StatePartial => "state_partial",
-            Self::StateUndecided => "state_undecided",
+            Self::StateLanded => "state_landed",
             Self::DemandSatisfied => "demand_satisfied",
             Self::DemandOwed => "demand_owed",
             Self::CommitsInWindow => "commits_in_window",
@@ -7436,15 +7958,24 @@ fn now_unix() -> i64 {
 /// with nothing owed from one whose whole outstanding set sits in a state nothing
 /// can act on.
 fn held_back_summary(rows: &[ChangeLedgerRow]) -> String {
-    ChangeState::ALL
-        .into_iter()
-        .filter(|state| *state != ChangeState::Pending)
-        .filter_map(|state| {
-            let n = rows.iter().filter(|row| row.state == state).count();
-            (n > 0).then(|| format!("{} {}", state.as_str(), n))
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+    // What is left out is no longer a state: every owed row is `pending`, and
+    // the ones that were not handed over are the ones carrying a reason for it.
+    let unmeasurable = rows
+        .iter()
+        .filter(|row| row.unsettled_reason.is_some())
+        .count();
+    let judged_out = rows
+        .iter()
+        .filter(|row| row.retire_reason.is_some())
+        .count();
+    let mut parts: Vec<String> = Vec::new();
+    if unmeasurable > 0 {
+        parts.push(format!("unmeasurable {unmeasurable}"));
+    }
+    if judged_out > 0 {
+        parts.push(format!("judged-out {judged_out}"));
+    }
+    parts.join(", ")
 }
 
 /// How many of these rows a pass would have judged.
@@ -7505,50 +8036,98 @@ fn still_unanswered(known: &UnsettledCheck, now: Instant) -> bool {
 /// A `landed` row is not outstanding -- the query excludes it -- so one showing
 /// up here means the storage filter broke, not that the ledger grew a row.
 ///
-/// The undecided rows are broken down by the reason they are stuck, because that
-/// reason is the whole answer to why they will never settle and it is a property
-/// of the row, not of any one pass. The pass's own `unsettled` field cannot give
-/// it: it counts only the rows *that* pass asked, so a row the pass did not reach
-/// -- which, over passes, is most of them -- never appears there. The reason is
-/// rendered in the closed set's order so two readings diff cleanly, and a row
-/// measured before the reason was persisted reads as `unstated` rather than being
-/// dropped, so the breakdown always sums to the undecided count.
+/// The rows are split by what is keeping each one owed: a row nothing could
+/// measure, a row the census judged out of the account, and the rest. The reason
+/// is the whole answer to why a row will not settle, and it is a property of the
+/// row rather than of one pass -- the pass's own `unsettled` field counts only the
+/// rows *that* pass asked, so a row it did not reach, which over passes is most of
+/// them, never appears there. Reasons are rendered in the closed set's order so
+/// two readings diff cleanly, and a row measured before the reason was persisted
+/// reads as `unstated` rather than being dropped, so each breakdown sums to its
+/// row count.
 fn outstanding_summary(rows: &[ChangeLedgerRow]) -> String {
-    let by_state = ChangeState::ALL
-        .into_iter()
-        .filter_map(|state| {
-            let n = rows.iter().filter(|row| row.state == state).count();
-            if n == 0 {
-                return None;
-            }
-            if state != ChangeState::Undecided {
-                return Some(format!("{} {}", state.as_str(), n));
-            }
-            let stuck: Vec<&ChangeLedgerRow> = rows
+    // `pending` covers three shapes now that it is the only owed state, and the
+    // reason columns are what tells them apart.
+    let stuck: Vec<&ChangeLedgerRow> = rows
+        .iter()
+        .filter(|row| row.state == ChangeState::Pending && row.unsettled_reason.is_some())
+        .collect();
+    let mut reasoned: Vec<String> = Vec::new();
+    if !stuck.is_empty() {
+        let mut parts: Vec<String> = UnsettledReason::ALL
+            .iter()
+            .filter_map(|reason| {
+                let m = stuck
+                    .iter()
+                    .filter(|row| row.unsettled_reason.as_deref() == Some(reason.as_str()))
+                    .count();
+                (m > 0).then(|| format!("{} {}", reason.as_str(), m))
+            })
+            .collect();
+        // A reason outside the judge's closed set is a row written before the
+        // reason column existed. Counted rather than dropped so the parts sum to
+        // the row count -- a breakdown that does not add up is a reading nobody
+        // can act on.
+        let unstated = stuck.len()
+            - stuck
                 .iter()
-                .filter(|row| row.state == ChangeState::Undecided)
-                .collect();
-            let mut parts: Vec<String> = UnsettledReason::ALL
-                .iter()
-                .filter_map(|reason| {
-                    let m = stuck
+                .filter_map(|row| row.unsettled_reason.as_deref())
+                .filter(|r| {
+                    UnsettledReason::ALL
                         .iter()
-                        .filter(|row| row.unsettled_reason.as_deref() == Some(reason.as_str()))
-                        .count();
-                    (m > 0).then(|| format!("{} {}", reason.as_str(), m))
+                        .any(|known| known.as_str() == *r)
                 })
-                .collect();
-            let unstated = stuck
-                .iter()
-                .filter(|row| row.unsettled_reason.is_none())
                 .count();
-            if unstated > 0 {
-                parts.push(format!("unstated {unstated}"));
-            }
-            Some(format!("undecided {n} ({})", parts.join(", ")))
+        if unstated > 0 {
+            parts.push(format!("unstated {unstated}"));
+        }
+        reasoned.push(format!(
+            "unmeasurable {} ({})",
+            stuck.len(),
+            parts.join(", ")
+        ));
+    }
+    let retired: Vec<&ChangeLedgerRow> = rows
+        .iter()
+        .filter(|row| row.retire_reason.is_some())
+        .collect();
+    if !retired.is_empty() {
+        let parts: Vec<String> = RetireReason::ALL
+            .iter()
+            .filter_map(|reason| {
+                let m = retired
+                    .iter()
+                    .filter(|row| row.retire_reason == Some(*reason))
+                    .count();
+                (m > 0).then(|| format!("{} {}", reason.as_str(), m))
+            })
+            .collect();
+        reasoned.push(format!(
+            "judged-out {} ({})",
+            retired.len(),
+            parts.join(", ")
+        ));
+    }
+    let plain = rows
+        .iter()
+        .filter(|row| {
+            row.state.is_outstanding()
+                && row.unsettled_reason.is_none()
+                && row.retire_reason.is_none()
         })
-        .collect::<Vec<_>>()
-        .join(", ");
+        .count();
+    if plain > 0 {
+        reasoned.push(format!("owed {}", plain));
+    }
+    if rows.iter().any(|row| !row.state.is_outstanding()) {
+        reasoned.push(format!(
+            "landed {} (the storage filter broke)",
+            rows.iter()
+                .filter(|row| !row.state.is_outstanding())
+                .count()
+        ));
+    }
+    let by_state = reasoned.join(", ");
     let never_measured = rows.iter().filter(|row| row.measured_at.is_none()).count();
     match rows.iter().filter_map(|row| row.measured_at).min() {
         Some(oldest) => format!(
@@ -7792,36 +8371,47 @@ mod tests {
         }
     }
 
-    /// How many rows, in which states, and how many nobody has looked at -- all
-    /// three have to be readable off the one line.
+    /// How many rows, split by what keeps each one owed, and how many nobody has
+    /// looked at -- all of it readable off the one line.
+    ///
+    /// Every row here is `pending`: that is the only owed state, and the split
+    /// that used to be a state word is now the reason beside the row.
     #[test]
-    fn the_summary_names_every_state_present_and_the_unmeasured_count() {
+    fn the_summary_splits_the_owed_rows_by_what_still_holds_them() {
         let rows = vec![
             row(ChangeState::Pending, None),
-            row(ChangeState::Undecided, Some(1_760_000_000)),
+            ChangeLedgerRow {
+                state: ChangeState::Pending,
+                unsettled_reason: Some(UnsettledReason::KindWithoutPredicate.as_str().to_string()),
+                ..row(ChangeState::Pending, Some(1_760_000_000))
+            },
             row(ChangeState::Pending, Some(1_760_000_100)),
         ];
         assert_eq!(
             outstanding_summary(&rows),
-            "3 outstanding: pending 2, undecided 1 (unstated 1); never measured 1; \
-             oldest measurement 2025-10-09T08:53:20+00:00"
+            "3 outstanding: unmeasurable 1 (kind_without_predicate 1), owed 2; \
+             never measured 1; oldest measurement 2025-10-09T08:53:20+00:00"
         );
     }
 
-    /// The undecided rows are split by the reason they are stuck, in the closed
-    /// set's order, and a row with no reason persisted yet reads as unstated
-    /// rather than vanishing -- so the parts always sum to the undecided count.
+    /// The unmeasurable rows are split by the reason they are stuck, in the
+    /// closed set's order -- so the parts sum to the bucket's own count.
     ///
     /// This is the reading the pass's own `unsettled` field cannot give: that
     /// field counts only the rows the pass asked, so a row the pass did not reach
     /// is missing from it entirely, and "why is this stuck" is unanswerable from
     /// the ledger once the log rolls.
+    ///
+    /// A row with no reason is not unmeasurable: no constructor can build one,
+    /// so a row without a reason either was measured and found absent or was
+    /// written before the column existed -- and both are owed work with nothing
+    /// to argue about, which is what the `owed` count says.
     #[test]
-    fn the_summary_splits_the_undecided_rows_by_reason() {
+    fn the_summary_splits_the_unmeasurable_rows_by_reason() {
         let stuck = |reason: Option<&str>| ChangeLedgerRow {
-            state: ChangeState::Undecided,
+            state: ChangeState::Pending,
             unsettled_reason: reason.map(str::to_string),
-            ..row(ChangeState::Undecided, Some(1_760_000_000))
+            ..row(ChangeState::Pending, Some(1_760_000_000))
         };
         let rows = vec![
             stuck(Some("scope_outside_tree")),
@@ -7832,8 +8422,8 @@ mod tests {
         ];
         assert_eq!(
             outstanding_summary(&rows),
-            "5 outstanding: pending 1, undecided 4 \
-             (kind_without_predicate 1, scope_outside_tree 2, unstated 1); \
+            "5 outstanding: unmeasurable 3 \
+             (kind_without_predicate 1, scope_outside_tree 2), owed 2; \
              never measured 0; oldest measurement 2025-10-09T08:53:20+00:00"
         );
     }
@@ -7844,26 +8434,32 @@ mod tests {
     fn all_unmeasured_rows_report_no_measurement_time() {
         let rows = vec![
             row(ChangeState::Pending, None),
-            row(ChangeState::Conflict, None),
+            row(ChangeState::Pending, None),
         ];
         assert_eq!(
             outstanding_summary(&rows),
-            "2 outstanding: conflict 1, pending 1; never measured 2"
+            "2 outstanding: owed 2; never measured 2"
         );
     }
 
-    /// States are ordered by the closed set, not by row order: the same rows in
+    /// Reasons are ordered by the closed set, not by row order: the same rows in
     /// a different order read out as the same line, or every diff of two readings
     /// would be noise.
     #[test]
-    fn the_state_order_does_not_follow_the_row_order() {
+    fn the_reason_order_does_not_follow_the_row_order() {
+        let stuck = |reason: UnsettledReason| ChangeLedgerRow {
+            state: ChangeState::Pending,
+            unsettled_reason: Some(reason.as_str().to_string()),
+            ..row(ChangeState::Pending, None)
+        };
         let rows = vec![
-            row(ChangeState::Undecided, None),
-            row(ChangeState::Conflict, None),
+            stuck(UnsettledReason::KindWithoutPredicate),
+            stuck(UnsettledReason::ScopeOutsideTree),
         ];
         assert_eq!(
             outstanding_summary(&rows),
-            "2 outstanding: conflict 1, undecided 1 (unstated 1); never measured 2"
+            "2 outstanding: unmeasurable 2 (kind_without_predicate 1, scope_outside_tree 1); \
+             never measured 2"
         );
     }
 
@@ -7960,7 +8556,8 @@ mod tests {
         let rows = vec![row(ChangeState::Landed, Some(1_760_000_000))];
         assert_eq!(
             outstanding_summary(&rows),
-            "1 outstanding: landed 1; never measured 0; oldest measurement 2025-10-09T08:53:20+00:00"
+            "1 outstanding: landed 1 (the storage filter broke); never measured 0; \
+             oldest measurement 2025-10-09T08:53:20+00:00"
         );
     }
 
@@ -8107,7 +8704,9 @@ mod tests {
         );
         let control: Arc<dyn OrchestratorControl> = graph.clone();
 
-        let settled = settle_dispatch_parents(&control).await;
+        let settled = settle_dispatch_parents(&control)
+            .await
+            .expect("the graph is readable here");
 
         assert_eq!(
             settled.anchored, 1,
@@ -8144,9 +8743,13 @@ mod tests {
                 .holding_root_change("change-b", "change-ledger:crates"),
         );
         let control: Arc<dyn OrchestratorControl> = graph.clone();
-        settle_dispatch_parents(&control).await;
+        settle_dispatch_parents(&control)
+            .await
+            .expect("the graph is readable here");
 
-        let settled = settle_dispatch_parents(&control).await;
+        let settled = settle_dispatch_parents(&control)
+            .await
+            .expect("the graph is readable here");
 
         assert_eq!(
             settled,
@@ -8173,7 +8776,9 @@ mod tests {
         );
         let control: Arc<dyn OrchestratorControl> = graph.clone();
 
-        let settled = settle_dispatch_parents(&control).await;
+        let settled = settle_dispatch_parents(&control)
+            .await
+            .expect("the graph is readable here");
 
         assert_eq!(settled.criteria, 1, "{settled:?}");
         assert_eq!(settled.failed, 0, "{settled:?}");
@@ -8195,7 +8800,9 @@ mod tests {
             "a row of another kind is not this pass's to fill"
         );
         assert_eq!(
-            settle_dispatch_parents(&control).await,
+            settle_dispatch_parents(&control)
+                .await
+                .expect("the graph is readable here"),
             SettledProjects::default(),
             "a second settle finds nothing left to do"
         );
@@ -8214,11 +8821,15 @@ mod tests {
         }
         let control: Arc<dyn OrchestratorControl> = Arc::new(graph);
 
-        let settled = settle_dispatch_parents(&control).await;
+        let settled = settle_dispatch_parents(&control)
+            .await
+            .expect("the graph is readable here");
         assert_eq!(settled.criteria, SETTLE_BATCH, "{settled:?}");
         assert_eq!(settled.remaining, 3, "{settled:?}");
 
-        let settled = settle_dispatch_parents(&control).await;
+        let settled = settle_dispatch_parents(&control)
+            .await
+            .expect("the graph is readable here");
         assert_eq!(settled.criteria, 3, "{settled:?}");
         assert_eq!(settled.remaining, 0, "{settled:?}");
 
@@ -8227,6 +8838,198 @@ mod tests {
             tasks.iter().filter(|t| t.acceptance.is_empty()).count(),
             0,
             "after the second settle every change says what closes it"
+        );
+    }
+
+    /// 结算读不到图，不是「已经补完了」。
+    ///
+    /// 这一趟的进度只看 `remaining`：折叠读回一份空图，`remaining` 就是 0，
+    /// 调用方据此把 `parents_settled` 立起来，这一趟回填此后一辈子不再跑。所以
+    /// 读不到要有自己的答案（`None`），调用方见到它就不立这一格。
+    #[tokio::test]
+    async fn a_settle_that_cannot_read_the_graph_is_not_a_settle_that_finished() {
+        let graph = Arc::new(FakeGraph::default().forgetting_the_graph());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        assert!(
+            settle_dispatch_parents(&control).await.is_none(),
+            "读不到图的一拍既没补上什么、也没法说还剩多少——它不该答成「补完了」"
+        );
+    }
+
+    /// 回填普通行时读不到那一行，不是「这行不在了」：它留到下一拍。
+    ///
+    /// 当作行没了就会 `continue`，`remaining` 停在 0 —— 这一趟于是宣布自己补完了，
+    /// 而那一行的判据此后没人再写。
+    #[tokio::test]
+    async fn a_dispatched_row_that_cannot_be_read_keeps_the_back_fill_asking() {
+        let row = ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "crates/x", "fn a"),
+            ..row(ChangeState::Pending, None)
+        };
+        // 今天写下的行自带判据（by construction），这里要的是那一代之前写下的
+        // 行：判据空着，才在回填的射程里。
+        let mut orphan = dispatch_one(&row, 0);
+        orphan.acceptance.clear();
+        let graph = Arc::new(FakeGraph::default().forgetting_the_graph());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+        let mut settled = SettledProjects::default();
+
+        fill_dispatch_criteria(&control, std::slice::from_ref(&orphan), &mut settled).await;
+
+        assert_eq!(settled.criteria, 0, "{settled:?}");
+        assert_eq!(settled.failed, 0, "读不到不是写失败：{settled:?}");
+        assert_eq!(settled.remaining, 1, "读不到的行要留到下一拍：{settled:?}");
+    }
+
+    /// 下发这一趟读不到图，就一条都不下发。
+    ///
+    /// 折叠读会让交接索引空着：每一行欠账都被当成「图上没有」，于是照 generation 0
+    /// 再投一次 —— 那个 id 很可能还在库里，目标那条路对重复 id 是直接报错的。与
+    /// 上面普查、欠账集读不到时给的是同一个答案：这一趟什么也不交出去。
+    #[tokio::test]
+    async fn a_pass_that_cannot_read_the_graph_hands_nothing_over() {
+        let rows: Vec<ChangeLedgerRow> = ["fn a", "fn b"]
+            .iter()
+            .map(|literal| ChangeLedgerRow {
+                identity: ChangeIdentity::new("grep", "crates/x", *literal),
+                ..row(ChangeState::Pending, None)
+            })
+            .collect();
+        let store = FakeLedger {
+            rows: rows.clone(),
+            ..Default::default()
+        };
+        let graph = Arc::new(FakeGraph::default().forgetting_the_graph());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            graph.submitted().is_empty(),
+            "读不到图的一趟不该把欠账按 generation 0 再投一次：{:?}",
+            graph.submitted()
+        );
+        assert!(
+            store.written().is_empty(),
+            "读不到图的一趟没有可写的读数，不该写出一行"
+        );
+    }
+
+    /// 代次那一问答不上来时，欠账留在账上，不按 generation 0 投出去。
+    ///
+    /// 代次走查的每一步都是「这一代有没有被占着」。读不出来当成「没有」，走查就断在
+    /// 这里、照那一代投出去——而那个 id 很可能还在库里，目标那条路对重复 id 是直接
+    /// 报错的，此后每一趟都报。所以读不到时这一行按「欠着、这一趟没交出去」记账。
+    #[tokio::test]
+    async fn an_owed_row_whose_generation_cannot_be_read_is_left_owed() {
+        let row = ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "crates/x", "fn a"),
+            ..row(ChangeState::Pending, None)
+        };
+        let store = FakeLedger {
+            rows: vec![row.clone()],
+            ..Default::default()
+        };
+        let graph =
+            Arc::new(FakeGraph::default().with_unreadable(&dispatch_task_id(&row.identity, 0)));
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            graph.submitted().is_empty(),
+            "代次读不到时不该照那一代投出去：{:?}",
+            graph.submitted()
+        );
+        let state = store.written().pop().expect("the pass wrote its row");
+        assert_eq!(
+            state.held_back, 1,
+            "这一行是「欠着、这一趟没交出去」：{state:?}"
+        );
+        assert_eq!(state.submitted, 0, "{state:?}");
+        assert_eq!(state.failed, 0, "读不到不是投递失败：{state:?}");
+    }
+
+    /// 放回交接之前的那一读问不上来时，这一条不收回。
+    ///
+    /// 收回是照着「这条从没开始」的结论去取消一行；读不出来就不能得出这个结论，
+    /// 而 store 那边取消一条已经在跑的任务是不会抱怨的——这一读就是拦它的那道门。
+    #[tokio::test]
+    async fn a_hand_over_that_cannot_be_read_is_not_taken_back() {
+        let rows: Vec<ChangeLedgerRow> = ["fn a", "fn b", "fn c"]
+            .iter()
+            .map(|literal| ChangeLedgerRow {
+                identity: ChangeIdentity::new("grep", "crates/x", *literal),
+                ..row(ChangeState::Pending, None)
+            })
+            .collect();
+        let store = FakeLedger {
+            rows: rows.clone(),
+            ..Default::default()
+        };
+        let mut graph = FakeGraph::default();
+        for row in &rows {
+            graph = graph.holding_handover(row, TaskStatus::Pending);
+        }
+        let unreadable = dispatch_task_id(&rows[0].identity, 0);
+        let graph = Arc::new(graph.with_unreadable(&unreadable));
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        let kept = graph.held(&unreadable).expect("它还拿着那一行");
+        assert_eq!(
+            kept.status,
+            TaskStatus::Pending,
+            "读不到「从没开始」的那一条不能被收回"
+        );
+        assert!(
+            !graph.cancelled().iter().any(|(id, _)| id == &unreadable),
+            "读不到的一条不该被取消：{:?}",
+            graph.cancelled()
         );
     }
 
@@ -8289,12 +9092,14 @@ mod tests {
     fn a_dispatched_change_states_what_done_means_in_the_account_s_own_terms() {
         let task = dispatch_one(&row(ChangeState::Pending, Some(1_760_000_000)), 0);
         assert_eq!(task.acceptance, vec![DISPATCH_ACCEPTANCE.to_string()]);
-        for terminal in ["landed", "retired"] {
-            assert!(
-                DISPATCH_ACCEPTANCE.contains(terminal),
-                "验收标准点名的不是账上的终态「{terminal}」：{DISPATCH_ACCEPTANCE}"
-            );
-        }
+        assert!(
+            DISPATCH_ACCEPTANCE.contains(ChangeState::Landed.as_str()),
+            "验收标准点名的不是账上唯一的终态：{DISPATCH_ACCEPTANCE}"
+        );
+        assert!(
+            !DISPATCH_ACCEPTANCE.contains("retired"),
+            "验收标准还点名了账上已经没有的终态，那一行永远等不到：{DISPATCH_ACCEPTANCE}"
+        );
         assert!(
             DISPATCH_ACCEPTANCE.contains("outstanding"),
             "没写清它清掉的正是这一行欠着的那一格：{DISPATCH_ACCEPTANCE}"
@@ -8549,18 +9354,26 @@ mod tests {
         assert_eq!(dispatch_goal(&bare), bare.identity.as_key());
     }
 
-    /// What was left out is on the line, by state. Otherwise a ledger whose whole
-    /// outstanding set sits in a state nothing can act on reads exactly like one
-    /// with nothing owed.
+    /// What was left out is on the line, by the reason it was left out.
+    /// Otherwise a ledger whose whole outstanding set is unmeasurable reads
+    /// exactly like one with nothing owed.
     #[test]
-    fn the_held_back_line_names_every_state_that_was_not_handed_over() {
+    fn the_held_back_line_names_every_row_that_was_not_handed_over() {
+        let stuck = |reason: UnsettledReason| ChangeLedgerRow {
+            unsettled_reason: Some(reason.as_str().to_string()),
+            ..row(ChangeState::Pending, None)
+        };
+        let judged_out = |reason: RetireReason| ChangeLedgerRow {
+            retire_reason: Some(reason),
+            ..row(ChangeState::Pending, None)
+        };
         let rows = vec![
-            row(ChangeState::Conflict, None),
+            judged_out(RetireReason::Fixture),
             row(ChangeState::Pending, None),
-            row(ChangeState::Undecided, None),
-            row(ChangeState::Undecided, None),
+            stuck(UnsettledReason::ScopeOutsideTree),
+            stuck(UnsettledReason::KindWithoutPredicate),
         ];
-        assert_eq!(held_back_summary(&rows), "conflict 1, undecided 2");
+        assert_eq!(held_back_summary(&rows), "unmeasurable 2, judged-out 1");
         assert_eq!(held_back_summary(&[row(ChangeState::Pending, None)]), "");
     }
 
@@ -8982,7 +9795,11 @@ mod tests {
 
         let measurements = store.measurements();
         assert_eq!(measurements.len(), 1, "{measurements:?}");
-        assert_eq!(measurements[0].state, ChangeState::Retired);
+        assert_eq!(
+            measurements[0].state,
+            ChangeState::Pending,
+            "a relocation is a judgement about the row, not a completion of it"
+        );
         assert_eq!(
             measurements[0].retire_reason,
             Some(RetireReason::Superseded),
@@ -9745,7 +10562,12 @@ mod tests {
             let mut blocked = self.blocked.lock().unwrap();
             let mut touched = 0;
             for row in &self.rows {
-                if !row.state.is_outstanding() || settled.contains(&row.identity) {
+                // Handed over means the tree will be asked again, and a row the
+                // census judged out has nothing new to answer.
+                if !row.state.is_outstanding()
+                    || row.retire_reason.is_some()
+                    || settled.contains(&row.identity)
+                {
                     continue;
                 }
                 match blocked.get(&row.identity).map(String::as_str) {
@@ -9901,7 +10723,11 @@ mod tests {
             Ok(self
                 .rows
                 .iter()
-                .filter(|row| row.state.is_outstanding() && !settled.contains(&row.identity))
+                .filter(|row| {
+                    row.state.is_outstanding()
+                        && row.retire_reason.is_none()
+                        && !settled.contains(&row.identity)
+                })
                 .take(limit)
                 .cloned()
                 .collect())
@@ -9920,7 +10746,11 @@ mod tests {
                     let rows = self
                         .rows
                         .iter()
-                        .filter(|row| row.state.is_outstanding() && row.priority() == band)
+                        .filter(|row| {
+                            row.state.is_outstanding()
+                                && row.retire_reason.is_none()
+                                && row.priority() == band
+                        })
                         .count();
                     (band, rows)
                 })
@@ -10015,10 +10845,7 @@ mod tests {
             Ok(self
                 .rows
                 .iter()
-                .filter(|row| {
-                    row.state == ChangeState::Retired
-                        && row.retire_reason == Some(RetireReason::SurfaceMoved)
-                })
+                .filter(|row| row.retire_reason == Some(RetireReason::SurfaceMoved))
                 .take(limit)
                 .cloned()
                 .collect())
@@ -10027,10 +10854,7 @@ mod tests {
             Ok(self
                 .rows
                 .iter()
-                .filter(|row| {
-                    row.state == ChangeState::Retired
-                        && row.retire_reason == Some(RetireReason::AnsweredElsewhere)
-                })
+                .filter(|row| row.retire_reason == Some(RetireReason::AnsweredElsewhere))
                 .take(limit)
                 .cloned()
                 .collect())
@@ -10125,6 +10949,10 @@ mod tests {
         /// gave. Kept apart from the row so a test can read *why* a row was
         /// closed without parsing the sentence back out of its error column.
         cancelled: std::sync::Mutex<Vec<(String, String)>>,
+        /// 测试用：读图的那几条都问不上来（模拟一个读不出来的 store）。
+        graph_unreadable: bool,
+        /// 测试用：整份行表读得出，但读这些 id 的那一问答不上来。
+        unreadable_ids: std::sync::Mutex<std::collections::HashSet<String>>,
     }
 
     impl FakeGraph {
@@ -10271,6 +11099,18 @@ mod tests {
             self
         }
 
+        /// 读图的那几条这一拍都问不上来：一个读不出来的 store 的形状。
+        fn forgetting_the_graph(mut self) -> Self {
+            self.graph_unreadable = true;
+            self
+        }
+
+        /// 整份行表照常读得出，只有这一个 id 的那一问答不上来。
+        fn with_unreadable(self, id: &str) -> Self {
+            self.unreadable_ids.lock().unwrap().insert(id.to_string());
+            self
+        }
+
         fn submitted(&self) -> Vec<String> {
             self.submitted.lock().unwrap().clone()
         }
@@ -10317,6 +11157,23 @@ mod tests {
         }
         async fn get_all_tasks(&self) -> Vec<Task> {
             self.tasks.lock().unwrap().values().cloned().collect()
+        }
+        /// 如实报错的那两条读：只有 store 读不出来时才走 `Err`，其余照内存答。
+        async fn get_all_tasks_checked(&self) -> SFResult<Vec<Task>> {
+            if self.graph_unreadable {
+                return Err(SFError::Database(
+                    "store unavailable: cannot read the task graph".into(),
+                ));
+            }
+            Ok(self.get_all_tasks().await)
+        }
+        async fn get_task_checked(&self, task_id: &str) -> SFResult<Option<Task>> {
+            if self.graph_unreadable || self.unreadable_ids.lock().unwrap().contains(task_id) {
+                return Err(SFError::Database(format!(
+                    "store unavailable: cannot read task {task_id}"
+                )));
+            }
+            Ok(self.get_task(task_id).await)
         }
         async fn push_to_dlq(&self, _task_id: &str, _error: String) -> SFResult<bool> {
             Ok(false)
@@ -10661,10 +11518,12 @@ mod tests {
         (dir, exited)
     }
 
-    /// A row already settled as retired because its scope left the tree.
+    /// A row the census already judged out because its scope left the tree. It
+    /// is still `pending`: the judgement is about the row's place in the
+    /// account, not a claim that the change is in the tree.
     fn retired_row(scope: &str, measured_rev: Option<&str>) -> ChangeLedgerRow {
         ChangeLedgerRow {
-            state: ChangeState::Retired,
+            state: ChangeState::Pending,
             measured_rev: measured_rev.map(str::to_string),
             retire_reason: Some(RetireReason::SurfaceMoved),
             retired_at: Some(Utc.timestamp_opt(1_760_000_100, 0).unwrap()),
@@ -10790,7 +11649,6 @@ mod tests {
         let snapshot = tree.snapshot().await.expect("the fixture is readable");
         let identity = ChangeIdentity::new("grep", "file", "fn thing");
         let retired = ChangeLedgerRow {
-            state: ChangeState::Retired,
             retire_reason: Some(RetireReason::Fixture),
             ..pending_row("file")
         };
@@ -10842,7 +11700,6 @@ mod tests {
         let identity = ChangeIdentity::new("grep", "file", "fn thing");
         let store = FakeLedger {
             rows: vec![ChangeLedgerRow {
-                state: ChangeState::Retired,
                 retire_reason: Some(RetireReason::Fixture),
                 ..pending_row("file")
             }],
@@ -11064,7 +11921,11 @@ mod tests {
         let measurements = store.measurements();
         assert_eq!(measurements.len(), 1, "the retirement was written back");
         let retirement = &measurements[0];
-        assert_eq!(retirement.state, ChangeState::Retired);
+        assert_eq!(
+            retirement.state,
+            ChangeState::Pending,
+            "the row is judged out, not completed"
+        );
         assert_eq!(
             retirement.retire_reason,
             Some(RetireReason::SurfaceMoved),
@@ -11445,6 +12306,42 @@ mod tests {
         );
     }
 
+    /// The per-row answer the pass splits its reading on: the revision the
+    /// running image descends from is on the line, and one it does not carry is
+    /// off it -- told apart by the ancestor set alone.
+    ///
+    /// Written as its own case because these two sides are the whole of the
+    /// reading: a classifier that answered "in line" for every revision the
+    /// repository can resolve would publish a rollout that had finished on the
+    /// first pass after any landing, which is the collapse this pass exists to
+    /// avoid. The two revisions here are both real commits in the fixture and
+    /// differ only in where the running revision stands relative to them.
+    #[tokio::test]
+    async fn a_landing_revision_is_placed_on_one_side_of_the_running_line() {
+        let (dir, first, second) = two_revision_repo();
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let reach = tree
+            .reach(&first)
+            .await
+            .expect("the fixture's first commit is a revision this tree can place");
+
+        assert_eq!(
+            landed_side(&reach, &first),
+            LandedSide::InLine,
+            "the revision the line was read from is on its own line"
+        );
+        assert_eq!(
+            landed_side(&reach, &second),
+            LandedSide::OffLine,
+            "a commit the running revision does not descend from is off the line"
+        );
+        assert_eq!(
+            LandedSide::OffLine.as_str(),
+            "off-line",
+            "the side is named when it is written down, and the name says which side"
+        );
+    }
+
     /// A row that stops being landed leaves the set: it is not out of effect any
     /// more, it is not done any more, and those are two different facts that the
     /// next landing of the same identity would otherwise read as one.
@@ -11581,7 +12478,7 @@ mod tests {
     /// would leave the row looking answered for the rest of the account's life.
     #[tokio::test]
     async fn a_one_row_handover_that_never_started_is_taken_back_for_its_batch() {
-        let rows: Vec<ChangeLedgerRow> = ["fn a", "fn b", "fn c"]
+        let rows: Vec<ChangeLedgerRow> = ["fn a", "fn b"]
             .iter()
             .map(|literal| ChangeLedgerRow {
                 identity: ChangeIdentity::new("grep", "crates/x", *literal),
@@ -11611,6 +12508,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -11629,16 +12527,16 @@ mod tests {
         }
 
         let state = store.written().pop().expect("the pass wrote its row");
-        assert_eq!(state.submitted, 3, "三条欠账该在这一拍全部出去");
+        assert_eq!(state.submitted, 2, "两条欠账该在这一拍全部出去");
         assert_the_counts_add_up(&state);
 
         let batch = graph
             .handed()
             .into_iter()
             .find(|task| task.input.get(cog_core::INPUT_CHANGE_IDENTITIES).is_some())
-            .expect("三条欠账该由一笔交接承载");
+            .expect("两条欠账该由一笔交接承载");
         let carried = dispatched_identities(&batch);
-        assert_eq!(carried.len(), 3, "三条挂在同一个任务上：{carried:?}");
+        assert_eq!(carried.len(), 2, "两条挂在同一个任务上：{carried:?}");
         assert_eq!(
             batch.id,
             dispatch_task_id(&carried[0], 1),
@@ -11682,6 +12580,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -11734,6 +12633,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -11773,6 +12673,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -11887,6 +12788,143 @@ mod tests {
         }
     }
 
+    /// 事件流的替身：记住钉住的批次与被关掉的轮次。
+    #[derive(Default)]
+    struct FakeRounds {
+        open: std::sync::Mutex<Option<RoundOpened>>,
+        opened: std::sync::Mutex<Vec<RoundOpened>>,
+        closed: std::sync::Mutex<Vec<String>>,
+        broken: bool,
+    }
+
+    impl FakeRounds {
+        fn broken() -> Self {
+            Self {
+                broken: true,
+                ..Self::default()
+            }
+        }
+        fn with(round: RoundOpened) -> Self {
+            Self {
+                open: std::sync::Mutex::new(Some(round)),
+                ..Self::default()
+            }
+        }
+        fn opened(&self) -> Vec<RoundOpened> {
+            self.opened.lock().unwrap().clone()
+        }
+        fn closed(&self) -> Vec<String> {
+            self.closed.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RoundEvents for FakeRounds {
+        fn writer(&self) -> &str {
+            "change-ledger"
+        }
+        async fn open(&self, round: &RoundOpened) -> SFResult<()> {
+            if self.broken {
+                return Err(SFError::Database("no stream".into()));
+            }
+            *self.open.lock().unwrap() = Some(round.clone());
+            self.opened.lock().unwrap().push(round.clone());
+            Ok(())
+        }
+        async fn current(&self) -> SFResult<Option<RoundOpened>> {
+            if self.broken {
+                return Err(SFError::Database("no stream".into()));
+            }
+            Ok(self.open.lock().unwrap().clone())
+        }
+        async fn close(&self, round: &str, _actor: &str) -> SFResult<()> {
+            self.closed.lock().unwrap().push(round.to_string());
+            *self.open.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    fn round_with(batch: &[&str]) -> RoundOpened {
+        RoundOpened {
+            round: "round-open".into(),
+            ledger_rev: String::new(),
+            code_rev: String::new(),
+            batch: batch.iter().map(|s| s.to_string()).collect(),
+            actor: "change-ledger".into(),
+            at: Utc::now(),
+        }
+    }
+
+    /// 没有开着的一轮：开一轮，批次就是这一刻可下发的那些。
+    #[tokio::test]
+    async fn a_pass_with_no_round_pins_the_batch_it_is_about_to_dispatch() {
+        let rounds = FakeRounds::default();
+        let pending = vec![pending_row("crates/a"), pending_row("crates/b")];
+        let pinned = pinned_batch(&rounds, &pending, pending.clone())
+            .await
+            .expect("pinning must succeed against a working stream");
+        assert_eq!(pinned.len(), 2, "开轮那一拍下发的就是这一批，不多不少");
+        let opened = rounds.opened();
+        assert_eq!(opened.len(), 1);
+        let ids: Vec<String> = pending
+            .iter()
+            .map(|r| handover_task_prefix(&r.identity))
+            .collect();
+        assert_eq!(opened[0].batch, ids, "钉住的清单就是这一拍要发的那些");
+    }
+
+    /// 开着一轮时只发那一轮的：**这一条在没有钉批时是红的**——那版会把两条都发出去。
+    #[tokio::test]
+    async fn an_open_round_narrows_the_dispatch_to_its_own_batch() {
+        // 批次里钉的是**派发任务号**（`handover_task_prefix`），不是身份串：
+        // 拿身份串去钉，这一轮永远匹配不到任何一条，测试就测的是「钉批失效」。
+        let pinned_id = handover_task_prefix(&pending_row("crates/a").identity);
+        let rounds = FakeRounds::with(round_with(&[pinned_id.as_str()]));
+        let pending = vec![pending_row("crates/a"), pending_row("crates/b")];
+        let pinned = pinned_batch(&rounds, &pending, pending.clone())
+            .await
+            .expect("读得到就得钉得住");
+        assert_eq!(pinned.len(), 1, "这一轮钉住的只有一条，第二条不属于这一批");
+        assert_eq!(pinned[0].identity, pending[0].identity);
+        assert!(rounds.opened().is_empty(), "已经开着的一轮不该再开一条");
+    }
+
+    /// 一条都不欠了：关轮，再按这一刻欠着的开新的一轮。只钉不关会把循环钉死。
+    #[tokio::test]
+    async fn a_round_whose_batch_is_no_longer_owed_is_closed_and_replaced() {
+        let stale = round_with(&["no-such-change"]);
+        let rounds = FakeRounds::with(stale);
+        let pending = vec![pending_row("crates/a")];
+        let pinned = pinned_batch(&rounds, &pending, pending.clone())
+            .await
+            .expect("pinning must succeed");
+        assert_eq!(
+            rounds.closed(),
+            vec!["round-open".to_string()],
+            "旧的一轮该关掉"
+        );
+        assert_eq!(pinned.len(), 1);
+        let opened = rounds.opened();
+        assert_eq!(opened.len(), 1, "关轮之后要开新的一轮");
+        assert_eq!(
+            opened[0].batch,
+            vec![handover_task_prefix(&pending[0].identity)]
+        );
+    }
+
+    /// 读不到批次就这一拍不下发：退回「没有钉住」等于把这道判据静默关掉。
+    #[tokio::test]
+    async fn an_unreadable_round_hands_nothing_over() {
+        let rounds = FakeRounds::broken();
+        let pending = vec![pending_row("crates/a")];
+        assert!(
+            pinned_batch(&rounds, &pending, pending.clone())
+                .await
+                .is_err(),
+            "读不到不是「没有开着一轮」，也不是「没有欠着的」"
+        );
+    }
+
     fn firing(face: Option<&str>) -> cog_core::PersistedAlert {
         let mut labels = serde_json::Map::new();
         if let Some(face) = face {
@@ -11926,20 +12964,22 @@ mod tests {
             identity: ChangeIdentity::new("grep", "crates/a/src/landed.rs", "fn landed()"),
             ..row(ChangeState::Landed, Some(1_760_000_100))
         };
-        let retired = ChangeLedgerRow {
-            identity: ChangeIdentity::new("grep", "crates/a/src/retired.rs", "fn retired()"),
+        // Judged out of the account, and therefore still owed: the census
+        // stopping asking is not the change being made.
+        let judged_out = ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "crates/a/src/judged.rs", "fn judged()"),
             retire_reason: Some(RetireReason::Fixture),
-            ..row(ChangeState::Retired, None)
+            ..row(ChangeState::Pending, None)
         };
         let owed = pending_row("crates/a/src/owed.rs");
         let store = FakeLedger {
-            rows: vec![landed.clone(), retired.clone(), owed.clone()],
+            rows: vec![landed.clone(), judged_out.clone(), owed.clone()],
             ..Default::default()
         };
         let graph = Arc::new(
             FakeGraph::default()
                 .holding_handover(&landed, TaskStatus::Pending)
-                .holding_handover(&retired, TaskStatus::Scheduled)
+                .holding_handover(&judged_out, TaskStatus::Scheduled)
                 .holding_handover(&owed, TaskStatus::Pending)
                 // The planner hangs its decomposition under `parent_task_id`,
                 // which the graph's own cascade does not follow.
@@ -11959,27 +12999,38 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
-        for (row, state) in [(&landed, "landed"), (&retired, "retired")] {
-            let id = dispatch_task_id(&row.identity, 0);
+        {
+            let id = dispatch_task_id(&landed.identity, 0);
             let held = graph.held(&id).expect("这一行还该在图里");
             assert_eq!(
                 held.status,
                 TaskStatus::Cancelled,
-                "账上已经是 {state} 的行还开着，它会一直排在未结里"
+                "账上已经 landed 的行还开着，它会一直排在未结里"
             );
             let why = held.error.unwrap_or_default();
             assert!(
-                why.contains(state),
-                "关掉时的理由没有点名账上的终态 {state}：{why}"
+                why.contains(ChangeState::Landed.as_str()),
+                "关掉时的理由没有点名账上的终态：{why}"
             );
             assert!(
                 declares(&why, SETTLED_HANDOVER_PREFIX),
                 "关掉时的理由没有声明「这是账上已结、不是活干完了」，重开时读不回来：{why}"
             );
         }
+        // 被判出账的行仍然是待办：它的身份还欠着一句话，只是普查不再追问。
+        // 把它的活关掉，等于用「不查了」冒充「做完了」。
+        assert_eq!(
+            graph
+                .held(&dispatch_task_id(&judged_out.identity, 0))
+                .expect("这一行还该在图里")
+                .status,
+            TaskStatus::Scheduled,
+            "被判出账的行不是已结，它的活不能跟着关"
+        );
         assert_eq!(
             graph
                 .held(&dispatch_task_id(&owed.identity, 0))
@@ -12132,6 +13183,7 @@ mod tests {
             None,
             None,
             Some(&alerts),
+            None,
         )
         .await;
 
@@ -12158,6 +13210,7 @@ mod tests {
             None,
             None,
             Some(&[firing(Some("tasks")), firing(Some("tasks"))]),
+            None,
         )
         .await;
         assert!(graph.submitted().is_empty(), "{:?}", graph.submitted());
@@ -12199,6 +13252,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -12264,6 +13318,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -12406,14 +13461,124 @@ mod tests {
     /// The batch size a deployment states is read, and a value that cannot mean
     /// a batch is refused with a reason rather than quietly replaced.
     #[test]
-    fn a_batch_size_that_cannot_mean_a_batch_is_refused() {
-        assert_eq!(parse_rows_per_handover("12"), Ok(12));
-        assert_eq!(parse_rows_per_handover(" 12 "), Ok(12));
-        assert!(
-            parse_rows_per_handover("0").is_err(),
-            "0 读成「不限」或「停摆」都会把额度花光的形状藏起来"
+    fn a_batch_size_the_deployment_states_is_read_and_zero_means_derive_it() {
+        assert_eq!(parse_rows_per_handover("12"), Ok(Some(12)));
+        assert_eq!(parse_rows_per_handover(" 12 "), Ok(Some(12)));
+        assert_eq!(
+            parse_rows_per_handover("0"),
+            Ok(None),
+            "0 现在说的是「让图里的批次定」，不是「不限」：不限只由测量说出来，不由一个空串说出来"
         );
+        assert_eq!(parse_rows_per_handover(""), Ok(None));
         assert!(parse_rows_per_handover("five").is_err());
+    }
+
+    // proves: changeLedger.rowsPerHandover
+    /// The bound follows the graph's own batches: one above the largest that
+    /// landed whole, and never a size a generation refused.
+    ///
+    /// One law, and nothing in it that a person picked. With nothing measured it
+    /// stands at the smallest batch the reading can see. A batch of five landing
+    /// argues for six. A six that comes back refused puts the bound back to five
+    /// -- the largest proven size -- and a refusal of four, below what has
+    /// already landed, does not shrink the proof, because five has been observed
+    /// to work and four failing says something else was wrong. With no landing
+    /// at all a refusal can only cap down to the floor: the bound never leaves
+    /// the sizes the measurement can read.
+    #[test]
+    fn the_batch_bound_follows_the_graphs_batch_outcomes() {
+        assert_eq!(rows_per_handover_bound(None, None), MIN_ROWS_PER_BATCH);
+        assert_eq!(rows_per_handover_bound(Some(2), None), 3);
+        assert_eq!(rows_per_handover_bound(Some(3), None), 4);
+        assert_eq!(rows_per_handover_bound(Some(5), None), 6);
+        assert_eq!(rows_per_handover_bound(Some(5), Some(6)), 5);
+        assert_eq!(rows_per_handover_bound(Some(5), Some(4)), 6);
+        assert_eq!(rows_per_handover_bound(Some(9), Some(7)), 10);
+        assert_eq!(rows_per_handover_bound(None, Some(5)), MIN_ROWS_PER_BATCH);
+        assert_eq!(
+            rows_per_handover_bound(None, Some(1)),
+            MIN_ROWS_PER_BATCH,
+            "一条都被算作「批次」的拒绝不是关于批大小的证据，界不许掉到读不到的行数上"
+        );
+    }
+
+    /// Every pass asks for the bound, whether or not the graph moved, and the
+    /// observable's evaluation count is the evidence of it.
+    ///
+    /// Two passes over a graph with nothing measured keep the floor both times.
+    /// Without the count, that steady bound and a loop that stopped after the
+    /// first pass publish the same number.
+    #[test]
+    fn the_batch_bound_beat_counts_even_when_the_graph_does_not_move() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 11, 13, 12, 0, 0)
+            .unwrap()
+            .timestamp();
+        let observable = crate::observable::rows_per_handover_observable();
+        let before = observable.evaluations();
+        let (first, first_source) = batch_size_for_this_pass(&[], now);
+        let (second, second_source) = batch_size_for_this_pass(&[], now);
+        assert_eq!(first, MIN_ROWS_PER_BATCH);
+        assert_eq!(second, first, "nothing measured is the same answer");
+        assert_eq!(first_source, crate::observable::SOURCE_DERIVED);
+        assert_eq!(second_source, first_source);
+        assert!(
+            observable.evaluations() >= before + 2,
+            "two passes, two evaluations: {} -> {}",
+            before,
+            observable.evaluations()
+        );
+    }
+
+    /// The measurement reads completed batches and refused ones, and nothing
+    /// else off the task table.
+    ///
+    /// The environment refusal is the pool's answer and must not shrink the
+    /// boundary; the cancelled task is a fold or a shutdown; the one-row
+    /// hand-over is not a batch and says nothing about how many rows fit. The
+    /// old refusal is outside the window: a generator replaced since then is not
+    /// the one that failed.
+    #[test]
+    fn the_outcome_reading_counts_batches_and_ignores_everything_else() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 13, 12, 0, 0).unwrap();
+        let at = now.timestamp();
+        let rows = |n: usize| -> Vec<ChangeLedgerRow> {
+            (0..n)
+                .map(|i| ChangeLedgerRow {
+                    identity: ChangeIdentity::new("grep", "crates/x", format!("fn row_{i}")),
+                    ..row(ChangeState::Pending, None)
+                })
+                .collect()
+        };
+        let mut tasks: Vec<Task> = Vec::new();
+        for (n, status, age_days) in [
+            (3usize, TaskStatus::Completed, 2i64),
+            (6, TaskStatus::Completed, 1),
+            (7, TaskStatus::Failed, 1),
+            (1, TaskStatus::Completed, 1),
+            (9, TaskStatus::Failed, 0),
+            (8, TaskStatus::Failed, 45),
+        ] {
+            let mut task = dispatch_task(&rows(n), 0);
+            task.status = status;
+            task.updated_at = now - chrono::Duration::days(age_days);
+            // The 7-row failure is the work's own -- a size refusal. The 9-row
+            // one is the pool's answer, which says nothing about rows per
+            // batch, so it is marked as the environment's.
+            if n == 9 {
+                task.error_cause = Some(UpstreamFailure::Auth);
+            }
+            tasks.push(task);
+        }
+        let mut cancelled = dispatch_task(&rows(4), 0);
+        cancelled.status = TaskStatus::Cancelled;
+        tasks.push(cancelled);
+
+        assert_eq!(
+            measured_batch_sizes(&tasks, at),
+            (Some(6), Some(7)),
+            "落地最大的是 6 条那批；被退回的 7 条那批记下界，9 条那批是环境拒绝、8 条那批在窗口外、4 条那批被取消、1 条那批不是批次"
+        );
     }
 
     /// A batch the account has not fully settled stays open.
@@ -12446,7 +13611,7 @@ mod tests {
         let tasks = control.get_all_tasks().await;
         let closed = close_settled_dispatch_rows(&control, &tasks, &store, &still_owed).await;
         assert_eq!(
-            closed.landed + closed.retired,
+            closed.landed,
             0,
             "其中一项还欠着，这一笔就不能算结清：{}",
             closed.line()
@@ -12475,9 +13640,13 @@ mod tests {
     /// each, and the queue held 1,957 rows, so the same work was priced 1,957
     /// times. What the counts keep saying is the row: `submitted` is still rows
     /// handed over, so the pass's arithmetic closes on the set it read.
+    ///
+    /// This graph has landed nothing, so the bound is the smallest batch the
+    /// measurement can read; the claim is that the project's owed rows share a
+    /// hand-over instead of each getting one.
     #[tokio::test]
     async fn a_pass_files_one_task_for_a_project_however_many_rows_it_owes() {
-        let rows: Vec<ChangeLedgerRow> = ["fn a", "fn b", "fn c"]
+        let rows: Vec<ChangeLedgerRow> = ["fn a", "fn b"]
             .iter()
             .map(|literal| ChangeLedgerRow {
                 identity: ChangeIdentity::new("grep", "crates/x", *literal),
@@ -12503,13 +13672,14 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
         let state = store.written().pop().expect("the pass wrote its row");
         assert_eq!(
-            state.submitted, 3,
-            "读数按行算：派出去的是三条账，不是一个任务"
+            state.submitted, 2,
+            "读数按行算：派出去的是两条账，不是一个任务"
         );
         assert_the_counts_add_up(&state);
         assert_eq!(
@@ -12526,8 +13696,8 @@ mod tests {
         let carried = dispatched_identities(&task);
         assert_eq!(
             carried.len(),
-            3,
-            "一个项目这一拍欠的三条都挂在同一个任务上：{carried:?}"
+            2,
+            "一个项目这一拍欠的两条都挂在同一个任务上：{carried:?}"
         );
         assert_eq!(
             task.id,
@@ -12568,6 +13738,7 @@ mod tests {
             None,
             &[],
             Some(&deliveries),
+            None,
             None,
             None,
         )
@@ -12628,6 +13799,7 @@ mod tests {
             Some(&deliveries),
             None,
             None,
+            None,
         )
         .await;
 
@@ -12668,6 +13840,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -12717,6 +13890,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -12793,6 +13967,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(
@@ -12818,6 +13993,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -12878,6 +14054,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(
@@ -12907,6 +14084,7 @@ mod tests {
             Some(&metrics),
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -12943,6 +14121,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(
@@ -12974,6 +14153,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -13014,6 +14194,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         let state = store.written().pop().expect("the pass wrote its row");
@@ -13035,6 +14216,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -13061,6 +14243,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -13099,6 +14282,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -13150,6 +14334,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -13185,6 +14370,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -13210,14 +14396,14 @@ mod tests {
         let empty: Arc<dyn OrchestratorControl> = Arc::new(FakeGraph::default());
         assert!(matches!(
             owed_row(&empty, &row, limit).await,
-            Owed::NoTask { generation: 0 }
+            Ok(Owed::NoTask { generation: 0 })
         ));
 
         let killed_once = FakeGraph::default().holding(&id(0), TaskStatus::Failed);
         let killed_once: Arc<dyn OrchestratorControl> = Arc::new(killed_once);
         assert!(matches!(
             owed_row(&killed_once, &row, limit).await,
-            Owed::NoTask { generation: 1 }
+            Ok(Owed::NoTask { generation: 1 })
         ));
 
         // The re-armed handover is in flight: the row is placed, and no third
@@ -13228,7 +14414,7 @@ mod tests {
         let in_flight: Arc<dyn OrchestratorControl> = Arc::new(in_flight);
         assert!(matches!(
             owed_row(&in_flight, &row, limit).await,
-            Owed::Held(Handover::InFlight)
+            Ok(Owed::Held(Handover::InFlight))
         ));
 
         // The work's own failure is the change's answer, and it is not re-armed:
@@ -13237,7 +14423,7 @@ mod tests {
             Arc::new(FakeGraph::default().holding_dead_work(&id(0)));
         assert!(matches!(
             owed_row(&dead_work, &row, limit).await,
-            Owed::Held(Handover::DeadWork)
+            Ok(Owed::Held(Handover::DeadWork))
         ));
 
         // A row this loop itself closed because the account had already settled
@@ -13256,7 +14442,7 @@ mod tests {
             Arc::new(FakeGraph::default().holding_closed_as_settled(&settled_version));
         assert!(matches!(
             owed_row(&settled, &reopened, limit).await,
-            Owed::NoTask { generation: 1 }
+            Ok(Owed::NoTask { generation: 1 })
         ));
 
         // The same closure in the form the sweep used before it declared itself.
@@ -13270,7 +14456,7 @@ mod tests {
             ));
         assert!(matches!(
             owed_row(&unnamed, &reopened, limit).await,
-            Owed::NoTask { generation: 1 }
+            Ok(Owed::NoTask { generation: 1 })
         ));
 
         // A cancellation for any other reason is still the row's answer.
@@ -13281,7 +14467,7 @@ mod tests {
             ));
         assert!(matches!(
             owed_row(&cancelled_by_hand, &reopened, limit).await,
-            Owed::Held(Handover::DeadWork)
+            Ok(Owed::Held(Handover::DeadWork))
         ));
 
         // Every generation the budget allows was refused by the environment, so
@@ -13293,7 +14479,7 @@ mod tests {
         let spent: Arc<dyn OrchestratorControl> = Arc::new(spent);
         assert!(matches!(
             owed_row(&spent, &row, limit).await,
-            Owed::Held(Handover::DeadEnvironment)
+            Ok(Owed::Held(Handover::DeadEnvironment))
         ));
     }
 
@@ -13386,6 +14572,9 @@ mod tests {
             None,
             Some(events),
             None,
+            None,
+            // 三格快照：这条路径的用例不读它。
+            None,
         );
 
         // The first tick is one pass interval away. Paused time makes that a
@@ -13450,7 +14639,7 @@ mod tests {
         );
 
         // The pass's own order: stamp, then measure.
-        stamp_deliveries(&fake, &deliveries, &HashMap::new()).await;
+        stamp_deliveries(&fake, &deliveries, Some(&HashMap::new())).await;
         let mut unsettled = HashMap::new();
         measure_pass(&fake, &tree, &mut unsettled, &[], None).await;
 
@@ -13469,6 +14658,78 @@ mod tests {
             measurements[0].measured_rev.as_deref(),
             Some(rev.as_str()),
             "the measurement is taken at the revision the log was read at"
+        );
+    }
+
+    /// 读不到批次清单时，只有批次带过的那一条说不出来——按自己 id 能盖的照盖，
+    /// 盖不了的那条记成「没量出来」，不记成「没交付」。
+    ///
+    /// 折叠读在这里的代价是那一条永远读作「从没交付」：它留在欠账集里，下一趟
+    /// 再被交出去一次，而库里其实已经有一笔跑完的活。
+    #[tokio::test]
+    async fn a_change_only_a_batch_carried_is_unmeasured_when_the_batch_list_cannot_be_read() {
+        let anchor = pending_row("file");
+        let behind = ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "file", "fn other"),
+            ..pending_row("file")
+        };
+        let batch = dispatch_task(&[anchor.clone(), behind.clone()], 0);
+        let mut deliveries = HashMap::new();
+        deliveries.insert(batch.id.clone(), "rev-1".to_string());
+        let fake = FakeLedger {
+            rows: vec![anchor.clone(), behind.clone()],
+            ..Default::default()
+        };
+        let carried = carried_handovers(std::slice::from_ref(&batch));
+
+        let stamped = stamp_deliveries(&fake, &deliveries, None).await;
+        assert_eq!(
+            stamped.unmeasured, 1,
+            "只有批次带过的那一条说不出话来：{stamped:?}"
+        );
+        assert_eq!(
+            fake.deliveries(),
+            vec![(anchor.identity.clone(), "rev-1".to_string())],
+            "自己 id 名字下的那一笔照盖，读不到批次不影响它：{:?}",
+            fake.deliveries()
+        );
+
+        // The same pass with the batch list read: the row behind the anchor is
+        // reachable through the batch, so it is stamped and nothing is left
+        // unmeasured. A test that only asserted the `None` half would stay green
+        // if the batch edge stopped working altogether.
+        //
+        // The fake records every stamp without writing back through the row, so
+        // the anchor is stamped a second time here; what this half pins is that
+        // the row behind it is reachable and that nothing went unmeasured.
+        let stamped = stamp_deliveries(&fake, &deliveries, Some(&carried)).await;
+        assert_eq!(stamped.unmeasured, 0, "{:?}", fake.deliveries());
+        assert!(stamped.recorded >= 1, "{:?}", fake.deliveries());
+        assert!(
+            fake.deliveries()
+                .contains(&(behind.identity.clone(), "rev-1".to_string())),
+            "批次带过的那一条要能被盖到：{:?}",
+            fake.deliveries()
+        );
+    }
+
+    /// 那一次读本身：读失败交 `None`，没有目标通路交 `Some(空)`。
+    ///
+    /// 两件事在折叠读里是一个答案，而这一个答案让被批次带过的每条欠账都读成
+    /// 「从没交付」。
+    #[tokio::test]
+    async fn a_graph_that_cannot_be_read_is_not_a_graph_with_no_batches() {
+        let no_goal_path = carried_batches(None).await;
+        assert_eq!(
+            no_goal_path,
+            Some(HashMap::new()),
+            "没有目标通路时确实没有批次，这是读数不是读失败"
+        );
+        let unreadable: Arc<dyn OrchestratorControl> =
+            Arc::new(FakeGraph::default().forgetting_the_graph());
+        assert!(
+            carried_batches(Some(&unreadable)).await.is_none(),
+            "读不到图不能答成「一条批次都没有」"
         );
     }
 
@@ -13518,6 +14779,7 @@ mod tests {
             Some(&metrics),
             Some(&events),
             &[],
+            None,
             None,
             None,
             None,
@@ -13798,12 +15060,12 @@ mod tests {
         let state = DispatchState {
             decision: DispatchDecision::PausedLlmPoolUnavailable,
             pool: PoolReading::Unavailable,
-            pending: 143,
+            pending: 155,
             submitted: 3,
             already: 12,
             failed: 1,
             dead_environment: 7,
-            held_back: 120,
+            held_back: 132,
             rearmed: 2,
             delivered: None,
             unmeasurable: 5,
@@ -13821,10 +15083,9 @@ mod tests {
         let metrics = Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let metrics: Arc<dyn MetricsBackend> = metrics.clone();
         // The account's own counts, as its census and its band count would
-        // answer them. The two partitions are of the same set, and that set is
-        // larger than the pass's pending column on purpose: twelve rows are
-        // `undecided`, so a reader of the pass's own columns alone would see
-        // 148 owed and miss them.
+        // answer them. Both partitions are of the same owed set, and each cell
+        // carries a non-zero count so a cell that is written from the wrong
+        // index cannot hide by reading zero.
         let owed = [
             (ChangePriority::P0, 4usize),
             (ChangePriority::P1, 2),
@@ -13832,14 +15093,7 @@ mod tests {
             (ChangePriority::P3, 1),
             (ChangePriority::Unstated, 153),
         ];
-        let census = [
-            (ChangeState::Conflict, 0u64),
-            (ChangeState::Pending, 148),
-            (ChangeState::Partial, 0),
-            (ChangeState::Undecided, 12),
-            (ChangeState::Landed, 900),
-            (ChangeState::Retired, 40),
-        ];
+        let census = [(ChangeState::Pending, 160u64), (ChangeState::Landed, 900)];
         // The demand side: what the documents asked for, and how much of it the
         // account holds as done. A pair, and the test carries a non-trivial pair
         // because a cell that only ever reads zero cannot tell a reading from an
@@ -13916,12 +15170,12 @@ mod tests {
                 .map(str::to_string)
                 .collect::<std::collections::BTreeSet<_>>()
         );
-        assert_eq!(published["pending"], 143.0);
+        assert_eq!(published["pending"], 155.0);
         assert_eq!(published["submitted"], 3.0);
         assert_eq!(published["already"], 12.0);
         assert_eq!(published["failed"], 1.0);
         assert_eq!(published["dead_environment"], 7.0);
-        assert_eq!(published["held_back"], 120.0);
+        assert_eq!(published["held_back"], 132.0);
         assert_eq!(published["rearmed"], 2.0);
         assert_eq!(published["unmeasurable"], 5.0);
         // The tree's own window: the count and the part of it that named a
@@ -13958,7 +15212,7 @@ mod tests {
         // could hand over plus the ones it could not settle. Read off the two
         // halves rather than recomputed from the rows, so the face's number and
         // the pass's own split cannot disagree.
-        assert_eq!(published["change_ledger_pending"], 148.0);
+        assert_eq!(published["change_ledger_pending"], 160.0);
         // The demand pair, and the reason both cells are published together:
         // 41 answered against 2085 still owed is a loop that closes slowly, and
         // the satisfied count alone would read exactly like a loop that closed
@@ -13985,25 +15239,19 @@ mod tests {
         );
         assert_eq!(published["owed_p3"], 1.0);
         assert_eq!(published["owed_unstated"], 153.0);
-        // The census, one cell per outstanding state. The two empty states are
-        // published as zeros rather than left out: an absent cell and a state
-        // nobody counted read the same, and this is the face that has to say
-        // which one it is.
-        assert_eq!(published["state_conflict"], 0.0);
-        assert_eq!(published["state_pending"], 148.0);
-        assert_eq!(published["state_partial"], 0.0);
-        assert_eq!(published["state_undecided"], 12.0);
+        // The census, one cell per state the account holds. `state_landed` is
+        // written too: it is the complement of the owed set, and a reader asking
+        // "how much of this account is done" reads it rather than subtracting.
+        assert_eq!(published["state_pending"], 160.0);
+        assert_eq!(published["state_landed"], 900.0);
         assert_eq!(
             published["owed_p0"]
                 + published["owed_p1"]
                 + published["owed_p2"]
                 + published["owed_p3"]
                 + published["owed_unstated"],
-            published["state_conflict"]
-                + published["state_pending"]
-                + published["state_partial"]
-                + published["state_undecided"],
-            "the bands and the states are two partitions of one owed set"
+            published["state_pending"],
+            "the bands and the account's pending state are two partitions of one owed set"
         );
         // The pass's pending cell and the account's `pending` state are the
         // same population read two ways -- the rows this pass could hand over
@@ -14197,7 +15445,7 @@ mod tests {
     /// state cell, rather than publishing zeros.
     ///
     /// A zero is not a neutral placeholder here: `owed_p0 = 0` says the urgent
-    /// work is done, and `state_undecided = 0` says every check can be settled;
+    /// work is done, and `state_pending = 0` says the account owes nothing;
     /// either is an answer a reader will act on. A skipped cell leaves the
     /// previous tick's count standing, and every write carries its own stamp, so
     /// "how old is this number" is readable. The pass says it could not count in

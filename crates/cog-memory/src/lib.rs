@@ -19,8 +19,10 @@ pub mod causal;
 pub mod composite;
 pub mod config;
 pub mod consolidator;
+pub mod deletion;
 mod drop_log;
 pub mod embedding_provider;
+pub mod redact_artifact;
 mod sparse_head;
 
 pub mod entry_store;

@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 
 use crate::common;
 
+use common::declared_once::literal_values;
 use common::lex::Dialect;
 use common::routes::{matching_brace, repo_root};
 use common::rust_production::{production_text, relative_name};
@@ -116,8 +117,8 @@ fn mapped_words(source: &str) -> Result<BTreeMap<String, String>, String> {
             ));
         };
         let face = &tail[..face_end];
-        for word in literals(&arm[..arrow]) {
-            mapped.insert(word, face.to_string());
+        for word in literal_values(&arm[..arrow]) {
+            mapped.insert(word.to_string(), face.to_string());
         }
     }
     if mapped.is_empty() {
@@ -126,31 +127,6 @@ fn mapped_words(source: &str) -> Result<BTreeMap<String, String>, String> {
         ));
     }
     Ok(mapped)
-}
-
-/// 一段文字里的字符串字面量。
-fn literals(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'"' {
-            i += 1;
-            continue;
-        }
-        let mut j = i + 1;
-        let mut word = String::new();
-        while j < bytes.len() && bytes[j] != b'"' {
-            if bytes[j] == b'\\' && j + 1 < bytes.len() {
-                j += 1;
-            }
-            word.push(bytes[j] as char);
-            j += 1;
-        }
-        out.push(word);
-        i = j + 1;
-    }
-    out
 }
 
 fn contradictions(root: &Path) -> Vec<String> {

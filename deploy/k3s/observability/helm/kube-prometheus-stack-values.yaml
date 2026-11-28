@@ -1,3 +1,4 @@
+# census-keep: shapes=deploy-numbers — 这是第三方 chart（kube-prometheus-stack）的取值：抓取/评估间隔、保留期与资源由该 chart 的公开约定给定，不由本仓的读数导出；改它要跟它的协议一起改
 # kube-prometheus-stack Helm Values
 # 用于 K3s 生产环境部署 16 项 DevOps 可观测性组件
 #

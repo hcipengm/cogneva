@@ -22,10 +22,16 @@ pub const LEARNING_REVIEW_LOOP: &str = "reflection_learning_review";
 /// 放过它，而下一次重启也许要几天之后——中间这段时间里，那行既没人等、也没人清。
 pub const PROMOTION_EVAL_SWEEP_LOOP: &str = "reflection_promotion_eval_sweep";
 /// 这一趟多久走一次。
-// cap: bound — 等待上限是一小时，收一行迟到十分钟没有代价；跑得更勤快不了任何事
+// cap: fixed — 等待上限是一小时，收一行迟到十分钟没有代价；跑得更勤快不了任何事
+// keep: 删掉后清扫比等待上限还密，跑的更勤快不了任何事只占 CPU；由「等待上限一小时」兜住
 pub const PROMOTION_EVAL_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 /// Loop name reported through the background-loop liveness family.
 pub const SKILL_EFFECTIVENESS_LOOP: &str = "reflection_skill_effectiveness";
+
+/// The tunable this process's build-cache scan cadence belongs to. It is also
+/// the name the loop's pacing reading carries, so a reader can look up the
+/// registry row from the series without a second mapping table.
+pub const CACHE_SCAN_PACING: &str = "evolution.workspaces.cacheScanIntervalSecs";
 /// Loop name reported through the background-loop liveness family.
 ///
 /// 「发现」这个词在本仓还有另一个意思：`cog-github` 的 `discovery_enabled`
@@ -35,6 +41,9 @@ pub const SKILL_EFFECTIVENESS_LOOP: &str = "reflection_skill_effectiveness";
 /// 这条环的属主由 `self_evolution.executor_enabled` 决定，而那个开关管的是
 /// 「谁执行变更」，两者本来是两件事（见 `SELF_DISCOVERY_ROLE`）。
 pub const DISCOVERY_LOOP: &str = "reflection_discovery";
+
+/// 发现循环的节拍读数落在登记表的哪一行。
+pub(crate) const DISCOVERY_POLL_PACING: &str = "evolution.pollIntervalSecs";
 
 /// 这条环在属主仲裁里领的角色名。
 ///
@@ -145,6 +154,12 @@ pub struct ReflectionPlugin {
     /// 进程会起循环，别的进程上这一族序列不存在，读作「没人在看这张卷」，
     /// 与「看了、够用」是两件事。
     volume_capacity: Arc<crate::volume_capacity::VolumeCapacityReadings>,
+    /// 按实测定节拍的回路共用的读数面：目标间隔与求值计数。无条件建——没起的
+    /// 回路在这里是「没有这条序列」，而不是一个看起来在跑的种子值。
+    pacing: Arc<cog_core::pacing::PacingReadings>,
+    /// 容器资源请求/上限跟着实测用量走那条闭环的读数。同样无条件建：
+    /// 只有跑构建那个进程会起循环，别处读到「没人在量」正是事实。
+    workload_resources: Arc<crate::workload_resources::WorkloadResourcesReadings>,
 }
 
 impl ReflectionPlugin {
@@ -168,6 +183,10 @@ impl ReflectionPlugin {
             rework_gate: None,
             promotion_eval_slot: Arc::new(std::sync::OnceLock::new()),
             volume_capacity: Arc::new(crate::volume_capacity::VolumeCapacityReadings::new()),
+            workload_resources: Arc::new(
+                crate::workload_resources::WorkloadResourcesReadings::new(),
+            ),
+            pacing: Arc::new(cog_core::pacing::PacingReadings::new()),
         }
     }
 }
@@ -217,9 +236,21 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         // 索引健康度的采样去处。在这里取一次而不是各消费者各取一次：分配器是
         // 单例，采样点在它内部，调用方不该为了上报再去问一遍服务表。
         let metrics_backend = ctx.consume_service::<dyn cog_core::MetricsBackend>();
+        // 两处保留界线的读数面。在这里发布而不是等部署器起来：`/metrics` 的采集
+        // 端在插件初始化时取一次已发布的可观测对象，晚发布的那个没人持有。
+        let retention = std::sync::Arc::new(cog_core::retention::RetentionReadings::new());
+        ctx.publish_observable(retention.clone());
+        // 实例身份在分配器建起来之前取：当前实例的 `evol/<id>` 分支永不回收，
+        // 而回收判据要按它来——分配器不知道自己是哪个实例时，宁可整条跳过。
+        let instance_id = resolve_port_instance_id().await;
         let mut workspaces =
             crate::workspace::WorkspaceManager::new(&bare_repo, &ws_cfg.root, &ws_cfg.target_dir)
-                .with_ephemeral_ttl(std::time::Duration::from_secs(ws_cfg.ephemeral_ttl_secs));
+                .with_ephemeral_ttl(std::time::Duration::from_secs(ws_cfg.ephemeral_ttl_secs))
+                .with_orphan_branch_ttl(std::time::Duration::from_secs(
+                    ws_cfg.orphan_branch_ttl_secs,
+                ))
+                .with_current_instance(instance_id.clone())
+                .with_retention(retention);
         if let Some(metrics) = metrics_backend.clone() {
             workspaces = workspaces.with_metrics(metrics);
         }
@@ -228,7 +259,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             bare = %bare_repo,
             root = %ws_cfg.root,
             target_dir = %ws_cfg.target_dir,
-            ttl_secs = ws_cfg.ephemeral_ttl_secs,
+            ttl_seed_secs = ws_cfg.ephemeral_ttl_secs,
             "workspace allocator configured"
         );
         self.workspaces = Some(workspaces);
@@ -249,7 +280,6 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
 
         // 引擎只把 project_root 用于变更路径校验，给它一棵稳定只读的基线
         // 工作树即可；工作树随沙盒生命周期存在，不再是那棵被大家共用的树。
-        let instance_id = resolve_port_instance_id().await;
         let version = current_version(ctx);
         let mut engine_root = project_root.clone();
         // 引擎基线树与启动期工作树清理都要写裸仓库；控制面进程的 /host-git
@@ -301,13 +331,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 }
                 // 裸仓库里的 `evol/<id>` 分支只有推入、没有删除，身份每轮换一次就
                 // 永久多一条。启动时收一次：只动非本实例、且已并入 main 或超期的。
-                match ws
-                    .gc_orphan_evol_branches(
-                        &instance_id,
-                        std::time::Duration::from_secs(ws_cfg.orphan_branch_ttl_secs),
-                    )
-                    .await
-                {
+                match ws.gc_orphan_evol_branches().await {
                     Ok(reclaimed) if !reclaimed.is_empty() => {
                         info!(
                             count = reclaimed.len(),
@@ -376,7 +400,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                         let shutdown = shutdown.clone();
                         let mut rx = broadcast_tx.0.subscribe();
                         tokio::spawn(async move {
-                            let _ = rx.recv().await;
+                            cog_core::ignore_lost!(rx.recv().await);
                             shutdown.trigger();
                         });
                     }
@@ -636,45 +660,14 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         }
 
         // Tool bridge.
+        //
+        // 建议的产物已经由引擎写进 `change_dir/tools/` 下，状态是 `Generated`。
+        // 这里只决定它要不要进工具表；答案是不进，理由见 `take_tool_suggestion`。
         {
             let tool_registry = tool_registry.clone();
-            let evolution = engine.evolution.clone();
             tokio::spawn(async move {
                 while let Some(tool_json) = tool_rx.recv().await {
-                    if let Some(name) = tool_json.get("name").and_then(|v| v.as_str()) {
-                        let description = tool_json
-                            .get("description")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let parameters = tool_json.get("parameters").cloned().unwrap_or_else(
-                            || serde_json::json!({"type": "object", "properties": {}}),
-                        );
-                        let tool = cog_core::Tool {
-                            name: name.to_string(),
-                            description,
-                            parameters,
-                            implementation: cog_core::ToolImplementation::Native(Arc::new(
-                                |_args| {
-                                    Box::pin(async move {
-                                        Ok(serde_json::json!({
-                                            "error": "not implemented yet"
-                                        }))
-                                    })
-                                },
-                            )),
-                        };
-                        tool_registry.register(tool);
-                        info!("Evolution tool variant registered: {}", name);
-                        if let Some(ref evo) = evolution {
-                            if !evo
-                                .update_status(name, crate::EvolutionStatus::Registered)
-                                .await
-                            {
-                                error!("Evolution tool registered but status update failed for artifact_id={}", name);
-                            }
-                        }
-                    }
+                    take_tool_suggestion(&tool_json, tool_registry.as_ref());
                 }
             });
         }
@@ -742,7 +735,6 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                         return Err(e);
                     }
                     info!(
-                        exec_timeout_secs = self_evolution.microvm.exec_timeout_secs,
                         "Firecracker microVM sandbox enabled; evolution runs inside cold-start VMs"
                     );
                     let metrics = evolution_metrics.clone();
@@ -820,10 +812,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // 且**同一个对象**提供这两个数——分开传就会出现"读到 3600、实际按 1800 杀"
                 // 的观测面，那比没有读数更坏。
                 let budget =
-                    std::sync::Arc::new(crate::verification_budget::VerificationBudget::new(
-                        self_evolution.test_timeout_secs,
-                        self_evolution.build_timeout_secs,
-                    ));
+                    std::sync::Arc::new(crate::verification_budget::VerificationBudget::new());
 
                 let mut pipeline = crate::ChangePipeline::new(
                     &project_root,
@@ -881,13 +870,11 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     target_dir: self_evolution.workspaces.target_dir.clone().into(),
                     binary_dir: self_evolution.binary_dir.clone().into(),
                     backup_dir: self_evolution.backup_dir.clone().into(),
-                    test_timeout_secs: self_evolution.test_timeout_secs,
                     test_command: self_evolution.test_command.clone(),
                     fmt_check_command: self_evolution.fmt_check_command.clone(),
                     lint_command: self_evolution.lint_command.clone(),
                     deploy_admission: self_evolution.deploy_admission.clone(),
                     web_admission: self_evolution.web_admission.clone(),
-                    build_timeout_secs: self_evolution.build_timeout_secs,
                     auto_apply: self_evolution.auto_apply,
                     manual_approve: self_evolution.manual_approve,
                     promotion: promotion.clone(),
@@ -951,24 +938,17 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // at the verification had the same face, and the reading that
                 // separates them is the age of the flight in progress.
                 //
-                // The wall it is judged against is the sum of the bounds of its
-                // two slowest steps, taken from the objects that enforce them:
-                // the verification budget the pipeline holds, and the wait the
-                // gate actually refuses at -- the same derived value
-                // `install_for` below hands the gate this process runs under.
-                // A gate that turns out not to be in force (disabled, or a slot
-                // directory it could not create) makes this wall larger than the
-                // flight's true bound, which delays a rule rather than firing
-                // one on a healthy flight. Only the process that runs flights
-                // publishes any of it: the role is the same `executor_enabled`
-                // the queue readings publish, and a second flag here could drift
-                // out of step with that one.
-                let flight_wall_secs = budget.timeout_secs(crate::verification_budget::KIND_TEST)
-                    + build_gate_cfg.wait_secs;
+                // Only the age is published. There is no line above which that
+                // age means "stuck": each step of the flight is stopped when it
+                // stops moving, so a step may keep working for hours, and a wall
+                // drawn on the total would go red on exactly the healthy long
+                // flights this reading exists to describe. Only the process that
+                // runs flights publishes any of it: the role is the same
+                // `executor_enabled` the queue readings publish, and a second flag
+                // here could drift out of step with that one.
                 let flight = Arc::new(if executor_enabled {
                     crate::evolution_flight_readings::EvolutionFlightReadings::new(
                         self_evolution.change_dir.clone(),
-                        flight_wall_secs,
                     )
                 } else {
                     crate::evolution_flight_readings::EvolutionFlightReadings::none(
@@ -989,6 +969,14 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // 循环由 start() 在跑构建的那个进程上起。发布无条件，因为
                 // 「这张卷没人在看」本身就是读者最需要看到的那一格。
                 ctx.publish_observable(self.volume_capacity.clone());
+
+                // 资源请求/上限的实测目标。与卷容量同一条理由：发布无条件，
+                // 由跑构建那个进程在 start() 起循环；别处读到的是「没人量」。
+                ctx.publish_observable(self.workload_resources.clone());
+
+                // 按实测定节拍的回路的读数面。发布无条件：没有回路在这格上
+                // 报出自己的名字，正是「这一条没人在跑」。
+                ctx.publish_observable(self.pacing.clone());
 
                 // 自动晋级运行时一键暂停开关：admin API 与 AutoPromoter
                 // 共享同一实例，暂停立即对排队晋级生效。
@@ -1113,10 +1101,6 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                         }
                         let reporter = crate::PromotionTrendReporter::new(
                             ledger.clone(),
-                            std::path::PathBuf::from(format!(
-                                "{}/reports",
-                                ctx.config().app.data_dir
-                            )),
                             std::time::Duration::from_secs(promotion.trend_report_interval_secs),
                             audit_stream.clone(),
                             alert_sink,
@@ -1146,8 +1130,8 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {
                         let mut rx = broadcast_tx.0.subscribe();
                         tokio::spawn(async move {
-                            let _ = rx.recv().await;
-                            let _ = shutdown_tx.send(true);
+                            cog_core::ignore_lost!(rx.recv().await);
+                            cog_core::ignore_lost!(shutdown_tx.send(true));
                         });
                     }
                     info!("Promotion trend reporter enabled");
@@ -1209,7 +1193,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                             let shutdown = puller_shutdown.clone();
                             let mut rx = broadcast_tx.0.subscribe();
                             tokio::spawn(async move {
-                                let _ = rx.recv().await;
+                                cog_core::ignore_lost!(rx.recv().await);
                                 shutdown.trigger();
                             });
                         }
@@ -1297,11 +1281,11 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     // 轮首打一次、之后每消费完一条变更再打一次，所以这个界要盖住的是
                     // **一条**变更——队列有多长这条循环才知道，声明的数不能是队列总和。
                     //
-                    // 一条变更的活：三次构建槽排队（闸门 wait_secs，闸门关着时不排队）
-                    // 之后各跑一条命令——clippy 与测试各吃一份测试预算、发布构建吃一份
-                    // 构建预算——再加格式化那一段（每趟封在 fmt 预算上，趟数见
-                    // `FMT_SEGMENT_WALL_SECS`）。三段都取自强制它们的那几个数，不是
-                    // 挑一个整数把规则按住。
+                    // 一条变更的活：几次构建槽排队（闸门 wait_secs，闸门关着时不排队）
+                    // 之后各跑一条命令——clippy、测试、发布构建——再加格式化那一段。
+                    // 命令不再是按秒的界：它们跑到静默超过实测窗口才被判停，所以每一条
+                    // 的上界就是那个窗口；这个数由 `one_change_wall_secs` 从排队次数、
+                    // 命令条数与实测窗口算出来，不是挑一个整数把租约按住。
                     //
                     // Job 那条执行路径不用另外算：它的等待预算（deadline + 余量，默认
                     // 9900 秒）本来就短于这里算出来的进程内上界，盖得住。
@@ -1314,11 +1298,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                         0
                     };
                     let one_change_work = std::time::Duration::from_secs(
-                        crate::change_pipeline::one_change_wall_secs(
-                            gate_wait_secs,
-                            budget.timeout_secs(crate::verification_budget::KIND_TEST),
-                            budget.timeout_secs(crate::verification_budget::KIND_BUILD),
-                        ),
+                        crate::change_pipeline::one_change_wall_secs(gate_wait_secs),
                     );
 
                     let Some(cycle_workspaces) = self.workspaces.clone() else {
@@ -1533,7 +1513,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 let sweep_shutdown = sweep_shutdown.clone();
                 let mut rx = broadcast_tx.0.subscribe();
                 tokio::spawn(async move {
-                    let _ = rx.recv().await;
+                    cog_core::ignore_lost!(rx.recv().await);
                     sweep_shutdown.trigger();
                 });
             }
@@ -1579,7 +1559,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 let shutdown = shutdown.clone();
                 let mut rx = broadcast_tx.0.subscribe();
                 tokio::spawn(async move {
-                    let _ = rx.recv().await;
+                    cog_core::ignore_lost!(rx.recv().await);
                     shutdown.trigger();
                 });
             }
@@ -1595,12 +1575,22 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             if taste_source.is_none() {
                 info!("signal watcher: no TasteIntentSource; taste channel off");
             }
+            // 对话意图通道：读「还没被接手的那几句」，把接手的去向写回去。读与写
+            // 由持有库的插件一同发布，所以两半要么都在、要么都不在；只到一半时
+            // 通道关掉而不是读了不写——读了不写会让同一批话每拍被派一次。
+            let intent_reader = ctx.consume_service::<dyn cog_core::IntentReader>();
+            let intent_writer = ctx.consume_service::<dyn cog_core::EventStore>();
+            if intent_reader.is_none() || intent_writer.is_none() {
+                info!("signal watcher: no chat intent store; intent channel off");
+            }
             drop(crate::spawn_signal_watcher_loop(
                 orch,
                 sw_config,
                 shutdown,
                 alert_source,
                 taste_source,
+                intent_reader,
+                intent_writer,
                 self.signal_readings.clone(),
                 // 本循环产出的每个意图都会落到一个 squad，池全灭时跑一轮只买到一次 503。
                 llm_gate.clone(),
@@ -1619,13 +1609,28 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     let shutdown = shutdown.clone();
                     let mut rx = broadcast_tx.0.subscribe();
                     tokio::spawn(async move {
-                        let _ = rx.recv().await;
+                        cog_core::ignore_lost!(rx.recv().await);
                         shutdown.trigger();
                     });
                 }
+                // The scan cadence is a loop of its own: a pass is timed, and
+                // the wait before the next one follows what it cost. The
+                // declared interval is the floor here, not just the seed --
+                // walking this tree more often than the deployment asked buys
+                // nothing, so a measurement may only lengthen the wait, never
+                // shorten it below the declaration.
+                // The shared pacing face `init` published, not a second one: the
+                // family is keyed by loop name, so a local instance would be a
+                // second face for the same series -- and published from `start`
+                // it would reach no scrape anyway, since the readers took their
+                // snapshot during `init`.
+                let seed = std::time::Duration::from_secs(readings.scan_interval_secs());
+                let scan_pacer =
+                    std::sync::Arc::new(self.pacing.pacer(CACHE_SCAN_PACING, seed, seed, 20.0));
                 drop(crate::build_cache_readings::spawn_build_cache_watch(
                     readings.clone(),
                     shutdown,
+                    Some(scan_pacer),
                 ));
             }
             None => info!(
@@ -1643,10 +1648,17 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 let shutdown = shutdown.clone();
                 let mut rx = broadcast_tx.0.subscribe();
                 tokio::spawn(async move {
-                    let _ = rx.recv().await;
+                    cog_core::ignore_lost!(rx.recv().await);
                     shutdown.trigger();
                 });
             }
+            // 容器资源的目标跟着实测走。与卷容量同一条角色前提：只有跑构建
+            // 那个进程有这套 kubectl 与 RBAC；别处起这条循环改不了对象。
+            drop(crate::workload_resources::spawn_workload_resources_loop(
+                self.workload_resources.clone(),
+                ctx.consume_service::<dyn cog_core::HttpClient>(),
+                shutdown.clone(),
+            ));
             drop(crate::volume_capacity::spawn_volume_capacity_loop(
                 self.volume_capacity.clone(),
                 // The cache, so the same loop that measures the claim tells the
@@ -1659,6 +1671,26 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 self.build_cache.clone(),
                 shutdown,
             ));
+        }
+
+        // 待落地队列的写者：事件流。挂在这里而不是 init，理由与决策统计表相同
+        // ——发布方（storage 插件）可能与本插件在同一层并行初始化。挂不上不是
+        // 「队列是空的」，是「这份进程没有队列」：生成侧会拒绝一条没有去处可去的
+        // 变更，而不是让它落成一份没人能说出状态的 `.diff`。
+        match ctx.consume_service::<dyn cog_core::ChangeCandidateStore>() {
+            Some(store) => {
+                let attached = crate::change_pipeline::attach_process_candidates(store);
+                if attached {
+                    info!("the change candidate queue is attached to the event stream");
+                } else {
+                    info!("the change candidate queue was already attached by an earlier start");
+                }
+            }
+            None => warn!(
+                "no change candidate store published; generated changes have no queue to be \
+                 recorded in and a generated change will be refused rather than left as an \
+                 unrecorded diff"
+            ),
         }
 
         // 决策统计的运行时作者从卷上的快照换成共享表。这一步放在 start 而不是
@@ -1683,7 +1715,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 let shutdown = shutdown.clone();
                 let mut rx = broadcast_tx.0.subscribe();
                 tokio::spawn(async move {
-                    let _ = rx.recv().await;
+                    cog_core::ignore_lost!(rx.recv().await);
                     shutdown.trigger();
                 });
             }
@@ -1708,7 +1740,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 let shutdown = shutdown.clone();
                 let mut rx = broadcast_tx.0.subscribe();
                 tokio::spawn(async move {
-                    let _ = rx.recv().await;
+                    cog_core::ignore_lost!(rx.recv().await);
                     shutdown.trigger();
                 });
             }
@@ -1758,7 +1790,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 let shutdown = shutdown.clone();
                 let mut rx = broadcast_tx.0.subscribe();
                 tokio::spawn(async move {
-                    let _ = rx.recv().await;
+                    cog_core::ignore_lost!(rx.recv().await);
                     shutdown.trigger();
                 });
             }
@@ -1856,7 +1888,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     let shutdown = shutdown.clone();
                     let mut rx = broadcast_tx.0.subscribe();
                     tokio::spawn(async move {
-                        let _ = rx.recv().await;
+                        cog_core::ignore_lost!(rx.recv().await);
                         shutdown.trigger();
                     });
                 }
@@ -1870,6 +1902,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     period,
                     self.pool_gate.clone(),
                     self.discovery_outcome_readings.clone(),
+                    Some(self.pacing.clone()),
                 );
                 spawn_skill_effectiveness_loop(engine, skill_registry, period, self.executor_role);
             }
@@ -1911,7 +1944,20 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // process reading them shares its life. The handle itself was
                 // published in init -- see the field's own note for why it cannot
                 // be published from here.
-                let deployer = crate::MainlineDeployer::new(ml_config.clone(), workspaces);
+                // registry 保留回路的读数与工作区 TTL 落在同一份面上：两者是同一条
+                // 「容量换件数」的律，各开一套指标名只会让同一个量读起来像两个东西。
+                let retention_face = workspaces.retention_face();
+                let deployer = crate::MainlineDeployer::new(ml_config.clone(), workspaces)
+                    // 判定 Job 的下一轮尺寸进同一个读数面：同一条律、同一个
+                    // source 标签，别让它单独长一套指标名。
+                    .with_workload_resources(self.workload_resources.clone())
+                    // 轮询节拍、启动/滚动/静置的申报界与两处冷却落进同一个读数面：
+                    // 一行一条序列，标签就是登记表的键。
+                    .with_pacing(self.pacing.clone());
+                let deployer = match retention_face {
+                    Some(readings) => deployer.with_retention(readings),
+                    None => deployer,
+                };
                 let deployer = match self.governance_drift.clone() {
                     Some(drift) => deployer.with_governance_drift(drift),
                     // init publishes it under this same guard, so reaching here
@@ -1949,7 +1995,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 let shutdown = shutdown.clone();
                 let mut rx = broadcast_tx.0.subscribe();
                 tokio::spawn(async move {
-                    let _ = rx.recv().await;
+                    cog_core::ignore_lost!(rx.recv().await);
                     shutdown.trigger();
                 });
             }
@@ -1986,7 +2032,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     interval_secs = ml_config.observability_stack.interval_secs,
                     "observability stack convergence enabled"
                 );
-                tokio::spawn(stack.run(shutdown.clone()));
+                tokio::spawn(stack.run(shutdown.clone(), Some(self.pacing.clone())));
             } else {
                 info!("observability stack convergence disabled by config");
             }
@@ -2000,7 +2046,11 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     shutdown.clone(),
                 ));
             }
-            tokio::spawn(crate::run_mainline_loop(deployer, shutdown));
+            tokio::spawn(crate::run_mainline_loop(
+                deployer,
+                shutdown,
+                Some(self.pacing.clone()),
+            ));
         } else {
             info!("mainline deployer disabled by config");
         }
@@ -2064,7 +2114,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             let shutdown = shutdown.clone();
             let mut rx = broadcast_tx.0.subscribe();
             tokio::spawn(async move {
-                let _ = rx.recv().await;
+                cog_core::ignore_lost!(rx.recv().await);
                 shutdown.trigger();
             });
         }
@@ -2089,6 +2139,36 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         info!("ReflectionPlugin shutdown");
         Ok(())
     }
+}
+
+/// 收下一条工具建议，回答它要不要进工具表。
+///
+/// 答案是不进。生成侧交回来的是名字、描述和参数表（`suggest_tool_variant`
+/// 要的就是这三样），里面没有工具表能调用的实现——原生闭包、WASM 导出、
+/// 沙盒操作，一样都没有。此前这里给它套了一个只会回
+/// `{"error": "not implemented yet"}` 的原生闭包登记进去，再把产物标成
+/// `Registered`：模型因此看得见一个可调用的名字、调用一次失败一次，而读产物
+/// 状态的人会以为这件事做完了。
+///
+/// 产物留在 `Generated`：它确实生成并写盘了（引擎写进 `change_dir/tools/`），
+/// 仅此而已。要变成可调用的工具，得有人把实现写进代码、重新编译发布。
+fn take_tool_suggestion(tool_json: &serde_json::Value, tool_registry: &dyn cog_core::ToolRegistry) {
+    let Some(name) = tool_json.get("name").and_then(|v| v.as_str()) else {
+        warn!(
+            "Evolution tool variant carries no name; nothing was written that a reader could find"
+        );
+        return;
+    };
+    // 与在用的工具同名时更要说一句：这份建议改的是描述和参数，调用仍然会走到
+    // 旧实现上，「看起来换过了」比「没有建议」更难查。
+    let shadows_a_live_tool = tool_registry.names().iter().any(|n| n == name);
+    warn!(
+        artifact_id = name,
+        shadows_a_live_tool = shadows_a_live_tool,
+        "Evolution tool variant written for review is not registered: the artifact carries a \
+         name, a description and a parameter schema, and no implementation for the tool table \
+         to call"
+    );
 }
 
 /// 当前运行版本号：部署注入的 COGNEVA_VERSION 优先（进化 Pod 种子即按它
@@ -2160,7 +2240,8 @@ fn spawn_skill_effectiveness_loop(
 /// 取负数是刻意的：这个平台上有两档已经用掉了 0 与 1——变更派发器的地板是 0，
 /// `Task::new` 的默认是 1——而探针要比**这两档都低**。用一个负数表达「比所有
 /// 落地的活儿都低」，就不会在下一档工作下沉到 0 时再次与探针打平。
-// cap: bound — 比派发变更（0）与默认工作（1）都低一档：探针只在没有别的活儿时跑
+// cap: fixed — 比派发变更（0）与默认工作（1）都低一档：探针只在没有别的活儿时跑
+// keep: 删掉后探针与默认工作同档，有别的活儿时也抢着跑；由「只在没有别的活儿时跑」兜住
 pub const PROBE_PRIORITY: i32 = -1;
 
 /// 一条探针怎么变成任务图里的一行。
@@ -2316,7 +2397,7 @@ where
         // 交出去之前把这条任务**自己声明的执行契约**取下来：它决定这条探针多久
         // 没结局就该作废，见 `outcome_deadline`。取在这里是因为 `task` 下面那一步
         // 就交给编排器了，交出去之后这一侧再也读不到它。
-        let timeout_secs = task.timeout_seconds;
+        let declared_secs = task.declared_duration_seconds;
         // 返回值不当成败判：它只说这一趟往图里加了几行（已经在图里的幂等提交不算数），
         // 离「这条探针跑成了没有」还隔着一整条回路。那一段要先把 `TaskType::Custom`
         // 的结局在哪个面可读量出来，在那之前把 Ok 读成成功就是拿「提交成功」冒充
@@ -2333,7 +2414,7 @@ where
                 // 空列表（幂等提交，那件事已经在图里）不记：它的结局归**早先交出
                 // 它的那一拍**管，这里再记一行就是同一件事记两遍。
                 if let Some(id) = ids.first() {
-                    handed_over.push((id.clone(), probe, timeout_secs));
+                    handed_over.push((id.clone(), probe, declared_secs));
                 }
             }
             Err(e) => {
@@ -2393,7 +2474,7 @@ struct PendingProbe {
 /// 一条探针的结局最晚什么时候该回来。
 ///
 /// 由**那条任务行上带的那个数**导出，不钉一个数：`Task::new` 给每条任务写一个
-/// `timeout_seconds`，这条册子拿它当「按经验这条探针也该有结局了」的尺度。
+/// `declared_duration_seconds`，这条册子拿它当「按经验这条探针也该有结局了」的尺度。
 ///
 /// 它**不再是一条会被兑现的界**：执行侧不按时钟回收任何一条正在跑的尝试，停住
 /// 由实测的步间隔判（`TaskStalled`）。所以这里的越界只说明「按经验该回来了」，
@@ -2407,25 +2488,27 @@ struct PendingProbe {
 /// 这个边界怎么重新量：轮次那一行里 `still_open` 长期非零而任务其实早就结束了 ⇒
 /// 余量偏小；`expired` 有值而任务随后仍跑出结果 ⇒ 同一个方向。两者恒为 0 而
 /// `row_missing` 有值 ⇒ 这块册子根本收不到东西，别再抬。
-fn outcome_deadline(timeout_secs: u64, period: std::time::Duration) -> std::time::Instant {
+fn outcome_deadline(declared_secs: u64, period: std::time::Duration) -> std::time::Instant {
     std::time::Instant::now()
-        + std::time::Duration::from_secs(timeout_secs)
+        + std::time::Duration::from_secs(declared_secs)
         + period * OUTCOME_QUEUE_MARGIN_ROUNDS
 }
 
 /// 执行契约之外多等几轮。见 `outcome_deadline`：它是一段**没有声明**的排队时间
 /// 的覆盖位，所以是一个标了来源的数，而不是一条实测出来的界。
-// cap: bound — 是 outcome_deadline 那段没有声明的排队时间的覆盖位，所以标来源而不是实测
+// cap: fixed — 是 outcome_deadline 那段没有声明的排队时间的覆盖位，所以标来源而不是实测
+// keep: 删掉后回到「是 outcome_deadline 那段没有声明的排队时间的覆盖位，所以标来源而不是实测」所描述的情形；由这条约定兜住
 const OUTCOME_QUEUE_MARGIN_ROUNDS: u32 = 3;
 
-/// 一条探针的执行契约（秒）：`Task::new` 给每一条任务写的 `timeout_seconds`。
+/// 一条探针的执行契约（秒）：`Task::new` 给每一条任务写的 `declared_duration_seconds`。
 ///
 /// 这里写一份是为了让**一轮的工期**有一个可读的来源——一轮把几条探针依次交给编排器，
 /// 每一次交接等的是同一条流水线，那条流水线对「最多跑多久」的声明就是它。真值仍在
 /// `Task::new` 里：`discovery_probe_declares_the_contract_its_round_is_sized_from`
 /// 那条测试盯着两处一致，那边改了而这里没跟，它会红。
-// cap: derived — 与 `Task::new` 给每条任务写的 `timeout_seconds` 同源，两处一致由那条测试盯着
-const DISCOVERY_PROBE_CONTRACT_SECS: u64 = 300;
+// cap: fixed — 直接读 `Task::new` 写进去的那个名字，两处不再是两个数
+// not-a-bound: 直接读 `Task::new` 写进去的那个名字，两处不再是两个数
+const DISCOVERY_PROBE_CONTRACT_SECS: u64 = cog_core::types::task::DEFAULT_DECLARED_DURATION_SECS;
 
 /// 一轮最多能把多久花在「开始新的交接」上。
 ///
@@ -2461,12 +2544,27 @@ async fn settle_discovery_outcomes<G, FutG>(
 ) -> OutcomeTally
 where
     G: Fn(String) -> FutG,
-    FutG: std::future::Future<Output = Option<cog_core::Task>>,
+    FutG: std::future::Future<Output = cog_core::SFResult<Option<cog_core::Task>>>,
 {
     let mut tally = OutcomeTally::default();
     let mut kept: Vec<PendingProbe> = Vec::with_capacity(pending.len());
     for entry in pending.drain(..) {
-        let row = fetch(entry.task_id.clone()).await;
+        // 读不到不是「这一条没带判词回来」，也不是「这一行不在」：这一条留在在途，
+        // 把读失败说出来——计数落在 row_missing 上会让一次库抖动看起来像探针丢了（CC26）。
+        let row = match fetch(entry.task_id.clone()).await {
+            Ok(row) => row,
+            Err(e) => {
+                let task_id = entry.task_id.clone();
+                tally.still_open += 1;
+                kept.push(entry);
+                warn!(
+                    task_id = %task_id,
+                    error = %e,
+                    "discovery probe outcome could not be read; it stays on the books"
+                );
+                continue;
+            }
+        };
         match row.as_ref().map(|t| t.status) {
             None => tally.row_missing += 1,
             Some(cog_core::TaskStatus::Completed) => {
@@ -2639,6 +2737,7 @@ fn spawn_discovery_loop(
     period: std::time::Duration,
     pool_gate: Arc<PoolGate>,
     readings: Arc<DiscoveryOutcomeReadings>,
+    pacing: Option<Arc<cog_core::pacing::PacingReadings>>,
 ) {
     // 三样在不在**先问一遍**再解构：`let … else` 的初始化式会把两个 Option 移进那个
     // 元组，else 那一支里就再也问不出它们了（这一句不是风格，是借用检查器的要求）。
@@ -2666,6 +2765,9 @@ fn spawn_discovery_loop(
         period_secs = period.as_secs(),
         "autonomous discovery loop enabled"
     );
+    // 节拍读数与登记行同名。地板是周期：发现跑的是同一批工具与技能，快于配置
+    // 的节拍只会多花 token，没有理由。
+    let pacer = pacing.map(|pacing| pacing.pacer(DISCOVERY_POLL_PACING, period, period, 1.0));
     // 部署有没有发布仲裁者——**与「角色持有」必须同一句印**：`may_act()` 在
     // `lease: None` 时早退返回真，既不调 `try_hold()` 也不在 beat 上记任何东西
     // （`cog-core/src/contract/owner_lease.rs:201-204`），于是「没仲裁者」与
@@ -2700,6 +2802,7 @@ fn spawn_discovery_loop(
             let role_broker = role_broker.clone();
             let shutdown = shutdown.clone();
             let role_beat = beat.clone();
+            let pacer = pacer.clone();
             async move {
                 // 角色不是一个「领了就一直攥在手里」的东西：**池闸关着的那几轮要松手**。
                 //
@@ -2714,7 +2817,8 @@ fn spawn_discovery_loop(
                 // 要过」在租约面上同形，而**到期**是这件事唯一自带时刻的证据。池一恢复，
                 // 下一轮 `RoleHold::start` 就把空着的角色领回来。
                 let mut held: Option<cog_core::RoleHold> = None;
-                let mut interval = tokio::time::interval(period);
+                // 下一拍等多久。首拍不等：一轮发现本该在启动后立刻发生。
+                let mut wait = std::time::Duration::ZERO;
                 // 交出去、结局还没回来的探针。**跨轮**留着，所以声明在 `loop` 外面：
                 // 受理与跑完之间隔着编排器那一整条路，同一拍里收不回来。
                 let mut pending: Vec<PendingProbe> = Vec::new();
@@ -2723,130 +2827,141 @@ fn spawn_discovery_loop(
                 let mut held_rounds: u64 = 0;
                 loop {
                     beat.beat();
-                    interval.tick().await;
-
-                    // 闸住的那一轮不生成也不提交：省下的是必然失败的任务行，
-                    // 不是「这一轮没事发生」。松手也在这里——见上。
-                    if pool_gate.llm_paused() {
-                        if held.take().is_some() {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.wait() => break,
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                    let started = std::time::Instant::now();
+                    'round: {
+                        // 闸住的那一轮不生成也不提交：省下的是必然失败的任务行，
+                        // 不是「这一轮没事发生」。松手也在这里——见上。
+                        if pool_gate.llm_paused() {
+                            if held.take().is_some() {
+                                info!(
+                                    role = SELF_DISCOVERY_ROLE,
+                                    broker = broker_present,
+                                    "discovery role released: the LLM pool gate is closed, so the \
+                                 out-of-band writer can take it"
+                                );
+                            }
+                            // 这一轮不是持有者。**必须显式写回**：`may_act()` 这一轮不再问，
+                            // `cogneva_loop_owner_held` 会上一次写的 1 一直留着，那条 gauge
+                            // 于是会一直说「我持着」，直到池恢复——而池恢复可能在几小时之后。
+                            //
+                            // 写的是 `Yielded` 而不是 `Elsewhere`：这条环不是**输了**这个角色
+                            // （没有别人持着它，也没有人告诉过它是别人的），是**自己站开了**。
+                            // 这个区别在告警面上是真金白银——`Yielded` 会把
+                            // `cogneva_loop_role_declared` 写成 0，而「已声明但没人持」那条
+                            // critical 规则要的是 1；塌成 `Elsewhere`（声明仍是 1、持有是 0）
+                            // 会让池一关超过 15 分钟就报一条「这条环没人管了」，而那时恰恰是
+                            // 它按设计把角色让出去的时候。
+                            beat.note_ownership(cog_core::Ownership::Yielded);
+                            held_rounds += 1;
                             info!(
                                 role = SELF_DISCOVERY_ROLE,
                                 broker = broker_present,
-                                "discovery role released: the LLM pool gate is closed, so the \
-                                 out-of-band writer can take it"
+                                held_rounds,
+                                period_secs = period.as_secs(),
+                                "discovery round held off: the LLM pool gate is closed"
                             );
+                            break 'round;
                         }
-                        // 这一轮不是持有者。**必须显式写回**：`may_act()` 这一轮不再问，
-                        // `cogneva_loop_owner_held` 会上一次写的 1 一直留着，那条 gauge
-                        // 于是会一直说「我持着」，直到池恢复——而池恢复可能在几小时之后。
-                        //
-                        // 写的是 `Yielded` 而不是 `Elsewhere`：这条环不是**输了**这个角色
-                        // （没有别人持着它，也没有人告诉过它是别人的），是**自己站开了**。
-                        // 这个区别在告警面上是真金白银——`Yielded` 会把
-                        // `cogneva_loop_role_declared` 写成 0，而「已声明但没人持」那条
-                        // critical 规则要的是 1；塌成 `Elsewhere`（声明仍是 1、持有是 0）
-                        // 会让池一关超过 15 分钟就报一条「这条环没人管了」，而那时恰恰是
-                        // 它按设计把角色让出去的时候。
-                        beat.note_ownership(cog_core::Ownership::Yielded);
-                        held_rounds += 1;
-                        info!(
-                            role = SELF_DISCOVERY_ROLE,
-                            broker = broker_present,
-                            held_rounds,
-                            period_secs = period.as_secs(),
-                            "discovery round held off: the LLM pool gate is closed"
-                        );
-                        continue;
-                    }
 
-                    // 池开着：这一轮手里必须有角色。没有就现领一个（`RoleHold` 自带按契约
-                    // 节拍续租的续期任务；租约那一刻空着的话，这一领当轮即成）。
-                    // 克隆先落到局部变量，是为了让这次领角色的**实参表里不出现带括号的
-                    // 表达式**——源码判据按第一个 `)` 截实参表，`.clone()` 会让它截在
-                    // `role_broker.clone(` 上，于是「领的是不是这个角色」那一条恒假。
-                    if held.is_none() {
-                        let broker = role_broker.clone();
-                        let beat_for_role = role_beat.clone();
-                        held = Some(cog_core::RoleHold::start(
-                            broker,
-                            SELF_DISCOVERY_ROLE,
-                            beat_for_role,
-                            &shutdown,
-                        ));
-                    }
-                    let hold = held.as_ref().expect("上一行刚保证这里有一个 RoleHold");
+                        // 池开着：这一轮手里必须有角色。没有就现领一个（`RoleHold` 自带按契约
+                        // 节拍续租的续期任务；租约那一刻空着的话，这一领当轮即成）。
+                        // 克隆先落到局部变量，是为了让这次领角色的**实参表里不出现带括号的
+                        // 表达式**——源码判据按第一个 `)` 截实参表，`.clone()` 会让它截在
+                        // `role_broker.clone(` 上，于是「领的是不是这个角色」那一条恒假。
+                        if held.is_none() {
+                            let broker = role_broker.clone();
+                            let beat_for_role = role_beat.clone();
+                            held = Some(cog_core::RoleHold::start(
+                                broker,
+                                SELF_DISCOVERY_ROLE,
+                                beat_for_role,
+                                &shutdown,
+                            ));
+                        }
+                        let hold = held.as_ref().expect("上一行刚保证这里有一个 RoleHold");
 
-                    // 角色在别处：这一轮不动手。跳过的那一答 `may_act()` 已经记在
-                    // beat 上（`cogneva_loop_owner_held` 一族），所以这句是给人看的
-                    // 第二面而不是唯一读数面；级别与同族对齐（`cog-github` 那条环
-                    // 同样的跳过是 `info!`）。
-                    if !hold.may_act().await {
-                        held_rounds += 1;
-                        info!(
+                        // 角色在别处：这一轮不动手。跳过的那一答 `may_act()` 已经记在
+                        // beat 上（`cogneva_loop_owner_held` 一族），所以这句是给人看的
+                        // 第二面而不是唯一读数面；级别与同族对齐（`cog-github` 那条环
+                        // 同样的跳过是 `info!`）。
+                        if !hold.may_act().await {
+                            held_rounds += 1;
+                            info!(
                             role = SELF_DISCOVERY_ROLE,
                             broker = broker_present,
                             held_rounds,
                             "discovery round skipped: another process holds the self-discovery role"
                         );
-                        continue;
-                    }
-
-                    // 恢复后的**第一个真跑轮**把计数写回 0 并印一次：状态类读数必须由
-                    // 结束那一轮写回，否则「连续被扣住到某轮为止」永远读不到尾——池一
-                    // 恢复那句就不再出现，读者手上只剩最后一个非零值。
-                    if held_rounds > 0 {
-                        info!(
-                            role = SELF_DISCOVERY_ROLE,
-                            broker = broker_present,
-                            held_rounds,
-                            "discovery round resumed after being held off"
-                        );
-                        held_rounds = 0;
-                    }
-
-                    // 先把已经交出去的探针的结局收回来。**在生成之前**：这一拍要不要再
-                    // 生成看的是池子（受理那一刻已过滤），与结局无关；但两件事放在同一拍
-                    // 的日志里，读数才在同一个窗口上。
-                    let waiting_before = pending.len();
-                    let outcomes =
-                        settle_discovery_outcomes(&outcome_engine, &mut pending, &readings, |id| {
-                            let orchestrator = orchestrator.clone();
-                            async move { orchestrator.get_task(&id).await }
-                        })
-                        .await;
-                    if waiting_before > 0 {
-                        // 一处出口、一行读数、每个出口一个数：合并成「收了 N 条」会让
-                        // 「全都读到了判词」与「全都没带判词回来」逐字同形，而后者正是
-                        // 「这条环还没有判官」那条发现本身。
-                        info!(
-                            role = SELF_DISCOVERY_ROLE,
-                            waited = waiting_before,
-                            validated = outcomes.validated,
-                            rejected = outcomes.rejected,
-                            inconclusive = outcomes.inconclusive,
-                            unanswered = outcomes.unanswered,
-                            run_ended_without_result = outcomes.run_ended_without_result,
-                            row_missing = outcomes.row_missing,
-                            expired = outcomes.expired,
-                            still_open = outcomes.still_open,
-                            not_recorded = outcomes.not_recorded,
-                            "discovery probe outcomes read back"
-                        );
-                    }
-
-                    let tool_names = tool_registry.names();
-                    // 一轮的宽度以工具面自身的大小为界，不钉一个数：工具面翻倍时
-                    // 这一轮跟着放宽，而生成器自己按组合去重，试过的不再出现——
-                    // 稳态下这一轮生成 0 条，循环的代价就不在生成上。
-                    let max_tasks = tool_names.len().max(1);
-                    let skill_ids: Vec<String> = match skill_registry.as_ref() {
-                        Some(reg) => {
-                            let guard = reg.read().await;
-                            guard.get_all().iter().map(|s| s.id.clone()).collect()
+                            break 'round;
                         }
-                        None => Vec::new(),
-                    };
-                    let round = run_discovery_round(
+
+                        // 恢复后的**第一个真跑轮**把计数写回 0 并印一次：状态类读数必须由
+                        // 结束那一轮写回，否则「连续被扣住到某轮为止」永远读不到尾——池一
+                        // 恢复那句就不再出现，读者手上只剩最后一个非零值。
+                        if held_rounds > 0 {
+                            info!(
+                                role = SELF_DISCOVERY_ROLE,
+                                broker = broker_present,
+                                held_rounds,
+                                "discovery round resumed after being held off"
+                            );
+                            held_rounds = 0;
+                        }
+
+                        // 先把已经交出去的探针的结局收回来。**在生成之前**：这一拍要不要再
+                        // 生成看的是池子（受理那一刻已过滤），与结局无关；但两件事放在同一拍
+                        // 的日志里，读数才在同一个窗口上。
+                        let waiting_before = pending.len();
+                        let outcomes = settle_discovery_outcomes(
+                            &outcome_engine,
+                            &mut pending,
+                            &readings,
+                            |id| {
+                                let orchestrator = orchestrator.clone();
+                                // 读失败留成错误：结算那边把它留在在途，而不是读成
+                                // 「这一条没带判词回来」（CC26）。
+                                async move { orchestrator.get_task_checked(&id).await }
+                            },
+                        )
+                        .await;
+                        if waiting_before > 0 {
+                            // 一处出口、一行读数、每个出口一个数：合并成「收了 N 条」会让
+                            // 「全都读到了判词」与「全都没带判词回来」逐字同形，而后者正是
+                            // 「这条环还没有判官」那条发现本身。
+                            info!(
+                                role = SELF_DISCOVERY_ROLE,
+                                waited = waiting_before,
+                                validated = outcomes.validated,
+                                rejected = outcomes.rejected,
+                                inconclusive = outcomes.inconclusive,
+                                unanswered = outcomes.unanswered,
+                                run_ended_without_result = outcomes.run_ended_without_result,
+                                row_missing = outcomes.row_missing,
+                                expired = outcomes.expired,
+                                still_open = outcomes.still_open,
+                                not_recorded = outcomes.not_recorded,
+                                "discovery probe outcomes read back"
+                            );
+                        }
+
+                        let tool_names = tool_registry.names();
+                        // 一轮的宽度以工具面自身的大小为界，不钉一个数：工具面翻倍时
+                        // 这一轮跟着放宽，而生成器自己按组合去重，试过的不再出现——
+                        // 稳态下这一轮生成 0 条，循环的代价就不在生成上。
+                        let max_tasks = tool_names.len().max(1);
+                        let skill_ids: Vec<String> = match skill_registry.as_ref() {
+                            Some(reg) => {
+                                let guard = reg.read().await;
+                                guard.get_all().iter().map(|s| s.id.clone()).collect()
+                            }
+                            None => Vec::new(),
+                        };
+                        let round = run_discovery_round(
                         &discovery,
                         |goal, task| {
                             let orchestrator = orchestrator.clone();
@@ -2865,48 +2980,67 @@ fn spawn_discovery_loop(
                         std::time::Instant::now() + discovery_round_wall(period),
                     )
                     .await;
-                    // 受理了就要欠着一条结局——**这一句是回程的入口**。少了它，
-                    // `evaluate_discovery_result` 又一次没有调用者，而这条环会在每一拍
-                    // 重新问同一个问题、没有任何一条证据留下来。
-                    for (task_id, probe, timeout_secs) in round.handed_over {
-                        pending.push(PendingProbe {
-                            task_id,
-                            probe,
-                            deadline: outcome_deadline(timeout_secs, period),
-                        });
-                    }
-                    if round.held_back > 0 {
-                        // 与下一句分开：这一拍**有**新组合可提，只是上一批还没走完。
-                        // 合成一句「没有新组合」会让「池子消化不动」读成「搜索空间
-                        // 穷尽」，而两者下一拍该做的事相反。
-                        info!(
-                            role = SELF_DISCOVERY_ROLE,
-                            waiting = round.held_back,
-                            round_width = max_tasks,
-                            "discovery round deferred: earlier probes are still unanswered"
-                        );
-                        continue;
-                    }
-                    if round.generated == 0 {
-                        debug!(
-                            tools = tool_names.len(),
-                            "discovery round: every combination in reach has been tried"
-                        );
-                        continue;
-                    }
+                        // 受理了就要欠着一条结局——**这一句是回程的入口**。少了它，
+                        // `evaluate_discovery_result` 又一次没有调用者，而这条环会在每一拍
+                        // 重新问同一个问题、没有任何一条证据留下来。
+                        for (task_id, probe, declared_secs) in round.handed_over {
+                            pending.push(PendingProbe {
+                                task_id,
+                                probe,
+                                deadline: outcome_deadline(declared_secs, period),
+                            });
+                        }
+                        if round.held_back > 0 {
+                            // 与下一句分开：这一拍**有**新组合可提，只是上一批还没走完。
+                            // 合成一句「没有新组合」会让「池子消化不动」读成「搜索空间
+                            // 穷尽」，而两者下一拍该做的事相反。
+                            info!(
+                                role = SELF_DISCOVERY_ROLE,
+                                waiting = round.held_back,
+                                round_width = max_tasks,
+                                "discovery round deferred: earlier probes are still unanswered"
+                            );
+                            break 'round;
+                        }
+                        if round.generated == 0 {
+                            debug!(
+                                tools = tool_names.len(),
+                                "discovery round: every combination in reach has been tried"
+                            );
+                            break 'round;
+                        }
 
-                    info!(
-                        tools = tool_names.len(),
-                        skills = skill_ids.len(),
-                        submitted = round.submitted,
-                        refused = round.refused,
-                        deferred = round.deferred,
-                        "autonomous discovery round"
-                    );
+                        info!(
+                            tools = tool_names.len(),
+                            skills = skill_ids.len(),
+                            submitted = round.submitted,
+                            refused = round.refused,
+                            deferred = round.deferred,
+                            "autonomous discovery round"
+                        );
+                    }
+                    let pass = started.elapsed();
+                    wait = discovery_wait(pacer.as_ref(), period, pass);
                 }
             }
         },
     ));
+}
+
+/// 一轮发现之后下一拍等多久。
+///
+/// 目标周期是这一轮实测与种子的较大者（被地板托住），等待是它减去这一轮用掉的
+/// 时间：一轮交出几条探针、收几条结局，比节拍久是常态，那一轮不该再叠一个节拍。
+fn discovery_wait(
+    pacer: Option<&cog_core::pacing::Pacer>,
+    period: std::time::Duration,
+    pass: std::time::Duration,
+) -> std::time::Duration {
+    let target = match pacer {
+        Some(pacer) => pacer.beat(Some(pass)),
+        None => period,
+    };
+    target.saturating_sub(pass)
 }
 
 /// 移植工作分支 `evol/<id>` 的实例 id 解析：显式 env 覆盖最优先，其次
@@ -3491,6 +3625,7 @@ async fn merge_verification_inputs(
         let already_queued = changes.iter().any(|c| c.artifact_id == change.change_id);
         if !already_queued {
             changes.push(crate::types::EvolutionResult {
+                unit_of_work: None,
                 kind: crate::types::EvolutionKind::CodeChange,
                 artifact_id: change.change_id.clone(),
                 description: change.goal.clone(),
@@ -3540,7 +3675,9 @@ async fn merge_verification_inputs(
                 // 拒绝要按判据与文件归档，而重新读一遍同一条规则正是这两者与
                 // 判词开始各说各话的方式。连路径都读不出来的 diff 保留拒绝本身，
                 // 只丢掉名字。
-                let files = landing.contribution_refusal_paths(diff).unwrap_or_default();
+                let files = landing
+                    .contribution_refusal_paths(diff)
+                    .unwrap_or(Default::default());
                 // 记录不留给这一轮的落地：这条变更不会落地。真正的收口（两份载体
                 // 一起退休）由调用方做，见 `run_evolution_cycle_in`。
                 recorded.remove(&change.artifact_id);
@@ -3590,7 +3727,7 @@ async fn fail_and_retire_change(
             change_id = %change_id,
             "A change was retired without a refusal cause; its record cannot be counted by criterion"
         );
-        let _ = engine.record_change_outcome(change_id, false, reason).await;
+        cog_core::ignore_lost!(engine.record_change_outcome(change_id, false, reason).await);
     }
     retire_change_everywhere(
         pipeline,
@@ -3617,7 +3754,10 @@ async fn retire_change_everywhere(
     change_id: &str,
     reason: &str,
 ) {
-    if let Err(e) = pipeline.retire_change(change_id, reason).await {
+    if let Err(e) = pipeline
+        .retire_change(change_id, cog_core::CandidateOutcome::Rejected, reason)
+        .await
+    {
         warn!(
             change_id = %change_id,
             error = %e,
@@ -3662,7 +3802,11 @@ async fn retire_landed_change(
     change_id: &str,
 ) {
     if let Err(e) = pipeline
-        .retire_change(change_id, "landed on the base branch")
+        .retire_change(
+            change_id,
+            cog_core::CandidateOutcome::Accepted,
+            "landed on the base branch",
+        )
         .await
     {
         warn!(
@@ -3893,7 +4037,7 @@ impl<'a> ChangeExecutor<'a> {
     fn window(&self) -> usize {
         match &self.job {
             None => 1,
-            Some(ctx) => ctx.config.max_parallel.max(1),
+            Some(ctx) => ctx.config.max_parallel,
         }
     }
 
@@ -4119,12 +4263,12 @@ async fn collect_dispatched_job(
     deps.budget.adopt_run(
         crate::verification_budget::KIND_TEST,
         outcome.test.last_secs,
-        outcome.test.timeouts,
+        outcome.test.stopped,
     );
     deps.budget.adopt_run(
         crate::verification_budget::KIND_BUILD,
         outcome.build.last_secs,
-        outcome.build.timeouts,
+        outcome.build.stopped,
     );
     if let Some(ending) = outcome.build_ending {
         // 结局只有跑在 Job 里的构建自己知道，变更身份只有这一侧知道：两边
@@ -4745,6 +4889,113 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
 mod tests {
     use super::*;
 
+    /// A tool table that remembers what was registered into it. `execute` is
+    /// never reached by these cases, but has to exist to satisfy the trait.
+    #[derive(Default)]
+    struct RecordingRegistry {
+        registered: std::sync::Mutex<Vec<cog_core::Tool>>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::ToolExecutor for RecordingRegistry {
+        async fn execute(
+            &self,
+            name: &str,
+            _arguments: serde_json::Value,
+        ) -> cog_core::SFResult<serde_json::Value> {
+            Err(cog_core::SFError::Agent(format!(
+                "nothing is registered under {name}"
+            )))
+        }
+    }
+
+    impl cog_core::ToolRegistry for RecordingRegistry {
+        fn register(&self, tool: cog_core::Tool) {
+            self.registered.lock().expect("left unpoisoned").push(tool);
+        }
+
+        fn names(&self) -> Vec<String> {
+            let mut names: Vec<String> = self
+                .registered
+                .lock()
+                .expect("left unpoisoned")
+                .iter()
+                .map(|t| t.name.clone())
+                .collect();
+            names.sort();
+            names
+        }
+
+        fn definitions(&self) -> Vec<cog_core::Tool> {
+            self.registered.lock().expect("left unpoisoned").clone()
+        }
+
+        fn calls(&self) -> std::collections::BTreeMap<String, u64> {
+            self.names().into_iter().map(|n| (n, 0)).collect()
+        }
+    }
+
+    /// 生成侧只交回来名字、描述和参数表。这样的建议进不了工具表：没有实现可
+    /// 调用，登记进去只会多出一个「看得见、调用就失败」的名字。
+    #[tokio::test]
+    async fn a_tool_variant_without_an_implementation_does_not_enter_the_tool_table() {
+        use cog_core::ToolRegistry as _;
+
+        let registry = RecordingRegistry::default();
+        let suggestion = serde_json::json!({
+            "name": "improved_grep",
+            "description": "a better search",
+            "parameters": {"type": "object", "properties": {}}
+        });
+
+        take_tool_suggestion(&suggestion, &registry);
+
+        assert!(
+            registry.names().is_empty(),
+            "the suggestion has no implementation, so nothing may be callable under its name: {:?}",
+            registry.names()
+        );
+    }
+
+    // proves: evolution.pollIntervalSecs
+    /// 发现循环的等待由上一轮实测决定：同一段代码换一次耗时，下一拍就换一个数，
+    /// 并且求值计数在走——回路在跑，不是一次启动时算出来的常量。
+    #[test]
+    fn the_discovery_wait_follows_what_a_round_cost() {
+        let readings = std::sync::Arc::new(cog_core::pacing::PacingReadings::new());
+        let pacer = readings.pacer(
+            DISCOVERY_POLL_PACING,
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(300),
+            1.0,
+        );
+        assert_eq!(
+            discovery_wait(
+                Some(&pacer),
+                std::time::Duration::from_secs(300),
+                std::time::Duration::from_secs(30)
+            ),
+            std::time::Duration::from_secs(270)
+        );
+        // 一轮跑了 700 秒：这一拍已经把节拍用光，等待为零，目标跟到 700。
+        assert_eq!(
+            discovery_wait(
+                Some(&pacer),
+                std::time::Duration::from_secs(300),
+                std::time::Duration::from_secs(700)
+            ),
+            std::time::Duration::ZERO
+        );
+        let (target, evaluations, derived) = readings
+            .target(DISCOVERY_POLL_PACING)
+            .expect("both waits were beats");
+        assert_eq!(target, std::time::Duration::from_secs(700));
+        // Two waits, two beats: the count is what separates a loop that is
+        // keeping its cadence from one that last moved the target and stopped.
+        assert_eq!(evaluations, 2);
+        assert!(derived);
+    }
+
     /// 探针 → 任务那一跳单独量：目标文本与 payload 里的 `goal` 必须是同一个值
     /// （两处分家时，执行侧读到的问句与提交时写下的目标就不是一回事），工具对
     /// 要原样到执行侧，`task_kind` 要与 `TaskType::Custom` 里那个串对上——拼错的
@@ -4900,6 +5151,7 @@ mod tests {
 
     fn generated(id: &str, goal: &str) -> cog_core::GeneratedChange {
         cog_core::GeneratedChange {
+            unit_of_work: None,
             change_id: id.into(),
             goal: goal.into(),
             content: "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n".into(),
@@ -4916,6 +5168,7 @@ mod tests {
 
     fn queued(id: &str, description: &str) -> crate::types::EvolutionResult {
         crate::types::EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: id.into(),
             description: description.into(),
@@ -5184,7 +5437,21 @@ mod tests {
         )
         .await
         .unwrap();
-        let pipeline = crate::ChangePipeline::new(temp.path(), &change_dir, true);
+        let pipeline = crate::change_pipeline::test_pipeline(temp.path(), &change_dir, true);
+        pipeline
+            .write_change_record(&crate::types::EvolutionResult {
+                unit_of_work: None,
+                kind: crate::types::EvolutionKind::CodeChange,
+                artifact_id: "chg-1".to_string(),
+                description: "goal".to_string(),
+                content: String::new(),
+                status: crate::types::EvolutionStatus::CompileChecked,
+                created_at: chrono::Utc::now(),
+                eval_summary: None,
+                tiering: None,
+            })
+            .await
+            .unwrap();
 
         assert_eq!(
             pipeline.pending_changes(None).await.unwrap().len(),
@@ -5261,8 +5528,11 @@ mod tests {
         }
     }
 
-    /// 一份同时摆上两份载体的变更：队列里的 `.diff` 与记录里的那条。
-    fn queued_and_recorded() -> (tempfile::TempDir, crate::ChangePipeline, RecordingLanding) {
+    /// 一份同时摆上两份载体的变更：队列里的候选事件与落地记录里的那条。
+    ///
+    /// 队列那一侧要先**记下候选**：一条只在盘上有 `.diff` 的变更是历史遗留的
+    /// 孤儿，队列不认识它，也就没有东西可以退役。
+    async fn queued_and_recorded() -> (tempfile::TempDir, crate::ChangePipeline, RecordingLanding) {
         let temp = tempfile::tempdir().unwrap();
         let change_dir = temp.path().join("changes");
         std::fs::create_dir_all(&change_dir).unwrap();
@@ -5271,7 +5541,21 @@ mod tests {
             "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n",
         )
         .unwrap();
-        let pipeline = crate::ChangePipeline::new(temp.path(), &change_dir, true);
+        let pipeline = crate::change_pipeline::test_pipeline(temp.path(), &change_dir, true);
+        pipeline
+            .write_change_record(&crate::types::EvolutionResult {
+                unit_of_work: None,
+                kind: crate::types::EvolutionKind::CodeChange,
+                artifact_id: "chg-1".to_string(),
+                description: "goal from the record".to_string(),
+                content: String::new(),
+                status: crate::types::EvolutionStatus::CompileChecked,
+                created_at: chrono::Utc::now(),
+                eval_summary: None,
+                tiering: None,
+            })
+            .await
+            .unwrap();
         let landing = RecordingLanding {
             unverified: std::sync::Mutex::new(vec![generated("chg-1", "goal from the record")]),
             retired: std::sync::Mutex::new(Vec::new()),
@@ -5291,7 +5575,7 @@ mod tests {
     /// 载体里都找不到它。
     #[tokio::test]
     async fn a_refused_change_leaves_both_channels() {
-        let (_temp, pipeline, landing) = queued_and_recorded();
+        let (_temp, pipeline, landing) = queued_and_recorded().await;
 
         assert_eq!(
             pipeline.pending_changes(None).await.unwrap().len(),
@@ -5341,10 +5625,14 @@ mod tests {
     /// 仍把同一条变更交给下一轮。
     #[tokio::test]
     async fn one_channel_alone_brings_a_retired_change_back() {
-        let (_temp, pipeline, landing) = queued_and_recorded();
+        let (_temp, pipeline, landing) = queued_and_recorded().await;
 
         pipeline
-            .retire_change("chg-1", "landing refused the change")
+            .retire_change(
+                "chg-1",
+                cog_core::CandidateOutcome::Rejected,
+                "landing refused the change",
+            )
             .await
             .unwrap();
         assert!(
@@ -5923,7 +6211,7 @@ mod tests {
 
     /// 轮的墙与告警的工期界都从探针自己的执行契约导出，而契约的真值在 `Task::new`。
     ///
-    /// 这一条盯的是那两处的一致性：`Task::new` 的默认 `timeout_seconds` 改了而
+    /// 这一条盯的是那两处的一致性：`Task::new` 的默认 `declared_duration_seconds` 改了而
     /// `DISCOVERY_PROBE_CONTRACT_SECS` 没跟，`background_loop_stalled` 就会按一个
     /// 比真实往返短的界判这条环——池一慢它就红，而环其实在干活。反过来，这里要是
     /// 比真值大，红会晚到，迟到的红等于没有。
@@ -5944,7 +6232,7 @@ mod tests {
             .expect("no probe proposed");
         let (_goal, task) = discovery_probe_task(&probe);
         assert_eq!(
-            task.timeout_seconds, DISCOVERY_PROBE_CONTRACT_SECS,
+            task.declared_duration_seconds, DISCOVERY_PROBE_CONTRACT_SECS,
             "一轮的工期界是按这个数算的：`Task::new` 的契约改了这一行也得跟着改"
         );
 
@@ -5978,12 +6266,12 @@ mod tests {
     fn pending_probe(
         probe: &crate::types::DiscoveryTask,
         task_id: &str,
-        timeout_secs: u64,
+        declared_secs: u64,
     ) -> PendingProbe {
         PendingProbe {
             task_id: task_id.to_string(),
             probe: probe.clone(),
-            deadline: outcome_deadline(timeout_secs, std::time::Duration::from_secs(60)),
+            deadline: outcome_deadline(declared_secs, std::time::Duration::from_secs(60)),
         }
     }
 
@@ -6043,7 +6331,7 @@ mod tests {
 
         let readings = DiscoveryOutcomeReadings::new();
         let tally = settle_discovery_outcomes(&engine, &mut pending, &readings, |id| async move {
-            match id.as_str() {
+            Ok(match id.as_str() {
                 "p-unmeasured" => Some(task_row(
                     "p-unmeasured",
                     cog_core::TaskStatus::Completed,
@@ -6063,7 +6351,7 @@ mod tests {
                     Some(serde_json::json!({ DISCOVERY_VERDICT_FIELD: "looks-good" })),
                 )),
                 _ => Some(task_row("p-running", cog_core::TaskStatus::Running, None)),
-            }
+            })
         })
         .await;
 

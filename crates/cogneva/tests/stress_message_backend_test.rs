@@ -16,10 +16,11 @@ const GROUP: &str = "stress-group";
 #[tokio::test]
 async fn stress_memory_backend_high_contention() {
     let backend = Arc::new(MemoryMessageBackend::new());
-    let _ = backend.create_consumer_group(STREAM, GROUP).await;
+    cog_core::ignore_lost!(backend.create_consumer_group(STREAM, GROUP).await);
 
     const PUBLISHERS: usize = 8;
     const CONSUMERS: usize = 8;
+    // not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
     const MESSAGES_PER_PUBLISHER: usize = 100;
 
     let start = Instant::now();
@@ -114,7 +115,7 @@ async fn stress_memory_backend_high_contention() {
 #[tokio::test]
 async fn stress_memory_backend_large_batch() {
     let backend = Arc::new(MemoryMessageBackend::new());
-    let _ = backend.create_consumer_group(STREAM, GROUP).await;
+    cog_core::ignore_lost!(backend.create_consumer_group(STREAM, GROUP).await);
 
     const BATCH_SIZE: usize = 1_000;
 
@@ -169,7 +170,7 @@ async fn stress_memory_backend_large_batch() {
 #[tokio::test]
 async fn stress_memory_backend_latency_distribution() {
     let backend = Arc::new(MemoryMessageBackend::new());
-    let _ = backend.create_consumer_group(STREAM, GROUP).await;
+    cog_core::ignore_lost!(backend.create_consumer_group(STREAM, GROUP).await);
 
     const MSG_COUNT: usize = 1_000;
 
@@ -262,6 +263,7 @@ async fn stress_memory_backend_churn() {
     let backend = Arc::new(MemoryMessageBackend::new());
 
     const CYCLES: usize = 100;
+    // not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
     const MSGS_PER_CYCLE: usize = 10;
 
     let start = Instant::now();
@@ -270,7 +272,7 @@ async fn stress_memory_backend_churn() {
         let stream = format!("{}:churn:{}", STREAM, cycle);
         let group = format!("{}:churn:{}", GROUP, cycle);
 
-        let _ = backend.create_consumer_group(&stream, &group).await;
+        cog_core::ignore_lost!(backend.create_consumer_group(&stream, &group).await);
 
         let payloads: Vec<Vec<u8>> = (0..MSGS_PER_CYCLE)
             .map(|i| format!("cycle-{}-msg-{}", cycle, i).into_bytes())

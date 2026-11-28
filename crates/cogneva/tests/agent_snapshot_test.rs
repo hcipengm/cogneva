@@ -15,17 +15,19 @@ async fn test_agent_loop_restore_preserves_context() {
     let (event_tx, _event_rx) = mpsc::channel(128);
     let mut agent_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "restore-agent".into(),
             role: "planner".to_string(),
             max_iterations: 3,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -50,17 +52,19 @@ async fn test_agent_loop_restore_preserves_context() {
     let (event_tx2, _event_rx2) = mpsc::channel(128);
     let mut restored_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "restore-agent".into(),
             role: "planner".to_string(),
             max_iterations: 3,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx2,
     );
@@ -80,17 +84,19 @@ async fn test_agent_loop_restore_changes_role_and_state() {
     let (event_tx, _event_rx) = mpsc::channel(128);
     let agent_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "role-agent".into(),
             role: "planner".to_string(),
             max_iterations: 2,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -101,17 +107,19 @@ async fn test_agent_loop_restore_changes_role_and_state() {
     let (event_tx2, _event_rx2) = mpsc::channel(128);
     let mut restored_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "role-agent".into(),
             role: "generator".to_string(),
             max_iterations: 2,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx2,
     );
@@ -126,17 +134,19 @@ async fn test_agent_loop_restore_changes_role_and_state() {
 async fn test_agent_snapshot_and_restore() {
     let agent = Agent::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "wrapper-agent".into(),
             role: "planner".to_string(),
             max_iterations: 2,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         Arc::new(MockProvider::new("result")),
     );
@@ -173,17 +183,19 @@ async fn test_agent_snapshot_and_restore() {
 async fn test_agent_restore_allows_continue() {
     let agent = Agent::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "continue-agent".into(),
             role: "planner".to_string(),
             max_iterations: 2,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         Arc::new(MockProvider::new("acknowledged")),
     );
@@ -226,17 +238,19 @@ async fn test_snapshot_event_replay_with_wal() {
     let (event_tx, _event_rx) = mpsc::channel(128);
     let mut agent_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "replay-agent".into(),
             role: "planner".to_string(),
             max_iterations: 2,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     )
@@ -264,17 +278,19 @@ async fn test_snapshot_event_replay_with_wal() {
     let (event_tx2, _event_rx2) = mpsc::channel(128);
     let mut restored_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "replay-agent".into(),
             role: "planner".to_string(),
             max_iterations: 2,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx2,
     )
@@ -308,17 +324,19 @@ async fn test_snapshot_without_wal_has_zero_offset() {
     let (event_tx, _event_rx) = mpsc::channel(128);
     let agent_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "no-wal-agent".into(),
             role: "planner".to_string(),
             max_iterations: 2,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -332,17 +350,19 @@ async fn test_restore_resets_steps() {
     let (event_tx, _event_rx) = mpsc::channel(128);
     let mut agent_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "steps-agent".into(),
             role: "planner".to_string(),
             max_iterations: 2,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );

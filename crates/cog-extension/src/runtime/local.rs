@@ -78,15 +78,6 @@ fn signal_death_note(sig: i32, facts: &super::cgroup::CgroupFacts, oom: bool) ->
     }
 }
 
-/// How long the wall's kill waits for its shell to be reaped.
-///
-/// The signal is not negotiable and the shell was already the one process this
-/// side started, so what is left here is collecting it (a zombie for the life of
-/// the executor otherwise). A wait longer than this buys nothing: a leader that
-/// has not died to SIGKILL after it is not going to.
-// cap: bound — SIGKILL 之后只剩回收：等更久换不到更早的回，只会吊住执行器
-const REAP_AFTER_KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// Programs whose invocation compiles the tree they run in.
 const BUILD_PROGRAMS: &[&str] = &[
     "cargo",
@@ -246,8 +237,8 @@ fn looks_like_duration(word: &str) -> bool {
 }
 
 /// Spawn `sh -c <command>` and drive stdout/stderr/exit into an event channel.
-/// Shared by the local backend and the executor server; kills the child on
-/// timeout.
+/// Shared by the local backend and the executor server; kills the child when it
+/// stops moving (see [`cog_core::progress`]), never because a clock ran out.
 ///
 /// `workdir` overrides the child cwd (the executor anchors it to the caller's
 /// task worktree); `cargo_target` is injected as `CARGO_TARGET_DIR` so trees
@@ -265,20 +256,25 @@ fn looks_like_duration(word: &str) -> bool {
 /// holds among the builds allowed to compile into the shared target directory.
 /// It is released when the child is gone, not when the request is answered, so
 /// the next build starts against a directory nobody is writing.
+///
+/// `reservation` is the room this command claimed when it was admitted, and it
+/// is held under the same rule: the memory is free when the child is gone, so
+/// that is when the next planner may count it.
 pub(crate) fn spawn_command(
     command: &str,
-    timeout: std::time::Duration,
+    task_id: &str,
     workdir: Option<&Path>,
     cargo_target: Option<&Path>,
     hold: Option<crate::workdir::CommandHold>,
-    build_slot: Option<tokio::sync::OwnedSemaphorePermit>,
+    build_slot: Option<crate::command_server::BuildSlot>,
+    reservation: Option<crate::pressure::Reservation>,
 ) -> SFResult<tokio::sync::mpsc::Receiver<CommandEvent>> {
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c")
         .arg(command)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    // Own process group, so the timeout below can reach what the command
+    // Own process group, so the stall kill below can reach what the command
     // actually started. `sh -c "cargo build"` is two processes deep: killing
     // the shell leaves cargo running, and a cargo that outlives its caller
     // keeps the shared build directory locked -- measured on the cluster, a
@@ -300,15 +296,33 @@ pub(crate) fn spawn_command(
         .map_err(|e| cog_core::SFError::IO(format!("spawn sh: {}", e)))?;
     // The group id is the leader's pid once the child has run `process_group(0)`.
     let group = child.id();
+    // A cgroup of this command's own, so the peak read when it finishes is
+    // this command's rather than the container's lifetime maximum. No cage is
+    // not a failure of the command: it is counted as an unavailable reading,
+    // and the command runs exactly the same either way.
+    let cage = match group {
+        Some(pid) => match super::cgroup::CommandCage::for_pid(pid) {
+            Ok(cage) => Some(cage),
+            Err(e) => {
+                tracing::debug!(pid, error = %e, "no cage for this command");
+                None
+            }
+        },
+        None => None,
+    };
 
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
     let (tx, rx) = tokio::sync::mpsc::channel::<CommandEvent>(64);
+    // Borrowed into an owned id before the task: the watchdog below lives on
+    // its own, so it cannot hold the caller's `&str`.
+    let task_id = task_id.to_string();
 
     tokio::spawn(async move {
         // Dropped when this task ends, i.e. after the child was waited for.
         let _hold = hold;
         let _build_slot = build_slot;
+        let _reservation = reservation;
         use tokio::io::AsyncReadExt;
         let tx_out = tx.clone();
         let tx_err = tx.clone();
@@ -345,11 +359,66 @@ pub(crate) fn spawn_command(
         let readers = async {
             tokio::join!(read_out, read_err);
         };
-        let exited = tokio::time::timeout(timeout, async {
-            readers.await;
-            child.wait().await
-        })
-        .await;
+        // 判停读的是「这条命令还在不在动」，不是它跑了多久（2026-11-10 拆掉按钟的
+        // `timeout`）：每写出一段输出是一拍，CPU 时间在涨也是一拍——后者是沉默的重活
+        // （编译、链接）唯一的「还在动」证据。判据在 `cog_core::progress` 里，与编排侧
+        // 的回收共用同一条，量不到窗口时不判。
+        cog_core::progress::beat(&task_id);
+        let stalled: std::sync::Arc<
+            std::sync::Mutex<Option<(std::time::Duration, std::time::Duration)>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let watchdog = {
+            let stalled = stalled.clone();
+            let task_id = task_id.clone();
+            tokio::spawn(async move {
+                // Read the counters once before the first judgement, not on the
+                // first tick: a change can only be seen against an earlier
+                // reading, and the read tick is a full second while the window
+                // can be a few milliseconds. Without this first sample a command
+                // that burns CPU from its first instant looked static at the
+                // first tick -- the tick that also exceeds the window -- and was
+                // killed for the one thing it was doing.
+                let mut burned: Option<(u64, u64)> = group.and_then(cog_core::progress::cpu_ticks);
+                loop {
+                    tokio::time::sleep(cog_core::progress::WATCH_TICK).await;
+                    if let Some(pid) = group {
+                        if let Some(now) = cog_core::progress::cpu_ticks(pid) {
+                            // CPU 时间在涨就是还在动：编译、链接这一段不印一个字节，
+                            // 但它一直在干活。没有这一拍，最忙的时候最像停住。
+                            if burned.is_some_and(|before| now != before) {
+                                cog_core::progress::beat(&task_id);
+                            }
+                            burned = Some(now);
+                        }
+                    }
+                    if let Some(verdict) = cog_core::declared_wall::stall(&task_id) {
+                        *stalled.lock().unwrap_or_else(|p| p.into_inner()) = Some(verdict);
+                        if let Some(pid) = group {
+                            kill_group(pid);
+                        }
+                        break;
+                    }
+                }
+            })
+        };
+        readers.await;
+        let status = child.wait().await;
+        watchdog.abort();
+        let verdict = *stalled.lock().unwrap_or_else(|p| p.into_inner());
+        cog_core::progress::forget(&task_id);
+        let exited = match verdict {
+            Some(_) => None,
+            None => Some(status),
+        };
+        // Read the cage before naming the death: its own `memory.events` says
+        // whether *this* command was killed for memory, where the container's
+        // counter only says something was killed while it ran. Read after
+        // `wait`, when the charge is final, and after the kill has landed, when
+        // the kernel has had the chance to record it.
+        let reading = match cage.as_ref() {
+            Some(cage) => cage.reading(),
+            None => super::cgroup::CageReading::Unavailable,
+        };
         let code = match exited {
             // `code()` is only set on a normal exit: a signal-terminated child
             // (the cgroup OOM killer, a crash, an external kill) reports None,
@@ -359,42 +428,51 @@ pub(crate) fn spawn_command(
             // (SIGKILL -> 137, SIGTERM -> 143, matching what k8s reports for an
             // OOMKilled container) and name the signal in stderr, since 137 by
             // itself cannot be told apart from a process calling exit(137).
-            Ok(Ok(status)) => match (status.code(), status.signal()) {
+            Some(Ok(status)) => match (status.code(), status.signal()) {
                 (Some(c), _) => c,
                 (None, Some(sig)) => {
                     let facts = super::cgroup::read();
-                    let oom = super::cgroup::CgroupFacts::oom_kill_between(&memory_before, &facts);
+                    // The cage names this command; the container count names
+                    // the neighbourhood. Where the cage can speak it decides,
+                    // and where it cannot the container reading stands as the
+                    // weaker answer, so neither is reported as certain when it
+                    // is not.
+                    let oom = reading.oom_killed().unwrap_or_else(|| {
+                        super::cgroup::CgroupFacts::oom_kill_between(&memory_before, &facts)
+                    });
                     if oom {
                         super::cgroup::record_oom_kill(facts.limit_bytes, facts.peak_bytes);
                     }
                     let data = signal_death_note(sig, &facts, oom);
-                    let _ = tx.send(CommandEvent::Stderr { data }).await;
+                    cog_core::ignore_lost!(tx.send(CommandEvent::Stderr { data }).await);
                     128 + sig
                 }
                 (None, None) => -1,
             },
-            Ok(Err(_)) => -1,
-            Err(_) => {
-                // Not `child.kill()`: that reaches the shell and leaves every
-                // process the command started -- cargo, rustc, the grandchild
-                // that holds the shared target directory -- alive and holding
-                // it. The whole group goes, leader included.
-                if let Some(pid) = group {
-                    kill_group(pid);
-                }
-                // Reap the leader so the pid is not left as a zombie for the
-                // life of the executor. Bounded: a group that ignores SIGKILL
-                // is not something this path should wait on.
-                let _ = tokio::time::timeout(REAP_AFTER_KILL_WAIT, child.wait()).await;
+            Some(Err(_)) => -1,
+            None => {
+                // 看门狗已经按实测的静默窗口判过、并且把整个组 kill 了（见上看门狗）。
+                // 这里只负责把判词交出去：两个实数都在里面，读的人能复算这次判定。
+                let (silent, window) = verdict.unwrap_or(Default::default());
                 let _ = tx
                     .send(CommandEvent::Stderr {
-                        data: format!("command timed out after {}s", timeout.as_secs()),
+                        data: format!(
+                            "command stopped moving: no output and no CPU time for {:?}, and \
+                             any gap this deployment has ever seen between steps {:?}",
+                            silent, window
+                        ),
                     })
                     .await;
                 -1
             }
         };
-        let _ = tx.send(CommandEvent::Exit { code }).await;
+        // Taken down only now: the peak is a high-water mark for the cage's
+        // lifetime, and the reading above is the only one it will ever give.
+        if let Some(cage) = cage {
+            cage.close();
+        }
+        super::cgroup::record_cage(reading);
+        cog_core::ignore_lost!(tx.send(CommandEvent::Exit { code }).await);
     });
 
     Ok(rx)
@@ -409,6 +487,40 @@ fn kill_group(pid: u32) {
     // SAFETY: one pid and one signal constant; no pointers, no ownership.
     unsafe {
         libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+/// 进程自己所在的那棵树。
+///
+/// 就地执行没有 lane 路由：命令就在调用方的当前目录里跑，所以检查点记的也只能是
+/// 那一棵。取不到就说出来，而不是退回一个相对路径——相对路径会随别的调用的 cwd
+/// 指到另一棵树上去。
+fn local_root() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
+
+/// 停住判据这一行。
+///
+/// 本地后端与执行器读的是同一条，因为停住同一条命令的就是同一段代码
+/// （[`spawn_command`] 的看门狗）：两处各答一份，其中一份迟早会说另一份的话。
+pub(crate) fn silence_line() -> cog_core::BoundaryLine {
+    let window = cog_core::progress::silence_window();
+    let detail = match window {
+        Some(window) => format!(
+            "不按墙钟计时：没有输出、CPU 时间也不涨超过 {} ms 就被停（窗口是这台机器实测的分位数）；持续有动静的命令不受它约束",
+            window.as_millis()
+        ),
+        None => "沉默窗口还没量够样本：现在停不下一条没有动静的命令".to_string(),
+    };
+    cog_core::BoundaryLine {
+        dimension: "超时".to_string(),
+        state: if window.is_some() {
+            "enforced"
+        } else {
+            "unknown"
+        }
+        .to_string(),
+        detail,
     }
 }
 
@@ -435,8 +547,10 @@ pub(crate) async fn collect_stream(mut stream: CommandEventStream) -> SandboxRes
     let mut stdout = String::new();
     let mut stderr = String::new();
     let mut exit_code = 0;
+    let mut workdir = None;
     while let Some(event) = stream.next().await {
         match event {
+            CommandEvent::Workdir { path, .. } => workdir = Some(path),
             CommandEvent::Stdout { data } => stdout.push_str(&data),
             CommandEvent::Stderr { data } => stderr.push_str(&data),
             CommandEvent::Exit { code } => exit_code = code,
@@ -449,6 +563,7 @@ pub(crate) async fn collect_stream(mut stream: CommandEventStream) -> SandboxRes
         output: None,
         duration_ms: 0,
         resource_usage: Default::default(),
+        workdir,
     }
 }
 
@@ -456,6 +571,34 @@ pub(crate) async fn collect_stream(mut stream: CommandEventStream) -> SandboxRes
 impl SandboxBackend for LocalExecutor {
     async fn execute(&self, req: &SandboxRequest) -> SFResult<SandboxResult> {
         Ok(collect_stream(self.execute_stream(req).await?).await)
+    }
+
+    /// 进程内执行就是进程内执行：这里如实说「没有容器边界」，而不是借宿主的
+    /// cgroup 与网络把这一层写成隔离的。三条 `none` 是这次调用真实的处境，界面
+    /// 据此把人话写出来；把它们省掉，默认部署看起来就和执行器 Pod 一样。
+    async fn boundary(&self) -> SFResult<cog_core::SandboxBoundary> {
+        let line = |dimension: &str, detail: &str| cog_core::BoundaryLine {
+            dimension: dimension.to_string(),
+            state: "none".to_string(),
+            detail: detail.to_string(),
+        };
+        Ok(cog_core::SandboxBoundary {
+            kind: "local".to_string(),
+            isolated: false,
+            workdir: Some(local_root().display().to_string()),
+            lines: vec![
+                line(
+                    "可写路径",
+                    "进程内执行：文件路径原样交给文件系统，越界不拦（部署独立执行器后这一行才变成 enforced）",
+                ),
+                line("网络", "进程内执行：命令用的是这个进程自己的网络，没有出口策略"),
+                line(
+                    "资源",
+                    "进程内执行：宿主容器的 cgroup 不是这条命令的界，命令与平台抢同一份内存与 CPU",
+                ),
+                silence_line(),
+            ],
+        })
     }
 
     async fn precompile(&self, _bytes: &[u8]) -> SFResult<String> {
@@ -471,7 +614,7 @@ impl SandboxBackend for LocalExecutor {
                 // Embedded use has no shared target directory to serialise:
                 // the command runs in whatever tree the caller's cwd names, so
                 // there is no slot to take here.
-                let rx = spawn_command(command, req.timeout, None, None, None, None)?;
+                let rx = spawn_command(command, &req.task_id, None, None, None, None, None)?;
                 Ok(Box::pin(futures::stream::unfold(rx, |mut rx| async move {
                     rx.recv().await.map(|event| (event, rx))
                 })))
@@ -499,6 +642,24 @@ impl SandboxBackend for LocalExecutor {
                 .map_err(std::io::Error::other);
                 Ok(file_stream(result))
             }
+            SandboxPayload::CaptureCheckpoint { key } => Ok(file_stream(
+                crate::checkpoints::capture(&local_root(), key)
+                    .await
+                    .map(|plan| plan.to_json().to_string())
+                    .map_err(std::io::Error::other),
+            )),
+            SandboxPayload::PlanCheckpoint { key } => Ok(file_stream(
+                crate::checkpoints::plan(&local_root(), key)
+                    .await
+                    .map(|plan| plan.to_json().to_string())
+                    .map_err(std::io::Error::other),
+            )),
+            SandboxPayload::RestoreCheckpoint { key } => Ok(file_stream(
+                crate::checkpoints::restore(&local_root(), key)
+                    .await
+                    .map(|plan| plan.to_json().to_string())
+                    .map_err(std::io::Error::other),
+            )),
             SandboxPayload::Wasm { .. } => Err(cog_core::SFError::Agent(
                 "LocalExecutor only executes environment payloads".into(),
             )),
@@ -511,12 +672,23 @@ mod tests {
     use super::*;
 
     fn req(payload: SandboxPayload) -> SandboxRequest {
+        // A fresh id per request, not one shared literal. The beacon table is
+        // process-wide and keyed by task id, so a fixed `"t"` made every
+        // command in this file refresh every other test's beacon: the silence
+        // test's `sleep 30` stayed "moving" whenever a sibling test ran a
+        // command, and it finished normally instead of being judged. The
+        // tests that judge a silence serialise against each other, but the
+        // ordinary command tests here do not take that lock and would still
+        // keep beating for them.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         SandboxRequest {
-            task_id: "t".into(),
+            task_id: format!(
+                "t{}",
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
             agent_id: "test".into(),
             payload,
             input: serde_json::json!({}),
-            timeout: std::time::Duration::from_secs(10),
             limits: Default::default(),
         }
     }
@@ -593,14 +765,70 @@ mod tests {
         assert_eq!(result.exit_code, 3);
     }
 
+    /// A command that stops moving is stopped -- and the record says both
+    /// numbers the decision was made from, so a reader can recompute it.
+    ///
+    /// The window is planted rather than raced: see
+    /// [`cog_core::progress::seed_gaps_for_tests`].
     #[tokio::test]
-    async fn local_backend_kills_on_timeout() {
+    async fn a_command_that_stops_moving_is_stopped_and_the_record_names_the_window() {
+        let _serial = cog_core::progress::async_test_lock().await;
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::seed_gaps_for_tests(std::time::Duration::from_millis(50), 1000);
+
         let backend = LocalExecutor::new();
-        let mut req = cmd("sleep 30");
-        req.timeout = std::time::Duration::from_secs(1);
-        let result = backend.execute(&req).await.unwrap();
+        let result = backend.execute(&cmd("sleep 30")).await.unwrap();
+        // 判据用的界在这一刻就是它：这一趟自己的拍会往水库里记真实的间隔，界只
+        // 会跟它们取大（见 `longest_gap`）。读回它，而不是认死上面那个 50ms——
+        // 认死的话，一次调度抖动记进来的间隔也会把界抬过 50ms，于是这条用例在
+        // 判词完全正确的时候红，红的原因却是宿主比种子慢。
+        let window = cog_core::declared_wall::Bound::now()
+            .value()
+            .expect("种下了样本就有一条界");
+
+        cog_core::progress::reset_for_tests();
         assert_eq!(result.exit_code, -1);
-        assert!(result.stderr.contains("timed out"));
+        assert!(
+            result.stderr.contains("stopped moving"),
+            "the record must say what was judged: {}",
+            result.stderr
+        );
+        assert!(
+            window >= std::time::Duration::from_millis(50),
+            "界不能比种下的样本还窄：{window:?}"
+        );
+        assert!(
+            result.stderr.contains(&format!("{window:?}")),
+            "the record must name the window the judgement used ({window:?}): {}",
+            result.stderr
+        );
+    }
+
+    /// The other half: a command that keeps burning CPU while printing nothing
+    /// is *working*, not stuck, however long it goes.
+    ///
+    /// This is the shape a compile has: one silent minute of rustc, at its
+    /// busiest. Judging it by its output alone would kill it exactly there.
+    #[tokio::test]
+    async fn a_silent_command_that_is_burning_cpu_is_not_judged_stopped() {
+        let _serial = cog_core::progress::async_test_lock().await;
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::seed_gaps_for_tests(std::time::Duration::from_millis(50), 1000);
+
+        let backend = LocalExecutor::new();
+        // Pure arithmetic in the shell itself: seconds of CPU, not one byte of
+        // output before the end. The planted window is 50 ms, so a judgement
+        // made on output alone would cut it at the first tick.
+        let result = backend
+            .execute(&cmd(
+                "i=0; while [ $i -lt 400000 ]; do i=$((i+1)); done; echo done",
+            ))
+            .await
+            .unwrap();
+
+        cog_core::progress::reset_for_tests();
+        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert_eq!(result.stdout.trim(), "done");
     }
 
     /// Whether the pid is still doing work: present in `/proc` and not already
@@ -621,18 +849,23 @@ mod tests {
         after_name.split_whitespace().next() != Some("Z")
     }
 
-    /// The wall has to end what the command started, not only the shell this
-    /// executor spawns. `sh -c "cargo build"` is two processes deep, and a
-    /// cargo left behind by a timed-out command keeps the shared build
-    /// directory locked: measured on the cluster, a build whose `sh` had been
-    /// killed at its wall went on holding the lock, and every round queued
-    /// behind it died at its own wall having compiled nothing.
+    /// The judgement has to end what the command started, not only the shell
+    /// this executor spawns. `sh -c "cargo build"` is two processes deep, and a
+    /// cargo left behind keeps the shared build directory locked: measured on
+    /// the cluster, a build whose `sh` was killed went on holding the lock, and
+    /// every round queued behind it died having compiled nothing.
     #[tokio::test]
-    async fn a_timeout_kills_what_the_command_started_not_only_the_shell() {
+    async fn a_stall_kills_what_the_command_started_not_only_the_shell() {
+        let _serial = cog_core::progress::async_test_lock().await;
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::seed_gaps_for_tests(std::time::Duration::from_millis(50), 1000);
+
         let backend = LocalExecutor::new();
-        let mut req = cmd("sleep 300 & echo $!; wait");
-        req.timeout = std::time::Duration::from_secs(1);
-        let result = backend.execute(&req).await.unwrap();
+        let result = backend
+            .execute(&cmd("sleep 300 & echo $!; wait"))
+            .await
+            .unwrap();
+        cog_core::progress::reset_for_tests();
         assert_eq!(result.exit_code, -1);
         let pid: u32 = result
             .stdout
@@ -646,7 +879,7 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        panic!("pid {pid} outlived the timeout: the wall reached the shell only");
+        panic!("pid {pid} outlived the stall: the kill reached the shell only");
     }
 
     /// A signal death must not look like a timeout or like any other failure:
@@ -766,7 +999,7 @@ mod tests {
             .unwrap();
         assert_eq!(missing.exit_code, 1);
         assert!(!missing.stderr.is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     #[tokio::test]

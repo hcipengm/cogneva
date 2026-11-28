@@ -56,6 +56,7 @@ impl MergerActor {
 
     /// Ask the underlying agent to pick the best branch or synthesize a merged
     /// result from the provided branch outputs.
+    // prompt: consumed by crates/cog-collaboration/src/actors/merger.rs::parse_merge_result
     pub async fn merge(
         &self,
         task: &cog_core::Task,
@@ -67,21 +68,17 @@ impl MergerActor {
             .map(|b| serde_json::to_value(b).unwrap_or_default())
             .collect();
 
-        // The stable half: what this role is choosing between, the rule the
-        // choice follows, and the shape the answer has to take. It does not move
+        // The stable half: the shape the answer has to take. It does not move
         // from one merge to the next, while the branches and the board it is
         // being asked about do — so it is assembled apart from the document and
         // handed over under the contract key, which the runtime renders as the
         // leading message. See `crate::actors::with_contract`.
+        //
+        // Only the shape is here. Which branch to carry and why is the decision
+        // this role was called for, and the branches it decides between travel
+        // in the document below; a sentence here telling it how to choose would
+        // be the platform ruling on a case it has not read.
         let mut contract = serde_json::json!({
-            "instructions": "Every entry in \
-             `branches` ran the same task and carries its own plan, its own generation, and \
-             the judge's ruling on it. Choose the branch this round carries out and answer \
-             with an object holding `plan`, `generation` and `outcome` copied unchanged from \
-             that branch, `selected_branch_id` set to that branch's `branch_id`, and \
-             `reasoning` saying why it. Rewrite nothing and invent no outcome: a product no \
-             judge ruled on must not be carried out of the round as if one had. A branch \
-             whose judge could not rule carries no score, so it cannot be ranked.",
             "output_schema": {
                 "plan": "object: the chosen branch's plan, copied unchanged",
                 "generation": "object: the chosen branch's generation, copied unchanged",
@@ -139,7 +136,7 @@ impl MergerActor {
                 )
             }
         };
-        let output_str = serde_json::to_string_pretty(&output).unwrap_or_default();
+        let output_str = serde_json::to_string_pretty(&output).unwrap_or(Default::default());
         if let Some(revised) = crate::actors::maybe_self_review(
             self.agent.as_ref(),
             &self.self_review,
@@ -194,11 +191,13 @@ pub fn fallback_best_branch(branches: &[PgeBranchResult]) -> MergeResult {
         },
         None => MergeResult {
             plan: PlannerOutput {
+                definition: None,
                 summary: String::new(),
                 plan: serde_json::json!({}),
                 sub_tasks: Vec::new(),
                 acceptance_criteria: Vec::new(),
                 targets: Vec::new(),
+                items: Vec::new(),
             },
             generation: GeneratorOutput::none(),
             outcome: RoundOutcome::Stopped {

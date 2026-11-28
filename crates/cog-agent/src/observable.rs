@@ -26,12 +26,35 @@ pub struct AgentObservable {
     budget_exhausted_count: AtomicU64,
     total_steps: AtomicU64,
     total_tool_calls: AtomicU64,
-    /// Per-role reads of how many iterations a run actually took, keyed by role.
+    /// Per-role counts of how a role's runs ended, keyed by role.
     ///
-    /// The key is a role, which is a closed set the code names — not a task id
-    /// or a path, which would grow without bound. The sample itself is a recent
-    /// window (see [`BUDGET_SAMPLE_WINDOW`]), so the map stays bounded too.
+    /// Readings, not inputs: a label says which roster row keeps meeting a
+    /// guardrail, and nothing here decides what a run does. The key is a role,
+    /// which is a closed set the code names — not a task id or a path, which
+    /// would grow without bound.
     role_calibrations: Arc<Mutex<HashMap<String, RoleCalibration>>>,
+    /// Iterations consumed by the most recent runs that delivered on their own,
+    /// one window for the process and one for each employee.
+    ///
+    /// The treatment rule is that a piece of work is treated by what it declares,
+    /// by the measured delivery record of the person taking it, and by the
+    /// operator's explicit override — so the person's own finished runs answer
+    /// first. The process window stays as the fallback for an employee with no
+    /// record of its own: a new hire has none, and reading that as `unmeasured`
+    /// would hand every first run no ceiling at all.
+    ///
+    /// The two windows stay distinguishable in the reading (`measured_own` /
+    /// `measured_process`): "measured from this person" and "measured from the
+    /// process" are different claims, and a single `measured` label would make
+    /// them look the same.
+    ///
+    /// Neither is keyed by role: a role is a free label on the roster, and the
+    /// same work must not run under a different ceiling because a different name
+    /// was written on the worker. The per-employee map is bounded by the live
+    /// roster — [`Self::publish_roster`] drops the windows of employees that are
+    /// no longer there — so employee churn cannot grow it without bound.
+    delivered_iterations: Arc<Mutex<VecDeque<u32>>>,
+    delivered_iterations_by_agent: Arc<Mutex<HashMap<String, VecDeque<u32>>>>,
     /// The agents the manager currently holds, one entry per live object.
     ///
     /// Published by the manager on every change and read at scrape time, so the
@@ -109,6 +132,18 @@ pub struct AgentObservable {
     /// no queue depth changes. The caller learns it from the tool result and
     /// nobody else would ever learn it at all, which is what this is for.
     inbox_ask_total: Mutex<HashMap<&'static str, u64>>,
+    /// 每一轮跑完时，这件活的声明来自哪一类，按来源计数。
+    ///
+    /// 与 [`RoleCalibration`] 分开：那个按角色名数结局，这个数的是「这轮待遇
+    /// 由什么决定」里属于活自己的那一半。四态全部计数，包括 `Unreadable`——
+    /// 「说了但读不出来」单列一格，才看得出有多少活带着一句没人读懂的话在跑。
+    decisions_by_declaration: Mutex<HashMap<cog_core::DeclarationState, u64>>,
+    /// 每一轮跑完时，轮次上限是哪一个来源给的，按来源计数。
+    ///
+    /// 与 `decisions_by_declaration` 并列而不是交叉成一张表：交叉之后每一格
+    /// 都是一小撮运行，而这两个问题各自有各自的读者——一个问「活自己说了没」，
+    /// 一个问「上限是操作者钉的还是实测出来的」。交叉表只会同时答不上来。
+    decisions_by_ceiling: Mutex<HashMap<CeilingSource, u64>>,
     /// How many tasks the pool may run at once, how many workers it holds, and
     /// the measured capacity those two are converging on.
     ///
@@ -126,6 +161,146 @@ pub struct AgentObservable {
     /// "not measured" and writes no series: a zero here would read as a
     /// container with nothing in it.
     pool_memory_fraction: Mutex<Option<f64>>,
+    /// What this process's calls have measured about the upstream's window.
+    ///
+    /// The window is a property of the upstream deployment, not of this tree:
+    /// no file here carries it, and the value in `agent_loop` is a bootstrap
+    /// rather than a fact. Two things measure it, and both are free — they are
+    /// sides of calls that were being made anyway:
+    ///
+    /// - a served call reports the prompt tokens it took, so the window is at
+    ///   least that large;
+    /// - a refusal that says the prompt was too long and names the limit says
+    ///   exactly how large the window is.
+    ///
+    /// Kept in the process and not per agent or per role: the upstream is a
+    /// property of the deployment, so every employee talking to it is talking
+    /// to the same window.
+    ///
+    /// An `Arc` rather than a plain `Mutex` because the runtime holds the same
+    /// cell: the call that measures the window happens inside a runtime that
+    /// was built from this observable, and handing it the cell keeps the
+    /// measurement and the decision looking at one number.
+    context_measurements: Arc<Mutex<ContextMeasurements>>,
+}
+
+/// One runtime's handle on the process's window measurements, kept per model.
+///
+/// Cloneable and cheap: the observable owns one, and every runtime built from
+/// it takes a clone. The buckets are shared because the upstream is shared —
+/// but the *model* answering is not necessarily the same: a deployment lets
+/// each session pick one, and a limit stated by one model says nothing about
+/// the next one's window. So a measurement is filed under the model that made
+/// it, and [`Self::decision_for`] reads the bucket of the model in use.
+#[derive(Clone, Default)]
+pub struct ContextWindowProbe {
+    measurements: Arc<Mutex<ContextMeasurements>>,
+}
+
+/// 一只型号量到的三样东西，单位与上游一致：token。
+#[derive(Debug, Clone, Copy, Default)]
+struct ModelMeasurements {
+    /// The largest prompt this model accepted here; zero for none yet.
+    accepted_max: u64,
+    /// The smallest limit a refusal from this model named. `None` is "not
+    /// measured", which is a different fact from any number: a refusal that
+    /// names no number teaches nothing, and reading it as zero would collapse
+    /// the budget.
+    limit_min: Option<u64>,
+    /// 上游回报的型号在厂商规格里公布的那个窗口（`cog_core::model_windows::configured`，来自 LLM 设置页）。
+    ///
+    /// 与下面两个实测分开存：它是「厂商说过多少」，不是「这台机器上量到多少」。
+    /// 两者的来源在读数面上必须分得开——规格查不到时这里是 `None`，与「规格说
+    /// 就是 0」不是一件事。它是起点而不是事实：实测（尤其拒收时自述的界）
+    /// 永远压在它上面。
+    published: Option<u64>,
+}
+
+/// 按型号分桶的读数，外加一桶「上游没报型号」时量到的数。
+///
+/// 为什么要分桶：设置页让每段对话挑一只型号，同一个进程里可以同时跑着窗口不同
+/// 的两只。甲的拒收自述的是甲的界，混进一个数里，小的那只就会一直压着大的那只
+/// ——而那正是「用哪只型号就用哪只型号的窗口」要避免的。
+///
+/// `unattributed` 只在型号从头到尾没报出来时才非空（有的上游不回型号）。那时确实
+/// 不知道答话的是哪一只，只能按实测优先、宁可保守的老口径算进每一只的决定；
+/// 它出现得越少，这条退化越不要紧。
+#[derive(Debug, Clone, Default)]
+struct ContextMeasurements {
+    per_model: HashMap<String, ModelMeasurements>,
+    unattributed: ModelMeasurements,
+}
+
+impl ContextMeasurements {
+    /// 桶名：大小写不决定查不查得到（与 `cog_core::model_windows` 同一条）。
+    fn key(model: &str) -> String {
+        model.trim().to_ascii_lowercase()
+    }
+
+    fn bucket_mut(&mut self, model: Option<&str>) -> &mut ModelMeasurements {
+        match model.map(Self::key).filter(|key| !key.is_empty()) {
+            Some(key) => self.per_model.entry(key).or_default(),
+            None => &mut self.unattributed,
+        }
+    }
+
+    /// 这只型号此刻的读数：它自己的，叠上「没报型号」那一桶。
+    fn reading(&self, model: Option<&str>) -> ModelMeasurements {
+        let own = model
+            .map(Self::key)
+            .filter(|key| !key.is_empty())
+            .and_then(|key| self.per_model.get(&key).copied())
+            .unwrap_or(Default::default());
+        ModelMeasurements {
+            accepted_max: own.accepted_max.max(self.unattributed.accepted_max),
+            limit_min: match (own.limit_min, self.unattributed.limit_min) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
+            published: own.published.or(self.unattributed.published),
+        }
+    }
+}
+
+/// Which input decided the window this process trims to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextWindowSource {
+    /// 没有任何一条读数说过窗口：没有型号报过名，也没有部署声明的值可兜底
+    /// （文档里没有那一格）。这是「量不到」那一档，必须与「量到正好是这个数」
+    /// 分得开——此时窗口是 `None`，调用方读作「不设界」，而不是零个 token。
+    Unstated,
+    /// 上游回报的型号在厂商公布的规格里查到了窗口，且没有实测数据压过它。
+    /// 这是「厂商说的」：比任何本地缺省值都更接近真窗口，但仍然不是实测。
+    PublishedSpec,
+    /// A served call reported a prompt larger than the starting point, so the
+    /// window is at least that large; the window was raised to it.
+    MeasuredAccepted,
+    /// A refusal named the upstream's limit; the window was lowered to it.
+    /// This one is authoritative: it is the upstream stating its own bound.
+    MeasuredLimit,
+}
+
+impl ContextWindowSource {
+    /// 型号声明的窗口是否比当前在用的预算还小。
+    ///
+    /// 这条比较回答的是与「窗口太大」相反的问题：**有人按一个比型号更小的数在裁**。
+    /// 只有 `PublishedSpec` 才会这样——另外三种来源要么是实测抬上去的（那时它就在
+    /// 预算上），要么根本没人说过（没有界可裁）。所以它不是一个阈值，是一次来源判定：
+    /// 型号说了 200K，而这一轮的预算还在 64K，说明那 64K 没有出处。
+    pub fn narrower_than(self, window: Option<usize>, in_use: usize) -> bool {
+        matches!(self, Self::PublishedSpec) && window.is_some_and(|tokens| in_use < tokens)
+    }
+
+    /// The word this source is stored and read under. A reader taking its
+    /// predicate from here cannot drift from the writer.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unstated => "unstated",
+            Self::PublishedSpec => "published_spec",
+            Self::MeasuredAccepted => "measured_accepted",
+            Self::MeasuredLimit => "measured_limit",
+        }
+    }
 }
 
 /// Every kind of inbox command this build can execute.
@@ -188,6 +363,13 @@ fn lifetime_label(task_scoped: bool) -> &'static str {
 /// One live agent as the manager holds it.
 #[derive(Clone)]
 struct RosterEntry {
+    /// The employee this object is, not the label on it.
+    ///
+    /// Carried so the budget sample can be pruned to the employees that are
+    /// still here. Without it the per-employee windows would outlive every
+    /// employee that ever ran, and a long-lived process would accumulate one
+    /// window per name it has ever seen.
+    agent_id: String,
     role: String,
     created_at: std::time::Instant,
     /// Whether this object is scoped to a task or lives as long as the process.
@@ -199,33 +381,28 @@ struct RosterEntry {
     task_scoped: bool,
 }
 
-/// How many of a role's most recent completed runs feed its budget.
+/// How many of the most recent completed runs feed the process's budget.
 ///
 /// A window rather than a lifetime archive on purpose: the ceiling is meant to
 /// track the workload as it is now, and a run from a month ago under a
 /// different model says nothing about how much work a run needs today.
-// cap: bound — 窗口跟的是现在的负载；一个月前另一个模型下的一轮跑，说不了今天的活要多少
+// cap: fixed — 窗口跟的是现在的负载；一个月前另一个模型下的一轮跑，说不了今天的活要多少
+// keep: 删掉后窗口无界，一个月前另一个模型的运行也来定今天的预算；由「窗口跟现在的负载」兜住
 const BUDGET_SAMPLE_WINDOW: usize = 64;
 
-/// What a role's own finished runs say about how many iterations it needs.
+/// How a role's own finished runs ended.
 ///
 /// The iteration budget used to be one literal for every role, which can only
 /// be right by accident: set too low, a run that was still working is cut off
 /// mid-exploration and returns nothing (measured: 6 of 8 generator runs stopped
 /// at exactly the ceiling with tool calls still pending, against a 25% delivery
 /// rate); set too high, every run pays for slack it does not use. How much work
-/// a role needs is observable from the runs it completes, so the ceiling is
-/// derived from that instead of being a number someone has to guess and keep
-/// guessing.
+/// a run needs is observable from the runs that complete, which is where the
+/// ceiling comes from — but those runs are counted once for the process
+/// ([`AgentObservable::delivered_iterations`]) and only their *endings* are
+/// split by label here.
 #[derive(Default)]
 struct RoleCalibration {
-    /// Iterations consumed by runs of this role that finished with an answer it
-    /// reached on its own. A run cut off at the ceiling is left out even when
-    /// the forced ask salvaged an answer: it stopped where the ceiling said, so
-    /// its length measures the ceiling, not the work. Feeding it back lets every
-    /// rescue raise the next ceiling, which makes the next rescue more likely —
-    /// a ceiling climbing on its own record of having been hit.
-    delivered_iterations: VecDeque<u32>,
     /// Runs of this role that were cut off at the ceiling. A run that stops
     /// this way is direct evidence the ceiling was binding, which is what an
     /// operator needs to see when the derived value is not moving.
@@ -308,6 +485,79 @@ impl RunOutcome {
     }
 }
 
+/// 这一轮跑的轮次上限是谁给的。
+///
+/// 操作者在配置面上钉的数、接手这个人自己的交卷读数、这个人还没有自己的读数时
+/// 这个进程的交卷读数，三样各成一格；外加一格表示三边都没有。分开不是为了好看：
+/// 「量到的是这个人的」与「量到的是这个进程的，而这个人还没有」是两个不同的结论，
+/// 而「量不到」是第三个。上限停在某个数上时，读者要能说出它是哪一样给的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CeilingSource {
+    /// 操作者钉在配置面上的数。实测读数只报它绑不绑，不改它。
+    Operated,
+    /// 没人钉数，接手这个人自己的交卷运行给出的值。
+    MeasuredOwn,
+    /// 没人钉数，这个人还没有自己的交卷样本；这个进程的交卷运行给出的值。
+    MeasuredProcess,
+    /// 没人钉数，这个进程也还没有一条交卷样本：量不到，所以这一轮无上限。
+    Unmeasured,
+}
+
+impl CeilingSource {
+    /// 读数标签上的那个词。
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Operated => "operated",
+            Self::MeasuredOwn => "measured_own",
+            Self::MeasuredProcess => "measured_process",
+            Self::Unmeasured => "unmeasured",
+        }
+    }
+}
+
+/// 一轮运行跑完之后的代价，三项都是读数直接要用的量。
+///
+/// 打成一个值而不是三个位置参数：它们一起进 [`AgentObservable::record_run`]，
+/// 一起决定「这一轮值多少」；逐项摆出来时，多一个读数项就多一个参数，而漏传
+/// 一项在编译期看不见——结构体字段少一项就会在解构处响。
+#[derive(Debug, Clone, Copy)]
+pub struct RunCost {
+    /// 上限与实测窗口使用的单位：轮数。
+    pub iterations: u32,
+    /// 助手回合数。
+    pub steps: usize,
+    /// 工具调用次数。
+    pub tool_calls: usize,
+}
+
+/// 一轮运行跑完之后要记下的「待遇由谁决定」。
+///
+/// 与结局、花销一起在 [`AgentObservable::record_run`] 的同一处写，而不是由调用方
+/// 顺手另记一笔：那一笔漏掉时，来源计数会安静地小于运行总数，而「小于」在读数面
+/// 上看不出是漏记还是这部分运行本来就不存在。传一个值而不是两个可选参数，也让
+/// 「这一轮没说」只能是一个明确的 `Unstated`，不能是忘了传。
+#[derive(Debug, Clone, Copy)]
+pub struct RunDecision {
+    /// 这件活的声明来自哪一类。
+    pub declaration: cog_core::DeclarationState,
+    /// 轮次上限是哪个来源给的。
+    pub ceiling: CeilingSource,
+}
+
+#[cfg(test)]
+impl RunDecision {
+    /// 单元测试里不关心待遇时的取值：没有声明，也没有实测样本。
+    ///
+    /// 只在本 crate 的测试里可用；其它 crate 的测试要自己写出那两个值，
+    /// 因为那里的运行通常正是在验证其中一个。
+    pub const fn no_declaration() -> Self {
+        Self {
+            declaration: cog_core::DeclarationState::Unstated,
+            ceiling: CeilingSource::Unmeasured,
+        }
+    }
+}
+
 impl AgentObservable {
     pub fn new() -> Self {
         Self::default()
@@ -337,7 +587,8 @@ impl AgentObservable {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = memory_fraction;
     }
 
-    /// Replace the published roster with `entries` (role, creation instant).
+    /// Replace the published roster with `entries`
+    /// (agent id, role, creation instant, task scoped).
     ///
     /// Replaced wholesale rather than incremented on create and on retire: a
     /// reader comparing a count that was incremented and decremented on two
@@ -345,13 +596,18 @@ impl AgentObservable {
     /// failed to decrement looks exactly like a path that never ran. Publishing
     /// the list makes the manager the single owner of the truth and the scrape
     /// a plain view of it.
+    ///
+    /// The same publish is what bounds the per-employee budget windows: the
+    /// roster is the set of employees that are still here, so a window for an id
+    /// the roster no longer names is a window nothing can ever read again.
     pub fn publish_roster(
         &self,
-        entries: impl IntoIterator<Item = (String, std::time::Instant, bool)>,
+        entries: impl IntoIterator<Item = (String, String, std::time::Instant, bool)>,
     ) {
         let next: Vec<RosterEntry> = entries
             .into_iter()
-            .map(|(role, created_at, task_scoped)| RosterEntry {
+            .map(|(agent_id, role, created_at, task_scoped)| RosterEntry {
+                agent_id,
                 role,
                 created_at,
                 task_scoped,
@@ -365,6 +621,15 @@ impl AgentObservable {
             for entry in &next {
                 roles.insert((entry.role.clone(), entry.task_scoped), ());
             }
+        }
+        {
+            let live: std::collections::HashSet<&str> =
+                next.iter().map(|entry| entry.agent_id.as_str()).collect();
+            let mut samples = self
+                .delivered_iterations_by_agent
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            samples.retain(|agent, _| live.contains(agent.as_str()));
         }
         *self
             .roster
@@ -448,38 +713,70 @@ impl AgentObservable {
 
     /// Record a high-level agent run (called by AgentRuntime::run).
     ///
-    /// `role` is what makes the reading usable at all: the iteration ceiling is
-    /// derived per role, and a run counted without its role cannot inform any
-    /// decision. `iterations` is in the same unit the ceiling is expressed in —
-    /// not `steps`, which counts assistant turns and would silently rescale
-    /// every reading it fed.
+    /// `agent` is the employee that ran; the window kept under its id is what the
+    /// next run of the same employee starts its ceiling from. `role` labels the
+    /// ending counts only: a role is a free label, and a run counted under a
+    /// different name must not land in a different window from the same run
+    /// counted under this one. `cost.iterations` is in the same unit the ceiling
+    /// is expressed in — not `steps`, which counts assistant turns and would
+    /// silently rescale every reading it fed.
     pub fn record_run(
         &self,
+        agent: &str,
         role: &str,
         outcome: RunOutcome,
-        iterations: u32,
-        steps: usize,
-        tool_calls: usize,
+        cost: RunCost,
+        decision: RunDecision,
     ) {
         self.run_count.fetch_add(1, Ordering::Relaxed);
+        // 「这轮待遇由谁决定」在同一处记账：漏记时来源计数会小于运行总数，
+        // 而分开记的两个调用点迟早会有一个被绕过。
+        *self
+            .decisions_by_declaration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(decision.declaration)
+            .or_insert(0) += 1;
+        *self
+            .decisions_by_ceiling
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(decision.ceiling)
+            .or_insert(0) += 1;
         if outcome.delivered() {
             self.success_count.fetch_add(1, Ordering::Relaxed);
         }
-        self.total_steps.fetch_add(steps as u64, Ordering::Relaxed);
+        self.total_steps
+            .fetch_add(cost.steps as u64, Ordering::Relaxed);
         self.total_tool_calls
-            .fetch_add(tool_calls as u64, Ordering::Relaxed);
+            .fetch_add(cost.tool_calls as u64, Ordering::Relaxed);
+
+        if outcome == RunOutcome::Delivered {
+            {
+                let mut sample = self
+                    .delivered_iterations
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                push_bounded(&mut sample, cost.iterations);
+            }
+            // The employee's own window is the one its next ceiling reads first.
+            // Kept per id (not per role) so a different person taking the same
+            // work starts from their own record, not from the previous holder's.
+            let mut windows = self
+                .delivered_iterations_by_agent
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            push_bounded(
+                windows.entry(agent.to_string()).or_default(),
+                cost.iterations,
+            );
+        }
 
         let mut calibrations = self
             .role_calibrations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let calibration = calibrations.entry(role.to_string()).or_default();
-        if outcome == RunOutcome::Delivered {
-            if calibration.delivered_iterations.len() == BUDGET_SAMPLE_WINDOW {
-                calibration.delivered_iterations.pop_front();
-            }
-            calibration.delivered_iterations.push_back(iterations);
-        }
         // Counted here, at the run's end, and not at the moment the ceiling is
         // judged spent (`note_budget_exhausted`): only the ending says whether
         // the forced ask produced an answer. The judgement-time counter cannot
@@ -513,28 +810,36 @@ impl AgentObservable {
             .exhausted_runs += 1;
     }
 
-    /// The iteration ceiling to run this role under, given the value a caller
-    /// would use with no evidence behind it (`seed`: the operator's config, or
-    /// the role's skill).
+    /// The iteration ceiling to run this piece of work under, given the value a
+    /// caller would use with no evidence behind it (`seed`: the operator's
+    /// config).
     ///
-    /// With nothing observed about this role the seed stands — moving a number
-    /// without evidence would be guesswork with extra steps. Once runs have
-    /// completed, the ceiling is the shape this role usually needs plus one more
-    /// typical run's worth of room:
+    /// There are exactly two sources for a ceiling — the operator's number and
+    /// this process's own measurements — and neither is keyed by a label. A role
+    /// is a free tag on the roster; keying the ceiling by it meant the same work
+    /// handed to a worker under another name ran under another ceiling, which is
+    /// the label deciding behaviour.
     ///
-    /// - the floor of experience is the ninetieth percentile of what the role
-    ///   has delivered, not the longest of it. A ceiling that will not admit the
-    ///   shape this role is known to need is a defect, and ninety in a hundred
+    /// Only one of the two can answer at a time. A stated seed stands — it is the
+    /// operator's own decision for this deployment, and moving a number without
+    /// evidence would be guesswork with extra steps. Only where nobody stated
+    /// one (`u32::MAX`) does the measurement answer, and the ceiling it gives is
+    /// the shape the work usually takes plus one more typical run's worth of
+    /// room:
+    ///
+    /// - the floor of experience is the ninetieth percentile of what has been
+    ///   delivered, not the longest of it. A ceiling that will not admit the
+    ///   shape this work is known to need is a defect, and ninety in a hundred
     ///   delivered runs is that shape. Taking the maximum makes a single outlier
-    ///   the ceiling for every run of every task until it ages out of the sample
-    ///   window, which is the opposite of following the workload: measured on
-    ///   2026-11-06 over 215 delivered generator runs in 24 hours, the median was
-    ///   5 iterations, the ninetieth percentile 32, the maximum 169. The 9.8% of
-    ///   runs above 32 carried 24.6% of every generator call, and the runs that
-    ///   spent a whole 3600s task budget without producing an artifact sat at
-    ///   63 — above the percentile, far below the maximum. A ceiling at the
-    ///   maximum was ~183 and bound nothing; at the percentile it is ~46 and
-    ///   binds exactly on the tail where the spend stops buying deliveries.
+    ///   the ceiling for every run until it ages out of the sample window, which
+    ///   is the opposite of following the workload: measured on 2026-11-06 over
+    ///   215 delivered generator runs in 24 hours, the median was 5 iterations,
+    ///   the ninetieth percentile 32, the maximum 169. The 9.8% of runs above 32
+    ///   carried 24.6% of every generator call, and the runs that spent a whole
+    ///   3600s task budget without producing an artifact sat at 63 — above the
+    ///   percentile, far below the maximum. A ceiling at the maximum was ~183 and
+    ///   bound nothing; at the percentile it is ~46 and binds exactly on the tail
+    ///   where the spend stops buying deliveries.
     /// - the headroom is what keeps the ceiling from being a claim about the
     ///   past. A ceiling set exactly to the percentile cuts off the first run
     ///   that is slightly harder than anything seen, and that cut is total: the
@@ -555,30 +860,279 @@ impl AgentObservable {
     /// on its first ralph iteration (60 of 60 over 14 days). The spend was
     /// going to retries that never turned into deliveries, and the only number
     /// anyone had measured was never consulted.
-    pub fn iteration_budget_for(&self, role: &str, seed: u32) -> u32 {
-        let calibrations = self
-            .role_calibrations
+    pub fn iteration_budget_for(&self, seed: u32, agent: &str) -> u32 {
+        self.iteration_budget_decision_for(seed, agent).0
+    }
+
+    /// 同上，并交出「这个数是谁给的」。
+    ///
+    /// 与 [`Self::iteration_budget_for`] 是同一次判断，不是两次：分两处各算一遍，
+    /// 读数上标的来源与实际用的上限迟早会各自演化，而这一对读数存在的意义正是
+    /// 让读者能指出「这一轮的上限是谁给的」。
+    ///
+    /// 三个来源按顺序问：操作者钉的数（`operated`），接手这个人自己的交卷运行
+    /// （`measured_own`），这才进场的人还没有自己的样本时退回这个进程的
+    /// （`measured_process`）。退到进程样本这一步不改变「待遇跟着人走」：自己的
+    /// 样本一出现，下一轮就换成它。
+    ///
+    /// `Unmeasured` 不是第四个来源，是三个人都没有：没人钉数，这个进程也还没有
+    /// 一条交卷样本。此时返回的上限就是那个「没人说」的记号，这一轮无上限——读数上
+    /// 必须能与「实测给出 u32::MAX」分开，后者不可能发生，但前者必须看得见。
+    pub fn iteration_budget_decision_for(&self, seed: u32, agent: &str) -> (u32, CeilingSource) {
+        // Any value other than `u32::MAX` is the operator's own decision for this
+        // deployment and stands as written. It used to be raised whenever the
+        // measurement was larger, back when the seed could also arrive from a
+        // role's skill row — a number written for a label, which the work was
+        // allowed to outgrow. The only seed left is the process-wide config: a
+        // statement about this deployment, which a measurement may report on (the
+        // exhausted-runs reading says when it is binding) but not silently
+        // overrule.
+        if seed != u32::MAX {
+            return (seed, CeilingSource::Operated);
+        }
+        let own = {
+            let windows = self
+                .delivered_iterations_by_agent
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            windows.get(agent).cloned()
+        };
+        if let Some(own) = own.filter(|window| !window.is_empty()) {
+            let sample: Vec<u32> = own.into_iter().collect();
+            return (calibrated_ceiling(sample), CeilingSource::MeasuredOwn);
+        }
+        let sample = self
+            .delivered_iterations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(calibration) = calibrations.get(role) else {
-            return seed;
-        };
-        if calibration.delivered_iterations.is_empty() {
-            return seed;
+        if sample.is_empty() {
+            return (seed, CeilingSource::Unmeasured);
         }
-        let mut sample: Vec<u32> = calibration.delivered_iterations.iter().copied().collect();
-        let admitted = ninetieth_percentile(&mut sample);
-        let sum: u32 = sample.iter().sum();
-        let typical = sum.div_ceil(sample.len() as u32);
-        let calibrated = admitted.saturating_add(typical);
-        // `u32::MAX` is this field's spelling of "nobody stated a ceiling", not a
-        // ceiling of four billion turns. Taking the max against it discards the
-        // only measured number, so the calibration answers instead.
-        if seed == u32::MAX {
-            return calibrated;
-        }
-        seed.max(calibrated)
+        let sample: Vec<u32> = sample.iter().copied().collect();
+        (calibrated_ceiling(sample), CeilingSource::MeasuredProcess)
     }
+
+    /// This process's window measurements, for a runtime to hold.
+    pub fn context_probe(&self) -> ContextWindowProbe {
+        ContextWindowProbe {
+            measurements: Arc::clone(&self.context_measurements),
+        }
+    }
+
+    /// The measurements as they stand: `(accepted_max, limit_min)`.
+    ///
+    /// For the reading surface: a zero accepted size and a `None` limit are
+    /// "not measured yet", and a series that shows the numbers as they are is
+    /// what keeps the bootstrap readable as a bootstrap.
+    pub fn context_measurements(&self) -> (u64, Option<u64>) {
+        self.context_probe().measurements(None)
+    }
+
+    /// Note that a refusal named the upstream's limit.
+    ///
+    /// 这不带型号：它答的是「这个进程量到了什么」，读数面用；决定窗口时走
+    /// [`ContextWindowProbe::note_limit`]，那条按答话的型号分桶。
+    pub fn note_context_limit(&self, limit_tokens: u64) {
+        self.context_probe().note_limit(None, limit_tokens);
+    }
+
+    /// Note that a served call's prompt was this many tokens.
+    pub fn note_context_accepted(&self, prompt_tokens: u64) {
+        self.context_probe().note_accepted(None, prompt_tokens);
+    }
+
+    /// 记下上游回报的型号在公布规格里的窗口（见 [`ContextWindowProbe::note_published`]）。
+    pub fn note_context_published(&self, window_tokens: u64) {
+        self.context_probe().note_published(None, window_tokens);
+    }
+
+    /// 公布规格里那个窗口；`None` = 还没查到，不是 0。
+    pub fn context_published(&self) -> Option<u64> {
+        self.context_probe().published(None)
+    }
+
+    /// The window this process should trim to, and which input decided it.
+    ///
+    /// 没有型号时不挑任何一只：只读「上游没报型号」那一桶的实测，读到什么算什么。
+    /// `starting` 是调用方手上已有的起点读数——生产里没有部署声明的窗口，构造时
+    /// 传 `None`；会话那一层已有决定时把它交进来，不必重算。
+    pub fn context_window_decision_for(
+        &self,
+        starting: Option<usize>,
+    ) -> (Option<usize>, ContextWindowSource) {
+        let (window, source) = self.context_probe().decision_for(None, starting);
+        // 起点比型号公布的窗口还小：这一轮之前，有人按一个更小的数在裁，
+        // 而那个数没有出处。现在预算跟着型号走了，所以这是一条**已经改正**的读数，
+        // 不是一条当下的故障——它回答的是「那个种子错得多离谱」。
+        if let Some(starting) = starting {
+            if source.narrower_than(window, starting) {
+                tracing::warn!(
+                    starting,
+                    window = window.unwrap_or_default(),
+                    source = source.as_str(),
+                    "上下文窗口的起点比型号公布的还小：预算已按型号走，这个种子没有出处"
+                );
+            }
+        }
+        (window, source)
+    }
+}
+
+impl ContextWindowProbe {
+    /// Note that a served call's prompt was this many tokens.
+    ///
+    /// The upstream answered, so its window is at least this large — that is a
+    /// measurement, and the only one available on the successful side. Zero
+    /// means the upstream reported no count (some faces do not fill
+    /// `usage.input`), and then nothing is learned: a zero prompt is not
+    /// evidence of a small window.
+    ///
+    /// 记在答话的那只型号名下：它证明的是这只型号的窗口有多大。
+    pub fn note_accepted(&self, model: Option<&str>, prompt_tokens: u64) {
+        if prompt_tokens == 0 {
+            return;
+        }
+        let mut held = self
+            .measurements
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let bucket = held.bucket_mut(model);
+        bucket.accepted_max = bucket.accepted_max.max(prompt_tokens);
+    }
+
+    /// Note that a refusal named the upstream's limit.
+    ///
+    /// The smallest stated limit for *this model* is kept rather than the
+    /// newest: the same model may sit behind several upstreams, and a prompt
+    /// that fits the largest of them is still refused by the smallest — so the
+    /// number that keeps the budget usable without being refused is the
+    /// minimum. A limit another model stated says nothing here.
+    pub fn note_limit(&self, model: Option<&str>, limit_tokens: u64) {
+        if limit_tokens == 0 {
+            return;
+        }
+        let mut held = self
+            .measurements
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let bucket = held.bucket_mut(model);
+        bucket.limit_min = Some(match bucket.limit_min {
+            Some(held) => held.min(limit_tokens),
+            None => limit_tokens,
+        });
+    }
+
+    /// 记下上游回报的型号在厂商规格里公布的窗口。
+    ///
+    /// 覆盖而不是取小：换了一只型号，起点就该跟着换。真正压住它的是
+    /// [`Self::note_limit`] 那条实测，`decision_for` 里更紧的那个界永远说了算。
+    pub fn note_published(&self, model: Option<&str>, window_tokens: u64) {
+        if window_tokens == 0 {
+            return;
+        }
+        let mut held = self
+            .measurements
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        held.bucket_mut(model).published = Some(window_tokens);
+    }
+
+    /// 规格里查到的那个窗口（`None` = 还没查到，不是 0）。
+    pub fn published(&self, model: Option<&str>) -> Option<u64> {
+        self.measurements
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reading(model)
+            .published
+    }
+
+    /// The window the given model should trim to, and which input decided it.
+    ///
+    /// The starting point is, in order: the model's published spec (once an
+    /// upstream has named it), the configured value otherwise. Neither is an
+    /// authority — nothing in this tree knows the upstream's actual window —
+    /// and once a measurement exists the measurement wins in both directions:
+    /// the accepted size raises a starting point that was too small, and a
+    /// stated limit lowers one that was too large.
+    ///
+    /// Only this model's measurements are read. The same model behind several
+    /// upstreams still takes the minimum stated limit, because any call may
+    /// land on the smaller one; a limit *another* model stated is not read at
+    /// all, because with per-session model choice it says nothing about this
+    /// one. `model` of `None` reads only the bucket for calls whose upstream
+    /// never named a model.
+    ///
+    /// `declared` of `None` means the caller stated no window at all; with no
+    /// published spec either, the answer is `None`, which callers read as "no
+    /// budget stated" (the unscoped context grows and the first refusal — which
+    /// names the real limit for every vendor shape in
+    /// [`cog_core::context_limit_from_refusal`] — closes the loop). `None` is
+    /// never a window of zero tokens.
+    pub fn decision_for(
+        &self,
+        model: Option<&str>,
+        declared: Option<usize>,
+    ) -> (Option<usize>, ContextWindowSource) {
+        let held = self
+            .measurements
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reading(model);
+        let (mut window, mut source) = match held.published {
+            Some(published) => (Some(published), ContextWindowSource::PublishedSpec),
+            None => (
+                declared.map(|declared| declared as u64),
+                ContextWindowSource::Unstated,
+            ),
+        };
+        if held.accepted_max > window.unwrap_or(0) {
+            window = Some(held.accepted_max);
+            source = ContextWindowSource::MeasuredAccepted;
+        }
+        if let Some(limit) = held.limit_min {
+            // 还没说过窗口时，任何具名的界都比「没说」更贴近事实。
+            if window.is_none_or(|window| limit < window) {
+                window = Some(limit);
+                source = ContextWindowSource::MeasuredLimit;
+            }
+        }
+        (
+            window.map(|window| window.min(usize::MAX as u64) as usize),
+            source,
+        )
+    }
+
+    /// The measurements as they stand: `(accepted_max, limit_min)`.
+    ///
+    /// For the reading surface: a zero accepted size and a `None` limit are
+    /// "not measured yet", and a series that shows the numbers as they are is
+    /// what keeps the bootstrap readable as a bootstrap.
+    pub fn measurements(&self, model: Option<&str>) -> (u64, Option<u64>) {
+        let held = self
+            .measurements
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reading(model);
+        (held.accepted_max, held.limit_min)
+    }
+}
+
+/// Push `value` into `window`, dropping the oldest entry once it is full.
+fn push_bounded(window: &mut VecDeque<u32>, value: u32) {
+    if window.len() == BUDGET_SAMPLE_WINDOW {
+        window.pop_front();
+    }
+    window.push_back(value);
+}
+
+/// The ceiling a sample of delivered runs supports: the ninetieth percentile
+/// (how long this work usually takes) plus one typical run (the mean, room for
+/// work slightly harder than anything seen). Both terms move with the sample.
+fn calibrated_ceiling(mut sample: Vec<u32>) -> u32 {
+    let admitted = ninetieth_percentile(&mut sample);
+    let sum: u32 = sample.iter().sum();
+    let typical = sum.div_ceil(sample.len() as u32);
+    admitted.saturating_add(typical)
 }
 
 /// The ninetieth percentile of a sample of delivered run lengths, nearest rank.
@@ -619,6 +1173,36 @@ impl Observable for AgentObservable {
             "agent_total_tool_calls",
             self.total_tool_calls.load(Ordering::Relaxed) as f64,
         ));
+
+        // 每一轮跑完都记下待遇的两半由谁决定：活自己声明的是哪一态，轮次上限由
+        // 操作者钉的数还是这个进程的实测样本给出。运行总数是分母——这两族逐个
+        // 来源加起来应当等于它，少了就是有运行没记下自己的决定。
+        //
+        // 写「见过的那些格」而不是每次都写全零：一个从没出现过的来源在这一刻
+        // 是零，但 scrape 之间它可能刚发生又刚翻页，写零会把「发生过」抹成
+        // 「没发生」。没写过的那一格读作「这进程里没发生过」，这正是对的。
+        for (state, count) in self
+            .decisions_by_declaration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+        {
+            metrics.push(
+                RawMetric::new("agent_runs_by_declaration", *count as f64)
+                    .with_label(crate::LABEL_DECLARATION, state.as_str()),
+            );
+        }
+        for (source, count) in self
+            .decisions_by_ceiling
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+        {
+            metrics.push(
+                RawMetric::new("agent_runs_by_ceiling", *count as f64)
+                    .with_label(crate::LABEL_CEILING_SOURCE, source.as_str()),
+            );
+        }
 
         // The iteration ceiling is decided per role, so the reading of it has
         // to be per role too: a single process-wide number here could not tell
@@ -865,6 +1449,137 @@ impl Observable for AgentObservable {
 mod tests {
     use super::*;
 
+    /// 一律按「活自己声明了什么、上限谁给的」记账：三样决定者的第一样与第三样
+    /// 每轮都要在读数里留下自己那一格。
+    ///
+    /// 漏记是这条读数的坏法：某一格变小，在读数面上与「这种运行本来就更少」
+    /// 长得一样。所以两个方向都判——每个来源的格子数对得上，且加起来等于运行
+    /// 总数，没有哪一轮漏报了自己的决定。
+    #[tokio::test]
+    async fn every_run_names_the_declaration_and_the_ceiling_that_decided_it() {
+        let o = AgentObservable::new();
+        let decided = |declaration, ceiling| RunDecision {
+            declaration,
+            ceiling,
+        };
+        o.record_run(
+            "employee-1",
+            "generator",
+            RunOutcome::Delivered,
+            RunCost {
+                iterations: 4,
+                steps: 9,
+                tool_calls: 3,
+            },
+            decided(
+                cog_core::DeclarationState::Stated,
+                CeilingSource::MeasuredOwn,
+            ),
+        );
+        o.record_run(
+            "employee-1",
+            "generator",
+            RunOutcome::Delivered,
+            RunCost {
+                iterations: 4,
+                steps: 9,
+                tool_calls: 3,
+            },
+            decided(
+                cog_core::DeclarationState::Stated,
+                CeilingSource::MeasuredOwn,
+            ),
+        );
+        o.record_run(
+            "employee-1",
+            "evaluator",
+            RunOutcome::BudgetExhausted,
+            RunCost {
+                iterations: 10,
+                steps: 12,
+                tool_calls: 2,
+            },
+            decided(
+                cog_core::DeclarationState::Unstated,
+                CeilingSource::Unmeasured,
+            ),
+        );
+
+        let metrics = o.collect_metrics("").await.expect("collect_metrics");
+        let by_label = |name: &str, key: &str| -> HashMap<String, f64> {
+            metrics
+                .iter()
+                .filter(|m| m.name == name)
+                .map(|m| (m.labels.get(key).cloned().unwrap_or_default(), m.value))
+                .collect()
+        };
+
+        let declarations = by_label("agent_runs_by_declaration", crate::LABEL_DECLARATION);
+        assert_eq!(declarations.get("stated"), Some(&2.0), "{declarations:?}");
+        assert_eq!(declarations.get("unstated"), Some(&1.0), "{declarations:?}");
+
+        let ceilings = by_label("agent_runs_by_ceiling", crate::LABEL_CEILING_SOURCE);
+        assert_eq!(ceilings.get("measured_own"), Some(&2.0), "{ceilings:?}");
+        assert_eq!(ceilings.get("unmeasured"), Some(&1.0), "{ceilings:?}");
+
+        let runs = metrics
+            .iter()
+            .find(|m| m.name == "agent_run_count")
+            .map(|m| m.value)
+            .expect("agent_run_count");
+        let declared: f64 = declarations.values().sum();
+        let decided_by: f64 = ceilings.values().sum();
+        assert_eq!(
+            (declared, decided_by),
+            (runs, runs),
+            "有运行没记下自己的决定：运行 {runs}，按声明记下 {declared}，按上限来源记下 {decided_by}"
+        );
+    }
+
+    /// 上限的来源与上限本身是同一次判定：没人钉数、也没有交卷样本时，上限是
+    /// 「没有」，读数是 `unmeasured`，不是「实测给出一个很大的数」。
+    #[test]
+    fn an_empty_sample_with_no_stated_ceiling_reads_as_unmeasured() {
+        let o = AgentObservable::new();
+        assert_eq!(
+            o.iteration_budget_decision_for(u32::MAX, "employee-1"),
+            (u32::MAX, CeilingSource::Unmeasured)
+        );
+        assert_eq!(
+            o.iteration_budget_decision_for(25, "employee-1"),
+            (25, CeilingSource::Operated)
+        );
+
+        o.record_run(
+            "employee-1",
+            "generator",
+            RunOutcome::Delivered,
+            RunCost {
+                iterations: 6,
+                steps: 9,
+                tool_calls: 3,
+            },
+            RunDecision {
+                declaration: cog_core::DeclarationState::Unstated,
+                ceiling: CeilingSource::Unmeasured,
+            },
+        );
+        let (value, source) = o.iteration_budget_decision_for(u32::MAX, "employee-1");
+        assert_eq!(source, CeilingSource::MeasuredOwn);
+        assert!(value > 6, "实测给出的上限要容得下交过的那一轮：{value}");
+
+        // 同一个进程里另一个还没有自己样本的员工，读到的是进程样本，来源分得开。
+        let (inherited, inherited_source) = o.iteration_budget_decision_for(u32::MAX, "employee-2");
+        assert_eq!(inherited_source, CeilingSource::MeasuredProcess);
+        assert_eq!(inherited, value, "自己的样本还没有时，先用这个进程的读数");
+
+        // 钉了数就还是钉的数，有样本也一样。
+        assert_eq!(
+            o.iteration_budget_decision_for(25, "employee-1"),
+            (25, CeilingSource::Operated)
+        );
+    }
+
     /// The collector asks an observable that declares no dimensions once, with
     /// an empty name; that is the only call this observable ever answers.
     async fn readings(o: &AgentObservable) -> (f64, f64, f64) {
@@ -892,8 +1607,13 @@ mod tests {
     async fn an_emptied_role_is_written_as_zero_rather_than_left_out() {
         let o = AgentObservable::new();
         let now = std::time::Instant::now();
-        o.publish_roster(vec![("planner".to_string(), now, true)]);
-        o.publish_roster(Vec::<(String, std::time::Instant, bool)>::new());
+        o.publish_roster(vec![(
+            "planner-1".to_string(),
+            "planner".to_string(),
+            now,
+            true,
+        )]);
+        o.publish_roster(Vec::<(String, String, std::time::Instant, bool)>::new());
 
         let metrics = o.collect_metrics("").await.expect("collect_metrics");
         let count = metrics
@@ -924,8 +1644,13 @@ mod tests {
         let o = AgentObservable::new();
         let now = std::time::Instant::now();
         o.publish_roster(vec![
-            ("planner".to_string(), now, true),
-            ("mode_selector".to_string(), now, false),
+            ("planner-1".to_string(), "planner".to_string(), now, true),
+            (
+                "mode-selector".to_string(),
+                "mode_selector".to_string(),
+                now,
+                false,
+            ),
         ]);
 
         let metrics = o.collect_metrics("").await.expect("collect_metrics");
@@ -961,9 +1686,14 @@ mod tests {
         let now = std::time::Instant::now();
         let long_lived = now - std::time::Duration::from_secs(30);
         o.publish_roster(vec![
-            ("planner".to_string(), now, true),
-            ("planner".to_string(), now, true),
-            ("planner".to_string(), long_lived, false),
+            ("planner-1".to_string(), "planner".to_string(), now, true),
+            ("planner-2".to_string(), "planner".to_string(), now, true),
+            (
+                "planner-3".to_string(),
+                "planner".to_string(),
+                long_lived,
+                false,
+            ),
         ]);
 
         let metrics = o.collect_metrics("").await.expect("collect_metrics");
@@ -1085,7 +1815,17 @@ mod tests {
     async fn a_run_that_spent_its_budget_is_counted_as_an_exhaustion_not_a_success() {
         let o = AgentObservable::new();
         o.note_budget_exhausted("generator");
-        o.record_run("generator", RunOutcome::BudgetExhausted, 10, 21, 12);
+        o.record_run(
+            "employee-1",
+            "generator",
+            RunOutcome::BudgetExhausted,
+            RunCost {
+                iterations: 10,
+                steps: 21,
+                tool_calls: 12,
+            },
+            RunDecision::no_declaration(),
+        );
 
         let (runs, successes, exhausted) = readings(&o).await;
         assert_eq!(runs, 1.0);
@@ -1104,11 +1844,15 @@ mod tests {
         let o = AgentObservable::new();
         o.note_budget_exhausted("generator");
         o.record_run(
+            "employee-1",
             "generator",
             RunOutcome::DeliveredAfterExhaustion,
-            11,
-            21,
-            12,
+            RunCost {
+                iterations: 11,
+                steps: 21,
+                tool_calls: 12,
+            },
+            RunDecision::no_declaration(),
         );
 
         let (runs, successes, exhausted) = readings(&o).await;
@@ -1124,14 +1868,18 @@ mod tests {
         let o = AgentObservable::new();
         o.note_budget_exhausted("generator");
         o.record_run(
+            "employee-1",
             "generator",
             RunOutcome::DeliveredAfterExhaustion,
-            11,
-            21,
-            12,
+            RunCost {
+                iterations: 11,
+                steps: 21,
+                tool_calls: 12,
+            },
+            RunDecision::no_declaration(),
         );
         assert_eq!(
-            o.iteration_budget_for("generator", 10),
+            o.iteration_budget_for(10, "employee-1"),
             10,
             "在上限处被截断的运行，不能是「上限太低」的证据"
         );
@@ -1140,7 +1888,17 @@ mod tests {
     #[tokio::test]
     async fn a_run_that_delivered_an_answer_is_counted_as_a_success() {
         let o = AgentObservable::new();
-        o.record_run("generator", RunOutcome::Delivered, 3, 7, 2);
+        o.record_run(
+            "employee-1",
+            "generator",
+            RunOutcome::Delivered,
+            RunCost {
+                iterations: 3,
+                steps: 7,
+                tool_calls: 2,
+            },
+            RunDecision::no_declaration(),
+        );
 
         let (runs, successes, exhausted) = readings(&o).await;
         assert_eq!(runs, 1.0);
@@ -1151,12 +1909,22 @@ mod tests {
     /// 没有任何观测就该原样用调用方给的种子：凭一个没看见过的事实改数字，
     /// 只是把猜数换了个地方猜。
     #[test]
-    fn a_role_with_no_completed_run_keeps_the_seed_budget() {
+    fn a_pool_with_no_completed_run_keeps_the_seed_budget() {
         let o = AgentObservable::new();
-        assert_eq!(o.iteration_budget_for("generator", 10), 10);
+        assert_eq!(o.iteration_budget_for(10, "employee-1"), 10);
         // 只有被截断的运行也不是"跑完过"的证据：它没交卷，也就没说需要多少轮。
-        o.record_run("generator", RunOutcome::BudgetExhausted, 10, 21, 12);
-        assert_eq!(o.iteration_budget_for("generator", 10), 10);
+        o.record_run(
+            "employee-1",
+            "generator",
+            RunOutcome::BudgetExhausted,
+            RunCost {
+                iterations: 10,
+                steps: 21,
+                tool_calls: 12,
+            },
+            RunDecision::no_declaration(),
+        );
+        assert_eq!(o.iteration_budget_for(10, "employee-1"), 10);
     }
 
     /// 调用方没写上限时（`u32::MAX` 就是"这里没写天花板"的拼法），标定不能被它
@@ -1166,18 +1934,30 @@ mod tests {
     fn an_unstated_ceiling_takes_the_calibration_instead_of_discarding_it() {
         let o = AgentObservable::new();
         for _ in 0..4 {
-            o.record_run("generator", RunOutcome::Delivered, 12, 21, 12);
+            o.record_run(
+                "employee-1",
+                "generator",
+                RunOutcome::Delivered,
+                RunCost {
+                    iterations: 12,
+                    steps: 21,
+                    tool_calls: 12,
+                },
+                RunDecision::no_declaration(),
+            );
         }
         // 最长 12 + 均值 12。
         assert_eq!(
-            o.iteration_budget_for("generator", u32::MAX),
+            o.iteration_budget_for(u32::MAX, "employee-1"),
             24,
             "没写上限不等于不要上限：测到的那一份就是上限"
         );
-        // 写死的种子照旧压过标定，操作者的决定不由标定推翻。
-        assert_eq!(o.iteration_budget_for("generator", 40), 40);
-        // 比标定小的种子仍是「已知形状放不下」，标定把它抬起来。
-        assert_eq!(o.iteration_budget_for("generator", 3), 24);
+        // 写下的数照原样用，写大了也一样。
+        assert_eq!(o.iteration_budget_for(40, "employee-1"), 40);
+        // 写小了也照原样用：这个数现在是操作者对本部署的决定，不是某一行的
+        // 数。标定只在没有人写过上限的时候回答。上限绑得太紧由「撞墙」那条
+        // 读数说，不靠标定悄悄改写一个人的决定。
+        assert_eq!(o.iteration_budget_for(3, "employee-1"), 3);
     }
 
     /// 一次都没交付过的时候，没写上限就仍然是没有上限：这时没有测到任何数，
@@ -1185,28 +1965,48 @@ mod tests {
     #[test]
     fn an_unstated_ceiling_stays_unstated_until_something_is_measured() {
         let o = AgentObservable::new();
-        assert_eq!(o.iteration_budget_for("generator", u32::MAX), u32::MAX);
-        o.record_run("generator", RunOutcome::BudgetExhausted, 10, 21, 12);
-        assert_eq!(o.iteration_budget_for("generator", u32::MAX), u32::MAX);
+        assert_eq!(o.iteration_budget_for(u32::MAX, "employee-1"), u32::MAX);
+        o.record_run(
+            "employee-1",
+            "generator",
+            RunOutcome::BudgetExhausted,
+            RunCost {
+                iterations: 10,
+                steps: 21,
+                tool_calls: 12,
+            },
+            RunDecision::no_declaration(),
+        );
+        assert_eq!(o.iteration_budget_for(u32::MAX, "employee-1"), u32::MAX);
     }
 
-    /// 上限必须容得下这个角色**已经交付过**的轮数，否则它不是安全线而是缺陷：
+    /// 上限必须容得下这个进程**已经交付过**的轮数，否则它不是安全线而是缺陷：
     /// 一个已知形状的运行会被砍在半路，而且砍掉是全额的——什么都没产出，
     /// 花掉的却全花了。
     #[test]
-    fn the_ceiling_admits_the_longest_run_this_role_has_delivered() {
+    fn the_ceiling_admits_the_longest_run_this_process_has_delivered() {
         let o = AgentObservable::new();
         for iterations in [6, 8] {
-            o.record_run("generator", RunOutcome::Delivered, iterations, 20, 5);
+            o.record_run(
+                "employee-1",
+                "generator",
+                RunOutcome::Delivered,
+                RunCost {
+                    iterations,
+                    steps: 20,
+                    tool_calls: 5,
+                },
+                RunDecision::no_declaration(),
+            );
         }
-        let budget = o.iteration_budget_for("generator", 10);
+        let budget = o.iteration_budget_for(u32::MAX, "employee-1");
         assert!(
             budget > 8,
             "the ceiling must clear the longest completed run: {budget}"
         );
         assert!(
             budget > 10,
-            "two delivered runs of 6 and 8 say the seed was binding, not that 10 is right: {budget}"
+            "two delivered runs of 6 and 8 say the shape is longer than that: {budget}"
         );
     }
 
@@ -1217,10 +2017,30 @@ mod tests {
     fn one_outlier_does_not_raise_every_runs_ceiling() {
         let o = AgentObservable::new();
         for _ in 0..18 {
-            o.record_run("generator", RunOutcome::Delivered, 5, 20, 4);
+            o.record_run(
+                "employee-1",
+                "generator",
+                RunOutcome::Delivered,
+                RunCost {
+                    iterations: 5,
+                    steps: 20,
+                    tool_calls: 4,
+                },
+                RunDecision::no_declaration(),
+            );
         }
-        o.record_run("generator", RunOutcome::Delivered, 169, 20, 4);
-        let budget = o.iteration_budget_for("generator", u32::MAX);
+        o.record_run(
+            "employee-1",
+            "generator",
+            RunOutcome::Delivered,
+            RunCost {
+                iterations: 169,
+                steps: 20,
+                tool_calls: 4,
+            },
+            RunDecision::no_declaration(),
+        );
+        let budget = o.iteration_budget_for(u32::MAX, "employee-1");
         assert!(
             budget < 60,
             "an outlier must not become every run's ceiling: {budget}"
@@ -1231,15 +2051,209 @@ mod tests {
         );
     }
 
-    /// 读数按角色分开：另外一条角色的运行说不了这个角色需要多少轮。
+    /// 同一批运行，换一个标签写进去，读出来的上限是同一个数。
+    ///
+    /// 这是「换一个标签接，行为不变」在预算这一面上的量法：两个 observable 收
+    /// 到的是同样四次交付（20 轮），都由同一个员工交，只是记在 `generator` 与
+    /// `evaluator` 两个名字下。以前上限按角色存，这两个数会分叉——一个名字接手
+    /// 同一件活，天花板就换了；现在样本按员工存，标签只落在读数上。
     #[test]
-    fn one_roles_runs_do_not_set_another_roles_ceiling() {
+    fn a_different_label_does_not_move_the_ceiling() {
+        let labeled_generator = AgentObservable::new();
+        let labeled_evaluator = AgentObservable::new();
+        for _ in 0..4 {
+            labeled_generator.record_run(
+                "employee-1",
+                "generator",
+                RunOutcome::Delivered,
+                RunCost {
+                    iterations: 20,
+                    steps: 40,
+                    tool_calls: 8,
+                },
+                RunDecision::no_declaration(),
+            );
+            labeled_evaluator.record_run(
+                "employee-1",
+                "evaluator",
+                RunOutcome::Delivered,
+                RunCost {
+                    iterations: 20,
+                    steps: 40,
+                    tool_calls: 8,
+                },
+                RunDecision::no_declaration(),
+            );
+        }
+        assert_eq!(
+            labeled_generator.iteration_budget_for(u32::MAX, "employee-1"),
+            labeled_evaluator.iteration_budget_for(u32::MAX, "employee-1"),
+            "同一个进程同样的运行，标签不同，预算必须相同"
+        );
+        assert!(
+            labeled_generator.iteration_budget_for(u32::MAX, "employee-1") > 20,
+            "四次 20 轮的交付给出的是一个容得下它们的数，换个标签也一样"
+        );
+    }
+
+    /// 一个员工名下的运行，不因标签不同就分进两个窗口：同一个 observable 里
+    /// 同一个人换着标签交卷，轮数一起算。分窗口的那个键是员工，不是标签。
+    #[test]
+    fn runs_under_two_labels_share_one_sample() {
         let o = AgentObservable::new();
         for _ in 0..4 {
-            o.record_run("generator", RunOutcome::Delivered, 20, 40, 8);
+            o.record_run(
+                "employee-1",
+                "generator",
+                RunOutcome::Delivered,
+                RunCost {
+                    iterations: 6,
+                    steps: 20,
+                    tool_calls: 5,
+                },
+                RunDecision::no_declaration(),
+            );
         }
-        assert_eq!(o.iteration_budget_for("evaluator", 5), 5);
-        assert!(o.iteration_budget_for("generator", 10) > 10);
+        let one_label = o.iteration_budget_for(u32::MAX, "employee-1");
+        for _ in 0..4 {
+            o.record_run(
+                "employee-1",
+                "evaluator",
+                RunOutcome::Delivered,
+                RunCost {
+                    iterations: 30,
+                    steps: 20,
+                    tool_calls: 5,
+                },
+                RunDecision::no_declaration(),
+            );
+        }
+        let two_labels = o.iteration_budget_for(u32::MAX, "employee-1");
+        assert!(
+            two_labels > one_label,
+            "第二次记录必须落进同一个窗口并把它抬起来：{one_label} -> {two_labels}"
+        );
+    }
+
+    /// 待遇跟着人走：同一个进程里两个人交出不同形状的活，各自的上限就各自不同；
+    /// 第三个还没有自己样本的人先读进程的，读数上标得出来，等他交出第一轮就换。
+    ///
+    /// 「同一个座位换个人坐，待遇跟着变」在这里是反过来的：同一个座位（同一种活、
+    /// 同一个标签）换个人坐，他带的是自己那份交卷记录，不继承前任的。
+    #[test]
+    fn each_employee_brings_their_own_record_to_the_same_seat() {
+        let o = AgentObservable::new();
+        for _ in 0..6 {
+            o.record_run(
+                "quick-hand",
+                "generator",
+                RunOutcome::Delivered,
+                RunCost {
+                    iterations: 4,
+                    steps: 20,
+                    tool_calls: 5,
+                },
+                RunDecision::no_declaration(),
+            );
+            o.record_run(
+                "deep-hand",
+                "generator",
+                RunOutcome::Delivered,
+                RunCost {
+                    iterations: 40,
+                    steps: 200,
+                    tool_calls: 40,
+                },
+                RunDecision::no_declaration(),
+            );
+        }
+
+        let (quick, quick_source) = o.iteration_budget_decision_for(u32::MAX, "quick-hand");
+        let (deep, deep_source) = o.iteration_budget_decision_for(u32::MAX, "deep-hand");
+        assert_eq!(quick_source, CeilingSource::MeasuredOwn);
+        assert_eq!(deep_source, CeilingSource::MeasuredOwn);
+        assert_eq!(quick, 8, "六次 4 轮的交付：4 + 4");
+        assert_eq!(deep, 80, "六次 40 轮的交付：40 + 40");
+
+        // 新来的人坐同一个座位：先读进程的，来源是 measured_process。
+        let (inherited, inherited_source) = o.iteration_budget_decision_for(u32::MAX, "newcomer");
+        assert_eq!(inherited_source, CeilingSource::MeasuredProcess);
+        assert_eq!(
+            inherited,
+            40 + 22,
+            "进程窗口里两位都在：40 轮的第 90 百分位 + 22 的平均"
+        );
+
+        // 他交出第一轮之后，读的就是自己的了。
+        o.record_run(
+            "newcomer",
+            "generator",
+            RunOutcome::Delivered,
+            RunCost {
+                iterations: 6,
+                steps: 20,
+                tool_calls: 4,
+            },
+            RunDecision::no_declaration(),
+        );
+        let (own_now, own_source) = o.iteration_budget_decision_for(u32::MAX, "newcomer");
+        assert_eq!(own_source, CeilingSource::MeasuredOwn);
+        assert_eq!(own_now, 12, "自己那条 6 轮：6 + 6");
+    }
+
+    /// 员工走了，他的窗口跟着走：名册是唯一还认得这个 id 的地方，名册里没有他
+    /// 了，这份窗口就再也没有读者——留着它只会让同一个 id 再出现时继承一段
+    /// 已经不属于任何人的历史。
+    #[test]
+    fn an_employee_that_leaves_the_roster_takes_their_window_with_them() {
+        let o = AgentObservable::new();
+        let now = std::time::Instant::now();
+        o.publish_roster(vec![
+            ("departing".to_string(), "generator".to_string(), now, true),
+            ("staying".to_string(), "generator".to_string(), now, true),
+        ]);
+        for _ in 0..4 {
+            o.record_run(
+                "departing",
+                "generator",
+                RunOutcome::Delivered,
+                RunCost {
+                    iterations: 40,
+                    steps: 20,
+                    tool_calls: 4,
+                },
+                RunDecision::no_declaration(),
+            );
+            o.record_run(
+                "staying",
+                "generator",
+                RunOutcome::Delivered,
+                RunCost {
+                    iterations: 4,
+                    steps: 20,
+                    tool_calls: 4,
+                },
+                RunDecision::no_declaration(),
+            );
+        }
+        assert_eq!(o.iteration_budget_for(u32::MAX, "departing"), 80);
+
+        o.publish_roster(vec![(
+            "staying".to_string(),
+            "generator".to_string(),
+            now,
+            true,
+        )]);
+        assert_eq!(
+            o.iteration_budget_decision_for(u32::MAX, "departing").1,
+            CeilingSource::MeasuredProcess,
+            "走了的人还剩进程样本可读，但不是他自己的那一份了"
+        );
+        assert_eq!(
+            o.iteration_budget_decision_for(u32::MAX, "staying").1,
+            CeilingSource::MeasuredOwn,
+            "还在名册上的人，自己的窗口不受影响"
+        );
     }
 
     /// 窗口是有界的：上限只跟着最近一轮的样本走，不会把整个历史累加进内存，
@@ -1248,11 +2262,21 @@ mod tests {
     fn the_sample_window_stays_bounded_and_recent() {
         let o = AgentObservable::new();
         for _ in 0..(BUDGET_SAMPLE_WINDOW + 10) {
-            o.record_run("generator", RunOutcome::Delivered, 40, 80, 8);
+            o.record_run(
+                "employee-1",
+                "generator",
+                RunOutcome::Delivered,
+                RunCost {
+                    iterations: 40,
+                    steps: 80,
+                    tool_calls: 8,
+                },
+                RunDecision::no_declaration(),
+            );
         }
         // 40 * (window + 10) 如果全留下会把均值抬到 40，上限就成 80 了。
         assert_eq!(
-            o.iteration_budget_for("generator", 1),
+            o.iteration_budget_for(u32::MAX, "employee-1"),
             40 + 40,
             "the ceiling must be derived from the retained window, not the whole history"
         );
@@ -1264,9 +2288,19 @@ mod tests {
     fn only_completed_runs_raise_the_ceiling() {
         let o = AgentObservable::new();
         for _ in 0..50 {
-            o.record_run("generator", RunOutcome::BudgetExhausted, 10, 21, 12);
+            o.record_run(
+                "employee-1",
+                "generator",
+                RunOutcome::BudgetExhausted,
+                RunCost {
+                    iterations: 10,
+                    steps: 21,
+                    tool_calls: 12,
+                },
+                RunDecision::no_declaration(),
+            );
         }
-        assert_eq!(o.iteration_budget_for("generator", 10), 10);
+        assert_eq!(o.iteration_budget_for(10, "employee-1"), 10);
     }
 
     /// 每个角色的截断次数要能被读到：上限是不是在绑住某条路径，是这次改动
@@ -1277,9 +2311,29 @@ mod tests {
         // 撞墙记在判定的那一刻，终局记在 run 结束时——按真实顺序两件都走一遍。
         for _ in 0..2 {
             o.note_budget_exhausted("generator");
-            o.record_run("generator", RunOutcome::BudgetExhausted, 10, 21, 12);
+            o.record_run(
+                "employee-1",
+                "generator",
+                RunOutcome::BudgetExhausted,
+                RunCost {
+                    iterations: 10,
+                    steps: 21,
+                    tool_calls: 12,
+                },
+                RunDecision::no_declaration(),
+            );
         }
-        o.record_run("evaluator", RunOutcome::Delivered, 3, 7, 2);
+        o.record_run(
+            "employee-1",
+            "evaluator",
+            RunOutcome::Delivered,
+            RunCost {
+                iterations: 3,
+                steps: 7,
+                tool_calls: 2,
+            },
+            RunDecision::no_declaration(),
+        );
 
         let metrics = o.collect_metrics("D1").await.expect("collect_metrics");
         let exhausted = |role: &str| {
@@ -1308,15 +2362,29 @@ mod tests {
         let o = AgentObservable::new();
         for _ in 0..2 {
             o.note_budget_exhausted("generator");
-            o.record_run("generator", RunOutcome::BudgetExhausted, 10, 21, 12);
+            o.record_run(
+                "employee-1",
+                "generator",
+                RunOutcome::BudgetExhausted,
+                RunCost {
+                    iterations: 10,
+                    steps: 21,
+                    tool_calls: 12,
+                },
+                RunDecision::no_declaration(),
+            );
         }
         o.note_budget_exhausted("generator");
         o.record_run(
+            "employee-1",
             "generator",
             RunOutcome::DeliveredAfterExhaustion,
-            10,
-            21,
-            12,
+            RunCost {
+                iterations: 10,
+                steps: 21,
+                tool_calls: 12,
+            },
+            RunDecision::no_declaration(),
         );
 
         let metrics = o.collect_metrics("D1").await.expect("collect_metrics");
@@ -1345,12 +2413,52 @@ mod tests {
     #[tokio::test]
     async fn a_run_stopped_by_a_rule_is_counted_per_role_under_its_own_name() {
         let o = AgentObservable::new();
-        o.record_run("writer", RunOutcome::Refused, 2, 3, 2);
-        o.record_run("writer", RunOutcome::Refused, 2, 3, 2);
-        o.record_run("planner", RunOutcome::Delivered, 4, 9, 3);
+        o.record_run(
+            "employee-1",
+            "writer",
+            RunOutcome::Refused,
+            RunCost {
+                iterations: 2,
+                steps: 3,
+                tool_calls: 2,
+            },
+            RunDecision::no_declaration(),
+        );
+        o.record_run(
+            "employee-1",
+            "writer",
+            RunOutcome::Refused,
+            RunCost {
+                iterations: 2,
+                steps: 3,
+                tool_calls: 2,
+            },
+            RunDecision::no_declaration(),
+        );
+        o.record_run(
+            "employee-1",
+            "planner",
+            RunOutcome::Delivered,
+            RunCost {
+                iterations: 4,
+                steps: 9,
+                tool_calls: 3,
+            },
+            RunDecision::no_declaration(),
+        );
         // A budget ending must not land on this series: the two are different
         // findings and a reader that cannot separate them cannot act on either.
-        o.record_run("planner", RunOutcome::BudgetExhausted, 10, 21, 12);
+        o.record_run(
+            "employee-1",
+            "planner",
+            RunOutcome::BudgetExhausted,
+            RunCost {
+                iterations: 10,
+                steps: 21,
+                tool_calls: 12,
+            },
+            RunDecision::no_declaration(),
+        );
 
         let metrics = o.collect_metrics("D1").await.expect("collect_metrics");
         let read = |role: &str| {
@@ -1376,8 +2484,28 @@ mod tests {
     #[tokio::test]
     async fn the_published_set_is_exactly_the_cumulative_counters() {
         let o = AgentObservable::new();
-        o.record_run("generator", RunOutcome::Delivered, 3, 7, 2);
-        o.record_run("evaluator", RunOutcome::BudgetExhausted, 10, 21, 12);
+        o.record_run(
+            "employee-1",
+            "generator",
+            RunOutcome::Delivered,
+            RunCost {
+                iterations: 3,
+                steps: 7,
+                tool_calls: 2,
+            },
+            RunDecision::no_declaration(),
+        );
+        o.record_run(
+            "employee-1",
+            "evaluator",
+            RunOutcome::BudgetExhausted,
+            RunCost {
+                iterations: 10,
+                steps: 21,
+                tool_calls: 12,
+            },
+            RunDecision::no_declaration(),
+        );
 
         let mut names: Vec<String> = o
             .collect_metrics("")
@@ -1401,6 +2529,8 @@ mod tests {
                 "agent_iteration_budget_exhausted",
                 "agent_iteration_budget_exhausted_no_deliverable",
                 "agent_run_count",
+                "agent_runs_by_ceiling",
+                "agent_runs_by_declaration",
                 "agent_success_count",
                 "agent_total_steps",
                 "agent_total_tool_calls",
@@ -1541,14 +2671,18 @@ mod tests {
             cog_core::InboxMessage::Prompt {
                 goal: serde_json::Value::Null,
                 reply_stream: None,
+                from_agent: None,
+                intent: None,
             },
             cog_core::InboxMessage::Continue {
                 instruction: String::new(),
+                from_agent: None,
             },
             cog_core::InboxMessage::Abort,
             cog_core::InboxMessage::Reset,
             cog_core::InboxMessage::Steering {
                 instruction: String::new(),
+                from_agent: None,
             },
         ];
         let mut kinds: Vec<&'static str> = every.iter().map(inbox_kind).collect();
@@ -1557,5 +2691,188 @@ mod tests {
         let mut listed = INBOX_KINDS.to_vec();
         listed.sort_unstable();
         assert_eq!(kinds, listed);
+    }
+
+    /// Before anything is measured the bootstrap is in force, and the reading
+    /// says so. The two must stay distinguishable: a `measured_*` label on the
+    /// configured number would claim a measurement that never happened.
+    #[test]
+    fn with_no_measurement_the_bootstrap_stands_and_says_it_is_the_bootstrap() {
+        let o = AgentObservable::new();
+        assert_eq!(
+            o.context_window_decision_for(Some(64_000)),
+            (Some(64_000), ContextWindowSource::Unstated)
+        );
+        assert_eq!(o.context_measurements(), (0, None));
+    }
+
+    /// A prompt the upstream accepted proves the window is at least that
+    /// large. The bootstrap rises to it — that is the direction in which the
+    /// 1,563-repeated-request livelock is broken: the floor that exceeded the
+    /// configured window stops being over budget on the very next round.
+    #[test]
+    fn an_accepted_prompt_raises_a_bootstrap_that_was_too_small() {
+        let o = AgentObservable::new();
+        o.note_context_accepted(66_368);
+        assert_eq!(
+            o.context_window_decision_for(Some(64_000)),
+            (Some(66_368), ContextWindowSource::MeasuredAccepted)
+        );
+        // A smaller accepted prompt later does not undo it: the largest one is
+        // the evidence, and it does not expire because the next call was small.
+        o.note_context_accepted(1_000);
+        assert_eq!(o.context_window_decision_for(Some(64_000)).0, Some(66_368));
+        // An upstream that reports no count teaches nothing.
+        o.note_context_accepted(0);
+        assert_eq!(o.context_measurements().0, 66_368);
+    }
+
+    /// A refusal that names the limit is the upstream stating its own bound;
+    /// it lowers the budget, and the smallest statement is the one kept
+    /// because the pool may hold upstreams with different windows.
+    #[test]
+    fn a_named_limit_lowers_the_budget_and_the_smallest_statement_binds() {
+        let o = AgentObservable::new();
+        o.note_context_limit(200_000);
+        assert_eq!(
+            o.context_window_decision_for(Some(64_000)),
+            (Some(64_000), ContextWindowSource::Unstated),
+            "a limit above the bootstrap does not bind"
+        );
+        o.note_context_limit(32_000);
+        assert_eq!(
+            o.context_window_decision_for(Some(64_000)),
+            (Some(32_000), ContextWindowSource::MeasuredLimit)
+        );
+        // A later, larger statement does not raise it back: the pool still
+        // contains the smaller upstream.
+        o.note_context_limit(200_000);
+        assert_eq!(o.context_window_decision_for(Some(64_000)).0, Some(32_000));
+        // Even a bootstrap smaller than the limit is not raised by the limit;
+        // the limit is a ceiling, not a target.
+        let fresh = AgentObservable::new();
+        fresh.note_context_limit(200_000);
+        assert_eq!(
+            fresh.context_window_decision_for(Some(16_000)).0,
+            Some(16_000)
+        );
+    }
+
+    /// The measured limit wins over the accepted size when the two disagree:
+    /// the accepted size came from an upstream with more room, and every call
+    /// may land on the one that stated less.
+    #[test]
+    fn a_limit_below_an_accepted_size_still_binds() {
+        let o = AgentObservable::new();
+        o.note_context_accepted(66_368);
+        o.note_context_limit(50_000);
+        assert_eq!(
+            o.context_window_decision_for(Some(64_000)),
+            (Some(50_000), ContextWindowSource::MeasuredLimit)
+        );
+    }
+
+    /// 型号的公布规格是起点，而且在读数面上与实测分得开。
+    ///
+    /// 「厂商说过 200,000」与「这里量到 200,000」是两件事：前者换了型号就会变，
+    /// 后者是这个池子的实测。测量压过规格，规格压过配置里的数——而配置里的 0
+    /// 不是「零个 token 的窗口」，是「没人说过」。
+    #[test]
+    fn a_published_window_is_a_starting_point_and_measurements_still_win() {
+        let o = AgentObservable::new();
+        o.note_context_published(200_000);
+        assert_eq!(
+            o.context_window_decision_for(None),
+            (Some(200_000), ContextWindowSource::PublishedSpec)
+        );
+        // 规格说了就不再靠声明的那个数；声明值只兜底。
+        assert_eq!(
+            o.context_window_decision_for(Some(64_000)),
+            (Some(200_000), ContextWindowSource::PublishedSpec)
+        );
+        // 上游自述的界压过规格。
+        o.note_context_limit(150_000);
+        assert_eq!(
+            o.context_window_decision_for(None),
+            (Some(150_000), ContextWindowSource::MeasuredLimit)
+        );
+        // 换了型号，起点跟着换；实测的界仍然说了算。
+        o.note_context_published(1_048_576);
+        assert_eq!(o.context_window_decision_for(None).0, Some(150_000));
+        assert_eq!(o.context_published(), Some(1_048_576));
+    }
+
+    /// 什么都没有时窗口是「没人说过」，不是 0：任何具名的界都比它更贴近事实，
+    /// 而不是被一个假的 0 挡在比较之外。
+    #[test]
+    fn an_unstated_window_is_not_a_window_of_zero_tokens() {
+        let o = AgentObservable::new();
+        assert_eq!(
+            o.context_window_decision_for(None),
+            (None, ContextWindowSource::Unstated)
+        );
+        o.note_context_limit(128_000);
+        assert_eq!(
+            o.context_window_decision_for(None),
+            (Some(128_000), ContextWindowSource::MeasuredLimit)
+        );
+    }
+
+    /// 一只型号量到的数不压另一只型号的窗口。
+    ///
+    /// 设置页让每段对话挑一只型号，同一个进程里可以同时跑着窗口差一个数量级的
+    /// 两只。甲被拒时自述的是甲的界；把它算进乙，乙的窗口就被按到了甲那儿。
+    #[test]
+    fn one_models_measurement_does_not_lower_another_models_window() {
+        let o = AgentObservable::new();
+        let probe = o.context_probe();
+        probe.note_limit(Some("small-model"), 32_000);
+        probe.note_accepted(Some("big-model"), 900_000);
+        probe.note_published(Some("big-model"), 1_048_576);
+        assert_eq!(
+            probe.decision_for(Some("big-model"), None),
+            (Some(1_048_576), ContextWindowSource::PublishedSpec),
+            "小那只型号自述的界不是大这只的界"
+        );
+        // 型号比对不认大小写，上游换个拼写不该换一桶。
+        assert_eq!(
+            probe.decision_for(Some("BIG-MODEL"), None),
+            (Some(1_048_576), ContextWindowSource::PublishedSpec)
+        );
+        assert_eq!(
+            probe.decision_for(Some("small-model"), None),
+            (Some(32_000), ContextWindowSource::MeasuredLimit),
+            "它自己的界仍然说了算"
+        );
+    }
+}
+
+#[cfg(test)]
+mod narrower_than_tests {
+    use super::ContextWindowSource;
+
+    /// 型号说了 200K 而预算还在 64K：这是「按一个更小的数在裁」，要能问出来。
+    #[test]
+    fn a_published_spec_below_the_budget_in_use_is_reported() {
+        assert!(ContextWindowSource::PublishedSpec.narrower_than(Some(200_000), 64_000));
+        assert!(!ContextWindowSource::PublishedSpec.narrower_than(Some(200_000), 200_000));
+        assert!(!ContextWindowSource::PublishedSpec.narrower_than(Some(32_000), 64_000));
+    }
+
+    /// 另外三种来源都不是这条告警：实测过的那个数就是预算，没有人说过就没有界。
+    #[test]
+    fn the_other_sources_never_answer_yes() {
+        for source in [
+            ContextWindowSource::MeasuredAccepted,
+            ContextWindowSource::MeasuredLimit,
+            ContextWindowSource::Unstated,
+        ] {
+            assert!(
+                !source.narrower_than(Some(1), 1_000_000),
+                "{} 不该触发「型号比预算小」",
+                source.as_str()
+            );
+        }
+        assert!(!ContextWindowSource::PublishedSpec.narrower_than(None, 64_000));
     }
 }

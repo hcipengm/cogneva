@@ -1,4 +1,5 @@
 use crate::common;
+use crate::common::supervisor::make_agent;
 
 use common::orchestrator::control;
 
@@ -6,24 +7,10 @@ use chrono::Utc;
 use cog_core::{AgentState, StateBackend, Task, TaskCheckpoint, TaskType};
 use cog_storage::MemoryStateBackend;
 use cog_supervisor::lifecycle_coordinator::RecoveredCheckpoint;
-use cog_supervisor::registry::{AgentInfo, AgentRegistry};
+use cog_supervisor::registry::AgentRegistry;
 use cog_supervisor::task_rebalancer::{TaskRebalancer, TaskRebalancerConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
-
-fn make_agent(id: &str) -> AgentInfo {
-    let now = Utc::now();
-    AgentInfo {
-        agent_id: id.into(),
-        role: None,
-        crew_id: None,
-        squad_id: None,
-        task_ids: Vec::new(),
-        last_heartbeat: now,
-        state_since: now,
-        registered_at: now,
-    }
-}
 
 #[tokio::test]
 async fn empty_orchestrator_yields_empty_plan() {
@@ -39,8 +26,8 @@ async fn empty_orchestrator_yields_empty_plan() {
 #[tokio::test]
 async fn ready_tasks_get_distributed_across_agents() {
     let reg = Arc::new(AgentRegistry::new());
-    reg.register_agent(make_agent("agent-1"));
-    reg.register_agent(make_agent("agent-2"));
+    reg.register_agent(common::orchestrator::agent("agent-1"));
+    reg.register_agent(common::orchestrator::agent("agent-2"));
 
     let backend: Arc<dyn StateBackend> = Arc::new(MemoryStateBackend::new());
     backend
@@ -81,7 +68,7 @@ async fn ready_tasks_get_distributed_across_agents() {
 #[tokio::test]
 async fn dead_agent_is_skipped() {
     let reg = Arc::new(AgentRegistry::new());
-    reg.register_agent(make_agent("agent-1"));
+    reg.register_agent(common::orchestrator::agent("agent-1"));
 
     let backend: Arc<dyn StateBackend> = Arc::new(MemoryStateBackend::new());
     backend
@@ -107,7 +94,7 @@ async fn dead_agent_is_skipped() {
 #[tokio::test]
 async fn overloaded_agent_is_flagged() {
     let reg = Arc::new(AgentRegistry::new());
-    reg.register_agent(make_agent("agent-1"));
+    reg.register_agent(common::orchestrator::agent("agent-1"));
 
     let backend: Arc<dyn StateBackend> = Arc::new(MemoryStateBackend::new());
     backend
@@ -208,7 +195,7 @@ async fn recovery_plan_includes_relevant_checkpoints() {
 #[tokio::test]
 async fn a_task_already_offered_to_the_queue_is_not_rebalanced_again() {
     let reg = Arc::new(AgentRegistry::new());
-    reg.register_agent(make_agent("agent-1"));
+    reg.register_agent(common::orchestrator::agent("agent-1"));
 
     let backend: Arc<dyn StateBackend> = Arc::new(MemoryStateBackend::new());
     backend

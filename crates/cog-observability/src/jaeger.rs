@@ -95,7 +95,7 @@ impl JaegerExporter {
         if buf.len() >= self.max_batch_size {
             let batch = std::mem::replace(&mut *buf, Vec::with_capacity(self.max_batch_size));
             drop(buf);
-            let _ = self.flush(batch);
+            cog_core::ignore_lost!(self.flush(batch));
         }
     }
 

@@ -16,8 +16,20 @@ use crate::SFResult;
 /// Larger than the forty messages the model is shown as context, because the
 /// two bounds answer different questions: the context window is what fits in a
 /// request, and this is how far back a reader can still see what was said.
-// cap: bound — 上下文窗管的是「一次请求装得下多少」，这个管的是「读者还能往回看多远」
+// cap: fixed — 上下文窗管的是「一次请求装得下多少」，这个管的是「读者还能往回看多远」
+// keep: 删掉后读者往回看的深度没有界，历史在列表里消失；由「读者还能往回看多远」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 pub const ROWS_KEPT_PER_SESSION: i64 = 200;
+
+/// 界面刷新一轮的周期。判「存储还跟不跟得上」时，写入延迟的 p99 与它的一半比。
+///
+/// 这个数不是后端的旋钮：它由界面自己定（`web/src/hooks/useResource.ts` 的默认
+/// 轮询间隔），后端读不到浏览器里的那个值，所以只能按协议常量收在这一处，
+/// 由一条跨树的门把它与界面源码里那个数钉在一起。浏览器把周期改了而这里没改，
+/// 判词的线就跟着错。
+// cap: fixed — 界面自己的轮询周期，由 `web/src/hooks/useResource.ts` 的默认值给定
+// keep: 删掉后写入延迟的判词没有可比的那条线；由这条协议约定兜住
+pub const UI_REFRESH_MS: u64 = 30_000;
 
 /// Who said one line of the transcript.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,12 +59,82 @@ impl ChatTurnRole {
     }
 }
 
+/// 一条随用户消息上来的附件（图片 / PDF / 音频 / 视频）。
+///
+/// 字节按 base64 存：它就是媒体块在上下文里的形状（`ContentBlock::Media`），
+/// 在这里解码只会多一份中间物，而解出来的字节下一步又要在协议边缘被编回去。
+///
+/// 它随那一行记录一起落库，因为「历史装配带上媒体」要求的正是这件事：重开一段
+/// 对话，后面几轮问的还是同一张图，那张图必须还在模型看得见的地方。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChatAttachment {
+    /// 文件名，只用来让人认出这一条。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 例如 `image/png`、`application/pdf`。
+    pub mime_type: String,
+    /// base64 编码的字节。
+    pub data: String,
+}
+
 /// One line of the transcript, oldest first when returned by
 /// [`ChatTurnStore::history`].
+///
+/// `content` 是**交给模型的那一份**：一句以 `/名字` 打头的命令，人在界面上打的是
+/// `/web-research 查一下`，模型看到的是展开后的那份说明。两者不同的地方只在这一
+/// 句是命令时；记录里另有一列存人打的那一行，给读记录的人看（[`ChatTurnRecord`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatTurn {
     pub role: ChatTurnRole,
     pub content: String,
+    /// 随这一句上来的附件。assistant 那一行永远是空的：回答里的图是模型写的，
+    /// 不是人递进来的。
+    pub attachments: Vec<ChatAttachment>,
+}
+
+/// A transcript line as a reader reopens it, with the attachments' identity but
+/// not their bytes: the page names what was sent, and the bytes stay where the
+/// prompt reads them from.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChatAttachmentInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub mime_type: String,
+}
+
+/// How one tool call ended. `Running` is a call the answer was written before it
+/// came back -- the turn is recorded when the reply is, not when the last tool
+/// settles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatToolCallStatus {
+    Running,
+    Ok,
+    Error,
+}
+
+/// One tool call that ran while an answer was being written.
+///
+/// Kept with the transcript because the panel that shows it -- the todo list a
+/// conversation maintains -- is part of the conversation, not of the connection:
+/// close the page and reopen it, and the list must still be there. `args` and
+/// `result` are the JSON text the live frames carried rather than values: they
+/// are compared against what the page drew live, and re-encoding a value on the
+/// way out would let the two differ in spacing or key order while claiming to be
+/// the same call.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChatToolCall {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    #[serde(default)]
+    pub args: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    pub status: ChatToolCallStatus,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// When it came back, when it did before the turn was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// One line of the transcript as a reader shows it: with the row's identity, its
@@ -77,7 +159,37 @@ pub struct ChatTurnRecord {
     /// see the goal on the live frame loses that distinction exactly when it is
     /// being relied on -- on reopen.
     pub goal: Option<String>,
+    /// What came up with this line, by name and type. Empty for the answer's
+    /// half, and empty for rows written before attachments existed.
+    pub attachments: Vec<ChatAttachmentInfo>,
+    /// What the answer ran on its way to being written. Empty for the question's
+    /// half, for failed turns, and for rows written before this was kept.
+    pub tool_calls: Vec<ChatToolCall>,
+    /// The employee that answered, when the turn named one.
+    ///
+    /// The live page learns this from an `agent.identity` frame, which exists
+    /// only while the socket is open; a reopened page has no way to compute the
+    /// id (it carries a process fingerprint), so the record is the only place
+    /// that still knows who wrote the answer.
+    pub agent: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One conversation as a listing shows it: which one, what it opened with, and
+/// when it was last spoken in.
+///
+/// The listing groups rows by session, so everything here is read off a group:
+/// `title` is the first thing the person said (not the last), `last_activity_at`
+/// is the newest row (that is what orders the list), and `turns` counts the
+/// exchanges kept -- one per question, whether or not an answer arrived. The
+/// transcript is bounded, so a long conversation reports the window the platform
+/// still holds rather than everything ever said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatSessionSummary {
+    pub session_id: String,
+    pub title: String,
+    pub last_activity_at: chrono::DateTime<chrono::Utc>,
+    pub turns: i64,
 }
 
 /// The transcript's operations.
@@ -94,7 +206,34 @@ pub trait ChatTurnStore: Send + Sync {
     /// Written as one turn rather than two appends so a reader never sees a
     /// question whose answer is still in flight -- half a turn reads as an
     /// answer that never came.
-    async fn record_turn(&self, session_id: &str, user: &str, assistant: &str) -> SFResult<()>;
+    ///
+    /// `attachments` 与这一句同写一行：它们是这句话的一部分，分开写就有一瞬间
+    /// 「这句话带不带那张图」没有答案。
+    ///
+    /// `model_content` 是这一句交给模型时用的正文，只在它与人打的那一行不同时才
+    /// 给：一条 `/名字` 命令展开成技能说明之后，人打的那一行与模型读到的不是同一段
+    /// 字。`None` 是「两者是同一句」——不是「模型什么都没看到」。后面几轮读历史
+    /// 用的是它，否则一段用技能开的对话在第二轮就不再带着那份规程。
+    ///
+    /// `owner` 是这段对话属于谁，取套接字握手时认出来的那个人。空串是「这条连接
+    /// 没有身份」：那时候写下的行不属于任何人，按人列出的名单里也不会出现它们——
+    /// 凭空补一个名字，是给一件没有测过的事记一笔账。
+    // One argument per column the row carries -- and the two new ones are the
+    // columns that make a reopened conversation look like the one that was left:
+    // what the answer ran (the tool calls), and who ran it (the agent). A struct
+    // would only move the same list one level down.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_turn(
+        &self,
+        session_id: &str,
+        owner: &str,
+        user: &str,
+        model_content: Option<&str>,
+        attachments: &[ChatAttachment],
+        assistant: &str,
+        tool_calls: &[ChatToolCall],
+        agent: Option<&str>,
+    ) -> SFResult<()>;
 
     /// Record one exchange whose reply handed the work to the orchestrator, and
     /// the goal it created.
@@ -103,15 +242,30 @@ pub trait ChatTurnStore: Send + Sync {
     /// different shapes, and an implementation that answered this one by
     /// forwarding to `record_turn` would keep the words and drop the goal --
     /// which reads, on reopen, as a conversation that never dispatched anything.
+    // One argument per column the row carries, and every one of them is read off a
+    // different place: the session, the person, the line typed, the line the model
+    // read, the attachments, the answer, the goal. A struct here would only move the
+    // same list one level down and hide the row's shape from the call site.
+    #[allow(clippy::too_many_arguments)]
     async fn record_dispatched_turn(
         &self,
         session_id: &str,
+        owner: &str,
         user: &str,
+        model_content: Option<&str>,
+        attachments: &[ChatAttachment],
         assistant: &str,
         goal_id: &str,
+        tool_calls: &[ChatToolCall],
+        agent: Option<&str>,
     ) -> SFResult<()>;
 
     /// Record one exchange whose reply never arrived, and why.
+    ///
+    /// The tool calls this turn ran are kept even though the answer did not
+    /// arrive: they are work that happened, and a person reopening the
+    /// conversation is looking for exactly that -- what it did before it failed.
+    /// The reply's half stays empty; a call is not an answer.
     ///
     /// A failed model call used to leave nothing behind: the words the user
     /// said to this platform existed only in the response they had just
@@ -119,8 +273,20 @@ pub trait ChatTurnStore: Send + Sync {
     /// earlier one had happened. The answer's absence is a fact about the turn,
     /// not a reason to forget the turn -- so the question is kept, and the row
     /// carries the reason instead of an answer.
-    async fn record_failed_turn(&self, session_id: &str, user: &str, failure: &str)
-        -> SFResult<()>;
+    // One argument per column the row carries: the session, the person, the words,
+    // the attachments, why no answer came, what the turn ran before it failed, and
+    // who ran it. A struct would only move the same list one level down.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_failed_turn(
+        &self,
+        session_id: &str,
+        owner: &str,
+        user: &str,
+        attachments: &[ChatAttachment],
+        failure: &str,
+        tool_calls: &[ChatToolCall],
+        agent: Option<&str>,
+    ) -> SFResult<()>;
 
     /// The last `limit` lines of a session, oldest first.
     ///
@@ -143,12 +309,50 @@ pub trait ChatTurnStore: Send + Sync {
     /// including the turns whose answer never arrived -- those are the ones a
     /// person most needs to find again.
     async fn transcript(&self, session_id: &str, limit: usize) -> SFResult<Vec<ChatTurnRecord>>;
+
+    /// Who this conversation belongs to, when a row ever named an owner.
+    ///
+    /// `None` is not "nobody owns it" in the sense of a policy; it is the
+    /// measured fact that no row of this session carries a name. Sessions
+    /// recorded before the owner column existed and sessions spoken in by a
+    /// connection without a login identity both read `None` — and that is the
+    /// honest answer for both, because there is no person whose access to it
+    /// could be defended. A caller deciding whether to hand the transcript to
+    /// someone reads this and decides; the store does not decide for it.
+    ///
+    /// The first row that names an owner claims the session: a conversation
+    /// does not change hands because a later turn was written by another
+    /// person, and answering with the newest name would let the second speaker
+    /// take the first one's conversation by speaking in it.
+    async fn owner_of(&self, session_id: &str) -> SFResult<Option<String>>;
+
+    /// One person's conversations, newest activity first.
+    ///
+    /// Scoped by `owner` rather than answered from every row: the transcript
+    /// holds conversations from every person who used this deployment, and a
+    /// listing without that filter is a list of other people's questions.
+    ///
+    /// `search`, when given, keeps sessions where any line contains it (case
+    /// insensitive). It filters sessions, not lines: a session that matched on
+    /// its third turn is returned whole, because reopening it is the point.
+    ///
+    /// Sessions with no owner (recorded when the socket was not authenticated)
+    /// are not listed for `""`: nobody declared them, so no person can be shown
+    /// them as theirs.
+    async fn sessions(
+        &self,
+        owner: &str,
+        limit: usize,
+        search: Option<&str>,
+    ) -> SFResult<Vec<ChatSessionSummary>>;
 }
 
 /// Rows kept per receiving peer, so a chatty sender cannot grow the table
 /// without bound. Larger than what a panel shows at once, because how far back
 /// a reader can scroll and what fits on one screen answer different questions.
-// cap: bound — 比一个面板一次显示的更多，因为「能往回滚多远」与「一屏装得下多少」答的不是同一个问题
+// cap: fixed — 比一个面板一次显示的更多，因为「能往回滚多远」与「一屏装得下多少」答的不是同一个问题
+// keep: 删掉后每对端的历史深度与面板一次显示的量混为一谈；由「能往回滚多远与一屏装多少不是同一个问题」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 pub const ROWS_KEPT_PER_PEER: i64 = 500;
 
 /// The settled shape of one send.

@@ -1,6 +1,5 @@
 //! The database's Service must keep publishing endpoints while the pod is not
 //! Ready.
-//! principle: feedback_an_observer_dying_must_not_take_the_observed_away
 //!
 //! The metrics sidecar shares its pod with the database. On 2026-10-25 that
 //! sidecar exited at startup over a flag its image does not know, so the pod
@@ -27,7 +26,7 @@
 
 use crate::common;
 
-use common::routes::read_repo;
+use common::routes::{read_repo, rendered_root};
 
 /// Every carrier of the database Service: the chart template that is the
 /// authority, the static copy the in-cluster puller applies, and the three
@@ -64,6 +63,8 @@ fn publishes_not_ready_addresses(doc: &str) -> bool {
 
 #[test]
 fn the_database_service_publishes_not_ready_addresses_in_every_carrier() {
+    // 四份载体里的三份是渲染产物：读之前让 chart 现场生成。
+    rendered_root();
     let mut found = 0;
     let mut failures = Vec::new();
     for carrier in CARRIERS {

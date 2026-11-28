@@ -369,7 +369,9 @@ mod tests {
                         else {
                             return;
                         };
-                        let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+                        cog_core::ignore_lost!(
+                            tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await
+                        );
                     });
                 }
             });

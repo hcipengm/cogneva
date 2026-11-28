@@ -220,8 +220,7 @@ impl LLMProvider for GoogleProvider {
                 .header("Content-Type", cog_core::CONTENT_TYPE_JSON)
                 .json(&body)
                 .map_err(|e| SFError::Agent(format!("JSON serialization failed: {}", e)))
-                .unwrap()
-                .timeout(120);
+                .unwrap();
 
             for (key, value) in &headers {
                 req = req.header(key, value);
@@ -646,6 +645,7 @@ impl LLMProvider for GoogleProvider {
         Ok(stream.result().await)
     }
 
+    // prompt: not-an-instruction — 探活请求，模型看不到它
     async fn health_check(&self) -> bool {
         match self
             .chat(

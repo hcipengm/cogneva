@@ -42,7 +42,7 @@ pub struct AuditEvent {
     pub target: String,
     /// 动作描述（如 "change.apply"、"hook.pre_prompt"）。
     pub action: String,
-    /// 结构化详情（禁止包含密钥；构造时已由 [`crate::secrets::redact_json_secrets`] 脱敏）。
+    /// 结构化详情。原样保存：审计记的是现场，脱敏会把它变成另一份字节。
     pub detail: serde_json::Value,
     /// 前一条记录的哈希；创世记录为 `"genesis"`。
     pub prev_hash: String,
@@ -75,14 +75,12 @@ impl AuditEvent {
         actor: impl Into<String>,
         target: impl Into<String>,
         action: impl Into<String>,
-        mut detail: serde_json::Value,
+        detail: serde_json::Value,
     ) -> Self {
-        // Where the guarantee lives: every record is built here, and the hash is
-        // taken from what this leaves behind, so the chain stays consistent with
-        // the stored (redacted) detail. Doing it in a storage backend instead
-        // would leave the next backend free to forget it, and would put the
-        // redaction after the hash.
-        crate::secrets::redact_json_secrets(&mut detail);
+        // 详情原样入库：它是现场，脱敏是**销毁信息**——把密钥替换成 `[redacted]`
+        // 之后，审计链的哈希也是对替换后的字节算的，事后连「当时那句里有没有凭证」
+        // 都答不出来。凭证不该出现在载荷里，那是写入侧该记成一条缺陷去修的，不是
+        // 读的时候打码把缺陷藏起来。
         let (seq, prev_hash) = match prev {
             Some(p) => (p.seq + 1, p.hash.clone()),
             None => (1, "genesis".to_string()),

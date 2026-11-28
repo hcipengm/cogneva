@@ -9,7 +9,9 @@ use crate::pools::{ConfigPool, ExplainPool, MessagesPool, RedisClient, UsersPool
 ///
 /// 这条探针用的是单连接池，只跑一句 SHOW；池被占满说明数据库已经吃紧，
 /// 5s 拿不到就按「读不到」处理，而不是跟着一起排队。
-// cap: bound — 探针用的是单连接池、只跑一句 SHOW；池满说明数据库已吃紧，拿不到就按「读不到」处理而不是跟着排队
+// cap: fixed — 探针用的是单连接池、只跑一句 SHOW；池满说明数据库已吃紧，拿不到就按「读不到」处理而不是跟着排队
+// keep: 删掉后池满时探针跟着排队，把观测变成对库的压力；由「拿不到就按读不到处理」兜住
+// wall: 等=单连接池里那条连接 / 等不到=这次探活读作「读不到」，不跟着一起排队——池满本身就是读数 / 续跑=能，下一拍再探
 const CONNECTION_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Storage plugin that creates and publishes PostgreSQL pools and Redis client.
@@ -24,6 +26,12 @@ pub struct StoragePlugin {
     /// that need a lease are not all in this plugin: whoever owns the shared
     /// database owns the arbitration, and everyone else reads it from here.
     lease_broker: Option<Arc<dyn cog_core::OwnerLeaseBroker>>,
+    /// The retention loops' shared reading face, created and published in
+    /// `init` because the scrape snapshot is taken there. A handle published
+    /// from `start` is held by a live sweep and read by nobody, which is the
+    /// same silent absence the sweeps exist to make visible. `start` attaches
+    /// the capacity loop to this face.
+    retention_readings: Option<Arc<cog_core::retention::RetentionReadings>>,
 }
 
 impl StoragePlugin {
@@ -33,6 +41,7 @@ impl StoragePlugin {
             initialized: false,
             pg_pool: None,
             lease_broker: None,
+            retention_readings: None,
         }
     }
 }
@@ -381,6 +390,89 @@ impl cog_core::SystemPlugin for StoragePlugin {
         ctx.publish_service(metrics_backend.clone());
         info!("StoragePlugin metrics backend published");
 
+        // 待落地队列的写者：正本是事件流，候选是它的读数。没库的部署不挂——
+        // 挂一份内存实现会让「重启后候选还在」变成一句没人在验的话，而队列的
+        // 整个价值就是它活得过写它的进程。缺席在消费侧是一条具名日志。
+        if let Some(pool) = self.pg_pool.clone() {
+            let writer = format!(
+                "{}@{}",
+                cog_core::env::process_identity(|name| std::env::var(name).ok()),
+                env!("CARGO_PKG_VERSION")
+            );
+            let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            let mut seed = [0u8; 10];
+            seed.copy_from_slice(&uuid::Uuid::new_v4().into_bytes()[..10]);
+            let store = crate::postgres::change_candidate_store::PgChangeCandidateStore::new(
+                pool.clone(),
+                "agent:reflection",
+                writer,
+                "",
+                cog_core::EventIdFactory::seeded(now_ms, seed),
+            );
+            ctx.publish_service::<dyn cog_core::ChangeCandidateStore>(std::sync::Arc::new(store));
+            info!("StoragePlugin change candidate store published");
+
+            // 一次调用 / 一次工具调用的事实落点：写入口只有这一处（`cogneva_event`
+            // 一条 INSERT），所以在这里发布，而不是让每个消费者各造一个。
+            let deployment = std::env::var(cog_core::env::DEPLOYMENT_NAME_ENV)
+                .unwrap_or_else(|_| "cogneva".to_string());
+            // 调用事实走同一条流与同一个写口；不再单独发布按族的服务。
+            // 工具调用事实走同一条流与同一个写口；不再单独发布按族的服务。
+            info!("StoragePlugin call-event sinks published");
+
+            // 唯一的写口：所有族的构造器都经过它落库。EventLog 是它的低层形态
+            // （现成的信封直接追加），EventStore 是高层形态（载荷枚举 → 信封）。
+            let event_log_store = std::sync::Arc::new(
+                crate::postgres::event_log::EventLogStore::new(pool.clone(), deployment.clone())
+                    // 写一条要多久：`append_pressure` 判词的写入面读数就从这里来。
+                    .with_metrics(Some(metrics_backend.clone())),
+            );
+            let event_log: std::sync::Arc<dyn cog_core::EventLog> = event_log_store.clone();
+            let event_store: std::sync::Arc<dyn cog_core::EventStore> = event_log_store;
+            ctx.publish_service::<dyn cog_core::EventLog>(event_log);
+            ctx.publish_service::<dyn cog_core::EventStore>(event_store.clone());
+            // 落地事实的读口：与写口同一个库、同一条流。落地通道（cog-github）
+            // 不依赖存储层，由装配处把这一份接给它。
+            ctx.publish_service::<dyn cog_core::LandingFactReader>(std::sync::Arc::new(
+                crate::postgres::landing_states::PostgresLandingFacts::new(pool.clone()),
+            ));
+
+            // 意图到达与接手：写面给对话那一屏，读面给把意图变成待办的那条循环。
+            let intents =
+                std::sync::Arc::new(crate::postgres::intent_events::IntentEventStore::new(
+                    pool.clone(),
+                    event_store.clone(),
+                ));
+            ctx.publish_service::<dyn cog_core::IntentReader>(intents);
+            info!("StoragePlugin intent event store published");
+
+            // 判据（终态）的修订：写面落一条 `task`／`terminal_revised` 事实，读面
+            // 按待办标记取最近一条。Ralph 循环每一轮开始前读它——判据定了之后要换
+            // 那一段话，只能从这里换。
+            let revisions: std::sync::Arc<
+                dyn cog_core::contract::terminal_revision::TerminalRevisions,
+            > = std::sync::Arc::new(
+                crate::postgres::terminal_revisions::PostgresTerminalRevisions::new(
+                    pool.clone(),
+                    event_store.clone(),
+                ),
+            );
+            ctx.publish_service::<dyn cog_core::contract::terminal_revision::TerminalRevisions>(
+                revisions,
+            );
+
+            // 一条待办被定义：与其他族同一条流、同一个信封；写面只有 `EventStore`，
+            // 不再单独发布一个按族分的服务。
+            info!("StoragePlugin ledger-item definition store published");
+
+            // 员工两条事实与消息一条事实：名册与会话是它们的投影。
+            // 员工事实走同一条流与同一个写口；不再单独发布按族的服务。
+            // 消息事实走同一条流与同一个写口；不再单独发布按族的服务。
+            info!("StoragePlugin employee and message event stores published");
+        } else {
+            info!("no PostgreSQL pool: the change candidate queue has no writer in this process");
+        }
+
         // Publish the ceiling each pool was actually given, once per pool.
         // The startup log line says the same thing to whoever is watching the
         // process start; this says it to whoever reads the store later, and
@@ -426,7 +518,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
                                 "PostgresSnapshotStore init_schema failed: {}. Falling back to file.",
                                 e
                             );
-                            let _ = tokio::fs::create_dir_all(&snapshot_dir).await;
+                            cog_core::ignore_lost!(tokio::fs::create_dir_all(&snapshot_dir).await);
                             Arc::new(crate::FileSnapshotStore::new(&snapshot_dir))
                         }
                     }
@@ -438,7 +530,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
                                 .into(),
                         ));
                     }
-                    let _ = tokio::fs::create_dir_all(&snapshot_dir).await;
+                    cog_core::ignore_lost!(tokio::fs::create_dir_all(&snapshot_dir).await);
                     Arc::new(crate::FileSnapshotStore::new(&snapshot_dir))
                 }
             }
@@ -571,17 +663,21 @@ impl cog_core::SystemPlugin for StoragePlugin {
             let notification_store = crate::PostgresNotificationStore::new(pool.clone());
             match notification_store.init_schema().await {
                 Ok(()) => {
-                    // 已读通知有保留期，未读的永远留着：表只增不减的话，它的体积
-                    // 由告警抖动的次数决定，而抖动正是这张表记的东西。启动时清一次，
-                    // 与 LLM 调用留底同一办理——进程滚得勤，漏一拍只少清一轮。
-                    match notification_store.prune_read(NOTIFICATION_KEEP_DAYS).await {
-                        Ok(removed) if removed > 0 => info!(
-                            removed,
+                    // 已读通知过了保留期**只数不删**：一条通知是平台对某个人说过的
+                    // 一句话，行是它的唯一一份，按年龄删就是删事实。数出来的那个数
+                    // 才是这一趟的产出——它说「该搬了」，说不了「该丢」。搬迁路径
+                    // 与观测日志同形：先落一份读得回来的副本，逐字节校验，才允许删。
+                    match notification_store
+                        .count_read_past_retention(NOTIFICATION_KEEP_DAYS)
+                        .await
+                    {
+                        Ok(due) if due > 0 => info!(
+                            due,
                             days = NOTIFICATION_KEEP_DAYS,
-                            "read notifications past retention removed"
+                            "read notifications past retention are due for archiving (kept)"
                         ),
                         Ok(_) => {}
-                        Err(e) => warn!(error = %e, "notification retention pass failed"),
+                        Err(e) => warn!(error = %e, "notification retention reading failed"),
                     }
                     let store: Arc<dyn cog_core::NotificationStore> = Arc::new(notification_store);
                     ctx.publish_service(store);
@@ -794,7 +890,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
         let wal_shutdown = ctx
             .consume::<cog_core::ShutdownSignal>()
             .map(|s| (*s).clone())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let _wal_sweep = Arc::clone(&wal_redis).spawn(wal_shutdown.clone());
         // The cap bounds a live log; nothing bounded the store. Every retired
         // agent left its log behind and every finished squad left one per
@@ -809,8 +905,20 @@ impl cog_core::SystemPlugin for StoragePlugin {
         info!("StoragePlugin WAL backend published");
 
         // ── AgentRegistry (Redis) ──
-        let agent_registry = crate::RedisAgentRegistry::new(redis_conn.clone())
+        let mut agent_registry = crate::RedisAgentRegistry::new(redis_conn.clone())
             .with_ttl_seconds(ctx.config().agent.registration_ttl_secs);
+        // 发号与离场的事件写者：有 PG 就让注册表自己写，没有就只写名册。
+        if let Some(pool) = self.pg_pool.clone() {
+            let store: std::sync::Arc<dyn cog_core::EventStore> = std::sync::Arc::new(
+                crate::postgres::event_log::EventLogStore::new(pool.clone(), deployment_name()),
+            );
+            let keys = std::sync::Arc::new(crate::postgres::key_events::KeyEventStore::new(
+                pool.clone(),
+                store.clone(),
+            ));
+            ctx.publish_service::<dyn cog_core::SecurityKeys>(keys);
+            agent_registry = agent_registry.with_events(store);
+        }
         let agent_registry_dyn: Arc<dyn cog_core::AgentRegistry> = Arc::new(agent_registry);
         ctx.publish_service(agent_registry_dyn);
         info!("StoragePlugin agent registry published");
@@ -895,7 +1003,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
                                 .and_then(|v| v.as_str())
                                 .map(String::from)
                         })
-                        .unwrap_or_default();
+                        .unwrap_or(Default::default());
                     let api_secret = std::env::var("LIVEKIT_API_SECRET")
                         .ok()
                         .or_else(|| {
@@ -905,7 +1013,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
                                 .and_then(|v| v.as_str())
                                 .map(String::from)
                         })
-                        .unwrap_or_default();
+                        .unwrap_or(Default::default());
                     let server_url = std::env::var("LIVEKIT_SERVER_URL")
                         .ok()
                         .or_else(|| {
@@ -915,7 +1023,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
                                 .and_then(|v| v.as_str())
                                 .map(String::from)
                         })
-                        .unwrap_or_default();
+                        .unwrap_or(Default::default());
                     if api_key.is_empty() || api_secret.is_empty() || server_url.is_empty() {
                         warn!("LiveKit media backend enabled but missing api_key, api_secret, or server_url");
                     } else {
@@ -1015,7 +1123,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
                             e
                         );
                         let trace_dir = format!("{}/traces", raw_logger_config.base_dir);
-                        let _ = tokio::fs::create_dir_all(&trace_dir).await;
+                        cog_core::ignore_lost!(tokio::fs::create_dir_all(&trace_dir).await);
                         Arc::new(crate::FileTraceStore::new(&trace_dir))
                     }
                 },
@@ -1024,7 +1132,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
                         "S3TraceStore requires S3 configuration. Falling back to FileTraceStore."
                     );
                     let trace_dir = format!("{}/traces", raw_logger_config.base_dir);
-                    let _ = tokio::fs::create_dir_all(&trace_dir).await;
+                    cog_core::ignore_lost!(tokio::fs::create_dir_all(&trace_dir).await);
                     Arc::new(crate::FileTraceStore::new(&trace_dir))
                 }
                 _ => {
@@ -1070,8 +1178,11 @@ impl cog_core::SystemPlugin for StoragePlugin {
         // table was built to remove. Without a pool nothing is published, and
         // the loop that maintains it finds no store and leaves the ledger alone.
         if let Some(pool) = self.pg_pool.clone() {
+            let events: Arc<dyn cog_core::EventStore> = Arc::new(
+                crate::postgres::event_log::EventLogStore::new(pool.clone(), deployment_name()),
+            );
             let store: Arc<dyn cog_core::ChangeLedgerStore> =
-                Arc::new(crate::PostgresChangeLedgerStore::new(pool));
+                Arc::new(crate::PostgresChangeLedgerStore::new(pool).with_events(events));
             ctx.publish_service(store);
             info!("StoragePlugin change ledger store published");
         } else if strict_persistence {
@@ -1080,6 +1191,20 @@ impl cog_core::SystemPlugin for StoragePlugin {
             ));
         } else {
             warn!("No PostgreSQL pool; the change ledger is unavailable in this deployment");
+        }
+
+        // ── RoundEvents ──
+        // 定批的落点：这一轮做哪几条，钉进事件流。与账本同池、同一条链：账本说
+        // 「欠着什么」，这一族说「这一轮做的是哪几条」。没有池就不发布，循环按
+        // 「没有可钉住的地方」跑——那一句在它启动时说得清，而不是让每一拍悄悄退回
+        // 「没有钉住」。
+        if let Some(pool) = self.pg_pool.clone() {
+            let deployment = std::env::var(cog_core::env::DEPLOYMENT_NAME_ENV)
+                .unwrap_or_else(|_| "cogneva".to_string());
+            let store: Arc<dyn cog_core::RoundEvents> =
+                Arc::new(crate::RoundEventStore::new(pool, deployment));
+            ctx.publish_service(store);
+            info!("StoragePlugin round events published");
         }
 
         // ── PrincipleLedgerStore ──
@@ -1098,6 +1223,25 @@ impl cog_core::SystemPlugin for StoragePlugin {
             ));
         } else {
             warn!("No PostgreSQL pool; the principle ledger is unavailable in this deployment");
+        }
+
+        // ── RuntimePrincipleStore ──
+        // The rules in force are the platform's, not this pod's. Published only
+        // with a pool, for the same reason as the ledgers above: a process-local
+        // copy would tell one pod's employees a different set of rules than the
+        // next pod's, and the difference would look like a rule that comes and
+        // goes. Without a pool runs carry only their base instruction.
+        if let Some(pool) = self.pg_pool.clone() {
+            let store: Arc<dyn cog_core::RuntimePrincipleStore> =
+                Arc::new(crate::PostgresRuntimePrincipleStore::new(pool));
+            ctx.publish_service(store);
+            info!("StoragePlugin runtime principle store published");
+        } else if strict_persistence {
+            return Err(cog_core::SFError::Config(
+                "No PostgreSQL pool for RuntimePrincipleStore (strict_persistence=true)".into(),
+            ));
+        } else {
+            warn!("No PostgreSQL pool; runtime principles are unavailable in this deployment");
         }
 
         // ── ResourceEventStore ──
@@ -1226,11 +1370,67 @@ impl cog_core::SystemPlugin for StoragePlugin {
         let http_client = ctx.consume_service::<dyn cog_core::HttpClient>();
         let object_backend =
             build_object_backend(&storage_provider_config, &data_dir, http_client)?;
+        // 桶在不在，启动时问一次：引用能不能取回全文取决于它。这里不拦启动——
+        // 对象存储短暂不可用不该让整个网关起不来——但失败要足以被看见：一行
+        // error 点名桶，读的人知道这一刻外置正文的引用不可解。
+        if let Err(error) = object_backend.ensure_ready().await {
+            tracing::error!(
+                error = %error,
+                provider = %storage_provider_config.provider,
+                "对象存储没有准备好：外置正文的引用此刻不可解"
+            );
+        }
         info!(
             "StoragePlugin object backend published (provider={})",
             storage_provider_config.provider
         );
         ctx.publish_service(object_backend.clone());
+
+        // ── 切换后端时，本地那份对象还在不在 ──
+        // 从 `local-fs` 换到对象存储是一次数据搬迁，不是一次配置改动：新后端
+        // 看不到旧后端写在盘上的对象，而这件事在切换后没有任何报错——读到的
+        // 就是「空库」。启动时数一次、放在日志里，切换当天就能看见搬没搬完；
+        // 「数到 0」与「没数成」分开写，后者不许读成前者。
+        if let Some(base) =
+            crate::backends::object_backends::local_object_base(&storage_provider_config)
+        {
+            let path = base.display().to_string();
+            let objects = match crate::backends::object_backends::objects_on_disk(&base).await {
+                Ok(0) => {
+                    info!(
+                        path = %path,
+                        "object store is not local-fs and the local object tree is empty; nothing was left behind"
+                    );
+                    Some(0)
+                }
+                Ok(objects) => {
+                    warn!(
+                        path = %path,
+                        objects,
+                        "object store is not local-fs but this path still holds objects written while it was; they are not visible through the active backend until they are copied into it"
+                    );
+                    Some(objects)
+                }
+                Err(e) => {
+                    warn!(
+                        path = %path,
+                        error = %e,
+                        "object store is not local-fs; the local object tree could not be read, so how many objects it still holds is unknown — not zero"
+                    );
+                    None
+                }
+            };
+            // 同一件事也要从抓取面答一次：看着日志的人当场就知道，而看告警的人
+            // 只问得到序列。两者读的是同一次清点，不各数一遍。
+            crate::legacy_object_tree::record_scan(crate::legacy_object_tree::LegacyObjectTree {
+                provider: storage_provider_config.provider.clone(),
+                path,
+                objects,
+            });
+        }
+        ctx.publish_observable(std::sync::Arc::new(
+            crate::legacy_object_tree::LegacyObjectTreeObservable,
+        ));
 
         // ── 数据库健康 ──
         // 报健康的进程（网关）不持有连接池：池是这一侧的资产。这里给出一个只回答
@@ -1328,6 +1528,16 @@ impl cog_core::SystemPlugin for StoragePlugin {
 
         self.lease_broker = lease_broker;
 
+        // The observability-event capacity loop's reading face: the target
+        // each beat computed, the unit it is in, whether its input was
+        // measured, and how many beats it has run. Published here rather than
+        // where the loop starts, because the scrape snapshot is taken during
+        // `init` -- a face published after it is live on the loop and absent
+        // from every scrape.
+        let retention_readings = Arc::new(cog_core::retention::RetentionReadings::new());
+        ctx.publish_observable(retention_readings.clone());
+        self.retention_readings = Some(retention_readings);
+
         self.initialized = true;
         Ok(())
     }
@@ -1355,7 +1565,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
                     let shutdown = ctx
                         .consume::<cog_core::ShutdownSignal>()
                         .map(|s| (*s).clone())
-                        .unwrap_or_default();
+                       .unwrap_or(Default::default());
                     cog_core::attempt_journal::install(journal.clone());
                     drop(crate::postgres::attempt_journal_store::spawn_sweeper(
                         journal,
@@ -1364,7 +1574,9 @@ impl cog_core::SystemPlugin for StoragePlugin {
                     ));
                     info!(
                         keep_days = keep,
-                        "attempt journal installed; an interrupted attempt resumes from its last recorded step"
+                        "attempt journal installed; an interrupted attempt resumes from its last \
+                         recorded step, and closed journals past the window are counted rather \
+                         than deleted"
                     );
                 }
                 Err(e) => warn!(
@@ -1388,7 +1600,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
                 let shutdown = ctx
                     .consume::<cog_core::ShutdownSignal>()
                     .map(|s| (*s).clone())
-                    .unwrap_or_default();
+                    .unwrap_or(Default::default());
                 match object_backend {
                     Some(object_backend) => {
                         let role = lease_broker.clone();
@@ -1433,7 +1645,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
             let shutdown = ctx
                 .consume::<cog_core::ShutdownSignal>()
                 .map(|s| (*s).clone())
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             let pm_metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
             if pm_metrics.is_none() {
                 warn!(
@@ -1470,7 +1682,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
             let shutdown = ctx
                 .consume::<cog_core::ShutdownSignal>()
                 .map(|s| (*s).clone())
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             let metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
 
             // Both readings that name a deployment take the name from one place,
@@ -1485,20 +1697,17 @@ impl cog_core::SystemPlugin for StoragePlugin {
                 retirement = retirement.with_metrics(mb);
             }
 
-            let mut cap = crate::SampleLogCap::new(pool, sample_max_rows)
+            let mut cap = crate::MetricsSampleLog::new(pool, sample_max_rows)
                 .with_retirement(std::sync::Arc::new(retirement))
                 .with_deployment(deployment);
             if let Some(mb) = metrics {
                 cap = cap.with_metrics(mb);
             }
-            if let Some(broker) = lease_broker.clone() {
-                cap = cap.with_role(broker);
-            }
             let _handle = Arc::new(cap).spawn(shutdown.clone());
             if sample_max_rows == 0 {
-                info!("Metrics sample capacity disabled (sample_max_rows=0)");
+                info!("Metrics sample log: no capacity declared (sample_max_rows=0)");
             } else {
-                info!(sample_max_rows, "Metrics sample capacity started");
+                info!(sample_max_rows, "Metrics sample log measuring started");
             }
         } else {
             info!("Metrics sample capacity disabled (no PostgreSQL pool)");
@@ -1517,21 +1726,30 @@ impl cog_core::SystemPlugin for StoragePlugin {
         // capacity may not cross, because the historical-events view asks for
         // the last day and a sweep that deleted inside it would answer a
         // well-formed query with a silent gap.
+        // Every retention loop in this process reports through one reading
+        // face: the target each beat computed, the unit it is in, whether its
+        // input was measured, and how many beats it has run. A target that does
+        // not move between beats is correct; the beat count is what separates a
+        // steady table from a stopped sweep.
+        let retention_readings = self
+            .retention_readings
+            .clone()
+            .unwrap_or(Default::default());
+        let database_volume = cog_core::retention::database_volume_from_env();
         let event_max_rows = crate::observability_event_cap::max_rows_from_env();
         let event_read_window = crate::observability_event_cap::read_window_from_env();
         if let Some(pool) = self.pg_pool.clone() {
             let shutdown = ctx
                 .consume::<cog_core::ShutdownSignal>()
                 .map(|s| (*s).clone())
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             let mut cap = crate::EventLogCap::new(pool, event_max_rows)
                 .with_read_window(event_read_window)
+                .with_database_volume(database_volume)
+                .with_readings(retention_readings.clone())
                 .with_deployment(deployment_name());
             if let Some(mb) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
                 cap = cap.with_metrics(mb);
-            }
-            if let Some(broker) = lease_broker.clone() {
-                cap = cap.with_role(broker);
             }
             let _handle = Arc::new(cap).spawn(shutdown.clone());
             if event_max_rows == 0 {
@@ -1547,6 +1765,28 @@ impl cog_core::SystemPlugin for StoragePlugin {
             info!("Observability event capacity disabled (no PostgreSQL pool)");
         }
 
+        // ── Event stream census ──
+        // 事件流是账的正本，而「今天一条都没进」与「写入口坏了」在别的读数上同形。
+        // 这一格按 kind 数最近一天进了多少行；闭集里的每一条都印，没有行印 0。
+        if let Some(pool) = self.pg_pool.clone() {
+            let shutdown = ctx
+                .consume::<cog_core::ShutdownSignal>()
+                .map(|s| (*s).clone())
+                .unwrap_or(Default::default());
+            match ctx.consume_service::<dyn cog_core::MetricsBackend>() {
+                Some(mb) => {
+                    crate::event_stream_census::spawn(pool, mb, shutdown);
+                    info!(
+                        window_secs = crate::event_stream_census::WINDOW_SECONDS,
+                        "Event stream census started"
+                    );
+                }
+                None => info!("Event stream census disabled (no metrics backend)"),
+            }
+        } else {
+            info!("Event stream census disabled (no PostgreSQL pool)");
+        }
+
         // ── Checkpoint store capacity ──
         // A checkpoint round writes the new snapshot, points the task board at
         // it, and only then deletes the one it replaced — so the board is the
@@ -1557,76 +1797,95 @@ impl cog_core::SystemPlugin for StoragePlugin {
         // of it travels in the nightly backup whose restore the drill has to
         // finish inside a budget.
         //
-        // The floor is two-part and neither half is a knob: a row a board points
-        // at is the resume point, and a row inside the read window is what the
-        // snapshots view is promised. A sweep that crossed either would answer a
-        // well-formed question with a silent gap.
+        // The floor is the board pointer, and it is not a knob: a row a board
+        // points at is the resume point, so a sweep that crossed it would answer
+        // a well-formed question with a silent gap. A row no board names is a
+        // leftover whatever its age — nothing reads this table by time.
         let checkpoint_max_rows = crate::checkpoint_cap::max_rows_from_env();
-        let checkpoint_read_window = crate::checkpoint_cap::read_window_from_env();
         if let Some(pool) = self.pg_pool.clone() {
             let shutdown = ctx
                 .consume::<cog_core::ShutdownSignal>()
                 .map(|s| (*s).clone())
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             let mut cap = crate::CheckpointCap::new(pool, checkpoint_max_rows)
-                .with_read_window(checkpoint_read_window)
+                .with_database_volume(database_volume)
+                .with_readings(retention_readings.clone())
                 .with_deployment(deployment_name());
             if let Some(mb) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
                 cap = cap.with_metrics(mb);
             }
-            if let Some(broker) = lease_broker.clone() {
-                cap = cap.with_role(broker);
-            }
             let _handle = Arc::new(cap).spawn(shutdown.clone());
             if checkpoint_max_rows == 0 {
-                info!("Checkpoint capacity disabled (max rows = 0)");
+                info!("Checkpoint store: no capacity declared (max rows = 0)");
             } else {
-                info!(
-                    checkpoint_max_rows,
-                    read_window_secs = checkpoint_read_window.as_secs(),
-                    "Checkpoint capacity started"
-                );
+                info!(checkpoint_max_rows, "Checkpoint store measuring started");
             }
         } else {
-            info!("Checkpoint capacity disabled (no PostgreSQL pool)");
+            info!("Checkpoint store measurement disabled (no PostgreSQL pool)");
         }
 
-        // ── Per-task event archive retention ──
-        // `cog_events` files each iteration of a task's agent loop so a run that
-        // did not converge can be read back afterwards, and nothing has ever
-        // removed a row from it: 130,871 rows over 211 MB on 2026-10-27, all of
-        // it in the nightly backup whose restore the drill has to finish inside
-        // a budget.
+        // ── Database surface: the bounds the database itself carries ──
         //
-        // The unit of retirement is the whole stream, not the row. Both readers
-        // replay a task's events from offset zero, so a deleted prefix would
-        // answer a well-formed read with a gap that looks exactly like the start
-        // of the run. A stream a checkpoint names is the resume point and is not
-        // deletable at all, for the same reason a board-pointed snapshot is not.
-        let task_event_keep_days = crate::task_event_retention::keep_days_from_env();
+        // The tree can be scanned for written constants and for deploy values,
+        // and both of those scans are green on a database that still kills a
+        // statement halfway. These are the server's own time bounds and the
+        // tables autovacuum has fallen behind on; read-only, nothing adjusted.
         if let Some(pool) = self.pg_pool.clone() {
             let shutdown = ctx
                 .consume::<cog_core::ShutdownSignal>()
                 .map(|s| (*s).clone())
-                .unwrap_or_default();
-            let keep = task_event_keep_days
-                .map(|days| std::time::Duration::from_secs(days as u64 * 86_400));
-            let mut sweep =
-                crate::TaskEventRetention::new(pool, keep).with_deployment(deployment_name());
+                .unwrap_or(Default::default());
+            let mut surface = crate::DatabaseSurface::new(pool).with_deployment(deployment_name());
+            if let Some(mb) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
+                surface = surface.with_metrics(mb);
+            }
+            let _handle = Arc::new(surface).spawn(shutdown);
+            info!("Database surface measurement started");
+        }
+
+        // ── Storage pressure: ask the judge, record the changes ──
+        //
+        // The four conditions exist and the manual entry (`cogneva storage-pressure`)
+        // can judge them, but nothing asked on a schedule — so a condition that went
+        // past its line produced no fact, and "proposed" was indistinguishable from
+        // "never looked". This loop is the asker: it records a `StoragePressureRaised`
+        // only when the verdict's sets change, and leaves the decision to a person.
+        if let Some(pool) = self.pg_pool.clone() {
+            let shutdown = ctx
+                .consume::<cog_core::ShutdownSignal>()
+                .map(|s| (*s).clone())
+                .unwrap_or(Default::default());
+            let mut watch = crate::StoragePressureWatch::new(pool);
+            if let Some(mb) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
+                watch = watch.with_metrics(mb);
+            }
+            if let Some(http) = ctx.consume_service::<dyn cog_core::HttpClient>() {
+                watch = watch.with_http(http);
+            }
+            watch = watch.with_prometheus_url(std::env::var(cog_core::env::PROMETHEUS_URL).ok());
+            let _handle = Arc::new(watch).spawn(shutdown);
+            info!("Storage pressure judge started");
+        }
+
+        // ── Per-task event archive measurement ──
+        // `cog_events` files each iteration of a task's agent loop so a run that
+        // did not converge can be read back afterwards. Nothing removes rows
+        // from it: both readers replay a task's events from offset zero, so a
+        // deleted prefix answers a well-formed read with a gap that looks
+        // exactly like the start of the run. The loop publishes how many rows,
+        // how many streams, and how far back the archive reaches; what to do
+        // about its growth is a decision against those readings.
+        if let Some(pool) = self.pg_pool.clone() {
+            let shutdown = ctx
+                .consume::<cog_core::ShutdownSignal>()
+                .map(|s| (*s).clone())
+                .unwrap_or(Default::default());
+            let mut sweep = crate::TaskEventRetention::new(pool).with_deployment(deployment_name());
             if let Some(mb) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
                 sweep = sweep.with_metrics(mb);
             }
-            if let Some(broker) = lease_broker.clone() {
-                sweep = sweep.with_role(broker);
-            }
             let _handle = Arc::new(sweep).spawn(shutdown.clone());
-            match task_event_keep_days {
-                Some(days) => info!(keep_days = days, "Task event retention started"),
-                None => info!(
-                    "Task event retention disabled for this deployment (keep days = 0); \
-                     it still publishes what the archive holds"
-                ),
-            }
+            info!("Task event archive measurement started");
         } else {
             info!("Task event retention disabled (no PostgreSQL pool)");
         }
@@ -1672,7 +1931,7 @@ fn deployment_name() -> String {
 /// could not see them and a restart on another node lost them. An unknown
 /// provider is a hard error rather than a silent fallback, for the same
 /// reason: falling back is how the misconfiguration stayed invisible.
-fn build_object_backend(
+pub fn build_object_backend(
     storage: &cog_core::ProviderConfig,
     data_dir: &str,
     http_client: Option<Arc<dyn cog_core::HttpClient>>,
@@ -1746,7 +2005,8 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
 /// same division and the divisor has to count it. Leaving it out would give
 /// every pool a share of a total one too large, and the overrun is paid by
 /// whichever component asks for a connection last.
-// cap: bound — 每个池分的是总数的一份，漏掉它每个池都按一个大了一的总量分，超支由最后要连接的那个组件付
+// cap: fixed — 每个池分的是总数的一份，漏掉它每个池都按一个大了一的总量分，超支由最后要连接的那个组件付
+// keep: 删掉后每个池按一个大了一的总量分，超支由最后要连接的组件付；由「每个池分总数的一份」兜住
 const POSTGRES_POOL_COUNT: u32 = 5;
 
 /// How long a read notification stays in the table.
@@ -1754,7 +2014,8 @@ const POSTGRES_POOL_COUNT: u32 = 5;
 /// Longer than the LLM exchange ledger's 30 days because these rows are read by
 /// people rather than by joins: a bell that forgets what happened last month is
 /// still usable, but the history is the only record of what was announced.
-// cap: bound — 比 LLM 交换台账的 30 天长，因为这些行是给人读的而不是给 join 用的；铃忘了上月的事还能用，但历史是唯一记下「宣布过什么」的东西
+// cap: fixed — 比 LLM 交换台账的 30 天长，因为这些行是给人读的而不是给 join 用的；铃忘了上月的事还能用，但历史是唯一记下「宣布过什么」的东西
+// keep: 删掉后铃的历史与 LLM 台账同长短，上月宣布过什么就没人记得；由「这些行是给人读的」兜住
 const NOTIFICATION_KEEP_DAYS: i64 = 90;
 
 /// The server's own connection ceiling and its superuser reserve.
@@ -1768,18 +2029,21 @@ async fn server_connection_ceiling(url: &str) -> Option<(u32, u32)> {
         .acquire_timeout(CONNECTION_ACQUIRE_TIMEOUT)
         .connect(url)
         .await
+        .map_err(|err| tracing::debug!(error = ?err, "连不上库，读不到服务端的连接上限"))
         .ok()?;
     let max = sqlx::query_scalar::<_, i64>(
         "select setting::bigint from pg_settings where name = 'max_connections'",
     )
     .fetch_one(&pool)
     .await
+    .map_err(|err| tracing::debug!(error = ?err, "读不到服务端的连接上限"))
     .ok();
     let reserved = sqlx::query_scalar::<_, i64>(
         "select setting::bigint from pg_settings where name = 'superuser_reserved_connections'",
     )
     .fetch_one(&pool)
     .await
+    .map_err(|err| tracing::debug!(error = ?err, "读不到服务端的连接上限"))
     .ok();
     pool.close().await;
     match (max, reserved) {

@@ -16,12 +16,10 @@
 //! 金丝雀镜像是最小 overlay（cogneva 基镜像 + 新编译二进制一个层），
 //! 构建无编译、push/pull 秒级。
 
-use std::path::PathBuf;
-use std::time::Duration;
-
 use crate::GitOpsConfig;
 use async_trait::async_trait;
 use cog_core::{SFError, SFResult};
+use std::path::PathBuf;
 use tracing::{info, warn};
 
 use crate::auto_promoter::{PromotionChannel, PromotionSource};
@@ -54,23 +52,21 @@ impl GitOpsPublisher {
         }
     }
 
+    /// 判的是它还在不在产出，不是它跑了多久：冷构建首拉基镜像能安静地忙上很久，
+    /// 而一份卡死的推送与它在那条按秒的界眼里是同一个读数。
     async fn run_in(
         &self,
         program: &str,
         dir: &std::path::Path,
         args: &[&str],
-        timeout_secs: u64,
     ) -> SFResult<String> {
         let cmdline = format!("{} {}", program, args.join(" "));
-        let fut = tokio::process::Command::new(program)
-            .args(args)
-            .current_dir(dir)
-            .kill_on_drop(true)
-            .output();
-        let output = tokio::time::timeout(Duration::from_secs(timeout_secs), fut)
-            .await
-            .map_err(|_| SFError::IO(crate::cmd_timeout::timed_out(&cmdline, timeout_secs)))?
-            .map_err(|e| SFError::IO(format!("failed to run {program}: {e}")))?;
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args).current_dir(dir).kill_on_drop(true);
+        let output = match cog_core::progress::run_child_watched(cmd, &cmdline).await {
+            Ok(cog_core::progress::ChildOutcome::Exited(output)) => output,
+            Err(e) => return Err(SFError::IO(format!("failed to run {program}: {e}"))),
+        };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(SFError::IO(format!("{cmdline} failed: {stderr}")));
@@ -78,13 +74,12 @@ impl GitOpsPublisher {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    async fn run(&self, program: &str, args: &[&str], timeout_secs: u64) -> SFResult<String> {
-        self.run_in(program, &self.repo_dir, args, timeout_secs)
-            .await
+    async fn run(&self, program: &str, args: &[&str]) -> SFResult<String> {
+        self.run_in(program, &self.repo_dir, args).await
     }
 
     async fn git_in(&self, dir: &std::path::Path, args: &[&str]) -> SFResult<String> {
-        self.run_in("git", dir, args, 120).await
+        self.run_in("git", dir, args).await
     }
 
     async fn git(&self, args: &[&str]) -> SFResult<String> {
@@ -170,10 +165,15 @@ impl GitOpsPublisher {
         // 目标写成完整 refname：refspec 的 src 是提交对象时 git 不再猜
         // destination，只给短分支名会被拒。
         let target_branch = self.config.branch.trim_start_matches("refs/heads/");
+        // `--progress`：看门狗按「还有没有产出」判它死，而 git 在 stderr 不是终端
+        // 时默认不吐进度。一次推大 pack 的等待于是既没有输出、也没有本进程的 CPU
+        // ——那是它被误判成停住的最短路径。远端在收包的时候，进度行就是它还在动的
+        // 证据。
         self.git_in(
             &dir,
             &[
                 "push",
+                "--progress",
                 &self.config.repo_url,
                 &format!("{head}:refs/heads/{target_branch}"),
             ],
@@ -183,6 +183,7 @@ impl GitOpsPublisher {
             &dir,
             &[
                 "push",
+                "--progress",
                 &self.config.repo_url,
                 &format!("refs/tags/{tag}:refs/tags/{tag}"),
             ],
@@ -290,10 +291,8 @@ impl GitOpsPublisher {
         let build_refs: Vec<&str> = build_args.iter().map(String::as_str).collect();
         let push_refs: Vec<&str> = push_args.iter().map(String::as_str).collect();
 
-        // 冷构建首拉基镜像（解压 ~1.5GB）给 30 分钟；热构建只有 COPY 秒级。
-        self.run(&self.config.builder_bin, &build_refs, 1800)
-            .await?;
-        self.run(&self.config.builder_bin, &push_refs, 900).await?;
+        self.run(&self.config.builder_bin, &build_refs).await?;
+        self.run(&self.config.builder_bin, &push_refs).await?;
         info!(image = %image, "Promotion overlay image pushed to registry");
         Ok(())
     }
@@ -345,8 +344,8 @@ impl GitOpsPublisher {
 /// 现役 tag 与它自己推镜像走的是同一个执行路径，别为读数另开一条。
 #[async_trait]
 impl CommandRunner for GitOpsPublisher {
-    async fn run(&self, program: &str, args: &[&str], timeout_secs: u64) -> SFResult<String> {
-        GitOpsPublisher::run(self, program, args, timeout_secs).await
+    async fn run(&self, program: &str, args: &[&str]) -> SFResult<String> {
+        GitOpsPublisher::run(self, program, args).await
     }
 }
 
@@ -469,7 +468,10 @@ mod tests {
         crate::test_support::write_executable(
             dir,
             "fake-buildah",
-            &format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 0\n", log.display()),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+                log.display()
+            ),
         )
     }
 
@@ -493,6 +495,7 @@ mod tests {
 
     fn change(id: &str) -> EvolutionResult {
         EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: id.into(),
             description: "test".into(),
@@ -713,7 +716,7 @@ mod tests {
     /// 空间。落日志用 printf 而不是 echo —— dash 的 echo 会解释参数里的 `\n`，
     /// jsonpath 那一段会散成多行，读出来的行数就不再是读的条数（这条曾把一次
     /// 正确的实现读成 5 条读）。
-    const FAKE_KUBECTL_BASE: &str = "#!/bin/sh\nverb=''\ntarget=''\nfor a in \"$@\"; do case \"$a\" in get|list|patch|apply|delete|rollout) verb=\"$a\";; deployment/*) target=\"$a\";; esac; done\nprintf '%s %s\\n' \"$verb\" \"$target\" >> \"$(dirname \"$0\")/argv.log\"\nname=$(printf '%s' \"$target\" | sed 's|^deployment/||')\nprintf '%s\\t%s=reg.test:5000/cogneva:main-abcdef012345\\n' \"$name\" \"$name\"\n";
+    const FAKE_KUBECTL_BASE: &str = "#!/bin/sh\nverb=''\ntarget=''\nfor a in \"$@\"; do case \"$a\" in get|list|patch|apply|delete|rollout) verb=\"$a\";; deployment/*|statefulset/*) target=\"$a\";; esac; done\nprintf '%s %s\\n' \"$verb\" \"$target\" >> \"$(dirname \"$0\")/argv.log\"\nname=$(printf '%s' \"$target\" | sed 's|^[a-z]*/||')\nprintf '%s\\t%s=reg.test:5000/cogneva:main-abcdef012345\\n' \"$name\" \"$name\"\n";
 
     #[tokio::test]
     async fn canary_overlay_uses_deployed_main_tag_as_base() {
@@ -752,12 +755,12 @@ mod tests {
             crate::live_revision::BASE_DEPLOYMENTS.len(),
             "基底要一个名字一条读，不是列一遍命名空间：{argv}"
         );
-        for name in crate::live_revision::BASE_DEPLOYMENTS {
+        for (resource, name) in crate::live_revision::BASE_DEPLOYMENTS {
             assert!(
                 reads
                     .iter()
-                    .any(|l| l.contains(&format!("get deployment/{name}"))),
-                "没有按名读 {name}：{argv}"
+                    .any(|l| l.contains(&format!("get {resource}/{name}"))),
+                "没有按名读 {resource}/{name}：{argv}"
             );
         }
     }
@@ -768,7 +771,7 @@ mod tests {
     #[tokio::test]
     async fn an_unreadable_canary_base_is_a_fallback_not_a_partial_claim() {
         let (central, work) = setup_repo().await;
-        let refused = "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in deployment/cogneva-sandbox-executor) echo 'Error from server (Forbidden): deployments.apps is forbidden' >&2; exit 1;; esac; done\nname=$(for a in \"$@\"; do case \"$a\" in deployment/*) echo \"$a\";; esac; done | sed 's|^deployment/||')\nprintf '%s\\t%s=reg.test:5000/cogneva:main-abcdef012345\\n' \"$name\" \"$name\"\n";
+        let refused = "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in statefulset/cogneva-sandbox-executor) echo 'Error from server (Forbidden): statefulsets.apps is forbidden' >&2; exit 1;; esac; done\nname=$(for a in \"$@\"; do case \"$a\" in deployment/*|statefulset/*) echo \"$a\";; esac; done | sed 's|^[a-z]*/||')\nprintf '%s\\t%s=reg.test:5000/cogneva:main-abcdef012345\\n' \"$name\" \"$name\"\n";
         let kubectl = crate::test_support::write_executable(work.path(), "fake-kubectl", refused);
 
         std::fs::write(work.path().join("cogneva"), b"staged-binary").unwrap();

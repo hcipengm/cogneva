@@ -15,10 +15,14 @@
 //! that invented owner are gone; when an authenticated chat arrives, the owner
 //! becomes a column on this table rather than a second table beside it.
 //!
-//! What is kept is a transcript, not an audit log: the oldest rows of a session
-//! fall off once it holds [`ROWS_KEPT_PER_SESSION`]. Unbounded growth is the
-//! other way a store like this dies, and a chat panel does not scroll back to
-//! last year.
+//! Reads are bounded to the newest [`ROWS_KEPT_PER_SESSION`] rows of a session --
+//! a chat panel does not scroll back to last year, and a prompt is built from the
+//! same window. Rows **outside** that window are no longer deleted: they are the
+//! only record of what was said, and an age/window bound that drops them is an
+//! age bound on a fact. They are counted instead (see
+//! [`PostgresChatTurnStore::overflow_beyond_window`]), and the count is what says
+//! an archive is owed. Deleting before that archive exists would make the table
+//! look smaller while the platform lost what it told a person.
 
 use async_trait::async_trait;
 use sqlx::PgPool;
@@ -26,6 +30,7 @@ use sqlx::PgPool;
 use cog_core::{SFError, SFResult};
 
 pub use cog_core::contract::conversation::{
+    ChatAttachment, ChatAttachmentInfo, ChatSessionSummary, ChatToolCall, ChatToolCallStatus,
     ChatTurn, ChatTurnRecord, ChatTurnRole, ChatTurnStore, ROWS_KEPT_PER_SESSION,
 };
 
@@ -45,13 +50,26 @@ impl PostgresChatTurnStore {
     /// `assistant` and `failure` are the two shapes a turn has: an answer that
     /// was delivered, or the reason none was. Exactly one of them is given, so a
     /// row can never claim both.
+    ///
+    /// `model` 只在「人打的那一行」与「模型读到的那一段」不是同一段字时给出
+    /// （一条 `/名字` 命令）：它写在用户那一行上，助手那一行永远是空的——回答
+    /// 展开成什么，交给模型的和界面上看到的是同一段。
+    // 每一格都是这一行上独立的一列（人打的那句、模型读到的那段、附件、回答、
+    // 失败原因、目标），打包成一个结构体只是把同一个形状换个地方写一遍。加列时
+    // 这里跟着加一个参数，读的人一眼看得出这一行现在由哪几样组成。
+    #[allow(clippy::too_many_arguments)]
     async fn write(
         &self,
         session_id: &str,
+        owner: &str,
         user: &str,
+        model: Option<&str>,
+        attachments: &[ChatAttachment],
         assistant: Option<&str>,
         failure: Option<&str>,
         goal: Option<&str>,
+        tool_calls: &[ChatToolCall],
+        agent: Option<&str>,
     ) -> SFResult<()> {
         if session_id.trim().is_empty() {
             return Err(SFError::Validation(
@@ -64,64 +82,107 @@ impl PostgresChatTurnStore {
             self.pool.begin().await.map_err(|e| {
                 SFError::Database(format!("start the chat turn's transaction: {e}"))
             })?;
+        // 附件与这一句同写一行，存成 JSON：它是一串形状固定的值，不是要按列查
+        // 的东西——拆成表只会让「这一行带了几张图」变成一次 join。
+        let attachments = serde_json::to_string(attachments)
+            .map_err(|e| SFError::Validation(format!("attachments cannot be serialised: {e}")))?;
+        // 没有工具调用时写 `NULL` 而不是 `[]`：老行也是 `NULL`，两者对读者是同一
+        // 件事，写空数组只会让「这一行走过这条路径」与「这一行比这个列老」看起来
+        // 不同。
+        let tool_calls = if tool_calls.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(tool_calls).map_err(|e| {
+                SFError::Validation(format!("tool calls cannot be serialised: {e}"))
+            })?)
+        };
+        let agent = agent.filter(|name| !name.trim().is_empty());
         let mut query = sqlx::query(match (assistant, goal) {
             (Some(_), Some(_)) => INSERT_DISPATCHED_TURN_SQL,
             (Some(_), None) => INSERT_TURN_SQL,
             (None, _) => INSERT_FAILED_TURN_SQL,
         })
         .bind(session_id)
+        .bind(owner)
         .bind(user);
         query = match (assistant, goal) {
-            (Some(reply), Some(goal_id)) => query.bind(reply).bind(goal_id),
-            (Some(reply), None) => query.bind(reply),
-            (None, _) => query.bind(failure.unwrap_or("")),
+            (Some(reply), Some(goal_id)) => query
+                .bind(attachments)
+                .bind(model)
+                .bind(reply)
+                .bind(goal_id)
+                .bind(tool_calls)
+                .bind(agent),
+            (Some(reply), None) => query
+                .bind(attachments)
+                .bind(model)
+                .bind(reply)
+                .bind(tool_calls)
+                .bind(agent),
+            (None, _) => query
+                .bind(failure.unwrap_or(""))
+                .bind(attachments)
+                .bind(tool_calls)
+                .bind(agent),
         };
         query
             .execute(&mut *tx)
             .await
             .map_err(|e| SFError::Database(format!("record a chat turn: {e}")))?;
-        // Same transaction as the insert: a trim that ran on its own could
-        // delete a row another writer had just appended to a different session,
-        // and a crash between the two would leave the bound unenforced.
-        sqlx::query(TRIM_TURNS_SQL)
-            .bind(session_id)
-            .bind(ROWS_KEPT_PER_SESSION)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| SFError::Database(format!("trim the chat transcript: {e}")))?;
         tx.commit()
             .await
             .map_err(|e| SFError::Database(format!("commit the chat turn: {e}")))?;
         Ok(())
+    }
+
+    /// Rows of `session_id` older than its newest `keep` -- the part a reader
+    /// will never be shown again, and therefore the part an archive owes.
+    ///
+    /// The answer may be zero or large; either way nothing is deleted here.
+    pub async fn overflow_beyond_window(&self, session_id: &str, keep: i64) -> SFResult<i64> {
+        sqlx::query_scalar(COUNT_OVERFLOW_SQL)
+            .bind(session_id)
+            .bind(keep)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("count the chat transcript overflow: {e}")))
     }
 }
 
 /// One statement for the pair, so the transcript never holds a question whose
 /// answer is missing.
 const INSERT_TURN_SQL: &str = "\
-INSERT INTO chat_turns (session_id, role, content) \
-VALUES ($1, 'user', $2), ($1, 'assistant', $3)";
+INSERT INTO chat_turns (session_id, owner, role, content, attachments, model_content, tool_calls, agent_id) \
+VALUES ($1, $2, 'user', $3, $4, $5, NULL, NULL), ($1, $2, 'assistant', $6, NULL, NULL, $7, $8)";
 
 /// The same pair for a turn that handed its work to the orchestrator. The goal
 /// goes on the assistant row only: the reply is where the platform said what it
 /// did with the message, and the question is not what carries a goal.
 const INSERT_DISPATCHED_TURN_SQL: &str = "\
-INSERT INTO chat_turns (session_id, role, content, goal_id) \
-VALUES ($1, 'user', $2, NULL), ($1, 'assistant', $3, $4)";
+INSERT INTO chat_turns (session_id, owner, role, content, attachments, model_content, goal_id, tool_calls, agent_id) \
+VALUES ($1, $2, 'user', $3, $4, $5, NULL, NULL, NULL), ($1, $2, 'assistant', $6, NULL, NULL, $7, $8, $9)";
 
 /// The same pair for an exchange that never got an answer: the reply's content
 /// is empty because nothing was said, and `failure` carries why. Both rows get
 /// the reason so a reader that finds either half knows what happened to the
 /// turn.
+///
+/// The assistant row still carries the tool calls: a turn that ran tools and
+/// then failed to answer did that work, and "what it was doing when it broke" is
+/// the question a reopened conversation is read for.
 const INSERT_FAILED_TURN_SQL: &str = "\
-INSERT INTO chat_turns (session_id, role, content, failure) \
-VALUES ($1, 'user', $2, $3), ($1, 'assistant', '', $3)";
+INSERT INTO chat_turns (session_id, owner, role, content, failure, attachments, tool_calls, agent_id) \
+VALUES ($1, $2, 'user', $3, $4, $5, NULL, NULL), ($1, $2, 'assistant', '', $4, NULL, $6, $7)";
 
-/// Drop what fell out of the window. `NOT IN` over the newest rows keeps the
-/// bound per session rather than global: one busy session must not push another
-/// one's history out.
-const TRIM_TURNS_SQL: &str = "\
-DELETE FROM chat_turns \
+/// How many rows of this session sit outside its window -- **counted, not
+/// deleted**.
+///
+/// `NOT IN` over the newest rows keeps the bound per session rather than
+/// global: one busy session must not push another one's history out. The count
+/// is the reading that says an archive is owed; the rows themselves stay until
+/// a readable copy exists and reads back byte for byte.
+const COUNT_OVERFLOW_SQL: &str = "\
+SELECT count(*) FROM chat_turns \
 WHERE session_id = $1 \
   AND id NOT IN ( \
       SELECT id FROM chat_turns WHERE session_id = $1 ORDER BY id DESC LIMIT $2 \
@@ -130,9 +191,11 @@ WHERE session_id = $1 \
 /// The newest `limit` rows, then put back into the order a prompt is built in.
 /// Reading oldest-first directly would need a count of the session, which is a
 /// second query that can disagree with the first under a concurrent write.
+/// `model_content` 优先：一行命令在记录里存的是人打的那一行，交给模型的却是展开
+/// 后的说明，而这一条查询回答的正是「这一段对话交给过模型什么」。
 const HISTORY_SQL: &str = "\
-SELECT role, content FROM ( \
-    SELECT id, role, content FROM chat_turns \
+SELECT role, COALESCE(model_content, content) AS content, attachments FROM ( \
+    SELECT id, role, content, model_content, attachments FROM chat_turns \
     WHERE session_id = $1 AND failure IS NULL \
     ORDER BY id DESC LIMIT $2 \
 ) newest \
@@ -142,26 +205,112 @@ ORDER BY id";
 /// of the `failure IS NULL` filter: the unanswered half is exactly what a
 /// reopened conversation has to show.
 const TRANSCRIPT_SQL: &str = "\
-SELECT id, role, content, failure, goal_id, created_at FROM ( \
-    SELECT id, role, content, failure, goal_id, created_at FROM chat_turns \
+SELECT id, role, content, failure, goal_id, attachments, tool_calls, agent_id, created_at FROM ( \
+    SELECT id, role, content, failure, goal_id, attachments, tool_calls, agent_id, created_at FROM chat_turns \
     WHERE session_id = $1 \
     ORDER BY id DESC LIMIT $2 \
 ) newest \
 ORDER BY id";
 
+/// One person's sessions, newest activity first, with the line that opened each.
+///
+/// `strpos(lower(..))` rather than `ILIKE '%' || $2 || '%'`: the search text
+/// comes from a person, and `%` or `_` typed into a search box is a character
+/// being looked for, not a wildcard. Grouped by session with `MAX(created_at)`
+/// as the order key, because "most recently spoken in" is what a reader means
+/// when they expect the conversation they just left at the top.
+///
+/// `turns` counts the question rows, not the table's rows: a turn is written as
+/// a pair, so counting rows would report two per exchange and the same
+/// conversation would show twice as long a list of turns as it had turns.
+const SESSIONS_SQL: &str = "\
+SELECT s.session_id, \
+       (SELECT t.content FROM chat_turns t \
+         WHERE t.session_id = s.session_id AND t.role = 'user' \
+         ORDER BY t.id LIMIT 1) AS first_line, \
+       MAX(s.created_at) AS last_activity_at, \
+       COUNT(*) FILTER (WHERE s.role = 'user') AS turns \
+FROM chat_turns s \
+WHERE s.owner = $1 \
+GROUP BY s.session_id \
+HAVING $2 = '' OR EXISTS ( \
+    SELECT 1 FROM chat_turns m \
+     WHERE m.session_id = s.session_id \
+       AND strpos(lower(m.content), lower($2)) > 0 \
+) \
+ORDER BY MAX(s.created_at) DESC \
+LIMIT $3";
+
+/// 一行的附件列。`NULL` 是「这一行没有附件」——老行与助手那一行都是它，
+/// 空数组与它在这里不区分：两者对读者、对提示词都是同一个意思。
+fn parse_attachments(raw: Option<&str>) -> SFResult<Vec<ChatAttachment>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(raw).map_err(|e| {
+        SFError::Database(format!(
+            "chat transcript holds attachments this build cannot read: {e}"
+        ))
+    })
+}
+
+/// 一行的工具调用列。与附件同一种读法：`NULL` 与空串都是「这一行没有」。
+fn parse_tool_calls(raw: Option<&str>) -> SFResult<Vec<ChatToolCall>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(raw).map_err(|e| {
+        SFError::Database(format!(
+            "chat transcript holds tool calls this build cannot read: {e}"
+        ))
+    })
+}
+
 #[async_trait]
 impl ChatTurnStore for PostgresChatTurnStore {
-    async fn record_turn(&self, session_id: &str, user: &str, assistant: &str) -> SFResult<()> {
-        self.write(session_id, user, Some(assistant), None, None)
-            .await
+    async fn record_turn(
+        &self,
+        session_id: &str,
+        owner: &str,
+        user: &str,
+        model_content: Option<&str>,
+        attachments: &[ChatAttachment],
+        assistant: &str,
+        tool_calls: &[ChatToolCall],
+        agent: Option<&str>,
+    ) -> SFResult<()> {
+        self.write(
+            session_id,
+            owner,
+            user,
+            model_content,
+            attachments,
+            Some(assistant),
+            None,
+            None,
+            tool_calls,
+            agent,
+        )
+        .await
     }
 
     async fn record_dispatched_turn(
         &self,
         session_id: &str,
+        owner: &str,
         user: &str,
+        model_content: Option<&str>,
+        attachments: &[ChatAttachment],
         assistant: &str,
         goal_id: &str,
+        tool_calls: &[ChatToolCall],
+        agent: Option<&str>,
     ) -> SFResult<()> {
         if goal_id.trim().is_empty() {
             return Err(SFError::Validation(
@@ -170,43 +319,81 @@ impl ChatTurnStore for PostgresChatTurnStore {
                     .into(),
             ));
         }
-        self.write(session_id, user, Some(assistant), None, Some(goal_id))
-            .await
+        self.write(
+            session_id,
+            owner,
+            user,
+            model_content,
+            attachments,
+            Some(assistant),
+            None,
+            Some(goal_id),
+            tool_calls,
+            agent,
+        )
+        .await
     }
 
     async fn record_failed_turn(
         &self,
         session_id: &str,
+        owner: &str,
         user: &str,
+        attachments: &[ChatAttachment],
         failure: &str,
+        tool_calls: &[ChatToolCall],
+        agent: Option<&str>,
     ) -> SFResult<()> {
-        self.write(session_id, user, None, Some(failure), None)
-            .await
+        self.write(
+            session_id,
+            owner,
+            user,
+            None,
+            attachments,
+            None,
+            Some(failure),
+            None,
+            tool_calls,
+            agent,
+        )
+        .await
     }
 
     async fn history(&self, session_id: &str, limit: usize) -> SFResult<Vec<ChatTurn>> {
+        // `limit` is the caller's ask, not the store's bound: the window is the
+        // per-session bound, and a caller asking for more than it is served the
+        // window. Without this clamp the HTTP layer's own 500 would read 500
+        // lines of a session the constant says is kept to 200.
+        let limit = limit.min(ROWS_KEPT_PER_SESSION as usize);
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let rows: Vec<(String, String)> = sqlx::query_as(HISTORY_SQL)
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(HISTORY_SQL)
             .bind(session_id)
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| SFError::Database(format!("read the chat transcript: {e}")))?;
         rows.into_iter()
-            .map(|(role, content)| {
+            .map(|(role, content, attachments)| {
                 let role = ChatTurnRole::parse(&role).ok_or_else(|| {
                     SFError::Database(format!(
                         "chat transcript holds a role this build cannot name: {role:?}"
                     ))
                 })?;
-                Ok(ChatTurn { role, content })
+                Ok(ChatTurn {
+                    role,
+                    content,
+                    attachments: parse_attachments(attachments.as_deref())?,
+                })
             })
             .collect()
     }
 
     async fn transcript(&self, session_id: &str, limit: usize) -> SFResult<Vec<ChatTurnRecord>> {
+        // The same window as `history`: the reader's page size may narrow it,
+        // never widen it. The HTTP layer's `limit` comes from the client.
+        let limit = limit.min(ROWS_KEPT_PER_SESSION as usize);
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -214,6 +401,9 @@ impl ChatTurnStore for PostgresChatTurnStore {
             i64,
             String,
             String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
             Option<String>,
             Option<String>,
             chrono::DateTime<chrono::Utc>,
@@ -224,21 +414,112 @@ impl ChatTurnStore for PostgresChatTurnStore {
             .await
             .map_err(|e| SFError::Database(format!("read the chat transcript: {e}")))?;
         rows.into_iter()
-            .map(|(id, role, content, failure, goal, created_at)| {
-                let role = ChatTurnRole::parse(&role).ok_or_else(|| {
-                    SFError::Database(format!(
-                        "chat transcript holds a role this build cannot name: {role:?}"
-                    ))
-                })?;
-                Ok(ChatTurnRecord {
-                    id,
-                    role,
-                    content,
-                    failure,
-                    goal,
-                    created_at,
-                })
-            })
+            .map(
+                |(id, role, content, failure, goal, attachments, tool_calls, agent, created_at)| {
+                    let role = ChatTurnRole::parse(&role).ok_or_else(|| {
+                        SFError::Database(format!(
+                            "chat transcript holds a role this build cannot name: {role:?}"
+                        ))
+                    })?;
+                    Ok(ChatTurnRecord {
+                        id,
+                        role,
+                        content,
+                        failure,
+                        goal,
+                        // 读者认得出这份附件是什么，但拿不到它的字节：字节留在记录里
+                        // 给提示词用，翻一页历史不该把每张图再下载一遍。
+                        attachments: parse_attachments(attachments.as_deref())?
+                            .into_iter()
+                            .map(|attachment| ChatAttachmentInfo {
+                                name: attachment.name,
+                                mime_type: attachment.mime_type,
+                            })
+                            .collect(),
+                        // 工具调用原样交回去：它们是重开页面时要重画的那张待办面板
+                        // 的唯一来源，实时帧在页面关掉那一刻就断了。
+                        tool_calls: parse_tool_calls(tool_calls.as_deref())?,
+                        agent: agent.filter(|name| !name.trim().is_empty()),
+                        created_at,
+                    })
+                },
+            )
             .collect()
     }
+
+    async fn owner_of(&self, session_id: &str) -> SFResult<Option<String>> {
+        // The first named row claims the session: an empty owner means "written
+        // before anyone was identified", and skipping those rows is what makes
+        // the answer stable once a name is on the session. `LIMIT 1` over the
+        // id order, not `MIN(owner)` -- the claim belongs to the earliest row.
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT owner FROM chat_turns \
+             WHERE session_id = $1 AND owner <> '' \
+             ORDER BY id ASC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(format!("read who a chat session belongs to: {e}")))?;
+        Ok(row.map(|(owner,)| owner))
+    }
+
+    async fn sessions(
+        &self,
+        owner: &str,
+        limit: usize,
+        search: Option<&str>,
+    ) -> SFResult<Vec<ChatSessionSummary>> {
+        // Nobody's conversations are not listed for anyone: `""` is the owner of
+        // rows written before the column existed and of connections that never
+        // named a person, and answering that with every unowned conversation
+        // would put them all in front of whoever asked with an empty identity.
+        if owner.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let probe = search.unwrap_or("").trim().to_string();
+        let rows: Vec<(String, String, chrono::DateTime<chrono::Utc>, i64)> =
+            sqlx::query_as(SESSIONS_SQL)
+                .bind(owner)
+                .bind(&probe)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| SFError::Database(format!("list the chat sessions: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(session_id, first_line, last_activity_at, turns)| ChatSessionSummary {
+                    session_id,
+                    title: title_of(&first_line),
+                    last_activity_at,
+                    turns,
+                },
+            )
+            .collect())
+    }
+}
+
+/// The first thing said in a session, cut to something a list row can hold.
+///
+/// A title is a pointer, not the message: the whole first line lives in the
+/// transcript and is one click away. Cutting at a character boundary matters
+/// here because the first line is often Chinese, where a byte cut would split a
+/// character and produce text that no longer says what it said.
+fn title_of(first_line: &str) -> String {
+    // cap: fixed — a list row's width, not a resource bound: the whole first line
+    // keep: 删掉后列表一行放不下第一句，读者只看到半行；由「一行是一整句开头的宽度」兜住
+    // stays in the transcript and is one click away.
+    const MAX_CHARS: usize = 60;
+    let mut title: String = first_line
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(MAX_CHARS)
+        .collect();
+    if first_line.chars().count() > MAX_CHARS {
+        title.push('…');
+    }
+    title.trim().to_string()
 }

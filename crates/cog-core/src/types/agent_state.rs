@@ -71,33 +71,219 @@ pub fn agent_id_for(task_id: &str, role: &str) -> String {
     format!("{}-{role}", squad_id_for(task_id))
 }
 
+/// [`agent_id_for`] 的反向：这个地址是 `task_id` 的哪一把座位。
+///
+/// 账本要在「进 running」那一刻记下这一段的角色，而那一刻手里只有执行地址
+/// ——角色没有第二处可读，它只写在地址里。所以反解与正拼放在一起，一次测试
+/// 管住两头：名字的形状改了而这里没改，两段尝试会各自记下自己的角色，读的
+/// 人却看不出哪个是哪个。
+///
+/// `None` 是「这不是这件任务的座位」：一个人的工号、别的任务的座位、或者
+/// 空座位名，都不该被认成这里的职务。
+pub fn role_of_seat<'a>(task_id: &str, agent_id: &'a str) -> Option<&'a str> {
+    let prefix = format!("{}-", squad_id_for(task_id));
+    let role = agent_id.strip_prefix(prefix.as_str())?;
+    (!role.is_empty()).then_some(role)
+}
+
+/// 一个 id 背后站着的那个人；座位形的 id 背后还没有人。
+///
+/// 人与座位是两件事：人是稳定的身份，座位是 `(task, role)` 的一段执行地址。
+/// 名字是这一刻唯一能把两者分开的东西——座位全都叫 [`SQUAD_ID_PREFIX`] 开头的
+/// `squad:<任务>-<座位>`，其余 id（安装期定下的名字、`employee:<建号>`）都属于
+/// 一个具体的人，那个人就是它自己。
+///
+/// `None` 是读数，不是缺字段：它说的正是「这个座位背后还没有人」。座位什么时候
+/// 有了人，记在任务任命上（`assignment_of`），名册行里不另存一格，到那时形状
+/// 答不出来，只有那一格答得出来。
+pub fn person_id_for(agent_id: &str) -> Option<&str> {
+    if agent_id.starts_with(SQUAD_ID_PREFIX) {
+        None
+    } else {
+        Some(agent_id)
+    }
+}
+
+/// 一条任命：哪个员工在哪个任务节点上、以什么职务、租约到什么时候。
+///
+/// 这是**读模型**，不是第五张表：任务节点是唯一的记录，职务由节点的
+/// [`crate::TaskType`] 给定（职务属于任务，不属于人），座位地址由
+/// [`agent_id_for`] 从任务与职务推出，租约就是行上的那两列。池里的位置不在
+/// 这里——它是运行时事实（谁此刻占着这个地址），不是身份。
+pub struct Assignment<'a> {
+    /// 任务节点。
+    pub task_id: &'a str,
+    /// 职务：这个节点要人做什么。
+    pub role: String,
+    /// 座位地址，由任务与职务推出；不另存一处。
+    pub seat_id: String,
+    /// 坐在这个节点上的员工；`None` 是「这个座位背后还没有人」。
+    pub person: Option<&'a str>,
+    /// 租约持有者与到期时刻；两列都在任务行上。
+    pub lease_owner: Option<&'a str>,
+    pub lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// 从任务节点读出一条任命。
+pub fn assignment_of(task: &crate::Task) -> Assignment<'_> {
+    let role = task.task_type.kind_key();
+    let seat_id = agent_id_for(&task.id, &role);
+    Assignment {
+        task_id: &task.id,
+        role,
+        seat_id,
+        person: task.agent_id.as_deref().and_then(person_id_for),
+        lease_owner: task.lease_owner.as_deref(),
+        lease_expires_at: task.lease_expires_at,
+    }
+}
+
+/// The prefix every employee's checkout is named with.
+///
+/// The prefix is also how the executor tells an employee's tree from a task's:
+/// an employee's tree comes back on the next turn and is never reaped for
+/// idleness, while a task's is reaped once that task's work is over -- see
+/// [`WORKTREE_TASK_PREFIX`] for the other half.
+pub const WORKTREE_LANE_PREFIX: &str = "employee-";
+
+/// The prefix every task's checkout is named with.
+///
+/// The prefix is how the executor tells a task's tree from an employee's, and
+/// that distinction decides which trees may be reaped for idleness: an
+/// employee's comes back on the next turn, while a task's is spent when the
+/// task is. Keeping it a prefix rather than a separate namespace is what makes
+/// the two kinds of lane one flat map everywhere else.
+pub const WORKTREE_TASK_PREFIX: &str = "task-";
+
+/// The longest a checkout's name may be.
+///
+/// A lane is used as a directory name (`<workspaces>/<lane>`) and as a branch
+/// name (`work/<lane>`), so what bounds it is the filesystem's limit on one
+/// path component -- 255 bytes on Linux -- with the branch's own prefix taken
+/// off. Exported because the executor's router validates the same names and
+/// would otherwise keep a ceiling of its own: the tighter of the two silently
+/// becomes the real one, and an id past it loses its checkout rather than
+/// failing anywhere a reader could see.
+// cap: fixed — Linux NAME_MAX (255 bytes per path component, a platform limit rather than this deployment's capacity) less the `work/` a branch name adds; no reading can move it, the kernel defines it
+// keep: 删掉后回到「Linux NAME_MAX (255 bytes per path component, a platform limit rather than this deployment's capacity) less the `work/` a branch name adds; no reading can move it, the kernel defines it」所描述的情形；由这条约定兜住
+pub const MAX_CHECKOUT_NAME_CHARS: usize = 255 - "work/".len();
+
+/// `-` plus the eight hex digits that end a truncated lane.
+// cap: fixed — 一个 `-` 和八位十六进制；它数的是指纹的写法，不是这台机器能承受多少
+// keep: 删掉后指纹的写法由调用点各拼一次，截断标识对不上；由「一个 - 和八位十六进制」兜住
+const TRUNCATION_TAIL_CHARS: usize = 9;
+
+/// A stable 32-bit fingerprint of the whole id, used only to end a truncated
+/// lane.
+///
+/// Written out instead of taking `std::collections::hash_map::DefaultHasher`,
+/// whose algorithm is deliberately unspecified: a toolchain upgrade would
+/// compute a different name for the same employee and hand it an empty tree.
+fn lane_fingerprint(text: &str) -> u32 {
+    // FNV-1a.
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in text.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// The checkout an employee works in, named after the employee.
+///
+/// One derivation, two readers that cannot import each other: the run writes
+/// this name into the system prefix so the model knows where its files land,
+/// and the executor routes every request by it. Two spellings do not fail --
+/// they put a turn's files in one tree while the prompt names another, and
+/// every later read of that tree then reads a checkout the model was never
+/// told about.
+///
+/// The id is folded to the byte set a worktree directory accepts, because agent
+/// ids carry characters a path should not: a task's agent is spelled
+/// `squad:<task>-<role>`, and a chat employee's id is a uuid.
+///
+/// A name that has to be shortened ends with a fingerprint of the full id.
+/// Truncating alone aliases: two ids sharing their first `LANE_NAME_MAX_CHARS`
+/// characters would land in one tree, and nothing downstream could tell that
+/// two people were writing there.
+pub fn worktree_lane(agent_id: &str) -> String {
+    fold_lane_name(WORKTREE_LANE_PREFIX, agent_id)
+}
+
+/// The checkout a task's work is done in.
+///
+/// A task is the unit of isolation: a planner reading, a generator writing and
+/// an evaluator running the same task all see one tree, and it is the task's
+/// tree rather than any one person's. The id is folded the same way an
+/// employee's is, so a task id carrying characters a path should not still
+/// names a directory -- and a shortened one ends with a fingerprint, so two
+/// ids sharing a prefix cannot alias onto one tree.
+pub fn worktree_task_lane(task_id: &str) -> String {
+    fold_lane_name(WORKTREE_TASK_PREFIX, task_id)
+}
+
+/// The checkout a call works in.
+///
+/// A call that names a task works in that task's tree; one that names only an
+/// employee works in the employee's own. The task wins because the task is
+/// what the work is: all the roles working on it must see the same files, and
+/// a tree named after the person would put one task's planner and generator in
+/// different checkouts while both believe they are looking at the task.
+///
+/// Both readers of this -- the executor that routes a call and the run that
+/// names the tree in its system prefix -- call this one function. Two
+/// derivations do not fail loudly; they leave the model told about one tree
+/// while its calls land in another.
+///
+/// `None` when neither id names anything: a call with no identity works outside
+/// any checkout rather than in a tree shared with everyone.
+pub fn checkout_lane(task_id: Option<&str>, agent_id: Option<&str>) -> Option<String> {
+    if let Some(task) = task_id.map(str::trim).filter(|id| !id.is_empty()) {
+        return Some(worktree_task_lane(task));
+    }
+    agent_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(worktree_lane)
+}
+
+/// Fold an id to the byte set a checkout name accepts, under the given prefix.
+fn fold_lane_name(prefix: &str, id: &str) -> String {
+    let budget = MAX_CHECKOUT_NAME_CHARS - prefix.len();
+    let folded: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // A leading dot names a hidden directory, which the router refuses; taking
+    // it off here means the refusal never has to be discovered as a failed
+    // call, and the prompt still names the tree that will be used.
+    let folded = folded.trim_start_matches('.').to_string();
+    if folded.chars().count() <= budget {
+        return format!("{prefix}{folded}");
+    }
+    let kept: String = folded
+        .chars()
+        .take(budget - TRUNCATION_TAIL_CHARS)
+        .collect();
+    format!("{prefix}{kept}-{:08x}", lane_fingerprint(&folded))
+}
+
 /// 数字员工名册：人名的唯一来源。
 ///
-/// 列表只管"好不好认"：名字的唯一性由 [`display_name_for`] 尾部那 8 位短码
-/// 承担，因此名册不需要很长。**长度不能随手改**——选取是 `哈希 % 名字数`，
-/// 增删一个名字会让所有员工换名，按旧名记下的归属就读不回同一个人。
+/// 列表只管"好不好认"：唯一性由 id 尾部那 8 位短码承担（见 [`unregistered_label`]
+/// 与 `cog_agent::identity` 的 id 派生），因此名册不需要很长。**长度不能随手改**
+/// ——选取是 `哈希 % 名字数`，增删一个名字会让所有员工换名，按旧名记下的归属就
+/// 读不回同一个人。
 pub const NAME_POOL: &[&str] = &[
     "Alice", "Ralph", "Nova", "Kai", "Vera", "Orion", "Sage", "Echo", "Iris", "Leo", "Mira",
     "Quinn", "Ada", "Felix", "Luna", "Max",
 ];
-
-/// 任意 agent 的展示名，形如 `Nova#3f2a91c7`。
-///
-/// 路由用的 id 必须由 (task, role) 推出来（[`agent_id_for`]）——两端各算一次
-/// 还得对上，所以它不能带人名。展示名反过来由 id 推出：纯函数、同一个 id 永远
-/// 是同一个人、不同 id 撞名概率是 2^-32 量级。这样"谁在干这件事"在名册、
-/// 日志、提交里都读得成一个名字，而路由那一侧一个字节都不用动。
-pub fn display_name_for(agent_id: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(agent_id.as_bytes());
-    let selector = u64::from_be_bytes(digest[0..8].try_into().unwrap_or([0; 8]));
-    let persona = NAME_POOL[(selector as usize) % NAME_POOL.len()];
-    let short = digest[8..12]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    format!("{persona}#{short}")
-}
 
 // ─── 工号 ＋ 姓名 ────────────────────────────────────────────────────────
 //
@@ -164,6 +350,29 @@ pub fn employee_name(number: u32) -> String {
     name
 }
 
+/// 一个人的唯一身份：由工号推出，`E0412`。
+///
+/// 与 [`employee_label`] 同一个前缀、同一处派生——展示名是「这个 id ＋ 姓名」，
+/// 不是另拼一份。身份与登记地址分开：地址（`agent_id`）是这个人此刻被叫到的
+/// 地方，换 Pod、换槽位都不换人；工号发出去之后也不换，所以由它推出的身份
+/// 跨重装稳定。这里不出现第二个拼法：要问「这个人是谁」，读这一格。
+pub fn employee_identity(number: u32) -> String {
+    format!("{prefix}{number:04}", prefix = EMPLOYEE_NUMBER_PREFIX)
+}
+
+/// [`employee_identity`] 的反向：这个 id 是哪个工号的人。
+///
+/// 员工 id 就是工号的字符串形式，没有第二层包装。只认这一个形状；座位
+/// （`squad:` 开头）、旧随机地址、别的任务席位都答 `None`——「这不是一个
+/// 由工号推出的员工 id」与「读不出来」是同一个答案，因为两者都只能退回旧口径。
+pub fn employee_number_of(employee_id: &str) -> Option<u32> {
+    let digits = employee_id.strip_prefix(EMPLOYEE_NUMBER_PREFIX)?;
+    if digits.len() < 4 || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 /// 名册、对话、日志里给人的那一行：`E0412 林清和`。
 pub fn employee_label(number: u32) -> String {
     format!(
@@ -190,43 +399,171 @@ pub fn unregistered_label(agent_id: &str) -> String {
 mod naming_tests {
     use super::*;
 
-    /// 一个 id 永远对应同一个名字：名字是读出来的一列，不是存下来的状态，
-    /// 重算一次就得对上，否则名册里同一个人会有两个名字。
+    /// 人形 id 背后的人是它自己，座位形 id 背后是「还没有人」。
+    ///
+    /// 这一格的两个答案必须分得开：`None` 不是「读不到」，是「这个座位背后还
+    /// 没有人」。把座位也算成一个人，名册就会在任务一多时凭空长出几百个「人」，
+    /// 而读的人分不出哪个是真员工。
     #[test]
-    fn a_display_name_is_a_function_of_the_id() {
-        let id = agent_id_for("task-1", "planner");
-        assert_eq!(display_name_for(&id), display_name_for(&id));
-        assert_ne!(
-            display_name_for(&id),
-            display_name_for(&agent_id_for("task-2", "planner"))
+    fn a_seat_has_no_person_and_an_employee_is_their_own_person() {
+        assert_eq!(person_id_for("mira-512bfc48"), Some("mira-512bfc48"));
+        assert_eq!(
+            person_id_for("employee:0e2ba053"),
+            Some("employee:0e2ba053")
         );
+        assert_eq!(
+            person_id_for(&agent_id_for("task-1", "generator")),
+            None,
+            "座位背后还没有人"
+        );
+        // 前缀是唯一的分界线：名字里带 squad 但不在开头的是一个人，不是座位。
+        assert_eq!(person_id_for("squad-member-kai"), Some("squad-member-kai"));
     }
 
-    /// 名册里的每个单元都要有自己的名字：撞名等于读的人分不出是谁在干。
+    /// 任命由任务节点推出：职务来自节点、座位由任务＋职务推、租约照抄行上两列；
+    /// 人是人的 id，座位形地址背后是「还没有人」。
     #[test]
-    fn distinct_agents_get_distinct_names() {
-        let mut names = std::collections::HashSet::new();
-        for t in 0..200 {
-            for role in ["planner", "generator", "evaluator"] {
-                let id = agent_id_for(&format!("task-{t}"), role);
-                assert!(
-                    names.insert(display_name_for(&id)),
-                    "two agents share a name: {id}"
-                );
-            }
+    fn an_assignment_is_derived_from_the_task_node() {
+        let mut task = crate::Task::new("t-1", crate::TaskType::Generator, serde_json::json!({}));
+        task.agent_id = Some("employee:7".into());
+        task.lease_owner = Some("pod-a".into());
+        task.lease_expires_at = Some(chrono::DateTime::from_timestamp(100, 0).unwrap());
+        let a = assignment_of(&task);
+        assert_eq!(a.task_id, "t-1");
+        // 拼写取任务 JSON 里的那一把尺子（`TaskType` 的 serde 形状是 snake_case），
+        // 不是变体名：席位地址与按种类取的样本都按它算，两处换了任一处都读不到行。
+        assert_eq!(a.role, "generator", "职务由节点的 TaskType 给定");
+        assert_eq!(
+            a.seat_id,
+            agent_id_for("t-1", "generator"),
+            "座位地址由任务与职务推出，不另存一处"
+        );
+        assert_eq!(a.person, Some("employee:7"));
+        assert_eq!(a.lease_owner, Some("pod-a"));
+        assert!(a.lease_expires_at.is_some());
+
+        // 地址本身就是座位形：这个座位背后还没有人。
+        task.agent_id = Some(agent_id_for("t-1", "Generator"));
+        assert_eq!(assignment_of(&task).person, None);
+    }
+
+    /// 角色能从执行地址里原样读回来：账本记「这一段是谁的哪把椅子」时只有地址。
+    ///
+    /// 两条错法各判一次：把别的任务（或别人的工号）认成本任务的座位，会让一处
+    /// 尝试记上别处的职务；任务 id 互为前缀时（`t-1` 与 `t-11`）少判一个分隔符
+    /// 就会把 `t-11` 的座位算成 `t-1` 的。
+    #[test]
+    fn a_seat_reads_back_the_role_it_was_built_with() {
+        for (task, role) in [
+            ("t-1", "planner"),
+            ("t-11", "generator"),
+            ("DSC-1A2B", "evaluator"),
+        ] {
+            let seat = agent_id_for(task, role);
+            assert_eq!(role_of_seat(task, &seat), Some(role));
         }
+        assert_eq!(role_of_seat("t-1", &agent_id_for("t-11", "planner")), None);
+        assert_eq!(role_of_seat("t-11", &agent_id_for("t-1", "planner")), None);
+        assert_eq!(role_of_seat("t-1", "mira-512bfc48"), None);
+        assert_eq!(
+            role_of_seat("t-1", &squad_id_for("t-1")),
+            None,
+            "空座位名不是职务"
+        );
     }
 
+    /// 车道名只由 id 决定，且落在目录名允许的那一组字节里。
+    ///
+    /// 任务里的执行体是 `squad:<task>-<role>`，冒号不是目录名该有的字节；折完
+    /// 之后名字仍然认得出是谁（任务号与角色都在），只是换了几个分隔符。
     #[test]
-    fn the_display_name_reads_as_a_person() {
-        let name = display_name_for(&agent_id_for("task-1", "planner"));
-        let (persona, short) = name.split_once('#').expect("handle carries a #");
-        assert!(
-            NAME_POOL.contains(&persona),
-            "persona {persona} not in the pool"
+    fn a_lane_name_is_folded_from_the_agent_id() {
+        assert_eq!(
+            worktree_lane("squad:DSC-1A2B-generator"),
+            "employee-squad-DSC-1A2B-generator"
         );
-        assert_eq!(short.len(), 8);
-        assert!(short.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(
+            worktree_lane("kai.a9ab11fc"),
+            "employee-kai.a9ab11fc",
+            "合法的字节不该被动，读者要能一眼认出是谁"
+        );
+        // 前导点会被路由当成隐藏目录拒绝；去掉它，而不是让调用去撞那道拒绝。
+        assert_eq!(worktree_lane(".hidden"), "employee-hidden");
+        // 超长 id 截断在文件系统给单个名字的上限以内：车道既是目录名，也是
+        // `work/<lane>` 这条分支名，两处都得装得下。
+        let long = worktree_lane(&"x".repeat(400));
+        assert!(
+            long.len() + "work/".len() <= 255,
+            "车道名 {} 字节，加上分支前缀就超过文件系统的单名上限了",
+            long.len()
+        );
+        // 截断不许制造别名：两个 id 前 300 个字符一样，也必须落进两棵树。
+        // 截断后系统上看不出这是两个人，两份改动会互相覆盖而且不报错。
+        let shared = "y".repeat(300);
+        let one = worktree_lane(&format!("{shared}-a"));
+        let two = worktree_lane(&format!("{shared}-b"));
+        assert_ne!(one, two, "两条长 id 落进了同一棵树：{one}");
+        // 同一个 id 永远同一个名字：系统前缀与路由各算一次，不能算出两个结果。
+        assert_eq!(worktree_lane("squad:t-role"), worktree_lane("squad:t-role"));
+    }
+
+    /// 一件活的树属于这件活，不属于接它的人。
+    ///
+    /// 同一个任务上的规划、生成、评审必须落在同一棵树里；一个人先后接两件
+    /// 活，那是两棵树。这两句是同一条规则的两半，缺任何一半都会让「隔离粒度
+    /// 等于并行粒度」变成一句只在单人单活时成立的话。
+    #[test]
+    fn a_task_decides_the_tree_and_the_person_only_stands_in_when_it_does_not() {
+        assert_eq!(
+            checkout_lane(Some("DSC-1A2B"), Some("squad:DSC-1A2B-generator")),
+            Some("task-DSC-1A2B".to_string()),
+            "点了任务的调用必须落在这件活那棵树上，不是执行者自己的树上"
+        );
+        assert_eq!(
+            checkout_lane(Some("DSC-1A2B"), Some("squad:DSC-1A2B-evaluator")),
+            Some("task-DSC-1A2B".to_string()),
+            "同一件活的两副角色落进了两棵树：评审看不到生成写的文件"
+        );
+        assert_ne!(
+            checkout_lane(Some("DSC-1A2B"), Some("kai-a9ab11fc")),
+            checkout_lane(Some("DSC-1A2C"), Some("kai-a9ab11fc")),
+            "同一个人接了两件活却只有一棵树：两件活的改动会互相覆盖"
+        );
+        assert_eq!(
+            checkout_lane(None, Some("kai-a9ab11fc")),
+            Some(worktree_lane("kai-a9ab11fc")),
+            "没点名任务的调用仍然落在执行者自己的树上"
+        );
+        assert_eq!(
+            checkout_lane(Some("   "), Some("kai-a9ab11fc")),
+            Some(worktree_lane("kai-a9ab11fc")),
+            "空白任务号等于没点名任务"
+        );
+        assert_eq!(checkout_lane(None, None), None, "没有身份的调用没有树");
+        assert_eq!(
+            checkout_lane(Some("DSC-1A2B"), None),
+            Some("task-DSC-1A2B".to_string()),
+            "点了任务、没点执行者，仍然是这件活那棵树"
+        );
+    }
+
+    /// 任务号里不该出现的字节也要折掉，且截断不许让两件活落进一棵树。
+    #[test]
+    fn a_task_lane_name_is_folded_and_never_aliases() {
+        assert_eq!(worktree_task_lane("DSC:1A2B/3"), "task-DSC-1A2B-3");
+        assert_eq!(worktree_task_lane(".hidden"), "task-hidden");
+        let long = worktree_task_lane(&"z".repeat(400));
+        assert!(
+            long.len() + "work/".len() <= 255,
+            "任务车道 {} 字节，加分支前缀就超过单名上限了",
+            long.len()
+        );
+        let shared = "q".repeat(300);
+        assert_ne!(
+            worktree_task_lane(&format!("{shared}-a")),
+            worktree_task_lane(&format!("{shared}-b"))
+        );
+        assert_eq!(worktree_task_lane("DSC-1"), worktree_task_lane("DSC-1"));
     }
 
     /// 工号唯一 ⇒ 展示名唯一。这是「员工不要重名」这条要求在代码里的判据：
@@ -244,6 +581,32 @@ mod naming_tests {
     fn the_same_number_is_the_same_person() {
         assert_eq!(employee_label(412), employee_label(412));
         assert_ne!(employee_label(412), employee_label(413));
+    }
+
+    /// 唯一身份由工号推出，且与展示名同一处派生：展示名的第一段就是它。
+    #[test]
+    fn the_identity_is_derived_from_the_number_and_heads_the_label() {
+        assert_eq!(employee_identity(412), "E0412");
+        assert_eq!(employee_identity(412), employee_identity(412));
+        assert_ne!(employee_identity(412), employee_identity(413));
+        let label = employee_label(412);
+        let (head, _) = label
+            .split_once(' ')
+            .expect("展示名里工号与姓名之间有一个空格");
+        assert_eq!(
+            head,
+            employee_identity(412),
+            "展示名的头与唯一身份不是同一处派生"
+        );
+        assert_eq!(employee_number_of(&employee_identity(412)), Some(412));
+        assert_eq!(employee_number_of("E0413"), Some(413));
+        assert_eq!(employee_number_of("squad:task-1-generator"), None);
+        assert_eq!(
+            employee_number_of("employee:0e2ba053"),
+            None,
+            "旧随机地址不是由工号推出的"
+        );
+        assert_eq!(employee_number_of("EA12"), None, "非数字后缀不是工号");
     }
 
     #[test]

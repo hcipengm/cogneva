@@ -17,6 +17,7 @@
 #   - 把 clusters 折成 clusters[0]  → 接上第二个集群那天，它在屏上根本不存在
 #   - 把卷与事件排进容器下面         → 屏上说的包含关系是 Kubernetes 里没有的
 #   - 服务端量到进程数而不上屏       → 读到的数活在 JSON 里，没有人看得见
+#   - 没量到的用量写成 `?? 0`        → 「这一拍没量到」与「用了 0」在屏上同形
 # 每段改动都先确认**落到了文件上**（否则「改动没生效」与「门没抓住」不可区分）。
 #
 # 最后一条断言是在**真树**上跑：夹具全绿而真树红，说明这条门只是在测自己。
@@ -336,6 +337,38 @@ fixture
 sed -i 's/ reading={reading}//' "${work}/web/src/views/ResourcesView.tsx"
 confirm "${work}/web/src/views/ResourcesView.tsx" "<ClusterTopology />"
 expect_red "挂了但没递读数" "没把读数递进去"
+
+# 16. 没量到的用量被折成 0：一个要去查采集器的容器，与一个真闲着的容器同形。
+fixture
+python3 - "${work}/web/src/topology/TopologyPanel.tsx" <<'FIXPATCH'
+import sys
+path = sys.argv[1]
+src = open(path, encoding="utf-8").read()
+src = src.replace(
+    "{counts.finished} / {counts.failed}",
+    "{counts.finished} / {counts.failed}\n"
+    "      {formatBytes(pod.memory_used_bytes ?? 0)}",
+    1,
+)
+open(path, "w", encoding="utf-8").write(src)
+FIXPATCH
+confirm "${work}/web/src/topology/TopologyPanel.tsx" "memory_used_bytes ?? 0"
+expect_red "用量折成 0" "把没量到的用量折成了 0"
+
+# 16b. 同一份夹具，改成「没量到就写无读数」→ 必须绿。
+python3 - "${work}/web/src/topology/TopologyPanel.tsx" <<'FIXPATCH'
+import sys
+path = sys.argv[1]
+src = open(path, encoding="utf-8").read()
+src = src.replace(
+    "{formatBytes(pod.memory_used_bytes ?? 0)}",
+    "{pod.memory_used_bytes == null ? '无读数' : formatBytes(pod.memory_used_bytes)}",
+    1,
+)
+open(path, "w", encoding="utf-8").write(src)
+FIXPATCH
+confirm "${work}/web/src/topology/TopologyPanel.tsx" "无读数"
+expect_green "没量到写无读数"
 
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0

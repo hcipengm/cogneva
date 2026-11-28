@@ -25,19 +25,29 @@ pub struct LongRunConfig {
 ///
 /// 长跑要看的是「一周之后系统还在不在正常工作」，短于一周就看不到周末的负载
 /// 形态与几轮滚动发布。
+// cap: fixed — 短于一周看不到周末的负载形态与几轮滚动发布；一周是这个观测窗口的取舍
+// keep: 删掉后长跑没有观测窗口，周末的负载形态看不到；由「一周的观测窗口」兜住
 const DEFAULT_LONG_RUN_DURATION: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// 长跑中途落检查点的间隔：6 小时。
 ///
 /// 一周跑崩一次要能从最近的点续上；6 小时是「最多重跑多久」与「落点开销」
 /// 之间的取舍。
+// cap: fixed — 「最多重跑多久」与「落点开销」之间的取舍；6 小时是那次取舍的结果
+// keep: 删掉后长跑没有检查点，进程一死这一段的观测作废；由「重跑时长与落点开销的取舍」兜住
 const DEFAULT_LONG_RUN_CHECKPOINT: Duration = Duration::from_secs(6 * 3600);
+
+/// 每小时注入十件活：一周两千四百件，足够让趋势回归看出斜率；再密就只是把
+/// 同一批负载压缩进更短的时间，看的是队列深度不是稳定性。
+// cap: fixed — 十件/小时：一周的量够拟合趋势，再密看的是队列不是稳定性
+// keep: 删掉后注入没有节拍，一周的量不够拟合趋势；由「一周够拟合趋势」兜住
+const DEFAULT_TASK_INJECTION_RATE: f64 = 10.0;
 
 impl Default for LongRunConfig {
     fn default() -> Self {
         Self {
             duration: DEFAULT_LONG_RUN_DURATION,
-            task_injection_rate: 10.0,
+            task_injection_rate: DEFAULT_TASK_INJECTION_RATE,
             checkpoint_interval: DEFAULT_LONG_RUN_CHECKPOINT,
         }
     }
@@ -248,6 +258,40 @@ impl StabilityReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 任务注入速率只有一处声明：默认值读常量，常量上面写着它由什么钉住。
+    ///
+    /// 两面一起钉：运行时默认值等于常量（改常量就改默认值），源码面
+    /// `impl Default` 的字段里不再有数字（下一笔写回裸字面量就红）。
+    #[test]
+    fn the_long_run_default_reads_its_injection_rate() {
+        assert_eq!(
+            LongRunConfig::default().task_injection_rate,
+            DEFAULT_TASK_INJECTION_RATE
+        );
+        let body = include_str!("long_run.rs")
+            .split("impl Default for LongRunConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    let value = value.trim().trim_end_matches(',');
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.starts_with(|c: char| c.is_ascii_digit())
+                        // 哨兵 0 与空串不是旋钮，是「没写」。
+                        && value != "0"
+                })
+            })
+            .map(str::trim)
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
+    }
     use std::sync::Mutex;
 
     #[test]

@@ -154,7 +154,7 @@ mod tests {
     /// whose every line fails verification, i.e. a tamper alarm that fires on
     /// every ordinary write.
     #[tokio::test]
-    async fn append_redacts_credentials_and_the_chain_still_verifies() {
+    async fn append_keeps_the_detail_verbatim_and_the_chain_still_verifies() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
 
@@ -175,18 +175,22 @@ mod tests {
             .unwrap();
         drop(stream);
 
+        // 详情原样入库：审计记的是现场，脱敏会把它变成另一份字节，而且链上的哈希
+        // 从此对的是被改写过的内容——事后连「当时那句里有没有凭证」都答不出来。
+        // 凭证出现在载荷里是**写入侧的缺陷**，该在那一侧记读数去修，不该在读的时候
+        // 打码把缺陷藏起来。
         let stored = std::fs::read_to_string(&path).unwrap();
         assert!(
-            !stored.contains("sk-ant-") && !stored.contains("ghp_"),
-            "the audit file holds a credential: {stored}"
+            stored.contains("sk-ant-") && stored.contains("ghp_"),
+            "the stored detail is not the bytes that arrived: {stored}"
         );
         assert!(
-            stored.contains("[redacted]"),
-            "nothing was redacted, so this reading proves nothing: {stored}"
+            !stored.contains("[redacted]"),
+            "the detail was rewritten on the way in: {stored}"
         );
         assert!(
             stored.contains("task-1"),
-            "the redaction took out a field that is not a credential: {stored}"
+            "a field that is not a credential went missing: {stored}"
         );
 
         let reopened = FileAuditStream::open(&path).await.unwrap();

@@ -1,3 +1,4 @@
+// census-keep: shapes=clocks — 排空到点只让位并落 DRAIN_TIMEOUT，在飞的运行下次从 journal 续跑；删掉会让 shutdown 永不返回、45s 被 SIGKILL，由 terminationGracePeriodSeconds=45 与 DRAIN_TIMEOUT 计数兜住
 //! Agent plugin — implements [`cog_core::SystemPlugin`].
 
 use std::sync::Arc;
@@ -9,18 +10,23 @@ pub const GRPC_CONTROL_HEARTBEAT_LOOP: &str = "agent_grpc_control_heartbeat";
 /// Loop name of the reading that moves the pool's concurrency.
 pub const POOL_SIZING_LOOP: &str = "agent_pool_sizing";
 
+/// Loop name of the heartbeat that keeps the evaluator's roster row alive.
+pub const EVAL_EMPLOYEE_HEARTBEAT_LOOP: &str = "agent_eval_employee_heartbeat";
+
 /// How often the container's memory is re-read against the count in force.
 ///
 /// Shorter than the pool's own task length on purpose: a task holds its turn
 /// for minutes, so a reading that stepped faster than that could shrink the
 /// pool and regrow it between two tasks without either reading being wrong.
-// cap: bound — 负载以分钟为单位变，比那更快的读数会在两次任务之间把池缩了又长回来，而两次读数都没错
+// cap: fixed — 负载以分钟为单位变，比那更快的读数会在两次任务之间把池缩了又长回来，而两次读数都没错
+// not-a-bound: 负载以分钟为单位变，比那更快的读数会在两次任务之间把池缩了又长回来，而两次读数都没错
 const POOL_SIZING_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How often this agent says it is alive to the control plane. Short enough
 /// that a restarted control plane re-learns its agents without a redeploy, long
 /// enough that the heartbeat is not the busiest thing on the channel.
-// cap: bound — 短到重启的控制面不用重新部署就能重新认出它的 agent，长到心跳不是这条通道上最忙的东西
+// cap: fixed — 短到重启的控制面不用重新部署就能重新认出它的 agent，长到心跳不是这条通道上最忙的东西
+// keep: 删掉后心跳要么不发（重启后认不出 agent），要么每轮都发（占满通道）；由「一个心跳周期」兜住
 const HEARTBEAT_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Keep the pool's concurrency equal to what the container can carry.
@@ -201,7 +207,6 @@ impl PoolSpawner {
             "127.0.0.1",
             &self.role,
             &self.workspace,
-            vec!["plan".into(), "generate".into(), "evaluate".into()],
             cog_core::ResourceInfo::default(),
         );
         let worker = PoolWorkerCell::default();
@@ -252,9 +257,15 @@ pub struct AgentPlugin {
     pool: Option<Arc<crate::GlobalAgentManager>>,
     lifecycle_client: Option<Arc<dyn cog_core::AgentLifecycleClient>>,
     eval_event_rx: tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<cog_core::AgentEvent>>>,
+    /// 这个进程里写判词的那一位的 id：登记成功才有。心跳环与关停注销都按这一位
+    /// 走；没有它就是没登上，读面会看到一条告警而不是一个假人。
+    eval_employee: Option<String>,
     /// 关停时等在飞的运行让路多久，来自 `core.system.shutdown_timeout_ms`。
     /// 零表示没人声明过，那就**不等**：一个没有依据的等待比不等更糟。
     drain_timeout_ms: std::sync::atomic::AtomicU64,
+    /// 关停排空的读数写到哪里。与 `drain_timeout_ms` 相邻不是偶然：那个数是
+    /// 这一格的界，这个读数说的是界够不够用，两个必须落在同一个进程里。
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
 }
 
 impl AgentPlugin {
@@ -266,10 +277,67 @@ impl AgentPlugin {
             pool: None,
             lifecycle_client: None,
             eval_event_rx: tokio::sync::Mutex::new(None),
+            eval_employee: None,
             drain_timeout_ms: std::sync::atomic::AtomicU64::new(0),
+            metrics: None,
+        }
+    }
+
+    /// 记一次排空：等了多久、等到了没有、还有几条没等到。
+    ///
+    /// `left` 只在超时时非零；等到零的那一次它也记一条 0，让「上一次超时留下了
+    /// 三条、这一次一条没留」在同一条序列上读得出来——一个只在坏结局里才出现的
+    /// 计数器，读的人分不清「归零了」与「这版还没装」。写失败只打一行日志：
+    /// 进程正在退出，读数写不进去不该改变关停顺序。
+    async fn record_drain(&self, millis: f64, outcome: &'static str, left: usize) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(crate::LABEL_OUTCOME.to_string(), outcome.to_string());
+        if let Err(e) = metrics
+            .record_histogram(
+                cog_core::metric_names::SHUTDOWN_DRAIN_MILLISECONDS,
+                millis,
+                labels,
+            )
+            .await
+        {
+            warn!(error = %e, "could not record how long the shutdown drain took");
+        }
+        if let Err(e) = metrics
+            .record_counter(
+                cog_core::metric_names::SHUTDOWN_DRAIN_ABANDONED_TOTAL,
+                left as f64,
+                std::collections::HashMap::new(),
+            )
+            .await
+        {
+            warn!(error = %e, "could not record the runs the drain left behind");
+        }
+    }
+
+    /// 记一次「没有声明预算、根本没有等」。
+    async fn record_drain_undeclared(&self) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        if let Err(e) = metrics
+            .record_counter(
+                cog_core::metric_names::SHUTDOWN_DRAIN_UNDECLARED_TOTAL,
+                1.0,
+                std::collections::HashMap::new(),
+            )
+            .await
+        {
+            warn!(error = %e, "could not record a shutdown with no drain budget");
         }
     }
 }
+
+/// 排空这一格的结局取值。闭集，读者按它选行。
+const DRAIN_DRAINED: &str = "drained";
+const DRAIN_TIMEOUT: &str = "timeout";
 
 impl Default for AgentPlugin {
     fn default() -> Self {
@@ -288,6 +356,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
             return Ok(());
         }
 
+        self.metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
         self.drain_timeout_ms.store(
             ctx.config().system.shutdown_timeout_ms,
             std::sync::atomic::Ordering::Relaxed,
@@ -296,8 +365,6 @@ impl cog_core::SystemPlugin for AgentPlugin {
         // Snapshot config values to drop immutable borrow before publishing.
         let (
             hook_change_dir,
-            tool_timeout_secs,
-            shell_timeout_secs,
             nats_config,
             hook_engine_config,
             agent_config,
@@ -307,8 +374,6 @@ impl cog_core::SystemPlugin for AgentPlugin {
             let config = ctx.config();
             (
                 cog_core::config::self_evolution_hook_dir(&config.self_evolution.change_dir),
-                config.system.tool_timeout_secs,
-                config.system.shell_timeout_secs,
                 config.dag_executor.nats.clone(),
                 config.hook_engine.clone(),
                 config.agent.clone(),
@@ -412,29 +477,30 @@ impl cog_core::SystemPlugin for AgentPlugin {
         self.lifecycle_client = lifecycle_client;
 
         // ── ToolRegistry ──
+        // `agent_loop` is a cog-agent-owned config section, read once here for
+        // the memory API base the archiving tools borrow, for the fetched-body
+        // threshold, for the evaluator's budgets below, and for the window the
+        // registry derives one page of a tool result from; changing a value
+        // needs no new image.
+        let agent_loop_config = crate::AgentLoopConfig::load()?;
         let tool_registry = Arc::new(
             crate::ToolRegistry::new()
-                .with_wasm_timeout(tool_timeout_secs)
-                .with_shell_timeout(shell_timeout_secs)
-                .with_sandbox_backend(sandbox_backend)
+                .with_sandbox_backend(sandbox_backend.clone())
                 .with_guardrail(guardrail)
                 .with_plugin_registry(plugin_registry)
                 .with_require_identity(require_tool_identity),
         );
+        // 一页工具结果的大小由这张表服务的窗口导出，与运行时裁进上下文的是同一个
+        // 函数（`context::tool_result_budget_chars`）。窗口不在这里写：构造时它还
+        // 没有读数，运行时收到第一条响应就按答话的型号把决定交下来。
         // Built-in execution tools. Without these the registry advertises zero
         // tool definitions and squads can plan but never act on the
-        // environment. search_code stays unregistered until it really
-        // searches — an always-empty tool teaches agents to distrust tools.
+        // environment.
         //
         // The list is registered through the one constructor for it rather
         // than laid out here, because this process is not the only caller: the
         // MCP server serves the same built-ins to an external client, and a
         // second list here would be a second answer to which tools exist.
-        // `agent_loop` is a cog-agent-owned config section, read once here for
-        // the memory API base the archiving tools borrow, for the fetched-body
-        // threshold, and for the evaluator's budgets below; changing a value
-        // needs no new image.
-        let agent_loop_config = crate::AgentLoopConfig::load()?;
         let memory_api_base = agent_loop_config.memory_api_base.clone();
         // Memory tools read through the platform memory API over HTTP rather
         // than an in-process backend: the process that runs the loops holds no
@@ -461,6 +527,12 @@ impl cog_core::SystemPlugin for AgentPlugin {
                 web_search_base: agent_loop_config.web_search_base.clone(),
                 web_search_fallback_base: agent_loop_config.web_search_fallback_base.clone(),
                 web_fetch_base: agent_loop_config.web_fetch_base.clone(),
+                // 搜索、glob、git、打补丁与 `run_command` 走同一个执行器：它们
+                // 的答案取决于调用者自己那棵树，在本进程跑就等于读一份与调用者
+                // 无关的源码。后端在交给注册表时克隆了一份，这里再拿一份。
+                sandbox_backend: Some(sandbox_backend.clone()),
+                message_events: ctx.consume_service::<dyn cog_core::EventStore>(),
+                intent_events: ctx.consume_service::<dyn cog_core::EventStore>(),
             },
         );
         info!(
@@ -479,6 +551,13 @@ impl cog_core::SystemPlugin for AgentPlugin {
         // handle would be absent exactly here. One archive handle serves the
         // eval runtime and the whole worker pool: the reading it carries is
         // keyed by tool, and a second copy would only split the count.
+        // 工具调用的事实落点：只要装配层给了就接上，与归档分开（记录 vs 载体）。
+        let tool_call_events = ctx.consume_service::<dyn cog_core::EventStore>();
+        if tool_call_events.is_none() {
+            warn!(
+                "EventStore unavailable; a tool call leaves no row in the event \n                 stream, so replaying a run from the stream alone cannot see it"
+            );
+        }
         let tool_output_archive: Option<Arc<dyn crate::ToolOutputArchive>> = ctx
             .consume_service::<dyn cog_core::HttpClient>()
             .map(|client| {
@@ -497,30 +576,78 @@ impl cog_core::SystemPlugin for AgentPlugin {
         }
         let (eval_event_tx, eval_event_rx) =
             tokio::sync::mpsc::channel::<cog_core::AgentEvent>(128);
+        // 评测这一侧的运行同样是这个进程里的一次模型调用，跑它的也是个人：
+        // 名字与常驻池用同一个派生函数，只是分组不同，所以同一个进程里两批
+        // 人不会撞名。从前这里写着 `eval-agent`——名册上没有、工号也没有的
+        // 一个名字：账上读不出这次判词是谁写的，同事也没法给它发消息。
+        let eval_employee = crate::identity::name_for(
+            &format!(
+                "{}:{}",
+                crate::identity::agent_instance(),
+                cog_core::roles::EVALUATOR
+            ),
+            cog_core::roles::EVALUATOR,
+            0,
+        );
+        let eval_declaration =
+            cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Judgement);
         let eval_config = cog_core::RuntimeConfig {
-            agent_id: "eval-agent".into(),
+            agent_id: eval_employee.id.clone(),
             role: cog_core::roles::EVALUATOR.into(),
             max_iterations: agent_loop_config.eval_max_iterations.unwrap_or(u32::MAX),
-            context_window_size: 32000,
+            // 与主循环同一条来路：这一格不是配置，是运行时在用的窗口的起点，
+            // 没有读数时就是 `None`，第一次响应之后按答话的型号定下来。
+            context_window_size: None,
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: agent_loop_config.final_draft_timeout_secs,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            // 这一份活交的是判词：它不动工作树，判的是别人交的东西。这句是这段
+            // 常驻评测的结构说的，不是行上某个字段说的，所以来源是 `protocol`。
+            // 结论与来源从同一份声明里取出：两格各写一遍就会各漂一次。
+            deliverable: eval_declaration.conclusion(),
+            deliverable_state: eval_declaration.state(),
+            // 常驻的评测员工没有一件具体的活，也就没有人就它说过方向。
+            stated_directions: Vec::new(),
         };
         let mut eval_runtime = crate::AgentRuntime::new(eval_config, eval_event_tx)
-            .with_tools(tool_registry.as_ref().clone());
+            .with_tools(tool_registry.as_ref().clone())
+            .with_roster(agent_registry.clone());
         eval_runtime = eval_runtime.with_sandbox_backend(sandbox_backend_for_eval);
         eval_runtime = eval_runtime.with_plugin_registry(plugin_registry_for_eval);
         if let Some(ref archive) = tool_output_archive {
             eval_runtime = eval_runtime.with_tool_output_archive(archive.clone());
         }
+        if let Some(ref events) = tool_call_events {
+            eval_runtime = eval_runtime.with_tool_call_events(events.clone());
+        }
+        if let Some(ref metrics) = self.metrics {
+            eval_runtime = eval_runtime.with_metrics(metrics.clone());
+        }
+        // 登记走与常驻池同一条路：注册即建行、发工号。登记不上不拦启动——
+        // 判词照样要写出来——但这条日志要说清读面会缺什么。
+        if let Err(e) = agent_registry
+            .register(&crate::runtime::manager::task_agent_registration(
+                &eval_employee.id,
+                cog_core::roles::EVALUATOR,
+            ))
+            .await
+        {
+            warn!(
+                agent_id = %eval_employee.id,
+                error = %e,
+                "the evaluator could not be registered; its runs still happen, but the roster \
+                 carries no row for the person writing the verdicts"
+            );
+        } else {
+            self.eval_employee = Some(eval_employee.id.clone());
+        }
         let eval_runtime_arc: Arc<tokio::sync::Mutex<dyn cog_core::AgentRuntime>> =
             Arc::new(tokio::sync::Mutex::new(eval_runtime));
         ctx.publish_service(eval_runtime_arc);
-        info!("AgentPlugin eval runtime published");
+        info!(agent_id = %eval_employee.id, "AgentPlugin eval runtime published");
         *self.eval_event_rx.lock().await = Some(eval_event_rx);
 
         // ── GlobalAgentManager ──
@@ -557,6 +684,9 @@ impl cog_core::SystemPlugin for AgentPlugin {
         .with_roster_observer(crate::observable::global_observable());
         if let Some(ref archive) = tool_output_archive {
             pool_builder = pool_builder.with_tool_output_archive(archive.clone());
+        }
+        if let Some(ref events) = tool_call_events {
+            pool_builder = pool_builder.with_tool_call_events(events.clone());
         }
         // Workers publish onto the cluster-wide bus (stream plugin) so live
         // observers see every turn/tool call in real time. Without the stream
@@ -599,6 +729,11 @@ impl cog_core::SystemPlugin for AgentPlugin {
             pool_builder = pool_builder.with_external_skill_registry(esr.clone());
         }
         pool_builder = pool_builder.with_observability(observability);
+        // 续跑读数走同一份后端：每个 worker 都要报「这次是从日志接着跑的，
+        // 还是从头开始」，而它们在池子里建，池子只有这一个后端。
+        if let Some(ref metrics) = self.metrics {
+            pool_builder = pool_builder.with_metrics(metrics.clone());
+        }
         pool_builder = pool_builder.with_wal_backend(wal_backend);
         // 检查点存储：把快照交给 agent 的落盘那一半。缺了它，快照照样返回、
         // 事件照样发、日志照样绿，只有 save 那一步不存在——于是「可续跑的
@@ -653,6 +788,47 @@ impl cog_core::SystemPlugin for AgentPlugin {
         // 的（它要在所有插件初始化完才有人等），`init` 里读只会读到没有。
         if let Some(signal) = ctx.consume::<cog_core::ShutdownSignal>() {
             crate::drain::install((*signal).clone());
+        }
+        // 写判词的那一位在注册表里也要有心跳：没有它，TTL 一过名册就把这个人
+        // 读成「退休了」，而判词还在继续写。丢键（TTL 到期、Redis 被清、另一个
+        // 副本关停）之后下一次心跳重新登记，而不是一直告警到重启。
+        if let (Some(eval_id), Some(registry)) =
+            (self.eval_employee.clone(), self.agent_registry.clone())
+        {
+            let registration = crate::runtime::manager::task_agent_registration(
+                &eval_id,
+                cog_core::roles::EVALUATOR,
+            );
+            let body = move |_beat: cog_core::loop_health::Beat| {
+                let registry = registry.clone();
+                let eval_id = eval_id.clone();
+                let registration = registration.clone();
+                async move {
+                    if registry.heartbeat(&eval_id).await.is_err() {
+                        if let Err(e) = registry.register(&registration).await {
+                            warn!(
+                                agent_id = %eval_id,
+                                error = %e,
+                                "the evaluator heartbeat could not put it back on the roster"
+                            );
+                        }
+                    }
+                }
+            };
+            let cadence = cog_core::loop_health::Cadence::Periodic(HEARTBEAT_PERIOD);
+            match ctx.consume::<cog_core::ShutdownSignal>() {
+                Some(signal) => drop(cog_core::loop_health::spawn(
+                    EVAL_EMPLOYEE_HEARTBEAT_LOOP,
+                    cadence,
+                    (*signal).clone(),
+                    body,
+                )),
+                None => drop(cog_core::loop_health::spawn_unstoppable(
+                    EVAL_EMPLOYEE_HEARTBEAT_LOOP,
+                    cadence,
+                    body,
+                )),
+            }
         }
         if let Some(ref pool) = self.pool {
             if let Some(task_runner) = ctx.consume_service::<dyn cog_core::TaskExecutionCallback>()
@@ -753,18 +929,38 @@ impl cog_core::SystemPlugin for AgentPlugin {
                 self.drain_timeout_ms
                     .load(std::sync::atomic::Ordering::Relaxed),
             );
+            // 等多久是这一格的界，等出来的结果是它的读数。两件事在同一段里量：
+            // 分开放会让「界够不够」只能靠日志里那句话去猜——而两种结局写下的
+            // 是同一句「等着让路」。
+            let started = std::time::Instant::now();
             if limit.is_zero() {
+                // 没有声明过预算就没有排空可量：这一跑**没有等**，而不是等了零秒。
+                // 把它记成一条 0 秒的观测量，会让「预算缺了」与「一次瞬间完成的排空」
+                // 在读面上同形，而这两件事要求的动作相反。
                 warn!(
                     in_flight = crate::drain::in_flight(),
                     "no shutdown timeout was declared; in-flight runs are left to their journals"
                 );
+                self.record_drain_undeclared().await;
             } else if crate::drain::wait_drained(limit).await {
                 info!("every in-flight run reached a turn boundary before shutdown");
+                self.record_drain(started.elapsed().as_secs_f64() * 1000.0, DRAIN_DRAINED, 0)
+                    .await;
             } else {
+                // keep: 删掉这个等待界，shutdown 永不返回，45s 处被 kubelet SIGKILL，
+                // WAL 与连接一步都排不掉；由 `terminationGracePeriodSeconds: 45` 与
+                // `DRAIN_TIMEOUT` 计数兜住（到点只是让位，在飞的运行下次从 journal 续跑）。
+                let left = crate::drain::in_flight();
                 warn!(
-                    in_flight = crate::drain::in_flight(),
+                    in_flight = left,
                     "shutdown ran out of time with runs still in flight; they resume from their journals"
                 );
+                self.record_drain(
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    DRAIN_TIMEOUT,
+                    left,
+                )
+                .await;
             }
         }
         // 注册表是全集群共享的（多副本同名 worker、其他 pod 的 squad 智能体
@@ -775,6 +971,14 @@ impl cog_core::SystemPlugin for AgentPlugin {
                 if let Err(e) = registry.deregister(&agent_id).await {
                     warn!("registry deregister({}) failed: {}", agent_id, e);
                 }
+            }
+        }
+        // 写判词的那一位同样由这个进程拉起，就同样要在走之前从名册上退下来：
+        // 留下一条没有进程服务的心跳，读面要等 TTL 过期才把它读成「不在岗」。
+        if let (Some(ref registry), Some(ref eval_id)) = (&self.agent_registry, &self.eval_employee)
+        {
+            if let Err(e) = registry.deregister(eval_id).await {
+                warn!("registry deregister({}) failed: {}", eval_id, e);
             }
         }
         info!("AgentPlugin shutdown");
@@ -821,9 +1025,12 @@ async fn event_upload_task(
 ) {
     use tokio::time::{interval, Duration};
 
-    // cap: bound — a batching choice; the flush deadline is what bounds the wait
+    // cap: fixed — a batching choice; the flush deadline is what bounds the wait
+    // keep: 删掉后每个事件单独写一次 WAL，条数速率变成 WAL 等待速率；由「批大小与冲线成对」兜住
     const BATCH_SIZE: usize = 16;
-    // cap: bound — flush deadline for buffered events; the batch size of 16 is the other half of the batching
+    // cap: fixed — flush deadline for buffered events; the batch size of 16 is the other half of the batching
+    // keep: 删掉后缓冲里的事件无限期等待，答复先于落盘；由「冲线与批大小成对」兜住
+    // wall: 等=攒够一批事件或者到点刷一次 / 等不到=不适用：它到点就刷，不结束任何一条事件 / 续跑=不适用
     const BATCH_TIMEOUT: Duration = Duration::from_millis(100);
 
     let mut buffer: Vec<cog_core::AgentEvent> = Vec::with_capacity(BATCH_SIZE);
@@ -1036,6 +1243,8 @@ mod conversation_reaches_the_worker_tests {
         handler(InboxMessage::Prompt {
             goal: serde_json::json!("你叫什么名字？"),
             reply_stream: Some(reply_stream.into()),
+            from_agent: None,
+            intent: None,
         })
         .await
         .expect("the worker answers a sentence without failing");
@@ -1051,5 +1260,104 @@ mod conversation_reaches_the_worker_tests {
             answer.to_string().contains("Ada#1234"),
             "the answer on the reply stream is the worker's own: {answer}"
         );
+    }
+}
+
+#[cfg(test)]
+mod shutdown_drain_readings_tests {
+    //! 关停排空的三条结局各自是读得出来的一格。
+    //!
+    //! 三种结局在日志里是同一句话——「等着让路」——差别只在结尾那一段。读数面
+    //! 存在的理由就是把它们分开：等到零、超时还留着几条、以及根本没有预算所以
+    //! 没等。第三种尤其不能记成一个 0 秒的观测量，那会让「没排空」与「瞬间排空」
+    //! 同形，而两者要求的动作相反。
+    //!
+    //! 判的是序列名、标签与数值：读者按 `outcome` 选行，标签写错等于这一族永远
+    //! 选不中。
+
+    use super::*;
+    use crate::recording_metrics::RecordingMetrics;
+    use std::sync::Arc;
+
+    fn plugin_with(spy: Arc<RecordingMetrics>) -> AgentPlugin {
+        let mut plugin = AgentPlugin::new();
+        plugin.metrics = Some(spy);
+        plugin
+    }
+
+    #[tokio::test]
+    async fn a_drained_shutdown_reports_its_duration_and_zero_abandoned() {
+        let spy = Arc::new(RecordingMetrics::default());
+        plugin_with(spy.clone())
+            .record_drain(12_500.0, DRAIN_DRAINED, 0)
+            .await;
+        let seconds = spy.rows_for(cog_core::metric_names::SHUTDOWN_DRAIN_MILLISECONDS);
+        assert_eq!(
+            seconds.len(),
+            1,
+            "one observation per shutdown: {seconds:?}"
+        );
+        assert_eq!(
+            seconds[0].2, 12_500.0,
+            "the observed duration is the wait itself, in the unit the bucket ladder covers"
+        );
+        assert_eq!(
+            seconds[0].1.get(crate::LABEL_OUTCOME).map(String::as_str),
+            Some(DRAIN_DRAINED),
+            "a drain that reached zero must be told apart by its outcome label"
+        );
+        let abandoned = spy.rows_for(cog_core::metric_names::SHUTDOWN_DRAIN_ABANDONED_TOTAL);
+        assert_eq!(
+            abandoned.len(),
+            1,
+            "a zero is a measurement, so it must be written too: {abandoned:?}"
+        );
+        assert_eq!(abandoned[0].2, 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_drain_reports_the_runs_it_left_in_flight() {
+        let spy = Arc::new(RecordingMetrics::default());
+        plugin_with(spy.clone())
+            .record_drain(30_000.0, DRAIN_TIMEOUT, 3)
+            .await;
+        let seconds = spy.rows_for(cog_core::metric_names::SHUTDOWN_DRAIN_MILLISECONDS);
+        assert_eq!(
+            seconds[0].1.get(crate::LABEL_OUTCOME).map(String::as_str),
+            Some(DRAIN_TIMEOUT),
+            "the two endings share a histogram only because the label separates them"
+        );
+        let abandoned = spy.rows_for(cog_core::metric_names::SHUTDOWN_DRAIN_ABANDONED_TOTAL);
+        assert_eq!(
+            abandoned[0].2, 3.0,
+            "three runs were handed to their journals; the count is the damage"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_with_no_budget_is_not_an_instant_drain() {
+        let spy = Arc::new(RecordingMetrics::default());
+        plugin_with(spy.clone()).record_drain_undeclared().await;
+        assert!(
+            spy.rows_for(cog_core::metric_names::SHUTDOWN_DRAIN_MILLISECONDS)
+                .is_empty(),
+            "a process that never waited must not observe a duration"
+        );
+        let undeclared = spy.rows_for(cog_core::metric_names::SHUTDOWN_DRAIN_UNDECLARED_TOTAL);
+        assert_eq!(
+            undeclared.len(),
+            1,
+            "the missing budget has a reading of its own"
+        );
+        assert_eq!(undeclared[0].2, 1.0, "one increment per shutdown");
+    }
+
+    #[tokio::test]
+    async fn no_metrics_backend_still_lets_the_process_exit() {
+        // 没有后端时这些调用必须是空操作：关停路径上的一次 panic 会把「读数写不
+        // 进去」升级成「进程退不掉」。
+        let plugin = AgentPlugin::new();
+        plugin.record_drain(1_000.0, DRAIN_DRAINED, 0).await;
+        plugin.record_drain_undeclared().await;
     }
 }

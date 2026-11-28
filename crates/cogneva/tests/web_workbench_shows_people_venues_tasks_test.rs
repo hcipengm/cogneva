@@ -224,3 +224,60 @@ fn the_conversation_pane_draws_the_frame_stream_not_only_the_transcript() {
          说过什么，不该说完就换成快照里的那一份"
     );
 }
+
+/// 员工页点任何一行都开流式对话，而不是「带 `session_id` 的那几个才有对话框、
+/// 其余只能异步留言」。
+///
+/// 三种身份（对话员工、池里的 worker、小队座位）是同一本名册上的员工；分叉的
+/// 不是能力，是这台进程上有没有一段会话。会话 id 由员工 id 现推，所以任何一个
+/// 员工都开得出一段属于他自己的对话。屏上还要说清是谁在答话：平台以该员工身份
+/// 跑的回合，不是池里的进程——否则读者把「没有人跑」读成「这个员工不在」。
+#[test]
+fn every_employee_row_opens_a_streaming_conversation() {
+    let text = source(&root(), "web/src/views/PeopleView.tsx");
+    // 点开的那一行只要选中了就画 `ChatLane`：分叉的是「选没选中」，不是
+    // 「有没有 session_id」。按 `session_id` 分叉的写法会让池里的员工点开只剩
+    // 收件箱——那正是这条要挡的形状。
+    let after = text
+        .split("{chosen ? (")
+        .nth(1)
+        .expect("员工页不再按「选中了谁」开对话：这一面的入口改了形状")
+        .trim_start();
+    assert!(
+        after.starts_with("<ChatLane"),
+        "选中一个员工之后第一个画出来的不是对话：点开池里的员工只剩收件箱"
+    );
+    assert!(
+        text.contains("employeeSessionId={chosen.session_id ?? sessionFor(chosen.agent_id)}"),
+        "会话 id 不是由员工 id 现推的：换一个没有存入会话的员工就没有对话可开"
+    );
+    assert!(text.contains("<ChatLane"), "员工页没有流式对话框");
+    assert!(
+        text.contains("平台以这个员工身份"),
+        "屏幕没说清是谁在答话：读者会把「平台以该员工身份跑的回合」读成「池里的进程」"
+    );
+}
+
+/// 员工页先把单位定下来：多少位人、多少个座位、座位背后有没有人。
+///
+/// 名册上的行是地址，人是身份；只数行数会把「座位多」读成「人多」。名册读不到
+/// 与「一个座位背后都没人」也不能画成同一个数。
+#[test]
+fn the_employee_page_says_people_and_seats_separately() {
+    let text = source(&root(), "web/src/views/PeopleView.tsx");
+    for needle in ["位人", "个座位", "座位背后"] {
+        assert!(
+            text.contains(needle),
+            "员工页缺 {needle:?}：人、座位两个单位没有分开说"
+        );
+    }
+    let hook = source(&root(), "web/src/hooks/useAgentConversation.ts");
+    assert!(
+        hook.contains("getAgentRoster()"),
+        "名单读的还是只有 agent 行：人／座位的读数拿不到"
+    );
+    assert!(
+        hook.contains("seats_without_a_person"),
+        "座位背后有没有人这一格没有读回来"
+    );
+}

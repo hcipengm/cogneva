@@ -1,0 +1,22 @@
+-- Migration: 101_chat_turn_attachments
+-- An exchange that carried a picture keeps the picture with it.
+--
+-- The media blocks reached the model on the turn that sent them and nowhere
+-- after that: the transcript stored words only, so reopening the conversation
+-- rebuilt a history in which the user had asked "这里怎么办" about a screenshot
+-- that no longer existed. The answer in the record referred to something the
+-- model could no longer see, and the next turn - "那这里呢" - had nothing to
+-- point at either.
+--
+-- JSON text rather than a separate table: the attachments belong to exactly one
+-- row and are read exactly when that row is read, so a join would buy nothing
+-- and a second table would need its own lifetime rules. The column holds the
+-- same base64 payload the wire carries (`ChatAttachment`), which is also the
+-- shape of `ContentBlock::Media` - the lookup that turns a turn back into a
+-- prompt message re-encodes nothing.
+--
+-- Null for the assistant half and for every row written before this column
+-- existed: "no attachments" and "attachments recorded as an empty list" read
+-- the same in the prompt, and the writer only fills the column when there is
+-- something in it.
+ALTER TABLE chat_turns ADD COLUMN IF NOT EXISTS attachments TEXT;

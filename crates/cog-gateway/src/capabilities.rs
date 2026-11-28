@@ -12,18 +12,21 @@
 //! - **执行手表（`SkillConfig`）**是分工表：这一块活可以交给哪一种手。分解时读它，
 //!   它空着是合法状态，不是「没配好」。
 //!
-//! **不新建任何存储。** 这张表由四个已经在跑的读取面拼出来，各有各的负责人：
+//! **不新建任何存储。** 这张表由五个已经在跑的读取面拼出来，各有各的负责人：
 //!
 //! - 内建动作：`cog_core::ToolRegistry` 的三个读法——`names()`（有什么）、
 //!   `definitions()`（要什么参数）与 `calls()`（点过几次），由 `cog-agent` 发布成服务；
 //! - 插件动作：`PluginRegistry::discover()` 读磁盘上的清单（工作台那一格读的就是本
 //!   文件，不另读一遍磁盘）；
 //! - 远端动作：`McpClient::list_tools()`，与 `/api/v1/protocol/mcp/tools` 同一个源；
+//! - 对话层动作：`ConversationTurn::offered_tools()`，也就是**最近一轮真正交给模型
+//!   的那张表**里共用表之外的那几只。这一层曾经在能力页上整层缺席：页上 25 只，
+//!   一轮对话手里 44 只，差的那 19 只只在聊过天的人那里存在。按装配代码另拼一份
+//!   会漂，所以读的是那一轮自己交出去的表；还没有一轮跑过时它自报 `unread`；
 //! - 谁能点它：共享技能表（`SkillRegistry`）里每个角色声明的 `tools`。读法与运行时
 //!   收窄一轮时一样——`skill_for_role` 决定一个角色的多行里哪一行算数——所以这一栏
 //!   不会报出运行时并不给的许可。没有声明 `tools` 的角色是「不设边界，拿整张注册
-//!   表」，单独一栏列出，不摊到每个动作上；
-//! - 持有人：`AgentRegistry::list()` 里每一行自报的 `capabilities` 与心跳。
+//!   表」，单独一栏列出，不摊到每个动作上。
 //!
 //! **使用次数只在有计数器的那一层是读数。** 内建这一层由 `cog-agent` 在派发点计
 //! （`execute_scoped_checked` 是每一次调用的唯一漏斗），所以那一栏的 0 是真的没人
@@ -58,6 +61,12 @@ pub enum Source {
     Plugin,
     /// 远端 MCP 服务器暴露的工具。
     Mcp,
+    /// 对话层在一轮里装上去的工具：只属于这一段对话，共用注册表里没有它们。
+    ///
+    /// 单列一层而不是并进内建，是因为它们的生命周期不同：内建那批随进程存在，
+    /// 这一批随一轮存在——属主身份与计划模式都会改变它。并进内建，能力页会报出
+    /// 一只「此刻这段对话拿不到」的工具，而点击它的人只会得到一次拒绝。
+    Conversation,
 }
 
 impl Source {
@@ -66,6 +75,7 @@ impl Source {
             Source::Builtin => "builtin",
             Source::Plugin => "plugin",
             Source::Mcp => "mcp",
+            Source::Conversation => "conversation",
         }
     }
 }
@@ -99,7 +109,7 @@ impl Reach {
 /// 在这里改一次——下面有一条测试钉着当前的值。
 fn reach_of(source: Source) -> Reach {
     match source {
-        Source::Builtin | Source::Mcp => Reach::Callable,
+        Source::Builtin | Source::Mcp | Source::Conversation => Reach::Callable,
         Source::Plugin => Reach::DeclaredOnly,
     }
 }
@@ -175,7 +185,7 @@ fn boundary_of(schema: Option<&serde_json::Value>) -> Option<Boundary> {
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     required.sort();
     Some(Boundary { required, params })
 }
@@ -225,39 +235,16 @@ pub struct Entry {
     /// 允许」——后者是 `Some(空)`。两种情形要的动作相反：一个去接表，一个是
     /// 「这一项没有角色点名」，读的人要能分清。
     pub allowed_roles: Option<Vec<String>>,
-    /// 自报了这一项的单位。空集合不是「没人会用」，是「没人这么自报」——这两句
-    /// 之间差着一次改名，读的人要能分清。
-    pub holders: Vec<Holder>,
-}
-
-/// 一个自报了某项能力的单位，以及它此刻在不在岗。
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Holder {
-    pub unit: String,
-    pub live: bool,
 }
 
 /// 一台机器上「会什么」的全貌。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Inventory {
     pub generated_at: chrono::DateTime<chrono::Utc>,
-    /// 按来源排好的读数。顺序固定：内建、插件、MCP。
+    /// 按来源排好的读数。顺序固定：内建、插件、MCP、对话层。
     pub sources: Vec<(Source, SourceReading)>,
     /// 全部项，去重后按名字排。同名来自两个源的各占一行。
     pub entries: Vec<Entry>,
-    /// 自报过能力的单位数。0 且名册非空，说明这一栏没人填——那是接线缺口，不是
-    /// 「没有人有能力」。
-    ///
-    /// `None` 是名册这一拍没读到（没接上，或读失败了）：那时「没有人自报」这句话
-    /// 无从说起，而它与「0 个单位自报」要采取的动作相反，所以在读数上就分开。
-    pub declaring_units: Option<usize>,
-    /// 名册这一拍没读到时的原因。
-    ///
-    /// `None` 是读到了（含「读到但没有单位自报」）。名册读不到时，持有人那一栏
-    /// 无从判断，而「为什么无从判断」要能说出来——否则读者只知道这一栏空着，分
-    /// 不清是该去接名册还是该去查读失败。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub roster_caveat: Option<String>,
     /// 没有声明 `tools` 的角色，按角色名排。
     ///
     /// 分工表里空表的意思是「不设边界，拿整张注册表」，所以这些角色能调每一项。
@@ -277,8 +264,6 @@ impl Default for Inventory {
             generated_at: chrono::Utc::now(),
             sources: Vec::new(),
             entries: Vec::new(),
-            declaring_units: None,
-            roster_caveat: None,
             unbounded_roles: None,
         }
     }
@@ -302,6 +287,60 @@ impl Inventory {
             .filter(|e| e.reach == Reach::Callable)
             .count()
     }
+
+    /// 各层报出的调用次数之和，以及**哪几层没有计数器**。
+    ///
+    /// 外层 `None` 是没有任何一层带计数器——那时「一次都没被点」与「这一格没接计数
+    /// 器」在读数面上必须分得开，所以这里不给 0。有计数器的一层报 `Some(0)` 是量到
+    /// 的零（「量过，没人点」），它照常参与求和。
+    ///
+    /// 里层那串来源是缺计数器的层：少算了几层要让读者看得见，否则「插件 7 项」会被
+    /// 读成「这 7 项没人点」。今天缺的是插件、MCP 与对话层——插件声明的动作本来
+    /// 就没人能调，MCP 的调用走网关自己的路由，对话层那几只装在每一轮私有的表上，
+    /// 三条理由都写在 `Entry` 的 `calls` 那一栏上。
+    ///
+    /// 求和而不是按层印：工作台那一行问的是「有没有人在点这些动作」，一层一条会把
+    /// 一格的明细撑成一张表，而那几层在这个问题上不是分开的答案。
+    pub fn call_total(&self) -> Option<(u64, Vec<Source>)> {
+        let mut total = 0u64;
+        let mut counted = false;
+        let mut without_counter: Vec<Source> = Vec::new();
+        for source in [
+            Source::Builtin,
+            Source::Plugin,
+            Source::Mcp,
+            Source::Conversation,
+        ] {
+            let mut entries = 0usize;
+            let mut with_counter = 0usize;
+            for entry in self.entries.iter().filter(|e| e.source == source) {
+                entries += 1;
+                if let Some(calls) = entry.calls {
+                    with_counter += 1;
+                    total = total.saturating_add(calls);
+                }
+            }
+            if with_counter > 0 {
+                counted = true;
+            } else if entries > 0 {
+                // 这一层有项、却一项都没报次数：它不是「没人点」，是没有计数器。
+                without_counter.push(source);
+            }
+        }
+        counted.then_some((total, without_counter))
+    }
+}
+
+/// 一行的 `calls` 从哪来：这一层有计数器就报它的数（**没点过是 0**），没有就 `None`。
+///
+/// 分成两个答案而不是一个 0，是因为它们要的动作不同：`None` 是「这一层还没接计数器」，
+/// 要去接；`Some(0)` 是「接了，量过，没人点」，要去问用的人为什么不来。合成 0 之后
+/// 第二种会被当成第一种，而第一种会被当成「没人用」。
+fn calls_of_this_layer(
+    counts: Option<&crate::mcp_calls::McpCallCounts>,
+    tool: &str,
+) -> Option<u64> {
+    counts.and_then(|counts| counts.count(tool))
 }
 
 /// 拼出这份清单。任何一个来源读不到都不影响其余来源——缺的那一层在 `sources` 里
@@ -335,7 +374,6 @@ pub async fn read(state: &GatewayState) -> Inventory {
                     }),
                     calls: calls.get(&tool.name).copied(),
                     allowed_roles: None,
-                    holders: Vec::new(),
                 });
             }
             SourceReading::Measured {
@@ -382,7 +420,6 @@ pub async fn read(state: &GatewayState) -> Inventory {
                                     // 读成「量过，没人用」。
                                     calls: None,
                                     allowed_roles: None,
-                                    holders: Vec::new(),
                                 });
                                 count += 1;
                             }
@@ -405,6 +442,7 @@ pub async fn read(state: &GatewayState) -> Inventory {
     sources.push((Source::Plugin, plugin));
 
     // ── MCP ──
+    let mcp_calls = state.mcp_call_counts.clone();
     let mcp = match state.mcp_client.as_ref() {
         None => SourceReading::Unwired {
             because: "这个部署没有配置 MCP 对端（COGNEVA_MCP_ENDPOINT / _COMMAND）".into(),
@@ -431,10 +469,11 @@ pub async fn read(state: &GatewayState) -> Inventory {
                         // 这一栏是 `None`。
                         runs_in: None,
                         // 远端调用走网关的 `/protocol/mcp/tools/call`，不经过内建
-                        // 那张登记表，所以这一层没有数可报。
-                        calls: None,
+                        // 那张登记表；网关在那条路上自己数（`mcp_calls`），所以这一
+                        // 层有自己的计数器。计数器缺席（这个部署没走到装配那条路）
+                        // 时仍是 `None`——「没接」与「接了、没人点」在这一栏上要分得开。
+                        calls: calls_of_this_layer(mcp_calls.as_deref(), name),
                         allowed_roles: None,
-                        holders: Vec::new(),
                     });
                 }
                 SourceReading::Measured {
@@ -449,11 +488,52 @@ pub async fn read(state: &GatewayState) -> Inventory {
     };
     sources.push((Source::Mcp, mcp));
 
+    // ── 对话层 ──
+    // 这一层没有自己的一份清单可读：它读的是**最近一轮真正交给模型的那张表**，
+    // 由对话层自报（见 `ConversationTurn::offered_tools`）。按装配代码另拼一份会
+    // 漂：加了工具忘了改这一面，屏幕上少的那几只没有任何读数会红。
+    let conversation = match state.conversation.get() {
+        None => SourceReading::Unwired {
+            because: "这个部署没有装配对话层，能力页读不到一轮的工具表".into(),
+        },
+        Some(turn) => match turn.offered_tools() {
+            None => SourceReading::Unread {
+                because: "还没有一轮对话跑过：这一层要读到的是那一轮实际交出去的表，跑过一轮之后这里才有名字"
+                    .into(),
+            },
+            Some(tools) => {
+                for tool in &tools {
+                    entries.push(Entry {
+                        name: tool.name.clone(),
+                        source: Source::Conversation,
+                        reach: reach_of(Source::Conversation),
+                        description: Some(tool.description.clone()),
+                        boundary: boundary_of(Some(&tool.parameters)),
+                        runs_in: Some(match &tool.implementation {
+                            cog_core::ToolImplementation::Native(_) => RunsIn::Native,
+                            cog_core::ToolImplementation::Wasm { .. } => RunsIn::Wasm,
+                            cog_core::ToolImplementation::Shell(_) => RunsIn::Shell,
+                        }),
+                        // 这几只装在那一轮私有的表上，调用计数记在那张表上，
+                        // 不经过共用的那张——这里没有数可报。
+                        calls: None,
+                        allowed_roles: None,
+                    });
+                }
+                SourceReading::Measured {
+                    entries: tools.len(),
+                    callable: tools.len(),
+                }
+            }
+        },
+    };
+    sources.push((Source::Conversation, conversation));
+
     // ── 谁能点它 ──
-    // 从角色分工表读，不从名册自报读：名册那一栏写的是角色名，这一面要的是动作
-    // 名，两边说的不是同一组词（下面 `holders` 就是这件事的现场）。读法与运行时
-    // 收窄一轮时一样——`skill_configs` 数出有哪些角色，`skill_for_role` 决定同一个
-    // 角色有多行时哪一行算数。用别的读法，这一栏会报出运行时并不会给的许可。
+    // 从角色分工表读：名册自报那一栏写的是工号与角色名，这一面要的是动作名，两
+    // 边说的不是同一组词。读法与运行时收窄一轮时一样——`skill_configs` 数出有哪
+    // 些角色，`skill_for_role` 决定同一个角色有多行时哪一行算数。用别的读法，这
+    // 一栏会报出运行时并不会给的许可。
     let (allowed, unbounded_roles) = match state.skill_registry.as_ref() {
         None => (None, None),
         Some(registry) => {
@@ -463,49 +543,7 @@ pub async fn read(state: &GatewayState) -> Inventory {
         }
     };
 
-    // ── 持有人 ──
-    // 名册读不到时 `declaring_units` 是 `None`，不是 0：那时两种情形在读数上同形，
-    // 而它们要的动作相反——一栏没人填是接线缺口，名册没读到是这一拍读失败。
-    let (declared, declaring_units, roster_caveat) = match state.agent_registry.as_ref() {
-        None => (
-            BTreeMap::new(),
-            None,
-            Some("这个部署没有员工名册".to_string()),
-        ),
-        Some(registry) => match registry.list().await {
-            Ok(agents) => {
-                let mut declared: BTreeMap<String, Vec<Holder>> = BTreeMap::new();
-                let mut declaring = 0usize;
-                let now = chrono::Utc::now();
-                for agent in agents {
-                    if agent.capabilities.is_empty() {
-                        continue;
-                    }
-                    declaring += 1;
-                    // 心跳多久算在岗：用的是面主那套判据，不另造一个界。同一个
-                    // 「这人还在不在」在两张表上给出两个答案，读的人只会记住先
-                    // 看到的那个。
-                    let live = (now - agent.last_heartbeat).num_seconds()
-                        < cog_core::contract::face_registry::OWNER_IDLE_AFTER_SECS;
-                    for capability in &agent.capabilities {
-                        declared
-                            .entry(capability.clone())
-                            .or_default()
-                            .push(Holder {
-                                unit: agent.agent_id.clone(),
-                                live,
-                            });
-                    }
-                }
-                (declared, Some(declaring), None)
-            }
-            Err(e) => (BTreeMap::new(), None, Some(format!("读员工名册失败：{e}"))),
-        },
-    };
     for entry in entries.iter_mut() {
-        if let Some(holders) = declared.get(&entry.name) {
-            entry.holders = holders.clone();
-        }
         if let Some(allowed) = allowed.as_ref() {
             // 分工表读到了，这一项有没有角色点名都要写成 `Some`：空表是读数
             // （没有角色点名它），`None` 才是没读到。
@@ -513,49 +551,29 @@ pub async fn read(state: &GatewayState) -> Inventory {
         }
     }
 
-    finish(
-        entries,
-        sources,
-        declaring_units,
-        roster_caveat,
-        unbounded_roles,
-    )
+    finish(entries, sources, unbounded_roles)
 }
 
-/// 分工表里「谁能点它」：按动作列开点名的角色，另加没有声明边界的角色。
+/// 分工表里「谁能点它」：没有角色声明边界，所以每个角色都能点每一项。
 ///
-/// 读法与运行时收窄一轮时一样：`skill_configs` 数出有哪些角色，`skill_for_role`
-/// 决定同一个角色有多行时哪一行算数。用别的读法（比如把每一行都算上），这一栏会
-/// 报出运行时并不会给的许可——一份被高优先级行盖掉的旧清单会重新长出一个「允许」。
+/// 工具只有一套：手上有什么由**进程装了什么**决定，不由「它是哪种手」决定。技能行
+/// 上曾经有一张 `tools` 白名单，按角色收窄一轮的工具表；那一栏现在没有来源了，
+/// 于是这里只报一份角色名单，全部落在「不设边界」那一侧。
 ///
-/// 空表 `tools` 的角色单独返回，不摊到每个动作上：空表的意思是「不设边界，拿整张
-/// 注册表」，所以它出现在这里就等于「每一项它都能点」。把它读成「什么都不能调」，
-/// 恰好把最宽的那个角色读成最窄的。
+/// 空表这一档不是「什么都不能调」，是「拿整张注册表」：把它读成禁止，恰好把最宽
+/// 的那个角色读成最窄的。
 ///
 /// 单独一段是为了能判：它只吃一份技能表，不需要一棵接了插件的网关状态。
 fn callers_by_tool(
     registry: &cog_core::SkillRegistry,
 ) -> (BTreeMap<String, Vec<String>>, Vec<String>) {
-    let mut roles: BTreeSet<String> = BTreeSet::new();
-    for config in registry.skill_configs() {
-        roles.insert(config.role_type.clone());
-    }
-    let mut per_tool: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut unbounded: Vec<String> = Vec::new();
+    let roles: BTreeSet<String> = registry
+        .skill_configs()
+        .into_iter()
+        .map(|config| config.role_type.clone())
+        .collect();
     // 角色名已经按 `BTreeSet` 排过：同一项的两个角色，顺序不随哈希历史变。
-    for role in roles {
-        let Some(config) = registry.skill_for_role(&role) else {
-            continue;
-        };
-        if config.tools.is_empty() {
-            unbounded.push(role);
-            continue;
-        }
-        for tool in &config.tools {
-            per_tool.entry(tool.clone()).or_default().push(role.clone());
-        }
-    }
-    (per_tool, unbounded)
+    (BTreeMap::new(), roles.into_iter().collect())
 }
 
 /// 把三路拼到的东西收成一份清单：排序、同一来源里同名的合成一行、每层条数与行数同源。
@@ -564,8 +582,6 @@ fn callers_by_tool(
 fn finish(
     mut entries: Vec<Entry>,
     mut sources: Vec<(Source, SourceReading)>,
-    declaring_units: Option<usize>,
-    roster_caveat: Option<String>,
     unbounded_roles: Option<Vec<String>>,
 ) -> Inventory {
     entries.sort_by(|a, b| {
@@ -599,8 +615,6 @@ fn finish(
         generated_at: chrono::Utc::now(),
         sources,
         entries,
-        declaring_units,
-        roster_caveat,
         unbounded_roles,
     }
 }
@@ -627,7 +641,6 @@ mod tests {
             runs_in: None,
             calls: None,
             allowed_roles: None,
-            holders: Vec::new(),
         };
         let inventory = finish(
             vec![
@@ -650,8 +663,6 @@ mod tests {
                     },
                 ),
             ],
-            Some(0),
-            None, // roster_caveat
             None, // unbounded_roles
         );
         assert_eq!(inventory.entry_count(), 2);
@@ -705,7 +716,6 @@ mod tests {
             runs_in: None,
             calls: None,
             allowed_roles: None,
-            holders: Vec::new(),
         };
         let inventory = finish(
             vec![entry("第一个插件"), entry("第二个插件")],
@@ -716,8 +726,6 @@ mod tests {
                     callable: 0,
                 },
             )],
-            Some(0),
-            None, // roster_caveat
             None, // unbounded_roles
         );
         assert_eq!(inventory.entry_count(), 1);
@@ -745,6 +753,7 @@ mod tests {
             (Source::Builtin, "builtin"),
             (Source::Plugin, "plugin"),
             (Source::Mcp, "mcp"),
+            (Source::Conversation, "conversation"),
         ] {
             assert_eq!(serde_json::to_value(source).unwrap(), expected);
         }
@@ -771,6 +780,7 @@ mod tests {
     fn the_plugin_layer_is_declared_only_until_something_registers_it() {
         assert_eq!(reach_of(Source::Builtin), Reach::Callable);
         assert_eq!(reach_of(Source::Mcp), Reach::Callable);
+        assert_eq!(reach_of(Source::Conversation), Reach::Callable);
         assert_eq!(reach_of(Source::Plugin), Reach::DeclaredOnly);
     }
 
@@ -846,7 +856,6 @@ mod tests {
             runs_in: None,
             calls: None,
             allowed_roles: None,
-            holders: Vec::new(),
         })
         .unwrap();
         assert!(uncounted["calls"].is_null());
@@ -860,10 +869,107 @@ mod tests {
             runs_in: Some(RunsIn::Native),
             calls: Some(0),
             allowed_roles: None,
-            holders: Vec::new(),
         })
         .unwrap();
         assert_eq!(counted["calls"], 0);
+    }
+
+    /// 一次派发数进来之后，那一层就从「没有计数器」变成「有计数器」。
+    ///
+    /// 这一格钉的是计数器与能力行之间那条缝：MCP 的派发点在网关自己的路由上
+    /// （`/api/v1/protocol/mcp/tools/call`），不经过内建那张登记表，所以它此前
+    /// 在这一栏上永远是 `null`——读的人分不清「这一层没接计数器」与「接了、没人点」。
+    /// 没有这条改动时，`counts.count()` 的数进不了 `call_total()` 的和。
+    #[test]
+    fn a_call_from_a_layer_with_a_counter_adds_one_to_the_total() {
+        let counts = crate::mcp_calls::McpCallCounts::new();
+        let row = |name: &str, calls| Entry {
+            name: name.into(),
+            source: Source::Mcp,
+            reach: Reach::Callable,
+            description: None,
+            boundary: None,
+            runs_in: None,
+            calls,
+            allowed_roles: None,
+        };
+
+        // 派发之前：有计数器，量到 0。
+        let before = Inventory {
+            entries: vec![row("search", calls_of_this_layer(Some(&counts), "search"))],
+            ..Default::default()
+        };
+        assert_eq!(
+            before.call_total(),
+            Some((0, Vec::new())),
+            "接了计数器的层在没人点时是量到的 0，不是缺口"
+        );
+
+        // 派发一次：那一行变 1，和也跟着变。
+        counts.record("search");
+        let after = Inventory {
+            entries: vec![row("search", calls_of_this_layer(Some(&counts), "search"))],
+            ..Default::default()
+        };
+        assert_eq!(
+            after.call_total(),
+            Some((1, Vec::new())),
+            "一次派发要进到那一行的数、再进到总和"
+        );
+
+        // 没有计数器时仍是 None：这两件事在线上一眼要分得开。
+        assert_eq!(
+            calls_of_this_layer(None, "search"),
+            None,
+            "这一层根本没有计数器"
+        );
+    }
+
+    /// 次数之和按行加，缺计数器的层要点名；一层都没有计数器时不算出 0。
+    ///
+    /// 三种形状各判一次，因为它们要的动作相反：求和是读数，点名缺哪层是接线缺口，
+    /// 全都没有计数器时印 0 会把「没人记」说成「没人用」。
+    #[test]
+    fn the_usage_total_sums_the_counted_layers_and_names_the_uncounted_ones() {
+        let row = |name: &str, source, calls| Entry {
+            name: name.into(),
+            source,
+            reach: Reach::Callable,
+            description: None,
+            boundary: None,
+            runs_in: None,
+            calls,
+            allowed_roles: None,
+        };
+        let inventory = |entries: Vec<Entry>| Inventory {
+            entries,
+            ..Default::default()
+        };
+
+        // 内建两层各有计数，插件那一层没有：和是两个内建的和，缺口点名插件。
+        let mixed = inventory(vec![
+            row("read_file", Source::Builtin, Some(3)),
+            row("write_file", Source::Builtin, Some(0)),
+            row("helper", Source::Plugin, None),
+        ]);
+        assert_eq!(
+            mixed.call_total(),
+            Some((3, vec![Source::Plugin])),
+            "有计数器的层（含量到 0 的）参与求和，没有计数器的层被点名"
+        );
+
+        // 有计数器、一次都没点过：这是量到的 0，不是没量到。
+        let counted_zero = inventory(vec![row("read_file", Source::Builtin, Some(0))]);
+        assert_eq!(counted_zero.call_total(), Some((0, Vec::new())));
+
+        // 一项都没有：尚未量到。把它读成 0 次会让人以为是「查过了，没人用」。
+        assert_eq!(inventory(Vec::new()).call_total(), None);
+        let uncounted = inventory(vec![row("helper", Source::Plugin, None)]);
+        assert_eq!(
+            uncounted.call_total(),
+            None,
+            "整份清单只有没计数器的层时，这一格是没量到"
+        );
     }
 
     /// 每一层的「其中几个能调」按行算，不照抄拼装时那个数。
@@ -882,7 +988,6 @@ mod tests {
             runs_in: None,
             calls: None,
             allowed_roles: None,
-            holders: Vec::new(),
         };
         let inventory = finish(
             vec![
@@ -898,8 +1003,6 @@ mod tests {
                     callable: 3,
                 },
             )],
-            Some(0),
-            None, // roster_caveat
             None, // unbounded_roles
         );
         assert_eq!(inventory.entry_count(), 2);
@@ -925,69 +1028,45 @@ mod tests {
 
     /// 点了名允许调它的角色按动作列开：这一栏答的是「运行时会不会放它进去」。
     ///
-    /// 名册那一栏（`holders`）写的是角色名或自由文本，这一栏要的是动作名；两边
-    /// 说的不是同一组词，所以这一栏必须从分工表读，不能从名册自报读。
-    #[test]
-    fn a_role_that_names_the_action_is_listed_as_its_caller() {
-        let registry = registry_with(
-            r#"[
-                {"skill_id":"planner","name":"Planner","tools":["read_file","search"],"role_type":"planner"},
-                {"skill_id":"generator","name":"Generator","tools":["write_file"],"role_type":"generator"}
-            ]"#,
-        );
-        let (per_tool, unbounded) = callers_by_tool(&registry);
-        assert_eq!(
-            per_tool.get("read_file").map(Vec::as_slice),
-            Some(&["planner".to_string()][..])
-        );
-        assert_eq!(
-            per_tool.get("write_file").map(Vec::as_slice),
-            Some(&["generator".to_string()][..])
-        );
-        assert!(unbounded.is_empty(), "两份技能都声明了边界");
-    }
-
-    /// 空 `tools` 的角色单独一栏，不摊到每个动作上：空表是「不设边界，拿整张
-    /// 注册表」，把它读成「什么都不能调」恰好把最宽的角色读成了最窄的。
-    #[test]
-    fn a_role_with_no_declared_tools_is_unbounded_rather_than_forbidden() {
-        let registry = registry_with(
-            r#"[
-                {"skill_id":"free","name":"Free","tools":[],"role_type":"generalist"},
-                {"skill_id":"planner","name":"Planner","tools":["read_file"],"role_type":"planner"}
-            ]"#,
-        );
-        let (per_tool, unbounded) = callers_by_tool(&registry);
-        assert_eq!(unbounded, vec!["generalist".to_string()]);
-        assert_eq!(
-            per_tool.get("read_file").map(Vec::as_slice),
-            Some(&["planner".to_string()][..])
-        );
-        assert_eq!(per_tool.len(), 1, "不设边界的角色不被摊到任何一项上");
-    }
-
-    /// 同一个角色有多行时，这一栏算的是运行时用的那一行，不是每一行都算。
+    /// 名册自报那一栏写的是角色名，这一栏要的是动作名；两边没有角色声明边界之后，
+    /// 每个角色都落在「不设边界」那一侧。
     ///
-    /// 把被盖掉的旧行也算上，这一栏会报出一个运行时并不给的许可——而那一栏的
-    /// 全部价值就是「说得出谁能点它」。
+    /// 这一栏从分工表读而不是从名册自报读，理由没变：两处说的不是同一组词。变的是
+    /// 分工表里不再有边界——工具只有一套，谁拿到的都是整张注册表。
     #[test]
-    fn the_row_that_governs_a_role_is_the_one_the_run_uses() {
-        let mut registry = registry_with(
+    fn every_role_is_unbounded_since_no_row_declares_a_boundary() {
+        let registry = registry_with(
             r#"[
-                {"skill_id":"a-generator","name":"A","tools":["write_file"],"role_type":"generator"},
-                {"skill_id":"b-generator","name":"B","tools":["admin_shell"],"role_type":"generator"}
+                {"skill_id":"planner","name":"Planner","role_type":"planner"},
+                {"skill_id":"generator","name":"Generator","role_type":"generator"}
             ]"#,
         );
-        // 同优先级按 skill id 定序（与 `skill_for_role` 一致）：a-generator 算数。
-        let (rows, _) = callers_by_tool(&registry);
-        assert_eq!(rows.keys().collect::<Vec<_>>(), vec!["write_file"]);
-        registry.set_priority("b-generator", 10);
-        let (rows, _) = callers_by_tool(&registry);
-        assert_eq!(
-            rows.keys().collect::<Vec<_>>(),
-            vec!["admin_shell"],
-            "高优先级那一行接管这个角色之后，旧行的工具不再算允许"
+        let (per_tool, unbounded) = callers_by_tool(&registry);
+        assert!(
+            per_tool.is_empty(),
+            "有动作被摊到了某个角色头上：分工表里已经没有任何边界可以声明它"
         );
+        assert_eq!(
+            unbounded,
+            vec!["generator".to_string(), "planner".to_string()],
+            "每个角色都该落进「拿整张注册表」那一栏，而不是被读成什么都不能调"
+        );
+    }
+
+    /// 同一个角色有多行时，这一栏只列它一次。
+    ///
+    /// 这一栏答的是「有哪些角色」，不是「有哪些行」：按行列，同一个角色会因为
+    /// 表里多出一行而在读者那里变成两个人。
+    #[test]
+    fn a_role_with_several_rows_is_listed_once() {
+        let registry = registry_with(
+            r#"[
+                {"skill_id":"a-generator","name":"A","role_type":"generator"},
+                {"skill_id":"b-generator","name":"B","role_type":"generator"}
+            ]"#,
+        );
+        let (_, unbounded) = callers_by_tool(&registry);
+        assert_eq!(unbounded, vec!["generator".to_string()]);
     }
 
     /// 「分工表没读到」与「读到了、没有角色点名它」在线上要分得开。
@@ -1002,7 +1081,6 @@ mod tests {
             runs_in: None,
             calls: Some(0),
             allowed_roles: None,
-            holders: Vec::new(),
         })
         .unwrap();
         assert!(absent["allowed_roles"].is_null());
@@ -1016,7 +1094,6 @@ mod tests {
             runs_in: None,
             calls: Some(0),
             allowed_roles: Some(Vec::new()),
-            holders: Vec::new(),
         })
         .unwrap();
         assert_eq!(named_none["allowed_roles"], serde_json::json!([]));

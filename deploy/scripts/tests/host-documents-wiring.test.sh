@@ -49,8 +49,16 @@ grep -q "path: \"/srv/alice/Documents\"" <<<"${enabled_out}" \
 # Read the type from the host-docs volume itself: the chart uses
 # DirectoryOrCreate elsewhere (buildah storage) and a whole-file grep would
 # report that one instead.
+# 取的是 host-docs 卷自己那一行 `type:`，不是注释里那句解释：模板在卷条目上方写了
+# `# type: Directory（非 DirectoryOrCreate）…` 一行说明，按「附近出现 type:」取字会
+# 把它读成 `$2` 恰好也像模像样（`type:`），于是判据看着有答案、其实没读到卷。
+# `$1 == "type:"` 把注释（`$1 == "#"`）挡在外面，并且以最后一条 `- name: host-docs-`
+# 为准——pod 里 volumeMounts 在 volumes 之前，同一个名字先出现的是挂载、后出现的才是卷。
 host_volume_type() {
-  awk '/name: host-docs-/{ hit = NR } hit && NR <= hit + 5 && /type:/ { print $2; exit }' "$1"
+  awk '
+    /^[[:blank:]]*- name: host-docs-/ { hit = NR }
+    hit && NR > hit && NR <= hit + 6 && $1 == "type:" { print $2; exit }
+  ' "$1"
 }
 render --set hostDocuments.scopes.alice=/srv/alice/Documents > "${work}/render.yaml"
 got_type="$(host_volume_type "${work}/render.yaml")"
@@ -80,7 +88,7 @@ assist_rs="${repo}/crates/cog-extension/src/hostdocs_assist.rs"
 for env_name in HOST_DOCS_SCOPES HOST_DOCS_JOURNAL_DIR HOST_DOCS_MAX_WRITE_BYTES \
   HOST_DOCS_MAX_READ_BYTES HOST_DOCS_APPROVAL_TTL_SECS HOST_DOCS_MAX_PLAN_BYTES \
   HOST_DOCS_CLASSIFY_RULES HOST_DOCS_AUDITED_LLM_URL HOST_DOCS_ASSIST_BODY_BYTES \
-  HOST_DOCS_ASSIST_MAX_CANDIDATES; do
+  HOST_DOCS_ASSIST_MAX_CANDIDATES HOST_DOCS_ASSIST_AUDIT_BUDGET_BYTES; do
   # The whole crate, not two files: the reading lives wherever the reading lives, and a
   # fixed file list goes stale the moment the capability is split across one more module
   # -- which is exactly how a dead knob would then pass this check.
@@ -116,7 +124,11 @@ env_value() {
 import sys, yaml
 path, workload, container, env = sys.argv[1:5]
 for doc in yaml.safe_load_all(open(path)):
-    if not doc or doc.get('kind') != 'Deployment' or doc['metadata']['name'] != workload:
+    # 执行器是 StatefulSet（一副副本一块卷），其它带 Pod 模板的也认：按 Deployment
+    # 一种读，执行器这一侧会读成「没有这个工作负载」，而读不到与「没配」在这里
+    # 同形——那一半的开关检查会静默跳过。
+    if not doc or doc.get('kind') not in ('Deployment', 'StatefulSet', 'DaemonSet') \
+            or doc['metadata']['name'] != workload:
         continue
     for c in doc['spec']['template']['spec']['containers']:
         if c['name'] != container:
@@ -214,7 +226,8 @@ got="$(env_value "${work}/scopes.yaml" cogneva-sandbox-executor sandbox-executor
 case "${got}" in
   ''|*[!0-9]*) fail "HOST_DOCS_APPROVAL_TTL_SECS reads '${got}'; it must be a decimal integer second count" ;;
 esac
-for bound_env in HOST_DOCS_ASSIST_BODY_BYTES HOST_DOCS_ASSIST_MAX_CANDIDATES; do
+for bound_env in HOST_DOCS_ASSIST_BODY_BYTES HOST_DOCS_ASSIST_MAX_CANDIDATES \
+  HOST_DOCS_ASSIST_AUDIT_BUDGET_BYTES; do
   got="$(env_value "${work}/scopes.yaml" cogneva-sandbox-executor sandbox-executor "${bound_env}")"
   case "${got}" in
     ''|*[!0-9]*) fail "${bound_env} reads '${got}'; it must be a decimal integer count" ;;
@@ -329,9 +342,17 @@ for render in sys.argv[1:-1]:
     fail = []
 
     def env_value(workload, container, name):
-        d = by_name.get(('Deployment', workload))
+        # 工作负载的种类属于这一份清单，不属于这份判据：执行器是 StatefulSet
+        # （一副副本一块卷）。按 Deployment 找人，找不到的那一句听起来像「清单里
+        # 没有这个工作负载」，其实是判据认错了词。
+        d = next(
+            (by_name[k] for k in
+             (('Deployment', workload), ('StatefulSet', workload), ('DaemonSet', workload))
+             if k in by_name),
+            None,
+        )
         if d is None:
-            fail.append(f"no Deployment {workload}")
+            fail.append(f"no workload {workload}")
             return None
         for c in d['spec']['template']['spec']['containers']:
             if c['name'] != container:
@@ -416,7 +437,9 @@ host_docs_facts() {
 import sys, yaml
 facts = []
 for doc in yaml.safe_load_all(open(sys.argv[1])):
-    if not doc or doc.get('kind') != 'Deployment' or doc['metadata']['name'] != 'cogneva-sandbox-executor':
+    # 执行器是 StatefulSet；种类在这里不该是判据，名字才是。
+    if not doc or doc.get('kind') not in ('Deployment', 'StatefulSet') \
+            or doc['metadata']['name'] != 'cogneva-sandbox-executor':
         continue
     spec = doc['spec']['template']['spec']
     for c in spec['containers']:

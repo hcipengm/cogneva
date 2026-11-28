@@ -40,11 +40,23 @@ CREATE TABLE IF NOT EXISTS alerts (
                 severity    TEXT        NOT NULL,
                 state       TEXT        NOT NULL,
                 message     TEXT        NOT NULL,
-                labels      JSONB       NOT NULL DEFAULT '{}'::jsonb,
+                labels      TEXT        NOT NULL DEFAULT '{}',
                 fired_at    TIMESTAMPTZ NOT NULL,
                 resolved_at TIMESTAMPTZ,
                 updated_at  TIMESTAMPTZ NOT NULL
             )
+;
+-- 标签集只整块读，所以它从 jsonb 降成 text（与库只存列那条线一致）。老库上这一列
+-- 还是 jsonb，而建表语句带 IF NOT EXISTS 时不会改已有列，所以降类型是显式两步：
+-- 先摘掉 jsonb 的默认值（它的类型没法自动转），再降类型。两步都是「catalog 已经
+-- 是那个形状就别再跑」的语句，因而第二次启动不会为它们去要锁。
+ALTER TABLE alerts ALTER COLUMN labels DROP DEFAULT;
+ALTER TABLE alerts ALTER COLUMN labels TYPE TEXT USING labels::text;
+-- 标签集里被**按值查**的两个键升成真列：`source`（镜子的收口）与
+-- `cogneva_io_face`（归属读的两跳之一）。其余部分只整块读，存 text。
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS source TEXT
+;
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS cogneva_io_face TEXT
 ;
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ
 ;
@@ -109,7 +121,8 @@ pub fn ddl() -> String {
 /// window) and a day of history is enough to explain a disagreement someone
 /// noticed this morning. The point of the bound is that the table's size has to
 /// follow the number of alert keys rather than the number of rollouts.
-// cap: bound — 界的是这张表的大小跟告警键数走、不跟发布次数走；一天够答「早上注意到的那条还在不在」
+// cap: fixed — 界的是这张表的大小跟告警键数走、不跟发布次数走；一天够答「早上注意到的那条还在不在」
+// keep: 删掉后断言表跟着发布次数无界长，一天前的告警键还在；由「跟告警键数走、不跟发布次数走」兜住
 pub const ASSERTION_RETENTION_SECONDS: i64 = 24 * 60 * 60;
 
 /// A new alert condition to raise (or close).
@@ -123,6 +136,27 @@ pub struct NewAlert {
     pub severity: String,
     pub message: String,
     pub labels: Value,
+}
+
+/// 这一条告警声明的来源标签：`source` 是标签集里被按值查的键之一，升成了真列。
+///
+/// 写入时同时落列与标签集：只落标签集，按来源读的那条查询（镜子的收口）永远读到
+/// 空——空集在它那里读作「没有一条是我该关的」，于是别人写的行会被它关掉，或者
+/// 自己的行永远关不掉，两种都不报错。
+fn source_of(labels: &Value) -> Option<String> {
+    labels
+        .get("source")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+/// 这一条告警声明的面：`cogneva_io_face` 也是被按值查的键（归属读要问「这一行
+/// 该谁看」），与 `source` 同一个理由升成真列。没带面不是错误：那一条会读作无主。
+fn face_of(labels: &Value) -> Option<String> {
+    labels
+        .get("cogneva_io_face")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
 }
 
 /// What a `set_alert` call changed. Declared in the contract layer, because
@@ -168,6 +202,12 @@ fn decide(condition: bool, stored: Option<&StoredAlert>) -> AlertTransition {
 /// passed, a usage value that has since grown. Consumers cannot tell a stale
 /// snapshot from a fresh one, so the refresh happens here rather than at each
 /// reader.
+/// 读出 labels 列再解析一次。列存的是 `text`（库只存列，开集载荷不进 jsonb），
+/// 解析失败退回空对象：一条坏行不该让整张告警面读不出来。
+fn parse_labels(raw: String) -> Value {
+    serde_json::from_str(&raw).unwrap_or_else(|_| Value::Object(Default::default()))
+}
+
 fn payload_differs(stored: &StoredAlert, alert: &NewAlert) -> bool {
     stored.severity != alert.severity
         || stored.message != alert.message
@@ -462,7 +502,7 @@ impl PostgresAlertStore {
                     state: row.get("state"),
                     severity: row.get("severity"),
                     message: row.get("message"),
-                    labels: row.get("labels"),
+                    labels: parse_labels(row.get::<String, _>("labels")),
                 });
 
         match decide(condition, stored.as_ref()) {
@@ -471,14 +511,16 @@ impl PostgresAlertStore {
                 sqlx::query(&alert_sql(
                     r#"
                     INSERT INTO alerts
-                        (id, rule, dedup_key, severity, state, message, labels,
-                         fired_at, resolved_at, updated_at, last_seen_at, writer)
-                    VALUES ($1, $2, $3, $4, '{state:firing}', $5, $6, $7, NULL, $7, $7, $8)
+                        (id, rule, dedup_key, severity, state, message, labels, source,
+                         cogneva_io_face, fired_at, resolved_at, updated_at, last_seen_at, writer)
+                    VALUES ($1, $2, $3, $4, '{state:firing}', $5, $6, $9, $10, $7, NULL, $7, $7, $8)
                     ON CONFLICT (dedup_key) DO UPDATE SET
                         severity   = EXCLUDED.severity,
                         state      = '{state:firing}',
                         message    = EXCLUDED.message,
                         labels     = EXCLUDED.labels,
+                        source     = EXCLUDED.source,
+                        cogneva_io_face = EXCLUDED.cogneva_io_face,
                         fired_at   = EXCLUDED.fired_at,
                         resolved_at = NULL,
                         updated_at = EXCLUDED.updated_at,
@@ -502,9 +544,11 @@ impl PostgresAlertStore {
                 .bind(&alert.dedup_key)
                 .bind(&alert.severity)
                 .bind(&alert.message)
-                .bind(&alert.labels)
+                .bind(alert.labels.to_string())
                 .bind(now)
                 .bind(&self.writer)
+                .bind(source_of(&alert.labels))
+                .bind(face_of(&alert.labels))
                 .execute(&self.pool)
                 .await?;
                 self.record_assertion_best_effort(&alert.dedup_key, AlertState::Firing)
@@ -553,7 +597,7 @@ impl PostgresAlertStore {
                         .bind(&alert.dedup_key)
                         .bind(&alert.severity)
                         .bind(&alert.message)
-                        .bind(&alert.labels)
+                        .bind(alert.labels.to_string())
                         .bind(now)
                         .execute(&self.pool)
                         .await?;
@@ -805,7 +849,7 @@ impl PostgresAlertStore {
                 dedup_key: row.get("dedup_key"),
                 severity: row.get("severity"),
                 message: row.get("message"),
-                labels: row.get("labels"),
+                labels: parse_labels(row.get::<String, _>("labels")),
             })
             .collect())
     }
@@ -842,7 +886,7 @@ impl PostgresAlertStore {
     pub async fn firing_keys_from_source(&self, source: &str) -> anyhow::Result<Vec<String>> {
         let rows = sqlx::query(&alert_sql(
             "SELECT dedup_key FROM alerts \
-             WHERE state = '{state:firing}' AND labels->>'source' = $1",
+             WHERE state = '{state:firing}' AND source = $1",
         ))
         .bind(source)
         .fetch_all(&self.pool)
@@ -918,7 +962,12 @@ fn row_to_record(row: sqlx::postgres::PgRow) -> AlertRecord {
         severity: row.get("severity"),
         state: row.get("state"),
         message: row.get("message"),
-        labels: row.get("labels"),
+        // 标签集在库里是 text（只整块读），契约面是一个 JSON 对象：解析放在这一处，
+        // 读不懂的字节不编一个空对象出来——空对象会读成「这条告警没有标签」。
+        labels: row
+            .get::<Option<String>, _>("labels")
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or(serde_json::Value::Null),
         fired_at: row.get("fired_at"),
         resolved_at: row.get("resolved_at"),
         updated_at: row.get("updated_at"),

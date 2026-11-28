@@ -94,7 +94,7 @@ CREATE TABLE IF NOT EXISTS cog_events (
                 id SERIAL PRIMARY KEY,
                 task_id TEXT NOT NULL,
                 event_type TEXT NOT NULL,
-                payload JSONB NOT NULL,
+                payload TEXT  NOT NULL,
                 offset_num BIGINT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
@@ -149,7 +149,7 @@ CREATE INDEX IF NOT EXISTS idx_cog_context_boards_field_value
 ;
 CREATE TABLE IF NOT EXISTS cog_dag_state (
                 workspace_id TEXT PRIMARY KEY,
-                state JSONB NOT NULL,
+                state TEXT  NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
 ;
@@ -170,7 +170,8 @@ CREATE TABLE IF NOT EXISTS task_defined (
                 created_at TIMESTAMPTZ NOT NULL,
                 priority INTEGER NOT NULL DEFAULT 0,
                 max_retries INTEGER NOT NULL DEFAULT 0,
-                timeout_seconds BIGINT NOT NULL DEFAULT 0,
+                -- db-column: task_defined.declared_duration_seconds — not-a-bound — 任务自己声明的时长（输入，不是我们设的界）
+                declared_duration_seconds BIGINT NOT NULL DEFAULT 0,
                 is_executable BOOLEAN NOT NULL DEFAULT TRUE,
                 acceptance TEXT[] NOT NULL DEFAULT '{}',
                 blocked_by TEXT[] NOT NULL DEFAULT '{}',
@@ -189,11 +190,25 @@ CREATE TABLE IF NOT EXISTS task_defined (
                 planner_source TEXT,
                 planner_confidence DOUBLE PRECISION,
                 planner_at TIMESTAMPTZ,
+                -- 收件台按意图身份问「这一条派生了没有」。与迁移 127 是同一列表述：
+                -- 全新安装与升级路径必须长出同一张表，由
+                -- `task_ledger_ddl_matches_the_migration` 逐条比对。
+                intent_id TEXT GENERATED ALWAYS AS (
+                    (CASE WHEN input ~ '^[[:space:]]*[\[{]' THEN input::jsonb END) ->> 'intent_id'
+                ) STORED,
+                -- 三格与迁移 141 是同一列表述；放在末尾，升上来的库与全新安装的
+                -- 列序才一样（`task_ledger_ddl_matches_the_migration` 逐列比）。
+                terminal TEXT NOT NULL DEFAULT '',
+                now TEXT NOT NULL DEFAULT '',
+                gap TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (task_id, rev)
             )
 ;
 CREATE INDEX IF NOT EXISTS idx_task_defined_latest
             ON task_defined(task_id, rev DESC)
+;
+CREATE INDEX IF NOT EXISTS idx_task_defined_intent_id
+            ON task_defined(intent_id) WHERE intent_id IS NOT NULL
 ;
 CREATE INDEX IF NOT EXISTS idx_task_defined_blocked_by
             ON task_defined USING GIN (blocked_by)
@@ -211,6 +226,19 @@ CREATE INDEX IF NOT EXISTS idx_task_defined_venue
 -- proxied call, so it is an index and not a scan.
 CREATE INDEX IF NOT EXISTS idx_task_defined_submitted_by
             ON task_defined(submitted_by)
+;
+-- 定义行携带的交接身份落成的侧表（迁移 131 的同一列表述）。一次交接可以带多行
+-- 身份，所以它不是 task_defined 上的一列；两跳对账按身份键查，读的人不再把
+-- `input` 文本解析一遍。写者与 `insert_definition_row` 在同一语句里落行。
+CREATE TABLE IF NOT EXISTS task_change_identity (
+                task_id TEXT NOT NULL,
+                rev BIGINT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                literal TEXT NOT NULL,
+                PRIMARY KEY (task_id, rev, ordinal)
+            )
 ;
 CREATE TABLE IF NOT EXISTS task_transition (
                 task_id TEXT NOT NULL,
@@ -250,6 +278,8 @@ CREATE TABLE IF NOT EXISTS task_attempt (
                 error_code TEXT,
                 error_text TEXT,
                 result TEXT,
+                role TEXT,
+                person TEXT,
                 PRIMARY KEY (task_id, attempt_no)
             )
 ;
@@ -412,6 +442,20 @@ pub struct PostgresStateBackend {
     pool: PgPool,
 }
 
+/// What a state transition must still be true of the row at the moment it lands.
+///
+/// The status check every transition makes is one of these; the two below are the
+/// conditions particular callers add. They are a struct rather than boolean
+/// parameters because a call site reading `Some(unit), true` says nothing about
+/// what the `true` guards, and the two answers here are never both in play.
+#[derive(Default, Clone, Copy)]
+struct TransitionGuard<'a> {
+    /// The row's `owner_unit` must be this unit, and `updated` must still name it.
+    owner: Option<&'a str>,
+    /// The row must be unclaimed: 接活只能成功一次。
+    claim: bool,
+}
+
 impl PostgresStateBackend {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -532,13 +576,16 @@ impl PostgresStateBackend {
     /// status = ANY(...)` is here a read of the last transition under the
     /// workspace lock, so the check and the write are one decision rather than
     /// two statements a second writer can slip between.
+    ///
+    /// `guard` carries the extra conditions a particular caller's write has to
+    /// meet at that same instant; see [`TransitionGuard`].
     async fn transition_task(
         &self,
         workspace_id: &str,
         task_id: &str,
         expected: &[cog_core::TaskStatus],
         updated: &cog_core::Task,
-        owner: Option<&str>,
+        guard: TransitionGuard<'_>,
     ) -> SFResult<()> {
         let mut tx = self
             .pool
@@ -555,7 +602,7 @@ impl PostgresStateBackend {
             });
         };
 
-        if let Some(owner) = owner {
+        if let Some(owner) = guard.owner {
             let row: Option<(Option<String>,)> = sqlx::query_as(
                 "SELECT owner_unit FROM task_defined WHERE task_id = $1 \
                  ORDER BY rev DESC LIMIT 1",
@@ -582,17 +629,55 @@ impl PostgresStateBackend {
             }
         }
 
+        if guard.claim {
+            // 接活只能成功一次。守卫读的是库里这一行自己的认领，不是调用方读到
+            // 的快照：两个消费者同时读到「待接」时，第二个的写必须落不下来，否则
+            // 同一条活会被两个人同时接走，而两边都会认为自己有责任去干。
+            //
+            // 持有 = 有个名字、且那个人的租约还没到期，与 `Task::claim_held_now`
+            // 同一个口径。只读到期的名字不行：一条回到队里、名字还留着的行会永远
+            // 「已经被 X 接了」，而 X 早就不在了——那条活从此没人接得走。
+            // `Pending` 行上的名字同样不算认领（那是上一轮交付的人）。
+            let row: Option<(Option<String>, Option<chrono::DateTime<chrono::Utc>>)> =
+                sqlx::query_as(
+                    "SELECT d.agent_id, c.lease_expires_at \
+                       FROM (SELECT agent_id FROM task_defined \
+                              WHERE task_id = $1 AND workspace_id = $2 \
+                              ORDER BY rev DESC LIMIT 1) d \
+                       LEFT JOIN task_current c \
+                         ON c.task_id = $1 AND c.workspace_id = $2",
+                )
+                .bind(task_id)
+                .bind(workspace_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| SFError::Database(e.to_string()))?;
+            let held = row.and_then(|(agent, expires)| {
+                agent.filter(|_| expires.is_some_and(|expires| expires > chrono::Utc::now()))
+            });
+            if current != cog_core::TaskStatus::Pending {
+                if let Some(held) = held {
+                    return Err(SFError::Conflict(format!(
+                        "task {task_id} is already claimed by {held}"
+                    )));
+                }
+            }
+        }
+
         if !expected.contains(&current) {
             // 两条路对「状态不对」的回答不同，因为这个错在这个调用方那里含义不同：
             // 带 owner 的那条是「我读到的快照过期了，重读一次」，不带 owner 的那条
             // 是「这件任务不该被我推进」。把它报成一个，前者的重试逻辑会退化成把
             // 一次过期读当成本次任务的失败。
-            return Err(match owner {
-                Some(_) => SFError::Conflict(format!(
+            //
+            // 接活走的是前一种：一次没接上（别人先接了）不是这条活坏了，是这次
+            // 读取过期了。
+            return Err(match (guard.owner, guard.claim) {
+                (Some(_), _) | (_, true) => SFError::Conflict(format!(
                     "task {task_id} is in {:?} state, not one of the states this transition accepts",
                     current
                 )),
-                None => SFError::TaskFailed {
+                (None, false) => SFError::TaskFailed {
                     task_id: task_id.into(),
                     reason: format!("Cannot transition task in {current:?} state"),
                 },
@@ -603,8 +688,13 @@ impl PostgresStateBackend {
         if updated.status != current {
             match updated.status {
                 cog_core::TaskStatus::Running => {
-                    task_ledger::open_attempt(&mut tx, task_id, updated.lease_owner.as_deref())
-                        .await?;
+                    task_ledger::open_attempt(
+                        &mut tx,
+                        task_id,
+                        updated.lease_owner.as_deref(),
+                        updated.owner_unit.as_deref(),
+                    )
+                    .await?;
                 }
                 landed => {
                     if current == cog_core::TaskStatus::Running {
@@ -621,7 +711,7 @@ impl PostgresStateBackend {
                     }
                 }
             }
-            task_ledger::append_transition(
+            let seq = task_ledger::append_transition(
                 &mut tx,
                 &task_ledger::Transition {
                     task_id,
@@ -634,9 +724,24 @@ impl PostgresStateBackend {
                 },
             )
             .await?;
+            // 接下的那一刻是一条事实：「谁接下了这条活、租到什么时候」。续租不进流
+            // ——同一个 owner 把到期时刻往后挪是读数，不是一件新发生的事。
+            if updated.status == cog_core::TaskStatus::Running {
+                if let Some(owner) = updated.lease_owner.clone() {
+                    let payload = cog_core::EventPayload::TaskLeased {
+                        task_id: task_id.to_string(),
+                        owner,
+                        expires_at: updated.lease_expires_at.unwrap_or_else(chrono::Utc::now),
+                        actor: "store".into(),
+                    };
+                    let fields =
+                        payload.envelope(&task_ledger::lease_event_id(task_id, seq), "storage");
+                    super::event_log::append_on(&mut tx, &fields, chrono::Utc::now()).await?;
+                }
+            }
         }
 
-        task_ledger::project(&mut tx, Some(task_id)).await?;
+        task_ledger::project_incremental(&mut tx, task_id).await?;
         sqlx::query(
             "UPDATE task_current SET lease_owner = $2, lease_expires_at = $3 WHERE task_id = $1",
         )
@@ -791,7 +896,7 @@ impl StateBackend for PostgresStateBackend {
     }
 
     async fn append_event(&self, task_id: &str, event: &Event) -> SFResult<u64> {
-        let payload = serde_json::to_value(event)?;
+        let payload = serde_json::to_string(event)?;
         let event_type = event.event_type.clone();
 
         // The next position is one past the last the task holds, and a task's
@@ -839,7 +944,7 @@ impl StateBackend for PostgresStateBackend {
     }
 
     async fn get_events(&self, task_id: &str, offset: u64, limit: usize) -> SFResult<Vec<Event>> {
-        let rows: Vec<(String, serde_json::Value, i64, chrono::DateTime<Utc>)> = self
+        let rows: Vec<(String, String, i64, chrono::DateTime<Utc>)> = self
             .retry(|| async {
                 sqlx::query_as(EVENTS_PAGE_SQL)
                     .bind(task_id)
@@ -869,9 +974,12 @@ impl StateBackend for PostgresStateBackend {
             // rather than as NULL, because appending is the only way this column
             // is ever written -- such a row is a defect elsewhere, not a shape
             // for this read to invent.
-            let payload = match payload.get("payload") {
+            // 列存的是 text：先解析回信封，再取它自己的载荷。
+            let envelope: serde_json::Value =
+                serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
+            let payload = match envelope.get("payload") {
                 Some(inner) => inner.clone(),
-                None => payload,
+                None => envelope,
             };
             events.push(Event {
                 offset: offset_num as u64,
@@ -976,7 +1084,7 @@ impl StateBackend for PostgresStateBackend {
                 "#,
             )
             .bind(workspace_id)
-            .bind(state.clone())
+            .bind(state.to_string())
             .execute(&self.pool)
             .await
         })
@@ -985,7 +1093,7 @@ impl StateBackend for PostgresStateBackend {
     }
 
     async fn load_dag_state(&self, workspace_id: &str) -> SFResult<Option<serde_json::Value>> {
-        let row: Option<(serde_json::Value,)> = self
+        let row: Option<(String,)> = self
             .retry(|| async {
                 sqlx::query_as("SELECT state FROM cog_dag_state WHERE workspace_id = $1")
                     .bind(workspace_id)
@@ -994,7 +1102,7 @@ impl StateBackend for PostgresStateBackend {
             })
             .await?;
 
-        Ok(row.map(|r| r.0))
+        Ok(row.map(|r| serde_json::from_str::<serde_json::Value>(&r.0).unwrap_or_default()))
     }
 
     fn dag_supports_fine_grained(&self) -> bool {
@@ -1058,8 +1166,34 @@ impl StateBackend for PostgresStateBackend {
         expected: &[cog_core::TaskStatus],
         updated: &cog_core::Task,
     ) -> SFResult<()> {
-        self.transition_task(workspace_id, task_id, expected, updated, None)
-            .await
+        self.transition_task(
+            workspace_id,
+            task_id,
+            expected,
+            updated,
+            TransitionGuard::default(),
+        )
+        .await
+    }
+
+    async fn dag_claim_task(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        expected: &[cog_core::TaskStatus],
+        updated: &cog_core::Task,
+    ) -> SFResult<()> {
+        self.transition_task(
+            workspace_id,
+            task_id,
+            expected,
+            updated,
+            TransitionGuard {
+                claim: true,
+                ..TransitionGuard::default()
+            },
+        )
+        .await
     }
 
     async fn dag_transition_owned_task(
@@ -1070,8 +1204,17 @@ impl StateBackend for PostgresStateBackend {
         updated: &cog_core::Task,
         owner: &str,
     ) -> SFResult<()> {
-        self.transition_task(workspace_id, task_id, expected, updated, Some(owner))
-            .await
+        self.transition_task(
+            workspace_id,
+            task_id,
+            expected,
+            updated,
+            TransitionGuard {
+                owner: Some(owner),
+                ..TransitionGuard::default()
+            },
+        )
+        .await
     }
 
     /// Remove every row a task owns.
@@ -1716,7 +1859,7 @@ SELECT t.to_state, COUNT(*)::bigint
             },
         )
         .await?;
-        task_ledger::project(&mut tx, Some(task_id)).await?;
+        task_ledger::project_incremental(&mut tx, task_id).await?;
 
         tx.commit()
             .await
@@ -1753,7 +1896,7 @@ SELECT t.to_state, COUNT(*)::bigint
                     reported = %error,
                     "a failure arrived for a finished task; keeping the outcome it already had"
                 );
-                tx.rollback().await.ok();
+                cog_core::ignore_lost!(tx.rollback().await);
                 return Ok((false, Vec::new()));
             }
         }
@@ -1786,9 +1929,16 @@ SELECT t.to_state, COUNT(*)::bigint
         task.error = Some(error.clone());
         task.error_cause = cause;
         task.failure_payer = payer;
+        // 这一行存下来的预算就是这次判决真正用的那个数。调用方传进来的是矩阵
+        // 按失败类算出的生效值（确定性失败是 0），而任务上原来记着的只是提交
+        // 时声明的那个数；不写回来的话，同一行上「还剩几次」有两个答案，读的
+        // 人按行里那个数算，调度器按另一个数收账。
+        task.max_retries = max_retries;
         task.updated_at = Utc::now();
 
-        let should_retry = task.retry_count < max_retries;
+        // 判决只看「有没有拿到新东西」：调用方给 0 就是不买，给 1 就是再跑一次。
+        // `retry_count` 照旧累加——它回答的是「试过几次」，不是「还准不准试」。
+        let should_retry = max_retries > 0;
         let not_before = if should_retry {
             task.retry_count += 1;
             task.status = cog_core::TaskStatus::Pending;
@@ -1830,7 +1980,7 @@ SELECT t.to_state, COUNT(*)::bigint
             },
         )
         .await?;
-        task_ledger::project(&mut tx, Some(task_id)).await?;
+        task_ledger::project_incremental(&mut tx, task_id).await?;
 
         let mut cancelled = Vec::new();
         if !should_retry {
@@ -1883,7 +2033,7 @@ SELECT t.to_state, COUNT(*)::bigint
                                 },
                             )
                             .await?;
-                            task_ledger::project(&mut tx, Some(&child)).await?;
+                            task_ledger::project_incremental(&mut tx, &child).await?;
                             cancelled.push(child.clone());
                         }
                     }
@@ -1952,7 +2102,7 @@ SELECT t.to_state, COUNT(*)::bigint
             },
         )
         .await?;
-        task_ledger::project(&mut tx, Some(task_id)).await?;
+        task_ledger::project_incremental(&mut tx, task_id).await?;
 
         let mut cancelled = Vec::new();
         let mut stack = vec![task_id.to_string()];
@@ -2002,7 +2152,7 @@ SELECT t.to_state, COUNT(*)::bigint
                             },
                         )
                         .await?;
-                        task_ledger::project(&mut tx, Some(&child)).await?;
+                        task_ledger::project_incremental(&mut tx, &child).await?;
                         cancelled.push(child.clone());
                     }
                 }

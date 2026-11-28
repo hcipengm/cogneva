@@ -364,11 +364,16 @@ mod tests {
 
     fn engine(dir: &Path) -> Arc<EvolutionEngine> {
         let registry = Arc::new(tokio::sync::RwLock::new(cog_core::SkillRegistry::new()));
-        Arc::new(EvolutionEngine::new(registry, None).with_change_dir(dir))
+        Arc::new(
+            EvolutionEngine::new(registry, None)
+                .with_change_dir(dir)
+                .with_candidates(crate::change_pipeline::test_candidates()),
+        )
     }
 
     fn readings(dir: &Path, owner: bool) -> EvolutionQueueReadings {
-        let pipeline = ChangePipeline::new(std::env::current_dir().unwrap(), dir, true);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(std::env::current_dir().unwrap(), dir, true);
         EvolutionQueueReadings::new(dir, owner, 60, pipeline, None)
     }
 
@@ -377,7 +382,8 @@ mod tests {
         owner: bool,
         engine: Arc<EvolutionEngine>,
     ) -> EvolutionQueueReadings {
-        let pipeline = ChangePipeline::new(std::env::current_dir().unwrap(), dir, true);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(std::env::current_dir().unwrap(), dir, true);
         EvolutionQueueReadings::new(dir, owner, 60, pipeline, Some(engine))
     }
 
@@ -612,6 +618,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = engine(dir.path());
         let skill = crate::types::EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::SkillRefinement,
             artifact_id: "skill-1".to_string(),
             description: "refined".to_string(),

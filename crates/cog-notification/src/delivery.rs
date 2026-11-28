@@ -181,7 +181,7 @@ mod tests {
             .unwrap()
             .into_iter()
             .map(|m| {
-                let label = |key: &str| m.labels.get(key).cloned().unwrap_or_default();
+                let label = |key: &str| m.labels.get(key).cloned().unwrap_or(Default::default());
                 (label("outlet"), label("result"), m.value)
             })
             .collect()

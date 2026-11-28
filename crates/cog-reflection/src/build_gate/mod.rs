@@ -110,7 +110,7 @@
 
 pub mod arming;
 
-pub use arming::{effective_config, effective_gate_for};
+pub use arming::effective_gate_for;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -313,10 +313,14 @@ impl HostFacts {
     }
 }
 
-/// The declaration fitted to this process's host, or as written when the host
-/// cannot be read.
-fn fit_to_host(t: Tuning) -> Tuning {
-    match HostFacts::read() {
+/// The declaration fitted to `host`, or as written when the host cannot be read.
+///
+/// The reading is an argument rather than taken here so the gate can keep the
+/// one reading its figures were fitted to: the labels published beside those
+/// figures describe *that* fit, and a second reading taken at publication time
+/// would answer about a fit that may never have happened (or one that did).
+fn fit_to_host(t: Tuning, host: Option<HostFacts>) -> Tuning {
+    match host {
         Some(host) => t.on_host(host),
         None => t,
     }
@@ -357,6 +361,62 @@ const CLAIM_FILE: &str = "builds.claim";
 /// no more than the window — and it is paid only while some build is turned away
 /// by it, which is the state this exists to end.
 const RESERVE_FILE: &str = "builds.reserve";
+/// When each work was last served a build -- took a slot, or took the field --
+/// by the name it asks and claims under.
+///
+/// This is the half of the takeover rule that says a claim has been honoured:
+/// a work stands down for another work's claim while that work has not been
+/// served since the stand-down began, and takes the turn once it has. A claim
+/// is kept fresh by being rewritten, so freshness alone cannot tell a work
+/// waiting its turn from one taking every turn (2026-10-20: the host's clippy
+/// producer rewrote its claim every twenty seconds while it built, and the
+/// deployer stood down on all fourteen rounds).
+///
+/// A file rather than this process's memory, because the gate is two
+/// programs and both serve slots: the host's shell client
+/// (`deploy/scripts/lib/build-slot.sh`) takes a slot by `flock`ing it and
+/// writes its holder record, and this process never sees that happen. The
+/// served fact used to live in an array here, keyed by [`asker_index`], and
+/// both halves of that were wrong for the shell client: its names
+/// (`gate: 名字契约（告警规则契约）`, `gate: clippy …`) are not in
+/// [`BUILD_GATE_ASKERS`], so they all collapsed into the unnamed cell, and
+/// nothing in this process ever moved that cell. The claim therefore looked
+/// unanswered forever and the mainline advance stood down on every round for
+/// three hours on 2026-11-10 -- thirteen deferrals, no advance, while the
+/// shell gate held the slot. The record is by name, not by cell, because the
+/// name is what a claim carries; see [`served_at`] and [`record_served`].
+const SERVED_FILE: &str = "builds.served";
+
+/// How many works [`SERVED_FILE`] keeps, as a bound.
+///
+/// A name leaves only after this many other works have been served since: the
+/// question the record answers is always "was *this* name served after an
+/// instant within the last [`TURN_STAND_DOWN_SECS`]", so entries older than
+/// the whole stand-down window are dead weight. The number is well above the
+/// distinct names that exist -- the ten asker cells plus the host's gate step
+/// labels -- because the cost of a missing line is one more stand-down, and
+/// the cost of a large file is a scan on every takeover question.
+// cap: fixed — 远超实际不同名字数的上界：丢一行只多让一轮，文件大了是每次仲裁都扫一遍
+// not-a-bound: 远超实际不同名字数的上界：丢一行只多让一轮，文件大了是每次仲裁都扫一遍
+const SERVED_RECORD_CAP: usize = 64;
+
+/// How many cargo jobs one build gets, from the same measurement the gate uses
+/// to decide how many builds fit: the host's cores divided by what one build
+/// demands of them.
+///
+/// Declared here rather than in the contract half beside the other gate names:
+/// nothing outside this crate reads it yet, and a new metric name is not a
+/// reason to make every crate rebuild.
+pub const BUILD_GATE_CARGO_JOBS: &str = "cogneva_build_gate_cargo_jobs";
+
+/// Windows in which [`BUILD_GATE_CARGO_JOBS`] was recomputed.
+///
+/// The width can stay the same for days on a host whose core count and build
+/// demand do not move, so "the reading is live" needs a count rather than the
+/// gauge: without it, a width frozen because the derivation stopped looks
+/// exactly like a stable host.
+pub const BUILD_GATE_CARGO_JOBS_EVALUATIONS_TOTAL: &str =
+    "cogneva_build_gate_cargo_jobs_evaluations_total";
 
 /// Claims on the next build that lapsed before anyone used them, as a counter
 /// carrying the `asker` that made the claim.
@@ -445,8 +505,21 @@ impl WalkOutcome {
 
 /// How often a waiter looks again. Builds run for minutes, so this only decides
 /// how promptly a freed slot is picked up.
-// cap: bound — 构建以分钟计，它只决定一个空出来的槽多快被捡走
+// cap: fixed — 构建以分钟计，它只决定一个空出来的槽多快被捡走
+// keep: 删掉后等待槽位的循环会空转，槽位空出来也没人按时捡；由「构建以分钟计，只决定多快被捡走」兜住
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The registry key this gate's wait budget is declared under, and the name its
+/// reading is published under.
+pub const WAIT_PACING: &str = "evolution.buildGate.waitSecs";
+
+/// The shortest wait worth handing a caller: two polls. A budget under one poll
+/// never re-asks, which is `try_acquire` under another name, and the gate would
+/// report a refusal it never actually waited for. This is a floor on what a
+/// measurement may derive, not a value anybody configures.
+fn wait_floor() -> Duration {
+    POLL_INTERVAL * 2
+}
 
 /// How many turns in a row an exclusion stands down for someone else's claim on
 /// the next build before it takes the field anyway.
@@ -459,7 +532,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// whether builds interfere with the cluster. Two turns is enough for the waiter
 /// to come round and take what it asked for, and short enough that a waiter that
 /// cannot take it does not hold the field off builds it never runs.
-// cap: bound — 拿不走的人不能一直占着这一手，让该轮到的人来拿
+// cap: fixed — 拿不走的人不能一直占着这一手，让该轮到的人来拿
+// keep: 删掉后拿不走的一方一直占着这一手，轮到的人也拿不到；由「让该轮到的人来拿」兜住
 const WALK_YIELD_LIMIT: u32 = 2;
 
 /// How long a work's stand-down for another work's claim on the next build is
@@ -470,14 +544,16 @@ const WALK_YIELD_LIMIT: u32 = 2;
 /// scoped to one call: it is the work that keeps losing, not the call. An hour
 /// is longer than any of those rounds and shorter than a work that has stopped
 /// asking has any claim to a turn it no longer wants.
-// cap: bound — 比那些回合都长，又短于一个已经不再提问的工作还有资格要的那一手
+// cap: fixed — 比那些回合都长，又短于一个已经不再提问的工作还有资格要的那一手
+// keep: 删掉后一个已经不再提问的工作永远占着它那一手，活的那一方等不到回合；由「短于一个不再提问的工作还有资格要的那一手」兜住
 const TURN_STAND_DOWN_SECS: u64 = 3600;
 
 /// 等构建场空出来再做进程切换的上限：1 小时。
 ///
 /// 构建最长可跑一小时，所以等不到就让这一版留在暂存处——在别人的构建上切一刀
 /// 的代价是一个半完成的部署；而无限期等待会让调用它的管理端永远挂着。
-// cap: bound — 构建最长一小时；等不到就让这一版留在暂存处，在别人的构建上切一刀是一个半完成的部署
+// cap: fixed — 构建最长一小时；等不到就让这一版留在暂存处，在别人的构建上切一刀是一个半完成的部署
+// keep: 删掉后在别人的构建上进行切换，切出一次半完成的部署；由「等不到就留在暂存处」兜住
 pub(crate) const SWITCH_FIELD_WAIT: Duration = Duration::from_secs(3600);
 
 static GLOBAL: OnceLock<Arc<BuildGate>> = OnceLock::new();
@@ -521,6 +597,19 @@ pub fn install(cfg: &BuildGateConfig) -> Arc<BuildGate> {
 /// The process-wide gate, when one has been installed.
 pub fn global() -> Option<Arc<BuildGate>> {
     GLOBAL.get().cloned()
+}
+
+/// How many cargo jobs one build should fan out over, from the latest window's
+/// measurement of the host.
+///
+/// `None` means this process has no gate in force or no window has measured a
+/// host yet: the caller keeps its declared seed, exactly as the gate itself
+/// falls back to the declaration when the host cannot be read. The width is
+/// read at the moment a build is spawned, so a build started after the window
+/// that changed the host uses the new share without a restart.
+pub fn cargo_jobs() -> Option<u64> {
+    let width = global()?.job_width.load(Ordering::Relaxed);
+    (width > 0).then_some(width)
 }
 
 /// Records the peak resident memory of a build this process ran.
@@ -649,6 +738,8 @@ impl Observable for InactiveBuildGate {
                 dir: &dir_identity(Path::new(&self.dir)),
                 role: BUILD_GATE_ROLE_CONTROL_PLANE,
             },
+            0,
+            0,
             0,
         ))
     }
@@ -785,7 +876,7 @@ struct HostLoad {
 /// the volume a non-root build must not plan on. A filesystem that cannot be
 /// read contributes no reading rather than a zero -- "this volume is full" and
 /// "nothing could be asked about this volume" are different facts.
-fn disk_bytes(dir: &Path) -> Option<u64> {
+pub(crate) fn disk_bytes(dir: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
     // SAFETY: `statvfs` writes into the `statvfs` it is given and retains
@@ -1258,7 +1349,8 @@ const HOST_DISK_FREE_BYTES: &str = "cogneva_host_disk_free_bytes";
 /// A fraction of one build rather than a count of windows: what is being damped
 /// is the reading's own noise across the integer it floors to, not a trend, and
 /// the noise is measured in the same unit the answer is.
-// cap: bound — 死区宽度就是读数在它取整的那个整数上的自身噪声，不是趋势
+// cap: fixed — 死区宽度就是读数在它取整的那个整数上的自身噪声，不是趋势
+// not-a-bound: 死区宽度就是读数在它取整的那个整数上的自身噪声，不是趋势
 const CEILING_DEAD_BAND: f64 = 0.15;
 /// How many windows a dimension read at an instant is taken over before it may
 /// size a bound.
@@ -1301,7 +1393,8 @@ const CEILING_DEAD_BAND: f64 = 0.15;
 /// and finish must not be able to move the bound, and one build is the shortest
 /// span that guarantees it. It is a count of windows rather than a duration
 /// because the window is the unit the derivation already runs in.
-// cap: bound — 窗口数由「一次构建的时长」定，不是由收紧告警的阈值反推
+// cap: fixed — 窗口数由「一次构建的时长」定，不是由收紧告警的阈值反推
+// keep: 删掉后读数回看没有尽头，一次古老的构建一直留在基线里；由「窗口数由一次构建的时长定」兜住
 const READING_HORIZON_WINDOWS: usize = 30;
 /// What each dimension answers on its own, beside the ceiling that takes the
 /// smallest of them.
@@ -1330,7 +1423,9 @@ pub const BUILD_GATE_BOUND_RULE: &str = "build_gate_bound_not_converging";
 /// nine tenths, which is inside the life of one build: the cost follows a
 /// workspace that got cheaper, without following a build that got quieter for a
 /// minute.
-// cap: bound — 跟住变便宜的工作区，又不跟一个只是安静了一分钟的构建跑
+// cap: fixed — 跟住变便宜的工作区，又不跟一个只是安静了一分钟的构建跑
+// keep: 删掉后跟随没有平滑，一次只是安静了一分钟的构建就被读成变便宜；由「跟住变便宜的工作区、不跟一分钟的安静」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const IO_PER_BUILD_SMOOTHING: f64 = 0.3;
 
 /// The kernel's averaging window for the `avg60` pressure figures, in seconds.
@@ -1338,7 +1433,8 @@ const IO_PER_BUILD_SMOOTHING: f64 = 0.3;
 /// Not a dial. It is the definition of the reading the io dimension explains:
 /// the occupancy charged against that reading has to be averaged over the same
 /// period, or the two describe different minutes. See [`next_occupancy_avg`].
-// cap: bound — 记在这条读数上的占用必须按同一段窗口平均，否则两边说的是不同的分钟
+// cap: fixed — 记在这条读数上的占用必须按同一段窗口平均，否则两边说的是不同的分钟
+// keep: 删掉后两边按不同的窗口平均，同一个占用在两个读数里说的是不同的分钟；由「同一条读数的同一段窗口」兜住
 const PSI_AVG60_WINDOW_SECONDS: f64 = 60.0;
 
 /// The build occupancy an io reading's window ends on, given the average it
@@ -1554,12 +1650,14 @@ fn host_metrics(reading: Option<HostReading>, origin: Origin<'_>) -> Vec<RawMetr
 /// all of it — and the number this replaces is the divisor of a bound that
 /// decides how many builds run at once. Three is the smallest count at which
 /// "they agree" can be true of a sequence rather than of a pair.
-// cap: bound — 三是「它们彼此一致」能对一串而不只是对一对成立的最小个数
+// cap: fixed — 三是「它们彼此一致」能对一串而不只是对一对成立的最小个数
+// keep: 删掉后只有两份样本也要判「彼此一致」，一对当然一致，判据永远亮；由「三份才谈得上一串」兜住
 const MEASURED_BUILD_COST_SAMPLES: usize = 3;
 
 /// How close the measured builds must be to each other, as a fraction of their
 /// median, before they count as agreeing.
-// cap: bound — 按中位数的比例算「算一致」的容差
+// cap: fixed — 按中位数的比例算「算一致」的容差
+// keep: 删掉后容差为零，正常的编译抖动被读成不一致，实测永远用不上；由「按中位数的比例算一致」兜住
 const MEASURED_BUILD_COST_AGREEMENT: f64 = 0.10;
 
 /// How far the measured divisor must be from the declared one before it is used
@@ -1569,7 +1667,8 @@ const MEASURED_BUILD_COST_AGREEMENT: f64 = 0.10;
 /// differences smaller than the measurement's own noise, and every flip would
 /// be a bound move: the same square wave the ceiling's dead band exists to
 /// stop, one level down.
-// cap: bound — 界别跟着方波跳，与天花板那条死区同一个理由，低一层
+// cap: fixed — 界别跟着方波跳，与天花板那条死区同一个理由，低一层
+// keep: 删掉后界跟着实测的方波跳，每一次抖动都改写一次请求；由「与天花板那条死区同一个理由」兜住
 const MEASURED_BUILD_COST_DEAD_BAND: f64 = 0.20;
 
 /// The divisor the measurements have earned, if they have earned one.
@@ -1644,6 +1743,50 @@ const SOURCE_CALIBRATED: &str = "calibrated";
 /// the only thing that would change it back is a bigger box or a lighter build.
 const SOURCE_FITTED: &str = "fitted";
 
+/// Somebody looked at this deployment and picked the number.
+const SOURCE_CONFIGURED: &str = "configured";
+
+/// Nobody picked it: it is computed from a measurement taken on this host. The
+/// measured build peak is the one input that moves on its own, so its own word
+/// is the only thing that says which input the loop moved.
+const SOURCE_DERIVED: &str = "derived";
+
+/// This input describes a machine, and this process could not read the machine
+/// it is running on.
+///
+/// The other four words all answer "where did this number come from" about a
+/// host that was read. For the two inputs [`Tuning::on_host`] computes, that is
+/// the wrong question on a box that could not be read: the declared figure is in
+/// force not because it is the right one for this machine but because nobody
+/// asked the machine. Read as `calibrated` it says the opposite -- that this box
+/// was measured and this is what it gave -- and read as `configured` it says a
+/// person settled it, when a person may have set it and the box never got its
+/// say. [`fit_to_host`] falls back to the declaration in that case, which is the
+/// right number to run with; the label's whole job is that the fallback is
+/// visible, because "量不到" and "量到就是这个值" must not look alike.
+const SOURCE_UNMEASURED: &str = "unmeasured";
+
+/// Which model inputs [`Tuning::on_host`] computes from the host.
+///
+/// Found by fitting the shipped declaration to a host that can pay for nothing
+/// and taking whatever moves, rather than naming the two fields here: a list of
+/// names would be a second declaration of what `on_host` reads, and the two
+/// would drift the first time it governs a third input.
+fn host_shaped_inputs() -> Vec<&'static str> {
+    let nothing = HostFacts {
+        cores: 1,
+        mem_total_bytes: 0,
+    };
+    let shipped = model_inputs(&Tuning::shipped());
+    let starved = model_inputs(&Tuning::shipped().on_host(nothing));
+    shipped
+        .into_iter()
+        .zip(starved)
+        .filter(|((_, _, before), (_, _, after))| (before - after).abs() > f64::EPSILON)
+        .map(|((field, _, _), _)| field)
+        .collect()
+}
+
 /// The model inputs as series, one per input, labelled by which one it is and
 /// by where the value came from.
 ///
@@ -1674,6 +1817,14 @@ fn tuning_readings(
         )
         .with_label(crate::LABEL_ROLE, origin.role.to_string())
     };
+    // A host that could not be read leaves the declaration in force through
+    // `fit_to_host`, and for the inputs that are a reading of the machine that
+    // is a fact about the reading, not a fact about the number.
+    let unmeasured = if host.is_none() {
+        host_shaped_inputs()
+    } else {
+        Vec::new()
+    };
     model_inputs(t)
         .into_iter()
         .map(|(field, key, value)| {
@@ -1681,21 +1832,25 @@ fn tuning_readings(
             // this table to `Tuning`, and reading it as the shipped value is the
             // fail-safe direction: it says "unchanged" about a number the table
             // could not compare.
-            let source = match shipped.iter().find(|(f, _, _)| *f == field) {
-                // The measured divisor is neither of the other two: nobody
-                // chose it and it was not frozen at build time. It says which
-                // input the loop moved on its own, which is the one thing the
-                // other two words cannot say.
-                Some(_) if field == "build_peak_rss_bytes" && measured_peak.is_some() => {
-                    crate::verification_budget::SOURCE_DERIVED
-                }
-                Some((_, _, s)) if (*s - value).abs() > f64::EPSILON => {
-                    match fitted.iter().find(|(f, _, _)| *f == field) {
-                        Some((_, _, f)) if (*f - value).abs() <= f64::EPSILON => SOURCE_FITTED,
-                        _ => crate::verification_budget::SOURCE_CONFIGURED,
+            let source = if unmeasured.contains(&field) {
+                SOURCE_UNMEASURED
+            } else {
+                match shipped.iter().find(|(f, _, _)| *f == field) {
+                    // The measured divisor is neither of the other two: nobody
+                    // chose it and it was not frozen at build time. It says
+                    // which input the loop moved on its own, which is the one
+                    // thing the other two words cannot say.
+                    Some(_) if field == "build_peak_rss_bytes" && measured_peak.is_some() => {
+                        SOURCE_DERIVED
                     }
+                    Some((_, _, s)) if (*s - value).abs() > f64::EPSILON => {
+                        match fitted.iter().find(|(f, _, _)| *f == field) {
+                            Some((_, _, f)) if (*f - value).abs() <= f64::EPSILON => SOURCE_FITTED,
+                            _ => SOURCE_CONFIGURED,
+                        }
+                    }
+                    _ => SOURCE_CALIBRATED,
                 }
-                _ => SOURCE_CALIBRATED,
             };
             label(
                 RawMetric::new(BUILD_GATE_TUNING, value)
@@ -1715,7 +1870,8 @@ fn tuning_readings(
 /// stall nobody measured. Capping at the sample's own horizon makes the counter
 /// a floor rather than a total, which is the safe direction for a rule that
 /// fires on it being large.
-// cap: derived — 取的是下限而不是总量，这对「它大就触发」的规则是安全方向
+// cap: fixed — 取的是下限而不是总量，这对「它大就触发」的规则是安全方向
+// keep: 删掉后一个采样窗口没有边界，构建期间的尖峰与空闲被平均成同一个数；由「取的是下限、对触发规则是安全方向」兜住
 const IO_SAMPLE_HORIZON: Duration = Duration::from_secs(60);
 
 /// What share of `since` a look at the disk may charge to [`BUILD_GATE_IO_OUTSIDE_SECONDS`].
@@ -1739,9 +1895,35 @@ fn io_outside_credit(
     Some(since.min(IO_SAMPLE_HORIZON))
 }
 
+/// How many cargo jobs one build gets, from the host's cores and the share one
+/// build is booked for.
+///
+/// The gate already measured both numbers for its own question: how many builds
+/// the CPU can host at once is cores divided by one build's demand. Giving each
+/// admitted build that same share is what makes the two readings agree -- cargo
+/// fans a build out over exactly the cores the gate booked for it, so the gate's
+/// admission arithmetic and the build's own parallelism are the same measurement
+/// rather than two guesses. A width wider than the box is never useful, so the
+/// result is capped at the core count.
+///
+/// `None` when either reading is missing or impossible (no cores, a demand of
+/// zero): the caller then keeps its declared seed instead of inventing a width.
+fn cargo_jobs_for(cores: f64, demand_cores: f64) -> Option<u64> {
+    if !cores.is_finite() || cores < 1.0 || !demand_cores.is_finite() || demand_cores <= 0.0 {
+        return None;
+    }
+    let width = (cores / demand_cores).floor().max(1.0);
+    Some(width.min(cores.floor()) as u64)
+}
+
 /// The whole series set, in one place: a reader that has to tell "no bound here"
 /// from "this deployment never reported" cannot do it if the two sources of the
 /// set can drift.
+// One parameter per reading, and each one is read off a different place (the
+// slot census, the gate's own counters, the cargo derivation, the origin). A
+// struct here would only move the same list one level down and make the gate's
+// shape unreadable at the call site.
+#[allow(clippy::too_many_arguments)]
 fn readings(
     slots: usize,
     occupied: usize,
@@ -1750,6 +1932,8 @@ fn readings(
     c: Counters,
     origin: Origin<'_>,
     wait_budget_ms: u64,
+    cargo_jobs: u64,
+    cargo_job_evaluations: u64,
 ) -> Vec<RawMetric> {
     let label = |m: RawMetric| {
         m.with_label(
@@ -1785,11 +1969,11 @@ fn readings(
     // hit nor the works it has refused. The ask is the outer loop because the
     // wall is the older axis and its rows keep their order.
     for wall in RefusedBy::ALL {
-        for asker in 0..ASKER_CELLS {
+        for (asker, by_wall) in c.refused.iter().enumerate() {
             out.push(
                 label(RawMetric::new(
                     BUILD_GATE_REFUSED_TOTAL,
-                    c.refused[asker][wall.index()] as f64,
+                    by_wall[wall.index()] as f64,
                 ))
                 .with_label(crate::LABEL_REASON, wall.as_str().to_string())
                 .with_label(crate::LABEL_ASKER, asker_label(asker).to_string()),
@@ -1800,11 +1984,11 @@ fn readings(
     // only once the counter moves would read as "this work never asked for the
     // next build" and "this work never lost its turn" the same way, and the
     // second is the one an operator has to notice.
-    for asker in 0..ASKER_CELLS {
+    for (asker, lapsed) in c.lapsed.iter().enumerate() {
         out.push(
             label(RawMetric::new(
                 BUILD_GATE_RESERVATION_LAPSED_TOTAL,
-                c.lapsed[asker] as f64,
+                *lapsed as f64,
             ))
             .with_label(crate::LABEL_ASKER, asker_label(asker).to_string()),
         );
@@ -1814,11 +1998,11 @@ fn readings(
     // renewal runs at 890 seconds" and "this work never asked" the same absent
     // row. Zero is the "no renewal yet" value here, and the pair with the lapse
     // counter is what tells the two apart.
-    for asker in 0..ASKER_CELLS {
+    for (asker, gap) in c.renew_gap_seconds.iter().enumerate() {
         out.push(
             label(RawMetric::new(
                 BUILD_GATE_RESERVATION_RENEW_GAP_SECONDS,
-                c.renew_gap_seconds[asker] as f64,
+                *gap as f64,
             ))
             .with_label(crate::LABEL_ASKER, asker_label(asker).to_string()),
         );
@@ -1828,12 +2012,12 @@ fn readings(
     // counter moves would read "this walk never met a claim" and "this walk
     // never stood down" the same way, and the second is the one that says a
     // reservation was written and then ignored.
-    for asker in 0..ASKER_CELLS {
+    for (asker, by_outcome) in c.walk_yield.iter().enumerate() {
         for outcome in WalkOutcome::ALL {
             out.push(
                 label(RawMetric::new(
                     BUILD_GATE_WALK_YIELD_TOTAL,
-                    c.walk_yield[asker][outcome.index()] as f64,
+                    by_outcome[outcome.index()] as f64,
                 ))
                 .with_label(crate::LABEL_ASKER, asker_label(asker).to_string())
                 .with_label(crate::LABEL_OUTCOME, outcome.as_str().to_string()),
@@ -1854,6 +2038,15 @@ fn readings(
         label(RawMetric::new(
             BUILD_GATE_WAIT_BUDGET_MS,
             wait_budget_ms as f64,
+        )),
+        // Zero means no window has derived a width yet, not "cargo gets no
+        // jobs": the consumers fall back to their declared seed until this
+        // moves, and the counter beside it is what separates "stable" from
+        // "stopped".
+        label(RawMetric::new(BUILD_GATE_CARGO_JOBS, cargo_jobs as f64)),
+        label(RawMetric::new(
+            BUILD_GATE_CARGO_JOBS_EVALUATIONS_TOTAL,
+            cargo_job_evaluations as f64,
         )),
     ]);
     out
@@ -2027,7 +2220,9 @@ pub const BUILD_CACHE_RECLAIM_ASKER: &str = "build-cache-reclaim";
 /// rather than dropped: summed over `asker` the counter is then the number it
 /// carried before this label existed, and a call site asking under words that
 /// are not here shows up as an unnamed row with a number in it instead of
-/// vanishing into the whole.
+/// vanishing into the whole. The host's own clients are the exception, and
+/// matched by the shape of their names rather than by these words: see
+/// [`asker_index`].
 ///
 /// Each pair is `(the words the call site asks with, the value the reading
 /// carries)`. It is a table rather than a type because `what` is a `&str` at
@@ -2050,24 +2245,55 @@ pub const BUILD_GATE_ASKERS: [(&str, &str); 10] = [
     // process tree; its refusals are counted here like any other work's, and
     // without this row they were the one refusal in the reading that named no
     // work at all.
-    ("host build", "host_build"),
+    (BUILD_GATE_HOST_ASKER, "host_build"),
 ];
 
 /// The value an ask carries when it asks under words
 /// [`BUILD_GATE_ASKERS`] does not list.
 pub const BUILD_GATE_ASKER_UNNAMED: &str = "unnamed";
 
+/// The words the host's own builder asks under.
+pub const BUILD_GATE_HOST_ASKER: &str = "host build";
+
+/// What the host's pre-push gate prefixes the step it is running with.
+///
+/// That client asks as `gate: <the step>`, one name per step it runs, so the
+/// only fixed part of its name is the prefix. Matched by shape because there is
+/// no list to match against: a closed vocabulary cannot hold a name that is
+/// free text by construction.
+const HOST_STEP_ASKER_PREFIX: &str = "gate: ";
+
 /// How many asks the refusal counter publishes per wall: the named works and
 /// the unnamed one.
+// cap: fixed — one cell per named asker plus the unnamed one; the +1 is that cell, not a dial
+// keep: 删掉后没有名字的那个问者没有自己的格，它的请求从读数上消失；由「每个点名的问者一格、再加无名的一格」兜住
 const ASKER_CELLS: usize = BUILD_GATE_ASKERS.len() + 1;
 
 /// The cell an ask is counted in, in the order [`BUILD_GATE_ASKERS`] lists the
 /// works; anything else is the last cell.
+///
+/// The host's clients are matched by the shape of their names as well as by the
+/// exact words, because their names carry the step (`gate: 名字契约（告警规则契约）`)
+/// or the worktree (`host build (wt-emp2)`). Until they did, every host ask fell
+/// into the unnamed cell -- so the reading could not name the work that held
+/// the mainline advance off for three hours on 2026-11-10, which is the one
+/// question a refusal counter exists to answer.
 fn asker_index(what: &str) -> usize {
-    BUILD_GATE_ASKERS
+    if let Some(index) = BUILD_GATE_ASKERS
         .iter()
         .position(|(words, _)| *words == what)
-        .unwrap_or(BUILD_GATE_ASKERS.len())
+    {
+        return index;
+    }
+    let host_shaped =
+        what.starts_with(HOST_STEP_ASKER_PREFIX) || what.starts_with(BUILD_GATE_HOST_ASKER);
+    let host_cell = BUILD_GATE_ASKERS
+        .iter()
+        .position(|(words, _)| *words == BUILD_GATE_HOST_ASKER);
+    match (host_shaped, host_cell) {
+        (true, Some(cell)) => cell,
+        _ => BUILD_GATE_ASKERS.len(),
+    }
 }
 
 /// The value the ask in cell `index` is published under.
@@ -2095,7 +2321,8 @@ pub fn reserve_build_field(what: &str) -> bool {
 /// dozen asks, and a bound moves at most once per measurement window. The number
 /// is not a policy about how many events matter -- anything this large means the
 /// consumer is not running, which is what the dropped count is for.
-// cap: bound — 不是关于多少事件算重要的策略：大到这个数说明消费端没在跑，那正是 dropped 计数要报的
+// cap: fixed — 不是关于多少事件算重要的策略：大到这个数说明消费端没在跑，那正是 dropped 计数要报的
+// keep: 删掉后消费端不跑时事件环无界地长，问题从 dropped 计数变成内存；由「大到这个数说明消费端没在跑」兜住
 const EVENT_RING_CAPACITY: usize = 256;
 
 /// The process that made a decision about the host, as the account records it.
@@ -2275,6 +2502,13 @@ pub struct BuildGate {
     /// measurement that cannot see the deployment's other users.
     fixed: Option<usize>,
     wait: Duration,
+    /// The waits that actually happened, as the loop's one input. A wait
+    /// shorter than one poll is not recorded: it says a slot was free, which is
+    /// what "no wait" means, and a window full of those would drive the budget
+    /// to its floor and turn every busy moment into an immediate refusal. What
+    /// the budget is sized by is how long a caller had to wait when it did.
+    wait_budget: Arc<cog_core::pacing::TailBudget>,
+    pacing: Arc<cog_core::pacing::PacingReadings>,
     installed: bool,
     /// The bound this process derived last, as the number it is enforcing; 0
     /// before any measurement.
@@ -2282,6 +2516,21 @@ pub struct BuildGate {
     /// The ceiling of that measurement: what the host could take if it stayed
     /// quiet, before the control law's say. 0 before any measurement.
     measured_ceiling: AtomicU64,
+    /// The core count of the machine this process landed on, read once. The
+    /// core count does not change while the process lives, so the pinned gate
+    /// can derive the cargo width without taking a host sample of its own.
+    host_cores: u64,
+    /// The host reading the tuning was fitted to, kept beside it.
+    ///
+    /// `None` is the reading that failed, and it must travel with the figures:
+    /// the published labels say whether each input was fitted to this box, and
+    /// re-reading the box at publication time would describe a fit that did not
+    /// happen rather than the one that produced the number in force.
+    host_facts: Option<HostFacts>,
+    /// The cargo job width the latest window derived; 0 before any window.
+    job_width: AtomicU64,
+    /// Windows in which that width was recomputed.
+    job_width_evaluations: AtomicU64,
     /// The integer the last window held after the dead band, which is what the
     /// next window damps against. Kept apart from `measured_ceiling` because
     /// that one is the measurement as it stands, published as such: a reader
@@ -2401,12 +2650,6 @@ pub struct BuildGate {
     /// the same number of turns that a work polling every half second collects
     /// in a second, and the turn it is losing is the same turn.
     turn_stand_down_since: [AtomicU64; ASKER_CELLS],
-    /// When each work was last served -- took a slot or took the field -- per
-    /// asker cell. This is the other half of the takeover rule: a work that
-    /// holds the next build and keeps being served is keeping the turn, and
-    /// that, not the freshness of its claim, is what makes another work's
-    /// stand-down unreasonable.
-    last_served: [AtomicU64; ASKER_CELLS],
     /// How many turns in a row each work has stood down for someone else's
     /// reservation. Reset when it takes the field, so the bound counts one
     /// unbroken series of yields rather than a lifetime total that would
@@ -2461,14 +2704,29 @@ impl BuildGate {
         if cfg.enabled {
             installed = create_slot_dir(&dir).is_ok();
         }
+        let wait = Duration::from_secs(cfg.wait_secs);
+        let host = HostFacts::read();
+        let host_cores = host.map(|host| host.cores).unwrap_or(0);
+        let pacing = Arc::new(cog_core::pacing::PacingReadings::new());
+        // The seed is the declared budget and nothing else: a gate that has
+        // never made anybody wait has no measurement to overrule it with. The
+        // floor is structural (two polls), so a measured budget can be short
+        // but never a budget that cannot poll.
+        let wait_budget = pacing.tail(WAIT_PACING, wait, wait_floor(), 2.0);
         Self {
             fixed: (cfg.max_concurrent > 0).then_some(cfg.max_concurrent),
-            wait: Duration::from_secs(cfg.wait_secs),
+            wait,
+            wait_budget,
+            pacing,
             installed,
             dir,
-            tuning: fit_to_host(Tuning::from_config(cfg)),
+            tuning: fit_to_host(Tuning::from_config(cfg), host),
+            host_facts: host,
             derived: AtomicU64::new(0),
             measured_ceiling: AtomicU64::new(0),
+            host_cores,
+            job_width: AtomicU64::new(0),
+            job_width_evaluations: AtomicU64::new(0),
             held_ceiling: AtomicU64::new(0),
             per_build_io: AtomicU64::new(0),
             occupancy_avg: AtomicU64::new(0),
@@ -2496,7 +2754,6 @@ impl BuildGate {
             lapsed_counted: Mutex::new(std::collections::HashMap::new()),
             renew_gap_seconds: std::array::from_fn(|_| AtomicU64::new(0)),
             turn_stand_down_since: std::array::from_fn(|_| AtomicU64::new(0)),
-            last_served: std::array::from_fn(|_| AtomicU64::new(0)),
             walk_yield_streak: Mutex::new(std::collections::HashMap::new()),
             events: Mutex::new(VecDeque::new()),
             events_dropped: AtomicU64::new(0),
@@ -2819,6 +3076,18 @@ impl BuildGate {
         next
     }
 
+    /// Derives the cargo job width from a host core count and publishes it.
+    ///
+    /// Called from every window (and from every ask on a pinned gate), so the
+    /// evaluations counter answers "is this still being computed" even when the
+    /// number itself has not moved for days.
+    fn derive_cargo_jobs(&self, cores: f64) {
+        if let Some(width) = cargo_jobs_for(cores, self.tuning.build_demand_cores) {
+            self.job_width.store(width, Ordering::Relaxed);
+            self.job_width_evaluations.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Re-derives the bound, at most once per window, and persists it where this
     /// process is the one elected to.
     ///
@@ -2846,6 +3115,17 @@ impl BuildGate {
         // facts disagreeing that this directory exists to prevent. Written by
         // the controller only, and only when it disagrees.
         if let Some(fixed) = self.fixed {
+            // A pinned gate measures no bound, but the core count is a reading
+            // the host gave once and the cargo width is a function of it. The
+            // window still paces the derivation: an ask is not a beat.
+            let due = {
+                let window = self.window.lock().unwrap_or_else(|e| e.into_inner());
+                window.is_none_or(|last| last.elapsed() >= self.tuning.bound_window)
+            };
+            if due {
+                self.derive_cargo_jobs(self.host_cores as f64);
+                *self.window.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+            }
             if self.is_controller() && self.persisted_bound() != Some(fixed) {
                 self.persist_bound(fixed);
             }
@@ -2874,6 +3154,9 @@ impl BuildGate {
             );
             return;
         };
+        // Same window, same host reading: the width a build fans out over is
+        // the share the CPU booked for it.
+        self.derive_cargo_jobs(load.cores as f64);
         // The measurement and the number this window enforces, side by side:
         // the second one is the first held through the dead band against what
         // the previous window enforced, so a host whose reading straddles an
@@ -3108,6 +3391,19 @@ impl BuildGate {
         true
     }
 
+    /// Whether a claim `age` seconds old has left the window it was written in.
+    ///
+    /// The bound is strict: a claim exactly [`Tuning::reserve_fresh`] seconds old
+    /// is still inside its window, because a claim is written to be honoured for
+    /// that many seconds and one tick of the clock between the write and the read
+    /// must not turn a live waiter into a loss. A lapse is charged from this one
+    /// predicate and nowhere else, so the drop, the count and the answer to the
+    /// arrival that read the claim are a single branch rather than two
+    /// comparisons kept in step by hand.
+    fn claim_expired(&self, age: u64) -> bool {
+        age > self.tuning.reserve_fresh.as_secs()
+    }
+
     /// The claim on the next build, when there is a fresh one.
     fn reservation(&self) -> Option<(String, u64)> {
         let text = read_gate_file(&self.dir.join(RESERVE_FILE))?;
@@ -3118,7 +3414,7 @@ impl BuildGate {
             return None;
         }
         let age = unix_now().saturating_sub(since);
-        if age > self.tuning.reserve_fresh.as_secs() {
+        if self.claim_expired(age) {
             // A claim that is not being refreshed is a work that stopped asking:
             // honoring it would hold builds out for a waiter that is gone.
             // Count it before dropping it: the work that asked loses this turn
@@ -3208,11 +3504,13 @@ impl BuildGate {
     ///
     /// A work that has been served has had its turn, so a stand-down that
     /// outlives that service is no longer "the turn is not mine yet" -- it is
-    /// the same work being passed over again and again.
+    /// the same work being passed over again and again. Written to
+    /// [`SERVED_FILE`] rather than kept here, because the slot this work was
+    /// served may have been given to it by the host's shell client, which this
+    /// process will never hear from.
     fn note_served(&self, what: &str) {
-        let cell = asker_index(what);
-        self.last_served[cell].store(unix_now(), Ordering::Relaxed);
-        self.turn_stand_down_since[cell].store(0, Ordering::Relaxed);
+        record_served(&self.dir, what, unix_now());
+        self.turn_stand_down_since[asker_index(what)].store(0, Ordering::Relaxed);
     }
 
     /// Whether a work that keeps being told "the next build is somebody else's"
@@ -3227,6 +3525,14 @@ impl BuildGate {
     /// the two is whether the holder was *served* since this work started
     /// standing down: a holder that takes its build and claims again is holding
     /// the turn for itself, and that is the only case this answers yes to.
+    ///
+    /// The service is read from [`SERVED_FILE`] by the claimant's own name, and
+    /// not from a counter kept here keyed by [`asker_index`]: both halves of the
+    /// gate serve slots, and the host's shell client asking as
+    /// `gate: 名字契约（告警规则契约）` is not one of [`BUILD_GATE_ASKERS`], so a
+    /// counter here could only ever have answered "never served" for it. That
+    /// answer, returned on every round, is a stand-down with no end -- it held
+    /// the mainline advance off for three hours on 2026-11-10.
     ///
     /// The stand-down is remembered across calls rather than within one, because
     /// the works that lose turns here ask on their own clocks -- the deployer
@@ -3243,7 +3549,7 @@ impl BuildGate {
             self.turn_stand_down_since[cell].store(now, Ordering::Relaxed);
             return false;
         }
-        self.last_served[asker_index(claimant)].load(Ordering::Relaxed) >= since
+        served_at(&self.dir, claimant).is_some_and(|served| served >= since)
     }
 
     /// How many exclusions stood down for another work's reservation, and how
@@ -3368,15 +3674,47 @@ impl BuildGate {
     /// force, since nothing is being waited for.
     fn wait_budget_ms(&self) -> u64 {
         if self.in_force() {
-            self.wait.as_millis() as u64
+            self.effective_wait().as_millis() as u64
         } else {
             0
+        }
+    }
+
+    /// The budget this gate hands the next caller.
+    ///
+    /// Before the first measured wait it is the declared value: nothing has
+    /// happened that could overrule it, and a gate that has never waited on
+    /// anybody has no evidence that it should wait less. Afterwards it is the
+    /// tail of the waits that did happen, times two, above a floor of two
+    /// polls -- so a gate whose contention clears in milliseconds stops tying
+    /// a caller up for half an hour, and one whose builders take twenty minutes
+    /// to free a slot stops refusing at a budget that only ever fit the fast
+    /// case.
+    fn effective_wait(&self) -> Duration {
+        if self.wait_budget.samples() == 0 {
+            self.wait
+        } else {
+            self.wait_budget.target()
         }
     }
 
     /// Records a wait that ended in taking a slot, and hands back when the slot
     /// was taken so the hold can be measured when it is released.
     fn slot_taken(&self, waited: Duration) -> Instant {
+        // The measurement the budget is derived from. Recorded at the moment a
+        // slot was actually taken, so the sample is "how long a caller had to
+        // wait to get one", which is the only question a wait budget answers.
+        //
+        // Only waits that outlasted a poll count. A caller that found the slot
+        // on its first pass measured microseconds, and a window full of those
+        // would pull the budget to the floor -- the gate would then refuse at
+        // the first moment of contention, having "learned" from waits that were
+        // not waits. Refusals are not recorded either: a caller that ran out of
+        // budget says the budget was too short *for it*, and feeding that back
+        // would let one unbroken build stretch the budget forever.
+        if waited >= POLL_INTERVAL {
+            self.wait_budget.observe(waited);
+        }
         let waited_ms = waited.as_millis() as u64;
         self.wait_ms_total.fetch_add(waited_ms, Ordering::Relaxed);
         self.wait_ms_max.fetch_max(waited_ms, Ordering::Relaxed);
@@ -3406,7 +3744,11 @@ impl BuildGate {
 
     /// Takes a slot, waiting for one up to the configured budget.
     pub async fn acquire(self: &Arc<Self>, what: &str) -> SFResult<BuildPermit> {
-        self.acquire_within(what, self.wait).await
+        // Read per call, not stored at construction: the budget is a reading of
+        // how long callers have had to wait, and a value frozen at start-up
+        // would be the declaration wearing the measurement's name.
+        let budget = self.effective_wait();
+        self.acquire_within(what, budget).await
     }
 
     /// Takes a slot only if one is free right now.
@@ -3959,6 +4301,51 @@ fn name_holder(dir: &Path, name: &str) -> String {
     }
 }
 
+/// When `name` was last served a build, from [`SERVED_FILE`].
+///
+/// The newest line carrying this name rather than the file's last line: the
+/// record is per name, and an entry for another work says nothing about this
+/// one. A malformed or half-written line is skipped, because the two mistakes
+/// are not equal -- a missed service costs one more stand-down, while reading
+/// a torn line as a service takes a turn from a work that was still waiting.
+fn served_at(dir: &Path, name: &str) -> Option<u64> {
+    read_gate_file(&dir.join(SERVED_FILE))?
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter(|(_, what)| *what == name)
+        .filter_map(|(epoch, _)| epoch.parse::<u64>().ok())
+        .max()
+}
+
+/// Says that `name` has just been served a build, keeping one line per name.
+///
+/// A read-modify-write of the whole file through [`write_gate_file`], whose
+/// rename is what decides the contents at the name: two writers doing this at
+/// once lose each other's line instead of interleaving half-lines, and that
+/// loss is one more stand-down. It is bounded by [`SERVED_RECORD_CAP`] entries
+/// per name in the vocabulary, so the whole file is a handful of lines.
+fn record_served(dir: &Path, name: &str, now: u64) {
+    let mut entries: Vec<(u64, String)> = read_gate_file(&dir.join(SERVED_FILE))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let (epoch, what) = line.split_once('\t')?;
+            let epoch = epoch.parse::<u64>().ok()?;
+            (!what.is_empty()).then(|| (epoch, what.to_string()))
+        })
+        .collect();
+    entries.retain(|(_, what)| what != name);
+    entries.push((now, name.to_string()));
+    entries.sort_by_key(|(epoch, _)| *epoch);
+    let excess = entries.len().saturating_sub(SERVED_RECORD_CAP);
+    entries.drain(0..excess);
+    let text: String = entries
+        .iter()
+        .map(|(epoch, what)| format!("{epoch}\t{what}\n"))
+        .collect();
+    cog_core::ignore_lost!(write_gate_file(&dir.join(SERVED_FILE), &text));
+}
+
 /// What a refusal can say about what is holding the slots it could not take.
 ///
 /// Told apart from "no holder" on purpose: a slot taken by a holder that wrote
@@ -4068,7 +4455,7 @@ fn lay_out_slots(dir: &Path, bound: usize) {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             continue;
         }
-        let _ = std::fs::remove_file(&path);
+        cog_core::ignore_lost!(std::fs::remove_file(&path));
     }
 }
 
@@ -4081,12 +4468,14 @@ fn lay_out_slots(_dir: &Path, _bound: usize) {}
 /// it. Nothing here is a secret -- a holder's name, a claim, a count -- so the
 /// mode is not about who may read it; it is about who may *write* it, and the
 /// answer has to be everyone who builds.
-// cap: bound — 这个模式管的不是谁能读，而是谁能写，答案必须是每个构建的人
+// cap: fixed — 这个模式管的不是谁能读，而是谁能写，答案必须是每个构建的人
+// keep: 删掉后本机别的构建写不进判词目录，一次构建变成一次权限故障；由「每个构建的人都要能写」兜住
 const GATE_DIR_MODE: u32 = 0o1777;
 /// Mode a gate file is created with. World-writable on purpose: every user that
 /// builds on this host has to be able to record a verdict, and the mode is about
 /// who may write, not about who may read.
-// cap: bound — 同上：本机每个构建都要能写判词，模式管写不管读
+// cap: fixed — 同上：本机每个构建都要能写判词，模式管写不管读
+// keep: 删掉后下一台构建读不到也写不回同一份判词文件；由「本机每个构建都要能写判词」兜住
 const GATE_FILE_MODE: u32 = 0o666;
 
 /// Opens the gate directory to every builder on this host, whichever user it
@@ -4201,7 +4590,9 @@ fn open_gate_file(path: &Path, write: bool) -> Option<std::fs::File> {
         // Best-effort: a file this process does not own refuses, and the holder
         // note it then cannot write is a reading it loses, not a lock it loses.
         use std::os::unix::fs::PermissionsExt;
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(GATE_FILE_MODE));
+        cog_core::ignore_lost!(
+            file.set_permissions(std::fs::Permissions::from_mode(GATE_FILE_MODE))
+        );
     }
     file.metadata().ok()?.is_file().then_some(file)
 }
@@ -4234,7 +4625,7 @@ fn write_gate_file(path: &Path, text: &str) -> std::io::Result<()> {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let tmp = path.with_file_name(format!(".{name}.{}", std::process::id()));
     {
         let mut file = std::fs::OpenOptions::new()
@@ -4254,7 +4645,9 @@ fn write_gate_file(path: &Path, text: &str) -> std::io::Result<()> {
         // own turn. Set before the write so the name never exists in the wrong
         // mode even for an instant.
         use std::os::unix::fs::PermissionsExt;
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(GATE_FILE_MODE));
+        cog_core::ignore_lost!(
+            file.set_permissions(std::fs::Permissions::from_mode(GATE_FILE_MODE))
+        );
         file.write_all(text.as_bytes())?;
     }
     std::fs::rename(&tmp, path)
@@ -4386,6 +4779,8 @@ impl Observable for BuildGate {
             self.counters(),
             origin,
             self.wait_budget_ms(),
+            self.job_width.load(Ordering::Relaxed),
+            self.job_width_evaluations.load(Ordering::Relaxed),
         );
         // The sample the ceiling came from, published beside it. `step` above
         // may have just taken one; a scrape that arrives inside the bound
@@ -4410,8 +4805,14 @@ impl Observable for BuildGate {
             &tuning,
             measured_peak,
             origin,
-            HostFacts::read(),
+            self.host_facts,
         ));
+        // The wait budget's own loop, on the shared pacing series: its target,
+        // whether that came from the declaration or from a measured wait, and
+        // how many waits have moved it. `wait_budget_ms` above carries the same
+        // number for the panels and rules that already read it; these two are
+        // what say whether the number is still being computed at all.
+        metrics.extend(self.pacing.collect_metrics("").await?);
         Ok(metrics)
     }
 
@@ -4588,8 +4989,9 @@ mod tests {
     /// 「有人选过」的读数，等于把一个人的判断读成一次测量。
     #[test]
     fn a_model_input_that_differs_from_the_shipped_one_names_itself_configured() {
+        // 挑一条不由机器算出来的输入：那两条归 `unmeasured` 管，见下一个测试。
         let cfg = BuildGateConfig {
-            build_demand_cores: 8.0,
+            cpu_calm_pct: 30.0,
             ..BuildGateConfig::default()
         };
         let tuned = Tuning::from_config(&cfg);
@@ -4598,27 +5000,91 @@ mod tests {
             role: BUILD_GATE_ROLE_BUILDER,
         };
         let series = tuning_readings(&tuned, None, origin, None);
-        let demand = series
+        let calm_chosen = series
             .iter()
-            .find(|m| {
-                m.labels.get(crate::LABEL_INPUT).map(String::as_str) == Some("build_demand_cores")
-            })
-            .expect("改过的 build_demand_cores 没有出现在这一族里");
-        assert_eq!(demand.value, 8.0);
+            .find(|m| m.labels.get(crate::LABEL_INPUT).map(String::as_str) == Some("cpu_calm_pct"))
+            .expect("改过的 cpu_calm_pct 没有出现在这一族里");
+        assert_eq!(calm_chosen.value, 30.0);
         assert_eq!(
-            demand.labels.get(crate::LABEL_SOURCE).map(String::as_str),
-            Some(crate::verification_budget::SOURCE_CONFIGURED)
+            calm_chosen
+                .labels
+                .get(crate::LABEL_SOURCE)
+                .map(String::as_str),
+            Some(SOURCE_CONFIGURED)
         );
         // 同一份读法下没被改过的那几条仍是标定值：整族都翻成 configured
         // 就等于这个标签什么都没说。
-        let calm = series
+        let untouched = series
             .iter()
-            .find(|m| m.labels.get(crate::LABEL_INPUT).map(String::as_str) == Some("cpu_calm_pct"))
-            .expect("cpu_calm_pct 没有出现在这一族里");
+            .find(|m| m.labels.get(crate::LABEL_INPUT).map(String::as_str) == Some("io_calm_pct"))
+            .expect("io_calm_pct 没有出现在这一族里");
         assert_eq!(
-            calm.labels.get(crate::LABEL_SOURCE).map(String::as_str),
+            untouched
+                .labels
+                .get(crate::LABEL_SOURCE)
+                .map(String::as_str),
             Some(SOURCE_CALIBRATED)
         );
+    }
+
+    /// 机器读不到时，那两条由机器算出来的输入必须自己说读不到：它们的声明值
+    /// 之所以在生效，不是因为它是这台机器的答案，而是因为没人问过这台机器。
+    ///
+    /// 读成 `calibrated` 说的是反话（这台机器量过，就是这个值），读成
+    /// `configured` 则把「没人问过机器」藏进「有人选过」里。
+    #[test]
+    fn an_input_computed_from_a_host_says_it_when_the_host_could_not_be_read() {
+        let origin = Origin {
+            dir: "d",
+            role: BUILD_GATE_ROLE_BUILDER,
+        };
+        let shaped = host_shaped_inputs();
+        assert_eq!(
+            shaped,
+            vec!["build_demand_cores", "mem_floor_bytes"],
+            "由机器算的输入就是这个集合；它若变了，是 `on_host` 变了"
+        );
+        // 读数带的是配置里的键（`mem_floor_mib`），上面那个集合是字段名
+        // （`mem_floor_bytes`）：翻译一次，别在两个坐标系之间比。
+        let shaped_keys: Vec<&str> = model_inputs(&Tuning::shipped())
+            .into_iter()
+            .filter(|(field, _, _)| shaped.contains(field))
+            .map(|(_, key, _)| key)
+            .collect();
+
+        let series = tuning_readings(&Tuning::shipped(), None, origin, None);
+        for metric in &series {
+            let input = metric.labels.get(crate::LABEL_INPUT).map(String::as_str);
+            let source = metric.labels.get(crate::LABEL_SOURCE).map(String::as_str);
+            let expected = if shaped_keys.contains(&input.unwrap_or_default()) {
+                SOURCE_UNMEASURED
+            } else {
+                SOURCE_CALIBRATED
+            };
+            assert_eq!(source, Some(expected), "{input:?} 的出处说错了");
+        }
+    }
+
+    /// 机器读得到时就没有「量不到」这回事：同一个词不能同时出现在两种情形里，
+    /// 否则它读起来和没有一样。
+    #[test]
+    fn a_host_that_was_read_never_reads_as_unmeasured() {
+        let origin = Origin {
+            dir: "d",
+            role: BUILD_GATE_ROLE_BUILDER,
+        };
+        let host = HostFacts {
+            cores: 4,
+            mem_total_bytes: 16u64 << 30,
+        };
+        let series = tuning_readings(&Tuning::shipped(), None, origin, Some(host));
+        for metric in &series {
+            assert_ne!(
+                metric.labels.get(crate::LABEL_SOURCE).map(String::as_str),
+                Some(SOURCE_UNMEASURED),
+                "机器读到了，就不该有一行说读不到"
+            );
+        }
     }
 
     /// 一次测量不换除数。一次构建要么只链了个二进制、要么吃了个冷缓存，
@@ -4693,7 +5159,7 @@ mod tests {
             .expect("build_peak_rss_mib 没有出现在这一族里");
         assert_eq!(
             peak.labels.get(crate::LABEL_SOURCE).map(String::as_str),
-            Some(crate::verification_budget::SOURCE_DERIVED),
+            Some(SOURCE_DERIVED),
             "量出来的除数必须自己说它是量出来的"
         );
     }
@@ -4826,6 +5292,76 @@ mod tests {
             lock_dir: dir.to_string_lossy().into_owned(),
             ..BuildGateConfig::default()
         }))
+    }
+
+    // proves: changeVerification.cargoBuildJobs
+    // proves: mainlineDeployer.cargoBuildJobs
+    /// 编译宽度是宿主核数与单构建需求的函数：同样的机器上需求变大，宽度变小；
+    /// 机器变小，宽度也变小；宽度不会超过核数，也不会小于一；量不到时不出数，
+    /// 由调用方落回声明——不猜一个宽度。
+    #[test]
+    fn cargo_jobs_follow_the_measured_cores_and_build_demand() {
+        assert_eq!(cargo_jobs_for(24.0, 4.1), Some(5));
+        assert_eq!(cargo_jobs_for(24.0, 8.0), Some(3));
+        assert_eq!(cargo_jobs_for(8.0, 8.0), Some(1));
+        assert_eq!(cargo_jobs_for(8.0, 0.5), Some(8), "宽度不超过核数");
+        assert_eq!(cargo_jobs_for(1.0, 4.1), Some(1), "一个构建至少一个 job");
+        for (cores, demand) in [
+            (0.0, 4.1),
+            (f64::NAN, 4.1),
+            (24.0, 0.0),
+            (24.0, -1.0),
+            (24.0, f64::INFINITY),
+        ] {
+            assert_eq!(cargo_jobs_for(cores, demand), None, "{cores}/{demand}");
+        }
+    }
+
+    /// 每个窗口重算一次宽度并让求值计数往上走：宽度可以几天不变，但「这个回路
+    /// 还在算」只能由计数回答。读数面同时带着宽度与计数。
+    #[tokio::test]
+    async fn the_cargo_width_is_recomputed_every_window_and_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gate = BuildGate::new(&BuildGateConfig {
+            enabled: true,
+            lock_dir: dir.path().to_string_lossy().into_owned(),
+            ..BuildGateConfig::default()
+        });
+        gate.tuning.build_demand_cores = 4.0;
+        gate.derive_cargo_jobs(24.0);
+        assert_eq!(gate.job_width.load(Ordering::Relaxed), 6);
+        gate.derive_cargo_jobs(16.0);
+        assert_eq!(gate.job_width.load(Ordering::Relaxed), 4);
+        assert_eq!(gate.job_width_evaluations.load(Ordering::Relaxed), 2);
+
+        let identity = String::new();
+        let series = readings(
+            0,
+            0,
+            0,
+            DIM_NONE,
+            Counters::default(),
+            Origin {
+                dir: &identity,
+                role: BUILD_GATE_ROLE_BUILDER,
+            },
+            0,
+            gate.job_width.load(Ordering::Relaxed),
+            gate.job_width_evaluations.load(Ordering::Relaxed),
+        );
+        // 这条序列带的就是闸门那一族固定的 `role` 标签（builder / control-plane），
+        // 宽度按进程角色分开读，不另起一套标签。
+        assert_eq!(crate::LABEL_ROLE, "role");
+        let width = series
+            .iter()
+            .find(|m| m.name == BUILD_GATE_CARGO_JOBS)
+            .expect("width series");
+        assert_eq!(width.value, 4.0);
+        let evaluations = series
+            .iter()
+            .find(|m| m.name == BUILD_GATE_CARGO_JOBS_EVALUATIONS_TOTAL)
+            .expect("evaluation series");
+        assert_eq!(evaluations.value, 2.0);
     }
 
     /// The outside-io reading counts one situation and nothing near it.
@@ -5666,6 +6202,7 @@ mod tests {
         assert!(excluding.held());
     }
 
+    // proves: evolution.buildGate.maxConcurrent
     /// Every dimension is a count of builds: what is left of it, divided by what
     /// one build demands. The tightest is the answer, and which one it was is
     /// part of the reading — a bound of one on a saturated disk is a different
@@ -6856,7 +7393,7 @@ unevictable 28532736
             .labels
             .get(crate::LABEL_DIMENSION)
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
 
         assert!(
             matches!(dimension.as_str(), DIM_CPU | DIM_MEMORY | DIM_IO),
@@ -7093,6 +7630,23 @@ unevictable 28532736
             2,
             "a claim still inside its window has not lapsed"
         );
+
+        // The window is a strict bound, and an arrival must not read a claim
+        // that is still inside it as a turn already lost: a claim written with a
+        // second to spare is honoured and charges nothing, even though a tick of
+        // the clock may land between the write and the read.
+        let inside = unix_now().saturating_sub(shipped().reserve_fresh.as_secs() - 1);
+        write_gate_file(&path, &format!("mainline advance\t{inside}\n")).unwrap();
+        assert_eq!(
+            gate.reservation().map(|(holder, _)| holder),
+            Some("mainline advance".to_string()),
+            "a claim one second inside its window is still this work's turn"
+        );
+        assert_eq!(
+            lapsed(&gate),
+            2,
+            "and it charges no lapse to the work that made it"
+        );
     }
 
     /// The renewal interval is a reading of its own: a work that rewrites the
@@ -7158,6 +7712,68 @@ unevictable 28532736
             gap(&gate),
             0,
             "the interval after a take-over belongs to the work that was overtaken"
+        );
+    }
+
+    /// A service performed by another process is what makes the turn movable.
+    ///
+    /// The host's shell client takes a slot by `flock`ing it and writes the one
+    /// line in [`SERVED_FILE`]; nothing about that reaches this process's
+    /// memory. When the served fact lived in an array here, a claim held by
+    /// such a work read as unanswered on every round, so the work waiting on it
+    /// stood down forever -- the mainline advance for three hours on 2026-11-10.
+    /// Two gate values over one directory are the two processes.
+    #[test]
+    fn a_service_from_the_other_half_of_the_gate_gives_the_turn_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let serving = gate(dir.path(), 1, 0);
+        let waiting = gate(dir.path(), 1, 0);
+        let claimant = "gate: 名字契约（告警规则契约）";
+        write_gate_file(
+            &dir.path().join(RESERVE_FILE),
+            &format!("{claimant}\t{}\n", unix_now().saturating_sub(60)),
+        )
+        .unwrap();
+
+        assert!(
+            !waiting.reserve_build_field("mainline advance"),
+            "the first stand-down leaves the turn to the work that asked first"
+        );
+        serving.note_served(claimant);
+        assert!(
+            waiting.reserve_build_field("mainline advance"),
+            "the work that was served has had its turn, so this one takes the claim"
+        );
+        assert_eq!(
+            waiting.reservation().map(|(who, _)| who).as_deref(),
+            Some("mainline advance")
+        );
+    }
+
+    /// A service older than the stand-down is not a turn this work lost. The
+    /// record is per name and the comparison is against the instant the
+    /// stand-down began, so a work served before this one started waiting is
+    /// still waiting its turn rather than already served.
+    #[test]
+    fn a_service_older_than_the_stand_down_leaves_the_turn_where_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 0);
+        let claimant = "gate: 名字契约（告警规则契约）";
+        write_gate_file(
+            &dir.path().join(RESERVE_FILE),
+            &format!("{claimant}\t{}\n", unix_now().saturating_sub(60)),
+        )
+        .unwrap();
+        write_gate_file(
+            &dir.path().join(SERVED_FILE),
+            &format!("{}\t{claimant}\n", unix_now().saturating_sub(30)),
+        )
+        .unwrap();
+
+        assert!(!gate.reserve_build_field("mainline advance"));
+        assert!(
+            !gate.reserve_build_field("mainline advance"),
+            "a service that predates the stand-down says nothing about this turn"
         );
     }
 
@@ -7479,6 +8095,80 @@ unevictable 28532736
         drop(next);
         drop(claim_copy);
         drop(slot_copy);
+    }
+
+    // proves: evolution.buildGate.waitSecs
+    /// The wait budget is the tail of the waits that actually happened.
+    ///
+    /// The declared budget is 2s. A wait of 1.5s is recorded the way `acquire`
+    /// records one (the moment a slot is taken), and the next caller is then
+    /// admitted after waiting 2.something seconds -- longer than the declaration,
+    /// which is the half of the loop a pure-function test cannot show: the next
+    /// acquisition is running against the derived budget, not the pinned one.
+    /// The second wait moves the budget again, and the evaluation count says the
+    /// loop is computing rather than the number having been written once.
+    #[tokio::test]
+    async fn the_wait_budget_follows_the_waits_that_actually_happened() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 2);
+        assert_eq!(
+            gate.effective_wait(),
+            Duration::from_secs(2),
+            "with nothing measured, the declaration is the budget"
+        );
+        assert_eq!(gate.wait_budget.evaluations(), 0);
+
+        // The same call `acquire_within` makes when it takes a slot.
+        gate.slot_taken(Duration::from_millis(1500));
+        assert_eq!(
+            gate.wait_budget.evaluations(),
+            1,
+            "one measured wait is one turn of the loop"
+        );
+        assert!(
+            gate.effective_wait() >= Duration::from_secs(3),
+            "a 1.5s wait has to set the next budget at twice that, got {:?}",
+            gate.effective_wait()
+        );
+        assert_eq!(
+            gate.wait_budget_ms(),
+            gate.effective_wait().as_millis() as u64,
+            "the published budget is the one in force"
+        );
+
+        // A wait longer than the declared 2s: only the derived budget admits it.
+        let held = gate.try_acquire("holder").await.unwrap();
+        let waiter = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move { gate.acquire("queued build").await })
+        };
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        drop(held);
+        let permit = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the caller is admitted by the derived budget, not the 2s declaration")
+            .unwrap()
+            .unwrap();
+        assert!(permit.held());
+        assert_eq!(
+            gate.wait_budget.evaluations(),
+            2,
+            "the caller's own wait is a second sample"
+        );
+        assert!(
+            gate.effective_wait() >= Duration::from_secs(4),
+            "the second wait was at least 2s, so the budget follows it, got {:?}",
+            gate.effective_wait()
+        );
+
+        // And the loop is on the published pacing series, not only in a field.
+        let metrics = gate.collect_metrics("").await.unwrap();
+        assert!(
+            metrics
+                .iter()
+                .any(|m| m.name == cog_core::pacing::TARGET_METRIC),
+            "the wait budget's target must be published under the shared pacing series"
+        );
     }
 
     /// A waiting build is a reading of its own: a gate at its bound with nothing
@@ -7902,6 +8592,12 @@ unevictable 28532736
             BUILD_GATE_HELD_MS_TOTAL,
             BUILD_GATE_HELD_MS_MAX,
             BUILD_GATE_WAIT_BUDGET_MS,
+            // Zero means no window has derived a width yet, not "cargo gets
+            // no jobs"; the counter beside it is what separates a stable
+            // width from a stopped derivation. Both are part of the set a
+            // process with no builds publishes.
+            BUILD_GATE_CARGO_JOBS,
+            BUILD_GATE_CARGO_JOBS_EVALUATIONS_TOTAL,
         ]);
         assert_eq!(
             names, expected,
@@ -8002,6 +8698,33 @@ unevictable 28532736
                 .sum::<f64>(),
             3.0,
             "summed over the asks the counter is the number it carried before the label"
+        );
+    }
+
+    /// The host's own clients are one work, whatever step they are running.
+    ///
+    /// Their names carry the step (`gate: 名字契约（告警规则契约）`) or the
+    /// worktree (`host build (wt-emp2)`), so a vocabulary of exact words matches
+    /// none of them and every one of their refusals landed in the unnamed cell.
+    /// On 2026-11-10 that cell is where the work that held the mainline advance
+    /// off for three hours would have been counted -- the reading could not name
+    /// it. Anything else still lands in the unnamed cell, which is what that
+    /// cell is for.
+    #[test]
+    fn the_hosts_step_names_are_counted_under_the_hosts_cell() {
+        let host = BUILD_GATE_ASKERS
+            .iter()
+            .position(|(words, _)| *words == BUILD_GATE_HOST_ASKER)
+            .expect("the host has a cell");
+        assert_eq!(asker_index("gate: 名字契约（告警规则契约）"), host);
+        assert_eq!(asker_index("gate: clippy --workspace"), host);
+        assert_eq!(asker_index("host build (wt-emp2)"), host);
+        assert_eq!(asker_index(BUILD_GATE_HOST_ASKER), host);
+        assert_ne!(asker_index("mainline advance"), host);
+        assert_eq!(
+            asker_index("a build in the first slot"),
+            BUILD_GATE_ASKERS.len(),
+            "a name that is neither listed nor host-shaped is still unnamed"
         );
     }
 

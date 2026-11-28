@@ -19,6 +19,13 @@ pub struct EventFilterQuery {
     pub squad_id: Option<String>,
     pub event_types: Option<String>,
     pub level: Option<String>,
+    /// How far back the caller asked to read, when it said so.
+    ///
+    /// A question wider than the store's floor widens the floor: the sweep
+    /// refuses to delete rows inside the longest span anyone has asked for,
+    /// so this number is both what this answer covers and the input the next
+    /// sweep beat recomputes against.
+    pub window_secs: Option<u64>,
 }
 
 /// Query parameters for paginated log fetching.
@@ -29,7 +36,8 @@ pub struct LogsQuery {
 }
 
 fn default_limit() -> usize {
-    100
+    // 一屏：与 A2A 的 `page_size` 默认值同一个数，列表面共用页长。
+    cog_core::config::A2A_LIST_PAGE_SIZE as usize
 }
 
 // ─── Cluster Overview ───
@@ -37,7 +45,8 @@ fn default_limit() -> usize {
 /// How many firing alerts to fetch when all the verdict needs is whether any
 /// exist. The question is boolean, so one row settles it and the read stays
 /// bounded no matter how much is firing.
-// cap: bound — 探测只取一条；有界，不随正在告警的数量增长
+// cap: fixed — 探测只取一条；有界，不随正在告警的数量增长
+// keep: 删掉后探测的代价跟着正在告警的数量长，风暴里探测先拖垮面板；由「只取一条、不随告警数量增长」兜住
 const FIRING_PROBE_LIMIT: i64 = 1;
 
 /// Verdict over the firing alerts an evidence source reported.
@@ -336,7 +345,7 @@ pub struct TokenUsageQuery {
 }
 
 fn default_usage_hours() -> i64 {
-    24
+    cog_core::day::HOURS_PER_DAY
 }
 
 /// 投入那一格与花销面读的必须是同一段窗口。
@@ -370,7 +379,8 @@ fn usage_reach_hours() -> i64 {
 /// weeks and a chart cannot draw them. The summed reads have no such limit and
 /// derive theirs from the retention ([`usage_reach_hours`]); only this one is
 /// bounded by how much can be drawn.
-// cap: bound — 逐窗口那一读的响应大小就是区间本身，界的是画得出来多少格
+// cap: fixed — 逐窗口那一读的响应大小就是区间本身，界的是画得出来多少格
+// keep: 删掉后一次读图可以要任意长的区间，响应大小就是区间本身；由「界的是画得出来多少格」兜住
 const MAX_SERIES_HOURS: i64 = 24 * 7;
 
 /// The instant a spend request asks the fold to sum from.
@@ -651,6 +661,13 @@ fn spend_range(
             "hours 与 since/until 只能二选一：两个都给时用哪个都要靠约定，而约定看不见",
         ));
     }
+    // 读者问过多宽，清扫那一侧就要把保留期的地板抬到多高：这是「谁能读多远」
+    // 的输入，不是一个被拒绝之后什么也不改变的请求。记在拒绝之前——一个被拒的
+    // 更宽请求正是「有人要读那么远」的证据。
+    cog_core::retention::record_read_span(
+        cog_core::retention::LLM_USAGE_READ_WINDOW_KNOB,
+        (until - since).num_seconds().max(0) as u64,
+    );
     if until <= since {
         return Err(ApiError::bad_request(format!(
             "until 必须晚于 since：{}, {}",
@@ -1293,9 +1310,24 @@ pub async fn events_handler(
         since: None,
     };
 
-    // For historical queries without a "since" parameter, we default to
-    // the last 24 hours to avoid unbounded result sets.
-    event_filter.since = Some(chrono::Utc::now() - chrono::Duration::hours(24));
+    // A query without a window asks for what the store promises: the
+    // deployment's declared floor, widened by the longest question already
+    // asked. A query that asks wider moves that floor, and the next sweep beat
+    // takes the new number — the reader's need is the input, not a constant
+    // copied beside it.
+    let knob = cog_core::retention::OBSERVABILITY_EVENTS_READ_WINDOW_KNOB;
+    let seed = cog_core::retention::read_window_seed(
+        std::env::var(cog_core::retention::OBSERVABILITY_EVENTS_READ_WINDOW_ENV)
+            .ok()
+            .as_deref(),
+        cog_core::retention::OBSERVABILITY_EVENTS_READ_WINDOW_DEFAULT_SECS,
+    );
+    let (floor, _) =
+        cog_core::retention::read_window_secs(seed, cog_core::retention::longest_read_span(knob));
+    let asked = filter.window_secs.filter(|secs| *secs > 0).unwrap_or(floor);
+    cog_core::retention::record_read_span(knob, asked);
+    event_filter.since =
+        Some(chrono::Utc::now() - chrono::Duration::seconds(asked.min(i64::MAX as u64) as i64));
 
     let mut stream = gateway
         .subscribe_events(event_filter)
@@ -1521,14 +1553,10 @@ pub fn event_matches_level(event: &cog_core::AgentEvent, level: Option<&str>) ->
 #[derive(Debug, Deserialize)]
 pub struct SearchQuery {
     pub q: String,
-    #[serde(default = "default_search_limit")]
+    /// Required: how many hits the caller wants is the caller's decision.
     pub limit: usize,
     #[serde(default = "default_search_index")]
     pub index: String,
-}
-
-fn default_search_limit() -> usize {
-    20
 }
 
 fn default_search_index() -> String {

@@ -162,6 +162,27 @@ async fn the_bound_applies_per_receiving_peer() {
     assert_eq!(kept.len(), 1, "the quiet peer's window was pushed out");
     assert_eq!(kept[0].body, "the one that must survive");
 
+    // 窗口之外的行**不被删除**：它们是那两个 agent 之间说过的唯一一份。数出来的
+    // 才是这一趟的产出——它说「该搬了」，说不了「该丢」。
+    let quiet_overflow = probe
+        .store
+        .overflow_beyond_window(&probe.right, cog_storage::ROWS_KEPT_PER_PEER)
+        .await
+        .expect("count the quiet peer's overflow");
+    assert_eq!(
+        quiet_overflow, 0,
+        "the quiet peer has nothing outside its window"
+    );
+    let noisy_overflow = probe
+        .store
+        .overflow_beyond_window(&noisy, cog_storage::ROWS_KEPT_PER_PEER)
+        .await
+        .expect("count the noisy peer's overflow");
+    assert_eq!(
+        noisy_overflow, 10,
+        "the noisy peer's ten rows past its window are counted, and still there"
+    );
+
     sqlx::query("DELETE FROM agent_messages WHERE from_unit = $1")
         .bind(&noisy)
         .execute(&probe.pool)

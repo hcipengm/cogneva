@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import glob
 import os
+import subprocess
 import sys
 
 import yaml
@@ -154,6 +155,19 @@ def main(argv):
             return 0
         if a.startswith("-"):
             print(f"check-ingress-forwarded-proto: unknown argument {a}", file=sys.stderr)
+            return 2
+    # 渲染产物不进仓：读默认的那几棵之前让 chart 现场生成。显式给了目录
+    # （测试的副本、某一次渲染的产物）就不动它——那份是它自己的题目。
+    if not args:
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        cache = os.path.join(root, "deploy", "scripts", "lib", "rendered-cache.sh")
+        rc = subprocess.run(["bash", cache, "--ensure", root]).returncode
+        if rc != 0:
+            print(
+                "check-ingress-forwarded-proto: cannot materialize deploy/rendered "
+                "(the tree is generated from the chart; see the message above)",
+                file=sys.stderr,
+            )
             return 2
     directories = args or ["deploy/k3s"] + sorted(glob.glob("deploy/rendered/*"))
     directories = [d for d in directories if os.path.isdir(d)]

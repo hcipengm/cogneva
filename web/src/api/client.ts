@@ -1,3 +1,5 @@
+// census-keep: shapes=clocks — 界面上的提示计时（复制成功、提示消失之类）：只影响提示停留多久，不参与任何决定；删掉只是提示不自动消失或一直不消失
+// census-keep: shapes=spaces — 界面取数的默认页大小：与服务端分页契约一致，删掉会一次拉全部行；由服务端的 LIMIT 契约兜住
 import type { ChatRole } from '@/types/events';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '';
@@ -84,6 +86,26 @@ export class ApiClient {
     headers.set('Content-Type', 'application/octet-stream');
     if (this.token) headers.set('Authorization', `Bearer ${this.token}`);
     const response = await fetch(`${API_BASE_URL}${path}`, { method, body, headers });
+    if (!response.ok) {
+      const text = await response.text();
+      throw { status: response.status, message: text || response.statusText } as ApiError;
+    }
+    return (await response.json()) as T;
+  }
+
+  /**
+   * 发一份 `multipart/form-data`。
+   *
+   * 不走 `request`：那一条会自己写上 `Content-Type: application/json`，而
+   * multipart 的分隔串由浏览器按 `FormData` 现生成——手写一个没有分隔串的类型，
+   * 服务端解析第一步就会拒。这里刻意不设 `Content-Type`，留给 `fetch` 补上带
+   * 分隔串的那一个。
+   */
+  async sendForm<T>(path: string, form: FormData): Promise<T> {
+    const headers = new Headers();
+    headers.set('Accept', 'application/json');
+    if (this.token) headers.set('Authorization', `Bearer ${this.token}`);
+    const response = await fetch(`${API_BASE_URL}${path}`, { method: 'POST', body: form, headers });
     if (!response.ok) {
       const text = await response.text();
       throw { status: response.status, message: text || response.statusText } as ApiError;
@@ -324,7 +346,45 @@ export interface ChatTranscriptLine {
    * 它还在跑）；空＝问答，回复只走当前这条连接。
    */
   goal_id?: string | null;
+  /**
+   * 随这一句发上去的附件，只有认人的那几格：名字与类型。
+   *
+   * 字节不在这里：附件体随记录落库、由服务端装进下一轮提示词，重开页面不需要
+   * 把整段对话的图重新下载一遍。
+   */
+  attachments?: ChatAttachmentInfo[] | null;
+  /**
+   * 这一轮调过的工具，按调用顺序。
+   *
+   * 实时帧只活在连接里：页面关掉之后，「这段对话的待办清单」只剩这一格还写着。
+   * `result` / `finished_at` 空着表示那一笔在记录时还没收尾（这一轮被停了）。
+   */
+  tool_calls?: ChatToolCallLine[] | null;
+  /**
+   * 回答这一轮的是哪个执行者。名字里带进程指纹，页面自己算不出来——没有这一格，
+   * 重开之后工具调用归不到这一段下面。
+   */
+  agent_id?: string | null;
   created_at: string;
+}
+
+/** 记录里的一笔工具调用。 */
+export interface ChatToolCallLine {
+  tool_call_id: string;
+  tool_name: string;
+  /** 入参原文（JSON 文本）；没有入参时是空串。 */
+  args?: string;
+  /** 返回原文；还没收尾时不在这一格上。 */
+  result?: string | null;
+  status: 'running' | 'ok' | 'error';
+  started_at: string;
+  finished_at?: string | null;
+}
+
+/** 记录里一条附件的身份。 */
+export interface ChatAttachmentInfo {
+  name?: string | null;
+  mime_type: string;
 }
 
 /**
@@ -341,6 +401,36 @@ export async function getSessionMessages(
     data?: { items?: ChatTranscriptLine[] };
     message?: string;
   }>(`/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`);
+  return res.data?.items ?? [];
+}
+
+/** 名单上的一段会话：哪一个、开头说了什么、最后一次说话在什么时候。 */
+export interface ChatSessionSummary {
+  session_id: string;
+  title: string;
+  last_activity_at: string;
+  turns: number;
+}
+
+/**
+ * 这个人的会话名单，最近说话的在前。
+ *
+ * 关掉页面、换一台机器、清掉浏览器存储之后，这是唯一还能找回那段对话的路：
+ * 本地那份开着的名单已经没了，而记录还在服务端。名单只含自己的会话，搜索是
+ * 字面匹配——搜索框里打进来的字是用户在找的字，不是通配符。
+ */
+export async function listChatSessions(
+  search?: string
+): Promise<ChatSessionSummary[]> {
+  const query = search?.trim();
+  const path = query
+    ? `/api/v1/sessions?search=${encodeURIComponent(query)}`
+    : '/api/v1/sessions';
+  const res = await api.get<{
+    code: string;
+    data?: { items?: ChatSessionSummary[] };
+    message?: string;
+  }>(path);
   return res.data?.items ?? [];
 }
 
@@ -404,6 +494,15 @@ export interface LlmConfigPayload {
   api_style?: string;
   /** 探测失败后的"仍然保存"：跳过连通验证直接落库 */
   skip_verify?: boolean;
+  /**
+   * 这只模型公布的上下文窗口（token），随上游条目一起落盘。
+   *
+   * 它不是这一页的旋钮：值来自预设旁边那条厂商规格（哪一页、哪一天写在注释里），
+   * 跟着条目走——同一家不同型号不同窗口，挂在厂商名上迟早把 A 型号的窗口算到
+   * B 型号头上。缺省 / 0 = 没说过，运行时走实测（收下过多大的 prompt、拒收时
+   * 自述多大的界）。
+   */
+  context_window?: number;
 }
 
 export async function getLlmStatus(): Promise<LlmStatus> {
@@ -536,7 +635,14 @@ export interface ContributionStatus {
   git_identity: GitIdentityStatus;
   github_app_configured: boolean;
   policy: string;
-  pending_count: number;
+  /**
+   * 待回流的变更条数。
+   *
+   * `null` 是第三种答案：这一刻问不到队列（控制面没接、或读失败）。它与 `0`
+   * （问到了，队列空着）不是一件事——把两者合成一个数，设置屏会在控制面打嗝的
+   * 那一拍告诉所有者「没有等你点头的变更」。
+   */
+  pending_count: number | null;
   /** GitHub 设备码通道可用（有 OAuth App client_id） */
   device_flow_available: boolean;
   /**
@@ -1082,7 +1188,6 @@ export interface AgentSummary {
   workspace_id: string;
   hostname: string;
   pod_ip: string;
-  capabilities: string[];
   last_heartbeat: string;
   /**
    * 此刻在心跳上。`false` 是「说过话、现在不在岗」——界面上的对话员工闭嘴
@@ -1104,11 +1209,51 @@ export interface AgentSummary {
   platform?: string | null;
   /** 同一台设备的同一个客户端，同样来自握手。 */
   device_id?: string | null;
+  /**
+   * 这一行背后站着的那个人。`null` 是读数，不是缺字段：它说的正是「这个座位
+   * 背后还没有人」——任务一多，座位能长到几百行，而人没变。
+   */
+  person_id?: string | null;
+}
+
+/** 名册按人收好后的一行：一个人一行，他此刻占着的地址挂在 `agent_ids` 里。 */
+export interface PersonSummary {
+  person_id: string | null;
+  /** 人那一行是「工号 姓名」；没派人的座位那组是「座位，尚未分配给人」。 */
+  display_name: string;
+  number?: string | null;
+  live: boolean;
+  retired: boolean;
+  roles: string[];
+  /**
+   * 这个人此刻占着的地址（可寻址的 agent id）。别丢——丢了这个人在对话页就
+   * 点不到。数目就是这一列的长度，服务端不再另发一个数：两个数各数一次，迟早
+   * 会对不上。
+   */
+  agent_ids: string[];
+}
+
+export interface AgentRosterPage {
+  agents: AgentSummary[];
+  /**
+   * 按人收好的名册。空 `person_id` 的那一行收着全部没派给人的座位，一次只出现
+   * 一行；名册读不到时服务端不编这一份，界面要能说出「没读到」。
+   */
+  people?: PersonSummary[] | null;
+  /**
+   * 读数：还有多少座位背后没有人。`null` 是「名册没读到」，`0` 是「量过了，
+   * 一个都没有」——两种答案不能画成同一个数。
+   */
+  seats_without_a_person?: number | null;
+}
+
+export async function getAgentRoster(): Promise<AgentRosterPage> {
+  const page = await api.get<AgentRosterPage>('/api/v1/agents');
+  return { ...page, agents: page.agents ?? [] };
 }
 
 export async function listAgents(): Promise<AgentSummary[]> {
-  const page = await api.get<{ agents: AgentSummary[] }>('/api/v1/agents');
-  return page.agents ?? [];
+  return (await getAgentRoster()).agents;
 }
 
 /**
@@ -1322,7 +1467,6 @@ export interface CrewProgress {
 export interface AgentLoad {
   agent_id: string;
   role: string;
-  capabilities: string[];
   /** healthy / suspect / stuck / dead / unknown（没有监管者判词）。 */
   health: string;
   running_tasks: number;
@@ -1405,7 +1549,8 @@ export interface TaskRow {
   lease_expires_at?: string | null;
   retry_not_before?: string | null;
   started_at?: string | null;
-  timeout_seconds?: number;
+  /** 这一行声明自己会花多久。不是刀：没有东西按它结束行。 */
+  declared_duration_seconds?: number;
   retry_count?: number;
   max_retries?: number;
   priority?: number;
@@ -1419,6 +1564,20 @@ export interface TaskRow {
   acceptance?: string[];
   is_executable?: boolean;
   result?: Record<string, unknown> | null;
+  /**
+   * 这一行带着的待办三格。状态按行自己的结局现算：**完成且差距已空**才是
+   * `已落`，其余仍 `未落`，差距不动。没带三格的行没有这一格。
+   */
+  ledger_item?: LedgerItem;
+}
+
+/** 一条待办的五个格子，与台账是同一套词。 */
+export interface LedgerItem {
+  id: string;
+  terminal: string;
+  now: string;
+  gap: string;
+  state: '未落' | '已落';
 }
 
 export interface TaskGraph {
@@ -1849,12 +2008,15 @@ export async function listTasks(params: {
   status?: string;
   goal_id?: string;
   agent_id?: string;
+  /** 只看这几行，逗号分隔。对话里的任务列表带的是这一轮派的那几个 id。 */
+  ids?: string;
   limit?: number;
 } = {}): Promise<TaskRow[]> {
   const query = new URLSearchParams();
   if (params.status) query.set('status', params.status);
   if (params.goal_id) query.set('goal_id', params.goal_id);
   if (params.agent_id) query.set('agent_id', params.agent_id);
+  if (params.ids) query.set('ids', params.ids);
   if (params.limit) query.set('limit', String(params.limit));
   const suffix = query.toString() ? `?${query.toString()}` : '';
   return api.get<TaskRow[]>(`/api/v1/tasks/list${suffix}`);
@@ -1980,7 +2142,8 @@ export async function getBackendHealth(): Promise<BackendHealthMatrix> {
 
 /**
  * 观测读数。`value` 为空是「问不到 / 没有样本」，与读到 0 不是一回事；
- * `dashboard_uid` 为空是「这条读数没有面板」，界面据此说明为什么点不过去。
+ * `panel` 是后端算出来的面板地址（哪块板、第几格），不是人写的 uid——
+ * 面板由注册表投影生成，写一份 uid 清单迟早与生成物对不上。
  * `group` 是闭集：面板按它分段，读到不认识的词就照原样单列一段，而不是把它
  * 并进某一段——并错段的一行数不算错，但读者会在错的那一分钟去找它。
  */
@@ -1996,7 +2159,8 @@ export interface ObservabilityReading {
   higher_is_worse: boolean;
   series: string;
   produced_by: string;
-  dashboard_uid: string | null;
+  /** 后端算出来的面板地址：板子的 uid 与这条读数在板上的格号。 */
+  panel: { uid: string; id: number };
   value: number | null;
   /**
    * 判词。闭集：`| string` 会把联合类型变成一句装饰——加了它，任何词都合法，
@@ -2058,7 +2222,7 @@ export interface BuildRun {
   change_id: string;
   /** 变更的入口；生成它的那一侧没有携带时是 `unattributed`。 */
   intent: string;
-  /** `built` / `failed` / `timed_out` / `unstarted`。 */
+  /** `built` / `failed` / `stalled` / `unstarted`。 */
   outcome: string;
   /** 这次构建占用主机的秒数；`unstarted` 没跑，所以没有这一格而不是 0。 */
   seconds?: number;
@@ -2110,7 +2274,49 @@ export interface BuildGateReport {
   reservation?: BuildGateReservation;
   pressure: BuildGatePressure[];
   load?: { load1: string; load5: string; load15: string };
+  /**
+   * 推之前那道门的最近两跑：每格花了多少秒、结局是什么。
+   *
+   * 空数组不是错误：这道门是后加的记录，槽目录里还没有它写过的东西。读不动另说——
+   * 那种情形由 `runs_why` 说话。
+   */
+  runs: BuildGateRun[];
+  /** `runs/` 读不动的理由；没有记录时不给。 */
+  runs_why?: string;
   generated_at: string;
+}
+
+export interface BuildGateRun {
+  /** 这一跑落在哪棵工作树上（路径里的 `/` 换成了 `_`）。 */
+  tree: string;
+  /**
+   * 交付链上的哪一段：`precommit` / `gate` / `prepush`。
+   * 三段共用同一份记录格式，页面按它把一跑放回链路上对应的那一格。
+   */
+  stage: string;
+  /** 从开跑到这一刻过了多久；跑完的那一份就是这一跑的时长。 */
+  started_secs_ago: number;
+  /** 有没有收尾。没收尾的是「还在跑，或者被杀了」——读数不替它二选一。 */
+  finished: boolean;
+  /** 最后一次落笔是多久以前：没收尾的那一跑，这一格是它停了多久。 */
+  last_write_secs_ago?: number;
+  /** 各格秒数之和，不含构建槽排队与格子之间的空隙。 */
+  total_secs: number;
+  red: number;
+  unjudged: number;
+  /**
+   * 记录在、内容读不出来（权限、坏文件）时的理由。
+   * 没有这一格，「读不动」与「这一跑一格都没记」都是空表配合计 0，页面上同形。
+   */
+  read_error?: string;
+  steps: BuildGateStep[];
+}
+
+export interface BuildGateStep {
+  seconds: number;
+  /** `ok` / `RED` / `UNJUDGED`，由写记录的那一侧判。 */
+  verdict: string;
+  what: string;
 }
 
 export interface BuildGateSlot {
@@ -2159,6 +2365,13 @@ export interface SourceLineReport {
   /** 仓库读得到但里面没有 main 时这一格缺席——那是第四种事实，不是「读不动」。 */
   main?: SourceLineBranch;
   branches: SourceLineBranch[];
+  /**
+   * 「编辑」那一格该写谁：尖端比 main 还晚、且已在推进之后有新提交的那条分支。
+   * 判在服务端，页面不重算——一条很早以前分叉、此后再没动过的旧分支不是编辑现场。
+   */
+  editing?: SourceLineBranch;
+  /** 与 `editing` 同属「推进之后还在动」的其余分支数。 */
+  editing_others: number;
   /** 被截断时还有几条没列；缺席是「全列上了」。 */
   more_branches?: number;
   generated_at: string;
@@ -2184,7 +2397,12 @@ export async function getSourceLine(): Promise<SourceLineReport> {
 export interface EvalDatasetInfo {
   name: string;
   path: string;
-  case_count: number;
+  /**
+   * 这个数据集里有几个用例。`null` 是**没数**，不是 0：只有 jsonl 有一行一个
+   * 用例的约定，yaml 没有，读不出来的文件也没有。写 0 会让「不数」与「空数据集」
+   * 在屏上同形。
+   */
+  case_count: number | null;
   tags: string[];
 }
 
@@ -2520,12 +2738,41 @@ export interface ChangeLedgerRow {
   /** 这一条落在哪一面；`none` 表示没有文档点名或点名不一致。 */
   block: string;
   /**
+   * 三格：代码 / 上线 / 验证，各填了没有。
+   *
+   * 不出现（`undefined`）是「这一页算不出三格」——平台读不到现网 revision。
+   * 那要印「量不到」，不能印成三格全空：全空读作「全都没做」，是另一个结论。
+   */
+  cells?: ChangeCells;
+  /**
    * 这一条自己花掉的 token，按它的全部交接代际求和。
    *
    * `null` 是「这一页量不了」，原因在响应上的 `cost_unreadable`；`0` 是量到的
    * 结论（这条没人接手过）。两者不能互相顶替。
    */
   cost: number | null;
+}
+
+/** 一件变更的三格。填了不等于好，只说明这一步有证据。 */
+export interface ChangeCells {
+  /** 树里有实现（交付过一次，或判据在树上为真）。 */
+  code: boolean;
+  /** 跑着的那一版里有它，而且那一次量就是在那一版上做的。 */
+  live: boolean;
+  /** 判据对着真东西量过，而且为真。 */
+  verified: boolean;
+}
+
+/** 一份三格快照按格数出来的行数。 */
+export interface ChangeCellsCensus {
+  rows: number;
+  code: number;
+  live: number;
+  verified: number;
+  /** 三格齐：终态。 */
+  terminal: number;
+  /** 代码填了、验证空着——读作做完了、实际没人核过。 */
+  unverified: number;
 }
 
 /**
@@ -2595,6 +2842,10 @@ export interface ChangesPage {
   /** 每次成本列读不到的原因；`null` 表示这一页每一行都有实测成本。 */
   cost_unreadable: string | null;
   outstanding_total: number;
+  /** 现网是哪一版（或为什么读不出来）。三格里的「上线」靠它算。 */
+  live_revision?: { Known?: string; Unmeasurable?: string };
+  /** 三格按格数出来的行数；不出现表示这一页没有可用快照。 */
+  cells_census?: ChangeCellsCensus;
   outstanding: ChangeLedgerRow[];
 }
 
@@ -2646,9 +2897,63 @@ export interface ChangeFunnelDay {
   unpriced_calls: number | null;
 }
 
+/**
+ * 上面那些天加起来是多少。
+ *
+ * 服务端算，不由页面自己加。两个原因，都是读数面的老账：
+ *
+ * 1. **单位成本是一个比值，分母得点名。** 分子是整台部署的花销（所有调用方），
+ *    分母可以是「所有关掉的条」也可以是「带 rev 关掉的条」，两个都说得通，但答的是
+ *    两个问题：前者是「关掉一条东西要花多少」，后者是「送出一个变更要花多少」，而账上
+ *    的 ¥ 目标说的是后一个。两者的比正好是 `rev_coverage`——只印其中一个而不印覆盖率，
+ *    读数就是坏的：拿前一个当后一个读，差的就是这个比；拿后一个却不看覆盖率，读的人
+ *    分不出它是贵，还是几乎什么都没送出去。
+ * 2. 页面自己加，加起来的方式就没有测试管得住。
+ */
+export interface FunnelSummary {
+  attempted: number;
+  rounds: number;
+  passed: number;
+  /** 窗口里账上关掉的全部条数。不是产出。 */
+  landed: number;
+  /** 其中带交付 rev 的条数——真送出去的那些。 */
+  landed_with_rev: number;
+  /** `landed_with_rev / landed`。`null` = 窗口里一条都没关（分母为零时比值不存在，不是 0）。 */
+  rev_coverage: number | null;
+  /** 有任何一天没读到用量表时是 `null`——静默少加一天的读数会读成「那天没花钱」。 */
+  llm_calls: number | null;
+  /**
+   * 窗口里有价调用的花销。`null` = 说不出来，`cost_unstated` 说明是哪一种。
+   *
+   * 一天没调用、或那天的调用全都没记价，都**不是**「说不出来」：它们给有价合计加零，
+   * 藏起来的下界由 `unpriced_calls` 说。
+   */
+  cost_micros: number | null;
+  /** `cost_micros` 的币种，取自价目表标签。页面不自己选符号。 */
+  cost_currency: string | null;
+  /**
+   * `cost_micros` 为 `null` 的原因：`usage_unread`（有用量的天没读到）、
+   * `mixed_currency`（跨币种，这里没有汇率）、`nothing_priced`（一天有价调用都没有，
+   * 合计是零但没有币种能把它说出来）。这是服务端算的，页面不自己从 days 里再推一遍。
+   */
+  cost_unstated: 'usage_unread' | 'mixed_currency' | 'nothing_priced' | null;
+  /** 有调用没记价的数量。有一个就让上面所有钱数是下界。`null` = 有天的用量没读到。 */
+  unpriced_calls: number | null;
+  /** 关掉一条东西要买多少次调用。 */
+  calls_per_landing: number | null;
+  /** 送出一个变更要买多少次调用——这是账上的目标所依据的那个分母。 */
+  calls_per_shipped_change: number | null;
+  /** `cost_micros / landed`。 */
+  cost_per_landing_micros: number | null;
+  /** `cost_micros / landed_with_rev`。 */
+  cost_per_shipped_change_micros: number | null;
+}
+
 export interface ChangeFunnel {
   /** 旧的在前，与账本自己的顺序一致；页面要新的在前时自己翻。 */
   days: ChangeFunnelDay[];
+  /** 上面那些天的合计，服务端算的。 */
+  summary: FunnelSummary;
 }
 
 export async function getChangeFunnel(days = 14): Promise<ChangeFunnel> {
@@ -2814,7 +3119,12 @@ export async function getWorkbench(): Promise<WorkbenchPage> {
 // ── 能力 ──
 
 /** 一项动作从哪来。同名不同源是两行。 */
-export type CapabilitySource = 'builtin' | 'plugin' | 'mcp';
+export type CapabilitySource =
+  | 'builtin'
+  | 'plugin'
+  | 'mcp'
+  /** 对话层在一轮里装上去的工具：只属于那一段对话，共用注册表里没有它们。 */
+  | 'conversation';
 
 /**
  * 这一项此刻能不能真的被调起来。
@@ -2825,11 +3135,6 @@ export type CapabilitySource = 'builtin' | 'plugin' | 'mcp';
 export type CapabilityReach = 'callable' | 'declared_only';
 
 /** 一个自报了某项能力的单位，以及它此刻在不在岗。 */
-export interface CapabilityHolder {
-  unit: string;
-  live: boolean;
-}
-
 /** 一项能力：能被点单的一个动作。 */
 /**
  * 调这一项要带什么。`null` 是这一层没给 schema，不是「不用参数」——后者是
@@ -2866,7 +3171,6 @@ export interface CapabilityEntry {
    * 允许」——后者是空数组；两者要采取的动作相反。
    */
   allowed_roles: string[] | null;
-  holders: CapabilityHolder[];
 }
 
 /**
@@ -2886,15 +3190,9 @@ export interface CapabilityInventory {
   sources: Array<[CapabilitySource, CapabilitySourceReading]>;
   entries: CapabilityEntry[];
   /**
-   * 自报了能力的单位数。0 而名册非空，说明这一栏没人填；`null` 是名册这一拍没读到
-   * ——那时「没有人自报」无从说起，两者要采取的动作相反。
-   */
-  declaring_units: number | null;
-  /** 名册这一拍没读到的原因；`null`/缺省是读到了（含读到但没人自报）。 */
-  roster_caveat?: string;
-  /**
-   * 没有声明 `tools` 的角色：它们拿整张注册表，所以每一项都能点。`null` 是分工表
-   * 没读到，不是「没有这种角色」——后者是空数组。
+   * 不设边界的角色：它们拿整张注册表，所以每一项都能点。分工表里已无人声明
+   * `tools`，所以这一栏通常就是全部角色。`null` 是分工表没读到，不是「没有这种
+   * 角色」——后者是空数组。
    */
   unbounded_roles: string[] | null;
 }
@@ -3182,6 +3480,12 @@ export interface TopologyNode {
   memory_requested_bytes: number;
   cpu_used_millicores: number | null;
   memory_used_bytes: number | null;
+  /**
+   * 上面那个用量和里漏了几个 Pod：这一拍还没采到样的那些（刚起来的容器要等
+   * 下一轮）。`null` ＝ 这一面没有用量来源，`0` ＝ 每个 Pod 都量到了。
+   * 不为 0 时那个和是一个下界，不是这台机器的用量。
+   */
+  pods_without_usage: number | null;
   /** Ready / MemoryPressure / DiskPressure …：压力条件为 true 才是坏消息。 */
   conditions: TopologyCondition[];
   /** 这台节点上进程采集器最后一次报到的时刻；`null` ＝ 这台节点上没有采集器。 */
@@ -3212,8 +3516,13 @@ export interface TopologyNode {
 export interface TopologyUnclaimedContainer {
   /** 容器实例 id 的前 12 个字符——够认出「同一台机器上刚才那两个」。 */
   id: string;
-  /** 里面跑着几个进程。 */
+  /** 这一面的表里读到了几条进程。 */
   processes: number;
+  /**
+   * 它本来跑着几个。表按上限收条数，所以 `processes` 可能只是前几十条；
+   * `null` ＝ 报上来的那一方没说（旧镜像），不是「就这么多」。
+   */
+  processes_total: number | null;
   /** 最占内存的那几个进程名，去重、最多 4 个。cgroup 只给 id，名字只能从进程来。 */
   commands: string[];
 }
@@ -3365,6 +3674,62 @@ export type FileSource = 'workspace' | 'project';
 
 function sourceQuery(source: FileSource): string {
   return source === 'workspace' ? '' : `&source=${source}`;
+}
+
+/**
+ * 这一段对话能点的命令：一行 `/` 打头时列出来的那份名单。
+ *
+ * 名字打不出来的技能、或者整个技能表读不到时，服务端在 `note` 里说一句为什么
+ * 名单短了——那不是「一条都没有」，两者在界面上要分得开。
+ */
+export interface ChatCommand {
+  name: string;
+  description: string;
+  kind: 'skill' | 'builtin';
+}
+
+export interface ChatCommandList {
+  commands: ChatCommand[];
+  note?: string;
+}
+
+export async function getChatCommands(): Promise<ChatCommandList> {
+  return api.get<ChatCommandList>('/api/v1/chat/commands');
+}
+
+/** 一段会话的配额读数里，某一级格子的那一半。 */
+export interface ChatQuotaCell {
+  scope: 'user' | 'workspace' | 'team' | 'organization' | 'global' | string;
+  target: string;
+  soft_limit: number;
+  hard_limit: number;
+  used_today: number;
+  remaining: number;
+  blocking: boolean;
+  warning: boolean;
+}
+
+/**
+ * 这一段对话的配额余量：与代理路径执法时读的是同一份判定。
+ *
+ * `effective` 是 `null` 表示**没人给这一格配过上限**——那是「未配置」，不是
+ * 「剩余无限」。`readable: false` 表示这一次根本没读到（没有配额层级），这时
+ * 连 `used_today` 都没有：读不到与花了零是两句话。
+ */
+export interface ChatQuota {
+  readable: boolean;
+  reason?: string;
+  user_id?: string;
+  /** 最窄的那个被声明过的格子；`null` = 没人为这个人 / 平台配过上限。 */
+  effective?: ChatQuotaCell | null;
+  /** 这个人今天已用多少 token（账本投影）。`readable: false` 时没有这一格。 */
+  used_today?: number;
+  resets_at_unix?: number;
+  scopes?: ChatQuotaCell[];
+}
+
+export async function getChatQuota(): Promise<ChatQuota> {
+  return api.get<ChatQuota>('/api/v1/chat/quota');
 }
 
 export async function getWorkspaceTree(
@@ -3547,9 +3912,11 @@ export async function listAuditEvents(query: AuditQuery = {}): Promise<AuditEven
 
 export interface QuotaUsage {
   user_id: string;
-  remaining: number;
+  /** `null` ＝ 没有任何人给这一格声明过上限，所以没有「还剩多少」可报。 */
+  remaining: number | null;
   used_today: number;
-  total_quota: number;
+  /** `null` ＝ 同上：没有上限，不是一个很大的上限。 */
+  total_quota: number | null;
 }
 
 /** 我这一份 token 额度今天用了多少、还剩多少。 */
@@ -3814,8 +4181,13 @@ export interface BackupPackage {
 }
 
 export interface BackupPackages {
-  /** 现在有没有一趟导出在跑。页面靠它决定要不要继续轮询。 */
-  running: boolean;
+  /**
+   * 现在有没有一趟导出在跑。页面靠它决定要不要继续轮询。
+   *
+   * `null` = 问不到集群。那不是「没有在跑」：把两者折叠在一起，一趟真在跑的
+   * 导出会在 apiserver 打嗝的那一拍从页面上消失。
+   */
+  running: boolean | null;
   packages: BackupPackage[];
 }
 
@@ -3860,4 +4232,709 @@ export async function downloadBackupPackage(name: string): Promise<void> {
   // 交给浏览器一段时间再收回：立刻 revoke 会让一部分浏览器的另存对话框
   // 拿到一个已经失效的 URL，表现是「下载了 0 字节」。
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+/**
+ * 知识库里的一份文档。
+ *
+ * 服务端的列表直接把整份文档发回来（含正文），没有单独的 `kind` 字段——此前
+ * 这里的类型按想象写了 `kind?`，界面上那一列因此永远是空的；类型现在按实际
+ * 字段声明。正文按路径取，不按 id：`/wiki/document` 认的是 `path`。
+ */
+export interface WikiDocument {
+  id: string;
+  path: string;
+  title: string;
+  content: string;
+  tags?: string[];
+  created_at?: string;
+  updated_at?: string;
+}
+
+/**
+ * 知识面的文档列表（服务端顺手把正文也带上了）。
+ *
+ * 只有 `prefix` 一个筛选条件：路由的 `ListQuery` 不认 `limit`，发过去会被 serde
+ * 静静丢掉——那会让界面上的「取前 N 条」变成一个不存在的旋钮，所以这里不给它。
+ */
+export async function listWikiDocuments(params: { prefix?: string } = {}): Promise<{
+  documents: WikiDocument[];
+}> {
+  const suffix = params.prefix ? `?prefix=${encodeURIComponent(params.prefix)}` : '';
+  return api.get(`/api/v1/wiki${suffix}`);
+}
+
+/** 一份文档的正文，按相对路径取（`path` 不是 `id`）。 */
+export async function getWikiDocument(path: string): Promise<WikiDocument> {
+  return api.get(`/api/v1/wiki/document?path=${encodeURIComponent(path)}`);
+}
+
+/** 知识库检索的一条命中，带高亮片段。 */
+export interface WikiSearchHit {
+  document: WikiDocument;
+  score: number;
+  match_type?: string;
+  /** 服务端为空时整个字段不出现（`skip_serializing_if`），不是空数组。 */
+  highlights?: string[];
+}
+
+export interface WikiSearchResponse {
+  results: WikiSearchHit[];
+  count: number;
+}
+
+/** 在知识库内按查询检索；`top_k` 被服务端夹到 1..100。 */
+export async function searchWiki(query: string, topK = 20): Promise<WikiSearchResponse> {
+  return api.post('/api/v1/wiki/search', { query, top_k: topK });
+}
+
+/** 知识库适配器自报的提供方与健康；没配适配器时这条路由答 503。 */
+export async function getWikiInfo(): Promise<{ provider: string; healthy: boolean }> {
+  return api.get('/api/v1/wiki/info');
+}
+
+/** 任务的快照列表：每条是事件流上的一个可回来的点。 */
+export async function listSnapshots(params: { limit?: number } = {}): Promise<{
+  snapshots: { snapshot_id: string; task_id: string; event_offset: number; timestamp: string }[];
+}> {
+  const suffix = params.limit ? `?limit=${params.limit}` : '';
+  return api.get(`/api/v1/snapshots${suffix}`);
+}
+
+/** 一份快照的取回地址。地址由网关向观测后端现取；它可能过期，不要当永久链接存。 */
+export async function getSnapshotUrl(snapshotId: string): Promise<{ snapshot_id: string; url: string }> {
+  return api.get(`/api/v1/snapshots/${encodeURIComponent(snapshotId)}`);
+}
+
+/** 知识检索：跨库按语义找。此前只有接口，界面上没有入口。 */
+export async function searchKnowledge(query: string, limit = 20): Promise<KnowledgeSearchResponse> {
+  // 处理函数读的是 `query` 与 `top_k`：发一个它不认的键（`limit`）不会报错，
+  // serde 只会丢掉它，服务端拿到默认值——界面上这次搜索「成功」返回，条数却不是你选的。
+  return api.post('/api/v1/knowledge/search', { query, top_k: limit });
+}
+
+/** 平台搜索：把一次查询同时问向几个面。路由只答 GET，查询条件走查询串。 */
+export async function searchPlatform(query: string, limit = 20, index = 'cogneva'): Promise<PlatformSearchResponse> {
+  const params = new URLSearchParams({ q: query, limit: String(limit), index });
+  return api.get(`/api/v1/search?${params.toString()}`);
+}
+
+// ---------------------------------------------------------------------------
+// 钩子 / 插件 / 工作区 / 动作计划 / 数据集
+//
+// 这五组接口此前只有路由没有入口：界面要么给一个「按接口原样列出」的临时面，
+// 要么根本点不到。下面这几种形状按服务端**实际**答的字段声明，不按想象的：
+// 钩子的 `trigger`／`action.type` 是闭集，少写的那个值 serde 会拒；工作区外面
+// 那层 `{code, data}` 与别的面不同，按裸数组读会得到一片 `undefined`。
+// ---------------------------------------------------------------------------
+
+/** 钩子触发点。闭集：服务端按这十一个词分发，写错一个不会报错，只是永远不触发。 */
+export const HOOK_TRIGGERS = [
+  'on_agent_start',
+  'on_agent_end',
+  'on_task_complete',
+  'on_task_fail',
+  'on_crew_complete',
+  'on_ralph_pass',
+  'on_ralph_unrecoverable',
+  'on_squad_retry',
+  'on_tool_before',
+  'on_tool_after',
+] as const;
+export type HookTriggerName = (typeof HOOK_TRIGGERS)[number];
+
+/** 钩子动作。`block` / `rewrite` 只有在 `on_tool_before` 上才有意义——它们决定调用。 */
+export const HOOK_ACTIONS = ['webhook', 'redis_stream', 'log', 'notify', 'block', 'rewrite'] as const;
+export type HookActionName = (typeof HOOK_ACTIONS)[number];
+
+export interface HookDefView {
+  id: string;
+  trigger: HookTriggerName;
+  scope?: 'global' | 'crew' | 'squad';
+  crew_id_filter?: string;
+  squad_id_filter?: string;
+  /** 钩子管哪个工具（名字或 `*` 通配）；不写＝所有工具。 */
+  tool?: string;
+  action: { type: HookActionName } & Record<string, unknown>;
+  rate_limit?: { burst: number; per_second: number };
+  timeout_ms?: number;
+}
+
+export async function listHooks(): Promise<{ hooks: HookDefView[] }> {
+  return api.get('/api/v1/hooks');
+}
+
+export async function createHook(def: HookDefView): Promise<void> {
+  await api.post('/api/v1/hooks', def);
+}
+
+export async function deleteHook(id: string): Promise<void> {
+  await api.delete(`/api/v1/hooks/${encodeURIComponent(id)}`);
+}
+
+/** 插件清单。服务端答的是 `PluginManifest` 原样，没有统一的 id 字段——名字即身份。 */
+export interface PluginSummary {
+  name: string;
+  version: string;
+  author: string;
+  capabilities?: { type: string; name?: string; skill_id?: string; backend_type?: string }[];
+  entry: string;
+  signature: string;
+}
+
+export async function listPlugins(): Promise<{ plugins: PluginSummary[] }> {
+  return api.get('/api/v1/plugins');
+}
+
+/**
+ * 装载一个插件。
+ *
+ * 请求体就是清单本身，不带外层包装：处理函数直接按 `PluginManifest` 反序列化，
+ * 包一层 `{manifest: ...}` 只会得到一条 `invalid_manifest`。字节由服务端按清单
+ * 自己去取，所以这一步在插件注册表没配或地址取不到时答的是 400/503。
+ */
+export async function loadPlugin(manifest: unknown): Promise<{
+  plugin_id: string;
+  name: string;
+  status: string;
+}> {
+  return api.post('/api/v1/plugins', manifest);
+}
+
+export async function unloadPlugin(name: string): Promise<void> {
+  await api.delete(`/api/v1/plugins/${encodeURIComponent(name)}`);
+}
+
+export interface WorkspaceSummary {
+  id: string;
+  name: string;
+  owner_id: string;
+  created_at: string;
+}
+
+export interface WorkspaceMemberView {
+  user_id: string;
+  role: string;
+}
+
+interface WorkspaceEnvelope<T> {
+  code: string;
+  data: T;
+}
+
+export async function listWorkspaces(): Promise<WorkspaceSummary[]> {
+  const res = await api.get<WorkspaceEnvelope<{ items: WorkspaceSummary[] }>>('/api/v1/workspaces');
+  return res.data?.items ?? [];
+}
+
+export async function getWorkspace(
+  id: string
+): Promise<WorkspaceSummary & { members: WorkspaceMemberView[] }> {
+  const res = await api.get<WorkspaceEnvelope<WorkspaceSummary & { members: WorkspaceMemberView[] }>>(
+    `/api/v1/workspaces/${encodeURIComponent(id)}`
+  );
+  return res.data;
+}
+
+// `/api/v1/workspaces/{id}/members` 没有单独的客户端函数：`getWorkspace` 答的
+// 详情里已经带着 `members`，两处各声明一遍就有两处会漂。
+
+/** 动作计划：分解出的目标图。`validation` 是服务端按六条 DAG 规则算的，不是界面自己数的。 */
+export interface ActionPlanTaskView {
+  id: string;
+  name: string;
+  skill_id?: string;
+  description?: string;
+  estimated_tokens?: number;
+  skill_gap?: boolean;
+  blocked_by?: string[];
+  blocks?: string[];
+  estimated_seconds?: number;
+}
+
+export interface StoredActionPlanView {
+  id: string;
+  created_at: string;
+  plan: {
+    goal: string;
+    tasks: ActionPlanTaskView[];
+    skills: { id: string; name: string; description: string; tools?: string[] }[];
+    edges: [string, string][];
+  };
+  validation: {
+    entry_nodes: string[];
+    exit_nodes: string[];
+    critical_path_len: number;
+    components: number;
+  } | null;
+}
+
+export async function listActionPlans(): Promise<StoredActionPlanView[]> {
+  const res = await api.get<{ plans: StoredActionPlanView[] }>('/api/v1/action-plan');
+  return res.plans ?? [];
+}
+
+export async function getActionPlan(id: string): Promise<StoredActionPlanView> {
+  return api.get(`/api/v1/action-plan/${encodeURIComponent(id)}`);
+}
+
+export async function createActionPlan(input: {
+  goal: string;
+  tasks?: unknown[];
+  skills?: unknown[];
+  edges?: [string, string][];
+}): Promise<{ id: string }> {
+  return api.post('/api/v1/action-plan', input);
+}
+
+export async function deleteActionPlan(id: string): Promise<void> {
+  await api.delete(`/api/v1/action-plan/${encodeURIComponent(id)}`);
+}
+
+export interface DatasetVersionView {
+  name: string;
+  version: string;
+  object_key: string;
+  content_sha256: string;
+  bytes: number;
+  row_count: number | null;
+  coverage_from: string | null;
+  coverage_to: string | null;
+  source: string;
+  media_type: string;
+  created_at: string;
+}
+
+export async function listDatasetVersions(
+  name: string,
+  limit = 20
+): Promise<{ name: string; count: number; versions: DatasetVersionView[] }> {
+  const res = await api.get<
+    WorkspaceEnvelope<{ name: string; count: number; versions: DatasetVersionView[] }>
+  >(`/api/v1/datasets/${encodeURIComponent(name)}?limit=${limit}`);
+  return res.data;
+}
+
+export interface DatasetCheckView {
+  name: string;
+  version: string;
+  object_key: string;
+  outcome: 'verified' | 'mismatched' | 'missing' | 'unreadable';
+  recorded_sha256?: string;
+  actual_sha256?: string;
+  recorded_bytes?: number;
+  actual_bytes?: number;
+  error?: string;
+}
+
+export interface DatasetVerifyReport {
+  checked: number;
+  verified: number;
+  failed: number;
+  all_verified: boolean;
+  checks: DatasetCheckView[];
+}
+
+/**
+ * 校验对象目录里每一份登记的字节。
+ *
+ * 不通过时服务端答 409——但它答的正文里仍然有那份逐条的检查表，这正是读者要看
+ * 的东西。传输层把非 2xx 一律抛成一条 message，这里把那一段正文捞回来：把一次
+ * 「校验没通过」显示成「请求失败」，读者会以为是网络问题，而事实是有版本对不上。
+ */
+export async function verifyDatasets(limit = 10_000): Promise<DatasetVerifyReport> {
+  try {
+    const res = await api.post<WorkspaceEnvelope<DatasetVerifyReport> | DatasetVerifyReport>(
+      `/api/v1/datasets/verify?limit=${limit}`,
+      {}
+    );
+    if (res && typeof res === 'object' && 'data' in res) {
+      return (res as WorkspaceEnvelope<DatasetVerifyReport>).data;
+    }
+    return res as DatasetVerifyReport;
+  } catch (e) {
+    const err = e as { status?: number; message?: string };
+    if (err.status === 409 && err.message) {
+      try {
+        const parsed = JSON.parse(err.message) as { data?: DatasetVerifyReport };
+        if (parsed.data) return parsed.data;
+      } catch {
+        // 正文不是 JSON 就照原样抛：这一次确实不是「有版本对不上」那种失败。
+      }
+    }
+    throw e;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 任务的十一条状态迁移端点里，控制台用得着的五个
+//
+// 这一组在管理员权限组里：操作者会话读得到任务，但迁不动它的状态。界面照这个
+// 事实把按钮画出来，按不动时服务端会答 403，原文落在输出格里——不按角色把按钮
+// 藏起来，是因为界面拿不到角色，藏起来只会让「为什么没有这个按钮」变成猜。
+// ---------------------------------------------------------------------------
+
+export async function startTask(id: string): Promise<void> {
+  await api.post(`/api/v1/tasks/${encodeURIComponent(id)}/start`, {});
+}
+
+export async function cancelTask(id: string): Promise<string[]> {
+  return api.post(`/api/v1/tasks/${encodeURIComponent(id)}/cancel`, {});
+}
+
+export async function retryTask(id: string): Promise<void> {
+  await api.post(`/api/v1/tasks/${encodeURIComponent(id)}/retry`, {});
+}
+
+/** 把一条任务判为失败。`error` 是给人看的原因，会记在行上。 */
+export async function failTask(
+  id: string,
+  error: string
+): Promise<{ retried: unknown; cancelled: unknown; dlq_pushed: unknown }> {
+  return api.post(`/api/v1/tasks/${encodeURIComponent(id)}/fail`, { error });
+}
+
+export async function deleteTask(id: string): Promise<void> {
+  await api.delete(`/api/v1/tasks/${encodeURIComponent(id)}`);
+}
+
+/**
+ * 让 supervisor 重启 / 终止一个它管着的进程。
+ *
+ * 只对平台自己拉起来的执行者有作用：supervisor 找不到这个 id 时答 404
+ * （`agent not found`），而只在说话时出现的对话员工名下本来就没有常驻进程。
+ * 接口答 202 也只表示**命令已发出**，进程什么时候真的退出由它自己决定。
+ */
+export async function restartAgent(id: string): Promise<void> {
+  await api.post(`/api/v1/agents/${encodeURIComponent(id)}/restart`, {});
+}
+
+export async function killAgent(id: string): Promise<void> {
+  await api.post(`/api/v1/agents/${encodeURIComponent(id)}/kill`, {});
+}
+
+// ---------------------------------------------------------------------------
+// 主管闸门、死信重试、积压清理、演化变更的放行
+//
+// 这四个动作都改变平台自己下一步做什么，而不只是改一张表：闸门停掉派发、
+// 死信把一个任务从死信队列里放回去、清理把一批积压判为取消、放行把一条变更
+// 送进构建与切换。所以界面上每一次都先要人确认，且把响应原文念出来——这些
+// 接口的 200 表示「命令执行了」，含义随动作而异。
+// ---------------------------------------------------------------------------
+
+/** 主管闸门：停掉 / 恢复派发。返回这一次调用是否真的改变了状态。 */
+export async function pauseSupervisorGate(): Promise<{ paused: boolean; was_already_paused: boolean }> {
+  return api.post('/api/v1/supervisor/gate/pause', {});
+}
+
+export async function resumeSupervisorGate(): Promise<{ paused: boolean; was_paused: boolean }> {
+  return api.post('/api/v1/supervisor/gate/resume', {});
+}
+
+export async function getSupervisorGate(): Promise<{ paused: boolean; timestamp: string }> {
+  return api.get('/api/v1/supervisor/gate');
+}
+
+/** 从死信队列取出一个任务并重试。`replayed_from_dlq` 说它是否真在死信里。 */
+export async function retryFromDlq(taskId: string): Promise<{
+  task_id: string;
+  replayed_from_dlq: boolean;
+  status: string;
+}> {
+  return api.post('/api/v1/dlq/retry', { task_id: taskId });
+}
+
+export interface PurgeRequest {
+  /** 只在积压状态里选；终态会被服务端拒绝（清理不是改历史）。 */
+  statuses?: string[];
+  task_type_prefix?: string;
+  older_than_secs?: number;
+  /** 默认 true：只报告会清掉哪些，不动。 */
+  dry_run?: boolean;
+}
+
+export interface PurgeResult {
+  dry_run: boolean;
+  matched: number;
+  matched_ids: string[];
+  cancelled: number;
+  resisted: string[];
+}
+
+export async function purgeTasks(req: PurgeRequest): Promise<PurgeResult> {
+  return api.post('/api/v1/tasks/purge', req);
+}
+
+/** 演化变更的人工放行：通过审核后走提交、构建、切换。 */
+export async function approveEvolutionChange(id: string): Promise<unknown> {
+  return api.post(`/api/v1/evolution/changes/${encodeURIComponent(id)}/approve`, {});
+}
+
+/** 把一条变更应用到工作树并跑测试。 */
+export async function applyEvolutionChange(id: string): Promise<unknown> {
+  return api.post(`/api/v1/evolution/changes/${encodeURIComponent(id)}/apply`, {});
+}
+
+// `/api/v1/evolution/changes/{id}/deploy` 没有对应的客户端函数：它是「应用 +
+// 提交 + 构建 + 切换」的无门版，跳过了人工审批。界面只给走审的「放行」
+// （`approveEvolutionChange`），不在别的入口上再画一个绕过它的按钮。
+
+export async function rollbackEvolution(): Promise<unknown> {
+  return api.post('/api/v1/evolution/rollback', {});
+}
+
+// ---------------------------------------------------------------------------
+// 补齐的面：搜索的形状、知识面检索、监管者队列、钩子健康、记忆时序、
+// 晋级台账，以及对象存储的文件上传。
+//
+// 这些此前只有路由没有入口（或者入口只是一段 `JSON.stringify`）。下面按服务端
+// **实际**答的字段声明，不按想象的：网关的 `MetricSampleView` 只有三格、
+// `QueueStats` 的时钟从第一拍起、晋级台账的 status 是 snake_case 闭集。
+// ---------------------------------------------------------------------------
+
+/** 知识检索的一条命中。`source` 说这一条由哪一层答的（memory:summary / memory:schema / wiki）。 */
+export interface KnowledgeHit {
+  id: string;
+  source: string;
+  title: string;
+  content: string;
+  relevance_score: number;
+}
+
+export interface KnowledgeSearchResponse {
+  results: KnowledgeHit[];
+  count: number;
+}
+
+/** 平台检索的一条命中：doc_id / index / score / highlights / source。 */
+export interface PlatformSearchHit {
+  doc_id: string;
+  index: string;
+  score: number;
+  highlights: string[];
+  source: unknown;
+}
+
+export interface PlatformSearchResponse {
+  query: string;
+  index: string;
+  results: PlatformSearchHit[];
+}
+
+/** 监管者的队列读数：待交接 / 重试 / 死信 / 就绪任务，以及最近一次扩充建议。 */
+export interface SupervisorQueueStats {
+  pending_handoffs: number;
+  retry_count: number;
+  dlq_count: number;
+  ready_tasks: number;
+  /** 监管者最近一次巡检轮次；第一拍之前是 0。 */
+  cycle: number;
+  /**
+   * 最近一次扩充建议，或 null。`null` 有两种来源：还没跑过巡检（看 `cycle`），
+   * 或者跑过但没有越线。它记的是**最后一条事件**，不是「现在负载高不高」。
+   */
+  scale_recommendation: {
+    recommended_agents: number;
+    reason: string;
+    decided_at: string;
+  } | null;
+  timestamp: string;
+}
+
+export async function getSupervisorQueueStats(): Promise<SupervisorQueueStats> {
+  return api.get('/api/v1/supervisor/queue_stats');
+}
+
+/**
+ * 钩子引擎的健康读数。
+ *
+ * `overall` 只反映「引擎装没装」（服务端从 `hook_engine.is_some()` 算出），
+ * 不是一次活的探测——`redis` 那一档的 `status` 也固定是 `unknown`。界面按这个
+ * 事实措辞，不把它说成「健康检查通过」。
+ */
+export interface HooksHealth {
+  overall: 'up' | 'down';
+  tiers: Record<string, { status: string; configured: boolean }>;
+  timestamp: string;
+}
+
+export async function getHooksHealth(): Promise<HooksHealth> {
+  return api.get('/api/v1/hooks/health');
+}
+
+/** 一个指标样本：时间点、操作名、值。counter 的 value 是一次增量，不是累计。 */
+export interface MetricSampleView {
+  timestamp: string;
+  operation: string;
+  value: number;
+}
+
+/**
+ * 记忆操作在最近 `seconds` 秒内的时序。
+ *
+ * `counters` 是 `memory_operations_total` 的样本——每条是一次增量，窗口内求和
+ * 才是这段时间的操作次数；`histograms` 是 `memory_operation_latency_ms`，每条
+ * 是一次观测。量不到与十秒内什么都没发生在这里都是空数组，界面必须说清这个空
+ * 不等于「后端没配」（没配时这条路由答 503）。
+ */
+export interface MemoryMetrics {
+  counters: MetricSampleView[];
+  histograms: MetricSampleView[];
+}
+
+export async function getMemoryMetrics(seconds = 60): Promise<MemoryMetrics> {
+  return api.get(`/api/v1/memory/metrics?seconds=${seconds}`);
+}
+
+/** 记忆检索一次命中的两种形状：结构化的 schema 行，或一段摘要。 */
+export type MemorySearchHit =
+  | { kind: 'schema'; data: { id: string; kind: string; name: string; key: string; confidence: number } }
+  | { kind: 'summary'; data: { id: string; text: string; score: number; confidence: number } };
+
+/**
+ * 在记忆后端里按文本检索，schema 与摘要一起召回。
+ *
+ * 这条路由按向量 + 文本混合排；`embedding` 可以不传（空数组），那时只按文本召回。
+ * 它答的是记忆这一层，与知识检索（`/knowledge/search`）不是同一个后端：知识那一
+ * 条还要过 wiki 与它自己的组合层。
+ */
+export async function searchMemory(query: string, topK = 10): Promise<{ results: MemorySearchHit[] }> {
+  return api.post('/api/v1/memory/search', { query, top_k: topK });
+}
+
+/** 自动晋级运行时开关。`effective_enabled` 是配置总开关与暂停标志的相与。 */
+export interface PromotionSwitchInfo {
+  config_enabled: boolean;
+  paused: boolean;
+  effective_enabled: boolean;
+  updated_at: string | null;
+  note: string;
+}
+
+export async function getPromotionSwitch(): Promise<PromotionSwitchInfo> {
+  return api.get('/api/v1/evolution/promotion/switch');
+}
+
+/** 一键暂停 / 恢复自动晋级；`paused` 立即生效，重启后回落到配置文件值。 */
+export async function setPromotionPaused(paused: boolean, note = ''): Promise<PromotionSwitchInfo> {
+  return api.put('/api/v1/evolution/promotion/switch', { paused, note });
+}
+
+/** 晋级台账的一条：哪个变更、哪一级、谁判的、走到哪一步。 */
+export interface PromotionRecord {
+  id: string;
+  change_id: string;
+  /** l0_config / l1_rollout / l2_approval。 */
+  level: string;
+  gate_kind: string | null;
+  decision_reason: string;
+  cluster: string;
+  status: 'pending' | 'promoted' | 'rolled_back' | 'failed' | 'awaiting_approval';
+  outcome: string;
+  eval_summary: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export async function listPromotions(limit = 100): Promise<{ promotions: PromotionRecord[] }> {
+  return api.get(`/api/v1/evolution/promotions?limit=${limit}`);
+}
+
+/** 单周晋级聚合。`success_rate` 为 null 表示这一周没有完结对局（全在审批中）。 */
+export interface PromotionTrendWeek {
+  week: string;
+  promoted: number;
+  rolled_back: number;
+  failed: number;
+  pending: number;
+  awaiting_review: number;
+  awaiting_by_gate: number;
+  awaiting_over_diff_limit: number;
+  success_rate: number | null;
+}
+
+export interface PromotionTrendReport {
+  generated_at: string;
+  weeks: PromotionTrendWeek[];
+  /** 成功率连降告警；与 `stall_alert` 是两条判据，不合并。 */
+  alert: string | null;
+  /** 停摆告警：连续多个已完成周零晋级。与「系统空闲」不是同一件事。 */
+  stall_alert: string | null;
+}
+
+export async function getPromotionTrend(): Promise<PromotionTrendReport> {
+  return api.get('/api/v1/evolution/promotion/trend');
+}
+
+/** 对象存储里的一份文件：上传成功时服务端连同目录行一起写入。 */
+export interface UploadedFile {
+  file_id: string;
+  uri: string;
+  file_name: string;
+  content_type: string;
+  size: number;
+  content_sha256: string;
+  uploaded_at: string;
+  dataset: { name: string; version: string };
+}
+
+/**
+ * 上传一份文件到对象存储，并写入数据集目录。
+ *
+ * 服务端只认字段名 `file`。对象存储或目录没配时答 503——上传不会写进一份
+ * 没人点得到名的字节，界面照实念出这条拒绝。
+ */
+export async function uploadFile(file: File): Promise<UploadedFile> {
+  const form = new FormData();
+  form.append('file', file);
+  const res = await api.sendForm<{ code: string; data: UploadedFile }>('/api/v1/files/upload', form);
+  return res.data;
+}
+
+// ── 签名钥匙的生命周期 ──
+
+/** 一把钥匙此刻的状态，与 `SecurityKeys::list` 的每一行同形。 */
+export interface SecurityKey {
+  key_id: string;
+  purpose: string;
+  public_key_b64: string;
+  fingerprint: string;
+  /** issued / rotated / revoked */
+  state: string;
+  overlap_until?: string | null;
+  revoked_reason?: string | null;
+}
+
+export async function getSecurityKeys(): Promise<SecurityKey[]> {
+  const body = await api.get<{ keys: SecurityKey[] }>('/api/v1/admin/keys');
+  return body.keys ?? [];
+}
+
+export async function issueSecurityKey(payload: {
+  key_id: string;
+  purpose: string;
+  public_key: string;
+  fingerprint: string;
+  actor: string;
+}): Promise<void> {
+  await api.post('/api/v1/admin/keys', payload);
+}
+
+export async function rotateSecurityKey(payload: {
+  key_id: string;
+  previous_key_id: string;
+  public_key: string;
+  fingerprint: string;
+  overlap_until?: string;
+  actor: string;
+}): Promise<void> {
+  await api.post('/api/v1/admin/keys/rotate', payload);
+}
+
+export async function revokeSecurityKey(payload: {
+  key_id: string;
+  reason: string;
+  actor: string;
+}): Promise<void> {
+  await api.post('/api/v1/admin/keys/revoke', payload);
 }

@@ -1,3 +1,4 @@
+// census-keep: shapes=clocks — 界面上的提示计时（复制成功、提示消失之类）：只影响提示停留多久，不参与任何决定；删掉只是提示不自动消失或一直不消失
 import { useEffect, useRef, useState } from 'react';
 import {
   getLlmStatus,
@@ -12,6 +13,14 @@ interface Preset {
   model: string;
   /** 协议面首猜：保存时后端用真 key 做双协议实证探测，猜错会被纠正 */
   api_style: string;
+  /**
+   * 这只模型公布的上下文窗口（token），保存时随上游条目一起落盘。
+   *
+   * 数来自厂商的模型页（出处写在这一项旁边的注释里，查于 2026-11-18），不是这里
+   * 拍的：换掉这一行等于换掉运行时裁剪的依据。0 = 这一项没有可查的公开规格
+   * （自定义型号、本地模型），运行时就按实测走——第一次超窗的拒收会说出真界。
+   */
+  context_window: number;
 }
 
 // base_url 必须是**完整前缀**，把版本段带在里面：平台自己只往后接最后一段
@@ -20,7 +29,7 @@ interface Preset {
 // 而且错在探测之前，各家的协议探测连不上会读成「这个 key 不行」。
 // model 用各家文档当前给出的调用名，不是界面上展示的型号名。
 const PRESETS: Preset[] = [
-  { label: '自定义', base_url: '', model: '', api_style: 'openai' },
+  { label: '自定义', base_url: '', model: '', api_style: 'openai', context_window: 0 },
   {
     // Kimi for Coding：OpenAI 兼容面在 `/coding/v1`，Anthropic 面在 `/coding`
     // （再拼 `/v1/messages`）。模型名取自这个端点自己的 `/models` 回答，那是唯一
@@ -30,58 +39,78 @@ const PRESETS: Preset[] = [
     // 与写对的名字在额度耗尽期间回的是同一个 429，所以只能照名单写。
     label: 'Kimi（月之暗面）',
     base_url: 'https://api.kimi.com/coding/v1',
+    // 窗口：Kimi 开放平台 kimi-k3 模型文档——1,048,576（k3-256k 变体是 262,144）。
     model: 'k3',
     api_style: 'openai',
+    context_window: 1_048_576,
   },
   {
     // 照文档原样：base_url 是 https://api.deepseek.com，不带 `/v1`；模型名用
     // `deepseek-flash`（旧名 deepseek-v4-flash 已下线）。
     label: 'DeepSeek',
     base_url: 'https://api.deepseek.com',
+    // 窗口：DeepSeek API Docs, Models & Pricing——1M（1,048,576）。
     model: 'deepseek-flash',
     api_style: 'openai',
+    context_window: 1_048_576,
   },
   {
     label: 'OpenAI',
     base_url: 'https://api.openai.com/v1',
+    // 窗口：OpenAI GPT-5.6 Sol 模型页——1,050,000（最大输入 922,000）。
     model: 'gpt-5.6-sol',
     api_style: 'openai',
+    context_window: 1_050_000,
   },
   {
     label: 'Anthropic',
     base_url: 'https://api.anthropic.com/v1',
+    // 窗口：Anthropic Claude Opus 5.5 模型概览——1M，无需 beta 头。
     model: 'claude-opus-5-5',
     api_style: 'anthropic',
+    context_window: 1_000_000,
   },
   {
     label: 'Qwen（通义千问）',
     base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    // 窗口：阿里云百炼 qwen3.8-max 模型文档——1,000,000（最大输入 991,808）。
     model: 'qwen3.8-max',
     api_style: 'openai',
+    context_window: 1_000_000,
   },
   {
     label: '智谱 GLM',
     base_url: 'https://open.bigmodel.cn/api/paas/v4',
+    // 窗口：智谱 AI 开放文档 GLM-5.2——1,048,576。
     model: 'glm-5.2',
     api_style: 'openai',
+    context_window: 1_048_576,
   },
   {
     label: 'MiniMax',
     base_url: 'https://api.minimaxi.com/v1',
+    // 窗口：MiniMax M3 模型页——1,048,576（官方保障至少 512K 可用）。
     model: 'MiniMax-M3',
     api_style: 'openai',
+    context_window: 1_048_576,
   },
   {
     label: '豆包（火山方舟）',
     base_url: 'https://ark.cn-beijing.volces.com/api/v3',
+    // 窗口：火山方舟模型列表——260628 这一版是 256K（262,144）；0915 版才是 1M，
+    // 换型号时要连这一行一起换。
     model: 'doubao-seed-2-1-pro-260628',
     api_style: 'openai',
+    context_window: 262_144,
   },
   {
     label: 'Ollama（本地）',
     base_url: 'http://host.docker.internal:11434/v1',
+    // 窗口：Qwen3 模型卡——32,768 原生（YaRN 可扩到 131,072）；本地实际能收多少
+    // 由 Ollama 的 num_ctx 决定，所以写原生值，超了让拒收把界说出来。
     model: 'qwen3',
     api_style: 'openai',
+    context_window: 32_768,
   },
 ];
 
@@ -193,6 +222,8 @@ export function LlmSetupOverlay({
       api_key: apiKey.trim(),
       api_style: styleHint,
       skip_verify: skipVerify,
+      // 窗口跟着这一项预设走：用户选了哪一行，就落哪一行的厂商规格。
+      context_window: PRESETS[presetIdx]?.context_window ?? 0,
     });
     // 保存只并入：池里没被点名的成员留在原处，所以"改后是哪几家"只能由服务端
     // 写完之后读一遍告诉我们，照着这次填的那一家更新会把别人从这一栏里抹掉。

@@ -61,7 +61,12 @@ const NON_IDENTITY_LABELS: &[&str] = &["__name__", "job", "endpoint", "service",
 /// through the same persistent state machine as infrastructure alerts so
 /// self-discovery sees the observation gap. Kept distinct from configured
 /// rule names so the series-resolution pass never touches these rows.
-pub const EVAL_FAILURE_RULE: &str = "infra_watch_eval_failure";
+///
+/// The string is declared in the shared contract, because the reader that turns
+/// firing rows into work tells this row apart from an ordinary fault by exactly
+/// this name — and both sides spelling it independently is the one way that
+/// reader can silently start treating an observation gap as a system fault.
+pub use cog_core::alerts::EVAL_FAILURE_RULE;
 
 /// This loop's name in the liveness census.
 pub const INFRA_WATCH_LOOP: &str = "infra_watch";
@@ -74,7 +79,8 @@ pub const INFRA_WATCH_LOOP: &str = "infra_watch";
 /// first miss turns that into a close followed by a re-fire, which the receiver
 /// reads as a brand-new alert with a fresh `fired_at` -- a false "it was
 /// resolved and came back" for something that never went away.
-// cap: bound — 少于两拍就关，会让一条没消失的告警读成全新的、带着新 fired_at 的告警，一次「解决过又回来了」的假象
+// cap: fixed — 少于两拍就关，会让一条没消失的告警读成全新的、带着新 fired_at 的告警，一次「解决过又回来了」的假象
+// keep: 删掉后回到「少于两拍就关，会让一条没消失的告警读成全新的、带着新 fired_at 的告警，一次「解决过又回来了」的假象」所描述的情形；由这条约定兜住
 const MISSING_TICKS_BEFORE_CLOSE: u32 = 2;
 
 /// Outlets the watcher drives. Both are optional: with no store the watcher
@@ -97,11 +103,7 @@ pub async fn run_infra_watch_loop(
     http: Arc<dyn cog_core::HttpClient>,
     shutdown: cog_core::ShutdownSignal,
 ) {
-    let interval = Duration::from_secs(
-        config
-            .poll_interval_secs
-            .max(InfraWatchConfig::MIN_POLL_INTERVAL_SECS),
-    );
+    let interval = Duration::from_secs(config.effective_poll_interval_secs());
     // Everything this loop reports is a judgement about other people's series, so
     // its death is the one failure it cannot report: the rules it evaluates go
     // quiet, and a rule that is quiet because nothing is wrong looks exactly like
@@ -515,8 +517,10 @@ async fn close_unattended(
     // One tick of margin either side of the count: a writer that reports every
     // tick leaves a clock at most one interval old, while a key this process
     // stopped seeing carries a clock at least this many intervals old.
+    // 与循环同一个节拍读数：声明 10 秒时循环实际按 30 跑，缺报窗也必须按 30
+    // 算，否则「这条规则没人再报」会比它真的停报早三倍触发。
     let stale_after = chrono::Duration::seconds(
-        (config.poll_interval_secs.max(1) * u64::from(MISSING_TICKS_BEFORE_CLOSE)) as i64,
+        (config.effective_poll_interval_secs() * u64::from(MISSING_TICKS_BEFORE_CLOSE)) as i64,
     );
     let (closing, present): (Unattended, HashSet<String>) = match &outlets.store {
         Some(store) => {
@@ -1123,7 +1127,8 @@ pub async fn query_prometheus(
 fn describe_api_error(body: &[u8]) -> Option<String> {
     /// Prometheus messages embed the whole match group; enough to recognise
     /// the cause, not enough to flood the alert row.
-    // cap: bound — Prometheus 的消息会带上整个匹配组；够认出病因，又不够淹掉告警那一行
+    // cap: fixed — Prometheus 的消息会带上整个匹配组；够认出病因，又不够淹掉告警那一行
+    // keep: 删掉后整个匹配组把告警那一行淹掉；由「够认出病因」兜住
     const MAX_CHARS: usize = 300;
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let kind = v.get("errorType").and_then(|e| e.as_str())?;
@@ -1200,7 +1205,7 @@ pub fn parse_vector_response(body: &serde_json::Value) -> Result<Vec<SeriesSampl
                     .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let value = entry
             .get("value")
             .and_then(|v| v.as_array())
@@ -1606,6 +1611,179 @@ fn top_level_comparison(text: &str) -> Option<(usize, usize)> {
         i += 1;
     }
     None
+}
+
+/// The threshold a rule writes into its own query, as `(operator, value)`.
+///
+/// The rule engine is two stages: the query fetches series, `condition` compares
+/// each value. Only the second stage is the document's own declaration — it is
+/// the field a reader sees, the one the shipped-numbers walk requires a
+/// `_comment_` for, and the one the alert fixture folds into the expression
+/// before asking promtool whether it fires. A number that also ends the query is
+/// a second copy of the same bound: raise the condition and the query still
+/// drops everything below the old line, so the rule keeps firing on the old
+/// number while the document says otherwise. The two only ever agree by
+/// accident, and nothing reds when they stop agreeing.
+///
+/// This finds the comparison that bounds *the value the rule returns*. Outer
+/// parentheses are unwrapped, and when the top-level operator is `and` / `or` /
+/// `unless` the returned value comes from the left operand, so the search
+/// continues there — a guard in the right-hand clause, or one inside a range
+/// selector, is a different fact and is left alone. `None` also covers every
+/// shape this scanner does not recognise: a compound right side
+/// (`6 * max(scan_interval_seconds)`) is a multiple of a measured quantity, not
+/// a written number, and a join modifier rewrites what the comparison means.
+/// `==` / `!=` are not scanned: in this library they are presence filters
+/// (`… {phase="Failed"} == 1`) far more often than bounds, so a hit there would
+/// be noise rather than a finding.
+pub fn threshold_in_query(promql: &str) -> Option<(String, f64)> {
+    let (at, len) = bounding_comparison(promql, 0, promql.len())?;
+    let op = promql[at..at + len].to_string();
+    // The right side runs to the next logical operator at the same level: an
+    // `and` after the number joins whole clauses, it is not part of the bound.
+    let rest = promql[at + len..rhs_end(promql, at + len)].trim_start();
+    let (value, consumed) = written_number(rest)?;
+    let tail = rest[consumed..].trim_end();
+    if tail.chars().any(|c| !matches!(c, ')' | ']' | ' ' | '\t')) {
+        return None; // the right side keeps going: a compound bound, not a number
+    }
+    Some((op, value))
+}
+
+/// Where the operand that starts at `from` ends: the next `and` / `or` /
+/// `unless` at the same parenthesised level, or the end of the text.
+fn rhs_end(text: &str, from: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut i = from;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' | b'`' => i = skip_string(bytes, i),
+            b'(' | b'{' | b'[' => depth += 1,
+            b')' | b'}' | b']' => {
+                if depth == 0 {
+                    return i; // the bound sits inside a group; stop at its close
+                }
+                depth -= 1;
+            }
+            c if depth == 0 && (c.is_ascii_alphabetic() || c == b'_') => {
+                let mut j = i;
+                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    j += 1;
+                }
+                if matches!(&text[i..j], "and" | "or" | "unless") {
+                    return i;
+                }
+                i = j;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// Offsets of the comparison that bounds the value `text[start..end]` returns.
+fn bounding_comparison(text: &str, start: usize, end: usize) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let (mut start, mut end) = trim(text, start, end);
+    // Strip parentheses that wrap the whole expression.
+    while start < end && bytes[start] == b'(' && matching_close(text, start) == Some(end - 1) {
+        (start, end) = trim(text, start + 1, end - 1);
+    }
+    let mut depth = 0i32;
+    let mut i = start;
+    while i < end {
+        match bytes[i] {
+            b'"' | b'\'' | b'`' => i = skip_string(bytes, i),
+            b'(' | b'{' | b'[' => depth += 1,
+            b')' | b'}' | b']' => depth -= 1,
+            b'>' | b'<' if depth == 0 => {
+                let len = 1 + usize::from(bytes.get(i + 1) == Some(&b'='));
+                return Some((i, len));
+            }
+            c if depth == 0 && (c.is_ascii_alphabetic() || c == b'_') => {
+                let mut j = i;
+                while j < end && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    j += 1;
+                }
+                if matches!(&text[i..j], "and" | "or" | "unless") {
+                    return bounding_comparison(text, start, i);
+                }
+                i = j;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn trim(text: &str, start: usize, end: usize) -> (usize, usize) {
+    let bytes = text.as_bytes();
+    let mut start = start;
+    let mut end = end;
+    while start < end && (bytes[start] as char).is_whitespace() {
+        start += 1;
+    }
+    while end > start && (bytes[end - 1] as char).is_whitespace() {
+        end -= 1;
+    }
+    (start, end)
+}
+
+/// The byte index of the `)` closing the `(` at `start`, if it closes one.
+fn matching_close(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' | b'`' => i = skip_string(bytes, i),
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// A PromQL number at the start of `text`, and how many bytes it took.
+fn written_number(text: &str) -> Option<(f64, usize)> {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    if bytes.first() == Some(&b'-') {
+        i = 1;
+    }
+    let digits = i;
+    while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+        i += 1;
+    }
+    if i == digits {
+        return None;
+    }
+    if matches!(bytes.get(i), Some(b'e') | Some(b'E')) {
+        let mut j = i + 1;
+        if matches!(bytes.get(j), Some(b'+') | Some(b'-')) {
+            j += 1;
+        }
+        let exp = j;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > exp {
+            i = j;
+        }
+    }
+    text[..i].parse::<f64>().ok().map(|value| (value, i))
 }
 
 /// Index of the byte that closes a quoted run, so the caller's own advance
@@ -2570,7 +2748,7 @@ mod tests {
             .expect("rules array");
         let mut checked = 0;
         for rule in rules {
-            let promql = rule["promql"].as_str().unwrap_or_default();
+            let promql = rule["promql"].as_str().unwrap_or(Default::default());
             // Labels this rule's own PromQL names: `label="..."` matchers and
             // `by (...)` groupings both keep that label on the sample.
             let mut selected: BTreeSet<String> = BTreeSet::new();
@@ -2599,7 +2777,7 @@ mod tests {
                 }
             }
 
-            let summary = rule["summary"].as_str().unwrap_or_default();
+            let summary = rule["summary"].as_str().unwrap_or(Default::default());
             let mut rest = summary;
             while let Some(open) = rest.find('{') {
                 let after = &rest[open + 1..];
@@ -2650,6 +2828,73 @@ mod tests {
             "规则的比较两侧配不上：它会装载、每拍求值，却一个样本也留不下:\n{}",
             flagged.join("\n")
         );
+    }
+
+    /// 规则的阈值只许写一处：`condition`。
+    ///
+    /// 进程拿查询返回的每个序列的值，再按 `condition` 比一次
+    /// （`AlertCondition::evaluate`）；告警夹具也是把这个条件折进表达式再问 promtool
+    /// 响不响。查询自己再带一个同向的数，就是同一个界写了第二遍——改 `condition` 的人
+    /// 看到规则「没变」，因为查询先把低于旧线的样本丢掉了，而文档读者只看得到
+    /// `condition` 那一格。走随包发布的每一条规则，命中即红。
+    #[test]
+    fn no_shipped_rule_writes_its_own_threshold_into_the_query() {
+        let root = repo_root();
+        let path = root.join("deploy/helm/cogneva/files/cogneva.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("chart JSON parses");
+        let rules = parsed
+            .pointer(cog_core::config_sections::ALERT_RULES_POINTER)
+            .and_then(|v| v.as_array())
+            .expect("rules array");
+        assert!(!rules.is_empty(), "no rules read; the config path moved");
+        let mut flagged: Vec<String> = Vec::new();
+        for rule in rules {
+            let Some(promql) = rule["promql"].as_str() else {
+                continue;
+            };
+            if let Some((op, value)) = threshold_in_query(promql) {
+                flagged.push(format!(
+                    "{}: 查询自己写着 `{op} {value}`，`condition` 另有一份",
+                    rule["name"].as_str().unwrap_or("<unnamed>")
+                ));
+            }
+        }
+        assert!(
+            flagged.is_empty(),
+            "这些规则的界在查询里又写了一遍：改 `condition` 改不动它们的实际阈值。\
+             把查询里那个比较去掉，让 `condition` 成为唯一一处：\n{}",
+            flagged.join("\n")
+        );
+    }
+
+    /// 扫描器认得的那几种形状，逐个钉住：认错的代价是两个方向都坏——把守卫报成阈值
+    /// 会逼人删掉新鲜度判据，把阈值漏掉就等于这条判据不存在。
+    #[test]
+    fn the_query_threshold_scanner_reads_the_returned_value_only() {
+        let one = |promql: &str| threshold_in_query(promql);
+        assert_eq!(
+            one("sum by (namespace) (increase(failures_total[6h])) > 6"),
+            Some((">".to_string(), 6.0))
+        );
+        assert_eq!(one("a >= 200"), Some((">=".to_string(), 200.0)));
+        assert_eq!(
+            one("((max(a) / min_over_time(a[3d:5m])) > 1.05) and (max(a) > 1073741824)"),
+            Some((">".to_string(), 1.05))
+        );
+        // 守卫在右支：返回值来自左边，左支的比较才算界。
+        assert_eq!(
+            one("(max(a) > 0.9) and (time() - max(b) < 1800)"),
+            Some((">".to_string(), 0.9))
+        );
+        assert_eq!(one("a and b > 5"), None);
+        // 量出来的倍数、`bool`、连接修饰语都不是写死的数。
+        assert_eq!(one("a > 6 * max(scan_interval_seconds)"), None);
+        assert_eq!(one("a > bool 0.5"), None);
+        assert_eq!(one("a > on(instance) max(b)"), None);
+        // 字符串里的比较符不是比较。
+        assert_eq!(one("count(a{tier=\">5\"})"), None);
     }
 
     /// 反例取自那条规则**修前**的原文。判据抓不住它，就等于没接上——一条只会给

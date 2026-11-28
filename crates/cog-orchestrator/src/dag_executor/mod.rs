@@ -23,7 +23,8 @@ const DECOMPOSITION_ALERT_PREFIX: &str = "decomposition_";
 /// 当成计划：一条三小时的任务按两个十分钟的样本排成二十分钟，会让它在计划上
 /// 「早就该完了」——一个凭空造出来的落后。样本不够就不排，读数上读作「还没
 /// 样本」，那是真话。
-// cap: bound — 样本不够就不排程；两三个样本排出来的计划会让一条任务在计划上「早就该完了」，那是凭空造出来的落后
+// cap: fixed — 样本不够就不排程；两三个样本排出来的计划会让一条任务在计划上「早就该完了」，那是凭空造出来的落后
+// keep: 删掉后两三个样本就排程，计划上的「早就该完了」是凭空造出来的；由「样本不够就不排程」兜住
 pub const MIN_ESTIMATE_SAMPLES: u64 = 5;
 
 /// 基线版本串里表示「这个数是估的、没有人批过」的那一段。
@@ -80,8 +81,8 @@ pub use circuit_registry::CircuitBreakerRegistry;
 pub use orchestrator::DagExecutor;
 pub use retry_matrix::{BackoffStrategy, CircuitBreakerConfig, RetryConfig, RetryMatrix};
 pub use task_checkpoint::{
-    checkpoint_task, checkpoint_task_with_timeout, CheckpointAgents, CheckpointRound,
-    LiveCheckpointAgents, CHECKPOINT_STEP_TIMEOUT,
+    checkpoint_task, checkpoint_task_expecting, CheckpointAgents, CheckpointRound,
+    LiveCheckpointAgents, CHECKPOINT_STEP_EXPECTATION,
 };
 pub use task_phase::{ExitCriteria, PhaseTransitionRules, PhasedTask, TaskPhase};
 
@@ -107,16 +108,63 @@ pub struct DagExecutorConfig {
 
 impl Default for DagExecutorConfig {
     fn default() -> Self {
+        // 每个数都在 `cog_core::DagExecutorConfig` 里有一份声明（生产装配就走那
+        // 一份）。这里再写一遍就是同一件事的第二个说法，改一处忘一处的那天，
+        // 兜底构造与部署读到的会是两个不同的执行器。
+        let core = cog_core::DagExecutorConfig::default();
         Self {
-            redis_url: String::new(),
-            workspace_id: String::new(),
-            consumer_group: String::new(),
-            max_retries: 3,
-            result_claim_idle_secs: 600,
-            result_claim_interval_secs: 60,
-            result_claim_batch: 16,
-            ready_task_poll_interval_secs: 0,
+            redis_url: core.redis_url,
+            workspace_id: core.workspace_id,
+            consumer_group: core.consumer_group,
+            max_retries: core.max_retries,
+            result_claim_idle_secs: core.result_claim_idle_secs,
+            result_claim_interval_secs: core.result_claim_interval_secs,
+            result_claim_batch: core.result_claim_batch,
+            ready_task_poll_interval_secs: core.ready_task_poll_interval_secs,
         }
+    }
+}
+
+/// 执行器用的重试矩阵：部署声明的节点重试次数就是 DAG 节点那一行的次数。
+///
+/// 矩阵的出厂值只是「没人声明」时的兜底。声明了还按出厂值跑，这个键就是个
+/// 摆设——部署把它改小，节点还是照出厂次数重试；改大，一次也不会多试。
+fn retry_matrix_for(config: &DagExecutorConfig) -> RetryMatrix {
+    let mut matrix = RetryMatrix::defaults();
+    let mut node = matrix.lookup(&cog_core::TaskType::DagNode).clone();
+    node.max_retries = config.max_retries;
+    matrix.set(cog_core::TaskType::DagNode, node);
+    matrix
+}
+
+#[cfg(test)]
+mod retry_matrix_wiring_tests {
+    use super::*;
+
+    /// 部署声明的节点重试次数必须落到矩阵上——这是这个键「生效」的意思。
+    /// 以前它只被拷进结构体，执行器读的是矩阵的出厂值：改这个键，一次重试
+    /// 都不会多也不会少。
+    #[test]
+    fn the_declared_node_retry_count_reaches_the_matrix() {
+        let declared = DagExecutorConfig {
+            max_retries: 7,
+            ..DagExecutorConfig::default()
+        };
+        assert_eq!(
+            retry_matrix_for(&declared).max_retries(&cog_core::TaskType::DagNode),
+            7
+        );
+    }
+
+    /// 没人声明时矩阵读执行器配置的出厂值，而不是自己再写一个数：两处各写
+    /// 一个 3，改一处的那天就分家了。
+    #[test]
+    fn the_factory_matrix_reads_the_executor_config_default() {
+        assert_eq!(
+            retry_matrix_for(&DagExecutorConfig::default())
+                .max_retries(&cog_core::TaskType::DagNode),
+            cog_core::DagExecutorConfig::default().max_retries
+        );
     }
 }
 
@@ -139,7 +187,9 @@ impl Default for DagExecutorConfig {
 /// `reason="pass_ceiling"`: a healthy publisher holds nothing under that label,
 /// and one that holds a large share of every pass is a ceiling that should be
 /// re-tuned or a pool reading that never arrives.
-// cap: bound — 落进 pass_ceiling 标签的计数是它的读数：健康的发布者在那里占用为零，占了大头的说明这个数该重调
+// cap: fixed — 落进 pass_ceiling 标签的计数是它的读数：健康的发布者在那里占用为零，占了大头的说明这个数该重调
+// keep: 删掉后回到「落进 pass_ceiling 标签的计数是它的读数：健康的发布者在那里占用为零，占了大头的说明这个数该重调」所描述的情形；由这条约定兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const READY_TASKS_PER_PASS: u64 = 200;
 
 /// 门类占比量的是最近多少小时的落地。
@@ -147,7 +197,8 @@ const READY_TASKS_PER_PASS: u64 = 200;
 /// 一天：短到能跟住队列今天的形状，长到装得下这个平台一天落一百来条账行的
 /// 量（2026-11-06 实测 24 小时 100 条）。半个小时的窗口在这个速率下只有两三条
 /// 样本，而两条样本算出来的占比是噪声，会让一整类活的座位跟着一次偶然走。
-// cap: derived — 窗口要装下一天的落地量；实测的日落地量变了，这个数跟着变
+// cap: fixed — 窗口要装下一天在这个速率下的落地量（2026-11-06 实测 24 小时 100 条）；速率再低时样本不够，GateShare 回答 None 而不是编一个占比。窗口是钉住的，不是跟着速率动的量
+// keep: 删掉后窗口跟着速率动，速率低时占比样本不够却照样编一个数；由「窗口是钉住的」兜住
 const GATE_SHARE_WINDOW_HOURS: i64 = 24;
 
 /// 门类占比的缓存：量它的时刻，与那次量到的答案。
@@ -161,7 +212,8 @@ type GateShareCache =
 ///
 /// 发布者的节拍是秒级，而落地数在十分钟里不会变出第二种答案：每拍问一次就是
 /// 拿一整类活的节拍去换一个十位数，而库已经在为别的读超时。
-// cap: bound — 只挡重复读；把账问得更勤换不到更早的答案，只会让库多一次超时
+// cap: fixed — 只挡重复读；把账问得更勤换不到更早的答案，只会让库多一次超时
+// keep: 删掉后每读一次都问账，库多一次超时换不到更早的答案；由「只挡重复读」兜住
 const GATE_SHARE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// How long the goal consumer holds before pulling the next goal when the
@@ -173,7 +225,8 @@ const GATE_SHARE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs
 /// waking, the same pool verdict is read again and a pool still down is refused
 /// without spending an LLM call. The cap is what makes the hold safe, not what
 /// makes it cheap.
-// cap: bound — 等待是池子自己说的「何时能再服务」，可以是小时级（月度配额）；扣满它会让 intake 对提前恢复失聪，而唤醒后那一问不花一次调用，没有读数应该把这个数移动
+// cap: fixed — 等待是池子自己说的「何时能再服务」，可以是小时级（月度配额）；扣满它会让 intake 对提前恢复失聪，而唤醒后那一问不花一次调用，没有读数应该把这个数移动
+// keep: 删掉后扣满池子的等待，intake 对提前恢复失聪；由「等待是池子自己说的」兜住
 const GOAL_CONSUMER_MAX_HOLD: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// What one pass may admit, together with the reading it was derived from.
@@ -313,34 +366,37 @@ fn hold_back_message(admitted: u64) -> &'static str {
     }
 }
 
+/// 三条声明的节拍各就各位：只有 0 被拒，其余原样用。
+///
+/// 0 秒的扫描是忙等，0 秒的停滞窗让每个刚出现的占位符立刻算孤儿——两者都不是
+/// 「越快越好」的极端，所以拒绝而不是替换成一个没人声明的数（从前它们被静默
+/// 抬到 30 与 60）。dwell 的下限是一次扫描周期，这条下限由扫描周期自己给出：
+/// 短于它的告警可能在两次扫描之间亮起又灭掉，消费者一次也轮询不到。
+fn reconciler_cadence(poll_secs: u64, stall_secs: u64, dwell_secs: u64) -> Option<(u64, u64, u64)> {
+    if poll_secs == 0 || stall_secs == 0 {
+        return None;
+    }
+    Some((poll_secs, stall_secs, dwell_secs.max(poll_secs)))
+}
+
 impl DagExecutorRuntime {
+    /// 具体后端类型的入口：与 [`Self::new_with_dyn_backend`] 同一套装配。
+    ///
+    /// 装配走同一条路，不是两段各写一遍的构造——两段会分家，第二段少配一样
+    /// 东西的那天，用哪个人口构造出来的执行器就是两个行为。
     pub fn new_with_backend(
         config: DagExecutorConfig,
         backend: impl MessageBackend + 'static,
     ) -> Self {
-        let orchestrator = DagExecutor::new(config.workspace_id.clone());
-        Self {
-            config,
-            backend: Arc::new(backend),
-            orchestrator: Arc::new(orchestrator),
-            action_planner: None,
-            skill_registry: None,
-            pool_source: Arc::new(tokio::sync::OnceCell::new()),
-            observability: Arc::new(tokio::sync::OnceCell::new()),
-            change_ledger: Arc::new(tokio::sync::OnceCell::new()),
-            gate_share: Arc::new(std::sync::Mutex::new(None)),
-            gate_last_admitted_unix: Arc::new(std::sync::atomic::AtomicI64::new(
-                chrono::Utc::now().timestamp(),
-            )),
-            board_wip_limits: load_board_wip_limits(),
-        }
+        Self::new_with_dyn_backend(config, Arc::new(backend))
     }
 
     pub fn new_with_dyn_backend(
         config: DagExecutorConfig,
         backend: Arc<dyn MessageBackend>,
     ) -> Self {
-        let orchestrator = DagExecutor::new(config.workspace_id.clone());
+        let orchestrator = DagExecutor::new(config.workspace_id.clone())
+            .with_retry_matrix(retry_matrix_for(&config));
         Self {
             config,
             backend,
@@ -536,7 +592,9 @@ impl DagExecutorRuntime {
                 return Ok(());
             }
         }
-        let work = self.orchestrator.ready_work().await;
+        // 读不出来就带着库的原话收口：折成空图的那一趟与一次正常的空扫描
+        // 同形，而派发恰恰是靠这一趟发现「没人可放」的。
+        let work = self.orchestrator.ready_work_checked().await?;
         let columns = work.columns;
         let (ready_tasks, in_flight) = (work.ready, work.in_flight);
         let window_jobs = pays_for.and_then(|bound| bound.window_jobs);
@@ -1512,7 +1570,7 @@ impl DagExecutorRuntime {
         // 阈值必须大于最长处理时长，否则正在处理的消息会被并发重投；重投是
         // at-least-once，已终态任务会被上面的拒绝分支 ack 丢弃，不会重复迁移。
         let claim_idle_ms = self.config.result_claim_idle_secs.saturating_mul(1000);
-        let interval_secs = self.config.result_claim_interval_secs.max(1);
+        let interval_secs = self.config.result_claim_interval_secs;
         // 观测面单独成任务，不搭清扫器的节拍：这个循环会在 tick 里就地 await
         // 一条重投消息的完整处理（可能几十分钟），测量挂在同一根节拍上就等于
         // "处理得越久，指标越静止"，而抓取面上一条静止的序列和一条干净流量的
@@ -1690,11 +1748,21 @@ impl DagExecutorRuntime {
     /// restaffing pass wrote onto the row -- is the one that has the result.
     /// Asking [`crate::ready_queue::carries_an_owner`] rather than testing the
     /// lane again keeps this check and the two dispatch gates on one answer.
-    async fn result_names_another_owner(&self, task_id: &str, sender: &str) -> bool {
-        match self.orchestrator.get_task(task_id).await {
+    ///
+    /// 行上那一格写的是**工号**，交活的人可能是同一个人这一段的座位
+    /// （`squad:<任务>-<座位>`）。座位名里没有工号，只有名册行答得出来，所以
+    /// 「是不是他」要问 [`DagExecutor::claimant_person`]；名册读不到时它答
+    /// `None`，这里就退回旧口径（名字要比得一模一样）——读不到名册不是判据
+    /// 说「不行」。
+    async fn result_names_another_owner(&self, task_id: &str, sender: &str) -> SFResult<bool> {
+        Ok(match self.orchestrator.get_task_checked(task_id).await? {
             Some(task) if crate::ready_queue::carries_an_owner(&task) => {
                 match task.owner_unit.as_deref() {
-                    Some(owner) => owner != sender,
+                    Some(owner) => {
+                        owner != sender
+                            && self.orchestrator.claimant_person(sender).await.as_deref()
+                                != Some(owner)
+                    }
                     None => false,
                 }
             }
@@ -1702,7 +1770,7 @@ impl DagExecutorRuntime {
             // An unknown task is not this check's business: the transition
             // below rejects it on its own terms, with its own log line.
             None => false,
-        }
+        })
     }
 
     async fn handle_result_message(
@@ -1751,13 +1819,26 @@ impl DagExecutorRuntime {
                 sender,
                 ..
             } => {
-                if self.result_names_another_owner(&task_id, &sender).await {
-                    tracing::warn!(
-                        task_id = %task_id, sender = %sender, msg_id = %msg_id,
-                        "result message names a task owned by another unit; dropping it"
-                    );
-                    self.ack_result(result_stream, group_name, msg_id).await;
-                    return;
+                match self.result_names_another_owner(&task_id, &sender).await {
+                    Ok(true) => {
+                        tracing::warn!(
+                            task_id = %task_id, sender = %sender, msg_id = %msg_id,
+                            "result message names a task owned by another unit; dropping it"
+                        );
+                        self.ack_result(result_stream, group_name, msg_id).await;
+                        return;
+                    }
+                    Ok(false) => {}
+                    // 读不到就判不了「这一行是不是别人的」。丢是唯一不可逆的那一步
+                    // ——ack 之后这条结果再也不会回来——所以不 ack，让重投再来一次：
+                    // 与本函数下面 `complete_task` 的其它错误同一处置。
+                    Err(e) => {
+                        tracing::warn!(
+                            task_id = %task_id, sender = %sender, msg_id = %msg_id,
+                            "cannot read the task this result names; leaving it for redelivery: {e}"
+                        );
+                        return;
+                    }
                 }
                 match self
                     .orchestrator
@@ -1802,13 +1883,23 @@ impl DagExecutorRuntime {
                 sender,
                 ..
             } => {
-                if self.result_names_another_owner(&task_id, &sender).await {
-                    tracing::warn!(
-                        task_id = %task_id, sender = %sender, msg_id = %msg_id,
-                        "failure message names a task owned by another unit; dropping it"
-                    );
-                    self.ack_result(result_stream, group_name, msg_id).await;
-                    return;
+                match self.result_names_another_owner(&task_id, &sender).await {
+                    Ok(true) => {
+                        tracing::warn!(
+                            task_id = %task_id, sender = %sender, msg_id = %msg_id,
+                            "failure message names a task owned by another unit; dropping it"
+                        );
+                        self.ack_result(result_stream, group_name, msg_id).await;
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            task_id = %task_id, sender = %sender, msg_id = %msg_id,
+                            "cannot read the task this failure names; leaving it for redelivery: {e}"
+                        );
+                        return;
+                    }
                 }
                 match self
                     .orchestrator
@@ -2094,11 +2185,17 @@ impl DagExecutorRuntime {
             tracing::info!("decomposition orphan reconciler disabled by config");
             return;
         }
-        let interval_secs = poll_interval_secs.max(30);
-        let stall_secs = stall_after_secs.max(60);
-        // The alert consumer polls independently; a dwell shorter than one scan
-        // interval could elude every poll. Default dwell is two intervals.
-        let dwell_secs = alert_dwell_secs.max(interval_secs);
+        let Some((interval_secs, stall_secs, dwell_secs)) =
+            reconciler_cadence(poll_interval_secs, stall_after_secs, alert_dwell_secs)
+        else {
+            tracing::error!(
+                poll_interval_secs,
+                stall_after_secs,
+                "decomposition orphan reconciler not started: a declared cadence is 0 seconds, \
+                 which is a busy loop (or every pending placeholder is an orphan the moment it appears)"
+            );
+            return;
+        };
         tracing::info!(
             interval_secs,
             stall_after_secs = stall_secs,
@@ -2318,7 +2415,19 @@ async fn orphan_reconcile_tick(
         if now < watch.resolve_after {
             continue;
         }
-        let task = orchestrator.get_task(&watch.parent_id).await;
+        // 读不到父行时不能把这一条当成「任务已经不在了」收掉：那正是这一族
+        // 的缺陷——读失败与「行真的没了」在返回值上同形，而收掉一条正在响的
+        // 告警是这一趟里唯一不可逆的决定。这一趟跳过它，下一趟再问。
+        let task = match orchestrator.get_task_checked(&watch.parent_id).await {
+            Ok(task) => task,
+            Err(e) => {
+                tracing::warn!(
+                    alert = %key, parent = %watch.parent_id,
+                    "cannot read the task this alert watches; it keeps firing this pass: {e}"
+                );
+                continue;
+            }
+        };
         // An anchor is re-filed every round and never settles, so it is not a
         // placeholder anything is waiting on: retire the row rather than leave
         // it firing on a verdict -- "nothing will ever finish this" -- that is
@@ -2390,9 +2499,20 @@ async fn wbs_verdict_no_longer_holds(
     let Some(goal_id) = goal_id else {
         return false;
     };
-    let plan: Vec<cog_core::AtomicTask> = orchestrator
-        .get_all_tasks()
-        .await
+    // 行表读不出来时不能答「判词不再成立」：那会把一条仍然成立的告警撤掉，
+    // 而撤掉是这一趟里唯一不可逆的一步。也答不出「成立」以外的第三种答案，
+    // 所以这一趟维持原样、把读失败说出来，下一趟再判。
+    let rows = match orchestrator.all_tasks_checked().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                goal_id = %goal_id,
+                "cannot read the rows to re-check a WBS verdict; it stands this pass: {e}"
+            );
+            return false;
+        }
+    };
+    let plan: Vec<cog_core::AtomicTask> = rows
         .iter()
         .filter(|task| task.goal_id.as_deref() == Some(goal_id))
         .map(|task| cog_core::AtomicTask {
@@ -2405,10 +2525,19 @@ async fn wbs_verdict_no_longer_holds(
             blocked_by: task.blocked_by.clone(),
             blocks: task.blocks.clone(),
             input: task.input.clone(),
+            terminal: String::new(),
+            now: String::new(),
+            gap: String::new(),
             output_entities: Vec::new(),
             estimated_seconds: 0,
             parent_id: task.parent_task_id.clone(),
             acceptance: task.acceptance.clone(),
+            // 从任务行反推工作包时，声明随它一起走：`Unstated` 就是空，
+            // 不在这里补一个词。
+            delivers: match task.deliverable() {
+                cog_core::Deliverable::Unstated => None,
+                other => Some(other.as_str().to_string()),
+            },
         })
         .collect();
     if plan.is_empty() {
@@ -2421,7 +2550,7 @@ async fn wbs_verdict_no_longer_holds(
 mod consumer_ack_tests {
     use super::*;
     use async_trait::async_trait;
-    use cog_core::{MessageStream, Observable};
+    use cog_core::{AgentRegistry, MessageStream, Observable};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -2574,7 +2703,7 @@ mod consumer_ack_tests {
                 .lock()
                 .unwrap()
                 .remove(subject)
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             let stream =
                 futures::stream::iter(queue.into_iter().map(Ok)).chain(futures::stream::pending());
             Ok(Box::pin(stream))
@@ -2703,6 +2832,9 @@ mod consumer_ack_tests {
             task_type: cog_core::TaskType::DagNode,
             status: cog_core::TaskStatus::Pending,
             input,
+            terminal: String::new(),
+            now: String::new(),
+            gap: String::new(),
             result: None,
             error: None,
             error_cause: None,
@@ -2718,7 +2850,7 @@ mod consumer_ack_tests {
             max_retries: 1,
             retry_not_before: None,
             started_at: None,
-            timeout_seconds: 30,
+            declared_duration_seconds: 30,
             lease_owner: None,
             lease_expires_at: None,
             action_planner_meta: None,
@@ -3332,21 +3464,86 @@ mod consumer_ack_tests {
         assert!(
             !runtime
                 .result_names_another_owner("task-lane", "unit-8b")
-                .await,
+                .await
+                .expect("读得到的时候这一问没有第二种答案"),
             "the lane's whole point is that whoever is free runs it, so that \
              unit's result is the row's result"
         );
         assert!(
             runtime
                 .result_names_another_owner("task-plain", "unit-8b")
-                .await,
+                .await
+                .expect("读得到的时候这一问没有第二种答案"),
             "outside the lane the owner check still refuses a stranger's result"
         );
         assert!(
             !runtime
                 .result_names_another_owner("task-plain", "unit-f5")
-                .await,
+                .await
+                .expect("读得到的时候这一问没有第二种答案"),
             "and the owner's own result is still accepted"
+        );
+    }
+
+    /// 座位交回的结果算它背后那个人的：行上写的是工号，交活的是座位。
+    ///
+    /// 同一个人的另一把椅子、以及这个人的工号本身都算行上那位；另一个人的
+    /// 座位不算。名册读不到时退回旧口径（名字要比得一模一样），这条用例钉的
+    /// 是读得到的那一半。
+    #[tokio::test]
+    async fn a_seats_result_counts_as_its_persons() {
+        let backend = ScriptedBackend::default();
+        let config = DagExecutorConfig {
+            redis_url: "memory".into(),
+            workspace_id: "ws-seat-result".into(),
+            consumer_group: "grp-seat-result".into(),
+            max_retries: 1,
+            ..DagExecutorConfig::default()
+        };
+        let runtime = test_runtime_with(backend.clone(), config);
+        // 负责人写在任务行上（`agent_id`）：座位背后是谁由这一格回答。
+        let mut bound = ready_task("task-seat", serde_json::json!({}));
+        bound.agent_id = Some("E0412".into());
+        bound.owner_unit = Some("E0412".into());
+        runtime
+            .orchestrator()
+            .submit_goal("goal-seat-result", vec![bound])
+            .await
+            .unwrap();
+
+        // 座位代表谁由它所属的那件活的负责人回答：同一件活的每一把椅子
+        // 都是行上那位；另一件活上的椅子才是别人。
+        let mut foreign = ready_task("task-foreign", serde_json::json!({}));
+        foreign.agent_id = Some("E0455".into());
+        runtime
+            .orchestrator()
+            .submit_goal("goal-seat-elsewhere", vec![foreign])
+            .await
+            .unwrap();
+
+        let same_person = cog_core::agent_id_for("task-seat", cog_core::roles::GENERATOR);
+        let other_person = cog_core::agent_id_for("task-foreign", cog_core::roles::EVALUATOR);
+
+        assert!(
+            !runtime
+                .result_names_another_owner("task-seat", &same_person)
+                .await
+                .expect("读得到的时候这一问没有第二种答案"),
+            "同一个人换一把椅子交活，交的仍是行上那位的活"
+        );
+        assert!(
+            runtime
+                .result_names_another_owner("task-seat", &other_person)
+                .await
+                .expect("读得到的时候这一问没有第二种答案"),
+            "另一个人的座位交的不是行上那位的活"
+        );
+        assert!(
+            !runtime
+                .result_names_another_owner("task-seat", "E0412")
+                .await
+                .expect("读得到的时候这一问没有第二种答案"),
+            "工号本人交活照旧算数"
         );
     }
 
@@ -3443,7 +3640,7 @@ mod consumer_ack_tests {
         let handle = tokio::spawn(async move { runtime.run_consumer(shutdown_clone).await });
         let acks = wait_for_acks(&backend, 1).await;
         shutdown.trigger();
-        let _ = handle.await.unwrap();
+        cog_core::ignore_lost!(handle.await.unwrap());
 
         assert_eq!(acks, vec!["rid-1".to_string()]);
     }
@@ -3463,7 +3660,7 @@ mod consumer_ack_tests {
         let handle = tokio::spawn(async move { runtime.run_consumer(shutdown_clone).await });
         let acks = wait_for_acks(&backend, 1).await;
         shutdown.trigger();
-        let _ = handle.await.unwrap();
+        cog_core::ignore_lost!(handle.await.unwrap());
 
         assert_eq!(acks, vec!["rid-poison".to_string()]);
     }
@@ -3489,7 +3686,7 @@ mod consumer_ack_tests {
         let handle = tokio::spawn(async move { runtime.run_consumer(shutdown_clone).await });
         wait_for_acks(&backend, 1).await;
         shutdown.trigger();
-        let _ = handle.await.unwrap();
+        cog_core::ignore_lost!(handle.await.unwrap());
 
         let writes = backend.dlq_writes();
         assert_eq!(writes.len(), 1, "一条毒消息对应一笔死信写");
@@ -3536,6 +3733,9 @@ mod consumer_ack_tests {
             task_type: cog_core::TaskType::DagNode,
             status: cog_core::TaskStatus::Pending,
             input: serde_json::json!({}),
+            terminal: String::new(),
+            now: String::new(),
+            gap: String::new(),
             result: None,
             error: None,
             error_cause: None,
@@ -3551,7 +3751,7 @@ mod consumer_ack_tests {
             max_retries: 1,
             retry_not_before: None,
             started_at: None,
-            timeout_seconds: 30,
+            declared_duration_seconds: 30,
             lease_owner: None,
             lease_expires_at: None,
             action_planner_meta: None,
@@ -3600,7 +3800,7 @@ mod consumer_ack_tests {
         let handle = tokio::spawn(async move { runtime.run_consumer(shutdown_clone).await });
         let acks = wait_for_acks(&backend, 1).await;
         shutdown.trigger();
-        let _ = handle.await.unwrap();
+        cog_core::ignore_lost!(handle.await.unwrap());
 
         assert_eq!(acks, vec!["rid-pending".to_string()]);
         // The point is the state transition, not merely draining the entry.
@@ -3666,7 +3866,7 @@ mod consumer_ack_tests {
         let handle = tokio::spawn(async move { runtime.run_consumer(shutdown_clone).await });
         let metrics = wait_for_stream_metrics(&stream).await;
         shutdown.trigger();
-        let _ = handle.await.unwrap();
+        cog_core::ignore_lost!(handle.await.unwrap());
 
         let of = |name: &str| {
             metrics
@@ -3750,7 +3950,7 @@ mod consumer_ack_tests {
         }
         let calls = backend.pending_stats_calls();
         shutdown.trigger();
-        let _ = handle.await;
+        cog_core::ignore_lost!(handle.await);
 
         // The round really is stuck, so those readings cannot have come from it:
         // a round that had returned would have taken the message back and acked
@@ -3788,7 +3988,7 @@ mod consumer_ack_tests {
         let handle = tokio::spawn(async move { runtime.run_goal_consumer(shutdown_clone).await });
         let acks = wait_for_acks(&backend, 1).await;
         shutdown.trigger();
-        let _ = handle.await.unwrap();
+        cog_core::ignore_lost!(handle.await.unwrap());
 
         assert_eq!(acks, vec!["gid-1".to_string()]);
     }
@@ -3845,7 +4045,7 @@ mod consumer_ack_tests {
         let handle = tokio::spawn(async move { runtime.run_goal_consumer(shutdown_clone).await });
         let acks = wait_for_acks(&backend, 1).await;
         shutdown.trigger();
-        let _ = handle.await.unwrap();
+        cog_core::ignore_lost!(handle.await.unwrap());
 
         assert_eq!(acks, vec!["gid-refused".to_string()]);
     }
@@ -4917,7 +5117,7 @@ mod orphan_reconciler_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         shutdown.trigger();
-        let _ = handle.await;
+        cog_core::ignore_lost!(handle.await);
 
         assert!(
             recording
@@ -4987,7 +5187,7 @@ mod orphan_reconciler_tests {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
         shutdown.trigger();
-        let _ = handle.await;
+        cog_core::ignore_lost!(handle.await);
 
         assert!(
             resolved,
@@ -5037,7 +5237,7 @@ mod orphan_reconciler_tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         shutdown.trigger();
-        let _ = handle.await;
+        cog_core::ignore_lost!(handle.await);
 
         assert!(
             !recording
@@ -5252,5 +5452,34 @@ mod hold_back_tests {
                  与它互相否证，而读者按文字行事"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod reconciler_cadence_tests {
+    use super::reconciler_cadence;
+
+    /// 声明的扫描与停滞窗原样生效（从前被静默抬到 30/60）；只有 0 被拒。
+    #[test]
+    fn a_declared_cadence_survives_and_only_zero_is_refused() {
+        assert_eq!(
+            reconciler_cadence(5, 45, 10),
+            Some((5, 45, 10)),
+            "声明的节拍不许被改写"
+        );
+        assert_eq!(reconciler_cadence(0, 60, 30), None, "0 秒扫描是忙等");
+        assert_eq!(
+            reconciler_cadence(30, 0, 30),
+            None,
+            "0 秒停滞窗让每个占位符立刻算孤儿"
+        );
+    }
+
+    /// 告警停留的下限是一次扫描周期，由扫描周期自己给出：短于它的告警可能
+    /// 在两次扫描之间亮起又灭掉。
+    #[test]
+    fn the_alert_dwell_is_floored_by_the_scan_it_must_outlive() {
+        assert_eq!(reconciler_cadence(300, 1800, 10), Some((300, 1800, 300)));
+        assert_eq!(reconciler_cadence(300, 1800, 600), Some((300, 1800, 600)));
     }
 }

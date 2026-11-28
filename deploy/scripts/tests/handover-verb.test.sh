@@ -119,10 +119,24 @@ out="$(python3 "$gate" "$d" 2>&1)"; rc=$?
 ck_rc "段内零处提到操作者 ⇒ 3，不是 0" 3 "$rc"
 ck_has "说清判的是零句" "$out" "一处都没提到操作者"
 
+# ---- case 6b: 两份 README 都不在 ----
+# 干净的检出里这两份文件不跟踪。没有可判的东西时说一句未判、退出 0；只少一份仍是 3。
+d="$work/absent"; mkdir -p "$d"
+out="$(python3 "$gate" "$d" 2>&1)"; rc=$?
+ck_rc "两份都不在 ⇒ 未判、退出 0" 0 "$rc"
+ck_has "说清是未判" "$out" "未判"
+
 # ---- case 7: 真树 ----
-out="$(cd "$repo" && python3 "$gate" . 2>&1)"; rc=$?
-ck_rc "真树的两段都干净" 0 "$rc"
-ck_has "真树里两段都进了判据" "$out" "sections=2"
+# 本地留着这两份文件就地判它们；干净的检出里它们不在，那就是未判。
+if [ -f "$repo/README.md" ] && [ -f "$repo/README.zh-CN.md" ]; then
+    out="$(cd "$repo" && python3 "$gate" . 2>&1)"; rc=$?
+    ck_rc "真树的两段都干净" 0 "$rc"
+    ck_has "真树里两段都进了判据" "$out" "sections=2"
+else
+    out="$(cd "$repo" && python3 "$gate" . 2>&1)"; rc=$?
+    ck_rc "真树没有这两份 README 时是未判" 0 "$rc"
+    ck_has "说清是未判" "$out" "未判"
+fi
 
 printf '\nhandover-verb.test: %d passed / %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

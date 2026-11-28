@@ -62,6 +62,7 @@ impl AgentScaffold for CodeAct {
         ACTION_SPACE
     }
 
+    // prompt: fixed — 评测 scaffold 的基线提示词：对照实验的方法本身，改了就换了题目
     async fn solve(&self, case: &EvalCase, ctx: &SolveContext) -> anyhow::Result<AgentOutput> {
         let tool = code_tool(&ctx.tools, ACTION_SPACE).ok_or_else(|| {
             anyhow::anyhow!(

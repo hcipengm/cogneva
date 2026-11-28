@@ -732,6 +732,13 @@ function NodeDetail({
         </span>
       </div>
 
+      {node.pods_without_usage != null && node.pods_without_usage > 0 && (
+        <p className="text-[10.5px] text-[var(--muted)]">
+          用量和里少 <span className="mono">{node.pods_without_usage}</span> 个 Pod：这一拍还没采到样，
+          上面那个数是量到的那些加起来，是个下界。
+        </p>
+      )}
+
       {node.census_containers != null && (
         <p className="text-[10.5px] text-[var(--muted)]">
           采集器看到 <span className="mono">{node.census_containers}</span> 个容器
@@ -741,7 +748,8 @@ function NodeDetail({
               个没有任何 Pod 认领
             </>
           )}
-          。
+          。进程数按条数收：下面写成 <span className="mono">64/137</span>{' '}
+          时，斜杠前是列出的条数，后面是它实际跑着几个。
         </p>
       )}
 
@@ -749,7 +757,11 @@ function NodeDetail({
         <ul className="space-y-0.5">
           {node.unclaimed.map((row) => (
             <li key={row.id} className="mono text-[10px] text-[var(--muted)]">
-              {row.id} · {row.processes} 个进程
+              {row.id} · {row.processes}
+              {row.processes_total != null && row.processes_total > row.processes
+                ? `/${row.processes_total}`
+                : ''}{' '}
+              个进程
               {row.commands.length > 0 && <> · {row.commands.join(' / ')}</>}
             </li>
           ))}

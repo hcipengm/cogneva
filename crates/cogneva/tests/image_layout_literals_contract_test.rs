@@ -154,7 +154,7 @@ fn the_host_directories_are_the_ones_the_chart_declares() {
     let gateway = std::fs::read_to_string(
         repo_root().join("deploy/helm/cogneva/templates/security-gateway.yaml"),
     )
-    .unwrap_or_default();
+    .unwrap_or(Default::default());
     assert!(
         gateway.contains(cog_core::paths::GIT_MIRROR_ROOT),
         "security-gateway 模板里没有 {}, 镜像根常量指向一个 chart 从不使用的目录",

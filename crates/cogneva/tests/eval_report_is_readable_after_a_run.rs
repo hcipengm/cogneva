@@ -142,7 +142,7 @@ async fn a_run_leaves_a_report_that_the_listing_and_the_reader_can_both_find() {
         "读面要给出渲染过的正文：{report}"
     );
 
-    std::fs::remove_dir_all(&data_dir).ok();
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&data_dir));
 }
 
 #[tokio::test]
@@ -177,7 +177,7 @@ async fn a_second_run_adds_a_second_report_instead_of_replacing_the_first() {
     );
     assert_ne!(reports[0]["id"], reports[1]["id"]);
 
-    std::fs::remove_dir_all(&data_dir).ok();
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&data_dir));
 }
 
 #[tokio::test]
@@ -201,5 +201,5 @@ async fn a_deployment_that_never_ran_an_eval_lists_nothing_and_names_its_directo
         "空列表要说出它读的是哪个目录，读者才分得清「这里空」与「读错地方」：{listing}"
     );
 
-    std::fs::remove_dir_all(&data_dir).ok();
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&data_dir));
 }

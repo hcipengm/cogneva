@@ -64,7 +64,7 @@ use cog_test_support::{database_url, drop_schema, own_schema, schema_pool};
 async fn seed(pool: &PgPool) {
     sqlx::query(
         "INSERT INTO cog_metrics_samples (metric_type, name, value, labels, timestamp)
-         SELECT 'gauge', $1, g::float8, jsonb_build_object('series', (g % $2)::text),
+         SELECT 'gauge', $1, g::float8, jsonb_build_object('series', (g % $2)::text)::text,
                 NOW() - make_interval(secs => g::float8)
          FROM generate_series(0, $3 - 1) AS g",
     )

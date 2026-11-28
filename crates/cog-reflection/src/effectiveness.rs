@@ -255,9 +255,6 @@ mod tests {
         registry.insert_skill_config(cog_core::SkillConfig {
             skill_id: skill_id.to_string(),
             name: skill_id.to_string(),
-            system_prompt: String::new(),
-            tools: Vec::new(),
-            max_iterations: Some(1),
             role_type: "role".to_string(),
         });
         registry
@@ -355,7 +352,7 @@ mod tests {
             Ok(tasks.into_iter().map(|task| task.id).collect())
         }
 
-        async fn row(&self, _id: &str) -> Option<cog_core::Task> {
+        async fn row(&self, _id: &str) -> cog_core::SFResult<Option<cog_core::Task>> {
             let mut row = cog_core::Task::new(
                 "counting",
                 cog_core::TaskType::Custom("counting".into()),
@@ -363,7 +360,7 @@ mod tests {
             );
             row.status = cog_core::TaskStatus::Completed;
             row.result = Some(serde_json::json!({ "result": "{}" }));
-            Some(row)
+            Ok(Some(row))
         }
     }
 

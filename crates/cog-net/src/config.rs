@@ -67,14 +67,30 @@ impl HttpClientConfig {
     }
 }
 
+// 十秒：TCP 三次握手在最坏的跨网段往返上的上限——再短，一次正常的网络抖动就被
+// 判成「对端不可达」；再长，「对端根本没起来」会一直拖到整体请求超时才暴露。
+// cap: fixed — 十秒：跨网段握手的最坏往返；再短误判不可达，再长拖成整体超时
+// keep: 删掉后不可达的连接会等内核放弃（分钟级），把整体拖成超时；由「跨网段最坏往返」兜住
+// wall: wait=TCP handshake; on-timeout=the connect fails with a network error; resume=yes, the caller may retry
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+// 三十二：同时向同一个提供方在飞的请求数就是每个主机的空闲连接上限该覆盖的峰值，
+// 再多只是让提供方替我们占着文件描述符。
+// cap: fixed — 三十二：同一提供方在飞请求数的峰值；再多只是替提供方占 fd
+// keep: 删掉后空闲连接无界，替提供方占 fd；由「同一提供方峰值」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 32;
+
+// cap: fixed — HTTP/1.1 客户端等一次应答的缺省：三十秒是协议层一次交换的常识上限，不是本部署的容量
+// not-a-bound: HTTP/1.1 客户端等一次应答的缺省：三十秒是协议层一次交换的常识上限，不是本部署的容量
 fn default_timeout_secs() -> u64 {
-    30
+    (cog_core::day::SECONDS_PER_MINUTE / 2) as u64
 }
 fn default_connect_timeout_secs() -> u64 {
-    10
+    DEFAULT_CONNECT_TIMEOUT_SECS
 }
 fn default_pool_max_idle_per_host() -> usize {
-    32
+    DEFAULT_POOL_MAX_IDLE_PER_HOST
 }
 fn default_user_agent() -> String {
     "cogneva-http-client/0.1".into()
@@ -98,7 +114,19 @@ mod tests {
         std::fs::write(&path, r#"{"http_client": {"timeout_secs": 5}}"#).unwrap();
         let cfg = HttpClientConfig::load_from(&path).unwrap();
         assert_eq!(cfg.timeout_secs, 5);
-        assert_eq!(cfg.connect_timeout_secs, 10);
-        std::fs::remove_dir_all(&dir).ok();
+        // 文件没写的那一格回落到默认值，而不是回落到某个写在这里的第二份数。
+        assert_eq!(
+            cfg.connect_timeout_secs,
+            HttpClientConfig::default().connect_timeout_secs
+        );
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
+    }
+
+    /// 两个默认值各只有一处声明：`fn default_*` 读具名常量，常量上写着它由什么钉住。
+    #[test]
+    fn the_http_client_defaults_read_their_names() {
+        let cfg = HttpClientConfig::default();
+        assert_eq!(cfg.connect_timeout_secs, DEFAULT_CONNECT_TIMEOUT_SECS);
+        assert_eq!(cfg.pool_max_idle_per_host, DEFAULT_POOL_MAX_IDLE_PER_HOST);
     }
 }

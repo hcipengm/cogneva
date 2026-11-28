@@ -31,6 +31,7 @@ pub(crate) fn slug(id: &str) -> String {
 }
 
 fn path_for(change_id: &str) -> PathBuf {
+    // state-file: handoff — PR 出口还没接通时的暂存队列，drain 取走即删，不是某条事实的第二份正本
     pending_dir().join(format!("{}.json", slug(change_id)))
 }
 
@@ -85,7 +86,7 @@ pub async fn load_pending() -> Vec<GeneratedChange> {
 
 /// Remove the staging file for a successfully published change.
 pub async fn remove_staged(change_id: &str) {
-    let _ = tokio::fs::remove_file(path_for(change_id)).await;
+    cog_core::ignore_lost!(tokio::fs::remove_file(path_for(change_id)).await);
 }
 
 /// A [`cog_core::ChangeSink`] that only stages changes locally. Registered
@@ -138,6 +139,7 @@ mod tests {
 
     fn sample(id: &str) -> GeneratedChange {
         GeneratedChange {
+            unit_of_work: None,
             change_id: id.into(),
             goal: "g".into(),
             content: "diff".into(),

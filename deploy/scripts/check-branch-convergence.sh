@@ -20,21 +20,31 @@
 # 远端分支（`--remote <name>`）没有本地对象可走上面两条腿，只能判「它的 tip 是不是 trunk
 # 的祖先」。查不到对象时按「判不了」报，不按「合格」——读不到与合格是两件事。
 #
-# 用法：
-#   check-branch-convergence.sh [仓库] [--trunk <名>] [--remote <远端>]
+# `--single`：另一种问法——**除 trunk 外一条分支头都不许有**，内容在不在 trunk 上不参与
+# 判定。默认那条判据只回答「能不能删」，它默认分支可以存在；而分支存在的代价不由它承担：
+# 2026-11-10 远端一度有 8 条头（`ahead8`/`ghost9`/`same`/`master`/`store-ledger` 之类），
+# 除 `master` 外每条的内容都早已在 main 上——每一条都是先被推上去，然后要有人在 211 笔
+# 之后回头用 cherry 逐条证一遍才敢删。一条分支从诞生到被删之间的每一刻，都得有人回答
+# 「它能不能删」；不诞生就没人要回答。所以这一档量的是「头有几个」，与内容无关，绿的条件
+# 是恰好一个：trunk。
 #
-# 退出码：0 每一条非 trunk 分支的内容都已在 trunk；1 至少一条没有（逐条点名）；
-#         3 判不了（不是 git 仓库 / trunk 不在 / 远端读不到）。
+# 用法：
+#   check-branch-convergence.sh [仓库] [--trunk <名>] [--remote <远端>] [--single]
+#
+# 退出码：0 每一条非 trunk 分支的内容都已在 trunk（`--single` 时：一条非 trunk 头都没有）；
+#         1 至少一条没有（逐条点名）；3 判不了（不是 git 仓库 / trunk 不在 / 远端读不到）。
 
 set -uo pipefail
 
 repo=""
 trunk="main"
 remote=""
+single=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
     --trunk) trunk="${2:-}"; shift 2 ;;
     --remote) remote="${2:-}"; shift 2 ;;
+    --single) single=1; shift ;;
     -h | --help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "check-branch-convergence: 不认识的参数 $1" >&2; exit 2 ;;
     *) repo="$1"; shift ;;
@@ -76,7 +86,20 @@ contained() { # $1=分支名，成功即「内容已在 trunk」
 while IFS= read -r branch; do
     [ -z "$branch" ] && continue
     [ "$branch" = "$trunk" ] && continue
+    # 给了 `--remote` 时这一档问的是**远端**的头：本机的分支是各会话的工作状态（工作树
+    # 就得站在某条分支上），把它算进「远端只许一个」里，这条判据在每台工作机上都是红的。
+    if [ "$single" -eq 1 ] && [ -n "$remote" ]; then continue; fi
     judged=$((judged + 1))
+    if [ "$single" -eq 1 ]; then
+        # 内容在不在 trunk 上不读：这一档问的是「头有几个」，读内容会把「已合并且该删」
+        # 读成合格，而它恰恰是这条规矩要拦的形状。
+        uncontained=$((uncontained + 1))
+        printf 'RED   - %s：非 %s 分支不许存在（--single）\n' "$branch" "$trunk"
+        printf '        修法：先证内容已在 %s，再 git merge --no-edit -s ours %s 记一笔合入，\n' \
+            "$trunk" "$branch"
+        printf '              最后 git branch -d %s 并向远端推删除（不用 -D）。\n' "$branch"
+        continue
+    fi
     if contained "$branch"; then
         ahead="$(git -C "$repo" rev-list --count "$trunk..$branch")"
         printf 'ok    - %s：ahead=%s 未上游补丁=0\n' "$branch" "$ahead"
@@ -102,6 +125,11 @@ if [ -n "$remote" ]; then
         name="${ref#refs/heads/}"
         [ "$name" = "$trunk" ] && continue
         judged=$((judged + 1))
+        if [ "$single" -eq 1 ]; then
+            uncontained=$((uncontained + 1))
+            printf 'RED   - %s@%s：远端也不许有非 %s 的头（--single）\n' "$name" "$sha" "$trunk"
+            continue
+        fi
         if ! git -C "$repo" cat-file -e "$sha^{commit}" 2>/dev/null; then
             unknown=$((unknown + 1))
             printf 'UNKNOWN - %s@%s：本地没有这个对象，判不了它是不是 %s 的祖先\n' \
@@ -121,6 +149,13 @@ printf 'check-branch-convergence: branches=%s uncontained=%s unknown=%s\n' \
     "$judged" "$uncontained" "$unknown"
 if [ "$uncontained" -gt 0 ]; then exit 1; fi
 if [ "$unknown" -gt 0 ]; then exit 3; fi
+if [ "$single" -eq 1 ]; then
+    # 这一档的合格形状就是「零条非 trunk 头」，所以零条在这里是**答案**，不是判不了：
+    # 上面那条「零条与全都已收敛同形」说的是默认那一问（它要数的是「还剩几条待收敛」）。
+    printf 'check-branch-convergence: single=%s heads=%s——除 %s 外没有别的分支头\n' \
+        "$trunk" "$judged" "$trunk"
+    exit 0
+fi
 if [ "$judged" -eq 0 ]; then
     echo "check-branch-convergence: 一条非 $trunk 分支都没有读到——零条与「全都已收敛」在汇总行上同形" >&2
     echo "check-branch-convergence: judged nothing (not the same as clean)" >&2

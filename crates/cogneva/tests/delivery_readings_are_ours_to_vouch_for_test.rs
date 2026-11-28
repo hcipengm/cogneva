@@ -26,10 +26,16 @@
 
 use crate::common;
 
-use common::routes::{read, repo_root};
-use common::rust_production::production_text;
+use common::routes::{read, rendered_root, repo_root};
+use common::rust_production::{production_sources, production_text};
 
-const METRIC_NAMES: &str = "crates/cog-core/src/contract/metric_names.rs";
+/// 名字的声明面：整个 `cog-core` 源树，不是一个文件。
+///
+/// 闭集（`metric_names.rs`）登记的是**存储能持有**的序列；抓取面渲染的序列
+/// （`RawMetric`）合法地住在同 crate 的别处（`contract/build_gate.rs` 十六条、
+/// `build_cache.rs` 的缓存目标一族）。判据要答的问题是「这个名字是不是本仓真的写出来的」，那要读整个
+/// 声明面；只读闭集文件会把抓取面的名字判成不存在，而它们一直都在。
+const CONTRACT_DIR: &str = "生产树（全仓，不含测试）";
 const RENDERED_CONFIG: &str = "deploy/rendered/k3s-single/10-configmap-cogneva-json.yaml";
 
 fn readings() -> &'static [&'static cog_gateway::readings::ReadingSpec] {
@@ -65,13 +71,27 @@ fn series_name(spec: &cog_gateway::readings::ReadingSpec) -> &str {
 
 #[test]
 fn every_delivery_reading_names_a_series_this_repo_publishes() {
-    let registry = production_text(&read(&repo_root().join(METRIC_NAMES)));
+    // 名字的声明面是**整棵生产树**，不是某个目录：闭集在
+    // `contract/metric_names.rs`，抓取面的名字在 `contract/build_gate.rs` 与
+    // `build_cache.rs`，还有一批在各 crate 自己的 readings 文件里
+    // （`discovery_outcome_readings.rs` 这类）。判据要答的是「本仓真的写出来过
+    // 这个名字吗」，按目录猜会把合法的名字判成不存在。
+    let registry: String = {
+        let mut text = String::new();
+        for path in production_sources(&repo_root()) {
+            if let Ok(source) = std::fs::read_to_string(&path) {
+                text.push_str(&production_text(&source));
+                text.push('\n');
+            }
+        }
+        text
+    };
     let mut checked = 0;
     for spec in delivery() {
         let name = series_name(spec);
         assert!(
             registry.contains(&format!("\"{name}\"")),
-            "reading {} names {name}, which no constant in {METRIC_NAMES} declares; \
+            "reading {} names {name}, which no constant in {CONTRACT_DIR} declares; \
              the board would show 没有序列 forever and the row would look like a \
              quiet system rather than a reading nobody wired",
             spec.id
@@ -99,7 +119,7 @@ fn every_delivery_reading_names_a_producer_file_that_exists() {
 
 /// The rendered rules, as the operator's pager sees them.
 fn rules() -> Vec<serde_json::Value> {
-    let text = read(&repo_root().join(RENDERED_CONFIG));
+    let text = read(&rendered_root().join("k3s-single/10-configmap-cogneva-json.yaml"));
     let at = text
         .find("cogneva.json:")
         .unwrap_or_else(|| panic!("{RENDERED_CONFIG} no longer carries cogneva.json"));
@@ -139,6 +159,26 @@ fn collect_rules(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
         }
         _ => {}
     }
+}
+
+/// The numbers a rule compares against: its `condition`, plus any numeric
+/// comparison left in the query.
+///
+/// `condition` is where a rule states its bound — the process applies it to each
+/// value the query returns, and the alert fixture folds it back into the
+/// expression before asking promtool. The promql scan stays because a bound can
+/// also be a multiple of a measured quantity (`6 * max(scan_interval_seconds)`),
+/// which no `condition` can express.
+fn rule_bounds(rule: &serde_json::Value) -> Vec<f64> {
+    let mut out: Vec<f64> = rule
+        .get("condition")
+        .and_then(|c| c.as_object())
+        .map(|c| c.values().filter_map(|v| v.as_f64()).collect())
+        .unwrap_or(Default::default());
+    out.extend(comparison_bounds(
+        rule.get("promql").and_then(|p| p.as_str()).unwrap_or(""),
+    ));
+    out
 }
 
 /// The numbers a promql compares against: `> 14400`, `>= 1`, `== 0`.
@@ -203,10 +243,7 @@ fn the_ci_hold_reading_carries_the_bound_its_alert_rule_states() {
         spec.series
     );
     assert!(
-        naming.iter().any(|rule| comparison_bounds(
-            rule.get("promql").and_then(|p| p.as_str()).unwrap_or("")
-        )
-        .contains(&value)),
+        naming.iter().any(|rule| rule_bounds(rule).contains(&value)),
         "the board calls {value} critical for {} but no rule naming that series \
          compares against it: {:?}. Two surfaces, one series, different bounds — \
          whichever one the operator opens decides what they believe",
@@ -216,7 +253,7 @@ fn the_ci_hold_reading_carries_the_bound_its_alert_rule_states() {
             .map(|rule| {
                 (
                     rule.get("name").and_then(|n| n.as_str()).unwrap_or(""),
-                    comparison_bounds(rule.get("promql").and_then(|p| p.as_str()).unwrap_or("")),
+                    rule_bounds(rule),
                 )
             })
             .collect::<Vec<_>>()

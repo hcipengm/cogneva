@@ -136,7 +136,12 @@ function BackupExportSection() {
   const [passphrase, setPassphrase] = useState('');
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
-  const running = packages.data?.running ?? false;
+  // 三种状态，不是两种：`null` 是「问不到集群」。把它折成 false，一趟真在跑的
+  // 导出会在 apiserver 打嗝的那一拍从页面上消失——轮询停掉，导出按钮又亮起来。
+  // 问不到时退回那条慢拍（`useResource` 自己每 30 秒重读），不做任何断言。
+  const runningState = packages.data?.running;
+  const running = runningState === true;
+  const runningUnknown = runningState === null;
 
   // 导出一趟要几分钟。只在「有 Job 在跑」时加快节奏，跑完就回到慢拍：
   // 常态下每 30 秒读一次目录没有意义，而轮询不会自己停。
@@ -198,7 +203,11 @@ function BackupExportSection() {
         <h2 className="text-[12px]">备份包</h2>
         <span className="text-[11px] text-[var(--muted)]">
           导出是一趟跑在集群里的备份；跑完包就出现在下面，可以直接下载
-          {running ? '；现在有一趟在跑' : ''}
+          {running
+            ? '；现在有一趟在跑'
+            : runningUnknown
+              ? '；读不到集群，确认不了现在有没有在跑'
+              : ''}
         </span>
         <div className="ml-auto">
           <Button onClick={packages.refresh}>重读</Button>
@@ -538,7 +547,12 @@ export function SettingsView() {
                         : 'plain'
                   }
                 />
-                <Reading label="待提交变更" value={contrib.pending_count} />
+                {/* `null` 是「问不到队列」，不是 0：那一格在没有读数时写下来，
+                    而不是替所有者断言没有等他点头的变更。 */}
+                <Reading
+                  label="待提交变更"
+                  value={contrib.pending_count ?? '读不到'}
+                />
                 <Reading label="回流策略" value={contrib.policy} />
               </div>
             </Readings>
@@ -604,7 +618,9 @@ export function SettingsView() {
             columns={[
               { key: 'name', title: '名称', width: '220px', render: (d) => d.name },
               { key: 'cases', title: '用例', width: '90px', render: (d) => (
-                <span className="mono text-[11px]">{d.case_count}</span>
+                <span className="mono text-[11px]">
+                  {d.case_count == null ? '未计' : d.case_count}
+                </span>
               ) },
               { key: 'tags', title: '标签', width: '220px', render: (d) => (
                 <span className="text-[11px] text-[var(--muted)]">{d.tags.join(', ') || '—'}</span>
@@ -617,13 +633,13 @@ export function SettingsView() {
             rowKey={(d) => d.path}
           />
         )}
-        {(datasets.data?.datasets ?? []).length > 0 && (
+        {(datasets.data?.datasets ?? []).some((d) => d.case_count != null) && (
           <BarList
             label="每个评估集有几个用例"
-            note="按磁盘上实际存在的用例数（GET /api/v1/eval/datasets）；用例多不等于覆盖广，覆盖看标签"
-            rows={(datasets.data?.datasets ?? [])
-              .map((d) => ({ id: d.path, label: d.name, value: d.case_count }))
-              .sort((a, b) => b.value - a.value)}
+            note="按磁盘上实际存在的用例数（GET /api/v1/eval/datasets）；只列数得出来的那些——yaml 没有一行一个用例的约定，读不出来的文件也没有。用例多不等于覆盖广，覆盖看标签"
+            rows={(datasets.data?.datasets ?? []).flatMap((d) =>
+              d.case_count == null ? [] : [{ id: d.path, label: d.name, value: d.case_count }]
+            ).sort((a, b) => b.value - a.value)}
           />
         )}
       </section>
@@ -652,8 +668,14 @@ export function SettingsView() {
           >
           <div className="flex flex-wrap py-2">
             <Reading label="今天已用" value={quota.data.used_today.toLocaleString()} />
-            <Reading label="剩余额度" value={quota.data.remaining.toLocaleString()} />
-            <Reading label="额度总量" value={quota.data.total_quota.toLocaleString()} />
+            <Reading
+              label="剩余额度"
+              value={quota.data.remaining === null ? '不限（没有人声明过上限）' : quota.data.remaining.toLocaleString()}
+            />
+            <Reading
+              label="额度总量"
+              value={quota.data.total_quota === null ? '不限（没有人声明过上限）' : quota.data.total_quota.toLocaleString()}
+            />
             <Reading label="账号" value={<span className="mono text-[13px]">{quota.data.user_id}</span>} />
           </div>
           </Readings>

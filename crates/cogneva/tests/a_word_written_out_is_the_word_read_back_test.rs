@@ -46,6 +46,7 @@ use std::path::{Path, PathBuf};
 
 use crate::common;
 
+use common::declared_once::literal_values;
 use common::lex::{split_top_level, Dialect};
 use common::rust_text::{raw_string_end, trailing_identifier};
 
@@ -96,55 +97,15 @@ fn open_brace_after(text: &str, from: usize) -> Option<usize> {
     None
 }
 
-/// 从 `open`（一个 `{`）起找配对的 `}`，跳过字符串、字符字面量、生命周期与原始字符串。
+/// 从 `open`（一个 `{`）起找配对的 `}`。
+///
+/// 配平问的是「哪里是代码」，那是 [`common::lex`] 那台状态机的题目，不是每个夹具
+/// 各写一遍的：这里原来自己走字节，只跳字符串、字符字面量、生命周期与原始字符串，
+/// 不跳注释。`impl` 体里一句注释中出现的花括号就能把配平挪进半句话中间，此后读到
+/// 的「函数体」不是那个函数——判词上它以「括号不闭合」收口，红在一条英文文案
+/// 上，而它想判的是类型的词表。方言表只留一份，从这里调它。
 fn body_end(text: &str, open: usize) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut depth = 0i32;
-    let mut i = open;
-    while i < bytes.len() {
-        if let Some(end) = raw_string_end(bytes, i) {
-            i = end;
-            continue;
-        }
-        match bytes[i] {
-            b'"' => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'"' {
-                    if bytes[i] == b'\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-                if i >= bytes.len() {
-                    return None;
-                }
-            }
-            b'\'' => {
-                if i + 2 < bytes.len() && bytes[i + 2] == b'\'' {
-                    i += 2;
-                } else if i + 3 < bytes.len() && bytes[i + 1] == b'\\' && bytes[i + 3] == b'\'' {
-                    i += 3;
-                } else {
-                    i += 1;
-                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-                    {
-                        i += 1;
-                    }
-                    continue;
-                }
-            }
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
+    common::routes::matching_brace(text, open, Dialect::Rust)
 }
 
 /// `from` 之后第一个**作为独立词**出现在代码里的 `needle`，跳过注释与字符串字面量。
@@ -277,32 +238,6 @@ fn match_body(body: &str) -> String {
     body.to_string()
 }
 
-fn literals(text: &str) -> Vec<String> {
-    let bytes = text.as_bytes();
-    let mut found = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'"' {
-            i += 1;
-            continue;
-        }
-        i += 1;
-        let mut word = String::new();
-        while i < bytes.len() && bytes[i] != b'"' {
-            if bytes[i] == b'\\' {
-                i += 1;
-            }
-            if i < bytes.len() {
-                word.push(bytes[i] as char);
-            }
-            i += 1;
-        }
-        found.push(word);
-        i += 1;
-    }
-    found
-}
-
 /// `Self::X`／`X::Y::Z`／`Ok(Self::X)` 里那个大写开头的变体名。
 fn leading_variant(text: &str) -> Option<String> {
     let text = text.trim_start();
@@ -362,8 +297,8 @@ impl Consts {
         let mut decls: Vec<(String, String, String)> = Vec::new();
         for (file, source) in sources {
             for (name, rhs) in const_decls(source) {
-                if let Some(word) = literals(&rhs).into_iter().next() {
-                    literal.entry(name.clone()).or_insert(word);
+                if let Some(word) = literal_values(&rhs).into_iter().next() {
+                    literal.entry(name.clone()).or_insert(word.to_string());
                 }
                 decls.push((file.clone(), name, rhs));
             }
@@ -417,8 +352,8 @@ fn written_words(
             continue;
         }
         let right = &arm[arrow + 2..];
-        let word = match literals(right).into_iter().next() {
-            Some(word) => word,
+        let word = match literal_values(right).into_iter().next() {
+            Some(word) => word.to_string(),
             None => {
                 let name = trailing_identifier(right);
                 match consts.get(file, &name) {
@@ -460,11 +395,11 @@ fn display_words(body: &str) -> Vec<(String, String)> {
         if !variant.chars().next().is_some_and(|c| c.is_uppercase()) {
             continue;
         }
-        let Some(word) = literals(&arm[arrow + 2..]).into_iter().next() else {
+        let Some(word) = literal_values(&arm[arrow + 2..]).into_iter().next() else {
             continue;
         };
-        if is_plain_word(&word) {
-            arms.push((variant, word));
+        if is_plain_word(word) {
+            arms.push((variant, word.to_string()));
         }
     }
     arms
@@ -496,9 +431,9 @@ fn explicit_arms(source: &str, owner: &str) -> Vec<(String, String)> {
         if pattern.contains("=>") || pattern.contains('=') {
             continue;
         }
-        for word in literals(pattern) {
-            if is_plain_word(&word) {
-                arms.push((word, variant.clone()));
+        for word in literal_values(pattern) {
+            if is_plain_word(word) {
+                arms.push((word.to_string(), variant.clone()));
             }
         }
     }
@@ -513,7 +448,7 @@ fn read_words(body: &str) -> Vec<(String, String)> {
         let Some(arrow) = arm.find("=>") else {
             continue;
         };
-        let words = literals(&arm[..arrow]);
+        let words = literal_values(&arm[..arrow]);
         if words.is_empty() {
             continue;
         }
@@ -521,7 +456,7 @@ fn read_words(body: &str) -> Vec<(String, String)> {
             continue;
         };
         for word in words {
-            arms.push((word, variant.clone()));
+            arms.push((word.to_string(), variant.clone()));
         }
     }
     arms

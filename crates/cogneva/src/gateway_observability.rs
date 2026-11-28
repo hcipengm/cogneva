@@ -14,7 +14,7 @@ use cog_gateway::security_gateway::{PoolObservability, SecurityGatewayConfig, Vo
 use cog_observability::alert_store::PostgresAlertStore;
 use cog_observability::analytics::{ClickHouseAnalyticsBackend, ClickHouseEventBuffer};
 use cog_observability::data_volume;
-use cog_observability::logs::{LokiBackgroundPusher, LokiPushClient};
+use cog_observability::logs::LokiBackgroundPusher;
 use cog_observability::metrics::PrometheusMetricsBackend;
 use cog_observability::usage_store::LlmUsageStore;
 
@@ -22,6 +22,9 @@ use cog_observability::usage_store::LlmUsageStore;
 pub struct GatewayObservability {
     pub pool: Arc<PoolObservability>,
     pub volume_footprint: Vec<VolumeFootprint>,
+    /// 流式正文的落点。`None` 表示这一代进程没有库可写，正文照旧留在扫描器的
+    /// 内存里——把它说成「正文进库了」是最贵的那种谎。
+    pub body_store: Option<Arc<dyn cog_core::BodyStore>>,
 }
 
 /// 造出安全网关的全部观测面，并把本进程的日志与卷走查一起装上。
@@ -69,9 +72,34 @@ pub async fn assemble(
         cog_core::ShutdownSignal::default(),
     );
 
+    // 流式正文的落点：与账本、告警、池读数同一个 `database_url`。正文写在大对象里，
+    // 行只留指针与封口时的哈希；不接上时正文留在进程内存里，而内存没有续跑。
+    //
+    // 这只池是本进程独立开的一只：账本与告警各自在 `connect_*` 里建自己的池，而
+    // 这里只要一个「写大对象」的句柄。代价是一条额外的连接预算，换来的是不必为了
+    // 一大对象去改那两条已经在跑的装配路径——真要省，该把 `build_pool_observability`
+    // 手里的池交出来共用，那是另一笔。
+    let body_store: Option<Arc<dyn cog_core::BodyStore>> = match config.database_url.as_deref() {
+        Some(url) => match sqlx::PgPool::connect(url).await {
+            Ok(pool) => Some(
+                std::sync::Arc::new(cog_storage::PostgresBodyStore::new(pool))
+                    as Arc<dyn cog_core::BodyStore>,
+            ),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "流式正文的落点建不出来（连不上库）：正文留在内存里，重启就没了"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
     GatewayObservability {
         pool,
         volume_footprint,
+        body_store,
     }
 }
 
@@ -83,23 +111,15 @@ fn init_gateway_logging(
     // 再没人设置的名字，而读不到与「本来就没配」在调用点上同形。
     let (level, format) = cog_observability::logs::level_and_format();
     let pusher = if obs.loki.enabled {
-        let client = Arc::new(
-            LokiPushClient::new(&obs.loki.endpoint)
-                .with_max_retries(obs.loki.max_retries.max(1))
-                .with_timeout(obs.loki.timeout_secs)
-                .with_label(
-                    cog_gateway::LABEL_SERVICE,
-                    cog_core::topology::SECURITY_GATEWAY,
-                )
-                .with_client(http_client.clone()),
-        );
         // 循环由调用方在后端建好后起（见 `assemble`）：在构造点起，后端之前
-        // 每一轮的结局就无处记。
-        Some(Arc::new(LokiBackgroundPusher::new(
-            client,
-            std::time::Duration::from_secs(obs.loki.flush_interval_sec.max(1)),
-            obs.loki.max_batch_size.max(1),
-        )))
+        // 每一轮的结局就无处记。三格原样生效——这里曾是第三个把声明的
+        // `max_retries = 0` 夹成一次重试的装配点。
+        let (_, pusher) = cog_observability::logs::client_and_pusher(
+            &obs.loki,
+            http_client.clone(),
+            cog_core::topology::SECURITY_GATEWAY,
+        );
+        Some(pusher)
     } else {
         None
     };
@@ -161,9 +181,11 @@ impl<T: ?Sized> DeferredSink<T> {
 /// ——撞锁的那一瞬旧 Pod 还在写，几秒之后就没了，重试太密只是把已经撞过的那把锁
 /// 再撞一遍。封顶一分钟：库真的不通时，每多试一次就多一条连接与一行日志，而一分
 /// 钟一次足够在恢复后的第一分钟里接上。
-// cap: bound — 要长过一次正常滚动的重叠期（撞锁的那一瞬旧 Pod 还在写、几秒后就走），又要短到恢复后第一分钟里接得上；没有一处读数能把它变成分位数
+// cap: fixed — 要长过一次正常滚动的重叠期（撞锁的那一瞬旧 Pod 还在写、几秒后就走），又要短到恢复后第一分钟里接得上；没有一处读数能把它变成分位数
+// keep: 删掉后滚动重叠期的撞锁被当成永久失败，恢复后第一分钟接不上；由「长过一次正常滚动的重叠期」兜住
 const SINK_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(5);
-// cap: bound — 库真的不通时每多试一次就多一条连接与一行日志；一分钟一次已经够在恢复后的第一分钟里接上，再密只是把不通的库再敲一遍
+// cap: fixed — 库真的不通时每多试一次就多一条连接与一行日志；一分钟一次已经够在恢复后的第一分钟里接上，再密只是把不通的库再敲一遍
+// keep: 删掉后库不通时无限密地重试，每多试一次多一条连接与一行日志；由「一分钟一次够接上」兜住
 const SINK_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 一直重试到接上为止，然后停下。
@@ -252,7 +274,7 @@ impl cog_core::PersistentAlertSink for DeferredSink<dyn cog_core::PersistentAler
 /// 不能读成「账本里本来就没有这一笔」。
 #[async_trait::async_trait]
 impl cog_core::LlmUsageLedger for DeferredSink<dyn cog_core::LlmUsageLedger> {
-    async fn record(&self, record: &cog_core::LlmUsageRecord) -> Result<(), String> {
+    async fn record(&self, record: &cog_core::LlmUsageRecord) -> Result<String, String> {
         self.ledger()?.record(record).await
     }
 
@@ -326,6 +348,13 @@ impl cog_core::LlmUsageLedger for DeferredSink<dyn cog_core::LlmUsageLedger> {
 
     async fn spend_by_task(&self, task_ids: &[String]) -> Result<Vec<(String, u64)>, String> {
         self.ledger()?.spend_by_task(task_ids).await
+    }
+
+    async fn spend_for_session(
+        &self,
+        session: &str,
+    ) -> Result<Option<cog_core::contract::usage_ledger::SessionSpend>, String> {
+        self.ledger()?.spend_for_session(session).await
     }
 
     async fn priced_spend_between(
@@ -464,6 +493,26 @@ async fn connect_usage_ledger(url: &str) -> Result<Arc<dyn cog_core::LlmUsageLed
         .init_schema(&runner)
         .await
         .map_err(|e| format!("gateway_llm_usage 建表失败: {e}"))?;
+    // 读切换之前，先把已有的行回填成事件：流只从切换那一刻开始，而「这周花了多少」
+    // 不区分切换前后——不回填就切读，等于把切换之前的花销从读数里抹掉。
+    // 幂等（键是行 id），所以每次启动都跑一遍是安全的；接不上就只记一行，
+    // 回填没做完之前读侧仍读行。
+    // 回填要一条自己的连接：账本 store 的连接不对外暴露，而回填是**独立的作业**，
+    // 不该借账本的池子——它的批大小与节奏都与请求路径无关。
+    match sqlx::PgPool::connect(url).await {
+        Ok(pool) => {
+            match cog_storage::postgres::usage_backfill::backfill_all(&pool, "gateway").await {
+                Ok(written) if written > 0 => {
+                    tracing::info!(written, "把账本里的调用回填成事件：读切换前的准备");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "调用回填没跑完；读侧在此之前仍读行，不会读到一个更小的数");
+                }
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "回填的连接建不出来；读侧仍读行"),
+    }
     Ok(Arc::new(store))
 }
 
@@ -631,9 +680,31 @@ async fn build_pool_observability(
         analytics.map(|sink| sink as Arc<dyn cog_core::AnalyticsSink>);
     let metrics: Arc<dyn cog_core::ScrapableMetrics> = metrics;
 
-    Arc::new(PoolObservability::new(
-        metrics, analytics, alerts, usage, durable,
-    ))
+    // 调用事实的写入口：与用量账本同一条 URL、同一个进程。接不上时留空——
+    // 读切换之前它只决定「正本多不多一行」，不决定任何读数的对错。
+    let mut pool_obs = PoolObservability::new(metrics, analytics, alerts, usage, durable);
+    if let Some(url) = config.database_url.as_deref() {
+        match sqlx::PgPool::connect(url).await {
+            Ok(pool) => {
+                let deployment = std::env::var(cog_core::env::DEPLOYMENT_NAME_ENV)
+                    .unwrap_or_else(|_| "cogneva".to_string());
+                pool_obs = pool_obs.with_call_events(Arc::new(
+                    cog_storage::postgres::event_log::EventLogStore::new(
+                        pool.clone(),
+                        deployment.clone(),
+                    ),
+                ));
+                // 行与事件同一次提交：接上之后网关不再分两步写。
+                pool_obs = pool_obs.with_usage_landing(
+                    crate::usage_landing_tx::postgres_usage_landing(pool, deployment),
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "调用事实的写入口接不上；读切换之前不影响读数");
+            }
+        }
+    }
+    Arc::new(pool_obs)
 }
 
 #[cfg(test)]
@@ -763,7 +834,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl cog_core::LlmUsageLedger for CountingLedger {
-        async fn record(&self, _: &cog_core::LlmUsageRecord) -> Result<(), String> {
+        async fn record(&self, _: &cog_core::LlmUsageRecord) -> Result<String, String> {
             unimplemented!("这一格只读不写")
         }
         async fn record_exchange(&self, _: &cog_core::LlmExchangeRecord) -> Result<(), String> {
@@ -817,6 +888,12 @@ mod tests {
             unimplemented!("这一格只读不写")
         }
         async fn spend_by_task(&self, _: &[String]) -> Result<Vec<(String, u64)>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn spend_for_session(
+            &self,
+            _: &str,
+        ) -> Result<Option<cog_core::contract::usage_ledger::SessionSpend>, String> {
             unimplemented!("这一格只读不写")
         }
         async fn priced_spend_between(

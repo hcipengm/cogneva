@@ -17,7 +17,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
-axum = { workspace = true }
 
 prost = { workspace = true }
 bytes = { workspace = true }
@@ -35,3 +34,5 @@ tonic-build = { workspace = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
+# The MCP SSE test serves a real endpoint; the library itself never builds one.
+axum = { workspace = true }

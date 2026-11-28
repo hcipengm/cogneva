@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# 编译之前先问一句：这一轮的待办，都改完了吗？
+#
+# 默认是**全量编辑**：这一轮所有未完成的待办，一次改完，再编译一次。所以这个垫片在
+# 脏树上做两件事：
+#
+#   1. 跑 `cogneva ledger editing`：把「未完成待办的触点」作为默认批次，
+#      有缺口（待办点名了但还没改的文件、或者没写触点的待办）就**拒绝编译**，
+#      并把缺口打出来——它给的不是禁令，是下一步该改什么。
+#   2. 记一行账：时间、工作树、参数、HEAD、树指纹。推之前那道门用它判两件事——
+#      「编辑晚于最后一次编译」与「一批编译了几次」。
+#
+# **要拆**：在编译前声明三条理由之一，例如
+#     COGNEVA_BATCH_SPLIT="2 — 这一批与下一批共用同一个测试目标" cargo test -p cog-storage
+# 声明会随这一笔进提交历史（推之前的门会再判一次真假），所以它不是免检牌。
+#
+# 干净树上不拦：没有待办在改，就没有「没改完」这回事。**没有绕过开关**：绕过一次，
+# 「同批编辑」就退回成「我挑的那几条」，而这正是这一层存在的理由。
+set -u
+
+real_cargo="${REAL_CARGO:-$HOME/.cargo/bin/cargo}"
+ledger="${COGNEVA_COMPILE_LEDGER:-$HOME/.local/state/cogneva/compile-ledger.tsv}"
+# 这个垫片被装在 PATH 上（/usr/local/bin 或 ~/.local/bin），所以它**不能**从自己的
+# 位置找判词——判词在产品里（`cogneva ledger ...`），二进制跟着仓库走，位置由当前
+# 工作树决定（`COGNEVA_BIN` 可以覆盖）。
+toplevel="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+ledger_bin="${COGNEVA_BIN:-${toplevel:+$toplevel/target/debug/cogneva}}"
+
+sub="${1:-}"
+# 两类命令分开：**只读类型检查**（`check`）随时可以跑——它不产出可推送的
+# 字节，不破坏「验过的字节＝要推的字节」，而它是把十分钟的编辑变成可确认的唯一手段。
+# 把它也关在批次门后面，等于让一批跨天的待办把树冻在「无法确认能不能编译」里，
+# 那不是严格，是把可验证性关掉了（2026-11-20 现场）。`clippy` 不放行：它在 CI 上跑，
+# 一条 lint 的判词属于那一笔的 CI 结论，不属于本地这一拍。
+case "$sub" in
+  check) builds=0 ;;
+  clippy|build|test|run|bench|doc|nextest|install|fix) builds=1 ;;
+  *) builds=0 ;;
+esac
+
+dirty=0
+if git rev-parse --git-dir >/dev/null 2>&1 && [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+  dirty=1
+fi
+
+# 判据是「这一轮开工以来改了什么」，不是「工作树干不干净」：每做完一小块就提交的人，
+# 工作树永远是干净的，按脏树判等于把门整个跳过——而漏下的子集正是这样漏掉的。
+# 没有开着一轮、或者事件流读不到：**判不了**，不是「没有缺口」。判不了就不许编译。
+if [ -n "$ledger_bin" ] && [ -x "$ledger_bin" ]; then
+  if ! round_out=$("$ledger_bin" ledger status 2>&1); then
+    case "$round_out" in
+      *"条未完成"*) : ;;
+      *)
+        printf '%s\n' "$round_out" >&2
+        cat >&2 <<'EOF'
+
+cargo: 这一轮判不了，先别编译。
+
+  要么没有开着一轮（`cogneva ledger open`），要么台账或事件流读不到。
+  「判不了」与「没有缺口」是两件事：退回「与 origin/main 的差」会把整段历史
+  当成这一轮的改动，缺口一律看不见。
+EOF
+        exit 1
+        ;;
+    esac
+  fi
+fi
+
+# 第 3 步：编译之前工作树必须是干净的——没提交的改动不会被推上去，编出来的字节与推的
+# 不是同一份，门的「已验」就对不上。提交是独立的一步，它有自己的判据，不是顺手做的。
+if [ "$builds" = "1" ] && [ "$dirty" = "1" ]; then
+  cat >&2 <<'EOF'
+cargo: 工作树不干净，先提交再编译。
+
+  没提交的改动不会被推上去：脏树上编出来的字节与最终推的不是同一份，门的「已验」
+  记账就对不上那一次推送。先把这一批的编辑提交完（提交多少笔都行），再编译一次。
+EOF
+  git status --porcelain >&2 || true
+  exit 1
+fi
+
+if [ "$builds" = "1" ] && [ -n "$ledger_bin" ] && [ -x "$ledger_bin" ]; then
+  if [ -z "${COGNEVA_BATCH_SPLIT:-}" ]; then
+    # 垫片按**三格**判，不按触点判（属主 2026-11-21：「先把整批编辑完，再编译一次」）。
+    # 按触点判的版本让「改一条、编一次、再改下一条」变成合法的，而那正是把同一份验证
+    # 付了 N 次：触点全动过的那一批，可能一条都还没做完。所以这里问的是「这一批每条
+    # 都有没有 `代码` 格」，缺一条就不编。
+    #
+    # `cargo check` 不受此限（它不产出可推送的字节），编辑期间随时可用；`build`/`test`
+    # 要等整批填完。这不是禁令，是把「一次编译」从习惯变成判据。
+    if ! "$ledger_bin" ledger editing; then
+      cat >&2 <<'EOF'
+
+cargo: 这一轮还有待办没改完，先别编译。
+
+  上面每一条 TODO 都是「这一轮该改、但还没改」的地方（待办点名的触点）。默认的做法
+  是把它们一次改完，再编译一次。
+
+  如果这一轮确实要拆，就在编译前声明三条理由之一，并点名被排除的那几条
+  （理由与排除清单一起进历史，推之前还要被判一次）：
+
+      COGNEVA_BATCH_SPLIT="2 — <会重叠的测试目标> — 排除: S1,S2"  # 失败不可归因
+      COGNEVA_BATCH_SPLIT="3 — <哪一处不可逆> — 排除: S3"          # 要滚动/迁移/动现场
+      COGNEVA_BATCH_SPLIT="4 — <这一侧为什么读不完> — 排除: S4,S5" # 工作集超限
+
+EOF
+      exit 1
+    fi
+  else
+    # 拆批声明要有理由码，也要点名被排除的行：只写理由的声明读完仍不知道
+    # 「哪几条没进这一批」，而下一批的人要靠这一格把自己接上。
+    case "$COGNEVA_BATCH_SPLIT" in
+      2\ —*|3\ —*|4\ —*) ;;
+      *)
+        printf 'cargo: 拆批声明要以 2/3/4 开头并写出理由（例如 "2 — 共用测试目标 — 排除: S1"）\n' >&2
+        exit 1
+        ;;
+    esac
+    case "$COGNEVA_BATCH_SPLIT" in
+      *"排除:"*) ;;
+      *)
+        printf 'cargo: 拆批要说出被排除的那几条（" — 排除: S1,S2"）；只说理由，下一批的人接不上\n' >&2
+        exit 1
+        ;;
+    esac
+    printf 'cargo: 本批按声明拆分：%s\n' "$COGNEVA_BATCH_SPLIT" >&2
+  fi
+fi
+
+# 账本的时间戳带亚秒（`%N`）：整秒的话，同一秒内「改文件 → 编译」会被读成
+# 「编译之后又改过」，那条判据在快的机器上自己红自己（2026-11-24 实测）。
+# 读的一侧用 RFC3339 解析，两种精度都认。
+
+# 同一份字节不许编第二次：这一棵树在当前 HEAD 上已经把**同一种**编译命令跑过了，
+# 再来一次买的是同一个答案。判据只读账本里已有的事实（时间、工作树、参数、HEAD）：
+# 同一棵树、同一个 HEAD、同一个子命令（`build`／`test`／…）出现过，就拒；`check`
+# 不算——它不产出可推的字节，编辑期随时可用。
+#
+# 2026-11-24 属主指出：这条判据 2026-11-21 被降成「读数」之后，反复「改一段编一段」
+# 没有任何东西拦得住；`Split` 管的是排除哪几条，不是可以多编几次，所以这里不再给
+# `Split` 留口子。改完之后再编只有两条路：先提交（新 HEAD 就是新的一批），或在提交
+# 信息里写一行 `Recompiled: <为什么上一次不够>`。
+if [ "$builds" = "1" ] && [ "$ledger" != "/dev/null" ] && [ -f "$ledger" ]; then
+  head_now="$(git rev-parse HEAD 2>/dev/null || echo no-head)"
+  # 判的是「同一份字节 + 同一条命令」：子命令加参数整体比，`--workspace` 与
+  # `--test x -- --ignored` 是两个不同的问题，各问一次不叫重复；重复的是同一条
+  # 命令在同一 HEAD 上再来一遍。
+  cmd_now="$(printf '%s' "$*" | tr -s ' ')"
+  # 变量名避开 awk 的内建函数（`sub` 就是一个）：撞上的那一版每次都在这里 fatal，
+  # 而错误被重定向吞掉，判据就静默地读成「没有前一次编译」——门在、从不拒绝。
+  if ! seen="$(awk -F'\t' -v tree="$PWD" -v cmd="$cmd_now" -v head="$head_now" '
+    $2 == tree && $4 == head && $3 == cmd { found = 1 }
+    END { print found + 0 }' "$ledger")"; then
+    echo "cargo: 编译账读不出来（$ledger），这一问没判——不当作「没有编过」。" >&2
+    exit 1
+  fi
+  if [ "$seen" = "1" ]; then
+    # 产物还在不在：账本上那一笔「编过了」说的是某一次真编出来的字节，而缓存被回收、
+    # 或人手把 target 删掉之后，那些字节已经不在盘上。这时再编一次不是重复购买，是
+    # 重建——而「编过了」与「产物不在了」在账本上同形，只有看盘才能分开。
+    target_dir="${CARGO_TARGET_DIR:-target}"
+    case "$target_dir" in
+    /*) ;;
+    *) target_dir="$PWD/$target_dir" ;;
+    esac
+    if [ ! -d "$target_dir/debug/deps" ] || [ -z "$(ls -A "$target_dir/debug/deps" 2>/dev/null | head -1)" ]; then
+      printf 'cargo: 上一次编译的产物已经不在（%s 是空的或不存在）——这一次是重建，不是重复。\n' \
+        "$target_dir/debug/deps" >&2
+    elif ! git log -1 --format='%B' 2>/dev/null | grep -q '^Recompiled:'; then
+      cat >&2 <<MSG
+
+cargo: 这一批已经在这份字节上把 \`$cmd_now\` 跑过一次了（HEAD ${head_now}），不再跑第二次。
+
+  一份字节只买一次编译：改完再编要么先提交（新 HEAD＝新的一批），要么在提交信息里写
+      Recompiled: <为什么上一次不够>
+  编辑期要确认类型，用 \`cargo check\`（它不产出可推送的字节，不受这一条限制）。
+MSG
+      exit 1
+    fi
+  fi
+fi
+
+fingerprint() {
+  {
+    git rev-parse HEAD 2>/dev/null || echo "no-head"
+    git status --porcelain=v2 2>/dev/null
+    git diff HEAD 2>/dev/null
+    git ls-files --others --exclude-standard 2>/dev/null
+  } | sha256sum | cut -d' ' -f1
+}
+
+if [ "$ledger" != "/dev/null" ]; then
+  {
+    mkdir -p "$(dirname "$ledger")" 2>/dev/null || true
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)" "$PWD" "$*" \
+      "$(git rev-parse HEAD 2>/dev/null || echo no-head)" "$(fingerprint 2>/dev/null || echo no-tree)" \
+      >>"$ledger"
+  } 2>/dev/null || true
+fi
+
+# 每次构建之前先放一遍临时工作树的整棵树。磁盘被填满的正是**某一次构建**，而定时
+# 扫的那一拍可能刚好落在它开始之前（2026-11-23：缓存回收器 14:43 跑完，14:45 那棵
+# 临时树开始长，15:15 下一拍之前磁盘读到 0 MB）。判据全在那份脚本里（空闲空间小于
+# 临时树自己占的空间、没有进程持有、只认 cargo 的缓存标记）；这里只负责在正确的
+# 时刻问它。它删不掉正在编译的那一棵——它的 cwd 就是本进程。
+if [ "$builds" = "1" ] && [ -n "$toplevel" ] && [ -x "$toplevel/deploy/scripts/host-scratch-gc.sh" ]; then
+  "$toplevel/deploy/scripts/host-scratch-gc.sh" >/dev/null 2>&1 || true
+fi
+
+# 只跑输入变了的格：`cargo test --workspace`（没点名包）按 cell plan 收窄。
+# 判据不在这⼀层：格清单与「哪些输入变了」由 `cogneva cell-plan` 算，这一层只把它翻成
+# `-p`。任何一步读不出来（没有 origin/main、二进制不在、输出不全）就不收窄，原样跑
+# 全量——收窄只允许少跑**本来就不需要重跑**的格，读不出来时不做这个减法。
+if [ "$sub" = "test" ] && [ -n "$ledger_bin" ] && [ -x "$ledger_bin" ] \
+   && [ "${COGNEVA_CELL_PLAN:-on}" != "off" ]; then
+  case " $* " in
+    *" --workspace "*)
+      case " $* " in
+        *" -p "*|*" --package "*) : ;;
+        *)
+          base="$(git merge-base origin/main HEAD 2>/dev/null || true)"
+          if [ -n "$base" ]; then
+            changed="$(git diff --name-only "$base" HEAD 2>/dev/null || true)"
+            plan_out="$(printf '%s\n' "$changed" | "$ledger_bin" cell-plan --changed-paths-from - 2>/dev/null || true)"
+            pkgs="$(printf '%s\n' "$plan_out" | awk -F'\t' '$1=="rerun" && $2!="" {printf " -p %s", $2}')"
+            if printf '%s\n' "$plan_out" | grep -q '^reused' && [ -n "$(printf '%s' "$pkgs" | tr -d ' ')" ]; then
+              printf 'cargo: 只跑输入变了的格：%s（其余格复用上一次的结论）\n' "$pkgs" >&2
+              narrowed=()
+              inserted=0
+              for arg in "$@"; do
+                [ "$arg" = "--workspace" ] && continue
+                if [ "$arg" = "--" ] && [ "$inserted" = "0" ]; then
+                  # shellcheck disable=SC2206
+                  narrowed+=($pkgs)
+                  inserted=1
+                fi
+                narrowed+=("$arg")
+              done
+              if [ "$inserted" = "0" ]; then
+                # shellcheck disable=SC2206
+                narrowed+=($pkgs)
+              fi
+              exec "$real_cargo" "${narrowed[@]}"
+            fi
+          fi
+          ;;
+      esac
+      ;;
+  esac
+fi
+
+exec "$real_cargo" "$@"

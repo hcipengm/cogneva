@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use cog_core::{
     ActionPlannerMeta, ActionPlannerSource, OrchestratorControl, SFError, SFResult, Task,
@@ -336,11 +336,14 @@ impl PromotionEvalOutcome {
 /// 默认 3600）：同样是「把一棵工作树建起来 + 跑固定评估集」这件最贵的事。两个数
 /// 目前各自写在构造点、没有共同的配置位——值一致是因为它们量的是同一件事，不是因为
 /// 有一处领它们；真要分开调时这两处就是覆盖点。
-// cap: bound — 两处构造点值一致是因为它们量的是同一件事，没有共同配置位；真要分开调时这两处就是覆盖点
+// cap: fixed — 两处构造点值一致是因为它们量的是同一件事，没有共同配置位；真要分开调时这两处就是覆盖点
+// keep: 删掉后两处构造点各写一个数，同一件事的墙迟早分开；由「两处量的是同一件事」兜住
+// wall: 等=一次晋级评测跑完 / 等不到=这一次评测按失败收尾，不产出「通过」——没有判词不等于判词是通过 / 续跑=能，重来是一次新的评测
 pub(crate) const DEFAULT_EVAL_TIMEOUT_SECS: u64 = 3600;
 
 /// 轮询任务结果的默认间隔（秒），与基线移植侧一致（默认 5）。
-// cap: bound — 与基线移植侧的轮询间隔一致
+// cap: fixed — 与基线移植侧的轮询间隔一致
+// keep: 删掉后评估轮询与基线移植侧各拍一个数，两边看到的进度不同步；由「与基线移植侧一致」兜住
 pub(crate) const DEFAULT_EVAL_POLL_INTERVAL_SECS: u64 = 5;
 
 impl PromotionEval {
@@ -401,7 +404,6 @@ impl PromotionEval {
             self.poll_interval_secs,
             task,
             goal,
-            self.timeout_secs,
         )
         .await
         {
@@ -443,8 +445,20 @@ impl PromotionEval {
     pub(crate) async fn withdraw_abandoned(&self) -> SFResult<usize> {
         let now = chrono::Utc::now();
         let mut withdrawn = 0usize;
-        for task in self.orchestrator.get_all_tasks().await {
-            if !is_abandoned_promotion_eval(&task, now, self.timeout_secs) {
+        // 读不到图时这一趟不能答「收走 0 条」：那句与「图上真没有孤儿」逐字同形，
+        // 而孤儿行不会自己消失，下一拍还得再清。把错误交出去，让调用方说出来。
+        let tasks = self
+            .orchestrator
+            .get_all_tasks_checked()
+            .await
+            .map_err(|e| {
+                SFError::Internal(format!(
+                    "the task graph could not be read, so no abandoned A/B row was withdrawn \
+                 this pass: {e}"
+                ))
+            })?;
+        for task in tasks {
+            if !is_abandoned_promotion_eval(&task, now) {
                 continue;
             }
             match self.orchestrator.cancel_task(&task.id).await {
@@ -506,30 +520,34 @@ pub fn promotion_eval_task(change_id: &str, rev: &str, repo: &Path, timeout_secs
             "repo": repo.display().to_string(),
         }),
     );
-    task.timeout_seconds = timeout_secs;
+    task.declared_duration_seconds = timeout_secs;
     task.acceptance
         .push(promotion_eval_acceptance(change_id, rev));
     task
 }
 
-/// 这一行是不是这道门交上去、而等它的那次等待已经不在了的行。
+/// 一行从没被认领过的门行，多久算孤儿。
 ///
-/// 判据只用这道门自己的时钟：等待上限就是「还在等」的界，过了它还没有终态的行，
-/// 要么等的人已经把它收回去（那它就不是这个状态），要么等的人已经不在了——进程
-/// 重启、任务被取消，都算。留一个等待上限的宽限，是为了不在收尾那一刻和正在收尾
-/// 的那次等待抢同一行。
-pub fn is_abandoned_promotion_eval(
-    task: &Task,
-    now: chrono::DateTime<chrono::Utc>,
-    timeout_secs: u64,
-) -> bool {
+/// 这里用一个钟是**可以的**，因为它收的不是一件活：`Pending`/`Scheduled` 上没有
+/// 任何进程在跑，收掉它不杀任何正在干的事，丢的只是那一行。它也不再用等待方的
+/// 上限来算——等待方已经不再有上限了（等的人等到终态为止），所以「等了多久」这
+/// 个读数在这个进程里已经不存在；留下的问题只是「这一行是不是被丢下了」，而这
+/// 与一件活跑了多久无关。
+// cap: fixed — 只收从没被认领过的行，收掉不杀任何在跑的活；这个数只回答「放这么久还没人认领就是孤儿」
+// keep: 删掉后从没被认领的行永远占着队列，孤儿没有被收掉的时刻；由「放这么久没人认领就是孤儿」兜住
+pub const ABANDONED_PROMOTION_EVAL_GRACE: Duration = Duration::from_secs(7200);
+
+/// 这一行是不是这道门交上去、而再没有人会来读的行。
+///
+/// 判据只剩一条：它从没被认领过，而且比 [孤儿宽限] 更久没动过。
+pub fn is_abandoned_promotion_eval(task: &Task, now: chrono::DateTime<chrono::Utc>) -> bool {
     if !task.id.starts_with(PROMOTION_EVAL_ID_PREFIX) {
         return false;
     }
     if !matches!(task.status, TaskStatus::Pending | TaskStatus::Scheduled) {
         return false;
     }
-    let grace = chrono::Duration::from_std(Duration::from_secs(timeout_secs.saturating_mul(2)))
+    let grace = chrono::Duration::from_std(ABANDONED_PROMOTION_EVAL_GRACE)
         .unwrap_or_else(|_| chrono::Duration::seconds(i64::MAX / 1000));
     task.updated_at + grace < now
 }
@@ -554,14 +572,20 @@ pub(crate) async fn submit_and_wait(
     poll_interval_secs: u64,
     task: Task,
     goal: String,
-    timeout_secs: u64,
 ) -> SFResult<Result<Task, String>> {
     let task_id = task.id.clone();
     // 图里同 id 的旧行会吃掉这一次提交：`add_tasks_batch` 撞上已有的 id 一律跳过，
     // 不读新交上去的那一份。上一次尝试留下的终态行（超时被收回、或失败）说的正是
     // 「那次没有答案」；让它挡在这里，同一个变更就再也跑不成 A/B，而且读起来是
     // 「门没跑」而不是「门被一行旧记录挡住了」。
-    if let Some(held) = orch.get_task(&task_id).await {
+    // 读不到时不能当成「没有旧行挡着」：那一行可能还在，而提交撞上已有 id 会被
+    // 当重投跳过——这一次 A/B 就静默地没跑，读起来像「门没跑」。
+    let held = orch.get_task_checked(&task_id).await.map_err(|e| {
+        SFError::Internal(format!(
+            "the row that might hold {task_id} could not be read: {e}"
+        ))
+    })?;
+    if let Some(held) = held {
         if matches!(held.status, TaskStatus::Cancelled | TaskStatus::Failed) {
             if let Err(e) = orch.delete_task(&task_id).await {
                 warn!(
@@ -579,9 +603,16 @@ pub(crate) async fn submit_and_wait(
         .map_err(|e| SFError::Internal(format!("submit task {task_id} failed: {e}")))?;
     let id = ids.into_iter().next().unwrap_or(task_id);
 
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    // 等到这一行有终态为止，不设等待上限：一件活结不结束由它自己（回收判据读的
+    // 是持有者租约与它上次动的时间）回答。等待方按秒数把它收走，收的是一件可能
+    // 正在干活的活——那正是这里删掉的那个东西。
     loop {
-        if let Some(t) = orch.get_task(&id).await {
+        // 等待方没有钟：把「读不到」当成「还在跑」就是无上限地等下去，而那条
+        // 活可能早就结束了。读不到就当场按读不到回去。
+        let polled = orch.get_task_checked(&id).await.map_err(|e| {
+            SFError::Internal(format!("promotion eval row {id} could not be read: {e}"))
+        })?;
+        if let Some(t) = polled {
             match t.status {
                 TaskStatus::Completed => return Ok(Ok(t)),
                 TaskStatus::Failed => {
@@ -590,21 +621,6 @@ pub(crate) async fn submit_and_wait(
                 TaskStatus::Cancelled => return Ok(Err("cancelled".into())),
                 _ => {}
             }
-        }
-        if Instant::now() >= deadline {
-            // 这次等待结束了，而那一行是它交上去的。就这么走开的话，行会一直挂在
-            // 图上：没有第二处会再来读它（派发器只在行有判据时才开工，清扫器只收
-            // `Scheduled`/`Running`），而按状态读这一行的人分不出「门还在想」与
-            // 「门走了、行留下了」。所以等的人把它收回去。
-            if let Err(e) = orch.cancel_task(&id).await {
-                warn!(
-                    task_id = %id,
-                    error = %e,
-                    "promotion eval: the wait is over but the row it filed could not be \
-                     withdrawn; it stays on the graph with nothing left to read it"
-                );
-            }
-            return Ok(Err(crate::cmd_timeout::timed_out_after(timeout_secs)));
         }
         tokio::time::sleep(Duration::from_secs(poll_interval_secs)).await;
     }
@@ -645,6 +661,13 @@ mod tests {
         tasks: Mutex<HashMap<String, Task>>,
         cancelled: Mutex<Vec<String>>,
         deleted: Mutex<Vec<String>>,
+        /// 读第一次之后把这一行推到终态：模拟「活自己结束了」。等待方不再有钟，
+        /// 所以测试里让它结束的必须是活本身，而不是等待方的耐心。
+        finish_on_first_read: Mutex<Option<TaskStatus>>,
+        /// 图读失败：问什么都答「读不到」，与「图上没有这一行」分开。
+        unreadable: Mutex<bool>,
+        /// 这一次提交落图之后把图推成读不到：模拟提交与轮询之间库坏掉。
+        unreadable_after_submit: Mutex<bool>,
     }
 
     fn pending_row(id: &str, since: chrono::DateTime<chrono::Utc>) -> Task {
@@ -675,6 +698,9 @@ mod tests {
                 ids.push(task.id.clone());
                 held.insert(task.id.clone(), task);
             }
+            if *self.unreadable_after_submit.lock().unwrap() {
+                *self.unreadable.lock().unwrap() = true;
+            }
             Ok(ids)
         }
         async fn assign_task(&self, _task_id: &str, _agent_id: &str) -> SFResult<()> {
@@ -694,6 +720,12 @@ mod tests {
         }
         async fn get_all_tasks(&self) -> Vec<Task> {
             self.tasks.lock().unwrap().values().cloned().collect()
+        }
+        async fn get_all_tasks_checked(&self) -> SFResult<Vec<Task>> {
+            if *self.unreadable.lock().unwrap() {
+                return Err(SFError::Database("mock graph cannot be read".into()));
+            }
+            Ok(self.get_all_tasks().await)
         }
         async fn push_to_dlq(&self, _task_id: &str, _error: String) -> SFResult<bool> {
             unimplemented!()
@@ -739,7 +771,26 @@ mod tests {
             Ok(vec![])
         }
         async fn get_task(&self, task_id: &str) -> Option<Task> {
-            self.tasks.lock().unwrap().get(task_id).cloned()
+            let mut held = self.tasks.lock().unwrap();
+            let task = held.get_mut(task_id)?;
+            // 只推还没到终态的行：提交前那次「旧行挡没挡住 id」的读不该把这一次
+            // 的结局提前用掉。
+            if matches!(task.status, TaskStatus::Pending | TaskStatus::Scheduled) {
+                let mut knob = self.finish_on_first_read.lock().unwrap();
+                if let Some(status) = *knob {
+                    task.status = status;
+                    *knob = None;
+                }
+            }
+            Some(task.clone())
+        }
+        async fn get_task_checked(&self, task_id: &str) -> SFResult<Option<Task>> {
+            if *self.unreadable.lock().unwrap() {
+                return Err(SFError::Database(format!(
+                    "mock graph cannot answer for {task_id}"
+                )));
+            }
+            Ok(self.get_task(task_id).await)
         }
         async fn schedule_task(&self, _task_id: &str) -> SFResult<()> {
             unimplemented!()
@@ -769,10 +820,12 @@ mod tests {
         }
     }
 
-    /// 等的人走了，行不能留在图上：按状态读它的人分不出「门还在想」与「门走了」。
+    /// 等待方不再有钟：活怎么结束由活自己回答，等待方只把它读回来，不把还在跑的
+    /// 那一行收走。收走一条正在干活的活，丢掉的是它已经付过的全部功夫。
     #[tokio::test]
-    async fn a_wait_that_ran_out_takes_its_row_back() {
+    async fn a_wait_ends_on_the_rows_own_ending_and_takes_nothing_back() {
         let graph = Arc::new(GateGraph::default());
+        *graph.finish_on_first_read.lock().unwrap() = Some(TaskStatus::Cancelled);
         let row = promotion_eval_task(
             "change-ledger-abc",
             "deadbeef",
@@ -781,16 +834,15 @@ mod tests {
         );
 
         let orch: Arc<dyn OrchestratorControl> = graph.clone();
-        let outcome = submit_and_wait(&orch, 0, row.clone(), "goal".into(), 0).await;
+        let outcome = submit_and_wait(&orch, 0, row.clone(), "goal".into()).await;
 
         assert!(
             matches!(outcome, Ok(Err(_))),
-            "超时要以理由回来，不是以一条任务回来"
+            "终态行要以理由回来，不是以一条任务回来"
         );
-        assert_eq!(
-            *graph.cancelled.lock().unwrap(),
-            vec![row.id.clone()],
-            "等待结束了，而它交上去的那一行还挂在图上"
+        assert!(
+            graph.cancelled.lock().unwrap().is_empty(),
+            "等待方把一行收走了：那一行可能还在干活"
         );
     }
 
@@ -808,19 +860,19 @@ mod tests {
         let mut ended = row.clone();
         ended.status = TaskStatus::Cancelled;
         graph.tasks.lock().unwrap().insert(ended.id.clone(), ended);
+        *graph.finish_on_first_read.lock().unwrap() = Some(TaskStatus::Cancelled);
 
         let orch: Arc<dyn OrchestratorControl> = graph.clone();
-        let _ = submit_and_wait(&orch, 0, row.clone(), "goal".into(), 0).await;
+        cog_core::ignore_lost!(submit_and_wait(&orch, 0, row.clone(), "goal".into()).await);
 
         assert_eq!(
             *graph.deleted.lock().unwrap(),
             vec![row.id.clone()],
             "旧行没让开，这一次提交会被当成重投跳过"
         );
-        // 让开之后这一次真的交上去了，才会又被这一次自己的等待收回。
-        assert_eq!(
-            *graph.cancelled.lock().unwrap(),
-            vec![row.id.clone()],
+        // 让开之后这一次真的交上去了，图上才会又出现这一行。
+        assert!(
+            graph.tasks.lock().unwrap().contains_key(&row.id),
             "这一次的提交没有落到图上"
         );
     }
@@ -835,8 +887,8 @@ mod tests {
             now - chrono::Duration::hours(20),
         );
         assert!(
-            is_abandoned_promotion_eval(&row, now, DEFAULT_EVAL_TIMEOUT_SECS),
-            "等待上限 3600 秒，而这行已经在图上停了 20 小时"
+            is_abandoned_promotion_eval(&row, now),
+            "孤儿宽限 7200 秒，而这行已经在图上没人认领地停了 20 小时"
         );
     }
 
@@ -846,8 +898,8 @@ mod tests {
         let now = chrono::Utc::now();
         let fresh = pending_row("promotion-eval-change-ledger-new", now);
         assert!(
-            !is_abandoned_promotion_eval(&fresh, now, DEFAULT_EVAL_TIMEOUT_SECS),
-            "刚落地的行还在等待上限之内"
+            !is_abandoned_promotion_eval(&fresh, now),
+            "刚落地的行还在孤儿宽限之内"
         );
 
         let mut done = pending_row(
@@ -856,13 +908,13 @@ mod tests {
         );
         done.status = TaskStatus::Completed;
         assert!(
-            !is_abandoned_promotion_eval(&done, now, DEFAULT_EVAL_TIMEOUT_SECS),
+            !is_abandoned_promotion_eval(&done, now),
             "终态的行不是没人等，是已经等到了"
         );
 
         let foreign = pending_row("some-other-work", now - chrono::Duration::hours(20));
         assert!(
-            !is_abandoned_promotion_eval(&foreign, now, DEFAULT_EVAL_TIMEOUT_SECS),
+            !is_abandoned_promotion_eval(&foreign, now),
             "不是这道门交上去的行，轮不到这道门来收"
         );
     }
@@ -892,5 +944,147 @@ mod tests {
 
         assert_eq!(withdrawn, 1, "收走的条数不对");
         assert_eq!(*graph.cancelled.lock().unwrap(), vec![stale.id.clone()]);
+    }
+
+    /// 清扫读不到图时不能答「收走 0 条」：那句与「图上真没有孤儿」逐字同形，而
+    /// 孤儿行不会自己消失，下一拍还得再清。
+    #[tokio::test]
+    async fn a_sweep_that_cannot_read_the_graph_withdraws_nothing_and_says_so() {
+        let graph = Arc::new(GateGraph::default());
+        let stale = pending_row(
+            "promotion-eval-change-ledger-ec0fc6a8c301bbf3-6862a991a1ff",
+            chrono::Utc::now() - chrono::Duration::hours(20),
+        );
+        graph.tasks.lock().unwrap().insert(stale.id.clone(), stale);
+        *graph.unreadable.lock().unwrap() = true;
+
+        let orch: Arc<dyn OrchestratorControl> = graph.clone();
+        let eval = PromotionEval::new(orch, DEFAULT_EVAL_TIMEOUT_SECS, 1, None);
+        let outcome = eval.withdraw_abandoned().await;
+
+        assert!(outcome.is_err(), "读不到图被答成了「这一趟收走 0 条」");
+        assert!(
+            graph.cancelled.lock().unwrap().is_empty(),
+            "图都没读到，却动了行"
+        );
+    }
+
+    /// 提交前那一读读不到时，别把一行可能还在的旧记录当成没有：交上去撞上已有
+    /// id 会被当重投跳过，这一次 A/B 就静默地没跑。
+    #[tokio::test]
+    async fn an_attempt_that_cannot_be_read_is_not_submitted_over() {
+        let graph = Arc::new(GateGraph::default());
+        *graph.unreadable.lock().unwrap() = true;
+        let row = promotion_eval_task(
+            "change-ledger-abc",
+            "deadbeef",
+            Path::new("/workspace/cogneva"),
+            900,
+        );
+
+        let orch: Arc<dyn OrchestratorControl> = graph.clone();
+        let outcome = submit_and_wait(&orch, 0, row.clone(), "goal".into()).await;
+
+        assert!(outcome.is_err(), "读不到却照样提交了");
+        assert!(
+            graph.tasks.lock().unwrap().is_empty(),
+            "读不到的那一行可能还在，却又交了一次"
+        );
+    }
+
+    /// 轮询里读不到时当场按读不到回去：等待方没有钟，把读失败当成「还在跑」
+    /// 就是无上限地等下去。
+    #[tokio::test]
+    async fn a_poll_that_cannot_read_the_row_answers_instead_of_waiting() {
+        let graph = Arc::new(GateGraph::default());
+        *graph.unreadable_after_submit.lock().unwrap() = true;
+        let row = promotion_eval_task(
+            "change-ledger-abc",
+            "deadbeef",
+            Path::new("/workspace/cogneva"),
+            900,
+        );
+
+        let orch: Arc<dyn OrchestratorControl> = graph.clone();
+        let outcome = submit_and_wait(&orch, 0, row.clone(), "goal".into()).await;
+
+        assert!(outcome.is_err(), "读不到那一行，却把它继续当成还在跑");
+    }
+}
+
+/// 判词与落地结果的分歧：**evaluator 说行、落地却否**（以及反过来）各有多少。
+///
+/// 只看分歧率没有用——它把「evaluator 太松」与「evaluator 太严」加成一个数，而两者
+/// 要做的活相反。所以这里成对给出，并且把「判过、落地结果还不知道」的那一档单独
+/// 列出来：它既不是分歧，也不是一致，把它算进分母会让率随未完成的比例漂移。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Disagreement {
+    /// 两处都说行。
+    pub agreed_pass: u64,
+    /// evaluator 说行、落地判否。
+    pub evaluator_looser: u64,
+    /// evaluator 说否、落地判行。
+    pub evaluator_stricter: u64,
+    /// 判过、落地结果还不知道：不进分母。
+    pub undecided: u64,
+}
+
+impl Disagreement {
+    /// 分歧率的分母：两处都有结论的那些。
+    pub fn decided(&self) -> u64 {
+        self.agreed_pass + self.evaluator_looser + self.evaluator_stricter
+    }
+
+    /// 分歧率；没有已决的样本时是 `None`——「一个都没判过」和「一个都没分歧」不是
+    /// 同一个数，前者用 0 表示会让判据在空样本上永远绿。
+    pub fn rate(&self) -> Option<f64> {
+        let decided = self.decided();
+        if decided == 0 {
+            return None;
+        }
+        Some((self.evaluator_looser + self.evaluator_stricter) as f64 / decided as f64)
+    }
+}
+
+#[cfg(test)]
+mod disagreement_tests {
+    use super::*;
+
+    /// 两个方向分开数：率一样、要做的事不同。
+    #[test]
+    fn the_two_directions_are_counted_apart() {
+        let loose = Disagreement {
+            agreed_pass: 8,
+            evaluator_looser: 2,
+            evaluator_stricter: 0,
+            undecided: 0,
+        };
+        let strict = Disagreement {
+            agreed_pass: 8,
+            evaluator_looser: 0,
+            evaluator_stricter: 2,
+            undecided: 0,
+        };
+        assert_eq!(loose.rate(), strict.rate());
+        assert_ne!(loose, strict);
+    }
+
+    /// 没结论的那些不进分母：进的话，率会随「还没落地」的比例漂移。
+    #[test]
+    fn undecided_rows_stay_out_of_the_denominator() {
+        let d = Disagreement {
+            agreed_pass: 1,
+            evaluator_looser: 1,
+            evaluator_stricter: 0,
+            undecided: 98,
+        };
+        assert_eq!(d.decided(), 2);
+        assert_eq!(d.rate(), Some(0.5));
+    }
+
+    /// 空样本没有率：0 会让判据在没东西可判时永远是绿的。
+    #[test]
+    fn an_empty_sample_has_no_rate() {
+        assert_eq!(Disagreement::default().rate(), None);
     }
 }

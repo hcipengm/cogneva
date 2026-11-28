@@ -105,6 +105,7 @@ async fn spawn_app_full(
     let (task_event_tx, _task_event_rx) = broadcast::channel::<cog_core::TaskEvent>(16);
 
     let gateway_state = Arc::new(GatewayState {
+        llm_call_events: None,
         data_dir: "/tmp".into(),
         config: std::sync::RwLock::new(GatewayConfig {
             http_port: 0, // random
@@ -113,15 +114,12 @@ async fn spawn_app_full(
             cors_origins: vec!["*".into()],
             websocket_timeout_secs: 30,
             websocket_inactivity_timeout_secs: 90,
-            websocket_tick_secs: 5,
             notification_limit: 50,
-            sandbox_task_timeout_secs: 30,
             request_timeout_secs: 30,
             notification_webhook_url: None,
             ..Default::default()
         }),
         request_timeout_secs: std::sync::atomic::AtomicU64::new(30),
-        sandbox_task_timeout_secs: std::sync::atomic::AtomicU64::new(30),
         event_tx: broadcast::channel(16).0,
         evolution_stream: None,
         task_event_tx,
@@ -178,10 +176,15 @@ async fn spawn_app_full(
         observables: Vec::new(),
         metrics_dimensions: Vec::new(),
         mcp_client: None,
+        mcp_call_counts: None,
         workspace_store: None,
         governance_store: None,
+        security_keys: None,
         principle_ledger: None,
         change_ledger: None,
+        intent_events: None,
+        employee_events: None,
+        message_events: None,
         key_value: None,
         external_skill_registry: None,
         tool_registry: None,
@@ -201,6 +204,7 @@ async fn spawn_app_full(
         llm_client: std::sync::Arc::new(std::sync::RwLock::new(None)),
         chat_turns: None,
         conversation: Default::default(),
+        chat_stream: Default::default(),
         agent_messages: None,
         datasets: None,
     });
@@ -669,10 +673,11 @@ async fn e2e_memory_ingest_and_search() {
         ingest_body
     );
 
-    // Search
+    // Search. `limit` is the caller's decision on how many rows to ask for,
+    // and the handler requires it rather than inventing a default.
     let res = client
         .get(format!(
-            "http://{}/api/v1/memory/schema?query=alice",
+            "http://{}/api/v1/memory/schema?query=alice&limit=10",
             app.addr
         ))
         .header("Authorization", &token)

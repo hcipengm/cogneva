@@ -15,8 +15,8 @@
 use std::path::{Path, PathBuf};
 
 pub use crate::contract::build_cache_reclaim::{
-    plan_reclaim, PlannedGroup, ReclaimPlan, DISCARDABLE_LEAVES, FLOOR_FILES_PER_LAYER,
-    RESULT_LEAVES,
+    cost_rank, plan_reclaim, PlannedGroup, ReclaimPlan, COMPILED_RESULT, DISCARDABLE_LEAVES,
+    FLOOR_FILES_PER_LAYER, RELOCATED_LEAVES, RESULT_LEAVES, TIME_ONLY,
 };
 
 /// What a pass removed, and what it could not.

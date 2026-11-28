@@ -18,10 +18,10 @@ metadata:
   name: cogneva-quota
   namespace: {{ include "cogneva.namespace" . }}
   # 额度按「声明工作负载 + 部署器判据 Job + 运行期自建 Pod + 替换重叠」定。
-  # 第三项在这里留的是 0：产品自己建的 Pod（评测台）在创建前按自己的清单把额度
-  # 抬到装得下，跑完放回去，所以渲染期不必替它预写一份。`runtimeWorkloads` 里有
-  # 条目时（不由产品创建、也不会自己抬额度的那种），投影把它的形状加进求和，
-  # 这一行随之非零。缺注解不是零，是报错：留空读作"没声明"，不读作"不需要"。
+  # 第三项留的是 0：产品自己建的 Pod（评测台）在创建前按线上部署此刻的容器声明
+  # 把额度抬到装得下，Pod 消失后放回去，所以渲染期不替它预写一份。这一项要声明
+  # 的是**别人**建的那类 Pod（运维临时起的等），它们同样记在 used 上、却没有谁替
+  # 它们抬额度；没有这类 Pod 也写 0，缺注解不是零，是报错。
   annotations:
     cogneva.io/runtime-pods-limits-cpu: {{ $r.limitsCpu | quote }}
     cogneva.io/runtime-pods-limits-memory: {{ $r.limitsMemory | quote }}

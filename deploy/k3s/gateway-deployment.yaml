@@ -34,7 +34,7 @@ spec:
       annotations:
         # 本 Pod 经 envFrom 取 cogneva-config。env 只在进程启动时读一次，所以
         # 只改配置的那次升级必须换掉这个模板，否则改完地址也不会生效。
-        checksum/config: c470b120e9915fa443dab074a287c64bab5bcd96396bff422cd65e9f1f7821a7
+        checksum/config: fdb3c2e9d0f3b958d3c82827d9c933ccb74b7cff309fe2b8b8bf670d7aad6f5c
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: security-gateway
@@ -107,6 +107,14 @@ spec:
                   name: cogneva-secrets-oob
                   key: search-fallback-upstreams
                   optional: true
+            # 内存 Raw 层的面：每次 LLM 调用的请求字节与回来的字节整份归档到这里，
+            # 留底表只留索引（哈希、字节数、指针）。指向主应用的**内部端口**，
+            # 与业务 Pod 那一份同源——正文的存放处只有一个，两边各配一个地址就会
+            # 出现「写入落在 A、读取去 B」。缺这个值＝正文没有永久副本，读数里带
+            # unconfigured 的原因。与 chart 的网关部署同源（端口取自
+            # gateway.internalPort），写在这里是为了 parity 能逐字段对上。
+            - name: COGNEVA_MEMORY_API_BASE
+              value: "http://cogneva:8085"
             - name: COGNEVA_GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:

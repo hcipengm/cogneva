@@ -202,7 +202,7 @@ async fn test_the_comparison_step_is_held_to_the_specification() {
         ..SelfReviewConfig::default()
     };
 
-    let _ = SelfReviewLoop::new(config).review("draft", &provider).await;
+    cog_core::ignore_lost!(SelfReviewLoop::new(config).review("draft", &provider).await);
 
     let payloads = provider.payloads();
     assert_eq!(payloads.len(), 2, "critique and compare, one call each");
@@ -672,18 +672,20 @@ async fn test_agent_loop_runs_correctly() {
 
     let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
     let config = RuntimeConfig {
+        stated_directions: Vec::new(),
         agent_id: "test-agent".into(),
         role: "planner".to_string(),
         max_iterations: 1,
-        context_window_size: 4000,
+        context_window_size: Some(4000),
         skill_config: None,
         crew_id: None,
         squad_id: None,
         skill_cache_ttl_secs: 30,
         think_stall_timeout_secs: 240,
-        final_draft_timeout_secs: 300,
         // 这条测的是运行循环与自审，不关心这次运行替谁干活。
         owner_task_id: None,
+        deliverable: cog_core::Deliverable::Unstated,
+        deliverable_state: cog_core::DeclarationState::Unstated,
     };
 
     let mut agent_loop = AgentRuntime::new(config, event_tx);

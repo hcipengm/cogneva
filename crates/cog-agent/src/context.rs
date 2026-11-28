@@ -1,4 +1,5 @@
 use cog_core::Message;
+use std::sync::Arc;
 
 /// Agent 上下文窗口管理。
 /// 参考 pi-agent-core 的 transcript 设计，但用 Rust Vec 替代 JS 数组。
@@ -13,18 +14,206 @@ pub struct ContextWindow {
     messages: Vec<Message>,
     /// 与 `messages` 同一套插入位置，但**从不**因为预算被裁。
     history: Vec<Message>,
-    max_tokens: usize,
+    max_tokens: Option<usize>,
     current_tokens: usize,
+    /// 这一轮从提示词里挤掉了什么。裁剪一次记一次，攒到 [`Self::take_compaction`]
+    /// 取走为止；没有裁剪就一直是 `None`。
+    compaction: Option<Compaction>,
+    /// 最近观察到的一次正常往返占多少 token。折中间段时，尾部要留够这么多，
+    /// 否则刚发生的事会被折掉。`None` 表示还没量到——那时一条也不折。
+    round_trip_tokens: Option<usize>,
+    /// 地板压进窗口时，被截掉的正文外置到哪个目录。数据根下的 `context-spill`：
+    /// 内容是原文的副本，`DATA_ROOT_SUBDIRS` 里的一句判词说它换机后能不能丢。
+    /// 测试把它指到临时目录，别往装好的那棵树上写。
+    spill_dir: std::path::PathBuf,
+}
+
+/// 一次（或一轮里几次）提示词裁剪的现场。
+///
+/// 裁剪是长对话的常态，但被挤出去的是**这段对话里已经发生过的事**：模型这一轮
+/// 不再看得见它，而屏幕上什么也没说——读者于是以为模型还记得。这份记录回答三件
+/// 事：挤掉了多少（条数与估算 token）、还在的那一段从哪一条开始、被挤掉那一段的
+/// 开头是什么。它由循环挂在这一轮的交付物上带给网关，界面据此画一行。
+///
+/// 不在这里生成摘要：摘要是第二次生成，读者分不清它是原文还是转述。给一段被挤掉
+/// 内容自己的开头，读者能认出那是哪一轮——与「引用里不带摘要」是同一条取舍。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Compaction {
+    /// 这一轮里被挤出提示词的消息条数（跨多次裁剪累加）。
+    pub dropped_messages: usize,
+    /// 这些消息按估算占了多少 token。
+    pub freed_tokens: usize,
+    /// 裁剪之后提示词里还剩多少条。
+    pub kept_messages: usize,
+    /// 还在的那一段从哪一条开始：`role: 开头几十个字`。
+    pub kept_from: Option<String>,
+    /// 被挤掉的第一条的开头：读者认得出这是哪一段对话。
+    pub dropped_head: Option<String>,
+    /// 这一次裁剪的界：窗口预算与低水位。两个数一起给，读者才看得出挤掉一大段
+    /// 是「窗口太小」还是「本来就这么紧」。
+    pub budget_tokens: usize,
+    pub target_tokens: usize,
+}
+
+/// 压实的三段划分：头（system 与目标）、要折掉的中间段、尾（最近几轮）。
+///
+/// 为什么是「折中间」而不是「从头删」：头部是这一轮的目标与系统提示，删掉它模型就不知道
+/// 自己在干什么；尾部是刚刚发生的事，删掉它模块就不知道接着做什么。中间那一段是**已经
+/// 发生、且不再驱动下一步**的历史——它该以摘要的形式留下，而不是整段消失。
+///
+/// 尾留多长**不是一个拍出来的轮数**：留「一次正常往返」那么多。那个量是实测的（最近
+/// 若干次往返里最大的一次占了多少 token），它随着这一轮怎么用而变；量不到时（还没有
+/// 任何一次往返的记录）就**什么都不折**——没有读数支撑的尾长，折出来的摘要必然切掉
+/// 刚刚发生的事。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoldPlan {
+    /// 尾部从第几条开始（索引）。
+    pub tail_from: usize,
+    /// 中间段有多少条会被折掉。
+    pub folded: usize,
+}
+
+/// 算出三段的分界。`messages` 按时间顺序；`tail_tokens` 是「一次正常往返」的量。
+///
+/// 头部边界由调用方给：`head` 是 system 与目标那几条的条数（运行时会保证它们在最前）。
+/// 尾部从后往前攒到 `tail_tokens` 为止，攒不够就一条都不折。
+pub fn plan_fold(message_tokens: &[usize], head: usize, tail_tokens: usize) -> Option<FoldPlan> {
+    // `tail_tokens == 0` 是**量不到**那次往返：没有读数支撑的尾长会切掉刚刚发生的事。
+    // 缺了这一句，循环第一次就把最后一条算进尾巴（`tail >= 0` 恒真），于是「没量到」
+    // 被当成「尾长很小」，折掉了一整段中间。
+    if message_tokens.len() <= head || tail_tokens == 0 {
+        return None;
+    }
+    let mut tail = 0usize;
+    let mut tail_from = message_tokens.len();
+    for (index, tokens) in message_tokens.iter().enumerate().rev() {
+        if index < head {
+            break;
+        }
+        tail += *tokens;
+        tail_from = index;
+        if tail >= tail_tokens {
+            break;
+        }
+    }
+    if tail_from <= head {
+        // 整段都装得进那次往返：中间没有可折的东西。
+        return None;
+    }
+    let folded = tail_from - head;
+    if folded == 0 {
+        return None;
+    }
+    Some(FoldPlan { tail_from, folded })
+}
+
+/// 被压掉那一段的**结构化摘要**：四样必须能从它读回来。
+///
+/// 压实把一段对话折成一条摘要时，最危险的不是丢内容，是丢了「什么还没定」与「什么
+/// 试过并且失败」——这两样是后面几步要用的，而模型自己不会记得它没见过的东西。所以摘要
+/// 的字段是四样具体的东西，不是一段自由文本：
+///
+/// - `decisions`：已经定下来的事（每条一句）；
+/// - `open`：**还没定**的事（每条一句，带它是谁提的）；
+/// - `files`：这一段里动过哪些文件，以及为什么动；
+/// - `failures`：试过并且失败的做法（每条一句，带失败的形状）。
+///
+/// 一段没有这四样的摘要是「原文的转述」，读者分不清哪句是事实、哪句是模型的复述——
+/// 与「引用里不带摘要」是同一条取舍：能逐条读回来的才写，写不回来的留原文。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompactionSummary {
+    pub decisions: Vec<String>,
+    pub open: Vec<String>,
+    pub files: Vec<String>,
+    pub failures: Vec<String>,
+}
+
+impl CompactionSummary {
+    /// 一条都不许空着写：空摘要不是「这一段没什么可记」，是「没人从这一段里读出东西」。
+    pub fn is_empty(&self) -> bool {
+        self.decisions.is_empty()
+            && self.open.is_empty()
+            && self.files.is_empty()
+            && self.failures.is_empty()
+    }
+
+    /// 折成一条消息：四段各有标题，标题就是字段名，读者按标题读回来。
+    ///
+    /// 不写「摘要如下」这类开头：一条摘要是不是真读出来了，看的是这四段有没有内容，
+    /// 而一句开场白会让空摘要也长得像有内容。
+    pub fn render(&self) -> String {
+        let section = |title: &str, items: &[String]| {
+            if items.is_empty() {
+                return String::new();
+            }
+            let mut out = format!("{title}:\n");
+            for item in items {
+                out.push_str("- ");
+                out.push_str(item);
+                out.push('\n');
+            }
+            out
+        };
+        let mut out = String::new();
+        out.push_str(&section("决定", &self.decisions));
+        out.push_str(&section("未决", &self.open));
+        out.push_str(&section("动过的文件", &self.files));
+        out.push_str(&section("失败过", &self.failures));
+        out
+    }
+}
+
+/// 一条消息给人看的开头：角色 + 正文第一行，够读者认出是哪一轮。
+///
+/// 按字符截而不是按字节：正文里通常有中文，按字节切会落在字的中间。
+// cap: fixed — 一行摘要的长度，不是资源界；它只决定界面上「保留边界」写多长，
+// not-a-bound: 一行摘要的展示长度，不参与任何判断
+
+fn headline(message: &Message) -> String {
+    let text = message.content();
+    let first = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    // 这里只用于日志与前缀里认出是哪一句。按「默认无损」的口径，截断是不合法的：
+    // 整行照原样带上——日志的读者要能读到完整的那一句。
+    format!("{}: {first}", message.role())
 }
 
 impl ContextWindow {
-    pub fn new(max_tokens: usize) -> Self {
+    /// `max_tokens` 为 `None` 表示**没人说过这个窗口有多大**——不是零个 token 的窗口。
+    ///
+    /// 这两个状态必须分开：窗口来自读数（型号公布的规格、实测的界），还没读到
+    /// 时它根本不存在（没有配置能写一个进来）。把「没说过」读成 0，第一条消息进来就会被
+    /// 裁到地板，模型每一轮看到的都是同一份空上下文；读成「暂时不裁」，由第一次
+    /// 拒收自述的界把窗口定下来，才是这两个状态本来的区别。这里从前用 `usize`
+    /// 的 0 表示「没人说过」，靠的是每个读者都记得那条约定；类型现在自己说。
+    pub fn new(max_tokens: Option<usize>) -> Self {
         Self {
             messages: Vec::new(),
             history: Vec::new(),
             max_tokens,
             current_tokens: 0,
+            compaction: None,
+            round_trip_tokens: None,
+            spill_dir: std::path::Path::new(&cog_core::paths::data_dir()).join("context-spill"),
         }
+    }
+
+    /// 记下一次正常往返占了多少 token。
+    ///
+    /// 这个数是「折中间段时尾部要留多长」的**唯一出处**：没有它就没有依据说哪一段
+    /// 是「刚刚发生」、哪一段是「已经过去」。量不到时保持 `None`，折的动作不发生。
+    pub fn note_round_trip(&mut self, tokens: usize) {
+        if tokens > 0 {
+            self.round_trip_tokens = Some(tokens);
+        }
+    }
+
+    /// 真正生效的预算：没人说过窗口时是「没有界」。
+    fn budget(&self) -> usize {
+        self.max_tokens.unwrap_or(usize::MAX)
     }
 
     pub fn add_message(&mut self, message: Message) {
@@ -69,6 +258,7 @@ impl ContextWindow {
     ///
     /// 已经有这段就什么都不做：同一个智能体跨轮复用，重复并进去等于同一条
     /// 指示按轮数计费。
+    // prompt: not-an-instruction — 把已有的几条系统消息并进第一条，本函数不新写一个字
     pub fn merge_head_system(&mut self, text: &str) {
         let text = text.trim();
         if text.is_empty() {
@@ -87,6 +277,48 @@ impl ContextWindow {
         } else {
             format!("{text}\n\n{old}")
         };
+        if let Some(Message::System { content, .. }) = self.messages.first_mut() {
+            *content = merged.clone();
+        }
+        // 历史开头与实际开头是同一条：模型读过的那份与系统留的那份要一致。
+        if let Some(Message::System { content, .. }) = self.history.first_mut() {
+            if content == &old {
+                *content = merged.clone();
+            }
+        }
+        self.current_tokens = self
+            .current_tokens
+            .saturating_add(estimate_tokens(&merged))
+            .saturating_sub(estimate_tokens(&old));
+    }
+
+    /// 把以前并进开头的那一段拿掉。
+    ///
+    /// 并进去的东西不都是一成不变的：平台此刻生效的规则会变，账上撤掉一条
+    /// 之后，上一轮并进系统前缀的那一段如果留着，模型这一轮会读到一条已经
+    /// 不生效的规则，并且不知道它已经不生效了。并进是按「这一段在不在」判断
+    /// 的，拿掉也按同一粒度：整段移除，再收掉因此留下的空段——不收的话，系统
+    /// 前缀会随着规则改写一次长高一段。
+    ///
+    /// 不在这段系统前缀里就什么都不做：上下文被重建过、或这一段从来没并进来，
+    /// 都不是错误。
+    pub fn drop_from_head_system(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let Some(Message::System { content, .. }) = self.messages.first() else {
+            return;
+        };
+        if !content.contains(text) {
+            return;
+        }
+        let old = content.clone();
+        let mut merged = old.replace(text, "");
+        while merged.contains("\n\n\n") {
+            merged = merged.replace("\n\n\n", "\n\n");
+        }
+        let merged = merged.trim().to_string();
         if let Some(Message::System { content, .. }) = self.messages.first_mut() {
             *content = merged.clone();
         }
@@ -132,6 +364,31 @@ impl ContextWindow {
         self.messages.clear();
         self.history.clear();
         self.current_tokens = 0;
+        // 裁剪记录属于**这一次运行**：清空窗口就是新的一段对话，上一段挤掉了
+        // 什么都不再是这一段的现场。
+        self.compaction = None;
+    }
+
+    /// 把这一轮累计的裁剪记录取走并清零。
+    ///
+    /// 取走而不是读：这条记录说的是「这一轮从提示词里挤掉了什么」，读到下一次
+    /// 运行里就是一份说错了对象的现场。没有裁剪就是 `None`——界面不发那条线。
+    /// 这一份提示里已经被挤掉多少条更早的消息；不取走（取走是运行收尾的事）。
+    pub fn last_compaction_dropped(&self) -> usize {
+        self.compaction
+            .as_ref()
+            .map(|report| report.dropped_messages)
+            .unwrap_or(0)
+    }
+
+    pub fn take_compaction(&mut self) -> Option<Compaction> {
+        let mut report = self.compaction.take()?;
+        // 保留条数取**交出去这一刻**的投影长度：裁剪之后这一轮还可能追加了几条
+        // （模型的回答、工具结果），读者问的是「现在手上还剩多少」，不是裁剪那
+        // 一拍剩了多少。边界（`kept_from`）不重算——裁剪只从头段删，尾巴从哪一条
+        // 开始不会因为后面追加而改变。
+        report.kept_messages = self.messages.len();
+        Some(report)
     }
 
     /// Replace all messages and recalculate token count.
@@ -164,6 +421,33 @@ impl ContextWindow {
         self.current_tokens
     }
 
+    /// The budget this window trims to, in estimated tokens; `None` = 没人说过。
+    pub fn max_tokens(&self) -> Option<usize> {
+        self.max_tokens
+    }
+
+    /// Move the budget, and trim to the new one in the same step.
+    ///
+    /// The budget is not a constant of the object: the only place the
+    /// upstream's window is measured is a call's own usage and its refusals,
+    /// and both arrive while this window holds a conversation. A budget that
+    /// could only be set at construction would leave every measurement
+    /// unactable until the next process — which is the whole shape of the bug
+    /// this is for: a run that keeps re-sending a prompt sized for a window it
+    /// does not have.
+    ///
+    /// Trimming here rather than at the next `add_message` is what makes the
+    /// next call different from the one that was just refused: the over-budget
+    /// messages are dropped now, so the very next request is smaller whether
+    /// or not another message arrives first.
+    pub fn set_max_tokens(&mut self, max_tokens: Option<usize>) {
+        if self.max_tokens == max_tokens {
+            return;
+        }
+        self.max_tokens = max_tokens;
+        self.trim_if_needed();
+    }
+
     /// 只剩地板（system 与首条 user）却仍然超预算。
     ///
     /// 这个状态一旦成立，之后每一条消息加进来都会在同一拍被裁掉：模型每一轮
@@ -172,7 +456,130 @@ impl ContextWindow {
     /// 2026-11-06 实测：一件自进化任务的窗口占用 66,368 token、窗口 64,000，
     /// 同一个 179,595 字节的请求体被原样发了 1,563 次，一小时零产出。
     pub fn floor_exceeds_budget(&self) -> bool {
-        self.messages.len() <= 2 && self.current_tokens > self.max_tokens
+        self.messages.len() <= 2 && self.current_tokens > self.budget()
+    }
+
+    /// 入口处的尺寸判据：这条活本身放不放得进窗口。
+    ///
+    /// 与 [`Self::shrink_floor_to_fit`] 是同一个判据的**只读**形态：入口在开跑之前问
+    /// 一次，答案是「放不进」时，那是入口写错了（有人把整本书塞进一句任务），不是这一
+    /// 轮的结局——运行时每轮都去截一次再失败，读起来会像「模型不行」。最短的形态也装
+    /// 不下时就没有更短的形态了：一个字符的开头加那行指针。
+    pub fn intake_fits(&self) -> bool {
+        let Some(budget) = self.max_tokens else {
+            return true; // 没人说过窗口多大：无所谓「装不下」
+        };
+        let Some(index) = self.messages.iter().position(|m| m.role() == "user") else {
+            return true;
+        };
+        let original = self.messages[index].content();
+        let spill_at = spill_path(&self.spill_dir, &original);
+        let head: String = original.chars().take(1).collect();
+        let shortest = format!(
+            "{head}\n…（任务正文被截到窗口里能放下的长度：共 {} 个字符；整段正文：{}）",
+            original.chars().count(),
+            spill_at.display()
+        );
+        // 判的是**这条任务正文**压成指针之后还放不放得进窗口。system 与工具面
+        // 那半截不在这里算：那半截装不下是「地板高过窗口」的另一种结局
+        // （`floor_exceeds_budget`），而这条界判的是入口写错了——把整本书塞进
+        // 一句任务。把固定半截也算进来时，窗口一小它就替地板那一条报成「正文
+        // 装不下」，读的人会去改入口，而该改的是窗口。
+        let pointer = Message::user(&shortest);
+        estimate_tokens(&pointer.content()) <= budget
+    }
+
+    /// 地板装不下时把它压进预算：截断首条 user（任务输入），窗口里只留它的开头。
+    ///
+    /// 「窗口有限、任务无界」靠的正是这一步：任务正文本该先落到可寻址的存储里、
+    /// 窗口里只放指针。这里做的是同一件事的最小形态——保留开头，截掉尾部，
+    /// 并在结尾写明被截了多少。压得进去返回 `true`，压完仍装不下返回 `false`：
+    /// 那时缺的是入口那一侧的尺寸判据（任务把整本书塞进一句话），不是运行时的错。
+    pub async fn shrink_floor_to_fit(
+        &mut self,
+        archive: Option<&Arc<dyn crate::archive::ToolOutputArchive>>,
+    ) -> bool {
+        let Some(budget) = self.max_tokens else {
+            return true; // 没人说过窗口多大：地板无所谓「装不下」
+        };
+        let Some(index) = self.messages.iter().position(|m| m.role() == "user") else {
+            return !self.floor_exceeds_budget();
+        };
+        let original = self.messages[index].content();
+        let chars: Vec<char> = original.chars().collect();
+        // 正文外置到哪个文件先算出来：内容是寻址的，写与不写都落在同一个路径上。
+        // 二分里的候选正文必须**已经**带上这个路径——截完的正文与预算判的要是
+        // 同一段字，否则补上那句话又把窗口顶出去，落回「压不进」。
+        // 正文外置到哪：优先平台归档（Raw 层，可检索、可重建），指针与工具结果
+        // 那一路同一个形状（`artifact://…`）；没有归档时退回本机数据根下的文件。
+        // 归档失败与「没有归档」走同一个回落——本机文件是两种情况下都能取回的那条路。
+        let archived = match archive {
+            Some(archive) => archive
+                .archive("task_input", &spill_id(&original), "text/plain", &original)
+                .await
+                .ok(),
+            None => None,
+        };
+        let spill_at = match archived {
+            Some(uri) => uri,
+            None => spill_path(&self.spill_dir, &original).display().to_string(),
+        };
+        let tail = format!(
+            "\n…（任务正文被截到窗口里能放下的长度：共 {} 个字符；整段正文：{}）",
+            chars.len(),
+            spill_at
+        );
+        // 二分出能装下的最长前缀：估算与裁剪用同一套字符计数。
+        let (mut low, mut high) = (0usize, chars.len());
+        while low < high {
+            let mid = (low + high + 1) / 2;
+            let head: String = chars[..mid].iter().collect();
+            let text = format!("{head}{tail}");
+            let candidate = Message::user(&text);
+            let total: usize = self
+                .messages
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    if i == index {
+                        estimate_tokens(&candidate.content())
+                    } else {
+                        estimate_tokens(&m.content())
+                    }
+                })
+                .sum();
+            if total <= budget {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        if low == 0 {
+            return false;
+        }
+        // 截掉的那一段**不能就这么丢**：正文外置到可寻址的文件里，窗口里留它的
+        // 路径，模型用 `read_file` 就能取回整段（属主 2026-11-23：「窗口有限、
+        // 任务无界」，靠的正是这一步，而不是把任务砍短了事）。
+        let head: String = chars[..low].iter().collect();
+        // 写不进去时不能留一个指向空处的路径：退回到「只在这条任务行上」——
+        // 这句话比路径短，二分定下的前缀仍然装得下。
+        let text = if spill_at.starts_with("artifact://")
+            || spill_floor(std::path::Path::new(&spill_at), &original)
+        {
+            format!("{head}{tail}")
+        } else {
+            format!(
+                "{head}\n…（任务正文被截到窗口里能放下的长度：共 {} 个字符；整段正文只在这条任务行上）",
+                chars.len()
+            )
+        };
+        self.messages[index] = Message::user(&text);
+        self.current_tokens = self
+            .messages
+            .iter()
+            .map(|m| estimate_tokens(&m.content()))
+            .sum();
+        !self.floor_exceeds_budget()
     }
 
     /// The character budget one tool result may occupy in this window.
@@ -193,14 +600,75 @@ impl ContextWindow {
     /// （system 与首条 user）那几百 token，窗口一旦填满就再也涨不回去。
     /// 裁到一半，同样的事隔一整个半窗才发生一次，中间每一轮都是纯追加。
     fn trim_target(&self) -> usize {
-        self.max_tokens / TRIM_LOW_WATER_DIVISOR
+        self.budget() / TRIM_LOW_WATER_DIVISOR
+    }
+
+    /// 折中间段：把头与尾之间那一段换成一条摘要消息。
+    ///
+    /// 只在**量到过一次往返**时做（`plan_fold` 给出分界）：尾留一次往返的量，头部
+    /// 是 system 与首条 user，中间那段是要折的。折的单位按**轮次组**——切点落在
+    /// assistant 与它的 tool result 之间时，把切点往前收，直到不切断一组：切断一组
+    /// 会留下声明了 tool_calls 却无响应的 assistant，严格校验的上游直接 400。
+    ///
+    /// 返回折掉了多少条；0 表示这一拍没有折（没量到、或者中间没有东西可折）。
+    fn fold_middle(&mut self) -> usize {
+        let Some(round_trip) = self.round_trip_tokens else {
+            return 0;
+        };
+        let head = self
+            .messages
+            .iter()
+            .take_while(|m| matches!(m, Message::System { .. }))
+            .count()
+            .max(1); // 首条 user 也是地板
+        let per_message: Vec<usize> = self
+            .messages
+            .iter()
+            .map(|m| estimate_tokens(&m.content()))
+            .collect();
+        let Some(plan) = plan_fold(&per_message, head, round_trip) else {
+            return 0;
+        };
+        // 切点不能落在「assistant 与它的 tool result 之间」：往前收到这一组的开头。
+        let mut start = plan.tail_from;
+        while start > head && matches!(self.messages[start], Message::ToolResult { .. }) {
+            start -= 1;
+        }
+        if start <= head {
+            return 0;
+        }
+        let dropped: Vec<Message> = self.messages.drain(head..start).collect();
+        let freed: usize = dropped.iter().map(|m| estimate_tokens(&m.content())).sum();
+        self.current_tokens = self.current_tokens.saturating_sub(freed);
+        // 折出来的那一条必须是**用户**消息：它描述的是「这一段里发生过什么」，
+        // 不是谁说的一句话；写成 assistant 会让下一轮看起来像模型自己刚说过。
+        let summary = CompactionSummary {
+            open: dropped
+                .iter()
+                .filter(|m| matches!(m, Message::User { .. }))
+                .map(headline)
+                .collect(),
+            ..Default::default()
+        };
+        let folded_tokens = estimate_tokens(&summary.render());
+        if !summary.is_empty() {
+            self.messages.insert(head, Message::user(summary.render()));
+            self.current_tokens += folded_tokens;
+        }
+        dropped.len()
     }
 
     fn trim_if_needed(&mut self) {
+        // 先折中间段：头与尾都是这一轮要继续的上下文，折中间把它变成一条摘要。
+        // 没量到往返（因此没依据留多长的尾）时 `fold_middle` 返回 0，落到下面
+        // 原来那条「从头按轮次组删」的路径上——两条路都只做一次，不叠加。
+        if self.current_tokens > self.budget() && self.fold_middle() > 0 {
+            return;
+        }
         // 只有真过界才裁；一旦裁就裁到低水位，而不是裁到刚好不超。
         // 判据是「这一次入队把窗口顶过了预算」——没过界就不裁，过界之后
         // 的循环由低水位收尾。
-        let over_budget = self.current_tokens > self.max_tokens;
+        let over_budget = self.current_tokens > self.budget();
         while over_budget && self.current_tokens > self.trim_target() && self.messages.len() > 2 {
             // 保留 system message 与首条 user（任务输入）：丢掉首条 user 后，
             // 后续轮次会变成 assistant/tool 起头的无目标对话，模型答非所问。
@@ -235,17 +703,48 @@ impl ContextWindow {
             }
             let mut freed = 0usize;
             let mut dropped = 0usize;
+            let mut dropped_head: Option<String> = None;
             for m in self.messages.drain(idx..end) {
                 freed += estimate_tokens(&m.content());
+                if dropped_head.is_none() {
+                    dropped_head = Some(headline(&m));
+                }
                 dropped += 1;
             }
             self.current_tokens = self.current_tokens.saturating_sub(freed);
-            // 裁剪只作用在投影上，所以这条报的是「模型这一轮少看到多少」，
-            // 而不是「丢了什么」——被裁的轮次仍在 history 里，落进 raw 归档。
-            // 不另铸指标：压力读数由耐久面自己给（transcript 的估算长度对窗口
-            // 配置），铸一个只在这里 +1 的计数器，等于把同一个量记两遍。
+            // 记下这一轮挤掉了什么：模型下一轮就看不见它了，屏幕上必须有一行说
+            // 这件事。跨多次裁剪累加——一次运行里可能裁好几拍，读者要的是「这一轮
+            // 一共少看到多少」，不是最后一拍。
+            let kept_from = self
+                .messages
+                .iter()
+                .find(|m| !matches!(m, Message::System { .. }))
+                .map(headline);
+            // 走到这里说明真的裁过，也就是预算存在；没有预算时 `budget()` 是
+            // `usize::MAX`，裁不会发生。读数与这条路径同源。
+            let budget_tokens = self.budget();
+            let target_tokens = self.trim_target();
+            let report = self.compaction.get_or_insert_with(|| Compaction {
+                budget_tokens,
+                target_tokens,
+                ..Compaction::default()
+            });
+            report.dropped_messages += dropped;
+            report.freed_tokens += freed;
+            report.kept_messages = self.messages.len();
+            report.kept_from = kept_from;
+            if report.dropped_head.is_none() {
+                report.dropped_head = dropped_head;
+            }
+            // 裁剪只作用在投影上，所以这条报的是「模型这一轮少看到多少」，而不是
+            // 「丢了什么」——被裁的轮次仍在 `history` 里（这一份从不因预算被裁）。
+            //
+            // 如实说清它到哪一步为止：`history` 是**进程内**的，一次 run 结束时
+            // 随 `AgentEnd` 整份发布出去；进程死在发布之前，这一段就只剩内存里
+            // 那一份。把它说成「已落进 raw 归档」是过头话——那一天还没有来（S45/S47
+            // 是那条待办）。
             tracing::debug!(
-                "Context window dropped {} messages (~{} tokens) from the prompt; the window budget is {}, the low-water target is {}, the run history keeps {} messages",
+                "Context window dropped {} messages (~{} tokens) from the prompt; the window budget is {:?}, the low-water target is {}, the run history keeps {} messages",
                 dropped,
                 freed,
                 self.max_tokens,
@@ -277,11 +776,11 @@ impl ContextWindow {
         // 出站」在读数上同形，而两种情况的处置相反：前者调估算，后者调预算或
         // 地板。上面那条逐次裁剪留在 debug（常态，按窗口预算反复发生），
         // 这一条是**例外**，所以报在被采集的那一级。
-        if self.current_tokens > self.max_tokens {
+        if self.current_tokens > self.budget() {
             tracing::warn!(
-                budget = self.max_tokens,
+                budget = self.budget(),
                 estimated = self.current_tokens,
-                excess = self.current_tokens - self.max_tokens,
+                excess = self.current_tokens - self.budget(),
                 kept_messages = self.messages.len(),
                 "the context window goes out over budget: the floor of system plus the first user message does not fit, so trimming ran out of messages to drop"
             );
@@ -294,7 +793,8 @@ impl ContextWindow {
 /// 留一半给任务输入、system 与后续轮次，超出的部分不是"内容多"而是
 /// 这条结果根本挤不进这段对话。与窗口同源而不是另立一个绝对值：
 /// 窗口配大了，允许的单条结果跟着变大，两者不会各自漂移。
-// cap: bound — 与窗口同源而不是另立一个绝对值：窗口配大了，允许的单条结果跟着变大，两者不会各自漂移
+// cap: fixed:上下文窗口的一半——单条工具结果最多占半个窗口，与裁剪低水位 `TRIM_LOW_WATER_DIVISOR` 同源（结构约定）
+// keep: 删掉后一条工具结果可以占满整个窗口，上下文超窗被上游拒收；由「单条结果不超过半个窗口」兜住
 const TOOL_RESULT_WINDOW_SHARE_DIVISOR: usize = 2;
 
 /// 裁剪要把窗口压到预算的几分之一为止，即滞回的低水位。
@@ -303,8 +803,35 @@ const TOOL_RESULT_WINDOW_SHARE_DIVISOR: usize = 2;
 /// 挪一格，缓存从第一个被删的位置起全部作废，命中率永远只剩地板。压到一半
 /// 之后，同样的裁剪要隔半个窗口才再发生一次，中间每一轮都是纯追加。
 /// 见 [`ContextWindow::trim_target`]。
-// cap: bound — 同样按窗口的一半：裁剪之后要隔半个窗口才再发生一次，中间每一轮都是纯追加
+// cap: fixed:上下文窗口的一半——裁剪低水位取半窗，使下一次裁剪隔半个窗口才发生（结构约定）
+// keep: 删掉后裁剪到整窗，下一次裁剪立刻又来，上下文在每轮抖动；由「低水位取半窗」兜住
 const TRIM_LOW_WATER_DIVISOR: usize = 2;
+
+/// 一段过大的任务正文外置到哪个文件：内容寻址，同一段正文永远落在同一条路径上，
+/// 重跑不会堆出第二份。
+fn spill_path(dir: &std::path::Path, text: &str) -> std::path::PathBuf {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(text.as_bytes());
+    dir.join(format!("{}.txt", hex::encode(&digest[..16])))
+}
+
+/// 同一段正文在平台归档里的名字：内容寻址，同一段正文重放不产生第二份。
+fn spill_id(text: &str) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(text.as_bytes());
+    format!("task-input-{}", hex::encode(&digest[..16]))
+}
+
+/// 把正文写到 [`spill_path`] 算出的位置上。已经在了就不再写（同一段正文只写一次）。
+///
+/// 写不进去返回 `false`——那时窗口里只剩「整段正文只在这条任务行上」：说得出取
+/// 不回，比给一个指向空处的路径要好。
+fn spill_floor(path: &std::path::Path, text: &str) -> bool {
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    std::fs::create_dir_all(dir).is_ok() && (path.exists() || std::fs::write(path, text).is_ok())
+}
 
 /// 一条工具结果最多带多少字符，无论窗口有多大。
 ///
@@ -314,9 +841,6 @@ const TRIM_LOW_WATER_DIVISOR: usize = 2;
 /// 占每轮新增字节的 76%，把界放在窗口的一半时，一条构建日志就能占掉一轮的
 /// 全部新增。与 `read_file` 一页的字符界同源：一页读回来的和一条命令打出来的
 /// 进的是同一个位置。
-// cap: bound — 与 read_file 一页的字符界同源：一页读回来的和一条命令打出来的进的是同一个位置
-const TOOL_RESULT_CHAR_CAP: usize = 32 * 1024;
-
 /// The number of characters one tool result may occupy before it is cut.
 ///
 /// The tool-return path reads this to decide whether a result needs archiving,
@@ -324,11 +848,20 @@ const TOOL_RESULT_CHAR_CAP: usize = 32 * 1024;
 /// the two cannot disagree about where the boundary is: a result the return path
 /// judged to fit and the window then cut would be truncated twice, and the second
 /// cut would take the truncation marker with it.
-pub fn tool_result_budget_chars(max_tokens: usize) -> usize {
+pub fn tool_result_budget_chars(max_tokens: Option<usize>) -> usize {
+    // 只有一条口径：窗口的一半。原先还有一条按字节写的固定上限压在上面（实测
+    // 2026-11-18：它把一页卡在 32 KiB，而那天的工具结果最大 33.9 KB），
+    // 它没有量过任何东西——它存在只是为了让「一条结果占满一轮新增」这件事不发生，
+    // 而那件事该由窗口自己回答：装不下就由裁剪去处理，装得下就不该有人替它设一个更小的数。
+    let Some(max_tokens) = max_tokens else {
+        // 「没人说过窗口」不是窗口很小：份额的一半无从导出。这里答「不设界」，
+        // 与运行时对同一种状态的处置是同一条——由第一次拒收把界说出来，而不是
+        // 由这里替上游猜一个。
+        return usize::MAX;
+    };
     (max_tokens / TOOL_RESULT_WINDOW_SHARE_DIVISOR)
         .max(1)
         .saturating_mul(cog_core::token_estimate::CHARS_PER_TOKEN)
-        .min(TOOL_RESULT_CHAR_CAP)
 }
 
 /// 把超出窗口份额的单条工具结果截断到预算内，其余消息原样返回。
@@ -348,7 +881,7 @@ pub fn tool_result_budget_chars(max_tokens: usize) -> usize {
 /// 没经过返回点的工具结果；那条路径上也没有 metrics handle 可发。真在这里
 /// 裁到工具结果，说明两处预算不再同源——那是 `tool_result_budget_chars` 的
 /// 不变量破了，不是一条读数能报的。
-fn bound_tool_result(message: Message, max_tokens: usize) -> Message {
+fn bound_tool_result(message: Message, max_tokens: Option<usize>) -> Message {
     let Message::ToolResult {
         tool_call_id,
         tool_name,
@@ -440,10 +973,113 @@ pub fn truncate_to_chars(text: &str, budget_chars: usize, reference: Option<&str
 pub use cog_core::estimate_tokens;
 
 #[cfg(test)]
+/// 有平台归档时，地板的指针与工具结果同一个形状（`artifact://…`），本地不再落文件。
+///
+/// 「两个去处」曾经是两个指针形状：工具结果进平台归档、地板进本地数据根。模型读到
+/// 的东西因此有两种取法，而「这一份放哪了」不该由它去猜。
+#[tokio::test]
+async fn a_shrunk_floor_points_at_the_same_archive_tool_results_use() {
+    #[derive(Debug)]
+    struct Archive(std::sync::Mutex<Vec<String>>);
+    #[async_trait::async_trait]
+    impl crate::archive::ToolOutputArchive for Archive {
+        async fn archive(
+            &self,
+            _tool: &str,
+            id: &str,
+            _content_type: &str,
+            _text: &str,
+        ) -> cog_core::SFResult<String> {
+            self.0.lock().unwrap().push(id.to_string());
+            Ok(format!("artifact://default/{id}"))
+        }
+        async fn record_truncation(&self, _tool: &str, _dropped: usize) {}
+    }
+    let archive = std::sync::Arc::new(Archive(std::sync::Mutex::new(Vec::new())));
+    let mut ctx = ContextWindow::new(Some(2_000));
+    let spill_dir = std::env::temp_dir().join(format!("cog-agent-spill-ar-{}", std::process::id()));
+    ctx.spill_dir = spill_dir.clone();
+    ctx.add_message(Message::system("你是执行者。"));
+    ctx.add_message(Message::user(&"任务正文".repeat(4_000)));
+    assert!(ctx.floor_exceeds_budget(), "前提：地板装不下");
+    let as_dyn: std::sync::Arc<dyn crate::archive::ToolOutputArchive> = archive.clone();
+    assert!(ctx.shrink_floor_to_fit(Some(&as_dyn)).await);
+    let text = ctx.messages()[1].content();
+    assert!(
+        text.contains("artifact://"),
+        "有归档时指针仍是文件路径：两个去处没合成一种指针——{text}"
+    );
+    assert!(
+        !spill_dir.exists() || std::fs::read_dir(&spill_dir).unwrap().next().is_none(),
+        "有归档时还在本地落了文件：同一段正文有了两份载体"
+    );
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&spill_dir));
+}
+
+#[cfg(test)]
+/// 地板压进窗口之后，被截掉的那一段有着落：内容寻址的文件里能读回整段。
+#[tokio::test]
+async fn a_shrunk_floor_names_where_the_full_text_lives() {
+    let big = "任务正文".repeat(4_000);
+    let mut ctx = ContextWindow::new(Some(2_000));
+    // 外置目录指到临时目录：这条测的是「截掉的正文去哪了」，不该往装好的数据根里写。
+    let spill_dir = std::env::temp_dir().join(format!("cog-agent-spill-{}", std::process::id()));
+    ctx.spill_dir = spill_dir.clone();
+    ctx.add_message(Message::system("你是执行者。"));
+    ctx.add_message(Message::user(&big));
+    assert!(ctx.floor_exceeds_budget(), "前提：地板装不下");
+    assert!(ctx.shrink_floor_to_fit(None).await, "压不进窗口");
+    let text = ctx.messages()[1].content();
+    let path = text
+        .split("整段正文：")
+        .nth(1)
+        .and_then(|s| s.split('）').next())
+        .unwrap_or("");
+    assert!(!path.is_empty(), "截断之后没说去哪取回：{text}");
+    let recovered = std::fs::read_to_string(path).expect("正文应当读得回来");
+    assert_eq!(recovered, big, "读回来的不是同一段正文");
+    // 内容寻址：同一条正文再压一次，落在同一个文件上，不堆第二份。
+    let before = std::fs::read_dir(&spill_dir).unwrap().count();
+    let mut again = ContextWindow::new(Some(2_000));
+    again.spill_dir = spill_dir.clone();
+    again.add_message(Message::system("你是执行者。"));
+    again.add_message(Message::user(&big));
+    assert!(again.shrink_floor_to_fit(None).await);
+    assert_eq!(std::fs::read_dir(&spill_dir).unwrap().count(), before);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&spill_dir));
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    /// 入口处的尺寸判据：窗口小到「一个字符的开头 + 指针」都装不下时，它说「放不进」。
+    ///
+    /// 这条判据的意义是把「入口写错了」与「这一轮没做成」分开：放不进窗口是那条活
+    /// 的写法有问题，运行时每轮去截一次再失败，读起来像模型不行。量不到窗口时它
+    /// 不下结论——「没人说过窗口多大」不是「装不下」。
+    #[test]
+    fn an_input_that_fits_no_window_at_all_is_caught_at_intake() {
+        let mut ctx = ContextWindow::new(Some(8));
+        ctx.add_message(Message::user(&"整本书".repeat(10_000)));
+        assert!(
+            !ctx.intake_fits(),
+            "窗口只有 8 个 token，正文再短也只有指针那一种形态，这一档应当读成「放不进」"
+        );
+
+        let mut roomy = ContextWindow::new(Some(100_000));
+        roomy.add_message(Message::user("把界改成实测的"));
+        assert!(roomy.intake_fits(), "普通的任务正文放得进大窗口");
+
+        let mut unmeasured = ContextWindow::new(None);
+        unmeasured.add_message(Message::user(&"整本书".repeat(10_000)));
+        assert!(
+            unmeasured.intake_fits(),
+            "没人说过窗口多大：量不到不等于装不下"
+        );
+    }
 
     /// 一段指示并进开头那条 system，而不是另开一条。
     ///
@@ -452,7 +1088,7 @@ mod tests {
     /// 那段在前、这一轮自己的在后」。
     #[test]
     fn a_second_instruction_is_merged_into_the_head_not_appended() {
-        let mut ctx = ContextWindow::new(10_000);
+        let mut ctx = ContextWindow::new(Some(10_000));
         ctx.add_message(Message::system("run's own instruction"));
         ctx.add_message(Message::user("do the thing"));
         ctx.merge_head_system("platform base");
@@ -476,7 +1112,7 @@ mod tests {
     /// 每轮的头都在变，上游的前缀缓存一次也命中不了。
     #[test]
     fn merging_the_same_instruction_twice_changes_nothing() {
-        let mut ctx = ContextWindow::new(10_000);
+        let mut ctx = ContextWindow::new(Some(10_000));
         ctx.add_message(Message::system("run's own instruction"));
         ctx.merge_head_system("platform base");
         let once = ctx.messages().to_vec();
@@ -487,10 +1123,37 @@ mod tests {
         assert_eq!(ctx.token_count(), tokens, "token 数也不该涨");
     }
 
+    /// 拿掉一段以后，系统前缀回到它并进来之前的样子：不含那一段，也不含
+    /// 因为它而多出来的空行。留下空行的话，规则改写一次前缀就长高一段。
+    #[test]
+    fn dropping_a_section_restores_the_head_it_was_merged_into() {
+        let mut ctx = ContextWindow::new(Some(10_000));
+        ctx.add_message(Message::system("run's own instruction"));
+        ctx.merge_head_system("platform base");
+        let before = ctx.messages().to_vec();
+        let tokens = ctx.token_count();
+
+        ctx.merge_head_system("rules in force");
+        assert!(ctx.messages()[0].content().contains("rules in force"));
+
+        ctx.drop_from_head_system("rules in force");
+        assert_eq!(
+            ctx.messages(),
+            before.as_slice(),
+            "拿掉之后应回到并进来之前"
+        );
+        assert_eq!(ctx.token_count(), tokens, "token 数也不该留着那一段");
+
+        // 不在里面的那一段：什么都不做，不是错误。
+        let once = ctx.messages().to_vec();
+        ctx.drop_from_head_system("never merged");
+        assert_eq!(ctx.messages(), once.as_slice());
+    }
+
     /// 开头没有 system 时新开一条，而且不碰历史里那条被预算裁掉的内容。
     #[test]
     fn a_context_without_a_system_head_gets_one() {
-        let mut ctx = ContextWindow::new(10_000);
+        let mut ctx = ContextWindow::new(Some(10_000));
         ctx.add_message(Message::user("hello"));
         ctx.merge_head_system("platform base");
 
@@ -591,7 +1254,7 @@ mod tests {
         ONCE.call_once(|| {
             // 装不上（别的用例先装了全局订阅者）不是这里的失败：那时兴趣位由
             // 那个订阅者决定，哨兵会立刻把「收不收得到」说清楚。
-            let _ = tracing::subscriber::set_global_default(AlwaysMaybe);
+            cog_core::ignore_lost!(tracing::subscriber::set_global_default(AlwaysMaybe));
         });
     }
 
@@ -651,7 +1314,7 @@ mod tests {
         let _serial = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (seen, observed) = capture(|| {
             // 地板本身就超预算：两条消息，循环的 `len() > 2` 立刻为假。
-            let mut ctx = ContextWindow::new(10);
+            let mut ctx = ContextWindow::new(Some(10));
             ctx.add_message(Message::system("系统提示词 很长 ".repeat(4)));
             ctx.add_message(Message::user("任务输入 很长 ".repeat(4)));
             assert!(
@@ -687,7 +1350,7 @@ mod tests {
     fn a_window_that_trims_to_budget_reports_no_excess() {
         let _serial = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (over_budget, over) = capture(|| {
-            let mut ctx = ContextWindow::new(200);
+            let mut ctx = ContextWindow::new(Some(200));
             ctx.add_message(Message::system("系统提示词"));
             ctx.add_message(Message::user("任务输入"));
             ctx.add_message(Message::assistant(vec![cog_core::ContentBlock::tool_call(
@@ -714,13 +1377,98 @@ mod tests {
         );
     }
 
+    /// 裁过一次，就得留下现场：挤掉几条、多少 token、还在的尾巴从哪一句开始、
+    /// 被挤掉那一段的开头是什么。模型下一轮再也不看见它，这一份是屏幕上唯一
+    /// 说得出口的凭据。
+    #[test]
+    fn a_trim_records_what_fell_out_and_where_the_tail_begins() {
+        let mut ctx = ContextWindow::new(Some(300));
+        ctx.add_message(Message::system("系统提示词"));
+        ctx.add_message(Message::user("任务输入"));
+        ctx.add_message(Message::assistant_text("先解释一段 ".repeat(20)));
+        ctx.add_message(Message::user("再问一段 ".repeat(20)));
+        ctx.add_message(Message::assistant_text("最后答一段 ".repeat(20)));
+        assert!(
+            ctx.token_count() <= 300,
+            "这条用例的题目是「裁过」，裁完必须在预算内：{}",
+            ctx.token_count()
+        );
+
+        let report = ctx.take_compaction().expect("窗口裁过，就必须有这一份现场");
+        assert!(
+            report.dropped_messages >= 1,
+            "裁过至少一条，读数是 {}",
+            report.dropped_messages
+        );
+        assert!(
+            report.freed_tokens > 0,
+            "挤掉的消息按估算总有 token：{}",
+            report.freed_tokens
+        );
+        assert_eq!(report.budget_tokens, 300);
+        assert_eq!(
+            report.target_tokens,
+            ctx.trim_target(),
+            "记录里的低水位必须就是这一次裁剪用的那一条"
+        );
+        assert_eq!(
+            report
+                .kept_from
+                .as_deref()
+                .map(|s| s.starts_with("user: 任务输入")),
+            Some(true),
+            "还在的尾巴从首条 user（地板）开始：{:?}",
+            report.kept_from
+        );
+        assert_eq!(
+            report
+                .dropped_head
+                .as_deref()
+                .map(|s| s.starts_with("assistant:")),
+            Some(true),
+            "被挤掉的第一条是紧随地板之后那条 assistant：{:?}",
+            report.dropped_head
+        );
+        assert_eq!(
+            report.kept_messages,
+            ctx.messages().len(),
+            "保留条数报的就是裁剪之后的投影长度"
+        );
+    }
+
+    /// 没裁过就没有现场，取走后也不留第二份：界面据此不画那一行，同一条记录
+    /// 也不会被下一次运行读成「这一轮挤掉了什么」。
+    #[test]
+    fn an_untouched_window_reports_no_compaction_and_taking_clears_it() {
+        let mut quiet = ContextWindow::new(Some(10_000));
+        quiet.add_message(Message::user("一句短话"));
+        assert_eq!(
+            quiet.take_compaction(),
+            None,
+            "没裁过却报了一份现场：界面上会凭空多一行"
+        );
+
+        let mut ctx = ContextWindow::new(Some(300));
+        ctx.add_message(Message::system("系统提示词"));
+        ctx.add_message(Message::user("任务输入"));
+        ctx.add_message(Message::assistant_text("先解释一段 ".repeat(20)));
+        ctx.add_message(Message::user("再问一段 ".repeat(20)));
+        ctx.add_message(Message::assistant_text("最后答一段 ".repeat(20)));
+        assert!(ctx.take_compaction().is_some(), "前提：这一段裁过");
+        assert_eq!(
+            ctx.take_compaction(),
+            None,
+            "同一份现场被取走两次：下一次运行会读成它自己的"
+        );
+    }
+
     /// 「这一轮没有记忆」这个状态只有一种成立方式：地板自己就超预算。
     ///
     /// 两个方向都要判：地板装得下时**不许**报（否则每一轮都会被当成没记忆
     /// 而收场），地板放不下时**必须**报（那是唯一能提前收住的地方）。
     #[test]
     fn only_a_floor_that_cannot_fit_is_reported_as_unreadable() {
-        let mut fits = ContextWindow::new(200);
+        let mut fits = ContextWindow::new(Some(200));
         fits.add_message(Message::system("sys"));
         fits.add_message(Message::user("任务输入"));
         fits.add_message(Message::assistant(vec![cog_core::ContentBlock::tool_call(
@@ -734,7 +1482,7 @@ mod tests {
             "装得下的窗口被报成「没有记忆」：每一轮都会在第一条结果之后收场"
         );
 
-        let mut blind = ContextWindow::new(10);
+        let mut blind = ContextWindow::new(Some(10));
         blind.add_message(Message::system("系统提示词 很长 ".repeat(4)));
         blind.add_message(Message::user("任务输入 很长 ".repeat(4)));
         assert!(
@@ -745,7 +1493,7 @@ mod tests {
 
     #[test]
     fn trim_never_leaves_orphan_tool_result_at_head() {
-        let mut ctx = ContextWindow::new(50);
+        let mut ctx = ContextWindow::new(Some(50));
         ctx.add_message(Message::system("sys"));
         ctx.add_message(Message::user(
             "用户消息占额度 用户消息占额度 用户消息占额度 用户消息占额度",
@@ -767,9 +1515,53 @@ mod tests {
         }
     }
 
+    /// 折中间段之后，提示词里不能有孤立的 tool result。
+    ///
+    /// 这条与下面那条「从头裁不切断轮次组」是同一个不变式的两条路径：折中间段是**新**的
+    /// 那条，切点如果落在 assistant 与它的 tool result 之间，就留下了声明了 tool_calls
+    /// 却无响应的 assistant 或一条没有声明的 result，严格校验的上游直接 400。
+    #[test]
+    fn folding_the_middle_never_leaves_an_orphan_tool_result() {
+        let mut ctx = ContextWindow::new(Some(400));
+        // 量到一次很小的往返：尾部只留最后一条，中间段足够长，一定触发折。
+        ctx.note_round_trip(10);
+        ctx.add_message(Message::user("任务：把这一批做完"));
+        for n in 0..6 {
+            ctx.add_message(Message::assistant(vec![cog_core::ContentBlock::tool_call(
+                format!("call_{n}"),
+                "run_command",
+                serde_json::json!({"command": "ls"}),
+            )]));
+            ctx.add_message(Message::tool_result_text(
+                format!("call_{n}"),
+                "run_command",
+                "输出 ".repeat(40),
+            ));
+        }
+
+        let msgs = ctx.messages();
+        for (index, message) in msgs.iter().enumerate() {
+            if matches!(message, Message::ToolResult { .. }) {
+                assert!(
+                    index > 0 && matches!(msgs[index - 1], Message::Assistant { .. }),
+                    "第 {index} 条是孤立的 tool result：折的切点切断了轮次组"
+                );
+            }
+            if let Message::Assistant { tool_calls, .. } = message {
+                if tool_calls.as_ref().is_some_and(|calls| !calls.is_empty()) {
+                    assert!(
+                        msgs.get(index + 1)
+                            .is_some_and(|next| matches!(next, Message::ToolResult { .. })),
+                        "第 {index} 条声明了 tool_calls 却没有紧随的 result"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn trim_never_evicts_first_user_message() {
-        let mut ctx = ContextWindow::new(60);
+        let mut ctx = ContextWindow::new(Some(60));
         let big = "任务 ".repeat(60);
         ctx.add_message(Message::user(big.clone()));
         ctx.add_message(Message::assistant(vec![cog_core::ContentBlock::tool_call(
@@ -794,7 +1586,7 @@ mod tests {
 
     #[test]
     fn trim_does_not_split_tool_call_from_its_result() {
-        let mut ctx = ContextWindow::new(30);
+        let mut ctx = ContextWindow::new(Some(30));
         ctx.add_message(Message::user("task input task input task input"));
         ctx.add_message(Message::user("filler filler filler filler filler filler"));
         ctx.add_message(Message::assistant(vec![cog_core::ContentBlock::tool_call(
@@ -826,7 +1618,7 @@ mod tests {
     /// 裁剪必须以「assistant + 其全部 tool result」为最小删除单位。
     #[test]
     fn trim_over_budget_never_leaves_assistant_tool_calls_unanswered() {
-        let mut ctx = ContextWindow::new(120);
+        let mut ctx = ContextWindow::new(Some(120));
         ctx.add_message(Message::user("原始任务输入 原始任务输入 原始任务输入"));
         ctx.add_message(Message::assistant(vec![
             cog_core::ContentBlock::tool_call(
@@ -892,7 +1684,7 @@ mod tests {
     /// 纯追加。这条用例钉的就是「裁完还有余量」，不是「裁到预算以内」。
     #[test]
     fn trimming_leaves_room_so_the_next_turn_does_not_trim_again() {
-        let mut ctx = ContextWindow::new(200);
+        let mut ctx = ContextWindow::new(Some(200));
         ctx.add_message(Message::system("系统提示词"));
         ctx.add_message(Message::user("原始任务输入"));
         let turn = |i: usize| Message::user(format!("第 {i} 轮输入 {}", "内容 ".repeat(20)));
@@ -935,7 +1727,7 @@ mod tests {
 
     #[test]
     fn one_oversized_tool_result_cannot_outgrow_the_window() {
-        let mut ctx = ContextWindow::new(400);
+        let mut ctx = ContextWindow::new(Some(400));
         ctx.add_message(Message::user("原始任务输入"));
         ctx.add_message(Message::assistant(vec![cog_core::ContentBlock::tool_call(
             "call_bin",
@@ -973,31 +1765,58 @@ mod tests {
 
     /// 窗口大不等于一条结果就可以带走半个窗口。
     ///
-    /// 生产窗口几十万 token，按份额算一条结果能带两百万字符——那是「装得下」，
-    /// 不是「值得之后每一轮都重发一遍」。两道界取更紧的那个；小窗口下份额仍是
-    /// 更紧的那道，所以小窗口的曲线不变。
+    /// 结果能带多少字，只由窗口决定：窗口大就带得多，没有第二道固定的字符上限。
+    ///
+    /// 原先这里还有一条 32 KiB 的固定上限压在上面。它量的不是任何一次实测，而是
+    /// 「一条结果别占满一轮新增」这个担心——而那件事窗口自己会回答：装不下，裁剪
+    /// 会处理；装得下，就不该有人替它设一个更小的数。
     #[test]
-    fn a_result_is_capped_by_characters_not_only_by_the_window_share() {
+    fn a_result_is_bounded_by_the_window_share_and_nothing_else() {
         assert_eq!(
-            tool_result_budget_chars(400),
+            tool_result_budget_chars(Some(400)),
             800,
-            "小窗口下份额仍是更紧的那道，老行为不变"
+            "小窗口：份额是多少就带多少"
         );
+        let big = tool_result_budget_chars(Some(200_000));
         assert_eq!(
-            tool_result_budget_chars(200_000),
-            TOOL_RESULT_CHAR_CAP,
-            "生产窗口下字符界才是更紧的那道"
+            big,
+            200_000 * cog_core::token_estimate::CHARS_PER_TOKEN / 2,
+            "大窗口：份额跟着窗口走，没有第二道上限把它压下来"
         );
         assert!(
-            tool_result_budget_chars(200_000)
-                < 200_000 * cog_core::token_estimate::CHARS_PER_TOKEN / 2,
-            "份额那道界必须真的被压下来，否则这条用例没有题目"
+            big > 32 * 1024,
+            "固定上限若还在，这条会立刻红：窗口大时它必须跟着长大"
+        );
+    }
+
+    /// 窗口是 0 表示「没人说过」，不是「零个 token 的窗口」。
+    ///
+    /// 读成后者的话，第一条消息进来就把整段对话裁到地板，模型每一轮看到的都是
+    /// 同一份空上下文；工具结果也会被压在「0 的一半」上。读成前者，内容照常进，
+    /// 单条工具结果不设份额界，等第一次拒收把真正的界说出来（见
+    /// `AgentRuntime::note_context_measurement`）。
+    #[test]
+    fn an_unstated_window_trims_nothing_and_states_no_share() {
+        let mut ctx = ContextWindow::new(None);
+        ctx.add_message(Message::system("sys"));
+        ctx.add_message(Message::user("q"));
+        for i in 0..50 {
+            ctx.add_message(Message::assistant(vec![cog_core::ContentBlock::text(
+                format!("turn {i}: {}", "x".repeat(400)),
+            )]));
+        }
+        assert_eq!(ctx.messages().len(), 52, "没人说过窗口时不该裁掉任何一条");
+        assert!(!ctx.floor_exceeds_budget());
+        assert_eq!(
+            tool_result_budget_chars(None),
+            usize::MAX,
+            "没有窗口就没有「窗口的一半」：0 的一半不是很小的份额，是没有份额"
         );
     }
 
     #[test]
     fn a_tool_result_that_fits_is_untouched() {
-        let mut ctx = ContextWindow::new(400);
+        let mut ctx = ContextWindow::new(Some(400));
         ctx.add_message(Message::assistant(vec![cog_core::ContentBlock::tool_call(
             "call_ok",
             "run_command",
@@ -1011,7 +1830,7 @@ mod tests {
     #[test]
     fn the_task_input_is_never_truncated_by_the_tool_result_bound() {
         // 首条 user 是任务输入，由调用方决定内容；这里的界只针对外部输出。
-        let mut ctx = ContextWindow::new(200);
+        let mut ctx = ContextWindow::new(Some(200));
         let input = "目标 ".repeat(200);
         ctx.add_message(Message::user(input.clone()));
         assert_eq!(ctx.messages()[0].content(), input);
@@ -1056,7 +1875,7 @@ mod tests {
     /// 发投影，于是「模型没看到」等于「这段对话没有发生过」。
     #[test]
     fn a_trimmed_turn_stays_in_the_history() {
-        let mut ctx = ContextWindow::new(40);
+        let mut ctx = ContextWindow::new(Some(40));
         let turns = [
             "第一轮 filler filler filler filler",
             "第二轮 filler filler filler filler",
@@ -1087,7 +1906,7 @@ mod tests {
     /// 有引用），历史记在它前面，被裁的字节就还在。
     #[test]
     fn a_tool_result_cut_on_the_way_in_keeps_its_bytes_in_the_history() {
-        let mut ctx = ContextWindow::new(400);
+        let mut ctx = ContextWindow::new(Some(400));
         let full = "z".repeat(5_000);
         ctx.add_message(Message::assistant(vec![cog_core::ContentBlock::tool_call(
             "call_raw",
@@ -1110,7 +1929,7 @@ mod tests {
 
     #[test]
     fn clearing_the_window_clears_both_faces() {
-        let mut ctx = ContextWindow::new(40);
+        let mut ctx = ContextWindow::new(Some(40));
         ctx.add_message(Message::user("第一轮 filler filler filler filler"));
         ctx.add_message(Message::user("第二轮 filler filler filler filler"));
         ctx.clear();
@@ -1126,7 +1945,7 @@ mod tests {
     /// 之后的新消息照旧记全。
     #[test]
     fn a_restored_snapshot_seeds_both_faces() {
-        let mut ctx = ContextWindow::new(400);
+        let mut ctx = ContextWindow::new(Some(400));
         ctx.restore_messages(vec![
             Message::user("任务输入"),
             Message::assistant_text("上一轮的回答"),
@@ -1140,7 +1959,7 @@ mod tests {
     fn an_already_truncated_result_keeps_its_reference_through_the_window() {
         // 返回点已按预算裁过一次并带上引用；进上下文时同一条界不能再裁一次，
         // 那一次会把标记连同引用一起砍掉。两处必须用同一个预算。
-        let mut ctx = ContextWindow::new(400);
+        let mut ctx = ContextWindow::new(Some(400));
         let budget = ctx.tool_result_budget_chars();
         ctx.add_message(Message::assistant(vec![cog_core::ContentBlock::tool_call(
             "call_ref",
@@ -1159,5 +1978,90 @@ mod tests {
             kept.contains("artifact://default/ref-1"),
             "二次裁剪不得把引用砍掉: {kept}"
         );
+    }
+}
+
+#[cfg(test)]
+mod compaction_summary_tests {
+    use super::CompactionSummary;
+
+    /// 四样都得能从折出来的那一条里读回来——这是 S35 的判据里能在这里判的那一半。
+    #[test]
+    fn every_part_survives_the_fold() {
+        let summary = CompactionSummary {
+            decisions: vec!["用事件流当正本".into()],
+            open: vec!["谁来做读切换（属主提的）".into()],
+            files: vec!["crates/cog-storage/src/postgres/llm_call_events.rs：新增写入口".into()],
+            failures: vec!["按目录触点判批次：一次编辑满足十几条".into()],
+        };
+        let rendered = summary.render();
+        for (title, item) in [
+            ("决定", &summary.decisions[0]),
+            ("未决", &summary.open[0]),
+            ("动过的文件", &summary.files[0]),
+            ("失败过", &summary.failures[0]),
+        ] {
+            assert!(
+                rendered.contains(title) && rendered.contains(item.as_str()),
+                "折出来的那一条读不回「{title}」：{rendered}"
+            );
+        }
+    }
+
+    /// 空的一格不印标题：印一个空标题会让「这一段没有失败」与「没人读」长得一样。
+    #[test]
+    fn an_empty_part_prints_no_heading() {
+        let rendered = CompactionSummary {
+            decisions: vec!["a".into()],
+            ..Default::default()
+        }
+        .render();
+        assert!(rendered.contains("决定"));
+        for absent in ["未决", "动过的文件", "失败过"] {
+            assert!(!rendered.contains(absent), "空的一格印了标题：{rendered}");
+        }
+    }
+
+    #[test]
+    fn all_four_empty_reads_as_empty() {
+        assert!(CompactionSummary::default().is_empty());
+        assert!(CompactionSummary::default().render().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod plan_fold_tests {
+    use super::plan_fold;
+
+    /// 头部与尾部都保留，中间那一段就是被折掉的。
+    #[test]
+    fn the_middle_is_what_gets_folded() {
+        // 头 2 条；中间 4 条；尾 3 条，各 10 token。
+        let tokens = [5, 5, 10, 10, 10, 10, 10, 10, 10];
+        let plan = plan_fold(&tokens, 2, 30).expect("中间有东西可折");
+        assert_eq!(plan.tail_from, 6, "尾从第 6 条起");
+        assert_eq!(plan.folded, 4, "中间 4 条被折");
+    }
+
+    /// 一次往返的量覆盖了全部消息：没有可折的东西，返回 `None` 而不是折掉一条。
+    #[test]
+    fn nothing_is_folded_when_the_tail_already_reaches_the_head() {
+        let tokens = [5, 5, 10, 10];
+        assert_eq!(plan_fold(&tokens, 2, 1_000), None);
+    }
+
+    /// 量不到「一次往返」时（`tail_tokens` 为 0）什么都不折：没有读数支撑的尾长会切掉刚刚发生的事。
+    #[test]
+    fn without_a_measured_round_trip_nothing_is_folded() {
+        let tokens = [5, 5, 10, 10, 10];
+        assert_eq!(plan_fold(&tokens, 2, 0), None);
+    }
+
+    /// 只有头部、或者比头部还少：没有中间段。
+    #[test]
+    fn a_conversation_that_is_only_head_has_nothing_to_fold() {
+        assert_eq!(plan_fold(&[5, 5], 2, 10), None);
+        assert_eq!(plan_fold(&[5], 2, 10), None);
+        assert_eq!(plan_fold(&[], 0, 10), None);
     }
 }

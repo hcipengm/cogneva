@@ -8,7 +8,7 @@ fn default_system_prompt() -> String {
 
 #[test]
 fn test_context_window_add_messages() {
-    let mut ctx = ContextWindow::new(1000);
+    let mut ctx = ContextWindow::new(Some(1000));
     ctx.add_message(Message::system(default_system_prompt()));
     ctx.add_message(Message::user("Hello!"));
 
@@ -18,7 +18,7 @@ fn test_context_window_add_messages() {
 
 #[test]
 fn test_context_window_system_preserved() {
-    let mut ctx = ContextWindow::new(10); // Very small to force trimming
+    let mut ctx = ContextWindow::new(Some(10)); // Very small to force trimming
     ctx.add_message(Message::system("System prompt".to_string()));
     ctx.add_message(Message::user("Message 1"));
     ctx.add_message(Message::user("Message 2"));
@@ -31,7 +31,7 @@ fn test_context_window_system_preserved() {
 
 #[test]
 fn test_context_window_clear() {
-    let mut ctx = ContextWindow::new(1000);
+    let mut ctx = ContextWindow::new(Some(1000));
     ctx.add_message(Message::system("test".to_string()));
     ctx.clear();
     assert_eq!(ctx.messages().len(), 0);
@@ -40,7 +40,7 @@ fn test_context_window_clear() {
 
 #[test]
 fn test_context_window_to_prompt() {
-    let mut ctx = ContextWindow::new(1000);
+    let mut ctx = ContextWindow::new(Some(1000));
     ctx.add_message(Message::system("sys".to_string()));
     ctx.add_message(Message::user("hello"));
 

@@ -368,7 +368,7 @@ impl LearningDetector for DefaultLearningDetector {
             return None;
         }
 
-        let error_text = serde_json::to_string_pretty(result).unwrap_or_default();
+        let error_text = serde_json::to_string_pretty(result).unwrap_or(Default::default());
 
         // Check if this looks like a recurring tool error
         if self

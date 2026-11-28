@@ -1,12 +1,37 @@
-# Build output
-target/
-node_modules/
-dist/
+# The two root READMEs are kept out of the repository but stay on disk: the
+# checks that read them (`check-readme-paths.sh`,
+# `check-readme-trait-members.sh`, `check-handover-verb.py`,
+# `bootstrap-entry.test.sh`) read the filesystem, so a working copy that still
+# has them keeps judging them, while a fresh clone -- and therefore CI, and the
+# two published remotes -- has neither the files nor anything to judge: those
+# checks say `未判` and exit 0 there. Anything that ignores the rule (`git add
+# -f`) puts them back, and then CI judges them again.
+/README.md
+/README.zh-CN.md
 
-# Local runtime config (template: cogneva.example.json)
+# Build output. No trailing slash on these three: a trailing slash matches only a
+# directory, and in a git worktree `web/node_modules` is typically a symlink to the
+# main checkout's copy -- which then reads as an untracked file, enters `git add -A`
+# and every work-tree key computed over it. Measured 2026-11-10: one such symlink
+# made the pre-push gate's patch key unforgeable by the committed bytes (7 files
+# judged, 8 in the delta), so a green run could not be claimed by the push.
+target
+node_modules
+dist
+
+# Local runtime config (shipped source: deploy/helm/cogneva/files/cogneva.json;
+# generate a standalone copy with deploy/scripts/gen-example-config.py)
 cogneva.json
 # Exception: the Helm chart ships its default cogneva.json via .Files.Get
 !deploy/helm/cogneva/files/cogneva.json
+
+# Rendered deploy trees are derived, not source: chart + profiles + the renderer
+# fully decide them, and every reader generates them at read time through
+# deploy/scripts/lib/rendered-cache.sh. Nothing to keep in sync with the chart.
+deploy/rendered/
+deploy/.rendered.lock
+deploy/.rendered.tmp.*
+deploy/.rendered.old.*
 
 # Bootstrap runtime artifacts (machine-specific, never commit)
 intent_config.yaml
@@ -19,3 +44,12 @@ evolution-patches/
 # Coverage counters dropped by instrumented test runs (machine-local)
 *.profraw
 *.profdata
+
+# Host-side flock file left by whoever serialises a render on this checkout
+deploy/.rendered.lock
+
+__pycache__/
+
+# Per-checkout Claude Code settings: a hook that only this working copy wants
+# is not part of what the repository ships.
+.claude/

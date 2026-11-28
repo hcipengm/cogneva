@@ -1,15 +1,27 @@
 #!/usr/bin/env bash
+# reads: deploy/helm/cogneva/profiles/*.yaml subject
+# writes: deploy/rendered/*/* generated
+# writes: deploy/helm/cogneva/values.resource-governance.*.yaml generated
+# writes: deploy/k3s/resource-quota.yaml generated
 # 预渲染部署 profile：Helm chart 为拓扑唯一权威源，本脚本把 chart + profile
 # values 渲染成 standalone YAML（deploy/rendered/<profile>/），供元启动
 # "读目录 -> kubectl apply" 消费——引导链零 helm 依赖。
 #
 # 用法：
 #   bash deploy/scripts/render-deploy.sh           # 渲染全部 profile，写回 deploy/rendered/
-#   bash deploy/scripts/render-deploy.sh --check   # CI 新鲜度门禁：重渲染到临时目录，
-#                                                  # 与已提交产物 diff，漂移即失败
+#   bash deploy/scripts/render-deploy.sh --out DIR # 同上，但产物只写到 DIR，一个字节都不碰仓
+#
+# `deploy/rendered/` 不进仓：读者（引导器构建、契约测试、部署门、集群内落地端）在
+# **读的那一刻**生成它，入口是 scripts/lib/rendered-cache.sh；它调这里的 `--out`。
+# `--out` 先把 chart 复制到临时目录再渲染——治理投影写进那份副本，所以整条渲染链
+# 不写仓。没有「产物是否新鲜」这道门：够了就现场生成，生成物不是被比对的对象。
+#
+# 额度里的节点数（DaemonSet 逐节点铺开）在写回的那一路从当前连着的集群读；
+# 没有集群的机器要显式给拓扑：COGNEVA_NODES=N bash deploy/scripts/render-deploy.sh。
+# `--out` 只按生成文件首部记下的拓扑重算，不需要集群。
 #
 # 渲染产物是构建产物，不要手改；改拓扑请动 chart templates / values / profile，
-# 然后重跑本脚本并一并提交。
+# 让读它的人在读的那一刻重新生成。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,7 +31,7 @@ PROFILES_DIR="$CHART_DIR/profiles"
 RENDERED_DIR="$REPO_ROOT/deploy/rendered"
 
 # profile 的集合是**读出来的**：deploy/helm/cogneva/profiles/ 下的每个 `<名字>.yaml` 就是
-# 一个 profile。写死一份名单，新增的那一个会安静地不渲染、不判新鲜度，
+# 一个 profile。写死一份名单，新增的那一个会安静地不渲染，
 # `deploy/rendered/<新名字>/` 也不会出现——下游按目录读 profile 的那几条门（采集器覆盖、
 # 读权限载体）于是也看不见它，几处一起空白，而空白读作「本来就没有这个 profile」。
 PROFILES=()
@@ -31,28 +43,6 @@ if [ "${#PROFILES[@]}" -eq 0 ]; then
     echo "FAIL: ${PROFILES_DIR} 下一个 profile 都没有——判不了该渲染哪些，这不等于全过" >&2
     exit 2
 fi
-
-# 反向也要比：deploy/rendered/ 下每一棵产物树都得有对应的 profile。删了 profile 却把
-# 产物留在树里时，新鲜度门只问「每个 profile 都有产物」，那棵没有出处的树就一直被提交，
-# 还被下游按目录读 profile 的门当成一条真的投递路径去判。
-require_rendered_trees_have_profiles() {
-    [ -d "$RENDERED_DIR" ] || return 0
-    local dir name known p stray=0
-    for dir in "$RENDERED_DIR"/*/; do
-        [ -d "$dir" ] || continue
-        name="$(basename "$dir")"
-        known=0
-        for p in "${PROFILES[@]}"; do
-            [ "$p" = "$name" ] && known=1
-        done
-        if [ "$known" -eq 0 ]; then
-            echo "FAIL: deploy/rendered/${name} 没有对应的 profile（profiles/${name}.yaml 不存在）。" >&2
-            echo "      这棵树不会有任何东西再渲染它；删掉它，或把 profile 加回来。" >&2
-            stray=1
-        fi
-    done
-    [ "$stray" -eq 0 ]
-}
 
 # 额度是投影出来的产物，不是 values 里手写的一段：见 project-resource-governance.py
 # 的头部。它单独成文件，是因为 values.yaml 里全是人写的注释，而投影要整份重写；
@@ -72,8 +62,9 @@ helm_render() {
   COGNEVA_RENDER_RAW="$raw" bash "$SCRIPT_DIR/render-chart.sh" "$profile" > "$out"
 }
 
-# 从一次渲染里投影出额度并写回（或只核对）。读的只有工作负载自己的声明与
-# chart values 里那两项算不出来的输入。
+# 从一次渲染里投影出额度并写回。读的只有工作负载自己的声明、chart values 里的
+# LimitRange 策略，以及拓扑（节点数）：写回的那一路从 live cluster 读，`--out`
+# 那一路按生成文件首部记下的拓扑重算（不需要集群）。
 project_governance() {
   local profile="$1" raw="$2" values_out="$3" quota_out="$4"
   shift 4
@@ -205,56 +196,66 @@ PY
   bash "$SCRIPT_DIR/check-governance-consistency.sh" "$out_dir"
 }
 
-if [[ "${1:-}" == "--check" ]]; then
-  require_rendered_trees_have_profiles
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
-  # 先核投影：额度文件与 deploy/k3s 基线必须等于「从渲染集重算一遍」的结果。
-  # 手改了数值、或改了工作负载没重新投影，都在这里红——它比重新渲染更早说明
-  # 问题出在数上还是出在模板上。
+mode="write"
+out_dir=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --out)
+      [ "$#" -ge 2 ] || { echo "usage: render-deploy.sh --out DIR" >&2; exit 2; }
+      mode="out"
+      out_dir="$2"
+      shift
+      ;;
+    *) echo "usage: render-deploy.sh [--out DIR]" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+if [ "$mode" = out ]; then
+  # 产物一个字节都不落进仓：治理投影写进 chart 的临时副本，渲染也从那份副本读。
+  mkdir -p "$out_dir"
+  out_dir="$(cd "$out_dir" && pwd)"
+  stage="$(mktemp -d)"
+  trap 'rm -rf "$stage"' EXIT
+  mkdir -p "$stage/chart"
+  cp -a "$CHART_DIR/." "$stage/chart/"
+  CHART_DIR="$stage/chart"
+  PROFILES_DIR="$CHART_DIR/profiles"
+  export COGNEVA_CHART="$CHART_DIR"
   for p in "${PROFILES[@]}"; do
-    helm_render "$p" "$tmp/raw-$p.yaml"
-    if [ "$p" = k3s-single ]; then
-      project_governance "$p" "$tmp/raw-$p.yaml" "$(generated_values "$p")" "$QUOTA_BASELINE" --check
-    else
-      project_governance "$p" "$tmp/raw-$p.yaml" "$(generated_values "$p")" "" --check
-    fi
+    helm_render "$p" "$stage/raw-$p.yaml" raw
+    # 节点数按副本里那份**已提交**的投影首部重算：它在渲染前被读出，随后
+    # --write-values 覆盖同一份副本，仓里那一份不动。
+    project_governance "$p" "$stage/raw-$p.yaml" "$(generated_values "$p")" "" \
+      --nodes-from "$(generated_values "$p")"
   done
   for p in "${PROFILES[@]}"; do
-    render_profile "$p" "$tmp/$p"
-    if [ ! -d "$RENDERED_DIR/$p" ]; then
-      echo "FAIL: deploy/rendered/$p 不在树里，而 profiles/$p.yaml 在。"
-      echo "      新增的 profile 必须先渲染并提交产物，否则选到它的安装形态手上就是空的。"
-      exit 1
-    fi
-    if ! diff -r "$tmp/$p" "$RENDERED_DIR/$p" >/dev/null 2>&1; then
-      echo "FAIL: deploy/rendered/$p 已过期（与 chart/profile 重渲染结果不一致）。"
-      echo "      请本地运行 bash deploy/scripts/render-deploy.sh 并提交产物。"
-      diff -r "$tmp/$p" "$RENDERED_DIR/$p" | head -40 || true
-      exit 1
-    fi
+    render_profile "$p" "$out_dir/$p"
   done
-  echo "RENDER FRESHNESS OK：deploy/rendered/ 与 chart/profiles 一致"
-else
-  require_rendered_trees_have_profiles
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
-  # 投影要一次渲染当输入，而渲染又要读投影产物。先渲染一遍（额度那时是上一版
-  # 或空，而额度不影响任何工作负载的声明），算出这一版，再渲染正式产物。
-  for p in "${PROFILES[@]}"; do
-    helm_render "$p" "$tmp/raw-$p.yaml"
-    if [ "$p" = k3s-single ]; then
-      project_governance "$p" "$tmp/raw-$p.yaml" "$(generated_values "$p")" "$QUOTA_BASELINE"
-    else
-      project_governance "$p" "$tmp/raw-$p.yaml" "$(generated_values "$p")" ""
-    fi
-  done
-  for p in "${PROFILES[@]}"; do
-    render_profile "$p" "$RENDERED_DIR/$p"
-  done
-  echo "渲染完成：$RENDERED_DIR"
-  # 静态清单里有两块是渲染出来的（配置正文、Pod 模板的配置指纹），渲染完就写回去：
-  # 这两块此前要人记得重抄一遍，而三道门只发现漂移、不消除漂移。同一个命令做完。
-  echo
-  bash "$SCRIPT_DIR/sync-static-manifests.sh"
+  echo "渲染完成：$out_dir"
+  exit 0
 fi
+
+# 写回：一次渲染当投影的输入，再渲染正式产物。这一路从当前连着的集群读节点数，
+# 写回的是投影产物（`values.resource-governance.*.yaml` 与 k3s 的配额基线）；
+# 读者要的是渲染产物本身，那条入口是上面的 `--out`。
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+# 投影要一次渲染当输入，而渲染又要读投影产物。先渲染一遍（额度那时是上一版
+# 或空，而额度不影响任何工作负载的声明），算出这一版，再渲染正式产物。
+for p in "${PROFILES[@]}"; do
+  helm_render "$p" "$tmp/raw-$p.yaml"
+  if [ "$p" = k3s-single ]; then
+    project_governance "$p" "$tmp/raw-$p.yaml" "$(generated_values "$p")" "$QUOTA_BASELINE"
+  else
+    project_governance "$p" "$tmp/raw-$p.yaml" "$(generated_values "$p")" ""
+  fi
+done
+for p in "${PROFILES[@]}"; do
+  render_profile "$p" "$RENDERED_DIR/$p"
+done
+echo "渲染完成：$RENDERED_DIR"
+# 静态清单里有两块是渲染出来的（配置正文、Pod 模板的配置指纹），渲染完就写回去：
+# 这两块此前要人记得重抄一遍，而三道门只发现漂移、不消除漂移。同一个命令做完。
+echo
+bash "$SCRIPT_DIR/sync-static-manifests.sh"

@@ -304,7 +304,7 @@ async fn dispatch_face(
                 .input
                 .get("role")
                 .and_then(|r| r.as_str())
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             registry.skill_for_role(role).is_none()
         })
         .count();
@@ -345,9 +345,7 @@ async fn fetch_sop(
         source.repo,
         source.sop_path
     );
-    let req = HttpRequest::get(url)
-        .header("Accept", cog_core::CONTENT_TYPE_JSON)
-        .timeout(30);
+    let req = HttpRequest::get(url).header("Accept", cog_core::CONTENT_TYPE_JSON);
     let resp = http.execute(req).await.map_err(|e| e.to_string())?;
     if !resp.is_success() {
         return Err(format!("platform returned HTTP {}", resp.status));

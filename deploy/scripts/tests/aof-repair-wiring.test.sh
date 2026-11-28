@@ -254,7 +254,7 @@ for needle, why in (
     ("--collector.textfile.directory=/report",
      "the chart lost the container that serves the verdict as Prometheus textfiles"),
     ("--dir /data", "the chart's redis no longer declares the --dir the repair target is derived from"),
-    ("image: {{ .Values.image.repository }}:{{ .Values.image.tag }}", "the repair no longer runs the deployed image"),
+    ('image: {{ include "cogneva.image" . }}', "the repair no longer runs the deployed image"),
     ("imagePullPolicy: {{ .Values.image.pullPolicy }}", "the repair no longer follows the image pull policy"),
     ("--help", "the chart lost the capability probe in front of the subcommand"),
 ):

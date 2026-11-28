@@ -22,6 +22,9 @@
 /// governance commands.
 pub const DATABASE_URL: &str = "COGNEVA_DATABASE_URL";
 
+/// 读数面与投影重建读的那个 Prometheus 地址。
+pub const PROMETHEUS_URL: &str = "COGNEVA_PROMETHEUS_URL";
+
 /// This pod's own name, as the cluster gave it. Identity and change execution
 /// both need it to answer "am I the pod that was asked".
 pub const POD_NAME: &str = "COGNEVA_POD_NAME";

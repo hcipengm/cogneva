@@ -19,6 +19,10 @@
 //! The intake is the other side and is not reachable from here: it lives in the
 //! private repository that feeds the account. A kind the intake accepts and this
 //! does not name is a row nothing will ever measure.
+//!
+//! principle: feedback_a_closed_state_set_must_route_an_unrecognized_verdict_to_a_non_pass_state
+//!
+//! This file gates the closed kind vocabulary and nothing it does not name.
 
 use std::collections::BTreeSet;
 

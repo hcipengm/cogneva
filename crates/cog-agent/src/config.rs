@@ -45,10 +45,6 @@ pub const AGENT_LOOP_ENV: &[(&str, &str)] = &[
         "COGNEVA_AGENT_LOOP_EVAL_MAX_ITERATIONS",
         "eval_max_iterations",
     ),
-    (
-        "COGNEVA_AGENT_LOOP_CONTEXT_WINDOW_SIZE",
-        "context_window_size",
-    ),
     ("COGNEVA_AGENT_LOOP_ROLE", "role"),
     (
         "COGNEVA_AGENT_LOOP_SKILL_CACHE_TTL_SECS",
@@ -57,10 +53,6 @@ pub const AGENT_LOOP_ENV: &[(&str, &str)] = &[
     (
         "COGNEVA_AGENT_LOOP_THINK_STALL_TIMEOUT_SECS",
         "think_stall_timeout_secs",
-    ),
-    (
-        "COGNEVA_AGENT_LOOP_FINAL_DRAFT_TIMEOUT_SECS",
-        "final_draft_timeout_secs",
     ),
     // The platform's own HTTP surface, borrowed the way the business pods
     // borrow the gateway (see `COGNEVA_GITHUB_API_BASE`): the loop archives an
@@ -88,7 +80,6 @@ pub const AGENT_LOOP_ENV: &[(&str, &str)] = &[
 ];
 
 const AGENT_POOL_ENV: &[(&str, &str)] = &[
-    ("COGNEVA_AGENT_POOL_ENABLED", "enabled"),
     ("COGNEVA_AGENT_POOL_WORKER_COUNT", "worker_count"),
     ("COGNEVA_AGENT_POOL_WORKER_ROLE", "worker_role"),
 ];
@@ -97,6 +88,10 @@ const AGENT_POOL_ENV: &[(&str, &str)] = &[
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentLoopConfig {
+    /// 缺省不是一个人。这个配置节给的是池子的**缺省参数**，池子里每一位
+    /// 员工的名字由它自己被造出来时决定（管理器逐位覆盖）；从前这里写着
+    /// `agent-001`，一个谁也没雇过、名册上没有的名字，读配置的人会以为
+    /// 平台上真有这么一位。
     pub agent_id: String,
     pub role: String,
     /// 这一份部署给智能体写下的轮数天花板；`None` 表示**不设天花板**。
@@ -114,16 +109,16 @@ pub struct AgentLoopConfig {
     /// （判一份交上来的结果用不了那么多轮），但同样是一个断言而不是一条度量，
     /// 所以同样交给部署去写。
     pub eval_max_iterations: Option<u32>,
-    pub context_window_size: usize,
     /// TTL for the available_skills cache in AgentRuntime (seconds).
     pub skill_cache_ttl_secs: u64,
     /// Abort a streaming think turn only after no stream event arrives for
     /// this many consecutive seconds (stall detection, not a wall-clock cap).
+    ///
+    /// Zero is refused at load: a zero-second window is not "abort at once" as
+    /// a setting — it kills every stream at its first quiet moment, and the
+    /// value that would actually run would be some other number than the one
+    /// written here.
     pub think_stall_timeout_secs: u64,
-    /// Wall-clock cap for the forced final-draft ask (seconds). Unlike the
-    /// stall timeout this bounds the whole call, because that ask is the one
-    /// that runs after the run's budget is already spent.
-    pub final_draft_timeout_secs: u64,
     /// Base URL of the platform memory API where an oversized tool output is
     /// archived. Absent when the deployment names none; the loop then still
     /// truncates, and the failure reading carries the cause.
@@ -172,21 +167,25 @@ pub struct AgentLoopConfig {
 /// starts being a document: comfortably above what an API or a page summary
 /// returns, comfortably below the tool-return budget of the smallest window the
 /// loop is configured with.
+// cap: fixed — 一头是 API/网页摘要的典型长度，另一头是最小窗口的工具返回预算
+// keep: 删掉后所有载荷都走外置归档，每读一次多一跳，或者都不走而把内存交出去；由「摘要典型长度与最小工具返回预算」兜住
+const EXTERNAL_ARCHIVE_THRESHOLD_CHARS: usize = 8192;
+
 fn default_external_archive_threshold_chars() -> usize {
-    8192
+    EXTERNAL_ARCHIVE_THRESHOLD_CHARS
 }
 
 impl Default for AgentLoopConfig {
     fn default() -> Self {
         Self {
-            agent_id: "agent-001".into(),
+            agent_id: String::new(),
             role: cog_core::roles::PLANNER.into(),
             max_iterations: None,
             eval_max_iterations: None,
-            context_window_size: 32000,
-            skill_cache_ttl_secs: 30,
-            think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 420,
+            skill_cache_ttl_secs: cog_core::config::SKILL_HOT_RELOAD_INTERVAL_SECS,
+            // 停滞窗的声明在运行时契约里（`cog_core::RuntimeConfig`），那边也
+            // 正是读它的地方；这里读那一份，不再抄一个 240。
+            think_stall_timeout_secs: cog_core::RuntimeConfig::default().think_stall_timeout_secs,
             memory_api_base: None,
             external_archive_threshold_chars: default_external_archive_threshold_chars(),
             web_search_base: None,
@@ -198,11 +197,28 @@ impl Default for AgentLoopConfig {
 
 impl AgentLoopConfig {
     pub fn load() -> SFResult<Self> {
-        load_section("/agent_loop", AGENT_LOOP_ENV)
+        let config: Self = load_section("/agent_loop", AGENT_LOOP_ENV)?;
+        config.refuse_a_window_that_cannot_be_a_window()?;
+        Ok(config)
     }
 
     pub fn load_from(path: &Path) -> SFResult<Self> {
-        load_section_from(path, "/agent_loop", AGENT_LOOP_ENV)
+        let config: Self = load_section_from(path, "/agent_loop", AGENT_LOOP_ENV)?;
+        config.refuse_a_window_that_cannot_be_a_window()?;
+        Ok(config)
+    }
+
+    /// 停滞窗是「多久没有收到流事件才算死」：0 秒不是一个窗口，是「每一条流在
+    /// 第一个静默瞬间就被判死」。读它的那一层从前把这个 0 悄悄换成 1 秒——声明的
+    /// 值与生效的值于是有两个，而写配置的人读不到后一个。声明在哪里拒在哪里。
+    fn refuse_a_window_that_cannot_be_a_window(&self) -> SFResult<()> {
+        if self.think_stall_timeout_secs == 0 {
+            return Err(SFError::Config(
+                "agent_loop.think_stall_timeout_secs 声明为 0 秒：停滞窗不是「立刻算死」的另一种写法。给它一个周期。"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -214,14 +230,19 @@ impl From<AgentLoopConfig> for cog_core::RuntimeConfig {
             // 没有写下的天花板就是没有天花板：运行面只有一个数表示「不设界」，
             // 不让「没配置」在别处变成一个新的缺省数。
             max_iterations: c.max_iterations.unwrap_or(u32::MAX),
-            context_window_size: c.context_window_size,
+            // 这一格没有配置来源：窗口由运行时从型号公布的规格与实测里定，
+            // 构造时写下的只是「还没量到」。
+            context_window_size: None,
             skill_cache_ttl_secs: c.skill_cache_ttl_secs,
             think_stall_timeout_secs: c.think_stall_timeout_secs,
-            final_draft_timeout_secs: c.final_draft_timeout_secs,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            // 配置文件不知道这次要跑哪件活；声明由拿到任务的那一层补。
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
+            stated_directions: Vec::new(),
         }
     }
 }
@@ -230,7 +251,6 @@ impl From<AgentLoopConfig> for cog_core::RuntimeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentManagerConfig {
-    pub enabled: bool,
     /// 操作者自己写下的并发上限；0 表示不写，此时只有资源读数约束并发。
     ///
     /// 它曾经是并发本身：写 3 就同时跑 3 个任务，谁也不问容器装不装得下。
@@ -243,7 +263,8 @@ pub struct AgentManagerConfig {
 impl Default for AgentManagerConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // cap: fixed — 0 ＝ 不写这个上限，并发由资源读数算；写下的数只在比实测更紧时生效
+            // not-a-bound: 0 表示「不写这个上限，并发由资源读数算」；它是哨兵，不是资源界
             worker_count: 0,
             worker_role: cog_core::roles::PLANNER.into(),
         }
@@ -264,17 +285,44 @@ impl AgentManagerConfig {
 mod tests {
     use super::*;
 
+    /// 声明的停滞窗原样生效；0 秒被点名拒绝，而不是在读到它的那一层被换成 1。
+    #[test]
+    fn a_declared_stall_window_survives_and_zero_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cogneva.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({"agent_loop": {"think_stall_timeout_secs": 90}}).to_string(),
+        )
+        .unwrap();
+        let declared = AgentLoopConfig::load_from(&path).unwrap();
+        assert_eq!(declared.think_stall_timeout_secs, 90);
+
+        std::fs::write(
+            &path,
+            serde_json::json!({"agent_loop": {"think_stall_timeout_secs": 0}}).to_string(),
+        )
+        .unwrap();
+        let refused = AgentLoopConfig::load_from(&path).unwrap_err();
+        let message = refused.to_string();
+        assert!(
+            message.contains("think_stall_timeout_secs"),
+            "the refusal must name the field: {message}"
+        );
+    }
+
     #[test]
     fn defaults_match_legacy_core_values() {
         let l = AgentLoopConfig::default();
-        assert_eq!(l.agent_id, "agent-001");
+        // 池子的缺省参数不替任何一位员工起名：名字由管理器逐位覆盖，这里空着
+        // 才是实情。写一个名字进来，读配置的人会以为平台上真有那一位。
+        assert!(l.agent_id.is_empty());
         assert_eq!(l.role, "planner");
         // No number written means no ceiling: a default here would be an
         // assertion about every job, made before any of them has run.
         assert_eq!(l.max_iterations, None);
         assert_eq!(l.eval_max_iterations, None);
         let p = AgentManagerConfig::default();
-        assert!(p.enabled);
         // 0 = 不声明上限：默认并发由资源读数决定，不再是一个写死的数。
         assert_eq!(p.worker_count, 0);
     }
@@ -306,10 +354,7 @@ mod tests {
     #[test]
     fn the_shipped_config_writes_no_iteration_ceiling() {
         let root = crate::checkout::repo_root();
-        for rel in [
-            "deploy/helm/cogneva/files/cogneva.json",
-            "cogneva.example.json",
-        ] {
+        for rel in ["deploy/helm/cogneva/files/cogneva.json"] {
             let path = root.join(rel);
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
@@ -326,6 +371,40 @@ mod tests {
         }
     }
 
+    /// 文档里没有窗口这一格，写成什么都不认。
+    ///
+    /// 窗口只能来自读数：设置页里那只型号公布的规格，加上这棵树实测到底收下过
+    /// 多大、被拒时上游自述多大的界。文档里写一个数就是替上游拍一个它没公布过的
+    /// 窗口——写小了裁掉装得下的历史，写大了第一次调用就被拒。所以这一格连同
+    /// 它的环境变量映射一起删掉了，不是改成「写 null」。
+    #[test]
+    fn the_document_has_no_window_slot() {
+        let rel = "deploy/helm/cogneva/files/cogneva.json";
+        let path = crate::checkout::repo_root().join(rel);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
+        let root_json: serde_json::Value = serde_json::from_str(&text).expect("config is JSON");
+        let section = root_json
+            .pointer("/agent_loop")
+            .unwrap_or_else(|| panic!("{rel}: agent_loop section present"));
+        assert!(
+            section.get("context_window_size").is_none(),
+            "{rel}: agent_loop 里又出现了 context_window_size——窗口只由型号规格与实测给出"
+        );
+        assert!(
+            !text.contains("COGNEVA_AGENT_LOOP_CONTEXT_WINDOW_SIZE"),
+            "{rel}: 环境变量映射里还留着窗口——没有这一格就没有要映射的东西"
+        );
+        // 环境变量那一头也只认 `AGENT_LOOP_ENV` 里的名字：表上没有了，就没有
+        // 一条 env 能把窗口递进来。
+        assert!(
+            !AGENT_LOOP_ENV
+                .iter()
+                .any(|(_, field)| *field == "context_window_size"),
+            "环境变量映射表里还留着窗口：没有这一格，就没有能递进一个数的名字"
+        );
+    }
+
     #[test]
     fn the_default_external_archive_threshold_stays_under_the_tool_return_budget() {
         // A response over the threshold is stored and comes back as a preview
@@ -336,7 +415,8 @@ mod tests {
         // stores stay disjoint only while the threshold is below the budget of
         // the smallest window the loop runs with.
         let threshold = default_external_archive_threshold_chars();
-        assert!(threshold < crate::context::tool_result_budget_chars(32000));
+        assert_eq!(threshold, EXTERNAL_ARCHIVE_THRESHOLD_CHARS);
+        assert!(threshold < crate::context::tool_result_budget_chars(Some(32000)));
     }
 
     #[test]
@@ -377,6 +457,6 @@ mod tests {
         );
         let rt: cog_core::RuntimeConfig = l.into();
         assert_eq!(rt.role, "evaluator");
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 }

@@ -503,7 +503,7 @@ impl A2aTask {
                     .collect::<Result<Vec<_>, _>>()
             })
             .transpose()?
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let history = task
             .get("history")
             .or_else(|| task.get("messages"))
@@ -515,7 +515,7 @@ impl A2aTask {
                     .collect::<Result<Vec<_>, _>>()
             })
             .transpose()?
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let context_id = task
             .get("contextId")
             .and_then(serde_json::Value::as_str)

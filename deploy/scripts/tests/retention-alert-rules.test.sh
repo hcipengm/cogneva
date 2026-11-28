@@ -104,7 +104,6 @@ check_fixture() {
     expect_red "${fixture}：规则被删，跑者非零" "$copy" "$case_file"
 }
 
-check_fixture cogneva-json-task-event-retention.test.yaml task_event_archive_behind
 check_fixture cogneva-json-llm-usage-retention.test.yaml llm_usage_retention_behind
 
 # 4) token 账独有：把「删不动的行有多老」那半砍掉，回填正在追那一格（期望静）必须红。

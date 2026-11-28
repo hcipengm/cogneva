@@ -12,9 +12,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use cog_core::{SFError, SFResult};
+use cog_core::{CandidateOutcome, ChangeCandidate, ChangeCandidateStore, SFError, SFResult};
 use tracing::{info, warn};
 
 use crate::types::{EvolutionKind, EvolutionResult, EvolutionStatus};
@@ -78,12 +78,6 @@ const VERIFICATION_ENV_PASSTHROUGH: &[&str] = &[
     "CARGO_BUILD_JOBS",
 ];
 
-/// Default wall-clock bound on the format check. Formatted-or-not is settled by
-/// parsing every file in the workspace, which takes seconds; a run that
-/// outlives this bound is a hung `rustfmt`, not a large workspace.
-// cap: bound — 一次格式化以秒计；超过它说明 rustfmt 挂了，不是工作区大
-pub(crate) const DEFAULT_FMT_TIMEOUT_SECS: u64 = 60;
-
 /// The formatter this workspace's deployments ran while the stage was
 /// hardcoded, in the three forms the stage needs: a probe that settles whether
 /// there is a formatter to ask at all, a check that answers whether the tree is
@@ -98,26 +92,20 @@ const BUILTIN_FMT_PROBE: &[&str] = &["cargo", "fmt", "--version"];
 const BUILTIN_FMT_CHECK: &[&str] = &["cargo", "fmt", "--all", "--", "--check"];
 const BUILTIN_FMT_CONFORM: &[&str] = &["cargo", "fmt", "--all"];
 
-/// Wall-clock bound on one deploy admission command.
+/// 一条变更要跑几条 WebUI 准入命令：声明里通常只有一条（装依赖 + 打包）。
 ///
-/// Measured on the host that judges these changes (2026-10-17): the chart
-/// render-freshness check took 3.7s and the parity check 1.6s. The bound is
-/// two orders of magnitude above that pair on purpose — see the test-side
-/// bound's reasoning — while still being a bound: a command that outlives it
-/// is hung, and a hung command would hold the executor's only in-flight slot.
-// cap: bound — 超了就是挂住了，而挂住的命令会把执行器唯一的在飞槽占死
-const DEPLOY_ADMISSION_TIMEOUT_SECS: u64 = 300;
+/// 这是一个**条数**，不是一个时长：每一条自己按「还在不在动」判，时长来自实测
+/// 窗口（[`progress_window_secs`]）。
+// cap: fixed — 条数不是时长：每条命令各自按动静判，时长由实测窗口供给；这个数只数「要跑几条」
+// keep: 删掉后一次变更的准入预算少了这一条，滚动会在跑到一半时超预算；由「只数要跑几条」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+const WEB_ADMISSION_RUNS_PER_CHANGE: u64 = 1;
 
-/// Wall-clock bound on one WebUI admission command.
-///
-/// The command that runs here installs the frontend dependencies and builds the
-/// bundle. A warm dependency cache makes it tens of seconds; a cold one is a
-/// registry round trip over a home connection, which is minutes. The bound sits
-/// above the cold path rather than at the warm reading: a bound that a cold
-/// cache outlives would refuse a sound change for the network it happened to
-/// run on, and the refusal reads exactly like a change that does not build.
-// cap: bound — 冷依赖缓存那趟是分钟级的下载；超了这个数说明命令挂住了
-const WEB_ADMISSION_TIMEOUT_SECS: u64 = 900;
+/// 一条变更跑几趟工具链供给（`rustup install`）。
+// cap: fixed — 同上，是条数：几趟供给各占一个自己的实测窗口，不按钟收尾
+// keep: 删掉后工具链那趟不计入预算，预算在最后一趟才被撞破；由「几趟供给各占一个自己的实测窗口」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+const TOOLCHAIN_RUNS_PER_CHANGE: u64 = 1;
 
 /// The linter this workspace's deployments ran while the stage was hardcoded.
 /// `--message-format=json` is what makes its findings comparable against the
@@ -164,7 +152,9 @@ const BUILTIN_LINT_LINE: &str = "cargo clippy --workspace --all-targets";
 
 /// [`ChangePipeline::run_cargo_fmt`] 里最多几趟命令：探针、判、改写、复判。
 /// 判干净就提前返回，所以这是上界不是次数。
-// cap: bound — 探针、判、改写、复判四趟；判干净就提前返回，所以是上界不是次数
+// cap: fixed — 探针、判、改写、复判四趟；判干净就提前返回，所以是上界不是次数
+// keep: 删掉后格式那几趟只剩一个估数，预算低估出三趟命令的钱；由「探针、判、改写、复判四趟」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const FMT_CMDS_PER_RUN_FMT: u64 = 4;
 
 /// 判这笔改动的格式化之前，先把这一侧的工具链对到 stable 的最新一次发布。
@@ -189,20 +179,6 @@ const FMT_CMDS_PER_RUN_FMT: u64 = 4;
 /// 读当前 stable 是哪一版，CI 拿到哪一版，这一侧就是哪一版。
 const BUILTIN_TOOLCHAIN_CHECK: &[&str] = &["rustup", "check"];
 
-/// 装一份工具链要多久：按分钟算，不是按秒。
-///
-/// 它只在某个 stable 发布之后第一次判变更时跑一趟——装好之后目录就在 `RUSTUP_HOME`
-/// 里，同一个 Pod 里后续的判据直接用，不再装。所以它有自己的一份界，不挤进 60 秒的
-/// 格式化界里：把安装塞进那份额度里，额度一到安装被砍，判据又回到旧那一把上，而
-/// 症状会读成「刷新老是失败」，看起来像网络问题。
-///
-/// 这个数是量出来的下限再翻一倍：实测一份 minimal + rustfmt + clippy 的工具链（250 MB
-/// 上下，2026-11-06 那台同时跑着两份下载的机器）装上用了十几分钟。给得紧的坏处
-/// 是「装不上 ⇒ 判据仍是旧那一把 ⇒ 整条链又回到这条要修的病上」，给得松的坏处只是
-/// 停摆告警晚半小时——两边不对称，所以往松的一边取。
-// cap: bound — 一次 stable 发布装一份；装好后同一次部署里不再装
-const TOOLCHAIN_PROVISION_TIMEOUT_SECS: u64 = 1800;
-
 /// `run_cargo_fmt` 之外直接跑的格式化命令有几趟。
 ///
 /// 两趟，都在它之前：apply 之前读一次「这棵树本来就是格式化过的样子吗」，以及更早
@@ -212,7 +188,8 @@ const TOOLCHAIN_PROVISION_TIMEOUT_SECS: u64 = 1800;
 /// `cargo fmt --all -- --check` 在这棵树上是绿还是红——而比较的两边得是同一把
 /// rustfmt。用镜像那一把读基线、用装好的那一把改写，改写过的每一行都会出现在
 /// diff 里，于是 linter 落在这些行上的报告会被记成这条变更写的。
-// cap: bound — 基线检查一趟，定工具链的刷新一趟
+// cap: fixed — 基线检查一趟，定工具链的刷新一趟
+// keep: 删掉后基线检查与工具链刷新两趟不计入，预算在变更之外先被花掉；由「基线一趟、定工具链一趟」兜住
 const FMT_CMDS_OUTSIDE_RUN_FMT: u64 = 2;
 
 /// `run_cargo_fmt` 在一条变更里最多被调用几次：apply 之后那趟，加上测试失败后
@@ -221,32 +198,45 @@ const FMT_CMDS_OUTSIDE_RUN_FMT: u64 = 2;
 /// 四段基线各跑各的：测试红了要读一次，门禁红了要读一次，linter 报了东西也要读
 /// 一次（摘掉改动之后同一棵树要能重新编译），而这三次不一定在同一条变更上发生。
 /// 数的是上界，所以按加起来算。
-// cap: bound — apply 之后那趟，加测试、门禁、linter 三处读基线各一趟
+// cap: fixed — apply 之后那趟，加测试、门禁、linter 三处读基线各一趟
+// keep: 删掉后 apply 之后的格式趟不计入，加测试、门禁、linter 三处读基线的支出一并失踪；由「apply 后那趟加三处读基线」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const FMT_RUNS_PER_CHANGE: u64 = 4;
 
-/// 一条变更在格式化这一段上最长的墙钟时间。
+/// 格式化这一段一条变更跑几趟命令：`run_cargo_fmt` 里那几趟，加外面那两趟
+/// （基线检查、定工具链的刷新）。
 ///
-/// 这一段既不被宿主构建槽约束、也不被任何单一超时约束，只能按"最多跑几趟命令"
-/// 封顶。验证循环把它加进自己声明的工期界里，所以它必须是数出来的：
 /// `the_one_change_wall_counts_every_call_site_it_names` 数着源码里的调用点守着
-/// 上面那三个数，免得加了新调用点而界还停在旧值上。
-///
-/// 工具链那一段（[`TOOLCHAIN_PROVISION_TIMEOUT_SECS`]）单独加在末尾：它不是格式
-/// 化命令，按命令条数乘出来的那份界装不下它（装一份要几分钟，一趟 `cargo fmt` 要几秒）。
-pub(crate) const FMT_SEGMENT_WALL_SECS: u64 = DEFAULT_FMT_TIMEOUT_SECS
-    * (FMT_CMDS_OUTSIDE_RUN_FMT + FMT_RUNS_PER_CHANGE * FMT_CMDS_PER_RUN_FMT)
-    + TOOLCHAIN_PROVISION_TIMEOUT_SECS;
+/// 这几个数，免得加了新调用点而界还停在旧值上。
+pub(crate) const FMT_COMMANDS_PER_CHANGE: u64 =
+    FMT_CMDS_OUTSIDE_RUN_FMT + FMT_RUNS_PER_CHANGE * FMT_CMDS_PER_RUN_FMT;
 
-/// 一条变更要跑几条吃**测试**预算的命令：`run_cargo_clippy` 一条，
+/// 一段活最长能持续多久：静默超过「这个部署见过的最长一步」它就已被判停、已被
+/// 杀了（`cog_core::declared_wall::stall`），所以一段活不可能比它更长。
+///
+/// 量不到（样本还没到 `SAMPLE_FLOOR`）时退回一个看门狗周期：那时什么都判不了，
+/// 而「什么都不判」在存活读数上不能读成 0——0 会让每一轮健康的工作都越界。
+pub(crate) fn progress_window_secs() -> u64 {
+    cog_core::progress::longest_gap()
+        .map(|gap| gap.as_secs())
+        .unwrap_or(0)
+        .max(cog_core::progress::WATCH_TICK.as_secs())
+}
+
+/// 一条变更要跑几条**测试那一类**的命令：`run_cargo_clippy` 一条，
 /// `run_test_command` 两条（套件一条，测试失败后读基线失败集合再一条），
 /// 加上 linter 报了东西之后要读的那趟基线（把改动摘掉、同一条命令再跑一遍）。
-/// 最后这一条只在红的路上付，界按上界算，所以也算进来。
-// cap: bound — clippy 一条加测试命令两条，加读 linter 基线那一条
-const TEST_BUDGET_RUNS_PER_CHANGE: u64 = 4;
+/// 最后这一条只在红的路上付，租约按上界算，所以也算进来。
+// cap: fixed — clippy 一条加测试命令两条，加读 linter 基线那一条
+// keep: 删掉后 clippy 与测试命令的开支不进入预算，变更跑到测试那一格才知道超了；由「clippy 一条、测试两条、读 linter 基线一条」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+const TEST_RUNS_PER_CHANGE: u64 = 4;
 
-/// 吃**构建**预算的那一条：发布构建，它的 acquire 在 `evolution_deployer` 里。
-// cap: bound — 吃构建预算的只有发布构建那一条
-const BUILD_BUDGET_RUNS_PER_CHANGE: u64 = 1;
+/// **构建那一类**里的那一条：发布构建，它的 acquire 在 `evolution_deployer` 里。
+// cap: fixed — 这一类的命令只有发布构建那一条
+// keep: 删掉后发布构建这一条不进入预算，最贵的一趟成了预算外支出；由「这一类的命令只有发布构建那一条」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+const BUILD_RUNS_PER_CHANGE: u64 = 1;
 
 /// 一条变更的验证最多收窄到几个包；超过就退回整棵 workspace。
 ///
@@ -254,41 +244,14 @@ const BUILD_BUDGET_RUNS_PER_CHANGE: u64 = 1;
 /// 过不过由落地后的 CI 判（红了有 `watch_landed` 回滚）。改动到这么多个包时
 /// 「自己」已经接近整棵树，再收窄省不下什么，却要多担一层「哪些包被算进来了」
 /// 的读数——那种时候跑整棵是更简单的那个答案。
-// cap: bound — 超过这么多个包，收窄省下的编译已经小于它多担的那层读数
+// cap: fixed — 超过这么多个包，收窄省下的编译已经小于它多担的那层读数
+// keep: 删掉后可以把任意多个包一起收窄，省下的编译小于多担的那层读数；由「超过这个数收窄就不划算了」兜住
 const MAX_SCOPED_PACKAGES: usize = 6;
 
-/// 读一次工作区成员清单的墙钟界。
-///
-/// `cargo metadata --no-deps` 只读清单、不编译，实测在几十毫秒量级；这个界是
-/// 「挂住了」的那条线，不是预算——一条读清单的命令卡住时，收回整棵 workspace
-/// 比等它更接近正确的判断。
-// cap: bound — 只读清单的命令卡住时宁可退回整棵 workspace
-const METADATA_TIMEOUT_SECS: u64 = 120;
-
-/// CI 那一族门禁整段活的墙钟界。
-///
-/// 工作流里那几十条判据在一个密封沙箱里逐个跑，其中一条是
-/// `deploy/scripts/check-live-services.sh`——需要真 PostgreSQL 与真 Redis 的那 64 条
-/// 检查。它是这一段的长尾：2026-11-06 实测 648 秒（热）／728 秒（冷），其余几条合计
-/// 159 秒（读源码树、读渲染产物、起 python3 与 rustup）。整段就是这两部分之和。
-///
-/// 这个界是「挂住了」的那条线，不是预算——一段门禁卡在这个数上时，判成没跑完比等它
-/// 更接近正确的判断。1800 秒按实测那一段（约 890 秒）的两倍取，与下面那次抬界同一个
-/// 倍数：量级变了，界跟着量级走。
-///
-/// 它抬过两次，两次都是同一件事：清单里多了跑得更久的东西。300 秒曾经够用，那时清单
-/// 只认得 `bash deploy/scripts/check-` 一种写法，读出来 52 条、合计 70.7 秒；认全之后
-/// 多出 python 判据、`.github/scripts/` 下的判据和两条 `--check` 只判不写的脚本，
-/// 安静时的读数到了 159 秒，界抬到 600。再抬到 1800 是因为那 64 条从工作流里挪成了
-/// 一条门禁：它们原先在 CI 里是 test job 的 64 个 step，本地一条都没跑过（命令带着包名
-/// 与测试名，被记成「这棵树给不出来」而跳过），挪过来之后本地与上游判的是同一批命令。
-/// 界只留一点几倍余量时，忙起来的宿主会把尾巴上那几条门跳掉，而跳掉只是「没问过」
-/// ——正是这一段要消灭的那种沉默。
-// cap: bound — 整段门禁卡住时宁可判成没跑完
-const REPO_GATE_STAGE_WALL_SECS: u64 = 1800;
-
 /// 一条变更跑几段门禁：判定那一段，以及红了之后读基线的那一段。
-// cap: bound — 判定一段 + 门禁失败后读基线一段
+// cap: fixed — 判定一段 + 门禁失败后读基线一段
+// keep: 删掉后门禁的两段支出不计入预算，失败后读基线那一段变成预算外；由「判定一段＋失败后读基线一段」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const REPO_GATE_RUNS_PER_CHANGE: u64 = 2;
 
 /// CI 工作流文件，门禁清单的唯一来源。
@@ -305,42 +268,32 @@ const CI_GATE_LAUNCHERS: &[&str] = &["bash", "sh", "python3", "python", "node"];
 /// 厂商名平等、README 的 trait 成员）。
 const CI_GATE_SCRIPT_MARKER: &str = "scripts/check-";
 
-/// 「只判不写」的调用旗标。`render-deploy.sh --check` 这类脚本名里没有 `check-`，
-/// 可它跑起来做的正是同一件事：把树渲染一遍，与提交的那份比。
+/// 「只判不写」的调用旗标。`sync-static-manifests.sh --check` 这类脚本名里没有
+/// `check-`，可它跑起来做的正是同一件事：把树里的东西与源比一遍，红了也不写。
 const CI_GATE_JUDGE_FLAG: &str = "--check";
 
-/// 一条变更上不受节拍约束的那几段活的墙钟上界——一个心跳到下一个心跳之间最长
-/// 的一段。加的是三段：
+/// 一条变更上不受节拍约束的那几段活能有多长——一个心跳到下一个心跳之间最长的
+/// 一段。加的是两块：
 ///
 /// - 每条 gated 命令各排一次宿主构建槽。闸门每次排队给的界是 `gate_wait_secs`；
-///   闸门关着（或并发上限为 0）时调用方传 0，那时 acquire 不排队。
-/// - 每条命令各吃一份自己的超时预算：`run_cargo_clippy`（判的那一趟与红了之后
-///   读基线的那一趟）与两条 `run_test_command` 吃测试预算，发布构建吃构建预算。
-/// - 门禁那一段，见 [`REPO_GATE_STAGE_WALL_SECS`]；它不排构建槽（跑的是壳脚本，
-///   不是编译器），所以只加时长、不加排队。
-/// - 格式化那一段，见 [`FMT_SEGMENT_WALL_SECS`]。
-/// - WebUI 准入那一段，见 [`WEB_ADMISSION_TIMEOUT_SECS`]。它只跑在碰
-///   `web/src/**` 的变更上，而那种变更**不跑**上面那两段 Rust 的活——两边是互斥
-///   的两条路。这里仍然加上它，因为界要覆盖的是任一种形状的最长一段，而一笔同时
-///   碰 Rust 与 WebUI 的变更在晋级门关掉时两条路都走。
+///   闸门关着时调用方传 0，那时 acquire 不排队。
+/// - 每条命令各占用一段时间。命令本身没有按秒的界了：它跑到静默超过实测窗口才被
+///   判停，所以一条命令最多占一个 [`progress_window_secs`]。段里几条命令就乘几。
 ///
 /// 谁在读它：`reflection_change_verification` 把它声明成
 /// [`cog_core::loop_health::Cadence::PeriodicWithWork`] 的工期界。**声明节拍的人
 /// 和拿这个数当存活界的人，量的必须是同一段活**——所以这里加的全是强制那几段活
 /// 的数，不是挑一个整数把规则按住。
-pub(crate) fn one_change_wall_secs(
-    gate_wait_secs: u64,
-    test_budget_secs: u64,
-    build_budget_secs: u64,
-) -> u64 {
+pub(crate) fn one_change_wall_secs(gate_wait_secs: u64) -> u64 {
     // 每条 gated 命令恰好 acquire 一次，所以排队次数就是命令条数。
-    let gate_waits = TEST_BUDGET_RUNS_PER_CHANGE + BUILD_BUDGET_RUNS_PER_CHANGE;
-    gate_waits * gate_wait_secs
-        + TEST_BUDGET_RUNS_PER_CHANGE * test_budget_secs
-        + BUILD_BUDGET_RUNS_PER_CHANGE * build_budget_secs
-        + WEB_ADMISSION_TIMEOUT_SECS
-        + REPO_GATE_RUNS_PER_CHANGE * REPO_GATE_STAGE_WALL_SECS
-        + FMT_SEGMENT_WALL_SECS
+    let gate_waits = TEST_RUNS_PER_CHANGE + BUILD_RUNS_PER_CHANGE;
+    let commands = TEST_RUNS_PER_CHANGE
+        + BUILD_RUNS_PER_CHANGE
+        + REPO_GATE_RUNS_PER_CHANGE
+        + FMT_COMMANDS_PER_CHANGE
+        + WEB_ADMISSION_RUNS_PER_CHANGE
+        + TOOLCHAIN_RUNS_PER_CHANGE;
+    gate_waits * gate_wait_secs + commands * progress_window_secs()
 }
 
 /// `rustup check` 对 stable 那一行的回答。
@@ -378,8 +331,17 @@ fn stable_release_from_check(output: &str) -> Option<StableRelease> {
         if lowered.contains("up to date") {
             return Some(StableRelease::Current);
         }
-        if let Some((_, after)) = line.split_once("->") {
-            return version_token(after).map(StableRelease::Install);
+        if let Some((before, after)) = line.split_once("->") {
+            let after = version_token(after)?;
+            // 箭头两边同版：本机的 stable 就是「最新发布」，rustup 只是把同一次
+            // 发布又列了一遍，装出来的东西与 stable 逐字节同源。2026-11-19 实测
+            // 的现场：`stable-x86_64… - update available: 1.100.0 (0ef1bc386)
+            // -> 1.100.0 (0ef1bc386)`，而本机 `rustc --version` 正是 1.100.0。
+            // 按「装箭头后面那个」走会重新下载几百兆，装出来的仍与 stable 同一把。
+            if version_token(before).as_deref() == Some(after.as_str()) {
+                return Some(StableRelease::Current);
+            }
+            return Some(StableRelease::Install(after));
         }
         return None;
     }
@@ -408,6 +370,13 @@ fn version_token(text: &str) -> Option<String> {
 /// clippy 是要点名装的组件；一个残缺的目录在这里被读成「已经装好了」，指过去之后每一条
 /// 格式化命令都起不来，而判据会把「这一侧没有 rustfmt」判成「这笔改动的格式不对」。
 /// 装的那一趟本来就是幂等的（缺什么补什么），所以缺组件就让它再跑一趟。
+///
+/// 组件文件在也不算数：安装被超时或取消打断时，`bin/rustfmt` 与 `bin/cargo-clippy`
+/// 都已经落盘，缺的却是 rustc 那份共享库——2026-11-19 门禁实测的现场是
+/// `librustc_driver-*.so: cannot open shared object file`，而 `rustup component list`
+/// 同一份目录上报 `missing manifest`。judge 把 `RUSTUP_TOOLCHAIN` 指过去之后，每一条
+/// 格式化命令都起不来，14 条与格式无关的测试被读成「是这笔改动弄坏了它们」。
+/// 判它起得来，只能真起一次。
 fn provisioned_toolchain(release: &str) -> Option<PathBuf> {
     let home = std::env::var_os("RUSTUP_HOME")
         .map(PathBuf::from)
@@ -420,6 +389,14 @@ fn provisioned_toolchain(release: &str) -> Option<PathBuf> {
 /// 分成两层是为了让「装好了」这件事可以被数：往一个临时目录里摆一份工具链目录，
 /// 就能问出这个函数认的是什么——不必去动进程的环境变量（那条路会让并行的测试互相
 /// 踩，而且踩出来的失败与这条判据无关）。
+/// 工具链目录里判据要用的那两个组件二进制。
+///
+/// 名字各写一遍：这份判断与真正起它的那一处必须指的是同一段路径，两次各写一份时
+/// 改一处不会让另一处红——读不出来的那一侧只会安静地换成一棵空目录。
+const TOOLCHAIN_BIN_DIR: &str = "bin";
+const TOOLCHAIN_RUSTFMT: &str = "rustfmt";
+const TOOLCHAIN_CLIPPY: &str = "cargo-clippy";
+
 fn provisioned_toolchain_in(home: &Path, release: &str) -> Option<PathBuf> {
     let prefix = format!("{release}-");
     std::fs::read_dir(home.join("toolchains"))
@@ -433,9 +410,26 @@ fn provisioned_toolchain_in(home: &Path, release: &str) -> Option<PathBuf> {
                 .is_some_and(|name| name.starts_with(&prefix));
             // 组件只写一遍：两处各写一份时，改一边而漏掉另一边，这里就会读成
             // 「装好了」或「没装」——两边都是对同一棵树的两个说法。
-            let bin = path.join("bin");
-            named && bin.join("rustfmt").exists() && bin.join("cargo-clippy").exists()
+            let bin = path.join(TOOLCHAIN_BIN_DIR);
+            named
+                && bin.join(TOOLCHAIN_RUSTFMT).exists()
+                && bin.join(TOOLCHAIN_CLIPPY).exists()
+                && toolchain_starts(path)
         })
+}
+
+/// 这一份工具链起得来吗。
+///
+/// 起一次 `rustfmt --version` 看退出码：这是唯一不依赖 rustup 内部布局（manifest、
+/// 组件目录、共享库放在哪）的判法，而判据后续要跑的正是这一把二进制。
+fn toolchain_starts(dir: &Path) -> bool {
+    std::process::Command::new(dir.join(TOOLCHAIN_BIN_DIR).join(TOOLCHAIN_RUSTFMT))
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// Resolve the environment for the verification test process: the passthrough
@@ -760,7 +754,8 @@ fn last_line_of(text: &str) -> &str {
 
 /// 输出的尾巴：门禁的报告是给人读的，前面大半是它读过的清单，红的那句在末尾。
 fn tail_of(text: &str) -> String {
-    // cap: bound — 够装下几组失败各自的收尾行（每组通常一两行），又不至于把整份
+    // cap: fixed — 够装下几组失败各自的收尾行（每组通常一两行），又不至于把整份
+    // keep: 删掉后一次失败要把所有收尾行都留在结果里，结果被日志淹没；由「够装几组失败的收尾行」兜住
     // 日志倒进提示词；没有测量能定这个数，它只决定「交回去的是结尾还是全文」。
     const KEPT: usize = 40;
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -1039,16 +1034,18 @@ enum LintVerdict {
 }
 
 /// Pipeline that turns validated code changes into tested source changes.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ChangePipeline {
     project_root: PathBuf,
     change_dir: PathBuf,
     auto_apply: bool,
-    /// Wall-clock budget for the verification test run. A cold verification
-    /// compiles the whole workspace on the deployment's own hardware before it
-    /// runs a single test, so this bounds a build-plus-test, not just a test;
-    /// a budget shorter than one real run turns every verdict into a timeout.
-    test_timeout_secs: u64,
+    /// 待落地队列的正本：一条只追加的事件流。
+    ///
+    /// 队列曾经就是那个目录，状态活在写它的进程内存里，重启后一条已经判过的
+    /// 变更与一条刚生成的读起来一样。写者由本进程在 `start` 时从服务表挂上
+    /// （[`attach_process_candidates`]）；夹具用 [`Self::with_candidates`] 挂一份
+    /// 内存实现，这样并发跑的用例各用各的队列。
+    candidates: Option<Arc<dyn ChangeCandidateStore>>,
     /// The command that judges a change, as argv. Comes from the deployment's
     /// `self_evolution.test_command`; the default judges a Rust workspace, so a
     /// project that is not one has to say so here rather than be judged by a
@@ -1063,6 +1060,11 @@ pub struct ChangePipeline {
     /// `None` means this workspace's own linter, the only one whose findings
     /// this pipeline can compare against the lines the change wrote.
     lint_command: Option<Vec<String>>,
+    /// 定批的读取器。可选：没有事件流的部署没有可比的批次，判据退成「不判」。
+    ///
+    /// 它在这里的理由只有一个：构建槽是这一整条流水线上最贵的动作，而「这一笔是不是
+    /// 当前那一轮钉住的那批里的一条」这件事，只有在**取槽之前**问才不会白付一次构建。
+    rounds: Option<std::sync::Arc<dyn cog_core::RoundEvents>>,
     /// The executable admission conditions for changes that touch `deploy/**`.
     /// `None` means this deployment declared none, and such a change is
     /// refused by name rather than sent to a person.
@@ -1071,11 +1073,6 @@ pub struct ChangePipeline {
     /// `None` means this deployment declared none, and such a change is refused
     /// by name rather than sent to a person.
     web_admission: Option<cog_core::WebAdmissionConfig>,
-    /// Wall-clock bound on the format check. Short on purpose: the check does
-    /// not compile anything, so a run this side of the bound is a hung process
-    /// rather than a slow one — and a hung process would hold the executor's
-    /// only in-flight slot, which is the state this bound exists to end.
-    fmt_timeout_secs: u64,
     promotion_policy: Option<crate::PromotionGateConfig>,
     /// 共享 CARGO_TARGET_DIR：把编译产物留在工作树之外，临时工作树用完即弃
     /// 也不会丢增量缓存。
@@ -1146,20 +1143,6 @@ impl std::fmt::Debug for MetricsSink {
     }
 }
 
-/// The metadata record that sits beside a change's `.diff`.
-///
-/// The queue is a directory and keeps no memory of its own: every change's
-/// status lived in a map a restart empties, so after a restart a `.diff` left
-/// over from a change that had already been judged and a brand new one were the
-/// same file, and the listing had to invent a status for both. The record is
-/// what makes them two different files on disk, and unlike the map it survives
-/// the process that wrote it. Shared by the writer (the engine, which knows the
-/// artifact's metadata the moment it is produced) and the readers here, so the
-/// path is spelled once.
-pub(crate) fn change_record_path(dir: &Path, artifact_id: &str) -> PathBuf {
-    dir.join(format!("{artifact_id}.json"))
-}
-
 /// 变更目录下放「已经离开待办队列」那一半的目录名。
 const RETIRED_SUBDIR: &str = "retired";
 
@@ -1170,82 +1153,6 @@ const RETIRED_SUBDIR: &str = "retired";
 /// rename answer "no such change" rather than failing.
 pub(crate) fn retired_dir(change_dir: &Path) -> PathBuf {
     change_dir.join(RETIRED_SUBDIR)
-}
-
-/// The record of a change that has left the pending queue. Retired beside the
-/// `.diff` it describes, so the pair moves together and neither can be read
-/// alone.
-pub(crate) fn retired_change_record_path(dir: &Path, artifact_id: &str) -> PathBuf {
-    retired_dir(dir).join(format!("{artifact_id}.json"))
-}
-
-/// Write a change's metadata record into `dir`.
-///
-/// Free rather than a method because the writer is the engine that produces the
-/// change (it holds the artifact's metadata the moment it has it) and the
-/// readers are here: both name the same path through
-/// [`change_record_path`], and one of them is not a `ChangePipeline`.
-/// Metadata only -- the artifact text stays where it is written.
-pub(crate) async fn write_record_file(dir: &Path, result: &EvolutionResult) -> SFResult<()> {
-    let path = change_record_path(dir, &result.artifact_id);
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| {
-            SFError::IO(format!(
-                "Failed to create change dir {}: {}",
-                parent.display(),
-                e
-            ))
-        })?;
-    }
-    let mut record = result.clone();
-    record.content.clear();
-    let text = serde_json::to_string(&record).map_err(SFError::Serialization)?;
-    tokio::fs::write(&path, text).await.map_err(|e| {
-        SFError::IO(format!(
-            "Failed to write change record {}: {}",
-            path.display(),
-            e
-        ))
-    })
-}
-
-/// Read a change's metadata record, telling "no record" apart from "a record
-/// nobody can read".
-///
-/// [`ChangePipeline::read_change_record`] collapses both to `None` on purpose:
-/// a caller building a listing has nothing better to do with either. A caller
-/// about to **write** the record has to tell them apart, because overwriting an
-/// unreadable record destroys the only copy of the fact it states, while
-/// overwriting an absent one destroys nothing. So: `Ok(None)` means there was
-/// no file, `Err` means there was one and its bytes did not parse.
-pub(crate) async fn read_record_beside(
-    dir: &Path,
-    artifact_id: &str,
-) -> SFResult<Option<EvolutionResult>> {
-    for path in [
-        change_record_path(dir, artifact_id),
-        retired_change_record_path(dir, artifact_id),
-    ] {
-        let text = match tokio::fs::read_to_string(&path).await {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                return Err(SFError::IO(format!(
-                    "Failed to read change record {}: {}",
-                    path.display(),
-                    e
-                )))
-            }
-        };
-        return serde_json::from_str(&text).map(Some).map_err(|e| {
-            SFError::IO(format!(
-                "Failed to parse change record {}: {}",
-                path.display(),
-                e
-            ))
-        });
-    }
-    Ok(None)
 }
 
 /// The timestamp a change carries when no record states one.
@@ -1262,6 +1169,135 @@ pub(crate) async fn read_record_beside(
 pub(crate) const UNKNOWN_CREATED_AT: chrono::DateTime<chrono::Utc> =
     chrono::DateTime::<chrono::Utc>::MIN_UTC;
 
+/// 本进程的队列写者。
+///
+/// 为什么要有进程级的那一份：管线在这份进程里不止一处被造出来（插件 init 的那条、
+/// 执行器为每个请求造的那条），而队列的写者只有一个。逐条构造点各传一次，漏传的
+/// 那处会以「没有写者」静默失败；一个进程一份，挂上的那一刻之后每一条管线都看得见。
+///
+/// 夹具不走这里：并发跑的用例共用一个进程，共用一份队列会让一个用例的候选出现在
+/// 另一个用例的待办里。它们用 [`ChangePipeline::with_candidates`] 各挂各的。
+static PROCESS_CANDIDATES: std::sync::OnceLock<Arc<dyn ChangeCandidateStore>> =
+    std::sync::OnceLock::new();
+
+/// 挂上本进程的队列写者。第二次挂以及更晚的调用是空操作。
+///
+/// 返回是否由这一次挂上：部署里它只在 `start` 调一次，而「已经挂过」与「这一跑
+/// 挂上了」在日志里必须分得开，否则一个没挂上的进程看起来也像挂上了。
+pub fn attach_process_candidates(store: Arc<dyn ChangeCandidateStore>) -> bool {
+    PROCESS_CANDIDATES.set(store).is_ok()
+}
+
+/// 夹具用的一条管线：队列挂一份内存实现。
+///
+/// 每条用例各挂各的：并发跑的用例共用一个进程，共用一份队列会让一个用例的候选
+/// 出现在另一个用例的待办里，而两边都是绿的——绿的来源不同。
+#[cfg(test)]
+pub(crate) fn test_pipeline(
+    project_root: impl Into<PathBuf>,
+    change_dir: impl Into<PathBuf>,
+    auto_apply: bool,
+) -> ChangePipeline {
+    ChangePipeline::new(project_root, change_dir, auto_apply)
+        .with_candidates(Arc::new(cog_test_support::MemoryCandidateStore::new()))
+}
+
+/// 夹具用的一份队列写者，给需要自己挂（比如同时给引擎与管线）的用例。
+#[cfg(test)]
+pub(crate) fn test_candidates() -> Arc<dyn ChangeCandidateStore> {
+    Arc::new(cog_test_support::MemoryCandidateStore::new())
+}
+
+/// 这个进程的队列写者，给没有自己那一份的调用方（引擎、执行器）。
+pub(crate) fn process_candidates() -> Option<Arc<dyn ChangeCandidateStore>> {
+    PROCESS_CANDIDATES.get().cloned()
+}
+
+/// 把一条变更记进队列：候选事件一条，它自己的状态词一条。
+///
+/// 两个写者（引擎与管线）走同一条路，因为它们是同一件事的两个入口：一边在
+/// 生成时记下候选，另一边在状态变化时追加事件。分成两份实现会让「第一次记录」
+/// 与「之后的状态」在两条路径上各拼一次 `kind` / `status` 的词。
+pub(crate) async fn record_change(
+    store: &Arc<dyn ChangeCandidateStore>,
+    result: &EvolutionResult,
+) -> SFResult<()> {
+    let status = status_word(result.status);
+    store
+        .record(&ChangeCandidate {
+            artifact_id: result.artifact_id.clone(),
+            kind: kind_word(result.kind),
+            description: result.description.clone(),
+            // 正文随候选一起进事件：`.diff` 从此只是导出工件，盘丢了也能重放出来。
+            // 状态更新那几条事件不带正文（`record` 只收第一次），所以它只写一遍。
+            content: result.content.clone(),
+            created_at: result.created_at,
+            eval_summary: result.eval_summary.clone(),
+            tiering: result
+                .tiering
+                .as_ref()
+                .and_then(|tiering| serde_json::to_string(tiering).ok()),
+            // 发起这次演化的那件活一路带到变更事实上；没有它就是 None。
+            unit_of_work: result.unit_of_work.clone(),
+            recorded_status: status.clone(),
+            status: "candidate".to_string(),
+            decision_reason: None,
+            event_id: String::new(),
+        })
+        .await?;
+    store.transition(&result.artifact_id, &status, "").await
+}
+
+/// 一个状态词在事件里的拼写。
+///
+/// 拼写从枚举的序列化里取，不在这里手抄一份：手抄的那份在改名之后仍然编译得过，
+/// 只是把新状态写成一个谁也不认得的老词，而读的人会把它当成「这一条还没记录」。
+fn status_word(status: EvolutionStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unrecorded".to_string())
+}
+
+/// 一个产物种类在事件里的拼写。理由同 [`status_word`]。
+fn kind_word(kind: EvolutionKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "code_change".to_string())
+}
+
+/// 从队列里的一行还原成引擎认的那条变更。
+///
+/// 状态词读不懂时记成 `Unrecorded`，而不是猜一个：这个变体的意思正是「这一行
+/// 没说出它走到了哪一步」，而猜成 `CompileChecked` 会让一条谁也没验过的变更
+/// 看起来可以落地。
+fn result_from_candidate(candidate: &ChangeCandidate) -> EvolutionResult {
+    let kind =
+        serde_json::from_value::<EvolutionKind>(serde_json::Value::String(candidate.kind.clone()))
+            .unwrap_or(EvolutionKind::CodeChange);
+    let status = serde_json::from_value::<EvolutionStatus>(serde_json::Value::String(
+        candidate.recorded_status.clone(),
+    ))
+    .unwrap_or(EvolutionStatus::Unrecorded);
+    EvolutionResult {
+        // 这一格随候选往返：从候选里读出来的那一版，仍然属于同一个目标；
+        // 写成 None 会把「谁要的」在重放/重投的那一刻丢掉。
+        unit_of_work: candidate.unit_of_work.clone(),
+        kind,
+        artifact_id: candidate.artifact_id.clone(),
+        description: candidate.description.clone(),
+        content: candidate.content.clone(),
+        status,
+        created_at: candidate.created_at,
+        eval_summary: candidate.eval_summary.clone(),
+        tiering: candidate
+            .tiering
+            .as_deref()
+            .and_then(|text| serde_json::from_str(text).ok()),
+    }
+}
+
 impl ChangePipeline {
     pub fn new(
         project_root: impl Into<PathBuf>,
@@ -1272,13 +1308,13 @@ impl ChangePipeline {
             project_root: project_root.into(),
             change_dir: change_dir.into(),
             auto_apply,
-            test_timeout_secs: 3600,
+            candidates: None,
             test_command: cog_core::SelfEvolutionConfig::default().test_command,
             fmt_check_command: None,
             lint_command: None,
+            rounds: None,
             deploy_admission: None,
             web_admission: None,
-            fmt_timeout_secs: DEFAULT_FMT_TIMEOUT_SECS,
             promotion_policy: None,
             target_dir: None,
             budget: None,
@@ -1298,40 +1334,26 @@ impl ChangePipeline {
         self
     }
 
-    /// Attach the observation sink and take the budget from it.
+    /// 接上「当前那一轮钉住了哪一批」。接上之后，取构建槽之前会先问这一笔在不在批里；
+    /// 不接就是「没有批次」——没有事件流的部署照样跑，只是不判这一条。
+    pub fn with_rounds(mut self, rounds: Arc<dyn cog_core::RoundEvents>) -> Self {
+        self.rounds = Some(rounds);
+        self
+    }
+
+    /// Attach the observation sink the cost of each verification run is
+    /// reported to.
     ///
-    /// The budget is read out of the sink rather than passed separately so that
-    /// the number reported and the number enforced cannot be two numbers: a
-    /// deployment whose reading said 3600 while its runs were being killed at
-    /// 1800 would be an observation surface that disagrees with the decision it
-    /// is supposed to explain.
-    ///
-    /// The field this sets is the fallback for a pipeline with no sink attached.
-    /// A pipeline that has one reads the budget at every run (see
-    /// [`Self::test_budget_secs`]), because the sink's number moves: a run that
-    /// came within the headroom of the pin raises the budget for the next one,
-    /// and a pipeline holding a copy taken at construction would keep enforcing
-    /// the old wall while the reading advertised the new one.
+    /// It no longer carries a wall: a run is judged by whether it is still
+    /// moving, not by how long it has been running. The sink still gets the
+    /// measured duration of every run that finished, which is what the cost
+    /// reading is made of.
     pub fn with_verification_budget(
         mut self,
         budget: Arc<crate::verification_budget::VerificationBudget>,
     ) -> Self {
-        self.test_timeout_secs = budget.timeout_secs(crate::verification_budget::KIND_TEST);
         self.budget = Some(budget);
         self
-    }
-
-    /// The test budget this run is held to.
-    ///
-    /// Read at the moment of the run, not at wiring time: the sink derives it
-    /// from the runs that already happened, so the number that applies to this
-    /// change is the one as of now. Without a sink the pipeline keeps the value
-    /// it was configured with.
-    fn test_budget_secs(&self) -> u64 {
-        match &self.budget {
-            Some(budget) => budget.timeout_secs(crate::verification_budget::KIND_TEST),
-            None => self.test_timeout_secs,
-        }
     }
 
     pub fn with_target_dir(mut self, dir: impl Into<PathBuf>) -> Self {
@@ -1343,11 +1365,6 @@ impl ChangePipeline {
     /// 接了分配器的调用方一律改用分配出来的工作树。
     pub fn project_root(&self) -> &std::path::Path {
         &self.project_root
-    }
-
-    pub fn with_test_timeout(mut self, secs: u64) -> Self {
-        self.test_timeout_secs = secs;
-        self
     }
 
     /// The deployment's test command. Taken from the config where the pipeline
@@ -1510,6 +1527,7 @@ impl ChangePipeline {
             }
 
             results.push(EvolutionResult {
+                unit_of_work: None,
                 kind: EvolutionKind::CodeChange,
                 artifact_id,
                 description,
@@ -1525,88 +1543,118 @@ impl ChangePipeline {
         Ok(results)
     }
 
-    /// Write a change's metadata record beside its `.diff`.
+    /// 挂上这条管线自己的队列写者。夹具用；部署里挂的是本进程那一份。
+    pub fn with_candidates(mut self, candidates: Arc<dyn ChangeCandidateStore>) -> Self {
+        self.candidates = Some(candidates);
+        self
+    }
+
+    /// 这个进程的队列写者：管线自己挂的那份，或者进程级的那份。
+    fn candidate_store(&self) -> Option<Arc<dyn ChangeCandidateStore>> {
+        self.candidates
+            .clone()
+            .or_else(|| PROCESS_CANDIDATES.get().cloned())
+    }
+
+    /// 把一条变更记进队列：候选事件一条，自己的状态词一条。
     ///
-    /// The record is the durable half of what the resident index holds: the
-    /// index is per-process and a restart empties it, so a change whose whole
-    /// state lives there stops existing the moment the process does.
+    /// 落两个事件而不是改一格：候选的身份、描述、正文与生成时刻是**发生过的
+    /// 一次**，写第二遍不该改写它；状态是另一条事实，会变，于是它是一条又一条
+    /// 事件，读的时候取最新的那条。这一步失败要往上抛：调用方已经改了内存里的
+    /// 状态，而库里没有对应的事件，等于这条变更在重启之后退回更早的状态。
     pub async fn write_change_record(&self, result: &EvolutionResult) -> SFResult<()> {
-        write_record_file(&self.change_dir, result).await
-    }
-
-    /// Read a change's metadata record, from the pending queue or `retired/`.
-    ///
-    /// `retired/` is searched second for the same reason the artifact text is:
-    /// that is where a change goes once it lands or is refused, and its record
-    /// moves with it. A record that cannot be parsed is reported as absent
-    /// rather than as a record with defaulted fields -- a record whose contents
-    /// are unreadable states nothing, and defaulting it would put a fabricated
-    /// status back in the one place built to stop that.
-    pub async fn read_change_record(&self, artifact_id: &str) -> Option<EvolutionResult> {
-        let pending = change_record_path(&self.change_dir, artifact_id);
-        if let Ok(text) = tokio::fs::read_to_string(&pending).await {
-            if let Ok(record) = serde_json::from_str(&text) {
-                return Some(record);
-            }
-        }
-        let retired = retired_change_record_path(&self.change_dir, artifact_id);
-        tokio::fs::read_to_string(retired)
+        let Some(candidates) = self.candidate_store() else {
+            return Err(SFError::Config(
+                "no change candidate store is attached to this process: the queue's author is the event stream, and without a writer there is no queue".to_string(),
+            ));
+        };
+        let status = status_word(result.status);
+        candidates
+            .record(&ChangeCandidate {
+                unit_of_work: None,
+                artifact_id: result.artifact_id.clone(),
+                kind: kind_word(result.kind),
+                description: result.description.clone(),
+                content: String::new(),
+                created_at: result.created_at,
+                eval_summary: result.eval_summary.clone(),
+                tiering: result
+                    .tiering
+                    .as_ref()
+                    .and_then(|tiering| serde_json::to_string(tiering).ok()),
+                recorded_status: status.clone(),
+                status: "candidate".to_string(),
+                decision_reason: None,
+                event_id: String::new(),
+            })
+            .await?;
+        candidates
+            .transition(&result.artifact_id, &status, "")
             .await
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
     }
 
-    /// Every change record this queue can see, pending and retired, newest
-    /// first.
+    /// 读一条变更此刻的样子。读不到就是读不到，读出错也是读不到——调用方
+    /// （列表、内容读取）对两者都没有更好的处置。
+    pub async fn read_change_record(&self, artifact_id: &str) -> Option<EvolutionResult> {
+        let candidate = self.candidate_store()?.read(artifact_id).await.ok()??;
+        Some(result_from_candidate(&candidate))
+    }
+
+    /// 队列里与已定案的全部变更，最新的在前。
     ///
-    /// This is the durable face a listing is built from. A change's record
-    /// outlives the process that produced it and stays with the artifact after
-    /// it leaves the queue, so a listing that reads it does not lose a change
-    /// when the resident index that used to carry it drops the entry.
-    pub async fn known_change_records(&self) -> Vec<EvolutionResult> {
-        let mut records: Vec<EvolutionResult> = Vec::new();
-        for dir in [self.change_dir.clone(), retired_dir(&self.change_dir)] {
-            let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
-                continue;
-            };
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
-                }
-                if let Ok(text) = tokio::fs::read_to_string(&path).await {
-                    if let Ok(record) = serde_json::from_str(&text) {
-                        records.push(record);
-                    }
-                }
+    /// 这是列表能读的那一面：候选活在库里，不带进程内存的状态，因而重启不会让
+    /// 一条已经判过的变更重新出现。
+    /// 队列里与已定案的全部变更，最新的在前。
+    ///
+    /// 读不出来要往上抛，不能折成一张空表：这份记录是列表里「已经退场的那一半」
+    /// 的唯一来源，因此「队列读不出」与「一条已退场的都没有」在调用方必须是两
+    /// 件事——折叠成空表时，一次读失败会让管理面安安静静地少掉每一条已落地的
+    /// 变更，而没有任何一处说得出少了什么。
+    pub async fn known_change_records(&self) -> SFResult<Vec<EvolutionResult>> {
+        let Some(candidates) = self.candidate_store() else {
+            return Ok(Vec::new());
+        };
+        let mut records: Vec<EvolutionResult> = candidates
+            .all()
+            .await?
+            .iter()
+            .map(result_from_candidate)
+            .collect();
+        records.sort_by_key(|record| std::cmp::Reverse(record.created_at));
+        Ok(records)
+    }
+
+    /// 这条变更是否已经离开待办队列。
+    ///
+    /// 判据是**库里那一条事件**，不是盘上有没有文件：一份没人删掉的 `.diff`
+    /// 曾被读成「这条变更还在队列里」，于是一条永远不可能应用的变更每轮重试。
+    /// 读不出队列时按「还没退役」处理——宁可多留一条内存记录，也不要丢掉一条
+    /// 还没定案的变更的状态。
+    pub async fn artifact_is_retired(&self, artifact_id: &str) -> bool {
+        let Some(candidates) = self.candidate_store() else {
+            return false;
+        };
+        match candidates.read(artifact_id).await {
+            Ok(Some(candidate)) => !candidate.is_pending(),
+            _ => false,
+        }
+    }
+
+    /// 读回一条变更的 diff 正文。
+    ///
+    /// 正文在库里（候选事件的 `attributes`），盘上的 `.diff` 只是**导出工件**：
+    /// 应用与落地读它，但「这条变更是什么」不以它为准。库里读不到时退回盘上那份，
+    /// 那是历史留下的、还没导入的旧文件。
+    pub async fn read_change_content(&self, artifact_id: &str) -> Option<String> {
+        let stored = match self.candidate_store() {
+            Some(candidates) => candidates.read(artifact_id).await.ok().flatten(),
+            None => None,
+        };
+        if let Some(candidate) = stored {
+            if !candidate.content.is_empty() {
+                return Some(candidate.content);
             }
         }
-        records.sort_by_key(|a| std::cmp::Reverse(a.created_at));
-        records
-    }
-
-    /// Whether a change's artifact has already left the pending queue.
-    ///
-    /// The condition a resident record may be dropped under. Dropping a record
-    /// is only safe once the artifact is out of the queue and its own record is
-    /// beside it: until then the index is the last thing holding that change's
-    /// state, and a drop would take the state with it.
-    pub fn artifact_is_retired(&self, artifact_id: &str) -> bool {
-        retired_dir(&self.change_dir)
-            .join(format!("{artifact_id}.diff"))
-            .exists()
-            && retired_change_record_path(&self.change_dir, artifact_id).exists()
-    }
-
-    /// Read a change's diff text back from disk by `artifact_id`.
-    ///
-    /// The engine's resident index deliberately keeps no artifact text (see
-    /// `resident_record`), so a reader that has an id but no content -- the
-    /// admin listing, for a change that has already left the pending queue --
-    /// reads it here instead. `retired/` is searched second because that is
-    /// where the queue puts every change that lands or is refused, and those
-    /// are exactly the ones the pending scan no longer returns.
-    pub async fn read_change_content(&self, artifact_id: &str) -> Option<String> {
         let pending = self.change_dir.join(format!("{artifact_id}.diff"));
         if let Ok(text) = tokio::fs::read_to_string(&pending).await {
             return Some(text);
@@ -1615,19 +1663,36 @@ impl ChangePipeline {
         tokio::fs::read_to_string(retired).await.ok()
     }
 
-    /// Take a change out of the pending queue, keeping it under `retired/` for
-    /// a post-mortem.
+    /// Take a change out of the pending queue.
     ///
-    /// The queue is the change directory itself and carries no memory of its
-    /// own: the statuses live in the engine, which every restart empties. Once
-    /// a record is gone a leftover `.diff` is indistinguishable from a brand
-    /// new one — it reads back as `CompileChecked` — so a change that can never
-    /// apply is re-applied on every cycle for the life of the deployment,
-    /// recording a learning each time and holding the landing channel shut.
-    /// Recording the outcome is the audit trail; retiring the artifact is what
-    /// makes a rejection final.
-    pub async fn retire_change(&self, artifact_id: &str, reason: &str) -> SFResult<()> {
+    /// 定案是**又一条事件**（`change_accepted` / `change_rejected`），不是改一格：
+    /// 队列里「在不在」由事件回答，因而重启之后同一条变更不会重新变成候选。
+    /// 盘上的 `.diff` 跟着挪进 `retired/`，那是导出工件，方便事后翻看——
+    /// 它不是判据，挪不动也不影响「这条变更已经定案」。
+    pub async fn retire_change(
+        &self,
+        artifact_id: &str,
+        outcome: CandidateOutcome,
+        reason: &str,
+    ) -> SFResult<()> {
+        // 先定案再挪文件：反过来的话，一次挪不动就会让一条永远不可能应用的变更
+        // 仍然出现在待办里，而它已经在盘上换了地方。
+        let store = self.candidate_store().ok_or_else(|| {
+            SFError::Config(
+                "no change candidate store is attached to this process: refusing to retire a change the queue cannot record"
+                    .to_string(),
+            )
+        })?;
+
         let from = self.change_dir.join(format!("{artifact_id}.diff"));
+        // 队列里没有这条候选、盘上也没有它：退役一条不存在的变更是空操作，不是
+        // 错误——「退役一条不在队列里的」与「退役一条已经退役过的」是同一件事。
+        let in_queue = matches!(store.read(artifact_id).await, Ok(Some(_)));
+        if !in_queue && !from.exists() {
+            return Ok(());
+        }
+        store.decide(artifact_id, outcome, reason).await?;
+
         if !from.exists() {
             return Ok(());
         }
@@ -1646,26 +1711,9 @@ impl ChangePipeline {
             SFError::IO(format!("Failed to retire change {}: {}", from.display(), e))
         })?;
 
-        // The record moves with the change it describes. Left behind, it would
-        // keep a retired change in the pending listing, and the pair would
-        // disagree about which queue the change is in. A record that cannot
-        // move is not fatal to the retirement -- the artifact is out of the
-        // queue, which is what retirement is for -- but it is what
-        // `artifact_is_retired` refuses a record drop over, so it is named.
-        let record_from = change_record_path(&self.change_dir, artifact_id);
-        if record_from.exists() {
-            let record_to = retired_change_record_path(&self.change_dir, artifact_id);
-            if let Err(e) = tokio::fs::rename(&record_from, &record_to).await {
-                warn!(
-                    change_id = %artifact_id,
-                    error = %e,
-                    "Change retired but its record could not be moved with it"
-                );
-            }
-        }
-
         info!(
             change_id = %artifact_id,
+            outcome = ?outcome,
             reason = %reason,
             retired_to = %to.display(),
             "Change retired from the pending queue"
@@ -1964,7 +2012,7 @@ impl ChangePipeline {
                 reason = %reason,
                 "Change refused by the deployment admission conditions"
             );
-            let _ = self.git_reset_hard(workdir, &change.content).await;
+            cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
             return Ok(ApplyResult {
                 change_id: change.artifact_id.clone(),
                 files_changed,
@@ -1988,7 +2036,7 @@ impl ChangePipeline {
                     reason = %reason,
                     "Change refused by the WebUI admission conditions"
                 );
-                let _ = self.git_reset_hard(workdir, &change.content).await;
+                cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
@@ -2023,7 +2071,7 @@ impl ChangePipeline {
                 change_id = %change.artifact_id,
                 "Change writes only defaults every shipped document overrides"
             );
-            let _ = self.git_reset_hard(workdir, &change.content).await;
+            cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
             return Ok(ApplyResult {
                 change_id: change.artifact_id.clone(),
                 files_changed,
@@ -2046,7 +2094,7 @@ impl ChangePipeline {
                     change_id = %change.artifact_id,
                     "Change is not what this deployment's formatter produces; rolling back"
                 );
-                let _ = self.git_reset_hard(workdir, &change.content).await;
+                cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
@@ -2060,7 +2108,7 @@ impl ChangePipeline {
             }
             Err(e) => {
                 warn!(change_id = %change.artifact_id, error = %e, "the format check did not run");
-                let _ = self.git_reset_hard(workdir, &change.content).await;
+                cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
@@ -2140,7 +2188,7 @@ impl ChangePipeline {
             Ok(LintVerdict::Clean(note)) => note,
             Ok(LintVerdict::NotDeclared) => NO_LINTER_NOTE.to_string(),
             Ok(LintVerdict::Unattributable(evidence)) => {
-                let _ = self.git_reset_hard(workdir, &change.content).await;
+                cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
@@ -2161,7 +2209,7 @@ impl ChangePipeline {
                     change_id = %change.artifact_id,
                     "The built-in linter reached no verdict; this change is not judged yet"
                 );
-                let _ = self.git_reset_hard(workdir, &change.content).await;
+                cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                 return Err(SFError::IO(evidence));
             }
             Ok(LintVerdict::Attributable { line, output }) => {
@@ -2187,7 +2235,9 @@ impl ChangePipeline {
                                 error = %e,
                                 "Could not read the lines this change wrote; reaching no verdict"
                             );
-                            let _ = self.git_reset_hard(workdir, &change.content).await;
+                            cog_core::ignore_lost!(
+                                self.git_reset_hard(workdir, &change.content).await
+                            );
                             return Err(e);
                         }
                     };
@@ -2211,7 +2261,7 @@ impl ChangePipeline {
                         })
                         .collect::<Vec<_>>()
                         .join("\n  ");
-                    let _ = self.git_reset_hard(workdir, &change.content).await;
+                    cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                     return Ok(ApplyResult {
                         change_id: change.artifact_id.clone(),
                         files_changed,
@@ -2273,7 +2323,9 @@ impl ChangePipeline {
                                 count = introduced.len(),
                                 "Change leaves findings this tree did not have"
                             );
-                            let _ = self.git_reset_hard(workdir, &change.content).await;
+                            cog_core::ignore_lost!(
+                                self.git_reset_hard(workdir, &change.content).await
+                            );
                             return Ok(ApplyResult {
                                 change_id: change.artifact_id.clone(),
                                 files_changed,
@@ -2311,7 +2363,9 @@ impl ChangePipeline {
                                 error = %e,
                                 "the linter's baseline got no build slot"
                             );
-                            let _ = self.git_reset_hard(workdir, &change.content).await;
+                            cog_core::ignore_lost!(
+                                self.git_reset_hard(workdir, &change.content).await
+                            );
                             return Err(e);
                         }
                         // A baseline this run could not read convicts nobody: the
@@ -2336,7 +2390,7 @@ impl ChangePipeline {
             }
             Err(e) if e.is_build_slot_refused() => {
                 warn!(change_id = %change.artifact_id, error = %e, "the linter got no build slot");
-                let _ = self.git_reset_hard(workdir, &change.content).await;
+                cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                 return Err(e);
             }
             Err(e) => {
@@ -2366,12 +2420,12 @@ impl ChangePipeline {
             // sound change for the load the machine happened to be under.
             Err(e) if e.is_build_slot_refused() => {
                 warn!(change_id = %change.artifact_id, error = %e, command = %self.test_command_line(), "the test command got no build slot");
-                let _ = self.git_reset_hard(workdir, &change.content).await;
+                cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                 return Err(e);
             }
             Err(e) => {
                 warn!(change_id = %change.artifact_id, error = %e, command = %self.test_command_line(), "the test command failed to execute");
-                let _ = self.git_reset_hard(workdir, &change.content).await;
+                cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
@@ -2456,7 +2510,7 @@ impl ChangePipeline {
                         error = %e,
                         "Could not read the tests this revision fails on its own; reaching no verdict"
                     );
-                    let _ = self.git_reset_hard(workdir, &change.content).await;
+                    cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                     return Err(e);
                 }
             }
@@ -2483,7 +2537,7 @@ impl ChangePipeline {
                     count = pre_existing_failures,
                     "The change leaves the red it claims to fix still red; rolling back"
                 );
-                let _ = self.git_reset_hard(workdir, &change.content).await;
+                cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
@@ -2507,7 +2561,7 @@ impl ChangePipeline {
                         command = %self.test_command_line(),
                         "The red this change claims to fix is green on this tree without it"
                     );
-                    let _ = self.git_reset_hard(workdir, &change.content).await;
+                    cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                     return Ok(ApplyResult {
                         change_id: change.artifact_id.clone(),
                         files_changed,
@@ -2546,7 +2600,7 @@ impl ChangePipeline {
                         error = %e,
                         "Could not read the red this tree shows without the change; reaching no verdict"
                     );
-                    let _ = self.git_reset_hard(workdir, &change.content).await;
+                    cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                     return Err(e);
                 }
             }
@@ -2637,7 +2691,7 @@ impl ChangePipeline {
                             error = %e,
                             "could not read the gates this revision fails on its own; reaching no verdict"
                         );
-                        let _ = self.git_reset_hard(workdir, &change.content).await;
+                        cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                         return Err(e);
                     }
                 }
@@ -2656,12 +2710,12 @@ impl ChangePipeline {
                 EvolutionStatus::Active
             } else {
                 info!(change_id = %change.artifact_id, "Change tests passed; rolling back for manual review");
-                let _ = self.git_reset_hard(workdir, &change.content).await;
+                cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                 EvolutionStatus::AwaitingReview
             }
         } else {
             warn!(change_id = %change.artifact_id, "Change tests failed; rolling back");
-            let _ = self.git_reset_hard(workdir, &change.content).await;
+            cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
             EvolutionStatus::ValidationFailed
         };
 
@@ -3058,7 +3112,7 @@ impl ChangePipeline {
                     .run_git_apply_args(workdir, change_content, &["--3way"])
                     .await;
                 if applied.is_err() {
-                    let _ = self.git_reset_hard(workdir, change_content).await;
+                    cog_core::ignore_lost!(self.git_reset_hard(workdir, change_content).await);
                 }
                 applied
             }
@@ -3119,7 +3173,7 @@ impl ChangePipeline {
             .three_way_probe_with_index(workdir, change_content, &index)
             .await
             .unwrap_or(false);
-        let _ = tokio::fs::remove_file(&index).await;
+        cog_core::ignore_lost!(tokio::fs::remove_file(&index).await);
         merged
     }
 
@@ -3368,11 +3422,11 @@ impl ChangePipeline {
         let head = self
             .git_try(workdir, &["rev-parse", "HEAD"])
             .await
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let upstream = self
             .git_try(workdir, &["rev-parse", "local/main"])
             .await
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         if head.is_empty() || upstream.is_empty() {
             return Ok(());
         }
@@ -3445,6 +3499,12 @@ impl ChangePipeline {
         for (key, value) in verification_env(|k| std::env::var(k).ok(), self.target_dir.as_deref())
         {
             cmd.env(key, value);
+        }
+        // 编译宽度按构建闸这一拍的测量覆盖部署声明：闸已经把「宿主核数 ÷ 一个
+        // 构建要多少核」算成每道构建的份额，验证与主线构建读同一份。没有闸时上面
+        // 那趟透传的环境值就是种子，不在这里再写一个默认。
+        if let Some(jobs) = crate::build_gate::cargo_jobs() {
+            cmd.env("CARGO_BUILD_JOBS", jobs.to_string());
         }
         // 刷新那一趟定下的工具链要真的被用上：只装不指等于没刷，而「用的是哪一把
         // 编译器」正是这条判据与 CI 会不会各说一套的全部内容。写在这里而不是写进
@@ -3524,9 +3584,7 @@ impl ChangePipeline {
         };
 
         for command in &config.commands {
-            let (ok, output) = self
-                .run_verification_command(workdir, command, WEB_ADMISSION_TIMEOUT_SECS)
-                .await?;
+            let (ok, output) = self.run_verification_command(workdir, command).await?;
             if !ok {
                 return Ok(Some(format!(
                     "WebUI 准入条件未通过：`{}` 退出非零。{}",
@@ -3639,11 +3697,11 @@ impl ChangePipeline {
             if self.auto_apply {
                 (EvolutionStatus::Active, ChangeVerdict::Passed)
             } else {
-                let _ = self.git_reset_hard(workdir, &change.content).await;
+                cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
                 (EvolutionStatus::AwaitingReview, ChangeVerdict::Passed)
             }
         } else {
-            let _ = self.git_reset_hard(workdir, &change.content).await;
+            cog_core::ignore_lost!(self.git_reset_hard(workdir, &change.content).await);
             (
                 EvolutionStatus::ValidationFailed,
                 ChangeVerdict::Refused(cog_core::RejectionCause::TestsFailed),
@@ -3690,9 +3748,7 @@ impl ChangePipeline {
         };
 
         for command in &config.commands {
-            let (ok, output) = self
-                .run_verification_command(workdir, command, DEPLOY_ADMISSION_TIMEOUT_SECS)
-                .await?;
+            let (ok, output) = self.run_verification_command(workdir, command).await?;
             if !ok {
                 return Ok(Some(format!(
                     "部署准入条件未通过：`{}` 退出非零。{}",
@@ -3706,9 +3762,7 @@ impl ChangePipeline {
             for path in touched.iter().filter(|p| p.starts_with("deploy/rendered/")) {
                 let mut argv = prefix.clone();
                 argv.push(path.clone());
-                let (ok, output) = self
-                    .run_verification_command(workdir, &argv, DEPLOY_ADMISSION_TIMEOUT_SECS)
-                    .await?;
+                let (ok, output) = self.run_verification_command(workdir, &argv).await?;
                 if !ok {
                     return Ok(Some(format!(
                         "服务端 dry-run 拒绝了 {path}：{}",
@@ -3806,7 +3860,7 @@ impl ChangePipeline {
         let after = self
             .git_capture(workdir, &["diff", "HEAD"])
             .await
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let added_after = untracked_of_change(
             &self
                 .git_capture(workdir, &["ls-files", "--others", "--exclude-standard"])
@@ -3831,11 +3885,14 @@ impl ChangePipeline {
     /// "what may it run under" keep one answer each rather than one per call
     /// site: a second site that rebuilt these lines by hand would be free to
     /// drop the environment the verdict is only valid in.
+    ///
+    /// 判据是这条命令还在不在动，不是它跑了多久：每一段输出是拍，CPU 时间在涨也
+    /// 是拍。一段静默超过这个部署见过的最长一步就被判停、被杀（`cog_core::progress`），
+    /// 否则一直等下去——判一份整棵 workspace 的活本来就可能比任何写下来的数更长。
     async fn run_verification_command(
         &self,
         workdir: &Path,
         argv: &[String],
-        timeout_secs: u64,
     ) -> SFResult<(bool, String)> {
         let Some(program) = argv.first() else {
             return Err(SFError::Config(
@@ -3847,15 +3904,12 @@ impl ChangePipeline {
         cmd.args(&argv[1..]).current_dir(workdir).kill_on_drop(true);
         self.apply_verification_env(&mut cmd);
 
-        let output = match tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output())
+        let id = format!("verification:{}", line);
+        let output = match cog_core::progress::run_child_watched(cmd, &id)
             .await
+            .map_err(|e| SFError::IO(format!("Failed to run {line}: {e}")))?
         {
-            Ok(result) => result.map_err(|e| SFError::IO(format!("Failed to run {line}: {e}")))?,
-            Err(_) => {
-                return Err(SFError::IO(format!(
-                    "{line} exceeded the {timeout_secs}s verification budget and was killed"
-                )))
-            }
+            cog_core::progress::ChildOutcome::Exited(output) => output,
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3867,8 +3921,7 @@ impl ChangePipeline {
     /// The argv is the whole command line, program included.
     async fn run_cargo_fmt_cmd(&self, workdir: &Path, argv: &[&str]) -> SFResult<(bool, String)> {
         let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
-        self.run_verification_command(workdir, &argv, self.fmt_timeout_secs)
-            .await
+        self.run_verification_command(workdir, &argv).await
     }
 
     /// 把判据这一侧的工具链对到 stable 的最新发布，失败不拦下这笔改动。
@@ -3970,11 +4023,21 @@ impl ChangePipeline {
         .iter()
         .map(|arg| (*arg).to_string())
         .collect();
-        match self
-            .run_verification_command(workdir, &argv, TOOLCHAIN_PROVISION_TIMEOUT_SECS)
-            .await
-        {
+        match self.run_verification_command(workdir, &argv).await {
             Ok((true, output)) => {
+                // 退出码 0 不是「这一份能用」：装到一半被打断的那一趟也可能留下一个
+                // 组件齐全、却起不来的目录。装完再问一次与「已经装好」同一个判据，
+                // 答不上来就退回镜像那一把，并在证据里写明。
+                if provisioned_toolchain(release.as_str()).is_none() {
+                    warn!(
+                        release = %release,
+                        output = output.trim(),
+                        "The installed toolchain does not start; judging with the toolchain this image carries"
+                    );
+                    return Some(format!(
+                        "判这一版用的不是 CI 那一把编译器：装好的 {release} 起不来（rustfmt --version 没有跑成）"
+                    ));
+                }
                 info!(
                     release = %release,
                     output = output.trim(),
@@ -4113,10 +4176,7 @@ impl ChangePipeline {
             Some(argv) => {
                 let line = argv.join(" ");
                 info!(command = %line, "Running the formatter this deployment declares");
-                match self
-                    .run_verification_command(workdir, argv, self.fmt_timeout_secs)
-                    .await
-                {
+                match self.run_verification_command(workdir, argv).await {
                     Ok((true, _)) => Ok(FormatVerdict::Conformed {
                         rewritten: false,
                         note: format!(
@@ -4190,10 +4250,12 @@ impl ChangePipeline {
         .current_dir(workdir)
         .kill_on_drop(true);
         self.apply_verification_env(&mut cmd);
-        let output = tokio::time::timeout(Duration::from_secs(METADATA_TIMEOUT_SECS), cmd.output())
+        let output = match cog_core::progress::run_child_watched(cmd, "verification:cargo-metadata")
             .await
             .ok()?
-            .ok()?;
+        {
+            cog_core::progress::ChildOutcome::Exited(output) => output,
+        };
         if !output.status.success() {
             return None;
         }
@@ -4263,29 +4325,19 @@ impl ChangePipeline {
         self.apply_verification_env(&mut cmd);
 
         let started = Instant::now();
-        let budget_secs = self.test_budget_secs();
-        let output =
-            match tokio::time::timeout(Duration::from_secs(budget_secs), cmd.output()).await {
-                Ok(result) => {
-                    let output =
-                        result.map_err(|e| SFError::IO(format!("Failed to run {line}: {e}")))?;
-                    if let Some(budget) = &self.budget {
-                        budget.record_run(
-                            crate::verification_budget::KIND_TEST,
-                            started.elapsed().as_secs(),
-                        );
-                    }
-                    output
-                }
-                Err(_) => {
-                    if let Some(budget) = &self.budget {
-                        budget.record_timeout(crate::verification_budget::KIND_TEST);
-                    }
-                    return Err(SFError::IO(format!(
-                        "{line} exceeded the {budget_secs}s verification budget and was killed"
-                    )));
-                }
-            };
+        let id = format!("verification:{line}");
+        let output = match cog_core::progress::run_child_watched(cmd, &id)
+            .await
+            .map_err(|e| SFError::IO(format!("Failed to run {line}: {e}")))?
+        {
+            cog_core::progress::ChildOutcome::Exited(output) => output,
+        };
+        if let Some(budget) = &self.budget {
+            budget.record_run(
+                crate::verification_budget::KIND_TEST,
+                started.elapsed().as_secs(),
+            );
+        }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -4349,8 +4401,7 @@ impl ChangePipeline {
             argv = scoped_argv(&argv, packages);
         }
         info!(command = %argv.join(" "), "Running the built-in linter");
-        self.run_verification_command(workdir, &argv, self.test_budget_secs())
-            .await
+        self.run_verification_command(workdir, &argv).await
     }
 
     /// What this deployment's linter reads for this tree, as the sentence the
@@ -4397,14 +4448,41 @@ impl ChangePipeline {
             Some(argv) => Some(argv),
             None => None,
         };
+        // 取槽之前先问：这一笔属不属于当前那一轮钉住的那一批。
+        //
+        // 平台的循环已经按那一批下发（`pinned_batch`），但「下发过」与「这一笔真在批里」
+        // 之间还有一段路：重放、手动提交、上一轮遗留的任务都会走到这里。构建槽是这条
+        // 流水线上最贵的一步，让一个不在批里的变更先付掉它，这一轮就多编译了一次。
+        //
+        // 读不到批次就不判：那是「这台机器答不了」，不是「这一笔不在批里」。
+        if let Some(rounds) = self.rounds.as_ref() {
+            match rounds.current().await {
+                Ok(Some(open)) if !open.batch.is_empty() => {
+                    if !open
+                        .batch
+                        .iter()
+                        .any(|prefix| change_id.starts_with(prefix))
+                    {
+                        return Err(SFError::Config(format!(
+                            "这一笔（{change_id}）不在当前那一轮（{}）钉住的 {} 条里：\
+                             批次外的变更不在这条流水线上取构建槽",
+                            open.round,
+                            open.batch.len()
+                        )));
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "读不到当前那一轮，这一笔按「没有批次」放行");
+                }
+            }
+        }
         let _slot = crate::build_gate::acquire("change lint verification").await?;
         let (line, passed, output) = match declared {
             Some(argv) => {
                 let line = argv.join(" ");
                 info!(command = %line, "Running the linter this deployment declares");
-                let (passed, output) = self
-                    .run_verification_command(workdir, argv, self.test_budget_secs())
-                    .await?;
+                let (passed, output) = self.run_verification_command(workdir, argv).await?;
                 (line, passed, output)
             }
             None => {
@@ -4506,24 +4584,20 @@ impl ChangePipeline {
     /// The refusal this change earns for writing only defaults nothing reads,
     /// `None` when it has an effect somewhere.
     ///
-    /// Two documents stand for the deployment's configuration here:
-    /// `cogneva.example.json` and the chart's own `cogneva.json`. Those are the
-    /// pair the configuration surface is already judged on, and `deploy/k3s` /
-    /// `deploy/rendered` are held to the chart by the parity gate rather than
-    /// carrying keys of their own. A document that cannot be read or parsed, or
-    /// a written file that cannot be read back, answers `None`: the criterion
-    /// is "every document writes the key", and an unread document has not been
-    /// shown to. Reading no documents is not the same finding as reading them
-    /// and not finding the key, and only the second one refuses a change.
+    /// The chart's `cogneva.json` stands for the deployment's configuration
+    /// here: `deploy/k3s` and `deploy/rendered` are held to it by the parity and
+    /// freshness gates rather than carrying keys of their own. A document that
+    /// cannot be read or parsed, or a written file that cannot be read back,
+    /// answers `None`: the criterion is "every document writes the key", and an
+    /// unread document has not been shown to. Reading no documents is not the
+    /// same finding as reading them and not finding the key, and only the
+    /// second one refuses a change.
     async fn unreachable_default_reason(
         &self,
         workdir: &Path,
         change_content: &str,
     ) -> Option<String> {
-        const DOCUMENTS: &[&str] = &[
-            "cogneva.example.json",
-            "deploy/helm/cogneva/files/cogneva.json",
-        ];
+        const DOCUMENTS: &[&str] = &["deploy/helm/cogneva/files/cogneva.json"];
         let mut documents = Vec::with_capacity(DOCUMENTS.len());
         for path in DOCUMENTS {
             let text = tokio::fs::read_to_string(workdir.join(path)).await.ok()?;
@@ -4541,7 +4615,7 @@ impl ChangePipeline {
         }
 
         let unreachable =
-            cog_core::contract::reflection::unreachable_defaults(&written, &sources, &documents);
+            crate::config_reachability::unreachable_defaults(&written, &sources, &documents);
         if unreachable.is_empty() {
             return None;
         }
@@ -4613,7 +4687,9 @@ impl ChangePipeline {
             not_asked: Vec::new(),
             interrupted: false,
         };
-        let deadline = Instant::now() + Duration::from_secs(REPO_GATE_STAGE_WALL_SECS);
+        // 门禁那一段没有按秒的界：每一条各自按「还在不在动」判（`cog_core::progress`），
+        // 一段静默超过这个部署见过的最长一步才算停住。原先那个共享的 deadline 是
+        // 整段的墙：它到点之后剩下的门一条都不问，而「没问过」在读数上与被判红连着。
         for gate in commands {
             let line = gate.line();
             if let Some(only) = only {
@@ -4625,11 +4701,6 @@ impl ChangePipeline {
                 run.not_asked
                     .push((line, "the workflow passes it an argument".into()));
                 continue;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                run.interrupted = true;
-                break;
             }
             let mut cmd = tokio::process::Command::new(&gate.argv[0]);
             cmd.args(&gate.argv[1..])
@@ -4647,20 +4718,21 @@ impl ChangePipeline {
             if let Some(dir) = target_dir {
                 cmd.env("CARGO_TARGET_DIR", dir);
             }
-            let output = match tokio::time::timeout(remaining, cmd.output()).await {
-                Ok(Ok(output)) => output,
+            let output = match cog_core::progress::run_child_watched(
+                cmd,
+                &format!("verification:repo-gate:{line}"),
+            )
+            .await
+            {
+                Ok(cog_core::progress::ChildOutcome::Exited(output)) => output,
                 // 启动不起来与门自己说「跑不了」是同一件事：这一条没被问过。差别只在
                 // 谁说的——门用退出码 2 说，操作系统用 errno 说。让一条启动不起来的
                 // 命令把整段门禁带走，这条变更就连别的门的结果都拿不到，而读数上看起来
                 // 是「这一段没跑完」，不是「这一条有问题」。
-                Ok(Err(e)) => {
+                Err(e) => {
                     run.not_asked
                         .push((line, format!("could not be launched: {e}")));
                     continue;
-                }
-                Err(_) => {
-                    run.interrupted = true;
-                    break;
                 }
             };
             run.asked.push(line.clone());
@@ -4777,7 +4849,9 @@ impl ChangePipeline {
         packages: Option<&[String]>,
     ) -> SFResult<BTreeSet<String>> {
         let rev = self.workspace_rev(workdir).await?;
-        let scope: Vec<String> = packages.map(|list| list.to_vec()).unwrap_or_default();
+        let scope: Vec<String> = packages
+            .map(|list| list.to_vec())
+            .unwrap_or(Default::default());
         if let Some((cached_rev, cached_scope, tests)) =
             self.baseline_failures.lock().await.as_ref()
         {
@@ -4850,11 +4924,7 @@ impl ChangePipeline {
         let _slot = crate::build_gate::acquire("change lint verification").await?;
         self.git_reset_hard(workdir, change_content).await?;
         let baseline = match self.lint_command.as_deref() {
-            Some(argv) if !argv.is_empty() => {
-                self.run_verification_command(workdir, argv, self.test_budget_secs())
-                    .await?
-                    .1
-            }
+            Some(argv) if !argv.is_empty() => self.run_verification_command(workdir, argv).await?.1,
             _ => self.run_cargo_clippy(workdir, packages).await?.1,
         };
         self.git_apply(workdir, change_content).await.map_err(|e| {
@@ -5040,6 +5110,35 @@ fn names_same_or_nested(target: &str, anchor: &str) -> bool {
 }
 
 #[cfg(test)]
+mod unit_of_work_tests {
+    use super::*;
+
+    /// 从候选读回来的那一版仍然属于同一个目标。
+    ///
+    /// 没有这次改动这条会红：`result_from_candidate` 把 `unit_of_work` 写成
+    /// `None`，重放/重投一次之后「谁要的」就丢了，链条在中间断掉。
+    #[test]
+    fn a_candidate_carries_its_unit_back_into_the_result() {
+        let candidate = ChangeCandidate {
+            artifact_id: "change-1".into(),
+            kind: "code_change".into(),
+            description: "d".into(),
+            content: "x".into(),
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+            tiering: None,
+            unit_of_work: Some("goal-9".into()),
+            recorded_status: "compile_checked".into(),
+            status: "candidate".into(),
+            decision_reason: None,
+            event_id: String::new(),
+        };
+        let result = result_from_candidate(&candidate);
+        assert_eq!(result.unit_of_work.as_deref(), Some("goal-9"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::rust_production::production_text;
@@ -5050,8 +5149,8 @@ mod tests {
     /// are different lines and can be moved independently.
     const TEN_LINES: &str = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
 
-    /// [`one_change_wall_secs`] 加的是哪几段活、`FMT_SEGMENT_WALL_SECS` 那个数
-    /// 乘的是哪几趟命令，都是数着源码里的调用点写下来的。加一条 gated 命令、
+    /// [`one_change_wall_secs`] 加的是哪几段活、谁乘的是哪几趟命令，都是数着
+    /// 源码里的调用点写下来的。加一条 gated 命令、
     /// 或让 `run_cargo_fmt` 多跑一趟，界就少算一段——而界少了的症状是停摆告警
     /// 在健康的轮上响，所以调用点数必须钉住。这里数的都是**生产**调用点：测试
     /// 模块里那几处调用带着 `root.path()` 这种实参，与下面这些模式不匹配。
@@ -5070,7 +5169,7 @@ mod tests {
             + deployer.matches("build_gate::acquire(").count();
         assert_eq!(acquire_sites, 4, "gated 命令的函数个数变了");
 
-        // 吃测试预算的：clippy 判一趟、读基线一趟，套件与读基线失败集合各一次。
+        // 测试那一类的：clippy 判一趟、读基线一趟，套件与读基线失败集合各一次。
         let test_runs = pipeline.matches("self.run_test_command(").count();
         assert_eq!(
             pipeline.matches("self.run_cargo_clippy(").count(),
@@ -5079,14 +5178,14 @@ mod tests {
         );
         assert_eq!(
             test_runs as u64 + 2,
-            TEST_BUDGET_RUNS_PER_CHANGE,
-            "吃测试预算的命令 = clippy 两条 + run_test_command 那几条"
+            TEST_RUNS_PER_CHANGE,
+            "测试那一类的命令 = clippy 两条 + run_test_command 那几条"
         );
 
         // 排队次数 = acquire 点 + run_test_command 多走的那一次。
         assert_eq!(
             acquire_sites as u64 + (test_runs as u64 - 1),
-            TEST_BUDGET_RUNS_PER_CHANGE + BUILD_BUDGET_RUNS_PER_CHANGE,
+            TEST_RUNS_PER_CHANGE + BUILD_RUNS_PER_CHANGE,
             "构建槽排队次数与它该覆盖的命令条数对不上了"
         );
 
@@ -5103,21 +5202,23 @@ mod tests {
             "格式化命令的调用点数变了：run_cargo_fmt 里那几处加外面那两趟"
         );
 
-        // 门禁那一段：判定一趟、红了之后读基线一趟，各占一份自己的墙钟界。
-        // 它不排构建槽，所以上面那三个数与它无关——但界里必须算上它，否则一段
-        // 合法的、慢慢跑完的门禁就会在界外，而界外的一段活在告警眼里就是停摆。
-        //
-        // 加数与用法：界是"每条命令一份等待 + 一份预算"，没有别的东西混进来。
-        let gate_segment = REPO_GATE_RUNS_PER_CHANGE * REPO_GATE_STAGE_WALL_SECS;
+        // 每一条命令各占一个实测窗口；闸门那一段只加排队等待。段里几条命令，
+        // 就要乘几个窗口——少乘一段的症状是停摆告警在健康的轮上响。
+        let commands = TEST_RUNS_PER_CHANGE
+            + BUILD_RUNS_PER_CHANGE
+            + REPO_GATE_RUNS_PER_CHANGE
+            + FMT_COMMANDS_PER_CHANGE
+            + WEB_ADMISSION_RUNS_PER_CHANGE
+            + TOOLCHAIN_RUNS_PER_CHANGE;
         assert_eq!(
-            one_change_wall_secs(0, 0, 0),
-            FMT_SEGMENT_WALL_SECS + gate_segment + WEB_ADMISSION_TIMEOUT_SECS,
-            "闸门与预算都是 0 时剩下的是门禁、格式化与 WebUI 准入那三段"
+            one_change_wall_secs(0),
+            commands * progress_window_secs(),
+            "闸门不排队时，界就是每条命令一个窗口"
         );
         assert_eq!(
-            one_change_wall_secs(1, 10, 100),
-            5 + 40 + 100 + gate_segment + FMT_SEGMENT_WALL_SECS + WEB_ADMISSION_TIMEOUT_SECS,
-            "每条 gated 命令一份等待，测试预算四条、构建预算一条，再加门禁、格式化与 WebUI 准入"
+            one_change_wall_secs(1),
+            (TEST_RUNS_PER_CHANGE + BUILD_RUNS_PER_CHANGE) + commands * progress_window_secs(),
+            "每条 gated 命令一份排队等待，再加每条命令一个窗口"
         );
     }
 
@@ -5227,47 +5328,42 @@ mod tests {
             .map(|m| m.value)
     }
 
-    /// A verification run that does not fit its budget is killed, and the error
-    /// names the budget that killed it.
+    /// A verification run that outlives its budget is waited on, not killed, and
+    /// the reading afterwards is a duration rather than a stop.
     ///
-    /// What this replaces was not a wrong verdict but an absent one: the knob
-    /// was stored on the pipeline and never read, so a stuck
-    /// `cargo test --workspace` held the executor's only in-flight slot
-    /// indefinitely and every change behind it queued forever. The reason
-    /// matters as much as the kill — a retired change is read afterwards by
-    /// whoever investigates it, and only "exceeded the Ns budget" says the
-    /// change was never judged.
+    /// 这条替换掉的是「到点就杀」：预算曾经是这把刀，而它砍掉的是一次**还在跑**的
+    /// `cargo test`——宿主已经为它付过整段编译，砍掉只让下一轮再付一次。预算现在只是
+    /// 一份期望：过了它说一句、继续等；一条**不再动**的命令由实测窗口判停
+    /// （`run_child_watched` 那条律），与这里申报的数无关。
     ///
-    /// The sleep is what makes this deterministic. The run is slow for a reason
-    /// the test controls, so the budget is exceeded whether the kill lands
-    /// during the compile or during the test.
+    /// 睡三秒而不是三十秒：这条用例量的是「过没过墙」，不是「等了多久」，而判据在
+    /// 过墙之后一点都没变——同样的判定，用最短的那次跑出来就够了。
     #[tokio::test]
-    async fn a_run_that_outlives_its_budget_is_killed_with_the_budget_named() {
+    async fn a_run_that_outlives_its_budget_is_waited_on_not_killed() {
         let root = tempfile::tempdir().unwrap();
-        write_sleeping_crate(root.path(), 30);
-        let budget = Arc::new(crate::verification_budget::VerificationBudget::new(1, 60));
-        let pipeline = ChangePipeline::new(root.path(), root.path(), false)
+        write_sleeping_crate(root.path(), 3);
+        let budget = Arc::new(crate::verification_budget::VerificationBudget::new());
+        let pipeline = crate::change_pipeline::test_pipeline(root.path(), root.path(), false)
             .with_verification_budget(budget.clone());
 
-        let err = pipeline
+        let (ok, output) = pipeline
             .run_test_command(root.path(), None)
             .await
-            .expect_err("a run that cannot finish in a second must not be waited on");
+            .expect("a run that outlives its declared budget is waited on");
 
+        assert!(ok, "the suite passed, so the reading is a pass: {output}");
+        assert_eq!(
+            test_kind_reading(&budget, crate::verification_budget::STOPPED_TOTAL_METRIC).await,
+            Some(0.0),
+            "nothing was stopped, and the counter is the place that says so"
+        );
+        let lasted =
+            test_kind_reading(&budget, crate::verification_budget::LAST_RUN_SECONDS_METRIC)
+                .await
+                .expect("a run that finished has a duration of its own to report");
         assert!(
-            err.to_string()
-                .contains("exceeded the 1s verification budget"),
-            "the rejection has to name the budget that caused it: {err}"
-        );
-        assert_eq!(
-            test_kind_reading(&budget, crate::verification_budget::TIMEOUTS_TOTAL_METRIC).await,
-            Some(1.0),
-            "a killed run has to be readable as a kill, not only as a log line"
-        );
-        assert_eq!(
-            test_kind_reading(&budget, crate::verification_budget::LAST_RUN_SECONDS_METRIC).await,
-            None,
-            "a run cut short at the budget has no duration of its own to report"
+            lasted >= 3.0,
+            "the duration has to cover the work that was waited on, got {lasted}s"
         );
     }
 
@@ -5283,10 +5379,7 @@ mod tests {
         let document = serde_json::json!({
             "metrics": { "sample_max_rows": 200000, "log_at_floor": false },
         });
-        let documents = [
-            workdir.join("cogneva.example.json"),
-            workdir.join("deploy/helm/cogneva/files/cogneva.json"),
-        ];
+        let documents = [workdir.join("deploy/helm/cogneva/files/cogneva.json")];
         for path in &documents {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, serde_json::to_string_pretty(&document).unwrap()).unwrap();
@@ -5326,7 +5419,7 @@ impl Default for MetricsConfig {
                 .expect("git");
             assert!(out.status.success(), "git {args:?} failed");
         }
-        let pipeline = ChangePipeline::new(workdir, workdir, false);
+        let pipeline = crate::change_pipeline::test_pipeline(workdir, workdir, false);
 
         // 落地闸要拒的那一笔：只把那个被文档钉死的默认值抬上去。
         std::fs::write(&config, source.replace("200_000", "500_000")).unwrap();
@@ -5339,7 +5432,7 @@ impl Default for MetricsConfig {
             "拒因要点名读不到的键：{reason}"
         );
         assert!(
-            reason.contains("cogneva.example.json"),
+            reason.contains("deploy/helm/cogneva/files/cogneva.json"),
             "拒因要点名它据以判定的文档：{reason}"
         );
 
@@ -5363,23 +5456,35 @@ impl Default for MetricsConfig {
     /// to binding before anything has been retired for it.
     #[tokio::test]
     async fn a_run_that_fits_its_budget_reports_its_duration() {
+        // 这一趟量的是预算读数，不是判停：睡一秒的 crate 在构建那一秒里既不输出
+        // 也不涨 CPU，若界取的是这个测试进程里别人量到的极值（可能是几百毫秒），
+        // 它会被判成停住，而判据本身完全没错。所以界在这里种宽，让这一秒的沉默
+        // 落在界内，测到的就只剩预算这一件事。
+        let _serial = cog_core::progress::async_test_lock().await;
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::seed_gaps_for_tests(
+            std::time::Duration::from_secs(60),
+            cog_core::progress::SAMPLE_FLOOR,
+        );
+
         let root = tempfile::tempdir().unwrap();
         write_sleeping_crate(root.path(), 1);
-        let budget = Arc::new(crate::verification_budget::VerificationBudget::new(120, 60));
-        let pipeline = ChangePipeline::new(root.path(), root.path(), false)
+        let budget = Arc::new(crate::verification_budget::VerificationBudget::new());
+        let pipeline = crate::change_pipeline::test_pipeline(root.path(), root.path(), false)
             .with_verification_budget(budget.clone());
 
-        let (passed, output) = pipeline
-            .run_test_command(root.path(), None)
-            .await
-            .expect("a run inside its budget must be waited on");
+        // 先收下结果再清种子：`.expect` 直接写在 await 上，红的时候种子留在这个
+        // 进程里，后面每个用例都拿着一条 60 秒的界。
+        let result = pipeline.run_test_command(root.path(), None).await;
+        cog_core::progress::reset_for_tests();
+        let (passed, output) = result.expect("a run inside its budget must be waited on");
 
         assert!(
             passed,
             "the sleeping crate passes once it finishes: {output}"
         );
         assert_eq!(
-            test_kind_reading(&budget, crate::verification_budget::TIMEOUTS_TOTAL_METRIC).await,
+            test_kind_reading(&budget, crate::verification_budget::STOPPED_TOTAL_METRIC).await,
             Some(0.0)
         );
         let elapsed =
@@ -5396,7 +5501,7 @@ impl Default for MetricsConfig {
     async fn the_configured_test_command_decides_the_verdict() {
         let root = tempfile::tempdir().unwrap();
 
-        let failing = ChangePipeline::new(root.path(), root.path(), false)
+        let failing = crate::change_pipeline::test_pipeline(root.path(), root.path(), false)
             .with_test_command(vec!["false".into()]);
         let (passed, _) = failing
             .run_test_command(root.path(), None)
@@ -5404,7 +5509,7 @@ impl Default for MetricsConfig {
             .expect("`false` runs");
         assert!(!passed, "the configured command decides the verdict");
 
-        let passing = ChangePipeline::new(root.path(), root.path(), false)
+        let passing = crate::change_pipeline::test_pipeline(root.path(), root.path(), false)
             .with_test_command(vec!["true".into()]);
         let (passed, _) = passing
             .run_test_command(root.path(), None)
@@ -5420,7 +5525,7 @@ impl Default for MetricsConfig {
     #[tokio::test]
     async fn a_test_command_that_cannot_start_names_itself() {
         let root = tempfile::tempdir().unwrap();
-        let pipeline = ChangePipeline::new(root.path(), root.path(), false)
+        let pipeline = crate::change_pipeline::test_pipeline(root.path(), root.path(), false)
             .with_test_command(vec!["cogneva-no-such-test-command".into()]);
 
         let err = pipeline
@@ -5439,8 +5544,8 @@ impl Default for MetricsConfig {
     #[tokio::test]
     async fn an_empty_test_command_is_refused_rather_than_read_as_a_pass() {
         let root = tempfile::tempdir().unwrap();
-        let pipeline =
-            ChangePipeline::new(root.path(), root.path(), false).with_test_command(Vec::new());
+        let pipeline = crate::change_pipeline::test_pipeline(root.path(), root.path(), false)
+            .with_test_command(Vec::new());
 
         let err = pipeline
             .run_test_command(root.path(), None)
@@ -5458,7 +5563,8 @@ impl Default for MetricsConfig {
     async fn a_declared_formatter_is_asked_and_never_rewrites() {
         let root = tempfile::tempdir().unwrap();
         let declaring = |argv: Vec<String>| {
-            ChangePipeline::new(root.path(), root.path(), false).with_fmt_check_command(Some(argv))
+            crate::change_pipeline::test_pipeline(root.path(), root.path(), false)
+                .with_fmt_check_command(Some(argv))
         };
 
         match declaring(vec!["true".into()])
@@ -5508,7 +5614,8 @@ impl Default for MetricsConfig {
     async fn a_declared_linter_decides_and_an_unreadable_refusal_is_not_clean() {
         let root = tempfile::tempdir().unwrap();
         let declaring = |argv: Vec<String>| {
-            ChangePipeline::new(root.path(), root.path(), false).with_lint_command(Some(argv))
+            crate::change_pipeline::test_pipeline(root.path(), root.path(), false)
+                .with_lint_command(Some(argv))
         };
 
         match declaring(vec!["true".into()])
@@ -5561,7 +5668,7 @@ impl Default for MetricsConfig {
         .await
         .unwrap();
 
-        let verdict = ChangePipeline::new(root.path(), root.path(), false)
+        let verdict = crate::change_pipeline::test_pipeline(root.path(), root.path(), false)
             .judge_lint(root.path(), "c", None)
             .await
             .unwrap();
@@ -5760,8 +5867,10 @@ impl Default for MetricsConfig {
     async fn the_apply_flow_refuses_a_change_that_misses_its_goal() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("README.md"), "# project\n").unwrap();
-        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false);
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "change-GOAL".into(),
             description: "补充 README.md 的 Windows 快速开始".into(),
@@ -5957,7 +6066,8 @@ index 1111111..2222222 100644
 +fn new() {}
 "#;
 
-        let pipeline = ChangePipeline::new(root.to_path_buf(), root.join("changes"), true);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(root.to_path_buf(), root.join("changes"), true);
         pipeline.git_apply_check(root, change).await.unwrap();
         pipeline.git_apply(root, change).await.unwrap();
 
@@ -6055,7 +6165,8 @@ index 1111111..2222222 100644
             .await
             .unwrap();
 
-        let pipeline = ChangePipeline::new(root.to_path_buf(), root.join("changes"), true);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(root.to_path_buf(), root.join("changes"), true);
         assert_eq!(
             pipeline.git_apply_check(root, &diff).await.unwrap(),
             ApplyMode::ThreeWay,
@@ -6153,7 +6264,8 @@ index 1111111..2222222 100644
             .await
             .unwrap();
 
-        let pipeline = ChangePipeline::new(root.to_path_buf(), root.join("changes"), true);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(root.to_path_buf(), root.join("changes"), true);
         assert!(
             pipeline.git_apply_check(root, &diff).await.is_err(),
             "a patch that conflicts with the moved branch must be refused"
@@ -6215,7 +6327,8 @@ index 1111111..2222222 100644
                       +fn added() {}\n\
                       +fn also() {}\n";
 
-        let pipeline = ChangePipeline::new(root.to_path_buf(), root.join("changes"), true);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(root.to_path_buf(), root.join("changes"), true);
         pipeline.git_apply(root, change).await.unwrap();
         pipeline.git_reset_hard(root, change).await.unwrap();
         assert!(
@@ -6311,7 +6424,8 @@ index 1111111..2222222 100644
         let (upstream, work) = scaffold_upstream().await;
         advance_upstream(upstream.path(), "b.txt").await;
 
-        let pipeline = ChangePipeline::new(work.path(), work.path().join("changes"), true);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(work.path(), work.path().join("changes"), true);
         pipeline.sync_with_upstream().await.unwrap();
 
         assert!(work.path().join("b.txt").exists());
@@ -6339,7 +6453,8 @@ index 1111111..2222222 100644
         let before = head_of(work.path()).await;
         advance_upstream(upstream.path(), "b.txt").await;
 
-        let pipeline = ChangePipeline::new(work.path(), work.path().join("changes"), true);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(work.path(), work.path().join("changes"), true);
         pipeline.sync_with_upstream().await.unwrap();
 
         // 未发布 commit 在途：不同步，HEAD 不变（soak/熔断窗口保护）。
@@ -6359,7 +6474,8 @@ index 1111111..2222222 100644
         git_ok(work.path(), &["push", "local", "HEAD:evolution-release"]).await;
         advance_upstream(upstream.path(), "b.txt").await;
 
-        let pipeline = ChangePipeline::new(work.path(), work.path().join("changes"), true);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(work.path(), work.path().join("changes"), true);
         pipeline.sync_with_upstream().await.unwrap();
 
         // 已发布的本地 commit 安全丢弃，树对齐最新主线。
@@ -6370,10 +6486,12 @@ index 1111111..2222222 100644
     #[tokio::test]
     async fn apply_and_test_rejects_forbidden_files_at_gate() {
         let temp = tempfile::tempdir().unwrap();
-        let pipeline = ChangePipeline::new(temp.path(), temp.path().join("changes"), true)
-            .with_promotion_policy(crate::PromotionGateConfig::default());
+        let pipeline =
+            crate::change_pipeline::test_pipeline(temp.path(), temp.path().join("changes"), true)
+                .with_promotion_policy(crate::PromotionGateConfig::default());
 
         let change = crate::types::EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: "evil-1".into(),
             description: "touches Cargo.toml".into(),
@@ -6463,15 +6581,16 @@ index 1111111..2222222 100644
             "-c".to_string(),
             format!("touch {}", gate_marker.display()),
         ];
-        let budget =
-            std::sync::Arc::new(crate::verification_budget::VerificationBudget::new(60, 60));
-        let pipeline = ChangePipeline::new(root.to_path_buf(), root.join("changes"), true)
-            .with_fmt_check_command(Some(gate.clone()))
-            .with_lint_command(Some(gate.clone()))
-            .with_test_command(gate)
-            .with_verification_budget(budget.clone());
+        let budget = std::sync::Arc::new(crate::verification_budget::VerificationBudget::new());
+        let pipeline =
+            crate::change_pipeline::test_pipeline(root.to_path_buf(), root.join("changes"), true)
+                .with_fmt_check_command(Some(gate.clone()))
+                .with_lint_command(Some(gate.clone()))
+                .with_test_command(gate)
+                .with_verification_budget(budget.clone());
 
         let change = crate::types::EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: "collides-with-the-moved-base-1".into(),
             description: "align the base before asking for a slot".into(),
@@ -6516,7 +6635,7 @@ index 1111111..2222222 100644
                 .map(|m| m.value)
         };
         assert_eq!(
-            cell(crate::verification_budget::TIMEOUTS_TOTAL_METRIC),
+            cell(crate::verification_budget::STOPPED_TOTAL_METRIC),
             Some(0.0),
             "no run of this change was killed by the budget, because none was started"
         );
@@ -6526,8 +6645,8 @@ index 1111111..2222222 100644
             "the published series carries no elapsed run: no slot was ever asked for"
         );
         assert!(
-            elapsed < std::time::Duration::from_secs(REPO_GATE_STAGE_WALL_SECS),
-            "the refusal costs the alignment's seconds, not a gate stage's wall: {elapsed:?}"
+            elapsed < std::time::Duration::from_secs(60),
+            "the refusal costs the alignment's seconds, not a gate stage's worth of work: {elapsed:?}"
         );
     }
 
@@ -6553,7 +6672,7 @@ index 1111111..2222222 100644
 
         // project_root 指到一个无关目录，确保走的是传入的 workdir 而不是构造值。
         let decoy = tmp.path().join("decoy");
-        let pipeline = ChangePipeline::new(&decoy, decoy.join("changes"), true);
+        let pipeline = crate::change_pipeline::test_pipeline(&decoy, decoy.join("changes"), true);
         let diff = r#"diff --git a/a.txt b/a.txt
 index 1111111..2222222 100644
 --- a/a.txt
@@ -6587,7 +6706,8 @@ index 1111111..2222222 100644
         // 未配置晋级策略时入口校验不生效（旧行为零回归）：
         // Cargo.toml change 会走到 validate_change_files 的既有黑名单。
         let temp = tempfile::tempdir().unwrap();
-        let pipeline = ChangePipeline::new(temp.path(), temp.path().join("changes"), true);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(temp.path(), temp.path().join("changes"), true);
         assert!(pipeline.promotion_policy.is_none());
     }
 
@@ -6597,8 +6717,10 @@ index 1111111..2222222 100644
     #[tokio::test]
     async fn an_unparsable_change_is_a_verdict_not_an_error() {
         let temp = tempfile::tempdir().unwrap();
-        let pipeline = ChangePipeline::new(temp.path(), temp.path().join("changes"), true);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(temp.path(), temp.path().join("changes"), true);
         let change = crate::types::EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: "garbage-1".into(),
             description: "not a diff at all".into(),
@@ -6631,8 +6753,10 @@ index 1111111..2222222 100644
     #[tokio::test]
     async fn a_change_that_leaves_the_tree_is_refused_for_its_path() {
         let root = tempfile::tempdir().unwrap();
-        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), true);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), true);
         let change = crate::types::EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: "escaping-1".into(),
             description: "补一个模块".into(),
@@ -6670,8 +6794,10 @@ index 1111111..2222222 100644
         git_ok(root.path(), &["add", "."]).await;
         git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
 
-        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false);
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "stale-1".into(),
             description: "调整这一行的取值".into(),
@@ -6716,8 +6842,10 @@ index 1111111..2222222 100644
         git_ok(root.path(), &["add", "."]).await;
         git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
 
-        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false);
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "corrupt-1".into(),
             description: "调整这一行的取值".into(),
@@ -6776,8 +6904,10 @@ index 1111111..2222222 100644
         git_ok(root.path(), &["add", "."]).await;
         git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
 
-        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false);
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "breaking-1".into(),
             description: "修正这个取值的计算".into(),
@@ -6854,8 +6984,10 @@ index 1111111..2222222 100644
         git_ok(root.path(), &["add", "."]).await;
         git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
 
-        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false);
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "banana-1".into(),
             description: "加一个取水果名的函数".into(),
@@ -6935,8 +7067,10 @@ index 1111111..2222222 100644
         git_ok(root.path(), &["add", "."]).await;
         git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
 
-        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false);
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "unrelated-1".into(),
             description: "加一行注释".into(),
@@ -7021,11 +7155,13 @@ index 1111111..2222222 100644
         git_ok(root.path(), &["add", "."]).await;
         git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
 
-        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false);
         // `&Vec<u8>` is `clippy::ptr_arg` and an uncalled private function is
         // `dead_code` — two lints from two sources on one written line, so the
         // refusal has to list what it found rather than the first thing.
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "linting-1".into(),
             description: "给取值模块补一个辅助函数".into(),
@@ -7121,9 +7257,11 @@ index 1111111..2222222 100644
         // `false` refuses every tree, and its refusal is plain text rather than
         // the interchange, so nothing here can show its findings are the tree's
         // rather than this change's.
-        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false)
-            .with_lint_command(Some(vec!["false".into()]));
+        let pipeline =
+            crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false)
+                .with_lint_command(Some(vec!["false".into()]));
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "opaque-lint-1".into(),
             description: "给取值模块补一个辅助函数".into(),
@@ -7198,8 +7336,10 @@ index 1111111..2222222 100644
         git_ok(root.path(), &["add", "."]).await;
         git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
 
-        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false);
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "clean-1".into(),
             description: "给取值模块补一个辅助函数".into(),
@@ -7274,8 +7414,10 @@ index 1111111..2222222 100644
         git_ok(root.path(), &["add", "."]).await;
         git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
 
-        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false);
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "orphan-1".into(),
             description: "把取值函数的间接层去掉".into(),
@@ -7339,13 +7481,14 @@ index 1111111..2222222 100644
         git_ok(root.path(), &["add", "."]).await;
         git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
 
-        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false)
-            // No formatter and no linter: this probe is about the reproduction
-            // gate, and a stage that asked cargo about a tree with no manifest
-            // would refuse before the gate was ever reached.
-            .with_fmt_check_command(Some(vec!["true".into()]))
-            .with_lint_command(Some(Vec::new()))
-            .with_test_command(vec!["sh".into(), "judge.sh".into()]);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false)
+                // No formatter and no linter: this probe is about the reproduction
+                // gate, and a stage that asked cargo about a tree with no manifest
+                // would refuse before the gate was ever reached.
+                .with_fmt_check_command(Some(vec!["true".into()]))
+                .with_lint_command(Some(Vec::new()))
+                .with_test_command(vec!["sh".into(), "judge.sh".into()]);
         (root, pipeline)
     }
 
@@ -7371,6 +7514,7 @@ index 1111111..2222222 100644
     async fn a_change_that_shows_the_red_before_it_shows_the_green_passes() {
         let (root, pipeline) = reproducing_tree("BROKEN\n").await;
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "reproduced-1".into(),
             description: "让判据看到修好后的取值".into(),
@@ -7401,6 +7545,7 @@ index 1111111..2222222 100644
     async fn a_change_whose_red_is_green_without_it_is_refused_as_unreproduced() {
         let (root, pipeline) = reproducing_tree("FIXED\n").await;
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "unreproduced-1".into(),
             description: "调整判据读到的取值".into(),
@@ -7432,6 +7577,7 @@ index 1111111..2222222 100644
     async fn the_same_change_is_judged_on_green_alone_when_it_owes_no_reproduction() {
         let (root, pipeline) = reproducing_tree("FIXED\n").await;
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "plain-1".into(),
             description: "调整判据读到的取值".into(),
@@ -7518,8 +7664,10 @@ index 1111111..2222222 100644
         git_ok(root.path(), &["add", "."]).await;
         git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
 
-        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false);
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "clean-2".into(),
             description: "给取值模块补一个辅助函数".into(),
@@ -7586,6 +7734,7 @@ index 1111111..2222222 100644
     async fn a_change_that_is_not_formatted_is_conformed_and_then_judged() {
         let (root, pipeline) = formatted_probe_workspace(true).await;
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "unformatted-1".into(),
             description: "修正这个取值的计算".into(),
@@ -7636,6 +7785,7 @@ index 1111111..2222222 100644
     async fn a_change_the_formatter_cannot_conform_is_refused() {
         let (root, pipeline) = formatted_probe_workspace(false).await;
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "unparsable-1".into(),
             description: "修正这个取值的计算".into(),
@@ -7685,6 +7835,7 @@ index 1111111..2222222 100644
     async fn a_formatted_change_is_neither_refused_nor_rewritten() {
         let (root, pipeline) = formatted_probe_workspace(false).await;
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "formatted-1".into(),
             description: "修正这个取值的计算".into(),
@@ -7749,7 +7900,11 @@ index 1111111..2222222 100644
         git_ok(root.path(), &["add", "."]).await;
         git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
 
-        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), auto_apply);
+        let pipeline = crate::change_pipeline::test_pipeline(
+            root.path(),
+            root.path().join("changes"),
+            auto_apply,
+        );
         (root, pipeline)
     }
 
@@ -7787,6 +7942,7 @@ index 1111111..2222222 100644
 
         // 变更指向真实存在的 a.txt，本身完全合法——失败只来自工作树状态。
         let change = crate::types::EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: "ok-1".into(),
             description: "valid change".into(),
@@ -7810,7 +7966,7 @@ index 1111111..2222222 100644
             .await
             .unwrap();
 
-        let pipeline = ChangePipeline::new(root, root.join("changes"), true);
+        let pipeline = crate::change_pipeline::test_pipeline(root, root.join("changes"), true);
         assert!(
             pipeline.apply_and_test(&change).await.is_err(),
             "工作树脏是环境问题，必须走 Err 而不是判定"
@@ -7825,15 +7981,26 @@ index 1111111..2222222 100644
         let temp = tempfile::tempdir().unwrap();
         let change_dir = temp.path().join("changes");
         tokio::fs::create_dir_all(&change_dir).await.unwrap();
-        let pipeline = ChangePipeline::new(temp.path(), &change_dir, true);
+        let pipeline = crate::change_pipeline::test_pipeline(temp.path(), &change_dir, true);
 
         let id = "task-1-abc123";
         tokio::fs::write(change_dir.join(format!("{id}.diff")), "not a real diff\n")
             .await
             .unwrap();
+        pipeline
+            .write_change_record(&written_record(
+                id,
+                EvolutionStatus::CompileChecked,
+                chrono::Utc::now(),
+            ))
+            .await
+            .unwrap();
         assert_eq!(pipeline.pending_changes(None).await.unwrap().len(), 1);
 
-        pipeline.retire_change(id, "corrupt patch").await.unwrap();
+        pipeline
+            .retire_change(id, CandidateOutcome::Rejected, "corrupt patch")
+            .await
+            .unwrap();
 
         assert!(
             pipeline.pending_changes(None).await.unwrap().is_empty(),
@@ -7855,6 +8022,7 @@ index 1111111..2222222 100644
         created_at: chrono::DateTime<chrono::Utc>,
     ) -> EvolutionResult {
         EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: id.to_string(),
             description: format!("goal-{id}"),
@@ -7874,7 +8042,7 @@ index 1111111..2222222 100644
         let temp = tempfile::tempdir().unwrap();
         let change_dir = temp.path().join("changes");
         tokio::fs::create_dir_all(&change_dir).await.unwrap();
-        let pipeline = ChangePipeline::new(temp.path(), &change_dir, true);
+        let pipeline = crate::change_pipeline::test_pipeline(temp.path(), &change_dir, true);
         tokio::fs::write(change_dir.join("leftover.diff"), "not a real diff\n")
             .await
             .unwrap();
@@ -7900,7 +8068,7 @@ index 1111111..2222222 100644
         let temp = tempfile::tempdir().unwrap();
         let change_dir = temp.path().join("changes");
         tokio::fs::create_dir_all(&change_dir).await.unwrap();
-        let pipeline = ChangePipeline::new(temp.path(), &change_dir, true);
+        let pipeline = crate::change_pipeline::test_pipeline(temp.path(), &change_dir, true);
         tokio::fs::write(change_dir.join("judged.diff"), "not a real diff\n")
             .await
             .unwrap();
@@ -7929,7 +8097,7 @@ index 1111111..2222222 100644
         let temp = tempfile::tempdir().unwrap();
         let change_dir = temp.path().join("changes");
         tokio::fs::create_dir_all(&change_dir).await.unwrap();
-        let pipeline = ChangePipeline::new(temp.path(), &change_dir, true);
+        let pipeline = crate::change_pipeline::test_pipeline(temp.path(), &change_dir, true);
         tokio::fs::write(change_dir.join("settled.diff"), "not a real diff\n")
             .await
             .unwrap();
@@ -7948,15 +8116,15 @@ index 1111111..2222222 100644
         assert!(change_dir.join("settled.diff").exists());
     }
 
-    /// Retirement moves the record with the artifact it describes. Left behind,
-    /// the record would keep a retired change in the pending listing, and the
-    /// two halves of the pair would disagree about which queue it is in.
+    /// 退役是**又一条事件**：盘上的 `.diff` 只是跟着挪的导出工件，队列里在不在
+    /// 由事件回答。所以退役之后本条变更仍在（读得出来、带得出定案原因），只是不再
+    /// 是候选——重启之后它也不会重新变成一条待办。
     #[tokio::test]
-    async fn retiring_a_change_moves_its_record_too() {
+    async fn retiring_a_change_decides_it_and_keeps_it_readable() {
         let temp = tempfile::tempdir().unwrap();
         let change_dir = temp.path().join("changes");
         tokio::fs::create_dir_all(&change_dir).await.unwrap();
-        let pipeline = ChangePipeline::new(temp.path(), &change_dir, true);
+        let pipeline = crate::change_pipeline::test_pipeline(temp.path(), &change_dir, true);
         let id = "task-2-def456";
         tokio::fs::write(change_dir.join(format!("{id}.diff")), "not a real diff\n")
             .await
@@ -7969,60 +8137,79 @@ index 1111111..2222222 100644
             ))
             .await
             .unwrap();
-        assert!(!pipeline.artifact_is_retired(id), "not retired yet");
+        assert!(!pipeline.artifact_is_retired(id).await, "not retired yet");
 
-        pipeline.retire_change(id, "corrupt patch").await.unwrap();
+        pipeline
+            .retire_change(id, CandidateOutcome::Rejected, "corrupt patch")
+            .await
+            .unwrap();
 
+        let mut names: Vec<String> = Vec::new();
+        let mut entries = tokio::fs::read_dir(&change_dir).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            names.push(entry.file_name().to_string_lossy().to_string());
+        }
         assert!(
-            !change_dir.join(format!("{id}.json")).exists(),
-            "the record may not stay in the pending queue describing a change that left it"
+            names.iter().all(|name| !name.ends_with(".json")),
+            "队列的写者不是盘上那份记录：退役不该再写一个 .json，目录里只有 {names:?}"
         );
         assert!(
             change_dir
                 .join("retired")
-                .join(format!("{id}.json"))
+                .join(format!("{id}.diff"))
                 .exists(),
-            "the record has to travel with the artifact"
+            "导出工件跟着挪进 retired/，方便事后翻看"
         );
-        assert!(pipeline.artifact_is_retired(id));
+        assert!(pipeline.artifact_is_retired(id).await);
         assert_eq!(
             pipeline.read_change_record(id).await.map(|r| r.status),
             Some(EvolutionStatus::CompileChecked),
-            "the retired record is still readable where the artifact is"
+            "定案之后这条变更仍然读得出来，且带着它自己的状态"
         );
     }
 
-    /// The guard under the drop of a resident record: only a change that is out
-    /// of the queue *and* has its record beside it may be forgotten, or the
-    /// index is the last thing holding the state and dropping it loses the state.
+    /// 驻留记录能不能丢，判据是队列里那一条事件，不是盘上有没有文件。
+    ///
+    /// 一份没人删掉的 `.diff` 曾被读成「这条变更还在队列里」；反过来，一个挪到
+    /// `retired/` 的文件也曾经单独把一条变更读成已退役。现在两边都不算数：
+    /// 只有「已经定案」那条事件算数。
     #[tokio::test]
-    async fn a_change_is_retired_only_with_both_halves_in_place() {
+    async fn a_change_is_retired_only_when_the_queue_says_so() {
         let temp = tempfile::tempdir().unwrap();
         let change_dir = temp.path().join("changes");
         let retired = change_dir.join("retired");
         tokio::fs::create_dir_all(&retired).await.unwrap();
-        let pipeline = ChangePipeline::new(temp.path(), &change_dir, true);
+        let pipeline = crate::change_pipeline::test_pipeline(temp.path(), &change_dir, true);
 
         tokio::fs::write(retired.join("half.diff"), "not a real diff\n")
             .await
             .unwrap();
         assert!(
-            !pipeline.artifact_is_retired("half"),
-            "the artifact alone leaves the state it was retired for unrecorded"
+            !pipeline.artifact_is_retired("half").await,
+            "盘上挪走了不等于队列里定案了：文件不是判据"
         );
 
-        tokio::fs::write(retired.join("half.json"), "{}")
+        tokio::fs::write(change_dir.join("pending.diff"), "not a real diff\n")
             .await
             .unwrap();
-        assert!(pipeline.artifact_is_retired("half"));
-
-        tokio::fs::write(change_dir.join("pending.json"), "{}")
+        pipeline
+            .write_change_record(&written_record(
+                "pending",
+                EvolutionStatus::CompileChecked,
+                chrono::Utc::now(),
+            ))
             .await
             .unwrap();
         assert!(
-            !pipeline.artifact_is_retired("pending"),
-            "a record still in the queue describes a change still in the queue"
+            !pipeline.artifact_is_retired("pending").await,
+            "有候选、没定案：它还在队列里"
         );
+
+        pipeline
+            .retire_change("pending", CandidateOutcome::Rejected, "refused")
+            .await
+            .unwrap();
+        assert!(pipeline.artifact_is_retired("pending").await);
     }
 
     /// The listing is built from the records, so it has to see both the ones
@@ -8033,7 +8220,7 @@ index 1111111..2222222 100644
         let temp = tempfile::tempdir().unwrap();
         let change_dir = temp.path().join("changes");
         tokio::fs::create_dir_all(&change_dir).await.unwrap();
-        let pipeline = ChangePipeline::new(temp.path(), &change_dir, true);
+        let pipeline = crate::change_pipeline::test_pipeline(temp.path(), &change_dir, true);
 
         let older = chrono::Utc::now() - chrono::Duration::hours(2);
         pipeline
@@ -8058,11 +8245,15 @@ index 1111111..2222222 100644
         tokio::fs::write(change_dir.join("gone.diff"), "not a real diff\n")
             .await
             .unwrap();
-        pipeline.retire_change("gone", "landed").await.unwrap();
+        pipeline
+            .retire_change("gone", CandidateOutcome::Accepted, "landed")
+            .await
+            .unwrap();
 
         let known: Vec<String> = pipeline
             .known_change_records()
             .await
+            .unwrap()
             .into_iter()
             .map(|r| r.artifact_id)
             .collect();
@@ -8073,6 +8264,68 @@ index 1111111..2222222 100644
         );
     }
 
+    /// 一份只肯拒绝读取的队列。其余方法不在这些用例走的路上，直接说不可达，
+    /// 而不是悄悄回 `Ok`——一个处处答应的替身会让用例在队列真没读到时也绿。
+    #[derive(Debug)]
+    struct RefusingCandidates;
+
+    #[async_trait::async_trait]
+    impl ChangeCandidateStore for RefusingCandidates {
+        async fn record(&self, _candidate: &ChangeCandidate) -> SFResult<()> {
+            unimplemented!("RefusingCandidates stands in only for the refused read")
+        }
+
+        async fn transition(&self, _artifact_id: &str, _status: &str, _note: &str) -> SFResult<()> {
+            unimplemented!("RefusingCandidates stands in only for the refused read")
+        }
+
+        async fn decide(
+            &self,
+            _artifact_id: &str,
+            _outcome: CandidateOutcome,
+            _reason: &str,
+        ) -> SFResult<()> {
+            unimplemented!("RefusingCandidates stands in only for the refused read")
+        }
+
+        async fn pending(&self) -> SFResult<Vec<ChangeCandidate>> {
+            unimplemented!("RefusingCandidates stands in only for the refused read")
+        }
+
+        async fn all(&self) -> SFResult<Vec<ChangeCandidate>> {
+            Err(SFError::Internal(
+                "the candidate queue is unreadable".into(),
+            ))
+        }
+
+        async fn read(&self, _artifact_id: &str) -> SFResult<Option<ChangeCandidate>> {
+            unimplemented!("RefusingCandidates stands in only for the refused read")
+        }
+    }
+
+    /// 队列读不出时要说出来，不能折成一张空表。
+    ///
+    /// 这份记录是管理面列表里「已退场那一半」的唯一来源：折成空表时，一次读失败
+    /// 会让每一条已落地的变更从列表里安安静静地消失，与「一条都没落地过」读成
+    /// 同一个样子。
+    #[tokio::test]
+    async fn an_unreadable_queue_is_an_error_not_an_empty_listing() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let pipeline = ChangePipeline::new(temp.path(), &change_dir, true)
+            .with_candidates(Arc::new(RefusingCandidates));
+
+        let error = pipeline
+            .known_change_records()
+            .await
+            .expect_err("a read that failed must not be handed out as no records");
+        assert!(
+            error.to_string().contains("unreadable"),
+            "the error has to be the store's own: {error}"
+        );
+    }
+
     /// 缺席即无事：调用方可能在失败路径上重复调用，或对一条已被别的分支退休的
     /// 变更再调一次，这都不该变成错误。
     #[tokio::test]
@@ -8080,10 +8333,10 @@ index 1111111..2222222 100644
         let temp = tempfile::tempdir().unwrap();
         let change_dir = temp.path().join("changes");
         tokio::fs::create_dir_all(&change_dir).await.unwrap();
-        let pipeline = ChangePipeline::new(temp.path(), &change_dir, true);
+        let pipeline = crate::change_pipeline::test_pipeline(temp.path(), &change_dir, true);
 
         pipeline
-            .retire_change("never-existed", "n/a")
+            .retire_change("never-existed", CandidateOutcome::Accepted, "n/a")
             .await
             .unwrap();
 
@@ -8190,6 +8443,15 @@ index 1111111..2222222 100644
             None,
             "读不到不是绿：它要变成一句写进证据的话"
         );
+        // 箭头两边同版：rustup 把同一次发布又列了一遍。原样输出见 2026-11-19 本机
+        // `rustup check`。按「箭头后面那个」走会重新下载几百兆来装同一把编译器。
+        assert_eq!(
+            stable_release_from_check(
+                "stable-x86_64-unknown-linux-gnu - update available: 1.100.0 (0ef1bc386 2026-11-09) -> 1.100.0 (0ef1bc386 2026-11-09)"
+            ),
+            Some(StableRelease::Current),
+            "两边同版还去装，等于为同一把编译器再下一次几百兆"
+        );
     }
 
     /// 刷新的结果要真的递到判据那几条命令手上。
@@ -8200,7 +8462,8 @@ index 1111111..2222222 100644
     #[test]
     fn the_refreshed_toolchain_reaches_the_commands_that_judge() {
         let temp = tempfile::tempdir().unwrap();
-        let pipeline = ChangePipeline::new(temp.path(), temp.path().join("changes"), true);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(temp.path(), temp.path().join("changes"), true);
         pipeline.remember_judge_toolchain("1.99.1");
         let mut cmd = tokio::process::Command::new("true");
         pipeline.apply_verification_env(&mut cmd);
@@ -8226,6 +8489,7 @@ index 1111111..2222222 100644
     /// 两个方向都钉：缺件的目录不认，补齐了才认。只钉第一个方向的话，一个「永远不认」
     /// 的实现也能过，而那会让每一条变更都重装几百兆。
     #[test]
+    #[cfg(unix)]
     fn a_toolchain_directory_without_its_components_is_not_provisioned() {
         let home = tempfile::tempdir().unwrap();
         let dir = home
@@ -8240,8 +8504,8 @@ index 1111111..2222222 100644
             "只有 cargo 的目录被当成装好了：判据会指过去，然后每一条格式化命令都起不来"
         );
 
-        std::fs::write(dir.join("bin").join("rustfmt"), "").unwrap();
-        std::fs::write(dir.join("bin").join("cargo-clippy"), "").unwrap();
+        write_stub(&dir.join("bin"), "rustfmt", 0);
+        write_stub(&dir.join("bin"), "cargo-clippy", 0);
         assert_eq!(
             provisioned_toolchain_in(home.path(), "1.99.1"),
             Some(dir),
@@ -8252,6 +8516,56 @@ index 1111111..2222222 100644
             None,
             "按 1.98.1 问，答的却是 1.99.1 的目录——那样装的那一趟永远被跳过，判据停在旧那一把"
         );
+    }
+
+    /// 一个组件文件都在、却起不来的目录也不算「装好了」。
+    ///
+    /// 2026-11-19 门禁实测的现场：`rustup toolchain install 1.100.0` 被超时打断，
+    /// 目录里 `bin/rustfmt` 与 `bin/cargo-clippy` 都在，缺的是 `librustc_driver-*.so`。
+    /// 只查文件在不在的判据把它认成装好了，于是 14 条与格式无关的测试一起被读成
+    /// 「是这笔改动弄坏了它们」——一条从未被评判的变更被判为不合格，和「变更确实是
+    /// 坏的」在证据里同形。两个方向都钉：起不来的不认，换成起得来的才认。
+    #[test]
+    #[cfg(unix)]
+    fn a_toolchain_whose_rustfmt_cannot_start_is_not_provisioned() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home
+            .path()
+            .join("toolchains")
+            .join("1.100.0-x86_64-unknown-linux-gnu");
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        write_stub(&dir.join("bin"), "rustfmt", 1);
+        write_stub(&dir.join("bin"), "cargo-clippy", 0);
+        assert_eq!(
+            provisioned_toolchain_in(home.path(), "1.100.0"),
+            None,
+            "起不来的工具链被当成装好了：判据指过去之后每一条格式化命令都起不来"
+        );
+
+        write_stub(&dir.join("bin"), "rustfmt", 0);
+        assert_eq!(
+            provisioned_toolchain_in(home.path(), "1.100.0"),
+            Some(dir),
+            "两个组件都在、rustfmt 也起得来，还不认——同一笔变更会守着 RUSTUP_HOME 重装几百兆"
+        );
+    }
+
+    /// 在 `bin` 下放一个可执行、退 `exit` 的脚本，冒充一个组件二进制。
+    ///
+    /// 先写临时名再 `rename`：并行跑的别的测试线程正在 `fork`/`exec` 时，那个孩子会
+    /// 继承这里打开着的写句柄；直接写在最终名下，紧接着的 `exec` 会拿到 `ETXTBSY`——
+    /// 2026-11-24 全量跑里这一条就这样红过一次（单跑绿）。换名后写到的是另一个 inode，
+    /// 孩子手里的句柄不再挡最终那个名字。
+    #[cfg(unix)]
+    fn write_stub(bin: &std::path::Path, name: &str, exit: i32) {
+        use std::os::unix::fs::PermissionsExt;
+        let staged = bin.join(format!(".{name}.staged"));
+        std::fs::write(&staged, format!("#!/bin/sh\nexit {exit}\n")).unwrap();
+        let mut perms = std::fs::metadata(&staged).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&staged, perms).unwrap();
+        let path = bin.join(name);
+        std::fs::rename(&staged, &path).unwrap();
     }
 
     /// 编译器包装器不得进入判据进程，两个方向都钉死：白名单里现在没有，将来加回来
@@ -8561,8 +8875,8 @@ index 1111111..2222222 100644
                 "        run: bash deploy/scripts/check-one.sh\n",
                 "      - name: a gate that lives outside deploy\n",
                 "        run: bash .github/scripts/check-three.sh\n",
-                "      - name: judge the rendered manifests\n",
-                "        run: bash deploy/scripts/render-deploy.sh --check\n",
+                "      - name: judge the static manifests\n",
+                "        run: bash deploy/scripts/sync-static-manifests.sh --check\n",
                 "      - name: with an argument\n",
                 "        run: bash deploy/scripts/check-four.sh \"${range}\"\n",
                 "      - name: a test, not a judgement\n",
@@ -8585,7 +8899,7 @@ index 1111111..2222222 100644
                 ("python3 deploy/scripts/check-two.py".to_string(), false),
                 ("bash .github/scripts/check-three.sh".to_string(), false),
                 (
-                    "bash deploy/scripts/render-deploy.sh --check".to_string(),
+                    "bash deploy/scripts/sync-static-manifests.sh --check".to_string(),
                     false
                 ),
                 (
@@ -8867,6 +9181,7 @@ index 1111111..2222222 100644
 
     fn a_change_moving_seeds(artifact_id: &str, content: String) -> EvolutionResult {
         EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: artifact_id.into(),
             description: "修正这个取值的计算".into(),
@@ -8906,7 +9221,8 @@ index 1111111..2222222 100644
         git_ok(root.path(), &["add", "."]).await;
         git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
 
-        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), true);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), true);
         (root, pipeline)
     }
 
@@ -9056,8 +9372,8 @@ index 1111111..2222222 100644
             .unwrap();
 
         let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
-        let pipeline =
-            ChangePipeline::new(root.path(), root.path(), true).with_metrics(metrics.clone());
+        let pipeline = crate::change_pipeline::test_pipeline(root.path(), root.path(), true)
+            .with_metrics(metrics.clone());
         let name = cog_core::metric_names::CHANGE_TIER_TOTAL.as_str();
 
         assert!(
@@ -9123,8 +9439,8 @@ index 1111111..2222222 100644\n\
 
         let root = tempfile::tempdir().unwrap();
         let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
-        let pipeline =
-            ChangePipeline::new(root.path(), root.path(), true).with_metrics(metrics.clone());
+        let pipeline = crate::change_pipeline::test_pipeline(root.path(), root.path(), true)
+            .with_metrics(metrics.clone());
         let name = cog_core::metric_names::PROJECT_KIND_TOTAL.as_str();
 
         assert!(
@@ -9186,8 +9502,10 @@ index 1111111..2222222 100644\n\
         git_ok(root.path(), &["add", "."]).await;
         git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
 
-        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false);
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "misdeclared-1".into(),
             description: "调整这一行的取值".into(),
@@ -9237,8 +9555,10 @@ index 1111111..2222222 100644\n\
         git_ok(root.path(), &["add", "."]).await;
         git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
 
-        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), false);
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "self-serving-1".into(),
             description: "把项目的 kind 改成 rust".into(),
@@ -9482,7 +9802,7 @@ index 1111111..2222222 100644\n\
     #[tokio::test]
     async fn a_topology_change_without_a_declared_condition_is_refused_by_name() {
         let root = tempfile::tempdir().unwrap();
-        let pipeline = ChangePipeline::new(root.path(), root.path(), false);
+        let pipeline = crate::change_pipeline::test_pipeline(root.path(), root.path(), false);
         let reason = pipeline
             .deploy_admission_reason(
                 root.path(),
@@ -9512,12 +9832,11 @@ index 1111111..2222222 100644\n\
     async fn a_declared_condition_decides_the_family_by_its_exit_status() {
         let root = tempfile::tempdir().unwrap();
         worktree_holding_the_change(root.path());
-        let passing = ChangePipeline::new(root.path(), root.path(), false).with_deploy_admission(
-            Some(cog_core::DeployAdmissionConfig {
+        let passing = crate::change_pipeline::test_pipeline(root.path(), root.path(), false)
+            .with_deploy_admission(Some(cog_core::DeployAdmissionConfig {
                 commands: vec![vec!["true".into()]],
                 server_dry_run: None,
-            }),
-        );
+            }));
         assert_eq!(
             passing
                 .deploy_admission_reason(root.path(), &targets(&["deploy/helm/x.yaml"]), PATCH)
@@ -9533,12 +9852,11 @@ index 1111111..2222222 100644\n\
             "回滚证明之后必须把这一笔应用回来"
         );
 
-        let failing = ChangePipeline::new(root.path(), root.path(), false).with_deploy_admission(
-            Some(cog_core::DeployAdmissionConfig {
+        let failing = crate::change_pipeline::test_pipeline(root.path(), root.path(), false)
+            .with_deploy_admission(Some(cog_core::DeployAdmissionConfig {
                 commands: vec![vec!["false".into()]],
                 server_dry_run: None,
-            }),
-        );
+            }));
         let reason = failing
             .deploy_admission_reason(root.path(), &targets(&["deploy/helm/x.yaml"]), PATCH)
             .await
@@ -9554,12 +9872,11 @@ index 1111111..2222222 100644\n\
     #[tokio::test]
     async fn the_server_dry_run_judges_only_the_rendered_files_the_change_touched() {
         let root = tempfile::tempdir().unwrap();
-        let pipeline = ChangePipeline::new(root.path(), root.path(), false).with_deploy_admission(
-            Some(cog_core::DeployAdmissionConfig {
+        let pipeline = crate::change_pipeline::test_pipeline(root.path(), root.path(), false)
+            .with_deploy_admission(Some(cog_core::DeployAdmissionConfig {
                 commands: vec![vec!["true".into()]],
                 server_dry_run: Some(vec!["false".into()]),
-            }),
-        );
+            }));
 
         let reason = pipeline
             .deploy_admission_reason(
@@ -9595,12 +9912,11 @@ index 1111111..2222222 100644\n\
     #[tokio::test]
     async fn a_family_the_tree_cannot_give_back_is_refused_even_when_every_command_passes() {
         let root = tempfile::tempdir().unwrap();
-        let pipeline = ChangePipeline::new(root.path(), root.path(), false).with_deploy_admission(
-            Some(cog_core::DeployAdmissionConfig {
+        let pipeline = crate::change_pipeline::test_pipeline(root.path(), root.path(), false)
+            .with_deploy_admission(Some(cog_core::DeployAdmissionConfig {
                 commands: vec![vec!["true".into()]],
                 server_dry_run: None,
-            }),
-        );
+            }));
         let reason = pipeline
             .deploy_admission_reason(root.path(), &targets(&["deploy/helm/x.yaml"]), PATCH)
             .await
@@ -9616,7 +9932,7 @@ index 1111111..2222222 100644\n\
     #[tokio::test]
     async fn a_change_outside_the_family_is_not_judged_by_its_conditions() {
         let root = tempfile::tempdir().unwrap();
-        let pipeline = ChangePipeline::new(root.path(), root.path(), false);
+        let pipeline = crate::change_pipeline::test_pipeline(root.path(), root.path(), false);
         assert_eq!(
             pipeline
                 .deploy_admission_reason(root.path(), &targets(&["crates/x/src/lib.rs"]), PATCH)
@@ -9652,7 +9968,7 @@ index 1111111..2222222 100644\n\
     #[tokio::test]
     async fn a_web_change_without_a_declared_condition_is_refused_by_name() {
         let root = tempfile::tempdir().unwrap();
-        let pipeline = ChangePipeline::new(root.path(), root.path(), false);
+        let pipeline = crate::change_pipeline::test_pipeline(root.path(), root.path(), false);
         let reason = pipeline
             .web_admission_reason(root.path(), &["web/src/App.tsx".to_string()])
             .await
@@ -9679,11 +9995,10 @@ index 1111111..2222222 100644\n\
         let root = tempfile::tempdir().unwrap();
         let touched = ["web/src/App.tsx".to_string()];
 
-        let passing = ChangePipeline::new(root.path(), root.path(), false).with_web_admission(
-            Some(cog_core::WebAdmissionConfig {
+        let passing = crate::change_pipeline::test_pipeline(root.path(), root.path(), false)
+            .with_web_admission(Some(cog_core::WebAdmissionConfig {
                 commands: vec![vec!["true".into()]],
-            }),
-        );
+            }));
         assert_eq!(
             passing
                 .web_admission_reason(root.path(), &touched)
@@ -9692,11 +10007,10 @@ index 1111111..2222222 100644\n\
             None
         );
 
-        let failing = ChangePipeline::new(root.path(), root.path(), false).with_web_admission(
-            Some(cog_core::WebAdmissionConfig {
+        let failing = crate::change_pipeline::test_pipeline(root.path(), root.path(), false)
+            .with_web_admission(Some(cog_core::WebAdmissionConfig {
                 commands: vec![vec!["false".into()]],
-            }),
-        );
+            }));
         let reason = failing
             .web_admission_reason(root.path(), &touched)
             .await
@@ -9712,7 +10026,7 @@ index 1111111..2222222 100644\n\
     #[tokio::test]
     async fn an_empty_web_declaration_is_not_a_condition() {
         let root = tempfile::tempdir().unwrap();
-        let pipeline = ChangePipeline::new(root.path(), root.path(), false)
+        let pipeline = crate::change_pipeline::test_pipeline(root.path(), root.path(), false)
             .with_web_admission(Some(cog_core::WebAdmissionConfig { commands: vec![] }));
         assert!(
             pipeline
@@ -9745,13 +10059,15 @@ index 1111111..2222222 100644\n\
         git_ok(root.path(), &["add", "."]).await;
         git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
 
-        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), true)
-            .with_web_admission(Some(cog_core::WebAdmissionConfig {
-                commands: vec![vec!["true".into()]],
-            }))
-            .with_test_command(vec!["false".into()]);
+        let pipeline =
+            crate::change_pipeline::test_pipeline(root.path(), root.path().join("changes"), true)
+                .with_web_admission(Some(cog_core::WebAdmissionConfig {
+                    commands: vec![vec!["true".into()]],
+                }))
+                .with_test_command(vec!["false".into()]);
 
         let change = EvolutionResult {
+            unit_of_work: None,
             kind: EvolutionKind::CodeChange,
             artifact_id: "web-only-1".into(),
             description: "让这个取值变成 2".into(),
@@ -9786,7 +10102,7 @@ index 1111111..2222222 100644\n\
     #[tokio::test]
     async fn a_non_web_change_is_not_judged_by_the_web_conditions() {
         let root = tempfile::tempdir().unwrap();
-        let pipeline = ChangePipeline::new(root.path(), root.path(), false);
+        let pipeline = crate::change_pipeline::test_pipeline(root.path(), root.path(), false);
         assert_eq!(
             pipeline
                 .web_admission_reason(root.path(), &[])
@@ -9795,5 +10111,312 @@ index 1111111..2222222 100644\n\
             None
         );
         assert!(ChangePipeline::web_targets(&targets(&["crates/x/src/lib.rs"])).is_empty());
+    }
+    /// 导出带水位、并能原样还原：同一条变更两次导出是同一串字节，去掉水位后
+    /// 与正本逐字节相等。
+    #[tokio::test]
+    async fn an_exported_diff_carries_its_watermark_and_comes_back_byte_for_byte() {
+        let diff = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n";
+        let mut row = candidate_with("chg-export", diff);
+        row.event_id = "01J8Z0000000000000000000AB".to_string();
+        let exported = crate::change_pipeline::export_diff(&row);
+        assert!(
+            exported.starts_with("# event_id: 01J8Z0000000000000000000AB\n"),
+            "the export has to say which event it came from: {exported}"
+        );
+        assert_eq!(
+            crate::change_pipeline::imported_diff(&exported),
+            diff,
+            "everything below the watermark is the diff, byte for byte"
+        );
+        // 正文里碰巧有形似水位的行，不算水位：只有第一行那个前缀才算。
+        let body = "# event_id: not-a-watermark\nx\n";
+        assert_eq!(crate::change_pipeline::imported_diff(body), body);
+    }
+
+    /// 一份可以塞进队列的候选：给定正文与 id。
+    fn candidate_with(id: &str, content: &str) -> ChangeCandidate {
+        ChangeCandidate {
+            unit_of_work: None,
+            artifact_id: id.to_string(),
+            kind: "code_change".to_string(),
+            description: "why".to_string(),
+            content: content.to_string(),
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+            tiering: None,
+            recorded_status: "compile_checked".to_string(),
+            status: "candidate".to_string(),
+            decision_reason: None,
+            event_id: String::new(),
+        }
+    }
+
+    /// 把盘上那份 `.diff` 删掉之后，同一串字节仍然导得出来——它本来就在流里。
+    #[tokio::test]
+    async fn a_deleted_diff_is_exported_from_the_queue() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let diff = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n";
+        let store = crate::change_pipeline::test_candidates();
+        let mut row = candidate_with("chg-kept", diff);
+        row.event_id = "01J8Z0000000000000000000CD".to_string();
+        store.record(&row).await.unwrap();
+        let pipeline = crate::change_pipeline::test_pipeline(temp.path(), &change_dir, true)
+            .with_candidates(store.clone());
+
+        let exported = crate::change_pipeline::export_diff(
+            &store
+                .read("chg-kept")
+                .await
+                .unwrap()
+                .expect("the row reads"),
+        );
+        assert_eq!(
+            crate::change_pipeline::imported_diff(&exported),
+            diff,
+            "the diff text travels with the candidate; the file on disk was never the source"
+        );
+        assert_eq!(
+            pipeline.read_change_content("chg-kept").await.as_deref(),
+            Some(diff)
+        );
+    }
+
+    /// 历史记录文件导进队列：在队的落成候选、在读的落成已定案，文件都删掉。
+    #[tokio::test]
+    async fn legacy_record_files_become_queue_rows_and_the_files_go() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        let retired = change_dir.join("retired");
+        tokio::fs::create_dir_all(&retired).await.unwrap();
+        let store = crate::change_pipeline::test_candidates();
+
+        let waiting = written_record(
+            "waiting",
+            EvolutionStatus::CompileChecked,
+            chrono::Utc::now(),
+        );
+        tokio::fs::write(
+            change_dir.join("waiting.json"),
+            serde_json::to_string(&waiting).unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut landed = written_record("landed", EvolutionStatus::Active, chrono::Utc::now());
+        landed.description = "the change that landed".to_string();
+        tokio::fs::write(
+            retired.join("landed.json"),
+            serde_json::to_string(&landed).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let report = crate::change_pipeline::import_legacy_records(&change_dir, &store).await;
+        assert_eq!(report.pending, 1);
+        assert_eq!(report.retired, 1);
+        assert!(report.unreadable.is_empty());
+
+        assert!(
+            !change_dir.join("waiting.json").exists() && !retired.join("landed.json").exists(),
+            "导入之后那份文件没有读者了，留着只会让下一个人以为它还是正本"
+        );
+        let pending = store.pending().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].artifact_id, "waiting");
+        let decided = store.read("landed").await.unwrap().expect("the row reads");
+        assert_eq!(decided.status, "accepted");
+        assert_eq!(
+            decided.description, "the change that landed",
+            "导入不该改写记录说过的话"
+        );
+    }
+
+    /// 读不懂的记录留在原地并被点名：删掉它就是删掉唯一那份它说过的东西。
+    #[tokio::test]
+    async fn an_unreadable_legacy_record_stays_where_it_is() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        tokio::fs::write(change_dir.join("broken.json"), "{ not a record")
+            .await
+            .unwrap();
+        let store = crate::change_pipeline::test_candidates();
+
+        let report = crate::change_pipeline::import_legacy_records(&change_dir, &store).await;
+        assert_eq!(report.unreadable.len(), 1);
+        assert!(change_dir.join("broken.json").exists());
+    }
+
+    /// 跑两遍是空操作：第二遍没有文件可导，队列不变。
+    #[tokio::test]
+    async fn importing_twice_changes_nothing_the_second_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let store = crate::change_pipeline::test_candidates();
+        let record = written_record("once", EvolutionStatus::Generated, chrono::Utc::now());
+        tokio::fs::write(
+            change_dir.join("once.json"),
+            serde_json::to_string(&record).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        crate::change_pipeline::import_legacy_records(&change_dir, &store).await;
+        let again = crate::change_pipeline::import_legacy_records(&change_dir, &store).await;
+        assert_eq!(again.pending, 0);
+        assert_eq!(again.retired, 0);
+        assert_eq!(store.pending().await.unwrap().len(), 1);
+    }
+}
+
+/// 历史遗留的记录文件导进队列之后的结果读数。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LegacyImportReport {
+    /// 导进来、并已从盘上删掉的候选（在队里的）。
+    pub pending: usize,
+    /// 导进来、并已从盘上删掉的已定案变更（`retired/` 里的）。
+    pub retired: usize,
+    /// 读不懂的记录：留在原地，点名出来。
+    pub unreadable: Vec<PathBuf>,
+}
+
+/// 把 `<id>.json` 记录文件导进队列，然后删掉文件。
+///
+/// 这一步是 S25 的顺序里唯一还需要盘上那份字节的一步：旧模型把它当唯一的那份事实，
+/// 新模型只认事件。导入之后那份文件就没有读者了，留着只会让下一个人以为它还是正本。
+///
+/// 三条纪律：
+///
+/// * **先落库、后删文件**：反过来，一次写库失败就永久丢掉了那条变更唯一的描述；
+/// * **在队与已退役分开落**：`retired/` 里的记录说的是「这条变更已经离开队列」，
+///   所以导入时补一条定案事件——否则它们会在待办里重新出现，而那正是这次要治的病。
+///   定案方向按记录自己的状态词判：被拒的那几个词落 `Rejected`，其余落 `Accepted`；
+/// * **读不懂的不删**：一份解不出来的记录留在原地并被点名，因为删掉它就是删掉唯一
+///   那份它说过的东西。
+pub async fn import_legacy_records(
+    change_dir: &Path,
+    store: &Arc<dyn ChangeCandidateStore>,
+) -> LegacyImportReport {
+    let mut report = LegacyImportReport::default();
+    for (dir, retired) in [
+        (change_dir.to_path_buf(), false),
+        (retired_dir(change_dir), true),
+    ] {
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let text = match tokio::fs::read_to_string(&path).await {
+                Ok(text) => text,
+                Err(_) => {
+                    report.unreadable.push(path);
+                    continue;
+                }
+            };
+            let Ok(record) = serde_json::from_str::<EvolutionResult>(&text) else {
+                report.unreadable.push(path);
+                continue;
+            };
+            if let Err(e) = record_change(store, &record).await {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "could not import a legacy change record; the file stays where it is"
+                );
+                report.unreadable.push(path);
+                continue;
+            }
+            if retired {
+                let outcome = landed_outcome(record.status);
+                if let Err(e) = store
+                    .decide(
+                        &record.artifact_id,
+                        outcome,
+                        "imported from a retired record: it had already left the queue",
+                    )
+                    .await
+                {
+                    warn!(
+                        artifact_id = %record.artifact_id,
+                        error = %e,
+                        "imported the candidate but could not mark it as retired; it stays as a pending candidate"
+                    );
+                    report.unreadable.push(path);
+                    continue;
+                }
+                report.retired += 1;
+            } else {
+                report.pending += 1;
+            }
+            if let Err(e) = tokio::fs::remove_file(&path).await {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "imported the record but could not remove the file; it is now a duplicate, not a source"
+                );
+            }
+        }
+    }
+    info!(
+        pending = report.pending,
+        retired = report.retired,
+        unreadable = report.unreadable.len(),
+        "legacy change records imported into the queue"
+    );
+    report
+}
+
+/// 一条已经离开队列的记录，当初是落地了还是被拒了。
+///
+/// 只按记录自己的状态词判：三个「没成」的词落 `Rejected`，其余落 `Accepted`。这不是
+/// 猜——退役当时只有这两条路，而记录里的状态词就是当时那条路的判词。
+fn landed_outcome(status: EvolutionStatus) -> CandidateOutcome {
+    match status {
+        EvolutionStatus::Rejected
+        | EvolutionStatus::CompileError
+        | EvolutionStatus::ValidationFailed => CandidateOutcome::Rejected,
+        _ => CandidateOutcome::Accepted,
+    }
+}
+
+/// 一条变更的 diff 导出：字节与水位。
+///
+/// `.diff` 在盘上只是**导出工件**，正本是事件流里的候选事件。所以「导出」这件事要
+/// 说得出它是从哪一条事件导出来的：同一条变更两次导出得到同一串字节，且那串字节
+/// 头顶写着产出它的 `event_id`——没有这个水位，一份 `.diff` 是谁、什么时候导的，
+/// 事后只能猜。
+///
+/// 头的形状是一行注释：`# event_id: <ULID>`。注释而不是 JSON 包装，是因为消费者
+/// （`git apply`）读的是 diff 正文；多一行以 `#` 开头的说明，patch 仍按原文应用。
+pub fn export_diff(candidate: &ChangeCandidate) -> String {
+    format!("# event_id: {}\n{}", candidate.event_id, candidate.content)
+}
+
+/// 把导出的字节还原成正文：去掉那一行水位，其余一个字节不动。
+///
+/// 只吃**自己写的那一行**：正文里如果碰巧有 `# event_id:` 开头的行（一个 shell 脚本
+/// 的注释），它不是水位。判据是那一行的值必须是一个身份的形状——26 位 Crockford
+/// base32（ULID 的字母表），其余一律当正文。只认前缀会让一份以这种注释开头的脚本
+/// 在第一次往返里丢掉第一行。
+pub fn imported_diff(exported: &str) -> &str {
+    const ALPHABET: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let Some((first, body)) = exported.split_once('\n') else {
+        return exported;
+    };
+    let Some(id) = first.strip_prefix("# event_id: ") else {
+        return exported;
+    };
+    let is_identity = id.len() == 26 && id.chars().all(|character| ALPHABET.contains(character));
+    if is_identity {
+        body
+    } else {
+        exported
     }
 }

@@ -37,6 +37,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use cog_core::contract::intent_events::IntentRow;
 use cog_core::observability::{DimensionSpec, Observable, RawMetric};
 use cog_core::{
     HttpClient, HttpRequest, OrchestratorControl, OwnerLeaseBroker, SFResult, ShutdownSignal, Task,
@@ -68,21 +69,26 @@ const SEARCH_BASE_ENV: &str = cog_core::WEB_SEARCH_BASE_ENV;
 /// the world this reads changes on the scale of releases and articles, and a
 /// tighter cadence would spend the same money to find the same items and have
 /// them deduplicated.
-// cap: bound — 被读的那件事按发布与文章变化，不按秒；更密的节奏买的是同一批条目
+// cap: fixed — 被读的那件事按发布与文章变化，不按秒；更密的节奏买的是同一批条目
+// keep: 删掉后节奏按秒去读一份按发布变化的东西，买的是同一批条目；由「被读的那件事不按秒变」兜住
 const DEFAULT_CADENCE_SECS: u64 = 6 * 60 * 60;
 /// How many results one source may hand over per pass. The backend returns its
 /// whole ranked list; an unbounded handover would turn one query into a day of
 /// work and bury everything else in the graph.
-// cap: bound — 一条查询变成一天的工作，图里其余的东西就都被埋了
+// cap: fixed — 一条查询变成一天的工作，图里其余的东西就都被埋了
+// keep: 删掉后一条查询变成一天的工作，图里其余的东西都被埋了；由「一条查询变一天的工作」兜住
 const DEFAULT_MAX_ITEMS: usize = 3;
 /// The backend runs inside this cluster, so a slow answer is a broken one: a
 /// request that needs longer than this is not going to be answered usefully,
 /// and holding the tick open costs every other source its turn.
-// cap: bound — SearXNG 就在集群里，三十秒还没答就是没在答
+// cap: fixed — SearXNG 就在集群里，三十秒还没答就是没在答
+// keep: 删掉后一个没在答的 SearXNG 把一轮挂住；由「三十秒还没答就是没在答」兜住
+// wall: 等=SearXNG 的回包 / 等不到=这一源这次没有结果，而整拍不停在它身上——别的源照常轮到自己 / 续跑=能，下一拍重新问
 const FETCH_TIMEOUT_SECS: u64 = 30;
 /// How much of a result's excerpt travels in the goal text. Enough to tell the
 /// taker whether it is worth opening; the URL is what they read when it is.
-// cap: bound — 够判断值不值得打开原文；要读细节的人去读 URL 那一页
+// cap: fixed — 够判断值不值得打开原文；要读细节的人去读 URL 那一页
+// keep: 删掉后摘录装不下，读者为了判断值不值得打开原文要读全文；由「够判断值不值得打开」兜住
 const EXCERPT_CHARS: usize = 600;
 /// The longest the loop sleeps between wakes, whatever its sources ask for.
 ///
@@ -95,7 +101,8 @@ const EXCERPT_CHARS: usize = 600;
 /// the loop reads as configured and permanently unexercised, and no reading ever
 /// says the outside world went unread. Waking sooner costs one timer, not one
 /// query -- each source is still only asked when its own cadence is due.
-// cap: bound — 一觉睡满一个节奏等于滚动比节奏快的部署里一次都不问
+// cap: fixed — 一觉睡满一个节奏等于滚动比节奏快的部署里一次都不问
+// keep: 删掉后一觉睡满一个节奏，滚动比节奏快的部署里一次都不问；由「一觉睡满一个节奏」兜住
 const WAKE_CEILING_SECS: u64 = 5 * 60;
 
 /// One subject to look for, and how often.
@@ -142,6 +149,8 @@ pub enum ConfigFault {
     Incomplete,
     /// Sources are configured but no search backend is named.
     NoEndpoint,
+    /// A source declares a cadence of zero or a hand-over of zero items.
+    Unusable,
 }
 
 impl ConfigFault {
@@ -153,6 +162,7 @@ impl ConfigFault {
             ConfigFault::Empty => "empty",
             ConfigFault::Incomplete => "incomplete",
             ConfigFault::NoEndpoint => "no_endpoint",
+            ConfigFault::Unusable => "unusable",
         }
     }
 
@@ -175,6 +185,11 @@ impl ConfigFault {
                 "outward queries are configured but no search backend is named, so there is \
                  nowhere to ask"
             }
+            ConfigFault::Unusable => {
+                "an outward source declares a cadence of zero seconds or a hand-over of zero \
+                 items: the first spins the loop and the second asks the backend for results \
+                 only to throw them away, so neither can be what its author meant"
+            }
         }
     }
 }
@@ -184,7 +199,7 @@ impl OutwardConfig {
     ///
     /// Fail-closed, like the other configuration-gated loops here: anything
     /// short of a complete list is not started, and the reason is returned
-    /// rather than swallowed, so the caller can record which of the five it was.
+    /// rather than swallowed, so the caller can record which of the six it was.
     pub fn from_env() -> Result<Self, ConfigFault> {
         let raw = std::env::var(QUERIES_ENV).ok();
         let base = std::env::var(SEARCH_BASE_ENV).ok();
@@ -198,7 +213,7 @@ impl OutwardConfig {
             .map(str::trim)
             .filter(|r| !r.is_empty())
             .ok_or(ConfigFault::Unset)?;
-        let mut sources: Vec<OutwardSource> =
+        let sources: Vec<OutwardSource> =
             serde_json::from_str(raw).map_err(|_| ConfigFault::Unparsable)?;
         if sources.is_empty() {
             return Err(ConfigFault::Empty);
@@ -212,9 +227,16 @@ impl OutwardConfig {
         {
             return Err(ConfigFault::Incomplete);
         }
-        for source in &mut sources {
-            source.cadence_secs = source.cadence_secs.max(60);
-            source.max_items = source.max_items.clamp(1, 20);
+        // 声明的值就是生效的值：这里不再把它们夹回区间。曾经 `max(60)` 与
+        // `clamp(1, 20)` 把部署写下的数悄悄换掉，读数面照旧报配置的样子，而跑的是
+        // 另一个数——同一个数在两边不一样，读的人只能靠猜。只剩两种值读不成任何
+        // 东西：0 秒的节奏是忙等，0 条的交接是「问完就扔」，都不是写它的人说得出口
+        // 的意思。
+        if sources
+            .iter()
+            .any(|s| s.cadence_secs == 0 || s.max_items == 0)
+        {
+            return Err(ConfigFault::Unusable);
         }
         let search_base = search_base
             .map(str::trim)
@@ -235,7 +257,10 @@ impl OutwardConfig {
             .map(|s| s.cadence_secs)
             .min()
             .unwrap_or(DEFAULT_CADENCE_SECS);
-        Duration::from_secs(least.max(60))
+        // 最短的那条声明就是节拍：解析时已经不再改写它，这里若再抬到 60 秒，
+        // 一条声明 5 秒的来源仍然只会在每分钟被看一眼——同一段改写只是换了个
+        // 位置。0 到不了这里：解析已经点名拒绝过。
+        Duration::from_secs(least)
     }
 
     /// How long the loop may sleep between wakes: its shortest source cadence,
@@ -506,16 +531,6 @@ pub const SOURCES_METRIC: &str = "cogneva_outward_sources_configured";
 
 pub(crate) const LABEL_SOURCE: &str = "source";
 
-/// The `items` cell that counts answer entries the backend ranked but which
-/// carried no http(s) URL, so nothing could be handed over from them.
-///
-/// Named once because two places decide it: `declare_source` seeds the cell at
-/// zero the moment a source is seen, and each pass adds to it. A spelling that
-/// moved in one place and not the other would leave the census declaring a cell
-/// no pass ever writes. It is not `FetchFault::Unparsable`, which is a `passes`
-/// cell: an answer that parsed and held cards is a pass that produced few items.
-pub(crate) const UNUSABLE_CELL: &str = "unusable";
-
 fn bump(map: &mut BTreeMap<String, BTreeMap<String, u64>>, source: &str, cell: &str, by: u64) {
     *map.entry(source.to_string())
         .or_default()
@@ -534,18 +549,17 @@ impl OutwardCensus {
         self.state.lock().await.config = Some((cell, sources));
     }
 
-    /// 这条源的四格结局从见到它那一刻起就存在，值可以是 0。
+    /// 这条源的三格结局从见到它那一刻起就存在，值可以是 0。
     ///
     /// 计数只在事情发生时加一，于是「一条也没交出去」与「这一格没接上」在读数面
     /// 上长得一样：两条都是序列缺席。外循环最要紧的那个问题恰好是前一种——它跑
-    /// 了、抓到了、却一条也没交出去——所以四格先落到 0，之后只往上加。
+    /// 了、抓到了、却一条也没交出去——所以三格先落到 0，之后只往上加。
     pub async fn declare_source(&self, source: &str) {
         let mut state = self.state.lock().await;
         for cell in [
             Handover::Handed.cell(),
             Handover::AlreadyHeld.cell(),
             Handover::Failed.cell(),
-            UNUSABLE_CELL,
         ] {
             bump(&mut state.items, source, cell, 0);
         }
@@ -606,6 +620,21 @@ impl Observable for OutwardCensus {
     }
 }
 
+/// 交接交出去的那一行：已经发生的事实（收件台上有一行）与还差的那一件（结局）。
+///
+/// 三格由这里一次写全——没有三格的任务进不了完成判，那一段只能拿一段编出来的
+/// 终态去判。
+fn handover_row(id: &str, goal: &str) -> Task {
+    Task::goal_row(id.to_string(), goal).with_cells(
+        format!(
+            "「{}」这条发现有一个结局：有人在任务账上把它做完、判失败或明确撤回",
+            goal.lines().next().unwrap_or(goal)
+        ),
+        "这条发现已经记在收件台上，还没有任务接走",
+        "缺接走它的人与它的结局",
+    )
+}
+
 /// What one item's handover ended in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Handover {
@@ -633,16 +662,53 @@ impl Handover {
 /// looked like it avoided. `get_task` is the cheap question; the id is what
 /// makes it answerable.
 async fn hand_over(
+    desk: Option<&Arc<dyn cog_core::EventStore>>,
     orchestrator: &Arc<dyn OrchestratorControl>,
     source: &OutwardSource,
     item: &OutwardItem,
 ) -> Handover {
+    // 先落收件台：入口只有一种写法（来源、外部身份、原文、因果父行），下游不必
+    // 知道它是从会话里说出来的还是检索找到的。落不进去不挡交接——交接是另一条
+    // 路，丢的是「这条发现被看见过」的那一行，而它会在 census 之外只留一条 warn。
+    if let Some(desk) = desk {
+        let row = IntentRow {
+            identity: format!("outward:{}", task_id_for(&item.url)),
+            source: source.name.clone(),
+            said_by: String::new(),
+            addressed_to: String::new(),
+            text: goal_for(source, item),
+            parent: Some(item.url.clone()),
+            session: None,
+            model_text: None,
+            at: chrono::Utc::now(),
+        };
+        if let Err(e) = desk.append(cog_core::intent_received_event(&row)).await {
+            warn!(
+                source = %source.name,
+                url = %item.url,
+                error = %e,
+                "outward: an item could not be recorded on the intent desk"
+            );
+        }
+    }
     let id = task_id_for(&item.url);
-    if orchestrator.get_task(&id).await.is_some() {
-        return Handover::AlreadyHeld;
+    // 读不到**不是**「没人拿着」：那一行可能还在图里。读失败这一拍不交，
+    // 按 Failed 记下、等下一次唤醒——否则一次库抖动会交出第二份同一 id 的目标（CC23）。
+    match orchestrator.get_task_checked(&id).await {
+        Ok(Some(_)) => return Handover::AlreadyHeld,
+        Ok(None) => {}
+        Err(e) => {
+            warn!(
+                source = %source.name,
+                url = %item.url,
+                error = %e,
+                "outward: could not read whether this item is already held; leaving it for the next wake"
+            );
+            return Handover::Failed;
+        }
     }
     let goal = goal_for(source, item);
-    let row = Task::goal_row(id.clone(), &goal);
+    let row = handover_row(&id, &goal);
     match orchestrator.submit_goal_auto(&goal, vec![row]).await {
         Ok(added) if added.is_empty() => {
             // The graph took nothing: another replica handed the same item over
@@ -669,7 +735,8 @@ async fn hand_over(
 /// rest. Three is enough for a refusal that is a collision or a momentary
 /// outage to clear, and bounded so that an item the goal path will never take
 /// stops costing a submission every five minutes for the rest of the day.
-// cap: bound — 一次交接被拒多是撞车或片刻不可用，下一两个唤醒就过去了；界设在「今天剩下的每一拍都再交一次」之前
+// cap: fixed — 一次交接被拒多是撞车或片刻不可用，下一两个唤醒就过去了；界设在「今天剩下的每一拍都再交一次」之前
+// keep: 删掉后一次被拒的交接要么不再交，要么今天剩下的每一拍都再交一次；由「下一两个唤醒就过去了」兜住
 const HANDOVER_ATTEMPTS: u32 = 3;
 
 /// An item whose hand-over failed, waiting for the next wake.
@@ -692,6 +759,7 @@ struct Retry {
 /// this pass found and what became of it" into a count of tries, and the pass
 /// reading beside it already says how often the source was asked.
 async fn drain_retries(
+    desk: Option<&Arc<dyn cog_core::EventStore>>,
     orchestrator: &Arc<dyn OrchestratorControl>,
     sources: &[OutwardSource],
     pending: &mut Vec<Retry>,
@@ -713,7 +781,7 @@ async fn drain_retries(
             );
             continue;
         };
-        let outcome = hand_over(orchestrator, source, &retry.item).await;
+        let outcome = hand_over(desk, orchestrator, source, &retry.item).await;
         if outcome == Handover::Failed && retry.attempts + 1 < HANDOVER_ATTEMPTS {
             retry.attempts += 1;
             still.push(retry);
@@ -736,6 +804,7 @@ pub fn spawn_outward_loop(
     shutdown: ShutdownSignal,
     config: OutwardConfig,
     census: Arc<OutwardCensus>,
+    intents: Option<Arc<dyn cog_core::EventStore>>,
 ) {
     let period = config.period();
     let wake = config.wake_interval();
@@ -762,6 +831,7 @@ pub fn spawn_outward_loop(
             let sources = sources.clone();
             let base = base.clone();
             let census = census.clone();
+            let intents = intents.clone();
             async move {
                 // Only one replica asks and hands over at a time. The ids would
                 // make a second replica's work harmless, but the reads and the
@@ -795,7 +865,14 @@ pub fn spawn_outward_loop(
                     if !hold.may_act().await {
                         continue;
                     }
-                    drain_retries(&orchestrator, &sources, &mut pending, &census).await;
+                    drain_retries(
+                        intents.as_ref(),
+                        &orchestrator,
+                        &sources,
+                        &mut pending,
+                        &census,
+                    )
+                    .await;
                     let now = Instant::now();
                     for (index, (source, due)) in
                         sources.iter().zip(next_due.iter_mut()).enumerate()
@@ -811,11 +888,9 @@ pub fn spawn_outward_loop(
                                 tick.fault.map(FetchFault::cell).unwrap_or("ok"),
                             )
                             .await;
-                        census
-                            .record_items(&source.name, UNUSABLE_CELL, tick.unusable as u64)
-                            .await;
                         for item in &tick.items {
-                            let outcome = hand_over(&orchestrator, source, item).await;
+                            let outcome =
+                                hand_over(intents.as_ref(), &orchestrator, source, item).await;
                             if outcome == Handover::Failed && HANDOVER_ATTEMPTS > 1 {
                                 pending.push(Retry {
                                     source: index,
@@ -940,6 +1015,41 @@ mod tests {
         assert_eq!(ok.sources[0].max_items, DEFAULT_MAX_ITEMS);
     }
 
+    /// A number the deployment states is the number in force.
+    ///
+    /// It used to be clamped back into a range on the way in: a source asking
+    /// for a five-second cadence or fifty items was run at sixty seconds and
+    /// twenty, and the configuration line still read as written. A zero is the
+    /// one value that cannot mean anything -- no interval at all, or results
+    /// asked for and thrown away -- so it is refused by name instead.
+    #[test]
+    fn a_declared_cadence_and_handover_survive_resolution() {
+        let declared = OutwardConfig::resolve(
+            Some(r#"[{"name":"a","query":"b","cadence_secs":5,"max_items":50}]"#),
+            Some("http://s"),
+        )
+        .expect("a complete configuration with values this loop can run");
+        assert_eq!(declared.sources[0].cadence_secs, 5);
+        assert_eq!(declared.sources[0].max_items, 50);
+        assert_eq!(
+            declared.period(),
+            Duration::from_secs(5),
+            "最短的那条声明就是 ticker 的节拍：解析之后还有一层把它抬到 60 秒，\
+             声明的 5 秒在跑起来之后一样不存在"
+        );
+
+        for raw in [
+            r#"[{"name":"a","query":"b","cadence_secs":0}]"#,
+            r#"[{"name":"a","query":"b","max_items":0}]"#,
+        ] {
+            assert_eq!(
+                OutwardConfig::resolve(Some(raw), Some("http://s")),
+                Err(ConfigFault::Unusable),
+                "{raw} 是两种读不成任何东西的值之一，必须点名拒绝而不是被悄悄换成别的数"
+            );
+        }
+    }
+
     #[test]
     fn every_refusal_has_its_own_cell_and_a_reason() {
         let cells: Vec<&str> = [
@@ -948,6 +1058,7 @@ mod tests {
             ConfigFault::Empty,
             ConfigFault::Incomplete,
             ConfigFault::NoEndpoint,
+            ConfigFault::Unusable,
         ]
         .iter()
         .map(|f| f.cell())
@@ -1054,6 +1165,7 @@ mod tests {
             ShutdownSignal::new(),
             config,
             Arc::new(OutwardCensus::new()),
+            None,
         );
         // Let the loop reach its first wait before moving the clock: a ticker
         // created after the clock moved would be one full wake later.
@@ -1133,6 +1245,64 @@ mod tests {
         /// How many more submissions to refuse before the graph starts taking
         /// them: a refusal that passes, which is what the retry is for.
         refusals_left: StdMutex<usize>,
+    }
+
+    /// 收件台的替身：只把交给它的行记下来。
+    #[derive(Default)]
+    struct RecordingDesk(StdMutex<Vec<IntentRow>>);
+
+    #[async_trait]
+    impl cog_core::EventStore for RecordingDesk {
+        fn writer(&self) -> &str {
+            "outward-probe"
+        }
+        fn next_event_id(&self) -> String {
+            format!("R{}", self.0.lock().unwrap().len())
+        }
+        async fn append(&self, event: cog_core::FactEvent) -> SFResult<()> {
+            if let cog_core::EventPayload::IntentRecorded(row) = event.payload {
+                self.0.lock().unwrap().push(row);
+            }
+            Ok(())
+        }
+    }
+
+    /// 检索到的那一条也走同一个入口：来源、外部身份、原文、因果父行。
+    /// 身份与目标路径用的是同一个 id——收件台与图问的是同一条身份。
+    #[tokio::test]
+    async fn an_item_found_outside_lands_on_the_same_intent_desk() {
+        let recording = Arc::new(RecordingDesk::default());
+        let desk: Arc<dyn cog_core::EventStore> = recording.clone();
+        let orchestrator: Arc<dyn OrchestratorControl> =
+            Arc::new(RememberingOrchestrator::default());
+        let source = OutwardSource {
+            name: "ai-news".into(),
+            query: "new inference kernels".into(),
+            ..Default::default()
+        };
+        let item = OutwardItem {
+            url: "https://example.com/paper".into(),
+            title: "A faster kernel".into(),
+            excerpt: "measured on two cards".into(),
+        };
+
+        let first = hand_over(Some(&desk), &orchestrator, &source, &item).await;
+        assert_eq!(first, Handover::Handed);
+        // 重放同一页：图说「已经拿着了」，而收件台照样收到同一个身份——
+        // 「收到过没有」由库的幂等键回答，不由这里的调用次数回答。
+        let again = hand_over(Some(&desk), &orchestrator, &source, &item).await;
+        assert_eq!(again, Handover::AlreadyHeld);
+
+        let rows = recording.0.lock().unwrap();
+        assert_eq!(rows.len(), 2, "每一次发现都该落一行：{rows:?}");
+        assert_eq!(rows[0].source, "ai-news");
+        assert_eq!(rows[0].identity, rows[1].identity);
+        assert_eq!(
+            rows[0].identity,
+            format!("outward:{}", task_id_for(&item.url))
+        );
+        assert!(rows[0].text.contains("https://example.com/paper"));
+        assert_eq!(rows[0].parent.as_deref(), Some(item.url.as_str()));
     }
 
     impl RememberingOrchestrator {
@@ -1258,6 +1428,19 @@ mod tests {
         }
     }
 
+    /// 交接行带着三格：事实在「现在」，缺的结局在「差距」。
+    #[test]
+    fn a_handover_row_carries_the_fact_and_the_missing_ending() {
+        use cog_core::contract::ledger_item::LedgerState;
+        let row = handover_row("outward:https://x/1", "某条发现");
+        let item = row.ledger_item().expect("三格在任务的一等字段上");
+        assert_eq!(item.id, "outward:https://x/1");
+        assert_eq!(item.state, LedgerState::Open);
+        assert!(item.terminal.contains("结局"), "{}", item.terminal);
+        assert!(item.now.contains("收件台"), "{}", item.now);
+        assert!(item.gap.contains("接走"), "{}", item.gap);
+    }
+
     #[tokio::test]
     async fn an_item_is_handed_over_once_and_a_second_pass_asks_the_graph_not_the_planner() {
         let orchestrator = Arc::new(RememberingOrchestrator::default());
@@ -1273,9 +1456,12 @@ mod tests {
             excerpt: "c".into(),
         };
 
-        assert_eq!(hand_over(&control, &source, &item).await, Handover::Handed);
         assert_eq!(
-            hand_over(&control, &source, &item).await,
+            hand_over(None, &control, &source, &item).await,
+            Handover::Handed
+        );
+        assert_eq!(
+            hand_over(None, &control, &source, &item).await,
             Handover::AlreadyHeld
         );
         // The second pass never reached the submission path: the graph answered
@@ -1326,14 +1512,14 @@ mod tests {
             attempts: 1,
         }];
 
-        drain_retries(&control, &sources, &mut pending, &census).await;
+        drain_retries(None, &control, &sources, &mut pending, &census).await;
         assert_eq!(pending.len(), 1, "被拒的那一条留在队里等下一拍");
         assert!(
             census_items(&census).await.is_empty(),
             "还没定局的东西不记进 items：这一格数的是发现的下场，不是尝试次数"
         );
 
-        drain_retries(&control, &sources, &mut pending, &census).await;
+        drain_retries(None, &control, &sources, &mut pending, &census).await;
         assert!(pending.is_empty());
         assert_eq!(
             census_items(&census).await,
@@ -1344,7 +1530,7 @@ mod tests {
     /// 一条也没交出去，读数要说 0，而不是整条缺席。
     ///
     /// 缺席的序列与「跑了一整天、一条都没交出去」在面板上是同一片空白，而后者
-    /// 正是外循环要回答的问题。四格在见到源的那一刻就落到 0。
+    /// 正是外循环要回答的问题。三格在见到源的那一刻就落到 0。
     #[tokio::test]
     async fn a_source_that_handed_nothing_reads_zero_rather_than_nothing() {
         let census = OutwardCensus::new();
@@ -1358,9 +1544,8 @@ mod tests {
                 ("rust".to_string(), "already_held".to_string(), 0.0),
                 ("rust".to_string(), "failed".to_string(), 0.0),
                 ("rust".to_string(), "handed".to_string(), 0.0),
-                ("rust".to_string(), "unusable".to_string(), 0.0),
             ],
-            "四格先落到 0：读者要能分清「一条都没交出去」与「这一格没接上」"
+            "三格先落到 0：读者要能分清「一条都没交出去」与「这一格没接上」"
         );
 
         census.record_items("rust", "handed", 1).await;
@@ -1394,7 +1579,7 @@ mod tests {
         }];
 
         for _ in 0..HANDOVER_ATTEMPTS {
-            drain_retries(&control, &sources, &mut pending, &census).await;
+            drain_retries(None, &control, &sources, &mut pending, &census).await;
         }
         assert!(pending.is_empty(), "给过的尝试次数用完就不再占着队");
         assert_eq!(
@@ -1414,29 +1599,55 @@ mod tests {
         census.record_items("rust", "failed", 1).await;
 
         let metrics = census.collect_metrics("").await.expect("a reading");
-        let find = |name: &str, source: Option<&str>, result: Option<&str>| -> Option<f64> {
-            metrics
-                .iter()
-                .find(|m| {
-                    m.name == name
-                        && source.is_none_or(|s| {
-                            m.labels.get(LABEL_SOURCE).map(String::as_str) == Some(s)
-                        })
-                        && result.is_none_or(|r| {
-                            m.labels.get(crate::LABEL_RESULT).map(String::as_str) == Some(r)
-                        })
-                })
-                .map(|m| m.value)
-        };
-        assert_eq!(find(PASSES_METRIC, Some("rust"), Some("ok")), Some(1.0));
         assert_eq!(
-            find(PASSES_METRIC, Some("rust"), Some("http_error")),
+            metric_value(&metrics, PASSES_METRIC, Some("rust"), Some("ok")),
             Some(1.0)
         );
-        assert_eq!(find(ITEMS_METRIC, Some("rust"), Some("handed")), Some(2.0));
-        assert_eq!(find(ITEMS_METRIC, Some("rust"), Some("already_held")), None);
-        assert_eq!(find(CONFIG_METRIC, None, Some("ok")), Some(1.0));
-        assert_eq!(find(SOURCES_METRIC, None, None), Some(2.0));
+        assert_eq!(
+            metric_value(&metrics, PASSES_METRIC, Some("rust"), Some("http_error")),
+            Some(1.0)
+        );
+        assert_eq!(
+            metric_value(&metrics, ITEMS_METRIC, Some("rust"), Some("handed")),
+            Some(2.0)
+        );
+        assert_eq!(
+            metric_value(&metrics, ITEMS_METRIC, Some("rust"), Some("already_held")),
+            None
+        );
+        assert_eq!(
+            metric_value(&metrics, CONFIG_METRIC, None, Some("ok")),
+            Some(1.0)
+        );
+        assert_eq!(
+            metric_value(&metrics, SOURCES_METRIC, None, None),
+            Some(2.0)
+        );
+    }
+
+    /// The value of the one series a reader is asking about.
+    ///
+    /// `source` and `result` are optional because two of the four readings are
+    /// published without them. `None` there means "do not constrain on this
+    /// label", not "match an empty value": a call that omits one must not be
+    /// satisfied by a series that happens to carry an empty label.
+    fn metric_value(
+        metrics: &[RawMetric],
+        name: &str,
+        source: Option<&str>,
+        result: Option<&str>,
+    ) -> Option<f64> {
+        metrics
+            .iter()
+            .find(|m| {
+                m.name == name
+                    && source
+                        .is_none_or(|s| m.labels.get(LABEL_SOURCE).map(String::as_str) == Some(s))
+                    && result.is_none_or(|r| {
+                        m.labels.get(crate::LABEL_RESULT).map(String::as_str) == Some(r)
+                    })
+            })
+            .map(|m| m.value)
     }
 
     #[test]

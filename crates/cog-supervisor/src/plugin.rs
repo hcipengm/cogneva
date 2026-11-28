@@ -73,28 +73,36 @@ impl SupervisorPlugin {
     /// gate and a Redis URL (the gateway publishes the pool snapshot there);
     /// without Redis this is a single-process deployment, so the loop is not
     /// started and the gate stays under operator control only.
-    fn spawn_llm_pool_guard(&self, ctx: &cog_core::PluginContext) {
+    fn spawn_llm_pool_guard(&self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
         let (Some(gate), Some(source)) = (self.scheduler_gate.clone(), self.pool_source.clone())
         else {
-            return;
+            return Ok(());
         };
         let Some(event_tx) =
             ctx.consume::<tokio::sync::broadcast::Sender<cog_core::SupervisorEvent>>()
         else {
             warn!("LLM pool guard disabled: no SupervisorEvent sender published");
-            return;
+            return Ok(());
         };
         let interval_secs = std::env::var(cog_core::env::LLM_POOL_CHECK_SECS)
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(30)
-            .max(5);
+            .unwrap_or(30);
+        // 声明的节拍原样生效：0 秒是忙等不是节拍，按名字拒绝；与网关读同一个
+        // env 名的那个循环同一条口径——两处不再各抬一次（从前是 5 秒）。
+        if interval_secs == 0 {
+            return Err(cog_core::SFError::Config(format!(
+                "{} 声明为 0 秒：那是忙等，不是一个节拍。给它一个周期。",
+                cog_core::env::LLM_POOL_CHECK_SECS
+            )));
+        }
         let guard = Arc::new(crate::llm_pool_guard::LlmPoolGuard::new(source, gate));
         guard.spawn(
             (*event_tx).clone(),
             std::time::Duration::from_secs(interval_secs),
         );
         info!(interval_secs, "LLM pool guard started");
+        Ok(())
     }
 }
 
@@ -110,17 +118,17 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
         }
 
         // Snapshot config values to drop immutable borrow before publishing.
-        let (
-            supervisor_config,
-            _observability_event_channel_capacity,
-            alert_history_max,
-            dag_executor_workspace_id,
-        ) = {
+        // 告警环的深度从**解析后**的那一份取：配置里没写是 0，换回默认值这一步
+        // 在 `from_core` 里，绕过它去读原始字段就是把环建成零深。
+        let (supervisor_config, alert_history_max, dag_executor_workspace_id) = {
             let config = ctx.config();
-            (
+            let supervisor_config = crate::SupervisorConfig::from_core(
                 config.supervisor.clone(),
-                config.system.observability_event_channel_capacity,
-                config.supervisor.alert_history_max,
+                config.agent.heartbeat_interval_secs,
+            );
+            (
+                supervisor_config.clone(),
+                supervisor_config.alert_history_max,
                 config.dag_executor.workspace_id.clone(),
             )
         };
@@ -163,7 +171,7 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
 
         // ── Build supervisor ──
         let (supervisor_config_tx, supervisor_config_rx) =
-            tokio::sync::watch::channel(supervisor_config.clone().into());
+            tokio::sync::watch::channel(supervisor_config.clone());
 
         let scheduler_gate = Arc::new(crate::SchedulerGate::new());
 
@@ -175,7 +183,7 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
         let metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
 
         let mut supervisor = crate::Supervisor::new(
-            supervisor_config.into(),
+            supervisor_config,
             supervisor_registry.clone(),
             state_backend.clone(),
             supervisor_orchestrator,
@@ -218,7 +226,7 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
         let alert_stop = ctx
             .consume::<cog_core::ShutdownSignal>()
             .map(|s| (*s).clone())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         drop(cog_core::loop_health::spawn(
             ALERT_STORE_LOOP,
             cog_core::loop_health::Cadence::EventDriven,
@@ -283,7 +291,7 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
         let handle = tokio::spawn(async move {
             supervisor
                 .run(async move {
-                    shutdown_rx.await.ok();
+                    cog_core::ignore_lost!(shutdown_rx.await);
                 })
                 .await;
             info!("Supervisor task exited");
@@ -295,7 +303,7 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
         // ── LLM upstream pool awareness ──
         // Pool health is owned by the security gateway; this loop reads its
         // cross-process snapshot and pauses only the LLM-dependent class.
-        self.spawn_llm_pool_guard(ctx);
+        self.spawn_llm_pool_guard(ctx)?;
 
         // ── Multi-backend consumer ──
         let mbc = ctx.config().multi_backend_consumer.clone();
@@ -315,12 +323,11 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
                 if let Some(event_tx) =
                     ctx.consume::<tokio::sync::broadcast::Sender<cog_core::AgentEvent>>()
                 {
-                    let consumer = crate::MultiBackendEventConsumer::new(
+                    let consumer = crate::MultiBackendEventConsumer::from_config(
                         backend.clone(),
                         (*event_tx).clone(),
-                        &mbc.channel,
-                    )
-                    .with_retry_interval(mbc.retry_interval_secs);
+                        &mbc,
+                    );
                     info!(
                         events_on_bus = mbc.events_on_bus,
                         "MultiBackendEventConsumer started"
@@ -339,7 +346,7 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
 
     async fn shutdown(&self) -> cog_core::SFResult<()> {
         if let Some(tx) = self.shutdown_tx.lock().await.take() {
-            let _ = tx.send(());
+            cog_core::ignore_lost!(tx.send(()));
         }
         if let Some(handle) = self.task_handle.lock().await.take() {
             if let Err(e) = handle.await {

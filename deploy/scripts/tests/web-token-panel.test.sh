@@ -824,6 +824,23 @@ sed -i 's/没有写过的缓存读不回来/上游这一格可能不逐次报/' 
 confirm "${work}/web/src/observability/usageRows.ts" "上游这一格可能不逐次报"
 expect_red "没说矛盾" "没有把「写了 0、读了 N」判成互相矛盾"
 
+# 48. 原生 title 回来了，但前面先挂了个箭头函数：`onClick={() => {}}` 里的 `>` 是
+#     箭头、不是标签结束，可旧版回退时按「中间有 `>`」提前放弃了，这一处 title=
+#     于是被当成「不是属性」静静放过。判的是标签结构，不是两个位置之间的字符。
+fixture
+sed -i 's|<span>{pace ??|<span onClick={() => {}} title="读数来自折叠账">{pace ??|' \
+  "${work}/web/src/overlay/TokenPanel.tsx"
+confirm "${work}/web/src/overlay/TokenPanel.tsx" 'onClick={() => {}} title='
+expect_red "箭头函数挡住了 title=" "DOM 元素上又出现了原生 title="
+
+# 49. 反向：组件自己的 title 参数跟着一个箭头函数，仍然不是提示框。门若因为多了
+#     一个 `>` 就把可见标题也判红，它只会被关掉，原生 title 反而回来得更快。
+fixture
+sed -i 's|<Note text="四格合起来才是唯一的一行">|<Note onClick={() => {}} title="四格">|' \
+  "${work}/web/src/overlay/TokenPanel.tsx"
+confirm "${work}/web/src/overlay/TokenPanel.tsx" '<Note onClick={() => {}} title="四格">'
+expect_green "大写标签的 title 不算提示框"
+
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0
 bash "${checker}" "${repo}" >"${work}/real.out" 2>&1 || got=$?

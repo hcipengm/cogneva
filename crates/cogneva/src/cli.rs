@@ -21,6 +21,46 @@ pub enum Command {
     HealthCheck,
     SecurityGateway,
     SandboxExecutor,
+    /// 2.1–2.4 的入口：把 2.5 的假清单变成一次生成请求。
+    BatchEdit,
+    /// 照着流重建一段会话的 `chat_turns`。
+    ChatRebuild,
+    RosterRebuild,
+    /// 把超出保留期的可观测事件搬进对象存储、核对后删热副本。
+    ArchiveEvents,
+    /// 签名钥匙的生命周期：list/issue/rotate/revoke。
+    Keys,
+    /// 表与流的分工：普查的分类计数与旧主存清单。
+    TableCensus,
+    /// 评估判词与最终结局的分歧率。
+    ChangeDivergence,
+    /// 变更账与流逐格比对（`--project` 先增量重折）：空的输出就是「表是流的一份
+    /// 投影」的证据。
+    ChangeLedgerParity,
+    /// 窗口里每一次没命中按为什么没命中分类计数（前缀断在哪一格／接得上却没命中）。
+    CacheMisses,
+    /// 这一批要跑哪些格、哪些可以复用（给宿主脚本决定怎么调 cargo）。
+    CellPlan,
+    BuildPlans,
+    /// 每条变更此刻的落地状态，从流上读（文件只是缓存）。
+    LandingStates,
+    /// 一张表的逐行内容摘要（迁移前后对照用）。
+    TableDigest,
+    /// 两张表逐行对照（迁移前后/双写两侧）。
+    TableDiff,
+    /// 把一张表搬到另一张：可中断、可从任意一点接着做（水位就是目标表的主键）。
+    TableCopy,
+    /// 换表走到第几段、能不能往下一段走（判据是这一刻的逐行对照）。
+    TableSwap,
+    /// 库自己那几格读数（体积、事务、临时文件、死锁）。
+    DbPressure,
+    /// 四条压力读数装成一次判词：存储还跟不跟得上，该不该前移写入口。
+    StoragePressure,
+    /// 用量行与事件流在同一窗口里的逐项对照（停写行之前盯它）。
+    UsageParity,
+    BatchPlan,
+    /// 五格台账的读法与批次规则：`cogneva ledger status`。
+    Ledger,
     VolumeWalker,
     HostLedger,
     ProcessCensus,
@@ -32,6 +72,9 @@ pub enum Command {
     Backup,
     Restore,
     BackupDrill,
+    RebuildMetricProjections,
+    ImportChangeRecords,
+    ExportChangeDiff,
     RepairAof,
     EvalTable,
     EvalCaseSubset,
@@ -39,12 +82,13 @@ pub enum Command {
     WriteRole,
     Governance,
     Work,
+    Principles,
     WindowsService,
 }
 
 /// Subcommands, in the order they appear in [`USAGE`]. A command added here but
 /// not documented fails the usage test.
-const SUBCOMMANDS: [(&str, Command); 20] = [
+const SUBCOMMANDS: [(&str, Command); 45] = [
     ("security-gateway", Command::SecurityGateway),
     ("sandbox-executor", Command::SandboxExecutor),
     ("volume-walker", Command::VolumeWalker),
@@ -58,6 +102,12 @@ const SUBCOMMANDS: [(&str, Command); 20] = [
     ("backup", Command::Backup),
     ("restore", Command::Restore),
     ("backup-drill", Command::BackupDrill),
+    (
+        "rebuild-metric-projections",
+        Command::RebuildMetricProjections,
+    ),
+    ("import-change-records", Command::ImportChangeRecords),
+    ("export-change-diff", Command::ExportChangeDiff),
     ("repair-aof", Command::RepairAof),
     ("eval-table", Command::EvalTable),
     ("eval-case-subset", Command::EvalCaseSubset),
@@ -65,6 +115,31 @@ const SUBCOMMANDS: [(&str, Command); 20] = [
     ("write-role", Command::WriteRole),
     ("governance", Command::Governance),
     ("work", Command::Work),
+    ("principles", Command::Principles),
+    // `batch-edit` 与 `batch-plan` 一直不在表里：枚举里有、分发里有，而 `parse` 查的是
+    // 这张表——于是「这条命令不存在」，而代码看起来写完了（2026-11-23 实测：`BatchEdit`
+    // 的 match 臂从加进来那天起没有一条命令能走到）。
+    ("batch-edit", Command::BatchEdit),
+    ("batch-plan", Command::BatchPlan),
+    ("chat-rebuild", Command::ChatRebuild),
+    ("roster-rebuild", Command::RosterRebuild),
+    ("archive-events", Command::ArchiveEvents),
+    ("keys", Command::Keys),
+    ("table-census", Command::TableCensus),
+    ("change-divergence", Command::ChangeDivergence),
+    ("change-ledger-parity", Command::ChangeLedgerParity),
+    ("cache-misses", Command::CacheMisses),
+    ("cell-plan", Command::CellPlan),
+    ("build-plans", Command::BuildPlans),
+    ("landing-states", Command::LandingStates),
+    ("table-digest", Command::TableDigest),
+    ("table-diff", Command::TableDiff),
+    ("table-copy", Command::TableCopy),
+    ("table-swap", Command::TableSwap),
+    ("db-pressure", Command::DbPressure),
+    ("storage-pressure", Command::StoragePressure),
+    ("usage-parity", Command::UsageParity),
+    ("ledger", Command::Ledger),
 ];
 
 /// Flags that take effect wherever they appear in the argument list.
@@ -95,6 +170,9 @@ const READ_ONLY_SUBCOMMANDS: &[Command] = &[
     Command::ValidateConfig,
     Command::HostLedger,
     Command::ClaimStore,
+    Command::BatchEdit,
+    Command::BatchPlan,
+    Command::Ledger,
     Command::VolumeWalker,
     Command::McpServe,
 ];
@@ -129,6 +207,19 @@ COMMANDS:
                            then drop it; --package names one in the retention window instead
                            of the newest, --also-unproven adds the package the window has
                            gone longest without proving
+    rebuild-metric-projections
+                           Rewrite the three metric accumulation tables from Prometheus,
+                           which is their source of truth; sets each row's `as_of` to the
+                           moment of the query. Needs COGNEVA_DATABASE_URL and
+                           COGNEVA_PROMETHEUS_URL
+    export-change-diff <id>
+                           Write one change's diff out of the queue, headed by the
+                           `event_id` it was exported from; needs COGNEVA_DATABASE_URL
+    import-change-records  Import the legacy <id>.json change records into the queue (the
+                           event stream) and delete the files; needs COGNEVA_DATABASE_URL
+                           and reads COGNEVA_EVOLUTION_CHANGE_DIR (default
+                           ./evolution-changes). Unreadable records are left in place and
+                           named, and the exit code is non-zero
     repair-aof <aof-dir>   Drop a torn tail from Redis' AOF files, then exit
     eval-table [OPTIONS]   Run the main comparison table (benchmarks x scaffolds x seeds)
                            against a pinned data root, then exit; --pins names the pins file
@@ -141,11 +232,18 @@ COMMANDS:
                            2 the ask could not be made, 3 no arbiter reading, 4 no pool
                            reading
     governance <SUB>       Read the face graph, print its verdict, write its projection,
-                           or import the roster; <SUB> is one of faces, drift,
-                           project, import-faces, progress
+                           or import a roster; <SUB> is one of faces, drift,
+                           project, import-faces, readings, drivers, fronts,
+                           progress and their import-* forms
     work <SUB> --unit <u>  Act on the tasks the graph assigns to one unit; <SUB> is one
                            of queue, claim, start, heartbeat, complete, fail, release,
                            inbox
+    principles <SUB>       Read the rules the platform's employees work by, and decide
+                           them; <SUB> is one of list, propose, approve, reject, retire
+    batch-edit             Turn the current edit verdict into one generation request
+    batch-plan             Write the plan for a batch of ledger rows read from stdin
+    ledger <SUB>           Read the five-cell ledger, say what the next step is, or
+                           open a round on it; <SUB> is one of status, next, open
 
     With no COMMAND the full application starts.
 

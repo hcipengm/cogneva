@@ -1,3 +1,4 @@
+// reads: prompts/*.yaml subject
 //! 声明的那句提示词和代码里的兜底，是同一句话的两份。
 //!
 //! 两条路会分岔而没有任何别的门看得见：代码这一路是测试跑的（每个用例都建不带提示词
@@ -110,7 +111,7 @@ async fn every_declared_prompt_is_the_text_the_code_falls_back_to() {
                 .expect("agent:default declares no instruction");
             let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
             for path in production_sources(root) {
-                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let text = std::fs::read_to_string(&path).unwrap_or(Default::default());
                 assert!(
                     !text.contains(opening),
                     "{} carries a second copy of the agent base instruction; \

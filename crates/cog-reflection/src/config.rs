@@ -105,16 +105,32 @@ pub struct PromotionGateConfig {
     pub gitops: GitOpsConfig,
 }
 
+/// 每 24 小时自动晋级几条：超出的排队。
+// cap: fixed — 由回退面（一天内出问题能回退到哪一版）与沙盒验证的吞吐定
+// keep: 删掉后一天之内可以推进任意多版，出问题能回退到哪一版变得没有答案；由「回退面与沙盒验证吞吐」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+const PROMOTION_QUOTA_PER_DAY: u32 = 3;
+
+/// 连续晋级后回滚几次触发熔断（转人工）。
+// cap: fixed — 由回滚的成因分布定：偶发一次是正常，连着两次同一类才是判据坏了
+// keep: 删掉后一次偶发回滚就停掉推进，正常变更被挡在外面；由「连着两次同一类才是判据坏了」兜住
+const ROLLBACK_BREAKER_THRESHOLD: u32 = 2;
+
+/// 连续沙盒验证失败几次触发熔断。
+// cap: fixed — 由沙盒环境的抖动率定：抖一次就停会把正常变更挡在外面
+// keep: 删掉后沙盒抖动一次就停，正常变更被挡在外面；由「抖一次是常态、连着来才是问题」兜住
+const FAILURE_BREAKER_THRESHOLD: u32 = 3;
+
 impl Default for PromotionGateConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             max_diff_lines: None,
-            quota_per_day: 3,
-            rollback_breaker_threshold: 2,
-            failure_breaker_threshold: 3,
-            soak_secs: 600,
-            awaiting_review_timeout_secs: 86_400,
+            quota_per_day: PROMOTION_QUOTA_PER_DAY,
+            rollback_breaker_threshold: ROLLBACK_BREAKER_THRESHOLD,
+            failure_breaker_threshold: FAILURE_BREAKER_THRESHOLD,
+            soak_secs: (10 * cog_core::day::SECONDS_PER_MINUTE) as u64,
+            awaiting_review_timeout_secs: cog_core::day::SECONDS_PER_DAY as u64,
             // 白名单故意收窄（宁严勿宽）：只有纯工具实现、前端、文档。
             // 未列出的路径一律按 L2 转人工。
             // `docs/` 是仓库内的外部/产品文档目录（可入库）；内部文档
@@ -163,7 +179,7 @@ impl Default for PromotionGateConfig {
                 .map(|s| s.to_string())
                 .collect(),
             trend_report_enabled: true,
-            trend_report_interval_secs: 604_800,
+            trend_report_interval_secs: cog_core::day::SECONDS_PER_WEEK as u64,
             gitops: GitOpsConfig::default(),
         }
     }
@@ -293,8 +309,23 @@ impl PromotionGateConfig {
         if let Some(v) = get("COGNEVA_GITOPS_GIT_USER_EMAIL") {
             g.git_user_email = v;
         }
+        // 声明的两条节拍原样生效。从前读侧把它们静默抬到 15 秒与 300 秒：配置面
+        // 写着 60，跑的却是 300，而没有任何一处说它被改写过。0 秒不是「越快越好」
+        // 的极端，是忙等，所以拒绝而不是替换成一个没人声明的数。
+        declared_cadence("gitops.poll_interval_secs", g.poll_interval_secs)?;
+        declared_cadence("gitops.canary_watch_secs", g.canary_watch_secs)?;
         Ok(())
     }
+}
+
+/// 一条声明的节拍只有两种归宿：原样用，或点名拒绝。
+pub(crate) fn declared_cadence(field: &str, secs: u64) -> SFResult<()> {
+    if secs == 0 {
+        return Err(SFError::Config(format!(
+            "{field} 为 0 秒：那是忙等，不是一个节拍。给它一个周期，或关掉这条循环。"
+        )));
+    }
+    Ok(())
 }
 
 /// 按变更一次的执行 Job：一次最多派几个、Job 自己的资源面与时限。
@@ -314,11 +345,12 @@ pub struct ChangeJobConfig {
     /// 一次最多同时派几个执行 Job。默认 1：与常驻进程里逐条处理的并发度相同，
     /// 也是命名空间配额在现状下容得下的数。值真的用来限并发派发——派满就等。
     pub max_parallel: usize,
-    /// 派发后等这个 Job 结束的上界（秒），同时就是 Job 的
-    /// `activeDeadlineSeconds`：两处必须是同一个数。等待比 Job 自己的上界长，
-    /// 等到的永远是「超时」；短了，会在 Job 还在写结果的时候走掉，把一次可能
-    /// 通过的执行读成「读不到结果」。默认值是算出来的：验证预算 3600 + 构建预算
-    /// 3600 + 构建闸门排队 1800 + 收尾 600。改那两个预算就要一起重算它。
+    /// 派发后等这个 Job 结束的上界（秒）。它**不是** Job 的期限：Job 里没有
+    /// `activeDeadlineSeconds`，死活由容器自己的存活探针按进度文件判（一步都不
+    /// 推进超过窗口才判死）。这个数只是派发方的耐心——等不到就先去干别的，下一
+    /// 轮再来看；Job 名是确定的，重新 apply 不会派重。默认值是算出来的：验证预算
+    /// 3600 + 构建预算 3600 + 构建闸门排队 1800 + 收尾 600。改那两个预算就要一起
+    /// 重算它。
     pub deadline_secs: u64,
     /// Job 结束后对象保留的时长（秒），供事后读日志与终止消息。
     pub ttl_secs_after_finished: u64,
@@ -344,14 +376,35 @@ pub struct ChangeJobConfig {
     pub kubectl_bin: String,
 }
 
+/// 派发方在 Job 结束之后还留给自己的收尾时间：读日志、记终止消息、清对象。
+// cap: fixed — 收尾那几步是分钟级的：十分钟够它跑完，再长只是白等
+// keep: 删掉后收尾几步没有上限，一轮执行可以停在删 Job 上；由「收尾是分钟级」兜住
+const CHANGE_JOB_TEARDOWN_SECS: u64 = 600;
+
+/// 同时派几个执行 Job：进程内那条路一次只跑一个构建，并发窗口只有派发这一侧
+/// 才有意义，而它受命名空间配额约束。
+// cap: fixed — 由命名空间 limits.cpu 的余量 ÷ 一个 Job 的请求量定
+// keep: 删掉后变更 Job 可以一起起，命名空间的 cpu 余量被一次吃完；由「余量 ÷ 一个 Job 的请求量」兜住
+const CHANGE_JOB_MAX_PARALLEL: usize = 1;
+
+/// 派发后多久看一次 Job 的状态：太密只是把同一个答案取回来。
+// cap: fixed — 由一次 Job 的最短执行时长定：轮询要短于它，又不能比它密一个量级
+// keep: 删掉后轮询要么比一次 Job 还密，要么比它稀一个量级；由「一次 Job 的最短执行时长」兜住
+const CHANGE_JOB_POLL_INTERVAL_SECS: u64 = 10;
+
 impl Default for ChangeJobConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            max_parallel: 1,
-            deadline_secs: 9600,
-            ttl_secs_after_finished: 86400,
-            poll_interval_secs: 10,
+            max_parallel: CHANGE_JOB_MAX_PARALLEL,
+            // 算出来的，不是挑的：验证预算 ＋ 构建预算 ＋ 构建闸门排队 ＋ 收尾。
+            // 四段里改任何一段，这个上界跟着改（见字段上的注释）。
+            deadline_secs: crate::promotion_eval::DEFAULT_EVAL_TIMEOUT_SECS
+                + crate::build_gate::SWITCH_FIELD_WAIT.as_secs()
+                + cog_core::config::BuildGateConfig::default().wait_secs
+                + CHANGE_JOB_TEARDOWN_SECS,
+            ttl_secs_after_finished: cog_core::day::SECONDS_PER_DAY as u64,
+            poll_interval_secs: CHANGE_JOB_POLL_INTERVAL_SECS,
             job_cpu_request: "500m".into(),
             job_memory_request: "2Gi".into(),
             job_cpu_limit: "2000m".into(),
@@ -391,6 +444,21 @@ impl ChangeJobConfig {
             Err(e) => return Err(SFError::Config(format!("{}: {e}", path.display()))),
         };
         cfg.apply_env_with(|k| std::env::var(k).ok())?;
+        if cfg.enabled {
+            // 声明了要派 Job，这两个数就是这份声明的执行面：0 秒是忙等，
+            // 0 个并发窗口等于一次也派不出去。读到它们的那一层从前各换成一个数，
+            // 声明的值与生效的值于是有两个。
+            declared_cadence(
+                "self_evolution.change_job.poll_interval_secs",
+                cfg.poll_interval_secs,
+            )?;
+            if cfg.max_parallel == 0 {
+                return Err(SFError::Config(
+                    "self_evolution.change_job.max_parallel 声明为 0：一次也派不出去的并发窗口不是一个窗口。至少给 1。"
+                        .into(),
+                ));
+            }
+        }
         Ok(cfg)
     }
 
@@ -516,8 +584,8 @@ impl Default for BaselinePortConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            poll_interval_secs: 3600,
-            retry_cooldown_secs: 86_400,
+            poll_interval_secs: cog_core::day::SECONDS_PER_HOUR as u64,
+            retry_cooldown_secs: cog_core::day::SECONDS_PER_DAY as u64,
         }
     }
 }
@@ -573,12 +641,14 @@ impl BaselinePortConfig {
 /// 它同时是「一份暂停最久能挂多久」的那一半：滚动侧等别人留下的 `paused` 时按
 /// 这个数算残渣，两个数必须同源，否则那边的界会比这边的看护还短，一次正在进行的
 /// 看护会被当成残渣 resume 掉。
-// cap: bound — 一次金丝雀最多看十分钟：更久只是在占用一次滚动的验证时间内不给结论
+// cap: fixed — 一次金丝雀最多看十分钟：更久只是在占用一次滚动的验证时间内不给结论
+// keep: 删掉后金丝雀没有看护窗口，要么不看结论就放、要么无限看下去；由「一次滚动的验证时间」兜住
 pub const DEFAULT_CANARY_WATCH_SECS: u64 = 600;
 
 /// 看护结束到滚动收场之间留的余量：resume/undo、全量滚动都在这段里做完。
 /// 与 [`DEFAULT_CANARY_WATCH_SECS`] 相加就是一份暂停的最长持有期。
-// cap: bound — 收场余量取看护窗口的一半：resume/undo 与一次全量滚动都在这段里做完
+// cap: fixed — 收场余量取看护窗口的一半：resume/undo 与一次全量滚动都在这段里做完
+// keep: 删掉后放行时 resume/undo 与全量滚动没有做完的余量，暂停状态被下一次操作打断；由「看护窗口的一半」兜住
 pub const CANARY_PAUSE_GRACE_SECS: u64 = 300;
 
 /// GitOps 分发配置（路线 B：推送端只推中央仓库，拉取端各自自治，
@@ -626,13 +696,30 @@ pub struct GitOpsConfig {
     pub git_user_email: String,
 }
 
+/// 金丝雀看护的判定倍数：错误率超过基线的这么多倍算回归。
+// cap: fixed — 由基线的抖动幅度定：倍数小于抖动，好版本会被判成回归
+// not-a-bound: 由基线的抖动幅度定：倍数小于抖动，好版本会被判成回归
+const CANARY_ERROR_RATE_MULTIPLIER: f64 = 1.5;
+
+// cap: fixed — 同上，按 P99 的抖动幅度定
+// keep: 删掉后金丝雀的 P99 与基线同一个数，正常抖动被读成回归；由「按 P99 的抖动幅度定」兜住
+const CANARY_P99_MULTIPLIER: f64 = 1.3;
+
+/// 累加计数器下，两次抓取之间至少要新增多少请求才允许对错误率下结论。
+///
+/// 这是算出来的：一版的错误率下限是 1%，要把 1% 与 0% 分开需要百量级样本，
+/// 而增量太小时一条 5xx 就能把比值抬到任意高。
+// cap: fixed — 由要分辨的最小错误率（1%）与置信所需的样本量定
+// keep: 删掉后几条请求就算出一个错误率，一次偶发错误被读成 100%；由「要分辨 1% 所需的样本量」兜住
+const CANARY_MIN_REQUESTS_FOR_RATE: f64 = 100.0;
+
 impl Default for GitOpsConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             repo_url: String::new(),
             branch: "evolution-release".into(),
-            poll_interval_secs: 120,
+            poll_interval_secs: (2 * cog_core::day::SECONDS_PER_MINUTE) as u64,
             registry: None,
             local_registry: String::new(),
             work_dir: cog_core::paths::app_path_str("gitops"),
@@ -642,9 +729,9 @@ impl Default for GitOpsConfig {
             deployment: cog_core::topology::MAIN_DEPLOYMENT.into(),
             container: cog_core::topology::MAIN_CONTAINER.into(),
             canary_watch_secs: DEFAULT_CANARY_WATCH_SECS,
-            canary_error_rate_multiplier: 1.5,
-            canary_p99_multiplier: 1.3,
-            canary_min_requests_for_rate: 100.0,
+            canary_error_rate_multiplier: CANARY_ERROR_RATE_MULTIPLIER,
+            canary_p99_multiplier: CANARY_P99_MULTIPLIER,
+            canary_min_requests_for_rate: CANARY_MIN_REQUESTS_FOR_RATE,
             puller_enabled: true,
             git_user_name: "Cogneva Self-Evolution".into(),
             git_user_email: "self-evolution@cogneva.ai".into(),
@@ -652,12 +739,26 @@ impl Default for GitOpsConfig {
     }
 }
 
+/// 一个滚动目标没写 `resource` 时的取值：滚动目标一开始全是 Deployment。
+fn deployment_resource() -> String {
+    "deployment".to_string()
+}
+
 /// 主线跟踪自动部署器的单个滚动目标。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RolloutTargetConfig {
-    /// Deployment 名（`kubectl set image deployment/<name>` 中的 name）。
+    /// 工作负载名（`kubectl set image <resource>/<name>` 中的 name）。
     pub deployment: String,
-    /// Deployment 内容器名。
+    /// 这个目标是什么工作负载，用 kubectl 认的资源词写（`deployment` /
+    /// `statefulset`）。以前这里是隐含的 `deployment`，直到沙箱执行器需要每副
+    /// 副本自己的卷：卷模板只有 StatefulSet 会建，而那一个词必须跟着目标走，
+    /// 不能由调用处各自拼——拼错的那一处不会报错，它只会 `NotFound`，读起来
+    /// 与「集群里没有这个对象」同形。
+    ///
+    /// 缺省是 `deployment`：配置文件里没写这一格的旧部署照旧能滚。
+    #[serde(default = "deployment_resource")]
+    pub resource: String,
+    /// 目标内容器名。
     pub container: String,
     /// Pod 标签 app.kubernetes.io/component（健康检查选择器用）。
     pub component: String,
@@ -705,7 +806,6 @@ pub struct UpstreamTrackConfig {
     #[serde(default)]
     pub api_base: Option<String>,
 }
-
 /// 主线跟踪自动部署器配置：进化 Pod 内常驻循环，检测集群内 bare 仓库
 /// （/host-git）公版 main 前进后，沙盒内增量构建 → buildah 叠层推集群内
 /// registry → 派独立 Job 门禁滚动四个 deployment，失败自动回滚。
@@ -729,9 +829,6 @@ pub struct MainlineDeployerConfig {
     /// 网关 git 透传根：上游 URL = `{base}/{platform}/{owner}/{repo}.git`，
     /// 凭证由网关在出口注入。空 = 不跟踪上游。
     pub git_proxy_base: String,
-    /// 单次上游 fetch 的超时（秒）。取的是网络往返的上界：网关到平台
-    /// 断了要能在一轮轮询内翻篇，不能把主循环挂在这里。
-    pub upstream_fetch_timeout_secs: u64,
     /// buildah 在进化 Pod 内 push/from 的 registry 端点（集群 DNS，http）：
     /// Pod 内可解析 svc 名，配合 --tls-verify=false。
     ///
@@ -754,8 +851,6 @@ pub struct MainlineDeployerConfig {
     pub kubectl_host_path: String,
     /// 状态/锁文件目录（sandbox PVC 上，跨重启持久）。
     pub state_dir: String,
-    /// 单次构建超时（秒），也是构建锁陈旧判定阈值。
-    pub build_timeout_secs: u64,
     /// cargo build --jobs 值（4C/7.5G 节点禁并发构建，默认 2）。
     pub cargo_build_jobs: u32,
     /// 四部署全部滚完后的 soak 观察窗（秒）。
@@ -838,16 +933,46 @@ pub struct MainlineDeployerConfig {
     pub registry_maintenance_cooldown_secs: u64,
 }
 
+/// registry 走查读取器监听的端口：node exporter 的约定口，走查按它抓同一个
+/// 读数，换端口等于换一个抓取方。
+// cap: fixed — node exporter 约定端口 9100
+// keep: 删掉后抓取端不知道自己该连哪个口，读数在部署里对不上；由「node exporter 约定端口 9100」兜住
+const REGISTRY_WALKER_PORT: u16 = 9100;
+
+/// 构建 Job 起几个 cargo 作业：这台构建机能同时跑几个线程就几个。
+///
+/// 构建是 CPU 密集的，作业数超过核数只会在同一台机器上互相抢；写死成 2 是
+/// 在替这台没量过的机器拍一个数。
+fn default_cargo_build_jobs() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1)
+}
+
+/// 新部署起来后被重启几次算「没起来」。
+// cap: fixed — 由启动期的探针节奏定：一次重启是滚动的常态，两次就是没起来
+// keep: 删掉后一次正常滚动重启就被读成没起来，主线被误停；由「一次是常态、两次是没起来」兜住
+const MAINLINE_RESTART_THRESHOLD: u32 = 1;
+
+/// 注册表里留多少个 rev：这是回退面的深度，不是磁盘容量。
+// cap: fixed — 由回退面要有多深定：真正的下界是 keep 集，这个数只管有多久的历史
+// keep: 删掉后历史没有深度，回退面只剩 keep 集，上一版一被替换就找不回来；由「回退面要有多深」兜住
+const REGISTRY_RETENTION: usize = 20;
+
+/// 回收在占用达到声明容量的这个比例时动手：规则在 1.0 开火，回收要走在它前面。
+// cap: fixed — 由告警规则的触发线定：它是那条线的一半，中间留一倍余量
+// keep: 删掉后维护的触发线与告警线重合，维护在告警之前没有余量可走；由「告警触发线的一半」兜住
+const REGISTRY_MAINTENANCE_THRESHOLD: f64 = 0.5;
+
 impl Default for MainlineDeployerConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            poll_interval_secs: 600,
+            poll_interval_secs: (10 * cog_core::day::SECONDS_PER_MINUTE) as u64,
             bare_repo: cog_core::paths::TREE_REPO.into(),
             branch: "main".into(),
             upstreams: Vec::new(),
             git_proxy_base: String::new(),
-            upstream_fetch_timeout_secs: 300,
             registry: String::new(),
             local_registry: String::new(),
             namespace: cog_core::topology::namespace(),
@@ -855,50 +980,57 @@ impl Default for MainlineDeployerConfig {
             kubectl_bin: "kubectl".into(),
             kubectl_host_path: String::new(),
             state_dir: cog_core::paths::app_path_str("sandbox/mainline"),
-            build_timeout_secs: 3600,
-            cargo_build_jobs: 2,
-            soak_secs: 120,
-            restart_threshold: 1,
-            failure_cooldown_secs: 3600,
-            rollout_timeout_secs: 300,
-            startup_timeout_secs: 900,
+            cargo_build_jobs: default_cargo_build_jobs(),
+            soak_secs: (2 * cog_core::day::SECONDS_PER_MINUTE) as u64,
+            restart_threshold: MAINLINE_RESTART_THRESHOLD,
+            failure_cooldown_secs: cog_core::day::SECONDS_PER_HOUR as u64,
+            rollout_timeout_secs: (5 * cog_core::day::SECONDS_PER_MINUTE) as u64,
+            startup_timeout_secs: (15 * cog_core::day::SECONDS_PER_MINUTE) as u64,
             job_cpu_request: "200m".into(),
             job_memory_request: "64Mi".into(),
             job_cpu_limit: "2".into(),
             job_memory_limit: "512Mi".into(),
-            heartbeat_log_secs: 3600,
+            heartbeat_log_secs: cog_core::day::SECONDS_PER_HOUR as u64,
             manifest_dir: "deploy/k3s".into(),
             deliver_manifests: true,
             observability_stack: ObservabilityStackConfig::default(),
-            registry_walker_port: 9100,
+            registry_walker_port: REGISTRY_WALKER_PORT,
             // 由 `COGNEVA_REGISTRY_CLAIM` 填（走查边车那条声明）；没声明就是不回收。
             registry_claim: String::new(),
             // 20 个 rev ≈ 20 次滚动的回退面，按每 rev 一层的叠层增量算约
             // 0.8 GB；比值本身不构成约束（10Gi 的卷装得下），定它的是"回退
             // 面要有多深"。真正的下界是 keep 集：在飞、上一版好、当前部署、
             // 仍被 Job 钉住的 rev 一律不删，与这个数无关。
-            registry_retention: 20,
+            registry_retention: REGISTRY_RETENTION,
             // 声明量的一半：规则 data_volume_over_declared_size 在 1.0 开火，
             // 回收在它之前把占用压回叠层基底的大小，中间留出一倍余量。
-            registry_maintenance_threshold: 0.5,
-            registry_maintenance_cooldown_secs: 21600,
+            registry_maintenance_threshold: REGISTRY_MAINTENANCE_THRESHOLD,
+            // cap: fixed — 维护环两趟之间的冷却：六小时是「一天最多四趟」的编制，不是按量伸缩的界
+            // keep: 删掉后维护环一天可以跑任意多趟，把 API 与日志刷满；由「一天最多四趟」兜住
+            registry_maintenance_cooldown_secs: 6 * cog_core::day::SECONDS_PER_HOUR as u64,
             targets: vec![
                 RolloutTargetConfig {
                     deployment: cog_core::topology::SECURITY_GATEWAY.into(),
+                    resource: deployment_resource(),
                     container: "security-gateway".into(),
                     component: cog_core::topology::COMPONENT_SECURITY_GATEWAY.into(),
                     name: cog_core::topology::WORKLOAD_NAME.into(),
                     manifest: Some("gateway-deployment.yaml".into()),
                 },
+                // 执行器是 StatefulSet：每副副本一块自己的卷，而卷模板只有
+                // StatefulSet 会建。它仍然是一个滚动目标——发布面按目标下发的
+                // 那份清单里就是 StatefulSet，`set image` 的回落路径也认这个词。
                 RolloutTargetConfig {
                     deployment: cog_core::topology::SANDBOX_EXECUTOR.into(),
+                    resource: "statefulset".into(),
                     container: "sandbox-executor".into(),
                     component: cog_core::topology::COMPONENT_SANDBOX_EXECUTOR.into(),
                     name: cog_core::topology::WORKLOAD_NAME.into(),
-                    manifest: Some("sandbox-executor-deployment.yaml".into()),
+                    manifest: Some("sandbox-executor-statefulset.yaml".into()),
                 },
                 RolloutTargetConfig {
                     deployment: cog_core::topology::MAIN_DEPLOYMENT.into(),
+                    resource: deployment_resource(),
                     container: cog_core::topology::MAIN_CONTAINER.into(),
                     component: cog_core::topology::COMPONENT_GATEWAY.into(),
                     name: cog_core::topology::WORKLOAD_NAME.into(),
@@ -906,6 +1038,7 @@ impl Default for MainlineDeployerConfig {
                 },
                 RolloutTargetConfig {
                     deployment: cog_core::topology::EVOLUTION.into(),
+                    resource: deployment_resource(),
                     container: cog_core::topology::MAIN_CONTAINER.into(),
                     component: cog_core::topology::COMPONENT_EVOLUTION.into(),
                     name: cog_core::topology::EVOLUTION.into(),
@@ -943,15 +1076,12 @@ pub struct ObservabilityStackConfig {
     /// `BACKENDS` 是同一个开关的两面：清单的处置表把这两个文件标成
     /// `backends`，两边都读它。
     pub backends: bool,
-    /// 单次 apply 的超时（秒）。
-    pub apply_timeout_secs: u64,
-    /// 一次收敛最多在告警消息里点名几个资源（其余折叠成计数，消息有界）。
-    pub max_named_resources: usize,
 }
 
 impl ObservabilityStackConfig {
     /// 间隔下限：低于它，一次 apply 还没落地就进下一轮，日志与 API 都被刷屏。
-    // cap: bound — 间隔下限：低于它，一次 apply 还没落地就进下一轮，日志与 API 都被刷屏
+    // cap: fixed — 间隔下限：低于它，一次 apply 还没落地就进下一轮，日志与 API 都被刷屏
+    // keep: 删掉后一轮 apply 还没落地就进下一轮，日志与 API 被刷屏；由「间隔下限」兜住
     pub const MIN_INTERVAL_SECS: u64 = 60;
 }
 
@@ -959,12 +1089,10 @@ impl Default for ObservabilityStackConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            interval_secs: 300,
+            interval_secs: (5 * cog_core::day::SECONDS_PER_MINUTE) as u64,
             manifest_dir: "deploy/k3s/observability/manifests".into(),
             namespace: "monitoring".into(),
             backends: true,
-            apply_timeout_secs: 120,
-            max_named_resources: 6,
         }
     }
 }
@@ -1068,6 +1196,10 @@ impl MainlineDeployerConfig {
         if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_POLL_INTERVAL_SECS", &get)? {
             self.poll_interval_secs = v;
         }
+        declared_cadence(
+            "self_evolution.mainline_deployer.poll_interval_secs",
+            self.poll_interval_secs,
+        )?;
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_BARE_REPO") {
             self.bare_repo = v;
         }
@@ -1076,12 +1208,6 @@ impl MainlineDeployerConfig {
         }
         if let Some(v) = get(cog_core::env::GIT_PROXY_BASE) {
             self.git_proxy_base = v;
-        }
-        if let Some(v) = knob(
-            "COGNEVA_MAINLINE_DEPLOYER_UPSTREAM_FETCH_TIMEOUT_SECS",
-            &get,
-        )? {
-            self.upstream_fetch_timeout_secs = v;
         }
         if let Some(v) = get(REGISTRY_ENV) {
             self.registry = v;
@@ -1094,9 +1220,6 @@ impl MainlineDeployerConfig {
         }
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_STATE_DIR") {
             self.state_dir = v;
-        }
-        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_BUILD_TIMEOUT_SECS", &get)? {
-            self.build_timeout_secs = v;
         }
         if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_CARGO_BUILD_JOBS", &get)? {
             self.cargo_build_jobs = v;
@@ -1151,12 +1274,6 @@ impl MainlineDeployerConfig {
         }
         if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_STACK_BACKENDS", &get)? {
             self.observability_stack.backends = v;
-        }
-        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_STACK_APPLY_TIMEOUT_SECS", &get)? {
-            self.observability_stack.apply_timeout_secs = v;
-        }
-        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_STACK_MAX_NAMED_RESOURCES", &get)? {
-            self.observability_stack.max_named_resources = v;
         }
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_BUILDER_BIN") {
             self.builder_bin = v;
@@ -1237,7 +1354,7 @@ mod tests {
         assert!(!cfg.enabled);
         assert_eq!(cfg.poll_interval_secs, 120);
         assert_eq!(cfg.retry_cooldown_secs, 86_400);
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     #[test]
@@ -1276,8 +1393,6 @@ mod tests {
             ),
             ("COGNEVA_MAINLINE_DEPLOYER_STACK_NAMESPACE", "mon"),
             ("COGNEVA_MAINLINE_DEPLOYER_STACK_BACKENDS", "false"),
-            ("COGNEVA_MAINLINE_DEPLOYER_STACK_APPLY_TIMEOUT_SECS", "45"),
-            ("COGNEVA_MAINLINE_DEPLOYER_STACK_MAX_NAMED_RESOURCES", "3"),
         ]
         .into_iter()
         .collect();
@@ -1290,8 +1405,6 @@ mod tests {
         assert_eq!(stack.manifest_dir, "deploy/other");
         assert_eq!(stack.namespace, "mon");
         assert!(!stack.backends);
-        assert_eq!(stack.apply_timeout_secs, 45);
-        assert_eq!(stack.max_named_resources, 3);
 
         let bad: HashMap<&str, &str> = [("COGNEVA_MAINLINE_DEPLOYER_STACK_INTERVAL_SECS", "soon")]
             .into_iter()
@@ -1336,7 +1449,7 @@ mod tests {
         let cfg = MainlineDeployerConfig::load_from(&path).unwrap();
         assert_eq!(cfg.upstreams.len(), 1);
         assert_eq!(cfg.upstreams[0].repo, "x/y");
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// 关掉或没配 repo 的平台不进跟踪列表：那表示这台部署不跟这一端，
@@ -1415,7 +1528,7 @@ mod tests {
         assert_eq!(cfg.gitops.poll_interval_secs, 30);
         // 段内未写的字段保持默认
         assert_eq!(cfg.gitops.branch, "evolution-release");
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     #[test]
@@ -1426,7 +1539,7 @@ mod tests {
         std::fs::write(&path, r#"{"self_evolution": {"enabled": true}}"#).unwrap();
         let cfg = PromotionGateConfig::load_from(&path).unwrap();
         assert!(!cfg.enabled);
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     #[test]
@@ -1440,7 +1553,7 @@ mod tests {
         )
         .unwrap();
         assert!(PromotionGateConfig::load_from(&path).is_err());
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     #[test]
@@ -1470,6 +1583,78 @@ mod tests {
         assert_eq!(cfg.gitops.registry.as_deref(), Some("localhost"));
         assert!(!cfg.gitops.puller_enabled);
         assert!((cfg.gitops.canary_p99_multiplier - 1.9).abs() < f64::EPSILON);
+    }
+
+    /// 声明的节拍只有两种归宿：原样用，或点名拒绝 0。
+    #[test]
+    fn only_zero_is_refused_as_a_cadence() {
+        assert!(declared_cadence("x", 1).is_ok());
+        let refused = declared_cadence("x", 0).expect_err("0 秒是忙等");
+        assert!(refused.to_string().contains('x'), "{refused}");
+    }
+
+    /// 声明的 10 秒 / 45 秒原样落到配置上（从前读侧换成 15 秒与 300 秒），
+    /// 0 秒被点名拒绝。
+    #[test]
+    fn a_declared_gitops_cadence_survives_and_zero_is_refused() {
+        let env: HashMap<&str, &str> = [
+            ("COGNEVA_GITOPS_POLL_INTERVAL_SECS", "10"),
+            ("COGNEVA_GITOPS_CANARY_WATCH_SECS", "45"),
+        ]
+        .into_iter()
+        .collect();
+        let mut cfg = PromotionGateConfig::default();
+        cfg.apply_env_with(|k| env.get(k).map(|s| s.to_string()))
+            .unwrap();
+        assert_eq!(cfg.gitops.poll_interval_secs, 10);
+        assert_eq!(cfg.gitops.canary_watch_secs, 45);
+
+        for (key, field) in [
+            (
+                "COGNEVA_GITOPS_POLL_INTERVAL_SECS",
+                "gitops.poll_interval_secs",
+            ),
+            (
+                "COGNEVA_GITOPS_CANARY_WATCH_SECS",
+                "gitops.canary_watch_secs",
+            ),
+        ] {
+            let env: HashMap<&str, &str> = [(key, "0")].into_iter().collect();
+            let mut cfg = PromotionGateConfig::default();
+            let refused = cfg
+                .apply_env_with(|k| env.get(k).map(|s| s.to_string()))
+                .unwrap_err();
+            assert!(
+                refused.to_string().contains(field),
+                "{key}=0 说「忙等」时必须点名 {field}：{refused}"
+            );
+        }
+    }
+
+    /// 主线上部署器的节拍同样原样生效；0 被点名拒绝。
+    #[test]
+    fn a_declared_deployer_cadence_survives_and_zero_is_refused() {
+        let env: HashMap<&str, &str> = [("COGNEVA_MAINLINE_DEPLOYER_POLL_INTERVAL_SECS", "12")]
+            .into_iter()
+            .collect();
+        let mut cfg = MainlineDeployerConfig::default();
+        cfg.apply_env_with(|k| env.get(k).map(|s| s.to_string()))
+            .unwrap();
+        assert_eq!(cfg.poll_interval_secs, 12);
+
+        let env: HashMap<&str, &str> = [("COGNEVA_MAINLINE_DEPLOYER_POLL_INTERVAL_SECS", "0")]
+            .into_iter()
+            .collect();
+        let mut cfg = MainlineDeployerConfig::default();
+        let refused = cfg
+            .apply_env_with(|k| env.get(k).map(|s| s.to_string()))
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("mainline_deployer.poll_interval_secs"),
+            "{refused}"
+        );
     }
 
     #[test]
@@ -1534,7 +1719,7 @@ mod tests {
         let cfg = ChangeJobConfig::load_from(&path).unwrap();
         assert!(!cfg.enabled);
         assert_eq!(cfg.max_parallel, 1);
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
 
         let env: HashMap<&str, &str> = [
             ("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_ENABLED", "true"),
@@ -1557,6 +1742,53 @@ mod tests {
         // 默认走 PATH 上的 kubectl：本 Pod 把 k3s 多调用二进制挂成
         // /usr/local/bin/kubectl（argv[0]=kubectl 即 kubectl），正好在 PATH 上。
         assert_eq!(ChangeJobConfig::default().kubectl_bin, "kubectl");
+    }
+
+    /// 声明要派 Job 时，节拍与并发窗口原样生效；0 秒与 0 个窗口被点名拒绝，
+    /// 而不是在读它们的那一层被换成 1。
+    #[test]
+    fn a_declared_change_job_cadence_and_window_survive_and_zero_is_refused() {
+        let dir =
+            std::env::temp_dir().join(format!("cog-reflection-cj-zero-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cogneva.json");
+
+        std::fs::write(
+            &path,
+            r#"{"self_evolution": {"change_job": {"enabled": true, "max_parallel": 2, "poll_interval_secs": 7}}}"#,
+        )
+        .unwrap();
+        let declared = ChangeJobConfig::load_from(&path).unwrap();
+        assert_eq!(declared.max_parallel, 2);
+        assert_eq!(declared.poll_interval_secs, 7);
+
+        std::fs::write(
+            &path,
+            r#"{"self_evolution": {"change_job": {"enabled": true, "poll_interval_secs": 0}}}"#,
+        )
+        .unwrap();
+        let refused = ChangeJobConfig::load_from(&path).unwrap_err().to_string();
+        assert!(
+            refused.contains("change_job.poll_interval_secs"),
+            "{refused}"
+        );
+
+        std::fs::write(
+            &path,
+            r#"{"self_evolution": {"change_job": {"enabled": true, "max_parallel": 0}}}"#,
+        )
+        .unwrap();
+        let refused = ChangeJobConfig::load_from(&path).unwrap_err().to_string();
+        assert!(refused.contains("max_parallel"), "{refused}");
+
+        // 关着的时候那两个数不执行任何东西，也就没有可拒的声明。
+        std::fs::write(
+            &path,
+            r#"{"self_evolution": {"change_job": {"enabled": false, "max_parallel": 0, "poll_interval_secs": 0}}}"#,
+        )
+        .unwrap();
+        assert!(ChangeJobConfig::load_from(&path).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
 
         let bad: HashMap<&str, &str> = [("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_MAX_PARALLEL", "nope")]
             .into_iter()
@@ -1586,7 +1818,7 @@ mod tests {
         assert_eq!(cfg.poll_interval_secs, 42);
         assert_eq!(cfg.targets.len(), 1);
         assert_eq!(cfg.targets[0].deployment, "d1");
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
 
         let env: HashMap<&str, &str> = [
             ("COGNEVA_MAINLINE_DEPLOYER_ENABLED", "true"),
@@ -1710,7 +1942,7 @@ mod tests {
         )
         .unwrap();
         assert!(GenerationLimits::load_from(&path).is_err());
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     #[test]
@@ -1728,5 +1960,63 @@ mod tests {
                 (k == "COGNEVA_GENERATION_MAX_CHANGED_LINES").then(|| "eighty".to_string())
             })
             .is_err());
+    }
+
+    /// 晋级、派发、金丝雀与主部署的十一条默认值都读具名常量。
+    #[test]
+    fn the_promotion_and_deployer_defaults_read_their_names() {
+        let gate = PromotionGateConfig::default();
+        assert_eq!(gate.quota_per_day, PROMOTION_QUOTA_PER_DAY);
+        assert_eq!(gate.rollback_breaker_threshold, ROLLBACK_BREAKER_THRESHOLD);
+        assert_eq!(gate.failure_breaker_threshold, FAILURE_BREAKER_THRESHOLD);
+        assert_eq!(
+            gate.gitops.canary_error_rate_multiplier,
+            CANARY_ERROR_RATE_MULTIPLIER
+        );
+        assert_eq!(gate.gitops.canary_p99_multiplier, CANARY_P99_MULTIPLIER);
+        assert_eq!(
+            gate.gitops.canary_min_requests_for_rate,
+            CANARY_MIN_REQUESTS_FOR_RATE
+        );
+
+        let job = ChangeJobConfig::default();
+        assert_eq!(job.max_parallel, CHANGE_JOB_MAX_PARALLEL);
+        assert_eq!(job.poll_interval_secs, CHANGE_JOB_POLL_INTERVAL_SECS);
+
+        let deployer = MainlineDeployerConfig::default();
+        assert_eq!(deployer.restart_threshold, MAINLINE_RESTART_THRESHOLD);
+        assert_eq!(deployer.registry_retention, REGISTRY_RETENTION);
+        assert_eq!(
+            deployer.registry_maintenance_threshold,
+            REGISTRY_MAINTENANCE_THRESHOLD
+        );
+
+        let source = include_str!("config.rs");
+        let names = [
+            "quota_per_day",
+            "rollback_breaker_threshold",
+            "failure_breaker_threshold",
+            "max_parallel",
+            "poll_interval_secs",
+            "canary_error_rate_multiplier",
+            "canary_p99_multiplier",
+            "canary_min_requests_for_rate",
+            "restart_threshold",
+            "registry_retention",
+            "registry_maintenance_threshold",
+        ];
+        let bare: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                names.iter().any(|name| {
+                    line.strip_prefix(name)
+                        .and_then(|rest| rest.strip_prefix(':'))
+                        .map(|value| value.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+                        .unwrap_or(false)
+                })
+            })
+            .collect();
+        assert!(bare.is_empty(), "这些默认值要读常量：{bare:?}");
     }
 }

@@ -2,6 +2,11 @@
 //!cog-plugin is the **external ecosystem** plugin system:
 //!third-party developers inject new tools / skills / backends without
 //!recompiling the main monorepo.
+//!
+//!The registry stops at fetching: this build compiles a plugin's module but has
+//!no runtime that instantiates it or calls its entry point, so there is no
+//!loaded-plugin handle to hand out. A trait method that returned one would be a
+//!capability no implementation can honor.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -52,21 +57,9 @@ pub trait PluginRegistry: Send + Sync {
     async fn discover(&self, source: &str) -> crate::SFResult<Vec<PluginManifest>>;
     /// Download and verify signature.
     async fn fetch(&self, manifest: &PluginManifest) -> crate::SFResult<Vec<u8>>;
-    /// Load plugin into runtime (WASM instantiation).
-    async fn load(&self, bytes: &[u8], manifest: &PluginManifest) -> crate::SFResult<PluginHandle>;
-    /// Unload plugin.
-    async fn unload(&self, handle: &PluginHandle) -> crate::SFResult<()>;
     /// Fetch a plugin's WASM bytes by its identifier.
     /// Implementations should cache discovered manifests for efficiency.
     async fn fetch_by_id(&self, plugin_id: &str) -> crate::SFResult<Vec<u8>>;
-}
-
-/// Handle to a loaded plugin.
-#[derive(Debug, Clone)]
-pub struct PluginHandle {
-    pub plugin_id: String,
-    pub manifest: PluginManifest,
-    pub loaded_at: chrono::DateTime<chrono::Utc>,
 }
 
 // ==========================================================================

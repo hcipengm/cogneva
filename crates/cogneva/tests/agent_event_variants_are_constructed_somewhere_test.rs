@@ -13,13 +13,14 @@
 //! still answers with.
 //!
 //! 实测（2026-10-27）：四张词表共 47 个变体，42 个在 `crates/*/src` 的生产
-//! 半边有构造点，剩下 5 个都在下面的登记里。其中 `AgentEvent::SelfReview` 与
-//! `AgentEvent::ToolExecutionUpdate` 的缺口最要命，因为两侧的消费端都在等着：
+//! 半边有构造点，剩下 5 个都在下面的登记里。其中 `AgentEvent::SelfReview` 的
+//! 缺口最要命，因为两侧的消费端都在等着：
 //! `web/src/store/streamStore.ts` 有一支 `case 'self_review'`，
 //! `crates/cog-reflection/src/detector.rs` 按它的 `status` 派生学习信号，
-//! `cog-observability` 拿它的 `agent_id` 归属；后者被
-//! `cog-gateway/src/websocket_protocol.rs`、`cog-storage` 的过滤与快照分类。
+//! `cog-observability` 拿它的 `agent_id` 归属。
 //! 面板空白与「没有自我复盘发生」读起来一模一样——这正是这条线一直在打的形状。
+//! `AgentEvent::ToolExecutionUpdate` 原先是同一形状的第二条，运行时现在会在一条
+//! 命令还在跑的时候发进度帧，那一行登记随之撤掉。
 //! `StreamEvent::Start` 与 `ToolCall` 同样没有构造点，且这一对的缺口还会改变
 //! 词的意思：解析器认不出的分片一律落到兜底那一支变成 `TextDelta`，所以
 //! 一个工具调用分片读出来是一段文本（见登记）。`AssistantMessageEvent::Usage`
@@ -86,13 +87,15 @@ const WIRE_ENUMS: &[WireEnum] = &[
 /// Variants with no producer in this tree, and why that is not a hole this gate
 /// can close.
 ///
-/// None of these is a fixture that was left lying around: the two agent events
-/// have live consumers that read them and behave differently when they arrive.
-/// They are registered rather than fixed because the missing half is the
-/// agent's own runtime — the thing that would have to decide to emit a
-/// self-review or a partial tool result — and that is a product change, not a
-/// vocabulary one. Registering them here is what makes the gap readable on
-/// every run instead of only in the `else` branch of a renderer.
+/// None of these is a fixture that was left lying around: the agent event has
+/// live consumers that read it and behave differently when it arrives. It is
+/// registered rather than fixed because the missing half is the agent's own
+/// runtime — the thing that would have to decide to emit a self-review — and
+/// that is a product change, not a vocabulary one. Registering it here is what
+/// makes the gap readable on every run instead of only in the `else` branch of
+/// a renderer. The partial tool result used to be registered on the same
+/// terms; the runtime now emits one whenever a running command has said
+/// something, so its row is gone.
 ///
 /// The two `StreamEvent` rows are a different kind of gap: that enum has no
 /// consumer in this tree at all (`LLMStream` is declared and re-exported, never
@@ -112,13 +115,6 @@ const NO_PRODUCER_HERE: &[(&str, &str, &str)] = &[
          WebUI 的 `case 'self_review'` 面板、`detector` 的 NEED_REVISION 分支、\
          观测网关的 agent 归属。树外 agent 可以经 gRPC `event_json` 推这种帧，\
          但本树的 agent 运行时自己从不发",
-    ),
-    (
-        "AgentEvent",
-        "ToolExecutionUpdate",
-        "本树没有构造点：`runtime` 只发 `ToolExecutionStart` 与 `ToolExecutionEnd`，\
-         工具的部分结果从不经总线发出。消费端在等它——`websocket_protocol` 的映射、\
-         `event_filter` 的分类、快照的归属",
     ),
     (
         "AssistantMessageEvent",

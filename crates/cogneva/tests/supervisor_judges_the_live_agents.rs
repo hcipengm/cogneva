@@ -27,7 +27,6 @@ async fn registered(shared: &MemoryAgentRegistry, agent_id: &str) {
             "10.42.0.10",
             "worker",
             "cogneva",
-            Vec::new(),
             ResourceInfo {
                 cpu_cores: 1,
                 memory_gb: 1,

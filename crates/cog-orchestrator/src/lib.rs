@@ -1,5 +1,7 @@
 pub mod action_planner;
 pub mod backup_runs;
+pub mod batch_edit;
+pub mod batch_plan;
 pub mod change_ledger;
 pub mod change_measure;
 pub mod dag_executor;
@@ -7,7 +9,9 @@ pub mod face_drift;
 pub mod face_lifecycle;
 pub mod face_staffing;
 pub mod governance_acts;
+pub mod landing_rate;
 pub mod lane_memory;
+pub mod ledger_pacing;
 pub mod observable;
 pub mod orchestrator_control_impl;
 pub mod outward;
@@ -105,9 +109,10 @@ pub const LABEL_RESULT: &str = "result";
 pub use action_planner::ActionPlanOrchestrator;
 pub use dag_executor::task_phase::{ExitCriteria, PhaseTransitionRules, PhasedTask, TaskPhase};
 pub use dag_executor::{
-    checkpoint_task_with_timeout, BackoffStrategy, CheckpointAgents, CheckpointRound,
+    checkpoint_task_expecting, BackoffStrategy, CheckpointAgents, CheckpointRound,
     CircuitBreakerConfig, CircuitBreakerRegistry, DagExecutor, DagExecutorConfig,
-    DagExecutorRuntime, LiveCheckpointAgents, RetryConfig, RetryMatrix, CHECKPOINT_STEP_TIMEOUT,
+    DagExecutorRuntime, LiveCheckpointAgents, RetryConfig, RetryMatrix,
+    CHECKPOINT_STEP_EXPECTATION,
 };
 pub use observable::OrchestratorObservable;
 pub use orchestrator_control_impl::OrchestratorControlImpl;

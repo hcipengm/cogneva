@@ -52,8 +52,9 @@ impl Deref for AppConfig {
 /// dead in the mode it does not cover — a manifest that sets
 /// `COGNEVA_SELF_EVOLUTION_EXECUTOR_ENABLED=false` against a table that never
 /// heard of it changes nothing, and "the switch is off" reads exactly like
-/// "the switch does nothing". The tests below hold the three spellings (this
-/// one, the chart document, the published example) to one account of each name.
+/// "the switch does nothing". The tests below hold every shipped spelling (this
+/// one, the chart document, the ConfigMap blob that carries it) to one account
+/// of each name.
 fn default_env_mappings() -> HashMap<String, String> {
     let mut m = HashMap::new();
     // app
@@ -61,15 +62,10 @@ fn default_env_mappings() -> HashMap<String, String> {
     m.insert("COGNEVA_APP_VERSION".into(), "app.version".into());
     m.insert(cog_core::env::LOG_LEVEL.into(), "app.log_level".into());
     m.insert(cog_core::paths::DATA_DIR_ENV.into(), "app.data_dir".into());
-    m.insert("COGNEVA_CONFIG_DIR".into(), "app.config_dir".into());
     m.insert(cog_core::paths::APP_DIR_ENV.into(), "app.app_dir".into());
     // providers
     m.insert("COGNEVA_DB_PROVIDER".into(), "providers.db.provider".into());
     m.insert("COGNEVA_PG_PROVIDER".into(), "providers.pg.provider".into());
-    m.insert(
-        "COGNEVA_VECTOR_PROVIDER".into(),
-        "providers.vector.provider".into(),
-    );
     m.insert(
         "COGNEVA_MEDIA_PROVIDER".into(),
         "providers.media.provider".into(),
@@ -290,14 +286,6 @@ fn default_env_mappings() -> HashMap<String, String> {
         "self_evolution.schema_repair_interval_secs".into(),
     );
     m.insert(
-        "COGNEVA_SELF_EVOLUTION_TEST_TIMEOUT_SECS".into(),
-        "self_evolution.test_timeout_secs".into(),
-    );
-    m.insert(
-        "COGNEVA_SELF_EVOLUTION_BUILD_TIMEOUT_SECS".into(),
-        "self_evolution.build_timeout_secs".into(),
-    );
-    m.insert(
         "COGNEVA_SELF_EVOLUTION_WORKSPACES_ROOT".into(),
         "self_evolution.workspaces.root".into(),
     );
@@ -394,26 +382,6 @@ fn default_env_mappings() -> HashMap<String, String> {
         "system.loop_restart_backoff_floor_secs".into(),
     );
     m.insert(
-        "COGNEVA_TOOL_TIMEOUT_SECS".into(),
-        "system.tool_timeout_secs".into(),
-    );
-    m.insert(
-        "COGNEVA_SHELL_TIMEOUT_SECS".into(),
-        "system.shell_timeout_secs".into(),
-    );
-    m.insert(
-        "COGNEVA_GRPC_RECONNECT_INTERVAL_SECS".into(),
-        "system.grpc_reconnect_interval_secs".into(),
-    );
-    m.insert(
-        "COGNEVA_PROBE_TIMEOUT_SECS".into(),
-        "system.probe_timeout_secs".into(),
-    );
-    m.insert(
-        "COGNEVA_HTTP_TIMEOUT_SECS".into(),
-        "system.http_timeout_secs".into(),
-    );
-    m.insert(
         "COGNEVA_PARTITION_MAINTENANCE_INTERVAL_SECS".into(),
         "system.partition_maintenance_interval_secs".into(),
     );
@@ -435,16 +403,8 @@ fn default_env_mappings() -> HashMap<String, String> {
         "gateway.websocket_inactivity_timeout_secs".into(),
     );
     m.insert(
-        "COGNEVA_WEBSOCKET_TICK_SECS".into(),
-        "gateway.websocket_tick_secs".into(),
-    );
-    m.insert(
         "COGNEVA_NOTIFICATION_LIMIT".into(),
         "gateway.notification_limit".into(),
-    );
-    m.insert(
-        "COGNEVA_SANDBOX_TASK_TIMEOUT_SECS".into(),
-        "gateway.sandbox_task_timeout_secs".into(),
     );
     m.insert(
         "COGNEVA_REQUEST_TIMEOUT_SECS".into(),
@@ -628,9 +588,11 @@ pub fn from_env() -> AppConfig {
 /// Apply environment-variable overrides to an existing [`AppConfig`].
 /// Reads the `env` field (env-var name → JSON dot-path), fetches each
 /// variable from the process environment and writes it into the matching
-/// config path.  No env-var names are hard-coded here — the mapping lives
-/// entirely in `cogneva.json` (or `default_env_mappings` when no file is
-/// present).
+/// config path. No env-var names are hard-coded here: both halves of the
+/// table apply — the one the loaded document carries and the built-in
+/// [`default_env_mappings`]. A document does not replace the built-in table,
+/// it supplements it: the merge below decides that, and the file-layer gate in
+/// the tests pins what it implies.
 pub fn apply_env_overrides(config: &mut AppConfig) {
     let mut value = match serde_json::to_value(&*config) {
         Ok(v) => v,
@@ -651,10 +613,28 @@ pub fn apply_env_overrides(config: &mut AppConfig) {
     }
     let mappings: Vec<(String, String)> = merged.into_iter().collect();
 
+    // 写下去之前先记下文档在这条路径上原本写着什么：env 赢，所以文档那一份在
+    // 这个进程里谁都不读，而这件事原先只有把两份文件摊开对看才看得出来——进程
+    // 自己知道两边的值，却一个字都不说。
+    let mut applied: Vec<(String, Option<String>, String)> = Vec::new();
     for (env_key, path) in mappings {
         if let Ok(env_val) = std::env::var(&env_key) {
+            applied.push((
+                path.clone(),
+                documented_text_at(&value, &path),
+                env_val.clone(),
+            ));
             cog_core::config::set_json_path(&mut value, &path, &env_val);
         }
+    }
+    let replaced = replaced_documented_paths(&applied);
+    if !replaced.is_empty() {
+        // 只点名路径，不打印值：这些变量里既有端口也有密钥，日志里出现的是
+        // 「哪一条被 env 层顶掉了」，不是被顶掉的那个词。
+        tracing::info!(
+            paths = ?replaced,
+            "env layer replaced documented values; the document's value is not used in this process"
+        );
     }
 
     // Special case: if wiki provider was set via env, auto-enable it.
@@ -674,6 +654,41 @@ pub fn apply_env_overrides(config: &mut AppConfig) {
     if let Ok(new_config) = serde_json::from_value::<AppConfig>(value) {
         *config = new_config;
     }
+}
+
+/// 配置树里某条点分路径上的标量，写成环境变量会带的那串文本。
+///
+/// 只认标量：环境变量只能送一个词，对象与数组那类路径本来就不是 env 层能表达的，
+/// 拿它们去比只会把「没法比」说成「不一样」。
+fn documented_text_at(root: &serde_json::Value, path: &str) -> Option<String> {
+    let mut cursor = root;
+    for segment in path.split('.') {
+        cursor = cursor.as_object()?.get(segment)?;
+    }
+    match cursor {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// env 层把哪些路径上文档的值换掉了：跑起来的是 env 送进去的那个。
+///
+/// 输入是写过 env 层之前记下的 `(路径, 文档的值, env 的值)`。只在文档本来有值时
+/// 才算数——文档没写这条路径，env 就是它唯一的声明，没有什么被换掉；两边写着同一个
+/// 词的也不算，那是同一件事的两种写法，跑起来没有差。
+fn replaced_documented_paths(applied: &[(String, Option<String>, String)]) -> Vec<String> {
+    let mut out: Vec<String> = applied
+        .iter()
+        .filter_map(|(path, documented, env_value)| match documented {
+            Some(documented) if documented != env_value => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Load configuration from a JSON file.
@@ -888,6 +903,46 @@ mod tests {
     use crate::checkout::repo_root;
     use std::io::Write;
 
+    /// 跑起来的是 env 那个，文档那个没人读——进程自己知道，这条判据要它说出来。
+    ///
+    /// 三种情况都要分开：文档有值且不同（报）、文档没写这条路径（不报，env 是唯一
+    /// 声明）、两边写着同一个词（不报，跑起来没有差）。
+    #[test]
+    fn the_env_layer_names_the_documented_paths_its_values_replace() {
+        let applied = vec![
+            (
+                "providers.storage.provider".to_string(),
+                Some("seaweedfs".to_string()),
+                "local-fs".to_string(),
+            ),
+            (
+                "app.log_level".to_string(),
+                Some("info".to_string()),
+                "info".to_string(),
+            ),
+            ("gateway.only_env".to_string(), None, "x".to_string()),
+        ];
+        assert_eq!(
+            replaced_documented_paths(&applied),
+            vec!["providers.storage.provider".to_string()]
+        );
+        assert!(replaced_documented_paths(&[]).is_empty());
+    }
+
+    /// 标量才比；对象、数组、缺键都读作「没得比」，不许当成「不一样」。
+    #[test]
+    fn the_documented_text_reads_scalars_and_nothing_else() {
+        let doc = serde_json::json!({
+            "a": {"number": 1, "flag": true, "word": "x", "block": {"nested": 1}, "list": [1]},
+        });
+        assert_eq!(documented_text_at(&doc, "a.number").as_deref(), Some("1"));
+        assert_eq!(documented_text_at(&doc, "a.flag").as_deref(), Some("true"));
+        assert_eq!(documented_text_at(&doc, "a.word").as_deref(), Some("x"));
+        assert_eq!(documented_text_at(&doc, "a.block"), None);
+        assert_eq!(documented_text_at(&doc, "a.list"), None);
+        assert_eq!(documented_text_at(&doc, "a.missing"), None);
+    }
+
     #[test]
     fn test_set_json_path_indexes_arrays() {
         let mut value = serde_json::json!({
@@ -1027,6 +1082,19 @@ mod tests {
             broken.is_empty(),
             "env mappings the config schema cannot hold: {broken:?}"
         );
+        // The absent-leaf branch above must not swallow typos: a leaf the type
+        // does not have is dropped by serde whichever probe is written, so it
+        // stays unholdable even though its parent object is there.
+        for typo in [
+            "dag_executor.archive_after_sec",
+            "dag_executor.no_such_knob",
+            "app.name.length",
+        ] {
+            assert!(
+                !holds_path(&value, typo),
+                "{typo} is not a path the config can hold, but the check accepted it"
+            );
+        }
     }
 
     /// Sections outside the core schema, with the env names their owning crate
@@ -1102,18 +1170,14 @@ mod tests {
     /// path rebuilt here: what the cluster receives is the ConfigMap blob, and
     /// the chart's copy is only assumed to be the same document — a gate that
     /// reads the assumption instead of the blob checks something no pod may
-    /// ever see. The example is in the set because it is the document an
-    /// operator copies to start a deployment, so a mapping nothing reads there
-    /// is the same dead knob one step earlier.
+    /// ever see.
+    ///
+    /// A sample copy at the repository root used to be read here as well, on
+    /// the argument that it is the document an operator copies. It was a
+    /// projection of the chart's file with no independent content, so it could
+    /// only agree or drift; the operator reads the chart's file now.
     fn documents_with_an_env_map() -> Vec<(&'static str, serde_json::Value)> {
-        let mut docs = shipped_documents();
-        let example_path = repo_root().join("cogneva.example.json");
-        let raw = std::fs::read_to_string(&example_path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", example_path.display()));
-        let example = serde_json::from_str(&raw)
-            .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", example_path.display()));
-        docs.push(("example", example));
-        docs
+        shipped_documents()
     }
 
     /// A loaded config file supplies its own override map, and `apply_env_overrides`
@@ -1139,7 +1203,7 @@ mod tests {
         let documents = documents_with_an_env_map();
         // Named rather than counted: a count still passes when one form drops
         // out and another takes its place, and the forms carry different maps.
-        for required in ["chart", "k3s configmap", "example"] {
+        for required in ["chart", "k3s configmap"] {
             assert!(
                 documents.iter().any(|(tag, _)| *tag == required),
                 "the `{required}` config document is not reaching this gate, so \
@@ -1204,10 +1268,70 @@ mod tests {
         );
     }
 
-    /// The file layer really is what drives overrides, not just the built-in
-    /// table. A variable that exists only in the loaded file's map must reach
-    /// its field; if it does not, the deploy map is decoration and the schema
-    /// check above is checking the wrong table.
+    /// A mapping names a setting, and nothing checked that it names one.
+    ///
+    /// `set_json_path` writes through whatever path it is handed, so a mapping
+    /// aimed at a whole section replaces that section with a scalar — and then
+    /// `apply_env_overrides` drops the entire result, because the deserialize
+    /// fails inside an `if let Ok(..)` and the config in hand is left as it
+    /// was. Every variable the deployment set goes away, not only the one that
+    /// was wrong. `holds_path` cannot see this: it asks whether the key is
+    /// there, and the leaf of `dag_executor` is a key of the serialized config
+    /// either way. So the leaf is asked what it is, in both trees a mapping can
+    /// point into: where the document carries a value at the target, and where
+    /// the serialized config does, that value has to be a setting.
+    #[test]
+    fn every_env_mapping_targets_a_setting_not_a_section() {
+        let schema =
+            serde_json::to_value(AppConfig::default()).expect("AppConfig serializes to JSON");
+        let mut checked = 0usize;
+        let mut broken: Vec<String> = Vec::new();
+        for (file, document) in documents_with_an_env_map() {
+            let env = document["env"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{file} carries no `env` map"));
+            for (key, target) in env {
+                if !key.starts_with("COGNEVA_") {
+                    continue;
+                }
+                let target = target
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{file}: {key} maps to a non-string target"));
+                let held = value_at(&document, target).or_else(|| value_at(&schema, target));
+                let Some(held) = held else {
+                    continue;
+                };
+                checked += 1;
+                if held.is_object() || held.is_array() {
+                    broken.push(format!("{file}: {key} -> {target}"));
+                }
+            }
+        }
+        // A join over nothing agrees with itself: every mapping whose leaf is
+        // absent from both trees is skipped above, so a reader that stops
+        // finding leaves would empty this test rather than fail it.
+        assert!(
+            checked >= 80,
+            "只读到 {checked} 条映射落在树上的值，floor 80——比较没看到东西"
+        );
+        assert!(
+            broken.is_empty(),
+            "these mappings point at a section instead of at a setting, and the write \
+             replaces the section wholesale: {broken:?}"
+        );
+    }
+
+    /// The document's map is joined with the built-in table, not swapped for
+    /// it: the file decides *where* a name goes, never *which* names exist. The
+    /// built-in table is therefore not a fallback for installations without a
+    /// file — it is the floor a real installation's document supplements, and
+    /// saying otherwise is what once left every name the document omitted dead.
+    ///
+    /// Both directions have to hold in one load. A variable only the file's map
+    /// knows must reach its field; if it does not, the deploy map is decoration
+    /// and the schema check above is checking the wrong table. A variable only
+    /// the built-in table knows must reach its field with that same document
+    /// loaded; if it does not, the manifests go on setting a name nothing reads.
     #[test]
     fn env_mappings_are_taken_from_the_loaded_file() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -1219,10 +1343,16 @@ mod tests {
         )
         .unwrap();
         let _sentinel = EnvGuard::set("COGNEVA_SENTINEL_ONLY_IN_FILE", "true");
+        // A name the built-in table knows and this document's map does not.
+        let _builtin_only = EnvGuard::set("COGNEVA_SELF_EVOLUTION_EXECUTOR_ENABLED", "false");
         let _config_path = EnvGuard::set("COGNEVA_CONFIG_PATH", &path.to_string_lossy());
         assert!(
             !default_env_mappings().contains_key("COGNEVA_SENTINEL_ONLY_IN_FILE"),
             "the sentinel must not be in the built-in table for this test to mean anything"
+        );
+        assert!(
+            default_env_mappings().contains_key("COGNEVA_SELF_EVOLUTION_EXECUTOR_ENABLED"),
+            "the built-in-only name must be in the built-in table for this test to mean anything"
         );
 
         let loaded = try_load().expect("the config file is present and valid");
@@ -1230,17 +1360,21 @@ mod tests {
             loaded.system.strict_persistence,
             "the file's own env map did not apply"
         );
+        assert!(
+            !loaded.self_evolution.executor_enabled,
+            "loading a document replaced the built-in table instead of joining it: a \
+             name the document omits is still a name the manifests set"
+        );
     }
 
     /// The table is spelled more than once, and nothing joined the spellings.
     ///
-    /// The built-in table, the `env` map inside the delivered document (the
-    /// chart's copy and the ConfigMap blob that carries it), and the map in the
-    /// example an operator copies are three hand-kept lists of the same fact.
-    /// They drifted: 126 entries against 113 against 95, and a name only one
-    /// copy knew did nothing in whichever mode read the other. The loader reads
-    /// both now; what still cannot stand is one name meaning two places, because
-    /// then where a variable writes is decided by which copy won.
+    /// The built-in table and the `env` map inside the delivered document (the
+    /// chart's copy and the ConfigMap blob that carries it) are hand-kept lists
+    /// of the same fact. They drifted: 126 entries against 113, and a name only
+    /// one copy knew did nothing in whichever mode read the other. The loader
+    /// reads both now; what still cannot stand is one name meaning two places,
+    /// because then where a variable writes is decided by which copy won.
     ///
     /// The floor on each copy is what keeps this from passing over an empty set:
     /// a reader that stops seeing entries makes every comparison below agree.
@@ -1281,35 +1415,25 @@ mod tests {
             "one variable, two config paths — which one it writes becomes luck: {conflicts:?}"
         );
 
-        // The example is the document an operator copies to start an install, so
-        // a name it carries and the delivered document does not is a setting
-        // that reads as configured and reaches nothing.
-        let env_of = |tag: &str| -> &serde_json::Map<String, serde_json::Value> {
-            documents
-                .iter()
-                .find(|(candidate, _)| *candidate == tag)
-                .and_then(|(_, document)| document["env"].as_object())
-                .unwrap_or_else(|| panic!("{tag} carries no `env` map"))
-        };
-        let delivered = env_of("chart");
-        // A join over nothing always agrees. The two tables share most of their
-        // names, so seeing far fewer than that means the comparison is reading
-        // an empty overlap rather than two copies of one table.
+        // A join over nothing always agrees. The floor here is only the guard
+        // against that: it does not pin how many names the two copies share,
+        // because the shared population moves whenever a dead knob is retired
+        // (the count that used to sit here said 80 until one was deleted, and
+        // a number that has to be re-typed after every deletion starts to look
+        // like a fact). Seeing no overlap at all is what means the comparison
+        // read nothing.
+        let delivered = documents
+            .iter()
+            .find(|(tag, _)| *tag == "chart")
+            .and_then(|(_, document)| document["env"].as_object())
+            .unwrap_or_else(|| panic!("chart carries no `env` map"));
         let shared = builtin
             .keys()
             .filter(|name| delivered.contains_key(*name))
             .count();
         assert!(
-            shared >= 80,
+            shared >= 1,
             "只有 {shared} 个名字同时出现在内置表与交付文档里——比较没看到东西"
-        );
-        let invented: Vec<&String> = env_of("example")
-            .keys()
-            .filter(|name| name.starts_with("COGNEVA_") && !delivered.contains_key(*name))
-            .collect();
-        assert!(
-            invented.is_empty(),
-            "the example invents variables the delivered document does not know: {invented:?}"
         );
     }
 
@@ -1491,13 +1615,22 @@ mod tests {
     /// else in the pipeline parses them until a pod reads the file at startup,
     /// where a stray comma is a crash-loop rather than a build failure. Both
     /// are parsed here so the syntax has a gate that runs before deploy.
+    ///
+    /// Parsing is not the whole of it: `{}` parses. A document that loses its
+    /// body — an emptied file, a block read under one indicator and not the
+    /// others, a reader that stops at the first line — would pass a parse gate
+    /// and then make every comparison against it agree, because two empty trees
+    /// are equal and hold no mapping left to check. So each carrier is also
+    /// required to still carry the config it is a carrier of: its sections, and
+    /// the override table a deployment reads out of it.
     #[test]
     fn shipped_deploy_configs_parse_as_json() {
         let chart_path = deploy_file("helm/cogneva/files/cogneva.json");
         let chart_raw = std::fs::read_to_string(&chart_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", chart_path.display()));
-        serde_json::from_str::<serde_json::Value>(&chart_raw)
+        let chart: serde_json::Value = serde_json::from_str(&chart_raw)
             .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", chart_path.display()));
+        assert_document_carries_a_config(&chart, &chart_path.display().to_string());
 
         let baseline_path = deploy_file("k3s/cogneva-json-configmap.yaml");
         let baseline_raw = std::fs::read_to_string(&baseline_path)
@@ -1508,12 +1641,40 @@ mod tests {
                 baseline_path.display()
             )
         });
-        serde_json::from_str::<serde_json::Value>(&embedded).unwrap_or_else(|e| {
+        let baseline: serde_json::Value = serde_json::from_str(&embedded).unwrap_or_else(|e| {
             panic!(
                 "the JSON block in {} is not valid: {e}",
                 baseline_path.display()
             )
         });
+        assert_document_carries_a_config(&baseline, &baseline_path.display().to_string());
+    }
+
+    /// The body a parsed carrier has to have: the sections a config document
+    /// has, and the override table its deployments read. A floor, not a count —
+    /// a section added to the document is not this gate's business, a document
+    /// that arrives empty is.
+    fn assert_document_carries_a_config(document: &serde_json::Value, label: &str) {
+        let sections = document
+            .as_object()
+            .unwrap_or_else(|| panic!("{label} is not a JSON object"))
+            .len();
+        assert!(
+            sections >= 20,
+            "{label}: {sections} top-level sections, floor 20 — a document this empty parses \
+             and then agrees with every comparison made against it"
+        );
+        let entries = document["env"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{label} carries no `env` override table"))
+            .keys()
+            .filter(|name| name.starts_with("COGNEVA_"))
+            .count();
+        assert!(
+            entries >= 85,
+            "{label}: {entries} COGNEVA_* override entries, floor 85 — the map nothing reads \
+             is the one this gate is here for"
+        );
     }
 
     /// The two carriers have to be one document, and nothing compared them.
@@ -1527,8 +1688,13 @@ mod tests {
     /// the older document, and "this knob is set" reads exactly like "this knob is
     /// set on the other topology".
     ///
-    /// They are equal today. What was missing is anything that says so, which is
-    /// also the only thing that would notice the day they stop being equal.
+    /// They are equal today, apart from the leaves the chart projects at render
+    /// time -- a value the source document cannot spell, such as an executor
+    /// address with one entry per replica. Those are registered once, in the
+    /// chart, and the difference is required to be exactly them: an
+    /// unregistered difference is a copy that has drifted, and a registered one
+    /// the chart no longer produces is a registration that has stopped meaning
+    /// anything. What was missing before was anything that said either.
     #[test]
     fn the_two_shipped_config_documents_are_one_document() {
         let docs = shipped_documents();
@@ -1554,15 +1720,43 @@ mod tests {
 
         let mut diffs = Vec::new();
         json_differences(chart, baseline, "", &mut diffs);
-        let shown = &diffs[..diffs.len().min(20)];
+        // 差值必须**正好**落在登记过的投影路径上：多一条是抄歪了，少一条是登记
+        // 成了一句空话（chart 不再改写它，判据却还以为这里可以不同）。两侧都判，
+        // 因为「只判一侧」的写法里，登记表变成一张谁都可以往上加的免死金牌。
+        let registered: Vec<String> = cog_core::config_sections::projected_config_paths()
+            .iter()
+            .map(|path| format!(".{}", path.join(".")))
+            .collect();
         assert!(
-            diffs.is_empty(),
+            !registered.is_empty(),
+            "no projection path is registered, so this test's exemption list is empty; \
+             the comparison below would then be the plain equality it always was -- \
+             and the first chart projection would make it red without saying why"
+        );
+        let path_of = |diff: &String| -> String {
+            diff.split_once(": ")
+                .map_or_else(|| diff.clone(), |(p, _)| p.to_string())
+        };
+        let unregistered: Vec<&String> = diffs
+            .iter()
+            .filter(|diff| !registered.iter().any(|r| r == &path_of(diff)))
+            .collect();
+        let stale: Vec<&String> = registered
+            .iter()
+            .filter(|r| !diffs.iter().any(|diff| path_of(diff) == **r))
+            .collect();
+        assert!(
+            unregistered.is_empty() && stale.is_empty(),
             "the chart document and the ConfigMap blob are not the same document \
-             (chart -> k3s configmap); {} difference(s), first {}: {shown:#?}\n\
+             (chart -> k3s configmap) outside the registered projections.\n\
+             {} difference(s) nobody registered: {unregistered:#?}\n\
+             {} registration(s) chart no longer projects: {stale:#?}\n\
              这两个文件是同一份文档的两个载体：抄歪一节，apply 路径的集群就继续跑旧的\
-             那一节，而「这一项配了」与「只在另一套拓扑上配了」在读数上分不开",
-            diffs.len(),
-            shown.len()
+             那一节，而「这一项配了」与「只在另一套拓扑上配了」在读数上分不开。\
+             登记表在 deploy/helm/cogneva/projected-config-paths.txt，chart 在渲染时\
+             真的改写了哪几片叶子，就只登记哪几片",
+            unregistered.len(),
+            stale.len()
         );
     }
 
@@ -1706,8 +1900,53 @@ mod tests {
         match cursor {
             Some(serde_json::Value::Null) => true,
             Some(serde_json::Value::Array(arr)) if arr.is_empty() => true,
-            Some(serde_json::Value::Object(map)) => map.contains_key(*leaf),
+            Some(serde_json::Value::Object(map)) => {
+                map.contains_key(*leaf) || the_type_refuses_a_probe_at(value, path)
+            }
             _ => false,
+        }
+    }
+
+    /// A leaf missing from the default tree is either a typo or a leaf the
+    /// serializer omitted because its value equals its code default
+    /// (`skip_serializing_if`). The tree cannot tell them apart, so the type is
+    /// asked directly: write a probe into the path and deserialize. A real leaf
+    /// refuses a probe of the wrong shape; a segment the schema does not have is
+    /// *dropped silently* by serde (there is no `deny_unknown_fields`), so a typo
+    /// refuses neither probe and stays red. Two shapes, because a leaf typed as a
+    /// string accepts the string probe and one typed as a map accepts the object.
+    fn the_type_refuses_a_probe_at(schema: &serde_json::Value, path: &str) -> bool {
+        let probes = [
+            serde_json::json!("__probe__"),
+            serde_json::json!({ "__probe__": 0 }),
+        ];
+        probes.iter().any(|probe| {
+            let mut document = schema.clone();
+            write_path(&mut document, path, probe.clone());
+            serde_json::from_value::<AppConfig>(document).is_err()
+        })
+    }
+
+    /// Writes `value` at the dot-path whose parents are already known to be
+    /// objects in `document` (the caller resolved that chain first).
+    fn write_path(document: &mut serde_json::Value, path: &str, value: serde_json::Value) {
+        let segments: Vec<&str> = path.split('.').collect();
+        let (leaf, parents) = match segments.split_last() {
+            Some(pair) => pair,
+            None => return,
+        };
+        let mut cursor = document;
+        for segment in parents {
+            cursor = match cursor {
+                serde_json::Value::Object(map) => match map.get_mut(*segment) {
+                    Some(next) => next,
+                    None => return,
+                },
+                _ => return,
+            };
+        }
+        if let serde_json::Value::Object(map) = cursor {
+            map.insert((*leaf).to_string(), value);
         }
     }
 
@@ -1870,7 +2109,7 @@ mod tests {
                 "health_interval_secs": 5,
                 "health_checker": { "suspect_after_secs": 10 }
             },
-            "hook_engine": { "dedup_window_secs": 2, "default_rate_limit": { "burst": 50 } }
+            "hook_engine": { "dedup_window_secs": 2, "default_rate_limit": { "burst": 50, "per_second": 25 } }
         }"#;
         tmpfile.write_all(json.as_bytes()).unwrap();
 
@@ -1880,7 +2119,13 @@ mod tests {
         assert_eq!(config.supervisor.health_interval_secs, 5);
         assert_eq!(config.supervisor.health_checker.suspect_after_secs, 10);
         assert_eq!(config.hook_engine.dedup_window_secs, 2);
-        assert_eq!(config.hook_engine.default_rate_limit.burst, 50);
+        let limit = config
+            .hook_engine
+            .default_rate_limit
+            .clone()
+            .expect("declared");
+        assert_eq!(limit.burst, 50);
+        assert_eq!(limit.per_second, 25);
     }
 
     #[test]
@@ -1907,7 +2152,10 @@ mod tests {
             control_plane_interval_secs: 30,
             control_plane_url: None,
         };
-        let business: cog_supervisor::SupervisorConfig = cfg.into();
+        let business = cog_supervisor::SupervisorConfig::from_core(
+            cfg,
+            cog_core::config::AGENT_HEARTBEAT_INTERVAL_SECS,
+        );
         assert_eq!(business.health_interval, std::time::Duration::from_secs(7));
         assert_eq!(business.broadcast_capacity, 512);
         assert_eq!(business.quota_threshold, 2000);
@@ -1917,15 +2165,15 @@ mod tests {
     fn test_hook_engine_config_conversion() {
         let cfg = cog_core::HookEngineConfig {
             dedup_window_secs: 3,
-            default_rate_limit: cog_core::RateLimitConfig {
+            default_rate_limit: Some(cog_core::RateLimitConfig {
                 burst: 200,
                 per_second: 200,
-            },
+            }),
             hook_timeout_secs: 30,
         };
         let business: cog_agent::HookEngineConfig = cfg.into();
         assert_eq!(business.dedup_window, std::time::Duration::from_secs(3));
-        assert_eq!(business.default_rate_limit.burst, 200);
+        assert_eq!(business.default_rate_limit.unwrap().burst, 200);
     }
 
     #[test]
@@ -1937,10 +2185,8 @@ mod tests {
             // 评估器预算只服务 cog-agent 自己的 eval runtime，没有 RuntimeConfig 对应字段，
             // 所以下面只断言 max_iterations。
             eval_max_iterations: Some(5),
-            context_window_size: 8192,
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             memory_api_base: None,
             // Only the fields that map onto RuntimeConfig are asserted below;
             // these are carried to complete the literal.
@@ -1953,7 +2199,10 @@ mod tests {
         assert_eq!(business.agent_id, "agent-42");
         assert_eq!(business.role, "generator");
         assert_eq!(business.max_iterations, 7);
-        assert_eq!(business.context_window_size, 8192);
+        assert_eq!(
+            business.context_window_size, None,
+            "窗口没有配置来源：文档里那一格删掉了，起点只能是读数"
+        );
     }
 
     #[test]
@@ -1984,7 +2233,7 @@ mod tests {
         let _g1 = EnvGuard::set("TEST_APP_NAME", "interpolated-app");
 
         let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
-        let json = r#"{ "app": { "name": "${TEST_APP_NAME}", "log_level": "info", "data_dir": "/tmp", "config_dir": "/tmp", "app_dir": "/tmp" } }"#;
+        let json = r#"{ "app": { "name": "${TEST_APP_NAME}", "log_level": "info", "data_dir": "/tmp", "app_dir": "/tmp" } }"#;
         tmpfile.write_all(json.as_bytes()).unwrap();
 
         let config = from_json_file(tmpfile.path()).unwrap();

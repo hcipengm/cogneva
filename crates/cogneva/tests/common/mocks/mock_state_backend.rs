@@ -154,7 +154,8 @@ impl StateBackend for MockStateBackend {
             .map_err(|_| SFError::Agent("lock poisoned".into()))?;
         match store.get(&Self::key_events(task_id)) {
             Some(v) => {
-                let list: Vec<Event> = serde_json::from_value(v.clone()).unwrap_or_default();
+                let list: Vec<Event> =
+                    serde_json::from_value(v.clone()).unwrap_or(Default::default());
                 let start = offset as usize;
                 let end = (start + limit).min(list.len());
                 if start >= list.len() {

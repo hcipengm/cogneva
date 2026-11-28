@@ -13,17 +13,19 @@ use mock_provider::MockProvider;
 async fn test_agent_prompt_completes() {
     let agent = Agent::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "test".into(),
             role: "planner".to_string(),
             max_iterations: 2,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         Arc::new(MockProvider::new("result")),
     );
@@ -44,24 +46,26 @@ async fn test_agent_prompt_completes() {
 async fn test_agent_subscribe_receives_events() {
     let agent = Agent::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "test".into(),
             role: "planner".to_string(),
             max_iterations: 2,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         Arc::new(MockProvider::new("result")),
     );
 
     let mut events = agent.subscribe();
 
-    let _ = agent.prompt(serde_json::json!({"goal": "test"})).await;
+    cog_core::ignore_lost!(agent.prompt(serde_json::json!({"goal": "test"})).await);
 
     let mut received = Vec::new();
     while let Ok(event) = events.try_recv() {
@@ -83,17 +87,19 @@ async fn test_agent_subscribe_receives_events() {
 async fn test_agent_state_transitions() {
     let agent = Agent::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "test".into(),
             role: "planner".to_string(),
             max_iterations: 2,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         Arc::new(MockProvider::new("result")),
     );
@@ -106,7 +112,7 @@ async fn test_agent_state_transitions() {
 
     // The prompt runs synchronously in our test (await blocks until done),
     // so we can't easily catch the Running state. Just verify final state.
-    let _ = prompt_future.await;
+    cog_core::ignore_lost!(prompt_future.await);
     assert_eq!(agent.state().await, AgentState::Idle);
 }
 
@@ -114,17 +120,19 @@ async fn test_agent_state_transitions() {
 async fn test_agent_abort_resets_to_idle() {
     let agent = Agent::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "test".into(),
             role: "planner".to_string(),
             max_iterations: 10,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         Arc::new(MockProvider::new("slow result")),
     );
@@ -151,22 +159,24 @@ async fn test_agent_abort_resets_to_idle() {
 async fn test_agent_reset_clears_state() {
     let agent = Agent::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "test".into(),
             role: "planner".to_string(),
             max_iterations: 2,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         Arc::new(MockProvider::new("result")),
     );
 
-    let _ = agent.prompt(serde_json::json!({"goal": "test"})).await;
+    cog_core::ignore_lost!(agent.prompt(serde_json::json!({"goal": "test"})).await);
     assert_eq!(agent.state().await, AgentState::Idle);
 
     agent.reset().await.expect("reset failed");
@@ -177,17 +187,19 @@ async fn test_agent_reset_clears_state() {
 async fn test_agent_continue_preserves_context() {
     let agent = Agent::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "test".into(),
             role: "planner".to_string(),
             max_iterations: 2,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         Arc::new(MockProvider::new("acknowledged")),
     );
@@ -212,17 +224,19 @@ async fn test_agent_continue_preserves_context() {
 async fn test_agent_wait_for_idle() {
     let agent = Agent::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "test".into(),
             role: "planner".to_string(),
             max_iterations: 2,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         Arc::new(MockProvider::new("result")),
     );
@@ -233,7 +247,7 @@ async fn test_agent_wait_for_idle() {
         .expect("wait_for_idle timed out")
         .expect("wait_for_idle failed");
 
-    let _ = agent.prompt(serde_json::json!({"goal": "test"})).await;
+    cog_core::ignore_lost!(agent.prompt(serde_json::json!({"goal": "test"})).await);
 
     // After completion, should also return immediately
     timeout(Duration::from_secs(1), agent.wait_for_idle())
@@ -246,17 +260,19 @@ async fn test_agent_wait_for_idle() {
 async fn test_agent_chat_stream_bypasses_loop() {
     let agent = Agent::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "test".into(),
             role: "planner".to_string(),
             max_iterations: 2,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         Arc::new(MockProvider::new("hello stream")),
     );

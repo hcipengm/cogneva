@@ -47,14 +47,16 @@ use tokio::sync::Notify;
 /// 按 30–60s 代理 worst 值越过 20 的分钟占 26%（io 25%、cpu 1.6%、memory 1.4%）；
 /// 1s 粒度活采里 17% 的样本越线、最大 49.8 —— 这条线够得着，不是摆设。它对行为也有
 /// 实权：把两条 PSI 红灯整个去掉，界停在 1 的时间从 54.9% 掉到 44.1%。
-// cap: derived — 7d 实测的 PSI avg10 分布定出的红灯线；是历史读数，不是这台机器当下的值
+// cap: fixed — 7d 实测的 PSI avg10 分布定出的红灯线；是历史读数，不是这台机器当下的值
+// keep: 删掉后准入没有红灯线，超载与正常在读数上同形；由「7d 实测分布定出的线」兜住
 pub const PSI_RED_AVG10: f64 = 20.0;
 /// 绿灯：PSI 三项的 `avg60` 全在这条线以下才加一。
 ///
 /// 实测：5.0 落在这台宿主自己 worst_avg60 分布的第 67 分位（p50 1.51、p75 21.7），
 /// 不是圆整数。但它是这条律里最不灵敏的旋钮：5 → 20 或 5 → 2，界停在 1 的时间只在
 /// 53.8%–56.7% 之间动（一到三个百分点）。别把它当主要调节手段。
-// cap: derived — 7d 实测 worst_avg60 的第 67 分位；同上，来自一次量过的分布
+// cap: fixed — 7d 实测 worst_avg60 的第 67 分位；同上，来自一次量过的分布
+// keep: 删掉后准入没有绿灯线，正常与临界同形；由「7d 实测分位」兜住
 pub const PSI_GREEN_AVG60: f64 = 5.0;
 /// 可用内存的两条线，按这台宿主的 MemTotal 折算出来的字节数。
 ///
@@ -70,14 +72,16 @@ pub struct MemoryLines {
 }
 
 /// 有牙齿的地板占实测宿主 MemTotal 的份额（44 GiB / 62.7 GiB）。
-// cap: derived — 7d 实测：44 GiB 地板 / 62.7 GiB MemTotal
+// cap: fixed — 7d 实测：44 GiB 地板 / 62.7 GiB MemTotal
+// keep: 删掉后内存地板不存在，低于它的机器也照跑并被压死；由「7d 实测 MemTotal 比例」兜住
 const MEM_FLOOR_PERCENT: u64 = 70;
 /// 绿灯线占实测宿主 MemTotal 的份额（46.4 GiB / 62.7 GiB）。
 ///
 /// 它比地板高出的那 4 个点就是回滞带：绿灯只排除实测里最干的那部分分钟，界不会在
 /// 地板附近抖着加一减半。两条线各有来源，不是「地板的倍数」——把绿灯写回地板乘二，
 /// 抬一侧会静默关死另一侧。
-// cap: derived — 7d 实测：46.4 GiB（MemAvailable p5）/ 62.7 GiB MemTotal
+// cap: fixed — 7d 实测：46.4 GiB（MemAvailable p5）/ 62.7 GiB MemTotal
+// keep: 删掉后内存绿灯线不存在，memory 压力在读数上消失；由「7d 实测 MemAvailable p5」兜住
 const MEM_GREEN_PERCENT: u64 = 74;
 
 /// 这台宿主的两条内存线。`total_bytes` 是 `/proc/meminfo` 的 MemTotal。
@@ -103,10 +107,12 @@ pub fn host_memory_lines() -> Option<MemoryLines> {
 ///
 /// 它是个比例而不是一个时间：一道题该跑多久取决于这道题，闸门不知道。所以这条灯只能
 /// 相对自己——宿主整体变慢由 PSI 那三条路说，不走这条。
-// cap: bound — 比例不是时间：一道题该跑多久取决于这道题，闸门不知道
+// cap: fixed — 比例不是时间：一道题该跑多久取决于这道题，闸门不知道
+// keep: 删掉后延迟没有相对线，慢用例与正常用例同形；由「按同负载历史比例判」兜住
 const LATENCY_RED_FACTOR: f64 = 2.0;
 /// 判中位数之前至少要看过几例。少于这个数，中位数还不是「这个负载的历史」。
-// cap: bound — 少于这个数还不算「这个负载的历史」
+// cap: fixed — 少于这个数还不算「这个负载的历史」
+// keep: 删掉后几条样本就当成历史，噪声决定界；由「至少五条才算历史」兜住
 const LATENCY_MIN_SAMPLES: usize = 5;
 
 /// 界为什么动。四种动法各是一个读数：少了「顶到上界」与「贴着下界」，「界在 2」与
@@ -247,18 +253,21 @@ pub struct AdmissionConfig {
 }
 
 /// 未实测的下界：1，只是「不许是零」的形式下界。
-// cap: bound — 形式下界，只表达「不许是零」
+// cap: fixed — 形式下界，只表达「不许是零」
+// keep: 删掉后未实测时的界可以是零，执行面一开就全开；由「形式下界」兜住
 const UNMEASURED_FLOOR: usize = 1;
 
 /// 未实测的上界：4，取的是驱动原先写死的并发数。
-// cap: bound — 未实测时的临时上界；取的是驱动原先写死的并发数
+// cap: fixed — 未实测时的临时上界；取的是驱动原先写死的并发数
+// keep: 删掉后未实测时没有临时上界，执行面按无界起量；由「驱动原先写死的并发数」兜住
 const UNMEASURED_CEILING: usize = 4;
 
 /// 重新算一次界的最小间隔：60s。
 ///
 /// 界要跟着实测走，而一次实测本身就是一份读数；比一分钟更密的窗口会让界在
 /// 噪声里来回跳，反而压不住并行度。
-// cap: bound — 界要跟着实测走，而一次实测本身就是一份读数：再密就是在噪声上改界
+// cap: fixed — 界要跟着实测走，而一次实测本身就是一份读数：再密就是在噪声上改界
+// keep: 删掉后每次采样都重算界，界跟着噪声跳；由「界要跟着实测走」兜住
 const ADMISSION_RECOMPUTE_WINDOW: Duration = Duration::from_secs(60);
 
 impl AdmissionConfig {
@@ -293,7 +302,12 @@ pub fn open(cfg: &AdmissionConfig) -> Result<Arc<Admission>, String> {
     let is_controller = take_controller_lock(&dir);
     let ceiling = cfg.ceiling_unmeasured.max(cfg.floor_unmeasured).max(1);
     let floor = cfg.floor_unmeasured.clamp(1, ceiling);
-    let bound = read_bound(&dir).unwrap_or(floor).clamp(floor, ceiling);
+    let bound = read_bound(&dir)
+        .unwrap_or_else(|| {
+            tracing::debug!(dir = %dir.display(), "这个目录还没有写出的界，按控制器上限起量");
+            ceiling
+        })
+        .clamp(floor, ceiling);
     if is_controller {
         // 控制器一起来就把自己的界写出去。否则从零到第一次判决之间，非控制器会各自
         // 退回自己的 `floor` 去猜——同一个目录上就有两个不同的界，而读数上看不出来。
@@ -705,7 +719,7 @@ mod tests {
         // 替它建一个空目录，就等于把「指错了」变成「闸门生效了」：它照样放行、照样报数，
         // 只是谁也不协调。
         let missing = std::env::temp_dir().join("cogneva-admission-nothing-here-2f9c1a");
-        let _ = std::fs::remove_dir_all(&missing);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&missing));
         let err = open(&AdmissionConfig::new(&missing)).unwrap_err();
         assert!(err.contains("is not a directory"), "{err}");
         assert!(!missing.exists(), "不存在的目录不该被就地造出来");

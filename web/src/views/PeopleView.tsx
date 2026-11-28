@@ -2,10 +2,13 @@ import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useAgentConversation } from '@/hooks/useAgentConversation';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
-import { hireEmployee, type AgentConversationLine } from '@/api/client';
+import { hireEmployee, killAgent, restartAgent, type AgentConversationLine } from '@/api/client';
 import { ConversationPane } from '@/conversation/ConversationPane';
+import { SessionDock } from '@/conversation/SessionDock';
+import { conversationNames } from '@/conversation/callsign';
 import { useChatStore } from '@/store/chatStore';
 import { useServices } from '@/shell/context';
+import { useShell } from '@/shell/store';
 import { USE_MOCK } from '@/runtime';
 import { useLiveAgentStore } from '@/store/liveAgentStore';
 import { useStreamStore, type Message as StreamedMessage, type ToolCallRecord } from '@/store/streamStore';
@@ -37,6 +40,15 @@ import { Note } from '@/ui/Note';
  */
 
 /** 每种结局一句话，键取自端点类型本身：没配话的结局会把英文原词贴在灰字里。 */
+/**
+ * 员工页的会话 id：由员工 id 派生，同一员工永远同一段。
+ *
+ * 前缀必须与 `crates/cogneva/src/conversation.rs` 的
+ * `SESSION_FOR_AGENT_PREFIX` 一致（`agent:`）；后端按它把会话钉到被点名的
+ * 员工，不另收一个客户端字段。没有会话说过的池员工，也从这里得到第一段。
+ */
+const sessionFor = (agentId: string) => `agent:${agentId}`;
+
 const OUTCOME_LABEL: Record<AgentConversationLine['outcome'], { text: string; color: string }> = {
   queued: { text: '已送达，等它自己回', color: 'var(--muted)' },
   replied: { text: '已回', color: 'var(--ok)' },
@@ -171,34 +183,58 @@ function Line({ line, showReply }: { line: AgentConversationLine; showReply: boo
  *
  * 这一格画的是实时对话面（`ConversationPane`），不是只读的历史列表：往收件箱投
  * 一句话给一个不读收件箱的人看不出任何回音，而一个只能看不能说的窗格也不叫对话框。
+ *
+ * 上面那一条是拨号条：点开一个人只是把「他那一段」放到这一格里，别的几段仍然
+ * 开着。几段同时开是这一面的常态——一段在等回答时，另一段照常能说话。
  */
-function ChatPersonPane({ sessionId, name }: { sessionId: string; name: string }) {
+function ChatLane({
+  employeeSessionId,
+  employeeName,
+}: {
+  employeeSessionId: string;
+  employeeName: string;
+}) {
   const { clientRef } = useServices();
   const openSession = useChatStore((s) => s.openSession);
+  const closeSession = useChatStore((s) => s.closeSession);
+  const order = useChatStore((s) => s.order);
+  const active = useChatStore((s) => s.active);
+  const names = conversationNames(order);
 
   // 会话先入账再画：`hydrate` 只认已经在 store 里的那一段，不在的话它会一声不响地
   // 返回，于是这一格永远是空的——看起来像「这段对话没有历史」。
   useEffect(() => {
-    openSession(sessionId);
-  }, [openSession, sessionId]);
+    openSession(employeeSessionId);
+  }, [openSession, employeeSessionId]);
 
+  const onThisEmployee = active === employeeSessionId;
   return (
     <section className="flex min-h-0 flex-1 flex-col">
       <div className="flex shrink-0 items-center justify-between border-b border-[var(--line)] px-3 py-1.5 text-[11px] text-[var(--muted)]">
-        <span>{`与 ${name} 的对话（会话 ${sessionId}）`}</span>
+        <span>
+          {onThisEmployee
+            ? `与 ${employeeName} 的对话（会话 ${employeeSessionId}）`
+            : `开着的第 ${order.indexOf(active) + 1} 段对话（会话 ${active}）`}
+        </span>
       </div>
+      <SessionDock clientRef={clientRef} />
+      {/*
+        换一段就是换一面：草稿、展开的思考、滚动位置都该各归各的。不换 key 的话，
+        在一段里写了一半的话会跟着到另一段上去。
+      */}
       <ConversationPane
-        sessionId={sessionId}
-        name={name}
+        key={active}
+        sessionId={active}
+        name={onThisEmployee ? employeeName : names.get(active) ?? '对话'}
         active
         onFocus={() => {}}
-        onClose={() => {}}
-        closable={false}
+        onClose={() => closeSession(active)}
+        closable={order.length > 1}
         historyEnabled={!USE_MOCK}
         clientRef={clientRef}
       />
       <p className="px-3 pb-2 text-[10px] text-[var(--muted)]">
-        这个人只在说话的那一段时间里活着，名下没有常驻进程；能接着跟他聊，是因为名字由会话 id 算出来。
+        同时开着几段就排成几个名字，段与段互不打扰。这一段是平台以这个员工身份跑的回合，不是池里的进程；能接着跟他聊，是因为会话 id 由他的工号/身份算出来。
       </p>
     </section>
   );
@@ -209,6 +245,7 @@ export function PeopleView() {
     agents,
     agentsError,
     agentsLoaded,
+    rosterUnits,
     selected,
     select,
     lines,
@@ -297,11 +334,41 @@ export function PeopleView() {
   // 位，那时按在岗算——名单上原本就只有心跳。
   const liveCount = agents.filter((agent) => agent.live !== false).length;
   const restCount = agents.length - liveCount;
+  // 名单上的行是地址（座位），人是身份：一行不代表一个人。单位读数分开写，
+  // 座位背后有没有人另说——把两个数并成一个「9,041 个员工」会让读的人以为
+  // 有九千个人。
+  const units = rosterUnits
+    ? `${rosterUnits.people} 位人 · ${agents.length} 个座位` +
+      (rosterUnits.seatsWithoutAPerson === null
+        ? ' · 座位背后有没有人：名册没读到'
+        : rosterUnits.seatsWithoutAPerson > 0
+          ? `（其中 ${rosterUnits.seatsWithoutAPerson} 个座位背后还没有人）`
+          : '（每个座位背后都有人）')
+    : null;
 
   const submit = async () => {
     const text = draft;
     setDraft('');
     await send(text);
+  };
+
+  /**
+   * 让 supervisor 重启 / 终止选中的这个执行者。
+   *
+   * 只有 supervisor 拉起来的进程才答得到：对话员工名下没有常驻进程，接口会答
+   * 404，这里把原文落进输出格，不把它说成「操作成功」。202 也只表示命令已发出。
+   */
+  const appendOutput = useShell((s) => s.appendOutput);
+  const control = async (label: string, action: (id: string) => Promise<void>, confirmText: string) => {
+    if (!selected || !window.confirm(confirmText)) return;
+    try {
+      await action(selected);
+      appendOutput(`${label}：命令已发给 ${selected}（进程何时真的退出由它自己决定）`);
+      refreshAgents();
+    } catch (e) {
+      const err = e as { status?: number; message?: string };
+      appendOutput(`${label}失败（${selected}，HTTP ${err.status ?? '?'}）：${err.message ?? '未知原因'}`);
+    }
   };
 
   const hire = async () => {
@@ -320,7 +387,7 @@ export function PeopleView() {
   return (
     <ViewFrame
       title="员工"
-      meta={`${liveCount} 个在岗${restCount > 0 ? ` · ${restCount} 个休息中` : ''} · 每人一个对话框 · 名单按 15 秒重读`}
+      meta={`${liveCount} 个在岗${restCount > 0 ? ` · ${restCount} 个休息中` : ''}${units ? ` · ${units}` : ''} · 每人一个对话框 · 名单按 15 秒重读`}
       actions={
         <>
           <Button onClick={hire} disabled={hiring} tone="accent">
@@ -422,29 +489,65 @@ export function PeopleView() {
                       </Note>
                     ) : null}
                   </div>
-                  <div className="text-[10px] text-[var(--muted)]">
-                    {agent.role} · {agent.workspace_id}
-                    {/* 来源只对「说过话的人」有意义：池里的 worker 没有会话，
-                        给它印一行「来源未声明」只是噪音。有会话而没声明平台的
-                        是探针、脚本、老版本界面——说出来比留白好。 */}
-                    {agent.session_id &&
-                      (agent.platform ? ` · 来自 ${agent.platform}` : ' · 来源未声明')}
-                  </div>
+                  {(agent.workspace_id || agent.session_id) && (
+                    <div className="text-[10px] text-[var(--muted)]">
+                      {/* 这一行说的是这个人在哪、从哪来，不说他此刻扮演什么：
+                          分工记在那一段执行上（尝试行），名册上的一个人可以
+                          先后做过不同的活，把人按角色标一行就把两件事混了。 */}
+                      {agent.workspace_id}
+                      {/* 来源只对「说过话的人」有意义：池里的 worker 没有会话，
+                          给它印一行「来源未声明」只是噪音。有会话而没声明平台的
+                          是探针、脚本、老版本界面——说出来比留白好。 */}
+                      {agent.session_id &&
+                        (agent.platform ? ` · 来自 ${agent.platform}` : ' · 来源未声明')}
+                    </div>
+                  )}
                 </button>
               );
             })}
           </aside>
 
-          {chosen?.session_id ? (
-            <ChatPersonPane sessionId={chosen.session_id} name={chosen.display_name} />
+          {chosen ? (
+            <ChatLane
+              employeeSessionId={chosen.session_id ?? sessionFor(chosen.agent_id)}
+              employeeName={chosen.display_name}
+            />
           ) : (
           <section className="flex min-h-0 flex-1 flex-col">
             <div className="flex shrink-0 items-center justify-between border-b border-[var(--line)] px-3 py-1.5 text-[11px] text-[var(--muted)]">
               <span>
-                {chosen ? `与 ${chosen.display_name} 的会话` : '先选一个员工'}
+                {selected ? `与 ${selected} 的会话` : '先选一个员工'}
                 {loading && ' · 读取中…'}
               </span>
-              <Button onClick={refreshConversation}>刷新会话</Button>
+              <span className="flex items-center gap-2">
+                {selected && (
+                  <>
+                    <Button
+                      onClick={() =>
+                        void control(
+                          '重启进程',
+                          restartAgent,
+                          `让 supervisor 重启 ${selected}？它手上的活会被打断。`
+                        )
+                      }
+                    >
+                      重启进程
+                    </Button>
+                    <Button
+                      onClick={() =>
+                        void control(
+                          '终止进程',
+                          killAgent,
+                          `终止 ${selected} 的进程？这不是离职——工号不回收，重启后还是同一个人。`
+                        )
+                      }
+                    >
+                      终止进程
+                    </Button>
+                  </>
+                )}
+                <Button onClick={refreshConversation}>刷新会话</Button>
+              </span>
             </div>
 
             <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2">

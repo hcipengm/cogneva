@@ -49,7 +49,7 @@ type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, 
 async fn deliver(pending: &Pending, id: u64, value: Result<serde_json::Value, String>) {
     let waiter = pending.lock().await.remove(&id);
     if let Some(tx) = waiter {
-        let _ = tx.send(value);
+        cog_core::ignore_lost!(tx.send(value));
     } else {
         debug!(id, "mcp: a reply arrived with nobody waiting for it");
     }
@@ -62,7 +62,7 @@ async fn deliver(pending: &Pending, id: u64, value: Result<serde_json::Value, St
 async fn fail_all_pending(pending: &Pending, reason: &str) {
     let waiters: Vec<_> = pending.lock().await.drain().map(|(_, tx)| tx).collect();
     for tx in waiters {
-        let _ = tx.send(Err(reason.to_string()));
+        cog_core::ignore_lost!(tx.send(Err(reason.to_string())));
     }
 }
 
@@ -219,7 +219,7 @@ impl SseTransport {
             .headers
             .get("content-type")
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         if !content_type.starts_with("text/event-stream") {
             anyhow::bail!(
                 "mcp sse endpoint {url} answered Content-Type {content_type:?}, not text/event-stream"
@@ -237,6 +237,7 @@ impl SseTransport {
             endpoint_tx,
         ));
 
+        // roundtrip: 一次 MCP 端点解析
         let message_url = match tokio::time::timeout(self.request_timeout, endpoint_rx).await {
             Ok(Ok(Ok(url))) => url,
             Ok(Ok(Err(e))) => anyhow::bail!("mcp sse endpoint {url}: {e}"),
@@ -322,6 +323,7 @@ impl SseTransport {
             }
         }
 
+        // roundtrip: 一次 JSON-RPC 应答
         match tokio::time::timeout(self.request_timeout, rx).await {
             Ok(Ok(Ok(value))) => unwrap_jsonrpc(method, value),
             Ok(Ok(Err(e))) => anyhow::bail!("mcp {method}: {e}"),
@@ -607,6 +609,7 @@ impl StdioTransport {
             anyhow::bail!("mcp {method}: writing to the stdio child failed: {e}");
         }
 
+        // roundtrip: 一次 JSON-RPC 应答
         match tokio::time::timeout(self.request_timeout, rx).await {
             Ok(Ok(Ok(value))) => unwrap_jsonrpc(method, value),
             Ok(Ok(Err(e))) => anyhow::bail!("mcp {method}: {e}"),

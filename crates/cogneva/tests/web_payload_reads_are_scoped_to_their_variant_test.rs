@@ -582,7 +582,7 @@ function handleLiveMessage(data) {
 #[test]
 fn a_page_read_of_a_field_its_variant_lacks_is_reported() {
     let root = std::env::temp_dir().join(format!("cogneva-page-fields-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     std::fs::create_dir_all(root.join(WEB)).expect("temp web");
     std::fs::create_dir_all(root.join("crates/cog-core/src/types")).expect("temp core");
     std::fs::create_dir_all(root.join("crates/cog-storage/src")).expect("temp storage");
@@ -615,7 +615,7 @@ fn a_page_read_of_a_field_its_variant_lacks_is_reported() {
         "{complaints:?}"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }
 
 #[test]
@@ -657,7 +657,7 @@ export function fromGuard(event: AgentEvent): unknown {
 #[test]
 fn a_field_outside_the_case_variant_is_reported() {
     let root = std::env::temp_dir().join(format!("cogneva-arm-fields-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     std::fs::create_dir_all(root.join(WEB)).expect("temp web tree");
     std::fs::create_dir_all(root.join("crates/cog-core/src/types")).expect("temp core");
     std::fs::create_dir_all(root.join("crates/cog-storage/src")).expect("temp storage");
@@ -713,7 +713,7 @@ fn a_field_outside_the_case_variant_is_reported() {
         "{complaints:?}"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }
 
 /// 普查面本身也要有判据：读法目录读不出来时必须炸。旧写法读不出来就 `return`，

@@ -112,8 +112,7 @@ impl MediaBackend for LiveKitMediaBackend {
             .map_err(|e| SFError::Adapter {
                 provider: "livekit".into(),
                 message: format!("create_room serialize failed: {}", e),
-            })?
-            .timeout(30);
+            })?;
         let resp = self
             .client()?
             .execute(req)
@@ -124,7 +123,7 @@ impl MediaBackend for LiveKitMediaBackend {
             })?;
 
         if !resp.is_success() {
-            let text = resp.text().unwrap_or_default();
+            let text = resp.text().unwrap_or(Default::default());
             return Err(SFError::Adapter {
                 provider: "livekit".into(),
                 message: format!("create_room failed: {}", text),
@@ -153,8 +152,7 @@ impl MediaBackend for LiveKitMediaBackend {
             .map_err(|e| SFError::Adapter {
                 provider: "livekit".into(),
                 message: format!("delete_room serialize failed: {}", e),
-            })?
-            .timeout(30);
+            })?;
         let resp = self
             .client()?
             .execute(req)
@@ -165,7 +163,7 @@ impl MediaBackend for LiveKitMediaBackend {
             })?;
 
         if !resp.is_success() {
-            let text = resp.text().unwrap_or_default();
+            let text = resp.text().unwrap_or(Default::default());
             return Err(SFError::Adapter {
                 provider: "livekit".into(),
                 message: format!("delete_room failed: {}", text),
@@ -183,8 +181,7 @@ impl MediaBackend for LiveKitMediaBackend {
             .map_err(|e| SFError::Adapter {
                 provider: "livekit".into(),
                 message: format!("list_rooms serialize failed: {}", e),
-            })?
-            .timeout(30);
+            })?;
         let resp = self
             .client()?
             .execute(req)
@@ -195,7 +192,7 @@ impl MediaBackend for LiveKitMediaBackend {
             })?;
 
         if !resp.is_success() {
-            let text = resp.text().unwrap_or_default();
+            let text = resp.text().unwrap_or(Default::default());
             return Err(SFError::Adapter {
                 provider: "livekit".into(),
                 message: format!("list_rooms failed: {}", text),
@@ -222,7 +219,7 @@ impl MediaBackend for LiveKitMediaBackend {
                     })
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         Ok(rooms)
     }
 
@@ -246,8 +243,7 @@ impl MediaBackend for LiveKitMediaBackend {
             .map_err(|e| SFError::Adapter {
                 provider: "livekit".into(),
                 message: format!("start_recording serialize failed: {}", e),
-            })?
-            .timeout(30);
+            })?;
         let resp = self
             .client()?
             .execute(req)
@@ -258,7 +254,7 @@ impl MediaBackend for LiveKitMediaBackend {
             })?;
 
         if !resp.is_success() {
-            let text = resp.text().unwrap_or_default();
+            let text = resp.text().unwrap_or(Default::default());
             return Err(SFError::Adapter {
                 provider: "livekit".into(),
                 message: format!("start_recording failed: {}", text),
@@ -281,8 +277,7 @@ impl MediaBackend for LiveKitMediaBackend {
             .map_err(|e| SFError::Adapter {
                 provider: "livekit".into(),
                 message: format!("stop_recording serialize failed: {}", e),
-            })?
-            .timeout(30);
+            })?;
         let resp = self
             .client()?
             .execute(req)
@@ -293,7 +288,7 @@ impl MediaBackend for LiveKitMediaBackend {
             })?;
 
         if !resp.is_success() {
-            let text = resp.text().unwrap_or_default();
+            let text = resp.text().unwrap_or(Default::default());
             return Err(SFError::Adapter {
                 provider: "livekit".into(),
                 message: format!("stop_recording failed: {}", text),

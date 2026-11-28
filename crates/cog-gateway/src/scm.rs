@@ -20,32 +20,35 @@ use cog_core::Claims;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Stdio;
-use std::time::Duration;
 
 use crate::error::ApiError;
 use crate::ide::{ensure_user_root, resolve_under};
 
-/// 一个 git 动作的硬上限。工作区是本机小仓库，慢过一次轮询周期就说明它坏了。
-// cap: bound — 一个 git 动作的硬上限；工作区是本机小仓库，慢过一次轮询周期就说明它坏了
-const GIT_TIMEOUT: Duration = Duration::from_secs(20);
 /// 一次点名多少条路径。
-// cap: bound — 一次点名多少条路径
+// cap: fixed — 一次点名多少条路径
+// keep: 删掉后一次点名路径无界，单次响应体积跟着调用方走；由「一次点名多少条路径」兜住
 const MAX_PATHS: usize = 500;
 /// 状态里最多回多少条变更。
-// cap: bound — 状态里最多回多少条变更
+// cap: fixed — 状态里最多回多少条变更
+// keep: 删掉后状态响应被变更列表撑爆；由「状态里最多回多少条变更」兜住
 const MAX_CHANGES: usize = 500;
 /// 提交说明的上限。留得比一条 changelog 宽，比一篇文章窄。
-// cap: bound — 提交说明的上限；比一条 changelog 宽，比一篇文章窄
+// cap: fixed — 提交说明的上限；比一条 changelog 宽，比一篇文章窄
+// keep: 删掉后提交说明无界，一条说明能是一篇文章；由「比一条 changelog 宽，比一篇文章窄」兜住
 const MAX_MESSAGE_CHARS: usize = 4000;
 /// 一次 diff 最多回多少字节、多少行。
-// cap: bound — 一次 diff 最多回多少字节
+// cap: fixed — 一次 diff 最多回多少字节
+// keep: 删掉后一次 diff 无界，响应把内存交出去；由「一次 diff 最多回多少字节」兜住
 const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
-// cap: bound — keeps a pathological line count from filling the byte cap with tiny lines; the byte cap is the primary bound
+// cap: fixed — keeps a pathological line count from filling the byte cap with tiny lines; the byte cap is the primary bound
+// keep: 删掉后病态的行数用极小行把字节上限填满，字节界不再是主界；由「字节界是主界」兜住
 const MAX_DIFF_LINES: usize = 20_000;
 /// 日志默认与最多回多少条。
-// cap: bound — 日志默认回多少条；调用方能要更多，上界另设
+// cap: fixed — 日志默认回多少条；调用方能要更多，上界另设
+// keep: 删掉后不点名页长的调用方拿不到默认值；由「调用方能要更多，上界另设」兜住
 const LOG_DEFAULT: usize = 20;
-// cap: bound — most log rows returned
+// cap: fixed — most log rows returned
+// keep: 删掉后一次日志读可以要任意多行；由「日志最多回多少行」兜住
 const LOG_MAX: usize = 200;
 
 #[derive(Debug, Deserialize)]
@@ -177,7 +180,7 @@ async fn run_git(root: &Path, args: &[&str], accept: &[i32]) -> Result<GitRun, A
     ];
     full.extend_from_slice(args);
 
-    let (child, mut guard) = crate::git_mirror::spawn_git_group(
+    let (mut child, mut guard) = crate::git_mirror::spawn_git_group(
         Path::new("git"),
         &full,
         None,
@@ -186,8 +189,12 @@ async fn run_git(root: &Path, args: &[&str], accept: &[i32]) -> Result<GitRun, A
     )
     .map_err(|e| ApiError::internal(format!("cannot start git: {e}")))?;
 
-    match tokio::time::timeout(GIT_TIMEOUT, child.wait_with_output()).await {
-        Ok(Ok(out)) => {
+    // 判据是它还在不在动（产出或 CPU），不是它跑了多久。工作区是本机小仓库，
+    // 但打包一个大仓库、落一次大提交能让一条 git 动作沉默地跑几分钟——那一直在
+    // 干活，钟砍它只会把已经付出的索引重来一遍。
+    let cmdline = format!("git {}", args.join(" "));
+    match cog_core::progress::watch_child(&mut child, &cmdline, None).await {
+        Ok(cog_core::progress::ChildOutcome::Exited(out)) => {
             // 进程已经收尾：pid 可能被复用，再对那个组发信号就会误伤别人。
             guard.disarm();
             let run = GitRun {
@@ -206,13 +213,7 @@ async fn run_git(root: &Path, args: &[&str], accept: &[i32]) -> Result<GitRun, A
                 )))
             }
         }
-        Ok(Err(e)) => Err(ApiError::internal(format!("git did not finish: {e}"))),
-        // 超时：守卫在离开作用域时对整组发 SIGKILL，git 自己起的孙子进程
-        // （打包、分页器）不会在网关里留一条后台链。
-        Err(_) => Err(ApiError::internal(format!(
-            "git timed out after {}s",
-            GIT_TIMEOUT.as_secs()
-        ))),
+        Err(e) => Err(ApiError::internal(format!("git did not finish: {e}"))),
     }
 }
 
@@ -513,7 +514,8 @@ async fn file_diff(root: &Path, rel: &str, staged: bool) -> Result<FileDiff, Api
         while cut > 0 && !text.is_char_boundary(cut) {
             cut -= 1;
         }
-        text.truncate(cut);
+        // keep: 完整 diff 就在磁盘上（同一条 `git diff -- <rel>` 重跑即得），这里只留判词读者读得完的前缀；由同一棵树重取兜住
+        text.truncate(cut); // full_ref: 同一棵树上 `git diff -- <rel>` 的完整输出
         truncated = true;
     }
 

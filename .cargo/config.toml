@@ -1,0 +1,16 @@
+# 测试线程的栈必须容得下 debug 构型下最大的协程帧。
+#
+# 实测（2026-11-11，cog-reflection 的 debug 测试二进制，用 objdump 读 resume 函数的
+# 开场指令）：`MainlineDeployer::poll_once` 的协程一开场就 `sub $0x1ec000,%rsp`
+# （1.92 MiB），调用它的 `run_cycle` 再加 0x23000（140 KiB）。两帧相加 2.06 MiB，
+# 已经超过测试线程默认的 2 MiB —— 溢出现场在 `poll_once` 的第一条语句之前，读起来
+# 像「一进函数就崩」，与哪一行代码无关。这不是某一个用例的问题：凡是驱动完整一轮
+# 的用例都会踩到它（实测 `a_cycle_that_fails_still_leaves_its_outcome_reading`
+# 用默认栈必红、4 MiB 转绿），而 debug 帧只会随后续改动长大。
+#
+# 8 MiB 是这一档的界：实测 1.92 MiB 帧的四倍。余量说明的不是「现在够用」，
+# 而是「帧再长一次时先红的是这个界本身，而不是随机某个用例的栈溢出」。
+# 外部显式设了 RUST_MIN_STACK 时以外部为准（cargo 默认不覆盖已存在的变量），
+# 复现与二分测量时不必改这份文件。
+[env]
+RUST_MIN_STACK = "8388608"

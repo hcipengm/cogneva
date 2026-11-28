@@ -18,17 +18,14 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 async-trait = "0.1"
 
 # Regex for pattern matching
 regex = "1.11"
-
-# Content filtering
-rs-snowflake = "0.6"
 
 # Unicode normalization for adversarial input detection
 unicode-normalization = "0.1"
 
 [dev-dependencies]
 tokio-test = "0.4"
+tracing-subscriber = { workspace = true }

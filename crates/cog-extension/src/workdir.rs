@@ -21,13 +21,22 @@
 //! with this process, so a restart cannot leave a stale claim behind, and
 //! everything a restart must reconcile is still on the volume.
 //!
+//! A tree belongs to one volume, but the work in it belongs to the task. When
+//! the replica holding a lane's tree is gone, [`WorkdirRouter::pack_lane`]
+//! turns that tree into a bundle the task can carry and
+//! [`WorkdirRouter::unpack_lane`] writes it back into a tree on another
+//! replica — content as uncommitted changes, history staying on the old
+//! volume. Without that step "the work follows the task" would only be true
+//! for work already pushed to a remote.
+//!
 //! The bare-repo + worktree + out-of-tree sidecar + external target dir +
 //! stale-lock self-heal pattern is deliberately copied from the evolution
 //! WorkspaceManager: cog-extension must not depend on upper crates, and only
 //! about a hundred lines of that semantics apply here.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,11 +45,12 @@ use cog_core::{SFError, SFResult};
 use prometheus::{Counter, CounterVec, Encoder, Gauge, GaugeVec, Opts, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use cog_core::build_cache_readings::{BuildCacheReadings, CacheSlot};
 
 use crate::build_cache::{BuildCacheConfig, CommandSlot, SANDBOX_BUILD_CACHE_LOOP};
+use crate::checkpoints;
 
 /// Loop name reported through the background-loop liveness family.
 pub const WORKTREE_GC_LOOP: &str = "extension_worktree_gc";
@@ -51,13 +61,17 @@ pub const WORKTREE_FETCH_LOOP: &str = "extension_worktree_fetch";
 /// Loop name of the claim-footprint walk over this executor's own volumes.
 pub const VOLUME_FOOTPRINT_LOOP: &str = "extension_volume_footprint";
 
-// cap: bound — seed; applies only until two trees exist to give an arrival interval
+// cap: fixed — seed; applies only until two trees exist to give an arrival interval
+// keep: 删掉后在两棵树出现之前没有到达间隔可算，空闲树没有可用的保留期，只能立刻回收刚用完的树；由「种子只用到有实测为止」兜住
 const DEFAULT_TTL_SECS: u64 = 21600;
-// cap: bound — seed; applies only until a reclamation pass has been timed, then the interval follows the pass
+// cap: fixed — seed; applies only until a reclamation pass has been timed, then the interval follows the pass
+// keep: 删掉后第一次回收还没有耗时读数，回收循环没有可用的间隔；由「种子只用到有一次实测为止」兜住
 const DEFAULT_GC_INTERVAL_SECS: u64 = 600;
-// cap: bound — seed; applies only until the first observed move of main, then the fetch period follows that
+// cap: fixed — seed; applies only until the first observed move of main, then the fetch period follows that
+// keep: 删掉后还没有见过 main 移动时，取回循环没有可用的周期；由「种子只用到第一次实测为止」兜住
 const DEFAULT_FETCH_INTERVAL_SECS: u64 = 300;
-// cap: bound — policy ceiling when the deployment names none; the disk measurement can still lower it
+// cap: fixed — seed when the deployment names none; the volume's own reading replaces it as soon as one tree exists
+// keep: 删掉后在还没有容量读数时没有并发树数可用，路一多就把卷写满；由「卷自己的读数一有就替换它」兜住
 const DEFAULT_MAX_WORKSPACES: usize = 8;
 
 /// Trees kept cut and ready under `workspaces/.warm`, so a new task's first
@@ -72,7 +86,8 @@ const DEFAULT_MAX_WORKSPACES: usize = 8;
 /// is only worth holding
 /// until the next arrival: arrivals measured ~1.1 a minute on this host, and
 /// the refill runs off the request path.
-// cap: bound — seed; a deployment that names none gets two, the pool never holds more than half the task ceiling
+// cap: fixed — seed; applies until an arrival rate and a checkout cost have both been measured
+// keep: 删掉后在两项实测都还没有时，新会话的第一次调用没有树可接；由「种子只用到两项实测都有为止」兜住
 const DEFAULT_WARM_TREES: usize = 2;
 
 /// Where warm trees wait between arrivals. Dot-prefixed because every listing
@@ -90,16 +105,21 @@ const META_DIR_NAME: &str = ".meta";
 /// deciding whether a task's tree is still the one git registered.
 const WORKTREE_LINK: &str = ".git";
 
-/// Maximum task id length, keeps the on-disk directory name clear of
+/// Maximum lane length, keeps the on-disk directory name clear of
 /// `ENAMETOOLONG` while accommodating generated ids such as
 /// `<owner-task>-ralph-roundtable-i12-<8 hex>`.
-// cap: bound — 目录名要躲开 ENAMETOOLONG，又要装得下生成的 id
-const MAX_TASK_ID_LEN: usize = 128;
+///
+/// Taken from `cog-core` rather than chosen here: the lane name is derived
+/// there and validated here, and a second, tighter ceiling would reject exactly
+/// the long ids that derivation promised a checkout -- with no error, since an
+/// invalid lane reads as a caller that named none.
+const MAX_TASK_ID_LEN: usize = cog_core::MAX_CHECKOUT_NAME_CHARS;
 
 /// The shortest time between two reclamation passes, and the pace the loop
 /// wakes at whatever the derived interval turns out to be -- waking is cheap,
 /// a pass is not.
-// cap: bound — 两次回收之间的最短间隔，也是循环无条件醒来的节奏
+// cap: fixed — 两次回收之间的最短间隔，也是循环无条件醒来的节奏
+// keep: 删掉后算出的间隔可以趋近于零，回收循环在卷空时也空转；由「唤醒便宜、一次 pass 不便宜」兜住
 const MIN_GC_INTERVAL_SECS: u64 = 30;
 
 /// How many times a pass's own duration the interval must cover, so maintenance
@@ -107,18 +127,25 @@ const MIN_GC_INTERVAL_SECS: u64 = 30;
 /// period: the pass gets slower as the volume fills, and the interval has to
 /// follow it or the upkeep becomes the load. Shared by reclamation and the
 /// build-cache walk -- one control law, one number.
-// cap: bound — 间隔要覆盖一次回收自身耗时的这么多倍，维护至多占 1/20
+// cap: fixed — 间隔要覆盖一次回收自身耗时的这么多倍，维护至多占 1/20
+// keep: 删掉后间隔只覆盖一次回收自身耗时，维护会占满进程的全部时间；由「维护至多占 1/20」兜住
 const MAINTENANCE_OVERHEAD_MULTIPLE: u64 = 20;
 
 /// The published name of the interval the reclamation loop is keeping.
 const GC_INTERVAL_METRIC: &str = "sandbox_workspace_gc_interval_seconds";
+
+/// How many times the reclamation interval has been recomputed. A pass that
+/// costs the same every time keeps the interval where it is, so the interval
+/// alone cannot say the loop is still running.
+const GC_INTERVAL_EVALUATIONS_METRIC: &str = "sandbox_workspace_gc_interval_evaluations_total";
 
 /// The shortest wait between two upstream fetches. Below this the loop would be
 /// asking the mirror for the same commit faster than a push can arrive, and the
 /// cost of the git round trip stops being paid for by anything. A floor rather
 /// than a period: the period itself follows how often `main` is observed to
 /// move.
-// cap: bound — 比这更密就是在向镜像要同一个 commit，比一次推送还快
+// cap: fixed — 比这更密就是在向镜像要同一个 commit，比一次推送还快
+// keep: 删掉后循环可以在同一个 commit 上反复问镜像，比一次推送到达还快；由「一次推送到达的节奏」兜住
 const MIN_FETCH_INTERVAL_SECS: u64 = 30;
 
 /// The published name of the wait the fetch loop is currently keeping, and the
@@ -126,6 +153,11 @@ const MIN_FETCH_INTERVAL_SECS: u64 = 30;
 /// configuration. Without it the configured number is the only one anyone can
 /// see, and the loop silently stopping to use it would be invisible.
 const FETCH_INTERVAL_METRIC: &str = "sandbox_repo_fetch_interval_seconds";
+
+/// How many times the fetch wait has been recomputed. An unchanged head keeps
+/// the period where it is; this is what tells a still repository from a loop
+/// that stopped asking.
+const FETCH_INTERVAL_EVALUATIONS_METRIC: &str = "sandbox_repo_fetch_interval_evaluations_total";
 
 /// The label saying which input set a published period -- configuration, floor
 /// or measurement. Without it the configured number is the only one anyone can
@@ -139,6 +171,91 @@ const SOURCES: [&str; 3] = ["configured", "floor", "measured"];
 
 /// The published name of the idle TTL the reclamation pass is using.
 const TTL_METRIC: &str = "sandbox_workspace_ttl_seconds";
+
+/// How many times the hold time has been recomputed. A steady arrival rate
+/// derives the same hold every pass, so the count is the only sign the law is
+/// still being evaluated.
+const TTL_EVALUATIONS_METRIC: &str = "sandbox_workspace_ttl_evaluations_total";
+
+/// How many task trees the volume is measured to hold, and the input set that
+/// chose it. The deployment's number is only the seed: before a tree exists
+/// there is no per-tree figure to divide the volume by, and after one exists
+/// the volume's own reading is the cap.
+const WORKSPACE_CAP_METRIC: &str = "sandbox_workspace_cap";
+
+/// How many times the cap has been recomputed. The number itself only moves
+/// when the volume or the trees do; this shows the pass that reads them is
+/// running.
+const WORKSPACE_CAP_EVALUATIONS_METRIC: &str = "sandbox_workspace_cap_evaluations_total";
+
+/// The input sets [`WORKSPACE_CAP_METRIC`] can name: the deployment's seed
+/// before any tree has been measured, the volume's reading after.
+const CAP_SOURCES: [&str; 2] = ["seed", "measured"];
+
+/// The number of trees the pool is keeping ready, and the input set that chose
+/// it. The seed is what the deployment names; the measurement is an arrival
+/// rate times a checkout cost. Without this series the seed is the only number
+/// anyone can see, and a pool that never left it looks the same as a pool whose
+/// law happens to agree with it.
+const WARM_TREES_METRIC: &str = "sandbox_workspace_warm_trees";
+
+/// How many times the pool's target has been recomputed. A value that only
+/// changes when its inputs do cannot show that the loop is running; this can.
+const WARM_TREES_EVALUATIONS_METRIC: &str = "sandbox_workspace_warm_trees_evaluations_total";
+
+/// The input sets [`WARM_TREES_METRIC`] can name: the deployment's seed before
+/// both measurements exist, the measurement after.
+const WARM_TREES_SOURCES: [&str; 2] = ["seed", "measured"];
+
+/// The window arrival samples are kept over. Longer than any working day, so a
+/// burst is not averaged away by the quiet hours around it.
+// cap: fixed — 7 天：比任何工作日都长，突发才不会被两旁的安静时段平均掉
+// keep: 删掉后到达样本无限留着，上个月的突发一直在定今天的树数；由「比任何工作日都长的一周」兜住
+const ARRIVAL_WINDOW_SECS: i64 = 7 * 24 * 3600;
+
+/// How many arrival timestamps to keep. A cap rather than a promise: the window
+/// above already bounds the queue for realistic rates, and this bounds it for
+/// a pathological one.
+// cap: fixed — 1024 是给病理速率的兜底（正常速率由上面的窗口兜）：内存代价随它走
+// keep: 删掉后病理速率下这份时间戳队列无界地长，内存跟着攻击性的到达走；由「正常速率由窗口兜、病理速率由它兜」兜住
+const MAX_ARRIVAL_SAMPLES: usize = 1024;
+
+/// How many checkout durations to keep for the median. Small on purpose: the
+/// cost follows the repository's size, which changes over days, not seconds.
+// cap: fixed — 32 个样本取中位数就够：成本跟着仓库大小走，那是按天变的，不是按秒
+// keep: 删掉后每次 checkout 都留一个样本，成本中位数被历史全量拖着走；由「成本按天变、32 个样本够」兜住
+const CHECKOUT_SAMPLES: usize = 32;
+
+/// How many ready trees are worth holding: Little's law over the two costs the
+/// pool trades against each other.
+///
+/// An arrival every `span / arrivals` seconds, each costing `checkout_secs` to
+/// serve, means that many arrivals are in flight while one tree is being cut.
+/// Holding exactly that many removes the checkout from the request path without
+/// spending the volume on trees no one has asked for. The ceiling is half the
+/// task capacity, because the pool exists to make arrivals cheap and spending
+/// the whole volume on trees no task has asked for would make the tasks
+/// themselves wait.
+///
+/// `None` until both a rate and a cost have been measured: a number invented
+/// from one measurement is the configured value wearing a measurement's
+/// clothes.
+fn warm_trees_from(
+    arrivals: usize,
+    span_secs: u64,
+    checkout_secs: f64,
+    ceiling: usize,
+) -> Option<usize> {
+    if arrivals < 2 || span_secs == 0 || checkout_secs <= 0.0 {
+        return None;
+    }
+    if ceiling == 0 {
+        return Some(0);
+    }
+    let per_second = arrivals as f64 / span_secs as f64;
+    let in_flight = (per_second * checkout_secs).ceil() as usize;
+    Some(in_flight.clamp(1, ceiling))
+}
 
 /// The published name of the wait the volume walk is currently keeping.
 const VOLUME_WALK_INTERVAL_METRIC: &str = "sandbox_volume_walk_interval_seconds";
@@ -228,7 +345,8 @@ fn ttl_from(capacity: usize, trees: usize, span_secs: u64) -> Option<Duration> {
 
 /// The shortest an idle tree is held, whatever the arithmetic says: below this
 /// the executor rebuilds trees it has just finished with.
-// cap: bound — 空闲树最少留一小时，再短执行器就在重建刚用完的树
+// cap: fixed — 空闲树最少留一小时，再短执行器就在重建刚用完的树
+// keep: 删掉后算出来的保留期可以短到几秒，执行器在重建刚用完的树；由「空闲树至少留一小时」兜住
 const MIN_TTL_SECS: u64 = 3600;
 
 /// Which of the three inputs set the period in force.
@@ -345,16 +463,22 @@ fn gc_interval_from(pass_millis: u64, configured: Duration) -> Duration {
 /// below a floor. A fixed period silently spends a growing share as the volume
 /// fills, which is the failure that looks like "the executor got slow" rather
 /// than "the executor is reclaiming".
+///
+/// The arithmetic is `cog_core::pacing`, the one copy every self-paced loop in
+/// the workspace uses; this wrapper only adapts milliseconds and a whole-number
+/// share to it.
 fn paced_interval(
     pass_millis: u64,
     configured: Duration,
     floor_secs: u64,
     multiple: u64,
 ) -> Duration {
-    if pass_millis == 0 {
-        return configured;
-    }
-    scaled(pass_millis, multiple).max(Duration::from_secs(floor_secs))
+    cog_core::pacing::paced_interval(
+        Duration::from_millis(pass_millis),
+        configured,
+        Duration::from_secs(floor_secs),
+        multiple as f64,
+    )
 }
 
 /// The period a pass of `pass_millis` buys at a given share, before any floor.
@@ -366,6 +490,21 @@ fn scaled(pass_millis: u64, multiple: u64) -> Duration {
     Duration::from_secs((pass_millis / 1000).saturating_mul(multiple))
 }
 
+/// 一个样本窗口的中位数；窗口空着时是 `None`。
+fn median_of(samples: &std::sync::Mutex<VecDeque<u64>>) -> Option<u64> {
+    let mut values: Vec<u64> = samples
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    Some(values[values.len() / 2])
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkdirConfig {
     pub workspaces_root: PathBuf,
@@ -375,11 +514,20 @@ pub struct WorkdirConfig {
     pub ttl: Duration,
     pub gc_interval: Duration,
     pub fetch_interval: Duration,
+    /// The cap's seed: how many trees this executor is meant to serve before
+    /// the volume has been measured. Once a tree exists its own size and the
+    /// volume's free room set the cap, and this stops applying.
     pub max_workspaces: usize,
-    /// How many trees to keep cut and ready under [`WARM_DIR_NAME`]. Never
-    /// more than half the task ceiling: the pool exists to make arrivals
-    /// cheap, and spending the ceiling on trees no task has asked for would
-    /// make the tasks themselves wait.
+    /// A fixture volume of a known capacity, for tests that need a ceiling
+    /// smaller than a test host's disk. Production never sets it: the cap is
+    /// what the volume measures.
+    #[cfg(test)]
+    pub cap_override: Option<usize>,
+    /// How many trees to keep cut and ready under [`WARM_DIR_NAME`], before an
+    /// arrival rate and a checkout cost have both been measured. The measured
+    /// target is clamped to half the task capacity: the pool exists to make
+    /// arrivals cheap, and spending the capacity on trees no task has asked
+    /// for would make the tasks themselves wait.
     pub warm_trees: usize,
     /// Claim-backed volumes this process measures the footprint of. Which claim
     /// backs which directory is a fact only the deployment knows, so it comes
@@ -421,8 +569,7 @@ impl WorkdirConfig {
         let warm = std::env::var("SANDBOX_WARM_TREES")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(DEFAULT_WARM_TREES)
-            .min(max / 2);
+            .unwrap_or(DEFAULT_WARM_TREES);
         let (data_volumes, data_volume_declaration_error) =
             match std::env::var(cog_core::claim_footprint::MOUNTS_ENV) {
                 Ok(raw) => match cog_core::claim_footprint::parse_claim_paths(&raw) {
@@ -484,6 +631,8 @@ impl WorkdirConfig {
                 30,
             ),
             max_workspaces: max,
+            #[cfg(test)]
+            cap_override: None,
             warm_trees: warm,
             data_volumes,
             data_volume_declaration_error,
@@ -514,6 +663,12 @@ fn split_seed_urls(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// What a tree's sidecar records about it.
+///
+/// `task_id` holds the lane the tree belongs to. The field kept its name so the
+/// sidecars on a running volume still read back: a rename would make every
+/// existing tree look like a registration without a record, and the boot pass
+/// would adopt each one as if its sidecar had been lost.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct TaskMeta {
     task_id: String,
@@ -526,11 +681,32 @@ pub struct WorkdirMetrics {
     registry: Registry,
     workspaces: Gauge,
     gc_reclaimed: Counter,
+    /// The same removals, split by why they happened. The total alone reads
+    /// "the volume is losing trees" and nothing about the reason: a TTL reap is
+    /// the pass doing its job on a tree nobody needs, while a cap reap is the
+    /// volume forcing the pass to choose -- and choosing is where work gets
+    /// lost. Both kinds are also counted separately where they are decided
+    /// (kept, deferred, took-uncommitted), and those counters answer different
+    /// questions; this pair is the one that says which path removed the tree.
+    ttl_reclaimed: Counter,
+    cap_reclaimed: Counter,
+    /// Idle trees a pass walked past because they still hold uncommitted work.
+    /// Without it, "the pass finds nothing to do" and "the pass finds trees it
+    /// must not touch" read the same on the volume-usage series, and the second
+    /// is the one worth knowing about: it is what fills the disk.
+    gc_kept: Counter,
     /// Cap passes that could not be met without deleting a tree a command is
     /// running in. A pass that defers is otherwise invisible: the cap holding
     /// and the cap being unreachable both read as "nothing happened", and only
     /// this series says which trees are keeping the count above the cap.
     cap_deferred: Counter,
+    /// Trees the cap took although they held work nobody committed. The cap is
+    /// a hard bound on the volume, so this can happen -- but it is the one way
+    /// this router destroys something it cannot rebuild from the bare
+    /// repository, and the loss has no other trace: the tree is gone, the
+    /// files with it, and the next command in that lane gets a fresh checkout
+    /// that looks exactly like the one it expected.
+    cap_took_uncommitted: Counter,
     fetch_failures: Counter,
     unscoped_requests: Counter,
     errors: CounterVec,
@@ -552,6 +728,20 @@ pub struct WorkdirMetrics {
     gc_interval_seconds: PeriodGauge,
     /// The volume walk's interval in force, published the same way.
     volume_walk_interval_seconds: PeriodGauge,
+    /// Recomputations of the fetch wait, the hold time and the reclamation
+    /// interval. Each of those numbers only moves when its input does, so the
+    /// period in force cannot say whether the loop that derives it still runs.
+    fetch_interval_evaluations: Counter,
+    ttl_evaluations: Counter,
+    gc_interval_evaluations: Counter,
+    /// The task-tree cap in force, and the input set that chose it.
+    cap: Gauge,
+    cap_source: GaugeVec,
+    cap_evaluations: Counter,
+    /// The warm pool's target in force, and the input set that chose it.
+    warm_trees: Gauge,
+    warm_trees_source: GaugeVec,
+    warm_trees_evaluations: Counter,
 }
 
 impl WorkdirMetrics {
@@ -567,9 +757,25 @@ impl WorkdirMetrics {
             "sandbox_workspace_gc_reclaimed_total",
             "Task worktrees removed by TTL/LRU garbage collection",
         )?;
+        let ttl_reclaimed = Counter::new(
+            "sandbox_workspace_ttl_reclaimed_total",
+            "Task worktrees removed because nothing had touched them past the TTL",
+        )?;
+        let cap_reclaimed = Counter::new(
+            "sandbox_workspace_cap_reclaimed_total",
+            "Task worktrees removed to hold the volume cap",
+        )?;
+        let gc_kept = Counter::new(
+            "sandbox_workspace_gc_kept_total",
+            "Idle task worktrees left in place because they hold uncommitted work",
+        )?;
         let cap_deferred = Counter::new(
             "sandbox_workspace_cap_deferred_total",
             "Task worktrees kept above the LRU cap because a command was running in them",
+        )?;
+        let cap_took_uncommitted = Counter::new(
+            "sandbox_workspace_cap_took_uncommitted_total",
+            "Task worktrees removed by the LRU cap although they held uncommitted work",
         )?;
         let fetch_failures = Counter::new(
             "sandbox_workspace_fetch_failures_total",
@@ -607,7 +813,11 @@ impl WorkdirMetrics {
         )?;
         registry.register(Box::new(workspaces.clone()))?;
         registry.register(Box::new(gc_reclaimed.clone()))?;
+        registry.register(Box::new(ttl_reclaimed.clone()))?;
+        registry.register(Box::new(cap_reclaimed.clone()))?;
+        registry.register(Box::new(gc_kept.clone()))?;
         registry.register(Box::new(cap_deferred.clone()))?;
+        registry.register(Box::new(cap_took_uncommitted.clone()))?;
         registry.register(Box::new(fetch_failures.clone()))?;
         registry.register(Box::new(unscoped_requests.clone()))?;
         registry.register(Box::new(errors.clone()))?;
@@ -638,11 +848,81 @@ impl WorkdirMetrics {
             "Seconds between walks of the volumes this executor writes",
             cfg.data_volume_interval,
         )?;
+        let fetch_interval_evaluations = Counter::new(
+            FETCH_INTERVAL_EVALUATIONS_METRIC,
+            "Recomputations of the wait between upstream fetches",
+        )?;
+        let ttl_evaluations = Counter::new(
+            TTL_EVALUATIONS_METRIC,
+            "Recomputations of the idle hold time during a reclamation pass",
+        )?;
+        let gc_interval_evaluations = Counter::new(
+            GC_INTERVAL_EVALUATIONS_METRIC,
+            "Recomputations of the interval between reclamation passes",
+        )?;
+        registry.register(Box::new(fetch_interval_evaluations.clone()))?;
+        registry.register(Box::new(ttl_evaluations.clone()))?;
+        registry.register(Box::new(gc_interval_evaluations.clone()))?;
+        let cap = Gauge::new(
+            WORKSPACE_CAP_METRIC,
+            "Task worktrees the volume is measured to hold at the size these trees are",
+        )?;
+        let cap_source = GaugeVec::new(
+            Opts::new(
+                format!("{WORKSPACE_CAP_METRIC}_source"),
+                "Which input set chose the task-tree cap: 1 for that one, 0 for the other",
+            ),
+            &[SOURCE_LABEL],
+        )?;
+        let cap_evaluations = Counter::new(
+            WORKSPACE_CAP_EVALUATIONS_METRIC,
+            "Recomputations of the task-tree cap from the volume's reading",
+        )?;
+        registry.register(Box::new(cap.clone()))?;
+        registry.register(Box::new(cap_source.clone()))?;
+        registry.register(Box::new(cap_evaluations.clone()))?;
+        cap.set(cfg.max_workspaces as f64);
+        for candidate in CAP_SOURCES {
+            cap_source
+                .with_label_values(&[candidate])
+                .set(if candidate == "seed" { 1.0 } else { 0.0 });
+        }
+        let warm_trees = Gauge::new(
+            WARM_TREES_METRIC,
+            "Trees the warm pool is keeping cut and ready, chosen from an arrival rate and a checkout cost",
+        )?;
+        let warm_trees_source = GaugeVec::new(
+            Opts::new(
+                format!("{WARM_TREES_METRIC}_source"),
+                "Which input set chose the pool target: 1 for that one, 0 for the other",
+            ),
+            &[SOURCE_LABEL],
+        )?;
+        let warm_trees_evaluations = Counter::new(
+            WARM_TREES_EVALUATIONS_METRIC,
+            "Recomputations of the warm pool target by the reclamation pass",
+        )?;
+        registry.register(Box::new(warm_trees.clone()))?;
+        registry.register(Box::new(warm_trees_source.clone()))?;
+        registry.register(Box::new(warm_trees_evaluations.clone()))?;
+        // Registered at the seed rather than at zero: zero would read as a
+        // pool that has been turned off, which is a decision the measurement
+        // has not made yet.
+        for candidate in WARM_TREES_SOURCES {
+            warm_trees_source
+                .with_label_values(&[candidate])
+                .set(if candidate == "seed" { 1.0 } else { 0.0 });
+        }
+        warm_trees.set(cfg.warm_trees as f64);
         Ok(Self {
             registry,
             workspaces,
             gc_reclaimed,
+            ttl_reclaimed,
+            cap_reclaimed,
+            gc_kept,
             cap_deferred,
+            cap_took_uncommitted,
             fetch_failures,
             unscoped_requests,
             errors,
@@ -653,7 +933,36 @@ impl WorkdirMetrics {
             ttl_seconds,
             gc_interval_seconds,
             volume_walk_interval_seconds,
+            fetch_interval_evaluations,
+            ttl_evaluations,
+            gc_interval_evaluations,
+            cap,
+            cap_source,
+            cap_evaluations,
+            warm_trees,
+            warm_trees_source,
+            warm_trees_evaluations,
         })
+    }
+
+    /// Publish the task-tree cap in force and the one input set that chose it.
+    fn set_cap(&self, trees: usize, source: &str) {
+        self.cap.set(trees as f64);
+        for candidate in CAP_SOURCES {
+            self.cap_source
+                .with_label_values(&[candidate])
+                .set(if candidate == source { 1.0 } else { 0.0 });
+        }
+    }
+
+    /// Publish the pool target in force and the one input set that chose it.
+    fn set_warm_trees(&self, trees: usize, source: &str) {
+        self.warm_trees.set(trees as f64);
+        for candidate in WARM_TREES_SOURCES {
+            self.warm_trees_source
+                .with_label_values(&[candidate])
+                .set(if candidate == source { 1.0 } else { 0.0 });
+        }
     }
 
     pub fn render(&self) -> String {
@@ -772,9 +1081,6 @@ pub struct WorkdirRouter {
     last_move_unix: AtomicI64,
     stillness_secs: AtomicU64,
     last_fetch_unix: AtomicI64,
-    /// The longest git command that has completed here, in milliseconds. What
-    /// the timeout is a multiple of; see [`cog_core::git_budget`].
-    git_slowest_ms: AtomicU64,
     /// The last reclamation pass's duration, in milliseconds, and when it
     /// started. What the interval is a multiple of.
     gc_pass_millis: AtomicU64,
@@ -785,6 +1091,40 @@ pub struct WorkdirRouter {
     /// The same two for the walk over the volumes this executor writes.
     volume_pass_millis: AtomicU64,
     last_volume_walk_unix: AtomicI64,
+    /// How many ready trees the pool should hold right now. Seeded from the
+    /// deployment, then recomputed by every reclamation pass from the arrival
+    /// rate and the checkout cost it measures.
+    warm_target: AtomicUsize,
+    /// When lanes last arrived, most recent last. The rate is counted over the
+    /// span these cover, so a burst is visible while it happens rather than
+    /// averaged away against the process's whole life.
+    arrivals: std::sync::Mutex<VecDeque<i64>>,
+    /// The last few successful checkout durations, in milliseconds. A checkout
+    /// is the cost the pool removes from the request path, and it is what the
+    /// rate is multiplied by.
+    checkout_millis: std::sync::Mutex<VecDeque<u64>>,
+    /// The last few carries of a lane's tree: how long the pack or unpack took
+    /// and how many bytes travelled. It is the shared shape's extra cost -- a
+    /// tree only moves when its replica goes away -- so it is a reading, not an
+    /// assumption. Same window width as a checkout: both follow how big a tree
+    /// is, which changes over days.
+    carry_millis: std::sync::Mutex<VecDeque<u64>>,
+    carry_bytes: std::sync::Mutex<VecDeque<u64>>,
+    /// The bytes and the count of the trees the last volume walk measured. The
+    /// quotient is what one task occupies on this volume, which is the volume
+    /// half of what a sandbox shape costs a task.
+    last_tree_bytes: AtomicU64,
+    last_tree_count: AtomicU64,
+}
+
+/// Why a tree was removed. The two passes answer different questions -- the
+/// TTL asks whether anybody still needs the tree, the cap asks whether the
+/// volume can hold it -- and a removal that cannot say which one it was reads
+/// the same either way, so the next pass cannot be tuned from the reading.
+#[derive(Clone, Copy)]
+enum Reap {
+    Ttl,
+    Cap,
 }
 
 impl WorkdirRouter {
@@ -813,6 +1153,7 @@ impl WorkdirRouter {
             })
             .collect();
         let build_cache = Arc::new(cfg.build_cache.readings(cfg.target_dir.clone()));
+        let warm_seed = cfg.warm_trees;
         Ok(Arc::new(Self {
             cfg,
             meta_dir,
@@ -827,13 +1168,19 @@ impl WorkdirRouter {
             last_move_unix: AtomicI64::new(0),
             stillness_secs: AtomicU64::new(0),
             last_fetch_unix: AtomicI64::new(0),
-            git_slowest_ms: AtomicU64::new(0),
             gc_pass_millis: AtomicU64::new(0),
             last_gc_unix: AtomicI64::new(0),
             cache_pass_millis: AtomicU64::new(0),
             last_cache_walk_unix: AtomicI64::new(0),
             volume_pass_millis: AtomicU64::new(0),
             last_volume_walk_unix: AtomicI64::new(0),
+            warm_target: AtomicUsize::new(warm_seed),
+            arrivals: std::sync::Mutex::new(VecDeque::new()),
+            checkout_millis: std::sync::Mutex::new(VecDeque::new()),
+            carry_millis: std::sync::Mutex::new(VecDeque::new()),
+            carry_bytes: std::sync::Mutex::new(VecDeque::new()),
+            last_tree_bytes: AtomicU64::new(0),
+            last_tree_count: AtomicU64::new(0),
         }))
     }
 
@@ -865,6 +1212,29 @@ impl WorkdirRouter {
 
     pub fn config(&self) -> &WorkdirConfig {
         &self.cfg
+    }
+
+    /// 切一棵任务树最近花掉的墙钟（中位，秒）。`None` 是一条都没切完：一个零
+    /// 会读成「免费」，而免费的树不存在。
+    pub fn checkout_seconds(&self) -> Option<f64> {
+        self.checkout_secs()
+    }
+
+    /// 一棵任务树占的字节：最近一次卷走查量到的总字节除以树数。走查还没量到
+    /// 两边时是 `None`。
+    pub fn tree_bytes(&self) -> Option<u64> {
+        let bytes = self.last_tree_bytes.load(Ordering::Relaxed);
+        let count = self.last_tree_count.load(Ordering::Relaxed);
+        (bytes > 0 && count > 0).then(|| bytes / count)
+    }
+
+    /// 这副副本自己那半段搬树代价：中位墙钟（秒）与中位字节。搬一次要打包、
+    /// 传输、解包，这里量得到的是它的这一头；一次都没搬过时是 `None`。
+    pub fn carry_reading(&self) -> Option<(f64, u64)> {
+        Some((
+            median_of(&self.carry_millis)? as f64 / 1000.0,
+            median_of(&self.carry_bytes)?,
+        ))
     }
 
     pub fn target_dir(&self) -> &Path {
@@ -938,26 +1308,166 @@ impl WorkdirRouter {
         }
     }
 
-    /// Resolve the working directory for a task id and claim it for the command
+    /// Resolve the working directory for a lane and claim it for the command
     /// about to run there, lazily creating the tree on first sight.
+    ///
+    /// A lane is whatever [`cog_core::checkout_lane`] named for the request: the
+    /// task's tree when the request named a task, the employee's own otherwise.
+    /// The router does not derive it -- a second derivation here would be the
+    /// one that drifts from what the run's system prefix says.
     ///
     /// The claim is taken before the first filesystem call: a reclamation pass
     /// that has already listed this tree must still see it in use when it
     /// reaches its own decision, and the only moment a claim can protect a tree
-    /// is before anything starts using it. Invalid ids and add failures surface
-    /// as errors instead of silently collapsing onto a shared directory.
-    pub async fn route(self: &Arc<Self>, task_id: &str) -> SFResult<(PathBuf, WorktreeUse)> {
-        validate_task_id(task_id)?;
-        let use_guard = self.claim(task_id);
-        let (path, took_warm) = self.route_validated(task_id, true).await?;
+    /// is before anything starts using it. Invalid lanes and add failures
+    /// surface as errors instead of silently collapsing onto a shared directory.
+    pub async fn route(
+        self: &Arc<Self>,
+        lane: &str,
+    ) -> SFResult<(PathBuf, WorktreeUse, cog_core::WorktreeOrigin)> {
+        validate_task_id(lane)?;
+        let use_guard = self.claim(lane);
+        let (path, origin) = self.route_validated(lane, true).await?;
         // Refill after the answer, never before it: the caller is waiting for
         // a directory to run in, and the tree that replaces the one just taken
         // is for a task that has not arrived yet.
-        if took_warm {
+        if origin == cog_core::WorktreeOrigin::Warm {
             let router = Arc::clone(self);
             tokio::spawn(async move { router.warm_pool_once().await });
         }
-        Ok((path, use_guard))
+        Ok((path, use_guard, origin))
+    }
+
+    /// 这棵树连同它身上未推送到远端的东西，打成一份能带走的包。
+    ///
+    /// 搬的是**内容**，不是历史：包里的那个提交是本模块拍的一张快照（临时索引、
+    /// 不碰真正的索引与 HEAD），落到另一副副本上时写回工作区——于是搬过来的改动
+    /// 在 `git status` 里如实可见，和它在原来那副上时一样。只在那副副本上存在过
+    /// 的分支提交不会以提交的身份跟过来；它们的效果在树里，历史在原来那副卷上。
+    ///
+    /// 一条 lane 上还有命令在跑时不打包：那棵树正在被写，打出来的包说不出它是
+    /// 哪一刻的样子。没有树则没什么可搬——那是 [`CarryError::NoTree`]，不是失败。
+    pub async fn pack_lane(&self, lane: &str) -> Result<Vec<u8>, CarryError> {
+        let started = std::time::Instant::now();
+        validate_task_id(lane).map_err(|e| CarryError::Refused(e.to_string()))?;
+        let tree = self.tree_of(lane).await.ok_or_else(|| {
+            CarryError::NoTree(format!("lane {lane} has no tree on this replica"))
+        })?;
+        if lock_claims(&self.in_use).get(lane).copied().unwrap_or(0) > 0 {
+            return Err(CarryError::Busy(format!(
+                "a command is running in lane {lane}'s tree right now"
+            )));
+        }
+        let key = carry_key(lane);
+        checkpoints::capture(&tree, &key)
+            .await
+            .map_err(CarryError::Failed)?;
+        let path = self.carry_path(lane);
+        let path_text = path.to_string_lossy().into_owned();
+        let refname = checkpoints::refname(&key);
+        let packed = self
+            .run_git(&["bundle", "create", &path_text, &refname], Some(&tree))
+            .await;
+        if let Err(e) = packed {
+            cog_core::ignore_lost!(tokio::fs::remove_file(&path).await);
+            return Err(CarryError::Failed(e.to_string()));
+        }
+        let bytes = tokio::fs::read(&path).await.map_err(|e| {
+            CarryError::Failed(format!("the bundle just written cannot be read: {e}"))
+        });
+        cog_core::ignore_lost!(tokio::fs::remove_file(&path).await);
+        let bytes = bytes?;
+        self.note_carry(started.elapsed().as_millis() as u64, bytes.len() as u64);
+        info!(
+            lane,
+            bytes = bytes.len(),
+            "packed a lane's tree so it can travel with the task"
+        );
+        Ok(bytes)
+    }
+
+    /// 把一份带过来的包放回这条 lane 的树里，返回写回了多少个文件。
+    ///
+    /// 没有树就先切一棵（这条路和第一次到达是同一条：暖池、卷上已有的都算），
+    /// 然后把包里的快照写回工作区。写回只动工作区：落到这棵树上的是一组未提交
+    /// 的改动，正如它在原来那副上时那样。
+    pub async fn unpack_lane(
+        self: &Arc<Self>,
+        lane: &str,
+        bundle: &[u8],
+    ) -> Result<usize, CarryError> {
+        let started = std::time::Instant::now();
+        validate_task_id(lane).map_err(|e| CarryError::Refused(e.to_string()))?;
+        let (tree, _in_use, _origin) = self
+            .route(lane)
+            .await
+            .map_err(|e| CarryError::Failed(e.to_string()))?;
+        let path = self.carry_path(lane);
+        let path_text = path.to_string_lossy().into_owned();
+        tokio::fs::write(&path, bundle)
+            .await
+            .map_err(|e| CarryError::Failed(format!("the carried bundle cannot be saved: {e}")))?;
+        let key = carry_key(lane);
+        let refname = checkpoints::refname(&key);
+        // 这个 ref 只是运输用的名字，不带历史含义：一条 lane 来回搬过几次时，
+        // 后一份快照与这一副上先前那份没有祖孙关系，而这里要的正是「换上这一份」。
+        let spec = format!("+{refname}:{refname}");
+        let fetched = self
+            .run_git(&["fetch", &path_text, &spec], Some(&tree))
+            .await;
+        cog_core::ignore_lost!(tokio::fs::remove_file(&path).await);
+        fetched.map_err(|e| CarryError::Failed(e.to_string()))?;
+        let plan = checkpoints::restore(&tree, &key)
+            .await
+            .map_err(CarryError::Failed)?;
+        self.note_carry(started.elapsed().as_millis() as u64, bundle.len() as u64);
+        info!(
+            lane,
+            files = plan.files.len(),
+            "unpacked a carried tree into this lane; the changes are uncommitted here"
+        );
+        Ok(plan.files.len())
+    }
+
+    /// 这副副本上这条 lane 有没有树。
+    ///
+    /// 「没有」是一个答案，不是失败：一个刚起来的客户端手上没有钉子，它就是
+    /// 拿这个问题决定这条 lane 落在哪副副本上；把「没有」写成错误，会让每一次
+    /// 普通的首次落点都带一条错误，而真正该报错的只有名字不能用和读不出来。
+    ///
+    /// 判的是 route 判复用的那一个凭据（树自己的 `.git` 链接与边车），不是仓里的
+    /// 登记：问「有没有」要的是「下一条命令会不会在这棵树上跑」，而仓读不出来时
+    /// 树还在、命令也跑得起来——按登记答「没有」会让客户端去别的副上另切一棵，
+    /// 丢掉这棵树上的工作。它也不起 git 进程：一副副本上来一次「问树」会按 lane
+    /// 数打过来，而每条 lane 的答案是一次 stat 就够的事。
+    pub async fn holds_tree(&self, lane: &str) -> Result<bool, CarryError> {
+        validate_task_id(lane).map_err(|e| CarryError::Refused(e.to_string()))?;
+        Ok(self.is_healthy(&self.cfg.workspaces_root.join(lane)).await)
+    }
+
+    /// The tree this lane already has on this volume, if it is still there.
+    async fn tree_of(&self, lane: &str) -> Option<PathBuf> {
+        let (_, path) = self
+            .list_task_trees()
+            .await
+            .into_iter()
+            .find(|(id, _)| id == lane)?;
+        tokio::fs::try_exists(&path).await.ok().filter(|yes| *yes)?;
+        Some(path)
+    }
+
+    /// Where a carry bundle is written on the way through. Inside the
+    /// workspaces root so it lands on the volume the trees are on, and named
+    /// apart from the trees so the cap's own listing never mistakes it for one.
+    fn carry_path(&self, lane: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let hash = checkpoints::refname(&carry_key(lane));
+        let hash = hash.rsplit('/').next().unwrap_or("0");
+        self.cfg.workspaces_root.join(format!(
+            ".carry-{}-{}-{hash}.bundle",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 
     /// The pool directory. Sits inside the workspaces root so it lands on the
@@ -965,6 +1475,99 @@ impl WorkdirRouter {
     /// pool whose hand-out is the copy it was meant to avoid.
     fn warm_root(&self) -> PathBuf {
         self.cfg.workspaces_root.join(WARM_DIR_NAME)
+    }
+
+    /// Record that a lane just got a tree, so the pool's target follows how
+    /// fast lanes actually arrive. Counted for a warm hand-out too: the pool
+    /// still has to replace the tree that was handed over, and the rate that
+    /// matters is arrivals, not checkouts.
+    fn note_arrival(&self) {
+        let now = unix_now();
+        let mut arrivals = self.arrivals.lock().unwrap_or_else(|e| e.into_inner());
+        arrivals.push_back(now);
+        while arrivals
+            .front()
+            .is_some_and(|first| now.saturating_sub(*first) > ARRIVAL_WINDOW_SECS)
+        {
+            arrivals.pop_front();
+        }
+        while arrivals.len() > MAX_ARRIVAL_SAMPLES {
+            arrivals.pop_front();
+        }
+    }
+
+    /// Record how long a successful checkout took. The median of the recent
+    /// samples is the cost the pool removes; the median rather than the mean so
+    /// one stalled `git worktree add` does not set the pool's size for as long
+    /// as it stays in the window.
+    fn note_checkout(&self, millis: u64) {
+        let mut samples = self
+            .checkout_millis
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        samples.push_back(millis);
+        while samples.len() > CHECKOUT_SAMPLES {
+            samples.pop_front();
+        }
+    }
+
+    /// Record what this replica's half of moving a lane's tree cost: the wall
+    /// and the bytes. A lane only moves when its replica goes away, so this is
+    /// a sample of a rare event; the window is the same width as a checkout's
+    /// because both follow how big a tree is, which changes over days.
+    fn note_carry(&self, millis: u64, bytes: u64) {
+        let mut times = self.carry_millis.lock().unwrap_or_else(|e| e.into_inner());
+        times.push_back(millis);
+        while times.len() > CHECKOUT_SAMPLES {
+            times.pop_front();
+        }
+        let mut sizes = self.carry_bytes.lock().unwrap_or_else(|e| e.into_inner());
+        sizes.push_back(bytes);
+        while sizes.len() > CHECKOUT_SAMPLES {
+            sizes.pop_front();
+        }
+    }
+
+    /// How fast lanes arrive: how many got a tree, over the span the samples
+    /// cover. `None` until two arrivals are far enough apart in time to define
+    /// an interval.
+    fn arrival_rate(&self) -> Option<(usize, u64)> {
+        let arrivals = self.arrivals.lock().unwrap_or_else(|e| e.into_inner());
+        let first = *arrivals.front()?;
+        let span = unix_now().saturating_sub(first);
+        (arrivals.len() >= 2 && span > 0).then_some((arrivals.len(), span as u64))
+    }
+
+    /// The checkout cost in force, as seconds.
+    fn checkout_secs(&self) -> Option<f64> {
+        median_of(&self.checkout_millis).map(|millis| millis as f64 / 1000.0)
+    }
+
+    /// Recompute the pool's target from this pass's capacity, the arrival rate
+    /// and the checkout cost. `seed` stands until all three exist.
+    fn derive_warm_target(&self, capacity: usize) {
+        self.metrics.warm_trees_evaluations.inc();
+        let seed = self.cfg.warm_trees;
+        if seed == 0 {
+            self.warm_target.store(0, Ordering::Relaxed);
+            self.metrics.set_warm_trees(0, "seed");
+            return;
+        }
+        let ceiling = capacity / 2;
+        let measured = self.arrival_rate().and_then(|(arrivals, span)| {
+            warm_trees_from(arrivals, span, self.checkout_secs()?, ceiling)
+        });
+        match measured {
+            Some(target) => {
+                self.warm_target.store(target, Ordering::Relaxed);
+                self.metrics.set_warm_trees(target, "measured");
+            }
+            None => {
+                let target = seed.min(ceiling);
+                self.warm_target.store(target, Ordering::Relaxed);
+                self.metrics.set_warm_trees(target, "seed");
+            }
+        }
     }
 
     /// The file that says a slot finished being cut. `git worktree add` writes
@@ -1010,8 +1613,8 @@ impl WorkdirRouter {
     /// Move a waiting tree onto `path` instead of cutting a new one there.
     /// Returns whether one was taken; a pool that is empty, disabled, or whose
     /// move failed falls through to the ordinary checkout.
-    async fn take_warm(&self, task_id: &str, path: &Path) -> bool {
-        if self.cfg.warm_trees == 0 {
+    async fn take_warm(&self, lane: &str, path: &Path) -> bool {
+        if self.warm_target.load(Ordering::Relaxed) == 0 {
             return false;
         }
         let slots = self.warm_slots().await;
@@ -1022,12 +1625,12 @@ impl WorkdirRouter {
         // two leaves a reclaimable record rather than an untracked tree.
         let now = unix_now();
         let meta = TaskMeta {
-            task_id: task_id.to_string(),
+            task_id: lane.to_string(),
             created_at_unix: now,
             last_used_unix: now,
         };
         if let Err(e) = self.write_meta(&meta).await {
-            warn!(task_id = %task_id, error = %e, "warm tree not taken: could not write its sidecar");
+            warn!(lane = %lane, error = %e, "warm tree not taken: could not write its sidecar");
             return false;
         }
         if let Err(e) = self
@@ -1039,47 +1642,52 @@ impl WorkdirRouter {
             ])
             .await
         {
-            self.remove_meta(task_id);
+            self.remove_meta(lane);
             warn!(
-                task_id = %task_id,
+                lane = %lane,
                 from = %slot.display(),
                 error = %e,
                 "warm tree not taken: moving it onto the task path failed"
             );
             return false;
         }
-        let _ = tokio::fs::remove_file(Self::ready_marker(&slot)).await;
+        cog_core::ignore_lost!(tokio::fs::remove_file(Self::ready_marker(&slot)).await);
         self.register_safe_directory(path).await;
-        // The pool is filled ahead of demand, so the tree may have been cut
-        // before `main` moved. Re-pointing it is what keeps a warm tree from
-        // being a stale one: a task that gets a tree three commits behind would
-        // read the platform's own source wrong, and nothing on the surface
-        // would say why.
-        self.reset_to_main(path).await;
+        // The slot was cut detached and the pool is filled ahead of demand, so
+        // two things have to happen at hand-out: the tree gets its owner's
+        // branch, and it is re-pointed at `main` in case the branch of that
+        // name was cut before `main` moved. `checkout -B` does both at once --
+        // a tree handed out three commits behind would read the platform's own
+        // source wrong, and nothing on the surface would say why.
+        //
+        // Untracked files need no cleanup here: a slot is cut and handed out
+        // without ever being run in, so there is nothing but `main` in it.
+        self.point_at_branch(path, lane).await;
         info!(
-            task_id = %task_id,
+            lane = %lane,
             from = %slot.display(),
-            "handed a warm worktree to a new task instead of cutting one"
+            "handed a warm worktree to an employee instead of cutting one"
         );
         true
     }
 
-    /// Point a task tree at `main`, and drop anything the previous user left in
-    /// it. Best effort: the tree is usable either way, and a failure here is
-    /// the next command's own to report.
-    async fn reset_to_main(&self, path: &Path) {
-        let Ok(head) = self.run_git(&["rev-parse", "HEAD"], Some(path)).await else {
-            return;
-        };
-        let Ok(main) = self.git_bare(&["rev-parse", "main"]).await else {
-            return;
-        };
-        if head.trim() == main.trim() {
-            // Nothing to move and nothing to drop: the tree was cut from the
-            // commit it is about to be handed out at.
-            return;
+    /// Put `path` on the branch its lane owns, starting from the current
+    /// `main`. Best effort: the tree is usable either way, and a failure here
+    /// is the next command's own to report.
+    async fn point_at_branch(&self, path: &Path, lane: &str) {
+        let branch = lane_branch(lane);
+        if let Err(e) = self
+            .run_git(&["checkout", "-B", &branch, "main"], Some(path))
+            .await
+        {
+            warn!(
+                lane = %lane,
+                branch = %branch,
+                error = %e,
+                "warm tree handed out but its lane branch could not be checked out; \
+                 the tree is usable and its commits would go to a detached head"
+            );
         }
-        let _ = self.run_git(&["reset", "--hard", "main"], Some(path)).await;
     }
 
     /// Cut trees until the pool holds as many as the deployment asked for.
@@ -1099,7 +1707,7 @@ impl WorkdirRouter {
     /// recorded the one refill and the two hand-outs and said nothing about the
     /// pool that stayed empty.
     async fn warm_pool_once(&self) {
-        let want = self.cfg.warm_trees;
+        let want = self.warm_target.load(Ordering::Relaxed);
         if want == 0 {
             return;
         }
@@ -1146,7 +1754,7 @@ impl WorkdirRouter {
                     continue;
                 }
             }
-            if let Err(e) = self.cut_worktree(&slot).await {
+            if let Err(e) = self.cut_worktree(&slot, None).await {
                 warn!(error = %e, slot = %slot.display(), "warm worktree pool: cutting a tree failed");
                 return;
             }
@@ -1164,83 +1772,108 @@ impl WorkdirRouter {
     /// The tree on its own, without a claim: a caller that will run something in
     /// it must go through [`Self::route`], which is the only thing that keeps a
     /// reclamation pass from deleting it while the command runs.
-    async fn route_validated(&self, task_id: &str, own_claim: bool) -> SFResult<(PathBuf, bool)> {
-        let path = self.cfg.workspaces_root.join(task_id);
+    async fn route_validated(
+        &self,
+        lane: &str,
+        own_claim: bool,
+    ) -> SFResult<(PathBuf, cog_core::WorktreeOrigin)> {
+        let path = self.cfg.workspaces_root.join(lane);
         if self.is_healthy(&path).await {
-            self.touch(task_id).await;
-            return Ok((path, false));
+            self.touch(lane).await;
+            return Ok((path, cog_core::WorktreeOrigin::Existing));
         }
         let _g = self.create_lock.lock().await;
         if self.is_healthy(&path).await {
-            self.touch(task_id).await;
-            return Ok((path, false));
+            self.touch(lane).await;
+            return Ok((path, cog_core::WorktreeOrigin::Existing));
         }
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-            if self.commands_running(task_id, own_claim) > 0 {
+            if self.commands_running(lane, own_claim) > 0 {
                 // Rebuilding means removing first, and a command is running in
                 // this tree: the caller can come back, the command cannot.
                 return Err(SFError::IO(format!(
-                    "task worktree for {task_id} is in use by a running command and is not a \
+                    "worktree for {lane} is in use by a running command and is not a \
                      healthy worktree; refusing to rebuild it from under that command"
                 )));
             }
-            warn!(task_id = %task_id, path = %path.display(),
-                "task path exists but is not a healthy worktree; rebuilding");
+            warn!(lane = %lane, path = %path.display(),
+                "lane path exists but is not a healthy worktree; rebuilding");
             self.force_remove(&path).await;
         }
         // The hand-out first, and the cap after it: a task that takes a warm
         // tree adds nothing to the volume, so asking the cap to make room for
         // it would reclaim a tree nobody needed to lose.
-        if self.take_warm(task_id, &path).await {
+        if self.take_warm(lane, &path).await {
+            self.note_arrival();
             self.refresh_count_metric().await;
-            return Ok((path, true));
+            return Ok((path, cog_core::WorktreeOrigin::Warm));
         }
         self.enforce_cap(1).await;
-        if let Err(e) = self.add_worktree(task_id, &path).await {
+        if let Err(e) = self.add_worktree(lane, &path).await {
             self.metrics.inc_error("worktree_add");
             return Err(e);
         }
+        self.note_arrival();
         self.refresh_count_metric().await;
-        Ok((path, false))
+        Ok((path, cog_core::WorktreeOrigin::Created))
     }
 
-    async fn add_worktree(&self, task_id: &str, path: &Path) -> SFResult<()> {
+    async fn add_worktree(&self, lane: &str, path: &Path) -> SFResult<()> {
         let now = unix_now();
         let meta = TaskMeta {
-            task_id: task_id.to_string(),
+            task_id: lane.to_string(),
             created_at_unix: now,
             last_used_unix: now,
         };
         // Sidecar lands before the tree: a crash between the two leaves a
         // reclaimable record; the reverse order leaves an untracked tree.
         self.write_meta(&meta).await?;
-        if let Err(e) = self.cut_worktree(path).await {
-            self.remove_meta(task_id);
+        if let Err(e) = self.cut_worktree(path, Some(lane)).await {
+            self.remove_meta(lane);
             return Err(e);
         }
-        info!(task_id = %task_id, path = %path.display(), "created per-task worktree");
+        info!(lane = %lane, path = %path.display(), "created the employee's worktree");
         self.register_safe_directory(path).await;
         Ok(())
     }
 
-    /// Check out `main` into `path` as a detached worktree of the bare repo.
-    /// Shared by the task path and the warm pool, which want the same tree and
-    /// differ only in what they record about it.
-    async fn cut_worktree(&self, path: &Path) -> SFResult<()> {
+    /// Cut `main` into `path` as a worktree of the bare repo.
+    ///
+    /// With a lane, the tree is checked out on that lane's branch rather than
+    /// detached: a detached checkout takes commits into no branch at all, so a
+    /// reader could not tell which tree a commit landed on, and the employee's
+    /// next turn would find nothing it had committed. Without a lane -- the warm
+    /// pool, whose slot has no owner yet -- the tree is cut detached and the
+    /// branch is attached when the slot is handed out (`take_warm`).
+    ///
+    /// `-B` rather than `-b`: a lane's branch outlives its tree, so a re-cut
+    /// finds the name taken. Moving it back to `main` is the point -- a tree
+    /// starts from the platform's current code, and the work of a tree that has
+    /// already been reclaimed belongs to the change it became, not to this
+    /// checkout.
+    async fn cut_worktree(&self, path: &Path, lane: Option<&str>) -> SFResult<()> {
         if let Some(root) = path.parent() {
             tokio::fs::create_dir_all(root).await.map_err(|e| {
                 SFError::IO(format!("create worktree root {}: {e}", root.display()))
             })?;
         }
-        self.git_bare(&[
-            "worktree",
-            "add",
-            "--detach",
-            path.to_str().unwrap_or(""),
-            "main",
-        ])
-        .await
-        .map(|_| ())
+        let branch = lane.map(lane_branch);
+        let mut args = vec!["worktree", "add"];
+        match branch.as_deref() {
+            Some(branch) => {
+                args.push("-B");
+                args.push(branch);
+            }
+            None => args.push("--detach"),
+        }
+        args.push(path.to_str().unwrap_or(""));
+        args.push("main");
+        let started = std::time::Instant::now();
+        let out = self.git_bare(&args).await;
+        if out.is_ok() {
+            self.note_checkout(started.elapsed().as_millis() as u64);
+        }
+        out.map(|_| ())
     }
 
     /// Healthy = worktree dir present with the `.git` link the bare repo
@@ -1262,8 +1895,8 @@ impl WorkdirRouter {
             .map_err(|e| {
                 SFError::IO(format!("create meta dir {}: {e}", self.meta_dir.display()))
             })?;
-        tokio::fs::create_dir_all(&self.cfg.target_dir).await.ok();
-        let _ = self.git_bare(&["worktree", "prune"]).await;
+        cog_core::ignore_lost!(tokio::fs::create_dir_all(&self.cfg.target_dir).await);
+        cog_core::ignore_lost!(self.git_bare(&["worktree", "prune"]).await);
         // `prune` leaves locked registrations alone, so one whose tree is
         // already gone survives every boot: the cap counts it, the volume does
         // not hold it, and no reclaim can ever clear it. Unlock the ones the
@@ -1280,7 +1913,7 @@ impl WorkdirRouter {
             }
         }
         if dropped {
-            let _ = self.git_bare(&["worktree", "prune"]).await;
+            cog_core::ignore_lost!(self.git_bare(&["worktree", "prune"]).await);
         }
 
         let trees = self.list_task_trees().await;
@@ -1306,6 +1939,25 @@ impl WorkdirRouter {
         Ok(())
     }
 
+    /// Whether a tree still holds work nobody has committed.
+    ///
+    /// A tree can be rebuilt from the bare repository in seconds; what cannot be
+    /// rebuilt is what was never committed. Once the unit of isolation is the
+    /// task, a task's tree outlives the round that cut it and is touched only
+    /// while that task is moving, so an idle tree is not evidence that the task
+    /// is done -- an empty `git status` is evidence that deleting it loses
+    /// nothing. A status that cannot be read counts as work: being wrong the
+    /// other way costs somebody's uncommitted files.
+    ///
+    /// Paid only by trees already past the TTL, and the pass times itself so a
+    /// pass made slow by many such trees pushes its own interval out.
+    async fn holds_uncommitted_work(&self, path: &Path) -> bool {
+        match self.run_git(&["status", "--porcelain"], Some(path)).await {
+            Ok(out) => !out.is_empty(),
+            Err(_) => true,
+        }
+    }
+
     /// Reap trees idle past the TTL, then enforce the LRU cap. Returns the
     /// number of reclaimed trees.
     ///
@@ -1328,19 +1980,20 @@ impl WorkdirRouter {
         let now = unix_now();
         let trees = self.list_task_trees().await;
         let capacity = self.cap_for(&trees).await;
+        self.derive_warm_target(capacity);
         // Oldest arrival to now, so the span covers exactly the trees being
         // counted. Without a second tree there is no arrival interval to read,
         // and the configured TTL stands.
         //
-        // Measured over the task lane only, because that is the lane the TTL
-        // governs: a standing shell is never reaped for idleness and is held
-        // for as long as its agent exists, so counting it would stretch the
-        // span by however old that conversation is and report a hold time
-        // derived from a tree the rule does not apply to.
-        let task_trees = trees.iter().filter(|(id, _)| !is_standing_lane(id)).count();
+        // Measured over the task-kind trees only, because those are the trees
+        // the TTL governs: an employee's checkout is never reaped for idleness
+        // and is held for as long as its employee is registered, so counting it
+        // would stretch the span by however old that conversation is and report
+        // a hold time derived from a tree the rule does not apply to.
+        let task_trees = trees.iter().filter(|(id, _)| !is_employee_lane(id)).count();
         let oldest = trees
             .iter()
-            .filter(|(id, _)| !is_standing_lane(id))
+            .filter(|(id, _)| !is_employee_lane(id))
             .filter_map(|(id, _)| self.read_meta(id))
             .map(|meta| meta.created_at_unix)
             .min();
@@ -1351,6 +2004,9 @@ impl WorkdirRouter {
                 now.saturating_sub(first).max(0) as u64,
             )
         });
+        // Counted whether or not the hold moved: a steady arrival rate derives
+        // the same number every pass, and that is the case the count exists for.
+        self.metrics.ttl_evaluations.inc();
         if let Some(d) = derived {
             self.metrics.ttl_seconds.set(d.as_secs() as f64, "measured");
         } else {
@@ -1367,14 +2023,21 @@ impl WorkdirRouter {
             if self.commands_running(id, false) > 0 {
                 continue;
             }
-            // An idle hour is not evidence that a standing shell is done with:
-            // its id comes back on the next turn, so the TTL would delete the
-            // user's files between two conversations rather than after one.
-            // The cap still reclaims it when a slot is needed -- see
-            // [`is_standing_lane`].
-            let reap = match self.read_meta(id) {
+            // An idle hour is not evidence that an employee is done with its
+            // checkout: the lane comes back on the next turn, so the TTL would
+            // delete the user's files between two conversations rather than
+            // after one. The cap still reclaims it when a slot is needed -- see
+            // [`is_employee_lane`].
+            //
+            // A task's tree is idle for a different reason: the task is waiting
+            // on something. Deleting it would lose whatever its roles wrote and
+            // have not committed, and rebuilding it from the bare repository
+            // brings back the committed state only. So the TTL is only half the
+            // question for a task -- the other half is whether the tree still
+            // holds work, which is what `git status` answers.
+            let idle = match self.read_meta(id) {
                 Some(meta) => {
-                    !is_standing_lane(id) && now.saturating_sub(meta.last_used_unix) >= ttl
+                    !is_employee_lane(id) && now.saturating_sub(meta.last_used_unix) >= ttl
                 }
                 None => {
                     // Registered tree without sidecar: adopt rather than reap,
@@ -1390,16 +2053,24 @@ impl WorkdirRouter {
                     false
                 }
             };
-            if reap {
+            if idle && self.holds_uncommitted_work(path).await {
+                debug!(
+                    task_id = %id,
+                    "keeping an idle task worktree: it holds work nobody committed"
+                );
+                self.metrics.gc_kept.inc();
+                continue;
+            }
+            if idle {
                 info!(task_id = %id, "reclaiming idle task worktree (TTL expired)");
                 self.force_remove(path).await;
                 self.remove_meta(id);
-                self.metrics.gc_reclaimed.inc();
+                self.record_reap(Reap::Ttl);
                 reclaimed += 1;
             }
         }
         self.enforce_cap(0).await;
-        let _ = self.git_bare(&["worktree", "prune"]).await;
+        cog_core::ignore_lost!(self.git_bare(&["worktree", "prune"]).await);
         self.prune_orphan_metas(&self.list_task_trees().await).await;
         self.refresh_count_metric().await;
         Ok(reclaimed)
@@ -1418,6 +2089,17 @@ impl WorkdirRouter {
     /// the next arrivals would spend it twice. That is also what gives the pool
     /// its reservation -- a task creation at the ceiling reclaims enough to
     /// leave the pool's slots standing.
+    /// One tree is gone, and the reading says which pass removed it. The total
+    /// and the reason move together here, so one of them cannot be right while
+    /// the other is wrong.
+    fn record_reap(&self, why: Reap) {
+        self.metrics.gc_reclaimed.inc();
+        match why {
+            Reap::Ttl => self.metrics.ttl_reclaimed.inc(),
+            Reap::Cap => self.metrics.cap_reclaimed.inc(),
+        }
+    }
+
     async fn enforce_cap(&self, incoming: usize) {
         let mut trees = self.list_task_trees().await;
         let warm = self.warm_slots().await.len();
@@ -1434,12 +2116,13 @@ impl WorkdirRouter {
         if trees.len() + warm + incoming <= max {
             return;
         }
-        // Two lanes, and the eviction order is per lane: a task tree pays
-        // before a standing shell does. See [`is_standing_lane`] for why the
-        // LRU premise does not hold for the second one.
+        // Two kinds of tree, and the eviction order is per kind: one round of
+        // task work pays before an employee's checkout does. See
+        // [`is_employee_lane`] for why the LRU premise does not hold for the
+        // second one.
         trees.sort_by_key(|(id, _)| {
             (
-                is_standing_lane(id),
+                is_employee_lane(id),
                 self.read_meta(id.as_str())
                     .map(|m| m.last_used_unix)
                     .unwrap_or(i64::MIN),
@@ -1450,6 +2133,16 @@ impl WorkdirRouter {
         // through the loop below: a pool tree is never the one reclaimed.
         let mut remaining = trees.len() + warm + incoming;
         let mut deferred = 0u64;
+        // Two kinds of idle tree, and the cap prefers the empty one: a tree can
+        // be rebuilt from the bare repository in seconds, and what was never
+        // committed cannot be rebuilt at all. So an idle tree is not skipped
+        // for holding work, it is merely moved behind every tree that holds
+        // none — and only taken, with a reading that says so, when the bare
+        // trees ran out and the cap still is not met. Taking one is real: the
+        // files are gone and the next command in that lane gets a checkout that
+        // looks like the one it expected.
+        let mut holding_work = Vec::new();
+        let mut took_uncommitted = 0u64;
         for (id, path) in trees {
             if remaining <= max {
                 break;
@@ -1463,10 +2156,30 @@ impl WorkdirRouter {
                 deferred += 1;
                 continue;
             }
+            if self.holds_uncommitted_work(&path).await {
+                holding_work.push((id, path));
+                continue;
+            }
             warn!(task_id = %id, cap = max, "reclaiming task worktree (LRU cap)");
             self.force_remove(&path).await;
             self.remove_meta(&id);
-            self.metrics.gc_reclaimed.inc();
+            self.record_reap(Reap::Cap);
+            remaining -= 1;
+        }
+        for (id, path) in holding_work {
+            if remaining <= max {
+                break;
+            }
+            warn!(
+                task_id = %id,
+                cap = max,
+                "reclaiming a task worktree that holds uncommitted work: every tree without work is already gone"
+            );
+            self.force_remove(&path).await;
+            self.remove_meta(&id);
+            self.record_reap(Reap::Cap);
+            self.metrics.cap_took_uncommitted.inc();
+            took_uncommitted += 1;
             remaining -= 1;
         }
         if deferred > 0 {
@@ -1475,6 +2188,13 @@ impl WorkdirRouter {
                 deferred,
                 cap = max,
                 "task worktree cap not met: the trees left to reclaim have commands running in them"
+            );
+        }
+        if took_uncommitted > 0 {
+            warn!(
+                took_uncommitted,
+                cap = max,
+                "the cap removed trees that held uncommitted work: that work is gone and cannot be rebuilt"
             );
         }
     }
@@ -1501,6 +2221,9 @@ impl WorkdirRouter {
         self.metrics
             .fetch_interval
             .set(wait.as_secs() as f64, source);
+        // Every ask is one recomputation; the wait only moves when a head has
+        // been still for a different length of time.
+        self.metrics.fetch_interval_evaluations.inc();
         let last = self.last_fetch_unix.load(Ordering::Relaxed);
         if last == 0 {
             return true;
@@ -1513,10 +2236,14 @@ impl WorkdirRouter {
     /// volume it walks gets. Recomputed per call, for the same reason the git
     /// timeout is.
     fn gc_interval(&self) -> Duration {
-        gc_interval_from(
+        let interval = gc_interval_from(
             self.gc_pass_millis.load(Ordering::Relaxed),
             self.cfg.gc_interval,
-        )
+        );
+        // Same pass cost, same interval -- and still a beat. The counter is the
+        // only reading that moves on a volume whose passes stay cheap.
+        self.metrics.gc_interval_evaluations.inc();
+        interval
     }
 
     /// Whether the interval since the last pass has elapsed.
@@ -1916,6 +2643,7 @@ impl WorkdirRouter {
     // -- internals -------------------------------------------------------------
 
     fn meta_path(&self, task_id: &str) -> PathBuf {
+        // state-file: cache — 这一份是工作树的可重算代价（最近使用时刻与大小），丢了从树本身重扫，不是平台事实的第二份正本
         self.meta_dir.join(format!("{task_id}.json"))
     }
 
@@ -1962,7 +2690,7 @@ impl WorkdirRouter {
     }
 
     fn remove_meta(&self, task_id: &str) {
-        let _ = std::fs::remove_file(self.meta_path(task_id));
+        cog_core::ignore_lost!(std::fs::remove_file(self.meta_path(task_id)));
     }
 
     async fn touch(&self, task_id: &str) {
@@ -1988,7 +2716,7 @@ impl WorkdirRouter {
                 continue;
             };
             if !live.contains(id) {
-                let _ = tokio::fs::remove_file(entry.path()).await;
+                cog_core::ignore_lost!(tokio::fs::remove_file(entry.path()).await);
             }
         }
     }
@@ -2027,10 +2755,10 @@ impl WorkdirRouter {
             .git_bare(&["worktree", "remove", "--force", path.to_str().unwrap_or("")])
             .await;
         if tokio::fs::try_exists(path).await.unwrap_or(false) {
-            let _ = tokio::fs::remove_dir_all(path).await;
+            cog_core::ignore_lost!(tokio::fs::remove_dir_all(path).await);
         }
         self.forget_safe_directory(path).await;
-        let _ = self.git_bare(&["worktree", "prune"]).await;
+        cog_core::ignore_lost!(self.git_bare(&["worktree", "prune"]).await);
     }
 
     /// Drop the `locked` marker a killed `worktree add` left on the tree at
@@ -2160,28 +2888,32 @@ impl WorkdirRouter {
         parse_df(&String::from_utf8_lossy(&out.stdout))
     }
 
-    /// The cap this pass runs under. Two different numbers, and the lower one
-    /// wins: the configured value is a policy ceiling (how many trees this
-    /// executor is meant to serve at once), while the measured one is what the
-    /// volume can actually hold at the size these trees are. A policy ceiling
-    /// on its own cannot stop the disk filling up -- the trees grow with the
-    /// repository -- and a disk reading on its own cannot stop inotify watches
-    /// and git processes multiplying.
+    /// The cap this pass runs under: what the volume is measured to hold at
+    /// the size these trees are. The deployment's number is the seed for the
+    /// passes before any tree exists -- there is no per-tree figure to divide
+    /// the volume by yet -- and stops applying as soon as one does. A policy
+    /// ceiling that kept applying would be a number about a volume somebody
+    /// measured once, held against a volume that has changed since: trees grow
+    /// with the repository, and co-tenants fill the same disk.
     async fn cap_for(&self, trees: &[(String, PathBuf)]) -> usize {
-        let declared = self.cfg.max_workspaces;
+        self.metrics.cap_evaluations.inc();
+        #[cfg(test)]
+        if let Some(cap) = self.cfg.cap_override {
+            // A fixture volume of a known size: the cap tests need a ceiling
+            // the workspace root of a test host does not naturally provide.
+            self.metrics.set_cap(cap, "measured");
+            return cap;
+        }
         match self.measured_cap(trees).await {
             Some(measured) => {
-                if measured < declared {
-                    info!(
-                        declared,
-                        measured,
-                        trees = trees.len(),
-                        "task worktree cap lowered to what the volume holds"
-                    );
-                }
-                measured.min(declared)
+                self.metrics.set_cap(measured, "measured");
+                measured
             }
-            None => declared,
+            None => {
+                let seed = self.cfg.max_workspaces;
+                self.metrics.set_cap(seed, "seed");
+                seed
+            }
         }
     }
 
@@ -2198,6 +2930,12 @@ impl WorkdirRouter {
             tokio::task::spawn_blocking(move || cog_core::fs_size::dir_size_bytes(&root, &[]).ok())
                 .await
                 .ok()??;
+        // Kept for the shape price: what one task occupies is this walk's bytes
+        // over its tree count, and it is the same figure the cap is computed
+        // from -- one measurement answering both questions.
+        self.last_tree_bytes.store(bytes, Ordering::Relaxed);
+        self.last_tree_count
+            .store(trees.len() as u64, Ordering::Relaxed);
         workspace_cap(disk, bytes, trees.len())
     }
 
@@ -2225,42 +2963,26 @@ impl WorkdirRouter {
         }
     }
 
-    /// How long a git command may run here: a multiple of the slowest one that
-    /// has completed on this volume, floored. Recomputed per call so a volume
-    /// that got slower (a bigger repository, a busier disk) is allowed the time
-    /// it now needs, rather than being killed at a number written elsewhere.
-    fn git_timeout(&self) -> Duration {
-        cog_core::git_budget::git_timeout_from(self.git_slowest_ms.load(Ordering::Relaxed))
-    }
-
-    /// How old a git lock has to be before it can only be a corpse.
-    ///
-    /// Killed git processes (OOM, node restart) leave `.lock` files behind, and
-    /// every git write here is bounded by [`Self::git_timeout`] and
-    /// kill-on-drop. So a lock older than twice that timeout cannot belong to a
-    /// live command: the command that made it would have been killed first. Twice
-    /// rather than once, because a command may have taken the lock just as this
-    /// pass looked at the clock.
+    /// How old a git lock has to be before it can only be a corpse; see
+    /// [`cog_core::git_budget`]. Absent until this deployment has measured how
+    /// quiet a live command gets, and then no lock is cleared.
     fn stale_lock_age(&self) -> Duration {
-        self.git_timeout() * 2
+        cog_core::git_budget::stale_lock_age()
     }
 
     async fn run_git_once(&self, args: &[&str], workdir: Option<&Path>) -> SFResult<String> {
+        let line = args.join(" ");
         let mut cmd = tokio::process::Command::new("git");
         cmd.args(args).kill_on_drop(true);
         if let Some(dir) = workdir {
             cmd.current_dir(dir);
         }
-        let started = std::time::Instant::now();
-        let out = tokio::time::timeout(self.git_timeout(), cmd.output())
+        let out = match cog_core::progress::run_child_watched(cmd, &format!("git {line}"))
             .await
-            .map_err(|_| SFError::IO(format!("git {} timed out", args.join(" "))))?
-            .map_err(|e| SFError::IO(format!("failed to run git: {e}")))?;
-        // Only completed commands are recorded, whatever their exit code: a
-        // command that failed fast is still evidence of how fast git is here,
-        // and one that never returns must not raise the bar for the next.
-        self.git_slowest_ms
-            .fetch_max(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+            .map_err(|e| SFError::IO(format!("failed to run git: {e}")))?
+        {
+            cog_core::progress::ChildOutcome::Exited(out) => out,
+        };
         if !out.status.success() {
             return Err(SFError::IO(format!(
                 "git {} failed: {}{}",
@@ -2277,6 +2999,40 @@ impl WorkdirRouter {
         full.extend_from_slice(args);
         self.run_git(&full, None).await
     }
+}
+
+/// 一条 lane 的工作没能被打包或放回来时，是哪一种没成。
+///
+/// 三种分开是为了让调用方分别对待：「这副上没有这条 lane 的树」不是故障，
+/// 是本来就没东西可搬；「还有命令在树里跑」是等一等再来；「打包本身失败了」
+/// 才是要报出去的错。
+#[derive(Debug)]
+pub enum CarryError {
+    /// 这副副本上没有这条 lane 的树——没有工作可搬。
+    NoTree(String),
+    /// 树还在用：一条命令正在里面跑，此刻打出来的包说不出是哪一刻的样子。
+    Busy(String),
+    /// lane 名不能用。
+    Refused(String),
+    /// 打包、保存、取回或写回失败了。
+    Failed(String),
+}
+
+impl std::fmt::Display for CarryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CarryError::NoTree(m) | CarryError::Busy(m) | CarryError::Refused(m) => f.write_str(m),
+            CarryError::Failed(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for CarryError {}
+
+/// 搬运用的检查点名。由 lane 定，所以同一棵树的两次搬运落在同一个 ref 上，
+/// 不会在树上越堆越多。
+fn carry_key(lane: &str) -> String {
+    format!("carry:{lane}")
 }
 
 /// Strict task id validation: the id is a client-supplied filesystem name, so
@@ -2298,27 +3054,50 @@ pub(crate) fn validate_task_id(id: &str) -> SFResult<()> {
     }
 }
 
-/// The prefix `cog-agent` gives the task id of a call that carries no task
-/// scope: one workspace per calling agent, named after that agent. Kept in
-/// step with `sandbox_task_id` in `crates/cog-agent/src/tools.rs`; the two
-/// crates do not depend on each other, so the spelling is shared by this
-/// comment rather than by an import.
-const STANDING_SHELL_PREFIX: &str = "unscoped-shell-";
-
-/// Whether a task id names a standing agent's shell rather than one round of
-/// task work.
+/// Whether a lane belongs to an employee rather than to one round of task work.
 ///
-/// The cap evicts by least-recently-used, and that rule rests on an assumption:
-/// a tree nobody touched recently is a tree nobody will ask for again. It holds
-/// for a task tree, whose id is spent by the round that created it, and it
-/// fails for a conversation shell, whose id is the calling agent's own name and
-/// is handed back verbatim on the next turn. Measured on the deployed chat lane
-/// (2026-11-06): a squad pipeline creating a tree roughly every minute churned
-/// an eight-slot pool, `unscoped-shell-vera-82191e4a` was reclaimed 144 s after
-/// the turn that used it, and the files written in that turn went with it --
-/// the next turn was routed to a fresh checkout and could not see its own work.
-fn is_standing_lane(task_id: &str) -> bool {
-    task_id.starts_with(STANDING_SHELL_PREFIX)
+/// The prefix is `cog-core`'s, because the run names its own checkout from the
+/// same spelling this router reads: two spellings leave the model told about one
+/// tree and the executor routing to another.
+///
+/// The distinction is what the TTL and the cap are told apart by. The TTL asks
+/// whether a tree has gone idle; for an employee's tree the answer never means
+/// "done", because the lane comes back on the next turn, so the rule does not
+/// apply to it at all. For a task's tree an idle pass is not evidence either --
+/// the task may be waiting on something -- which is why the TTL is only half
+/// the decision there and [`WorkdirRouter::holds_uncommitted_work`] is the other
+/// half. The cap evicts by least-recently-used, and that assumption also fails
+/// for an employee's tree: measured on the deployed chat lane (2026-11-06), a
+/// squad pipeline creating a tree roughly every minute churned an eight-slot
+/// pool, `unscoped-shell-vera-82191e4a` was reclaimed 144 s after the turn that
+/// used it, and the files written in that turn went with it -- the next turn was
+/// routed to a fresh checkout and could not see its own work.
+fn is_employee_lane(lane: &str) -> bool {
+    lane.starts_with(cog_core::WORKTREE_LANE_PREFIX)
+}
+
+/// The branch a lane's checkout is on.
+///
+/// Under `work/` so a reader listing the bare repo's branches can see whose
+/// work is where; the lane name is unique per employee, and a branch name may
+/// carry `/` even where a directory name may not.
+fn lane_branch(lane: &str) -> String {
+    format!("work/{lane}")
+}
+
+/// The checkout an employee works in, from the employee's own id.
+///
+/// The employee's own tree, not the request's answer: a request that carries a
+/// task works in that task's tree, and [`cog_core::checkout_lane`] is the one
+/// place that decides which of the two applies. Kept as the employee half of
+/// that decision, and as the name the run writes into its system prefix when it
+/// is not working on a task.
+pub fn worktree_for_agent(agent_id: &str) -> Option<String> {
+    if agent_id.trim().is_empty() {
+        return None;
+    }
+    let lane = cog_core::worktree_lane(agent_id);
+    validate_task_id(&lane).ok().map(|_| lane)
 }
 
 fn unix_now() -> i64 {
@@ -2395,12 +3174,181 @@ pub fn anchor_path(base: Option<&Path>, path: &str) -> PathBuf {
     }
 }
 
+/// 把调用方给的路径落到这棵树上；走出这棵树就拒绝，并把范围说出来。
+///
+/// 归一化按字面做（`.` 与 `..` 只当路径段），不跟符号链接：要写的新文件可能还
+/// 不存在，跟链接就没有可解的目标。所以这一层拦的是**写偏了的路径**——模型给的
+/// `../../etc/passwd`、手滑多写一层的绝对路径；恶意构造的链接仍由容器边界管。
+/// 这两个边界分开答，谁都不冒充谁。
+pub fn anchor_inside(base: &Path, path: &str) -> Result<PathBuf, String> {
+    let base = lexically_normal(base);
+    let candidate = Path::new(path);
+    let anchored = if candidate.is_absolute() {
+        lexically_normal(candidate)
+    } else {
+        lexically_normal(&base.join(candidate))
+    };
+    if !anchored.starts_with(&base) {
+        return Err(format!(
+            "{path} 越界：可写范围是 {}（相对路径挂在这棵树上；走出它的路径被拒，没有替它改道）",
+            base.display()
+        ));
+    }
+    Ok(anchored)
+}
+
+/// 逐段消掉 `.` 与 `..`，不碰文件系统。
+fn lexically_normal(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                // 退到根之上就没有可退的了：把 `..` 原样留下，让调用方的
+                // `starts_with` 判它越界，而不是悄悄把它变成根。
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// Visible to the crate because the executor server has to drive a real router:
 /// whether a running command claims its tree is decided there, and a claim that
 /// is never taken looks exactly like one that is.
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// The lane an employee id routes to. The tests say `lane("vera-…")` rather
+    /// than spelling the name so that a change to the derivation is felt here
+    /// too: a literal would keep passing while the run named a different tree.
+    fn lane(agent_id: &str) -> String {
+        worktree_for_agent(agent_id).expect("a named agent has a lane")
+    }
+
+    /// 一辆树的车道上挂着自己的分支：树被回收之后，那份活落在哪仍然读得出来。
+    ///
+    /// 以前切出来的是游离头（`--detach`），在上面提交等于把提交放进没有名字的
+    /// 地方——读的人说不出它落在哪棵树上，而这一位下一回合回来也找不到自己刚提
+    /// 过的那个提交。
+    #[tokio::test]
+    async fn a_lane_checkout_is_on_a_branch_named_after_its_lane() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
+        let (path, _, _) = r.route(&lane("squad:DSC-1A2B-generator")).await.unwrap();
+
+        let head = tokio::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&path)
+            .output()
+            .await
+            .unwrap();
+        let branch = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        assert_eq!(
+            branch,
+            lane_branch(&lane("squad:DSC-1A2B-generator")),
+            "车道上的树要站在自己的分支上，否则提交没有落点"
+        );
+        assert_ne!(branch, "HEAD", "游离头上的提交不属于任何一棵树");
+    }
+
+    /// 暖池交出去的树同样站在车道的分支上：池子里的槽是游离切出来的，分支在
+    /// 交出去的那一刻才挂上。
+    #[tokio::test]
+    async fn a_warm_tree_is_handed_out_on_its_lane_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router_with_warm(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK, 1);
+        r.warm_pool_once().await;
+        assert!(
+            !r.warm_slots().await.is_empty(),
+            "the pool is meant to be cut ahead of demand"
+        );
+
+        let (path, origin) = r
+            .route_validated(&lane("squad:DSC-1A2B-planner"), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            origin,
+            cog_core::WorktreeOrigin::Warm,
+            "the slot was there and had to be handed out"
+        );
+        let head = tokio::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&path)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&head.stdout).trim(),
+            lane_branch(&lane("squad:DSC-1A2B-planner")),
+            "暖池交出去的树也必须站在车道的分支上"
+        );
+    }
+
+    /// 三种来处在盘上读起来一样，都是一棵健康的树；只有路由器分得清这一棵是
+    /// 刚切的、提前切好的，还是这条车道本来就在用的。这个区别只在一件事上
+    /// 有用：车道换到另一副执行器之后，能不能说死「先前的改动不在这棵树上」。
+    #[tokio::test]
+    async fn the_router_says_where_the_tree_it_handed_out_came_from() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router_with_warm(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK, 1);
+
+        // 池子还空着：这棵树是为这次调用现切的。
+        let (_, _, origin) = r.route("cold-task").await.unwrap();
+        assert_eq!(
+            origin,
+            cog_core::WorktreeOrigin::Created,
+            "现切的树被报成了别的来处"
+        );
+
+        // 同一条车道再来一次：树本来就在。
+        let (_, _, origin) = r.route("cold-task").await.unwrap();
+        assert_eq!(
+            origin,
+            cog_core::WorktreeOrigin::Existing,
+            "本来就在的树被报成了刚切的"
+        );
+
+        // 提前切好的槽交出去：树在盘上已有一阵，但没有任务用过它。
+        r.warm_pool_once().await;
+        assert!(!r.warm_slots().await.is_empty(), "池子该有槽了");
+        let (_, _, origin) = r.route("warm-task").await.unwrap();
+        assert_eq!(
+            origin,
+            cog_core::WorktreeOrigin::Warm,
+            "暖池交出去的树被报成了现切的"
+        );
+    }
+
+    /// 请求里的执行者决定树，请求里的任务号只做归属。
+    ///
+    /// 同一个任务里的几位以前共用一棵树：规划器读的文件、生成器写的文件、评审
+    /// 跑的命令都在同一个工作区里，而任务号做完就废，树也跟着废。这里钉住的是
+    /// 「两个执行者、同一个任务号 → 两棵树」。
+    #[tokio::test]
+    async fn two_employees_on_one_task_do_not_share_a_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
+        let generator = lane("squad:DSC-1A2B-generator");
+        let planner = lane("squad:DSC-1A2B-planner");
+        let (g, _, _) = r.route(&generator).await.unwrap();
+        let (p, _, _) = r.route(&planner).await.unwrap();
+        assert_ne!(g, p, "同一个任务里的两个执行者挤进了一棵树");
+        assert!(g.ends_with(&generator) && p.ends_with(&planner));
+        assert!(
+            worktree_for_agent("").is_none(),
+            "没报名号的请求没有车道，只能按任务号退回去"
+        );
+    }
 
     #[test]
     fn config_parses_env_with_safe_floors() {
@@ -2479,6 +3427,7 @@ pub(crate) mod tests {
             gc_interval: Duration::from_secs(600),
             fetch_interval: Duration::from_secs(300),
             max_workspaces: 8,
+            cap_override: Some(8),
             warm_trees: 0,
             data_volumes: vec![ClaimMount {
                 claim: claim.to_string(),
@@ -2572,6 +3521,7 @@ pub(crate) mod tests {
             gc_interval: Duration::from_secs(600),
             fetch_interval: Duration::from_secs(300),
             max_workspaces: 8,
+            cap_override: Some(8),
             warm_trees: 0,
             data_volumes: Vec::new(),
             data_volume_declaration_error: None,
@@ -2631,6 +3581,7 @@ pub(crate) mod tests {
             gc_interval: Duration::from_secs(600),
             fetch_interval: Duration::from_secs(300),
             max_workspaces: 8,
+            cap_override: Some(8),
             warm_trees: 0,
             data_volumes: vec![
                 ClaimMount {
@@ -2792,7 +3743,31 @@ pub(crate) mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
+    /// A directory's identity on one filesystem. `git worktree move` renames, so
+    /// the moved tree keeps it; a copy beside the slot would get a new one.
+    fn inode_of(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path)
+            .unwrap_or_else(|e| panic!("{} is unreadable: {e}", path.display()))
+            .ino()
+    }
+
+    /// 给这一支的产物一次身份：检查点会跑 `git commit-tree`，而 commit-tree 在没有
+    /// 名字与邮箱时直接失败（CI 的 runner 上没有全局 git 身份，本机有，于是这条
+    /// 只在 CI 红）。设的是**本进程的环境**：被测代码起的子进程会继承它，而值对每
+    /// 一条用例都一样，并发跑不会互相干扰。
+    pub(crate) fn git_identity() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            std::env::set_var("GIT_AUTHOR_NAME", "cogneva-test");
+            std::env::set_var("GIT_AUTHOR_EMAIL", "cogneva-test@example.invalid");
+            std::env::set_var("GIT_COMMITTER_NAME", "cogneva-test");
+            std::env::set_var("GIT_COMMITTER_EMAIL", "cogneva-test@example.invalid");
+        });
+    }
+
     pub(crate) fn seed_bare(root: &Path) -> PathBuf {
+        git_identity();
         let work = root.join("seed");
         std::fs::create_dir_all(&work).unwrap();
         git(&["init", "-q", "-b", "main"], &work);
@@ -2836,6 +3811,7 @@ pub(crate) mod tests {
             gc_interval: Duration::from_secs(600),
             fetch_interval: Duration::from_secs(300),
             max_workspaces: max,
+            cap_override: Some(max),
             warm_trees: 0,
             data_volumes: Vec::new(),
             data_volume_declaration_error: None,
@@ -2862,6 +3838,7 @@ pub(crate) mod tests {
             gc_interval: Duration::from_secs(600),
             fetch_interval: Duration::from_secs(300),
             max_workspaces: max,
+            cap_override: Some(max),
             warm_trees: warm,
             data_volumes: Vec::new(),
             data_volume_declaration_error: None,
@@ -2938,14 +3915,36 @@ pub(crate) mod tests {
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
 
-        let (path, _) = r.route("task-1").await.unwrap();
+        let (path, _, _) = r.route("task-1").await.unwrap();
         assert_eq!(path, tmp.path().join("workspaces").join("task-1"));
         assert!(path.join("README").exists());
         assert!(tmp.path().join("workspaces/.meta/task-1.json").exists());
 
-        let (again, _) = r.route("task-1").await.unwrap();
+        let (again, _, _) = r.route("task-1").await.unwrap();
         assert_eq!(again, path);
         assert_eq!(r.list_task_trees().await.len(), 1);
+    }
+
+    /// 问树答的是「下一条命令会不会在这棵树上跑」，所以它读树自己的凭据，不读
+    /// 仓里的登记：仓读不出来时那棵树还在、命令也跑得起来，答「没有」会让客户端
+    /// 去别的副上另切一棵，把这棵树上的工作留在原地。
+    #[tokio::test]
+    async fn the_tree_question_reads_the_tree_itself_not_the_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
+        let (path, _, _) = r.route("task-1").await.unwrap();
+        assert_eq!(path, tmp.path().join("workspaces").join("task-1"));
+        assert!(r.holds_tree("task-1").await.unwrap());
+        assert!(!r.holds_tree("task-2").await.unwrap());
+
+        // 把仓整个拿走：登记读不出来了，树还在。
+        std::fs::rename(&bare, tmp.path().join("repo-gone")).unwrap();
+        assert!(
+            r.holds_tree("task-1").await.unwrap(),
+            "仓读不出来时把一棵还在的树说成没有"
+        );
+        assert!(!r.holds_tree("task-2").await.unwrap());
     }
 
     /// A new task takes a tree that was cut before it arrived. Without the
@@ -2961,20 +3960,32 @@ pub(crate) mod tests {
         let slots = r.warm_slots().await;
         assert_eq!(slots.len(), 2, "the pool fills ahead of demand");
         let taken = slots[0].clone();
+        // 身份在交树**之前**取：`route` 在答复之后才排补池，补出来的那棵会占回刚
+        // 交出去的那个槽位名——所以这里问的是**这棵树的身份**（目录的 inode），
+        // 不是那个路径还在不在。按路径判两个方向都会读错：补池先完成时「交出去了」
+        // 读成「还留在池子里」，补池没跟上的时候路径已经没了（2026-11-22 实测，
+        // 满负载下两种都出现过）。
+        let taken_id = inode_of(&taken);
 
-        let (path, _) = r.route("warm-task").await.unwrap();
+        let (path, _, _) = r.route("warm-task").await.unwrap();
         assert!(
             path.join("README").exists(),
             "the handed tree is a real checkout"
         );
         assert_eq!(
-            r.warm_slots().await.len(),
-            1,
-            "the tree came out of the pool instead of being cut beside it"
+            inode_of(&path),
+            taken_id,
+            "the handed tree is the one that was waiting; a copy is a checkout, not a hand-out"
         );
+        let still_waiting: Vec<_> = r
+            .warm_slots()
+            .await
+            .into_iter()
+            .filter(|slot| inode_of(slot) == taken_id)
+            .collect();
         assert!(
-            !taken.exists(),
-            "the pool slot moved to the task path; a copy left behind is a checkout, not a hand-out"
+            still_waiting.is_empty(),
+            "the tree came out of the pool instead of being cut beside it: {still_waiting:?}"
         );
         assert!(
             r.list_task_trees()
@@ -3004,7 +4015,7 @@ pub(crate) mod tests {
         // Two tasks and an empty pool, so the ceiling is full with task trees
         // and no claim is holding either of them.
         for id in ["first", "second"] {
-            let (_path, guard) = r.route(id).await.unwrap();
+            let (_path, guard, _) = r.route(id).await.unwrap();
             drop(guard);
         }
         assert_eq!(
@@ -3039,7 +4050,7 @@ pub(crate) mod tests {
 
         // The task first, while the pool is still empty, so this tree is cut
         // rather than handed out and no refill is queued behind it.
-        let (_path, guard) = r.route("a").await.unwrap();
+        let (_path, guard, _) = r.route("a").await.unwrap();
         drop(guard);
         r.warm_pool_once().await;
         assert_eq!(r.warm_slots().await.len(), 1);
@@ -3073,7 +4084,7 @@ pub(crate) mod tests {
         assert_eq!(r.warm_slots().await.len(), 1);
         let moved_to = advance_bare(&bare, &tmp.path().join("advance-work"));
 
-        let (path, _) = r.route("late-task").await.unwrap();
+        let (path, _, _) = r.route("late-task").await.unwrap();
         assert_eq!(
             git_out(&path, &["rev-parse", "HEAD"]),
             moved_to,
@@ -3110,7 +4121,7 @@ pub(crate) mod tests {
             "a slot with no finished checkout is not a tree to hand out"
         );
 
-        let (path, _) = r.route("racing-task").await.unwrap();
+        let (path, _, _) = r.route("racing-task").await.unwrap();
         assert!(path.join("README").exists(), "the task got a whole tree");
         assert!(
             slot.exists(),
@@ -3128,8 +4139,8 @@ pub(crate) mod tests {
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
 
-        let (a, _) = r.route("task-a").await.unwrap();
-        let (b, _) = r.route("task-b").await.unwrap();
+        let (a, _, _) = r.route("task-a").await.unwrap();
+        let (b, _, _) = r.route("task-b").await.unwrap();
         std::fs::write(a.join("out.txt"), "from-a").unwrap();
         std::fs::write(b.join("out.txt"), "from-b").unwrap();
 
@@ -3161,7 +4172,7 @@ pub(crate) mod tests {
         let r = router(tmp.path(), &bare, 8, Duration::ZERO);
         // No command is running, so the claim `route` returns is dropped at
         // once — an idle tree, which is the only kind this reaps.
-        let (path, _) = r.route("stale-task").await.unwrap();
+        let (path, _, _) = r.route("stale-task").await.unwrap();
         let meta = tmp.path().join("workspaces/.meta/stale-task.json");
         assert!(meta.exists());
 
@@ -3170,6 +4181,12 @@ pub(crate) mod tests {
         assert!(!path.exists());
         assert!(!meta.exists());
         assert_eq!(r.list_task_trees().await.len(), 0);
+        assert_eq!(
+            r.metrics.ttl_reclaimed.get(),
+            1.0,
+            "the removal did not say it was the TTL that did it"
+        );
+        assert_eq!(r.metrics.cap_reclaimed.get(), 0.0, "the cap did not run");
     }
 
     #[tokio::test]
@@ -3188,6 +4205,8 @@ pub(crate) mod tests {
         assert!(ids.contains(&"mid".to_string()), "{ids:?}");
         assert!(ids.contains(&"new".to_string()), "{ids:?}");
         assert!(!ids.contains(&"old".to_string()));
+        assert_eq!(r.metrics.cap_reclaimed.get(), 1.0, "{ids:?}");
+        assert_eq!(r.metrics.ttl_reclaimed.get(), 0.0, "{ids:?}");
     }
 
     /// A tree with a command running in it is in use, and the cap's own policy
@@ -3199,7 +4218,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 2, DEFAULT_TTL_SECS_FALLBACK);
-        let (running, in_use) = r.route("running").await.unwrap();
+        let (running, in_use, _) = r.route("running").await.unwrap();
         tokio::time::sleep(Duration::from_millis(1100)).await;
         r.route("idle").await.unwrap();
 
@@ -3235,17 +4254,80 @@ pub(crate) mod tests {
         );
     }
 
-    /// A conversation shell is named after the agent and comes back on the next
-    /// turn; a task tree is named after one round and never comes back. Under a
-    /// plain LRU the older shell loses every time a pipeline round needs a
-    /// slot, and the user's files lose with it.
+    /// The cap prefers the tree it can put back.
+    ///
+    /// A tree is rebuilt from the bare repository in seconds; what was never
+    /// committed is gone for good. So among idle trees the cap takes the empty
+    /// one first, even when that is the newer one: LRU is the order within each
+    /// kind of tree, not across them.
     #[tokio::test]
-    async fn a_standing_shell_outlives_the_task_trees_that_share_its_cap() {
+    async fn the_cap_takes_the_tree_nothing_is_holding_before_the_one_with_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router(tmp.path(), &bare, 2, DEFAULT_TTL_SECS_FALLBACK);
+        let (older, _, _) = r.route("older").await.unwrap();
+        std::fs::write(older.join("notes.txt"), b"nobody committed me\n").unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let (newer, _, _) = r.route("newer").await.unwrap();
+        assert!(newer.exists());
+
+        // A third tree does not fit under a cap of two, and the only tree the
+        // cap may take without losing anything is the empty one -- even though
+        // the tree with work in it is the older of the two.
+        r.route("third").await.unwrap();
+
+        assert!(
+            older.exists(),
+            "the cap took the tree that held work while an empty one was there to take"
+        );
+        assert!(
+            !newer.exists(),
+            "the empty tree survived a cap that had to take one"
+        );
+        assert_eq!(r.metrics.gc_reclaimed.get(), 1.0);
+        assert_eq!(
+            r.metrics.cap_took_uncommitted.get(),
+            0.0,
+            "an empty tree was available and a tree with work was taken instead"
+        );
+    }
+
+    /// When every tree holds work the cap still holds: the bound is the volume,
+    /// and a tree that can be rebuilt is cheaper than a full disk. What it took
+    /// has to reach the scraped surface, because the loss has no other trace —
+    /// the files are gone and the next command in that lane gets a checkout
+    /// that looks exactly like the one it expected.
+    #[tokio::test]
+    async fn a_cap_that_had_to_take_uncommitted_work_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router(tmp.path(), &bare, 1, DEFAULT_TTL_SECS_FALLBACK);
+        let (only, _, _) = r.route("only").await.unwrap();
+        std::fs::write(only.join("notes.txt"), b"nobody committed me\n").unwrap();
+
+        r.route("second").await.unwrap();
+
+        assert!(!only.exists(), "the cap did not hold");
+        assert_eq!(r.metrics.gc_reclaimed.get(), 1.0);
+        assert_eq!(r.metrics.cap_reclaimed.get(), 1.0);
+        assert_eq!(
+            r.metrics.cap_took_uncommitted.get(),
+            1.0,
+            "the cap destroyed uncommitted work and nothing said so"
+        );
+    }
+
+    /// An employee's checkout is named after the employee and comes back on the
+    /// next turn; a task's tree is named after one round and never comes back.
+    /// Under a plain LRU the older checkout loses every time a pipeline round
+    /// needs a slot, and the user's files lose with it.
+    #[tokio::test]
+    async fn an_employee_checkout_outlives_the_task_trees_that_share_its_cap() {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 2, DEFAULT_TTL_SECS_FALLBACK);
         // The shell is the oldest tree on the volume, so plain LRU takes it.
-        r.route("unscoped-shell-vera-82191e4a").await.unwrap();
+        r.route(&lane("vera-82191e4a")).await.unwrap();
         tokio::time::sleep(Duration::from_millis(1100)).await;
         r.route("round-a").await.unwrap();
         tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -3258,7 +4340,7 @@ pub(crate) mod tests {
             .map(|(id, _)| id)
             .collect();
         assert!(
-            ids.contains(&"unscoped-shell-vera-82191e4a".to_string()),
+            ids.contains(&lane("vera-82191e4a")),
             "a conversation must keep the tree its files are in: {ids:?}"
         );
         assert!(ids.contains(&"round-b".to_string()), "{ids:?}");
@@ -3269,34 +4351,35 @@ pub(crate) mod tests {
         let tmp2 = tempfile::tempdir().unwrap();
         let bare2 = seed_bare(tmp2.path());
         let r = router(tmp2.path(), &bare2, 1, DEFAULT_TTL_SECS_FALLBACK);
-        r.route("unscoped-shell-old").await.unwrap();
+        r.route(&lane("old")).await.unwrap();
         tokio::time::sleep(Duration::from_millis(1100)).await;
-        r.route("unscoped-shell-new").await.unwrap();
+        r.route(&lane("new")).await.unwrap();
         let ids: Vec<String> = r
             .list_task_trees()
             .await
             .into_iter()
             .map(|(id, _)| id)
             .collect();
-        assert_eq!(ids, vec!["unscoped-shell-new".to_string()]);
+        assert_eq!(ids, vec![lane("new")]);
         assert_eq!(r.metrics.cap_deferred.get(), 0.0);
     }
 
-    /// The idle TTL is a rule about finished work: a task tree's id is spent by
-    /// its round, so an idle one is a tree nobody will ask for. A standing shell
-    /// comes back by name, so the same idle hour says nothing — reaping it would
-    /// delete the user's files between two conversations rather than after one.
+    /// The idle TTL is a rule about finished work: a task's tree is spent by
+    /// its round, so an idle one is a tree nobody will ask for. An employee's
+    /// checkout comes back by name, so the same idle hour says nothing —
+    /// reaping it would delete the user's files between two conversations
+    /// rather than after one.
     #[tokio::test]
-    async fn the_idle_ttl_leaves_a_standing_shell_alone() {
+    async fn the_idle_ttl_leaves_an_employee_checkout_alone() {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, Duration::ZERO);
-        let (shell, _) = r.route("unscoped-shell-vera-82191e4a").await.unwrap();
-        let (round, _) = r.route("round-a").await.unwrap();
+        let (shell, _, _) = r.route(&lane("vera-82191e4a")).await.unwrap();
+        let (round, _, _) = r.route("round-a").await.unwrap();
         // Stamped together so the arrival span is zero and the configured TTL
         // stands; the derived one is floored at an hour and would hide the rule.
         let together = unix_now();
-        for id in ["unscoped-shell-vera-82191e4a", "round-a"] {
+        for id in [lane("vera-82191e4a").as_str(), "round-a"] {
             let mut meta = r.read_meta(id).expect("a routed tree has a sidecar");
             meta.created_at_unix = together;
             meta.last_used_unix = together;
@@ -3317,7 +4400,7 @@ pub(crate) mod tests {
     }
 
     /// The idle rule reaps task trees, so the hold time it derives has to come
-    /// from their arrivals. A conversation that has been open for a week would
+    /// from their arrivals. A checkout that has been open for a week would
     /// otherwise stretch the span by that week and publish a hold time the rule
     /// never applied — a number that reads as "idle rounds are kept for weeks".
     #[tokio::test]
@@ -3325,14 +4408,14 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
-        r.route("unscoped-shell-vera-82191e4a").await.unwrap();
+        r.route(&lane("vera-82191e4a")).await.unwrap();
         for id in ["round-a", "round-b", "round-c", "round-d"] {
             r.route(id).await.unwrap();
         }
         let week_ago = unix_now() - 7 * 86_400;
         let hour_ago = unix_now() - 3_600;
         for id in [
-            "unscoped-shell-vera-82191e4a",
+            lane("vera-82191e4a").as_str(),
             "round-a",
             "round-b",
             "round-c",
@@ -3362,7 +4445,7 @@ pub(crate) mod tests {
         );
 
         fn is_standing(id: &str) -> bool {
-            id.starts_with("unscoped-shell-")
+            is_employee_lane(id)
         }
     }
 
@@ -3378,7 +4461,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 1, DEFAULT_TTL_SECS_FALLBACK);
-        let (old, claim) = r.route("locked-old").await.unwrap();
+        let (old, claim, _) = r.route("locked-old").await.unwrap();
         drop(claim);
         git(
             &[
@@ -3417,7 +4500,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
-        let (path, claim) = r.route("killed-add").await.unwrap();
+        let (path, claim, _) = r.route("killed-add").await.unwrap();
         drop(claim);
         git(
             &[
@@ -3461,22 +4544,33 @@ pub(crate) mod tests {
     /// creation straddles a second boundary give a span of two, which derives
     /// `MIN_TTL_SECS` and reaps nothing at all. That made this assertion fail
     /// on CI on 2026-11-03 (reaped 0 where it asserts 1) on a runner slow
-    /// enough for the two routes below to land in different seconds. So the
-    /// premise this test needs — "the configured TTL is the one in force" — is
-    /// written down instead of hoped for: both trees are stamped as arriving at
-    /// the same instant, which is what makes the derivation decline to answer.
+    /// enough for the two routes below to land in different seconds, and again
+    /// on 2026-11-12 in a full-suite run, where the same two routes sat more
+    /// than a second apart in wall-clock time.
+    ///
+    /// So this test no longer asks which of the two TTLs is in force. It stamps
+    /// both trees **older than either one** — the configured `ZERO` and the
+    /// largest value the derivation can return, `MIN_TTL_SECS` — and then the
+    /// only thing left deciding the outcome is the in-use exception, which is
+    /// the premise the test exists for. The arrivals are still stamped at one
+    /// instant, so a reader that wonders which branch ran is not answered by a
+    /// race either.
     #[tokio::test]
     async fn ttl_reaps_idle_trees_but_not_one_in_use() {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, Duration::ZERO);
-        let (running, _in_use) = r.route("running").await.unwrap();
-        let (idle, _) = r.route("idle").await.unwrap();
+        let (running, _in_use, _) = r.route("running").await.unwrap();
+        let (idle, _, _) = r.route("idle").await.unwrap();
         let arriving_together = unix_now();
+        // Older than every TTL a pass can pick, so neither branch can spare an
+        // idle tree and the assertion measures the exception rather than the
+        // derivation.
+        let past_every_ttl = arriving_together - MIN_TTL_SECS as i64 - 1;
         for id in ["running", "idle"] {
             let mut meta = r.read_meta(id).expect("a routed tree has a sidecar");
             meta.created_at_unix = arriving_together;
-            meta.last_used_unix = arriving_together;
+            meta.last_used_unix = past_every_ttl;
             r.write_meta(&meta).await.unwrap();
         }
 
@@ -3548,7 +4642,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
-        let (_, in_use) = r.route("built").await.unwrap();
+        let (_, in_use, _) = r.route("built").await.unwrap();
         let before = r.read_meta("built").unwrap().last_used_unix;
 
         // The stamp has second granularity, so a command has to outlive the
@@ -3581,7 +4675,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
-        let (path, _in_use) = r.route("busy").await.unwrap();
+        let (path, _in_use, _) = r.route("busy").await.unwrap();
 
         // The tree stops looking like a worktree while a command runs in it.
         std::fs::remove_file(path.join(WORKTREE_LINK)).unwrap();
@@ -3602,7 +4696,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r1 = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
-        let (path, _) = r1.route("task-survive").await.unwrap();
+        let (path, _, _) = r1.route("task-survive").await.unwrap();
 
         // Simulate a lost sidecar (tree still registered): recover adopts it.
         std::fs::remove_file(tmp.path().join("workspaces/.meta/task-survive.json")).unwrap();
@@ -3625,14 +4719,26 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn stale_git_lock_is_cleared_and_retried() {
+        // How old a lock has to be before it can only be a corpse is the
+        // deployment's own measured window doubled, not a number chosen here:
+        // until something has been measured no lock may be cleared, because a
+        // corpse cannot be told from a command still working. So the window is
+        // seeded first and the lock is backdated past twice it.
+        let _serial = cog_core::progress::async_test_lock().await;
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::seed_gaps_for_tests(
+            Duration::from_secs(300),
+            cog_core::progress::SAMPLE_FLOOR,
+        );
+
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
-        let (path, _) = r.route("lock-task").await.unwrap();
+        let (path, _, _) = r.route("lock-task").await.unwrap();
         let gitdir = PathBuf::from(git_out(&path, &["rev-parse", "--absolute-git-dir"]));
         let lock = gitdir.join("index.lock");
         std::fs::write(&lock, "").unwrap();
-        // Backdate mtime past the 600s stale threshold.
+        // Backdate mtime past twice the 300s window seeded above.
         let old = std::time::SystemTime::now() - Duration::from_secs(900);
         let times = std::fs::FileTimes::new()
             .set_accessed(old)
@@ -3647,6 +4753,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(!lock.exists());
+        cog_core::progress::reset_for_tests();
     }
 
     /// The cap is a reading, not a setting: it says what this volume holds at
@@ -3680,6 +4787,201 @@ pub(crate) mod tests {
         assert_eq!(workspace_cap(disk_with(4096), 0, 4), None);
     }
 
+    // proves: sandboxExecutor.maxTaskWorkspaces
+    /// The cap is not a setting: a pass reads the volume, and when the
+    /// footprint these trees occupy changes, the very next pass answers a
+    /// different cap. No restart, no configuration.
+    #[tokio::test]
+    async fn the_worktree_cap_is_recomputed_from_the_volume_on_the_next_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let cfg = WorkdirConfig {
+            workspaces_root: tmp.path().join("workspaces"),
+            bare_repo: bare.clone(),
+            target_dir: tmp.path().join("src").join("target"),
+            seed_urls: Vec::new(),
+            ttl: DEFAULT_TTL_SECS_FALLBACK,
+            gc_interval: Duration::from_secs(600),
+            fetch_interval: Duration::from_secs(300),
+            max_workspaces: 32,
+            cap_override: None,
+            warm_trees: 0,
+            data_volumes: Vec::new(),
+            data_volume_declaration_error: None,
+            data_volume_interval: Duration::from_secs(30),
+            build_cache: BuildCacheConfig::default(),
+        };
+        let r = WorkdirRouter::new(cfg).unwrap();
+        r.route("one").await.unwrap();
+        r.route("two").await.unwrap();
+        r.gc_once().await.unwrap();
+        let before = r.metrics().cap.get();
+        assert!(
+            before > 32.0,
+            "a volume this empty holds more than the seed: {before}"
+        );
+        assert_eq!(
+            r.metrics()
+                .cap_source
+                .with_label_values(&["measured"])
+                .get(),
+            1.0
+        );
+
+        // The same trees, a footprint eight mebibytes larger: the next pass
+        // can only answer a smaller cap. This is the input the law divides by.
+        std::fs::write(
+            tmp.path().join("workspaces").join("grown.bin"),
+            vec![0u8; 8 * 1024 * 1024],
+        )
+        .unwrap();
+        r.gc_once().await.unwrap();
+        let after = r.metrics().cap.get();
+        assert!(
+            after < before,
+            "the cap did not follow the measured footprint: {before} -> {after}"
+        );
+        assert!(r.metrics().cap_evaluations.get() >= 2.0);
+    }
+
+    /// The pool's size is a function of two measurements: how often lanes
+    /// arrive and what one checkout costs. A different input answers
+    /// differently, which is the whole difference between this and a number
+    /// someone chose.
+    #[test]
+    fn the_warm_pool_target_follows_arrivals_and_checkout_cost() {
+        // Two arrivals in a minute at a 3.4 s checkout: less than one tree in
+        // flight, so the pool holds one.
+        assert_eq!(warm_trees_from(2, 60, 3.4, 16), Some(1));
+        // Thirty a minute at the same cost: two are in flight while one is cut.
+        assert_eq!(warm_trees_from(30, 60, 3.4, 16), Some(2));
+        // The same arrivals against a cheaper checkout need one.
+        assert_eq!(warm_trees_from(30, 60, 1.0, 16), Some(1));
+        // Never more than half the capacity, however busy the volume is.
+        assert_eq!(warm_trees_from(6000, 60, 3.4, 4), Some(4));
+        // Nothing measured: no target, so the seed stands.
+        assert_eq!(warm_trees_from(1, 60, 3.4, 16), None);
+        assert_eq!(warm_trees_from(2, 0, 3.4, 16), None);
+        assert_eq!(warm_trees_from(2, 60, 0.0, 16), None);
+        assert_eq!(warm_trees_from(2, 60, 3.4, 0), Some(0));
+    }
+
+    // proves: sandboxExecutor.warmTrees
+    /// The target is recomputed by every reclamation pass and published with
+    /// the input set that chose it. The evaluation counter is what shows the
+    /// beat is running when the number happens not to move.
+    #[tokio::test]
+    async fn the_warm_pool_target_is_recomputed_on_the_next_reclamation_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router_with_warm(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK, 1);
+        r.gc_once().await.unwrap();
+        assert_eq!(r.metrics().warm_trees.get(), 1.0);
+        assert_eq!(
+            r.metrics()
+                .warm_trees_source
+                .with_label_values(&["seed"])
+                .get(),
+            1.0
+        );
+        let beats = r.metrics().warm_trees_evaluations.get();
+
+        // Two arrivals a second apart and a checkout measured at 3.4 s: seven
+        // would be in flight, clamped to half the eight-tree capacity.
+        r.note_checkout(3400);
+        r.note_arrival();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        r.note_arrival();
+        r.gc_once().await.unwrap();
+        assert_eq!(r.metrics().warm_trees.get(), 4.0);
+        assert_eq!(
+            r.metrics()
+                .warm_trees_source
+                .with_label_values(&["measured"])
+                .get(),
+            1.0
+        );
+        assert!(r.metrics().warm_trees_evaluations.get() > beats);
+    }
+
+    /// The fetch wait is recomputed on every ask, and the count moves even when
+    /// the head has been still for the same length of time.
+    #[tokio::test]
+    async fn the_fetch_beat_counts_even_when_the_period_does_not_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router_with_warm(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK, 0);
+        let before = r.metrics().fetch_interval_evaluations.get();
+        assert!(r.fetch_due(), "no fetch has run yet");
+        r.last_fetch_unix.store(unix_now(), Ordering::Relaxed);
+        assert!(!r.fetch_due(), "no time has passed since the last fetch");
+        assert_eq!(
+            r.metrics().fetch_interval_evaluations.get() - before,
+            2.0,
+            "both asks evaluated the wait, whatever the wait answered"
+        );
+        assert_eq!(
+            r.metrics().fetch_interval.seconds.get(),
+            300.0,
+            "nothing measured a moving head, so the configured period stands"
+        );
+    }
+
+    /// The reclamation interval is recomputed before every pass, and a pass
+    /// that costs the same keeps the same interval while the count rises.
+    #[tokio::test]
+    async fn the_gc_beat_counts_even_when_the_interval_does_not_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router_with_warm(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK, 0);
+        let before = r.metrics().gc_interval_evaluations.get();
+        let first = r.gc_interval();
+        let second = r.gc_interval();
+        assert_eq!(first, second, "the same pass cost is the same interval");
+        assert_eq!(
+            r.metrics().gc_interval_evaluations.get() - before,
+            2.0,
+            "two recomputations, counted even though the number did not move"
+        );
+    }
+
+    /// The hold time is recomputed by every reclamation pass, and the count
+    /// moves on a pass that finds no tree to reap.
+    #[tokio::test]
+    async fn the_ttl_beat_counts_even_when_the_hold_time_does_not_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router_with_warm(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK, 0);
+        let before = r.metrics().ttl_evaluations.get();
+        r.gc_once().await.unwrap();
+        r.gc_once().await.unwrap();
+        assert_eq!(
+            r.metrics().ttl_evaluations.get() - before,
+            2.0,
+            "each pass evaluated the hold, including the passes with no trees"
+        );
+    }
+
+    /// The cache walk states its cadence every time it is due, and the count
+    /// rises whether or not the walk's cost moved the interval.
+    #[tokio::test]
+    async fn the_cache_walk_beat_counts_even_when_the_interval_does_not_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router_with_warm(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK, 0);
+        let cache = r.build_cache().clone();
+        let before = cache.scan_interval_evaluations();
+        assert!(r.cache_walk_due(&cache), "no walk has run yet");
+        r.last_cache_walk_unix.store(unix_now(), Ordering::Relaxed);
+        assert!(!r.cache_walk_due(&cache), "no time has passed");
+        assert_eq!(
+            cache.scan_interval_evaluations() - before,
+            2,
+            "the interval was stated twice, even when it did not move"
+        );
+    }
+
+    // proves: sandboxExecutor.repoFetchIntervalSecs
     /// Polling is paid for by how often the thing being polled changes.
     #[test]
     fn the_fetch_period_follows_how_long_main_was_still() {
@@ -3698,6 +5000,7 @@ pub(crate) mod tests {
         );
     }
 
+    // proves: sandboxExecutor.buildCacheScanIntervalSecs
     /// The same law paces the cache walk, at its own floor: a walk that costs
     /// N seconds buys twenty times that period, never less than the shared
     /// floor. Both loops take their multiple from one constant, so tuning the
@@ -3931,6 +5234,7 @@ pub(crate) mod tests {
         );
     }
 
+    // proves: sandboxExecutor.workspaceGcIntervalSecs
     /// Reclamation's own cost is what the interval covers, so a volume that
     /// fills and makes the pass slower moves the interval with it instead of
     /// letting the loop's share of the process grow. The pass is timed as the
@@ -3962,6 +5266,7 @@ pub(crate) mod tests {
         );
     }
 
+    // proves: sandboxExecutor.workspaceTtlSecs
     /// The TTL is set by how fast trees arrive and how many fit -- never by how
     /// long trees have sat idle, which is the one input that cannot be observed
     /// independently of the TTL itself.
@@ -3988,6 +5293,179 @@ pub(crate) mod tests {
         );
         assert_eq!(ttl_from(20, 1, 10 * 3600), None);
         assert_eq!(ttl_from(20, 10, 0), None);
+    }
+
+    /// 两副副本各有各的卷。在一副上做下的工作，搬到另一副上仍在：内容在，
+    /// 而且以未提交改动的样子在——`git status` 读得出来，接着干的人看得见。
+    ///
+    /// 搬的是内容不是历史：只在那副上的提交不以提交的身份跟过来，但它的效果在
+    /// 树里。这条测试同时钉住打包不改变原树：原副上那棵树还是原样。
+    #[tokio::test]
+    async fn work_made_on_one_replica_arrives_on_another() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let bare_a = seed_bare(a.path());
+        let bare_b = seed_bare(b.path());
+        let ra = router(a.path(), &bare_a, 8, DEFAULT_TTL_SECS_FALLBACK);
+        let rb = router(b.path(), &bare_b, 8, DEFAULT_TTL_SECS_FALLBACK);
+        let name = lane("squad:DSC-CARRY");
+
+        let (tree_a, use_a, _) = ra.route(&name).await.unwrap();
+        std::fs::write(tree_a.join("new.rs"), "fn main() {}\n").unwrap();
+        std::fs::create_dir_all(tree_a.join("sub").join("dir")).unwrap();
+        std::fs::write(tree_a.join("sub").join("dir").join("deep.txt"), "deep\n").unwrap();
+        std::fs::remove_file(tree_a.join("README")).unwrap();
+        drop(use_a);
+
+        let bundle = ra.pack_lane(&name).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tree_a.join("new.rs")).unwrap(),
+            "fn main() {}\n",
+            "打包不该动原树：这边打完包还要接着干活"
+        );
+
+        let files = rb.unpack_lane(&name, &bundle).await.unwrap();
+        assert_eq!(files, 3, "删了一个、添了两个：写回的就是这三处");
+        let (tree_b, use_b, _) = rb.route(&name).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tree_b.join("new.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tree_b.join("sub").join("dir").join("deep.txt")).unwrap(),
+            "deep\n"
+        );
+        assert!(
+            !tree_b.join("README").exists(),
+            "原树上删掉的文件不该在这一副上留下"
+        );
+        let status = git_out(&tree_b, &["status", "--porcelain"]);
+        assert!(
+            status.contains("new.rs"),
+            "搬来的东西该是未提交的改动：{status}"
+        );
+        assert!(
+            status.contains("README"),
+            "删掉的那处在 status 里也要有：{status}"
+        );
+        drop(use_b);
+    }
+
+    /// 一条 lane 来回搬：第二趟的包和第一趟的包在两副上都没有祖孙关系（两副的
+    /// HEAD 各是各的），运输用的那个 ref 要能被换掉，而不是被 fetch 当成
+    /// non-fast-forward 拒收——拒了，第二次搬家就悄悄什么都没带。
+    #[tokio::test]
+    async fn a_lane_carried_back_and_forth_takes_the_latest_content_each_time() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let bare_a = seed_bare(a.path());
+        let bare_b = seed_bare(b.path());
+        let ra = router(a.path(), &bare_a, 8, DEFAULT_TTL_SECS_FALLBACK);
+        let rb = router(b.path(), &bare_b, 8, DEFAULT_TTL_SECS_FALLBACK);
+        let name = lane("squad:DSC-ROUNDTRIP");
+
+        let (tree_a, use_a, _) = ra.route(&name).await.unwrap();
+        std::fs::write(tree_a.join("note.txt"), "first\n").unwrap();
+        drop(use_a);
+        let over = ra.pack_lane(&name).await.unwrap();
+        rb.unpack_lane(&name, &over).await.unwrap();
+
+        let (tree_b, use_b, _) = rb.route(&name).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tree_b.join("note.txt")).unwrap(),
+            "first\n"
+        );
+        std::fs::write(tree_b.join("note.txt"), "second\n").unwrap();
+        drop(use_b);
+        let back = rb.pack_lane(&name).await.unwrap();
+        ra.unpack_lane(&name, &back)
+            .await
+            .expect("第二趟搬家该把这一副上的 ref 换掉，而不是被拒收");
+
+        let (tree_a, use_a, _) = ra.route(&name).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tree_a.join("note.txt")).unwrap(),
+            "second\n",
+            "来回搬两次之后，树上该是最后动过的那一份"
+        );
+        drop(use_a);
+    }
+
+    /// 一副上没有这条 lane 的树时，没有什么可搬：这不是失败，是空手而来。
+    #[tokio::test]
+    async fn a_lane_with_no_tree_has_nothing_to_carry() {
+        let a = tempfile::tempdir().unwrap();
+        let bare = seed_bare(a.path());
+        let r = router(a.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
+        match r.pack_lane(&lane("squad:DSC-NOTHING")).await {
+            Err(CarryError::NoTree(_)) => {}
+            other => panic!("没有树的 lane 该答「没有东西可搬」，实际是 {other:?}"),
+        }
+    }
+
+    /// 树里还有命令在跑时不打包：那一刻打出来的包说不出它是哪一刻的样子。
+    #[tokio::test]
+    async fn a_lane_whose_tree_is_in_use_is_not_packed() {
+        let a = tempfile::tempdir().unwrap();
+        let bare = seed_bare(a.path());
+        let r = router(a.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
+        let name = lane("squad:DSC-BUSY");
+        let (tree, use_guard, _) = r.route(&name).await.unwrap();
+        std::fs::write(tree.join("wip.txt"), "half written\n").unwrap();
+
+        match r.pack_lane(&name).await {
+            Err(CarryError::Busy(_)) => {}
+            other => panic!("树在用的时候该答「忙」，实际是 {other:?}"),
+        }
+        drop(use_guard);
+        assert!(r.pack_lane(&name).await.is_ok(), "命令跑完了就该能搬");
+    }
+
+    /// 名字过不了路由的字面检查的，一开始就不该进这条路。
+    #[tokio::test]
+    async fn a_lane_name_that_cannot_be_a_tree_is_refused_before_any_git() {
+        let a = tempfile::tempdir().unwrap();
+        let bare = seed_bare(a.path());
+        let r = router(a.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
+        match r.pack_lane("../escape").await {
+            Err(CarryError::Refused(_)) => {}
+            other => panic!("越界的名字该当场拒，实际是 {other:?}"),
+        }
+    }
+
+    /// 形态价格要的三条读数都从已经存在的事件里借：切树的中位、卷走查的每树字节、
+    /// 搬树的中位。一条都还没发生过时它们是 `None`，不是一个免费的 0；样本换了，
+    /// 读数跟着换。
+    #[tokio::test]
+    async fn the_shape_readings_are_none_until_the_thing_they_price_has_happened() {
+        let a = tempfile::tempdir().unwrap();
+        let bare = seed_bare(a.path());
+        let r = router(a.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
+        assert_eq!(r.checkout_seconds(), None);
+        assert_eq!(r.tree_bytes(), None);
+        assert_eq!(r.carry_reading(), None);
+
+        r.note_checkout(1_000);
+        r.note_checkout(3_000);
+        r.note_checkout(2_000);
+        assert_eq!(r.checkout_seconds(), Some(2.0));
+
+        // 走查量到字节与树数两样才有一棵树的体积；只量到一边时不成形。
+        r.last_tree_bytes.store(10_000, Ordering::Relaxed);
+        r.last_tree_count.store(4, Ordering::Relaxed);
+        assert_eq!(r.tree_bytes(), Some(2_500));
+        r.last_tree_count.store(0, Ordering::Relaxed);
+        assert_eq!(r.tree_bytes(), None);
+
+        r.note_carry(100, 1_000);
+        r.note_carry(2_000, 9_000);
+        r.note_carry(300, 4_000);
+        assert_eq!(r.carry_reading(), Some((0.3, 4_000)));
+        // 窗口里换成更大的样本，读数跟着变大：它是量出来的，不是钉住的。
+        for _ in 0..3 {
+            r.note_carry(5_000, 20_000);
+        }
+        assert_eq!(r.carry_reading(), Some((5.0, 20_000)));
     }
 
     #[test]

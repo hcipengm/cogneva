@@ -21,6 +21,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 [ "${1:-}" = "" ] || ROOT="$1"
 cd "$ROOT"
 
+# 渲染产物不进仓：读之前让 chart 现场生成（输入没变就是一次摘要比较）。
+# 夹具树只摆自己判的那几个文件、没有生成器，缺它时按「这里没有产物要生成」跳过。
+if [ -f "${ROOT}/deploy/scripts/lib/rendered-cache.sh" ]; then
+    # shellcheck source=lib/rendered-cache.sh
+    source "${ROOT}/deploy/scripts/lib/rendered-cache.sh"
+    ensure_rendered "${ROOT}" || exit $?
+fi
+
 command -v python3 >/dev/null || { echo "缺少依赖：python3" >&2; exit 2; }
 
 python3 - deploy/rendered <<'PY'
@@ -32,7 +40,7 @@ import yaml
 
 base = sys.argv[1]
 if not os.path.isdir(base):
-    sys.exit(f"找不到 {base}/：先跑 deploy/scripts/render-deploy.sh")
+    sys.exit(f"找不到 {base}/：先跑 bash deploy/scripts/lib/rendered-cache.sh --ensure")
 
 profiles = sorted(
     name for name in os.listdir(base) if os.path.isdir(os.path.join(base, name))

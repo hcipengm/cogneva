@@ -2,24 +2,31 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::Agent;
+use crate::{Agent, LifecycleManager};
 use cog_core::{
     AgentRegistration, AgentRegistry, InboxMessage, MessageBackend, SFResult, StateBackend,
 };
 
 /// Build the runtime config a new agent of `role` starts from.
 ///
-/// Installing the role's skill here is the single point where the skill's
-/// declared parameters reach the runtime: `AgentRuntime::new` applies the
-/// skill's iteration budget on top of the config value, and the per-role
-/// calibration in the observable moves it from there. Without this hop the
-/// skill file is written, validated, and evolved while nothing reads it.
+/// The role's row is attached here so that a run's outcome can be reported
+/// against the hand that produced it (`report_skill_outcome`), which is what
+/// feeds the skill-effectiveness tracker. It is the row and nothing else: the
+/// turn ceiling is not read off it — a row is dispatched by role name, and a
+/// ceiling keyed by a label is the same work running under a different limit
+/// depending on which name was written on the worker. The ceiling comes from
+/// the operator's config and from this process's own delivered runs.
 ///
-/// A role with no registered skill keeps the config value: the mapping is
-/// absent for that role, which is not the same statement as "this role wants
-/// the default" — it is simply no evidence, and inventing one would change
+/// A role with no registered row keeps the config value: the mapping is absent
+/// for that role, which is not the same statement as "this role wants the
+/// default" — it is simply no evidence, and inventing one would change
 /// behaviour for roles nobody has described yet.
-async fn runtime_config_for(
+///
+/// Public because it is the single construction point for an agent's config,
+/// and a differential over "the same work under two labels" has to read the
+/// config the production path would hand each of them. A test that rebuilt the
+/// config by hand would be comparing its own copy of the rules, not the rules.
+pub async fn runtime_config_for(
     default_config: &cog_core::RuntimeConfig,
     skill_registry: Option<&RwLock<cog_core::SkillRegistry>>,
     agent_id: &str,
@@ -42,7 +49,6 @@ async fn runtime_config_for(
 pub struct WorkerHandle {
     pub agent_id: String,
     pub role: String,
-    pub capabilities: Vec<String>,
     pub agent: Arc<Agent>,
     /// When this object was put on the roster.
     ///
@@ -73,6 +79,13 @@ pub struct GlobalAgentManager {
     registry: Arc<dyn AgentRegistry>,
     message_backend: Arc<dyn MessageBackend>,
     state_backend: Arc<dyn StateBackend>,
+    /// 员工生命周期的那台机器，交给池子里每一个新对象。
+    ///
+    /// 放在管理器上而不是逐个新建：它只包着同一本 `StateBackend`，池子里的
+    /// 对象共享同一张转换表与同一个持久面。挂上它，池子里每个员工在开跑时
+    /// 就有一行可读的状态，监管者的健康判决与再平衡才有东西可读——不挂的
+    /// 时候一切照跑，只是「谁在什么状态」这件事在持久面上从来没有答案。
+    lifecycle: Arc<LifecycleManager>,
     workers: RwLock<Vec<WorkerHandle>>,
     round_robin: Mutex<usize>,
     default_runtime_config: cog_core::RuntimeConfig,
@@ -97,6 +110,8 @@ pub struct GlobalAgentManager {
     event_bus_sink: Option<crate::EventBusSink>,
     /// Durable per-task token census sink handed to every spawned worker.
     observability: Option<Arc<dyn cog_core::ObservabilityGateway>>,
+    /// Handed to every worker so a resumed attempt can report itself.
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
     /// Where a worker's checkpoint is persisted when something asks for a
     /// snapshot.
     ///
@@ -124,6 +139,8 @@ pub struct GlobalAgentManager {
     /// Where a spawned worker's loop archives a tool output too large for the
     /// context window. Shared by every worker, like the observability gateway.
     tool_output_archive: Option<Arc<dyn crate::archive::ToolOutputArchive>>,
+    /// 工具调用的事实落点。与归档并存：一个是记录，一个是正文载体。
+    tool_call_events: Option<Arc<dyn cog_core::EventStore>>,
     /// How often every worker renews its registration.
     ///
     /// Read from the `agent` section at startup and handed to each spawned
@@ -151,10 +168,12 @@ impl GlobalAgentManager {
         message_backend: Arc<dyn MessageBackend>,
         state_backend: Arc<dyn StateBackend>,
     ) -> Self {
+        let lifecycle = Arc::new(LifecycleManager::new(state_backend.clone()));
         Self {
             registry,
             message_backend,
             state_backend,
+            lifecycle,
             workers: RwLock::new(Vec::new()),
             round_robin: Mutex::new(0),
             // The rest comes from the one default rather than a second copy of
@@ -172,10 +191,12 @@ impl GlobalAgentManager {
             event_bus: None,
             event_bus_sink: None,
             observability: None,
+            metrics: None,
             checkpoint_store: None,
             wal_backend: None,
             wal_missing_reported: AtomicBool::new(false),
             tool_output_archive: None,
+            tool_call_events: None,
             heartbeat_interval_secs: None,
             roster_observer: None,
         }
@@ -201,7 +222,14 @@ impl GlobalAgentManager {
             observer.publish_roster(
                 workers
                     .iter()
-                    .map(|w| (w.role.clone(), w.created_at, w.task_id.is_some()))
+                    .map(|w| {
+                        (
+                            w.agent_id.clone(),
+                            w.role.clone(),
+                            w.created_at,
+                            w.task_id.is_some(),
+                        )
+                    })
                     .collect::<Vec<_>>(),
             );
         }
@@ -292,6 +320,12 @@ impl GlobalAgentManager {
         self
     }
 
+    /// Give every spawned worker the series a resumed attempt reports itself on.
+    pub fn with_metrics(mut self, metrics: Arc<dyn cog_core::MetricsBackend>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
     /// Give every spawned worker the store its snapshots are persisted to.
     pub fn with_checkpoint_store(mut self, store: Arc<dyn cog_core::CheckpointStore>) -> Self {
         self.checkpoint_store = Some(store);
@@ -353,12 +387,18 @@ impl GlobalAgentManager {
         self
     }
 
+    /// Give every spawned worker the sink a tool call is recorded in.
+    pub fn with_tool_call_events(mut self, events: Arc<dyn cog_core::EventStore>) -> Self {
+        self.tool_call_events = Some(events);
+        self
+    }
+
     /// Spawn a new worker agent, register it globally, and start its inbox consumer.
     /// # Arguments
     /// * `agent_id` — unique worker identifier
     /// * `role` — agent role (planner, generator, evaluator)
     /// * `llm` — shared LLM provider
-    /// * `registration` — registry payload (capabilities, resources, etc.)
+    /// * `registration` — registry payload (resources, host, etc.)
     /// * `handler` — closure invoked for each [`InboxMessage`]
     pub async fn spawn_worker<F, Fut>(
         &self,
@@ -375,14 +415,13 @@ impl GlobalAgentManager {
         let agent_id = agent_id.into();
         let config = self.runtime_config_for(&agent_id, &role).await;
 
-        let capabilities = registration.capabilities.clone();
-
         let agent = {
             let mut a = Agent::new(config, llm)
                 .with_registry(self.registry.clone())
                 .with_registration(registration)
                 .with_message_backend(self.message_backend.clone())
-                .with_state_backend(self.state_backend.clone());
+                .with_state_backend(self.state_backend.clone())
+                .with_lifecycle(self.lifecycle.clone());
             if let Some(secs) = self.heartbeat_interval_secs {
                 a = a.with_heartbeat_interval(secs);
             }
@@ -407,8 +446,14 @@ impl GlobalAgentManager {
             if let Some(ref ob) = self.observability {
                 a = a.with_observability(ob.clone());
             }
+            if let Some(ref m) = self.metrics {
+                a = a.with_metrics(m.clone());
+            }
             if let Some(ref cp) = self.checkpoint_store {
                 a = a.with_checkpoint_store(cp.clone());
+            }
+            if let Some(ref events) = self.tool_call_events {
+                a = a.with_tool_call_events(events.clone());
             }
             if let Some(ref ar) = self.tool_output_archive {
                 a = a.with_tool_output_archive(ar.clone());
@@ -422,7 +467,6 @@ impl GlobalAgentManager {
         let handle = WorkerHandle {
             agent_id: agent_id.clone(),
             role: role.to_string(),
-            capabilities,
             agent: Arc::new(agent),
             created_at: std::time::Instant::now(),
             // A worker spawned with a caller-supplied handler is not tied to a
@@ -564,7 +608,7 @@ impl GlobalAgentManager {
     pub async fn shutdown(&self) -> SFResult<()> {
         let workers = self.workers.read().await;
         for w in workers.iter() {
-            let _ = w.agent.abort().await;
+            cog_core::ignore_lost!(w.agent.abort().await);
         }
         Ok(())
     }
@@ -577,14 +621,13 @@ impl GlobalAgentManager {
 /// which pod holds which squad, so a stuck squad in one pod and a quiet pod
 /// read the same. The pod name is available as `COGNEVA_POD_NAME` or
 /// `HOSTNAME`, and a plain host run honestly reports that host.
-fn task_agent_registration(agent_id: &str, role: &str) -> cog_core::AgentRegistration {
+pub(crate) fn task_agent_registration(agent_id: &str, role: &str) -> cog_core::AgentRegistration {
     cog_core::AgentRegistration::new(
         agent_id,
         crate::identity::agent_instance(),
         "127.0.0.1",
         role.to_string(),
         "default",
-        vec![role.to_string()],
         cog_core::ResourceInfo::default(),
     )
 }
@@ -597,6 +640,27 @@ impl cog_core::AgentManager for GlobalAgentManager {
         role: &str,
         llm: std::sync::Arc<dyn cog_core::LlmClient>,
         task_id: Option<&str>,
+    ) -> cog_core::SFResult<std::sync::Arc<dyn cog_core::Agent>> {
+        // 没有声明：调用方没带任务，答不出这件活交什么。
+        self.create_agent_declaring(
+            agent_id,
+            role,
+            llm,
+            task_id,
+            cog_core::DeliverableDeclaration::Unstated,
+            Vec::new(),
+        )
+        .await
+    }
+
+    async fn create_agent_declaring(
+        &self,
+        agent_id: &str,
+        role: &str,
+        llm: std::sync::Arc<dyn cog_core::LlmClient>,
+        task_id: Option<&str>,
+        deliverable: cog_core::DeliverableDeclaration,
+        stated_directions: Vec<String>,
     ) -> cog_core::SFResult<std::sync::Arc<dyn cog_core::Agent>> {
         // 同一个名字只对应一个活的对象。
         //
@@ -623,8 +687,16 @@ impl cog_core::AgentManager for GlobalAgentManager {
         // 就是这个任务的 id（`create_role_agent` 与 roundtable 的角色都是这么建
         // 的），所以这里不做推断。
         config.owner_task_id = task_id.map(str::to_string);
+        // 这份活交什么、这个结论从哪儿来，是拿到任务的那一层说的
+        // （`Task::deliverable_declaration`）。运行时够不到任务对象，只读这两格；
+        // 按角色名判时，同一个人换件活就判错。结论与来源从同一份声明里取出，
+        // 所以两格不会各自漂。
+        config.deliverable = deliverable.conclusion();
+        config.deliverable_state = deliverable.state();
+        // 同一份声明里来自人的那半：有人就这件活说过的方向。抄进来而不是让运行时
+        // 自己去读，理由与上一句相同——运行时够不到任务，读不到就没得判。
+        config.stated_directions = stated_directions;
 
-        let capabilities = vec![role.to_string()];
         let registration = task_agent_registration(agent_id, role);
 
         let agent = {
@@ -632,7 +704,8 @@ impl cog_core::AgentManager for GlobalAgentManager {
                 .with_registry(self.registry.clone())
                 .with_registration(registration)
                 .with_message_backend(self.message_backend.clone())
-                .with_state_backend(self.state_backend.clone());
+                .with_state_backend(self.state_backend.clone())
+                .with_lifecycle(self.lifecycle.clone());
             if let Some(secs) = self.heartbeat_interval_secs {
                 a = a.with_heartbeat_interval(secs);
             }
@@ -656,6 +729,9 @@ impl cog_core::AgentManager for GlobalAgentManager {
             }
             if let Some(ref ob) = self.observability {
                 a = a.with_observability(ob.clone());
+            }
+            if let Some(ref m) = self.metrics {
+                a = a.with_metrics(m.clone());
             }
             if let Some(ref cp) = self.checkpoint_store {
                 a = a.with_checkpoint_store(cp.clone());
@@ -683,7 +759,6 @@ impl cog_core::AgentManager for GlobalAgentManager {
         let handle = WorkerHandle {
             agent_id: agent_id.into(),
             role: role.to_string(),
-            capabilities,
             agent: agent.clone(),
             created_at: std::time::Instant::now(),
             task_id: task_id.map(str::to_string),
@@ -724,7 +799,6 @@ impl cog_core::AgentManager for GlobalAgentManager {
             .map(|w| cog_core::WorkerInfo {
                 agent_id: w.agent_id,
                 role: w.role,
-                capabilities: w.capabilities,
                 owner_task: w.task_id,
             })
             .collect())
@@ -767,18 +841,15 @@ mod tests {
         Arc::new(RwLock::new(registry))
     }
 
-    fn skill_json(role: &str, max_iterations: u32) -> String {
-        format!(
-            r#"[{{"skill_id":"{role}","name":"{role}","tools":[],"max_iterations":{max_iterations},"role_type":"{role}"}}]"#
-        )
+    fn skill_json(role: &str) -> String {
+        format!(r#"[{{"skill_id":"{role}","name":"{role}","role_type":"{role}"}}]"#)
     }
 
-    /// 技能面的预算要真的走到运行时头上。这条链路曾经只差最后一跳——技能
-    /// 被装上、被校验、被改写，运行时却没有任何读点，于是"自进化能调预算"
-    /// 看起来是真的而实际是死的。这里量的是那一跳。
+    /// 角色绑定的那一行要真的走到运行时头上：结局按这一行报给有效性追踪器，
+    /// 少了这一跳，技能被装上、被校验、被改写，却收不到任何一条结局。
     #[tokio::test]
     async fn the_roles_skill_reaches_the_runtime_config() {
-        let registry = registry_with(&skill_json("generator", 17));
+        let registry = registry_with(&skill_json("generator"));
         let config = runtime_config_for(
             &cog_core::RuntimeConfig::default(),
             Some(registry.as_ref()),
@@ -789,7 +860,6 @@ mod tests {
 
         let skill: &SkillConfig = config.skill_config.as_ref().expect("skill installed");
         assert_eq!(skill.skill_id, "generator");
-        assert_eq!(skill.max_iterations, Some(17));
         assert_eq!(config.role, "generator");
         assert_eq!(config.agent_id, "squad-a-generator");
     }
@@ -797,7 +867,7 @@ mod tests {
     /// 技能是**按角色**取的：别的角色的技能不能顺手落到这个角色头上。
     #[tokio::test]
     async fn another_roles_skill_is_not_installed() {
-        let registry = registry_with(&skill_json("generator", 17));
+        let registry = registry_with(&skill_json("generator"));
         let config = runtime_config_for(
             &cog_core::RuntimeConfig::default(),
             Some(registry.as_ref()),
@@ -826,9 +896,6 @@ mod tests {
         assert_eq!(config.max_iterations, 23);
     }
 
-    /// 那一跳的另一半：装上的技能预算真的成为运行时的预算。角色名只有本用例
-    /// 用——预算还跟着该角色自己跑出来的读数走，借用别的用例写过的角色名会把
-    /// 断言变成对执行顺序的断言。
     /// 名册上"这个 agent 跑在哪里"必须答得出真话。原来每个任务角色的 agent
     /// 都登记成 `cog-agent`——那不是任何一台机器的名字，于是「某个 pod 里的
     /// squad 卡住了」和「那个 pod 闲著」在名册上读成同一行。
@@ -843,7 +910,6 @@ mod tests {
 
         assert_eq!(reg.hostname, "cogneva-647bb49dcd-4cttc");
         assert_eq!(reg.role, "planner");
-        assert_eq!(reg.capabilities, vec!["planner".to_string()]);
 
         match previous {
             Some(v) => std::env::set_var("COGNEVA_POD_NAME", v),
@@ -851,12 +917,20 @@ mod tests {
         }
     }
 
+    /// 装上的那一行不移动轮次上限：上限只来自配置面（覆盖）与实测（样本）。
+    ///
+    /// 这条以前量的是相反的断言——行上的预算成为运行时的预算。那一跳正是按标签
+    /// 分发天花板的入口：行按角色名取，同一件活换个标签接手就换一个上限。
     #[tokio::test]
-    async fn the_installed_skill_sets_the_runtime_budget() {
+    async fn the_installed_skill_cannot_move_the_budget() {
         let role = "skill-chain-budget-test";
-        let registry = registry_with(&skill_json(role, 17));
+        let registry = registry_with(&skill_json(role));
+        let default_config = cog_core::RuntimeConfig {
+            max_iterations: 23,
+            ..Default::default()
+        };
         let config = runtime_config_for(
-            &cog_core::RuntimeConfig::default(),
+            &default_config,
             Some(registry.as_ref()),
             "skill-chain-budget-test-agent",
             role,
@@ -864,7 +938,11 @@ mod tests {
         .await;
 
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let runtime = crate::AgentRuntime::new(config, tx);
-        assert_eq!(runtime.config().max_iterations, 17);
+        let runtime = crate::AgentRuntime::new_with_observable(
+            config,
+            tx,
+            &crate::observable::AgentObservable::new(),
+        );
+        assert_eq!(runtime.config().max_iterations, 23);
     }
 }

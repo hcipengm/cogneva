@@ -60,6 +60,7 @@ fn slug(id: &str) -> String {
 }
 
 fn path_for(change_id: &str) -> PathBuf {
+    // state-file: handoff — 切换是 execve，判定必须在换映像前落到同一卷上；这条记录只活到 soak 期满、取走即撤回，不是某条事实的第二份正本
     dir().join(format!("{}.json", slug(change_id)))
 }
 
@@ -170,6 +171,7 @@ mod tests {
 
     fn handed_off_change(id: &str) -> EvolutionResult {
         EvolutionResult {
+            unit_of_work: None,
             kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: id.into(),
             description: "hand-off round trip".into(),

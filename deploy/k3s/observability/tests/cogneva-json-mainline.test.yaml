@@ -433,14 +433,16 @@ tests:
         alertname: mainline_ci_hold_unowned
         exp_alerts: []
 
-  # 序列比窗口年轻：一分钟的交不出去也没有。这一格里的读数头三十分钟根本不存在，
+  # 序列比窗口年轻：一分钟的交不出去也没有。这一格里的读数前三十五分钟根本不存在，
   # 之后一直是 1；`min_over_time[1800s]` 此时看到的全是 1，会当作「连续半小时都
   # 没人接手」——而部署器刚从重启里回来，那只是它写下的第一个采样。铺满那一腿
   # （`count_over_time[1h] > count_over_time[30m]`）是这一格唯一能把它拦下来的东西。
+  # 起点不能正好压在 t=30 上：30m 子查询左端开区间，那一格样本只落进 1h 那边，
+  # count 差 1 就被读成「比半小时老」，读的是分辨率而不是序列年龄。
   - interval: 1m
     input_series:
       - series: 'cogneva_mainline_ci_hold_unowned'
-        values: '_x30 1x30'
+        values: '_x35 1x25'
       - series: 'cogneva_mainline_ci_hold_unowned_observed_timestamp_seconds'
         values: '3000x60'
     alert_rule_test:

@@ -25,13 +25,16 @@ path = "src/main.rs"
 name = "suite"
 path = "tests/suite.rs"
 
+
+[[test]]
+name = "backup_large_objects"
+path = "tests/backup_large_objects.rs"
+
+
 [[test]]
 name = "backup_pg"
 path = "tests/backup_pg.rs"
 
-[[test]]
-name = "ignored_test_corpus_contract_test"
-path = "tests/ignored_test_corpus_contract_test.rs"
 
 [[test]]
 name = "memory_decay_plugin_test"
@@ -45,9 +48,34 @@ path = "tests/memory_refusal_sweep_plugin_test.rs"
 name = "store_derived_reading"
 path = "tests/store_derived_reading.rs"
 
+# The four live-DB cases that read both stores: a test-only edge may not point
+# at a shipping crate, so they live in the assembly rather than in cog-storage.
+# They are their own targets instead of `suite` modules because the ignored
+# corpus contract names a case by `--test <stem>` and a step that names a
+# module target runs nothing.
+[[test]]
+name = "the_rollup_is_gone_test"
+path = "tests/the_rollup_is_gone_test.rs"
+
+[[test]]
+name = "metric_projections_rebuild_from_prometheus"
+path = "tests/metric_projections_rebuild_from_prometheus.rs"
+
+[[test]]
+name = "a_batch_id_answers_what_the_batch_cost_test"
+path = "tests/a_batch_id_answers_what_the_batch_cost_test.rs"
+
+[[test]]
+name = "the_usage_readers_agree_row_by_row"
+path = "tests/the_usage_readers_agree_row_by_row.rs"
+
 [[test]]
 name = "swe_pro_container"
 path = "tests/swe_pro_container.rs"
+
+[[test]]
+name = "scale_capacity_reading"
+path = "tests/scale_capacity_reading.rs"
 
 [dependencies]
 cog-core = { workspace = true }
@@ -93,7 +121,7 @@ redis = { workspace = true }
 sqlx = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
-dirs = "5"
+dirs = { workspace = true }
 sd-notify = "0.4"
 notify = "6"
 futures = { workspace = true }
@@ -113,6 +141,7 @@ ring = "0.17"
 # （起容器里的 MCP server），不是测试——放在 dev-dependencies 里只有测试 profile 编译得过，
 # `cargo build` 会红。
 serde_yaml = "0.9"
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"

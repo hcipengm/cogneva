@@ -97,6 +97,14 @@ export function SideBar() {
 }
 
 const TITLES: Record<ActivityId, string> = {
+  search: '搜索',
+  hooks: '钩子',
+  plugins: '插件',
+  workspaces: '工作区',
+  'action-plan': '动作计划',
+  datasets: '数据集',
+  snapshots: '快照',
+  wiki: '知识',
   workspace: '工作台',
   people: '员工',
   venues: '场地',
@@ -116,6 +124,7 @@ const TITLES: Record<ActivityId, string> = {
   governance: '治理',
   observability: '观测',
   token: 'Token',
+  keys: '密钥',
   resources: '资源',
   storage: '存储',
   eval: '评测',
@@ -484,7 +493,7 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
             <Row label="调用点" note="在＝按名字点单会真的跑；「只声明」点了落空" />
             <Row
               label="谁能点它"
-              note="分工表里点了名的角色；没有声明 tools 的角色能点每一项，不摊在这一栏"
+              note="没有一个角色声明工具边界：每个角色都拿整张注册表，所以只在不设边界那一侧列名"
             />
             <Row label="要什么参数" note="schema 里声明的必填与总数；「清单没给」不是「不要参数」" />
             <Row label="跑在哪" note="进程内 / WASM 沙箱 / 远端执行器——它决定做砸了长什么样" />
@@ -705,7 +714,7 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
             <Row label="就绪 / 目标" note="滚动还没走完时会差一截" />
             <Row label="条件" note="Progressing=False 是卡住" />
             <Row label="构建跑次" note="一次构建一行，同一变更重试就有多行" />
-            <Row label="结局" note="built / failed / timed_out / unstarted" />
+            <Row label="结局" note="built / failed / stalled / unstarted" />
             <Note>
               上半页读 apiserver：谁在跑第几版。下半页读演进进程：这轮构建过什么、每条
               怎么结束的。下半页的窗口在演进进程内存里，重启清零，所以它回答的是「这一

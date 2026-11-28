@@ -116,7 +116,7 @@ impl HookPublisher for WalHookPublisher {
         match self.primary.publish_redis_stream(channel, payload).await {
             Ok(()) => {
                 // Primary succeeded — try to replay any buffered events
-                let _ = self.replay().await;
+                cog_core::ignore_lost!(self.replay().await);
                 Ok(())
             }
             Err(e) => {

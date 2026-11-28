@@ -42,7 +42,8 @@ pub struct BehaviorMonitor {
 }
 
 impl BehaviorMonitor {
-    // cap: bound — actions the pattern detector can see; a fixed depth, not a reading
+    // cap: fixed — actions the pattern detector can see; a fixed depth, not a reading
+    // keep: 删掉后模式检测器能看到任意长的历史，模式被很早以前的动作定义；由「a fixed depth」兜住
     pub const DEFAULT_MAX_HISTORY: usize = 20;
 
     pub fn new(agent_id: impl Into<String>) -> Self {

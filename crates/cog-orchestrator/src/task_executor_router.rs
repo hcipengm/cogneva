@@ -19,12 +19,16 @@ use std::time::Duration;
 // whose message this sweeper is no longer going to deliver. Defined once in
 // cog-core so the two cannot drift into a pair that publishes a duplicate while
 // the first copy is still on its way.
+// cap: fixed — 1000 is the seconds-to-milliseconds conversion, not a dial; the window itself is DEFAULT_READY_CLAIM_IDLE_SECS
+// keep: 删掉后回到「1000 is the seconds-to-milliseconds conversion, not a dial; the window itself is DEFAULT_READY_CLAIM_IDLE_SECS」所描述的情形；由这条约定兜住
 const PENDING_IDLE_MS: u64 = cog_core::config::DEFAULT_READY_CLAIM_IDLE_SECS * 1000;
-// cap: bound — sweeper poll period; PENDING_IDLE_MS is the claim threshold, this only sets how late a stuck message is seen
+// cap: fixed — sweeper poll period; PENDING_IDLE_MS is the claim threshold, this only sets how late a stuck message is seen
+// keep: 删掉后回到「sweeper poll period; PENDING_IDLE_MS is the claim threshold, this only sets how late a stuck message is seen」所描述的情形；由这条约定兜住
 const CLAIM_INTERVAL: Duration = Duration::from_secs(60);
 /// 一次认领要多少条：够把下一次醒来之前的工作铺在 executor 前面，也小到一次认领
 /// 本身跨不过两轮之间的间隔。
-// cap: bound — 够把下一次醒来之前的工作铺在 executor 前面，又小到一次认领跨不过两轮之间的间隔
+// cap: fixed — 够把下一次醒来之前的工作铺在 executor 前面，又小到一次认领跨不过两轮之间的间隔
+// keep: 删掉后一次认领跨不过两轮之间的间隔；由「够铺、又小到跨不过两轮」兜住
 const CLAIM_BATCH: usize = 16;
 /// 给在途执行上限的那个环境变量名。
 ///
@@ -35,15 +39,22 @@ const CLAIM_BATCH: usize = 16;
 /// k3 的 5 小时窗口（1,670,569 token）在开窗 10 分钟里被花掉 1,105,275，
 /// 八道变更各走一半、一道也没走完。这种数只能改代码才改得动，而它要改的时机
 /// 恰好是额度读数变了的时候。
+///
+/// 现在它有了读数一侧：不配、配 `0` 或配空串都是「按池子的额度导出」，
+/// 正数是钉死的覆盖位（见 [`pinned_claim_concurrency`]）。
 pub const CLAIM_CONCURRENCY_ENV: &str = "COGNEVA_TASK_CLAIM_CONCURRENCY";
 
-/// 没有配置时的在途执行上限。
+/// 还没量到窗口时的在途执行上限，也是导出循环的起点。
 ///
-/// 与 [`cog_core::BoardWipLimits`] 同一个口径：**不配就按默认值跑，不配不等于
+/// 与 [`cog_core::BoardWipLimits`] 同一个口径：**量不到就按这个数跑，量不到不等于
 /// 零**。一个凭空造出来的 0 会让所有执行停摆，而它与「没配」在读数上是同一个
-/// 空白。
-// cap: bound — 进程级许可：本进程读的每条就绪队列共用同一份，多读一条队列不该把在途执行翻倍
+/// 空白。窗口一旦读出来，下一次重算就把它换成 `(额度-已花)/单任务价格`。
+// cap: fixed — 进程级许可：本进程读的每条就绪队列共用同一份，多读一条队列不该把在途执行翻倍
+// keep: 删掉后多读一条就绪队列把在途执行翻倍；由「进程级许可」兜住
 pub const DEFAULT_CLAIM_CONCURRENCY: usize = 4;
+
+/// 认领上限的导出循环在存活登记里的名字。
+pub const CLAIM_WINDOW_LOOP: &str = "task_claim_window_bound";
 
 /// How many stop-the-line tasks one process runs at once.
 ///
@@ -54,7 +65,8 @@ pub const DEFAULT_CLAIM_CONCURRENCY: usize = 4;
 /// that the cost of the exception is bounded by a single extra task in flight.
 /// One is enough because a red main is one finding: the deployer files one row
 /// per revision per day and the row names the whole failing set.
-// cap: bound — 这条例外的价钱就定在这一格：单开一份许可，同时最多多一条在跑的活；不是量出来的，是「例外不该翻倍」定的
+// cap: fixed — 这条例外的价钱就定在这一格：单开一份许可，同时最多多一条在跑的活；不是量出来的，是「例外不该翻倍」定的
+// keep: 删掉后停线这条例外把在跑的活翻倍；由「例外不该翻倍」兜住
 pub const STOP_THE_LINE_CLAIM_CONCURRENCY: usize = 1;
 
 /// 进程本地车道的在途执行上限，从环境读。
@@ -121,7 +133,8 @@ pub const LOCAL_CLAIM_CONCURRENCY_ENV: &str = "COGNEVA_LOCAL_CLAIM_CONCURRENCY";
 ///
 /// 它现在是两件事的共同起点：导出模式的起始值与下限（还没量到一条任务的价格
 /// 时用它），以及这个导出的界在任何一次读失败之后退回的那一格。
-// cap: bound — 这条例外的价钱就定在这一格：单开一份许可，同时最多多一条在跑的活
+// cap: fixed — 这条例外的价钱就定在这一格：单开一份许可，同时最多多一条在跑的活
+// keep: 删掉后本地这条路径自己开会把在跑的活翻倍；由「例外不该翻倍」兜住
 pub const DEFAULT_LOCAL_CLAIM_CONCURRENCY: usize = 1;
 
 /// 读一条在途执行上限。
@@ -130,9 +143,9 @@ pub const DEFAULT_LOCAL_CLAIM_CONCURRENCY: usize = 1;
 /// （或误读成不限）都会把额度花光的形状藏起来。拒绝时用默认值，并把这一行
 /// 报告出去——悄悄换成默认值等于运维以为自己改的那个数生效了。
 ///
-/// 本地车道那一格不到这里：它在调用之前就把 `0` 读成「按读数导出」
-/// （见 [`local_claim_concurrency`]），所以同一条命令行在两条车道上含义不同，
-/// 而这是有意的——那条车道的界真的可以量出来。
+/// 两条能导出界值的车道都不到这里：它们在调用之前就把 `0` 读成「按读数导出」
+/// （见 [`local_claim_concurrency`] 与 [`pinned_claim_concurrency`]），所以同一条
+/// 命令行在「钉死」与「导出」上的含义是统一的。
 pub fn parse_claim_concurrency(raw: &str) -> Result<usize, String> {
     match raw.trim().parse::<usize>() {
         Ok(0) => Err(
@@ -143,27 +156,184 @@ pub fn parse_claim_concurrency(raw: &str) -> Result<usize, String> {
     }
 }
 
-/// 本进程的在途执行上限，从环境读。
+/// 本进程钉死的在途执行上限，从环境读；`None` = 由池子的额度导出。
+///
+/// 与 [`local_claim_concurrency`] 同一个口径，而理由不同：这条车道的界不是
+/// 「容器装得下几条」，是「这一窗的额度还付得起几条」——`(额度-已花) ÷ 单任务
+/// 价格`，两个数都在池子的状态里、都随窗口滚动，配置里写下的那个数只能是写下
+/// 那天窗口的样子。所以「没配」读成「去量」，正数是覆盖位。
+///
+/// `0`/空串是导出的写法，与 `COGNEVA_BUILD_GATE_MAX_CONCURRENT: "0"`、目标容量
+/// `"auto"` 同一套词。写坏的值退回导出而不是默认值：默认值是一个没人量过的数，
+/// 退回它等于把一次配置笔误伪装成一次测量。
+pub fn pinned_claim_concurrency() -> Option<usize> {
+    match std::env::var(CLAIM_CONCURRENCY_ENV) {
+        Err(_) => None,
+        Ok(raw) => match claim_concurrency_override(&raw) {
+            Ok(bound) => bound,
+            Err(problem) => {
+                tracing::warn!(
+                    variable = CLAIM_CONCURRENCY_ENV,
+                    problem = %problem,
+                    using = "the derived bound",
+                    "task claim concurrency entry ignored"
+                );
+                None
+            }
+        },
+    }
+}
+
+/// 一个配置值说的是哪件事：`Ok(Some(n))` 是覆盖位，`Ok(None)` 是去量，`Err` 是写坏了。
+///
+/// 生产读法与部署面的判据读同一个函数。判据自己再抄一遍「0 与空串是导出」这两个
+/// 词，会在代码下一次改口径之后仍然判着旧的那个——那就成了一条替旧契约背书的门。
+pub fn claim_concurrency_override(raw: &str) -> Result<Option<usize>, String> {
+    let raw = raw.trim();
+    if raw == "0" || raw.is_empty() {
+        return Ok(None);
+    }
+    parse_claim_concurrency(raw).map(Some)
+}
+
+/// 本进程的在途执行上限：钉死的那个数，或者还没量到窗口时的起点。
 ///
 /// 进程级上限：本进程读的每条 ready 队列共用同一份许可，多读一条队列不该把
 /// 在途执行翻倍。它同时是 `cogneva_task_router_claim_slots` 报出去的那个数，
 /// 所以配了多少、生效了多少在读数面是同一个值。
 pub fn claim_concurrency() -> usize {
-    match std::env::var(CLAIM_CONCURRENCY_ENV) {
-        Err(_) => DEFAULT_CLAIM_CONCURRENCY,
-        Ok(raw) => match parse_claim_concurrency(&raw) {
-            Ok(n) => n,
-            Err(problem) => {
-                tracing::warn!(
-                    variable = CLAIM_CONCURRENCY_ENV,
-                    problem = %problem,
-                    using = DEFAULT_CLAIM_CONCURRENCY,
-                    "task claim concurrency entry ignored"
-                );
-                DEFAULT_CLAIM_CONCURRENCY
+    pinned_claim_concurrency().unwrap_or(DEFAULT_CLAIM_CONCURRENCY)
+}
+
+/// 下一拍的认领上限：这一窗还付得起几条，就放到几条。
+///
+/// 与 `lane_memory::next_bound` 同形——下降立即，上升要凭据（当前的界被真的用满
+/// 过才爬一格）——底部不同：内存的界不能是 0，0 个许可等于那条车道永远不读，而
+/// 内存量不到时至少一条能跑；额度窗口的界**可以**是 0，那正是「这一窗已经付不起
+/// 一条活」的读数。此时再放进一条，只是把一个执行位置花在一条必然停在上游前的
+/// 活上。停线车道有自己的一份许可，不受这个 0 影响。
+///
+/// 窗口量不到（`None`，见 `jobs_the_window_can_pay_for_status`）不到这里：调用点
+/// 不动界。把「量不到」读成「付得起零条」会让一次滚动发布停掉整条普通车道。
+pub fn next_claim_bound(bound: usize, ceiling: usize, ran_full: bool) -> usize {
+    if ceiling == 0 {
+        return 0;
+    }
+    crate::lane_memory::next_bound(
+        bound,
+        ceiling,
+        crate::lane_memory::should_grow(bound, ceiling, ran_full),
+    )
+}
+
+/// 把这一拍算出来的界落到许可上，返回真正生效的条数以及界是否往上走过。
+///
+/// 收缩只能收回空闲许可，在跑的那几条要等自己结束，所以「算出来的界」与「生效的
+/// 条数」可以差几拍——读数面报的是生效的那个。界往上走过一次，下一格上升的凭据
+/// 就清掉：新界要重新被用满过。
+pub fn apply_claim_ceiling(
+    slots: &tokio::sync::Semaphore,
+    capacity: usize,
+    ceiling: usize,
+    ran_full: bool,
+) -> (usize, bool) {
+    let want = next_claim_bound(capacity, ceiling, ran_full);
+    let applied = crate::lane_memory::apply_bound(slots, capacity, want);
+    (applied, applied > capacity)
+}
+
+/// 认领上限的导出循环：每一拍读池子的窗口，按「还剩多少额度 ÷ 单任务价格」
+/// 重算普通车道能同时跑几条。
+///
+/// `streams` 是共用这份许可的那几条普通流：导出的界必须写回它们的读数，否则
+/// `claim_slots` 会一直报进程启动时的那个数，而许可早已换成另一个——这正是这个
+/// 数被写死时没人看得见它的原因。
+///
+/// 拍子与认领循环同一个 [`CLAIM_INTERVAL`]：上限的输入是池子对「一道活多贵」的
+/// 实测，那个测量在任务结束时就已在状态里，一拍一次足够它跟到下一拍；更密的轮询
+/// 买的只是同一个读数。
+pub fn spawn_claim_window_bound(
+    streams: Vec<String>,
+    slots: Arc<tokio::sync::Semaphore>,
+    seed: usize,
+    source: Arc<dyn cog_core::LlmPoolStatusSource>,
+    shutdown: ShutdownSignal,
+) {
+    if streams.is_empty() {
+        // 这个进程不读普通车道：没有许可要调，也没有读数要写回。
+        return;
+    }
+    drop(cog_core::loop_health::spawn(
+        CLAIM_WINDOW_LOOP,
+        cog_core::loop_health::Cadence::Periodic(CLAIM_INTERVAL),
+        shutdown.clone(),
+        move |beat| {
+            let shutdown = shutdown.clone();
+            let slots = Arc::clone(&slots);
+            let streams = streams.clone();
+            let source = Arc::clone(&source);
+            // `capacity` 是真正发给信号量的许可条数；`seed` 是还没量到窗口时的
+            // 起点。缩界时两者可以不相等：在跑的许可要等它们自己释放才收得回来。
+            let mut capacity = seed;
+            // 这个界有没有被真的用满过。爬一格的前提，每爬一次清一次。
+            let mut ran_full = false;
+            async move {
+                let mut ticker = tokio::time::interval(CLAIM_INTERVAL);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // 第一格立即到点：先读一次窗口，再谈放几条。
+                ticker.tick().await;
+                loop {
+                    beat.beat();
+                    tokio::select! {
+                        _ = ticker.tick() => {}
+                        _ = shutdown.wait() => break,
+                    }
+                    let Some(status) = source.status().await else {
+                        // 读不到就不动界：一次滚动发布里的空读不是空池子。
+                        continue;
+                    };
+                    let Some(ceiling) =
+                        crate::ready_queue::jobs_the_window_can_pay_for_status(&status)
+                    else {
+                        // 测量不足以给池子定界（没量到、储备为 0、只覆盖了一部分
+                        // upstream）：同样不动界，把「量不到」当成「没有额度」
+                        // 会把一次测量缺口变成一次停摆。
+                        continue;
+                    };
+                    let ceiling = ceiling as usize;
+                    let in_flight = capacity
+                        .saturating_sub(slots.available_permits())
+                        .min(capacity);
+                    if in_flight >= capacity {
+                        ran_full = true;
+                    }
+                    let (applied, grew) = apply_claim_ceiling(&slots, capacity, ceiling, ran_full);
+                    if grew {
+                        ran_full = false;
+                    }
+                    if applied != capacity {
+                        let observable = crate::observable::claim_slots_observable();
+                        for stream in &streams {
+                            observable.set_slots(stream, applied);
+                        }
+                        tracing::debug!(
+                            from = capacity,
+                            to = applied,
+                            ceiling,
+                            allowance_tokens = status.pace.allowance_tokens,
+                            spent_tokens = status.pace.spent_tokens,
+                            reserve_tokens = status.pace.reserve_tokens,
+                            "claim bound moved with the pool's token window"
+                        );
+                        capacity = applied;
+                    }
+                    // 目标没动也要记一次：同一个窗口得出同一个界是正确行为，
+                    // 「这个回路还在算」只能由求值计数来答。
+                    crate::observable::claim_slots_observable().record_bound_evaluation();
+                }
             }
         },
-    }
+    ));
 }
 
 /// 本进程本地车道的在途执行上限，从环境读；`None` = 由读数导出。
@@ -223,7 +393,8 @@ fn stall_poll_interval() -> Duration {
 }
 
 /// 守护空转的下限。
-// cap: bound — 这是 CPU 代价的下限不是判据：没有窗口时每拍只醒一次判据，
+// cap: fixed — 这是 CPU 代价的下限不是判据：没有窗口时每拍只醒一次判据，
+// keep: 删掉后没有窗口时拍子可以趋零，判据循环空转；由「这是 CPU 代价的下限不是判据」兜住
 // 而判据那时恒为 `None`；再密也只是把一次 `select!` 换成两次。窗口有了之后
 // 拍子由窗口导出，这个数就不再是主力。
 const STALL_POLL_FLOOR: Duration = Duration::from_secs(1);
@@ -237,6 +408,13 @@ const STALL_POLL_FLOOR: Duration = Duration::from_secs(1);
 pub struct TaskExecutorRouter {
     executors: Arc<tokio::sync::RwLock<Vec<Arc<dyn TaskExecutor>>>>,
     orchestrator: Option<Arc<dyn OrchestratorControl>>,
+    /// 池子的额度读数，认领上限的唯一输入。
+    ///
+    /// 空表示这个进程读不到池子（单进程部署）：那时上限停在
+    /// [`DEFAULT_CLAIM_CONCURRENCY`]，「读不到窗口」不是「窗口是零」。它由
+    /// `start` 挂上——发布它的 crate 与本 crate 的 `init` 谁先谁后不由这里定，
+    /// 而 `start` 在所有 `init` 之后才跑。
+    pool_source: Option<Arc<dyn cog_core::LlmPoolStatusSource>>,
 }
 
 impl TaskExecutorRouter {
@@ -244,7 +422,17 @@ impl TaskExecutorRouter {
         Self {
             executors: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             orchestrator: None,
+            pool_source: None,
         }
+    }
+
+    /// 挂上池子的额度读数，让认领上限跟着窗口走。
+    pub fn with_pool_status_source(
+        mut self,
+        source: Option<Arc<dyn cog_core::LlmPoolStatusSource>>,
+    ) -> Self {
+        self.pool_source = source;
+        self
     }
 
     pub async fn with_executor(self, executor: Arc<dyn TaskExecutor>) -> Self {
@@ -272,7 +460,7 @@ impl TaskExecutorRouter {
     /// 会无限期占住串行消费位置（实测 90+ 分钟不返回，后续就绪消息全部队头
     /// 阻塞）。
     ///
-    /// 判据与编排侧的回收是同一条读数（[`cog_core::progress::stall`]）：两份
+    /// 判据与编排侧的回收是同一条读数（[`cog_core::declared_wall::stall`]）：两份
     /// 判据只要各写一份，就会有一天一边判停住、另一边继续等，而那正是「这条活
     /// 到底还在不在跑」没人答得上来的状态。等待的长度只决定判据最晚多久被读到
     /// 一次，不参与判定。
@@ -283,7 +471,7 @@ impl TaskExecutorRouter {
                 result = &mut run => return result,
                 _ = tokio::time::sleep(stall_poll_interval()) => {}
             }
-            if let Some((silent, window)) = cog_core::progress::stall(&task.id) {
+            if let Some((silent, window)) = cog_core::declared_wall::stall(&task.id) {
                 return Err(SFError::Agent(
                     crate::dag_executor::orchestrator::stall_reason(silent, window),
                 ));
@@ -308,6 +496,21 @@ impl TaskExecutorRouter {
         executor.execute(task).await
     }
 
+    /// 这条行该由谁来接——问的是**真的会执行它的那个**执行器。
+    ///
+    /// 与 [`Self::execute`] 同一个挑选顺序（第一个 `supports` 的执行器），因为
+    /// 认领与执行若落在不同的执行器上，行上就会写着一个人、活由另一个人干。
+    async fn claimant_for_the_run(&self, task: &Task) -> Option<String> {
+        let executor = self
+            .executors
+            .read()
+            .await
+            .iter()
+            .find(|e| e.supports(&task.task_type))
+            .cloned()?;
+        executor.claimant_for(task).await
+    }
+
     /// Consume ready tasks from the message backend, execute them, and publish
     /// results back to the results stream.
     ///
@@ -326,15 +529,20 @@ impl TaskExecutorRouter {
         // 主订阅循环与清扫器共用的执行许可：新鲜投递与 idle 认领合计最多
         // `claim_concurrency()` 条在途执行。读一次，两条腿用的是同一个数——
         // 一处读一次会让「报出去的预算」和「真正的许可数」各走各的。
-        let claim_concurrency = claim_concurrency();
+        let pinned_claim = pinned_claim_concurrency();
+        let claim_concurrency = pinned_claim.unwrap_or(DEFAULT_CLAIM_CONCURRENCY);
         let claim_slots = Arc::new(tokio::sync::Semaphore::new(claim_concurrency));
 
         let claim = ClaimBudget {
-            slots: claim_slots,
+            slots: claim_slots.clone(),
             limit: claim_concurrency,
-            // 普通活那一格是部署钉的：它的界在 token 预算维度上，进程里没有
-            // 那个读数可导（见 `deploy/helm/cogneva/tunables.yaml` 的同名行）。
-            source: crate::observable::SOURCE_OVERRIDE,
+            // 普通活那一格的界来自池子的额度读数（每窗重算，见
+            // [`spawn_claim_window_bound`]）；正数环境变量是它的覆盖位。
+            source: if pinned_claim.is_some() {
+                crate::observable::SOURCE_OVERRIDE
+            } else {
+                crate::observable::SOURCE_DERIVED
+            },
         };
         // 停线那条通道的许可不来自上面那一份：它的整条理由就是「别的活占满
         // 所有许可时它仍然要跑」。共用一份时，优先级最高的那条变更也只是排在
@@ -388,25 +596,44 @@ impl TaskExecutorRouter {
             );
         }
 
-        let loops = crate::ready_queue::consumed_ready_streams(workspace_id, owns_executor_role)
-            .into_iter()
-            .map(|ready_stream| {
-                let budget = if ready_stream == stop_the_line {
-                    preempting.clone()
-                } else if ready_stream == local {
-                    own.clone()
-                } else {
-                    claim.clone()
-                };
-                self.run_one_ready_stream(
-                    task_backend.clone(),
-                    result_backend.clone(),
-                    ready_stream,
-                    workspace_id.to_string(),
-                    budget,
+        let streams = crate::ready_queue::consumed_ready_streams(workspace_id, owns_executor_role);
+        // 共用普通许可的那几条流：导出循环把每一拍的新界写回它们的读数。只有
+        // 没钉死、并且真的读得到池子时才起这条循环——单进程部署里每拍问一次
+        // 不存在的读数，只是一条空转的循环。
+        if pinned_claim.is_none() {
+            if let Some(pool_source) = self.pool_source.clone() {
+                let ordinary: Vec<String> = streams
+                    .iter()
+                    .filter(|stream| **stream != stop_the_line && **stream != local)
+                    .cloned()
+                    .collect();
+                spawn_claim_window_bound(
+                    ordinary,
+                    claim_slots.clone(),
+                    claim_concurrency,
+                    pool_source,
                     shutdown.clone(),
-                )
-            });
+                );
+            }
+        }
+
+        let loops = streams.into_iter().map(|ready_stream| {
+            let budget = if ready_stream == stop_the_line {
+                preempting.clone()
+            } else if ready_stream == local {
+                own.clone()
+            } else {
+                claim.clone()
+            };
+            self.run_one_ready_stream(
+                task_backend.clone(),
+                result_backend.clone(),
+                ready_stream,
+                workspace_id.to_string(),
+                budget,
+                shutdown.clone(),
+            )
+        });
 
         for outcome in futures::future::join_all(loops).await {
             if let Err(e) = outcome {
@@ -488,7 +715,14 @@ impl TaskExecutorRouter {
             // same shutdown signal.
             drop(cog_core::loop_health::spawn(
                 reclaim_loop_name,
-                cog_core::loop_health::Cadence::Periodic(CLAIM_INTERVAL),
+                // The cycle awaits an execution permit inside `sweep_stalled_ready`,
+                // and that wait's duration is owned by the task holding the permit,
+                // bounded by this file's invariant that PENDING_IDLE_MS exceeds the
+                // longest running execution -- so the work bound is that same number.
+                cog_core::loop_health::Cadence::PeriodicWithWork {
+                    period: CLAIM_INTERVAL,
+                    work: Duration::from_millis(PENDING_IDLE_MS),
+                },
                 sweep_shutdown.clone(),
                 // Rebuilt per attempt, so everything the body consumes is cloned here.
                 move |beat| {
@@ -688,12 +922,23 @@ impl TaskExecutorRouter {
         let Ok(task) = serde_json::from_slice::<Task>(bytes) else {
             return false;
         };
-        let cannot_run = match orch.get_task(&task.id).await {
-            None => true,
-            Some(row) => matches!(
+        let cannot_run = match orch.get_task_checked(&task.id).await {
+            Ok(None) => true,
+            Ok(Some(row)) => matches!(
                 row.status,
                 TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
             ),
+            // 读不到不是「不能跑」：ack 掉就再也重投不回来了。这一条留给下一轮，
+            // 让一次读失败不至于把一条活任务丢掉（CC24）。
+            Err(e) => {
+                tracing::warn!(
+                    task_id = %task.id,
+                    msg_id = %msg_id,
+                    error = %e,
+                    "could not read what became of this ready message's task; leaving it to be redelivered"
+                );
+                return false;
+            }
         };
         if !cannot_run {
             return false;
@@ -886,6 +1131,59 @@ impl TaskExecutorRouter {
             }
             return;
         }
+
+        // 接活：先认领，再准入。
+        //
+        // 认领把责任人写在行上（`agent_id`），而执行器跑这一行时读的就是那一格，
+        // 所以「谁接了」与「谁在干」是同一个答案，不再由执行器各自挑一次。认领
+        // 之后拿回来的是**新的行**，下面执行照它走：手里的这份是发布时序列化的
+        // 快照，认领发生在它之后，照旧快照跑等于没认领。
+        //
+        // 执行器说不出一个人（没有名册）时退回旧的交接：先把行挪进已派发、再起。
+        // 那条路上行上没有责任人，所以它是一条要看得见的缺口——只记一行日志，
+        // 不静默。
+        let task = match (
+            self.claimant_for_the_run(&task).await,
+            self.orchestrator.as_ref(),
+        ) {
+            (Some(claimant), Some(orch)) => match orch.claim_task(&task.id, &claimant).await {
+                Ok(claimed) => claimed,
+                Err(cog_core::SFError::NotImplemented(_)) => task,
+                Err(e) => {
+                    // 别人先接了、或者这条行已经跑完了：这条消息来晚了。ack 掉，
+                    // 让队列过得去；行本身归接走它的人，不归这里。
+                    tracing::warn!(
+                        task_id = %task.id,
+                        claimant = %claimant,
+                        msg_id = %msg_id,
+                        "the ready message named work nobody could take ({e}); dropping it"
+                    );
+                    if let Err(e) = pipe
+                        .task_backend
+                        .ack(
+                            &pipe.ready_stream,
+                            &pipe.group,
+                            std::slice::from_ref(&msg_id),
+                        )
+                        .await
+                    {
+                        tracing::warn!(task_id = %task.id, msg_id = %msg_id, "Failed to ack a ready message whose claim was refused: {e}");
+                    }
+                    return;
+                }
+            },
+            (named, _) => {
+                if named.is_none() {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        msg_id = %msg_id,
+                        "no one could be named to take this ready row; it is being admitted \
+                         without a respondent, so the row will carry no one's name"
+                    );
+                }
+                task
+            }
+        };
 
         // Notify orchestrator that task is now running.
         if let Some(ref orch) = self.orchestrator {
@@ -1245,7 +1543,7 @@ mod ready_pipeline_tests {
         }
     }
 
-    fn test_task(timeout_seconds: u64) -> Task {
+    fn test_task(declared_seconds: u64) -> Task {
         let now = chrono::Utc::now();
         // task_type custom 变体即可，SlowExecutor supports 全部类型。
         let task: Task = serde_json::from_value(serde_json::json!({
@@ -1260,7 +1558,7 @@ mod ready_pipeline_tests {
             "updated_at": now,
             "retry_count": 0,
             "max_retries": 3,
-            "timeout_seconds": timeout_seconds,
+            "declared_duration_seconds": declared_seconds,
             "is_executable": true
         }))
         .unwrap();
@@ -1348,8 +1646,9 @@ mod ready_pipeline_tests {
 
         let mut task = test_task(3600);
         task.id = "t-stopped-moving".into();
-        // 窗口量成零：任何一点静默都超过它。这个执行器一次心跳都不打，所以
-        // 它从第一拍起就被判成停住。
+        // 窗口量成零，判据会把它抬到读数能分辨的下限（两拍，见
+        // `MIN_DISCERNIBLE_SILENCE`）：比一拍还窄的窗口判的是采样格，不是停没停。
+        // 这个执行器一次心跳都不打，所以两拍之后就被判成停住。
         cog_core::progress::seed_gaps_for_tests(std::time::Duration::ZERO, 1000);
         cog_core::progress::beat(&task.id);
 
@@ -1377,6 +1676,273 @@ mod ready_pipeline_tests {
             other => panic!("expected TaskFailed on a stall, got {other:?}"),
         }
         cog_core::progress::reset_for_tests();
+    }
+
+    /// 一条可以接的活：有验收标准、还在待接。`test_task` 不带验收，接不了。
+    fn claimable_task() -> Task {
+        let mut task = test_task(30);
+        task.id = "t-claim".into();
+        task.acceptance = vec!["done when the executor says it wrote the row".into()];
+        task
+    }
+
+    /// 记下「谁在这一轮里被认作执行者」的控制面：认领写在自己的行上，
+    /// 准入/起跑只记一笔调用顺序。
+    struct ClaimingGraph {
+        row: tokio::sync::Mutex<Task>,
+        calls: tokio::sync::Mutex<Vec<&'static str>>,
+        /// 有人先接了的时候，认领该被拒；文案就是下面那条测试要读的那句。
+        refuse: Option<String>,
+    }
+
+    impl ClaimingGraph {
+        fn new(task: Task) -> Self {
+            Self {
+                row: tokio::sync::Mutex::new(task),
+                calls: tokio::sync::Mutex::new(Vec::new()),
+                refuse: None,
+            }
+        }
+
+        fn refusing(task: Task, reason: &str) -> Self {
+            Self {
+                refuse: Some(reason.to_string()),
+                ..Self::new(task)
+            }
+        }
+    }
+
+    #[async_trait]
+    impl OrchestratorControl for ClaimingGraph {
+        async fn submit_goal(&self, _goal: &str, _tasks: Vec<Task>) -> SFResult<()> {
+            Ok(())
+        }
+        async fn submit_goal_auto(&self, _goal: &str, tasks: Vec<Task>) -> SFResult<Vec<String>> {
+            Ok(tasks.iter().map(|task| task.id.clone()).collect())
+        }
+        async fn assign_task(&self, _task_id: &str, _agent_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn add_task(&self, _task: Task) -> SFResult<()> {
+            Ok(())
+        }
+        async fn replace_task(&self, _task: Task) -> SFResult<()> {
+            Ok(())
+        }
+        async fn crew_can_retry(&self, _task_ids: &[String]) -> bool {
+            false
+        }
+        async fn crew_retry_all(&self, _task_ids: &[String]) -> usize {
+            0
+        }
+        async fn get_ready_tasks(&self) -> Vec<Task> {
+            Vec::new()
+        }
+        async fn get_all_tasks(&self) -> Vec<Task> {
+            vec![self.row.lock().await.clone()]
+        }
+        async fn push_to_dlq(&self, _task_id: &str, _error: String) -> SFResult<bool> {
+            Ok(false)
+        }
+        async fn retry_task(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn dlq_len(&self) -> SFResult<usize> {
+            Ok(0)
+        }
+        async fn start_task(&self, _task_id: &str) -> SFResult<()> {
+            self.calls.lock().await.push("start");
+            self.row.lock().await.status = TaskStatus::Running;
+            Ok(())
+        }
+        async fn complete_task(
+            &self,
+            _task_id: &str,
+            _result: serde_json::Value,
+        ) -> SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn fail_task(
+            &self,
+            _task_id: &str,
+            _error: String,
+            _cause: Option<cog_core::UpstreamFailure>,
+        ) -> SFResult<(bool, Vec<String>, bool)> {
+            Ok((false, Vec::new(), false))
+        }
+        async fn fail_task_after(
+            &self,
+            _task_id: &str,
+            _error: String,
+            _cause: Option<cog_core::UpstreamFailure>,
+            _retry_after_secs: Option<u64>,
+        ) -> SFResult<(bool, Vec<String>, bool)> {
+            Ok((false, Vec::new(), false))
+        }
+        async fn cancel_task(&self, _task_id: &str) -> SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn get_task(&self, _task_id: &str) -> Option<Task> {
+            Some(self.row.lock().await.clone())
+        }
+        async fn schedule_task(&self, _task_id: &str) -> SFResult<()> {
+            self.calls.lock().await.push("schedule");
+            self.row.lock().await.status = TaskStatus::Scheduled;
+            Ok(())
+        }
+        async fn claim_task(&self, _task_id: &str, claimant: &str) -> SFResult<Task> {
+            self.calls.lock().await.push("claim");
+            if let Some(reason) = &self.refuse {
+                return Err(SFError::Conflict(reason.clone()));
+            }
+            let mut row = self.row.lock().await;
+            let claimed = crate::ready_queue::approve_claim(
+                &row,
+                claimant,
+                chrono::Duration::seconds(300),
+                chrono::Utc::now(),
+            )
+            .map_err(|refusal| SFError::Conflict(refusal.as_str().into()))?;
+            *row = claimed.clone();
+            Ok(claimed)
+        }
+        async fn check_timeouts(&self) -> Vec<(String, bool, Vec<String>, bool)> {
+            Vec::new()
+        }
+        async fn get_dependents(&self, _task_id: &str) -> Option<Vec<Task>> {
+            None
+        }
+        async fn get_dependencies(&self, _task_id: &str) -> Option<Vec<Task>> {
+            None
+        }
+        async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>) {
+            (Vec::new(), Vec::new())
+        }
+        async fn delete_task(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn all_completed(&self) -> bool {
+            true
+        }
+        async fn replay_dlq(&self, _task_id: &str) -> SFResult<bool> {
+            Ok(false)
+        }
+    }
+
+    /// 会在执行时说出自己拿了哪一行的执行器。
+    struct TakesTheWork {
+        seen: Arc<tokio::sync::Mutex<Option<Task>>>,
+    }
+
+    #[async_trait]
+    impl TaskExecutor for TakesTheWork {
+        fn supports(&self, _task_type: &TaskType) -> bool {
+            true
+        }
+        async fn claimant_for(&self, _task: &Task) -> Option<String> {
+            Some("E0455".into())
+        }
+        async fn execute(&self, task: &Task) -> SFResult<TaskResult> {
+            *self.seen.lock().await = Some(task.clone());
+            Ok(TaskResult {
+                success: true,
+                output: serde_json::json!({"done": true}),
+                metadata: TaskResultMetadata::new("takes-the-work"),
+            })
+        }
+    }
+
+    /// 接话在准入之前：执行器拿到的必须是**认领之后**的那一行。
+    ///
+    /// 这是一条判别测试，不是流程描述：把认领删掉，执行器手里那一行的
+    /// `agent_id` 就是空的，「谁接了」与「谁在干」重新分成两个答案。
+    #[tokio::test]
+    async fn the_row_handed_to_the_executor_is_the_one_that_was_claimed() {
+        let backend = Arc::new(ScriptedBackend::default());
+        let pipe = test_pipe(backend.clone());
+        let seen = Arc::new(tokio::sync::Mutex::new(None::<Task>));
+        let task = claimable_task();
+        let graph = Arc::new(ClaimingGraph::new(task.clone()));
+        let router = TaskExecutorRouter::new()
+            .with_executor(Arc::new(TakesTheWork { seen: seen.clone() }))
+            .await
+            .with_orchestrator(graph.clone());
+
+        router
+            .process_ready_message(
+                &pipe,
+                "m-claim".into(),
+                &serde_json::to_vec(&task).unwrap(),
+                &test_hold(),
+            )
+            .await;
+
+        let ran = seen.lock().await.clone().expect("执行器必须跑到");
+        assert_eq!(
+            ran.claimed_by(),
+            Some("E0455"),
+            "执行器手里那一行必须写着认领者的名字，否则它是在替没人认领的活干活"
+        );
+        assert!(
+            ran.lease_expires_at.is_some(),
+            "认领必须带租约：没有租约的认领永远不会过期，也就永远不会被别人重新接走"
+        );
+        assert_eq!(
+            graph.calls.lock().await.as_slice(),
+            ["claim", "start"],
+            "顺序必须是先接后跑；反过来就是先跑了一件还挂在板上的活"
+        );
+        assert_eq!(
+            graph.row.lock().await.claimed_by(),
+            Some("E0455"),
+            "行上的责任人必须留下"
+        );
+    }
+
+    /// 别人先接了：这条消息来晚了，它不许再开一轮，也不许动那条行。
+    #[tokio::test]
+    async fn a_row_taken_by_someone_else_is_not_run_again() {
+        let backend = Arc::new(ScriptedBackend::default());
+        let pipe = test_pipe(backend.clone());
+        let seen = Arc::new(tokio::sync::Mutex::new(None::<Task>));
+        let task = claimable_task();
+        let graph = Arc::new(ClaimingGraph::refusing(
+            task.clone(),
+            "task t-claim is already claimed by E0456",
+        ));
+        let router = TaskExecutorRouter::new()
+            .with_executor(Arc::new(TakesTheWork { seen: seen.clone() }))
+            .await
+            .with_orchestrator(graph.clone());
+
+        router
+            .process_ready_message(
+                &pipe,
+                "m-claim-lost".into(),
+                &serde_json::to_vec(&task).unwrap(),
+                &test_hold(),
+            )
+            .await;
+
+        assert!(
+            seen.lock().await.is_none(),
+            "别人接走的活不许被这个消费者再跑一遍"
+        );
+        assert_eq!(
+            graph.calls.lock().await.as_slice(),
+            ["claim"],
+            "认领被拒之后不许再准入或起跑"
+        );
+        let acks = backend.acks.lock().await;
+        assert_eq!(
+            acks.as_slice(),
+            [(
+                "ready".to_string(),
+                "grp".to_string(),
+                vec!["m-claim-lost".to_string()]
+            )],
+            "这条消息已经没有活可干了，必须 ack 掉让队列过得去"
+        );
     }
 
     /// 上游的失败类型与它明说的等待都要过总线：算出重试时刻的是消费这条消息
@@ -1452,7 +2018,7 @@ mod ready_pipeline_tests {
         let task = test_task(60);
         let mut drifted = serde_json::to_value(&task).unwrap();
         // 同一个字段换了类型：这一份一定读不进 `Task`，而 `id` 毫发无伤。
-        drifted["timeout_seconds"] = serde_json::json!("sixty");
+        drifted["declared_duration_seconds"] = serde_json::json!("sixty");
         let bytes = serde_json::to_vec(&drifted).unwrap();
         assert!(
             serde_json::from_slice::<Task>(&bytes).is_err(),
@@ -2035,7 +2601,7 @@ mod ready_permit_fast_lane_tests {
             "updated_at": now,
             "retry_count": 0,
             "max_retries": 3,
-            "timeout_seconds": 5,
+            "declared_duration_seconds": 5,
             "is_executable": true
         }))
         .unwrap()
@@ -2587,6 +3153,125 @@ mod claim_concurrency_tests {
             "0 asks for the derived bound; a stop would be the one reading it must never have"
         );
         std::env::remove_var(LOCAL_CLAIM_CONCURRENCY_ENV);
+    }
+
+    /// `0` 在普通车道上也读作「按窗口导出」，而不是被退回默认值。
+    ///
+    /// 退回默认值会把一次「请开始量」的配置读成「就按 4 跑」——一个再也不会
+    /// 跟着窗口动的数，而它在读数面上与导出模式同形（都是 `claim_slots` 一个数）。
+    #[test]
+    fn a_zero_ordinary_budget_asks_for_the_window_derived_bound() {
+        let _serial = lane_env_lock();
+        std::env::set_var(CLAIM_CONCURRENCY_ENV, "0");
+        assert_eq!(
+            pinned_claim_concurrency(),
+            None,
+            "0 asks for the derived bound, not the default"
+        );
+        assert_eq!(claim_concurrency(), DEFAULT_CLAIM_CONCURRENCY);
+        std::env::remove_var(CLAIM_CONCURRENCY_ENV);
+    }
+
+    /// 认领上限跟着池子的窗口走：窗口比界大就爬一格，小就当场降，付不起就是 0。
+    ///
+    /// 与内存车道同一个律（`lane_memory::next_bound`），底部不同：内存的界不能是 0
+    /// ——0 个许可等于那条车道永远不读；额度窗口的界可以是 0，那正是「这一窗付不起
+    /// 一条活」。
+    #[test]
+    fn the_claim_bound_follows_the_pool_window() {
+        // 窗口还有位置：当前的界没被用满过就原地，用满过才爬一格。
+        assert_eq!(next_claim_bound(4, 12, false), 4);
+        assert_eq!(next_claim_bound(4, 12, true), 5);
+        // 窗口变小：当场降到它，不用等凭据。
+        assert_eq!(next_claim_bound(5, 3, false), 3);
+        // 窗口付不起一条：界就是 0。
+        assert_eq!(next_claim_bound(3, 0, false), 0);
+        assert_eq!(next_claim_bound(1, 0, false), 0);
+        // 从 0 恢复也要先「用满」过（0 个许可永远算用满），再爬一格。
+        assert_eq!(next_claim_bound(0, 2, true), 1);
+    }
+
+    // proves: taskRouter.claimConcurrency
+    /// 同一个信号量、同一份读数面：窗口从 12 改到 3，下一拍报出去的界就跟着改，
+    /// 不重启；窗口没变的那一拍，求值计数仍然往上走。
+    ///
+    /// 这是登记表里 `taskRouter.claimConcurrency` 的行为证明。
+    #[tokio::test]
+    async fn the_claim_bound_is_republished_when_the_window_moves() {
+        use cog_core::observability::RawMetric;
+        use cog_core::Observable;
+
+        let observer = Arc::new(crate::observable::ClaimSlotsObservable::new());
+        let slots = Arc::new(tokio::sync::Semaphore::new(4));
+        const STREAM: &str = "ws:ready";
+        observer.register(STREAM, slots.clone(), 4, crate::observable::SOURCE_DERIVED);
+
+        let reading = |metrics: &[RawMetric], name: &str| {
+            metrics
+                .iter()
+                .find(|m| m.name == name)
+                .map(|m| m.value)
+                .unwrap_or_else(|| panic!("{name} missing"))
+        };
+        let published = |observer: &Arc<crate::observable::ClaimSlotsObservable>| {
+            let observer = Arc::clone(observer);
+            async move { observer.collect_metrics("D8").await.unwrap() }
+        };
+
+        // 第一拍：窗口付得起 12 条，当前界 4 条且被用满过 -> 爬一格到 5。
+        let (applied, grew) = apply_claim_ceiling(&slots, 4, 12, true);
+        assert_eq!((applied, grew), (5, true));
+        observer.set_slots(STREAM, applied);
+        observer.record_bound_evaluation();
+        let metrics = published(&observer).await;
+        assert_eq!(
+            reading(&metrics, crate::observable::TASK_ROUTER_CLAIM_SLOTS_METRIC),
+            5.0
+        );
+        assert_eq!(slots.available_permits(), 5);
+
+        // 第二拍：窗口没变、这一格还没重新挣到「用满」的凭据，目标不动；但求值
+        // 计数必须往上走——「还在算」不能由目标本身来答。
+        let (applied, grew) = apply_claim_ceiling(&slots, 5, 12, false);
+        assert_eq!((applied, grew), (5, false));
+        observer.set_slots(STREAM, applied);
+        observer.record_bound_evaluation();
+        let metrics = published(&observer).await;
+        assert_eq!(
+            reading(&metrics, crate::observable::TASK_ROUTER_CLAIM_SLOTS_METRIC),
+            5.0
+        );
+
+        // 第三拍：窗口缩到 3 条，界当场降下来，已发出的许可只收得回空闲的那几条。
+        let (applied, grew) = apply_claim_ceiling(&slots, 5, 3, false);
+        assert_eq!((applied, grew), (3, false));
+        observer.set_slots(STREAM, applied);
+        observer.record_bound_evaluation();
+        let metrics = published(&observer).await;
+        assert_eq!(
+            reading(&metrics, crate::observable::TASK_ROUTER_CLAIM_SLOTS_METRIC),
+            3.0
+        );
+        assert_eq!(slots.available_permits(), 3);
+
+        // 第四拍：窗口付不起一条，界是 0。
+        let (applied, grew) = apply_claim_ceiling(&slots, 3, 0, false);
+        assert_eq!((applied, grew), (0, false));
+        observer.set_slots(STREAM, applied);
+        observer.record_bound_evaluation();
+        let metrics = published(&observer).await;
+        assert_eq!(
+            reading(&metrics, crate::observable::TASK_ROUTER_CLAIM_SLOTS_METRIC),
+            0.0
+        );
+        assert_eq!(
+            reading(
+                &metrics,
+                crate::observable::TASK_ROUTER_CLAIM_BOUND_EVALUATIONS_METRIC
+            ),
+            4.0,
+            "each beat that evaluated the law is one count, whether or not the target moved"
+        );
     }
 
     /// 写同一对进程级环境变量的用例之间的一把锁。

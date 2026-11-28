@@ -3,8 +3,9 @@
 //!
 //! This lives beside the contract tests rather than in the metric registry:
 //! the registry is a cross-crate contract that every crate rebuilds, and the
-//! only readers of this table are the two contracts below and the live probe.
-//! A metric that a production path ever needs to classify can move up then.
+//! only readers of this table are the contract tests that include this file and
+//! the live probe. A metric that a production path ever needs to classify can
+//! move up then.
 //!
 //! Each test target compiles this file into itself, and no target reads the
 //! whole of it: one asks for the table, another for the lookup. Being unused in
@@ -183,6 +184,7 @@ pub const METRIC_DERIVATIONS: &[(&str, MetricDerivation)] = &[
     ("cogneva_skill_hot_reload_total", MetricDerivation::Store),
     ("cogneva_supervisor_pass_total", MetricDerivation::Store),
     ("cogneva_task_checkpoint_total", MetricDerivation::Store),
+    ("cogneva_tool_call_archived_total", MetricDerivation::Store),
     (
         "cogneva_tool_output_archive_failed_total",
         MetricDerivation::Store,
@@ -254,6 +256,29 @@ pub const METRIC_DERIVATIONS: &[(&str, MetricDerivation)] = &[
         MetricDerivation::Process,
     ),
     ("cogneva_notification_sign_total", MetricDerivation::Process),
+    // 关停排空与尝试续跑：四个数都是**每个进程自己数自己的**。一次关停只有
+    // 一个进程经历，一次尝试只有一个进程跑，因此两台各自的 3 与 5 加起来是
+    // 8 件发生过的事，而不是同一件事的两次渲染。`sum` 就是这里的答案；面板
+    // 上的「一小时内几次」正是这么读的。
+    (
+        "cogneva_shutdown_drain_abandoned_total",
+        MetricDerivation::Process,
+    ),
+    (
+        "cogneva_shutdown_drain_undeclared_total",
+        MetricDerivation::Process,
+    ),
+    ("cogneva_attempt_resume_total", MetricDerivation::Process),
+    (
+        "cogneva_attempt_unresolved_calls_total",
+        MetricDerivation::Process,
+    ),
+    // 数在这个进程自己的调用路径上：一次被拒只发生在一个进程里，两台各自的 2 与
+    // 3 加起来是 5 次被拒的调用，不是同一件事的两次渲染。所以 `sum` 是对的。
+    (
+        "cogneva_agent_context_limit_refusals_total",
+        MetricDerivation::Process,
+    ),
     (
         "cogneva_registry_prune_failures_total",
         MetricDerivation::Process,

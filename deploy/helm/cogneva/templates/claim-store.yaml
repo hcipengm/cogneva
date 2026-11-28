@@ -42,6 +42,10 @@ metadata:
   labels:
     {{- include "cogneva.labels" . | nindent 4 }}
     app.kubernetes.io/component: claim-store
+  annotations:
+    # 启动预算由实测启动时长决定（Pod 从 startTime 到第一次 Ready），
+    # 只改带这个标记的对象。
+    cogneva.io/startup-policy: measured
 spec:
   selector:
     matchLabels:

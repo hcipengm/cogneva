@@ -45,7 +45,7 @@ const INSTALL_CALLS: [&str; 3] = [".init(", "::init(", "set_global_default("];
 /// 读法：多一处，说明有一支新二进制或一条新路径自己装上了，装配层那边迟早会再装一次；
 /// 少一处，说明这里的理由已经不成立——要么它被删了却没删这一行，要么装配层已经接管了它
 /// 而这一行还在替它说话。两种都要重新决定。
-const DECLARED: [(&str, &str); 3] = [
+const DECLARED: [(&str, &str); 4] = [
     (
         "crates/bootstrap/src/main.rs",
         "独立二进制（引导器）：没有装配层为它装订阅者，它自己就是那一层",
@@ -58,6 +58,11 @@ const DECLARED: [(&str, &str); 3] = [
         "crates/cogneva/src/mcp_serve.rs",
         "同一支二进制里唯一不归装配层管的子命令：`STANDALONE_LOG_SERVICES` 表里没有它，\
          所以它装的这一次就是这一次",
+    ),
+    (
+        "crates/cog-orchestrator/src/test_support.rs",
+        "整份文件只在 `#[cfg(test)]` 里编译（crate 根上的 `mod test_support` 带那个属性）：\
+         装它的是测试二进制，装配层不在里面；`OnceLock` 保证同一支测试二进制里只装一次",
     ),
 ];
 
@@ -223,7 +228,7 @@ fn the_detector_knows_an_install_from_a_filter() {
 
     let idempotent = r#"
         fn try_install() {
-            let _ = tracing_subscriber::registry().try_init();
+            cog_core::ignore_lost!(tracing_subscriber::registry().try_init());
         }
     "#;
     assert!(

@@ -64,6 +64,8 @@ CREATE INDEX IF NOT EXISTS idx_cog_llm_skip_ts ON cog_llm_skip (ts);
 #[derive(Clone)]
 pub struct LlmSkipStore {
     pool: PgPool,
+    /// 事件流的写口；没接上时只写行（读切换之前两者并存）。
+    events: Option<std::sync::Arc<dyn cog_core::EventStore>>,
 }
 
 /// The table. Named in the `cog_` family rather than the `gateway_` one because
@@ -74,7 +76,13 @@ pub const SKIP_TABLE: &str = "cog_llm_skip";
 impl LlmSkipStore {
     pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
         let pool = PgPool::connect(database_url).await?;
-        Ok(Self { pool })
+        Ok(Self { pool, events: None })
+    }
+
+    /// 接上事件流：每一次「省下」同时落一条事实。
+    pub fn with_events(mut self, events: std::sync::Arc<dyn cog_core::EventStore>) -> Self {
+        self.events = Some(events);
+        self
     }
 
     pub async fn init_schema(&self, schema: &dyn cog_core::SchemaRunner) -> anyhow::Result<()> {
@@ -90,6 +98,7 @@ impl LlmSkipStore {
     /// writer whose clock drifted would land its saving in a window the spend
     /// was never in — the one way to make a skip unreadable against its spend.
     pub async fn record(&self, record: &cog_core::LlmSkipRecord) -> anyhow::Result<()> {
+        let now = chrono::Utc::now();
         sqlx::query(&format!(
             "INSERT INTO {SKIP_TABLE} (id, stage, reason) VALUES ($1, $2, $3)"
         ))
@@ -98,6 +107,20 @@ impl LlmSkipStore {
         .bind(record.reason)
         .execute(&self.pool)
         .await?;
+        // 同一次「省下」也落一条事实：这段为什么没花钱，三面（花销/结局/拒绝）
+        // 都答不出，只有它能答。没接写口时只写行——读切换之前两者并存。
+        if let Some(events) = self.events.as_ref() {
+            let mut event = cog_core::FactEvent::new(cog_core::EventPayload::LlmSkip {
+                stage: record.stage.clone(),
+                reason: record.reason.to_string(),
+                at_millis: now.timestamp_millis(),
+            });
+            event.at = Some(now);
+            events
+                .append(event)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
         Ok(())
     }
 
@@ -109,8 +132,37 @@ impl LlmSkipStore {
         since: DateTime<Utc>,
         until: DateTime<Utc>,
     ) -> anyhow::Result<Vec<StageSkip>> {
-        skips_between(&self.pool, since, until).await
+        // 读切换：事实已在流上（写者与行同落），这里从流上折同一问。
+        skips_between_from_stream(&self.pool, since, until).await
     }
+}
+
+/// 同一问，**从事件流算**：每个 `(stage, reason)` 在窗口里的条数。
+pub async fn skips_between_from_stream(
+    pool: &PgPool,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+) -> anyhow::Result<Vec<StageSkip>> {
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT COALESCE(attributes::jsonb ->> 'stage','') AS stage, \
+                COALESCE(attributes::jsonb ->> 'reason','') AS reason, \
+                COUNT(*)::BIGINT AS skips \
+           FROM cogneva_event \
+          WHERE kind = 'llm_skip' AND at >= $1 AND at < $2 \
+          GROUP BY 1, 2 ORDER BY 1, 2",
+    )
+    .bind(since)
+    .bind(until)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(stage, reason, skips)| StageSkip {
+            stage,
+            reason,
+            skips,
+        })
+        .collect())
 }
 
 /// The savings recorded over `[since, until)`.

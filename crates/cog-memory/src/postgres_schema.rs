@@ -1,7 +1,8 @@
 //! PostgreSQL-backed implementation of [`SchemaBackend`].
 //! This is the production-grade Layer 1 (Schema) backend.  It stores
-//! [`SchemaEntry`] rows in a single `schema_entries` table with a JSONB
-//! `properties` column for arbitrary structured data.
+//! [`SchemaEntry`] rows in a single `schema_entries` table. `properties` is an
+//! open-set payload stored as text; the three keys any query reads by name are
+//! columns beside it (see [`RELATION_FROM_KEY`]).
 //! The table shape lives in [`SCHEMA_ENTRIES_DDL`] alone, so that the columns
 //! a statement may bind and the columns the table actually has cannot drift
 //! apart in two places.  Call [`PostgresSchemaBackend::init_table`] at startup
@@ -16,6 +17,18 @@ use std::time::Duration;
 use cog_core::{fill_slots, SchemaEntry, SchemaKind, SchemaSearchResult, SourceRef};
 use cog_core::{merge_schema_observation, SchemaBackend};
 use cog_core::{SFError, SFResult};
+
+/// The three `properties` keys a relation entry is classified by.
+///
+/// They were values inside the document and were filtered on with `->>`
+/// (`from`, `to`, `relation_type`). A key read by value wants a column, so each
+/// has one — and the document no longer carries it: one fact, one place. The
+/// store splits them off on write and puts them back on read, so a caller still
+/// sees the map it wrote.
+pub const RELATION_FROM_KEY: &str = "from";
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+pub const RELATION_TO_KEY: &str = "to";
+pub const RELATION_TYPE_KEY: &str = "relation_type";
 
 /// SQL DDL applied by [`PostgresSchemaBackend::init_table`].
 ///
@@ -35,7 +48,15 @@ CREATE TABLE IF NOT EXISTS schema_entries (
     kind              TEXT        NOT NULL,
     name              TEXT        NOT NULL,
     key               TEXT        NOT NULL,
-    properties        JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    -- 开集载荷存 text：它整块写、整块读，没有被按名索引进去的形状。
+    -- 没有默认值：两台机器（新装的与升上来的）形状要一样，而 `SET DEFAULT` 是
+    -- 一条从目录里答不出来的语句——它会被每一次启动重发，每发一次取一次
+    -- ACCESS EXCLUSIVE。写这一列的两条语句都带值。
+    properties        TEXT        NOT NULL,
+    -- 三个按键读的键升成列。关系查询按值筛这三格，索引也在这三格上。
+    rel_from          TEXT,
+    rel_to            TEXT,
+    rel_relation_type TEXT,
     raw_uri           TEXT        NOT NULL,
     range_spec        TEXT,
     extractor_version TEXT        NOT NULL,
@@ -49,12 +70,30 @@ CREATE TABLE IF NOT EXISTS schema_entries (
     retrieval_count   BIGINT      NOT NULL DEFAULT 0,
     last_retrieved_at TIMESTAMPTZ
 );
+-- 删之前的那一份副本：整行 row_to_json 的文本，按 (id, namespace) 一条。
+-- 事实面只有一种删法——写副本、读回来逐字节比、然后才删；这张表自己不删。
+CREATE TABLE IF NOT EXISTS schema_entries_archive (
+    id          TEXT        NOT NULL,
+    namespace   TEXT        NOT NULL,
+    body        TEXT        NOT NULL,
+    archived_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 ALTER TABLE schema_entries ADD COLUMN IF NOT EXISTS observed_by TEXT[] NOT NULL DEFAULT '{}';
 ALTER TABLE schema_entries ADD COLUMN IF NOT EXISTS occurrences BIGINT NOT NULL DEFAULT 1;
 ALTER TABLE schema_entries ADD COLUMN IF NOT EXISTS first_seen  TIMESTAMPTZ;
 ALTER TABLE schema_entries ADD COLUMN IF NOT EXISTS last_seen   TIMESTAMPTZ;
 ALTER TABLE schema_entries ADD COLUMN IF NOT EXISTS retrieval_count BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE schema_entries ADD COLUMN IF NOT EXISTS last_retrieved_at TIMESTAMPTZ;
+-- 老库：三格先加列（回填在 [`SCHEMA_ENTRIES_REPAIR`] 里，那一步要扫表），
+-- 载荷列从 jsonb 搬成 text。默认值要跟着换：jsonb 的 `'{}'::jsonb` 不能自动
+-- 转成 text，直接 `TYPE` 会以「default cannot be cast automatically」失败。
+ALTER TABLE schema_entries ADD COLUMN IF NOT EXISTS rel_from TEXT;
+ALTER TABLE schema_entries ADD COLUMN IF NOT EXISTS rel_to TEXT;
+ALTER TABLE schema_entries ADD COLUMN IF NOT EXISTS rel_relation_type TEXT;
+ALTER TABLE schema_entries ALTER COLUMN properties DROP DEFAULT;
+ALTER TABLE schema_entries ALTER COLUMN properties TYPE TEXT USING properties::text;
+CREATE INDEX IF NOT EXISTS idx_schema_entries_rel_from ON schema_entries(namespace, rel_from);
+CREATE INDEX IF NOT EXISTS idx_schema_entries_rel_to   ON schema_entries(namespace, rel_to);
 "#;
 
 /// The rows [`SCHEMA_ENTRIES_DDL`] leaves unset, filled in its own transaction.
@@ -74,6 +113,17 @@ pub const SCHEMA_ENTRIES_REPAIR: &str = r#"
 UPDATE schema_entries SET observed_by = ARRAY[raw_uri] WHERE cardinality(observed_by) = 0;
 UPDATE schema_entries SET first_seen = extracted_at WHERE first_seen IS NULL;
 UPDATE schema_entries SET last_seen  = extracted_at WHERE last_seen  IS NULL;
+-- 三个按键读的键从文档搬进列，搬完从文档里删掉：同一个事实留在两处就是两个
+-- 写者，改一处不改另一处。谓词先按文本找（不解析 JSON），所以每一次启动的代价
+-- 是一次列扫描而不是一次逐行解析；搬完之后它读到零行，`jsonb` 那一侧一次也不跑。
+UPDATE schema_entries
+   SET rel_from = properties::jsonb ->> 'from',
+       rel_to = properties::jsonb ->> 'to',
+       rel_relation_type = properties::jsonb ->> 'relation_type',
+       properties = (properties::jsonb - 'from' - 'to' - 'relation_type')::text
+ WHERE properties LIKE '%"from"%'
+    OR properties LIKE '%"to"%'
+    OR properties LIKE '%"relation_type"%';
 "#;
 
 /// What can only be said once the rows are filled: the two columns the repair
@@ -101,7 +151,8 @@ CREATE INDEX IF NOT EXISTS idx_schema_entries_observed_by ON schema_entries USIN
 
 /// Columns every `SELECT` in this module returns, in the order
 /// [`PostgresSchemaBackend::row_to_entry`] reads them.
-const ENTRY_COLUMNS: &str = "namespace, id, kind, name, key, properties, raw_uri, range_spec, \
+const ENTRY_COLUMNS: &str = "namespace, id, kind, name, key, properties, rel_from, rel_to, \
+                             rel_relation_type, raw_uri, range_spec, \
                              extractor_version, extracted_at, confidence, importance, \
                              observed_by, occurrences, first_seen, last_seen, \
                              retrieval_count, last_retrieved_at";
@@ -113,16 +164,17 @@ const ENTRY_COLUMNS: &str = "namespace, id, kind, name, key, properties, raw_uri
 /// the query matching nothing — which is exactly what an entity with no
 /// relations returns.
 const RELATIONS_SQL_TEMPLATE: &str = r#"
-            SELECT namespace, id, kind, name, key, properties, raw_uri, range_spec,
+            SELECT namespace, id, kind, name, key, properties, rel_from, rel_to,
+                   rel_relation_type, raw_uri, range_spec,
                    extractor_version, extracted_at, confidence, importance
             FROM schema_entries
             WHERE namespace = $1 AND kind = '{kind:relation}'
               AND (
-                  ($2 = '{dir:from}' AND properties ->> 'from' = $3)
-                  OR ($2 = '{dir:to}' AND properties ->> 'to' = $3)
-                  OR ($2 = '{dir:both}' AND (properties ->> 'from' = $3 OR properties ->> 'to' = $3))
+                  ($2 = '{dir:from}' AND rel_from = $3)
+                  OR ($2 = '{dir:to}' AND rel_to = $3)
+                  OR ($2 = '{dir:both}' AND (rel_from = $3 OR rel_to = $3))
               )
-              AND ($4::TEXT IS NULL OR properties ->> 'relation_type' = $4)
+              AND ($4::TEXT IS NULL OR rel_relation_type = $4)
             "#;
 
 /// 关系查询要填的槽：行的 `kind` 与三个方向词。
@@ -204,6 +256,29 @@ impl PostgresSchemaBackend {
         Ok(())
     }
 
+    /// 把三个升成列的键从文档里取出来，剩下的存成文本。
+    ///
+    /// 与 [`Self::row_to_entry`] 对称：那边把列拼回文档，这边把键拆出去。
+    /// 两处都只有这一份拼写，所以「文档里有这三个键」不会在库里出现第二次。
+    fn split_relation_keys(
+        properties: &serde_json::Value,
+    ) -> (String, Option<String>, Option<String>, Option<String>) {
+        let mut document = properties
+            .as_object()
+            .cloned()
+            .unwrap_or(Default::default());
+        let mut take = |key: &str| {
+            document
+                .remove(key)
+                .and_then(|value| value.as_str().map(str::to_string))
+        };
+        let from = take(RELATION_FROM_KEY);
+        let to = take(RELATION_TO_KEY);
+        let relation_type = take(RELATION_TYPE_KEY);
+        let rest = serde_json::Value::Object(document).to_string();
+        (rest, from, to, relation_type)
+    }
+
     fn row_to_entry(row: &PgRow) -> SFResult<SchemaEntry> {
         let namespace: String = row
             .try_get("namespace")
@@ -231,9 +306,25 @@ impl PostgresSchemaBackend {
         let importance: f32 = row
             .try_get("importance")
             .map_err(|e| SFError::Agent(format!("decode importance: {}", e)))?;
-        let properties: serde_json::Value = row
+        // 载荷是 JSON 文本，三个按键读的键在列里；读的一端把列拼回文档，
+        // 所以调用方看到的仍是它写进去的那张 map。坏行读成空文档而不是让整批
+        // 读失败：一条条目的其余列仍然是真的。
+        let properties_text: String = row
             .try_get("properties")
             .map_err(|e| SFError::Agent(format!("decode properties: {}", e)))?;
+        let mut properties: serde_json::Value =
+            serde_json::from_str(&properties_text).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(document) = properties.as_object_mut() {
+            for (column, key) in [
+                ("rel_from", RELATION_FROM_KEY),
+                ("rel_to", RELATION_TO_KEY),
+                ("rel_relation_type", RELATION_TYPE_KEY),
+            ] {
+                if let Ok(Some(value)) = row.try_get::<Option<String>, _>(column) {
+                    document.insert(key.to_string(), serde_json::Value::String(value));
+                }
+            }
+        }
         let id: String = row
             .try_get("id")
             .map_err(|e| SFError::Agent(format!("decode id: {}", e)))?;
@@ -301,6 +392,51 @@ fn parse_schema_kind(s: &str) -> SFResult<SchemaKind> {
     SchemaKind::parse(s).ok_or_else(|| SFError::Agent(format!("unknown schema kind: {s}")))
 }
 
+/// 删之前先写一份读得回来的副本，读回来逐字节比，然后才删。两条删路径（最后一位
+/// 观察者被摘掉、显式删一条）共用这一处：两份写法分家时，其中一条会漏掉副本，
+/// 而漏掉的那条看起来与「这张表本来就没有这一行」一模一样。
+async fn archive_and_delete(
+    conn: &mut sqlx::PgConnection,
+    namespace: &str,
+    id: &str,
+) -> SFResult<()> {
+    let body: Option<String> = sqlx::query_scalar(
+        "SELECT row_to_json(t)::text FROM schema_entries t \
+          WHERE namespace = $1 AND id = $2",
+    )
+    .bind(namespace)
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| SFError::Agent(format!("archive_and_delete read: {e}")))?;
+    let Some(body) = body else {
+        return Ok(());
+    };
+    sqlx::query("INSERT INTO schema_entries_archive (id, namespace, body) VALUES ($1, $2, $3)")
+        .bind(id)
+        .bind(namespace)
+        .bind(&body)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| SFError::Agent(format!("archive_and_delete archive: {e}")))?;
+    let back: String = sqlx::query_scalar(
+        "SELECT body FROM schema_entries_archive WHERE id = $1 AND namespace = $2",
+    )
+    .bind(id)
+    .bind(namespace)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| SFError::Agent(format!("archive_and_delete read-back: {e}")))?;
+    crate::deletion::deletion_is_allowed(back == body)?;
+    sqlx::query("DELETE FROM schema_entries WHERE namespace = $1 AND id = $2")
+        .bind(namespace)
+        .bind(id)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| SFError::Agent(format!("archive_and_delete delete: {e}")))?;
+    Ok(())
+}
+
 #[async_trait]
 impl SchemaBackend for PostgresSchemaBackend {
     /// Write one observation of a fact, merging it into the row that identity
@@ -321,13 +457,17 @@ impl SchemaBackend for PostgresSchemaBackend {
             .await
             .map_err(|e| SFError::Agent(format!("store_schema begin: {}", e)))?;
 
+        let (properties, rel_from, rel_to, rel_relation_type) =
+            Self::split_relation_keys(&entry.properties);
         sqlx::query(
             r#"
             INSERT INTO schema_entries
                 (id, namespace, kind, name, key, properties, raw_uri, range_spec,
                  extractor_version, extracted_at, confidence, importance,
-                 observed_by, occurrences, first_seen, last_seen)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                 observed_by, occurrences, first_seen, last_seen,
+                 rel_from, rel_to, rel_relation_type)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                    $17, $18, $19)
             ON CONFLICT (id) DO NOTHING
             "#,
         )
@@ -336,7 +476,7 @@ impl SchemaBackend for PostgresSchemaBackend {
         .bind(schema_kind_str(entry.kind))
         .bind(&entry.name)
         .bind(&entry.key)
-        .bind(&entry.properties)
+        .bind(&properties)
         .bind(&entry.source_ref.raw_uri)
         .bind(&entry.source_ref.range)
         .bind(&entry.source_ref.extractor_version)
@@ -347,6 +487,9 @@ impl SchemaBackend for PostgresSchemaBackend {
         .bind(entry.occurrences as i64)
         .bind(entry.first_seen)
         .bind(entry.last_seen)
+        .bind(rel_from)
+        .bind(rel_to)
+        .bind(rel_relation_type)
         .execute(&mut *tx)
         .await
         .map_err(|e| SFError::Agent(format!("store_schema insert: {}", e)))?;
@@ -359,13 +502,16 @@ impl SchemaBackend for PostgresSchemaBackend {
             .map_err(|e| SFError::Agent(format!("store_schema lock: {}", e)))?;
         let merged = merge_schema_observation(&Self::row_to_entry(&stored)?, entry);
 
+        let (properties, rel_from, rel_to, rel_relation_type) =
+            Self::split_relation_keys(&merged.properties);
         sqlx::query(
             r#"
             UPDATE schema_entries SET
                 namespace = $2, kind = $3, name = $4, key = $5, properties = $6,
                 raw_uri = $7, range_spec = $8, extractor_version = $9,
                 extracted_at = $10, confidence = $11, importance = $12,
-                observed_by = $13, occurrences = $14, first_seen = $15, last_seen = $16
+                observed_by = $13, occurrences = $14, first_seen = $15, last_seen = $16,
+                rel_from = $17, rel_to = $18, rel_relation_type = $19
             WHERE id = $1
             "#,
         )
@@ -374,7 +520,7 @@ impl SchemaBackend for PostgresSchemaBackend {
         .bind(schema_kind_str(merged.kind))
         .bind(&merged.name)
         .bind(&merged.key)
-        .bind(&merged.properties)
+        .bind(&properties)
         .bind(&merged.source_ref.raw_uri)
         .bind(&merged.source_ref.range)
         .bind(&merged.source_ref.extractor_version)
@@ -385,6 +531,9 @@ impl SchemaBackend for PostgresSchemaBackend {
         .bind(merged.occurrences as i64)
         .bind(merged.first_seen)
         .bind(merged.last_seen)
+        .bind(rel_from)
+        .bind(rel_to)
+        .bind(rel_relation_type)
         .execute(&mut *tx)
         .await
         .map_err(|e| SFError::Agent(format!("store_schema update: {}", e)))?;
@@ -519,14 +668,7 @@ impl SchemaBackend for PostgresSchemaBackend {
                 })?;
             }
             None => {
-                sqlx::query("DELETE FROM schema_entries WHERE namespace = $1 AND id = $2")
-                    .bind(namespace)
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| {
-                        SFError::Agent(format!("forget_schema_source delete failed: {}", e))
-                    })?;
+                archive_and_delete(&mut tx, namespace, id).await?;
             }
         }
         tx.commit()
@@ -551,12 +693,15 @@ impl SchemaBackend for PostgresSchemaBackend {
     }
 
     async fn delete_schema(&self, namespace: &str, id: &str) -> SFResult<()> {
-        sqlx::query("DELETE FROM schema_entries WHERE namespace = $1 AND id = $2")
-            .bind(namespace)
-            .bind(id)
-            .execute(&self.pool)
+        let mut tx = self
+            .pool
+            .begin()
             .await
-            .map_err(|e| SFError::Agent(format!("delete_schema failed: {}", e)))?;
+            .map_err(|e| SFError::Agent(format!("delete_schema begin: {e}")))?;
+        archive_and_delete(&mut tx, namespace, id).await?;
+        tx.commit()
+            .await
+            .map_err(|e| SFError::Agent(format!("delete_schema commit: {e}")))?;
         Ok(())
     }
 
@@ -592,19 +737,29 @@ impl SchemaBackend for PostgresSchemaBackend {
     /// a unique index on those columns that does not exist — the statement
     /// would fail outright rather than update anything.
     async fn update_schema(&self, _namespace: &str, entry: &SchemaEntry) -> SFResult<()> {
+        let (properties, rel_from, rel_to, rel_relation_type) =
+            Self::split_relation_keys(&entry.properties);
         sqlx::query(
             r#"
             INSERT INTO schema_entries
                 (id, namespace, kind, name, key, properties, raw_uri, range_spec,
                  extractor_version, extracted_at, confidence, importance,
-                 observed_by, occurrences, first_seen, last_seen)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                 observed_by, occurrences, first_seen, last_seen,
+                 rel_from, rel_to, rel_relation_type)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                    $17, $18, $19)
             ON CONFLICT (id) DO UPDATE SET
                 namespace         = EXCLUDED.namespace,
                 kind              = EXCLUDED.kind,
                 name              = EXCLUDED.name,
                 key               = EXCLUDED.key,
-                properties        = COALESCE(schema_entries.properties, '{}'::jsonb) || EXCLUDED.properties,
+                -- 载荷是 text：合并仍在库侧完成，因为两个写者同时改一行时，
+                -- 读出来在应用层合并会丢一次更新。`::jsonb` 只在这一处出现，
+                -- 而它不是查询——没有任何一条语句按键筛过这一列。
+                properties        = (schema_entries.properties::jsonb || EXCLUDED.properties::jsonb)::text,
+                rel_from          = COALESCE(EXCLUDED.rel_from, schema_entries.rel_from),
+                rel_to            = COALESCE(EXCLUDED.rel_to, schema_entries.rel_to),
+                rel_relation_type = COALESCE(EXCLUDED.rel_relation_type, schema_entries.rel_relation_type),
                 raw_uri           = EXCLUDED.raw_uri,
                 range_spec        = EXCLUDED.range_spec,
                 extractor_version = EXCLUDED.extractor_version,
@@ -622,7 +777,7 @@ impl SchemaBackend for PostgresSchemaBackend {
         .bind(schema_kind_str(entry.kind))
         .bind(&entry.name)
         .bind(&entry.key)
-        .bind(&entry.properties)
+        .bind(&properties)
         .bind(&entry.source_ref.raw_uri)
         .bind(&entry.source_ref.range)
         .bind(&entry.source_ref.extractor_version)
@@ -633,6 +788,9 @@ impl SchemaBackend for PostgresSchemaBackend {
         .bind(entry.occurrences as i64)
         .bind(entry.first_seen)
         .bind(entry.last_seen)
+        .bind(rel_from)
+        .bind(rel_to)
+        .bind(rel_relation_type)
         .execute(&self.pool)
         .await
         .map_err(|e| SFError::Agent(format!("update_schema failed: {}", e)))?;

@@ -161,6 +161,7 @@ hooks:
                     scope: cog_core::HookScope::Global,
                     crew_id_filter: None,
                     squad_id_filter: None,
+                    tool: None,
                     action: HookAction::Log {
                         level: LogLevel::Info,
                     },
@@ -173,6 +174,7 @@ hooks:
                     scope: cog_core::HookScope::Global,
                     crew_id_filter: None,
                     squad_id_filter: None,
+                    tool: None,
                     action: HookAction::Log {
                         level: LogLevel::Info,
                     },
@@ -191,6 +193,7 @@ hooks:
                     scope: cog_core::HookScope::Global,
                     crew_id_filter: None,
                     squad_id_filter: None,
+                    tool: None,
                     action: HookAction::Log {
                         level: LogLevel::Warn,
                     },
@@ -203,6 +206,7 @@ hooks:
                     scope: cog_core::HookScope::Global,
                     crew_id_filter: None,
                     squad_id_filter: None,
+                    tool: None,
                     action: HookAction::Log {
                         level: LogLevel::Error,
                     },

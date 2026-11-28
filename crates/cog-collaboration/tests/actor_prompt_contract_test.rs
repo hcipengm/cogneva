@@ -141,11 +141,13 @@ fn a_branch(branch_id: u32) -> PgeBranchResult {
     PgeBranchResult {
         branch_id,
         plan: PlannerOutput {
+            definition: None,
             summary: format!("plan {branch_id}"),
             plan: serde_json::json!({}),
             sub_tasks: Vec::new(),
             acceptance_criteria: Vec::new(),
             targets: Vec::new(),
+            items: Vec::new(),
         },
         generation: GeneratorOutput::none(),
         outcome: RoundOutcome::Stopped {
@@ -329,6 +331,80 @@ async fn every_stable_half_names_the_answers_its_own_parser_reads() {
     }
 }
 
+/// 每个角色的稳定半段只交答案的形状，不交一套判断标准。
+///
+/// 五个角色决定的都是平台自己没决定的事：分解成什么、交出什么、这活干得怎么样、
+/// 这一轮往哪走、交付哪一条分支。交给它们的文档就是那个案子。稳定半段里再写一段
+/// 「该怎么做」，等于平台把它刚问出去的决定自己做了：模型照抄一遍，判断却没有发
+/// 生；而平台上真能判的那些（计划结构、变更形状、验收覆盖）都有各自的判据，判词
+/// 会自己回到下一轮——写在这里的那一份既不会红，也不会跟着判据改。
+///
+/// 需要它们知道的只有答案的形状与解析器认的拼写。所以稳定半段就只有这两样，多出
+/// 任何一个键都说明规则又以提示词的形式长回来了。
+#[tokio::test]
+async fn every_stable_half_carries_the_answer_shape_and_nothing_else() {
+    let roles = two_prompts_from_every_actor().await;
+    for role in ["planner", "generator", "evaluator", "moderator", "merger"] {
+        let agent = roles
+            .iter()
+            .find(|(r, _, _)| *r == role)
+            .map(|(_, agent, _)| agent)
+            .unwrap_or_else(|| panic!("{role} sent no document to read"));
+        let contract: serde_json::Value =
+            serde_json::from_str(&stable_half(agent.inputs()[0].clone()))
+                .unwrap_or_else(|e| panic!("{role}'s stable half is not JSON: {e}"));
+        let keys: std::collections::BTreeSet<&str> = contract
+            .as_object()
+            .unwrap_or_else(|| panic!("{role}'s stable half is not an object: {contract}"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["output_schema", "response_format"].into_iter().collect(),
+            "{role}'s stable half carries more than the answer shape: {contract}"
+        );
+    }
+}
+
+/// 分解被要求在每一片上说清交什么，且说出的词就是任务行认的那个闭集。
+///
+/// 计划是平台自己的生产者：它比外部提交者更清楚每一片要交出哪种产物。字段一旦
+/// 从契约里掉出去，模型就不会再答，任务行从此回到「没人说」——差分与判据那一侧
+/// 全绿，因为问题不在读的那一端。
+///
+/// 判据是 `Deliverable::as_str` 的每个词都在契约里，不是某一句劝告在不在：
+/// 「别从座位名反推」是一句话，没有东西检查它，契约里留着它只是每轮多付一句；
+/// 词表才是任务行读得懂的那一半，缺一个词，生产者就会写出一个 `Deliverable::parse`
+/// 不认的拼法，行上于是回到「说了一个认不出的词」。
+#[tokio::test]
+async fn the_planner_asks_each_sub_task_what_it_delivers() {
+    let roles = two_prompts_from_every_actor().await;
+    let agent = roles
+        .iter()
+        .find(|(role, _, _)| *role == "planner")
+        .map(|(_, agent, _)| agent)
+        .expect("planner 没有发过一份可读的文档");
+    let contract = stable_half(agent.inputs()[0].clone());
+    assert!(
+        contract.contains("\"delivers\""),
+        "分解契约不再问每一片交什么，任务行会退回「没人说」：{contract}"
+    );
+    for kind in [
+        cog_core::Deliverable::Plan,
+        cog_core::Deliverable::Change,
+        cog_core::Deliverable::Judgement,
+        cog_core::Deliverable::Answer,
+        cog_core::Deliverable::WorkProduct,
+    ] {
+        assert!(
+            contract.contains(kind.as_str()),
+            "分解契约没有点名 `{}`，生产者写出的这个词任务行不认识：{contract}",
+            kind.as_str()
+        );
+    }
+}
+
 /// No actor hands the model a role to play.
 ///
 /// The agent that runs a step is a colleague with an identity of its own; the
@@ -423,8 +499,8 @@ fn identity_claim(text: &str) -> Option<String> {
 /// both stale and the guard green. So the vocabulary is read out of the parsers
 /// here by running them, on the words the contract names. This is the one place
 /// the failure is silent: a decision word the moderator's parse does not
-/// recognize lands on its default `continue`, so a round would carry on and the
-/// reading would show a decision nobody made.
+/// recognize reads as no decision at all, so the round would record nothing
+/// where the contract promised one of the four.
 #[test]
 fn the_words_the_contracts_name_are_the_words_the_parsers_take() {
     // Every decision the contract offers has to come back as itself, not as the
@@ -437,7 +513,8 @@ fn the_words_the_contracts_name_are_the_words_the_parsers_take() {
     ] {
         let parsed = parse_moderator_output(&serde_json::json!({ "decision": word }));
         assert_eq!(
-            parsed.decision, expected,
+            parsed.decision,
+            Some(expected),
             "the moderator's contract tells the model to answer {word:?}, which its parse does not take"
         );
     }
@@ -493,7 +570,9 @@ async fn a_handed_back_change_carries_the_files_the_gate_named() {
     );
     // The list is data, so the model also has to be told what it means and that
     // it is not a hint to search for.
-    let instructions = parsed["instructions"].as_str().unwrap_or_default();
+    let instructions = parsed["instructions"]
+        .as_str()
+        .unwrap_or(Default::default());
     assert!(
         instructions.contains("must appear in your targets"),
         "the file list arrived without the rule that makes it a requirement: {contract}"
@@ -560,7 +639,9 @@ async fn a_path_refusal_hands_the_planner_paths_to_stay_out_of() {
         parsed.get("required_targets").is_none(),
         "a path the change may not touch was handed over as a required target: {contract}"
     );
-    let instructions = parsed["instructions"].as_str().unwrap_or_default();
+    let instructions = parsed["instructions"]
+        .as_str()
+        .unwrap_or(Default::default());
     assert!(
         !instructions.contains("must appear in your targets"),
         "the refused path arrived with the rule that says to touch it: {contract}"

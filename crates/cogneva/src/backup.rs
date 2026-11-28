@@ -57,33 +57,36 @@ const TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 /// 与「没配」同形。
 const BACKUP_DIR_ENV: &str = "COGNEVA_BACKUP_DIR";
 const BACKUP_OFFSITE_DIR_ENV: &str = "COGNEVA_BACKUP_OFFSITE_DIR";
-/// 演练**单趟**的预算（秒）。一趟 = 一份包从解包到对数完。
+/// 演练静默多久算停：**这一步之内也没有一处推进**，不是这一步走了多久，也不是部署里
+/// 写死的一个数。
 ///
-/// 界必须由进程自己拿着，而不是只由 Job 的 `activeDeadlineSeconds` 兜着：Job 的界
-/// 到点是把 Pod 杀掉，进程没有机会写那一行，`backup_drills` 里于是只剩上一晚的记录
-/// ——「这一趟被杀了」与「这一趟没跑过」在账上同形。2026-10-27 实测正是这样：第一趟
-/// 2271 s 之后，第二趟在 3600 s 的 Job 界上被杀，一行都没留下。
-const DRILL_PASS_BUDGET_ENV: &str = "COGNEVA_BACKUP_DRILL_PASS_BUDGET_SECS";
-/// 没配 env 时单趟的预算。数与 values.yaml 的 `backup.drillPassBudgetSeconds`
-/// 同源，由 `deploy/scripts/tests/backup-drill-budget-covers-both-passes.test.sh`
-/// 盯着两边与 Job 界的关系。
-// cap: bound — 与 Job 的界同源，由 backup-drill-budget-covers-both-passes 那个测试盯着两边的关系
-const DRILL_PASS_BUDGET_DEFAULT_SECS: u64 = 3600;
+/// 判据从「这一趟总共用了多久」换成「还有没有在搬」：一趟开得慢不是问题，停下来才是。
+/// 旧的那个数是整趟的钟，它杀的是**还在一步一步往前走**的运行——2026-10-27 实测：
+/// 第一趟 2271 s 之后，第二趟在 3600 s 的整趟界上被杀，账上那一行都没留下。
+///
+/// 光把单位从整趟换到单步还不够：一次 COPY 一张几百万行的表，能在这「一步」里跑上
+/// 几十分钟，边界上仍然只有一次拍，于是「灌得很久」与「灌不动了」读起来一样。所以
+/// 导出、灌回、打包、解包、算摘要这五条搬数据的路都按块记拍（[`BeatsOnIo`]），对面
+/// 还在执行时另有一条证据（[`PEER_PROGRESS_TASK`]）——只要还有一条通道在前进，这一跑
+/// 就还在动，判词也就不会落在它身上。
+///
+/// 界本身不在这里：它是这个作业类上一次运行量到的最长间隔（`progress_bounds`），
+/// 开工时采纳（[`load_measured_bound`]）。量不到就不判停。
 const QDRANT_HTTP_URL_ENV: &str = "COGNEVA_QDRANT_HTTP_URL";
 const IMAGE_REF_ENV: &str = "COGNEVA_IMAGE_REF";
 
-/// 落库的错误文本上限。错误本身通常只有一行，这个界是为了让一条失控的长错误
-/// （整段响应体、整张表名清单）不至于把行撑成不可读的东西。
-// cap: bound — 错误本身通常只有一行；这个界让一条失控的长错误（整段响应体、整张表名清单）不至于把行撑成不可读的东西
-const ERROR_TEXT_MAX_CHARS: usize = 2000;
-
-/// 一次运行默认的期限，也是集群清单里那个 `activeDeadlineSeconds` 的默认值。
+/// 一次运行开出来时记下的期限：只落进账本，不杀任何东西。
 ///
-/// 实测一次运行 41 秒（含导出、快照、打包、裁剪），一小时的界是它的一百多倍：
-/// 落在里面的运行照跑，落在外面的那个不是慢，是卡死了——而它卡着的时候，
-/// 调度器的 `Forbid` 会让后面每一次都不再开始。没有这个界，一次挂住的运行
-/// 就能把备份永久停掉，顺带把「谁来给它收尾」也一并停掉。
-// cap: bound — 调度器的 Forbid 会让后面每一次都不再开始；没有这个界，一次挂住的运行就能把备份永久停掉
+/// 容器的死活由备份 Job 的存活探针判——每走一步更新一次进展文件，超过实测到的
+/// 最长步间隔没有新的一拍，kubelet 才判这一趟停了。整趟跑了多久不参与判定，
+/// 一次慢但一直在推进的运行不会被它收走。
+///
+/// 这个数只写进账本 `backup_runs` 那一行的 `run_deadline_seconds`，让「一条开着
+/// 却没人收尾的记录」有一个可判的时刻：判那一行要用**它自己被开出来时**的期限，
+/// 不是今天的旋钮。实测一次运行 41 秒（含导出、快照、打包、裁剪），一小时的界
+/// 是它的一百多倍。
+// cap: fixed — 账本里一条开着的记录没有别的判据；这个数只判那一行，不掐正在跑的容器
+// keep: 删掉后账本里开着的记录没有别的判据，孤儿记录永远开着；由「只判那一行，不掐正在跑的容器」兜住
 const DEFAULT_RUN_DEADLINE_SECONDS: i32 = 3600;
 
 /// 内部实例密钥对象名：业务 Pod 读的那一份（数据库/缓存/内部签名/S3/邮件）。
@@ -117,13 +120,32 @@ pub struct TableReport {
 pub struct CollectionReport {
     pub name: String,
     pub snapshot: String,
-    pub points: u64,
+    /// 这个集合里有多少点，`None` 是「数不出来」。
+    ///
+    /// 快照已经下下来了，数不出来只影响这一格读数，所以它不让整趟备份失败；但它
+    /// 也不能写成 0：0 读作「这个集合是空的」，那是另一个事实，而清单正是读这份
+    /// 包覆盖了什么的地方。
+    pub points: Option<u64>,
+}
+
+/// 一段正文在包里的读数：oid 与字节数。
+///
+/// 正文落在 `pg_largeobject` 里，表行只存 oid。oid 是行的引用键，恢复必须把它
+/// 原样建回去——换一个 oid，表里的引用就指向空处；字节数进清单，核包时才判得出
+/// 「这一段在包里是全的」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LargeObjectReport {
+    pub oid: u32,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PostgresReport {
     pub tables: Vec<TableReport>,
     pub sequences: usize,
+    /// 正文段。旧包没有这一段（`serde(default)` 读成空），核包按「当年没声明」跳过。
+    #[serde(default)]
+    pub large_objects: Vec<LargeObjectReport>,
 }
 
 /// 一个策略库的打包读数：版本数、链头、当前激活版本。
@@ -326,25 +348,22 @@ pub struct BackupConfig {
     /// 备份 Pod 把进化卷**只读**挂进来，并靠同节点亲和避开 RWO 跨节点 attach
     /// 失败。名字是清单里的身份，不能重复、不能叫 `app`（主根的名字）。
     pub extra_data_roots: Vec<(String, PathBuf)>,
-    /// 保留几个包：**覆盖位**（`COGNEVA_BACKUP_KEEP`，构造时 `unwrap_or(7)`）。
+    /// 保留几个包的**部署声明**（`COGNEVA_BACKUP_KEEP`，构造时 `unwrap_or(7)`）。
     ///
-    /// 7 的来历量过、不是拍的：备份卷 `cogneva-backup-pvc` 声明 10 GiB，而
-    /// 2026-10-09…10-15 那七个包实测 42–195 MB、合计 788 MB ⇒ 按**最大的那个**
-    /// 外推 7 个包 ≈ 1.4 GiB，约占声明容量的 14%。取「一周」是因为 CronJob 一天
-    /// 一趟，一周覆盖「发现坏了到修好」的窗口。
+    /// 生效值每趟现算：[`effective_keep_count`] 读备份卷的容量和卷上现存包的实测
+    /// 大小，按 [`cog_core::retention::items_that_fit`] 得到「这一卷装得下几个」。
+    /// 这个声明只在量不到卷（statvfs 失败、卷上还没有包）时顶着。
     ///
-    /// 它**不能**建成闭环：留几个包是策略不是测量，按剩余空间算只会让「留多久的
-    /// 账」随磁盘水位漂。生效值由 `cogneva_backup_run_readings{readout="keep_target"}`
-    /// 发出去。**缺判据**：那条读数没有 `source` 标签（界读数该标来源），也没有
-    /// 东西在包体量长期贴住卷容量时报。
+    /// 7 只是声明的来历：2026-10-09…10-15 那七个包实测 42–195 MB、合计 788 MB，
+    /// 而卷声明的默认是 10 GiB。声明本身不再是窗口的长度——窗口是卷装得下的包数，卷由
+    /// 容量回路按实测占用抬高。
     pub keep_count: usize,
-    /// 这一次运行最长能跑多久。集群侧同一个值同时是 Job 的
-    /// `activeDeadlineSeconds`（到点由 kubelet 杀容器）和这里的 env——一个值
-    /// 两处承载，不许各自写一份。
+    // db-column: backup_runs.run_deadline_seconds — not-a-bound — 运行开出时记下的期限（判「开着却没人收尾」用）
+    /// 这一次运行开出来时的期限，随这一行落进账本的 `run_deadline_seconds`。
     ///
-    /// 它落进账本那一行的 `run_deadline_seconds`，因为那个数要跟着这一行走：
-    /// 一行运行中的记录没人在跑，只有拿**它自己被开出来时**的期限才能判，用
-    /// 今天的旋钮去判昨天那一次是两回事。
+    /// 它**不是**判这一趟死活的判据：Job 的死活由存活探针按进展文件判，整趟跑了
+    /// 多久不参与判定。它跟着这一行走，是因为一条开着却没人在跑的记录，只有拿
+    /// **它自己被开出来时**的期限才判得了——用今天的旋钮去判昨天那一次是两回事。
     pub run_deadline_seconds: i32,
     /// 备份卷之外的第二个落点：每跑完一次，新包再往这里复制一份。
     ///
@@ -673,6 +692,9 @@ async fn copy_package_table_into(
             break;
         }
         copy_in.send(buf[..n].to_vec()).await?;
+        // 同导出：这一块进去了就是一拍。灌一张几百万行的表可以跑很久，但只要还在
+        // 往里送，它就不是「停住」。
+        cog_core::progress::beat(DATA_PROGRESS_TASK);
     }
     copy_in.finish().await?;
     Ok(())
@@ -736,6 +758,9 @@ pub async fn backup_postgres(
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         .execute(&mut *tx)
         .await?;
+    // 从这一刻起，对面还在执行就是证据：导出最先的几十分钟常常花在服务端把查询跑完上，
+    // 那一整段我们这侧一个字节都没读到。
+    let _peer = backend_pid(&mut tx).await.map(|pid| watch_peer(pool, pid));
 
     let tables: Vec<String> = sqlx::query_scalar(DISCOVER_TABLES_SQL)
         .fetch_all(&mut *tx)
@@ -743,6 +768,7 @@ pub async fn backup_postgres(
     let mut report = PostgresReport {
         tables: Vec::with_capacity(tables.len()),
         sequences: 0,
+        large_objects: Vec::new(),
     };
 
     for table in &tables {
@@ -763,6 +789,9 @@ pub async fn backup_postgres(
         use std::io::Write;
         while let Some(chunk) = copy_out.next().await {
             file.write_all(&chunk?)?;
+            // 一块就是一段工作量：大表要导很久，而「导了很久」与「导不动了」必须在
+            // 读数面上分得开，否则判停只剩按时间杀这一条路。
+            cog_core::progress::beat(DATA_PROGRESS_TASK);
         }
         drop(copy_out);
         report.tables.push(TableReport {
@@ -792,6 +821,44 @@ pub async fn backup_postgres(
     }
     std::fs::write(out_dir.join(SEQUENCES_FILE), &sql)?;
     report.sequences = sequences.len();
+    // 正文段：同一个 REPEATABLE READ 快照里读，与那些引用它的表行是同一刻的样子。
+    let lo_dir = out_dir.join(LARGE_OBJECTS_DIR);
+    // `oid` 这一列的类型是 OID，不是 INT8：sqlx 不会把它解成 `i64`（真库上
+    // `mismatched types ... INT8 vs OID`，2026-11-24 实测），所以在 SQL 里转一次。
+    let oids: Vec<i64> =
+        sqlx::query_scalar("SELECT oid::bigint FROM pg_largeobject_metadata ORDER BY oid")
+            .fetch_all(&mut *tx)
+            .await?;
+    if !oids.is_empty() {
+        std::fs::create_dir_all(&lo_dir)?;
+    }
+    for oid in oids {
+        let oid = oid as u32;
+        let path = lo_dir.join(format!("{oid}.bin"));
+        let mut file = std::fs::File::create(&path)?;
+        let mut offset: i64 = 0;
+        loop {
+            let chunk: Vec<u8> = sqlx::query_scalar(
+                "SELECT COALESCE(substring(lo_get($1::oid, $2::bigint, $3::int) from 1), ''::bytea)",
+            )
+            .bind(oid as i64)
+            .bind(offset)
+            .bind(BODY_EXPORT_CHUNK)
+            .fetch_one(&mut *tx)
+            .await?;
+            if chunk.is_empty() {
+                break;
+            }
+            use std::io::Write;
+            file.write_all(&chunk)?;
+            offset += chunk.len() as i64;
+            cog_core::progress::beat(DATA_PROGRESS_TASK);
+        }
+        report.large_objects.push(LargeObjectReport {
+            oid,
+            bytes: offset as u64,
+        });
+    }
     // 出错时 tx 在 drop 时回滚；成功路径显式提交，把快照释放掉。
     tx.commit().await?;
     Ok(report)
@@ -815,6 +882,8 @@ pub struct RestoreReport {
     /// 按旧导出点名它。跳过它必须留名字——静默跳过会让「装回去的序列数」看起来与
     /// 清单一致，而实际上少的那一条正是被删表的自增计数器。
     pub sequences_without_a_home: Vec<String>,
+    /// 装回去的正文段。空 = 包里这一段本来就没有（旧包），不是「装失败了」。
+    pub large_objects: Vec<LargeObjectReport>,
 }
 
 /// PG 恢复：整包表一次性 TRUNCATE ... RESTART IDENTITY CASCADE，
@@ -837,6 +906,9 @@ pub async fn restore_postgres(
 ) -> Result<RestoreReport, Box<dyn std::error::Error>> {
     let mut tables = Vec::new();
     let mut recomputed = Vec::new();
+    // 正文段先建回去：表行里存的就是这些 oid，先有字节再有引用，中途失败时不会
+    // 留下「行指着一段不存在的正文」的半成品。
+    let large_objects = restore_large_objects(pool, &pkg_pg_dir.join(LARGE_OBJECTS_DIR)).await?;
     for entry in std::fs::read_dir(pkg_pg_dir)? {
         let name = entry?.file_name().to_string_lossy().into_owned();
         if let Some(rest) = name.strip_prefix("public.") {
@@ -880,6 +952,9 @@ pub async fn restore_postgres(
             .await?;
         let mut load = tables.clone();
         let mut tx = pool.begin().await?;
+        // 同导出：`COPY … FROM STDIN` 在最后等服务端把这一张表收完，那一段我们这侧
+        // 没有一块数据可搬，只有对面那条后端仍然 active 这一条证据。
+        let _peer = backend_pid(&mut tx).await.map(|pid| watch_peer(pool, pid));
         if is_superuser {
             sqlx::query("SET LOCAL session_replication_role = 'replica'")
                 .execute(&mut *tx)
@@ -1028,7 +1103,70 @@ pub async fn restore_postgres(
         recomputed,
         tables_without_a_home,
         sequences_without_a_home,
+        large_objects,
     })
+}
+
+/// 把包里的正文段按原 oid 建回目标库。
+///
+/// 先丢后建：目标里若已经有同一个 oid，`lo_create(oid)` 会失败，而这一趟的语义
+/// 是「把目标做成包里那一刻的样子」——同名的那一段本来就该被包里那份取代。
+///
+/// 包里有 `pg/largeobjects/` 而这一段读不出来，就是错：正文不是可以悄悄少掉的
+/// 装饰，少了它的表行还指着那个 oid，读的人拿到的是「有引用、没有字节」。
+pub async fn restore_large_objects(
+    pool: &PgPool,
+    dir: &Path,
+) -> Result<Vec<LargeObjectReport>, Box<dyn std::error::Error>> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut oids: Vec<u32> = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        if let Some(oid) = name
+            .strip_suffix(".bin")
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            oids.push(oid);
+        }
+    }
+    oids.sort_unstable();
+    let mut out = Vec::with_capacity(oids.len());
+    for oid in oids {
+        let bytes = std::fs::read(dir.join(format!("{oid}.bin")))?;
+        let mut tx = pool.begin().await?;
+        sqlx::query("SELECT lo_unlink($1) FROM pg_largeobject_metadata WHERE oid = $1::oid")
+            .bind(oid as i64)
+            .execute(&mut *tx)
+            .await?;
+        let created: i64 = sqlx::query_scalar("SELECT lo_create($1::oid)::bigint")
+            .bind(oid as i64)
+            .fetch_one(&mut *tx)
+            .await?;
+        if created as u32 != oid {
+            return Err(
+                format!("asked for oid {oid} and got {created}: the rows point at {oid}").into(),
+            );
+        }
+        let mut offset = 0usize;
+        for chunk in bytes.chunks(BODY_EXPORT_CHUNK as usize) {
+            sqlx::query("SELECT lo_put($1::oid, $2::bigint, $3)")
+                .bind(oid as i64)
+                .bind(offset as i64)
+                .bind(chunk)
+                .execute(&mut *tx)
+                .await?;
+            offset += chunk.len();
+            cog_core::progress::beat(DATA_PROGRESS_TASK);
+        }
+        tx.commit().await?;
+        out.push(LargeObjectReport {
+            oid,
+            bytes: offset as u64,
+        });
+    }
+    Ok(out)
 }
 
 /// Secret 卷（只读挂载，key 一文件）打成 apply-able manifest。
@@ -1153,6 +1291,9 @@ pub fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<(u64, u64)> {
                 bytes += entry.metadata()?.len();
                 std::fs::copy(entry.path(), target)?;
                 files += 1;
+                // 一个文件是一段工作量。对象层与工作区可以有很多小文件，也可以有
+                // 几个很大的：两种都按「搬过一个」记拍，静默才只表示没人搬。
+                cog_core::progress::beat(DATA_PROGRESS_TASK);
             }
         }
     }
@@ -1194,22 +1335,34 @@ impl QdrantHttp {
         Ok(resp.json().await?)
     }
 
+    /// 列出要快照的集合。
+    ///
+    /// 两种「没读到」都不折成空表：答了 200 却没有 `result.collections`，是这份
+    /// 清单坏了，不是这个部署没有向量数据；一个没有 `name` 的条目也一样——丢掉
+    /// 它，包就会从它的实体层里少一整个集合，而清单上写着这份包覆盖了什么。
+    /// 空数组仍然是合法的：一个真的没有集合的部署，没有什么可快照的。
     async fn collection_names(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let body = self.get_json("/collections").await?;
-        let names = body["result"]["collections"]
+        let entries = body["result"]["collections"]
             .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|c| c["name"].as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .ok_or_else(|| format!("qdrant /collections has no result.collections: {body}"))?;
+        let mut names = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let name = entry["name"]
+                .as_str()
+                .ok_or_else(|| format!("qdrant /collections entry has no name: {entry}"))?;
+            names.push(name.to_string());
+        }
         Ok(names)
     }
 
     async fn points_count(&self, collection: &str) -> Result<u64, Box<dyn std::error::Error>> {
         let body = self.get_json(&format!("/collections/{collection}")).await?;
-        Ok(body["result"]["points_count"].as_u64().unwrap_or(0))
+        // 少了这一格是「没读到」，不是「0 个点」：把两者折在一起，清单就会替一个
+        // 数不出来的集合作证说它是空的。
+        body["result"]["points_count"].as_u64().ok_or_else(|| {
+            format!("qdrant collection {collection} info has no result.points_count: {body}").into()
+        })
     }
 
     /// 服务端一致性快照：创建（wait=true 阻塞到落盘）→ 下载 → 删服务端副本
@@ -1236,7 +1389,7 @@ impl QdrantHttp {
             .ok_or("qdrant snapshot response missing result.name")?
             .to_string();
 
-        let resp = self
+        let mut resp = self
             .client
             .get(format!(
                 "{}/collections/{collection}/snapshots/{snap_name}",
@@ -1247,8 +1400,19 @@ impl QdrantHttp {
         if !resp.status().is_success() {
             return Err(format!("qdrant download {snap_name} -> {}", resp.status()).into());
         }
-        let bytes = resp.bytes().await?;
-        std::fs::write(out_dir.join(format!("{collection}.snapshot")), &bytes)?;
+        // 一个集合的快照可以有几百 MB，整段读进 `bytes()` 是一次没有中间的等待：外面
+        // 看得见的就是「这一跑很久没动了」，而它其实一直在收字节。按块落盘、按块记拍，
+        // 下载多久只要还在进数据，就不是停住。
+        let path = out_dir.join(format!("{collection}.snapshot"));
+        let mut file = std::fs::File::create(&path)?;
+        {
+            use std::io::Write;
+            while let Some(chunk) = resp.chunk().await? {
+                file.write_all(&chunk)?;
+                cog_core::progress::beat(DATA_PROGRESS_TASK);
+            }
+            file.flush()?;
+        }
 
         let resp = self
             .client
@@ -1267,10 +1431,21 @@ impl QdrantHttp {
             );
         }
 
+        let points = match self.points_count(collection).await {
+            Ok(points) => Some(points),
+            Err(error) => {
+                tracing::warn!(
+                    collection,
+                    error = %error,
+                    "快照已经下下来了，但这个集合的点数没读到：清单里这一格记作「数不出来」，不记 0——0 读作「这个集合是空的」"
+                );
+                None
+            }
+        };
         Ok(CollectionReport {
             name: collection.to_string(),
             snapshot: snap_name,
-            points: self.points_count(collection).await.unwrap_or(0),
+            points,
         })
     }
 
@@ -1294,7 +1469,7 @@ impl QdrantHttp {
             .await?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = cog_core::logged_default!(resp.text().await);
             return Err(format!("qdrant upload {collection} -> {status}: {body}").into());
         }
         Ok(())
@@ -1306,21 +1481,31 @@ impl QdrantHttp {
 /// 单独一个函数是因为它有两个读者：保留策略要按它裁，账要按它报「留下了几个、
 /// 最老的那个是哪一刻」。两处各自 `read_dir` 一遍会走出两个目录快照，而它们
 /// 说的是同一件事。
-pub fn packages_in(dir: &Path) -> Vec<PathBuf> {
-    let mut packages: Vec<PathBuf> = match std::fs::read_dir(dir) {
-        Ok(entries) => entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with(PACKAGE_PREFIX) && n.ends_with(PACKAGE_SUFFIX))
-            })
-            .collect(),
-        Err(_) => return Vec::new(),
+///
+/// 列不出来就抛错，不折成空表：空表说的是「看过了，一个包都没有」，而它与
+/// 「这一趟没看过」在每一个读者那里都得出相反的结论——保留策略会把「数不出
+/// 存量」读成「没有存量」，账会把「没量到」写成「留了 0 个」，卷外补缺会把
+/// 每一份都当成缺的。目录不存在是另一件事：那是这个安装还没有这个落点，按
+/// 空表算。逐条读一半失败同样抛错，半张表比没有更坏——它看起来是完整的。
+pub fn packages_in(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
     };
+    let mut packages: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(PACKAGE_PREFIX) && n.ends_with(PACKAGE_SUFFIX))
+        {
+            packages.push(path);
+        }
+    }
     packages.sort();
-    packages
+    Ok(packages)
 }
 
 /// 一个装着凭证材料的目录，有多少条权限违例。
@@ -1332,8 +1517,8 @@ pub fn packages_in(dir: &Path) -> Vec<PathBuf> {
 /// 计数按条目数：目录本身不合记一条，每个不合的包文件各记一条。子目录不递归，
 /// 旧包里的 tar 条目不打开——这条读数量的是落盘的现场，不是包里的历史。
 ///
-/// 返回 `None` 是三件不同的事：目录不存在（这个安装没有这个落点）、不是目录、
-/// 或者列不出来。三种都不该印成 0——0 说的是「看了，干净」。
+/// 返回 `None` 是四件不同的事：目录不存在（这个安装没有这个落点）、不是目录、
+/// 列不出来、或者里面有一条读不出来。四种都不该印成 0——0 说的是「看了，干净」。
 fn credential_violations_in(dir: &Path) -> Option<i32> {
     let meta = match std::fs::symlink_metadata(dir) {
         Ok(meta) => meta,
@@ -1349,7 +1534,7 @@ fn credential_violations_in(dir: &Path) -> Option<i32> {
         return None;
     }
 
-    let mut violations = i32::from(meta.permissions().mode() & 0o777 != 0o700);
+    let base = i32::from(meta.permissions().mode() & 0o777 != 0o700);
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
@@ -1357,22 +1542,48 @@ fn credential_violations_in(dir: &Path) -> Option<i32> {
             return None;
         }
     };
-    for entry in entries.filter_map(|e| e.ok()) {
-        let name_is_package = entry
-            .file_name()
-            .to_str()
-            .is_some_and(|n| n.ends_with(PACKAGE_SUFFIX));
-        if !name_is_package {
-            continue;
+    match credential_violations_from(base, entries) {
+        Some(violations) => Some(violations),
+        None => {
+            tracing::warn!(path = %dir.display(), "凭证目录里有一条读不出来，这一类按没量过记");
+            None
         }
-        let Ok(file_meta) = entry.metadata() else {
-            continue;
-        };
-        if !file_meta.is_file() {
-            continue;
-        }
-        if file_meta.permissions().mode() & 0o777 != 0o600 {
-            violations += 1;
+    }
+}
+
+/// 一条条目的判词：`Ok(None)` 不是要看的包，`Ok(Some(true/false))` 是判过的包，
+/// `Err` 是这一条量不出来。
+fn package_violation(entry: std::io::Result<std::fs::DirEntry>) -> std::io::Result<Option<bool>> {
+    use std::os::unix::fs::PermissionsExt;
+    let entry = entry?;
+    let name_is_package = entry
+        .file_name()
+        .to_str()
+        .is_some_and(|n| n.ends_with(PACKAGE_SUFFIX));
+    if !name_is_package {
+        return Ok(None);
+    }
+    let file_meta = entry.metadata()?;
+    if !file_meta.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(file_meta.permissions().mode() & 0o777 != 0o600))
+}
+
+/// 计数本身：`None` 是「这一格没量全」。
+///
+/// 读不出来的一条与「目录列不出来」是同一类：跳过它，这一格就从「没量过」滑成
+/// 「看了，干净」——而这一格唯一要回答的正是「有没有别人读得到」。
+fn credential_violations_from(
+    base: i32,
+    entries: impl Iterator<Item = std::io::Result<std::fs::DirEntry>>,
+) -> Option<i32> {
+    let mut violations = base;
+    for entry in entries {
+        match package_violation(entry) {
+            Ok(Some(open)) => violations += i32::from(open),
+            Ok(None) => {}
+            Err(_) => return None,
         }
     }
     Some(violations)
@@ -1410,10 +1621,86 @@ pub fn package_instant(name: &str) -> Option<chrono::DateTime<Utc>> {
         .map(|naive| naive.and_utc())
 }
 
+/// 备份卷的容量字节数，或 `None` 当文件系统答不出来。
+///
+/// 容量而不是剩余：包是按定义要占满这块卷的东西，剩余空间里已经算进了「要删的
+/// 那些包」，拿它当预算会让保留数取决于上一次删到哪一步。
+#[cfg(unix)]
+fn volume_capacity_bytes(dir: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `path` 以 NUL 结尾并在调用期间一直有效，`stats` 是可写且由调用填满的结构。
+    let stats = unsafe {
+        let mut stats: libc::statvfs = std::mem::zeroed();
+        (libc::statvfs(path.as_ptr(), &mut stats) == 0).then_some(stats)
+    }?;
+    let unit = if stats.f_frsize > 0 {
+        stats.f_frsize
+    } else {
+        stats.f_bsize
+    } as u64;
+    Some((stats.f_blocks as u64).saturating_mul(unit))
+}
+
+#[cfg(not(unix))]
+fn volume_capacity_bytes(_dir: &Path) -> Option<u64> {
+    None
+}
+
+/// 保留几个包：卷容量除以实测包大小；量不到时部署声明顶着。
+///
+/// 实测的是卷上**现存**包的大小——本趟的包还没写出来，但它的量级由上一趟刚写的
+/// 那个给出，而保留裁的是同一批文件。一个包都还没有、或者卷答不出容量时，没有
+/// 可除的数，声明的数生效。
+pub fn keep_count_for_volume(capacity: Option<u64>, sizes: &[u64], seed: usize) -> usize {
+    match capacity {
+        Some(bytes) if !sizes.is_empty() => {
+            cog_core::retention::items_that_fit(bytes, sizes).max(1) as usize
+        }
+        _ => seed,
+    }
+}
+
+/// 本趟生效的保留数：从备份卷的容量和卷上现存包的大小现算。
+fn effective_keep_count(dir: &Path, seed: usize) -> usize {
+    let packages = match packages_in(dir) {
+        Ok(packages) => packages,
+        Err(e) => {
+            // 列不出来不是「一个包都没有」：这一趟按声明的数留，并在日志里点明
+            // 这个数是声明而不是量出来的。
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "备份卷列不出来，这一趟的保留数用声明值"
+            );
+            return seed;
+        }
+    };
+    let sizes: Vec<u64> = packages
+        .iter()
+        .filter_map(|path| std::fs::metadata(path).ok())
+        .map(|metadata| metadata.len())
+        .collect();
+    keep_count_for_volume(volume_capacity_bytes(dir), &sizes, seed)
+}
+
 /// 保留策略：包名时间戳字典序即新旧序，留最新 N 份。删除旧包失败只告警——
 /// 保留失败绝不能反过来弄丢新包。
 pub fn enforce_retention(dir: &Path, keep: usize) -> Vec<PathBuf> {
-    let mut packages = packages_in(dir);
+    let mut packages = match packages_in(dir) {
+        Ok(packages) => packages,
+        Err(e) => {
+            // 删除不可逆：列不出来就一份也不裁，把决定留给下一趟能看见卷的跑。
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "备份卷列不出来，这一趟不裁任何包"
+            );
+            return Vec::new();
+        }
+    };
     let mut deleted = Vec::new();
     while packages.len() > keep {
         let victim = packages.remove(0);
@@ -1453,7 +1740,9 @@ fn tar_package_with_key(
 ) -> std::io::Result<()> {
     let tmp = out.with_extension("tmp");
     {
-        let file = std::fs::File::create(&tmp)?;
+        // 打包是一段读整棵 staging、写整份包的长活：每写出一块记一拍，卡住与「包很大」
+        // 才分得开。
+        let file = BeatsOnIo::new(std::fs::File::create(&tmp)?);
         // 临时名也可能从上一趟没清掉的残留来，所以不放宽成「只在新建时设」。
         restrict_to_owner(&tmp, 0o600)?;
         match key {
@@ -1515,7 +1804,8 @@ fn untar_package_with_key(
     } else {
         Box::new(file)
     };
-    let decoder = zstd::Decoder::new(reader)?;
+    // 解包读的是整份包：每读一块记一拍，解一份大包与解不动在读数面上才分得开。
+    let decoder = zstd::Decoder::new(BeatsOnIo::new(reader))?;
     let mut archive = tar::Archive::new(decoder);
     std::fs::create_dir_all(dest)?;
     // 解出来的树里有 Secret 清单，包内的条目权限沿用了打包时的 0644；
@@ -1548,7 +1838,19 @@ struct LeftBehind {
 
 /// 这一次运行跑完之后，目录里还剩什么。两个数出自同一次枚举。
 fn retained_state(dir: &Path) -> (Option<i32>, Option<chrono::DateTime<Utc>>) {
-    let packages = packages_in(dir);
+    let packages = match packages_in(dir) {
+        Ok(packages) => packages,
+        Err(e) => {
+            // 两个数都记「没量到」。`Some(0)` 会被读成「这一趟跑完卷上一个包都不
+            // 剩」，而那是一次没有发生过的删除——账上的这种 0 不会自己消失。
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "备份目录列不出来，这一趟的留存数记作没量到"
+            );
+            return (None, None);
+        }
+    };
     let oldest = packages
         .first()
         .and_then(|p| p.file_name())
@@ -1652,8 +1954,150 @@ fn credential_surface_refusal(drill: Option<&cog_core::BackupDrillRecord>) -> Op
     ))
 }
 
+/// 把这一趟自己看得见的凭证面收紧到判据线上：目录恰为 0700，顶层 `*.tar.zst`
+/// 恰为 0600，收完再量一遍——判据按量到的数，不按「我试过了」。
+///
+/// 写者原来只会拒绝，而那条拒绝没有出路：上一次演练量到的开放权限里，只要是
+/// **旧包**上的那几条，写者这一侧永远不会把它们修掉——收紧只发生在新字节落盘的
+/// 那一刻，而旧包是更早的某一趟写出来的。于是每一晚的运行都读到同一行读数、拒绝、
+/// 不产包，卷上的包一晚上比一晚上旧（备份包过旧那条告警正是这么一直响着的），
+/// 而演练下一趟量到的还是那几份旧包，读数一个字节都不变。写者有手能改权限，却只
+/// 把它写进一句「请先用 0700 收紧」的判词里，等于把一个自己能闭上的环留给一个不在
+/// 环上的人。
+///
+/// `Err` 只说一件事：这个面收完之后**仍然**有别人读得到的条目，或者收不动。那时
+/// 才该拒绝——拒绝的依据是「这个面上还能不能被别人读到」。落点不存在（这个安装
+/// 没有这一处）与演练那一侧「没量过」同一个口径，不拿去拦住下一份包。
+fn tighten_credential_surface(cfg: &BackupConfig) -> Result<(), String> {
+    let mut surfaces: Vec<&Path> = vec![cfg.backup_dir.as_path()];
+    if let Some(dir) = &cfg.offsite_dir {
+        surfaces.push(dir.as_path());
+    }
+    let mut still_open: Vec<String> = Vec::new();
+    for dir in surfaces {
+        if let Err(e) = tighten_one_surface(dir) {
+            still_open.push(format!("{}：{e}", dir.display()));
+            continue;
+        }
+        match credential_violations_in(dir) {
+            Some(0) => {}
+            Some(count) => {
+                still_open.push(format!("{}：收紧之后仍量到 {count} 条", dir.display()));
+            }
+            None => {}
+        }
+    }
+    if still_open.is_empty() {
+        Ok(())
+    } else {
+        Err(still_open.join("；"))
+    }
+}
+
+/// 一处凭证面的收紧：目录 0700，顶层 `*.tar.zst` 0600。别的文件不动——判据不看
+/// 它们，动它们只是无端改动别人放在那里的东西。落点不在就什么都不做。
+fn tighten_one_surface(dir: &Path) -> std::io::Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    restrict_to_owner(dir, 0o700)?;
+    tighten_entries(std::fs::read_dir(dir)?)
+}
+
+/// 收紧列出来的条目；一条读不出来就整面报错。
+///
+/// 跳过它而答 `Ok`，这一趟就宣称收紧过一个其实没碰到的条目——下一趟演练再从 0
+/// 之外读到它时，没有人知道上一趟根本没看它。
+fn tighten_entries(
+    entries: impl Iterator<Item = std::io::Result<std::fs::DirEntry>>,
+) -> std::io::Result<()> {
+    for entry in entries {
+        let entry = entry?;
+        let is_package = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.ends_with(PACKAGE_SUFFIX));
+        if !is_package {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_file() {
+            restrict_to_owner(&path, 0o600)?;
+        }
+    }
+    Ok(())
+}
+
+/// 收掉被杀的上一趟留下的暂存目录，返回收掉几个。
+///
+/// 暂存目录与包同名，但没有 `.tar.zst` 后缀：`packages_in` 只认包，保留窗口也
+/// 只数包，于是这些目录在每一面的读数上都不存在，却在盘上一直占着整份明文。
+/// 判据是「比这一趟自己申报的期限还老」——被杀的那一趟正是过了自己的期限还没
+/// 收尾的那种；年轻于期限的可能是另一趟正在写，不动。
+fn sweep_abandoned_staging(dir: &Path, older_than_secs: u64) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now();
+    let mut swept = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(PACKAGE_PREFIX) {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let age = now.duration_since(modified).unwrap_or_default();
+        if age.as_secs() <= older_than_secs {
+            continue;
+        }
+        // keep: 收的是上一趟被杀留下的暂存目录（未改名的半成品）；包本体改名后才算数，删掉它不会丢已发布的包
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => swept += 1,
+            Err(e) => tracing::warn!(
+                dir = %path.display(),
+                error = %e,
+                "备份：上一趟被杀留下的暂存目录收不掉"
+            ),
+        }
+    }
+    swept
+}
+
 pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    // 开工先记一拍：容器外的存活探针从这一刻起就有东西可读，这一跑在导出、快照这些
+    // 不印日志的段里也一直「在动」。
+    cog_core::progress::beat(BACKUP_PROGRESS_TASK);
+    // 同演练：界是上一次运行量出来的，开工时采纳；量不到就是没有界，这一跑不判停。
+    load_measured_bound(&cfg.database_url, BACKUP_BOUND_CLASS)
+        .await
+        .adopt();
     std::fs::create_dir_all(&cfg.backup_dir)?;
+    // 被杀掉的那一趟不会自己收尾：它的暂存目录留在卷上，是打包之前的明文树，
+    // 里面还有 Secret 清单。2026-11-27 现场：11 个 abandoned 的暂存目录在备份卷上
+    // 躺了约 250 GB、把宿主盘推到 90%（这是那一台备份卷的实测，不是软件的容量界）。
+    // 判据是**这一趟自己申报的期限**：比它更老的
+    // 暂存目录，说明那一趟早已过了它自己的期限，不会再有进程在写它；比它年轻的
+    // 可能是另一趟正在跑，不动。
+    let swept = sweep_abandoned_staging(&cfg.backup_dir, cfg.run_deadline_seconds.max(0) as u64);
+    if swept > 0 {
+        tracing::warn!(
+            swept,
+            "备份：收掉了上一趟被杀后留下的暂存目录（它们不是包，保留窗口里看不见它们）"
+        );
+    }
+    // 保留数是一趟一算，不是一个部署一写：卷上现存的包和卷容量都是这一趟看得到
+    // 的现场。开工时算出的数同时写进账本那一行，于是「这一趟按几个包裁」在账上
+    // 和盘上是同一句话。
+    let keep_count = effective_keep_count(&cfg.backup_dir, cfg.keep_count);
     let now = Utc::now();
     let staging_name = package_name(now)
         .trim_end_matches(PACKAGE_SUFFIX)
@@ -1670,7 +2114,7 @@ pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::erro
             .open_run(&BackupRunOpening {
                 run_id: staging_name.clone(),
                 started_at: now,
-                keep_target: cfg.keep_count as i32,
+                keep_target: keep_count as i32,
                 run_deadline_seconds: cfg.run_deadline_seconds,
             })
             .await
@@ -1694,29 +2138,42 @@ pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::erro
             }
         };
         if let Some(reason) = refusal {
-            tracing::error!(run = %staging_name, reason = %reason, "备份被凭证面拦住");
-            let _ = std::fs::remove_dir_all(&staging);
-            record_run(
-                run_store.as_ref(),
-                &staging_name,
-                BackupRunClosing {
-                    outcome: BackupOutcome::Failed,
-                    finished_at: Utc::now(),
-                    package: None,
-                    bytes: None,
-                    package_checksum: None,
-                    package_coverage: None,
-                    kept_after: None,
-                    oldest_kept_at: None,
-                    error: Some(reason.clone()),
-                },
-            )
-            .await;
-            return Err(reason.into());
+            // 拒绝之前先自己动手：能改的权限这一趟就改掉，再按改完的现场问一次。
+            // 这一步是「备份包过旧」那条告警的出口，见 [`tighten_credential_surface`]：
+            // 上一次演练的读数说的是那一刻的现场，而这一趟已经把现场改了。
+            match tighten_credential_surface(cfg) {
+                Ok(()) => tracing::warn!(
+                    run = %staging_name,
+                    reason = %reason,
+                    "备份：凭证面由这一趟自己收紧到 0700/0600，照常出包"
+                ),
+                Err(detail) => {
+                    let reason = format!("{reason}；这一趟自己收紧之后仍然收不住：{detail}");
+                    tracing::error!(run = %staging_name, reason = %reason, "备份被凭证面拦住");
+                    cog_core::ignore_lost!(std::fs::remove_dir_all(&staging));
+                    record_run(
+                        run_store.as_ref(),
+                        &staging_name,
+                        BackupRunClosing {
+                            outcome: BackupOutcome::Failed,
+                            finished_at: Utc::now(),
+                            package: None,
+                            bytes: None,
+                            package_checksum: None,
+                            package_coverage: None,
+                            kept_after: None,
+                            oldest_kept_at: None,
+                            error: Some(reason.clone()),
+                        },
+                    )
+                    .await;
+                    return Err(reason.into());
+                }
+            }
         }
     }
 
-    match finish_backup(cfg, now, &staging, &staging_name).await {
+    let result = match finish_backup(cfg, keep_count, now, &staging, &staging_name).await {
         Ok(left) => {
             record_run(
                 run_store.as_ref(),
@@ -1761,7 +2218,11 @@ pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::erro
             .await;
             Err(e)
         }
-    }
+    };
+    // 这一跑量到的最长一次间隔留给下一趟。成功与失败都写：失败那一趟停下之前走过的
+    // 步骤，同样是这个作业类的真实快慢。
+    record_measured_bound(&cfg.database_url, BACKUP_BOUND_CLASS).await;
+    result
 }
 
 /// 把刚打好的包再复制一份到卷外，并按同样的份数裁掉旧的。
@@ -1798,7 +2259,7 @@ fn copy_offsite(dir: &Path, package: &Path, keep: usize) {
     match copied {
         Ok(()) => {}
         Err(e) => {
-            let _ = std::fs::remove_file(&partial);
+            cog_core::ignore_lost!(std::fs::remove_file(&partial));
             tracing::warn!(
                 package = %package.display(),
                 dir = %dir.display(),
@@ -1828,12 +2289,35 @@ fn copy_offsite(dir: &Path, package: &Path, keep: usize) {
 /// 返回值——`copy_offsite` 把失败写成日志而不改这一跑的结局，那份日志不该被这里
 /// 读成「补好了」。
 fn backfill_offsite(volume: &Path, dir: &Path, keep: usize) -> usize {
-    let present: std::collections::HashSet<std::ffi::OsString> = packages_in(dir)
-        .into_iter()
-        .filter_map(|p| p.file_name().map(|n| n.to_os_string()))
-        .collect();
+    // 两张表都要：卷上那份读不出来就没有源，卷外那份读不出来就分不清「缺的」
+    // 与「已经有了的」，两种都会让这一趟把整卷重抄一遍或一份都不补。
+    let volume_packages = match packages_in(volume) {
+        Ok(packages) => packages,
+        Err(e) => {
+            tracing::warn!(
+                dir = %volume.display(),
+                error = %e,
+                "备份卷列不出来，这一趟不补卷外副本"
+            );
+            return 0;
+        }
+    };
+    let present: std::collections::HashSet<std::ffi::OsString> = match packages_in(dir) {
+        Ok(packages) => packages
+            .into_iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_os_string()))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "卷外目录列不出来，这一趟不补卷外副本"
+            );
+            return 0;
+        }
+    };
     let mut copied = 0;
-    for package in packages_in(volume).into_iter().rev() {
+    for package in volume_packages.into_iter().rev() {
         let Some(name) = package.file_name().map(|n| n.to_os_string()) else {
             continue;
         };
@@ -1875,7 +2359,7 @@ fn publish_package(dir: &Path, package: &Path) -> Result<PathBuf, Box<dyn std::e
         std::fs::remove_file(&target)?;
     }
     let partial = dir.join(format!(".{}.partial", name.to_string_lossy()));
-    let _ = std::fs::remove_file(&partial);
+    cog_core::ignore_lost!(std::fs::remove_file(&partial));
     std::fs::copy(package, &partial)?;
     restrict_to_owner(&partial, 0o600)?;
     std::fs::rename(&partial, &target)?;
@@ -1890,6 +2374,7 @@ fn publish_package(dir: &Path, package: &Path) -> Result<PathBuf, Box<dyn std::e
 /// 真正跑一次备份并收尾：导出、写清单、打包、清 staging、裁保留。
 async fn finish_backup(
     cfg: &BackupConfig,
+    keep_count: usize,
     now: chrono::DateTime<Utc>,
     staging: &Path,
     staging_name: &str,
@@ -1899,18 +2384,21 @@ async fn finish_backup(
     let key = crate::backup_crypto::PackageKey::from_env();
     match run_backup_into(cfg, staging, key.is_some()).await {
         Ok(manifest) => {
+            cog_core::progress::beat(BACKUP_PROGRESS_TASK);
             // 覆盖清单在打包之前算：它说的是「这个包**该有**什么」，而清单是包内
             // 唯一那份声明。打包之后就算不出来了——staging 已经删掉。
             let coverage = package_coverage(&manifest);
             let manifest_json = serde_json::to_string_pretty(&manifest)?;
             std::fs::write(staging.join(MANIFEST_FILE), format!("{manifest_json}\n"))?;
             let package = cfg.backup_dir.join(package_name(now));
+            cog_core::progress::beat(BACKUP_PROGRESS_TASK);
             tar_package_with_key(staging, staging_name, &package, key.as_ref())?;
             std::fs::remove_dir_all(staging)?;
-            let deleted = enforce_retention(&cfg.backup_dir, cfg.keep_count);
+            cog_core::progress::beat(BACKUP_PROGRESS_TASK);
+            let deleted = enforce_retention(&cfg.backup_dir, keep_count);
             if let Some(dir) = &cfg.offsite_dir {
-                copy_offsite(dir, &package, cfg.keep_count);
-                let backfilled = backfill_offsite(&cfg.backup_dir, dir, cfg.keep_count);
+                copy_offsite(dir, &package, keep_count);
+                let backfilled = backfill_offsite(&cfg.backup_dir, dir, keep_count);
                 if backfilled > 0 {
                     tracing::info!(
                         dir = %dir.display(),
@@ -1925,7 +2413,7 @@ async fn finish_backup(
             let (kept_after, oldest_kept_at) = retained_state(&cfg.backup_dir);
             tracing::info!(
                 package = %package.display(),
-                kept = cfg.keep_count,
+                kept = keep_count,
                 pruned = deleted.len(),
                 "backup package complete"
             );
@@ -1955,7 +2443,7 @@ async fn finish_backup(
         }
         Err(e) => {
             // 半成品 staging 必须清掉：留在原地会被当成可恢复包误用。
-            let _ = std::fs::remove_dir_all(staging);
+            cog_core::ignore_lost!(std::fs::remove_dir_all(staging));
             Err(e)
         }
     }
@@ -1978,9 +2466,11 @@ async fn run_backup_into(
     // 数据是什么时候被取走的」，不是「这一跑什么时候开始」。
     let mut segments = Vec::new();
     let pool = PgPool::connect(&cfg.database_url).await?;
+    cog_core::progress::beat(BACKUP_PROGRESS_TASK);
     let postgres = backup_postgres(&pool, &staging.join(PACKAGE_PG_DIR)).await?;
     segments.push(segment_stamp("postgres"));
 
+    cog_core::progress::beat(BACKUP_PROGRESS_TASK);
     let qdrant = QdrantHttp::new(&cfg.qdrant_http_url)?;
     let qdrant_dir = staging.join(QDRANT_DIR);
     std::fs::create_dir_all(&qdrant_dir)?;
@@ -1989,6 +2479,7 @@ async fn run_backup_into(
         collections.push(qdrant.snapshot_collection(&name, &qdrant_dir).await?);
     }
     segments.push(segment_stamp("qdrant"));
+    cog_core::progress::beat(BACKUP_PROGRESS_TASK);
 
     // 对象层：备份进程只拿到 `data_dir`，读不到 `providers.storage.options.base_path`，
     // 所以按约定找 `<data_dir>/storage`。约定之外的部署——chart 默认的 seaweedfs 把对象
@@ -2001,8 +2492,10 @@ async fn run_backup_into(
         None => (0, 0),
     };
     segments.push(segment_stamp("objects"));
+    cog_core::progress::beat(BACKUP_PROGRESS_TASK);
     let artifacts = collect_artifacts(cfg, staging, Some(&pool)).await?;
     segments.push(segment_stamp("artifacts"));
+    cog_core::progress::beat(BACKUP_PROGRESS_TASK);
 
     // 进化 bare 仓：它不在数据根里，是独立的一卷，所以单独打成 git bundle。
     // 打包失败不让整次备份失败——没有 bundle 的包仍然救得回其余全部状态，而
@@ -2021,7 +2514,7 @@ async fn run_backup_into(
     if evolution_bundle.is_some() {
         segments.push(segment_stamp("git-bundle"));
     }
-    let bound = max_segment_skew();
+    let bound = segment_skew_bound(cfg.run_deadline_seconds);
     if let Ok((first, last, skew)) = segment_span(&segments) {
         if skew > bound as i64 {
             // 包照打：一份偏差超界的包仍然比没有包强（PG 那一段本身是自洽的），
@@ -2087,6 +2580,20 @@ const PACKAGE_PG_DIR: &str = "pg";
 
 /// PG 段里那串序列语句的文件名。写包的一侧拼它，核包与恢复的一侧再拼一遍。
 const SEQUENCES_FILE: &str = "sequences.sql";
+
+/// 包里正文段：一段一个文件，名字是它的 oid。
+///
+/// 表行只存 oid，字节在 `pg_largeobject` 里。只导表不导大对象，恢复之后每一段
+/// 正文都还是「有引用、没有字节」，而清单逐表逐行对得上——这是最坏的一种绿。
+const LARGE_OBJECTS_DIR: &str = "largeobjects";
+
+/// 读一段正文时一次取多少字节。
+///
+/// 一次数据库往返的载荷（`lo_get` 返回一个 `bytea`），与正文大小无关：正文多大
+/// 由上游说了算，这个数只决定进程内存跟着走多远。
+// cap: fixed — 一次 lo_get 往返的载荷（单值 bytea），与正文大小无关
+// keep: 删掉后回到「一次 lo_get 往返的载荷（单值 bytea），与正文大小无关」所描述的情形；由这条约定兜住
+const BODY_EXPORT_CHUNK: i32 = 1_048_576;
 
 /// 数据根下装对象的那一级。
 pub const OBJECTS_SUBDIR: &str = "storage";
@@ -2228,6 +2735,14 @@ pub const DATA_ROOT_SUBDIRS: &[DataRootSubdir] = &[
         what: "评测数据集（{data_dir}/eval/datasets）",
         why: "`deploy/scripts/fetch-benchmark-data.sh` 可从公开来源重取",
     },
+    DataRootSubdir {
+        name: "context-spill",
+        roots: &["main"],
+        class: SubdirClass::Discardable,
+        what: "地板压进窗口时被截掉的那段任务正文（内容寻址，一条正文一个文件）",
+        why: "原文就在任务行上，这里只是它的副本；换机后下一次同样的超界地板\
+              写回同一个路径（文件名是正文的哈希）",
+    },
 ];
 
 /// 按子目录名取判词。
@@ -2250,18 +2765,20 @@ fn current_schema_version() -> i64 {
     }
 }
 
-/// 跨段偏差的默认界：五分钟。超过它，包里几段就已经不是同一份数据了。可由
-/// `COGNEVA_BACKUP_MAX_SEGMENT_SKEW_SECONDS` 覆盖——大对象层在小机器上本来就慢，
-/// 把界写死会让那类环境每一晚都产出一个恢复端拒收的包。
-// cap: bound — 大对象层在小机器上本来就慢，写死会让那类环境每一晚都产出一个恢复端拒收的包，所以它可覆盖
-const DEFAULT_MAX_SEGMENT_SKEW_SECONDS: u64 = 300;
-
-fn max_segment_skew() -> u64 {
-    std::env::var("COGNEVA_BACKUP_MAX_SEGMENT_SKEW_SECONDS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(DEFAULT_MAX_SEGMENT_SKEW_SECONDS)
+/// 跨段偏差的界**就是这一趟运行自己的期限**，不是另一个人挑的数。
+///
+/// 段时刻是打包过程中逐段写下的，所以同一趟里首段与末段相距不可能超过这一趟跑了多久；
+/// 而这一趟的期限（`run_deadline_seconds`，随运行行落进账本）正是它被允许跑多久的声明。
+/// 于是界与期限是同一个数：换期限它跟着换，不需要一个「大对象层慢就调大」的旋钮——
+/// 机器慢到段间隔超过期限时，该调的是期限本身，界自动跟上。
+///
+/// 超过它的含义也因此是确定的：这个包不是一趟运行能产出的东西（至少有一段来自别的
+/// 一趟），或者那一趟跑过了它自己声明的期限。两种都不该被恢复端当成一份完整包。
+///
+/// 期限没有声明（<=0）时界也是 0：恢复端把「声明了分段却没有界」读作拒收，而不是
+/// 拿一个编出来的数替它下判。
+fn segment_skew_bound(run_deadline_seconds: i32) -> u64 {
+    run_deadline_seconds.max(0) as u64
 }
 
 fn segment_stamp(name: &str) -> SegmentStamp {
@@ -2459,7 +2976,7 @@ fn bundle_evolution(
     std::fs::create_dir_all(out_dir)?;
     let bundle = out_dir.join(EVOLUTION_BUNDLE_FILE);
     let partial = out_dir.join("evolution.bundle.partial");
-    let _ = std::fs::remove_file(&partial);
+    cog_core::ignore_lost!(std::fs::remove_file(&partial));
     let partial_s = partial
         .to_str()
         .ok_or("bundle 路径不是 UTF-8，git 命令行给不出来")?;
@@ -2480,7 +2997,7 @@ fn bundle_evolution(
         .count() as u64;
     let head = git_ok(dir, &["symbolic-ref", "-q", "HEAD"])
         .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     let commit = git_ok(dir, &["rev-parse", "HEAD"])?.trim().to_string();
     let bytes = std::fs::metadata(&bundle)?.len();
     tracing::info!(
@@ -3010,6 +3527,47 @@ fn verify_package_against_manifest(
                 manifest.postgres.sequences
             ));
         }
+        // 正文段：声明的 oid 集与包内文件集相等，每段字节数相等。只核表行的那一版
+        // 让一份「表全、正文全丢」的包读起来是完整的——行在，字节没了。
+        if !manifest.postgres.large_objects.is_empty() {
+            let lo_dir = pg_dir.join(LARGE_OBJECTS_DIR);
+            let mut found: BTreeMap<u32, u64> = BTreeMap::new();
+            if lo_dir.is_dir() {
+                for entry in std::fs::read_dir(&lo_dir)? {
+                    let entry = entry?;
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if let Some(oid) = name
+                        .strip_suffix(".bin")
+                        .and_then(|s| s.parse::<u32>().ok())
+                    {
+                        found.insert(oid, entry.metadata()?.len());
+                    }
+                }
+            }
+            for declared in &manifest.postgres.large_objects {
+                match found.get(&declared.oid) {
+                    None => problems.push(format!(
+                        "pg: declared body {} is not in the package",
+                        declared.oid
+                    )),
+                    Some(len) if *len != declared.bytes => problems.push(format!(
+                        "pg: body {} declared {} byte(s), package holds {len}",
+                        declared.oid, declared.bytes
+                    )),
+                    Some(_) => {}
+                }
+            }
+            for oid in found.keys() {
+                if !manifest
+                    .postgres
+                    .large_objects
+                    .iter()
+                    .any(|d| d.oid == *oid)
+                {
+                    problems.push(format!("pg: package body {oid} is not in the manifest"));
+                }
+            }
+        }
     }
 
     // qdrant：声明的集合集与包内 `qdrant/<集合>.snapshot` 集相等。快照的
@@ -3135,7 +3693,56 @@ fn restore_summary(manifest: &BackupManifest) -> String {
 ///
 /// 动手恢复之前先拿 manifest 逐段核包（`verify_package_against_manifest`）：
 /// 内容与清单对不上就退非零，绝不带着分歧走到 `TRUNCATE` 那一步。
-pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
+/// 包里会落到哪些表、这些表在这个库此刻各有多少行。
+async fn existing_rows_for_package(
+    pool: &PgPool,
+    pkg_pg_dir: &Path,
+) -> Result<Vec<(String, i64)>, Box<dyn std::error::Error>> {
+    let mut tables = Vec::new();
+    for entry in std::fs::read_dir(pkg_pg_dir)? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        if let Some(rest) = name.strip_prefix("public.") {
+            if let Some(table) = rest.strip_suffix(".csv") {
+                validate_table_name(table)?;
+                tables.push(table.to_string());
+            }
+        }
+    }
+    tables.sort_unstable();
+    let mut counts = Vec::new();
+    for table in tables {
+        let sql = format!("SELECT count(*)::bigint FROM \"{table}\"");
+        match sqlx::query_scalar::<_, i64>(&sql).fetch_one(pool).await {
+            Ok(rows) => counts.push((table, rows)),
+            // 表在这个库不存在：包里的行不会覆盖任何东西。
+            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("42P01") => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(counts)
+}
+
+/// 覆盖判据：非空且没有显式接受时，把将被覆盖的表与行数点名。
+fn overwrite_refusal(counts: &[(String, i64)], overwrite: bool) -> Option<String> {
+    if overwrite {
+        return None;
+    }
+    let filled: Vec<String> = counts
+        .iter()
+        .filter(|(_, rows)| *rows > 0)
+        .map(|(table, rows)| format!("{table} ({rows})"))
+        .collect();
+    if filled.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "restore would overwrite rows that are already in this database ({}). \
+         Nothing has been loaded. Pass --overwrite if replacing them is intended",
+        filled.join(", ")
+    ))
+}
+
+pub async fn run_restore(pkg: &Path, overwrite: bool) -> Result<(), Box<dyn std::error::Error>> {
     let database_url = std::env::var(cog_core::env::DATABASE_URL)
         .map_err(|_| "COGNEVA_DATABASE_URL is required for restore")?;
     let data_dir = PathBuf::from(cog_core::paths::data_dir());
@@ -3183,6 +3790,13 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let pg_dir = pkg_dir.join(PACKAGE_PG_DIR);
     if pg_dir.exists() {
         let pool = PgPool::connect(&database_url).await?;
+        // 动作之前先判一次会不会永久失去什么：恢复是往**这个库**里装，目标表里
+        // 已有的行会被覆盖。装了哪些、覆盖了多少，动手之前点名；没有显式接受就
+        // 停在这里——演练恢复进的是空库，因此照常通过。
+        let counts = existing_rows_for_package(&pool, &pg_dir).await?;
+        if let Some(refusal) = overwrite_refusal(&counts, overwrite) {
+            return Err(refusal.into());
+        }
         let report = restore_postgres(&pool, &pg_dir).await?;
         tracing::info!(
             tables = report.tables.len(),
@@ -3235,7 +3849,7 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
     seed_evolution_bundle(&pkg_dir, &manifest)?;
 
     if let Some((root, _)) = &extract_root {
-        let _ = std::fs::remove_dir_all(root);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(root));
     }
     tracing::info!("{}", restore_summary(&manifest));
     Ok(())
@@ -3279,7 +3893,30 @@ fn seed_evolution_bundle(
             .into());
         }
     };
-    seed_evolution_bundle_into(&bundle, report, &target)
+    seed_evolution_bundle_into(&bundle, report, &target).map(|_| ())
+}
+
+/// 种子那一步真正做了什么，而不是包里声明了什么。
+///
+/// 清单上的 `refs` 是出包那一刻 `bundle list-heads` 数出来的，里面既有
+/// `refs/heads/*`、`refs/tags/*`，也有远端跟踪 ref；种子只种前两类。两个数
+/// 并排才是这一段的读数：只报声明的那一个，「种回 N 个 ref」在一份只带了一个
+/// 远端跟踪 ref 的包上也是 N，而目标仓里一个 ref 都没有。
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SeededRefs {
+    created: usize,
+    fast_forward: usize,
+    same: usize,
+    diverged: usize,
+    /// 包里不属于权威面（既不是 heads 也不是 tags）的 ref：带了也不种。
+    outside: usize,
+}
+
+impl SeededRefs {
+    /// 现在目标仓里指着的、包里的那一份：新建、快进、本来就一样，都算。
+    fn seeded(&self) -> usize {
+        self.created + self.fast_forward + self.same
+    }
 }
 
 /// 种子本体，落点由调用方给出：恢复入口从 env 取，测试直接给临时目录。
@@ -3287,7 +3924,7 @@ fn seed_evolution_bundle_into(
     bundle: &Path,
     report: &EvolutionBundleReport,
     target: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<SeededRefs, Box<dyn std::error::Error>> {
     let meta = std::fs::metadata(bundle).map_err(|e| {
         format!(
             "包里有进化 bare 仓的 bundle 声明，但 {} 打不开：{e}",
@@ -3322,8 +3959,7 @@ fn seed_evolution_bundle_into(
             "+refs/tags/*:refs/restore/tags/*",
         ],
     )?;
-    let mut created = 0usize;
-    let mut fast_forward = 0usize;
+    let mut counts = SeededRefs::default();
     let mut diverged = Vec::new();
     let heads = git_ok(target, &["bundle", "list-heads", bundle_s])?;
     for line in heads.lines() {
@@ -3340,23 +3976,26 @@ fn seed_evolution_bundle_into(
         } else if let Some(name) = refname.strip_prefix("refs/tags/") {
             (format!("refs/restore/tags/{name}"), refname.to_string())
         } else {
-            // 远端跟踪之类不属于权威面的 ref：包里带了也不种。
+            // 远端跟踪之类不属于权威面的 ref：包里带了也不种，但要说出来——
+            // 声明数与种进去的数差的就是这几个。
+            counts.outside += 1;
             continue;
         };
         match merge_bundle_ref(target, &tmp, &target_ref)? {
-            BundleRefMerge::Created => created += 1,
-            BundleRefMerge::FastForwarded => fast_forward += 1,
-            BundleRefMerge::Same => {}
+            BundleRefMerge::Created => counts.created += 1,
+            BundleRefMerge::FastForwarded => counts.fast_forward += 1,
+            BundleRefMerge::Same => counts.same += 1,
             BundleRefMerge::Diverged => diverged.push(target_ref),
         }
     }
+    counts.diverged = diverged.len();
     // 临时命名空间不留在目标仓里：下一轮恢复再建一份，名字不会越攒越多。
     let leftovers = git_ok(
         target,
         &["for-each-ref", "--format=%(refname)", "refs/restore/"],
     )?;
     for refname in leftovers.lines().map(str::trim).filter(|s| !s.is_empty()) {
-        let _ = git_run(target, &["update-ref", "-d", refname]);
+        cog_core::ignore_lost!(git_run(target, &["update-ref", "-d", refname]));
     }
 
     // 空白卷上 `git init --bare` 的 HEAD 指向 master；包里是 main 时那个符号引用
@@ -3381,21 +4020,36 @@ fn seed_evolution_bundle_into(
     tracing::info!(
         target = %target.display(),
         bytes = report.bytes,
-        refs = report.refs,
-        created,
-        fast_forward,
-        diverged = diverged.len(),
+        refs_declared = report.refs,
+        refs_seeded = counts.seeded(),
+        created = counts.created,
+        fast_forward = counts.fast_forward,
+        same = counts.same,
+        diverged = counts.diverged,
+        outside = counts.outside,
         head = %report.head,
         commit = %report.commit,
         "进化 bare 仓已从包里的 git bundle 种回"
     );
+    // 包里声明了 ref、目标仓里一个都没种上，而分叉那条警告也不会亮（没有一条
+    // 走到分叉）：恢复收尾照常写「完成」，而进化仓是空的。这不是包的错（`bundle
+    // verify` 已经过了），是包里那几个 ref 全在权威面之外。
+    if report.refs > 0 && counts.seeded() == 0 && counts.diverged == 0 {
+        tracing::warn!(
+            refs_declared = report.refs,
+            outside = counts.outside,
+            head = %report.head,
+            "包里声明了 ref，但没有一个属于 refs/heads 或 refs/tags：进化 bare 仓是空的，\
+             恢复收尾不会把这件事当成失败"
+        );
+    }
     if !diverged.is_empty() {
         tracing::warn!(
             refs = %diverged.join(","),
             "这些 ref 在目标仓里已有不同的历史，没有强推覆盖：包里的那份仍在包内"
         );
     }
-    Ok(())
+    Ok(counts)
 }
 
 enum BundleRefMerge {
@@ -3673,7 +4327,7 @@ async fn restore_artifact_root(
     let scratch = target.join(format!(".restore-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&scratch)?;
     let outcome = stage_artifact_root(&base, root, target, &scratch, readings).await;
-    let _ = std::fs::remove_dir_all(&scratch);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&scratch));
     outcome
 }
 
@@ -3805,12 +4459,12 @@ fn replace_dir(staged: &Path, live: &Path) -> std::io::Result<()> {
     }
     if let Err(e) = std::fs::rename(staged, live) {
         if had_live {
-            let _ = std::fs::rename(&parked, live);
+            cog_core::ignore_lost!(std::fs::rename(&parked, live));
         }
         return Err(e);
     }
     if had_live {
-        let _ = std::fs::remove_dir_all(&parked);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&parked));
     }
     Ok(())
 }
@@ -3823,7 +4477,8 @@ fn replace_dir(staged: &Path, live: &Path) -> std::io::Result<()> {
 pub const DRILL_DATABASE: &str = "cog_drill";
 
 /// 演练互斥锁的键。取自 `cog_dril` 的 ASCII，只要求集群内不与人撞车，不承担含义。
-// cap: bound — 取自 cog_dril 的 ASCII，只要求集群内不与人撞车，不承担含义
+// cap: fixed — 取自 cog_dril 的 ASCII，只要求集群内不与人撞车，不承担含义
+// keep: 删掉后回到「取自 cog_dril 的 ASCII，只要求集群内不与人撞车，不承担含义」所描述的情形；由这条约定兜住
 const DRILL_LOCK_KEY: i64 = 0x636f_675f_6472_696c;
 
 /// 演练配置。只要库、卷与迁移目录。
@@ -3860,9 +4515,6 @@ pub struct DrillConfig {
     /// 只开最新那份证明不了保留窗口的其余成员：旧包与读端不同步的问题只在它们
     /// 身上出现，而它们要到真正需要恢复的那天才第一次被打开。
     pub also_unproven: bool,
-    /// 单趟预算：一份包从解包到对数完最多花多久。到点由这一跑自己收尾并落一行
-    /// `failed`，而不是等 Job 的界把进程杀掉——被杀掉的那一趟写不出任何东西。
-    pub pass_budget: Duration,
 }
 
 impl DrillConfig {
@@ -3887,27 +4539,8 @@ impl DrillConfig {
             migrations_dir: cog_storage::migrate::migrations_dir(&app_dir),
             package,
             also_unproven,
-            pass_budget: pass_budget_from_env(),
         })
     }
-}
-
-/// 单趟预算：`COGNEVA_BACKUP_DRILL_PASS_BUDGET_SECS`，没配或读不成数就用默认值。
-///
-/// 读不成数不报错：一个拼错的 env 让演练整场起不来，比让它按默认值跑一趟更坏——
-/// 起不来的那一晚，账上没有任何一行说为什么。
-fn pass_budget_from_env() -> Duration {
-    pass_budget_from(std::env::var(DRILL_PASS_BUDGET_ENV).ok().as_deref())
-}
-
-/// 解析那一格。`None`、空串、零、非数一律落到默认值：这四种写法在这里是同一件事
-/// （没给出可用的界），而它们各自的来历留给读 env 的人，不该让演练从此起不来。
-fn pass_budget_from(raw: Option<&str>) -> Duration {
-    let secs = raw
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|s| *s > 0)
-        .unwrap_or(DRILL_PASS_BUDGET_DEFAULT_SECS);
-    Duration::from_secs(secs)
 }
 
 /// `backup-drill` 自己在子命令之后认的那个操作数。
@@ -4214,6 +4847,9 @@ fn package_digest(path: &Path) -> std::io::Result<String> {
             break;
         }
         hasher.update(&buf[..n]);
+        // 算摘要要把整份包读一遍，几百 MB 的包读起来比一次导出还久。读一块记一拍：
+        // 这一路也是「在搬」，不是「一步开始了就等它结束」。
+        cog_core::progress::beat(DATA_PROGRESS_TASK);
     }
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
@@ -4227,7 +4863,8 @@ fn package_digest(path: &Path) -> std::io::Result<String> {
 ///
 /// 段名与清单里的段名一致（postgres／qdrant／objects／artifacts／secrets），空数组读作
 /// 「这一段一份都没有」，与「这一段没声明」分开：旧包的清单里本来就没有 artifacts 段，
-/// 而今天一段都没有是事实。
+/// 而今天一段都没有是事实。qdrant 那一格的点数同理分三态：一个数、`null`（数不出来）、
+/// 以及集合不在单子上——`null` 不许折成 0，0 读作「这个集合是空的」。
 fn package_coverage(manifest: &BackupManifest) -> String {
     serde_json::json!({
         "secrets": manifest.secrets_keys,
@@ -4281,7 +4918,7 @@ struct TempTree(PathBuf);
 
 impl Drop for TempTree {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&self.0));
     }
 }
 
@@ -4321,7 +4958,7 @@ fn with_database(url: &str, database: &str) -> String {
             let query = path_and_query
                 .split_once('?')
                 .map(|(_, q)| format!("?{q}"))
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             format!("{scheme}://{authority}/{database}{query}")
         }
         // 连接串里没有路径：数据库名取默认值，换名就是把路径补上。
@@ -4364,11 +5001,13 @@ impl ScratchBackend {
 /// 三分钟是按「大表自动清理不一定几秒就完」留的余量：一趟演练的预算是 3600 秒，
 /// 收尾与预清理各最多等这么久，加起来仍是一个零头，而「上一趟的库清不掉、这一趟
 /// 不开工」是整趟演练白跑。界是有的，不会无限等一个挂着不放的后台进程。
-// cap: bound — 没有一份「自动清理要走多久」的实测可依，所以取的是界不是量：36 × 5 ＝
+// cap: fixed — 没有一份「自动清理要走多久」的实测可依，所以取的是界不是量：36 × 5 ＝
+// keep: 删掉后自动清理的等待要么没有界、要么一有抖动就放弃；由「36 × 5 秒」兜住
 // 180 秒，远小于单趟预算 3600 秒，而它的代价只是一次多等几分钟，收益是一本会白跑的
 // 演练。
 const BACKGROUND_DRAIN_ATTEMPTS: u32 = 36;
-// cap: bound — 轮询间隔取 5 秒：自动清理收工的时刻不可预知，间隔只影响发现它走了的
+// cap: fixed — 轮询间隔取 5 秒：自动清理收工的时刻不可预知，间隔只影响发现它走了的
+// keep: 删掉后轮询密到白打盘，或稀到清理走了很久没发现；由「间隔只影响发现它走了的时刻」兜住
 // 延迟；再短只是多问服务端几次，再长则等待的尾巴变粗。
 const BACKGROUND_DRAIN_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -4467,7 +5106,7 @@ pub async fn drop_scratch_database(live: &PgPool, database: &str) -> Result<(), 
                 return Ok(());
             }
             Err(e) => {
-                let left = backends_on(live, database).await.unwrap_or_default();
+                let left = cog_core::logged_default!(backends_on(live, database).await);
                 if !can_still_drain(&left) || attempt >= BACKGROUND_DRAIN_ATTEMPTS {
                     return Err(format!(
                         "删不掉 {database}：{e}（{}）",
@@ -4602,6 +5241,312 @@ fn read_offsite_observation(dir: &Path) -> Option<OffsiteObservation> {
     }
 }
 
+/// 演练在进度面上的名字。容器里的看门狗与容器外的存活探针读的是同一串拍子，
+/// 两处的名字也必须是同一个：改一处而漏另一处，差别只是日志里少一个可对上的标识。
+const DRILL_PROGRESS_TASK: &str = "backup-drill";
+/// 备份那一跑在进度面上的名字。
+const BACKUP_PROGRESS_TASK: &str = "backup";
+
+/// 搬数据那几条路共用的名字：导出、灌回、打包、解包、算摘要。
+///
+/// 这些路一条都可能跑上几十分钟而不印一行日志——一次 COPY 就是一大段。只按「做完一步」
+/// 记拍，一段本该在动的活看起来与卡死一模一样，判停就只能按时间杀了。所以记拍的粒度
+/// 跟**工作量**走：搬过一块，就是一拍。
+const DATA_PROGRESS_TASK: &str = "backup-data";
+
+/// 对面还在干活的证据：库在这条事务上仍然在执行。
+///
+/// 有一整类「看起来什么也没动、其实正在干活」的时刻，本进程这一侧一个字节都读不到：
+/// 大表 COPY 之前服务端还要把查询跑完、一条几千万行的 COPY 在 `finish` 上等服务端
+/// 收尾。这些时刻 CPU 是平的、读到的字节是零，与卡死同形。唯一还看得见的证据在对面：
+/// `pg_stat_activity` 里那条后端仍然 active。它记的是 [`cog_core::progress::mark`]，
+/// 不进间隔水库——对面每秒报一次活会把水库填成一秒的间隔，把实测极值压低。
+const PEER_PROGRESS_TASK: &str = "backup-peer";
+
+/// 判这一步「还在不在动」的那几拍：步骤开工、搬过一块、对面还在执行。
+///
+/// 三选一即可：任何一条通道还在前进，这一步就没有静默。判据只有这一份，
+/// 看门狗、探针与账上的判词都读它。
+const WATCHED_TASKS: [&str; 3] = [DRILL_PROGRESS_TASK, DATA_PROGRESS_TASK, PEER_PROGRESS_TASK];
+
+/// 对面这条后台查询还活着的时长：自己消失了就退出，不额外留住一条连接。
+struct PeerWatch {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for PeerWatch {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// 盯着「这条后端还在不在执行」，在就记一拍。
+///
+/// 用池里另借一条连接去读 `pg_stat_activity`：正在 COPY 的那条连接上是发不出查询的，
+/// 而它什么时候在等、等多久，只有从旁边看才看得见。借不到连接就不记——一条读不到的
+/// 证据比一条编出来的证据好：编出来的会把卡死读成活。
+fn watch_peer(pool: &PgPool, pid: i32) -> PeerWatch {
+    let pool = pool.clone();
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(cog_core::progress::WATCH_TICK).await;
+            // 在等锁也算「还在执行」：等锁的后端是个活着的后端，它只是排在别人后面。
+            // 把它排除掉，一个排在长事务后面等了一刻钟的 COPY 就会在本进程这条通道上
+            // 读成静默——而它一动没动错，错的是我们只数了「在跑」没数「在等」。
+            let state: Result<Option<bool>, sqlx::Error> =
+                sqlx::query_scalar("SELECT state = 'active' FROM pg_stat_activity WHERE pid = $1")
+                    .bind(pid)
+                    .fetch_optional(&pool)
+                    .await;
+            match state {
+                Ok(Some(true)) => cog_core::progress::mark(PEER_PROGRESS_TASK),
+                // 这条后端已经不在、或者不在执行：没有证据，什么也不写。
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!(error = %e, "读不到对面的状态，这一趟只剩本进程的记拍");
+                    break;
+                }
+            }
+        }
+    });
+    PeerWatch { handle }
+}
+
+/// 这条连接的后端 pid。读不到时返回 `None`：那是「没装上这条证据」，不是「它没在干活」。
+async fn backend_pid(tx: &mut sqlx::PgConnection) -> Option<i32> {
+    sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await
+        .ok()
+}
+
+/// 搬多少字节记一拍。它只决定读数的分辨率，不参与任何判断——判据是「多久没有一拍」，
+/// 拍子越密，「静默」越接近「真的没在搬」。
+// cap: fixed — 记拍粒度钉在这里，不是界；界是那个实测静默窗口
+// keep: 删掉后记拍粒度跟着读缓冲走，进度条与实际静默窗口脱钩；由「记拍粒度钉在这里，不是界」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+const PROGRESS_BYTES_PER_BEAT: usize = 4 * 1024 * 1024;
+
+/// 每搬过 [`PROGRESS_BYTES_PER_BEAT`] 字节记一拍。
+///
+/// 包一层读写而不是在每个循环里各写一遍：导出、灌回、打包、解包、算摘要五条路读或写
+/// 的都是同一种流。任何一条忘了记拍，那一条就退回「按跑了多久判死」，而它在读数面上
+/// 与真的停住分不开——正是这种分不开让误杀无从发现。
+struct BeatsOnIo<T> {
+    inner: T,
+    moved: usize,
+}
+
+impl<T> BeatsOnIo<T> {
+    fn new(inner: T) -> Self {
+        Self { inner, moved: 0 }
+    }
+
+    fn note(&mut self, bytes: usize) {
+        self.moved = self.moved.saturating_add(bytes);
+        if self.moved >= PROGRESS_BYTES_PER_BEAT {
+            self.moved = 0;
+            cog_core::progress::beat(DATA_PROGRESS_TASK);
+        }
+    }
+}
+
+impl<T: std::io::Read> std::io::Read for BeatsOnIo<T> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.note(n);
+        Ok(n)
+    }
+}
+
+impl<T: std::io::Write> std::io::Write for BeatsOnIo<T> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.note(n);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// 演练里「还在动」的拍子。
+///
+/// 判据是**多久没有任何一处推进**，不是这一趟总共用了多久，也不只是这一步开头到现在的
+/// 距离：每一步开工记一次，搬数据的循环每搬过一块再记一次（[`DATA_PROGRESS_TASK`]）。
+/// 只要还有一块在进去，静默就从那一块算起——判的是动静，不是时长。
+///
+/// 它同时就是进度文件的那一拍：容器外的存活探针读的是同一串拍子，所以两处不会一个
+/// 说在动、一个说停了。
+struct PassWatch {
+    current: std::sync::Mutex<&'static str>,
+}
+
+impl PassWatch {
+    fn new(first: &'static str) -> Self {
+        Self {
+            current: std::sync::Mutex::new(first),
+        }
+    }
+
+    /// 记一步。名字是**静默时判词要点名的那一个**，所以它写的是这一步在干什么，
+    /// 不是承载它的函数名。
+    fn step(&self, name: &'static str) {
+        *self.current.lock().unwrap_or_else(|p| p.into_inner()) = name;
+        cog_core::progress::beat(DRILL_PROGRESS_TASK);
+    }
+
+    /// 等到这一步静默超过**这个作业类实测到的**极值，返回（哪一步，静默了多久，那道界）。
+    ///
+    /// 界不是这里给的，是 [`cog_core::declared_wall::wait_until_stalled`] 回答的：它取
+    /// 这一跑开工时采纳的上一次运行的极值，以及这一跑自己量到的样本。量不到时它就
+    /// 不返回 —— 也就是说，在有人量过之前，这一跑不判停。
+    ///
+    /// 静默从**最近的那一拍**算起，而拍子有好几条通道：搬数据的循环每搬过一块记一拍，
+    /// 对面还在执行也记一拍。少了这一层，一张表灌了四十分钟会被读成「这一步静默了
+    /// 四十分钟」——判据就成了「这一步走了多久」，正是要拆掉的那种墙。
+    async fn stalled(&self) -> (&'static str, Duration, Duration) {
+        let (silent, bound) = cog_core::declared_wall::wait_until_stalled(&WATCHED_TASKS).await;
+        let step = *self.current.lock().unwrap_or_else(|p| p.into_inner());
+        (step, silent, bound)
+    }
+}
+
+/// 这个作业类在 `progress_bounds` 里的名字。备份与演练各一行：两者的步骤快慢毫无关系，
+/// 共用一个界只会让慢的那个把快的拖进误杀。
+///
+/// 名字读的是进度面那一个，不是又写了一遍：这一行与 `cogneva_*_progress` 那几拍
+/// 记的是同一趟活，运维要把「界」与「拍子」按名字对上，两处漂开的那一刻这个 join
+/// 就断了，而断掉的样子与「这一跑没有界」同形。
+const DRILL_BOUND_CLASS: &str = DRILL_PROGRESS_TASK;
+
+/// 备份那一趟自己的界。与演练分开，理由同上；名字与进度面同源，理由同上。
+const BACKUP_BOUND_CLASS: &str = BACKUP_PROGRESS_TASK;
+
+/// 上一次运行量到的最长间隔，读不到的每一种情形都是
+/// [`cog_core::declared_wall::Bound::Unmeasured`]。
+///
+/// 读不到（表还没有、库暂时连不上）与「没有记录」在这里是同一件事：这一跑没有界，
+/// 不判停。两种情况都不该让一趟开工失败——界是读数，不是开工资格。
+async fn load_measured_bound(database_url: &str, class: &str) -> cog_core::declared_wall::Bound {
+    use cog_core::declared_wall::Bound;
+    use sqlx::Connection as _;
+    let Ok(mut conn) = sqlx::PgConnection::connect(database_url).await else {
+        return Bound::Unmeasured;
+    };
+    let secs: Option<f64> =
+        sqlx::query_scalar("SELECT longest_gap_seconds FROM progress_bounds WHERE job_class = $1")
+            .bind(class)
+            .fetch_optional(&mut conn)
+            .await
+            .ok()
+            .flatten();
+    Bound::from_stored(secs)
+}
+
+/// 把这一跑**自己量到**的最长一次间隔写回去，供下一趟在开工时采纳。
+///
+/// 写的是这一跑的读数，不取历史最大值：一个只会变宽的界和常量是同一种毛病——它不再
+/// 跟着实际发生的事情变。这一跑没量到就不写，让上一次的数留着：把 0 或极小值写回去
+/// 会让下一趟拿一个不存在的界去判停。
+async fn record_measured_bound(database_url: &str, class: &str) {
+    use cog_core::declared_wall::Bound;
+    let Bound::Measured(gap) = Bound::observed() else {
+        return;
+    };
+    use sqlx::Connection as _;
+    let Ok(mut conn) = sqlx::PgConnection::connect(database_url).await else {
+        return;
+    };
+    let samples = cog_core::progress::gap_sample_count() as i64;
+    if let Err(e) = sqlx::query(
+        "INSERT INTO progress_bounds (job_class, longest_gap_seconds, samples, observed_at) \
+         VALUES ($1, $2, $3, now()) \
+         ON CONFLICT (job_class) DO UPDATE SET \
+           longest_gap_seconds = EXCLUDED.longest_gap_seconds, \
+           samples = EXCLUDED.samples, \
+           observed_at = EXCLUDED.observed_at",
+    )
+    .bind(class)
+    .bind(gap.as_secs_f64())
+    .bind(samples)
+    .execute(&mut conn)
+    .await
+    {
+        tracing::warn!(class, error = %e, "实测界没能写回去：下一趟仍按上一次的数跑");
+    }
+}
+
+/// 这一趟演练**开过工**：在收尾之前先落一行。
+///
+/// 收尾那一行（`backup_drills`）是结论，写在最后。于是一个被容器外探针杀掉的进程
+/// 什么都不留，那一夜在账上与「根本没跑」同形——而它跑到了半路，可能已经建了一半
+/// 临时库。开工先写一行，收尾再把它合上，三种形状就分开了：有 `finished_at`（自己
+/// 走到了收尾）、有行没 `finished_at`（开过工，结局没被任何人看见）、没有行（没开过）。
+///
+/// 写不进去只是少一种读法，不是这一趟不能跑：它是证据，不是开工资格。
+async fn open_drill_attempt(
+    database_url: &str,
+    drill_id: &str,
+    started_at: chrono::DateTime<Utc>,
+    opening_bound: &str,
+) {
+    use sqlx::Connection as _;
+    let Ok(mut conn) = sqlx::PgConnection::connect(database_url).await else {
+        return;
+    };
+    // 先把上一趟没合上的合上：被杀掉的进程回不来写自己那一行，而一行永远开着就等于
+    // 说「它还在跑」。和 `backup_runs` 的 `abandon_overdue` 同一条道理，区别只是这里
+    // 由下一趟开工顺手扫——演练同时只许一场（会话咨询锁），所以开工那一刻之前还开着的
+    // 只可能是上一次没走完的那一场。
+    if let Err(e) = sqlx::query(
+        "UPDATE backup_drill_attempts SET finished_at = now(), ended_by = 'never_seen' \
+         WHERE ended_by IS NULL AND drill_id <> $1",
+    )
+    .bind(drill_id)
+    .execute(&mut conn)
+    .await
+    {
+        tracing::warn!(drill_id, error = %e, "上一次没走完的开工行没合上：账上会多一行「还在飞」");
+    }
+    if let Err(e) = sqlx::query(
+        "INSERT INTO backup_drill_attempts (drill_id, started_at, opening_silence_bound) \
+         VALUES ($1, $2, $3) ON CONFLICT (drill_id) DO NOTHING",
+    )
+    .bind(drill_id)
+    .bind(started_at)
+    .bind(opening_bound)
+    .execute(&mut conn)
+    .await
+    {
+        tracing::warn!(drill_id, error = %e, "开工那一行没落下来：这一趟若被杀掉，账上读得出「没跑」而读不出「跑到半路」");
+    }
+}
+
+/// 这一趟走到了收尾，把开工那一行合上。
+///
+/// 只有走到这里的那一趟才会合上它；被外部杀掉的那一趟永远停在这一步之前，于是
+/// 「开过工、结局没被看见」在账上是一个可查的形状，而不是一句推测。
+async fn close_drill_attempt(database_url: &str, drill_id: &str) {
+    use sqlx::Connection as _;
+    let Ok(mut conn) = sqlx::PgConnection::connect(database_url).await else {
+        return;
+    };
+    // 收尾的时刻取库里的 now()：与 `started_at` 同一个钟（那一格也是这么写的），
+    // 表上的 `finished_at >= started_at` 才不会因为两个钟的偏差把这一趟读成倒流。
+    if let Err(e) = sqlx::query(
+        "UPDATE backup_drill_attempts SET finished_at = now(), ended_by = 'itself' \
+         WHERE drill_id = $1 AND ended_by IS NULL",
+    )
+    .bind(drill_id)
+    .execute(&mut conn)
+    .await
+    {
+        tracing::warn!(drill_id, error = %e, "收尾没合上开工那一行：这一趟会被读成「结局没被看见」");
+    }
+}
+
 /// 演练：把一个包装进空库，读它装成了什么。
 ///
 /// 失败不返回 `Err` 而是落进 `error`：一次演练的失败是要**被记录下来**的结果，
@@ -4618,6 +5563,7 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
         package_bytes: None,
         restore_source: None,
         restore_target: None,
+        silence_bound: None,
         segment_skew_seconds: None,
         segment_skew_bound_seconds: None,
         packages_on_volume: 0,
@@ -4647,7 +5593,21 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
 
     // 先自己走一遍目录。这一对数不取自写者的 kept_after：演练存在的理由之一
     // 就是「写者说自己留了几个」需要一个不靠它的读者。
-    let packages = packages_in(&cfg.backup_dir);
+    //
+    // 列不出来是这一趟的失败，不是「卷上一个包都没有」：折成空表时，点名了
+    // `package` 的那一趟照样会打开那一份、带着 `volume_packages=0` 报成功。
+    let volume_listing = packages_in(&cfg.backup_dir);
+    let packages = match &volume_listing {
+        Ok(packages) => packages.clone(),
+        Err(e) => {
+            tracing::warn!(
+                dir = %cfg.backup_dir.display(),
+                error = %e,
+                "演练：备份卷列不出来，这一趟记作失败"
+            );
+            Vec::new()
+        }
+    };
     drill.packages_on_volume = packages.len() as i32;
     drill.oldest_package_at = packages
         .first()
@@ -4659,18 +5619,41 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
     // 读者自己看见它在。没有配置落点时这一列留空，「从来没有过一份」与「复制
     // 停了」于是由两条不同的读数分开说。
     if let Some(dir) = &cfg.offsite_dir {
-        drill.offsite_newest_at = packages_in(dir)
-            .last()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .and_then(package_instant);
+        drill.offsite_newest_at = match packages_in(dir) {
+            // 列不出来时这一格留空：它是「没量到」，与「卷外一份都没有」用同一种
+            // 缺席表示，规则读缺席，不会把一个没量到的 0 当成读数。
+            Err(e) => {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "演练：卷外目录列不出来，这一面记作没量到"
+                );
+                None
+            }
+            Ok(packages) => packages
+                .last()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .and_then(package_instant),
+        };
     }
 
     // 卷外覆盖了窗口的多少份：卷上每一份去卷外目录找同名的那一份，找不到的就是
     // 「只有这一份」。只比最新那份回答不了这件事——复制是后来才打开的时候，更早
     // 写出来的几份从来没被复制过，而最新那一列照样是绿的、照样是今晚的。
     if let Some(dir) = &cfg.offsite_dir {
-        drill.offsite_missing_packages = Some(missing_from_window(&packages, &packages_in(dir)));
+        drill.offsite_missing_packages = match packages_in(dir) {
+            // 卷外那张表读不出来时，缺口数不是 0 也不等于卷上的份数：它是没量到。
+            Err(e) => {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "演练：卷外目录列不出来，缺口数记作没量到"
+                );
+                None
+            }
+            Ok(offsite) => Some(missing_from_window(&packages, &offsite)),
+        };
     }
 
     // 仓库侧的两个时刻：宿主那一跑把 `restic snapshots` / `restic key list` 读到的
@@ -4695,40 +5678,80 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
         drill.credential_violations_state_dir = credential_violations_in(dir);
     }
 
-    // 一趟有界：到点就把这一趟收尾并落一行，而不是等 Job 的界把进程杀掉。后者
-    // 账上什么都不留——「被杀」于是读作「没跑过」，而 Job 面只看见一个 DeadlineExceeded，
-    // 说不出是哪一份包、走到哪一步、预算多少。
-    // 先落进一个变量再 match：`match timeout(...).await` 的临时量活到整个 match
-    // 结束，`drill` 的独占借用于是跟着活到每一个分支里。
-    let outcome =
-        tokio::time::timeout(cfg.pass_budget, drill_once(cfg, live, packages, &mut drill)).await;
-    match outcome {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => drill.error = Some(scrub_error(&e.to_string(), &cfg.database_url)),
-        Err(_) => {
-            mark_pass_timed_out(&mut drill, cfg.pass_budget);
-            // 临时库这一趟是收不了尾了。下一次开工本来也会先删它，但一份照着包大小
-            // 铺开的残库不该留到明晚：删不掉也只是警告，那本来就是下一趟的第一次开工。
-            if let Err(e) = drop_scratch_database(live, DRILL_DATABASE).await {
-                tracing::warn!(error = %e, "演练超时的临时库没删掉，下一次开工时会再删一次");
+    // 判的是**这一步静默了多久**，不是这一趟花了多久。到点由这一跑自己收尾并落
+    // 一行，判词点名停在哪一步；而不是等 kubelet 的探针把容器杀掉——那样账上什么都
+    // 不留，「被杀」于是读作「没跑过」，集群面只看见一个重启计数，说不出是哪一份包。
+    // 上一次运行量到的极值先装进来：这一跑从开工起就有一个别人量过的界，而不是等自己
+    // 攒够样本。量不到（这个作业类还从没成功跑完过）就是没有界，这一跑不判停。
+    load_measured_bound(&cfg.database_url, DRILL_BOUND_CLASS)
+        .await
+        .adopt();
+    // 开工这一行先落下去，带着**开工时**那个界。界在收尾时可能已经不同（这一跑自己
+    // 攒到了样本），两处都写、各写各的时刻，才读得出「这一趟是按什么开始、按什么结束」。
+    open_drill_attempt(
+        &cfg.database_url,
+        &drill.drill_id,
+        drill.started_at,
+        &cog_core::declared_wall::Bound::now().words(),
+    )
+    .await;
+    let watch = PassWatch::new("开工");
+    let outcome = match volume_listing {
+        Err(e) => Some(Err::<(), Box<dyn std::error::Error>>(
+            format!("卷上的包列不出来：{e}").into(),
+        )),
+        Ok(_) => tokio::select! {
+            done = drill_once(cfg, live, packages, &mut drill, &watch) => Some(done),
+            (step, silent, bound) = watch.stalled() => {
+                mark_pass_silent(&mut drill, step, silent, bound);
+                None
             }
+        },
+    };
+    if outcome.is_none() {
+        // 临时库这一趟是收不了尾了。下一次开工本来也会先删它，但一份照着包大小
+        // 铺开的残库不该留到明晚：删不掉也只是警告，那本来就是下一趟的第一次开工。
+        if let Err(e) = drop_scratch_database(live, DRILL_DATABASE).await {
+            tracing::warn!(error = %e, "演练停在一步上，临时库没删掉，下一次开工时会再删一次");
         }
     }
+    match outcome {
+        Some(Ok(())) => {}
+        Some(Err(e)) => drill.error = Some(scrub_error(&e.to_string(), &cfg.database_url)),
+        None => {}
+    }
     drill.finished_at = Utc::now();
+    // 这一趟是**按哪个界在跑**，与这一趟自己量到的最长间隔一起写进行上。判停的界只住在
+    // `progress_bounds` 的当前值里，下一趟收尾就把它覆盖；没有这一格，一趟跑成功的、
+    // 被外部杀掉的、从没跑过的演练，事后都说不出它当时有没有一个界、界是多少。
+    // 词与进度文件同一份（[`cog_core::declared_wall::Bound::words`]）：`unbounded` 是
+    // 「还没有人量过」，不是缺席。
+    drill.silence_bound = Some(cog_core::declared_wall::Bound::now().words());
+    // 这一跑量到的最长一次间隔留给下一趟当开工时的界。写在收尾之后：哪怕这一趟是
+    // 被自己的判据停下的，它停下之前走过的那些步骤仍然是这个作业类的真实快慢。
+    record_measured_bound(&cfg.database_url, DRILL_BOUND_CLASS).await;
+    // 走到这里说明这一趟看见了结尾。合上开工那一行之后，账上剩下的没合上的行就都是
+    // 「开过工、结局没被任何人看见」——被探针杀掉的那一趟正是其中之一。
+    close_drill_attempt(&cfg.database_url, &drill.drill_id).await;
     drill
 }
 
-/// 一趟超时之后写到那一行上的结论。
+/// 一步静默超过界之后写到那一行上的结论。
 ///
-/// 单独成函数是为了让它可测：这一行的判词决定读数面能不能把「被杀」与「没跑过」
+/// 单独成函数是为了让它可测：这一行的判词决定读数面能不能把「停在某一步」与「没跑过」
 /// 分开，而它不该靠一次真的挂住的演练来验证。`outcome` 由 `error.is_some()` 推出，
 /// 所以这里只写错误文本、并把已经量到的读数留在原处。
-fn mark_pass_timed_out(drill: &mut BackupDrillRecord, budget: Duration) {
+///
+/// 判词必须点名**哪一步**：整趟的钟到期时读的人只知道「花了很久」，而一步的钟到期
+/// 是一条可以直接去查的线索——卡在「恢复」与卡在「解包」是两件修法完全不同的事。
+fn mark_pass_silent(drill: &mut BackupDrillRecord, step: &str, silent: Duration, bound: Duration) {
     drill.error = Some(format!(
-        "这一趟 {} 秒（{DRILL_PASS_BUDGET_ENV}）没有跑完就收尾了。本行其余读数是走到那一步\
-         之前量到的：表数与行数为空 ＝ 还没走到对数那一段，不是零张表。界由这一跑自己拿着，\
-         因为 Job 的 activeDeadlineSeconds 到点是把进程杀掉——那样账上一行都不会有。",
-        budget.as_secs(),
+        "这一趟停在「{step}」上，那一步已经 {} 秒没有推进：没有一块数据在搬，对面也不在执行。\
+         判据取的是这个作业类实测到的最长一次间隔（{} 秒），不是部署里写死的钟。\
+         本行其余读数是走到那一步之前量到的：表数与行数为空 ＝ 还没走到对数那一段，不是零张表。\
+         整趟不受时长约束——它在每一步都推进的时候不会被收尾。",
+        silent.as_secs(),
+        bound.as_secs(),
     ));
 }
 
@@ -4824,7 +5847,11 @@ async fn drill_once(
     live: &PgPool,
     packages: Vec<PathBuf>,
     drill: &mut BackupDrillRecord,
+    watch: &PassWatch,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // 每一步开工先记一拍：静默界量的是「这一步多久没推进」，而判词要点名的是
+    // 这一步在干什么。名字写在这里，与 `PassWatch::step` 的文档是同一件事。
+    watch.step("核最新那份包");
     // 问的是卷上最新那份，不是这一趟打开的：轮换窗口里旧包本来就是明文，点名去开
     // 一份旧包不能替最新那份回答「写端到底用没用口令」。
     if let Some(newest) = packages.last() {
@@ -4846,6 +5873,7 @@ async fn drill_once(
             return Err(reason.into());
         }
     }
+    watch.step("选这一趟要开的包");
     let package = choose_package(&packages, cfg.package.as_deref())
         .map_err(|e| format!("{}：{e}", cfg.backup_dir.display()))?;
     // `outcome=ok` 只说明这一趟跑完了，「读到的是老包」也能 ok。没点名时的默认
@@ -4875,17 +5903,30 @@ async fn drill_once(
     // 比的是卷上最新那份，不是这一趟打开的那份：读这一列的是「卷外那份是不是最新」
     // 的规则，点名开一份旧包时拿旧包去比，会把一条本来绿的规则判红。
     if let Some(dir) = &cfg.offsite_dir {
-        drill.offsite_matches_newest = packages_in(dir)
-            .last()
-            .zip(packages.last())
-            .map(|(copy, volume)| same_file(copy, volume));
+        drill.offsite_matches_newest = match packages_in(dir) {
+            // 读不出来时这一格留空：「是不是同一份」没有量到，不写成「不是」。
+            Err(e) => {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "演练：卷外目录列不出来，这一面记作没量到"
+                );
+                None
+            }
+            Ok(offsite) => offsite
+                .last()
+                .zip(packages.last())
+                .map(|(copy, volume)| same_file(copy, volume)),
+        };
     }
 
     // 解包先做：包本身坏了要在这里停，不能等到把库删了再发现。
+    watch.step("解包");
     let extract_root = std::env::temp_dir().join(format!("cogneva-drill-{}", uuid::Uuid::new_v4()));
     let tree = TempTree(extract_root.clone());
     let pkg_dir = untar_package(&package, &extract_root)?;
 
+    watch.step("读清单");
     let manifest: BackupManifest =
         serde_json::from_str(&std::fs::read_to_string(pkg_dir.join(MANIFEST_FILE))?)?;
     tracing::info!(
@@ -4896,15 +5937,18 @@ async fn drill_once(
     );
     // 名字说这是哪一晚的包，内容也得这么说。这一条不读 outcome：它问的是「开的是
     // 不是这一份」，而一套把旧包改名当成新包的流程每一晚都会 ok。
+    watch.step("对账本：包名是不是那一跑的");
     if let Some(reason) = package_belongs_to_its_run(live, &name, &manifest.created_at).await? {
         return Err(reason.into());
     }
     // 名字对上了还不够：盘上这串字节也得还是写它那一跑交给卷的那一串。一条能解开的
     // 包也可能已经不是原件——坏块、截断补零、被同名文件覆盖，恢复时会以数据不对的形式
     // 暴露，而不是以「包坏了」的形式。
+    watch.step("核校验和");
     if let Some(reason) = package_checksum_mismatch(live, &name, &package).await? {
         return Err(reason.into());
     }
+    watch.step("按清单核产物");
     // 清单说这个包里有什么，此刻盘上是事实。这一段覆盖的是 qdrant 与对象层：
     // 它们不进空库，能核的就是「清单声明的字节与文件数是不是真的在包里」。
     verify_package_against_manifest(&pkg_dir, &manifest)?;
@@ -4917,6 +5961,8 @@ async fn drill_once(
     // 「离界还有多远」。旧包没有分段表，两列留空——没有声明就没有可比的数。
     if let Ok((_, _, skew)) = segment_span(&manifest.segments) {
         drill.segment_skew_seconds = Some(skew);
+        // db-column: backup_drills.segment_skew_bound_seconds — derived — backup.rs segment_skew_bound(run_deadline_seconds)：包里声明的跨段界＝这一趟的期限
+        // db-column: backup_drills.segment_skew_seconds — not-a-bound — 那一趟实测的跨段偏差
         drill.segment_skew_bound_seconds = Some(manifest.max_segment_skew_seconds as i64);
     }
     verify_artifact_stores(&pkg_dir, &manifest, drill).await;
@@ -4929,6 +5975,7 @@ async fn drill_once(
     // 清不掉上一趟的残库时，这一趟其实**连包都没打开**：报出来的话要说「开工
     // 没开始」，不能说成「这个包装不回去」。两件事的修法差得很远——一处是清理，
     // 一处是包——而一句「演练没有证明这个包可恢复」会把前者写成后者。
+    watch.step("建空库");
     drop_scratch_database(live, DRILL_DATABASE)
         .await
         .map_err(|e| format!("上一趟演练的临时库清不掉，这一趟没有开工：{e}"))?;
@@ -4943,7 +5990,10 @@ async fn drill_once(
     drill.restore_target = Some(endpoint_of(&scratch_url));
     tracing::info!(database = DRILL_DATABASE, "drill: scratch database created");
 
-    let result = restore_and_compare(cfg, live, &scratch_url, &pkg_dir, &manifest, drill).await;
+    watch.step("恢复并逐表对数");
+    let result =
+        restore_and_compare(cfg, live, &scratch_url, &pkg_dir, &manifest, drill, watch).await;
+    watch.step("删临时库");
     // 无论成败都把库删掉：留着它下一次会先删，但磁盘里那份 1 GB 的残库会一直在。
     if let Err(e) = drop_scratch_database(live, DRILL_DATABASE).await {
         tracing::warn!(error = %e, "drill: 临时库没删掉，下一次演练开工时会再删一次");
@@ -4963,6 +6013,9 @@ async fn verify_artifact_stores(
     drill: &mut BackupDrillRecord,
 ) {
     for root in &manifest.artifacts {
+        // 每一个产物根都是一个工作单元：逐个核对可以跑很久，但每过一个根就说明这一跑
+        // 还在往前走，不该被读成停住。
+        cog_core::progress::beat(DATA_PROGRESS_TASK);
         let base = pkg_dir.join(ARTIFACTS_DIR).join(&root.root);
         if root.policies_present {
             let store = cog_reflection::PolicyStore::new(cog_reflection::policies_path(&base));
@@ -5215,13 +6268,15 @@ async fn restore_and_compare(
     pkg_dir: &Path,
     manifest: &BackupManifest,
     drill: &mut BackupDrillRecord,
+    watch: &PassWatch,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 表结构必须由**这个镜像**的迁移建出来：恢复只做 TRUNCATE + COPY，目标是
     // 一个跑完迁移的空库。改用模板库复制会更快，但那要求源库上没有别的连接——
     // 而源库此刻正被整个平台用着。
-    // 四段的耗时各记一行：这个数随时间涨（库在长），而「一趟多少秒」是一个总数，
-    // 读的人分不出是迁移、建结构、灌数据还是逐表对数长出来的。界（单趟预算）到点
-    // 时日志里最后一行就是走到哪一段，比在账上写一句「超时了」多一个坐标。
+    // 四段各记一拍、各记一行耗时：这个数随时间涨（库在长），而「一趟多少秒」是
+    // 一个总数，读的人分不出是迁移、建结构、灌数据还是逐表对数长出来的。这一步
+    // 静默到界时，账上点名的是这四段里的哪一段，比一句「停了」多一个坐标。
+    watch.step("恢复：跑迁移");
     let phase = std::time::Instant::now();
     cog_storage::migrate::Migrator::new(&cfg.migrations_dir)
         .run(scratch_url)
@@ -5235,6 +6290,7 @@ async fn restore_and_compare(
     let migrations_done = phase.elapsed();
 
     let scratch = PgPool::connect(scratch_url).await?;
+    watch.step("恢复：建 store 表");
     // 迁移只建得出迁移文件里有的表；各 store 首次启动时自己建的那批表也要先建，
     // 否则下一段的 COPY 会在第一张缺失的表上失败——那是镜像建不出自己的结构，
     // 不是包不可恢复。
@@ -5250,6 +6306,7 @@ async fn restore_and_compare(
     if !pg_dir.exists() {
         return Err("包里没有 pg 段，这次演练无表可恢复".into());
     }
+    watch.step("恢复：灌数据");
     let restore_started = std::time::Instant::now();
     let restored = restore_postgres(&scratch, &pg_dir).await?;
     tracing::info!(
@@ -5281,6 +6338,7 @@ async fn restore_and_compare(
 
     // 逐表把「装回来几行」与清单声明比。比对的是**这个镜像的结构装得下的那批表**：
     // 被迁移删掉的表由上面的读数点名，它们的行数无从比，也不该被算成"没装上"。
+    watch.step("逐表对数");
     let compare_started = std::time::Instant::now();
     let without_a_home: std::collections::HashSet<&str> = restored
         .tables_without_a_home
@@ -5372,14 +6430,21 @@ async fn restore_and_compare(
 
 /// 落库前把错误文本洗干净：口令整段换掉，再交给公共脱敏。
 fn scrub_error(text: &str, database_url: &str) -> String {
-    let scrubbed = url_password(database_url)
-        .map(|secret| cog_core::redact_secrets(text).replace(&secret, "[redacted]"))
-        .unwrap_or_else(|| cog_core::redact_secrets(text));
-    scrubbed.chars().take(ERROR_TEXT_MAX_CHARS).collect()
+    // 只做一件事：把**我们自己的**数据库口令从错误文本里拿掉。那不是信息，是我们
+    // 的事故——错误文本里带出连接串口令，等于把凭证写进账。
+    //
+    // 除此之外原样保留：通用模式扫描（`redact_secrets`）会把看起来像密钥的普通内容
+    // 一起换掉，长度截断会把「后面还有一句话」变成「没有那句话」。错误文本是现场，
+    // 现场不许被改写。
+    match url_password(database_url) {
+        Some(secret) => text.replace(&secret, "[redacted]"),
+        None => text.to_string(),
+    }
 }
 
 /// `cogneva backup`：CronJob 与手动共用入口。
 pub async fn run_backup_from_env() -> Result<(), Box<dyn std::error::Error>> {
+    cog_core::progress::start_progress_file();
     let cfg = BackupConfig::from_env()?;
     let package = run_backup(&cfg).await?;
     println!("{}", package.display());
@@ -5392,6 +6457,9 @@ pub async fn run_backup_from_env() -> Result<(), Box<dyn std::error::Error>> {
 /// 用，但两者都要有——只落库不退出非零，集群面看不到这次失败；只退出非零不落库，
 /// 读数面看不到为什么。
 pub async fn run_drill_from_env() -> Result<(), Box<dyn std::error::Error>> {
+    // 开工就把进度文件建出来：容器外的存活探针在第一步完成之前读到的只能是「还没
+    // 开始」，而它没有别的办法把「还没开始」与「一直没开始」分开。
+    cog_core::progress::start_progress_file();
     let cfg = DrillConfig::from_env()?;
     let live = PgPool::connect(&cfg.database_url).await?;
     let store = PostgresBackupRunStore::new(live.clone());
@@ -5414,7 +6482,19 @@ pub async fn run_drill_from_env() -> Result<(), Box<dyn std::error::Error>> {
     // 旧包的失败会被随后一行的绿盖住，而读数读的正是最新那一行。
     let mut targets: Vec<Option<String>> = vec![cfg.package.clone()];
     if cfg.also_unproven {
-        let packages = packages_in(&cfg.backup_dir);
+        let packages = match packages_in(&cfg.backup_dir) {
+            Ok(packages) => packages,
+            Err(e) => {
+                // 没有第二趟的候选就不开第二趟：这一趟仍然跑最新那份，但日志要说
+                // 明第二趟是因为列不出来才没跑，而不是因为卷上没有别的包。
+                tracing::warn!(
+                    dir = %cfg.backup_dir.display(),
+                    error = %e,
+                    "演练：备份卷列不出来，这一趟不挑第二份包"
+                );
+                Vec::new()
+            }
+        };
         // 最新那份已经在第一趟里开过了，不参加第二趟的候选：否则「从没成功过」
         // 的排序会永远先把刚写出来的那份挑出来（它当然从没成功过），第二趟每次都
         // 空转，旧包一份也轮不到。
@@ -5456,10 +6536,11 @@ pub async fn run_drill_from_env() -> Result<(), Box<dyn std::error::Error>> {
 
 /// `cogneva restore <pkg>`：换机/重装的一次性恢复 Job 入口。
 pub async fn run_restore_from_env() -> Result<(), Box<dyn std::error::Error>> {
+    let overwrite = std::env::args().any(|arg| arg == "--overwrite");
     let pkg = std::env::args()
         .nth(2)
         .ok_or("usage: cogneva restore <package.tar.zst|dir>")?;
-    run_restore(Path::new(&pkg)).await
+    run_restore(Path::new(&pkg), overwrite).await
 }
 
 #[cfg(test)]
@@ -5483,6 +6564,20 @@ mod tests {
         );
         // 没有 scheme、没有库名：只剩地址的那一段原样交出去，不编一个库名。
         assert_eq!(endpoint_of("postgres:5432"), "postgres:5432");
+    }
+
+    /// 跨段偏差的界跟着这一趟运行自己的期限走：换期限它跟着换，没有第二个旋钮。
+    ///
+    /// 现场（2026-11-27）：一份合法的包各段相隔 2201 秒，被写死的 300 秒拒收。段间隔
+    /// 的长短是这一趟跑了多久的函数，所以界要挂在「这一趟允许跑多久」上，而不是一个人
+    /// 在小机器前面拍的数。
+    #[test]
+    fn the_segment_skew_bound_follows_the_run_deadline() {
+        assert_eq!(segment_skew_bound(3600), 3600);
+        assert_eq!(segment_skew_bound(1800), 1800);
+        // 没有声明期限：界也是 0，恢复端据此拒收，而不是拿一个编出来的数替它下判。
+        assert_eq!(segment_skew_bound(0), 0);
+        assert_eq!(segment_skew_bound(-5), 0);
     }
 
     /// 没有超级用户位时外键检查是开着的，装载顺序就是唯一能让它通过的东西。
@@ -5617,6 +6712,7 @@ mod tests {
             package_bytes: None,
             restore_source: Some("postgres:5432/cogneva".into()),
             restore_target: None,
+            silence_bound: None,
             segment_skew_seconds: None,
             segment_skew_bound_seconds: None,
             packages_on_volume: 7,
@@ -5643,23 +6739,181 @@ mod tests {
             artifact_errors: Vec::new(),
             error: None,
         };
-        mark_pass_timed_out(&mut drill, Duration::from_secs(3600));
-        let error = drill.error.as_ref().expect("超时的那一趟必须有错误文本");
-        // 判词要能回答「界是多少」，否则读的人只能去翻部署清单。
+        mark_pass_silent(
+            &mut drill,
+            "恢复：灌数据",
+            Duration::from_secs(5000),
+            Duration::from_secs(3600),
+        );
+        let error = drill
+            .error
+            .as_ref()
+            .expect("停在一步上的那趟必须有错误文本");
+        // 判词要能回答「哪一步、静默多久、界是多少」：整趟的钟到期时读的人只知道
+        // 「花了很久」，而这三个数是可以直接去查的线索。
+        assert!(
+            error.contains("恢复：灌数据"),
+            "错误文本没点名哪一步：{error}"
+        );
+        assert!(error.contains("5000"), "错误文本没写静默了多久：{error}");
         assert!(error.contains("3600"), "错误文本没写界：{error}");
         // 而且它必须让这一行读作 failed：面读数按 outcome 取行，不按过程猜。
-        assert!(!drill.ok(), "超时的行被判成了成功");
+        assert!(!drill.ok(), "停在一步上的行被判成了成功");
     }
 
-    /// 界读不成数时按默认值跑，而不是让整场演练起不来——起不来的那一晚，
-    /// 账上连一行说「为什么」的都没有。
+    /// 「一步之内也在搬」必须在判据里看得见：一张表灌上半小时，只要块还在进去，
+    /// 静默就从最后一块算起，而不是从这一步开工算起。看不见的话，判停就只剩
+    /// 「这一步走了多久」一条路——那就是按时间杀活，正是要拆掉的那种。
+    #[tokio::test]
+    async fn a_chunk_moving_inside_a_step_keeps_the_watch_from_reading_silence() {
+        let _serial = cog_core::progress::async_test_lock().await;
+        cog_core::progress::reset_for_tests();
+        // 这两条通道是这一格独有的，不用 `WATCHED_TASKS` 里那三个名字：那是
+        // **进程级**的名字，同一二进制里别的用例跑真的搬运循环时也往同名通道上
+        // 记拍。共用时「谁都没有推进」这个前提会被别人的一拍推翻，于是这条用例
+        // 在判据完全正确时红——红的读数是宿主上同时在跑的别的测试。
+        const STEP: &str = "backup-stall-probe-step";
+        const CHUNK: &str = "backup-stall-probe-chunk";
+        let channels = [STEP, CHUNK];
+        // 界摆在 200 毫秒：界只跟实测取大，别的用例量到的间隔可能把它抬宽，
+        // 所以下面等的是「判据成立」而不是一个写死的时长——等不到才是红。
+        cog_core::progress::adopt_longest_gap(Duration::from_millis(200));
+        cog_core::progress::beat(STEP);
+        let mut waited = Duration::ZERO;
+        let (silent, bound) = loop {
+            if let Some(verdict) = cog_core::declared_wall::stall_any(&channels) {
+                break verdict;
+            }
+            assert!(
+                waited < Duration::from_secs(20),
+                "没有任何一处推进时，界就该成立——不然下一句证明不了是那一拍把它救回来的"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            waited += Duration::from_millis(50);
+        };
+        assert!(
+            silent > bound,
+            "判停的条件是静默越过界：{silent:?} 对 {bound:?}"
+        );
+        cog_core::progress::beat(CHUNK);
+        assert!(
+            cog_core::declared_wall::stall_any(&channels).is_none(),
+            "刚搬过一块仍被读成静默：判据又回到了「这一步走了多久」"
+        );
+        cog_core::progress::reset_for_tests();
+    }
+
+    /// 这个作业类还没有一条实测界时，判据不成立：这一跑不会被一个没人量过的数收尾。
+    ///
+    /// 这正是 3600 被删掉之后要守的东西。若哪天有人为了让「看起来能判停」给它补一个
+    /// 默认值，这条会红——那时它已经不是一个读数，而是一个挑出来的钟。
     #[test]
-    fn a_budget_that_cannot_be_read_falls_back_instead_of_stopping_the_drill() {
-        let default = Duration::from_secs(DRILL_PASS_BUDGET_DEFAULT_SECS);
-        for raw in [None, Some(""), Some("  "), Some("0"), Some("ten")] {
-            assert_eq!(pass_budget_from(raw), default, "raw={raw:?}");
+    fn a_class_without_a_measured_bound_does_not_stop_a_pass() {
+        let _serial = cog_core::progress::test_lock();
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::beat(DRILL_PROGRESS_TASK);
+        std::thread::sleep(Duration::from_millis(20));
+
+        assert_eq!(
+            cog_core::declared_wall::Bound::now(),
+            cog_core::declared_wall::Bound::Unmeasured,
+            "没有样本也没有采纳值时，界必须是「量不到」"
+        );
+        assert!(
+            cog_core::declared_wall::stall_any(&WATCHED_TASKS).is_none(),
+            "没有实测界时判停不成立：拿一个挑出来的数杀掉还在干的活是这里最贵的错误"
+        );
+        cog_core::progress::reset_for_tests();
+    }
+
+    /// 等到判词真的出现为止。
+    ///
+    /// 界读的是**进程级**样本水库（[`cog_core::progress::longest_gap`]），而同一个测试
+    /// 二进制里别的用例正在真跑备份、真在打拍：它们留下的长间隔会把界抬到这几条用例
+    /// 等的那道界之上，于是「静默 30 毫秒」在一个忙碌的进程里时红时绿——2026-11-14
+    /// 全量跑 520 条时实测两跑一红（单独跑必绿）。静默每过一刻都在变长，界只可能被
+    /// 别人抬高，等下去必然收敛；十秒还不收敛，说明不是并发样本的问题，是判据没接上
+    /// 读数——两种原因在这里当场分开。
+    fn verdict_once_silence_exceeds(tasks: &[&str]) -> (Duration, Duration) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(verdict) = cog_core::declared_wall::stall_any(tasks) {
+                return verdict;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "十秒内没有出现判词：不是并发样本把界抬高（那样静默迟早越过它），\
+                 而是判据没有接上读数"
+            );
+            std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(pass_budget_from(Some(" 900 ")), Duration::from_secs(900));
+    }
+
+    /// 采纳一条实测界之后，同一组通道立刻可以判停——判据跟着读数走，不是反过来。
+    #[test]
+    fn an_adopted_bound_is_what_the_pass_is_judged_against() {
+        use cog_core::declared_wall::Bound;
+        let _serial = cog_core::progress::test_lock();
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::beat(DRILL_PROGRESS_TASK);
+        Bound::Measured(Duration::from_millis(5)).adopt();
+        // 采纳有没有接上读数，先在这一刻问一次：别处留下的样本只会让界变大，不会让
+        // 一条没装进去的界变出来。这一句就是「采纳生效」的判据，下面等的只是静默。
+        assert!(
+            Bound::now()
+                .value()
+                .is_some_and(|bound| bound >= Duration::from_millis(5)),
+            "采纳的界没有进判据：静默再久也不会改判"
+        );
+
+        let (silent, bound) = verdict_once_silence_exceeds(&WATCHED_TASKS);
+        assert!(
+            bound >= Duration::from_millis(5),
+            "判据用的界比采纳的那道还窄：采纳被一个更小的样本顶掉了"
+        );
+        assert!(silent > bound);
+        cog_core::progress::reset_for_tests();
+    }
+
+    /// 闭环的两个方向各走一趟：读不出来的那一格装不进判据，量到的极值装进去就能改判。
+    ///
+    /// 这条量的是「换输入 ⇒ 值跟着变」：同一个作业类，持久面写 0 秒与写 5 毫秒，判停的
+    /// 结论必须不同。两次一样，就说明读的那一步没接上，界仍是某处的常量。
+    #[test]
+    fn the_closed_loop_between_the_store_and_the_judgement_is_live() {
+        use cog_core::declared_wall::Bound;
+        let _serial = cog_core::progress::test_lock();
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::beat(DRILL_PROGRESS_TASK);
+        std::thread::sleep(Duration::from_millis(30));
+
+        // 持久面写了 0：读作「量不到」，装进判据后仍然不判停。
+        Bound::from_stored(Some(0.0)).adopt();
+        assert_eq!(Bound::now(), Bound::Unmeasured);
+        assert!(cog_core::declared_wall::stall_any(&WATCHED_TASKS).is_none());
+
+        // 持久面写的是一条实测：装进去，同一组通道立刻判停。采纳先在这一刻问一次
+        // （见上一条用例：样本只会把界抬高，不会让没装进去的界凭空出现），静默本身
+        // 则等它真的越过这道界——别处并发打拍抬高的界，等下去同样会被越过。
+        Bound::from_stored(Some(0.005)).adopt();
+        assert!(
+            Bound::now()
+                .value()
+                .is_some_and(|bound| bound >= Duration::from_millis(5)),
+            "持久面读回来的实测没有进判据"
+        );
+        let (silent, bound) = verdict_once_silence_exceeds(&WATCHED_TASKS);
+        assert!(silent > bound);
+
+        // 写回持久面的那个数是这一跑自己量到的，不是采纳进来的那个。这里比的是
+        // 「没有被采纳值顶替」，不是「一定量不到」：同一进程里别的用例也在打拍，
+        // 它们会留下自己的间隔样本，而这一条要证的是闭环的方向，不是样本的清零。
+        assert_ne!(
+            Bound::observed(),
+            Bound::Measured(Duration::from_millis(5)),
+            "the adopted window leaked into the reading written back"
+        );
+        cog_core::progress::reset_for_tests();
     }
 
     #[test]
@@ -5864,11 +7118,19 @@ mod tests {
             },
         ];
         manifest.postgres.sequences = 3;
-        manifest.qdrant = vec![CollectionReport {
-            name: "code".into(),
-            snapshot: "code.snapshot".into(),
-            points: 1024,
-        }];
+        manifest.qdrant = vec![
+            CollectionReport {
+                name: "code".into(),
+                snapshot: "code.snapshot".into(),
+                points: Some(1024),
+            },
+            // 数不出来的集合也在单子上，读作 `null`：与「空的」（0）分开。
+            CollectionReport {
+                name: "drafts".into(),
+                snapshot: "drafts.snapshot".into(),
+                points: None,
+            },
+        ];
         manifest.objects = ObjectsReport {
             files: 7,
             bytes: 2048,
@@ -5898,7 +7160,10 @@ mod tests {
             serde_json::json!([["public.backup_runs", 42], ["public.empty_table", 0]])
         );
         assert_eq!(value["postgres"]["sequences"], 3);
-        assert_eq!(value["qdrant"], serde_json::json!([["code", 1024]]));
+        assert_eq!(
+            value["qdrant"],
+            serde_json::json!([["code", 1024], ["drafts", null]])
+        );
         assert_eq!(
             value["objects"],
             serde_json::json!({"files": 7, "bytes": 2048})
@@ -6073,7 +7338,7 @@ mod tests {
         std::fs::write(off.join(older), vec![0u8; 10]).unwrap();
         assert!(!same_file(&vol.join(older), &off.join(name)));
 
-        std::fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     #[test]
@@ -6094,7 +7359,7 @@ mod tests {
         std::fs::write(off.join(newest), vec![0u8; 10]).unwrap();
 
         let count = |vol: &std::path::Path, off: &std::path::Path| {
-            missing_from_window(&packages_in(vol), &packages_in(off))
+            missing_from_window(&packages_in(vol).unwrap(), &packages_in(off).unwrap())
         };
         assert_eq!(count(&vol, &off), 2);
 
@@ -6110,7 +7375,7 @@ mod tests {
         std::fs::write(off.join("cogneva-backup-20261016T031700Z.tar.zst"), b"x").unwrap();
         assert_eq!(count(&vol, &off), 0);
 
-        std::fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 
     #[test]
@@ -6260,6 +7525,90 @@ mod tests {
         assert!(dir.path().join("notes.txt").exists(), "非包文件不许动");
     }
 
+    // proves: backup.keepCount
+    /// 保留数是卷容量与实测包大小的函数：卷更大或包更小就多留几个；量不到卷
+    /// 或一个包都还没有时，部署声明顶着。
+    #[test]
+    fn the_keep_count_follows_the_volume_and_the_measured_package_size() {
+        let gib = 1024u64 * 1024 * 1024;
+        let sizes = [200 * 1024u64 * 1024, 100 * 1024 * 1024];
+        assert_eq!(
+            keep_count_for_volume(Some(2 * gib), &sizes, 7),
+            2,
+            "two gibibytes hold the two measured packages and nothing more"
+        );
+        assert_eq!(
+            keep_count_for_volume(Some(4 * gib), &sizes, 7),
+            2,
+            "the newest always stays; a budget that fits both keeps both"
+        );
+        assert_eq!(
+            keep_count_for_volume(Some(400 * 1024 * 1024), &sizes, 7),
+            2,
+            "the newest is kept even when it alone is over the budget"
+        );
+        assert_eq!(
+            keep_count_for_volume(
+                Some(gib),
+                &[100 * 1024 * 1024, 100 * 1024 * 1024, 100 * 1024 * 1024],
+                7
+            ),
+            3,
+            "three measured packages in a gibibyte"
+        );
+        assert_eq!(
+            keep_count_for_volume(None, &sizes, 7),
+            7,
+            "no volume reading means the declaration stands"
+        );
+        assert_eq!(
+            keep_count_for_volume(Some(gib), &[], 7),
+            7,
+            "no package has been measured yet, so the seed stands"
+        );
+    }
+
+    /// 保留数不变的一跑仍然是一跑：每跑收尾都写下一个新的时刻，读侧发布的
+    /// `latest_finish_age_seconds` 因此每跑重置。它是这条回路的「最后一拍」。
+    ///
+    /// 只留 `keep_target` 的账面对「这一跑算过、算出同一个数」与「回路停了」
+    /// 发布同一个数；年龄是两者之间唯一的区别。
+    #[test]
+    fn the_keep_beat_is_the_newest_run_finishing_even_when_the_count_stands() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 13, 12, 0, 0).unwrap();
+        let account = |finished_at: DateTime<Utc>| cog_core::BackupAccountReading {
+            latest_finish_at: Some(finished_at),
+            newest_package: Some(cog_core::BackupPackageRecord {
+                run_id: format!("cogneva-backup-{}", finished_at.timestamp()),
+                finished_at,
+                package: None,
+                bytes: None,
+                package_checksum: None,
+                package_coverage: None,
+                keep_target: 7,
+                kept_after: Some(7),
+                oldest_kept_at: None,
+            }),
+            ..Default::default()
+        };
+        let yesterday = account(now - chrono::Duration::hours(24));
+        let just_now = account(now - chrono::Duration::minutes(5));
+        assert_eq!(
+            yesterday.newest_package.as_ref().map(|p| p.keep_target),
+            just_now.newest_package.as_ref().map(|p| p.keep_target),
+            "both runs derived the same count"
+        );
+        assert_eq!(
+            cog_orchestrator::backup_runs::latest_finish_age_seconds(&yesterday, now),
+            Some(86_400.0)
+        );
+        assert_eq!(
+            cog_orchestrator::backup_runs::latest_finish_age_seconds(&just_now, now),
+            Some(300.0),
+            "the last beat moved even though the count stood"
+        );
+    }
+
     #[test]
     fn secret_manifest_is_applyable_sorted_and_base64() {
         // 复刻 K8s Secret 卷的真实形态：每个 key 是指向 ..data/<key> 的符号
@@ -6339,6 +7688,7 @@ mod tests {
             package_bytes: Some(1),
             restore_source: Some("postgres:5432/cogneva".into()),
             restore_target: Some("postgres:5432/cogneva_drill".into()),
+            silence_bound: None,
             segment_skew_seconds: Some(1),
             segment_skew_bound_seconds: Some(300),
             packages_on_volume: 1,
@@ -6387,6 +7737,40 @@ mod tests {
         );
     }
 
+    /// 收紧之后判据要归零。拒绝原来是闭着的环：旧包上的那几条权限写者从来不修，
+    /// 于是每一晚都被同一行读数拦下、包越来越旧。这里钉住出口的那一半——同一趟
+    /// 运行把看得见的条目改回 0700/0600，下一趟演练量到的就是 0。
+    #[cfg(unix)]
+    #[test]
+    fn tightening_a_surface_leaves_nothing_open_for_the_next_drill_to_find() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("backups");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pkg = dir.join("cogneva-backup-20261018T031700Z.tar.zst");
+        std::fs::write(&pkg, b"x").unwrap();
+        std::fs::set_permissions(&pkg, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // 判据不看松散文件，收紧也就不该动它们。
+        let loose = dir.join("notes.txt");
+        std::fs::write(&loose, b"x").unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(credential_violations_in(&dir), Some(2));
+
+        tighten_one_surface(&dir).unwrap();
+
+        assert_eq!(
+            credential_violations_in(&dir),
+            Some(0),
+            "收紧之后这个面不该再有别人读得到的条目"
+        );
+        let loose_mode = std::fs::metadata(&loose).unwrap().permissions().mode() & 0o777;
+        assert_eq!(loose_mode, 0o644, "判据不看的文件不该被改动");
+
+        // 落点不存在不是错误：这个安装没有这一处。
+        tighten_one_surface(&root.path().join("absent")).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_credential_surface_counts_each_open_entry() {
@@ -6413,6 +7797,32 @@ mod tests {
 
         // 没有这个落点不是 0：那一格要说的是「有没有量」，不是「干净」。
         assert_eq!(credential_violations_in(&root.path().join("absent")), None);
+    }
+
+    /// 读不出来的一条不许被跳过：跳过就把这一格从「没量过」滑成 0「干净」。
+    ///
+    /// 判据：把 `credential_violations_from` 换回 `filter_map(|e| e.ok())`，这条会红
+    /// （读到的是 `Some(0)`）。
+    #[test]
+    fn an_entry_that_cannot_be_read_is_not_a_clean_credential_surface() {
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        assert_eq!(
+            credential_violations_from(0, vec![Err(denied)].into_iter()),
+            None,
+            "读不出来的一条要记成没量过，不是跳过之后印 0"
+        );
+    }
+
+    /// 收紧时读不出来的一条也不许被跳过：跳过等于宣称这一面收紧过。
+    ///
+    /// 判据：把 `tighten_entries` 换回 `filter_map(|e| e.ok())`，`is_err` 会红。
+    #[test]
+    fn tightening_cannot_report_success_over_an_entry_it_could_not_read() {
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        assert!(
+            tighten_entries(vec![Err(denied)].into_iter()).is_err(),
+            "读不出来的一条要让这一面报错，不是答 Ok"
+        );
     }
 
     #[test]
@@ -6677,14 +8087,14 @@ mod tests {
         // 卷外复制是第三天才有的事：前两份写下时它还不存在，所以一直缺着。
         std::fs::copy(vol.join(names[2]), off.join(names[2])).unwrap();
         assert_eq!(
-            missing_from_window(&packages_in(&vol), &packages_in(&off)),
+            missing_from_window(&packages_in(&vol).unwrap(), &packages_in(&off).unwrap()),
             2
         );
 
         assert_eq!(backfill_offsite(&vol, &off, 7), 2);
         // 判据就是演练那一列：补完必须回到 0，否则这条修法只是把同样的缺口留给下一晚。
         assert_eq!(
-            missing_from_window(&packages_in(&vol), &packages_in(&off)),
+            missing_from_window(&packages_in(&vol).unwrap(), &packages_in(&off).unwrap()),
             0,
             "补完之后 offsite_missing_packages 必须读作 0"
         );
@@ -6827,11 +8237,12 @@ mod tests {
                     rows: 2,
                 }],
                 sequences: 1,
+                large_objects: Vec::new(),
             },
             qdrant: vec![CollectionReport {
                 name: "c1".into(),
                 snapshot: "c1-123.snapshot".into(),
-                points: 7,
+                points: Some(7),
             }],
             objects: ObjectsReport { files: 1, bytes: 5 },
             artifacts: Vec::new(),
@@ -7040,10 +8451,60 @@ mod tests {
             b"new bytes"
         );
         assert_eq!(
-            packages_in(offsite.path()).len(),
+            packages_in(offsite.path()).unwrap().len(),
             2,
             "卷外也要按同一个份数裁，不然它只涨不落"
         );
+    }
+
+    /// 列不出来与「一个包都没有」必须是两种答案。
+    ///
+    /// 备份的每一个读者都从这张表往下算：保留策略数存量、账报「留了几个」、卷外
+    /// 补缺比窗口。折成空表时，一次读失败会让它们各自得出一个没有发生过的结论，
+    /// 而其中「留了 0 个」会随着账本落库活过写它的进程。
+    #[test]
+    fn a_directory_that_cannot_be_listed_is_an_error_not_an_empty_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        // 还没有这个落点：这是空表，不是错误。
+        assert!(packages_in(&dir.path().join("never-created"))
+            .unwrap()
+            .is_empty());
+
+        // 路径在那儿，但不是目录：读不出来。
+        let not_a_dir = dir.path().join("a-file");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        let error =
+            packages_in(&not_a_dir).expect_err("a path that is not a directory cannot be listed");
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+    }
+
+    /// 留存数读不出来时记「没量到」，不记 0。
+    ///
+    /// `Some(0)` 在账上读作「这一趟跑完卷上一个包都不剩」，与一次真实的清空同形。
+    #[test]
+    fn an_unlistable_directory_leaves_the_retained_count_unmeasured() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("a-file");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+
+        assert_eq!(
+            retained_state(&not_a_dir),
+            (None, None),
+            "列不出来不是留了 0 个"
+        );
+    }
+
+    /// 列不出来时一份也不删：保留策略的删除不可逆，看不见卷就不动手。
+    #[test]
+    fn an_unlistable_directory_deletes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("a-file");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+
+        assert!(enforce_retention(&not_a_dir, 0).is_empty());
+        assert!(not_a_dir.exists(), "看不见卷时什么都不该被删掉");
+        // 保留数退回声明值，而不是「0 份能装下」算出的 1。
+        assert_eq!(effective_keep_count(&not_a_dir, 7), 7);
     }
 
     #[test]
@@ -7054,7 +8515,7 @@ mod tests {
         let name = package_name(Utc.with_ymd_and_hms(2026, 10, 18, 3, 17, 0).unwrap());
         std::fs::write(dir.path().join(format!("{name}.partial")), b"half").unwrap();
 
-        assert!(packages_in(dir.path()).is_empty());
+        assert!(packages_in(dir.path()).unwrap().is_empty());
     }
 
     #[test]
@@ -7123,6 +8584,37 @@ mod tests {
     }
 
     /// 只填本节用得到的段：其余段空着，恢复产物层不看它们。
+    /// 被杀的那一趟留下的暂存目录要被下一趟收掉；比申报期限年轻的可能是另一趟
+    /// 正在写，不许动；包不是暂存。
+    ///
+    /// 没有这次改动这条会红：旧的 `run_backup` 只建自己的暂存目录，从不看卷上
+    /// 还有谁的——2026-11-27 现场 11 个这样的目录占了约 250 GB。
+    #[test]
+    fn an_abandoned_staging_tree_is_swept_and_a_live_one_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join(format!("{PACKAGE_PREFIX}20261107T031730Z"));
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::File::open(&stale)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7_200))
+            .unwrap();
+        let live = dir.path().join(format!("{PACKAGE_PREFIX}20261127T031730Z"));
+        std::fs::create_dir_all(&live).unwrap();
+        let package = dir
+            .path()
+            .join(format!("{PACKAGE_PREFIX}20261126T031710Z{PACKAGE_SUFFIX}"));
+        std::fs::write(&package, b"package").unwrap();
+
+        let swept = sweep_abandoned_staging(dir.path(), 3_600);
+        assert_eq!(swept, 1, "one abandoned tree, exactly");
+        assert!(!stale.exists(), "被杀的上一趟留下的暂存树要收掉");
+        assert!(
+            live.exists(),
+            "比申报期限年轻的暂存目录可能是另一趟正在写，不能动"
+        );
+        assert!(package.exists(), "包不是暂存目录");
+    }
+
     fn manifest_with(artifacts: Vec<ArtifactRootReport>) -> BackupManifest {
         BackupManifest {
             version: "0.1.0".into(),
@@ -7423,6 +8915,66 @@ mod tests {
         seed_evolution_bundle_into(&bundle, &report, target.path()).unwrap();
         assert_eq!(git(&["rev-parse", "refs/heads/main"]), head_commit);
         assert_eq!(git(&["symbolic-ref", "HEAD"]), "refs/heads/main");
+    }
+
+    /// 包里带着远端跟踪 ref 时，声明数与种进去的数不是一个数：日志里那个收货
+    /// 读数必须是后者，否则「种回 N 个 ref」在一份只带了一个远端跟踪 ref 的包上
+    /// 也是 N，而目标仓里一个 ref 都没有。
+    #[test]
+    fn a_bundle_with_a_remote_tracking_ref_says_what_it_seeded_not_what_was_declared() {
+        let src = tempfile::tempdir().unwrap();
+        let src_path = src.path();
+        let run = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(src_path, &["init", "-q"]);
+        run(src_path, &["config", "user.email", "t@example.com"]);
+        run(src_path, &["config", "user.name", "t"]);
+        run(src_path, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        std::fs::write(src_path.join("a"), b"a").unwrap();
+        run(src_path, &["add", "a"]);
+        run(src_path, &["commit", "-qm", "a", "--", "a"]);
+        let head_commit = run(src_path, &["rev-parse", "HEAD"]);
+
+        let bare = tempfile::tempdir().unwrap();
+        let clone = std::process::Command::new("git")
+            .args(["clone", "-q", "--bare"])
+            .arg(src_path)
+            .arg(bare.path())
+            .output()
+            .unwrap();
+        assert!(clone.status.success());
+        // `bundle create --all` 会把它一起打进去，而种子只种 heads/tags。
+        run(
+            bare.path(),
+            &["update-ref", "refs/remotes/origin/main", &head_commit],
+        );
+
+        let out = tempfile::tempdir().unwrap();
+        let report = bundle_evolution(Some(bare.path()), out.path())
+            .unwrap()
+            .expect("有提交的仓必须打得出 bundle");
+        assert_eq!(report.refs, 2, "main 与那个远端跟踪 ref 都在清单里");
+
+        let bundle = out.path().join("evolution.bundle");
+        let target = tempfile::tempdir().unwrap();
+        let counts = seed_evolution_bundle_into(&bundle, &report, target.path()).unwrap();
+        assert_eq!(counts.created, 1);
+        assert_eq!(counts.outside, 1, "远端跟踪 ref 带了也不种");
+        assert_eq!(counts.seeded(), 1, "种进去的是一个 ref，不是清单上的两个");
+        let refs = run(target.path(), &["for-each-ref", "--format=%(refname)"]);
+        assert_eq!(refs.lines().collect::<Vec<_>>(), vec!["refs/heads/main"]);
     }
 
     fn manifest_with_segments(segments: Vec<SegmentStamp>, bound: u64) -> BackupManifest {
@@ -8236,5 +9788,196 @@ mod tests {
             serde_json::json!([4, 3])
         );
         assert!(doc["groups"][0]["counts"].get("broken").is_none());
+    }
+
+    /// 只会说 Qdrant 快照接口那几句话的端点：建快照、下载、删快照，外加一个集合
+    /// 信息——最后这句的正文由用例给，要测的正是「数不出来」与「0 个点」分不分得开。
+    async fn serve_qdrant(info: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut chunk = [0u8; 512];
+                    loop {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&chunk[..n]),
+                        }
+                        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&head);
+                    let line = request.lines().next().unwrap_or(Default::default());
+                    let body = if line.starts_with("POST ") {
+                        r#"{"result":{"name":"c1.snap"}}"#
+                    } else if line.starts_with("GET ") && line.contains("/snapshots/") {
+                        "snapshot-bytes"
+                    } else if line.starts_with("DELETE ") {
+                        r#"{"result":true}"#
+                    } else {
+                        info
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    cog_core::ignore_lost!(socket.write_all(response.as_bytes()).await);
+                    cog_core::ignore_lost!(socket.shutdown().await);
+                });
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// 收一条 warn 的消息正文：这一格读不到时，屏幕上是哪句话。
+    #[derive(Clone, Default)]
+    struct WarnText(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    struct MessageField(String);
+
+    impl tracing::field::Visit for MessageField {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnText {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            let mut field = MessageField(String::new());
+            event.record(&mut field);
+            self.0.lock().unwrap().push(field.0);
+        }
+    }
+
+    /// 集合信息里没有 `points_count`：快照仍然是一份好快照（包不该为这一格丢掉），
+    /// 但清单里这一格必须记作「数不出来」，而且在屏幕上说得出是哪一件没读到。
+    ///
+    /// 没有这一条，`unwrap_or(0)` 会把「没读到」写成「这个集合是空的」——读这份包
+    /// 覆盖了什么的人，会以为向量层本来就没有数据。
+    #[test]
+    fn a_collection_whose_point_count_could_not_be_read_is_not_recorded_as_empty() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let warns = WarnText::default();
+        let captured = warns.clone();
+        let subscriber = tracing_subscriber::registry().with(warns);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let report = tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                let (base, server) = serve_qdrant(r#"{"result":{"status":"green"}}"#).await;
+                let dir = tempfile::tempdir().unwrap();
+                let qdrant = QdrantHttp::new(&base).unwrap();
+                let report = qdrant
+                    .snapshot_collection("c1", dir.path())
+                    .await
+                    .expect("快照本身是好的，数不出来只影响那一格");
+                assert!(
+                    dir.path().join("c1.snapshot").exists(),
+                    "快照已经下下来了，不该因为点数没读到就丢掉"
+                );
+                server.abort();
+                report
+            })
+        });
+        assert_eq!(report.points, None, "读不到的点数不许折成 0");
+        let said = captured.0.lock().unwrap().clone();
+        assert!(
+            said.iter().any(|m| m.contains("点数没读到")),
+            "数不出来这件事没有在日志里说出名字：{said:?}"
+        );
+    }
+
+    /// 反例：0 个点是量到的读数，不是「量不到」。一个永远记 `None` 的「修法」
+    /// 也必须在这里红，否则这条改动把一次真空集合读成了读不到。
+    #[tokio::test]
+    async fn an_empty_collection_is_still_counted_as_zero() {
+        let (base, server) = serve_qdrant(r#"{"result":{"points_count":0}}"#).await;
+        let dir = tempfile::tempdir().unwrap();
+        let qdrant = QdrantHttp::new(&base).unwrap();
+        let report = qdrant.snapshot_collection("c1", dir.path()).await.unwrap();
+        assert_eq!(report.points, Some(0));
+        server.abort();
+    }
+
+    /// 集合清单读不到：答了 200 却没有 `result.collections`，这一趟备份必须停下，
+    /// 而不是打出一个「qdrant 是空的」的包——清单会把这句话抄进这一跑的账里，读的人
+    /// 会以为这个部署没有向量数据，而真相是它一份都没备到。
+    ///
+    /// 没有这一条，`unwrap_or_default()` 会把「没问到」写成「一个集合都没有」。
+    #[tokio::test]
+    async fn a_collection_list_nobody_could_read_refuses_the_backup() {
+        let (base, server) = serve_qdrant(r#"{"result":{"status":"green"}}"#).await;
+        let qdrant = QdrantHttp::new(&base).unwrap();
+        let error = qdrant
+            .collection_names()
+            .await
+            .expect_err("没有 result.collections 不是「没有集合」");
+        assert!(error.to_string().contains("result.collections"), "{error}");
+        server.abort();
+    }
+
+    /// 条目没有名字：丢掉它，包里就少一整个集合，而清单还写着这份包覆盖了什么。
+    #[tokio::test]
+    async fn a_collection_entry_without_a_name_refuses_the_backup() {
+        let (base, server) =
+            serve_qdrant(r#"{"result":{"collections":[{"name":"kept"},{"id":7}]}}"#).await;
+        let qdrant = QdrantHttp::new(&base).unwrap();
+        let error = qdrant
+            .collection_names()
+            .await
+            .expect_err("没有名字的条目不是一个能快照的集合");
+        assert!(error.to_string().contains("has no name"), "{error}");
+        server.abort();
+    }
+
+    /// 反例：真的一个集合都没有时备份照常跑。一个永远报错的「修法」也必须在这里红，
+    /// 否则这条改动让任何部署都备不成份。
+    #[tokio::test]
+    async fn a_deployment_with_no_collections_still_backs_up() {
+        let (base, server) = serve_qdrant(r#"{"result":{"collections":[]}}"#).await;
+        let qdrant = QdrantHttp::new(&base).unwrap();
+        let names = qdrant.collection_names().await.unwrap();
+        assert!(names.is_empty(), "{names:?}");
+        server.abort();
+    }
+
+    /// 顺序按服务端给的来：清单里排出来的是同一份，读的人按它对账。
+    #[tokio::test]
+    async fn the_collection_list_keeps_the_servers_order() {
+        let (base, server) =
+            serve_qdrant(r#"{"result":{"collections":[{"name":"beta"},{"name":"alpha"}]}}"#).await;
+        let qdrant = QdrantHttp::new(&base).unwrap();
+        let names = qdrant.collection_names().await.unwrap();
+        assert_eq!(names, vec!["beta".to_string(), "alpha".to_string()]);
+        server.abort();
+    }
+    /// 空库的演练照常；非空且没有显式接受时点名将被覆盖的表与行数。
+    #[test]
+    fn a_restore_over_filled_tables_is_refused_until_accepted() {
+        let counts = vec![("alerts".to_string(), 3), ("nothing".to_string(), 0)];
+        let refusal = overwrite_refusal(&counts, false).expect("非空目标必须拒绝");
+        assert!(refusal.contains("alerts (3)"), "{refusal}");
+        assert!(!refusal.contains("nothing"), "空表不该被点名：{refusal}");
+        assert!(overwrite_refusal(&counts, true).is_none());
+        assert!(overwrite_refusal(&[("nothing".to_string(), 0)], false).is_none());
     }
 }

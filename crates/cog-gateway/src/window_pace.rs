@@ -590,6 +590,14 @@ impl PoolPace {
 
     /// The report, with the reserve that is shared across the whole pool (one
     /// job's cost does not depend on who serves it).
+    ///
+    /// A report, not a judgment. A pool sum cannot say which candidate ran out:
+    /// one member burnt out plus another never measured adds up to the same
+    /// positive allowance as two healthy members. The verdict is taken per
+    /// candidate, on that member's own `LlmWindowPace`; this exists for the 429
+    /// body and the ledger's scalar columns, and the population rides beside
+    /// the mean because the reserve is a sample mean — without `N` the reserve
+    /// does not recompute.
     pub fn finish(self, reserve_tokens: u64, reserve_population: u64) -> LlmWindowPace {
         let window = if self.mixed_windows {
             None

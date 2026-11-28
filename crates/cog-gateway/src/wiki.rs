@@ -62,12 +62,8 @@ pub struct CreateDocumentRequest {
 #[derive(Debug, Deserialize)]
 pub struct SearchRequest {
     pub query: String,
-    #[serde(default = "default_top_k")]
+    /// Required: how many results the caller wants is the caller's decision.
     pub top_k: usize,
-}
-
-fn default_top_k() -> usize {
-    10
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,7 +240,9 @@ pub async fn search_handler(
             .into_response();
     }
 
-    let top_k = req.top_k.clamp(1, 100);
+    // 与知识面同一个收口：两条检索路由问的是同一件事（一次 HTTP 请求最多
+    // 取回多少行），界因此也只有一份。
+    let top_k = crate::knowledge::clamp_top_k(req.top_k);
     match adapter.search(&req.query, top_k).await {
         Ok(mut results) => {
             if let Some(p) = prefix.as_ref() {

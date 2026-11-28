@@ -392,7 +392,7 @@ fn a_file_that_moved_is_the_shape_this_gate_exists_for() {
         std::process::id(),
         line!()
     ));
-    let _ = std::fs::remove_dir_all(&scratch);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&scratch));
 
     let write = |rel: &str, body: &str| {
         let path = scratch.join(rel);
@@ -447,7 +447,7 @@ fn a_file_that_moved_is_the_shape_this_gate_exists_for() {
         "只有位置对的那两份不该红：{found:?}"
     );
 
-    let _ = std::fs::remove_dir_all(&scratch);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&scratch));
 }
 
 /// 普查的根读不出来时必须炸。
@@ -461,7 +461,7 @@ fn a_census_root_that_cannot_be_read_is_refused() {
         std::process::id(),
         line!()
     ));
-    let _ = std::fs::remove_dir_all(&scratch);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&scratch));
     std::fs::create_dir_all(&scratch).expect("建目录");
     let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| candidate_files(&scratch)));
     assert!(

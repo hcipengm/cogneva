@@ -13,7 +13,6 @@
 //! [`AgentScaffold`]: crate::scaffold::AgentScaffold
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 
@@ -21,48 +20,41 @@ use crate::scaffold::FinishReason;
 
 /// 一支外部流派跑一次的上限。
 ///
-/// 三个值都由**组合根**给定（本 crate 只定义形状）：外部流派的循环不在我们手里，
-/// 步数管不到它，能管的只有时间与这台机器分给它的资源。
+/// 两项都由**组合根**给定（本 crate 只定义形状）：外部流派的循环不在我们手里，
+/// 步数管不到它，能管的只有这台机器分给它的资源。没有时间一项——时限不区分「慢」
+/// 与「停住」，一道难题跑得久不是它错了（见 `cog_core::progress`）。
 ///
 /// 上限是**四行三列、所有种子共用的一个值**，与 [`Budget`] 同理：一个流派给自己多要
-/// 一倍时间或一倍内存，它那一行就不再是同一张考卷下的读数。
+/// 一倍内存，它那一行就不再是同一张考卷下的读数。
 ///
 /// [`Budget`]: crate::scaffold::Budget
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ExecLimits {
-    /// 墙上时钟上限。到点即失败，不算「没做出来」——见 [`ExecSeam`] 那一节。
-    pub wall_clock: Duration,
     /// 容器能用的 CPU 核数。
     pub cpus: f32,
     /// 容器能用的内存字节数。
     pub memory_bytes: u64,
 }
 
-/// 一次外部流派评测的默认墙钟：10 分钟。
-///
-/// 取的是「一整支外部 agent 跑一道题」的量级：多步工具调用加一次模型往返，
-/// 十分钟够跑完一条正常轨迹，又短到卡住的循环不会占住评测机半天。
-// cap: bound — 一整支外部 agent 跑一道题的量级：多步工具调用加一次模型往返
-pub const DEFAULT_WALL_CLOCK: Duration = Duration::from_secs(600);
-
 /// 默认给外部流派几个核：2。
 ///
 /// 一行评测同时只跑一个流派，两核让它的编译/脚本步骤不至于排队，同时四行
 /// 并发仍落在评测机的余量里。
-// cap: bound — 一行评测同时只跑一个流派：两核够它不排队，四行同跑也不至于抢光
+// cap: fixed — 一行评测同时只跑一个流派：两核够它不排队，四行同跑也不至于抢光
+// keep: 删掉后评测容器没有 CPU 请求，调度器按 0 排，几行同跑会抢光节点；由「一行评测一核起」兜住
 pub const DEFAULT_CPUS: f32 = 2.0;
 
 /// 默认给外部流派多少内存：4 GiB。
 ///
 /// 装得下一次容器镜像解包加一个中型工具链；再多就是在替流派的选择买单，
 /// 而内存上限一旦按行不同，读数就不再同题可比。
-// cap: bound — 装得下一次镜像解包加一个中型工具链；再多是替流派的选择买单
+// cap: fixed — 装得下一次镜像解包加一个中型工具链；再多是替流派的选择买单
+// keep: 删掉后评测容器没有内存请求，镜像解包与工具链会把节点压到 OOM；由「一次镜像解包加中型工具链」兜住
 pub const DEFAULT_MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 impl Default for ExecLimits {
     fn default() -> Self {
         Self {
-            wall_clock: DEFAULT_WALL_CLOCK,
             cpus: DEFAULT_CPUS,
             memory_bytes: DEFAULT_MEMORY_BYTES,
         }

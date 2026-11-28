@@ -220,9 +220,7 @@ export function FlowView() {
                     <Meter percent={a.load_score == null ? null : a.load_score * 100} label={a.load_score == null ? '' : undefined} />
                   ) },
                   { key: 'beat', title: '最后心跳', width: '130px', render: (a) => <Moment iso={a.last_heartbeat} /> },
-                  { key: 'caps', title: '能力', render: (a) => (
-                    <span className="text-[11px] text-[var(--muted)]">{a.capabilities.join(' · ') || '—'}</span>
-                  ) },
+                  // 能力不列：它是数字员工这个类的属性，人人同一份，按人列一列不区分谁。
                 ]}
                 rows={overview.agents}
                 rowKey={(a) => a.agent_id}

@@ -1,158 +1,109 @@
-//! principle: feedback_a_bound_enforced_on_write_leaves_every_object_nobody_writes_anymore_over_it
 //! principle: feedback_a_bound_reading_is_not_the_population_it_governs
-//! Bounds the metrics sample log by how much it holds, not by how old it is.
+//! 指标样本日志的规模是一条**读数**，不是一个到点执行的删除循环。
 //!
-//! `cog_metrics_samples` is append-only — one row per observation — and for a
-//! long time the only thing keeping it from growing without bound was a
-//! retention window: delete every row older than N seconds. That answers the
-//! wrong question. Age is a property of the row, not of the log, and the two
-//! things anyone actually cares about are "how much is in here" and "is any of
-//! it still readable". A time window bounds neither: traffic can put an
-//! unbounded number of rows inside any window, and the window still deletes
-//! rows that are being read while keeping rows nobody ever asks for.
+//! `cog_metrics_samples` 是 append-only 的：一次观察一行。从前的做法是给它一个行数上限，
+//! 超了就从最老的开始删——这条路上每一格都试过了（租约选一个副本删、按填充速率自适应
+//! 调整扫的节拍、给每个 gauge 系列留最新一行当地板、删不动就说「触底」），而它们治的
+//! 是同一个病：**删除是一种判断，而这里没有人做那个判断**。
 //!
-//! So the knob is a capacity — a ceiling on rows held — and the sweep runs to
-//! hold the log under it. Nothing in the config answers "how long do we keep
-//! this"; an operator sets how big it may get.
+//! 三个问题在删除循环里都答不上来：
 //!
-//! Rows rather than bytes because rows are what the producer makes. The
-//! producer cannot choose how wide a row is, so a byte ceiling would be a
-//! ceiling it can only honour by writing fewer observations — which it cannot
-//! do without dropping facts. The footprint in bytes is measured and published
-//! alongside, so the disk cost is visible, but it is a reading, not the knob.
+//! 1. 删谁？按行龄删会删掉正在被读的，留着没人问的；按行数删要先知道谁在增长，而增长
+//!    本身就是读数。地板（每个 gauge 留最新一行）承认了这一点：它承认「删到什么程度会
+//!    让读数消失」，却只能为 gauge 补一格，counter/histogram 的当前值根本不在这张表里。
+//! 2. 谁删？多个副本共享一个库，谁都可能删，于是要有租约；租约要有属主、要有续期、
+//!    要有「持有者死了」的判定——一整套只为了让一件事成立：恰好一个人删。
+//! 3. 删得对不对？删掉的字节没有任何地方留痕：事后问「上个月的某个读数还在不在」，
+//!    答案只能是「按当时的界算应该不在了」，那是推断，不是读数。
 //!
-//! One row is exempt from eviction: the newest row of every gauge series. A
-//! gauge's value *is* its newest row — the scrape asks for the latest sample per
-//! label set — so a gauge series whose newest row went is a series that vanished
-//! from `/metrics`, which reads as "this never existed" rather than as "this was
-//! trimmed". That floor is what the capacity may never buy, and it is one row
-//! per series rather than everything at the newest instant: a row is exempt for
-//! being a series' newest, not for being as recent as its newest. If the floor
-//! alone holds more rows than the capacity allows, the sweep stops at the floor
-//! and says so: refusing to delete more is the correct outcome, and a silent
-//! refusal would look exactly like the capacity being met.
+//! 所以这一族改成**只测量、不删除**：每一拍把「现在有多少行、字节多少、声明的容量是多少、
+//! 超了没有」四个读数一起发出去。超了就是超了——让那个数在面板上红着，由人去决定是抬容量、
+//! 是给这个序列换一种记法、还是承认它就该长。这不是把问题往后推：读数带标签、带时间戳，
+//! 「超了多久、超了多少」是能被追着看的，而删除循环给出的只是「已经处理过了」。
 //!
-//! Counters and histograms are not floored, because the log is not where their
-//! value is. Their current value lives in their own accumulation tables, one row
-//! per label set, and the log holds the observations that fed it — history a
-//! reader may look back over, not a reading that has to be there. Flooring them
-//! would also make the capacity unbindable exactly where it matters most: a
-//! counter keyed on an object id mints a series per object and never repeats
-//! one, so the floor over those kinds grows without bound and the sweep would
-//! report itself over capacity on every pass while unable to reach it.
+//! 退役（[`crate::MetricsRetirement`]）仍然挂在这个循环的节拍上，但它不是容量那一半：
+//! 退役判的是「这个名字不再有生产者」，与日志有多满无关，所以它的形状是「按名字搬走」，
+//! 不是「按时间或行数删掉」。
 //!
-//! A name nothing writes any more needs no exemption here at all, and the
-//! release is not a variant of this sweep — a retired name's rows have to go
-//! whether or not the log is over budget, so it is its own pass (see
-//! [`crate::MetricsRetirement`]) driven from this loop for its cadence. What the
-//! sweep must not do is inherit the retirement's reach or the retirement the
-//! sweep's capacity gate.
+//! 容量本身仍是部署声明的一个数（chart 的 `sample_max_rows`），语义是「这个部署声明容忍
+//! 它长到多少」；`0` 表示这个部署不声明容量，读数里 `budget` 那一格就不发——不声明与
+//! 声明为 0 在读数上必须分得开。
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+
+use std::time::Duration;
 
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::warn;
 
-use cog_core::{MetricsBackend, SFError, SFResult, ShutdownSignal};
+use cog_core::{MetricsBackend, SFResult, ShutdownSignal};
 
 /// The append-only sample log written by [`crate::PostgresMetricsBackend`].
 pub const SAMPLES_TABLE: &str = "cog_metrics_samples";
 
-/// The role this loop takes a lease on, as a reader joins it to the work.
-pub const ROLE: &str = "metrics_sample_cap";
-
-/// The loop, as the liveness readings name it.
+/// The supervised loop this module registers under. Unchanged from the pruning
+/// era on purpose: it names the same loop in `loop_health`, and a rename would
+/// start a second series that says nothing about the first.
 pub const LOOP: &str = "storage_metrics_sample_cap";
 
-/// The label that names the deployment a reading below came from.
-///
-/// The sample log is shared and a series is its label set, so a reading
-/// published with an empty one belongs to every process at once: whichever
-/// deployment wrote last is what every scrape serves, and a deployment that
-/// deliberately publishes nothing still serves whoever did. That is the wrong
-/// shape for a reading that is a deployment's own claim — how large it allows
-/// this log to grow, and whether the pass *it* ran could free anything — and it
-/// is invisible for a reading about the log itself, which every writer would
-/// answer the same way.
-///
-/// The value has to be bounded: a deployment name, not a pod name. Every
-/// series' newest row is kept forever, so an identity that changes per rollout
-/// buys a permanent floor row per rollout — around seventy a day at this
-/// repository's landing rate, which is the unbounded floor the log's own design
-/// refuses to grow.
+/// The label naming which deployment declared the capacity it reports.
 pub const DEPLOYMENT_LABEL: &str = "deployment";
 
-/// The cadence this loop declares for itself: the longest it will wait between
-/// two passes.
+/// How often the log is measured.
 ///
-/// The wait it actually takes next is derived from how fast the log is filling
-/// and is never longer than this, so a declared period of this length is the
-/// one that makes "no pass for six of them" mean the loop stopped rather than
-/// that the log went quiet.
-pub const LOOP_PERIOD: Duration = MAX_SWEEP_PERIOD;
+/// 一分钟是五分钟这个**约定**的五分之一：Prometheus 的默认 lookback delta 是
+/// 五分钟，超过它这一条序列就从抓取面上消失——不是变成旧值，是不存在。所以一个
+/// 「现在有多大」的读数必须比那个窗口刷新得更勤，留出余量给一次迟到的抓取。这个数
+/// 不是谁挑的节拍，它就是那条约定除以一个整数；换算成界写在下面一行。
+// cap: fixed — Prometheus 的默认 lookback delta = 5 分钟，读数须在其内至少刷新一次；这里取 1/5
+// keep: 删掉后读数在 lookback 内不刷新，序列消失；由「lookback delta 的 1/5」兜住
+pub const LOOP_PERIOD: Duration = Duration::from_secs(60);
 
-/// Longest the sweeper will wait between passes.
-///
-/// Not a policy: the sweep also republishes the log's size, and Prometheus
-/// drops a series it has not seen for five minutes rather than holding the
-/// last value. A period at or beyond that would make the size reading
-/// disappear exactly when the log has gone quiet — the moment an operator is
-/// most likely to look. Half the staleness window leaves room for a scrape to
-/// land late.
-// cap: bound — 到五分钟这条序列就消失，正是日志安静下来、运维最可能去看的那一刻；留给一次迟到的抓取一半余量
-const MAX_SWEEP_PERIOD: Duration = Duration::from_secs(120);
-
-/// Shortest the sweeper will wait between passes. A guard against a control
-/// loop that never sleeps, not a cadence anyone is choosing.
-// cap: bound — 防的是一个从不睡眠的控制循环，不是谁在挑节拍
-const MIN_SWEEP_PERIOD: Duration = Duration::from_secs(1);
-
-/// What one pass did, so a caller can assert on it rather than infer it.
+/// 读一次日志得到的那几个数。**一个都不来自删除**。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SweepOutcome {
-    /// Rows held after the pass.
+pub struct SampleReading {
+    /// Rows the log holds.
     pub held: i64,
-    /// Rows deleted by the pass.
-    pub removed: u64,
-    /// The capacity the pass was aiming at; `None` when pruning is off.
+    /// The capacity this deployment declares, or `None` when it declares none.
+    ///
+    /// `None` and `Some(0)` are different statements and the readings keep them
+    /// apart: nobody declared a capacity here, versus somebody declared zero.
     pub budget: Option<i64>,
-    /// Set when the newest-per-series floor stopped the pass short of the
-    /// capacity. The log is over budget and no amount of further sweeping will
-    /// fix it.
-    pub floor_held: bool,
+    /// Bytes the table occupies, when the size could be read.
+    pub bytes: Option<i64>,
+    /// `held > budget`, decided only when there is a budget to compare to.
+    ///
+    /// Published rather than left to the reader: the two numbers it is made of
+    /// are published beside it, and a reader that has to compute it can get the
+    /// comparison backwards without anything noticing.
+    pub over_capacity: bool,
 }
 
-/// Holds the metrics sample log under a row capacity.
-pub struct SampleLogCap {
+impl SampleReading {
+    /// The same reading with what the table costs on disk attached.
+    fn with_bytes(mut self, bytes: Option<i64>) -> Self {
+        self.bytes = bytes;
+        self
+    }
+}
+
+/// Measures the metrics sample log. Removes nothing from it.
+pub struct MetricsSampleLog {
     pool: PgPool,
     table: String,
+    /// The declared capacity; `0` means this deployment declares none.
     budget: i64,
     metrics: Option<Arc<dyn MetricsBackend>>,
     retirement: Option<Arc<crate::metrics_retirement::RetirementPass>>,
-    /// The arbiter over which replica prunes, when the deployment has one.
-    role: Option<Arc<dyn cog_core::OwnerLeaseBroker>>,
     /// The deployment this process is, for the readings below. `None` publishes
     /// them unlabelled, which is what a process whose platform never told it
     /// which deployment it belongs to can honestly do.
     deployment: Option<String>,
 }
 
-/// What the previous pass saw and when it ran. The next period is derived from
-/// this so it is a function of how fast the log is actually filling rather
-/// than of a number someone picked.
-#[derive(Debug, Clone, Copy)]
-struct PreviousPass {
-    at: Instant,
-    held: i64,
-}
-
-impl SampleLogCap {
-    /// `budget` is the row ceiling; 0 turns pruning off, which is also how a
-    /// deployment opts out — only the deployment that means to hold the log
-    /// down should be the one doing it, and every deployment sharing the
-    /// database would otherwise sweep the same rows.
+impl MetricsSampleLog {
+    /// `budget` is the row capacity this deployment declares; `0` declares none.
     pub fn new(pool: PgPool, budget: u64) -> Self {
         Self {
             pool,
@@ -160,7 +111,6 @@ impl SampleLogCap {
             budget: budget as i64,
             metrics: None,
             retirement: None,
-            role: None,
             deployment: None,
         }
     }
@@ -168,11 +118,11 @@ impl SampleLogCap {
     /// Name this deployment on the readings this loop publishes.
     ///
     /// Every one of them is a claim made by one deployment — the capacity it
-    /// allows this log, and whether the pass it ran could free anything — and
-    /// they land in a log every deployment shares. Without a name they are
-    /// served by whichever process a reader scrapes as though the value had
-    /// come from there, which is how a deployment that publishes no budget at
-    /// all comes to answer with the one the deployment beside it declared.
+    /// declares for a log every deployment writes to — and they land in a log
+    /// every deployment shares. Without a name they are served by whichever
+    /// process a reader scrapes as though the value had come from there, which
+    /// is how a deployment that declares no budget at all comes to answer with
+    /// the one the deployment beside it declared.
     ///
     /// A blank name is treated as none: an empty label value is a series of its
     /// own that says nothing, and it would split every reader's series set
@@ -183,53 +133,38 @@ impl SampleLogCap {
         self
     }
 
-    /// Lease the pruning half of this loop, so that replicas sharing one
-    /// database do not each hold the log down towards the same capacity.
-    ///
-    /// The budget keeps its meaning — whether this deployment prunes at all —
-    /// and the lease decides which replica does. Without an arbiter the loop
-    /// prunes wherever the budget allows it, which is what every deployment did
-    /// before there was one.
-    pub fn with_role(mut self, broker: Arc<dyn cog_core::OwnerLeaseBroker>) -> Self {
-        self.role = Some(broker);
-        self
-    }
-
-    /// Spawn the sweeper as a supervised loop under this file's own name.
+    /// Spawn the measuring loop under this module's own name.
     ///
     /// Registered from here rather than by the caller so the name the reading
     /// reports and the name the loop is declared under cannot become two
-    /// spellings of the same loop — the caller would have to reach across a
-    /// crate boundary for the constant, and a call site is where a literal
-    /// gets written.
+    /// spellings of the same loop.
     pub fn spawn(self: Arc<Self>, shutdown: ShutdownSignal) -> tokio::task::JoinHandle<()> {
         cog_core::loop_health::spawn(
             LOOP,
             cog_core::loop_health::Cadence::Periodic(LOOP_PERIOD),
             shutdown.clone(),
             move |beat| {
-                let cap = Arc::clone(&self);
+                let log = Arc::clone(&self);
                 let shutdown = shutdown.clone();
-                async move { cap.run(beat, shutdown).await }
+                async move { log.run(beat, shutdown).await }
             },
         )
     }
 
-    /// Prune a table other than the live one. Exists so a test can point the
-    /// sweeper at a throwaway table.
+    /// Measure a table other than the live one. Exists so a test can point the
+    /// loop at a throwaway table.
     pub fn with_table(mut self, table: impl Into<String>) -> Self {
         self.table = table.into();
         self
     }
 
-    /// Run the retirement pass every cycle, whatever the budget says.
+    /// Run the retirement pass every cycle.
     ///
     /// The release is attached here rather than given a loop of its own because
     /// this loop is the only thing that visits the metric store on a period, and
     /// a second period would be a second constant to keep right. Being attached
-    /// does not make it conditional on pruning: a budget of 0 means this
-    /// deployment does not own the log, which is a statement about capacity and
-    /// not about whether a retired name should still be served.
+    /// does not make it conditional on the capacity: a retired name's rows have
+    /// to go whether or not any deployment ever declares a capacity.
     pub fn with_retirement(
         mut self,
         retirement: Arc<crate::metrics_retirement::RetirementPass>,
@@ -238,301 +173,128 @@ impl SampleLogCap {
         self
     }
 
-    /// Attach a metrics backend so each pass reports how many rows it removed,
-    /// how much is left, and how many bytes that costs. Without it the sweeper
-    /// still runs; the log simply has no size of its own to report.
+    /// Attach a metrics backend so each pass publishes the size it read. Without
+    /// it the loop still measures; the log simply has no published size.
     pub fn with_metrics(mut self, metrics: Arc<dyn MetricsBackend>) -> Self {
         self.metrics = Some(metrics);
         self
     }
 
-    /// Sweep once immediately, then at whatever period the fill rate calls
-    /// for, until shutdown.
-    ///
-    /// `beat` is the loop's own handle, handed here because this is where the
-    /// role is contended for: the same stamp that says the loop is cycling
-    /// carries whether this process is the one pruning.
+    /// Measure once immediately, then once per [`LOOP_PERIOD`], until shutdown.
     pub async fn run(&self, beat: cog_core::loop_health::Beat, shutdown: ShutdownSignal) {
-        // Held on the lease's own cadence rather than on this loop's, because a
-        // pass over a log far over its budget can outlast a term: the loop's
-        // period is inside the ask period (see the test that holds the two
-        // together), but a pass does not have to be, and a term that ran out
-        // mid-pass would hand the log to a second process sweeping it.
-        //
-        // Only a deployment that means to prune contends for it. A claim is not
-        // free to the process that has no use for one: the holder renews on its
-        // own cadence, so a deployment that never prunes keeps the deployment
-        // that does out of the role for as long as it lives. Asking the budget
-        // first is what makes the ordering below true instead of intended.
-        let role = if self.budget_enabled() {
-            Some(cog_core::RoleHold::start(
-                self.role.clone(),
-                ROLE,
-                beat.clone(),
-                &shutdown,
-            ))
-        } else {
-            None
-        };
-        let mut period = MIN_SWEEP_PERIOD;
-        let mut previous: Option<PreviousPass> = None;
         loop {
             beat.beat();
-            // Before the sweep, so a retired name's rows are gone when the sweep
-            // ranks what is left rather than being counted as ordinary history
-            // for one more cycle.
+            // Before the measurement, so a retired name's rows are already gone
+            // when the size is read; otherwise the reading counts rows the
+            // release just decided nobody will ever read again.
             if let Some(retirement) = self.retirement.clone() {
                 retirement.run_once().await;
             }
-            // Two different questions decide the same pass, and they are asked
-            // in this order on purpose: the budget says whether this deployment
-            // prunes at all, and only a deployment that does asks who should be
-            // doing it. A deployment with no role to ask is one whose budget
-            // already answered no.
-            //
-            // A process that may not prune still measures and reports. That is
-            // not the same reading as the one the pruner publishes — no budget,
-            // no floor, no removals — and it is deliberately not: this process
-            // cannot say whether the log is being held down, and the reading it
-            // publishes must not claim it can. The role's own series are where
-            // that distinction is legible.
-            let prunes = match role.as_ref() {
-                Some(hold) => hold.may_act().await,
-                None => false,
-            };
-            let pass = if prunes {
-                self.sweep_once_beating(|| beat.beat()).await
-            } else {
-                self.measure_once().await
-            };
-            match pass {
-                Ok(outcome) => {
-                    if outcome.removed > 0 {
-                        info!(
-                            table = self.table,
-                            rows = outcome.removed,
-                            held = outcome.held,
-                            "Pruned metrics samples over capacity"
-                        );
-                    }
-                    if outcome.floor_held {
+            match self.measure_once().await {
+                Ok(reading) => {
+                    if reading.over_capacity {
                         warn!(
                             table = self.table,
-                            held = outcome.held,
-                            budget = outcome.budget,
-                            "Metrics sample log is over capacity and cannot be pruned further \
-                             without dropping a series' current value"
+                            held = reading.held,
+                            budget = reading.budget,
+                            "Metrics sample log is over the capacity this deployment declares; \
+                             nothing deletes it, so this reading stays red until somebody \
+                             decides what to do with it"
                         );
                     }
-                    period = next_period(previous, &outcome);
-                    previous = Some(PreviousPass {
-                        at: Instant::now(),
-                        held: outcome.held,
-                    });
-                    self.report(&outcome).await;
+                    self.report(&reading).await;
                     self.report_pass_outcome(false).await;
                 }
                 Err(e) => {
-                    // 一次失败的 pass 让四个读数全部不盖，而两条容量规则按伴生
-                    // 钟年龄在界内还信它们——冻住的日志与不再增长的日志于是同形。
-                    // 「这一趟没拿到结果」必须自己成一条读数。
+                    // A failed pass leaves all four readings frozen, and the
+                    // capacity rules trust them inside their companion-clock
+                    // age — a log that stopped being measured and one that
+                    // stopped growing then read the same. This cell is that
+                    // fact's own reading.
                     self.report_pass_outcome(true).await;
-                    warn!(table = self.table, error = %e, "Metrics sample capacity sweep failed")
+                    warn!(table = self.table, error = %e, "Metrics sample log measurement failed")
                 }
             }
             tokio::select! {
-                _ = tokio::time::sleep(period) => {}
+                _ = tokio::time::sleep(LOOP_PERIOD) => {}
                 _ = shutdown.wait() => break,
             }
         }
     }
 
-    /// Measure the log and prune nothing.
+    /// Read the log: how many rows, what it costs, what this deployment declared.
     ///
-    /// What a process owes its readers when it may not prune: the size is a
-    /// property of the table, not of who is allowed to delete from it, and the
-    /// budgets a process that is not pruning reports as `None` are exactly the
-    /// ones it is not enforcing. The alternative — publishing the configured
-    /// capacity and a held count above it — reads as a log being let grow by the
-    /// process that is not the one letting it.
-    pub async fn measure_once(&self) -> SFResult<SweepOutcome> {
-        Ok(SweepOutcome {
-            held: self.row_count().await?,
-            removed: 0,
-            budget: None,
-            floor_held: false,
-        })
-    }
-
-    /// Delete oldest-first until the log is within capacity, or until the only
-    /// rows left are the ones every series needs.
-    pub async fn sweep_once(&self) -> SFResult<SweepOutcome> {
-        self.sweep_once_beating(|| {}).await
-    }
-
-    /// The same pass, calling `progress` once before every delete.
-    ///
-    /// The loop hands `beat.beat` in here so that the age it publishes is
-    /// bounded by one statement rather than by the whole pass. A log far over
-    /// its budget is drained over several statements when one of them takes
-    /// fewer rows than the surplus, and the pass itself is otherwise one
-    /// statement long — longer than any wall the loop can declare for itself,
-    /// because what the pass has to delete is the surplus and the surplus has
-    /// no bound. What a stall rule should see instead is the one statement
-    /// wedged on a lock, and that is what beating between them leaves visible.
-    pub async fn sweep_once_beating(&self, progress: impl Fn()) -> SFResult<SweepOutcome> {
+    /// The bytes are read separately and their absence is carried as `None`
+    /// rather than as a zero: a size that could not be read and a table that
+    /// occupies nothing are different facts, and only one of them is good news.
+    pub async fn measure_once(&self) -> SFResult<SampleReading> {
         let held = self.row_count().await?;
-        let mut outcome = SweepOutcome {
-            held,
-            removed: 0,
-            budget: self.budget_enabled().then_some(self.budget),
-            floor_held: false,
-        };
-
-        let Some(budget) = outcome.budget else {
-            return Ok(outcome);
-        };
-        if held <= budget {
-            return Ok(outcome);
-        }
-
-        let mut remaining = held - budget;
-        // Whether the deletion order ran out of rows it was allowed to take.
-        // That is not the same claim as the count taken after the deletes
-        // still standing above the budget, and reading the second as the first
-        // is wrong by construction: the log is written while a pass runs, so a
-        // sweep that took every row it was asked to can recount a few rows
-        // higher and read as one the floor stopped. Measured on the live log:
-        // a pass read 200,855 rows and recounted 200,003 against a budget of
-        // 200,000, and that recount published the floor verdict. The loop
-        // stops early only on a batch that took nothing, and 199,959 rows were
-        // still deletable, so the three rows above the budget were the writes
-        // and not the heads. Only a batch that took nothing says the log is
-        // resting on its floor.
-        let mut stalled = false;
-        while remaining > 0 {
-            progress();
-            let batch = self.delete_surplus(remaining).await?;
-            outcome.removed += batch;
-            remaining -= batch as i64;
-            if batch == 0 {
-                stalled = true;
-                break;
+        let budget = (self.budget > 0).then_some(self.budget);
+        let bytes = match crate::relation_bytes::relation_bytes(&self.pool, &self.table).await {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                warn!(table = self.table, error = %e, "sample log size unavailable");
+                None
             }
+        };
+        Ok(SampleReading {
+            held,
+            budget,
+            bytes: None,
+            over_capacity: budget.is_some_and(|budget| held > budget),
         }
-
-        outcome.held = self.row_count().await?;
-        outcome.floor_held = stalled && outcome.held > budget;
-        Ok(outcome)
+        .with_bytes(bytes))
     }
 
-    /// Delete up to `limit` rows, oldest first, keeping each gauge series'
-    /// newest row. Returns how many went.
+    /// 发布「这一趟有没有量到」。
     ///
-    /// The exemption is by rank, not by a timestamp cutoff. A cutoff at
-    /// `min(per-series max timestamp)` reads well and is cheap, but it keeps
-    /// every row that happens to share that instant, so a series written as one
-    /// burst under a single timestamp could not be pruned at all — the sweep
-    /// would report itself over capacity while fifty deletable rows sat there.
-    /// The rank question — "is this the newest row of its series" — is asked of
-    /// one candidate row at a time, with ties broken by id so the answer does
-    /// not depend on which of two equal rows the planner happens to visit
-    /// first.
-    ///
-    /// The predicate names the kind because the exemption is not about rows at
-    /// all: it is about which kinds are read through the log. A gauge is, a
-    /// counter and a histogram are read from their accumulation tables, so their
-    /// log rows are history and fall to the sweep at their ordinary rank — every
-    /// row of theirs is deletable, and the rank question is never asked about
-    /// them.
-    ///
-    /// Asking it per row rather than ranking the table first is what keeps a
-    /// pass' cost following the overshoot instead of the log. Computing
-    /// `row_number() OVER (PARTITION BY metric_type, name, labels ...)` for the
-    /// whole table reads every row of the log to delete a batch of it: measured
-    /// at limit 50 over 200,200 rows, a `WindowAgg` over all 200,200 rows, an
-    /// external merge sort of 15 MB, and 1.7 s. The correlated form walks rows
-    /// in `(timestamp, id)` order, stops inside `LIMIT`, and answers each
-    /// candidate with one probe of the newest-per-series index — measured at the
-    /// same limit, 1.1 ms and 209 buffers over 200,200 rows against 1.3 ms and
-    /// 156 buffers over 5,000, so the same batch costs the same either way. That
-    /// index is why the per-row question is cheap, and the correlated subquery
-    /// names `name`, `labels` and `timestamp` in the order the index holds them.
-    ///
-    /// The batch size is the only number bounding a single statement's work and
-    /// the locks it holds: the `LIMIT` is the cap being enforced, not a second
-    /// knob, so a pass' reach and its cost are the same number.
-    async fn delete_surplus(&self, limit: i64) -> SFResult<u64> {
-        let sql = delete_surplus_sql(&self.table);
-        Ok(sqlx::query(&sql)
-            .bind(limit.max(1))
-            .execute(&self.pool)
-            .await
-            .map_err(|e| SFError::Database(e.to_string()))?
-            .rows_affected())
+    /// 行数、容量、超没超、字节四个读数只在 `Ok` 分支盖章，所以一趟量失败的 pass 会让
+    /// 它们全停在上一笔值上，而容量规则按伴生钟年龄在界内还信它们——量不动与不再增长
+    /// 于是在读数上同形。这一格是那件事自己的读数：量到记 0、取不到记 1，每一趟都写。
+    async fn report_pass_outcome(&self, failed: bool) {
+        let Some(ref mb) = self.metrics else { return };
+        publish_pass_outcome(mb, &self.labels(), failed).await;
     }
 
-    fn budget_enabled(&self) -> bool {
-        self.budget > 0
-    }
-
-    /// Publish what the log holds, what it is allowed to hold, and what it
-    /// costs on disk, so the log's growth is visible from the scrape instead
-    /// of only through a query against the database.
-    async fn report(&self, outcome: &SweepOutcome) {
+    /// Publish what the log holds, what it is declared to be allowed to hold, and
+    /// what it costs on disk, so its growth is visible from the scrape instead of
+    /// only through a query against the database.
+    async fn report(&self, reading: &SampleReading) {
         let Some(ref mb) = self.metrics else { return };
 
         self.emit(
             mb,
             cog_core::metric_names::METRICS_SAMPLES_ROWS,
-            outcome.held as f64,
+            reading.held as f64,
         )
         .await;
-        if let Some(budget) = outcome.budget {
+        if let Some(budget) = reading.budget {
             self.emit(
                 mb,
                 cog_core::metric_names::METRICS_SAMPLES_BUDGET_ROWS,
                 budget as f64,
             )
             .await;
-            // The floor verdict belongs to the pass that could have pruned, and
-            // it is published under the same condition as the budget because it
-            // is the same claim: a pass with no budget did not sweep, has no
-            // floor to report, and a zero written from here would say "nothing
-            // is being held down" on behalf of a process that never looked.
-            // The deployment label is what keeps that silence legible: without
-            // it a deployment that published nothing would still be served the
-            // budget the deployment beside it declared.
+            // The verdict is published under the same condition as the capacity
+            // because it is the same claim: a deployment that declares no
+            // capacity has none to be over, and a zero written from here would
+            // say "this log is fine" on behalf of a process that declared
+            // nothing.
             self.emit(
                 mb,
                 cog_core::metric_names::METRICS_SAMPLES_OVER_CAPACITY,
-                outcome.floor_held as u8 as f64,
+                reading.over_capacity as u8 as f64,
             )
             .await;
         }
-
-        match crate::relation_bytes::relation_bytes(&self.pool, &self.table).await {
-            Ok(bytes) => {
-                self.emit(
-                    mb,
-                    cog_core::metric_names::METRICS_SAMPLES_BYTES,
-                    bytes as f64,
-                )
-                .await
-            }
-            Err(e) => warn!(table = self.table, error = %e, "sample log size unavailable"),
+        if let Some(bytes) = reading.bytes {
+            self.emit(
+                mb,
+                cog_core::metric_names::METRICS_SAMPLES_BYTES,
+                bytes as f64,
+            )
+            .await;
         }
-    }
-
-    /// 发布「这一趟 pass 有没有拿到结果」。
-    ///
-    /// 行数、预算、触底判词、字节四个读数只在 `Ok(outcome)` 分支盖章，所以
-    /// 一趟失败的 pass 会让它们全停在上一笔值上，而两条容量规则按伴生钟年龄
-    /// 在界内还信它们——扫不动与不再增长于是在读数上同形。这一格是那件事自己
-    /// 的读数：拿到结果记 0、取不到记 1，每一趟都写。
-    async fn report_pass_outcome(&self, failed: bool) {
-        let Some(ref mb) = self.metrics else { return };
-        publish_pass_outcome(mb, &self.labels(), failed).await;
     }
 
     /// The labels every reading this loop publishes carries.
@@ -560,12 +322,11 @@ impl SampleLogCap {
     }
 }
 
-/// Publish whether a sweep pass returned a result, under the same labels as the
-/// readings that pass produced.
+/// Publish whether a measuring pass returned a result, under the same labels as
+/// the readings that pass produced.
 ///
-/// Free rather than a method for the same reason [`delete_surplus_sql`] is: a
-/// test can drive it against a recording backend and assert both outcomes,
-/// instead of standing up a pool to reach one line through the loop.
+/// Free rather than a method so a test can drive it against a recording backend
+/// and assert both outcomes without standing up a pool.
 async fn publish_pass_outcome(
     metrics: &Arc<dyn MetricsBackend>,
     labels: &HashMap<String, String>,
@@ -584,302 +345,182 @@ async fn publish_pass_outcome(
     }
 }
 
-/// The statement a pass runs, with the table already quoted.
-///
-/// Exported rather than inlined at the call site so what a test explains is the
-/// text the sweep executes rather than a copy of it: the costs that matter here
-/// are properties of the plan this text produces, and a copy goes on being
-/// explained happily after the statement beside it has been rewritten.
-///
-/// `$1` is the batch size. Rows go oldest first, and a gauge row is skipped when
-/// it is the newest row of its own series — the one row every reader of that
-/// series reaches it through.
-///
-/// The kind is filled from [`cog_core::MetricType::as_str`] rather than spelled
-/// here: a stale word would make every row look like a non-gauge row, and the
-/// sweep would then delete the newest sample of every series — emptying exactly
-/// the readings the scrape serves, with no error to show for it.
-pub fn delete_surplus_sql(table: &str) -> String {
-    format!(
-        "DELETE FROM {table} WHERE id IN (
-             SELECT c.id FROM {table} c
-             WHERE c.metric_type <> '{gauge}'
-                OR c.id <> (SELECT g.id FROM {table} g
-                            WHERE g.metric_type = '{gauge}'
-                              AND g.name = c.name
-                              AND g.labels = c.labels
-                            ORDER BY g.timestamp DESC, g.id DESC
-                            LIMIT 1)
-             ORDER BY c.timestamp, c.id
-             LIMIT $1
-         )",
-        table = cog_core::sql::quote_relation(table),
-        gauge = cog_core::MetricType::Gauge.as_str(),
-    )
-}
-
-/// How long to wait before the next pass.
-///
-/// Derived from how fast the log is filling: wait about as long as it would
-/// take to reach the capacity at the rate the previous pass observed, so a
-/// busy log is checked often and a quiet one is left alone. There is no
-/// configured sweep interval, for the same reason there is no configured
-/// retention: the useful cadence is a consequence of the traffic, and one
-/// constant would only be right for one deployment.
-///
-/// A log that cannot be brought under capacity waits the longest period even
-/// though it is not quiet, because waiting is all that is left — the rows it
-/// would need to delete are the ones the floor protects, and retrying sooner
-/// cannot help.
-fn next_period(previous: Option<PreviousPass>, outcome: &SweepOutcome) -> Duration {
-    if outcome.floor_held {
-        return MAX_SWEEP_PERIOD;
-    }
-    let Some(budget) = outcome.budget else {
-        return MAX_SWEEP_PERIOD;
-    };
-    let Some(previous) = previous else {
-        return MIN_SWEEP_PERIOD;
-    };
-    let elapsed = previous.at.elapsed().as_secs_f64();
-    let added = outcome.held - previous.held;
-    if elapsed <= 0.0 || added <= 0 {
-        // Not filling. Nothing to prune until something is written, so the
-        // longest period is the right one: it still republishes the size often
-        // enough to outlive the scrape's staleness window.
-        return MAX_SWEEP_PERIOD;
-    }
-    let per_second = added as f64 / elapsed;
-    // The wait is until the first row that will need pruning, not until the
-    // capacity: a log sitting exactly at its budget is one row away from work.
-    let headroom = (budget - outcome.held + 1).max(1) as f64;
-    let secs = headroom / per_second;
-    if !secs.is_finite() {
-        return MAX_SWEEP_PERIOD;
-    }
-    Duration::from_secs_f64(secs).clamp(MIN_SWEEP_PERIOD, MAX_SWEEP_PERIOD)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn outcome(held: i64, budget: Option<i64>, floor_held: bool) -> SweepOutcome {
-        SweepOutcome {
+    fn reading(held: i64, budget: Option<i64>) -> SampleReading {
+        SampleReading {
             held,
-            removed: 0,
             budget,
-            floor_held,
+            bytes: None,
+            over_capacity: budget.is_some_and(|budget| held > budget),
         }
     }
 
-    /// 容量清扫的地板只对 gauge 成立，且那个 kind 字面量来自 `MetricType`。
-    ///
-    /// 计数器与直方图的日志行是历史而不是读数：它们从各自的累加表里被读，所以
-    /// 任何一行都可以按普通次序删掉，排序问题根本不该问到它们头上。这条断言是
-    /// 那份豁免的范围本身——`<>` 一旦写成 `=`，或者 kind 字面量被换成一个手写
-    /// 的词，清扫就会转去删掉每个系列的最新样本，而那正是 scrape 唯一的来源，
-    /// 且不会报错。
+    /// A log past the capacity it declares reads as over it; one at the capacity
+    /// does not. The boundary is the whole reading: off by one here and a
+    /// dashboard says "over" for a log that is exactly at its limit.
     #[test]
-    fn the_floor_is_gauge_only_and_the_kind_comes_from_metric_type() {
-        let sql = delete_surplus_sql("metrics_samples");
-        let gauge = cog_core::MetricType::Gauge.as_str();
-        assert!(
-            sql.contains(&format!("c.metric_type <> '{gauge}'")),
-            "the exemption must be conditioned on the kind being a gauge: {sql}"
-        );
-        assert!(
-            sql.contains(&format!("g.metric_type = '{gauge}'")),
-            "the newest-per-series probe must ask about gauge rows: {sql}"
-        );
+    fn over_capacity_is_strictly_above_the_declared_capacity() {
+        assert!(!reading(10, Some(10)).over_capacity);
+        assert!(reading(11, Some(10)).over_capacity);
+        assert!(!reading(9, Some(10)).over_capacity);
     }
 
-    fn pass_ago(held: i64, secs: u64) -> Option<PreviousPass> {
-        Some(PreviousPass {
-            at: Instant::now() - Duration::from_secs(secs),
-            held,
-        })
-    }
-
-    /// Both outcomes of a pass land, and the labels the pass's other readings
-    /// carry are on them.
+    /// A deployment that declares no capacity is not over one.
     ///
-    /// The value readings this loop publishes are stamped only on the branch that
-    /// returned an outcome, so a pass that could not reach the database leaves
-    /// them frozen at their last values while the two capacity rules still trust
-    /// them for as long as the companion clock's age allows. This reading is the
-    /// one that separates "the sweep found nothing to do" from "the sweep could
-    /// not run": it is written on both branches, one row per pass, so the rule
-    /// reading it can tell a live quiet log from a silent one. The second
-    /// assertion pins that a failed pass is a 1 and not the absence of a row.
+    /// This is the reading that keeps "nobody declared a limit" from being
+    /// reported as "the limit is zero, you are over it" — which is how an
+    /// operator who never set the knob gets paged about it.
+    #[test]
+    fn no_declared_capacity_is_not_a_capacity_of_zero() {
+        assert!(!reading(5, None).over_capacity);
+        assert!(!reading(5, Some(5)).over_capacity);
+        assert!(reading(5, Some(4)).over_capacity);
+    }
+
+    /// 读回一段时间里某一格 gauge 的样本：(名字, 值, 标签)。
+    async fn published(
+        metrics: &Arc<crate::MemoryMetricsBackend>,
+        name: &str,
+    ) -> Vec<(String, f64, HashMap<String, String>)> {
+        let end = chrono::Utc::now() + chrono::Duration::seconds(1);
+        let start = end - chrono::Duration::seconds(60);
+        metrics
+            .query_gauge_range(name, start, end)
+            .await
+            .expect("the in-memory face is readable")
+            .into_iter()
+            .map(|sample| (name.to_string(), sample.value, sample.labels))
+            .collect()
+    }
+
+    /// The four readings are published every pass, from one measurement.
     #[tokio::test]
-    async fn a_pass_outcome_is_written_on_both_branches() {
-        let concrete = std::sync::Arc::new(crate::MemoryMetricsBackend::new());
-        let metrics: std::sync::Arc<dyn MetricsBackend> =
-            std::sync::Arc::clone(&concrete) as std::sync::Arc<dyn MetricsBackend>;
-        let labels = HashMap::from([(DEPLOYMENT_LABEL.to_string(), "cogneva-app".to_string())]);
-        let now = chrono::Utc::now();
+    async fn every_reading_of_a_pass_is_written_from_the_same_measurement() {
+        let metrics = Arc::new(crate::MemoryMetricsBackend::new());
+        let mb: Arc<dyn MetricsBackend> = metrics.clone();
+        let mut log = MetricsSampleLog::new(PgPool::connect_lazy("postgres://x/y").unwrap(), 100)
+            .with_deployment("d1");
+        log.metrics = Some(mb);
+        log.report(&reading(150, Some(100))).await;
 
-        publish_pass_outcome(&metrics, &labels, false).await;
-        let ok = concrete
-            .query_gauge_range(
-                cog_core::metric_names::METRICS_SAMPLE_SWEEP_FAILED.as_str(),
-                now - chrono::Duration::minutes(5),
-                now + chrono::Duration::minutes(5),
+        let rows = published(
+            &metrics,
+            cog_core::metric_names::METRICS_SAMPLES_ROWS.as_str(),
+        )
+        .await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "the size is published once per pass: {rows:?}"
+        );
+        assert_eq!(rows[0].1, 150.0);
+        assert_eq!(
+            rows[0].2.get(DEPLOYMENT_LABEL).map(String::as_str),
+            Some("d1"),
+            "a reading that does not say which deployment declared the capacity is served by \
+             whichever deployment the scraper happens to hit"
+        );
+        let budget = published(
+            &metrics,
+            cog_core::metric_names::METRICS_SAMPLES_BUDGET_ROWS.as_str(),
+        )
+        .await;
+        assert_eq!(budget.len(), 1);
+        assert_eq!(budget[0].1, 100.0);
+        let over = published(
+            &metrics,
+            cog_core::metric_names::METRICS_SAMPLES_OVER_CAPACITY.as_str(),
+        )
+        .await;
+        assert_eq!(over.len(), 1);
+        assert_eq!(over[0].1, 1.0, "150 rows against a declared 100 is over");
+    }
+
+    /// A deployment that declares no capacity publishes no capacity and no
+    /// verdict — silence, not zeros.
+    #[tokio::test]
+    async fn a_deployment_that_declares_nothing_publishes_no_capacity() {
+        let metrics = Arc::new(crate::MemoryMetricsBackend::new());
+        let mb: Arc<dyn MetricsBackend> = metrics.clone();
+        let mut log = MetricsSampleLog::new(PgPool::connect_lazy("postgres://x/y").unwrap(), 0);
+        log.metrics = Some(mb);
+        log.report(&reading(10, None)).await;
+
+        assert_eq!(
+            published(
+                &metrics,
+                cog_core::metric_names::METRICS_SAMPLES_ROWS.as_str()
             )
             .await
-            .unwrap();
-        assert_eq!(ok.len(), 1, "a returned pass publishes exactly one row");
-        assert_eq!(ok[0].value, 0.0);
-        assert_eq!(
-            ok[0].labels.get(DEPLOYMENT_LABEL),
-            Some(&"cogneva-app".to_string())
+            .len(),
+            1,
+            "the size is still a reading when nobody declared a capacity"
         );
-
-        publish_pass_outcome(&metrics, &labels, true).await;
-        let failed = concrete
-            .query_gauge_range(
-                cog_core::metric_names::METRICS_SAMPLE_SWEEP_FAILED.as_str(),
-                now - chrono::Duration::minutes(5),
-                now + chrono::Duration::minutes(5),
+        assert!(
+            published(
+                &metrics,
+                cog_core::metric_names::METRICS_SAMPLES_BUDGET_ROWS.as_str()
             )
             .await
-            .unwrap();
-        assert_eq!(failed.len(), 2, "a failed pass publishes its own row");
-        assert_eq!(failed.last().unwrap().value, 1.0);
-    }
-
-    /// A log filling at ten rows a second with nine hundred rows of headroom
-    /// left is checked in about ninety seconds — the cadence follows the
-    /// traffic rather than a constant.
-    #[test]
-    fn a_filling_log_is_checked_when_it_would_reach_capacity() {
-        let period = next_period(pass_ago(1000, 10), &outcome(1100, Some(2000), false));
+            .is_empty(),
+            "a deployment that declared nothing published a capacity"
+        );
         assert!(
-            period >= Duration::from_secs(89) && period <= Duration::from_secs(91),
-            "expected about the time to fill 900 rows at 10 rows/s, got {period:?}"
+            published(
+                &metrics,
+                cog_core::metric_names::METRICS_SAMPLES_OVER_CAPACITY.as_str()
+            )
+            .await
+            .is_empty(),
+            "a deployment that declared nothing published a verdict"
         );
     }
 
-    /// A log that is not growing waits the longest period rather than being
-    /// polled.
-    #[test]
-    fn a_log_that_is_not_filling_waits_the_longest_period() {
+    /// A pass that could not measure says so, on its own gauge.
+    ///
+    /// The four readings keep their last value when a pass fails, so this cell is
+    /// the only thing that tells a frozen reading from a quiet log.
+    #[tokio::test]
+    async fn a_pass_that_could_not_measure_says_so_on_both_branches() {
+        let metrics = Arc::new(crate::MemoryMetricsBackend::new());
+        let mb: Arc<dyn MetricsBackend> = metrics.clone();
+        let labels = HashMap::from([(DEPLOYMENT_LABEL.to_string(), "d1".to_string())]);
+        publish_pass_outcome(&mb, &labels, false).await;
+        publish_pass_outcome(&mb, &labels, true).await;
+
+        let values: Vec<f64> = published(
+            &metrics,
+            cog_core::metric_names::METRICS_SAMPLE_SWEEP_FAILED.as_str(),
+        )
+        .await
+        .into_iter()
+        .map(|(_, value, _)| value)
+        .collect();
         assert_eq!(
-            next_period(pass_ago(1000, 10), &outcome(1000, Some(2000), false)),
-            MAX_SWEEP_PERIOD
+            values,
+            vec![0.0, 1.0],
+            "both branches have to be written, or a pass that never returned reads as one that \
+             returned nothing to report"
         );
     }
 
-    /// A log that has just been pruned below its previous reading is shrinking,
-    /// not filling, and must not be read as a negative rate.
+    /// Nothing in this module deletes. The reading is the whole mechanism.
+    ///
+    /// This is the shape of the change and the thing that must not come back: a
+    /// capacity that deletes what it measures cannot be read as a reading, because
+    /// the number it reports has already been acted on by the time anybody sees it.
     #[test]
-    fn a_log_pruned_since_the_last_pass_waits_the_longest_period() {
-        assert_eq!(
-            next_period(pass_ago(9000, 10), &outcome(100, Some(2000), false)),
-            MAX_SWEEP_PERIOD
-        );
-    }
-
-    /// A log that cannot be brought under capacity is not retried on a short
-    /// period: nothing it does next pass could change the outcome.
-    #[test]
-    fn a_log_the_floor_holds_wait_the_longest_period_however_fast_it_fills() {
-        assert_eq!(
-            next_period(pass_ago(100, 10), &outcome(900, Some(500), true)),
-            MAX_SWEEP_PERIOD
-        );
-    }
-
-    /// A log sitting exactly at its budget is one write away from needing a
-    /// pass. The wait is until that write, and never shorter than the floor
-    /// that keeps the loop from spinning.
-    #[test]
-    fn a_log_at_its_budget_waits_until_the_next_write() {
-        // Filling at ten rows a second, the next write is a tenth of a second
-        // away, which is inside the floor.
-        let fast = next_period(pass_ago(1990, 1), &outcome(2000, Some(2000), false));
-        assert_eq!(fast, MIN_SWEEP_PERIOD);
-        // At a tenth of a row a second it is ten seconds away.
-        let slow = next_period(pass_ago(1990, 100), &outcome(2000, Some(2000), false));
+    fn the_module_carries_no_delete_statement() {
+        let source = include_str!("metrics_sample_cap.rs");
+        // The word is assembled rather than written, so this assertion does not
+        // match itself — it lives in this same file.
+        let forbidden = ["DE", "LETE FROM"].join("");
         assert!(
-            slow >= Duration::from_secs(9) && slow <= Duration::from_secs(11),
-            "expected about ten seconds, got {slow:?}"
-        );
-    }
-
-    /// Pruning off is not a reason to poll.
-    #[test]
-    fn no_budget_waits_the_longest_period() {
-        assert_eq!(
-            next_period(pass_ago(10, 10), &outcome(2000, None, false)),
-            MAX_SWEEP_PERIOD
-        );
-    }
-
-    /// The very first pass has nothing to compare against, so it looks again
-    /// promptly rather than assuming the log is quiet.
-    #[test]
-    fn the_first_pass_schedules_the_next_one_promptly() {
-        assert_eq!(
-            next_period(None, &outcome(10, Some(2000), false)),
-            MIN_SWEEP_PERIOD
-        );
-    }
-
-    /// The batch has to be what bounds the statement's work, and the shape that
-    /// broke that is a ranking over the whole table: `row_number() OVER (...)`
-    /// reads every row of the log to delete a batch of it. Only a live plan can
-    /// show the cost, but this pins the shape, so the rewrite cannot be undone
-    /// and go on passing everything that never runs a plan.
-    #[test]
-    fn the_delete_asks_about_one_row_at_a_time() {
-        let sql = delete_surplus_sql("cog_metrics_samples");
-        assert!(
-            !sql.contains("row_number()"),
-            "the delete ranks the whole table again: {sql}"
-        );
-        assert!(
-            sql.contains("c.id <> (SELECT g.id"),
-            "the delete no longer answers the rank question per row: {sql}"
-        );
-        assert!(
-            sql.contains("ORDER BY g.timestamp DESC, g.id DESC"),
-            "the per-row answer is not the newest row of the series: {sql}"
-        );
-        assert!(
-            sql.contains("LIMIT $1"),
-            "the batch is not the bound the statement is given: {sql}"
-        );
-    }
-
-    /// The table name is an identifier, so it is quoted everywhere it lands —
-    /// the delete's own table and the two scans the subquery is built from.
-    /// Forgetting one leaves the statement erroring out or, worse, resolving to
-    /// a different table.
-    #[test]
-    fn every_place_the_table_is_named_is_quoted() {
-        let sql = delete_surplus_sql(r#"odd"name"#);
-        assert_eq!(
-            sql.matches(r#""odd""name""#).count(),
-            3,
-            "the table is not quoted everywhere it is named: {sql}"
-        );
-    }
-
-    /// The loop asks again as often as the lease contract assumes, which is what
-    /// lets the rule that says a role is unowned treat a handover as bounded by
-    /// the term plus one ask period. A loop whose work cadence was slower than
-    /// that would have to ask on a timer of its own rather than declare a longer
-    /// period here, because a holder that asks after its term has run out is
-    /// contending with whoever took the role in the meantime.
-    #[test]
-    fn the_declared_period_renews_inside_the_lease_contract() {
-        assert!(
-            LOOP_PERIOD <= cog_core::owner_lease::ASK_PERIOD,
-            "the loop declares a period of {LOOP_PERIOD:?}, longer than the ask period {:?} \
-             the lease and its alerting are written against",
-            cog_core::owner_lease::ASK_PERIOD
+            !source.to_uppercase().contains(&forbidden),
+            "a delete statement came back into the measuring loop"
         );
     }
 }

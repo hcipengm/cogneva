@@ -248,7 +248,9 @@ impl IssueConversation {
 
 /// At most this many attachments are fetched and sent to the judge per
 /// intent (the most recent ones).
-// cap: bound — 每个意图最多抓这么多附件（取最近的）送给评审；再多只是把同一段对话的截图全塞进去
+// cap: fixed — 每个意图最多抓这么多附件（取最近的）送给评审；再多只是把同一段对话的截图全塞进去
+// keep: 删掉后把同一段对话的所有截图都塞进评审；由「取最近的几条」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 pub const MAX_MEDIA_PER_INTENT: usize = 6;
 
 /// Keep at most `cap` items, preferring the most recent (tail) — comments

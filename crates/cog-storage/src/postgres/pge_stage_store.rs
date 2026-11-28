@@ -35,8 +35,8 @@ CREATE TABLE IF NOT EXISTS pge_stage_product (
     stage TEXT NOT NULL,
     stage_rank SMALLINT NOT NULL,
     request_sha256 TEXT NOT NULL,
-    change_identity JSONB,
-    product JSONB NOT NULL,
+    change_identity TEXT,
+    product TEXT NOT NULL,
     produced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (task_id, generation, repair_iteration, stage)
 )"#;
@@ -134,7 +134,7 @@ impl PgeStageStore for PostgresPgeStageStore {
             .bind(product.stage.rank())
             .bind(&product.request_sha256)
             .bind(product.change_identity.as_ref())
-            .bind(&product.product)
+            .bind(product.product.to_string())
             .execute(&self.pool)
             .await
             .map_err(|e| SFError::Database(e.to_string()))?;

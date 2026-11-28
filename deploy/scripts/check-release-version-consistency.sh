@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# reads: deploy/helm/cogneva/Chart.yaml subject
 # 发布版本一致性门禁：交付物里写着版本号的每一处，都要等于 Cargo.toml 声明的那一个。
 #
 # 这条判据原先住在 build-release-image.sh 里，判的是一份写死的四文件名单
@@ -9,7 +10,9 @@
 # 不是同一个，而门读作绿。名单与树是同一个事实的两份写法，中间没有东西比较。
 #
 # 判据（集合全部从树里读出来，本脚本不写第二份）：
-#   1. chart：Chart.yaml 的 version 与 appVersion、values.yaml 的 image.tag；
+#   1. chart：Chart.yaml 的 version 与 appVersion、values.yaml 的 image.tag
+#      （tag 留空合法——chart 里镜像助手 default 到 appVersion，那一条上面刚判过；
+#      非空则必须等于声明版本）；
 #   2. 静态清单：deploy/k3s/*.yaml 里**本平台自己的**工作负载——kind 是
 #      Deployment / DaemonSet / StatefulSet，且 Pod 模板的 app.kubernetes.io/name 以
 #      `cogneva` 开头。第三方工作负载不归这条判：它们的版本标签写的是它们自己的版本
@@ -70,10 +73,13 @@ for key in ("version", "appVersion"):
         )
 
 values = read("deploy/helm/cogneva/values.yaml")
-m = re.search(r'^image:\s*\n(?:\s+[^\n]*\n)*?\s+tag:\s*"([^"]+)"', values, re.M)
+m = re.search(r'^image:\s*\n(?:\s+[^\n]*\n)*?\s+tag:\s*"([^"]*)"', values, re.M)
 if not m:
     problems.append("deploy/helm/cogneva/values.yaml: 读不到 image.tag")
-elif m.group(1) != WANT:
+elif m.group(1) and m.group(1) != WANT:
+    # 空串不是一个「没写」：chart 里 image 助手 default 到 .Chart.AppVersion，
+    # 而它上面已经判过等于声明版本。留空是正常的（发布不写第二份版本号），
+    # 写了就必须与服务版本一致——否则渲染出来的镜像引用停在上一版。
     problems.append(
         f"deploy/helm/cogneva/values.yaml: image.tag 是 {m.group(1)}，声明版本是 {WANT}"
     )
@@ -141,7 +147,7 @@ if not judged:
     sys.exit(2)
 
 print(
-    f"ok：chart 的 version 与 appVersion、values 的 image.tag、"
+    f"ok：chart 的 version 与 appVersion、values 的 image.tag（或它留空时由 appVersion 导出的那一个）、"
     f"configmap 的 COGNEVA_APP_VERSION，以及 deploy/k3s 里 {len(judged)} 个本平台"
     f"工作负载的 Pod 模板版本标签，都是 {WANT}"
 )

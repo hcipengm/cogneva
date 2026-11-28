@@ -39,15 +39,18 @@ impl PatternEntry {
 }
 
 /// Default maximum pattern DB size before LRU/score-based eviction kicks in.
-// cap: bound — 淘汰策略的触发点，不是数据库容量：界的是「什么时候开始丢最不值的那条模式」，值随实际使用量再调
+// cap: fixed — 淘汰策略的触发点，不是数据库容量：界的是「什么时候开始丢最不值的那条模式」，值随实际使用量再调
+// keep: 删掉后模式库在淘汰之前无界增长，最不值的那条一直占着位置；由「什么时候开始丢最不值的那条模式」兜住
 pub const DEFAULT_MAX_PATTERN_DB_SIZE: usize = 256;
 /// Default maximum age (in days) for pattern DB entries before they are
 /// expired even if the size cap has not been reached.
-// cap: bound — 单条模式的最长寿命：过期的模式是没人再验证过的经验，认它等于让一个旧结论一直生效
+// cap: fixed — 单条模式的最长寿命：过期的模式是没人再验证过的经验，认它等于让一个旧结论一直生效
+// keep: 删掉后旧结论永远生效，没人再验证过的经验一直参与决策；由「过期的模式是没人再验证过的经验」兜住
 pub const DEFAULT_MAX_PATTERN_AGE_DAYS: i64 = 30;
 
 /// 同一道目标的分解答案复用多久（秒）。
-// cap: bound — 复用窗口。比实测的重投节拍（约 120 秒）宽出数倍，否则省不下来；
+// cap: fixed — 复用窗口。比实测的重投节拍（约 120 秒）宽出数倍，否则省不下来；
+// keep: 删掉后复用窗口没有长度，要么不省、要么把过时的回答一直发给别处；由「比实测重投节拍宽出数倍」兜住
 // 又不能长到「计划该重做了还拿旧答案」，所以它是一个有限窗口而不是永久缓存。
 pub const DEFAULT_ANSWER_REUSE_TTL_SECS: u64 = 600;
 
@@ -739,11 +742,30 @@ impl ActionPlanOrchestrator {
             None => TaskType::Custom("unknown".to_string()),
         };
         let mut task = Task::new(at.id.clone(), task_type, at.input.clone());
+        task.terminal = at.terminal.clone();
+        task.now = at.now.clone();
+        task.gap = at.gap.clone();
         task.blocked_by = at.blocked_by.clone();
         task.blocks = at.blocks.clone();
         // 验收标准跟着任务行走，不跟着基线行：没有估算的工作包不落基线行，写在
         // 那里会在入图那一刻丢掉，而重规划正是要读它。
         task.acceptance = at.acceptance.clone();
+        // 分解说的那一句交给落定那一格：原样的词写进行上，读不成闭集里的词时
+        // 入口会记成「读不出来」，而不是在这里换一个座位名去猜。
+        if let Some(word) = at
+            .delivers
+            .as_deref()
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+        {
+            if let Some(fields) = task.input.as_object_mut() {
+                fields.insert(
+                    cog_core::types::task::INPUT_DELIVERS.to_string(),
+                    serde_json::json!(word),
+                );
+            }
+        }
+        task.settle_deliverable();
         task
     }
 
@@ -844,11 +866,110 @@ impl ActionPlanOrchestrator {
     fn states_its_own_work(task: &Task) -> bool {
         task.is_executable
             && !task.acceptance.is_empty()
-            && task
+            && (task
                 .input
                 .get(cog_core::INPUT_TASK_KIND)
                 .and_then(|v| v.as_str())
                 .is_some_and(|kind| !kind.trim().is_empty())
+                // 平台自己的员工活（`PLATFORM_AGENT_TASK`）把「这是什么活」
+                // 写在任务类型上，而不是再抄一个 `task_kind` 进输入：两类说法
+                // 并存时，只认输入那一格会把员工活全部送去再分解一遍。
+                || Self::is_platform_agent_row(task))
+    }
+
+    /// 这条行是不是平台自己的员工活（类型就是它的 kind）。
+    fn is_platform_agent_row(task: &Task) -> bool {
+        matches!(
+            &task.task_type,
+            TaskType::Custom(kind)
+                if kind == cog_core::contract::work_item::PLATFORM_AGENT_TASK
+        )
+    }
+
+    /// 一条行自己带着待办三格时，它的终态就是它的验收标准。
+    ///
+    /// 「按定义整段做、判据按 items 判」在入口上的落地：调用方或员工已经知道
+    /// 拆法时，每件活自带 `terminal / now / gap`。没有这一格，行读起来像「只说
+    /// 了要做什么」，会被送去再分解一遍，而分解出来的子任务拿不到这三格。
+    fn fill_acceptance_from_ledger_items(tasks: &mut [Task]) {
+        for task in tasks {
+            if !task.acceptance.is_empty() {
+                continue;
+            }
+            let Some(terminal) = task
+                .ledger_item()
+                .map(|item| item.terminal)
+                .map(|terminal| terminal.trim().to_string())
+                .filter(|terminal| !terminal.is_empty())
+            else {
+                continue;
+            };
+            task.acceptance = vec![terminal];
+        }
+    }
+
+    /// 那一行的状态，读失败时说明读失败。
+    ///
+    /// 日志里的 `status: None` 有两种来源：图里没有这一行，和这一行读不出来。
+    /// 读的人只有这一个字段可看，两种来源印成同一个值，这一面就在替一次没发生的
+    /// 读作答。读走带报错的那条，失败连同原因一起印出来。
+    async fn held_status(dag: &dyn cog_core::DagExecutor, task_id: &str) -> String {
+        match dag.get_task_checked(task_id).await {
+            Ok(Some(row)) => format!("{:?}", row.status),
+            Ok(None) => "absent".to_string(),
+            Err(e) => format!("unreadable: {e}"),
+        }
+    }
+
+    /// 这一批新入图的占位，哪些在图里找不到挂上来的子任务。
+    ///
+    /// 读不到子任务时不判：父子关系只在这一读里，读不到与「没挂上」同形，而
+    /// 按「没挂上」处理会把一条健康的行删除再改写 Failed——不可逆，孤儿收口
+    /// 按停摆阈值再看一遍是代价小得多的那一支。读不到占位的那一行同样跳过。
+    async fn stranded_placeholders(
+        dag: &dyn cog_core::DagExecutor,
+        goal_id: &str,
+        child_ids: &[String],
+        placeholder_ids: &[String],
+        queued: &[String],
+    ) -> Vec<Task> {
+        let mut parented: HashSet<String> = HashSet::new();
+        for child_id in child_ids {
+            match dag.get_task_checked(child_id).await {
+                Ok(Some(child)) => {
+                    if let Some(parent) = child.parent_task_id {
+                        parented.insert(parent);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        goal_id = %goal_id,
+                        task_id = %child_id,
+                        error = %e,
+                        "cannot read a child of this decomposition; no placeholder is judged stranded this pass"
+                    );
+                    return Vec::new();
+                }
+            }
+        }
+        let mut stranded: Vec<Task> = Vec::new();
+        for pid in placeholder_ids.iter().filter(|pid| queued.contains(*pid)) {
+            if parented.contains(pid) {
+                continue;
+            }
+            match dag.get_task_checked(pid).await {
+                Ok(Some(row)) => stranded.push(row),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    goal_id = %goal_id,
+                    placeholder = %pid,
+                    error = %e,
+                    "cannot read a placeholder that may be stranded; it is left for the orphan reconciler"
+                ),
+            }
+        }
+        stranded
     }
 
     /// High-level entry point: process a goal with optional pre-existing tasks,
@@ -874,6 +995,13 @@ impl ActionPlanOrchestrator {
         tasks: Vec<Task>,
         skill_registry: &SkillRegistry,
     ) -> SFResult<Vec<String>> {
+        // 行自己带着待办三格时，先把终态抄成验收标准：它说的是「这一类活是什么
+        // ＋这条怎样算完」，正是「说清了自己要做什么」的形状，只是判据写在待办
+        // 三格里。不先抄，这一行会被读成「只说了要做什么」而送去再分解一遍，
+        // 分解出来的子任务又拿不到这三格。
+        let mut tasks = tasks;
+        Self::fill_acceptance_from_ledger_items(&mut tasks);
+
         // Self-evolution tasks are human intents that should be executed
         // atomically by the collaboration pipeline without decomposition.
         // Matching the task type alone is not enough: the platform
@@ -956,10 +1084,10 @@ impl ActionPlanOrchestrator {
                 // held ids and their state so the drop is at least attributable
                 // when it is noticed downstream.
                 for held in requested.iter().filter(|id| !queued.contains(id)) {
-                    let status = dag.get_task(held).await.map(|t| t.status);
+                    let status = Self::held_status(dag.as_ref(), held).await;
                     tracing::warn!(
                         task_id = %held,
-                        ?status,
+                        status = %status,
                         "self-evolution submission held by an existing task; nothing was queued"
                     );
                 }
@@ -1014,10 +1142,10 @@ impl ActionPlanOrchestrator {
                 );
                 let queued = dag.add_tasks_batch(batch).await?;
                 for held in requested.iter().filter(|id| !queued.contains(id)) {
-                    let status = dag.get_task(held).await.map(|t| t.status);
+                    let status = Self::held_status(dag, held).await;
                     tracing::warn!(
                         task_id = %held,
-                        ?status,
+                        status = %status,
                         "stated-work submission held by an existing task; nothing was queued"
                     );
                 }
@@ -1030,7 +1158,6 @@ impl ActionPlanOrchestrator {
         // 它身上，判退也要有行可落。少了这一行，一次提交无论成败在读面上都不存在——
         // 成功时子任务挂在空父下、没有哪一行声明答案，失败时连判词都没有落点。
         // 它是不可执行的标记行，组 hints 时按这个键被排除，分解身份也不受影响。
-        let mut tasks = tasks;
         if tasks.is_empty() {
             tasks.push(cog_core::Task::goal_row(
                 uuid::Uuid::new_v4().to_string(),
@@ -1062,10 +1189,10 @@ impl ActionPlanOrchestrator {
             let queued = if let Some(ref dag) = self.dag_executor {
                 let queued = dag.add_tasks_batch(tasks).await?;
                 for held in requested.iter().filter(|id| !queued.contains(id)) {
-                    let status = dag.get_task(held).await.map(|t| t.status);
+                    let status = Self::held_status(dag.as_ref(), held).await;
                     tracing::warn!(
                         task_id = %held,
-                        ?status,
+                        status = %status,
                         "verified submission held by an existing task; nothing was queued"
                     );
                 }
@@ -1113,7 +1240,23 @@ impl ActionPlanOrchestrator {
         // 已经排上的答复是 `Ok(空)`，与「这一批都已经被别的行持有」同一条口径：
         // 调用方问的是「这次提交排上了什么」，答案是一条也没有。
         if let (Some(dag), Some(first)) = (self.dag_executor.as_deref(), tasks.first()) {
-            if let Some(held) = dag.get_task(&first.id).await {
+            // 读不到那一行时这一问没有答案，而两个候选答案都不便宜：按「没这一行」
+            // 处理要再付一次完整分解（这一问就是为拦住它而存在的），按「已计划」
+            // 处理会吞掉一次还没落下工作的提交。交回给调用方，按它自己的节拍重投。
+            let held = match dag.get_task_checked(&first.id).await {
+                Ok(held) => held,
+                Err(e) => {
+                    tracing::warn!(
+                        goal = %goal,
+                        task_id = %first.id,
+                        error = %e,
+                        "cannot read the row that says whether this goal is already planned; \
+                         leaving the submission for redelivery rather than decomposing again"
+                    );
+                    return Err(e);
+                }
+            };
+            if let Some(held) = held {
                 let already_planned = held
                     .action_planner_meta
                     .as_ref()
@@ -1463,10 +1606,10 @@ impl ActionPlanOrchestrator {
                 }
             }
             for held in all_injected_ids.iter().filter(|id| !queued.contains(id)) {
-                let status = dag.get_task(held).await.map(|t| t.status);
+                let status = Self::held_status(dag.as_ref(), held).await;
                 tracing::warn!(
                     task_id = %held,
-                    ?status,
+                    status = %status,
                     "decomposed submission held by an existing task; nothing was queued"
                 );
             }
@@ -1477,22 +1620,14 @@ impl ActionPlanOrchestrator {
             // orphan reconciler only finds after the stall threshold. Check
             // real DAG state (not the returned queued list): a child that
             // was already there keeps an idempotent replay a no-op.
-            let mut parented: HashSet<String> = HashSet::new();
-            for child_id in child_ids {
-                if let Some(child) = dag.get_task(child_id).await {
-                    if let Some(parent) = child.parent_task_id {
-                        parented.insert(parent);
-                    }
-                }
-            }
-            let mut stranded: Vec<Task> = Vec::new();
-            for pid in &placeholder_ids {
-                if queued.contains(pid) && !parented.contains(pid) {
-                    if let Some(row) = dag.get_task(pid).await {
-                        stranded.push(row);
-                    }
-                }
-            }
+            let stranded = Self::stranded_placeholders(
+                dag.as_ref(),
+                &goal_id,
+                child_ids,
+                &placeholder_ids,
+                &queued,
+            )
+            .await;
             if !stranded.is_empty() {
                 let held_children: Vec<&str> = child_ids
                     .iter()
@@ -1703,10 +1838,10 @@ impl ActionPlanOrchestrator {
         // write skips rows that already landed instead of erroring.
         let queued = dag.add_tasks_batch(failed_rows).await?;
         for held in failed_ids.iter().filter(|id| !queued.contains(id)) {
-            let status = dag.get_task(held).await.map(|t| t.status);
+            let status = Self::held_status(dag.as_ref(), held).await;
             tracing::warn!(
                 task_id = %held,
-                ?status,
+                status = %status,
                 "failed-outcome row held by an existing task; the verdict was not recorded"
             );
         }
@@ -2343,11 +2478,15 @@ mod tests {
             blocked_by: vec![],
             blocks: vec![],
             input: serde_json::json!({}),
+            terminal: String::new(),
+            now: String::new(),
+            gap: String::new(),
             output_entities: vec![],
             estimated_seconds: 600,
             parent_id: None,
             // 工作包要带验收标准，分解门才会放行：这条夹具走的是同一条入图路径。
             acceptance: vec!["有产出".into()],
+            delivers: None,
         };
         Arc::new(MockTaskExecutor {
             atomic_tasks: vec![task],
@@ -2792,9 +2931,6 @@ mod tests {
         registry.insert_skill_config(cog_core::SkillConfig {
             skill_id: "planner".into(),
             name: "Planner".into(),
-            system_prompt: String::new(),
-            tools: vec!["read_file".into()],
-            max_iterations: Some(10),
             role_type: "planner".into(),
         });
 
@@ -2838,11 +2974,15 @@ mod tests {
             blocked_by: vec![],
             blocks: vec![],
             input: serde_json::json!({}),
+            terminal: String::new(),
+            now: String::new(),
+            gap: String::new(),
             output_entities: vec![],
             estimated_seconds: 600,
             parent_id: None,
             // 叶子工作包带验收标准：分解门会拒没有判据的叶子，夹具按合规的造。
             acceptance: vec!["有产出".into()],
+            delivers: None,
         }
     }
 
@@ -2882,6 +3022,47 @@ mod tests {
         let task =
             ActionPlanOrchestrator::atomic_task_to_task(&atomic_task_with_skill("t", "web_search"));
         assert_eq!(task.task_type, TaskType::Custom("web_search".into()));
+    }
+
+    /// 分解说的那一句，原样走到任务行的记录上；没说就是「没人说」。
+    ///
+    /// 这一段是「让平台自己的生产者写声明」的第一处：计划知道每一片交什么，
+    /// 让它说，而不是让派发时按 `skill_id` 反推。反推出来的形状换个座位接手就变，
+    /// 正是这套改动要清掉的那种待遇。
+    #[test]
+    fn the_decomposition_states_what_each_package_delivers() {
+        let stated = ActionPlanOrchestrator::atomic_task_to_task(&AtomicTask {
+            delivers: Some("judgement".into()),
+            ..atomic_task_with_skill("t", "evaluator")
+        });
+        assert_eq!(stated.deliverable(), cog_core::Deliverable::Judgement);
+        assert_eq!(
+            stated.deliverable_declaration(),
+            cog_core::DeliverableDeclaration::Stated {
+                conclusion: cog_core::Deliverable::Judgement,
+                by: None,
+                via: cog_core::StatementVia::Delivers,
+            }
+        );
+
+        // 不说就不猜：座位是 evaluator 也不把交付物推成判词。
+        let silent =
+            ActionPlanOrchestrator::atomic_task_to_task(&atomic_task_with_skill("t", "evaluator"));
+        assert_eq!(silent.deliverable(), cog_core::Deliverable::Unstated);
+
+        // 说出来但不在闭集里：记成读不出来，不退回旧键，也不改写成一个形状。
+        let misspelled = ActionPlanOrchestrator::atomic_task_to_task(&AtomicTask {
+            delivers: Some("review".into()),
+            ..atomic_task_with_skill("t", "evaluator")
+        });
+        assert!(
+            matches!(
+                misspelled.deliverable_declaration(),
+                cog_core::DeliverableDeclaration::Unreadable { .. }
+            ),
+            "闭集外的词被读成了：{:?}",
+            misspelled.deliverable_declaration()
+        );
     }
 
     /// TaskExecutor that replies a scripted sequence of atomic-task lists,
@@ -3162,6 +3343,138 @@ mod tests {
         assert!(
             dag.get_task("face-gap-CI-1").await.is_some(),
             "the held row stays the row the first submission wrote"
+        );
+    }
+
+    /// 读不到那一行时，这一问没有答案：不能按「没这一行」去分解。
+    ///
+    /// 上一笔的判据只防住了「已经在图里」那一支；读口一坏，同一条面漂移目标每次
+    /// 重投都会先付一次完整分解——而这一问本来就是为拦住这笔开销加的。
+    #[tokio::test]
+    async fn a_goal_whose_row_cannot_be_read_is_not_decomposed_again() {
+        let inner = Arc::new(crate::DagExecutor::new("ws-unreadable-goal".to_string()));
+        let dag: Arc<dyn cog_core::DagExecutor> = inner.clone();
+        let executor = Arc::new(CountingPlanExecutor::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(executor.clone())
+            .with_dag_executor(dag)
+            .with_decomposition_max_attempts(1);
+        let registry = SkillRegistry::new();
+        let asked = || executor.calls.load(std::sync::atomic::Ordering::SeqCst);
+        let goal = "face-gap: CI/构建/部署 drifted_binding";
+
+        planner
+            .process_goal_impl(goal, vec![hint_task("face-gap-CI-1")], &registry)
+            .await
+            .expect("the first submission decomposes and lands");
+        assert_eq!(asked(), 1);
+
+        inner.fail_task_reads_of("face-gap-CI-1");
+        let second = planner
+            .process_goal_impl(goal, vec![hint_task("face-gap-CI-1")], &registry)
+            .await;
+        assert!(
+            second.is_err(),
+            "a read that did not happen must not be answered as 'not planned yet'"
+        );
+        assert_eq!(asked(), 1, "no second decomposition may be paid for");
+    }
+
+    /// 子任务读不到时不判占位是孤儿：父子关系只在这一读里，读不到与「没挂上」同形，
+    /// 而按「没挂上」处理要把一条健康的行删掉再改写 Failed——不可逆。
+    #[tokio::test]
+    async fn a_placeholder_is_not_judged_stranded_when_a_child_cannot_be_read() {
+        let inner = Arc::new(crate::DagExecutor::new("ws-unreadable-child".to_string()));
+        let dag: Arc<dyn cog_core::DagExecutor> = inner.clone();
+
+        let mut child = hint_task("goal/child-1");
+        child.parent_task_id = Some("goal".to_string());
+        dag.add_task(child).await.expect("the child lands");
+        dag.add_task(hint_task("goal"))
+            .await
+            .expect("the placeholder lands");
+
+        inner.fail_task_reads_of("goal/child-1");
+        let stranded = ActionPlanOrchestrator::stranded_placeholders(
+            &*dag,
+            "goal",
+            &["goal/child-1".to_string()],
+            &["goal".to_string()],
+            &["goal".to_string()],
+        )
+        .await;
+        assert!(
+            stranded.is_empty(),
+            "a child nobody could read is not a childless placeholder"
+        );
+    }
+
+    /// 读不到占位本身时同样跳过这一趟，并说出跳过的是哪一条。
+    ///
+    /// 这一支返回的仍然是空表，与「它确实挂上了子任务」同形，屏幕上那一行是唯一
+    /// 能分开两者的地方。
+    #[tokio::test]
+    async fn a_placeholder_that_cannot_be_read_is_left_for_the_reconciler() {
+        let warns = crate::test_support::warn_text();
+        let inner = Arc::new(crate::DagExecutor::new(
+            "ws-unreadable-placeholder".to_string(),
+        ));
+        let dag: Arc<dyn cog_core::DagExecutor> = inner.clone();
+        dag.add_task(hint_task("goal"))
+            .await
+            .expect("the placeholder lands");
+
+        inner.fail_task_reads_of("goal");
+        let stranded = ActionPlanOrchestrator::stranded_placeholders(
+            &*dag,
+            "goal",
+            &[],
+            &["goal".to_string()],
+            &["goal".to_string()],
+        )
+        .await;
+        assert!(stranded.is_empty());
+        assert!(
+            warns.any("cannot read a placeholder that may be stranded"),
+            "读不到要占屏幕一行；否则这一趟与「它挂了子任务」逐字同形"
+        );
+    }
+
+    /// 入图时被同一 id 顶掉的那一行，日志里要说出「读不到」而不是 `None`。
+    #[tokio::test]
+    async fn a_held_row_whose_state_cannot_be_read_says_so_in_the_log() {
+        let warns = crate::test_support::warn_text();
+        let inner = Arc::new(crate::DagExecutor::new("ws-unreadable-held".to_string()));
+        let dag: Arc<dyn cog_core::DagExecutor> = inner.clone();
+        dag.add_task(hint_task("probe-1"))
+            .await
+            .expect("the held row lands");
+
+        let executor = Arc::new(CountingPlanExecutor::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(executor)
+            .with_dag_executor(dag);
+        let registry = SkillRegistry::new();
+
+        let mut probe = hint_task("probe-1");
+        probe.is_executable = true;
+        probe
+            .acceptance
+            .push("探针跑完并带回一条可判的结局".to_string());
+        probe.input["task_kind"] = serde_json::json!("capability_discovery");
+
+        inner.fail_task_reads_of("probe-1");
+        let ids = planner
+            .process_goal_impl("run the probe as written", vec![probe], &registry)
+            .await
+            .expect("a held row is an idempotent no-op, not a refusal");
+        assert!(
+            ids.is_empty(),
+            "nothing was queued: the id was already held"
+        );
+        assert!(
+            warns.any("unreadable"),
+            "the log line must say the row could not be read, not that no row exists"
         );
     }
 
@@ -4505,8 +4818,8 @@ mod tests {
         assert_eq!(stored.status, cog_core::TaskStatus::Pending);
         // 自我进化任务不领一个时长预算：计划器不再往行上写一个秒数当墙。
         assert_eq!(
-            stored.timeout_seconds,
-            Task::new("probe", TaskType::DagNode, serde_json::json!({})).timeout_seconds,
+            stored.declared_duration_seconds,
+            Task::new("probe", TaskType::DagNode, serde_json::json!({})).declared_duration_seconds,
             "计划器不该覆盖任务自带的那个数：它已经不是一条可回收的界了"
         );
         assert_eq!(
@@ -4544,9 +4857,10 @@ mod tests {
             .unwrap();
         assert_eq!(submitted, vec!["issue-12".to_string()]);
         let stored = dag.get_task("issue-12").await.unwrap();
-        let born = Task::new("probe", TaskType::DagNode, serde_json::json!({})).timeout_seconds;
+        let born =
+            Task::new("probe", TaskType::DagNode, serde_json::json!({})).declared_duration_seconds;
         assert_eq!(
-            stored.timeout_seconds, born,
+            stored.declared_duration_seconds, born,
             "行上那个数只能是造这条任务的人写的，不能是计划器按一类活的历史时长猜的"
         );
     }
@@ -4575,7 +4889,7 @@ mod tests {
             // 提交方自己声明的耐心。planner 不许覆盖它：规划器手上一度有一份按
             // 种类查出来的时长预算，写进每一行，从此这一列是那一刻的快照，而不是
             // 任何一条实测。一个显眼的数就能验「这一行是谁写的」。
-            t.timeout_seconds = 1234;
+            t.declared_duration_seconds = 1234;
             t
         };
 
@@ -4599,7 +4913,7 @@ mod tests {
         let stored = dag.get_task("github-issue-11").await.unwrap();
         assert!(stored.is_executable);
         assert_eq!(
-            stored.timeout_seconds, 1234,
+            stored.declared_duration_seconds, 1234,
             "planner 把提交方声明的耐心覆盖成了自己的快照"
         );
         assert_eq!(dag.get_all_tasks().await.len(), 1);
@@ -4650,7 +4964,7 @@ mod tests {
             }),
         );
         // 提交方声明的耐心，planner 不许改写（见自进化那条测试）。
-        leaf.timeout_seconds = 1234;
+        leaf.declared_duration_seconds = 1234;
 
         let ids = planner
             .process_goal_impl("fix the firing alert", vec![anchor, leaf], &registry)
@@ -4677,7 +4991,7 @@ mod tests {
         let stored_leaf = dag.get_task("self-signal-alert-abc").await.unwrap();
         assert!(stored_leaf.is_executable);
         assert_eq!(
-            stored_leaf.timeout_seconds, 1234,
+            stored_leaf.declared_duration_seconds, 1234,
             "planner 把提交方声明的耐心覆盖成了自己的快照"
         );
         assert_eq!(stored_leaf.goal_id.as_deref(), Some("signal:alert/r"));
@@ -4741,6 +5055,93 @@ mod tests {
             "the row has to be runnable: an outcome can only be read off a row that ran"
         );
         assert!(stored.action_planner_meta.as_ref().unwrap().verified);
+    }
+
+    /// 带着待办三格的行自己就是计划：终态抄成验收标准，不再花一次分解。
+    ///
+    /// 这是「按定义整段做、判据按 items 判」在入口上的形状：调用方给出拆法时，
+    /// 每件活自带 `terminal / now / gap`，那三格就是它说清的「怎样算完」。这条
+    /// 测试同时钉住两件事——执行器一次都没被调用（没有第二次分解），以及入图的
+    /// 那一行带着从三格抄来的验收标准（否则派发器不认它是说清了自己的活）。
+    #[tokio::test]
+    async fn a_row_that_carries_its_ledger_cell_is_taken_as_written() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-cell-row".to_string()));
+        let executor = Arc::new(CountingExecutor::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(executor.clone())
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(1);
+        let registry = SkillRegistry::new();
+
+        let row = Task::new(
+            "goal-cell/t1",
+            TaskType::Custom(cog_core::contract::work_item::PLATFORM_AGENT_TASK.into()),
+            serde_json::json!({
+                "query": "把三处收进一处",
+                "definition": "这一类：把三处收进一处；做完＝只剩一处。",
+                cog_core::contract::ledger_item::ITEM_INPUT_KEY: {
+                    "id": "goal-cell/t1",
+                    "terminal": "只剩一处",
+                    "now": "三处",
+                    "gap": "两处",
+                    "state": "未落",
+                },
+            }),
+        );
+
+        let ids = planner
+            .process_goal_impl("把三处收进一处", vec![row], &registry)
+            .await
+            .unwrap();
+
+        assert_eq!(ids, vec!["goal-cell/t1".to_string()]);
+        assert_eq!(
+            executor.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the cell already says what done means; decomposing it again costs a model call \
+             and drops the cell into no child"
+        );
+        let stored = dag.get_task("goal-cell/t1").await.unwrap();
+        assert_eq!(
+            stored.acceptance,
+            vec!["只剩一处".to_string()],
+            "the terminal has to reach the row: a dispatcher that reads acceptance would \
+             otherwise treat this row as one that never said what done means"
+        );
+        assert!(stored.action_planner_meta.as_ref().unwrap().verified);
+    }
+
+    /// 对照：既没有待办三格、也没有 `task_kind` 的行仍落到模型。
+    ///
+    /// 这一条防的是把「员工活」这个类型读成一张免判的批文——没有判据的行照样要
+    /// 由模型补出「怎样算完」，直通只会让它在派发器前面吊着。
+    #[tokio::test]
+    async fn a_row_without_cells_or_kind_still_goes_to_the_model() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-cell-row-bare".to_string()));
+        let executor = Arc::new(CountingExecutor::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(executor.clone())
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(1);
+        let registry = SkillRegistry::new();
+
+        let bare = Task::new(
+            "goal-bare/t1",
+            TaskType::Custom(cog_core::contract::work_item::PLATFORM_AGENT_TASK.into()),
+            serde_json::json!({ "query": "把三处收进一处" }),
+        );
+
+        let _ = planner
+            .process_goal_impl("把三处收进一处", vec![bare], &registry)
+            .await;
+
+        assert_eq!(
+            executor.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a row that states no criterion still needs the planner to state one"
+        );
     }
 
     /// 判据缺一项就不放行：只声明 `task_kind`、没写「怎样算完」的行，放行之后派发器

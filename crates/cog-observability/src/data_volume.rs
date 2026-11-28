@@ -436,7 +436,7 @@ mod tests {
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("cog-datavol-{}-{}", name, std::process::id()));
-        fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(fs::remove_dir_all(&dir));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -848,7 +848,7 @@ mod tests {
         }
         assert_eq!(obs.used_bytes(), Some(4096));
         handle.abort();
-        fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(fs::remove_dir_all(&root));
     }
 
     /// One process watching two volumes runs two loops, and the census says so.

@@ -43,7 +43,8 @@ pub const MEMORY_CURRENT_FILE: &str = "memory.current";
 /// 一条变更任务的寿命是十分钟量级（实测 2026-11-07 变更验证的服务时长均值
 /// 12.8 分钟），半分钟一采，一条任务的生命里落二十来个样本，够看见它的峰值；
 /// 再密就是在读一个半小时都不变的数。
-// cap: bound — 半分钟一采，一条任务里二十来个样本；更密只是重复读同一个数
+// cap: fixed — 半分钟一采，一条任务里二十来个样本；更密只是重复读同一个数
+// keep: 删掉后采样密到重复读同一个数，读数没更细；由「一条任务二十来个样本」兜住
 pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// 内核告诉进程「你在哪一格」的那份文件。
@@ -168,7 +169,8 @@ pub fn read_memory_current_from(root: &Path, proc_file: &Path) -> Option<u64> {
 /// 「没量到」、界掉回 1 又爬回来，来回抖；比这更长，窗里压着一条早已过去的大
 /// 构建，界被一个当下不会再发生的事件钉死，直到进程重启才松——那与写死一个数
 /// 只差一个重启周期。
-// cap: bound — 实测一条变更任务 12.8 分钟，一小时约五条
+// cap: fixed — 实测一条变更任务 12.8 分钟，一小时约五条
+// keep: 删掉后价格窗口装不下几条变更任务，均价被一两条定义；由「实测一条变更任务 12.8 分钟」兜住
 pub const PRICE_WINDOW: Duration = Duration::from_secs(3600);
 
 /// 一个样本：那一刻容器占了多少，同时有几条任务在跑。
@@ -313,6 +315,51 @@ pub fn apply_bound(slots: &tokio::sync::Semaphore, current: usize, want: usize) 
     }
 }
 
+/// 这条车道的一拍：读容器、量一条任务的价、算出界并把它应用到许可上。
+///
+/// 返回这一拍之后真正在用的界，以及「这一拍看见界被用满过」的凭据——下一拍能
+/// 不能往上爬靠它。读不到容器的那一拍返回 `None`：没有输入就没有求值，界留在
+/// 原地，与「算出来没变」是两件事。
+fn apply_lane_bound(
+    slots: &tokio::sync::Semaphore,
+    stream: &str,
+    root: &Path,
+    capacity: usize,
+    ran_full: bool,
+    footprint: &mut Footprint,
+) -> Option<(usize, bool)> {
+    let (Some(limit), Some(current)) = (read_memory_max(root), read_memory_current(root)) else {
+        return None;
+    };
+    let in_flight = capacity
+        .saturating_sub(slots.available_permits())
+        .min(capacity);
+    footprint.observe(current, in_flight, Instant::now());
+    let ran_full = ran_full || in_flight >= capacity;
+    let ceiling = derive_ceiling(limit, footprint);
+    let want = next_bound(capacity, ceiling, should_grow(capacity, ceiling, ran_full));
+    let applied = apply_bound(slots, capacity, want);
+    // 爬到新界之后，「用满过」要重新挣：新界还没有被一整拍跑满过。
+    let ran_full = if applied > capacity { false } else { ran_full };
+    if applied != capacity {
+        debug!(
+            stream = %stream,
+            from = capacity,
+            to = applied,
+            ceiling,
+            limit,
+            current,
+            baseline = footprint.baseline(),
+            per_task = footprint.per_task_bytes(),
+            "lane bound moved with the container's memory"
+        );
+        crate::observable::claim_slots_observable().set_slots(stream, applied);
+    }
+    // 每拍都记一次：界停在原地时，计数是唯一能说这条回路还在走的东西。
+    crate::observable::claim_slots_observable().record_bound_evaluation();
+    Some((applied, ran_full))
+}
+
 /// 车道许可的内存导出循环。
 ///
 /// `stream` 是读数面上这条车道的那一行：导出的界必须写回它，否则「配了几条」
@@ -360,42 +407,20 @@ pub fn spawn_lane_memory_bound(
                         _ = ticker.tick() => {}
                         _ = shutdown.wait() => break,
                     }
-                    let (Some(limit), Some(current)) =
-                        (read_memory_max(&root), read_memory_current(&root))
-                    else {
+                    let Some((applied, next_full)) = apply_lane_bound(
+                        &slots,
+                        &stream,
+                        &root,
+                        capacity,
+                        ran_full,
+                        &mut footprint,
+                    ) else {
                         // 读不到就不动界：把「量不到」当成「没有上限」会把界
                         // 一次抬到别的维度上去，那不是这次改动想干的事。
                         continue;
                     };
-                    let in_flight = capacity
-                        .saturating_sub(slots.available_permits())
-                        .min(capacity);
-                    footprint.observe(current, in_flight, std::time::Instant::now());
-                    if in_flight >= capacity {
-                        ran_full = true;
-                    }
-                    let ceiling = derive_ceiling(limit, &footprint);
-                    let want =
-                        next_bound(capacity, ceiling, should_grow(capacity, ceiling, ran_full));
-                    let applied = apply_bound(&slots, capacity, want);
-                    if applied > capacity {
-                        ran_full = false;
-                    }
-                    if applied != capacity {
-                        debug!(
-                            stream = %stream,
-                            from = capacity,
-                            to = applied,
-                            ceiling,
-                            limit,
-                            current,
-                            baseline = footprint.baseline(),
-                            per_task = footprint.per_task_bytes(),
-                            "lane bound moved with the container's memory"
-                        );
-                        crate::observable::claim_slots_observable().set_slots(&stream, applied);
-                        capacity = applied;
-                    }
+                    capacity = applied;
+                    ran_full = next_full;
                 }
             }
         },
@@ -428,6 +453,7 @@ mod tests {
         footprint
     }
 
+    // proves: taskRouter.localClaimConcurrency
     /// 界必须跟着容器上限走：同一个足迹下把 `memory.max` 抬上去，导出值要跟着抬。
     ///
     /// 这就是那条原则的判据——改动前界是配置里的一个数，`memory.max` 怎么改它都不动。
@@ -449,6 +475,47 @@ mod tests {
         assert!(
             derive_ceiling(raised, &footprint) > derive_ceiling(16 * GIB, &footprint),
             "抬了容器的 memory.max，导出的界却没跟着抬"
+        );
+    }
+
+    /// 界不变的一拍仍然是一拍：观测面上的求值计数每拍都往上走。
+    ///
+    /// 没有这一条，「这一窗算过」只能从界本身看，而一个停住的界与一条停摆的
+    /// 回路在读数面上是同一个数。
+    #[test]
+    fn the_bound_beat_counts_even_when_the_container_does_not_move() {
+        let dir = fixture(&[
+            (MEMORY_MAX_FILE, "17179869184\n"),
+            (MEMORY_CURRENT_FILE, "3221225472\n"),
+        ]);
+        let slots = tokio::sync::Semaphore::new(1);
+        let observable = crate::observable::claim_slots_observable();
+        let before = observable.bound_evaluations();
+        let mut footprint = Footprint::default();
+        let first = apply_lane_bound(
+            &slots,
+            "lane-memory-test",
+            dir.path(),
+            1,
+            false,
+            &mut footprint,
+        )
+        .expect("both readings are in the fixture");
+        let second = apply_lane_bound(
+            &slots,
+            "lane-memory-test",
+            dir.path(),
+            first.0,
+            first.1,
+            &mut footprint,
+        )
+        .expect("both readings are in the fixture");
+        assert_eq!(first.0, 1, "no price measured yet is one task, not zero");
+        assert_eq!(second.0, first.0, "the container did not move");
+        assert!(
+            observable.bound_evaluations() >= before + 2,
+            "two beats, two evaluations: before={before}, after={}",
+            observable.bound_evaluations()
         );
     }
 

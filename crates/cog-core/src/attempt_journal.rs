@@ -5,10 +5,11 @@
 //! 已交付结果）都随进程消失；盘上唯一忠实的副本，是每一条进入过上下文的
 //! `Message`。所以这份日志记的就是那些消息，按顺序、原样。
 //!
-//! 与 `gateway_llm_exchange` 的分工：那张表记的是**发出去的字节**，脱敏、截断、
-//! 只供人事后查一笔调用（它的 doc 就是这么写的）。续跑要的是**能原样交还给模型的
-//! 消息**，脱敏过的字节把它交回去，就是把一段被改过的对话当成它自己的历史。
-//! 所以两件事两张表，各自只存自己那一面。
+//! 与 `gateway_llm_exchange` 的分工：那张表记的是**一次调用的发生**——谁花的、
+//! 哪个上游、两边的哈希与字节数，正文的整份副本在内存 Raw 层，表里是它的指针。
+//! 续跑要的是**能原样交还给模型的消息**，而且要按顺序一次读回来；从一次次的
+//! 交换行里重新拼，拼出来的是「发过哪些字节」，不是「这段对话长什么样」——工具
+//! 返回被剪过的那些，拼回去就少了半截。所以两件事两张表，各自只存自己那一面。
 //!
 //! 落点选在进程级单例（与 `progress` 同一个套路）：写这条日志的是内核，而内核
 //! 不认识数据库。装进来的是存储插件，它手里有池子。
@@ -132,8 +133,10 @@ pub enum EffectClass {
 pub fn effect_of(tool: &str) -> EffectClass {
     match tool {
         "read_file" | "raw_list" | "raw_fetch" | "read_task_ledger" | "list_agents"
-        | "search_code" | "command_output" => EffectClass::Read,
-        "write_file" | "edit_file" => EffectClass::Write,
+        | "search_code" | "grep" | "glob" | "git_status" | "git_diff" | "command_output" => {
+            EffectClass::Read
+        }
+        "write_file" | "edit_file" | "apply_patch" => EffectClass::Write,
         _ => EffectClass::Effect,
     }
 }
@@ -193,12 +196,29 @@ mod tests {
     fn a_named_read_tool_never_pays_for_a_second_look() {
         assert_eq!(effect_of("read_file"), EffectClass::Read);
         assert_eq!(effect_of("read_task_ledger"), EffectClass::Read);
+        // 树上的四种读法：搜索、找文件、看改了没有、看改了什么。它们没有一样
+        // 会改树，续跑时重看去一遍是白付一次。
+        assert_eq!(effect_of("search_code"), EffectClass::Read);
+        assert_eq!(effect_of("grep"), EffectClass::Read);
+        assert_eq!(effect_of("glob"), EffectClass::Read);
+        assert_eq!(effect_of("git_status"), EffectClass::Read);
+        assert_eq!(effect_of("git_diff"), EffectClass::Read);
     }
 
     #[test]
     fn file_writes_are_replayable_only_because_the_resume_checks_them_first() {
         assert_eq!(effect_of("write_file"), EffectClass::Write);
         assert_eq!(effect_of("edit_file"), EffectClass::Write);
+        // 补丁是一次落一片的写：没点名的话它会掉进 Effect，那一格仍然安全，
+        // 但「这条要重放」的判断从此只能靠猜。
+        assert_eq!(effect_of("apply_patch"), EffectClass::Write);
+    }
+
+    /// 提交不在可重放的那一类：同一笔提交落两次，历史里就多一个不该有的
+    /// 提交，而这件事事后修不掉。
+    #[test]
+    fn a_commit_is_an_effect_not_a_replayable_write() {
+        assert_eq!(effect_of("git_commit"), EffectClass::Effect);
     }
 
     /// 名单上是 Effect 的，与名单上根本没有的，必须是同一类：一个不认识的工具

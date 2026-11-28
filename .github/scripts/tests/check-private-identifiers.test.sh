@@ -10,7 +10,7 @@
 # 长成一张全网仓名清单。
 #
 # 裸标识那一边的输入来自 CI secret，所以它在本地有四种状态：注入且命中（红）、
-# 注入且无命中（绿）、没注入（绿但要明说没跑）、没注入且本级要求必须有（红）。
+# 注入且无命中（绿）、没注入（3＝没验，不是绿）、没注入且本级要求必须有（红）。
 # 四种都要钉——只测「命中即红」的话，一个永远没注入的 secret 会让这层静默作废。
 #
 # 两层的夹具分开：测裸标识那一边时树上不留任何 `owner/repo` 泄露，否则红可能来自
@@ -35,6 +35,9 @@ trap 'rm -rf "${work}"' EXIT
 
 fixture="${work}/fixture"
 git -C "${work}" init -q fixture
+# 所有者现在从**仓自己的 origin** 读（2026-11-20：原来是一个写死的账号名）。
+# 夹具因此要有一条 origin，否则门判「读不出所有者」并退 3——那不是这条用例要测的东西。
+git -C "${fixture}" remote add origin https://github.com/hcipengm/cogneva.git
 mkdir -p "${fixture}/src"
 printf '%s\n' 'clone: https://github.com/hcipengm/cogneva.git' >"${fixture}/README.md"
 printf '%s\n' 'https://gitee.com/hcipengm/cogneva.git' >"${fixture}/src/notes.txt"
@@ -61,12 +64,17 @@ run_gate() {
 # --- 1：所有者/仓那一层 ---
 
 # 允许的那两个写法：绿。`.git` 后缀被算成同一个仓，不是第二个。
+#
+# 这一段的两格判的是**第一层**，所以要给它一份造出来的名单让第二层跑成：
+# 不注入时第二层报 3（没验），那个 3 会盖住这里要看的东西。
+export PRIVATE_IDENTIFIERS='zzfacequuxnothere'
 run_gate 0 '只有 hcipengm/cogneva' "${fixture}"
 
 # 第三方 owner 完全不在这条判据的视野里：加进去仍然绿。
 printf '%s\n' 'upstream: https://github.com/rust-lang/rust.git' >"${fixture}/src/third.txt"
 git -C "${fixture}" add -A
 run_gate 0 '只有 hcipengm/cogneva' "${fixture}"
+unset PRIVATE_IDENTIFIERS
 
 # 另一个仓：红，且判词指到行（文件:行号）。
 #
@@ -88,7 +96,6 @@ esac
 rm "${fixture}/src/leak.txt"
 printf '%s\n' 'the face name zzfacequux appears here' >"${fixture}/src/bare.txt"
 git -C "${fixture}" add -A
-run_gate 0 '只有 hcipengm/cogneva' "${fixture}"   # 第一层干净，红只能来自第二层
 
 # 注入且命中 ⇒ 红。
 export PRIVATE_IDENTIFIERS='zzfacequux'
@@ -100,8 +107,10 @@ export PRIVATE_IDENTIFIERS='no-such-token-anywhere'
 run_gate 0 '无命中' "${fixture}"
 unset PRIVATE_IDENTIFIERS
 
-# 没注入 ⇒ 绿，但必须明说这一遍没跑（不静默当通过）。
-run_gate 0 '这一遍没跑' "${fixture}"
+# 没注入 ⇒ 3，不是 0：这一层没跑成，与「跑了且干净」在退出码上不能同形——
+# 同形的话整层从没执行过而作业永远是绿的。调用方可以决定 3 算不算失败，但
+# 它必须自己看见这个 3。
+run_gate 3 '这一遍没跑' "${fixture}"
 
 # 没注入而本级要求必须在 ⇒ 红。
 export REQUIRE_PRIVATE_IDENTIFIERS=true
@@ -115,6 +124,7 @@ unset REQUIRE_PRIVATE_IDENTIFIERS
 #   b) 根目录根本不是 git 仓库（git grep 退出 >1，命中同样为空）。
 quiet="${work}/quiet"
 git -C "${work}" init -q quiet
+git -C "${quiet}" remote add origin https://github.com/hcipengm/cogneva.git
 mkdir -p "${quiet}/deploy"
 printf '%s\n' 'nothing points at a repository here' >"${quiet}/deploy/notes.txt"
 git -C "${quiet}" add deploy/notes.txt
@@ -125,8 +135,11 @@ mkdir -p "${not_a_repo}/deploy"
 printf '%s\n' 'see https://github.com/hcipengm/cogneva' >"${not_a_repo}/deploy/notes.txt"
 run_gate 3 '读不出这棵树' "${not_a_repo}"
 
-# --- 4：真文件 —— 这棵仓库今天必须绿 ---
-# 夹具全绿而真树红，说明这条门在测自己；两边都绿，才说明它今天在守东西。
-run_gate 0 '通过' "${repo}"
+# --- 4：真文件 ---
+# 夹具全绿而真树红，说明这条门在测自己。真树上今天的状态是 3：第一层（所有者/仓）
+# 干净，第二层没有名单可读——这两件事分开印，所以退出码是 3 而不是 0。
+run_gate 3 '通过' "${repo}"
+# 「注入之后是 0」不在这里再演一遍：这一份测试文件自己就在真树里，名单里的任何一个
+# 字面量写在这里都会被那一层扫到，红是对的。注入那一侧由上面的夹具覆盖。
 
 echo "check-private-identifiers.test: all checks passed"

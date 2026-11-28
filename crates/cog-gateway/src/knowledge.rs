@@ -27,22 +27,27 @@ use std::sync::Arc;
 
 use crate::GatewayState;
 
-fn default_top_k() -> usize {
-    10
-}
-
 /// The widest answer this route will assemble. Same ceiling the wiki search
 /// applies, because both are asking a store to return a page of its contents
 /// over HTTP rather than sizing an internal candidate window.
-// cap: bound — 检索最多回多少条，界的是单次查询的代价
+// cap: fixed — 检索最多回多少条，界的是单次查询的代价
+// keep: 删掉后一次检索可以要任意多条，单次查询的代价无界；由「界的是单次查询的代价」兜住
 const MAX_TOP_K: usize = 100;
+
+/// 检索宽度的唯一收口：两条检索路由（知识面、wiki）都从这里取界。
+///
+/// 从前 wiki 那条自己写着一个 100，doc 却写着「与知识面同一个上限」——同一个
+/// 事实两处记录，改一处另一处不会跟着动，而那句话只在有人碰巧读到它时才成立。
+pub(crate) fn clamp_top_k(asked: usize) -> usize {
+    asked.clamp(1, MAX_TOP_K)
+}
 
 #[derive(Debug, Deserialize)]
 pub struct KnowledgeSearchRequest {
     /// The question, in the same form a caller would ask the layer directly.
     pub query: String,
-    /// How many entries the caller wants back.
-    #[serde(default = "default_top_k")]
+    /// How many entries the caller wants back. Required: how much a caller
+    /// wants is the caller's decision, not a number this route invents for it.
     pub top_k: usize,
 }
 
@@ -99,7 +104,7 @@ async fn search(
             .into_response();
     }
 
-    let top_k = req.top_k.clamp(1, MAX_TOP_K);
+    let top_k = clamp_top_k(req.top_k);
     // The retrieval takes a task because its callers have one and build the
     // query key from it. Here there is no task: the query is the whole input.
     let task = cog_core::Task::new(

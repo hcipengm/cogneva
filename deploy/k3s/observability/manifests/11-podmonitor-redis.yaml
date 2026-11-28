@@ -1,3 +1,4 @@
+# census-keep: shapes=deploy-numbers — 部署清单里的数是部署自己的声明：它写在生效的那一处，改它只改这一次部署，不是代码里看不见的默认；由部署面本身兜住
 # PodMonitor — 抓 redis Pod 上那个只做 textfile 采集的 node-exporter 边车。
 #
 # 为什么要多一跳：AOF 修复是一次性 init 容器的结论（"这次启动放弃了多少字节、

@@ -57,8 +57,6 @@ use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragmen
 use cog_core::{ResourceEvent, ResourceEventKind, ResourceEventOutcome, SFResult, ShutdownSignal};
 use tracing::{debug, info, warn};
 
-use crate::change_execution::{KUBECTL_READ_TIMEOUT_SECS, KUBECTL_TIMEOUT_SECS};
-
 /// What became of one claim in one round, counted per outcome.
 pub const OUTCOME_METRIC: &str = "cogneva_volume_capacity_outcome_total";
 
@@ -223,28 +221,36 @@ impl CapacityOutcome {
 /// The same factor the chart's volumes are declared by, and stated once here so
 /// the loop that repairs a declaration and the numbers in `values.yaml` cannot
 /// drift apart into two standards for "big enough".
-// cap: bound — 声明值按这条余量放大，维修循环与 values.yaml 才不会各自立一套「够大」的标尺
+///
+/// 它是 `values.yaml` 里写定的那条约定（卷声明与 cpu/memory 上限的 why 都写着
+/// 「times the 120% headroom」），不是某次测量推出来的数：改它要先改那张表。
+// cap: fixed — `deploy/helm/cogneva/values.yaml` 的卷与资源上限都按这条 120% 余量声明（why 行点名）
+// keep: 删掉后卷与资源上限不再按 120% 余量声明，声明值与代码里的判据脱钩；由「values.yaml 的 why 行点名」兜住
 pub const HEADROOM_PERCENT: u64 = 120;
 
 /// Walks whose peak is kept. Six is about an hour at the default cadence, which
 /// is longer than any one build and shorter than the day a mis-sized
 /// declaration otherwise survives.
-// cap: derived — 峰值要盖过任何一次构建，又要短于「填错一次能活一整天」
+// cap: fixed — 峰值要盖过任何一次构建，又要短于「填错一次能活一整天」
+// keep: 删掉后峰值窗口要么盖不住一次构建，要么长到填错一次能活一整天；由「盖过任何一次构建、短于一天」兜住
 pub const PEAK_ROUNDS: usize = 6;
 
 /// Cadence of the loop when the deployment states none.
-// cap: bound — 部署没给节拍时的默认轮询间隔
+// cap: fixed — 部署没给节拍时的默认声明值：真正的节拍由部署写，这里只是不说自己节拍的部署的退路
+// keep: 删掉后不说自己节拍的部署没有重决的时刻，卷在无人看的情况下变满；由「没给节拍时的退路」兜住
 pub const DEFAULT_INTERVAL_SECS: u64 = 600;
 
 /// Floor on that cadence: a walk and an API read are cheap, but a loop that
 /// re-decides faster than the volume changes is just a busier way to be wrong.
-// cap: bound — 节拍下限：比卷的变化更快地重决只是在更忙地犯错
+// cap: fixed — 节拍下限：比卷的变化更快地重决只是在更忙地犯错
+// keep: 删掉后节拍可以比卷的变化还快，重决变成更忙地犯错；由「节拍下限」兜住
 pub const MIN_INTERVAL_SECS: u64 = 300;
 
 /// How long a claim that refused the patch is left alone before it is tried
 /// again. An API refusal is usually a property of the StorageClass and will not
 /// change by asking again next round.
-// cap: bound — API 拒绝通常是 StorageClass 的属性，再问一遍不会变
+// cap: fixed — API 拒绝通常是 StorageClass 的属性，再问一遍不会变
+// keep: 删掉后 StorageClass 的固定拒绝被每拍重问，同一次拒绝占满日志；由「再问一遍不会变」兜住
 pub const REFUSAL_COOLDOWN_SECS: u64 = 3600;
 
 /// How long a claim may announce more than it has been given, with no resize
@@ -263,7 +269,8 @@ pub const REFUSAL_COOLDOWN_SECS: u64 = 3600;
 /// half an hour at the floor, so a resizer that takes forty minutes would be
 /// called missing on a loop that merely decided more often. The fact being
 /// judged is how long nothing has answered, and that is time.
-// cap: bound — 一个钟头还没有任何 resize 条件，就不是「慢」而是「没人应答」
+// cap: fixed — 一个钟头还没有任何 resize 条件，就不是「慢」而是「没人应答」
+// keep: 删掉后一个钟头没有 resize 条件的卷永远读成「慢」，没人应答的扩容不被发现；由「慢与没人应答的分界」兜住
 pub const ORPHAN_AFTER_SECS: u64 = 3600;
 
 /// Where the shortfall's start time is kept: unix seconds, on the claim itself.
@@ -1110,12 +1117,25 @@ pub fn targets_from_env() -> Vec<ClaimTarget> {
 /// series that stays empty instead of a deployment that is fine.
 pub const OCCUPANCY_URL_ENV: &str = "COGNEVA_CLAIM_STORE_METRICS_URL";
 
-/// How long one scrape of that endpoint may take.
+/// How long the scrape may go without receiving a byte before it is judged stuck.
 ///
-/// What arrives is already up to one scan interval old, so a scrape that
-/// outlives a round would hold the round for a figure the next one has anyway.
-// cap: bound — 比一拍还慢的抓取拿不到新东西，下一拍读到的还是同一个数
+/// Not a total time: what arrives is already up to one scan interval old, so a
+/// scrape that is still delivering is worth finishing even when it outlives a
+/// round, while a connection that has produced nothing for this long is the
+/// shape a dead endpoint has.
+// cap: fixed — 一拍内没有新字节＝这条连接不是慢，是不动了；判据是字节，不是总时长
+// keep: 删掉后一条不再来字节的连接一直挂着，抓取永远不结束；由「一拍内没有新字节就是不动了」兜住
+// wall: 等=这条连接上的新字节 / 等不到=这一拍读作「不动了」，与「慢」分开——判据是字节，不是总时长 / 续跑=能，下一拍重新连上再读
 pub const OCCUPANCY_SCRAPE_TIMEOUT_SECS: u64 = 10;
+
+/// How long curl may spend before the connection is up.
+// cap: fixed — 连不上与连上不动是两件事，这一条只管握手
+// keep: 删掉后握手没有上限，连不上的抓取会一直重试；由「连不上与连上不动是两件事」兜住
+const CURL_CONNECT_TIMEOUT_SECS: &str = "15";
+
+/// 只要有字节进来就算在动。写成 1 而不是 0，因为 0 在 curl 里不是「任何速率都算在动」。
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+const CURL_SPEED_LIMIT_BYTES_PER_SEC: &str = "1";
 
 /// The label the published series names its namespace with.
 const NAMESPACE_LABEL: &str = "namespace";
@@ -1227,18 +1247,25 @@ async fn scrape_occupancy(
     url: &str,
     namespace: &str,
 ) -> Result<std::collections::BTreeMap<String, u64>, String> {
-    let max_time = OCCUPANCY_SCRAPE_TIMEOUT_SECS.to_string();
-    let out = tokio::time::timeout(
-        Duration::from_secs(OCCUPANCY_SCRAPE_TIMEOUT_SECS),
-        tokio::process::Command::new("curl")
-            .args(["-sSf", "--max-time", &max_time, url])
-            .output(),
-    )
-    .await
-    .map_err(|_| {
-        crate::cmd_timeout::timed_out(&format!("curl {url}"), OCCUPANCY_SCRAPE_TIMEOUT_SECS)
-    })?
-    .map_err(|e| format!("curl {url} could not run: {e}"))?;
+    // 判据是字节，不是总时长：`--max-time` 会砍掉一条慢但一直在送字节的连接，
+    // 而这条读数要的正是「它在不在送」。`--speed-time` 是 curl 自己的「不动」判据。
+    let stall = OCCUPANCY_SCRAPE_TIMEOUT_SECS.to_string();
+    let mut cmd = tokio::process::Command::new("curl");
+    cmd.args([
+        "-sSf",
+        "--connect-timeout",
+        CURL_CONNECT_TIMEOUT_SECS,
+        "--speed-limit",
+        CURL_SPEED_LIMIT_BYTES_PER_SEC,
+        "--speed-time",
+        &stall,
+        url,
+    ])
+    .kill_on_drop(true);
+    let out = match cog_core::progress::run_child_watched(cmd, &format!("curl {url}")).await {
+        Ok(cog_core::progress::ChildOutcome::Exited(out)) => out,
+        Err(e) => return Err(format!("curl {url} could not run: {e}")),
+    };
     if !out.status.success() {
         return Err(format!(
             "curl {url} exited {}: {}",
@@ -1252,14 +1279,16 @@ async fn scrape_occupancy(
     ))
 }
 
-async fn kubectl(args: &[&str], timeout_secs: u64) -> Result<String, String> {
-    let out = tokio::time::timeout(
-        Duration::from_secs(timeout_secs),
-        tokio::process::Command::new("kubectl").args(args).output(),
-    )
-    .await
-    .map_err(|_| crate::cmd_timeout::timed_out(&format!("kubectl {args:?}"), timeout_secs))?
-    .map_err(|e| format!("kubectl {args:?} could not run: {e}"))?;
+/// 判的是它还在不在产出，不是它跑了多久：一次 `kubectl get` 在 API 服务器忙时可能
+/// 走上很久，而一份卡住的读与它按秒的界眼里是同一个读数。
+async fn kubectl(args: &[&str]) -> Result<String, String> {
+    let cmdline = format!("kubectl {args:?}");
+    let mut cmd = tokio::process::Command::new("kubectl");
+    cmd.args(args).kill_on_drop(true);
+    let out = match cog_core::progress::run_child_watched(cmd, &cmdline).await {
+        Ok(cog_core::progress::ChildOutcome::Exited(out)) => out,
+        Err(e) => return Err(format!("{cmdline} could not run: {e}")),
+    };
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(format!(
@@ -1443,12 +1472,7 @@ async fn reconcile(
     let peak = state.observe(used);
 
     let ns = namespace();
-    let json = match kubectl(
-        &["get", "pvc", &target.claim, "-n", &ns, "-o", "json"],
-        KUBECTL_READ_TIMEOUT_SECS,
-    )
-    .await
-    {
+    let json = match kubectl(&["get", "pvc", &target.claim, "-n", &ns, "-o", "json"]).await {
         Ok(json) => json,
         Err(e) => {
             warn!(claim = %target.claim, error = %e, "volume capacity: claim unreadable");
@@ -1600,19 +1624,16 @@ async fn reconcile(
         "{{\"spec\":{{\"resources\":{{\"requests\":{{\"storage\":\"{}\"}}}}}}}}",
         wanted
     );
-    match kubectl(
-        &[
-            "patch",
-            "pvc",
-            &target.claim,
-            "-n",
-            &ns,
-            "--type=merge",
-            "-p",
-            &patch,
-        ],
-        KUBECTL_TIMEOUT_SECS,
-    )
+    match kubectl(&[
+        "patch",
+        "pvc",
+        &target.claim,
+        "-n",
+        &ns,
+        "--type=merge",
+        "-p",
+        &patch,
+    ])
     .await
     {
         Ok(_) => {
@@ -1663,12 +1684,7 @@ async fn reconcile(
 /// that watches it lives, and nothing else on any surface says so.
 async fn stamp_shortfall(claim: &str, ns: &str, now_unix: u64) -> bool {
     let pair = format!("{SHORTFALL_SINCE_ANNOTATION}={now_unix}");
-    if let Err(e) = kubectl(
-        &["annotate", "pvc", claim, "-n", ns, &pair, "--overwrite"],
-        KUBECTL_TIMEOUT_SECS,
-    )
-    .await
-    {
+    if let Err(e) = kubectl(&["annotate", "pvc", claim, "-n", ns, &pair, "--overwrite"]).await {
         warn!(
             claim,
             error = %e,
@@ -1683,12 +1699,7 @@ async fn stamp_shortfall(claim: &str, ns: &str, now_unix: u64) -> bool {
 
 async fn clear_shortfall_stamp(claim: &str, ns: &str) {
     let removal = format!("{SHORTFALL_SINCE_ANNOTATION}-");
-    if let Err(e) = kubectl(
-        &["annotate", "pvc", claim, "-n", ns, &removal],
-        KUBECTL_TIMEOUT_SECS,
-    )
-    .await
-    {
+    if let Err(e) = kubectl(&["annotate", "pvc", claim, "-n", ns, &removal]).await {
         warn!(
             claim,
             error = %e,
@@ -1702,32 +1713,26 @@ async fn clear_shortfall_stamp(claim: &str, ns: &str) {
 /// quota moves as other claims are created, and a cached ceiling would let this
 /// loop write a request the namespace can no longer accept.
 async fn read_ceiling(ns: &str, own_request: u64) -> Option<Ceiling> {
-    let limit = kubectl(
-        &["get", "limitrange", "-n", ns, "-o", "json"],
-        KUBECTL_READ_TIMEOUT_SECS,
-    )
-    .await
-    .ok()
-    .and_then(|json| match limit_range_max_storage(&json) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error = %e, "volume capacity: limit range unreadable; ceiling unknown");
-            None
-        }
-    });
-    let quota = kubectl(
-        &["get", "resourcequota", "-n", ns, "-o", "json"],
-        KUBECTL_READ_TIMEOUT_SECS,
-    )
-    .await
-    .ok()
-    .and_then(|json| match quota_free_storage(&json, own_request) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error = %e, "volume capacity: quota unreadable; ceiling unknown");
-            None
-        }
-    });
+    let limit = kubectl(&["get", "limitrange", "-n", ns, "-o", "json"])
+        .await
+        .ok()
+        .and_then(|json| match limit_range_max_storage(&json) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "volume capacity: limit range unreadable; ceiling unknown");
+                None
+            }
+        });
+    let quota = kubectl(&["get", "resourcequota", "-n", ns, "-o", "json"])
+        .await
+        .ok()
+        .and_then(|json| match quota_free_storage(&json, own_request) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "volume capacity: quota unreadable; ceiling unknown");
+                None
+            }
+        });
     admission_ceiling(limit, quota)
 }
 
@@ -1833,13 +1838,10 @@ pub fn spawn_volume_capacity_loop(
                     // a claim other than the one about to be raised, and a read
                     // taken after the first raise would be answering the
                     // question too late to be acted on.
-                    let blocked_classes = match kubectl(
-                        &["get", "pvc", "-n", &ns, "-o", "json"],
-                        KUBECTL_READ_TIMEOUT_SECS,
-                    )
-                    .await
-                    .map_err(|e| e.to_string())
-                    .and_then(|json| parse_claims(&json))
+                    let blocked_classes = match kubectl(&["get", "pvc", "-n", &ns, "-o", "json"])
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|json| parse_claims(&json))
                     {
                         Ok(claims) => classes_that_do_not_expand(&claims, unix_now()),
                         Err(e) => {
@@ -1930,6 +1932,7 @@ mod tests {
         assert_eq!(growth_target(100 * GIB, 120 * GIB), None);
     }
 
+    // proves: appData.storage
     #[test]
     fn a_declaration_below_the_peak_is_raised_to_the_headroom_rounded_up() {
         // 149GiB peak, 72Gi declared: 149 * 1.2 = 178.8 -> 179Gi.
@@ -1941,6 +1944,50 @@ mod tests {
     #[test]
     fn an_empty_volume_never_asks_for_more() {
         assert_eq!(growth_target(0, 10 * GIB), None);
+    }
+
+    // proves: backup.storage
+    // proves: securityGateway.gitMirror.storage
+    // proves: evolution.gitRemote.storage
+    // proves: evolution.sandboxStorage
+    // proves: evolution.sourceStorage
+    // proves: evolution.dataStorage
+    // proves: sandboxExecutor.storage
+    // proves: clusterRegistry.storage
+    // proves: backends.postgres.storage
+    // proves: backends.redis.storage
+    // proves: backends.qdrant.storage
+    // proves: backends.nats.storage
+    // proves: backends.meilisearch.storage
+    // proves: backends.seaweedfs.storage
+    /// The declaration is a function of one measured input: the used bytes the
+    /// loop read this round. Feed it a different reading and the target moves;
+    /// that is what separates a derived declaration from a pinned one.
+    ///
+    /// It also pins the direction: a claim is only ever raised. A reading that
+    /// came back below the declaration announces nothing, because a PVC cannot
+    /// be shrunk -- the loop must not report a target it cannot carry out.
+    #[test]
+    fn a_claim_target_follows_the_measured_used_bytes() {
+        let declared = 20 * GIB;
+        assert_eq!(
+            growth_target(4 * GIB, declared),
+            None,
+            "4 * 1.2 is inside 20Gi"
+        );
+        assert_eq!(
+            growth_target(30 * GIB, declared),
+            Some(36 * GIB),
+            "30 * 1.2 = 36: the same claim, a different reading, a different target"
+        );
+        assert_eq!(
+            growth_target(50 * GIB, declared),
+            Some(60 * GIB),
+            "the target has to keep following the reading, not stop at the first raise"
+        );
+        // Once raised, the new declaration is the baseline: the same reading
+        // does not ask again, so the loop converges instead of re-patching.
+        assert_eq!(growth_target(30 * GIB, 36 * GIB), None);
     }
 
     /// One scrape names every claim on the node. This deployment may only
@@ -2519,6 +2566,23 @@ mod tests {
         }
     }
 
+    /// 目标不变的一拍仍然是一拍：连续两拍记下同一个结果，计数必须往上走。
+    ///
+    /// 界没动时，`outcome_count` 是唯一能说这条回路还在走的东西；没有它，
+    /// 一个安静卷与一条停摆的回路发布的是同一个形状。
+    #[test]
+    fn a_beat_whose_target_does_not_move_still_counts() {
+        let readings = VolumeCapacityReadings::new();
+        for expected in 1..=2 {
+            readings.record("cogneva-evolution-source-pvc", CapacityOutcome::AtTarget);
+            assert_eq!(
+                readings.outcome_count("cogneva-evolution-source-pvc", CapacityOutcome::AtTarget),
+                expected,
+                "a steady clock is still a round"
+            );
+        }
+    }
+
     fn target() -> ClaimTarget {
         ClaimTarget {
             claim: "cogneva-evolution-source-pvc".to_string(),
@@ -2769,6 +2833,6 @@ mod tests {
         );
         assert_eq!(unmeasured.cap_bytes(), None);
 
-        std::fs::remove_dir_all(&root).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     }
 }

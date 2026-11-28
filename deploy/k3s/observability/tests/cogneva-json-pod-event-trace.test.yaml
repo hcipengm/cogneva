@@ -187,8 +187,10 @@ tests:
         values: '20000x360'
       - series: 'cogneva_trace_tier_scan_interval_seconds{job="trace"}'
         values: '60x360'
+      # 窗口是 1 小时、左端开区间：跳变落在 t=302，窗口 (300, 360] 里先留一个 0 的样本，
+      # 压在 300 上 increase 读出来是 0，这一条就不会响。
       - series: 'cogneva_trace_tier_pass_failures_total{job="trace"}'
-        values: '0x300 2x60'
+        values: '0x302 2x58'
     alert_rule_test:
       - eval_time: 360m
         alertname: trace_tier_demotion_stalled
@@ -207,12 +209,14 @@ tests:
               severity: warning
               job: trace
 
-  # 同样的超期，但这条读数三小时前才开始报：先攒够六小时窗口。
+  # 同样的超期，但这条读数只有 175 分钟的历史：先攒够六小时窗口。
   # 删掉「六小时里的点比三小时里的多」那条腿，这一格会响。
+  # 起点不能正好压在 t=180 上：3h 子查询左端开区间，那一格样本只落进 6h 那边，
+  # count 差 1 就被读成「比三小时老」，读的是分辨率而不是历史。
   - interval: 1m
     input_series:
       - series: 'cogneva_trace_tier_overdue'
-        values: '_x180 1x180'
+        values: '_x185 1x175'
     alert_rule_test:
       - eval_time: 360m
         alertname: trace_tier_demotion_stalled

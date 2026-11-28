@@ -171,6 +171,19 @@ pub trait TaskExecutor: Send + Sync {
 
     /// Execute a single task and return a unified `TaskResult`.
     async fn execute(&self, task: &Task) -> SFResult<TaskResult>;
+
+    /// 这条活该交给谁。
+    ///
+    /// 派工侧在跨过队列边界之前问一次，拿这个名字去认领：认领要把责任人写在行
+    /// 上，而只有执行器知道自己会用谁。答案必须与 [`Self::execute`] 实际用的是
+    /// 同一个人——两处各挑一次，行上写着甲、活由乙跑，署名与责任就分家了。
+    ///
+    /// `None` 是「这个执行器说不出一个人」（没有名册、名册上空无一人）。它不是
+    /// 「谁接都行」：说不出责任人的派工要能被读出来，而不是悄悄退回没有责任人
+    /// 的那条路。
+    async fn claimant_for(&self, _task: &Task) -> Option<String> {
+        None
+    }
 }
 
 // ─── Action Planner ────────────────────────────────────────────────────────
@@ -188,6 +201,46 @@ pub trait ActionPlanner: Send + Sync {
         tasks: Vec<Task>,
         skill_registry: &SkillRegistry,
     ) -> SFResult<Vec<String>>;
+}
+
+/// 一批待干的活：一本账上**所有未完成**的条目，连同它们各自的触点。
+///
+/// 这是编排的主入口的输入形状。它刻意不是「一个目标」：从目标往下拆是人类的管理
+/// 动作（执行者上下文有限、必须交接），而智能体装得下整批、成本在验证——拆得越碎，
+/// 一次编译与一次闸门的成本付得越多。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BatchItem {
+    pub id: String,
+    pub title: String,
+    /// 这一条要动哪些文件。空表示「说不出来」——它进不了批次，要么先被拆细，要么被
+    /// `Split` 逐条点名排除。
+    pub touches: Vec<String>,
+    /// 这一条的三格：终态、现在、差距（`LedgerItem`）。状态由它自己带。
+    ///
+    /// 计划判的是「这一批能不能一起成立」，而一条差距还写着的行与一条差距清空的行，
+    /// 在同一份验收下的答案不同：前者只能说「还在改」，说不了「成了」。把这一格留在
+    /// 账本里、让计划再去猜，就等于让同一件事有两个答案。
+    #[serde(default)]
+    pub item: crate::contract::ledger_item::LedgerItem,
+}
+
+impl BatchItem {
+    /// 这一条到了终态没有：状态是 `已落` **且**差距为空。
+    pub fn is_terminal(&self) -> bool {
+        self.item.state == crate::contract::ledger_item::LedgerState::Reached
+            && self.item.gap_is_empty()
+    }
+}
+
+/// 给一批活写计划：这一批的「这一类」是什么、必须成立什么、怎么量。
+///
+/// 与 [`ActionPlanner`] 的分工：那个是从目标往下拆（只在目标还没有对应账本条目时用
+/// 一次，用来落条目），这个是把账上已经存在的活汇成一批并写下定义。两者产出的都是
+/// [`crate::types::action_plan::Plan`]，而那份计划由固定程序判合格（`Plan::validate`），
+/// 不由 planner 自己宣布合格。
+#[async_trait]
+pub trait BatchPlanner: Send + Sync {
+    async fn plan_batch(&self, items: &[BatchItem]) -> SFResult<crate::types::action_plan::Plan>;
 }
 
 // ─── Task Execution Callback ───────────────────────────────────────────────

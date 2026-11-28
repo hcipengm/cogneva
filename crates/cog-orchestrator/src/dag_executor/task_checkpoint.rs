@@ -22,17 +22,31 @@ use cog_core::{AgentManager, CheckpointStore, SFResult, StateBackend};
 // 板上的续跑指针字段名与 agent 的命名，词汇定义在 `cog-core`：产出侧（本模块）
 // 与恢复侧（派发时建 agent 的那一端）各写一份字面量不会报错，只会让两边认领的
 // 不是同一批 agent，而整条链看起来就像「从来没有可续跑的进度」。
-use cog_core::{agent_id_for, checkpoint_field};
+use cog_core::checkpoint_field;
 
-/// `agent_id` 是不是 `task_id` 这个任务的 agent。
+/// 这个执行体是不是 `task_id` 这件任务现起的。
 ///
-/// 任务与 agent 的唯一关联是命名约定（[`agent_id_for`]）——没有映射表，注册表
-/// 里那份 `task_ids` 在生产里也没有产出方。角色不从这个 id 里解析，而是由
-/// agent 自己声明（`WorkerInfo.role`）后拼回去精确比对：解析式（取任务 id 之后
-/// 的全部）在任务 id 互为前缀时会互相认领，`t-1` 会把 `t-11-planner` 算成自己
-/// 的 `1-planner`，于是写下去的指针挂到了别人的板上。
-pub fn belongs_to_task(agent_id: &str, role: &str, task_id: &str) -> bool {
-    !role.is_empty() && agent_id == agent_id_for(task_id, role)
+/// 读的是名册行上那一格 `owner_task`——「它替哪件任务干活」写在行上，不由名字
+/// 推。从名字推要解析出角色再拼回去比，任务 id 互为前缀时就会互相认领（`t-1`
+/// 把 `t-11-planner` 算成自己的 `1-planner`），写下去的指针挂到别人的板上。
+/// 名册行是建这个执行体的人写的，它答得比任何一个字符串形状都准：座位换了名
+/// 字（同一件活换一把椅子）归属不该跟着丢，换了任务归属必须跟着变，而这两件
+/// 事都只有那一格说得清。
+///
+/// 常驻员工的行上 `owner_task` 是空的：它不属于任何一件活，也不会被任何一件
+/// 活的续跑点名。
+///
+/// 答案还要再看一层名字：并行分支的执行体（`<任务>-branch-<n>-<座位>`）行上
+/// 写的也是这件任务，但它们不是任务级的座位。续跑指针在板上只按角色取一格
+/// （`checkpoint:<角色>`），分支的 planner 与任务级的 planner 同名，放进来就会
+/// 互相覆盖，恢复时读到的是另一支的对话。分支的进度由 roundtable 自己那一支
+/// 收着，不在这张板的这一格。所以「行说它替这件活干」之外，名字必须是这件活
+/// 现起的那把座位——比的是 [`agent_id_for`] 拼出来的整串，不是从名字里解析，
+/// 任务 id 互为前缀时也就不会互相认领。
+pub fn belongs_to_task(worker: &cog_core::WorkerInfo, task_id: &str) -> bool {
+    worker.owner_task.as_deref() == Some(task_id)
+        && !worker.role.is_empty()
+        && worker.agent_id == cog_core::agent_id_for(task_id, &worker.role)
 }
 
 /// 一轮产出侧动作的读数。
@@ -141,7 +155,7 @@ impl CheckpointAgents for LiveCheckpointAgents {
         let workers = self.manager.list_workers().await?;
         Ok(workers
             .into_iter()
-            .filter(|w| belongs_to_task(&w.agent_id, &w.role, task_id))
+            .filter(|w| belongs_to_task(w, task_id))
             .map(|w| (w.agent_id, w.role))
             .collect())
     }
@@ -168,31 +182,35 @@ impl CheckpointAgents for LiveCheckpointAgents {
     }
 }
 
-/// 单个检查点动作（枚举 agent、拍快照、读写板、回收旧点）的等待上限。
+/// 单个检查点动作（枚举 agent、拍快照、读写板、回收旧点）的预期工期。
 ///
-/// 它必须是个**有界**值，不能无限等：产出侧每一步 await 的都是别的进程
-/// （agent）或存储；任一个挂死（挂死的 RPC、锁竞争、存储 I/O）时，无限等
-/// 会让整个迭代回不到循环顶部、心跳戳停更——表现就是
-/// `background_loop_stalled`。超时走既有结局计数（快照类记 `failed`，回收
-/// 旧点记 `unsuperseded`），下一轮重试，单个 agent 再卡也毒不倒整条链。
+/// 过了这个点，动作**不会被切断**：发一条告警然后继续等。每一步 await 的
+/// 对象都是活的进程（agent）或存储；一个还在干活、只是比预期慢的上游，被
+/// 切断后下一轮还要从头再做一遍——那份工作与它的代价一起被扔掉。真正结束
+/// 它的是它自己返回或报错，不是我们事先挑的钟点。
+///
+/// 那「挂死了怎么办」：等的时候心跳照走（外层用
+/// [`cog_core::declared_wall::wait_past_wall_beating`] 把 beat 接进来），所以
+/// 循环不会因为等待被读成停摆；而这条告警每几分钟重复一次，「比预期慢」与
+/// 「没事」在读数面上分得开。
 ///
 /// 它同时是循环向存活体系申报工期界的原料（见
-/// [`cog_core::loop_health::Cadence::PeriodicWithWork`]）：申报的工期界由真正
-/// 施加该界的对象推导，而不是挑一个能让规则闭嘴的整数，所以调整这里的超时
-/// 会带着告警的墙一起动。
-// cap: bound — 申报的工期界由真正施加该界的对象推导，不是挑一个让规则闭嘴的整数；调它会带着告警的墙一起动
-pub const CHECKPOINT_STEP_TIMEOUT: Duration = Duration::from_secs(15);
+/// [`cog_core::loop_health::Cadence::PeriodicWithWork`]）：申报的值由真正施加
+/// 该判断的对象推导，调它会带着告警的墙一起动。
+// cap: fixed — 只决定「超过多久说一声」；过点之后继续等，从不丢弃仍在跑的步
+// keep: 删掉后一步超过预期没有说一声的时刻，读者以为它挂了；由「过点之后继续等，不丢弃仍在跑的步」兜住
+pub const CHECKPOINT_STEP_EXPECTATION: Duration = Duration::from_secs(15);
 
-/// 给一次检查点动作套上等待上限：超时落成 `cog_core::SFError::Timeout`，
-/// 走调用点既有的错误分支（计 `failed` 并继续），而不是把 await 挂到永远。
-async fn bounded<T>(
-    step_timeout: Duration,
+/// 等一次检查点动作到它自己结束；过了 `expectation` 就发一条告警，继续等。
+///
+/// 返回的永远是动作自己的结果：真正的错误（agent 不在、存储报错）照旧走
+/// 调用点既有的错误分支，没有「我们自己判超时」这一条路。
+async fn awaited<T>(
+    expectation: Duration,
+    what: &str,
     fut: impl std::future::Future<Output = SFResult<T>>,
 ) -> SFResult<T> {
-    match tokio::time::timeout(step_timeout, fut).await {
-        Ok(result) => result,
-        Err(_) => Err(cog_core::SFError::Timeout),
-    }
+    cog_core::declared_wall::wait_past_wall(expectation, what, fut).await
 }
 
 /// 为一个任务名下的每个 agent 落检查点，并把可恢复的那些指针挂到任务的板上。
@@ -201,19 +219,25 @@ pub async fn checkpoint_task(
     agents: &dyn CheckpointAgents,
     state: &Arc<dyn StateBackend>,
 ) -> CheckpointRound {
-    checkpoint_task_with_timeout(task_id, agents, state, CHECKPOINT_STEP_TIMEOUT).await
+    checkpoint_task_expecting(task_id, agents, state, CHECKPOINT_STEP_EXPECTATION).await
 }
 
-/// 同 [`checkpoint_task`]，但每个动作的等待上限由调用方给定（生产走
-/// [`CHECKPOINT_STEP_TIMEOUT`]，测试用短超时证明挂死会被切断）。
-pub async fn checkpoint_task_with_timeout(
+/// 同 [`checkpoint_task`]，但每一步的预期工期由调用方给定（生产走
+/// [`CHECKPOINT_STEP_EXPECTATION`]，测试用短数字观察「过点之后继续等」）。
+pub async fn checkpoint_task_expecting(
     task_id: &str,
     agents: &dyn CheckpointAgents,
     state: &Arc<dyn StateBackend>,
-    step_timeout: Duration,
+    step_expectation: Duration,
 ) -> CheckpointRound {
     let mut round = CheckpointRound::default();
-    let roster = match bounded(step_timeout, agents.agents_of(task_id)).await {
+    let roster = match awaited(
+        step_expectation,
+        "enumerate the agents of a running task",
+        agents.agents_of(task_id),
+    )
+    .await
+    {
         Ok(roster) => roster,
         Err(e) => {
             tracing::warn!(task = task_id, error = %e, "cannot enumerate the agents of a running task");
@@ -224,7 +248,13 @@ pub async fn checkpoint_task_with_timeout(
     // 板读一次给整轮用：上一份指针在写新的之前读，才知道该替掉哪一份。读不到
     // 只影响「旧的那份能不能回收」，不影响本轮该写的指针照写——续跑是主功能，
     // 容量是附带条件，不能因为后者读不到就把前者停掉。
-    let previous = match bounded(step_timeout, state.get_board(task_id)).await {
+    let previous = match awaited(
+        step_expectation,
+        "read the task board",
+        state.get_board(task_id),
+    )
+    .await
+    {
         Ok(Some(board)) => board.fields,
         Ok(None) => Default::default(),
         Err(e) => {
@@ -235,7 +265,13 @@ pub async fn checkpoint_task_with_timeout(
 
     for (agent_id, role) in roster {
         round.agents += 1;
-        let snapshot = match bounded(step_timeout, agents.snapshot(task_id, &agent_id)).await {
+        let snapshot = match awaited(
+            step_expectation,
+            "take an agent snapshot",
+            agents.snapshot(task_id, &agent_id),
+        )
+        .await
+        {
             Ok(snapshot) => snapshot,
             Err(e) => {
                 round.failed += 1;
@@ -262,12 +298,19 @@ pub async fn checkpoint_task_with_timeout(
             continue;
         }
         let checkpoint_id = snapshot.checkpoint_id;
-        match bounded(step_timeout, agents.persisted(&checkpoint_id)).await {
+        match awaited(
+            step_expectation,
+            "read a checkpoint back to confirm it was persisted",
+            agents.persisted(&checkpoint_id),
+        )
+        .await
+        {
             // 指针只在续跑点真的存在时写：写下一条指不到东西的路标，恢复端
             // 只会把它读成「没有续跑点」，而产出侧的读数会说是「写了」。
             Ok(true) => {
-                match bounded(
-                    step_timeout,
+                match awaited(
+                    step_expectation,
+                    "record the resume pointer on the task board",
                     state.set_board_field(task_id, &checkpoint_field(&role), &checkpoint_id),
                 )
                 .await
@@ -281,7 +324,13 @@ pub async fn checkpoint_task_with_timeout(
                             // 顺序不能反：先写指针再删旧的。反过来，删成功而写
                             // 失败就成了「续跑点没了」；这个顺序最坏也只是多留
                             // 一份没人指的实物。
-                            match bounded(step_timeout, agents.forget(old)).await {
+                            match awaited(
+                                step_expectation,
+                                "delete the checkpoint this one replaces",
+                                agents.forget(old),
+                            )
+                            .await
+                            {
                                 Ok(()) => round.superseded += 1,
                                 Err(e) => {
                                     round.unsuperseded += 1;
@@ -542,22 +591,55 @@ mod tests {
             );
     }
 
+    fn worker(agent_id: &str, role: &str, owner_task: Option<&str>) -> cog_core::WorkerInfo {
+        cog_core::WorkerInfo {
+            agent_id: agent_id.to_string(),
+            role: role.to_string(),
+            owner_task: owner_task.map(str::to_string),
+        }
+    }
+
     #[test]
-    fn an_agent_belongs_to_the_task_its_id_names() {
-        assert!(belongs_to_task("squad:t-1-planner", "planner", "t-1"));
-        assert!(belongs_to_task("squad:t-1-evaluator", "evaluator", "t-1"));
+    fn an_agent_belongs_to_the_task_its_roster_row_names() {
+        assert!(belongs_to_task(
+            &worker("squad:t-1-planner", "planner", Some("t-1")),
+            "t-1"
+        ));
+        // 换一把椅子还是同一件活：归属读名册行，身份读座位的名字。
+        assert!(belongs_to_task(
+            &worker("squad:t-1-generator", "generator", Some("t-1")),
+            "t-1"
+        ));
         // 任务 id 互为前缀时不许互相认领：这条错了，写下去的就是别人的续跑点。
-        assert!(!belongs_to_task("squad:t-11-planner", "planner", "t-1"));
-        assert!(!belongs_to_task("squad:t-1-planner", "planner", "t-11"));
-        assert!(!belongs_to_task("squad:t-2-planner", "planner", "t-1"));
-        // 少了 squad 前缀的裸任务名不是这个词汇里的一个 id。
-        assert!(!belongs_to_task("t-1", "planner", "t-1"));
-        assert!(!belongs_to_task("t-1-planner", "planner", "t-1"));
-        // 角色必须与 id 的尾段一致：声明是 planner 的 agent 不该被按 generator 认领。
-        assert!(!belongs_to_task("squad:t-1-planner", "generator", "t-1"));
-        assert!(!belongs_to_task("squad:t-1-planner", "", "t-1"));
-        // 并行分支的 agent 有自己的一段后缀，不属于任务级的这个角色。
-        assert!(!belongs_to_task("t-1-branch-0-planner", "planner", "t-1"));
+        assert!(!belongs_to_task(
+            &worker("squad:t-11-planner", "planner", Some("t-11")),
+            "t-1"
+        ));
+        assert!(!belongs_to_task(
+            &worker("squad:t-1-planner", "planner", Some("t-1")),
+            "t-11"
+        ));
+        // 名字看着像这件任务的座位、行上却说替别人干活：行说了算。
+        assert!(!belongs_to_task(
+            &worker("squad:t-1-planner", "planner", Some("t-2")),
+            "t-1"
+        ));
+        // 常驻员工不属于任何一件活。
+        assert!(!belongs_to_task(
+            &worker("mira-512bfc48", "planner", None),
+            "t-1"
+        ));
+        // 并行分支的执行体也替这件活干活，但它不是任务级的座位：板的续跑指针
+        // 按角色一格，放它进来就会与任务级同名角色互相覆盖。
+        assert!(!belongs_to_task(
+            &worker("t-1-branch-0-planner", "planner", Some("t-1")),
+            "t-1"
+        ));
+        // 行说替这件活干，名字的尾段却是另一个角色：不是这件活的座位。
+        assert!(!belongs_to_task(
+            &worker("squad:t-1-generator", "planner", Some("t-1")),
+            "t-1"
+        ));
     }
 
     #[test]
@@ -567,7 +649,10 @@ mod tests {
 
     #[test]
     fn the_agent_id_is_derived_not_spelled() {
-        assert_eq!(agent_id_for("t-1", "planner"), "squad:t-1-planner");
+        assert_eq!(
+            cog_core::agent_id_for("t-1", "planner"),
+            "squad:t-1-planner"
+        );
     }
 
     #[tokio::test]
@@ -839,55 +924,77 @@ mod tests {
         assert!(fields.contains_key(&("t-1".into(), "checkpoint:evaluator".into())));
     }
 
-    /// 一个永远不返回的 agent 调用也不能把检查点迭代挂死：每步有超时，
-    /// 超时计入 `failed`，迭代照常返回——这正是 `background_loop_stalled`
-    /// 当初的形状（一个卡住的调用让循环回不到顶部）。
+    /// 过了申报点不切断：比预期慢若干倍的快照仍然等到它自己返回，续跑点照常
+    /// 落盘。旧形状在这里记 `failed`、`saved = 0`，下一轮从头再跑一遍——那份
+    /// 已经在路上的工作连同样本一起被扔掉，而它本来马上就要到了。
     #[tokio::test]
-    async fn a_hung_agent_call_is_bounded_and_counted_as_failed() {
-        struct HungAgents {
+    async fn a_snapshot_that_outlives_the_expectation_is_still_waited_on() {
+        struct SlowAgents {
             roster: Vec<(String, String)>,
+            delay: Duration,
         }
 
         #[async_trait::async_trait]
-        impl CheckpointAgents for HungAgents {
+        impl CheckpointAgents for SlowAgents {
             async fn agents_of(&self, _task_id: &str) -> SFResult<Vec<(String, String)>> {
                 Ok(self.roster.clone())
             }
-            async fn snapshot(&self, _task_id: &str, _agent_id: &str) -> SFResult<Snapshot> {
-                std::future::pending().await
+            async fn snapshot(&self, _task_id: &str, agent_id: &str) -> SFResult<Snapshot> {
+                tokio::time::sleep(self.delay).await;
+                Ok(Snapshot {
+                    messages: 3,
+                    checkpoint_id: format!("cp-{agent_id}"),
+                })
             }
             async fn persisted(&self, _checkpoint_id: &str) -> SFResult<bool> {
-                std::future::pending().await
+                Ok(true)
             }
             async fn forget(&self, _checkpoint_id: &str) -> SFResult<()> {
-                std::future::pending().await
+                Ok(())
             }
         }
 
-        let (_, state) = board();
-        let agents = HungAgents {
-            roster: vec![
-                ("squad:t-1-planner".to_string(), "planner".to_string()),
-                ("squad:t-1-evaluator".to_string(), "evaluator".to_string()),
-            ],
+        let (board, state) = board();
+        let agents = SlowAgents {
+            roster: vec![("squad:t-1-planner".to_string(), "planner".to_string())],
+            delay: Duration::from_millis(150),
         };
         let started = std::time::Instant::now();
 
-        let round = checkpoint_task_with_timeout(
-            "t-1",
-            &agents,
-            &state,
-            std::time::Duration::from_millis(20),
-        )
-        .await;
+        let round =
+            checkpoint_task_expecting("t-1", &agents, &state, Duration::from_millis(20)).await;
 
-        assert_eq!(round.agents, 2, "both agents were attempted");
-        assert_eq!(round.failed, 2, "each hung call is bounded and counted");
-        assert_eq!(round.saved, 0);
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(500),
-            "a hung agent used to block the whole iteration indefinitely"
+        assert_eq!(
+            round.saved, 1,
+            "快照超过了申报的 20ms 就没有被等，续跑点丢了"
         );
+        assert_eq!(round.failed, 0, "慢不是失败：它自己返回了");
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "返回时 {:?}：没有等快照自己结束",
+            started.elapsed()
+        );
+        assert!(board
+            .fields
+            .lock()
+            .unwrap()
+            .contains_key(&("t-1".into(), "checkpoint:planner".into())));
+    }
+
+    /// 真正的错误照旧计 `failed`：把时钟拆掉不等于把所有结局都算成成功。
+    #[tokio::test]
+    async fn an_agent_that_answers_with_an_error_is_still_counted_as_failed() {
+        let (_, state) = board();
+        let mut agents = fake(
+            &[("squad:t-1-planner", "planner")],
+            &["cp-squad:t-1-planner"],
+        );
+        agents.snapshots.remove("squad:t-1-planner");
+
+        let round = checkpoint_task("t-1", &agents, &state).await;
+
+        assert_eq!(round.failed, 1);
+        assert_eq!(round.saved, 0);
     }
 
     /// 写得进、读不出的板：只用来把「板读失败」这条路走通。

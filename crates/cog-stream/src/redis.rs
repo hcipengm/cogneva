@@ -24,7 +24,8 @@ use cog_core::{MessageBackend, MessageStream, SFError, SFResult};
 /// saturates at this page, and a saturated page is itself the finding — it
 /// means the reclaim path has stopped taking anything back, which the
 /// reported age says just as plainly.
-// cap: bound — 一页列出的超阈值条目上限；满页本身就是「回收路径不干活」的读数
+// cap: fixed — 一页列出的超阈值条目上限；满页本身就是「回收路径不干活」的读数
+// keep: 删掉后一页列出全部超阈值条目，读数本身被撑爆；由「满页即回收路径不干活」兜住
 const PENDING_STATS_PAGE: usize = 1024;
 
 /// How long past its own block period a stream read may wait for a reply before
@@ -36,7 +37,8 @@ const PENDING_STATS_PAGE: usize = 1024;
 /// not tight: a read wrongly declared lost is retried, re-delivered from the
 /// pending list and counted, which is noise, while a read left to the kernel is
 /// a process that stops consuming for minutes.
-// cap: bound — 服务器承诺有答案的宽限；误判丢失的代价是重投一次的噪声
+// cap: fixed — 服务器承诺有答案的宽限；误判丢失的代价是重投一次的噪声
+// keep: 删掉后服务器还没答就判丢失，重投变成噪声；由「服务器承诺的宽限」兜住
 const READ_RESPONSE_GRACE_MS: u64 = 15_000;
 
 /// Redis Streams-backed [`MessageBackend`].
@@ -433,6 +435,7 @@ impl MessageBackend for RedisMessageBackend {
                             );
                             return Ok(None);
                         }
+                        // roundtrip: 一次阻塞读（服务端读指针不动）
                         let read = tokio::time::timeout(
                             read_deadline,
                             group_read(&mut conn, &subject, &group, ">", block_ms),
@@ -593,6 +596,7 @@ impl MessageBackend for RedisMessageBackend {
                         // own block period is a socket that will not answer, not
                         // a stream with nothing to say, and retrying on that
                         // socket is what makes the silence permanent.
+                        // roundtrip: 一次阻塞读（服务端读指针不动）
                         let read = tokio::time::timeout(
                             read_deadline(block_ms),
                             group_read(&mut conn, &subject, &group, &id, block_ms),
@@ -1480,7 +1484,9 @@ mod tests {
                 .subscribe(&idle_stream_task, &idle_group_task)
                 .await
                 .unwrap();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(8), sub.next()).await;
+            cog_core::ignore_lost!(
+                tokio::time::timeout(std::time::Duration::from_secs(8), sub.next()).await
+            );
         });
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -1748,7 +1754,9 @@ mod tests {
         // Let the loop take its first read before the key is taken away, so the
         // loss lands on a consumer that is already reading rather than on one
         // that has not started.
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), sub.next()).await;
+        cog_core::ignore_lost!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), sub.next()).await
+        );
         let _: i64 = redis::cmd("DEL")
             .arg(stream.as_str())
             .query_async(&mut raw)
@@ -1827,7 +1835,9 @@ mod tests {
         // backoff. One is enough for what is asserted, and the second makes the
         // reading below unlikely to be a single attempt's accident.
         let mut first = backend.subscribe(&stream, &group).await.unwrap();
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(2100), first.next()).await;
+        cog_core::ignore_lost!(
+            tokio::time::timeout(std::time::Duration::from_millis(2100), first.next()).await
+        );
         let first_alone = family(&health).failures();
         assert!(
             first_alone >= 2,
@@ -1838,7 +1848,9 @@ mod tests {
         // question is whether its registration leaves the first loop's count
         // standing.
         let mut second = backend.subscribe(&stream, &group).await.unwrap();
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(700), second.next()).await;
+        cog_core::ignore_lost!(
+            tokio::time::timeout(std::time::Duration::from_millis(700), second.next()).await
+        );
         let both = family(&health);
         assert_eq!(both.loops, 2, "the name covers both loops: {both:?}");
         assert!(
@@ -1852,7 +1864,9 @@ mod tests {
         // row and every later write was skipped, so the reading went to zero in
         // the one moment it mattered.
         drop(first);
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(2400), second.next()).await;
+        cog_core::ignore_lost!(
+            tokio::time::timeout(std::time::Duration::from_millis(2400), second.next()).await
+        );
         let after = family(&health);
         assert_eq!(
             after.loops, 1,

@@ -36,18 +36,22 @@ pub const DEFAULT_SUMMARY_COLLECTION: &str = "summaries";
 /// half a minute of failed attempts took a process down on 2026-10-25) and it
 /// stays well inside the 300s startup probe, so a store that is genuinely
 /// broken still surfaces instead of hanging.
-// cap: bound — 要留在 300s 启动探针之内，真正坏掉的存储才会浮出来而不是挂着
+// cap: fixed — 要留在 300s 启动探针之内，真正坏掉的存储才会浮出来而不是挂着
+// keep: 删掉后建集合超过 300s 启动探针，真坏掉的存储被挂着而不是浮出来；由「要留在启动探针之内」兜住
+// wall: 等=向量存储把集合建出来 / 等不到=这次启动读作「存储坏了」并浮出来，而不是一直挂着；建了一半的集合不被当成建好了 / 续跑=能，重启时重试建集合（建集合是幂等的）
 const CREATE_COLLECTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Delay before the second attempt; doubled for each attempt after that, up to
 /// [`CREATE_COLLECTION_BACKOFF_DOUBLINGS`], so a long wait keeps asking often
 /// instead of sleeping one long block.
-// cap: bound — 与翻倍次数一起用，让长等待仍在频繁地问，而不是睡一大块
+// cap: fixed — 与翻倍次数一起用，让长等待仍在频繁地问，而不是睡一大块
+// keep: 删掉后长等待沉睡一大块，恢复后要等一整段才再问；由「让长等待仍在频繁地问」兜住
 const CREATE_COLLECTION_BACKOFF_MS: u64 = 500;
 
 /// How many times the backoff doubles before it stops growing: 500ms × 2⁴ = 8s
 /// between attempts.
-// cap: bound — 翻倍四次后停住：500ms × 2⁴ = 8s 一次
+// cap: fixed — 翻倍四次后停住：500ms × 2⁴ = 8s 一次
+// keep: 删掉后翻倍无界，500ms 一路睡到分钟级，恢复被拖长；由「500ms × 2⁴ = 8s 一次」兜住
 const CREATE_COLLECTION_BACKOFF_DOUBLINGS: u32 = 4;
 
 /// What one repair pass did.
@@ -77,6 +81,17 @@ const SUMMARY_FILE: &str = "summary.json";
 /// [`SummaryBackend`] that delegates similarity search to a
 /// [`cog_core::VectorBackend`] and structured-data persistence to a
 /// [`SummaryEntryStore`].
+/// Qdrant 一次请求的字节上限（服务端 `max_request_size_mb` 默认 32）。
+///
+/// 冷启动要把库里的每一条记忆灌回向量索引。逐条 upsert 在现网实测是每点一次
+/// gRPC 往返、约 4.4 点/秒：18,905 条要一个多小时，超过启动探针的时间就把 Pod
+/// 杀掉，而重启又从删集合开始——永远起不来。同一批装进一次请求后，冷启动的
+/// 请求数从「每条一次」降到「每 32MB 一次」（Qdrant 的 `max_request_size_mb` 默认
+/// 32MB（Qdrant 的 `max_request_size_mb` 默认值，服务端给定的一次请求上限；不是这里挑的批大小）。
+// cap: fixed — Qdrant 的 max_request_size_mb 默认 32MB，服务端给定的一次请求上限
+// keep: 删掉后回到「Qdrant 的 max_request_size_mb 默认 32MB，服务端给定的一次请求上限」所描述的情形；由这条约定兜住
+const UPSERT_REQUEST_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+
 pub struct VectorSummaryBackend {
     vector: Arc<dyn VectorBackend>,
     store: Arc<dyn SummaryEntryStore>,
@@ -208,11 +223,22 @@ impl VectorSummaryBackend {
         let started = std::time::Instant::now();
         let mut attempt: u32 = 1;
         loop {
-            let failure = match self
+            // 每一次创建都记下**它花了多久**：这个部署建一个集合要几秒，今天没有任何
+            // 读数回答过，而客户端超时该设多大正是由那个分布决定的。2026-11-21 实测同一条
+            // 请求两次差了五倍（12.15s / 2.40s），所以「调大超时」不是答案，先要有分布。
+            let attempt_started = std::time::Instant::now();
+            let outcome = self
                 .vector
                 .create_collection(&self.collection, self.embedding_dim)
-                .await
-            {
+                .await;
+            tracing::info!(
+                collection = %self.collection,
+                attempt,
+                elapsed_ms = attempt_started.elapsed().as_millis() as u64,
+                created = outcome.is_ok(),
+                "vector collection create finished"
+            );
+            let failure = match outcome {
                 Ok(()) => return Ok(()),
                 Err(e) => e,
             };
@@ -291,15 +317,83 @@ impl VectorSummaryBackend {
             entries
         };
 
-        let _ = self.vector.delete_collection(&self.collection).await;
+        cog_core::ignore_lost!(self.vector.delete_collection(&self.collection).await);
         self.create_collection_with_retry().await?;
         *self.init_guard.lock().await = true;
 
         let mut rebuilt = HashMap::new();
-        for entry in entries {
-            if let Some(vec_id) = self.index_entry(&entry).await {
-                rebuilt.insert(entry.id.clone(), vec_id);
+        let mut dense: Vec<Vec<f32>> = Vec::new();
+        let mut dense_meta: Vec<serde_json::Value> = Vec::new();
+        let mut dense_owners: Vec<String> = Vec::new();
+        let mut dense_bytes = 0usize;
+        let mut sparse: Vec<cog_core::contract::storage::SparseEmbedding> = Vec::new();
+        let mut sparse_meta: Vec<serde_json::Value> = Vec::new();
+        let mut sparse_bytes = 0usize;
+        for entry in &entries {
+            let meta = Self::entry_meta(entry);
+            let meta_bytes = meta.to_string().len();
+            if !entry.embedding.is_empty() {
+                let bytes = entry.embedding.len() * 4 + meta_bytes + 64;
+                if !dense.is_empty() && dense_bytes + bytes > UPSERT_REQUEST_BUDGET_BYTES {
+                    if let Ok(ids) = self
+                        .vector
+                        .insert(
+                            &self.collection,
+                            std::mem::take(&mut dense),
+                            std::mem::take(&mut dense_meta),
+                        )
+                        .await
+                    {
+                        for (owner, vec_id) in dense_owners.drain(..).zip(ids) {
+                            rebuilt.insert(owner, vec_id);
+                        }
+                    } else {
+                        dense_owners.clear();
+                    }
+                    dense_bytes = 0;
+                }
+                dense.push(entry.embedding.clone());
+                dense_meta.push(meta.clone());
+                dense_owners.push(entry.id.clone());
+                dense_bytes += bytes;
             }
+            if let Some(ref sparse_vector) = entry.sparse_embedding {
+                let bytes = sparse_vector.indices.len() * 8
+                    + sparse_vector.values.len() * 4
+                    + meta_bytes
+                    + 64;
+                if !sparse.is_empty() && sparse_bytes + bytes > UPSERT_REQUEST_BUDGET_BYTES {
+                    let _ = self
+                        .vector
+                        .insert_sparse(
+                            &self.collection,
+                            std::mem::take(&mut sparse),
+                            std::mem::take(&mut sparse_meta),
+                        )
+                        .await;
+                    sparse_bytes = 0;
+                }
+                sparse.push(sparse_vector.clone());
+                sparse_meta.push(meta);
+                sparse_bytes += bytes;
+            }
+        }
+        if !dense.is_empty() {
+            if let Ok(ids) = self
+                .vector
+                .insert(&self.collection, dense, dense_meta)
+                .await
+            {
+                for (owner, vec_id) in dense_owners.drain(..).zip(ids) {
+                    rebuilt.insert(owner, vec_id);
+                }
+            }
+        }
+        if !sparse.is_empty() {
+            let _ = self
+                .vector
+                .insert_sparse(&self.collection, sparse, sparse_meta)
+                .await;
         }
         let mut vec_ids = self
             .vec_ids
@@ -311,35 +405,13 @@ impl VectorSummaryBackend {
 
     /// Index one entry's dense and sparse vectors into the collection,
     /// returning the dense vector id when the backend accepted it.
-    async fn index_entry(&self, entry: &SummaryEntry) -> Option<String> {
-        let meta = serde_json::json!({
+    /// 一条记忆写进向量库时带的载荷。重建与增量走同一个形状。
+    fn entry_meta(entry: &SummaryEntry) -> serde_json::Value {
+        serde_json::json!({
             "id": entry.id,
             "text": entry.text,
             "raw_uri": entry.source_ref.raw_uri,
-        });
-        // An entry with no embedding has nothing to index. Passing the empty
-        // run through would either be rejected for its dimension or, worse, be
-        // stored as a point that ties with every other unembedded entry.
-        let vec_id = if entry.embedding.is_empty() {
-            None
-        } else {
-            self.vector
-                .insert(
-                    &self.collection,
-                    vec![entry.embedding.clone()],
-                    vec![meta.clone()],
-                )
-                .await
-                .ok()
-                .and_then(|mut ids| ids.pop())
-        };
-        if let Some(ref sparse) = entry.sparse_embedding {
-            let _ = self
-                .vector
-                .insert_sparse(&self.collection, vec![sparse.clone()], vec![meta])
-                .await;
-        }
-        vec_id
+        })
     }
 
     /// Persist the current store to `<persist_dir>/summary.json`.
@@ -496,7 +568,7 @@ impl SummaryBackend for VectorSummaryBackend {
             // hands back a different one, and that older point is the stale copy this
             // exists to remove.
             if written_id.as_deref() != Some(prev.as_str()) {
-                let _ = self.vector.delete(&self.collection, &[prev]).await;
+                cog_core::ignore_lost!(self.vector.delete(&self.collection, &[prev]).await);
             }
         }
         self.persist().await?;
@@ -597,7 +669,7 @@ impl SummaryBackend for VectorSummaryBackend {
         };
         self.store.delete(namespace, id).await?;
         if let Some(vid) = vec_id {
-            let _ = self.vector.delete(&self.collection, &[vid]).await;
+            cog_core::ignore_lost!(self.vector.delete(&self.collection, &[vid]).await);
         }
         self.persist().await?;
         Ok(())
@@ -717,7 +789,7 @@ impl SummaryBackend for VectorSummaryBackend {
             // Same rule as `store_summary`: an id the insert just wrote is the entry's
             // current point, not a stale copy of it.
             if written_id != prev {
-                let _ = self.vector.delete(&self.collection, &[prev]).await;
+                cog_core::ignore_lost!(self.vector.delete(&self.collection, &[prev]).await);
             }
         }
         self.persist().await?;
@@ -796,6 +868,86 @@ mod tests {
             "test/v1",
             SourceRef::new(format!("memory://{id}"), "test/v1"),
         )
+    }
+
+    /// 冷启动按请求字节上限成批写入，不是一条记忆一次往返。
+    ///
+    /// 现网实测：逐条 upsert 是每点一次 gRPC、约 4.4 点/秒，18,905 条要一个多小时，
+    /// 启动探针到点就把 Pod 杀掉、重启再从删集合开始——永远起不来。这条门判的是
+    /// 「一次 load 的 insert 调用数与条数无关，按预算分批」：十条记忆必须是一次请求，
+    /// 而不是十次。没有这次改动这条会红（十条 → 十次调用）。
+    #[tokio::test]
+    async fn a_cold_load_upserts_in_batches_not_point_by_point() {
+        struct CountingInsert {
+            inner: cog_test_support::MemoryVectorBackend,
+            calls: std::sync::atomic::AtomicUsize,
+            max_batch: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait]
+        impl VectorBackend for CountingInsert {
+            async fn create_collection(&self, c: &str, d: usize) -> SFResult<()> {
+                self.inner.create_collection(c, d).await
+            }
+            async fn delete_collection(&self, c: &str) -> SFResult<()> {
+                self.inner.delete_collection(c).await
+            }
+            async fn insert(
+                &self,
+                c: &str,
+                vectors: Vec<Vec<f32>>,
+                metadata: Vec<serde_json::Value>,
+            ) -> SFResult<Vec<String>> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let size = vectors.len();
+                self.max_batch
+                    .fetch_max(size, std::sync::atomic::Ordering::SeqCst);
+                self.inner.insert(c, vectors, metadata).await
+            }
+            async fn insert_sparse(
+                &self,
+                c: &str,
+                sparse: Vec<cog_core::contract::storage::SparseEmbedding>,
+                metadata: Vec<serde_json::Value>,
+            ) -> SFResult<Vec<String>> {
+                self.inner.insert_sparse(c, sparse, metadata).await
+            }
+            async fn search(
+                &self,
+                c: &str,
+                v: &[f32],
+                k: usize,
+            ) -> SFResult<Vec<cog_core::contract::storage::VectorSearchResult>> {
+                self.inner.search(c, v, k).await
+            }
+            async fn delete(&self, c: &str, ids: &[String]) -> SFResult<()> {
+                self.inner.delete(c, ids).await
+            }
+            async fn collection_exists(&self, c: &str) -> SFResult<bool> {
+                self.inner.collection_exists(c).await
+            }
+        }
+
+        let store = Arc::new(DurableStubStore::new());
+        for i in 0..10 {
+            store.upsert(&entry(&format!("s{i}"))).await.unwrap();
+        }
+        let vector = Arc::new(CountingInsert {
+            inner: cog_test_support::MemoryVectorBackend::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            max_batch: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let backend = VectorSummaryBackend::new(vector.clone(), 4).with_store(store);
+        backend.load().await.unwrap();
+        assert_eq!(
+            vector.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "十条记忆应当一次请求写完；一次一条就是现网那个一小时的冷启动"
+        );
+        assert_eq!(
+            vector.max_batch.load(std::sync::atomic::Ordering::SeqCst),
+            10,
+            "一批里要装着这一批的全部记忆"
+        );
     }
 
     /// The vector collection is a derived index over the entry store. Loading

@@ -145,8 +145,18 @@ pub(crate) fn repo_path_of(repository: &str, rest: &str) -> String {
 /// that followed that unboundedly would be a loop, and one that stopped quietly
 /// would under-count. So the limit is a bound on what may be read, and a manifest
 /// beyond it fails the walk rather than contributing nothing.
-// cap: bound — 界的是可读的范围；超界的清单让这次走查失败，而不是静默少算
+// cap: fixed — 界的是可读的范围；超界的清单让这次走查失败，而不是静默少算
+// keep: 删掉后走查可以读到任意深的清单，深到超出可读范围时静默少算；由「超界让这次走查失败而不是少算」兜住
 const MAX_INDEX_DEPTH: usize = 2;
+
+/// 读响应时每次系统调用取多少字节。
+///
+/// 它不是判据：判的是「两个字节之间有没有停下来」（`platform_http::READ_TIMEOUT`
+/// 包的是单次读完，超时即判这条读停了），而不是「整段读了多少秒」。改这个数只改
+/// 每次系统调用的批量，不改任何一次判停。
+// cap: fixed — 只决定一次系统调用搬多少字节，不参与判停：判据是两次读之间停没停
+// keep: 删掉后一次系统调用搬多少字节没有界，读缓冲跟着清单大小走；由「判据在两次读之间停没停」兜住
+const READ_CHUNK_BYTES: usize = 64 * 1024;
 
 /// The read side of the registry's HTTP API, over the plain-HTTP path `buildah`
 /// already uses for the same store.
@@ -168,7 +178,7 @@ impl RegistryClient {
     /// whether the store is full has to tell "this path was not there" from "the
     /// size was zero", and a body it could not parse from an empty one.
     pub async fn get(&self, path: &str, accept: &[&str]) -> SFResult<Vec<u8>> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let (host, port) = endpoint_host_port(&self.endpoint).ok_or_else(|| {
             SFError::Config(format!(
                 "registry endpoint {:?} is not host:port",
@@ -182,6 +192,7 @@ impl RegistryClient {
         };
         let req =
             format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{accepted}Connection: close\r\n\r\n");
+        // roundtrip: 一次 TCP 连接
         let mut stream = tokio::time::timeout(
             crate::platform_http::CONNECT_TIMEOUT,
             tokio::net::TcpStream::connect((host, port)),
@@ -193,14 +204,31 @@ impl RegistryClient {
             .write_all(req.as_bytes())
             .await
             .map_err(|e| SFError::IO(format!("registry request write failed: {e}")))?;
+        // 判据是字节，不是总时长：一个还在吐字节的响应哪怕比一整块大也不算停住，
+        // 而「连着、但一个字节也不再进来」正是死掉的那副样子。整段读完的上限会把
+        // 一份慢却正常的响应砍在中间，读出来的是一份残缺的清单。
         let mut raw = Vec::new();
-        tokio::time::timeout(
-            crate::platform_http::READ_TIMEOUT,
-            stream.read_to_end(&mut raw),
-        )
-        .await
-        .map_err(|_| SFError::IO("registry read timed out".into()))?
-        .map_err(|e| SFError::IO(format!("registry read failed: {e}")))?;
+        let mut chunk = [0u8; READ_CHUNK_BYTES];
+        loop {
+            // roundtrip: 一次 http 读
+            let read = tokio::time::timeout(
+                crate::platform_http::READ_TIMEOUT,
+                tokio::io::AsyncReadExt::read(&mut stream, &mut chunk),
+            )
+            .await
+            .map_err(|_| {
+                SFError::IO(format!(
+                    "registry {} sent nothing for {:?}; judged stopped",
+                    self.endpoint,
+                    crate::platform_http::READ_TIMEOUT
+                ))
+            })?
+            .map_err(|e| SFError::IO(format!("registry read failed: {e}")))?;
+            if read == 0 {
+                break;
+            }
+            raw.extend_from_slice(&chunk[..read]);
+        }
         let (status, body) = parse_http_response(&raw)
             .ok_or_else(|| SFError::IO("registry returned a malformed HTTP response".into()))?;
         if status != 200 {
@@ -629,8 +657,8 @@ mod tests {
                         "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".into()
                     });
                 seen.push(target);
-                let _ = sock.write_all(resp.as_bytes()).await;
-                let _ = sock.shutdown().await;
+                cog_core::ignore_lost!(sock.write_all(resp.as_bytes()).await);
+                cog_core::ignore_lost!(sock.shutdown().await);
             }
             seen
         });

@@ -60,9 +60,6 @@ impl AgentRegistry for OneAgent {
     async fn list_by_role(&self, _role: &str) -> SFResult<Vec<AgentRegistration>> {
         Ok(vec![common::mocks::registration(AGENT)])
     }
-    async fn list_by_capability(&self, _capability: &str) -> SFResult<Vec<AgentRegistration>> {
-        Ok(vec![common::mocks::registration(AGENT)])
-    }
 }
 
 /// The transcript, kept in the test's own memory so it can be read back whole.

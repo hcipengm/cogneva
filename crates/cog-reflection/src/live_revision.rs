@@ -24,11 +24,16 @@ use crate::mainline_deployer::MAIN_TAG_PREFIX;
 ///
 /// 名单写在模块作用域、只此一份——按名把集群读回来的那条命令，与按名字过滤出这几行的
 /// 解析函数，共用它。
-pub const BASE_DEPLOYMENTS: [&str; 4] = [
-    cog_core::topology::MAIN_DEPLOYMENT,
-    cog_core::topology::SECURITY_GATEWAY,
-    cog_core::topology::SANDBOX_EXECUTOR,
-    cog_core::topology::EVOLUTION,
+///
+/// 每一项是 `(资源词, 名字)`：执行器是 StatefulSet（每副副本一块自己的卷），
+/// 其余三个是 Deployment。资源词跟着名字走而不是由调用处假定——假定成
+/// `deployment` 的那一天，读执行器会得到 `NotFound`，而它与「这个对象不在」
+/// 在判决上是同一句话：现役 rev 读不出来，退回浮动 tag。
+pub const BASE_DEPLOYMENTS: [(&str, &str); 4] = [
+    ("deployment", cog_core::topology::MAIN_DEPLOYMENT),
+    ("deployment", cog_core::topology::SECURITY_GATEWAY),
+    ("statefulset", cog_core::topology::SANDBOX_EXECUTOR),
+    ("deployment", cog_core::topology::EVOLUTION),
 ];
 
 /// 按名读一个 deployment 的输出形状：`<名字>\t<容器>=<image>,…\n`。
@@ -43,7 +48,8 @@ pub const DEPLOYMENTS_JSONPATH: &str = "{.metadata.name}{\"\\t\"}{range .spec.te
 /// 「第一个读不出来的名字就中止、且报出是哪一个」这件事，只能在没有真集群时量。
 #[async_trait::async_trait]
 pub trait CommandRunner: Send + Sync {
-    async fn run(&self, program: &str, args: &[&str], timeout_secs: u64) -> SFResult<String>;
+    /// 没有「能跑多久」这个参数：判的是它还在不在产出，不是它跑了多久。
+    async fn run(&self, program: &str, args: &[&str]) -> SFResult<String>;
 }
 
 /// 四个主负载里哪一个读不出来、为什么。
@@ -69,14 +75,13 @@ pub async fn read_base_deployments(
     // ——而那条路读出来的是 `ClusterUnreadable`，长得像「集群读不了」，与真正的原因
     // （参数拼错了）隔着一层。2026-10-16 现网实测：裸模板恒失败，加前缀立刻对。
     let format = format!("jsonpath={DEPLOYMENTS_JSONPATH}");
-    for name in BASE_DEPLOYMENTS {
-        // 名字只在这一处拼成目标。
-        let target = format!("deployment/{name}");
+    for (resource, name) in BASE_DEPLOYMENTS {
+        // 名字与资源词只在这一处拼成目标。
+        let target = format!("{resource}/{name}");
         match runner
             .run(
                 kubectl_bin,
                 &["-n", namespace, "get", &target, "-o", &format],
-                30,
             )
             .await
         {
@@ -131,7 +136,7 @@ pub fn deployed_main_rev(jsonpath_out: &str) -> Option<String> {
         let Some((name, rest)) = line.split_once('\t') else {
             continue;
         };
-        if !BASE_DEPLOYMENTS.contains(&name) {
+        if !BASE_DEPLOYMENTS.iter().any(|(_, base)| *base == name) {
             continue;
         }
         for pair in rest.split(',') {
@@ -168,16 +173,14 @@ pub struct Subprocess;
 
 #[async_trait::async_trait]
 impl CommandRunner for Subprocess {
-    async fn run(&self, program: &str, args: &[&str], timeout_secs: u64) -> SFResult<String> {
+    async fn run(&self, program: &str, args: &[&str]) -> SFResult<String> {
         let cmdline = format!("{program} {}", args.join(" "));
-        let fut = tokio::process::Command::new(program)
-            .args(args)
-            .kill_on_drop(true)
-            .output();
-        let out = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut)
-            .await
-            .map_err(|_| SFError::IO(crate::cmd_timeout::timed_out(&cmdline, timeout_secs)))?
-            .map_err(|e| SFError::IO(format!("failed to run {program}: {e}")))?;
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args).kill_on_drop(true);
+        let out = match cog_core::progress::run_child_watched(cmd, &cmdline).await {
+            Ok(cog_core::progress::ChildOutcome::Exited(out)) => out,
+            Err(e) => return Err(SFError::IO(format!("failed to run {program}: {e}"))),
+        };
         if !out.status.success() {
             return Err(SFError::IO(format!(
                 "{cmdline} failed: {}",
@@ -277,13 +280,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CommandRunner for FakeRunner {
-        async fn run(&self, _program: &str, args: &[&str], _timeout_secs: u64) -> SFResult<String> {
+        async fn run(&self, _program: &str, args: &[&str]) -> SFResult<String> {
             let target = args
                 .iter()
-                .find(|a| a.starts_with("deployment/"))
-                .expect("读取一定是按名 get 一个 deployment");
+                .find(|a| a.contains('/') && !a.starts_with("jsonpath="))
+                .expect("读取一定是按名 get 一个工作负载");
             self.asked.lock().unwrap().push((*target).to_string());
-            let name = target.trim_start_matches("deployment/");
+            let name = target.split_once('/').map(|(_, n)| n).unwrap_or(target);
             for (expected, answer) in &self.answers {
                 if *expected == name {
                     return match answer {
@@ -317,13 +320,13 @@ mod tests {
     #[tokio::test]
     async fn the_first_unreadable_name_is_named_and_stops_the_read() {
         let mut runner = FakeRunner::on_main();
-        runner.answers[1] = (BASE_DEPLOYMENTS[1], Err("cannot get resource"));
+        runner.answers[1] = (BASE_DEPLOYMENTS[1].1, Err("cannot get resource"));
 
         let err = read_base_deployments(&runner, "kubectl", "cogneva")
             .await
             .expect_err("第二个名字读不出来，这一趟就不算读到了");
 
-        assert_eq!(err.name, BASE_DEPLOYMENTS[1]);
+        assert_eq!(err.name, BASE_DEPLOYMENTS[1].1);
         assert!(
             err.why.contains("cannot get resource"),
             "失败的原因要带出来：{}",
@@ -386,23 +389,23 @@ mod tests {
     #[tokio::test]
     async fn an_answer_that_does_not_name_the_object_asked_for_is_unreadable() {
         let mut runner = FakeRunner::on_main();
-        runner.answers[2] = (BASE_DEPLOYMENTS[2], Ok(""));
+        runner.answers[2] = (BASE_DEPLOYMENTS[2].1, Ok(""));
         let empty = read_base_deployments(&runner, "kubectl", "cogneva")
             .await
             .expect_err("空回答不是「不在 main 上」");
-        assert_eq!(empty.name, BASE_DEPLOYMENTS[2]);
+        assert_eq!(empty.name, BASE_DEPLOYMENTS[2].1);
         assert!(empty.why.contains("empty output"), "{}", empty.why);
 
         // 张冠李戴同样算没读到：交回来的是别的对象，我们对这个名字一无所知。
         let mut runner = FakeRunner::on_main();
         runner.answers[3] = (
-            BASE_DEPLOYMENTS[3],
+            BASE_DEPLOYMENTS[3].1,
             Ok("some-other-deployment\tx=reg/cogneva:main-aaa\n"),
         );
         let wrong = read_base_deployments(&runner, "kubectl", "cogneva")
             .await
             .expect_err("答的不是问的那个对象");
-        assert_eq!(wrong.name, BASE_DEPLOYMENTS[3]);
+        assert_eq!(wrong.name, BASE_DEPLOYMENTS[3].1);
         assert!(wrong.why.contains("does not name"), "{}", wrong.why);
     }
 
@@ -415,14 +418,14 @@ mod tests {
     async fn the_subprocess_runner_reports_failure_rather_than_empty_output() {
         assert_eq!(
             Subprocess
-                .run("sh", &["-c", "printf 'a\\tb\\n'"], 5)
+                .run("sh", &["-c", "printf 'a\\tb\\n'"])
                 .await
                 .expect("成功的命令要交回 stdout"),
             "a\tb"
         );
 
         let err = Subprocess
-            .run("sh", &["-c", "echo denied >&2; exit 1"], 5)
+            .run("sh", &["-c", "echo denied >&2; exit 1"])
             .await
             .expect_err("非零退出是失败，不是空输出");
         assert!(err.to_string().contains("denied"), "{err}");
@@ -451,7 +454,7 @@ mod tests {
              while [ $# -gt 0 ]; do\n\
              \x20 case \"$1\" in\n\
              \x20   -o) fmt=\"$2\"; shift 2 ;;\n\
-             \x20   deployment/*) target=\"$1\"; shift ;;\n\
+             \x20   deployment/*|statefulset/*) target=\"$1\"; shift ;;\n\
              \x20   *) shift ;;\n\
              \x20 esac\n\
              done\n\
@@ -459,7 +462,7 @@ mod tests {
              \x20 jsonpath=*) ;;\n\
              \x20 *) echo \"error: unable to match a printer suitable for the output format \\\"$fmt\\\"\" >&2; exit 1 ;;\n\
              esac\n\
-             name=\"${target#deployment/}\"\n\
+             name=\"${target#*/}\"\n\
              printf '%s\\t%s=reg/cogneva:main-abc,\\n' \"$name\" \"$name\"\n",
         )
         .unwrap();
@@ -481,7 +484,6 @@ mod tests {
                     "-o",
                     DEPLOYMENTS_JSONPATH,
                 ],
-                5,
             )
             .await;
         assert!(
@@ -519,7 +521,7 @@ mod tests {
         // 读不动：授权被拒、超时、进程起不来，以及空回答（由读的那一层判成 Err）。
         assert_eq!(
             as_reading(Err(UnreadableDeployment {
-                name: BASE_DEPLOYMENTS[0],
+                name: BASE_DEPLOYMENTS[0].1,
                 why: "Forbidden".into(),
             })),
             LiveRevision::Unmeasurable(LiveRevisionGap::ClusterUnreadable)

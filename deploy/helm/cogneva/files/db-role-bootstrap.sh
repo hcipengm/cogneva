@@ -45,23 +45,17 @@ until pg_isready -q -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE"; do
     echo "postgres never became ready; the role cannot be bootstrapped" >&2
     exit 1
   fi
+  # not-a-bound: 等待外部状态收敛/轮询的让路节拍——它决定多久看一次，不结束任何活
   sleep 2
 done
 
-# 第二件要等的事：`public.backup_drills` 出现。新装机上这个 Job 与业务 Pod 同时起步，
-# 而 GRANT 只能授已经存在的表——那句授早了会在第一次演练的凌晨变成一行
-# `permission denied for table backup_drills`，演练记不下自己那一行就证明不了任何事。
-# 等的是「迁移跑完了」，不是「库起来了」：上面那个 pg_isready 只回答后者。
-attempt=0
-until [ "$(psql -tAqc "select to_regclass('public.backup_drills') is not null")" = t ]; do
-  attempt=$((attempt + 1))
-  if [ "$attempt" -ge 120 ]; then
-    echo "public.backup_drills never appeared; the backup role cannot be granted on it" >&2
-    exit 1
-  fi
-  sleep 2
-done
-
+# 先把角色做实，再去等迁移建出来的表。顺序不能反：迁移是**业务角色**在启动时跑的，
+# 而业务角色就是这一节建出来的 cog_app——它不存在，业务 Pod 连不上库，也就没有任何
+# 迁移会跑，`public.backup_drills` 永远不会出现，等着它的那个循环只会等到超时。
+# 2026-11-19 在一台新装机上实测：Job 与业务 Pod 互相等，业务 Pod 反复 CrashLoopBackOff
+# （`password authentication failed for user "cog_app" / Role "cog_app" does not exist`），
+# Job 一直停在 active 1/1。所以建角色、授 schema、装扩展这几步排在最前；只有
+# `backup_drills` 上的那条 GRANT 需要等迁移（见这个 heredoc 之后的那一段）。
 psql -v ON_ERROR_STOP=1 -v app_password="$APP_PASSWORD" -v backup_password="$BACKUP_PASSWORD" \
   -v test_password="$TEST_PASSWORD" \
   -f /dev/stdin <<'SQL'
@@ -114,7 +108,8 @@ END $do$;
 -- 而演练的比对恰好会读每一张表——漏一张，那一张的行数就不在比对里，读起来像一致。
 GRANT pg_read_all_data TO cog_backup;
 
-GRANT INSERT ON public.backup_drills TO cog_backup;
+-- `backup_drills` 上的写权不在这里授：这张表由迁移建出来，而这个脚本跑在迁移之前
+-- （见文件上半段的顺序说明）。它在这个 heredoc 之后、等表出现之后再授。
 
 -- 测试库的那个角色。两项特权都是被用例的题目逼出来的，不是顺手给的：
 --   CREATEDB    —— `backup_pg` 把包恢复进一台现建的库；
@@ -209,6 +204,47 @@ BEGIN
 END
 $do$;
 SQL
+
+# 现在才等 `public.backup_drills`：角色已经能连库了，业务 Pod 才跑得动迁移。
+# GRANT 只能授已经存在的表——授早了会在第一次演练的凌晨变成一行
+# `permission denied for table backup_drills`，演练记不下自己那一行就证明不了任何事。
+# 等的是「迁移跑完了」，不是「库起来了」：上面那个 pg_isready 只回答后者。
+attempt=0
+until [ "$(psql -tAqc "select to_regclass('public.backup_drills') is not null")" = t ]; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 120 ]; then
+    echo "public.backup_drills never appeared; the backup role cannot be granted on it" >&2
+    exit 1
+  fi
+  # not-a-bound: 等待外部状态收敛/轮询的让路节拍——它决定多久看一次，不结束任何活
+  sleep 2
+done
+# 三张表都由迁移建出来，顺序与时刻各不相同：`backup_drills` 只在有结论时写得出来；
+# 开工那一行（`backup_drill_attempts`）与它测到的界（`progress_bounds`）也归它写，
+# 否则「开过工、结局没人看见」与「根本没跑」在账上分不开（2026-11-19 现场：
+# `backup_drill_attempts` 漏授，整趟演练以 `permission denied` 收尾，那一夜读起来像没跑过）。
+# 逐张按 `to_regclass` 判断：表还没出现就跳过这一张，而不是让整个 Job 因为一句 GRANT 失败。
+psql -v ON_ERROR_STOP=1 <<'SQL'
+DO $do$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['backup_drills', 'backup_drill_attempts', 'progress_bounds'] LOOP
+    IF to_regclass('public.' || t) IS NOT NULL THEN
+      EXECUTE format('GRANT SELECT, INSERT, UPDATE ON public.%I TO cog_backup', t);
+    END IF;
+  END LOOP;
+END $do$;
+SQL
+
+# 此后由 cog_app 建出来的表也归 cog_backup 写：上面那张名单只盖得住**建库那一刻
+# 已经存在**的表，而迁移会继续加表（2026-11-26 现场：`backup_drill_attempts` 在
+# bootstrap 跑完之后才建出来，整趟演练以 `permission denied` 收尾）。默认权限补的
+# 是名单的盲区，不替掉名单——bootstrap 之前就存在的表仍要靠上面那几条 GRANT。
+psql -v ON_ERROR_STOP=1 <<'SQL'
+ALTER DEFAULT PRIVILEGES FOR ROLE cog_app IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE ON TABLES TO cog_backup;
+SQL
+echo "db role bootstrap: tables cog_app creates from now on are writable by cog_backup"
 
 # 测试专用库：需要真服务的检查（`deploy/scripts/check-live-services.sh`，变更验证
 # 会跑它）连这一个，不连业务库。分开是硬要求——清单里有几条一上来就清空整张任务表，

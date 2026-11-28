@@ -34,7 +34,8 @@ const PROBE: &str = "probe_metric_batch_writes";
 
 /// 这一轮发多少条。要明显大于一批的上限（256）才看得出「按批提交」与「按条
 /// 提交」的差别，又要小到一次轮询能在几秒内写完。
-// cap: bound — 远大于批上限（256）以显出差别，又小到能在几秒内写完
+// cap: fixed — 远大于批上限（256）以显出差别，又小到能在几秒内写完
+// keep: 删掉后回到「远大于批上限（256）以显出差别，又小到能在几秒内写完」所描述的情形；由这条约定兜住
 const BURST: usize = 600;
 
 fn labels(series: usize) -> HashMap<String, String> {

@@ -237,7 +237,7 @@ const options = {
 #[test]
 fn a_subscription_nothing_publishes_and_a_family_nobody_hears_are_both_reported() {
     let root = std::env::temp_dir().join(format!("cogneva-channels-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     std::fs::create_dir_all(root.join("crates/cog-gateway/src")).expect("temp gateway");
     std::fs::create_dir_all(root.join(WEB)).expect("temp web");
 
@@ -268,5 +268,5 @@ fn a_subscription_nothing_publishes_and_a_family_nobody_hears_are_both_reported(
     let (complaints, _) = contradictions(&root);
     assert!(complaints.is_empty(), "{complaints:?}");
 
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }

@@ -52,7 +52,8 @@ const FAILURE_MARKERS: [&str; 2] = ["panicked at ", "--> "];
 /// Measured on the failing revisions this was written against: two and three
 /// registry-source paths named per run, with the rest of the log's path-like
 /// text being files outside the repository.
-// cap: bound — 一次运行里真正改了名册窗口内文件的路径只有十几条，日志里其余像路径的文本是仓外的文件
+// cap: fixed — 一次运行里真正改了名册窗口内文件的路径只有十几条，日志里其余像路径的文本是仓外的文件
+// keep: 删掉后把日志里所有像路径的文本都当仓内文件去读，一次运行读几百个仓外路径；由「真正改了名册窗口内文件的只有十几条」兜住
 const MAX_FILES_READ: usize = 16;
 
 /// The repository-relative files a job's log names as a failure site.

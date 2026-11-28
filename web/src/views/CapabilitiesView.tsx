@@ -15,7 +15,7 @@
  * 只有声明的那几项自己说出来——混在一起读，这张表就退化成「装了什么」。
  *
  * 「谁能点它」另占一栏，读的是分工表（每个角色声明的 tools），不是名册自报——名册
- * 那一栏写的是角色名，而运行时收窄一轮用的是分工表。没有声明 tools 的角色是「不设
+ * 那一栏写的是角色名，而工具由进程装了什么决定。每个角色都是「不设
  * 边界，拿整张注册表」，单独一句话说清：不点破的话，那一栏的空格会被读成「谁都不许」。
  *
  * 三要件各占一栏：名字、调用点、边界（要什么参数）。第四栏是「点过几次」——它不属
@@ -42,6 +42,7 @@ const SOURCE_LABEL: Record<CapabilitySource, string> = {
   builtin: '内建',
   plugin: '插件',
   mcp: 'MCP',
+  conversation: '对话层',
 };
 
 const RUNS_IN_LABEL: Record<CapabilityRunsIn, string> = {
@@ -54,6 +55,9 @@ const SOURCE_NOTE: Record<CapabilitySource, string> = {
   builtin: '编译进这个进程、由 cog-agent 发布的工具',
   plugin: '磁盘清单声明的工具',
   mcp: '远端 MCP 对端暴露的工具',
+  // 这一层按**最近一轮**记：属主身份与计划模式会改变它，所以表里这一组是那一轮
+  // 实际递出去的，不是平台能提供的全集。还没有一轮跑过时这一层自报「没跑过」。
+  conversation: '最近一轮对话交给模型的工具（属主与计划模式会改变它）',
 };
 
 export function CapabilitiesView() {
@@ -67,7 +71,7 @@ export function CapabilitiesView() {
   // 两个都印，主数才是「会做什么」。
   const callable = data?.entries.filter((e) => e.reach === 'callable').length ?? 0;
   const declaredOnly = (data?.entries.length ?? 0) - callable;
-  // 分工表里没有声明 tools 的角色：它们拿整张注册表，所以每一项都能点。`null` 是这张
+  // 不设边界的角色：它们拿整张注册表，所以每一项都能点。`null` 是这张
   // 表没读到——那时「没有这种角色」无从说起。
   const unboundedRoles = data?.unbounded_roles ?? null;
 
@@ -99,10 +103,6 @@ export function CapabilitiesView() {
         data
           ? `${callable} 项能调${
               declaredOnly > 0 ? ` · ${declaredOnly} 项只有声明` : ''
-            } · ${
-              data.declaring_units === null
-                ? '名册这一拍没读到'
-                : `${data.declaring_units} 个单位自报了能力`
             } · 按 30 秒重读`
           : '这个系统此刻做得到的动作 · 按 30 秒重读'
       }
@@ -164,23 +164,12 @@ export function CapabilitiesView() {
           的登记表，那两个数要分开读。
         </p>
         {unboundedRoles && unboundedRoles.length > 0 ? (
-          // 空表 `tools` 不是「什么都不能调」，是「不设边界，拿整张注册表」——
-          // 不点破的话，「谁能点它」那一栏的空格会被读成「谁都不许」，而那恰好
-          // 把最宽的角色读成了最窄的。
+          // 分工表里已经没有 `tools` 了，每个角色都拿整张注册表。这一栏照旧读
+          // 「不设边界」那一档：空着不是「什么都不能调」，不点破的话，「谁能点它」
+          // 的空格会被读成「谁都不许」，而那恰好把最宽的角色读成了最窄的。
           <p className="px-4 pb-2 text-[11px] leading-relaxed text-[var(--warn,var(--muted))]">
-            {unboundedRoles.join('、')} 没有声明 tools：它们拿整张注册表，所以每一项都能点。
+            工具只有一套：{unboundedRoles.join('、')} 拿的都是整张注册表，所以每一项都能点。
             「谁能点它」那一栏空着，不等于谁都不许。
-          </p>
-        ) : null}
-        {data && data.declaring_units !== null && data.declaring_units > 0 && callable + declaredOnly > 0 && data.entries.every((e) => e.holders.length === 0) ? (
-          // 名册这一拍确实有单位自报了能力，而没有一个名字对得上动作名：这不是「没人
-          // 会做」，是两边说的不是同一组词——名册自报的是角色（planner、generator），
-          // 这一栏要的是动作名（read_file）。不点破的话，读者会去查一个不存在的接线
-          // 问题，而真正要接的是「谁可以调它」这条来自角色分工表的读数。
-          <p className="px-4 pb-2 text-[11px] leading-relaxed text-[var(--warn,var(--muted))]">
-            {data.declaring_units} 个单位自报了能力，却没有一条与动作名对上：名册自报的是
-            角色，不是动作名。「谁可以调它」要看角色分工表（SkillConfig 的 tools），这一栏
-            今天没人填。
           </p>
         ) : null}
         {data && data.entries.length === 0 ? (
@@ -323,29 +312,6 @@ export function CapabilitiesView() {
                 render: (e) => (
                   <span className="text-[11px] text-[var(--muted)]">{e.description || '—'}</span>
                 ),
-              },
-              {
-                key: 'holders',
-                title: '自报持有它的单位',
-                width: '240px',
-                render: (e) =>
-                  data.declaring_units === null ? (
-                    // 名册没读到这一拍，「没有单位自报」这句话无从说起：它与「零个单位
-                    // 自报」在屏幕上同形，而一个要接线、一个要查读失败。
-                    <span className="text-[11px] text-[var(--muted)]">
-                      {data.roster_caveat
-                        ? `名册没读到：${data.roster_caveat}`
-                        : '名册没读到，这一栏无从判断'}
-                    </span>
-                  ) : e.holders.length === 0 ? (
-                    // 空集合不是「没有单位能用它」，是「没有单位这么自报」——名册上的
-                    // 能力标签与实际能点单的动作之间差着一次改名。
-                    <span className="text-[11px] text-[var(--muted)]">没有单位自报</span>
-                  ) : (
-                    <span className="text-[11px]">
-                      {e.holders.map((h) => `${h.unit}${h.live ? '' : '（不在岗）'}`).join(' · ')}
-                    </span>
-                  ),
               },
             ]}
             rows={data.entries}

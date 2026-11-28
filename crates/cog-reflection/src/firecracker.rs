@@ -18,17 +18,14 @@ use cog_core::{MicroVmConfig, SFError, SFResult};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
-/// 等 firecracker 的 API socket 出现：5s。
-///
-/// 进程一起来就 bind，这个等待只覆盖 exec 到 bind 之间的那几毫秒加上调度抖动；
-/// 5s 之后还没出现，说明它已经在启动里退出了，再等只是拖住调用方。
-// cap: bound — 只覆盖 exec 到 bind 的几毫秒加调度抖动；5s 还没出现说明它已在启动里退出了
-const SOCKET_APPEAR_TIMEOUT: Duration = Duration::from_secs(5);
+/// 「firecracker 还在动」这条证据通道的名字：轮询期间由它的 CPU 读数喂。
+const FIRECRACKER_START_CHANNEL: &str = "firecracker-start";
 
 /// 等 socket 出现时的轮询间隔：50ms。
 ///
 /// 比预期出现时间（毫秒级）长一个量级，既不会漏掉，也不会把这条等待变成忙等。
-// cap: bound — 比预期出现时间（毫秒级）长一个量级，不漏也不忙等
+// cap: fixed — 比预期出现时间（毫秒级）长一个量级，不漏也不忙等
+// keep: 删掉后等 socket 出现要么忙等、要么漏掉毫秒级的出现窗口；由「比预期出现时间长一个量级」兜住
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Firecracker 实例句柄。
@@ -96,21 +93,20 @@ impl FirecrackerSandbox {
         copy_cow(&self.config.rootfs_image, &rootfs_copy).await?;
 
         let socket_path = instance_dir.join("firecracker.socket");
-        let child = tokio::process::Command::new(&self.config.firecracker_bin)
+        let mut child = tokio::process::Command::new(&self.config.firecracker_bin)
             .arg("--api-sock")
             .arg(&socket_path)
+            // 自己的进程组：判停时整组一起收，guest 与它拉起的进程不会留在宿主上。
+            .process_group(0)
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| SFError::IO(format!("spawn {}: {e}", self.config.firecracker_bin)))?;
 
-        // 等 API socket 出现（firecracker 启动即建）
-        let socket_ready = wait_for_path(&socket_path, SOCKET_APPEAR_TIMEOUT).await;
-        if !socket_ready {
-            return Err(SFError::IO(format!(
-                "firecracker API socket 未就绪: {}",
-                socket_path.display()
-            )));
-        }
+        // 等 API socket 出现。按动静判：socket 出现就是完成，子进程退出就是直接
+        // 证据；「等了五秒」不是证据——启动慢与已经死掉在时钟眼里同形。
+        wait_for_socket(&socket_path, &mut child, FIRECRACKER_START_CHANNEL)
+            .await
+            .map_err(SFError::IO)?;
 
         let vm = MicroVm {
             id,
@@ -177,21 +173,20 @@ impl FirecrackerSandbox {
         let begin = std::time::Instant::now();
         let mut vm = self.cold_start().await?;
 
-        let timeout = Duration::from_secs(self.config.exec_timeout_secs);
-        let completed = match tokio::time::timeout(timeout, vm.child.wait()).await {
-            Ok(Ok(status)) => {
-                if !status.success() {
-                    warn!(vm_id = %vm.id, ?status, "firecracker exited abnormally");
+        // 判据是它还在不在动（guest 吃的 CPU），不是一个声明的钟：一次正常的进化
+        // 可能跑上半小时，按秒砍它等于把整轮付过的功夫扔掉；而一个真正卡死的 guest
+        // 在一段实测窗口里一个 tick 都不会涨。
+        let cmdline = format!("firecracker {}", vm.id);
+        let completed = match cog_core::progress::watch_child(&mut vm.child, &cmdline, None).await {
+            Ok(cog_core::progress::ChildOutcome::Exited(output)) => {
+                if !output.status.success() {
+                    warn!(vm_id = %vm.id, status = ?output.status, "firecracker exited abnormally");
                 }
                 true
             }
-            Ok(Err(e)) => {
-                self.destroy(vm).await.ok();
+            Err(e) => {
+                cog_core::ignore_lost!(self.destroy(vm).await);
                 return Err(SFError::IO(format!("wait firecracker: {e}")));
-            }
-            Err(_) => {
-                warn!(vm_id = %vm.id, "microvm exec timeout; destroying");
-                false
             }
         };
 
@@ -237,15 +232,45 @@ async fn copy_cow(src: &str, dst: &Path) -> SFResult<()> {
     Ok(())
 }
 
-async fn wait_for_path(path: &Path, timeout: Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
+/// 等子进程建出 API socket。
+///
+/// 三种答案，都不是钟：
+///
+/// * socket 存在 —— 完成；
+/// * 子进程已经退出 —— 直接证据，把它带的那句退出码写进判词；
+/// * 实测界说它不再动 —— [`cog_core::declared_wall::stall`]，界量不到就一直等。
+///
+/// 原来那五秒把「启动慢」与「已经死掉」读成同一件事：慢的那一次被误杀，而快的
+/// 那次才刚好在界内。子进程的 CPU 计数是这条通道的直接证据——一个在启动的
+/// firecracker 会烧 CPU，一个卡死的不会。
+async fn wait_for_socket(
+    path: &Path,
+    child: &mut tokio::process::Child,
+    channel: &str,
+) -> Result<(), String> {
+    let mut movement = cog_core::declared_wall::Movement::new();
+    loop {
         if path.exists() {
-            return true;
+            return Ok(());
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!(
+                "firecracker exited ({status}) before creating its API socket at {}",
+                path.display()
+            ));
+        }
+        if let Some(pid) = child.id() {
+            movement.sample(pid, channel);
+        }
+        if let Some((silent, bound)) = cog_core::declared_wall::stall(channel) {
+            return Err(format!(
+                "firecracker stopped moving (silent {silent:?}, measured window {bound:?}) \
+                 before creating its API socket at {}",
+                path.display()
+            ));
         }
         tokio::time::sleep(SOCKET_POLL_INTERVAL).await;
     }
-    false
 }
 
 /// Firecracker REST API 的最小客户端：HTTP/1.1 over Unix socket。
@@ -279,7 +304,7 @@ impl FcApiClient {
     ) -> SFResult<(u16, String)> {
         let payload = body
             .map(|b| serde_json::to_string(&b).unwrap_or_default())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
             payload.len()
@@ -346,7 +371,7 @@ mod tests {
                     writeln!(f, "{line}").unwrap();
                     conn.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                         .await
-                        .ok();
+                       .ok();
                 }
             }
         })
@@ -366,7 +391,6 @@ mod tests {
             mem_size_mib: 1024,
             boot_args: "init=/evolution/init".into(),
             instance_root: dir.join("instances").to_string_lossy().into(),
-            exec_timeout_secs: 5,
         }
     }
 
@@ -409,12 +433,12 @@ mod tests {
         let server = tokio::spawn(async move {
             if let Ok((mut conn, _)) = listener.accept().await {
                 let mut buf = [0u8; 4096];
-                let _ = conn.read(&mut buf).await;
+                cog_core::ignore_lost!(conn.read(&mut buf).await);
                 conn.write_all(
                     b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\nConnection: close\r\n\r\nbad request",
                 )
                 .await
-                .ok();
+               .ok();
             }
         });
 
@@ -460,5 +484,46 @@ mod tests {
         let err = sandbox.preflight().unwrap_err().to_string();
         // /dev/kvm 与缺失镜像都可能先触发，二者皆可
         assert!(err.contains("/dev/kvm") || err.contains("kernel_image"));
+    }
+
+    /// socket 晚一点出现也照样等到它：完成由子进程的动作说了算，不由等了多久。
+    ///
+    /// 界要**属于这份工作**：这条用例里的子进程是一个睡 300 毫秒再建 socket 的
+    /// `sh`，它在这段时间里不烧 CPU、不印东西——按别的活量出来的窗口去判，它第二拍
+    /// 就被判停了，而它只是在睡。所以这里自己落一枚足够宽的实测窗口（水库的规矩见
+    /// [`cog_core::progress::seed_gaps_for_tests`]），拿锁是因为那座水库是进程级的。
+    #[tokio::test]
+    async fn the_socket_wait_ends_when_the_child_creates_it() {
+        let _serial = cog_core::progress::async_test_lock().await;
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::seed_gaps_for_tests(
+            Duration::from_secs(5),
+            cog_core::progress::SAMPLE_FLOOR,
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("fc.sock");
+        let path = sock.display().to_string();
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("sleep 0.3; : > '{path}'"))
+            .spawn()
+            .unwrap();
+        wait_for_socket(&sock, &mut child, "test-firecracker-slow")
+            .await
+            .expect("the socket appeared");
+        cog_core::ignore_lost!(child.kill().await);
+        cog_core::progress::reset_for_tests();
+    }
+
+    /// 子进程退出且没建 socket 时立刻收尾，并说出是它退出了——不是「等了五秒」。
+    #[tokio::test]
+    async fn a_child_that_exits_without_a_socket_is_named_not_waited_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("never.sock");
+        let mut child = tokio::process::Command::new("false").spawn().unwrap();
+        let err = wait_for_socket(&sock, &mut child, "test-firecracker-dead")
+            .await
+            .expect_err("a child that is gone cannot create the socket");
+        assert!(err.contains("exited"), "{err}");
     }
 }

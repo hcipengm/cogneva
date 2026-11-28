@@ -32,14 +32,16 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
     let system = &config.system;
 
     let backend = cog_extension::executor_backend(system.sandbox_executor_url.clone())?;
+    let agent_loop = cog_agent::AgentLoopConfig::load()?;
     let registry = cog_agent::ToolRegistry::new()
-        .with_wasm_timeout(system.tool_timeout_secs)
-        .with_shell_timeout(system.shell_timeout_secs)
-        .with_sandbox_backend(backend)
+        .with_sandbox_backend(backend.clone())
         .with_guardrail(cog_guardrail::build_default_guardrail(Arc::new(
             cog_guardrail::InMemoryAuditRecorder::new(),
         )))
         .with_require_identity(system.require_tool_identity);
+    // 一页工具结果的大小由这张表服务的窗口导出：「同一个函数算出来的」说的是
+    // `context::tool_result_budget_chars`，不是同一个数。这里没有会话在跑，也就
+    // 没有型号、没有读数，一页因此不设界——与主进程里「还没有读数」那一档一样。
 
     // 内建工具**整批**取自与主应用同一个构造函数（`register_builtins`），不在这里
     // 另列一份。列一份更短的表曾经就写在下面这一行：它看起来完成度更高（少三个
@@ -60,7 +62,6 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
-    let agent_loop = cog_agent::AgentLoopConfig::load()?;
     cog_agent::tools::builtins::register_builtins(
         &registry,
         cog_agent::tools::builtins::BuiltinInputs {
@@ -79,6 +80,11 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
             web_search_base: agent_loop.web_search_base.clone(),
             web_search_fallback_base: agent_loop.web_search_fallback_base.clone(),
             web_fetch_base: agent_loop.web_fetch_base.clone(),
+            // 树读工具在这个进程里也走执行器：MCP 客户端调 `grep`，读的是它自己
+            // 那棵树（请求里带 agent id 时），而不是这个进程脚下的源码。
+            sandbox_backend: Some(backend),
+            message_events: None,
+            intent_events: None,
         },
     );
 

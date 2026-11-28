@@ -395,11 +395,56 @@ pub trait ObjectBackend: Send + Sync {
     /// Generate a presigned URL for temporary access (no-op for memory/fs backends).
     async fn presign_url(&self, key: &str, expiry_secs: u64) -> SFResult<String>;
 
+    /// 让这个后端此刻真的能服务：它存放的根（桶／目录）在，写出去的引用解得开。
+    ///
+    /// 默认什么都不做：文件后端按需建目录，内存后端没有可准备的东西。S3 一类要
+    /// 先确认桶在——引用（`artifact://…`、`s3://<bucket>/<key>`）能不能取回全文
+    /// 取决于桶是否存在，而「配置里写了桶」与「存储上有这个桶」是两件事
+    /// （2026-11-27 现场：配置了 `seaweedfs` 与桶 `cogneva`，存储上一个桶都没有）。
+    async fn ensure_ready(&self) -> SFResult<()> {
+        Ok(())
+    }
+
     /// Check whether an object exists.
     async fn exists(&self, key: &str) -> SFResult<bool>;
 
     /// List object keys matching an optional prefix.
     async fn list(&self, prefix: Option<&str>) -> SFResult<Vec<String>>;
+
+    /// 边来边写：开一段写、一块块交、最后封口。
+    ///
+    /// 与 [`Self::put`] 的差别是**谁攒**：`put` 要求调用方先把整段字节交进来，于是
+    /// 任何「大块字节」的写都必须在内存里攒齐——工具结果、归档、备份包都一样。
+    /// 这一条让攒这件事落在后端：块到了就写，进程的内存不随对象大小走。
+    ///
+    /// **默认是不支持，而不是一个缓冲式的默认实现。** 后者会让 `put` 换一个名字继续
+    /// 活着，而调用方无法分辨它拿到的是真流式还是一段在内存里攒齐的字节——那正是这
+    /// 条契约要拆掉的东西，包成新名字只会让它更难找。没实现的后端如实报错，调用方
+    /// 据此知道这一处还不能边写边落。
+    async fn open_write(&self, _key: &str) -> SFResult<Box<dyn ObjectWrite>> {
+        Err(SFError::Config(
+            "this object backend has no streaming write: it still needs the whole \
+             object in memory before it lands"
+                .to_string(),
+        ))
+    }
+}
+
+/// 一段正在写的对象。
+///
+/// 三条形状：块到了就写（[`Self::write`]）、封口之后才算存在（[`Self::finish`]）、
+/// 中途不要了就丢掉（[`Self::abort`]）。**写进去的字节在封口之前不属于这个对象**：
+/// 一个读到一半的读者要么看不到它，要么看到完整的那一份，不存在「看到半段」。
+#[async_trait::async_trait]
+pub trait ObjectWrite: Send {
+    /// 写一块。块就是这一拍手上的字节，不合并、不切分。
+    async fn write(&mut self, chunk: &[u8]) -> SFResult<()>;
+
+    /// 封口：把这一段收尾，返回它的 URI。封口之后它才对读者存在。
+    async fn finish(self: Box<Self>) -> SFResult<String>;
+
+    /// 放弃这一段：已经写下去的部分要收掉，不能留成一个没人引用的半段。
+    async fn abort(self: Box<Self>) -> SFResult<()>;
 }
 
 /// Unified raw data envelope.
@@ -585,8 +630,20 @@ pub struct RawLoggerConfig {
     pub flush_interval_secs: u64,
 }
 
+// 一条记录的大小在几百字节量级：一千条留在内存里是几百 KB，是一次刷盘能背得动
+// 的量；再多，进程死掉时丢的那一段就不再是一瞬间的读数。
+// cap: fixed — 一千条几百 KB：一次刷盘背得动，死掉时丢的只是一瞬间的读数
+// keep: 删掉后回到「一千条几百 KB：一次刷盘背得动，死掉时丢的只是一瞬间的读数」所描述的情形；由这条约定兜住
+const RAW_LOG_MAX_BUFFER_RECORDS: usize = 1000;
+
+// 一秒：计时器与条数两个触发谁先到谁刷，一秒是「事件驱动的一拍」的下限——再短
+// 就退化成每条记录一次刷盘。
+// cap: fixed — 一秒：再短就退化成每条一次刷盘，一拍的下限就是这个节拍
+// keep: 删掉后刷盘退化成每条一次，一拍的下限跟着每条日志走；由「一拍的下限就是这个节拍」兜住
+const RAW_LOG_FLUSH_INTERVAL_SECS: u64 = 1;
+
 fn default_flush_interval_secs() -> u64 {
-    1
+    RAW_LOG_FLUSH_INTERVAL_SECS
 }
 
 impl Default for RawLoggerConfig {
@@ -594,7 +651,7 @@ impl Default for RawLoggerConfig {
         Self {
             enabled: false,
             base_dir: String::new(),
-            max_buffer_size: 1000,
+            max_buffer_size: RAW_LOG_MAX_BUFFER_RECORDS,
             format: RawLoggerFormat::default(),
             zstd_level: None,
             flush_interval_secs: default_flush_interval_secs(),
@@ -782,6 +839,31 @@ pub trait StateBackend: Send + Sync {
         let _ = workspace_id;
         let _ = task_id;
         Err(SFError::NotImplemented("dag_transition_owned_task".into()))
+    }
+
+    /// 接活：把一条还在等人接的行交给 `updated` 里写的那个人，原子地。
+    ///
+    /// 与 [`Self::dag_transition_task`] 的差别只有一道守卫，而那道守卫就是「接活
+    /// 只能成功一次」：写入只在**这一行此刻没有人持有时**落地。判据读的是存储里
+    /// 那一行自己的认领与租约，不是调用方读到的快照——两个消费者同时读到「待接」
+    /// 时，只有一个的写会落下来，另一个拿到 [`SFError::Conflict`]，于是同一条活
+    /// 不会被两个人同时认走。
+    ///
+    /// 状态门槛仍是调用方给的 `expected`：一条已经跑完或已被取消的行不在任何
+    /// 一份 `expected` 里，因为接活不是复活。
+    ///
+    /// 默认实现返回 `NotImplemented`，与同一族的另外两个迁移方法一致：没有存储的
+    /// 后端不该悄悄把认领做成一次无条件覆盖。
+    async fn dag_claim_task(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        _expected: &[crate::TaskStatus],
+        _updated: &crate::Task,
+    ) -> SFResult<()> {
+        let _ = workspace_id;
+        let _ = task_id;
+        Err(SFError::NotImplemented("dag_claim_task".into()))
     }
 
     /// Remove a task from the DAG state.
@@ -1157,7 +1239,8 @@ pub trait VectorBackend: Send + Sync {
         /// The damping constant of reciprocal rank fusion as the literature defines it
         /// (k = 60): it holds the weight of the lowest ranks near the weight of the
         /// highest instead of letting one list's top hit decide the fusion.
-        // cap: bound — 取的是 RRF 论文的 k = 60：它让最低那些名次的权重接近最高的，而不是让一张表的头名决定整次融合
+        // cap: fixed — 取的是 RRF 论文的 k = 60：它让最低那些名次的权重接近最高的，而不是让一张表的头名决定整次融合
+        // keep: 删掉后换一个 k，最低名次的权重被压低，一张表的头名决定整次融合；由「RRF 论文的 k=60」兜住
         const RRF_K: f32 = 60.0;
         let mut fused_scores: std::collections::HashMap<String, f32> =
             std::collections::HashMap::new();
@@ -1405,7 +1488,7 @@ pub fn tier_for_age(
     hot_duration: std::time::Duration,
     warm_duration: std::time::Duration,
 ) -> StorageTier {
-    let age = age.to_std().unwrap_or_default();
+    let age = age.to_std().unwrap_or(Default::default());
     if age < hot_duration {
         StorageTier::Hot
     } else if age < hot_duration + warm_duration {
@@ -1435,13 +1518,33 @@ pub struct TierPolicy {
 }
 
 /// 默认热层保留 7 天：最近一周的原始流是排障与评测最常回看的那一段。
+// cap: fixed — 最近一周的原始流是排障与评测最常回看的那一段；这是一次回看窗口的取舍，不是测量
+// keep: 删掉后最近一周的原始流不在热层，排障与评测最常回看的那一段要跨层读；由「回看窗口的取舍」兜住
 const DEFAULT_HOT_DURATION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// 默认温层保留 90 天：超过一个季度的事件已经属于归档，但仍要能查。
+// cap: fixed — 一个季度之后的事件属于归档但仍要能查；这是分层策略的取舍，不是测量
+// keep: 删掉后一个季度内的归档不可查，分层策略把仍要能查的那段切掉；由「一个季度之后仍要能查」兜住
 const DEFAULT_WARM_DURATION: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 
+/// zstd 的三档压缩级别：`0` 是库自己的默认档，`3` 是推荐区间里的快档，`9` 是
+/// 高压缩档。
+///
+/// 三个存储面说的是同一件事——原始日志、冷热分层迁移、可观测快照各写一份，改
+/// 一处忘一处，盘上就会出现「同一天的日志在两个 tier 用两种档压」。
+// cap: fixed — zstd 语义：0 = 库默认档
+// keep: 删掉后默认档由各处自己写，同一层用不同压缩档；由「zstd 库默认档」兜住
+pub const COMPRESSION_LEVEL_DEFAULT: i32 = 0;
+// cap: fixed — zstd 推荐压缩档（快档 3）
+// keep: 删掉后热层用别的压缩档，写读两侧的档位对不上；由「zstd 快档 3」兜住
+pub const COMPRESSION_LEVEL_WARM: i32 = 3;
+// cap: fixed — zstd 推荐压缩档（高压缩档 9）
+// keep: 删掉后冷层用别的压缩档，冷数据的存储代价随写入方走；由「zstd 高压缩档 9」兜住
+pub const COMPRESSION_LEVEL_COLD: i32 = 9;
+
 /// 默认每小时扫一次分层：分层是按时间的判据，密到分钟级只会重复搬同一批对象。
-// cap: bound — 分层是按时间的判据，密到分钟级只会重复搬同一批对象
+// cap: fixed — 分层是按时间的判据，密到分钟级只会重复搬同一批对象
+// keep: 删掉后分层按分钟重扫，重复搬同一批对象；由「分层是按时间的判据」兜住
 const DEFAULT_TIER_SCAN_INTERVAL: Duration = Duration::from_secs(3600);
 
 impl Default for TierPolicy {
@@ -1449,8 +1552,8 @@ impl Default for TierPolicy {
         Self {
             hot_duration: DEFAULT_HOT_DURATION,
             warm_duration: DEFAULT_WARM_DURATION,
-            warm_compression_level: 3,
-            cold_compression_level: 9,
+            warm_compression_level: COMPRESSION_LEVEL_WARM,
+            cold_compression_level: COMPRESSION_LEVEL_COLD,
             scan_interval: DEFAULT_TIER_SCAN_INTERVAL,
             cold_key_prefix: "raw".into(),
         }
@@ -1495,4 +1598,93 @@ pub struct RawLogQuery {
 pub trait RawLogIndexStore: Send + Sync {
     async fn upsert(&self, entry: RawLogIndexEntry) -> SFResult<()>;
     async fn query(&self, q: &RawLogQuery) -> SFResult<Vec<RawLogIndexEntry>>;
+}
+
+#[cfg(test)]
+mod streaming_write_tests {
+    use super::*;
+
+    /// 一个只实现了整段写的后端：它没有流式入口，于是第一次开写就必须**如实报错**。
+    ///
+    /// 这条用例钉的是那个默认实现：`put` 换一个名字继续活着（在内存里攒齐再落）会让
+    /// 调用方分辨不出自己拿到的是真流式还是一段攒出来的字节，而整条契约要拆的正是
+    /// 那件事。报错是「这里还不能边写边落」，是读数；悄悄缓冲是同一个行为换了名字。
+    struct WholeObjectOnly;
+
+    #[async_trait::async_trait]
+    impl ObjectBackend for WholeObjectOnly {
+        async fn put(&self, _key: &str, _data: &[u8]) -> SFResult<String> {
+            Ok("uri".into())
+        }
+        async fn get(&self, _key: &str) -> SFResult<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn delete(&self, _key: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn presign_url(&self, _key: &str, _expiry: u64) -> SFResult<String> {
+            Ok("uri".into())
+        }
+        async fn exists(&self, _key: &str) -> SFResult<bool> {
+            Ok(false)
+        }
+        async fn list(&self, _prefix: Option<&str>) -> SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_backend_without_a_streaming_write_says_so() {
+        let error = WholeObjectOnly
+            .open_write("k")
+            .await
+            .err()
+            .expect("没有流式入口的后端必须报错，而不是悄悄返回一个攒着写的句柄");
+        let text = error.to_string();
+        assert!(
+            text.contains("no streaming write"),
+            "判词要说出缺的是什么：{text}"
+        );
+        assert!(
+            text.contains("whole object in memory"),
+            "判词要说出它现在是哪一种写：{text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 原始日志的缓冲条数与刷盘间隔各只有一处声明：默认值读常量，常量上面写着
+    /// 它由什么钉住。`#[serde(default = …)]` 走的是同一个常量。
+    #[test]
+    fn the_raw_logger_reads_its_buffer_and_flush_interval() {
+        let cfg = RawLoggerConfig::default();
+        assert_eq!(cfg.max_buffer_size, RAW_LOG_MAX_BUFFER_RECORDS);
+        assert_eq!(cfg.flush_interval_secs, RAW_LOG_FLUSH_INTERVAL_SECS);
+        assert_eq!(default_flush_interval_secs(), RAW_LOG_FLUSH_INTERVAL_SECS);
+
+        let body = include_str!("storage.rs")
+            .split("impl Default for RawLoggerConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    let value = value.trim().trim_end_matches(',');
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.starts_with(|c: char| c.is_ascii_digit())
+                        && value != "0"
+                })
+            })
+            .map(str::trim)
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
+    }
 }

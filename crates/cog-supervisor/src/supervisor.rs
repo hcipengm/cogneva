@@ -11,50 +11,72 @@ use crate::autonomous::{AutonomousCollaborator, AutonomousConfig, AUTONOMOUS_EVE
 /// Loop name reported through the background-loop liveness family.
 pub const SUPERVISOR_LOOP: &str = "supervisor_main";
 
-/// How long one pass may hold the beat before it is abandoned.
+/// How long a pass is expected to take before the duration is worth announcing.
 ///
 /// The loop beats at the top of its cycle and then awaits exactly one pass, so
-/// a pass's duration is time the heartbeat stamp does not move. Every arm
+/// a pass's duration is time the heartbeat stamp would not move. Every arm
 /// awaits components this crate does not own — a roster probe, lifecycle
 /// transitions, a recovery plan, a respawn, a control-plane report — and none
-/// of them carried a timeout, so an upstream that stopped answering held the
-/// beat for as long as it wanted. Measured 2026-11-01, a database restart held
-/// this loop's stamp still for four minutes and the liveness rule duly reported
-/// `supervisor_main` stalled: the loop was not stuck, it was waiting on a call
-/// nobody had bounded.
+/// of them is idle while it is slow: a database restart holds a probe for
+/// minutes and then answers it. Measured 2026-11-01, such a restart held this
+/// loop's stamp still for four minutes; the loop was not stuck, it was waiting
+/// on a call that had not answered yet.
 ///
-/// The bound is what turns the pass's duration into a number this loop states
-/// instead of one it inherits, and [`supervisor_cadence`] is where it is
-/// stated. Thirty seconds is the coarsest of the loop's own schedules: a pass
-/// that outlives it has been overtaken by its next turn, which is the point
-/// where the wait is no longer this loop doing its work.
-// cap: bound — 一趟超过本环最粗的节拍就已经被自己下一次追上，再等就不是这条环在干活了
-pub const PASS_TIMEOUT: Duration = Duration::from_secs(30);
+/// So this number is an expectation, not a knife. Past it the wait publishes
+/// one line and keeps waiting, while the beat goes on moving (a wait that stops
+/// beating is exactly what the liveness rule would read as a dead process).
+/// Thirty seconds is the coarsest of the loop's own schedules: a pass that
+/// outlives it has been overtaken by its next turn, which is the point where
+/// the duration is worth somebody's attention — not the point where the work
+/// is thrown away.
+// cap: fixed — 只决定「超过多久说一声」；过点之后继续等，从不丢弃仍在跑的 pass
+// keep: 删掉后一拍超过预期没有说一声的时刻；由「过点之后继续等，不丢弃仍在跑的 pass」兜住
+pub const PASS_EXPECTATION: Duration = Duration::from_secs(30);
 
-/// Await one pass, but not forever.
+/// Await one pass to completion, beating while it runs and saying so once it
+/// has outlived [`PASS_EXPECTATION`].
 ///
-/// `None` is a verdict of this loop, not of the component that failed to
-/// answer: the caller records it as a failed pass, which the pass counters
-/// already publish, and the cycle resumes at its next tick with the beat
-/// moving again. Every pass is re-derived from the stores on the next round,
-/// so an abandoned one costs its own work and nothing else.
-async fn bounded_pass<T>(limit: Duration, pass: impl std::future::Future<Output = T>) -> Option<T> {
-    tokio::time::timeout(limit, pass).await.ok()
+/// The result is always the pass's own. A pass that never returns is visible as
+/// the warning this publishes (repeated every few minutes) and as the pass
+/// never reaching its counter, not as a cut that reports a failure.
+async fn pass_past_its_expectation<T, B>(
+    what: &str,
+    beat: B,
+    pass: impl std::future::Future<Output = T>,
+) -> T
+where
+    B: FnMut(),
+{
+    pass_with_expectation(PASS_EXPECTATION, what, beat, pass).await
+}
+
+/// The same law with the expectation injected, so a test does not have to sit
+/// through the production number to observe what happens past it.
+async fn pass_with_expectation<T, B>(
+    expectation: Duration,
+    what: &str,
+    beat: B,
+    pass: impl std::future::Future<Output = T>,
+) -> T
+where
+    B: FnMut(),
+{
+    cog_core::declared_wall::wait_past_wall_beating(expectation, what, beat, pass).await
 }
 
 /// The cadence this loop declares for itself.
 ///
 /// The period is the shortest of its arms' intervals, because the loop beats
-/// whenever any of its tickers fires; the work budget is [`PASS_TIMEOUT`],
-/// because what stands between two beats is one pass and that is the bound the
-/// pass is cut at. Both numbers are read by the rule that compares the
-/// heartbeat's age against this declaration, so declaring them from one place
-/// is what keeps the wall the alarm uses and the wall the passes are held to
-/// from drifting apart.
+/// whenever any of its tickers fires; the work expectation is
+/// [`PASS_EXPECTATION`], because what stands between two beats is one pass.
+/// Both numbers are read by the rule that compares the heartbeat's age against
+/// this declaration, so declaring them from one place is what keeps the number
+/// the alarm reasons about and the number the passes are measured against from
+/// drifting apart.
 pub fn supervisor_cadence(beat_period: Duration) -> cog_core::loop_health::Cadence {
     cog_core::loop_health::Cadence::PeriodicWithWork {
         period: beat_period,
-        work: PASS_TIMEOUT,
+        work: PASS_EXPECTATION,
     }
 }
 
@@ -67,7 +89,8 @@ pub fn supervisor_cadence(beat_period: Duration) -> cog_core::loop_health::Caden
 /// given up on. Reaping earlier would delete the evidence while the attempt to
 /// bring the crew back was still running; reaping later costs nothing but the
 /// announcement each pass makes about an agent that is already gone.
-// cap: bound — 比「把队伍拉回来」所需的时间长；再晚收只是每拍多发一条关于早就没了的 agent 的通告
+// cap: fixed — 比「把队伍拉回来」所需的时间长；再晚收只是每拍多发一条关于早就没了的 agent 的通告
+// keep: 删掉后每拍多发一条关于早就没了的 agent 的通告；由「比把队伍拉回来所需的时间长」兜住
 const REAP_AFTER_DEAD: Duration = Duration::from_secs(1800);
 
 /// The verdicts a pass may announce as an unhealthy agent.
@@ -156,37 +179,35 @@ pub struct SupervisorConfig {
 
 /// 健康巡检周期：10s。
 ///
-/// 判据（可疑 15s、死亡 60s）都在秒级，巡检必须比它们密，否则判据被巡检自己
-/// 拖粗。
-// cap: bound — 判据（可疑 15s、死亡 60s）都在秒级，巡检必须比它们密，否则判据被巡检自己拖粗
-const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
+/// 判据（可疑、死亡）都是秒级的，巡检必须比它们密，否则判据被巡检自己拖粗。
+const HEALTH_INTERVAL: Duration =
+    Duration::from_secs(cog_core::config::SUPERVISOR_HEALTH_INTERVAL_SECS);
 
 /// 配额巡检周期：60s。
 ///
 /// 配额是按分钟算的额度，一分钟读一次就够；更密只是重复读同一批计数。
-// cap: bound — 配额是按分钟算的额度，一分钟读一次就够；更密只是重复读同一批计数
-const QUOTA_INTERVAL: Duration = Duration::from_secs(60);
+const QUOTA_INTERVAL: Duration =
+    Duration::from_secs(cog_core::config::SUPERVISOR_QUOTA_INTERVAL_SECS);
 
 /// 任务再平衡周期：300s。
 ///
 /// 再平衡会挪动在跑的任务，代价远高于一次巡检；五分钟一拍让舰队形状稳定下来，
 /// 而不是跟着一次抖动来回搬。
-// cap: bound — 再平衡会挪动在跑的任务，代价远高于一次巡检；五分钟一拍让舰队形状稳定下来而不是跟着一次抖动来回搬
-const REBALANCE_INTERVAL: Duration = Duration::from_secs(300);
+const REBALANCE_INTERVAL: Duration =
+    Duration::from_secs(cog_core::config::SUPERVISOR_REBALANCE_INTERVAL_SECS);
 
 /// 事件窗口：30s。
 ///
 /// 告警去重与突发判定都看这个窗口；它要长到能盖住一次真实的故障脉冲，短到
 /// 不会把两次独立故障并成一条。
-// cap: bound — 告警去重与突发判定都看它：要长到能盖住一次真实的故障脉冲，短到不会把两次独立故障并成一条
-const EVENT_WINDOW: Duration = Duration::from_secs(30);
+const EVENT_WINDOW: Duration = Duration::from_secs(cog_core::config::SUPERVISOR_EVENT_WINDOW_SECS);
 
 /// 控制面巡检周期：30s。
 ///
 /// 控制面地址是可选的外部依赖，读它的代价在网络往返上；30s 一拍足够发现
 /// 「控制面不在了」，而不会把监控面变成对它的压力源。
-// cap: bound — 控制面地址是可选的外部依赖，读它的代价在网络往返；30s 一拍够发现「控制面不在了」，又不会把监控面变成对它的压力源
-const CONTROL_PLANE_INTERVAL: Duration = Duration::from_secs(30);
+const CONTROL_PLANE_INTERVAL: Duration =
+    Duration::from_secs(cog_core::config::SUPERVISOR_CONTROL_PLANE_INTERVAL_SECS);
 
 impl Default for SupervisorConfig {
     fn default() -> Self {
@@ -195,37 +216,55 @@ impl Default for SupervisorConfig {
             quota_interval: QUOTA_INTERVAL,
             rebalance_interval: REBALANCE_INTERVAL,
             event_window: EVENT_WINDOW,
-            broadcast_capacity: 256,
+            broadcast_capacity: cog_core::config::SUPERVISOR_BROADCAST_DEPTH,
             health_checker: HealthCheckerConfig::default(),
             task_rebalancer: TaskRebalancerConfig::default(),
             autonomous: AutonomousConfig::default(),
-            quota_threshold: 1_000,
+            quota_threshold: cog_core::config::SUPERVISOR_QUOTA_PAUSE_REMAINING_TOKENS,
             control_plane_interval: CONTROL_PLANE_INTERVAL,
             control_plane_url: None,
-            behavior_history_max: 20,
-            heartbeat_history_max: 1_000,
-            alert_history_max: 10_000,
+            // 这三处本来各写一个数，而每个数在自己的读者那里已经有一个名字。
+            // 默认值只是那个名字的第二次声明，写第二遍只会让两处慢慢走散。
+            behavior_history_max: crate::behavior_monitor::BehaviorMonitor::DEFAULT_MAX_HISTORY,
+            heartbeat_history_max: crate::registry::HEARTBEAT_HISTORY_MAX,
+            alert_history_max: crate::alert_store::ALERT_HISTORY_MAX,
         }
     }
 }
 
-impl From<cog_core::SupervisorConfig> for SupervisorConfig {
-    fn from(c: cog_core::SupervisorConfig) -> Self {
+impl SupervisorConfig {
+    /// 从交付配置取这一段。
+    ///
+    /// `heartbeat_secs` 是这次生效的心跳：健康判据的三个阈值没写时跟着它走，
+    /// 所以它必须由调用方从整份配置里读出来递进来，而不是这里假定一个拍子。
+    pub fn from_core(c: cog_core::SupervisorConfig, heartbeat_secs: u64) -> Self {
         Self {
             health_interval: Duration::from_secs(c.health_interval_secs),
             quota_interval: Duration::from_secs(c.quota_interval_secs),
             rebalance_interval: Duration::from_secs(c.rebalance_interval_secs),
             event_window: Duration::from_secs(c.event_window_secs),
             broadcast_capacity: c.broadcast_capacity,
-            health_checker: c.health_checker.into(),
+            health_checker: HealthCheckerConfig::from_core(&c.health_checker, heartbeat_secs),
             task_rebalancer: c.task_rebalancer.into(),
             autonomous: AutonomousConfig::default(),
             quota_threshold: c.quota_threshold,
             control_plane_interval: Duration::from_secs(c.control_plane_interval_secs),
             control_plane_url: c.control_plane_url,
-            behavior_history_max: c.behavior_history_max,
-            heartbeat_history_max: c.heartbeat_history_max,
-            alert_history_max: c.alert_history_max,
+            behavior_history_max: if c.behavior_history_max == 0 {
+                crate::behavior_monitor::BehaviorMonitor::DEFAULT_MAX_HISTORY
+            } else {
+                c.behavior_history_max
+            },
+            heartbeat_history_max: if c.heartbeat_history_max == 0 {
+                crate::registry::HEARTBEAT_HISTORY_MAX
+            } else {
+                c.heartbeat_history_max
+            },
+            alert_history_max: if c.alert_history_max == 0 {
+                crate::alert_store::ALERT_HISTORY_MAX
+            } else {
+                c.alert_history_max
+            },
         }
     }
 }
@@ -602,7 +641,7 @@ impl Supervisor {
             .health_checker
             .dead_after;
         let grace = chrono::Duration::from_std(dead_after).unwrap_or_default()
-            + chrono::Duration::from_std(REAP_AFTER_DEAD).unwrap_or_default();
+            + chrono::Duration::from_std(REAP_AFTER_DEAD).unwrap_or(Default::default());
         let now = Utc::now();
         for (agent_id, issue) in dead {
             let last_seen = match issue {
@@ -722,7 +761,7 @@ impl Supervisor {
                 .event_window
                 .as_secs(),
         ) {
-            let _ = self.event_tx.send(event);
+            cog_core::ignore_lost!(self.event_tx.send(event));
         }
         Ok(())
     }
@@ -897,9 +936,15 @@ impl Supervisor {
             tokio::select! {
                 _ = health.tick() => {
                     cycle = cycle.saturating_add(1);
-                    let _ = this.event_tx.send(SupervisorEvent::Tick { timestamp: Utc::now(), cycle });
-                    let ok = match bounded_pass(PASS_TIMEOUT, this.run_health_pass()).await {
-                        Some(Ok(report)) => {
+                    cog_core::ignore_lost!(this.event_tx.send(SupervisorEvent::Tick { timestamp: Utc::now(), cycle }));
+                    let ok = match pass_past_its_expectation(
+                        "supervisor health pass",
+                        || beat.beat(),
+                        this.run_health_pass(),
+                    )
+                    .await
+                    {
+                        Ok(report) => {
                             if !report.is_clean() {
                                 warn!(
                                     "Supervisor health pass: suspect={}, dead={}, stuck={}",
@@ -912,57 +957,59 @@ impl Supervisor {
                             }
                             true
                         }
-                        Some(Err(e)) => {
+                        Err(e) => {
                             warn!("Supervisor health pass failed: {}", e);
-                            false
-                        }
-                        None => {
-                            warn!(limit = ?PASS_TIMEOUT, "Supervisor health pass did not answer within its bound");
                             false
                         }
                     };
                     this.record_pass(SupervisorPass::Health, ok).await;
                 }
                 _ = quota.tick() => {
-                    let ok = match bounded_pass(PASS_TIMEOUT, this.run_quota_pass()).await {
-                        Some(Ok(())) => true,
-                        Some(Err(e)) => {
+                    let ok = match pass_past_its_expectation(
+                        "supervisor quota pass",
+                        || beat.beat(),
+                        this.run_quota_pass(),
+                    )
+                    .await
+                    {
+                        Ok(()) => true,
+                        Err(e) => {
                             warn!("Supervisor quota pass failed: {}", e);
-                            false
-                        }
-                        None => {
-                            warn!(limit = ?PASS_TIMEOUT, "Supervisor quota pass did not answer within its bound");
                             false
                         }
                     };
                     this.record_pass(SupervisorPass::Quota, ok).await;
                 }
                 _ = rebalance.tick() => {
-                    let ok = match bounded_pass(PASS_TIMEOUT, this.run_rebalance_pass()).await {
-                        Some(Ok(())) => {
+                    let ok = match pass_past_its_expectation(
+                        "supervisor rebalance pass",
+                        || beat.beat(),
+                        this.run_rebalance_pass(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
                             *this.last_rebalance.lock().await = Some(Utc::now());
                             true
                         }
-                        Some(Err(e)) => {
+                        Err(e) => {
                             warn!("Supervisor rebalance pass failed: {}", e);
-                            false
-                        }
-                        None => {
-                            warn!(limit = ?PASS_TIMEOUT, "Supervisor rebalance pass did not answer within its bound");
                             false
                         }
                     };
                     this.record_pass(SupervisorPass::Rebalance, ok).await;
                 }
                 _ = events.tick() => {
-                    let ok = match bounded_pass(PASS_TIMEOUT, this.run_event_pass()).await {
-                        Some(Ok(())) => true,
-                        Some(Err(e)) => {
+                    let ok = match pass_past_its_expectation(
+                        "supervisor event pass",
+                        || beat.beat(),
+                        this.run_event_pass(),
+                    )
+                    .await
+                    {
+                        Ok(()) => true,
+                        Err(e) => {
                             warn!("Supervisor event pass failed: {}", e);
-                            false
-                        }
-                        None => {
-                            warn!(limit = ?PASS_TIMEOUT, "Supervisor event pass did not answer within its bound");
                             false
                         }
                     };
@@ -970,46 +1017,46 @@ impl Supervisor {
                 }
                 _ = autonomous_tick.tick() => {
                     // A decision pass reports no error by construction: a
-                    // failure inside it is logged there and a panic ends the
-                    // loop attempt, which the liveness family counts. What it
-                    // can still do is outlive its bound, and that is recorded
-                    // as a failed round rather than as a healthy one: the
-                    // counter is the only place a reader can see the pass did
-                    // not finish.
-                    let answered =
-                        bounded_pass(PASS_TIMEOUT, this.autonomous.run_decision_pass()).await;
-                    if answered.is_none() {
-                        warn!(limit = ?PASS_TIMEOUT, "Supervisor decision pass did not answer within its bound");
-                    }
-                    this.record_pass(SupervisorPass::Autonomous, answered.is_some())
-                        .await;
+                    // failure inside it is logged there. It is awaited to
+                    // completion like every other arm — a decision that is
+                    // still being made is not a failed round, and the only
+                    // place its duration shows up is the warning published
+                    // once it passes the expectation.
+                    pass_past_its_expectation(
+                        "supervisor decision pass",
+                        || beat.beat(),
+                        this.autonomous.run_decision_pass(),
+                    )
+                    .await;
+                    this.record_pass(SupervisorPass::Autonomous, true).await;
                 }
                 _ = control_plane_tick.tick() => {
                     if let Some(ref client) = this.control_plane {
-                        let report = match bounded_pass(PASS_TIMEOUT, this.run_health_pass()).await {
-                            Some(Ok(r)) => r,
-                            Some(Err(e)) => {
+                        let report = match pass_past_its_expectation(
+                            "control plane tick: health pass",
+                            || beat.beat(),
+                            this.run_health_pass(),
+                        )
+                        .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
                                 warn!("Control plane tick: health pass failed: {}", e);
                                 crate::health_checker::HealthReport::default()
                             }
-                            None => {
-                                warn!(limit = ?PASS_TIMEOUT, "Control plane tick: health pass did not answer within its bound");
-                                crate::health_checker::HealthReport::default()
-                            }
                         };
-                        let pending_handoffs = bounded_pass(
-                            PASS_TIMEOUT,
+                        let pending_handoffs = pass_past_its_expectation(
+                            "control plane tick: pending count",
+                            || beat.beat(),
                             this.autonomous.pending_count(),
                         )
-                        .await
-                        .unwrap_or(0);
-                        let last_rebalance = bounded_pass(
-                            PASS_TIMEOUT,
+                        .await;
+                        let last_rebalance = *pass_past_its_expectation(
+                            "control plane tick: last rebalance",
+                            || beat.beat(),
                             this.last_rebalance.lock(),
                         )
-                        .await
-                        .map(|held| *held)
-                        .unwrap_or(None);
+                        .await;
                         let status = SupervisorStatus {
                             cycle,
                             healthy_agents: report.healthy.len(),
@@ -1018,14 +1065,16 @@ impl Supervisor {
                             last_rebalance,
                             timestamp: Utc::now(),
                         };
-                        let ok = match bounded_pass(PASS_TIMEOUT, client.report_status(status)).await {
-                            Some(Ok(())) => true,
-                            Some(Err(e)) => {
+                        let ok = match pass_past_its_expectation(
+                            "control plane report",
+                            || beat.beat(),
+                            client.report_status(status),
+                        )
+                        .await
+                        {
+                            Ok(()) => true,
+                            Err(e) => {
                                 warn!("Control plane report failed: {}", e);
-                                false
-                            }
-                            None => {
-                                warn!(limit = ?PASS_TIMEOUT, "Control plane report did not answer within its bound");
                                 false
                             }
                         };
@@ -1289,46 +1338,80 @@ mod announceable_tests {
         assert_eq!(announced, vec!["resident".to_string()]);
     }
 
-    /// A pass that never answers must not hold the beat.
+    /// A pass that outlives its expectation is waited on, not abandoned.
     ///
-    /// The loop stamps its heartbeat at the top of a cycle and then awaits one
-    /// pass, so a pass that awaits an upstream nobody has bounded stops the
-    /// stamp. Measured 2026-11-01: a database restart produced exactly that for
-    /// four minutes and the liveness rule reported this loop stalled. The bound
-    /// here is short rather than [`PASS_TIMEOUT`] so the test proves the cut
-    /// happens at the caller's number and not at some wall clock further out.
+    /// The old shape cut the pass at the bound and recorded a failed round, so
+    /// the answer the upstream was about to send was thrown away and the next
+    /// tick asked for it again — the same work, paid for twice. Measured
+    /// 2026-11-01, a database restart held a probe for four minutes and the
+    /// answer existed; the cut was the only reason the loop did not see it.
     #[tokio::test]
-    async fn a_pass_that_never_answers_is_abandoned_at_the_bound() {
+    async fn a_pass_that_outlives_its_expectation_is_waited_on() {
         let started = std::time::Instant::now();
-        let answered = bounded_pass(Duration::from_millis(20), std::future::pending::<()>()).await;
+        let answered =
+            pass_with_expectation(Duration::from_millis(20), "test pass", || {}, async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                7u8
+            })
+            .await;
+        assert_eq!(answered, 7, "过了申报点就丢弃 pass，上游的答案就永远收不到");
         assert!(
-            answered.is_none(),
-            "挂死的 pass 必须被放弃，否则心跳戳停更、读作循环停摆"
+            started.elapsed() >= Duration::from_millis(200),
+            "返回时 {:?}：没有等到 pass 自己结束",
+            started.elapsed()
         );
+    }
+
+    /// The beat keeps moving while a pass outlives its expectation.
+    ///
+    /// This is the half that made the old cut look like the right answer: a
+    /// wait that stops stamping the heartbeat reads as a dead loop. Waiting
+    /// while beating separates the two — the loop is alive, and the duration
+    /// is published instead of being read as a stall.
+    #[tokio::test]
+    async fn the_beat_moves_while_a_pass_outlives_its_expectation() {
+        cog_core::declared_wall::set_poll_every_for_tests(Duration::from_millis(10));
+        let beats = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = beats.clone();
+        let _ = pass_with_expectation(
+            Duration::ZERO,
+            "beating pass",
+            move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            },
+            async {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+            },
+        )
+        .await;
+        cog_core::declared_wall::set_poll_every_for_tests(Duration::ZERO);
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "放弃 pass 的时刻必须由声明的界决定，不是由上游什么时候回来决定"
+            beats.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "等了三个轮询周期而心跳一次都没动，存活读数会把这一趟读成停摆"
         );
     }
 
     #[tokio::test]
-    async fn a_pass_that_answers_inside_the_bound_returns_its_own_value() {
-        assert_eq!(bounded_pass(PASS_TIMEOUT, async { 7u8 }).await, Some(7));
+    async fn a_pass_that_answers_inside_the_expectation_returns_its_own_value() {
+        assert_eq!(
+            pass_with_expectation(PASS_EXPECTATION, "quick", || {}, async { 7u8 }).await,
+            7
+        );
     }
 
-    /// The wall the alarm compares against and the wall the passes are cut at
-    /// are the same declaration.
+    /// The wall the alarm compares against and the expectation the passes are
+    /// measured against are the same declaration.
     ///
     /// A loop declared as `Periodic(beat_period)` with no work budget says its
     /// cycle is shorter than its period, which this loop's cycle is not: it
     /// awaits several components it does not own. That declaration is what made
-    /// the 2026-11-01 restart read as a stall, and this asserts the work budget
-    /// is the bound rather than a number chosen to quiet the rule.
+    /// the 2026-11-01 restart read as a stall, and this asserts the work
+    /// expectation is that number rather than one chosen to quiet the rule.
     #[test]
-    fn the_declared_cadence_carries_the_bound_the_passes_are_cut_at() {
+    fn the_declared_cadence_carries_the_expectation_the_passes_are_measured_against() {
         let cadence = supervisor_cadence(Duration::from_secs(5));
         assert_eq!(cadence.period_secs(), 5);
-        assert_eq!(cadence.work_budget_secs(), PASS_TIMEOUT.as_secs());
+        assert_eq!(cadence.work_budget_secs(), PASS_EXPECTATION.as_secs());
         assert_ne!(
             cadence.work_budget_secs(),
             0,

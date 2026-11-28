@@ -38,18 +38,6 @@ use crate::{
 };
 use cog_core::KeyValueStore;
 
-// cap: bound — 一个谁都没配过的格子读到的默认日上限。它没有实测来源，也不该有：
-// 这个数只决定「没配过的格子读成什么」，决定谁被拦下的是属主为那个人声明的那一对。
-/// The daily token ceiling a scope starts with before anyone configures it.
-///
-/// It is a bound, not a policy: every level refuses only against a pair an
-/// operator declared for that cell, so this number decides what an
-/// unconfigured cell *reads* as, never who gets cut off. The default is
-/// smaller than one working day of the platform's own spend by three orders of
-/// magnitude, which is exactly why it must never be the number a decision is
-/// made from.
-pub const PLATFORM_DAILY_TOKENS: u64 = 50_000;
-
 /// Hierarchy checker over a key-value store.
 #[derive(Clone)]
 pub struct HierarchyManager {
@@ -83,15 +71,19 @@ impl HierarchyManager {
         }
     }
 
-    /// A manager on this store with the platform's own starting ceiling.
+    /// A manager on this store whose undeclared cells read as **no ceiling**.
     ///
     /// Two processes build one of these on the same store -- the app holding
     /// the management face and the LLM gateway holding the enforcement point --
-    /// so the number they start from has to be one definition, not two that
-    /// happen to agree today. A cell an operator configured keeps its own pair
-    /// either way; this is only what a cell with no override evaluates against.
+    /// so what an undeclared cell reads as has to be one definition, not two
+    /// that happen to agree today. It used to be a platform daily ceiling
+    /// (`50_000`), and that number had no source: it was three orders of
+    /// magnitude below one working day's spend, so any reader that folded the
+    /// default into the decision refused every cell nobody had configured.
+    /// A cell an operator declares keeps its own pair; this is only what a
+    /// cell with no override reads as, and it is now a refusal to invent one.
     pub fn from_store(store: Arc<dyn KeyValueStore>) -> Self {
-        Self::new(store, QuotaLimits::from_hard(PLATFORM_DAILY_TOKENS, 0.8))
+        Self::new(store, QuotaLimits::unlimited())
     }
 
     /// Override the default history retention window (in days).
@@ -418,6 +410,10 @@ impl cog_core::HierarchyManager for HierarchyManager {
         self.override_limits(scope, target_id)
             .await
             .map_err(|e| cog_core::SFError::Internal(e.to_string()))
+    }
+
+    fn default_limits(&self) -> QuotaLimits {
+        self.default_limits
     }
 
     async fn set_limits(

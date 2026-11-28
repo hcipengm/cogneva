@@ -236,7 +236,7 @@ fn the_census_is_wide_enough_to_mean_something() {
 #[test]
 fn a_function_without_a_caller_is_reported() {
     let root = std::env::temp_dir().join(format!("cogneva-api-called-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
     std::fs::create_dir_all(root.join("web/src/api")).expect("temp tree");
     std::fs::write(
         root.join(CLIENT),
@@ -275,7 +275,7 @@ fn a_function_without_a_caller_is_reported() {
     .expect("view");
     assert!(uncalled(&root).is_empty(), "{:?}", uncalled(&root));
 
-    let _ = std::fs::remove_dir_all(&root);
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }
 
 #[test]

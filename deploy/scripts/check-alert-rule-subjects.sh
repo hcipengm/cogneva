@@ -324,7 +324,7 @@ CONTRACT_PINNED = {}
 # 控制集：这 18 条读出来必须是「已收敛」，否则是 lint 自己被改坏了（这类改坏会让
 # 整张表的判词系统性偏松或偏严，而它不会报错）。
 FIXED = ['goal_class_not_carried', 'task_checkpoint_not_persisted', 'task_checkpoint_not_superseded',
-         'task_resume_point_unusable', 'verification_killed_by_budget', 'deployment_killed_by_budget',
+         'task_resume_point_unusable', 'verification_stopped_moving', 'deployment_stopped_moving',
          'build_gate_refused', 'background_loop_restarted', 'background_loop_role_probe_failing',
          'registry_store_walk_failing', 'node_disk_usage_high', 'node_disk_usage_critical',
          'node_disk_pressure', 'node_memory_pressure', 'node_capacity_changed', 'build_gate_not_in_force',

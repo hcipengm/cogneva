@@ -27,7 +27,7 @@ use super::lex::{blank, Dialect};
 /// 把它删掉让消费者改走 `common::root::repo_root`，等于让 75 个文件各写一条路径，
 /// 而这里的一行恰恰是它们只写一条路径的原因。
 #[allow(unused_imports)]
-pub use super::root::repo_root;
+pub use super::root::{rendered_root, repo_root};
 
 /// 读文件、走目录的那两条规则本身在 [`super::fsio`]——那里不 import 兄弟模块，
 /// 所以 `src/` 的单测也能按 `#[path]` 编它。这里只是把它们原样再导一次：消费者
@@ -55,6 +55,25 @@ pub fn source_texts(root: &Path) -> Vec<(String, String)> {
             (super::rust_production::relative_name(root, &path), text)
         })
         .collect()
+}
+
+/// 一段源码里两个标记之间的那一段。
+///
+/// 四份 Web 面的夹具各抄过一遍，逐字相同：它们问的都是「这一面里、从这个名字到那个名字
+/// 之间，写的是什么」。抄件的毛病不在重复，在于找不到标记时那句 panic 各写各的——
+/// 一旦其中一份把 panic 换成 `unwrap_or_default()`，找不到标记就变成一段空字符串，
+/// 而「这段里没有那句话」与「这段没找到」在判词上同形，那一面从此对什么都点头。
+///
+/// 收的是纯文本，不认方言：TS、Rust、YAML 三种源码都在用，去注释由调用方自己先做。
+pub fn region_between(text: &str, from: &str, to: &str) -> String {
+    let start = text
+        .find(from)
+        .unwrap_or_else(|| panic!("源码里找不到 `{from}`"));
+    let end = start
+        + text[start..]
+            .find(to)
+            .unwrap_or_else(|| panic!("`{from}` 之后找不到 `{to}`"));
+    text[start..end].to_string()
 }
 
 /// One path reduced to the shape both sides can be compared by.
@@ -259,6 +278,28 @@ pub fn matching_in(
         if c == opening {
             depth += 1;
         } else if c == closing {
+            depth -= 1;
+            if depth == 0 {
+                return Some(at);
+            }
+        }
+    }
+    None
+}
+
+/// 调用方只在 `blanked` 上工作时的配平，偏移全是 `blanked` 自己的字节偏移。
+///
+/// [`matching_in`] 要把字符下标译回**原文**的字节偏移，为此每次调用都要数一遍前缀的
+/// 字符数、再逐字符 zip 两份文本；而有的调用方（按 `blanked` 切段读访问链的普查）
+/// 本来就只在 `blanked` 的坐标系里定位，这份翻译是白做的，热路径上它把一道普查从
+/// 秒级拖到分钟级。UTF-8 的续字节都 ≥ 0x80，扫字节不会把多字节字符误认成 ASCII
+/// 括号，所以单份 `blanked` 上按字节配平是安全的。
+pub fn matching_blanked(blanked: &str, open: usize, opening: u8, closing: u8) -> Option<usize> {
+    let mut depth = 0i32;
+    for (at, byte) in blanked.bytes().enumerate().skip(open.min(blanked.len())) {
+        if byte == opening {
+            depth += 1;
+        } else if byte == closing {
             depth -= 1;
             if depth == 0 {
                 return Some(at);

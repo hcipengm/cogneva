@@ -29,7 +29,7 @@ pub fn write_executable(dir: &Path, name: &str, script: &str) -> PathBuf {
     std::fs::write(&staged, script).unwrap();
     // Unlink rather than let `cp` truncate: truncating a file something is
     // currently executing fails with ETXTBSY inside `cp` itself.
-    let _ = std::fs::remove_file(&path);
+    cog_core::ignore_lost!(std::fs::remove_file(&path));
     let status = std::process::Command::new("cp")
         .arg(&staged)
         .arg(&path)

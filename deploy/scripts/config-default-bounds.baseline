@@ -1,0 +1,11 @@
+# 配置面默认值的存量底账：每行「文件<TAB>未声明来源的条数」，只许减。
+# 数的是 1) `fn default_…() -> T` 且函数体头两行里出现数字 token（注释与字符串不算，
+# 所以 `A2A`、`"1.0.0"` 这类不是数），与 2) `impl Default for X` 块里 `字段: 数字`；
+# 紧挨着的上一行写了 `// cap: bound` 或 `// cap: fixed` 的那一条已声明来源，不计入。
+# 函数体只是一个具名常量时不算新的叶子——那个数已经在那条常量上判过。
+# 减的办法：改成由一条读数算出（并补换输入值就跟着变的测试），或删掉它、说清
+# 这件事此後由哪条读数在什么条件下被看见。门在 the_config_default_book_only_shrinks_test.rs。
+crates/cog-core/src/config.rs	0
+crates/cog-gateway/src/governance.rs	0
+crates/cog-net/src/config.rs	0
+crates/cog-reflection/src/config.rs	0

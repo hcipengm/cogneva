@@ -54,7 +54,8 @@ pub const FACE_INPUT_KEY: &str = "face";
 ///
 /// Ten minutes: long enough to cover a build or a long model call, short enough
 /// that an owner who stopped is visible inside the same working session.
-// cap: bound — 十分钟：够盖住一次构建或一次长模型调用，又短到停下来的属主在同一个工作时段内可见
+// cap: fixed — 十分钟：够盖住一次构建或一次长模型调用，又短到停下来的属主在同一个工作时段内可见
+// keep: 删掉后停下来的属主在同一工作时段内不可见；由「够盖住一次构建或长调用」兜住
 pub const OWNER_IDLE_AFTER_SECS: i64 = 600;
 
 /// Whether a row is one of the standing faces or one of the lines that cut
@@ -126,8 +127,13 @@ pub struct FaceSpec {
     pub revision: i64,
 }
 
+/// 修订号的第一版：从 1 起数，0 留给「没有修订」这件事。
+// cap: fixed — 计数从 1 起：0 是「没有」，不是第一版
+// keep: 删掉后计数从 0 起，0 分不清「没有」与「第一版」；由「计数从 1 起」兜住
+pub const FIRST_REVISION: i64 = 1;
+
 fn default_revision() -> i64 {
-    1
+    FIRST_REVISION
 }
 
 impl FaceSpec {
@@ -240,6 +246,11 @@ impl Face {
         // earned-value one, which is indistinguishable from the face having no
         // work at all.
         task.goal_id = Some(self.face_id.clone());
+        // 面名同时写进它自己的列：读者要知道「这一行是哪一面」不该去解 `input` 的
+        // 文本（存储终态：要按某个键读，就给它一列）。`goal_id` 对根行也是面名，
+        // 但那是「这个项目叫什么」，不是「这一行属于哪一面」——两件事今天恰好同值，
+        // 不该靠这个巧合。
+        task.face_id = Some(self.face_id.clone());
         task.parent_task_id = None;
         task.task_type = crate::TaskType::Custom(FACE_TASK_TYPE.into());
         task.status = crate::TaskStatus::Pending;
@@ -1157,7 +1168,10 @@ pub async fn read_drift(
     let mut readings = Vec::with_capacity(ids.len());
     for face_id in ids {
         let face = faces.iter().find(|f| f.face_id == face_id);
-        let open_tasks = by_face.get(face_id).map(Vec::as_slice).unwrap_or_default();
+        let open_tasks = by_face
+            .get(face_id)
+            .map(Vec::as_slice)
+            .unwrap_or(Default::default());
 
         // Ask the registry about the name the row carries. A name it knows is
         // the owner and nothing needs to be measured; a name it does not know
@@ -1251,6 +1265,21 @@ mod tests {
         task.owner_unit = owner.map(str::to_string);
         task.status = status;
         task
+    }
+
+    /// 面节点的行把面名写进它自己的列：读者不该去解 `input` 的文本。
+    ///
+    /// 没有这次改动这条会红：`to_task` 只写 `goal_id`，`face_id` 一列在每一行治理
+    /// 数据上都是空的（2026-11-27 实测 205 行、0 个非空），宿主读数只能解析文本载荷。
+    #[test]
+    fn the_face_node_names_its_face_in_the_column() {
+        let node = face(Some("unit-operator")).to_task(None);
+        assert_eq!(
+            node.face_id.as_deref(),
+            Some("task-management"),
+            "面节点的 face_id 必须指向它自己；空值时读的人只能去解输入的文本"
+        );
+        assert_eq!(node.goal_id.as_deref(), Some("task-management"));
     }
 
     #[test]

@@ -17,7 +17,8 @@ use cog_core::SupervisorEvent;
 
 /// Threshold for pending-handoffs / active-agents ratio that triggers a
 /// scale-out recommendation in [`AutonomousCollaborator::run_decision_pass`].
-// cap: bound — 待办交接比在跑 agent 多到这个倍数就建议扩容：再低会把正常排队当不足，再高就是排到没人干
+// cap: fixed — 待办交接比在跑 agent 多到这个倍数就建议扩容：再低会把正常排队当不足，再高就是排到没人干
+// keep: 删掉后正常的排队被读成不足，或排到没人干才扩容；由「再低会把正常排队当不足」兜住
 const LOAD_RATIO_THRESHOLD: f64 = 0.8;
 
 /// Configuration for autonomous collaboration decisions.
@@ -29,11 +30,23 @@ pub struct AutonomousConfig {
     pub decision_interval_secs: u64,
 }
 
+// 三次重试后进死信：自治编排里一次失败可能是调度冲突（会自己过去），三次都失败
+// 说明这件活需要人看一眼；再多轮只是把同一个坏任务在队列里来回搬。
+// cap: fixed — 三次：调度冲突会自己过去，三次都失败就需要人看
+// keep: 删掉后调度冲突被反复重试，或三次都失败也无人看；由「三次都失败就需要人看」兜住
+const AUTONOMOUS_MAX_TASK_RETRIES: u32 = 3;
+
+// 五秒一拍：编排决策读的是队列与 agent 的当前状态，一拍的下限要短于一次交接的
+// 往返，否则决策看到的是上一拍的现场。
+// cap: fixed — 五秒：短于一次交接的往返，否则决策看到的是上一拍的现场
+// keep: 删掉后决策看到的是上一拍的现场；由「短于一次交接的往返」兜住
+const AUTONOMOUS_DECISION_INTERVAL_SECS: u64 = 5;
+
 impl Default for AutonomousConfig {
     fn default() -> Self {
         Self {
-            max_task_retries: 3,
-            decision_interval_secs: 5,
+            max_task_retries: AUTONOMOUS_MAX_TASK_RETRIES,
+            decision_interval_secs: AUTONOMOUS_DECISION_INTERVAL_SECS,
         }
     }
 }
@@ -234,7 +247,7 @@ impl AutonomousCollaborator {
         };
         if had_retries {
             if let Some(ref meta) = self.meta_learning {
-                if let Some(group) = self.decision_group_for(task_id).await {
+                if let Some(group) = self.decision_group_or_skip(task_id).await {
                     let _ = meta
                         .record(
                             cog_core::DecisionCategory::RetryPolicy,
@@ -259,7 +272,7 @@ impl AutonomousCollaborator {
 
         // Build task features and query meta-learning for retry strategy.
         let ml_recommendation = if let Some(ref meta) = self.meta_learning {
-            if let Some(group) = self.decision_group_for(task_id).await {
+            if let Some(group) = self.decision_group_or_skip(task_id).await {
                 let decision = meta
                     .recommend(cog_core::DecisionCategory::RetryPolicy, &group)
                     .await;
@@ -311,7 +324,7 @@ impl AutonomousCollaborator {
 
             // Record failed outcome to meta-learning.
             if let Some(ref meta) = self.meta_learning {
-                if let Some(group) = self.decision_group_for(task_id).await {
+                if let Some(group) = self.decision_group_or_skip(task_id).await {
                     let _ = meta
                         .record(
                             cog_core::DecisionCategory::RetryPolicy,
@@ -347,7 +360,7 @@ impl AutonomousCollaborator {
 
             // Record retry decision to meta-learning.
             if let Some(ref meta) = self.meta_learning {
-                if let Some(group) = self.decision_group_for(task_id).await {
+                if let Some(group) = self.decision_group_or_skip(task_id).await {
                     let _ = meta
                         .record(
                             cog_core::DecisionCategory::RetryPolicy,
@@ -394,7 +407,15 @@ impl AutonomousCollaborator {
     /// scale-out event when the load exceeds `LOAD_RATIO_THRESHOLD`.
     pub async fn run_decision_pass(&self) {
         let pending = self.pending_count().await;
-        let ready = self.orchestrator.get_ready_tasks().await.len();
+        // 读不到**不是**「这一拍没有可派的活」：那会让扩容判断把一次库抖动读成空闲
+        // （CC27）。这一拍不给出结论，把读失败说出来。
+        let ready = match self.orchestrator.get_ready_tasks_checked().await {
+            Ok(tasks) => tasks.len(),
+            Err(e) => {
+                warn!(error = %e, "Autonomous: could not read the ready queue; this decision pass draws no conclusion");
+                return;
+            }
+        };
 
         if ready == 0 {
             debug!("Autonomous: decision pass — no ready tasks");
@@ -434,12 +455,69 @@ impl AutonomousCollaborator {
     /// task, so every group would hold a single observation, never reach the
     /// sample floor, and the retry decision would stay unlearnable no matter
     /// how many tasks run.
-    async fn decision_group_for(&self, task_id: &str) -> Option<cog_core::DecisionGroupKey> {
-        let tasks = self.orchestrator.get_all_tasks().await;
-        let task = tasks.into_iter().find(|t| t.id == task_id)?;
-        Some(cog_core::DecisionGroupKey::by_task_type(format!(
-            "{:?}",
-            task.task_type
-        )))
+    async fn decision_group_for(
+        &self,
+        task_id: &str,
+    ) -> cog_core::SFResult<Option<cog_core::DecisionGroupKey>> {
+        let tasks = self.orchestrator.get_all_tasks_checked().await?;
+        Ok(tasks
+            .into_iter()
+            .find(|t| t.id == task_id)
+            .map(|task| cog_core::DecisionGroupKey::by_task_type(format!("{:?}", task.task_type))))
+    }
+
+    /// 读不到分组时**不把观察记进那一组**，并把读失败说出来：那与「任务不在图里」
+    /// 是两件事，而后者才是一次正当的跳过（CC27）。
+    async fn decision_group_or_skip(&self, task_id: &str) -> Option<cog_core::DecisionGroupKey> {
+        match self.decision_group_for(task_id).await {
+            Ok(group) => group,
+            Err(e) => {
+                warn!(
+                    task_id = %task_id,
+                    error = %e,
+                    "Autonomous: could not read the task graph for a decision group; skipping this observation"
+                );
+                None
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 任务重试上限与决策节拍各只有一处声明：默认值读常量，源码面
+    /// `impl Default` 的字段里不再有数字（下一笔写回裸字面量就红）。
+    #[test]
+    fn the_autonomous_default_reads_its_names() {
+        let cfg = AutonomousConfig::default();
+        assert_eq!(cfg.max_task_retries, AUTONOMOUS_MAX_TASK_RETRIES);
+        assert_eq!(
+            cfg.decision_interval_secs,
+            AUTONOMOUS_DECISION_INTERVAL_SECS
+        );
+
+        let body = include_str!("autonomous.rs")
+            .split("impl Default for AutonomousConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    let value = value.trim().trim_end_matches(',');
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.starts_with(|c: char| c.is_ascii_digit())
+                        && value != "0"
+                })
+            })
+            .map(str::trim)
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
     }
 }

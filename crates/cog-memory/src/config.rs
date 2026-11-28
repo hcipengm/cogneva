@@ -101,14 +101,24 @@ pub struct MaintenanceConfig {
     pub refusal_sweep_namespaces: Vec<String>,
 }
 
+/// 重要度低于它的记忆按衰减顺序清掉。
+///
+/// 一条记忆被回读时重要度会被抬高，所以这条阈值分的是「还会被回读」与「已经
+/// 不再被回读」两堆。它由衰减之后回读面里还剩多少被清掉的条目定：清错了就把
+/// 它调低，清不干净就调高——不是一个可以拍定的档位。
+// cap: fixed — 由衰减后的回读率定：被清掉的条目还出现在回读里，就是它太高
+// keep: 删掉后被清掉的条目还出现在回读里，衰减线没有判据；由「由衰减后的回读率定」兜住
+const DECAY_IMPORTANCE_THRESHOLD: f32 = 0.5;
+
 impl Default for MaintenanceConfig {
     fn default() -> Self {
         Self {
-            decay_interval_secs: 3600,
-            decay_age_threshold_secs: 7 * 24 * 3600,
-            decay_importance_threshold: 0.5,
+            // 两个时间长度按「几小时 / 几天」写：一个 3600 读不出它是几小时。
+            decay_interval_secs: cog_core::day::SECONDS_PER_HOUR as u64,
+            decay_age_threshold_secs: cog_core::day::SECONDS_PER_WEEK as u64,
+            decay_importance_threshold: DECAY_IMPORTANCE_THRESHOLD,
             decay_namespaces: vec!["default".into()],
-            refusal_sweep_interval_secs: 1800,
+            refusal_sweep_interval_secs: cog_core::day::SECONDS_PER_HOUR as u64 / 2,
             refusal_sweep_namespaces: vec!["reflection".into()],
         }
     }
@@ -119,7 +129,8 @@ impl Default for MaintenanceConfig {
 /// 取今天窗口配置的值：raw 层改存完整历史之前，抽取器拿到的最长载荷就是被
 /// 裁到一个窗口的那份，默认值让这条请求的量级不变。它是这条链路上第一个显式
 /// 的界——窗口配置改了要一起看，两者比的是同一段文本。
-// cap: bound — 与窗口同源：两者量的是同一段文本，窗口配置改了要一起看
+// cap: fixed — 与窗口同源：两者量的是同一段文本，窗口配置改了要一起看
+// keep: 删掉后抽取输入与窗口各说各的，同一段文本两处预算对不上；由「与窗口同源」兜住
 pub const DEFAULT_EXTRACTION_INPUT_BUDGET_TOKENS: usize = 64_000;
 
 /// 自动摄取管线的运行参数。代码侧 [`Default`] 只是兜底，集群上调参改
@@ -208,29 +219,65 @@ pub struct IngestConfig {
     pub benchmark_canary_markers: Vec<String>,
 }
 
+/// 一条消息在进 DLQ 之前重试几次。
+///
+/// 它钉的是「一条消息从首投到终局要多久」与上游断供重放窗口的关系：重试跑完
+/// 的时间长过重放窗口，消息在队列里等的那段时间就白等了；短太多则一次抖动就
+/// 进 DLQ。
+// cap: fixed — 由断供重放窗口定：一条消息从首投到进 DLQ 要短于这个窗
+// keep: 删掉后一条消息从首投到进 DLQ 的时间超过断供重放窗，重放再也接不上；由「要短于断供重放窗口」兜住
+const INGEST_MAX_RETRIES: u32 = 3;
+
+/// 同时在途的抽取请求条数。
+// cap: fixed — 由提供方的速率上限与单条抽取时长定：被 429 顶住就是它太大
+// keep: 删掉后并发被提供方的 429 顶住，重试代替了抽取；由「由速率上限与单条时长定」兜住
+const EXTRACTION_CONCURRENCY: usize = 4;
+
+/// 一拍搬运多少条：回看窗外的补驱动与 pending 认领问的是同一件事。
+///
+/// 真正的批量不是这个数：认领那一拍按「一拍时长 ÷ 单次抽取的 p95 耗时」现算
+/// （`claim_batch_for_pass`），读数来自 `memory_operation_latency_ms{operation="extract"}`。
+/// 这一格只是**量不到时的种子**（还没有一条抽取耗时样本，或者指标面没接上）——
+/// 种子是退路，不是结论。
+// cap: fixed — 量不到时的种子：真正的一拍批量由实测的抽取耗时现算，这个数只在没有样本时兜底
+// keep: 删掉后量不到时没有种子，一拍批量在冷启动时无值可依；由「只在没有样本时兜底」兜住
+const INGEST_BATCH: usize = 32;
+
+/// 连续多少次环境类抽取失败后暂停拉取。
+// cap: fixed — 由上游断供的判定时长定：暂停要早于断供把事件面塞满
+// keep: 删掉后暂停晚于断供把事件面塞满，上游断供不被发现；由「暂停要早于断供塞满」兜住
+const PULL_PAUSE_AFTER_FAILURES: u32 = 3;
+
+/// 积压深度告警起点：达到后每翻倍打一条 WARN。
+// cap: fixed — 由一拍的抽取吞吐定：它是「几拍才清得完」的积压量
+// keep: 删掉后积压到几拍才清得完之前不报警，读数只在事后可见；由「几拍才清得完的积压量」兜住
+const BACKLOG_WARN_AT: usize = 64;
+
 impl Default for IngestConfig {
     fn default() -> Self {
         Self {
-            max_retries: 3,
-            retry_base_delay_ms: 1000,
+            max_retries: INGEST_MAX_RETRIES,
+            retry_base_delay_ms: cog_core::day::MILLIS_PER_SECOND as u64,
             enable_dlq: true,
             dlq_namespace: "dlq".into(),
-            extraction_concurrency: 4,
+            extraction_concurrency: EXTRACTION_CONCURRENCY,
             extraction_input_budget_tokens: DEFAULT_EXTRACTION_INPUT_BUDGET_TOKENS,
             startup_reconcile: true,
-            reconcile_lookback_hours: 24,
-            aged_out_redrive_batch: 32,
-            reconcile_interval_secs: 600,
-            pull_pause_after_failures: 3,
-            pull_pause_initial_secs: 60,
-            pull_pause_max_secs: 1800,
-            pool_check_secs: 30,
-            pull_resume_observation_secs: 300,
-            backlog_warn_at: 64,
+            reconcile_lookback_hours: cog_core::day::HOURS_PER_DAY as u64,
+            aged_out_redrive_batch: INGEST_BATCH,
+            reconcile_interval_secs: (10 * cog_core::day::SECONDS_PER_MINUTE) as u64,
+            pull_pause_after_failures: PULL_PAUSE_AFTER_FAILURES,
+            pull_pause_initial_secs: cog_core::day::SECONDS_PER_MINUTE as u64,
+            pull_pause_max_secs: (30 * cog_core::day::SECONDS_PER_MINUTE) as u64,
+            pool_check_secs: (cog_core::day::SECONDS_PER_MINUTE / 2) as u64,
+            pull_resume_observation_secs: (5 * cog_core::day::SECONDS_PER_MINUTE) as u64,
+            backlog_warn_at: BACKLOG_WARN_AT,
             bus_group: "memory-ingestor".into(),
-            bus_claim_interval_secs: 30,
-            bus_claim_min_idle_ms: 900_000,
-            bus_claim_batch: 32,
+            bus_claim_interval_secs: (cog_core::day::SECONDS_PER_MINUTE / 2) as u64,
+            bus_claim_min_idle_ms: (15
+                * cog_core::day::SECONDS_PER_MINUTE
+                * cog_core::day::MILLIS_PER_SECOND) as u64,
+            bus_claim_batch: INGEST_BATCH,
             benchmark_namespaces: Vec::new(),
             benchmark_canary_markers: Vec::new(),
         }
@@ -259,8 +306,41 @@ impl MemoryConfig {
             Err(e) => return Err(SFError::Config(format!("{}: {e}", path.display()))),
         };
         cog_core::config::apply_env_paths(&mut section, MEMORY_ENV);
-        serde_json::from_value(section)
-            .map_err(|e| SFError::Config(format!("{} memory: {e}", path.display())))
+        let config: Self = serde_json::from_value(section)
+            .map_err(|e| SFError::Config(format!("{} memory: {e}", path.display())))?;
+        config.ingest.refuse_zero_pull_gate()?;
+        Ok(config)
+    }
+}
+
+impl IngestConfig {
+    /// 拉取闸门的四个输入都是「一个有长度的窗口 / 一段有内容的间隔」：
+    /// 0 次失败之后的暂停、0 秒长的暂停、0 秒的封顶、0 秒的检查间隔，都不是
+    /// 同一件事的极端写法，而是没有意义的值。此前 `PullGate::new` 把四个都
+    /// `.max(1)`，声明的 0 被悄悄换成一个别的数，配置面读到的却不是生效值。
+    /// 改成在这一层（声明进入的地方）按字段名拒绝。
+    fn refuse_zero_pull_gate(&self) -> SFResult<()> {
+        let zero = [
+            (
+                "memory.ingest.pull_pause_after_failures",
+                self.pull_pause_after_failures == 0,
+            ),
+            (
+                "memory.ingest.pull_pause_initial_secs",
+                self.pull_pause_initial_secs == 0,
+            ),
+            (
+                "memory.ingest.pull_pause_max_secs",
+                self.pull_pause_max_secs == 0,
+            ),
+            ("memory.ingest.pool_check_secs", self.pool_check_secs == 0),
+        ];
+        if let Some((name, _)) = zero.iter().find(|(_, is_zero)| *is_zero) {
+            return Err(SFError::Config(format!(
+                "{name} 声明为 0：拉取闸门要一个长度才能判「暂停多久」或「隔多久看一眼」，0 不是这个长度的极端值。要关掉暂停请改配置语义，不要写 0。"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -288,7 +368,7 @@ mod tests {
         assert!(cfg.enabled);
         assert_eq!(cfg.backend_type, "composite");
         assert_eq!(cfg.embedding_dimension, 1024);
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     /// 模型加载默认关：一个 2Gi 上限的 Pod 装不下 BGE-M3 的常驻权重，而本地无缓存
@@ -298,5 +378,94 @@ mod tests {
         let cfg = MemoryConfig::load_from(std::path::Path::new("/nonexistent/x.json")).unwrap();
         assert!(!cfg.load_embedding_model);
         assert!(!cfg.load_reranker_model);
+    }
+
+    /// 补驱动与 pending 认领问的是同一件事：一拍搬得动多少条。两个字段读同一个
+    /// 常量，改一个数两处一起动；这里从两个面钉住它——值相等，且 `Default` 里
+    /// 两个字段后面都不是裸数字。
+    #[test]
+    fn both_claims_read_one_batch_constant() {
+        let ingest = IngestConfig::default();
+        assert_eq!(ingest.aged_out_redrive_batch, INGEST_BATCH);
+        assert_eq!(ingest.bus_claim_batch, INGEST_BATCH);
+
+        let source = include_str!("config.rs");
+        let bare: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                (line.starts_with("aged_out_redrive_batch:")
+                    || line.starts_with("bus_claim_batch:"))
+                    && line
+                        .split_once(':')
+                        .map(|(_, value)| {
+                            value.trim_start().starts_with(|c: char| c.is_ascii_digit())
+                        })
+                        .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            bare.is_empty(),
+            "这两个字段不该各自写一个数，要读 INGEST_BATCH：{bare:?}"
+        );
+    }
+
+    /// 拉取闸门的四格：声明的值原样生效，0 在加载时按字段名拒绝。
+    ///
+    /// 没有这条测试，`.max(1)` 回来时没人会红：声明的 0 会被悄悄换成 1，而
+    /// 配置面读到的仍然像生效值。
+    #[test]
+    fn a_declared_pull_gate_survives_and_zero_is_refused() {
+        let dir = std::env::temp_dir().join(format!("cog-mem-pull-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cogneva.json");
+
+        std::fs::write(
+            &path,
+            r#"{"memory": {"enabled": true, "ingest": {"pull_pause_initial_secs": 90, "pool_check_secs": 5}}}"#,
+        )
+        .unwrap();
+        let cfg = MemoryConfig::load_from(&path).unwrap();
+        assert_eq!(cfg.ingest.pull_pause_initial_secs, 90);
+        assert_eq!(cfg.ingest.pool_check_secs, 5);
+
+        for field in [
+            "pull_pause_after_failures",
+            "pull_pause_initial_secs",
+            "pull_pause_max_secs",
+            "pool_check_secs",
+        ] {
+            std::fs::write(
+                &path,
+                format!(r#"{{"memory": {{"ingest": {{"{field}": 0}}}}}}"#),
+            )
+            .unwrap();
+            let err = MemoryConfig::load_from(&path).unwrap_err().to_string();
+            assert!(
+                err.contains(field),
+                "{field} 声明 0 的错误要点名这个字段，实际是：{err}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `Default` 里其余几条具名常量也要真的被读到：常量与默认值相等，改常量就
+    /// 改默认。
+    #[test]
+    fn every_named_ingest_default_reads_its_constant() {
+        assert_eq!(IngestConfig::default().max_retries, INGEST_MAX_RETRIES);
+        assert_eq!(
+            IngestConfig::default().extraction_concurrency,
+            EXTRACTION_CONCURRENCY
+        );
+        assert_eq!(
+            IngestConfig::default().pull_pause_after_failures,
+            PULL_PAUSE_AFTER_FAILURES
+        );
+        assert_eq!(IngestConfig::default().backlog_warn_at, BACKLOG_WARN_AT);
+        assert_eq!(
+            MaintenanceConfig::default().decay_importance_threshold,
+            DECAY_IMPORTANCE_THRESHOLD
+        );
     }
 }

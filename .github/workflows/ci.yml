@@ -2,14 +2,27 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
-    branches: [main, master]
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  census:
+    # 界与有损：只判这一段提交新增的行。判据在 scripts/ 的两个脚本里，
+    # 这里只调用；钩子管本机最早反馈，这一格管「没接钩子或 --no-verify」的漏网。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: bounds and loss census on this range
+        run: |
+          base="origin/${{ github.base_ref || 'main' }}"
+          python3 scripts/bounds-census.py --root . --check-since "$base"
+          python3 scripts/loss-census.py --root . --check-since "$base"
   check:
     name: Check
     runs-on: ubuntu-latest
@@ -19,6 +32,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # 编译这棵树就要渲染它：bootstrap 的构建脚本把部署清单从 chart 现场生成后
+      # 打进二进制（产物不进仓），`cargo check` 也会跑那个构建脚本。版本从引导器
+      # 的 HELM_VERSION 读——渲染字节随 helm 版本漂，两边各挑一个版本就会在不相关
+      # 的地方红。
+      - name: Resolve pinned Helm version
+        id: helmver
+        run: |
+          v=$(grep -oP 'const HELM_VERSION: &str = "\K[^"]+' crates/bootstrap/src/main.rs)
+          [ -n "$v" ] || { echo "未从 crates/bootstrap/src/main.rs 读到 HELM_VERSION"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ steps.helmver.outputs.version }}
+      - name: Install pyyaml
+        run: sudo apt-get update && sudo apt-get install -y python3-yaml
       # --all-targets: this job's verdict is the one a person or a script can read
       # without a token, so it has to be able to go red for the failures the
       # token-only jobs would otherwise be alone in reporting. A library-only
@@ -72,6 +100,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # 这棵树的两处构建期事实都要 helm：bootstrap 的构建脚本从 chart 现场生成
+      # 部署清单（产物不进仓），而读渲染产物的契约测试在读的那一刻生成同一棵树。
+      # 版本从引导器的 HELM_VERSION 读，不在 CI 里另抄一份。
+      - name: Resolve pinned Helm version
+        id: helmver
+        run: |
+          v=$(grep -oP 'const HELM_VERSION: &str = "\K[^"]+' crates/bootstrap/src/main.rs)
+          [ -n "$v" ] || { echo "未从 crates/bootstrap/src/main.rs 读到 HELM_VERSION"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ steps.helmver.outputs.version }}
+      - name: Install pyyaml
+        run: sudo apt-get update && sudo apt-get install -y python3-yaml
       # A red run has to name the test that broke. The job log is behind a
       # token, so without one all that is readable -- by a person or by anything
       # that reads CI status programmatically -- is "the suite failed", which is
@@ -203,6 +245,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # 与 check 同一个理由：clippy 也跑 bootstrap 的构建脚本，而那一步要 helm。
+      - name: Resolve pinned Helm version
+        id: helmver
+        run: |
+          v=$(grep -oP 'const HELM_VERSION: &str = "\K[^"]+' crates/bootstrap/src/main.rs)
+          [ -n "$v" ] || { echo "未从 crates/bootstrap/src/main.rs 读到 HELM_VERSION"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ steps.helmver.outputs.version }}
+      - name: Install pyyaml
+        run: sudo apt-get update && sudo apt-get install -y python3-yaml
       # `--keep-going` is what makes one red run list every offending crate. Without
       # it the build halts at the first crate that fails, so a toolchain bump that
       # adds a lint to two unrelated crates costs one push per crate, and the tree
@@ -230,6 +284,40 @@ jobs:
       # 新写的一条要么说清是谁的数（实测／本机／默认／例如），要么写机制与比例。
       - name: Check comments state whose capacity they quote
         run: bash deploy/scripts/check-comment-capacity-figures.sh
+      # 注释点名的测试文件必须还在。改名或退休之后那句话继续指着一片空地——读注释的
+      # 人跟不过去，而没有任何东西会红：跑一个改名的测试会立刻报「找不到」，读一句注释
+      # 不会。判词是「引用的名字落到树上」，落点三条（仓库根、引用文件所在目录、树上某处
+      # 的同名文件）；故意点名一份已不在的，在同一行标「已退休／已删／旧路径／待建」。
+      - name: Check comments cite tests the tree carries
+        run: python3 deploy/scripts/check-comment-test-references.py
+      - name: Check the comment-test-reference gate rejects what it should
+        run: bash deploy/scripts/tests/comment-test-references.test.sh
+      # 同一份清单里一个键出现两次，apply 会以 `duplicate entries` 拒收整份，整轮滚动
+      # 失败并把所有工作负载回滚到旧镜像——两笔改动各自都对，合起来才知道。2026-11-18
+      # 现场：网关 env 里的 `COGNEVA_MEMORY_API_BASE`。parity 比的是「有没有这个字段」，
+      # 不比「出现了几次」，这一族一条都拦不住。
+      - name: Check manifests do not repeat a key inside one list
+        run: python3 deploy/scripts/check-manifest-duplicate-keys.py
+      - name: Check the duplicate-key gate rejects what it should
+        run: bash deploy/scripts/tests/manifest-duplicate-keys.test.sh
+      # 767KB 的 `cogneva-json` ConfigMap 走 client-side apply 会被 256KiB 的
+      # last-applied 注解上限拒掉，换版停在「应用主部署结构」这一步（实测 2026-11-24）。
+      # 判据：换版脚本 apply 这一份时必须带 --server-side，且这一步不许整个消失。
+      - name: Check the big ConfigMap is applied server-side
+        run: bash deploy/scripts/tests/big-configmap-applies-server-side.test.sh
+      # StatefulSet 的 `spec.volumeClaimTemplates` 不可变：整份 apply 一份由 chart 建出来
+      # 的对象会被 apiserver 以 `field is immutable` 拒收，换版停在这一步（实测 2026-11-25）。
+      # 判据：换版脚本对这一份先判存在性，在则只 patch Pod 模板。
+      - name: Check the executor StatefulSet is patched, not re-applied
+        run: bash deploy/scripts/tests/executor-statefulset-is-patched-not-reapplied.test.sh
+      # 批次纪律那四道门各自的判据，在 CI 与本机跑同一份夹具：本机绿而 CI 红过一次
+      # （或者反过来），说明判据在两边不是同一条。
+      - name: Check the compile-discipline gate judges what it claims
+        run: bash deploy/scripts/tests/compile-discipline.test.sh
+      - name: Check opening a round asks the batch planner
+        run: bash deploy/scripts/tests/ledger-open-asks-the-planner.test.sh
+      - name: Check one batch buys one compile
+        run: bash deploy/scripts/tests/one-batch-one-compile.test.sh
       # 跑在共享测试库上的测试，不许把整张表数一遍。`COGNEVA_TEST_DATABASE_URL`
       # 把整个套件指向同一份库，整表数行数等于断言「别的测试此刻有没有行」；
       # 而且踩中的那一跑常常 panic 在自己的 cleanup 之前，把它写的行留在库里，
@@ -252,6 +340,17 @@ jobs:
       # 是个死指针。判的是反引号括起来、带扩展名的串（口径见脚本头部）。
       - name: Check README paths exist
         run: bash deploy/scripts/check-readme-paths.sh
+      # 被判词脚本读的表必须有身份，身份写在代码动作的旁边而不是一张登记表里：写者在
+      # 自己的注释里写 writes: <模式> generated 并在正文点到它；只读来验的判词脚本写
+      # reads: <模式> subject；文件自己用 debt: <理由>; expires: <日期> 或 carrier:
+      # 认领。一张手写的分类表改一格就改判词，而树上没有一句话说那一格该不该在——
+      # 叶子头上 `# tunable:` 的每个 derived/fixed 判词就是这种表。没人读的表不判；量不出来（没有
+      # 数据文件、没有判词脚本）退 3——不是绿。测试文件钉住它判红的那些格，否则这扇门
+      # 自己静默答「没意见」也没人看得出来。
+      - name: Check every table a gate reads names its producer
+        run: python3 -I deploy/scripts/check-judgment-inputs.py
+      - name: Check the judgment-input census rejects what it should
+        run: bash deploy/scripts/tests/judgment-inputs.test.sh
       # 编译期内嵌的文件必须真的在镜像构建上下文里。这条失败只在 tag 发版的镜像
       # job 上现形：从开发树（以及本机发布脚本）编永远看得见那些文件，
       # `.dockerignore` 却把它们挡在上下文之外。2026-10-19 实测它静默红了一个多月，
@@ -263,18 +362,14 @@ jobs:
       # 整部扫一次等于「第一次失手之后永久红」，而永久红的门最后会被删掉。
       # 范围按事件算：PR 读 base/head，push 读 before/sha；before 全零（新建分支）时
       # 退回「HEAD 可达的全部」。范围算不出来时脚本自己拒绝，不静默放行。
+      #
+      # 范围计算放在脚本里、这里留**单行**：推前门只回放单行的 `run:`，写成多行块它
+      # 跳过，然后在判词里说「这一面本机没验」——而这个判据本机跑得了，判词就自相矛盾。
       - name: Check commit messages carry no AI attribution
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: |
-          base="${BASE_SHA}"
-          case "${base}" in
-            "" | 0000000000000000000000000000000000000000) base="" ;;
-          esac
-          if [ -n "${base}" ]; then range="${base}..${HEAD_SHA}"; else range="${HEAD_SHA}"; fi
-          echo "judging ${range}"
-          bash deploy/scripts/check-commit-attribution.sh "${range}"
+        run: bash deploy/scripts/check-commit-attribution-ci.sh
       # 公开树里不许把私有仓指出来。第一层锚在所有者句柄上（结构判据），第二层要一份
       # 裸标识名单，而名单进公开文件本身就是泄露 —— 它从 secret 注入。
       #
@@ -284,10 +379,27 @@ jobs:
       # `release-tag` 依赖本 job，常红就是发布停摆，一条把发布卡死的门活不过下一次
       # 有人赶时间。所以这一层缺席时**明说它没跑**（那行 `这一遍没跑` 就是它的读数），
       # 不冒充通过。配上 secret 之后要转 fail-closed，是把上面那行 env 加回来。
+      # 名单缺席时这一层是**没跑**，不是通过。secret 在不在从这棵树里读不出来，
+      # 所以它一直没打开 fail-closed——但那意味着「私有仓名写进公开文件」这半条
+      # 判据在主线上默认是关着的（2026-11-19 实测：那个名字就这样被写进了
+      # 两个公开文件）。配好 secret 之后把下面这行打开，这一层才真的在看。
       - name: Check public surface carries no private identifier
         env:
           PRIVATE_IDENTIFIERS: ${{ secrets.PRIVATE_IDENTIFIERS }}
-        run: bash .github/scripts/check-private-identifiers.sh
+          # REQUIRE_PRIVATE_IDENTIFIERS: "true"   # 属主配好 secret 后打开
+        # 退出码 3 是「有一层没验」：它不再与「跑了且干净」同形，所以这里必须自己
+        # 处理它——记一条 annotation，让这一层从没执行过这件事在 job 的清单上读得到，
+        # 而不是靠谁去翻日志里的那行「这一遍没跑」。1 照旧是红。
+        run: |
+          set +e
+          bash .github/scripts/check-private-identifiers.sh
+          code=$?
+          set -e
+          if [ "${code}" -eq 3 ]; then
+            echo "::warning title=私有标识门::裸标识那一层没跑（PRIVATE_IDENTIFIERS 未注入）；这一层今天没有在守东西"
+            exit 0
+          fi
+          exit "${code}"
       # LLM 平等：业务侧的清单与配置零厂商名、零厂商 env，真上游只住在网关的上游池。
       # 方言词（openai/anthropic）是协议名，不是厂商身份——判据锚在凭证 env、端点、
       # 域名、模型品牌这些**带身份的形状**上，所以那两个词不会被误伤。
@@ -430,6 +542,37 @@ jobs:
       # 把这份声明推上去的那个人核。
       - name: Check every required check is one a workflow can report
         run: python3 deploy/scripts/check-required-checks.py
+
+  # 远端只许一个分支头：main。分支存在的代价不在「推上去」那一刻，而在它之后：2026-11-10
+  # 实测远端积了 8 条头（`ahead8`/`ghost9`/`same`/`master`/`store-ledger`/…），除 `master`
+  # 外每条的内容都早已落在 main 上——删它们的成本全在「证明能删」，每条都要对着往前走了
+  # 两百多笔的 trunk 用 cherry 逐条证一遍。一条分支从诞生到被删之间的每一刻都得有人回答
+  # 「它能不能删」；不诞生就没人要回答。
+  #
+  # 这一条判**已经存在的**头（本地 + 远端，除 main 外一个都不许有），与内容无关：内容已经
+  # 在 main 上恰恰是它该被删的形状，不是留下来的理由。挡在诞生那一刻的是宿主上的
+  # pre-push 钩子（推非 main 的分支头直接拒），两条合起来才闭合：钩子挡住下一个，这里
+  # 发现漏网的。分开两个作业也是这个原因——本地那条推前自检按作业名取步骤，把需要网络的
+  # 判据塞进去等于让每一次推都依赖 GitHub 可达。
+  branch-singularity:
+    name: Branch Singularity
+    runs-on: ubuntu-latest
+    steps:
+      # 判据要看全部头，不是一个深度的提交。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # detached HEAD 的检出里没有 `refs/heads/main`，判据会以「trunk 不在」退出 3——
+      # 那是「判不了」，不是合格。先把 trunk 建成一个本地头再判。
+      #
+      # 有的 checkout 形态会把 main 直接检出（那时 `git branch -f main` 报
+      # `cannot force update the branch 'main' used by worktree`）；两种形态都要能跑，
+      # 所以「没有才建」。
+      - name: Check the repository carries one branch, main
+        run: |
+          git rev-parse --verify --quiet refs/heads/main >/dev/null ||
+            git branch -f main origin/main
+          bash deploy/scripts/check-branch-convergence.sh . --trunk main --remote origin --single
 
   # 上面那条门证的是**消费面**（从入口沿 import 图可达、被一格渲染出来、那一屏读
   # 覆盖端点），它结构上证明不了 `web/` 编得过：类型错、装不上的依赖、打包不进
@@ -596,11 +739,11 @@ jobs:
       #
       # `if:` for the same reason as the script-test step below, measured on the
       # other side of it: when an earlier step fails these get skipped, helm is
-      # then whatever the runner image happens to carry, and the freshness gate
-      # reports the committed manifests as stale -- telling the author to
-      # re-render, which would rewrite the whole tree in that foreign helm's
-      # shape. A skipped setup does not read as "no helm"; it reads as a render
-      # disagreement.
+      # then whatever the runner image happens to carry, and the gates render
+      # the chart with that foreign helm -- parity then reports the static
+      # manifests as drifted by block-scalar whitespace, somewhere unrelated to
+      # the change. A skipped setup does not read as "no helm"; it reads as a
+      # render disagreement.
       - name: Resolve pinned Helm version
         id: helmver
         if: ${{ !cancelled() }}
@@ -689,6 +832,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # 与 test 同一个理由：这一格跑的是同一套用例，构建期渲染与读渲染产物的
+      # 测试都要 helm。
+      - name: Resolve pinned Helm version
+        id: helmver
+        run: |
+          v=$(grep -oP 'const HELM_VERSION: &str = "\K[^"]+' crates/bootstrap/src/main.rs)
+          [ -n "$v" ] || { echo "未从 crates/bootstrap/src/main.rs 读到 HELM_VERSION"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ steps.helmver.outputs.version }}
+      - name: Install pyyaml
+        run: sudo apt-get update && sudo apt-get install -y python3-yaml
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       # 审计 1.4：--fail-under-lines 基线阈值防退化，只升不降。
@@ -753,11 +909,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # 新鲜度门禁是**字节级**比对（重渲染后 diff 已提交产物），而 helm 各版本
-      # 渲染块标量的尾随空白不同：放任 setup-helm 取 latest，一次取不到就静默
-      # 回落它内置的默认版本（实测 3.18.4 与 4.x 在这份 chart 上产出不同字节），
-      # 门禁会在与代码无关的地方红。版本从引导器的 HELM_VERSION 读——安装期就是
-      # 用它下载 helm 的，不在这里再抄一份。
+      # 这条 job 下的门吃的都是**渲染字节**（parity、静态清单回写、各处按目录读
+      # profile 的判据），而 helm 各版本渲染块标量的尾随空白不同：放任 setup-helm
+      # 取 latest，一次取不到就静默回落它内置的默认版本（实测 3.18.4 与 4.x 在这份
+      # chart 上产出不同字节），门禁会在与代码无关的地方红。版本从引导器的
+      # HELM_VERSION 读——安装期就是用它下载 helm 的，不在这里再抄一份。
       - name: Resolve pinned Helm version
         id: helmver
         run: |
@@ -783,11 +939,21 @@ jobs:
           promtool --version
       - name: Check helm/kustomize parity
         run: bash deploy/scripts/check-deploy-parity.sh
-      - name: Check rendered profiles are fresh
-        run: bash deploy/scripts/render-deploy.sh --check
-      # 静态清单里有两块是渲染出来的（配置正文、Pod 模板的配置指纹）。新鲜度门只管
-      # deploy/rendered/，parity 只管字段级对齐，两块都不问「抄过来的那两份还等于
-      # 源吗」——于是改一次配置、忘了手抄，静态清单会一直落后而三道门全绿。
+      # 渲染产物不进仓：这条门判两件事——仓里没有它们，而每个 profile 此刻都
+      # 从 chart 渲染得出来。没有「已提交的产物」可以比，所以没有新鲜度这一说。
+      - name: Check rendered trees are generated, not committed
+        run: bash deploy/scripts/check-rendered-trees.sh
+      # 副本数是部署里的一个数：加一副副本要真的多一块卷、多一条可钉的地址。
+      # 两条都由 chart 投影出来，而投影断掉的那一侧不会报错——一个地址照样能跑，
+      # 只是所有 lane 挤在同一副副本、同一个目录上。判据是换输入值跟着变（1→3）。
+      - name: Check sandbox replicas project into volumes and endpoints
+        run: bash deploy/scripts/tests/sandbox-replica-projection.test.sh
+      # 示例配置不再提交：它就是 chart 配置文档的投影，读它的人够得着源。
+      # 需要一份独立文件的人在消费点跑 `deploy/scripts/gen-example-config.py`，
+      # 生成到 stdout，结果不进树。没有副本，就没有「副本是否等于源」的新鲜度门。
+      # 静态清单里有两块是渲染出来的（配置正文、Pod 模板的配置指纹）。渲染产物本身
+      # 不进仓（上一条门判它不在），parity 只管字段级对齐，两者都不问「抄过来的那两份
+      # 还等于源吗」——于是改一次配置、忘了同步，静态清单会一直落后而三道门全绿。
       - name: Check static manifests carry the rendered config and fingerprints
         run: bash deploy/scripts/sync-static-manifests.sh --check
       - name: Check the Postgres connection share covers every pooled process
@@ -932,6 +1098,22 @@ jobs:
       - name: Install protoc (Windows)
         if: runner.os == 'Windows'
         run: choco install protoc -y
+      # Linux 目标要渲染部署清单（bootstrap 的构建脚本把它们打进二进制）；
+      # 别的目标不嵌那一份——交付面就是 Linux 集群，理由在 build.rs。
+      - name: Resolve pinned Helm version
+        if: runner.os == 'Linux'
+        id: helmver
+        run: |
+          v=$(grep -oP 'const HELM_VERSION: &str = "\K[^"]+' crates/bootstrap/src/main.rs)
+          [ -n "$v" ] || { echo "未从 crates/bootstrap/src/main.rs 读到 HELM_VERSION"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: azure/setup-helm@v4
+        if: runner.os == 'Linux'
+        with:
+          version: ${{ steps.helmver.outputs.version }}
+      - name: Install pyyaml
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-yaml
       # 只编译不跑测试：引导器运行时逻辑是 Linux 专属（K3s/buildah），
       # 本矩阵证明它在三平台都能通过编译（cfg 门控无遗漏）
       - run: cargo check -p cogneva-bootstrap

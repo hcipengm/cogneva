@@ -223,9 +223,21 @@ impl Agent for StubAgent {
     }
 }
 
+/// 一个座位被建起来时交出去的那份声明，按交出去的原文记。
+///
+/// 记的是 `create_agent_declaring` 收到的参数，不是 squad 配置里的字段：中间任何
+/// 一层把它丢掉，配置里仍然写着，而判活的尺子上没有。
+#[derive(Debug, Clone)]
+struct Seat {
+    role: String,
+    deliverable: cog_core::DeliverableDeclaration,
+    directions: Vec<String>,
+}
+
 struct StubAgentManager {
     log: Arc<CallLog>,
     checkout: Checkout,
+    seats: Arc<Mutex<Vec<Seat>>>,
 }
 
 #[async_trait]
@@ -271,6 +283,23 @@ impl AgentManager for StubAgentManager {
             log: Arc::clone(&self.log),
             checkout: self.checkout.clone(),
         }))
+    }
+
+    async fn create_agent_declaring(
+        &self,
+        agent_id: &str,
+        role: &str,
+        llm: Arc<dyn LlmClient>,
+        task_id: Option<&str>,
+        deliverable: cog_core::DeliverableDeclaration,
+        stated_directions: Vec<String>,
+    ) -> cog_core::SFResult<Arc<dyn Agent>> {
+        self.seats.lock().unwrap().push(Seat {
+            role: role.to_string(),
+            deliverable,
+            directions: stated_directions,
+        });
+        self.create_agent(agent_id, role, llm, task_id).await
     }
 
     async fn dispatch(&self, _msg: InboxMessage) -> cog_core::SFResult<()> {
@@ -365,6 +394,8 @@ fn squad_config(goal: &str, task: &Task, pge_mode: PgeMode) -> SquadConfig {
         max_retries: 0,
         profile: Some(derive_task_profile(task)),
         is_self_evolution: task.is_self_evolution(),
+        deliverable: task.deliverable_declaration(),
+        stated_directions: task.stated_directions(),
         ..Default::default()
     }
 }
@@ -381,6 +412,15 @@ async fn run_declared(task: Task) -> (bool, Arc<CallLog>) {
 
 /// The same run, with the checkout stated instead of assumed.
 async fn run_declared_over(checkout: Checkout, task: Task) -> (bool, Arc<CallLog>) {
+    let (success, log, _) = run_declared_recording(checkout, task).await;
+    (success, log)
+}
+
+/// The same run, reporting the seats it created and the declaration each got.
+async fn run_declared_recording(
+    checkout: Checkout,
+    task: Task,
+) -> (bool, Arc<CallLog>, Arc<Mutex<Vec<Seat>>>) {
     let goal = task
         .input
         .get("goal")
@@ -389,11 +429,13 @@ async fn run_declared_over(checkout: Checkout, task: Task) -> (bool, Arc<CallLog
         .to_string();
     let mode = select_mode(&derive_task_profile(&task)).mode;
     let log = Arc::new(CallLog::default());
+    let seats: Arc<Mutex<Vec<Seat>>> = Arc::new(Mutex::new(Vec::new()));
     let executor = SquadExecutor::new()
         .with_llm_provider(Arc::new(StubLlm))
         .with_agent_manager(Arc::new(StubAgentManager {
             log: Arc::clone(&log),
             checkout,
+            seats: Arc::clone(&seats),
         }))
         .with_self_review(SelfReviewConfig {
             max_iterations: 1,
@@ -411,7 +453,93 @@ async fn run_declared_over(checkout: Checkout, task: Task) -> (bool, Arc<CallLog
         result.pge_mode, mode,
         "the run must use the routed topology"
     );
-    (result.success, log)
+    (result.success, log, seats)
+}
+
+/// 声明的来源跟着结论一起到座位上。
+///
+/// 只把结论传下去时，运行时那一头永远读成「没人说」——结论对、来源丢在半路，
+/// 而读数上「生产者说的」与「平台推的」从此都归到没人说那一格。这条走真实派单
+/// 路径，看每个座位建 agent 时真正交出去的那份声明：没有一个是 `unstated`，
+/// 产出改动的那一位拿到的是任务自己的来源。
+#[tokio::test]
+async fn the_source_of_each_declaration_reaches_the_agent_that_runs_it() {
+    let task = self_evolution_task("raise the timeout");
+    let (_, _, seats) =
+        run_declared_recording(Checkout::Changed(WORKSPACE_DIFF.to_string()), task).await;
+    let seats = seats.lock().unwrap().clone();
+    assert!(
+        !seats.is_empty(),
+        "这次运行一个座位都没建：这条判据什么都没在守"
+    );
+    for seat in &seats {
+        assert_ne!(
+            seat.deliverable.state(),
+            cog_core::DeclarationState::Unstated,
+            "建 {} 时把声明的来源丢了：运行时会把这一轮读成「没人就这份活说过话」\n{:?}",
+            seat.role,
+            seat.deliverable
+        );
+    }
+    let producing: Vec<_> = seats
+        .iter()
+        .filter(|seat| seat.deliverable.conclusion().declares_change())
+        .collect();
+    assert!(
+        !producing.is_empty(),
+        "没有一位座位接的是任务自己声明的改动：这条判据量不到来源"
+    );
+    for seat in producing {
+        assert_eq!(
+            seat.deliverable.state(),
+            cog_core::DeclarationState::Derived,
+            "{} 接的是自进化入口推出来的那份声明，来源却不是 `derived`：{:?}",
+            seat.role,
+            seat.deliverable
+        );
+    }
+}
+
+/// 有人就这件活说过方向，每个座位都带着它去判自己的产出。
+///
+/// 方向此前只变成一件新活：判这份活的尺子上没有它，「按我说过的算好」与「按默认
+/// 算好」在读数上同形。这条测试走真实的派单路径，看的是建每个座位时真正交出去的
+/// 那份声明——配置里写着而中间某一层丢掉，正是这条测试要红的那一格。
+#[tokio::test]
+async fn a_direction_stated_about_the_work_reaches_every_seat_that_judges_it() {
+    let mut task = self_evolution_task("quote the failing line in the review");
+    task.input[cog_core::INPUT_SIGNAL] = serde_json::json!({
+        "kind": cog_core::TASTE_SIGNAL_KIND,
+        "taste_kind": "direction_preference",
+        "payload": {
+            "kind": "direction_preference",
+            "preferred": "quoting the failing line",
+            "alternative": "a prose verdict",
+            "rationale": "prose verdicts could not be checked"
+        }
+    });
+
+    let (_, _, seats) =
+        run_declared_recording(Checkout::Changed(WORKSPACE_DIFF.to_string()), task).await;
+    let seats = seats.lock().unwrap().clone();
+    assert!(
+        !seats.is_empty(),
+        "这次运行一个座位都没建：这条判据什么都没在守"
+    );
+    for seat in &seats {
+        assert_eq!(
+            seat.directions.len(),
+            1,
+            "建 {} 时把方向丢了：它判自己的产出时按的是没人说过的那一份标准",
+            seat.role
+        );
+        assert!(
+            seat.directions[0].contains("quoting the failing line"),
+            "{} 拿到的是概括过的一句，不是提交者的原话：{:?}",
+            seat.role,
+            seat.directions
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

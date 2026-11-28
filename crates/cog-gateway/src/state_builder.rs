@@ -90,9 +90,14 @@ pub async fn build_gateway_state(
     taste_intent_sink: &Option<Arc<dyn cog_core::TasteIntentSink>>,
     llm_usage_reader: &Option<Arc<dyn cog_core::LlmUsageReader>>,
     llm_usage: &Option<Arc<dyn cog_core::LlmUsageLedger>>,
+    llm_call_events: &Option<Arc<dyn cog_core::EventStore>>,
     governance_store: &Option<Arc<dyn cog_core::GovernanceStore>>,
     principle_ledger: &Option<Arc<dyn cog_core::PrincipleLedgerStore>>,
+    security_keys: &Option<Arc<dyn cog_core::SecurityKeys>>,
     change_ledger: &Option<Arc<dyn cog_core::ChangeLedgerStore>>,
+    intent_events: &Option<Arc<dyn cog_core::EventStore>>,
+    employee_events: &Option<Arc<dyn cog_core::EventStore>>,
+    message_events: &Option<Arc<dyn cog_core::EventStore>>,
     key_value: &Option<Arc<dyn cog_core::KeyValueStore>>,
     chat_turns: &crate::ChatTurnHandle,
     conversation: crate::chat::ConversationHandle,
@@ -121,11 +126,12 @@ pub async fn build_gateway_state(
     let gateway_state = Arc::new(crate::GatewayState {
         config: std::sync::RwLock::new(config.gateway.clone()),
         data_dir: config.app.data_dir.clone(),
+        // 存生效值而不是原始字段：0 在这里会被建成一条 0 秒的期限，每个请求立刻 408，
+        // 而「没写」与「不限」在 0 上是同一个数。
         request_timeout_secs: std::sync::atomic::AtomicU64::new(
-            config.gateway.request_timeout_secs,
-        ),
-        sandbox_task_timeout_secs: std::sync::atomic::AtomicU64::new(
-            config.gateway.sandbox_task_timeout_secs,
+            config
+                .gateway
+                .effective_request_timeout_secs(config.system.shutdown_timeout_ms),
         ),
         event_tx: event_tx.clone(),
         task_event_tx: task_event_tx.clone(),
@@ -177,6 +183,11 @@ pub async fn build_gateway_state(
         observables,
         metrics_dimensions: config.metrics.scrape_dimensions.clone(),
         mcp_client: mcp_client.clone(),
+        // 有客户端才有计数器：没有客户端时这一层连行都没有，装一个空计数器只会
+        // 让「没接」与「接了但没人点」互换位置。
+        mcp_call_counts: mcp_client
+            .as_ref()
+            .map(|_| Arc::new(crate::mcp_calls::McpCallCounts::new())),
         object_backend: object_backend.clone(),
         notification_store: notification_store.clone(),
         notification_dispatcher: notification_dispatcher.clone(),
@@ -184,7 +195,11 @@ pub async fn build_gateway_state(
         workspace_store: None,
         governance_store: governance_store.clone(),
         principle_ledger: principle_ledger.clone(),
+        security_keys: security_keys.clone(),
         change_ledger: change_ledger.clone(),
+        intent_events: intent_events.clone(),
+        employee_events: employee_events.clone(),
+        message_events: message_events.clone(),
         key_value: key_value.clone(),
         external_skill_registry: external_skill_registry.clone(),
         tool_registry: tool_registry.clone(),
@@ -202,9 +217,15 @@ pub async fn build_gateway_state(
         // 逐笔 token 账由拥有它的 crate 装配好交进来；没交进来时读面报
         // 「量不了」而不是零。
         llm_usage: llm_usage.clone(),
+        llm_call_events: llm_call_events.clone(),
         llm_client: Arc::new(std::sync::RwLock::new(None)),
         chat_turns: chat_turns.clone(),
         conversation,
+        // 每一段对话的帧流与在跑的轮：跟着对话走，不跟着某一条连接走——连接断开
+        // 之后那一轮还在说，重连上来的人要接得上（见 `chat_stream`）。
+        chat_stream: crate::chat_stream::ChatStream::new(
+            config.system.websocket_event_cache_capacity,
+        ),
         agent_messages: agent_messages.clone(),
         datasets: datasets.clone(),
     });

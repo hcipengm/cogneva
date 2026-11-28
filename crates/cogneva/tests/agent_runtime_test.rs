@@ -11,17 +11,19 @@ async fn test_agent_loop_completes_without_tools() {
     let (event_tx, mut event_rx) = mpsc::channel(128);
     let mut agent_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "test".into(),
             role: "planner".to_string(),
             max_iterations: 3,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -58,17 +60,19 @@ async fn test_agent_loop_state_transitions() {
     let (event_tx, _event_rx) = mpsc::channel(128);
     let mut agent_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "test".into(),
             role: "planner".to_string(),
             max_iterations: 2,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -76,7 +80,7 @@ async fn test_agent_loop_state_transitions() {
     assert_eq!(agent_loop.state(), RuntimeState::Idle);
 
     let llm = Arc::new(MockProvider::new("done"));
-    let _ = agent_loop.run(serde_json::json!({}), llm.as_ref()).await;
+    cog_core::ignore_lost!(agent_loop.run(serde_json::json!({}), llm.as_ref()).await);
 
     assert_eq!(agent_loop.state(), RuntimeState::Complete);
 }
@@ -86,17 +90,19 @@ async fn test_agent_loop_steps_recorded() {
     let (event_tx, _event_rx) = mpsc::channel(128);
     let mut agent_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "test".into(),
             role: "generator".to_string(),
             max_iterations: 2,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -115,17 +121,19 @@ async fn test_agent_loop_max_iterations() {
     let (event_tx, _event_rx) = mpsc::channel(128);
     let mut agent_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "test".into(),
             role: "planner".to_string(),
             max_iterations: 1,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -157,17 +165,19 @@ async fn test_agent_loop_chat_stream_returns_raw_stream() {
     let (event_tx, _event_rx) = mpsc::channel(128);
     let mut agent_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "test".into(),
             role: "planner".to_string(),
             max_iterations: 2,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -200,17 +210,19 @@ async fn test_agent_loop_checkpoint() {
     let (event_tx, _event_rx) = mpsc::channel(128);
     let agent_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "checkpoint-agent".into(),
             role: "planner".to_string(),
             max_iterations: 3,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -233,17 +245,19 @@ async fn test_react_loop_wraps_agent_loop() {
     let (event_tx, _event_rx) = mpsc::channel(128);
     let agent_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "react-test".into(),
             role: "planner".to_string(),
             max_iterations: 3,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -258,17 +272,19 @@ async fn test_react_loop_emits_react_events() {
     let (event_tx, mut event_rx) = mpsc::channel(128);
     let agent_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "react-events".into(),
             role: "generator".to_string(),
             max_iterations: 3,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -314,17 +330,19 @@ async fn test_react_loop_steps_extracted_correctly() {
     let (event_tx, _event_rx) = mpsc::channel(128);
     let agent_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "react-steps".into(),
             role: "evaluator".to_string(),
             max_iterations: 3,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -367,17 +385,19 @@ async fn test_agent_runtime_discovers_dynamically_registered_tool() {
     let registry = cog_agent::ToolRegistry::new();
     let runtime = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "test".into(),
             role: "planner".to_string(),
             max_iterations: 3,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     )
@@ -438,17 +458,19 @@ fn runtime_with_one_tool(
     });
     let runtime = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: agent_id.into(),
             role: role.to_string(),
             max_iterations,
-            context_window_size: 4000,
+            context_window_size: Some(4000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     )

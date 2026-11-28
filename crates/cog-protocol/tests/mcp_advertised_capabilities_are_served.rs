@@ -203,7 +203,7 @@ async fn every_declared_method_is_answered_and_undeclared_ones_are_not_advertise
             is_method_not_found(&reply),
             "`{undeclared}` has no arm, so it is refused: {reply}"
         );
-        let namespace = undeclared.split('/').next().unwrap_or_default();
+        let namespace = undeclared.split('/').next().unwrap_or(Default::default());
         assert!(
             !keys.contains(namespace),
             "`{namespace}` is not implemented, so it must not be advertised -- a key \

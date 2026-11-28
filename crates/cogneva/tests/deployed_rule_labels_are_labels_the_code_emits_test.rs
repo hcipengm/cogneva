@@ -75,6 +75,7 @@ const WRITTEN_BY_CODE: &[(&str, &str)] = &[
     ("consumer_group", "crates/cog-stream/src/observable.rs"),
     ("data_dir", "crates/cog-reflection/src/store_readouts.rs"),
     ("dir", "crates/cog-reflection/src/build_gate/mod.rs"),
+    ("effect", "crates/cog-agent/src/agent_kernel/runtime.rs"),
     ("face", "crates/cog-orchestrator/src/face_drift.rs"),
     ("intent", "crates/cog-github/src/landing.rs"),
     ("kind", "crates/cog-orchestrator/src/resource_ledger.rs"),
@@ -291,7 +292,7 @@ fn references_a_declaration_of(root: &Path, file: &str, label: &str) -> bool {
     if names.is_empty() {
         return false;
     }
-    let body = std::fs::read_to_string(root.join(file)).unwrap_or_default();
+    let body = std::fs::read_to_string(root.join(file)).unwrap_or(Default::default());
     names.iter().any(|name| body.contains(&format!("::{name}")))
 }
 

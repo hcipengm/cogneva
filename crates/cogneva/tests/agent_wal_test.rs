@@ -417,18 +417,20 @@ async fn test_agent_loop_with_wal_persists_events() {
 
     let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
     let config = RuntimeConfig {
+        stated_directions: Vec::new(),
         agent_id: "test-agent".into(),
         role: "planner".to_string(),
         max_iterations: 1,
-        context_window_size: 4000,
+        context_window_size: Some(4000),
         skill_cache_ttl_secs: 30,
         think_stall_timeout_secs: 240,
-        final_draft_timeout_secs: 300,
         skill_config: None,
         crew_id: None,
         squad_id: None,
         // 这一条测的是 WAL 往返，不关心这次运行替谁干活。
         owner_task_id: None,
+        deliverable: cog_core::Deliverable::Unstated,
+        deliverable_state: cog_core::DeclarationState::Unstated,
     };
     let mut agent_loop = AgentRuntime::new(config, event_tx).with_wal(wal);
 

@@ -9,7 +9,10 @@ use axum::{
     Json, Router,
 };
 use base64::Engine as _;
+use cog_core::contract::observability::METRICS_PATH;
 use cog_core::TraceContext;
+
+use crate::error::ApiError;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap};
@@ -34,8 +37,11 @@ pub mod backup_admin;
 pub mod buildgate;
 pub mod capabilities;
 pub mod chat;
+pub mod chat_models;
+pub mod chat_stream;
 pub mod cluster;
 pub mod collaboration;
+pub mod commands;
 pub mod contribution_admin;
 pub mod dashboard;
 pub mod datasets;
@@ -51,12 +57,16 @@ pub mod git_mirror;
 pub mod git_routing;
 pub mod github_app;
 pub mod governance;
+pub mod grafana_export;
 pub mod heartbeat_history;
 pub mod hook_forwarder;
 pub mod hooks;
 pub mod ide;
+pub mod intent;
+pub mod keys_api;
 pub mod knowledge;
 pub mod llm_admin;
+pub mod mcp_calls;
 pub mod memory;
 pub mod notifications;
 pub mod observability;
@@ -215,7 +225,6 @@ pub struct GatewayState {
     pub data_dir: String,
     /// Hot-path timeouts stored as atomics to avoid RwLock on every request.
     pub request_timeout_secs: std::sync::atomic::AtomicU64,
-    pub sandbox_task_timeout_secs: std::sync::atomic::AtomicU64,
     pub event_tx: broadcast::Sender<cog_core::AgentEvent>,
     pub task_event_tx: broadcast::Sender<cog_core::TaskEvent>,
     pub jwt_manager: Arc<dyn cog_core::AuthProvider>,
@@ -328,12 +337,19 @@ pub struct GatewayState {
     /// 缺席时读面显式报「量不了」，不把缺账读成零花销。借的是库里已有的池，
     /// 不为这一次读新开一套连接。
     pub llm_usage: Option<Arc<dyn cog_core::LlmUsageLedger>>,
+    /// 调用事实的写入口（`cogneva_event` 的 `llm_call`）。与账本并存：账本是投影，
+    /// 事件是正本；读切换之前两条都写。
+    pub llm_call_events: Option<Arc<dyn cog_core::EventStore>>,
     /// Observables — 各业务 crate 暴露的系统级指标（D5/D8/D9）。
     pub observables: Vec<Arc<dyn cog_core::Observable>>,
     /// 抓取维度集合的可选收窄项；空 = 不收窄，采每个 observable 自己声明的有界维度。
     pub metrics_dimensions: Vec<String>,
     /// MCP client — discover and call external MCP tools.
     pub mcp_client: Option<Arc<dyn cog_core::McpClient>>,
+    /// MCP 这一层的调用计数。与 `mcp_client` 同生共死：没有客户端时不装计数器，
+    /// 能力格那一栏就答 `null`（没有计数器），而不是 `0`（量过、没人用）。
+    /// 口径是进程内、累计——与内建注册表的 `calls()` 同一条。
+    pub mcp_call_counts: Option<Arc<crate::mcp_calls::McpCallCounts>>,
     /// Object storage backend for file uploads/downloads.
     pub object_backend: Option<Arc<dyn cog_core::ObjectBackend>>,
     /// Notification store (per-process in-memory by default; replace with persistent store when needed).
@@ -353,12 +369,23 @@ pub struct GatewayState {
     /// 与面名册同样按请求现读；`None` 时那条路由报「没有台账」而不是回一份
     /// 全零的账——全零会被读成「一条原则都没有」。
     pub principle_ledger: Option<Arc<dyn cog_core::PrincipleLedgerStore>>,
+    /// 签名钥匙的读写面：页面上的签发/轮换/吊销走它。
+    pub security_keys: Option<Arc<dyn cog_core::SecurityKeys>>,
     /// The change account: what the corpus asks for, what the tree has been
     /// measured to hold, and how much intake is still waiting to be folded in.
     /// Read per request, like the face roster; `None` makes the route report
     /// that there is no account rather than answer an empty one, because an
     /// empty answer is the claim that nothing is owed.
     pub change_ledger: Option<Arc<dyn cog_core::ChangeLedgerStore>>,
+    /// 意图进门那一条事件的写者。对话收尾用它把这一轮落成一条意图行；缺席时写意图
+    /// 的那一步显式报「没有收件台」，不把「没地方交」读成「没有意图」。
+    pub intent_events: Option<Arc<dyn cog_core::EventStore>>,
+    /// 员工编制与离场两条事实的写者。雇佣与离场 handler 各写一条；名册是这两条
+    /// 事实的投影。缺席时那一步只记日志、不写事件——「没有落点」与「没发生」因此
+    /// 在日志里分得开。
+    pub employee_events: Option<Arc<dyn cog_core::EventStore>>,
+    /// 消息事实的写者：投递成功之后写一条 `message_sent`。缺席时只少这一条账。
+    pub message_events: Option<Arc<dyn cog_core::EventStore>>,
     /// The shared key-value face this deployment's processes publish to.
     ///
     /// The gateway that holds the upstream credentials writes the LLM pool's
@@ -381,11 +408,12 @@ pub struct GatewayState {
     /// (`SkillConfig::tools`), published by the skill plugin.
     ///
     /// Held so the capability inventory can answer "who may order this
-    /// action" from the same rows the runtime narrows a run against, instead
-    /// of from the agent roster's free-form `capabilities` list, which names
-    /// roles and never action names. `None` is a deployment without the shared
-    /// skill registry — the column then says the table could not be read, which
-    /// is not the same reading as "no role may call it".
+    /// action" from the same rows the runtime narrows a run against. The
+    /// roster cannot answer it: it names people and their roles, never action
+    /// names, and every digital employee carries the same capability set
+    /// anyway. `None` is a deployment without the shared skill registry — the
+    /// column then says the table could not be read, which is not the same
+    /// reading as "no role may call it".
     pub skill_registry: Option<Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>>,
     /// Global agent pool for production multi-agent parallelism.
     pub agent_pool: Option<Arc<dyn cog_core::AgentManager>>,
@@ -430,6 +458,11 @@ pub struct GatewayState {
     /// empty at construction and the chat says the wiring is missing rather
     /// than quietly answering with half the capability.
     pub conversation: chat::ConversationHandle,
+    /// 每一段对话的实时流与正在跑的轮（见 [`chat_stream::ChatStream`]）。
+    ///
+    /// 不在连接上：断线之后那一轮还在说，重连的是一条新连接，它要接得上；停止
+    /// 也按会话寻址，名册跟着对话走，不跟着某一条 socket 走。
+    pub chat_stream: chat_stream::ChatStream,
     /// Every command sent to an agent, with what came back. Written by the
     /// send route, read by the conversation view.
     pub agent_messages: AgentMessageHandle,
@@ -502,6 +535,8 @@ impl GatewayState {
     pub fn ops_state(&self) -> state::OpsState {
         state::OpsState {
             quota_manager: self.quota_manager.clone(),
+            llm_usage: self.llm_usage.clone(),
+            llm_call_events: self.llm_call_events.clone(),
             hierarchy_manager: self.hierarchy_manager.clone(),
             supervisor: self.supervisor.clone(),
             agent_registry: self.agent_registry.clone(),
@@ -625,7 +660,8 @@ fn memory_raw_routes() -> Router<Arc<GatewayState>> {
 /// 记忆写入与原始流上传是这里唯一的批量入口，两条路由面（对外与集群内）共用
 /// 这一个数——各写一份时，改一处就有一个面静默地留着旧上限。这是这段代码自己
 /// 选的界，不是量出来的容量。
-// cap: bound — 选出来的一道界，不是量出来的容量
+// cap: fixed — 选出来的一道界，不是量出来的容量
+// keep: 删掉后请求体无界，一次请求把网关内存吃穿；由「选出来的一道界」兜住
 const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 pub fn create_internal_router(state: Arc<GatewayState>) -> Router {
@@ -664,26 +700,7 @@ pub fn create_internal_router(state: Arc<GatewayState>) -> Router {
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
-        .layer(from_fn({
-            let state = state.clone();
-            move |req: Request, next: Next| {
-                let state = state.clone();
-                async move {
-                    let timeout_secs = state
-                        .request_timeout_secs
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let timeout = std::time::Duration::from_secs(timeout_secs);
-                    match tokio::time::timeout(timeout, next.run(req)).await {
-                        Ok(response) => response,
-                        Err(_) => {
-                            let mut response = Response::new(axum::body::Body::empty());
-                            *response.status_mut() = StatusCode::REQUEST_TIMEOUT;
-                            response
-                        }
-                    }
-                }
-            }
-        }))
+        .layer(from_fn(answer_deadline(state.clone())))
         .with_state(state)
 }
 
@@ -699,7 +716,7 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route("/api/v1/auth/login", post(auth::login_handler))
         .route("/api/v1/auth/register", post(auth::register_handler))
         .route("/api/v1/auth/refresh", post(auth::refresh_handler))
-        .route("/metrics", get(prometheus_metrics_handler))
+        .route(METRICS_PATH, get(prometheus_metrics_handler))
         // A2A 的发现入口：对端的第一步是「先取名片、再按名片上声明的方式取凭证」。
         // 名片要是也跟在业务鉴权组里，这一步就闭成环——先有凭证才能知道该用什么
         // 凭证。名片只公布地址、能力与鉴权方式，不含任何业务数据，所以它公开；
@@ -778,7 +795,9 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
                                 if let Ok(session_id) = uuid::Uuid::parse_str(token) {
                                     match session_mgr.get(user_id, session_id).await {
                                         Ok(Some(_)) => {
-                                            let _ = session_mgr.refresh(user_id, session_id).await;
+                                            cog_core::ignore_lost!(
+                                                session_mgr.refresh(user_id, session_id).await
+                                            );
                                         }
                                         Ok(None) => {
                                             return (
@@ -954,6 +973,18 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             get(evolution::promotion_trend_handler),
         )
         .route(
+            "/api/v1/admin/keys",
+            get(keys_api::list_keys_handler).post(keys_api::issue_key_handler),
+        )
+        .route(
+            "/api/v1/admin/keys/rotate",
+            post(keys_api::rotate_key_handler),
+        )
+        .route(
+            "/api/v1/admin/keys/revoke",
+            post(keys_api::revoke_key_handler),
+        )
+        .route(
             "/api/v1/admin/llm-status",
             get(llm_admin::llm_status_handler),
         )
@@ -1120,6 +1151,12 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             get(progress::progress_handler),
         )
         .route("/api/v1/workbench", get(workbench::workbench_handler))
+        // 对话里 `/` 打头那一句能点哪些名字。与上面的能力面同一种读法：这份名单
+        // 是「这个部署里真有的」技能表读出来的，不是一个写死的列表。
+        .route("/api/v1/chat/commands", get(commands::catalogue_handler))
+        // 这一段对话的配额余量：与代理路径执法时读的是同一份判定。没配过上限
+        // 的格子读成「未配置」，读得到的格子给出剩余与日界。
+        .route("/api/v1/chat/quota", get(chat::quota_handler))
         .route(
             "/api/v1/capabilities",
             get(capabilities::capabilities_handler),
@@ -1439,6 +1476,9 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
 
     // Viewer-level protected routes (wiki read/write + user-facing core APIs)
     let viewer_routes = Router::new()
+        // 图形面：Grafana 挂在本进程的同源子路径上，复用这一层的鉴权。地址是相对的，
+        // 所以换了域名不会断，构建期也不再需要注入一个主机名。
+        .route("/grafana/{*path}", get(grafana_export::proxy_get))
         .route("/api/v1/wiki", get(wiki::list_handler))
         .route("/api/v1/wiki", post(wiki::create_handler))
         .route("/api/v1/wiki/info", get(wiki::info_handler))
@@ -1548,26 +1588,7 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .layer(from_fn(security_headers_middleware))
         .layer(cors_layer)
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
-        .layer(from_fn({
-            let state = state.clone();
-            move |req: Request, next: Next| {
-                let state = state.clone();
-                async move {
-                    let timeout_secs = state
-                        .request_timeout_secs
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let timeout = std::time::Duration::from_secs(timeout_secs);
-                    match tokio::time::timeout(timeout, next.run(req)).await {
-                        Ok(response) => response,
-                        Err(_) => {
-                            let mut response = Response::new(axum::body::Body::empty());
-                            *response.status_mut() = StatusCode::REQUEST_TIMEOUT;
-                            response
-                        }
-                    }
-                }
-            }
-        }))
+        .layer(from_fn(answer_deadline(state.clone())))
         .layer(CompressionLayer::new())
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -1976,7 +1997,7 @@ pub const LABEL_SERVICE: &str = "service";
 pub const LABEL_KIND: &str = "kind";
 
 /// 读数按「哪个上游」归属时用的标签键。
-pub const LABEL_UPSTREAM: &str = "upstream";
+pub const LABEL_UPSTREAM: &str = cog_core::observability_text::UPSTREAM_LABEL;
 
 /// 读数按「哪个出口」归属时用的标签键。
 pub const LABEL_OUTLET: &str = "outlet";
@@ -2040,7 +2061,8 @@ pub const OBSERVABLES_REGISTERED_METRIC: &str = "cogneva_observables_registered"
 /// scrape that asks for more connections than exist does not finish sooner --
 /// it queues, and it holds connections the writers whose work it is about to
 /// read would otherwise have.
-// cap: bound — 一个抓取同时占住的连接数上限；远低于连接池上限（默认 50），留给正在写这些读数的写者
+// cap: fixed — 一个抓取同时占住的连接数上限；远低于连接池上限（默认 50），留给正在写这些读数的写者
+// keep: 删掉后一个抓取占满连接池，正在写这些读数的写者没有连接可用；由「远低于连接池上限，留给写者」兜住
 const BACKEND_READ_CONCURRENCY: usize = 8;
 
 /// A label value with the three characters the text format reserves escaped.
@@ -2321,6 +2343,16 @@ async fn prometheus_metrics_handler(State(state): State<Arc<GatewayState>>) -> R
         body.push_str(&prometheus_render::render_raw_metrics(&audit_readings));
     }
 
+    // 意图入口的三个计数：进来多少句、其中几句没落成、这台进程有没有落点。
+    // 与审计出口同一种接线（进程级单例、装配处一处），理由也相同。
+    let intent_readings = intent::readings();
+    if !intent_readings.is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&prometheus_render::render_raw_metrics(&intent_readings));
+    }
+
     // Self-observation: registry 按静态 TypeId 登记服务，某个 observable 若
     // 以具体类型注册就对这里不可见，指标静默消失。暴露注册数量让告警面
     // 能发现"指标缺席"本身，而不是等人工察觉。
@@ -2383,14 +2415,61 @@ async fn readiness_check(State(state): State<Arc<GatewayState>>) -> Response {
 }
 
 /// Parse query string into a HashMap of key-value pairs.
+///
+/// The values are handed to callers that use them as credentials and as
+/// identifiers (`?token=` on the WebSocket upgrade is one), so `%XX` escapes
+/// are decoded here: a client that percent-encodes its token, as RFC 3986
+/// says it may, would otherwise have it verified percent-encoded, and that
+/// fails as a bad token rather than as a bad encoding.
+///
+/// `+` is left as written: it is a literal in a JWT and in every other
+/// value this is called with, not the space it means in a form body.
 fn parse_query_params(query: &str) -> HashMap<String, String> {
     let mut params = HashMap::new();
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
-            params.insert(k.to_string(), v.to_string());
+            params.insert(percent_decode(k), percent_decode(v));
         }
     }
     params
+}
+
+/// Decode the `%XX` escapes in one query-string component.
+///
+/// A malformed escape (`%` with no two hexadecimal digits behind it) is kept
+/// as written rather than dropped or truncated: the answer a caller gives
+/// about a bad credential has to be about the credential it was handed.
+fn percent_decode(component: &str) -> String {
+    let bytes = component.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Some(byte) = percent_decode_escape(bytes[index + 1], bytes[index + 2]) {
+                decoded.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+/// The byte two hexadecimal digits spell, or `None` when either is not one.
+fn percent_decode_escape(high: u8, low: u8) -> Option<u8> {
+    Some((percent_decode_digit(high)? << 4) | percent_decode_digit(low)?)
+}
+
+/// The value of one hexadecimal digit, or `None` when the byte is not one.
+fn percent_decode_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 async fn ws_handler(
@@ -2509,11 +2588,15 @@ async fn quota_usage_handler(
         .unwrap_or_else(|| "anonymous".to_string());
 
     let summary = state.quota_manager.get_user_summary(&user_id).await;
+    // 没人声明过的格子读到「没有上限」（`QuotaLimits::unlimited`）。这一面对
+    // 它写 `null` 而不是把 `u64::MAX` 印出去：没有上限就没有「还剩多少」，而
+    // 一个十八位整数在读数面上与「额度真的这么多」同形。
+    let unlimited = summary.total_quota == u64::MAX;
     let mut body = serde_json::json!({
         "user_id": user_id,
-        "remaining": summary.remaining,
+        "remaining": if unlimited { None } else { Some(summary.remaining) },
         "used_today": summary.used_today,
-        "total_quota": summary.total_quota,
+        "total_quota": if unlimited { None } else { Some(summary.total_quota) },
     });
 
     if let Some(hier) = state.hierarchy_manager.as_ref() {
@@ -2600,6 +2683,14 @@ async fn quota_recharge_handler(
             })),
         )
             .into_response(),
+        // 抬一个没人声明过的格子是调用方的问题，不是服务端故障：配额实现把
+        // 「先声明一对上限」这一种拒绝报成 `Validation`，照 400 答，调用方才
+        // 知道该改什么；`Internal` 仍是服务端故障。
+        Err(cog_core::SFError::Validation(message)) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid_argument", "message": message})),
+        )
+            .into_response(),
         Err(e) => {
             tracing::warn!("Quota recharge failed: {}", e);
             (
@@ -2620,13 +2711,16 @@ async fn quota_workspace_handler(
         .quota_manager
         .get_workspace_summary(&workspace_id)
         .await;
+    // 与个人那一面同一条：没人声明过的格子没有上限，就报 `null`，不把
+    // `u64::MAX` 印成「额度真的这么多」。
+    let unlimited = summary.total_quota == u64::MAX;
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "workspace_id": workspace_id,
-            "remaining": summary.remaining,
+            "remaining": if unlimited { None } else { Some(summary.remaining) },
             "used_today": summary.used_today,
-            "total_quota": summary.total_quota,
+            "total_quota": if unlimited { None } else { Some(summary.total_quota) },
         })),
     )
         .into_response()
@@ -2675,8 +2769,8 @@ pub(crate) const GLOBAL_QUOTA_TARGET: &str = "platform";
 /// 三处各写一份的话，改了一处另两处就开始说谎。
 fn scope_enforcement(scope: cog_core::QuotaScope) -> Option<&'static str> {
     match scope {
-        // 代理路径按「调用方声明的属主，否则是任务提交人」判，与账本折叠花销
-        // 用的是同一条解析。
+        // 代理路径按「调用方声明的属主，否则是这一发所在那次尝试的工号，再否则
+        // 是任务提交人」判，与账本折叠花销用的是同一条解析。
         cog_core::QuotaScope::User => Some("the LLM proxy path judges the call's person"),
         // 代理路径按任务行上的 `workspace_id` 判：这一级的标识只有任务图知道。
         cog_core::QuotaScope::Workspace => {
@@ -2964,6 +3058,41 @@ async fn quota_clear_limits_handler(
     }
 }
 
+/// 一次 HTTP 请求的应答期限。
+///
+/// 这**不是**对活儿的判词：处理这枚请求的活（一次构建、一次滚动）在期限之后仍会自己
+/// 走完，只是这一头没有人在等它的回应了。所以它是一条覆盖，上限由
+/// `request_timeout_secs`（运维可调）给——理由是网关不能把一条永远不回话的连接留在
+/// 客户端手里，而不是「这件事该停了」。而「这件活该不该停」由
+/// [`cog_core::declared_wall`] 那一侧按实测的动静判；把期限写进活儿本身，就是把钟
+/// 变成判词，那正是这条控制律要拆掉的东西。
+///
+/// 两处 router 共用这一条：正文上限、压缩、追踪两套各挂一次，各自抄一遍分支时改
+/// 一处不会报错，另一处会继续用旧的处置（比如不再回 408，而把连接挂住）。
+fn answer_deadline(
+    state: Arc<GatewayState>,
+) -> impl Fn(Request, Next) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>>
+       + Clone {
+    move |req: Request, next: Next| {
+        let state = state.clone();
+        Box::pin(async move {
+            let timeout_secs = state
+                .request_timeout_secs
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let timeout = std::time::Duration::from_secs(timeout_secs);
+            // wall: 等=一次请求的处理 / 等不到=按超时答复调用方 / 续跑=能，调用方重发
+            match tokio::time::timeout(timeout, next.run(req)).await {
+                Ok(response) => response,
+                Err(_) => {
+                    let mut response = Response::new(axum::body::Body::empty());
+                    *response.status_mut() = StatusCode::REQUEST_TIMEOUT;
+                    response
+                }
+            }
+        })
+    }
+}
+
 /// Add common security headers to all responses.
 async fn security_headers_middleware(req: Request, next: Next) -> Response {
     let mut response = next.run(req).await;
@@ -2985,33 +3114,37 @@ async fn security_headers_middleware(req: Request, next: Next) -> Response {
 
 // ─── Supervisor Status Handler ───
 
-async fn supervisor_status_handler(State(state): State<Arc<GatewayState>>) -> Response {
-    match state.supervisor {
-        Some(ref supervisor) => {
-            let report = supervisor.run_health_pass().await.unwrap_or_default();
-            let snapshot = supervisor_status::SupervisorStatusSnapshot {
-                cycle: state.supervisor_event_cache.cycle(),
-                healthy_agents: report.healthy.len(),
-                dead_agents: report.dead.len(),
-                suspect_agents: report.suspect.len(),
-                stuck_agents: report.stuck.len(),
-                pending_handoffs: supervisor.autonomous_pending_count().await,
-                scheduler_paused: supervisor.gate().is_paused(),
-                // Read off the event channel, not the supervisor's mutex: that
-                // mutex is on no trait method, and the only event carrying a
-                // rebalance is `SupervisorEvent::Rebalance`. See
-                // `SupervisorEventCache::last_plan_emitted_at`.
-                last_plan_emitted_at: state.supervisor_event_cache.last_plan_emitted_at(),
-                timestamp: chrono::Utc::now(),
-            };
-            (StatusCode::OK, Json(snapshot)).into_response()
-        }
-        None => (
+/// 巡检快照：报告跑不出来是 503，不是「四个都是 0」。
+///
+/// 折成默认报告，四格计数一起落到 0，读的人看到的是「四个没病」——与一轮
+/// 查过、确实没有异常逐字同形，而这一页存在的理由就是让人看见异常。
+async fn supervisor_status_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Response, ApiError> {
+    let Some(supervisor) = state.supervisor.as_ref() else {
+        return Ok((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "supervisor not configured"})),
         )
-            .into_response(),
-    }
+            .into_response());
+    };
+    let report = crate::processes::health_report_from_reading(supervisor.run_health_pass().await)?;
+    let snapshot = supervisor_status::SupervisorStatusSnapshot {
+        cycle: state.supervisor_event_cache.cycle(),
+        healthy_agents: report.healthy.len(),
+        dead_agents: report.dead.len(),
+        suspect_agents: report.suspect.len(),
+        stuck_agents: report.stuck.len(),
+        pending_handoffs: supervisor.autonomous_pending_count().await,
+        scheduler_paused: supervisor.gate().is_paused(),
+        // Read off the event channel, not the supervisor's mutex: that
+        // mutex is on no trait method, and the only event carrying a
+        // rebalance is `SupervisorEvent::Rebalance`. See
+        // `SupervisorEventCache::last_plan_emitted_at`.
+        last_plan_emitted_at: state.supervisor_event_cache.last_plan_emitted_at(),
+        timestamp: chrono::Utc::now(),
+    };
+    Ok((StatusCode::OK, Json(snapshot)).into_response())
 }
 
 // ─── HookEngine Health Handler ───
@@ -3051,30 +3184,40 @@ async fn hooks_health_handler(State(state): State<Arc<GatewayState>>) -> Respons
 
 // ─── Supervisor Queue Stats Handler ───
 
-async fn supervisor_queue_stats_handler(State(state): State<Arc<GatewayState>>) -> Response {
-    match state.supervisor {
-        Some(ref supervisor) => {
-            let pending_handoffs = supervisor.autonomous_pending_count().await;
-            let retry_count = supervisor.autonomous_retry_count().await;
-            let dlq_count = supervisor.orchestrator_dlq_len().await.unwrap_or(0);
-            let ready_tasks = state.orchestrator.get_ready_tasks().await.len();
-            let stats = supervisor_control::QueueStats {
-                pending_handoffs,
-                retry_count,
-                dlq_count,
-                ready_tasks,
-                cycle: state.supervisor_event_cache.cycle(),
-                scale_recommendation: state.supervisor_event_cache.scale_recommendation(),
-                timestamp: chrono::Utc::now(),
-            };
-            (StatusCode::OK, Json(stats)).into_response()
-        }
-        None => (
+/// 队列这一页的两格读数：死信几条、待办几条。
+///
+/// 两格都是「现在有多少活压着」。读失败折成 0，画出来正是一副排空了的队列——
+/// 与真的没有活压着逐字同形，而这一页正是运维决定要不要清死信、要不要催派活
+/// 的地方。读不出来是 503；读到了就是那个数。
+async fn supervisor_queue_stats_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Response, ApiError> {
+    let Some(supervisor) = state.supervisor.as_ref() else {
+        return Ok((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "supervisor not configured"})),
         )
-            .into_response(),
-    }
+            .into_response());
+    };
+    let pending_handoffs = supervisor.autonomous_pending_count().await;
+    let retry_count = supervisor.autonomous_retry_count().await;
+    let dlq_count =
+        crate::processes::dlq_len_from_reading(supervisor.orchestrator_dlq_len().await)?;
+    let ready_tasks = crate::tasks::task_rows_from_reading(
+        state.orchestrator.get_ready_tasks_checked().await,
+        "supervisor queue stats",
+    )?
+    .len();
+    let stats = supervisor_control::QueueStats {
+        pending_handoffs,
+        retry_count,
+        dlq_count,
+        ready_tasks,
+        cycle: state.supervisor_event_cache.cycle(),
+        scale_recommendation: state.supervisor_event_cache.scale_recommendation(),
+        timestamp: chrono::Utc::now(),
+    };
+    Ok((StatusCode::OK, Json(stats)).into_response())
 }
 
 // ─── Supervisor Gate Handler ───
@@ -3217,16 +3360,15 @@ async fn backends_health_handler(State(state): State<Arc<GatewayState>>) -> Resp
 async fn task_timeline_handler(
     State(state): State<Arc<GatewayState>>,
     Path(task_id): Path<String>,
-) -> Response {
-    let task = match state.orchestrator.get_task(&task_id).await {
-        Some(t) => t,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "task_not_found", "task_id": task_id})),
-            )
-                .into_response();
-        }
+) -> Result<Response, ApiError> {
+    let Some(task) =
+        crate::tasks::task_from_reading(state.orchestrator.get_task_checked(&task_id).await)?
+    else {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "task_not_found", "task_id": task_id})),
+        )
+            .into_response());
     };
 
     let mut milestones = Vec::new();
@@ -3259,14 +3401,14 @@ async fn task_timeline_handler(
         }));
     }
 
-    (
+    Ok((
         StatusCode::OK,
         Json(json!({
             "task_id": task_id,
             "milestones": milestones,
         })),
     )
-        .into_response()
+        .into_response())
 }
 
 // ─── Agent Heartbeats Handler ───
@@ -3440,7 +3582,7 @@ pub(crate) async fn read_active_alerts(
                 })
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
 
     // The store above is process-local: it holds the supervisor's health
     // events for this process and starts empty after a restart. Durable
@@ -3565,7 +3707,8 @@ struct SnapshotsListQuery {
 }
 
 fn default_snapshot_limit() -> usize {
-    100
+    // 一屏：与 A2A 的 `page_size` 默认值同一个数，列表面共用页长。
+    cog_core::config::A2A_LIST_PAGE_SIZE as usize
 }
 
 async fn snapshots_list_handler(
@@ -3611,7 +3754,8 @@ struct TracesListQuery {
 }
 
 fn default_trace_limit() -> usize {
-    100
+    // 一屏：与 A2A 的 `page_size` 默认值同一个数，列表面共用页长。
+    cog_core::config::A2A_LIST_PAGE_SIZE as usize
 }
 
 async fn traces_list_handler(
@@ -3758,59 +3902,98 @@ async fn plugins_list_handler(State(state): State<Arc<GatewayState>>) -> Respons
     }
 }
 
+/// Register a plugin from its manifest.
+///
+/// **Status:** Not implemented -- the manifest is parsed, the entry file is
+/// fetched (which checks the manifest's signature over those bytes), and the
+/// module is compiled; the answer to a well-formed upload is then `501`. This
+/// build has no runtime that instantiates a module or calls its entry point, so
+/// there is nothing to load into and a module that arrived here would never run.
+/// The route used to answer `200` with `"status": "loaded"`: it called a `load`
+/// that compiled the module, dropped the module id it got back, and returned a
+/// handle for a module nobody kept. The three checks stay because they tell a
+/// caller what a real upload looks like; reporting that one was loaded is not
+/// one of the things this build can do.
 async fn plugin_upload_handler(State(state): State<Arc<GatewayState>>, body: String) -> Response {
-    match state.plugin_registry {
-        Some(ref registry) => match serde_json::from_str::<cog_core::PluginManifest>(&body) {
-            Ok(manifest) => match registry.fetch(&manifest).await {
-                Ok(bytes) => match registry.load(&bytes, &manifest).await {
-                    Ok(handle) => (
-                        StatusCode::OK,
-                        Json(json!({
-                            "plugin_id": handle.plugin_id,
-                            "name": handle.manifest.name,
-                            "status": "loaded"
-                        })),
-                    )
-                        .into_response(),
-                    Err(e) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "load_failed", "message": e.to_string()})),
-                    )
-                        .into_response(),
-                },
-                Err(e) => (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": "fetch_failed", "message": e.to_string()})),
-                )
-                    .into_response(),
-            },
-            Err(e) => (
+    let manifest = match serde_json::from_str::<cog_core::PluginManifest>(&body) {
+        Ok(manifest) => manifest,
+        Err(e) => {
+            return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": "invalid_manifest", "message": e.to_string()})),
             )
-                .into_response(),
-        },
-        None => (
+                .into_response()
+        }
+    };
+    let Some(registry) = state.plugin_registry.as_ref() else {
+        return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "plugin_registry_not_configured"})),
         )
-            .into_response(),
+            .into_response();
+    };
+    let Some(backend) = state.sandbox_backend.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "sandbox_backend_not_configured"})),
+        )
+            .into_response();
+    };
+
+    let bytes = match registry.fetch(&manifest).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "fetch_failed", "message": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+
+    // 签名对不上、模块编不动、后端根本不编 WASM，是三件不同的事，答复里
+    // 不能都写成「模块是坏的」：最后一种的模块可能完全合法，缺的是编译器。
+    if let Err(e) = backend.precompile(&bytes).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "module_not_compiled",
+                "message": format!("签名与清单一致，但后端没有把这个模块编译出来：{e}"),
+            })),
+        )
+            .into_response();
     }
+
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "error": "not_implemented",
+            "message": "签名校验与编译都通过了，但这个构建不实例化也不调用 WASM：\
+                        上传的插件不会运行",
+        })),
+    )
+        .into_response()
 }
 
+/// Unregister a plugin by id.
+///
+/// **Status:** Not implemented -- nothing is loaded, so there is nothing to
+/// unload. The route used to answer `200` with `"status": "unloaded"`, which was
+/// a receipt for a removal of something the process never held.
 async fn plugin_unload_handler(
     State(state): State<Arc<GatewayState>>,
     Path(plugin_id): Path<String>,
 ) -> Response {
     match state.plugin_registry {
-        Some(ref _registry) => {
-            // MVP: unload is a no-op until registry maintains loaded handles by id.
-            (
-                StatusCode::OK,
-                Json(json!({ "plugin_id": plugin_id, "status": "unloaded" })),
-            )
-                .into_response()
-        }
+        Some(_) => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "error": "not_implemented",
+                "plugin_id": plugin_id,
+                "message": "这个构建不加载插件：没有模块被装载，因此没有可卸载的东西",
+            })),
+        )
+            .into_response(),
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "plugin_registry_not_configured"})),
@@ -3827,7 +4010,6 @@ async fn plugin_unload_handler(
 struct SandboxExecuteRequest {
     payload: serde_json::Value,
     input: serde_json::Value,
-    timeout_secs: Option<u64>,
 }
 
 async fn sandbox_execute_handler(
@@ -3870,13 +4052,6 @@ async fn sandbox_execute_handler(
                 agent_id: "gateway".into(),
                 payload,
                 input: req.input,
-                timeout: std::time::Duration::from_secs(
-                    req.timeout_secs.unwrap_or(
-                        state
-                            .sandbox_task_timeout_secs
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                    ),
-                ),
                 limits: Default::default(),
             };
 
@@ -3933,12 +4108,18 @@ async fn guard_check_handler(
                     guardrail.check_input(&messages).await
                 }
                 "output" => {
-                    let response = req.response.unwrap_or_default();
+                    let response = req.response.unwrap_or(Default::default());
                     guardrail.check_output(&response).await
                 }
                 "tool" => {
-                    let tool_call = req.tool_call.and_then(|v| serde_json::from_value::<cog_core::ToolCall>(v).ok())
-                        .unwrap_or(cog_core::ToolCall { id: "".into(), name: "".into(), arguments: serde_json::Value::Null });
+                    let tool_call = req
+                        .tool_call
+                        .and_then(|v| serde_json::from_value::<cog_core::ToolCall>(v).ok())
+                        .unwrap_or_else(|| cog_core::ToolCall {
+                            id: "".into(),
+                            name: "".into(),
+                            arguments: serde_json::Value::Null,
+                        });
                     guardrail.check_tool_call(&tool_call).await
                 }
                 _ => return (
@@ -4084,7 +4265,20 @@ async fn eval_compare_handler(
 
 async fn eval_list_datasets_handler(State(state): State<Arc<GatewayState>>) -> Response {
     let dir = eval_datasets::datasets_dir(&state.data_dir);
-    let listed = eval_datasets::list_datasets(&dir);
+    let listed = match eval_datasets::list_datasets(&dir) {
+        Ok(listed) => listed,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "eval_datasets_unreadable",
+                    "dir": dir.display().to_string(),
+                    "message": e.to_string(),
+                })),
+            )
+                .into_response()
+        }
+    };
     let resp = cog_core::EvalListDatasetsResponse {
         datasets: listed.datasets,
         dir: dir.display().to_string(),
@@ -4118,7 +4312,7 @@ async fn eval_get_report_handler(
                         .and_then(|d| d.as_str())
                         .map(String::from)
                 })
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             let report_markdown = match state.eval_service {
                 Some(ref service) => match service.render_report(&content, "markdown").await {
                     Ok(md) => md,
@@ -4189,14 +4383,22 @@ async fn mcp_tool_call_handler(
     Json(req): Json<McpToolCallRequest>,
 ) -> Response {
     match state.mcp_client {
-        Some(ref client) => match client.call_tool(&req.name, req.arguments).await {
-            Ok(result) => (StatusCode::OK, Json(json!({ "result": result }))).into_response(),
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"error": "mcp_call_failed", "message": e.to_string()})),
-            )
-                .into_response(),
-        },
+        Some(ref client) => {
+            // 数的是**派发**，不是成功：能力格那一栏问的是「有没有人在点这项」，
+            // 一次打到端点上、对端报错的调用照样是有人在点它。成功与否在
+            // `mcp_call_failed` 那一支上有自己的读数，两个问题不合成一个。
+            if let Some(counts) = state.mcp_call_counts.as_ref() {
+                counts.record(&req.name);
+            }
+            match client.call_tool(&req.name, req.arguments).await {
+                Ok(result) => (StatusCode::OK, Json(json!({ "result": result }))).into_response(),
+                Err(e) => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": "mcp_call_failed", "message": e.to_string()})),
+                )
+                    .into_response(),
+            }
+        }
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "mcp_client_not_configured"})),

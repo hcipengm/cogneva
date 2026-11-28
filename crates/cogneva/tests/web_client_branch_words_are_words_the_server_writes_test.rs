@@ -1,7 +1,7 @@
 //! principle: feedback_no_hardcoding_config_surface
 //!
 //! The WebUI branches on the words the server answers with, and the branch is
-//! where the word is *used*: `outcome === 'timed_out'` picks the colour of a
+//! where the word is *used*: `outcome === 'stalled'` picks the colour of a
 //! build row, `status === 'hook_event'` decides a frame is not a task changing
 //! state, `parsed.error === 'llm_verify_failed'` decides whether the operator is
 //! offered the "save anyway" button at all.
@@ -84,10 +84,10 @@ const SERVER_WORDS: &[ServerWord] = &[
     },
     ServerWord {
         field: "outcome",
-        word: "timed_out",
+        word: "stalled",
         client_file: "web/src/views/DeliveryView.tsx",
         server_file: "crates/cog-reflection/src/evolution_build_readings.rs",
-        server_needle: "BuildEnding::TimedOut(_) => \"timed_out\"",
+        server_needle: "BuildEnding::Stalled { .. } => \"stalled\"",
     },
     ServerWord {
         field: "outcome",
@@ -145,6 +145,32 @@ const SERVER_WORDS: &[ServerWord] = &[
         server_file: "crates/cog-gateway/src/hook_forwarder.rs",
         server_needle: "status: \"hook_event\"",
     },
+    // 待办面板按一项的状态画符号与颜色。这三个词是 `todo` 这只工具回答里的
+    // `status`，由它在同一段答案里写出（每个词都在 `items[].status` 与计数那一行
+    // 上各写一次，针取带计数的那个，改名时两个地方一起改）。面板若把其中一个
+    // 拼错，那一项就落进 `marker` 的兜底分支——画成一个问号，看上去像服务端写
+    // 了一种没人认识的状态，而不是像客户端拼错了。
+    ServerWord {
+        field: "status",
+        word: "pending",
+        client_file: "web/src/conversation/TodoPanel.tsx",
+        server_file: "crates/cog-agent/src/tools.rs",
+        server_needle: "\"pending\": counts(\"pending\")",
+    },
+    ServerWord {
+        field: "status",
+        word: "in_progress",
+        client_file: "web/src/conversation/TodoPanel.tsx",
+        server_file: "crates/cog-agent/src/tools.rs",
+        server_needle: "\"in_progress\": counts(\"in_progress\")",
+    },
+    ServerWord {
+        field: "status",
+        word: "done",
+        client_file: "web/src/conversation/TodoPanel.tsx",
+        server_file: "crates/cog-agent/src/tools.rs",
+        server_needle: "\"done\": counts(\"done\")",
+    },
     ServerWord {
         field: "status",
         word: "slow_down",
@@ -192,6 +218,95 @@ const SERVER_WORDS: &[ServerWord] = &[
         server_file: "crates/cog-gateway/src/llm_admin.rs",
         server_needle: "\"error\": \"llm_verify_failed\"",
     },
+    // 对象目录的校验报告：每一份的 `outcome` 由网关的那段 match 写出。客户端按这四个
+    // 词选颜色与细节格——拼错一个，那一份就落进兜底，看上去像服务端答了一种没人
+    // 认识的结果，而不是像客户端拼错了。
+    ServerWord {
+        field: "outcome",
+        word: "verified",
+        client_file: "web/src/views/DatasetsView.tsx",
+        server_file: "crates/cog-gateway/src/datasets.rs",
+        server_needle: "cog_core::DatasetOutcome::Verified => (\"verified\"",
+    },
+    ServerWord {
+        field: "outcome",
+        word: "mismatched",
+        client_file: "web/src/views/DatasetsView.tsx",
+        server_file: "crates/cog-gateway/src/datasets.rs",
+        server_needle: "                            \"mismatched\",",
+    },
+    ServerWord {
+        field: "outcome",
+        word: "missing",
+        client_file: "web/src/views/DatasetsView.tsx",
+        server_file: "crates/cog-gateway/src/datasets.rs",
+        server_needle: "cog_core::DatasetOutcome::Missing => (\"missing\"",
+    },
+    ServerWord {
+        field: "outcome",
+        word: "unreadable",
+        client_file: "web/src/views/DatasetsView.tsx",
+        server_file: "crates/cog-gateway/src/datasets.rs",
+        server_needle: "(\"unreadable\", json!({ \"error\": e }))",
+    },
+    // 晋级台账那一格：`PromotionStatus::as_str` 是这份词表的唯一拼写处，读写两侧
+    // 都走它。客户端按这三个词给色调——拼错的那个永远不相等，那一行就没有色调。
+    ServerWord {
+        field: "status",
+        word: "promoted",
+        client_file: "web/src/views/ChangesView.tsx",
+        server_file: "crates/cog-core/src/contract/promotion.rs",
+        server_needle: "PromotionStatus::Promoted => \"promoted\"",
+    },
+    ServerWord {
+        field: "status",
+        word: "rolled_back",
+        client_file: "web/src/views/ChangesView.tsx",
+        server_file: "crates/cog-core/src/contract/promotion.rs",
+        server_needle: "PromotionStatus::RolledBack => \"rolled_back\"",
+    },
+    ServerWord {
+        field: "status",
+        word: "awaiting_approval",
+        client_file: "web/src/views/ChangesView.tsx",
+        server_file: "crates/cog-core/src/contract/promotion.rs",
+        server_needle: "PromotionStatus::AwaitingApproval => \"awaiting_approval\"",
+    },
+    // 变更行上的 `status` 不是手写 match 写出的，是 `EvolutionStatus` 经
+    // `#[serde(rename_all = "snake_case")]` 序列化出来的（`evolution_admin.rs` 的
+    // `status_word` 就是 `serde_json::to_value`）。所以这里的针落在变体声明上：
+    // 变体名一改，serde 写出的词跟着变，这三条立刻过期。页面按它们决定「应用 /
+    // 放行」两个按钮出不出——拼错了按钮不出现，读起来像「这一步不需要」。
+    ServerWord {
+        field: "status",
+        word: "generated",
+        client_file: "web/src/views/ChangesView.tsx",
+        server_file: "crates/cog-reflection/src/types.rs",
+        server_needle: "    Generated,",
+    },
+    ServerWord {
+        field: "status",
+        word: "compile_checked",
+        client_file: "web/src/views/ChangesView.tsx",
+        server_file: "crates/cog-reflection/src/types.rs",
+        server_needle: "    CompileChecked,",
+    },
+    ServerWord {
+        field: "status",
+        word: "awaiting_review",
+        client_file: "web/src/views/ChangesView.tsx",
+        server_file: "crates/cog-reflection/src/types.rs",
+        server_needle: "    AwaitingReview,",
+    },
+    // `scheduled` 是 `TaskStatus::as_str` 的一臂；任务面的「待办」那一格把
+    // pending 与 scheduled 当成同一类（都还没开跑）。
+    ServerWord {
+        field: "status",
+        word: "scheduled",
+        client_file: "web/src/views/TasksView.tsx",
+        server_file: "crates/cog-core/src/types/task.rs",
+        server_needle: "TaskStatus::Scheduled => \"scheduled\"",
+    },
 ];
 
 /// Statuses the client writes into its own stores and then compares against.
@@ -199,9 +314,19 @@ const SERVER_WORDS: &[ServerWord] = &[
 /// a census of the panel's own words.
 const CLIENT_ONLY: &[(&str, &str, &str)] = &[
     ("status", "running", "工具调用的行内状态，面板自己写自己读"),
+    (
+        "status",
+        "ok",
+        "工具调用收尾后的行内状态：客户端按帧上的 `is_error` 自己折成 ok/error，服务端不发这两个字",
+    ),
     ("status", "sending", "对话气泡的发送状态，客户端自己写"),
     ("status", "streaming", "对话气泡的流式状态，客户端自己写"),
     ("status", "done", "对话气泡收尾后的状态，客户端自己写自己读"),
+    (
+        "status",
+        "open",
+        "这条连接通没通由客户端自己报（transport 的 onStatusChange），服务端在 connected 帧里说的是 hello，不说这个字",
+    ),
 ];
 
 /// 客户端源码文件数下限。普查面是这条判据的**题目**：读不出来的目录会让文件表

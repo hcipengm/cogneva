@@ -19,7 +19,8 @@ use uuid::Uuid;
 /// The `importance` field on each entry type stays a plain `f32` in
 /// `0.0..=1.0`, because that is what consumers sort on, and a bounded float
 /// needs no conversion at the point of use.
-// cap: bound — 消费者按 0.0..=1.0 排序，有界浮点在使用点不需要转换
+// cap: fixed — 消费者按 0.0..=1.0 排序，有界浮点在使用点不需要转换
+// keep: 删掉后评分域没有上界，消费者使用点每次都要转换；由「0.0..=1.0 排序」兜住
 pub const IMPORTANCE_RATING_MAX: u8 = 10;
 
 /// Place a rating on the shared importance scale, clamping it into range.
@@ -131,34 +132,35 @@ pub fn artifact_uri(namespace: &str, id: &str) -> String {
     format!("artifact://{namespace}/{id}")
 }
 
-/// The raw id of one tool output: the task, the turn it was produced in, and its
-/// position among that turn's tool calls.
+/// The raw id of one tool call: who the run belongs to, when the run started,
+/// the turn it was produced in, and its position among that turn's tool calls.
 ///
-/// Both numbers are zero-padded so lexicographic order is chronological -- a
-/// prefix listing of a task's outputs reads back in the order they happened,
-/// which is what "everything this task saw, in order" asks for. The two numbers
-/// travel inside one segment rather than as two path segments because a
+/// Every segment is fixed-width and each level only grows, so lexicographic
+/// order is chronological -- a prefix listing reads back in the order the calls
+/// happened, which is what "everything this task saw, in order" asks for. The
+/// numbers travel inside one segment rather than as path segments because a
 /// separator in a raw id turns into a directory in the object store and the
 /// source silently vanishes from every listing that would have counted it (see
 /// [`raw_id_key_error`]).
 ///
-/// The task id is folded into that one segment too, and the fold has to be a
-/// substitution rather than the id itself: a task id is free text by the time it
-/// reaches here, and one carrying a separator would make the whole id
-/// unaddressable -- the write would be refused at the API and the output would
-/// be lost with only a failure count to show for it. The characters
-/// [`raw_id_key_error`] refuses are replaced instead of the write being skipped,
-/// because a lossy id is still a reachable archive and a refused one is not.
-pub fn tool_output_raw_id(task_id: &str, turn: u32, frame: u32) -> String {
-    let key: String = task_id
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | '\0' => '_',
-            other => other,
-        })
-        .collect();
-    let key = if key.is_empty() { "task" } else { &key };
-    format!("{key}-{turn:04}-{frame:04}")
+/// The owner is folded with [`raw_id_slug`], which is a substitution rather than
+/// the id itself: an owner is free text by the time it reaches here (an agent id
+/// in the self-evolving system is a whole issue title), and one carrying a
+/// separator would make the whole id unaddressable -- the write would be refused
+/// at the API and the call would be lost with only a failure count to show for
+/// it. The fold also bounds the length, which is what keeps a long owner from
+/// pushing the key past the file system's `NAME_MAX`. A lossy id is still a
+/// reachable archive; a refused one is not.
+///
+/// The run start is in the id because a task can be attempted more than once and
+/// `turn`/`frame` restart at zero each attempt. Without it the second attempt's
+/// calls would overwrite the first attempt's records -- the exact loss this
+/// archive exists to prevent -- and a listing would show one attempt's history
+/// where two happened.
+pub fn tool_call_raw_id(owner: &str, run_millis: i64, turn: u32, frame: u32) -> String {
+    let slug = raw_id_slug(owner);
+    let slug = if slug.is_empty() { "task" } else { &slug };
+    format!("{slug}-{run_millis}-{turn:04}-{frame:04}")
 }
 
 /// The longest the source slug inside a raw id may grow.
@@ -166,7 +168,8 @@ pub fn tool_output_raw_id(task_id: &str, turn: u32, frame: u32) -> String {
 /// With the timestamp and random segments alongside it the whole key stays far
 /// below the file system's `NAME_MAX` (255 bytes), while the prefix is still
 /// long enough for a listing to show where an entry came from.
-// cap: bound — 落在文件系统 NAME_MAX（255 字节）之下，而前缀仍长到让一次列表看得出条目来自哪里
+// cap: fixed — 落在文件系统 NAME_MAX（255 字节）之下，而前缀仍长到让一次列表看得出条目来自哪里
+// keep: 删掉后回到「落在文件系统 NAME_MAX（255 字节）之下，而前缀仍长到让一次列表看得出条目来自哪里」所描述的情形；由这条约定兜住
 pub const RAW_ID_SLUG_MAX: usize = 64;
 
 /// Fold any source name into something safe to put in an object key: ASCII

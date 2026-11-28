@@ -17,7 +17,7 @@
 //! 读。这一面只报账——包括「这一行自己写着多久算超时、它已经跑了多久」这种算术，
 //! 但绝不替它宣布这件事过没过。再判一遍就成了第二个判据来源。
 //!
-//! 代价写在明处：这条读走的是 [`cog_core::OrchestratorControl::get_all_tasks`]，
+//! 代价写在明处：这条读走的是 [`cog_core::OrchestratorControl::get_all_tasks_checked`]，
 //! 也就是整张图（2026-11-06 实测 9,991 行 / 42 MB 的 JSON），因为按状态与按类型
 //! 计数需要每一行。这与场地那一面不同——那一面按标签筛选后只剩四行，所以它走
 //! 了一条窄查询。这里的调用是**按需的**（一个智能体在规划前问一次），不是每二十
@@ -35,6 +35,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::error::ApiError;
 use crate::GatewayState;
 
 /// 一次能带回多少条最老的活。
@@ -42,11 +43,13 @@ use crate::GatewayState;
 /// 上限存在的理由与聚合存在的理由同一条：这条读是给一个要据此决定下一件事做什么
 /// 的智能体用的，不是给一个要把整张账搬到内存里的人用的。超出上限的条数不是被
 /// 悄悄截掉——`truncated` 与 `open` 的差就是没带回来的那些。
-// cap: bound — 这条读是给智能体据此决定下一件事用的，不是用来搬整张账的；没带回来的那些由 truncated 报出，靠抬这个数补不上
+// cap: fixed — 这条读是给智能体据此决定下一件事用的，不是用来搬整张账的；没带回来的那些由 truncated 报出，靠抬这个数补不上
+// keep: 删掉后一次读把整张账搬回来，决定下一件事的读变成搬账；由「没带回来的由 truncated 报出」兜住
 pub const MAX_OLDEST: usize = 50;
 
 /// 没点名时要几条。
-// cap: bound — 不点名时的默认页长；要更多的调用方自己点名，所以它不跟着任何一条读数走
+// cap: fixed — 不点名时的默认页长；要更多的调用方自己点名，所以它不跟着任何一条读数走
+// keep: 删掉后不点名的调用方没有默认页长；由「要更多的调用方自己点名」兜住
 pub const DEFAULT_OLDEST: usize = 20;
 
 /// `GET /api/v1/tasks/ledger` 的筛选条件，都可以不给。
@@ -93,8 +96,8 @@ pub struct LedgerRow {
     pub started_at: Option<DateTime<Utc>>,
     /// 接手之后跑了多少秒；没接手时为 `None`。
     pub running_seconds: Option<i64>,
-    /// 这一行自己写着多久算超时。读数不替它判过没过，只把两个数一起给出来。
-    pub timeout_seconds: u64,
+    /// 这一行自己声明要花多久。读数不替它判过没过，只把两个数一起给出来。
+    pub declared_duration_seconds: u64,
     pub retry_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub goal_id: Option<String>,
@@ -113,14 +116,14 @@ pub struct LedgerReading {
     /// 在册的行里已经有人接手的条数。这就是「正在跑的量」——它与 `by_status` 里
     /// 那一格 `running` 不一定相等：接手过又落回排队（重试）的行两个都算。
     pub claimed: usize,
-    /// 在册的行里，接手时刻离现在已经超过它自己那条 `timeout_seconds` 的条数。
+    /// 在册的行里，接手时刻离现在已经超过它自己声明时长的条数。
     ///
     /// 这是算术，不是判据：它只是把行上本来就有的两个数（`started_at`、
-    /// `timeout_seconds`）与「现在」比了一次。改由实测的步间隔判停摆之后，这两个
-    /// 数已经**都不是**回收会读的东西了，所以这一格比以往更只是一条历史尺度：
-    /// 它回答「这一行比它自己声明的活了更久」，不回答「它该不该收」。判停摆要读
-    /// 的是上一次动是什么时候，而那不在这一行上。
-    pub past_its_timeout: usize,
+    /// `declared_duration_seconds`）与「现在」比了一次。回收读的是持有者的租约与
+    /// 实测的步间窗口，这两个数**都不是**回收会读的东西，所以这一格只是一条
+    /// 历史尺度：它回答「这一行比它自己声明的活了更久」，不回答「它该不该收」。
+    /// 判停摆要读的是上一次动是什么时候，而那不在这一行上。
+    pub past_its_declaration: usize,
     /// 满足条件的行按状态分。已终态的行留在这里，因为「这几天清掉了多少」与
     /// 「还压着多少」是同一张账的两半。
     pub by_status: BTreeMap<String, usize>,
@@ -170,7 +173,7 @@ pub fn read_task_ledger(
     let mut open_rows: Vec<&cog_core::Task> = Vec::new();
     let mut unclaimed = 0usize;
     let mut claimed = 0usize;
-    let mut past_its_timeout = 0usize;
+    let mut past_its_declaration = 0usize;
 
     for task in &matched {
         *by_status
@@ -189,8 +192,8 @@ pub fn read_task_ledger(
             None => unclaimed += 1,
             Some(started) => {
                 claimed += 1;
-                if (now - started).num_seconds() > task.timeout_seconds as i64 {
-                    past_its_timeout += 1;
+                if (now - started).num_seconds() > task.declared_duration_seconds as i64 {
+                    past_its_declaration += 1;
                 }
             }
         }
@@ -217,7 +220,7 @@ pub fn read_task_ledger(
         open,
         unclaimed,
         claimed,
-        past_its_timeout,
+        past_its_declaration,
         by_status,
         by_kind_status,
         by_venue,
@@ -323,7 +326,7 @@ fn row_of(task: &cog_core::Task, now: DateTime<Utc>) -> LedgerRow {
         age_seconds: (now - task.created_at).num_seconds(),
         started_at: task.started_at,
         running_seconds: task.started_at.map(|started| (now - started).num_seconds()),
-        timeout_seconds: task.timeout_seconds,
+        declared_duration_seconds: task.declared_duration_seconds,
         retry_count: task.retry_count,
         goal_id: task.goal_id.clone(),
     }
@@ -337,10 +340,15 @@ fn row_of(task: &cog_core::Task, now: DateTime<Utc>) -> LedgerRow {
 pub async fn task_ledger_handler(
     State(state): State<std::sync::Arc<GatewayState>>,
     Query(query): Query<LedgerQuery>,
-) -> Response {
-    let tasks = state.orchestrator.get_all_tasks().await;
+) -> Result<Response, ApiError> {
+    // 读失败留成 503：把一整张图的读折成空表，这一面账就会在一个库读不出来
+    // 的部署上报「在册 0 条、无事可做」——而它正是要安排活的那个人唯一的凭据。
+    let tasks = crate::tasks::task_rows_from_reading(
+        state.orchestrator.get_all_tasks_checked().await,
+        "task ledger",
+    )?;
     let now = Utc::now();
-    (StatusCode::OK, Json(read_task_ledger(&tasks, now, &query))).into_response()
+    Ok((StatusCode::OK, Json(read_task_ledger(&tasks, now, &query))).into_response())
 }
 
 #[cfg(test)]
@@ -437,29 +445,29 @@ mod tests {
         assert_eq!(by_id("f1").running_seconds, Some(600));
     }
 
-    /// 过了自己那条时限要能被数出来，但那是行上两个数的算术，不是这一面下的判据：
-    /// 超时窗是行自己写的，读数只把它与「现在」比一次。
+    /// 过了自己声明的时长要能被数出来，但那是行上两个数的算术，不是这一面下的判据：
+    /// 声明是行自己写的，读数只把它与「现在」比一次。
     #[test]
-    fn a_row_past_its_own_timeout_is_counted_and_not_judged() {
+    fn a_row_past_its_own_declaration_is_counted_and_not_judged() {
         let now = Utc::now();
         let mut late = row("late", TaskStatus::Running, 300);
         late.started_at = Some(now - Duration::seconds(901));
-        late.timeout_seconds = 900;
+        late.declared_duration_seconds = 900;
         let mut on_time = row("on-time", TaskStatus::Running, 300);
         on_time.started_at = Some(now - Duration::seconds(100));
-        on_time.timeout_seconds = 900;
+        on_time.declared_duration_seconds = 900;
 
         let reading = read_task_ledger(&[late, on_time], now, &LedgerQuery::default());
 
         assert_eq!(reading.claimed, 2);
         assert_eq!(
-            reading.past_its_timeout, 1,
-            "只有过了它自己那条时限的那条算"
+            reading.past_its_declaration, 1,
+            "只有过了它自己声明的时长的那条算"
         );
         assert_eq!(
             reading.by_status.get("running"),
             Some(&2),
-            "过了时限的行仍然是 running：这一面不改行，只读行"
+            "过了自己声明的行仍然是 running：这一面不改行，只读行"
         );
     }
 
@@ -576,6 +584,22 @@ mod tests {
             by_owner.matched, 2,
             "指定给他做的与结果是他交的，都算在他名下"
         );
+    }
+
+    /// 一个人接两条任务：账上两行，按人汇总是一格两件。
+    ///
+    /// R17 阶段 0 的判据要的是「两条任务行 `owner_unit` 同一人」——按人汇总
+    /// 时，同一个人手上的活不能因为挂在两件活上就被拆成两个人。
+    #[test]
+    fn two_tasks_held_by_one_person_are_counted_under_that_person() {
+        let now = Utc::now();
+        let mut a = row("a", TaskStatus::Running, 20);
+        a.owner_unit = Some("employee:1".into());
+        let mut b = row("b", TaskStatus::Running, 10);
+        b.owner_unit = Some("employee:1".into());
+        let reading = read_task_ledger(&[a, b], now, &LedgerQuery::default());
+        assert_eq!(reading.by_owner.get("employee:1"), Some(&2));
+        assert_eq!(reading.by_owner.len(), 1, "同一个人不该在账上被拆成两行");
     }
 
     /// 空白场地不是场地：与场地那一面同一条判据，否则「没填」会被读成一个叫

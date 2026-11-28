@@ -33,7 +33,6 @@
 03-grafana-secrets.yaml exempt # Grafana 管理员 Secret 根本不在清单里（安装期随机生成）；这个文件留下的是一条**没有任何 chart 引用**的占位 webhook，真值是带外凭证——交付它只可能把真人填的值覆盖成占位串
 04-servicemonitor-cogneva.yaml deliver # 主服务（网关/进化 Pod）的指标抓取目标
 05-podmonitor-cogneva.yaml exempt # 与 04-servicemonitor-cogneva.yaml 是二选一的替代方案，两个都应用就是双份抓取
-06-grafana-dashboard-configmap.yaml deliver # Cogneva 自己的 Grafana 面板；Grafana sidecar 按标签热加载，改这里就是改面板
 07-ingress-monitoring.yaml deliver # Prometheus / Grafana / Alertmanager 的对外入口
 08-servicemonitor-gateway.yaml deliver # 安全网关的指标抓取目标（与 04 是不同服务、不是替代关系）
 09-clickhouse.yaml backends # 时序明细后端，只有开了日志/明细后端才装

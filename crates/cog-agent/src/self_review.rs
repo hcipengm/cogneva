@@ -1,6 +1,6 @@
 use cog_core::{
-    execute_structured, ChatOptions, ChatResponse, LlmClient, Message, ResponseFormat, SFError,
-    SFResult, SelfReviewConfig, SelfReviewResult, ThinkingLevel,
+    execute_structured, ChatOptions, ChatResponse, Deliverable, LlmClient, Message, ResponseFormat,
+    SFError, SFResult, SelfReviewConfig, SelfReviewResult, ThinkingLevel,
 };
 
 /// Observation of an agent output.
@@ -174,6 +174,18 @@ pub fn self_review_actor(role: &str) -> String {
 pub struct SelfReviewLoop {
     pub config: SelfReviewConfig,
     actor: String,
+    /// 这份活交什么，由它挑判据（见 [`SelfReviewLoop::judging_rubric`]）。
+    ///
+    /// 与 `actor` 分开记，因为两者答的不是同一问：`actor` 答「谁在花这笔钱」，
+    /// 这一格答「被审的是什么物」。原先判据从 `actor` 里的角色名取，同一个人换
+    /// 件活就判错——被判的是物，标准就该跟着物走。
+    deliverable: Deliverable,
+    /// 有人就这份活说过的方向，原文照录（见 `cog_core::Task::stated_directions`）。
+    ///
+    /// 与 `deliverable` 分开：`deliverable` 说这份活交什么物、由它挑判据；
+    /// 这一格说「往哪儿算好」——外部提交的偏好与判据改写，是判据**之外**的
+    /// 一份标准。空表示没人就这份活说过方向，不是「人没有偏好」。
+    stated_directions: Vec<String>,
     /// The DAG task this review is being run for, when it is being run for one.
     ///
     /// 与 `actor` 分开记，因为两者答的不是同一问：`actor` 答「哪个角色在花」，
@@ -189,15 +201,40 @@ impl SelfReviewLoop {
         Self {
             config,
             actor: DEFAULT_SELF_REVIEW_ACTOR.to_string(),
+            deliverable: Deliverable::Unstated,
+            stated_directions: Vec::new(),
             task: None,
         }
     }
 
+    /// 有人就这份活说过的方向，原文照录。判据后面会被逐字引用（见
+    /// [`SelfReviewLoop::rubric`]），所以这里不概括、不改写。
+    pub fn with_stated_directions(mut self, directions: Vec<String>) -> Self {
+        self.stated_directions = directions;
+        self
+    }
+
     /// Report this loop's token spend under `actor`, so a caller that reviews
     /// on behalf of a specific agent can be charged for it.
+    ///
+    /// 这只决定花销记在谁头上，不决定怎么判。
     pub fn with_actor(mut self, actor: impl Into<String>) -> Self {
         self.actor = actor.into();
         self
+    }
+
+    /// 这份活交什么（见 [`cog_core::Task::deliverable`]）。判据按它挑。
+    ///
+    /// 不设时是 `Unstated`——没有声明不是「按最常见的形状判」：判据要求评判先
+    /// 从原文探明它是五种里的哪一种，并说出依据；探不明才是这一格里唯一的 unmet。
+    pub fn with_deliverable(mut self, deliverable: Deliverable) -> Self {
+        self.deliverable = deliverable;
+        self
+    }
+
+    /// 这一次用的是哪一种判据，以及它有没有人说出来。
+    pub fn rubric_source(&self) -> Deliverable {
+        self.deliverable
     }
 
     /// Charge this review's spend to `task`, so "what did this change cost"
@@ -400,7 +437,7 @@ impl SelfReviewLoop {
         let options = stamp(ChatOptions::default(), actor, task);
 
         let output = execute_structured::<CritiqueOutput>(llm, &[user_msg], &options).await?;
-        let raw = serde_json::to_string(&output).unwrap_or_default();
+        let raw = serde_json::to_string(&output).unwrap_or(Default::default());
 
         Ok(Critique {
             issues: output.issues,
@@ -438,7 +475,7 @@ impl SelfReviewLoop {
         let options = stamp(ChatOptions::default(), actor, task);
 
         let output = execute_structured::<ComparisonOutput>(llm, &[user_msg], &options).await?;
-        let raw = serde_json::to_string(&output).unwrap_or_default();
+        let raw = serde_json::to_string(&output).unwrap_or(Default::default());
 
         // 分数只在 0.0–1.0 上可比。走出这个区间的数不是「差一点」，是另一把
         // 尺子（8/10、85 分），夹紧之后会变成 1.0——一次越界的读数被读成满分
@@ -487,8 +524,9 @@ impl SelfReviewLoop {
                 "the review has no specification to hold the text to".into(),
             ));
         }
+        let rubric = self.rubric();
         let user_payload = serde_json::to_string(&JudgeRequest {
-            rubric: SelfReviewLoop::judging_rubric(&self.actor),
+            rubric: rubric.as_ref(),
             spec,
             output,
         })?;
@@ -698,17 +736,20 @@ impl SelfReviewLoop {
     /// asks a plan to answer the task cannot be passed by any plan, and a gate
     /// that never opens teaches its readers to ignore it.
     ///
-    /// The text is chosen by the role the review is charged to. It has to stay
-    /// byte-identical across calls, because it is the head of the request and
-    /// the only part an upstream prefix cache can hold across tasks.
-    fn judging_rubric(actor: &str) -> &'static str {
-        // 名字从 `cog_core::roles` 读，不在这里再拼一遍：这五个词是配置、代码与
-        // 存下来的标识三者必须同意的一份声明，第二处拼写改了名不会报错，只会让
-        // 这个角色悄悄落在 `_` 那一臂上、拿默认判据去判。
-        use cog_core::roles::{EVALUATOR, MERGER, MODERATOR, PLANNER};
-        let role = actor.rsplit(':').next().unwrap_or(actor);
-        match role {
-            PLANNER => {
+    /// The text is chosen by what the work delivers, not by who delivers it.
+    ///
+    /// It has to stay byte-identical across calls, because it is the head of
+    /// the request and the only part an upstream prefix cache can hold across
+    /// tasks. Anything a person said about this particular piece of work is
+    /// appended after it by [`SelfReviewLoop::rubric`], never folded into it.
+    /// `Unstated` gets wording of its own, and the first thing it asks
+    /// for is the step nobody took: say which of the five this text is, from the
+    /// text, and quote what decided it. Handing it the work-product wording
+    /// would have made "nobody said" and "somebody said work product" the same
+    /// treatment, which is the collapse the field exists to prevent.
+    fn judging_rubric(deliverable: Deliverable) -> &'static str {
+        match deliverable {
+            Deliverable::Plan => {
                 "The text under judgement is a PLAN: a decomposition of a task into sub-tasks. \
                  A plan is not expected to answer the task or to carry out any step -- that is \
                  what its sub-tasks are for -- so \"it does not give the answer\", \"it does not \
@@ -727,7 +768,7 @@ impl SelfReviewLoop {
                  character against the text, whitespace aside, and a quote that is not there is \
                  not a `met`."
             }
-            EVALUATOR => {
+            Deliverable::Judgement => {
                 "The text under judgement is a JUDGEMENT about someone else's work. Judge it as \
                  a judgement: whether it names what it assessed, states a verdict, and says what \
                  the verdict rests on. Whether the work itself is good is not this text's \
@@ -738,7 +779,7 @@ impl SelfReviewLoop {
                  the specification that states the requirement, in `spec_quote`, verbatim; a \
                  quote that is not in the specification does not count."
             }
-            MODERATOR | MERGER => {
+            Deliverable::Answer => {
                 "The text under judgement is a FINAL ANSWER to the task. List every requirement \
                  the specification states. For each one decide met, unmet or undetermined, and \
                  for `met` quote the words of the text that carry it, character for character, \
@@ -746,7 +787,23 @@ impl SelfReviewLoop {
                  states the requirement, in `spec_quote`, verbatim; a quote that is not in the \
                  specification does not count."
             }
-            _ => {
+            // 没人说过交什么，就不许当成最常见的那一种判：那会让「没人说」与「有人说是
+            // 产物」在待遇上同形，而那正是这个字段被加进来的理由。这一格要判的第一件事
+            // 是**先探明它是什么**，把判断依据（原文的哪几个字）说出来；判据本身仍是规格。
+            Deliverable::Unstated => {
+                "Nobody said what this work delivers, and this review must not assume the \
+                 commonest kind. First say which of the five it is -- a plan, a change, a \
+                 judgement, an answer, or a work product -- quoting the words of the text that \
+                 made you decide, and judge the text as that kind. A text whose words do not \
+                 settle the question is the one thing this rubric calls unmet: name the part \
+                 that reads two ways and what the task would have to say to settle it.\n\n\
+                 List every requirement the specification states. For each one decide met, unmet \
+                 or undetermined, and for `met` quote the words of the text that carry it, \
+                 character for character, whitespace aside. Every row also quotes the sentence of \
+                 the specification that states the requirement, in `spec_quote`, verbatim; a \
+                 quote that is not in the specification does not count."
+            }
+            Deliverable::Change | Deliverable::WorkProduct => {
                 "The text under judgement is a WORK PRODUCT the task asked for. List every \
                  requirement the specification states. For each one decide met, unmet or \
                  undetermined, and for `met` quote the words of the text that carry it, \
@@ -755,6 +812,33 @@ impl SelfReviewLoop {
                  quote that is not in the specification does not count."
             }
         }
+    }
+
+    /// 这一轮交给判官的标准：判据本身在前，有人就这份活说过的话逐字贴在后。
+    ///
+    /// 顺序是有意的：判据每次相同，是请求里能被上游前缀缓存命中的那一段；方向按任务
+    /// 不同，贴在它后面，换了方向只坏在尾上。方向只引用、不归纳——提交者的理由是全部
+    /// 输入，判官读到的要是原话；它也不取代上面的要求，两份标准各管各的。
+    fn rubric(&self) -> std::borrow::Cow<'static, str> {
+        let base = SelfReviewLoop::judging_rubric(self.deliverable);
+        if self.stated_directions.is_empty() {
+            return std::borrow::Cow::Borrowed(base);
+        }
+        let mut stated = String::from(
+            "\n\nSomeone outside this work stated a direction for it, quoted here verbatim. \
+             Weigh it as part of what counts as good in this round; it does not replace the \
+             requirements above:\n",
+        );
+        for direction in &self.stated_directions {
+            stated.push_str("- ");
+            stated.push_str(direction);
+            stated.push('\n');
+        }
+        // 容量就是拼出来多长：贴上去的是人的原话，长短由提交者决定，这里不猜一个数。
+        let mut text = String::with_capacity(base.len() + stated.len());
+        text.push_str(base);
+        text.push_str(&stated);
+        std::borrow::Cow::Owned(text)
     }
 
     /// Step 4: Decide — PASS or NEED_REVISION based on score vs threshold.
@@ -801,6 +885,7 @@ impl SelfReviewLoop {
     }
 
     /// Step 5: Revise — ask the LLM to improve the output.
+    // prompt: consumed by crates/cog-agent/src/self_review.rs::extract_text
     pub async fn revise(
         result: &SelfReviewResult,
         original: &str,
@@ -845,9 +930,7 @@ impl SelfReviewLoop {
         // the only part an upstream's prefix cache can reuse.
         let instruction = Message::system(
             "Rewrite the original text so that it answers every point in the critique and \
-             the suggestions, keeping every part the critique does not object to. Answer with \
-             the revised text only: no preamble, no markdown fences, no commentary about the \
-             change.",
+             the suggestions, keeping every part the critique does not object to.",
         );
 
         let response = llm.chat(&[instruction, user_msg], &options).await?;
@@ -858,7 +941,7 @@ impl SelfReviewLoop {
         if let Some(reason) = response.error_message.as_deref() {
             return Err(SFError::LLM(format!("self-review revise failed: {reason}")));
         }
-        let revised = extract_text(&response);
+        let revised = unwrap_fence_added_by_the_rewrite(&extract_text(&response), original);
         // The same guarantee for a provider that succeeded without producing
         // anything: no revision is not an empty revision.
         if revised.trim().is_empty() {
@@ -885,12 +968,76 @@ fn stamp(options: ChatOptions, actor: &str, task: Option<&str>) -> ChatOptions {
 
 /// Extract plain text from a ChatResponse.
 fn extract_text(response: &ChatResponse) -> String {
-    response
+    let text = response
         .content
         .iter()
         .filter_map(|b| b.as_text())
         .collect::<Vec<_>>()
-        .join("")
+        .join("");
+    text
+}
+
+/// 改写自己加上去的围栏拆掉；原文本本来就有的围栏留着。
+fn unwrap_fence_added_by_the_rewrite(revised: &str, original: &str) -> String {
+    if original.trim_start().starts_with("```") {
+        // 原文就是一段代码，改写把它再包一层是它在引用，不是在交付。
+        return revised.to_string();
+    }
+    unwrap_fence(revised)
+}
+
+/// 整段被一条围栏包着时把它拆掉。
+///
+/// 拆在这里而不是要求模型别写围栏：那条要求没有任何东西检查，模型照写时调用方
+/// 拿到的是「```……```」而不是正文，而两者都是非空字符串——把围栏当正文应用下去，
+/// 坏掉的是被改写的那份东西。只在整段就是一条围栏时拆，正文里本来就有的围栏不动。
+fn unwrap_fence(text: &str) -> String {
+    let trimmed = text.trim();
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return text.to_string();
+    };
+    let Some(body) = rest.strip_suffix("```") else {
+        return text.to_string();
+    };
+    match body.split_once('\n') {
+        // 第一行是语言标注，或什么都没有；正文从换行之后开始。
+        Some((tag, inner)) if !tag.contains('`') => inner.trim_end().to_string(),
+        _ => text.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use super::{unwrap_fence, unwrap_fence_added_by_the_rewrite};
+
+    /// 围栏当正文交回去，改写的调用方会把「```」写进被改的那份东西里。
+    #[test]
+    fn a_body_wrapped_in_one_fence_is_unwrapped() {
+        assert_eq!(unwrap_fence("```\nfn main() {}\n```"), "fn main() {}");
+        assert_eq!(unwrap_fence("```rust\nlet a = 1;\n```"), "let a = 1;");
+        assert_eq!(unwrap_fence("plain text"), "plain text");
+        // 只开不关的不是一段被包起来的正文，不动。
+        assert_eq!(unwrap_fence("```\na\n```\nb"), "```\na\n```\nb");
+        assert_eq!(unwrap_fence("```a```"), "```a```");
+        assert_eq!(
+            unwrap_fence("```\n```rust\nlet a = 1;\n```\n```"),
+            "```rust\nlet a = 1;\n```"
+        );
+    }
+
+    /// 原文本身就是一段代码时，围栏是原文的一部分。
+    #[test]
+    fn a_fence_the_original_already_had_is_left_alone() {
+        let original = "```rust\nlet a = 1;\n```";
+        assert_eq!(
+            unwrap_fence_added_by_the_rewrite("```rust\nlet a = 2;\n```", original),
+            "```rust\nlet a = 2;\n```"
+        );
+        assert_eq!(
+            unwrap_fence_added_by_the_rewrite("```\nlet a = 2;\n```", "let a = 1;"),
+            "let a = 2;"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1218,6 +1365,7 @@ mod tests {
         body: &'static str,
         calls: std::sync::atomic::AtomicUsize,
         levels: std::sync::Mutex<Vec<Option<ThinkingLevel>>>,
+        payloads: std::sync::Mutex<Vec<String>>,
     }
 
     impl TableLlm {
@@ -1226,11 +1374,17 @@ mod tests {
                 body,
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 levels: std::sync::Mutex::new(Vec::new()),
+                payloads: std::sync::Mutex::new(Vec::new()),
             }
         }
 
         fn calls(&self) -> usize {
             self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// 每次请求带出去的正文，按调用顺序。
+        fn payloads(&self) -> Vec<String> {
+            self.payloads.lock().unwrap().clone()
         }
 
         /// 每次请求带出去的思考档，按调用顺序。
@@ -1259,11 +1413,15 @@ mod tests {
 
         async fn chat(
             &self,
-            _messages: &[Message],
+            messages: &[Message],
             options: &ChatOptions,
         ) -> SFResult<ChatResponse> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.levels.lock().unwrap().push(options.reasoning);
+            self.payloads
+                .lock()
+                .unwrap()
+                .push(messages.last().map(|m| m.content()).unwrap_or_default());
             Ok(ChatResponse {
                 content: vec![cog_core::ContentBlock::text(self.body)],
                 ..Default::default()
@@ -1702,19 +1860,149 @@ mod tests {
     /// 去判计划，计划永远过不了，这道门也就永远开不了。
     #[test]
     fn a_plan_is_judged_as_a_plan() {
-        let plan = SelfReviewLoop::judging_rubric("self_review:planner");
+        let plan = SelfReviewLoop::judging_rubric(Deliverable::Plan);
         assert!(
             plan.contains("is not expected to answer the task"),
             "计划这条判据必须把「没有回答任务」划出缺陷之外：{plan}"
         );
         assert!(
-            !SelfReviewLoop::judging_rubric("self_review:generator")
+            !SelfReviewLoop::judging_rubric(Deliverable::WorkProduct)
                 .contains("is not expected to answer the task"),
             "生成物就是答案，不能沿用计划那条豁免"
         );
         assert!(
-            SelfReviewLoop::judging_rubric("self_review:evaluator").contains("JUDGEMENT"),
+            SelfReviewLoop::judging_rubric(Deliverable::Judgement).contains("JUDGEMENT"),
             "判词按判词判"
+        );
+        assert!(
+            SelfReviewLoop::judging_rubric(Deliverable::Answer).contains("FINAL ANSWER"),
+            "结论按结论判"
+        );
+    }
+
+    /// 没人说过交什么，判据不许兜底成最常见的那一种形状。
+    ///
+    /// 「信息不足」是一等状态，有去处：先探明它是什么，把依据说出来。兜底会让
+    /// 「没人说」与「有人说是产物」得到同一套待遇，而这两件事在读数上分得开，
+    /// 正是这个字段存在的全部理由。
+    #[test]
+    fn an_unstated_deliverable_is_probed_rather_than_defaulted() {
+        let unstated = SelfReviewLoop::judging_rubric(Deliverable::Unstated);
+        let work_product = SelfReviewLoop::judging_rubric(Deliverable::WorkProduct);
+        assert_ne!(
+            unstated, work_product,
+            "没人说过却按最常见的那种形状判：两个不同的输入得到同一套待遇，读数上再也分不开"
+        );
+        assert!(
+            unstated.contains("Nobody said what this work delivers"),
+            "这一格的第一件事是承认没人说过：{unstated}"
+        );
+        assert!(
+            unstated.contains("quoting the words of the text"),
+            "探明之后要说出依据，否则「探明了」与「猜的」同形：{unstated}"
+        );
+        // 判据仍是规格：探明形状不改变量它的尺子。
+        assert!(
+            unstated.contains("spec_quote"),
+            "探明形状不该把规格那条尺子弄丢：{unstated}"
+        );
+    }
+
+    /// 有人就这份活说过的方向，要真的到得了判官手里，而且不顶替判据。
+    ///
+    /// 改之前人说的话只变成一件新活：判这份活的尺子不带它，于是「按我的偏好算好」
+    /// 与「按默认算好」在读数上同形——两者都是「有一份判据」。这条测试钉两半：方向
+    /// 出现在请求里（逐字），判据本身仍是请求的开头（换了方向只坏在尾上）。
+    #[tokio::test]
+    async fn a_stated_direction_reaches_the_rubric_without_replacing_it() {
+        const TABLE: &str = r#"{"rows":[
+             {"requirement":"names a sub-task","spec_quote":"t1 and t2 must be done","status":"met","evidence":"t1: read the file"}]}"#;
+
+        async fn rubric_under(directions: Vec<String>) -> String {
+            let llm = TableLlm::new(TABLE);
+            let loop_ = SelfReviewLoop::new(SelfReviewConfig {
+                revise: false,
+                spec: Some("t1 and t2 must be done".into()),
+                ..Default::default()
+            })
+            .with_stated_directions(directions);
+            let _ = loop_.review("t1: read the file", &llm).await.unwrap();
+            let payload = llm.payloads().pop().expect("一次评判一次请求");
+            let request: serde_json::Value = serde_json::from_str(&payload).expect("请求是 JSON");
+            request["rubric"]
+                .as_str()
+                .expect("判据在请求里")
+                .to_string()
+        }
+
+        let head = SelfReviewLoop::judging_rubric(Deliverable::Unstated);
+        let silent = rubric_under(Vec::new()).await;
+        assert_eq!(
+            silent, head,
+            "没人说过方向时，判据必须与原来逐字相同：多一个字都会让前缀缓存失效"
+        );
+
+        let direction =
+            "prefers \"the stricter one\" over \"the looser one\": the looser one hid a regression";
+        let spoken = rubric_under(vec![direction.to_string()]).await;
+        assert!(
+            spoken.starts_with(&silent),
+            "判据本身必须还是开头：方向贴在尾上，换了方向只坏在尾上\n{spoken}"
+        );
+        assert!(
+            spoken.contains(direction),
+            "方向要原样到判官手里，概括过的那句不是提交者的话\n{spoken}"
+        );
+        assert!(
+            spoken.contains("does not replace the requirements"),
+            "方向是加在判据之外的一份标准，不该被读成把要求换掉了\n{spoken}"
+        );
+    }
+
+    /// 同一件活换个标签接手，判据逐字相同——标签只决定花销记在谁头上。
+    ///
+    /// 这条是「角色不决定行为」在本模块的落点：改之前判据从 actor 里取角色名，
+    /// 两个角色接同一份活拿到两份标准；两个都绿不了，或者一个绿一个不绿，而
+    /// 读数上看不出是标准换了。
+    #[tokio::test]
+    async fn the_label_does_not_choose_the_rubric() {
+        const TABLE: &str = r#"{"rows":[
+             {"requirement":"names a sub-task","spec_quote":"t1 and t2 must be done","status":"met","evidence":"t1: read the file"}]}"#;
+        const SPEC: &str = "t1 and t2 must be done";
+
+        async fn payload_under(actor: &str, deliverable: Deliverable) -> (String, Deliverable) {
+            let llm = TableLlm::new(TABLE);
+            let loop_ = SelfReviewLoop::new(SelfReviewConfig {
+                revise: false,
+                spec: Some(SPEC.into()),
+                ..Default::default()
+            })
+            .with_actor(actor)
+            .with_deliverable(deliverable);
+            let source = loop_.rubric_source();
+            loop_
+                .review("t1: read the file, then t2: deploy", &llm)
+                .await
+                .unwrap();
+            (llm.payloads().pop().expect("一次评判一次请求"), source)
+        }
+
+        let (planner, _) = payload_under("self_review:planner", Deliverable::Plan).await;
+        let (generator, source) = payload_under("self_review:generator", Deliverable::Plan).await;
+        assert_eq!(
+            planner, generator,
+            "同一个声明、两个标签接手，判据正文必须逐字相同；标签只该决定花销记在谁头上"
+        );
+        assert!(
+            planner.contains("is not expected to answer the task"),
+            "这条活声明的是计划，判据就得是计划那条：{planner}"
+        );
+        assert_eq!(source, Deliverable::Plan);
+
+        let (other, _) = payload_under("self_review:planner", Deliverable::Judgement).await;
+        assert_ne!(
+            other, planner,
+            "同一份活声明成别的物，判据必须跟着变——否则「按物判」只是换了块牌子"
         );
     }
 

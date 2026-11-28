@@ -1,0 +1,1 @@
+ALTER TABLE messages ADD COLUMN file_attachments JSON NOT NULL DEFAULT (JSON_ARRAY());

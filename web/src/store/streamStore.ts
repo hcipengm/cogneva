@@ -224,6 +224,12 @@ export const LIVE_TASK_LIMIT = 200;
 export interface ToolCallRecord {
   id: string;
   agent: string | null;
+  /**
+   * 这一笔是从哪一段对话的记录里重放回来的。实时帧不带会话号（它来自总线，
+   * 按 `agent_id` 归人），而记录读回来时知道自己在读哪一段——那一格是重开
+   * 之后把调用放回对话下面的第二条路，用于回答者没被记下的老轮。
+   */
+  session?: string | null;
   name: string;
   /** 入参原文（紧凑 JSON）。 */
   args: string;
@@ -300,6 +306,8 @@ export interface StreamState {
   noteToolCall: (record: {
     id: string;
     agent: string | null;
+    /** 从记录里重放时给，实时帧不给：总线上的帧不知道自己在哪一段对话里。 */
+    session?: string | null;
     /**
      * 工具名。只有开始那一帧带着它；中途与结束的帧只带调用 id，所以这里可以不传——
      * 同一次调用已经记过名，后面的帧再传一个读不到的值只会把它盖成空串。
@@ -310,6 +318,11 @@ export interface StreamState {
     progress?: string;
     status: ToolCallRecord['status'];
     at: string;
+    /**
+     * 这一笔开始于什么时候。实时帧的 `at` 就是开始那一刻；记录里重放的一笔两头
+     * 都有，`at` 给的是收尾那一刻——不给起点，重开之后每一次调用的时长都画成 0。
+     */
+    startedAt?: string;
   }) => void;
   recordActivity: (entry: ActivityEntry) => void;
   clearActivity: () => void;
@@ -382,16 +395,20 @@ export const useStreamStore = create<StreamState>((set) => ({
           : {
               id: record.id,
               agent: record.agent,
+              session: record.session ?? null,
               name: record.name ?? '',
               args: '',
               result: '',
               progress: '',
               status: 'running' as const,
-              startedAt: record.at,
+              startedAt: record.startedAt ?? record.at,
               endedAt: null,
             };
       const merged: ToolCallRecord = {
         ...base,
+        // 重放那一次带着会话号补齐实时那一笔没记过的归属；反过来，实时那一次
+        // 不会把它清掉。
+        session: base.session ?? record.session ?? null,
         status: record.status,
         args: record.args === undefined ? base.args : toolText(record.args),
         result: record.result === undefined ? base.result : toolText(record.result),

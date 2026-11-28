@@ -9,7 +9,9 @@ pub struct ToolGuardConfig {
     pub blocked_tools: Vec<String>,
     pub dangerous_tools: Vec<String>,
     pub require_approval_tools: Vec<String>,
-    pub max_file_delete_count: u32,
+    // 没有「一次最多删几个文件」这一项：护栏里没有任何一处读它，而一个没人读的界不是
+    // 界，是配置面在声称一件代码没做的事。真要做「一次删太多」的判定，判定点
+    // 得先存在，界才轮到从某条读数导出。
     pub allowed_domains: Vec<String>,
 }
 
@@ -23,7 +25,6 @@ impl Default for ToolGuardConfig {
                 "send_email".into(),
             ],
             require_approval_tools: vec!["database_migration".into(), "deploy_production".into()],
-            max_file_delete_count: 10,
             allowed_domains: vec![],
         }
     }
@@ -92,5 +93,28 @@ impl cog_core::Guardrail for ToolGuard {
 
     async fn check_tool_call(&self, tool: &ToolCall) -> GuardResult {
         self.check(tool)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 配置面上不许留没人读的界。
+    ///
+    /// 一项「一次最多删几个文件」的界曾经在这里，护栏里没有任何一处读它——删掉而不是
+    /// 给它命名：一个没人读的界不是界，是配置面在声称一件代码没做的事。
+    #[test]
+    fn the_guard_config_claims_no_bound_it_never_reads() {
+        // 针不在这一行里原样出现：否则这条判据读到的就是它自己。
+        let needle = concat!("max_file_delete_", "count");
+        assert!(
+            !include_str!("tool_guard.rs").contains(needle),
+            "护栏不读的界不许留在配置面上"
+        );
+        // 删除之后结构仍然建得出来：剩下的三个工具清单与域名清单才是它的全部。
+        let config = ToolGuardConfig::default();
+        assert!(config.blocked_tools.contains(&"execute_shell".to_string()));
+        assert!(config.allowed_domains.is_empty());
     }
 }

@@ -29,7 +29,7 @@
 
 use crate::common;
 
-use common::routes::repo_root;
+use common::routes::{rendered_root, repo_root};
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -41,7 +41,7 @@ const OCCUPANCY_URL_ENV: &str = "COGNEVA_CLAIM_STORE_METRICS_URL";
 /// Every manifest in a rendered profile, keyed by nothing — the checks below ask
 /// for kinds, so the documents are all kept and filtered at the use.
 fn rendered_documents() -> Vec<serde_yaml::Value> {
-    let dir = repo_root().join("deploy/rendered/k3s-single");
+    let dir = rendered_root().join("k3s-single");
     let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
     let mut paths: Vec<_> = entries
         .filter_map(|e| e.ok())
@@ -212,6 +212,55 @@ fn claim_of_volume(pod_spec: &serde_yaml::Value) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Volume name → (the claim that volume is at runtime, how a declaration spells
+/// that claim) for the claims a StatefulSet creates from `volumeClaimTemplates`.
+///
+/// A template claim has no pod-level `volumes` entry: the controller injects one
+/// per replica, named `<template>-<workload>-<ordinal>`. A manifest spelling that
+/// name cannot know the ordinal, so it writes `$(POD_NAME)` for the pod part —
+/// that substitution is the kubelet's, not a wildcard this test grants. Leaving
+/// these out would not fail anything: every template mount would find no volume
+/// and be skipped, which reads as "this pod declares nothing to raise".
+fn claim_templates_of_workload(workload: &serde_yaml::Value) -> Vec<(String, String, String)> {
+    let workload_name = workload
+        .get("metadata")
+        .and_then(|m| m.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("<unnamed>");
+    let Some(spec) = workload.get("spec") else {
+        return Vec::new();
+    };
+    let replicas = spec
+        .get("replicas")
+        .and_then(|r| r.as_u64())
+        .unwrap_or(1)
+        .max(1);
+    let Some(templates) = spec
+        .get("volumeClaimTemplates")
+        .and_then(|v| v.as_sequence())
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for template in templates {
+        let Some(name) = template
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(|n| n.as_str())
+        else {
+            continue;
+        };
+        for ordinal in 0..replicas {
+            out.push((
+                name.to_string(),
+                format!("{name}-{workload_name}-{ordinal}"),
+                format!("{name}-$(POD_NAME)"),
+            ));
+        }
+    }
+    out
+}
+
 fn container_name(container: &serde_yaml::Value) -> String {
     container
         .get("name")
@@ -258,7 +307,14 @@ fn every_claim_a_pod_mounts_is_one_its_mounts_variable_names() {
         }
         pods_judged += 1;
 
-        let volumes = claim_of_volume(pod_spec);
+        // 卷可以来自 Pod 里声明的 PVC，也可以来自 StatefulSet 的卷模板；后者的
+        // 运行期名字与声明里的写法不同（前者 `claim`，后者 `<模板>-$(POD_NAME)`），
+        // 所以两样一起带着走。
+        let mut volumes: Vec<(String, String, String)> = claim_of_volume(pod_spec)
+            .into_iter()
+            .map(|(volume, claim)| (volume, claim.clone(), claim))
+            .collect();
+        volumes.extend(claim_templates_of_workload(workload));
         for container in containers {
             let Some(mounts) = container.get("volumeMounts").and_then(|m| m.as_sequence()) else {
                 continue;
@@ -267,14 +323,15 @@ fn every_claim_a_pod_mounts_is_one_its_mounts_variable_names() {
                 let Some(volume) = mount.get("name").and_then(|n| n.as_str()) else {
                     continue;
                 };
-                let Some((_, claim)) = volumes.iter().find(|(v, _)| v == volume) else {
+                let Some((_, claim, spelling)) = volumes.iter().find(|(v, _, _)| v == volume)
+                else {
                     continue;
                 };
                 let Some(path) = mount.get("mountPath").and_then(|p| p.as_str()) else {
                     continue;
                 };
                 claims_judged += 1;
-                if !declared.contains(&(claim.clone(), path.to_string())) {
+                if !declared.contains(&(spelling.clone(), path.to_string())) {
                     complaints.push(format!(
                         "{name}/{} 挂着卷 {claim} 在 {path}，而 {MOUNTS_ENV} 里没有这一条：\
                          这条卷只被量、没有抬声明的人，涨到头来要靠人改 values",
@@ -330,7 +387,7 @@ fn the_evolution_pods_own_data_claim_is_one_the_loop_can_raise() {
         .get("containers")
         .and_then(|c| c.as_sequence())
         .map(|cs| cs.iter().flat_map(declared_mounts).collect())
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
 
     assert!(
         declared
@@ -399,8 +456,20 @@ fn a_size_nothing_can_carry_out_is_not_written_and_the_write_sits_behind_that_ve
     let guard = body
         .find("if !may_raise(")
         .expect("单卷决策里没有 may_raise 这一判：白名单算出来了却没人用");
+    // The verb and the resource it is sent to, found by what they say rather
+    // than by how they are laid out: wrapping the call in the guard above
+    // changes the indentation, and a judge that reads the indent would go red
+    // on a decision that still sits in the right place.
     let patch = body
-        .find("\"patch\",\n            \"pvc\",")
+        .match_indices("\"patch\",")
+        .map(|(at, _)| at)
+        .find(|at| {
+            body[*at..]
+                .chars()
+                .take(120)
+                .collect::<String>()
+                .contains("\"pvc\",")
+        })
         .expect("单卷决策里找不到改卷声明的 patch");
     assert!(
         guard < patch,
@@ -474,7 +543,7 @@ fn workloads_that_may_raise(documents: &[serde_yaml::Value]) -> BTreeSet<String>
             .get("roleRef")
             .and_then(|r| r.get("name"))
             .and_then(|n| n.as_str())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         if !writing_roles.contains(role) {
             continue;
         }
@@ -605,7 +674,7 @@ fn the_pod_that_raises_claims_is_given_the_endpoint_the_others_publish_on() {
                     .filter_map(|n| u16::try_from(n).ok())
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         assert!(
             ports.contains(&port),
             "{name} 的地址用的是 {port}，而 Service {service_name} 只提供 {ports:?}"

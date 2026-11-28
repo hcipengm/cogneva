@@ -11,7 +11,7 @@
 # 读那一个 CronJob。名字写死是 RBAC 的硬约束——resourceNames 不接受通配；
 # 改名要连这行一起改，否则表现是「读不到备份 CronJob」，而备份本身一切正常。
 #
-# jobs 只给 get/list/create：删由 Job 自己的 ttlSecondsAfterFinished 做，
+# jobs 只给 get/list/create：Job 的个数由 CronJob 的 history 上限封住，
 # 导出端没有任何理由去删一个正在跑或已经跑完的 Job。
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role

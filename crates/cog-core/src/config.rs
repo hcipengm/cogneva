@@ -46,6 +46,10 @@ pub struct Config {
     pub multi_backend_consumer: MultiBackendConsumerConfig,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    // `bounds` 不在这个类型里，虽然它是一份交付配置的顶层段：这个进程不读它。
+    // 它是「系统给自己设的界」的登记簿，读者是 `crates/cogneva/tests/bounds_registry_test.rs`
+    // ——在那里按文档原样读（`doc.get("bounds")`），不经过一个没人消费的反序列化。
+    // serde 会略过不认识的键，所以文档里那段照样合法。
 }
 
 pub fn redacted(value: &str) -> &str {
@@ -70,9 +74,8 @@ pub struct AppInfo {
     pub name: String,
     pub version: String,
     pub log_level: String,
-    pub data_dir: String,   // see cog_core::paths::DATA_DIR
-    pub config_dir: String, // see cog_core::paths::CONFIG_DIR
-    pub app_dir: String,    // see cog_core::paths::APP_DIR
+    pub data_dir: String, // see cog_core::paths::DATA_DIR
+    pub app_dir: String,  // see cog_core::paths::APP_DIR
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,7 +84,6 @@ pub struct AppInfo {
 pub struct ProviderConfigs {
     pub db: ProviderConfig,
     pub pg: ProviderConfig,
-    pub vector: ProviderConfig,
     pub media: ProviderConfig,
     pub storage: ProviderConfig,
     #[serde(default)]
@@ -134,15 +136,37 @@ pub struct NatsConfig {
     pub stream_retention: String,
 }
 
+/// 一条消息最多投几次：投完就进 DLQ。
+///
+/// 它与 [`NatsConfig::consumer_ack_wait_secs`] 一起决定一条消息在总线上的最长
+/// 存续时间（次数 × 一次 ack 等待）；重投次数不是独立的档位，是「一条消息的
+/// 终局要多久」除以「一次重投等多久」。
+// 删掉它，一次确定性失败会被无限重投（消息永远没有终局）；来源是上面这条除法约定。
+fn nats_max_deliver() -> crate::Bound<i64> {
+    crate::Bound::fixed(
+        5,
+        "一条消息的终局预算 ÷ 一次 ack 等待：超了就只是没进 DLQ 的慢",
+    )
+}
+
+/// 一个消费者同时在途、未 ack 的消息上限。
+// 删掉它在途无界：消费慢下来时积压只在内存里长，看不见也停不住；来源是上面这条速率约定。
+fn nats_max_ack_pending() -> crate::Bound<usize> {
+    crate::Bound::fixed(
+        1024,
+        "一拍处理得完的条数：在途上限小于吃进来的速率，吞吐就卡在这里",
+    )
+}
+
 impl Default for NatsConfig {
     fn default() -> Self {
         Self {
             urls: Vec::new(),
             auth: NatsAuthConfig::default(),
             tls: NatsTlsConfig::default(),
-            consumer_ack_wait_secs: 900,
-            consumer_max_deliver: 5,
-            consumer_max_ack_pending: 1024,
+            consumer_ack_wait_secs: (15 * crate::day::SECONDS_PER_MINUTE) as u64,
+            consumer_max_deliver: nats_max_deliver().get(),
+            consumer_max_ack_pending: nats_max_ack_pending().get(),
             stream_retention: "workqueue".into(),
         }
     }
@@ -176,8 +200,6 @@ impl std::fmt::Debug for NatsAuthConfig {
 pub struct NatsTlsConfig {
     pub enabled: bool,
     pub ca_cert_path: Option<String>,
-    pub client_cert_path: Option<String>,
-    pub client_key_path: Option<String>,
     pub insecure_skip_verify: bool,
 }
 
@@ -195,7 +217,6 @@ pub struct DagExecutorConfig {
     pub workspace_id: String,
     pub consumer_group: String,
     pub max_retries: u32,
-    pub retry_delay_ms: u64,
     #[serde(default = "default_ready_task_poll_interval_secs")]
     pub ready_task_poll_interval_secs: u64,
     /// How often the process holding a task writes a checkpoint of that task's
@@ -255,6 +276,7 @@ pub struct DagExecutorConfig {
     /// weighed against this value; `cog-reflection` holds the pair together
     /// with a gate.
     #[serde(default = "default_archive_after_secs")]
+    #[serde(skip_serializing_if = "is_the_default_archive_after_secs")]
     pub archive_after_secs: u64,
     /// Interval between archive scans (seconds).
     #[serde(default = "default_archive_poll_interval_secs")]
@@ -332,12 +354,14 @@ pub struct DagExecutorConfig {
 /// block per consumer, short enough that a message reaches an idle consumer
 /// promptly. Every consumer holds its own connection, so this is a per-consumer
 /// quiet period, not a shared polling budget.
-// cap: bound — 每个消费者各持一条连接，所以这是每个消费者自己的静默期，不是共享的轮询预算
+// cap: fixed — 每个消费者各持一条连接：静默期是每个消费者自己的，不是共享轮询预算
+// keep: 删了空流会变成忙轮询（每次读立即返回），CPU 随连接数线性上升；由「每消费者一条连接」这条约定兜住
 pub const DEFAULT_REDIS_READ_BLOCK_MS: u64 = 5000;
 
 /// One second: the resume read is a drain, and the entries it is looking for
 /// are already in the stream.
-// cap: bound — 恢复读是一次排空，它要找的条目已经在流里
+// cap: fixed — 恢复读是一次排空，它要找的条目已经在流里
+// keep: 删了恢复读会变成阻塞未知时长的读；由「恢复读是排空」这条约定兜住
 pub const DEFAULT_REDIS_READ_RESUME_BLOCK_MS: u64 = 1000;
 
 fn default_redis_read_block_ms() -> u64 {
@@ -357,13 +381,15 @@ fn default_redis_read_resume_block_ms() -> u64 {
 /// address for **473 s** (measured, recorded as an ignored test beside the code
 /// that overrides it), during which the process reports no progress and looks
 /// wedged rather than degraded.
-// cap: bound — 超了之后进程报不出进展，看起来是卡住而不是降级
+// cap: fixed — 驱动对不可达地址会重试 473s（实测，代码旁有被忽略的测试记着）
+// keep: 删了进程在那 473s 里报不出进展，看起来是卡住而不是降级；由那次实测与「降级要秒级」兜住
 pub const DEFAULT_REDIS_CONNECT_BUDGET_MS: u64 = 2_000;
 
 /// Retries within that budget. Kept low on purpose: the callers that can
 /// tolerate redis being away for a while already retry the whole operation, and
 /// they need the failure to come back to them rather than be absorbed here.
-// cap: bound — 本来就容忍 redis 短暂不在的调用方会重试整个操作；它们需要失败回到自己手上而不是被这里吞掉
+// cap: fixed — 容忍 redis 短暂不在的调用方会重试整个操作：失败要回到它们手上
+// keep: 删了失败会在连接层被更久地吞掉，调用方拿不到自己的失败；由这条重试约定兜住
 pub const DEFAULT_REDIS_CONNECT_RETRIES: usize = 2;
 
 /// How long one command on an established connection may wait for its reply.
@@ -374,16 +400,21 @@ pub const DEFAULT_REDIS_CONNECT_RETRIES: usize = 2;
 /// explicitly. Left unset, the wait is the kernel's, which is measured in
 /// minutes (ten minutes of silence on 2026-10-22, with nothing counted as a
 /// refusal because a hung read is not a refused one).
-// cap: bound — 2026-10-22 实测十分钟无声且没被记成一次拒绝，因为挂住的读不是被拒的读
+// cap: fixed — 2026-10-22 实测：挂住的读十分钟无声且不会被记成拒绝，因为挂住的读不是被拒的读
+// keep: 删了挂住的读无限等且读面上无声；由那次实测兜住
+// wall: 等=Redis 对一条命令的应答 / 等不到=这次读以超时失败并被记成一次失败（不是一次拒绝：挂住的读不是被拒的读），调用方拿到错误 / 续跑=能，重来是一次新的命令
 pub const DEFAULT_REDIS_RESPONSE_TIMEOUT_MS: u64 = 30_000;
 
 /// A budget below this would turn a momentary refusal into a permanent error.
-// cap: bound — 比它更小的预算会把一次瞬时拒绝变成永久错误
+// cap: fixed — 比它更小的预算把一次瞬时拒绝变成永久错误
+// keep: 删了下界，瞬时拒绝会被读成永久错误；由连接预算的下界约定兜住
 pub const MIN_REDIS_CONNECT_BUDGET_MS: u64 = 100;
 
 /// A response timeout below this is not a bound, it is a race against the round
 /// trip.
-// cap: bound — 比它更小的应答超时不是界，是跟一个往返赛跑
+// cap: fixed — 比它更小的应答超时不是界，是跟一个往返赛跑
+// keep: 删掉后应答超时可以被配得比一次往返还小，每个请求都在跟往返赛跑；由「比这更小的不是界」兜住
+// wall: 等=一次 Redis 往返的下限，用来挡住配成更小的值 / 等不到=不适用：这个数本身不会被等，它是别人被等多久的下限 / 续跑=不适用
 pub const MIN_REDIS_RESPONSE_TIMEOUT_MS: u64 = 100;
 
 /// How long a redis connection attempt may take, how many times it is retried,
@@ -475,7 +506,8 @@ impl RedisConnectBudget {
 /// judges it gone. Shorter values make a live process lose its own tasks to a
 /// slow tick; much longer ones put the orphan window back within reach of the
 /// replacement cadence this exists to stay ahead of.
-// cap: bound — 一拍慢是秒级；再长就把孤儿窗口推回到这个数要甩开的那个替换节拍里
+// cap: fixed — 一拍慢是秒级；再长就把孤儿窗口推回到这个数要甩开的那个替换节拍里
+// keep: 删掉后孤儿窗口落进替换节拍里，租约还没到期就被当孤儿回收；由「一拍慢是秒级」兜住
 pub const DEFAULT_TASK_LEASE_SECS: u64 = 120;
 
 fn default_task_lease_secs() -> u64 {
@@ -492,8 +524,17 @@ fn default_task_lease_secs() -> u64 {
 /// keep compiling when one is edited, and the pair would then disagree by
 /// exactly the amount that makes the publisher publish a duplicate while the
 /// sweeper is still about to deliver the first copy.
-// cap: bound — 取的就是那个量：再多一点，发布方会在清扫者送出第一份之前先发布一份重复
+// cap: fixed — 取的就是那个量：再多一点，发布方会在清扫者送出第一份之前先发布一份重复
+// keep: 删掉后发布方在清扫者送出第一份之前先发布一份重复；由「取的就是那个量」兜住
 pub const DEFAULT_READY_CLAIM_IDLE_SECS: u64 = 600;
+
+/// 一个任务节点失败后重试几次（重试矩阵里 DagNode 那一行的次数）。
+///
+/// 它是一条退避阶梯的长度：每次等待由矩阵给出，次数由「一条任务的总预算 ÷
+/// 一次等待」定，不是可以单拍的档位。
+// cap: fixed — 由一条任务的总预算 ÷ 一次退避等待定：次数多到超预算，等于把失败拖长
+// keep: 删掉后重试没有次数界，超预算的失败被拉长成无限退避；由「总预算 ÷ 一次退避等待」兜住
+const DAG_NODE_MAX_RETRIES: u32 = 3;
 
 impl Default for DagExecutorConfig {
     fn default() -> Self {
@@ -503,8 +544,7 @@ impl Default for DagExecutorConfig {
             nats_url: None,
             workspace_id: String::new(),
             consumer_group: String::new(),
-            max_retries: 3,
-            retry_delay_ms: 1000,
+            max_retries: DAG_NODE_MAX_RETRIES,
             ready_task_poll_interval_secs: default_ready_task_poll_interval_secs(),
             task_checkpoint_interval_secs: default_task_checkpoint_interval_secs(),
             scheduled_task_stall_secs: default_scheduled_task_stall_secs(),
@@ -530,6 +570,19 @@ impl Default for DagExecutorConfig {
     }
 }
 
+impl DagExecutorConfig {
+    /// Effective ready-task poll interval; never zero. Zero used to be read as
+    /// "poll without waiting" and got clamped to one second by the read site,
+    /// which is a busy loop wearing a knob's name.
+    pub fn effective_ready_task_poll_interval_secs(&self) -> u64 {
+        if self.ready_task_poll_interval_secs == 0 {
+            DEFAULT_READY_TASK_POLL_INTERVAL_SECS
+        } else {
+            self.ready_task_poll_interval_secs
+        }
+    }
+}
+
 /// Per-platform webhook configuration (DingTalk / Feishu / WeChat Work).
 ///
 /// **只有地址。** 曾经这里还有一个 `secret`，用来自算机器人报文的签名——那条路
@@ -547,7 +600,8 @@ pub struct PlatformWebhookConfig {
 /// Built-in access-token TTL when the config leaves it at 0. Both the JWT
 /// manager (cog-auth) and the HTTP handlers (expires_in responses) derive
 /// from this so the two never drift apart.
-// cap: bound — 认证管理器（cog-auth）与 HTTP 处理器（expires_in）都从这里派生，两处才不会走散
+// cap: fixed — 认证管理器（cog-auth）与 HTTP 处理器（expires_in）都从这里派生，两处才不会走散
+// keep: 删掉后回到「认证管理器（cog-auth）与 HTTP 处理器（expires_in）都从这里派生，两处才不会走散」所描述的情形；由这条约定兜住
 pub const DEFAULT_ACCESS_TOKEN_TTL_MINUTES: u64 = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -577,16 +631,26 @@ pub struct GatewayConfig {
     /// production uses the bootstrap admin password or a real user store.
     #[serde(default)]
     pub demo_login_enabled: bool,
+    /// WebSocket 心跳间隔。0 ＝ 没写，取
+    /// [`DEFAULT_WEBSOCKET_HEARTBEAT_SECS`]（读侧走
+    /// [`GatewayConfig::effective_websocket_heartbeat_secs`]）。
     #[serde(default = "default_websocket_timeout_secs")]
     pub websocket_timeout_secs: u64,
+    /// 客户端多久不发消息就断开。0 ＝ 没写，取心跳的
+    /// [`WEBSOCKET_BEATS_BEFORE_DROPPING`] 倍（读侧走
+    /// [`GatewayConfig::effective_websocket_inactivity_timeout_secs`]）。
     #[serde(default = "default_websocket_inactivity_timeout_secs")]
     pub websocket_inactivity_timeout_secs: u64,
-    #[serde(default = "default_websocket_tick_secs")]
-    pub websocket_tick_secs: u64,
+    /// 通知列表的默认页大小。0 ＝ 没写，取列表面共用的
+    /// [`A2A_LIST_PAGE_SIZE`]。
     #[serde(default = "default_notification_limit")]
     pub notification_limit: u32,
-    #[serde(default = "default_sandbox_task_timeout_secs")]
-    pub sandbox_task_timeout_secs: u64,
+    /// 一次 HTTP 请求的应答期限。
+    ///
+    /// 0 ＝ 没写，取本次停机的排空时长（`system.shutdown_timeout_ms`，
+    /// 由 [`GatewayConfig::effective_request_timeout_secs`] 读进来）：排空愿意为
+    /// 一条在飞请求等多久，请求自己就可以占这条连接多久。这个数没有内置常数——
+    /// 它要么由部署给，要么跟着排空走。
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
     /// How often the contribution OAuth refresher wakes up. 0 = built-in
@@ -645,45 +709,135 @@ impl GatewayConfig {
             self.contribution_oauth_refresh_threshold_secs
         }
     }
+
+    /// Effective WebSocket heartbeat; never zero. Zero is not "no heartbeat":
+    /// `tokio::time::interval` panics on a zero period, so a connection would
+    /// die on connect instead of staying alive.
+    pub fn effective_websocket_heartbeat_secs(&self) -> u64 {
+        if self.websocket_timeout_secs == 0 {
+            DEFAULT_WEBSOCKET_HEARTBEAT_SECS
+        } else {
+            self.websocket_timeout_secs
+        }
+    }
+
+    /// Effective client inactivity timeout; never zero. Zero would disconnect
+    /// every client the moment it connects.
+    ///
+    /// 没写时不是取一个常数，而是跟着**这次生效的心跳**走：三拍。心跳被部署改了，
+    /// 掉线期限跟着改，两处不会各说各的。
+    pub fn effective_websocket_inactivity_timeout_secs(&self) -> u64 {
+        if self.websocket_inactivity_timeout_secs == 0 {
+            self.effective_websocket_heartbeat_secs() * WEBSOCKET_BEATS_BEFORE_DROPPING
+        } else {
+            self.websocket_inactivity_timeout_secs
+        }
+    }
+
+    /// Effective notification page size; never zero. Zero would make every
+    /// list response empty, which reads as "you have no notifications".
+    pub fn effective_notification_limit(&self) -> u32 {
+        if self.notification_limit == 0 {
+            A2A_LIST_PAGE_SIZE
+        } else {
+            self.notification_limit
+        }
+    }
+
+    /// Effective per-request answer deadline; never zero. Zero would build a
+    /// zero-second timeout and answer every request with 408 immediately.
+    ///
+    /// 没写时取这次停机的排空时长（`system.shutdown_timeout_ms`）：排空愿意为一条
+    /// 在飞请求等多久，请求自己就可以占这条连接多久。排空不是常数而是一个配置项，
+    /// 所以这里要读它，而不是回落到一个写死的数。
+    pub fn effective_request_timeout_secs(&self, shutdown_timeout_ms: u64) -> u64 {
+        if self.request_timeout_secs == 0 {
+            (shutdown_timeout_ms / 1000).max(1)
+        } else {
+            self.request_timeout_secs
+        }
+    }
 }
 
 /// Hourly wake-up. The access token lives 24h, so an hourly check leaves room
 /// for several failed attempts before the token actually lapses.
-// cap: bound — 访问令牌活 24h，每小时查一次留出几次失败尝试的余量
+// cap: fixed — 访问令牌活 24h，每小时查一次留出几次失败尝试的余量
+// keep: 删掉后令牌到期前没有几次失败尝试的余量，一次刷新失败就落到过期；由「令牌活 24h、每小时查一次」兜住
 pub const DEFAULT_CONTRIBUTION_OAUTH_REFRESH_INTERVAL_SECS: u64 = 3600;
 /// Renew once under 4h of lifetime remain: enough for the token exchange, the
 /// Secret patch and the gateway roll to all land before expiry.
-// cap: bound — 剩不到 4h 就换：够令牌交换、Secret 改写与网关滚动都在到期前落完
+// cap: fixed — 剩不到 4h 就换：够令牌交换、Secret 改写与网关滚动都在到期前落完
+// keep: 删掉后等到令牌快过期才换，交换、Secret 改写与网关滚动来不及在到期前落完；由「剩不到 4h 就换」兜住
 pub const DEFAULT_CONTRIBUTION_OAUTH_REFRESH_THRESHOLD_SECS: u64 = 4 * 3600;
 
+/// WebSocket 心跳间隔：半开连接靠自己发现不了，一次 ping 让对端在下一次心跳里
+/// 暴露自己已经走了。
+///
+/// 控制台的 `EventStreamClient.HEARTBEAT_INTERVAL_MS`（`web/src/transport/websocket.ts`）
+/// 是同一个拍子：同一条 socket 的两端，一边换了拍另一边要跟着换，
+/// `the_console_and_the_gateway_beat_at_one_cadence` 判这处一致。
+// cap: fixed — 控制台的 `HEARTBEAT_INTERVAL_MS = 30000`：同一条 socket 的两端共用一个拍子
+// keep: 删掉后回到「控制台的 `HEARTBEAT_INTERVAL_MS = 30000`：同一条 socket 的两端共用一个拍子」所描述的情形；由这条约定兜住
+pub const DEFAULT_WEBSOCKET_HEARTBEAT_SECS: u64 = 30;
+
+/// 一条连接连丢几拍心跳才算死。
+///
+/// 这是两端约定本身，不是界：不活跃期限 = 心跳 × 它。必须是 3 而不是 1——一次
+/// 抖动的丢包不该踢掉一个活着的人；也不能再大，控制台自己 2 拍 ＋ 5 秒就放弃并
+/// 重连了，服务端排在它后面才轮得到客户端先发现掉线。
+// cap: fixed — 心跳约定：连续丢三拍才断（一次抖动不算离线）
+// keep: 删掉后一次心跳抖动就把连接断掉，读者被重连与补发拖一轮；由「连续丢三拍才断」兜住
+pub const WEBSOCKET_BEATS_BEFORE_DROPPING: u64 = 3;
+
+/// 列表端点的默认页大小：一屏滚动能读完的量，其余由游标翻页。
+///
+/// 数出自 A2A 规范对 `page_size` 的说明——不写就按 50（见
+/// `crates/cog-gateway/src/a2a.rs` 的 `LIST_PAGE_DEFAULT`，它读的就是这里）。
+/// 治理面的 `REFUSED_PAGE` / `TIMELINE_PAGE` 也是这一屏：通知、拒绝、时间线
+/// 各写一个 50 只会让「一屏」在几个面上慢慢走散。
+// cap: fixed — A2A 规范对 `page_size` 的默认值：不写就按 50，本仓列表面都按这一屏取
+// not-a-bound: A2A 规范对 `page_size` 的默认值：不写就按 50，本仓列表面都按这一屏取
+pub const A2A_LIST_PAGE_SIZE: u32 = 50;
+
+/// 就绪任务的轮询节拍：任务就绪后最多等一拍被发现。
+///
+/// 取的是消费者的阻塞读预算：等待就绪任务的 executor 以
+/// `redis_read_block_ms` 阻塞读一次，拍长等于它，一条新就绪的任务最多等到
+/// 下一次读超时；再长，下一次读超时之后还要再等一拍才有人回来。
+// cap: fixed — 一拍＝一个消费者阻塞读预算（`DEFAULT_REDIS_READ_BLOCK_MS`），两处不各走各的
+// keep: 删掉后回到「一拍＝一个消费者阻塞读预算（`DEFAULT_REDIS_READ_BLOCK_MS`），两处不各走各的」所描述的情形；由这条约定兜住
+pub const DEFAULT_READY_TASK_POLL_INTERVAL_SECS: u64 = DEFAULT_REDIS_READ_BLOCK_MS / 1000;
+
 fn default_websocket_timeout_secs() -> u64 {
-    0
+    DEFAULT_WEBSOCKET_HEARTBEAT_SECS
 }
+// cap: fixed — 0 是「没写」的哨兵，不是界；生效值＝心跳×3（`WEBSOCKET_BEATS_BEFORE_DROPPING`）
+// not-a-bound: 0 是「没写」的哨兵，不是界；生效值＝心跳×3（`WEBSOCKET_BEATS_BEFORE_DROPPING`）
 fn default_websocket_inactivity_timeout_secs() -> u64 {
     0
 }
-fn default_websocket_tick_secs() -> u64 {
-    0
-}
+// cap: fixed — 0 是「没写」的哨兵，不是界；生效值＝列表面共用的 `A2A_LIST_PAGE_SIZE`
+// not-a-bound: 0 是「没写」的哨兵，不是界；生效值＝列表面共用的 `A2A_LIST_PAGE_SIZE`
 fn default_notification_limit() -> u32 {
     0
 }
-fn default_sandbox_task_timeout_secs() -> u64 {
-    0
-}
+// cap: fixed — 0 是「没写」的哨兵，不是界；生效值＝本次停机的排空时长
+// not-a-bound: 0 是「没写」的哨兵，不是界；生效值＝本次停机的排空时长
 fn default_request_timeout_secs() -> u64 {
     0
 }
 fn default_ready_task_poll_interval_secs() -> u64 {
-    0
+    DEFAULT_READY_TASK_POLL_INTERVAL_SECS
 }
 /// 检查点节拍：进度最多丢这么久。
 ///
 /// 取值不是拍脑袋的：它是「一次检查点的开销」与「可接受的重跑时长」之间的
 /// 取舍，而重跑的上界由任务自己的预算决定——30s 意味着一次换版最多让每个在跑
 /// 任务白跑半分钟，代价小于更密的快照对 agent 命令通道的占用。
+// cap: fixed — 一拍＝一个消费者阻塞读预算（`DEFAULT_READY_CLAIM_IDLE_SECS`）：一次检查点最多让重跑等一拍
+// keep: 删掉后回到「一拍＝一个消费者阻塞读预算（`DEFAULT_READY_CLAIM_IDLE_SECS`）：一次检查点最多让重跑等一拍」所描述的情形；由这条约定兜住
 fn default_task_checkpoint_interval_secs() -> u64 {
-    30
+    (crate::day::SECONDS_PER_MINUTE / 2) as u64
 }
 fn default_scheduled_task_stall_secs() -> u64 {
     DEFAULT_READY_CLAIM_IDLE_SECS
@@ -691,44 +845,73 @@ fn default_scheduled_task_stall_secs() -> u64 {
 fn default_batch_persistence_enabled() -> bool {
     false
 }
+// cap: fixed — 0 是「没有分批」的哨兵（分批持久化默认关闭），不是界
+// not-a-bound: 0 是「没有分批」的哨兵（分批持久化默认关闭），不是界
 fn default_batch_persistence_max_changes() -> u32 {
     0
 }
+// cap: fixed — 0 是「没有分批」的哨兵（分批持久化默认关闭），不是界
+// not-a-bound: 0 是「没有分批」的哨兵（分批持久化默认关闭），不是界
 fn default_batch_persistence_interval_secs() -> u64 {
     0
 }
 fn default_archive_enabled() -> bool {
     false
 }
+// cap: fixed — 归档默认关闭；这个数只在部署显式开启归档后生效，是那次开启自己的声明
+// keep: 删掉后开启归档的部署没有年龄线，归档要么立刻发生要么永不发生；由「开启归档自己的声明」兜住
 fn default_archive_after_secs() -> u64 {
-    172_800
+    // 两天：按「几天的秒数」写，读的人不必把这串数字除以 86400。
+    2 * crate::day::SECONDS_PER_DAY as u64
 }
+// cap: fixed — 与归档年龄同一档：每天走一遍就够，不是一条要实时响应的界
+// keep: 删掉后归档没有走一遍的节拍，部署开启归档后不知道隔多久再走；由「与归档年龄同一档」兜住
 fn default_archive_poll_interval_secs() -> u64 {
-    300
+    (5 * crate::day::SECONDS_PER_MINUTE) as u64
 }
+// 两遍：一次拆不出原子任务，可能是提供方在那一刻抽出了一个坏结果；两遍都空，
+// 说明这个目标本身拆不出可执行的任务，再试只是把同一个坏提示词反复送去烧 token。
+// cap: fixed — 两遍：一次是抽样，两遍还空是目标真拆不出来
+// keep: 删掉后拆解没有次数界，目标拆不出来时一遍遍重拆；由「一次是抽样、两遍还空是真拆不出来」兜住
+const DECOMPOSITION_MAX_ATTEMPTS: u32 = 2;
+
 fn default_decomposition_max_attempts() -> u32 {
-    2
+    DECOMPOSITION_MAX_ATTEMPTS
 }
 fn default_decomposition_orphan_watch_enabled() -> bool {
     true
 }
+// cap: fixed — 五拍：一拍＝`DEFAULT_READY_CLAIM_IDLE_SECS`，孤儿是「连续五拍没人续租」才开始看
+// keep: 删掉后回到「五拍：一拍＝`DEFAULT_READY_CLAIM_IDLE_SECS`，孤儿是「连续五拍没人续租」才开始看」所描述的情形；由这条约定兜住
 fn default_decomposition_orphan_poll_interval_secs() -> u64 {
-    300
+    (5 * crate::day::SECONDS_PER_MINUTE) as u64
 }
+// cap: fixed — 三百拍：五拍一扫、扫到六十次都没人续租才算停住
+// keep: 删掉后没有人续租的节点没有停住的时刻，孤儿永远不算停；由「五拍一扫、六十次都没人续租」兜住
 fn default_decomposition_orphan_stall_after_secs() -> u64 {
-    1800
+    // 半小时。
+    crate::day::SECONDS_PER_HOUR as u64 / 2
 }
+// cap: fixed — 一百二十拍：停住之后再看两分钟，避免一次抖动就报警
+// keep: 删掉后停住之后立刻报警，一次抖动就被读成事故；由「停住之后再看两分钟」兜住
 fn default_decomposition_orphan_alert_dwell_secs() -> u64 {
-    600
+    (10 * crate::day::SECONDS_PER_MINUTE) as u64
 }
 fn default_result_claim_idle_secs() -> u64 {
-    600
+    // 与就绪流的清扫窗口同一个数：发布方的停止阈值与清扫者的认领阈值是同一条。
+    DEFAULT_READY_CLAIM_IDLE_SECS
 }
 fn default_result_claim_interval_secs() -> u64 {
-    60
+    crate::day::SECONDS_PER_MINUTE as u64
 }
+// 一拍认领十六条：认领与状态迁移在同一条语句里，这个量既能让一次进程死亡留下的
+// 积压在一两个扫描周期内清掉，又不至于让一次扫描把事务拖成一把长锁。
+// cap: fixed — 十六条：一拍清得掉一次进程死亡留下的积压，又不拖成长事务
+// keep: 删掉后一拍要么清不掉一次进程死亡的积压，要么拖成长事务；由「十六条」兜住
+const RESULT_CLAIM_BATCH: usize = 16;
+
 fn default_result_claim_batch() -> usize {
-    16
+    RESULT_CLAIM_BATCH
 }
 
 /// Configuration for the Hot/Warm/Cold tier migrator.
@@ -759,20 +942,51 @@ pub struct TierMigratorConfig {
 /// migrator would demote everything to cold. A section omitted from the config
 /// file must behave like the one that ships, so a config typo cannot turn into
 /// an unbounded migration.
+/// trace 层一次冷迁多少行：一拍的搬运量要在一拍的时限内走完。
+// cap: fixed — 由一拍搬得动的行数定：批大过一拍搬得动，扫描就积压
+// keep: 删掉后批大过一拍搬得动的行数，扫描自己积压；由「一拍搬得动的行数」兜住
+const TRACE_SCAN_BATCH: u64 = 5_000;
+
 impl Default for TierMigratorConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            hot_duration_secs: 86_400,
-            warm_duration_secs: 604_800,
-            warm_compression_level: 3,
-            cold_compression_level: 9,
-            scan_interval_secs: 3_600,
+            // 三层保留是三个时间长度，不是三个数：各写一个秒数只会让「热一天」
+            // 这个说法在几处慢慢走散。
+            hot_duration_secs: crate::day::SECONDS_PER_DAY as u64,
+            warm_duration_secs: crate::day::SECONDS_PER_WEEK as u64,
+            warm_compression_level: crate::contract::storage::COMPRESSION_LEVEL_WARM,
+            cold_compression_level: crate::contract::storage::COMPRESSION_LEVEL_COLD,
+            scan_interval_secs: crate::day::SECONDS_PER_HOUR as u64,
             cold_key_prefix: "raw".into(),
-            trace_scan_batch: 5_000,
+            trace_scan_batch: TRACE_SCAN_BATCH,
         }
     }
 }
+
+/// 名册上一条 agent 记录活多久。
+///
+/// 这不是本仓挑的数：Redis / etcd 的 agent 注册默认 TTL 就是 30 秒，监督者判
+/// 「它还在不在」用的也是这同一条——两边各走各的，就会出现「监督者眼里死了、
+/// agent 自己还觉得自己活着」。交付文档的 `agent.registration_ttl_secs` 写的就是它。
+// cap: fixed — Redis / etcd 的 agent 注册默认 TTL：监督者与 agent 自己必须用同一条
+// keep: 删掉后监督者与 agent 各自定 TTL，注册在对方眼里提前消失；由「两侧必须用同一条」兜住
+pub const AGENT_REGISTRATION_TTL_SECS: u64 = 30;
+
+/// 一条注册记录要活过几拍心跳。
+///
+/// 一拍丢包是常态，不该把一个活着的员工判死；连丢三拍才说明它真走了。心跳因此
+/// 不是自己挑的数，而是 TTL ÷ 它。
+// cap: fixed — 三拍：一次抖动丢一拍不算离线，连丢三拍才算
+// keep: 删掉后一次抖动丢一拍就算离线，agent 被反复判死；由「连丢三拍才算」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+pub const BEATS_PER_REGISTRATION_TTL: u64 = 3;
+
+/// 心跳间隔：worker 向名册续约的拍子。
+///
+/// 由 TTL 与拍数算出来，不单独声明：改 TTL 或改拍数，它跟着变。
+pub const AGENT_HEARTBEAT_INTERVAL_SECS: u64 =
+    AGENT_REGISTRATION_TTL_SECS / BEATS_PER_REGISTRATION_TTL;
 
 /// Agent registration and heartbeat configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -799,21 +1013,25 @@ pub struct AgentConfig {
 #[serde(default)]
 pub struct MetricsConfig {
     pub enabled: bool,
-    pub endpoint: String,
-    /// Ceiling on rows held in the metrics sample log. `0` prunes nothing.
+    /// The capacity this deployment **declares** for the metrics sample log,
+    /// in rows. `0` declares none.
     ///
-    /// The sample log is append-only: one row per observation. What bounds it
-    /// is how much it holds, not how old its rows are — a time window answers
-    /// neither question, since traffic can put any number of rows inside any
-    /// window. The sweep deletes oldest-first until the log is under this, and
-    /// stops at the newest row of each series, which every reader reaches the
-    /// log through and which therefore may never be deleted.
+    /// It is a statement, not a mechanism: the log is measured every minute and
+    /// the measurement is published (`rows`, this capacity, the bytes on disk,
+    /// and whether the first exceeds the second), but nothing deletes from the
+    /// table on account of it. A reading that deletes what it measures cannot
+    /// be read as a reading — by the time anybody sees the number it has
+    /// already been acted on, and the rows behind it are gone with nothing but
+    /// an inference to say they were there.
     ///
-    /// The default covers a full day at the observed observation rate with
-    /// room to spare. There is no matching "keep for N seconds" knob on
-    /// purpose: how a busy deployment and a quiet one spend the same budget is
-    /// exactly what should differ between them, and a duration would force
-    /// them to trim at the same rate instead.
+    /// So "over capacity" is a decision point rather than a fault: raise the
+    /// declaration if the log is doing its job, change how the series that
+    /// grew it is recorded, or stop declaring a capacity at all. Declaring
+    /// nothing (`0`) is different from declaring zero and the readings keep
+    /// them apart — the first publishes no capacity and no verdict, the second
+    /// would claim every row is over a limit nobody asked for.
+    ///
+    /// The default covers about ten days at the observed observation rate.
     pub sample_max_rows: u64,
     /// An optional narrowing of what the `/metrics` scrape asks for.
     ///
@@ -835,16 +1053,74 @@ pub struct MetricsConfig {
     pub scrape_dimensions: Vec<String>,
 }
 
+/// 每次抓取最多返回多少行样本：抓取体的大小上限。
+// cap: fixed — 由抓取间隔 × 序列产生速率定：超过它就是一次抓取扛不完的量
+// keep: 删掉后一次抓取可以要求搬任意多行，抓取自己扛不完；由「抓取间隔 × 序列产生速率」兜住
+const METRICS_SAMPLE_MAX_ROWS: u64 = 500_000;
+
 impl Default for MetricsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            endpoint: "/metrics".into(),
-            sample_max_rows: 500_000,
+            sample_max_rows: METRICS_SAMPLE_MAX_ROWS,
             scrape_dimensions: Vec::new(),
         }
     }
 }
+
+/// 监督者巡检心跳活性的节拍。
+///
+/// 判据（可疑、死亡）都是秒级的，巡检必须比它们密，否则判据被巡检自己拖粗——判据
+/// 说「两拍没心跳就算可疑」，而巡检十秒才看一次，实际发现它的时刻就晚了一拍。
+// cap: fixed — 与判据的拍子同量级：巡检比判据疏，判据就被巡检拖粗
+// keep: 删掉后巡检比判据疏，判据被巡检拖粗；由「与判据的拍子同量级」兜住
+pub const SUPERVISOR_HEALTH_INTERVAL_SECS: u64 = 10;
+
+/// 配额巡检的节拍。
+///
+/// 配额是按分钟结算的额度，一拍一分钟就够；更密只是把同一批计数再读一遍。
+// cap: fixed — 配额按分钟结算：一拍一分钟，更密只是重复读同一批计数
+// keep: 删掉后配额按更密的拍结算，只是重复读同一批计数；由「配额按分钟结算」兜住
+pub const SUPERVISOR_QUOTA_INTERVAL_SECS: u64 = 60;
+
+/// 任务再平衡的节拍。
+///
+/// 再平衡会挪动在跑的任务，代价远高于一次巡检；五分钟一拍让舰队形状稳定下来，
+/// 而不是跟着一次抖动来回搬。
+// cap: fixed — 再平衡挪的是在跑的任务：五分钟一拍让形状稳定，不跟着一次抖动来回搬
+// keep: 删掉后再平衡跟着一次抖动来回搬在跑的任务；由「五分钟一拍让形状稳定」兜住
+pub const SUPERVISOR_REBALANCE_INTERVAL_SECS: u64 = 300;
+
+/// 告警去重与突发判定看的事件窗口。
+///
+/// 要长到能盖住一次真实的故障脉冲，短到不会把两次独立故障并成一条。
+// cap: fixed — 要盖住一次真实故障脉冲，又不把两次独立故障并成一条
+// keep: 删掉后窗口把两次独立故障并成一条，或盖不住一次脉冲；由「盖住一次脉冲又不并成一条」兜住
+pub const SUPERVISOR_EVENT_WINDOW_SECS: u64 = 30;
+
+/// 控制面巡检的节拍。
+///
+/// 控制面是可选的外部依赖，读它要一次网络往返；够密才发现它不在了，又不至于让
+/// 监控面变成对它的压力源。
+// cap: fixed — 外部依赖的一次网络往返：够密才发现它不在了，又不把监控变成压力
+// keep: 删掉后外部依赖不在了要更久才发现，或监控变成压力；由「一次网络往返的节奏」兜住
+pub const SUPERVISOR_CONTROL_PLANE_INTERVAL_SECS: u64 = 30;
+
+/// 监督者向订阅方广播事件的通道深度。
+///
+/// 一个巡检周期里可能同时到达的判决条数：通道比它浅，生产方会在两次巡检之间溢出，
+/// 而溢出的那几条判决没有第二个读者能补回来。
+// cap: fixed — 一个巡检周期内同时到达的判决条数：浅了就会在两次巡检之间溢出
+// keep: 删掉后两次巡检之间到达的判决溢出，读数丢条；由「一个巡检周期内同时到达的条数」兜住
+pub const SUPERVISOR_BROADCAST_DEPTH: usize = 256;
+
+/// 配额低于它时暂停调度：剩不到这么多 token 就不该再接新任务。
+///
+/// 一千是一轮 LLM 调用装得下的量级：余量比它还少，下一步派出去的任务只会开个头就
+/// 撞上限，而撞限失败比排队更贵——一次调用已经花掉的 token 收不回来。
+// cap: fixed — 一轮调用的量级：余量比它少时新任务只会开个头就撞上限
+// keep: 删掉后余量比一轮调用还少时照样开新任务，它只开个头就撞上限；由「一轮调用的量级」兜住
+pub const SUPERVISOR_QUOTA_PAUSE_REMAINING_TOKENS: u64 = 1_000;
 
 /// Supervisor sub-system intervals and thresholds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -872,38 +1148,93 @@ pub struct SupervisorConfig {
 impl Default for SupervisorConfig {
     fn default() -> Self {
         Self {
-            health_interval_secs: 10,
-            quota_interval_secs: 60,
-            rebalance_interval_secs: 300,
-            event_window_secs: 30,
-            broadcast_capacity: 256,
-            quota_threshold: 1_000,
+            health_interval_secs: SUPERVISOR_HEALTH_INTERVAL_SECS,
+            quota_interval_secs: SUPERVISOR_QUOTA_INTERVAL_SECS,
+            rebalance_interval_secs: SUPERVISOR_REBALANCE_INTERVAL_SECS,
+            event_window_secs: SUPERVISOR_EVENT_WINDOW_SECS,
+            broadcast_capacity: SUPERVISOR_BROADCAST_DEPTH,
+            quota_threshold: SUPERVISOR_QUOTA_PAUSE_REMAINING_TOKENS,
             health_checker: HealthCheckerConfig::default(),
             task_rebalancer: TaskRebalancerConfig::default(),
-            behavior_history_max: 20,
-            heartbeat_history_max: 1_000,
-            alert_history_max: 10_000,
-            control_plane_interval_secs: 30,
+            // 三个保留深度没有内置默认：0 ＝ 没写，由持有这些环的那一层换回
+            // 它自己的常量（`BehaviorMonitor::DEFAULT_MAX_HISTORY` 等）。
+            // cap: fixed — 0 ＝ 没写，由这个环的持有一层换回它自己的常量
+            // keep: 删掉后这个 0 表示「没写」的语义消失，持有层把它读成「保留深度为零」；由「0 由持有一层换回自己的常量」兜住
+            behavior_history_max: 0,
+            // cap: fixed — 同上：0 ＝ 没写，不是保留深度为零
+            // keep: 删掉后 0 被读成保留深度为零，心跳历史被关掉；由「0 ＝ 没写」兜住
+            heartbeat_history_max: 0,
+            // cap: fixed — 同上
+            // keep: 删掉后 0 被读成保留深度为零，告警历史被关掉；由「0 ＝ 没写」兜住
+            alert_history_max: 0,
+            control_plane_interval_secs: SUPERVISOR_CONTROL_PLANE_INTERVAL_SECS,
             control_plane_url: None,
         }
     }
 }
 
+/// 多久没心跳算可疑：连丢两拍。
+///
+/// 一拍抖动是常态；第二拍也没来，才值得看一眼。
+// cap: fixed — 心跳的两倍：一拍丢包不算异常，连着两拍没声才值得看一眼
+// keep: 删掉后一拍丢包就被读成可疑，正常心跳抖动进入告警；由「连着两拍没声才值得看一眼」兜住
+pub const SUSPECT_BEATS: u64 = 2;
+
+/// 多久没心跳算死亡：连丢六拍。
+///
+/// 可疑之后还接着丢四拍，一条还活着的进程不会这样；两档之间分开的是「网络抖动」
+/// 与「进程真没了」。
+// cap: fixed — 心跳的六倍：可疑之后还丢四拍，一条活着的进程不会这样
+// keep: 删掉后可疑之后丢四拍就判死，一条活着的慢进程被回收；由「心跳的六倍」兜住
+pub const DEAD_BEATS: u64 = 6;
+
+/// 多久没有进展算卡住：死亡期限的十倍。
+///
+/// 一次长任务（构建、一轮评测）可以十分钟没有可见输出；判据比它短会误报，比它
+/// 长则卡住的 agent 白占一个槽。
+// cap: fixed — 死亡期限的十倍：长任务十分钟不出声是常态，比这更短就是误报
+// keep: 删掉后长任务十分钟不出声被读成卡住，正常的沉默被回收；由「长任务十分钟不出声是常态」兜住
+pub const STUCK_AFTER_DEATHS: u64 = 10;
+
 /// Health-checker timing thresholds.
+///
+/// 三个数都是 0 ＝ 没写：它们没有自己的值，读的是**这次生效的心跳**（见
+/// [`Self::effective_suspect_after_secs`] 等）。一个部署改心跳而判据不跟着改，
+/// 判据就会在一个不存在的拍子上打分。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct HealthCheckerConfig {
     pub suspect_after_secs: u64,
     pub dead_after_secs: u64,
     pub stuck_after_secs: u64,
 }
 
-impl Default for HealthCheckerConfig {
-    fn default() -> Self {
-        Self {
-            suspect_after_secs: 15,
-            dead_after_secs: 60,
-            stuck_after_secs: 600,
+impl HealthCheckerConfig {
+    /// 可疑：连丢 [`SUSPECT_BEATS`] 拍心跳。
+    pub fn effective_suspect_after_secs(&self, heartbeat_secs: u64) -> u64 {
+        if self.suspect_after_secs == 0 {
+            heartbeat_secs * SUSPECT_BEATS
+        } else {
+            self.suspect_after_secs
+        }
+    }
+
+    /// 死亡：连丢 [`DEAD_BEATS`] 拍心跳。
+    pub fn effective_dead_after_secs(&self, heartbeat_secs: u64) -> u64 {
+        if self.dead_after_secs == 0 {
+            heartbeat_secs * DEAD_BEATS
+        } else {
+            self.dead_after_secs
+        }
+    }
+
+    /// 卡住：没有进展达到死亡期限的 [`STUCK_AFTER_DEATHS`] 倍。
+    pub fn effective_stuck_after_secs(&self, heartbeat_secs: u64) -> u64 {
+        if self.stuck_after_secs == 0 {
+            self.effective_dead_after_secs(heartbeat_secs) * STUCK_AFTER_DEATHS
+        } else {
+            self.stuck_after_secs
         }
     }
 }
@@ -916,11 +1247,23 @@ pub struct TaskRebalancerConfig {
     pub max_assignments_per_pass: usize,
 }
 
+/// 一个代理同时背多少任务算过载（告警线，不是硬闸）。
+// cap: fixed — 由实测的任务时延随并发上升的拐点定：过了拐点再加只是排队
+// keep: 删掉后过了时延拐点还继续加，多给的任务只是在排队；由「实测的并发拐点」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+const REBALANCER_MAX_TASKS_PER_AGENT: usize = 4;
+
+/// 一拍最多给出几条建议：建议由人/上层消费，一拍给太多没有消费者接得住。
+// cap: fixed — 由一次调度决策的处理速率定：一拍给得比消费得快，建议就是噪音
+// keep: 删掉后一拍给出的建议比消费得快，建议自己成了噪音；由「一次调度决策的处理速率」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
+const REBALANCER_MAX_ASSIGNMENTS_PER_PASS: usize = 32;
+
 impl Default for TaskRebalancerConfig {
     fn default() -> Self {
         Self {
-            max_tasks_per_agent: 4,
-            max_assignments_per_pass: 32,
+            max_tasks_per_agent: REBALANCER_MAX_TASKS_PER_AGENT,
+            max_assignments_per_pass: REBALANCER_MAX_ASSIGNMENTS_PER_PASS,
         }
     }
 }
@@ -930,37 +1273,95 @@ impl Default for TaskRebalancerConfig {
 #[serde(default)]
 pub struct HookEngineConfig {
     pub dedup_window_secs: u64,
+    /// 引擎层的限流缺省。`None` ＝ 没有缺省：没有声明限流的钩子不限流。
+    ///
+    /// 这里曾经是「每秒 100 次」。那个数没有任何触发密度读数支撑，是拍出来的；
+    /// 按「无界是缺省态」的口径，缺省只是一句没有根据的话，删掉它。限流只来自
+    /// 钩子自己声明的 `rate_limit`（部署的选择），或将来由实测触发密度导出的闭环。
     #[serde(default)]
-    pub default_rate_limit: RateLimitConfig,
+    pub default_rate_limit: Option<RateLimitConfig>,
     pub hook_timeout_secs: u64,
 }
+
+/// 去重窗口：一秒。
+///
+/// 窗口本身不是档位——它说的是「同一秒内的重复投递是同一次唤醒」，这是去重的
+/// 定义；把窗口调大就变成「相邻两次合法的触发也只跑一次」。
+// cap: fixed — 一秒：同一秒内的重复投递按同一次唤醒算，这是去重的定义
+// not-a-bound: 一秒：同一秒内的重复投递按同一次唤醒算，这是去重的定义
+pub const HOOK_DEDUP_WINDOW_SECS: u64 = 1;
 
 impl Default for HookEngineConfig {
     fn default() -> Self {
         Self {
-            dedup_window_secs: 1,
-            default_rate_limit: RateLimitConfig::default(),
-            hook_timeout_secs: 30,
+            dedup_window_secs: HOOK_DEDUP_WINDOW_SECS,
+            default_rate_limit: None,
+            // 无界是缺省态，不是这条界的一个取值。
+            // cap: fixed — 0 ＝「没声明」的哨兵：没写 `timeout_ms` 的钩子跑到完
+            // not-a-bound: 0 ＝「没声明」的哨兵：没写 `timeout_ms` 的钩子跑到完
+            hook_timeout_secs: 0,
         }
     }
 }
 
 /// Per-hook rate-limit configuration (token bucket).
+///
+/// 两格都必须写：一个只写半边的限流会让另一半落到某个谁也没声明过的数上。
+/// 不声明限流就是不限流，这条路径经过 `Option::None`，不经过任何缺省值。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
 pub struct RateLimitConfig {
     pub burst: u32,
     pub per_second: u32,
 }
 
-impl Default for RateLimitConfig {
-    fn default() -> Self {
-        Self {
-            burst: 100,
-            per_second: 100,
-        }
-    }
-}
+/// `AgentEvent` 广播通道的缓冲深度：慢订阅者能落后多少条。
+// cap: fixed — 由订阅者的处理时长 × 事件到达率定：落后超过这个深度就是丢事件
+// keep: 删掉后通道无界，订阅者落后时事件堆在内存里；由「订阅者处理时长 × 到达率」兜住
+const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 1024;
+
+/// `TaskEvent` 广播通道的缓冲深度（同上；任务事件的到达率比代理事件低一档）。
+// cap: fixed — 由订阅者的处理时长 × 事件到达率定：落后超过这个深度就是丢事件
+// keep: 删掉后任务事件通道无界，订阅者落后时事件堆在内存里；由「落后超过这个深度就是丢事件」兜住
+const DEFAULT_TASK_EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// 动作规划器模式库的容量上限：检索只在一拍扫得完的范围里有意义。
+// cap: fixed — 由一拍的检索预算与命中率的拐点定：再深只是把旧模式堆在库里
+// keep: 删掉后模式库无界，旧模式一直堆着把检索预算吃完；由「检索预算与命中率的拐点」兜住
+const DEFAULT_PATTERN_DB_MAX_SIZE: usize = 256;
+
+/// PG 连接池上限。
+///
+/// 这不是本仓能单方面定的数：服务端的 `max_connections` 除以副本数才是天花板，
+/// `cog-storage` 起池时已经在读那个上限并取两者的小值；这里的默认只是没读到
+/// 服务端时的起点。
+// cap: fixed — 由服务端 max_connections / 副本数 与一次查询的时延定
+// keep: 删掉后回到「由服务端 max_connections / 副本数 与一次查询的时延定」所描述的情形；由这条约定兜住
+const DEFAULT_PG_MAX_CONNECTIONS: u32 = 50;
+
+// cap: fixed — 由稳态查询速率 × 一条查询的时延定：保住热连接，又不多占服务端的槽
+// keep: 删掉后没有热连接，每个请求都付一次握手；由「稳态速率 × 一条查询的时延」兜住
+const DEFAULT_PG_MIN_CONNECTIONS: u32 = 2;
+
+/// 等一条连接的时间上限：超过就是这一请求失败了，等更久只是把失败推后。
+// cap: fixed — 由一条请求的预算定：等连接的时间要短于整条请求的超时
+// keep: 删掉后等连接可以长过整条请求的超时，请求死在等连接的队列里；由「等连接要短于整条请求的预算」兜住
+// wall: wait=pool acquire; on-timeout=the request fails with a database error; resume=yes, the next request asks again
+const DEFAULT_PG_ACQUIRE_TIMEOUT_SECS: u64 = 10;
+
+/// 记忆消息后端广播通道的缓冲深度（同 `AgentEvent`）。
+// cap: fixed — 由订阅者的处理时长 × 事件到达率定：落后超过这个深度就是丢事件
+// keep: 删掉后广播无界，落后订阅者让内存跟着积压走；由「落后超过这个深度就是丢事件」兜住
+const DEFAULT_MEMORY_MESSAGE_BROADCAST_CAPACITY: usize = 1024;
+
+/// 观测网关事件通道的缓冲深度（同 `TaskEvent`）。
+// cap: fixed — 由订阅者的处理时长 × 事件到达率定：落后超过这个深度就是丢事件
+// keep: 删掉后可观测通道无界，观测自己成了内存压力；由「落后超过这个深度就是丢事件」兜住
+const DEFAULT_OBSERVABILITY_EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// WebSocket 连接管理器的事件缓存：一次重连要补回多少条。
+// cap: fixed — 由一次重连的补发量与它的时长定：缓存短于补发量，重连就丢事件
+// keep: 删掉后重连补发的量没有缓存可依，重连就丢事件；由「一次重连的补发量」兜住
+const DEFAULT_WEBSOCKET_EVENT_CACHE_CAPACITY: usize = 1000;
 
 /// System-wide runtime tunables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -986,13 +1387,6 @@ pub struct SystemConfig {
     pub loop_restart_backoff_floor_secs: u64,
     /// Interval between monthly-partition maintenance rounds (seconds).
     pub partition_maintenance_interval_secs: u64,
-    /// WASM tool execution timeout (seconds).
-    pub tool_timeout_secs: u64,
-    /// Shell command timeout (seconds). Separate from `tool_timeout_secs`: a
-    /// WASM snippet is bounded work, while a command may legitimately run a
-    /// compiler — one budget cannot serve both. Must not exceed the executor's
-    /// own ceiling, which silently clamps anything larger.
-    pub shell_timeout_secs: u64,
     /// URL of the remote sandbox executor (e.g.
     /// `http://cogneva-sandbox-executor.cogneva.svc:9090`). When set, shell
     /// command tools execute in the isolated executor pod; when absent,
@@ -1006,12 +1400,6 @@ pub struct SystemConfig {
     /// self-evolution deployment profile sets this true as a fail-closed gate.
     #[serde(default)]
     pub require_tool_identity: bool,
-    /// gRPC client reconnect interval (seconds).
-    pub grpc_reconnect_interval_secs: u64,
-    /// Health probe default timeout (seconds).
-    pub probe_timeout_secs: u64,
-    /// HTTP client default timeout for observability calls (seconds).
-    pub http_timeout_secs: u64,
     /// Maximum pattern DB size for ActionPlanOrchestrator.
     pub pattern_db_max_size: usize,
     /// Maximum pattern age in days for ActionPlanOrchestrator.
@@ -1036,8 +1424,6 @@ pub struct SystemConfig {
     pub anthropic_default_max_tokens: u32,
     /// When true, fail fast on missing persistence backends (no memory fallback).
     pub strict_persistence: bool,
-    /// When true, require a persistent vector backend for summary/embedding layer.
-    pub vector_backend_required: bool,
     /// Explicitly enabled system plugins. When `None`, all registered plugins are loaded.
     /// When `Some(list)`, only plugins whose names appear in the list are initialised.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1048,36 +1434,40 @@ pub struct SystemConfig {
     pub disabled_plugins: Vec<String>,
 }
 
+/// Anthropic 模型的输出长度：模型卡上的 `max_tokens`。
+///
+/// 不是本仓的偏好——同一条事实在模型名册里也写着（`cog_llm` 的
+/// `default_model_for`），两处各写一个 4096 就是同一件事的两次声明。
+// cap: fixed — 模型卡：Claude 一代模型的 `max_tokens` 是 4096
+// not-a-bound: 模型卡：Claude 一代模型的 `max_tokens` 是 4096
+pub const ANTHROPIC_OUTPUT_TOKEN_DEFAULT: u32 = 4096;
+
 impl Default for SystemConfig {
     fn default() -> Self {
         Self {
-            event_channel_capacity: 1024,
-            task_event_channel_capacity: 256,
-            shutdown_timeout_ms: 30_000,
-            timeout_checker_interval_secs: 30,
-            loop_restart_max_consecutive: 3,
-            loop_restart_backoff_floor_secs: 5,
-            partition_maintenance_interval_secs: 3600,
-            tool_timeout_secs: 30,
-            shell_timeout_secs: 600,
+            event_channel_capacity: DEFAULT_EVENT_CHANNEL_CAPACITY,
+            task_event_channel_capacity: DEFAULT_TASK_EVENT_CHANNEL_CAPACITY,
+            shutdown_timeout_ms: (30 * crate::day::MILLIS_PER_SECOND) as u64,
+            timeout_checker_interval_secs: (crate::day::SECONDS_PER_MINUTE / 2) as u64,
+            loop_restart_max_consecutive: crate::contract::loop_health::RestartSettings::default()
+                .max_consecutive,
+            loop_restart_backoff_floor_secs:
+                crate::contract::loop_health::RestartSettings::default().backoff_floor_secs,
+            partition_maintenance_interval_secs: crate::day::SECONDS_PER_HOUR as u64,
             sandbox_executor_url: None,
             require_tool_identity: false,
-            grpc_reconnect_interval_secs: 5,
-            probe_timeout_secs: 5,
-            http_timeout_secs: 10,
-            pattern_db_max_size: 256,
-            pattern_max_age_days: 30,
-            pg_max_connections: 50,
-            pg_min_connections: 2,
-            pg_acquire_timeout_secs: 10,
-            pg_idle_timeout_secs: 600,
-            memory_message_broadcast_capacity: 1024,
-            observability_event_channel_capacity: 256,
-            websocket_event_cache_capacity: 1000,
-            skill_hot_reload_interval_secs: 30,
-            anthropic_default_max_tokens: 4096,
+            pattern_db_max_size: DEFAULT_PATTERN_DB_MAX_SIZE,
+            pattern_max_age_days: crate::day::DAYS_PER_MONTH,
+            pg_max_connections: DEFAULT_PG_MAX_CONNECTIONS,
+            pg_min_connections: DEFAULT_PG_MIN_CONNECTIONS,
+            pg_acquire_timeout_secs: DEFAULT_PG_ACQUIRE_TIMEOUT_SECS,
+            pg_idle_timeout_secs: (10 * crate::day::SECONDS_PER_MINUTE) as u64,
+            memory_message_broadcast_capacity: DEFAULT_MEMORY_MESSAGE_BROADCAST_CAPACITY,
+            observability_event_channel_capacity: DEFAULT_OBSERVABILITY_EVENT_CHANNEL_CAPACITY,
+            websocket_event_cache_capacity: DEFAULT_WEBSOCKET_EVENT_CACHE_CAPACITY,
+            skill_hot_reload_interval_secs: SKILL_HOT_RELOAD_INTERVAL_SECS,
+            anthropic_default_max_tokens: ANTHROPIC_OUTPUT_TOKEN_DEFAULT,
             strict_persistence: true,
-            vector_backend_required: true,
             enabled_plugins: None,
             disabled_plugins: Vec::new(),
         }
@@ -1114,17 +1504,29 @@ pub struct MultiBackendConsumerConfig {
     pub events_stream_retention: String,
 }
 
+/// 总线故障窗里重试写回总线的间隔。
+// cap: fixed — 由总线恢复时长定：间隔要短于故障窗，长了缓冲先满
+// keep: 删掉后总线故障窗内重试要么太密、要么缓冲先满；由「间隔要短于故障窗」兜住
+const BUS_RETRY_INTERVAL_SECS: u64 = 5;
+
+/// 持久总线写不进去时，进程内兜底的缓冲深度。
+///
+/// 它兜的是「总线故障窗」：深度 × 到达速率要盖住那段窗，否则兜底先丢事件。
+// cap: fixed — 由事件到达速率 × 总线故障窗定：窗变长或速率变高都要一起抬
+// keep: 删掉后故障窗内的发布无界，内存跟着总线故障的时长走；由「到达速率 × 总线故障窗」兜住
+const BUS_PUBLISH_BUFFER_CAPACITY: usize = 256;
+
 impl Default for MultiBackendConsumerConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             channel: "cogneva-events".into(),
             group: "cogneva-consumer".into(),
-            retry_interval_secs: 5,
+            retry_interval_secs: BUS_RETRY_INTERVAL_SECS,
             events_on_bus: false,
             nats_urls: Vec::new(),
-            publish_buffer_capacity: 256,
-            publish_retry_base_delay_ms: 1000,
+            publish_buffer_capacity: BUS_PUBLISH_BUFFER_CAPACITY,
+            publish_retry_base_delay_ms: crate::day::MILLIS_PER_SECOND as u64,
             events_stream_retention: "limits".into(),
         }
     }
@@ -1173,7 +1575,7 @@ impl Default for ImageRolloutConfig {
             namespace: crate::topology::namespace(),
             deployment: crate::topology::MAIN_DEPLOYMENT.into(),
             container: crate::topology::MAIN_CONTAINER.into(),
-            rollout_timeout_secs: 300,
+            rollout_timeout_secs: (5 * crate::day::SECONDS_PER_MINUTE) as u64,
         }
     }
 }
@@ -1200,9 +1602,19 @@ pub struct MicroVmConfig {
     pub boot_args: String,
     /// API socket 与实例目录的根路径。
     pub instance_root: String,
-    /// 单次进化执行超时；超时即销毁 VM。
-    pub exec_timeout_secs: u64,
 }
+
+/// 微虚拟机给几个核、多少内存。
+///
+/// 这是 guest 的规格：由「一次进化任务在 guest 里跑得动」这条要求定，同时受宿主
+/// 余量约束——给得比宿主的空闲还大，实例根本起不来。
+// cap: fixed — 由一次进化任务的资源需求与宿主余量定：超过宿主的空闲就起不来
+// keep: 删掉后微虚机可以超出宿主空闲，进化任务起不来；由「一次任务的资源需求与宿主余量」兜住
+const MICROVM_VCPU_COUNT: u32 = 2;
+
+// cap: fixed — 同上：由任务的内存峰值与宿主余量定
+// keep: 删掉后内存没有上限，任务峰值把宿主余量吃穿；由「任务的内存峰值与宿主余量」兜住
+const MICROVM_MEM_SIZE_MIB: u32 = 2048;
 
 impl Default for MicroVmConfig {
     fn default() -> Self {
@@ -1212,11 +1624,10 @@ impl Default for MicroVmConfig {
             kernel_image: crate::paths::app_path_str("microvm/vmlinux"),
             rootfs_image: crate::paths::app_path_str("microvm/rootfs.ext4"),
             pv_image: crate::paths::app_path_str("microvm/evolution-pv.ext4"),
-            vcpu_count: 2,
-            mem_size_mib: 2048,
+            vcpu_count: MICROVM_VCPU_COUNT,
+            mem_size_mib: MICROVM_MEM_SIZE_MIB,
             boot_args: "console=ttyS0 reboot=k panic=1 pci=off init=/evolution/init".into(),
             instance_root: "/tmp/cogneva-microvm".into(),
-            exec_timeout_secs: 1800,
         }
     }
 }
@@ -1385,9 +1796,15 @@ impl Default for SelfEvolutionWorkspaceConfig {
         Self {
             root: crate::paths::app_path_str("sandbox/workspaces"),
             target_dir: crate::paths::app_path_str("sandbox/src/target"),
-            ephemeral_ttl_secs: 21600,
-            orphan_branch_ttl_secs: 2592000,
-            cache_scan_interval_secs: 300,
+            // 两个寿命按「几小时 / 几天」写：一个 21600 读不出它是六小时。
+            // cap: fixed — 一次演化运行的最长寿命：跑过六小时的沙箱按「死在半路」收；分支留三十天是仓库的保留约定
+            // keep: 删掉后沙箱没有最长寿命，跑过六小时的演化运行永远占着树；由「跑过六小时的按死在半路收」兜住
+            ephemeral_ttl_secs: 6 * crate::day::SECONDS_PER_HOUR as u64,
+            // cap: fixed — 与上一格同一档：一条被丢下的演化分支留三十天，够人认领，不会长到占满命名空间
+            // keep: 删掉后被丢下的演化分支永远留着，长到占满命名空间；由「留三十天够人认领」兜住
+            orphan_branch_ttl_secs: 30 * crate::day::SECONDS_PER_DAY as u64,
+            // 与体积测量的节拍同一个数：缓存多久重走一遍，两处不该各说各的。
+            cache_scan_interval_secs: crate::claim_footprint::DEFAULT_SCAN_INTERVAL_SECS,
             target_max_bytes: CacheCapSetting::Unbounded,
         }
     }
@@ -1498,13 +1915,52 @@ pub struct BuildGateConfig {
     pub reserve_fresh_secs: u64,
 }
 
+// 构建闸门的九个出厂读数：每一个都是这台宿主的测量值，口径写在各字段上
+// （取中位还是峰值、为什么不用 load average、地板为什么不能从 MemAvailable
+// 反读）。写成具名常量是为了让「读数」有一个可被引用的落点——读数变了改这里，
+// 而不是在 `Default` 里改一个谁也叫不出名字的数字。
+
+// cap: fixed — 一次构建同时吃几个核（实测取中位）；换机器要重量，读侧只压不抬
+// keep: 删掉后构建门没有单次构建的核需求，准入按拍脑袋的并发算；由「实测取中位」兜住
+const BUILD_GATE_DEMAND_CORES: f64 = 4.1;
+
+// cap: fixed — 一次构建的峰值 RSS（实测取峰值）；换机器要重量，读侧只压不抬
+// keep: 删掉后构建门没有峰值内存，准入把两个构建塞进一个装不下它们的槽里；由「实测取峰值」兜住
+const BUILD_GATE_PEAK_RSS_MIB: u64 = 4481;
+
+// cap: fixed — 开工前要留的空闲内存（宿主读数）；写成 GiB 换算而不是一个孤零零的 MiB 数
+// not-a-bound: 开工前要留的空闲内存（宿主读数）；写成 GiB 换算而不是一个孤零零的 MiB 数
+const BUILD_GATE_MEM_FLOOR_MIB: u64 = 24 * 1024;
+
+// cap: fixed — IO 停顿占一拍的预算比例（宿主读数）：超过它就是这台机器的盘跟不上
+// keep: 删掉后没有「盘跟不上」的判据线，IO 停顿多少都放行；由「IO 停顿占一拍的预算」兜住
+const BUILD_GATE_IO_STALL_BUDGET_PCT: f64 = 70.0;
+
+// cap: fixed — 「安静」的判定线（宿主读数）：CPU 占用低于它算一拍空闲
+// keep: 删掉后「安静」没有判定线，忙的机器被读成空；由「CPU 占用低于它算一拍空闲」兜住
+const BUILD_GATE_CPU_CALM_PCT: f64 = 5.0;
+
+// cap: fixed — 「安静」的判定线（宿主读数）：IO 停顿低于它算一拍空闲
+// keep: 删掉后 IO 停顿多少都算安静，忙的盘被读成空；由「IO 停顿低于它算一拍空闲」兜住
+const BUILD_GATE_IO_CALM_PCT: f64 = 1.0;
+
+// cap: fixed — 「安静」的判定线（宿主读数）：内存占用低于它算一拍空闲
+// keep: 删掉后内存占用多少都算安静，紧的内存被读成空；由「内存占用低于它算一拍空闲」兜住
+const BUILD_GATE_MEM_CALM_PCT: f64 = 1.0;
+
+// cap: fixed — 两次采样之间的最小间隔（宿主读数）：密到采样本身成了负载就没有意义
+// keep: 删掉后采样密到采样本身成了负载；由「两次采样之间的最小间隔」兜住
+const BUILD_GATE_CPU_SAMPLE_GAP_MS: u64 = 200;
+
 impl Default for BuildGateConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             // 不覆盖：装机时不认识这台机器，而"1"是一个跟宿主容量无关的常量。
+            // cap: fixed — 0 ＝ 不覆盖，真正的并发由装机时对这台机器的读取决定
+            // keep: 删掉后 0 ＝ 不覆盖的语义消失，装机读取被写死成一个数；由「真正的并发由装机时对这台机器的读取决定」兜住
             max_concurrent: 0,
-            wait_secs: 1800,
+            wait_secs: (30 * crate::day::SECONDS_PER_MINUTE) as u64,
             // 与部署清单挂的那条 hostPath 同名：哪一层（配置文件、环境变量、
             // 默认值）最后说话，落点都是同一个字符串。默认值本身不保证共享——
             // 目录只有在部署真的把它挂出来时才是同一块。
@@ -1523,19 +1979,43 @@ impl Default for BuildGateConfig {
             // 的范围里（核数、MemTotal 减去一个构建的峰值），只压不抬，并在
             // `source` 标签上写 `fitted`。搬到更小的机器上，这两个出厂值不会
             // 变成两条永远清不掉的墙，也不会被当成有人选过的数。
-            build_demand_cores: 4.1,
-            build_peak_rss_mib: 4481,
-            mem_floor_mib: 24 * 1024,
-            io_stall_budget_pct: 70.0,
-            cpu_calm_pct: 5.0,
-            io_calm_pct: 1.0,
-            mem_calm_pct: 1.0,
-            bound_window_secs: 60,
-            cpu_sample_gap_ms: 200,
-            reserve_fresh_secs: 900,
+            build_demand_cores: BUILD_GATE_DEMAND_CORES,
+            build_peak_rss_mib: BUILD_GATE_PEAK_RSS_MIB,
+            mem_floor_mib: BUILD_GATE_MEM_FLOOR_MIB,
+            io_stall_budget_pct: BUILD_GATE_IO_STALL_BUDGET_PCT,
+            cpu_calm_pct: BUILD_GATE_CPU_CALM_PCT,
+            io_calm_pct: BUILD_GATE_IO_CALM_PCT,
+            mem_calm_pct: BUILD_GATE_MEM_CALM_PCT,
+            bound_window_secs: crate::day::SECONDS_PER_MINUTE as u64,
+            cpu_sample_gap_ms: BUILD_GATE_CPU_SAMPLE_GAP_MS,
+            reserve_fresh_secs: (15 * crate::day::SECONDS_PER_MINUTE) as u64,
         }
     }
 }
+
+/// 技能目录多久扫一次改动。
+///
+/// 扫描是读目录、比 mtime，不花模型调用；三十秒是「改完技能到生效」的可接受
+/// 延迟与一次空扫的代价之间的那一档。技能注册表与 core 的运行时配置读同一份。
+// cap: fixed — 热加载节拍：半分钟
+// keep: 删掉后技能热加载没有节拍，要么每拍扫盘、要么改了不生效；由「半分钟」兜住
+pub const SKILL_HOT_RELOAD_INTERVAL_SECS: u64 = 30;
+
+/// 换版探活的三个数：启动宽限、探测节拍、连败几次判死。
+///
+/// 三者是同一件事的三个量：新二进制从 execve 到能答 `/health` 之间必须先给一段
+/// 宽限，之后按节拍问，连败到底就换回去。判死的总时长是节拍 × 次数（5s × 6 =
+/// 30s），与一次换版的观测窗同量级——宽限比它长、或总时长短到一次慢启动就被判
+/// 死，都会让「换版没起来」和「换版还在起」在读数上同形。
+// cap: fixed — 探活口径：十秒宽限、五秒一探、六次判死
+// not-a-bound: 探活口径：十秒宽限、五秒一探、六次判死
+pub const HEALTH_CHECK_GRACE_SECS: u64 = 10;
+// cap: fixed — 同上：探测节拍五秒
+// keep: 删掉后探测没有节拍，健康状态要么过时要么每拍都探；由「探测节拍五秒」兜住
+pub const HEALTH_CHECK_INTERVAL_SECS: u64 = 5;
+// cap: fixed — 同上：连败六次判死（合计约三十秒）
+// keep: 删掉后一次探测失败就判死，滚动中的 Pod 被误杀；由「连败六次约三十秒」兜住
+pub const HEALTH_CHECK_FAILURES_BEFORE_DEAD: u32 = 6;
 
 /// Configuration for the self-evolution auto-deploy pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1577,7 +2057,6 @@ pub struct SelfEvolutionConfig {
     pub health_check_grace_period_secs: u64,
     pub health_check_interval_secs: u64,
     pub health_check_max_retries: u32,
-    pub test_timeout_secs: u64,
     /// The command that judges a generated change, as argv — a program and its
     /// arguments, not a shell line, so a configured value cannot become one.
     /// The default is this workspace's own suite; a project that is not a Rust
@@ -1636,14 +2115,12 @@ pub struct SelfEvolutionConfig {
     /// not the change's.
     /// Empty: this project has no linter, recorded as the stage not running.
     pub lint_command: Option<Vec<String>>,
-    pub build_timeout_secs: u64,
     pub poll_interval_secs: u64,
     /// 反思条目的归档与它的派生层（schema）是两次独立写，第二次失败或中途
     /// 重启会留下「归档在、按 schema 检索不到」的孤儿。这个间隔决定多久重扫
     /// 一次并补上缺口，0 表示关闭重扫。补齐只读本地归档、不调 LLM，所以上游
     /// 断供时也该照跑。
     pub schema_repair_interval_secs: u64,
-    pub notify_on_success: bool,
     pub notify_on_failure: bool,
     /// Image-based 滚动更新；enabled=false 时忽略整块配置。
     pub image_rollout: ImageRolloutConfig,
@@ -1770,19 +2247,16 @@ impl Default for SelfEvolutionConfig {
             binary_dir: crate::paths::app_path_str("bin"),
             backup_dir: crate::paths::app_path_str("bin/backups"),
             switch_mode: "self_exec".into(),
-            health_check_grace_period_secs: 10,
-            health_check_interval_secs: 5,
-            health_check_max_retries: 6,
-            test_timeout_secs: 3600,
+            health_check_grace_period_secs: HEALTH_CHECK_GRACE_SECS,
+            health_check_interval_secs: HEALTH_CHECK_INTERVAL_SECS,
+            health_check_max_retries: HEALTH_CHECK_FAILURES_BEFORE_DEAD,
             test_command: Self::default_test_command(),
             fmt_check_command: None,
             lint_command: None,
             deploy_admission: None,
             web_admission: None,
-            build_timeout_secs: 3600,
-            poll_interval_secs: 60,
-            schema_repair_interval_secs: 600,
-            notify_on_success: false,
+            poll_interval_secs: crate::day::SECONDS_PER_MINUTE as u64,
+            schema_repair_interval_secs: (10 * crate::day::SECONDS_PER_MINUTE) as u64,
             notify_on_failure: true,
             image_rollout: ImageRolloutConfig::default(),
             microvm: MicroVmConfig::default(),
@@ -1804,8 +2278,8 @@ impl Default for Config {
             raw_logger: crate::storage::RawLoggerConfig::default(),
             tier_migrator: TierMigratorConfig::default(),
             agent: AgentConfig {
-                registration_ttl_secs: 30,
-                heartbeat_interval_secs: 10,
+                registration_ttl_secs: AGENT_REGISTRATION_TTL_SECS,
+                heartbeat_interval_secs: AGENT_HEARTBEAT_INTERVAL_SECS,
             },
             metrics: MetricsConfig::default(),
             supervisor: SupervisorConfig::default(),
@@ -2033,9 +2507,60 @@ impl BoardWipLimits {
     }
 }
 
+// 等于默认值的归档保留期不出现在序列化里：模板不必抄一遍代码自己给的答案。
+fn is_the_default_archive_after_secs(v: &u64) -> bool {
+    *v == default_archive_after_secs()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 健康判据的三个阈值不是三个独立旋钮：没写的那几项跟着这次生效的心跳走，
+    /// 换一个心跳它们就跟着换（这条测试红，就是有一个数又变回自己挑的了）。
+    #[test]
+    fn the_health_thresholds_follow_the_heartbeat_in_force() {
+        let unset = HealthCheckerConfig::default();
+        for beat in [5u64, 10, 20, 60] {
+            assert_eq!(
+                unset.effective_suspect_after_secs(beat),
+                beat * SUSPECT_BEATS,
+                "可疑没有跟着 {beat} 秒的心跳走"
+            );
+            assert_eq!(
+                unset.effective_dead_after_secs(beat),
+                beat * DEAD_BEATS,
+                "死亡没有跟着 {beat} 秒的心跳走"
+            );
+            assert_eq!(
+                unset.effective_stuck_after_secs(beat),
+                beat * DEAD_BEATS * STUCK_AFTER_DEATHS,
+                "卡住没有跟着 {beat} 秒的心跳走"
+            );
+        }
+        // 部署写了的项不被心跳覆盖：它自己已经回答了这个问题。
+        let stated = HealthCheckerConfig {
+            suspect_after_secs: 7,
+            dead_after_secs: 8,
+            stuck_after_secs: 9,
+        };
+        assert_eq!(stated.effective_suspect_after_secs(60), 7);
+        assert_eq!(stated.effective_dead_after_secs(60), 8);
+        assert_eq!(stated.effective_stuck_after_secs(60), 9);
+    }
+
+    /// 心跳是注册 TTL 分出来的，不是第二个人挑的数：一个部署只该声明 TTL，
+    /// 心跳跟着它。
+    #[test]
+    fn the_heartbeat_is_the_registration_ttl_spread_over_its_beats() {
+        assert_eq!(
+            AGENT_HEARTBEAT_INTERVAL_SECS,
+            AGENT_REGISTRATION_TTL_SECS / BEATS_PER_REGISTRATION_TTL
+        );
+        // 两者都是常量，所以这是编译期就该成立的事：放在 const 块里，编译不过
+        // 比这条测试红更早。`clippy::assertions_on_constants` 要的也正是这个形状。
+        const { assert!(AGENT_HEARTBEAT_INTERVAL_SECS > 0) };
+    }
 
     /// 没配就是没配：每一列都读成 `None`，不是 0。0 在调用点是一个具体的
     /// 判据（「一条也不许进」），没配是「没有任何东西在拦」。
@@ -2189,6 +2714,15 @@ mod tests {
         assert_eq!(cfg.trace_scan_batch, 123);
     }
 
+    /// 分解重试次数与结果认领批各只有一处声明：默认值读具名常量，常量上写着
+    /// 它由什么钉住。
+    #[test]
+    fn the_dag_executor_retry_and_claim_defaults_read_their_names() {
+        let cfg = DagExecutorConfig::default();
+        assert_eq!(cfg.decomposition_max_attempts, DECOMPOSITION_MAX_ATTEMPTS);
+        assert_eq!(cfg.result_claim_batch, RESULT_CLAIM_BATCH);
+    }
+
     /// The refresher's two knobs default to zero, which means "use the built-in
     /// default". A zero interval would busy-loop the token exchange and a zero
     /// threshold would renew only once the token had already expired, so the
@@ -2214,6 +2748,172 @@ mod tests {
         assert_eq!(
             cfg.effective_contribution_oauth_refresh_threshold_secs(),
             900
+        );
+    }
+
+    /// 「没写」与「写成 0」都不许变成一条坏掉的界。这五个数曾经把 0 当默认值，而 0 在
+    /// 读侧不是「不限」：`request_timeout_secs` 0 建一条 0 秒的超时期限（每个请求立刻
+    /// 408），`websocket_timeout_secs` 0 让零周期的定时器构造即 panic，
+    /// `websocket_inactivity_timeout_secs` 0 一连上就断，`notification_limit` 0 让每页
+    /// 都是空的，`ready_task_poll_interval_secs` 0 被读侧夹到 1 秒成了忙轮询。现在
+    /// 每个 0 都在读侧换成它的合法来源，没有一个是 0 秒的期限。
+    #[test]
+    fn an_unwritten_or_zero_gateway_bound_reads_the_built_in_value() {
+        let drain_ms = SystemConfig::default().shutdown_timeout_ms;
+        let absent: GatewayConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            absent.effective_websocket_heartbeat_secs(),
+            DEFAULT_WEBSOCKET_HEARTBEAT_SECS
+        );
+        assert_eq!(
+            absent.effective_websocket_inactivity_timeout_secs(),
+            WEBSOCKET_BEATS_BEFORE_DROPPING * DEFAULT_WEBSOCKET_HEARTBEAT_SECS
+        );
+        assert_eq!(absent.effective_notification_limit(), A2A_LIST_PAGE_SIZE);
+        assert_eq!(
+            absent.effective_request_timeout_secs(drain_ms),
+            drain_ms / 1000
+        );
+
+        let zeroed: GatewayConfig = serde_json::from_str(
+            r#"{"websocket_timeout_secs": 0, "websocket_inactivity_timeout_secs": 0,
+                "notification_limit": 0, "request_timeout_secs": 0}"#,
+        )
+        .unwrap();
+        // 原始字段照文档说的存 0；读到界的地方换回它的来源，不是 0。
+        assert_eq!(zeroed.request_timeout_secs, 0);
+        assert_eq!(
+            zeroed.effective_websocket_heartbeat_secs(),
+            DEFAULT_WEBSOCKET_HEARTBEAT_SECS
+        );
+        assert_eq!(
+            zeroed.effective_websocket_inactivity_timeout_secs(),
+            WEBSOCKET_BEATS_BEFORE_DROPPING * DEFAULT_WEBSOCKET_HEARTBEAT_SECS
+        );
+        assert_eq!(zeroed.effective_notification_limit(), A2A_LIST_PAGE_SIZE);
+        assert_eq!(
+            zeroed.effective_request_timeout_secs(drain_ms),
+            drain_ms / 1000
+        );
+
+        // 写了一个正数就照它来：生效值不是「总是那个兜底」。
+        let set: GatewayConfig = serde_json::from_str(
+            r#"{"websocket_timeout_secs": 7, "websocket_inactivity_timeout_secs": 21,
+                "notification_limit": 9, "request_timeout_secs": 45}"#,
+        )
+        .unwrap();
+        assert_eq!(set.effective_websocket_heartbeat_secs(), 7);
+        assert_eq!(set.effective_websocket_inactivity_timeout_secs(), 21);
+        assert_eq!(set.effective_notification_limit(), 9);
+        assert_eq!(set.effective_request_timeout_secs(drain_ms), 45);
+    }
+
+    /// 不活跃期限跟的是**这次生效的心跳**，不是一条写死的倍数：心跳被部署改成
+    /// 10 秒时，掉线期限跟着变 30 秒，而不是还停在按默认心跳算出来的 90 秒。
+    #[test]
+    fn the_inactivity_timeout_follows_the_effective_heartbeat() {
+        let set: GatewayConfig = serde_json::from_str(r#"{"websocket_timeout_secs": 10}"#).unwrap();
+        assert_eq!(
+            set.effective_websocket_inactivity_timeout_secs(),
+            WEBSOCKET_BEATS_BEFORE_DROPPING * 10
+        );
+        // 两边都写了就各按各的：跟着心跳只发生在「没写」这一半。
+        let both: GatewayConfig = serde_json::from_str(
+            r#"{"websocket_timeout_secs": 10, "websocket_inactivity_timeout_secs": 90}"#,
+        )
+        .unwrap();
+        assert_eq!(both.effective_websocket_inactivity_timeout_secs(), 90);
+    }
+
+    /// 就绪轮询的 0 同样读作「没写」：读侧曾经把 0 夹到 1 秒，那是把「空转」当成
+    /// 默认节拍。
+    #[test]
+    fn an_unwritten_ready_task_poll_reads_the_built_in_value() {
+        let absent: DagExecutorConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            absent.ready_task_poll_interval_secs,
+            DEFAULT_READY_TASK_POLL_INTERVAL_SECS
+        );
+        let zeroed: DagExecutorConfig =
+            serde_json::from_str(r#"{"ready_task_poll_interval_secs": 0}"#).unwrap();
+        assert_eq!(
+            zeroed.effective_ready_task_poll_interval_secs(),
+            DEFAULT_READY_TASK_POLL_INTERVAL_SECS
+        );
+        let set: DagExecutorConfig =
+            serde_json::from_str(r#"{"ready_task_poll_interval_secs": 12}"#).unwrap();
+        assert_eq!(set.effective_ready_task_poll_interval_secs(), 12);
+    }
+
+    /// 没写请求期限时，它取的就是**这次停机的排空时长**——部署把排空改成 60 秒，
+    /// 没写期限的网关就等 60 秒，而不是回到一个写死的 30。
+    #[test]
+    fn an_unwritten_request_deadline_is_the_shutdown_drain() {
+        let absent: GatewayConfig = serde_json::from_str("{}").unwrap();
+        for drain_ms in [15_000u64, 30_000, 60_000] {
+            assert_eq!(
+                absent.effective_request_timeout_secs(drain_ms),
+                drain_ms / 1000,
+                "排空 {drain_ms} ms 时，没写的请求期限没有跟着它走"
+            );
+        }
+        // 排空短到不足一秒时仍给一秒：0 秒的期限会让每个请求立刻 408。
+        assert_eq!(absent.effective_request_timeout_secs(400), 1);
+    }
+
+    /// 控制台与服务端是同一条 socket 的两端：拍子、判死的先后都在这两份源码里。
+    ///
+    /// 控制台的 `HEARTBEAT_INTERVAL_MS` 与服务端心跳是同一个数；它的 `PONG_TIMEOUT_MS`
+    /// （2 拍 ＋ 5 秒）必须**先于**服务端的不活跃期限触发，这样掉线由浏览器自己发现并
+    /// 重连；反过来则是服务端先断一条浏览器还以为是活的会话，用户看到的是「连着但没反应」。
+    #[test]
+    fn the_console_and_the_gateway_beat_at_one_cadence() {
+        let console = include_str!("../../../web/src/transport/websocket.ts");
+
+        let marker = "HEARTBEAT_INTERVAL_MS =";
+        let at = console
+            .find(marker)
+            .unwrap_or_else(|| panic!("控制台里找不到 `{marker}`：这条判据的锚点搬走了"));
+        let digits: String = console[at + marker.len()..]
+            .chars()
+            .skip_while(|c| c.is_whitespace())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        let console_heartbeat_ms: u64 = digits
+            .parse()
+            .unwrap_or_else(|_| panic!("`{marker}` 后面不是一个数：{digits:?}"));
+        assert_eq!(
+            console_heartbeat_ms,
+            DEFAULT_WEBSOCKET_HEARTBEAT_SECS * 1000,
+            "控制台心跳与服务端心跳不是同一个拍子"
+        );
+
+        // 控制台的放弃公式必须是「两拍 ＋ 5 秒」，服务端期限必须排在它后面。
+        assert!(
+            console.contains("EventStreamClient.HEARTBEAT_INTERVAL_MS * 2 + 5000"),
+            "控制台的 `PONG_TIMEOUT_MS` 公式变了：这条判据要跟着重算"
+        );
+        let console_gives_up_ms = console_heartbeat_ms * 2 + 5000;
+        let server_drops_ms =
+            WEBSOCKET_BEATS_BEFORE_DROPPING * DEFAULT_WEBSOCKET_HEARTBEAT_SECS * 1000;
+        assert!(
+            server_drops_ms > console_gives_up_ms,
+            "服务端不活跃期限 {server_drops_ms} ms 不晚于控制台放弃的 {console_gives_up_ms} ms：\
+             掉线会由服务端先发现，浏览器看到的是「连着但没反应」"
+        );
+    }
+
+    /// 就绪轮询的拍长就是消费者阻塞读一次的预算：一条新就绪的任务最多等到下一次读超时。
+    ///
+    /// 拍比它长时，读超时之后还要再等一拍才有人回来，那段空窗没人说得出为什么是
+    /// 这么长；拍比它短则每一拍都写一条消费者还没读完的消息。
+    #[test]
+    fn the_ready_poll_is_one_blocking_read_budget() {
+        assert_eq!(
+            DEFAULT_READY_TASK_POLL_INTERVAL_SECS * 1000,
+            DEFAULT_REDIS_READ_BLOCK_MS,
+            "就绪轮询拍长与消费者阻塞读预算不再同值：这两处一个决定「多久看一眼」，\
+             一个决定「一眼看多久」"
         );
     }
 
@@ -2392,5 +3092,147 @@ mod tests {
             unusable.response_timeout(),
             std::time::Duration::from_millis(DEFAULT_REDIS_RESPONSE_TIMEOUT_MS)
         );
+    }
+
+    /// 构建闸门的九个出厂读数也读具名常量。
+    #[test]
+    fn the_build_gate_reads_its_names() {
+        let cfg = BuildGateConfig::default();
+        assert_eq!(cfg.build_demand_cores, BUILD_GATE_DEMAND_CORES);
+        assert_eq!(cfg.build_peak_rss_mib, BUILD_GATE_PEAK_RSS_MIB);
+        assert_eq!(cfg.mem_floor_mib, BUILD_GATE_MEM_FLOOR_MIB);
+        assert_eq!(cfg.io_stall_budget_pct, BUILD_GATE_IO_STALL_BUDGET_PCT);
+        assert_eq!(cfg.cpu_calm_pct, BUILD_GATE_CPU_CALM_PCT);
+        assert_eq!(cfg.io_calm_pct, BUILD_GATE_IO_CALM_PCT);
+        assert_eq!(cfg.mem_calm_pct, BUILD_GATE_MEM_CALM_PCT);
+        assert_eq!(cfg.cpu_sample_gap_ms, BUILD_GATE_CPU_SAMPLE_GAP_MS);
+
+        let source = include_str!("config.rs");
+        let body = source
+            .split("impl Default for BuildGateConfig")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("BuildGateConfig 的默认值在这份文件里");
+        let names = [
+            "build_demand_cores",
+            "build_peak_rss_mib",
+            "mem_floor_mib",
+            "io_stall_budget_pct",
+            "cpu_calm_pct",
+            "io_calm_pct",
+            "mem_calm_pct",
+            "cpu_sample_gap_ms",
+        ];
+        let bare: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                names.iter().any(|name| {
+                    line.strip_prefix(name)
+                        .and_then(|rest| rest.strip_prefix(':'))
+                        .map(|value| value.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+                        .unwrap_or(false)
+                })
+            })
+            .collect();
+        assert!(bare.is_empty(), "这些出厂读数要读常量：{bare:?}");
+    }
+}
+#[cfg(test)]
+mod system_config_reads_its_names {
+    use super::*;
+
+    /// 九条容量／超时默认值都读具名常量：改常量就改默认，改回裸写就红。
+    #[test]
+    fn every_system_capacity_reads_its_constant() {
+        let cfg = SystemConfig::default();
+        assert_eq!(cfg.event_channel_capacity, DEFAULT_EVENT_CHANNEL_CAPACITY);
+        assert_eq!(
+            cfg.task_event_channel_capacity,
+            DEFAULT_TASK_EVENT_CHANNEL_CAPACITY
+        );
+        assert_eq!(cfg.pattern_db_max_size, DEFAULT_PATTERN_DB_MAX_SIZE);
+        assert_eq!(cfg.pg_max_connections, DEFAULT_PG_MAX_CONNECTIONS);
+        assert_eq!(cfg.pg_min_connections, DEFAULT_PG_MIN_CONNECTIONS);
+        assert_eq!(cfg.pg_acquire_timeout_secs, DEFAULT_PG_ACQUIRE_TIMEOUT_SECS);
+        assert_eq!(
+            cfg.memory_message_broadcast_capacity,
+            DEFAULT_MEMORY_MESSAGE_BROADCAST_CAPACITY
+        );
+        assert_eq!(
+            cfg.observability_event_channel_capacity,
+            DEFAULT_OBSERVABILITY_EVENT_CHANNEL_CAPACITY
+        );
+        assert_eq!(
+            cfg.websocket_event_cache_capacity,
+            DEFAULT_WEBSOCKET_EVENT_CACHE_CAPACITY
+        );
+
+        let source = include_str!("config.rs");
+        let body = source
+            .split("impl Default for SystemConfig")
+            .nth(1)
+            .and_then(|rest| rest.split("\n#[cfg(test)]").next())
+            .expect("SystemConfig 的默认值在这份文件里");
+        let names = [
+            "event_channel_capacity",
+            "task_event_channel_capacity",
+            "pattern_db_max_size",
+            "pg_max_connections",
+            "pg_min_connections",
+            "pg_acquire_timeout_secs",
+            "memory_message_broadcast_capacity",
+            "observability_event_channel_capacity",
+            "websocket_event_cache_capacity",
+        ];
+        let bare: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                names.iter().any(|name| {
+                    line.strip_prefix(name)
+                        .and_then(|rest| rest.strip_prefix(':'))
+                        .map(|value| value.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+                        .unwrap_or(false)
+                })
+            })
+            .collect();
+        assert!(bare.is_empty(), "这些默认值要读常量：{bare:?}");
+    }
+
+    /// 总线消费的两个计数与两个兜底参数也读具名常量。
+    #[test]
+    fn the_bus_consumer_reads_its_names() {
+        let nats = NatsConfig::default();
+        assert_eq!(nats.consumer_max_deliver, nats_max_deliver().get());
+        assert_eq!(nats.consumer_max_ack_pending, nats_max_ack_pending().get());
+        let consumer = MultiBackendConsumerConfig::default();
+        assert_eq!(consumer.retry_interval_secs, BUS_RETRY_INTERVAL_SECS);
+        assert_eq!(
+            consumer.publish_buffer_capacity,
+            BUS_PUBLISH_BUFFER_CAPACITY
+        );
+
+        let source = include_str!("config.rs");
+        let bare: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                [
+                    "consumer_max_deliver",
+                    "consumer_max_ack_pending",
+                    "retry_interval_secs",
+                    "publish_buffer_capacity",
+                ]
+                .iter()
+                .any(|name| {
+                    line.strip_prefix(name)
+                        .and_then(|rest| rest.strip_prefix(':'))
+                        .map(|value| value.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+                        .unwrap_or(false)
+                })
+            })
+            .collect();
+        assert!(bare.is_empty(), "这些默认值要读常量：{bare:?}");
     }
 }

@@ -52,14 +52,21 @@ fn the_chart_delivers_the_env_name_from_values() {
 }
 
 /// 引用的那个 values 键必须真的存在，否则渲染成空串而不报错。
+///
+/// 值有两种合法形态，与进程读它的函数是同一套词：正数是覆盖位，`0` 是「按池子的
+/// 窗口导出」。`0` 不是停摆——导出循环每拍用「这一窗还付得起几条」重写这个界，
+/// 写坏的配置才退回导出并留一条警告。判据走 [`claim_concurrency_override`] 而
+/// 不是自己再认一遍这两个词，否则代码改了口径它还在判旧的。
 #[test]
 fn the_values_key_exists_and_reads_as_a_count() {
     let value = values_claim_concurrency().unwrap_or_else(|| {
         panic!("values.yaml 的 {VALUES_BLOCK} 段里没有 {VALUES_KEY}：引用不存在的键会渲染成空串")
     });
-    let parsed = cog_orchestrator::task_executor_router::parse_claim_concurrency(&value)
+    let parsed = cog_orchestrator::task_executor_router::claim_concurrency_override(&value)
         .unwrap_or_else(|problem| panic!("values.yaml 里的 {VALUES_KEY} 进程读不动：{problem}"));
-    assert!(parsed > 0, "解析成功却得到 0 个许可：所有执行都会停摆");
+    if let Some(n) = parsed {
+        assert!(n > 0, "解析成功却得到 0 个许可：所有执行都会停摆");
+    }
 }
 
 /// 静态清单那条路径也要有这个名字：k3s 投递不经 helm，少了它就是两种投递两个行为。

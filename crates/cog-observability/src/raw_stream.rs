@@ -19,7 +19,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 ///
 /// 一条帧是一行 JSON，远小于这个数；整块读让大帧也不必多次系统调用，而
 /// 默认的 64 KiB 是页缓存里「一次读一次拷贝」的量级。
-// cap: bound — 一条帧是一行 JSON，远小于这个数；整块读让大帧也不必多次系统调用，而块大小取的是页缓存里「一次读一次拷贝」的量级
+// cap: fixed — 一条帧是一行 JSON，远小于这个数；整块读让大帧也不必多次系统调用，而块大小取的是页缓存里「一次读一次拷贝」的量级
+// keep: 删掉后大帧要多次系统调用，或读缓冲无界；由「页缓存里一次读一次拷贝的量级」兜住
 const COPY_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Unified writer for all 7 raw streams.
@@ -306,7 +307,7 @@ impl RawEnvelopeBuilder {
     }
 
     pub fn json_payload(mut self, value: &impl serde::Serialize) -> Self {
-        self.payload = serde_json::to_vec(value).unwrap_or_default();
+        self.payload = serde_json::to_vec(value).unwrap_or(Default::default());
         self
     }
 

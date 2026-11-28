@@ -6,7 +6,8 @@
 #
 # 为什么要有这一层：出生占用那份 promtool 单测判的是规则会不会响，而它自己也可能是一枚
 # 橡皮图章。这里把那一库的副本改坏五次，每次都必须让它红在**该红的那一格**：
-#   1. 界 1.05 抬到 1.5：firing 那一格必须红——否则一条永远不响的规则也绿；
+#   1. 界 1.05 抬到 1.5（改的是 `condition`，不是表达式）：firing 那一格必须红——
+#      否则一条永远不响的规则也绿；
 #   2. `for_seconds` 改成 900000000：firing 那一格必须红——否则「等一亿秒」也绿；
 #   3. 删掉铺满腿：序列比窗口年轻那一格必须红——否则「刚起的 Pod 凭一条采样证明三天」也绿；
 #   4. 删掉默认的 1 GiB 地板：小阶段那一格必须红——否则 300→400 MiB 的噪声也会响；
@@ -21,6 +22,11 @@
 #   5d. 把一条长窗口规则退回 `increase()`：值夹具必须红——它判的是发货的那份表达式，
 #       不是抄进夹具的一份。
 # 另有两格证明它**不会**白红：真文件必须绿；拿不到 promtool 必须退 3（看不了 ≠ 一致）。
+#
+# 这条门判「会不会响」；**不判阈值从哪来**——一条规则的线该由哪条实测导出、或点名哪条
+# 约定，归交付文档的走查（`crates/cogneva/tests/shipped_config_numbers_are_registered_test.rs`，
+# `rules` 那一族要带一句 `_comment_<比较键>`）。把界抬到 1.5 或十亿证明的是夹具会红，
+# 不是这条线定得对；告警阈值不因有形状门就算判过来源。
 #
 # 跑法：bash deploy/scripts/tests/cogneva-json-alert-rules.test.sh
 set -uo pipefail
@@ -70,7 +76,7 @@ if [ "$rc" -eq 3 ]; then
 fi
 
 # 1) 界抬到 1.5：永远不响，必须红。
-mutate "${work}/c1.json" 'rule["promql"] = rule["promql"].replace("> 1.05)", "> 1.5)")'
+mutate "${work}/c1.json" 'rule["condition"] = {"greater_than": 1.5}'
 run "${work}/c1.json"
 [ "$rc" -eq 1 ] && ok "界抬到 1.5：单测红（抓得住「永远不会响」）" \
     || bad "界抬到 1.5 应红" "1" "$rc"

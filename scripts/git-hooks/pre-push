@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+# Judge the commits being pushed, on the side of the wire where the commit is
+# still the only thing that matters.
+#
+# Why this carrier exists: `deploy/scripts/check-before-push.sh` is run by a
+# person, and on 2026-10-29 nobody ran it. A commit went out whose tree said
+# `use crate::test_support::scrape;` while the module it names had stayed in
+# somebody's working tree; the working tree compiled, CI did not, and the
+# deployment driver held at the last green revision for about an hour. The
+# finding was already written -- what was missing was the call site. A gate
+# that only runs when remembered is a checklist item, and the shape it guards
+# (a shared tree's narrow add carrying a peer's in-flight reference) is one the
+# committer cannot see.
+#
+# It runs the checks that are cheap enough to sit in front of every push and
+# whose question a push can still answer: the references the pushed commits add,
+# resolved against the pushed tip's own tree, and shellcheck over the `*.sh`
+# files those commits touch.
+#
+# The rest of the suite is no longer left to CI. The owner's
+# requirement that day was flat -- every commit, whether a host session wrote it
+# or cogneva landed it, must have passed CI's own criteria on this machine
+# before it reaches the repository -- and the cheap legs above answer only two
+# of CI's nineteen job-steps. So the last leg here runs the repository's own
+# `deploy/scripts/check-before-push.sh` in full: the same `cargo fmt` / `check`
+# / `clippy` / `test --workspace` / version-contract commands CI runs, plus the
+# script jobs. That leg costs tens of minutes on a warm target directory; it is
+# the price of not pushing red, and it is paid once per push rather than once
+# per red CI round (30-40 minutes) with the deployment driver held for the whole
+# round.
+#
+# 2026-11-10: the remote carried eight branch heads besides main, and only one of
+# them (`master`) had content main did not. The others had landed long before and
+# simply stayed; proving that afterwards costs a `git cherry` per branch against a
+# trunk two hundred commits further along. So this hook now refuses every pushed
+# head but `refs/heads/main` -- deletions stay allowed, because cleanup has to be
+# possible without a waiver. The matching half, which erases heads that already
+# exist, is `deploy/scripts/check-branch-convergence.sh --single` run in CI: this
+# hook stops the next branch from being born, that one notices any that already was.
+#
+# What it judges: the working tree, because that is what the gate script reads.
+# Two shapes that makes it an answer about something else, both said out loud
+# rather than passed silently -- a push whose tip is not this checkout's HEAD
+# (another worktree, or an older revision) is not judged at all, and a dirty
+# tree is judged with the number of uncommitted edits printed, since a peer's
+# in-flight change can red a push it is not part of. Neither becomes a block:
+# a gate that cannot judge must not speak as if it had.
+#
+# The shellcheck leg was added on 2026-11-01 for the mirror-image of the accident
+# above. A test file was rewritten to derive its file list from `$REPO` and its
+# `SCRIPTS=` declaration was left behind; the script tests passed, `shellcheck
+# -S warning` (a separate step of the same CI job) reported SC2034, and the job
+# went red thirteen minutes after the push -- with the deployment driver holding
+# at the last green revision for as long as that took. Running `shellcheck` by
+# hand is the same checklist item this hook exists to replace.
+#
+# It judges only the scripts this push touches, not the tree: 29 seconds over
+# 227 scripts is not a price to put in front of every push, and at `-S warning`
+# without `-x` a finding like SC2034 is a single file's answer anyway. The
+# whole-tree pass stays where it is, in CI.
+#
+# Judged from the pushed revisions, never from the working tree: the check reads
+# `<rev>:<path>` and `git grep <rev>`, so a file that only exists on disk cannot
+# make a commit look whole -- which is the whole accident.
+#
+# Cheap when it does not apply: a push that touches no `crates/*.rs` costs one
+# diff. Measured at about a tenth of a second on this tree.
+#
+# Escape hatch: "cannot judge" never blocks. No python3, no checker in this
+# checkout (an older clone, a branch that predates it), a ref that is being
+# deleted or created -- each says so and exits 0, because CI's Check job still
+# governs what arrives. To push through a real finding: `git push --no-verify`
+# and say why in the message.
+set -u
+# 界与有损：判要推的这段提交（origin/main...HEAD）新增的行。判据在
+# `scripts/{bounds,loss}-census.py` 里，这里只是薄入口。根从钩子位置解析，不靠 cwd；
+# 缺 python3 或缺脚本是「判不了」，说出来放行，不是拒推——拒推只留给真正的未处置。
+census_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.."
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "pre-push: 界与有损没有判——这台机器没有 python3。" >&2
+else
+    for census in bounds-census.py loss-census.py; do
+        if [ -f "${census_root}/scripts/${census}" ]; then
+            python3 "${census_root}/scripts/${census}" --root "${census_root}" --check-since origin/main || exit 1
+        else
+            echo "pre-push: 界与有损没有判——缺 scripts/${census}。" >&2
+        fi
+    done
+fi
+
+
+# git hands the hook one line per ref on stdin; without it there is nothing to
+# judge, and reading the script's own stdin would hang.
+[ -t 0 ] && exit 0
+
+repo="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+[ -n "${repo:-}" ] || exit 0
+cd "$repo" || exit 0
+
+checker="deploy/scripts/check-commit-references.py"
+[ -f "$checker" ] || exit 0
+command -v python3 >/dev/null 2>&1 || exit 0
+
+zero=0000000000000000000000000000000000000000
+failed=0
+judged=0
+sh_failed=0
+sh_judged=0
+# The tips this push carries, collected for the last leg: it can only answer for
+# a revision that is checked out here, and that is a question about the set, not
+# about one ref.
+pushed_shas=()
+# The revision the push grows from, kept alongside the tip: the last leg asks
+# "was this delta judged", and a delta is a pair. Without the base it can only
+# ask the whole-tree questions.
+pushed_bases=()
+have_shellcheck=0
+command -v shellcheck >/dev/null 2>&1 && have_shellcheck=1
+# 这个远端只许有一个分支头：trunk。2026-11-10 实测远端积了 8 条头，除 `master` 外
+# 每条的内容都早已在 main 上——每一条都要有人在两百多笔之后回头用 cherry 逐条证一遍
+# 才敢删。「内容已经在 main 上」不是留下来的理由：一条头从诞生到被删之间的每一刻，
+# 都得有人回答「它能不能删」；不诞生就没人要回答。所以这一条判的是**被推的头**，
+# 与内容无关，合格形状是恰好一个。判据的另一半（擦掉已有的）在
+# `deploy/scripts/check-branch-convergence.sh --single`，CI 里对远端跑。
+trunk_ref="refs/heads/main"
+refused_refs=()
+refused_count=0
+while read -r _local_ref local_sha remote_ref remote_sha; do
+    [ -n "${remote_sha:-}" ] || continue
+    case "$remote_ref" in refs/heads/*) ;; *) continue ;; esac
+    # 删分支（local_sha 全零）不受这条约束：清理必须走得动，否则规矩只能靠人一点点来。
+    if [ "$remote_ref" != "$trunk_ref" ] && [ "$local_sha" != "$zero" ]; then
+        refused_refs+=("$remote_ref")
+        refused_count=$((refused_count + 1))
+    fi
+    [ "$local_sha" = "$zero" ] && continue
+    # A new branch has no revision behind it to diff against; what it carries is
+    # still judged at the far end, by CI.
+    [ "$remote_sha" = "$zero" ] && continue
+
+    # Both legs answer the same two questions -- what does this push add, and
+    # does the pushed tree itself hold up -- so they share one pass over the
+    # refs. Neither may `continue` past the other: a clean reference answer is
+    # not an answer about the scripts.
+    judged=$((judged + 1))
+    pushed_shas+=("$local_sha")
+    pushed_bases+=("$remote_sha")
+    python3 "$checker" --base "$remote_sha" --head "$local_sha"
+    rc=$?
+    case "$rc" in
+    0) ;;
+    2) echo "pre-push: 这一问没问成（上面那行说了为什么），不拦；CI 的 Check 仍会判推上去的树。" >&2 ;;
+    *) failed=$((failed + 1)) ;;
+    esac
+
+    [ "$have_shellcheck" -eq 1 ] || continue
+    # Materialize the pushed revision's copies: shellcheck against the working
+    # tree would judge bytes that are not what is being pushed, which is the
+    # whole accident this hook exists for.
+    sh_files=()
+    mapfile -t sh_files < <(git diff --name-only --diff-filter=d "$remote_sha" "$local_sha" -- '*.sh' 2>/dev/null)
+    [ "${#sh_files[@]}" -gt 0 ] || continue
+    tmp="$(mktemp -d)"
+    sh_paths=()
+    for f in "${sh_files[@]}"; do
+        mkdir -p "$tmp/$(dirname "$f")" 2>/dev/null
+        # A path that does not read back is not a finding; handing shellcheck a
+        # name it cannot open would turn "could not judge this file" into "this
+        # file is red" and block the push for the wrong reason.
+        if git show "$local_sha:$f" > "$tmp/$f" 2>/dev/null; then
+            sh_paths+=("$f")
+        else
+            rm -f "$tmp/$f"
+        fi
+    done
+    [ "${#sh_paths[@]}" -gt 0 ] || { rm -rf "$tmp"; continue; }
+    sh_judged=$((sh_judged + 1))
+    # Relative to the copy, so shellcheck's spans name the path the committer
+    # knows. Without `-x` it does not follow sources, so a partial tree is fine.
+    if ! ( cd "$tmp" && shellcheck -S warning "${sh_paths[@]}" ); then
+        sh_failed=$((sh_failed + 1))
+    fi
+    rm -rf "$tmp"
+done
+
+if [ "$refused_count" -gt 0 ]; then
+    echo "pre-push（分支头）: 这个远端只许有一个分支头 ${trunk_ref}；这一推要推：" >&2
+    for r in "${refused_refs[@]}"; do printf '  - %s\n' "$r" >&2; done
+    echo "  内容先落到 main（逐条 git cherry 证过），再把分支删掉：git push origin --delete <名字>。" >&2
+    echo "  「分支存在」本身就要有人回答「它能不能删」，内容已经在 main 上不是留下来的理由。" >&2
+    echo "  要照常推：\`git push --no-verify\`，并在提交信息里写清为什么。" >&2
+    exit 1
+fi
+
+if [ "$have_shellcheck" -eq 0 ]; then
+    echo "pre-push: 本机没有 shellcheck，这一推改过的 *.sh 没有判（CI 的 Entry Scripts Lint 仍会判全树）。" >&2
+fi
+
+[ "$judged" -gt 0 ] || [ "$sh_judged" -gt 0 ] || exit 0
+if [ "$failed" -gt 0 ]; then
+    echo "pre-push（提交里的模块引用）: 这一推里有些引用，推上去的那棵树自己回答不了。" >&2
+    echo "  修法是让那一笔带上定义它的文件，或把引用去掉；要照常推：\`git push --no-verify\`，" >&2
+    echo "  并在提交信息里写清为什么。" >&2
+    exit 1
+fi
+if [ "$sh_failed" -gt 0 ]; then
+    echo "pre-push（脚本 lint）: 这一推改过的脚本在 shellcheck -S warning 下有问题，CI 的 Entry Scripts Lint 会红在那里。" >&2
+    echo "  修法是就地改掉它；要照常推：\`git push --no-verify\`，并在提交信息里写清为什么。" >&2
+    exit 1
+fi
+
+# ---- 最后一腿：这棵树的字节验过没有 ----
+#
+# 判据只有一份，在 `deploy/scripts/check-before-push.sh` 里，它逐字照抄
+# `.github/workflows/ci.yml` 的命令（整棵工作区，不按改动收窄）。这里是它的调用点：
+# 见文件头那一段。
+#
+# 这里问的是「验过没有」，不是「现在替我验一遍」：验证是独立的一步，
+# 一次几十多分钟的整棵编译，挂着构建槽排队，挂在一个推送前面没人受得了。戳按字节记，
+# 所以推的要是刚验过的那份字节，这一推秒过；不是，就点名并给出验证命令。
+# 别的仓库没有这个脚本，那一推就不跑——判词要说出来，跳过的绿与跑过的绿在读数上一样。
+gate="deploy/scripts/check-before-push.sh"
+head_sha="$(git rev-parse HEAD 2>/dev/null || true)"
+off_head=""
+head_base=""
+i=-1
+for sha in "${pushed_shas[@]+"${pushed_shas[@]}"}"; do
+    i=$((i + 1))
+    if [ "$sha" = "$head_sha" ]; then
+        head_base="${pushed_bases[$i]}"
+    else
+        off_head="$sha"
+    fi
+done
+if [ ! -f "$gate" ]; then
+    echo "pre-push: 这棵树上没有 ${gate}（不是 cogneva 的工作树），整棵 CI 判据这一推没跑。" >&2
+elif [ -n "$off_head" ]; then
+    echo "pre-push: 这一推推的有一笔是 ${off_head:0:12}，当前检出的是 ${head_sha:0:12}；" >&2
+    echo "  戳按工作树的字节记，判不了另一笔提交。CI 仍会整棵判。" >&2
+else
+    dirty="$(git status --porcelain 2>/dev/null | wc -l)"
+    # Three questions, asked in order of what they are worth to this push:
+    #
+    #   --status-patch <base>  was this delta judged? A rebase onto a moved
+    #       origin/main keeps the delta and changes the tree, which is the shape
+    #       that made every session re-run the whole suite -- 2026-11-08: the gate
+    #       runs two hours and the landing lands every 66 to 123 minutes, so a tree
+    #       verified here is never the tip by the time the run ends. The key is
+    #       `git patch-id --stable` over base..HEAD: it survives a rebase that
+    #       leaves the change sitting in the same surrounding text, and it does not
+    #       survive one that rewrites the lines around it or whose conflict
+    #       resolution changes the solution. Both are misses, which is the safe
+    #       direction -- a re-run, not an unjudged combination let through. It is
+    #       read from the committed tree on both sides -- the gate stamps the bytes
+    #       it judged, this asks base..HEAD -- so a peer's in-flight edit in a
+    #       shared working tree is in neither, and the question is asked whether or
+    #       not the tree is dirty.
+    #   --status-content       were these exact tree bytes judged? The commit that
+    #       follows a run does not change the tree, so this survives it.
+    #   --status               was HEAD judged against this origin/main? What is left
+    #       for a dirty tree, where the working tree is not what goes up.
+    #
+    # Each flag is probed in the gate's bytes before use: an older gate runs the
+    # whole suite on an argument it does not know.
+    patch_out=""
+    if [ -n "$head_base" ] && grep -q -- '--status-patch' "$gate"; then
+        patch_out="$(bash "$gate" --status-patch "$head_base" 2>&1)"
+        prc=$?
+        if [ "$prc" -eq 0 ]; then
+            echo "pre-push: $(printf '%s' "$patch_out")" >&2
+            exit 0
+        fi
+        # rc 2 is "cannot tell" -- not evidence either way, so fall through. rc 1 is
+        # a real miss; the whole-tree questions still get their say below, and only
+        # if they miss too does this push stop.
+        [ "$prc" -eq 2 ] && patch_out=""
+    fi
+    status_flag=--status
+    if [ "${dirty}" -eq 0 ] && grep -q -- '--status-content' "$gate"; then
+        status_flag=--status-content
+    elif [ "${dirty}" -gt 0 ]; then
+        echo "pre-push: 工作树上有 ${dirty} 处未提交改动；问的是 HEAD 的账，不是这棵脏树。" >&2
+    fi
+    out="$(bash "$gate" "$status_flag" 2>&1)"
+    rc=$?
+    if [ "$rc" -eq 1 ]; then
+        [ -n "$patch_out" ] && echo "$patch_out" >&2
+        echo "$out" >&2
+        echo "pre-push（CI 等价门）: 这一推的改动（或这棵树的这份字节）没验过，推上去红不红没人知道，这一推停下来。" >&2
+        echo "  要照常推：\`git push --no-verify\`，并在提交信息里写清为什么。" >&2
+        exit 1
+    fi
+    if [ "$rc" -ne 0 ]; then
+        echo "pre-push（CI 等价门）: 门自己说判不了（退出码 ${rc}），不拦；CI 仍会整棵判这一推。" >&2
+        exit 0
+    fi
+    echo "pre-push: $(printf '%s' "$out")" >&2
+fi
+exit 0

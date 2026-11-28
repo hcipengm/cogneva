@@ -38,6 +38,11 @@
 //! named by a step, or that no longer holds an ignored test, fails as well -- a
 //! list that only ever licenses is a list that stops describing the tree.
 
+// 这几个目标各自 `mod common;` 一次，`common/` 下的每一份因此被编进好几个二进制——
+// clippy 报 `duplicate_mod`。它建议的改法（留一个 `mod`，其余 `use`）在这里不成立：
+// 测试二进制之间没有共享的模块树，`use` 够不着别的目标里那一份。编两次是安全的，
+// 这些文件只放自由函数与夹具，不定义需要在副本之间保持同一身份的类型。
+#[allow(clippy::duplicate_mod)]
 mod common;
 
 use common::routes::{read_repo, repo_root, walk_files};
@@ -78,6 +83,12 @@ const IGNORE_MARKER: &str = concat!("#[ig", "nore");
 /// site that is absent from both this list and the workflow is a decision nobody
 /// made, which is the failure the test below exists to catch.
 const UNNAMED: &[(&str, &str)] = &[
+    (
+        "crates/cog-storage/src/db_surface.rs",
+        "这条用例要连一个真库并把库面的读数逐项对一遍；它跑在 live 那一档，\n         \
+         而那一档的步骤是按**测试目标**点名的，单元测试没有自己的目标，\n         \
+         点不到。留在这里是明写的一条决定，不是没人发现。",
+    ),
     (
         "crates/cog-storage/src/redis/connect.rs",
         "The one test here asserts that the default configuration stalls the \
@@ -143,9 +154,19 @@ const UNNAMED: &[(&str, &str)] = &[
          registry calls store-derived, so it needs addresses CI does not have: \
          a running cluster with the app and evolution pods, port-forwarded. Its \
          subject is the live system, not the tree — the tree-side gate next to \
-         it (`observability_alert_rule_contract_test` and the dashboard contract) \
+         it (`observability_alert_rule_contract_test`) \
          runs in CI. Manual reading: `COGNEVA_METRICS_URLS=<a>/metrics,<b>/metrics \
          cargo test -p cogneva --test store_derived_reading -- --ignored --nocapture`.",
+    ),
+    (
+        "crates/cogneva/tests/scale_capacity_reading.rs",
+        "The probe judges whether a live deployment scales wide enough to cover \
+         its queue: it scrapes the capacity, slot, holding and waiting series the \
+         workload loop publishes and fails when capacity does not cover demand. \
+         CI has no cluster, so the tree side of the same numbers lives in \
+         `cog_reflection::workload_resources` tests. Manual reading: \
+         `COGNEVA_METRICS_URLS=<app-pod>/metrics cargo test -p cogneva --test \
+         scale_capacity_reading -- --ignored --nocapture`.",
     ),
     (
         "crates/cogneva/src/eval_mcp_in_pod.rs",

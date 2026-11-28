@@ -8,10 +8,9 @@ use crate::squad::pge::types::PgeRoundtableIteration;
 ///
 /// The moderator reviews the full debate history and decides whether to
 /// continue iterating, change strategy, accept a partial result, or escalate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ModeratorDecision {
     /// Continue to the next iteration with current strategy.
-    #[default]
     Continue,
     /// Pivot the discussion angle (e.g. reframe the goal, introduce new
     /// constraints, or ask agents to focus on a specific weakness).
@@ -23,9 +22,15 @@ pub enum ModeratorDecision {
     Escalate,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ModeratorOutput {
-    pub decision: ModeratorDecision,
+    /// What the moderator decided, or `None` when no decision could be read:
+    /// the call failed, or it answered in words this parser does not recognise
+    /// as one of the four. `None` is not [`ModeratorDecision::Continue`] — a
+    /// round that carried on because nobody could read the answer is a
+    /// different observation from one the moderator chose to continue, and the
+    /// roundtable publishes them in different cells.
+    pub decision: Option<ModeratorDecision>,
     pub reasoning: String,
     /// Concrete suggestions for the next iteration (e.g. "focus on error
     /// handling", "re-evaluate the schema design").
@@ -33,17 +38,6 @@ pub struct ModeratorOutput {
     /// Optional flag indicating whether the moderator believes the current
     /// result is "good enough" despite not reaching formal consensus.
     pub good_enough: bool,
-}
-
-impl Default for ModeratorOutput {
-    fn default() -> Self {
-        Self {
-            decision: ModeratorDecision::Continue,
-            reasoning: String::new(),
-            suggestions: Vec::new(),
-            good_enough: false,
-        }
-    }
 }
 
 /// Moderator Actor — semantic wrapper around a `dyn Agent`.
@@ -91,6 +85,7 @@ impl ModeratorActor {
     /// owns: the debate applies it to every round's own score before asking, so
     /// what it is being asked is what to do about a debate that did not confirm
     /// — never whether it did.
+    // prompt: consumed by crates/cog-collaboration/src/actors/moderator.rs::parse_moderator_output
     pub async fn moderate(
         &self,
         task: &cog_core::Task,
@@ -115,18 +110,16 @@ impl ModeratorActor {
         // them, not the way the enum variants are named: `parse_moderator_output`
         // lowercases the reply and matches `continue`, `change_strategy`,
         // `accept_partial`, `escalate`. A contract naming `ChangeStrategy` would
-        // be naming a spelling the parse reads as none of the four, and the round
-        // would continue by default — a decision taken by a word nobody wrote.
+        // be naming a spelling the parse reads as none of the four, and the
+        // round would carry on with no decision recorded — the roundtable
+        // publishes that as unreadable rather than as a choice to continue.
+        //
+        // The words are all that is here, together with the shape they arrive
+        // in. What each one commits the round to is the platform's own reading of
+        // them, and the debate they are a judgement on travels in the document
+        // below; a paragraph here defining them would be the platform making the
+        // judgement it just asked for.
         let mut contract = serde_json::json!({
-            "instructions": "Each agent \
-             proposed a plan and a generation, and a judge has ruled on the round. Read the \
-             debate so far and decide what happens next: you are not asked whether the round \
-             passed — that verdict is already in the history — you are asked what to do about \
-             a debate that has not confirmed. `decision` is exactly one of: \
-             `continue` — another round with the current strategy; \
-             `change_strategy` — same goal, a different angle, named in `suggestions`; \
-             `accept_partial` — the current best result stands even though consensus was not \
-             reached; `escalate` — this needs an external review or a human.",
             "output_schema": {
                 "decision": "string: continue | change_strategy | accept_partial | escalate",
                 "reasoning": "string: why this is the right call",
@@ -194,6 +187,10 @@ impl ModeratorActor {
             }
             Err(e) => {
                 tracing::warn!("Moderator prompt failed: {}", e);
+                // 没答上话不是「主持人选择继续」。默认值里没有决策，调用方
+                // 才能把这一格和「问了、答案是 Continue」分开计数。真因在
+                // 上面那条 warn 里；这里不留一句话，是因为这个结构体的
+                // reasoning 没有任何读者，留着只会长出一段没人读的字。
                 (
                     ModeratorOutput::default(),
                     crate::actors::ReviewBasis::Passed(
@@ -202,7 +199,7 @@ impl ModeratorActor {
                 )
             }
         };
-        let output_str = serde_json::to_string_pretty(&output).unwrap_or_default();
+        let output_str = serde_json::to_string_pretty(&output).unwrap_or(Default::default());
         if let Some(revised) = crate::actors::maybe_self_review(
             self.agent.as_ref(),
             &self.self_review,
@@ -237,8 +234,7 @@ pub fn parse_moderator_output(value: &serde_json::Value) -> ModeratorOutput {
             }
             "escalate" | "escalation" | "human" | "handoff" => Some(ModeratorDecision::Escalate),
             _ => None,
-        })
-        .unwrap_or_default();
+        });
 
     let reasoning = value
         .get("reasoning")
@@ -255,7 +251,7 @@ pub fn parse_moderator_output(value: &serde_json::Value) -> ModeratorOutput {
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
 
     let good_enough = value
         .get("good_enough")
@@ -267,5 +263,35 @@ pub fn parse_moderator_output(value: &serde_json::Value) -> ModeratorOutput {
         reasoning,
         suggestions,
         good_enough,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 读不出决策的三种形状：散文、缺字段、类型不对。默认值是 `None`，
+    /// 不是 `Continue` —— 调用方据此把「问了没答上」与「选择继续」分开计数。
+    #[test]
+    fn a_reply_with_no_recognised_decision_reads_as_no_decision() {
+        for reply in [
+            serde_json::json!({"decision": "I think we should pivot to a different framing"}),
+            serde_json::json!({}),
+            serde_json::json!({"decision": 3}),
+        ] {
+            assert_eq!(
+                parse_moderator_output(&reply).decision,
+                None,
+                "reply {reply} names no decision the parser takes"
+            );
+        }
+    }
+
+    #[test]
+    fn a_contracted_word_still_reads_as_its_decision() {
+        assert_eq!(
+            parse_moderator_output(&serde_json::json!({"decision": "change_strategy"})).decision,
+            Some(ModeratorDecision::ChangeStrategy)
+        );
     }
 }

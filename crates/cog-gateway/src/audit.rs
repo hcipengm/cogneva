@@ -15,8 +15,43 @@ use std::sync::Arc;
 use crate::error::ApiError;
 use crate::GatewayState;
 
+/// 往平台自己那本账上追加一条，写不成要说出来。
+///
+/// 这本账的用处就在「事后追查」：一条没落上去的记录不会自己补上来，而它漏掉的
+/// 恰恰是平台做过的一件真事（一次拒绝、一次保存、一次挪动）。`let _ = append`
+/// 把失败变成沉默，读账的人只会以为那件事没有发生——「没记」与「没做」在账面上
+/// 是同一个读数。动作连同目标与错误一起写进日志，这是唯一能把两者分开的地方。
+///
+/// 返回这条记录有没有落上：调用方的答复不因它而变（真事已经做了），但需要知道
+/// 的调用方拿得到。
+pub(crate) async fn append_or_warn(
+    stream: &Arc<dyn cog_core::AuditStream>,
+    kind: cog_core::AuditKind,
+    actor: &str,
+    target: &str,
+    action: &str,
+    detail: serde_json::Value,
+) -> bool {
+    match stream.append(kind, actor, target, action, detail).await {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(
+                action = %action,
+                target = %target,
+                error = %error,
+                "这件事做了，但审计链上没有它：写不进去的记录不会自己补上来"
+            );
+            false
+        }
+    }
+}
+
 /// Query parameters for audit event listing.
-#[derive(Debug, Deserialize, Default)]
+///
+/// 不派生 `Default`：派生出来的 `limit` 是 0，而没写这一格的查询串拿到的是共用
+/// 页长——同一件「没写」的事两处答案，且 0 条比页长更难被察觉（它看起来像
+/// 「没有记录」）。没有人构造它，删掉就只剩一处。
+#[derive(Debug, Deserialize)]
 pub struct AuditQuery {
     pub agent_id: Option<String>,
     pub task_id: Option<String>,
@@ -27,7 +62,8 @@ pub struct AuditQuery {
 }
 
 fn default_limit() -> usize {
-    100
+    // 一屏：与 A2A 的 `page_size` 默认值同一个数，列表面共用页长。
+    cog_core::config::A2A_LIST_PAGE_SIZE as usize
 }
 
 /// List archived hook events.
@@ -59,7 +95,7 @@ pub async fn list_audit_events_handler(
 /// 与 `/api/v1/audit/events` 是两本账：那一本记 hook 归档（谁触发、payload 是什么），
 /// 这一本记平台自己做过的事——配额拒绝、授权、变更、以及上游池被谁改成什么样。
 /// 两本混在一个端点下，读的人就分不清一条记录是"某次回调来过"还是"平台做了一件事"。
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct AuditStreamQuery {
     /// 动作前缀，如 `llm.` 或 `quota.`。
     pub action: Option<String>,

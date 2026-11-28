@@ -25,6 +25,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
+use cog_core::contract::usage_ledger::SessionSpend;
 use cog_core::{
     HierarchyDecision, HierarchyManager, LlmUsageLedger, QuotaContext, QuotaLimits, QuotaScope,
     SFResult,
@@ -154,7 +155,7 @@ impl LlmUsageLedger for FakeSpend {
         Ok(self.refused_workspaces.clone())
     }
 
-    async fn record(&self, _: &cog_core::LlmUsageRecord) -> Result<(), String> {
+    async fn record(&self, _: &cog_core::LlmUsageRecord) -> Result<String, String> {
         unimplemented!("只读替身")
     }
     async fn record_exchange(&self, _: &cog_core::LlmExchangeRecord) -> Result<(), String> {
@@ -204,6 +205,9 @@ impl LlmUsageLedger for FakeSpend {
         unimplemented!("只读替身")
     }
     async fn spend_by_task(&self, _: &[String]) -> Result<Vec<(String, u64)>, String> {
+        unimplemented!("只读替身")
+    }
+    async fn spend_for_session(&self, _: &str) -> Result<Option<SessionSpend>, String> {
         unimplemented!("只读替身")
     }
     async fn priced_spend_between(
@@ -296,6 +300,10 @@ impl FakeCeilings {
 
 #[async_trait::async_trait]
 impl HierarchyManager for FakeCeilings {
+    fn default_limits(&self) -> QuotaLimits {
+        unimplemented!("只读替身：这里不问落回哪一对")
+    }
+
     async fn check(&self, _: &QuotaContext, _: u64) -> HierarchyDecision {
         unimplemented!("这一读不问判定")
     }

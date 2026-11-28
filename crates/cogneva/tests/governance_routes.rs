@@ -235,6 +235,8 @@ fn state_with(
     let orchestrator = control("test-workspace");
 
     Arc::new(GatewayState {
+        llm_call_events: None,
+        security_keys: None,
         data_dir: "/tmp".into(),
         config: std::sync::RwLock::new(GatewayConfig {
             http_port: 0,
@@ -243,15 +245,12 @@ fn state_with(
             cors_origins: vec!["*".into()],
             websocket_timeout_secs: 30,
             websocket_inactivity_timeout_secs: 90,
-            websocket_tick_secs: 5,
             notification_limit: 50,
-            sandbox_task_timeout_secs: 30,
             request_timeout_secs: 30,
             notification_webhook_url: None,
             ..Default::default()
         }),
         request_timeout_secs: std::sync::atomic::AtomicU64::new(30),
-        sandbox_task_timeout_secs: std::sync::atomic::AtomicU64::new(30),
         event_tx: broadcast::channel(16).0,
         evolution_stream: None,
         task_event_tx: broadcast::channel(16).0,
@@ -303,10 +302,14 @@ fn state_with(
         observables: Vec::new(),
         metrics_dimensions: Vec::new(),
         mcp_client: None,
+        mcp_call_counts: None,
         workspace_store: None,
         governance_store,
         principle_ledger,
         change_ledger: None,
+        intent_events: None,
+        employee_events: None,
+        message_events: None,
         key_value: None,
         external_skill_registry: None,
         tool_registry: None,
@@ -326,6 +329,7 @@ fn state_with(
         llm_client: std::sync::Arc::new(std::sync::RwLock::new(None)),
         chat_turns: None,
         conversation: Default::default(),
+        chat_stream: Default::default(),
         agent_messages: None,
         datasets: None,
     })
@@ -467,29 +471,45 @@ async fn the_capability_and_output_faces_answer_and_name_their_missing_layers() 
         "the capability face answers: {body}"
     );
     let sources = body["sources"].as_array().expect("sources is an array");
-    assert_eq!(sources.len(), 3, "one row per layer: {body}");
+    // 按名字判，不按条数判：少一层与多一层都要在这里现形，而条数只看得见后者。
+    // 四层是 `Source` 的四个取值——进程级注册表、插件注册表、MCP 对端，以及上一轮
+    // 交给模型的那张表。
+    let layers: Vec<&str> = sources
+        .iter()
+        .map(|row| row[0].as_str().expect("each row names its layer"))
+        .collect();
+    assert_eq!(
+        layers,
+        ["builtin", "plugin", "mcp", "conversation"],
+        "one row per layer, in the order the face publishes them: {body}"
+    );
     for row in sources {
         assert_eq!(
             row[1]["state"], "unwired",
-            "the fixture wires none of the three layers: {body}"
+            "the fixture wires none of the four layers: {body}"
         );
         assert!(
             row[1]["because"].is_string(),
             "a missing layer names itself: {body}"
         );
     }
-    // "Who may order this action" and "why can it not be judged" must say which
-    // of the two they are on the wire: the fixture has neither a role table nor
-    // a roster, so both are "not read", and the roster names why. An empty list
-    // here would read as "no role may call it and nobody declares it", which is
-    // a different deployment.
+    // "Who may order this action" must distinguish "not read" from "no role":
+    // the fixture has no role table, so the field is null. An empty list here
+    // would read as "no role may call it", which is a different deployment.
     assert!(
         body["unbounded_roles"].is_null(),
         "no skill registry means the role table was not read, not that no role is unbounded: {body}"
     );
+    // The roster no longer answers "who declares this action": capability was a
+    // per-person column, and every digital employee has the same one. A body
+    // that still carries a roster-sourced column is reading a table that no
+    // longer exists.
     assert!(
-        body["roster_caveat"].is_string(),
-        "a missing roster says why the column cannot be judged: {body}"
+        !body
+            .as_object()
+            .expect("the inventory is an object")
+            .contains_key("roster_caveat"),
+        "the capability face no longer reads a roster: {body}"
     );
 
     let (status, body) = ask(&app, "GET", "/api/v1/output", &token, "{}").await;

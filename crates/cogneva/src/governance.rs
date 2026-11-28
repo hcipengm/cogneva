@@ -26,8 +26,8 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use cog_core::{
-    Face, FaceImportOutcome, FaceKind, FaceSpec, GovernanceStore, Handover, StateBackend, Task,
-    TaskStatus, HANDOVER_TASK_TYPE,
+    Face, FaceImportOutcome, FaceKind, FaceSpec, GovernanceStore, Handover, PrincipleState,
+    StateBackend, Task, TaskStatus, HANDOVER_TASK_TYPE,
 };
 use cog_orchestrator::face_drift::UnexplainedOwner;
 use cog_storage::{
@@ -70,9 +70,10 @@ SUBCOMMANDS:
     drift [--json]         Print the current verdict of every face. Reads the
                            workers' heartbeats too; an owner nobody can see
                            reads unread, never green.
-    project --out <dir>    Write faces.tsv, drift.tsv, decisions.tsv and
-                           tasks.tsv into <dir>, each with its generated_at and
-                           the graph's largest revision. This is the write a
+    project --out <dir>    Write faces.tsv, drift.tsv, decisions.tsv,
+                           tasks.tsv and one <kind>.tsv per declaration kind
+                           into <dir>, each with its generated_at and the
+                           graph's largest revision. This is the write a
                            freshness gate reads.
     import-faces --from <file> [--keep-ownership]
                            Put each roster row into the graph. Columns:
@@ -85,6 +86,8 @@ SUBCOMMANDS:
                            it, because a clock re-reading a file is not a
                            decision to hand a face over, and only a signed
                            handover carries the work bound to the face.
+                           `--from -` reads stdin, so the one-time move of a
+                           deleted roster file needs nothing staged on the pod.
     handover <SUB>         Open, sign, apply, withdraw or list a move of a face
                            from one unit to another. A move counts only when
                            every required unit signed and it was applied.
@@ -104,6 +107,60 @@ SUBCOMMANDS:
                            act that removes it. `--from -` reads stdin, which is
                            how a host with no database credentials feeds it in:
                            `kubectl exec -i ... import-readings --from -`.
+    drivers                Print the driver roster, five columns:
+                           front kind unit stopped-reading host. One unit is one
+                           node; a unit that drives several fronts states its
+                           stopped-reading once per front. The self-sufficiency
+                           gate parses this exactly as it parsed the declaration
+                           file, which no longer exists.
+    import-drivers --from <file> [--upsert]
+                           Put a five-column roster into the graph. Without
+                           --upsert it replaces the roster: units the input no
+                           longer names are cancelled, which is the shape of the
+                           one-time move of the legacy declaration table.
+                           --upsert only writes the units the input names: the
+                           host re-reads the unit files that exist, and a unit
+                           that is not installed is a red the gate must keep
+                           seeing, not a row to drop. `--from -` reads stdin for
+                           the same reason as import-readings — the host that
+                           owns the units holds no database credentials.
+    fronts                 Print the closed set of fronts the self-sufficiency
+                           gate judges, two columns: front what-it-covers. The
+                           gate pairs the first column with the driver roster's
+                           first column; ownership is not here, because the face
+                           node owns it and a signed handover moves it.
+    import-fronts --from <file> [--upsert]
+                           Put a front roster into the graph. Columns past the
+                           second are ignored and counted: the legacy file
+                           carried owner and deputy there, and importing them
+                           would be a second ownership truth. Without --upsert
+                           the input replaces the set (fronts it no longer names
+                           are cancelled); --upsert only writes the fronts it
+                           names. `--from -` reads stdin, so the one-time move
+                           of the deleted file needs nothing staged on the pod.
+    exemptions             Print every exemption in force, one line per row:
+                           kind, the kind's columns, then its expiry date. A
+                           row states why it exists and the last day it is in
+                           force; a reader judges the date, not a prose memory.
+    import-exemptions --from <file> [--upsert]
+                           Put exemption rows into the graph. Without --upsert
+                           the input is the whole set in force: rows it no
+                           longer states are withdrawn from their kind's node.
+                           --upsert only adds or renews the rows it names, which
+                           is how one exemption is granted without restating the
+                           rest. `--from -` reads stdin for the same reason as
+                           the other imports.
+    declarations --kind <kind>
+                           Print one declaration table from the graph: the rows
+                           a host reading judges against, in the kind's own
+                           columns and no header. Kinds:
+                           face-reading-criteria, principle-face-map.
+    import-declarations --kind <kind> --from <file> [--upsert]
+                           Put a declaration table into the graph. Without
+                           --upsert the input is the whole table: rows it no
+                           longer states are withdrawn from the kind's node.
+                           Row contracts and closed sets are enforced here, so
+                           a row the reader cannot use is refused on import.
     progress [--json]
                            One reading of three ledgers at the same instant: the
                            task graph by the unit it names, the change account,
@@ -166,6 +223,40 @@ pub enum Action {
     ImportReadings {
         from: PathBuf,
     },
+    /// The driver roster, five columns, straight from the graph.
+    Drivers,
+    ImportDrivers {
+        from: PathBuf,
+        /// Only write the units the input names. The host's reconciliation uses
+        /// this; the one-time replacement of the legacy table does not.
+        upsert: bool,
+    },
+    /// The closed set of fronts, two columns, straight from the graph.
+    Fronts,
+    ImportFronts {
+        from: PathBuf,
+        /// Only write the fronts the input names, so a declaration of one new
+        /// front cannot narrow the gate's scope to that one.
+        upsert: bool,
+    },
+    /// Every exemption in force, one row per line, straight from the graph.
+    Exemptions,
+    ImportExemptions {
+        from: PathBuf,
+        /// Only state the rows the input names: granting one exemption must not
+        /// silently withdraw the others that were in force.
+        upsert: bool,
+    },
+    /// One declaration table, straight from the graph: the rows a host reading
+    /// judges against.
+    Declarations {
+        kind: String,
+    },
+    ImportDeclarations {
+        from: PathBuf,
+        kind: String,
+        upsert: bool,
+    },
     // Boxed: a handover carries a spec whose text fields make it the widest
     // variant, and every other action would pay for that width. One CLI
     // process builds exactly one of these, so the extra allocation costs
@@ -215,10 +306,12 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
     let mut brief = false;
     let mut json = false;
     let mut keep_ownership = false;
+    let mut upsert = false;
     let mut out: Option<PathBuf> = None;
     let mut from: Option<PathBuf> = None;
     let mut face: Option<String> = None;
     let mut workspace: Option<String> = None;
+    let mut kind: Option<String> = None;
 
     let mut subcommand: Option<&str> = None;
     let mut iter = args.iter();
@@ -233,6 +326,7 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
             "--brief" => brief = true,
             "--json" => json = true,
             "--keep-ownership" => keep_ownership = true,
+            "--upsert" => upsert = true,
             "--out" => {
                 out = Some(PathBuf::from(iter.next().ok_or("--out needs a directory")?));
             }
@@ -244,6 +338,9 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
             }
             "--workspace" => {
                 workspace = Some(iter.next().ok_or("--workspace needs an id")?.clone());
+            }
+            "--kind" => {
+                kind = Some(iter.next().ok_or("--kind needs a name")?.clone());
             }
             other if other.starts_with('-') => return Err(format!("unknown option {other}")),
             other => {
@@ -269,6 +366,29 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
         Some("readings") => Action::Readings,
         Some("import-readings") => Action::ImportReadings {
             from: from.ok_or("import-readings needs --from <file>")?,
+        },
+        Some("drivers") => Action::Drivers,
+        Some("import-drivers") => Action::ImportDrivers {
+            from: from.ok_or("import-drivers needs --from <file>")?,
+            upsert,
+        },
+        Some("fronts") => Action::Fronts,
+        Some("import-fronts") => Action::ImportFronts {
+            from: from.ok_or("import-fronts needs --from <file>")?,
+            upsert,
+        },
+        Some("exemptions") => Action::Exemptions,
+        Some("import-exemptions") => Action::ImportExemptions {
+            from: from.ok_or("import-exemptions needs --from <file>")?,
+            upsert,
+        },
+        Some("declarations") => Action::Declarations {
+            kind: known_kind(kind)?,
+        },
+        Some("import-declarations") => Action::ImportDeclarations {
+            from: from.ok_or("import-declarations needs --from <file>")?,
+            kind: known_kind(kind)?,
+            upsert,
         },
         Some(other) => return Err(format!("unknown governance subcommand {other}")),
         None => return Err("governance needs a subcommand".into()),
@@ -374,8 +494,13 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
                 eprintln!("cogneva governance: {note}");
             }
             let backend = PostgresStateBackend::new(progress_pool.clone());
+            let events: Arc<dyn cog_core::EventStore> =
+                Arc::new(cog_storage::postgres::event_log::EventLogStore::new(
+                    progress_pool.clone(),
+                    "cogneva",
+                ));
             let change: Arc<dyn cog_core::ChangeLedgerStore> =
-                Arc::new(PostgresChangeLedgerStore::new(progress_pool.clone()));
+                Arc::new(PostgresChangeLedgerStore::new(progress_pool.clone()).with_events(events));
             let principle: Arc<dyn cog_core::PrincipleLedgerStore> =
                 Arc::new(PostgresPrincipleLedgerStore::new(progress_pool));
             progress(
@@ -393,6 +518,18 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
         }
         Action::Readings => readings_roster(&*store).await?,
         Action::ImportReadings { from } => import_readings(&*store, &from).await?,
+        Action::Drivers => drivers_roster(&*store).await?,
+        Action::ImportDrivers { from, upsert } => import_drivers(&*store, &from, upsert).await?,
+        Action::Fronts => fronts_roster(&*store).await?,
+        Action::ImportFronts { from, upsert } => import_fronts(&*store, &from, upsert).await?,
+        Action::Exemptions => exemptions_roster(&*store).await?,
+        Action::ImportExemptions { from, upsert } => {
+            import_exemptions(&*store, &from, upsert).await?
+        }
+        Action::Declarations { kind } => declarations_table(&*store, &kind).await?,
+        Action::ImportDeclarations { from, kind, upsert } => {
+            import_declarations(&*store, &from, &kind, upsert).await?
+        }
         Action::Act(act) => {
             // The heartbeat store is what an exit handover's apply step
             // re-reads. Without it the command still works for every handover
@@ -525,20 +662,140 @@ async fn readings_roster(store: &dyn GovernanceStore) -> Result<(), Box<dyn Erro
     Ok(())
 }
 
-async fn import_readings(store: &dyn GovernanceStore, from: &Path) -> Result<(), Box<dyn Error>> {
-    // `-` reads stdin. The roster has to get into the graph from a host that holds
-    // no database credentials, so the route is `kubectl exec -i ... import-readings
-    // --from -`: piped in, nothing staged on the pod's disk and nothing left there.
-    let text = if from == Path::new("-") {
+/// A roster import's input. `-` reads stdin: the roster has to get into the graph
+/// from a host that holds no database credentials, so the route is
+/// `kubectl exec -i ... import-<roster> --from -`: piped in, nothing staged on
+/// the pod's disk and nothing left there.
+fn read_roster_input(from: &Path) -> Result<String, Box<dyn Error>> {
+    if from == Path::new("-") {
         let mut text = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
             .map_err(|why| format!("cannot read stdin: {why}"))?;
-        text
+        Ok(text)
     } else {
         std::fs::read_to_string(from)
-            .map_err(|why| format!("cannot read {}: {why}", from.display()))?
-    };
+            .map_err(|why| format!("cannot read {}: {why}", from.display()).into())
+    }
+}
+
+async fn import_readings(store: &dyn GovernanceStore, from: &Path) -> Result<(), Box<dyn Error>> {
+    let text = read_roster_input(from)?;
     let summary = crate::governance_readings::import_from_text(store, &text).await?;
+    println!("{}", summary.line());
+    Ok(())
+}
+
+/// The driver roster, exactly the five columns the self-sufficiency gate parses.
+///
+/// Printed from the graph on every call: the gate has to judge the same rows the
+/// platform holds, and a cached copy on the host would be a second account of
+/// which units drive what — the thing the declaration file already was.
+async fn drivers_roster(store: &dyn GovernanceStore) -> Result<(), Box<dyn Error>> {
+    print!("{}", crate::governance_drivers::roster(store).await?);
+    Ok(())
+}
+
+async fn import_drivers(
+    store: &dyn GovernanceStore,
+    from: &Path,
+    upsert: bool,
+) -> Result<(), Box<dyn Error>> {
+    let text = read_roster_input(from)?;
+    let summary = if upsert {
+        crate::governance_drivers::upsert_from_text(store, &text).await?
+    } else {
+        crate::governance_drivers::import_from_text(store, &text).await?
+    };
+    println!("{}", summary.line());
+    Ok(())
+}
+
+/// The closed set, exactly the two columns the self-sufficiency gate parses.
+async fn fronts_roster(store: &dyn GovernanceStore) -> Result<(), Box<dyn Error>> {
+    print!("{}", crate::governance_fronts::fronts(store).await?);
+    Ok(())
+}
+
+async fn import_fronts(
+    store: &dyn GovernanceStore,
+    from: &Path,
+    upsert: bool,
+) -> Result<(), Box<dyn Error>> {
+    let text = read_roster_input(from)?;
+    let summary = if upsert {
+        crate::governance_fronts::upsert_from_text(store, &text).await?
+    } else {
+        crate::governance_fronts::import_from_text(store, &text).await?
+    };
+    println!("{}", summary.line());
+    Ok(())
+}
+
+/// The kind a `--kind` named, checked against the closed set here rather than
+/// inside the import: an unknown kind would otherwise write a node nobody
+/// reads, which looks exactly like a table with no rows.
+fn known_kind(kind: Option<String>) -> Result<String, String> {
+    let name = kind.ok_or("--kind <name> is required")?;
+    if crate::governance_declarations::kind_by_name(&name).is_none() {
+        return Err(format!(
+            "`{name}` is not one of {}",
+            crate::governance_declarations::kind_names()
+        ));
+    }
+    Ok(name)
+}
+
+fn declaration_kind(name: &str) -> &'static crate::governance_declarations::Kind {
+    crate::governance_declarations::kind_by_name(name)
+        .expect("parse_args only accepts declared kinds")
+}
+
+/// One declaration table, printed from the graph on every call: a consumer that
+/// judged a cached copy would be judging rows somebody already withdrew.
+async fn declarations_table(store: &dyn GovernanceStore, kind: &str) -> Result<(), Box<dyn Error>> {
+    print!(
+        "{}",
+        crate::governance_declarations::table(store, declaration_kind(kind)).await?
+    );
+    Ok(())
+}
+
+async fn import_declarations(
+    store: &dyn GovernanceStore,
+    from: &Path,
+    kind: &str,
+    upsert: bool,
+) -> Result<(), Box<dyn Error>> {
+    let text = read_roster_input(from)?;
+    let kind = declaration_kind(kind);
+    let summary = if upsert {
+        crate::governance_declarations::upsert_from_text(store, kind, &text).await?
+    } else {
+        crate::governance_declarations::import_from_text(store, kind, &text).await?
+    };
+    println!("{}", summary.line());
+    Ok(())
+}
+
+/// Every exemption in force, printed from the graph on every call: a consumer
+/// that judged a cached copy would be judging exemptions somebody already
+/// withdrew.
+async fn exemptions_roster(store: &dyn GovernanceStore) -> Result<(), Box<dyn Error>> {
+    print!("{}", crate::governance_exemptions::exemptions(store).await?);
+    Ok(())
+}
+
+async fn import_exemptions(
+    store: &dyn GovernanceStore,
+    from: &Path,
+    upsert: bool,
+) -> Result<(), Box<dyn Error>> {
+    let text = read_roster_input(from)?;
+    let summary = if upsert {
+        crate::governance_exemptions::upsert_from_text(store, &text).await?
+    } else {
+        crate::governance_exemptions::import_from_text(store, &text).await?
+    };
     println!("{}", summary.line());
     Ok(())
 }
@@ -844,18 +1101,41 @@ async fn project(
         ));
     }
 
+    // The declaration tables are contracts the host readings judge against: a
+    // criteria row says how a face's owed reading fails, a principle-face row
+    // says which face a theme belongs to. They are declarations, not
+    // measurements, so this projection is their only copy on a host that has no
+    // repository to read them from.
+    // A kind the graph does not state writes no file at all: a header over no
+    // rows would read as "the table is empty" to a reader, which is a different
+    // answer from "this platform never received the table".
+    let mut declaration_rows = 0usize;
+    let mut declaration_files: Vec<(String, String)> = Vec::new();
+    for kind in crate::governance_declarations::KINDS {
+        let Some(table) = crate::governance_declarations::declared_table(store, kind).await? else {
+            continue;
+        };
+        declaration_rows += table.lines().count();
+        declaration_files.push((format!("{}.tsv", kind.name), format!("{stamp}{table}")));
+    }
+
     std::fs::write(out.join("faces.tsv"), faces_tsv)?;
     std::fs::write(out.join("drift.tsv"), drift_tsv)?;
     std::fs::write(out.join("decisions.tsv"), decisions_tsv)?;
     std::fs::write(out.join("tasks.tsv"), tasks_tsv)?;
+    for (name, body) in &declaration_files {
+        std::fs::write(out.join(name), body)?;
+    }
     println!(
-        "wrote faces.tsv, drift.tsv, decisions.tsv and tasks.tsv at {} \
-         (faces={}, decisions={}, open_tasks={}, source_revision={}, \
-         owners_no_act_explains={})",
+        "wrote faces.tsv, drift.tsv, decisions.tsv, tasks.tsv and {} declaration \
+         tables at {} (faces={}, decisions={}, open_tasks={}, declaration_rows={}, \
+         source_revision={}, owners_no_act_explains={})",
+        declaration_files.len(),
         now.to_rfc3339(),
         faces.len(),
         decisions.len(),
         open_tasks.len(),
+        declaration_rows,
         revision,
         unexplained.len()
     );
@@ -899,6 +1179,45 @@ pub struct RosterRow {
     pub face: Face,
 }
 
+/// The first underscore-separated word of a `first_reading` cell decides
+/// whether the cell is a state list at all. Only then is the whole cell read
+/// as states: ordinary reading names (`tasks_rows_read`,
+/// `principle_ledger_enforced`) pass through untouched. This is the same
+/// boundary the commit-time vocabulary gate used while the roster was a file;
+/// the rule moves to the declaration point because the file is going away.
+///
+/// `never_measured` is the one word that is not a contract state:
+/// `Verdict::Unsettled` writes no state, so a row judged unsettled is read as
+/// never measured. It is a reading name, not a promise the platform produces.
+fn a_state_list_names_only_producible_states(cell: &str) -> Result<(), String> {
+    let states: Vec<&str> = PrincipleState::ALL.iter().map(|s| s.as_str()).collect();
+    let head = cell.split('_').next().unwrap_or("");
+    if !states.contains(&head) {
+        return Ok(());
+    }
+    let mut vocabulary: Vec<&str> = states;
+    vocabulary.push("never_measured");
+    // Longest first: `enforced` and `unenforced` share a suffix, and a short
+    // match taken at the wrong offset would leave a piece of a real word
+    // behind and report it as an unknown state.
+    vocabulary.sort_by_key(|w| std::cmp::Reverse(w.len()));
+    let mut rest = cell;
+    while !rest.is_empty() {
+        let Some(word) = vocabulary.iter().copied().find(|w| rest.starts_with(*w)) else {
+            return Err(rest.split('_').next().unwrap_or(rest).to_string());
+        };
+        rest = &rest[word.len()..];
+        if rest.is_empty() {
+            break;
+        }
+        match rest.strip_prefix('_') {
+            Some(tail) => rest = tail,
+            None => return Err(rest.split('_').next().unwrap_or(rest).to_string()),
+        }
+    }
+    Ok(())
+}
+
 /// Parse the roster file.
 ///
 /// Comment and blank lines are skipped. A row with the wrong width is an error
@@ -939,6 +1258,21 @@ pub fn parse_roster(text: &str) -> Result<Vec<RosterRow>, String> {
         if face_id.is_empty() {
             return Err(format!("line {}: no face name", index + 1));
         }
+        let first_reading = field(9);
+        // A `first_reading` that names a state list has to name states the
+        // contract really publishes. A reader waiting for a state like
+        // `unsettled` waits forever -- `Verdict::Unsettled` writes no state at
+        // all -- and that failure is invisible until somebody reads the row.
+        // Refusing it here answers at declaration time, before the graph
+        // carries a promise nothing can keep.
+        if let Some(cell) = &first_reading {
+            if let Err(unknown) = a_state_list_names_only_producible_states(cell) {
+                return Err(format!(
+                    "line {}: first_reading {cell:?} names {unknown:?}, which the principle contract cannot produce",
+                    index + 1
+                ));
+            }
+        }
         rows.push(RosterRow {
             face: Face {
                 spec: FaceSpec {
@@ -950,7 +1284,7 @@ pub fn parse_roster(text: &str) -> Result<Vec<RosterRow>, String> {
                     vacancy_until,
                     vacancy_assigner: field(7),
                     gap_task_id: field(8),
-                    first_reading: field(9),
+                    first_reading,
                     entry_path: field(10),
                     legacy_front_id: None,
                     source_fronts: field(12),
@@ -1470,8 +1804,7 @@ async fn import_faces(
     keep_ownership: bool,
     workspace: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let text = std::fs::read_to_string(from)
-        .map_err(|e| format!("cannot read {}: {e}", from.display()))?;
+    let text = read_roster_input(from)?;
     let summary = import_faces_from_roster(store, &text, keep_ownership).await?;
     println!("{}", summary.line());
     // Before the refusal below: an import that erased a binding still wrote the
@@ -1556,6 +1889,66 @@ mod tests {
             "the continuous writer refreshes descriptions and never moves a face"
         );
         assert_eq!(
+            parse_args(&args(&["fronts"])).unwrap().action,
+            Action::Fronts
+        );
+        assert_eq!(
+            parse_args(&args(&["import-fronts", "--from", "-", "--upsert"]))
+                .unwrap()
+                .action,
+            Action::ImportFronts {
+                from: PathBuf::from("-"),
+                upsert: true,
+            }
+        );
+        assert_eq!(
+            parse_args(&args(&["import-fronts", "--from", "fronts.tsv"]))
+                .unwrap()
+                .action,
+            Action::ImportFronts {
+                from: PathBuf::from("fronts.tsv"),
+                upsert: false,
+            }
+        );
+        assert_eq!(
+            parse_args(&args(&["exemptions"])).unwrap().action,
+            Action::Exemptions
+        );
+        assert_eq!(
+            parse_args(&args(&["import-exemptions", "--from", "-", "--upsert"]))
+                .unwrap()
+                .action,
+            Action::ImportExemptions {
+                from: PathBuf::from("-"),
+                upsert: true,
+            }
+        );
+        assert_eq!(
+            parse_args(&args(&["declarations", "--kind", "principle-face-map"]))
+                .unwrap()
+                .action,
+            Action::Declarations {
+                kind: "principle-face-map".into()
+            }
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "import-declarations",
+                "--kind",
+                "face-reading-criteria",
+                "--from",
+                "-",
+                "--upsert"
+            ]))
+            .unwrap()
+            .action,
+            Action::ImportDeclarations {
+                from: PathBuf::from("-"),
+                kind: "face-reading-criteria".into(),
+                upsert: true,
+            }
+        );
+        assert_eq!(
             parse_args(&args(&["assign"])).unwrap().action,
             Action::Assign {
                 face: None,
@@ -1577,6 +1970,16 @@ mod tests {
     fn a_subcommand_missing_its_operand_is_refused_rather_than_defaulted() {
         assert!(parse_args(&args(&["project"])).is_err());
         assert!(parse_args(&args(&["import-faces"])).is_err());
+        assert!(parse_args(&args(&["import-fronts"])).is_err());
+        assert!(parse_args(&args(&["import-exemptions"])).is_err());
+        assert!(parse_args(&args(&["declarations"])).is_err());
+        assert!(parse_args(&args(&["import-declarations", "--kind", "nope"])).is_err());
+        assert!(parse_args(&args(&[
+            "import-declarations",
+            "--kind",
+            "principle-face-map"
+        ]))
+        .is_err());
         assert!(parse_args(&args(&["faces", "--out"])).is_err());
         assert!(parse_args(&args(&[])).is_err());
         assert!(parse_args(&args(&["no-such-face"])).is_err());
@@ -1986,6 +2389,44 @@ mod tests {
         let line = ["-"; 11].join("\t");
         let text = format!("某面\tline\t{line}\n");
         assert!(parse_roster(&text).is_err());
+    }
+
+    fn face_line(first_reading: &str) -> String {
+        let mut columns = ["-"; 13];
+        columns[0] = "某面";
+        columns[1] = "face";
+        columns[9] = first_reading;
+        columns.join("\t") + "\n"
+    }
+
+    /// A reader waiting for a state the contract cannot produce waits forever,
+    /// and no reading says so. The import is the last place that still holds
+    /// the bytes before they become a graph node, so it refuses them there.
+    #[test]
+    fn a_first_reading_naming_an_unproducible_state_is_refused() {
+        let err = parse_roster(&face_line("enforced_unenforced_unsettled_retired")).unwrap_err();
+        assert!(err.contains("unsettled"), "{err}");
+    }
+
+    #[test]
+    fn a_first_reading_naming_published_states_is_accepted() {
+        let cell = "enforced_unenforced_never_measured";
+        let rows = parse_roster(&face_line(cell)).unwrap();
+        assert_eq!(rows[0].face.spec.first_reading.as_deref(), Some(cell));
+    }
+
+    /// The state check only starts when the first segment is a state word.
+    /// A reading name that merely ends in one -- `principle_ledger_enforced`
+    /// -- is a reading, not a promise about states.
+    #[test]
+    fn an_ordinary_reading_name_is_not_mistaken_for_a_state_list() {
+        for cell in [
+            "principle_ledger_enforced",
+            "tasks_rows_read",
+            "reading_enforced",
+        ] {
+            assert!(parse_roster(&face_line(cell)).is_ok(), "{cell}");
+        }
     }
 
     /// 没有在岗账时的形状必须是「读不到」而不是「没人」：调用方拿 None 就说不出

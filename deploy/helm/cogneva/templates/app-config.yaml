@@ -9,8 +9,8 @@ files/cogneva.json 里的服务地址与告警表达式写的是 `*.cogneva.svc.
 `Redis error: Password authentication failed`——口令是这一份的，连的却是隔壁那一份。
 两份口令碰巧相同时不会报错，会直接互相写数据。所以按 `cogneva.namespace` 替换这两类
 字面量；命名空间就是 cogneva 时替换恒等，k3s 三种 profile 的渲染产物一个字节都不变。
-注释用 Helm 注释而不写成 `#`：`#` 会原样落进渲染产物，让 `deploy/rendered/` 里三份
-已提交的清单无谓地漂移，`render-deploy.sh --check` 会因此判新鲜度失败。
+注释用 Helm 注释而不写成 `#`：`#` 会原样落进渲染产物，让同一份配置在不同命名空间
+安装出来的字节无谓地不同，而这份文件在 k3s 静态基线里还有另一份由同步脚本写入的副本。
 
 下面那组赋值里，**最后一行收尾必须是 `}}` 而不是 `-}}`**：`{{-` 把上游的换行剥光了
 （包括文件顶部最后一行注释行尾的换行），最后一个 `-}}` 再把 `apiVersion: v1` 之前的
@@ -60,7 +60,6 @@ JSON 不经过 Helm 渲染（文件里的双花括号是应用自己的 prompt �
       "\"port\": 9091" (printf "\"port\": %d" (int .Values.gateway.webhookPort))
       "\"port\": 5432" (printf "\"port\": %d" (int .Values.backends.postgres.port))
       (printf "postgres.%s.svc.cluster.local:5432" $ns) (printf "postgres.%s.svc.cluster.local:%d" $ns (int .Values.backends.postgres.port))
-      (printf "qdrant.%s.svc.cluster.local:6334" $ns) (printf "qdrant.%s.svc.cluster.local:%d" $ns (int .Values.backends.qdrant.grpcPort))
       (printf "seaweedfs.%s.svc.cluster.local:8333" $ns) (printf "seaweedfs.%s.svc.cluster.local:%d" $ns (int .Values.backends.seaweedfs.s3Port))
       (printf "meilisearch.%s.svc.cluster.local:7700" $ns) (printf "meilisearch.%s.svc.cluster.local:%d" $ns (int .Values.backends.meilisearch.port))
       (printf "redis-0.redis.%s.svc.cluster.local:6379" $ns) (printf "redis-0.redis.%s.svc.cluster.local:%d" $ns (int .Values.backends.redis.port))
@@ -71,9 +70,21 @@ JSON 不经过 Helm 渲染（文件里的双花括号是应用自己的 prompt �
       "cogneva-security-gateway:8081" (printf "cogneva-security-gateway:%d" (int .Values.securityGateway.llmProxyPort))
       "http://loki.monitoring.svc.cluster.local:3100" (printf "%s" .Values.observability.loki.endpoint)
       "http://cog-observability-prometheus.monitoring:9090" (printf "%s" .Values.observability.infraWatch.prometheusUrl)
-      "localhost:8080/metrics" (printf "localhost:%d/metrics" (int .Values.gateway.httpPort))
+      "localhost:8080/metrics" (printf "localhost:%d%s" (int .Values.gateway.httpPort) .Values.observability.metricsPath)
 -}}
 {{- range $from, $to := $portage }}{{ if not (contains $from $json) }}{{ fail (printf "app-config.yaml: %q is no longer written in files/cogneva.json, so this replacement would silently keep the old port -- update the pattern here to the file's new form" $from) }}{{ end }}{{ $json = replace $from $to $json }}{{ end }}
+{{- /* 执行器的地址是**无头服务的名字**，不是一份副本清单。客户端在每次派发时把名字
+       解析成此刻存在的那些副本，再按 agent 把一条 lane 钉在其中一副上（同一个 agent
+       的两条命令必须落在同一块卷上，否则它建的树下一次命令就找不到了）。走 ClusterIP
+       服务名不行：负载均衡会把同一 agent 的两条命令分到两副副本，lane 钉定的意义就被
+       抹掉了；无头服务把每个 Pod 变成一个地址，客户端拿到的是一份逐副本的表。
+
+       这里不再按序号展开：序号表是「客户端知道副本数」的那种写法，而副本数是部署在
+       扩缩的东西——名字解析拿到的表跟着副本变，加一副副本不需要改这里的一个字。 */ -}}
+{{- $sandboxBase := printf "http://cogneva-sandbox-executor:%d" (int .Values.sandboxExecutor.metricsPort) }}
+{{- if not (contains $sandboxBase $json) }}{{ fail (printf "app-config.yaml: %q is no longer written in files/cogneva.json, so the replica name would never replace it -- the file's sandbox_executor_url has a new form" $sandboxBase) }}{{ end }}
+{{- $sandboxName := printf "dns://cogneva-sandbox-executor-pods:%d" (int .Values.sandboxExecutor.metricsPort) }}
+{{- $json = replace $sandboxBase $sandboxName $json }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -113,20 +124,18 @@ metadata:
     {{- include "cogneva.labels" . | nindent 4 }}
     app.kubernetes.io/component: evolution
 data:
-  COGNEVA_SELF_EVOLUTION_ENABLED: "true"
+  {{- /* 进化开关、自动应用/部署、沙盒模式、切换模式与变更目录这一组不在这里写：
+         交接文档 `files/cogneva.json` 的 self_evolution 段已经写着同样的值，本 Pod
+         也挂那份文档。写第二遍的后果不是「多说一句」，而是两处一起改才生效——只改
+         文档，这里的字面量会沉默地盖回去，读文档的人以为改了行为，其实没有。 */}}
   # 本 Pod 是专用变更执行器：跑进化循环 / 基线移植 / 主线部署器。主应用 Pod 置
   # false 只留控制面（admin + GitOps 拉取端），两端不抢同一实例的工作树。
   COGNEVA_SELF_EVOLUTION_EXECUTOR_ENABLED: "true"
-  COGNEVA_SELF_EVOLUTION_AUTO_APPLY: "true"
-  COGNEVA_SELF_EVOLUTION_AUTO_DEPLOY: "true"
-  COGNEVA_SELF_EVOLUTION_SANDBOX_MODE: "true"
-  COGNEVA_SELF_EVOLUTION_SWITCH_MODE: "self_exec"
-  COGNEVA_SELF_EVOLUTION_CHANGE_DIR: "/opt/cogneva/sandbox/changes"
+  # 沙盒里的构建产物与备份目录是这份 Pod 与共享文档的**差**：文档写的是部署器那
+  # 棵稳定工作树的路径，这里换到沙盒自己的树下，所以它们留在这里，不是复述。
   COGNEVA_SELF_EVOLUTION_BINARY_DIR: "/opt/cogneva/sandbox/bin"
   COGNEVA_SELF_EVOLUTION_BACKUP_DIR: "/opt/cogneva/sandbox/backups"
   COGNEVA_SELF_EVOLUTION_POLL_INTERVAL_SECS: {{ .Values.evolution.pollIntervalSecs | int | quote }}
-  COGNEVA_SELF_EVOLUTION_TEST_TIMEOUT_SECS: {{ .Values.evolution.testTimeoutSecs | int | quote }}
-  COGNEVA_SELF_EVOLUTION_BUILD_TIMEOUT_SECS: {{ .Values.evolution.buildTimeoutSecs | int | quote }}
   # 工作树动态分配：部署器独占一棵稳定路径的检出，进化任务各取临时检出，
   # 互不影响；共享 CARGO_TARGET_DIR 在工作树之外，重建工作树不丢增量缓存。
   COGNEVA_SELF_EVOLUTION_WORKSPACES_ROOT: {{ .Values.evolution.workspaces.root | quote }}
@@ -151,7 +160,7 @@ data:
   # 走 GitOps 发布（annotated tag + evolution-release 分支推中央 bare 仓库），
   # L2 留审批台。推送只写挂载的 bare 仓库 /host-git，不持任何集群凭证。
   COGNEVA_SELF_EVOLUTION_PROMOTION_ENABLED: "true"
-  COGNEVA_GITOPS_ENABLED: "true"
+  COGNEVA_GITOPS_ENABLED: {{ .Values.gitops.enabled | quote }}
   COGNEVA_GITOPS_REPO_URL: "/host-git"
   # 沙盒只推不拉：拉取端（poll/金丝雀/回滚）跑在主部署 Pod，那里有 kubectl
   # 与 RBAC；本 Pod 起拉取端只会每轮报错。
@@ -184,7 +193,6 @@ data:
   # 走 in-memory 模式，凡是要跨重启活下来的状态就不能放在共享 memory 数据集里，
   # 得由其属主自己落到 app.data_dir 下。
   COGNEVA_MEMORY_ENABLED: "false"
-  COGNEVA_VECTOR_BACKEND_REQUIRED: "false"
   COGNEVA_STRICT_PERSISTENCE: "false"
   # 记忆衰减留在主 app：这条循环的单写者租约（角色 memory_decay）只回答「谁可以
   # 写」，不回答「写的那个人看到的是不是同一份数据」。本 Pod 的 memory 后端将来若
@@ -205,8 +213,8 @@ data:
   COGNEVA_MAINLINE_DEPLOYER_SOAK_SECS: {{ .Values.mainlineDeployer.soakSecs | int | quote }}
   COGNEVA_MAINLINE_DEPLOYER_FAILURE_COOLDOWN_SECS: {{ .Values.mainlineDeployer.failureCooldownSecs | int | quote }}
   COGNEVA_MAINLINE_DEPLOYER_CARGO_BUILD_JOBS: {{ .Values.mainlineDeployer.cargoBuildJobs | int | quote }}
-  # 变更验证那一趟的编译宽度。白名单会把它带进判据进程（`CARGO_BUILD_JOBS`）；不进
-  # 主线部署器的构建——那条路自己显式设这个变量。
+  # 变更验证那一趟的编译宽度种子。两条构建路径（验证与主线）在派生子进程时都会用
+  # 构建闸当拍量出的宽度覆盖它；这里只是没有闸、或还没有一拍测量时的种子。
   CARGO_BUILD_JOBS: {{ .Values.changeVerification.cargoBuildJobs | int | quote }}
   # 集群内 registry 那张卷的容量回收。声明量只有一个来源（PVC 自己的 spec），所以
   # 这里不配"卷有多大"；这里配的是判据与保留策略，占用读数取自 registry Pod 里只读
@@ -242,7 +250,5 @@ data:
   COGNEVA_MAINLINE_DEPLOYER_STACK_MANIFEST_DIR: {{ .Values.mainlineDeployer.observabilityStack.manifestDir | quote }}
   COGNEVA_MAINLINE_DEPLOYER_STACK_NAMESPACE: {{ .Values.mainlineDeployer.observabilityStack.namespace | quote }}
   COGNEVA_MAINLINE_DEPLOYER_STACK_BACKENDS: {{ .Values.mainlineDeployer.observabilityStack.backends | quote }}
-  COGNEVA_MAINLINE_DEPLOYER_STACK_APPLY_TIMEOUT_SECS: {{ .Values.mainlineDeployer.observabilityStack.applyTimeoutSecs | int | quote }}
-  COGNEVA_MAINLINE_DEPLOYER_STACK_MAX_NAMED_RESOURCES: {{ .Values.mainlineDeployer.observabilityStack.maxNamedResources | int | quote }}
   {{- end }}
 {{- end }}

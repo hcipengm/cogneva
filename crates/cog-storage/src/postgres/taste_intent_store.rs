@@ -45,8 +45,8 @@ CREATE TABLE IF NOT EXISTS cog_taste_intents (
                 subject       TEXT        NOT NULL,
                 submitted_by  TEXT        NOT NULL,
                 submitted_at  TIMESTAMPTZ NOT NULL,
-                payload       JSONB       NOT NULL,
-                evidence_refs JSONB       NOT NULL DEFAULT '[]'::jsonb,
+                payload       TEXT        NOT NULL,
+                evidence_refs TEXT        NOT NULL DEFAULT '[]',
                 status        TEXT        NOT NULL,
                 task_id       TEXT,
                 disposed_at   TIMESTAMPTZ
@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS cog_taste_intents (
 -- deployment that predates evidence_refs would reject its own submissions
 -- until somebody dropped the table by hand.
 ALTER TABLE cog_taste_intents
-    ADD COLUMN IF NOT EXISTS evidence_refs JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ADD COLUMN IF NOT EXISTS evidence_refs TEXT NOT NULL DEFAULT '[]';
 
 CREATE INDEX IF NOT EXISTS idx_cog_taste_intents_status
     ON cog_taste_intents(status, submitted_at);
@@ -87,15 +87,15 @@ impl PostgresTasteIntentStore {
         let id: Uuid = row
             .try_get("id")
             .map_err(|e| format!("id column unreadable: {e}"))?;
-        let payload: serde_json::Value = row
+        let payload: String = row
             .try_get("payload")
             .map_err(|e| format!("payload column unreadable: {e}"))?;
         let payload: TasteIntentPayload =
-            serde_json::from_value(payload).map_err(|e| format!("payload unparsable: {e}"))?;
-        let evidence_refs: serde_json::Value = row
+            serde_json::from_str(&payload).map_err(|e| format!("payload unparsable: {e}"))?;
+        let evidence_refs: String = row
             .try_get("evidence_refs")
             .map_err(|e| format!("evidence_refs column unreadable: {e}"))?;
-        let evidence_refs: Vec<String> = serde_json::from_value(evidence_refs)
+        let evidence_refs: Vec<String> = serde_json::from_str(&evidence_refs)
             .map_err(|e| format!("evidence_refs unparsable: {e}"))?;
         Ok(StoredTasteIntent {
             intent: TasteIntent {
@@ -151,8 +151,8 @@ impl PostgresTasteIntentStore {
 #[async_trait]
 impl TasteIntentSink for PostgresTasteIntentStore {
     async fn submit(&self, intent: &TasteIntent) -> SFResult<()> {
-        let payload = serde_json::to_value(&intent.payload)?;
-        let evidence_refs = serde_json::to_value(&intent.evidence_refs)?;
+        let payload = serde_json::to_string(&intent.payload)?;
+        let evidence_refs = serde_json::to_string(&intent.evidence_refs)?;
         let result = sqlx::query(
             "INSERT INTO cog_taste_intents \
                  (id, subject, submitted_by, submitted_at, payload, evidence_refs, status) \

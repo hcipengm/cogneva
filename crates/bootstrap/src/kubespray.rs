@@ -1,3 +1,4 @@
+// census-keep: shapes=clocks — 外部命令（apt-get、kubespray）的超时与重试都是这些工具自己的选项；删掉会让引导卡在它们的等待里，由工具约定兜住
 //! kubespray 标准 Kubernetes 集群供给。
 //!
 //! 元启动新建集群时，除了默认的 K3s，还可以用 kubespray 官方容器镜像新建
@@ -29,7 +30,8 @@ use super::{cn_mirror, command_exists, docker_mirror_host, download, probe_alive
 ///
 /// kubelet 报 Ready 与 apiserver 把它算进 node 列表之间有一个传播窗口；不等
 /// 这一下，紧接着的 wait_all_nodes_ready 会先数到一个缺了节点的集群。
-// cap: bound — kubelet 报 Ready 与 apiserver 把它算进 node 列表之间有一个传播窗；不等这一下，紧接的 wait_all_nodes_ready 会先数到一个缺了节点的集群
+// cap: fixed — kubelet 报 Ready 与 apiserver 把它算进 node 列表之间有一个传播窗；不等这一下，紧接的 wait_all_nodes_ready 会先数到一个缺了节点的集群
+// keep: 删掉后会在 apiserver 还没把节点算进列表时就开始等就绪，把缺节点的集群判成坏；由「Ready 到 node list 的传播窗」兜住
 const NODE_REGISTRATION_SETTLE: Duration = Duration::from_secs(5);
 
 /// kubespray 容器镜像 tag（跟随官方稳定版，它钉住经测试的 K8s 版本矩阵）。
@@ -335,11 +337,16 @@ pub(crate) async fn node_ssh_reachable(target: &str) -> bool {
 /// 预检：python3（kubespray 目标节点依赖）+ 本机 SSH 自可达（all-in-one ansible
 /// 经 127.0.0.1 连本机）。target 为 None 表示本机。
 async fn ensure_python(target: Option<&str>) -> Result<()> {
-    // 远端节点的 apt 源不归我们改（那是别人机器上的配置），所以这里用 timeout
-    // 把它变成"有界的失败"：远端直连 archive.ubuntu.com 时不会一直挂着，
-    // 报错也带得上"是这一步超时"的线索。
-    let ensure = "python3 --version >/dev/null 2>&1 || (timeout 300 apt-get update && timeout 600 apt-get install -y python3)";
-    sh_on(target, ensure).await
+    // 远端节点的 apt 源不归我们改（那是别人机器上的配置）。这里不用 `timeout`
+    // 包住整条 apt：到点就杀会杀了正在落盘的 dpkg，留下一个坏掉的包数据库，而
+    // 安装本身可能只差最后几个包。改用 apt 自己的连接级界——一次连接多久没有
+    // 数据就放弃（Acquire::*::Timeout）、等别的 apt 放锁最多多久（DPkg::Lock）。
+    // 这两个数都只判「这一条连接/这把锁停住了」，不判「整个安装跑了多久」。
+    let apt = "apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+               -o Acquire::Retries=2 -o DPkg::Lock::Timeout=300";
+    let ensure =
+        format!("python3 --version >/dev/null 2>&1 || ({apt} update && {apt} install -y python3)");
+    sh_on(target, &ensure).await
 }
 
 /// 保证 root 能以密钥免密 SSH 到本机 127.0.0.1（kubespray 容器经 host 网络连本机）。
@@ -347,7 +354,10 @@ async fn ensure_localhost_ssh() -> Result<()> {
     // 确保 sshd 在跑。
     sh_on(
         None,
-        "command -v sshd >/dev/null 2>&1 || (timeout 300 apt-get update && timeout 600 apt-get install -y openssh-server)",
+        "command -v sshd >/dev/null 2>&1 || (apt-get -o Acquire::http::Timeout=30 \
+         -o Acquire::https::Timeout=30 -o Acquire::Retries=2 -o DPkg::Lock::Timeout=300 \
+         update && apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+         -o Acquire::Retries=2 -o DPkg::Lock::Timeout=300 install -y openssh-server)",
     )
     .await?;
     sh_on(

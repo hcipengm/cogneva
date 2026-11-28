@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::contract::live_revision::LiveRevision;
 use crate::SFResult;
 
 /// What is outstanding about one named artifact.
@@ -29,7 +30,7 @@ use crate::SFResult;
 /// its parts -- it is a rendering for humans, not the key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChangeIdentity {
-    /// The kind of check: `grep`, `absent`, `exists`, ...
+    /// The kind of check: `grep`, `exists`, `gone`, ...
     pub kind: String,
     /// What the check looks in: a path or a directory.
     pub scope: String,
@@ -59,6 +60,19 @@ impl ChangeIdentity {
     pub fn as_key(&self) -> String {
         format!("{}:{}:{}", self.kind, self.scope, self.literal)
     }
+
+    /// 写进「这一轮做哪几条」那一份清单里的身份。
+    ///
+    /// 与 [`Self::as_key`] 的区别只有一条，而这一条正是清单要的：**它是一对一的**。
+    /// `kind:scope:literal` 把三段用冒号粘起来，字面量里带冒号的两条变更会粘出一模
+    /// 一样的两行——于是「这一批里有它」在清单上认得出错的那一条。清单是要拿来判
+    /// 「做完了没有」的，认出错的那一条与没认出来一样坏。
+    ///
+    /// 编码成 JSON 数组：三段各自转义，拼起来必然一对一，而且是稳定的（同一身份每次
+    /// 得到同一串），因为清单要跨进程、跨重启对得上。
+    pub fn batch_id(&self) -> String {
+        serde_json::json!([self.kind, self.scope, self.literal]).to_string()
+    }
 }
 
 impl std::fmt::Display for ChangeIdentity {
@@ -69,65 +83,59 @@ impl std::fmt::Display for ChangeIdentity {
 
 /// Where a change is, as of the last time something looked.
 ///
+/// Two states, and only two: the artifact is there (`landed`) or it is not yet
+/// (`pending`). Every word this enum used to carry beside them -- `conflict`,
+/// `partial`, `undecided`, `retired` -- was a way to move a row out of the
+/// outstanding set without anybody doing the work, and each of them could be
+/// written by the side being judged. "The documents disagree" and "nothing
+/// settled it" are readings about one pass, not places a change can be; they
+/// ride on the row as [`ChangeMeasurement::unsettled_reason`] while the state
+/// stays `pending`, so the work is still owed and the reason it has not been
+/// done is beside it rather than instead of it.
+///
+/// `retired` is the case that made the collapse necessary. A row whose identity
+/// should not be held was being written out of the outstanding set by the census
+/// itself -- the judged party marking its own work done. Most of what was retired
+/// had never been done; the account simply stopped asking. Those rows are
+/// `pending` now, and [`RetireReason`] says that the ask is, in the census's
+/// reading, one nobody should carry: a judgement about the row's place in the
+/// account, not a statement that the change is in the tree.
+///
 /// The set is closed: a state outside it is a caller error rather than a new
 /// category, and the storage layer refuses to store one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeState {
-    /// The artifact and the documents disagree about it.
-    Conflict,
-    /// Wanted, not there yet.
+    /// Not in the tree yet, whether because nobody has written it or because
+    /// the last look could not settle the question. `unsettled_reason` tells
+    /// the two apart; the state does not, on purpose -- turning "could not
+    /// measure" into something other than outstanding is how work disappears.
     Pending,
-    /// Partly there: some of what the change asks for exists.
-    Partial,
-    /// Nothing has looked, or what it found does not settle the question.
-    Undecided,
     /// A measurement found the artifact as the change asks for it.
     Landed,
-    /// A look found the identity itself is one the account should not be
-    /// holding, so there is nothing left to ask of the code tree. A second
-    /// terminal state beside [`ChangeState::Landed`], and like it a property of
-    /// the `(identity, criterion revision)` pair rather than of the artifact: a
-    /// later look at a different corpus can move the row back out, which is why
-    /// this is a state and not a deletion.
-    Retired,
 }
 
 impl ChangeState {
     /// Every state, in the order the repository views group them.
     ///
-    /// The two terminal states come last, side by side, because that is how a
-    /// reader asks about them: `landed` and `retired` are the two ways a row
-    /// stops being outstanding, and the four before them are the ways it is not.
-    pub const ALL: [ChangeState; 6] = [
-        ChangeState::Conflict,
-        ChangeState::Pending,
-        ChangeState::Partial,
-        ChangeState::Undecided,
-        ChangeState::Landed,
-        ChangeState::Retired,
-    ];
+    /// Outstanding first: a reader asking "what is owed" reads the leading part
+    /// of this list regardless of how long the rest becomes.
+    pub const ALL: [ChangeState; 2] = [ChangeState::Pending, ChangeState::Landed];
 
     pub fn as_str(self) -> &'static str {
         match self {
-            ChangeState::Conflict => "conflict",
             ChangeState::Pending => "pending",
-            ChangeState::Partial => "partial",
-            ChangeState::Undecided => "undecided",
             ChangeState::Landed => "landed",
-            ChangeState::Retired => "retired",
         }
     }
 
     /// Whether a row in this state is still outstanding work.
     ///
-    /// Both terminal states read false, and both for the same reason: a row
-    /// whose question has been answered -- by the artifact being there, or by the
-    /// identity turning out not to belong -- is not work anybody still owes. A
-    /// reader that asked "is it landed" to answer this would count every retired
-    /// row as outstanding.
+    /// A row that could not be measured is outstanding: the missing reading is
+    /// the row's work, and a state that read otherwise would turn every
+    /// unreadable scope into a silent completion.
     pub fn is_outstanding(self) -> bool {
-        !matches!(self, ChangeState::Landed | ChangeState::Retired)
+        self == ChangeState::Pending
     }
 }
 
@@ -135,10 +143,17 @@ impl std::str::FromStr for ChangeState {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::ALL
-            .into_iter()
-            .find(|state| state.as_str() == s)
-            .ok_or_else(|| format!("unknown change state: {s}"))
+        match s {
+            "pending" => Ok(ChangeState::Pending),
+            "landed" => Ok(ChangeState::Landed),
+            // The four words the account no longer has. A stored row was moved to
+            // `pending` by the migration; a projection or a note written before it
+            // still says the old word, and reading that as `pending` is the honest
+            // answer -- none of them was a certificate that the change is in the
+            // tree. Anything else is a caller error, not a new category.
+            "conflict" | "partial" | "undecided" | "retired" => Ok(ChangeState::Pending),
+            other => Err(format!("unknown change state: {other}")),
+        }
     }
 }
 
@@ -676,11 +691,133 @@ impl ChangeLedgerRow {
     /// the account can measure about itself -- the holder is named by the
     /// delivery, and the held are the rows measured at that same revision.
     ///
+    /// A row the census has judged out of the account does not hold it, even
+    /// though the row is still `pending`: the demand it was delivered for has
+    /// been taken back, so a delivered diff on it is not a promise anybody is
+    /// carrying. The judgement rides on the reason, not on the state, which is
+    /// why this asks about the reason rather than the state alone.
+    ///
     /// Deliberately a method over the row's own facts rather than a stored
     /// band: the moment the claim becomes true the state moves and this answers
     /// false, with nothing left behind to go stale.
     pub fn holds_the_line(&self) -> bool {
-        self.delivered_rev.is_some() && self.state.is_outstanding()
+        self.delivered_rev.is_some() && self.state.is_outstanding() && self.retire_reason.is_none()
+    }
+
+    /// 这一行做到哪一步了：三格（代码 / 上线 / 验证）。
+    ///
+    /// 状态词（`landed` / `pending` / …）只回答一个问题，而「做完了没有」是三个：
+    /// **树里有没有实现**、**跑着的那一版有没有它**、**判据对着真东西量过没有**。
+    /// 一个 `landed` 把前两个混在一起，读的人于是把「diff 进了主线」当成「线上有」。
+    ///
+    /// 三格都由行自己的事实与那一刻的现网读数算出来，谁也不能被写进来：
+    ///
+    /// - `code`：有 `delivered_rev`（一次 diff 到了主线）或 `state == Landed`
+    ///   （判据在树上为真）。两者都是「树里有」。
+    /// - `live`：现网 revision 是可命名的，而且**这一次量就是在那个 revision 上做的**
+    ///   （`measured_rev == live`）。少这一条，一个几小时前在别的 revision 上做的量
+    ///   会被读成「线上有」。
+    /// - `verified`：`landed_at` 有值——有一次量判它为真。`measured_at` 不够：它只说
+    ///   「有人看过」，看的结果可能是没落。
+    pub fn cells(&self, live: &LiveRevision) -> ChangeCells {
+        let code = self.delivered_rev.is_some() || self.state == ChangeState::Landed;
+        let live_filled = match (live.known(), self.measured_rev.as_deref()) {
+            (Some(running), Some(measured)) => running == measured,
+            _ => false,
+        };
+        ChangeCells {
+            code,
+            live: live_filled,
+            verified: self.landed_at.is_some(),
+        }
+    }
+}
+
+/// 一次「三格」快照：哪一刻、现网是哪一版、每一行填了哪几格。
+///
+/// 它是一份**读数**，不是一张表：由读得到现网 revision 的那一侧（编排层的
+/// `live_revision_pass`）周期性地算出来，读的那一侧只取最新的一份。存进账本会让
+/// 三格从「由事实算出来」变成「由谁写进去」，那正是这三格要防的。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeCellsSnapshot {
+    /// 这一份是哪一刻算的。
+    pub taken_at: DateTime<Utc>,
+    /// 算的时候，现网是哪一版（或为什么读不出来）。
+    pub live: LiveRevision,
+    /// 账本里每一行的三格。键是 [`ChangeIdentity::as_key`]。
+    pub cells: std::collections::BTreeMap<String, ChangeCells>,
+}
+
+impl ChangeCellsSnapshot {
+    /// 这一份里「代码填了、验证空着」的那几行——红的那一形状。
+    pub fn unverified(&self) -> impl Iterator<Item = (&String, &ChangeCells)> {
+        self.cells.iter().filter(|(_, cells)| cells.unverified())
+    }
+
+    /// 三格齐的行数、与各格填了的行数。**行数**而不是比例：比例在总量变化时
+    /// 会自己变好看，而行数不会。
+    pub fn census(&self) -> ChangeCellsCensus {
+        let mut census = ChangeCellsCensus::default();
+        for cells in self.cells.values() {
+            census.add(cells);
+        }
+        census
+    }
+}
+
+/// 一份快照按格数出来的行数。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeCellsCensus {
+    // 每一格数的是「填了的行数」，`rows` 是分母。行数而不是比例：比例在总量变化时
+    // 会自己变好看，行数不会。
+    pub rows: u64,
+    pub code: u64,
+    pub live: u64,
+    pub verified: u64,
+    pub terminal: u64,
+    /// 代码填了、验证空着：读作做完了、实际没人核过。
+    pub unverified: u64,
+}
+
+impl ChangeCellsCensus {
+    /// 把一行的三格数进去。
+    pub fn add(&mut self, cells: &ChangeCells) {
+        self.rows += 1;
+        self.code += u64::from(cells.code);
+        self.live += u64::from(cells.live);
+        self.verified += u64::from(cells.verified);
+        self.terminal += u64::from(cells.is_terminal());
+        self.unverified += u64::from(cells.unverified());
+    }
+}
+
+/// 一件变更的三格：每一格「填了没有」。
+///
+/// 填了不等于好——它只说这一步有证据。判「终态」与「红了」的是
+/// [`ChangeCells::is_terminal`] 与 [`ChangeCells::unverified`]。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeCells {
+    /// 树里有实现。
+    pub code: bool,
+    /// 跑着的那一版里有它。
+    pub live: bool,
+    /// 判据对着真东西量过，而且为真。
+    pub verified: bool,
+}
+
+impl ChangeCells {
+    /// 终态：三格都填。这就是「做完了」——台账上的 `已落` 与它同义。
+    pub fn is_terminal(&self) -> bool {
+        self.code && self.live && self.verified
+    }
+
+    /// **写着做完了、却没有量过**：代码那一格填了，验证那一格空着。
+    ///
+    /// 这一条是红的判据，而不是「进度不足」：一个 `landed` 而没有一次量的行，读作
+    /// 「这件事成了」，而它实际说的是「有人改过、没人核过」。两件事在账面上同形，
+    /// 差别只在这一格。
+    pub fn unverified(&self) -> bool {
+        self.code && !self.verified
     }
 }
 
@@ -699,16 +836,17 @@ impl ChangeLedgerRow {
 pub struct ChangeMeasurement {
     pub identity: ChangeIdentity,
     pub state: ChangeState,
-    /// Why, when the state is [`ChangeState::Retired`]. `None` for every other
-    /// state, and required for that one: a retirement that did not say why would
-    /// be a deletion wearing a state's clothes.
+    /// Why the census believes this row's identity is one the account should not
+    /// hold. Carried on a **pending** row: the reason is a judgement about the
+    /// row's place in the account, not a claim that the change is in the tree, so
+    /// it does not end the work -- it says what the ask has become.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retire_reason: Option<RetireReason>,
-    /// Why, when the state is [`ChangeState::Undecided`]. `None` for every other
-    /// state, and required for that one: a row retracted from the outstanding set
-    /// without a reason to argue with would read as answered. A name from the
-    /// judge's closed set, as text for the same reason [`ChangeLedgerRow`] keeps
-    /// it as text.
+    /// Why the last pass could not settle this row, when it could not. The row is
+    /// still `pending`: the missing reading is the row's work, and a row retracted
+    /// from the outstanding set without a reason to argue with would read as
+    /// answered. A name from the judge's closed set, as text for the same reason
+    /// [`ChangeLedgerRow`] keeps it as text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unsettled_reason: Option<String>,
     /// What the measurement saw, kept with the row so a state that disagrees
@@ -738,25 +876,10 @@ pub struct ChangeMeasurement {
 }
 
 impl ChangeMeasurement {
-    /// A measurement of a non-retired state.
-    ///
-    /// Panics on [`ChangeState::Retired`] rather than building a retirement with
-    /// no reason: retire through [`ChangeMeasurement::retired`], which cannot be
-    /// called without one. The alternative -- letting this build a reason-less
-    /// retirement and rejecting it later in the store -- would make the invariant
-    /// a property of one storage backend instead of of the value, and the two
-    /// would drift the moment a second backend appeared.
+    /// A measurement that settled the row, with no reason to carry: the two
+    /// states that are arguments about *why* a row is where it is have their own
+    /// constructors, and this one cannot build them without their reason.
     pub fn new(identity: ChangeIdentity, state: ChangeState) -> Self {
-        assert_ne!(
-            state,
-            ChangeState::Retired,
-            "a retirement must be built with ChangeMeasurement::retired so it carries a reason"
-        );
-        assert_ne!(
-            state,
-            ChangeState::Undecided,
-            "an undecided measurement must be built with ChangeMeasurement::undecided so it carries a reason"
-        );
         Self {
             identity,
             state,
@@ -768,18 +891,18 @@ impl ChangeMeasurement {
         }
     }
 
-    /// A measurement that could not settle the row because of a property of the
-    /// row itself, with the reason it could not.
+    /// A measurement that could not settle the row, with the reason it could not.
     ///
-    /// The reason is an argument rather than a field a caller may leave empty, so
-    /// an undecided measurement with no reason is not a value that can be built --
-    /// the same shape [`ChangeMeasurement::retired`] has, and for the same
-    /// reason: a row moved out of the outstanding set with nothing to say why
-    /// would read as answered.
+    /// The state stays [`ChangeState::Pending`]: "could not measure" is a defect
+    /// in the reading, not an answer about the tree, and the work of fixing it is
+    /// what the row is owed. The reason is an argument rather than a field a
+    /// caller may leave empty, so a row left unsettled with nothing to say why
+    /// cannot be built -- a pending row indistinguishable from an unread one
+    /// would read as measured.
     pub fn undecided(identity: ChangeIdentity, reason: impl Into<String>) -> Self {
         Self {
             identity,
-            state: ChangeState::Undecided,
+            state: ChangeState::Pending,
             retire_reason: None,
             unsettled_reason: Some(reason.into()),
             observation: None,
@@ -791,14 +914,17 @@ impl ChangeMeasurement {
     /// A measurement that found the identity is one the account should not hold,
     /// with the reason it should not.
     ///
-    /// The reason is an argument to this constructor rather than a field a caller
-    /// may leave empty, so a retirement without one is not a value that can be
-    /// built -- the closed set of reasons is a required part of the state, not a
-    /// label hung on it afterwards.
+    /// The row stays [`ChangeState::Pending`]: the census declining to ask again
+    /// is not the change being in the tree, and a retired row that read as done
+    /// was the judged party writing its own completion. The reason is an argument
+    /// to this constructor rather than a field a caller may leave empty, so a
+    /// retirement without one is not a value that can be built -- the closed set
+    /// of reasons is a required part of the judgement, not a label hung on it
+    /// afterwards.
     pub fn retired(identity: ChangeIdentity, reason: RetireReason) -> Self {
         Self {
             identity,
-            state: ChangeState::Retired,
+            state: ChangeState::Pending,
             retire_reason: Some(reason),
             unsettled_reason: None,
             observation: None,
@@ -1202,12 +1328,14 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// The rows that are still outstanding, most urgent band first and, within
     /// a band, stalest measurement first.
     ///
-    /// Both terminal states are left out, [`ChangeState::Landed`] and
-    /// [`ChangeState::Retired`]: a row whose question is answered is not work,
-    /// and a reader that took "not landed" for "outstanding" would hand a retired
-    /// row back to the tree and overwrite the retirement with whatever the tree
-    /// says -- which for an identity that is not an artifact is the unsettled
-    /// answer this state exists to stop repeating.
+    /// A landed row is left out: its question is answered, so it is not work. A
+    /// pending row is in, including the ones the census has judged the account
+    /// should not hold ([`ChangeMeasurement::retired`]): the judgement is about
+    /// the row's place in the account, and until somebody acts on it the ask is
+    /// still there to be read. What such a row must not get is another pass at
+    /// the tree -- re-asking a question whose answer cannot change only
+    /// re-stamps the same absent reading over the reason -- and that decision
+    /// stays with the census, which reads `retire_reason` before it measures.
     ///
     /// The band leads because the bound is what makes the order matter. A caller
     /// takes a slice of a set thousands deep, and a slice ordered only by
@@ -2071,6 +2199,21 @@ mod tests {
     /// Every state and reason round-trips through its name, and the lists hold no
     /// duplicates.
     ///
+    /// 批次清单上的身份必须一对一：`as_key` 把三段用冒号粘起来，字面量里带冒号的
+    /// 两条变更会粘成同一行——清单一旦认错那一条，「这一批做完了没有」就答的是别人。
+    #[test]
+    fn the_batch_id_separates_identities_the_flat_key_merges() {
+        let one = ChangeIdentity::new("grep", "crates/a", "fn x: y");
+        let two = ChangeIdentity::new("grep:crates/a", "fn x", " y");
+        assert_eq!(one.as_key().len(), two.as_key().len());
+        assert_ne!(
+            one.batch_id(),
+            two.batch_id(),
+            "两条不同的变更给出了同一个批次身份"
+        );
+        assert_eq!(one.batch_id(), one.batch_id(), "同一身份每次要给同一串");
+    }
+
     /// This is the gate on the closed sets: the storage writes a state by its
     /// name and reads it back by parsing, and a variant left out of `ALL` is one
     /// no reader enumerates -- the census would count it as absent and the row
@@ -2145,80 +2288,92 @@ mod tests {
         );
     }
 
-    /// The two terminal states are the two that are not outstanding.
+    /// The two states and what each says about whether work is owed.
     ///
-    /// A reader that asked "is it landed" to answer "is there work here" would
-    /// count every retired row as outstanding, and hand a fixture identity back
-    /// to the tree. This pins the predicate to the set so the two cannot drift.
+    /// Pinned to the set so a third word appearing here cannot quietly inherit
+    /// "not outstanding" -- that is how a row leaves the batch without anybody
+    /// doing it.
     #[test]
-    fn only_the_terminal_states_are_not_outstanding() {
+    fn only_landed_is_not_outstanding() {
+        assert_eq!(ChangeState::ALL.len(), 2);
         for state in ChangeState::ALL {
-            let terminal = matches!(state, ChangeState::Landed | ChangeState::Retired);
-            assert_eq!(state.is_outstanding(), !terminal, "{}", state.as_str());
+            assert_eq!(
+                state.is_outstanding(),
+                state != ChangeState::Landed,
+                "{}",
+                state.as_str()
+            );
         }
     }
 
-    /// A retirement cannot be built without a reason, and a reason cannot be hung
-    /// on a non-retired measurement.
+    /// A row that could not be measured is still pending, and says what was
+    /// missing.
     ///
-    /// The first half is a panic because the value is unbuildable; the second is
-    /// checked in the store, and this only pins the constructor's side of it.
+    /// "Could not measure" used to be its own state, which made an unreadable
+    /// scope look like an answer. Now the state stays `pending` and the reason
+    /// rides beside it: the row is still owed work, and the work is the missing
+    /// reading.
     #[test]
-    #[should_panic(expected = "must be built with ChangeMeasurement::retired")]
-    fn a_retirement_without_a_reason_cannot_be_built() {
-        let _ = ChangeMeasurement::new(
-            ChangeIdentity::new("grep", "crates/", "x"),
-            ChangeState::Retired,
-        );
-    }
-
-    #[test]
-    fn a_retirement_carries_its_reason_and_a_plain_measurement_carries_none() {
-        let retired = ChangeMeasurement::retired(
-            ChangeIdentity::new("grep", "crates/", "x"),
-            RetireReason::Fixture,
-        );
-        assert_eq!(retired.state, ChangeState::Retired);
-        assert_eq!(retired.retire_reason, Some(RetireReason::Fixture));
-
-        let pending = ChangeMeasurement::new(
-            ChangeIdentity::new("grep", "crates/", "x"),
-            ChangeState::Pending,
-        );
-        assert_eq!(pending.retire_reason, None);
-    }
-
-    /// An undecided row cannot be written without the reason it is undecided,
-    /// the same way a retirement cannot be written without its reason: a row
-    /// retracted from the outstanding set with nothing to say why would read as
-    /// answered.
-    #[test]
-    #[should_panic(expected = "must be built with ChangeMeasurement::undecided")]
-    fn an_undecided_measurement_without_a_reason_cannot_be_built() {
-        let _ = ChangeMeasurement::new(
-            ChangeIdentity::new("grep", "crates/", "x"),
-            ChangeState::Undecided,
-        );
-    }
-
-    #[test]
-    fn an_undecided_measurement_carries_its_reason_and_a_plain_one_carries_none() {
+    fn a_row_that_could_not_be_measured_is_still_outstanding() {
         let undecided = ChangeMeasurement::undecided(
             ChangeIdentity::new("grep", "crates/", "x"),
             "kind_without_predicate",
         );
-        assert_eq!(undecided.state, ChangeState::Undecided);
+        assert_eq!(undecided.state, ChangeState::Pending);
+        assert!(undecided.state.is_outstanding());
         assert_eq!(
             undecided.unsettled_reason.as_deref(),
             Some("kind_without_predicate")
         );
         assert_eq!(undecided.retire_reason, None);
 
-        let pending = ChangeMeasurement::new(
+        let settled = ChangeMeasurement::new(
             ChangeIdentity::new("grep", "crates/", "x"),
             ChangeState::Pending,
         );
-        assert_eq!(pending.unsettled_reason, None);
+        assert_eq!(settled.unsettled_reason, None);
+    }
+
+    /// A retirement is a judgement about the row, not a completion of it: the
+    /// row stays pending and carries the reason it should not be held.
+    ///
+    /// This is the shape that used to be wrong in the direction that costs most
+    /// -- the census writing its own rows out of the outstanding set.
+    #[test]
+    fn a_retired_row_is_still_pending_and_carries_why() {
+        let retired = ChangeMeasurement::retired(
+            ChangeIdentity::new("grep", "crates/", "x"),
+            RetireReason::Fixture,
+        );
+        assert_eq!(retired.state, ChangeState::Pending);
+        assert!(retired.state.is_outstanding());
+        assert_eq!(retired.retire_reason, Some(RetireReason::Fixture));
+        assert_eq!(retired.unsettled_reason, None);
+
+        let plain = ChangeMeasurement::new(
+            ChangeIdentity::new("grep", "crates/", "x"),
+            ChangeState::Pending,
+        );
+        assert_eq!(plain.retire_reason, None);
+    }
+
+    /// The four words the account no longer has read back as `pending`, and
+    /// nothing else sneaks in as a state.
+    ///
+    /// Old projections and notes still spell them; reading one as `landed` would
+    /// retire work that was never done, and reading one as an error would make
+    /// every old row unreadable.
+    #[test]
+    fn the_retired_words_read_as_pending_and_only_two_words_are_states() {
+        for word in ["conflict", "partial", "undecided", "retired"] {
+            assert_eq!(
+                word.parse::<ChangeState>(),
+                Ok(ChangeState::Pending),
+                "{word} should read as owed work"
+            );
+        }
+        assert_eq!("landed".parse::<ChangeState>(), Ok(ChangeState::Landed));
+        assert!("proposed".parse::<ChangeState>().is_err());
     }
 
     /// The band order is the one a reader acts on: `P0` outranks `P1`, and a
@@ -2419,5 +2574,111 @@ mod tests {
         row.delivered_rev = Some("abc123".into());
         row.state = ChangeState::Landed;
         assert!(!row.holds_the_line(), "a landed change holds nothing");
+    }
+
+    use crate::contract::live_revision::LiveRevisionGap;
+
+    fn cells_fixture() -> ChangeLedgerRow {
+        ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "crates/", "x"),
+            state: ChangeState::Landed,
+            title: None,
+            assertion: None,
+            sources: Vec::new(),
+            first_seen_at: Utc::now(),
+            measured_at: None,
+            measured_rev: None,
+            delivered_rev: Some("abc123".into()),
+            landed_at: None,
+            unsettled_reason: None,
+            retire_reason: None,
+            retired_at: None,
+        }
+    }
+
+    /// 代码那一格：`landed` 或有一次交付都算「树里有」。
+    #[test]
+    fn the_code_cell_is_filled_by_landing_or_by_a_delivered_diff() {
+        let mut row = cells_fixture();
+        assert!(
+            row.cells(&LiveRevision::Unmeasurable(
+                LiveRevisionGap::ClusterUnreadable
+            ))
+            .code
+        );
+        row.state = ChangeState::Pending;
+        assert!(
+            row.cells(&LiveRevision::Unmeasurable(
+                LiveRevisionGap::ClusterUnreadable
+            ))
+            .code
+        );
+        row.delivered_rev = None;
+        assert!(
+            !row.cells(&LiveRevision::Unmeasurable(
+                LiveRevisionGap::ClusterUnreadable
+            ))
+            .code
+        );
+    }
+
+    /// 上线那一格：现网 revision 命得出名字，而且**这一次量就是在它上面做的**。
+    /// 一条几小时前在别的 revision 上做的量，不能读成「线上有」。
+    #[test]
+    fn the_live_cell_needs_a_measurement_taken_on_the_running_revision() {
+        let mut row = cells_fixture();
+        let running = LiveRevision::Known("abc123".into());
+        row.measured_rev = Some("abc123".into());
+        assert!(row.cells(&running).live);
+
+        row.measured_rev = Some("older".into());
+        assert!(
+            !row.cells(&running).live,
+            "别的 revision 上的量不是「线上有」"
+        );
+
+        row.measured_rev = Some("abc123".into());
+        assert!(
+            !row.cells(&LiveRevision::Unmeasurable(
+                LiveRevisionGap::NoUnanimousMainTag
+            ))
+            .live,
+            "命名不出现网 revision 时，这一格不能填"
+        );
+    }
+
+    /// 验证那一格：有一次量判它为真。`measured_at` 不够——它只说有人看过。
+    #[test]
+    fn the_verified_cell_is_a_measurement_that_found_it_true() {
+        let mut row = cells_fixture();
+        let running = LiveRevision::Known("abc123".into());
+        row.measured_rev = Some("abc123".into());
+        assert!(!row.cells(&running).verified);
+        assert!(
+            row.cells(&running).unverified(),
+            "落了但没量过：这一行是红的那个形状"
+        );
+
+        row.landed_at = Some(Utc::now());
+        assert!(row.cells(&running).verified);
+        assert!(row.cells(&running).is_terminal());
+        assert!(!row.cells(&running).unverified());
+    }
+
+    /// 终态是三格齐，不是两格。少任何一格都不是「做完」。
+    #[test]
+    fn terminal_needs_all_three_cells() {
+        let running = LiveRevision::Known("abc123".into());
+        let mut row = cells_fixture();
+        row.measured_rev = Some("abc123".into());
+        row.landed_at = Some(Utc::now());
+        assert!(row.cells(&running).is_terminal());
+
+        row.measured_rev = None;
+        assert!(!row.cells(&running).is_terminal(), "缺上线格不是终态");
+        assert!(
+            !row.cells(&running).unverified(),
+            "缺的不是验证格，不该判红"
+        );
     }
 }

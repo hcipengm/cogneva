@@ -1,4 +1,6 @@
+# census-keep: shapes=truncations — 工具输出里的列宽与短摘要：完整值就在源文件/行号里（每行已带 path:line），删掉只会让一份报告撑满终端；由源文件本身兜住
 #!/usr/bin/env bash
+# reads: .github/workflows/*.yml subject
 # 推之前跑一遍 CI 里那些**只靠 shell 就能跑**的作业。
 #
 # 为什么要有这个调用点：2026-10-18 的一串提交里，连着十几个 commit 推上去之后红在
@@ -21,22 +23,25 @@
 # 拿一个固定的超时去包它，包出来的是「超时」而不是「绿/红」——要么给足时间，要么别把它
 # 当一次能等到结果的动作。也正因为被杀在中间，这一次没有给出任何判据读数：杀掉不等于通过。
 #
-# carrier: 人 —— 推之前手动跑。它没有自动调用点也不该有：跑的是 CI 自己的作业，
-#   再挂到 CI 上就是同一件事跑两遍。`check-gate-carriers.py` 认这一行。
+# carrier: 人 —— 调试入口，不挡任何一步。它没有自动调用点也不该有：跑的是 CI 自己的
+#   作业，再挂到 CI 上就是同一件事跑两遍。推之前要不要先跑它，是一个人的选择，不是流程
+#   的一环：CI 判的是同一批字节，漏跑它不会让任何东西更晚被发现，只是晚一点知道。
+#   `check-gate-carriers.py` 认这一行。
 #
 # 命令是从 `.github/workflows/ci.yml` 里**取**的，不是在这里抄一份：抄一份的门会在
 # 有人加作业时静默变窄，而这条门唯一不能犯的错就是「它绿了，CI 却红了」。
 #
-# 不覆盖：Check / Code Coverage / Version Contract /
+# 不覆盖：Check / Code Coverage / Version Contract / Clippy /
 # Web Build / Bootstrap Cross-Platform —— 它们要编译或要 Node，本机跑一遍可能比 CI
-# 还慢。末尾会把这份清单印出来：**这条门绿不等于 CI 绿**，它只保证那几类「改动碰了
-# 别的面的读者」的判据不是推上去才发现的。
+# 还慢，或者在 CI 上按红修与在本机按红修是同一件事。末尾会把这份清单印出来：**这条门
+# 绿不等于 CI 绿**，它只保证那几类「改动碰了别的面的读者」的判据不是推上去才发现的。
 #
 # Test 是个折中：整棵工作区在本机是十几分钟起，所以只判**这次动过的包加装配件**。
 # 2026-11-06 20:26 那笔直接推到 main 的改动正是死在「改了包却没跑包自己的测试」上，
 # 那一笔之后部署器停了九版。容量登记表那条秒级的纯文本扫描（`rust_capacity_constants_registry_test.rs`）
 # 仍然单独在这里跑，理由是它可以不编译就判。
 set -uo pipefail
+
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "${here}/../.." && pwd)"
@@ -57,6 +62,17 @@ if [ ! -r "${here}/lib/build-slot.sh" ]; then
 fi
 # shellcheck source=lib/build-slot.sh
 . "${here}/lib/build-slot.sh"
+# 等槽的秒数记在这里，由 lib/build-slot.sh 每次退出槽时追加一行。不这么做，表上的一格
+# 就是「这一格花了多少秒」，而其中可能有一半是排队——两件事要相反的应对（一格真慢要
+# 拆判据，排队久要加槽或让路），混在一行里读的人只会去优化编译。
+# 写不进去只是少了这一面拆分：这一跑照常判，格子按整段记，不拿一个没量到的数去减。
+slot_report="$(mktemp "${TMPDIR:-/tmp}/cogneva-gate-slot-waits.XXXXXX")" 2>/dev/null || slot_report=""
+[ -n "${slot_report}" ] && export COGNEVA_BUILD_SLOT_REPORT="${slot_report}"
+# 这一跑每一格的秒数与结局也写进构建槽目录下的 runs/：网关在它已有的「编译与测」那一面
+# 读，页面因此不必另开一条通道，也不必在宿主上再落一份自成一体的台账。缺了它只是屏上
+# 少这一面读数，判据不受影响。
+# shellcheck source=lib/gate-run-record.sh
+. "${here}/lib/gate-run-record.sh"
 # 按格记账：一格判过、它读的东西没变，下一次就不必再判一遍。没有它，这一跑仍然是对的，
 # 只是每一格都重判（改一个测试文件，199 格一起作废重跑）。
 # shellcheck source=lib/cell-stamp.sh
@@ -114,7 +130,7 @@ tool_sig() { # 名字 命令…
         printf '%s=absent\n' "${name}"
         return 0
     fi
-    printf '%s=%s\n' "${name}" "$("$@" 2>/dev/null | head -n 1)"
+    printf '%s=%s\n' "${name}" "$("$@" 2>/dev/null)"
 }
 
 work_tree_oid() {
@@ -144,8 +160,23 @@ work_tree_oid() {
 
 # 判据自己的输入：门脚本的字节、`ci.yml` 的字节、工具的版本、测试库设没设。
 # 三把键都要带上它——判据变了，上一次的结论就不再作数。
+# 这道门里「装置」的那一半：函数体与顶层变量，一格都不含具体判据。
+#
+# 原先这里哈希的是整份脚本，于是改一个只影响日志的槽标签、改一句某一个格子的说明，
+# 都会让 137 格的键同时变、一格也沿用不了——实测一次 105 格只沿用 2 格。而格子自己的
+# 命令本来就进了 `cell_id`（名字＋argv），改哪一格只有那一格该重判。真正该全体作废的
+# 是装置：调度、记录、槽、判词口径，它们在这份文件里全写成函数体与顶层赋值。
+gate_machinery() {
+    awk '
+        /^[A-Za-z_][A-Za-z0-9_]*\(\) *\{/ { in_fn = 1 }
+        in_fn { print; if ($0 ~ /^\}/) { in_fn = 0; print "" }; next }
+        /^[A-Za-z_][A-Za-z0-9_]*=/ { print; next }
+        /^set / { print; next }
+    ' "${here}/check-before-push.sh"
+}
+
 gate_inputs() {
-    [ -f "${here}/check-before-push.sh" ] && sha256sum "${here}/check-before-push.sh"
+    [ -f "${here}/check-before-push.sh" ] && gate_machinery | sha256sum
     [ -f "$root/.github/workflows/ci.yml" ] && sha256sum "$root/.github/workflows/ci.yml"
     tool_sig cargo cargo --version
     tool_sig rustc rustc --version
@@ -172,22 +203,38 @@ content_key() {
 # 落一笔；要推上去就得先变基，一变基树里就多了别人的文件，两小时白跑。谁的整门都快不
 # 过这个间隔，于是每个会话都在重复这两小时——不是红，是永远差一步。
 #
-# 所以第三把键记的是**改动本身**：从共同祖先到工作树的那一份 diff 的 patch-id，加判据
-# 自己的输入。`git patch-id --stable` 按补丁正文算——提交 id、blob id、`@@` 里的行号都
-# 不进哈希（2026-11-08 实测：只改这三样，id 一字不变），所以改动落在文件的哪一处不影响；
-# **改动前后那几行在场文字进哈希**，同一份改动换个上下文就是另一个 id。
+# 所以第三把键记的是**改动本身**：从共同祖先到工作树的那一份 diff，加判据自己的输入。
 #
-# 这两面都实测过（同一台机器，同一天）：
-#   - 今天这两笔变基到 `845c45a5`（别人只动了另外两个文件），整批的 id 一分没变
-#     （24a757a4…），这也是这条链能成立的原因；
-#   - 基底在紧邻处改过一行、把我的改动挤进另一片上下文，id 就换了。落空是保守的方向：
-#     宁可重判一次，不把「没判过的组合」放行。
-# 解冲突改了解法的变基同样换 id，这正是要拦的那种。
+# 这份 diff 的身份怎么算，实测过两次，两次都付过钱：
+#   - 第一版是 `git patch-id --stable`。2026-11-08 实测它按补丁正文算——提交 id、blob id、
+#     `@@` 里的行号都不进哈希，那两笔变基到 `845c45a5`（别人只动了另外两个文件）之后 id
+#     一分没变（24a757a4…），这也是这条链能成立的原因；
+#   - 2026-11-12 实测它还是把 `@@` 的**切法**算进身份。上游在紧邻处插了一行 `// cap:`，把
+#     同一片改动切成两段：10 笔干净变基（无冲突、增删行一字不差）之后 id 从 265b6c37… 变成
+#     dc23a383…，两小时的整门就此作废。而变基换掉的恰恰是上下文与切法，改动本身一个字没动。
+# 所以身份现在自己算（`patch_identity`）：逐行取增删行与文件元信息，上下文行、`@@` 头、
+# `index` 行的 blob 号这三样不进哈希——它们正是变基会换、而改动不会动的东西。增删行的次序
+# 仍逐个字节进哈希，所以解冲突改了解法、多加一行、少删一行，身份照样会变，那正是要拦的。
 #
-# 它证明的是另一句话，必须说准：**这批改动在当时那棵树上判过**，不是**这批改动与今天这棵
-# 树合起来判过**。合起来那一问由便宜的腿答——推之前那道钩子按推上去的树解引用、对改动的
+# 这一面必须说准：它证明的是**这批改动在当时那棵树上判过**，不是**这批改动与今天这棵树
+# 合起来判过**。合起来那一问由便宜的腿答——推之前那道钩子按推上去的树解引用、对改动的
 # 脚本跑 shellcheck，CI 再整棵判一遍。本机整门的职责是「别把明显坏的东西推上去」，不是
 # 替代 CI；把这两件事混成一件，门就会长到把自己卡死。
+# 一份 diff 的身份：留下增删行（含文件边界、模式变化、二进制声明），去掉上下文行、
+# `@@` 头、`index` 行的 blob 号。
+#
+# 为什么不用 `git patch-id`：理由在上面的注释里，一句话是它把 `@@` 的切法算进了身份，
+# 而上游在紧邻处插一行就会换掉切法。去掉的那三样正是「变基会换、改动不会动」的东西。
+#
+# 空的 diff 打出空串（调用方据此说「问不了」），不是空输入的一个哈希：没有任何改动的
+# 指纹与「一批改动」同形，读的人分不出这两种。
+patch_identity() { # stdin：`git diff` 的正文
+    local body
+    body="$(grep -Ev '^( |@@|index )' || true)"
+    [ -n "${body}" ] || return 0
+    printf '%s\n' "${body}" | sha256sum | cut -d' ' -f1
+}
+
 patch_key() { # [共同祖先] —— 工作树那一份（这一跑判的就是它）
     local base idx p
     base="${1:-}"
@@ -211,7 +258,7 @@ patch_key() { # [共同祖先] —— 工作树那一份（这一跑判的就是
     p="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY \
              -u GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE="${idx}" \
              git diff --cached --no-color --no-ext-diff "${base}" 2>/dev/null |
-         git patch-id --stable 2>/dev/null | cut -d' ' -f1)"
+         patch_identity)"
     rm -f "${idx}"
     [ -n "${p}" ] || return 1
     {
@@ -236,7 +283,7 @@ patch_key_committed() { # [共同祖先]
     [ -n "${base}" ] || return 1
     # 树对树，不碰索引与工作树：别人的在飞改动不在这份 diff 里。
     p="$(git diff --no-color --no-ext-diff "${base}" HEAD 2>/dev/null |
-         git patch-id --stable 2>/dev/null | cut -d' ' -f1)"
+         patch_identity)"
     [ -n "${p}" ] || return 1
     {
         printf 'patch=%s\n' "${p}"
@@ -268,11 +315,22 @@ print_cost_table() { # [段日志]
 # 有；父进程用兜底找到了它，孩子（`check-format.sh` 的 `command -v cargo`、各条夹具自己的
 # 自检）却按 PATH 找、找不到，于是同一台机器上「这一格判得了」而「这一格里那条用例说这
 # 机器没有 cargo」。找到的那一份交给孩子，两处就只有一个来源。
+#
+# node 是同一类，2026-11-14 实测到的是它的形状：那一跑在一个 `export PATH=<nvm>/bin:$PATH`
+# 的壳里起跑，gate_inputs 记下 `node=v22.…`；推送时钩子从没带 nvm 的 PATH 里被拉起来，
+# 同一棵树算出的是 `node=absent`——刚判绿的字节在推送口报「没验过」，人只能去查两把根本
+# 没有分歧的内容键。node 的兜底与 cargo 不同的是它按版本目录装（`~/.nvm/versions/node/
+# vX.Y.Z/bin/node`），所以取版本号最高的那一个，而不是写死一个版本。
 gate_rustc="$(command -v rustc || true)"
 [ -n "${gate_rustc}" ] || [ ! -x "${HOME}/.cargo/bin/rustc" ] || gate_rustc="${HOME}/.cargo/bin/rustc"
 gate_cargo="$(command -v cargo || true)"
 [ -n "${gate_cargo}" ] || [ ! -x "${HOME}/.cargo/bin/cargo" ] || gate_cargo="${HOME}/.cargo/bin/cargo"
-for gate_tool in "${gate_rustc}" "${gate_cargo}"; do
+gate_node="$(command -v node || true)"
+if [ -z "${gate_node}" ]; then
+    # cap: fixed — nvm 的安装位是约定，不是可调的量；版本号由目录名给出，不在这里写。
+    gate_node="$(ls -1d "${HOME}/.nvm/versions/node/"*/bin/node 2>/dev/null | sort -V | tail -n 1)"
+fi
+for gate_tool in "${gate_rustc}" "${gate_cargo}" "${gate_node}"; do
     [ -n "${gate_tool}" ] || continue
     gate_tool_dir="$(dirname "${gate_tool}")"
     case ":${PATH}:" in
@@ -298,7 +356,7 @@ case "${1:-}" in
 --status)
     key="$(tree_key)"
     if [ -f "${stamp_dir}/${key}" ]; then
-        echo "这份字节验过：$(head -n 1 "${stamp_dir}/${key}")"
+        echo "这份字节验过：$(cat "${stamp_dir}/${key}")"
         exit 0
     fi
     echo "这份字节没验过（$(git rev-parse --short HEAD 2>/dev/null)，键 ${key:0:12}）；"
@@ -334,10 +392,10 @@ case "${1:-}" in
     fi
     if [ -f "${stamp_dir}/patch.${pkey}" ]; then
         # 判词必须说清验的是什么。这一问验的是**这几笔改动本身**，不是它们落到这次推的
-        # 基底上的合并结果：干净的变基与「套得上但语义变了」的变基在 patch-id 上同形
+        # 基底上的合并结果：干净的变基与「套得上但语义变了」的变基在改动键上同形
         # （上游改了同一个函数的签名，这几笔照样干净套上、却编不过），本地分不出，只有
         # CI 整棵判得出。一句笼统的「已验证」会把这两件事说成一件。
-        echo "这批改动验过（验的是改动本身，不是它与基底 ${pbase:0:12} 的合并结果）：$(head -n 1 "${stamp_dir}/patch.${pkey}")"
+        echo "这批改动验过（验的是改动本身，不是它与基底 ${pbase:0:12} 的合并结果）：$(cat "${stamp_dir}/patch.${pkey}")"
         exit 0
     fi
     echo "这批改动（改动键 ${pkey:0:12}，基底 ${pbase:0:12}）没验过：这批改动本身改过、或从没跑过验证；"
@@ -352,7 +410,7 @@ case "${1:-}" in
         exit 2
     fi
     if [ -f "${stamp_dir}/content.${ckey}" ]; then
-        echo "这份字节验过：$(head -n 1 "${stamp_dir}/content.${ckey}")"
+        echo "这份字节验过：$(cat "${stamp_dir}/content.${ckey}")"
         exit 0
     fi
     echo "这份字节（内容键 ${ckey:0:12}）没验过：改过、或者从没跑过验证；"
@@ -376,9 +434,38 @@ run_dirty="$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
 # 记一把，结尾对不上就不记账：这一跑仍然回答了「开跑那棵树绿不绿」，但它不是现在这份
 # 字节的判词。取不到（读不出指纹）时不参与比对，交给结尾那一处自己说。
 start_ckey="$(content_key 2>/dev/null || true)"
+# 改动键的基底也记一把：远端在这一跑的期间往前走了，收尾那把键就会变，而这**不是**
+# 这批改动被改过——判过的字节一个位没动，变的只是「从哪儿算起」这个标签。两种漂移
+# 要分得开（2026-11-10 实测：同事在我这跑期间推进了 main，我这一跑判的字节没变，
+# 改动键却按「改动变过」作废，两小时白跑）。
+start_base="$(git merge-base HEAD origin/main 2>/dev/null || true)"
 start_pkey="$(patch_key 2>/dev/null || true)"
 
 failures=0
+
+# 编译纪律：一批编辑一次编译；编辑之后必须编译过。判据读宿主上的编译账本，
+# 账本由 scripts/hooks/install.sh 装的 cargo 垫片写。读不到就不判——量不到不是零次，
+# 也不是绿：它自己印一句，不混进任何一格的判词。
+if [ -x "$(dirname "${BASH_SOURCE[0]}")/check-compile-discipline.sh" ]; then
+    bash "$(dirname "${BASH_SOURCE[0]}")/check-compile-discipline.sh" || exit 1
+fi
+# 说出口的结论要带出处：「修好了」「引第 N 条」「普查完备」各要一行 Reading/Rule/Census。
+if [ -x "$(dirname "${BASH_SOURCE[0]}")/check-claims.sh" ]; then
+    bash "$(dirname "${BASH_SOURCE[0]}")/check-claims.sh" || exit 1
+fi
+# 默认做完整批：义务清单没做完又没有 Split 就拒；Split 的四条理由逐条判真假。
+# 判词在产品里（`cogneva ledger gate`）：同一套读数、同一份台账，带外不再有第二份实现。
+# 没有二进制就是**没判**（退 2），不是绿——`.test.sh` 那套用例判的是同一批判据。
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+batch_gate="${COGNEVA_BIN:-${repo_root:+$repo_root/target/debug/cogneva}}"
+if [ -n "$batch_gate" ] && [ -x "$batch_gate" ]; then
+    "$batch_gate" ledger gate || exit 1
+else
+    printf 'check-before-push: 后台没有平台二进制（%s），这一推的批次没有判。\n' \
+        "${batch_gate:-未找到}" >&2
+    exit 2
+fi
+
 # 「没判」与「判红」是两件事，读数上也得是两个：一格没进构建槽就跑，判词写成红是把
 # 机器的忙碌栽给这一笔改动；写成绿更糟，那是一份没人问过的字节被记成验过。所以它自己
 # 一格，挡住推送，但说的是它自己的话。
@@ -414,10 +501,50 @@ skip_ci_step() { # <这一步的名字> <为什么回放不了>
 # cargo 里面，这道门看不见。别把「本格 900 秒」读成「编译了 900 秒」——它可能是 100 秒
 # 编译加 800 秒排队。要分开这两者，得给排队那一层加上自己的读数，那是下一件事。
 segment_log="$(mktemp "${TMPDIR:-/tmp}/cogneva-gate-segments.XXXXXX")" || segment_log=/dev/null
-trap 'rm -f "${segment_log}"' EXIT
+# 同一份格子另写一份到构建槽目录：那份活得过这一跑的终端，网关从它已有的挂载里读出来，
+# 页面上的「编译与测」那一格就答得了「刚才那一推慢在哪」。写不进去只是少这一面读数，
+# 这一跑照常判——所以这里不问、也不拦。
+# 目录取构建槽客户端算好的那一个：同一个键、同一个默认值，两处各写一遍会在改过路径的
+# 机器上分叉——记录落在一个没人读的目录里，屏上永远是「没有这一跑」。
+run_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+run_file=""
+case "${run_root}" in
+# 夹具树是 `mktemp -d` 造的。把一次夹具跑记成「最近一跑」，页面上就会出现一棵早已删掉
+# 的树、一段几秒的「编译与测」——测试的产物穿着交付读数的外衣。判据只有一处，所以这条
+# 守卫写在这里，不散在各个夹具里。
+"${TMPDIR:-/tmp}"/*) ;;
+*) run_file="$(gate_run_begin "$(build_slot_dir_path)" "${run_root}" gate "$(date +%s)" "$$")" ;;
+esac
+finish_segments() {
+    rm -f "${segment_log}"
+    [ -z "${slot_report}" ] || rm -f "${slot_report}"
+    gate_run_finish "${run_file}"
+}
+trap finish_segments EXIT
 
+segments_written=0
 record_segment() { # <秒> <结局> <说明>
     printf '%s\t%s\t%s\n' "$1" "$2" "$3" >>"${segment_log}" 2>/dev/null
+    gate_run_append "${run_file}" "$1" "$2" "$3"
+    segments_written=$((segments_written + 1))
+}
+
+# 一格只记一行，排队的秒数从这一格里拆出来单独记一行「等槽」。
+#
+# 拆的依据是构建槽客户端写的那份报告（`build_slot_report`），量不到就不拆：宁可把整段
+# 记在这格上，也不拿一个没量到的数去减——减错的那一格会让人去拆一条并不慢的判据。
+# 这一行同时是「这一跑有多少时间不是在判」的唯一读数：门慢可以是判据贵，也可以是机器
+# 满，而这两个答案要求完全相反的动作。
+record_cell() { # <起始秒> <起始等槽行数> <结局> <说明>
+    local t0="$1" wait0="$2" outcome="$3" what="$4" row secs out txt
+    local waited
+    local -a rows=()
+    waited="$(build_slot_reported_waits_since "${wait0}")"
+    mapfile -t rows < <(cell_rows "$((SECONDS - t0))" "${waited}" "${outcome}" "${what}")
+    for row in "${rows[@]}"; do
+        IFS="$(printf '\t')" read -r secs out txt <<<"${row}"
+        record_segment "${secs}" "${out}" "${txt}"
+    done
 }
 
 run_suite_file() { # run_suite_file <说明> <模块名>
@@ -428,51 +555,59 @@ run_suite_file() { # run_suite_file <说明> <模块名>
     # 退出码，还要求它真的报出至少一条通过的用例。
     local what="$1"; shift
     local filter="$1"; shift
-    local out status t0=${SECONDS}
+    local out status t0=${SECONDS} wait0
+    wait0="$(build_slot_reported_lines)"
     out="$("$@" "${filter}" 2>&1)"
     status=$?
     printf '%s\n' "${out}" | tail -6
     if [ "${status}" -eq 75 ]; then
         printf 'UNJUDGED  %s：这一格没进构建槽，一行判据都没跑（不是红，也不是绿）。\n' "${what}" >&2
         unjudged=$((unjudged + 1))
-        record_segment "$((SECONDS - t0))" UNJUDGED "${what}"
+        record_cell "${t0}" "${wait0}" UNJUDGED "${what}"
         return 0
     fi
     if [ "${status}" -ne 0 ]; then
         printf 'RED  %s\n' "${what}" >&2
         failures=$((failures + 1))
-        record_segment "$((SECONDS - t0))" RED "${what}"
+        record_cell "${t0}" "${wait0}" RED "${what}"
         return 0
     fi
     if ! printf '%s\n' "${out}" | grep -Eq 'test result: ok\. [1-9][0-9]* passed'; then
         printf 'RED  %s：filter“%s”一条用例都没命中，这条判据没跑\n' "${what}" "${filter}" >&2
         failures=$((failures + 1))
-        record_segment "$((SECONDS - t0))" RED "${what}"
+        record_cell "${t0}" "${wait0}" RED "${what}"
         return 0
     fi
-    record_segment "$((SECONDS - t0))" ok "${what}"
+    record_cell "${t0}" "${wait0}" ok "${what}"
     return 0
 }
 
 run_step() { # run_step <说明> <命令…>
     local what="$1"; shift
-    local t0=${SECONDS} status
+    local t0=${SECONDS} status wait0 written0
+    wait0="$(build_slot_reported_lines)"
+    written0=${segments_written}
     printf '== %s\n' "${what}"
     "$@"
     status=$?
+    # 命令自己记过一格的，这一格不再记第二行：表上的两行会把同一段时间算两遍，
+    # 而「合计」是拿来排期的。外层只负责在里层什么都没记时兜底。
+    if [ "${segments_written}" -ne "${written0}" ]; then
+        return 0
+    fi
     if [ "${status}" -eq 0 ]; then
-        record_segment "$((SECONDS - t0))" ok "${what}"
+        record_cell "${t0}" "${wait0}" ok "${what}"
         return 0
     fi
     if [ "${status}" -eq 75 ]; then
         printf 'UNJUDGED  %s：这一格没进构建槽，一行判据都没跑（不是红，也不是绿）。\n' "${what}" >&2
         unjudged=$((unjudged + 1))
-        record_segment "$((SECONDS - t0))" UNJUDGED "${what}"
+        record_cell "${t0}" "${wait0}" UNJUDGED "${what}"
         return 0
     fi
     printf 'RED  %s\n' "${what}" >&2
     failures=$((failures + 1))
-    record_segment "$((SECONDS - t0))" RED "${what}"
+    record_cell "${t0}" "${wait0}" RED "${what}"
     return 0
 }
 
@@ -483,21 +618,45 @@ run_step() { # run_step <说明> <命令…>
 # 拿不准的格子继续走 run_step——不记账只是慢一点，记错账是把没判过的字节说成判过。
 run_cell_step() { # run_cell_step <说明> <外部命令…>
     local what="$1"; shift
-    local t0=${SECONDS} status=0
+    local t0=${SECONDS} status=0 wait0
+    # 与 run_step 同一条口径：等槽的秒数从构建槽客户端的报告里拆出去，记在另一行。
+    # 把整段记成一格等于把「机器满」和「判据贵」写成同一个数——这两件事要的动作相反。
+    wait0="$(build_slot_reported_lines)"
     cell_run "${what}" "$@" || status=$?
     if [ "${status}" -eq 0 ]; then
-        record_segment "$((SECONDS - t0))" ok "${what}"
+        record_cell "${t0}" "${wait0}" ok "${what}"
         return 0
     fi
     if [ "${status}" -eq 75 ]; then
         printf 'UNJUDGED  %s：这一格没进构建槽，一行判据都没跑（不是红，也不是绿）。\n' "${what}" >&2
         unjudged=$((unjudged + 1))
-        record_segment "$((SECONDS - t0))" UNJUDGED "${what}"
+        record_cell "${t0}" "${wait0}" UNJUDGED "${what}"
+        return 0
+    fi
+    # 三态是脚本自己说的：0 绿、1 红、3「这一条没判」。现网判据（读集群的配额与占用）
+    # 连得上集群却读不出配额时退 3；把它记成红，下一次真撞线时那一格与它逐字同形。
+    # 判词由脚本自己印在上面的输出里，这里记「没判」，不替它说成绿。
+    # 连不上集群是另一回事（退 4）：那台机器不是判这一格的地方，见下。
+    if [ "${status}" -eq 3 ]; then
+        printf 'UNJUDGED  %s：退 3（这一条没判），判词见上一行。\n' "${what}" >&2
+        unjudged=$((unjudged + 1))
+        record_cell "${t0}" "${wait0}" UNJUDGED "${what}"
+        return 0
+    fi
+    # 退 4 是格子自己说的「这一格不该在这台机器上判」：读数只在平台宿主上存在（现网配额、
+    # 集群占用）。它与退 3 的区别是「这里不是判它的地方」与「这里判过但没判成」；前者
+    # 与没装 pwsh 的那一步同一处置——点名记进没验的面，不拦推送。拦推送的仍是红，与
+    # 「本该在这里判却没判成」。
+    if [ "${status}" -eq 4 ]; then
+        # 走 skip_step 而不是自己印一行：印 SKIP 与记账必须同一个名单，否则判词里的
+        # 面数会少一个而看不出来（`skipped-faces-are-censused.test.sh` 钉的就是这件事）。
+        skip_step "${what}" "这一格只在平台宿主上判（判词见上一行）"
+        record_cell "${t0}" "${wait0}" SKIP "${what}"
         return 0
     fi
     printf 'RED  %s\n' "${what}" >&2
     failures=$((failures + 1))
-    record_segment "$((SECONDS - t0))" RED "${what}"
+    record_cell "${t0}" "${wait0}" RED "${what}"
     return 0
 }
 
@@ -635,7 +794,7 @@ capreg_compiled=no
 # 别的会话的构建一起抢同一台机器的 CPU 与 IO，而界是同一个数。不在槽里，读数归不到因，
 # 界也管不住它——「只差一秒」不是理由，界的单位是并发构建数，不是秒。
 if [ -n "${gate_rustc}" ] && \
-        build_slot_run "gate: 容量登记表（rustc 直编）" \
+        build_slot_run "容量登记表（rustc 直编）" \
             env CARGO_MANIFEST_DIR="${root}/crates/cogneva" \
             "${gate_rustc}" --test --edition 2021 -o "${capreg_bin}" "${capreg_src}"; then
     capreg_compiled=yes
@@ -694,8 +853,21 @@ if [ -n "${cargo_bin}" ]; then
         build_slot_run "名字契约（告警规则契约）" "${cargo_bin}" test -p cogneva --test suite
     run_suite_file "名字契约（观测面普查）" observability_scrape_census_contract_test \
         build_slot_run "名字契约（观测面普查）" "${cargo_bin}" test -p cogneva --test suite
+    # 交付文档的数字走查：`crates/cogneva/tests/shipped_config_numbers_are_registered_test.rs`
+    # 是唯一会在「交付文档抄了一个数」或「新增了一个没人说来源的数」时红的门，而它此前
+    # 同样只住在 CI 的 Test 里——新增一个数值叶子，要等下一次全量套件才可能被发现。
+    #
+    # 这一格**不带触发条件**，与上面那张 crate 骨架表不同。它判的是「文档里这个数是不是
+    # 应用自己会给出的答案」，答案来自各个 crate 的默认值：改任何一处 `impl Default` 都
+    # 可能让文档里某个叶子从「有来源」变成「抄件」，而那一笔往往不碰文档。按「这次动没
+    # 动 `cogneva.json`」开触发条件，正好漏掉这一半——而它漏掉的样子与判过了一模一样。
+    #
+    # 价格：判定不到 1 秒；编译与名字契约同一份 `cogneva` test target，轮到这一格时已经
+    # 热了。排在它们之后就是为这个。
+    run_suite_file "交付文档的数字走查（抄件 / 无主 / 每个叶子的来源）" shipped_config_numbers_are_registered_test \
+        build_slot_run "交付文档的数字走查" "${cargo_bin}" test -p cogneva --test suite
 else
-    skip_step "名字契约" "本机没有可用的 cargo（CI 的 Code Coverage 会跑这两步）"
+    skip_step "名字契约与交付文档走查" "本机没有可用的 cargo（CI 的 Code Coverage 会跑这几步）"
 fi
 
 # 工作区的骨架，两面都由树自己推、没有手工表：依赖方向、仅测试 crate 的豁免、crate 有没有
@@ -766,15 +938,13 @@ touched_crate_sources() {
     } | sed '/^[[:space:]]*$/d' | sort -u
 }
 
-# 这些字节里还有没有没提交的（已改／未跟踪都算）。Clippy 那一格问它：那一格原先判的是
-# HEAD 展开出来的临时树，而临时树里放不下脏树的改动——脏树上的绿会变成一份对
-# 「没人要推的字节」的判词，而末尾的戳记的却是盘上这份。
+# 这些字节里还有没有没提交的（已改／未跟踪都算）。Test 那一格问它：那一格判的是工作树，
+# 盘上有别人在飞的改动时要说明「判的比这一推多」，否则一份别人字节的判词会记到这一推头上。
 crate_sources_uncommitted() {
     git status --porcelain -- 'crates/*.rs' 2>/dev/null | sed '/^[[:space:]]*$/d'
 }
 
-# 整跑读一次，Clippy 与 Test 两格共用这一份。两格各读一次会在中间树变了的时候印出
-# 两个不一致的数——而收尾那把内容键本来就会让这一跑不记账，那时这两个数谁也不对。
+# 整跑读一次，Test 那一格读它（Clippy 交给 CI 之后，本机只剩这一个读它的格）。
 uncommitted_crate_sources="$(crate_sources_uncommitted)"
 
 # 数一次，两格共用。空表数出来是 0，不是 1：`printf '%s\n' ""` 仍然输出一个空行，
@@ -786,80 +956,12 @@ if [ -n "${uncommitted_crate_sources}" ]; then
     uncommitted_crate_count="$(printf '%s\n' "${uncommitted_crate_sources}" | wc -l | tr -d ' ')"
 fi
 
-# Clippy 那一格在 CI 里是整份 workspace 的 `--all-targets -- -D warnings`，红一格就判整轮
-# 四十分钟为红。它的红只值一行：2026-10-30 一次 `let mut` 的 `unused_mut` 就这样烧掉了一轮，
-# 而本机此前一条读数都看不见它——脚本末尾那句「未覆盖」里写着 Clippy。
-#
-# 本机不能整份跑：实测一次冷跑 214 秒。所以这一格的**题目**由 diff 推出来——这次要推的
-# 提交动过哪些 `crates/<dir>` 下的 `.rs`，就把那个计件包名（读 `crates/<dir>/Cargo.toml`
-# 的 `name`，不点名，`crates/bootstrap` 这种目录名与包名不一致的也不用另写一条）交给 cargo；
-# **每一个题目里跑的是 CI 的同一条命令与同一组 flag**，不挑 lint、不挑 target。CI 仍然整份跑。
-#
-# 判的是**提交**不是工作树：CI 编译的是推上去的那棵树，而共享工作树里别人飞到一半的字节
-# 会给这次推的判词投票——红的那个人往往不是推的人。所以 HEAD 展开到一个临时工作树里判，
-# 目标目录指向主树的 `target`：registry 依赖的指纹不随路径变，实测 `-p cog-quota` 在展开里
-# 1m27s，其中大部分是在等别人的构建锁，自己只花 22s CPU。
-if [ -n "${cargo_bin}" ]; then
-    if ! git rev-parse --verify --quiet 'origin/main^{commit}' >/dev/null; then
-        skip_step "Clippy" "本机没有 origin/main，推的范围判不出来（CI 的 Clippy 会整份跑）"
-    elif ! "${cargo_bin}" clippy --version >/dev/null 2>&1; then
-        skip_step "Clippy" "这个工具链没装 clippy 组件（CI 的 Clippy 会整份跑）"
-    else
-        mapfile -t touched_crates < <(
-            touched_crate_sources |
-                awk -F/ '$1 == "crates" && NF >= 3 { print $2 }' | sort -u
-        )
-        clippy_args=()
-        crate_count=0
-        for crate_dir in ${touched_crates[@]+"${touched_crates[@]}"}; do
-            package="$(sed -n 's/^name *= *"\([^"]*\)".*/\1/p' "crates/${crate_dir}/Cargo.toml" 2>/dev/null | head -1)"
-            if [ -n "${package}" ]; then
-                clippy_args+=(-p "${package}")
-                crate_count=$((crate_count + 1))
-            else
-                # 有 `.rs` 却读不到包名：那个目录不是工作区成员。另一条门
-                # （`crate_source_membership_contract_test`）判这件事，这里只说没判到。
-                skip_step "Clippy" "crates/${crate_dir} 下这次动过源码但读不到包名，这一份没判（CI 的 Clippy 会整份跑）"
-            fi
-        done
-        if [ "${crate_count}" -gt 0 ] && [ "${uncommitted_crate_count}" -gt 0 ]; then
-            # 树脏时就地判：临时树里放不下脏树的改动，而末尾盖的戳是盘上这份字节。
-            # 判一份没人要推的字节、再把结论记到这份字节头上，等于用一个别的树的
-            # 结论替这棵树背书。与 Test 那一格同一取舍：多判别人的在飞改动是不绿得
-            # 过头，不是假绿。
-            echo "== Clippy：这次动过 ${crate_count} 个 crate 的源码（其中 ${uncommitted_crate_count} 份还没提交），判的是工作树"
-            judge_worktree_clippy() {
-                build_slot_run "clippy ${clippy_args[*]}" \
-                    "${cargo_bin}" clippy "${clippy_args[@]}" --all-targets -- -D warnings
-            }
-            run_step "cargo clippy ${clippy_args[*]} --all-targets -- -D warnings" judge_worktree_clippy
-        elif [ "${crate_count}" -gt 0 ]; then
-            repo_toplevel="$(git rev-parse --show-toplevel)"
-            head_tree="$(mktemp -d "${TMPDIR:-/tmp}/cogneva-push-clippy.XXXXXX")"
-            git worktree prune 2>/dev/null
-            if git worktree add --detach --quiet "${head_tree}" HEAD 2>/dev/null; then
-                echo "== Clippy：这次要推的提交动过 ${crate_count} 个 crate 的源码，判的是 HEAD 展开出来的那棵树"
-                judge_head_tree_inner() {
-                    ( cd "${head_tree}" &&
-                        CARGO_TARGET_DIR="${repo_toplevel}/target" \
-                            "${cargo_bin}" clippy "${clippy_args[@]}" --all-targets -- -D warnings )
-                }
-                judge_head_tree() {
-                    build_slot_run "clippy ${clippy_args[*]}" judge_head_tree_inner
-                }
-                run_step "cargo clippy ${clippy_args[*]} --all-targets -- -D warnings" judge_head_tree
-                git worktree remove --force "${head_tree}" >/dev/null 2>&1 || rm -rf "${head_tree}"
-            else
-                rm -rf "${head_tree}"
-                skip_step "Clippy" "展开不出 HEAD 的临时工作树（${head_tree}），这一份没判（CI 的 Clippy 会整份跑）"
-            fi
-        else
-            echo "== Clippy：这次要推的提交与工作树都没动 crates/ 下的 .rs，跳过（CI 的 Clippy 会整份跑）"
-        fi
-    fi
-else
-    skip_step "Clippy" "本机没有可用的 cargo 或 python3（CI 的 Clippy 会整份跑）"
-fi
+# Clippy 这一格原先在本机跑：题目由 diff 缩到这次动过的 crate，命令与 flag 同 CI。属主
+# 2026-11-19 定把它交给 CI，理由是“红就在 CI 上按红修”——本机跑不跑都不改变要修的东西，
+# 而 CI 的日志里同样是 lint 名、文件与行号，本机这一格换来的只有几分钟的提前量。删掉它，
+# 这台 4 核 7G 的机器上最重的一次并行编译不再与别的活抢内存；代价是 clippy 红会落在 main
+# 上一次（部署器按设计在红期间不滚），所以末尾那句「未覆盖」里点名它，让读判词的人看得见
+# 这份绿不管 lint。
 
 # Test：CI 的 Test 作业跑 `cargo test --workspace --no-fail-fast`。整棵在本机是十几
 # 分钟起，而这一步要站在每一次推送前面，所以收窄到**这次要推的提交动过的包，加上
@@ -933,6 +1035,21 @@ else
     skip_step "提交引用可达性" "本机没有 python3 或没有 origin/main（CI 的 Check 会跑编译）"
 fi
 
+# 私有仓的名字不许出现在要推的这份字节里。判据只有一份、住在私有仓（名单从它自己的仓名推；
+# 写进公开树就等于把它要防的东西放进被它守的树里），所以这一格只是一个**位置**。CI 那道
+# `.github/scripts/check-private-identifiers.sh` 的裸标识层名单从 secret 注入，本机没有 secret，
+# 它自己印「这一遍没跑」——2026-11-20 实测一次代价：`5a3137db3` 的一行注释点了私有仓的名字与
+# 路径，推到了两个远端，而推之前这一侧没有任何一层在问这个名字。
+# 没配私有仓检出的机器上这一格退 75，记成 UNJUDGED，不是绿。
+run_step "私有标识（公开树里不许出现私有仓的名字）" \
+    bash "${here}/check-private-names.sh" "${here}/.."
+
+# 提交信息不带 AI 署名（`Check commit messages carry no AI attribution`）：这一步不
+# 在这里另写一份。判的字节在提交信息里，一旦推上去能修的只剩历史，而 CI 那一步以前是
+# 多行块、本机回放不了，于是本机从来没判过它、判词里一直写着「这一面没验」。现在范围
+# 计算收在 `check-commit-attribution-ci.sh` 里，CI 那一步是单行，这里**回放的就是它**，
+# 本机与 CI 判的是同一段范围、同一份判据。
+
 # ShellCheck：清单同样由 git 推出来，与 CI 同一条命令。
 mapfile -t shell_scripts < <(git ls-files '*.sh')
 # 零个脚本时 shellcheck 没有参数，它读 stdin、读到空、退 0——「一个脚本都没读到」
@@ -970,35 +1087,74 @@ fi
 # 「判了的全绿」与「每一面都判过」是两句话。上一版只说前一句，于是缺工具的格子（印了
 # SKIP 的那些）在判词上与验过同形——同一份字节在一台装了 pwsh 的机器上有 8 面都验过，
 # 在这台只有 7 面，两次都说「全绿」。要推的是字节，不是机器，所以没验的那几面得点名。
-skipped_list="$(printf '%s\n' "${skipped_faces[@]:-}" | awk 'NF && !seen[$0]++' | paste -sd'、' -)"
-if [ -n "${skipped_list}" ]; then
-    echo "PRE-PUSH: 判过的 $(wc -l <"${segment_log}" 2>/dev/null | tr -d ' ') 步全绿；另有 $(printf '%s\n' "${skipped_list}" | tr '、' '\n' | wc -l | tr -d ' ') 面本机没验，不算验过：${skipped_list}。"
+# 名字与条数从同一个地方数出来。上一版用 `paste -d'、' -` 拼名字、再用 `tr '、' '\n'`
+# 数条数：`paste -d` 的分隔符按**字节**取（C locale 下 `、` 只取了首字节 0xe3），印出来是
+# 一个替换符、几个面名黏成一句；而 `tr` 也按字节切，正好把那一个字节切成换行，条数歪打正着
+# 是对的。两处都不能留：名字是给人读的，读不出来等于没点名；条数若哪天跟着改了实现，就没
+# 人发现它其实一直在数错。现在 awk 一次拼出名字（它写的是 UTF-8 字节，不经过任何 locale
+# 规则），条数直接数数组。
+skipped_unique=()
+if [ "${#skipped_faces[@]}" -gt 0 ]; then
+    mapfile -t skipped_unique < <(printf '%s\n' "${skipped_faces[@]}" | awk 'NF && !seen[$0]++')
+fi
+skipped_count="${#skipped_unique[@]}"
+skipped_list=""
+if [ "${skipped_count}" -gt 0 ]; then
+    skipped_list="$(printf '%s\n' "${skipped_unique[@]}" |
+        awk 'NR == 1 { out = $0; next } { out = out "、" $0 } END { printf "%s", out }')"
+fi
+if [ "${skipped_count}" -gt 0 ]; then
+    echo "PRE-PUSH: 判过的 $(wc -l <"${segment_log}" 2>/dev/null | tr -d ' ') 步全绿；另有 ${skipped_count} 面本机没验，不算验过：${skipped_list}。"
     echo "         这几面推上去由 CI 判，它们红了这一跑看不出来——所以别把这一行读成整轮验过。"
 else
     echo "PRE-PUSH: 上列的判据全绿。"
 fi
-echo "Clippy 只判这次要推的提交动过的 crate；其余 crate 的 lint 仍由 CI 整份跑。"
 echo "Test 只判这次动过的包加装配件 cogneva；其余 crate 的测试仍由 CI 整棵跑。"
 echo "未覆盖（要编译 / 要 Node，CI 才会跑）：Check / Code Coverage /"
-echo "Version Contract / Web Build / Bootstrap Cross-Platform。"
+echo "Version Contract / Clippy / Web Build / Bootstrap Cross-Platform。"
 
 # 绿了才记账。红的那一跑什么也不写：一份没验过的字节不能因为「上次跑过」就推得出去。
 #
 # 三笔分开记，因为它们回答三个不同的问题：
 #   - 内容键（`content.<键>`）：这一跑判的就是工作树的字节，脏不脏无关——提交之后字节不变，
 #     所以提交前后同一份指纹，提交那一问（`--status-content`）命中的正是判过的那一份；
-#   - 改动键（`patch.<键>`）：从共同祖先到工作树的那份 diff 的 patch-id。远端往前走了、
-#     变基到新基底上，改动还是这一批，这一笔照样命中；改动本身被改过（解冲突改了解法）
-#     才作废。推送那一问（`--status-patch`）问的是它；
+#   - 改动键（`patch.<键>`）：从共同祖先到工作树的那份 diff 的身份（`patch_identity`），再加上整门的
+#     输入（`gate_inputs`：门脚本、`ci.yml`、工具版本）。远端往前走了、变基到新基底上，
+#     改动还是这一批，这一笔照样命中——**前提是那几笔没动整门自己的输入**：输入变了，
+#     那一跑判的是旧输入下的结论，这一批要按新输入重判。改动本身被改过（解冲突改了解法）
+#     同样作废。推送那一问（`--status-patch`）问的是它；
 #   - 推送键（`<HEAD+origin/main>`）：只在干净的树上成立，因为推上去的是 HEAD，而这跑判的
 #     是工作树；脏的时候两者不是同一份字节，只在结尾说明。
 mkdir -p "${stamp_dir}" 2>/dev/null
 ckey="$(content_key)"
 pkey="$(patch_key)"
+# 「算不出改动键」与「没有改动可判」是两句话，读它们的人会去查不同的东西。共同祖先涨到了
+# HEAD（远端已经含了这一支）、工作树又干净时，从基底到工作树本来就没有 diff，身份是
+# 空的——这不是读不出来，是没东西可读。2026-11-10 实测：这一形状记不上改动键，印的却是
+# 「没有共同祖先，或临时索引写不了」，于是下一个人去查那把根本不缺的东西。
+# 判据是**两个树对象相等**，用的就是这一跑自己那套定位工作树的办法（`add -A` 进临时索引），
+# 不是另起一套更松的「脏不脏」：脏不脏问的是相对 HEAD，而这里问的是相对基底，两者在
+# 「远端已经含了这一支」时不是一回事。
+patch_why=""
+if [ -z "${pkey}" ]; then
+    base_probe="$(git merge-base HEAD origin/main 2>/dev/null || true)"
+    if [ -n "${base_probe}" ]; then
+        wtree="$(work_tree_oid)"
+        btree_obj="$(git rev-parse --verify "${base_probe}^{tree}" 2>/dev/null || true)"
+        if [ -n "${wtree}" ] && [ -n "${btree_obj}" ] && [ "${wtree}" = "${btree_obj}" ]; then
+            patch_why="no-diff"
+        else
+            patch_why="unreadable"
+        fi
+    else
+        patch_why="unreadable"
+    fi
+fi
 # 开跑时那把指纹与现在这把对不上，说明中间有人动过树：现在这份字节没有被这一跑判过，
 # 两把键都不记。判词本身照常留在输出里——它说的是开跑那棵树。
 moved=0
 moved_why="这棵树在跑的过程中变过"
+tree_moved=0
 if [ -n "${start_ckey}" ] && [ -z "${ckey}" ]; then
     # 「算不出」与「变过」都让这一跑不能记账，但叫人去做的事相反：前者是收尾这一问
     # 读不到（树忽然读不出来），后者是有人动了字节。落进同一条消息里，读的人会去找
@@ -1012,15 +1168,40 @@ if [ -n "${start_ckey}" ] && [ -z "${ckey}" ]; then
     echo "记账：收尾算不出内容键（开跑 ${start_ckey:0:12}），内容键不记；改动键照记——这一跑判过这批改动，缺的是收尾那一问。" >&2
 elif [ -n "${start_ckey}" ] && [ "${ckey}" != "${start_ckey}" ]; then
     moved=1
+    tree_moved=1
     echo "记账：${moved_why}（开跑 ${start_ckey:0:12}，收尾 ${ckey:0:12}），这一跑的判词不属于现在这份字节，两把键都不记。" >&2
     ckey=""
 fi
 voided_patch=0
-if [ -n "${start_pkey}" ] && [ -n "${pkey}" ] && [ "${pkey}" != "${start_pkey}" ]; then
-    moved=1
+base_now="$(git merge-base HEAD origin/main 2>/dev/null || true)"
+base_moved=0
+if [ -n "${start_base}" ] && [ -n "${base_now}" ] && [ "${base_now}" != "${start_base}" ]; then
+    base_moved=1
+fi
+if [ "${tree_moved}" -ne 0 ]; then
+    # 树自己变过：这批改动与判过的那份不是一回事，两把键都不记（上面已经说过）。
+    # 判据是 `tree_moved` 而不是 `moved`：收尾算不出内容键时 `moved` 也是 1，但那与
+    # 「判过的是不是这批改动」无关，那只该丢内容键。
     voided_patch=1
-    echo "记账：这批改动在跑的过程中变过（开跑 ${start_pkey:0:12}，收尾 ${pkey:0:12}），改动键不记。" >&2
     pkey=""
+elif [ "${base_moved}" -ne 0 ]; then
+    # 远端在这一跑期间往前走了，而树一个位没动。共同祖先只会在一种情况下变深：远端涨到了
+    # 这个 HEAD 的后代（别人把这一支推上去了）。于是「这一推要补上的那一段」缩水了，收尾
+    # 按**新基底**重算的这把才是推前钩子要问的那把——记它，判过的字节没变，不必重判。
+    #
+    # 旁支型前进（远端落了与 HEAD 无关的一笔）不会走到这里：那种情况下共同祖先一个位没动，
+    # 改动键也一个位没动。这条边界值得写下来，否则下一个人会把「远端动了」当成触发器。
+    moved=1
+    if [ -z "${pkey}" ] && [ "${patch_why}" = "no-diff" ]; then
+        echo "记账：远端在这跑期间已经含了这一支（基底 ${start_base:0:12} → ${base_now:0:12}），从新基底到工作树没有 diff，没有改动键可记；这一推没有要补的那一段。" >&2
+    else
+        echo "记账：远端在这跑期间往前走了（基底 ${start_base:0:12} → ${base_now:0:12}），判过的字节没变，改动键按新基底重记（${pkey:0:12}）。" >&2
+    fi
+elif [ -n "${start_pkey}" ] && [ -n "${pkey}" ] && [ "${pkey}" != "${start_pkey}" ]; then
+    # 基底没动、改动键却变了：变的是这批改动本身（判过的那批不是你手上这批）。
+    voided_patch=1
+    pkey=""
+    echo "记账：这批改动在跑的过程中变过（开跑 ${start_pkey:0:12}，收尾 ${pkey:0:12}），改动键不记。" >&2
 fi
 if [ -z "${ckey}" ]; then
     # 上面已经说过为什么不记（树变过），这里不再补一句读起来像「写盘失败」的话。
@@ -1033,20 +1214,26 @@ else
     echo "记账：写不进 ${stamp_dir}，这一跑照常算数，只是下一次提交／推送还得再判一遍。" >&2
 fi
 # 第三笔：这批改动本身。它与脏不脏无关——判的是从共同祖先到「现在这棵树」的那一份 diff，
-# 提交只是把同样的字节换个名字（工作树 → 提交），patch-id 不变。所以这一笔在脏树上也记。
+# 提交只是把同样的字节换个名字（工作树 → 提交），身份不变。所以这一笔在脏树上也记。
 if [ "${voided_patch}" -ne 0 ]; then
     :
+elif [ -z "${pkey}" ] && [ "${patch_why}" = "no-diff" ]; then
+    echo "记账：没有改动键可记——远端已含这一支、工作树干净，从基底到工作树没有 diff，这批改动没有要推的那一段。"
 elif [ -z "${pkey}" ]; then
     echo "记账：算不出改动键（没有共同祖先，或临时索引写不了），这一跑照常算数，只是变基之后还得重判。" >&2
 elif printf '%s %s（改动，基底 %s）\n' "$(date -Is)" "$(git rev-parse --short HEAD 2>/dev/null)" \
        "$(git merge-base HEAD origin/main 2>/dev/null | cut -c1-7)" \
        > "${stamp_dir}/patch.${pkey}" 2>/dev/null; then
-    echo "记账：改动键 ${pkey:0:12} 这批改动判过；远端往前走了、变基到新基底上照样命中。"
+    echo "记账：改动键 ${pkey:0:12} 这批改动判过；远端往前走了、变基到新基底上照样命中（前提是那几笔没动整门的输入：门脚本、ci.yml、工具版本）。"
 else
     echo "记账：算不出改动键（没有共同祖先，或临时索引写不了），这一跑照常算数，只是变基之后还得重判。" >&2
 fi
 if [ "${moved}" -ne 0 ]; then
-    echo "推进账不记：${moved_why}，这一跑判的不是现在这份字节。" >&2
+    if [ "${tree_moved}" -eq 0 ] && [ "${base_moved}" -ne 0 ]; then
+        echo "推进账不记：origin/main 在这跑期间往前走了，这一跑判的（HEAD, origin/main）这一对已经不是现在那一对；内容键与改动键另记，照常能推。" >&2
+    else
+        echo "推进账不记：${moved_why}，这一跑判的不是现在这份字节。" >&2
+    fi
 elif [ "${run_dirty}" -ne 0 ]; then
     echo "推进账另记：工作树上有 ${run_dirty} 处未提交改动，这一跑判的不是 HEAD 的字节，暂不记。"
     echo "      提交之后这棵树的字节没变，内容键照样命中，提交与推送两个钩子都不用再判。"

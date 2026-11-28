@@ -13,7 +13,6 @@ async fn udp_heartbeat_end_to_end() {
         "10.0.0.1",
         "planner",
         "ws-1",
-        vec!["code".into()],
         ResourceInfo {
             cpu_cores: 4,
             memory_gb: 8,
@@ -39,7 +38,9 @@ async fn udp_heartbeat_end_to_end() {
     );
 
     cancel.trigger();
-    let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), client_handle).await;
+    cog_core::ignore_lost!(
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), client_handle).await
+    );
     server_handle.abort();
 }
 

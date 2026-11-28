@@ -12,11 +12,12 @@
 //!   the plan remains fixed.
 //! - Evaluator cannot mutate the artifact — it only emits [`EvaluationResult`].
 //! - When local repair is exhausted, the pipeline performs a global reset
-//!   (re-runs the Planner) up to [`PgePipelineConfig::max_retries`] times.
+//!   (re-runs the Planner) and keeps going until the terminal holds or the
+//!   stall detector says no attempt is buying progress — there is no attempt cap.
 
 use crate::actors::{EvaluatorActor, GeneratorActor, PlannerActor};
 use crate::squad::pge::stall::{
-    degenerate_loop_feedback, ProgressSignals, StallDetector, StallVerdict,
+    degenerate_loop_feedback, ProgressSignals, StallDetector, StallVerdict, STALL_THRESHOLD,
 };
 use crate::squad::pge::types::{
     EvaluationResult, GeneratorOutput, LocalRepairAttempt, PlannerOutput, Verdict,
@@ -27,11 +28,7 @@ use crate::squad::pge::types::{
 pub struct PgePipelineConfig {
     /// Maximum number of full Planner→Generator→Evaluator passes before
     /// returning the last attempt regardless of evaluator outcome.
-    pub max_retries: u32,
-    /// Soft timeout for a single full pass, in milliseconds.
-    /// Currently advisory — the agents themselves drive their own timeouts;
     /// this is exposed so callers and orchestrators can record/respect it.
-    pub timeout_ms: u64,
     /// Maximum number of local repair attempts within a single full pass.
     /// When the evaluator fails, the feedback is sent back to the generator
     /// while the plan remains unchanged. 0 disables local repair.
@@ -41,21 +38,20 @@ pub struct PgePipelineConfig {
     /// criterion is whether spend buys progress, never a flat spend cap.
     /// 0 disables stall detection.
     pub stall_threshold: u32,
-    /// When true, an evaluator Pass is re-judged once in a fresh context
-    /// (no attempt history, no prior feedback) before the pipeline accepts
-    /// it. Author and reviewer conclusions are both recorded in the final
-    /// evaluation; on conflict the reviewer wins.
-    pub independent_review: bool,
 }
+
+// 三次完整重跑：一次重跑是重规划、重生成、重评审，评审还带一遍独立复核；
+// 第三次仍然不过，说明问题不在一次生成的抖动里。
+// cap: fixed — 三次：每次重跑都带独立复核，第三次不过就不是抖动了
+// keep: 删掉后把非抖动当成抖动放过，或把抖动当成真坏；由「三次不过就不是抖动了」兜住
 
 impl Default for PgePipelineConfig {
     fn default() -> Self {
         Self {
-            max_retries: 3,
-            timeout_ms: 30_000,
+            // cap: fixed — 0 是哨兵不是旋钮：没写＝这个配置不打开局部修复，真正的上限由 PgeSettings 给
+            // not-a-bound: 0 是哨兵不是旋钮：没写＝这个配置不打开局部修复，真正的上限由 PgeSettings 给
             local_repair_max: 0,
-            stall_threshold: 2,
-            independent_review: true,
+            stall_threshold: STALL_THRESHOLD,
         }
     }
 }
@@ -103,7 +99,8 @@ pub struct PgePipelineResult {
 /// On evaluator failure the pipeline first tries to repair the generation
 /// while keeping the plan fixed, up to [`PgePipelineConfig::local_repair_max`]
 /// times. Only when local repair is exhausted does it perform a global reset
-/// (re-run the Planner) up to [`PgePipelineConfig::max_retries`] times.
+/// (re-run the Planner); the loop itself has no attempt cap — its exits are the
+/// terminal holding, a deterministic environment failure, or the stall detector.
 #[derive(Debug)]
 pub struct PgePipeline {
     config: PgePipelineConfig,
@@ -186,6 +183,7 @@ pub fn declared_plan(goal: &str, scale: crate::profile::DeclaredScale) -> Planne
         crate::profile::DeclaredScale::Unknown => (0, 0, None),
     };
     PlannerOutput {
+        definition: None,
         summary: format!(
             "declared scope: {files} file(s) named in the request, {code_files} of them source{}, \
              no planning stage",
@@ -204,6 +202,7 @@ pub fn declared_plan(goal: &str, scale: crate::profile::DeclaredScale) -> Planne
         sub_tasks: Vec::new(),
         acceptance_criteria: Vec::new(),
         targets: Vec::new(),
+        items: Vec::new(),
     }
 }
 
@@ -387,14 +386,17 @@ impl PgePipeline {
         for row in rows.iter().filter(|row| row.request_sha256 == want) {
             match row.stage {
                 cog_core::PgeStage::Planned => {
-                    resumed.plan = serde_json::from_value(row.product.clone()).ok();
+                    resumed.plan =
+                        cog_core::logged_ok!(serde_json::from_value(row.product.clone()));
                 }
                 cog_core::PgeStage::Generated => {
-                    resumed.generation = serde_json::from_value(row.product.clone()).ok();
+                    resumed.generation =
+                        cog_core::logged_ok!(serde_json::from_value(row.product.clone()));
                     resumed.evaluation = None;
                 }
                 cog_core::PgeStage::Evaluated => {
-                    resumed.evaluation = serde_json::from_value(row.product.clone()).ok();
+                    resumed.evaluation =
+                        cog_core::logged_ok!(serde_json::from_value(row.product.clone()));
                 }
             }
         }
@@ -464,6 +466,22 @@ impl PgePipeline {
         }
     }
 
+    /// 完成判的接线：判词由 [`EvaluatorActor::completion_evaluation`] 合成，这里只
+    /// 补上这一族自己的确定性完整性检查（交付物是不是一个可应用的改动）。
+    async fn judge_completion(
+        evaluator: &EvaluatorActor,
+        goal: &str,
+        plan: &PlannerOutput,
+        task: &cog_core::Task,
+        generation: &GeneratorOutput,
+    ) -> EvaluationResult {
+        let mut evaluation = evaluator
+            .completion_evaluation(goal, &plan.items, plan.definition.as_deref())
+            .await;
+        evaluation.enforce_change_artifact_integrity(generation.change_artifact_defect(task));
+        evaluation
+    }
+
     /// Run the pipeline with a structured [`cog_core::Task`] instead of a plain `goal` string.
     /// This is the preferred entry point for new code.
     pub async fn execute_task(
@@ -525,10 +543,9 @@ impl PgePipeline {
         let mut history: Vec<PgePipelineAttempt> = Vec::new();
         let mut last_evaluation: Option<EvaluationResult> = None;
         let mut last_generation: Option<GeneratorOutput> = None;
-        let max_attempts = self.config.max_retries.max(1);
         let mut stall = StallDetector::new(self.config.stall_threshold);
 
-        for attempt in 1..=max_attempts {
+        for attempt in 1.. {
             // 重入：这一代上一次已经买过的计划、生成与判词都记在库里。上游在半路
             // 断掉时，付过钱的东西不该跟着进程一起没——这一次从记录接着跑，
             // 不重买一遍。
@@ -587,7 +604,7 @@ impl PgePipeline {
             let prev_gen_json = last_generation
                 .as_ref()
                 .map(|g| serde_json::to_value(g).unwrap_or_default());
-            let plan_json = serde_json::to_value(&plan).unwrap_or_default();
+            let plan_json = serde_json::to_value(&plan).unwrap_or(Default::default());
             let mut generation = match resumed.as_ref().and_then(|r| r.generation.clone()) {
                 Some(generation) => generation,
                 None => {
@@ -624,39 +641,6 @@ impl PgePipeline {
             // 评估之前，才有「下一通调用失败时 diff 已经在盘上」这个性质。
             self.archive_generation(task, attempt, 0, &generation).await;
 
-            let eval_history: Vec<serde_json::Value> = history
-                .iter()
-                .map(|h| {
-                    serde_json::json!({
-                        "attempt": h.attempt,
-                        "plan": &h.plan,
-                        "generation": &h.generation,
-                        "evaluation": &h.evaluation,
-                    })
-                })
-                .collect();
-            // The evaluator's history section, measured at the same one place the
-            // roundtable path measures it, so both stages of PGE read alike.
-            let (history_bytes, latest_bytes) =
-                crate::observable::eval_doc_byte_ends(&eval_history);
-            crate::observable::global_observable()
-                .record_eval_doc_bytes(history_bytes, latest_bytes);
-            // Acceptance criteria: the plan's own verifiable criteria gate the
-            // evaluation; caller-supplied context criteria are the fallback.
-            let context_criteria: Vec<&str> = _context
-                .get("criteria")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-                .unwrap_or_default();
-            let criteria: Vec<&str> = if plan.acceptance_criteria.is_empty() {
-                context_criteria
-            } else {
-                plan.acceptance_criteria
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect()
-            };
-
             // An empty envelope is not a terminal failure, and it is nothing to
             // spend an inference call on either: there is no artifact to judge,
             // so the evaluator's only possible answer is "there is nothing
@@ -674,21 +658,15 @@ impl PgePipeline {
                 );
                 crate::squad::pge::types::empty_envelope_evaluation()
             } else {
-                // Stage 3: Evaluator.
-                let mut evaluation = evaluator
-                    .evaluate(
-                        task,
-                        &plan_json,
-                        &serde_json::to_value(&generation).unwrap_or_default(),
-                        &eval_history,
-                        &criteria,
-                        None,
-                    )
-                    .await;
-                evaluation.enforce_criteria_evidence(!criteria.is_empty());
-                evaluation
-                    .enforce_change_artifact_integrity(generation.change_artifact_defect(task));
-                evaluation
+                // Stage 3: 完成判——对着每条的终态读这一轮的树。没有三格就没有
+                // 可对的终态，直接把「先写三格」交回去，不花模型调用。
+                let goal = _context
+                    .get("goal")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| task.input.get("goal").and_then(serde_json::Value::as_str))
+                    .unwrap_or_default()
+                    .to_string();
+                Self::judge_completion(evaluator, &goal, &plan, task, &generation).await
             };
 
             // Same guard as the two above, on the third role: an evaluator that
@@ -724,8 +702,10 @@ impl PgePipeline {
                 }
 
                 let repair_feedback = evaluation.feedback.clone();
-                let repair_eval_json = serde_json::to_value(&evaluation).unwrap_or_default();
-                let repair_gen_json = serde_json::to_value(&generation).unwrap_or_default();
+                let repair_eval_json =
+                    serde_json::to_value(&evaluation).unwrap_or(Default::default());
+                let repair_gen_json =
+                    serde_json::to_value(&generation).unwrap_or(Default::default());
 
                 generation = generator
                     .generate(
@@ -768,20 +748,13 @@ impl PgePipeline {
                     );
                     crate::squad::pge::types::empty_envelope_evaluation()
                 } else {
-                    let mut evaluation = evaluator
-                        .evaluate(
-                            task,
-                            &plan_json,
-                            &serde_json::to_value(&generation).unwrap_or_default(),
-                            &eval_history,
-                            &criteria,
-                            None,
-                        )
-                        .await;
-                    evaluation.enforce_criteria_evidence(!criteria.is_empty());
-                    evaluation
-                        .enforce_change_artifact_integrity(generation.change_artifact_defect(task));
-                    evaluation
+                    let goal = _context
+                        .get("goal")
+                        .and_then(serde_json::Value::as_str)
+                        .or_else(|| task.input.get("goal").and_then(serde_json::Value::as_str))
+                        .unwrap_or_default()
+                        .to_string();
+                    Self::judge_completion(evaluator, &goal, &plan, task, &generation).await
                 };
 
                 if let Some(reason) = evaluation.terminal_env_failure_reason() {
@@ -828,88 +801,14 @@ impl PgePipeline {
                 }
             }
 
-            // Independent review gate: the evaluator above judged with the
-            // earlier attempts in hand, so its Pass is the one verdict a second
-            // opinion can be independent *of*. Re-judge in a fresh context (no
-            // history) before accepting; on conflict the reviewer wins. Both
-            // verdicts stay on the record.
-            //
-            // Asked only where that premise holds. On a first attempt the
-            // authoring evaluator was handed no history at all — `eval_history`
-            // is built from the attempts before this one — so the reviewer's
-            // request would be byte-identical to the author's: same task, plan,
-            // generation, criteria, empty history. Paying for it anyway buys
-            // nothing: at a fixed temperature the answer is the same by
-            // construction, and at a sampled one a coin flip gets the power to
-            // reject a Pass the run then has no attempt left to retry. The skip
-            // is a saving and is recorded as one, because an unread saving reads
-            // exactly like a gate that is gone.
+            // 复核这一问已经并入第三段：完成判本身就是另一次调用，对着终态读同一棵树。
+            // 再买一次同题复核，问的是同一份字节、同一段描述，答的还是同一件事——
+            // 这一次不花。读数记「已被取代」，不是「关掉了」：关掉是有人决定的，
+            // 取代是结构上不再需要。
             if matches!(evaluation.verdict, Verdict::Pass) {
-                let not_asked = if !self.config.independent_review {
-                    Some(crate::observable::INDEPENDENT_REVIEW_NOT_ASKED_DISABLED)
-                } else if eval_history.is_empty() {
-                    Some(crate::observable::INDEPENDENT_REVIEW_NOT_ASKED_NO_PRIOR_VERDICT)
-                } else {
-                    None
-                };
-                if let Some(reason) = not_asked {
-                    crate::observable::global_observable().record_independent_review(reason);
-                } else {
-                    let mut review = evaluator
-                        .evaluate(
-                            task,
-                            &plan_json,
-                            &serde_json::to_value(&generation).unwrap_or_default(),
-                            &[],
-                            &criteria,
-                            None,
-                        )
-                        .await;
-                    review.enforce_criteria_evidence(!criteria.is_empty());
-                    // The reviewer ran out of budget too, so it did not reject the
-                    // pass — it never looked. Wrapping that as "independent reviewer
-                    // rejected" would put the second role's failure on a verdict the
-                    // reviewer never reached, and a review that answered nothing is
-                    // not one of the two verdict cells either.
-                    if let Some(reason) = review.terminal_env_failure_reason() {
-                        // The call was paid for and came back with no verdict.
-                        // Neither verdict cell may claim it, and it is the only
-                        // record that this failure cost a call at all.
-                        crate::observable::global_observable().record_independent_review(
-                            crate::observable::INDEPENDENT_REVIEW_NOT_ANSWERED,
-                        );
-                        tracing::warn!(
-                            attempt,
-                            "Independent reviewer reported terminal environment failure; aborting pipeline"
-                        );
-                        return Self::terminal_result(
-                            attempt,
-                            plan.clone(),
-                            generation,
-                            Some(reason),
-                            history,
-                        );
-                    }
-                    let review_json = serde_json::to_value(&review).unwrap_or_default();
-                    if !matches!(review.verdict, Verdict::Pass) {
-                        evaluation.verdict = Verdict::Fail;
-                        evaluation.feedback = format!(
-                            "independent reviewer rejected the pass: {}",
-                            review.feedback
-                        );
-                    }
-                    let details = evaluation.details.take().unwrap_or(serde_json::json!({}));
-                    let mut details = details;
-                    details["independent_review"] = review_json;
-                    evaluation.details = Some(details);
-                    crate::observable::global_observable().record_independent_review(
-                        if matches!(evaluation.verdict, Verdict::Pass) {
-                            crate::observable::INDEPENDENT_REVIEW_AGREED
-                        } else {
-                            crate::observable::INDEPENDENT_REVIEW_REJECTED
-                        },
-                    );
-                }
+                crate::observable::global_observable().record_independent_review(
+                    crate::observable::INDEPENDENT_REVIEW_NOT_ASKED_SUPERSEDED,
+                );
             }
 
             let passed = matches!(evaluation.verdict, Verdict::Pass);
@@ -955,7 +854,7 @@ impl PgePipeline {
         }
 
         let last = history.last().cloned().expect(
-            "PgePipeline::execute always runs at least one attempt because max_retries.max(1)",
+            "PgePipeline::execute always runs at least one attempt: the loop has no attempt cap",
         );
 
         PgePipelineResult {
@@ -1012,6 +911,78 @@ mod tests {
         is_deterministic_failure, DEGENERATE_LOOP_PREFIX, EMPTY_GENERATION_PREFIX,
     };
 
+    /// 整链重跑的次数只有一处声明：默认值读常量，常量上面写着它由什么钉住。
+    ///
+    /// 两面一起钉：运行时默认值等于常量（改常量就改默认值），源码面
+    /// `impl Default` 的字段里不再有数字（下一笔写回裸字面量就红）。
+    #[test]
+    fn the_pipeline_default_reads_its_full_pass_count() {
+        let source = include_str!("pipeline.rs");
+        let body = source
+            .split("impl Default for PgePipelineConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    let value = value.trim().trim_end_matches(',');
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.starts_with(|c: char| c.is_ascii_digit())
+                        // 哨兵 0 不是旋钮，是「没写」：`local_repair_max` 的 0 关掉
+                        // 本地修复，它没有第二个取值要命名。
+                        && value != "0"
+                })
+            })
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
+    }
+
+    /// 完成判的夹具应答：问的是「树上是不是终态说的样子」，夹具按脚本里的 verdict 答。
+    /// 没有 `items` 的问题（计划、生成）原样返回——这一层只改测试替身，不改产品。
+    fn as_completion_answer(
+        input: &serde_json::Value,
+        response: serde_json::Value,
+    ) -> serde_json::Value {
+        if response.get("verdicts").is_some() {
+            return response;
+        }
+        let asks = input
+            .get("instructions")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.contains("Judge whether each terminal description is true"));
+        if !asks {
+            return response;
+        }
+        let ok = response
+            .get("verdict")
+            .and_then(|v| v.as_str())
+            .map(|v| v.eq_ignore_ascii_case("pass"))
+            .unwrap_or(true);
+        let reason = response
+            .get("feedback")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let verdicts: Vec<serde_json::Value> = input
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|i| i.get("id"))
+                    .map(|id| serde_json::json!({"id": id, "ok": ok, "reason": reason}))
+                    .collect()
+            })
+            .unwrap_or(Default::default());
+        serde_json::json!({ "verdicts": verdicts })
+    }
+
     /// Test-only mock implementing the object-level [`cog_core::Agent`] trait.
     /// All methods except [`prompt`] are no-op stubs.
     struct MockAgent {
@@ -1027,11 +998,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl cog_core::Agent for MockAgent {
-        async fn prompt(&self, _input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
+        async fn prompt(&self, input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
             if self.response.as_str() == Some(PANIC_ON_PROMPT) {
                 panic!("this role was asked for an answer it must never be asked for");
             }
-            Ok(self.response.clone())
+            Ok(as_completion_answer(&input, self.response.clone()))
         }
 
         async fn start(&self) {}
@@ -1142,11 +1113,8 @@ mod tests {
     #[tokio::test]
     async fn pipeline_executes_three_stages_in_order() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
-            timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
-            independent_review: false,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({
@@ -1187,11 +1155,8 @@ mod tests {
     #[tokio::test]
     async fn pipeline_records_full_history_when_failing() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 2,
-            timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
-            independent_review: false,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
@@ -1250,11 +1215,8 @@ mod tests {
     #[tokio::test]
     async fn pipeline_zero_retries_still_runs_once() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 0,
-            timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
-            independent_review: false,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
@@ -1283,11 +1245,8 @@ mod tests {
     #[tokio::test]
     async fn pipeline_attempts_are_numbered_sequentially() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 3,
-            timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
-            independent_review: false,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
@@ -1322,12 +1281,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl cog_core::Agent for SequenceMockAgent {
-        async fn prompt(&self, _input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
+        async fn prompt(&self, input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
             let mut responses = self.responses.lock().unwrap();
             if responses.is_empty() {
                 Ok(serde_json::Value::Null)
             } else {
-                Ok(responses.remove(0))
+                Ok(as_completion_answer(&input, responses.remove(0)))
             }
         }
 
@@ -1416,16 +1375,23 @@ mod tests {
     #[tokio::test]
     async fn pipeline_local_repair_succeeds_without_global_reset() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
-            timeout_ms: 5_000,
             local_repair_max: 2,
             stall_threshold: 2,
-            independent_review: false,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({
                 "summary": "test analysis",
                 "plan": {"specification": "test spec"},
+                // 完成判读的是三条待办（终态/现在/差距）：没有 items 时判据审
+                // 什么也答不出，那一轮永远判不过——这不是本用例要判的局部修复。
+                "definition": "这一类：打印出 hello world；做完＝屏幕上出现那一行",
+                "items": [{
+                    "id": "N1",
+                    "terminal": "屏幕上出现 hello world",
+                    "now": "还没有输出",
+                    "gap": "缺的是：打印那一行",
+                    "state": "未落"
+                }],
                 "sub_tasks": [],
             }),
         }));
@@ -1462,17 +1428,20 @@ mod tests {
             1,
             "one local repair cycle"
         );
-        assert_eq!(result.history[0].local_repairs[0].feedback, "missing print");
+        assert!(
+            result.history[0].local_repairs[0]
+                .feedback
+                .contains("missing print"),
+            "局部修复的理由应当是判据审点名的缺口：{}",
+            result.history[0].local_repairs[0].feedback
+        );
     }
 
     #[tokio::test]
     async fn pipeline_local_repair_exhausts_then_global_reset() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 2,
-            timeout_ms: 5_000,
             local_repair_max: 1,
             stall_threshold: 2,
-            independent_review: false,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
@@ -1511,11 +1480,8 @@ mod tests {
     #[tokio::test]
     async fn pipeline_stops_degenerate_loop_early() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 5,
-            timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
-            independent_review: false,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
@@ -1558,11 +1524,8 @@ mod tests {
     #[tokio::test]
     async fn pipeline_progressing_attempts_are_not_stalled() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 4,
-            timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
-            independent_review: false,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
@@ -1607,11 +1570,8 @@ mod tests {
     #[tokio::test]
     async fn an_empty_envelope_fails_under_its_own_cause_without_evaluating() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
-            timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
-            independent_review: false,
         });
         let planner = pass_planner();
         let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
@@ -1657,11 +1617,8 @@ mod tests {
     #[tokio::test]
     async fn a_blank_string_content_is_the_same_empty_envelope() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
-            timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
-            independent_review: false,
         });
         let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({"content": "   \n", "artifacts": []}),
@@ -1692,11 +1649,8 @@ mod tests {
     #[tokio::test]
     async fn an_empty_repair_is_judged_under_its_own_cause_too() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
-            timeout_ms: 5_000,
             local_repair_max: 1,
             stall_threshold: 2,
-            independent_review: false,
         });
         // 首轮交了东西（走评估器），修复轮交了空信封。
         let generator = GeneratorActor::new(std::sync::Arc::new(SequenceMockAgent {
@@ -1765,11 +1719,8 @@ mod tests {
     #[tokio::test]
     async fn independent_review_rejection_fails_the_attempt() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 2,
-            timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 0,
-            independent_review: true,
         });
         let evaluator = EvaluatorActor::new(std::sync::Arc::new(SequenceMockAgent {
             responses: std::sync::Mutex::new(vec![
@@ -1807,11 +1758,8 @@ mod tests {
     #[tokio::test]
     async fn independent_review_agreement_passes_and_records_review() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 2,
-            timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 0,
-            independent_review: true,
         });
         let evaluator = EvaluatorActor::new(std::sync::Arc::new(SequenceMockAgent {
             responses: std::sync::Mutex::new(vec![
@@ -1856,11 +1804,8 @@ mod tests {
     #[tokio::test]
     async fn a_first_attempt_pass_is_not_re_sampled() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 2,
-            timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 0,
-            independent_review: true,
         });
         let evaluator = EvaluatorActor::new(std::sync::Arc::new(SequenceMockAgent {
             responses: std::sync::Mutex::new(vec![
@@ -1895,66 +1840,31 @@ mod tests {
         );
     }
 
-    /// The gate's cost decision is read off the source, not the run.
-    ///
-    /// A behaviour test can only show the branch taken for the inputs it
-    /// scripts. What has to hold for every input is the ordering itself: the
-    /// premise (`eval_history.is_empty()`, the only thing that makes the second
-    /// judge independent of the first) is read *before* the reviewer is paid
-    /// for, and every route through the gate leaves one of the four cells
-    /// behind. Reading the file the producer runs is the reading that survives
-    /// an input the suite never scripts — and it fails if a later edit reverses
-    /// the two or drops the record.
+    /// 复核这一问已被完成判取代：源码里那一段只记「已被取代」的读数，不再调用
+    /// 第二个判者。同一份字节被问两遍，是这条流水线上最贵的重复。
     #[test]
-    fn the_review_gate_reads_its_premise_before_it_pays_for_the_reviewer() {
+    fn the_duplicate_review_is_replaced_by_the_completion_judgement() {
         let source = include_str!("pipeline.rs");
         let production = source
             .split("\n#[cfg(test)]\n")
             .next()
             .expect("the file always has a first segment");
-
-        // Anchored on the saving itself: the same `Pass` test appears earlier
-        // for the repair path, and taking the first one would scan past the
-        // gate into unrelated code.
-        let open = "if matches!(evaluation.verdict, Verdict::Pass) {";
-        let anchor = "let not_asked = if !self.config.independent_review {";
-        let start = production
-            .find(anchor)
-            .expect("the gate no longer separates the two reasons for not asking");
+        let gate = production
+            .split("// 复核这一问已经并入第三段")
+            .nth(1)
+            .expect("复核那一段不见了");
+        let block = gate
+            .split("\n            let passed =")
+            .next()
+            .expect("那一段没有在自己的结尾前结束");
         assert!(
-            production[..start].trim_end().ends_with(open),
-            "the saving is no longer reached only on an authoring Pass"
+            block.contains("INDEPENDENT_REVIEW_NOT_ASKED_SUPERSEDED"),
+            "取代没有留下读数：读面会把「没问」读成「没发生」"
         );
-        let gate = &production[start..];
-        let end = gate
-            .find("\n            let passed =")
-            .expect("the gate block no longer ends where the pass is recomputed");
-        let gate = &gate[..end];
-
-        let premise = gate
-            .find("eval_history.is_empty()")
-            .expect("the gate no longer checks whether the premise (a prior verdict) holds");
-        let call = gate
-            .find(".evaluate(")
-            .expect("the gate no longer calls the reviewer");
         assert!(
-            premise < call,
-            "the gate pays for the second judgement before reading whether it is independent"
+            !block.contains(".evaluate("),
+            "重复的复核又回来了：同一份字节被问了两遍"
         );
-
-        for name in [
-            "INDEPENDENT_REVIEW_NOT_ASKED_DISABLED",
-            "INDEPENDENT_REVIEW_NOT_ASKED_NO_PRIOR_VERDICT",
-            "INDEPENDENT_REVIEW_AGREED",
-            "INDEPENDENT_REVIEW_REJECTED",
-            "INDEPENDENT_REVIEW_NOT_ANSWERED",
-        ] {
-            assert!(
-                gate.contains(name),
-                "the gate no longer records `{name}`; a saving nobody can read is \
-                 indistinguishable from a gate that was deleted"
-            );
-        }
     }
 
     /// With the gate off the reviewer is not asked even where its premise would
@@ -1964,11 +1874,8 @@ mod tests {
     #[tokio::test]
     async fn a_disabled_gate_does_not_ask_the_reviewer_where_it_would_have() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 2,
-            timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 0,
-            independent_review: false,
         });
         let evaluator = EvaluatorActor::new(std::sync::Arc::new(SequenceMockAgent {
             responses: std::sync::Mutex::new(vec![
@@ -2093,11 +2000,8 @@ mod tests {
     #[tokio::test]
     async fn a_planner_that_never_reached_its_upstream_ends_the_run_and_says_why() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 3,
-            timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
-            independent_review: false,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(FailingAgent));
         // 生成器若被调用会回一个可辨认的内容，用它证明这轮根本没走到生成。
@@ -2136,6 +2040,63 @@ mod tests {
         assert_eq!(result.attempts, 1, "环境类失败不该被重试");
     }
 
+    /// 评委这一环没到上游，不是对作品的判决。把这次失败凭空写成一个
+    /// `Verdict::Fail` 会让终止守卫看不见环境故障：本地修复与全部重试照买，
+    /// 台账与共识票也会把「没人读到作品」记成「作品不合格」。
+    #[tokio::test]
+    async fn an_evaluator_that_never_reached_its_upstream_is_not_a_verdict_on_the_work() {
+        let pipeline = PgePipeline::new(PgePipelineConfig {
+            local_repair_max: 1,
+            stall_threshold: 2,
+        });
+        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({
+                "summary": "s",
+                "plan": {"steps": ["edit"]},
+                "sub_tasks": [],
+                "acceptance_criteria": []
+            }),
+        }));
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({"content": {"draft": "attempt output"}, "artifacts": []}),
+        }));
+        // 计划与生成都答得出，只有评委这一格没到上游。
+        let evaluator = EvaluatorActor::new(std::sync::Arc::new(FailingAgent));
+
+        let task = test_task("implement a hello world function");
+        let result = pipeline
+            .execute_task(
+                &task,
+                serde_json::json!({}),
+                &planner,
+                &generator,
+                &evaluator,
+            )
+            .await;
+
+        let reason = result
+            .terminal_reason
+            .as_deref()
+            .expect("评委没答上话，这一跑必须以终止性原因收口，而不是照常重试");
+        assert!(
+            reason.contains("HTTP 503 upstream unavailable"),
+            "终止原因必须指向真实的上游故障，实到: {reason}"
+        );
+        assert_eq!(result.attempts, 1, "环境类失败不该被重试");
+        assert_ne!(
+            result.final_evaluation.feedback, "Evaluation failed",
+            "「没判定」不能用一句对作品的判决顶替"
+        );
+        assert!(
+            result
+                .final_evaluation
+                .feedback
+                .contains("HTTP 503 upstream unavailable"),
+            "终止结果必须带着调用的真因，实到: {}",
+            result.final_evaluation.feedback
+        );
+    }
+
     /// A generator whose ReAct loop spends its whole iteration budget still
     /// exploring comes back as the runtime's `max_iterations_reached` sentinel.
     /// Read as an ordinary empty output it buys an evaluator call, a full round
@@ -2144,11 +2105,8 @@ mod tests {
     #[tokio::test]
     async fn a_generator_that_ran_out_of_iterations_ends_the_run_before_the_evaluator() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 3,
-            timeout_ms: 5_000,
             local_repair_max: 2,
             stall_threshold: 2,
-            independent_review: false,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({
@@ -2208,11 +2166,8 @@ mod tests {
     #[tokio::test]
     async fn an_evaluator_that_ran_out_of_iterations_ends_the_run_before_repairs() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 3,
-            timeout_ms: 5_000,
             local_repair_max: 2,
             stall_threshold: 2,
-            independent_review: false,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({
@@ -2331,11 +2286,8 @@ mod tests {
 
     fn config() -> PgePipelineConfig {
         PgePipelineConfig {
-            max_retries: 1,
-            timeout_ms: 5_000,
             local_repair_max: 2,
             stall_threshold: 2,
-            independent_review: false,
         }
     }
 

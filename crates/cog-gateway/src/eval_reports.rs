@@ -26,7 +26,8 @@ use crate::GatewayState;
 /// 列举要按修改时间排序，并且为了给出数据集名要读每一份的正文——每个返回项一次
 /// 读。不设上限时，「列一下目录」会退化成按文件数读盘，所以上限落在这里，同时把
 /// 未截断的总数报出去：调用方必须能看出自己拿到的是前缀。
-// cap: bound — 列评估报告时没传 limit 的默认条数
+// cap: fixed — 列评估报告时没传 limit 的默认条数
+// keep: 删掉后不传 limit 的列表没有默认页长，一次响应装下所有报告；由「没传 limit 的默认条数」兜住
 pub const DEFAULT_LIST_LIMIT: usize = 200;
 
 /// 报告目录：`{data_dir}/eval/reports`。
@@ -69,8 +70,11 @@ pub fn store_report(dir: &Path, id: &str, report_json: &str) -> std::io::Result<
     let mut final_id = id.to_string();
     let mut attempt = 1usize;
     let path = loop {
+        // state-file: artifact — 一次评测跑出来的报告产物，按运行命名，不是平台事实的影子
         let candidate = dir.join(format!("{final_id}.json"));
-        if !candidate.exists() {
+        // 「这个名字没人用」要查得出来才算数：查不出来时当空名用，会把一份
+        // 已经写下的报告改名覆盖掉，而这份实现承诺的是不覆盖前一份。
+        if !name_is_taken(&candidate)? {
             break candidate;
         }
         attempt += 1;
@@ -87,6 +91,21 @@ pub fn store_report(dir: &Path, id: &str, report_json: &str) -> std::io::Result<
     Ok((final_id, path))
 }
 
+/// 这个名字上有没有东西。
+///
+/// 名字查不了（读不动、链接成环）时返回错误：把它当成空名，下一步就是覆盖
+/// 一份可能已经在那里的报告。
+fn name_is_taken(path: &Path) -> std::io::Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if crate::eval_datasets::path_is_absent(&e) => Ok(false),
+        Err(e) => Err(std::io::Error::new(
+            e.kind(),
+            format!("checking {}: {e}", path.display()),
+        )),
+    }
+}
+
 /// 目录里的一份报告，只带选择下一份读所需的元数据。
 #[derive(Debug, Serialize)]
 pub struct StoredReport {
@@ -97,6 +116,7 @@ pub struct StoredReport {
 }
 
 /// 一次列举的结果：**返回的**与前缀**之前的总数**分开给。
+#[derive(Debug)]
 pub struct ReportListing {
     pub reports: Vec<StoredReport>,
     pub total: usize,
@@ -108,11 +128,22 @@ pub struct ReportListing {
 /// 读失败，会让「没跑过」和「读不通」看起来一样。正文读不出来时才放弃那一份——目录
 /// 里有别的进程写坏的字节，不该让整张列表消失。
 pub fn list_reports(dir: &Path, limit: usize) -> std::io::Result<ReportListing> {
-    if !dir.is_dir() {
-        return Ok(ReportListing {
-            reports: Vec::new(),
-            total: 0,
-        });
+    let empty = ReportListing {
+        reports: Vec::new(),
+        total: 0,
+    };
+    // 目录不在与目录看不到是两件事：前者是没有跑过评测，后者是这一读没成。
+    // 折成同一份空列表，一个读不通的数据卷会报成「还没有跑过」。
+    match std::fs::metadata(dir) {
+        Ok(md) if md.is_dir() => {}
+        Ok(_) => return Ok(empty),
+        Err(e) if crate::eval_datasets::path_is_absent(&e) => return Ok(empty),
+        Err(e) => {
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!("looking at {}: {e}", dir.display()),
+            ))
+        }
     }
 
     let mut files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
@@ -147,7 +178,7 @@ pub fn list_reports(dir: &Path, limit: usize) -> std::io::Result<ReportListing> 
                     .and_then(|d| d.as_str())
                     .map(String::from)
             })
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         let created_at = Utc
             .timestamp_opt(
                 modified
@@ -258,7 +289,7 @@ mod tests {
             std::fs::read_to_string(&first_path).unwrap(),
             r#"{"dataset_name":"probe","n":1}"#
         );
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     // 列举要新的在前，并在截断时报出截断前的总数——否则一页列表与一份完整的列表
@@ -279,7 +310,7 @@ mod tests {
         assert_eq!(listing.reports.len(), 2);
         assert_eq!(listing.reports[0].dataset_name, "set-2", "新的要在前");
         assert_eq!(listing.reports[1].dataset_name, "set-1");
-        std::fs::remove_dir_all(&dir).ok();
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 
     // 目录不存在（还没跑过评测）与读失败是两件事：前者是一份空列举。
@@ -294,5 +325,40 @@ mod tests {
     fn set_mtime(path: &Path, stamp: std::time::SystemTime) {
         let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         file.set_modified(stamp).unwrap();
+    }
+
+    /// 目录看不到与目录不在是两件事；名字查不了也不等于这个名字空着。
+    /// 后者更贵：当成空名用，下一步就是把一份已经写下的报告覆盖掉。
+    #[test]
+    fn a_store_that_cannot_be_looked_at_is_not_empty_and_a_name_is_not_free() {
+        let dir = scratch("unlookable");
+        let looped = dir.join("loop");
+        std::os::unix::fs::symlink("loop", &looped).unwrap();
+
+        let err = list_reports(&looped, 10).expect_err("看不到的目录不许答成空列表");
+        assert!(err.to_string().contains("loop"), "错误要点名路径：{err}");
+
+        let err = name_is_taken(&looped.join("x.json")).expect_err("查不了的名字不许当成空名");
+        assert!(err.to_string().contains("loop"), "错误要点名路径：{err}");
+        assert!(
+            !name_is_taken(&dir.join("free.json")).unwrap(),
+            "空着的名字"
+        );
+
+        std::fs::write(dir.join("held.json"), "{}").unwrap();
+        assert!(
+            name_is_taken(&dir.join("held.json")).unwrap(),
+            "有东西的名字"
+        );
+
+        // 写点走的是同一条查名：查不出来要在这一步说，而不是等到 rename 那一步
+        // 报一句含义不明的写失败。
+        let err = store_report(&dir, "loop/deep", "{}").expect_err("写不进的名字要报出来");
+        assert!(
+            err.to_string().contains("checking"),
+            "错误要说是查名这一步失败：{err}"
+        );
+
+        cog_core::ignore_lost!(std::fs::remove_dir_all(&dir));
     }
 }

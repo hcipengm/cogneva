@@ -92,6 +92,16 @@ pub trait CodePlatformProvider: Send + Sync {
         "platform"
     }
 
+    /// 列表端点会不会把第 101 条起截掉。
+    ///
+    /// 默认 `false`：只问一页的实现（以及测试替身）交出来的名单，条数撞上页长
+    /// 上限就可能是截断的，调用方不能把它当「全部还开着的」。翻页翻到不满一页
+    /// 为止的实现报 `true`——它的名单里装多少条都仍然是全部，按条数猜截断对它
+    /// 是错的（会让裁决回收在一个几百条意图的仓库上永远不跑）。
+    fn lists_every_page(&self) -> bool {
+        false
+    }
+
     /// List open issues from the configured repository.
     async fn list_open_issues(&self) -> Result<Vec<PlatformIssue>>;
 
@@ -380,7 +390,8 @@ pub struct AttachmentData {
 
 /// Cap on a single attachment's bytes (mirrors the gateway `/attach` limit;
 /// applied in direct mode too so a huge file cannot blow up memory).
-// cap: derived — 与网关 /attach 那条界同值：直连模式也一样，超大文件不能把内存撑破
+// cap: fixed — 与网关 /attach 那条界同值：直连模式也一样，超大文件不能把内存撑破
+// keep: 删掉后直连模式的超大附件把内存撑破，与网关那侧的规模也不一致；由「与网关 /attach 同值」兜住
 pub const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 
 /// Derive the security-gateway root (where `/attach` lives) from a platform

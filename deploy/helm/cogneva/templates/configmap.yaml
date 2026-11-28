@@ -6,40 +6,57 @@ metadata:
   labels:
     {{- include "cogneva.labels" . | nindent 4 }}
     app.kubernetes.io/component: config
+{{- /* 应用名、日志级别、数据与应用目录、三个 provider 名、工作区与消费组这几格，
+       交接文档 `files/cogneva.json` 里已写着同一个值——那份文件是进程真正按它加载
+       的配置，本 ConfigMap 只是把其中几格摆到 env 层。所以这里不另写一遍，而是从
+       那份文件取：写两遍的后果是改一处、另一处沉默地盖回去，而两份值相等的今天，
+       渲染结果一个字节都不变。 */}}
+{{- $doc := .Files.Get "files/cogneva.json" | fromJson }}
 data:
-  COGNEVA_APP_NAME: "cogneva"
+  COGNEVA_APP_NAME: {{ $doc.app.name | quote }}
   COGNEVA_APP_VERSION: {{ .Chart.AppVersion | quote }}
-  COGNEVA_LOG_LEVEL: "info"
-  COGNEVA_DATA_DIR: "/var/lib/cogneva-data"
-  COGNEVA_CONFIG_DIR: "/etc/cogneva"
-  COGNEVA_APP_DIR: "/opt/cogneva"
+  COGNEVA_LOG_LEVEL: {{ $doc.app.log_level | quote }}
+  COGNEVA_DATA_DIR: {{ $doc.app.data_dir | quote }}
+  COGNEVA_APP_DIR: {{ $doc.app.app_dir | quote }}
   # WebUI 静态资源目录（镜像内 web 构建产物位置），不设会回退到构建机源码路径
   COGNEVA_WEB_DIR: "/opt/cogneva/web"
 
-  COGNEVA_DB_PROVIDER: "mysql"
-  COGNEVA_PG_PROVIDER: "postgres"
+  COGNEVA_DB_PROVIDER: {{ $doc.providers.db.provider | quote }}
+  COGNEVA_PG_PROVIDER: {{ $doc.providers.pg.provider | quote }}
   # 同一台 Postgres 上有几个进程各开一套连接池：主应用、进化、安全网关，再加一个
   # 滚动更新时同时活着的新 Pod。每个进程把服务器的连接上限按这个数分摊到自己的池
   # 上，数少了就是把别人的份也算成自己的——实测 2026-10-30 滚动时新 Pod 报
   # `pool timed out while waiting for an open connection`：每进程五个池各九条，
   # 三个进程九十条，服务器只剩九十七条，第四个进程一上来就超。
   #
-  # 值从各工作负载的副本数算出来，不是这里另写一个数：改了副本数而这里不动，
-  # 分摊就会按过期的进程数做。`+1` 是滚动影子——同一次滚动里新 Pod 已经连上、
-  # 旧 Pod 还没退出，两者都要算。
+  # 值按各工作负载**可能达到的副本数上限**算：主应用与安全网关的副本数由
+  # 集群就绪节点数在运行时给出（一节点一个、多节点两个），渲染时只知道种子上限，
+  # 所以这里取 `max(种子, 2)`——按运行时的最小值算，分摊就会按过期的进程数做，
+  # 多出来的那个 Pod 一上来就会等到 `pool timed out`。`+1` 是滚动影子——同一次
+  # 滚动里新 Pod 已经连上、旧 Pod 还没退出，两者都要算。
   {{- /* lit: 1 fixed — 滚动影子：一次滚动里新 Pod 已经连上、旧 Pod 还没退出，两者同时分摊同一个连接上限；它不随任何 profile 的副本数变 */}}
-  COGNEVA_PG_SHARING_PROCESSES: {{ add (int .Values.gateway.replicas) (int .Values.evolution.replicas) (int .Values.securityGateway.replicas) 1 | quote }}
-  COGNEVA_VECTOR_PROVIDER: "qdrant"
+  {{- /* lit: 2 fixed — 运行时副本数的上限：主应用与安全网关按就绪节点数取副本（一节点一个、最多两个），渲染期读不到节点数，所以按上限算而不是按渲染时的种子副本数算 */}}
+  COGNEVA_PG_SHARING_PROCESSES: {{ add (max 2 (int .Values.gateway.replicas)) (int .Values.evolution.replicas) (max 2 (int .Values.securityGateway.replicas)) 1 | quote }}
+  # 向量后端的地址直接由代码读 QDRANT_URL；没有第二个 provider 开关要同步。
   QDRANT_URL: {{ printf "http://qdrant.%s.svc.cluster.local:%d" (include "cogneva.namespace" .) (int .Values.backends.qdrant.grpcPort) | quote }}
-  COGNEVA_MEDIA_PROVIDER: "local-sfu"
-  COGNEVA_STORAGE_PROVIDER: "local-fs"
+  COGNEVA_MEDIA_PROVIDER: {{ $doc.providers.media.provider | quote }}
+  {{- /* 存储的 provider 只有 `files/cogneva.json` 一处声明：那份文件里
+         `providers.storage.provider` 是 `seaweedfs`，而 seaweedfs 段默认 `enabled: true`
+         就是照着它开的。这里曾经写死 `"local-fs"`，于是同一个 provider 在树上有了两个
+         声明，且 env 层按 `files/cogneva.json` 的 env→配置路径映射盖住那份文件——
+         集群里跑着 SeaweedFS，进程读到的却是本地文件系统，Raw 层与冷层写去卷上而不是
+         桶里。两处相等不等于一处在说：改一处、另一处沉默地盖回去。 */}}
+  COGNEVA_STORAGE_PROVIDER: {{ $doc.providers.storage.provider | quote }}
 
-  COGNEVA_WORKSPACE_ID: "default"
-  # 每个用户工作区的字节上限（0 = 不限）。拒绝写入时把这条错误信息里点名的
-  # 就是这一个键，所以它必须真的能从 values 走到这里——否则报错指的是一条
-  # 运维按正常路径改不动的开关。
-  COGNEVA_WORKSPACE_MAX_BYTES: {{ .Values.workspace.maxBytes | int64 | quote }}
-  COGNEVA_CONSUMER_GROUP: "cogneva"
+  COGNEVA_WORKSPACE_ID: {{ $doc.dag_executor.workspace_id | quote }}
+  # 每个用户工作区的字节上限。这里**不写默认值**：网关自己有同一条界（它的
+  # 默认在建工作区的那段代码里），chart 再抄一份就是同一件事的第二处声明。
+  # 但这条 env 必须留着可写——拒绝写入的错误信息点名这个键，运维要能沿正常
+  # 路径把它传进去；不传时由网关自己的默认生效。
+  {{- with .Values.workspace.maxBytes }}
+  COGNEVA_WORKSPACE_MAX_BYTES: {{ . | int64 | quote }}
+  {{- end }}
+  COGNEVA_CONSUMER_GROUP: {{ $doc.dag_executor.consumer_group | quote }}
   # 看板列的在制品上限。空串＝没配＝不限，渲染成空串而不是省略：省略会让「清单里
   # 没有这个键」与「运维没配」变成同一件事。发布侧与看板读面都经 envFrom 取这一份，
   # 写在这里的数就是真正拦住派发的那个——两处各配一份，看板会报一个没人拦的数。
@@ -50,8 +67,11 @@ data:
 
   # 一个执行进程同时跑几道任务，也就是同时花 token 额度的条数。进程级：本进程
   # 读的每条就绪队列共用这一份许可。它是「全局一次跑几道」的那个数——看板的列
-  # 上限按 goal 分区，管不到跨 goal 的并行。进程读它一次，并把它作为
-  # `cogneva_task_router_claim_slots` 报出去，所以配置与生效在读数面是同一个值。
+  # 上限按 goal 分区，管不到跨 goal 的并行。
+  #
+  # 0 = 按池子的窗口导出：每拍读 `(额度-已花) ÷ 单任务价格`（价格是池子对已完成
+  # 任务的实测），把界写回 `cogneva_task_router_claim_slots` 并带 `source` 标签；
+  # 正数是钉死的覆盖位。两种情形报的都是真正在用的那个界。
   COGNEVA_TASK_CLAIM_CONCURRENCY: {{ .Values.taskRouter.claimConcurrency | int | quote }}
 
   # 本地车道（`:local`）自己的在途上限。只有带 executor 角色的部署读这条流，变更
@@ -63,8 +83,12 @@ data:
   # 变更账一拍把一个项目的几条欠账并成一道任务派出去。价格的大头是任务的固定部分
   # （一次规划、一轮上下文、一轮沙箱验证），它不随任务承载几条增长，所以并得越多、
   # 每条欠账摊到的钱越少。上限在生成侧而不在这一格：一批写成一份变更，超过一次
-  # 生成写得完的量就会截断、整批报废，所以它是「一次生成装得下几条修复」，不是
-  # 拍板定的界——要抬就直接改这一格，代码里那个默认值只是没配时的起点。
+  # 生成写得完的量就会截断、整批报废。
+  #
+  # 0 = 按图里的批次导出：每拍读一次它自己交出去的批次，落地整批的最大条数 + 1
+  # 就是下一拍的界，被工作本身退回的批次给界封顶（证据 30 天后过期）；还没有任何
+  # 批次落地时界停在「能称为批次的最小条数」（2 条），每落地一次涨一条。界写回 `cogneva_change_ledger_rows_per_handover`
+  # 并带 `source`，每拍记一次 `_evaluations_total`。正数是钉死的覆盖位。
   COGNEVA_CHANGE_LEDGER_ROWS_PER_HANDOVER: {{ .Values.changeLedger.rowsPerHandover | int | quote }}
 
   # 进程被告知的三个端口，与容器实际监听的那三个同源（values 的 gateway.*Port，
@@ -83,6 +107,10 @@ data:
   # 同源——规则求值读的是 cogneva.json 的 infra_watch.prometheus_url，两者问的
   # 是同一台机器，各写一个地址就等于允许它们分开。
   COGNEVA_PROMETHEUS_URL: {{ .Values.observability.infraWatch.prometheusUrl | quote }}
+  # 面板生成器把算出来的面板推给这一台。空值＝这个部署没有 Grafana，导出器不
+  # 启动：面板从注册表算出来，没有 Grafana 就没有投递面，猜一个集群内的地址只会
+  # 让「推不上去」和「本来就没有面板」在读数面上同形。
+  COGNEVA_GRAFANA_URL: {{ .Values.observability.grafana.baseUrl | quote }}
   # 集群内 registry 的两条访问端点：Pod 内 buildah 用 Service DNS，节点上 kubelet
   # 用 localhost:NodePort。两者都是 `clusterRegistry.port` / `nodePort` 的投影，
   # 放在共用 env 里而不是只给进化 Pod：晋级镜像的引用由主应用的拉取端产出，它同样

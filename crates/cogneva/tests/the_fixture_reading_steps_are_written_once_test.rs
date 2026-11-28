@@ -62,7 +62,7 @@ use std::path::PathBuf;
 
 use common::js_literal::{quoted_word, top_level_keys, KeyWords};
 use common::lex::{blank, brace_delta, split_top_level, strip, Dialect};
-use common::routes::{matching_in, matching_paren, repo_root};
+use common::routes::{matching_in, matching_paren, repo_root, walk};
 use common::rust_production::{opens_test_module, opens_test_module_block, relative_name};
 
 /// 读文件、走目录这两条的唯一定义。
@@ -150,16 +150,23 @@ const THE_PREDICATE: &str =
     "crates/cogneva/tests/the_fixture_reading_steps_are_written_once_test.rs";
 
 /// 跨 crate 的夹具支撑：几个 crate 的夹具都要的同一件事（哪个 PostgreSQL、哪个
-/// Redis、没有的时候停还是跳过）。它判的是「这份文件里定义过的体，夹具里不许再写一
-/// 遍」——所以它的位置本身就是判据的一部分：搬进它，就要先从所有夹具里删干净。
-const SUPPORT_HOME: &str = "crates/cog-test-support/src/lib.rs";
+/// Redis、没有的时候停还是跳过，以及一条源码行里的字面量怎么读）。它判的是「这个
+/// 目录里定义过的体，夹具里不许再写一遍」——所以它的位置本身就是判据的一部分：搬进
+/// 它，就要先从所有夹具里删干净。
+///
+/// 按目录而不是按一个文件：支撑 crate 已经不止一份模块，只读 `lib.rs` 会让搬进
+/// 别的模块的体从判据底下走过去。
+const SUPPORT_HOME: &str = "crates/cog-test-support/src";
+
+/// 支撑 crate 的源码前缀，用来排除它自己（它的生产代码当然会读自己的体）。
+const SUPPORT_PREFIX: &str = "crates/cog-test-support/src/";
 
 /// 支撑 crate 里必须真有的入口：每搬一族进来，就在这上面加一个名字。
 ///
 /// 它挡的是上一族留下的那种空转：`support_copies` 判的是「夹具里没有第二份」，而一份
 /// 定义被删空的支撑 crate 让这条判据永远成立——判据只证明了「别处没有」，没证明「这里
 /// 有」。
-const SUPPORT_ENTRY_POINTS: [&str; 7] = [
+const SUPPORT_ENTRY_POINTS: [&str; 9] = [
     "pub fn database_url()",
     "pub fn redis_url()",
     "pub fn redis_url_required()",
@@ -167,6 +174,8 @@ const SUPPORT_ENTRY_POINTS: [&str; 7] = [
     "pub async fn drop_schema(",
     "pub async fn schema_pool(",
     "pub async fn schema_pool_with(",
+    "pub fn literals_in(",
+    "pub fn literal_values(",
 ];
 
 /// 支撑 crate 负责的那两个环境变量：`crates/` 里除了 `SUPPORT_HOME`，不许再有一处代码
@@ -497,7 +506,7 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
         //
         // 这份门自己写着标本（那些字符串里也有 `fn …`），所以它自己也摘出去；它认得
         // 这个形状由下面那条消融单独证明。
-        if name == SUPPORT_HOME {
+        if name.starts_with(SUPPORT_PREFIX) {
             for (function, _, body) in free_function_bodies(&text) {
                 support_bodies.insert(body, function);
             }
@@ -545,7 +554,7 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
         // 支撑 crate 负责的那两个名字：别处直接读它就是要红的那一处。这一面按**读的
         // 形状**判（`env::var("名字")`），不按名字出现在哪一行判——`expect` 的消息里
         // 写着同一个名字是在告诉人怎么设它，不是第二处在读。
-        if name != SUPPORT_HOME {
+        if !name.starts_with(SUPPORT_PREFIX) {
             for (index, line) in text.lines().enumerate() {
                 if line.trim_start().starts_with("//") {
                     continue;
@@ -564,6 +573,8 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
             "cog_test_support::own_schema",
             "cog_test_support::drop_schema",
             "cog_test_support::schema_pool",
+            "cog_test_support::literals_in",
+            "cog_test_support::literal_values",
         ] {
             support_callsites += text.matches(form).count();
         }
@@ -803,7 +814,17 @@ fn the_fixture_reading_steps_are_written_once() {
          「夹具里不许自己造」读的是一个没人用的构造函数",
         found.orchestrator_callsites
     );
-    let support = std::fs::read_to_string(root.join(SUPPORT_HOME)).expect("支撑 crate 读得到");
+    let mut support_files = Vec::new();
+    walk(&root.join(SUPPORT_HOME), &["rs"], &mut support_files);
+    assert!(
+        !support_files.is_empty(),
+        "{SUPPORT_HOME} 一份源码都没读到：那么下面的入口判据是在一个空集上说的"
+    );
+    let support: String = support_files
+        .iter()
+        .map(|path| std::fs::read_to_string(path).expect("支撑 crate 读得到"))
+        .collect::<Vec<_>>()
+        .join("\n");
     let missing: Vec<&str> = SUPPORT_ENTRY_POINTS
         .iter()
         .copied()
@@ -1148,7 +1169,7 @@ fn a_copy_on_disk_is_reported() {
         found.copies
     );
 
-    std::fs::remove_dir_all(&root).ok();
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }
 
 /// 判据自检：**自走的递归**这个形状认不认得出。
@@ -1208,7 +1229,7 @@ fn a_recursion_on_disk_is_reported() {
         "要点名到文件和行号，且报出那个自己调自己的函数名（它按定义名判不出来）"
     );
 
-    std::fs::remove_dir_all(&root).ok();
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }
 
 /// 判据自检：**同一段函数体写在两个夹具里**这个形状认不认得出。
@@ -1279,7 +1300,7 @@ fn a_body_written_twice_is_reported() {
         "两份都要点名到文件与行号，哪怕它们的函数名不一样：{at:?}"
     );
 
-    std::fs::remove_dir_all(&root).ok();
+    cog_core::ignore_lost!(std::fs::remove_dir_all(&root));
 }
 
 /// 同一段字节，两种方言的读法不同——这正是方言必须由调用方说出来的原因。

@@ -461,7 +461,7 @@ pub(crate) async fn ensure_git_identity(config: &IdentityConfig) -> Outcome {
                 .as_ref()
                 .or(facts.candidate_key.as_ref())
                 .cloned()
-                .unwrap_or_default();
+                .unwrap_or(Default::default());
             confirm_or_prompt(&kube, config, &facts, &key).await
         }
         Step::GenerateThenRegister | Step::GenerateThenAwaitHuman => {
@@ -689,11 +689,16 @@ fn probe_reason(probe: SshProbe) -> String {
 /// （目录按 umask 是 0755）并直接忽略这把密钥——失败发生在读文件那一步，密钥
 /// 本身对不对根本没被问到。所以"交给 ssh 的是什么"与"临时文件在哪里"由同一个
 /// 函数给出，谁改都不会只改一半。
+// cap: fixed — 一次 ssh 连接建立的等待上限：git/ssh 的连接超时选项
+// keep: 删掉后连不上的主机要等到 TCP 自己的放弃（分钟级），而这一次探测只是问「键还能不能用」；由 ssh 的连接选项约定兜住
+// wall: 等=一次 TCP 连接建立走完（ssh 的 ConnectTimeout）/ 等不到=这一次探测读作「连不上目标仓库」，不改任何已存的凭证——判词只属于这一次 / 续跑=能，下一次探测重新连接
+const SSH_CONNECT_TIMEOUT_SECS: u64 = 10;
+
 fn probe_key_and_options(private_key: &str) -> Result<(tempfile::TempDir, String), String> {
     let (dir, key_path) = temp_key_file(private_key)?;
     let options = format!(
         "ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
-         -o ConnectTimeout=10",
+         -o ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}",
         key_path.display()
     );
     Ok((dir, options))
@@ -727,6 +732,7 @@ async fn verify_ssh(config: &IdentityConfig, private_key: &str) -> SshProbe {
         }
     };
 
+    // roundtrip: 一次 SSH 探测的往返
     let out = tokio::time::timeout(SSH_PROBE_TIMEOUT, child.wait_with_output()).await;
     match out {
         Ok(Ok(out)) if out.status.success() => {
@@ -759,14 +765,18 @@ async fn verify_ssh(config: &IdentityConfig, private_key: &str) -> SshProbe {
 
 /// SSH 自证握手的硬超时。与选路探测同量级（那是一条 `ls-remote` 的一次往返），
 /// 但要留出"密钥被接受、仓库可读"这一段真实往返的余量。
-// cap: bound — 单次 SSH 探测的上限，要留出「密钥被接受、仓库可读」那段真实往返的余量
+// cap: fixed — 单次 SSH 探测的上限，要留出「密钥被接受、仓库可读」那段真实往返的余量
+// keep: 删掉后一次 SSH 探测永不到点，配置页停在探测上；由「留出密钥被接受、仓库可读的往返余量」兜住
+// wall: 等=一次 SSH 自证握手走完 / 等不到=这次探测读作「这条凭证不成立」，而它不改任何已存的凭证——判词是这一次的 / 续跑=能，下一次探测重新握手
 const SSH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// 登记部署密钥那次调用（GitHub API）的单次上限：15s。
 ///
 /// 这一步在交互式向导里同步等待，超过十几秒用户已经在怀疑卡死了；而一次
 /// 创建 deploy key 的请求本身很小，慢到 15s 基本就是网络或上游不可用。
-// cap: bound — 创建 deploy key 的请求本身很小，慢到 15s 基本就是网络或上游不可用
+// cap: fixed — 创建 deploy key 的请求本身很小，慢到 15s 基本就是网络或上游不可用
+// keep: 删掉后一个挂起的上游让创建按钮永远转；由「请求本身很小，慢到 15s 就是不可用」兜住
+// wall: 等=代码平台对一次建 key 请求的答复 / 等不到=这次创建失败；**对端可能已经建好了**，所以留下的是「不确定」，下一次要先去读一遍已有的 key 而不是直接再建 / 续跑=能，但先读后建，否则会建出第二把
 const DEPLOY_KEY_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// 把私钥写到临时文件（0600）供 git 使用。私钥不进命令行、不进环境变量，
@@ -837,7 +847,7 @@ async fn register_deploy_key(token: &str, repo: &str, public_line: &str) -> Resu
         .map_err(|e| format!("请求 GitHub 失败: {e}"))?;
     let status = resp.status().as_u16();
     if let Err(reason) = registration_verdict(status) {
-        let body = resp.text().await.unwrap_or_default();
+        let body = cog_core::logged_default!(resp.text().await);
         let snippet: String = body.chars().take(200).collect();
         return Err(format!("{reason}（响应: {snippet}）"));
     }

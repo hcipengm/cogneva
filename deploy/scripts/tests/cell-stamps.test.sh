@@ -13,6 +13,10 @@
 #   4. 动判据自己的输入（`ci.yml`）：全部作废——判据变了，上一次的结论就不作数。
 #   5. 量不出作用域（strace 没起来）：不记账，并且当场说一句。空作用域若当成键记下来，
 #      这一格此后永不重判，而读数上与「判过、是绿的」同形。
+#   6. 红的判词从**不沿用**：红的那一次常常停在第一条断言上，作用域因此比这一格真读的
+#      少；修掉第一处之后，第二处要读的那份字节不在作用域里，键不变——沿用下去就是一句
+#      永远修不掉的红，而它看起来像「同一处还没修好」。这里用最锋利的那一形来判：这一格
+#      红在一份仓外的文件上，那份字节从来不在键里，修好它键一动不动。
 #
 # 反证：把 `cell_run` 换回 `run_step`（或让 `cell_key` 恒等于一个常数），第 2 条就红在
 # 「没动过的树上有 N 格重判」上；只让键恒等于常数、不做作用域，第 3 条会红在「读了它的
@@ -92,6 +96,17 @@ set -euo pipefail
 cd fixtures
 cat input-rel.txt >/dev/null
 SH
+# 第六格：判词取决于一个**仓外**的文件。作用域只记仓里的路径，所以修好它时这一格的键
+# 一动不动——沿用红的形状因此是「这一格读的东西没变，上次是红的」：一句永远不会自己消失
+# 的红，而它看起来像「同一处还没修好」。现实里更常见的是红的那次停在第一条断言上、作用域
+# 因此比这一格真判的短，同一个病。
+outside="${work}/outside-flag"
+cat >"${tree}/deploy/scripts/tests/red-until-fixed.test.sh" <<SH
+#!/usr/bin/env bash
+set -euo pipefail
+[ "\$(cat ${outside})" = fixed ] || exit 1
+SH
+printf 'broken\n' >"${outside}"
 printf 'x1\n' >"${tree}/fixtures/input-x.txt"
 printf 'y1\n' >"${tree}/fixtures/input-y.txt"
 printf 'r1\n' >"${tree}/fixtures/input-rel.txt"
@@ -164,6 +179,18 @@ for cell in reads-x.test.sh reads-y.test.sh reads-rel.test.sh noop.test.sh hates
 done
 note "树没动过：每一格都沿用上次的判词"
 
+# ---- 2b. 红的判词不沿用：把它红的那份字节修好，它必须重判并转绿 ----
+# 这一格红在一份仓外的文件上，那份字节不在键里：修好它时这一格的键一动不动。
+[ "$(cell_state "${out2}" red-until-fixed.test.sh)" = ran ] ||
+    fail "红的格子第二次跑仍然沿用了旧判词：$(grep -F '== red-until-fixed.test.sh' "${out2}" || true)"
+printf 'fixed\n' >"${outside}"
+out2b="$(run_gate red-refixed)"
+[ "$(cell_state "${out2b}" red-until-fixed.test.sh)" = ran ] ||
+    fail "修好它红的那份字节之后那一格没有重判（沿用了旧红）：$(grep -F '== red-until-fixed.test.sh' "${out2b}" || true)"
+[ "$(cell_verdict "${out2b}" red-until-fixed.test.sh)" = ok ] ||
+    fail "那份字节已经修好，这一格却还是 $(cell_verdict "${out2b}" red-until-fixed.test.sh)"
+note "红的判词不沿用：修好它红的那份字节就转绿"
+
 # ---- 3. 动一个被某格读过的文件：只有那格重判 ----
 printf 'x2\n' >"${tree}/fixtures/input-x.txt"
 out3="$(run_gate changed-x)"
@@ -221,6 +248,75 @@ esac
 [ -z "$(find "${unit}" -name verdict -print -quit)" ] ||
     fail "量不出作用域的一格仍然记了账：$(find "${unit}" -name verdict -print -quit)"
 note "量不出作用域的一格不记账，并且说得出这一跑为什么没记"
+
+# ---- 6. 格的键只对「装置」失效，不对别人那一格的措辞失效 ----
+# 原先 `gate_inputs` 哈希的是整份门脚本：改一个只影响日志的槽标签，137 格的键同时变，
+# 一次 105 格只沿用 2 格。格子自己的命令进了 `cell_id`，所以真正该全体作废的是装置——
+# 函数体与顶层赋值。这一节把这两半分开验：
+#   改别格的一行说明 -> 装置哈希不变；
+#   改一个函数体     -> 装置哈希变。
+machinery_hash() { # <脚本内容>
+    printf '%s' "$1" | awk '
+        /^[A-Za-z_][A-Za-z0-9_]*\(\) *\{/ { in_fn = 1 }
+        in_fn { print; if ($0 ~ /^\}/) { in_fn = 0; print "" }; next }
+        /^[A-Za-z_][A-Za-z0-9_]*=/ { print; next }
+        /^set / { print; next }
+    ' | sha256sum
+}
+
+base_script='set -uo pipefail
+helper() {
+    echo one
+}
+run_step "格子甲" true
+run_step "格子乙" true
+'
+relabelled='set -uo pipefail
+helper() {
+    echo one
+}
+run_step "格子甲（改了措辞）" true
+run_step "格子乙" true
+'
+helper_changed='set -uo pipefail
+helper() {
+    echo two
+}
+run_step "格子甲" true
+run_step "格子乙" true
+'
+
+[ "$(machinery_hash "${base_script}")" = "$(machinery_hash "${relabelled}")" ] ||
+    fail "只改了某一格的措辞，装置哈希也变了：整门 137 格会一起作废"
+[ "$(machinery_hash "${base_script}")" != "$(machinery_hash "${helper_changed}")" ] ||
+    fail "改了装置（函数体），装置哈希没变：所有格会沿用一份已经不对的判词"
+note "格戳只对装置失效：改措辞不动哈希，改函数体才动"
+
+# ---- 7. 轨迹有上限：一个格子的轨迹不会把盘写满，而且停下之后仍要判一次 ----
+# 2026-11-19 实测：`host-target-gc.test.sh` 这一格判的是宿主机（回收器按 /proc 枚举
+# 进程），而 `-y` 每解一个 fd 也读 /proc —— 轨迹一边写一边放大；本机实测 2026-11-19
+# 本机五分钟写了 256 MiB，同一台机器盘上用量从 20 GiB 涨到 32 GiB。量作用域的仪器
+# 把「判」变成了「填盘」。
+# 这一节判三件事：超过上限要停下并说出来；停下之后按不带追踪重跑出判词；半份轨迹不记账
+# （半份轨迹解出的作用域会让这一格永不重判，而永不重判与一直绿同形）。
+unit_cap="${work}/unit-cap"
+mkdir -p "${unit_cap}"
+export COGNEVA_CELL_STAMP_DIR="${unit_cap}"
+export COGNEVA_CELL_TRACE_MAX_BYTES=65536
+status_cap=0
+out_cap="$(cell_run "一格把轨迹写爆" bash -c 'for _ in $(seq 1 800); do cat /proc/self/stat >/dev/null; done' 2>&1)" || status_cap=$?
+case "${out_cap}" in
+    *"轨迹超过"*) ;;
+    *) fail "轨迹超过上限时没有停下来说一句 —— ${out_cap}" ;;
+esac
+[ "${status_cap}" -eq 0 ] ||
+    fail "停掉追踪之后没有按不带追踪重跑出判词：退出码 ${status_cap} —— ${out_cap}"
+[ -z "$(find "${unit_cap}" -name verdict -print -quit)" ] ||
+    fail "半份轨迹的那一格记了账：$(find "${unit_cap}" -name verdict -print -quit)"
+[ ! -e "${TMPDIR:-/tmp}/cogneva-cell.$$.trace" ] ||
+    fail "轨迹文件留在了盘上：${TMPDIR:-/tmp}/cogneva-cell.$$.trace"
+note "轨迹超过上限时停下追踪、按不带追踪判一次，且不记半份作用域的账"
+unset COGNEVA_CELL_TRACE_MAX_BYTES
 
 echo "cell-stamps.test: all checks passed"
 

@@ -94,8 +94,19 @@ pub fn owner_of_task(tasks: &[cog_core::Task], task_id: &str) -> Option<String> 
 /// 同一条规则，从编排器现读一遍任务图。任务行是这条信息的正本：加边的时候去读，
 /// 而不是在边上留一个空位等人事后猜。
 async fn owner_from_graph(state: &crate::GatewayState, task_id: &str) -> Option<String> {
-    let (tasks, _edges) = state.orchestrator.get_graph().await;
-    owner_of_task(&tasks, task_id)
+    match state.orchestrator.get_graph_checked().await {
+        Ok((tasks, _edges)) => owner_of_task(&tasks, task_id),
+        Err(e) => {
+            // 这一读答不上来时，这一列留空，但要让读日志的人知道空的是
+            // 「没读出来」而不是「没人经手」。
+            warn!(
+                task = task_id,
+                error = %e,
+                "the task graph could not be read; this link is added without an owner"
+            );
+            None
+        }
+    }
 }
 
 pub fn tasks_interrupted_by_restart(tasks: &[cog_core::Task], agent_id: &str) -> Vec<String> {
@@ -204,10 +215,26 @@ pub fn spawn_collaboration_listener(
                                     .await;
                                     match event {
                                     cog_core::TaskEvent::TaskCompleted { task_id, timestamp, .. } => {
-                                        let dependents: Vec<String> = {
-                                            state.orchestrator.get_dependents(&task_id).await
-                                                .map(|deps| deps.into_iter().map(|t| t.id.clone()).collect())
-                                                .unwrap_or_default()
+                                        let dependents: Vec<String> = match state
+                                            .orchestrator
+                                            .get_dependents_checked(&task_id)
+                                            .await
+                                        {
+                                            Ok(Some(deps)) => {
+                                                deps.into_iter().map(|t| t.id.clone()).collect()
+                                            }
+                                            Ok(None) => Vec::new(),
+                                            Err(e) => {
+                                                // 读失败与「这条任务确实没有下游」在上面的
+                                                // 边集上同形：都没有边。把它说出来，日志里
+                                                // 才分得清这一趟是漏了，还是本来就空。
+                                                warn!(
+                                                    task = %task_id,
+                                                    error = %e,
+                                                    "the dependents of a completed task could not be read; no hand-off edges were added"
+                                                );
+                                                Vec::new()
+                                            }
                                         };
                                         // 交接边记的是「谁交出来的」：任务结果是谁交的
                                         // 就写在它自己那一行上，加边时去读，而不是让
@@ -270,9 +297,25 @@ pub fn spawn_collaboration_listener(
                                 Ok(cog_core::SupervisorEvent::AgentRestarted { agent_id, timestamp, .. }) => {
                                     // 执行者被重启时手上还在跑的任务，它的执行被打断了，
                                     // 重启后接着做——这正是「重启」这条边要说的事。
-                                    let interrupted: Vec<String> = {
-                                        let (tasks, _edges) = state.orchestrator.get_graph().await;
-                                        tasks_interrupted_by_restart(&tasks, &agent_id)
+                                    let interrupted: Vec<String> = match state
+                                        .orchestrator
+                                        .get_graph_checked()
+                                        .await
+                                    {
+                                        Ok((tasks, _edges)) => {
+                                            tasks_interrupted_by_restart(&tasks, &agent_id)
+                                        }
+                                        Err(e) => {
+                                            // 空集在这里说「这次重启没有打断在跑的任务」，
+                                            // 而读失败也画成同一个空集。分开说，界面上的
+                                            // 零才不是替一次没读到的图作证。
+                                            warn!(
+                                                agent = %agent_id,
+                                                error = %e,
+                                                "the task graph could not be read; no respawn edges were added for this restart"
+                                            );
+                                            Vec::new()
+                                        }
                                     };
                                     for task_id in interrupted {
                                         graph.add_link(crate::collaboration::CollaborationLink {

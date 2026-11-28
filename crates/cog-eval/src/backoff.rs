@@ -28,7 +28,8 @@ use cog_core::contract::llm::retry_after_hint_in;
 ///
 /// 单位已经写在名字里；窗口再另立一个数，就会出现「每分钟 3 次、窗口 90 秒」
 /// 这种自相矛盾的组合。
-// cap: bound — 单位写在名字里；另立窗口数就会出现「每分钟 3 次、窗口 90 秒」
+// cap: fixed — 单位写在名字里；另立窗口数就会出现「每分钟 3 次、窗口 90 秒」
+// not-a-bound: 单位写在名字里；另立窗口数就会出现「每分钟 3 次、窗口 90 秒」
 const PER_MINUTE_WINDOW: Duration = Duration::from_secs(60);
 use cog_core::{
     AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions, LlmClient, Message,
@@ -40,7 +41,8 @@ use cog_core::{
 /// 一秒不是拍出来的：它比一次快速失败（实测 0.7 ms）长三个数量级，足以把
 /// 「一秒钟灌进几百条」压回「一秒钟一条」。比它更长的值会把一次正常的重跑也拖慢，
 /// 而拒绝本来就是少数时刻。
-// cap: derived — 比一次实测的快速失败（0.7 ms）长三个数量级，足以把两个失败分开
+// cap: fixed — 比一次实测的快速失败（0.7 ms）长三个数量级，足以把两个失败分开
+// keep: 删掉后连续被拒没有间隔，重试把上游打得更狠；由「退避要长于一次快速失败三个数量级」兜住
 pub const DEFAULT_REFUSAL_BACKOFF: Duration = Duration::from_secs(1);
 
 /// 同一个调用方一分钟内最多发起多少次尝试。
@@ -49,7 +51,9 @@ pub const DEFAULT_REFUSAL_BACKOFF: Duration = Duration::from_secs(1);
 /// 一分钟上千次。这个数是**每一次调用都要过的一道闸**，与单次退避叠加。
 /// 10 次/秒 比正常评测的调用密度（现网一小时几十到几百次）高两个数量级，所以它
 /// 不是正常路径的节流阀；它只在拒绝风暴里咬合。
-// cap: bound — 单次退避管不住「很多任务同时失败」，所以另有一个每分钟预算
+// cap: fixed — 单次退避管不住「很多任务同时失败」，所以另有一个每分钟预算
+// keep: 删掉后同时失败的任务没有每分钟预算，形成重试风暴；由「每分钟尝试预算」兜住
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 pub const ATTEMPTS_PER_MINUTE: usize = 600;
 
 /// 一跑最多肯为**一次**拒绝坐等多久；默认 600 秒。
@@ -65,7 +69,8 @@ pub const ATTEMPTS_PER_MINUTE: usize = 600;
 ///
 /// 600 秒这个数取的是「比实测见过的窗口翻页（约 4 分钟）长、又明显短于一次 Pod 的
 /// 寿命（45 分钟）」，两头都留得下一段。
-// cap: bound — 一次拒绝的坐等上限：上游给的等待可以比这一跑能活的时间更长
+// cap: fixed — 一次拒绝的坐等上限：上游给的等待可以比这一跑能活的时间更长
+// keep: 删掉后一次被拒的坐等可以超过这一跑的寿命，任务白占槽；由「上游给的等待可以比这一跑长」兜住
 pub const DEFAULT_REFUSAL_WAIT_CAP: Duration = Duration::from_secs(600);
 
 /// 一跑里调用侧退避的界，以及它咬合了多少次。随表一起出（`Table::backoff`）。
@@ -318,7 +323,10 @@ impl BackoffLlm {
                 .as_deref()
                 .and_then(retry_after_hint_in)
         });
-        let detail = response.error_message.as_deref().unwrap_or_default();
+        let detail = response
+            .error_message
+            .as_deref()
+            .unwrap_or(Default::default());
         self.backoff.note_refusal(stated, detail);
     }
 }
@@ -703,8 +711,8 @@ mod tests {
         let backoff = Arc::new(RefusalBackoff::new(ATTEMPTS_PER_MINUTE));
         let llm = BackoffLlm::new(inner.clone(), backoff.clone());
 
-        let _ = llm.chat(&[], &ChatOptions::default()).await;
-        let _ = llm.chat(&[], &ChatOptions::default()).await;
+        cog_core::ignore_lost!(llm.chat(&[], &ChatOptions::default()).await);
+        cog_core::ignore_lost!(llm.chat(&[], &ChatOptions::default()).await);
 
         let calls = inner.calls.lock().unwrap();
         assert!(

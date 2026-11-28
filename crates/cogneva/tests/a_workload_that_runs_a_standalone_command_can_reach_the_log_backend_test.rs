@@ -24,6 +24,7 @@
 use crate::common;
 
 use common::routes::read;
+use common::routes::rendered_root;
 use common::routes::repo_root;
 use common::routes::walk;
 use common::rust_text;
@@ -84,7 +85,7 @@ fn every_workload_that_runs_a_standalone_command_can_reach_the_log_backend() {
     }
 
     let mut files = Vec::new();
-    walk(&root.join("deploy/rendered"), &["yaml"], &mut files);
+    walk(&rendered_root(), &["yaml"], &mut files);
     assert!(
         files.len() > 10,
         "read {} rendered manifests; the walk is not seeing the trees",

@@ -98,7 +98,7 @@ impl MessageBackend for MemoryMessageBackend {
         state.next_id += 1;
         let msg = (id, payload.to_vec());
         state.buffer.push(msg.clone());
-        let _ = state.sender.send(msg);
+        cog_core::ignore_lost!(state.sender.send(msg));
         Ok(())
     }
 
@@ -116,7 +116,7 @@ impl MessageBackend for MemoryMessageBackend {
             state.next_id += 1;
             let msg = (id, payload.to_vec());
             state.buffer.push(msg.clone());
-            let _ = state.sender.send(msg);
+            cog_core::ignore_lost!(state.sender.send(msg));
         }
         Ok(())
     }
@@ -182,7 +182,7 @@ impl MessageBackend for MemoryMessageBackend {
                 .cloned()
         };
         if let Some(sender) = sender {
-            let _ = sender.send(true);
+            cog_core::ignore_lost!(sender.send(true));
         }
     }
 

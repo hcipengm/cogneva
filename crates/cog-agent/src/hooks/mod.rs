@@ -10,6 +10,7 @@
 //! See [`HookEngine`] for the entry point.
 
 pub mod engine;
+pub mod guard;
 pub mod lifecycle;
 pub mod loader;
 pub mod rate_limit;
@@ -22,6 +23,7 @@ pub use cog_core::{
     RateLimitConfig,
 };
 pub use engine::{DefaultHookPublisher, HookEngine, HookEngineConfig, HookPublisher};
+pub use guard::{before_tool_call, GuardAction, GuardRule, HookRun, Runs};
 pub use lifecycle::{
     HookHandler, HookType, LifecycleHookEngine, LifecycleHookEvent,
     DEFAULT_LIFECYCLE_CHANNEL_BUFFER,
@@ -29,5 +31,5 @@ pub use lifecycle::{
 pub use loader::{apply_runtime_overrides, load_and_apply, HookConfig};
 pub use rate_limit::TokenBucket;
 pub use tiered::TieredHookPublisher;
-pub use types::{DEFAULT_DEDUP_WINDOW, DEFAULT_HOOK_TIMEOUT};
+pub use types::DEFAULT_DEDUP_WINDOW;
 pub use wal_buffer::WalHookPublisher;

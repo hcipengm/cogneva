@@ -33,7 +33,8 @@ pub struct PolicyEvolutionConfig {
     /// 总开关。默认开：这条循环的输入全部是本进程已记录的结果，副作用只
     /// 落在本进程自己的策略目录里，不需要按部署指定属主。
     pub enabled: bool,
-    /// 相邻两轮之间的间隔（秒），下限 60。
+    /// 相邻两轮之间的间隔（秒）。声明的值原样生效；0 秒在加载时点名拒绝
+    /// （那是忙等，不是一个节拍）。
     pub interval_secs: u64,
     /// 演化的策略名。参数语义由该策略的读取方决定，换名字等于换策略。
     ///
@@ -51,13 +52,19 @@ pub struct PolicyEvolutionConfig {
     pub margin_grid: Vec<f64>,
 }
 
+// 四十次：一次比较要看出两个策略的差别，样本低于这个数时胜出者可能只是运气；
+// 部署上这个数经常攒不满，所以它是「能不能下结论」的门，不是「等到攒满」的期限。
+// cap: fixed — 四十次：低于它胜出者可能只是运气，它决定能不能下结论
+// keep: 删掉后几轮试验就敢说胜出，结论可能只是运气；由「低于四十次结论下不了」兜住
+const POLICY_MIN_TRIALS: usize = 40;
+
 impl Default for PolicyEvolutionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            interval_secs: 3600,
+            interval_secs: cog_core::day::SECONDS_PER_HOUR as u64,
             policy_name: crate::META_LEARNING_POLICY.into(),
-            min_trials: 40,
+            min_trials: POLICY_MIN_TRIALS,
             min_samples_grid: vec![2, 3, 5, 8],
             margin_grid: vec![0.0, 0.05, 0.1, 0.15, 0.2, 0.3],
         }
@@ -92,6 +99,10 @@ impl PolicyEvolutionConfig {
                 SFError::Config(format!("COGNEVA_POLICY_EVOLUTION_INTERVAL_SECS: {v}"))
             })?;
         }
+        crate::config::declared_cadence(
+            "self_evolution.artifact_evolution.interval_secs",
+            cfg.interval_secs,
+        )?;
         Ok(cfg)
     }
 }
@@ -307,7 +318,7 @@ pub async fn run_policy_evolution_loop(
     driver: Arc<PolicyEvolutionDriver>,
     shutdown: cog_core::ShutdownSignal,
 ) {
-    let interval = Duration::from_secs(driver.config.interval_secs.max(60));
+    let interval = Duration::from_secs(driver.config.interval_secs);
     info!(
         interval_secs = interval.as_secs(),
         policy = %driver.config.policy_name,
@@ -361,6 +372,37 @@ pub async fn run_policy_evolution_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 「够不够下结论」的样本门只有一处声明：默认值读常量，源码面 `impl Default` 的字段里不再有数字。
+    #[test]
+    fn the_policy_evolution_default_reads_its_name() {
+        assert_eq!(
+            PolicyEvolutionConfig::default().min_trials,
+            POLICY_MIN_TRIALS
+        );
+        let body = include_str!("policy_evolution.rs")
+            .split("impl Default for PolicyEvolutionConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    let value = value.trim().trim_end_matches(',');
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.starts_with(|c: char| c.is_ascii_digit())
+                        // 哨兵 0 与空串不是旋钮，是「没写」。
+                        && value != "0"
+                })
+            })
+            .map(str::trim)
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
+    }
     use cog_core::{DecisionCategory, DecisionOutcome, MetricsBackend};
 
     /// Record outcomes through the same entry point the live system uses, so

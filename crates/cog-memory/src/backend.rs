@@ -316,6 +316,20 @@ impl cog_core::MemoryBackend for MemoryMemoryBackend {
             existing.confidence = entry.confidence;
             store.schema.insert(existing.id.clone(), existing);
         } else {
+            // The map is keyed by the id alone, so this slot can already be
+            // taken by an entry another namespace holds under the same id.
+            // Inserting here would overwrite that entry out of existence; a
+            // namespace is a boundary, so say so instead of replacing it.
+            if let Some(stored) = store
+                .schema
+                .get(&entry.id)
+                .filter(|stored| stored.namespace != namespace)
+            {
+                return Err(SFError::Agent(format!(
+                    "schema id `{}` is held by namespace `{}`",
+                    entry.id, stored.namespace
+                )));
+            }
             store.schema.insert(entry.id.clone(), entry.clone());
         }
         metrics.schema_updated += 1;
@@ -562,6 +576,15 @@ impl cog_core::MemoryBackend for MemoryMemoryBackend {
         results.extend(ranked.into_iter().map(|(_, result)| result));
 
         results.truncate(top_k);
+        // Both layers were consulted, which is what the two counters mean on
+        // `search_schema` and `search_summary`; a unified search that skipped
+        // them would be missing from the readings those paths publish.
+        let mut metrics = self
+            .metrics
+            .write()
+            .map_err(|_| SFError::Agent("lock poisoned".into()))?;
+        metrics.schema_searched += 1;
+        metrics.summary_searched += 1;
         Ok(results)
     }
 
@@ -726,5 +749,57 @@ impl cog_core::MemoryBackend for MemoryMemoryBackend {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cog_core::MemoryBackend;
+
+    /// 统一检索读的是同样两层：`search_all` 走过 schema 与 summary 之后，两个
+    /// 分层计数必须跟着涨，否则读数描述的世界比实际跑过的小一圈——按层调用
+    /// 有计数、合起来调一次没有，正是那条缺口。
+    #[tokio::test]
+    async fn a_unified_search_counts_both_layers() {
+        let backend = MemoryMemoryBackend::new();
+        backend
+            .store_schema(
+                "default",
+                &SchemaEntry::new(
+                    "schema-1",
+                    "default",
+                    cog_core::SchemaKind::Entity,
+                    "PostgreSQL",
+                    "postgresql",
+                    cog_core::SourceRef::new("memory://raw-1", "test/v1"),
+                ),
+            )
+            .await
+            .unwrap();
+        backend
+            .store_summary(
+                "default",
+                &SummaryEntry::new(
+                    "summary-1",
+                    "default",
+                    "PostgreSQL is a relational database",
+                    Vec::new(),
+                    cog_core::NO_EMBEDDING_MODEL,
+                    cog_core::SourceRef::new("memory://raw-1", "test/v1"),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(backend.metrics().schema_searched, 0);
+        assert_eq!(backend.metrics().summary_searched, 0);
+
+        let results = backend
+            .search_all("default", "PostgreSQL", None, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(backend.metrics().schema_searched, 1);
+        assert_eq!(backend.metrics().summary_searched, 1);
     }
 }

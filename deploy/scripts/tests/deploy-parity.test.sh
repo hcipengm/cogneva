@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# reads: deploy/helm/cogneva/templates/*.yaml subject
 # check-deploy-parity.sh 的定向测试：比对面是**声明**出来的，而声明比实际做得宽不会
 # 报错——比对落到名字上时，一类资源改哪个字段它都绿，判词照样写着「全对齐」。
 #

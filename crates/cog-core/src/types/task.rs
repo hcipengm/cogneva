@@ -132,6 +132,19 @@ pub struct Task {
     pub task_type: TaskType,
     pub status: TaskStatus,
     pub input: serde_json::Value,
+    /// 终态描述：讨论写下的那段话，原样。判据只读这一格。
+    ///
+    /// 与 `now`／`gap` 一起是待办的五格里的三格（另两格是 `id` 与算出来的
+    /// 状态）。它们是一等字段而不是 `input` 里的一个键：判据与界面都按名读它们，
+    /// 埋在文本载荷里就不可查询，只好像什么「按键读的键升成真列」那样再补一层。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub terminal: String,
+    /// 此刻的样子，写明来源（census／test／planner／owner）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub now: String,
+    /// 终态减现在，用话写明缺什么；空 = 到终态。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gap: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -184,7 +197,7 @@ pub struct Task {
     /// 沙盒工具要把一个外部进程按住不让它跑飞。那些等待由发起方兑现，不由平台
     /// 兑现——平台这边读它的地方只有读数（「按经验这条活该有结局了」），没有
     /// 一处拿它做删除或取消。
-    pub timeout_seconds: u64,
+    pub declared_duration_seconds: u64,
     /// 持有本任务执行权的进程身份，随进程消亡而失效。
     ///
     /// 它不是实例身份：同一台机器上换一个进程，持有者就换了一个值，而这正是
@@ -858,6 +871,273 @@ pub const INPUT_PRINCIPLES: &str = "principles";
 /// for the reason the markers above state.
 pub const INPUT_READY_LANE: &str = "ready_lane";
 
+/// The `task.input` key by which a task says its work changes the checkout.
+///
+/// 「这件活要动工作树」是任务自己的事，不是接手的人是谁的事。按角色判时，同一个
+/// 人接了另一类活就判错：一位工程师做评审时被当成该写树的（于是被「半小时没动」
+/// 收住），而一个小队队员做变更时被当成只读的（于是绕圈一小时没人叫停）。生产
+/// 者在提交时说清楚这一件活要交什么，读的人只问任务。
+///
+/// 写成键而不是一句话，理由与上面几个标记相同：两端各拼一遍，写的那一端继续写
+/// 旧词、读的那一端比对新词，任务只是安静地不再被认出来。
+pub const INPUT_DECLARES_CHANGE: &str = "declares_change";
+
+/// The `task.input` key by which a task says what it delivers.
+///
+/// 这是 [`INPUT_DECLARES_CHANGE`] 所代理的那个量本身。判据、输出形状、任务类型都跟
+/// 「这份活交什么」走，而这件事只有任务说得出来；以前它们从接手人的角色名反推，于是
+/// 同一件活换个标签接手就换一套待遇。声明写明时以声明为准，`declares_change` 只作为
+/// 旧生产者还不会写新键时的兼容读法。
+pub const INPUT_DELIVERS: &str = "delivers";
+
+/// The `task.input` key under which a signal-filed task carries the detail of
+/// the reading that filed it.
+///
+/// The reader that filed the row (`signal_watcher`) puts the whole detail here,
+/// so a task made from an outside judgement still carries what was said when
+/// it is judged later. Read through [`Task::stated_directions`]; spelled as a
+/// key for the same reason as the markers above — two hand-written copies drift.
+pub const INPUT_SIGNAL: &str = "signal";
+
+/// The detail's own `kind` for a taste submission.
+///
+/// A signal detail is tagged by kind, and only this kind carries a taste
+/// payload. Matching on anything else would let an alert whose detail happens
+/// to have a `payload` key be read as a stated direction.
+pub const TASTE_SIGNAL_KIND: &str = "taste_intent";
+
+/// The detail's own `kind` for a batch of chat intents taken up for triage.
+///
+/// One task carries a batch rather than one task per sentence: a conversation
+/// turn is cheap to say and expensive to run end to end, so the judgement of
+/// which turns ask for work happens once per batch. The task reads the kind
+/// back to know the detail is a list of the owner's own words.
+pub const CHAT_INTENT_TASK_KIND: &str = "chat_intents";
+
+/// What a piece of work delivers.
+///
+/// The closed set the treatment of the work follows: the rubric that judges it,
+/// the shape its output is asked for in, the task type it runs as. Who takes the
+/// work is not one of the inputs — the same work taken by two labels must be
+/// treated the same.
+///
+/// `Unstated` is a state rather than a kind: the row did not say what it
+/// delivers. It is spelled out instead of defaulting to the commonest kind,
+/// because a default would make "nobody said" and "somebody said work product"
+/// read the same, and telling those two apart is the whole point of recording
+/// the declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Deliverable {
+    /// A decomposition of a task into sub-tasks.
+    Plan,
+    /// A change to the checkout: an expected state of the tree.
+    Change,
+    /// A judgement about someone else's work.
+    Judgement,
+    /// A final answer to the task's question.
+    Answer,
+    /// Anything else the task asked for: a report, a build artifact, one run.
+    WorkProduct,
+    /// The row did not say. Not a kind; a state that readers must answer for.
+    Unstated,
+}
+
+impl Deliverable {
+    /// Read the word a producer writes, or nothing for a word outside the set.
+    ///
+    /// The two spellings `judgement` / `judgment` and the dashed form of
+    /// `work_product` are accepted because they are what people actually type in
+    /// a JSON body; anything else is not silently coerced to a kind.
+    pub fn from_word(word: &str) -> Option<Self> {
+        match word.trim() {
+            "plan" => Some(Self::Plan),
+            "change" => Some(Self::Change),
+            "judgement" | "judgment" => Some(Self::Judgement),
+            "answer" => Some(Self::Answer),
+            "work_product" | "work-product" => Some(Self::WorkProduct),
+            "unstated" => Some(Self::Unstated),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Change => "change",
+            Self::Judgement => "judgement",
+            Self::Answer => "answer",
+            Self::WorkProduct => "work_product",
+            Self::Unstated => "unstated",
+        }
+    }
+
+    /// Whether a run for this work is expected to change the checkout.
+    ///
+    /// The one question the runtime asked before the set existed; kept as a
+    /// reading of the declaration rather than as a second field.
+    pub const fn declares_change(&self) -> bool {
+        matches!(self, Self::Change)
+    }
+}
+
+/// The `task.input` key where a settled declaration is written.
+///
+/// 「这件活交什么」此前每次都在读的那一端现推：新键一个读法、旧布尔一个读法、
+/// 自进化标记又一个读法。哪一端以后加了条件，同一行在不同人手里就有了两个答案，
+/// 而谁也没错——错的只是没有一个共同的落点。这一格就是那个落点：写下一次，之后
+/// 所有读的人都读它。
+pub const INPUT_DELIVERABLE_RECORD: &str = "deliverable_record";
+
+/// The `task.input` key holding every declaration this row's record replaced.
+///
+/// 新声明覆盖旧声明时旧的那份不丢：`who` 什么时候说过什么、后来被谁改成了什么，
+/// 是审计与差分要读的东西。只留最新一份，覆盖这件事本身就没有证据了。
+pub const INPUT_DELIVERABLE_SUPERSEDED: &str = "deliverable_superseded";
+
+/// 生产者是用哪种拼法说出这份活交什么的。
+///
+/// 与 [`Deliverable`] 分开：那是「交什么」，这是「话是怎么说出来的」。合成一格
+/// 之后，旧布尔写下的 `change` 与按新键写下的 `change` 在读数里就分不开了，而
+/// 「旧键还会被读多久」正是收尾旧拼法时要看的数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatementVia {
+    /// 按 [`INPUT_DELIVERS`] 写了闭集里的一个词。
+    Delivers,
+    /// 只会写旧键 [`INPUT_DECLARES_CHANGE`]，真值为真。
+    DeclaresChange,
+    /// 平台在代码里为这道工序说的：这段结构固定产出这个物，不由行上的字段说。
+    ///
+    /// 与 `Delivers` 分开，因为它不是某一份活自己说的——它在任何任务行被读之前
+    /// 就成立。合进 `Delivers` 会让读数把「行上写了」与「这段代码就是这样」算成
+    /// 同一个数，而收尾旧拼法时要知道的正是行上还有多少份没被生产者说出来。
+    Protocol,
+}
+
+/// 哪条规则把任务行上的一个标记读成了交付物。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DerivationRule {
+    /// 自进化入口：任务类型或模式标记本身就是「交一份变更」那句话。
+    SelfEvolutionEntry,
+}
+
+/// 一件活交什么，以及这个结论是从哪儿来的。
+///
+/// 终态要能指出来源：一份活交什么只由「活自己说了什么」「接手的人实测交过什么」
+/// 「操作者显式覆盖」这三样决定。这一个类型就是第一样的载体——`Stated` 有人、
+/// 有拼法，`Derived` 有原文、有规则、有时间，`Unstated` 与 `Unreadable` 分开，
+/// 因为「没人说」和「说了但读不出来」在读数里必须是两个数，否则一个拼错的词会
+/// 永远安静地落在「没人说」那一格里。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum DeliverableDeclaration {
+    /// 生产者自己在提交时说了。
+    Stated {
+        conclusion: Deliverable,
+        /// 说这句话的是谁。提交人从令牌来，行上没有身份时这里是 `None`——
+        /// 空着比编一个名字诚实。
+        by: Option<String>,
+        via: StatementVia,
+    },
+    /// 平台按行上的一个标记推出来的。
+    ///
+    /// 三格缺一不可：`from` 是当时读到的原文（不是概括），`rule` 是哪条规则，
+    /// `at` 是这个结论在行上成立的时间。没有这三格，「推出来的」与「生产者
+    /// 说的」在读数里长得一样。
+    Derived {
+        conclusion: Deliverable,
+        from: String,
+        rule: DerivationRule,
+        /// 取行自己的 `created_at`。读取本身不读时钟：同一行读多少次都得到
+        /// 同一份声明，重放一次历史也不会得到第二个答案。
+        at: DateTime<Utc>,
+    },
+    /// 行上写了东西，但读不成声明——拼错的词、读不懂的标记、坏掉的记录。
+    Unreadable {
+        /// 原样留下当时写着的那一段，不概括、不截断。
+        raw: String,
+    },
+    /// 行上没写，也没有一条规则读得出它。
+    Unstated,
+}
+
+impl DeliverableDeclaration {
+    /// 这份声明说的交付物；读不出来就是 [`Deliverable::Unstated`]。
+    ///
+    /// 「读不出来」与「没人说」在这里合流，因为这个问题只问交什么；要分辨两者
+    /// 的读数读的是本类型本身，不是这个函数。
+    pub const fn conclusion(&self) -> Deliverable {
+        match self {
+            Self::Stated { conclusion, .. } | Self::Derived { conclusion, .. } => *conclusion,
+            Self::Unreadable { .. } | Self::Unstated => Deliverable::Unstated,
+        }
+    }
+
+    /// 平台自己为一道工序说的那份声明（见 [`StatementVia::Protocol`]）。
+    ///
+    /// `by` 空着：这句话不是某个人说的，是这段结构说的。编一个提交人会让
+    /// 「谁说的」在读数里指到一个没说过它的人。
+    pub const fn protocol(conclusion: Deliverable) -> Self {
+        Self::Stated {
+            conclusion,
+            by: None,
+            via: StatementVia::Protocol,
+        }
+    }
+
+    /// 这份声明来自哪一类来源，不带内容。
+    pub const fn state(&self) -> DeclarationState {
+        match self {
+            Self::Stated { .. } => DeclarationState::Stated,
+            Self::Derived { .. } => DeclarationState::Derived,
+            Self::Unreadable { .. } => DeclarationState::Unreadable,
+            Self::Unstated => DeclarationState::Unstated,
+        }
+    }
+}
+
+/// 一份声明的来源属于哪一类。
+///
+/// 与 [`DeliverableDeclaration`] 分开：运行期的读数要按来源计数，而整份声明里
+/// 的 `by`、`at`、`from` 与待遇无关——把它们当标签，同一条读数会被拆成一串只
+/// 差时间戳的格子。
+///
+/// 四态而不是两态：「说了」与「没说」之间还隔着「说了但读不出来」，那正是
+/// 「量不到」与「量到的就是没有」的区别，合进 `Unstated` 之后一个拼错的词会
+/// 永远安静地落在没人说那一格。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeclarationState {
+    /// 生产者自己说的。
+    Stated,
+    /// 平台按行上一个标记推出来的。
+    Derived,
+    /// 行上写了东西，读不成声明。
+    Unreadable,
+    /// 没人说，也没有一条规则读得出它。
+    Unstated,
+}
+
+impl DeclarationState {
+    /// 读数标签上的那一个字（与序列化同名）。
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stated => "stated",
+            Self::Derived => "derived",
+            Self::Unreadable => "unreadable",
+            Self::Unstated => "unstated",
+        }
+    }
+}
+
+impl std::fmt::Display for DeclarationState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// The lane for work that must run before ordinary work, whether or not the
 /// ordinary lane is full.
 ///
@@ -868,7 +1148,122 @@ pub const INPUT_READY_LANE: &str = "ready_lane";
 /// mean something here rather than only describing the order of a list.
 pub const READY_LANE_STOP_THE_LINE: &str = "stop_the_line";
 
+/// 交活方没声明重试预算时，任务行上的初值。
+///
+/// 判决读的是 `retry_matrix` 的「未分类」档（`effective_max_retries`），行上这一列
+/// 只被落库与读回；两处各写一个 3 的那一版，改一边不会让另一边红。这里只留一份，
+/// 两边读同一个名字。
+// cap: fixed — 三次重试：与 retry_matrix 未分类档同源（角色失败多是上游抖动，三次之后每次只是把同一个失败拖得更久）
+// keep: 删掉后回到「三次重试：与 retry_matrix 未分类档同源（角色失败多是上游抖动，三次之后每次只是把同一个失败拖得更久）」所描述的情形；由这条约定兜住
+pub const DEFAULT_MAX_RETRIES: u32 = 3;
+
+/// 交活方没说「这件活预计多久」时，任务行上的声明值（秒）。
+///
+/// 它不是刀：平台从不拿它砍正在跑的活。它被读成「这条活预计多久」，探针那一侧的
+/// `outcome_deadline` 用它算「多久没有结局算欠着」。与 `DISCOVERY_PROBE_CONTRACT_SECS`
+/// 是同一个数，两边读同一个名字。
+// cap: fixed — 与探针那一侧的「一轮工期」约定同值（五分钟），不是测出来的量
+// keep: 删掉后工期声明没有默认值，读的人分不出慢与卡；由「与探针那一侧的轮工期同值」兜住
+pub const DEFAULT_DECLARED_DURATION_SECS: u64 = 300;
+
 impl Task {
+    /// 待办的第五格：状态是算出来的，不是存的。
+    ///
+    /// 只有「完成且差距为空（空串或破折号）」才是 `已落`；失败、撤回、还在跑，
+    /// 或者完成却仍写着差距，都是 `未落`——一次运行报告成功不等于那件事在树上成立了。
+    pub fn ledger_state(&self) -> crate::contract::ledger_item::LedgerState {
+        crate::contract::ledger_item::LedgerState::from_outcome(
+            self.status == TaskStatus::Completed,
+            &self.gap,
+        )
+    }
+
+    /// 这条待办此刻的五格。字段是正本；字段全空时退回 `input[ITEM_INPUT_KEY]`
+    /// （过渡期的旧入口/旧行）。状态按任务的当前状态与差距现算。
+    pub fn ledger_item(&self) -> Option<crate::contract::ledger_item::LedgerItem> {
+        let mut item = if !self.terminal.is_empty() || !self.now.is_empty() || !self.gap.is_empty()
+        {
+            crate::contract::ledger_item::LedgerItem {
+                id: self.id.clone(),
+                terminal: self.terminal.clone(),
+                now: self.now.clone(),
+                gap: self.gap.clone(),
+                state: Default::default(),
+            }
+        } else {
+            let raw = self
+                .input
+                .get(crate::contract::ledger_item::ITEM_INPUT_KEY)?
+                .clone();
+            crate::logged_ok!(serde_json::from_value::<
+                crate::contract::ledger_item::LedgerItem,
+            >(raw))?
+        };
+        item.state = item.clone().at_outcome(self.status).state;
+        Some(item)
+    }
+
+    /// 把 `input[ITEM_INPUT_KEY]` 里的三格提到一等字段上（过渡期用）。
+    ///
+    /// 入口不止一处，今天还有几条路把三格塞在输入里；写任务事实之前在这里提一次，
+    /// 保证流上那条定义带着三格。字段已经有值时不动——字段是正本，输入是旧写法。
+    pub fn lift_item_cells(&mut self) {
+        if !self.terminal.is_empty() || !self.now.is_empty() || !self.gap.is_empty() {
+            return;
+        }
+        let Some(raw) = self
+            .input
+            .get(crate::contract::ledger_item::ITEM_INPUT_KEY)
+            .cloned()
+        else {
+            return;
+        };
+        if let Ok(item) = serde_json::from_value::<crate::contract::ledger_item::LedgerItem>(raw) {
+            self.terminal = item.terminal;
+            self.now = item.now;
+            self.gap = item.gap;
+        }
+    }
+
+    /// 写事实时把输入里的三格副本退休：字段是正本，同一件事不再留第二份。
+    ///
+    /// 只影响要写下去的那一份（`save_definition` 在克隆上调它）；入口仍在输入里
+    /// 交三格是**传输形状**，不是事实的第二份。旧事件里的副本不动，读法仍有回退。
+    pub fn retire_item_cells_copy(&mut self) {
+        if let Some(obj) = self.input.as_object_mut() {
+            obj.remove(crate::contract::ledger_item::ITEM_INPUT_KEY);
+        }
+    }
+
+    /// 把一条待办的三格挂到任务行上（一等字段）。
+    ///
+    /// 意图的入口不止一处——对话、GitHub 发现、A2A、信号、变更再修——它们都要把
+    /// 「做完是什么样、现在什么样、还差什么」一起交进来；否则协作层拿到的只有一句
+    /// 目标，判者判完之后也没有东西可以写回去。入口各拼一次键名就会漂，所以键与这一
+    /// 句都住在这里。字段是正本；输入里的副本供还没切过来的旧读者，下一段退休。
+    /// 给任务挂上三格：终态、现在、差距。五格的中心是 `Task`，不是另造一个值对象
+    /// 再把字符串拷进来；`LedgerItem` 是读出来的投影，`carrying` 只是它的桥。
+    pub fn with_cells(
+        mut self,
+        terminal: impl Into<String>,
+        now: impl Into<String>,
+        gap: impl Into<String>,
+    ) -> Self {
+        self.terminal = terminal.into();
+        self.now = now.into();
+        self.gap = gap.into();
+        self
+    }
+
+    /// 这条任务带的三格；三格都空即不是待办，答 `None`。
+    pub fn cells(&self) -> Option<(&str, &str, &str)> {
+        if self.terminal.is_empty() && self.now.is_empty() && self.gap.is_empty() {
+            None
+        } else {
+            Some((&self.terminal, &self.now, &self.gap))
+        }
+    }
+
     pub fn new(id: impl Into<String>, task_type: TaskType, input: serde_json::Value) -> Self {
         let now = Utc::now();
         Task {
@@ -876,6 +1271,9 @@ impl Task {
             task_type,
             status: TaskStatus::Pending,
             input,
+            terminal: String::new(),
+            now: String::new(),
+            gap: String::new(),
             result: None,
             error: None,
             error_cause: None,
@@ -888,10 +1286,10 @@ impl Task {
             agent_id: None,
             workspace_id: None,
             retry_count: 0,
-            max_retries: 3,
+            max_retries: DEFAULT_MAX_RETRIES,
             retry_not_before: None,
             started_at: None,
-            timeout_seconds: 300,
+            declared_duration_seconds: DEFAULT_DECLARED_DURATION_SECS,
             lease_owner: None,
             lease_expires_at: None,
             action_planner_meta: None,
@@ -978,6 +1376,62 @@ impl Task {
         self.lease_expires_at = None;
     }
 
+    /// 接活：待接 → 已认领的唯一写点。
+    ///
+    /// 认领写在 `agent_id` 上，不新开一列。这一格在认领到交付之间只有一个含义
+    /// ——「谁为这条行的结果负责」：认领时是接过它的人，跑起来以后仍是同一个人
+    /// （一次运行只能由它的认领者来跑），交付以后还是它。中间不会出现第二个人，
+    /// 所以一个格子够。开一列 `claimed_by` 的代价是把同一句话存两处，然后要
+    /// 回答「两处不一致时信哪个」，而那正是这里最不该有的一个问题。
+    ///
+    /// `Pending` 行上的 `agent_id` 不读作认领（[`Self::claimed_by`] 就在这一处
+    /// 收口）：回到队里的行是一次跑完或回了队的行的旧值，它按定义没人持有。
+    ///
+    /// 租约与认领同时写，和 [`Self::begin_run`] 同一个理由：只写认领不写租约的
+    /// 行，在认领者消失以后永远没人能接手，而它看起来像是有人在干。
+    pub fn take_claim(&mut self, claimant: &str, lease: chrono::Duration, now: DateTime<Utc>) {
+        self.status = TaskStatus::Scheduled;
+        self.agent_id = Some(claimant.to_string());
+        self.lease_owner = Some(claimant.to_string());
+        self.lease_expires_at = Some(now + lease);
+        self.updated_at = now;
+    }
+
+    /// 这条行此刻有没有人认领。`Pending` 是「待接」，不是「已认领」。
+    ///
+    /// 交了活的行（`Completed` / `Failed` / `Cancelled`）也不再有人持有：那一格
+    /// 记的是谁交的，不是谁还拿着。
+    pub fn claimed_by(&self) -> Option<&str> {
+        match self.status {
+            TaskStatus::Scheduled | TaskStatus::Running => self.agent_id.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// 认领者的租约还有没有效。没有效 = 那个人已经不在了，这条行可以再被接走。
+    ///
+    /// 与 [`Self::lease_expiry`] 分开命名，因为两者答的不是一回事：那个问「这个
+    /// 进程还持不持有」，这个问「这条行还有没有人认」。认领者消失之后进程身份
+    /// 已经换过，只有租约还留在行上。
+    pub fn claim_is_live(&self, lease: chrono::Duration, now: DateTime<Utc>) -> bool {
+        self.claimed_by().is_some()
+            && self
+                .lease_expiry(lease)
+                .is_some_and(|expires| expires > now)
+    }
+
+    /// 这条行此刻被谁持有——只认行上写着的到期时刻。
+    ///
+    /// 与 [`Self::claim_is_live`] 分开：那个用调用方手里的租约长度去补一条没写
+    /// 到期时刻的老行，这个只读板上那一个数。存储里的守卫（认领只能落一次）
+    /// 手里没有租约长度，它读的就是这一条：有名字、且到期时刻还没到，才算有人
+    /// 持有。已经过期或没写到期时刻的认领不拦人——那是「那个人不在了」，不是
+    /// 「这件活有人干」。
+    pub fn claim_held_now(&self, now: DateTime<Utc>) -> Option<&str> {
+        self.claimed_by()
+            .filter(|_| self.lease_expires_at.is_some_and(|expires| expires > now))
+    }
+
     /// Whether re-running this task could succeed, judged on both channels a
     /// failure can arrive by: the typed `error_cause` (what the transport
     /// saw) and the in-band declaration inside the rendered `error` text,
@@ -1037,6 +1491,27 @@ impl Task {
     /// input under `input` and the evaluator omits it — so a predicate that
     /// inspects the built context silently never matches, and change generation
     /// degrades into ordinary narrative output.
+    /// 这一条是谁提的：各入口写同一组键（`input.origin`），读的人不必按入口分叉。
+    /// 空串与缺失都读作「这条连接没有身份」——不编一个匿名的人。
+    pub fn said_by(&self) -> Option<&str> {
+        self.input
+            .get("origin")?
+            .get("said_by")?
+            .as_str()
+            .filter(|s| !s.is_empty())
+    }
+
+    /// 这一跑是不是「把收件台上的意图变成工作」的那一批。
+    ///
+    /// 收件台只能有**一个**读它并处置它的角色：两个读者各接一次时，同一句话会
+    /// 被两边各派一次活（2026-11-24 合流时撞到）。所以 planner 只在跑这一类任务
+    /// 时把未派生的意图读进请求——普通目标的那一跑不该看见别人说的话。
+    pub fn is_chat_intent_batch(&self) -> bool {
+        matches!(&self.task_type, TaskType::Custom(s) if s == CHAT_INTENT_TASK_KIND)
+            || self.input.get(INPUT_TASK_KIND).and_then(|v| v.as_str())
+                == Some(CHAT_INTENT_TASK_KIND)
+    }
+
     pub fn is_self_evolution(&self) -> bool {
         matches!(&self.task_type, TaskType::Custom(s) if s == "self_evolution")
             || self
@@ -1044,6 +1519,173 @@ impl Task {
                 .get(INPUT_EVOLUTION_MODE)
                 .and_then(|v| v.as_str())
                 == Some(EVOLUTION_MODE_GENERATE_CHANGE)
+    }
+
+    /// 这件活要不要动工作树——由任务说，不由接手的人的角色说。
+    ///
+    /// 答案来自 [`Self::deliverable_declaration`]：行上已经落定了记录时读那份记录，
+    /// 否则按输入得出。按输入得出时三种来源都算数：
+    ///
+    /// - 输入里明说（[`INPUT_DELIVERS`]），这是要补的那个量本身。
+    /// - 只会写旧键（[`INPUT_DECLARES_CHANGE`] 为真），兼容读法。
+    /// - 自进化生成变更这一类（[`Self::is_self_evolution`]）。它的标记本身就是
+    ///   「产出一份变更」那句话，再让生产者抄一遍只是多一个会漂的副本。
+    ///
+    /// 读的人要的是「这一件活得改树吗」，问出来的答案只取决于任务本身：同一个人
+    /// 接了另一件活，答案跟着那件活变；角色标签怎么变都不影响它。
+    pub fn deliverable(&self) -> Deliverable {
+        self.deliverable_declaration().conclusion()
+    }
+
+    /// 这件活交什么，连同这个结论的来源。
+    ///
+    /// 行上有记录时读记录——那是唯一的写入点写下的东西，读的人不再各自回到输入里
+    /// 重推；没有记录时才按输入得出（旧键、自进化标记）。两种读法的规则都只在这一
+    /// 个函数里，读的人要的答案与它们从哪儿来一起回去。
+    pub fn deliverable_declaration(&self) -> DeliverableDeclaration {
+        match self.input.get(INPUT_DELIVERABLE_RECORD) {
+            Some(value) => serde_json::from_value(value.clone())
+                // 坏掉的记录不当成「没有记录」再推出一个：那会让一次损坏悄悄变成
+                // 另一个看似合理、其实没人说过的答案。它读不成就是读不成。
+                .unwrap_or_else(|_| DeliverableDeclaration::Unreadable {
+                    raw: value.to_string(),
+                }),
+            None => self.deliverable_from_inputs(),
+        }
+    }
+
+    /// 把一个声明写进任务行——**唯一的写入点**。
+    ///
+    /// 已有记录时那个旧声明先移进 [`INPUT_DELIVERABLE_SUPERSEDED`]，再写新的：
+    /// 覆盖留下证据，才不会出现「昨天读出来是 A、今天读出来是 B、中间没有人说过话」。
+    pub fn declare_deliverable(&mut self, declaration: DeliverableDeclaration) {
+        let Some(fields) = self.input.as_object_mut() else {
+            return;
+        };
+        if let Some(previous) = fields.get(INPUT_DELIVERABLE_RECORD).cloned() {
+            let history = fields
+                .entry(INPUT_DELIVERABLE_SUPERSEDED)
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+            if let Some(list) = history.as_array_mut() {
+                list.push(previous);
+            }
+        }
+        if let Ok(value) = serde_json::to_value(&declaration) {
+            fields.insert(INPUT_DELIVERABLE_RECORD.to_string(), value);
+        }
+    }
+
+    /// 确保这一行带着一份落定的声明，并把它读回来。
+    ///
+    /// 入口处调用一次即可。已有记录时原样返回、不回到输入重推：一次写定之后，
+    /// 改旧标记不改读法——这正是「记录」与「每次现推」的区别。
+    pub fn settle_deliverable(&mut self) -> DeliverableDeclaration {
+        if self.input.get(INPUT_DELIVERABLE_RECORD).is_some() {
+            return self.deliverable_declaration();
+        }
+        let declaration = self.deliverable_from_inputs();
+        self.declare_deliverable(declaration.clone());
+        declaration
+    }
+
+    /// 只按任务行上的输入得出一份声明；不读记录。
+    fn deliverable_from_inputs(&self) -> DeliverableDeclaration {
+        // 写明的声明优先：它是这套读法要补的那个量本身，`declares_change`
+        // 只是它缺席时的兼容读法。两者同时出现且互相矛盾时以声明为准——
+        // 让布尔盖住声明，等于让旧键继续决定新键该说什么。
+        if let Some(value) = self.input.get(INPUT_DELIVERS) {
+            // 新键出现但词不在闭集里时不再退回旧布尔：生产者已经用新拼法开口，
+            // 拼错是一个要看得见的错过，不是一个可以安静换条路读过去的缺席。
+            return match value.as_str().and_then(Deliverable::from_word) {
+                Some(conclusion) => DeliverableDeclaration::Stated {
+                    conclusion,
+                    by: self.submitted_by.clone(),
+                    via: StatementVia::Delivers,
+                },
+                None => DeliverableDeclaration::Unreadable {
+                    raw: value.to_string(),
+                },
+            };
+        }
+        let legacy = match self.input.get(INPUT_DECLARES_CHANGE) {
+            None | Some(serde_json::Value::Bool(false)) => false,
+            Some(serde_json::Value::Bool(true)) => true,
+            Some(serde_json::Value::String(word)) => match word.trim() {
+                "true" | "yes" | "1" => true,
+                "false" | "no" | "0" | "" => false,
+                _ => return DeliverableDeclaration::Unreadable { raw: word.clone() },
+            },
+            Some(other) => {
+                return DeliverableDeclaration::Unreadable {
+                    raw: other.to_string(),
+                }
+            }
+        };
+        if legacy {
+            return DeliverableDeclaration::Stated {
+                conclusion: Deliverable::Change,
+                by: self.submitted_by.clone(),
+                via: StatementVia::DeclaresChange,
+            };
+        }
+        if self.is_self_evolution() {
+            return DeliverableDeclaration::Derived {
+                conclusion: Deliverable::Change,
+                from: self.self_evolution_marker(),
+                rule: DerivationRule::SelfEvolutionEntry,
+                at: self.created_at,
+            };
+        }
+        DeliverableDeclaration::Unstated
+    }
+
+    /// 让这条任务被认成自进化的那个标记，原文照录。
+    fn self_evolution_marker(&self) -> String {
+        match &self.task_type {
+            TaskType::Custom(name) if name == "self_evolution" => format!("task_type:{name}"),
+            _ => format!(
+                "{INPUT_EVOLUTION_MODE}:{}",
+                self.input
+                    .get(INPUT_EVOLUTION_MODE)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+            ),
+        }
+    }
+
+    pub fn declares_change(&self) -> bool {
+        self.deliverable().declares_change()
+    }
+
+    /// 有人就这份活说过的方向，原文照录；没人说过就是空的。
+    ///
+    /// 「这一轮什么算好」不只有规格说了算。外部提交的判词里，`direction_preference`
+    /// 说了两个方向里偏好哪一个，`rubric_override` 说判据本身该改成什么——这两类此前
+    /// 只变成一件新活，改不动判活的标准。文件这条任务的那次读数把提交的内容留在
+    /// [`INPUT_SIGNAL`] 里，所以从任务自己读得出来：与 [`Self::deliverable`] 同一个
+    /// 读法，读任务，不读接手的人。
+    ///
+    /// 只收这两类。`evaluator_verdict` 说的是某份材料够不够格，不是「以后按什么算
+    /// 好」；把它也当成方向，等于让一次对结果的判断永久改写判据。读不出、种类不对、
+    /// 字段缺，一律当没说过——这里不猜。
+    pub fn stated_directions(&self) -> Vec<String> {
+        let Some(detail) = self.input.get(INPUT_SIGNAL) else {
+            return Vec::new();
+        };
+        if detail.get("kind").and_then(|v| v.as_str()) != Some(TASTE_SIGNAL_KIND) {
+            return Vec::new();
+        }
+        let Some(payload) = detail.get("payload") else {
+            return Vec::new();
+        };
+        let Ok(payload) = serde_json::from_value::<crate::TasteIntentPayload>(payload.clone())
+        else {
+            return Vec::new();
+        };
+        if matches!(payload, crate::TasteIntentPayload::EvaluatorVerdict(_)) {
+            return Vec::new();
+        }
+        vec![payload.summary()]
     }
 
     /// The producer's own spelling of this task's entry point, or `None` for a
@@ -1102,6 +1744,200 @@ mod tests {
     use super::*;
     use crate::checkout::repo_root;
 
+    /// 三格挂在任务的一等字段上，输入里不再有副本。
+    #[test]
+    fn with_cells_puts_the_three_cells_on_the_task() {
+        use crate::contract::ledger_item::{LedgerItem, ITEM_INPUT_KEY};
+        let item = LedgerItem {
+            id: "L1".into(),
+            terminal: "到终态".into(),
+            now: "此刻".into(),
+            gap: "缺的是：接线".into(),
+            state: Default::default(),
+        };
+        let task = Task::new("L1", TaskType::DagNode, serde_json::json!({})).with_cells(
+            item.terminal.clone(),
+            item.now.clone(),
+            item.gap.clone(),
+        );
+        assert_eq!(task.terminal, "到终态");
+        assert_eq!(task.now, "此刻");
+        assert_eq!(task.gap, "缺的是：接线");
+        assert!(
+            task.input.get(ITEM_INPUT_KEY).is_none(),
+            "系统流程用字段，不在输入里留第二份"
+        );
+    }
+
+    /// 状态是算出来的：完成且差距为空才已落；完成却还写着差距仍是未落。
+    #[test]
+    fn the_ledger_state_is_computed_from_status_and_gap() {
+        use crate::contract::ledger_item::LedgerState;
+        let mut task = Task::new("L1", TaskType::DagNode, serde_json::json!({}));
+        task.status = TaskStatus::Completed;
+        assert_eq!(
+            task.ledger_state(),
+            LedgerState::Reached,
+            "完成且差距为空才是终态"
+        );
+        task.gap = "缺的是：最后一处".into();
+        assert_eq!(
+            task.ledger_state(),
+            LedgerState::Open,
+            "完成却还写着差距，不许冒充终态"
+        );
+        task.gap = "—".into();
+        assert_eq!(
+            task.ledger_state(),
+            LedgerState::Reached,
+            "破折号是排版上的「没有差距」，与空串同义"
+        );
+        task.gap = String::new();
+        task.status = TaskStatus::Running;
+        assert_eq!(task.ledger_state(), LedgerState::Open);
+    }
+
+    /// 写事实时旧入口留在输入里的副本退休：字段留下，输入里不再有第二个落点。
+    #[test]
+    fn retiring_the_copy_removes_the_input_key_and_keeps_the_fields() {
+        use crate::contract::ledger_item::{LedgerItem, ITEM_INPUT_KEY};
+        let item = LedgerItem {
+            id: "L1".into(),
+            terminal: "到终态".into(),
+            now: "此刻".into(),
+            gap: "缺的是：接线".into(),
+            state: Default::default(),
+        };
+        let mut task = Task::new(
+            "L1",
+            TaskType::DagNode,
+            serde_json::json!({ ITEM_INPUT_KEY: serde_json::to_value(&item).unwrap() }),
+        );
+        task.terminal = item.terminal.clone();
+        task.now = item.now.clone();
+        task.gap = item.gap.clone();
+        assert!(task.input.get(ITEM_INPUT_KEY).is_some());
+        task.retire_item_cells_copy();
+        assert!(
+            task.input.get(ITEM_INPUT_KEY).is_none(),
+            "写下去的那一份不再带副本"
+        );
+        assert_eq!(task.terminal, "到终态");
+        assert_eq!(task.gap, "缺的是：接线");
+    }
+
+    /// 旧入口把三格塞在 `input` 里：写事实前 lift 一次，字段成为正本。
+    #[test]
+    fn lifting_moves_the_input_copy_onto_the_fields() {
+        use crate::contract::ledger_item::{LedgerItem, ITEM_INPUT_KEY};
+        let item = LedgerItem {
+            id: "L1".into(),
+            terminal: "到终态".into(),
+            now: "此刻".into(),
+            gap: "缺的是：接线".into(),
+            state: Default::default(),
+        };
+        let mut task = Task::new(
+            "L1",
+            TaskType::DagNode,
+            serde_json::json!({ ITEM_INPUT_KEY: serde_json::to_value(&item).unwrap() }),
+        );
+        task.lift_item_cells();
+        assert_eq!(task.terminal, "到终态");
+        assert_eq!(task.now, "此刻");
+        assert_eq!(task.gap, "缺的是：接线");
+    }
+
+    /// 行上那两个数各有一个名字：重试预算与声明时长。
+    ///
+    /// 它们不是「这条用例挑的值」——判决（`retry_matrix`）与探针的欠结判据
+    /// （`DISCOVERY_PROBE_CONTRACT_SECS`）读的都是同一对名字。谁想调它们，调的是
+    /// 那个常量；两处各写一个 3、一个 300 的那一版，改一边另一边不会红。
+    /// 入口把三格挂上行：键是同一个名字，读它的人按那个名字取。
+    #[test]
+    /// 「谁提的」读同一个键；缺失与空串都读作没有身份。
+    #[test]
+    fn who_filed_it_is_read_from_one_key() {
+        let mut task = Task::new(
+            "t",
+            TaskType::Custom("dag_node".into()),
+            serde_json::json!({}),
+        );
+        assert_eq!(task.said_by(), None);
+        task.input["origin"] = serde_json::json!({"source": "a2a", "said_by": ""});
+        assert_eq!(task.said_by(), None, "空串是「没有身份」，不是一个匿名的人");
+        task.input["origin"] = serde_json::json!({"source": "a2a", "said_by": "u-1"});
+        assert_eq!(task.said_by(), Some("u-1"));
+    }
+
+    /// 只有「意图那一批」的任务算这一类：普通目标带着 `task_kind` 的旧写法也算，
+    /// 而 `self_evolution` 不算——两族各读各的输入。
+    #[test]
+    fn only_the_intent_batch_reads_the_receipt_desk() {
+        let batch = Task::new(
+            "t1",
+            TaskType::Custom(CHAT_INTENT_TASK_KIND.into()),
+            serde_json::json!({}),
+        );
+        assert!(batch.is_chat_intent_batch());
+        let by_input = Task::new(
+            "t2",
+            TaskType::Custom("dag_node".into()),
+            serde_json::json!({ INPUT_TASK_KIND: CHAT_INTENT_TASK_KIND }),
+        );
+        assert!(by_input.is_chat_intent_batch());
+        let goal = Task::new(
+            "t3",
+            TaskType::Custom("dag_node".into()),
+            serde_json::json!({}),
+        );
+        assert!(!goal.is_chat_intent_batch());
+    }
+
+    fn a_task_carries_its_cells_on_its_fields() {
+        use crate::contract::ledger_item::{LedgerItem, LedgerState, ITEM_INPUT_KEY};
+        let item = LedgerItem {
+            id: "N1".into(),
+            terminal: "窗口里每一轮都带着它需要的全部".into(),
+            now: "地板还装不下".into(),
+            gap: "缺的是：地板外置".into(),
+            state: LedgerState::Open,
+        };
+        let task = Task::new("t1", TaskType::DagNode, serde_json::json!({"goal": "g"})).with_cells(
+            item.terminal.clone(),
+            item.now.clone(),
+            item.gap.clone(),
+        );
+        let back = task.ledger_item().expect("三格在任务字段上");
+        assert_eq!(back.id, "t1");
+        assert_eq!(back.terminal, item.terminal);
+        assert_eq!(back.now, item.now);
+        assert_eq!(back.gap, item.gap);
+        assert_eq!(back.state, LedgerState::Open);
+        assert!(
+            task.input.get(ITEM_INPUT_KEY).is_none(),
+            "三格不在输入里留副本"
+        );
+        assert_eq!(
+            task.input.get("goal").and_then(|v| v.as_str()),
+            Some("g"),
+            "原有字段不该丢"
+        );
+    }
+
+    #[test]
+    fn a_new_task_carries_the_named_defaults() {
+        let task = Task::new("t1", TaskType::DagNode, serde_json::json!({}));
+        assert_eq!(
+            task.max_retries, DEFAULT_MAX_RETRIES,
+            "重试预算要读那个名字，不是写一个数"
+        );
+        assert_eq!(
+            task.declared_duration_seconds, DEFAULT_DECLARED_DURATION_SECS,
+            "声明时长要读那个名字，不是写一个数"
+        );
+    }
+
     /// 一个场地标签只有一种「算有」的拼法。
     ///
     /// 三个读者拿它判成员：看板的折叠、替它预筛行的存储查询、内存里那条
@@ -1158,6 +1994,56 @@ mod tests {
         assert_eq!(task.status, TaskStatus::Running);
         assert!(task.error.is_none(), "开始跑了，上一轮的判词不再说明任何事");
         assert!(task.error_cause.is_none(), "类型通道同理");
+    }
+
+    /// 接活的迁移写下了负责人与租约，租约到期后这条行重新算「没人认领」。
+    ///
+    /// 三处读法必须同源：`claimed_by` 答「谁接了」，`claim_is_live` 答「他还在
+    /// 不在」，而认领者消失之后这条行要能被下一个人接走。判据若分三处写，最先
+    /// 漂的总是「租约到期」那一份。
+    #[test]
+    fn a_claim_names_who_took_the_row_and_lapses_with_its_lease() {
+        let now = Utc::now();
+        let lease = chrono::Duration::seconds(300);
+        let mut task = Task::new("t1", TaskType::DagNode, serde_json::json!({}));
+        assert_eq!(task.claimed_by(), None, "待接的行没有人认领");
+
+        task.take_claim("E0412", lease, now);
+        assert_eq!(task.status, TaskStatus::Scheduled);
+        assert_eq!(task.claimed_by(), Some("E0412"));
+        assert_eq!(task.lease_owner.as_deref(), Some("E0412"));
+        assert_eq!(task.lease_expires_at, Some(now + lease));
+        assert!(task.claim_is_live(lease, now + chrono::Duration::seconds(299)));
+        assert!(
+            !task.claim_is_live(lease, now + chrono::Duration::seconds(301)),
+            "认领者过了自己的租约就不再持有它"
+        );
+        assert_eq!(
+            task.claim_held_now(now + chrono::Duration::seconds(299)),
+            Some("E0412"),
+            "板上的守卫读同一个口径：有名字且租约没到期"
+        );
+        assert_eq!(
+            task.claim_held_now(now + chrono::Duration::seconds(301)),
+            None,
+            "过期之后这个名字不再拦人"
+        );
+
+        task.begin_run("run-7", lease, now);
+        assert_eq!(
+            task.claimed_by(),
+            Some("E0412"),
+            "跑起来以后责任人不变：接活的人就是干活的人"
+        );
+        assert_eq!(
+            task.lease_owner.as_deref(),
+            Some("run-7"),
+            "进程身份接管租约，认领者的名字留在责任人那一格"
+        );
+
+        task.clear_run();
+        task.status = TaskStatus::Pending;
+        assert_eq!(task.claimed_by(), None, "回到队里的行按定义没人持有");
     }
 
     /// 两个通道各自都能判死一次重试：类型通道（`error_cause` 为配额/鉴权这类
@@ -1346,6 +2232,403 @@ mod tests {
         assert!(task.is_self_evolution());
     }
 
+    /// 要不要动工作树是任务说的，且换个任务答案就跟着变。
+    ///
+    /// 旧判据问的是接手的人的角色：同一位工程师做评审时被当成「该写树的」，
+    /// 做变更时若不是 generator 又被当成「只读的」。这里把同一份输入换一换，
+    /// 只看任务的声明变不变。
+    #[test]
+    fn a_task_says_whether_its_work_changes_the_checkout() {
+        let writes = Task::new(
+            "t-review",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ "goal": "raise the timeout", INPUT_DECLARES_CHANGE: true }),
+        );
+        let reads = Task::new(
+            "t-review",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ "goal": "read the timeout" }),
+        );
+        assert!(writes.declares_change());
+        assert!(!reads.declares_change());
+
+        // 生产者从环境里读来的配置常常是字符串。
+        let spelled = Task::new(
+            "t-spelled",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ INPUT_DECLARES_CHANGE: "true" }),
+        );
+        assert!(spelled.declares_change());
+
+        // 自进化的生成变更那类任务，标记本身就是声明。
+        let evolution = Task::new(
+            "t-evo",
+            TaskType::Custom("self_evolution".into()),
+            serde_json::json!({}),
+        );
+        assert!(
+            evolution.declares_change(),
+            "自进化生成变更的任务没有另抄一遍声明就该被认出来"
+        );
+    }
+
+    /// 闭集里每一个显式取值都读得出来，两种缺席都读成「没说」。
+    ///
+    /// 「没说」不许兜底成最常见的种类：兜底之后「没人说过」与「有人说是
+    /// work_product」在读数上同形，而把这两者分开正是记这一格的用处。
+    #[test]
+    fn a_task_reads_the_closed_set_of_deliverables() {
+        for (word, expected) in [
+            ("plan", Deliverable::Plan),
+            ("change", Deliverable::Change),
+            ("judgement", Deliverable::Judgement),
+            ("judgment", Deliverable::Judgement),
+            ("answer", Deliverable::Answer),
+            ("work_product", Deliverable::WorkProduct),
+            ("work-product", Deliverable::WorkProduct),
+        ] {
+            let task = Task::new(
+                "t-word",
+                TaskType::Custom("platform_task".into()),
+                serde_json::json!({ INPUT_DELIVERS: word }),
+            );
+            assert_eq!(task.deliverable(), expected, "声明 {word} 读错了");
+        }
+
+        let silent = Task::new(
+            "t-silent",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ "goal": "read the timeout" }),
+        );
+        assert_eq!(silent.deliverable(), Deliverable::Unstated);
+
+        // 闭集外的词不猜：一个拼错的声明不比没有声明多知道什么。
+        let outside = Task::new(
+            "t-outside",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ INPUT_DELIVERS: "plan-ish" }),
+        );
+        assert_eq!(outside.deliverable(), Deliverable::Unstated);
+        assert!(!outside.declares_change(), "不在闭集里的词不该被读成变更");
+
+        // 写明的声明优先于旧键：两者矛盾时以声明为准。
+        let both = Task::new(
+            "t-both",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ INPUT_DELIVERS: "plan", INPUT_DECLARES_CHANGE: true }),
+        );
+        assert_eq!(both.deliverable(), Deliverable::Plan);
+        assert!(!both.declares_change(), "旧键不该盖过声明");
+    }
+
+    /// 一份声明要说得出来源：谁说的、用哪种拼法、按哪条规则、读的是哪段原文。
+    ///
+    /// 「交什么」与「从哪儿来」分开记，是为了让终态那句「待遇只由三样东西决定」
+    /// 在读得出来之前先写得下来：生产者说的、平台推的、没人说的，差的不只是结论。
+    #[test]
+    fn a_declaration_names_where_it_came_from() {
+        let mut stated = Task::new(
+            "t-stated",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ INPUT_DELIVERS: "judgement" }),
+        );
+        stated.submitted_by = Some("op@example".into());
+        assert_eq!(
+            stated.deliverable_declaration(),
+            DeliverableDeclaration::Stated {
+                conclusion: Deliverable::Judgement,
+                by: Some("op@example".into()),
+                via: StatementVia::Delivers,
+            }
+        );
+
+        let legacy = Task::new(
+            "t-legacy",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ INPUT_DECLARES_CHANGE: true }),
+        );
+        assert_eq!(
+            legacy.deliverable_declaration(),
+            DeliverableDeclaration::Stated {
+                conclusion: Deliverable::Change,
+                by: None,
+                via: StatementVia::DeclaresChange,
+            }
+        );
+
+        let evolution = Task::new(
+            "t-evolution",
+            TaskType::Custom("self_evolution".into()),
+            serde_json::json!({ "goal": "raise the timeout" }),
+        );
+        assert_eq!(
+            evolution.deliverable_declaration(),
+            DeliverableDeclaration::Derived {
+                conclusion: Deliverable::Change,
+                from: "task_type:self_evolution".into(),
+                rule: DerivationRule::SelfEvolutionEntry,
+                at: evolution.created_at,
+            }
+        );
+
+        let silent = Task::new(
+            "t-silent",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            silent.deliverable_declaration(),
+            DeliverableDeclaration::Unstated
+        );
+    }
+
+    /// 来源那一类要能把「量不到」与「量到的就是没有」分开。
+    ///
+    /// 四态逐个走一遍：结论相同的两份声明（`stated` 与 `derived` 都读出
+    /// `Change`）在来源上必须不同——运行期按来源计数，合成的读数会把「生产者
+    /// 说的」和「平台推的」算成同一个数。拼错的那份落在 `unreadable`，不是
+    /// `unstated`。
+    #[test]
+    fn a_declarations_state_keeps_unreadable_apart_from_unstated() {
+        let stated = Task::new(
+            "t-state-stated",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ INPUT_DELIVERS: "change" }),
+        );
+        let derived = Task::new(
+            "t-state-derived",
+            TaskType::Custom("self_evolution".into()),
+            serde_json::json!({}),
+        );
+        let unreadable = Task::new(
+            "t-state-unreadable",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ INPUT_DELIVERS: "chagne" }),
+        );
+        let unstated = Task::new(
+            "t-state-unstated",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({}),
+        );
+
+        assert_eq!(
+            stated.deliverable_declaration().state(),
+            DeclarationState::Stated
+        );
+        assert_eq!(
+            derived.deliverable_declaration().state(),
+            DeclarationState::Derived
+        );
+        assert_eq!(
+            unreadable.deliverable_declaration().state(),
+            DeclarationState::Unreadable
+        );
+        assert_eq!(
+            unstated.deliverable_declaration().state(),
+            DeclarationState::Unstated
+        );
+
+        // 结论相同的两份声明，来源不同：来源那一栏不是结论的别名。
+        assert_eq!(stated.deliverable(), derived.deliverable());
+        assert_ne!(
+            stated.deliverable_declaration().state(),
+            derived.deliverable_declaration().state()
+        );
+
+        // 平台替一道工序说的话有自己的来源，不冒认成行上写的。
+        let protocol = DeliverableDeclaration::protocol(Deliverable::Judgement);
+        assert_eq!(protocol.state(), DeclarationState::Stated);
+        assert_eq!(
+            protocol,
+            DeliverableDeclaration::Stated {
+                conclusion: Deliverable::Judgement,
+                by: None,
+                via: StatementVia::Protocol,
+            }
+        );
+    }
+
+    /// 一次写定之后，改旧标记不改读法。
+    ///
+    /// 这条是「记录」与「每次现推」的分界：没有它，同一行在写入前后可以被两个
+    /// 标记读出两个答案，而两边都声称自己读的是任务。
+    #[test]
+    fn a_settled_declaration_is_not_reread_from_the_old_marker() {
+        let mut task = Task::new(
+            "t-settle",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ INPUT_DELIVERS: "change" }),
+        );
+        assert_eq!(task.settle_deliverable().conclusion(), Deliverable::Change);
+
+        task.input.as_object_mut().unwrap().remove(INPUT_DELIVERS);
+        task.input
+            .as_object_mut()
+            .unwrap()
+            .insert(INPUT_DECLARES_CHANGE.into(), serde_json::json!(false));
+        assert_eq!(
+            task.deliverable(),
+            Deliverable::Change,
+            "落定的声明被行上的旧标记改写了"
+        );
+
+        // 落定是幂等的：再调一次既不改结论，也不往覆盖史里再记一笔。
+        assert_eq!(task.settle_deliverable().conclusion(), Deliverable::Change);
+        assert!(task.input.get(INPUT_DELIVERABLE_SUPERSEDED).is_none());
+    }
+
+    /// 新声明覆盖旧声明时，旧的那份留在行上。
+    ///
+    /// 覆盖不留证据，读数就只能看见最后一个答案，「谁在什么时候改了口」永远查不到。
+    #[test]
+    fn superseding_a_declaration_keeps_the_old_one() {
+        let mut task = Task::new(
+            "t-supersede",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({}),
+        );
+        task.declare_deliverable(DeliverableDeclaration::Stated {
+            conclusion: Deliverable::Plan,
+            by: Some("planner@example".into()),
+            via: StatementVia::Delivers,
+        });
+        task.declare_deliverable(DeliverableDeclaration::Stated {
+            conclusion: Deliverable::Answer,
+            by: Some("op@example".into()),
+            via: StatementVia::Delivers,
+        });
+
+        assert_eq!(task.deliverable(), Deliverable::Answer);
+        let history = task
+            .input
+            .get(INPUT_DELIVERABLE_SUPERSEDED)
+            .and_then(|v| v.as_array())
+            .expect("覆盖史应当留在行上");
+        assert_eq!(history.len(), 1);
+        let superseded: DeliverableDeclaration =
+            serde_json::from_value(history[0].clone()).expect("旧声明应当读得回来");
+        assert_eq!(superseded.conclusion(), Deliverable::Plan);
+        assert_eq!(
+            superseded,
+            DeliverableDeclaration::Stated {
+                conclusion: Deliverable::Plan,
+                by: Some("planner@example".into()),
+                via: StatementVia::Delivers,
+            }
+        );
+    }
+
+    /// 新键拼错是一个看得见的错过，不是一条安静退回旧键的路。
+    ///
+    /// 旧读法会接着读 `declares_change`，于是一个写错词的提交者拿到的仍是旧语义，
+    /// 谁也不知道那句新声明没被读懂。
+    #[test]
+    fn a_misspelled_new_key_is_unreadable_not_silent() {
+        let task = Task::new(
+            "t-misspell",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ INPUT_DELIVERS: "plan-ish", INPUT_DECLARES_CHANGE: true }),
+        );
+        assert_eq!(
+            task.deliverable_declaration(),
+            DeliverableDeclaration::Unreadable {
+                raw: "\"plan-ish\"".into(),
+            }
+        );
+        assert_eq!(task.deliverable(), Deliverable::Unstated);
+        assert!(!task.declares_change(), "拼错的新键不该退回旧键去读");
+    }
+
+    /// 外部就这份活说过的方向，任务自己带得住；没说、说了别的种类、读不出来，都不编。
+    ///
+    /// 这两类判词此前只变成一件新活，改不动判活的标准。任务带着提交时的 detail
+    /// 走，判它的时候就还在；这条测试钉的是「读得回来」与「不猜」两半。
+    #[test]
+    fn a_task_carries_the_direction_stated_about_it() {
+        fn filed(input: serde_json::Value) -> Task {
+            Task::new("t-direction", TaskType::Custom("self_signal".into()), input)
+        }
+        let detail = |payload: serde_json::Value| {
+            serde_json::json!({
+                INPUT_SIGNAL: {
+                    "kind": TASTE_SIGNAL_KIND,
+                    "taste_kind": payload["kind"].clone(),
+                    "payload": payload,
+                }
+            })
+        };
+
+        let preferred = filed(detail(serde_json::json!({
+            "kind": "direction_preference",
+            "preferred": "the stricter one",
+            "alternative": "the looser one",
+            "rationale": "the looser one hid a regression"
+        })));
+        assert_eq!(
+            preferred.stated_directions(),
+            vec![
+                "prefers \"the stricter one\" over \"the looser one\": the looser one hid a \
+                 regression"
+                    .to_string()
+            ],
+            "提交原文要原样回到判它的人手里，不是重新概括一遍"
+        );
+
+        let override_ = filed(detail(serde_json::json!({
+            "kind": "rubric_override",
+            "criterion": "the review rubric",
+            "new_wording": "quote the failing line",
+            "rationale": "prose verdicts could not be checked"
+        })));
+        assert_eq!(
+            override_.stated_directions(),
+            vec![
+                "the evaluation criterion \"the review rubric\" should read \"quote the failing \
+                 line\": prose verdicts could not be checked"
+                    .to_string()
+            ],
+            "改判据的那一类也是方向，同样要到得了判活的那一侧"
+        );
+
+        // 对某份材料的判断不是「以后按什么算好」：把它当方向，等于让一次对结果的
+        // 判断永久改写判据。
+        let verdict = filed(detail(serde_json::json!({
+            "kind": "evaluator_verdict",
+            "verdict": "insufficient",
+            "rationale": "the log lines do not show the retry"
+        })));
+        assert!(verdict.stated_directions().is_empty());
+
+        // 没有 detail、detail 不是这一种、payload 读不出来：都当没说过。
+        let plain = Task::new(
+            "t-plain",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ "goal": "read the timeout" }),
+        );
+        assert!(plain.stated_directions().is_empty());
+
+        let alert = filed(serde_json::json!({
+            INPUT_SIGNAL: { "kind": "persisted_alert", "rule": "ApiDown",
+                            "payload": { "kind": "rubric_override", "criterion": "x",
+                                         "new_wording": "y", "rationale": "z" } }
+        }));
+        assert!(
+            alert.stated_directions().is_empty(),
+            "别的信号碰巧带一个 payload 键，不该被读成方向"
+        );
+
+        let broken = filed(serde_json::json!({
+            INPUT_SIGNAL: {
+                "kind": TASTE_SIGNAL_KIND,
+                "payload": { "kind": "direction_preference", "preferred": "a" }
+            }
+        }));
+        assert!(
+            broken.stated_directions().is_empty(),
+            "字段缺一半的提交读不成方向：猜出来的那半句会冒充提交者的话"
+        );
+    }
+
     #[test]
     fn evolution_mode_marker_is_self_evolution() {
         // The marker is how the platform integrations opt in: the task type is
@@ -1500,7 +2783,7 @@ mod tests {
                 problems.push(format!("{kind} is declared by a producer but unattributed"));
             }
             for file in *files {
-                let text = std::fs::read_to_string(root.join(file)).unwrap_or_default();
+                let text = std::fs::read_to_string(root.join(file)).unwrap_or(Default::default());
                 if !text.contains(kind) {
                     problems.push(format!("{kind} is no longer declared in {file}"));
                 }

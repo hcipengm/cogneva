@@ -3,15 +3,23 @@ use crate::actors::{
 };
 use crate::squad::pge::context_board::ContextBoard;
 use crate::squad::pge::stall::{
-    degenerate_loop_feedback, ProgressSignals, StallDetector, StallVerdict,
+    degenerate_loop_feedback, ProgressSignals, StallDetector, StallVerdict, STALL_THRESHOLD,
 };
 use crate::squad::pge::types::{
-    best_scored, Artifact, BranchMergeStrategy, ConsensusFloor, Criterion, EvaluationResult,
-    GeneratorOutput, MergeSummary, PgeBranchResult, PgeRoundtableIteration, PlannerOutput,
-    RoundOutcome, StopCause, StoppedProduct, Verdict,
+    best_scored, rejected_candidates, round_history_doc, Artifact, BranchMergeStrategy,
+    ConsensusFloor, Criterion, EvaluationResult, GeneratorOutput, MergeSummary, PgeBranchResult,
+    PgeRoundtableIteration, PlannerOutput, RoundOutcome, StopCause, StoppedProduct, Verdict,
 };
 use std::sync::Arc;
 use tracing::info;
+
+/// 一份分支就是不做并行：这是并行度的单位，不是它的一个档。
+///
+/// 并行是要有人显式打开的模式（并且要给出合并策略与合并者）；默认落在
+/// 「一条线跑完」，是因为不并行不需要任何额外的约定。
+// cap: fixed — 并行度的单位：一＝顺序
+// not-a-bound: 并行度的单位：一＝顺序
+pub const SEQUENTIAL_BRANCHES: u32 = 1;
 
 pub struct PgeRoundtableConfig {
     pub max_iterations: u32,
@@ -91,22 +99,34 @@ impl std::fmt::Debug for PgeRoundtableConfig {
     }
 }
 
+// 五轮：每一轮所有分支都出一份方案并互相打分，五轮之后新的一轮已经不再改变
+// 排序，再跑只是多花一轮的分支开销。
+// cap: fixed — 五轮：轮次再多不再改变排序，只是多花一轮的分支开销
+// keep: 删掉后轮次再多不改变排序，只多花一轮分支开销；由「五轮之外不再改变排序」兜住
+const ROUNDTABLE_MAX_ROUNDS: u32 = 5;
+
+// 八成以上分支同意才收口。阈值定在多数而非全体：五五开说明这一轮没有形成
+// 结论，而要求全体一致会让任何一条少数意见把桌子永远钉在原地。
+// cap: fixed — 0.8：多数即收口；五五开没结论，全体一致则被少数意见钉死
+// keep: 删掉后五五开就没结论、全体一致则被少数意见钉死；由「多数即收口」兜住
+const ROUNDTABLE_CONSENSUS: f64 = 0.8;
+
 impl Default for PgeRoundtableConfig {
     fn default() -> Self {
         Self {
-            max_iterations: 5,
-            consensus_threshold: 0.8,
+            max_iterations: ROUNDTABLE_MAX_ROUNDS,
+            consensus_threshold: ROUNDTABLE_CONSENSUS,
             skill_ids: Vec::new(),
             context_board: None,
             board_store: None,
             moderator: None,
             knowledge_backend: None,
-            parallel_branches: 1,
+            parallel_branches: SEQUENTIAL_BRANCHES,
             branch_merge_strategy: BranchMergeStrategy::BestScore,
             agent_manager: None,
             llm_provider: None,
             merger: None,
-            stall_threshold: 2,
+            stall_threshold: STALL_THRESHOLD,
             independent_review: true,
         }
     }
@@ -242,17 +262,7 @@ impl PgeRoundtable {
                 .map(|e| serde_json::to_value(e).unwrap_or_default());
             let prev_eval_ref2 = prev_eval_ref.as_ref();
 
-            let eval_history: Vec<serde_json::Value> = history
-                .iter()
-                .map(|h| {
-                    serde_json::json!({
-                        "iteration": h.iteration,
-                        "plan": &h.plan,
-                        "generation": &h.generation,
-                        "outcome": &h.outcome,
-                    })
-                })
-                .collect();
+            let eval_history: Vec<serde_json::Value> = round_history_doc(&history);
 
             // The evaluator is shown the whole run so far through this section;
             // measure it where both the sequential and the parallel path take it.
@@ -286,9 +296,9 @@ impl PgeRoundtable {
                     (p, g, o, Vec::new(), None)
                 };
 
-            let plan_json = serde_json::to_value(&plan).unwrap_or_default();
-            let generation_json = serde_json::to_value(&generation).unwrap_or_default();
-            let outcome_json = serde_json::to_value(&outcome).unwrap_or_default();
+            let plan_json = serde_json::to_value(&plan).unwrap_or(Default::default());
+            let generation_json = serde_json::to_value(&generation).unwrap_or(Default::default());
+            let outcome_json = serde_json::to_value(&outcome).unwrap_or(Default::default());
             board["latest_plan"] = plan_json.clone();
             self.persist_field("latest_plan", &plan_json).await;
             board["latest_generation"] = generation_json.clone();
@@ -417,29 +427,33 @@ impl PgeRoundtable {
                 // writing it as one would file a round's own ending under the
                 // moderator's name.
                 let outcome = match mod_output.decision {
-                    crate::actors::moderator::ModeratorDecision::Continue => {
+                    Some(crate::actors::moderator::ModeratorDecision::Continue) => {
                         crate::observable::MODERATOR_CONTINUE
                     }
-                    crate::actors::moderator::ModeratorDecision::ChangeStrategy => {
+                    Some(crate::actors::moderator::ModeratorDecision::ChangeStrategy) => {
                         crate::observable::MODERATOR_CHANGE_STRATEGY
                     }
-                    crate::actors::moderator::ModeratorDecision::AcceptPartial => {
+                    Some(crate::actors::moderator::ModeratorDecision::AcceptPartial) => {
                         crate::observable::MODERATOR_ACCEPT_PARTIAL
                     }
-                    crate::actors::moderator::ModeratorDecision::Escalate => {
+                    Some(crate::actors::moderator::ModeratorDecision::Escalate) => {
                         crate::observable::MODERATOR_ESCALATE
                     }
+                    // 问了但没有可读的决策：调用失败，或答复里的词不在这四个
+                    // 之内。它有自己的格子——计成 continue 就是记下一次没人做过的
+                    // 决定，还会把一个读不懂合同的宿主藏进「继续」那一格。
+                    None => crate::observable::MODERATOR_UNREADABLE,
                 };
                 crate::observable::global_observable().record_moderator_consulted(outcome);
                 match mod_output.decision {
-                    crate::actors::moderator::ModeratorDecision::AcceptPartial => {
+                    Some(crate::actors::moderator::ModeratorDecision::AcceptPartial) => {
                         consensus_reached = true;
                         break;
                     }
-                    crate::actors::moderator::ModeratorDecision::Escalate => {
+                    Some(crate::actors::moderator::ModeratorDecision::Escalate) => {
                         break;
                     }
-                    crate::actors::moderator::ModeratorDecision::ChangeStrategy => {
+                    Some(crate::actors::moderator::ModeratorDecision::ChangeStrategy) => {
                         if let Ok(suggestions_json) = serde_json::to_value(&mod_output.suggestions)
                         {
                             board["moderator_suggestions"] = suggestions_json.clone();
@@ -447,7 +461,9 @@ impl PgeRoundtable {
                                 .await;
                         }
                     }
-                    crate::actors::moderator::ModeratorDecision::Continue => {}
+                    // 没有可读决策时按保守方向处置：和真正的 Continue 一样
+                    // 再走一轮，但这一轮已经落在 unreadable 格上，看得见。
+                    Some(crate::actors::moderator::ModeratorDecision::Continue) | None => {}
                 }
             } else {
                 // The other reason a round ends with no moderator decision: the
@@ -474,11 +490,13 @@ impl PgeRoundtable {
             .unwrap_or_else(|| PgeRoundtableIteration {
                 iteration: 0,
                 plan: PlannerOutput {
+                    definition: None,
                     summary: String::new(),
                     plan: serde_json::json!({}),
                     sub_tasks: Vec::new(),
                     acceptance_criteria: Vec::new(),
                     targets: Vec::new(),
+                    items: Vec::new(),
                 },
                 generation: GeneratorOutput::none(),
                 outcome: RoundOutcome::Stopped {
@@ -498,80 +516,12 @@ impl PgeRoundtable {
         // accepted as a partial is not a Pass, and a round nobody judged has no
         // claim to re-check: in both cases there is nothing to confirm and the
         // fresh-context judge is not paid for.
+        // 复核这一问已由本轮的完成判回答：同一份计划、同一份生成、同一棵树上再问
+        // 一遍，答的是同一件事。这里只留一条读数——不是“关掉了”，是“被取代了”。
         if consensus_reached {
-            if let RoundOutcome::Judged { evaluation } = &mut last.outcome {
-                if matches!(evaluation.verdict, Verdict::Pass) {
-                    let observable = crate::observable::global_observable();
-                    if !self.config.independent_review {
-                        observable.record_independent_review(
-                            crate::observable::INDEPENDENT_REVIEW_NOT_ASKED_DISABLED,
-                        );
-                    } else {
-                        let criteria: Vec<&str> = last
-                            .plan
-                            .acceptance_criteria
-                            .iter()
-                            .map(|s| s.as_str())
-                            .collect();
-                        // Fresh context means fresh: the board is withheld, not
-                        // just the history. Every round writes its plan, its
-                        // generation and its verdict into the board before the
-                        // review is reached, and the evaluator's context builder
-                        // hands the whole board to whichever evaluator runs — so
-                        // a reviewer given the board is handed the consensus it
-                        // is supposed to be checking, independently of the
-                        // history argument right above.
-                        let mut review = self
-                            .evaluator
-                            .evaluate(
-                                task,
-                                &serde_json::to_value(&last.plan).unwrap_or_default(),
-                                &serde_json::to_value(&last.generation).unwrap_or_default(),
-                                &[],
-                                &criteria,
-                                None,
-                            )
-                            .await;
-                        review.enforce_criteria_evidence(!criteria.is_empty());
-                        let review_json = serde_json::to_value(&review).unwrap_or_default();
-                        if let Some(reason) = review.terminal_env_failure_reason() {
-                            tracing::warn!(
-                                "Roundtable independent reviewer reported terminal environment failure"
-                            );
-                            // Paid for and answered nothing: neither verdict cell
-                            // may claim it, and without this one the call would
-                            // be invisible except as the run's terminal reason.
-                            observable.record_independent_review(
-                                crate::observable::INDEPENDENT_REVIEW_NOT_ANSWERED,
-                            );
-                            consensus_reached = false;
-                            evaluation.verdict = Verdict::Fail;
-                            evaluation.feedback =
-                                crate::squad::classify::declare_for(reason.clone());
-                            terminal_reason = Some(reason);
-                        } else {
-                            let agreed = matches!(review.verdict, Verdict::Pass);
-                            observable.record_independent_review(if agreed {
-                                crate::observable::INDEPENDENT_REVIEW_AGREED
-                            } else {
-                                crate::observable::INDEPENDENT_REVIEW_REJECTED
-                            });
-                            if !agreed {
-                                consensus_reached = false;
-                                evaluation.verdict = Verdict::Fail;
-                                evaluation.feedback = format!(
-                                    "independent reviewer rejected the consensus: {}",
-                                    review.feedback
-                                );
-                            }
-                        }
-                        let mut details =
-                            evaluation.details.take().unwrap_or(serde_json::json!({}));
-                        details["independent_review"] = review_json;
-                        evaluation.details = Some(details);
-                    }
-                }
-            }
+            crate::observable::global_observable().record_independent_review(
+                crate::observable::INDEPENDENT_REVIEW_NOT_ASKED_SUPERSEDED,
+            );
         }
 
         PgeRoundtableResult {
@@ -699,7 +649,7 @@ impl PgeRoundtable {
             );
         }
 
-        let plan_json = serde_json::to_value(&plan).unwrap_or_default();
+        let plan_json = serde_json::to_value(&plan).unwrap_or(Default::default());
         let generation = self
             .generator
             .generate(
@@ -722,30 +672,14 @@ impl PgeRoundtable {
             return (plan, generation, outcome);
         }
 
-        let generation_json = serde_json::to_value(&generation).unwrap_or_default();
-        let criteria: Vec<&str> = plan
-            .acceptance_criteria
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-        // `eval_history` ends on the round the board was last written with, so
-        // the board is carrying that same round a second time.
-        let evaluation_board = Self::board_without_mirrored_round(
-            board,
-            eval_history.last().unwrap_or(&serde_json::Value::Null),
-        );
         let mut evaluation = self
             .evaluator
-            .evaluate(
-                task,
-                &plan_json,
-                &generation_json,
-                eval_history,
-                &criteria,
-                Some(&evaluation_board),
+            .completion_evaluation(
+                roundtable_goal(task),
+                &plan.items,
+                plan.definition.as_deref(),
             )
             .await;
-        evaluation.enforce_criteria_evidence(!criteria.is_empty());
         evaluation.enforce_change_artifact_integrity(generation.change_artifact_defect(task));
 
         (plan, generation, Self::outcome_from_evaluation(evaluation))
@@ -830,7 +764,7 @@ impl PgeRoundtable {
                     };
                 }
 
-                let plan_json = serde_json::to_value(&plan).unwrap_or_default();
+                let plan_json = serde_json::to_value(&plan).unwrap_or(Default::default());
                 let generation = generator
                     .generate(
                         &task,
@@ -858,29 +792,13 @@ impl PgeRoundtable {
                     };
                 }
 
-                let generation_json = serde_json::to_value(&generation).unwrap_or_default();
-                let criteria: Vec<&str> = plan
-                    .acceptance_criteria
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect();
-                // `eval_history` ends on the round the board was last written
-                // with, so the board is carrying that same round a second time.
-                let evaluation_board = Self::board_without_mirrored_round(
-                    &board,
-                    eval_history.last().unwrap_or(&serde_json::Value::Null),
-                );
                 let mut evaluation = evaluator
-                    .evaluate(
-                        &task,
-                        &plan_json,
-                        &generation_json,
-                        &eval_history,
-                        &criteria,
-                        Some(&evaluation_board),
+                    .completion_evaluation(
+                        roundtable_goal(&task),
+                        &plan.items,
+                        plan.definition.as_deref(),
                     )
                     .await;
-                evaluation.enforce_criteria_evidence(!criteria.is_empty());
                 evaluation
                     .enforce_change_artifact_integrity(generation.change_artifact_defect(&task));
 
@@ -926,6 +844,7 @@ impl PgeRoundtable {
             selected_branch_id: merge_result.selected_branch_id,
             strategy: self.config.branch_merge_strategy,
             reasoning: merge_result.reasoning.clone(),
+            rejected: rejected_candidates(&branches, merge_result.selected_branch_id),
         });
 
         (
@@ -948,29 +867,38 @@ impl PgeRoundtable {
 
         let prefix = format!("{}-branch-{}", task.id, branch_id);
         let planner = manager
-            .create_agent(
+            .create_agent_declaring(
                 &format!("{}-planner", prefix),
                 cog_core::roles::PLANNER,
                 llm.clone(),
                 Some(&task.id),
+                // 这一段工序固定产出计划：平台在代码里说的，不由行上的字段说。
+                cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Plan),
+                task.stated_directions(),
             )
             .await
             .ok()?;
+        // 这一支交什么、往哪儿算好，都由任务说，不由角色名说。
         let generator = manager
-            .create_agent(
+            .create_agent_declaring(
                 &format!("{}-generator", prefix),
                 cog_core::roles::GENERATOR,
                 llm.clone(),
                 Some(&task.id),
+                task.deliverable_declaration(),
+                task.stated_directions(),
             )
             .await
             .ok()?;
         let evaluator = manager
-            .create_agent(
+            .create_agent_declaring(
                 &format!("{}-evaluator", prefix),
                 cog_core::roles::EVALUATOR,
                 llm.clone(),
                 Some(&task.id),
+                // 同上：这一段的产出是判词，由 roundtable 的结构定。
+                cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Judgement),
+                task.stated_directions(),
             )
             .await
             .ok()?;
@@ -1010,11 +938,13 @@ impl PgeRoundtable {
         if branches.is_empty() {
             return MergeResult {
                 plan: PlannerOutput {
+                    definition: None,
                     summary: String::new(),
                     plan: serde_json::json!({}),
                     sub_tasks: Vec::new(),
                     acceptance_criteria: Vec::new(),
                     targets: Vec::new(),
+                    items: Vec::new(),
                 },
                 generation: GeneratorOutput::none(),
                 outcome: RoundOutcome::Stopped {
@@ -1116,11 +1046,13 @@ impl PgeRoundtable {
             },
             None => MergeResult {
                 plan: PlannerOutput {
+                    definition: None,
                     summary: String::new(),
                     plan: serde_json::json!({}),
                     sub_tasks: Vec::new(),
                     acceptance_criteria: Vec::new(),
                     targets: Vec::new(),
+                    items: Vec::new(),
                 },
                 generation: GeneratorOutput::none(),
                 outcome: RoundOutcome::Stopped {
@@ -1229,19 +1161,23 @@ pub fn parse_planner_output(value: &serde_json::Value, goal: &str) -> PlannerOut
         .or_else(|| crate::squad::pge::types::no_checkout_progress_reason(value))
     {
         return PlannerOutput {
+            definition: None,
             summary: format!("Plan for: {goal}"),
             plan: serde_json::Value::String(reason),
             sub_tasks: Vec::new(),
             acceptance_criteria: Vec::new(),
             targets: Vec::new(),
+            items: Vec::new(),
         };
     }
     serde_json::from_value(value.clone()).unwrap_or_else(|_| PlannerOutput {
+        definition: None,
         summary: format!("Plan for: {}", goal),
         plan: value.clone(),
         sub_tasks: Vec::new(),
         acceptance_criteria: Vec::new(),
         targets: Vec::new(),
+        items: Vec::new(),
     })
 }
 
@@ -1390,7 +1326,7 @@ pub fn parse_evaluation_result(value: &serde_json::Value) -> EvaluationResult {
         let criteria: Vec<Criterion> = value
             .get("criteria")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
+            .unwrap_or(Default::default());
         EvaluationResult {
             verdict,
             feedback: value
@@ -1488,6 +1424,38 @@ fn board_mirror_trim(
 mod tests {
     use super::*;
 
+    /// 轮次上限与共识线各只有一处声明：默认值读常量，常量上面写着它由什么钉住。
+    ///
+    /// 两面一起钉：运行时默认值等于常量（改常量就改默认值），源码面
+    /// `impl Default` 的字段里不再有数字（下一笔写回裸字面量就红）。
+    #[test]
+    fn the_roundtable_default_reads_its_rounds_and_consensus_line() {
+        let cfg = PgeRoundtableConfig::default();
+        assert_eq!(cfg.max_iterations, ROUNDTABLE_MAX_ROUNDS);
+        assert_eq!(cfg.consensus_threshold, ROUNDTABLE_CONSENSUS);
+
+        let source = include_str!("roundtable.rs");
+        let body = source
+            .split("impl Default for PgeRoundtableConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.trim().starts_with(|c: char| c.is_ascii_digit())
+                })
+            })
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
+    }
+
     struct MockAgent {
         responses: std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>,
         /// How many times this actor was asked for anything. The only way to
@@ -1543,14 +1511,64 @@ mod tests {
         }
     }
 
+    /// 完成判的夹具应答：问的是「树上是不是终态说的样子」，夹具按脚本里的 verdict 答。
+    fn as_completion_answer(
+        input: &serde_json::Value,
+        response: serde_json::Value,
+    ) -> serde_json::Value {
+        if response.get("verdicts").is_some() {
+            return response;
+        }
+        let asks = input
+            .get("instructions")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.contains("Judge whether each terminal description is true"));
+        if !asks {
+            return response;
+        }
+        let ok = response
+            .get("verdict")
+            .and_then(|v| v.as_str())
+            .map(|v| v.eq_ignore_ascii_case("pass"))
+            .unwrap_or(true);
+        let reason = response
+            .get("feedback")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let verdicts: Vec<serde_json::Value> = input
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|i| i.get("id"))
+                    .map(|id| serde_json::json!({"id": id, "ok": ok, "reason": reason}))
+                    .collect()
+            })
+            .unwrap_or(Default::default());
+        serde_json::json!({ "verdicts": verdicts })
+    }
+
+    /// 让这个替身在被问到时代码路径拿到一个上游错误，而不是一个答案。
+    /// 主持人「问了但没答上」的那一格只能靠它走到。
+    const FAIL_ON_PROMPT: &str = "__fail_on_prompt__";
+
     #[async_trait::async_trait]
     impl cog_core::Agent for MockAgent {
         async fn prompt(&self, input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
+            let answer_input = input.clone();
             self.inputs
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(input);
-            Ok(self.next_response())
+            let response = self.next_response();
+            if response.as_str() == Some(FAIL_ON_PROMPT) {
+                return Err(cog_core::SFError::LLM(
+                    "HTTP 503 upstream unavailable".into(),
+                ));
+            }
+            Ok(as_completion_answer(&answer_input, response))
         }
         async fn start(&self) {}
         async fn snapshot(
@@ -1636,11 +1654,13 @@ mod tests {
 
     fn empty_planner_output() -> PlannerOutput {
         PlannerOutput {
+            definition: None,
             summary: String::new(),
             plan: serde_json::json!({}),
             sub_tasks: Vec::new(),
             acceptance_criteria: Vec::new(),
             targets: Vec::new(),
+            items: Vec::new(),
         }
     }
 
@@ -2548,6 +2568,7 @@ mod tests {
             "MODERATOR_CHANGE_STRATEGY",
             "MODERATOR_ACCEPT_PARTIAL",
             "MODERATOR_ESCALATE",
+            "MODERATOR_UNREADABLE",
             "record_moderator_consulted",
         ] {
             assert!(
@@ -2675,6 +2696,75 @@ mod tests {
         assert!(matches!(judgement.verdict, Verdict::Fail));
     }
 
+    /// 问了主持人、却读不出决策，与「主持人选择了继续」是两件事。前者有两种
+    /// 来路：调用没答上，或答了一串不在这四个词之内的散文。两种都必须落进
+    /// `unreadable`，不能计成 `continue` —— 那会把一次没人做过的决定写进
+    /// 「继续」那一格，并让一个读不懂合同的宿主看起来一切正常。
+    #[tokio::test]
+    async fn a_moderator_with_no_readable_decision_is_not_a_continue() {
+        for reply in [
+            // 散文：模型违反了契约，决策词无法解析。
+            serde_json::json!({"decision": "I think we should pivot to a different framing"}),
+            // 调用本身没到上游。
+            serde_json::json!(FAIL_ON_PROMPT),
+        ] {
+            let rt = PgeRoundtable::new(
+                PgeRoundtableConfig {
+                    max_iterations: 2,
+                    consensus_threshold: 1.0,
+                    stall_threshold: 0,
+                    independent_review: false,
+                    moderator: Some(ModeratorActor::new(std::sync::Arc::new(MockAgent::fixed(
+                        reply.clone(),
+                    )))),
+                    ..Default::default()
+                },
+                PlannerActor::new(std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+                    "summary": "s",
+                    "plan": {},
+                    "sub_tasks": []
+                })))),
+                GeneratorActor::new(std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+                    "content": {"code": "draft"},
+                    "artifacts": []
+                })))),
+                EvaluatorActor::new(std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+                    "verdict": "fail", "score": 10, "feedback": "not yet", "criteria": []
+                })))),
+            );
+            let task = cog_core::Task::new(
+                format!("t-unreadable-{}", uuid::Uuid::new_v4()),
+                cog_core::TaskType::Custom("test".into()),
+                serde_json::json!({"goal": "g"}),
+            );
+
+            // Only this cell may move: it is written nowhere except the `None`
+            // arm, so an increment here is the None arm firing. `continue` is
+            // written by other tests sharing the process-wide observable, so a
+            // delta on it would be noise rather than a reading.
+            let unreadable_before = cell(
+                "pge_moderator_consulted_total",
+                crate::observable::MODERATOR_UNREADABLE,
+            )
+            .await;
+
+            rt.debate(&task, serde_json::json!({})).await;
+
+            let unreadable_after = cell(
+                "pge_moderator_consulted_total",
+                crate::observable::MODERATOR_UNREADABLE,
+            )
+            .await;
+
+            assert!(
+                unreadable_after > unreadable_before,
+                "a consulted moderator with no readable decision has its own cell, \
+                 not the continue cell: {unreadable_before} -> {unreadable_after} \
+                 (reply {reply})"
+            );
+        }
+    }
+
     /// A round that produced nothing has nothing to judge, so the judge is not
     /// paid for. The evaluator here would return a Pass if it were ever asked,
     /// which is exactly the fabrication that used to travel downstream as a
@@ -2797,4 +2887,13 @@ mod tests {
         assert_eq!(judgement.score, Some(90));
         assert!(result.consensus_reached);
     }
+}
+
+/// 完成判要的 goal 文本：只用来问「是不是目标要的那件事」。
+fn roundtable_goal(task: &cog_core::Task) -> &str {
+    task.input
+        .get("goal")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| task.input.get("task").and_then(serde_json::Value::as_str))
+        .unwrap_or_default()
 }

@@ -174,6 +174,25 @@ fn a_dispatch_from_the_chat_asks_the_same_quota_as_the_submit_face() {
     );
 }
 
+/// 对话里说的一句「什么算好」与网关那个提交面落到同一本账。
+///
+/// 这条通道最容易坏成静默的一种：装配根写 `None` 照样编译，工具还在，只是每次
+/// 都说「这个进程没接到判定账」。属主说完了、员工回了「记不下来」，而部署里其实
+/// 装着那本账——读数上这长得像「这个部署没有那条面」，不是像一条没接的线。
+#[test]
+fn a_direction_stated_in_the_chat_lands_in_the_store_the_submit_face_uses() {
+    let boot = source(BOOT);
+    assert!(
+        boot.contains("consume_service::<dyn cog_core::TasteIntentSink>()"),
+        "装配根没有把判定账交给这段对话：属主在对话里说的那一句只会得到「记不下来」，\
+         而网关那个提交面照常收得下——同一种提交在一个入口上有、另一个入口上没有"
+    );
+    assert!(
+        boot.contains("taste_sink,"),
+        "取到了判定账却没有往会话里传：工具拿到的永远是空的那一格"
+    );
+}
+
 #[test]
 fn the_one_tool_that_changes_the_system_is_dispatch() {
     let text = source(ASSEMBLY);
@@ -229,9 +248,16 @@ fn the_turn_carries_the_process_tool_table_instead_of_a_short_one() {
 #[test]
 fn a_turn_runs_as_the_employee_of_its_session() {
     let text = source(ASSEMBLY);
+    // 按会话取员工这一步收在 `employee_here` 里，检查点也要走同一处——两处各算
+    // 一次名字，快照就可能落在另一个车道上。判的是「这一轮从会话取人」，不是
+    // 它写在哪个函数里。
     assert!(
-        text.contains("employee_for(&request.session_id)"),
+        text.contains("self.employee_here(owner, &request.session_id)"),
         "这一轮没有按会话取员工：同一个会话的两轮在账上会变成两个人"
+    );
+    assert!(
+        text.contains("None => employee_for(session_id)"),
+        "没有绑定表时退回按会话算的名字这一条不在了：进程没装 KV 时这一段对话就没有员工"
     );
     assert!(
         text.contains("agent_id: employee.id.clone()"),
@@ -277,17 +303,12 @@ fn the_employee_is_on_the_roster_and_listens_before_it_speaks() {
         text.contains("EmployeeLease::take"),
         "说话的时候没有把自己登记进名册：这一轮里它不可达"
     );
-    // 名册上的「它能做什么」= 这一轮手上真有的工具。这里曾经填的是
-    // `vec![employee.id.clone()]`：能力字段里装着自己的 id，读出来是
-    // 「mira 的能力是 mira」，按能力找人的那一步什么也筛不出来——而员工
-    // 本来就没有预设，它有的只是这个进程给它的工具。
+    // 名册上曾经有一栏「它能做什么」，填的是这一轮的工具集。工具集对每个数字
+    // 员工都是同一份——同一个进程给同一套工具——所以按人列一列不区分谁，它已
+    // 经从名册负载里去掉。这条判据钉住它不再被传进来。
     assert!(
-        text.contains("let capabilities = tools.names();"),
-        "名册上的能力不是这一轮的工具集：那一位在名单上又退回成一个共同标签"
-    );
-    assert!(
-        !text.contains("vec![employee.id.clone()]"),
-        "能力字段里装着自己的 id：这不是能力声明，是一个名字占了两格"
+        !text.contains("capabilities"),
+        "名册负载里又出现了按人列的能力：这个类人人同一份，列出来只是把同一样东西写 N 遍"
     );
     assert!(
         text.contains("lease.release()"),

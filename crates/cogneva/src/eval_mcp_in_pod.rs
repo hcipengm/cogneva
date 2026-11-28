@@ -32,7 +32,9 @@ use crate::eval_toolathlon::PodRuntime;
 ///
 /// 60 秒取自上游（`cfg.get("client_session_timeout_seconds", 60)`），不由调用点另定：
 /// 两个地方各定一个默认值，同一条配置就有两个超时，而慢的那一台会被读成坏的那一台。
-// cap: bound — 取自上游 client_session_timeout_seconds 的默认值，不由调用点另定：两处各定一个，同一条配置就有两个超时，慢的那台会被读成坏的那台
+// cap: fixed — 取自上游 client_session_timeout_seconds 的默认值，不由调用点另定：两处各定一个，同一条配置就有两个超时，慢的那台会被读成坏的那台
+// keep: 删掉后回到「取自上游 client_session_timeout_seconds 的默认值，不由调用点另定：两处各定一个，同一条配置就有两个超时，慢的那台会被读成坏的那台」所描述的情形；由这条约定兜住
+// wall: 等=MCP 服务端在一次会话内的下一次答复 / 等不到=这一会话超时结束，已拿到的结果留着，没拿到的按「没答」记 / 续跑=不能在同一会话里续，要新开一次会话
 pub const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 配置里那三个占位符。上游 runner 做的替换逐字就是这三个（`utils/mcp/tool_servers.py`
@@ -262,6 +264,7 @@ impl StdioServerSpec {
 /// 标准 libpq 变量名 → MCP server 那一侧用的 `PG_*` 名。
 ///
 /// 上游 `utils/mcp/tool_servers.py` 里逐字是这五对，桥接发生在环境合并**之后**。
+// not-a-bound: 单位换算（定义性常量：改它只改单位，不改任何阈值行为）
 const LIBPQ_TO_PG: [(&str, &str); 5] = [
     ("PGHOST", "PG_HOST"),
     ("PGPORT", "PG_PORT"),
@@ -539,6 +542,7 @@ impl ToolFace {
     /// 里逐字是 `seen_names` ＋ 一条 warning）。这不是可以随手改成报错的地方——上游撞名
     /// 时照样跑完，报错会让某些题从「有分」变成「没跑成」，而这道题的分数并不因为撞名
     /// 而失去意义，只是少了一件工具。丢掉的那几件在这里留一条告警，别静默。
+    // prompt: not-an-instruction — 逐字转发 server 自己声明的工具描述与参数 schema
     pub fn build(servers: &[ConnectedServer]) -> Self {
         let mut definitions = Vec::new();
         let mut routes = HashMap::new();

@@ -41,6 +41,10 @@ fn parses_as_principle_state(word: &str) -> bool {
     cog_core::PrincipleState::parse(word).is_some()
 }
 
+fn parses_as_runtime_principle_state(word: &str) -> bool {
+    cog_core::RuntimePrincipleState::parse(word).is_some()
+}
+
 fn parses_as_principle_check_kind(word: &str) -> bool {
     cog_core::PrincipleCheckKind::parse(word).is_some()
 }
@@ -127,6 +131,7 @@ struct Vocabulary {
 
 const CHANGE_LEDGER: &str = "crates/cog-storage/src/postgres/change_ledger_store.rs";
 const PRINCIPLE_LEDGER: &str = "crates/cog-storage/src/postgres/principle_ledger_store.rs";
+const RUNTIME_PRINCIPLE: &str = "crates/cog-storage/src/postgres/runtime_principle_store.rs";
 
 const VOCABULARIES: &[Vocabulary] = &[
     Vocabulary {
@@ -142,7 +147,7 @@ const VOCABULARIES: &[Vocabulary] = &[
         subjects: &["state", "to_state", "from_state"],
         parses: parses_as_change_state,
         home: "cog_core::ChangeState",
-        except_in: &[PRINCIPLE_LEDGER],
+        except_in: &[PRINCIPLE_LEDGER, RUNTIME_PRINCIPLE],
     },
     Vocabulary {
         subjects: &["retire_reason"],
@@ -154,7 +159,18 @@ const VOCABULARIES: &[Vocabulary] = &[
         subjects: &["state"],
         parses: parses_as_principle_state,
         home: "cog_core::PrincipleState",
-        except_in: &[CHANGE_LEDGER],
+        except_in: &[CHANGE_LEDGER, RUNTIME_PRINCIPLE],
+    },
+    Vocabulary {
+        // The rules the platform hands its employees. Two of its four words
+        // (`retired`, and the decision `approved` once a query spells one out)
+        // are also this build's words elsewhere, so without this entry a
+        // query here would be read as the change ledger's or the engineering
+        // ledger's set -- a true statement about the wrong table.
+        subjects: &["state"],
+        parses: parses_as_runtime_principle_state,
+        home: "cog_core::RuntimePrincipleState",
+        except_in: &[],
     },
     Vocabulary {
         subjects: &["check_kind"],

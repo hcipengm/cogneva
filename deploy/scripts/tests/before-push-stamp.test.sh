@@ -34,6 +34,17 @@ fail() { echo "FAIL: $*"; exit 1; }
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
 
+# 私有标识那一格（2026-11-20 起在推前门里）：按 `cogneva.privateRoot` 找私有仓的判据，没配
+# 就退 75（没验）。夹具里每一棵树都是临时仓，本机装没装私有仓检出不该决定它们的判词——
+# 不钉住的话，同一份字节在一台配了私有仓的机器上会让下面每个「整门绿」的夹具变成红。
+# 那一格自己的行为由它自己的测试判；这里只给一份退 0 的桩，让「整门绿」这一侧可复现。
+private_stub="${work}/private-stub"
+mkdir -p "${private_stub}/scripts/gates"
+printf '#!/usr/bin/env bash\nexit 0\n' \
+    >"${private_stub}/scripts/gates/check-private-references.sh"
+chmod +x "${private_stub}/scripts/gates/check-private-references.sh"
+export COGNEVA_PRIVATE_ROOT="${private_stub}"
+
 tree="${work}/tree"
 mkdir -p "${tree}/deploy/scripts/tests" "${tree}/.github/workflows"
 stage_gate "${repo}" "${tree}"
@@ -130,8 +141,9 @@ there_key="$(GIT_DIR="${caller}/.git" GIT_WORK_TREE="${caller}" \
 #
 # 为什么要有它：2026-11-08 实测，整门跑两小时，而远端每 66～123 分钟往前走一笔。要推就得
 # 先变基，一变基这棵树里就多了别人的文件，按树记的两把键一起作废——于是每个会话都在重复
-# 这两小时，不是红，是永远差一步。这几格钉住的是 patch-id 的两面：干净的变基之后同一批
-# 改动仍是验过的，而解冲突改了解法之后它就不再是同一批。
+# 这两小时，不是红，是永远差一步。这几格钉住的是改动键的三面：干净的变基之后同一批改动仍
+# 是验过的（上游只动别的文件是一格、动同一个文件的紧邻处是另一格——后者换了 `@@` 的切法），
+# 而解冲突改了解法之后它就不再是同一批。
 ptree="${work}/ptree"
 mkdir -p "${ptree}/deploy/scripts"
 stage_gate "${repo}" "${ptree}"
@@ -187,6 +199,61 @@ base2="$(git -C "${ptree}" rev-parse upstream)"
 grep -q '不是它与基底' "${work}/out" ||
     fail "放行的那一句没说清「验的是改动本身、不是合并结果」；实得：$(cat "${work}/out")"
 
+# 12b) 上游在**紧邻处**插进一行 ⇒ 同一片改动被切成两片，仍是同一批改动，账照样命中。
+#      这一格与上一格问的不是同一件事：上一格上游只动别的文件，这份 diff 一字不变；这一格
+#      上游动的是同一个文件——变基之后增删行仍然一字不差，只是 `@@` 从一片变成两片。2026-11-12
+#      实测：这正是 `git patch-id --stable` 会换 id 的形状（切法进了哈希），10 笔干净变基之后
+#      两小时的整门就此作废。所以这一格先自证形状（增删行相同、切法不同），再判账。
+htree="${work}/htree"
+mkdir -p "${htree}/deploy/scripts"
+stage_gate "${repo}" "${htree}"
+(
+    cd "${htree}" || exit 1
+    git init -q -b main .
+    git config user.email gate@example.invalid
+    git config user.name gate
+    printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n' >h.txt
+    git add h.txt
+    git commit -q -m base
+) || fail "夹具仓（切法）建不起来"
+hbase="$(git -C "${htree}" rev-parse HEAD)"
+# 这批改动改第 2 行与第 9 行，中间隔着 6 行——按默认的 3 行上下文，这 6 行正好把两处并进
+# 同一片 `@@`。上游插的第 4 行两头都够：它撑大了中间那段，两处只好各占一片；它又紧挨着
+# 第一处（三行上下文之内），于是作为上下文行进补丁正文——这正是 `git patch-id` 会换 id 的
+# 那一面（2026-11-12 实测：86dc873b… → 67e5cc8b…，增删行一字不差）。
+(
+    cd "${htree}" || exit 1
+    printf 'l1\nL2\nl3\nl4\nl5\nl6\nl7\nl8\nL9\nl10\n' >h.txt
+    git add h.txt
+    git commit -q -m mine
+) || fail "夹具的这批改动提交不掉"
+hmine="$(git -C "${htree}" rev-parse HEAD)"
+hkey="$( cd "${htree}" && bash deploy/scripts/check-before-push.sh --key-patch "${hbase}" )" ||
+    fail "--key-patch 退非零（切法夹具）"
+[ -n "${hkey}" ] || fail "--key-patch 什么都没印（切法夹具）"
+mkdir -p "${htree}/.git/check-before-push"
+printf 'fixture\n' >"${htree}/.git/check-before-push/patch.${hkey}"
+(
+    cd "${htree}" || exit 1
+    git checkout -q -b upstream "${hbase}"
+    printf 'l1\nl2\nl3\ninserted\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n' >h.txt
+    git add h.txt
+    git commit -q -m upstream
+) || fail "夹具的上游那一笔建不起来（切法）"
+hbase2="$(git -C "${htree}" rev-parse upstream)"
+( cd "${htree}" && git checkout -q main && git rebase -q upstream ) || fail "夹具的干净变基没走完（切法）"
+# 形状自证：同一批增删行，切法从一片变成两片。这一格哪天不再造出这个形状，它就不再判
+# 「切法」这件事了——那时要换夹具，而不是让它继续绿着。
+same_lines() { git -C "${htree}" diff --no-color "$1" "$2" -- h.txt | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)'; }
+[ "$(git -C "${htree}" diff --no-color "${hbase}" "${hmine}" -- h.txt | grep -c '^@@')" = "1" ] ||
+    fail "夹具没造出「一片 @@」的形状：$(git -C "${htree}" diff --no-color "${hbase}" "${hmine}" -- h.txt | grep -c '^@@') 片"
+[ "$(git -C "${htree}" diff --no-color "${hbase2}" HEAD -- h.txt | grep -c '^@@')" = "2" ] ||
+    fail "变基之后没切成两片：$(git -C "${htree}" diff --no-color "${hbase2}" HEAD -- h.txt | grep -c '^@@') 片"
+[ "$(same_lines "${hbase}" "${hmine}")" = "$(same_lines "${hbase2}" HEAD)" ] ||
+    fail "夹具的增删行变了，这一格就不再是「只是切法变了」"
+( cd "${htree}" && bash deploy/scripts/check-before-push.sh --status-patch "${hbase2}" ) >"${work}/out" 2>&1 ||
+    fail "上游在紧邻处插一行（切法变了、增删行没变）之后这批改动的账失效了；实得：$(cat "${work}/out")"
+
 # 13) 解冲突改了解法 ⇒ 这批改动不再是判过的那一批，旧账不许替它说话。
 (
     cd "${ptree}" || exit 1
@@ -241,6 +308,34 @@ found_key="$(HOME="${fakehome}" PATH="${fakehome}/.cargo/bin:${stripped_path}" \
 [ -n "${bare_key}" ] || fail "PATH 里没有 cargo 时 --key-content 什么都没印"
 [ "${bare_key}" = "${found_key}" ] ||
     fail "同一个工具、两条发现路径算出了两个键（兜底 ${bare_key:0:12}，PATH ${found_key:0:12}）：工具解析必须在子命令分派之前"
+
+# 15b) node 是同一类，2026-11-14 实测到的是它的形状：跑绿的那一跑在一个 `export PATH=
+#      <nvm>/bin:$PATH` 的壳里起跑，键里记着 `node=v22.…`；推送时钩子从没带 nvm 的 PATH
+#      里被拉起来，同一棵树算出 `node=absent`——刚判绿的字节在推送口报「没验过」，而两把
+#      内容键之间根本没有分歧。node 装在版本目录下，兜底要按版本挑，所以这一格用一份自己
+#      的 HOME 造出两个版本目录，钉的是「哪条发现路径都落到同一个版本上」。
+mkdir -p "${fakehome}/.nvm/versions/node/v22.0.0/bin" "${fakehome}/.nvm/versions/node/v9.9.9/bin"
+for v in v22.0.0 v9.9.9; do
+    printf '#!/usr/bin/env bash\necho %s\n' "$v" >"${fakehome}/.nvm/versions/node/${v}/bin/node"
+    chmod +x "${fakehome}/.nvm/versions/node/${v}/bin/node"
+done
+node_stripped=()
+for d in "${path_dirs[@]}"; do
+    [ -n "$d" ] || continue
+    # 与上面同一套摘法：只摘「只装着 node」的目录，系统目录留着（门要 git/sha256sum）。
+    if [ -x "$d/node" ] && [ "$d" != /usr/bin ] && [ "$d" != /bin ]; then continue; fi
+    node_stripped+=("$d")
+done
+node_stripped_path="$(IFS=:; printf '%s' "${node_stripped[*]}")"
+node_bare_key="$(HOME="${fakehome}" PATH="${node_stripped_path}" \
+    bash deploy/scripts/check-before-push.sh --key-content)" ||
+    fail "--key-content 在 PATH 里没有 node 时退非零"
+node_found_key="$(HOME="${fakehome}" PATH="${fakehome}/.nvm/versions/node/v22.0.0/bin:${node_stripped_path}" \
+    bash deploy/scripts/check-before-push.sh --key-content)" ||
+    fail "--key-content 在 PATH 里带着 node 时退非零"
+[ -n "${node_bare_key}" ] || fail "PATH 里没有 node 时 --key-content 什么都没印"
+[ "${node_bare_key}" = "${node_found_key}" ] ||
+    fail "node 的两条发现路径算出了两个键（兜底 ${node_bare_key:0:12}，PATH ${node_found_key:0:12}）：跑绿的一跑与推送的钩子会各算一个，刚验过的字节在推送口报没验过；兜底还得挑版本最高的那份，否则这条也不会等"
 
 # 16) 跑的途中这棵树变过 ⇒ 这一跑的判词不属于现在这份字节，两把键都不记。
 #
@@ -364,6 +459,9 @@ case "\$1" in
 esac
 SH
 chmod +x "${ftree}/bin/cargo"
+# pwsh 那一格只在装了 pwsh 的机器上跑（没装就 SKIP），所以夹具缺这个文件时本机照绿、
+# CI 上一跑就红。真仓库里它永远在，夹具得连它一起造齐。
+printf 'Write-Host "fixture"\n' >"${ftree}/bootstrap.ps1"
 printf '#!/usr/bin/env bash\nexit 0\n' >"${ftree}/nothing.sh"
 printf '[workspace]\nmembers = ["crates/foo"]\n' >"${ftree}/Cargo.toml"
 printf '[package]\nname = "foo"\nversion = "0.0.0"\nedition = "2021"\n' >"${ftree}/crates/foo/Cargo.toml"
@@ -382,7 +480,7 @@ YAML
     git config user.email gate@example.invalid
     git config user.name gate
     printf 'one\n' >tracked.txt
-    git add tracked.txt nothing.sh Cargo.toml crates/foo/Cargo.toml crates/foo/src/lib.rs \
+    git add tracked.txt bootstrap.ps1 nothing.sh Cargo.toml crates/foo/Cargo.toml crates/foo/src/lib.rs \
         .github/workflows/ci.yml deploy/scripts/tests/ok.test.sh \
         .github/scripts/tests/ok.test.sh deploy/scripts/check-before-push.sh \
         deploy/scripts/lib/build-slot.sh
@@ -401,81 +499,6 @@ grep -q '没动 crates/ 下的 .rs' "${work}/out" &&
     fail "盘上有未提交的 crates/foo/src/lib.rs，Test 那一格却说「没动 crates/ 下的 .rs」跳过了：这份字节没有被它判过；实得：$(cat "${work}/out")"
 grep -q -- '-p foo' "${work}/ftree-cargo-calls" 2>/dev/null ||
     fail "Test 那一格没有把 foo 交给 cargo（未提交的改动没进题目）；实得：$(cat "${work}/ftree-cargo-calls" 2>/dev/null)"
-
-# 20) 树脏时 Clippy 就地判，不判 HEAD 展开出来的临时树。
-#
-# 临时树里放不下脏树的改动，而收尾盖的内容键是盘上这份字节。脏树上去判那份拷贝，绿的是
-# 一份没人要推的字节；把它记成「这份字节验过」，等于用一个别的树的结论替这棵树背书。
-ctree="${work}/ctree"
-mkdir -p "${ctree}/deploy/scripts/tests" "${ctree}/.github/scripts/tests" \
-    "${ctree}/.github/workflows" "${ctree}/bin" "${ctree}/crates/foo/src"
-stage_gate "${repo}" "${ctree}"
-printf '#!/usr/bin/env bash\nexit 0\n' >"${ctree}/deploy/scripts/tests/ok.test.sh"
-printf '#!/usr/bin/env bash\nexit 0\n' >"${ctree}/.github/scripts/tests/ok.test.sh"
-cat >"${ctree}/bin/cargo" <<SH
-#!/usr/bin/env bash
-case "\$1" in
-  --version|-V) echo "cargo 9.9.9 (fixture)"; exit 0 ;;
-  fmt) exit 1 ;;
-  clippy)
-    case "\$2" in
-      --version) echo "clippy 9.9.9 (fixture)"; exit 0 ;;
-      *) printf '%s\n' "\$(pwd)" >>"${work}/ctree-clippy-cwd"; exit 0 ;;
-    esac ;;
-  *)
-    printf '%s\n' "\$*" >>"${work}/ctree-cargo-calls"
-    echo "test result: ok. 1 passed; 0 failed; 0 ignored"; exit 0 ;;
-esac
-SH
-chmod +x "${ctree}/bin/cargo"
-printf '#!/usr/bin/env bash\nexit 0\n' >"${ctree}/nothing.sh"
-printf '[workspace]\nmembers = ["crates/foo"]\n' >"${ctree}/Cargo.toml"
-printf '[package]\nname = "foo"\nversion = "0.0.0"\nedition = "2021"\n' >"${ctree}/crates/foo/Cargo.toml"
-printf 'pub fn one() -> u8 { 1 }\n' >"${ctree}/crates/foo/src/lib.rs"
-cat >"${ctree}/.github/workflows/ci.yml" <<'YAML'
-name: ci
-jobs:
-  repo-conventions:
-    steps:
-      - name: nothing
-        run: bash nothing.sh
-YAML
-(
-    cd "${ctree}" || exit 1
-    git init -q -b main .
-    git config user.email gate@example.invalid
-    git config user.name gate
-    printf 'one\n' >tracked.txt
-    git add tracked.txt nothing.sh Cargo.toml crates/foo/Cargo.toml crates/foo/src/lib.rs \
-        .github/workflows/ci.yml deploy/scripts/tests/ok.test.sh \
-        .github/scripts/tests/ok.test.sh deploy/scripts/check-before-push.sh \
-        deploy/scripts/lib/build-slot.sh
-    git commit -q -m base
-    git update-ref refs/remotes/origin/main HEAD
-) || fail "Clippy 脏树那一格的夹具建不起来"
-ct_env=(env COGNEVA_BUILD_GATE_LOCK_DIR="${work}/ctree-gate" COGNEVA_BUILD_LOCK_FILE="${work}/ctree.lock"
-    PATH="${ctree}/bin:${PATH}")
-printf 'pub fn two() -> u8 { 2 }\n' >"${ctree}/crates/foo/src/lib.rs"
-rm -f "${work}/ctree-clippy-cwd"
-( cd "${ctree}" && "${ct_env[@]}" bash deploy/scripts/check-before-push.sh ) >"${work}/out" 2>&1 ||
-    fail "Clippy 脏树那一跑自己红了：$(cat "${work}/out")"
-dirty_cwd="$(head -n 1 "${work}/ctree-clippy-cwd" 2>/dev/null)"
-[ -n "${dirty_cwd}" ] || fail "Clippy 在脏树上没跑：$(cat "${work}/out")"
-case "${dirty_cwd}" in
-    "${ctree}") : ;;
-    *) fail "脏树上的 Clippy 判的不是工作树（cwd=${dirty_cwd}），而收尾记的是工作树的键" ;;
-esac
-# 干净树上反过来：判的是 HEAD 展开出来的那份拷贝（原行为，不许被这一改顺手丢掉）。
-rm -f "${work}/ctree-clippy-cwd"
-( cd "${ctree}" && git add crates/foo/src/lib.rs && git commit -q -m "two" ) || fail "干净树造不出来"
-( cd "${ctree}" && "${ct_env[@]}" bash deploy/scripts/check-before-push.sh ) >"${work}/out" 2>&1 ||
-    fail "Clippy 干净树那一跑自己红了：$(cat "${work}/out")"
-clean_cwd="$(head -n 1 "${work}/ctree-clippy-cwd" 2>/dev/null)"
-[ -n "${clean_cwd}" ] || fail "Clippy 在干净树上没跑：$(cat "${work}/out")"
-case "${clean_cwd}" in
-    *cogneva-push-clippy*) : ;;
-    *) fail "干净树上的 Clippy 没有判 HEAD 展开出来的那份拷贝（cwd=${clean_cwd}）" ;;
-esac
 
 # 21) 容量登记表那格单文件 rustc 直编也要走构建槽。
 #
@@ -513,6 +536,9 @@ case "$1" in
 esac
 SH
 chmod +x "${rtree}/bin/cargo"
+# pwsh 那一格只在装了 pwsh 的机器上跑（没装就 SKIP），所以夹具缺这个文件时本机照绿、
+# CI 上一跑就红。真仓库里它永远在，夹具得连它一起造齐。
+printf 'Write-Host "fixture"\n' >"${rtree}/bootstrap.ps1"
 printf '#!/usr/bin/env bash\nexit 0\n' >"${rtree}/nothing.sh"
 cat >"${rtree}/.github/workflows/ci.yml" <<'YAML'
 name: ci
@@ -528,7 +554,7 @@ YAML
     git config user.email gate@example.invalid
     git config user.name gate
     printf 'one\n' >tracked.txt
-    git add tracked.txt nothing.sh .github/workflows/ci.yml \
+    git add tracked.txt bootstrap.ps1 nothing.sh .github/workflows/ci.yml \
         crates/cogneva/tests/rust_capacity_constants_registry_test.rs \
         deploy/scripts/tests/ok.test.sh .github/scripts/tests/ok.test.sh \
         deploy/scripts/check-before-push.sh deploy/scripts/lib/build-slot.sh
@@ -598,7 +624,10 @@ YAML
     git config user.name gate
     printf 'one\n' >tracked.txt
     printf '#!/usr/bin/env bash\nexit 0\n' >nothing.sh
-    git add tracked.txt nothing.sh .github/workflows/ci.yml \
+    # pwsh 那一格只在装了 pwsh 的机器上跑（没装就 SKIP），所以夹具缺这个文件时本机照绿、
+    # CI 上一跑就红。真仓库里它永远在，夹具得连它一起造齐。
+    printf 'Write-Host "fixture"\n' >bootstrap.ps1
+    git add tracked.txt bootstrap.ps1 nothing.sh .github/workflows/ci.yml \
         deploy/scripts/tests/ok.test.sh .github/scripts/tests/ok.test.sh \
         deploy/scripts/check-before-push.sh deploy/scripts/lib/build-slot.sh
     git commit -q -m base
@@ -617,4 +646,203 @@ grep -q '这棵树在跑的过程中变过' "${work}/out" &&
 grep -q '两把键都不记' "${work}/out" &&
     fail "收尾算不出内容键那一支说「两把键都不记」，但改动键照常落地：那句话会把一份已经判过的改动说成没判过；实得：$(cat "${work}/out")"
 
-echo "ok - before-push 的戳：没验过 / 验过 / 新提交 三种结局分得开，未提交改动不进键；提交前那一问按工作树字节记，改字节或改判据都失效；改动键在干净的变基后仍命中、解冲突后失效；键不取决于调用方的 PATH 里有没有 cargo"
+# 23) 远端在这一跑的期间往前走了，而这棵树一个字节都没动。改动键的基底跟着变了，
+#     于是开跑那把与收尾那把对不上——上一版把这当成「这批改动在跑的过程中变过」，
+#     改动键直接作废：判过的明明是同一份字节，只因为远端追上了一笔就要重判两小时。
+#     2026-11-10 实测：两边同时在门下跑，谁先推谁就把对方这一跑白烧掉。
+#     这一格要的是：收尾按**新基底**重算改动键并记下来，而且这一笔在提交之后、以及
+#     变基到新基底之后都仍然命中（推前钩子问的正是那个基底）。
+#     边界：共同祖先只会因为「远端涨到了这个 HEAD 的后代」而变深。旁支型前进（远端落了
+#     与 HEAD 无关的一笔）不会让共同祖先动，改动键本来就不变，也就轮不到这里。
+btree="${work}/btree"
+mkdir -p "${btree}/deploy/scripts/tests" "${btree}/.github/workflows" "${btree}/.github/scripts/tests" "${btree}/bin"
+stage_gate "${repo}" "${btree}"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${btree}/deploy/scripts/tests/ok.test.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${btree}/.github/scripts/tests/ok.test.sh"
+printf 'Write-Host "fixture"\n' >"${btree}/bootstrap.ps1"
+cat >"${btree}/bin/cargo" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  --version|-V) echo "cargo 9.9.9 (fixture)"; exit 0 ;;
+  fmt|clippy) exit 1 ;;
+  *) echo "test result: ok. 1 passed; 0 failed; 0 ignored"; exit 0 ;;
+esac
+SH
+chmod +x "${btree}/bin/cargo"
+# 这一步只动 `.git` 里的那个引用：造一个 C1 的后代提交（内容多一个 peer.txt），
+# 把 refs/remotes/origin/main 指过去。工作树与真索引都不碰——碰了就成了第 16 格
+# 那种「树变过」，两件事就分不开了。
+cat >"${btree}/advance-origin.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+idx="$(mktemp)"
+rm -f "${idx}"
+GIT_INDEX_FILE="${idx}" git read-tree HEAD
+printf 'peer\n' >peer.txt
+GIT_INDEX_FILE="${idx}" git add peer.txt
+tree="$(GIT_INDEX_FILE="${idx}" git write-tree)"
+rm -f peer.txt "${idx}"
+commit="$(printf 'peer advance\n' | git commit-tree "${tree}" -p HEAD)"
+git update-ref refs/remotes/origin/main "${commit}"
+SH
+cat >"${btree}/.github/workflows/ci.yml" <<'YAML'
+name: ci
+jobs:
+  repo-conventions:
+    steps:
+      - name: a peer pushes main while the gate is judging this tree
+        run: bash advance-origin.sh
+YAML
+(
+    cd "${btree}" || exit 1
+    git init -q -b main .
+    git config user.email gate@example.invalid
+    git config user.name gate
+    printf 'one\n' >tracked.txt
+    git add tracked.txt advance-origin.sh .github/workflows/ci.yml bootstrap.ps1 \
+        deploy/scripts/tests/ok.test.sh .github/scripts/tests/ok.test.sh \
+        deploy/scripts/check-before-push.sh deploy/scripts/lib/build-slot.sh \
+        deploy/scripts/*.py
+    git commit -q -m base
+    # 起跑时远端在 C0、HEAD 在 C1：改动键里含 C1 这一笔。
+    git update-ref refs/remotes/origin/main HEAD
+    printf 'two\n' >second.txt
+    git add second.txt
+    git commit -q -m second
+    # 未提交的那一份：这一跑判的是它，提交之后它就该命中推前钩子问的那个键。
+    printf 'dirty\n' >>tracked.txt
+) || fail "远端前进那一格的夹具建不起来"
+bt_env=(env COGNEVA_BUILD_GATE_LOCK_DIR="${work}/btree-gate" COGNEVA_BUILD_LOCK_FILE="${work}/btree.lock"
+    PATH="${btree}/bin:${PATH}")
+( cd "${btree}" && "${bt_env[@]}" bash deploy/scripts/check-before-push.sh ) >"${work}/bout" 2>&1 ||
+    fail "远端前进那一跑自己红了，这一格判不了记账：$(cat "${work}/bout")"
+grep -q '这批改动在跑的过程中变过' "${work}/bout" &&
+    fail "远端往前走被当成「这批改动变过」：判过的字节一个位没动，改动键不该作废；实得：$(grep '记账' "${work}/bout")"
+grep -q '远端在这跑期间往前走了' "${work}/bout" ||
+    fail "远端在跑期间往前走了，记账时没说；实得：$(grep '记账' "${work}/bout")"
+# 提交的是**这一跑判过的那份字节**，所以用 `add -A`：夹具里未跟踪的东西（假 cargo 之类）
+# 也在判过的那份里，只提交 touched 的那个文件会让两边对不上，而那种对不上是夹具的错，
+# 不是门的错。真实流程里也一样——你判完把自己那份提交掉。
+git -C "${btree}" add -A
+git -C "${btree}" commit -q -m 'the change the gate judged'
+( cd "${btree}" && "${bt_env[@]}" bash deploy/scripts/check-before-push.sh --status-patch ) >"${work}/bout3" 2>&1 ||
+    fail "提交之后改动键不再命中：这一笔本可以不再重判，现在要重跑；$(cat "${work}/bout3")"
+# 真正的结局在这里：推之前必须先把远端那笔合进来（快进不了就被拒），而合进来之后
+# 从新基底到 HEAD 的 diff 正是这批改动本身——钩子问的是这一把。只有开跑那把会命中；
+# 照新基底重算的那把（diff 里反着算进 peer.txt）在这里必然对不上。
+git -C "${btree}" rebase -q refs/remotes/origin/main >"${work}/brebase" 2>&1 ||
+    fail "夹具的变基做不成，这一格判不了：$(cat "${work}/brebase")"
+( cd "${btree}" && "${bt_env[@]}" bash deploy/scripts/check-before-push.sh --status-patch ) >"${work}/bout4" 2>&1 ||
+    fail "变基到远端新基底之后改动键不再命中：这才是这一格要防的白跑；$(cat "${work}/bout4")"
+
+# 24) 第三种形状：远端在这跑期间**含了这一支自己**（远端涨到了 HEAD），工作树干净。
+#     这时从新基底（= HEAD）到工作树是一份空 diff，patch-id 本来就是空的。上一版在这一
+#     形状下先印「改动键按新基底重记（）」——括号里什么都没有——再印一句「没有共同祖先，
+#     或临时索引写不了」。读的人会照着后一句去查共同祖先、去查临时索引，而两样都不缺；
+#     真正的事实是「没有要补的那一段」。这一格钉三件事：两种话分得开、不印空的键、
+#     这一跑照常退出 0（判词照旧有效，只是没有改动键）。
+utree="${work}/utree"
+mkdir -p "${utree}/deploy/scripts/tests" "${utree}/.github/workflows" "${utree}/.github/scripts/tests" "${utree}/bin"
+stage_gate "${repo}" "${utree}"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${utree}/deploy/scripts/tests/ok.test.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${utree}/.github/scripts/tests/ok.test.sh"
+printf 'Write-Host "fixture"\n' >"${utree}/bootstrap.ps1"
+cp "${btree}/bin/cargo" "${utree}/bin/cargo"
+chmod +x "${utree}/bin/cargo"
+# 远端在这一跑期间涨到 HEAD 自己：别人把这一支推上去了。只动 `.git` 里的引用，
+# 工作树与真索引一个字节都不碰。
+cat >"${utree}/catch-up.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+git update-ref refs/remotes/origin/main HEAD
+SH
+cat >"${utree}/.github/workflows/ci.yml" <<'YAML'
+name: ci
+jobs:
+  repo-conventions:
+    steps:
+      - name: a peer pushes this very branch while the gate is judging it
+        run: bash catch-up.sh
+YAML
+(
+    cd "${utree}" || exit 1
+    git init -q -b main .
+    git config user.email gate@example.invalid
+    git config user.name gate
+    printf 'one\n' >tracked.txt
+    # `add -A`：这一格要的是「工作树与 HEAD 一个字节都不差」。逐个列出来的话，
+    # `stage_gate` 哪天多摆一个兄弟脚本（2026-11-10 就多了 check-format.sh），
+    # 它就是未跟踪的、进差值，于是这一格的失败长得像门的错而不是夹具的错。
+    git add -A
+    git commit -q -m base
+    if git status --porcelain | grep -q .; then
+        fail "夹具在起跑前就不干净，这一格判不了：$(git status --porcelain)"
+    fi
+    # 起跑时远端在 C0、HEAD 在 C1：开跑那把改动键非空，收尾没东西可算。
+    git update-ref refs/remotes/origin/main HEAD
+    printf 'two\n' >second.txt
+    git add second.txt
+    git commit -q -m second
+)
+ct_env=(env COGNEVA_BUILD_GATE_LOCK_DIR="${work}/utree-gate" COGNEVA_BUILD_LOCK_FILE="${work}/utree.lock"
+    PATH="${utree}/bin:${PATH}")
+( cd "${utree}" && "${ct_env[@]}" bash deploy/scripts/check-before-push.sh ) >"${work}/cout" 2>&1 ||
+    fail "远端已经含了这一支的那一跑自己红了：没有改动可判不等于判过的那份字节变红了；$(cat "${work}/cout")"
+grep -q '改动键按新基底重记' "${work}/cout" &&
+    fail "远端已经含了这一支，仍按新基底重记改动键（那意味着印了个空的键）；实得：$(grep '记账' "${work}/cout")"
+grep -q '算不出改动键' "${work}/cout" &&
+    fail "空 diff 被说成「算不出改动键」：共同祖先与临时索引都在，缺的是可判的改动；实得：$(grep '记账' "${work}/cout")"
+grep -q '远端在这跑期间已经含了这一支' "${work}/cout" ||
+    fail "收尾没说「远端已经含了这一支」；实得：$(grep '记账' "${work}/cout")"
+grep -q '没有改动键可记' "${work}/cout" ||
+    fail "收尾没把「没有要推的那一段」说成一句自己的话；实得：$(grep '记账' "${work}/cout")"
+
+# 17) 远端那几笔动了**整门自己的输入**（`ci.yml`、门脚本、工具版本）⇒ 变基再干净也不命中：
+#     那一跑判的是旧输入下的结论，这一批要按新输入重判。
+#
+# 「变基照样命中」容易被读成无条件，连记账那一行也这么印。2026-11-11 实测：整门绿的之后
+# 远端改了一格 `ci.yml`，照那句话以为变基就能推，pre-push 判「没验过」，两小时白跑。
+# 这一格让两面同形（patch 逐字相同、变基干净），只让 `ci.yml` 变，问：旧账还命中吗。
+itree="${work}/itree"
+mkdir -p "${itree}/deploy/scripts" "${itree}/.github/workflows"
+stage_gate "${repo}" "${itree}"
+(
+    cd "${itree}" || exit 1
+    git init -q -b main .
+    git config user.email gate@example.invalid
+    git config user.name gate
+    printf 'jobs: {}\n' >.github/workflows/ci.yml
+    printf 'a\n' >f.txt
+    git add .github/workflows/ci.yml f.txt
+    git commit -q -m base
+) || fail "整门输入变了的夹具建不起来"
+ibase="$(git -C "${itree}" rev-parse HEAD)"
+printf 'a\nb\n' >"${itree}/f.txt"
+ikey="$( cd "${itree}" && bash deploy/scripts/check-before-push.sh --key-patch-tree "${ibase}" )" ||
+    fail "--key-patch-tree 在输入变的夹具上退非零"
+[ -n "${ikey}" ] || fail "--key-patch-tree 在输入变的夹具上什么都没印"
+mkdir -p "${itree}/.git/check-before-push"
+printf 'fixture\n' >"${itree}/.git/check-before-push/patch.${ikey}"
+(
+    cd "${itree}" || exit 1
+    git add -A
+    git commit -q -m work
+) || fail "输入变了的夹具提交不掉"
+# 正向对照：输入没动之前，同一份账命中。没有这一格，下面那次「不命中」可能来自别的
+# 原因（基底给错、夹具没搭好），这一格让两边的差别只剩「输入变没变」。
+( cd "${itree}" && bash deploy/scripts/check-before-push.sh --status-patch "${ibase}" ) >"${work}/out" 2>&1 ||
+    fail "输入没动时这批改动就报没验过（夹具本身不对，下面的「不命中」证明不了任何事）：$(cat "${work}/out")"
+(
+    cd "${itree}" || exit 1
+    git checkout -q -b upstream "${ibase}"
+    printf 'jobs: {timeout: 1}\n' >.github/workflows/ci.yml
+    git add .github/workflows/ci.yml
+    git commit -q -m "the gate input moves upstream"
+    git checkout -q main
+    git rebase -q upstream
+) || fail "输入变了的夹具变基没走完"
+if ( cd "${itree}" && bash deploy/scripts/check-before-push.sh --status-patch "$(git -C "${itree}" rev-parse upstream)" ) >"${work}/out" 2>&1; then
+    fail "整门的输入变了（ci.yml）、这批改动逐字没变，旧账仍说验过：那一跑判的是旧输入下的结论"
+fi
+
+echo "ok - before-push 的戳：没验过 / 验过 / 新提交 三种结局分得开，未提交改动不进键；提交前那一问按工作树字节记，改字节或改判据都失效；改动键在干净的变基后仍命中、解冲突后失效、整门输入变了就失效，远端在跑期间追上了这一支时按新基底重记而不是作废、并且变基之后照样命中；远端已经含了这一支时说的是「没有改动可判」而不是「算不出」；键不取决于调用方的 PATH 里有没有 cargo，或 node（后者按版本目录兜底、挑最高的那份）"

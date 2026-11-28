@@ -376,14 +376,29 @@ pub async fn collect(
 pub(crate) async fn merged_tasks(
     state: &GatewayState,
 ) -> Result<Vec<cog_core::Task>, cog_core::SFError> {
-    let mut merged: BTreeMap<String, cog_core::Task> = state
-        .orchestrator
-        .get_all_tasks()
-        .await
+    merged_from(
+        state.orchestrator.as_ref(),
+        state.governance_store.as_deref(),
+    )
+    .await
+}
+
+/// 两个读面共用的那一次合流。
+///
+/// 任务图那一路读**带报错**的那条（[`cog_core::OrchestratorControl::get_all_tasks_checked`]）：
+/// 折成空表之后，「库读不到」与「库里没有活」在读数面上是同一个 `0`，而这一格
+/// 的两个数是给人当结论用的。
+async fn merged_from(
+    orchestrator: &dyn cog_core::OrchestratorControl,
+    store: Option<&dyn cog_core::GovernanceStore>,
+) -> Result<Vec<cog_core::Task>, cog_core::SFError> {
+    let mut merged: BTreeMap<String, cog_core::Task> = orchestrator
+        .get_all_tasks_checked()
+        .await?
         .into_iter()
         .map(|task| (task.id.clone(), task))
         .collect();
-    if let Some(store) = state.governance_store.as_deref() {
+    if let Some(store) = store {
         for task in store.face_nodes().await? {
             merged.entry(task.id.clone()).or_insert(task);
         }
@@ -392,21 +407,100 @@ pub(crate) async fn merged_tasks(
 }
 
 pub async fn read_progress(state: &GatewayState) -> Result<Progress, ApiError> {
-    let tasks = state.orchestrator.get_all_tasks().await;
-    Ok(collect(
-        tasks,
+    progress_from(
+        state.orchestrator.as_ref(),
+        state.governance_store.as_deref(),
         Sources {
-            governance: state.governance_store.as_deref(),
+            // 面节点已经在 `merged_from` 里并过一次；这里再传一遍会读第二趟，
+            // 而两次读之间新落下的行会让这一页自己与自己的合流不一致。
+            governance: None,
             change_ledger: state.change_ledger.as_deref(),
             principle_ledger: state.principle_ledger.as_deref(),
             registry: state.agent_registry.as_deref(),
         },
     )
-    .await?)
+    .await
+}
+
+/// 进度这一页的两步：把行合流，再数成一张账。
+///
+/// 合流走带报错的那条读：折成空表之后，一个读不动库的部署会把「0 条任务、
+/// 0 条未结」印成这一刻的结论——与一个真的没有活的部署逐字同形。
+async fn progress_from(
+    orchestrator: &dyn cog_core::OrchestratorControl,
+    governance: Option<&dyn cog_core::GovernanceStore>,
+    sources: Sources<'_>,
+) -> Result<Progress, ApiError> {
+    let tasks = merged_from(orchestrator, governance).await?;
+    Ok(collect(tasks, sources).await?)
 }
 
 pub async fn progress_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<Progress>, ApiError> {
     Ok(Json(read_progress(&state).await?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cog_core::OrchestratorControl;
+
+    /// 任务图读失败时合流是 `Err`，不是一张空表。
+    ///
+    /// 两个读面把它 `.ok()` 成 `None`，那一支就是 `unread`；一旦这一层把失败折成
+    /// 空表，它们拿到的是 `Ok(vec![])`，工作台上印出来的就是 **0 条活的活**——与
+    /// 「库里真的没有活」逐字同形，而一个要人去查库、一个什么都不用做。
+    #[tokio::test]
+    async fn a_graph_read_that_fails_is_not_an_empty_graph() {
+        let orchestrator = cog_test_support::TaskGraphStub::whose_read_fails("connection refused");
+
+        // 同一个替身，两种读法：折叠的那条说「没有活」，带报错的那条说「读不到」。
+        // 生产实现就是这个形状，读数面要的不是第一个。
+        assert_eq!(orchestrator.get_all_tasks().await, Vec::new());
+
+        let merged = merged_from(&orchestrator, None).await;
+        match merged {
+            Ok(tasks) => panic!("读失败被折成了 {} 条空账", tasks.len()),
+            Err(e) => assert!(
+                e.to_string().contains("connection refused"),
+                "错误要带着为什么，实际是：{e}"
+            ),
+        }
+    }
+
+    /// 进度这一页读不出图时，不是「0 条任务、0 条未结」。
+    ///
+    /// 这一页的两个数给人当结论用。旧读把库故障折成空表，于是读不动库的部署
+    /// 会印出一块空板——与一个真的没有活的部署逐字同形，而一个要人去查库、
+    /// 一个什么都不用做。
+    #[tokio::test]
+    async fn a_progress_page_that_cannot_read_the_graph_is_not_an_empty_board() {
+        let sources = || Sources {
+            governance: None,
+            change_ledger: None,
+            principle_ledger: None,
+            registry: None,
+        };
+        let unreadable = cog_test_support::TaskGraphStub::whose_read_fails("connection refused");
+        let failure = progress_from(&unreadable, None, sources())
+            .await
+            .expect_err("读不出来时这一页要带着错误收口，不能印成一块空板");
+        assert!(
+            failure.message.contains("connection refused"),
+            "拒绝的理由要带原始错误，让人看得出是读失败: {}",
+            failure.message
+        );
+
+        let one = cog_core::Task::new(
+            String::from("t-one"),
+            cog_core::TaskType::DagNode,
+            serde_json::json!({}),
+        );
+        let readable = cog_test_support::TaskGraphStub::holding(vec![one]);
+        let board = progress_from(&readable, None, sources())
+            .await
+            .expect("读得出来时照常印这一页");
+        assert_eq!(board.tasks.rows, 1, "读得出来的那一行要数进去");
+    }
 }

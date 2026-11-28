@@ -226,19 +226,21 @@ else
     bad "没有 --to 那一趟不对（rc=$rc）：$(printf '%s' "$out" | tr '\n' ' ')"
 fi
 
-# 9e. --wait 对一棵**没有** Deployment 的树判不了：等不到东西不等于就绪。
+# 9e. --wait 对一棵**没有** Deployment / StatefulSet 的树判不了：等不到东西不等于就绪。
 # 写死名单时这里会照样「等」那三个名字，然后报 ready——而那一版的树里根本没有它们。
 : > "$WORK/calls"
 out="$(run --repo "$FIX" --to "$old_rev" --profile k3s-airgap --apply --wait)"
 rc=$?
-if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q '一个 Deployment 都没有'; then
-    ok "--wait 在没有 Deployment 的那一版判不了，而不是报 ready"
+if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q '没有 Deployment 或 StatefulSet'; then
+    ok "--wait 在没有可等工作负载的那一版判不了，而不是报 ready"
 else
-    bad "没有 Deployment 的一版没有判不了（rc=$rc）：$(printf '%s' "$out" | tr '\n' ' ')"
+    bad "没有可等工作负载的一版没有判不了（rc=$rc）：$(printf '%s' "$out" | tr '\n' ' ')"
 fi
 
-# 9d. 要等哪几个 Deployment 是从这一版清单里读的：多一个就多等一个。
+# 9d. 要等哪几个工作负载是从这一版清单里读的：多一个就多等一个。
 # 写死三个名字时，第四个既不会被等，也不会被数出来——回滚报 ready 而它还没起来。
+# 同一个夹具里放一条 StatefulSet：只读 Deployment 那一版会把执行器 apply 下去、
+# 然后一眼都不看它就报 ready。
 git -C "$FIX" checkout -q master 2>/dev/null || git -C "$FIX" checkout -q main
 mkdir -p "$FIX/deploy/rendered/k3s-single"
 cat > "$FIX/deploy/rendered/k3s-single/41-deployment.yaml" <<'EOF'
@@ -257,19 +259,24 @@ metadata:
 kind: Deployment
 metadata:
   name: cogneva-registry
+---
+kind: StatefulSet
+metadata:
+  name: cogneva-sandbox-executor
 EOF
 printf 'kind: ConfigMap\nmetadata:\n  name: new\n' > "$FIX/deploy/rendered/k3s-single/10-configmap.yaml"
-git -C "$FIX" add deploy/rendered && git -C "$FIX" commit -qm "a fourth workload"
+git -C "$FIX" add deploy/rendered && git -C "$FIX" commit -qm "a fourth workload and a statefulset"
 extra_rev="$(git -C "$FIX" rev-parse HEAD)"
 : > "$WORK/calls"
 out="$(run --repo "$FIX" --to "$extra_rev" --apply --wait)"
 rc=$?
 if [ "$rc" -eq 0 ] && [ "$(grep -c 'rollout status deployment/' "$WORK/calls")" -eq 4 ] \
+   && grep -q 'rollout status statefulset/cogneva-sandbox-executor' "$WORK/calls" \
    && grep -q 'deployment/cogneva-registry' "$WORK/calls" \
-   && printf '%s' "$out" | grep -q 'deployments=4'; then
-    ok "要等的 Deployment 从这一版清单里读：多出来的那个也被等、也被数"
+   && printf '%s' "$out" | grep -q 'workloads=5'; then
+    ok "要等的工作负载从这一版清单里读：多的那个与换了种的都被等、都被数"
 else
-    bad "第四个 Deployment 没被等（rc=$rc）：$(cat "$WORK/calls" 2>/dev/null | tr '\n' ' ')"
+    bad "第四个工作负载或 StatefulSet 没被等（rc=$rc）：$(cat "$WORK/calls" 2>/dev/null | tr '\n' ' ')"
 fi
 
 printf '\nrollback.test: %s passed, %s failed\n' "$pass" "$fail"

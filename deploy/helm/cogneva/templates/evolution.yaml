@@ -198,10 +198,10 @@ spec:
         app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
     spec:
       serviceAccountName: cogneva-evolution
-      {{- /* 与主应用同一对：这个 Pod 也跑 agent 回合（实测 2026-11-09 它的
+      {{- /* 与主应用同一格：这个 Pod 也跑 agent 回合（实测 2026-11-09 它的
       self-signal-alert-* planner 与主应用的 generator 同时在飞）。没有这一格，
-      进化 Pod 被滚动时宽限期停在默认 30 秒，进程的排空预算还没走完就被 SIGKILL，
-      清单上却看起来「已经做了」。 */}}
+      进化 Pod 被滚动时宽限期停在 kubelet 默认，进程的排空预算由这一格算出、也不会
+      比它长。 */}}
       terminationGracePeriodSeconds: {{ .Values.shutdown.terminationGraceSeconds }}
       securityContext:
         {{- /* lit: 0 fixed — the evolution workload runs as root to drive host-path workspaces */}}
@@ -215,24 +215,19 @@ spec:
           command:
             - sh
             - -c
-            {{- /* lit: 124 fixed — coreutils timeout's exit status; a shell contract, not a dial */}}
             - |
               set -e
               git config --global --add safe.directory /host-git
-              git config --global --add safe.directory /opt/cogneva/sandbox/workspaces
+              git config --global --add safe.directory {{ .Values.evolution.workspaces.root }}
               # 镜像按序尝试，第一个可达的胜出：可达性按主机不对称（实测本集群
               # github 间歇黑洞、gitee 秒级应答），只配一个地址时该主机不可达期间
               # 既 seed 不出空卷、也刷不到新 release tag。
-              # http.connectTimeout/lowSpeed 给网络操作兜底，否则离线时 git 会
-              # 长时间挂在连接上拖慢 Init 与整 Pod 就绪。
-              # 但连接超时与低速阈值管不住"带宽很低但在动"的传输：实测一次
-              # fetch 跑了 14 分钟没完，把整段启动预算吃光、Pod 被判启动超时
-              # （一次网络慢被记成版本缺陷）。所以每个走公网的 git 调用再加一层
-              # 挂钟上界：单次尝试最多 `workspaceFetch.timeoutSecs` 秒（实测正常读数秒级到几十秒，取数倍
-              # 余量）。超了就当这个镜像不可用、走下面已有的失败分支，语义不变。
-              # 代价：真的很大的传输可能一次传不完而被放弃，下一轮从零再来（被杀
-              # 掉的 fetch 不落 refs），极端网络下裸仓会停在旧 main——启动可用性
-              # 优先于基线新鲜度，与"全部镜像失败不阻塞启动"同向。
+              # 这里的界全是「网络还在不在动」：`http.connectTimeout` 管镜像根本
+              # 不答，`http.lowSpeedLimit/lowSpeedTime` 管传输速率掉到
+              # `workspaceFetch.lowSpeedLimitBytesPerSec` 以下、并一直持续到
+              # `workspaceFetch.lowSpeedSecs`。没有一道按「跑了多久」收尾的钟——实测
+              # 一次 fetch 在很慢但仍在推进的链路上一度跑到十四分钟，按挂钟砍掉它只是
+              # 把已经传过的字节作废、下一轮从零再来。真死的传输由 git 自己那两条界判。
               mirrors="{{ join "," .Values.evolution.gitRemote.seedUrls }}"
               # gitRemote.mode=pvc 时首挂是空卷，从公开仓库 seed；
               # hostPath 模式宿主已预 seed，本步自动跳过。
@@ -241,20 +236,16 @@ spec:
                 for m in $(echo "$mirrors" | tr ',' ' '); do
                   echo "git-remote is empty; seeding bare repo from $m ..."
                   rc=0
-                  /usr/bin/timeout {{ .Values.workspaceFetch.timeoutSecs }} git -c http.connectTimeout={{ .Values.workspaceFetch.connectTimeoutSecs }} -c http.lowSpeedLimit={{ .Values.workspaceFetch.lowSpeedLimitBytesPerSec }} -c http.lowSpeedTime={{ .Values.workspaceFetch.lowSpeedSecs }} clone --bare "$m" /tmp/seed.git || rc=$?
+                  git -c http.connectTimeout={{ .Values.workspaceFetch.connectTimeoutSecs }} -c http.lowSpeedLimit={{ .Values.workspaceFetch.lowSpeedLimitBytesPerSec }} -c http.lowSpeedTime={{ .Values.workspaceFetch.lowSpeedSecs }} clone --bare "$m" /tmp/seed.git || rc=$?
                   if [ "$rc" = 0 ]; then
                     cp -a /tmp/seed.git/. /host-git/
                     rm -rf /tmp/seed.git
                     break
                   fi
-                  if [ "$rc" = 124 ]; then
-                    echo "WARN: git-remote seed from $m gave up after the {{ .Values.workspaceFetch.timeoutSecs }}s bound (transfer slower than the bound, or the mirror never answered)"
-                  else
-                    echo "WARN: git-remote seed from $m failed (rc=$rc)"
-                  fi
+                  echo "WARN: git-remote seed from $m failed (rc=$rc)"
                   rm -rf /tmp/seed.git
                 done
-                [ -f /host-git/HEAD ] || echo "WARN: git-remote seed failed on every mirror (no mirror answered within the bound); starting without a seeded baseline"
+                [ -f /host-git/HEAD ] || echo "WARN: git-remote seed failed on every mirror (no mirror answered); starting without a seeded baseline"
               fi
               if [ -f /host-git/HEAD ]; then
                 # bare 保持一个指向上游的 upstream remote，启动时拉最新 main 与
@@ -264,21 +255,17 @@ spec:
                   git --git-dir=/host-git remote remove upstream 2>/dev/null || true
                   git --git-dir=/host-git remote add upstream "$m"
                   rc=0
-                  /usr/bin/timeout {{ .Values.workspaceFetch.timeoutSecs }} git --git-dir=/host-git -c http.connectTimeout={{ .Values.workspaceFetch.connectTimeoutSecs }} -c http.lowSpeedLimit={{ .Values.workspaceFetch.lowSpeedLimitBytesPerSec }} -c http.lowSpeedTime={{ .Values.workspaceFetch.lowSpeedSecs }} fetch upstream --tags --force || rc=$?
+                  git --git-dir=/host-git -c http.connectTimeout={{ .Values.workspaceFetch.connectTimeoutSecs }} -c http.lowSpeedLimit={{ .Values.workspaceFetch.lowSpeedLimitBytesPerSec }} -c http.lowSpeedTime={{ .Values.workspaceFetch.lowSpeedSecs }} fetch upstream --tags --force || rc=$?
                   if [ "$rc" = 0 ]; then
                     break
                   fi
-                  if [ "$rc" = 124 ]; then
-                    echo "WARN: fetch upstream tags from $m gave up after the {{ .Values.workspaceFetch.timeoutSecs }}s bound (transfer slower than the bound, or the mirror never answered); trying the next mirror"
-                  else
-                    echo "WARN: fetch upstream tags from $m failed (rc=$rc); trying the next mirror"
-                  fi
+                  echo "WARN: fetch upstream tags from $m failed (rc=$rc); trying the next mirror"
                 done
               fi
               # 工作树由分配器按需从裸仓库切出（零克隆、共享对象库），这里只清掉
               # 崩溃留下的孤儿登记，并备好工作树根目录（app 容器的 workingDir）。
               git --git-dir=/host-git worktree prune
-              mkdir -p /opt/cogneva/sandbox/workspaces
+              mkdir -p {{ .Values.evolution.workspaces.root }}
           volumeMounts:
             - name: source
               mountPath: /opt/cogneva/sandbox/src
@@ -290,7 +277,7 @@ spec:
         - name: cogneva
           image: {{ include "cogneva.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          workingDir: /opt/cogneva/sandbox/workspaces
+          workingDir: {{ .Values.evolution.workspaces.root }}
           # 特权容器 = 文件系统沙盒边界（3.2 image-based 滚动更新后移除）
           securityContext:
             privileged: true
@@ -304,6 +291,7 @@ spec:
                 name: cogneva-evolution-config
           env:
             {{- include "cogneva.timeEnv" . | nindent 12 }}
+            {{- include "cogneva.drainBudgetEnv" . | nindent 12 }}
             - name: COGNEVA_CONFIG_PATH
               value: "/etc/cogneva/cogneva.json"
             # 本 Pod 的名字：按变更派出的执行 Job 要跑**同一份代码**，而"同一份"
@@ -370,7 +358,7 @@ spec:
             # 不配这一条不会「不抬」，而是每一拍都读成 unmeasured：没有读数就不下判据，
             # 那些卷停在 values 里的声明上，涨到头来要靠人改。
             - name: COGNEVA_CLAIM_STORE_METRICS_URL
-              value: {{ printf "http://cogneva-claim-store.%s.svc:%d/metrics" (include "cogneva.namespace" .) (int .Values.claimStore.port) | quote }}
+              value: {{ printf "http://cogneva-claim-store.%s.svc:%d%s" (include "cogneva.namespace" .) (int .Values.claimStore.port) .Values.observability.metricsPath | quote }}
             {{- end }}
             {{- if .Values.clusterRegistry.enabled }}
             # 集群内 registry 的卷不归本 Pod 写，走查也不在它的挂载表里：本 Pod 的
@@ -438,7 +426,7 @@ spec:
               value: {{ printf "http://cogneva-security-gateway:%d" (int .Values.securityGateway.llmProxyPort) | quote }}
             - name: COGNEVA_GIT_PROXY_BASE
               value: {{ printf "http://cogneva-security-gateway:%d/git" (int .Values.securityGateway.llmProxyPort) | quote }}
-            # 内存 Raw 层的面（归档工具的巨量输出 + 取引用读回），零凭证。指向主应用
+            # 内存 Raw 层的面（每次工具调用整份归档 + 取引用读回），零凭证。指向主应用
             # 的**内部端口** 8085，不是主 API 的 8080：8080 上那几条按角色判，本 Pod
             # 零凭证恒吃 401。本 Pod 的 egress 是白名单，少了 network-policy 里那一条
             # 端口放行，归档请求会被静默丢弃。与主应用那份同源。
@@ -504,7 +492,7 @@ spec:
                   - -c
                   - |
                     git config --global --add safe.directory /host-git
-                    git config --global --add safe.directory /opt/cogneva/sandbox/workspaces
+                    git config --global --add safe.directory {{ .Values.evolution.workspaces.root }}
           ports:
             - name: http
               containerPort: {{ .Values.gateway.httpPort }}
@@ -545,7 +533,8 @@ spec:
               readOnly: true
             {{- end }}
             {{- if .Values.gitops.helmBin.enabled }}
-            # 部署准入条件（chart 渲染 + parity）在判定进程里跑，helm 来自宿主。
+            # 部署准入条件（chart 渲染 + parity）在判定进程里跑；镜像自带钉版 helm，
+            # 这一挂只在属主显式要求用宿主那把时打开。
             - name: helm-bin
               mountPath: /usr/local/bin/helm
               readOnly: true

@@ -76,6 +76,12 @@ EOF
 cat >"${unit_dir}/${unit_name}.timer" <<'EOF'
 [Unit]
 Description=Release the host build cache when the disk is above the trigger
+# 自足门的驱动者声明：这个单元驱动哪条战线、怎么看出它停了。门的正本是任务图里的
+# `driver` 节点；装机时 `cogneva-drivers-roster.sh --import` 读这几行把它灌进图。
+X-Cogneva-Front=资源管理
+X-Cogneva-Driver-Kind=machine
+X-Cogneva-Stopped-Reading=systemctl --user show cogneva-host-target-gc.service -p ExecMainStatus（上次运行结果）
+X-Cogneva-Hosts=platform
 
 [Timer]
 # 相位来自 phase_minute：同一周期的两个 timer 落在同一个分钟，每一拍都会撞在一起，

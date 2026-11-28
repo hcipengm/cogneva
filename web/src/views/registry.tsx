@@ -1,17 +1,25 @@
+import { ActionPlansView } from '@/views/ActionPlansView';
 import { AlertsView } from '@/views/AlertsView';
 import { AuditView } from '@/views/AuditView';
 import { CapabilitiesView } from '@/views/CapabilitiesView';
 import { ChangesView } from '@/views/ChangesView';
 import { CommsView } from '@/views/CommsView';
+import { DatasetsView } from '@/views/DatasetsView';
 import { DeliveryView } from '@/views/DeliveryView';
 import { DiffView } from '@/views/DiffView';
 import { EvalView } from '@/views/EvalView';
 import { FilesView } from '@/views/FilesView';
 import { FlowView } from '@/views/FlowView';
 import { GovernanceView } from '@/views/GovernanceView';
+import { HooksView } from '@/views/HooksView';
 import { InboxView } from '@/views/InboxView';
+import { KeysView } from '@/views/KeysView';
 import { ObservabilityView } from '@/views/ObservabilityView';
+import { SearchView } from '@/views/SearchView';
+import { SnapshotsView } from '@/views/SnapshotsView';
+import { WikiView } from '@/views/WikiView';
 import { OutputView } from '@/views/OutputView';
+import { PluginsView } from '@/views/PluginsView';
 import { ProgressView } from '@/views/ProgressView';
 import { PeopleView } from '@/views/PeopleView';
 import { ProjectsView } from '@/views/ProjectsView';
@@ -24,6 +32,7 @@ import { TimelineView } from '@/views/TimelineView';
 import { VenuesView } from '@/views/VenuesView';
 import { TokenView } from '@/views/TokenView';
 import { WorkbenchView } from '@/views/WorkbenchView';
+import { WorkspacesView } from '@/views/WorkspacesView';
 import { Empty } from '@/ui/primitives';
 
 /**
@@ -77,8 +86,26 @@ export function ViewFor({ view }: { view: string }) {
       return <CapabilitiesView />;
     case 'output':
       return <OutputView />;
+    case 'snapshots':
+      return <SnapshotsView />;
+    case 'hooks':
+      return <HooksView />;
+    case 'plugins':
+      return <PluginsView />;
+    case 'workspaces':
+      return <WorkspacesView />;
+    case 'action-plan':
+      return <ActionPlansView />;
+    case 'datasets':
+      return <DatasetsView />;
+    case 'search':
+      return <SearchView />;
+    case 'wiki':
+      return <WikiView />;
     case 'observability':
       return <ObservabilityView />;
+    case 'keys':
+      return <KeysView />;
     case 'token':
       return <TokenView />;
     case 'resources':

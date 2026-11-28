@@ -213,17 +213,19 @@ fn runtime(
     let (tx, rx) = mpsc::channel::<AgentEvent>(256);
     let agent = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: agent_id.into(),
             role: "worker".to_string(),
             max_iterations: 4,
-            context_window_size: 60_000,
+            context_window_size: Some(60_000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 30,
             skill_config: None,
             crew_id: None,
             squad_id: None,
             owner_task_id: Some(task_id.to_string()),
+            deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         tx,
     )
@@ -300,7 +302,7 @@ async fn a_run_records_the_conversation_in_the_order_that_makes_resume_possible(
         .unwrap()
         .first()
         .cloned()
-        .unwrap_or_default();
+        .unwrap_or(Default::default());
     assert!(
         !first_request.iter().any(|m| matches!(
             m,

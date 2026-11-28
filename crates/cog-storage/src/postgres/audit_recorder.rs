@@ -17,9 +17,9 @@ pub const DDL: &str = r#"
                 reason TEXT,
                 rule TEXT,
                 input_hash TEXT NOT NULL,
-                messages JSONB,
+                messages TEXT,
                 response TEXT,
-                tool_call JSONB
+                tool_call TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_guard_audit_timestamp ON cog_guard_audit_log(timestamp);
             CREATE INDEX IF NOT EXISTS idx_guard_audit_verdict ON cog_guard_audit_log(verdict);
@@ -62,9 +62,9 @@ impl PostgresAuditRecorder {
         check_type: CheckType,
         result: &GuardResult,
         input_hash: String,
-        messages: Option<serde_json::Value>,
+        messages: Option<String>,
         response: Option<String>,
-        tool_call: Option<serde_json::Value>,
+        tool_call: Option<String>,
     ) {
         let (verdict, reason, rule) = match result {
             GuardResult::Pass => ("pass".to_string(), None, None),
@@ -111,8 +111,9 @@ impl PostgresAuditRecorder {
 #[async_trait]
 impl GuardAuditRecorder for PostgresAuditRecorder {
     async fn record_input_check(&self, messages: &[Message], result: &GuardResult) {
-        let messages_json =
-            serde_json::to_value(messages.iter().map(|m| m.content()).collect::<Vec<_>>()).ok();
+        let messages_json = cog_core::logged_ok!(serde_json::to_string(
+            &messages.iter().map(|m| m.content()).collect::<Vec<_>>()
+        ));
         self.insert(
             "composite",
             CheckType::Input,
@@ -139,7 +140,7 @@ impl GuardAuditRecorder for PostgresAuditRecorder {
     }
 
     async fn record_tool_check(&self, tool: &ToolCall, result: &GuardResult) {
-        let tool_json = serde_json::to_value(tool).ok();
+        let tool_json = cog_core::logged_ok!(serde_json::to_string(tool));
         self.insert(
             "composite",
             CheckType::ToolCall,

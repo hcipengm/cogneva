@@ -227,7 +227,7 @@ impl BroadcastDispatcher {
 #[async_trait]
 impl cog_core::NotificationDispatcher for BroadcastDispatcher {
     async fn dispatch(&self, notification: &cog_core::Notification) -> cog_core::SFResult<()> {
-        let _ = self.tx.send(notification.clone());
+        cog_core::ignore_lost!(self.tx.send(notification.clone()));
         Ok(())
     }
 }

@@ -6,7 +6,8 @@ use tokio::sync::broadcast;
 use cog_core::{AlertSeverity, SupervisorEvent};
 
 /// Maximum number of alerts retained in memory.
-// cap: bound — 内存里最多留多少条告警；更久的历史读的是落盘的那本账
+// cap: fixed — 内存里最多留多少条告警；更久的历史读的是落盘的那本账
+// keep: 删掉后内存里的告警无界，落盘那本账之外再长一份；由「更久的历史读的是落盘的那本账」兜住
 pub const ALERT_HISTORY_MAX: usize = 10_000;
 
 /// A single alert entry derived from a SupervisorEvent.

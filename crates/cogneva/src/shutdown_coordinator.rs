@@ -84,7 +84,7 @@ impl ShutdownCoordinator {
             }
             #[cfg(not(unix))]
             {
-                let _ = tokio::signal::ctrl_c().await;
+                cog_core::ignore_lost!(tokio::signal::ctrl_c().await);
             }
             signal.trigger();
         })
@@ -112,6 +112,7 @@ impl ShutdownCoordinator {
         let timeout = tokio::time::Duration::from_millis(self.timeout_ms);
         let futures: Vec<_> = hooks.into_iter().map(|h| h()).collect();
 
+        // wall: 等=各 hook 的收尾 / 等不到=照常退出，未完成的部分由重启从持久位置接着做 / 续跑=能，重启后接着做
         let result = tokio::time::timeout(timeout, futures::future::join_all(futures)).await;
         if result.is_err() {
             // Hooks timed out; we exit anyway to avoid hanging.

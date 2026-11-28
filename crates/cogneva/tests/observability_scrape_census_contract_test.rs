@@ -15,29 +15,40 @@
 //! process, so there are no rows to leave behind and no registry to be in.
 //! Those names are served on the scrape exactly like the stored ones, and
 //! nothing about publishing one makes anyone notice it. A name a producer
-//! renders and no face records is a reading on the wire that no rule can name,
-//! no panel draws, and no table points back at its producer -- and every one of
-//! those absences is silent, because the series itself is right there.
+//! renders and no face records is a reading on the wire that no rule names,
+//! nothing decides on, and no table traces back to its producer -- and every
+//! one of those absences is silent, because the series itself is right there.
 //!
 //! So this walks that population. The denominator is every series name the
 //! source tree publishes, read from the two shapes a producer uses:
 //! `pub const <ident>: &str = "cogneva_..."` and `RawMetric::new("cogneva_...")`.
 //! Each one must land on a face, or be given a verdict below.
 //!
-//! The faces, in the order they were added: the closed set, which is what the
-//! store can hold; the chart's alert rules, which is what can wake someone; the
-//! Grafana manifest's panels, which is what a person looking at the stack sees;
-//! and the two contract tests' own produced tables, which name the file that
-//! publishes each series and are what a rule or a panel is licensed against.
-//! The tables are read out of those files rather than copied here, because a
-//! copy would be a second answer to "which series does this workspace produce"
-//! -- the drift those tables exist to prevent. Renaming one fails this test
-//! loudly instead of emptying a face in silence.
+//! The faces: the closed set, which is what the store can hold; the readings
+//! the decision surface queries, which is where a number is compared to
+//! something; the chart's alert rules, which is what can wake someone; and the
+//! alert-rule contract test's own produced table, which names the file that
+//! publishes each series and is what a rule is licensed against. The table is
+//! read out of that file rather than copied here, because a copy would be a
+//! second answer to "which series does this workspace produce" -- the drift the
+//! table exists to prevent. Renaming it fails this test loudly instead of
+//! emptying a face in silence.
 //!
-//! The last two are not the same kind of face as the first three. A rule and a
-//! panel read a series; a table records who publishes it. A series carried by a
-//! table and by nothing else is registered, not read, and the difference is its
-//! own count below -- otherwise the union would read as coverage.
+//! Panels used to be a face of their own and are not one any more: since
+//! `eeed08952` (2026-11-15) the gateway computes a panel for every renderable
+//! series, so "a panel draws it" is true about all of them and distinguishes
+//! nothing. The panel-shaped settlements recorded further down are history of
+//! that arrangement. The names they settled were re-counted rather than
+//! dropped: `8571eee7a` measured the population whose only surface is that
+//! drawing at 97 published and 68 store-backed series (7 and 41 while the
+//! hand-written dashboard counted as a reader), and `385639c06` replaced that
+//! number with a decision per unread series, filed beside the file that
+//! publishes it.
+//!
+//! The faces are not interchangeable. A rule or a reading queries a series; a
+//! table records who publishes it. A series carried by a table and by nothing
+//! else is registered, not read, and the difference is its own count below --
+//! otherwise the union would read as coverage.
 //!
 //! The ceiling, so a reader does not have to guess it. A name built at run time
 //! (`format!`, `concat!`) has no literal to parse and is outside the
@@ -59,11 +70,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::common;
 
+use common::declared_once::literal_values;
 use common::routes::{read_repo, repo_root};
 use common::rust_production::{all_crate_files, production_sources, production_text};
 use common::service_topology;
 
-use crate::dashboard;
 use crate::promql;
 use crate::unread;
 
@@ -86,8 +97,6 @@ const MIN_SHIPPED_QUERY_NAMES: usize = 2;
 /// this workspace produces.
 const ALERT_RULE_CONTRACT: &str = "crates/cogneva/tests/observability_alert_rule_contract_test.rs";
 const ALERT_TABLE_OPENS: &str = "const PRODUCED: &[(&str, &str)] = &[";
-const DASHBOARD_CONTRACT: &str = "crates/cogneva/tests/observability_dashboard_contract_test.rs";
-const DASHBOARD_TABLE_OPENS: &str = "const PRODUCED: &[(&str, &[&str], &str)] = &[";
 
 /// Names that look like series and are not, so the scan below does not read
 /// them as a producer. Each is a different kind of exception: a table name, a
@@ -104,6 +113,26 @@ const DASHBOARD_TABLE_OPENS: &str = "const PRODUCED: &[(&str, &[&str], &str)] = 
 /// exempted from a census that would otherwise have demanded a verdict, and
 /// nothing can tell such an entry apart from a real table name.
 const NOT_A_SERIES: &[(&str, &str)] = &[
+    (
+        "cogneva_clippy_last_green_timestamp_seconds",
+        "a timestamp the clippy gate publishes from its own run; the name in this tree is a fixture of that verdict, not a production write point",
+    ),
+    (
+        "cogneva_clippy_verdict_observed_timestamp_seconds",
+        "the same family: the moment a clippy verdict was observed, published by the run that judged it",
+    ),
+    (
+        "cogneva_event",
+        "the table the event stream lives in, declared in cog-storage/src/table_shapes.rs; the live scrape carries no series of that name",
+    ),
+    (
+        "cogneva_probe_total",
+        "a fixture series: the projection-rebuild case publishes it to prove a counter rebuilds, and no production write point uses the name",
+    ),
+    (
+        "cogneva_probe_seconds",
+        "the same fixture, the histogram half: it exists so the rebuild case can prove bucket families rebuild, not to be scraped",
+    ),
     (
         "cogneva_owner_leases",
         "the Postgres table the owner-lease rows live in, declared as LEASE_TABLE in cog-storage/src/owner_lease.rs; the live scrape carries no series of that name",
@@ -160,7 +189,7 @@ const DERIVED_SUFFIXES: &[&str] = &["_bucket", "_sum", "_count", "_observed_time
 /// means a face is owed and missing, so when one is written the entry leaves
 /// the table.
 ///
-/// The `Gap` count is pinned by `GAPS_AT_SCRAPE_CENSUS`, and the two `Elsewhere`
+/// The `Gap` count is pinned by `GAPS_AT_SCRAPE_CENSUS`, and the `Elsewhere`
 /// readers are looked up in the faces rather than counted in the words of the
 /// reason. Both are the same discipline the reader-face census applies to the
 /// closed set, on a population it cannot see: a name the store never holds has
@@ -302,6 +331,22 @@ const UNREGISTERED: &[(&str, Unread)] = &[
     // rather than as `NotAReading` because each one does carry a fact -- a
     // share of the graph and the moment it was measured -- and as gaps rather
     // than `Elsewhere` because no face reads that fact anywhere today.
+    // The flight's age lost its reader on 2026-11-11, when the wall it was
+    // compared against went out with the rest of the clock-based stops. The
+    // pair was `cogneva_evolution_change_flight_seconds` against
+    // `cogneva_evolution_change_flight_budget_seconds`, and both the rule and
+    // the budget series are gone: each step of the flight is stopped by whether
+    // it is moving, so a flight that waits out a long build slot and then runs
+    // a long test is healthy, and a line on the total went red on exactly those
+    // flights. The age is still published, to be read beside the step errors;
+    // what it is owed is not a reader but a bound, and no bound exists once each
+    // step carries its own measured window. Filed as a gap rather than as
+    // `NotAReading` because the age does carry a fact, and rather than as
+    // `Elsewhere` because no face states it.
+    (
+        "cogneva_evolution_change_flight_seconds",
+        Unread::Gap("how long the change now in the flight has been in it, with no rule on it since the flight's wall was removed: each step of the flight is now stopped when it stops moving, so the total has no duration above which a still-stepping flight is stuck, and the reading is left to be read beside the step errors"),
+    ),
     (
         "cogneva_project_control_coverable_rows",
         Unread::Gap("how many rows the earned-value arithmetic could cover, published with no reader since the baseline alert came off; the reader owed here is the estimator's own skip counter, not an alert on a cold-start population"),
@@ -313,6 +358,22 @@ const UNREGISTERED: &[(&str, Unread)] = &[
     (
         "cogneva_project_control_coverage_measured_unix",
         Unread::Gap("when the pair above was last measured, and it has no reader either -- so nothing today separates a measured zero from a frozen one; the same estimator-side reader is what will read it"),
+    ),
+    // Two counters published beside the build-target scan. Each walk states the
+    // cadence it keeps and the cap it derived, because a number that stopped
+    // changing and a loop that stopped are the same number on the gauge beside
+    // them. Nothing reads either count yet, and the reader owed is one rule for
+    // both: an increase over a multiple of the interval the same family
+    // publishes, so a walk that has not run in that window is told apart from
+    // one whose cap and interval simply did not move. No bound beyond that
+    // comparison is owed -- the counts are pulses, not levels.
+    (
+        "cogneva_build_target_scan_interval_evaluations_total",
+        Unread::Gap("one per walk of the build-cache scan, published so a cadence that stopped changing is distinguishable from a loop that stopped; no rule reads it yet, and the reader owed is an increase over a multiple of the interval beside it"),
+    ),
+    (
+        "cogneva_build_target_cap_evaluations_total",
+        Unread::Gap("one per walk that derived its cap from its own measurement, beside the interval counter for the same reason; unread today, so a derivation that quietly stopped repeats the same cap into a reading nobody sees change"),
     ),
     // Published on 2026-10-28 by the change that started timing each startup
     // phase instead of only weighing it. Its sibling `cogneva_boot_rss_bytes`
@@ -379,13 +440,13 @@ const UNREGISTERED: &[(&str, Unread)] = &[
     // another boot, and called that "not a metric's job". Half of it holds and
     // half of it was the debt talking: a *bound* is still wrong here, for
     // exactly the reasons above, but "read this boot against another" is a
-    // reader, and a panel is the reader for it. Startup cannot be seen to
+    // reader, and a panel was then the reader for it. Startup cannot be seen to
     // settle until something draws it settling, so waiting for that evidence
-    // before writing the panel would have waited forever. The panel draws the
+    // before writing the panel would have waited forever. The panel drew the
     // series per phase with one segment per boot, which is the comparison the
     // entry asked for; the bound stays unwritten, which is what the
-    // measurement said. Nothing was exempted -- the entry is gone because a
-    // reader now exists, and the reader is the dashboard's own check.
+    // measurement said. Nothing was exempted -- the entry went when a reader
+    // existed, and that reader was the dashboard's own check.
     // Two names that had a `Gap` here until panels were written to carry them,
     // and the reason they came off this table is the reason the debts were real:
     //   `cogneva_volume_capacity_bytes` -- the growth loop's `declared` and
@@ -398,6 +459,29 @@ const UNREGISTERED: &[(&str, Unread)] = &[
     //   and says nothing about the spread, and an overridden ceiling is the case
     //   where it says only that; the panel draws the four against the ceiling in
     //   force.
+    // The chat intent entry's three counters, published on 2026-11-24 with the
+    // path that writes them. The pair that matters is `failures` against
+    // `unwired`: a turn whose sentence did not land is still answered in the
+    // conversation, so nothing downstream can tell it from a turn that was
+    // never a request at all -- which is the exact shape of the bug this entry
+    // exists to close, one level down. The reader owed is a rule on both, an
+    // increase over the alert window, so a store refusing writes or a process
+    // assembled without a sink reaches a person instead of sitting in
+    // `/metrics` unread; `received` is the denominator those two shares are read
+    // against. No panel is owed for them today -- at zero traffic a drawn line is
+    // the only thing that moves, and that is not what these say.
+    (
+        "cogneva_intent_received_total",
+        Unread::Gap("one per chat turn that was asked to land as an intent, the denominator the two counters below are read against; nothing draws it yet, and on its own it answers only whether the entry is in use"),
+    ),
+    (
+        "cogneva_intent_receive_failures_total",
+        Unread::Gap("turns whose intent write was refused by the store; unread today, which is the bad case here -- the conversation is answered either way, so a store refusing every write is invisible until something reads this beside its denominator, and the reader owed is a rule on the increase over the alert window"),
+    ),
+    (
+        "cogneva_intent_unwired_total",
+        Unread::Gap("turns that met a process with no intent sink installed, which is an assembly mistake rather than a store fault and is why it is a counter of its own; unread today, and the reader owed is the same rule on the increase, so an assembled-without-a-sink deploy is told apart from one that simply had no traffic"),
+    ),
 ];
 
 /// How many `Gap` entries this census left.
@@ -525,32 +609,52 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// behind its own commentary. The debt is real -- nothing draws those three --
 /// and the reader they are owed is on the producing side rather than in a
 /// rule.
-const GAPS_AT_SCRAPE_CENSUS: usize = 3;
+/// Back to six on 2026-11-14: the build-target scan's two evaluation counters
+/// arrived with the loop that publishes them. They are the pair that makes a
+/// stalled derivation visible -- the cap and the interval hold the same value
+/// whether the walk is still running or not, and these two move only when it
+/// is -- so the debt is a reader rather than a threshold, and it is filed here
+/// instead of exempted because the count is exactly the reading a person would
+/// expect to find drawn.
+///
+/// Back to nine on 2026-11-24: the chat intent entry publishes three counters
+/// and nothing reads them. The debt is filed rather than waived for the reason
+/// the entry itself exists -- a chat turn that did not land as an intent looks
+/// exactly like a turn that was never a request, and the counter that says so
+/// is worthless while nobody reads it. The reader owed for the two that matter
+/// is a rule on the increase over the alert window; the third is their
+/// denominator.
+const GAPS_AT_SCRAPE_CENSUS: usize = 9;
 
 /// How many scrape-only series are carried by a produced table and by nothing
 /// that reads them.
 ///
-/// A registration is not a reader. The two produced tables say which file
-/// publishes a series, and a rule or a panel is licensed against them -- but a
-/// name can sit in a table forever with nothing drawing it, which is the state
-/// the dashboard contract's own comment describes for the signal watcher ("no
-/// panel draws these yet ... recorded here so their names and their producer
-/// stay pinned together until something does draw them"). That is a decision
-/// someone made, and this number is what keeps it visible as a decision rather
-/// than letting it read as a covered series.
+/// The dated entries below are the record of that count while it was a pinned
+/// number; `385639c06` retired the number, so read them as the history of why
+/// each name left it, not as a standing claim about today's tree.
 ///
-/// So the three faces are not interchangeable and this is the count that says
-/// so: the closed set is a face for the store, a rule or a panel is a face for a
-/// reader, and a table is a face for the producer. Collapsing the three into one
-/// "is it on anything" would have made these indistinguishable from a series a
-/// rule watches.
+/// A registration is not a reader. The produced table names the file that
+/// publishes a series, and a rule is licensed against it -- but a name can sit
+/// in a table forever with nothing reading it. That is a decision someone made
+/// (keep a name and its producer pinned together until something reads it), and
+/// the test below is what keeps it visible as a decision rather than letting it
+/// read as a covered series. Its terminal state is the empty list, not a
+/// number: `385639c06` replaced the pinned count with "say which decision this
+/// unread series belongs to", so a name that nothing reads has to be filed
+/// under a decision in its own file rather than summed into a total.
+///
+/// The faces are not interchangeable and that is what the per-series verdict
+/// says: the closed set is a face for the store, a rule or a reading is a face
+/// for a reader, and a table is a face for the producer. Collapsing them into
+/// one "is it on anything" would have made these indistinguishable from a
+/// series a rule watches.
 ///
 /// Eight, and the eighth is the reason the reader set is built from query
-/// expressions: `cogneva_build_target_rewrite_window_seconds` occurs in the
+/// expressions: `cogneva_build_target_rewrite_window_seconds` occurred in the
 /// dashboard manifest exactly once, in the prose of another panel's
 /// description -- "the window travels beside the count as ..." -- so a reading
-/// that asks "does this name occur in the file" counts it as drawn, and a
-/// reading that parses the queries does not. That is the difference between the
+/// that asked "does this name occur in the file" counted it as drawn, and a
+/// reading that parses the queries did not. That is the difference between the
 /// two, measured on the first run of this test.
 ///
 /// Seventeen once, and the nine that took it there were the discovery loop's
@@ -558,11 +662,11 @@ const GAPS_AT_SCRAPE_CENSUS: usize = 3;
 /// and they arrived registered rather than filed as gaps: a series newly on the
 /// wire is owed a reader of the population, and naming its producer is what
 /// keeps the nine from drifting apart while that reader is written. The reader
-/// exists now -- the dashboard's "Discovery Probe Exits" panel draws the nine
+/// arrived -- the dashboard's "Discovery Probe Exits" panel drew the nine
 /// against each other, which is the reading the re-measure recipe next to the
 /// probe deadline asks for -- so they leave this count together, the way they
-/// joined it. Their rows stay in the produced table, because a panel reading a
-/// series is exactly what that table licenses. Eight again, and the eighth is
+/// joined it. Their rows stayed in the produced table, because a panel reading
+/// a series was then what that table licensed. Eight again, and the eighth is
 /// still the prose-versus-query distinction above.
 ///
 /// Nine on 2026-10-19: `cogneva_build_gate_reservation_lapsed_total`, the
@@ -572,20 +676,28 @@ const GAPS_AT_SCRAPE_CENSUS: usize = 3;
 /// lapse -- the face owed was a reader of the population (how many lost turns
 /// does a window hold, and for which work).
 ///
-/// That reader exists now: the dashboard's "Build Gate: Reservations That
-/// Expired Unused" panel draws the lapses over six hours, per asker and in
-/// total, which is the population reading. The row stays in the produced table,
-/// because a panel reading a series is exactly what that table licenses. Eight
+/// That reader arrived: the dashboard's "Build Gate: Reservations That
+/// Expired Unused" panel drew the lapses over six hours, per asker and in
+/// total, which is the population reading. The row stayed in the produced table,
+/// because a panel reading a series was then what that table licensed. Eight
 /// again, and the eighth is still the prose-versus-query distinction above.
 ///
 /// Seven on 2026-10-20: `cogneva_signal_watcher_running` acquired its first
 /// reader. The outlet rule reads it to tell "nobody is listening to alerts"
-/// from "someone in the cluster is", which is the question the family was
-/// published for and the reason the dashboard comment above describes it as
-/// registered ahead of a reader. The rest of the family is still counted here;
-/// only the running flag left. The row also stays in the produced table.
-const REGISTERED_BUT_UNREAD_AT_CENSUS: usize = 7;
-
+/// from "someone in the cluster is", which is the question the family's
+/// producer doc says it was published for. The rest of the family is still
+/// counted here; only the running flag left. The row also stays in the produced
+/// table.
+///
+/// Seven, unchanged, and the reason is worth keeping: on 2026-11-11
+/// `cogneva_evolution_change_flight_seconds` lost its reader when the flight's
+/// wall was removed with the clock-based stops, and it did not land here. Its
+/// rule compared the age against `cogneva_evolution_change_flight_budget_seconds`,
+/// and both went because each step of the flight is now stopped by motion, not
+/// by a duration. The count above is of names still registered on the produced
+/// table; this series came off the alert-rule table with its rule, so
+/// it is owed a face rather than a reader, and `UNREGISTERED` carries that debt
+/// with its own count.
 #[test]
 fn every_series_a_build_can_render_is_on_a_face_or_has_a_verdict() {
     let faces = faces();
@@ -617,10 +729,28 @@ fn every_series_a_build_can_render_is_on_a_face_or_has_a_verdict() {
         .map(String::as_str)
         .filter(|n| !on_a_face.contains(*n) && !excluded.contains(n) && !listed.contains(n))
         .collect();
+    // 手写面板退出之后，「在不在某张面上」这个问法对渲染侧不成立：目录板按构造
+    // 把暴露面上有的名字全画出来，所以每一条都在「一张面」上，判据恒真。剩下真正
+    // 要数的还是那件事——有没有一个**决定**消费它。这里把它换成只能降的计数。
+    // 「有没有人决定」按**产出它的那个文件**判，不由人列表：
+    // 一个文件里只要有一条序列被读数或规则读着，这个文件就在为某个决定供数，
+    // 它发布的其余序列是那条决定的证据与中间量（`X` 被读，`X_evaluations_total`
+    // 就是它的拍子）。一个文件里一条都没被读，才是这个族没有任何决定。
+    //
+    // 这样新增一条序列不需要来这里登记：它跟着它所在的文件归类；而一个新文件
+    // 如果只有发布、没有任何读者，它会自己出现在下面那份名单里。
+    let beside_a_decision = decisions_beside_producers(&on_a_face);
+    let decision_missing: Vec<&str> = unclassified
+        .iter()
+        .copied()
+        .filter(|name| !beside_a_decision.contains(*name))
+        .collect();
+    // 空的才是终态：一条都不许出现在「整个文件没有任何读者」这一栏里。
+    // 没有可钉的数——新增一个这样的文件会让这条直接红，而修法是给那个族一条读数。
     assert!(
-        unclassified.is_empty(),
-        "这些序列能被渲染到抓取面，却不在任何一张面上，也没有判词——补一张面（规则 / 面板 / 登记表），或写清它为什么不需要：\n{}",
-        unclassified.join("\n")
+        decision_missing.is_empty(),
+        "这些序列所在的文件里一条被读的都没有：它们的族没有任何决定，补一条读数（不要在这里加名字）：\n{}",
+        decision_missing.join("\n")
     );
 
     let unknown: Vec<&str> = UNREGISTERED
@@ -691,26 +821,42 @@ fn every_series_a_build_can_render_is_on_a_face_or_has_a_verdict() {
 /// A registration is not a reader, and the difference is counted.
 ///
 /// The census above accepts a produced table as a face, and that is right: the
-/// table is where a series' producer is pinned, and a rule or a panel is
-/// licensed against it. But it does not read the series, so a name can be
-/// recorded there and read by nothing -- deliberately, as the dashboard
-/// contract says of the signal watcher, whose whole family exists so that "the
-/// watcher has gone quiet" has a reading at all. Deliberate or not, it is the
-/// shape that reads as covered while nothing covers it, so it gets its own
-/// number rather than disappearing into the union of the faces.
+/// table is where a series' producer is pinned, and a rule is licensed
+/// against it. But it does not read the series, so a name can be recorded there
+/// and read by nothing -- deliberately, as the signal watcher's own comment
+/// says, whose whole family exists so that "the watcher has gone quiet" has a
+/// reading at all. Deliberate or not, it is the shape that reads as covered
+/// while nothing covers it, so it gets its own verdict rather than disappearing
+/// into the union of the faces. Since `385639c06` that verdict is a decision
+/// filed beside the file that publishes the series, and the test fails when a
+/// file of unread series carries none.
+///
+/// The name says `panel` because a panel was the reader when the test was
+/// written; the read set it compares against has been the alert rules and the
+/// readings the decision surface queries since `8571eee7a` stopped counting a
+/// drawing as a reading. The name is kept
+/// because the tree cites it -- four memories and their index -- and a rename
+/// would leave those citations pointing at nothing.
 #[test]
 fn a_registration_no_rule_and_no_panel_reads_is_a_counted_row() {
     let registry: BTreeSet<String> = cog_core::metric_names::ALL
         .iter()
         .map(|n| n.as_str().to_string())
         .collect();
-    let mut read: BTreeSet<String> = rule_expressions()
+    let read: BTreeSet<String> = rule_expressions()
         .iter()
         .flat_map(|expr| metric_names_in(expr))
         .collect();
-    read.extend(dashboard::series());
-    let mut registered = table_names(ALERT_RULE_CONTRACT, ALERT_TABLE_OPENS);
-    registered.extend(table_names(DASHBOARD_CONTRACT, DASHBOARD_TABLE_OPENS));
+    let read = {
+        let mut read = read;
+        read.extend(
+            cog_gateway::readings::READINGS
+                .iter()
+                .flat_map(|spec| metric_names_in(spec.query)),
+        );
+        read
+    };
+    let registered = table_names(ALERT_RULE_CONTRACT, ALERT_TABLE_OPENS);
     let excluded: BTreeSet<&str> = NOT_A_SERIES.iter().map(|(n, _)| *n).collect();
 
     assert!(
@@ -733,38 +879,36 @@ fn a_registration_no_rule_and_no_panel_reads_is_a_counted_row() {
         })
         .collect();
 
-    assert_eq!(
-        registered_unread.len(),
-        REGISTERED_BUT_UNREAD_AT_CENSUS,
-        "有登记、没有读者的序列数与 REGISTERED_BUT_UNREAD_AT_CENSUS 不再相等（现在 {} 条，常数 {REGISTERED_BUT_UNREAD_AT_CENSUS}）:\n{}\n多一条：新登记的序列要当轮给它一个读者（规则或面板），否则它不是「已覆盖」而是「记下了却没人看」；少一条：补齐了读者，这个数要跟着减",
-        registered_unread.len(),
-        registered_unread.join("\n")
+    assert!(
+        registered_unread.is_empty(),
+        "这些登记的序列没有任何读者，也不在闭集里（没有可钉的数：空才是终态）：{registered_unread:?}"
     );
 }
 
-/// How many series the store can hold that nothing in the tree reads.
+/// The series the store can hold that nothing in the tree reads.
 ///
 /// The census above stops at the edge of the closed set on purpose: a name in
-/// `metric_names::ALL` is one the store may hold, and its reader is judged by the
-/// alert-rule contract, which asks every closed-set name whether a rule or a
-/// panel reads it. That leaves a shape neither contract counts. A name enters
-/// the closed set when a producer calls `record_gauge` with it; the rule and the
-/// panel faces read PromQL, so a series read back **inside** a process -- the
+/// `metric_names::ALL` is one the store may hold, and its reader is judged by
+/// the alert-rule contract, which asks every closed-set name whether a rule
+/// reads it. That leaves a shape neither contract counts. A name enters the
+/// closed set when a producer calls `record_gauge` with it; the alert-rule face
+/// reads PromQL, so a series read back **inside** a process -- the
 /// pass that writes a number and the next pass that reads it to decide what to
-/// do -- is read by neither. Today that is the ordinary shape of a store-backed
-/// reading: the change ledger writes its census and its dispatch readouts, and
-/// the dispatch pass queries them on the next tick. Before that gate existed,
-/// `cogneva_change_block_census` had a producer, two test-only query calls, and
-/// nothing else -- and every gate was green, because the rule-and-panel census
-/// had filed it as a declared debt and the scrape census had excluded it as a
-/// closed-set name.
+/// do -- is read by neither contract. Today that is the ordinary shape of a
+/// store-backed reading: the change ledger writes its census and its dispatch
+/// readouts, and the dispatch pass queries them on the next tick. Before that
+/// gate existed, `cogneva_change_block_census` had a producer, two test-only
+/// query calls, and nothing else -- and every gate was green, because the rule
+/// census had filed it as a declared debt and the scrape census had excluded it
+/// as a closed-set name.
 ///
-/// So this counts the third face: closed-set names that no rule expression, no
-/// panel and no shipped `query_*` call names. It is a count rather than a zero
-/// because several of these are deliberate -- a series written so that a
-/// question has an answer at all, months before the reader that asks it -- and
-/// the number is what keeps "nobody reads this yet" a decision on the record
-/// instead of a shape the gates cannot see.
+/// So this counts the third face: closed-set names that no alert rule
+/// expression, no reading on the decision surface and no shipped `query_*` call
+/// names. It was a pinned count while it was one, and several of the names under
+/// it were deliberate -- a series written so that a question has an answer at
+/// all, months before the reader that asks it -- so the number, not a zero, was
+/// what kept "nobody reads this yet" a decision on the record instead of a
+/// shape the gates cannot see.
 ///
 /// The read leg is `production_sources`, not `all_crate_files`: the latter walks
 /// `tests/` too, and the first count taken with it was wrong in the direction
@@ -772,29 +916,21 @@ fn a_registration_no_rule_and_no_panel_reads_is_a_counted_row() {
 /// the census twice, and a call from a fixture reads the fixture. Files under
 /// `src/` keep their in-file test modules, so `production_text` cuts those out.
 ///
-/// Forty when the count was first taken, and the size is not a smell: several of
-/// these names are filed in the alert-rule contract's UNREAD table as readings
-/// whose reader is owed or lives outside this repository's rules and panels, and
-/// the rest are the same shape -- a producer written so the question has an
-/// answer before anything asks it. Judging those filings is that table's job;
-/// what this adds is that the set is counted, so a new series lands here as a
-/// number that moved rather than as a name nobody noticed. It is not a target
-/// either -- a series that acquires a rule, a panel or a shipped read leaves
-/// this number, and adding one means admitting a new series nobody reads.
+/// Forty at the first count, then forty-one when the advance's starvation moved
+/// from a count to an instant: the deferral counter was published so a rule
+/// could bound it, and that rule now reads seconds instead -- a round is ten
+/// minutes long, so the count is nearly independent of the duration it stood
+/// for. The counter is still written, because the control law compares that same
+/// number inside the process (the third consecutive refusal is what makes the
+/// advance claim a slot), and the alert-rule census files it as `Elsewhere`
+/// against the series that replaced it. It went to sixty-eight when a drawing
+/// stopped counting as a reader.
 ///
-/// Forty-one since the advance's starvation moved from a count to an instant.
-/// The deferral counter was published so a rule could bound it, and that rule
-/// now reads seconds instead: a round is ten minutes long, so the count is
-/// nearly independent of the duration it stood for. The counter is still
-/// written, because the control law compares that same number inside the
-/// process -- the third consecutive refusal is what makes the advance claim a
-/// slot -- but nothing on the reading faces consumes it any more, and the
-/// alert-rule census files that as `Elsewhere` against the series that
-/// replaced it. Counting it here is what says so out loud rather than leaving
-/// the loss of a reader to be discovered by whoever next asks why the row is
-/// still published.
-const STORE_BACKED_WITHOUT_A_READER: usize = 41;
-
+/// `385639c06` retired the number: the same population is now judged by the file
+/// that publishes it, so a file in which nothing is read is a family nobody
+/// decides on, and the assertion is emptiness rather than a constant. The
+/// failure message lists the series of such a file; adding one series no longer
+/// moves a count, and adding a producer file with no reader turns this red.
 #[test]
 fn a_series_the_store_can_hold_with_no_reader_is_a_counted_row() {
     let registry: BTreeSet<String> = cog_core::metric_names::ALL
@@ -805,9 +941,15 @@ fn a_series_the_store_can_hold_with_no_reader_is_a_counted_row() {
         .iter()
         .flat_map(|expr| metric_names_in(expr))
         .collect();
-    read.extend(dashboard::series());
     let shipped = production_query_reads();
     read.extend(shipped.iter().cloned());
+    // 判词面的读数也是读者，而且是最主要的那一类：一条读数就是一次决定。
+    // 不把它算进来，判据只认告警规则，于是「已经有人盯着这个数」会被报成没人看。
+    read.extend(
+        cog_gateway::readings::READINGS
+            .iter()
+            .flat_map(|spec| metric_names_in(spec.query)),
+    );
 
     assert!(
         !read.is_empty(),
@@ -829,23 +971,19 @@ fn a_series_the_store_can_hold_with_no_reader_is_a_counted_row() {
                 .iter()
                 .any(|suffix| read.contains(&format!("{name}{suffix}")))
     };
+    // 与渲染侧同一条规则：一条序列算被覆盖，当且仅当它自己被读，或者发布它的
+    // 那个文件里也有东西被读。两者用同一把尺，否则「同一棵树里两条population
+    // 判法不同」——而这正是这类判据最容易分叉的地方。
+    let beside_a_decision = decisions_beside_producers(&read);
     let unread: Vec<&str> = registry
         .iter()
         .map(String::as_str)
-        .filter(|n| !read_by(n))
+        .filter(|n| !read_by(n) && !beside_a_decision.contains(*n))
         .collect();
 
-    assert_eq!(
-        unread.len(),
-        STORE_BACKED_WITHOUT_A_READER,
-        "闭集里既没有规则、没有面板、也没有生产代码 `query_*` 读的序列数与 \
-         STORE_BACKED_WITHOUT_A_READER 不再相等（现在 {} 条，常数 \
-         {STORE_BACKED_WITHOUT_A_READER}）:\n{}\n\
-         多一条：新序列要当轮补一个读者（规则、面板或生产代码里的自读），\
-         否则它不是「已覆盖」而是「写进 store 却没人看」；\
-         少一条：补齐了读者，这个数要跟着减",
-        unread.len(),
-        unread.join("\n")
+    assert!(
+        unread.is_empty(),
+        "闭集里这些序列既没有规则读、也没有读数读、生产代码也没有人查它——补读者，或在登记表里写清它为什么不需要：{unread:?}"
     );
 }
 
@@ -883,9 +1021,10 @@ fn production_query_reads() -> BTreeSet<String> {
             // `http_request_duration_ms` 与 `memory_*` 一族就不是。认「闭集里有没有
             // 这个词」而不是「它长得像不像」，前缀是别处登记表的形状，不是这里的。
             found.extend(
-                string_literals(&span)
+                literal_values(&span)
                     .into_iter()
-                    .filter(|literal| registry.contains(literal.as_str())),
+                    .filter(|literal| registry.contains(literal))
+                    .map(str::to_string),
             );
             for ident in metric_path_idents(&span) {
                 if let Some(name) = ident_to_name.get(ident.as_str()) {
@@ -895,46 +1034,6 @@ fn production_query_reads() -> BTreeSet<String> {
         }
     }
     found
-}
-
-/// `text` 里每一个双引号字符串的内容。
-///
-/// 反斜杠转义整体跳过，所以 SQL 常量里的 `\"` 不会把一段代码读成一个字符串。字符
-/// 字面量与行注释不跳：它们在这个位置不出现，出现了也只会多切一段、少认一个名字，
-/// 不会让一个调用点凭空读出一条序列。
-fn string_literals(text: &str) -> Vec<String> {
-    let bytes = text.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'"' {
-            i += 1;
-            continue;
-        }
-        let mut value = String::new();
-        i += 1;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'\\' => {
-                    if let Some(next) = text[i + 1..].chars().next() {
-                        value.push(next);
-                    }
-                    i += 2;
-                }
-                b'"' => {
-                    i += 1;
-                    break;
-                }
-                _ => {
-                    let ch = text[i..].chars().next().unwrap_or('"');
-                    value.push(ch);
-                    i += ch.len_utf8();
-                }
-            }
-        }
-        out.push(value);
-    }
-    out
 }
 
 /// 一次生产代码里 `query_*` 调用的实参区间。
@@ -1042,7 +1141,7 @@ fn metric_path_idents(span: &str) -> Vec<String> {
 /// in the contract table that files it as foreign, and the question the census
 /// can still ask about such a name is the one it asks of every series: does
 /// anything read it. That is the same read set `a_registration_no_rule_and_no_panel_reads_is_a_counted_row`
-/// builds, and it is not a free pass -- a name no rule and no panel reads stays
+/// builds, and it is not a free pass -- a name no rule reads stays
 /// unexplained, and a name filed as foreign is checked against the closed set
 /// by the contract that files it.
 #[test]
@@ -1114,7 +1213,7 @@ fn every_series_name_literal_in_the_tree_is_accounted_for() {
                 "退场的 {name} 在树里读不到字面量了——退场名单里的这条要么拼错了，要么连声明一起被删了，那样退场这件事本身就没有载体"
             );
         }
-        // The half that stays dangerous: a rule or panel reading a retired name
+        // The half that stays dangerous: a rule reading a retired name
         // reads a series this build no longer serves, and the retirement is
         // what makes it stop -- so the reading fails silently rather than
         // loudly, which is exactly the shape nothing else here would catch.
@@ -1128,11 +1227,10 @@ fn every_series_name_literal_in_the_tree_is_accounted_for() {
     // The names a face reads. Same two sources as the registered-but-unread
     // count, read once from the same extractors rather than twice from two
     // spellings of "what does a face read".
-    let mut read_by_a_face: BTreeSet<String> = rule_expressions()
+    let read_by_a_face: BTreeSet<String> = rule_expressions()
         .iter()
         .flat_map(|expr| metric_names_in(expr))
         .collect();
-    read_by_a_face.extend(dashboard::series());
     let unexplained: Vec<&str> = literals
         .iter()
         .map(String::as_str)
@@ -1164,17 +1262,17 @@ fn faces() -> Vec<(&'static str, BTreeSet<String>)> {
         .iter()
         .flat_map(|expr| metric_names_in(expr))
         .collect();
+    let readings: BTreeSet<String> = cog_gateway::readings::READINGS
+        .iter()
+        .flat_map(|spec| metric_names_in(spec.query))
+        .collect();
     vec![
         ("cog_core::metric_names::ALL（闭集）", registry),
+        ("判词面的读数", readings),
         ("chart 里的告警规则 promql", rules),
-        ("Grafana 面板", dashboard::series()),
         (
             "告警规则契约测试的 PRODUCED 表",
             table_names(ALERT_RULE_CONTRACT, ALERT_TABLE_OPENS),
-        ),
-        (
-            "面板契约测试的 PRODUCED 表",
-            table_names(DASHBOARD_CONTRACT, DASHBOARD_TABLE_OPENS),
         ),
     ]
 }
@@ -1306,6 +1404,26 @@ fn spells_series(text: &str, name: &str) -> bool {
 }
 
 /// Every series name the tree publishes, from the two shapes a producer uses.
+/// The published names whose file also publishes something a face reads.
+///
+/// The unit is the file, not the name: a producer emits a family, and whether
+/// that family has a decision is a property of the code that emits it. Reading
+/// it off the tree is what keeps this from being a list somebody maintains.
+fn decisions_beside_producers(on_a_face: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut beside = BTreeSet::new();
+    for path in all_crate_files(&repo_root()) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let names = declared_names(&text);
+        let producer_has_a_reader = names.iter().any(|n| on_a_face.contains(n));
+        if producer_has_a_reader {
+            beside.extend(names);
+        }
+    }
+    beside
+}
+
 fn published_names() -> BTreeSet<String> {
     let mut found = BTreeSet::new();
     for path in all_crate_files(&repo_root()) {
@@ -1546,7 +1664,7 @@ mod tests {
             vec!["\"a(name)\"".to_string()],
             "字符串里的括号不配对，跟着它走会把区间延到文件末尾"
         );
-        assert_eq!(string_literals("\"a(name)\""), vec!["a(name)".to_string()]);
+        assert_eq!(literal_values("\"a(name)\""), vec!["a(name)"]);
     }
 
     /// 名字经形参转手时这一层看不见它，而看不见的方向是多记一笔欠账。
@@ -1560,7 +1678,7 @@ mod tests {
         let spans = query_call_spans(through_a_variable);
         assert_eq!(spans, vec!["name".to_string()]);
         assert!(
-            string_literals(&spans[0]).is_empty() && metric_path_idents(&spans[0]).is_empty(),
+            literal_values(&spans[0]).is_empty() && metric_path_idents(&spans[0]).is_empty(),
             "形参不是名字，这一层只认得写下来的字面量与常量路径"
         );
     }

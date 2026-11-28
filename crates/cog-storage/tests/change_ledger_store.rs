@@ -115,14 +115,17 @@ async fn an_undecided_reason_reaches_its_column_and_clears_when_the_state_leaves
         .await
         .expect("read the row")
         .expect("the row exists");
-    assert_eq!(row.state, ChangeState::Undecided);
+    assert_eq!(row.state, ChangeState::Pending);
     assert_eq!(
         row.unsettled_reason.as_deref(),
         Some("scope_outside_tree"),
         "the reason a row is undecided must survive the write, or no reader can ask which rows are stuck for which reason"
     );
     assert_eq!(row.measured_rev.as_deref(), Some("probe-rev-1"));
-    assert_eq!(row.retire_reason, None, "an undecided row is not retired");
+    assert_eq!(
+        row.retire_reason, None,
+        "a row nothing could measure is not also judged out of the account"
+    );
 
     // A settled measurement of the same identity moves the row out of undecided
     // and must leave no reason behind.
@@ -465,7 +468,11 @@ async fn a_queued_retirement_folds_into_the_account_and_is_idempotent() {
     assert_eq!(folded, 1, "the one queued retirement must be folded");
 
     let row = store.get(&id).await.expect("read").expect("the row exists");
-    assert_eq!(row.state, ChangeState::Retired);
+    assert_eq!(
+        row.state,
+        ChangeState::Pending,
+        "a judged-out row is still owed"
+    );
     assert_eq!(
         row.retire_reason,
         Some(RetireReason::Fixture),
@@ -515,7 +522,7 @@ async fn a_later_measurement_clears_a_retirement() {
             .expect("read")
             .expect("the row exists")
             .state,
-        ChangeState::Retired
+        ChangeState::Pending
     );
 
     store
@@ -1676,8 +1683,8 @@ async fn a_history_reads_back_through_the_store_newest_first_and_on_its_own_iden
 
     for (state, rev) in [
         (ChangeState::Pending, "rev-a"),
-        (ChangeState::Partial, "rev-b"),
-        (ChangeState::Landed, "rev-c"),
+        (ChangeState::Landed, "rev-b"),
+        (ChangeState::Pending, "rev-c"),
     ] {
         store
             .apply_measurement(&ChangeMeasurement::new(id.clone(), state).at_revision(rev))
@@ -1693,8 +1700,8 @@ async fn a_history_reads_back_through_the_store_newest_first_and_on_its_own_iden
 
     let history = store.events(&id, 50).await.expect("read one row's history");
     assert_eq!(history.len(), 3, "the sibling's move is not this row's");
-    assert_eq!(history[0].to_state, ChangeState::Landed);
-    assert_eq!(history[0].from_state, Some(ChangeState::Partial));
+    assert_eq!(history[0].to_state, ChangeState::Pending);
+    assert_eq!(history[0].from_state, Some(ChangeState::Landed));
     assert_eq!(history[0].measured_rev.as_deref(), Some("rev-c"));
     assert_eq!(
         history[2].from_state, None,
@@ -1707,8 +1714,13 @@ async fn a_history_reads_back_through_the_store_newest_first_and_on_its_own_iden
     assert_eq!(newest.len(), 1);
     assert_eq!(
         newest[0].to_state,
-        ChangeState::Landed,
+        ChangeState::Pending,
         "the bound has to drop the oldest steps, not keep them"
+    );
+    assert_eq!(
+        newest[0].measured_rev.as_deref(),
+        Some("rev-c"),
+        "the one step kept is the last one taken, not the first"
     );
 
     cleanup(&pool, &marker).await;
@@ -1743,8 +1755,11 @@ async fn the_reason_of_a_transition_is_recorded_with_it() {
     assert_eq!(
         event_reasons(&pool, &marker).await,
         vec![
+            // The account has two state words, and the event records the state
+            // the move landed in: an unsettled measurement is `pending` with
+            // the reason beside it.
             (
-                "undecided".to_string(),
+                "pending".to_string(),
                 None,
                 Some("scope_outside_tree".to_string())
             ),
