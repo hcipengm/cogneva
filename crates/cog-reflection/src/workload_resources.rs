@@ -1867,16 +1867,25 @@ async fn kubectl(args: &[&str]) -> Result<String, String> {
     let cmdline = format!("kubectl {args:?}");
     let mut cmd = tokio::process::Command::new("kubectl");
     cmd.args(args).kill_on_drop(true);
-    let out = match cog_core::progress::run_child_watched(cmd, &cmdline).await {
-        Ok(cog_core::progress::ChildOutcome::Exited(out)) => out,
-        Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
+    // 判停只归因，动手由归因决定：等 I/O、等锁的那几档继续等，空转的那一档收掉。
+    let (outcome, stall) = cog_core::progress::run_child_watched_with_pid_decided(
+        cmd,
+        &cmdline,
+        |_pid| {},
+        std::sync::Arc::new(|stall| cog_core::progress::action_for(&stall.cause)),
+    )
+    .await
+    .map_err(|e| format!("{cmdline} could not run: {e}"))?;
+    let cog_core::progress::ChildOutcome::Exited(out) = outcome;
+    if let Some(stall) = stall {
+        if out.status.code().is_none() {
             return Err(format!(
-                "{cmdline} 停住了：{silent:?} 没有输出、也没有消耗 CPU，比这份部署见过的\
-                 任何一次「还在干活」的两次推进之间的最长间隔都长（{window:?}）；已杀掉"
-            ))
+                "{cmdline} 停住了：{:?} 没有输出、也没有消耗 CPU，比这份部署见过的\
+                 任何一次「还在干活」的两次推进之间的最长间隔都长（{:?}）；已收掉",
+                stall.silent, stall.window
+            ));
         }
-        Err(e) => return Err(format!("{cmdline} could not run: {e}")),
-    };
+    }
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(format!(
